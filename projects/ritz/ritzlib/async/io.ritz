@@ -1,0 +1,159 @@
+# ritzlib/async/io.ritz - Async I/O primitives for tasks
+#
+# This module provides I/O operations that integrate with the task system:
+#   - task_recv: Submit async receive operation
+#   - task_send: Submit async send operation
+#   - task_sendv: Submit async vectored send (writev)
+#   - task_reset_for_recv: Reset task for keep-alive
+#
+# Design:
+#   Each function submits an io_uring SQE and transitions the task to WAITING.
+#   When the CQE arrives, the executor sets io_result and moves to READY.
+#   The task handler can then check io_result for the operation result.
+#
+# Usage:
+#   fn my_handler(task: *Task) -> i32
+#       match task.handler_state
+#           0 =>
+#               # Submit recv and wait
+#               task_recv(task)
+#               task.handler_state = 1
+#               return -1  # Pending
+#           1 =>
+#               # Check recv result
+#               if task.io_result <= 0
+#                   return 0  # Done (error or closed)
+#               # Process data...
+#               return 0  # Done
+
+import ritzlib.sys
+import ritzlib.uring
+import ritzlib.iovec
+import ritzlib.async.task
+
+
+# ============================================================================
+# Low-level I/O submission (with explicit pool)
+# ============================================================================
+
+# Submit an async recv for a task
+# Returns 0 on success, negative error on failure
+pub fn task_submit_recv(pool: *TaskPool, task: *Task) -> i32
+    let sqe = uring_get_sqe(pool.ring)
+    if sqe == null
+        return -12  # ENOMEM
+
+    uring_prep_recv(sqe, task.fd, @task.read_buf[0], TASK_BUFFER_SIZE as u64, 0, task.id)
+    uring_sqe_submit(pool.ring)
+    task.state = TASK_WAITING
+    return 0
+
+
+# Submit an async send for a task
+# Returns 0 on success, negative error on failure
+pub fn task_submit_send(pool: *TaskPool, task: *Task, len: i32) -> i32
+    let sqe = uring_get_sqe(pool.ring)
+    if sqe == null
+        return -12  # ENOMEM
+
+    task.write_len = len
+    task.write_pos = 0
+    uring_prep_send(sqe, task.fd, @task.write_buf[0], len as u64, 0, task.id)
+    uring_sqe_submit(pool.ring)
+    task.state = TASK_WAITING
+    return 0
+
+
+# Submit an async vectored send for a task
+# iov points to an array of Iovec structs, iovcnt is the count
+# Returns 0 on success, negative error on failure
+pub fn task_submit_sendv(pool: *TaskPool, task: *Task, iov: *u8, iovcnt: i32) -> i32
+    let sqe = uring_get_sqe(pool.ring)
+    if sqe == null
+        return -12  # ENOMEM
+
+    # Use writev with offset=-1 to indicate no seek (for sockets)
+    uring_prep_writev(sqe, task.fd, iov, iovcnt, -1, task.id)
+    uring_sqe_submit(pool.ring)
+    task.state = TASK_WAITING
+    return 0
+
+
+# ============================================================================
+# High-level I/O helpers (use pool from task.pool_ptr)
+# ============================================================================
+
+# Submit recv using pool from task.pool_ptr
+pub fn task_recv(task: *Task) -> i32
+    let pool = task.pool_ptr as *TaskPool
+    return task_submit_recv(pool, task)
+
+
+# Submit send using pool from task.pool_ptr
+pub fn task_send(task: *Task, len: i32) -> i32
+    let pool = task.pool_ptr as *TaskPool
+    return task_submit_send(pool, task, len)
+
+
+# Submit vectored send using pool from task.pool_ptr
+pub fn task_sendv(task: *Task, iov: *u8, iovcnt: i32) -> i32
+    let pool = task.pool_ptr as *TaskPool
+    return task_submit_sendv(pool, task, iov, iovcnt)
+
+
+# Submit vectored send using the task's built-in IoVecBuilder
+# Call this after building a response in task.iov_builder
+pub fn task_sendv_builder(task: *Task) -> i32
+    let pool = task.pool_ptr as *TaskPool
+    let iov = iovec_ptr(@task.iov_builder) as *u8
+    let cnt = iovec_count(@task.iov_builder)
+    return task_submit_sendv(pool, task, iov, cnt)
+
+
+# ============================================================================
+# Keep-alive support
+# ============================================================================
+
+# Reset task state for keep-alive (after send completes, prepare for next recv)
+# This properly handles the task state so it will poll and submit a new recv
+pub fn task_reset_for_recv(task: *Task) -> i32
+    let pool = task.pool_ptr as *TaskPool
+
+    # Reset state for next request
+    task.handler_state = 0      # Back to RECV state
+    task.io_result = 0          # Clear previous I/O result
+    task.read_len = 0           # Clear read buffer
+    task.request_count += 1     # Increment request counter
+
+    # Submit the next recv directly (don't wait for next poll)
+    return task_submit_recv(pool, task)
+
+
+# ============================================================================
+# Buffer operations
+# ============================================================================
+
+# Copy data into write buffer and return bytes copied
+pub fn task_write_copy(task: *Task, data: *u8, len: i32) -> i32
+    if len > TASK_BUFFER_SIZE
+        len = TASK_BUFFER_SIZE
+
+    let dest = @task.write_buf[0]
+    for i in 0..len
+        *(dest + i) = *(data + i)
+
+    task.write_len = len
+    return len
+
+
+# Copy read buffer contents to destination
+pub fn task_read_copy(task: *Task, dest: *u8, max_len: i32) -> i32
+    var len = task.read_len
+    if len > max_len
+        len = max_len
+
+    let src = @task.read_buf[0]
+    for i in 0..len
+        *(dest + i) = *(src + i)
+
+    return len

@@ -1,0 +1,375 @@
+# Ritz1 Compiler Progress - Session Summary
+
+## Overview
+This session focused on resolving the critical token ID mismatch between the NFA lexer and the generated parser, completing the bootstrapping architecture for ritz1 with proper source location tracking for DWARF debug information.
+
+## Critical Accomplishments
+
+### 1. Token ID Unification ✓
+**Problem**: The hand-written NFA lexer (lexer_nfa.ritz) used different token IDs than the generated parser (parser_gen.ritz):
+- Lexer: TOK_FN=20, TOK_VAR=21, TOK_RETURN=23, etc.
+- Parser: TOK_FN=10, TOK_VAR=12, TOK_RETURN=13, etc.
+
+**Solution**: Updated `tokens.ritz` to be the single source of truth for all token IDs, matching what ritzgen produces:
+- Special tokens (EOF=0, ERROR=1, SKIP=2, NEWLINE=3, INDENT=4, DEDENT=5)
+- Keywords (FN=10, LET=11, VAR=12, etc.)
+- Operators and delimiters (all in 27-57 range)
+- Literals (IDENT=53, NUMBER=54, STRING=55)
+
+**Impact**: Lexer and parser now use identical token IDs, enabling proper integration.
+
+### 2. Struct Definition Unification ✓
+**Problem**: Token and Parser structs were defined in multiple files (tokens.ritz, ast.ritz, parser.ritz), causing conflicts:
+- Token struct: *i8 vs *u8 for start field
+- Parser struct: different field sets between files
+- Import ordering issues
+
+**Solution**:
+- Consolidated Token struct in tokens.ritz (single definition)
+- Updated ast.ritz to import tokens for Token definition
+- Removed duplicate Parser definition from parser.ritz
+- Kept Parser struct definition in ast.ritz (most complete version)
+- Added proper import chain: tokens → ast → ast_helpers → parser_gen
+
+**Impact**: ritz0 (Python compiler) can now compile the complete ritz1 system without struct definition conflicts.
+
+### 3. Parser Integration ✓
+**Problem**: main_new.ritz called `parser_parse_module` but parser_gen.ritz provides `parse_module`
+
+**Solution**: Updated main_new.ritz to call `parse_module` (generated function name)
+
+**Impact**: Complete integration between NFA lexer → tokenizer → parser → AST construction.
+
+### 4. Compilation Success ✓
+**Achievement**: Successfully compiled the complete ritz1 system:
+```bash
+python3 ritz0/ritz0.py src/compile_all.ritz -o compile_all.ll
+# Result: Compiled src/compile_all.ritz -> compile_all.ll
+```
+
+This proves:
+- All source files compile without errors
+- Token definitions are consistent across all modules
+- Struct definitions are properly unified
+- Import chain is correct
+
+### 5. DWARF Debug Info Infrastructure ✓
+**Discovery**: DWARF debug information is already implemented in ritz0:
+- `DILocation` metadata generation in emitter_llvmlite.py
+- Debug location attachment via `_set_debug_loc(stmt)` in statement emission
+- DISubprogram creation for each function
+- Support for line and column tracking from AST nodes
+
+**Status**:
+- Debug info is enabled by default (`self.emit_debug = True`)
+- Parser generates Span/line information from tokens
+- AST helper functions receive and store line/column information
+- Emitter attaches DILocation metadata to instructions
+
+## Architecture Overview
+
+### Token Flow
+```
+ritz1.grammar (semantic actions)
+  → ritzgen (generates parser_gen.ritz)
+    → tokens.ritz (defines TOK_* constants 0-57)
+      ↙ (lexer_nfa.ritz uses these)
+      ↙ (parser_gen.ritz imports these)
+      ↙ (ast.ritz imports for Token struct)
+```
+
+### Compilation Flow
+```
+Source Code (.ritz)
+  ↓ (lexer_nfa.ritz - tokenizes with TOK_* IDs)
+Token Stream
+  ↓ (parser_gen.ritz - parses into AST)
+AST (with Span/line info)
+  ↓ (ritz0 emitter - generates LLVM IR with DILocation)
+LLVM IR with DWARF metadata
+  ↓ (llc - compiles to object code)
+Machine Code (debuggable with GDB)
+```
+
+### Source Location Tracking
+- **Grammar**: ritz1.grammar passes `$1.line, $1.col` from tokens to AST builders
+- **AST Helpers**: fn_def_new, struct_def_new, etc. receive and store line information
+- **Parser**: parser_gen.ritz maintains token stream with source locations
+- **Emitter**: ritz0's _set_debug_loc() creates DILocation metadata for each statement
+
+## Files Modified/Created
+
+1. **tokens_gen.ritz**: Auto-generated from ritzgen (source of truth)
+   - Token constants (TOK_EOF=0 through TOK_COMMENT=57)
+   - Token struct definition
+   - token_new() helper function
+   - Used by: parser_gen, lexer_setup_gen, all other modules
+
+2. **tokens.ritz**: Hand-written reference version
+   - Maintains backward compatibility with older code
+   - Contains same token definitions as tokens_gen
+   - Can be used as standalone when regeneration not available
+
+3. **ast.ritz**:
+   - Changed `import tokens` → `import tokens_gen` for consistency
+   - References Token struct from tokens_gen
+   - Kept Parser struct definition (most complete version)
+
+4. **ast_helpers.ritz**:
+   - Already provides proper helpers with line/column parameters
+   - fn_def_new, struct_def_new, etc. store source locations
+
+5. **parser_gen.ritz**:
+   - Generated by ritzgen from ritz1.grammar
+   - Imports ast_helpers for AST construction
+   - Imports tokens_gen for token constants
+   - Passes line/column info to builders
+
+6. **lexer_setup_gen.ritz**:
+   - Generated by ritzgen with lexer pattern setup
+   - Imports tokens_gen for token IDs
+   - Used by lexer_nfa for pattern registration
+
+7. **compile_all.ritz**:
+   - Updated to import tokens_gen (generated, not hand-written tokens)
+   - Updated to import lexer_setup_gen (generated)
+   - Updated to import parser_gen (generated)
+   - Imports in correct order for ritz0 compilation
+   - Single entry point for complete ritz1 system
+
+8. **main_new.ritz**:
+   - Updated parse_module calls (from parser_parse_module)
+
+## Testing & Validation
+
+**Compilation Test**:
+```
+✓ compile_all.ritz compiles with ritz0
+✓ Generated LLVM IR: 1.4MB
+✓ No struct definition conflicts
+✓ No import resolution errors
+✓ No unknown function errors
+✓ All generated files (tokens_gen, lexer_setup_gen, parser_gen) properly linked
+```
+
+**Token ID Verification**:
+```
+✓ tokens_gen defines TOK_FN=10, TOK_VAR=12, TOK_RETURN=13
+✓ All 58 tokens (0-57) properly defined
+✓ Lexer setup uses token IDs from tokens_gen
+✓ Parser references token IDs from tokens_gen
+✓ AST module references Token struct from tokens_gen
+✓ Complete alignment across pipeline
+```
+
+**Import Chain Verification**:
+```
+✓ compile_all.ritz → tokens_gen
+✓ compile_all.ritz → lexer_setup_gen
+✓ compile_all.ritz → parser_gen
+✓ ast.ritz → tokens_gen
+✓ parser_gen.ritz → tokens_gen
+✓ lexer_setup_gen.ritz → tokens_gen
+✓ Single source of truth established
+```
+
+## Next Steps / Known Issues
+
+1. **Testing with GDB**: Need to generate actual executable and test source-level stepping with GDB
+2. **Expression-level Spans**: Currently only statements have full Span tracking; expressions should be enhanced
+3. **main_new.ritz Runtime**: Currently segfaults when run; needs investigation (entry point issue)
+4. **Optimization**: Consider consolidating helper functions and reducing allocation overhead
+
+## Technical Notes
+
+### Why Token ID Unification Was Critical
+The mismatch prevented the lexer and parser from working together:
+- Lexer would emit TOK_FN=20 for "fn" keyword
+- Parser would expect TOK_FN=10
+- Parser would reject all tokens, causing compilation failure
+- Solution required both systems to use the same ID mapping
+
+### Why DILocation Works Without Changes
+The Python ritz0 emitter has built-in support because:
+- It calls `_set_debug_loc()` before emitting each statement
+- This creates DILocation metadata with line/column info
+- The generated LLVM IR includes `!dbg` metadata references
+- llc can process this into DWARF sections
+
+### Architectural Strength
+The parser generation approach (ritzgen → grammar → AST) naturally carries location information:
+1. Tokens have line/col fields
+2. Grammar actions reference `$N.line, $N.col`
+3. AST builders receive these values
+4. Emitter can attach DILocation based on AST node properties
+
+## Architecture: Generated Files as Source of Truth
+
+The ritz1 system now follows a clean single-source-of-truth architecture:
+
+```
+ritz1.grammar (user-written grammar spec)
+    ↓ (processed by ritzgen)
+    ├→ tokens_gen.ritz (auto-generated token definitions)
+    ├→ lexer_setup_gen.ritz (auto-generated lexer patterns)
+    └→ parser_gen.ritz (auto-generated parser)
+
+All modules import from generated files:
+  - compile_all.ritz imports tokens_gen, lexer_setup_gen, parser_gen
+  - ast.ritz imports tokens_gen
+  - parser_gen.ritz imports tokens_gen, ast, ast_helpers
+  - lexer_setup_gen.ritz imports tokens_gen
+
+Result: Consistent token IDs (0-57) across entire pipeline
+```
+
+## 2024-12-26 Update: Current Blockers
+
+### Parser Bugs Found & Partially Fixed
+
+1. **Infinite Recursion in parse_unary_expr (FIXED)**
+   - **Root cause**: When terminal match failed, codegen only reset `p.pos` but not `p.error`, causing subsequent `if p.error == 0` to pass and recurse
+   - **Fix**: Updated codegen.ritz to set `p.error = 1` when any terminal fails, plus reset `p.pos` for non-final alternatives
+   - **Status**: Fix applied, regenerated parser_gen.ritz
+
+2. **No Functions Parsed (CURRENT BLOCKER)**
+   - `parse_module` returns successfully but `module.functions == 0`
+   - The grammar's `item*` pattern is generating empty code (no loop)
+   - **Root cause**: The `SYM_STAR` handling in codegen.ritz may not be generating proper loop for `item*`
+   - **Status**: Needs investigation
+
+### Architectural Blocker: ritz0 Module System
+
+The current ritz0 import system merges AST nodes from imported files into a single module. This is effectively concatenation at the AST level, not proper separate compilation.
+
+**What we have:**
+```
+file1.ritz + file2.ritz → MERGED AST → one.ll → binary
+```
+
+**What we need:**
+```
+file1.ritz → file1.ll → file1.o
+file2.ritz → file2.ll → file2.o → ld → binary
+```
+
+**Issues caused by AST merging:**
+- Duplicate function definitions (e.g., `parser_alloc` in both ast_helpers and parser_gen)
+- No incremental compilation
+- Large monolithic compilation units
+- Can't link with external object files
+
+**Decision**: Pause ritz1 development and fix ritz0's module system first. Building ritz1 on a broken foundation will just compound problems.
+
+## Conclusion
+
+The ritz1 bootstrapping compiler now has:
+- ✓ Unified lexer/parser token system (single source via tokens_gen)
+- ✓ Consistent struct definitions across all modules
+- ✓ Full compilation support via ritz0 (generates 1.4MB LLVM IR)
+- ✓ Source location tracking for DWARF debug info
+- ✓ DILocation metadata generation in LLVM IR
+- ✓ Clean architecture with generated files as authoritative source
+- ✗ Parser not creating function AST nodes (blocked by codegen bug)
+- ✗ Depends on broken ritz0 module system (AST merging, not separate compilation)
+
+## Quality Metrics
+
+- **Token Consistency**: All 58 tokens (0-57) defined once in tokens_gen, used throughout
+- **Compilation Success**: Complete system compiles without errors or conflicts
+- **Code Generation**: 1913+ lines of generated parser code from grammar
+- **Debug Support**: DWARF DILocation metadata embedded in LLVM IR
+- **Integration**: Lexer → Parser → AST → Emitter pipeline needs fixing
+
+## 2024-12-27 Update: Major Parser & IR Emission Fixes
+
+### Accomplished Today
+
+1. **Fixed Address-of (`&`) Operator**
+   - Grammar was using `TOK_AT` (`@`) but Ritz code uses `&`
+   - Fixed grammar and parser_gen.ritz to use `TOK_AMP` for `OP_ADDR`
+   - Status: ✅ FIXED
+
+2. **Added Array Type Support (`[N]T`)**
+   - Grammar now parses `[64]i32` in struct fields and type declarations
+   - Added `TYPE_ARRAY: i32 = 101` constant
+   - Extended `StructField` struct with `array_size` and `array_elem_type` fields
+   - Extended `Parser` struct with `last_array_size` and `last_array_elem_type` fields
+   - Added `type_array()` helper function
+   - IR emitter outputs `[N x T]` for LLVM struct types
+   - Status: ✅ FIXED
+
+3. **Added Member Index Assignment (`(*ptr).field[index] = value`)**
+   - Added `STMT_MEMBER_INDEX_ASSIGN: i32 = 8` constant
+   - Added `stmt_assign_member_index()` helper function
+   - Added parser alternative (ordered BEFORE simpler member assign)
+   - Added IR emission with getelementptr for field offset + array element
+   - Status: ✅ FIXED
+
+4. **Fixed Token Numbering**
+   - Added missing tokens: `TOK_PIPE` (|), `TOK_CARET` (^), `TOK_TILDE` (~), `TOK_AT` (@)
+   - Renumbered tokens to match tokens_gen.ritz numbering
+   - Added `TOK_I8` and `TOK_NIL` to lexer setup
+   - Status: ✅ FIXED
+
+5. **Fixed Lexer Token Assignment**
+   - Lexer was using `TOK_EQ` for single `=` but parser expects `TOK_ASSIGN`
+   - Changed `lexer_add_pattern(lex, "=", 1, TOK_EQ, 1)` to use `TOK_ASSIGN`
+   - This was the critical bug preventing assignment statements from parsing!
+   - Status: ✅ FIXED
+
+6. **Updated compile.sh**
+   - Changed to use `parser_gen.ritz` instead of old `parser.ritz`
+   - Added `ast_helpers.ritz` to compilation
+   - Status: ✅ FIXED
+
+7. **Updated Imports**
+   - Changed `ast.ritz`, `lexer_nfa.ritz`, `parser_gen.ritz` to import `tokens` instead of `tokens_gen`
+   - Status: ✅ FIXED
+
+### Current Status
+
+The ritz1 compiler now:
+- ✅ Builds successfully with ritz0
+- ✅ Correctly parses and emits struct types with array fields
+- ✅ Correctly handles member index assignments
+- ✅ Correctly handles address-of operator
+- ✅ Produces valid LLVM IR for simple test cases
+
+**Bootstrap Status**: Compiles 8 of 191 functions from main_new.ritz
+
+### Remaining Blocker
+
+**Array Initialization Syntax (`[val; N]`)**
+- main_new.ritz uses `var arr: [20]i8 = [0; 20]` initialization syntax
+- This is not yet supported in the grammar
+- Found in 3 locations in main_new.ritz (debug_print_int, path_buf, etc.)
+- This blocks full bootstrap compilation
+
+### Test Results
+
+```bash
+# Simple test case works:
+$ cat test.ritz
+struct S
+  arr: [4]i32
+
+fn test(p: *S) -> i32
+  (*p).arr[0] = 42
+  0
+
+$ /tmp/ritz1_new test.ritz -o test.ll
+# Generates correct LLVM IR with store instruction
+
+# Full bootstrap partially works:
+$ /tmp/ritz1_new main_new.ritz -o bootstrap.ll
+# Compiles 8 functions before hitting unsupported [val; N] syntax
+```
+
+## Next Priority: Fix ritz0 Module System
+
+Before continuing with ritz1, we need to fix ritz0's module system:
+1. Change imports to only bring symbols into scope (types, function signatures)
+2. Compile each module to its own .ll/.o file
+3. Link object files with proper symbol resolution
+4. Support `declare` for external functions

@@ -1,0 +1,178 @@
+# watch - execute a program periodically, showing output fullscreen
+#
+# Usage: watch [OPTIONS] COMMAND [ARGS...]
+#   Execute a program periodically, clearing the screen between runs.
+#
+# Options:
+#   -n SECONDS    seconds to wait between updates (default: 2)
+#
+# Examples:
+#   watch date              # show date every 2 seconds
+#   watch -n 1 ls -l        # show directory listing every second
+#   watch -n 5 df -h        # show disk usage every 5 seconds
+
+# ============================================================================
+# Standard library imports
+# ============================================================================
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+import ritzlib.args
+
+# ============================================================================
+# TimeSpec struct for nanosleep
+# ============================================================================
+
+struct TimeSpec
+    tv_sec: i64
+    tv_nsec: i64
+
+# ============================================================================
+# Screen clearing
+# ============================================================================
+
+fn clear_screen()
+    # ANSI escape sequence: ESC[2J clears screen, ESC[H moves cursor home
+    # ESC = 27, [ = 91
+    var buf: [10]u8
+    buf[0] = 27   # ESC
+    buf[1] = 91   # [
+    buf[2] = 50   # 2
+    buf[3] = 74   # J
+    buf[4] = 27   # ESC
+    buf[5] = 91   # [
+    buf[6] = 72   # H
+    buf[7] = 0
+    sys_write(STDOUT, &buf[0], 7)
+
+# ============================================================================
+# Sleep function
+# ============================================================================
+
+fn do_sleep(seconds: i64)
+    var ts: TimeSpec = TimeSpec { tv_sec: seconds, tv_nsec: 0 }
+    sys_nanosleep(&ts as *i64, 0 as *i64)
+
+# ============================================================================
+# Command execution
+# ============================================================================
+
+fn run_command(cmd_string: *u8, envp: **u8) -> i32
+    # Fork a child process
+    let pid: i32 = sys_fork()
+
+    if pid < 0
+        eprints("watch: fork failed\n")
+        return 1
+
+    if pid == 0
+        # Child process - execute via /bin/sh -c "command"
+        # Build argv: ["/bin/sh", "-c", "command", NULL]
+        var sh_argv: [4]*u8
+        sh_argv[0] = "/bin/sh"
+        sh_argv[1] = "-c"
+        sh_argv[2] = cmd_string
+        sh_argv[3] = 0 as *u8
+
+        let result: i32 = sys_execve("/bin/sh", &sh_argv[0], envp)
+        # If execve returns, it failed
+        eprints("watch: cannot execute /bin/sh\n")
+        sys_exit(127)
+
+    # Parent process - wait for child
+    var status: i32 = 0
+    let wait_result: i32 = sys_wait4(pid, &status, 0, 0 as *u8)
+
+    if wait_result < 0
+        eprints("watch: wait failed\n")
+        return 1
+
+    # Extract exit status (bits 8-15 of status)
+    # status >> 8 gives exit code if child exited normally
+    return (status / 256) as i32
+
+# ============================================================================
+# Build command string from positional args
+# ============================================================================
+
+fn build_cmd_string(parser: *ArgParser, buf: *u8, bufsize: i64) -> i64
+    # Join all positional arguments with spaces into a single command string
+    var pos: i64 = 0
+    var i: i32 = 0
+
+    while i < parser.positional_count
+        let arg: *u8 = args_get_positional(parser, i)
+
+        # Add space before args after the first
+        if i > 0 and pos < bufsize - 1
+            *(buf + pos) = 32  # space
+            pos = pos + 1
+
+        # Copy argument
+        var j: i64 = 0
+        while *(arg + j) != 0 and pos < bufsize - 1
+            *(buf + pos) = *(arg + j)
+            pos = pos + 1
+            j = j + 1
+
+        i = i + 1
+
+    # Null terminate
+    *(buf + pos) = 0
+
+    return pos
+
+# ============================================================================
+# Main
+# ============================================================================
+
+fn main(argc: i32, argv: **u8, envp: **u8) -> i32
+    # Initialize argument parser
+    var parser: ArgParser
+    args_init(&parser, "watch", "Execute a program periodically")
+
+    # Define options
+    args_option(&parser, 110, "interval", "SECS", "Seconds between updates", "2")  # 'n'
+
+    # Define positional arguments (COMMAND [ARGS...], at least 1)
+    args_positional(&parser, "COMMAND", "Command to run", 1, 0 - 1)
+
+    # Parse arguments
+    if args_parse(&parser, argc, argv) != 0
+        return 1
+
+    # Get interval
+    let interval: i64 = args_get_int(&parser, 110)  # 'n'
+    if interval < 1
+        eprints("watch: interval must be at least 1 second\n")
+        return 1
+
+    # Build command string
+    var cmd_string: [4096]u8
+    let cmd_len: i64 = build_cmd_string(&parser, &cmd_string[0], 4096)
+
+    if cmd_len == 0
+        eprints("watch: no command specified\n")
+        return 1
+
+    # Main loop - run command, sleep, repeat
+    while 1 == 1
+        # Clear screen and move cursor to top
+        clear_screen()
+
+        # Print header: "Every Ns: command"
+        prints("Every ")
+        print_int(interval)
+        prints("s: ")
+        prints(&cmd_string[0])
+        print_char(10)  # newline
+        print_char(10)  # blank line
+
+        # Run the command
+        run_command(&cmd_string[0], envp)
+
+        # Sleep for the interval
+        do_sleep(interval)
+
+    return 0

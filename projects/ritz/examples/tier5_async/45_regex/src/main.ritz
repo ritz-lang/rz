@@ -1,0 +1,384 @@
+# regex - Simple regex matcher using backtracking
+#
+# Usage: regex PATTERN [FILE]
+#   Match lines against a regex pattern.
+#
+# Supported syntax:
+#   .        Any character
+#   *        Zero or more of previous
+#   +        One or more of previous
+#   ?        Zero or one of previous
+#   ^        Start of line
+#   $        End of line
+#   [abc]    Character class
+#   [^abc]   Negated character class
+#   [a-z]    Character range
+#   \d       Digit [0-9]
+#   \w       Word char [a-zA-Z0-9_]
+#   \s       Whitespace
+#   \x       Escape special character
+#
+# Examples:
+#   regex 'hello' file.txt      # Lines containing 'hello'
+#   regex '^#' file.txt         # Lines starting with #
+#   regex '[0-9]+' file.txt     # Lines with numbers
+
+# ============================================================================
+# Standard library imports
+# ============================================================================
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+import ritzlib.args
+
+# ============================================================================
+# Regex matcher using recursive backtracking
+# ============================================================================
+
+# Match context
+struct MatchCtx
+    text: *u8
+    text_len: i64
+    pattern: *u8
+    pattern_len: i64
+
+fn is_special(c: u8) -> i32
+    if c == '.' or c == '*' or c == '+' or c == 63  # . * + ?
+        return 1
+    if c == '[' or c == ']'  # [ ]
+        return 1
+    if c == 94 or c == 36  # ^ $
+        return 1
+    if c == '\\'  # \
+        return 1
+    return 0
+
+fn match_char_class(ctx: *MatchCtx, ppos: i64, c: u8) -> i64
+    # Returns new pattern position after ], or -1 if no match
+    let pattern: *u8 = ctx.pattern
+    var pos: i64 = ppos + 1  # Skip '['
+
+    var negated: i32 = 0
+    if *(pattern + pos) == 94  # '^'
+        negated = 1
+        pos += 1
+
+    var matched: i32 = 0
+
+    while pos < ctx.pattern_len
+        let pc: u8 = *(pattern + pos)
+        if pc == ']'  # ']'
+            pos += 1
+            break
+
+        # Check for range
+        if pos + 2 < ctx.pattern_len and *(pattern + pos + 1) == '-' and *(pattern + pos + 2) != 93
+            let start: u8 = pc
+            let end: u8 = *(pattern + pos + 2)
+            if c >= start and c <= end
+                matched = 1
+            pos += 3
+        else
+            if c == pc
+                matched = 1
+            pos += 1
+
+    if negated != 0
+        matched = (matched == 0) as i32
+
+    if matched != 0
+        return pos
+    return -1
+
+fn match_escape(ctx: *MatchCtx, ppos: i64, c: u8) -> i32
+    # Check if escaped pattern at ppos matches character c
+    let pattern: *u8 = ctx.pattern
+    let escape_char: u8 = *(pattern + ppos + 1)
+
+    if escape_char == 'd'  # 'd' - digit
+        return (c >= '0' and c <= '9') as i32  # '0'-'9'
+
+    if escape_char == 119  # 'w' - word char
+        if c >= '0' and c <= '9'  # '0'-'9'
+            return 1
+        if c >= 'A' and c <= 'Z'  # 'A'-'Z'
+            return 1
+        if c >= 'a' and c <= 'z'  # 'a'-'z'
+            return 1
+        if c == '_'  # '_'
+            return 1
+        return 0
+
+    if escape_char == 115  # 's' - whitespace
+        if c == ' ' or c == '\t' or c == '\n' or c == '\r'
+            return 1
+        return 0
+
+    # Literal escaped character
+    return (c == escape_char) as i32
+
+fn match_single(ctx: *MatchCtx, ppos: i64, c: u8) -> i32
+    # Check if pattern at ppos matches character c
+    let pattern: *u8 = ctx.pattern
+    let pc: u8 = *(pattern + ppos)
+
+    if pc == '.'  # '.' - any char except newline
+        return (c != '\n') as i32
+
+    if pc == '\\'  # '\' - escape
+        return match_escape(ctx, ppos, c)
+
+    # Literal character
+    return (pc == c) as i32
+
+fn pattern_len_at(ctx: *MatchCtx, ppos: i64) -> i64
+    # Returns length of pattern element at ppos
+    let pattern: *u8 = ctx.pattern
+    let pc: u8 = *(pattern + ppos)
+
+    if pc == '\\'  # '\' - escape is 2 chars
+        return 2
+
+    if pc == '['  # '[' - find matching ']'
+        var pos: i64 = ppos + 1
+        if pos < ctx.pattern_len and *(pattern + pos) == 94
+            pos += 1
+        while pos < ctx.pattern_len
+            if *(pattern + pos) == ']'
+                return pos - ppos + 1
+            pos += 1
+        return ctx.pattern_len - ppos
+
+    return 1
+
+fn try_match(ctx: *MatchCtx, tpos: i64, ppos: i64) -> i32
+    # Try to match text[tpos:] against pattern[ppos:]
+    let text: *u8 = ctx.text
+    let pattern: *u8 = ctx.pattern
+
+    # Success if pattern exhausted
+    if ppos >= ctx.pattern_len
+        return 1
+
+    let pc: u8 = *(pattern + ppos)
+
+    # Handle $ anchor
+    if pc == 36  # '$'
+        if tpos == ctx.text_len
+            return try_match(ctx, tpos, ppos + 1)
+        return 0
+
+    # Get element length and check for quantifier
+    let elem_len: i64 = pattern_len_at(ctx, ppos)
+    var has_quant: i32 = 0
+    var quant: u8 = 0
+    if ppos + elem_len < ctx.pattern_len
+        quant = *(pattern + ppos + elem_len)
+        if quant == '*' or quant == '+' or quant == 63  # * + ?
+            has_quant = 1
+
+    if has_quant != 0
+        let next_ppos: i64 = ppos + elem_len + 1
+
+        if quant == 63  # '?' - zero or one
+            # Try matching one
+            if tpos < ctx.text_len
+                var matched: i32 = 0
+                if pc == '['  # character class
+                    let result: i64 = match_char_class(ctx, ppos, *(text + tpos))
+                    matched = (result >= 0) as i32
+                else
+                    matched = match_single(ctx, ppos, *(text + tpos))
+
+                if matched != 0
+                    if try_match(ctx, tpos + 1, next_ppos) != 0
+                        return 1
+            # Try matching zero
+            return try_match(ctx, tpos, next_ppos)
+
+        if quant == '*'  # '*' - zero or more
+            # Try matching zero first (greedy would try more first)
+            if try_match(ctx, tpos, next_ppos) != 0
+                return 1
+
+            # Try matching one and recursing
+            if tpos < ctx.text_len
+                var matched: i32 = 0
+                if pc == '['
+                    let result: i64 = match_char_class(ctx, ppos, *(text + tpos))
+                    matched = (result >= 0) as i32
+                else
+                    matched = match_single(ctx, ppos, *(text + tpos))
+
+                if matched != 0
+                    return try_match(ctx, tpos + 1, ppos)  # Try more matches
+            return 0
+
+        if quant == '+'  # '+' - one or more
+            # Must match at least one
+            if tpos >= ctx.text_len
+                return 0
+
+            var matched: i32 = 0
+            if pc == '['
+                let result: i64 = match_char_class(ctx, ppos, *(text + tpos))
+                matched = (result >= 0) as i32
+            else
+                matched = match_single(ctx, ppos, *(text + tpos))
+
+            if matched == 0
+                return 0
+
+            # Matched one, now try * behavior for the rest
+            # Try matching zero more
+            if try_match(ctx, tpos + 1, next_ppos) != 0
+                return 1
+            # Try matching more
+            return try_match(ctx, tpos + 1, ppos)
+
+    # No quantifier - must match exactly one
+    if tpos >= ctx.text_len
+        return 0
+
+    let c: u8 = *(text + tpos)
+
+    if pc == '['  # character class
+        let result: i64 = match_char_class(ctx, ppos, c)
+        if result >= 0
+            return try_match(ctx, tpos + 1, result)
+        return 0
+
+    if match_single(ctx, ppos, c) != 0
+        return try_match(ctx, tpos + 1, ppos + elem_len)
+
+    return 0
+
+fn regex_match(pattern: *u8, text: *u8, text_len: i64) -> i32
+    # Returns 1 if pattern matches anywhere in text
+    var ctx: MatchCtx
+    ctx.text = text
+    ctx.text_len = text_len
+    ctx.pattern = pattern
+    ctx.pattern_len = strlen(pattern)
+
+    # Check for ^ anchor
+    var pstart: i64 = 0
+    var anchored: i32 = 0
+    if ctx.pattern_len > 0 and *pattern == 94  # '^'
+        anchored = 1
+        pstart = 1
+
+    if anchored != 0
+        # Must match at start
+        ctx.pattern += pstart
+        ctx.pattern_len = ctx.pattern_len - pstart
+        return try_match(&ctx, 0, 0)
+
+    # Try matching at each position
+    var pos: i64 = 0
+    ctx.pattern += pstart
+    ctx.pattern_len = ctx.pattern_len - pstart
+    while pos <= text_len
+        if try_match(&ctx, pos, 0) != 0
+            return 1
+        pos += 1
+
+    return 0
+
+# ============================================================================
+# Line processing
+# ============================================================================
+
+fn process_line(pattern: *u8, line: *u8, len: i64) -> i32
+    # Remove trailing newline for matching
+    var match_len: i64 = len
+    if match_len > 0 and *(line + match_len - 1) == '\n'
+        match_len -= 1
+    if match_len > 0 and *(line + match_len - 1) == '\r'
+        match_len -= 1
+
+    if regex_match(pattern, line, match_len) != 0
+        # Print matching line
+        sys_write(1, line, len)
+        return 1
+
+    return 0
+
+fn process_stream(pattern: *u8, fd: i32) -> i32
+    var buf: [4096]u8
+    var line_start: i64 = 0
+    var buf_len: i64 = 0
+    var matched: i32 = 0
+
+    while 1 == 1
+        # Read more data
+        let n: i64 = sys_read(fd, &buf[0] + buf_len, 4096 - buf_len)
+        if n < 0
+            return -1
+        if n == 0
+            # Process remaining data as last line
+            if buf_len > line_start
+                if process_line(pattern, &buf[0] + line_start, buf_len - line_start) != 0
+                    matched = 1
+            break
+
+        buf_len += n
+
+        # Process complete lines
+        var i: i64 = line_start
+        while i < buf_len
+            if buf[i] == '\n'  # newline
+                if process_line(pattern, &buf[0] + line_start, i - line_start + 1) != 0
+                    matched = 1
+                line_start = i + 1
+            i += 1
+
+        # Move remaining data to start of buffer
+        if line_start > 0
+            var j: i64 = 0
+            while line_start + j < buf_len
+                buf[j] = buf[line_start + j]
+                j += 1
+            buf_len -= line_start
+            line_start = 0
+
+    return matched
+
+# ============================================================================
+# Main
+# ============================================================================
+
+fn main(argc: i32, argv: **u8) -> i32
+    var argparser: ArgParser
+    args_init(&argparser, "regex", "Simple regex matcher")
+    args_positional(&argparser, "PATTERN", "Regular expression pattern", 1, 1)
+    args_positional(&argparser, "FILE", "File to search (stdin if omitted)", 0, 1)
+
+    if args_parse(&argparser, argc, argv) != 0
+        return 1
+
+    let pattern: *u8 = args_get_positional(&argparser, 0)
+
+    var result: i32 = 0
+
+    if argparser.positional_count > 1
+        let path: *u8 = args_get_positional(&argparser, 1)
+        let fd: i32 = sys_open(path, 0)
+        if fd < 0
+            eprints("regex: cannot open file: ")
+            eprints(path)
+            eprints("\n")
+            return 1
+        if process_stream(pattern, fd) != 0
+            result = 0
+        else
+            result = 1
+        sys_close(fd)
+    else
+        if process_stream(pattern, 0) != 0
+            result = 0
+        else
+            result = 1
+
+    return result

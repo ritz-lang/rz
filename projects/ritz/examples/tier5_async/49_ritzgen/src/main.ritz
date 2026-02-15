@@ -1,0 +1,313 @@
+# ritzgen - Ritz Parser Generator
+#
+# A combined lexer/parser generator with a flex/bison-style grammar DSL.
+# Generates recursive descent parsers for the Ritz language.
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+import ritzlib.args
+import ritzlib.gvec
+
+import tokens
+import ast
+import lexer
+import grammar
+import codegen
+import parser
+
+# =============================================================================
+# File testing
+# =============================================================================
+
+fn test_file(path: *u8, defs: *TokenDefs, verbose: i32) -> i32
+    # Read file
+    var buf: Vec<u8> = vec_new<u8>()
+    let fd: i32 = sys_open(path, 0)
+    if fd < 0
+        eprints("Cannot open: ")
+        eprints(path)
+        eprints("\n")
+        return -1
+
+    var chunk: [4096]u8
+    while 1 == 1
+        let n: i64 = sys_read(fd, &chunk[0], 4096)
+        if n <= 0
+            break
+        vec_push_bytes<u8>(&buf, &chunk[0], n)
+    sys_close(fd)
+
+    # Lex file
+    var lex: Lexer
+    lexer_init(&lex, buf.data, buf.len, defs)
+
+    var tok: Token
+    var error_count: i32 = 0
+    var token_count: i32 = 0
+
+    while 1 == 1
+        lexer_next(&lex, &tok)
+        token_count += 1
+
+        if verbose != 0
+            var name: [64]u8
+            get_token_name(defs, tok.kind, &name[0], 64)
+
+            # Print token info
+            print_int(tok.line as i64)
+            prints(":")
+            print_int(tok.col as i64)
+            prints(" ")
+            prints(&name[0])
+
+            if tok.len > 0 and tok.kind != TOK_NEWLINE
+                prints(" '")
+                sys_write(1, tok.start, tok.len as i64)
+                prints("'")
+            prints("\n")
+
+        if tok.kind == TOK_ERROR
+            error_count += 1
+            if verbose == 0
+                eprints(path)
+                eprints(":")
+                eprint_int(tok.line as i64)
+                eprints(":")
+                eprint_int(tok.col as i64)
+                eprints(": error: unexpected character '")
+                sys_write(2, tok.start, 1)
+                eprints("'\n")
+
+        if tok.kind == TOK_EOF
+            break
+
+    # buf is auto-dropped via Drop trait
+
+    if error_count == 0
+        if verbose == 0
+            prints(path)
+            prints(": OK (")
+            print_int(token_count as i64)
+            prints(" tokens)\n")
+        return 0
+    else
+        eprints(path)
+        eprints(": ")
+        eprint_int(error_count as i64)
+        eprints(" errors\n")
+        return error_count
+
+# =============================================================================
+# Main
+# =============================================================================
+
+fn main(argc: i32, argv: **u8) -> i32
+    var argparser: ArgParser
+    args_init(&argparser, "ritzgen", "Ritz Parser Generator")
+    args_flag(&argparser, 't', "test", "Test mode: lex files and report errors")
+    args_flag(&argparser, 'v', "verbose", "Verbose output (show all tokens)")
+    args_flag(&argparser, 'g', "generate", "Generate parser code")
+    args_flag(&argparser, 'l', "lexer", "Generate lexer setup code")
+    args_flag(&argparser, 'k', "tokens", "Generate token constants")
+    args_flag(&argparser, 'a', "ast", "Parse input and print AST")
+    args_option(&argparser, 'o', "output", "FILE", "Output file for generated code", "")
+    # Single positional def: GRAMMAR [INPUT...]
+    # First arg is grammar, rest are input files
+    args_positional(&argparser, "GRAMMAR [INPUT...]", "Grammar file and optional input files", 1, 100)
+
+    if args_parse(&argparser, argc, argv) != 0
+        return 1
+
+    let test_mode: i32 = args_get_flag(&argparser, 't')
+    let verbose: i32 = args_get_flag(&argparser, 'v')
+    let generate: i32 = args_get_flag(&argparser, 'g')
+    let gen_lexer: i32 = args_get_flag(&argparser, 'l')
+    let gen_tokens: i32 = args_get_flag(&argparser, 'k')
+    let ast_mode: i32 = args_get_flag(&argparser, 'a')
+
+    # Read grammar file
+    let grammar_path: *u8 = args_get_positional(&argparser, 0)
+
+    var grammar_buf: Vec<u8> = vec_new<u8>()
+    let gfd: i32 = sys_open(grammar_path, 0)
+    if gfd < 0
+        eprints("Cannot open grammar file: ")
+        eprints(grammar_path)
+        eprints("\n")
+        return 1
+
+    var chunk: [4096]u8
+    while 1 == 1
+        let n: i64 = sys_read(gfd, &chunk[0], 4096)
+        if n <= 0
+            break
+        vec_push_bytes<u8>(&grammar_buf, &chunk[0], n)
+    sys_close(gfd)
+
+    # Parse grammar
+    var gp: GrammarParser
+    gp_init(&gp, grammar_buf.data, grammar_buf.len)
+
+    var defs: TokenDefs
+    let parse_result: i32 = parse_grammar(&gp, &defs)
+    if parse_result < 0
+        eprints("Failed to parse grammar file\n")
+        # grammar_buf auto-dropped
+        return 1
+
+    eprints("Loaded ")
+    eprint_int(defs.count as i64)
+    eprints(" token definitions\n")
+
+    # Parse grammar rules if %grammar section present
+    var gram: Grammar
+    gram.rule_count = 0
+    if parse_result == 1
+        parse_grammar_rules(&gp, &gram)
+        eprints("Parsed ")
+        eprint_int(gram.rule_count as i64)
+        eprints(" grammar rules\n")
+        if verbose != 0
+            print_grammar(&gram)
+
+    # Generate token constants if requested
+    if gen_tokens != 0
+        var code: Vec<u8> = vec_new<u8>()
+        generate_tokens(&defs, &code)
+        sys_write(1, code.data, code.len)
+        # code and grammar_buf auto-dropped
+        return 0
+
+    # Generate lexer setup if requested
+    if gen_lexer != 0
+        var code: Vec<u8> = vec_new<u8>()
+        generate_lexer_setup(&defs, &code)
+        sys_write(1, code.data, code.len)
+        # code and grammar_buf auto-dropped
+        return 0
+
+    # Generate parser code if requested
+    if generate != 0 and gram.rule_count > 0
+        var code: Vec<u8> = vec_new<u8>()
+        generate_parser(&defs, &gram, &code)
+        sys_write(1, code.data, code.len)
+        # code and grammar_buf auto-dropped
+        return 0
+
+    # Special mode: 4 positional args = grammar + 3 output files
+    # Usage: ritzgen GRAMMAR TOKENS_OUT LEXER_OUT PARSER_OUT
+    if argparser.positional_count == 4 and gram.rule_count > 0
+        let tokens_path: *u8 = args_get_positional(&argparser, 1)
+        let lexer_path: *u8 = args_get_positional(&argparser, 2)
+        let parser_path: *u8 = args_get_positional(&argparser, 3)
+
+        # Generate and write tokens
+        var tokens_code: Vec<u8> = vec_new<u8>()
+        generate_tokens(&defs, &tokens_code)
+        # O_WRONLY | O_CREAT | O_TRUNC = 1 | 64 | 512 = 577
+        let tfd: i32 = sys_open3(tokens_path, 577, 420)  # 420 = 0644
+        if tfd >= 0
+            sys_write(tfd, tokens_code.data, tokens_code.len)
+            sys_close(tfd)
+            prints(tokens_path)
+            prints(": OK (")
+            print_int(tokens_code.len)
+            prints(" bytes)\n")
+        else
+            eprints("Cannot write: ")
+            eprints(tokens_path)
+            eprints("\n")
+            return 1
+
+        # Generate and write lexer setup
+        var lexer_code: Vec<u8> = vec_new<u8>()
+        generate_lexer_setup(&defs, &lexer_code)
+        let lfd: i32 = sys_open3(lexer_path, 577, 420)
+        if lfd >= 0
+            sys_write(lfd, lexer_code.data, lexer_code.len)
+            sys_close(lfd)
+            prints(lexer_path)
+            prints(": OK (")
+            print_int(lexer_code.len)
+            prints(" bytes)\n")
+        else
+            eprints("Cannot write: ")
+            eprints(lexer_path)
+            eprints("\n")
+            return 1
+
+        # Generate and write parser
+        var parser_code: Vec<u8> = vec_new<u8>()
+        generate_parser(&defs, &gram, &parser_code)
+        let pfd: i32 = sys_open3(parser_path, 577, 420)
+        if pfd >= 0
+            sys_write(pfd, parser_code.data, parser_code.len)
+            sys_close(pfd)
+            prints(parser_path)
+            prints(": OK (")
+            print_int(parser_code.len)
+            prints(" bytes)\n")
+        else
+            eprints("Cannot write: ")
+            eprints(parser_path)
+            eprints("\n")
+            return 1
+
+        return 0
+
+    # AST mode: parse input files and print AST
+    if ast_mode != 0 and argparser.positional_count > 1
+        var i: i32 = 1
+        var errors: i32 = 0
+        while i < argparser.positional_count
+            let input_path: *u8 = args_get_positional(&argparser, i)
+            let result: i32 = parse_file_ast(input_path, &defs, verbose)
+            if result != 0
+                errors += 1
+            i += 1
+        # grammar_buf auto-dropped
+        if errors > 0
+            return 1
+        return 0
+
+    # Process input files
+    if argparser.positional_count > 1
+        var i: i32 = 1
+        var errors: i32 = 0
+        while i < argparser.positional_count
+            let input_path: *u8 = args_get_positional(&argparser, i)
+            let result: i32 = test_file(input_path, &defs, verbose)
+            if result != 0
+                errors += 1
+            i += 1
+        # grammar_buf auto-dropped
+        if errors > 0
+            return 1
+        return 0
+
+    # No input files - just show loaded tokens
+    prints("\nToken definitions:\n")
+    var i: i32 = 0
+    while i < defs.count
+        let def: *TokenDef = &defs.defs[i]
+        prints("  ")
+        print_int(def.token_id as i64)
+        prints(": ")
+        prints(def.name)
+        prints(" = ")
+        if def.is_literal != 0
+            prints("\"")
+            prints(def.pattern)
+            prints("\"")
+        else
+            prints("/")
+            prints(def.pattern)
+            prints("/")
+        if def.is_skip != 0
+            prints(" (skip)")
+        prints("\n")
+        i += 1
+
+    # grammar_buf auto-dropped
+    return 0

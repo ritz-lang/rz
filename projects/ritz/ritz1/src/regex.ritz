@@ -1,0 +1,206 @@
+# ritz1/src/regex.ritz - Regex Pattern Parser
+#
+# Parses regex patterns and builds NFAs using Thompson's construction.
+# Supports: literals, character classes, quantifiers, alternation.
+#
+# NOTE: Grouping () is NOT supported in the bootstrap due to mutual recursion
+# requiring forward declarations. Build complex patterns programmatically instead.
+#
+# Grammar:
+#   regex   = concat ('|' concat)*
+#   concat  = repeat+
+#   repeat  = atom ('*' | '+' | '?')?
+#   atom    = char | '[' charclass ']' | '.'
+#   char    = literal | escape
+#   escape  = '\' anychar
+
+import nfa
+
+# Parse state
+# NOTE: Using i64 for all non-pointer fields to ensure 8-byte alignment for ritz1 self-hosting
+struct RegexParser
+  src: *u8
+  pos: i64
+  len: i64
+  nfa: *NFA
+
+fn regex_peek(p: *RegexParser) -> i32
+  if p.pos >= p.len
+    -1
+  else
+    (*(p.src + p.pos)) & 255
+
+fn regex_advance(p: *RegexParser) -> i32
+  let ch: i32 = regex_peek(p)
+  if ch >= 0
+    p.pos = p.pos + 1
+  ch
+
+fn regex_at_end(p: *RegexParser) -> i32
+  if p.pos >= p.len
+    1
+  else
+    0
+
+# Parse an escape sequence, returns the character
+fn regex_parse_escape(p: *RegexParser) -> i32
+  let ch: i32 = regex_advance(p)
+  if ch == 110   # n
+    return 10    # newline
+  if ch == 116   # t
+    return 9     # tab
+  if ch == 114   # r
+    return 13    # carriage return
+  if ch == 48    # 0
+    return 0     # null
+  # Otherwise return the literal character (for \*, \+, \[, etc.)
+  ch
+
+# Parse a single character or escape
+fn regex_parse_char(p: *RegexParser) -> i32
+  let ch: i32 = regex_peek(p)
+  if ch == 92    # backslash
+    regex_advance(p)
+    return regex_parse_escape(p)
+  regex_advance(p)
+  ch
+
+# Parse a character class [...]
+# Returns an NFAFragment matching the class
+fn regex_parse_class(p: *RegexParser) -> NFAFragment
+  # Skip opening [
+  regex_advance(p)
+
+  # Check for negation
+  var negated: i32 = 0
+  if regex_peek(p) == 94  # ^
+    negated = 1
+    regex_advance(p)
+
+  # Create alternation of all ranges/chars in the class
+  # For negated classes, we'll need to track what to exclude
+  var result: NFAFragment = NFAFragment { start: -1, end: -1 }
+  var first: i32 = 1
+  var excluded_char: i32 = 0  # For negation, track the excluded char
+
+  while regex_at_end(p) == 0 and regex_peek(p) != 93
+    let ch: i32 = regex_parse_char(p)
+
+    # If negated, just track the first excluded char (for single-char negation)
+    if negated == 1 and first == 1
+      excluded_char = ch
+
+    # Check for range
+    var frag: NFAFragment = NFAFragment { start: 0, end: 0 }
+    if regex_peek(p) == 45  # -
+      regex_advance(p)
+      if regex_peek(p) != 93
+        let hi: i32 = regex_parse_char(p)
+        frag = thompson_range(p.nfa, ch, hi)
+      else
+        # Trailing dash, treat as literal
+        frag = thompson_char(p.nfa, ch)
+        let dash: NFAFragment = thompson_char(p.nfa, 45)
+        frag = thompson_alt(p.nfa, frag, dash)
+    else
+      frag = thompson_char(p.nfa, ch)
+
+    # Only build normal result if not negated
+    if negated == 0
+      if first == 1
+        result = frag
+        first = 0
+      else
+        result = thompson_alt(p.nfa, result, frag)
+
+    first = 0
+
+  # Skip closing ]
+  if regex_peek(p) == 93
+    regex_advance(p)
+
+  # Handle negation: for [^x], create complement (everything except x)
+  # For simplicity, support only single-char negation for bootstrap
+  if negated == 1
+    # For [^x], match everything except x
+    # Create: [\x00-\x{x-1}] | [\x{x+1}-\xFF]
+    var before: NFAFragment = thompson_range(p.nfa, 0, excluded_char - 1)
+    var after: NFAFragment = thompson_range(p.nfa, excluded_char + 1, 255)
+    result = thompson_alt(p.nfa, before, after)
+
+  result
+
+# Parse an atom: char, charclass, or dot (no grouping in bootstrap)
+fn regex_parse_atom(p: *RegexParser) -> NFAFragment
+  let ch: i32 = regex_peek(p)
+
+  # Character class
+  if ch == 91    # [
+    return regex_parse_class(p)
+
+  # Match any character
+  if ch == 46    # .
+    regex_advance(p)
+    return thompson_any(p.nfa)
+
+  # Literal character (possibly escaped)
+  let c: i32 = regex_parse_char(p)
+  thompson_char(p.nfa, c)
+
+# Parse a repeated atom: atom ('*' | '+' | '?')?
+fn regex_parse_repeat(p: *RegexParser) -> NFAFragment
+  var atom: NFAFragment = regex_parse_atom(p)
+
+  let ch: i32 = regex_peek(p)
+  if ch == 42    # *
+    regex_advance(p)
+    return thompson_star(p.nfa, atom)
+  if ch == 43    # +
+    regex_advance(p)
+    return thompson_plus(p.nfa, atom)
+  if ch == 63    # ?
+    regex_advance(p)
+    return thompson_opt(p.nfa, atom)
+
+  atom
+
+# Parse concatenation: repeat+
+fn regex_parse_concat(p: *RegexParser) -> NFAFragment
+  var result: NFAFragment = regex_parse_repeat(p)
+
+  while regex_at_end(p) == 0
+    let ch: i32 = regex_peek(p)
+    # Stop at alternation or end of input
+    if ch == 124 or ch < 0
+      return result
+    let next: NFAFragment = regex_parse_repeat(p)
+    result = thompson_concat(p.nfa, result, next)
+
+  result
+
+# Parse alternation: concat ('|' concat)*
+fn regex_parse_alt(p: *RegexParser) -> NFAFragment
+  var result: NFAFragment = regex_parse_concat(p)
+
+  while regex_peek(p) == 124   # |
+    regex_advance(p)
+    let right: NFAFragment = regex_parse_concat(p)
+    result = thompson_alt(p.nfa, result, right)
+
+  result
+
+# Parse a complete regex pattern and return the NFA fragment
+fn regex_parse(src: *u8, len: i32, nfa: *NFA) -> NFAFragment
+  var parser: RegexParser = RegexParser { src: src, pos: 0, len: len, nfa: nfa }
+  regex_parse_alt(@parser)
+
+# Parse a literal string (unquoted) and return NFA fragment
+# The string is passed directly, not with surrounding quotes
+fn regex_parse_literal(src: *u8, len: i32, nfa: *NFA) -> NFAFragment
+  if len < 1
+    # Empty string - return single state that accepts immediately
+    let s0: i32 = nfa_add_state(nfa, 0, 0)
+    return NFAFragment { start: s0, end: s0 }
+
+  # Build NFA for the literal string (no quote skipping needed)
+  thompson_string(nfa, src, len)

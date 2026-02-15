@@ -1,0 +1,266 @@
+# cp - copy files and directories
+#
+# Usage: cp [OPTIONS] SOURCE DEST
+#        cp [OPTIONS] SOURCE... DIRECTORY
+#
+# Options:
+#   -r, -R    copy directories recursively
+#   -v        verbose: print files as they're copied
+#   -p        preserve mode, ownership, timestamps
+#   -n        do not overwrite existing files
+#
+# Examples:
+#   cp file.txt backup.txt       # copy file
+#   cp -r dir1/ dir2/            # copy directory
+#   cp file1 file2 dir/          # copy multiple files
+
+# ============================================================================
+# Standard library imports
+# ============================================================================
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+import ritzlib.fs
+import ritzlib.args
+
+# ============================================================================
+# Options
+# ============================================================================
+
+struct CpOptions
+    recursive: i32   # -r/-R
+    verbose: i32     # -v
+    preserve: i32    # -p
+    no_clobber: i32  # -n
+
+# ============================================================================
+# Copy functions
+# ============================================================================
+
+fn copy_file_data(src_fd: i32, dst_fd: i32) -> i32
+    var buf: [8192]u8
+
+    loop
+        let nread: i64 = sys_read(src_fd, &buf[0], 8192)
+        if nread < 0
+            return 1
+        if nread == 0
+            break
+
+        var written: i64 = 0
+        while written < nread
+            let n: i64 = sys_write(dst_fd, &buf[0] + written, nread - written)
+            if n < 0
+                return 1
+            written += n
+
+    return 0
+
+fn cp_copy_file(src: *u8, dst: *u8, opts: *CpOptions) -> i32
+    # Check if destination exists and -n is set
+    if opts.no_clobber != 0 and path_exists(dst) != 0
+        return 0  # Silently skip
+
+    # Get source mode for preserve
+    var src_mode: i32 = 420  # 0644 default
+    if opts.preserve != 0
+        var statbuf: [144]u8
+        if sys_lstat(src, &statbuf[0]) == 0
+            src_mode = stat_get_mode(&statbuf[0]) % 4096  # Lower 12 bits
+
+    # Open source
+    let src_fd: i32 = sys_open(src, O_RDONLY)
+    if src_fd < 0
+        eprints("cp: cannot open '")
+        eprints(src)
+        eprints("'\n")
+        return 1
+
+    # Open destination: O_WRONLY | O_CREAT | O_TRUNC = 577
+    let dst_fd: i32 = sys_open3(dst, 577, 420)  # mode 0644
+    if dst_fd < 0
+        sys_close(src_fd)
+        eprints("cp: cannot create '")
+        eprints(dst)
+        eprints("'\n")
+        return 1
+
+    # Copy data
+    let result: i32 = copy_file_data(src_fd, dst_fd)
+
+    # Preserve mode
+    if opts.preserve != 0 and result == 0
+        sys_fchmod(dst_fd, src_mode)
+
+    sys_close(src_fd)
+    sys_close(dst_fd)
+
+    if result != 0
+        eprints("cp: error copying '")
+        eprints(src)
+        eprints("'\n")
+        return 1
+
+    if opts.verbose != 0
+        prints("'")
+        prints(src)
+        prints("' -> '")
+        prints(dst)
+        prints("'\n")
+
+    return 0
+
+fn copy_dir(src: *u8, dst: *u8, opts: *CpOptions) -> i32
+    # Create destination directory
+    var src_mode: i32 = 493  # 0755 default
+    if opts.preserve != 0
+        var statbuf: [144]u8
+        if sys_lstat(src, &statbuf[0]) == 0
+            src_mode = stat_get_mode(&statbuf[0]) % 4096
+
+    if path_exists(dst) == 0
+        let r: i32 = sys_mkdir(dst, src_mode)
+        if r != 0
+            eprints("cp: cannot create directory '")
+            eprints(dst)
+            eprints("'\n")
+            return 1
+
+        if opts.verbose != 0
+            prints("'")
+            prints(src)
+            prints("' -> '")
+            prints(dst)
+            prints("'\n")
+
+    # Open source directory
+    let fd: i32 = sys_open(src, O_DIRECTORY)
+    if fd < 0
+        eprints("cp: cannot open directory '")
+        eprints(src)
+        eprints("'\n")
+        return 1
+
+    var result: i32 = 0
+    var buf: [8192]u8
+
+    loop
+        let nread: i64 = sys_getdents64(fd, &buf[0], 8192)
+        if nread <= 0
+            break
+
+        var pos: i64 = 0
+        while pos < nread
+            let entry: *u8 = &buf[0] + pos
+            let reclen: i32 = dirent_get_reclen(entry)
+            let name: *u8 = dirent_get_name(entry)
+
+            # Skip . and ..
+            if streq(name, ".") == 0 and streq(name, "..") == 0
+                var src_path: [4096]u8
+                var dst_path: [4096]u8
+                path_join(src, name, &src_path[0])
+                path_join(dst, name, &dst_path[0])
+
+                if is_directory(&src_path[0]) != 0
+                    let r: i32 = copy_dir(&src_path[0], &dst_path[0], opts)
+                    if r != 0
+                        result = 1
+                else
+                    let r: i32 = cp_copy_file(&src_path[0], &dst_path[0], opts)
+                    if r != 0
+                        result = 1
+
+            pos += reclen as i64
+
+    sys_close(fd)
+    return result
+
+fn copy_path(src: *u8, dst: *u8, opts: *CpOptions) -> i32
+    # Check if source exists
+    if path_exists(src) == 0
+        eprints("cp: cannot stat '")
+        eprints(src)
+        eprints("': No such file or directory\n")
+        return 1
+
+    # Check if source is a directory
+    if is_directory(src) != 0
+        if opts.recursive == 0
+            eprints("cp: -r not specified; omitting directory '")
+            eprints(src)
+            eprints("'\n")
+            return 1
+        return copy_dir(src, dst, opts)
+
+    return cp_copy_file(src, dst, opts)
+
+# ============================================================================
+# Main
+# ============================================================================
+
+fn main(argc: i32, argv: **u8) -> i32
+    # Initialize argument parser
+    var parser: ArgParser
+    args_init(&parser, "cp", "Copy files and directories")
+
+    # Define flags
+    args_flag(&parser, 'r', "recursive", "Copy directories recursively")
+    args_flag(&parser, 'R', null, "Copy directories recursively (same as -r)")
+    args_flag(&parser, 'v', "verbose", "Print files as they're copied")
+    args_flag(&parser, 'p', "preserve", "Preserve mode, ownership, timestamps")
+    args_flag(&parser, 'n', "no-clobber", "Do not overwrite existing files")
+
+    # Define positional: SOURCE... DEST (min=2, max=unlimited)
+    args_positional(&parser, "SOURCE... DEST", "Source files/directories and destination", 2, -1)
+
+    # Parse arguments
+    if args_parse(&parser, argc, argv) != 0
+        return 1
+
+    # Extract options
+    var opts: CpOptions
+    opts.recursive = args_get_flag(&parser, 'r') | args_get_flag(&parser, 'R')
+    opts.verbose = args_get_flag(&parser, 'v')
+    opts.preserve = args_get_flag(&parser, 'p')
+    opts.no_clobber = args_get_flag(&parser, 'n')
+
+    # Get positional arguments: last one is DEST, all others are SOURCEs
+    let num_args: i32 = parser.positional_count
+    let last_arg: *u8 = args_get_positional(&parser, num_args - 1)
+    let dst_is_dir: i32 = is_directory(last_arg)
+
+    # Multi-source case requires directory destination
+    if num_args > 2 and dst_is_dir == 0
+        eprints("cp: target '")
+        eprints(last_arg)
+        eprints("' is not a directory\n")
+        return 1
+
+    var result: i32 = 0
+
+    if num_args == 2
+        # cp source dest
+        let src: *u8 = args_get_positional(&parser, 0)
+        let dst: *u8 = args_get_positional(&parser, 1)
+
+        if dst_is_dir != 0
+            # Copy into directory
+            var dst_path: [4096]u8
+            path_join(dst, path_basename(src), &dst_path[0])
+            result = copy_path(src, &dst_path[0], &opts)
+        else
+            result = copy_path(src, dst, &opts)
+    else
+        # cp source... directory
+        for i in 0..(num_args - 1)
+            let src: *u8 = args_get_positional(&parser, i)
+            var dst_path: [4096]u8
+            path_join(last_arg, path_basename(src), &dst_path[0])
+
+            let r: i32 = copy_path(src, &dst_path[0], &opts)
+            if r != 0
+                result = 1
+
+    return result

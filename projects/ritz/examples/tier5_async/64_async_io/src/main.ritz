@@ -1,0 +1,263 @@
+# examples/64_async_io - TRUE async I/O with async/await keywords
+#
+# This example ACTUALLY uses:
+# - `async fn` keyword for async functions
+# - `await` keyword to suspend at I/O points
+# - Compiler-generated state machines (Future struct + poll fn)
+# - Executor's block_on() to drive futures to completion
+#
+# This is NOT hand-written state machines - the compiler does the work!
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.uring
+import ritzlib.executor
+
+# ============================================================================
+# Async I/O primitives that return Poll values
+# ============================================================================
+
+# These are the low-level poll functions that return:
+#   -1 (POLL_PENDING) = I/O not ready, need to wait
+#   >= 0 = Ready with result value
+
+# Synchronous wrapper to submit and wait for io_uring read
+fn poll_read(exec: *Executor, fd: i32, buf: *u8, len: i32) -> i32
+    # Submit read to io_uring
+    let result: i32 = exec_async_read(exec, fd, buf, len, 0)
+    return result
+
+# ============================================================================
+# Test 1: Simple async fn that doesn't do I/O
+# ============================================================================
+
+async fn compute_value(x: i32) -> i32
+    x * 2 + 1
+
+fn test_simple_async() -> i32
+    prints("test_simple_async... ")
+
+    # Create the future using compiler-generated constructor
+    var future: compute_value_Future = compute_value(10)
+
+    # Poll using compiler-generated poll function
+    let result: i32 = compute_value_poll(&future)
+
+    # -1 = Pending, >= 0 = Ready(value)
+    if result < 0
+        prints("FAIL: got Pending for compute\n")
+        return 1
+
+    # Expected: 10 * 2 + 1 = 21
+    if result != 21
+        prints("FAIL: expected 21, got ")
+        print_int(result as i64)
+        prints("\n")
+        return 1
+
+    prints("OK\n")
+    return 0
+
+# ============================================================================
+# Test 2: Async fn that awaits a poll function (returns i32 directly)
+# ============================================================================
+
+# This is a "poll function" - it returns the Poll encoding directly
+# -1 = Pending, >= 0 = Ready(value)
+fn double_poll_fn(x: i32) -> i32
+    # Always immediately ready with x * 2
+    x * 2
+
+async fn double_then_add(x: i32) -> i32
+    # await on a poll function (not async fn) - this works!
+    let doubled: i32 = await double_poll_fn(x)
+    doubled + 5
+
+fn test_chained_async() -> i32
+    prints("test_chained_async... ")
+
+    var future: double_then_add_Future = double_then_add(7)
+    let result: i32 = double_then_add_poll(&future)
+
+    # Expected: 7 * 2 + 5 = 19
+    if result != 19
+        prints("FAIL: expected 19, got ")
+        print_int(result as i64)
+        prints("\n")
+        return 1
+
+    prints("OK\n")
+    return 0
+
+# ============================================================================
+# Test 3: Use block_on with compiler-generated async function
+# ============================================================================
+
+# We need a poll wrapper that matches fn(*u8) -> i32 signature
+fn compute_value_poll_wrapper(future_ptr: *u8) -> i32
+    let future: *compute_value_Future = future_ptr as *compute_value_Future
+    return compute_value_poll(future)
+
+fn test_block_on_async() -> i32
+    prints("test_block_on_async... ")
+
+    var exec: Executor
+    let init_ret: i32 = executor_init(&exec)
+    if init_ret < 0
+        prints("FAIL: executor init\n")
+        return 1
+
+    # Create future
+    var future: compute_value_Future = compute_value(15)
+
+    # Run with block_on
+    let poll_fn: fn(*u8) -> i32 = compute_value_poll_wrapper
+    let result: i32 = block_on(&exec, &future as *u8, poll_fn)
+
+    executor_destroy(&exec)
+
+    # Expected: 15 * 2 + 1 = 31
+    if result != 31
+        prints("FAIL: expected 31, got ")
+        print_int(result as i64)
+        prints("\n")
+        return 1
+
+    prints("OK\n")
+    return 0
+
+# ============================================================================
+# Test 4: Async pipe read using await
+# ============================================================================
+
+# This struct holds the async read state
+struct AsyncReadState
+    exec: *Executor
+    fd: i32
+    buf: *u8
+    len: i32
+    result: i32
+
+# Poll function for async read - returns Poll encoding
+fn async_read_poll(state: *AsyncReadState) -> i32
+    let exec: *Executor = state.exec
+    let fd: i32 = state.fd
+    let buf: *u8 = state.buf
+    let len: i32 = state.len
+
+    # Check if we already have a result from io_uring completion
+    if exec.waker_io_result != 0
+        let res: i32 = exec.waker_io_result
+        exec.waker_io_result = 0
+        state.result = res
+        return res
+
+    # Submit async read to io_uring
+    let result: i32 = exec_async_read(exec, fd, buf, len, 0)
+    return result
+
+# Async function that reads from a file descriptor
+async fn async_read_fd(state: *AsyncReadState) -> i32
+    let result: i32 = await async_read_poll(state)
+    result
+
+# Poll wrapper for block_on
+fn async_read_fd_poll_wrapper(future_ptr: *u8) -> i32
+    let future: *async_read_fd_Future = future_ptr as *async_read_fd_Future
+    return async_read_fd_poll(future)
+
+fn test_async_pipe_read() -> i32
+    prints("test_async_pipe_read... ")
+
+    var exec: Executor
+    let init_ret: i32 = executor_init(&exec)
+    if init_ret < 0
+        prints("FAIL: executor init\n")
+        return 1
+
+    # Create pipe
+    var fds: [2]i32
+    let pipe_ret: i32 = sys_pipe(&fds[0])
+    if pipe_ret < 0
+        prints("FAIL: pipe\n")
+        executor_destroy(&exec)
+        return 1
+
+    let read_fd: i32 = fds[0]
+    let write_fd: i32 = fds[1]
+
+    # Write data to pipe
+    var write_buf: [8]u8
+    write_buf[0] = 65  # 'A'
+    write_buf[1] = 66  # 'B'
+    write_buf[2] = 67  # 'C'
+    write_buf[3] = 0
+    let written: i64 = sys_write(write_fd, &write_buf[0], 3)
+
+    # Set up read state
+    var read_buf: [16]u8
+    for i in 0..16
+        read_buf[i] = 0
+
+    var read_state: AsyncReadState
+    read_state.exec = &exec
+    read_state.fd = read_fd
+    read_state.buf = &read_buf[0]
+    read_state.len = 16
+    read_state.result = 0
+
+    # Create async future using async fn
+    var future: async_read_fd_Future = async_read_fd(&read_state)
+
+    # Run with block_on
+    let poll_fn: fn(*u8) -> i32 = async_read_fd_poll_wrapper
+    let result: i32 = block_on(&exec, &future as *u8, poll_fn)
+
+    # Cleanup
+    sys_close(read_fd)
+    sys_close(write_fd)
+    executor_destroy(&exec)
+
+    if result < 0
+        prints("FAIL: read error ")
+        print_int(result as i64)
+        prints("\n")
+        return 1
+
+    if result != 3
+        prints("FAIL: expected 3 bytes, got ")
+        print_int(result as i64)
+        prints("\n")
+        return 1
+
+    # Verify data
+    if read_buf[0] != 65
+        prints("FAIL: wrong data\n")
+        return 1
+
+    prints("OK\n")
+    return 0
+
+# ============================================================================
+# Main
+# ============================================================================
+
+fn main() -> i32
+    prints("=== True Async I/O Tests ===\n")
+    prints("Using async fn / await keywords with compiler-generated state machines\n\n")
+
+    var failures: i32 = 0
+
+    failures += test_simple_async()
+    failures += test_chained_async()
+    failures += test_block_on_async()
+    failures += test_async_pipe_read()
+
+    prints("\n")
+    if failures > 0
+        print_int(failures as i64)
+        prints(" test(s) FAILED\n")
+        return 1
+
+    prints("All true async I/O tests PASSED!\n")
+    return 0

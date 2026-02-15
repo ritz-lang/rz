@@ -1,0 +1,143 @@
+# sort - sort lines of text
+#
+# Usage: sort [FILE...]
+#   If no files given, reads stdin
+#   Sorts lines lexicographically (byte-wise, like LC_ALL=C)
+#
+# This example exercises:
+#   - Vec<u8> and Vec<LineBounds> from ritzlib
+#   - Byte-wise string comparison
+#   - Quicksort algorithm
+#
+# Note: UTF-8 strings compare correctly for ASCII. Full Unicode collation
+# would require ICU or similar - overkill for a basic sort.
+
+# ============================================================================
+# Standard library imports
+# ============================================================================
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.gvec
+
+# ============================================================================
+# String comparison (byte-wise, like strcmp)
+# ============================================================================
+
+fn line_compare(buf: @Vec<u8>, a: *LineBounds, b: *LineBounds) -> i32
+    # Compare two lines byte-by-byte
+    # Returns: <0 if a < b, 0 if a == b, >0 if a > b
+    let a_ptr: *u8 = buf.data + a.start
+    let b_ptr: *u8 = buf.data + b.start
+    let a_len: i64 = a.length
+    let b_len: i64 = b.length
+
+    # Compare up to the shorter length
+    var min_len: i64 = a_len
+    if b_len < min_len
+        min_len = b_len
+
+    var i: i64 = 0
+    while i < min_len
+        let a_byte: i32 = (*(a_ptr + i)) as i32
+        let b_byte: i32 = (*(b_ptr + i)) as i32
+        if a_byte < b_byte
+            return -1
+        if a_byte > b_byte
+            return 1
+        i += 1
+
+    # If all compared bytes are equal, shorter string comes first
+    if a_len < b_len
+        return -1
+    if a_len > b_len
+        return 1
+    return 0
+
+# ============================================================================
+# Quicksort implementation
+# ============================================================================
+
+fn partition(buf: @Vec<u8>, v: @&Vec<LineBounds>, low: i64, high: i64) -> i64
+    # Use middle element as pivot to avoid worst case on sorted input
+    let mid: i64 = low + (high - low) / 2
+    v.swap(mid, high)
+
+    let pivot: *LineBounds = v.data + high
+    var i: i64 = low - 1
+
+    var j: i64 = low
+    while j < high
+        let current: *LineBounds = v.data + j
+        if line_compare(buf, current, pivot) <= 0
+            i += 1
+            v.swap(i, j)
+        j += 1
+
+    v.swap(i + 1, high)
+    return i + 1
+
+fn quicksort(buf: @Vec<u8>, v: @&Vec<LineBounds>, low: i64, high: i64)
+    if low < high
+        let p: i64 = partition(buf, v, low, high)
+        quicksort(buf, v, low, p - 1)
+        quicksort(buf, v, p + 1, high)
+
+fn sort_lines(buf: @Vec<u8>, v: @&Vec<LineBounds>)
+    if v.len > 1
+        quicksort(buf, v, 0, v.len - 1)
+
+# ============================================================================
+# Output
+# ============================================================================
+
+fn print_lines(buf: @Vec<u8>, lines: @Vec<LineBounds>)
+    var i: i64 = 0
+    while i < lines.len
+        let bounds: *LineBounds = lines.data + i
+        sys_write(STDOUT, buf.data + bounds.start, bounds.length)
+        i += 1
+
+# ============================================================================
+# Main
+# ============================================================================
+
+fn sort_fd(fd: i32) -> i32
+    var buf: Vec<u8> = vec_with_cap<u8>(4096)
+    var lines: Vec<LineBounds> = vec_with_cap<LineBounds>(64)
+
+    let result: i64 = vec_read_all_fd(fd, &buf)
+    if result < 0
+        return 1
+
+    vec_find_lines(&buf, &lines)
+    sort_lines(&buf, &lines)
+    print_lines(&buf, &lines)
+
+    return 0
+
+fn sort_file(path: *u8) -> i32
+    let fd: i32 = sys_open(path, O_RDONLY)
+    if fd < 0
+        sys_write(STDERR, "sort: cannot open file\n" as *u8, 23)
+        return 1
+
+    let result: i32 = sort_fd(fd)
+    sys_close(fd)
+    return result
+
+fn main(argc: i32, argv: **u8) -> i32
+    if argc < 2
+        return sort_fd(STDIN)
+
+    var exit_code: i32 = 0
+    var i: i32 = 1
+
+    while i < argc
+        let path: *u8 = *(argv + i)
+        let result: i32 = sort_file(path)
+        if result != 0
+            exit_code = result
+        i += 1
+
+    return exit_code

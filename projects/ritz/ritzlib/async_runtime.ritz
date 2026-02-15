@@ -1,0 +1,187 @@
+# ritzlib/async_runtime.ritz - io_uring-backed async runtime
+#
+# This module provides the actual async runtime that drives futures using
+# io_uring for high-performance non-blocking I/O.
+#
+# Key components:
+#   - Runtime: Holds io_uring instance and manages I/O operations
+#   - block_on: Runs a future to completion
+#
+# Usage:
+#   fn main() -> i32
+#       var rt: Runtime
+#       if runtime_init(@rt) < 0
+#           return 1
+#       let result: i32 = block_on_i32(@rt, my_async_fn())
+#       runtime_destroy(@rt)
+#       result
+
+import ritzlib.sys
+import ritzlib.uring
+
+# ============================================================================
+# Runtime - the async I/O runtime
+# ============================================================================
+
+# Runtime holds the io_uring instance and coordinates async operations.
+# Only one runtime should be active at a time per thread.
+struct Runtime
+    # The io_uring instance
+    ring: IoUring
+    # Is the runtime initialized?
+    initialized: i32
+    # Global user_data counter for tracking operations
+    next_user_data: i64
+
+# Initialize the runtime with an io_uring instance
+# Returns 0 on success, negative error code on failure
+pub fn runtime_init(rt: *Runtime) -> i32
+    rt.initialized = 0
+    rt.next_user_data = 1
+
+    # Initialize io_uring with 256 entries (good default)
+    let ret: i32 = uring_init(@rt.ring, 256)
+    if ret < 0
+        return ret
+
+    rt.initialized = 1
+    return 0
+
+# Destroy the runtime, cleaning up io_uring resources
+pub fn runtime_destroy(rt: *Runtime)
+    if rt.initialized != 0
+        uring_destroy(@rt.ring)
+        rt.initialized = 0
+
+# ============================================================================
+# I/O Operations - submit to io_uring and get result
+# ============================================================================
+
+# Submit a read operation and wait for completion
+# This is a blocking call - it submits to io_uring and waits for the result
+pub fn runtime_read(rt: *Runtime, fd: i32, buf: *u8, count: i32, offset: i64) -> i64
+    let user_data: i64 = rt.next_user_data
+    rt.next_user_data = rt.next_user_data + 1
+
+    # Get an SQE
+    let sqe: *IoUringSqe = uring_get_sqe(@rt.ring)
+    if sqe == (null)
+        return -12  # ENOMEM
+
+    # Prepare the read
+    uring_prep_read(sqe, fd, buf, count, offset, user_data)
+    uring_sqe_submit(@rt.ring)
+
+    # Submit and wait for completion
+    let ret: i32 = uring_submit_and_wait(@rt.ring, 1)
+    if ret < 0
+        return ret as i64
+
+    # Get the completion
+    let cqe: *IoUringCqe = uring_peek_cqe(@rt.ring)
+    if cqe == (null)
+        return -5  # EIO
+
+    let result: i64 = cqe.res as i64
+    uring_cqe_seen(@rt.ring, cqe)
+
+    return result
+
+# Submit a write operation and wait for completion
+pub fn runtime_write(rt: *Runtime, fd: i32, buf: *u8, count: i32, offset: i64) -> i64
+    let user_data: i64 = rt.next_user_data
+    rt.next_user_data = rt.next_user_data + 1
+
+    let sqe: *IoUringSqe = uring_get_sqe(@rt.ring)
+    if sqe == (null)
+        return -12  # ENOMEM
+
+    uring_prep_write(sqe, fd, buf, count, offset, user_data)
+    uring_sqe_submit(@rt.ring)
+
+    let ret: i32 = uring_submit_and_wait(@rt.ring, 1)
+    if ret < 0
+        return ret as i64
+
+    let cqe: *IoUringCqe = uring_peek_cqe(@rt.ring)
+    if cqe == (null)
+        return -5  # EIO
+
+    let result: i64 = cqe.res as i64
+    uring_cqe_seen(@rt.ring, cqe)
+
+    return result
+
+# Submit a close operation and wait for completion
+pub fn runtime_close(rt: *Runtime, fd: i32) -> i32
+    let user_data: i64 = rt.next_user_data
+    rt.next_user_data = rt.next_user_data + 1
+
+    let sqe: *IoUringSqe = uring_get_sqe(@rt.ring)
+    if sqe == (null)
+        return -12  # ENOMEM
+
+    uring_prep_close(sqe, fd, user_data)
+    uring_sqe_submit(@rt.ring)
+
+    let ret: i32 = uring_submit_and_wait(@rt.ring, 1)
+    if ret < 0
+        return ret
+
+    let cqe: *IoUringCqe = uring_peek_cqe(@rt.ring)
+    if cqe == (null)
+        return -5  # EIO
+
+    let result: i32 = cqe.res
+    uring_cqe_seen(@rt.ring, cqe)
+
+    return result
+
+# ============================================================================
+# Block On - run a future to completion
+# ============================================================================
+
+# block_on runs a future to completion, blocking the current thread.
+#
+# For MVP, since our futures run synchronously, block_on just calls
+# the poll function once and returns the result.
+#
+# Full implementation would:
+# 1. Poll the future
+# 2. If Pending, wait on io_uring for completions
+# 3. Match completions to tasks via user_data
+# 4. Re-poll ready tasks
+# 5. Repeat until all tasks complete
+
+# block_on for i32 result
+# Takes a pointer to a future struct and its poll function
+pub fn block_on_i32(rt: *Runtime, future_ptr: *u8, poll_fn: fn(*u8) -> i32) -> i32
+    # For MVP: just call poll once (synchronous execution)
+    # Full async would loop, checking io_uring between polls
+    poll_fn(future_ptr)
+
+# block_on for i64 result
+pub fn block_on_i64(rt: *Runtime, future_ptr: *u8, poll_fn: fn(*u8) -> i64) -> i64
+    poll_fn(future_ptr)
+
+# ============================================================================
+# Global Runtime (for convenience)
+# ============================================================================
+
+# Global runtime instance - initialized lazily
+var g_runtime: Runtime
+var g_runtime_initialized: i32 = 0
+
+# Get or initialize the global runtime
+pub fn get_runtime() -> *Runtime
+    if g_runtime_initialized == 0
+        let ret: i32 = runtime_init(@g_runtime)
+        if ret >= 0
+            g_runtime_initialized = 1
+    return @g_runtime
+
+# Clean up the global runtime (call at program exit)
+pub fn cleanup_runtime()
+    if g_runtime_initialized != 0
+        runtime_destroy(@g_runtime)
+        g_runtime_initialized = 0

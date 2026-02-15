@@ -1,0 +1,169 @@
+# ritzlib/lang/tokens.ritz - Core Token Infrastructure
+#
+# Generic token infrastructure for building lexers and parsers.
+# Language-specific token definitions (like TOK_FN, TOK_STRUCT) should
+# be defined in the consuming project's tokens module.
+
+import ritzlib.sys
+import ritzlib.io
+
+# =============================================================================
+# Core Token Constants
+# =============================================================================
+
+# Reserved token IDs (0-99) for system use
+const TOK_EOF: i32 = 0
+const TOK_ERROR: i32 = 1
+const TOK_NEWLINE: i32 = 2
+const TOK_INDENT: i32 = 3
+const TOK_DEDENT: i32 = 4
+const TOK_SKIP: i32 = 5     # Whitespace, comments - skipped during lexing
+
+# Generic literal types (10-19)
+const TOK_IDENT: i32 = 10
+const TOK_NUMBER: i32 = 11
+const TOK_STRING: i32 = 12
+const TOK_CHAR: i32 = 13
+const TOK_HEX: i32 = 14     # 0x... hex literal
+
+# User-defined tokens should start at 100+
+
+# =============================================================================
+# Token Structure
+# =============================================================================
+
+struct Token
+    kind: i32       # Token type (TOK_* constant)
+    start: *u8      # Pointer to start of token in source
+    len: i32        # Length of token text
+    line: i32       # Line number (1-based)
+    col: i32        # Column number (1-based)
+
+# Helper to create a token
+fn token_new(kind: i32, start: *u8, len: i32, line: i32, col: i32) -> Token
+    return Token {
+        kind: kind,
+        start: start,
+        len: len,
+        line: line,
+        col: col
+    }
+
+# Print token info for debugging
+fn token_print(tok: *Token) -> i32
+    print_int(tok.line as i64)
+    prints(":")
+    print_int(tok.col as i64)
+    prints(" kind=")
+    print_int(tok.kind as i64)
+    if tok.len > 0
+        prints(" '")
+        sys_write(1, tok.start, tok.len as i64)
+        prints("'")
+    prints("\n")
+    return 0
+
+# =============================================================================
+# Token Definition (for grammar-driven lexers)
+# =============================================================================
+
+const MAX_TOKEN_DEFS: i32 = 128
+const MAX_PATTERN_LEN: i32 = 128
+const MAX_TOKEN_NAME_LEN: i32 = 32
+
+struct TokenDef
+    token_id: i32
+    name: [32]u8        # Token name (e.g., "FN", "IDENT")
+    pattern: [128]u8    # Pattern (literal or regex)
+    is_literal: i32     # 1 = literal match, 0 = regex pattern
+    is_skip: i32        # 1 = skip token (whitespace, comments)
+
+struct TokenDefs
+    defs: [128]TokenDef
+    count: i32
+
+fn tokendefs_new() -> TokenDefs
+    return TokenDefs {
+        defs: [TokenDef {
+            token_id: 0,
+            name: [0; 32],
+            pattern: [0; 128],
+            is_literal: 0,
+            is_skip: 0
+        }; 128],
+        count: 0
+    }
+
+# Add a token definition
+fn tokendefs_add(defs: *TokenDefs, id: i32, name: *u8, pattern: *u8, is_literal: i32, is_skip: i32) -> i32
+    if defs.count >= MAX_TOKEN_DEFS
+        return 0 - 1
+
+    let def: *TokenDef = @defs.defs[defs.count]
+    def.token_id = id
+    def.is_literal = is_literal
+    def.is_skip = is_skip
+
+    # Copy name
+    var i: i32 = 0
+    for j in 0..MAX_TOKEN_NAME_LEN - 1
+        let c: u8 = *(name + j)
+        if c == 0
+            break
+        def.name[j] = c
+        i = j + 1
+    def.name[i] = 0
+
+    # Copy pattern
+    i = 0
+    for j in 0..MAX_PATTERN_LEN - 1
+        let c: u8 = *(pattern + j)
+        if c == 0
+            break
+        def.pattern[j] = c
+        i = j + 1
+    def.pattern[i] = 0
+
+    defs.count = defs.count + 1
+    return 0
+
+# Find token definition by name
+fn tokendefs_find_by_name(defs: *TokenDefs, name: *u8) -> i32
+    for i in 0..defs.count
+        let def: *TokenDef = @defs.defs[i]
+        # Compare names
+        var is_match: i32 = 1
+        for j in 0..MAX_TOKEN_NAME_LEN - 1
+            let c1: u8 = def.name[j]
+            let c2: u8 = *(name + j)
+            if c1 != c2
+                is_match = 0
+                break
+            if c1 == 0
+                break
+        if is_match != 0
+            return def.token_id
+    return -1
+
+# Get token name by ID
+fn tokendefs_get_name(defs: *TokenDefs, id: i32, out: *u8, out_len: i32) -> i32
+    for i in 0..defs.count
+        let def: *TokenDef = @defs.defs[i]
+        if def.token_id == id
+            var end: i32 = 0
+            let limit: i32 = out_len - 1
+            for j in 0..limit
+                if j >= MAX_TOKEN_NAME_LEN
+                    break
+                let c: u8 = def.name[j]
+                if c == 0
+                    break
+                *(out + j) = c
+                end = j + 1
+            *(out + end) = 0
+            return 0
+
+    # Not found - return numeric ID
+    *(out) = 63  # '?'
+    *(out + 1) = 0
+    return 0 - 1

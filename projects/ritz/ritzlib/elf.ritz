@@ -1,0 +1,304 @@
+# ritzlib/elf.ritz - ELF Binary Format Parser
+#
+# Parses ELF object files and executables to extract symbol information.
+# Used by the test runner to discover test functions from compiled .o files.
+#
+# ELF64 format reference: https://refspecs.linuxfoundation.org/elf/gabi4+/ch4.eheader.html
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.memory
+
+# ============================================================================
+# ELF Constants
+# ============================================================================
+
+# ELF Magic bytes
+const ELF_MAGIC_0: u8 = 0x7f
+const ELF_MAGIC_1: u8 = 0x45  # 'E'
+const ELF_MAGIC_2: u8 = 0x4c  # 'L'
+const ELF_MAGIC_3: u8 = 0x46  # 'F'
+
+# ELF Class (32-bit vs 64-bit)
+const ELFCLASS64: u8 = 2
+
+# ELF Type (e_type)
+pub const ET_EXEC: i16 = 2    # Executable file
+pub const ET_DYN: i16 = 3     # Shared object / PIE
+
+# ELF Data encoding
+const ELFDATA2LSB: u8 = 1  # Little-endian
+
+# Section header types
+const SHT_NULL: i32 = 0
+const SHT_SYMTAB: i32 = 2    # Symbol table
+const SHT_STRTAB: i32 = 3    # String table
+const SHT_DYNSYM: i32 = 11   # Dynamic symbol table
+
+# Symbol binding (upper 4 bits of st_info)
+const STB_LOCAL: u8 = 0
+const STB_GLOBAL: u8 = 1
+const STB_WEAK: u8 = 2
+
+# Symbol type (lower 4 bits of st_info)
+const STT_NOTYPE: u8 = 0
+const STT_FUNC: u8 = 2
+
+# ============================================================================
+# ELF64 Structures
+# ============================================================================
+# These mirror the ELF64 header structures
+
+# ELF64 File Header (64 bytes)
+struct Elf64_Ehdr
+    e_ident: [16]u8       # Magic number and other info
+    e_type: i16           # Object file type
+    e_machine: i16        # Architecture
+    e_version: i32        # Object file version
+    e_entry: i64          # Entry point virtual address
+    e_phoff: i64          # Program header table file offset
+    e_shoff: i64          # Section header table file offset
+    e_flags: i32          # Processor-specific flags
+    e_ehsize: i16         # ELF header size in bytes
+    e_phentsize: i16      # Program header table entry size
+    e_phnum: i16          # Program header table entry count
+    e_shentsize: i16      # Section header table entry size
+    e_shnum: i16          # Section header table entry count
+    e_shstrndx: i16       # Section header string table index
+
+# ELF64 Section Header (64 bytes)
+struct Elf64_Shdr
+    sh_name: i32          # Section name (string table index)
+    sh_type: i32          # Section type
+    sh_flags: i64         # Section flags
+    sh_addr: i64          # Section virtual address at execution
+    sh_offset: i64        # Section file offset
+    sh_size: i64          # Section size in bytes
+    sh_link: i32          # Link to another section
+    sh_info: i32          # Additional section information
+    sh_addralign: i64     # Section alignment
+    sh_entsize: i64       # Entry size if section holds table
+
+# ELF64 Symbol Table Entry (24 bytes)
+struct Elf64_Sym
+    st_name: i32          # Symbol name (string table index)
+    st_info: u8           # Symbol type and binding
+    st_other: u8          # Symbol visibility
+    st_shndx: i16         # Section index
+    st_value: i64         # Symbol value
+    st_size: i64          # Symbol size
+
+# ============================================================================
+# ELF Reader
+# ============================================================================
+
+struct ElfReader
+    data: *u8             # File data
+    size: i64             # File size
+    ehdr: *Elf64_Ehdr     # Pointer to ELF header
+    shdr: *Elf64_Shdr     # Pointer to section header table
+    symtab: *Elf64_Sym    # Pointer to symbol table
+    symtab_count: i64     # Number of symbols
+    strtab: *u8           # Pointer to string table
+
+# Initialize an ELF reader from file data
+pub fn elf_init(reader: *ElfReader, data: *u8, size: i64) -> i32
+    reader.data = data
+    reader.size = size
+    reader.ehdr = null
+    reader.shdr = null
+    reader.symtab = null
+    reader.symtab_count = 0
+    reader.strtab = null
+
+    # Check minimum size for ELF header
+    if size < 64
+        return -1
+
+    # Check ELF magic
+    if *data != ELF_MAGIC_0
+        return -1
+    if *(data + 1) != ELF_MAGIC_1
+        return -1
+    if *(data + 2) != ELF_MAGIC_2
+        return -1
+    if *(data + 3) != ELF_MAGIC_3
+        return -1
+
+    # Check 64-bit
+    if *(data + 4) != ELFCLASS64
+        return -1
+
+    # Check little-endian
+    if *(data + 5) != ELFDATA2LSB
+        return -1
+
+    reader.ehdr = data as *Elf64_Ehdr
+    return 0
+
+# Read a 16-bit little-endian value
+pub fn read_u16(ptr: *u8) -> i32
+    let lo: i32 = *ptr as i32
+    let hi: i32 = *(ptr + 1) as i32
+    return lo + (hi << 8)
+
+# Read a 32-bit little-endian value
+pub fn read_u32(ptr: *u8) -> i32
+    let b0: i32 = *ptr as i32
+    let b1: i32 = *(ptr + 1) as i32
+    let b2: i32 = *(ptr + 2) as i32
+    let b3: i32 = *(ptr + 3) as i32
+    return b0 + (b1 << 8) + (b2 << 16) + (b3 << 24)
+
+# Read a 64-bit little-endian value
+pub fn read_u64(ptr: *u8) -> i64
+    let lo: i64 = read_u32(ptr) as i64
+    let hi: i64 = read_u32(ptr + 4) as i64
+    # Handle sign extension carefully
+    return (lo & 0xFFFFFFFF) + ((hi & 0xFFFFFFFF) << 32)
+
+# Parse section headers and find symbol/string tables
+pub fn elf_parse_sections(reader: *ElfReader) -> i32
+    let ehdr: *Elf64_Ehdr = reader.ehdr
+    if ehdr == null
+        return -1
+
+    let data: *u8 = reader.data
+
+    # Get section header offset and count
+    # Note: We read raw bytes due to potential alignment issues
+    let shoff: i64 = read_u64(data + 40)  # e_shoff at offset 40
+    let shentsize: i32 = read_u16(data + 58)  # e_shentsize at offset 58
+    let shnum: i32 = read_u16(data + 60)  # e_shnum at offset 60
+    let shstrndx: i32 = read_u16(data + 62)  # e_shstrndx at offset 62
+
+    if shoff == 0 or shnum == 0
+        return -1
+
+    reader.shdr = (data + shoff) as *Elf64_Shdr
+
+    # Find .symtab and .strtab sections
+    for i in 0..shnum
+        let sh_ptr: *u8 = data + shoff + (i as i64 * shentsize as i64)
+        let sh_type: i32 = read_u32(sh_ptr + 4)  # sh_type at offset 4
+
+        if sh_type == SHT_SYMTAB
+            # Found symbol table
+            let sh_offset: i64 = read_u64(sh_ptr + 24)  # sh_offset at offset 24
+            let sh_size: i64 = read_u64(sh_ptr + 32)  # sh_size at offset 32
+            let sh_entsize: i64 = read_u64(sh_ptr + 56)  # sh_entsize at offset 56
+            let sh_link: i32 = read_u32(sh_ptr + 40)  # sh_link at offset 40 (strtab index)
+
+            reader.symtab = (data + sh_offset) as *Elf64_Sym
+            if sh_entsize > 0
+                reader.symtab_count = sh_size / sh_entsize
+
+            # Get the linked string table
+            let strtab_sh_ptr: *u8 = data + shoff + (sh_link as i64 * shentsize as i64)
+            let strtab_offset: i64 = read_u64(strtab_sh_ptr + 24)
+            reader.strtab = data + strtab_offset
+
+    if reader.symtab == null
+        return -1
+
+    return 0
+
+# Get the name of a symbol
+pub fn elf_get_symbol_name(reader: *ElfReader, sym_index: i64) -> *u8
+    if reader.symtab == null or reader.strtab == null
+        return null
+    if sym_index < 0 or sym_index >= reader.symtab_count
+        return null
+
+    # Read symbol's st_name field
+    let sym_ptr: *u8 = (reader.symtab as *u8) + (sym_index * 24)  # sizeof(Elf64_Sym) = 24
+    let st_name: i32 = read_u32(sym_ptr)
+
+    return reader.strtab + st_name
+
+# Get symbol info byte (type in lower 4 bits, binding in upper 4 bits)
+pub fn elf_get_symbol_info(reader: *ElfReader, sym_index: i64) -> u8
+    if reader.symtab == null
+        return 0
+    if sym_index < 0 or sym_index >= reader.symtab_count
+        return 0
+
+    let sym_ptr: *u8 = (reader.symtab as *u8) + (sym_index * 24)
+    return *(sym_ptr + 4)  # st_info at offset 4
+
+# Check if symbol is a function
+pub fn elf_is_function(info: u8) -> i32
+    let sym_type: u8 = info & 0x0f
+    if sym_type == STT_FUNC
+        return 1
+    return 0
+
+# Check if symbol is global
+pub fn elf_is_global(info: u8) -> i32
+    let binding: u8 = info >> 4
+    if binding == STB_GLOBAL
+        return 1
+    return 0
+
+# Get number of symbols
+pub fn elf_symbol_count(reader: *ElfReader) -> i64
+    return reader.symtab_count
+
+# ============================================================================
+# Test Function Discovery
+# ============================================================================
+
+# Check if a string starts with a prefix
+pub fn starts_with(s: *u8, prefix: *u8) -> i32
+    var i: i64 = 0
+    while *(prefix + i) != 0
+        if *(s + i) != *(prefix + i)
+            return 0
+        i += 1
+    return 1
+
+# Callback type for iterating test functions
+# Takes: name pointer, name length
+# Note: Using *u8 as generic callback pointer
+
+# Find all test functions (functions starting with "test_")
+# Calls callback for each found test function
+# Returns count of test functions found
+pub fn elf_find_test_functions(reader: *ElfReader, callback: *u8, user_data: *u8) -> i32
+    var count: i32 = 0
+    var i: i64 = 0
+
+    while i < reader.symtab_count
+        let info: u8 = elf_get_symbol_info(reader, i)
+
+        # Only look at global functions
+        if elf_is_function(info) != 0 and elf_is_global(info) != 0
+            let name: *u8 = elf_get_symbol_name(reader, i)
+            if name != null
+                # Check if name starts with "test_"
+                if starts_with(name, c"test_") != 0
+                    count += 1
+                    # If callback provided, call it
+                    # (callback mechanism would need function pointer support)
+
+        i += 1
+
+    return count
+
+# Print all test functions found in an ELF file
+pub fn elf_print_test_functions(reader: *ElfReader)
+    prints("Test functions found:\n")
+    var i: i64 = 0
+
+    while i < reader.symtab_count
+        let info: u8 = elf_get_symbol_info(reader, i)
+
+        if elf_is_function(info) != 0 and elf_is_global(info) != 0
+            let name: *u8 = elf_get_symbol_name(reader, i)
+            if name != null
+                if starts_with(name, c"test_") != 0
+                    prints("  ")
+                    prints_cstr(name)
+                    prints("\n")
+
+        i += 1

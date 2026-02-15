@@ -1,0 +1,193 @@
+# rm - remove files or directories
+#
+# Usage: rm [OPTIONS] FILE...
+#   Remove FILE(s).
+#
+# Options:
+#   -r, -R    remove directories and their contents recursively
+#   -f        ignore nonexistent files, never prompt
+#   -d        remove empty directories
+#   -v        verbose: print each file as it's removed
+#
+# Examples:
+#   rm file.txt           # remove file
+#   rm -rf dir/           # remove directory recursively
+#   rm -v a b c           # remove with verbose output
+
+# ============================================================================
+# Standard library imports
+# ============================================================================
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+import ritzlib.fs
+import ritzlib.args
+
+# ============================================================================
+# Options
+# ============================================================================
+
+struct RmOptions
+    recursive: i32   # -r/-R
+    force: i32       # -f
+    dir: i32         # -d (remove empty directories)
+    verbose: i32     # -v
+
+# ============================================================================
+# Removal functions
+# ============================================================================
+
+fn remove_file(path: *u8, opts: *RmOptions) -> i32
+    let result: i32 = sys_unlink(path)
+    if result != 0
+        if opts.force == 0
+            eprints("rm: cannot remove '")
+            eprints(path)
+            eprints("'\n")
+        return result
+
+    if opts.verbose != 0
+        prints("removed '")
+        prints(path)
+        prints("'\n")
+
+    return 0
+
+fn remove_dir_recursive(path: *u8, opts: *RmOptions) -> i32
+    # Open directory
+    let fd: i32 = sys_open(path, O_DIRECTORY)
+    if fd < 0
+        if opts.force == 0
+            eprints("rm: cannot open directory '")
+            eprints(path)
+            eprints("'\n")
+        return 1
+
+    var result: i32 = 0
+    var buf: [8192]u8
+
+    # Read and remove all entries
+    loop
+        let nread: i64 = sys_getdents64(fd, &buf[0], 8192)
+        if nread <= 0
+            break
+
+        var pos: i64 = 0
+        while pos < nread
+            let entry: *u8 = &buf[0] + pos
+            let reclen: i32 = dirent_get_reclen(entry)
+            let name: *u8 = dirent_get_name(entry)
+
+            # Skip . and ..
+            if streq(name, ".") == 0 and streq(name, "..") == 0
+                # Build full path
+                var child_path: [4096]u8
+                path_join(path, name, &child_path[0])
+
+                # Check if directory
+                if is_directory(&child_path[0]) != 0
+                    # Recurse
+                    let r: i32 = remove_dir_recursive(&child_path[0], opts)
+                    if r != 0
+                        result = 1
+                else
+                    # Remove file
+                    let r: i32 = remove_file(&child_path[0], opts)
+                    if r != 0
+                        result = 1
+
+            pos += reclen as i64
+
+    sys_close(fd)
+
+    # Now remove the empty directory
+    let r: i32 = sys_rmdir(path)
+    if r != 0
+        if opts.force == 0
+            eprints("rm: cannot remove directory '")
+            eprints(path)
+            eprints("'\n")
+        return 1
+
+    if opts.verbose != 0
+        prints("removed directory '")
+        prints(path)
+        prints("'\n")
+
+    return result
+
+fn remove_path(path: *u8, opts: *RmOptions) -> i32
+    # Check if path exists
+    if path_exists(path) == 0
+        if opts.force == 0
+            eprints("rm: cannot remove '")
+            eprints(path)
+            eprints("': No such file or directory\n")
+            return 1
+        return 0  # -f ignores nonexistent
+
+    # Check if it's a directory
+    if is_directory(path) != 0
+        if opts.recursive != 0
+            return remove_dir_recursive(path, opts)
+        else if opts.dir != 0
+            # Try to remove empty directory
+            let r: i32 = sys_rmdir(path)
+            if r != 0
+                eprints("rm: cannot remove '")
+                eprints(path)
+                eprints("': Is a directory\n")
+                return 1
+            if opts.verbose != 0
+                prints("removed directory '")
+                prints(path)
+                prints("'\n")
+            return 0
+        else
+            eprints("rm: cannot remove '")
+            eprints(path)
+            eprints("': Is a directory\n")
+            return 1
+
+    return remove_file(path, opts)
+
+# ============================================================================
+# Main
+# ============================================================================
+
+fn main(argc: i32, argv: **u8) -> i32
+    # Initialize argument parser
+    var parser: ArgParser
+    args_init(&parser, "rm", "Remove files or directories")
+
+    # Define flags
+    args_flag(&parser, 'r', "recursive", "Remove directories and their contents recursively")
+    args_flag(&parser, 'R', null, "Remove directories and their contents recursively")
+    args_flag(&parser, 'f', "force", "Ignore nonexistent files, never prompt")
+    args_flag(&parser, 'd', "dir", "Remove empty directories")
+    args_flag(&parser, 'v', "verbose", "Print each file as it's removed")
+
+    # Define positional arguments
+    args_positional(&parser, "FILE", "Files or directories to remove", 1, -1)
+
+    # Parse arguments
+    if args_parse(&parser, argc, argv) != 0
+        return 1
+
+    # Set options from parsed flags
+    var opts: RmOptions
+    opts.recursive = args_get_flag(&parser, 'r') | args_get_flag(&parser, 'R')
+    opts.force = args_get_flag(&parser, 'f')
+    opts.dir = args_get_flag(&parser, 'd')
+    opts.verbose = args_get_flag(&parser, 'v')
+
+    # Process each file
+    var result: i32 = 0
+    for i in 0..parser.positional_count
+        let path: *u8 = args_get_positional(&parser, i)
+        let r: i32 = remove_path(path, &opts)
+        if r != 0
+            result = 1
+
+    return result

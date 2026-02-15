@@ -1,0 +1,386 @@
+# cut - remove sections from each line of files
+#
+# Usage: cut OPTION... [FILE...]
+#   Print selected parts of lines from each FILE to standard output.
+#
+# Options:
+#   -f FIELDS   select only these fields (1-indexed)
+#   -d DELIM    use DELIM instead of TAB for field delimiter
+#   -c CHARS    select only these character positions (1-indexed)
+#   -s          suppress lines with no delimiter characters (with -f)
+#
+# Field/char selection format:
+#   N       single field/char N
+#   N-M     range from N to M (inclusive)
+#   N-      from N to end of line
+#   -M      from start to M
+#   N,M,... multiple selections (comma-separated)
+#
+# Examples:
+#   cut -f1 file.txt           # first field (tab-delimited)
+#   cut -f1,3 -d: /etc/passwd  # fields 1 and 3, colon-delimited
+#   cut -c1-10 file.txt        # first 10 characters of each line
+
+# ============================================================================
+# Standard library imports
+# ============================================================================
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.gvec
+import ritzlib.args
+import ritzlib.memory
+
+# ============================================================================
+# Options struct
+# ============================================================================
+
+struct CutOptions
+    mode: i32           # 0=fields, 1=chars
+    delimiter: u8       # field delimiter (default TAB=9)
+    suppress: i32       # -s: suppress lines without delimiter
+    # Field/char selection stored as ranges
+    ranges: *Range
+    range_count: i64
+    range_cap: i64
+    ranges_size: i64
+
+struct Range
+    start: i64   # 1-indexed, 0 means "from beginning"
+    end: i64     # 1-indexed, 0 means "to end"
+
+# ============================================================================
+# Range parsing
+# ============================================================================
+
+fn options_init(opts: *CutOptions)
+    opts.mode = 0
+    opts.delimiter = 9  # TAB
+    opts.suppress = 0
+    let initial_cap: i64 = 16
+    let elem_size: i64 = 16  # sizeof(Range)
+    opts.ranges_size = initial_cap * elem_size
+    opts.ranges = heap_alloc(opts.ranges_size) as *Range
+    opts.range_count = 0
+    opts.range_cap = initial_cap
+
+fn options_free(opts: *CutOptions)
+    heap_free(opts.ranges as *u8, opts.ranges_size)
+
+fn options_add_range(opts: *CutOptions, start: i64, end: i64)
+    if opts.range_count >= opts.range_cap
+        let old_cap: i64 = opts.range_cap
+        let new_cap: i64 = old_cap * 2
+        let elem_size: i64 = 16
+        let old_size: i64 = old_cap * elem_size
+        let new_size: i64 = new_cap * elem_size
+
+        let new_ranges: *Range = heap_alloc(new_size) as *Range
+
+        for i in 0..opts.range_count
+            let src: *Range = opts.ranges + i
+            let dst: *Range = new_ranges + i
+            dst.start = src.start
+            dst.end = src.end
+
+        heap_free(opts.ranges as *u8, old_size)
+        opts.ranges = new_ranges
+        opts.range_cap = new_cap
+        opts.ranges_size = new_size
+
+    let r: *Range = opts.ranges + opts.range_count
+    r.start = start
+    r.end = end
+    opts.range_count = opts.range_count + 1
+
+fn parse_number(s: *u8, pos: *i64) -> i64
+    # Parse a number starting at s[*pos], update pos to point past it
+    var num: i64 = 0
+    var has_digit: i32 = 0
+
+    loop
+        let c: u8 = *(s + *pos)
+        if c >= '0' and c <= '9'  # '0'-'9'
+            num = num * 10 + (c - '0') as i64
+            has_digit = 1
+            *pos = *pos + 1
+        else
+            break
+
+    if has_digit == 0
+        return 0  # No number found
+    return num
+
+fn parse_ranges(s: *u8, opts: *CutOptions) -> i32
+    # Parse field/char specification like "1,3-5,7-"
+    var pos: i64 = 0
+
+    while *(s + pos) != 0
+        # Skip comma separators
+        if *(s + pos) == ','  # ','
+            pos += 1
+            continue
+
+        var start: i64 = 0
+        var end: i64 = 0
+
+        # Check for leading hyphen (-M means 1-M)
+        if *(s + pos) == '-'  # '-'
+            start = 1
+            pos += 1
+            end = parse_number(s, &pos)
+            if end == 0
+                return 1  # Error: "-" alone is invalid
+        else
+            start = parse_number(s, &pos)
+            if start == 0
+                return 1  # Error: expected number
+
+            # Check for range
+            if *(s + pos) == '-'  # '-'
+                pos += 1
+                end = parse_number(s, &pos)
+                # end == 0 means "to end of line" (N-)
+            else
+                # Single field/char
+                end = start
+
+        options_add_range(opts, start, end)
+
+    return 0
+
+# ============================================================================
+# Field selection check
+# ============================================================================
+
+fn in_selection(pos: i64, opts: *CutOptions) -> i32
+    # Check if position (1-indexed) is in any of the selected ranges
+    for i in 0..opts.range_count
+        let r: *Range = opts.ranges + i
+        let start: i64 = r.start
+        let end: i64 = r.end
+
+        if end == 0
+            # N- : from start to end
+            if pos >= start
+                return 1
+        else
+            if pos >= start and pos <= end
+                return 1
+
+    return 0
+
+# ============================================================================
+# Line processing
+# ============================================================================
+
+fn process_line_fields(line: *u8, len: i64, opts: *CutOptions, outbuf: @&Vec<u8>)
+    # Split line by delimiter and output selected fields
+    let delim: u8 = opts.delimiter
+    var field_num: i64 = 1
+    var field_start: i64 = 0
+    var has_delim: i32 = 0
+    var first_output: i32 = 1
+
+    var i: i64 = 0
+    while i <= len
+        var is_delim: i32 = 0
+        var is_end: i32 = 0
+
+        if i < len
+            if *(line + i) == delim
+                is_delim = 1
+                has_delim = 1
+        if i == len
+            is_end = 1
+
+        if is_delim != 0 or is_end != 0
+            # End of current field
+            if in_selection(field_num, opts) != 0
+                # Output delimiter between fields
+                if first_output == 0
+                    vec_push<u8>(outbuf, delim)
+                first_output = 0
+
+                # Output field content
+                var j: i64 = field_start
+                while j < i
+                    # Skip newline at end
+                    let c: u8 = *(line + j)
+                    if c != '\n'
+                        vec_push<u8>(outbuf, c)
+                    j += 1
+
+            field_num += 1
+            field_start = i + 1
+
+        i += 1
+
+    # Handle -s: suppress lines without delimiter
+    if opts.suppress != 0 and has_delim == 0
+        outbuf.clear()
+        return
+
+    # Add newline if we output anything
+    if first_output == 0
+        vec_push<u8>(outbuf, '\n')
+    else if opts.suppress == 0 and has_delim == 0
+        # No delimiter, output whole line (unless -s)
+        i = 0
+        while i < len
+            vec_push<u8>(outbuf, *(line + i))
+            i += 1
+        if len == 0 or *(line + len - 1) != '\n'
+            vec_push<u8>(outbuf, '\n')
+
+fn process_line_chars(line: *u8, len: i64, opts: *CutOptions, outbuf: @&Vec<u8>)
+    # Output selected character positions
+    var char_num: i64 = 1
+    var output_any: i32 = 0
+
+    var i: i64 = 0
+    while i < len
+        let c: u8 = *(line + i)
+        if c == '\n'
+            break  # Don't count newline as character
+
+        if in_selection(char_num, opts) != 0
+            vec_push<u8>(outbuf, c)
+            output_any = 1
+
+        char_num += 1
+        i += 1
+
+    if output_any != 0
+        vec_push<u8>(outbuf, '\n')
+
+fn process_line(line: *u8, len: i64, opts: *CutOptions, outbuf: @&Vec<u8>)
+    if opts.mode == 0
+        process_line_fields(line, len, opts, outbuf)
+    else
+        process_line_chars(line, len, opts, outbuf)
+
+# ============================================================================
+# File processing
+# ============================================================================
+
+fn process_fd(fd: i32, opts: *CutOptions) -> i32
+    var buf: Vec<u8> = vec_with_cap<u8>(4096)
+    var linebuf: Vec<u8> = vec_with_cap<u8>(1024)
+    var outbuf: Vec<u8> = vec_with_cap<u8>(1024)
+
+    loop
+        let n: i64 = sys_read(fd, buf.data, buf.cap)
+        if n < 0
+            return 1
+        if n == 0
+            break
+
+        # Process bytes, building lines
+        var i: i64 = 0
+        while i < n
+            let c: u8 = *(buf.data + i)
+            vec_push<u8>(&linebuf, c)
+
+            if c == '\n'
+                # End of line, process it
+                process_line(linebuf.data, linebuf.len, opts, &outbuf)
+
+                # Flush output
+                if outbuf.len > 0
+                    sys_write(STDOUT, outbuf.data, outbuf.len)
+                    outbuf.clear()
+
+                linebuf.clear()
+
+            i += 1
+
+    # Handle last line without newline
+    if linebuf.len > 0
+        process_line(linebuf.data, linebuf.len, opts, &outbuf)
+        if outbuf.len > 0
+            sys_write(STDOUT, outbuf.data, outbuf.len)
+
+    return 0
+
+# ============================================================================
+# Main
+# ============================================================================
+
+fn main(argc: i32, argv: **u8) -> i32
+    # Set up argument parser
+    var parser: ArgParser
+    args_init(&parser, "cut", "Remove sections from each line of files")
+
+    # Define options
+    args_option(&parser, 102, null, "FIELDS", "Select only these fields (1-indexed)", null)  # 'f'
+    args_option(&parser, 99, null, "CHARS", "Select only these character positions", null)   # 'c'
+    args_option(&parser, 100, null, "DELIM", "Use DELIM instead of TAB for field delimiter", "\t")  # 'd'
+    args_flag(&parser, 115, null, "Suppress lines with no delimiter characters")  # 's'
+
+    # Define positionals: FILE... (optional, 0 to unlimited)
+    args_positional(&parser, "FILE", "Input files (stdin if none)", 0, -1)
+
+    # Parse arguments
+    if args_parse(&parser, argc, argv) != 0
+        return 1
+
+    # Validate: -f and -c are mutually exclusive, one is required
+    let has_f: i32 = args_is_set(&parser, 102)
+    let has_c: i32 = args_is_set(&parser, 99)
+
+    if has_f != 0 and has_c != 0
+        eprints("cut: only one of -f or -c may be specified\n")
+        return 1
+
+    if has_f == 0 and has_c == 0
+        eprints("cut: you must specify a list of bytes, characters, or fields\n")
+        return 1
+
+    # Initialize cut options
+    var opts: CutOptions
+    options_init(&opts)
+
+    # Set mode based on which option was provided
+    if has_c != 0
+        opts.mode = 1  # character mode
+        let char_spec: *u8 = args_get_str(&parser, 99)
+        if parse_ranges(char_spec, &opts) != 0
+            eprints("cut: invalid character list\n")
+            return 1
+    else
+        opts.mode = 0  # field mode
+        let field_spec: *u8 = args_get_str(&parser, 102)
+        if parse_ranges(field_spec, &opts) != 0
+            eprints("cut: invalid field list\n")
+            return 1
+
+    # Set delimiter (get first character of delimiter string)
+    let delim_str: *u8 = args_get_str(&parser, 100)
+    if delim_str != null
+        opts.delimiter = *delim_str
+
+    # Set suppress flag
+    opts.suppress = args_get_flag(&parser, 115)
+
+    # Process files
+    var exit_code: i32 = 0
+
+    if parser.positional_count == 0
+        # Read from stdin
+        if process_fd(STDIN, &opts) != 0
+            exit_code = 1
+    else
+        for i in 0..parser.positional_count
+            let path: *u8 = args_get_positional(&parser, i)
+            let fd: i32 = sys_open(path, O_RDONLY)
+            if fd < 0
+                eprints("cut: cannot open file\n")
+                exit_code = 1
+            else
+                if process_fd(fd, &opts) != 0
+                    exit_code = 1
+                sys_close(fd)
+
+    options_free(&opts)
+    return exit_code

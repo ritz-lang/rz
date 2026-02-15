@@ -1,0 +1,253 @@
+# ritzlib/async/server.ritz - Async TCP server patterns
+#
+# This module provides high-level server patterns using io_uring:
+#   - TaskServer: Complete server with accept loop and task management
+#   - Multishot accept support (kernel 5.19+)
+#   - Connection handling with keep-alive
+#
+# Design:
+#   TaskServer combines a TaskPool with an io_uring ring and manages
+#   the accept/dispatch loop. Two modes are supported:
+#   - Standard: One accept SQE per connection
+#   - Multishot: Single accept SQE generates continuous CQEs
+#
+# Usage:
+#   import ritzlib.async.server
+#   import ritzlib.async_net  # For tcp_socket, tcp_bind, etc.
+#
+#   fn handle_connection(task: *Task) -> i32
+#       # Your handler logic here
+#       0
+#
+#   fn main() -> i32
+#       let listen_fd = tcp_socket()
+#       tcp_bind(listen_fd, 0, 8080)
+#       tcp_listen(listen_fd, 128)
+#       set_reuseaddr(listen_fd)
+#
+#       var srv: TaskServer
+#       task_server_init(@srv, listen_fd)
+#       task_server_run_multishot(@srv, handle_connection)
+#       task_server_destroy(@srv)
+#       0
+
+import ritzlib.sys
+import ritzlib.uring
+import ritzlib.async_net
+import ritzlib.async.task
+
+
+# ============================================================================
+# TaskServer - Complete async server
+# ============================================================================
+
+pub struct TaskServer
+    listen_fd: i32                      # Listening socket
+    pool: TaskPool                      # Task pool for connections
+    ring: IoUring                       # io_uring instance
+    accept_user_data: i64               # Special user_data for accept (always 0)
+    running: i32                        # Server is running flag
+
+
+# ============================================================================
+# Server lifecycle
+# ============================================================================
+
+# Initialize the server with a listening socket
+pub fn task_server_init(srv: *TaskServer, listen_fd: i32) -> i32
+    srv.listen_fd = listen_fd
+    srv.accept_user_data = 0            # Reserve 0 for accept operations
+    srv.running = 0
+
+    # Initialize io_uring
+    let ret = uring_init(@srv.ring, 256)
+    if ret < 0
+        return ret
+
+    # Initialize task pool with our ring
+    task_pool_init(@srv.pool, @srv.ring)
+    return 0
+
+
+# Destroy the server and clean up resources
+pub fn task_server_destroy(srv: *TaskServer)
+    uring_destroy(@srv.ring)
+
+
+# Stop the server (can be called from signal handler)
+pub fn task_server_stop(srv: *TaskServer)
+    srv.running = 0
+
+
+# ============================================================================
+# Accept operations
+# ============================================================================
+
+# Submit a standard accept SQE (one per connection)
+fn task_server_submit_accept(srv: *TaskServer) -> i32
+    let sqe = uring_get_sqe(@srv.ring)
+    if sqe == null
+        return -12
+
+    uring_prep_accept(sqe, srv.listen_fd, null, null, 0, srv.accept_user_data)
+    uring_sqe_submit(@srv.ring)
+    return 0
+
+
+# Submit a multishot accept SQE (kernel 5.19+)
+# Only needs to be submitted once - generates continuous CQEs
+fn task_server_submit_accept_multishot(srv: *TaskServer) -> i32
+    let sqe = uring_get_sqe(@srv.ring)
+    if sqe == null
+        return -12
+
+    uring_prep_accept_multishot(sqe, srv.listen_fd, null, null, 0, srv.accept_user_data)
+    uring_sqe_submit(@srv.ring)
+    return 0
+
+
+# ============================================================================
+# Internal: Task processing
+# ============================================================================
+
+# Process all READY tasks, calling their handlers
+fn task_server_poll_tasks(srv: *TaskServer)
+    for i in 0..MAX_TASKS
+        let task = @srv.pool.tasks[i]
+        if task.state == TASK_READY
+            let h: fn(*Task) -> i32 = task.handler
+            let result = h(task)
+            if result >= 0
+                task_complete(@srv.pool, task)
+
+
+# Handle a new connection
+fn task_server_handle_accept(srv: *TaskServer, client_fd: i32, handler: fn(*Task) -> i32)
+    # Set TCP_NODELAY for low latency
+    set_nodelay(client_fd)
+
+    let spawn_ret = spawn_task(@srv.pool, client_fd, handler)
+    if spawn_ret < 0
+        # Pool full, close connection
+        sys_close(client_fd)
+
+
+# Wake a task with an I/O result
+fn task_server_wake_task(srv: *TaskServer, task_id: i64, result: i32)
+    let task = task_pool_find(@srv.pool, task_id)
+    if task != null
+        task.io_result = result
+        task.state = TASK_READY
+
+
+# ============================================================================
+# Public API: Server run modes
+# ============================================================================
+
+# Run the server event loop with standard accept (one SQE per connection)
+pub fn task_server_run(srv: *TaskServer, handler: fn(*Task) -> i32) -> i32
+    srv.running = 1
+
+    # Submit initial accept
+    task_server_submit_accept(srv)
+    uring_submit(@srv.ring)
+
+    loop
+        # Poll all READY tasks
+        task_server_poll_tasks(srv)
+
+        # Submit any pending I/O and wait for completions
+        let wait_ret = uring_submit_and_wait(@srv.ring, 1)
+        if wait_ret < 0
+            return wait_ret
+
+        # Process all CQEs
+        loop
+            let cqe = uring_peek_cqe(@srv.ring)
+            if cqe == null
+                break
+
+            let user_data = cqe.user_data
+            let cqe_res = cqe.res
+
+            if user_data == srv.accept_user_data
+                # New connection accepted
+                if cqe_res >= 0
+                    task_server_handle_accept(srv, cqe_res, handler)
+                # Re-submit accept for next connection
+                task_server_submit_accept(srv)
+            else
+                # Wake the task
+                task_server_wake_task(srv, user_data, cqe_res)
+
+            uring_cqe_seen(@srv.ring, cqe)
+
+        if srv.running == 0
+            break
+
+    return 0
+
+
+# Run server with multishot accept (kernel 5.19+)
+# More efficient than task_server_run - only one accept SQE needed
+pub fn task_server_run_multishot(srv: *TaskServer, handler: fn(*Task) -> i32) -> i32
+    srv.running = 1
+
+    # Submit multishot accept - only needs to be done once
+    task_server_submit_accept_multishot(srv)
+    uring_submit(@srv.ring)
+
+    loop
+        # Poll all READY tasks
+        task_server_poll_tasks(srv)
+
+        # Submit any pending I/O and wait for completions
+        let wait_ret = uring_submit_and_wait(@srv.ring, 1)
+        if wait_ret < 0
+            return wait_ret
+
+        # Process all CQEs
+        loop
+            let cqe = uring_peek_cqe(@srv.ring)
+            if cqe == null
+                break
+
+            let user_data = cqe.user_data
+            let cqe_res = cqe.res
+            let cqe_flags = cqe.flags
+
+            if user_data == srv.accept_user_data
+                # New connection from multishot accept
+                if cqe_res >= 0
+                    task_server_handle_accept(srv, cqe_res, handler)
+
+                # With multishot, only re-submit if IORING_CQE_F_MORE is NOT set
+                # (which means the multishot was cancelled or errored)
+                if (cqe_flags & IORING_CQE_F_MORE) == 0
+                    if cqe.res < 0
+                        # Error - re-submit multishot
+                        task_server_submit_accept_multishot(srv)
+            else
+                # Wake the task
+                task_server_wake_task(srv, user_data, cqe_res)
+
+            uring_cqe_seen(@srv.ring, cqe)
+
+        if srv.running == 0
+            break
+
+    return 0
+
+
+# ============================================================================
+# Server statistics
+# ============================================================================
+
+# Get number of active tasks/connections
+pub fn task_server_active_count(srv: *TaskServer) -> i32
+    let pool_ptr: *TaskPool = @srv.pool
+    return pool_ptr.active_count
+
+# Check if server is running
+pub fn task_server_is_running(srv: *TaskServer) -> i32
+    return srv.running

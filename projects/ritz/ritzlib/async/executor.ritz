@@ -1,0 +1,214 @@
+# ritzlib/async/executor.ritz - Unified async executor
+#
+# This module provides a clean executor that can:
+#   - Run the TaskServer event loop (via run_tasks)
+#   - Block on a single future (via block_on)
+#   - Coordinate I/O completions via io_uring
+#
+# Design:
+#   The executor wraps TaskPool + IoUring and provides the event loop.
+#   This is separate from TaskServer for cases where you want:
+#   - Custom accept logic
+#   - Non-server async patterns
+#   - Manual task spawning
+#
+# Usage:
+#   import ritzlib.async.executor
+#   import ritzlib.async.task
+#
+#   var pool: TaskPool
+#   var ring: IoUring
+#   uring_init(@ring, 256)
+#   task_pool_init(@pool, @ring)
+#
+#   spawn_task(@pool, client_fd, my_handler)
+#   run_tasks(@pool)
+
+import ritzlib.sys
+import ritzlib.uring
+import ritzlib.async.task
+
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+# Poll result encoding (matches compiler-generated futures)
+pub const POLL_PENDING: i32 = -1       # -1 = Pending
+pub const POLL_READY_BASE: i32 = 0     # value >= 0 = Ready(value)
+
+
+# ============================================================================
+# run_tasks - Event loop for TaskPool
+# ============================================================================
+#
+# Runs all tasks in the pool until all complete.
+# This is the core event loop used by TaskServer.
+
+pub fn run_tasks(pool: *TaskPool) -> i32
+    loop
+        # First, poll all READY tasks
+        var submitted: i32 = 0
+        for i in 0..MAX_TASKS
+            let task = @pool.tasks[i]
+            if task.state == TASK_READY
+                # Poll the handler (extract fn ptr first)
+                let h: fn(*Task) -> i32 = task.handler
+                let result = h(task)
+                if result >= 0
+                    # Task is complete
+                    task_complete(pool, task)
+                # If result < 0 (pending), handler should have submitted I/O
+
+        # Submit any pending SQEs
+        uring_submit(pool.ring)
+
+        # Count active tasks
+        if pool.active_count == 0
+            break
+
+        # Wait for at least one completion
+        let wait_ret = uring_submit_and_wait(pool.ring, 1)
+        if wait_ret < 0
+            return wait_ret
+
+        # Process all available CQEs
+        loop
+            let cqe = uring_peek_cqe(pool.ring)
+            if cqe == null
+                break
+
+            # Find the task and wake it
+            let task_id = cqe.user_data
+            let task = task_pool_find(pool, task_id)
+            if task != null
+                task.io_result = cqe.res
+                task.state = TASK_READY
+
+            uring_cqe_seen(pool.ring, cqe)
+
+    return 0
+
+
+# ============================================================================
+# block_on - Run a single future to completion
+# ============================================================================
+#
+# For simple async operations outside the TaskPool pattern.
+# Takes a future pointer and its poll function.
+#
+# The poll function should:
+# - Return >= 0 when complete (the result value)
+# - Return POLL_PENDING (-1) when waiting for I/O
+#
+# Typical usage for file I/O or single-shot async operations.
+
+pub fn block_on(ring: *IoUring, future_ptr: *u8, poll_fn: fn(*u8) -> i32) -> i32
+    var completed: i32 = 0
+    var result: i32 = 0
+
+    while completed == 0
+        # Poll the future
+        result = poll_fn(future_ptr)
+
+        if result != POLL_PENDING
+            # Ready! We have a result
+            completed = 1
+        else
+            # Pending - wait for at least one I/O completion
+            let wait_result = uring_submit_and_wait(ring, 1)
+            if wait_result < 0
+                # Error waiting for I/O
+                result = wait_result
+                completed = 1
+            else
+                # Consume all available CQEs (the future should check them)
+                loop
+                    let cqe = uring_peek_cqe(ring)
+                    if cqe == null
+                        break
+                    uring_cqe_seen(ring, cqe)
+
+    return result
+
+
+# ============================================================================
+# block_on variants for different return types
+# ============================================================================
+
+pub fn async_block_on_i64(ring: *IoUring, future_ptr: *u8, poll_fn: fn(*u8) -> i64) -> i64
+    var completed: i32 = 0
+    var result: i64 = 0
+
+    while completed == 0
+        result = poll_fn(future_ptr)
+
+        if result != POLL_PENDING as i64
+            completed = 1
+        else
+            let wait_result = uring_submit_and_wait(ring, 1)
+            if wait_result < 0
+                result = wait_result as i64
+                completed = 1
+            else
+                loop
+                    let cqe = uring_peek_cqe(ring)
+                    if cqe == null
+                        break
+                    uring_cqe_seen(ring, cqe)
+
+    return result
+
+
+# ============================================================================
+# Convenience: Initialize ring + pool together
+# ============================================================================
+
+pub struct AsyncTaskRuntime
+    ring: IoUring
+    pool: TaskPool
+    initialized: i32
+
+
+pub fn async_runtime_init(rt: *AsyncTaskRuntime) -> i32
+    rt.initialized = 0
+
+    let ret = uring_init(@rt.ring, 256)
+    if ret < 0
+        return ret
+
+    task_pool_init(@rt.pool, @rt.ring)
+    rt.initialized = 1
+    return 0
+
+
+pub fn async_runtime_destroy(rt: *AsyncTaskRuntime)
+    if rt.initialized != 0
+        uring_destroy(@rt.ring)
+        rt.initialized = 0
+
+
+# Spawn a task on the runtime's pool
+pub fn async_runtime_spawn(rt: *AsyncTaskRuntime, fd: i32, handler: fn(*Task) -> i32) -> i32
+    return spawn_task(@rt.pool, fd, handler)
+
+
+# Run all tasks to completion
+pub fn async_runtime_run(rt: *AsyncTaskRuntime) -> i32
+    return run_tasks(@rt.pool)
+
+
+# Get active task count
+pub fn async_runtime_active_count(rt: *AsyncTaskRuntime) -> i32
+    let pool_ptr: *TaskPool = @rt.pool
+    return pool_ptr.active_count
+
+
+# Get the pool (for direct manipulation)
+pub fn async_runtime_pool(rt: *AsyncTaskRuntime) -> *TaskPool
+    return @rt.pool
+
+
+# Get the ring (for direct manipulation)
+pub fn async_runtime_ring(rt: *AsyncTaskRuntime) -> *IoUring
+    return @rt.ring

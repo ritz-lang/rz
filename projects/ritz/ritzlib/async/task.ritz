@@ -1,0 +1,224 @@
+# ritzlib/async/task.ritz - Async task types and pool management
+#
+# This module provides the core types for async task management:
+#   - Task: A single async task with state machine and I/O buffers
+#   - TaskPool: Fixed-size pool of async tasks
+#   - TaskState: Task lifecycle states
+#
+# Design:
+#   Tasks hold state for a single connection/operation. Each task has:
+#   - A unique ID for tracking via io_uring user_data
+#   - State (IDLE, WAITING, READY)
+#   - I/O buffers for recv/send operations
+#   - A handler function pointer for state machine logic
+#
+# Usage:
+#   import ritzlib.async.task
+#
+#   var pool: TaskPool
+#   task_pool_init(@pool, @ring)
+#   spawn_task(@pool, client_fd, handle_connection)
+
+import ritzlib.sys
+import ritzlib.uring
+import ritzlib.iovec
+
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+pub const MAX_TASKS: i32 = 256              # Maximum concurrent tasks
+pub const TASK_BUFFER_SIZE: i32 = 8192      # Per-task I/O buffer size
+
+# Task states
+pub const TASK_IDLE: i32 = 0                # Slot is unused
+pub const TASK_WAITING: i32 = 1             # Waiting for I/O completion
+pub const TASK_READY: i32 = 2               # Ready to be polled
+
+
+# ============================================================================
+# Task - A single async task
+# ============================================================================
+#
+# Represents a single async operation (typically a connection).
+# Contains all state needed for the task's lifecycle.
+
+pub struct Task
+    # Task identity
+    id: i64                             # Unique task ID (matches user_data)
+    state: i32                          # IDLE, WAITING, READY
+
+    # I/O state
+    fd: i32                             # File descriptor for this task
+    io_result: i32                      # Result from last I/O operation
+
+    # Handler callback and state machine
+    handler: fn(*Task) -> i32           # Poll function (-1=pending, else=done)
+    handler_state: i32                  # State machine position
+
+    # Buffers for I/O
+    read_buf: [8192]u8
+    write_buf: [8192]u8
+    read_len: i32                       # Bytes in read buffer
+    write_len: i32                      # Bytes to write
+    write_pos: i32                      # Current write position
+
+    # Pool pointer (for I/O helpers to find their pool)
+    pool_ptr: *u8
+
+    # Connection state
+    request_count: i32                  # Number of requests handled (keep-alive)
+
+    # Vectored I/O builder for zero-copy responses
+    iov_builder: IoVecBuilder
+
+
+# ============================================================================
+# TaskPool - Pool of async tasks
+# ============================================================================
+#
+# Manages a fixed array of tasks with O(n) allocation/lookup.
+# For high-performance scenarios, consider a free list.
+
+pub struct TaskPool
+    tasks: [256]Task                    # Fixed task array
+    next_id: i64                        # Next task ID to assign
+    active_count: i32                   # Number of active tasks
+    ring: *IoUring                      # io_uring instance (external)
+
+
+# ============================================================================
+# Pool initialization
+# ============================================================================
+
+# Initialize the task pool with an io_uring instance
+pub fn task_pool_init(pool: *TaskPool, ring: *IoUring)
+    pool.next_id = 1
+    pool.active_count = 0
+    pool.ring = ring
+
+    # Initialize all task slots
+    for i in 0..MAX_TASKS
+        let task = @pool.tasks[i]
+        task_init(task)
+
+
+# Initialize a single task slot to default values
+fn task_init(task: *Task)
+    task.id = 0
+    task.state = TASK_IDLE
+    task.fd = -1
+    task.io_result = 0
+    task.handler = null
+    task.handler_state = 0
+    task.read_len = 0
+    task.write_len = 0
+    task.write_pos = 0
+    task.pool_ptr = null
+    task.request_count = 0
+
+
+# ============================================================================
+# Pool allocation and lookup
+# ============================================================================
+
+# Find a free task slot, returns null if pool is full
+pub fn task_pool_alloc(pool: *TaskPool) -> *Task
+    for i in 0..MAX_TASKS
+        if pool.tasks[i].state == TASK_IDLE
+            return @pool.tasks[i]
+    return null
+
+
+# Find a task by its ID (user_data)
+pub fn task_pool_find(pool: *TaskPool, task_id: i64) -> *Task
+    for i in 0..MAX_TASKS
+        if pool.tasks[i].id == task_id
+            if pool.tasks[i].state != TASK_IDLE
+                return @pool.tasks[i]
+    return null
+
+
+# ============================================================================
+# Task lifecycle
+# ============================================================================
+
+# Spawn a new task for handling an operation (typically a connection)
+# Returns 0 on success, -1 if pool is full
+pub fn spawn_task(pool: *TaskPool, fd: i32, handler: fn(*Task) -> i32) -> i32
+    let task = task_pool_alloc(pool)
+    if task == null
+        return -1
+
+    # Initialize the task
+    task.id = pool.next_id
+    pool.next_id += 1
+    task.state = TASK_READY          # Start in READY state for first poll
+    task.fd = fd
+    task.io_result = 0
+    task.handler = handler
+    task.handler_state = 0
+    task.read_len = 0
+    task.write_len = 0
+    task.write_pos = 0
+    task.pool_ptr = pool as *u8      # Store pool pointer for I/O helpers
+    task.request_count = 0           # No requests yet
+
+    pool.active_count += 1
+    return 0
+
+
+# Mark a task as complete and free its slot
+pub fn task_complete(pool: *TaskPool, task: *Task)
+    # Close the fd if still open
+    if task.fd >= 0
+        sys_close(task.fd)
+        task.fd = -1
+
+    task.state = TASK_IDLE
+    task.id = 0
+    pool.active_count -= 1
+
+
+# ============================================================================
+# Task state helpers
+# ============================================================================
+
+# Check if task is in a particular state
+pub fn task_is_idle(task: *Task) -> i32
+    return task.state == TASK_IDLE
+
+pub fn task_is_waiting(task: *Task) -> i32
+    return task.state == TASK_WAITING
+
+pub fn task_is_ready(task: *Task) -> i32
+    return task.state == TASK_READY
+
+
+# Get task's pool pointer (for I/O operations)
+pub fn task_get_pool(task: *Task) -> *TaskPool
+    return task.pool_ptr as *TaskPool
+
+
+# Get task's io_uring instance
+pub fn task_get_ring(task: *Task) -> *IoUring
+    let pool = task.pool_ptr as *TaskPool
+    return pool.ring
+
+
+# ============================================================================
+# Task buffer access
+# ============================================================================
+
+# Get pointer to read buffer
+pub fn task_read_buf(task: *Task) -> *u8
+    return @task.read_buf[0]
+
+# Get pointer to write buffer
+pub fn task_write_buf(task: *Task) -> *u8
+    return @task.write_buf[0]
+
+# Get IoVecBuilder for vectored I/O
+pub fn task_iov_builder(task: *Task) -> *IoVecBuilder
+    return @task.iov_builder

@@ -1,0 +1,149 @@
+# ritzlib/async/mod.ritz - Async module re-exports
+#
+# This module provides a unified interface to the async system.
+# Import this to get all async types and functions.
+#
+# Usage:
+#   import ritzlib.async.mod
+#
+# Or import specific submodules:
+#   import ritzlib.async.task
+#   import ritzlib.async.io
+#   import ritzlib.async.server
+#   import ritzlib.async.executor
+#
+# Architecture:
+#   ┌─────────────────────────────────────────────────────────┐
+#   │                    Application Layer                     │
+#   │   (Valet HTTP handler, your server logic, etc.)         │
+#   └─────────────────────────────────────────────────────────┘
+#                              │
+#                              ▼
+#   ┌─────────────────────────────────────────────────────────┐
+#   │                   async/server.ritz                      │
+#   │   TaskServer - accept loop, connection dispatch          │
+#   │   task_server_run(), task_server_run_multishot()        │
+#   └─────────────────────────────────────────────────────────┘
+#                              │
+#                              ▼
+#   ┌─────────────────────────────────────────────────────────┐
+#   │                  async/executor.ritz                     │
+#   │   run_tasks() - event loop for TaskPool                  │
+#   │   block_on() - run single future to completion           │
+#   │   AsyncRuntime - convenience wrapper                     │
+#   └─────────────────────────────────────────────────────────┘
+#                              │
+#            ┌─────────────────┴─────────────────┐
+#            ▼                                   ▼
+#   ┌─────────────────────────┐   ┌─────────────────────────┐
+#   │    async/task.ritz      │   │     async/io.ritz       │
+#   │   Task, TaskPool        │   │   task_recv/send/sendv  │
+#   │   spawn_task()          │   │   task_reset_for_recv() │
+#   │   task_complete()       │   │   I/O buffer helpers    │
+#   └─────────────────────────┘   └─────────────────────────┘
+#                              │
+#                              ▼
+#   ┌─────────────────────────────────────────────────────────┐
+#   │                      uring.ritz                          │
+#   │   io_uring bindings - SQE/CQE handling                   │
+#   │   uring_prep_recv/send/writev/accept_multishot          │
+#   └─────────────────────────────────────────────────────────┘
+#                              │
+#                              ▼
+#   ┌─────────────────────────────────────────────────────────┐
+#   │                    Linux Kernel                          │
+#   │   io_uring subsystem                                     │
+#   └─────────────────────────────────────────────────────────┘
+
+# Re-export task types
+import ritzlib.async.task
+
+# Re-export I/O primitives
+import ritzlib.async.io
+
+# Re-export server patterns
+import ritzlib.async.server
+
+# Re-export executor
+import ritzlib.async.executor
+
+
+# ============================================================================
+# Quick reference - Common patterns
+# ============================================================================
+#
+# Pattern 1: Simple TCP server with multishot accept
+#
+#   fn handle_connection(task: *Task) -> i32
+#       match task.handler_state
+#           0 =>
+#               task_recv(task)
+#               task.handler_state = 1
+#               return -1
+#           1 =>
+#               if task.io_result <= 0
+#                   return 0
+#               # Process request, build response...
+#               task_send(task, response_len)
+#               task.handler_state = 2
+#               return -1
+#           2 =>
+#               # Send complete, reset for keep-alive or close
+#               if should_keep_alive
+#                   task_reset_for_recv(task)
+#                   return -1
+#               return 0
+#
+#   fn main() -> i32
+#       let fd = tcp_socket()
+#       tcp_bind(fd, 0, 8080)
+#       tcp_listen(fd, 128)
+#       set_reuseaddr(fd)
+#
+#       var srv: TaskServer
+#       task_server_init(@srv, fd)
+#       task_server_run_multishot(@srv, handle_connection)
+#       task_server_destroy(@srv)
+#       0
+#
+#
+# Pattern 2: Vectored I/O for zero-copy responses
+#
+#   fn handle_connection(task: *Task) -> i32
+#       match task.handler_state
+#           0 =>
+#               task_recv(task)
+#               task.handler_state = 1
+#               return -1
+#           1 =>
+#               if task.io_result <= 0
+#                   return 0
+#               # Build response using IoVecBuilder
+#               let b = @task.iov_builder
+#               iovec_builder_reset(b)
+#               iovec_append_static(b, "HTTP/1.1 200 OK\r\n")
+#               iovec_append_static(b, "Content-Length: 13\r\n\r\n")
+#               iovec_append_static(b, "Hello, World!")
+#               task_sendv_builder(task)
+#               task.handler_state = 2
+#               return -1
+#           2 =>
+#               return 0
+#
+#
+# Pattern 3: Manual TaskPool without TaskServer
+#
+#   var ring: IoUring
+#   uring_init(@ring, 256)
+#
+#   var pool: TaskPool
+#   task_pool_init(@pool, @ring)
+#
+#   # Manually accept and spawn
+#   let client = tcp_accept(listen_fd)
+#   spawn_task(@pool, client, my_handler)
+#
+#   # Run all tasks
+#   run_tasks(@pool)
+#
+#   uring_destroy(@ring)

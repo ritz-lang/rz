@@ -1,0 +1,617 @@
+# toml - TOML config file parser
+#
+# Usage: toml [OPTIONS] [FILE]
+#   Parse and query TOML configuration files.
+#
+# Options:
+#   -g KEY        Get value for specific key (dotted path, e.g., "package.name")
+#   -k, --keys    List all top-level keys
+#   -v, --validate Validate only (no output)
+#   -h, --help    Show help
+#
+# Examples:
+#   toml config.toml                   # Pretty print
+#   toml -g package.name config.toml   # Get specific value
+#   toml -k config.toml                # List keys
+#
+# Supported TOML subset:
+#   - Key-value pairs (key = "value")
+#   - Sections ([section])
+#   - Strings (basic and literal)
+#   - Integers and floats
+#   - Booleans (true/false)
+#   - Comments (#)
+
+# ============================================================================
+# Standard library imports
+# ============================================================================
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+import ritzlib.args
+import ritzlib.gvec
+
+# ============================================================================
+# TOML Value Types
+# ============================================================================
+
+const TOML_STRING: i32 = 0
+const TOML_INTEGER: i32 = 1
+const TOML_FLOAT: i32 = 2
+const TOML_BOOL: i32 = 3
+const TOML_ARRAY: i32 = 4
+const TOML_TABLE: i32 = 5
+
+const MAX_KEY_LEN: i64 = 256
+const MAX_VALUE_LEN: i64 = 4096
+
+# ============================================================================
+# Key-Value Entry
+# ============================================================================
+
+struct TomlEntry
+    key: [256]u8       # Full dotted key path
+    value: [4096]u8    # String representation of value
+    value_type: i32
+
+# Helper functions to get pointers to entry fields
+# (workaround for &entry.key[0] not being supported)
+fn entry_key_ptr(entry: *TomlEntry) -> *u8
+    return entry as *u8
+
+fn entry_value_ptr(entry: *TomlEntry) -> *u8
+    return (entry as *u8) + 256
+
+# ============================================================================
+# TOML Parser
+# ============================================================================
+
+struct TomlParser
+    data: *u8
+    len: i64
+    pos: i64
+    line: i32
+    # Current section prefix
+    section: [256]u8
+    section_len: i64
+    # Parsed entries
+    entries: *TomlEntry
+    entry_count: i32
+    max_entries: i32
+    # Error tracking
+    error: i32
+    error_msg: *u8
+
+# Get pointer to parser's section field (at offset 32: 8+8+8+4+4padding)
+fn parser_section_ptr(p: *TomlParser) -> *u8
+    return (p as *u8) + 32
+
+fn parser_init(p: *TomlParser, data: *u8, len: i64, entries: *TomlEntry, max: i32) -> i32
+    p.data = data
+    p.len = len
+    p.pos = 0
+    p.line = 1
+    let sec_ptr: *u8 = parser_section_ptr(p)
+    *sec_ptr = 0
+    p.section_len = 0
+    p.entries = entries
+    p.entry_count = 0
+    p.max_entries = max
+    p.error = 0
+    p.error_msg = ""
+    return 0
+
+fn peek(p: *TomlParser) -> u8
+    if p.pos >= p.len
+        return 0
+    return *(p.data + p.pos)
+
+fn peek_at(p: *TomlParser, offset: i64) -> u8
+    let pos: i64 = p.pos + offset
+    if pos >= p.len
+        return 0
+    return *(p.data + pos)
+
+fn advance(p: *TomlParser) -> u8
+    if p.pos >= p.len
+        return 0
+    let c: u8 = *(p.data + p.pos)
+    p.pos = p.pos + 1
+    if c == '\n'
+        p.line = p.line + 1
+    return c
+
+fn set_error(p: *TomlParser, msg: *u8) -> i32
+    p.error = 1
+    p.error_msg = msg
+    return -1
+
+fn skip_whitespace(p: *TomlParser) -> i32
+    while p.pos < p.len
+        let c: u8 = peek(p)
+        if c == ' ' or c == '\t'  # space or tab
+            advance(p)
+        else
+            break
+    return 0
+
+fn skip_to_eol(p: *TomlParser) -> i32
+    while p.pos < p.len
+        let c: u8 = peek(p)
+        if c == '\n' or c == '\r'
+            break
+        advance(p)
+    return 0
+
+fn skip_comment(p: *TomlParser) -> i32
+    if peek(p) == '#'  # '#'
+        skip_to_eol(p)
+    return 0
+
+fn skip_ws_and_comments(p: *TomlParser) -> i32
+    while p.pos < p.len
+        let c: u8 = peek(p)
+        if c == ' ' or c == '\t'
+            advance(p)
+        else if c == '#'  # '#'
+            skip_to_eol(p)
+        else if c == '\n' or c == '\r'
+            advance(p)
+        else
+            break
+    return 0
+
+fn is_bare_key_char(c: u8) -> i32
+    # A-Z, a-z, 0-9, _, -
+    if c >= 'A' and c <= 'Z'
+        return 1
+    if c >= 'a' and c <= 'z'
+        return 1
+    if c >= '0' and c <= '9'
+        return 1
+    if c == '_' or c == '-'  # _ or -
+        return 1
+    return 0
+
+# ============================================================================
+# Key parsing
+# ============================================================================
+
+fn parse_bare_key(p: *TomlParser, out: *u8, max_len: i64) -> i64
+    var len: i64 = 0
+    while p.pos < p.len and len < max_len - 1
+        let c: u8 = peek(p)
+        if is_bare_key_char(c) == 0
+            break
+        *(out + len) = advance(p)
+        len += 1
+    *(out + len) = 0
+    return len
+
+fn parse_quoted_key(p: *TomlParser, out: *u8, max_len: i64) -> i64
+    let quote: u8 = advance(p)  # skip opening quote
+    var len: i64 = 0
+
+    while p.pos < p.len and len < max_len - 1
+        let c: u8 = peek(p)
+        if c == quote
+            advance(p)
+            break
+        if c == '\\'  # backslash
+            advance(p)
+            if p.pos < p.len
+                *(out + len) = advance(p)
+                len += 1
+        else
+            *(out + len) = advance(p)
+            len += 1
+
+    *(out + len) = 0
+    return len
+
+fn parse_key(p: *TomlParser, out: *u8, max_len: i64) -> i64
+    let c: u8 = peek(p)
+    if c == '"' or c == '\''  # " or '
+        return parse_quoted_key(p, out, max_len)
+    else
+        return parse_bare_key(p, out, max_len)
+
+# ============================================================================
+# Value parsing
+# ============================================================================
+
+fn parse_basic_string(p: *TomlParser, out: *u8, max_len: i64) -> i64
+    advance(p)  # skip opening "
+    var len: i64 = 0
+
+    while p.pos < p.len and len < max_len - 1
+        let c: u8 = peek(p)
+        if c == '"'  # "
+            advance(p)
+            break
+        if c == '\\'  # backslash
+            advance(p)
+            if p.pos < p.len
+                let esc: u8 = advance(p)
+                if esc == 'n'  # n
+                    *(out + len) = 10
+                else if esc == 't'  # t
+                    *(out + len) = 9
+                else if esc == 'r'  # r
+                    *(out + len) = 13
+                else if esc == '\\'  # \
+                    *(out + len) = 92
+                else if esc == '"'  # "
+                    *(out + len) = 34
+                else
+                    *(out + len) = esc
+                len += 1
+        else
+            *(out + len) = advance(p)
+            len += 1
+
+    *(out + len) = 0
+    return len
+
+fn parse_literal_string(p: *TomlParser, out: *u8, max_len: i64) -> i64
+    advance(p)  # skip opening '
+    var len: i64 = 0
+
+    while p.pos < p.len and len < max_len - 1
+        let c: u8 = peek(p)
+        if c == '\''  # '
+            advance(p)
+            break
+        *(out + len) = advance(p)
+        len += 1
+
+    *(out + len) = 0
+    return len
+
+fn parse_number(p: *TomlParser, out: *u8, max_len: i64, val_type: *i32) -> i64
+    var len: i64 = 0
+    var has_dot: i32 = 0
+
+    # Optional sign
+    let c: u8 = peek(p)
+    if c == '+' or c == '-'  # + or -
+        *(out + len) = advance(p)
+        len += 1
+
+    while p.pos < p.len and len < max_len - 1
+        let d: u8 = peek(p)
+        if d >= '0' and d <= '9'
+            *(out + len) = advance(p)
+            len += 1
+        else if d == '.' and has_dot == 0
+            *(out + len) = advance(p)
+            len += 1
+            has_dot = 1
+        else if d == '_'  # underscore separator
+            advance(p)  # skip, don't include
+        else if d == 'e' or d == 69  # e or E
+            *(out + len) = advance(p)
+            len += 1
+            has_dot = 1  # exponent means float
+        else
+            break
+
+    *(out + len) = 0
+    if has_dot != 0
+        *val_type = TOML_FLOAT
+    else
+        *val_type = TOML_INTEGER
+    return len
+
+fn parse_value(p: *TomlParser, out: *u8, max_len: i64, val_type: *i32) -> i64
+    skip_whitespace(p)
+    let c: u8 = peek(p)
+
+    # String
+    if c == '"'  # "
+        *val_type = TOML_STRING
+        return parse_basic_string(p, out, max_len)
+
+    if c == '\''  # '
+        *val_type = TOML_STRING
+        return parse_literal_string(p, out, max_len)
+
+    # Boolean
+    if c == 't'  # 't'
+        if peek_at(p, 1) == 'r' and peek_at(p, 2) == 117 and peek_at(p, 3) == 'e'  # "rue"
+            p.pos = p.pos + 4
+            strcpy(out, "true")
+            *val_type = TOML_BOOL
+            return 4
+
+    if c == 'f'  # 'f'
+        if peek_at(p, 1) == 'a' and peek_at(p, 2) == 108 and peek_at(p, 3) == 115 and peek_at(p, 4) == 'e'  # "alse"
+            p.pos = p.pos + 5
+            strcpy(out, "false")
+            *val_type = TOML_BOOL
+            return 5
+
+    # Number
+    if c == '+' or c == '-' or (c >= '0' and c <= '9')  # + - 0-9
+        return parse_number(p, out, max_len, val_type)
+
+    # Array (simplified - just store as string representation)
+    if c == '['  # [
+        *val_type = TOML_ARRAY
+        var len: i64 = 0
+        var depth: i32 = 0
+        while p.pos < p.len and len < max_len - 1
+            let ch: u8 = peek(p)
+            if ch == '['
+                depth += 1
+            else if ch == ']'
+                depth -= 1
+            *(out + len) = advance(p)
+            len += 1
+            if depth == 0
+                break
+        *(out + len) = 0
+        return len
+
+    # Unknown
+    *val_type = TOML_STRING
+    return 0
+
+# ============================================================================
+# Entry management
+# ============================================================================
+
+fn add_entry(p: *TomlParser, key: *u8, value: *u8, val_type: i32) -> i32
+    if p.entry_count >= p.max_entries
+        return set_error(p, "too many entries")
+
+    let entry: *TomlEntry = p.entries + p.entry_count
+    let entry_key: *u8 = entry_key_ptr(entry)
+    let entry_val: *u8 = entry_value_ptr(entry)
+    let sec_ptr: *u8 = parser_section_ptr(p)
+
+    # Build full key path
+    if p.section_len > 0
+        strcpy(entry_key, sec_ptr)
+        strcpy(entry_key + p.section_len, ".")
+        strcpy(entry_key + p.section_len + 1, key)
+    else
+        strcpy(entry_key, key)
+
+    strcpy(entry_val, value)
+    entry.value_type = val_type
+
+    p.entry_count = p.entry_count + 1
+    return 0
+
+# ============================================================================
+# Section and key-value parsing
+# ============================================================================
+
+fn parse_section(p: *TomlParser) -> i32
+    advance(p)  # skip [
+    let sec_ptr: *u8 = parser_section_ptr(p)
+
+    # Check for [[array]]
+    if peek(p) == '['
+        advance(p)
+        # Parse array table name
+        let len: i64 = parse_key(p, sec_ptr, 256)
+        p.section_len = len
+        skip_whitespace(p)
+        if peek(p) == ']'
+            advance(p)
+        if peek(p) == ']'
+            advance(p)
+        return 0
+
+    # Regular section
+    p.section_len = parse_key(p, sec_ptr, 256)
+    skip_whitespace(p)
+    if peek(p) == ']'
+        advance(p)
+    return 0
+
+fn parse_keyval(p: *TomlParser) -> i32
+    var key_buf: [256]u8
+    let key_len: i64 = parse_key(p, &key_buf[0], 256)
+    if key_len == 0
+        return set_error(p, "expected key")
+
+    skip_whitespace(p)
+    if peek(p) != 61  # '='
+        return set_error(p, "expected '='")
+    advance(p)
+
+    var value_buf: [4096]u8
+    var val_type: i32 = TOML_STRING
+    let val_len: i64 = parse_value(p, &value_buf[0], 4096, &val_type)
+
+    add_entry(p, &key_buf[0], &value_buf[0], val_type)
+    return 0
+
+fn parse_line(p: *TomlParser) -> i32
+    skip_whitespace(p)
+    let c: u8 = peek(p)
+
+    if c == 0 or c == '\n' or c == '\r'
+        # Empty line
+        if c != 0
+            advance(p)
+        return 0
+
+    if c == '#'  # Comment
+        skip_to_eol(p)
+        return 0
+
+    if c == '['  # Section
+        parse_section(p)
+        skip_comment(p)
+        if peek(p) == '\n' or peek(p) == '\r'
+            advance(p)
+        return 0
+
+    # Key-value pair
+    parse_keyval(p)
+    skip_whitespace(p)
+    skip_comment(p)
+    if peek(p) == '\n' or peek(p) == '\r'
+        advance(p)
+    return 0
+
+fn parse_document(p: *TomlParser) -> i32
+    skip_ws_and_comments(p)
+    while p.pos < p.len and p.error == 0
+        parse_line(p)
+    return p.error
+
+# ============================================================================
+# Query and output
+# ============================================================================
+
+fn find_entry(entries: *TomlEntry, count: i32, key: *u8) -> *TomlEntry
+    for i in 0..count
+        let e: *TomlEntry = entries + i
+        let e_key: *u8 = entry_key_ptr(e)
+        if streq(e_key, key) != 0
+            return e
+    return null
+
+fn print_entries(entries: *TomlEntry, count: i32) -> i32
+    for i in 0..count
+        let e: *TomlEntry = entries + i
+        let e_key: *u8 = entry_key_ptr(e)
+        let e_val: *u8 = entry_value_ptr(e)
+        prints(e_key)
+        prints(" = ")
+        if e.value_type == TOML_STRING
+            prints("\"")
+            prints(e_val)
+            prints("\"")
+        else
+            prints(e_val)
+        prints("\n")
+    return 0
+
+fn print_keys(entries: *TomlEntry, count: i32) -> i32
+    for i in 0..count
+        let e: *TomlEntry = entries + i
+        let e_key: *u8 = entry_key_ptr(e)
+        prints(e_key)
+        prints("\n")
+    return 0
+
+# ============================================================================
+# File reading
+# ============================================================================
+
+fn read_file(path: *u8, buf: *Vec<u8>) -> i32
+    let fd: i32 = sys_open(path, 0)
+    if fd < 0
+        return -1
+
+    var tmp: [4096]u8
+    while 1 == 1
+        let n: i64 = sys_read(fd, &tmp[0], 4096)
+        if n < 0
+            sys_close(fd)
+            return -1
+        if n == 0
+            break
+        vec_push_bytes<u8>(buf, &tmp[0], n)
+
+    sys_close(fd)
+    return 0
+
+fn read_stdin(buf: *Vec<u8>) -> i32
+    var tmp: [4096]u8
+    while 1 == 1
+        let n: i64 = sys_read(0, &tmp[0], 4096)
+        if n < 0
+            return -1
+        if n == 0
+            break
+        vec_push_bytes<u8>(buf, &tmp[0], n)
+    return 0
+
+# ============================================================================
+# Main
+# ============================================================================
+
+const MAX_ENTRIES: i32 = 256
+
+fn main(argc: i32, argv: **u8) -> i32
+    var argparser: ArgParser
+    args_init(&argparser, "toml", "TOML config file parser")
+    args_option(&argparser, 'g', "get", "KEY", "Get value for specific key", "")
+    args_flag(&argparser, 'k', "keys", "List all keys")
+    args_flag(&argparser, 'v', "validate", "Validate only (no output)")
+    args_positional(&argparser, "FILE", "TOML file to process (stdin if omitted)", 0, 1)
+
+    if args_parse(&argparser, argc, argv) != 0
+        return 1
+
+    let get_key: *u8 = args_get_str(&argparser, 'g')
+    let list_keys: i32 = args_get_flag(&argparser, 'k')
+    let validate_only: i32 = args_get_flag(&argparser, 'v')
+
+    # Read input
+    var input: Vec<u8> = vec_new<u8>()
+
+    if argparser.positional_count > 0
+        let path: *u8 = args_get_positional(&argparser, 0)
+        if read_file(path, &input) != 0
+            eprints("toml: cannot read file: ")
+            eprints(path)
+            eprints("\n")
+            return 1
+    else
+        if read_stdin(&input) != 0
+            eprints("toml: cannot read stdin\n")
+            return 1
+
+    vec_push<u8>(&input, 0)  # null terminate
+
+    # Allocate entry storage
+    let entries_size: i64 = MAX_ENTRIES as i64 * 4360  # sizeof(TomlEntry) approx
+    let entries_ptr: i64 = sys_mmap(0, entries_size, 3, 34, -1, 0)
+    if entries_ptr < 0
+        eprints("toml: memory allocation failed\n")
+        return 1
+    let entries: *TomlEntry = entries_ptr as *TomlEntry
+
+    # Parse
+    var parser: TomlParser
+    parser_init(&parser, input.data, input.len - 1, entries, MAX_ENTRIES)
+
+    if parse_document(&parser) != 0
+        eprints("toml: parse error at line ")
+        print_int(parser.line as i64)
+        eprints(": ")
+        eprints(parser.error_msg)
+        eprints("\n")
+        sys_munmap(entries_ptr, entries_size)
+        return 1
+
+    # Output
+    if validate_only == 0
+        if get_key != null and *get_key != 0
+            let entry: *TomlEntry = find_entry(entries, parser.entry_count, get_key)
+            if entry == null
+                eprints("toml: key not found: ")
+                eprints(get_key)
+                eprints("\n")
+                sys_munmap(entries_ptr, entries_size)
+                return 1
+            let entry_val: *u8 = entry_value_ptr(entry)
+            prints(entry_val)
+            prints("\n")
+        else if list_keys != 0
+            print_keys(entries, parser.entry_count)
+        else
+            print_entries(entries, parser.entry_count)
+
+    sys_munmap(entries_ptr, entries_size)
+    # Drop is automatic via RAII
+    return 0

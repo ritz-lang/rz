@@ -1,0 +1,504 @@
+# ritz1/src/main.ritz - Main Entry Point for ritz1 Compiler
+#
+# The ritz1 compiler: compiles Ritz source to LLVM IR.
+# Uses the generated parser (parser_gen.ritz) and emitter (emitter.ritz).
+#
+# Usage: ritz1 input.ritz -o output.ll
+#
+# Pipeline:
+#   1. Read source file
+#   2. Tokenize with NFA lexer
+#   3. Parse to AST using generated parser
+#   4. Emit LLVM IR
+#   5. Write to output file
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+import ritzlib.gvec
+import ritzlib.memory
+
+# Lexer and parser infrastructure
+import tokens_gen
+import nfa
+import lexer_nfa
+import lexer_setup_gen
+import ast
+import ast_helpers
+import parser_gen
+import monomorph
+import emitter
+
+# =============================================================================
+# File I/O Helpers
+# =============================================================================
+
+fn read_file(path: *u8) -> Vec<u8>
+  var buf: Vec<u8> = vec_new<u8>()
+  let fd: i32 = sys_open(path, O_RDONLY)
+  if fd < 0
+    eprints("Error: Cannot open file: ")
+    eprints(path)
+    eprints("\n")
+    return buf
+
+  # Read in chunks
+  var chunk: [4096]u8
+  let chunk_ptr: *u8 = @chunk[0]
+  var n: i64 = 1
+  while n > 0
+    n = sys_read(fd, chunk_ptr, 4096)
+    if n > 0
+      for i in 0..n
+        vec_push<u8>(@buf, chunk[i])
+
+  sys_close(fd)
+  # Add null terminator
+  vec_push<u8>(@buf, 0)
+  buf
+
+fn write_file(path: *u8, data: *u8, len: i64) -> i32
+  let fd: i32 = sys_open3(path, O_WRONLY + O_CREAT + O_TRUNC, 420)
+  if fd < 0
+    eprints("Error: Cannot create output file: ")
+    eprints(path)
+    eprints("\n")
+    return -1
+  sys_write(fd, data, len)
+  sys_close(fd)
+  0
+
+# =============================================================================
+# Tokenizer
+# =============================================================================
+
+fn tokenize(src: *u8, src_len: i64, tokens: *Vec<Token>) -> i32
+  # Allocate storage for lexer NFA structures
+  var nfa_storage: NFA
+  var patterns_storage: [128]TokenPattern
+  var states_storage: [4096]NFAState
+  var trans_storage: [8192]Transition
+
+  # Initialize lexer with NFA patterns
+  var lex: Lexer
+  setup_lexer(@lex, @nfa_storage, @patterns_storage[0], @states_storage[0], @trans_storage[0])
+  lexer_reset(@lex, src, src_len)
+
+  var errors: i32 = 0
+  while 1 == 1
+    var tok: Token = lexer_next(@lex)
+    let kind: i32 = tok.kind
+    let line: i32 = tok.line
+    let col: i32 = tok.col
+    # Always push the token first (moves tok)
+    vec_push<Token>(tokens, tok)
+    # Then check conditions on kind (not tok)
+    if kind == TOK_EOF
+      break
+    if kind == TOK_ERROR
+      eprints("Lexer error at line ")
+      eprint_int(line as i64)
+      eprints(", column ")
+      eprint_int(col as i64)
+      eprints("\n")
+      errors = errors + 1
+
+  errors
+
+# =============================================================================
+# Parser
+# =============================================================================
+
+fn parse_tokens(tokens: *Vec<Token>) -> *Module
+  var p: Parser
+  parser_init(@p, tokens.data, tokens.len as i32, null)
+
+  let m: *Module = parse_module(@p)
+
+  if p.error != 0
+    eprints("Parse error at pos ")
+    eprint_int(p.pos as i64)
+    eprints("\n")
+    return null
+
+  m
+
+# =============================================================================
+# Import Resolution - Inline imported code into the module
+# =============================================================================
+
+# Track processed imports to avoid circular dependencies
+const MAX_PROCESSED_IMPORTS: i32 = 128
+
+# Store paths and lengths in separate parallel pointer-based arrays
+var g_import_paths: *u8 = null      # Packed storage of pointers (8 bytes each)
+var g_import_lens: *i32 = null     # Packed storage of lengths
+var g_processed_import_count: i32 = 0
+
+# Track source buffers to keep them alive (AST points into them)
+var g_source_buffers: **u8 = null
+var g_source_buffer_count: i32 = 0
+const MAX_SOURCE_BUFFERS: i32 = 128
+
+fn init_import_tracker()
+    # Allocate storage for 128 pointers (8 bytes each) = 1024 bytes
+    g_import_paths = malloc(1024) as *u8
+    # Allocate storage for 128 i32s (4 bytes each) = 512 bytes
+    g_import_lens = malloc(512) as *i32
+    # Allocate storage for source buffer pointers
+    g_source_buffers = malloc(1024) as **u8
+
+fn keep_source_alive(src_ptr: *u8)
+    # Store the source buffer pointer so it won't be deallocated
+    if g_source_buffer_count < MAX_SOURCE_BUFFERS
+        *(g_source_buffers + g_source_buffer_count) = src_ptr
+        g_source_buffer_count = g_source_buffer_count + 1
+
+fn was_import_processed(path: *u8, len: i32) -> i32
+    for i in 0..g_processed_import_count
+        # Access as pointer arrays
+        let stored_path: *u8 = *((g_import_paths as **u8) + i)
+        let stored_len: i32 = *(g_import_lens + i)
+        if stored_len == len
+            var j: i32 = 0
+            var matched: i32 = 1
+            while j < len
+                if *(stored_path + j) != *(path + j)
+                    matched = 0
+                    break
+                j += 1
+            if matched == 1
+                return 1
+    0
+
+fn mark_import_processed(path: *u8, len: i32)
+    if g_processed_import_count < MAX_PROCESSED_IMPORTS
+        # Store path pointer
+        *((g_import_paths as **u8) + g_processed_import_count) = path
+        # Store length
+        *(g_import_lens + g_processed_import_count) = len
+        g_processed_import_count = g_processed_import_count + 1
+
+# Get directory from a file path (returns length of directory part including trailing /)
+fn get_dir_len(path: *u8) -> i32
+    var len: i32 = 0
+    var last_slash: i32 = -1
+    while *(path + len) != 0
+        if *(path + len) == 47  # '/'
+            last_slash = len
+        len += 1
+    if last_slash >= 0
+        return last_slash + 1  # Include the trailing /
+    0
+
+# Build import path from import segments
+# Returns a null-terminated path string (caller must free)
+fn build_import_path(dir: *u8, dir_len: i32, imp: *ImportPath, ritz_path: *u8) -> *u8
+    # Calculate total length
+    # Format: dir + "/" + segment1/segment2/...segmentN.ritz
+    var total_len: i32 = dir_len + 1  # +1 for '/' separator between dir and segments
+    var seg: *ImportPath = imp
+    while seg != null
+        total_len = total_len + seg.segment_len
+        if seg.next != null
+            total_len = total_len + 1  # For '/'
+        else
+            total_len = total_len + 5  # For ".ritz"
+        seg = seg.next
+
+    # Allocate buffer
+    let buf: *u8 = malloc(total_len as i64 + 1) as *u8
+    if buf == null
+        return null
+
+    # Copy directory
+    var pos: i32 = 0
+    for i in 0..dir_len
+        *(buf + pos) = *(dir + i)
+        pos = pos + 1
+
+    # Add separator between dir and segments
+    *(buf + pos) = 47  # '/'
+    pos = pos + 1
+
+    # Copy segments
+    seg = imp
+    while seg != null
+        for i in 0..seg.segment_len
+            *(buf + pos) = *(seg.segment + i)
+            pos = pos + 1
+        if seg.next != null
+            *(buf + pos) = 47  # '/'
+            pos = pos + 1
+        else
+            # Add .ritz extension
+            *(buf + pos) = 46   # '.'
+            *(buf + pos + 1) = 114  # 'r'
+            *(buf + pos + 2) = 105  # 'i'
+            *(buf + pos + 3) = 116  # 't'
+            *(buf + pos + 4) = 122  # 'z'
+            pos = pos + 5
+        seg = seg.next
+
+    *(buf + pos) = 0  # Null terminate
+    buf
+
+# Try to open an import file, checking multiple paths
+# Returns: path to file if found, 0 if not found
+# Sets found_via_ritz_path to 1 if found via RITZ_PATH, 0 otherwise
+fn try_open_import(imp: *ImportPath, source_dir: *u8, source_dir_len: i32, ritz_path: *u8, ritz_path_len: i32, found_via_ritz_path: *i32) -> *u8
+    *found_via_ritz_path = 0
+
+    # First try relative to source file
+    var path: *u8 = build_import_path(source_dir, source_dir_len, imp, ritz_path)
+    if path != null
+        eprints("  Trying: ")
+        eprints(path)
+        eprints("\n")
+        let fd: i32 = sys_open(path, O_RDONLY)
+        if fd >= 0
+            sys_close(fd)
+            return path
+        free(path as *i8)
+
+    # Then try RITZ_PATH if set
+    if ritz_path_len > 0
+        path = build_import_path(ritz_path, ritz_path_len, imp, ritz_path)
+        if path != null
+            eprints("  Trying: ")
+            eprints(path)
+            eprints("\n")
+            let fd: i32 = sys_open(path, O_RDONLY)
+            if fd >= 0
+                sys_close(fd)
+                *found_via_ritz_path = 1
+                return path
+            free(path as *i8)
+
+    null
+
+# Resolve imports recursively, merging into the main module
+fn resolve_imports(m: *Module, source_dir: *u8, source_dir_len: i32, ritz_path: *u8, ritz_path_len: i32) -> i32
+    var imp: *ImportDecl = m.imports
+    while imp != null
+        # Debug: print what we're trying to import
+        eprints("[IMPORT] ")
+        var seg: *ImportPath = imp.path
+        while seg != null
+            for k in 0..seg.segment_len
+                eprint_char(*(seg.segment + k))
+            if seg.next != null
+                eprint_char(46)  # '.'
+            seg = seg.next
+        eprints("\n")
+
+        # Find the import file
+        var found_via_ritz_path: i32 = 0
+        let path: *u8 = try_open_import(imp.path, source_dir, source_dir_len, ritz_path, ritz_path_len, @found_via_ritz_path)
+        if path == null
+            eprints("Error: Could not read import file: ")
+            # Print import path for debugging
+            var seg: *ImportPath = imp.path
+            while seg != null
+                for k in 0..seg.segment_len
+                    eprint_char(*(seg.segment + k))
+                if seg.next != null
+                    eprint_char(47)  # '/'
+                seg = seg.next
+            eprints(".ritz\n")
+            return -1
+
+        # Check if already processed (cycle detection)
+        var path_len: i32 = 0
+        while *(path + path_len) != 0
+            path_len += 1
+
+        if was_import_processed(path, path_len) == 1
+            eprints("  (already processed, skipping)\n")
+            free(path as *i8)
+            imp = imp.next
+            continue
+
+        eprints("  Processing: ")
+        eprints(path)
+        eprints("\n")
+        mark_import_processed(path, path_len)
+
+        # Read, tokenize, parse the import
+        var import_src: Vec<u8> = read_file(path)
+        if import_src.len == 0
+            free(path as *i8)
+            return -1
+
+        # IMPORTANT: Token is 48 bytes but ritz0's sizeof returns 8 (6x undercount)
+        # So vec_with_cap<Token>(6000) only allocates space for ~1000 tokens
+        # We need capacity for 5000+ tokens, so request 6x that = 30000
+        var import_tokens: Vec<Token> = vec_with_cap<Token>(30000)
+        let lex_err: i32 = tokenize(import_src.data, import_src.len - 1, @import_tokens)
+        if lex_err > 0
+            eprints("Lexer errors in import: ")
+            eprints(path)
+            eprints("\n")
+            free(path as *i8)
+            return -1
+
+        let import_module: *Module = parse_tokens(@import_tokens)
+        if import_module == null
+            eprints("Parse error in import: ")
+            eprints(path)
+            eprints("\n")
+            free(path as *i8)
+            return -1
+
+        # Keep source buffer alive - AST node names point into it
+        # CRITICAL: We must "steal" the data pointer from the Vec to prevent
+        # the Vec's Drop impl from freeing it when import_src goes out of scope.
+        # The AST nodes hold pointers into this buffer, so we need it to persist.
+        keep_source_alive(import_src.data)
+        import_src.data = null  # Prevent Drop from freeing
+
+        # Recursively resolve imports in the imported module
+        # If file was found via RITZ_PATH, use empty source_dir so child imports
+        # also resolve relative to RITZ_PATH (not the file's directory)
+        var import_dir_len: i32 = 0
+        if found_via_ritz_path == 0
+            import_dir_len = get_dir_len(path)
+        let res: i32 = resolve_imports(import_module, path, import_dir_len, ritz_path, ritz_path_len)
+        if res < 0
+            free(path as *i8)
+            return -1
+
+        # Merge imported module into main module
+        # Merge structs (prepend to list)
+        if import_module.structs != null
+            var last_struct: *StructDef = import_module.structs
+            while last_struct.next != null
+                last_struct = last_struct.next
+            last_struct.next = m.structs
+            m.structs = import_module.structs
+
+        # Merge functions (prepend to list)
+        if import_module.functions != null
+            var last_fn: *FnDef = import_module.functions
+            while last_fn.next != null
+                last_fn = last_fn.next
+            last_fn.next = m.functions
+            m.functions = import_module.functions
+
+        # Merge constants (prepend to list)
+        if import_module.constants != null
+            var last_const: *ConstEntry = import_module.constants
+            while last_const.next != null
+                last_const = last_const.next
+            last_const.next = m.constants
+            m.constants = import_module.constants
+
+        # Merge global variables (prepend to list)
+        if import_module.globals != null
+            var last_global: *GlobalVarDef = import_module.globals
+            while last_global.next != null
+                last_global = last_global.next
+            last_global.next = m.globals
+            m.globals = import_module.globals
+
+        # Merge impl blocks (prepend to list)
+        if import_module.impls != null
+            var last_impl: *ImplBlock = import_module.impls
+            while last_impl.next != null
+                last_impl = last_impl.next
+            last_impl.next = m.impls
+            m.impls = import_module.impls
+
+        # DON'T free path - it's stored in import tracker for dedup checks
+        # (minor memory leak, but compiler only runs once)
+        imp = imp.next
+
+    0
+
+# =============================================================================
+# Main Entry Point
+# =============================================================================
+
+fn main(argc: i32, argv: **u8) -> i32
+  if argc < 4
+    eprints("Usage: ritz1 <input.ritz> -o <output.ll>\n")
+    return 1
+
+  let input_path: *u8 = argv[1]
+  let flag: *u8 = argv[2]
+  let output_path: *u8 = argv[3]
+
+  # Check for -o flag
+  if *(flag + 0) != 45 or *(flag + 1) != 111  # -o
+    eprints("Error: Expected -o flag\n")
+    return 1
+
+  # Read source file
+  var src: Vec<u8> = read_file(input_path)
+  if src.len == 0
+    return 1
+
+  # Tokenize - pre-allocate enough capacity to avoid realloc bug
+  # (ritz0 has a bug where sizeof(T) returns 8 instead of the actual struct size)
+  # Token is ~48 bytes, but sizeof returns 8 (6x undercount)
+  # To get space for ~1000 tokens, we need to request 6000 capacity
+  var tokens: Vec<Token> = vec_with_cap<Token>(6000)
+  let lex_errors: i32 = tokenize(src.data, src.len - 1, @tokens)
+  if lex_errors > 0
+    eprints("Lexer errors: ")
+    eprint_int(lex_errors as i64)
+    eprints("\n")
+    return 1
+
+  # Parse
+  let m: *Module = parse_tokens(@tokens)
+  if m == null
+    return 1
+
+  # DISABLED: Keep main source buffer alive - see comment below
+  # Note: src.data is a Vec that stays in scope until function returns,
+  # so AST pointers into it remain valid during emit. No need to call
+  # keep_source_alive here - it would corrupt the allocator.
+
+  # Get source directory for relative imports
+  let source_dir_len: i32 = get_dir_len(input_path)
+
+  # Parse RITZ_PATH from optional command line argument: -I <path>
+  var ritz_path: *u8 = null
+  var ritz_path_len: i32 = 0
+  if argc >= 6
+    let dash_i: *u8 = argv[4]
+    if *(dash_i + 0) == 45 and *(dash_i + 1) == 73  # "-I"
+      ritz_path = argv[5]
+      while *(ritz_path + ritz_path_len) != 0
+        ritz_path_len += 1
+      # Ensure path ends with /
+      if ritz_path_len > 0 and *(ritz_path + ritz_path_len - 1) != 47
+        let new_ritz_path: *u8 = malloc(ritz_path_len as i64 + 2) as *u8
+        for k in 0..ritz_path_len
+          *(new_ritz_path + k) = *(ritz_path + k)
+        *(new_ritz_path + ritz_path_len) = 47  # '/'
+        *(new_ritz_path + ritz_path_len + 1) = 0
+        ritz_path = new_ritz_path
+        ritz_path_len = ritz_path_len + 1
+
+  # Initialize import tracker and resolve imports recursively
+  init_import_tracker()
+  let resolve_result: i32 = resolve_imports(m, input_path, source_dir_len, ritz_path, ritz_path_len)
+  if resolve_result < 0
+    eprints("Error: Import resolution failed\n")
+    return 1
+
+  # Monomorphize: generate specialized versions of generic functions
+  monomorphize_module(m)
+
+  # Emit IR - pre-allocate buffer to avoid realloc issues
+  # Typical IR output is 10-100KB for medium programs
+  var ir: Vec<u8> = vec_with_cap<u8>(131072)  # 128KB
+  emit_module(m, @ir)
+
+  # Write output
+  if write_file(output_path, ir.data, ir.len as i64) < 0
+    return 1
+
+  0

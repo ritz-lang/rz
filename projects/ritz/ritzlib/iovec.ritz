@@ -1,0 +1,274 @@
+# ritzlib/iovec.ritz - Vectored I/O for scatter/gather writes
+#
+# Provides zero-copy string building using iovec arrays for writev/sendmsg.
+# Static strings point directly to .rodata, dynamic strings use a pool.
+
+import ritzlib.sys
+import ritzlib.str
+import ritzlib.io
+import ritzlib.span
+
+# ============================================================================
+# iovec structure (matches Linux struct iovec)
+# ============================================================================
+
+struct Iovec
+    base: *u8      # Pointer to buffer
+    len: u64       # Length of buffer
+
+
+# ============================================================================
+# Small string optimization slot (16 bytes inline storage)
+# ============================================================================
+
+const INLINE_SIZE: i32 = 16
+
+struct InlineSlot
+    data: [16]u8   # Inline storage for small strings
+    len: i32       # Length used (0 = slot is a pointer, not inline)
+
+
+# ============================================================================
+# IoVec Builder - builds vectored strings for writev
+# ============================================================================
+#
+# Usage:
+#   var builder: IoVecBuilder
+#   iovec_builder_init(@builder)
+#   iovec_append_span(@builder, http_200_ok())         # Pre-computed length
+#   iovec_append_span(@builder, http_content_length()) # No strlen!
+#   iovec_append_int(@builder, 13)
+#   iovec_append_span(@builder, http_crlf())
+#   iovec_append_span(@builder, http_crlf())
+#   iovec_append_span(@builder, http_hello_world())
+#   let count = iovec_count(@builder)
+#   writev(fd, iovec_ptr(@builder), count)
+
+const MAX_IOVECS: i32 = 32
+const POOL_SIZE: i32 = 512   # Bytes for dynamic strings
+
+struct IoVecBuilder
+    iovecs: [32]Iovec       # Array of iovec entries
+    pool: [512]u8           # Pool for dynamic string data
+    count: i32              # Number of iovecs used
+    pool_used: i32          # Bytes used in pool
+
+
+# Initialize builder
+pub fn iovec_builder_init(b: *IoVecBuilder)
+    b.count = 0
+    b.pool_used = 0
+
+
+# Reset builder for reuse (keeps memory)
+pub fn iovec_builder_reset(b: *IoVecBuilder)
+    b.count = 0
+    b.pool_used = 0
+
+
+# Get pointer to iovec array (for writev)
+pub fn iovec_ptr(b: *IoVecBuilder) -> *Iovec
+    return @b.iovecs[0]
+
+
+# Get number of iovecs
+pub fn iovec_count(b: *IoVecBuilder) -> i32
+    return b.count
+
+
+# ============================================================================
+# Append operations
+# ============================================================================
+
+# Append a Span<u8> slice (zero-copy, length already known - NO strlen!)
+# This is the preferred method for Ritz strings.
+pub fn iovec_append_span(b: *IoVecBuilder, s: Span<u8>) -> i32
+    if b.count >= MAX_IOVECS
+        return -1
+
+    b.iovecs[b.count].base = s.ptr
+    b.iovecs[b.count].len = s.len as u64
+    b.count += 1
+    return s.len as i32
+
+
+# Append a static string (zero-copy - points directly to the string literal)
+# NOTE: This calls strlen() - prefer iovec_append_span() with Span<u8> slices!
+pub fn iovec_append_static(b: *IoVecBuilder, s: *u8) -> i32
+    if b.count >= MAX_IOVECS
+        return -1
+
+    let slen: u64 = strlen(s)
+    b.iovecs[b.count].base = s
+    b.iovecs[b.count].len = slen
+    b.count += 1
+    return slen as i32
+
+
+# Append a static string with explicit length (for binary data)
+pub fn iovec_append_bytes(b: *IoVecBuilder, data: *u8, len: i32) -> i32
+    if b.count >= MAX_IOVECS
+        return -1
+
+    b.iovecs[b.count].base = data
+    b.iovecs[b.count].len = len as u64
+    b.count += 1
+    return len
+
+
+# Append a Str slice (zero-copy - uses pre-computed length)
+# This is the preferred method for static strings with known lengths
+# Note: Works with Span<u8> since Str and Span<u8> are structurally identical
+pub fn iovec_append_str(b: *IoVecBuilder, s: Span<u8>) -> i32
+    if b.count >= MAX_IOVECS
+        return -1
+
+    b.iovecs[b.count].base = s.ptr
+    b.iovecs[b.count].len = s.len as u64
+    b.count += 1
+    return s.len as i32
+
+
+# Append a dynamic string (copies to pool)
+pub fn iovec_append_copy(b: *IoVecBuilder, s: *u8) -> i32
+    if b.count >= MAX_IOVECS
+        return -1
+
+    let slen: i32 = strlen(s) as i32
+    if b.pool_used + slen > POOL_SIZE
+        return -1  # Pool exhausted
+
+    # Copy to pool
+    let dest: *u8 = @b.pool[b.pool_used]
+    for i in 0..slen
+        *(dest + i) = *(s + i)
+
+    b.iovecs[b.count].base = dest
+    b.iovecs[b.count].len = slen as u64
+    b.count += 1
+    b.pool_used += slen
+    return slen
+
+
+# Append an integer as decimal string (uses pool)
+pub fn iovec_append_int(b: *IoVecBuilder, n: i64) -> i32
+    if b.count >= MAX_IOVECS
+        return -1
+
+    # i64 max is 20 digits + sign
+    if b.pool_used + 21 > POOL_SIZE
+        return -1
+
+    let dest: *u8 = @b.pool[b.pool_used]
+    var len: i32 = 0
+    var val: i64 = n
+
+    # Handle negative
+    if val < 0
+        *dest = '-'
+        len = 1
+        val = -val
+
+    # Handle zero
+    if val == 0
+        *(dest + len) = '0'
+        len += 1
+    else
+        # Count digits
+        var temp: i64 = val
+        var digits: i32 = 0
+        while temp > 0
+            digits += 1
+            temp = temp / 10
+
+        # Write digits in reverse
+        var pos: i32 = len + digits - 1
+        while val > 0
+            let digit: i32 = (val % 10) as i32
+            *(dest + pos) = ('0' + digit) as u8
+            pos -= 1
+            val = val / 10
+
+        len += digits
+
+    b.iovecs[b.count].base = dest
+    b.iovecs[b.count].len = len as u64
+    b.count += 1
+    b.pool_used += len
+    return len
+
+
+# Append unsigned integer
+pub fn iovec_append_uint(b: *IoVecBuilder, n: u64) -> i32
+    if b.count >= MAX_IOVECS
+        return -1
+
+    if b.pool_used + 20 > POOL_SIZE
+        return -1
+
+    let dest: *u8 = @b.pool[b.pool_used]
+    var len: i32 = 0
+    var val: u64 = n
+
+    if val == 0
+        *dest = '0'
+        len = 1
+    else
+        var temp: u64 = val
+        var digits: i32 = 0
+        while temp > 0
+            digits += 1
+            temp = temp / 10
+
+        var pos: i32 = digits - 1
+        while val > 0
+            let digit: i32 = (val % 10) as i32
+            *(dest + pos) = ('0' + digit) as u8
+            pos -= 1
+            val = val / 10
+
+        len = digits
+
+    b.iovecs[b.count].base = dest
+    b.iovecs[b.count].len = len as u64
+    b.count += 1
+    b.pool_used += len
+    return len
+
+
+# ============================================================================
+# Convenience: append CRLF
+# ============================================================================
+
+pub fn iovec_append_crlf(b: *IoVecBuilder) -> i32
+    return iovec_append_static(b, c"\r\n")
+
+
+# ============================================================================
+# io_uring / writev integration
+# ============================================================================
+
+# Total bytes across all iovecs
+pub fn iovec_total_len(b: *IoVecBuilder) -> i64
+    var total: i64 = 0
+    for i in 0..b.count
+        total += b.iovecs[i].len as i64
+    return total
+
+
+# For debugging: print all iovecs
+pub fn iovec_debug_print(b: *IoVecBuilder)
+    prints("IoVecBuilder: ")
+    print_int(b.count as i64)
+    prints(" iovecs, ")
+    print_int(b.pool_used as i64)
+    prints(" pool bytes, ")
+    print_int(iovec_total_len(b))
+    prints(" total bytes\n")
+
+    for i in 0..b.count
+        prints("  [")
+        print_int(i as i64)
+        prints("] len=")
+        print_int(b.iovecs[i].len as i64)
+        prints("\n")

@@ -1,0 +1,401 @@
+# ritz1/src/lexer.ritz - Hand-Written Lexer
+#
+# Character-by-character scanner that produces Token stream
+
+import tokens_gen
+
+# Lexer state
+struct Lexer
+  src: *u8          # Source code buffer
+  len: i32          # Source length
+  pos: i32          # Current position
+  line: i32         # Current line (1-based)
+  col: i32          # Current column (1-based)
+
+# Initialize lexer with source buffer
+fn lexer_init(src: *u8, len: i32) -> Lexer
+  Lexer {
+    src: src,
+    len: len,
+    pos: 0,
+    line: 1,
+    col: 1
+  }
+
+# Peek current character without advancing
+fn lexer_peek(lex: *Lexer) -> i32
+  if lex**.pos >= lex**.len
+    return 0  # EOF
+  let p = lex**.src + lex**.pos
+  *p as i32
+
+# Advance one character and update position tracking
+fn lexer_advance(lex: *Lexer) -> i32
+  if lex**.pos >= lex**.len
+    return 0
+
+  let p = lex**.src + lex**.pos
+  let ch = *p as i32
+
+  lex**.pos = lex**.pos + 1
+
+  if ch == 10  # '\n'
+    lex**.line = lex**.line + 1
+    lex**.col = 1
+  else
+    lex**.col = lex**.col + 1
+
+  ch
+
+# Check if character is digit (0-9)
+fn is_digit(ch: i32) -> i32
+  ch >= 48 and ch <= 57  # '0' to '9'
+
+# Check if character is letter or underscore
+fn is_alpha(ch: i32) -> i32
+  (ch >= 65 and ch <= 90) or   # 'A' to 'Z'
+  (ch >= 97 and ch <= 122) or  # 'a' to 'z'
+  ch == 95                    # '_'
+
+# Check if character is alphanumeric or underscore
+fn is_alnum(ch: i32) -> i32
+  is_alpha(ch) or is_digit(ch)
+
+# Check if character is whitespace (space, tab, CR)
+# Note: newline is significant in Ritz, so it's NOT whitespace
+fn is_whitespace(ch: i32) -> i32
+  ch == 32 or ch == 9 or ch == 13  # space, tab, CR
+
+# Skip whitespace (but not newlines)
+fn lexer_skip_whitespace(lex: *Lexer)
+  while 1
+    let ch = lexer_peek(lex)
+    if is_whitespace(ch)
+      lexer_advance(lex)
+    else
+      return
+
+# Skip line comment (# to end of line)
+fn lexer_skip_comment(lex: *Lexer)
+  while 1
+    let ch = lexer_peek(lex)
+    if ch == 0 or ch == 10  # EOF or '\n'
+      return
+    lexer_advance(lex)
+
+# Match keyword or return TOK_IDENT
+fn lexer_match_keyword(start: *u8, len: i32) -> i32
+  # Two-character keywords
+  if len == 2
+    let c0 = *start as i32
+    let c1 = *(start + 1) as i32
+    if c0 == 102 and c1 == 110  # "fn"
+      return TOK_FN
+    if c0 == 105 and c1 == 102  # "if"
+      return TOK_IF
+    if c0 == 117 and c1 == 56  # "u8"
+      return TOK_U8
+
+  # Three-character keywords
+  if len == 3
+    let c0 = *start as i32
+    let c1 = *(start + 1) as i32
+    let c2 = *(start + 2) as i32
+    if c0 == 118 and c1 == 97 and c2 == 114  # "var"
+      return TOK_VAR
+    if c0 == 108 and c1 == 101 and c2 == 116  # "let"
+      return TOK_LET
+    if c0 == 105 and c1 == 51 and c2 == 50  # "i32"
+      return TOK_I32
+    if c0 == 105 and c1 == 54 and c2 == 52  # "i64"
+      return TOK_I64
+
+  # Four-character keywords
+  if len == 4
+    let c0 = *start as i32
+    let c1 = *(start + 1) as i32
+    let c2 = *(start + 2) as i32
+    let c3 = *(start + 3) as i32
+    if c0 == 101 and c1 == 108 and c2 == 115 and c3 == 101  # "else"
+      return TOK_ELSE
+    if c0 == 98 and c1 == 111 and c2 == 111 and c3 == 108  # "bool"
+      return TOK_BOOL
+
+  # Five-character keywords
+  if len == 5
+    let c0 = *start as i32
+    let c1 = *(start + 1) as i32
+    let c2 = *(start + 2) as i32
+    let c3 = *(start + 3) as i32
+    let c4 = *(start + 4) as i32
+    if c0 == 119 and c1 == 104 and c2 == 105 and c3 == 108 and c4 == 101  # "while"
+      return TOK_WHILE
+
+  # Six-character keywords
+  if len == 6
+    let c0 = *start as i32
+    let c1 = *(start + 1) as i32
+    let c2 = *(start + 2) as i32
+    let c3 = *(start + 3) as i32
+    let c4 = *(start + 4) as i32
+    let c5 = *(start + 5) as i32
+    if c0 == 114 and c1 == 101 and c2 == 116 and c3 == 117 and c4 == 114 and c5 == 110  # "return"
+      return TOK_RETURN
+    if c0 == 101 and c1 == 120 and c2 == 116 and c3 == 101 and c4 == 114 and c5 == 110  # "extern"
+      return TOK_EXTERN
+    if c0 == 115 and c1 == 116 and c2 == 114 and c3 == 117 and c4 == 99 and c5 == 116  # "struct"
+      return TOK_STRUCT
+
+  # Not a keyword
+  TOK_IDENT
+
+# Scan identifier or keyword
+fn lexer_scan_ident(lex: *Lexer) -> Token
+  let start_pos = lex**.pos
+  let start_line = lex**.line
+  let start_col = lex**.col
+
+  # Consume first character (already verified as alpha)
+  lexer_advance(lex)
+
+  # Consume remaining alphanumeric characters
+  while 1
+    let ch = lexer_peek(lex)
+    if is_alnum(ch)
+      lexer_advance(lex)
+    else
+      # End of identifier
+      let len = lex**.pos - start_pos
+      let start = lex**.src + start_pos
+      let kind = lexer_match_keyword(start, len)
+
+      return Token {
+        kind: kind,
+        start: start,
+        len: len,
+        line: start_line,
+        col: start_col
+      }
+
+# Scan number (integers only for now)
+fn lexer_scan_number(lex: *Lexer) -> Token
+  let start_pos = lex**.pos
+  let start_line = lex**.line
+  let start_col = lex**.col
+
+  # Consume digits
+  while 1
+    let ch = lexer_peek(lex)
+    if is_digit(ch)
+      lexer_advance(lex)
+    else
+      # End of number
+      let len = lex**.pos - start_pos
+      return Token {
+        kind: TOK_NUMBER,
+        start: lex**.src + start_pos,
+        len: len,
+        line: start_line,
+        col: start_col
+      }
+
+# Scan string literal
+fn lexer_scan_string(lex: *Lexer) -> Token
+  let start_pos = lex**.pos
+  let start_line = lex**.line
+  let start_col = lex**.col
+
+  # Consume opening quote
+  lexer_advance(lex)
+
+  # Consume characters until closing quote
+  while 1
+    let ch = lexer_peek(lex)
+
+    if ch == 0  # EOF
+      # Unterminated string - return error token
+      return Token {
+        kind: TOK_ERROR,
+        start: lex**.src + start_pos,
+        len: lex**.pos - start_pos,
+        line: start_line,
+        col: start_col
+      }
+
+    if ch == 34  # '"'
+      # Consume closing quote
+      lexer_advance(lex)
+
+      # Return token (includes quotes)
+      let len = lex**.pos - start_pos
+      return Token {
+        kind: TOK_STRING,
+        start: lex**.src + start_pos,
+        len: len,
+        line: start_line,
+        col: start_col
+      }
+
+    if ch == 92  # '\' (escape sequence)
+      lexer_advance(lex)
+      # Consume next character (escaped char)
+      lexer_advance(lex)
+    else
+      lexer_advance(lex)
+
+# Get next token from source
+fn lexer_next_token(lex: *Lexer) -> Token
+  # Skip whitespace and comments
+  while 1
+    lexer_skip_whitespace(lex)
+
+    let ch = lexer_peek(lex)
+
+    # Skip comments
+    if ch == 35  # '#'
+      lexer_skip_comment(lex)
+    else
+      # Not whitespace or comment
+      let start_line = lex**.line
+      let start_col = lex**.col
+      let start_pos = lex**.pos
+
+      # EOF
+      if ch == 0
+        return Token {
+          kind: TOK_EOF,
+          start: lex**.src + start_pos,
+          len: 0,
+          line: start_line,
+          col: start_col
+        }
+
+      # Newline (significant in Ritz)
+      if ch == 10  # '\n'
+        lexer_advance(lex)
+        return Token {
+          kind: TOK_NEWLINE,
+          start: lex**.src + start_pos,
+          len: 1,
+          line: start_line,
+          col: start_col
+        }
+
+      # Identifier or keyword
+      if is_alpha(ch)
+        return lexer_scan_ident(lex)
+
+      # Number
+      if is_digit(ch)
+        return lexer_scan_number(lex)
+
+      # String literal
+      if ch == 34  # '"'
+        return lexer_scan_string(lex)
+
+      # Single-character tokens
+      lexer_advance(lex)
+
+      # Operators and delimiters
+      if ch == 43  # '+'
+        return Token { kind: TOK_PLUS, start: lex**.src + start_pos, len: 1, line: start_line, col: start_col }
+
+      if ch == 45  # '-'
+        # Check for '->'
+        if lexer_peek(lex) == 62  # '>'
+          lexer_advance(lex)
+          return Token { kind: TOK_ARROW, start: lex**.src + start_pos, len: 2, line: start_line, col: start_col }
+        return Token { kind: TOK_MINUS, start: lex**.src + start_pos, len: 1, line: start_line, col: start_col }
+
+      if ch == 42  # '*'
+        # Check for '**'
+        if lexer_peek(lex) == 42
+          lexer_advance(lex)
+          return Token { kind: TOK_STAR_STAR, start: lex**.src + start_pos, len: 2, line: start_line, col: start_col }
+        return Token { kind: TOK_STAR, start: lex**.src + start_pos, len: 1, line: start_line, col: start_col }
+
+      if ch == 47  # '/'
+        return Token { kind: TOK_SLASH, start: lex**.src + start_pos, len: 1, line: start_line, col: start_col }
+
+      if ch == 37  # '%'
+        return Token { kind: TOK_PERCENT, start: lex**.src + start_pos, len: 1, line: start_line, col: start_col }
+
+      if ch == 61  # '='
+        # Check for '=='
+        if lexer_peek(lex) == 61
+          lexer_advance(lex)
+          return Token { kind: TOK_EQ_EQ, start: lex**.src + start_pos, len: 2, line: start_line, col: start_col }
+        return Token { kind: TOK_EQ, start: lex**.src + start_pos, len: 1, line: start_line, col: start_col }
+
+      if ch == 33  # '!'
+        # Check for '!='
+        if lexer_peek(lex) == 61
+          lexer_advance(lex)
+          return Token { kind: TOK_BANG_EQ, start: lex**.src + start_pos, len: 2, line: start_line, col: start_col }
+        return Token { kind: TOK_BANG, start: lex**.src + start_pos, len: 1, line: start_line, col: start_col }
+
+      if ch == 60  # '<'
+        # Check for '<='
+        if lexer_peek(lex) == 61
+          lexer_advance(lex)
+          return Token { kind: TOK_LT_EQ, start: lex**.src + start_pos, len: 2, line: start_line, col: start_col }
+        return Token { kind: TOK_LT, start: lex**.src + start_pos, len: 1, line: start_line, col: start_col }
+
+      if ch == 62  # '>'
+        # Check for '>='
+        if lexer_peek(lex) == 61
+          lexer_advance(lex)
+          return Token { kind: TOK_GT_EQ, start: lex**.src + start_pos, len: 2, line: start_line, col: start_col }
+        return Token { kind: TOK_GT, start: lex**.src + start_pos, len: 1, line: start_line, col: start_col }
+
+      if ch == 38  # '&'
+        # Check for '&&'
+        if lexer_peek(lex) == 38
+          lexer_advance(lex)
+          return Token { kind: TOK_AND_AND, start: lex**.src + start_pos, len: 2, line: start_line, col: start_col }
+        return Token { kind: TOK_AMP, start: lex**.src + start_pos, len: 1, line: start_line, col: start_col }
+
+      if ch == 124  # '|'
+        # Check for '||'
+        if lexer_peek(lex) == 124
+          lexer_advance(lex)
+          return Token { kind: TOK_OR_OR, start: lex**.src + start_pos, len: 2, line: start_line, col: start_col }
+        # Single '|' is not a token yet
+        return Token { kind: TOK_ERROR, start: lex**.src + start_pos, len: 1, line: start_line, col: start_col }
+
+      # Delimiters
+      if ch == 40  # '('
+        return Token { kind: TOK_LPAREN, start: lex**.src + start_pos, len: 1, line: start_line, col: start_col }
+
+      if ch == 41  # ')'
+        return Token { kind: TOK_RPAREN, start: lex**.src + start_pos, len: 1, line: start_line, col: start_col }
+
+      if ch == 123  # '{'
+        return Token { kind: TOK_LBRACE, start: lex**.src + start_pos, len: 1, line: start_line, col: start_col }
+
+      if ch == 125  # '}'
+        return Token { kind: TOK_RBRACE, start: lex**.src + start_pos, len: 1, line: start_line, col: start_col }
+
+      if ch == 91  # '['
+        return Token { kind: TOK_LBRACKET, start: lex**.src + start_pos, len: 1, line: start_line, col: start_col }
+
+      if ch == 93  # ']'
+        return Token { kind: TOK_RBRACKET, start: lex**.src + start_pos, len: 1, line: start_line, col: start_col }
+
+      if ch == 44  # ','
+        return Token { kind: TOK_COMMA, start: lex**.src + start_pos, len: 1, line: start_line, col: start_col }
+
+      if ch == 58  # ':'
+        return Token { kind: TOK_COLON, start: lex**.src + start_pos, len: 1, line: start_line, col: start_col }
+
+      if ch == 46  # '.'
+        return Token { kind: TOK_DOT, start: lex**.src + start_pos, len: 1, line: start_line, col: start_col }
+
+      # Unknown character - error token
+      return Token {
+        kind: TOK_ERROR,
+        start: lex**.src + start_pos,
+        len: 1,
+        line: start_line,
+        col: start_col
+      }

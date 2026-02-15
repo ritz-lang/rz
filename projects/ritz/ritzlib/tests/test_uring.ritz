@@ -1,0 +1,111 @@
+# Test io_uring bindings
+#
+# Note: These tests require Linux 5.1+ with io_uring support.
+
+import ritzlib.sys
+import ritzlib.uring
+import ritzlib.testing
+
+[[test]]
+fn test_uring_constants()
+    # Verify syscall numbers
+    assert SYS_IO_URING_SETUP == 425
+    assert SYS_IO_URING_ENTER == 426
+    assert SYS_IO_URING_REGISTER == 427
+
+    # Verify opcode values
+    assert IORING_OP_NOP == 0
+    assert IORING_OP_READ == 22
+    assert IORING_OP_WRITE == 23
+    assert IORING_OP_ACCEPT == '\r'
+
+[[test]]
+fn test_uring_struct_sizes()
+    # Verify struct sizes match kernel expectations
+    # SQE should be 64 bytes
+    # CQE should be 16 bytes
+    # These are checked implicitly by correct field offsets
+
+    # For now just verify the constants exist
+    assert SQE_SIZE == '@'
+    assert CQE_SIZE == 16
+
+[[test]]
+fn test_uring_init_destroy()
+    # Test ring initialization and cleanup
+    var ring: IoUring
+
+    # Initialize with 8 entries
+    let ret: i32 = uring_init(@ring, 8)
+
+    if ret < 0
+        # io_uring not available (old kernel or container restriction)
+        # Skip test gracefully
+        return
+
+    # Verify ring was set up
+    assert ring.ring_fd >= 0
+    assert ring.sq_entries >= 8
+    assert ring.cq_entries >= 8
+
+    # Clean up
+    uring_destroy(@ring)
+
+[[test]]
+fn test_uring_sqe_preparation()
+    var ring: IoUring
+    let ret: i32 = uring_init(@ring, 8)
+
+    if ret < 0
+        return  # Skip if io_uring not available
+
+    # Get an SQE
+    let sqe: *IoUringSqe = uring_get_sqe(@ring)
+    assert sqe != (null)
+
+    # Prepare a read operation
+    var buf: [64]u8
+    uring_prep_read(sqe, 0, @buf[0], 64, 0, 12345)
+
+    # Verify SQE fields
+    assert sqe.opcode == IORING_OP_READ
+    assert sqe.fd == 0
+    assert sqe.len == '@'
+    assert sqe.user_data == 12345
+
+    uring_destroy(@ring)
+
+[[test]]
+fn test_uring_nop()
+    # Submit a NOP operation and verify completion
+    var ring: IoUring
+    let ret: i32 = uring_init(@ring, 8)
+
+    if ret < 0
+        return  # Skip if io_uring not available
+
+    # Prepare a NOP
+    let sqe: *IoUringSqe = uring_get_sqe(@ring)
+    if sqe == (null)
+        uring_destroy(@ring)
+        return
+
+    sqe.opcode = IORING_OP_NOP
+    sqe.user_data = 42
+
+    uring_sqe_submit(@ring)
+
+    # Submit and wait for completion
+    let submit_ret: i32 = uring_submit_and_wait(@ring, 1)
+    if submit_ret < 0
+        uring_destroy(@ring)
+        return
+
+    # Get the CQE
+    let cqe: *IoUringCqe = uring_peek_cqe(@ring)
+    assert cqe != (null)
+    assert cqe.user_data == 42
+    assert cqe.res == 0  # NOP should succeed with 0
+
+    uring_cqe_seen(@ring, cqe)
+    uring_destroy(@ring)

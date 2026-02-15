@@ -1,0 +1,228 @@
+# stat - display file or file system status
+#
+# Usage: stat [OPTIONS] FILE...
+#   Display detailed information about FILE(s).
+#
+# Options:
+#   -L        follow symlinks (use stat instead of lstat)
+#
+# Output includes:
+#   - File name
+#   - Size in bytes
+#   - Blocks allocated
+#   - File type and mode
+#   - Inode number
+#   - Links count
+#   - UID/GID
+#
+# Examples:
+#   stat file.txt
+#   stat -L link
+
+# ============================================================================
+# Standard library imports
+# ============================================================================
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.fs
+import ritzlib.args
+
+# ============================================================================
+# Options
+# ============================================================================
+
+struct StatOptions
+    follow_links: i32  # -L
+
+# ============================================================================
+# Display helpers
+# ============================================================================
+
+fn print_octal(n: i32)
+    # Print 4-digit octal
+    var buf: [4]u8
+    var val: i32 = n
+    var i: i32 = 3
+    while i >= 0
+        buf[i] = ((val % 8) + '0') as u8
+        val /= 8
+        i -= 1
+    sys_write(STDOUT, &buf[0], 4)
+
+fn get_file_type(mode: i32) -> *u8
+    let type_bits: i32 = mode / 4096
+    if type_bits == 1
+        return "FIFO"
+    if type_bits == 2
+        return "character device"
+    if type_bits == 4
+        return "directory"
+    if type_bits == 6
+        return "block device"
+    if type_bits == 8
+        return "regular file"
+    if type_bits == '\n'
+        return "symbolic link"
+    if type_bits == 12
+        return "socket"
+    return "unknown"
+
+fn print_mode_string(mode: i32)
+    var buf: [10]u8
+
+    let type_bits: i32 = mode / 4096
+    if type_bits == 4
+        buf[0] = 100  # 'd'
+    else if type_bits == '\n'
+        buf[0] = 108  # 'l'
+    else if type_bits == 2
+        buf[0] = 99   # 'c'
+    else if type_bits == 6
+        buf[0] = 98   # 'b'
+    else if type_bits == 1
+        buf[0] = 112  # 'p'
+    else if type_bits == 12
+        buf[0] = 115  # 's'
+    else
+        buf[0] = 45   # '-'
+
+    let user_bits: i32 = (mode / 64) % 8
+    if user_bits / 4 >= 1
+        buf[1] = 114  # 'r'
+    else
+        buf[1] = 45
+    if (user_bits / 2) % 2 == 1
+        buf[2] = 119  # 'w'
+    else
+        buf[2] = 45
+    if user_bits % 2 == 1
+        buf[3] = 120  # 'x'
+    else
+        buf[3] = 45
+
+    let group_bits: i32 = (mode / 8) % 8
+    if group_bits / 4 >= 1
+        buf[4] = 114
+    else
+        buf[4] = 45
+    if (group_bits / 2) % 2 == 1
+        buf[5] = 119
+    else
+        buf[5] = 45
+    if group_bits % 2 == 1
+        buf[6] = 120
+    else
+        buf[6] = 45
+
+    let other_bits: i32 = mode % 8
+    if other_bits / 4 >= 1
+        buf[7] = 114
+    else
+        buf[7] = 45
+    if (other_bits / 2) % 2 == 1
+        buf[8] = 119
+    else
+        buf[8] = 45
+    if other_bits % 2 == 1
+        buf[9] = 120
+    else
+        buf[9] = 45
+
+    sys_write(STDOUT, &buf[0], 10)
+
+# ============================================================================
+# Stat display
+# ============================================================================
+
+fn display_stat(path: *u8, opts: *StatOptions) -> i32
+    var statbuf: [144]u8
+    var result: i32
+
+    if opts.follow_links != 0
+        result = sys_stat(path, &statbuf[0])
+    else
+        result = sys_lstat(path, &statbuf[0])
+
+    if result != 0
+        eprints("stat: cannot stat '")
+        eprints(path)
+        eprints("': No such file or directory\n")
+        return 1
+
+    let mode: i32 = stat_get_mode(&statbuf[0])
+    let size: i64 = stat_get_size(&statbuf[0])
+    let blocks: i64 = stat_get_blocks(&statbuf[0])
+    let blksize: i64 = stat_get_blksize(&statbuf[0])
+    let ino: i64 = stat_get_ino(&statbuf[0])
+    let nlink: i64 = stat_get_nlink(&statbuf[0])
+    let uid: i32 = stat_get_uid(&statbuf[0])
+    let gid: i32 = stat_get_gid(&statbuf[0])
+    let dev: i64 = stat_get_dev(&statbuf[0])
+
+    prints("  File: ")
+    prints(path)
+    print_char(10)
+
+    prints("  Size: ")
+    print_int(size)
+    prints("\t\tBlocks: ")
+    print_int(blocks)
+    prints("\t\tIO Block: ")
+    print_int(blksize)
+    prints("\t")
+    prints(get_file_type(mode))
+    print_char(10)
+
+    prints("Device: ")
+    print_int(dev)
+    prints("\t\tInode: ")
+    print_int(ino)
+    prints("\t\tLinks: ")
+    print_int(nlink)
+    print_char(10)
+
+    prints("Access: (")
+    print_octal(mode % 4096)
+    prints("/")
+    print_mode_string(mode)
+    prints(")\tUid: ")
+    print_int(uid as i64)
+    prints("\tGid: ")
+    print_int(gid as i64)
+    print_char(10)
+
+    return 0
+
+# ============================================================================
+# Main
+# ============================================================================
+
+fn main(argc: i32, argv: **u8) -> i32
+    # Set up argument parser
+    var parser: ArgParser
+    args_init(&parser, "stat", "Display file status")
+
+    # Define options
+    args_flag(&parser, 76, "dereference", "Follow symlinks")  # 'L'
+
+    # Define positional arguments (FILE... required, min=1, unlimited max)
+    args_positional(&parser, "FILE", "File(s) to display status for", 1, -1)
+
+    # Parse arguments
+    if args_parse(&parser, argc, argv) != 0
+        return 1
+
+    # Build options from parsed values
+    var opts: StatOptions
+    opts.follow_links = args_get_flag(&parser, 76)  # 'L'
+
+    # Process each file
+    var result: i32 = 0
+    for i in 0..parser.positional_count
+        let path: *u8 = args_get_positional(&parser, i)
+        let r: i32 = display_stat(path, &opts)
+        if r != 0
+            result = 1
+
+    return result

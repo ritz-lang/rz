@@ -1,0 +1,717 @@
+# ritzlib/async_tasks.ritz - Multi-task async executor with io_uring
+#
+# This module provides concurrent task execution for servers:
+#   - TaskPool: Fixed-size pool of async tasks
+#   - spawn_task: Add a new task to the pool
+#   - run_tasks: Event loop that polls all tasks concurrently
+#
+# Design:
+#   Each task has state (IDLE, WAITING, READY) and a user_data.
+#   When io_uring completes, we find the task by user_data and mark it READY.
+#   The event loop processes all READY tasks, which may submit new I/O.
+#
+# Usage:
+#   var pool: TaskPool
+#   task_pool_init(@pool)
+#
+#   # In accept loop, spawn connection handlers
+#   spawn_task(@pool, client_fd, handle_connection)
+#
+#   # Run all tasks until idle
+#   run_tasks(@pool, @ring)
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.uring
+import ritzlib.async_net
+import ritzlib.iovec
+
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+const MAX_TASKS: i32 = 256              # Maximum concurrent tasks
+const TASK_BUFFER_SIZE: i32 = 8192      # Per-task I/O buffer size
+
+# Task states
+const TASK_IDLE: i32 = 0                # Slot is unused
+const TASK_WAITING: i32 = 1             # Waiting for I/O completion
+const TASK_READY: i32 = 2               # Ready to be polled
+
+# Error codes
+const ETIME: i32 = -62                  # Timer expired (from io_uring timeout)
+
+
+# ============================================================================
+# Task - A single async task
+# ============================================================================
+
+struct Task
+    # Task identity
+    id: i64                             # Unique task ID (matches user_data)
+    state: i32                          # IDLE, WAITING, READY
+
+    # I/O state
+    fd: i32                             # File descriptor for this task
+    io_result: i32                      # Result from last I/O operation
+
+    # Handler callback and state machine
+    handler: fn(*Task) -> i32           # Poll function (-1=pending, else=done)
+    handler_state: i32                  # State machine position
+
+    # Buffers for I/O
+    read_buf: [8192]u8
+    write_buf: [8192]u8
+    read_len: i32                       # Bytes in read buffer
+    write_len: i32                      # Bytes to write
+    write_pos: i32                      # Current write position
+
+    # User data pointer (for handler context)
+    user_data: *u8
+
+    # Keep-alive state
+    request_count: i32              # Number of requests handled on this connection
+
+    # Vectored I/O builder for zero-copy responses
+    iov_builder: IoVecBuilder
+
+    # Idle timeout tracking
+    last_activity: i64              # Unix timestamp of last activity (seconds)
+
+
+# ============================================================================
+# TaskPool - Pool of async tasks
+# ============================================================================
+
+struct TaskPool
+    tasks: [256]Task                    # Fixed task array
+    next_id: i64                        # Next task ID to assign
+    active_count: i32                   # Number of active tasks
+    ring: *IoUring                      # io_uring instance (external)
+
+
+# Initialize the task pool
+pub fn task_pool_init(pool: *TaskPool, ring: *IoUring)
+    pool.next_id = 1
+    pool.active_count = 0
+    pool.ring = ring
+
+    # Initialize all task slots
+    for i in 0..MAX_TASKS
+        let task = @pool.tasks[i]
+        task.id = 0
+        task.state = TASK_IDLE
+        task.fd = -1
+        task.io_result = 0
+        task.handler = null
+        task.handler_state = 0
+        task.read_len = 0
+        task.write_len = 0
+        task.write_pos = 0
+        task.user_data = null
+
+
+# Find a free task slot, returns null if pool is full
+pub fn task_pool_alloc(pool: *TaskPool) -> *Task
+    for i in 0..MAX_TASKS
+        if pool.tasks[i].state == TASK_IDLE
+            return @pool.tasks[i]
+    return null
+
+
+# Find a task by its ID (user_data)
+pub fn task_pool_find(pool: *TaskPool, task_id: i64) -> *Task
+    for i in 0..MAX_TASKS
+        if pool.tasks[i].id == task_id
+            if pool.tasks[i].state != TASK_IDLE
+                return @pool.tasks[i]
+    return null
+
+
+# ============================================================================
+# Time helpers
+# ============================================================================
+
+# Get current time in seconds (for idle timeout tracking)
+pub fn get_current_time() -> i64
+    var tv: Timeval
+    sys_gettimeofday(@tv, null)
+    return tv.tv_sec
+
+
+# ============================================================================
+# Task lifecycle
+# ============================================================================
+
+# Spawn a new task for handling a connection
+# Returns 0 on success, -1 if pool is full
+pub fn spawn_task(pool: *TaskPool, fd: i32, handler: fn(*Task) -> i32) -> i32
+    let task = task_pool_alloc(pool)
+    if task == null
+        return -1
+
+    # Initialize the task
+    task.id = pool.next_id
+    pool.next_id += 1
+    task.state = TASK_READY          # Start in READY state for first poll
+    task.fd = fd
+    task.io_result = 0
+    task.handler = handler
+    task.handler_state = 0
+    task.read_len = 0
+    task.write_len = 0
+    task.write_pos = 0
+    task.user_data = pool as *u8     # Store pool pointer for I/O helpers
+    task.request_count = 0           # No requests yet
+    task.last_activity = get_current_time()  # Initialize activity timestamp
+
+    pool.active_count += 1
+    return 0
+
+
+# Mark a task as complete and free its slot
+pub fn task_complete(pool: *TaskPool, task: *Task)
+    # Close the fd if still open
+    if task.fd >= 0
+        sys_close(task.fd)
+        task.fd = -1
+
+    task.state = TASK_IDLE
+    task.id = 0
+    pool.active_count -= 1
+
+
+# ============================================================================
+# I/O helpers for tasks
+# ============================================================================
+
+# Submit an async recv for a task
+# Returns 0 on success
+pub fn task_submit_recv(pool: *TaskPool, task: *Task) -> i32
+    let sqe = uring_get_sqe(pool.ring)
+    if sqe == null
+        return -12  # ENOMEM
+
+    uring_prep_recv(sqe, task.fd, @task.read_buf[0], TASK_BUFFER_SIZE as u64, 0, task.id)
+    uring_sqe_submit(pool.ring)  # Advance the SQ tail
+    task.state = TASK_WAITING
+    return 0
+
+
+# Submit an async send for a task
+# Returns 0 on success
+pub fn task_submit_send(pool: *TaskPool, task: *Task, len: i32) -> i32
+    let sqe = uring_get_sqe(pool.ring)
+    if sqe == null
+        return -12  # ENOMEM
+
+    task.write_len = len
+    task.write_pos = 0
+    uring_prep_send(sqe, task.fd, @task.write_buf[0], len as u64, 0, task.id)
+    uring_sqe_submit(pool.ring)  # Advance the SQ tail
+    task.state = TASK_WAITING
+    return 0
+
+
+# ============================================================================
+# Simplified I/O helpers (use pool stored in task.user_data)
+# ============================================================================
+
+# Submit recv using pool from task.user_data
+pub fn task_recv(task: *Task) -> i32
+    let pool = task.user_data as *TaskPool
+    return task_submit_recv(pool, task)
+
+
+# Submit send using pool from task.user_data
+pub fn task_send(task: *Task, len: i32) -> i32
+    let pool = task.user_data as *TaskPool
+    return task_submit_send(pool, task, len)
+
+
+# Submit an async vectored send for a task
+# iov points to an array of Iovec structs, iovcnt is the count
+# Returns 0 on success
+pub fn task_submit_sendv(pool: *TaskPool, task: *Task, iov: *u8, iovcnt: i32) -> i32
+    let sqe = uring_get_sqe(pool.ring)
+    if sqe == null
+        return -12  # ENOMEM
+
+    # Use writev with offset=-1 to indicate no seek (for sockets)
+    uring_prep_writev(sqe, task.fd, iov, iovcnt, -1, task.id)
+    uring_sqe_submit(pool.ring)
+    task.state = TASK_WAITING
+    return 0
+
+
+# Submit vectored send using pool from task.user_data
+pub fn task_sendv(task: *Task, iov: *u8, iovcnt: i32) -> i32
+    let pool = task.user_data as *TaskPool
+    return task_submit_sendv(pool, task, iov, iovcnt)
+
+
+# Submit vectored send using the task's built-in IoVecBuilder
+# Call this after building a response in task.iov_builder
+pub fn task_sendv_builder(task: *Task) -> i32
+    let pool = task.user_data as *TaskPool
+    let iov = iovec_ptr(@task.iov_builder) as *u8
+    let cnt = iovec_count(@task.iov_builder)
+    return task_submit_sendv(pool, task, iov, cnt)
+
+
+# ============================================================================
+# Zero-copy send operations (kernel 6.0+)
+# ============================================================================
+#
+# Zero-copy send avoids the kernel copy from userspace to socket buffer.
+# The kernel references the userspace buffer directly until TCP ACK.
+#
+# IMPORTANT: The write buffer MUST remain valid until CQE is received!
+# This is naturally satisfied when using task.write_buf since tasks
+# are not recycled until I/O completes.
+
+# Submit an async zero-copy send for a task
+# Uses the task's write_buf, which must remain valid until completion
+# Returns 0 on success, negative errno on failure
+pub fn task_submit_send_zc(pool: *TaskPool, task: *Task, len: i32) -> i32
+    let sqe = uring_get_sqe(pool.ring)
+    if sqe == null
+        return -12  # ENOMEM
+
+    task.write_len = len
+    task.write_pos = 0
+    uring_prep_send_zc(sqe, task.fd, @task.write_buf[0], len as u64, 0, task.id)
+    uring_sqe_submit(pool.ring)
+    task.state = TASK_WAITING
+    return 0
+
+
+# Submit zero-copy send using pool from task.user_data
+pub fn task_send_zc(task: *Task, len: i32) -> i32
+    let pool = task.user_data as *TaskPool
+    return task_submit_send_zc(pool, task, len)
+
+
+# Submit an async zero-copy send from an external buffer
+# CAUTION: The buffer MUST remain valid until CQE is received!
+# Use this for sending data that's already in a stable location
+# (e.g., static .rodata strings, mmap'd files, pre-allocated pools)
+pub fn task_submit_send_zc_buf(pool: *TaskPool, task: *Task, buf: *u8, len: i32) -> i32
+    let sqe = uring_get_sqe(pool.ring)
+    if sqe == null
+        return -12  # ENOMEM
+
+    uring_prep_send_zc(sqe, task.fd, buf, len as u64, 0, task.id)
+    uring_sqe_submit(pool.ring)
+    task.state = TASK_WAITING
+    return 0
+
+
+# Zero-copy send from external buffer (simplified API)
+pub fn task_send_zc_buf(task: *Task, buf: *u8, len: i32) -> i32
+    let pool = task.user_data as *TaskPool
+    return task_submit_send_zc_buf(pool, task, buf, len)
+
+
+# ============================================================================
+# Splice operations (zero-copy between file descriptors)
+# ============================================================================
+#
+# Splice transfers data between two fds without copying through userspace.
+# For sendfile-style operations over io_uring, use splice with a pipe.
+
+# Submit a splice operation
+# fd_out: destination fd (e.g., socket)
+# fd_in: source fd (e.g., file)
+# off_in: offset in source file (-1 to use and update file position)
+# len: number of bytes to transfer
+# Returns 0 on success, negative errno on failure
+pub fn task_submit_splice(pool: *TaskPool, task: *Task, fd_out: i32, fd_in: i32, off_in: i64, len: u32, splice_flags: i32) -> i32
+    let sqe = uring_get_sqe(pool.ring)
+    if sqe == null
+        return -12  # ENOMEM
+
+    # For sockets, off_out should be -1 (non-seekable)
+    uring_prep_splice(sqe, fd_out, -1, fd_in, off_in, len, splice_flags, task.id)
+    uring_sqe_submit(pool.ring)
+    task.state = TASK_WAITING
+    return 0
+
+
+# Submit splice using pool from task.user_data
+# Transfers len bytes from fd_in at off_in to task's socket (task.fd)
+pub fn task_splice(task: *Task, fd_in: i32, off_in: i64, len: u32, splice_flags: i32) -> i32
+    let pool = task.user_data as *TaskPool
+    return task_submit_splice(pool, task, task.fd, fd_in, off_in, len, splice_flags)
+
+
+# Reset task state for keep-alive (after send completes, prepare for next recv)
+# This properly handles the task state so it will poll and submit a new recv
+pub fn task_reset_for_recv(task: *Task) -> i32
+    let pool = task.user_data as *TaskPool
+
+    # Reset state for next request
+    task.handler_state = 0      # Back to RECV state
+    task.io_result = 0          # Clear previous I/O result
+    task.read_len = 0           # Clear read buffer
+
+    # Submit the next recv directly (don't wait for next poll)
+    return task_submit_recv(pool, task)
+
+
+# ============================================================================
+# Event loop
+# ============================================================================
+
+# Run all tasks, polling READY tasks and waiting for I/O
+# Returns when all tasks are complete
+pub fn run_tasks(pool: *TaskPool) -> i32
+    loop
+        # First, poll all READY tasks
+        var submitted: i32 = 0
+        for i in 0..MAX_TASKS
+            let task = @pool.tasks[i]
+            if task.state == TASK_READY
+                # Poll the handler (extract fn ptr first)
+                let h: fn(*Task) -> i32 = task.handler
+                let result = h(task)
+                if result >= 0
+                    # Task is complete
+                    task_complete(pool, task)
+                # If result < 0 (pending), handler should have submitted I/O
+
+        # Submit any pending SQEs
+        uring_submit(pool.ring)
+
+        # Count active tasks
+        if pool.active_count == 0
+            break
+
+        # Wait for at least one completion
+        let wait_ret = uring_submit_and_wait(pool.ring, 1)
+        if wait_ret < 0
+            return wait_ret
+
+        # Process all available CQEs
+        loop
+            let cqe = uring_peek_cqe(pool.ring)
+            if cqe == null
+                break
+
+            # Find the task and wake it
+            let task_id = cqe.user_data
+            let task = task_pool_find(pool, task_id)
+            if task != null
+                task.io_result = cqe.res
+                task.state = TASK_READY
+
+            uring_cqe_seen(pool.ring, cqe)
+
+    return 0
+
+
+# ============================================================================
+# High-level server pattern: Accept loop with task spawning
+# ============================================================================
+
+# Server context for accept loop
+struct TaskServer
+    listen_fd: i32
+    pool: TaskPool
+    ring: IoUring
+    accept_user_data: i64               # Special user_data for accept
+    running: i32
+    # Shutdown hook - called once per event loop iteration
+    # Return non-zero to trigger shutdown
+    shutdown_hook: fn() -> i32
+    # Idle timeout in seconds (0 = disabled)
+    idle_timeout: i32
+    # Special user_data for timeout
+    timeout_user_data: i64
+    # Timeout spec for idle check timer (1 second intervals)
+    timeout_ts: KernelTimespec
+    # Maximum concurrent connections (0 = unlimited)
+    max_connections: i32
+
+
+pub fn task_server_init(srv: *TaskServer, listen_fd: i32) -> i32
+    srv.listen_fd = listen_fd
+    srv.accept_user_data = 0            # Reserve 0 for accept
+    srv.running = 0
+    srv.shutdown_hook = null
+    srv.idle_timeout = 0
+    srv.max_connections = 0             # 0 = unlimited
+    # Use a large positive value for timeout user_data
+    # Task IDs start at 1 and increment, so this won't conflict
+    srv.timeout_user_data = 0x7FFFFFFE
+
+    # Initialize timeout timespec
+    srv.timeout_ts.tv_sec = 0
+    srv.timeout_ts.tv_nsec = 0
+
+    # Initialize io_uring
+    let ret = uring_init(@srv.ring, 256)
+    if ret < 0
+        return ret
+
+    # Initialize task pool
+    task_pool_init(@srv.pool, @srv.ring)
+    return 0
+
+
+# Set a shutdown hook that's called once per event loop iteration
+# Hook returns non-zero to trigger shutdown
+pub fn task_server_set_shutdown_hook(srv: *TaskServer, hook: fn() -> i32)
+    srv.shutdown_hook = hook
+
+
+# Set idle timeout for connections (in seconds, 0 = disabled)
+pub fn task_server_set_idle_timeout(srv: *TaskServer, timeout_secs: i32)
+    srv.idle_timeout = timeout_secs
+
+
+pub fn task_server_set_max_connections(srv: *TaskServer, max_conns: i32)
+    srv.max_connections = max_conns
+
+
+# Submit a timeout SQE to wake up the event loop periodically for idle checks
+# Uses 1-second intervals to balance responsiveness with overhead
+# NOTE: Currently disabled - io_uring timeout causing EINVAL on some systems
+pub fn task_server_submit_idle_timeout(srv: *TaskServer) -> i32
+    # DISABLED: The io_uring timeout is returning EINVAL
+    # For now, idle timeouts only work when there's other activity
+    return 0
+
+    # Original implementation:
+    # if srv.idle_timeout <= 0
+    #     return 0
+    # let sqe = uring_get_sqe(@srv.ring)
+    # if sqe == null
+    #     return -12
+    # srv.timeout_ts.tv_sec = 1
+    # srv.timeout_ts.tv_nsec = 0
+    # uring_prep_timeout(sqe, @srv.timeout_ts, 0, 0, srv.timeout_user_data)
+    # uring_sqe_submit(@srv.ring)
+    # return 0
+
+
+pub fn task_server_destroy(srv: *TaskServer)
+    uring_destroy(@srv.ring)
+
+
+# Submit an accept SQE
+pub fn task_server_submit_accept(srv: *TaskServer) -> i32
+    let sqe = uring_get_sqe(@srv.ring)
+    if sqe == null
+        return -12
+
+    uring_prep_accept(sqe, srv.listen_fd, null, null, 0, srv.accept_user_data)
+    uring_sqe_submit(@srv.ring)  # Advance the SQ tail
+    return 0
+
+
+# Submit a multishot accept SQE (kernel 5.19+)
+# Only needs to be submitted once - generates continuous CQEs for new connections
+pub fn task_server_submit_accept_multishot(srv: *TaskServer) -> i32
+    let sqe = uring_get_sqe(@srv.ring)
+    if sqe == null
+        return -12
+
+    uring_prep_accept_multishot(sqe, srv.listen_fd, null, null, 0, srv.accept_user_data)
+    uring_sqe_submit(@srv.ring)
+    return 0
+
+
+# ============================================================================
+# Internal: Core event loop - shared by both accept modes
+# ============================================================================
+
+# Process all READY tasks, calling their handlers
+pub fn task_server_poll_tasks(srv: *TaskServer)
+    for i in 0..MAX_TASKS
+        let task = @srv.pool.tasks[i]
+        if task.state == TASK_READY
+            let h: fn(*Task) -> i32 = task.handler
+            let result = h(task)
+            if result >= 0
+                task_complete(@srv.pool, task)
+
+
+# Handle a new connection (shared by both modes)
+pub fn task_server_handle_accept(srv: *TaskServer, client_fd: i32, handler: fn(*Task) -> i32)
+    # Check max connections limit
+    if srv.max_connections > 0 and srv.pool.active_count >= srv.max_connections
+        # At connection limit, reject new connection
+        sys_close(client_fd)
+        return
+
+    # Set TCP_NODELAY for low latency
+    set_nodelay(client_fd)
+    let spawn_ret = spawn_task(@srv.pool, client_fd, handler)
+    if spawn_ret < 0
+        # Pool full, close connection
+        sys_close(client_fd)
+
+
+# Wake a task with an I/O result
+pub fn task_server_wake_task(srv: *TaskServer, task_id: i64, result: i32)
+    let task = task_pool_find(@srv.pool, task_id)
+    if task != null
+        task.io_result = result
+        task.state = TASK_READY
+        task.last_activity = get_current_time()  # Update activity timestamp
+
+
+# Check for idle connections and close them
+# Returns number of connections closed
+pub fn task_server_check_idle(srv: *TaskServer) -> i32
+    if srv.idle_timeout <= 0
+        return 0
+
+    let now: i64 = get_current_time()
+    let timeout_secs: i64 = srv.idle_timeout as i64
+    var closed: i32 = 0
+
+    for i in 0..MAX_TASKS
+        let task = @srv.pool.tasks[i]
+        # Only check tasks that are waiting for I/O (not IDLE, not READY)
+        if task.state == TASK_WAITING
+            let idle_time: i64 = now - task.last_activity
+            if idle_time >= timeout_secs
+                # Connection is idle too long - close it
+                task_complete(@srv.pool, task)
+                closed += 1
+
+    return closed
+
+
+# ============================================================================
+# Public API: Server run modes
+# ============================================================================
+
+pub fn task_server_stop(srv: *TaskServer)
+    srv.running = 0
+
+
+# Run the server event loop with a connection handler
+pub fn task_server_run(srv: *TaskServer, handler: fn(*Task) -> i32) -> i32
+    srv.running = 1
+
+    # Submit initial accept
+    task_server_submit_accept(srv)
+
+    # Submit initial idle check timeout if enabled
+    task_server_submit_idle_timeout(srv)
+
+    uring_submit(@srv.ring)
+
+    loop
+        # Check shutdown hook at start of each iteration
+        if srv.shutdown_hook != null
+            let hook: fn() -> i32 = srv.shutdown_hook
+            if hook() != 0
+                srv.running = 0
+
+        if srv.running == 0
+            break
+
+        # Poll all READY tasks
+        task_server_poll_tasks(srv)
+
+        # Submit any pending I/O and wait for completions
+        let wait_ret = uring_submit_and_wait(@srv.ring, 1)
+        if wait_ret < 0
+            return wait_ret
+
+        # Process all CQEs
+        loop
+            let cqe = uring_peek_cqe(@srv.ring)
+            if cqe == null
+                break
+
+            let user_data = cqe.user_data
+            let cqe_res = cqe.res
+
+            if user_data == srv.accept_user_data
+                # New connection accepted
+                if cqe_res >= 0
+                    task_server_handle_accept(srv, cqe_res, handler)
+                # Re-submit accept for next connection
+                task_server_submit_accept(srv)
+            else if user_data == srv.timeout_user_data
+                # Timeout fired - check idle connections and re-submit
+                task_server_check_idle(srv)
+                task_server_submit_idle_timeout(srv)
+            else
+                # Wake the task
+                task_server_wake_task(srv, user_data, cqe_res)
+
+            uring_cqe_seen(@srv.ring, cqe)
+
+    return 0
+
+
+# Run server with multishot accept (kernel 5.19+)
+# More efficient than task_server_run - only one accept SQE needed
+pub fn task_server_run_multishot(srv: *TaskServer, handler: fn(*Task) -> i32) -> i32
+    srv.running = 1
+
+    # Submit multishot accept - only needs to be done once
+    task_server_submit_accept_multishot(srv)
+
+    # Submit initial idle check timeout if enabled
+    task_server_submit_idle_timeout(srv)
+
+    uring_submit(@srv.ring)
+
+    loop
+        # Check shutdown hook at start of each iteration
+        if srv.shutdown_hook != null
+            let hook: fn() -> i32 = srv.shutdown_hook
+            if hook() != 0
+                srv.running = 0
+
+        if srv.running == 0
+            break
+
+        # Poll all READY tasks
+        task_server_poll_tasks(srv)
+
+        # Submit any pending I/O and wait for completions
+        let wait_ret = uring_submit_and_wait(@srv.ring, 1)
+        if wait_ret < 0
+            return wait_ret
+
+        # Process all CQEs
+        loop
+            let cqe = uring_peek_cqe(@srv.ring)
+            if cqe == null
+                break
+
+            let user_data = cqe.user_data
+            let cqe_res = cqe.res
+            let cqe_flags = cqe.flags
+
+            if user_data == srv.accept_user_data
+                # New connection from multishot accept
+                if cqe_res >= 0
+                    task_server_handle_accept(srv, cqe_res, handler)
+
+                # With multishot, only re-submit if IORING_CQE_F_MORE is NOT set
+                # (which means the multishot was cancelled or errored)
+                if (cqe_flags & IORING_CQE_F_MORE) == 0
+                    if cqe.res < 0
+                        # Error - re-submit multishot
+                        task_server_submit_accept_multishot(srv)
+            else if user_data == srv.timeout_user_data
+                # Timeout fired - check idle connections and re-submit
+                task_server_check_idle(srv)
+                task_server_submit_idle_timeout(srv)
+            else
+                # Wake the task
+                task_server_wake_task(srv, user_data, cqe_res)
+
+            uring_cqe_seen(@srv.ring, cqe)
+
+    return 0

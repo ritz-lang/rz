@@ -1,0 +1,375 @@
+# ritzlib/strview.ritz - Zero-copy string view
+#
+# StrView is the default string type for string literals in RERITZ.
+# It's a lightweight, non-owning view into UTF-8 string data.
+#
+# Key properties:
+# - Zero allocation: just a pointer and length
+# - Non-owning: does not free memory when dropped
+# - Immutable: cannot modify the underlying data
+# - UTF-8: assumed to be valid UTF-8 (not validated)
+# - Pass by const ref (@StrView): 16 bytes via pointer, no move
+#
+# Usage:
+#   let greeting = "hello"           # StrView (default in RERITZ)
+#   let owned = greeting.to_string() # String (explicit heap allocation)
+#   let cstr = greeting.as_cstr()    # *u8 (for FFI)
+#
+# Note: StrView must not outlive the data it references.
+# For owned strings that can be stored/moved, use String.
+
+import ritzlib.str     # strlen, memcpy
+import ritzlib.memory  # malloc, free
+
+# ============================================================================
+# StrView - Zero-copy string view
+# ============================================================================
+
+pub struct StrView
+    ptr: *u8       # Pointer to first byte (not owned, not null-terminated)
+    len: i64       # Number of bytes
+
+# ============================================================================
+# Constructors
+# ============================================================================
+
+# Create an empty StrView
+pub fn strview_empty() -> StrView
+    var s: StrView
+    s.ptr = null
+    s.len = 0
+    return s
+
+# Create a StrView from a raw pointer and length
+pub fn strview_from_ptr(ptr: *u8, len: i64) -> StrView
+    var s: StrView
+    s.ptr = ptr
+    s.len = len
+    return s
+
+# Create a StrView from a null-terminated C string
+pub fn strview_from_cstr(cstr: *u8) -> StrView
+    var s: StrView
+    s.ptr = cstr
+    s.len = strlen(cstr)
+    return s
+
+# ============================================================================
+# Accessors (pass by const ref - no move, no copy)
+# ============================================================================
+
+# Get the length of the string view
+pub fn strview_len(s: @StrView) -> i64
+    return s.len
+
+# Check if the string view is empty
+pub fn strview_is_empty(s: @StrView) -> i32
+    if s.len == 0
+        return 1
+    return 0
+
+# Get a byte at the given index (unchecked)
+pub fn strview_get(s: @StrView, idx: i64) -> u8
+    return *(s.ptr + idx)
+
+# Get raw pointer to the data
+pub fn strview_as_ptr(s: @StrView) -> *u8
+    return s.ptr
+
+# ============================================================================
+# FFI Support
+# ============================================================================
+
+# Convert to a null-terminated C string.
+# WARNING: This allocates a new buffer and copies the string!
+# The caller is responsible for freeing the returned pointer with free().
+# For zero-cost FFI, ensure your StrView points to null-terminated data.
+pub fn strview_to_cstr(s: @StrView) -> *u8
+    let buf: *u8 = malloc(s.len + 1)
+    memcpy(buf, s.ptr, s.len)
+    *(buf + s.len) = 0
+    return buf
+
+# Get a pointer suitable for C FFI.
+# If the original data is null-terminated (like string literals),
+# this returns the pointer directly. Otherwise, behavior is undefined
+# if passed to C functions expecting null termination.
+# Use strview_to_cstr() for guaranteed null-termination.
+pub fn strview_as_cstr_unchecked(s: @StrView) -> *u8
+    return s.ptr
+
+# ============================================================================
+# Comparison
+# ============================================================================
+
+# Compare two StrViews for equality
+pub fn strview_eq(a: @StrView, b: @StrView) -> i32
+    if a.len != b.len
+        return 0
+    if a.len == 0
+        return 1
+    for i in 0..a.len
+        if *(a.ptr + i) != *(b.ptr + i)
+            return 0
+    return 1
+
+# Compare a StrView to a null-terminated C string
+pub fn strview_eq_cstr(s: @StrView, cstr: *u8) -> i32
+    var i: i64 = 0
+    while i < s.len
+        if *(cstr + i) == 0
+            return 0  # cstr is shorter
+        if *(s.ptr + i) != *(cstr + i)
+            return 0
+        i += 1
+    # Check that cstr ends here
+    if *(cstr + i) != 0
+        return 0
+    return 1
+
+# ============================================================================
+# Slicing (creates new views, no allocation)
+# ============================================================================
+
+# Create a sub-view [start:end)
+pub fn strview_slice(s: @StrView, start: i64, end: i64) -> StrView
+    var result: StrView
+    var st: i64 = start
+    var en: i64 = end
+    if st < 0
+        st = 0
+    if en > s.len
+        en = s.len
+    if st >= en
+        result.ptr = null
+        result.len = 0
+        return result
+    result.ptr = s.ptr + st
+    result.len = en - st
+    return result
+
+# Get first n bytes as new view
+pub fn strview_take(s: @StrView, n: i64) -> StrView
+    var result: StrView
+    result.ptr = s.ptr
+    if n < s.len
+        result.len = n
+    else
+        result.len = s.len
+    return result
+
+# Skip first n bytes and return rest as new view
+pub fn strview_skip(s: @StrView, n: i64) -> StrView
+    var result: StrView
+    if n >= s.len
+        result.ptr = s.ptr + s.len
+        result.len = 0
+    else
+        result.ptr = s.ptr + n
+        result.len = s.len - n
+    return result
+
+# ============================================================================
+# Search
+# ============================================================================
+
+# Check if view starts with prefix
+pub fn strview_starts_with(s: @StrView, prefix: @StrView) -> i32
+    if prefix.len > s.len
+        return 0
+    for i in 0..prefix.len
+        if *(s.ptr + i) != *(prefix.ptr + i)
+            return 0
+    return 1
+
+# Check if view starts with a C string prefix
+pub fn strview_starts_with_cstr(s: @StrView, prefix: *u8) -> i32
+    var i: i64 = 0
+    while *(prefix + i) != 0
+        if i >= s.len
+            return 0
+        if *(s.ptr + i) != *(prefix + i)
+            return 0
+        i += 1
+    return 1
+
+# Check if view ends with suffix
+pub fn strview_ends_with(s: @StrView, suffix: @StrView) -> i32
+    if suffix.len > s.len
+        return 0
+    let offset: i64 = s.len - suffix.len
+    for i in 0..suffix.len
+        if *(s.ptr + offset + i) != *(suffix.ptr + i)
+            return 0
+    return 1
+
+# Check if view contains needle
+pub fn strview_contains(haystack: @StrView, needle: @StrView) -> i32
+    if needle.len == 0
+        return 1
+    if haystack.len < needle.len
+        return 0
+
+    var pos: i64 = 0
+    let max_pos: i64 = haystack.len - needle.len + 1
+    while pos < max_pos
+        var found: i32 = 1
+        var i: i64 = 0
+        while i < needle.len and found == 1
+            if *(haystack.ptr + pos + i) != *(needle.ptr + i)
+                found = 0
+            i += 1
+        if found == 1
+            return 1
+        pos += 1
+    return 0
+
+# Find first occurrence of needle, return index or -1
+pub fn strview_find(haystack: @StrView, needle: @StrView) -> i64
+    if needle.len == 0
+        return 0
+    if haystack.len < needle.len
+        return -1
+
+    var pos: i64 = 0
+    let max_pos: i64 = haystack.len - needle.len + 1
+    while pos < max_pos
+        var found: i32 = 1
+        var i: i64 = 0
+        while i < needle.len and found == 1
+            if *(haystack.ptr + pos + i) != *(needle.ptr + i)
+                found = 0
+            i += 1
+        if found == 1
+            return pos
+        pos += 1
+    return -1
+
+# Find first occurrence of a byte, return index or -1
+pub fn strview_find_byte(s: @StrView, c: u8) -> i64
+    for i in 0..s.len
+        if *(s.ptr + i) == c
+            return i
+    return -1
+
+# ============================================================================
+# Iteration helpers
+# ============================================================================
+
+# Split on first occurrence of delimiter byte
+# Returns (before, after) where 'after' excludes the delimiter
+# If delimiter not found, returns (full string, empty)
+# Uses mutable borrows for output parameters
+pub fn strview_split_once(s: @StrView, delim: u8, before:& StrView, after:& StrView) -> i32
+    let idx: i64 = strview_find_byte(s, delim)
+    if idx < 0
+        before.ptr = s.ptr
+        before.len = s.len
+        after.ptr = s.ptr + s.len
+        after.len = 0
+        return 0  # Delimiter not found
+
+    before.ptr = s.ptr
+    before.len = idx
+    after.ptr = s.ptr + idx + 1
+    after.len = s.len - idx - 1
+    return 1  # Delimiter found
+
+# ============================================================================
+# Trim whitespace
+# ============================================================================
+
+# Trim leading whitespace
+pub fn strview_trim_start(s: @StrView) -> StrView
+    var result: StrView
+    var start: i64 = 0
+    while start < s.len
+        let c: u8 = *(s.ptr + start)
+        if c != ' ' and c != '\t' and c != '\n' and c != '\r'
+            break
+        start += 1
+    result.ptr = s.ptr + start
+    result.len = s.len - start
+    return result
+
+# Trim trailing whitespace
+pub fn strview_trim_end(s: @StrView) -> StrView
+    var result: StrView
+    var end: i64 = s.len
+    while end > 0
+        let c: u8 = *(s.ptr + end - 1)
+        if c != ' ' and c != '\t' and c != '\n' and c != '\r'
+            break
+        end -= 1
+    result.ptr = s.ptr
+    result.len = end
+    return result
+
+# Trim both leading and trailing whitespace
+pub fn strview_trim(s: @StrView) -> StrView
+    var trimmed: StrView = strview_trim_start(s)
+    return strview_trim_end(@trimmed)
+
+# ============================================================================
+# Method syntax support (impl block)
+# ============================================================================
+
+impl StrView
+    fn len(self: @StrView) -> i64
+        return strview_len(self)
+
+    fn is_empty(self: @StrView) -> i32
+        return strview_is_empty(self)
+
+    fn get(self: @StrView, idx: i64) -> u8
+        return strview_get(self, idx)
+
+    fn as_ptr(self: @StrView) -> *u8
+        return strview_as_ptr(self)
+
+    fn slice(self: @StrView, start: i64, end: i64) -> StrView
+        return strview_slice(self, start, end)
+
+    fn take(self: @StrView, n: i64) -> StrView
+        return strview_take(self, n)
+
+    fn skip(self: @StrView, n: i64) -> StrView
+        return strview_skip(self, n)
+
+    fn starts_with(self: @StrView, prefix: @StrView) -> i32
+        return strview_starts_with(self, prefix)
+
+    fn ends_with(self: @StrView, suffix: @StrView) -> i32
+        return strview_ends_with(self, suffix)
+
+    fn contains(self: @StrView, needle: @StrView) -> i32
+        return strview_contains(self, needle)
+
+    fn find(self: @StrView, needle: @StrView) -> i64
+        return strview_find(self, needle)
+
+    fn find_byte(self: @StrView, c: u8) -> i64
+        return strview_find_byte(self, c)
+
+    fn trim(self: @StrView) -> StrView
+        return strview_trim(self)
+
+    fn trim_start(self: @StrView) -> StrView
+        return strview_trim_start(self)
+
+    fn trim_end(self: @StrView) -> StrView
+        return strview_trim_end(self)
+
+    fn eq(self: @StrView, other: @StrView) -> i32
+        return strview_eq(self, other)
+
+    fn eq_cstr(self: @StrView, cstr: *u8) -> i32
+        return strview_eq_cstr(self, cstr)
+
+    # Convert to owned C string (allocates, caller must free())
+    fn to_cstr(self: @StrView) -> *u8
+        return strview_to_cstr(self)
+
+    # Get raw pointer (assumes underlying data is null-terminated!)
+    fn as_cstr_unchecked(self: @StrView) -> *u8
+        return strview_as_cstr_unchecked(self)

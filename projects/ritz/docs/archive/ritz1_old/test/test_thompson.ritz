@@ -1,0 +1,163 @@
+# ritz1 Thompson's Construction Tests
+#
+# Tests for NFA construction from regex patterns.
+# Run with: python ritz0/ritz0.py --test ritz1/src/nfa.ritz ritz1/test/test_thompson.ritz
+
+# Helper to allocate NFA storage on stack
+fn make_nfa() -> NFA
+  let states: *NFAState = __builtin_alloca(3072)    # 256 * 12 bytes
+  let trans: *Transition = __builtin_alloca(10240)  # 512 * 20 bytes
+  var nfa: NFA = NFA { states: states, state_count: 0, transitions: trans, trans_count: 0, start_state: 0 }
+  nfa_init(&nfa, states, trans)
+  nfa
+
+# Test single character NFA
+@test
+fn test_thompson_char() -> i32
+  var nfa: NFA = make_nfa()
+  let frag: NFAFragment = thompson_char(&nfa, 97)  # 'a'
+  thompson_accept(&nfa, frag, 1)
+
+  assert nfa_accepts(&nfa, "a", 1) == 1
+  assert nfa_accepts(&nfa, "b", 1) == 0
+  assert nfa_accepts(&nfa, "", 0) == 0
+  0
+
+# Test character range NFA
+@test
+fn test_thompson_range() -> i32
+  var nfa: NFA = make_nfa()
+  let frag: NFAFragment = thompson_range(&nfa, 48, 57)  # [0-9]
+  thompson_accept(&nfa, frag, 1)
+
+  assert nfa_accepts(&nfa, "0", 1) == 1
+  assert nfa_accepts(&nfa, "5", 1) == 1
+  assert nfa_accepts(&nfa, "9", 1) == 1
+  assert nfa_accepts(&nfa, "a", 1) == 0
+  0
+
+# Test concatenation: "ab"
+@test
+fn test_thompson_concat() -> i32
+  var nfa: NFA = make_nfa()
+  let a: NFAFragment = thompson_char(&nfa, 97)  # 'a'
+  let b: NFAFragment = thompson_char(&nfa, 98)  # 'b'
+  let ab: NFAFragment = thompson_concat(&nfa, a, b)
+  thompson_accept(&nfa, ab, 1)
+
+  assert nfa_accepts(&nfa, "ab", 2) == 1
+  assert nfa_accepts(&nfa, "a", 1) == 0
+  assert nfa_accepts(&nfa, "b", 1) == 0
+  assert nfa_accepts(&nfa, "abc", 3) == 0
+  0
+
+# Test alternation: "a|b"
+@test
+fn test_thompson_alt() -> i32
+  var nfa: NFA = make_nfa()
+  let a: NFAFragment = thompson_char(&nfa, 97)  # 'a'
+  let b: NFAFragment = thompson_char(&nfa, 98)  # 'b'
+  let alt: NFAFragment = thompson_alt(&nfa, a, b)
+  thompson_accept(&nfa, alt, 1)
+
+  assert nfa_accepts(&nfa, "a", 1) == 1
+  assert nfa_accepts(&nfa, "b", 1) == 1
+  assert nfa_accepts(&nfa, "c", 1) == 0
+  assert nfa_accepts(&nfa, "ab", 2) == 0
+  0
+
+# Test Kleene star: "a*"
+@test
+fn test_thompson_star() -> i32
+  var nfa: NFA = make_nfa()
+  let a: NFAFragment = thompson_char(&nfa, 97)  # 'a'
+  let star: NFAFragment = thompson_star(&nfa, a)
+  thompson_accept(&nfa, star, 1)
+
+  assert nfa_accepts(&nfa, "", 0) == 1    # zero matches
+  assert nfa_accepts(&nfa, "a", 1) == 1   # one match
+  assert nfa_accepts(&nfa, "aa", 2) == 1  # two matches
+  assert nfa_accepts(&nfa, "aaa", 3) == 1
+  assert nfa_accepts(&nfa, "b", 1) == 0
+  0
+
+# Test plus: "a+"
+@test
+fn test_thompson_plus() -> i32
+  var nfa: NFA = make_nfa()
+  let a: NFAFragment = thompson_char(&nfa, 97)  # 'a'
+  let plus: NFAFragment = thompson_plus(&nfa, a)
+  thompson_accept(&nfa, plus, 1)
+
+  assert nfa_accepts(&nfa, "", 0) == 0    # zero - should fail
+  assert nfa_accepts(&nfa, "a", 1) == 1   # one match
+  assert nfa_accepts(&nfa, "aa", 2) == 1  # two matches
+  assert nfa_accepts(&nfa, "aaa", 3) == 1
+  0
+
+# Test optional: "a?"
+@test
+fn test_thompson_opt() -> i32
+  var nfa: NFA = make_nfa()
+  let a: NFAFragment = thompson_char(&nfa, 97)  # 'a'
+  let opt: NFAFragment = thompson_opt(&nfa, a)
+  thompson_accept(&nfa, opt, 1)
+
+  assert nfa_accepts(&nfa, "", 0) == 1    # zero matches
+  assert nfa_accepts(&nfa, "a", 1) == 1   # one match
+  assert nfa_accepts(&nfa, "aa", 2) == 0  # two - should fail
+  0
+
+# Test string literal: "fn"
+@test
+fn test_thompson_string() -> i32
+  var nfa: NFA = make_nfa()
+  let frag: NFAFragment = thompson_string(&nfa, "fn", 2)
+  thompson_accept(&nfa, frag, 1)
+
+  assert nfa_accepts(&nfa, "fn", 2) == 1
+  assert nfa_accepts(&nfa, "f", 1) == 0
+  assert nfa_accepts(&nfa, "fnn", 3) == 0
+  assert nfa_accepts(&nfa, "let", 3) == 0
+  0
+
+# Test complex pattern: identifier [a-z][a-z0-9]*
+@test
+fn test_thompson_identifier() -> i32
+  var nfa: NFA = make_nfa()
+
+  # First char: [a-z]
+  let first: NFAFragment = thompson_range(&nfa, 97, 122)
+
+  # Rest: [a-z0-9]*
+  let letter: NFAFragment = thompson_range(&nfa, 97, 122)
+  let digit: NFAFragment = thompson_range(&nfa, 48, 57)
+  let alphanum: NFAFragment = thompson_alt(&nfa, letter, digit)
+  let rest: NFAFragment = thompson_star(&nfa, alphanum)
+
+  let ident: NFAFragment = thompson_concat(&nfa, first, rest)
+  thompson_accept(&nfa, ident, 1)
+
+  assert nfa_accepts(&nfa, "a", 1) == 1
+  assert nfa_accepts(&nfa, "foo", 3) == 1
+  assert nfa_accepts(&nfa, "x1", 2) == 1
+  assert nfa_accepts(&nfa, "abc123", 6) == 1
+  assert nfa_accepts(&nfa, "1abc", 4) == 0  # can't start with digit
+  assert nfa_accepts(&nfa, "", 0) == 0
+  0
+
+# Test integer pattern: [0-9]+
+@test
+fn test_thompson_integer() -> i32
+  var nfa: NFA = make_nfa()
+
+  let digit: NFAFragment = thompson_range(&nfa, 48, 57)  # [0-9]
+  let num: NFAFragment = thompson_plus(&nfa, digit)       # [0-9]+
+  thompson_accept(&nfa, num, 1)
+
+  assert nfa_accepts(&nfa, "0", 1) == 1
+  assert nfa_accepts(&nfa, "42", 2) == 1
+  assert nfa_accepts(&nfa, "12345", 5) == 1
+  assert nfa_accepts(&nfa, "", 0) == 0
+  assert nfa_accepts(&nfa, "a", 1) == 0
+  0

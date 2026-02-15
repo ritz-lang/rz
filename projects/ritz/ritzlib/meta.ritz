@@ -1,0 +1,664 @@
+# ritzlib/meta.ritz - Ritz Module Metadata Parser
+#
+# Reads and writes .ritz-meta JSON files for incremental compilation.
+# This is the Ritz implementation matching ritz0/metadata.py.
+#
+# Cache location: .ritz-cache/<module_path>.ritz-meta
+# Invalidation: Timestamp-based (source_mtime)
+
+import ritzlib.sys
+import ritzlib.str
+import ritzlib.memory
+import ritzlib.fs
+import ritzlib.json
+
+# =============================================================================
+# Metadata Structures
+# =============================================================================
+
+struct ParamMeta
+    name: *u8           # Parameter name (heap-allocated)
+    type_str: *u8       # Type string (heap-allocated)
+
+struct FnSignature
+    name: *u8           # Function name
+    params: *ParamMeta  # Array of parameters
+    param_count: i64
+    ret_type: *u8       # Return type string
+    is_extern: i32
+    is_generic: i32
+    type_params: **u8   # Array of type parameter names
+    type_param_count: i64
+
+struct StructMeta
+    name: *u8
+    fields: *ParamMeta  # Reusing ParamMeta for name/type pairs
+    field_count: i64
+    is_generic: i32
+    type_params: **u8
+    type_param_count: i64
+
+struct EnumVariantMeta
+    name: *u8
+    fields: **u8        # Array of field type strings
+    field_count: i64
+
+struct EnumMeta
+    name: *u8
+    variants: *EnumVariantMeta
+    variant_count: i64
+
+struct ConstMeta
+    name: *u8
+    type_str: *u8
+
+struct TypeAliasMeta
+    name: *u8
+    target: *u8
+
+struct TraitMethodMeta
+    name: *u8
+    params: *ParamMeta
+    param_count: i64
+    ret_type: *u8
+
+struct TraitMeta
+    name: *u8
+    methods: *TraitMethodMeta
+    method_count: i64
+
+struct ModuleMetadata
+    source_path: *u8
+    source_mtime: i64       # Unix timestamp (seconds)
+    source_mtime_ns: i64    # Nanoseconds part (for sub-second precision)
+
+    functions: *FnSignature
+    function_count: i64
+
+    structs: *StructMeta
+    struct_count: i64
+
+    enums: *EnumMeta
+    enum_count: i64
+
+    constants: *ConstMeta
+    constant_count: i64
+
+    type_aliases: *TypeAliasMeta
+    type_alias_count: i64
+
+    traits: *TraitMeta
+    trait_count: i64
+
+    imports: **u8
+    import_count: i64
+
+# =============================================================================
+# Allocation Helpers
+# =============================================================================
+
+fn str_dup(s: *u8) -> *u8
+    if s == null
+        return null
+    let len: i64 = strlen(s)
+    let copy: *u8 = malloc(len + 1)
+    if copy != null
+        memcpy(copy, s, len + 1)
+    return copy
+
+fn meta_alloc() -> *ModuleMetadata
+    let m: *ModuleMetadata = malloc(256) as *ModuleMetadata
+    if m == null
+        return null
+    # Zero initialize
+    m.source_path = null
+    m.source_mtime = 0
+    m.source_mtime_ns = 0
+    m.functions = null
+    m.function_count = 0
+    m.structs = null
+    m.struct_count = 0
+    m.enums = null
+    m.enum_count = 0
+    m.constants = null
+    m.constant_count = 0
+    m.type_aliases = null
+    m.type_alias_count = 0
+    m.traits = null
+    m.trait_count = 0
+    m.imports = null
+    m.import_count = 0
+    return m
+
+fn meta_free(m: *ModuleMetadata)
+    if m == null
+        return
+
+    if m.source_path != null
+        free(m.source_path)
+
+    # Free functions
+    if m.functions != null
+        for i in 0..m.function_count
+            let f: *FnSignature = m.functions + i
+            if f.name != null
+                free(f.name)
+            if f.ret_type != null
+                free(f.ret_type)
+            if f.params != null
+                for j in 0..f.param_count
+                    let p: *ParamMeta = f.params + j
+                    if p.name != null
+                        free(p.name)
+                    if p.type_str != null
+                        free(p.type_str)
+                free(f.params as *u8)
+            if f.type_params != null
+                for j in 0..f.type_param_count
+                    let tp: *u8 = *(f.type_params + j)
+                    if tp != null
+                        free(tp)
+                free(f.type_params as *u8)
+        free(m.functions as *u8)
+
+    # Free structs
+    if m.structs != null
+        for i in 0..m.struct_count
+            let s: *StructMeta = m.structs + i
+            if s.name != null
+                free(s.name)
+            if s.fields != null
+                for j in 0..s.field_count
+                    let f: *ParamMeta = s.fields + j
+                    if f.name != null
+                        free(f.name)
+                    if f.type_str != null
+                        free(f.type_str)
+                free(s.fields as *u8)
+            if s.type_params != null
+                for j in 0..s.type_param_count
+                    let tp: *u8 = *(s.type_params + j)
+                    if tp != null
+                        free(tp)
+                free(s.type_params as *u8)
+        free(m.structs as *u8)
+
+    # Free enums
+    if m.enums != null
+        for i in 0..m.enum_count
+            let e: *EnumMeta = m.enums + i
+            if e.name != null
+                free(e.name)
+            if e.variants != null
+                for j in 0..e.variant_count
+                    let v: *EnumVariantMeta = e.variants + j
+                    if v.name != null
+                        free(v.name)
+                    if v.fields != null
+                        for k in 0..v.field_count
+                            let f: *u8 = *(v.fields + k)
+                            if f != null
+                                free(f)
+                        free(v.fields as *u8)
+                free(e.variants as *u8)
+        free(m.enums as *u8)
+
+    # Free constants
+    if m.constants != null
+        for i in 0..m.constant_count
+            let c: *ConstMeta = m.constants + i
+            if c.name != null
+                free(c.name)
+            if c.type_str != null
+                free(c.type_str)
+        free(m.constants as *u8)
+
+    # Free type aliases
+    if m.type_aliases != null
+        for i in 0..m.type_alias_count
+            let t: *TypeAliasMeta = m.type_aliases + i
+            if t.name != null
+                free(t.name)
+            if t.target != null
+                free(t.target)
+        free(m.type_aliases as *u8)
+
+    # Free traits
+    if m.traits != null
+        for i in 0..m.trait_count
+            let t: *TraitMeta = m.traits + i
+            if t.name != null
+                free(t.name)
+            if t.methods != null
+                for j in 0..t.method_count
+                    let m2: *TraitMethodMeta = t.methods + j
+                    if m2.name != null
+                        free(m2.name)
+                    if m2.ret_type != null
+                        free(m2.ret_type)
+                    if m2.params != null
+                        for k in 0..m2.param_count
+                            let p: *ParamMeta = m2.params + k
+                            if p.name != null
+                                free(p.name)
+                            if p.type_str != null
+                                free(p.type_str)
+                        free(m2.params as *u8)
+                free(t.methods as *u8)
+        free(m.traits as *u8)
+
+    # Free imports
+    if m.imports != null
+        for i in 0..m.import_count
+            let imp: *u8 = *(m.imports + i)
+            if imp != null
+                free(imp)
+        free(m.imports as *u8)
+
+    free(m as *u8)
+
+# =============================================================================
+# JSON Parsing Helpers
+# =============================================================================
+
+fn parse_params(arr: *JsonValue, out_params: **ParamMeta, out_count: *i64) -> i32
+    let count: i64 = json_array_len(arr)
+    *out_count = count
+    if count == 0
+        *out_params = null
+        return 0
+
+    let params: *ParamMeta = malloc(count * 16) as *ParamMeta  # sizeof(ParamMeta) = 16
+    if params == null
+        return -1
+
+    for i in 0..count
+        let item: *JsonValue = json_get_index(arr, i)
+        let p: *ParamMeta = params + i
+        let name_v: *JsonValue = json_get_field(item, c"name")
+        let type_v: *JsonValue = json_get_field(item, c"type")
+        p.name = str_dup(json_get_string(name_v))
+        p.type_str = str_dup(json_get_string(type_v))
+
+    *out_params = params
+    return 0
+
+fn parse_string_array(arr: *JsonValue, out_strs: ***u8, out_count: *i64) -> i32
+    let count: i64 = json_array_len(arr)
+    *out_count = count
+    if count == 0
+        *out_strs = null
+        return 0
+
+    let strs: **u8 = malloc(count * 8) as **u8
+    if strs == null
+        return -1
+
+    for i in 0..count
+        let item: *JsonValue = json_get_index(arr, i)
+        *(strs + i) = str_dup(json_get_string(item))
+
+    *out_strs = strs
+    return 0
+
+fn parse_functions(arr: *JsonValue, m: *ModuleMetadata) -> i32
+    let count: i64 = json_array_len(arr)
+    m.function_count = count
+    if count == 0
+        m.functions = null
+        return 0
+
+    m.functions = malloc(count * 64) as *FnSignature  # sizeof(FnSignature) ~= 64
+    if m.functions == null
+        return -1
+
+    for i in 0..count
+        let item: *JsonValue = json_get_index(arr, i)
+        let f: *FnSignature = m.functions + i
+
+        f.name = str_dup(json_get_string(json_get_field(item, c"name")))
+        f.ret_type = str_dup(json_get_string(json_get_field(item, c"ret_type")))
+        f.is_extern = json_get_bool(json_get_field(item, c"is_extern"))
+        f.is_generic = json_get_bool(json_get_field(item, c"is_generic"))
+
+        parse_params(json_get_field(item, c"params"), @f.params, @f.param_count)
+        parse_string_array(json_get_field(item, c"type_params"), @f.type_params, @f.type_param_count)
+
+    return 0
+
+fn parse_structs(arr: *JsonValue, m: *ModuleMetadata) -> i32
+    let count: i64 = json_array_len(arr)
+    m.struct_count = count
+    if count == 0
+        m.structs = null
+        return 0
+
+    m.structs = malloc(count * 48) as *StructMeta
+    if m.structs == null
+        return -1
+
+    for i in 0..count
+        let item: *JsonValue = json_get_index(arr, i)
+        let s: *StructMeta = m.structs + i
+
+        s.name = str_dup(json_get_string(json_get_field(item, c"name")))
+        s.is_generic = json_get_bool(json_get_field(item, c"is_generic"))
+
+        parse_params(json_get_field(item, c"fields"), @s.fields, @s.field_count)
+        parse_string_array(json_get_field(item, c"type_params"), @s.type_params, @s.type_param_count)
+
+    return 0
+
+fn parse_enums(arr: *JsonValue, m: *ModuleMetadata) -> i32
+    let count: i64 = json_array_len(arr)
+    m.enum_count = count
+    if count == 0
+        m.enums = null
+        return 0
+
+    m.enums = malloc(count * 24) as *EnumMeta
+    if m.enums == null
+        return -1
+
+    for i in 0..count
+        let item: *JsonValue = json_get_index(arr, i)
+        let e: *EnumMeta = m.enums + i
+
+        e.name = str_dup(json_get_string(json_get_field(item, c"name")))
+
+        let variants_arr: *JsonValue = json_get_field(item, c"variants")
+        let var_count: i64 = json_array_len(variants_arr)
+        e.variant_count = var_count
+
+        if var_count > 0
+            e.variants = malloc(var_count * 24) as *EnumVariantMeta
+            for j in 0..var_count
+                let v_item: *JsonValue = json_get_index(variants_arr, j)
+                let v: *EnumVariantMeta = e.variants + j
+                v.name = str_dup(json_get_string(json_get_field(v_item, c"name")))
+                parse_string_array(json_get_field(v_item, c"fields"), @v.fields, @v.field_count)
+        else
+            e.variants = null
+
+    return 0
+
+fn parse_constants(arr: *JsonValue, m: *ModuleMetadata) -> i32
+    let count: i64 = json_array_len(arr)
+    m.constant_count = count
+    if count == 0
+        m.constants = null
+        return 0
+
+    m.constants = malloc(count * 16) as *ConstMeta
+    if m.constants == null
+        return -1
+
+    for i in 0..count
+        let item: *JsonValue = json_get_index(arr, i)
+        let c: *ConstMeta = m.constants + i
+        c.name = str_dup(json_get_string(json_get_field(item, c"name")))
+        c.type_str = str_dup(json_get_string(json_get_field(item, c"type")))
+
+    return 0
+
+fn parse_type_aliases(arr: *JsonValue, m: *ModuleMetadata) -> i32
+    let count: i64 = json_array_len(arr)
+    m.type_alias_count = count
+    if count == 0
+        m.type_aliases = null
+        return 0
+
+    m.type_aliases = malloc(count * 16) as *TypeAliasMeta
+    if m.type_aliases == null
+        return -1
+
+    for i in 0..count
+        let item: *JsonValue = json_get_index(arr, i)
+        let t: *TypeAliasMeta = m.type_aliases + i
+        t.name = str_dup(json_get_string(json_get_field(item, c"name")))
+        t.target = str_dup(json_get_string(json_get_field(item, c"target")))
+
+    return 0
+
+fn parse_traits(arr: *JsonValue, m: *ModuleMetadata) -> i32
+    let count: i64 = json_array_len(arr)
+    m.trait_count = count
+    if count == 0
+        m.traits = null
+        return 0
+
+    m.traits = malloc(count * 24) as *TraitMeta
+    if m.traits == null
+        return -1
+
+    for i in 0..count
+        let item: *JsonValue = json_get_index(arr, i)
+        let t: *TraitMeta = m.traits + i
+        t.name = str_dup(json_get_string(json_get_field(item, c"name")))
+
+        let methods_arr: *JsonValue = json_get_field(item, c"methods")
+        let method_count: i64 = json_array_len(methods_arr)
+        t.method_count = method_count
+
+        if method_count > 0
+            t.methods = malloc(method_count * 32) as *TraitMethodMeta
+            for j in 0..method_count
+                let m_item: *JsonValue = json_get_index(methods_arr, j)
+                let tm: *TraitMethodMeta = t.methods + j
+                tm.name = str_dup(json_get_string(json_get_field(m_item, c"name")))
+                tm.ret_type = str_dup(json_get_string(json_get_field(m_item, c"ret_type")))
+                parse_params(json_get_field(m_item, c"params"), @tm.params, @tm.param_count)
+        else
+            t.methods = null
+
+    return 0
+
+# =============================================================================
+# Main Parsing Function
+# =============================================================================
+
+fn meta_from_json(json_str: *u8, len: i64) -> *ModuleMetadata
+    let result: JsonResult = json_parse(json_str, len)
+    if result.ok == 0
+        return null
+
+    let root: *JsonValue = result.value
+    if root == null
+        return null
+
+    let m: *ModuleMetadata = meta_alloc()
+    if m == null
+        json_free(root)
+        return null
+
+    # Parse top-level fields
+    m.source_path = str_dup(json_get_string(json_get_field(root, c"source_path")))
+
+    # Parse source_mtime as float (stored as integer seconds + fractional)
+    let mtime_v: *JsonValue = json_get_field(root, c"source_mtime")
+    if mtime_v != null
+        # For now, just store as integer (we lose sub-second precision)
+        m.source_mtime = json_get_number(mtime_v)
+
+    # Parse arrays
+    parse_string_array(json_get_field(root, c"imports"), @m.imports, @m.import_count)
+    parse_functions(json_get_field(root, c"functions"), m)
+    parse_structs(json_get_field(root, c"structs"), m)
+    parse_enums(json_get_field(root, c"enums"), m)
+    parse_constants(json_get_field(root, c"constants"), m)
+    parse_type_aliases(json_get_field(root, c"type_aliases"), m)
+    parse_traits(json_get_field(root, c"traits"), m)
+
+    json_free(root)
+    return m
+
+# =============================================================================
+# File I/O
+# =============================================================================
+
+fn meta_load_file(path: *u8) -> *ModuleMetadata
+    # Get file size
+    let size: i64 = file_size(path)
+    if size < 0
+        return null
+
+    # Open and read file
+    let fd: i32 = sys_open(path, O_RDONLY)
+    if fd < 0
+        return null
+
+    let buf: *u8 = malloc(size + 1)
+    if buf == null
+        sys_close(fd)
+        return null
+
+    let nread: i64 = sys_read(fd, buf, size)
+    sys_close(fd)
+
+    if nread != size
+        free(buf)
+        return null
+
+    *(buf + size) = 0  # Null terminate
+
+    let m: *ModuleMetadata = meta_from_json(buf, size)
+    free(buf)
+    return m
+
+# =============================================================================
+# Cache Path Calculation
+# =============================================================================
+
+fn get_cache_path(source_path: *u8, buf: *u8, buf_size: i64) -> i64
+    # Format: .ritz-cache/<source_path>.ritz-meta
+    # For now, simple implementation that strips leading / if present
+
+    var pos: i64 = 0
+    let prefix: *u8 = c".ritz-cache/"
+    var i: i64 = 0
+    while *(prefix + i) != 0 and pos < buf_size - 1
+        *(buf + pos) = *(prefix + i)
+        pos += 1
+        i += 1
+
+    # Copy source path, skipping leading /
+    i = 0
+    if *source_path == '/'  # '/'
+        i = 1
+    while *(source_path + i) != 0 and pos < buf_size - 1
+        *(buf + pos) = *(source_path + i)
+        pos += 1
+        i += 1
+
+    # Change .ritz to .ritz-meta
+    # Find and remove .ritz suffix if present
+    let suffix: *u8 = c".ritz"
+    let suffix_len: i64 = 5
+    if pos >= suffix_len
+        var matches: i32 = 1
+        var j: i64 = 0
+        while j < suffix_len
+            if *(buf + pos - suffix_len + j) != *(suffix + j)
+                matches = 0
+                break
+            j += 1
+        if matches != 0
+            pos -= suffix_len
+
+    # Add .ritz-meta
+    let meta_suffix: *u8 = c".ritz-meta"
+    i = 0
+    while *(meta_suffix + i) != 0 and pos < buf_size - 1
+        *(buf + pos) = *(meta_suffix + i)
+        pos += 1
+        i += 1
+
+    *(buf + pos) = 0
+    return pos
+
+# =============================================================================
+# Cache Validation
+# =============================================================================
+
+fn meta_is_valid(m: *ModuleMetadata, source_path: *u8) -> i32
+    if m == null
+        return 0
+
+    # Check if source file exists
+    if path_exists(source_path) == 0
+        return 0
+
+    # Get current source mtime
+    var stat: Stat
+    if sys_stat2(source_path, @stat) != 0
+        return 0
+
+    # If source is newer than cached metadata, cache is stale
+    if stat.st_mtime > m.source_mtime
+        return 0
+
+    return 1
+
+# =============================================================================
+# Lookup Functions
+# =============================================================================
+
+fn meta_find_function(m: *ModuleMetadata, name: *u8) -> *FnSignature
+    if m == null
+        return null
+
+    for i in 0..m.function_count
+        let f: *FnSignature = m.functions + i
+        if streq(f.name, name) != 0
+            return f
+    return null
+
+fn meta_find_struct(m: *ModuleMetadata, name: *u8) -> *StructMeta
+    if m == null
+        return null
+
+    for i in 0..m.struct_count
+        let s: *StructMeta = m.structs + i
+        if streq(s.name, name) != 0
+            return s
+    return null
+
+fn meta_find_enum(m: *ModuleMetadata, name: *u8) -> *EnumMeta
+    if m == null
+        return null
+
+    for i in 0..m.enum_count
+        let e: *EnumMeta = m.enums + i
+        if streq(e.name, name) != 0
+            return e
+    return null
+
+fn meta_find_constant(m: *ModuleMetadata, name: *u8) -> *ConstMeta
+    if m == null
+        return null
+
+    for i in 0..m.constant_count
+        let c: *ConstMeta = m.constants + i
+        if streq(c.name, name) != 0
+            return c
+    return null
+
+fn meta_find_type_alias(m: *ModuleMetadata, name: *u8) -> *TypeAliasMeta
+    if m == null
+        return null
+
+    for i in 0..m.type_alias_count
+        let t: *TypeAliasMeta = m.type_aliases + i
+        if streq(t.name, name) != 0
+            return t
+    return null
+
+fn meta_find_trait(m: *ModuleMetadata, name: *u8) -> *TraitMeta
+    if m == null
+        return null
+
+    for i in 0..m.trait_count
+        let t: *TraitMeta = m.traits + i
+        if streq(t.name, name) != 0
+            return t
+    return null

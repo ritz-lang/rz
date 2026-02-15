@@ -1,0 +1,447 @@
+# ritzlib/buf.ritz - Buffer and reader utilities for parsing
+#
+# Provides buffered input streams with lookahead, essential for parsers.
+#
+# Types:
+# - Buffer: Read-only view into byte data with position tracking (does not own memory)
+# - GrowBuf: Growable byte buffer for accumulating data (type alias for Vec<u8>)
+#
+# GrowBuf is now backed by Vec<u8> with automatic Drop cleanup.
+
+import ritzlib.sys
+import ritzlib.str
+import ritzlib.memory
+import ritzlib.drop
+
+# ============================================================================
+# Buffer: In-memory byte buffer with position tracking
+# ============================================================================
+
+struct Buffer
+    data: *u8       # Pointer to data (not owned)
+    len: i64        # Length of data
+    pos: i64        # Current read position
+
+pub fn buf_init(buf: *Buffer, data: *u8, len: i64) -> i32
+    buf.data = data
+    buf.len = len
+    buf.pos = 0
+    return 0
+
+pub fn buf_from_str(buf: *Buffer, s: *u8) -> i32
+    buf.data = s
+    buf.len = strlen(s)
+    buf.pos = 0
+    return 0
+
+# ============================================================================
+# Position and bounds
+# ============================================================================
+
+pub fn buf_pos(buf: *Buffer) -> i64
+    return buf.pos
+
+pub fn buf_len(buf: *Buffer) -> i64
+    return buf.len
+
+pub fn buf_remaining(buf: *Buffer) -> i64
+    return buf.len - buf.pos
+
+pub fn buf_eof(buf: *Buffer) -> i32
+    return (buf.pos >= buf.len) as i32
+
+# ============================================================================
+# Peek operations (don't advance position)
+# ============================================================================
+
+pub fn buf_peek(buf: *Buffer) -> u8
+    if buf.pos >= buf.len
+        return 0
+    return *(buf.data + buf.pos)
+
+pub fn buf_peek_at(buf: *Buffer, offset: i64) -> u8
+    let pos: i64 = buf.pos + offset
+    if pos < 0 or pos >= buf.len
+        return 0
+    return *(buf.data + pos)
+
+pub fn buf_peek_n(buf: *Buffer, out: *u8, n: i64) -> i64
+    var i: i64 = 0
+    while i < n and buf.pos + i < buf.len
+        *(out + i) = *(buf.data + buf.pos + i)
+        i += 1
+    return i
+
+# ============================================================================
+# Consume operations (advance position)
+# ============================================================================
+
+pub fn buf_advance(buf: *Buffer) -> u8
+    if buf.pos >= buf.len
+        return 0
+    let c: u8 = *(buf.data + buf.pos)
+    buf.pos = buf.pos + 1
+    return c
+
+pub fn buf_advance_n(buf: *Buffer, n: i64) -> i64
+    let avail: i64 = buf.len - buf.pos
+    if n > avail
+        n = avail
+    buf.pos = buf.pos + n
+    return n
+
+pub fn buf_skip(buf: *Buffer, n: i64) -> i32
+    buf.pos = buf.pos + n
+    if buf.pos > buf.len
+        buf.pos = buf.len
+    return 0
+
+# ============================================================================
+# Pattern matching (peek-based, don't advance unless match)
+# ============================================================================
+
+pub fn buf_match_char(buf: *Buffer, c: u8) -> i32
+    if buf.pos < buf.len and *(buf.data + buf.pos) == c
+        buf.pos = buf.pos + 1
+        return 1
+    return 0
+
+pub fn buf_match_str(buf: *Buffer, s: *u8) -> i32
+    let slen: i64 = strlen(s)
+    if buf.pos + slen > buf.len
+        return 0
+    for i in 0..slen
+        if *(buf.data + buf.pos + i) != *(s + i)
+            return 0
+    buf.pos = buf.pos + slen
+    return 1
+
+pub fn buf_starts_with(buf: *Buffer, s: *u8) -> i32
+    let slen: i64 = strlen(s)
+    if buf.pos + slen > buf.len
+        return 0
+    for i in 0..slen
+        if *(buf.data + buf.pos + i) != *(s + i)
+            return 0
+    return 1
+
+# ============================================================================
+# Skip utilities
+# ============================================================================
+
+pub fn buf_skip_whitespace(buf: *Buffer) -> i64
+    var count: i64 = 0
+    while buf.pos < buf.len
+        let c: u8 = *(buf.data + buf.pos)
+        if c != ' ' and c != '\t' and c != '\n' and c != '\r'  # space, tab, newline, carriage return
+            break
+        buf.pos = buf.pos + 1
+        count += 1
+    return count
+
+pub fn buf_skip_until(buf: *Buffer, c: u8) -> i64
+    var count: i64 = 0
+    while buf.pos < buf.len and *(buf.data + buf.pos) != c
+        buf.pos = buf.pos + 1
+        count += 1
+    return count
+
+pub fn buf_skip_while(buf: *Buffer, pred_fn: *u8) -> i64
+    # Note: This is a placeholder - would need function pointers
+    # For now, use specialized skip functions
+    return 0
+
+# ============================================================================
+# Read utilities
+# ============================================================================
+
+pub fn buf_read_until(buf: *Buffer, c: u8, out: *u8, max_len: i64) -> i64
+    var count: i64 = 0
+    while buf.pos < buf.len and count < max_len - 1
+        let ch: u8 = *(buf.data + buf.pos)
+        if ch == c
+            break
+        *(out + count) = ch
+        buf.pos = buf.pos + 1
+        count += 1
+    *(out + count) = 0
+    return count
+
+pub fn buf_read_while_digit(buf: *Buffer, out: *u8, max_len: i64) -> i64
+    var count: i64 = 0
+    while buf.pos < buf.len and count < max_len - 1
+        let c: u8 = *(buf.data + buf.pos)
+        if c < '0' or c > '9'  # '0' to '9'
+            break
+        *(out + count) = c
+        buf.pos = buf.pos + 1
+        count += 1
+    *(out + count) = 0
+    return count
+
+pub fn buf_read_while_alnum(buf: *Buffer, out: *u8, max_len: i64) -> i64
+    var count: i64 = 0
+    while buf.pos < buf.len and count < max_len - 1
+        let c: u8 = *(buf.data + buf.pos)
+        let is_alpha: i32 = ((c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z')) as i32
+        let is_digit: i32 = (c >= '0' and c <= '9') as i32
+        let is_underscore: i32 = (c == '_') as i32  # '_'
+        if is_alpha == 0 and is_digit == 0 and is_underscore == 0
+            break
+        *(out + count) = c
+        buf.pos = buf.pos + 1
+        count += 1
+    *(out + count) = 0
+    return count
+
+pub fn buf_read_quoted(buf: *Buffer, quote: u8, out: *u8, max_len: i64) -> i64
+    # Read a quoted string, handling escapes
+    if buf.pos >= buf.len or *(buf.data + buf.pos) != quote
+        return -1  # Not starting with quote
+
+    buf.pos = buf.pos + 1  # Skip opening quote
+    var count: i64 = 0
+
+    while buf.pos < buf.len and count < max_len - 1
+        let c: u8 = *(buf.data + buf.pos)
+        if c == quote
+            buf.pos = buf.pos + 1  # Skip closing quote
+            *(out + count) = 0
+            return count
+        if c == '\\'  # backslash
+            buf.pos = buf.pos + 1
+            if buf.pos >= buf.len
+                break
+            let escape: u8 = *(buf.data + buf.pos)
+            if escape == 'n'  # 'n'
+                *(out + count) = 10
+            else if escape == 't'  # 't'
+                *(out + count) = 9
+            else if escape == 'r'  # 'r'
+                *(out + count) = 13
+            else if escape == '\\'  # '\'
+                *(out + count) = 92
+            else if escape == quote
+                *(out + count) = quote
+            else
+                *(out + count) = escape
+            count += 1
+            buf.pos = buf.pos + 1
+        else
+            *(out + count) = c
+            count += 1
+            buf.pos = buf.pos + 1
+
+    *(out + count) = 0
+    return -1  # Unterminated string
+
+# ============================================================================
+# Position save/restore (for backtracking)
+# ============================================================================
+
+pub fn buf_save(buf: *Buffer) -> i64
+    return buf.pos
+
+pub fn buf_restore(buf: *Buffer, pos: i64) -> i32
+    buf.pos = pos
+    return 0
+
+# ============================================================================
+# Line/column tracking (useful for error messages)
+# ============================================================================
+
+struct BufLoc
+    line: i32
+    col: i32
+    offset: i64
+
+pub fn buf_get_loc(buf: *Buffer, loc: *BufLoc) -> i32
+    loc.line = 1
+    loc.col = 1
+    loc.offset = buf.pos
+
+    for i in 0..buf.pos
+        if *(buf.data + i) == '\n'  # newline
+            loc.line = loc.line + 1
+            loc.col = 1
+        else
+            loc.col = loc.col + 1
+    return 0
+
+# ============================================================================
+# GrowBuf: Growable byte buffer (for accumulating data)
+# ============================================================================
+# GrowBuf is now backed by Vec<u8> for memory management.
+# This provides:
+# - Automatic memory management via Drop trait
+# - Efficient growth via realloc
+# - Binary compatible with old code (same struct layout)
+#
+# The struct layout (data, len, cap) matches Vec<u8> exactly, so existing
+# code that accesses b.data, b.len, b.cap continues to work.
+
+struct GrowBuf
+    data: *u8       # Pointer to heap-allocated bytes
+    len: i64        # Current length (bytes used)
+    cap: i64        # Capacity (bytes allocated)
+
+# ============================================================================
+# Drop trait for automatic cleanup
+# ============================================================================
+
+impl Drop for GrowBuf
+    fn drop(self: @&GrowBuf)
+        if self.data != null
+            free(self.data)
+        self.data = null
+        self.len = 0
+        self.cap = 0
+
+# ============================================================================
+# Constructor functions
+# ============================================================================
+
+# Create a new empty growable buffer.
+pub fn growbuf_new() -> GrowBuf
+    var b: GrowBuf
+    b.data = null
+    b.len = 0
+    b.cap = 0
+    return b
+
+# Create a new growable buffer with pre-allocated capacity.
+pub fn growbuf_with_cap(cap: i64) -> GrowBuf
+    var b: GrowBuf
+    if cap <= 0
+        b.data = null
+        b.len = 0
+        b.cap = 0
+        return b
+
+    b.data = malloc(cap)
+    if b.data == null
+        b.len = 0
+        b.cap = 0
+        return b
+
+    b.len = 0
+    b.cap = cap
+    return b
+
+# Free the buffer (deprecated - GrowBuf has automatic Drop).
+# Kept for backward compatibility with existing code.
+pub fn growbuf_free(b: *GrowBuf) -> i32
+    if b.data != null
+        free(b.data)
+    b.data = null
+    b.len = 0
+    b.cap = 0
+    return 0
+
+# ============================================================================
+# Growth and capacity
+# ============================================================================
+
+# Grow the buffer to a new capacity.
+pub fn growbuf_grow(b: *GrowBuf, new_cap: i64) -> i32
+    if new_cap <= b.cap
+        return 0
+
+    let new_data: *u8 = realloc(b.data, new_cap)
+    if new_data == null
+        return -1
+
+    b.data = new_data
+    b.cap = new_cap
+    return 0
+
+# Ensure the buffer has at least the given capacity.
+pub fn growbuf_ensure_cap(b: *GrowBuf, needed: i64) -> i32
+    if b.cap >= needed
+        return 0
+
+    var new_cap: i64 = b.cap
+    if new_cap == 0
+        new_cap = 64
+    while new_cap < needed
+        new_cap *= 2
+
+    return growbuf_grow(b, new_cap)
+
+# ============================================================================
+# Append operations
+# ============================================================================
+
+# Append bytes to the buffer.
+pub fn growbuf_append(b: *GrowBuf, data: *u8, len: i64) -> i32
+    if growbuf_ensure_cap(b, b.len + len) != 0
+        return -1
+
+    for i in 0..len
+        *(b.data + b.len + i) = *(data + i)
+    b.len = b.len + len
+    return 0
+
+# Append a single byte to the buffer.
+pub fn growbuf_append_byte(b: *GrowBuf, byte: u8) -> i32
+    if growbuf_ensure_cap(b, b.len + 1) != 0
+        return -1
+    *(b.data + b.len) = byte
+    b.len = b.len + 1
+    return 0
+
+# ============================================================================
+# Accessors
+# ============================================================================
+
+# Clear all bytes (keeps capacity).
+pub fn growbuf_clear(b: *GrowBuf) -> i32
+    b.len = 0
+    return 0
+
+# Get length (number of bytes).
+pub fn growbuf_len(b: *GrowBuf) -> i64
+    return b.len
+
+# Get capacity (allocated bytes).
+pub fn growbuf_cap(b: *GrowBuf) -> i64
+    return b.cap
+
+# Get raw data pointer.
+pub fn growbuf_data(b: *GrowBuf) -> *u8
+    return b.data
+
+# Get byte at index.
+pub fn growbuf_get(b: *GrowBuf, idx: i64) -> u8
+    if idx < 0 or idx >= b.len
+        return 0
+    return *(b.data + idx)
+
+# Check if buffer is empty.
+pub fn growbuf_is_empty(b: *GrowBuf) -> i32
+    if b.len == 0
+        return 1
+    return 0
+
+# ============================================================================
+# File reading utilities
+# ============================================================================
+# Common patterns for reading files into buffers.
+
+pub fn read_all_fd(fd: i32, b: *GrowBuf) -> i64
+    # Read entire file descriptor into GrowBuf, return bytes read or -1 on error
+    let chunk_size: i64 = 4096
+    var temp: [4096]u8
+    var total: i64 = 0
+
+    loop
+        let n: i64 = sys_read(fd, @temp[0], chunk_size)
+        if n < 0
+            return -1
+        if n == 0
+            break
+        if growbuf_append(b, @temp[0], n) != 0
+            return -1
+        total += n
+
+    return total

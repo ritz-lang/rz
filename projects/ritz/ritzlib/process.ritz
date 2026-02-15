@@ -1,0 +1,447 @@
+# ritzlib/process.ritz - Process spawning and I/O
+#
+# Simple, direct process management for subprocess testing.
+# Spawns child processes with connected stdin/stdout/stderr pipes.
+#
+# Design principles:
+# - No BufferedStreamReader nonsense - simple read/write ops
+# - Ownership: Process owns pipe FDs, cleaned up on drop
+# - Vec<u8> for output capture (growable, owned)
+# - Clear, intent-revealing API
+#
+# Usage:
+#   let proc = spawn(c"./hello")
+#   let output = proc.read_stdout_all()  # Returns Vec<u8>
+#   let result = proc.wait()
+#   assert result.success()
+#
+# For commands with arguments:
+#   var args: [3]*u8 = [c"ls", c"-la", null]
+#   let proc = spawn_args(c"ls", @args[0])
+
+import ritzlib.sys
+import ritzlib.memory
+import ritzlib.gvec
+import ritzlib.str
+import ritzlib.env
+
+# ============================================================================
+# Process - Subprocess handle with connected pipes
+# ============================================================================
+
+struct Process
+    pid: i32            # Child process ID
+    stdin_fd: i32       # Write end of stdin pipe (-1 if closed)
+    stdout_fd: i32      # Read end of stdout pipe (-1 if closed)
+    stderr_fd: i32      # Read end of stderr pipe (-1 if closed)
+    waited: i32         # 1 if already waited, 0 otherwise
+
+# ============================================================================
+# ProcessResult - Exit status from wait()
+# ============================================================================
+
+struct ProcessResult
+    exit_code: i32      # Exit code (0-255) if exited normally
+    signaled: i32       # 1 if killed by signal, 0 otherwise
+    signal: i32         # Signal number if signaled
+
+# ============================================================================
+# PATH search helper (must come before spawn functions)
+# ============================================================================
+
+pub fn find_command_in_path(name: *u8, buf: *u8, bufsize: i64) -> *u8
+    # If name contains '/', use it directly
+    var i: i64 = 0
+    while *(name + i) != 0
+        if *(name + i) == '/'
+            return name
+        i += 1
+
+    # Search common PATH locations
+    # Since we can't access envp easily in the child, hardcode common paths
+    var paths: [6]*u8
+    paths[0] = c"/usr/local/bin/"
+    paths[1] = c"/usr/bin/"
+    paths[2] = c"/bin/"
+    paths[3] = c"/usr/local/sbin/"
+    paths[4] = c"/usr/sbin/"
+    paths[5] = c"/sbin/"
+
+    for pi in 0..6
+        let path: *u8 = paths[pi]
+        var j: i64 = 0
+
+        # Copy path prefix
+        while *(path + j) != 0 and j < bufsize - 2
+            *(buf + j) = *(path + j)
+            j += 1
+
+        # Append command name
+        var k: i64 = 0
+        while *(name + k) != 0 and j < bufsize - 1
+            *(buf + j) = *(name + k)
+            j += 1
+            k += 1
+
+        *(buf + j) = 0  # Null terminate
+
+        # Check if executable
+        if sys_access(buf, X_OK) == 0
+            return buf
+
+    return null
+
+# ============================================================================
+# Process spawning
+# ============================================================================
+
+# Spawn a command (searched in PATH)
+# Returns Process with connected pipes, or invalid process on failure
+pub fn spawn(cmd: *u8) -> Process
+    # Build null-terminated argv: [cmd, null]
+    var argv: [2]*u8
+    argv[0] = cmd
+    argv[1] = null
+    return spawn_full(cmd, @argv[0], null)
+
+# Spawn with arguments (argv must be null-terminated)
+pub fn spawn_args(cmd: *u8, argv: **u8) -> Process
+    return spawn_full(cmd, argv, null)
+
+# Spawn with arguments and environment
+pub fn spawn_full(cmd: *u8, argv: **u8, envp: **u8) -> Process
+    var p: Process
+    p.pid = -1
+    p.stdin_fd = -1
+    p.stdout_fd = -1
+    p.stderr_fd = -1
+    p.waited = 0
+
+    # Create pipes for stdin, stdout, stderr
+    # pipe() returns [read_fd, write_fd]
+    var stdin_pipe: [2]i32
+    var stdout_pipe: [2]i32
+    var stderr_pipe: [2]i32
+
+    if sys_pipe(@stdin_pipe[0]) < 0
+        return p
+    if sys_pipe(@stdout_pipe[0]) < 0
+        sys_close(stdin_pipe[0])
+        sys_close(stdin_pipe[1])
+        return p
+    if sys_pipe(@stderr_pipe[0]) < 0
+        sys_close(stdin_pipe[0])
+        sys_close(stdin_pipe[1])
+        sys_close(stdout_pipe[0])
+        sys_close(stdout_pipe[1])
+        return p
+
+    # Fork
+    let pid: i32 = sys_fork()
+
+    if pid < 0
+        # Fork failed - close all pipes
+        sys_close(stdin_pipe[0])
+        sys_close(stdin_pipe[1])
+        sys_close(stdout_pipe[0])
+        sys_close(stdout_pipe[1])
+        sys_close(stderr_pipe[0])
+        sys_close(stderr_pipe[1])
+        return p
+
+    if pid == 0
+        # Child process
+        # Redirect stdin/stdout/stderr to pipes
+        sys_dup2(stdin_pipe[0], STDIN)    # stdin reads from pipe
+        sys_dup2(stdout_pipe[1], STDOUT)  # stdout writes to pipe
+        sys_dup2(stderr_pipe[1], STDERR)  # stderr writes to pipe
+
+        # Close unused pipe ends
+        sys_close(stdin_pipe[0])
+        sys_close(stdin_pipe[1])
+        sys_close(stdout_pipe[0])
+        sys_close(stdout_pipe[1])
+        sys_close(stderr_pipe[0])
+        sys_close(stderr_pipe[1])
+
+        # Find command in PATH
+        var path_buf: [4096]u8
+        let cmd_path: *u8 = find_command_in_path(cmd, @path_buf[0], 4096)
+
+        # Use passed envp, or inherit from parent if null
+        # Note: We can't easily get parent envp here, so pass null to execve
+        # which inherits the current environment
+
+        if cmd_path != null
+            sys_execve(cmd_path, argv, envp)
+        else
+            # Try command directly (might be absolute path)
+            sys_execve(cmd, argv, envp)
+
+        # If we get here, exec failed
+        sys_exit(127)
+
+    # Parent process
+    # Close child's ends of pipes
+    sys_close(stdin_pipe[0])   # Child reads from stdin
+    sys_close(stdout_pipe[1])  # Child writes to stdout
+    sys_close(stderr_pipe[1])  # Child writes to stderr
+
+    # Store our ends
+    p.pid = pid
+    p.stdin_fd = stdin_pipe[1]   # We write to child's stdin
+    p.stdout_fd = stdout_pipe[0]  # We read from child's stdout
+    p.stderr_fd = stderr_pipe[0]  # We read from child's stderr
+
+    return p
+
+# ============================================================================
+# Process validity check
+# ============================================================================
+
+pub fn process_valid(p: *Process) -> i32
+    if p.pid > 0
+        return 1
+    return 0
+
+# ============================================================================
+# Writing to process stdin
+# ============================================================================
+
+# Write bytes to stdin
+pub fn process_write(p: *Process, data: *u8, len: i64) -> i64
+    if p.stdin_fd < 0
+        return -1
+    return sys_write(p.stdin_fd, data, len)
+
+# Write a null-terminated string to stdin
+pub fn process_write_str(p: *Process, s: *u8) -> i64
+    return process_write(p, s, strlen(s))
+
+# Close stdin (signals EOF to child)
+pub fn process_close_stdin(p: *Process)
+    if p.stdin_fd >= 0
+        sys_close(p.stdin_fd)
+        p.stdin_fd = -1
+
+# ============================================================================
+# Reading from process stdout
+# ============================================================================
+
+# Read up to max bytes from stdout into buffer
+pub fn process_read_stdout(p: *Process, buf: *u8, max: i64) -> i64
+    if p.stdout_fd < 0
+        return -1
+    return sys_read(p.stdout_fd, buf, max)
+
+# Read all stdout into a Vec<u8> (caller owns the Vec)
+pub fn process_read_stdout_all(p: *Process) -> Vec<u8>
+    var output: Vec<u8> = vec_new<u8>()
+
+    if p.stdout_fd < 0
+        return output
+
+    var temp: [4096]u8
+
+    loop
+        let n: i64 = sys_read(p.stdout_fd, @temp[0], 4096)
+        if n <= 0
+            break
+        vec_push_bytes<u8>(@output, @temp[0], n)
+
+    return output
+
+# Read one line from stdout (up to newline or EOF)
+pub fn process_read_line(p: *Process) -> Vec<u8>
+    var line: Vec<u8> = vec_new<u8>()
+
+    if p.stdout_fd < 0
+        return line
+
+    var c: u8 = 0
+
+    loop
+        let n: i64 = sys_read(p.stdout_fd, @c, 1)
+        if n <= 0
+            break
+        vec_push<u8>(@line, c)
+        if c == '\n'
+            break
+
+    return line
+
+# ============================================================================
+# Reading from process stderr
+# ============================================================================
+
+pub fn process_read_stderr(p: *Process, buf: *u8, max: i64) -> i64
+    if p.stderr_fd < 0
+        return -1
+    return sys_read(p.stderr_fd, buf, max)
+
+pub fn process_read_stderr_all(p: *Process) -> Vec<u8>
+    var output: Vec<u8> = vec_new<u8>()
+
+    if p.stderr_fd < 0
+        return output
+
+    var temp: [4096]u8
+
+    loop
+        let n: i64 = sys_read(p.stderr_fd, @temp[0], 4096)
+        if n <= 0
+            break
+        vec_push_bytes<u8>(@output, @temp[0], n)
+
+    return output
+
+# ============================================================================
+# Waiting for process
+# ============================================================================
+
+# Wait for process to exit, return result
+pub fn process_wait(p: *Process) -> ProcessResult
+    var result: ProcessResult
+    result.exit_code = -1
+    result.signaled = 0
+    result.signal = 0
+
+    if p.pid < 0 or p.waited != 0
+        return result
+
+    # Close stdin to signal EOF if not already closed
+    process_close_stdin(p)
+
+    var status: i32 = 0
+    let ret: i32 = sys_wait4(p.pid, @status, 0, null)
+
+    if ret < 0
+        return result
+
+    p.waited = 1
+
+    # Parse wait status
+    # WIFEXITED: (status & 127) == 0
+    # WEXITSTATUS: (status >> 8) & 255
+    # WIFSIGNALED: (status & 127) != 0 and (status & 127) != 127
+    # WTERMSIG: status & 127
+
+    let term_signal: i32 = status & 127
+
+    if term_signal == 0
+        # Exited normally
+        result.exit_code = (status / 256) & 255
+        result.signaled = 0
+    else if term_signal != 127
+        # Killed by signal
+        result.signaled = 1
+        result.signal = term_signal
+        result.exit_code = 128 + term_signal
+
+    return result
+
+# ============================================================================
+# ProcessResult helpers
+# ============================================================================
+
+pub fn result_success(r: *ProcessResult) -> i32
+    if r.signaled == 0 and r.exit_code == 0
+        return 1
+    return 0
+
+pub fn result_code(r: *ProcessResult) -> i32
+    return r.exit_code
+
+# ============================================================================
+# Process cleanup
+# ============================================================================
+
+# Kill the process (if still running)
+pub fn process_kill(p: *Process)
+    if p.pid > 0 and p.waited == 0
+        sys_kill(p.pid, SIGKILL)
+
+# Close all pipe file descriptors
+pub fn process_close_pipes(p: *Process)
+    if p.stdin_fd >= 0
+        sys_close(p.stdin_fd)
+        p.stdin_fd = -1
+    if p.stdout_fd >= 0
+        sys_close(p.stdout_fd)
+        p.stdout_fd = -1
+    if p.stderr_fd >= 0
+        sys_close(p.stderr_fd)
+        p.stderr_fd = -1
+
+# Full cleanup: wait for child if needed, close pipes
+pub fn process_cleanup(p: *Process)
+    if p.pid > 0 and p.waited == 0
+        # Try to wait non-blocking first
+        var status: i32 = 0
+        let ret: i32 = sys_wait4(p.pid, @status, WNOHANG, null)
+        if ret == 0
+            # Still running - kill it
+            sys_kill(p.pid, SIGTERM)
+            # Brief pause
+            var ts: [2]i64
+            ts[0] = 0
+            ts[1] = 10000000  # 10ms
+            sys_nanosleep(@ts[0], null)
+            # Check again
+            let ret2: i32 = sys_wait4(p.pid, @status, WNOHANG, null)
+            if ret2 == 0
+                # Still alive - SIGKILL
+                sys_kill(p.pid, SIGKILL)
+                sys_wait4(p.pid, @status, 0, null)
+
+    process_close_pipes(p)
+
+# ============================================================================
+# Drop trait implementation (for automatic cleanup)
+# ============================================================================
+# NOTE: ritz1 impl blocks may not be fully supported yet
+# impl Drop for Process
+#     fn drop(self: @&Process)
+#         process_cleanup(self)
+
+# ============================================================================
+# Method syntax support (when impl blocks work)
+# ============================================================================
+# impl Process
+#     fn valid(self: *Process) -> i32
+#         return process_valid(self)
+#
+#     fn write(self: *Process, data: *u8, len: i64) -> i64
+#         return process_write(self, data, len)
+#
+#     fn write_str(self: *Process, s: *u8) -> i64
+#         return process_write_str(self, s)
+#
+#     fn close_stdin(self: *Process)
+#         process_close_stdin(self)
+#
+#     fn read_stdout(self: *Process, buf: *u8, max: i64) -> i64
+#         return process_read_stdout(self, buf, max)
+#
+#     fn read_stdout_all(self: *Process) -> Vec<u8>
+#         return process_read_stdout_all(self)
+#
+#     fn read_line(self: *Process) -> Vec<u8>
+#         return process_read_line(self)
+#
+#     fn wait(self: *Process) -> ProcessResult
+#         return process_wait(self)
+#
+#     fn kill(self: *Process)
+#         process_kill(self)
+#
+#     fn cleanup(self: *Process)
+#         process_cleanup(self)
+
+# impl ProcessResult
+#     fn success(self: *ProcessResult) -> i32
+#         return result_success(self)
+#
+#     fn code(self: *ProcessResult) -> i32
+#         return result_code(self)
+

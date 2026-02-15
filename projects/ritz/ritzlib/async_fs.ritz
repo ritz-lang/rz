@@ -1,0 +1,111 @@
+# ritzlib/async_fs.ritz - Async filesystem operations
+#
+# Async file I/O built on io_uring for high-performance non-blocking operations.
+#
+# Usage:
+#   async fn read_file(path: *u8) -> i64
+#       let fd: i32 = await async_open(path, O_RDONLY)
+#       var buf: [1024]u8
+#       let n: i64 = await async_read(fd, @buf[0], 1024)
+#       await async_close(fd)
+#       n
+#
+# Note: Currently these functions run synchronously (await is a no-op).
+# Future versions will use io_uring for true async I/O.
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.uring
+
+# ============================================================================
+# Async File Operations
+# ============================================================================
+
+# Async open - opens a file and returns the file descriptor
+# For now, this is synchronous. True async will use io_uring OPENAT.
+async fn async_open(path: *u8, flags: i32) -> i32
+    sys_open(path, flags)
+
+# Async open with mode
+async fn async_open3(path: *u8, flags: i32, mode: i32) -> i32
+    sys_open3(path, flags, mode)
+
+# Async read - reads from a file descriptor into a buffer
+# For now, this is synchronous. True async will use io_uring READ.
+async fn async_read(fd: i32, buf: *u8, count: i64) -> i64
+    sys_read(fd, buf, count)
+
+# Async write - writes from a buffer to a file descriptor
+# For now, this is synchronous. True async will use io_uring WRITE.
+async fn async_write(fd: i32, buf: *u8, count: i64) -> i64
+    sys_write(fd, buf, count)
+
+# Async close - closes a file descriptor
+# For now, this is synchronous. True async will use io_uring CLOSE.
+async fn async_close(fd: i32) -> i32
+    sys_close(fd)
+
+# ============================================================================
+# Higher-level async helpers
+# ============================================================================
+
+# Read entire file contents into a buffer
+# Returns number of bytes read, or negative on error
+async fn async_read_file(path: *u8, buf: *u8, buf_size: i64) -> i64
+    let fd: i32 = await async_open(path, O_RDONLY)
+    if fd < 0
+        return fd as i64
+
+    var total: i64 = 0
+    while total < buf_size
+        let n: i64 = await async_read(fd, buf + total, buf_size - total)
+        if n < 0
+            await async_close(fd)
+            return n
+        if n == 0
+            break
+        total += n
+
+    await async_close(fd)
+    return total
+
+# Write buffer contents to a file
+# Creates the file if it doesn't exist, truncates if it does
+# Returns number of bytes written, or negative on error
+async fn async_write_file(path: *u8, buf: *u8, count: i64) -> i64
+    # O_WRONLY | O_CREAT | O_TRUNC = 1 + 64 + 512 = 577
+    let fd: i32 = await async_open3(path, 577, 420)  # 0644 = 420
+    if fd < 0
+        return fd as i64
+
+    var total: i64 = 0
+    while total < count
+        let n: i64 = await async_write(fd, buf + total, count - total)
+        if n < 0
+            await async_close(fd)
+            return n
+        if n == 0
+            break
+        total += n
+
+    await async_close(fd)
+    return total
+
+# ============================================================================
+# io_uring-based async operations (future)
+# ============================================================================
+#
+# These will be the true async implementations once the state machine
+# transformation is complete. They will:
+#
+# 1. Submit an SQE to io_uring
+# 2. Return Pending to the executor
+# 3. When the CQE arrives, wake the task
+# 4. Resume and return Ready with the result
+#
+# async fn uring_read(ring: *IoUring, fd: i32, buf: *u8, count: i64) -> i64
+#     let sqe = uring_get_sqe(ring)
+#     uring_prep_read(sqe, fd, buf, count, 0, task_id())
+#     uring_sqe_submit(ring)
+#     # ... yield until completion ...
+#     cqe.res

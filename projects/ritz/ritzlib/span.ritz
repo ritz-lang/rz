@@ -1,0 +1,333 @@
+# ritzlib/span.ritz - Non-owning views into contiguous memory
+#
+# Span<T> is a lightweight, non-owning view into an array of T elements.
+# - No allocation, no ownership - just a pointer and length
+# - Can be created from Vec<T>, arrays, or raw pointers
+# - Ideal for passing slices of data to functions without copying
+# - Zero-cost abstraction: compiles down to (ptr, len) pair
+#
+# Usage:
+#   var v: Vec<u8> = ...
+#   let span: Span<u8> = span_from_vec<u8>(@v)
+#   let sub: Span<u8> = span_slice<u8>(@span, 1, 5)
+#
+# Common patterns:
+#   span_from_cstr("hello")      # Span<u8> from C string
+#   span_from_vec<i32>(@v)       # Span<i32> from Vec
+#   span_from_ptr<u8>(ptr, len)  # Span<u8> from raw pointer
+#
+# Note: Span does NOT own the memory it points to. The underlying data
+# must outlive any spans referencing it.
+
+import ritzlib.str
+import ritzlib.gvec
+import ritzlib.strview { StrView }
+
+# ============================================================================
+# Span<T> - Non-owning view into contiguous memory
+# ============================================================================
+
+struct Span<T>
+    ptr: *T        # Pointer to first element (not owned)
+    len: i64       # Number of elements
+
+# ============================================================================
+# Span constructors
+# ============================================================================
+
+# Create an empty span
+pub fn span_empty<T>() -> Span<T>
+    var s: Span<T>
+    s.ptr = null
+    s.len = 0
+    return s
+
+# Create a span from a raw pointer and length
+pub fn span_from_ptr<T>(ptr: *T, len: i64) -> Span<T>
+    var s: Span<T>
+    s.ptr = ptr
+    s.len = len
+    return s
+
+# Create a span from a Vec<T>
+pub fn span_from_vec<T>(v: *Vec<T>) -> Span<T>
+    var s: Span<T>
+    s.ptr = v.data
+    s.len = v.len
+    return s
+
+# Create a Span<u8> from a null-terminated C string
+pub fn span_from_cstr(cstr: *u8) -> Span<u8>
+    var s: Span<u8>
+    s.ptr = cstr
+    s.len = strlen(cstr)
+    return s
+
+# Create a Span<u8> from a StrView (zero-cost, same memory layout)
+# This is useful for bridging between string literals and Span<u8> APIs
+pub fn span_from_strview(sv: *StrView) -> Span<u8>
+    var s: Span<u8>
+    s.ptr = sv.ptr
+    s.len = sv.len
+    return s
+
+# ============================================================================
+# Span accessors
+# ============================================================================
+
+# Get length of span
+pub fn span_len<T>(s: *Span<T>) -> i64
+    return s.len
+
+# Check if span is empty
+pub fn span_is_empty<T>(s: *Span<T>) -> i32
+    if s.len == 0
+        return 1
+    return 0
+
+# Get element at index (unchecked)
+pub fn span_get<T>(s: *Span<T>, idx: i64) -> T
+    return *(s.ptr + idx)
+
+# Get pointer to element at index (unchecked)
+pub fn span_get_ptr<T>(s: *Span<T>, idx: i64) -> *T
+    return s.ptr + idx
+
+# Get raw pointer to span data
+pub fn span_as_ptr<T>(s: *Span<T>) -> *T
+    return s.ptr
+
+# ============================================================================
+# Span slicing (creates new spans, no allocation)
+# ============================================================================
+
+# Create a sub-span [start:end)
+pub fn span_slice<T>(s: *Span<T>, start: i64, end: i64) -> Span<T>
+    var result: Span<T>
+    if start < 0
+        start = 0
+    if end > s.len
+        end = s.len
+    if start >= end
+        result.ptr = null
+        result.len = 0
+        return result
+    result.ptr = s.ptr + start
+    result.len = end - start
+    return result
+
+# Create a span from start to end of original
+pub fn span_from<T>(s: *Span<T>, start: i64) -> Span<T>
+    return span_slice<T>(s, start, s.len)
+
+# Create a span from beginning to index
+pub fn span_to<T>(s: *Span<T>, end: i64) -> Span<T>
+    return span_slice<T>(s, 0, end)
+
+# ============================================================================
+# Span<u8> specific operations (byte/string processing)
+# ============================================================================
+
+# Compare two byte spans for equality
+pub fn span_eq(a: *Span<u8>, b: *Span<u8>) -> i32
+    if a.len != b.len
+        return 0
+    if a.len == 0
+        return 1
+    for i in 0..a.len
+        if *(a.ptr + i) != *(b.ptr + i)
+            return 0
+    return 1
+
+# Check if haystack contains needle (byte spans)
+pub fn span_contains(haystack: *Span<u8>, needle: *Span<u8>) -> i32
+    if needle.len == 0
+        return 1  # Empty pattern matches everything
+    if haystack.len < needle.len
+        return 0  # Needle longer than haystack
+
+    var pos: i64 = 0
+    let max_pos: i64 = haystack.len - needle.len + 1
+    while pos < max_pos
+        var found: i32 = 1
+        var i: i64 = 0
+        while i < needle.len and found == 1
+            if *(haystack.ptr + pos + i) != *(needle.ptr + i)
+                found = 0
+            i += 1
+        if found == 1
+            return 1
+        pos += 1
+    return 0
+
+# Check if span starts with prefix
+pub fn span_starts_with(s: *Span<u8>, prefix: *Span<u8>) -> i32
+    if prefix.len > s.len
+        return 0
+    for i in 0..prefix.len
+        if *(s.ptr + i) != *(prefix.ptr + i)
+            return 0
+    return 1
+
+# Check if span ends with suffix
+pub fn span_ends_with(s: *Span<u8>, suffix: *Span<u8>) -> i32
+    if suffix.len > s.len
+        return 0
+    let offset: i64 = s.len - suffix.len
+    for i in 0..suffix.len
+        if *(s.ptr + offset + i) != *(suffix.ptr + i)
+            return 0
+    return 1
+
+# Find first occurrence of needle in haystack, return index or -1
+pub fn span_find(haystack: *Span<u8>, needle: *Span<u8>) -> i64
+    if needle.len == 0
+        return 0
+    if haystack.len < needle.len
+        return -1
+
+    var pos: i64 = 0
+    let max_pos: i64 = haystack.len - needle.len + 1
+    while pos < max_pos
+        var found: i32 = 1
+        var i: i64 = 0
+        while i < needle.len and found == 1
+            if *(haystack.ptr + pos + i) != *(needle.ptr + i)
+                found = 0
+            i += 1
+        if found == 1
+            return pos
+        pos += 1
+    return -1
+
+# ============================================================================
+# Method syntax support
+# ============================================================================
+
+impl<T> Span<T>
+    fn len(self: *Span<T>) -> i64
+        return span_len<T>(self)
+
+    fn is_empty(self: *Span<T>) -> i32
+        return span_is_empty<T>(self)
+
+    fn get(self: *Span<T>, idx: i64) -> T
+        return span_get<T>(self, idx)
+
+    fn get_ptr(self: *Span<T>, idx: i64) -> *T
+        return span_get_ptr<T>(self, idx)
+
+    fn as_ptr(self: *Span<T>) -> *T
+        return span_as_ptr<T>(self)
+
+    fn slice(self: *Span<T>, start: i64, end: i64) -> Span<T>
+        return span_slice<T>(self, start, end)
+
+
+# ============================================================================
+# Additional Span<u8> string operations
+# ============================================================================
+
+# Find first occurrence of a single byte in span, returns index or -1
+pub fn span_find_byte(s: *Span<u8>, c: u8) -> i64
+    for i in 0..s.len
+        if *(s.ptr + i) == c
+            return i
+    return -1
+
+# Compare Span<u8> to a null-terminated C string
+pub fn span_eq_cstr(s: *Span<u8>, cstr: *u8) -> i32
+    var i: i64 = 0
+    while i < s.len
+        if *(cstr + i) == 0
+            return 0  # cstr is shorter
+        if *(s.ptr + i) != *(cstr + i)
+            return 0
+        i += 1
+    # Check that cstr ends here
+    if *(cstr + i) != 0
+        return 0
+    return 1
+
+# Get first n bytes as new span
+pub fn span_take(s: *Span<u8>, n: i64) -> Span<u8>
+    var result: Span<u8>
+    result.ptr = s.ptr
+    if n < s.len
+        result.len = n
+    else
+        result.len = s.len
+    return result
+
+# Skip first n bytes and return rest as new span
+pub fn span_skip(s: *Span<u8>, n: i64) -> Span<u8>
+    var result: Span<u8>
+    if n >= s.len
+        result.ptr = s.ptr + s.len
+        result.len = 0
+    else
+        result.ptr = s.ptr + n
+        result.len = s.len - n
+    return result
+
+# Create a Span<u8> from a pointer and length
+pub fn span_from_bytes(ptr: *u8, len: i64) -> Span<u8>
+    var s: Span<u8>
+    s.ptr = ptr
+    s.len = len
+    return s
+
+# Create a Span<u8> with explicit length (alias for span_from_ptr)
+# Useful for compile-time constants where length is known
+pub fn span_literal(ptr: *u8, len: i64) -> Span<u8>
+    var s: Span<u8>
+    s.ptr = ptr
+    s.len = len
+    return s
+
+
+# ============================================================================
+# HTTP Constants as Span<u8> (pre-computed lengths, zero strlen overhead)
+# ============================================================================
+
+# HTTP status lines
+pub fn http_200_ok() -> Span<u8>
+    return span_literal(c"HTTP/1.1 200 OK\r\n", 17)
+
+pub fn http_404_not_found() -> Span<u8>
+    return span_literal(c"HTTP/1.1 404 Not Found\r\n", 24)
+
+pub fn http_400_bad_request() -> Span<u8>
+    return span_literal(c"HTTP/1.1 400 Bad Request\r\n", 26)
+
+pub fn http_500_internal_error() -> Span<u8>
+    return span_literal(c"HTTP/1.1 500 Internal Server Error\r\n", 36)
+
+# HTTP headers
+pub fn http_content_length() -> Span<u8>
+    return span_literal(c"Content-Length: ", 16)
+
+pub fn http_content_type_text() -> Span<u8>
+    return span_literal(c"Content-Type: text/plain\r\n", 26)
+
+pub fn http_content_type_html() -> Span<u8>
+    return span_literal(c"Content-Type: text/html\r\n", 25)
+
+pub fn http_content_type_json() -> Span<u8>
+    return span_literal(c"Content-Type: application/json\r\n", 32)
+
+pub fn http_connection_close() -> Span<u8>
+    return span_literal(c"Connection: close\r\n", 19)
+
+pub fn http_connection_keepalive() -> Span<u8>
+    return span_literal(c"Connection: keep-alive\r\n", 24)
+
+pub fn http_crlf() -> Span<u8>
+    return span_literal(c"\r\n", 2)
+
+# Common bodies
+pub fn http_hello_world() -> Span<u8>
+    return span_literal(c"Hello, World!", 13)
+
+pub fn http_not_found_body() -> Span<u8>
+    return span_literal(c"404 Not Found", 13)

@@ -1,0 +1,424 @@
+# ritzlib/args.ritz - Declarative argument parsing
+#
+# Provides a simple, declarative way to define and parse command-line arguments.
+#
+# Usage:
+#   var parser: ArgParser
+#   args_init(@parser, "myprogram", "Description of my program")
+#   args_flag(@parser, 'v', "verbose", "Enable verbose output")
+#   args_option(@parser, 'n', "count", "NUM", "Number of items", "10")
+#   args_positional(@parser, "FILE", "Input file(s)", 0, -1)  # 0 to unlimited
+#
+#   if args_parse(@parser, argc, argv) != 0
+#       return 1
+#
+#   let verbose: i32 = args_get_flag(@parser, 'v')
+#   let count: i64 = args_get_int(@parser, 'n')
+#   for i in 0..parser.positional_count
+#       let file: *u8 = args_get_positional(@parser, i)
+
+import ritzlib.sys
+import ritzlib.str
+import ritzlib.io
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+const MAX_OPTIONS: i32 = 32
+const MAX_POSITIONALS: i32 = 256
+
+# Option types
+const OPT_FLAG: i32 = 0      # Boolean flag (-v, --verbose)
+const OPT_VALUE: i32 = 1     # Option with value (-n NUM, --count=NUM)
+
+# ============================================================================
+# Data structures
+# ============================================================================
+
+struct OptDef
+    short_name: u8           # Single char (-v), 0 if none
+    long_name: *u8           # Long name (--verbose), null if none
+    value_name: *u8          # Name of value for help (NUM), null for flags
+    description: *u8         # Help text
+    default_value: *u8       # Default value string, null if required
+    opt_type: i32            # OPT_FLAG or OPT_VALUE
+    is_set: i32              # Was this option provided?
+    value: *u8               # The value (for OPT_VALUE) or "1"/"0" (for OPT_FLAG)
+
+struct PosDef
+    name: *u8                # Name for help (FILE)
+    description: *u8         # Help text
+    min_count: i32           # Minimum required (0 = optional)
+    max_count: i32           # Maximum allowed (-1 = unlimited)
+
+struct ArgParser
+    program_name: *u8
+    description: *u8
+
+    # Option definitions
+    options: [32]OptDef      # MAX_OPTIONS
+    option_count: i32
+
+    # Positional definitions
+    pos_defs: [8]PosDef      # Up to 8 positional arg types
+    pos_def_count: i32
+
+    # Parsed positional values
+    positionals: [256]*u8    # MAX_POSITIONALS
+    positional_count: i32
+
+    # Error state
+    error_msg: *u8
+
+# ============================================================================
+# Initialization
+# ============================================================================
+
+pub fn args_init(parser: *ArgParser, program: *u8, desc: *u8)
+    parser.program_name = program
+    parser.description = desc
+    parser.option_count = 0
+    parser.pos_def_count = 0
+    parser.positional_count = 0
+    parser.error_msg = null
+
+# ============================================================================
+# Option definition
+# ============================================================================
+
+pub fn args_flag(parser: *ArgParser, short: u8, long: *u8, desc: *u8)
+    if parser.option_count >= MAX_OPTIONS
+        return
+
+    let idx: i32 = parser.option_count
+    parser.options[idx].short_name = short
+    parser.options[idx].long_name = long
+    parser.options[idx].value_name = null
+    parser.options[idx].description = desc
+    parser.options[idx].default_value = c"0"
+    parser.options[idx].opt_type = OPT_FLAG
+    parser.options[idx].is_set = 0
+    parser.options[idx].value = c"0"
+    parser.option_count = parser.option_count + 1
+
+pub fn args_option(parser: *ArgParser, short: u8, long: *u8, value_name: *u8, desc: *u8, default: *u8)
+    if parser.option_count >= MAX_OPTIONS
+        return
+
+    let idx: i32 = parser.option_count
+    parser.options[idx].short_name = short
+    parser.options[idx].long_name = long
+    parser.options[idx].value_name = value_name
+    parser.options[idx].description = desc
+    parser.options[idx].default_value = default
+    parser.options[idx].opt_type = OPT_VALUE
+    parser.options[idx].is_set = 0
+    parser.options[idx].value = default
+    parser.option_count = parser.option_count + 1
+
+pub fn args_positional(parser: *ArgParser, name: *u8, desc: *u8, min: i32, max: i32)
+    if parser.pos_def_count >= 8
+        return
+
+    let idx: i32 = parser.pos_def_count
+    parser.pos_defs[idx].name = name
+    parser.pos_defs[idx].description = desc
+    parser.pos_defs[idx].min_count = min
+    parser.pos_defs[idx].max_count = max
+    parser.pos_def_count = parser.pos_def_count + 1
+
+# ============================================================================
+# Option lookup helpers
+# ============================================================================
+
+pub fn find_option_short(parser: *ArgParser, short: u8) -> i32
+    for i in 0..parser.option_count
+        if parser.options[i].short_name == short
+            return i
+    return -1
+
+pub fn find_option_long(parser: *ArgParser, long: *u8) -> i32
+    for i in 0..parser.option_count
+        if parser.options[i].long_name != null
+            if streq(parser.options[i].long_name, long) != 0
+                return i
+    return -1
+
+# ============================================================================
+# Parsing
+# ============================================================================
+
+pub fn args_parse(parser: *ArgParser, argc: i32, argv: **u8) -> i32
+    var i: i32 = 1  # Skip program name
+    var stop_options: i32 = 0  # After --, treat everything as positional
+
+    while i < argc
+        let arg: *u8 = *(argv + i)
+
+        # Check for -- (end of options)
+        if stop_options == 0 and streq(arg, c"--") != 0
+            stop_options = 1
+            i += 1
+            continue
+
+        # Check for --option or --option=value
+        if stop_options == 0 and *arg == '-' and *(arg + 1) == '-'
+            # Long option
+            let opt_start: *u8 = arg + 2
+
+            # Check for = in the option
+            var eq_pos: i64 = 0
+            var j: i64 = 0
+            while *(opt_start + j) != 0
+                if *(opt_start + j) == '='  # '='
+                    eq_pos = j
+                    break
+                j += 1
+
+            if eq_pos > 0
+                # --option=value form
+                var opt_name: [64]u8
+                var k: i64 = 0
+                while k < eq_pos and k < 63
+                    opt_name[k] = *(opt_start + k)
+                    k += 1
+                opt_name[k] = 0
+
+                let idx: i32 = find_option_long(parser, @opt_name[0])
+                if idx < 0
+                    eprints_cstr(parser.program_name)
+                    eprints(": unknown option '--")
+                    eprints_cstr(@opt_name[0])
+                    eprints("'\n")
+                    return 1
+
+                if parser.options[idx].opt_type == OPT_FLAG
+                    eprints_cstr(parser.program_name)
+                    eprints(": option '--")
+                    eprints_cstr(@opt_name[0])
+                    eprints("' doesn't accept a value\n")
+                    return 1
+
+                parser.options[idx].value = opt_start + eq_pos + 1
+                parser.options[idx].is_set = 1
+            else
+                # --option form (possibly followed by value)
+                let idx: i32 = find_option_long(parser, opt_start)
+                if idx < 0
+                    eprints_cstr(parser.program_name)
+                    eprints(": unknown option '--")
+                    eprints_cstr(opt_start)
+                    eprints("'\n")
+                    return 1
+
+                if parser.options[idx].opt_type == OPT_FLAG
+                    parser.options[idx].value = c"1"
+                    parser.options[idx].is_set = 1
+                else
+                    # Need next argument as value
+                    i += 1
+                    if i >= argc
+                        eprints_cstr(parser.program_name)
+                        eprints(": option '--")
+                        eprints_cstr(opt_start)
+                        eprints("' requires a value\n")
+                        return 1
+                    parser.options[idx].value = *(argv + i)
+                    parser.options[idx].is_set = 1
+
+            i += 1
+            continue
+
+        # Check for -x or -xyz (short options)
+        if stop_options == 0 and *arg == '-' and *(arg + 1) != 0
+            # Short option(s)
+            var j: i32 = 1
+            while *(arg + j) != 0
+                let c: u8 = *(arg + j)
+                let idx: i32 = find_option_short(parser, c)
+
+                if idx < 0
+                    eprints_cstr(parser.program_name)
+                    eprints(": unknown option '-")
+                    print_char(c)
+                    eprints("'\n")
+                    return 1
+
+                if parser.options[idx].opt_type == OPT_FLAG
+                    parser.options[idx].value = c"1"
+                    parser.options[idx].is_set = 1
+                    j += 1
+                else
+                    # Value option - rest of this arg or next arg
+                    if *(arg + j + 1) != 0
+                        # Value is rest of this argument
+                        parser.options[idx].value = arg + j + 1
+                        parser.options[idx].is_set = 1
+                        break
+                    else
+                        # Value is next argument
+                        i += 1
+                        if i >= argc
+                            eprints_cstr(parser.program_name)
+                            eprints(": option '-")
+                            print_char(c)
+                            eprints("' requires a value\n")
+                            return 1
+                        parser.options[idx].value = *(argv + i)
+                        parser.options[idx].is_set = 1
+                        break
+
+            i += 1
+            continue
+
+        # Positional argument
+        if parser.positional_count < MAX_POSITIONALS
+            parser.positionals[parser.positional_count] = arg
+            parser.positional_count = parser.positional_count + 1
+
+        i += 1
+
+    # Validate positional counts
+    if parser.pos_def_count > 0
+        # Access first positional def directly (can't take address of array element in struct)
+        let min_count: i32 = parser.pos_defs[0].min_count
+        let max_count: i32 = parser.pos_defs[0].max_count
+        if parser.positional_count < min_count
+            eprints_cstr(parser.program_name)
+            eprints(": missing required argument '")
+            eprints_cstr(parser.pos_defs[0].name)
+            eprints("'\n")
+            return 1
+        if max_count >= 0 and parser.positional_count > max_count
+            eprints_cstr(parser.program_name)
+            eprints(": too many arguments\n")
+            return 1
+
+    return 0
+
+# ============================================================================
+# Value retrieval
+# ============================================================================
+
+pub fn args_get_flag(parser: *ArgParser, short: u8) -> i32
+    let idx: i32 = find_option_short(parser, short)
+    if idx < 0
+        return 0
+    return streq(parser.options[idx].value, c"1")
+
+pub fn args_get_flag_long(parser: *ArgParser, long: *u8) -> i32
+    let idx: i32 = find_option_long(parser, long)
+    if idx < 0
+        return 0
+    return streq(parser.options[idx].value, c"1")
+
+pub fn args_get_str(parser: *ArgParser, short: u8) -> *u8
+    let idx: i32 = find_option_short(parser, short)
+    if idx < 0
+        return null
+    return parser.options[idx].value
+
+pub fn args_get_str_long(parser: *ArgParser, long: *u8) -> *u8
+    let idx: i32 = find_option_long(parser, long)
+    if idx < 0
+        return null
+    return parser.options[idx].value
+
+pub fn args_get_int(parser: *ArgParser, short: u8) -> i64
+    let val: *u8 = args_get_str(parser, short)
+    if val == null
+        return 0
+    return atoi(val)
+
+pub fn args_get_int_long(parser: *ArgParser, long: *u8) -> i64
+    let val: *u8 = args_get_str_long(parser, long)
+    if val == null
+        return 0
+    return atoi(val)
+
+pub fn args_get_positional(parser: *ArgParser, idx: i32) -> *u8
+    if idx < 0 or idx >= parser.positional_count
+        return null
+    return parser.positionals[idx]
+
+pub fn args_is_set(parser: *ArgParser, short: u8) -> i32
+    let idx: i32 = find_option_short(parser, short)
+    if idx < 0
+        return 0
+    return parser.options[idx].is_set
+
+pub fn args_is_set_long(parser: *ArgParser, long: *u8) -> i32
+    let idx: i32 = find_option_long(parser, long)
+    if idx < 0
+        return 0
+    return parser.options[idx].is_set
+
+# ============================================================================
+# Help generation
+# ============================================================================
+
+pub fn args_print_usage(parser: *ArgParser)
+    prints("Usage: ")
+    prints_cstr(parser.program_name)
+    prints(" [OPTIONS]")
+
+    for i in 0..parser.pos_def_count
+        prints(" ")
+        if parser.pos_defs[i].min_count == 0
+            prints("[")
+        prints_cstr(parser.pos_defs[i].name)
+        if parser.pos_defs[i].max_count < 0 or parser.pos_defs[i].max_count > 1
+            prints("...")
+        if parser.pos_defs[i].min_count == 0
+            prints("]")
+
+    prints("\n")
+
+pub fn args_print_help(parser: *ArgParser)
+    args_print_usage(parser)
+
+    if parser.description != null
+        prints("\n")
+        prints_cstr(parser.description)
+        prints("\n")
+
+    if parser.option_count > 0
+        prints("\nOptions:\n")
+        for i in 0..parser.option_count
+            prints("  ")
+
+            if parser.options[i].short_name != 0
+                prints("-")
+                print_char(parser.options[i].short_name)
+                if parser.options[i].long_name != null
+                    prints(", ")
+            else
+                prints("    ")
+
+            if parser.options[i].long_name != null
+                prints("--")
+                prints_cstr(parser.options[i].long_name)
+                if parser.options[i].value_name != null
+                    prints("=")
+                    prints_cstr(parser.options[i].value_name)
+
+            prints("\n        ")
+            prints_cstr(parser.options[i].description)
+
+            if parser.options[i].default_value != null
+                if parser.options[i].opt_type == OPT_VALUE
+                    prints(" (default: ")
+                    prints_cstr(parser.options[i].default_value)
+                    prints(")")
+
+            prints("\n")
+
+    if parser.pos_def_count > 0
+        prints("\nArguments:\n")
+        for i in 0..parser.pos_def_count
+            prints("  ")
+            prints_cstr(parser.pos_defs[i].name)
+            prints("\n        ")
+            prints_cstr(parser.pos_defs[i].description)
+            prints("\n")

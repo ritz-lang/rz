@@ -1,0 +1,405 @@
+# ritzlib/memory.ritz - Memory allocation infrastructure
+#
+# Provides allocation primitives for Ritz programs:
+# - Arena: Fast bump allocator for batch allocations (reset all at once)
+# - Pool: Fixed-size block allocator (TODO)
+# - Global process heap with simple allocation/free
+#
+# Design principles:
+# - Arena is the primary allocator for compilers, parsers, etc.
+# - Arenas are cheap to create and destroy (single mmap/munmap)
+# - No per-allocation tracking needed - just bump the offset
+# - Call arena_reset() to reuse memory, arena_destroy() to free
+
+import ritzlib.sys
+import ritzlib.str  # For memcpy, memset, memcmp
+
+# ============================================================================
+# Arena Allocator
+# ============================================================================
+# Fast bump allocator: allocations just increment an offset.
+# Memory is freed all at once via reset() or destroy().
+# Perfect for compilers (one arena per AST), parsers, etc.
+
+const ARENA_DEFAULT_SIZE: i64 = 1048576  # 1 MB default
+
+struct Arena
+    base: *u8       # Base pointer from mmap
+    size: i64       # Total size of arena
+    offset: i64     # Current allocation offset (next free byte)
+
+# Create a new arena with the given capacity
+pub fn arena_new(size: i64) -> Arena
+    var a: Arena
+    a.base = sys_mmap(0, size, PROT_READ + PROT_WRITE, MAP_PRIVATE + MAP_ANONYMOUS, -1, 0)
+    if a.base == (-1) as *u8
+        # mmap failed
+        a.base = null
+        a.size = 0
+        a.offset = 0
+        return a
+    a.size = size
+    a.offset = 0
+    return a
+
+# Create a new arena with default size (1 MB)
+pub fn arena_default() -> Arena
+    return arena_new(ARENA_DEFAULT_SIZE)
+
+# Allocate `size` bytes from the arena
+# Returns pointer to allocated memory, or nil on failure
+pub fn arena_alloc(a: *Arena, size: i64) -> *u8
+    if size <= 0
+        return null
+
+    # Align to 8 bytes for safety
+    let aligned_size: i64 = (size + 7) & (0 - 8)
+
+    if a.offset + aligned_size > a.size
+        # Out of space
+        return null
+
+    let ptr: *u8 = a.base + a.offset
+    a.offset = a.offset + aligned_size
+    return ptr
+
+# Allocate and zero-initialize `size` bytes
+pub fn arena_alloc_zero(a: *Arena, size: i64) -> *u8
+    let ptr: *u8 = arena_alloc(a, size)
+    if ptr == null
+        return ptr
+
+    # Zero the memory
+    var i: i64 = 0
+    while i < size
+        *(ptr + i) = 0
+        i += 1
+
+    return ptr
+
+# Allocate space for `count` elements of `elem_size` bytes each
+pub fn arena_alloc_array(a: *Arena, count: i64, elem_size: i64) -> *u8
+    return arena_alloc(a, count * elem_size)
+
+# Reset the arena (free all allocations, keep the memory)
+pub fn arena_reset(a: *Arena)
+    a.offset = 0
+
+# Destroy the arena (free the underlying memory)
+pub fn arena_destroy(a: *Arena)
+    if a.base != null and a.size > 0
+        sys_munmap(a.base, a.size)
+    a.base = null
+    a.size = 0
+    a.offset = 0
+
+# Get the current usage of the arena
+pub fn arena_used(a: *Arena) -> i64
+    return a.offset
+
+# Get the remaining capacity of the arena
+pub fn arena_remaining(a: *Arena) -> i64
+    return a.size - a.offset
+
+# Check if arena is valid (successfully allocated)
+pub fn arena_valid(a: *Arena) -> i32
+    if a.base != null
+        return 1
+    return 0
+
+# ============================================================================
+# Process Heap
+# ============================================================================
+# Simple mmap-based heap for when you need per-allocation free.
+# For most use cases, prefer Arena instead.
+
+# Allocate `size` bytes from the process heap
+pub fn heap_alloc(size: i64) -> *u8
+    if size <= 0
+        return null
+    return sys_mmap(0, size, PROT_READ + PROT_WRITE, MAP_PRIVATE + MAP_ANONYMOUS, -1, 0)
+
+# Free `size` bytes of heap memory at `ptr`
+pub fn heap_free(ptr: *u8, size: i64) -> i32
+    if ptr == null or size <= 0
+        return 0
+    return sys_munmap(ptr, size)
+
+# Reallocate memory to a new size
+# Note: Requires knowing the old size (limitation of mmap-based approach)
+pub fn heap_realloc(ptr: *u8, old_size: i64, new_size: i64) -> *u8
+    if new_size <= 0
+        if ptr != null and old_size > 0
+            heap_free(ptr, old_size)
+        return null
+
+    let new_ptr: *u8 = heap_alloc(new_size)
+    if new_ptr == null
+        return null
+
+    # Copy old data (up to the smaller of old/new size)
+    var copy_size: i64 = old_size
+    if new_size < old_size
+        copy_size = new_size
+
+    var i: i64 = 0
+    while i < copy_size
+        *(new_ptr + i) = *(ptr + i)
+        i += 1
+
+    # Free old memory
+    if ptr != null and old_size > 0
+        heap_free(ptr, old_size)
+
+    return new_ptr
+
+# ============================================================================
+# Memory utilities
+# ============================================================================
+# Note: memcpy, memset, memcmp are provided by ritzlib.str
+
+# Zero `n` bytes at `dst`
+pub fn memzero(dst: *u8, n: i64)
+    memset(dst, 0, n)
+
+# ============================================================================
+# jemalloc-style Allocator
+# ============================================================================
+# A proper malloc/free implementation with size classes.
+# - No need to track sizes when freeing
+# - Size class bins for common sizes (16-2048 bytes)
+# - Direct mmap for large allocations (>2048 bytes)
+# - Free lists per size class for fast reuse
+
+const NUM_SIZE_CLASSES: i32 = 9
+const PAGE_SIZE: i64 = 4096
+const LARGE_THRESHOLD: i64 = 2048
+const HEADER_SIZE: i64 = 16  # Block header (size + padding for alignment)
+
+# Size class block sizes (including header)
+# Class 0: 32 bytes  (usable: 16)
+# Class 1: 48 bytes  (usable: 32)
+# Class 2: 80 bytes  (usable: 64)
+# Class 3: 144 bytes (usable: 128)
+# Class 4: 272 bytes (usable: 256)
+# Class 5: 528 bytes (usable: 512)
+# Class 6: 1040 bytes (usable: 1024)
+# Class 7: 2064 bytes (usable: 2048)
+# Class 8+: mmap direct
+
+# Lookup table for block sizes by class (O(1) instead of if-else chain)
+const BLOCK_SIZES: [9]i64 = [32, 48, 80, 144, 272, 528, 1040, 2064, 0]
+
+# Block header stored before each allocation
+# For size-class: stores class index (0-8)
+# For large: stores actual mmap size (negative to indicate large)
+struct BlockHeader
+    size_class: i64   # 0-8 for bins, negative for mmap size
+
+# Free list node (embedded in free blocks, after header)
+struct FreeNode
+    next: *FreeNode
+
+# Size class bin - manages allocations of one size
+struct SizeBin
+    free_list: *FreeNode  # Free list head
+    block_size: i64       # Total block size (header + usable)
+    slab: *u8             # Current slab being carved
+    slab_offset: i64      # Next allocation offset in slab
+    slab_size: i64        # Total slab size
+
+# Global allocator state
+struct GlobalAlloc
+    bins: [9]SizeBin      # One per size class
+    initialized: i32
+
+# Global allocator instance
+var g_alloc: GlobalAlloc
+
+# Get block size for a size class (O(1) lookup table)
+fn get_block_size(class: i32) -> i64
+    if class < 0 or class > 8
+        return 0
+    return BLOCK_SIZES[class]
+
+# Get size class for a requested size using clz intrinsic (O(1) instead of if-else chain)
+# Maps size ranges to classes: ≤16 → 0, ≤32 → 1, ≤64 → 2, ... ≤2048 → 7, >2048 → -1
+fn get_size_class(size: i64) -> i32
+    if size <= 0
+        return -1
+    if size <= 16
+        return 0
+    if size > 2048
+        return -1  # Large allocation
+    # Use clz to compute log2: 64 - clz(size - 1) gives bit width
+    # Subtract 4 to get class (since class 0 handles up to 16 = 2^4)
+    let bits: u8 = (size - 1).clz()
+    return (64 - bits as i32) - 4
+
+# Initialize a size bin
+fn bin_init(bin: *SizeBin, block_size: i64)
+    bin.free_list = null
+    bin.block_size = block_size
+    bin.slab = null
+    bin.slab_offset = 0
+    bin.slab_size = 0
+
+# Allocate a new slab for a bin
+fn bin_new_slab(bin: *SizeBin) -> i32
+    # Allocate 64KB slabs for efficiency
+    let slab_size: i64 = 65536
+    let slab: *u8 = sys_mmap(0, slab_size, PROT_READ + PROT_WRITE, MAP_PRIVATE + MAP_ANONYMOUS, -1, 0)
+    if slab == (-1) as *u8
+        return -1
+    bin.slab = slab
+    bin.slab_offset = 0
+    bin.slab_size = slab_size
+    return 0
+
+# Allocate from a bin
+fn bin_alloc(bin: *SizeBin, class: i32) -> *u8
+    # Try free list first
+    if bin.free_list != null
+        let node: *FreeNode = bin.free_list
+        bin.free_list = node.next
+        # The header is at (node - HEADER_SIZE)
+        let header: *BlockHeader = (node as i64 - HEADER_SIZE) as *BlockHeader
+        header.size_class = class as i64
+        return node as *u8
+
+    # Carve from slab
+    if bin.slab == null or bin.slab_offset + bin.block_size > bin.slab_size
+        if bin_new_slab(bin) != 0
+            return null
+
+    let block: *u8 = bin.slab + bin.slab_offset
+    bin.slab_offset = bin.slab_offset + bin.block_size
+
+    # Set up header
+    let header: *BlockHeader = block as *BlockHeader
+    header.size_class = class as i64
+
+    # Return pointer after header
+    return block + HEADER_SIZE
+
+# Free to a bin
+fn bin_free(bin: *SizeBin, ptr: *u8)
+    # Add to free list
+    let node: *FreeNode = ptr as *FreeNode
+    node.next = bin.free_list
+    bin.free_list = node
+
+# Initialize the global allocator
+fn alloc_init()
+    if g_alloc.initialized != 0
+        return
+
+    for i in 0..NUM_SIZE_CLASSES
+        bin_init(@g_alloc.bins[i], get_block_size(i))
+
+    g_alloc.initialized = 1
+
+# ============================================================================
+# Public API: malloc, free, realloc
+# ============================================================================
+
+# Allocate size bytes
+pub fn malloc(size: i64) -> *u8
+    if size <= 0
+        return null
+
+    alloc_init()
+
+    let class: i32 = get_size_class(size)
+
+    if class < 0
+        # Large allocation - use mmap directly
+        let total_size: i64 = size + HEADER_SIZE
+        # Round up to page size
+        let pages: i64 = (total_size + PAGE_SIZE - 1) / PAGE_SIZE
+        let mmap_size: i64 = pages * PAGE_SIZE
+
+        let block: *u8 = sys_mmap(0, mmap_size, PROT_READ + PROT_WRITE, MAP_PRIVATE + MAP_ANONYMOUS, -1, 0)
+        if block == (-1) as *u8
+            return null
+
+        # Store negative size to indicate large block
+        let header: *BlockHeader = block as *BlockHeader
+        header.size_class = 0 - mmap_size
+
+        return block + HEADER_SIZE
+
+    # Small allocation - use bins
+    return bin_alloc(@g_alloc.bins[class], class)
+
+# Free a pointer (no size needed!)
+pub fn free(ptr: *u8)
+    if ptr == null
+        return
+
+    # Read header
+    let header: *BlockHeader = (ptr as i64 - HEADER_SIZE) as *BlockHeader
+    let size_class: i64 = header.size_class
+
+    if size_class < 0
+        # Large allocation - munmap
+        let block: *u8 = (ptr as i64 - HEADER_SIZE) as *u8
+        let mmap_size: i64 = 0 - size_class
+        sys_munmap(block, mmap_size)
+        return
+
+    # Small allocation - return to bin
+    let class: i32 = size_class as i32
+    if class >= 0 and class < NUM_SIZE_CLASSES
+        bin_free(@g_alloc.bins[class], ptr)
+
+# Reallocate to new size
+pub fn realloc(ptr: *u8, new_size: i64) -> *u8
+    if ptr == null
+        return malloc(new_size)
+
+    if new_size <= 0
+        free(ptr)
+        return null
+
+    # Read old size class
+    let header: *BlockHeader = (ptr as i64 - HEADER_SIZE) as *BlockHeader
+    let old_class: i64 = header.size_class
+
+    var old_usable: i64 = 0
+    if old_class < 0
+        # Large block
+        old_usable = (0 - old_class) - HEADER_SIZE
+    else
+        # Get usable size from block size
+        old_usable = get_block_size(old_class as i32) - HEADER_SIZE
+
+    # Check if new size fits in current block
+    let new_class: i32 = get_size_class(new_size)
+    if new_class >= 0 and new_class == old_class as i32
+        return ptr  # Fits in same class, no change needed
+
+    # Need to allocate new block
+    let new_ptr: *u8 = malloc(new_size)
+    if new_ptr == null
+        return null
+
+    # Copy data
+    var copy_size: i64 = old_usable
+    if new_size < copy_size
+        copy_size = new_size
+
+    memcpy(new_ptr, ptr, copy_size)
+
+    # Free old block
+    free(ptr)
+
+    return new_ptr
+
+# Allocate and zero-initialize
+pub fn calloc(count: i64, size: i64) -> *u8
+    let total: i64 = count * size
+    let ptr: *u8 = malloc(total)
+    if ptr != null
+        memzero(ptr, total)
+    return ptr

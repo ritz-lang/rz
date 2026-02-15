@@ -1,0 +1,228 @@
+# find - search for files in a directory hierarchy
+#
+# Usage: find [PATH...] [OPTIONS]
+#   Search for files matching criteria.
+#
+# Options:
+#   -name PATTERN   match filename (simple glob: * matches anything)
+#   -type TYPE      match file type: f (file), d (directory), l (link)
+#   -maxdepth N     descend at most N levels
+#
+# Examples:
+#   find .                     # list all files
+#   find . -name "*.txt"       # find .txt files
+#   find . -type d             # find directories
+#   find /tmp -maxdepth 1      # shallow search
+
+# ============================================================================
+# Standard library imports
+# ============================================================================
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+import ritzlib.fs
+import ritzlib.args
+
+# ============================================================================
+# Options
+# ============================================================================
+
+struct FindOptions
+    name_pattern: *u8   # -name
+    type_filter: u8     # -type: 'f', 'd', 'l', or 0 for any
+    maxdepth: i32       # -maxdepth, -1 for unlimited
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+fn parse_int(s: *u8) -> i32
+    var val: i32 = 0
+    var i: i64 = 0
+    while *(s + i) != 0
+        let c: u8 = *(s + i)
+        if c < '0' or c > '9'
+            return val
+        val = val * 10 + (c - '0') as i32
+        i += 1
+    return val
+
+# Simple glob match: * matches any sequence
+fn glob_match(pattern: *u8, text: *u8) -> i32
+    var pi: i64 = 0
+    var ti: i64 = 0
+    var star_pi: i64 = -1
+    var star_ti: i64 = 0
+
+    while *(text + ti) != 0
+        let pc: u8 = *(pattern + pi)
+        let tc: u8 = *(text + ti)
+
+        if pc == '*'  # '*'
+            star_pi = pi
+            star_ti = ti
+            pi += 1
+        else if pc == tc or pc == '?'  # '?' matches any single char
+            pi += 1
+            ti += 1
+        else if star_pi >= 0
+            # Backtrack: try matching more with the star
+            pi = star_pi + 1
+            star_ti += 1
+            ti = star_ti
+        else
+            return 0
+
+    # Check remaining pattern (only stars allowed)
+    while *(pattern + pi) == '*'
+        pi += 1
+
+    return (*(pattern + pi) == 0) as i32
+
+fn get_file_type_char(mode: i32) -> u8
+    let type_bits: i32 = mode / 4096
+    if type_bits == 4
+        return 100  # 'd'
+    if type_bits == 8
+        return 102  # 'f'
+    if type_bits == 10
+        return 108  # 'l'
+    return 0
+
+# ============================================================================
+# Find function
+# ============================================================================
+
+fn matches_filter(path: *u8, d_type: u8, opts: *FindOptions) -> i32
+    # Check type filter
+    if opts.type_filter != 0
+        var type_char: u8 = 0
+        if d_type == DT_DIR
+            type_char = 100  # 'd'
+        else if d_type == DT_REG
+            type_char = 102  # 'f'
+        else if d_type == DT_LNK
+            type_char = 108  # 'l'
+        else if d_type == DT_UNKNOWN  # need to stat
+            var statbuf: [144]u8
+            if sys_lstat(path, &statbuf[0]) == 0
+                type_char = get_file_type_char(stat_get_mode(&statbuf[0]))
+
+        if type_char != opts.type_filter
+            return 0
+
+    # Check name pattern
+    if opts.name_pattern != null
+        let name: *u8 = path_basename(path)
+        if glob_match(opts.name_pattern, name) == 0
+            return 0
+
+    return 1
+
+fn find_path(path: *u8, depth: i32, opts: *FindOptions)
+    # Check maxdepth
+    if opts.maxdepth >= 0 and depth > opts.maxdepth
+        return
+
+    var statbuf: [144]u8
+    if sys_lstat(path, &statbuf[0]) != 0
+        eprints("find: '")
+        eprints(path)
+        eprints("': No such file or directory\n")
+        return
+
+    let mode: i32 = stat_get_mode(&statbuf[0])
+    let type_bits: i32 = mode / 4096
+    var d_type: u8 = 0
+    if type_bits == 4
+        d_type = DT_DIR
+    else if type_bits == 8
+        d_type = DT_REG
+    else if type_bits == 10
+        d_type = DT_LNK
+
+    # Print if matches
+    if matches_filter(path, d_type, opts) != 0
+        prints(path)
+        print_char(10)
+
+    # Recurse into directories
+    if type_bits != 4  # Not a directory
+        return
+
+    if opts.maxdepth >= 0 and depth >= opts.maxdepth
+        return
+
+    let fd: i32 = sys_open(path, O_DIRECTORY)
+    if fd < 0
+        return
+
+    var buf: [8192]u8
+
+    loop
+        let nread: i64 = sys_getdents64(fd, &buf[0], 8192)
+        if nread <= 0
+            break
+
+        var pos: i64 = 0
+        while pos < nread
+            let entry: *u8 = &buf[0] + pos
+            let reclen: i32 = dirent_get_reclen(entry)
+            let entry_type: u8 = dirent_get_type(entry)
+            let name: *u8 = dirent_get_name(entry)
+
+            if streq(name, ".") == 0 and streq(name, "..") == 0
+                var child_path: [4096]u8
+                path_join(path, name, &child_path[0])
+                find_path(&child_path[0], depth + 1, opts)
+
+            pos += reclen as i64
+
+    sys_close(fd)
+
+# ============================================================================
+# Main
+# ============================================================================
+
+fn main(argc: i32, argv: **u8) -> i32
+    # Set up argument parser
+    var parser: ArgParser
+    args_init(&parser, "find", "Search for files in a directory hierarchy")
+
+    # Define options (find uses single-dash long options)
+    args_option(&parser, 0, "name", "PATTERN", "Match filename (glob: * matches anything)", null)
+    args_option(&parser, 0, "type", "TYPE", "Match file type: f (file), d (directory), l (link)", null)
+    args_option(&parser, 0, "maxdepth", "N", "Descend at most N levels", null)
+
+    # Define positional: PATH... (optional, defaults to ".")
+    args_positional(&parser, "PATH", "Directory to search", 0, -1)
+
+    # Parse arguments
+    if args_parse(&parser, argc, argv) != 0
+        return 1
+
+    # Build FindOptions from parsed arguments
+    var opts: FindOptions
+    opts.name_pattern = args_get_str_long(&parser, "name")
+    opts.maxdepth = -1  # unlimited by default
+
+    # Get type filter (first char of type string, or 0)
+    let type_str: *u8 = args_get_str_long(&parser, "type")
+    if type_str != null
+        opts.type_filter = *type_str
+    else
+        opts.type_filter = 0
+
+    # Get maxdepth if specified
+    if args_is_set_long(&parser, "maxdepth") != 0
+        opts.maxdepth = args_get_int_long(&parser, "maxdepth") as i32
+
+    # Process paths
+    if parser.positional_count == 0
+        find_path(".", 0, &opts)
+    else
+        for i in 0..parser.positional_count
+            find_path(args_get_positional(&parser, i), 0, &opts)
+
+    return 0

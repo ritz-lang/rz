@@ -1,0 +1,402 @@
+# ritzlib/net.ritz - Networking primitives for TCP/IP communication
+#
+# Provides socket operations for building network clients and servers.
+# Designed with HTTP 1.0/1.1 (and future HTTP/2, HTTP/3) in mind.
+#
+# Architecture:
+# - Low-level syscall wrappers for sockets
+# - Address types (IPv4, IPv6)
+# - Connection abstractions
+# - Non-blocking I/O support for async patterns
+#
+# Usage:
+#   # Server
+#   var sock: Socket = socket_tcp()
+#   sock.set_reuseaddr()
+#   sock.bind("0.0.0.0", 8080)
+#   sock.listen(128)
+#   var client: Socket = sock.accept()
+#   client.send("HTTP/1.1 200 OK\r\n\r\nHello" as *u8, 25)
+#   client.close()
+#
+#   # Client
+#   var sock: Socket = socket_tcp()
+#   sock.connect("127.0.0.1", 8080)
+#   sock.send("GET / HTTP/1.1\r\n\r\n" as *u8, 18)
+#   var n: i64 = sock.recv(buf, 4096)
+#   sock.close()
+
+import ritzlib.sys  # For sys_read, sys_write, sys_close, __syscallN
+import ritzlib.str  # For memset, strlen
+import ritzlib.string  # For String type
+
+# ============================================================================
+# Socket syscall numbers (Linux x86_64)
+# ============================================================================
+
+const SYS_SOCKET: i64 = 41
+const SYS_CONNECT: i64 = 42
+const SYS_ACCEPT: i64 = 43
+const SYS_SENDTO: i64 = 44
+const SYS_RECVFROM: i64 = 45
+const SYS_BIND: i64 = 49
+const SYS_LISTEN: i64 = 50
+const SYS_GETSOCKNAME: i64 = 51
+const SYS_GETPEERNAME: i64 = 52
+const SYS_SETSOCKOPT: i64 = 54
+const SYS_GETSOCKOPT: i64 = 55
+const SYS_ACCEPT4: i64 = 288
+const SYS_EPOLL_CREATE1: i64 = 291
+const SYS_EPOLL_CTL: i64 = 233
+const SYS_EPOLL_WAIT: i64 = 232
+
+# ============================================================================
+# Socket constants
+# ============================================================================
+
+# Address families
+const AF_INET: i32 = 2        # IPv4
+const AF_INET6: i32 = 10      # IPv6
+
+# Socket types
+const SOCK_STREAM: i32 = 1    # TCP
+const SOCK_DGRAM: i32 = 2     # UDP
+const SOCK_NONBLOCK: i32 = 2048   # Non-blocking flag (can OR with type)
+const SOCK_CLOEXEC: i32 = 524288  # Close-on-exec flag
+
+# Socket options
+const SOL_SOCKET: i32 = 1
+const SO_REUSEADDR: i32 = 2
+const SO_REUSEPORT: i32 = 15
+const SO_KEEPALIVE: i32 = 9
+const SO_RCVBUF: i32 = 8
+const SO_SNDBUF: i32 = 7
+
+# TCP options
+const IPPROTO_TCP: i32 = 6
+const TCP_NODELAY: i32 = 1
+const TCP_CORK: i32 = 3
+
+# Epoll events
+const EPOLLIN: i32 = 1
+const EPOLLOUT: i32 = 4
+const EPOLLERR: i32 = 8
+const EPOLLHUP: i32 = 16
+const EPOLLET: u32 = 2147483648  # 0x80000000 - Edge-triggered
+const EPOLL_CTL_ADD: i32 = 1
+const EPOLL_CTL_DEL: i32 = 2
+const EPOLL_CTL_MOD: i32 = 3
+
+# ============================================================================
+# Address structures
+# ============================================================================
+
+# IPv4 socket address (16 bytes)
+# Layout matches struct sockaddr_in
+struct SockAddrIn
+    family: i16       # AF_INET (2)
+    port: u16         # Port in network byte order
+    addr: u32         # IPv4 address in network byte order
+    zero: [8]u8       # Padding
+
+# IPv6 socket address (28 bytes)
+struct SockAddrIn6
+    family: i16       # AF_INET6 (10)
+    port: u16         # Port in network byte order
+    flowinfo: u32     # Flow info
+    addr: [16]u8      # IPv6 address
+    scope_id: u32     # Scope ID
+
+# ============================================================================
+# Socket handle
+# ============================================================================
+
+struct Socket
+    fd: i32           # File descriptor
+    family: i32       # AF_INET or AF_INET6
+    socktype: i32     # SOCK_STREAM or SOCK_DGRAM
+
+# ============================================================================
+# Byte order conversion (host to network)
+# ============================================================================
+
+# Convert 16-bit host to network byte order (big-endian)
+pub fn htons(val: i32) -> u16
+    let high: u16 = ((val >> 8) & 255) as u16
+    let low: u16 = (val & 255) as u16
+    return (low << 8) | high
+
+# Convert 16-bit network to host byte order
+pub fn ntohs(val: u16) -> i32
+    let high: i32 = (val >> 8) as i32
+    let low: i32 = (val & 255) as i32
+    return (low << 8) | high
+
+# Convert 32-bit host to network byte order
+pub fn htonl(val: i64) -> u32
+    let b0: u32 = ((val >> 24) & 255) as u32
+    let b1: u32 = ((val >> 16) & 255) as u32
+    let b2: u32 = ((val >> 8) & 255) as u32
+    let b3: u32 = (val & 255) as u32
+    return (b3 << 24) | (b2 << 16) | (b1 << 8) | b0
+
+# ============================================================================
+# IP address parsing
+# ============================================================================
+
+# Parse IPv4 address string (e.g., "127.0.0.1") to network byte order
+pub fn parse_ipv4(addr_str: *u8) -> u32
+    var result: u32 = 0
+    var octet: u32 = 0
+    var shift: i32 = 0
+    var i: i64 = 0
+
+    while *(addr_str + i) != 0
+        let c: u8 = *(addr_str + i)
+        if c >= '0' and c <= '9'  # '0'-'9'
+            octet = octet * 10 + (c - '0') as u32
+        else
+            if c == '.'  # '.'
+                result = result | (octet << shift)
+                shift += 8
+                octet = 0
+        i += 1
+
+    # Last octet
+    result = result | (octet << shift)
+    return result
+
+# INADDR_ANY (0.0.0.0)
+const INADDR_ANY: u32 = 0
+
+# INADDR_LOOPBACK (127.0.0.1) in network byte order
+pub fn inaddr_loopback() -> u32
+    return parse_ipv4(c"127.0.0.1")
+
+# ============================================================================
+# Socket syscall wrappers
+# ============================================================================
+
+pub fn sys_socket(domain: i32, socktype: i32, protocol: i32) -> i32
+    return __syscall3(SYS_SOCKET, domain as i64, socktype as i64, protocol as i64) as i32
+
+pub fn sys_bind(fd: i32, addr: *u8, addrlen: i32) -> i32
+    return __syscall3(SYS_BIND, fd as i64, addr as i64, addrlen as i64) as i32
+
+pub fn sys_listen(fd: i32, backlog: i32) -> i32
+    return __syscall2(SYS_LISTEN, fd as i64, backlog as i64) as i32
+
+pub fn sys_accept(fd: i32, addr: *u8, addrlen: *i32) -> i32
+    return __syscall3(SYS_ACCEPT, fd as i64, addr as i64, addrlen as i64) as i32
+
+pub fn sys_accept4(fd: i32, addr: *u8, addrlen: *i32, flags: i32) -> i32
+    return __syscall4(SYS_ACCEPT4, fd as i64, addr as i64, addrlen as i64, flags as i64) as i32
+
+pub fn sys_connect(fd: i32, addr: *u8, addrlen: i32) -> i32
+    return __syscall3(SYS_CONNECT, fd as i64, addr as i64, addrlen as i64) as i32
+
+pub fn sys_setsockopt(fd: i32, level: i32, optname: i32, optval: *u8, optlen: i32) -> i32
+    return __syscall5(SYS_SETSOCKOPT, fd as i64, level as i64, optname as i64, optval as i64, optlen as i64) as i32
+
+pub fn sys_getsockopt(fd: i32, level: i32, optname: i32, optval: *u8, optlen: *i32) -> i32
+    return __syscall5(SYS_GETSOCKOPT, fd as i64, level as i64, optname as i64, optval as i64, optlen as i64) as i32
+
+pub fn sys_epoll_create1(flags: i32) -> i32
+    return __syscall1(SYS_EPOLL_CREATE1, flags as i64) as i32
+
+pub fn sys_epoll_ctl(epfd: i32, op: i32, fd: i32, event: *u8) -> i32
+    return __syscall4(SYS_EPOLL_CTL, epfd as i64, op as i64, fd as i64, event as i64) as i32
+
+pub fn sys_epoll_wait(epfd: i32, events: *u8, maxevents: i32, timeout: i32) -> i32
+    return __syscall4(SYS_EPOLL_WAIT, epfd as i64, events as i64, maxevents as i64, timeout as i64) as i32
+
+# ============================================================================
+# High-level socket operations
+# ============================================================================
+
+# Create a TCP socket (IPv4)
+pub fn socket_tcp() -> Socket
+    var sock: Socket
+    sock.fd = sys_socket(AF_INET, SOCK_STREAM, 0)
+    sock.family = AF_INET
+    sock.socktype = SOCK_STREAM
+    return sock
+
+# Create a non-blocking TCP socket (IPv4)
+pub fn socket_tcp_nonblock() -> Socket
+    var sock: Socket
+    sock.fd = sys_socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0)
+    sock.family = AF_INET
+    sock.socktype = SOCK_STREAM
+    return sock
+
+# Create a UDP socket (IPv4)
+pub fn socket_udp() -> Socket
+    var sock: Socket
+    sock.fd = sys_socket(AF_INET, SOCK_DGRAM, 0)
+    sock.family = AF_INET
+    sock.socktype = SOCK_DGRAM
+    return sock
+
+# Check if socket is valid
+pub fn socket_valid(sock: *Socket) -> i32
+    if sock.fd >= 0
+        return 1
+    return 0
+
+# Close a socket
+pub fn socket_close(sock: *Socket) -> i32
+    if sock.fd >= 0
+        let result: i32 = sys_close(sock.fd)
+        sock.fd = -1
+        return result
+    return 0
+
+# Set socket option (integer value)
+pub fn socket_set_opt_int(sock: *Socket, level: i32, optname: i32, value: i32) -> i32
+    var val: i32 = value
+    return sys_setsockopt(sock.fd, level, optname, @val as *u8, 4)
+
+# Enable SO_REUSEADDR
+pub fn socket_set_reuseaddr(sock: *Socket) -> i32
+    return socket_set_opt_int(sock, SOL_SOCKET, SO_REUSEADDR, 1)
+
+# Enable SO_REUSEPORT
+pub fn socket_set_reuseport(sock: *Socket) -> i32
+    return socket_set_opt_int(sock, SOL_SOCKET, SO_REUSEPORT, 1)
+
+# Enable TCP_NODELAY (disable Nagle's algorithm)
+pub fn socket_set_nodelay(sock: *Socket) -> i32
+    return socket_set_opt_int(sock, IPPROTO_TCP, TCP_NODELAY, 1)
+
+# Bind socket to address and port
+pub fn socket_bind(sock: *Socket, addr_str: *u8, port: i32) -> i32
+    var addr: SockAddrIn
+    addr.family = AF_INET as i16
+    addr.port = htons(port)
+    addr.addr = parse_ipv4(addr_str)
+    memset(@addr.zero[0], 0, 8)
+
+    return sys_bind(sock.fd, @addr as *u8, 16)
+
+# Bind to any address
+pub fn socket_bind_any(sock: *Socket, port: i32) -> i32
+    return socket_bind(sock, c"0.0.0.0", port)
+
+# Listen for connections
+pub fn socket_listen(sock: *Socket, backlog: i32) -> i32
+    return sys_listen(sock.fd, backlog)
+
+# Accept a connection (blocking)
+pub fn socket_accept(sock: *Socket) -> Socket
+    var client: Socket
+    var addr: SockAddrIn
+    var addrlen: i32 = 16
+
+    client.fd = sys_accept(sock.fd, @addr as *u8, @addrlen)
+    client.family = AF_INET
+    client.socktype = SOCK_STREAM
+    return client
+
+# Accept a connection (non-blocking)
+pub fn socket_accept_nonblock(sock: *Socket) -> Socket
+    var client: Socket
+    var addr: SockAddrIn
+    var addrlen: i32 = 16
+
+    client.fd = sys_accept4(sock.fd, @addr as *u8, @addrlen, SOCK_NONBLOCK)
+    client.family = AF_INET
+    client.socktype = SOCK_STREAM
+    return client
+
+# Connect to a remote address
+pub fn socket_connect(sock: *Socket, addr_str: *u8, port: i32) -> i32
+    var addr: SockAddrIn
+    addr.family = AF_INET as i16
+    addr.port = htons(port)
+    addr.addr = parse_ipv4(addr_str)
+    memset(@addr.zero[0], 0, 8)
+
+    return sys_connect(sock.fd, @addr as *u8, 16)
+
+# Send data
+pub fn socket_send(sock: *Socket, buf: *u8, len: i64) -> i64
+    return sys_write(sock.fd, buf, len)
+
+# Receive data
+pub fn socket_recv(sock: *Socket, buf: *u8, len: i64) -> i64
+    return sys_read(sock.fd, buf, len)
+
+# Send a String
+pub fn socket_send_string(sock: *Socket, s: *String) -> i64
+    return sys_write(sock.fd, string_as_ptr(s), string_len(s))
+
+# ============================================================================
+# Epoll operations (for async/event-driven I/O)
+# ============================================================================
+
+# Epoll event structure (12 bytes)
+struct EpollEvent
+    events: u32       # EPOLLIN, EPOLLOUT, etc.
+    data: u64         # User data (fd or pointer)
+
+# Create epoll instance
+pub fn epoll_create() -> i32
+    return sys_epoll_create1(0)
+
+# Add fd to epoll
+pub fn epoll_add(epfd: i32, fd: i32, events: u32) -> i32
+    var ev: EpollEvent
+    ev.events = events
+    ev.data = fd as u64
+    return sys_epoll_ctl(epfd, EPOLL_CTL_ADD, fd, @ev as *u8)
+
+# Remove fd from epoll
+pub fn epoll_del(epfd: i32, fd: i32) -> i32
+    return sys_epoll_ctl(epfd, EPOLL_CTL_DEL, fd, null)
+
+# Modify fd events in epoll
+pub fn epoll_mod(epfd: i32, fd: i32, events: u32) -> i32
+    var ev: EpollEvent
+    ev.events = events
+    ev.data = fd as u64
+    return sys_epoll_ctl(epfd, EPOLL_CTL_MOD, fd, @ev as *u8)
+
+# Wait for events (returns number of ready fds)
+pub fn epoll_wait_events(epfd: i32, events: *EpollEvent, maxevents: i32, timeout_ms: i32) -> i32
+    return sys_epoll_wait(epfd, events as *u8, maxevents, timeout_ms)
+
+# ============================================================================
+# Method syntax support
+# ============================================================================
+
+impl Socket
+    fn valid(self: *Socket) -> i32
+        return socket_valid(self)
+
+    fn close(self: *Socket) -> i32
+        return socket_close(self)
+
+    fn set_reuseaddr(self: *Socket) -> i32
+        return socket_set_reuseaddr(self)
+
+    fn set_nodelay(self: *Socket) -> i32
+        return socket_set_nodelay(self)
+
+    fn bind(self: *Socket, addr: *u8, port: i32) -> i32
+        return socket_bind(self, addr, port)
+
+    fn listen(self: *Socket, backlog: i32) -> i32
+        return socket_listen(self, backlog)
+
+    fn accept(self: *Socket) -> Socket
+        return socket_accept(self)
+
+    fn connect(self: *Socket, addr: *u8, port: i32) -> i32
+        return socket_connect(self, addr, port)
+
+    fn send(self: *Socket, buf: *u8, len: i64) -> i64
+        return socket_send(self, buf, len)
+
+    fn recv(self: *Socket, buf: *u8, len: i64) -> i64
+        return socket_recv(self, buf, len)

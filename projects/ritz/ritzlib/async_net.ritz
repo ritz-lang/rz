@@ -1,0 +1,335 @@
+# ritzlib/async_net.ritz - Async TCP networking
+#
+# TCP socket operations using io_uring for async I/O.
+#
+# This module provides:
+#   - Socket creation (tcp_socket)
+#   - Server operations (tcp_bind, tcp_listen, tcp_accept)
+#   - Client operations (tcp_connect)
+#   - Async I/O via runtime (runtime_accept, runtime_recv, runtime_send)
+#
+# Example server:
+#   let fd: i32 = tcp_socket()
+#   tcp_bind(fd, 0, 8080)    # 0.0.0.0:8080
+#   tcp_listen(fd, 128)
+#   let client: i32 = runtime_accept(@rt, fd)
+
+import ritzlib.sys
+import ritzlib.uring
+import ritzlib.async_runtime
+
+# ============================================================================
+# Socket syscall numbers (Linux x86-64)
+# ============================================================================
+
+const SYS_SOCKET: i64 = 41
+const SYS_CONNECT: i64 = 42
+const SYS_ACCEPT: i64 = 43
+const SYS_SENDTO: i64 = 44
+const SYS_RECVFROM: i64 = 45
+const SYS_BIND: i64 = 49
+const SYS_LISTEN: i64 = 50
+const SYS_GETSOCKNAME: i64 = 51
+const SYS_GETPEERNAME: i64 = 52
+const SYS_SOCKETPAIR: i64 = 53
+const SYS_SETSOCKOPT: i64 = 54
+const SYS_GETSOCKOPT: i64 = 55
+const SYS_SHUTDOWN: i64 = 48
+const SYS_ACCEPT4: i64 = 288
+
+# ============================================================================
+# Socket constants
+# ============================================================================
+
+# Address families
+const AF_UNIX: i32 = 1
+const AF_INET: i32 = 2
+const AF_INET6: i32 = 10
+
+# Socket types
+const SOCK_STREAM: i32 = 1    # TCP
+const SOCK_DGRAM: i32 = 2     # UDP
+const SOCK_RAW: i32 = 3
+const SOCK_NONBLOCK: i32 = 2048   # 0x800
+const SOCK_CLOEXEC: i32 = 524288  # 0x80000
+
+# IP protocol
+const IPPROTO_TCP: i32 = 6
+const IPPROTO_UDP: i32 = 17
+
+# Socket options
+const SOL_SOCKET: i32 = 1
+const SO_REUSEADDR: i32 = 2
+const SO_REUSEPORT: i32 = 15
+const SO_KEEPALIVE: i32 = 9
+const SO_RCVBUF: i32 = 8
+const SO_SNDBUF: i32 = 7
+
+const IPPROTO_IP: i32 = 0
+const TCP_NODELAY: i32 = 1
+
+# Shutdown options
+const SHUT_RD: i32 = 0
+const SHUT_WR: i32 = 1
+const SHUT_RDWR: i32 = 2
+
+# ============================================================================
+# sockaddr_in structure (IPv4)
+# ============================================================================
+# Size: 16 bytes
+# struct sockaddr_in {
+#     sa_family_t sin_family;  // 2 bytes: AF_INET
+#     in_port_t sin_port;      // 2 bytes: port in network byte order
+#     struct in_addr sin_addr; // 4 bytes: IP address
+#     char sin_zero[8];        // 8 bytes: padding
+# };
+
+struct SockaddrIn
+    sin_family: u16    # 0: AF_INET (2)
+    sin_port: u16      # 2: port (network byte order = big endian)
+    sin_addr: i32      # 4: IPv4 address (network byte order)
+    sin_zero: i64      # 8: padding (8 bytes)
+
+const SOCKADDR_IN_SIZE: i32 = 16
+
+# ============================================================================
+# Byte order helpers (host to network, network to host)
+# ============================================================================
+
+# Convert 16-bit value from host to network byte order (big endian)
+pub fn htons(host: i32) -> u16
+    let h: i32 = host & 65535  # 0xFFFF
+    let low: i32 = h & 255
+    let high: i32 = (h >> 8) & 255
+    return ((low << 8) | high) as u16
+
+# Convert 16-bit value from network to host byte order
+pub fn ntohs(net: u16) -> i32
+    let n: i32 = net as i32
+    let low: i32 = n & 255
+    let high: i32 = (n >> 8) & 255
+    return (low << 8) | high
+
+# Convert 32-bit value from host to network byte order
+pub fn htonl(host: i32) -> i32
+    let b0: i32 = host & 255
+    let b1: i32 = (host >> 8) & 255
+    let b2: i32 = (host >> 16) & 255
+    let b3: i32 = (host >> 24) & 255
+    return (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+
+# Convert 32-bit value from network to host byte order
+pub fn ntohl(net: i32) -> i32
+    return htonl(net)  # Same operation for swapping
+
+# ============================================================================
+# Socket syscalls
+# ============================================================================
+
+pub fn sys_socket(domain: i32, stype: i32, protocol: i32) -> i32
+    return syscall3(SYS_SOCKET, domain as i64, stype as i64, protocol as i64) as i32
+
+pub fn sys_bind(fd: i32, addr: *u8, addrlen: i32) -> i32
+    return syscall3(SYS_BIND, fd as i64, addr as i64, addrlen as i64) as i32
+
+pub fn sys_listen(fd: i32, backlog: i32) -> i32
+    return syscall2(SYS_LISTEN, fd as i64, backlog as i64) as i32
+
+pub fn sys_accept(fd: i32, addr: *u8, addrlen: *i32) -> i32
+    return syscall3(SYS_ACCEPT, fd as i64, addr as i64, addrlen as i64) as i32
+
+pub fn sys_accept4(fd: i32, addr: *u8, addrlen: *i32, flags: i32) -> i32
+    return syscall4(SYS_ACCEPT4, fd as i64, addr as i64, addrlen as i64, flags as i64) as i32
+
+pub fn sys_connect(fd: i32, addr: *u8, addrlen: i32) -> i32
+    return syscall3(SYS_CONNECT, fd as i64, addr as i64, addrlen as i64) as i32
+
+pub fn sys_setsockopt(fd: i32, level: i32, optname: i32, optval: *u8, optlen: i32) -> i32
+    return syscall5(SYS_SETSOCKOPT, fd as i64, level as i64, optname as i64, optval as i64, optlen as i64) as i32
+
+pub fn sys_getsockopt(fd: i32, level: i32, optname: i32, optval: *u8, optlen: *i32) -> i32
+    return syscall5(SYS_GETSOCKOPT, fd as i64, level as i64, optname as i64, optval as i64, optlen as i64) as i32
+
+pub fn sys_getsockname(fd: i32, addr: *u8, addrlen: *i32) -> i32
+    return syscall3(SYS_GETSOCKNAME, fd as i64, addr as i64, addrlen as i64) as i32
+
+pub fn sys_shutdown(fd: i32, how: i32) -> i32
+    return syscall2(SYS_SHUTDOWN, fd as i64, how as i64) as i32
+
+pub fn sys_send(fd: i32, buf: *u8, len: i64, flags: i32) -> i64
+    return syscall4(SYS_SENDTO, fd as i64, buf as i64, len, flags as i64)
+
+pub fn sys_recv(fd: i32, buf: *u8, len: i64, flags: i32) -> i64
+    return syscall4(SYS_RECVFROM, fd as i64, buf as i64, len, flags as i64)
+
+# ============================================================================
+# High-level TCP socket operations
+# ============================================================================
+
+# Create a TCP socket
+pub fn tcp_socket() -> i32
+    return sys_socket(AF_INET, SOCK_STREAM, 0)
+
+# Create a non-blocking TCP socket
+pub fn tcp_socket_nonblock() -> i32
+    return sys_socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0)
+
+# Set SO_REUSEADDR option (useful for servers)
+pub fn set_reuseaddr(fd: i32) -> i32
+    var optval: i32 = 1
+    return sys_setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, @optval as *u8, 4)
+
+# Set SO_REUSEPORT option (useful for load balancing)
+pub fn set_reuseport(fd: i32) -> i32
+    var optval: i32 = 1
+    return sys_setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, @optval as *u8, 4)
+
+# Set TCP_NODELAY (disable Nagle's algorithm)
+pub fn set_nodelay(fd: i32) -> i32
+    var optval: i32 = 1
+    return sys_setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, @optval as *u8, 4)
+
+# Initialize a sockaddr_in structure
+pub fn sockaddr_init(addr: *SockaddrIn, ip: i32, port: i32)
+    addr.sin_family = AF_INET as u16
+    addr.sin_port = htons(port)
+    addr.sin_addr = htonl(ip)
+    addr.sin_zero = 0
+
+# Bind a socket to an IP address and port
+# ip=0 means INADDR_ANY (0.0.0.0)
+pub fn tcp_bind(fd: i32, ip: i32, port: i32) -> i32
+    var addr: SockaddrIn
+    sockaddr_init(@addr, ip, port)
+    return sys_bind(fd, @addr as *u8, SOCKADDR_IN_SIZE)
+
+# Start listening for connections
+pub fn tcp_listen(fd: i32, backlog: i32) -> i32
+    return sys_listen(fd, backlog)
+
+# Accept a connection (blocking)
+pub fn tcp_accept(fd: i32) -> i32
+    var addr: SockaddrIn
+    var addrlen: i32 = SOCKADDR_IN_SIZE
+    return sys_accept(fd, @addr as *u8, @addrlen)
+
+# Connect to a remote server (blocking)
+pub fn tcp_connect(fd: i32, ip: i32, port: i32) -> i32
+    var addr: SockaddrIn
+    sockaddr_init(@addr, ip, port)
+    return sys_connect(fd, @addr as *u8, SOCKADDR_IN_SIZE)
+
+# Shutdown the socket
+pub fn tcp_shutdown(fd: i32, how: i32) -> i32
+    return sys_shutdown(fd, how)
+
+# Get the local address of a socket
+pub fn tcp_getsockname(fd: i32, ip: *i32, port: *i32) -> i32
+    var addr: SockaddrIn
+    var addrlen: i32 = SOCKADDR_IN_SIZE
+    let ret: i32 = sys_getsockname(fd, @addr as *u8, @addrlen)
+    if ret >= 0
+        *ip = ntohl(addr.sin_addr)
+        *port = ntohs(addr.sin_port)
+    return ret
+
+# ============================================================================
+# Async operations via runtime
+# ============================================================================
+
+# Accept a connection asynchronously via io_uring
+pub fn runtime_accept(rt: *Runtime, server_fd: i32) -> i32
+    let user_data: i64 = rt.next_user_data
+    rt.next_user_data = rt.next_user_data + 1
+
+    # Get an SQE
+    let sqe: *IoUringSqe = uring_get_sqe(@rt.ring)
+    if sqe == (null)
+        return -12  # ENOMEM
+
+    # Prepare accept SQE
+    uring_prep_accept(sqe, server_fd, null, null, 0, user_data)
+    uring_sqe_submit(@rt.ring)
+
+    # Submit and wait for completion
+    let ret: i32 = uring_submit_and_wait(@rt.ring, 1)
+    if ret < 0
+        return ret
+
+    # Get the completion
+    let cqe: *IoUringCqe = uring_peek_cqe(@rt.ring)
+    if cqe == (null)
+        return -5  # EIO
+
+    let result: i32 = cqe.res
+    uring_cqe_seen(@rt.ring, cqe)
+
+    return result
+
+# Send data asynchronously via io_uring
+pub fn runtime_send(rt: *Runtime, fd: i32, buf: *u8, len: i32) -> i64
+    let user_data: i64 = rt.next_user_data
+    rt.next_user_data = rt.next_user_data + 1
+
+    let sqe: *IoUringSqe = uring_get_sqe(@rt.ring)
+    if sqe == (null)
+        return -12
+
+    # Use WRITE for send (works for sockets)
+    uring_prep_write(sqe, fd, buf, len, 0, user_data)
+    uring_sqe_submit(@rt.ring)
+
+    let ret: i32 = uring_submit_and_wait(@rt.ring, 1)
+    if ret < 0
+        return ret as i64
+
+    let cqe: *IoUringCqe = uring_peek_cqe(@rt.ring)
+    if cqe == (null)
+        return -5
+
+    let result: i64 = cqe.res as i64
+    uring_cqe_seen(@rt.ring, cqe)
+
+    return result
+
+# Receive data asynchronously via io_uring
+pub fn runtime_recv(rt: *Runtime, fd: i32, buf: *u8, len: i32) -> i64
+    let user_data: i64 = rt.next_user_data
+    rt.next_user_data = rt.next_user_data + 1
+
+    let sqe: *IoUringSqe = uring_get_sqe(@rt.ring)
+    if sqe == (null)
+        return -12
+
+    # Use READ for recv (works for sockets)
+    uring_prep_read(sqe, fd, buf, len, 0, user_data)
+    uring_sqe_submit(@rt.ring)
+
+    let ret: i32 = uring_submit_and_wait(@rt.ring, 1)
+    if ret < 0
+        return ret as i64
+
+    let cqe: *IoUringCqe = uring_peek_cqe(@rt.ring)
+    if cqe == (null)
+        return -5
+
+    let result: i64 = cqe.res as i64
+    uring_cqe_seen(@rt.ring, cqe)
+
+    return result
+
+# ============================================================================
+# IP address helpers
+# ============================================================================
+
+# Create an IPv4 address from 4 octets (a.b.c.d)
+pub fn ipv4(a: i32, b: i32, c: i32, d: i32) -> i32
+    return (a << 24) | (b << 16) | (c << 8) | d
+
+# Localhost address (127.0.0.1)
+pub fn localhost() -> i32
+    return ipv4(127, 0, 0, 1)
+
+# Any address (0.0.0.0)
+pub fn inaddr_any() -> i32
+    return 0

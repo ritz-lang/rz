@@ -1,0 +1,303 @@
+# ritz1/src/types.ritz - Type Representation
+#
+# Type system for the Ritz compiler. Types are represented as structs
+# with a kind tag and additional data depending on the kind.
+
+import mem  # For Arena, arena_alloc
+
+# ============================================================================
+# Type Kind Constants
+# ============================================================================
+
+# Primitive types
+const TY_VOID: i32 = 0
+const TY_BOOL: i32 = 1
+const TY_I8: i32 = 2
+const TY_I16: i32 = 3
+const TY_I32: i32 = 4
+const TY_I64: i32 = 5
+const TY_U8: i32 = 6
+const TY_U16: i32 = 7
+const TY_U32: i32 = 8
+const TY_U64: i32 = 9
+
+# Compound types
+const TY_PTR: i32 = 10      # *T or *mut T
+const TY_REF: i32 = 11      # &T
+const TY_REF_MUT: i32 = 12  # &mut T
+const TY_ARRAY: i32 = 13    # [N]T
+const TY_SLICE: i32 = 14    # [T]
+
+# User-defined types
+const TY_STRUCT: i32 = 20
+const TY_ENUM: i32 = 21
+
+# Function type
+const TY_FN: i32 = 30
+
+# Error/unknown type (for error recovery)
+const TY_ERROR: i32 = 99
+
+# ============================================================================
+# Type Structures
+# ============================================================================
+
+# Forward declaration for self-referential types
+struct Type
+  kind: i32           # TY_* constant
+  is_mut: i32         # For PTR/REF: 1 if mutable
+  size: i32           # For ARRAY: element count; for primitives: byte size
+  inner: *Type        # For PTR/REF/ARRAY/SLICE: pointee/element type
+  name: *i8           # For STRUCT/ENUM: type name
+  name_len: i32       # Length of name
+  fields: *Field      # For STRUCT: linked list of fields
+  params: *TypeList   # For FN: parameter types
+  ret: *Type          # For FN: return type
+  next: *Type         # For linking in type lists
+
+# Field in a struct type
+struct Field
+  name: *i8
+  name_len: i32
+  ty: *Type
+  offset: i32         # Byte offset in struct layout
+  next: *Field
+
+# Linked list of types (for function params, etc.)
+struct TypeList
+  ty: *Type
+  next: *TypeList
+
+# ============================================================================
+# Primitive Type Singletons
+# ============================================================================
+
+# We allocate these once and reuse them (initialized in type_init())
+# Note: These are module-level variables initialized during type_init()
+# For now, they are const placeholders since we can't have global vars in this implementation
+const ty_void_ptr: i32 = 0
+const ty_bool_ptr: i32 = 0
+const ty_i8_ptr: i32 = 0
+const ty_i16_ptr: i32 = 0
+const ty_i32_ptr: i32 = 0
+const ty_i64_ptr: i32 = 0
+const ty_u8_ptr: i32 = 0
+const ty_u16_ptr: i32 = 0
+const ty_u32_ptr: i32 = 0
+const ty_u64_ptr: i32 = 0
+
+# ============================================================================
+# Type Constructors
+# ============================================================================
+
+fn type_new(arena: *Arena, kind: i32) -> *Type
+  let ty: *Type = arena_alloc(arena, 128) as *Type
+  (*ty).kind = kind
+  (*ty).is_mut = 0
+  (*ty).size = 0
+  (*ty).inner = 0 as *Type
+  (*ty).name = 0 as *i8
+  (*ty).name_len = 0
+  (*ty).fields = 0 as *Field
+  (*ty).params = 0 as *TypeList
+  (*ty).ret = 0 as *Type
+  (*ty).next = 0 as *Type
+  ty
+
+fn type_ptr(arena: *Arena, inner: *Type, is_mut: i32) -> *Type
+  let ty: *Type = type_new(arena, TY_PTR)
+  (*ty).inner = inner
+  (*ty).is_mut = is_mut
+  ty
+
+fn type_ref(arena: *Arena, inner: *Type) -> *Type
+  let ty: *Type = type_new(arena, TY_REF)
+  (*ty).inner = inner
+  ty
+
+fn type_ref_mut(arena: *Arena, inner: *Type) -> *Type
+  let ty: *Type = type_new(arena, TY_REF_MUT)
+  (*ty).inner = inner
+  ty
+
+fn type_array(arena: *Arena, inner: *Type, size: i32) -> *Type
+  let ty: *Type = type_new(arena, TY_ARRAY)
+  (*ty).inner = inner
+  (*ty).size = size
+  ty
+
+fn type_slice(arena: *Arena, inner: *Type) -> *Type
+  let ty: *Type = type_new(arena, TY_SLICE)
+  (*ty).inner = inner
+  ty
+
+fn type_struct(arena: *Arena, name: *i8, name_len: i32) -> *Type
+  let ty: *Type = type_new(arena, TY_STRUCT)
+  (*ty).name = name
+  (*ty).name_len = name_len
+  ty
+
+fn type_fn(arena: *Arena, params: *TypeList, ret: *Type) -> *Type
+  let ty: *Type = type_new(arena, TY_FN)
+  (*ty).params = params
+  (*ty).ret = ret
+  ty
+
+# ============================================================================
+# Type Queries
+# ============================================================================
+
+fn type_is_primitive(ty: *Type) -> i32
+  if ty == 0 as *Type
+    return 0
+  let k: i32 = (*ty).kind
+  if k >= TY_VOID
+    if k <= TY_U64
+      return 1
+  0
+
+fn type_is_integer(ty: *Type) -> i32
+  if ty == 0 as *Type
+    return 0
+  let k: i32 = (*ty).kind
+  if k >= TY_I8
+    if k <= TY_U64
+      return 1
+  0
+
+fn type_is_signed(ty: *Type) -> i32
+  if ty == 0 as *Type
+    return 0
+  let k: i32 = (*ty).kind
+  if k >= TY_I8
+    if k <= TY_I64
+      return 1
+  0
+
+fn type_is_pointer(ty: *Type) -> i32
+  if ty == 0 as *Type
+    return 0
+  if (*ty).kind == TY_PTR
+    return 1
+  0
+
+fn type_is_reference(ty: *Type) -> i32
+  if ty == 0 as *Type
+    return 0
+  let k: i32 = (*ty).kind
+  if k == TY_REF
+    return 1
+  if k == TY_REF_MUT
+    return 1
+  0
+
+# ============================================================================
+# Type Comparison
+# ============================================================================
+
+fn type_eq(a: *Type, b: *Type) -> i32
+  if a == b
+    return 1
+  if a == 0 as *Type
+    return 0
+  if b == 0 as *Type
+    return 0
+  if (*a).kind != (*b).kind
+    return 0
+
+  let k: i32 = (*a).kind
+
+  # Primitives are equal if same kind
+  if type_is_primitive(a) == 1
+    return 1
+
+  # Pointers: compare inner and mutability
+  if k == TY_PTR
+    if (*a).is_mut != (*b).is_mut
+      return 0
+    return type_eq((*a).inner, (*b).inner)
+
+  # References: compare inner
+  if k == TY_REF
+    return type_eq((*a).inner, (*b).inner)
+  if k == TY_REF_MUT
+    return type_eq((*a).inner, (*b).inner)
+
+  # Arrays: compare inner and size
+  if k == TY_ARRAY
+    if (*a).size != (*b).size
+      return 0
+    return type_eq((*a).inner, (*b).inner)
+
+  # Slices: compare inner
+  if k == TY_SLICE
+    return type_eq((*a).inner, (*b).inner)
+
+  # Structs: compare by name (structural for now)
+  if k == TY_STRUCT
+    if (*a).name_len != (*b).name_len
+      return 0
+    # TODO: compare name bytes
+    return 1
+
+  # Default: not equal
+  0
+
+# ============================================================================
+# Type Size (for layout)
+# ============================================================================
+
+fn type_sizeof(ty: *Type) -> i32
+  if ty == 0 as *Type
+    return 0
+
+  let k: i32 = (*ty).kind
+
+  if k == TY_VOID
+    return 0
+  if k == TY_BOOL
+    return 1
+  if k == TY_I8
+    return 1
+  if k == TY_U8
+    return 1
+  if k == TY_I16
+    return 2
+  if k == TY_U16
+    return 2
+  if k == TY_I32
+    return 4
+  if k == TY_U32
+    return 4
+  if k == TY_I64
+    return 8
+  if k == TY_U64
+    return 8
+
+  # Pointers are 8 bytes on x86_64
+  if k == TY_PTR
+    return 8
+  if k == TY_REF
+    return 8
+  if k == TY_REF_MUT
+    return 8
+
+  # Arrays: element size * count
+  if k == TY_ARRAY
+    return type_sizeof((*ty).inner) * (*ty).size
+
+  # Slices: fat pointer (ptr + len) = 16 bytes
+  if k == TY_SLICE
+    return 16
+
+  # Structs: sum of field sizes (simplified, no padding)
+  if k == TY_STRUCT
+    var total: i32 = 0
+    var field: *Field = (*ty).fields
+    while field != 0 as *Field
+      total = total + type_sizeof((*field).ty)
+      field = (*field).next
+    return total
+
+  # Unknown
+  0

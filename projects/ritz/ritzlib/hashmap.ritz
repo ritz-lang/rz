@@ -1,0 +1,302 @@
+# ritzlib/hashmap.ritz - Hash map for i64 keys
+#
+# Provides O(1) average lookup, insert, and delete.
+# Uses open addressing with linear probing.
+#
+# Usage:
+#   var m: HashMapI64 = hashmap_i64_new()
+#   hashmap_i64_insert(@m, 42, 100)
+#   let val: i64 = hashmap_i64_get(@m, 42)
+#   hashmap_i64_drop(@m)
+#
+# Note: This is a specialized implementation for i64 keys and i64 values.
+# Generic HashMap<K,V> requires parser support for multi-param generics in casts.
+
+import ritzlib.memory
+import ritzlib.hash
+import ritzlib.eq
+import ritzlib.drop
+
+# Entry states
+# EMPTY = 0: slot never used
+# OCCUPIED = 1: slot has valid key/value
+# TOMBSTONE = 2: slot was occupied but deleted (for probe chain continuity)
+
+struct HashMapEntryI64
+    key: i64
+    value: i64
+    state: i32  # 0=empty, 1=occupied, 2=tombstone
+
+struct HashMapI64
+    entries: *HashMapEntryI64  # Array of entries
+    cap: i64                    # Capacity (power of 2)
+    len: i64                    # Number of occupied entries
+    tombstones: i64             # Number of tombstones
+
+# ============================================================================
+# Drop trait implementation
+# ============================================================================
+
+impl Drop for HashMapI64
+    fn drop(self: @&HashMapI64)
+        let ptr: *u8 = self.entries as *u8
+        if ptr != null
+            free(ptr)
+        self.entries = null
+        self.cap = 0
+        self.len = 0
+        self.tombstones = 0
+
+# ============================================================================
+# Constructor
+# ============================================================================
+
+pub fn hashmap_i64_new() -> HashMapI64
+    return hashmap_i64_with_cap(16)
+
+pub fn hashmap_i64_with_cap(cap: i64) -> HashMapI64
+    var m: HashMapI64
+
+    # Initialize to null BEFORE malloc to prevent Drop on garbage if malloc fails
+    m.entries = null
+    m.cap = 0
+    m.len = 0
+    m.tombstones = 0
+
+    # Round up to power of 2
+    var actual_cap: i64 = 16
+    while actual_cap < cap
+        actual_cap *= 2
+
+    let size: i64 = actual_cap * sizeof(HashMapEntryI64)
+    m.entries = malloc(size) as *HashMapEntryI64
+    m.cap = actual_cap
+
+    # Initialize all entries to empty
+    for i in 0..actual_cap
+        let entry: *HashMapEntryI64 = m.entries + i
+        entry.state = 0  # EMPTY
+
+    return m
+
+# ============================================================================
+# Method syntax support - enables m.len(), m.insert(k, v), etc.
+# ============================================================================
+
+impl HashMapI64
+    # Get the number of entries in the map.
+    fn len(self: @HashMapI64) -> i64
+        return self.len
+
+    # Get the capacity of the map.
+    fn cap(self: @HashMapI64) -> i64
+        return self.cap
+
+    # Check if the map is empty.
+    fn is_empty(self: @HashMapI64) -> i32
+        if self.len == 0
+            return 1
+        return 0
+
+    # Insert or update a key-value pair.
+    fn insert(self: @&HashMapI64, key: i64, value: i64)
+        hashmap_i64_insert(self, key, value)
+
+    # Get value for key (returns 0 if not found).
+    fn get(self: @HashMapI64, key: i64) -> i64
+        return hashmap_i64_get(self, key)
+
+    # Check if key exists.
+    fn contains(self: @HashMapI64, key: i64) -> i32
+        return hashmap_i64_contains(self, key)
+
+    # Remove a key (returns 1 if removed, 0 if not found).
+    fn remove(self: @&HashMapI64, key: i64) -> i32
+        return hashmap_i64_remove(self, key)
+
+# ============================================================================
+# Core operations (standalone functions)
+# ============================================================================
+
+pub fn hashmap_i64_len(m: @HashMapI64) -> i64
+    return m.len
+
+pub fn hashmap_i64_cap(m: @HashMapI64) -> i64
+    return m.cap
+
+pub fn hashmap_i64_is_empty(m: @HashMapI64) -> i32
+    if m.len == 0
+        return 1
+    return 0
+
+# Drop (free) the hashmap - prefer automatic Drop via scope exit.
+pub fn hashmap_i64_drop(m: @&HashMapI64)
+    let ptr: *u8 = m.entries as *u8
+    if ptr != null
+        free(ptr)
+    m.entries = null
+    m.cap = 0
+    m.len = 0
+    m.tombstones = 0
+
+# ============================================================================
+# Find, Insert, Get, Contains, Remove
+# ============================================================================
+
+# Find slot for key (returns index, or -1 if full and not found)
+pub fn hashmap_i64_find_slot(m: @HashMapI64, key: i64) -> i64
+    let h: u64 = hash_i64(key)
+    let mask: i64 = m.cap - 1  # For power-of-2 modulo
+    var idx: i64 = (h as i64) & mask
+    var first_tombstone: i64 = -1
+
+    var i: i64 = 0
+    while i < m.cap
+        let entry: *HashMapEntryI64 = m.entries + idx
+
+        if entry.state == 0  # EMPTY
+            # Not found - return tombstone slot if we saw one, else this empty slot
+            if first_tombstone >= 0
+                return first_tombstone
+            return idx
+
+        if entry.state == 2  # TOMBSTONE
+            # Remember first tombstone for insertion
+            if first_tombstone < 0
+                first_tombstone = idx
+
+        if entry.state == 1  # OCCUPIED
+            if entry.key == key
+                return idx  # Found!
+
+        # Linear probe to next slot
+        idx = (idx + 1) & mask
+        i += 1
+
+    # Table full (shouldn't happen with proper load factor)
+    if first_tombstone >= 0
+        return first_tombstone
+    return -1
+
+# Insert or update a key-value pair
+pub fn hashmap_i64_insert(m: @&HashMapI64, key: i64, value: i64)
+    # Check load factor and resize if needed (> 75%)
+    let load: i64 = (m.len + m.tombstones + 1) * 100 / m.cap
+    if load > 75
+        hashmap_i64_grow(m)
+
+    let idx: i64 = hashmap_i64_find_slot(m, key)
+    if idx < 0
+        # Table full - should not happen after resize
+        return
+
+    let entry: *HashMapEntryI64 = m.entries + idx
+
+    if entry.state == 1  # Already occupied with same key - update
+        entry.value = value
+    else
+        # New insertion
+        if entry.state == 2  # Was tombstone
+            m.tombstones = m.tombstones - 1
+        entry.key = key
+        entry.value = value
+        entry.state = 1  # OCCUPIED
+        m.len = m.len + 1
+
+# Get value for key (returns 0 if not found - use contains to check)
+pub fn hashmap_i64_get(m: @HashMapI64, key: i64) -> i64
+    let h: u64 = hash_i64(key)
+    let mask: i64 = m.cap - 1
+    var idx: i64 = (h as i64) & mask
+
+    var i: i64 = 0
+    while i < m.cap
+        let entry: *HashMapEntryI64 = m.entries + idx
+
+        if entry.state == 0  # EMPTY - not found
+            return 0
+
+        if entry.state == 1  # OCCUPIED
+            if entry.key == key
+                return entry.value
+
+        # Continue probing (skip tombstones)
+        idx = (idx + 1) & mask
+        i += 1
+
+    return 0  # Not found
+
+# Check if key exists
+pub fn hashmap_i64_contains(m: @HashMapI64, key: i64) -> i32
+    let h: u64 = hash_i64(key)
+    let mask: i64 = m.cap - 1
+    var idx: i64 = (h as i64) & mask
+
+    var i: i64 = 0
+    while i < m.cap
+        let entry: *HashMapEntryI64 = m.entries + idx
+
+        if entry.state == 0  # EMPTY - not found
+            return 0
+
+        if entry.state == 1  # OCCUPIED
+            if entry.key == key
+                return 1
+
+        idx = (idx + 1) & mask
+        i += 1
+
+    return 0
+
+# Remove a key (returns 1 if removed, 0 if not found)
+pub fn hashmap_i64_remove(m: @&HashMapI64, key: i64) -> i32
+    let h: u64 = hash_i64(key)
+    let mask: i64 = m.cap - 1
+    var idx: i64 = (h as i64) & mask
+
+    var i: i64 = 0
+    while i < m.cap
+        let entry: *HashMapEntryI64 = m.entries + idx
+
+        if entry.state == 0  # EMPTY - not found
+            return 0
+
+        if entry.state == 1  # OCCUPIED
+            if entry.key == key
+                entry.state = 2  # TOMBSTONE
+                m.len = m.len - 1
+                m.tombstones = m.tombstones + 1
+                return 1
+
+        idx = (idx + 1) & mask
+        i += 1
+
+    return 0
+
+# Grow the table (double capacity)
+pub fn hashmap_i64_grow(m: @&HashMapI64)
+    let old_entries: *HashMapEntryI64 = m.entries
+    let old_cap: i64 = m.cap
+
+    # Allocate new table with double capacity
+    let new_cap: i64 = old_cap * 2
+    let size: i64 = new_cap * sizeof(HashMapEntryI64)
+    m.entries = malloc(size) as *HashMapEntryI64
+    m.cap = new_cap
+    m.len = 0
+    m.tombstones = 0
+
+    # Initialize new entries to empty
+    for i in 0..new_cap
+        let entry: *HashMapEntryI64 = m.entries + i
+        entry.state = 0
+
+    # Rehash all occupied entries from old table
+    for i in 0..old_cap
+        let old_entry: *HashMapEntryI64 = old_entries + i
+        if old_entry.state == 1  # OCCUPIED
+            hashmap_i64_insert(m, old_entry.key, old_entry.value)
+
+    # Free old table
+    free(old_entries as *u8)
+

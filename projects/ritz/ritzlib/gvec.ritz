@@ -1,0 +1,385 @@
+# ritzlib/gvec.ritz - Generic dynamic array
+#
+# Vec<T> provides a growable array for any type T.
+# - Dynamic sizing with automatic growth
+# - Ownership semantics: one owner, automatic cleanup via Drop trait
+# - Heap allocation via malloc/realloc/free
+# - Generic via monomorphization
+#
+# Usage:
+#   var v: Vec<i32> = vec_new<i32>()
+#   v.push(42)
+#   v.push(100)
+#   let val: i32 = v.get(0)  # 42
+#   # Automatic cleanup when v goes out of scope (Drop trait)
+
+import ritzlib.memory
+import ritzlib.drop
+import ritzlib.str
+
+# ============================================================================
+# Vec<T> - Generic Dynamic Array
+# ============================================================================
+# Stores elements contiguously in heap memory.
+# Grows automatically when capacity is exceeded.
+
+struct Vec<T>
+    data: *T       # Pointer to heap-allocated array
+    len: i64       # Current number of elements
+    cap: i64       # Allocated capacity (number of T elements)
+
+# ============================================================================
+# Drop trait implementation for automatic cleanup
+# ============================================================================
+
+# NOTE: ritz1 doesn't support impl blocks yet, so these are commented out.
+# The methods are implemented as standalone functions with the name mangled
+# to Type_method format (e.g., Vec_len, Vec_push, etc.).
+#
+# impl<T> Drop for Vec<T>
+#     fn drop(self: @&Vec<T>)
+#         if self.data != null
+#             free(self.data as *u8)
+#         self.data = null
+#         self.len = 0
+#         self.cap = 0
+#
+# ============================================================================
+# Method syntax support - enables v.len(), v.push(x), etc.
+# ============================================================================
+#
+# impl<T> Vec<T>
+#     # Get the length of the Vec.
+#     fn len(self: @Vec<T>) -> i64
+#         return self.len
+#
+#     # Get the capacity of the Vec.
+#     fn cap(self: @Vec<T>) -> i64
+#         return self.cap
+#
+#     # Check if the Vec is empty.
+#     fn is_empty(self: @Vec<T>) -> i32
+#         if self.len == 0
+#             return 1
+#         return 0
+#
+#     # Push an element onto the end of the Vec.
+#     fn push(self: @&Vec<T>, item: T) -> i32
+#         return vec_push<T>(self, item)
+#
+#     # Pop the last element from the Vec.
+#     fn pop(self: @&Vec<T>) -> T
+#         return vec_pop<T>(self)
+#
+#     # Get an element by index.
+#     fn get(self: @Vec<T>, idx: i64) -> T
+#         return *(self.data + idx)
+#
+#     # Get a pointer to an element by index.
+#     fn get_ptr(self: @&Vec<T>, idx: i64) -> *T
+#         return self.data + idx
+#
+#     # Set an element by index.
+#     fn set(self: @&Vec<T>, idx: i64, item: T) -> i32
+#         *(self.data + idx) = item
+#         return 0
+#
+#     # Clear all elements (keeps capacity).
+#     fn clear(self: @&Vec<T>)
+#         self.len = 0
+#
+#     # Get the first element.
+#     fn first(self: @Vec<T>) -> T
+#         return *(self.data)
+#
+#     # Get the last element.
+#     fn last(self: @Vec<T>) -> T
+#         return *(self.data + self.len - 1)
+#
+#     # Get raw pointer to the data.
+#     fn as_ptr(self: @Vec<T>) -> *T
+#         return self.data
+#
+#     # Create a new Vec from a slice of this Vec [start:end).
+#     fn slice(self: @Vec<T>, start: i64, end: i64) -> Vec<T>
+#         return vec_slice<T>(self, start, end)
+#
+#     # Swap two elements at indices i and j.
+#     fn swap(self: @&Vec<T>, i: i64, j: i64) -> i32
+#         return vec_swap<T>(self, i, j)
+
+# ============================================================================
+# Constructors
+# ============================================================================
+
+# Create a new empty Vec.
+pub fn vec_new<T>() -> Vec<T>
+    var v: Vec<T>
+    v.data = null
+    v.len = 0
+    v.cap = 0
+    return v
+
+# Create a new Vec with pre-allocated capacity.
+pub fn vec_with_cap<T>(cap: i64) -> Vec<T>
+    var v: Vec<T>
+    if cap <= 0
+        v.data = null
+        v.len = 0
+        v.cap = 0
+        return v
+
+    let size: i64 = cap * sizeof(T)
+    v.data = malloc(size) as *T
+    if v.data == null
+        v.len = 0
+        v.cap = 0
+        return v
+
+    v.len = 0
+    v.cap = cap
+    return v
+
+# ============================================================================
+# Standalone functions (for compatibility and internal use)
+# ============================================================================
+
+# Drop (free) the Vec - prefer automatic Drop via scope exit.
+pub fn vec_drop<T>(v: @&Vec<T>)
+    if v.data != null
+        free(v.data as *u8)
+    v.data = null
+    v.len = 0
+    v.cap = 0
+
+# Check if Vec is valid (non-null or empty).
+pub fn vec_valid<T>(v: @Vec<T>) -> i32
+    # A vec is always valid - even empty vecs with null data
+    return 1
+
+# Get the length of the Vec.
+pub fn vec_len<T>(v: @Vec<T>) -> i64
+    return v.len
+
+# Get the capacity of the Vec.
+pub fn vec_cap<T>(v: @Vec<T>) -> i64
+    return v.cap
+
+# Check if the Vec is empty.
+pub fn vec_is_empty<T>(v: @Vec<T>) -> i32
+    if v.len == 0
+        return 1
+    return 0
+
+# ============================================================================
+# Growth and Capacity
+# ============================================================================
+
+# Grow the Vec to a new capacity.
+pub fn vec_grow<T>(v: @&Vec<T>, new_cap: i64) -> i32
+    if new_cap <= v.cap
+        return 0
+
+    let new_size: i64 = new_cap * sizeof(T)
+    let new_data: *u8 = realloc(v.data as *u8, new_size)
+    if new_data == null
+        return -1
+
+    v.data = new_data as *T
+    v.cap = new_cap
+    return 0
+
+# Ensure the Vec has at least the given capacity.
+pub fn vec_ensure_cap<T>(v: @&Vec<T>, needed: i64) -> i32
+    if v.cap >= needed
+        return 0
+
+    var new_cap: i64 = v.cap
+    if new_cap == 0
+        new_cap = 8  # Start with 8 elements
+    while new_cap < needed
+        new_cap *= 2
+
+    return vec_grow<T>(v, new_cap)
+
+# ============================================================================
+# Element Access
+# ============================================================================
+
+# Push an element onto the end of the Vec.
+pub fn vec_push<T>(v: @&Vec<T>, item: T) -> i32
+    if vec_ensure_cap<T>(v, v.len + 1) != 0
+        return -1
+    *(v.data + v.len) = item
+    v.len = v.len + 1
+    return 0
+
+# Pop the last element from the Vec.
+# Returns the element. Caller must ensure vec is not empty!
+pub fn vec_pop<T>(v: @&Vec<T>) -> T
+    v.len = v.len - 1
+    return *(v.data + v.len)
+
+# Get an element by index.
+# Returns the element. Caller must ensure index is valid!
+pub fn vec_get<T>(v: @Vec<T>, idx: i64) -> T
+    return *(v.data + idx)
+
+# Get a pointer to an element by index.
+# Returns pointer to element. Caller must ensure index is valid!
+pub fn vec_get_ptr<T>(v: @&Vec<T>, idx: i64) -> *T
+    return v.data + idx
+
+# Set an element by index.
+# Caller must ensure index is valid!
+pub fn vec_set<T>(v: @&Vec<T>, idx: i64, item: T) -> i32
+    *(v.data + idx) = item
+    return 0
+
+# ============================================================================
+# Utilities
+# ============================================================================
+
+# Clear all elements (keeps capacity).
+pub fn vec_clear<T>(v: @&Vec<T>)
+    v.len = 0
+
+# Get the first element. Caller must ensure vec is not empty!
+pub fn vec_first<T>(v: @Vec<T>) -> T
+    return *(v.data)
+
+# Get the last element. Caller must ensure vec is not empty!
+pub fn vec_last<T>(v: @Vec<T>) -> T
+    return *(v.data + v.len - 1)
+
+# Get raw pointer to the data.
+pub fn vec_as_ptr<T>(v: @Vec<T>) -> *T
+    return v.data
+
+# Create a new Vec from a slice of this Vec [start:end).
+# Returns a new Vec containing copies of elements from start to end (exclusive).
+pub fn vec_slice<T>(v: @Vec<T>, start: i64, end: i64) -> Vec<T>
+    # Clamp bounds
+    var s: i64 = start
+    var e: i64 = end
+    if s < 0
+        s = 0
+    if e > v.len
+        e = v.len
+    if s > e
+        s = e
+
+    let count: i64 = e - s
+    var result: Vec<T> = vec_with_cap<T>(count)
+
+    # Copy elements
+    for i in 0..count
+        let item: T = *(v.data + s + i)
+        vec_push<T>(@result, item)
+
+    return result
+
+# ============================================================================
+# Vec<u8> specific utilities (for byte buffer compatibility)
+# ============================================================================
+# These functions provide convenient byte-level operations on Vec<u8>.
+
+# Push multiple bytes from a pointer.
+pub fn vec_push_bytes<T>(v: @&Vec<T>, data: *T, len: i64) -> i32
+    for i in 0..len
+        if vec_push<T>(v, *(data + i)) != 0
+            return -1
+    return 0
+
+# Push a null-terminated string (excluding the null terminator).
+pub fn vec_push_str(v: @&Vec<u8>, s: *u8) -> i32
+    var i: i64 = 0
+    while *(s + i) != 0
+        if vec_push<u8>(v, *(s + i)) != 0
+            return -1
+        i += 1
+    return 0
+
+# Get a null-terminated string view of the Vec contents.
+# Appends a null terminator (doesn't count in len) and returns the data pointer.
+pub fn vec_as_str(v: @&Vec<u8>) -> *u8
+    # Ensure there's room for null terminator
+    if vec_ensure_cap<u8>(v, v.len + 1) != 0
+        return null
+    # Add null terminator without increasing len
+    *(v.data + v.len) = 0
+    return v.data
+
+# Swap two elements at indices i and j.
+# Returns 0 on success, -1 if indices out of bounds.
+pub fn vec_swap<T>(v: @&Vec<T>, i: i64, j: i64) -> i32
+    if i < 0 or i >= v.len or j < 0 or j >= v.len
+        return -1
+    if i == j
+        return 0
+    let tmp: T = *(v.data + i)
+    *(v.data + i) = *(v.data + j)
+    *(v.data + j) = tmp
+    return 0
+
+# ============================================================================
+# LineBounds - Line position tracking for line-oriented utilities
+# ============================================================================
+# Each LineBounds represents a line's position within a buffer.
+# Used by tac, sort, uniq, and similar line-based utilities.
+
+struct LineBounds
+    start: i64      # Start offset in buffer
+    length: i64     # Length in bytes (may include newline)
+
+# ============================================================================
+# File and line utilities for Vec<u8> and Vec<LineBounds>
+# ============================================================================
+# These replace the legacy GrowBuf/LineVec functions from buf.ritz and vec.ritz.
+
+import ritzlib.sys
+
+# Read entire file descriptor into a Vec<u8>.
+# Returns bytes read on success, -1 on error.
+pub fn vec_read_all_fd(fd: i32, v: @&Vec<u8>) -> i64
+    let chunk_size: i64 = 4096
+    var temp: [4096]u8
+    var total: i64 = 0
+
+    loop
+        let n: i64 = sys_read(fd, @temp[0], chunk_size)
+        if n < 0
+            return -1
+        if n == 0
+            break
+        if vec_push_bytes<u8>(v, @temp[0], n) != 0
+            return -1
+        total += n
+
+    return total
+
+# Scan a Vec<u8> and record line boundaries into a Vec<LineBounds>.
+# Each line includes its trailing newline (if present).
+pub fn vec_find_lines(buf: @Vec<u8>, lines: @&Vec<LineBounds>) -> i32
+    var line_start: i64 = 0
+    var i: i64 = 0
+
+    while i < buf.len
+        if *(buf.data + i) == '\n'  # newline
+            var bounds: LineBounds
+            bounds.start = line_start
+            bounds.length = i - line_start + 1
+            if vec_push<LineBounds>(lines, bounds) != 0
+                return -1
+            line_start = i + 1
+        i += 1
+
+    # Handle last line without trailing newline
+    if line_start < buf.len
+        var bounds: LineBounds
+        bounds.start = line_start
+        bounds.length = buf.len - line_start
+        if vec_push<LineBounds>(lines, bounds) != 0
+            return -1
+
+    return 0

@@ -1,0 +1,275 @@
+# ritzlib/executor.ritz - Simple async executor with io_uring integration
+#
+# This module provides a minimal async executor that:
+# 1. Polls futures until completion
+# 2. Waits on io_uring for I/O completions
+#
+# Usage:
+#   fn main() -> i32
+#       var exec: Executor
+#       executor_init(@exec)
+#       let result: i32 = block_on(@exec, @future as *u8, my_poll_fn)
+#       executor_destroy(@exec)
+#       result
+
+import ritzlib.sys
+import ritzlib.uring
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+# Poll result encoding (same as compiler-generated futures)
+const POLL_PENDING: i32 = -1       # -1 = Pending
+const POLL_READY_BASE: i32 = 0     # value >= 0 = Ready(value)
+
+# ============================================================================
+# Executor - The async task scheduler
+# ============================================================================
+#
+# Simplified executor that holds io_uring state and coordinates polling.
+
+struct Executor
+    # io_uring instance
+    ring: IoUring
+    # Is initialized?
+    initialized: i32
+    # Next user_data to assign (for tracking I/O operations)
+    next_user_data: i64
+    # Waker state for current operation
+    waker_user_data: i64
+    waker_io_result: i32
+    waker_active: i32
+
+# ============================================================================
+# Executor initialization
+# ============================================================================
+
+pub fn executor_init(exec: *Executor) -> i32
+    exec.initialized = 0
+    exec.next_user_data = 1
+    exec.waker_user_data = 0
+    exec.waker_io_result = 0
+    exec.waker_active = 0
+
+    # Initialize io_uring with 256 entries
+    let ret: i32 = uring_init(@exec.ring, 256)
+    if ret < 0
+        return ret
+
+    exec.initialized = 1
+    return 0
+
+pub fn executor_destroy(exec: *Executor)
+    if exec.initialized != 0
+        uring_destroy(@exec.ring)
+        exec.initialized = 0
+
+# ============================================================================
+# Waker operations (stored directly in Executor for simplicity)
+# ============================================================================
+
+pub fn executor_waker_register(exec: *Executor, user_data: i64)
+    exec.waker_user_data = user_data
+    exec.waker_active = 1
+
+pub fn executor_waker_clear(exec: *Executor)
+    exec.waker_active = 0
+    exec.waker_user_data = 0
+
+# ============================================================================
+# block_on - Run a single future to completion
+# ============================================================================
+#
+# This polls the future until it returns Ready.
+# When Pending is returned, it waits on io_uring.
+
+pub fn block_on(exec: *Executor, future_ptr: *u8, poll_fn: fn(*u8) -> i32) -> i32
+    var completed: i32 = 0
+    var result: i32 = 0
+
+    while completed == 0
+        # Poll the future
+        result = poll_fn(future_ptr)
+
+        if result != POLL_PENDING
+            # Ready! We have a result
+            completed = 1
+        else
+            # Pending - wait for I/O
+            if exec.waker_active != 0
+                # Future registered for I/O, wait for completion
+                let wait_result: i32 = wait_for_io(exec)
+                if wait_result < 0
+                    # Error waiting for I/O
+                    result = wait_result
+                    completed = 1
+            else
+                # No waker registered but returned Pending?
+                # This shouldn't happen - avoid infinite loop
+                result = -22  # EINVAL
+                completed = 1
+
+    return result
+
+# ============================================================================
+# wait_for_io - Wait for io_uring completion
+# ============================================================================
+
+pub fn wait_for_io(exec: *Executor) -> i32
+    # Submit any pending SQEs and wait for at least one CQE
+    let ret: i32 = uring_submit_and_wait(@exec.ring, 1)
+    if ret < 0
+        return ret
+
+    # Process completions
+    var processed: i32 = 0
+    while processed < 100  # Safety limit
+        let cqe: *IoUringCqe = uring_peek_cqe(@exec.ring)
+        if cqe == (null)
+            break  # No more completions
+
+        # Check if this completion matches our waker
+        let user_data: i64 = cqe.user_data
+        let io_result: i32 = cqe.res
+
+        if exec.waker_active != 0
+            if exec.waker_user_data == user_data
+                exec.waker_io_result = io_result
+                executor_waker_clear(exec)
+
+        uring_cqe_seen(@exec.ring, cqe)
+        processed += 1
+
+    return 0
+
+# ============================================================================
+# Async I/O operations that properly suspend
+# ============================================================================
+#
+# These functions:
+# 1. Check if we're resuming with a result
+# 2. If not, submit I/O and return Pending
+# 3. Register waker so executor knows to wait
+
+pub fn exec_async_read(exec: *Executor, fd: i32, buf: *u8, len: i32, offset: i64) -> i32
+    # Check if we're resuming with a result
+    if exec.waker_io_result != 0
+        let result: i32 = exec.waker_io_result
+        exec.waker_io_result = 0
+        return result
+
+    # First call - submit the I/O
+    let user_data: i64 = exec.next_user_data
+    exec.next_user_data = exec.next_user_data + 1
+
+    let sqe: *IoUringSqe = uring_get_sqe(@exec.ring)
+    if sqe == (null)
+        return -12  # ENOMEM
+
+    uring_prep_read(sqe, fd, buf, len, offset, user_data)
+    uring_sqe_submit(@exec.ring)
+
+    # Register waker for this operation
+    executor_waker_register(exec, user_data)
+
+    # Return Pending
+    return POLL_PENDING
+
+pub fn exec_async_write(exec: *Executor, fd: i32, buf: *u8, len: i32, offset: i64) -> i32
+    if exec.waker_io_result != 0
+        let result: i32 = exec.waker_io_result
+        exec.waker_io_result = 0
+        return result
+
+    let user_data: i64 = exec.next_user_data
+    exec.next_user_data = exec.next_user_data + 1
+
+    let sqe: *IoUringSqe = uring_get_sqe(@exec.ring)
+    if sqe == (null)
+        return -12
+
+    uring_prep_write(sqe, fd, buf, len, offset, user_data)
+    uring_sqe_submit(@exec.ring)
+
+    executor_waker_register(exec, user_data)
+    return POLL_PENDING
+
+pub fn exec_async_accept(exec: *Executor, server_fd: i32) -> i32
+    if exec.waker_io_result != 0
+        let result: i32 = exec.waker_io_result
+        exec.waker_io_result = 0
+        return result
+
+    let user_data: i64 = exec.next_user_data
+    exec.next_user_data = exec.next_user_data + 1
+
+    let sqe: *IoUringSqe = uring_get_sqe(@exec.ring)
+    if sqe == (null)
+        return -12
+
+    uring_prep_accept(sqe, server_fd, null, null, 0, user_data)
+    uring_sqe_submit(@exec.ring)
+
+    executor_waker_register(exec, user_data)
+    return POLL_PENDING
+
+# Socket recv (like read but for sockets with MSG_* flags support)
+pub fn exec_async_recv(exec: *Executor, fd: i32, buf: *u8, len: i32, flags: i32) -> i32
+    if exec.waker_io_result != 0
+        let result: i32 = exec.waker_io_result
+        exec.waker_io_result = 0
+        return result
+
+    let user_data: i64 = exec.next_user_data
+    exec.next_user_data = exec.next_user_data + 1
+
+    let sqe: *IoUringSqe = uring_get_sqe(@exec.ring)
+    if sqe == (null)
+        return -12
+
+    uring_prep_recv(sqe, fd, buf, len as u64, flags, user_data)
+    uring_sqe_submit(@exec.ring)
+
+    executor_waker_register(exec, user_data)
+    return POLL_PENDING
+
+# Socket send (like write but for sockets with MSG_* flags support)
+pub fn exec_async_send(exec: *Executor, fd: i32, buf: *u8, len: i32, flags: i32) -> i32
+    if exec.waker_io_result != 0
+        let result: i32 = exec.waker_io_result
+        exec.waker_io_result = 0
+        return result
+
+    let user_data: i64 = exec.next_user_data
+    exec.next_user_data = exec.next_user_data + 1
+
+    let sqe: *IoUringSqe = uring_get_sqe(@exec.ring)
+    if sqe == (null)
+        return -12
+
+    uring_prep_send(sqe, fd, buf, len as u64, flags, user_data)
+    uring_sqe_submit(@exec.ring)
+
+    executor_waker_register(exec, user_data)
+    return POLL_PENDING
+
+# Socket close (async close to avoid blocking on shutdown)
+pub fn exec_async_close(exec: *Executor, fd: i32) -> i32
+    if exec.waker_io_result != 0
+        let result: i32 = exec.waker_io_result
+        exec.waker_io_result = 0
+        return result
+
+    let user_data: i64 = exec.next_user_data
+    exec.next_user_data = exec.next_user_data + 1
+
+    let sqe: *IoUringSqe = uring_get_sqe(@exec.ring)
+    if sqe == (null)
+        return -12
+
+    uring_prep_close(sqe, fd, user_data)
+    uring_sqe_submit(@exec.ring)
+
+    executor_waker_register(exec, user_data)
+    return POLL_PENDING

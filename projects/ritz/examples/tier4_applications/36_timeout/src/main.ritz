@@ -1,0 +1,410 @@
+# timeout - run a command with a time limit
+#
+# Usage: timeout [OPTION]... DURATION COMMAND [ARG]...
+#   Run COMMAND with a time limit of DURATION seconds.
+#   If the command does not complete within the time limit,
+#   it is terminated with SIGTERM (or SIGKILL if -k is specified).
+#
+# Options:
+#   -k, --kill-after=DURATION  Send SIGKILL after this duration if still running
+#   -s, --signal=SIGNAL        Specify the signal to send (default: TERM)
+#
+# Exit status:
+#   124 - command timed out
+#   125 - timeout itself failed
+#   126 - command found but not executable
+#   127 - command not found
+#   Otherwise, the exit status of COMMAND
+#
+# Examples:
+#   timeout 5 sleep 10        # Kills sleep after 5 seconds
+#   timeout 0.5 ls            # Run ls with 0.5 second timeout
+#   timeout -k 2 5 ./myprogram  # SIGTERM after 5s, SIGKILL after 2s more
+
+# ============================================================================
+# Standard library imports
+# ============================================================================
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+import ritzlib.env
+import ritzlib.args
+
+# ============================================================================
+# Exit codes
+# ============================================================================
+
+const EXIT_TIMEDOUT: i32 = 124
+const EXIT_CANCELED: i32 = 125
+const EXIT_CANNOT_INVOKE: i32 = 126
+const EXIT_ENOENT: i32 = 127
+
+# ============================================================================
+# TimeSpec struct for nanosleep
+# ============================================================================
+
+struct TimeSpec
+    tv_sec: i64
+    tv_nsec: i64
+
+# ============================================================================
+# Duration parsing
+# ============================================================================
+
+# Parse a duration string (e.g., "5", "0.5", "10.25")
+# Returns 0 on success, non-zero on error
+fn parse_duration(s: *u8, out_sec: *i64, out_nsec: *i64) -> i32
+    var sec: i64 = 0
+    var nsec: i64 = 0
+    var i: i32 = 0
+    var frac_digits: i32 = 0
+    var in_frac: i32 = 0
+
+    while *(s + i) != 0
+        let c: u8 = *(s + i)
+
+        if c == '.'  # '.'
+            if in_frac == 1
+                return 1  # Multiple decimal points
+            in_frac = 1
+            i += 1
+        else
+            if c < '0' or c > '9'
+                return 1  # Not a digit
+
+            if in_frac == 0
+                sec = sec * 10 + (c - '0') as i64
+            else
+                # Handle up to 9 fractional digits (nanoseconds)
+                if frac_digits < 9
+                    nsec = nsec * 10 + (c - '0') as i64
+                    frac_digits += 1
+            i += 1
+
+    # Pad nanoseconds to 9 digits
+    while frac_digits < 9
+        nsec *= 10
+        frac_digits += 1
+
+    *out_sec = sec
+    *out_nsec = nsec
+    return 0
+
+# ============================================================================
+# Command execution helpers
+# ============================================================================
+
+# Search PATH for command and return full path, or return command if it contains /
+fn find_command(envp: **u8, name: *u8, buf: *u8, bufsize: i64) -> *u8
+    # If name contains a /, use it directly
+    var i: i64 = 0
+    while *(name + i) != 0
+        if *(name + i) == '/'  # '/'
+            return name
+        i += 1
+
+    # Get PATH from environment
+    let path_val: *u8 = getenv(envp, "PATH")
+    if path_val == null
+        return null
+
+    var pos: i64 = 0
+
+    while *(path_val + pos) != 0
+        # Extract next PATH component (up to ':' or end)
+        var len: i64 = 0
+        while *(path_val + pos + len) != 0 and *(path_val + pos + len) != 58  # ':'
+            len += 1
+
+        # Build full path: dir/name
+        var j: i64 = 0
+        while j < len and j < bufsize - 2
+            *(buf + j) = *(path_val + pos + j)
+            j += 1
+
+        # Add '/' separator
+        *(buf + j) = 47  # '/'
+        j += 1
+
+        # Add command name
+        var k: i64 = 0
+        while *(name + k) != 0 and j < bufsize - 1
+            *(buf + j) = *(name + k)
+            j += 1
+            k += 1
+
+        *(buf + j) = 0  # Null terminate
+
+        # Check if executable
+        if sys_access(buf, X_OK) == 0
+            return buf
+
+        # Move to next PATH component
+        pos += len
+        if *(path_val + pos) == ':'  # ':'
+            pos += 1
+
+    return null
+
+# ============================================================================
+# Wait status helpers
+# ============================================================================
+
+# WIFEXITED(status) - true if child exited normally
+fn wifexited(status: i32) -> i32
+    return ((status & 127) == 0) as i32
+
+# WEXITSTATUS(status) - exit code if exited normally
+fn wexitstatus(status: i32) -> i32
+    # (status >> 8) & 255 - use division by 256 instead of right shift
+    return (status / 256) & 255
+
+# WIFSIGNALED(status) - true if child was killed by signal
+fn wifsignaled(status: i32) -> i32
+    return ((status & 127) != 0 and (status & 127) != 127) as i32
+
+# WTERMSIG(status) - signal number if signaled
+fn wtermsig(status: i32) -> i32
+    return status & 127
+
+# ============================================================================
+# Main timeout logic
+# ============================================================================
+
+fn run_timeout(envp: **u8, timeout_sec: i64, timeout_nsec: i64, kill_sec: i64, kill_nsec: i64, use_kill: i32, signal: i32, cmd_argc: i32, cmd_argv: **u8) -> i32
+    # Find the command
+    var path_buf: [4096]u8
+    let cmd_name: *u8 = *(cmd_argv + 0)
+    let cmd_path: *u8 = find_command(envp, cmd_name, &path_buf[0], 4096)
+
+    if cmd_path == null
+        eprints("timeout: '")
+        eprints(cmd_name)
+        eprints("': No such file or directory\n")
+        return EXIT_ENOENT
+
+    # Fork
+    let pid: i32 = sys_fork()
+
+    if pid < 0
+        eprints("timeout: fork failed\n")
+        return EXIT_CANCELED
+
+    if pid == 0
+        # Child process: exec the command
+        # Build null-terminated argv array
+        var child_argv: [256]*u8
+        let max_args: i32 = if cmd_argc < 255 then cmd_argc else 255
+        for i in 0..max_args
+            child_argv[i] = *(cmd_argv + i)
+        child_argv[max_args] = null
+
+        # Replace first arg with full path for execve
+        child_argv[0] = cmd_path
+
+        let ret: i32 = sys_execve(cmd_path, &child_argv[0], envp)
+
+        # If we get here, exec failed
+        if ret == (0 - ENOENT) or ret == (0 - EACCES)
+            sys_exit(EXIT_CANNOT_INVOKE)
+        sys_exit(EXIT_CANCELED)
+
+    # Parent process: wait with timeout
+    var elapsed_sec: i64 = 0
+    var elapsed_nsec: i64 = 0
+    var sent_signal: i32 = 0
+    var sent_kill: i32 = 0
+
+    # Poll interval: 10ms
+    var poll_ts: TimeSpec = TimeSpec { tv_sec: 0, tv_nsec: 10000000 }
+
+    while 1 == 1
+        # Check if child has exited (non-blocking)
+        var status: i32 = 0
+        let wait_result: i32 = sys_wait4(pid, &status, WNOHANG, null)
+
+        if wait_result > 0
+            # Child exited
+            if wifexited(status) != 0
+                return wexitstatus(status)
+            if wifsignaled(status) != 0
+                # Child was killed by signal
+                let sig: i32 = wtermsig(status)
+                if sent_signal != 0
+                    return EXIT_TIMEDOUT
+                # Return 128 + signal number
+                return 128 + sig
+            return EXIT_CANCELED
+
+        if wait_result < 0
+            # Wait failed (child doesn't exist)
+            return EXIT_CANCELED
+
+        # Check if we've exceeded the timeout
+        if sent_signal == 0
+            if elapsed_sec > timeout_sec or (elapsed_sec == timeout_sec and elapsed_nsec >= timeout_nsec)
+                # Send the termination signal
+                sys_kill(pid, signal)
+                sent_signal = 1
+
+        # Check if we should send SIGKILL
+        if use_kill != 0 and sent_signal != 0 and sent_kill == 0
+            # Calculate time since initial signal
+            let kill_elapsed_sec: i64 = elapsed_sec - timeout_sec
+            let kill_elapsed_nsec: i64 = elapsed_nsec - timeout_nsec
+            var adj_sec: i64 = kill_elapsed_sec
+            var adj_nsec: i64 = kill_elapsed_nsec
+            if adj_nsec < 0
+                adj_sec -= 1
+                adj_nsec += 1000000000
+
+            if adj_sec > kill_sec or (adj_sec == kill_sec and adj_nsec >= kill_nsec)
+                sys_kill(pid, SIGKILL)
+                sent_kill = 1
+
+        # Sleep for the poll interval
+        sys_nanosleep(&poll_ts as *i64, null)
+
+        # Update elapsed time
+        elapsed_nsec += 10000000
+        if elapsed_nsec >= 1000000000
+            elapsed_sec += 1
+            elapsed_nsec -= 1000000000
+
+# ============================================================================
+# Main
+# ============================================================================
+
+fn main(argc: i32, argv: **u8, envp: **u8) -> i32
+    if argc < 3
+        eprints("Usage: timeout [OPTION]... DURATION COMMAND [ARG]...\n")
+        eprints("Run COMMAND with a time limit.\n")
+        return EXIT_CANCELED
+
+    # Parse options manually to handle positional args properly
+    var timeout_str: *u8 = null
+    var kill_str: *u8 = null
+    var signal: i32 = SIGTERM
+    var cmd_start: i32 = 0
+
+    var i: i32 = 1
+    while i < argc
+        let arg: *u8 = *(argv + i)
+
+        # Check for -k or --kill-after
+        if streq(arg, "-k") != 0
+            i += 1
+            if i >= argc
+                eprints("timeout: option '-k' requires an argument\n")
+                return EXIT_CANCELED
+            kill_str = *(argv + i)
+            i += 1
+            continue
+
+        if strneq(arg, "--kill-after=", 13) != 0
+            kill_str = arg + 13
+            i += 1
+            continue
+
+        # Check for -s or --signal
+        if streq(arg, "-s") != 0
+            i += 1
+            if i >= argc
+                eprints("timeout: option '-s' requires an argument\n")
+                return EXIT_CANCELED
+            let sig_str: *u8 = *(argv + i)
+            # Parse signal (support TERM, KILL, or number)
+            if streq(sig_str, "TERM") != 0 or streq(sig_str, "SIGTERM") != 0
+                signal = SIGTERM
+            else if streq(sig_str, "KILL") != 0 or streq(sig_str, "SIGKILL") != 0
+                signal = SIGKILL
+            else if streq(sig_str, "INT") != 0 or streq(sig_str, "SIGINT") != 0
+                signal = SIGINT
+            else if streq(sig_str, "HUP") != 0 or streq(sig_str, "SIGHUP") != 0
+                signal = SIGHUP
+            else
+                signal = atoi(sig_str) as i32
+                if signal <= 0
+                    eprints("timeout: invalid signal '")
+                    eprints(sig_str)
+                    eprints("'\n")
+                    return EXIT_CANCELED
+            i += 1
+            continue
+
+        if strneq(arg, "--signal=", 9) != 0
+            let sig_str: *u8 = arg + 9
+            if streq(sig_str, "TERM") != 0 or streq(sig_str, "SIGTERM") != 0
+                signal = SIGTERM
+            else if streq(sig_str, "KILL") != 0 or streq(sig_str, "SIGKILL") != 0
+                signal = SIGKILL
+            else if streq(sig_str, "INT") != 0 or streq(sig_str, "SIGINT") != 0
+                signal = SIGINT
+            else if streq(sig_str, "HUP") != 0 or streq(sig_str, "SIGHUP") != 0
+                signal = SIGHUP
+            else
+                signal = atoi(sig_str) as i32
+                if signal <= 0
+                    eprints("timeout: invalid signal '")
+                    eprints(sig_str)
+                    eprints("'\n")
+                    return EXIT_CANCELED
+            i += 1
+            continue
+
+        # Check for -- (end of options)
+        if streq(arg, "--") != 0
+            i += 1
+            break
+
+        # Check for other options starting with -
+        if *arg == '-' and *(arg + 1) != 0
+            eprints("timeout: unrecognized option '")
+            eprints(arg)
+            eprints("'\n")
+            return EXIT_CANCELED
+
+        # Not an option, this is the duration
+        break
+
+    # Now i points to DURATION
+    if i >= argc
+        eprints("timeout: missing operand\n")
+        return EXIT_CANCELED
+
+    timeout_str = *(argv + i)
+    i += 1
+
+    if i >= argc
+        eprints("timeout: missing command\n")
+        return EXIT_CANCELED
+
+    cmd_start = i
+
+    # Parse timeout duration
+    var timeout_sec: i64 = 0
+    var timeout_nsec: i64 = 0
+    if parse_duration(timeout_str, &timeout_sec, &timeout_nsec) != 0
+        eprints("timeout: invalid time interval '")
+        eprints(timeout_str)
+        eprints("'\n")
+        return EXIT_CANCELED
+
+    # Parse kill duration if specified
+    var kill_sec: i64 = 0
+    var kill_nsec: i64 = 0
+    var use_kill: i32 = 0
+    if kill_str != null
+        if parse_duration(kill_str, &kill_sec, &kill_nsec) != 0
+            eprints("timeout: invalid time interval '")
+            eprints(kill_str)
+            eprints("'\n")
+            return EXIT_CANCELED
+        use_kill = 1
+
+    # Run the command with timeout
+    let cmd_argc: i32 = argc - cmd_start
+    let cmd_argv: **u8 = argv + cmd_start
+
+    return run_timeout(envp, timeout_sec, timeout_nsec, kill_sec, kill_nsec, use_kill, signal, cmd_argc, cmd_argv)

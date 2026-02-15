@@ -1,0 +1,222 @@
+# test_async_server.ritz - Test the async server framework
+#
+# This test verifies that the new async module compiles and the
+# basic patterns work correctly.
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.uring
+import ritzlib.async.task
+import ritzlib.async.io
+import ritzlib.async.server
+import ritzlib.async.executor
+
+
+# ============================================================================
+# Test 1: Task initialization and pool management
+# ============================================================================
+
+fn test_task_pool_init() -> i32
+    var ring: IoUring
+    let ret = uring_init(@ring, 64)
+    if ret < 0
+        prints("FAIL: uring_init failed\n")
+        return 1
+
+    var pool: TaskPool
+    task_pool_init(@pool, @ring)
+
+    # Verify initial state
+    if pool.active_count != 0
+        prints("FAIL: active_count should be 0\n")
+        uring_destroy(@ring)
+        return 1
+
+    if pool.next_id != 1
+        prints("FAIL: next_id should be 1\n")
+        uring_destroy(@ring)
+        return 1
+
+    uring_destroy(@ring)
+    prints("OK: task_pool_init\n")
+    return 0
+
+
+# ============================================================================
+# Test 2: Task allocation
+# ============================================================================
+
+fn dummy_handler(task: *Task) -> i32
+    return 0
+
+fn test_task_alloc() -> i32
+    var ring: IoUring
+    uring_init(@ring, 64)
+
+    var pool: TaskPool
+    task_pool_init(@pool, @ring)
+
+    # Spawn a task
+    let ret = spawn_task(@pool, 99, dummy_handler)
+    if ret != 0
+        prints("FAIL: spawn_task failed\n")
+        uring_destroy(@ring)
+        return 1
+
+    if pool.active_count != 1
+        prints("FAIL: active_count should be 1\n")
+        uring_destroy(@ring)
+        return 1
+
+    # Find the task
+    let task = task_pool_find(@pool, 1)  # First task gets ID 1
+    if task == null
+        prints("FAIL: task not found\n")
+        uring_destroy(@ring)
+        return 1
+
+    if task.fd != 99
+        prints("FAIL: task.fd should be 99\n")
+        uring_destroy(@ring)
+        return 1
+
+    if task.state != TASK_READY
+        prints("FAIL: task.state should be TASK_READY\n")
+        uring_destroy(@ring)
+        return 1
+
+    uring_destroy(@ring)
+    prints("OK: task_alloc\n")
+    return 0
+
+
+# ============================================================================
+# Test 3: Task completion
+# ============================================================================
+
+fn test_task_complete() -> i32
+    var ring: IoUring
+    uring_init(@ring, 64)
+
+    var pool: TaskPool
+    task_pool_init(@pool, @ring)
+
+    # Spawn a task (use -1 for fd so sys_close doesn't fail)
+    spawn_task(@pool, -1, dummy_handler)
+
+    if pool.active_count != 1
+        prints("FAIL: active_count should be 1 after spawn\n")
+        uring_destroy(@ring)
+        return 1
+
+    # Complete the task
+    let task = task_pool_find(@pool, 1)
+    task.fd = -1  # Prevent close attempt
+    task_complete(@pool, task)
+
+    if pool.active_count != 0
+        prints("FAIL: active_count should be 0 after complete\n")
+        uring_destroy(@ring)
+        return 1
+
+    # Task should now be idle
+    if task.state != TASK_IDLE
+        prints("FAIL: task.state should be TASK_IDLE\n")
+        uring_destroy(@ring)
+        return 1
+
+    uring_destroy(@ring)
+    prints("OK: task_complete\n")
+    return 0
+
+
+# ============================================================================
+# Test 4: AsyncTaskRuntime convenience wrapper
+# ============================================================================
+
+fn test_async_runtime() -> i32
+    var rt: AsyncTaskRuntime
+    let ret = async_runtime_init(@rt)
+    if ret < 0
+        prints("FAIL: async_runtime_init failed\n")
+        return 1
+
+    if rt.initialized != 1
+        prints("FAIL: rt.initialized should be 1\n")
+        async_runtime_destroy(@rt)
+        return 1
+
+    if async_runtime_active_count(@rt) != 0
+        prints("FAIL: active_count should be 0\n")
+        async_runtime_destroy(@rt)
+        return 1
+
+    # Spawn a task
+    async_runtime_spawn(@rt, -1, dummy_handler)
+
+    if async_runtime_active_count(@rt) != 1
+        prints("FAIL: active_count should be 1 after spawn\n")
+        async_runtime_destroy(@rt)
+        return 1
+
+    async_runtime_destroy(@rt)
+    prints("OK: async_runtime\n")
+    return 0
+
+
+# ============================================================================
+# Test 5: Uring vectored I/O prep functions exist
+# ============================================================================
+
+fn test_uring_writev() -> i32
+    var ring: IoUring
+    uring_init(@ring, 64)
+
+    let sqe = uring_get_sqe(@ring)
+    if sqe == null
+        prints("FAIL: uring_get_sqe failed\n")
+        uring_destroy(@ring)
+        return 1
+
+    # Just verify the function compiles and can be called
+    var buf: [16]u8
+    uring_prep_writev(sqe, 1, @buf[0], 1, 0, 123)
+
+    if sqe.opcode != IORING_OP_WRITEV
+        prints("FAIL: opcode should be IORING_OP_WRITEV\n")
+        uring_destroy(@ring)
+        return 1
+
+    if sqe.user_data != 123
+        prints("FAIL: user_data should be 123\n")
+        uring_destroy(@ring)
+        return 1
+
+    uring_destroy(@ring)
+    prints("OK: uring_writev\n")
+    return 0
+
+
+# ============================================================================
+# Main - run all tests
+# ============================================================================
+
+fn main() -> i32
+    prints("Running async framework tests...\n")
+    prints("================================\n")
+
+    var failures: i32 = 0
+
+    failures += test_task_pool_init()
+    failures += test_task_alloc()
+    failures += test_task_complete()
+    failures += test_async_runtime()
+    failures += test_uring_writev()
+
+    prints("================================\n")
+    if failures == 0
+        prints("All tests passed!\n")
+        return 0
+    else
+        prints("Some tests failed!\n")
+        return 1
