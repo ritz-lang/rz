@@ -1,0 +1,461 @@
+# lib/collection.ritz - Document Collection storage
+#
+# A Collection stores documents using a B-tree index.
+# Documents are serialized to byte buffers for storage.
+
+import ritzlib.sys
+import ritzlib.str
+
+import lib.m7m_types
+import lib.buffer_pool
+import lib.btree
+import lib.document
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+# Max serialized document size (fits in B-tree value)
+const MAX_DOC_SIZE: i64 = 2048
+
+# Serialization format version
+const DOC_SERIAL_VERSION: i32 = 1
+
+# ============================================================================
+# Collection - Storage for documents
+# ============================================================================
+
+struct Collection
+    pool: *BufferPool
+    tree: *BTree
+    collection_id: i32
+    next_sequence: i32
+    doc_count: i64
+
+pub fn collection_init(col: *Collection, pool: *BufferPool, collection_id: i32) -> i32
+    if pool == null
+        return ERR_INVALID
+
+    col.pool = pool
+    col.collection_id = collection_id
+    col.next_sequence = 1
+    col.doc_count = 0
+
+    # Initialize the B-tree
+    col.tree = btree_create(pool)
+    if col.tree == null
+        return ERR_NO_MEMORY
+    return ERR_OK
+
+# Destroy a collection (frees the B-tree, not the buffer pool)
+pub fn collection_destroy(col: *Collection)
+    if col == null
+        return
+    if col.tree != null
+        btree_destroy(col.tree)
+        col.tree = null
+
+# ============================================================================
+# Document Serialization
+# ============================================================================
+
+# Serialize a document to a byte buffer
+# Format:
+#   version: i32
+#   id: i64
+#   parent_id: i64
+#   version: i64
+#   created_at: i64
+#   updated_at: i64
+#   field_count: i32
+#   for each field:
+#     key_len: i32
+#     key: [key_len]u8
+#     ftype: i32
+#     value data (type-dependent)
+#   link_count: i32
+#   for each link:
+#     label_len: i32
+#     label: [label_len]u8
+#     target: i64
+fn doc_serialize(doc: *Document, buf: *u8, buf_len: i64) -> i64
+    var pos: i64 = 0
+
+    # Version
+    if pos + 4 > buf_len
+        return -1
+    var version_ptr: *i32 = (buf + pos) as *i32
+    *version_ptr = DOC_SERIAL_VERSION
+    pos = pos + 4
+
+    # ID
+    if pos + 8 > buf_len
+        return -1
+    var id_ptr: *i64 = (buf + pos) as *i64
+    *id_ptr = doc.id.value
+    pos = pos + 8
+
+    # Parent ID
+    if pos + 8 > buf_len
+        return -1
+    var parent_ptr: *i64 = (buf + pos) as *i64
+    *parent_ptr = doc.parent_id.value
+    pos = pos + 8
+
+    # Document version
+    if pos + 8 > buf_len
+        return -1
+    var ver_ptr: *i64 = (buf + pos) as *i64
+    *ver_ptr = doc.version
+    pos = pos + 8
+
+    # Created at
+    if pos + 8 > buf_len
+        return -1
+    var created_ptr: *i64 = (buf + pos) as *i64
+    *created_ptr = doc.created_at.nanos
+    pos = pos + 8
+
+    # Updated at
+    if pos + 8 > buf_len
+        return -1
+    var updated_ptr: *i64 = (buf + pos) as *i64
+    *updated_ptr = doc.updated_at.nanos
+    pos = pos + 8
+
+    # Field count
+    if pos + 4 > buf_len
+        return -1
+    var fc_ptr: *i32 = (buf + pos) as *i32
+    *fc_ptr = doc.field_count
+    pos = pos + 4
+
+    # Fields
+    var i: i32 = 0
+    while i < doc.field_count
+        var entry: *FieldEntry = @doc.fields[i]
+        var key_len: i64 = strlen(@entry.key[0])
+
+        # Key length
+        if pos + 4 > buf_len
+            return -1
+        var kl_ptr: *i32 = (buf + pos) as *i32
+        *kl_ptr = key_len as i32
+        pos = pos + 4
+
+        # Key
+        if pos + key_len > buf_len
+            return -1
+        memcpy(buf + pos, @entry.key[0], key_len)
+        pos = pos + key_len
+
+        # Field type
+        if pos + 4 > buf_len
+            return -1
+        var ft_ptr: *i32 = (buf + pos) as *i32
+        *ft_ptr = entry.value.ftype
+        pos = pos + 4
+
+        # Field value (depends on type)
+        if entry.value.ftype == FIELD_NULL
+            # No data needed
+            var dummy: i32 = 0
+        else if entry.value.ftype == FIELD_INT or entry.value.ftype == FIELD_BOOL or entry.value.ftype == FIELD_FLOAT
+            if pos + 8 > buf_len
+                return -1
+            var val_ptr: *i64 = (buf + pos) as *i64
+            *val_ptr = entry.value.int_val
+            pos = pos + 8
+        else if entry.value.ftype == FIELD_STRING or entry.value.ftype == FIELD_BYTES
+            # Length + data
+            if pos + 8 > buf_len
+                return -1
+            var len_ptr: *i64 = (buf + pos) as *i64
+            *len_ptr = entry.value.len_val
+            pos = pos + 8
+
+            if pos + entry.value.len_val > buf_len
+                return -1
+            if entry.value.len_val > 0
+                memcpy(buf + pos, entry.value.ptr_val, entry.value.len_val)
+            pos = pos + entry.value.len_val
+        else if entry.value.ftype == FIELD_DOCREF
+            if pos + 8 > buf_len
+                return -1
+            var ref_ptr: *i64 = (buf + pos) as *i64
+            *ref_ptr = entry.value.ref_val
+            pos = pos + 8
+
+        i = i + 1
+
+    # Link count
+    if pos + 4 > buf_len
+        return -1
+    var lc_ptr: *i32 = (buf + pos) as *i32
+    *lc_ptr = doc.link_count
+    pos = pos + 4
+
+    # Links
+    i = 0
+    while i < doc.link_count
+        var link: *Link = @doc.links[i]
+        var label_len: i64 = strlen(@link.label[0])
+
+        # Label length
+        if pos + 4 > buf_len
+            return -1
+        var ll_ptr: *i32 = (buf + pos) as *i32
+        *ll_ptr = label_len as i32
+        pos = pos + 4
+
+        # Label
+        if pos + label_len > buf_len
+            return -1
+        memcpy(buf + pos, @link.label[0], label_len)
+        pos = pos + label_len
+
+        # Target ID
+        if pos + 8 > buf_len
+            return -1
+        var target_ptr: *i64 = (buf + pos) as *i64
+        *target_ptr = link.target.value
+        pos = pos + 8
+
+        i = i + 1
+
+    return pos
+
+# Deserialize a document from a byte buffer
+pub fn doc_deserialize(buf: *u8, buf_len: i64, doc: *Document) -> i32
+    var pos: i64 = 0
+
+    # Version check
+    if pos + 4 > buf_len
+        return ERR_CORRUPT
+    var version: i32 = *((buf + pos) as *i32)
+    if version != DOC_SERIAL_VERSION
+        return ERR_VERSION
+    pos = pos + 4
+
+    # ID
+    if pos + 8 > buf_len
+        return ERR_CORRUPT
+    doc.id.value = *((buf + pos) as *i64)
+    pos = pos + 8
+
+    # Parent ID
+    if pos + 8 > buf_len
+        return ERR_CORRUPT
+    doc.parent_id.value = *((buf + pos) as *i64)
+    pos = pos + 8
+
+    # Document version
+    if pos + 8 > buf_len
+        return ERR_CORRUPT
+    doc.version = *((buf + pos) as *i64)
+    pos = pos + 8
+
+    # Created at
+    if pos + 8 > buf_len
+        return ERR_CORRUPT
+    doc.created_at.nanos = *((buf + pos) as *i64)
+    pos = pos + 8
+
+    # Updated at
+    if pos + 8 > buf_len
+        return ERR_CORRUPT
+    doc.updated_at.nanos = *((buf + pos) as *i64)
+    pos = pos + 8
+
+    # Field count
+    if pos + 4 > buf_len
+        return ERR_CORRUPT
+    doc.field_count = *((buf + pos) as *i32)
+    pos = pos + 4
+
+    # Fields
+    var i: i32 = 0
+    while i < doc.field_count
+        var entry: *FieldEntry = @doc.fields[i]
+
+        # Key length
+        if pos + 4 > buf_len
+            return ERR_CORRUPT
+        var key_len: i32 = *((buf + pos) as *i32)
+        pos = pos + 4
+
+        # Key
+        if pos + key_len as i64 > buf_len
+            return ERR_CORRUPT
+        memcpy(@entry.key[0], buf + pos, key_len as i64)
+        entry.key[key_len] = 0  # Null terminate
+        pos = pos + key_len as i64
+
+        # Field type
+        if pos + 4 > buf_len
+            return ERR_CORRUPT
+        entry.value.ftype = *((buf + pos) as *i32)
+        pos = pos + 4
+
+        # Field value
+        if entry.value.ftype == FIELD_NULL
+            entry.value.int_val = 0
+            entry.value.ptr_val = null
+            entry.value.len_val = 0
+            entry.value.ref_val = 0
+        else if entry.value.ftype == FIELD_INT or entry.value.ftype == FIELD_BOOL or entry.value.ftype == FIELD_FLOAT
+            if pos + 8 > buf_len
+                return ERR_CORRUPT
+            entry.value.int_val = *((buf + pos) as *i64)
+            pos = pos + 8
+        else if entry.value.ftype == FIELD_STRING or entry.value.ftype == FIELD_BYTES
+            if pos + 8 > buf_len
+                return ERR_CORRUPT
+            entry.value.len_val = *((buf + pos) as *i64)
+            pos = pos + 8
+
+            # Note: We point into the buffer - caller must ensure buffer lifetime
+            # For full implementation, we'd copy to owned memory
+            if entry.value.len_val > 0
+                if pos + entry.value.len_val > buf_len
+                    return ERR_CORRUPT
+                entry.value.ptr_val = buf + pos
+                pos = pos + entry.value.len_val
+            else
+                entry.value.ptr_val = null
+        else if entry.value.ftype == FIELD_DOCREF
+            if pos + 8 > buf_len
+                return ERR_CORRUPT
+            entry.value.ref_val = *((buf + pos) as *i64)
+            pos = pos + 8
+
+        i = i + 1
+
+    # Link count
+    if pos + 4 > buf_len
+        return ERR_CORRUPT
+    doc.link_count = *((buf + pos) as *i32)
+    pos = pos + 4
+
+    # Links
+    i = 0
+    while i < doc.link_count
+        var link: *Link = @doc.links[i]
+
+        # Label length
+        if pos + 4 > buf_len
+            return ERR_CORRUPT
+        var label_len: i32 = *((buf + pos) as *i32)
+        pos = pos + 4
+
+        # Label
+        if pos + label_len as i64 > buf_len
+            return ERR_CORRUPT
+        memcpy(@link.label[0], buf + pos, label_len as i64)
+        link.label[label_len] = 0  # Null terminate
+        pos = pos + label_len as i64
+
+        # Target ID
+        if pos + 8 > buf_len
+            return ERR_CORRUPT
+        link.target.value = *((buf + pos) as *i64)
+        pos = pos + 8
+
+        i = i + 1
+
+    return ERR_OK
+
+# ============================================================================
+# Collection Operations
+# ============================================================================
+
+pub fn collection_insert(col: *Collection, doc: *Document, out_id: *DocumentId) -> i32
+    if col == null or doc == null
+        return ERR_INVALID
+
+    # Assign new ID
+    doc.id = doc_id_new(col.collection_id, col.next_sequence)
+    col.next_sequence = col.next_sequence + 1
+
+    # Serialize document
+    var buf: [2048]u8
+    var size: i64 = doc_serialize(doc, @buf[0], MAX_DOC_SIZE)
+    if size < 0
+        return ERR_FULL
+
+    # Build key from document ID (8 bytes)
+    var key: [8]u8
+    var key_ptr: *i64 = @key[0] as *i64
+    *key_ptr = doc.id.value
+
+    # Insert into B-tree
+    var result: i32 = btree_put(col.tree, @key[0], 8, @buf[0], size)
+    if result != ERR_OK
+        return result
+
+    col.doc_count = col.doc_count + 1
+    *out_id = doc.id
+    return ERR_OK
+
+pub fn collection_get(col: *Collection, id: *DocumentId, out_doc: *Document) -> i32
+    if col == null or id == null or out_doc == null
+        return ERR_INVALID
+
+    # Build key from document ID
+    var key: [8]u8
+    var key_ptr: *i64 = @key[0] as *i64
+    *key_ptr = id.value
+
+    # Get from B-tree
+    var buf: [2048]u8
+    var val_len: i32 = 0
+    var result: i32 = btree_get(col.tree, @key[0], 8, @buf[0], @val_len)
+    if result != ERR_OK
+        return result
+
+    # Deserialize
+    return doc_deserialize(@buf[0], val_len as i64, out_doc)
+
+pub fn collection_update(col: *Collection, doc: *Document) -> i32
+    if col == null or doc == null
+        return ERR_INVALID
+
+    # Check document exists
+    var key: [8]u8
+    var key_ptr: *i64 = @key[0] as *i64
+    *key_ptr = doc.id.value
+
+    var tmp_buf: [2048]u8
+    var tmp_len: i32 = 0
+    var result: i32 = btree_get(col.tree, @key[0], 8, @tmp_buf[0], @tmp_len)
+    if result != ERR_OK
+        return ERR_NOT_FOUND
+
+    # Serialize updated document
+    var buf: [2048]u8
+    var size: i64 = doc_serialize(doc, @buf[0], MAX_DOC_SIZE)
+    if size < 0
+        return ERR_FULL
+
+    # Update in B-tree (put overwrites)
+    return btree_put(col.tree, @key[0], 8, @buf[0], size)
+
+pub fn collection_delete(col: *Collection, id: *DocumentId) -> i32
+    if col == null or id == null
+        return ERR_INVALID
+
+    # Build key from document ID
+    var key: [8]u8
+    var key_ptr: *i64 = @key[0] as *i64
+    *key_ptr = id.value
+
+    # Delete from B-tree
+    var result: i32 = btree_delete(col.tree, @key[0], 8)
+    if result == ERR_OK
+        col.doc_count = col.doc_count - 1
+    return result
+
+pub fn collection_count(col: *Collection) -> i64
+    if col == null
+        return 0
+    return col.doc_count

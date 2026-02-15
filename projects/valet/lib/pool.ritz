@@ -1,0 +1,276 @@
+# valet/lib/pool.ritz - Memory pool for efficient buffer reuse
+#
+# Provides a pool of fixed-size memory blocks that can be allocated and
+# freed without malloc/free overhead. Useful for high-performance servers
+# where connection buffers are frequently allocated and deallocated.
+#
+# Design:
+#   - Fixed-size blocks (configurable at init time)
+#   - Free list for O(1) allocation/deallocation
+#   - Pre-allocated contiguous memory region
+#   - Thread-unsafe (designed for single-threaded event loops)
+#
+# SAFETY INVARIANTS:
+#   - Only one thread may access a pool at a time (no synchronization)
+#   - Pointers returned by pool_alloc() are valid until pool_free() or pool_destroy()
+#   - Double-free is undefined behavior (no runtime check)
+#   - Freeing a pointer not from this pool is undefined behavior
+#   - All blocks are 8-byte aligned
+#
+# Usage:
+#   var pool: MemPool
+#   pool_init(@pool, 64, 8192)  # 64 blocks of 8KB each
+#   let buf = pool_alloc(@pool)
+#   # use buf...
+#   pool_free(@pool, buf)
+#   pool_destroy(@pool)
+
+import ritzlib.sys
+import ritzlib.memory
+
+# ============================================================================
+# Memory Pool structure
+# ============================================================================
+
+# Maximum number of blocks in a pool
+const POOL_MAX_BLOCKS: i32 = 4096
+
+# Pool header stored at the start of each free block
+# Points to the next free block in the free list
+struct PoolBlockHeader
+    next: *u8  # Pointer to next free block (or null)
+
+
+struct MemPool
+    base: *u8           # Base address of allocated memory
+    block_size: i32     # Size of each block in bytes
+    block_count: i32    # Total number of blocks
+    free_list: *u8      # Head of free list (points to first free block)
+    free_count: i32     # Number of free blocks
+    total_size: i64     # Total allocated memory
+
+
+# ============================================================================
+# Pool initialization and destruction
+# ============================================================================
+
+# Initialize a memory pool with the specified number of blocks and block size.
+# block_size should be at least sizeof(PoolBlockHeader) = 8 bytes.
+# Returns 0 on success, negative error code on failure.
+pub fn pool_init(pool: *MemPool, block_count: i32, block_size: i32) -> i32
+    # Validate parameters
+    if block_count <= 0 || block_count > POOL_MAX_BLOCKS
+        return -22  # EINVAL
+    if block_size < 8
+        return -22  # EINVAL - too small for header
+
+    # Align block_size to 8 bytes for proper alignment
+    let aligned_size: i32 = (block_size + 7) & -8
+
+    # Calculate total memory needed
+    let total: i64 = (block_count as i64) * (aligned_size as i64)
+
+    # Allocate memory using mmap for better alignment and page handling
+    let flags: i32 = MAP_PRIVATE | MAP_ANONYMOUS
+    let prot: i32 = PROT_READ | PROT_WRITE
+    let mem: *u8 = sys_mmap(0, total, prot, flags, -1, 0)
+
+    if (mem as i64) < 0
+        return mem as i64 as i32  # Return mmap error
+
+    pool.base = mem
+    pool.block_size = aligned_size
+    pool.block_count = block_count
+    pool.free_count = block_count
+    pool.total_size = total
+
+    # Initialize free list - chain all blocks together
+    var current: *u8 = mem
+    for i in 0..(block_count - 1)
+        let header: *PoolBlockHeader = current as *PoolBlockHeader
+        header.next = current + aligned_size
+        current = current + aligned_size
+
+    # Last block points to null
+    let last_header: *PoolBlockHeader = current as *PoolBlockHeader
+    last_header.next = null
+
+    # Free list head is first block
+    pool.free_list = mem
+
+    return 0
+
+
+# Destroy a memory pool and free all memory
+pub fn pool_destroy(pool: *MemPool)
+    if pool.base != null
+        sys_munmap(pool.base, pool.total_size)
+        pool.base = null
+        pool.free_list = null
+        pool.free_count = 0
+
+
+# ============================================================================
+# Allocation and deallocation
+# ============================================================================
+
+# Allocate a block from the pool.
+# Returns pointer to block, or null if pool is exhausted.
+# O(1) operation - just pops from free list.
+pub fn pool_alloc(pool: *MemPool) -> *u8
+    if pool.free_list == null
+        return null  # Pool exhausted
+
+    # Pop from free list
+    let block: *u8 = pool.free_list
+    let header: *PoolBlockHeader = block as *PoolBlockHeader
+    pool.free_list = header.next
+    pool.free_count -= 1
+
+    return block
+
+
+# Free a block back to the pool.
+# O(1) operation - just pushes to free list.
+# WARNING: Does not validate that ptr belongs to this pool!
+pub fn pool_free(pool: *MemPool, ptr: *u8)
+    if ptr == null
+        return
+
+    # Push to free list
+    let header: *PoolBlockHeader = ptr as *PoolBlockHeader
+    header.next = pool.free_list
+    pool.free_list = ptr
+    pool.free_count += 1
+
+
+# ============================================================================
+# Pool statistics
+# ============================================================================
+
+# Get number of free blocks remaining
+pub fn pool_available(pool: *MemPool) -> i32
+    return pool.free_count
+
+
+# Get total number of blocks in pool
+pub fn pool_capacity(pool: *MemPool) -> i32
+    return pool.block_count
+
+
+# Get number of allocated (in-use) blocks
+pub fn pool_used(pool: *MemPool) -> i32
+    return pool.block_count - pool.free_count
+
+
+# Get the block size (useful when passing pools around)
+pub fn pool_block_size(pool: *MemPool) -> i32
+    return pool.block_size
+
+
+# Check if a pointer belongs to this pool (for debugging)
+pub fn pool_contains(pool: *MemPool, ptr: *u8) -> i32
+    let p: i64 = ptr as i64
+    let base: i64 = pool.base as i64
+    let end: i64 = base + pool.total_size
+
+    if p < base || p >= end
+        return 0
+
+    # Check alignment
+    let offset: i64 = p - base
+    if (offset % (pool.block_size as i64)) != 0
+        return 0
+
+    return 1
+
+
+# ============================================================================
+# Bulk operations
+# ============================================================================
+
+# Reset pool - marks all blocks as free
+# Useful for batch processing where you want to reuse the pool
+pub fn pool_reset(pool: *MemPool)
+    let count: i32 = pool.block_count
+    let size: i32 = pool.block_size
+    var current: *u8 = pool.base
+
+    # Re-chain all blocks
+    for i in 0..(count - 1)
+        let header: *PoolBlockHeader = current as *PoolBlockHeader
+        header.next = current + size
+        current = current + size
+
+    # Last block points to null
+    let last_header: *PoolBlockHeader = current as *PoolBlockHeader
+    last_header.next = null
+
+    pool.free_list = pool.base
+    pool.free_count = count
+
+
+# ============================================================================
+# Connection buffer pool
+# ============================================================================
+#
+# Convenience wrapper for connection-oriented servers.
+# Pre-allocates read/write buffer pairs.
+
+const CONN_READ_BUF_SIZE: i32 = 8192
+const CONN_WRITE_BUF_SIZE: i32 = 8192
+const CONN_TOTAL_BUF_SIZE: i32 = 16384  # CONN_READ_BUF_SIZE + CONN_WRITE_BUF_SIZE
+
+struct ConnBuffers
+    read_buf: *u8
+    write_buf: *u8
+
+
+# Connection buffer pool - manages paired read/write buffers
+struct ConnBufferPool
+    pool: MemPool
+
+
+# Initialize a connection buffer pool
+# max_connections: maximum number of concurrent connections to support
+pub fn conn_pool_init(pool: *ConnBufferPool, max_connections: i32) -> i32
+    return pool_init(@pool.pool, max_connections, CONN_TOTAL_BUF_SIZE)
+
+
+# Destroy a connection buffer pool
+pub fn conn_pool_destroy(pool: *ConnBufferPool)
+    pool_destroy(@pool.pool)
+
+
+# Allocate buffers for a new connection
+# Returns read_buf pointer, write_buf is at read_buf + CONN_READ_BUF_SIZE
+pub fn conn_pool_alloc(pool: *ConnBufferPool) -> ConnBuffers
+    var bufs: ConnBuffers
+    let block: *u8 = pool_alloc(@pool.pool)
+
+    if block == null
+        bufs.read_buf = null
+        bufs.write_buf = null
+    else
+        bufs.read_buf = block
+        bufs.write_buf = block + CONN_READ_BUF_SIZE
+
+    return bufs
+
+
+# Free buffers when connection closes
+pub fn conn_pool_free(pool: *ConnBufferPool, bufs: *ConnBuffers)
+    if bufs.read_buf != null
+        pool_free(@pool.pool, bufs.read_buf)
+        bufs.read_buf = null
+        bufs.write_buf = null
+
+
+# Get number of available connection slots
+pub fn conn_pool_available(pool: *ConnBufferPool) -> i32
+    return pool_available(@pool.pool)
+
+
+# Get total connection capacity
+pub fn conn_pool_capacity(pool: *ConnBufferPool) -> i32
+    return pool_capacity(@pool.pool)

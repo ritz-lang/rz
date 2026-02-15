@@ -1,0 +1,368 @@
+# test/test_limits.ritz - Tests for resource limits per worker
+#
+# Resource limits help prevent runaway workers from consuming
+# excessive system resources. Limits include:
+#   - Memory usage (arena allocation)
+#   - CPU time
+#   - Request count
+#   - Connection count
+
+import ritzlib.sys
+import ritzlib.io
+import helpers
+import lib.limits
+
+# ============================================================================
+# Test: Resource Limits Initialization
+# ============================================================================
+
+[[test]]
+fn test_resource_limits_init() -> i32
+    var limits: ResourceLimits
+    resource_limits_init(@limits)
+
+    # Should have sensible defaults
+    if limits.max_memory_bytes <= 0
+        "FAIL: max_memory should be > 0\n"
+        return 1
+
+    if limits.max_requests <= 0
+        "FAIL: max_requests should be > 0\n"
+        return 1
+
+    return 0
+
+[[test]]
+fn test_resource_limits_custom() -> i32
+    var limits: ResourceLimits
+    resource_limits_init(@limits)
+
+    limits.max_memory_bytes = 1048576  # 1 MB
+    limits.max_requests = 1000
+    limits.max_connections = 100
+    limits.max_cpu_ms = 5000  # 5 seconds
+
+    let r1: i32 = assert_eq_i64(limits.max_memory_bytes, 1048576)
+    if r1 != 0
+        return r1
+
+    let r2: i32 = assert_eq_i64(limits.max_requests, 1000)
+    if r2 != 0
+        return r2
+
+    return 0
+
+# ============================================================================
+# Test: Resource Usage Tracking
+# ============================================================================
+
+[[test]]
+fn test_resource_usage_init() -> i32
+    var usage: ResourceUsage
+    resource_usage_init(@usage)
+
+    let r1: i32 = assert_eq_i64(usage.memory_bytes, 0)
+    if r1 != 0
+        return r1
+
+    let r2: i32 = assert_eq_i64(usage.request_count, 0)
+    if r2 != 0
+        return r2
+
+    let r3: i32 = assert_eq_i64(usage.connection_count, 0)
+    if r3 != 0
+        return r3
+
+    return 0
+
+[[test]]
+fn test_resource_usage_increment() -> i32
+    var usage: ResourceUsage
+    resource_usage_init(@usage)
+
+    resource_usage_add_memory(@usage, 1024)
+    if usage.memory_bytes != 1024
+        "FAIL: memory should be 1024\n"
+        return 1
+
+    resource_usage_add_request(@usage)
+    if usage.request_count != 1
+        "FAIL: request_count should be 1\n"
+        return 1
+
+    resource_usage_add_connection(@usage)
+    if usage.connection_count != 1
+        "FAIL: connection_count should be 1\n"
+        return 1
+
+    return 0
+
+[[test]]
+fn test_resource_usage_decrement() -> i32
+    var usage: ResourceUsage
+    resource_usage_init(@usage)
+
+    resource_usage_add_memory(@usage, 1024)
+    resource_usage_add_connection(@usage)
+    resource_usage_add_connection(@usage)
+
+    resource_usage_remove_memory(@usage, 512)
+    if usage.memory_bytes != 512
+        "FAIL: memory should be 512\n"
+        return 1
+
+    resource_usage_remove_connection(@usage)
+    if usage.connection_count != 1
+        "FAIL: connection_count should be 1\n"
+        return 1
+
+    return 0
+
+# ============================================================================
+# Test: Limit Enforcement
+# ============================================================================
+
+[[test]]
+fn test_limit_check_memory() -> i32
+    var limits: ResourceLimits
+    var usage: ResourceUsage
+
+    resource_limits_init(@limits)
+    resource_usage_init(@usage)
+
+    limits.max_memory_bytes = 1024
+
+    # Under limit
+    usage.memory_bytes = 512
+    if resource_check_memory(@limits, @usage) != LIMIT_OK
+        "FAIL: should be under limit\n"
+        return 1
+
+    # At limit
+    usage.memory_bytes = 1024
+    if resource_check_memory(@limits, @usage) != LIMIT_OK
+        "FAIL: should be at limit\n"
+        return 1
+
+    # Over limit
+    usage.memory_bytes = 1025
+    if resource_check_memory(@limits, @usage) != LIMIT_EXCEEDED
+        "FAIL: should be over limit\n"
+        return 1
+
+    return 0
+
+[[test]]
+fn test_limit_check_requests() -> i32
+    var limits: ResourceLimits
+    var usage: ResourceUsage
+
+    resource_limits_init(@limits)
+    resource_usage_init(@usage)
+
+    limits.max_requests = 100
+
+    usage.request_count = 99
+    if resource_check_requests(@limits, @usage) != LIMIT_OK
+        "FAIL: should be under limit\n"
+        return 1
+
+    usage.request_count = 101
+    if resource_check_requests(@limits, @usage) != LIMIT_EXCEEDED
+        "FAIL: should be over limit\n"
+        return 1
+
+    return 0
+
+[[test]]
+fn test_limit_check_connections() -> i32
+    var limits: ResourceLimits
+    var usage: ResourceUsage
+
+    resource_limits_init(@limits)
+    resource_usage_init(@usage)
+
+    limits.max_connections = 10
+
+    usage.connection_count = 5
+    if resource_check_connections(@limits, @usage) != LIMIT_OK
+        "FAIL: should be under limit\n"
+        return 1
+
+    usage.connection_count = 11
+    if resource_check_connections(@limits, @usage) != LIMIT_EXCEEDED
+        "FAIL: should be over limit\n"
+        return 1
+
+    return 0
+
+[[test]]
+fn test_limit_check_all() -> i32
+    var limits: ResourceLimits
+    var usage: ResourceUsage
+
+    resource_limits_init(@limits)
+    resource_usage_init(@usage)
+
+    limits.max_memory_bytes = 1024
+    limits.max_requests = 100
+    limits.max_connections = 10
+
+    # All under limit
+    usage.memory_bytes = 512
+    usage.request_count = 50
+    usage.connection_count = 5
+
+    if resource_check_all(@limits, @usage) != LIMIT_OK
+        "FAIL: all should be under limit\n"
+        return 1
+
+    # One over limit
+    usage.request_count = 150
+
+    if resource_check_all(@limits, @usage) != LIMIT_EXCEEDED
+        "FAIL: should detect exceeded limit\n"
+        return 1
+
+    return 0
+
+# ============================================================================
+# Test: Limit Warning Threshold
+# ============================================================================
+
+[[test]]
+fn test_limit_warning_threshold() -> i32
+    var limits: ResourceLimits
+    var usage: ResourceUsage
+
+    resource_limits_init(@limits)
+    resource_usage_init(@usage)
+
+    limits.max_memory_bytes = 1000
+    limits.warning_threshold_percent = 80  # Warn at 80%
+
+    # Under warning threshold
+    usage.memory_bytes = 700
+    if resource_check_warning(@limits, @usage) != LIMIT_OK
+        "FAIL: should be under warning threshold\n"
+        return 1
+
+    # At warning threshold
+    usage.memory_bytes = 800
+    if resource_check_warning(@limits, @usage) != LIMIT_WARNING
+        "FAIL: should be at warning threshold\n"
+        return 1
+
+    # Over warning but under limit
+    usage.memory_bytes = 900
+    if resource_check_warning(@limits, @usage) != LIMIT_WARNING
+        "FAIL: should be warning\n"
+        return 1
+
+    return 0
+
+# ============================================================================
+# Test: Worker Limit Context
+# ============================================================================
+
+[[test]]
+fn test_worker_limit_context() -> i32
+    var ctx: WorkerLimitContext
+    worker_limit_context_init(@ctx)
+
+    # Set custom limits
+    ctx.limits.max_memory_bytes = 4096
+    ctx.limits.max_requests = 1000
+
+    # Track some usage
+    worker_limit_track_memory(@ctx, 1024)
+    worker_limit_track_request(@ctx)
+    worker_limit_track_request(@ctx)
+
+    if ctx.usage.memory_bytes != 1024
+        "FAIL: memory should be 1024\n"
+        return 1
+
+    if ctx.usage.request_count != 2
+        "FAIL: request_count should be 2\n"
+        return 1
+
+    # Check still within limits
+    if worker_limit_check(@ctx) != LIMIT_OK
+        "FAIL: should be within limits\n"
+        return 1
+
+    return 0
+
+[[test]]
+fn test_worker_limit_exceeded() -> i32
+    var ctx: WorkerLimitContext
+    worker_limit_context_init(@ctx)
+
+    ctx.limits.max_memory_bytes = 1000
+
+    # Exceed memory limit
+    worker_limit_track_memory(@ctx, 1500)
+
+    if worker_limit_check(@ctx) != LIMIT_EXCEEDED
+        "FAIL: should detect exceeded limit\n"
+        return 1
+
+    return 0
+
+# ============================================================================
+# Test: Limit Reset
+# ============================================================================
+
+[[test]]
+fn test_resource_usage_reset() -> i32
+    var usage: ResourceUsage
+    resource_usage_init(@usage)
+
+    usage.memory_bytes = 1000
+    usage.request_count = 50
+    usage.connection_count = 10
+
+    resource_usage_reset(@usage)
+
+    if usage.memory_bytes != 0
+        "FAIL: memory should be 0\n"
+        return 1
+
+    if usage.request_count != 0
+        "FAIL: request_count should be 0\n"
+        return 1
+
+    if usage.connection_count != 0
+        "FAIL: connection_count should be 0\n"
+        return 1
+
+    return 0
+
+# ============================================================================
+# Test: Disabled Limits
+# ============================================================================
+
+[[test]]
+fn test_disabled_limits() -> i32
+    var limits: ResourceLimits
+    var usage: ResourceUsage
+
+    resource_limits_init(@limits)
+    resource_usage_init(@usage)
+
+    # Set to 0 to disable
+    limits.max_memory_bytes = 0
+    limits.max_requests = 0
+    limits.max_connections = 0
+
+    # Any usage should be OK
+    usage.memory_bytes = 999999999
+    usage.request_count = 999999999
+    usage.connection_count = 999999999
+
+    if resource_check_all(@limits, @usage) != LIMIT_OK
+        "FAIL: disabled limits should allow any usage\n"
+        return 1
+
+    return 0

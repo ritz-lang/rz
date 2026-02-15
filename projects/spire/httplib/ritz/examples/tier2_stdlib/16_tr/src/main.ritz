@@ -1,0 +1,368 @@
+# tr - translate or delete characters
+#
+# Usage: tr [OPTION]... SET1 [SET2]
+#   Translate, squeeze, and/or delete characters from stdin to stdout.
+#
+# Options:
+#   -d    delete characters in SET1, do not translate
+#   -s    squeeze repeated characters in SET2 to single
+#   -c    complement SET1 (use characters NOT in SET1)
+#
+# Character sets:
+#   CHAR          literal character
+#   CHAR1-CHAR2   range of characters (e.g., a-z, 0-9)
+#   \n \t \r \\   escape sequences
+#
+# Examples:
+#   tr a-z A-Z           # lowercase to uppercase
+#   tr -d '0-9'          # delete all digits
+#   tr -s ' '            # squeeze multiple spaces to one
+#   tr -dc 'a-zA-Z\n'    # keep only letters and newlines
+
+# ============================================================================
+# Standard library imports
+# ============================================================================
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+import ritzlib.args
+
+# ============================================================================
+# Options
+# ============================================================================
+
+struct TrOptions
+    delete: i32       # -d: delete characters in SET1
+    squeeze: i32      # -s: squeeze repeated output chars
+    complement: i32   # -c: complement SET1
+
+# ============================================================================
+# Character set (256-byte array for simplicity - one byte per char)
+# ============================================================================
+
+struct CharSet
+    present: [256]u8   # 1 if char is in set, 0 otherwise
+
+fn charset_init(cs: *CharSet)
+    for i in 0..256
+        cs.present[i] = 0
+
+fn charset_add(cs: *CharSet, c: u8)
+    cs.present[c as i32] = 1
+
+fn charset_contains(cs: *CharSet, c: u8) -> i32
+    if cs.present[c as i32] != 0
+        return 1
+    return 0
+
+fn charset_complement(cs: *CharSet)
+    for i in 0..256
+        if cs.present[i] != 0
+            cs.present[i] = 0
+        else
+            cs.present[i] = 1
+
+# ============================================================================
+# Translation table (256-byte lookup)
+# ============================================================================
+
+struct TransTable
+    map: [256]u8
+
+fn transtable_init(tt: *TransTable)
+    # Initialize to identity mapping
+    for i in 0..256
+        tt.map[i] = i as u8
+
+fn transtable_set(tt: *TransTable, from: u8, to: u8)
+    tt.map[from as i32] = to
+
+fn transtable_get(tt: *TransTable, c: u8) -> u8
+    return tt.map[c as i32]
+
+# ============================================================================
+# Set parsing
+# ============================================================================
+
+fn parse_escape(s: *u8, pos: *i64) -> u8
+    # Parse escape sequence starting at s[*pos] (after the backslash)
+    let c: u8 = *(s + *pos)
+    *pos = *pos + 1
+
+    if c == 'n'  # 'n'
+        return 10  # newline
+    if c == 't'  # 't'
+        return 9   # tab
+    if c == 'r'  # 'r'
+        return 13  # carriage return
+    if c == '\\'   # '\'
+        return 92  # backslash
+    if c == '0'   # '0' - octal
+        # Parse up to 3 octal digits
+        var val: i32 = 0
+        var count: i32 = 0
+        while count < 3
+            let digit: u8 = *(s + *pos)
+            if digit >= '0' && digit <= '7'
+                val = val * 8 + (digit - '0') as i32
+                *pos = *pos + 1
+                count += 1
+            else
+                break
+        return val as u8
+
+    # Unknown escape, return as-is
+    return c
+
+fn parse_set(s: *u8, cs: *CharSet) -> i32
+    # Parse a character set specification into the bitmap
+    # Returns 0 on success, 1 on error
+    var pos: i64 = 0
+
+    while *(s + pos) != 0
+        var c: u8 = *(s + pos)
+        pos += 1
+
+        # Handle escape sequences
+        if c == '\\'  # '\'
+            c = parse_escape(s, &pos)
+            charset_add(cs, c)
+            continue
+
+        # Check for range (a-z)
+        if *(s + pos) == '-' && *(s + pos + 1) != 0  # '-' and not at end
+            pos += 1  # skip '-'
+            var end_c: u8 = *(s + pos)
+            pos += 1
+
+            if end_c == '\\'  # escape in range end
+                end_c = parse_escape(s, &pos)
+
+            # Add all characters in range
+            var ch: i32 = c as i32
+            while ch <= end_c as i32
+                charset_add(cs, ch as u8)
+                ch += 1
+        else
+            charset_add(cs, c)
+
+    return 0
+
+fn build_translation(set1: *u8, set2: *u8, tt: *TransTable, set1_chars: *CharSet) -> i32
+    # Build translation table from SET1 to SET2
+    # Also populates set1_chars for use with -d and -c
+
+    # Parse SET1 into ordered list
+    var s1_list: [256]u8
+    var s1_len: i32 = 0
+    var pos: i64 = 0
+
+    while *(set1 + pos) != 0
+        var c: u8 = *(set1 + pos)
+        pos += 1
+
+        if c == '\\'  # escape
+            c = parse_escape(set1, &pos)
+            s1_list[s1_len] = c
+            charset_add(set1_chars, c)
+            s1_len += 1
+            continue
+
+        if *(set1 + pos) == '-' && *(set1 + pos + 1) != 0  # range
+            pos += 1
+            var end_c: u8 = *(set1 + pos)
+            pos += 1
+            if end_c == '\\'
+                end_c = parse_escape(set1, &pos)
+
+            var ch: i32 = c as i32
+            while ch <= end_c as i32
+                s1_list[s1_len] = ch as u8
+                charset_add(set1_chars, ch as u8)
+                s1_len += 1
+                ch += 1
+        else
+            s1_list[s1_len] = c
+            charset_add(set1_chars, c)
+            s1_len += 1
+
+    # Parse SET2 into ordered list
+    var s2_list: [256]u8
+    var s2_len: i32 = 0
+    pos = 0
+
+    while *(set2 + pos) != 0
+        var c: u8 = *(set2 + pos)
+        pos += 1
+
+        if c == '\\'
+            c = parse_escape(set2, &pos)
+            s2_list[s2_len] = c
+            s2_len += 1
+            continue
+
+        if *(set2 + pos) == '-' && *(set2 + pos + 1) != 0
+            pos += 1
+            var end_c: u8 = *(set2 + pos)
+            pos += 1
+            if end_c == '\\'
+                end_c = parse_escape(set2, &pos)
+
+            var ch: i32 = c as i32
+            while ch <= end_c as i32
+                s2_list[s2_len] = ch as u8
+                s2_len += 1
+                ch += 1
+        else
+            s2_list[s2_len] = c
+            s2_len += 1
+
+    # Build translation: s1_list[i] -> s2_list[min(i, s2_len-1)]
+    for i in 0..s1_len
+        var target_idx: i32 = i
+        if target_idx >= s2_len && s2_len > 0
+            target_idx = s2_len - 1
+        if s2_len > 0
+            transtable_set(tt, s1_list[i], s2_list[target_idx])
+
+    return 0
+
+# ============================================================================
+# Main processing
+# ============================================================================
+
+fn process(opts: *TrOptions, set1_chars: *CharSet, tt: *TransTable, squeeze_set: *CharSet)
+    var buf: [4096]u8
+    var outbuf: [4096]u8
+    var out_len: i64 = 0
+    var last_out: i32 = -1  # For squeeze: last output char, -1 = none
+
+    loop
+        let n: i64 = sys_read(STDIN, &buf[0], 4096)
+        if n <= 0
+            break
+
+        var i: i64 = 0
+        while i < n
+            let c: u8 = buf[i]
+            var in_set1: i32 = charset_contains(set1_chars, c)
+
+            # Handle complement
+            if opts.complement != 0
+                if in_set1 != 0
+                    in_set1 = 0
+                else
+                    in_set1 = 1
+
+            if opts.delete != 0
+                # Delete mode: skip chars in set1
+                if in_set1 != 0
+                    i += 1
+                    continue
+
+                # Squeeze on remaining chars if -s
+                if opts.squeeze != 0
+                    if charset_contains(squeeze_set, c) != 0
+                        if c as i32 == last_out
+                            i += 1
+                            continue
+
+                outbuf[out_len] = c
+                out_len += 1
+                last_out = c as i32
+            else
+                # Translate mode
+                var out_c: u8 = c
+                if in_set1 != 0
+                    out_c = transtable_get(tt, c)
+
+                # Squeeze repeated output chars
+                if opts.squeeze != 0
+                    if charset_contains(squeeze_set, out_c) != 0
+                        if out_c as i32 == last_out
+                            i += 1
+                            continue
+
+                outbuf[out_len] = out_c
+                out_len += 1
+                last_out = out_c as i32
+
+            # Flush buffer if full
+            if out_len >= 4096
+                sys_write(STDOUT, &outbuf[0], out_len)
+                out_len = 0
+
+            i += 1
+
+    # Flush remaining
+    if out_len > 0
+        sys_write(STDOUT, &outbuf[0], out_len)
+
+# ============================================================================
+# Argument parsing
+# ============================================================================
+
+fn main(argc: i32, argv: **u8) -> i32
+    # Initialize argument parser
+    var parser: ArgParser
+    args_init(&parser, "tr", "Translate, squeeze, and/or delete characters from stdin to stdout")
+
+    # Define flags
+    args_flag(&parser, 100, "delete", "Delete characters in SET1, do not translate")      # 'd'
+    args_flag(&parser, 115, "squeeze", "Squeeze repeated characters in SET2 to single")   # 's'
+    args_flag(&parser, 99, "complement", "Complement SET1 (use characters NOT in SET1)")  # 'c'
+
+    # Define positionals: SET1 required, SET2 optional (1-2 positional args total)
+    args_positional(&parser, "SET1 [SET2]", "Character sets for translation", 1, 2)
+
+    # Parse arguments
+    if args_parse(&parser, argc, argv) != 0
+        return 1
+
+    # Retrieve flag values
+    var opts: TrOptions
+    opts.delete = args_get_flag(&parser, 100)      # 'd'
+    opts.squeeze = args_get_flag(&parser, 115)     # 's'
+    opts.complement = args_get_flag(&parser, 99)   # 'c'
+
+    # Retrieve positional arguments
+    let set1: *u8 = args_get_positional(&parser, 0)
+    var set2: *u8 = null
+    if parser.positional_count > 1
+        set2 = args_get_positional(&parser, 1)
+
+    # Validate: if -d is not set, SET2 is required
+    if opts.delete == 0 && set2 == null
+        eprints("tr: missing SET2 for translation\n")
+        return 1
+
+    # Initialize structures
+    var set1_chars: CharSet
+    charset_init(&set1_chars)
+
+    var tt: TransTable
+    transtable_init(&tt)
+
+    var squeeze_set: CharSet
+    charset_init(&squeeze_set)
+
+    if opts.delete != 0
+        # Delete mode: just need set1
+        parse_set(set1, &set1_chars)
+        if set2 != null && opts.squeeze != 0
+            # -ds: squeeze on set2
+            parse_set(set2, &squeeze_set)
+    else
+        # Translation mode
+        if set2 == null
+            set2 = "" as *u8
+        build_translation(set1, set2, &tt, &set1_chars)
+
+        if opts.squeeze != 0
+            # Squeeze on set2 characters
+            parse_set(set2, &squeeze_set)
+
+    process(&opts, &set1_chars, &tt, &squeeze_set)
+
+    return 0

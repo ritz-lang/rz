@@ -1,0 +1,447 @@
+# test/test_wal.ritz - Tests for Write-Ahead Log
+#
+# Tests for WAL writer/reader operations
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+import ritzlib.memory
+
+import lib.m7m_types
+import lib.page
+import lib.wal
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+# Create a temporary test file path
+fn get_test_path(suffix: i32) -> *u8
+    # Use /tmp for test files
+    var path: *u8 = malloc(64)
+    if path == null
+        return null
+
+    let base: *u8 = c"/tmp/m7m_test_wal_"
+    memcpy(path, base, 18)
+
+    # Add suffix as digit
+    path[18] = (48 + suffix) as u8  # '0' + suffix
+    path[19] = 0
+
+    return path
+
+# Clean up test file
+fn cleanup_test_file(path: *u8)
+    sys_unlink(path)
+    free(path)
+
+# ============================================================================
+# WAL Writer Creation Tests
+# ============================================================================
+
+[[test]]
+fn test_wal_writer_new() -> i32
+    var path: *u8 = get_test_path(0)
+    var writer: *WalWriter = wal_writer_new(path)
+    if writer == null
+        free(path)
+        return 1
+
+    wal_writer_destroy(writer)
+    free(path)
+    0
+
+[[test]]
+fn test_wal_writer_new_null_path() -> i32
+    var writer: *WalWriter = wal_writer_new(null)
+    if writer != null
+        return 1
+    0
+
+[[test]]
+fn test_wal_writer_open() -> i32
+    var path: *u8 = get_test_path(1)
+    var writer: *WalWriter = wal_writer_new(path)
+    if writer == null
+        free(path)
+        return 1
+
+    var err: i32 = wal_writer_open(writer)
+    if err != ERR_OK
+        wal_writer_destroy(writer)
+        free(path)
+        return 2
+
+    wal_writer_destroy(writer)
+
+    # Clean up WAL file
+    var wal_path: [64]u8
+    memcpy(@wal_path[0], path, 20)
+    let suffix: *u8 = c".wal.000000"
+    memcpy(@wal_path[19], suffix, 12)
+    sys_unlink(@wal_path[0])
+    free(path)
+    0
+
+# ============================================================================
+# WAL Record Writing Tests
+# ============================================================================
+
+[[test]]
+fn test_wal_write_begin() -> i32
+    var path: *u8 = get_test_path(2)
+    var writer: *WalWriter = wal_writer_new(path)
+    if writer == null
+        free(path)
+        return 1
+
+    var err: i32 = wal_writer_open(writer)
+    if err != ERR_OK
+        wal_writer_destroy(writer)
+        free(path)
+        return 2
+
+    var lsn: i64 = wal_write_begin(writer, 100)
+    if lsn < 0
+        wal_writer_destroy(writer)
+        free(path)
+        return 3
+
+    # LSN should be 1 (first record)
+    if lsn != 1
+        wal_writer_destroy(writer)
+        free(path)
+        return 4
+
+    wal_writer_destroy(writer)
+
+    # Cleanup
+    var wal_path: [64]u8
+    memcpy(@wal_path[0], path, 20)
+    memcpy(@wal_path[19], c".wal.000000", 12)
+    sys_unlink(@wal_path[0])
+    free(path)
+    0
+
+[[test]]
+fn test_wal_write_commit() -> i32
+    var path: *u8 = get_test_path(3)
+    var writer: *WalWriter = wal_writer_new(path)
+    if writer == null
+        free(path)
+        return 1
+
+    wal_writer_open(writer)
+
+    var begin_lsn: i64 = wal_write_begin(writer, 200)
+    var commit_lsn: i64 = wal_write_commit(writer, 200, begin_lsn)
+
+    if commit_lsn != 2
+        wal_writer_destroy(writer)
+        free(path)
+        return 2
+
+    wal_writer_destroy(writer)
+
+    # Cleanup
+    var wal_path: [64]u8
+    memcpy(@wal_path[0], path, 20)
+    memcpy(@wal_path[19], c".wal.000000", 12)
+    sys_unlink(@wal_path[0])
+    free(path)
+    0
+
+[[test]]
+fn test_wal_write_abort() -> i32
+    var path: *u8 = get_test_path(4)
+    var writer: *WalWriter = wal_writer_new(path)
+    wal_writer_open(writer)
+
+    var begin_lsn: i64 = wal_write_begin(writer, 300)
+    var abort_lsn: i64 = wal_write_abort(writer, 300, begin_lsn)
+
+    if abort_lsn != 2
+        wal_writer_destroy(writer)
+        free(path)
+        return 1
+
+    wal_writer_destroy(writer)
+
+    # Cleanup
+    var wal_path: [64]u8
+    memcpy(@wal_path[0], path, 20)
+    memcpy(@wal_path[19], c".wal.000000", 12)
+    sys_unlink(@wal_path[0])
+    free(path)
+    0
+
+[[test]]
+fn test_wal_write_insert() -> i32
+    var path: *u8 = get_test_path(5)
+    var writer: *WalWriter = wal_writer_new(path)
+    wal_writer_open(writer)
+
+    var begin_lsn: i64 = wal_write_begin(writer, 400)
+
+    var data: [16]u8
+    data[0] = 1
+    data[1] = 2
+    data[2] = 3
+    data[3] = 4
+
+    var insert_lsn: i64 = wal_write_insert(writer, 400, begin_lsn, 0, 100, @data[0], 4)
+    if insert_lsn != 2
+        wal_writer_destroy(writer)
+        free(path)
+        return 1
+
+    wal_writer_destroy(writer)
+
+    # Cleanup
+    var wal_path: [64]u8
+    memcpy(@wal_path[0], path, 20)
+    memcpy(@wal_path[19], c".wal.000000", 12)
+    sys_unlink(@wal_path[0])
+    free(path)
+    0
+
+[[test]]
+fn test_wal_write_page() -> i32
+    var path: *u8 = get_test_path(6)
+    var writer: *WalWriter = wal_writer_new(path)
+    wal_writer_open(writer)
+
+    var begin_lsn: i64 = wal_write_begin(writer, 500)
+
+    var page: Page
+    page_init_heap(@page, 42)
+    page.data[0] = 99
+
+    var page_lsn: i64 = wal_write_page(writer, 500, begin_lsn, 42, @page)
+    if page_lsn != 2
+        wal_writer_destroy(writer)
+        free(path)
+        return 1
+
+    wal_writer_destroy(writer)
+
+    # Cleanup
+    var wal_path: [64]u8
+    memcpy(@wal_path[0], path, 20)
+    memcpy(@wal_path[19], c".wal.000000", 12)
+    sys_unlink(@wal_path[0])
+    free(path)
+    0
+
+[[test]]
+fn test_wal_write_checkpoint() -> i32
+    var path: *u8 = get_test_path(7)
+    var writer: *WalWriter = wal_writer_new(path)
+    wal_writer_open(writer)
+
+    var cp_lsn: i64 = wal_write_checkpoint(writer)
+    if cp_lsn != 1
+        wal_writer_destroy(writer)
+        free(path)
+        return 1
+
+    wal_writer_destroy(writer)
+
+    # Cleanup
+    var wal_path: [64]u8
+    memcpy(@wal_path[0], path, 20)
+    memcpy(@wal_path[19], c".wal.000000", 12)
+    sys_unlink(@wal_path[0])
+    free(path)
+    0
+
+# ============================================================================
+# WAL Reader Tests
+# ============================================================================
+
+[[test]]
+fn test_wal_reader_new() -> i32
+    var reader: *WalReader = wal_reader_new()
+    if reader == null
+        return 1
+
+    wal_reader_destroy(reader)
+    0
+
+[[test]]
+fn test_wal_write_then_read() -> i32
+    # Write some records
+    var path: *u8 = get_test_path(8)
+    var writer: *WalWriter = wal_writer_new(path)
+    wal_writer_open(writer)
+
+    wal_write_begin(writer, 600)
+    wal_write_commit(writer, 600, 1)
+    wal_write_checkpoint(writer)
+
+    wal_writer_close(writer)
+    wal_writer_destroy(writer)
+
+    # Build WAL file path
+    var wal_path: [64]u8
+    memcpy(@wal_path[0], path, 20)
+    memcpy(@wal_path[19], c".wal.000000", 12)
+
+    # Read them back
+    var reader: *WalReader = wal_reader_new()
+    var err: i32 = wal_reader_open(reader, @wal_path[0])
+    if err != ERR_OK
+        wal_reader_destroy(reader)
+        sys_unlink(@wal_path[0])
+        free(path)
+        return 1
+
+    var header: WalRecordHeader
+
+    # Read first record (BEGIN)
+    err = wal_reader_next(reader, @header)
+    if err != ERR_OK
+        wal_reader_destroy(reader)
+        sys_unlink(@wal_path[0])
+        free(path)
+        return 2
+
+    if header.rec_type != WAL_REC_BEGIN
+        wal_reader_destroy(reader)
+        sys_unlink(@wal_path[0])
+        free(path)
+        return 3
+
+    if header.txn_id != 600
+        wal_reader_destroy(reader)
+        sys_unlink(@wal_path[0])
+        free(path)
+        return 4
+
+    # Read second record (COMMIT)
+    err = wal_reader_next(reader, @header)
+    if err != ERR_OK
+        wal_reader_destroy(reader)
+        sys_unlink(@wal_path[0])
+        free(path)
+        return 5
+
+    if header.rec_type != WAL_REC_COMMIT
+        wal_reader_destroy(reader)
+        sys_unlink(@wal_path[0])
+        free(path)
+        return 6
+
+    # Read third record (CHECKPOINT)
+    err = wal_reader_next(reader, @header)
+    if err != ERR_OK
+        wal_reader_destroy(reader)
+        sys_unlink(@wal_path[0])
+        free(path)
+        return 7
+
+    if header.rec_type != WAL_REC_CHECKPOINT
+        wal_reader_destroy(reader)
+        sys_unlink(@wal_path[0])
+        free(path)
+        return 8
+
+    # Should be EOF now
+    err = wal_reader_next(reader, @header)
+    if err != -1  # -1 is EOF
+        wal_reader_destroy(reader)
+        sys_unlink(@wal_path[0])
+        free(path)
+        return 9
+
+    wal_reader_destroy(reader)
+    sys_unlink(@wal_path[0])
+    free(path)
+    0
+
+# ============================================================================
+# WAL Statistics Tests
+# ============================================================================
+
+[[test]]
+fn test_wal_writer_lsn() -> i32
+    var path: *u8 = get_test_path(9)
+    var writer: *WalWriter = wal_writer_new(path)
+    wal_writer_open(writer)
+
+    # Initial LSN should be 1
+    if wal_writer_lsn(writer) != 1
+        wal_writer_destroy(writer)
+        free(path)
+        return 1
+
+    wal_write_begin(writer, 700)
+
+    # After one write, LSN should be 2
+    if wal_writer_lsn(writer) != 2
+        wal_writer_destroy(writer)
+        free(path)
+        return 2
+
+    wal_writer_destroy(writer)
+
+    # Cleanup
+    var wal_path: [64]u8
+    memcpy(@wal_path[0], path, 20)
+    memcpy(@wal_path[19], c".wal.000000", 12)
+    sys_unlink(@wal_path[0])
+    free(path)
+    0
+
+# ============================================================================
+# Transaction Sequence Tests
+# ============================================================================
+
+[[test]]
+fn test_wal_full_transaction() -> i32
+    var path: *u8 = get_test_path(10)
+    var writer: *WalWriter = wal_writer_new(path)
+    wal_writer_open(writer)
+
+    # Simulate a complete transaction
+    var txn_id: i64 = 1000
+
+    # Begin
+    var begin_lsn: i64 = wal_write_begin(writer, txn_id)
+    if begin_lsn < 0
+        wal_writer_destroy(writer)
+        free(path)
+        return 1
+
+    # Multiple inserts
+    var data: [32]u8
+    for i in 0..5
+        var lsn: i64 = wal_write_insert(writer, txn_id, begin_lsn, i as i64, i, @data[0], 8)
+        if lsn < 0
+            wal_writer_destroy(writer)
+            free(path)
+            return 2
+
+    # Commit
+    var commit_lsn: i64 = wal_write_commit(writer, txn_id, begin_lsn)
+    if commit_lsn < 0
+        wal_writer_destroy(writer)
+        free(path)
+        return 3
+
+    # Check final LSN (1 begin + 5 inserts + 1 commit = 7)
+    if wal_writer_lsn(writer) != 8
+        wal_writer_destroy(writer)
+        free(path)
+        return 4
+
+    wal_writer_destroy(writer)
+
+    # Cleanup
+    var wal_path: [64]u8
+    memcpy(@wal_path[0], path, 20)
+    memcpy(@wal_path[19], c".wal.000000", 12)
+    sys_unlink(@wal_path[0])
+    free(path)
+    0

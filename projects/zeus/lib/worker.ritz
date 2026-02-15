@@ -1,0 +1,186 @@
+# lib/worker.ritz - Worker process context and operations
+#
+# The worker is the process that runs user Ritz applications.
+# It attaches to shared memory created by Valet and processes
+# requests from the ring buffer.
+#
+# Lifecycle:
+#   1. worker_init() - attach to shared memory
+#   2. worker_set_running() - mark ready
+#   3. loop:
+#      a. worker_poll_request() - get next request
+#      b. worker_set_busy() - mark processing
+#      c. process request, access arena data
+#      d. worker_begin_response() - start response
+#      e. worker_commit_response() - publish response
+#      f. worker_ack_request() - consume request
+#      g. worker_set_running() - mark ready
+#   4. worker_destroy() - clean shutdown
+
+import ritzlib.sys
+import lib.shm
+import lib.control
+import lib.ring
+import lib.arena
+
+# ============================================================================
+# Worker Context
+# ============================================================================
+
+pub struct WorkerContext
+    region: ShmRegion         # Attached shared memory region
+    current_req_idx: i64      # Index of request being processed
+
+# ============================================================================
+# Initialization
+# ============================================================================
+
+# Initialize worker context by attaching to shared memory
+# fd: file descriptor received from Valet
+# size: size of shared memory region
+# Returns 0 on success, negative on error
+pub fn worker_init(ctx: *WorkerContext, fd: i32, size: i64) -> i32
+    let result: i32 = shm_attach(@ctx.region, fd, size)
+    if result != 0
+        return result
+
+    ctx.current_req_idx = -1
+
+    # Set our PID in the control block
+    let cb: *ControlBlock = shm_get_control_block(@ctx.region)
+    cb.worker_pid = sys_getpid()
+
+    return 0
+
+# Destroy worker context (detach from shared memory)
+pub fn worker_destroy(ctx: *WorkerContext)
+    # Clear our PID
+    let cb: *ControlBlock = shm_get_control_block(@ctx.region)
+    if cb != null
+        cb.worker_pid = 0
+        cb.state = WORKER_STATE_IDLE
+
+    shm_detach(@ctx.region)
+    ctx.current_req_idx = -1
+
+# ============================================================================
+# State Management
+# ============================================================================
+
+# Get the control block
+pub fn worker_get_control_block(ctx: *WorkerContext) -> *ControlBlock
+    return shm_get_control_block(@ctx.region)
+
+# Get the data arena
+pub fn worker_get_arena(ctx: *WorkerContext, arena: *DataArena)
+    shm_get_arena(@ctx.region, arena)
+
+# Set worker state to RUNNING (ready to accept requests)
+pub fn worker_set_running(ctx: *WorkerContext)
+    let cb: *ControlBlock = shm_get_control_block(@ctx.region)
+    cb.state = WORKER_STATE_RUNNING
+
+# Set worker state to BUSY (processing a request)
+pub fn worker_set_busy(ctx: *WorkerContext)
+    let cb: *ControlBlock = shm_get_control_block(@ctx.region)
+    cb.state = WORKER_STATE_BUSY
+
+# Set worker state to STOPPING (shutting down)
+pub fn worker_set_stopping(ctx: *WorkerContext)
+    let cb: *ControlBlock = shm_get_control_block(@ctx.region)
+    cb.state = WORKER_STATE_STOPPING
+
+# ============================================================================
+# Request Processing
+# ============================================================================
+
+# Poll for the next request (non-blocking)
+# Returns pointer to request slot, or null if no request available
+pub fn worker_poll_request(ctx: *WorkerContext) -> *RequestSlot
+    let cb: *ControlBlock = shm_get_control_block(@ctx.region)
+
+    # Check if there's a request
+    if control_block_req_empty(cb) != 0
+        return null
+
+    # Get the request ring
+    let req_ring: *RequestSlot = shm_get_request_ring(@ctx.region)
+
+    # Calculate slot index
+    let slot_idx: i64 = control_block_slot_index(cb, cb.req_read_idx)
+    ctx.current_req_idx = cb.req_read_idx
+
+    return req_ring + slot_idx
+
+# Acknowledge that the current request has been processed
+# This advances the read index
+pub fn worker_ack_request(ctx: *WorkerContext)
+    let cb: *ControlBlock = shm_get_control_block(@ctx.region)
+    control_block_req_read_inc(cb)
+    ctx.current_req_idx = -1
+
+# ============================================================================
+# Response Writing
+# ============================================================================
+
+# Begin writing a response for the given request ID
+# Returns pointer to response slot, or null if ring is full
+pub fn worker_begin_response(ctx: *WorkerContext, request_id: u64) -> *ResponseSlot
+    let cb: *ControlBlock = shm_get_control_block(@ctx.region)
+
+    # Check if response ring is full
+    if control_block_resp_full(cb) != 0
+        return null
+
+    # Get the response ring
+    let resp_ring: *ResponseSlot = shm_get_response_ring(@ctx.region)
+
+    # Calculate slot index
+    let slot_idx: i64 = control_block_slot_index(cb, cb.resp_write_idx)
+    let slot: *ResponseSlot = resp_ring + slot_idx
+
+    # Initialize slot
+    response_slot_init(slot)
+    slot.id = request_id
+
+    return slot
+
+# Commit the current response (make it visible to Valet)
+# This advances the write index
+pub fn worker_commit_response(ctx: *WorkerContext)
+    let cb: *ControlBlock = shm_get_control_block(@ctx.region)
+    control_block_resp_write_inc(cb)
+
+# ============================================================================
+# Convenience Functions
+# ============================================================================
+
+# Get pointer to request path in arena
+pub fn worker_get_request_path(ctx: *WorkerContext, req: *RequestSlot) -> *u8
+    var arena: DataArena
+    shm_get_arena(@ctx.region, @arena)
+    return data_arena_offset_to_ptr(@arena, req.path_offset as i64)
+
+# Get pointer to request body in arena
+pub fn worker_get_request_body(ctx: *WorkerContext, req: *RequestSlot) -> *u8
+    var arena: DataArena
+    shm_get_arena(@ctx.region, @arena)
+    return data_arena_offset_to_ptr(@arena, req.body_offset as i64)
+
+# Get pointer to request headers in arena
+pub fn worker_get_request_headers(ctx: *WorkerContext, req: *RequestSlot) -> *u8
+    var arena: DataArena
+    shm_get_arena(@ctx.region, @arena)
+    return data_arena_offset_to_ptr(@arena, req.headers_offset as i64)
+
+# Allocate space in arena for response data
+pub fn worker_alloc_response_data(ctx: *WorkerContext, size: i64) -> *u8
+    var arena: DataArena
+    shm_get_arena(@ctx.region, @arena)
+    return data_arena_alloc(@arena, size)
+
+# Get offset for a pointer (for setting in response slots)
+pub fn worker_ptr_to_offset(ctx: *WorkerContext, ptr: *u8) -> i64
+    var arena: DataArena
+    shm_get_arena(@ctx.region, @arena)
+    return data_arena_ptr_to_offset(@arena, ptr)

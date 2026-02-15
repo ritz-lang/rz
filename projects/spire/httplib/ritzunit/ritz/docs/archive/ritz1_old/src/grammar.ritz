@@ -1,0 +1,270 @@
+# Ritz Language Grammar
+#
+# Combined token + grammar definition in Lark-like EBNF syntax.
+# This file is the single source of truth for Ritz syntax.
+#
+# Conventions:
+#   UPPERCASE = token (lexical rule)
+#   lowercase = grammar rule (parser rule)
+#   .N suffix = priority (higher N = higher priority, for longest-match ties)
+#   @skip     = token to discard (whitespace, comments)
+#   @synthetic = token injected by indenter, not matched by lexer
+#   "..."     = literal string
+#   /.../     = regex pattern
+#   ?         = optional
+#   *         = zero or more
+#   +         = one or more
+#   |         = alternation
+#   ( )       = grouping
+#
+# The lexer uses longest-match with priority for ties.
+# The parser is recursive descent with Pratt for expressions.
+
+# =============================================================================
+# TOKENS - Lexical Rules
+# =============================================================================
+
+# --- Multi-character operators (high priority to beat single-char) ---
+EQEQ.10      = "=="
+NEQ.10       = "!="
+LEQ.10       = "<="
+GEQ.10       = ">="
+ARROW.10     = "->"
+FATARROW.10  = "=>"
+DOTDOT.10    = ".."
+AMPAMP.10    = "&&"
+PIPEPIPE.10  = "||"
+PLUSEQ.10    = "+="
+MINUSEQ.10   = "-="
+STAREQ.10    = "*="
+SLASHEQ.10   = "/="
+COLONCOLON.10 = "::"
+
+# --- Single-character operators ---
+PLUS     = "+"
+MINUS    = "-"
+STAR     = "*"
+SLASH    = "/"
+PERCENT  = "%"
+AMP      = "&"
+PIPE     = "|"
+CARET    = "^"
+TILDE    = "~"
+BANG     = "!"
+LT       = "<"
+GT       = ">"
+EQ       = "="
+DOT      = "."
+QUESTION = "?"
+
+# --- Delimiters ---
+LPAREN   = "("
+RPAREN   = ")"
+LBRACKET = "["
+RBRACKET = "]"
+LBRACE   = "{"
+RBRACE   = "}"
+COMMA    = ","
+COLON    = ":"
+SEMI     = ";"
+AT       = "@"
+
+# --- Keywords (high priority to beat IDENT) ---
+FN.10       = "fn"
+LET.10      = "let"
+VAR.10      = "var"
+IF.10       = "if"
+ELSE.10     = "else"
+WHILE.10    = "while"
+FOR.10      = "for"
+IN.10       = "in"
+MATCH.10    = "match"
+RETURN.10   = "return"
+STRUCT.10   = "struct"
+ENUM.10     = "enum"
+IMPORT.10   = "import"
+EXTERN.10   = "extern"
+TRUE.10     = "true"
+FALSE.10    = "false"
+UNSAFE.10   = "unsafe"
+CONST.10    = "const"
+ASSERT.10   = "assert"
+BREAK.10    = "break"
+CONTINUE.10 = "continue"
+MUT.10      = "mut"
+
+# --- Literals and identifiers ---
+INT      = /[0-9]+/
+FLOAT    = /[0-9]+\.[0-9]+/
+STRING   = /"([^"\\]|\\.)*"/
+CHAR     = /'([^'\\]|\\.)?'/
+IDENT    = /[a-zA-Z_][a-zA-Z0-9_]*/
+
+# --- Skip patterns (discarded by lexer) ---
+@skip WS      = /[ \t]+/
+@skip COMMENT = /#[^\n]*/
+
+# --- Synthetic tokens (injected by indenter, not lexer) ---
+@synthetic NEWLINE
+@synthetic INDENT
+@synthetic DEDENT
+
+# =============================================================================
+# GRAMMAR - Parser Rules
+# =============================================================================
+
+# --- Top level ---
+start: item*
+
+item: fn_def
+    | struct_def
+    | enum_def
+    | const_def
+    | extern_def
+
+# --- Function definition ---
+fn_def: AT IDENT NEWLINE fn_def      # @test, @ignore, etc.
+      | FN IDENT LPAREN params? RPAREN (ARROW type)? COLON block
+
+params: param (COMMA param)*
+param: IDENT COLON type
+
+# --- Struct definition ---
+struct_def: STRUCT IDENT NEWLINE INDENT field+ DEDENT
+field: IDENT COLON type NEWLINE
+
+# --- Enum definition ---
+enum_def: ENUM IDENT NEWLINE INDENT variant+ DEDENT
+variant: IDENT (LPAREN types RPAREN)? NEWLINE
+types: type (COMMA type)*
+
+# --- Const definition ---
+const_def: CONST IDENT COLON type EQ expr NEWLINE
+
+# --- Extern declaration ---
+extern_def: EXTERN FN IDENT LPAREN params? RPAREN (ARROW type)? NEWLINE
+
+# --- Types ---
+type: IDENT                          # i32, MyStruct, etc.
+    | STAR type                      # *i32 (pointer)
+    | STAR MUT type                  # *mut i32 (mutable pointer)
+    | AMP type                       # &i32 (reference)
+    | AMP MUT type                   # &mut i32 (mutable reference)
+    | LBRACKET type SEMI INT RBRACKET  # [i32; 10] (array)
+
+# --- Blocks ---
+block: NEWLINE INDENT stmt+ DEDENT
+     | simple_stmt                   # single-line: fn foo(): 42
+
+# --- Statements ---
+stmt: simple_stmt NEWLINE
+    | compound_stmt
+
+simple_stmt: let_stmt
+           | var_stmt
+           | assign_stmt
+           | return_stmt
+           | break_stmt
+           | continue_stmt
+           | assert_stmt
+           | expr
+
+compound_stmt: if_stmt
+             | while_stmt
+             | for_stmt
+             | match_stmt
+
+let_stmt: LET IDENT (COLON type)? EQ expr
+var_stmt: VAR IDENT (COLON type)? EQ expr
+assign_stmt: lvalue EQ expr
+           | lvalue PLUSEQ expr
+           | lvalue MINUSEQ expr
+           | lvalue STAREQ expr
+           | lvalue SLASHEQ expr
+
+return_stmt: RETURN expr?
+break_stmt: BREAK
+continue_stmt: CONTINUE
+assert_stmt: ASSERT expr (COMMA STRING)?
+
+if_stmt: IF expr COLON block (ELSE COLON block)?
+       | IF expr COLON block (ELSE if_stmt)
+
+while_stmt: WHILE expr COLON block
+
+for_stmt: FOR IDENT IN expr COLON block
+
+match_stmt: MATCH expr COLON NEWLINE INDENT match_arm+ DEDENT
+match_arm: pattern FATARROW block
+
+# --- Patterns (for match) ---
+pattern: IDENT                       # binding
+       | IDENT LPAREN patterns RPAREN  # Variant(x, y)
+       | literal
+       | IDENT LBRACE field_patterns RBRACE  # Struct { x, y }
+
+patterns: pattern (COMMA pattern)*
+field_patterns: field_pattern (COMMA field_pattern)*
+field_pattern: IDENT (COLON pattern)?
+
+# --- Expressions (Pratt-style precedence) ---
+# Precedence from lowest to highest:
+#   1. || (or)
+#   2. && (and)
+#   3. == != < > <= >= (comparison)
+#   4. | (bitwise or)
+#   5. ^ (bitwise xor)
+#   6. & (bitwise and)
+#   7. + - (additive)
+#   8. * / % (multiplicative)
+#   9. unary: - ! * & (prefix)
+#  10. postfix: call, index, field access
+
+expr: or_expr
+
+or_expr: and_expr (PIPEPIPE and_expr)*
+and_expr: cmp_expr (AMPAMP cmp_expr)*
+cmp_expr: bitor_expr ((EQEQ | NEQ | LT | GT | LEQ | GEQ) bitor_expr)*
+bitor_expr: bitxor_expr (PIPE bitxor_expr)*
+bitxor_expr: bitand_expr (CARET bitand_expr)*
+bitand_expr: add_expr (AMP add_expr)*
+add_expr: mul_expr ((PLUS | MINUS) mul_expr)*
+mul_expr: unary_expr ((STAR | SLASH | PERCENT) unary_expr)*
+
+unary_expr: MINUS unary_expr
+          | BANG unary_expr
+          | STAR unary_expr          # dereference
+          | AMP unary_expr           # address-of
+          | AMP MUT unary_expr       # mutable reference
+          | postfix_expr
+
+postfix_expr: atom trailer*
+trailer: LPAREN args? RPAREN         # function call
+       | LBRACKET expr RBRACKET      # index
+       | DOT IDENT                   # field access
+
+atom: IDENT
+    | literal
+    | LPAREN expr RPAREN             # grouped
+    | if_expr
+    | struct_lit
+    | array_lit
+
+if_expr: IF expr COLON block ELSE COLON block
+       | IF expr COLON block ELSE if_expr
+
+struct_lit: IDENT LBRACE field_inits? RBRACE
+field_inits: field_init (COMMA field_init)*
+field_init: IDENT COLON expr
+
+array_lit: LBRACKET (expr (COMMA expr)*)? RBRACKET
+
+literal: INT | FLOAT | STRING | CHAR | TRUE | FALSE
+
+args: expr (COMMA expr)*
+
+lvalue: IDENT
+      | lvalue DOT IDENT
+      | lvalue LBRACKET expr RBRACKET
+      | STAR lvalue                  # *ptr
+      | LPAREN lvalue RPAREN         # (*ptr).field

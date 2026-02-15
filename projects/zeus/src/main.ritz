@@ -1,0 +1,510 @@
+# src/main.ritz - Zeus daemon entry point
+#
+# Zeus is a process manager for Ritz applications.
+# It owns the shared memory ring buffers and spawns worker processes.
+#
+# Usage:
+#   zeus [options] <app-module>
+#
+# Options:
+#   -w <count>     Number of workers (default: 4)
+#   -m <bytes>     Shared memory size per worker (default: 2MB)
+#   -r <capacity>  Ring buffer capacity (default: 256)
+#   -s <path>      Unix socket path (default: /run/zeus/zeus.sock)
+#   -p <path>      PID file path (default: /run/zeus/zeus.pid)
+#   -f             Run in foreground (don't daemonize)
+#   -v             Verbose logging
+#   -h, --help     Show help
+
+import ritzlib.sys
+import lib.daemon
+import lib.main_helpers
+import lib.control
+
+# ============================================================================
+# Simple Print Helpers
+# ============================================================================
+
+fn print_str(s: *u8)
+    var len: i64 = 0
+    while *(s + len) != 0
+        len = len + 1
+    sys_write(1, s, len)
+
+fn print_i32(n: i32)
+    if n < 0
+        sys_write(1, c"-", 1)
+        print_i32(-n)
+        return
+    if n == 0
+        sys_write(1, c"0", 1)
+        return
+    var buf: [12]u8
+    var i: i32 = 0
+    var v: i32 = n
+    while v > 0
+        buf[i] = (0x30 + (v % 10)) as u8
+        v = v / 10
+        i = i + 1
+    # Reverse
+    while i > 0
+        i = i - 1
+        sys_write(1, @buf[i], 1)
+
+# ============================================================================
+# Global State
+# ============================================================================
+
+# Signal pipe for async-safe signal handling
+var g_signal_pipe_read: i32 = -1
+var g_signal_pipe_write: i32 = -1
+
+# Daemon context (global for signal handler access)
+var g_daemon: DaemonContext
+
+# Running flag
+var g_running: i32 = 1
+
+# App module for respawning workers
+var g_app_module: *u8 = null
+
+# ============================================================================
+# Main Event Loop
+# ============================================================================
+
+fn run_event_loop(ctx: *DaemonContext, opts: *ZeusOptions) -> i32
+    print_str(c"zeus: entering event loop\n")
+
+    # Poll fds: signal pipe + listen socket
+    var poll_fds: [2]PollFd
+
+    poll_fds[0].fd = ctx.signal_read_fd
+    poll_fds[0].events = 1  # POLLIN
+    poll_fds[0].revents = 0
+
+    poll_fds[1].fd = ctx.listen_fd
+    poll_fds[1].events = 1  # POLLIN
+    poll_fds[1].revents = 0
+
+    while g_running != 0
+        # Poll with 1 second timeout
+        let nready: i32 = sys_poll(@poll_fds[0], 2, 1000)
+
+        if nready < 0
+            # Error (might be EINTR from signal)
+            continue
+
+        if nready == 0
+            # Timeout - check worker health
+            check_workers(ctx)
+            continue
+
+        # Handle signal pipe
+        if (poll_fds[0].revents & 1) != 0
+            handle_signals(ctx)
+
+        # Handle new connections
+        if (poll_fds[1].revents & 1) != 0
+            handle_accept(ctx)
+
+        # Check workers periodically
+        check_workers(ctx)
+
+    print_str(c"zeus: exiting event loop\n")
+    return 0
+
+# Handle signals from pipe
+fn handle_signals(ctx: *DaemonContext)
+    var buf: [16]u8
+    let n: i64 = sys_read(ctx.signal_read_fd, @buf[0], 16)
+
+    var i: i64 = 0
+    while i < n
+        let sig: i32 = buf[i] as i32
+        if sig == SIGTERM || sig == SIGINT
+            print_str(c"zeus: received shutdown signal\n")
+            g_running = 0
+            initiate_shutdown(ctx)
+        else if sig == SIGHUP
+            print_str(c"zeus: received reload signal, restarting workers...\n")
+            initiate_hot_reload(ctx)
+        else if sig == SIGCHLD
+            # Child exited - will be handled by check_workers
+            let _: i32 = 0  # noop
+        i = i + 1
+
+# Protocol constants (must match lib/zeus_client.ritz)
+const ZEUS_PROTOCOL_VERSION: u8 = 1
+const CLIENT_MSG_HELLO: u8 = 1
+const DAEMON_MSG_WELCOME: u8 = 1
+const DAEMON_MSG_WORKER_INFO: u8 = 2
+
+# Protocol message structures
+struct ClientMessage
+    msg_type: u8
+    version: u8
+    _reserved: [6]u8
+
+struct DaemonMessage
+    msg_type: u8
+    _pad1: u8
+    payload_len: u16
+    worker_idx: i32
+    shm_size: i64
+
+# SCM_RIGHTS constants
+const SOL_SOCKET: i32 = 1
+const SCM_RIGHTS: i32 = 1
+const SYS_SENDMSG: i64 = 46
+
+# IoVec for sendmsg
+struct IoVec
+    iov_base: *u8
+    iov_len: u64
+
+# msghdr for sendmsg
+struct MsgHdr
+    msg_name: *u8
+    msg_namelen: u32
+    _pad1: u32
+    msg_iov: *IoVec
+    msg_iovlen: u64
+    msg_control: *u8
+    msg_controllen: u64
+    msg_flags: i32
+    _pad2: i32
+
+# Handle new Valet connection
+fn handle_accept(ctx: *DaemonContext)
+    var addr: [110]u8
+    var addrlen: i32 = 110
+
+    let client_fd: i32 = syscall3(43, ctx.listen_fd as i64, @addr[0] as i64, @addrlen as i64) as i32
+    if client_fd < 0
+        return
+
+    print_str(c"zeus: accepted connection\n")
+
+    # Wait for HELLO message from client
+    var hello: ClientMessage
+    let n: i64 = sys_read(client_fd, @hello as *u8, 8)
+    if n != 8 || hello.msg_type != CLIENT_MSG_HELLO
+        print_str(c"zeus: invalid handshake\n")
+        sys_close(client_fd)
+        return
+
+    if hello.version != ZEUS_PROTOCOL_VERSION
+        print_str(c"zeus: protocol version mismatch\n")
+        sys_close(client_fd)
+        return
+
+    # Send WELCOME response with worker count
+    var welcome: DaemonMessage
+    welcome.msg_type = DAEMON_MSG_WELCOME
+    welcome._pad1 = 0
+    welcome.payload_len = 0
+    welcome.worker_idx = daemon_get_running_worker_count(ctx)
+    welcome.shm_size = 0
+    sys_write(client_fd, @welcome as *u8, 16)
+
+    # Send WORKER_INFO + fd for each running worker
+    send_worker_info(ctx, client_fd)
+
+    print_str(c"zeus: handshake complete\n")
+    # Keep connection open - client may request more workers later
+    # For now, close it (TODO: keep alive for wakeup signaling)
+    sys_close(client_fd)
+
+# Send worker shm fds to client
+fn send_worker_info(ctx: *DaemonContext, client_fd: i32)
+    var i: i32 = 0
+    while i < MAX_WORKERS
+        let slot: *WorkerSlot = daemon_get_worker_slot(ctx, i)
+        if slot != null && slot.state == WORKER_SLOT_RUNNING
+            # Send WORKER_INFO message with fd via SCM_RIGHTS
+            var msg: DaemonMessage
+            msg.msg_type = DAEMON_MSG_WORKER_INFO
+            msg._pad1 = 0
+            msg.payload_len = 8
+            msg.worker_idx = i
+            msg.shm_size = slot.shm.size
+
+            send_msg_with_fd(client_fd, @msg, slot.shm.fd)
+        i = i + 1
+
+# Send a DaemonMessage with an fd attached via SCM_RIGHTS
+fn send_msg_with_fd(sock: i32, msg: *DaemonMessage, fd: i32)
+    var iov: IoVec
+    iov.iov_base = msg as *u8
+    iov.iov_len = 16  # sizeof(DaemonMessage)
+
+    # Control message buffer: cmsghdr (16 bytes) + fd (4 bytes) + padding
+    var cmsg_buf: [24]u8
+    var j: i32 = 0
+    while j < 24
+        cmsg_buf[j] = 0
+        j = j + 1
+
+    # cmsg_len = 20 (CMSG_LEN(sizeof(int)))
+    let cmsg_len_ptr: *u64 = @cmsg_buf[0] as *u64
+    *cmsg_len_ptr = 20
+
+    # cmsg_level = SOL_SOCKET
+    let level_ptr: *i32 = @cmsg_buf[8] as *i32
+    *level_ptr = SOL_SOCKET
+
+    # cmsg_type = SCM_RIGHTS
+    let type_ptr: *i32 = @cmsg_buf[12] as *i32
+    *type_ptr = SCM_RIGHTS
+
+    # fd at offset 16
+    let fd_ptr: *i32 = @cmsg_buf[16] as *i32
+    *fd_ptr = fd
+
+    var hdr: MsgHdr
+    hdr.msg_name = null
+    hdr.msg_namelen = 0
+    hdr.msg_iov = @iov
+    hdr.msg_iovlen = 1
+    hdr.msg_control = @cmsg_buf[0]
+    hdr.msg_controllen = 24  # CMSG_SPACE(sizeof(int))
+    hdr.msg_flags = 0
+
+    syscall3(SYS_SENDMSG, sock as i64, @hdr as i64, 0)
+
+# Check worker health and respawn if needed
+fn check_workers(ctx: *DaemonContext)
+    var i: i32 = 0
+    while i < MAX_WORKERS
+        let slot: *WorkerSlot = daemon_get_worker_slot(ctx, i)
+        if slot == null
+            i = i + 1
+            continue
+
+        if slot.state == WORKER_SLOT_RUNNING
+            # Check if process is still alive
+            let result: i32 = sys_kill(slot.pid, 0)
+            if result < 0
+                # Process is dead - respawn it
+                print_str(c"zeus: worker ")
+                print_i32(i)
+                print_str(c" died, respawning...\n")
+
+                # Re-prepare the slot (reinitialize control block)
+                daemon_prepare_worker(ctx, i)
+
+                # Spawn new worker
+                let pid: i32 = spawn_worker(slot.shm.fd, slot.shm.size, i, g_app_module)
+                if pid > 0
+                    daemon_mark_worker_running(ctx, i, pid)
+                    print_str(c"zeus: respawned worker ")
+                    print_i32(i)
+                    print_str(c" (pid ")
+                    print_i32(pid)
+                    print_str(c")\n")
+                else
+                    print_str(c"zeus: failed to respawn worker\n")
+                    slot.state = WORKER_SLOT_DEAD
+
+        i = i + 1
+
+# Initiate graceful shutdown
+fn initiate_shutdown(ctx: *DaemonContext)
+    daemon_stop(ctx)
+
+    # Request all workers to stop
+    var i: i32 = 0
+    while i < MAX_WORKERS
+        let slot: *WorkerSlot = daemon_get_worker_slot(ctx, i)
+        if slot != null && slot.state == WORKER_SLOT_RUNNING
+            daemon_request_worker_stop(ctx, i)
+        i = i + 1
+
+# Initiate hot reload - restart all workers one by one
+fn initiate_hot_reload(ctx: *DaemonContext)
+    var i: i32 = 0
+    while i < MAX_WORKERS
+        let slot: *WorkerSlot = daemon_get_worker_slot(ctx, i)
+        if slot == null
+            i = i + 1
+            continue
+
+        if slot.state == WORKER_SLOT_RUNNING
+            # Signal worker to stop gracefully
+            daemon_request_worker_stop(ctx, i)
+
+            # Wait briefly for worker to exit (non-blocking check)
+            var attempts: i32 = 0
+            while attempts < 50  # ~500ms total
+                let result: i32 = sys_kill(slot.pid, 0)
+                if result < 0
+                    # Worker exited
+                    break
+                # Sleep 10ms
+                var tv: [2]i64
+                tv[0] = 0       # seconds
+                tv[1] = 10000000  # nanoseconds (10ms)
+                syscall2(35, @tv[0] as i64, 0)  # SYS_NANOSLEEP
+                attempts = attempts + 1
+
+            # Respawn worker
+            print_str(c"zeus: reloading worker ")
+            print_i32(i)
+            print_str(c"\n")
+
+            daemon_prepare_worker(ctx, i)
+            let pid: i32 = spawn_worker(slot.shm.fd, slot.shm.size, i, g_app_module)
+            if pid > 0
+                daemon_mark_worker_running(ctx, i, pid)
+            else
+                print_str(c"zeus: failed to reload worker\n")
+                slot.state = WORKER_SLOT_DEAD
+
+        i = i + 1
+
+    print_str(c"zeus: hot reload complete\n")
+
+# ============================================================================
+# Startup
+# ============================================================================
+
+fn spawn_workers(ctx: *DaemonContext, opts: *ZeusOptions) -> i32
+    print_str(c"zeus: spawning workers...\n")
+
+    var i: i32 = 0
+    while i < opts.worker_count
+        let slot_idx: i32 = daemon_alloc_worker_slot(ctx)
+        if slot_idx < 0
+            print_str(c"zeus: failed to allocate worker slot\n")
+            return -1
+
+        let result: i32 = daemon_prepare_worker(ctx, slot_idx)
+        if result < 0
+            print_str(c"zeus: failed to prepare worker\n")
+            return -1
+
+        # Fork worker
+        let slot: *WorkerSlot = daemon_get_worker_slot(ctx, slot_idx)
+        let pid: i32 = spawn_worker(slot.shm.fd, slot.shm.size, slot_idx, opts.app_module)
+        if pid < 0
+            print_str(c"zeus: failed to spawn worker\n")
+            return -1
+
+        daemon_mark_worker_running(ctx, slot_idx, pid)
+        print_str(c"zeus: spawned worker ")
+        print_i32(slot_idx)
+        print_str(c" (pid ")
+        print_i32(pid)
+        print_str(c")\n")
+
+        i = i + 1
+
+    return 0
+
+fn print_usage()
+    print_str(c"Usage: zeus [options] <app-module>\n")
+    print_str(c"\n")
+    print_str(c"Options:\n")
+    print_str(c"  -w <count>     Number of workers (default: 4)\n")
+    print_str(c"  -m <bytes>     Shared memory size per worker (default: 2MB)\n")
+    print_str(c"  -r <capacity>  Ring buffer capacity (default: 256)\n")
+    print_str(c"  -s <path>      Unix socket path (default: /run/zeus/zeus.sock)\n")
+    print_str(c"  -p <path>      PID file path (default: /run/zeus/zeus.pid)\n")
+    print_str(c"  -f             Run in foreground (don't daemonize)\n")
+    print_str(c"  -v             Verbose logging\n")
+    print_str(c"  -h, --help     Show this help\n")
+
+# ============================================================================
+# Poll structures
+# ============================================================================
+
+struct PollFd
+    fd: i32
+    events: i16
+    revents: i16
+
+fn sys_poll(fds: *PollFd, nfds: i32, timeout: i32) -> i32
+    return syscall3(7, fds as i64, nfds as i64, timeout as i64) as i32
+
+# ============================================================================
+# Entry Point
+# ============================================================================
+
+pub fn main(argc: i32, argv: **u8) -> i32
+    print_str(c"zeus: starting\n")
+
+    # Parse arguments
+    var opts: ZeusOptions
+    zeus_options_init(@opts)
+
+    let parse_result: i32 = zeus_parse_args(@opts, argc, argv)
+    if parse_result < 0
+        print_str(c"zeus: invalid arguments\n")
+        print_usage()
+        return 1
+    if parse_result > 0
+        print_usage()
+        return 0
+
+    # Check we have an app module
+    if opts.app_module == null
+        print_str(c"zeus: no application module specified\n")
+        print_usage()
+        return 1
+
+    # Store app module globally for respawning
+    g_app_module = opts.app_module
+
+    # Initialize daemon
+    var cfg: DaemonConfig
+    daemon_config_init(@cfg)
+    cfg.worker_count = opts.worker_count
+    cfg.shm_size = opts.shm_size
+    cfg.ring_capacity = opts.ring_capacity
+    cfg.socket_path = opts.socket_path
+
+    let init_result: i32 = daemon_init(@g_daemon, @cfg)
+    if init_result < 0
+        print_str(c"zeus: failed to initialize daemon\n")
+        return 1
+
+    # Store signal pipe fds globally
+    g_signal_pipe_read = g_daemon.signal_read_fd
+    g_signal_pipe_write = g_daemon.signal_write_fd
+
+    # Create socket
+    let sock_result: i32 = daemon_create_socket(@g_daemon, opts.socket_path)
+    if sock_result < 0
+        print_str(c"zeus: failed to create socket\n")
+        daemon_destroy(@g_daemon)
+        return 1
+    print_str(c"zeus: listening on socket\n")
+
+    # Start daemon
+    daemon_start(@g_daemon)
+
+    # Spawn workers
+    let spawn_result: i32 = spawn_workers(@g_daemon, @opts)
+    if spawn_result < 0
+        print_str(c"zeus: failed to spawn workers\n")
+        daemon_destroy(@g_daemon)
+        return 1
+
+    # Mark running
+    daemon_set_running(@g_daemon)
+    print_str(c"zeus: ")
+    print_i32(opts.worker_count)
+    print_str(c" workers running\n")
+
+    # Enter event loop
+    let loop_result: i32 = run_event_loop(@g_daemon, @opts)
+
+    # Cleanup
+    print_str(c"zeus: shutting down\n")
+    daemon_destroy(@g_daemon)
+
+    # Remove socket file
+    sys_unlink(opts.socket_path)
+
+    print_str(c"zeus: done\n")
+    return loop_result

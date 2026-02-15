@@ -1,0 +1,356 @@
+# spire/router/mod.ritz
+#
+# Router module - HTTP request routing
+#
+# Routes incoming requests to handlers based on method and path patterns.
+# Supports path parameters (e.g., /users/:id) and middleware.
+#
+# Example:
+#
+#   var router: Router = router_new()
+#   let home_path: StrView = "/"
+#   let users_path: StrView = "/users/:id"
+#   router_get(@router, @home_path, home_handler)
+#   router_get(@router, @users_path, user_handler)
+#
+# Note: When closures are available (Ritz issue #121), handlers will
+# be able to capture context.
+
+import ritzlib.option
+import ritzlib.strview { StrView, strview_from_ptr, strview_len }
+import ritzlib.string { String, string_new, string_from_strview, string_push, string_len }
+import ritzlib.gvec { Vec, vec_new, vec_push, vec_get, vec_get_ptr, vec_len }
+
+import http.types { METHOD_GET, METHOD_POST, METHOD_PUT, METHOD_PATCH, METHOD_DELETE, METHOD_HEAD, METHOD_OPTIONS, METHOD_TRACE, METHOD_CONNECT }
+import lib.http.request { Request }
+import lib.http.response { Response, response_not_found }
+import lib.utils { string_as_strview, strview_eq }
+
+# ============================================================================
+# Handler Type
+# ============================================================================
+
+# Handler function signature
+# Takes a pointer to request, returns a response
+pub type Handler = fn(*Request) -> Response
+
+# ============================================================================
+# Route
+# ============================================================================
+
+# A single route definition
+pub struct Route
+    method: i32
+    pattern: String
+    segments: Vec<Segment>
+    handler: Handler
+
+# Segment kind enum
+pub enum SegmentKind
+    KindStatic
+    KindParam
+    KindWildcard
+
+# A path segment - either static text or a parameter
+pub struct Segment
+    kind: SegmentKind
+    value: String
+
+# Create static segment
+fn segment_static(s: *StrView) -> Segment
+    var seg: Segment
+    seg.kind = KindStatic
+    seg.value = string_from_strview(s)
+    return seg
+
+# Create param segment
+fn segment_param(s: *StrView) -> Segment
+    var seg: Segment
+    seg.kind = KindParam
+    seg.value = string_from_strview(s)
+    return seg
+
+# Create wildcard segment
+fn segment_wildcard() -> Segment
+    var seg: Segment
+    seg.kind = KindWildcard
+    seg.value = string_new()
+    return seg
+
+# Parse a pattern into segments
+fn parse_pattern(pattern: *StrView) -> Vec<Segment>
+    var segments: Vec<Segment> = vec_new<Segment>()
+    var i: i64 = 0
+    var start: i64 = 0
+
+    # Skip leading slash
+    if pattern.len > 0 and *(pattern.ptr) == 47  # '/'
+        i = 1
+        start = 1
+
+    while i < pattern.len
+        let c: u8 = *(pattern.ptr + i)
+
+        if c == 47  # '/'
+            if i > start
+                let seg: StrView = strview_from_ptr(pattern.ptr + start, i - start)
+                vec_push<Segment>(@segments, parse_segment(@seg))
+            i += 1
+            start = i
+        else
+            i += 1
+
+    # Handle last segment
+    if i > start
+        let seg: StrView = strview_from_ptr(pattern.ptr + start, i - start)
+        vec_push<Segment>(@segments, parse_segment(@seg))
+
+    return segments
+
+fn parse_segment(s: *StrView) -> Segment
+    if s.len == 0
+        let empty: StrView = ""
+        return segment_static(@empty)
+    if *(s.ptr) == 58  # ':'
+        let param_name: StrView = strview_from_ptr(s.ptr + 1, s.len - 1)
+        return segment_param(@param_name)
+    if *(s.ptr) == 42  # '*'
+        return segment_wildcard()
+    return segment_static(s)
+
+# ============================================================================
+# Router
+# ============================================================================
+
+pub struct Router
+    routes: Vec<Route>
+    not_found_handler: Option<Handler>
+
+# Create a new router
+pub fn router_new() -> Router
+    var r: Router
+    r.routes = vec_new<Route>()
+    r.not_found_handler = None
+    return r
+
+# Add a route
+pub fn router_route(self:& Router, method: i32, pattern: *StrView, handler: Handler)
+    let segments: Vec<Segment> = parse_pattern(pattern)
+    var route: Route
+    route.method = method
+    route.pattern = string_from_strview(pattern)
+    route.segments = segments
+    route.handler = handler
+    vec_push<Route>(@self.routes, route)
+
+# Convenience methods for common HTTP methods
+pub fn router_get(self:& Router, pattern: *StrView, handler: Handler)
+    router_route(self, METHOD_GET, pattern, handler)
+
+pub fn router_post(self:& Router, pattern: *StrView, handler: Handler)
+    router_route(self, METHOD_POST, pattern, handler)
+
+pub fn router_put(self:& Router, pattern: *StrView, handler: Handler)
+    router_route(self, METHOD_PUT, pattern, handler)
+
+pub fn router_patch(self:& Router, pattern: *StrView, handler: Handler)
+    router_route(self, METHOD_PATCH, pattern, handler)
+
+pub fn router_delete(self:& Router, pattern: *StrView, handler: Handler)
+    router_route(self, METHOD_DELETE, pattern, handler)
+
+# Set custom 404 handler
+pub fn router_set_not_found(self:& Router, handler: Handler)
+    self.not_found_handler = Some(handler)
+
+# ============================================================================
+# Route Matching
+# ============================================================================
+
+# Result of matching a route
+pub struct RouteMatch
+    route_index: i64
+    params: Vec<RouteParam>
+
+pub struct RouteParam
+    name: String
+    value: String
+
+# Match a request path against route patterns
+fn match_route(router: *Router, method: i32, path: *StrView) -> Option<RouteMatch>
+    var i: i64 = 0
+    while i < vec_len<Route>(@router.routes)
+        let route: *Route = vec_get_ptr<Route>(@router.routes, i)
+
+        # Check method first
+        if method_matches(route.method, method) == 0
+            i += 1
+            continue
+
+        # Try to match path
+        var params: Vec<RouteParam> = vec_new<RouteParam>()
+        if match_path_into(@route.segments, path, @params) == 1
+            var rm: RouteMatch
+            rm.route_index = i
+            rm.params = params
+            return Some(rm)
+
+        i += 1
+
+    return None
+
+fn method_matches(route_method: i32, request_method: i32) -> i32
+    # HEAD requests can match GET routes
+    if request_method == METHOD_HEAD
+        if route_method == METHOD_GET or route_method == METHOD_HEAD
+            return 1
+        return 0
+
+    return (route_method == request_method) as i32
+
+# Method constants are already i32, just return directly
+fn method_ordinal(m: i32) -> i32
+    return m
+
+# Match a path against route segments, extracting params
+# Returns 1 on success, 0 on failure
+fn match_path_into(segments: *Vec<Segment>, path: *StrView, params:& Vec<RouteParam>) -> i32
+    var path_segments: Vec<StrView> = split_path(path)
+
+    var i: i64 = 0
+    var j: i64 = 0
+
+    while i < vec_len<Segment>(segments)
+        let seg: *Segment = vec_get_ptr<Segment>(segments, i)
+
+        if match_segment_kind_static(seg) == 1
+            if j >= vec_len<StrView>(@path_segments)
+                return 0
+            let actual: StrView = vec_get<StrView>(@path_segments, j)
+            let expected_sv: StrView = string_as_strview(@seg.value)
+            if strview_eq(@expected_sv, @actual) == 0
+                return 0
+            j += 1
+        else if match_segment_kind_param(seg) == 1
+            if j >= vec_len<StrView>(@path_segments)
+                return 0
+            let value: StrView = vec_get<StrView>(@path_segments, j)
+            var rp: RouteParam
+            rp.name = string_clone(@seg.value)
+            rp.value = string_from_strview(@value)
+            vec_push<RouteParam>(params, rp)
+            j += 1
+        else if match_segment_kind_wildcard(seg) == 1
+            if j >= vec_len<StrView>(@path_segments)
+                return 0
+            # Capture rest as single param named "*"
+            var rest: String = string_new()
+            while j < vec_len<StrView>(@path_segments)
+                if string_len(@rest) > 0
+                    string_push(@rest, 47)  # '/'
+                let part: StrView = vec_get<StrView>(@path_segments, j)
+                string_push_strview(@rest, @part)
+                j += 1
+            var rp: RouteParam
+            let wildcard_name: StrView = "*"
+            rp.name = string_from_strview(@wildcard_name)
+            rp.value = rest
+            vec_push<RouteParam>(params, rp)
+
+        i += 1
+
+    # All segments matched, check no extra path segments
+    if j != vec_len<StrView>(@path_segments)
+        return 0
+
+    return 1
+
+fn match_segment_kind_static(seg: *Segment) -> i32
+    match seg.kind
+        KindStatic => 1
+        _ => 0
+
+fn match_segment_kind_param(seg: *Segment) -> i32
+    match seg.kind
+        KindParam => 1
+        _ => 0
+
+fn match_segment_kind_wildcard(seg: *Segment) -> i32
+    match seg.kind
+        KindWildcard => 1
+        _ => 0
+
+# Split path into segments
+fn split_path(path: *StrView) -> Vec<StrView>
+    var result: Vec<StrView> = vec_new<StrView>()
+    var i: i64 = 0
+    var start: i64 = 0
+
+    # Skip leading slash
+    if path.len > 0 and *(path.ptr) == 47
+        i = 1
+        start = 1
+
+    while i < path.len
+        if *(path.ptr + i) == 47  # '/'
+            if i > start
+                vec_push<StrView>(@result, strview_from_ptr(path.ptr + start, i - start))
+            i += 1
+            start = i
+        else
+            i += 1
+
+    # Handle last segment
+    if i > start
+        vec_push<StrView>(@result, strview_from_ptr(path.ptr + start, i - start))
+
+    return result
+
+# Helper to clone a String
+fn string_clone(s: *String) -> String
+    let sv: StrView = string_as_strview(s)
+    return string_from_strview(@sv)
+
+# Helper to push strview to string
+fn string_push_strview(s:& String, sv: *StrView)
+    var i: i64 = 0
+    while i < sv.len
+        string_push(s, *(sv.ptr + i))
+        i += 1
+
+# Helper to create string from strview
+fn string_from_sv(sv: *StrView) -> String
+    return string_from_strview(sv)
+
+# ============================================================================
+# Request Handling
+# ============================================================================
+
+# Handle a request, returning a response
+pub fn router_handle(self: *Router, request: *Request) -> Response
+    let path: StrView = request_path_strview(request)
+    let method: i32 = request.method
+
+    match match_route(self, method, @path)
+        Some(route_match) => handle_matched_route(self, request, @route_match)
+        None => handle_not_found(self, request)
+
+fn handle_matched_route(router: *Router, request: *Request, route_match: *RouteMatch) -> Response
+    # TODO: Inject params into request (needs type compatibility fix)
+    # Currently params are stored in RouteMatch but not injected
+
+    # Call handler
+    let route: *Route = vec_get_ptr<Route>(@router.routes, route_match.route_index)
+    return (route.handler)(request)
+
+fn handle_not_found(router: *Router, request: *Request) -> Response
+    match router.not_found_handler
+        Some(handler) => handler(request)
+        None => response_not_found()
+
+# Helper to get path as strview from request
+fn request_path_strview(request: *Request) -> StrView
+    var sv: StrView
+    sv.ptr = request.path.data.data
+    sv.len = request.path.data.len
+    return sv

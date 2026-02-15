@@ -1,0 +1,521 @@
+# lib/protocol.ritz - Wire protocol for mausoleum database
+#
+# Binary protocol design:
+#
+# Message format:
+#   [4 bytes] magic: 0x4D375350 ("M7SP" - Mausoleum 7 Server Protocol)
+#   [4 bytes] length: Total message length including header
+#   [1 byte]  version: Protocol version (1)
+#   [1 byte]  msg_type: Message type
+#   [2 bytes] flags: Message flags
+#   [4 bytes] request_id: Client-assigned request ID for correlation
+#   [N bytes] payload: Message-specific data
+#
+# Request types:
+#   0x01: PING       - Check server health
+#   0x02: CONNECT    - Establish session
+#   0x03: DISCONNECT - End session
+#   0x10: INSERT     - Insert document
+#   0x11: GET        - Get document by ID
+#   0x12: UPDATE     - Update document
+#   0x13: DELETE     - Delete document
+#   0x20: QUERY      - Execute query
+#   0x21: QUERY_NEXT - Fetch next batch
+#   0x30: INDEX_CREATE - Create index
+#   0x31: INDEX_DROP   - Drop index
+#   0x40: TXN_BEGIN  - Begin transaction
+#   0x41: TXN_COMMIT - Commit transaction
+#   0x42: TXN_ABORT  - Abort transaction
+#
+# Response types (0x80 | request_type):
+#   0x81: PONG       - Response to PING
+#   0x82: CONNECTED  - Session established
+#   0x83: DISCONNECTED
+#   0x90: INSERT_OK  - Insert result
+#   0x91: GET_OK     - Get result
+#   0x92: UPDATE_OK  - Update result
+#   0x93: DELETE_OK  - Delete result
+#   0xA0: QUERY_RESULT - Query results
+#   0xA1: QUERY_MORE   - More results available
+#   0xB0: INDEX_CREATED
+#   0xB1: INDEX_DROPPED
+#   0xC0: TXN_BEGUN  - Transaction started
+#   0xC1: TXN_COMMITTED
+#   0xC2: TXN_ABORTED
+#   0xFF: ERROR      - Error response
+
+import ritzlib.memory
+import ritzlib.str
+
+# ============================================================================
+# Protocol constants
+# ============================================================================
+
+pub const PROTO_MAGIC: i32 = 0x4D375350  # "M7SP"
+pub const PROTO_VERSION: i32 = 1
+pub const PROTO_HEADER_SIZE: i32 = 16
+pub const PROTO_MAX_MESSAGE_SIZE: i32 = 16777216  # 16 MB max message
+
+# Request message types
+pub const MSG_PING: i32 = 0x01
+pub const MSG_CONNECT: i32 = 0x02
+pub const MSG_DISCONNECT: i32 = 0x03
+pub const MSG_INSERT: i32 = 0x10
+pub const MSG_GET: i32 = 0x11
+pub const MSG_UPDATE: i32 = 0x12
+pub const MSG_DELETE: i32 = 0x13
+pub const MSG_QUERY: i32 = 0x20
+pub const MSG_QUERY_NEXT: i32 = 0x21
+pub const MSG_INDEX_CREATE: i32 = 0x30
+pub const MSG_INDEX_DROP: i32 = 0x31
+pub const MSG_TXN_BEGIN: i32 = 0x40
+pub const MSG_TXN_COMMIT: i32 = 0x41
+pub const MSG_TXN_ABORT: i32 = 0x42
+
+# Response message types (0x80 | request_type)
+pub const MSG_PONG: i32 = 0x81
+pub const MSG_CONNECTED: i32 = 0x82
+pub const MSG_DISCONNECTED: i32 = 0x83
+pub const MSG_INSERT_OK: i32 = 0x90
+pub const MSG_GET_OK: i32 = 0x91
+pub const MSG_UPDATE_OK: i32 = 0x92
+pub const MSG_DELETE_OK: i32 = 0x93
+pub const MSG_QUERY_RESULT: i32 = 0xA0
+pub const MSG_QUERY_MORE: i32 = 0xA1
+pub const MSG_INDEX_CREATED: i32 = 0xB0
+pub const MSG_INDEX_DROPPED: i32 = 0xB1
+pub const MSG_TXN_BEGUN: i32 = 0xC0
+pub const MSG_TXN_COMMITTED: i32 = 0xC1
+pub const MSG_TXN_ABORTED: i32 = 0xC2
+pub const MSG_ERROR: i32 = 0xFF
+
+# Message flags
+pub const FLAG_NONE: i32 = 0x0000
+pub const FLAG_COMPRESSED: i32 = 0x0001  # Payload is compressed
+pub const FLAG_MORE_DATA: i32 = 0x0002   # More data follows
+pub const FLAG_IN_TXN: i32 = 0x0004      # Operation is within a transaction
+
+# Protocol error codes (prefixed with PROTO_ to avoid conflicts with m7m_types)
+pub const PROTO_OK: i32 = 0
+pub const PROTO_ERR_PROTOCOL: i32 = 1        # Protocol error (bad magic, version)
+pub const PROTO_ERR_MESSAGE_TOO_LARGE: i32 = 2
+pub const PROTO_ERR_INVALID_MSG_TYPE: i32 = 3
+pub const PROTO_ERR_NOT_FOUND: i32 = 4       # Document/index not found
+pub const PROTO_ERR_ALREADY_EXISTS: i32 = 5  # Duplicate key/index
+pub const PROTO_ERR_INVALID_DOCUMENT: i32 = 6
+pub const PROTO_ERR_TXN_CONFLICT: i32 = 7    # Transaction conflict
+pub const PROTO_ERR_TXN_NOT_ACTIVE: i32 = 8  # No active transaction
+pub const PROTO_ERR_INTERNAL: i32 = 9        # Internal server error
+pub const PROTO_ERR_DISCONNECTED: i32 = 10   # Client disconnected
+
+# ============================================================================
+# Message header
+# ============================================================================
+
+struct MessageHeader
+    magic: i32        # PROTO_MAGIC
+    length: i32       # Total message length
+    version: i32      # Protocol version (stored as i32 for alignment)
+    msg_type: i32     # Message type
+    flags: i32        # Message flags
+    request_id: i32   # Request correlation ID
+
+# Initialize a message header
+pub fn header_init(header: *MessageHeader, msg_type: i32, request_id: i32)
+    header.magic = PROTO_MAGIC
+    header.length = PROTO_HEADER_SIZE
+    header.version = PROTO_VERSION
+    header.msg_type = msg_type
+    header.flags = FLAG_NONE
+    header.request_id = request_id
+
+# Validate a message header
+pub fn header_validate(header: *MessageHeader) -> i32
+    if header.magic != PROTO_MAGIC
+        return PROTO_ERR_PROTOCOL
+    if header.version != PROTO_VERSION
+        return PROTO_ERR_PROTOCOL
+    if header.length < PROTO_HEADER_SIZE
+        return PROTO_ERR_PROTOCOL
+    if header.length > PROTO_MAX_MESSAGE_SIZE
+        return PROTO_ERR_MESSAGE_TOO_LARGE
+    return PROTO_OK
+
+# Check if message type is a response
+pub fn is_response(msg_type: i32) -> i32
+    if (msg_type & 0x80) != 0
+        return 1
+    return 0
+
+# Get request type from response type
+pub fn response_to_request(msg_type: i32) -> i32
+    return msg_type & 0x7F
+
+# Get response type from request type
+pub fn request_to_response(msg_type: i32) -> i32
+    return msg_type | 0x80
+
+# ============================================================================
+# Message buffer for building messages
+# ============================================================================
+
+struct MessageBuffer
+    data: *u8         # Buffer data
+    capacity: i32     # Buffer capacity
+    length: i32       # Current data length
+    header: MessageHeader  # Cached header
+
+# Initialize a stack-allocated message buffer with external storage
+pub fn msgbuf_init(buf: *MessageBuffer, data: *u8, capacity: i32)
+    buf.data = data
+    buf.capacity = capacity
+    buf.length = 0
+    memset(@buf.header as *u8, 0, 24)
+
+# Create a new message buffer
+pub fn msgbuf_new(capacity: i32) -> *MessageBuffer
+    var buf: *MessageBuffer = malloc(32) as *MessageBuffer  # sizeof(MessageBuffer)
+    if buf == null
+        return null
+
+    buf.data = malloc(capacity as i64) as *u8
+    if buf.data == null
+        free(buf as *u8)
+        return null
+
+    buf.capacity = capacity
+    buf.length = 0
+    memset(@buf.header as *u8, 0, 24)  # sizeof(MessageHeader)
+    return buf
+
+# Free a message buffer
+pub fn msgbuf_free(buf: *MessageBuffer)
+    if buf != null
+        if buf.data != null
+            free(buf.data)
+        free(buf as *u8)
+
+# Reset buffer for reuse
+pub fn msgbuf_reset(buf: *MessageBuffer)
+    buf.length = 0
+    memset(@buf.header as *u8, 0, 24)
+
+# Start building a new message
+pub fn msgbuf_start(buf: *MessageBuffer, msg_type: i32, request_id: i32)
+    msgbuf_reset(buf)
+    header_init(@buf.header, msg_type, request_id)
+    # Reserve space for header
+    buf.length = PROTO_HEADER_SIZE
+
+# Write i8 to buffer
+pub fn msgbuf_write_i8(buf: *MessageBuffer, value: i32) -> i32
+    if buf.length + 1 > buf.capacity
+        return -1
+    *(buf.data + buf.length) = value as u8
+    buf.length += 1
+    return 0
+
+# Write i32 to buffer (big-endian)
+pub fn msgbuf_write_i32(buf: *MessageBuffer, value: i32) -> i32
+    if buf.length + 4 > buf.capacity
+        return -1
+    var ptr: *u8 = buf.data + buf.length
+    *(ptr + 0) = ((value >> 24) & 0xFF) as u8
+    *(ptr + 1) = ((value >> 16) & 0xFF) as u8
+    *(ptr + 2) = ((value >> 8) & 0xFF) as u8
+    *(ptr + 3) = (value & 0xFF) as u8
+    buf.length += 4
+    return 0
+
+# Write i64 to buffer (big-endian)
+pub fn msgbuf_write_i64(buf: *MessageBuffer, value: i64) -> i32
+    if buf.length + 8 > buf.capacity
+        return -1
+    var ptr: *u8 = buf.data + buf.length
+    *(ptr + 0) = ((value >> 56) & 0xFF) as u8
+    *(ptr + 1) = ((value >> 48) & 0xFF) as u8
+    *(ptr + 2) = ((value >> 40) & 0xFF) as u8
+    *(ptr + 3) = ((value >> 32) & 0xFF) as u8
+    *(ptr + 4) = ((value >> 24) & 0xFF) as u8
+    *(ptr + 5) = ((value >> 16) & 0xFF) as u8
+    *(ptr + 6) = ((value >> 8) & 0xFF) as u8
+    *(ptr + 7) = (value & 0xFF) as u8
+    buf.length += 8
+    return 0
+
+# Write bytes to buffer (length-prefixed)
+pub fn msgbuf_write_bytes(buf: *MessageBuffer, data: *u8, len: i32) -> i32
+    if buf.length + 4 + len > buf.capacity
+        return -1
+    # Write length prefix
+    msgbuf_write_i32(buf, len)
+    # Write data
+    if len > 0
+        memcpy(buf.data + buf.length, data, len as i64)
+        buf.length += len
+    return 0
+
+# Write raw bytes (no length prefix)
+pub fn msgbuf_write_raw(buf: *MessageBuffer, data: *u8, len: i32) -> i32
+    if buf.length + len > buf.capacity
+        return -1
+    if len > 0
+        memcpy(buf.data + buf.length, data, len as i64)
+        buf.length += len
+    return 0
+
+# Finalize message (write header to beginning)
+pub fn msgbuf_finish(buf: *MessageBuffer) -> i32
+    buf.header.length = buf.length
+    # Write header to start of buffer
+    var ptr: *u8 = buf.data
+    # Magic (big-endian)
+    *(ptr + 0) = ((buf.header.magic >> 24) & 0xFF) as u8
+    *(ptr + 1) = ((buf.header.magic >> 16) & 0xFF) as u8
+    *(ptr + 2) = ((buf.header.magic >> 8) & 0xFF) as u8
+    *(ptr + 3) = (buf.header.magic & 0xFF) as u8
+    # Length (big-endian)
+    *(ptr + 4) = ((buf.header.length >> 24) & 0xFF) as u8
+    *(ptr + 5) = ((buf.header.length >> 16) & 0xFF) as u8
+    *(ptr + 6) = ((buf.header.length >> 8) & 0xFF) as u8
+    *(ptr + 7) = (buf.header.length & 0xFF) as u8
+    # Version
+    *(ptr + 8) = buf.header.version as u8
+    # Message type
+    *(ptr + 9) = buf.header.msg_type as u8
+    # Flags (big-endian 16-bit)
+    *(ptr + 10) = ((buf.header.flags >> 8) & 0xFF) as u8
+    *(ptr + 11) = (buf.header.flags & 0xFF) as u8
+    # Request ID (big-endian)
+    *(ptr + 12) = ((buf.header.request_id >> 24) & 0xFF) as u8
+    *(ptr + 13) = ((buf.header.request_id >> 16) & 0xFF) as u8
+    *(ptr + 14) = ((buf.header.request_id >> 8) & 0xFF) as u8
+    *(ptr + 15) = (buf.header.request_id & 0xFF) as u8
+    return 0
+
+# Get message data pointer
+pub fn msgbuf_data(buf: *MessageBuffer) -> *u8
+    return buf.data
+
+# Get message length
+pub fn msgbuf_len(buf: *MessageBuffer) -> i32
+    return buf.length
+
+# ============================================================================
+# Message reader for parsing messages
+# ============================================================================
+
+struct MessageReader
+    data: *u8         # Message data
+    length: i32       # Total message length
+    pos: i32          # Current read position
+    header: MessageHeader  # Parsed header
+
+# Initialize reader from raw data
+pub fn msgreader_init(reader: *MessageReader, data: *u8, length: i32) -> i32
+    if length < PROTO_HEADER_SIZE
+        return PROTO_ERR_PROTOCOL
+
+    reader.data = data
+    reader.length = length
+    reader.pos = PROTO_HEADER_SIZE  # Start after header
+
+    # Parse header
+    var ptr: *u8 = data
+    reader.header.magic = (*(ptr + 0) as i32) << 24
+    reader.header.magic = reader.header.magic | ((*(ptr + 1) as i32) << 16)
+    reader.header.magic = reader.header.magic | ((*(ptr + 2) as i32) << 8)
+    reader.header.magic = reader.header.magic | (*(ptr + 3) as i32)
+
+    reader.header.length = (*(ptr + 4) as i32) << 24
+    reader.header.length = reader.header.length | ((*(ptr + 5) as i32) << 16)
+    reader.header.length = reader.header.length | ((*(ptr + 6) as i32) << 8)
+    reader.header.length = reader.header.length | (*(ptr + 7) as i32)
+
+    reader.header.version = *(ptr + 8) as i32
+    reader.header.msg_type = *(ptr + 9) as i32
+
+    reader.header.flags = (*(ptr + 10) as i32) << 8
+    reader.header.flags = reader.header.flags | (*(ptr + 11) as i32)
+
+    reader.header.request_id = (*(ptr + 12) as i32) << 24
+    reader.header.request_id = reader.header.request_id | ((*(ptr + 13) as i32) << 16)
+    reader.header.request_id = reader.header.request_id | ((*(ptr + 14) as i32) << 8)
+    reader.header.request_id = reader.header.request_id | (*(ptr + 15) as i32)
+
+    return header_validate(@reader.header)
+
+# Read i8 from reader
+pub fn msgreader_read_i8(reader: *MessageReader) -> i32
+    if reader.pos + 1 > reader.length
+        return -1
+    let value: i32 = *(reader.data + reader.pos) as i32
+    reader.pos += 1
+    return value
+
+# Read i32 from reader (big-endian)
+pub fn msgreader_read_i32(reader: *MessageReader) -> i32
+    if reader.pos + 4 > reader.length
+        return -1
+    var ptr: *u8 = reader.data + reader.pos
+    var value: i32 = (*(ptr + 0) as i32) << 24
+    value = value | ((*(ptr + 1) as i32) << 16)
+    value = value | ((*(ptr + 2) as i32) << 8)
+    value = value | (*(ptr + 3) as i32)
+    reader.pos += 4
+    return value
+
+# Read i64 from reader (big-endian)
+pub fn msgreader_read_i64(reader: *MessageReader) -> i64
+    if reader.pos + 8 > reader.length
+        return -1
+    var ptr: *u8 = reader.data + reader.pos
+    var value: i64 = (*(ptr + 0) as i64) << 56
+    value = value | ((*(ptr + 1) as i64) << 48)
+    value = value | ((*(ptr + 2) as i64) << 40)
+    value = value | ((*(ptr + 3) as i64) << 32)
+    value = value | ((*(ptr + 4) as i64) << 24)
+    value = value | ((*(ptr + 5) as i64) << 16)
+    value = value | ((*(ptr + 6) as i64) << 8)
+    value = value | (*(ptr + 7) as i64)
+    reader.pos += 8
+    return value
+
+# Read bytes (returns pointer to data in buffer, sets out_len)
+pub fn msgreader_read_bytes(reader: *MessageReader, out_len: *i32) -> *u8
+    let len: i32 = msgreader_read_i32(reader)
+    if len < 0
+        return null
+    *out_len = len
+    if len == 0
+        return null
+    if reader.pos + len > reader.length
+        return null
+    var ptr: *u8 = reader.data + reader.pos
+    reader.pos += len
+    return ptr
+
+# Get remaining bytes in reader
+pub fn msgreader_remaining(reader: *MessageReader) -> i32
+    return reader.length - reader.pos
+
+# Get message type from reader
+pub fn msgreader_msg_type(reader: *MessageReader) -> i32
+    return reader.header.msg_type
+
+# Get request ID from reader
+pub fn msgreader_request_id(reader: *MessageReader) -> i32
+    return reader.header.request_id
+
+# Get flags from reader
+pub fn msgreader_flags(reader: *MessageReader) -> i32
+    return reader.header.flags
+
+# ============================================================================
+# Convenience functions for building common messages
+# ============================================================================
+
+# Build PING message
+pub fn build_ping(buf: *MessageBuffer, request_id: i32) -> i32
+    msgbuf_start(buf, MSG_PING, request_id)
+    return msgbuf_finish(buf)
+
+# Build PONG response
+pub fn build_pong(buf: *MessageBuffer, request_id: i32) -> i32
+    msgbuf_start(buf, MSG_PONG, request_id)
+    return msgbuf_finish(buf)
+
+# Build CONNECT message
+pub fn build_connect(buf: *MessageBuffer, request_id: i32, collection_name: *u8, name_len: i32) -> i32
+    msgbuf_start(buf, MSG_CONNECT, request_id)
+    msgbuf_write_bytes(buf, collection_name, name_len)
+    return msgbuf_finish(buf)
+
+# Build CONNECTED response
+pub fn build_connected(buf: *MessageBuffer, request_id: i32, session_id: i64) -> i32
+    msgbuf_start(buf, MSG_CONNECTED, request_id)
+    msgbuf_write_i64(buf, session_id)
+    return msgbuf_finish(buf)
+
+# Build ERROR response
+pub fn build_error(buf: *MessageBuffer, request_id: i32, error_code: i32, message: *u8, msg_len: i32) -> i32
+    msgbuf_start(buf, MSG_ERROR, request_id)
+    msgbuf_write_i32(buf, error_code)
+    msgbuf_write_bytes(buf, message, msg_len)
+    return msgbuf_finish(buf)
+
+# Build INSERT message (document data is already serialized)
+pub fn build_insert(buf: *MessageBuffer, request_id: i32, doc_data: *u8, doc_len: i32) -> i32
+    msgbuf_start(buf, MSG_INSERT, request_id)
+    msgbuf_write_bytes(buf, doc_data, doc_len)
+    return msgbuf_finish(buf)
+
+# Build INSERT_OK response
+pub fn build_insert_ok(buf: *MessageBuffer, request_id: i32, doc_id: i64) -> i32
+    msgbuf_start(buf, MSG_INSERT_OK, request_id)
+    msgbuf_write_i64(buf, doc_id)
+    return msgbuf_finish(buf)
+
+# Build GET message
+pub fn build_get(buf: *MessageBuffer, request_id: i32, doc_id: i64) -> i32
+    msgbuf_start(buf, MSG_GET, request_id)
+    msgbuf_write_i64(buf, doc_id)
+    return msgbuf_finish(buf)
+
+# Build GET_OK response
+pub fn build_get_ok(buf: *MessageBuffer, request_id: i32, doc_data: *u8, doc_len: i32) -> i32
+    msgbuf_start(buf, MSG_GET_OK, request_id)
+    msgbuf_write_bytes(buf, doc_data, doc_len)
+    return msgbuf_finish(buf)
+
+# Build DELETE message
+pub fn build_delete(buf: *MessageBuffer, request_id: i32, doc_id: i64) -> i32
+    msgbuf_start(buf, MSG_DELETE, request_id)
+    msgbuf_write_i64(buf, doc_id)
+    return msgbuf_finish(buf)
+
+# Build DELETE_OK response
+pub fn build_delete_ok(buf: *MessageBuffer, request_id: i32) -> i32
+    msgbuf_start(buf, MSG_DELETE_OK, request_id)
+    return msgbuf_finish(buf)
+
+# Build TXN_BEGIN message
+pub fn build_txn_begin(buf: *MessageBuffer, request_id: i32) -> i32
+    msgbuf_start(buf, MSG_TXN_BEGIN, request_id)
+    return msgbuf_finish(buf)
+
+# Build TXN_BEGUN response
+pub fn build_txn_begun(buf: *MessageBuffer, request_id: i32, txn_id: i64) -> i32
+    msgbuf_start(buf, MSG_TXN_BEGUN, request_id)
+    msgbuf_write_i64(buf, txn_id)
+    return msgbuf_finish(buf)
+
+# Build TXN_COMMIT message
+pub fn build_txn_commit(buf: *MessageBuffer, request_id: i32) -> i32
+    msgbuf_start(buf, MSG_TXN_COMMIT, request_id)
+    return msgbuf_finish(buf)
+
+# Build TXN_COMMITTED response
+pub fn build_txn_committed(buf: *MessageBuffer, request_id: i32) -> i32
+    msgbuf_start(buf, MSG_TXN_COMMITTED, request_id)
+    return msgbuf_finish(buf)
+
+# Build TXN_ABORT message
+pub fn build_txn_abort(buf: *MessageBuffer, request_id: i32) -> i32
+    msgbuf_start(buf, MSG_TXN_ABORT, request_id)
+    return msgbuf_finish(buf)
+
+# Build TXN_ABORTED response
+pub fn build_txn_aborted(buf: *MessageBuffer, request_id: i32) -> i32
+    msgbuf_start(buf, MSG_TXN_ABORTED, request_id)
+    return msgbuf_finish(buf)
+
+# Build DISCONNECT request
+pub fn build_disconnect(buf: *MessageBuffer, request_id: i32) -> i32
+    msgbuf_start(buf, MSG_DISCONNECT, request_id)
+    return msgbuf_finish(buf)
+
+# Build DISCONNECTED response
+pub fn build_disconnected(buf: *MessageBuffer, request_id: i32) -> i32
+    msgbuf_start(buf, MSG_DISCONNECTED, request_id)
+    return msgbuf_finish(buf)

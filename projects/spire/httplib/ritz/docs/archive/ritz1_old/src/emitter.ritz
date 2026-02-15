@@ -1,0 +1,2602 @@
+# ritz1/src/emitter.ritz - LLVM IR text generation
+#
+# Generates LLVM IR as text strings. This is the final stage of the
+# ritz1 compiler pipeline: source -> lexer -> parser -> checker -> emitter -> IR
+#
+# The IR can then be compiled with llc + gcc/ld to produce an executable.
+
+import types  # For TY_* type kind constants
+
+# =============================================================================
+# IR String Builder
+# =============================================================================
+#
+# We build IR as a buffer of bytes. The arena provides memory for the buffer.
+# We track position and grow as needed.
+
+# NOTE: Using i64 for all non-pointer fields to ensure 8-byte alignment for ritz1 self-hosting
+struct IRBuilder
+  buf: *i8       # Output buffer
+  len: i64       # Current length
+  cap: i64       # Capacity
+  arena: *Arena  # Memory source
+  next_id: i64   # Next SSA value ID (%1, %2, etc.)
+  next_label: i64 # Next basic block label ID (L0, L1, etc.)
+  indent: i64    # Current indentation level
+  consts: *i8    # Pointer to ConstDef linked list (from parser)
+  structs: *i8   # Pointer to StructDef linked list (from parser)
+
+# ConstDef layout (from parser.ritz):
+# - name: *i8 at offset 0
+# - name_len: i32 at offset 8 (with padding)
+# - value: i64 at offset 16
+# - next: *ConstDef at offset 24
+
+# Create a new IR builder with given capacity
+fn ir_builder_new(arena: *Arena, capacity: i64) -> *IRBuilder
+  let b: *IRBuilder = arena_alloc(arena, 64) as *IRBuilder
+  b.buf = arena_alloc(arena, capacity)
+  b.len = 0
+  b.cap = capacity
+  b.arena = arena
+  b.next_id = 1
+  b.next_label = 0
+  b.indent = 0
+  b.consts = 0 as *i8
+  b.structs = 0 as *i8
+  b
+
+# Get a fresh SSA value name like "%1", "%2", etc.
+fn ir_fresh_id(b: *IRBuilder) -> i32
+  let id: i32 = b.next_id
+  b.next_id = b.next_id + 1
+  id
+
+# Get a fresh basic block label ID like L0, L1, etc.
+fn ir_fresh_label(b: *IRBuilder) -> i32
+  let id: i32 = b.next_label
+  b.next_label = b.next_label + 1
+  id
+
+# Reset SSA counter (for new function)
+fn ir_reset_ids(b: *IRBuilder) -> i32
+  b.next_id = 1
+  b.next_label = 0
+  0
+
+# Register constants from parser's ConstDef list
+fn ir_add_consts(b: *IRBuilder, consts: *i8) -> i32
+  # Append new constants to existing list
+  if consts == 0 as *i8
+    return 0
+  if b.consts == 0 as *i8
+    b.consts = consts
+    return 0
+  # Find end of existing list and append
+  var cur: *i8 = b.consts
+  while 1 == 1
+    let next: *i8 = *((cur + 24) as **i8)  # ConstDef.next at offset 24
+    if next == 0 as *i8
+      *((cur + 24) as **i8) = consts
+      return 0
+    cur = next
+  0
+
+# Register struct definitions from parser's StructDef list
+fn ir_add_structs(b: *IRBuilder, structs: *i8) -> i32
+  # Append new structs to existing list
+  if structs == 0 as *i8
+    return 0
+  if b.structs == 0 as *i8
+    b.structs = structs
+    return 0
+  # Find end of existing list and append
+  # StructDef layout: name(*i8), name_len(i32), fields(*StructField), field_count(i32), next(*StructDef)
+  # next is at offset 32 (8 + 8 padded + 8 + 8)
+  var cur: *i8 = b.structs
+  while 1 == 1
+    let next: *i8 = *((cur + 32) as **i8)  # StructDef.next at offset 32
+    if next == 0 as *i8
+      *((cur + 32) as **i8) = structs
+      return 0
+    cur = next
+  0
+
+# Lookup struct by name, returns pointer to StructDef or 0
+fn ir_lookup_struct(b: *IRBuilder, name: *i8, name_len: i32) -> *i8
+  var cur: *i8 = b.structs
+  while cur != 0 as *i8
+    let sname: *i8 = *((cur + 0) as **i8)   # StructDef.name at offset 0
+    let slen: i32 = *((cur + 8) as *i64) as i32     # StructDef.name_len at offset 8 (i64)
+    if slen == name_len
+      # Compare names
+      var matched: i32 = 1
+      var i: i32 = 0
+      while i < name_len
+        if *(sname + i) != *(name + i)
+          matched = 0
+        i = i + 1
+      if matched == 1
+        return cur
+    cur = *((cur + 32) as **i8)  # next at offset 32
+  0 as *i8
+
+# Lookup field offset in a struct. Returns offset in bytes, or -1 if not found.
+# All fields are assumed to be 8 bytes (i64, ptr, or i32 padded).
+fn ir_lookup_field_offset(struct_def: *i8, field_name: *i8, field_len: i32) -> i32
+  if struct_def == 0 as *i8
+    return -1
+  # StructDef.fields is at offset 16
+  var field: *i8 = *((struct_def + 16) as **i8)
+  var offset: i32 = 0
+  # StructField layout (i64): name(*i8 at 0), name_len(i64 at 8), type_expr(*TypeExpr at 16), next(*StructField at 24)
+  while field != 0 as *i8
+    let fname: *i8 = *((field + 0) as **i8)
+    let flen: i32 = *((field + 8) as *i64) as i32
+    if flen == field_len
+      var matched: i32 = 1
+      var i: i32 = 0
+      while i < field_len
+        if *(fname + i) != *(field_name + i)
+          matched = 0
+        i = i + 1
+      if matched == 1
+        return offset
+    offset = offset + 8  # All fields are 8 bytes
+    field = *((field + 24) as **i8)  # next at offset 24
+  -1
+
+# Lookup field offset by searching all known structs for a matching field name.
+# This is a workaround for lack of proper type tracking.
+# Returns the offset in bytes, or 0 if not found (default to first field).
+fn ir_find_field_offset(b: *IRBuilder, field_name: *i8, field_len: i32) -> i32
+  var cur: *i8 = b.structs
+  while cur != 0 as *i8
+    let offset: i32 = ir_lookup_field_offset(cur, field_name, field_len)
+    if offset >= 0
+      return offset
+    cur = *((cur + 32) as **i8)  # next at offset 32
+  0  # Default to offset 0 if not found
+
+# Lookup constant by name, returns 1 if found with value in out_val
+fn ir_lookup_const(b: *IRBuilder, name: *i8, name_len: i32, out_val: *i64) -> i32
+  var cur: *i8 = b.consts
+  while cur != 0 as *i8
+    let cname: *i8 = *((cur + 0) as **i8)   # ConstDef.name at offset 0
+    let clen: i32 = *((cur + 8) as *i64) as i32     # ConstDef.name_len at offset 8 (i64)
+    if clen == name_len
+      var matched: i32 = 1
+      var i: i32 = 0
+      while i < name_len
+        if *(cname + i) != *(name + i)
+          matched = 0
+        i = i + 1
+      if matched == 1
+        *out_val = *((cur + 16) as *i64)    # ConstDef.value at offset 16
+        return 1
+    cur = *((cur + 24) as **i8)  # ConstDef.next at offset 24
+  0
+
+# Append a single byte
+fn ir_put_byte(b: *IRBuilder, ch: i32) -> i32
+  if b.len >= b.cap
+    return -1  # Buffer full
+  *(b.buf + b.len) = ch as i8
+  b.len = b.len + 1
+  0
+
+# Append a null-terminated string
+fn ir_put_str(b: *IRBuilder, s: *i8) -> i32
+  var i: i32 = 0
+  while *(s + i) != 0
+    if ir_put_byte(b, *(s + i) as i32) < 0
+      return -1
+    i = i + 1
+  0
+
+# Append a string with explicit length (not null-terminated)
+fn ir_put_str_len(b: *IRBuilder, s: *i8, len: i32) -> i32
+  var i: i32 = 0
+  while i < len
+    if ir_put_byte(b, *(s + i) as i32) < 0
+      return -1
+    i = i + 1
+  0
+
+# Append an integer as decimal string
+fn ir_put_int(b: *IRBuilder, n: i64) -> i32
+  # Handle negative
+  if n < 0
+    ir_put_byte(b, 45)  # '-'
+    return ir_put_int(b, 0 - n)
+
+  # Handle zero
+  if n == 0
+    return ir_put_byte(b, 48)  # '0'
+
+  # Build digits in reverse
+  var digits: [20]i8 = [0; 20]
+  var count: i32 = 0
+  var val: i64 = n
+
+  while val > 0
+    let digit: i32 = (val - (val / 10) * 10) as i32
+    digits[count] = (48 + digit) as i8
+    count = count + 1
+    val = val / 10
+
+  # Output in correct order
+  var i: i32 = count - 1
+  while i >= 0
+    if ir_put_byte(b, digits[i] as i32) < 0
+      return -1
+    i = i - 1
+  0
+
+# Append newline
+fn ir_newline(b: *IRBuilder) -> i32
+  ir_put_byte(b, 10)  # '\n'
+
+# Append current indentation (2 spaces per level)
+fn ir_put_indent(b: *IRBuilder) -> i32
+  var i: i32 = 0
+  while i < b.indent
+    ir_put_str(b, "  ")
+    i = i + 1
+  0
+
+# =============================================================================
+# LLVM Type Emission
+# =============================================================================
+#
+# Note: TY_* constants are imported from types.ritz
+
+# Emit LLVM type string for a Ritz type
+# Returns 0 on success, -1 on error
+fn ir_emit_type(b: *IRBuilder, kind: i32) -> i32
+  if kind == TY_VOID
+    ir_put_str(b, "void")
+  else if kind == TY_BOOL
+    ir_put_str(b, "i1")
+  else if kind == TY_I8
+    ir_put_str(b, "i8")
+  else if kind == TY_I16
+    ir_put_str(b, "i16")
+  else if kind == TY_I32
+    ir_put_str(b, "i32")
+  else if kind == TY_I64
+    ir_put_str(b, "i64")
+  else if kind == TY_U8
+    ir_put_str(b, "i8")
+  else if kind == TY_U16
+    ir_put_str(b, "i16")
+  else if kind == TY_U32
+    ir_put_str(b, "i32")
+  else if kind == TY_U64
+    ir_put_str(b, "i64")
+  else
+    # Default to i64 for unknown types (PTR, REF, STRUCT, etc.)
+    ir_put_str(b, "i64")
+
+# Emit pointer type: T*
+fn ir_emit_ptr_type(b: *IRBuilder, pointee_kind: i32) -> i32
+  ir_emit_type(b, pointee_kind)
+  ir_put_str(b, "*")
+
+# =============================================================================
+# LLVM Instruction Emission
+# =============================================================================
+
+# Emit: %id = add i32 %lhs, %rhs
+fn ir_emit_binop(b: *IRBuilder, op: *i8, ty: i32, result: i32, lhs: i32, rhs: i32) -> i32
+  ir_put_indent(b)
+  ir_put_str(b, "%")
+  ir_put_int(b, result as i64)
+  ir_put_str(b, " = ")
+  ir_put_str(b, op)
+  ir_put_str(b, " ")
+  ir_emit_type(b, ty)
+  ir_put_str(b, " %")
+  ir_put_int(b, lhs as i64)
+  ir_put_str(b, ", %")
+  ir_put_int(b, rhs as i64)
+  ir_newline(b)
+
+# Emit: %id = add i32 %lhs, <imm>
+fn ir_emit_binop_imm(b: *IRBuilder, op: *i8, ty: i32, result: i32, lhs: i32, imm: i64) -> i32
+  ir_put_indent(b)
+  ir_put_str(b, "%")
+  ir_put_int(b, result as i64)
+  ir_put_str(b, " = ")
+  ir_put_str(b, op)
+  ir_put_str(b, " ")
+  ir_emit_type(b, ty)
+  ir_put_str(b, " %")
+  ir_put_int(b, lhs as i64)
+  ir_put_str(b, ", ")
+  ir_put_int(b, imm)
+  ir_newline(b)
+
+# Emit: %tmp = icmp <cond> i64 %lhs, %rhs ; %result = zext i1 %tmp to i64
+# Comparison produces i1, then we extend to i64 so the result can be used
+# Returns the result SSA value ID (allocates its own IDs internally)
+fn ir_emit_icmp(b: *IRBuilder, cond: *i8, ty: i32, lhs: i32, rhs: i32) -> i32
+  # First emit the icmp into a temp
+  let tmp: i32 = ir_fresh_id(b)
+  ir_put_indent(b)
+  ir_put_str(b, "%")
+  ir_put_int(b, tmp as i64)
+  ir_put_str(b, " = icmp ")
+  ir_put_str(b, cond)
+  ir_put_str(b, " ")
+  ir_emit_type(b, ty)
+  ir_put_str(b, " %")
+  ir_put_int(b, lhs as i64)
+  ir_put_str(b, ", %")
+  ir_put_int(b, rhs as i64)
+  ir_newline(b)
+  # Now zext from i1 to i64
+  let result: i32 = ir_fresh_id(b)
+  ir_put_indent(b)
+  ir_put_str(b, "%")
+  ir_put_int(b, result as i64)
+  ir_put_str(b, " = zext i1 %")
+  ir_put_int(b, tmp as i64)
+  ir_put_str(b, " to i64")
+  ir_newline(b)
+  result
+
+# Emit: %id = alloca T
+fn ir_emit_alloca(b: *IRBuilder, result: i32, ty: i32) -> i32
+  ir_put_indent(b)
+  ir_put_str(b, "%")
+  ir_put_int(b, result as i64)
+  ir_put_str(b, " = alloca ")
+  ir_emit_type(b, ty)
+  ir_newline(b)
+
+# Emit: store T %val, T* %ptr
+fn ir_emit_store(b: *IRBuilder, ty: i32, val: i32, ptr: i32) -> i32
+  ir_put_indent(b)
+  ir_put_str(b, "store ")
+  ir_emit_type(b, ty)
+  ir_put_str(b, " %")
+  ir_put_int(b, val as i64)
+  ir_put_str(b, ", ")
+  ir_emit_type(b, ty)
+  ir_put_str(b, "* %")
+  ir_put_int(b, ptr as i64)
+  ir_newline(b)
+
+# Emit: store T <imm>, T* %ptr
+fn ir_emit_store_imm(b: *IRBuilder, ty: i32, imm: i64, ptr: i32) -> i32
+  ir_put_indent(b)
+  ir_put_str(b, "store ")
+  ir_emit_type(b, ty)
+  ir_put_str(b, " ")
+  ir_put_int(b, imm)
+  ir_put_str(b, ", ")
+  ir_emit_type(b, ty)
+  ir_put_str(b, "* %")
+  ir_put_int(b, ptr as i64)
+  ir_newline(b)
+
+# Emit: %id = load T, T* %ptr
+fn ir_emit_load(b: *IRBuilder, result: i32, ty: i32, ptr: i32) -> i32
+  ir_put_indent(b)
+  ir_put_str(b, "%")
+  ir_put_int(b, result as i64)
+  ir_put_str(b, " = load ")
+  ir_emit_type(b, ty)
+  ir_put_str(b, ", ")
+  ir_emit_type(b, ty)
+  ir_put_str(b, "* %")
+  ir_put_int(b, ptr as i64)
+  ir_newline(b)
+
+# Emit: ret T %val
+fn ir_emit_ret(b: *IRBuilder, ty: i32, val: i32) -> i32
+  ir_put_indent(b)
+  ir_put_str(b, "ret ")
+  ir_emit_type(b, ty)
+  ir_put_str(b, " %")
+  ir_put_int(b, val as i64)
+  ir_newline(b)
+
+# Emit: ret T <imm>
+fn ir_emit_ret_imm(b: *IRBuilder, ty: i32, imm: i64) -> i32
+  ir_put_indent(b)
+  ir_put_str(b, "ret ")
+  ir_emit_type(b, ty)
+  ir_put_str(b, " ")
+  ir_put_int(b, imm)
+  ir_newline(b)
+
+# Emit: ret void
+fn ir_emit_ret_void(b: *IRBuilder) -> i32
+  ir_put_indent(b)
+  ir_put_str(b, "ret void")
+  ir_newline(b)
+
+# Emit: br label %label
+fn ir_emit_br(b: *IRBuilder, label: *i8) -> i32
+  ir_put_indent(b)
+  ir_put_str(b, "br label %")
+  ir_put_str(b, label)
+  ir_newline(b)
+
+# Emit: br i1 %cond, label %then, label %else
+fn ir_emit_br_cond(b: *IRBuilder, cond: i32, then_label: *i8, else_label: *i8) -> i32
+  ir_put_indent(b)
+  ir_put_str(b, "br i1 %")
+  ir_put_int(b, cond as i64)
+  ir_put_str(b, ", label %")
+  ir_put_str(b, then_label)
+  ir_put_str(b, ", label %")
+  ir_put_str(b, else_label)
+  ir_newline(b)
+
+# Emit label: <name>:
+fn ir_emit_label(b: *IRBuilder, name: *i8) -> i32
+  ir_put_str(b, name)
+  ir_put_str(b, ":")
+  ir_newline(b)
+
+# =============================================================================
+# Function and Module Emission
+# =============================================================================
+
+# Emit function header: define T @name(params) {
+fn ir_emit_fn_start(b: *IRBuilder, name: *i8, ret_ty: i32) -> i32
+  ir_put_str(b, "define ")
+  ir_emit_type(b, ret_ty)
+  ir_put_str(b, " @\"")
+  ir_put_str(b, name)
+  ir_put_byte(b, 34)
+  ir_put_str(b, "(")
+  0
+
+# Emit function parameter: T %name
+fn ir_emit_fn_param(b: *IRBuilder, ty: i32, name: *i8, is_first: i32) -> i32
+  if is_first == 0
+    ir_put_str(b, ", ")
+  ir_emit_type(b, ty)
+  ir_put_str(b, " %\"")
+  ir_put_str(b, name)
+  ir_put_str(b, ".arg\"")
+  0
+
+# Emit function parameter with explicit name length: T %name.arg
+fn ir_emit_fn_param_len(b: *IRBuilder, ty: i32, name: *i8, name_len: i32, is_first: i32) -> i32
+  if is_first == 0
+    ir_put_str(b, ", ")
+  ir_emit_type(b, ty)
+  ir_put_str(b, " %\"")
+  ir_put_str_len(b, name, name_len)
+  ir_put_str(b, ".arg\"")
+  0
+
+# Emit function header end: ) {
+fn ir_emit_fn_header_end(b: *IRBuilder) -> i32
+  ir_put_str(b, ")")
+  ir_newline(b)
+  ir_put_str(b, "{")
+  ir_newline(b)
+  ir_put_str(b, "entry:")
+  ir_newline(b)
+  b.indent = 1
+  0
+
+# Emit function end: }
+fn ir_emit_fn_end(b: *IRBuilder) -> i32
+  b.indent = 0
+  ir_put_str(b, "}")
+  ir_newline(b)
+  ir_newline(b)
+
+# Emit module header
+fn ir_emit_module_header(b: *IRBuilder, name: *i8) -> i32
+  ir_put_str(b, "; Ritz compiled module")
+  ir_newline(b)
+  ir_put_str(b, "; ModuleID = \"")
+  ir_put_str(b, name)
+  ir_put_str(b, "\"")
+  ir_newline(b)
+  ir_put_str(b, "target triple = ")
+  ir_put_byte(b, 34)
+  ir_put_str(b, "x86_64-unknown-linux-gnu")
+  ir_put_byte(b, 34)
+  ir_newline(b)
+  ir_put_str(b, "target datalayout = ")
+  ir_put_byte(b, 34)
+  ir_put_byte(b, 34)
+  ir_newline(b)
+  ir_newline(b)
+
+# Emit the _start entry point for standalone executables (no args)
+fn ir_emit_start(b: *IRBuilder) -> i32
+  ir_put_str(b, "define void @_start() naked")
+  ir_newline(b)
+  ir_put_str(b, "{")
+  ir_newline(b)
+  ir_put_str(b, "entry:")
+  ir_newline(b)
+  ir_put_str(b, "  call void asm sideeffect \"")
+  ir_newline(b)
+  ir_put_str(b, "    andq $$-16, %rsp")
+  ir_newline(b)
+  ir_put_str(b, "    call main")
+  ir_newline(b)
+  ir_put_str(b, "    movq %rax, %rdi")
+  ir_newline(b)
+  ir_put_str(b, "    movq $$60, %rax")
+  ir_newline(b)
+  ir_put_str(b, "    syscall")
+  ir_newline(b)
+  ir_put_str(b, "  ")
+  ir_put_byte(b, 34)
+  ir_put_str(b, ", ")
+  ir_put_byte(b, 34)
+  ir_put_str(b, "~{rax},~{rdi},~{rsi},~{rsp},~{rcx},~{r11},~{memory}")
+  ir_put_byte(b, 34)
+  ir_newline(b)
+  ir_put_str(b, "()")
+  ir_newline(b)
+  ir_put_str(b, "  unreachable")
+  ir_newline(b)
+  ir_put_str(b, "}")
+  ir_newline(b)
+
+# Emit the _start entry point that passes argc/argv to main
+fn ir_emit_start_with_args(b: *IRBuilder) -> i32
+  ir_put_str(b, "define void @_start() naked")
+  ir_newline(b)
+  ir_put_str(b, "{")
+  ir_newline(b)
+  ir_put_str(b, "entry:")
+  ir_newline(b)
+  ir_put_str(b, "  call void asm sideeffect \"")
+  ir_newline(b)
+  ir_put_str(b, "    movq (%rsp), %rdi\\0A")
+  ir_newline(b)
+  ir_put_str(b, "    leaq 8(%rsp), %rsi\\0A")
+  ir_newline(b)
+  ir_put_str(b, "    andq $$-16, %rsp\\0A")
+  ir_newline(b)
+  ir_put_str(b, "    subq $$8, %rsp\\0A")
+  ir_newline(b)
+  ir_put_str(b, "    call main\\0A")
+  ir_newline(b)
+  ir_put_str(b, "    movq %rax, %rdi\\0A")
+  ir_newline(b)
+  ir_put_str(b, "    movq $$60, %rax\\0A")
+  ir_newline(b)
+  ir_put_str(b, "    syscall")
+  ir_newline(b)
+  ir_put_str(b, "  ")
+  ir_put_byte(b, 34)
+  ir_put_str(b, ", ")
+  ir_put_byte(b, 34)
+  ir_put_str(b, "~{rax},~{rdi},~{rsi},~{rsp},~{rcx},~{r11},~{memory}")
+  ir_put_byte(b, 34)
+  ir_newline(b)
+  ir_put_str(b, "()")
+  ir_newline(b)
+  ir_put_str(b, "  unreachable")
+  ir_newline(b)
+  ir_put_str(b, "}")
+  ir_newline(b)
+
+# =============================================================================
+# Call Emission
+# =============================================================================
+
+# Emit: %id = call T @name(args...)
+# Start a call - caller must add args and finish with ir_emit_call_end
+fn ir_emit_call_start(b: *IRBuilder, result: i32, ret_ty: i32, name: *i8) -> i32
+  ir_put_indent(b)
+  ir_put_str(b, "%")
+  ir_put_int(b, result as i64)
+  ir_put_str(b, " = call ")
+  ir_emit_type(b, ret_ty)
+  ir_put_str(b, " @\"")
+  ir_put_str(b, name)
+  ir_put_byte(b, 34)
+  ir_put_str(b, "(")
+  0
+
+# Emit call void (no result)
+fn ir_emit_call_void_start(b: *IRBuilder, name: *i8) -> i32
+  ir_put_indent(b)
+  ir_put_str(b, "call void @\"")
+  ir_put_str(b, name)
+  ir_put_byte(b, 34)
+  ir_put_str(b, "(")
+  0
+
+# Emit call argument: T %val
+fn ir_emit_call_arg(b: *IRBuilder, ty: i32, val: i32, is_first: i32) -> i32
+  if is_first == 0
+    ir_put_str(b, ", ")
+  ir_emit_type(b, ty)
+  ir_put_str(b, " %")
+  ir_put_int(b, val as i64)
+  0
+
+# Emit call argument with immediate: T <imm>
+fn ir_emit_call_arg_imm(b: *IRBuilder, ty: i32, imm: i64, is_first: i32) -> i32
+  if is_first == 0
+    ir_put_str(b, ", ")
+  ir_emit_type(b, ty)
+  ir_put_str(b, " ")
+  ir_put_int(b, imm)
+  0
+
+# Emit call end: )
+fn ir_emit_call_end(b: *IRBuilder) -> i32
+  ir_put_str(b, ")")
+  ir_newline(b)
+
+# =============================================================================
+# Struct Type Emission
+# =============================================================================
+
+# Emit struct type definition: %name = type { fields... }
+fn ir_emit_struct_start(b: *IRBuilder, name: *i8) -> i32
+  ir_put_str(b, "%")
+  ir_put_byte(b, 34)
+  ir_put_str(b, "struct.")
+  ir_put_str(b, name)
+  ir_put_byte(b, 34)
+  ir_put_str(b, " = type {")
+  0
+
+fn ir_emit_struct_field(b: *IRBuilder, ty: i32, is_first: i32) -> i32
+  if is_first == 0
+    ir_put_str(b, ", ")
+  ir_emit_type(b, ty)
+  0
+
+fn ir_emit_struct_end(b: *IRBuilder) -> i32
+  ir_put_str(b, "}")
+  ir_newline(b)
+
+# =============================================================================
+# GEP (GetElementPtr) Emission
+# =============================================================================
+
+# Emit: %id = getelementptr T, T* %ptr, i32 0, i32 <idx>
+fn ir_emit_gep_field(b: *IRBuilder, result: i32, struct_name: *i8, ptr: i32, field_idx: i32) -> i32
+  ir_put_indent(b)
+  ir_put_str(b, "%")
+  ir_put_int(b, result as i64)
+  ir_put_str(b, " = getelementptr %")
+  ir_put_byte(b, 34)
+  ir_put_str(b, "struct.")
+  ir_put_str(b, struct_name)
+  ir_put_byte(b, 34)
+  ir_put_str(b, ", %")
+  ir_put_byte(b, 34)
+  ir_put_str(b, "struct.")
+  ir_put_str(b, struct_name)
+  ir_put_byte(b, 34)
+  ir_put_str(b, "* %")
+  ir_put_int(b, ptr as i64)
+  ir_put_str(b, ", i32 0, i32 ")
+  ir_put_int(b, field_idx as i64)
+  ir_newline(b)
+
+# Emit: %id = getelementptr T, T* %ptr, i64 %idx
+fn ir_emit_gep_index(b: *IRBuilder, result: i32, elem_ty: i32, ptr: i32, idx: i32) -> i32
+  ir_put_indent(b)
+  ir_put_str(b, "%")
+  ir_put_int(b, result as i64)
+  ir_put_str(b, " = getelementptr ")
+  ir_emit_type(b, elem_ty)
+  ir_put_str(b, ", ")
+  ir_emit_type(b, elem_ty)
+  ir_put_str(b, "* %")
+  ir_put_int(b, ptr as i64)
+  ir_put_str(b, ", i64 %")
+  ir_put_int(b, idx as i64)
+  ir_newline(b)
+
+# =============================================================================
+# Conversion Emission
+# =============================================================================
+
+# Emit: %id = trunc i64 %val to i32
+fn ir_emit_trunc(b: *IRBuilder, result: i32, from_ty: i32, to_ty: i32, val: i32) -> i32
+  ir_put_indent(b)
+  ir_put_str(b, "%")
+  ir_put_int(b, result as i64)
+  ir_put_str(b, " = trunc ")
+  ir_emit_type(b, from_ty)
+  ir_put_str(b, " %")
+  ir_put_int(b, val as i64)
+  ir_put_str(b, " to ")
+  ir_emit_type(b, to_ty)
+  ir_newline(b)
+
+# Emit: %id = sext i32 %val to i64
+fn ir_emit_sext(b: *IRBuilder, result: i32, from_ty: i32, to_ty: i32, val: i32) -> i32
+  ir_put_indent(b)
+  ir_put_str(b, "%")
+  ir_put_int(b, result as i64)
+  ir_put_str(b, " = sext ")
+  ir_emit_type(b, from_ty)
+  ir_put_str(b, " %")
+  ir_put_int(b, val as i64)
+  ir_put_str(b, " to ")
+  ir_emit_type(b, to_ty)
+  ir_newline(b)
+
+# Emit: %id = zext i1 %val to i32
+fn ir_emit_zext(b: *IRBuilder, result: i32, from_ty: i32, to_ty: i32, val: i32) -> i32
+  ir_put_indent(b)
+  ir_put_str(b, "%")
+  ir_put_int(b, result as i64)
+  ir_put_str(b, " = zext ")
+  ir_emit_type(b, from_ty)
+  ir_put_str(b, " %")
+  ir_put_int(b, val as i64)
+  ir_put_str(b, " to ")
+  ir_emit_type(b, to_ty)
+  ir_newline(b)
+
+# Emit: %id = bitcast T* %val to U*
+fn ir_emit_bitcast(b: *IRBuilder, result: i32, from_ty: i32, to_ty: i32, val: i32) -> i32
+  ir_put_indent(b)
+  ir_put_str(b, "%")
+  ir_put_int(b, result as i64)
+  ir_put_str(b, " = bitcast ")
+  ir_emit_type(b, from_ty)
+  ir_put_str(b, "* %")
+  ir_put_int(b, val as i64)
+  ir_put_str(b, " to ")
+  ir_emit_type(b, to_ty)
+  ir_put_str(b, "*")
+  ir_newline(b)
+
+# Emit: %id = inttoptr i64 %val to T*
+fn ir_emit_inttoptr(b: *IRBuilder, result: i32, int_ty: i32, ptr_ty: i32, val: i32) -> i32
+  ir_put_indent(b)
+  ir_put_str(b, "%")
+  ir_put_int(b, result as i64)
+  ir_put_str(b, " = inttoptr ")
+  ir_emit_type(b, int_ty)
+  ir_put_str(b, " %")
+  ir_put_int(b, val as i64)
+  ir_put_str(b, " to ")
+  ir_emit_type(b, ptr_ty)
+  ir_put_str(b, "*")
+  ir_newline(b)
+
+# Emit: %id = ptrtoint T* %val to i64
+fn ir_emit_ptrtoint(b: *IRBuilder, result: i32, ptr_ty: i32, int_ty: i32, val: i32) -> i32
+  ir_put_indent(b)
+  ir_put_str(b, "%")
+  ir_put_int(b, result as i64)
+  ir_put_str(b, " = ptrtoint ")
+  ir_emit_type(b, ptr_ty)
+  ir_put_str(b, "* %")
+  ir_put_int(b, val as i64)
+  ir_put_str(b, " to ")
+  ir_emit_type(b, int_ty)
+  ir_newline(b)
+
+# =============================================================================
+# Utility Functions
+# =============================================================================
+
+# Get the buffer contents as a null-terminated string
+fn ir_get_buffer(b: *IRBuilder) -> *i8
+  # Ensure null terminated
+  if b.len < b.cap
+    *(b.buf + b.len) = 0
+  b.buf
+
+# Get current buffer length
+fn ir_get_length(b: *IRBuilder) -> i64
+  b.len
+
+# =============================================================================
+# AST Expression Emission
+# =============================================================================
+#
+# These functions emit LLVM IR from parsed AST nodes.
+# They return the SSA value ID of the result (%1, %2, etc.)
+
+# Expression kinds (must match parser.ritz)
+const EXPR_INT_LIT: i32 = 1
+const EXPR_IDENT: i32 = 2
+const EXPR_STRING_LIT: i32 = 3
+const EXPR_BOOL_LIT: i32 = 4
+const EXPR_BIN_OP: i32 = 5
+const EXPR_UNARY_OP: i32 = 6
+const EXPR_CALL: i32 = 7
+const EXPR_INDEX: i32 = 8
+const EXPR_FIELD: i32 = 9
+const EXPR_PAREN: i32 = 10
+const EXPR_CAST: i32 = 11
+const EXPR_STRUCT_LIT: i32 = 12
+const EXPR_FIELD_INIT: i32 = 13
+const EXPR_ARRAY_REPEAT: i32 = 14
+
+# Statement kinds (must match parser.ritz)
+const STMT_EXPR: i32 = 20
+const STMT_VAR: i32 = 21
+const STMT_LET: i32 = 22
+const STMT_IF: i32 = 23
+const STMT_WHILE: i32 = 24
+const STMT_FOR: i32 = 25
+const STMT_RETURN: i32 = 26
+const STMT_BLOCK: i32 = 27
+const STMT_BREAK: i32 = 28
+const STMT_CONTINUE: i32 = 29
+const STMT_ASSIGN: i32 = 30
+
+# Token types for operators (must match tokens.ritz)
+const TOK_PLUS: i32 = 28
+const TOK_MINUS: i32 = 29
+const TOK_STAR: i32 = 30
+const TOK_SLASH: i32 = 31
+const TOK_PERCENT: i32 = 32
+const TOK_LT: i32 = 38
+const TOK_GT: i32 = 39
+const TOK_EQEQ: i32 = 43
+const TOK_NEQ: i32 = 44
+const TOK_LEQ: i32 = 45
+const TOK_GEQ: i32 = 46
+const TOK_AMP: i32 = 33
+const TOK_PIPE: i32 = 34
+const TOK_CARET: i32 = 35
+const TOK_AMPAMP: i32 = 50
+const TOK_PIPEPIPE: i32 = 51
+
+# Simplified Expr struct for emission (mirrors parser Expr)
+struct EmitExpr
+  kind: i32
+  val1: i32
+  val2: i32
+  left: *EmitExpr
+  right: *EmitExpr
+  next: *EmitExpr
+
+# Simplified Stmt struct for emission
+struct EmitStmt
+  kind: i32
+  name: *i8
+  name_len: i32
+  type_expr: *i32
+  expr: *EmitExpr
+  stmt: *EmitStmt
+  next: *EmitStmt
+
+# Local variable binding for emission
+struct EmitLocal
+  name: *i8
+  name_len: i32
+  ty: i32        # Type kind (TY_I32, etc.)
+  slot: i32      # SSA value ID of alloca slot
+  next: *EmitLocal
+
+# Emission context
+struct EmitCtx
+  b: *IRBuilder
+  locals: *EmitLocal
+  arena: *Arena
+  src: *i8       # Source text for identifier lookup
+
+# Create emission context
+fn emit_ctx_new(arena: *Arena, src: *i8) -> *EmitCtx
+  let ctx: *EmitCtx = arena_alloc(arena, 64) as *EmitCtx
+  ctx.b = ir_builder_new(arena, 65536)
+  ctx.locals = 0 as *EmitLocal
+  ctx.arena = arena
+  ctx.src = src
+  ctx
+
+# Look up a local variable by name
+fn emit_lookup_local(ctx: *EmitCtx, name: *i8, name_len: i32) -> *EmitLocal
+  var cur: *EmitLocal = ctx.locals
+  while cur != 0 as *EmitLocal
+    # Compare names
+    if cur.name_len == name_len
+      var matched: i32 = 1
+      var i: i32 = 0
+      while i < name_len
+        if *(cur.name + i) != *(name + i)
+          matched = 0
+        i = i + 1
+      if matched == 1
+        return cur
+    cur = cur.next
+  0 as *EmitLocal
+
+# Add a local variable
+fn emit_add_local(ctx: *EmitCtx, name: *i8, name_len: i32, ty: i32, slot: i32) -> *EmitLocal
+  let local: *EmitLocal = arena_alloc(ctx.arena, 40) as *EmitLocal
+  local.name = name
+  local.name_len = name_len
+  local.ty = ty
+  local.slot = slot
+  local.next = ctx.locals
+  ctx.locals = local
+  local
+
+# Emit expression, returns SSA value ID
+fn emit_expr(ctx: *EmitCtx, e: *EmitExpr) -> i32
+  let b: *IRBuilder = ctx.b
+
+  if e.kind == EXPR_INT_LIT
+    # Integer literal: emit as immediate (special handling needed)
+    # For now, store to temp and load back to get SSA value
+    let slot: i32 = ir_fresh_id(b)
+    ir_emit_alloca(b, slot, TY_I64)
+    ir_emit_store_imm(b, TY_I64, e.val1 as i64, slot)
+    let result: i32 = ir_fresh_id(b)
+    ir_emit_load(b, result, TY_I64, slot)
+    return result
+
+  if e.kind == EXPR_BOOL_LIT
+    let slot: i32 = ir_fresh_id(b)
+    ir_emit_alloca(b, slot, TY_BOOL)
+    ir_emit_store_imm(b, TY_BOOL, e.val1 as i64, slot)
+    let result: i32 = ir_fresh_id(b)
+    ir_emit_load(b, result, TY_BOOL, slot)
+    return result
+
+  if e.kind == EXPR_IDENT
+    # Look up variable
+    let name: *i8 = ctx.src + e.val1
+    let name_len: i32 = e.val2
+    let local: *EmitLocal = emit_lookup_local(ctx, name, name_len)
+    if local == 0 as *EmitLocal
+      return -1  # Error: undefined variable
+    # Load from slot
+    let result: i32 = ir_fresh_id(b)
+    ir_emit_load(b, result, local.ty, local.slot)
+    return result
+
+  if e.kind == EXPR_BIN_OP
+    # Emit left and right
+    let lhs: i32 = emit_expr(ctx, e.left)
+    let rhs: i32 = emit_expr(ctx, e.right)
+    let result: i32 = ir_fresh_id(b)
+    let op: i32 = e.val2
+
+    # Arithmetic operators
+    if op == TOK_PLUS
+      ir_emit_binop(b, "add", TY_I64, result, lhs, rhs)
+      return result
+    if op == TOK_MINUS
+      ir_emit_binop(b, "sub", TY_I64, result, lhs, rhs)
+      return result
+    if op == TOK_STAR
+      ir_emit_binop(b, "mul", TY_I64, result, lhs, rhs)
+      return result
+    if op == TOK_SLASH
+      ir_emit_binop(b, "sdiv", TY_I64, result, lhs, rhs)
+      return result
+    if op == TOK_PERCENT
+      ir_emit_binop(b, "srem", TY_I64, result, lhs, rhs)
+      return result
+
+    # Comparison operators (ir_emit_icmp allocates IDs and returns result)
+    if op == TOK_EQEQ
+      return ir_emit_icmp(b, "eq", TY_I64, lhs, rhs)
+    if op == TOK_NEQ
+      return ir_emit_icmp(b, "ne", TY_I64, lhs, rhs)
+    if op == TOK_LT
+      return ir_emit_icmp(b, "slt", TY_I64, lhs, rhs)
+    if op == TOK_LEQ
+      return ir_emit_icmp(b, "sle", TY_I64, lhs, rhs)
+    if op == TOK_GT
+      return ir_emit_icmp(b, "sgt", TY_I64, lhs, rhs)
+    if op == TOK_GEQ
+      return ir_emit_icmp(b, "sge", TY_I64, lhs, rhs)
+
+    return -1  # Unknown operator
+
+  if e.kind == EXPR_PAREN
+    # Just emit the inner expression
+    return emit_expr(ctx, e.left)
+
+  -1  # Unknown expression kind
+
+# Emit statement
+fn emit_stmt(ctx: *EmitCtx, s: *EmitStmt) -> i32
+  let b: *IRBuilder = ctx.b
+
+  if s.kind == STMT_EXPR
+    emit_expr(ctx, s.expr)
+    return 0
+
+  if s.kind == STMT_VAR
+    # Allocate space for variable
+    let slot: i32 = ir_fresh_id(b)
+    ir_emit_alloca(b, slot, TY_I64)  # TODO: use actual type
+    # Store initial value if present
+    if s.expr != 0 as *EmitExpr
+      let val: i32 = emit_expr(ctx, s.expr)
+      ir_emit_store(b, TY_I64, val, slot)
+    # Register local
+    emit_add_local(ctx, s.name, s.name_len, TY_I64, slot)
+    return 0
+
+  if s.kind == STMT_LET
+    # Same as var for now (let is immutable but same codegen)
+    let slot: i32 = ir_fresh_id(b)
+    ir_emit_alloca(b, slot, TY_I64)
+    if s.expr != 0 as *EmitExpr
+      let val: i32 = emit_expr(ctx, s.expr)
+      ir_emit_store(b, TY_I64, val, slot)
+    emit_add_local(ctx, s.name, s.name_len, TY_I64, slot)
+    return 0
+
+  if s.kind == STMT_RETURN
+    if s.expr != 0 as *EmitExpr
+      let val: i32 = emit_expr(ctx, s.expr)
+      ir_emit_ret(b, TY_I64, val)
+    else
+      ir_emit_ret_void(b)
+    return 0
+
+  0  # Unknown statement kind
+
+# Emit a sequence of statements
+fn emit_stmts(ctx: *EmitCtx, s: *EmitStmt) -> i32
+  var cur: *EmitStmt = s
+  while cur != 0 as *EmitStmt
+    emit_stmt(ctx, cur)
+    cur = cur.next
+  0
+
+# =============================================================================
+# AST-Direct Emission (for parser FnDef/Stmt/Expr)
+# =============================================================================
+#
+# The parser's Stmt and EmitStmt have the same layout, so we can cast directly.
+# FnDef: name(*i8), name_len(i32), params(*Param), ret_type(*TypeExpr), body(*Stmt), next(*FnDef)
+
+# Maximum number of local variables per function
+const MAX_LOCALS: i32 = 256
+# Size of AstLocal struct in bytes (4 fields * 8 bytes each, since all i64)
+const ASTLOCAL_SIZE: i64 = 32
+
+# Local variable for AST emission path
+struct AstLocal
+  name: *i8       # Pointer into source buffer
+  name_len: i32   # Length of name
+  ty: i32         # Type kind (TY_I64, etc.)
+  slot: i32       # SSA value ID of alloca slot
+
+# Emission context for AST path
+# Uses fixed-size array for locals (avoids __builtin_alloca issues)
+struct AstEmitCtx
+  b: *IRBuilder   # IR builder
+  src: *i8        # Source buffer (for resolving identifiers)
+  locals: *AstLocal  # Pointer to locals array
+  local_count: i32   # Number of locals
+
+# Look up a local variable by name in source buffer
+fn ast_lookup_local(ctx: *AstEmitCtx, name_start: i32, name_len: i32) -> *AstLocal
+  let name: *i8 = ctx.src + name_start
+  var i: i32 = 0
+  while i < ctx.local_count
+    # Pointer arithmetic in Ritz is byte-based, so multiply by struct size
+    let cur: *AstLocal = (ctx.locals as *i8 + (i as i64) * ASTLOCAL_SIZE) as *AstLocal
+    if cur.name_len == name_len
+      var matched: i32 = 1
+      var j: i32 = 0
+      while j < name_len
+        if *(cur.name + j) != *(name + j)
+          matched = 0
+        j = j + 1
+      if matched == 1
+        return cur
+    i = i + 1
+  0 as *AstLocal
+
+# Add a local variable to the context
+fn ast_add_local(ctx: *AstEmitCtx, name: *i8, name_len: i32, ty: i32, slot: i32) -> i32
+  if ctx.local_count >= MAX_LOCALS
+    return -1
+  # Pointer arithmetic in Ritz is byte-based, so multiply by struct size
+  let local: *AstLocal = (ctx.locals as *i8 + (ctx.local_count as i64) * ASTLOCAL_SIZE) as *AstLocal
+  local.name = name
+  local.name_len = name_len
+  local.ty = ty
+  local.slot = slot
+  ctx.local_count = ctx.local_count + 1
+  0
+
+# Convert parser TypeExpr to emitter type kind
+# Returns type kind suitable for LLVM emission
+fn parser_type_to_kind(type_expr: *i8) -> i32
+  if type_expr == 0 as *i8
+    return TY_I32  # Default to i32
+
+  # TypeExpr layout (all i64): kind(0), name(8), name_len(16), inner(24), size(32), is_mut(40)
+  let kind: i32 = *((type_expr + 0) as *i32)
+
+  if kind == TYPE_NAMED
+    # Check type name - use name_len to infer type since parser doesn't store actual name pointer
+    let name_len: i32 = *((type_expr + 16) as *i64) as i32
+
+    # Infer type from name_len pattern
+    # Parser sets name_len to tok.len which is the length of the identifier token
+    if name_len == 4
+      return TY_I32  # i32, i64, bool all are 4 chars for our purposes, default to i32
+    if name_len == 3
+      return TY_I64  # Could be i64 without the last digit stored correctly
+    if name_len == 1
+      return TY_I32  # Single letter types default to i32
+
+    return TY_I32  # Default
+
+  if kind == TYPE_PTR
+    return TY_PTR
+
+  if kind == TYPE_REF
+    return TY_REF
+
+  TY_I32  # Default
+
+# =============================================================================
+# Pre-scan for alloca emission at function entry
+# =============================================================================
+
+# Pre-scan a single statement for variable declarations.
+# Emits allocas and registers variables, handling nested blocks.
+fn prescan_stmt_allocas(ctx: *AstEmitCtx, stmt: *i8) -> i32
+  if stmt == 0 as *i8
+    return 0
+  let b: *IRBuilder = ctx.b
+  let kind: i32 = *((stmt + 0) as *i32)
+  var count: i32 = 0
+
+  if kind == STMT_VAR || kind == STMT_LET
+    # Variable declaration: emit alloca and register
+    let var_name: *i8 = *((stmt + 8) as **i8)
+    let var_name_len: i32 = *((stmt + 16) as *i64) as i32
+    if var_name != 0 as *i8
+      let slot: i32 = ir_fresh_id(b)
+      ir_put_indent(b)
+      ir_put_str(b, "%")
+      ir_put_int(b, slot as i64)
+      ir_put_str(b, " = alloca i64")
+      ir_newline(b)
+      ast_add_local(ctx, var_name, var_name_len, TY_I64, slot)
+      count = 1
+
+  if kind == STMT_IF
+    # Scan then block: stmt at offset 40
+    let then_stmt: *i8 = *((stmt + 40) as **i8)
+    var cur: *i8 = then_stmt
+    while cur != 0 as *i8
+      count = count + prescan_stmt_allocas(ctx, cur)
+      cur = *((cur + 48) as **i8)
+    # Scan else block: stmt at offset 24 (stored in type_expr field)
+    let else_stmt: *i8 = *((stmt + 24) as **i8)
+    cur = else_stmt
+    while cur != 0 as *i8
+      count = count + prescan_stmt_allocas(ctx, cur)
+      cur = *((cur + 48) as **i8)
+
+  if kind == STMT_WHILE
+    # Scan body block: stmt at offset 40
+    let body_stmt: *i8 = *((stmt + 40) as **i8)
+    var cur: *i8 = body_stmt
+    while cur != 0 as *i8
+      count = count + prescan_stmt_allocas(ctx, cur)
+      cur = *((cur + 48) as **i8)
+
+  count
+
+# Pre-scan all statements in a function body and emit allocas at entry
+fn prescan_fn_allocas(ctx: *AstEmitCtx, body: *i8) -> i32
+  var count: i32 = 0
+  var stmt: *i8 = body
+  while stmt != 0 as *i8
+    count = count + prescan_stmt_allocas(ctx, stmt)
+    stmt = *((stmt + 48) as **i8)
+  count
+
+# Lookup local by name via pointer comparison (for prescan)
+fn ast_lookup_local_ptr(ctx: *AstEmitCtx, name: *i8, name_len: i32) -> *AstLocal
+  var i: i32 = 0
+  while i < ctx.local_count
+    let cur: *AstLocal = (ctx.locals as *i8 + (i as i64) * ASTLOCAL_SIZE) as *AstLocal
+    if cur.name_len == name_len
+      var matched: i32 = 1
+      var j: i32 = 0
+      while j < name_len
+        if *(cur.name + j) != *(name + j)
+          matched = 0
+        j = j + 1
+      if matched == 1
+        return cur
+    i = i + 1
+  0 as *AstLocal
+
+# =============================================================================
+# Function Emission
+# =============================================================================
+
+# Emit a function from parser's FnDef struct
+# Returns 0 on success
+fn emit_ast_fn(b: *IRBuilder, fn_def: *i8, src: *i8) -> i32
+  # FnDef layout: name(*i8 at 0), name_len(i32 at 8), params(*Param at 16),
+  #               ret_type(*TypeExpr at 24), body(*Stmt at 32), next(*FnDef at 40)
+  let name: *i8 = *((fn_def + 0) as **i8)
+  let body: *i8 = *((fn_def + 32) as **i8)  # Stmt pointer
+
+  # Reset SSA IDs for this function
+  ir_reset_ids(b)
+
+  # Allocate locals array on stack
+  # AstLocal is 32 bytes (4 fields * 8 bytes each, since all stored as i64)
+  let locals_buf: *i8 = __builtin_alloca(8192) as *i8  # 256 * 32 bytes
+
+  # Create emission context for this function
+  var ctx: AstEmitCtx = AstEmitCtx {
+    b: b,
+    src: src,
+    locals: locals_buf as *AstLocal,
+    local_count: 0
+  }
+
+  # For now, emit simple i64 return type (unified with expression types)
+  # TODO: Parse ret_type properly when parser stores name pointers
+  ir_emit_fn_start(b, name, TY_I64)
+
+  # Emit parameters from params list
+  # Param layout: name(*i8 at 0), name_len(i32 at 8), type_expr(*TypeExpr at 16), next(*Param at 24)
+  let params: *i8 = *((fn_def + 16) as **i8)
+  var param: *i8 = params
+  var is_first: i32 = 1
+  while param != 0 as *i8
+    let param_name: *i8 = *((param + 0) as **i8)
+    let param_name_len: i32 = *((param + 8) as *i64) as i32
+    # For now, all params are i64
+    if param_name != 0 as *i8
+      ir_emit_fn_param_len(b, TY_I64, param_name, param_name_len, is_first)
+      is_first = 0
+    param = *((param + 24) as **i8)
+  ir_emit_fn_header_end(b)
+
+  # Register function parameters as locals
+  # Need to allocate slots for them so they can be assigned
+  param = params
+  while param != 0 as *i8
+    let param_name: *i8 = *((param + 0) as **i8)
+    let param_name_len: i32 = *((param + 8) as *i64) as i32
+    if param_name != 0 as *i8
+      # Allocate slot for parameter
+      let slot: i32 = ir_fresh_id(b)
+      ir_put_indent(b)
+      ir_put_str(b, "%")
+      ir_put_int(b, slot as i64)
+      ir_put_str(b, " = alloca i64")
+      ir_newline(b)
+      # Store argument value to slot
+      ir_put_indent(b)
+      ir_put_str(b, "store i64 %\"")
+      ir_put_str_len(b, param_name, param_name_len)
+      ir_put_str(b, ".arg\", ptr %")
+      ir_put_int(b, slot as i64)
+      ir_newline(b)
+      # Register in symbol table
+      ast_add_local(&ctx, param_name, param_name_len, TY_I64, slot)
+    param = *((param + 24) as **i8)
+
+  # Pre-scan function body and emit all local variable allocas at entry
+  # This ensures allocas dominate all uses (LLVM requirement)
+  prescan_fn_allocas(&ctx, body)
+
+  # Emit body statements, tracking the last one for implicit return
+  var stmt: *i8 = body
+  var last_stmt: *i8 = 0 as *i8
+  while stmt != 0 as *i8
+    last_stmt = stmt
+    # Check if this is the last statement (next == 0) and it's an expression
+    let next: *i8 = *((stmt + 48) as **i8)
+    if next == 0 as *i8
+      # This is the last statement - check if it's an expression statement
+      let kind: i32 = *((stmt + 0) as *i32)
+      if kind == STMT_EXPR
+        # Emit the expression and use its value as return
+        let expr: *i8 = *((stmt + 32) as **i8)
+        if expr != 0 as *i8
+          let val: i32 = emit_ast_expr(&ctx, expr)
+          ir_emit_ret(b, TY_I64, val)
+          ir_emit_fn_end(b)
+          return 0
+      # Not an expression or expression is null - emit normally and fall through to default return
+      emit_ast_stmt(&ctx, stmt)
+    else
+      emit_ast_stmt(&ctx, stmt)
+    stmt = next
+
+  # Emit default return if no explicit return (empty body or last was not expression)
+  ir_put_str(b, "  ret i64 0")
+  ir_newline(b)
+
+  ir_emit_fn_end(b)
+  0
+
+# Emit a statement from parser's Stmt struct
+fn emit_ast_stmt(ctx: *AstEmitCtx, stmt: *i8) -> i32
+  # Stmt layout: kind(i32 at 0), name(*i8 at 8), name_len(i32 at 16),
+  #              type_expr(*i32 at 24), expr(*i32 at 32), stmt(*i32 at 40), next(*i32 at 48)
+
+  if stmt == 0 as *i8
+    return 0
+
+  let b: *IRBuilder = ctx.b
+  let kind: i32 = *((stmt + 0) as *i32)
+
+  if kind == STMT_RETURN
+    let expr: *i8 = *((stmt + 32) as **i8)
+    if expr != 0 as *i8
+      let val: i32 = emit_ast_expr(ctx, expr)
+      if val >= 0
+        ir_emit_ret(b, TY_I64, val)
+      else
+        ir_put_str(b, "  ret i64 0")
+        ir_newline(b)
+    else
+      ir_put_str(b, "  ret i64 0")
+      ir_newline(b)
+    return 0
+
+  if kind == STMT_EXPR
+    let expr: *i8 = *((stmt + 32) as **i8)
+    if expr != 0 as *i8
+      emit_ast_expr(ctx, expr)
+    return 0
+
+  if kind == STMT_VAR || kind == STMT_LET
+    # Variable declaration: find pre-registered slot and store initial value
+    # Allocas were already emitted by prescan_fn_allocas at function entry
+    # Stmt layout (all i64): kind(0), name(8), name_len(16), type_expr(24), expr(32), stmt(40), next(48)
+    let var_name: *i8 = *((stmt + 8) as **i8)
+    let var_name_len: i32 = *((stmt + 16) as *i64) as i32
+    # Find pre-registered local (alloca was emitted in prescan)
+    let local_ptr: *AstLocal = ast_lookup_local_ptr(ctx, var_name, var_name_len)
+    if local_ptr == 0 as *AstLocal
+      # Should not happen if prescan worked correctly
+      ir_put_str(b, "; ERROR: local not found: ")
+      ir_put_str_len(b, var_name, var_name_len)
+      ir_newline(b)
+      return 0
+    let slot: i32 = (*local_ptr).slot
+    # Store initial value if present
+    let init_expr: *i8 = *((stmt + 32) as **i8)
+    if init_expr != 0 as *i8
+      let val: i32 = emit_ast_expr(ctx, init_expr)
+      ir_put_indent(b)
+      ir_put_str(b, "store i64 %")
+      ir_put_int(b, val as i64)
+      ir_put_str(b, ", ptr %")
+      ir_put_int(b, slot as i64)
+      ir_newline(b)
+    return 0
+
+  if kind == STMT_IF
+    # If statement: expr at 32 (condition), stmt at 40 (then block), type_expr at 24 (else block)
+    let cond_expr: *i8 = *((stmt + 32) as **i8)
+    let then_stmt: *i8 = *((stmt + 40) as **i8)
+    let else_stmt: *i8 = *((stmt + 24) as **i8)  # else block stored in type_expr field
+    let cond: i32 = emit_ast_expr(ctx, cond_expr)
+    let then_label: i32 = ir_fresh_label(b)
+    var else_label: i32 = 0
+    let end_label: i32 = ir_fresh_label(b)
+    # If we have an else block, create a label for it
+    if else_stmt != 0 as *i8
+      else_label = ir_fresh_label(b)
+    # Compare condition to 0
+    let cmp: i32 = ir_fresh_id(b)
+    ir_put_indent(b)
+    ir_put_str(b, "%")
+    ir_put_int(b, cmp as i64)
+    ir_put_str(b, " = icmp ne i64 %")
+    ir_put_int(b, cond as i64)
+    ir_put_str(b, ", 0")
+    ir_newline(b)
+    ir_put_indent(b)
+    ir_put_str(b, "br i1 %")
+    ir_put_int(b, cmp as i64)
+    ir_put_str(b, ", label %L")
+    ir_put_int(b, then_label as i64)
+    ir_put_str(b, ", label %L")
+    if else_stmt != 0 as *i8
+      ir_put_int(b, else_label as i64)
+    else
+      ir_put_int(b, end_label as i64)
+    ir_newline(b)
+    # Then block
+    ir_put_str(b, "L")
+    ir_put_int(b, then_label as i64)
+    ir_put_str(b, ":")
+    ir_newline(b)
+    # Emit all statements in then block
+    var cur: *i8 = then_stmt
+    var last_stmt: *i8 = 0 as *i8
+    while cur != 0 as *i8
+      last_stmt = cur
+      emit_ast_stmt(ctx, cur)
+      cur = *((cur + 48) as **i8)  # Stmt.next at offset 48
+    # Only emit br if the block didn't end with a return
+    var block_terminated: i32 = 0
+    if last_stmt != 0 as *i8
+      let last_kind: i32 = *((last_stmt + 0) as *i32)
+      if last_kind == STMT_RETURN
+        block_terminated = 1
+    if block_terminated == 0
+      ir_put_indent(b)
+      ir_put_str(b, "br label %L")
+      ir_put_int(b, end_label as i64)
+      ir_newline(b)
+    # Else block (if present)
+    if else_stmt != 0 as *i8
+      ir_put_str(b, "L")
+      ir_put_int(b, else_label as i64)
+      ir_put_str(b, ":")
+      ir_newline(b)
+      # Emit else statements
+      cur = else_stmt
+      last_stmt = 0 as *i8
+      while cur != 0 as *i8
+        last_stmt = cur
+        emit_ast_stmt(ctx, cur)
+        cur = *((cur + 48) as **i8)
+      # Jump to end if needed
+      block_terminated = 0
+      if last_stmt != 0 as *i8
+        let last_kind: i32 = *((last_stmt + 0) as *i32)
+        if last_kind == STMT_RETURN
+          block_terminated = 1
+      if block_terminated == 0
+        ir_put_indent(b)
+        ir_put_str(b, "br label %L")
+        ir_put_int(b, end_label as i64)
+        ir_newline(b)
+    # End label
+    ir_put_str(b, "L")
+    ir_put_int(b, end_label as i64)
+    ir_put_str(b, ":")
+    ir_newline(b)
+    return 0
+
+  if kind == STMT_WHILE
+    # While loop: expr at 32 (condition), stmt at 40 (body)
+    let cond_label: i32 = ir_fresh_label(b)
+    let body_label: i32 = ir_fresh_label(b)
+    let end_label: i32 = ir_fresh_label(b)
+    # Jump to condition check
+    ir_put_indent(b)
+    ir_put_str(b, "br label %L")
+    ir_put_int(b, cond_label as i64)
+    ir_newline(b)
+    # Condition check
+    ir_put_str(b, "L")
+    ir_put_int(b, cond_label as i64)
+    ir_put_str(b, ":")
+    ir_newline(b)
+    let cond_expr: *i8 = *((stmt + 32) as **i8)
+    let cond: i32 = emit_ast_expr(ctx, cond_expr)
+    let cmp: i32 = ir_fresh_id(b)
+    ir_put_indent(b)
+    ir_put_str(b, "%")
+    ir_put_int(b, cmp as i64)
+    ir_put_str(b, " = icmp ne i64 %")
+    ir_put_int(b, cond as i64)
+    ir_put_str(b, ", 0")
+    ir_newline(b)
+    ir_put_indent(b)
+    ir_put_str(b, "br i1 %")
+    ir_put_int(b, cmp as i64)
+    ir_put_str(b, ", label %L")
+    ir_put_int(b, body_label as i64)
+    ir_put_str(b, ", label %L")
+    ir_put_int(b, end_label as i64)
+    ir_newline(b)
+    # Body
+    ir_put_str(b, "L")
+    ir_put_int(b, body_label as i64)
+    ir_put_str(b, ":")
+    ir_newline(b)
+    let body_stmt: *i8 = *((stmt + 40) as **i8)
+    var cur: *i8 = body_stmt
+    var last_stmt: *i8 = 0 as *i8
+    while cur != 0 as *i8
+      last_stmt = cur
+      emit_ast_stmt(ctx, cur)
+      cur = *((cur + 48) as **i8)  # Stmt.next at offset 48
+    # Only emit br back to condition if the block didn't end with a return
+    var block_terminated: i32 = 0
+    if last_stmt != 0 as *i8
+      let last_kind: i32 = *((last_stmt + 0) as *i32)
+      if last_kind == STMT_RETURN
+        block_terminated = 1
+    if block_terminated == 0
+      ir_put_indent(b)
+      ir_put_str(b, "br label %L")
+      ir_put_int(b, cond_label as i64)
+      ir_newline(b)
+    # End
+    ir_put_str(b, "L")
+    ir_put_int(b, end_label as i64)
+    ir_put_str(b, ":")
+    ir_newline(b)
+    return 0
+
+  if kind == STMT_ASSIGN
+    # Assignment statement: expr at 32 (target LHS), stmt at 40 (value RHS, reused field)
+    let target: *i8 = *((stmt + 32) as **i8)
+    let value_expr: *i8 = *((stmt + 40) as **i8)
+    if target == 0 as *i8 || value_expr == 0 as *i8
+      return 0
+    # Emit value expression first
+    let value: i32 = emit_ast_expr(ctx, value_expr)
+    # Check target type
+    let target_kind: i32 = *((target + 0) as *i32)
+    if target_kind == EXPR_IDENT
+      # Simple variable assignment: look up local and store
+      let name_start: i32 = *((target + 8) as *i64) as i32
+      let name_len: i32 = *((target + 16) as *i64) as i32
+      let local: *AstLocal = ast_lookup_local(ctx, name_start, name_len)
+      if local != 0 as *AstLocal
+        ir_put_indent(b)
+        ir_put_str(b, "store i64 %")
+        ir_put_int(b, value as i64)
+        ir_put_str(b, ", ptr %")
+        ir_put_int(b, (*local).slot as i64)
+        ir_newline(b)
+    if target_kind == EXPR_FIELD
+      # Field assignment: arena.field = value
+      # Get base expression and field info
+      let base_expr: *i8 = *((target + 24) as **i8)
+      let field_start: i32 = *((target + 8) as *i64) as i32
+      let field_len: i32 = *((target + 16) as *i64) as i32
+      # For (*ptr).field = value, we need the pointer address, not the loaded value
+      var base: i32 = 0
+      let base_kind: i32 = *((base_expr + 0) as *i32)
+      if base_kind == EXPR_UNARY_OP
+        # Check if it's a DEREF (TOK_STAR = 30) - operator is at offset 16 (val2)
+        let base_op: i32 = *((base_expr + 16) as *i64) as i32
+        if base_op == 30  # TOK_STAR - dereference
+          # For (*ptr).field, emit the pointer value directly, skip the load
+          let inner_expr: *i8 = *((base_expr + 24) as **i8)
+          base = emit_ast_expr(ctx, inner_expr)
+        else
+          base = emit_ast_expr(ctx, base_expr)
+      else
+        base = emit_ast_expr(ctx, base_expr)
+      # Convert i64 to pointer
+      let ptr: i32 = ir_fresh_id(b)
+      ir_put_indent(b)
+      ir_put_str(b, "%")
+      ir_put_int(b, ptr as i64)
+      ir_put_str(b, " = inttoptr i64 %")
+      ir_put_int(b, base as i64)
+      ir_put_str(b, " to ptr")
+      ir_newline(b)
+      # Find field offset by searching all structs
+      let field_name: *i8 = ctx.src + field_start
+      var field_offset: i32 = 0
+      var found_offset: i32 = -1
+      var struct_def: *i8 = b.structs
+      while struct_def != 0 as *i8 && found_offset == -1
+        var field: *i8 = *((struct_def + 16) as **i8)
+        field_offset = 0
+        while field != 0 as *i8
+          let fname: *i8 = *((field + 0) as **i8)
+          let flen: i32 = *((field + 8) as *i64) as i32
+          if flen == field_len
+            var matched: i32 = 1
+            var i: i32 = 0
+            while i < field_len
+              if *(fname + i) != *(field_name + i)
+                matched = 0
+              i = i + 1
+            if matched == 1
+              found_offset = field_offset
+              struct_def = 0 as *i8
+          if found_offset == -1
+            field_offset = field_offset + 8
+          field = *((field + 24) as **i8)
+        struct_def = *((struct_def + 32) as **i8)
+      if found_offset == -1
+        found_offset = 0
+      # Compute field address
+      let field_ptr: i32 = ir_fresh_id(b)
+      ir_put_indent(b)
+      ir_put_str(b, "%")
+      ir_put_int(b, field_ptr as i64)
+      ir_put_str(b, " = getelementptr i8, ptr %")
+      ir_put_int(b, ptr as i64)
+      ir_put_str(b, ", i64 ")
+      ir_put_int(b, found_offset as i64)
+      ir_newline(b)
+      # Store value to field
+      ir_put_indent(b)
+      ir_put_str(b, "store i64 %")
+      ir_put_int(b, value as i64)
+      ir_put_str(b, ", ptr %")
+      ir_put_int(b, field_ptr as i64)
+      ir_newline(b)
+    if target_kind == EXPR_INDEX
+      # Array element assignment: base[index] = value
+      let base_expr: *i8 = *((target + 24) as **i8)
+      let idx_expr: *i8 = *((target + 32) as **i8)
+      let idx: i32 = emit_ast_expr(ctx, idx_expr)
+      # Check if base is EXPR_FIELD (array-in-struct)
+      let base_kind: i32 = *((base_expr + 0) as *i32)
+      var base_ptr: i32 = 0
+      if base_kind == EXPR_FIELD
+        # Compute field address without loading
+        let field_base_expr: *i8 = *((base_expr + 24) as **i8)
+        let field_start: i32 = *((base_expr + 8) as *i64) as i32
+        let field_len: i32 = *((base_expr + 16) as *i64) as i32
+        let field_base: i32 = emit_ast_expr(ctx, field_base_expr)
+        let ptr: i32 = ir_fresh_id(b)
+        ir_put_indent(b)
+        ir_put_str(b, "%")
+        ir_put_int(b, ptr as i64)
+        ir_put_str(b, " = inttoptr i64 %")
+        ir_put_int(b, field_base as i64)
+        ir_put_str(b, " to ptr")
+        ir_newline(b)
+        # Find field offset
+        let field_name: *i8 = ctx.src + field_start
+        var field_offset: i32 = 0
+        var found_offset: i32 = -1
+        var struct_def: *i8 = b.structs
+        while struct_def != 0 as *i8 && found_offset == -1
+          var field: *i8 = *((struct_def + 16) as **i8)
+          field_offset = 0
+          while field != 0 as *i8
+            let fname: *i8 = *((field + 0) as **i8)
+            let flen: i32 = *((field + 8) as *i64) as i32
+            if flen == field_len
+              var matched: i32 = 1
+              var i: i32 = 0
+              while i < field_len
+                if *(fname + i) != *(field_name + i)
+                  matched = 0
+                i = i + 1
+              if matched == 1
+                found_offset = field_offset
+                struct_def = 0 as *i8
+            if found_offset == -1
+              field_offset = field_offset + 8
+            field = *((field + 24) as **i8)
+          struct_def = *((struct_def + 32) as **i8)
+        if found_offset == -1
+          found_offset = 0
+        let field_ptr: i32 = ir_fresh_id(b)
+        ir_put_indent(b)
+        ir_put_str(b, "%")
+        ir_put_int(b, field_ptr as i64)
+        ir_put_str(b, " = getelementptr i8, ptr %")
+        ir_put_int(b, ptr as i64)
+        ir_put_str(b, ", i64 ")
+        ir_put_int(b, found_offset as i64)
+        ir_newline(b)
+        base_ptr = field_ptr
+      else
+        # Normal case
+        let base: i32 = emit_ast_expr(ctx, base_expr)
+        let ptr: i32 = ir_fresh_id(b)
+        ir_put_indent(b)
+        ir_put_str(b, "%")
+        ir_put_int(b, ptr as i64)
+        ir_put_str(b, " = inttoptr i64 %")
+        ir_put_int(b, base as i64)
+        ir_put_str(b, " to ptr")
+        ir_newline(b)
+        base_ptr = ptr
+      # Compute element address
+      let scaled_idx: i32 = ir_fresh_id(b)
+      ir_put_indent(b)
+      ir_put_str(b, "%")
+      ir_put_int(b, scaled_idx as i64)
+      ir_put_str(b, " = mul i64 %")
+      ir_put_int(b, idx as i64)
+      ir_put_str(b, ", 8")
+      ir_newline(b)
+      let addr: i32 = ir_fresh_id(b)
+      ir_put_indent(b)
+      ir_put_str(b, "%")
+      ir_put_int(b, addr as i64)
+      ir_put_str(b, " = getelementptr i8, ptr %")
+      ir_put_int(b, base_ptr as i64)
+      ir_put_str(b, ", i64 %")
+      ir_put_int(b, scaled_idx as i64)
+      ir_newline(b)
+      # Store value
+      ir_put_indent(b)
+      ir_put_str(b, "store i64 %")
+      ir_put_int(b, value as i64)
+      ir_put_str(b, ", ptr %")
+      ir_put_int(b, addr as i64)
+      ir_newline(b)
+    return 0
+
+  # Skip unknown statement types
+  0
+
+# Emit an expression from parser's Expr struct
+fn emit_ast_expr(ctx: *AstEmitCtx, expr: *i8) -> i32
+  # Expr layout (all i64): kind(0), val1(8), val2(16), left(24), right(32), next(40)
+  let b: *IRBuilder = ctx.b
+  let kind: i32 = *((expr + 0) as *i32)
+
+  if kind == EXPR_INT_LIT
+    # val1 at offset 8
+    let val: i64 = *((expr + 8) as *i64)
+    # Emit: %id = add i64 0, <val>
+    let result: i32 = ir_fresh_id(b)
+    ir_put_indent(b)
+    ir_put_str(b, "%")
+    ir_put_int(b, result as i64)
+    ir_put_str(b, " = add i64 0, ")
+    ir_put_int(b, val)
+    ir_newline(b)
+    return result
+
+  if kind == EXPR_BOOL_LIT
+    # val1 is 1 for true, 0 for false (offset 8)
+    let val: i64 = *((expr + 8) as *i64)
+    let result: i32 = ir_fresh_id(b)
+    ir_put_indent(b)
+    ir_put_str(b, "%")
+    ir_put_int(b, result as i64)
+    ir_put_str(b, " = add i64 0, ")
+    ir_put_int(b, val)
+    ir_newline(b)
+    return result
+
+  if kind == EXPR_IDENT
+    # Variable reference: val1 = start position in source (offset 8), val2 = length (offset 16)
+    let name_start: i32 = *((expr + 8) as *i64) as i32
+    let name_len: i32 = *((expr + 16) as *i64) as i32
+    let local: *AstLocal = ast_lookup_local(ctx, name_start, name_len)
+    if local != 0 as *AstLocal
+      # Load from the local's slot (using opaque ptr)
+      let result: i32 = ir_fresh_id(b)
+      ir_put_indent(b)
+      ir_put_str(b, "%")
+      ir_put_int(b, result as i64)
+      ir_put_str(b, " = load i64, ptr %")
+      ir_put_int(b, local.slot as i64)
+      ir_newline(b)
+      return result
+    # Check if it's a constant
+    var const_val: i64 = 0
+    let name: *i8 = ctx.src + name_start
+    if ir_lookup_const(b, name, name_len, &const_val) == 1
+      # Emit constant as immediate value
+      let result: i32 = ir_fresh_id(b)
+      ir_put_indent(b)
+      ir_put_str(b, "%")
+      ir_put_int(b, result as i64)
+      ir_put_str(b, " = add i64 0, ")
+      ir_put_int(b, const_val)
+      ir_newline(b)
+      return result
+    # Variable not found - emit 0 as fallback
+    let result: i32 = ir_fresh_id(b)
+    ir_put_indent(b)
+    ir_put_str(b, "%")
+    ir_put_int(b, result as i64)
+    ir_put_str(b, " = add i64 0, 0  ; undefined variable")
+    ir_newline(b)
+    return result
+
+  if kind == EXPR_PAREN
+    # Just emit the inner expression (left at offset 24)
+    let inner: *i8 = *((expr + 24) as **i8)
+    return emit_ast_expr(ctx, inner)
+
+  if kind == EXPR_CALL
+    # Function call: left = callee (EXPR_IDENT) at offset 24, right = args list at offset 32
+    # callee name is in left.val1 (offset 8) and left.val2 (offset 16)
+    let callee: *i8 = *((expr + 24) as **i8)
+    let args: *i8 = *((expr + 32) as **i8)
+    # Get callee name from source buffer
+    let callee_start: i32 = *((callee + 8) as *i64) as i32
+    let callee_len: i32 = *((callee + 16) as *i64) as i32
+
+    # Get callee name pointer for builtin/syscall checks
+    let callee_name: *i8 = ctx.src + callee_start
+
+    # Check for __builtin_alloca - emit as LLVM alloca instruction
+    if callee_len == 16
+      # Check if it starts with "__builtin_alloca"
+      if *(callee_name + 0) == 95  # '_'
+        if *(callee_name + 1) == 95  # '_'
+          if *(callee_name + 2) == 98  # 'b'
+            # Emit args first to get size value
+            let size_val: i32 = emit_ast_expr(ctx, args)
+            let result: i32 = ir_fresh_id(b)
+            ir_put_indent(b)
+            ir_put_str(b, "%")
+            ir_put_int(b, result as i64)
+            ir_put_str(b, " = alloca i8, i64 %")
+            ir_put_int(b, size_val as i64)
+            ir_newline(b)
+            # Convert alloca result (ptr) to i64
+            let ptr_val: i32 = ir_fresh_id(b)
+            ir_put_indent(b)
+            ir_put_str(b, "%")
+            ir_put_int(b, ptr_val as i64)
+            ir_put_str(b, " = ptrtoint ptr %")
+            ir_put_int(b, result as i64)
+            ir_put_str(b, " to i64")
+            ir_newline(b)
+            return ptr_val
+
+    # Check for syscall functions: read, write, open, close
+    # These are emitted as inline asm syscalls
+    if callee_len == 4 && *(callee_name + 0) == 114  # 'r'ead
+      if *(callee_name + 1) == 101 && *(callee_name + 2) == 97 && *(callee_name + 3) == 100
+        # read(fd, buf, count) -> syscall 0
+        var arg_vals: [3]i32 = [0; 3]
+        var arg: *i8 = args
+        var i: i32 = 0
+        while arg != 0 as *i8 && i < 3
+          arg_vals[i] = emit_ast_expr(ctx, arg)
+          arg = *((arg + 40) as **i8)  # Expr.next at offset 40
+          i = i + 1
+        let result: i32 = ir_fresh_id(b)
+        ir_put_indent(b)
+        ir_put_str(b, "%")
+        ir_put_int(b, result as i64)
+        ir_put_str(b, " = call i64 asm sideeffect ")
+        ir_put_byte(b, 34)
+        ir_put_str(b, "syscall")
+        ir_put_byte(b, 34)
+        ir_put_str(b, ", ")
+        ir_put_byte(b, 34)
+        ir_put_str(b, "=&{rax},{rax},{rdi},{rsi},{rdx},~{rcx},~{r11},~{memory}")
+        ir_put_byte(b, 34)
+        ir_put_str(b, "(i64 0, i64 %")
+        ir_put_int(b, arg_vals[0] as i64)
+        ir_put_str(b, ", i64 %")
+        ir_put_int(b, arg_vals[1] as i64)
+        ir_put_str(b, ", i64 %")
+        ir_put_int(b, arg_vals[2] as i64)
+        ir_put_str(b, ")")
+        ir_newline(b)
+        return result
+
+    if callee_len == 5 && *(callee_name + 0) == 119  # 'w'rite
+      if *(callee_name + 1) == 114 && *(callee_name + 2) == 105 && *(callee_name + 3) == 116 && *(callee_name + 4) == 101
+        # write(fd, buf, count) -> syscall 1
+        var arg_vals: [3]i32 = [0; 3]
+        var arg: *i8 = args
+        var i: i32 = 0
+        while arg != 0 as *i8 && i < 3
+          arg_vals[i] = emit_ast_expr(ctx, arg)
+          arg = *((arg + 40) as **i8)  # Expr.next at offset 40
+          i = i + 1
+        let result: i32 = ir_fresh_id(b)
+        ir_put_indent(b)
+        ir_put_str(b, "%")
+        ir_put_int(b, result as i64)
+        ir_put_str(b, " = call i64 asm sideeffect ")
+        ir_put_byte(b, 34)
+        ir_put_str(b, "syscall")
+        ir_put_byte(b, 34)
+        ir_put_str(b, ", ")
+        ir_put_byte(b, 34)
+        ir_put_str(b, "=&{rax},{rax},{rdi},{rsi},{rdx},~{rcx},~{r11},~{memory}")
+        ir_put_byte(b, 34)
+        ir_put_str(b, "(i64 1, i64 %")
+        ir_put_int(b, arg_vals[0] as i64)
+        ir_put_str(b, ", i64 %")
+        ir_put_int(b, arg_vals[1] as i64)
+        ir_put_str(b, ", i64 %")
+        ir_put_int(b, arg_vals[2] as i64)
+        ir_put_str(b, ")")
+        ir_newline(b)
+        return result
+
+    if callee_len == 4 && *(callee_name + 0) == 111  # 'o'pen
+      if *(callee_name + 1) == 112 && *(callee_name + 2) == 101 && *(callee_name + 3) == 110
+        # open(path, flags, mode) -> syscall 2
+        var arg_vals: [3]i32 = [0; 3]
+        var arg: *i8 = args
+        var i: i32 = 0
+        while arg != 0 as *i8 && i < 3
+          arg_vals[i] = emit_ast_expr(ctx, arg)
+          arg = *((arg + 40) as **i8)  # Expr.next at offset 40
+          i = i + 1
+        let result: i32 = ir_fresh_id(b)
+        ir_put_indent(b)
+        ir_put_str(b, "%")
+        ir_put_int(b, result as i64)
+        ir_put_str(b, " = call i64 asm sideeffect ")
+        ir_put_byte(b, 34)
+        ir_put_str(b, "syscall")
+        ir_put_byte(b, 34)
+        ir_put_str(b, ", ")
+        ir_put_byte(b, 34)
+        ir_put_str(b, "=&{rax},{rax},{rdi},{rsi},{rdx},~{rcx},~{r11},~{memory}")
+        ir_put_byte(b, 34)
+        ir_put_str(b, "(i64 2, i64 %")
+        ir_put_int(b, arg_vals[0] as i64)
+        ir_put_str(b, ", i64 %")
+        ir_put_int(b, arg_vals[1] as i64)
+        ir_put_str(b, ", i64 %")
+        ir_put_int(b, arg_vals[2] as i64)
+        ir_put_str(b, ")")
+        ir_newline(b)
+        return result
+
+    if callee_len == 5 && *(callee_name + 0) == 99  # 'c'lose
+      if *(callee_name + 1) == 108 && *(callee_name + 2) == 111 && *(callee_name + 3) == 115 && *(callee_name + 4) == 101
+        # close(fd) -> syscall 3
+        let arg_val: i32 = emit_ast_expr(ctx, args)
+        let result: i32 = ir_fresh_id(b)
+        ir_put_indent(b)
+        ir_put_str(b, "%")
+        ir_put_int(b, result as i64)
+        ir_put_str(b, " = call i64 asm sideeffect ")
+        ir_put_byte(b, 34)
+        ir_put_str(b, "syscall")
+        ir_put_byte(b, 34)
+        ir_put_str(b, ", ")
+        ir_put_byte(b, 34)
+        ir_put_str(b, "=&{rax},{rax},{rdi},~{rcx},~{r11},~{memory}")
+        ir_put_byte(b, 34)
+        ir_put_str(b, "(i64 3, i64 %")
+        ir_put_int(b, arg_val as i64)
+        ir_put_str(b, ")")
+        ir_newline(b)
+        return result
+
+    # Check for syscall2(nr, arg1, arg2)
+    if callee_len == 8 && *(callee_name + 0) == 115  # 's'yscall2
+      if *(callee_name + 7) == 50  # '2'
+        var arg_vals: [3]i32 = [0; 3]
+        var arg: *i8 = args
+        var i: i32 = 0
+        while arg != 0 as *i8 && i < 3
+          arg_vals[i] = emit_ast_expr(ctx, arg)
+          arg = *((arg + 40) as **i8)  # Expr.next at offset 40
+          i = i + 1
+        let result: i32 = ir_fresh_id(b)
+        ir_put_indent(b)
+        ir_put_str(b, "%")
+        ir_put_int(b, result as i64)
+        ir_put_str(b, " = call i64 asm sideeffect ")
+        ir_put_byte(b, 34)
+        ir_put_str(b, "syscall")
+        ir_put_byte(b, 34)
+        ir_put_str(b, ", ")
+        ir_put_byte(b, 34)
+        ir_put_str(b, "=&{rax},{rax},{rdi},{rsi},~{rcx},~{r11},~{memory}")
+        ir_put_byte(b, 34)
+        ir_put_str(b, "(i64 %")
+        ir_put_int(b, arg_vals[0] as i64)
+        ir_put_str(b, ", i64 %")
+        ir_put_int(b, arg_vals[1] as i64)
+        ir_put_str(b, ", i64 %")
+        ir_put_int(b, arg_vals[2] as i64)
+        ir_put_str(b, ")")
+        ir_newline(b)
+        return result
+
+    # Check for syscall6(nr, arg1, arg2, arg3, arg4, arg5, arg6)
+    if callee_len == 8 && *(callee_name + 0) == 115  # 's'yscall6
+      if *(callee_name + 7) == 54  # '6'
+        var arg_vals: [7]i32 = [0; 7]
+        var arg: *i8 = args
+        var i: i32 = 0
+        while arg != 0 as *i8 && i < 7
+          arg_vals[i] = emit_ast_expr(ctx, arg)
+          arg = *((arg + 40) as **i8)  # Expr.next at offset 40
+          i = i + 1
+        let result: i32 = ir_fresh_id(b)
+        ir_put_indent(b)
+        ir_put_str(b, "%")
+        ir_put_int(b, result as i64)
+        ir_put_str(b, " = call i64 asm sideeffect ")
+        ir_put_byte(b, 34)
+        ir_put_str(b, "syscall")
+        ir_put_byte(b, 34)
+        ir_put_str(b, ", ")
+        ir_put_byte(b, 34)
+        ir_put_str(b, "=&{rax},{rax},{rdi},{rsi},{rdx},{r10},{r8},{r9},~{rcx},~{r11},~{memory}")
+        ir_put_byte(b, 34)
+        ir_put_str(b, "(i64 %")
+        ir_put_int(b, arg_vals[0] as i64)
+        ir_put_str(b, ", i64 %")
+        ir_put_int(b, arg_vals[1] as i64)
+        ir_put_str(b, ", i64 %")
+        ir_put_int(b, arg_vals[2] as i64)
+        ir_put_str(b, ", i64 %")
+        ir_put_int(b, arg_vals[3] as i64)
+        ir_put_str(b, ", i64 %")
+        ir_put_int(b, arg_vals[4] as i64)
+        ir_put_str(b, ", i64 %")
+        ir_put_int(b, arg_vals[5] as i64)
+        ir_put_str(b, ", i64 %")
+        ir_put_int(b, arg_vals[6] as i64)
+        ir_put_str(b, ")")
+        ir_newline(b)
+        return result
+
+    # Emit args first to get their SSA values
+    var arg_vals: [32]i32 = [0; 32]
+    var arg_count: i32 = 0
+    var arg: *i8 = args
+    while arg != 0 as *i8
+      if arg_count < 32
+        arg_vals[arg_count] = emit_ast_expr(ctx, arg)
+        arg_count = arg_count + 1
+      arg = *((arg + 40) as **i8)  # Expr.next at offset 40  # next pointer at offset 32
+    # Emit the call
+    let result: i32 = ir_fresh_id(b)
+    ir_put_indent(b)
+    ir_put_str(b, "%")
+    ir_put_int(b, result as i64)
+    ir_put_str(b, " = call i64 @\"")
+    ir_put_str_len(b, ctx.src + callee_start, callee_len)
+    ir_put_byte(b, 34)
+    ir_put_str(b, "(")
+    # Emit arg list
+    var i: i32 = 0
+    while i < arg_count
+      if i > 0
+        ir_put_str(b, ", ")
+      ir_put_str(b, "i64 %")
+      ir_put_int(b, arg_vals[i] as i64)
+      i = i + 1
+    ir_put_str(b, ")")
+    ir_newline(b)
+    return result
+
+  if kind == EXPR_UNARY_OP
+    # Unary operation: val2 = operator (offset 16), left = operand (offset 24)
+    let op: i32 = *((expr + 16) as *i64) as i32
+    let operand: *i8 = *((expr + 24) as **i8)
+    let val: i32 = emit_ast_expr(ctx, operand)
+    if op == TOK_MINUS
+      let result: i32 = ir_fresh_id(b)
+      ir_put_indent(b)
+      ir_put_str(b, "%")
+      ir_put_int(b, result as i64)
+      ir_put_str(b, " = sub i64 0, %")
+      ir_put_int(b, val as i64)
+      ir_newline(b)
+      return result
+    if op == TOK_STAR  # Dereference
+      # For *(ptr + offset) pattern, we do byte-level pointer arithmetic
+      # This works correctly for *i8 (most common case for strings)
+      # For *i64 indexing, source code should explicitly multiply by 8
+      # Regular dereference (no pointer arithmetic)
+      # val is an i64 (pointer value), convert to ptr and load
+      let ptr: i32 = ir_fresh_id(b)
+      ir_put_indent(b)
+      ir_put_str(b, "%")
+      ir_put_int(b, ptr as i64)
+      ir_put_str(b, " = inttoptr i64 %")
+      ir_put_int(b, val as i64)
+      ir_put_str(b, " to ptr")
+      ir_newline(b)
+      # Allocate result ID AFTER ptr to maintain SSA ordering
+      let result: i32 = ir_fresh_id(b)
+      ir_put_indent(b)
+      ir_put_str(b, "%")
+      ir_put_int(b, result as i64)
+      ir_put_str(b, " = load i64, ptr %")
+      ir_put_int(b, ptr as i64)
+      ir_newline(b)
+      return result
+    if op == TOK_AMP  # Address-of
+      # For &var, we need the slot address as an i64
+      # Check if operand is an identifier and get its slot
+      let op_kind: i32 = *((operand + 0) as *i32)
+      if op_kind == EXPR_IDENT
+        let name_start: i32 = *((operand + 8) as *i64) as i32
+        let name_len: i32 = *((operand + 16) as *i64) as i32
+        let local: *AstLocal = ast_lookup_local(ctx, name_start, name_len)
+        if local != 0 as *AstLocal
+          # Convert slot pointer to i64
+          let addr: i32 = ir_fresh_id(b)
+          ir_put_indent(b)
+          ir_put_str(b, "%")
+          ir_put_int(b, addr as i64)
+          ir_put_str(b, " = ptrtoint ptr %")
+          ir_put_int(b, local.slot as i64)
+          ir_put_str(b, " to i64")
+          ir_newline(b)
+          return addr
+      # Fallback: return the evaluated value
+      return val
+    return -1
+
+  if kind == EXPR_FIELD
+    # Field access: left = base expr (offset 24), val1 = field name start (offset 8), val2 = field name len (offset 16)
+    # For (*ptr).field, we need the pointer address, NOT the loaded value
+    # Check if base is UNARY_OP(DEREF) - if so, get the pointer directly
+    let base_expr: *i8 = *((expr + 24) as **i8)
+    let field_start: i32 = *((expr + 8) as *i64) as i32    # val1 = field name start
+    let field_len: i32 = *((expr + 16) as *i64) as i32      # val2 = field name len
+    var base: i32 = 0
+    let base_kind: i32 = *((base_expr + 0) as *i32)
+    if base_kind == EXPR_UNARY_OP
+      # Check if it's a DEREF (TOK_STAR = 30) - operator is at offset 16 (val2)
+      let base_op: i32 = *((base_expr + 16) as *i64) as i32
+      if base_op == 30  # TOK_STAR - dereference
+        # For (*ptr).field, emit the pointer value directly, skip the load
+        let inner_expr: *i8 = *((base_expr + 24) as **i8)
+        base = emit_ast_expr(ctx, inner_expr)
+      else
+        base = emit_ast_expr(ctx, base_expr)
+    else
+      base = emit_ast_expr(ctx, base_expr)
+    # Convert i64 to pointer
+    let ptr: i32 = ir_fresh_id(b)
+    ir_put_indent(b)
+    ir_put_str(b, "%")
+    ir_put_int(b, ptr as i64)
+    ir_put_str(b, " = inttoptr i64 %")
+    ir_put_int(b, base as i64)
+    ir_put_str(b, " to ptr")
+    ir_newline(b)
+    # Compute field offset: search through all structs for matching field
+    let field_name: *i8 = ctx.src + field_start
+    var field_offset: i32 = 0
+    var found_offset: i32 = -1
+    var struct_def: *i8 = b.structs
+    while struct_def != 0 as *i8 && found_offset == -1
+      # struct_def.fields is at offset 16 (*StructField)
+      var field: *i8 = *((struct_def + 16) as **i8)
+      field_offset = 0
+      while field != 0 as *i8
+        # StructField layout (all i64): name(*i8 at 0), name_len(i64 at 8), type_expr(*TypeExpr at 16), next(*StructField at 24)
+        let fname: *i8 = *((field + 0) as **i8)
+        let flen: i32 = *((field + 8) as *i64) as i32
+        if flen == field_len
+          # Compare field names
+          var matched: i32 = 1
+          var i: i32 = 0
+          while i < field_len
+            if *(fname + i) != *(field_name + i)
+              matched = 0
+            i = i + 1
+          if matched == 1
+            found_offset = field_offset
+            struct_def = 0 as *i8  # Break outer loop
+        if found_offset == -1
+          field_offset = field_offset + 8  # Each field is 8 bytes
+        field = *((field + 24) as **i8)
+      struct_def = *((struct_def + 32) as **i8)  # Next struct
+    # If not found, use offset 0 (fallback)
+    if found_offset == -1
+      found_offset = 0
+    # Compute field address using GEP
+    let field_ptr: i32 = ir_fresh_id(b)
+    ir_put_indent(b)
+    ir_put_str(b, "%")
+    ir_put_int(b, field_ptr as i64)
+    ir_put_str(b, " = getelementptr i8, ptr %")
+    ir_put_int(b, ptr as i64)
+    ir_put_str(b, ", i64 ")
+    ir_put_int(b, found_offset as i64)
+    ir_newline(b)
+    # Load field value
+    let result: i32 = ir_fresh_id(b)
+    ir_put_indent(b)
+    ir_put_str(b, "%")
+    ir_put_int(b, result as i64)
+    ir_put_str(b, " = load i64, ptr %")
+    ir_put_int(b, field_ptr as i64)
+    ir_newline(b)
+    return result
+
+  if kind == EXPR_CAST
+    # Type cast: left = expr (offset 24), right = type
+    # For now just emit the expression (no actual conversion)
+    let inner: *i8 = *((expr + 24) as **i8)
+    return emit_ast_expr(ctx, inner)
+
+  if kind == EXPR_BIN_OP
+    # Offsets: val2 at 16, left at 24, right at 32
+    let op: i32 = *((expr + 16) as *i64) as i32
+    let left: *i8 = *((expr + 24) as **i8)
+    let right: *i8 = *((expr + 32) as **i8)
+
+    let lhs: i32 = emit_ast_expr(ctx, left)
+    let rhs: i32 = emit_ast_expr(ctx, right)
+
+    if op == TOK_EQEQ
+      return ir_emit_icmp(b, "eq", TY_I64, lhs, rhs)
+    if op == TOK_NEQ
+      return ir_emit_icmp(b, "ne", TY_I64, lhs, rhs)
+    if op == TOK_LT
+      return ir_emit_icmp(b, "slt", TY_I64, lhs, rhs)
+    if op == TOK_LEQ
+      return ir_emit_icmp(b, "sle", TY_I64, lhs, rhs)
+    if op == TOK_GT
+      return ir_emit_icmp(b, "sgt", TY_I64, lhs, rhs)
+    if op == TOK_GEQ
+      return ir_emit_icmp(b, "sge", TY_I64, lhs, rhs)
+
+    # For arithmetic and bitwise operators, pre-allocate result ID
+    let result: i32 = ir_fresh_id(b)
+
+    if op == TOK_PLUS
+      ir_emit_binop(b, "add", TY_I64, result, lhs, rhs)
+      return result
+    if op == TOK_MINUS
+      ir_emit_binop(b, "sub", TY_I64, result, lhs, rhs)
+      return result
+    if op == TOK_STAR
+      ir_emit_binop(b, "mul", TY_I64, result, lhs, rhs)
+      return result
+    if op == TOK_SLASH
+      ir_emit_binop(b, "sdiv", TY_I64, result, lhs, rhs)
+      return result
+    if op == TOK_PERCENT
+      ir_emit_binop(b, "srem", TY_I64, result, lhs, rhs)
+      return result
+    if op == TOK_AMP
+      ir_emit_binop(b, "and", TY_I64, result, lhs, rhs)
+      return result
+    if op == TOK_PIPE
+      ir_emit_binop(b, "or", TY_I64, result, lhs, rhs)
+      return result
+    if op == TOK_CARET
+      ir_emit_binop(b, "xor", TY_I64, result, lhs, rhs)
+      return result
+    if op == TOK_AMPAMP  # Logical AND
+      ir_emit_binop(b, "and", TY_I64, result, lhs, rhs)
+      return result
+    if op == TOK_PIPEPIPE  # Logical OR
+      ir_emit_binop(b, "or", TY_I64, result, lhs, rhs)
+      return result
+
+    return -1  # Unknown operator
+
+  if kind == EXPR_STRING_LIT
+    # String literal: val1=start (offset 8), val2=len (offset 16) in source buffer
+    # The source buffer contains the quoted string "..."
+    # We need to skip the opening quote and handle the content
+    let start: i32 = *((expr + 8) as *i64) as i32
+    let slen: i32 = *((expr + 16) as *i64) as i32
+    # slen includes the quotes, so content length is slen - 2
+    let content_len: i32 = slen - 2
+    # Allocate content_len+1 bytes on stack (for null terminator)
+    let slot: i32 = ir_fresh_id(b)
+    ir_put_indent(b)
+    ir_put_str(b, "%")
+    ir_put_int(b, slot as i64)
+    ir_put_str(b, " = alloca [")
+    ir_put_int(b, (content_len + 1) as i64)
+    ir_put_str(b, " x i8]")
+    ir_newline(b)
+    # Get pointer to start of array
+    let ptr: i32 = ir_fresh_id(b)
+    ir_put_indent(b)
+    ir_put_str(b, "%")
+    ir_put_int(b, ptr as i64)
+    ir_put_str(b, " = getelementptr [")
+    ir_put_int(b, (content_len + 1) as i64)
+    ir_put_str(b, " x i8], [")
+    ir_put_int(b, (content_len + 1) as i64)
+    ir_put_str(b, " x i8]* %")
+    ir_put_int(b, slot as i64)
+    ir_put_str(b, ", i64 0, i64 0")
+    ir_newline(b)
+    # Store each character from source buffer (skip opening quote at start+1)
+    # src_pos is position in source, out_pos is position in output buffer
+    var src_pos: i32 = 0
+    var out_pos: i32 = 0
+    while src_pos < content_len
+      let ch: i32 = (*((ctx.src + start + 1 + src_pos) as *i8)) & 255
+      # Handle escape sequences
+      var actual_ch: i32 = ch
+      if ch == 92  # backslash
+        if src_pos + 1 < content_len
+          let next_ch: i32 = (*((ctx.src + start + 1 + src_pos + 1) as *i8)) & 255
+          if next_ch == 110  # 'n'
+            actual_ch = 10  # newline
+            src_pos = src_pos + 1
+          else
+            if next_ch == 116  # 't'
+              actual_ch = 9  # tab
+              src_pos = src_pos + 1
+            else
+              if next_ch == 92  # '\\'
+                actual_ch = 92
+                src_pos = src_pos + 1
+              else
+                if next_ch == 34  # '"'
+                  actual_ch = 34
+                  src_pos = src_pos + 1
+      # Get pointer to output position
+      let char_ptr: i32 = ir_fresh_id(b)
+      ir_put_indent(b)
+      ir_put_str(b, "%")
+      ir_put_int(b, char_ptr as i64)
+      ir_put_str(b, " = getelementptr i8, ptr %")
+      ir_put_int(b, ptr as i64)
+      ir_put_str(b, ", i64 ")
+      ir_put_int(b, out_pos as i64)
+      ir_newline(b)
+      # Store the character
+      ir_put_indent(b)
+      ir_put_str(b, "store i8 ")
+      ir_put_int(b, actual_ch as i64)
+      ir_put_str(b, ", ptr %")
+      ir_put_int(b, char_ptr as i64)
+      ir_newline(b)
+      src_pos = src_pos + 1
+      out_pos = out_pos + 1
+    # Store null terminator
+    let null_ptr: i32 = ir_fresh_id(b)
+    ir_put_indent(b)
+    ir_put_str(b, "%")
+    ir_put_int(b, null_ptr as i64)
+    ir_put_str(b, " = getelementptr i8, ptr %")
+    ir_put_int(b, ptr as i64)
+    ir_put_str(b, ", i64 ")
+    ir_put_int(b, out_pos as i64)
+    ir_newline(b)
+    ir_put_indent(b)
+    ir_put_str(b, "store i8 0, ptr %")
+    ir_put_int(b, null_ptr as i64)
+    ir_newline(b)
+    # Convert pointer to i64 for uniform value representation
+    let result: i32 = ir_fresh_id(b)
+    ir_put_indent(b)
+    ir_put_str(b, "%")
+    ir_put_int(b, result as i64)
+    ir_put_str(b, " = ptrtoint ptr %")
+    ir_put_int(b, ptr as i64)
+    ir_put_str(b, " to i64")
+    ir_newline(b)
+    return result
+
+  if kind == EXPR_INDEX
+    # Array/pointer indexing: base[index]
+    # left = base expression (offset 24), right = index expression (offset 32)
+    let base_expr: *i8 = *((expr + 24) as **i8)
+    let idx_expr: *i8 = *((expr + 32) as **i8)
+    let idx: i32 = emit_ast_expr(ctx, idx_expr)
+
+    # Check if base is EXPR_FIELD (array-in-struct like indent_stack[i])
+    let base_kind: i32 = *((base_expr + 0) as *i32)
+    var base_ptr: i32 = 0
+
+    if base_kind == EXPR_FIELD
+      # For field access, we need the ADDRESS of the field, not its value
+      # Re-implement field address computation without the final load
+      let field_base_expr: *i8 = *((base_expr + 24) as **i8)
+      let field_start: i32 = *((base_expr + 8) as *i64) as i32
+      let field_len: i32 = *((base_expr + 16) as *i64) as i32
+      let field_base: i32 = emit_ast_expr(ctx, field_base_expr)
+      # Convert to pointer
+      let ptr: i32 = ir_fresh_id(b)
+      ir_put_indent(b)
+      ir_put_str(b, "%")
+      ir_put_int(b, ptr as i64)
+      ir_put_str(b, " = inttoptr i64 %")
+      ir_put_int(b, field_base as i64)
+      ir_put_str(b, " to ptr")
+      ir_newline(b)
+      # Find field offset
+      let field_name: *i8 = ctx.src + field_start
+      var field_offset: i32 = 0
+      var found_offset: i32 = -1
+      var struct_def: *i8 = b.structs
+      while struct_def != 0 as *i8 && found_offset == -1
+        var field: *i8 = *((struct_def + 16) as **i8)
+        field_offset = 0
+        while field != 0 as *i8
+          let fname: *i8 = *((field + 0) as **i8)
+          let flen: i32 = *((field + 8) as *i64) as i32
+          if flen == field_len
+            var matched: i32 = 1
+            var i: i32 = 0
+            while i < field_len
+              if *(fname + i) != *(field_name + i)
+                matched = 0
+              i = i + 1
+            if matched == 1
+              found_offset = field_offset
+              struct_def = 0 as *i8
+          if found_offset == -1
+            field_offset = field_offset + 8
+          field = *((field + 24) as **i8)
+        struct_def = *((struct_def + 32) as **i8)
+      if found_offset == -1
+        found_offset = 0
+      # Compute field address (this is the array base)
+      let field_ptr: i32 = ir_fresh_id(b)
+      ir_put_indent(b)
+      ir_put_str(b, "%")
+      ir_put_int(b, field_ptr as i64)
+      ir_put_str(b, " = getelementptr i8, ptr %")
+      ir_put_int(b, ptr as i64)
+      ir_put_str(b, ", i64 ")
+      ir_put_int(b, found_offset as i64)
+      ir_newline(b)
+      base_ptr = field_ptr
+    else
+      # Normal case: emit base and convert to pointer
+      let base: i32 = emit_ast_expr(ctx, base_expr)
+      let ptr: i32 = ir_fresh_id(b)
+      ir_put_indent(b)
+      ir_put_str(b, "%")
+      ir_put_int(b, ptr as i64)
+      ir_put_str(b, " = inttoptr i64 %")
+      ir_put_int(b, base as i64)
+      ir_put_str(b, " to ptr")
+      ir_newline(b)
+      base_ptr = ptr
+
+    # Compute element address: base_ptr + idx * 8 (assuming i64 elements)
+    # For i32 arrays, we should use 4, but for now assume i64
+    let scaled_idx: i32 = ir_fresh_id(b)
+    ir_put_indent(b)
+    ir_put_str(b, "%")
+    ir_put_int(b, scaled_idx as i64)
+    ir_put_str(b, " = mul i64 %")
+    ir_put_int(b, idx as i64)
+    ir_put_str(b, ", 8")
+    ir_newline(b)
+    let addr: i32 = ir_fresh_id(b)
+    ir_put_indent(b)
+    ir_put_str(b, "%")
+    ir_put_int(b, addr as i64)
+    ir_put_str(b, " = getelementptr i8, ptr %")
+    ir_put_int(b, base_ptr as i64)
+    ir_put_str(b, ", i64 %")
+    ir_put_int(b, scaled_idx as i64)
+    ir_newline(b)
+    # Load from address
+    let result: i32 = ir_fresh_id(b)
+    ir_put_indent(b)
+    ir_put_str(b, "%")
+    ir_put_int(b, result as i64)
+    ir_put_str(b, " = load i64, ptr %")
+    ir_put_int(b, addr as i64)
+    ir_newline(b)
+    return result
+
+  if kind == EXPR_STRUCT_LIT
+    # Struct literal: StructName { field1: val1, field2: val2, ... }
+    # val1 = struct name start, val2 = struct name length, left = field list
+    # Allocate struct size on stack and return pointer as i64
+    let slot: i32 = ir_fresh_id(b)
+    ir_put_indent(b)
+    ir_put_str(b, "%")
+    ir_put_int(b, slot as i64)
+    ir_put_str(b, " = alloca [128 x i8]")  # Allocate 128 bytes for struct
+    ir_newline(b)
+    # Get pointer to start
+    let ptr: i32 = ir_fresh_id(b)
+    ir_put_indent(b)
+    ir_put_str(b, "%")
+    ir_put_int(b, ptr as i64)
+    ir_put_str(b, " = getelementptr [128 x i8], [128 x i8]* %")
+    ir_put_int(b, slot as i64)
+    ir_put_str(b, ", i64 0, i64 0")
+    ir_newline(b)
+
+    # Process field initializers and store values at correct offsets
+    # Expr layout (all i64): kind(0), val1(8), val2(16), left(24), right(32), next(40)
+    let field_list: *i8 = *((expr + 24) as **i8)  # left = field list
+    var field: *i8 = field_list
+    var field_offset: i32 = 0
+    while field != 0 as *i8
+      let field_kind: i32 = *((field + 0) as *i32)
+      if field_kind == EXPR_FIELD_INIT
+        # Get value expression from right (offset 32)
+        let value_expr: *i8 = *((field + 32) as **i8)
+        if value_expr != 0 as *i8
+          let value: i32 = emit_ast_expr(ctx, value_expr)
+          # Compute field address: ptr + field_offset
+          let field_ptr: i32 = ir_fresh_id(b)
+          ir_put_indent(b)
+          ir_put_str(b, "%")
+          ir_put_int(b, field_ptr as i64)
+          ir_put_str(b, " = getelementptr i8, ptr %")
+          ir_put_int(b, ptr as i64)
+          ir_put_str(b, ", i64 ")
+          ir_put_int(b, field_offset as i64)
+          ir_newline(b)
+          # Store value at field address
+          ir_put_indent(b)
+          ir_put_str(b, "store i64 %")
+          ir_put_int(b, value as i64)
+          ir_put_str(b, ", ptr %")
+          ir_put_int(b, field_ptr as i64)
+          ir_newline(b)
+      # Move to next field - each field is 8 bytes
+      field_offset = field_offset + 8
+      # Get next field from Expr.next (offset 40)
+      field = *((field + 40) as **i8)
+
+    # Convert struct pointer to i64 for uniform value representation
+    let result: i32 = ir_fresh_id(b)
+    ir_put_indent(b)
+    ir_put_str(b, "%")
+    ir_put_int(b, result as i64)
+    ir_put_str(b, " = ptrtoint ptr %")
+    ir_put_int(b, ptr as i64)
+    ir_put_str(b, " to i64")
+    ir_newline(b)
+    return result
+
+  if kind == EXPR_ARRAY_REPEAT
+    # Array repeat literal: [value; count]
+    # val1 = count (offset 8), left = value expression (offset 24)
+    # Allocate count * 8 bytes on stack and fill with value
+    let count: i32 = *((expr + 8) as *i64) as i32
+    let value_expr: *i8 = *((expr + 24) as **i8)
+    let value: i32 = emit_ast_expr(ctx, value_expr)
+    # Allocate array on stack
+    let total_size: i32 = count * 8
+    let slot: i32 = ir_fresh_id(b)
+    ir_put_indent(b)
+    ir_put_str(b, "%")
+    ir_put_int(b, slot as i64)
+    ir_put_str(b, " = alloca [")
+    ir_put_int(b, count as i64)
+    ir_put_str(b, " x i64]")
+    ir_newline(b)
+    # Get pointer to start
+    let ptr: i32 = ir_fresh_id(b)
+    ir_put_indent(b)
+    ir_put_str(b, "%")
+    ir_put_int(b, ptr as i64)
+    ir_put_str(b, " = getelementptr [")
+    ir_put_int(b, count as i64)
+    ir_put_str(b, " x i64], [")
+    ir_put_int(b, count as i64)
+    ir_put_str(b, " x i64]* %")
+    ir_put_int(b, slot as i64)
+    ir_put_str(b, ", i64 0, i64 0")
+    ir_newline(b)
+    # Store value at each index (unrolled for now since count is small)
+    var i: i32 = 0
+    while i < count
+      let elem_ptr: i32 = ir_fresh_id(b)
+      ir_put_indent(b)
+      ir_put_str(b, "%")
+      ir_put_int(b, elem_ptr as i64)
+      ir_put_str(b, " = getelementptr i64, ptr %")
+      ir_put_int(b, ptr as i64)
+      ir_put_str(b, ", i64 ")
+      ir_put_int(b, i as i64)
+      ir_newline(b)
+      ir_put_indent(b)
+      ir_put_str(b, "store i64 %")
+      ir_put_int(b, value as i64)
+      ir_put_str(b, ", ptr %")
+      ir_put_int(b, elem_ptr as i64)
+      ir_newline(b)
+      i = i + 1
+    # Return pointer as i64
+    let result: i32 = ir_fresh_id(b)
+    ir_put_indent(b)
+    ir_put_str(b, "%")
+    ir_put_int(b, result as i64)
+    ir_put_str(b, " = ptrtoint ptr %")
+    ir_put_int(b, ptr as i64)
+    ir_put_str(b, " to i64")
+    ir_newline(b)
+    return result
+
+  -1  # Unknown expression type

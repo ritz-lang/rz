@@ -1,0 +1,352 @@
+# csv - CSV parser and formatter
+#
+# Usage: csv [OPTIONS] [FILE]
+#   Parse and format CSV data.
+#
+# Options:
+#   -d CHAR       Field delimiter (default: comma)
+#   -H, --header  First row is header (print field names)
+#   -f FIELDS     Select specific fields (1-indexed, comma-separated)
+#   -t, --tsv     Use tab as delimiter (same as -d '\t')
+#   -h, --help    Show help
+#
+# Examples:
+#   csv data.csv                    # Pretty print all fields
+#   csv -f 1,3 data.csv             # Print columns 1 and 3
+#   csv -H data.csv                 # Treat first row as header
+#   csv -t data.tsv                 # Parse tab-separated values
+
+# ============================================================================
+# Standard library imports
+# ============================================================================
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+import ritzlib.args
+import ritzlib.gvec
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+const MAX_FIELDS: i32 = 64
+const MAX_FIELD_LEN: i64 = 4096
+
+# ============================================================================
+# CSV Parser
+# ============================================================================
+
+struct CsvParser
+    data: *u8
+    len: i64
+    pos: i64
+    delimiter: u8
+    # Current row fields
+    fields: *Vec<*u8>
+    field_buf: *Vec<u8>
+
+fn csv_init(p: *CsvParser, data: *u8, len: i64, delim: u8, fields: *Vec<*u8>, buf: *Vec<u8>) -> i32
+    p.data = data
+    p.len = len
+    p.pos = 0
+    p.delimiter = delim
+    p.fields = fields
+    p.field_buf = buf
+    return 0
+
+fn csv_eof(p: *CsvParser) -> i32
+    return (p.pos >= p.len) as i32
+
+fn peek(p: *CsvParser) -> u8
+    if p.pos >= p.len
+        return 0
+    return *(p.data + p.pos)
+
+fn advance(p: *CsvParser) -> u8
+    if p.pos >= p.len
+        return 0
+    let c: u8 = *(p.data + p.pos)
+    p.pos = p.pos + 1
+    return c
+
+fn parse_quoted_field(p: *CsvParser) -> i32
+    # Skip opening quote
+    advance(p)
+
+    let start: i64 = p.field_buf.len
+
+    while p.pos < p.len
+        let c: u8 = peek(p)
+
+        if c == '"'  # '"'
+            advance(p)
+            # Check for escaped quote ("")
+            if peek(p) == '"'
+                vec_push<u8>(p.field_buf, advance(p))
+            else
+                # End of quoted field
+                break
+        else
+            vec_push<u8>(p.field_buf, advance(p))
+
+    # Null terminate and store pointer
+    vec_push<u8>(p.field_buf, 0)
+    vec_push<*u8>(p.fields, p.field_buf.data + start)
+
+    return 0
+
+fn parse_unquoted_field(p: *CsvParser) -> i32
+    let start: i64 = p.field_buf.len
+
+    while p.pos < p.len
+        let c: u8 = peek(p)
+
+        if c == p.delimiter || c == '\n' || c == '\r'
+            break
+
+        vec_push<u8>(p.field_buf, advance(p))
+
+    # Null terminate and store pointer
+    vec_push<u8>(p.field_buf, 0)
+    vec_push<*u8>(p.fields, p.field_buf.data + start)
+
+    return 0
+
+fn parse_field(p: *CsvParser) -> i32
+    if peek(p) == '"'  # '"'
+        return parse_quoted_field(p)
+    else
+        return parse_unquoted_field(p)
+
+fn parse_row(p: *CsvParser) -> i32
+    # Clear previous fields
+    vec_clear<*u8>(p.fields)
+
+    # Handle empty line
+    if peek(p) == '\n'
+        advance(p)
+        return 0
+
+    # Parse first field
+    parse_field(p)
+
+    # Parse remaining fields
+    while p.pos < p.len
+        let c: u8 = peek(p)
+
+        if c == p.delimiter
+            advance(p)
+            parse_field(p)
+        else if c == '\n'  # newline
+            advance(p)
+            break
+        else if c == '\r'  # CR
+            advance(p)
+            if peek(p) == '\n'
+                advance(p)
+            break
+        else
+            break
+
+    return 0
+
+# ============================================================================
+# Field selection parsing
+# ============================================================================
+
+struct FieldSelector
+    indices: [64]i32      # 1-indexed field numbers to select
+    count: i32
+
+fn parse_field_selector(selector: *FieldSelector, spec: *u8) -> i32
+    selector.count = 0
+
+    if spec == null
+        return 0
+
+    var pos: i64 = 0
+    var num: i32 = 0
+
+    while *(spec + pos) != 0
+        let c: u8 = *(spec + pos)
+
+        if c >= '0' && c <= '9'  # digit
+            num = num * 10 + (c - '0') as i32
+        else if c == ','  # comma
+            if num > 0 && selector.count < 64
+                selector.indices[selector.count] = num
+                selector.count = selector.count + 1
+            num = 0
+
+        pos += 1
+
+    # Don't forget last number
+    if num > 0 && selector.count < 64
+        selector.indices[selector.count] = num
+        selector.count = selector.count + 1
+
+    return 0
+
+# ============================================================================
+# File reading
+# ============================================================================
+
+fn read_file(path: *u8, buf: *Vec<u8>) -> i32
+    let fd: i32 = sys_open(path, 0)  # O_RDONLY
+    if fd < 0
+        return -1
+
+    var tmp: [4096]u8
+    while 1 == 1
+        let n: i64 = sys_read(fd, &tmp[0], 4096)
+        if n < 0
+            sys_close(fd)
+            return -1
+        if n == 0
+            break
+        vec_push_bytes<u8>(buf, &tmp[0], n)
+
+    sys_close(fd)
+    return 0
+
+fn read_stdin(buf: *Vec<u8>) -> i32
+    var tmp: [4096]u8
+    while 1 == 1
+        let n: i64 = sys_read(0, &tmp[0], 4096)
+        if n < 0
+            return -1
+        if n == 0
+            break
+        vec_push_bytes<u8>(buf, &tmp[0], n)
+    return 0
+
+# ============================================================================
+# Output
+# ============================================================================
+
+fn print_field(s: *u8) -> i32
+    prints(s)
+    return 0
+
+fn print_row(fields: *Vec<*u8>, selector: *FieldSelector, headers: *Vec<*u8>, show_headers: i32) -> i32
+    var first: i32 = 1
+
+    if selector.count > 0
+        # Print only selected fields
+        for i in 0..selector.count
+            let idx: i32 = selector.indices[i] - 1  # Convert to 0-indexed
+            if idx >= 0 && idx < fields.len as i32
+                if first == 0
+                    prints("\t")
+                first = 0
+
+                if show_headers != 0 && headers.len > idx as i64
+                    let header: *u8 = vec_get<*u8>(headers, idx as i64)
+                    prints(header)
+                    prints("=")
+
+                print_field(vec_get<*u8>(fields, idx as i64))
+    else
+        # Print all fields
+        for i in 0..fields.len
+            if first == 0
+                prints("\t")
+            first = 0
+
+            if show_headers != 0 && headers.len > i
+                let header: *u8 = vec_get<*u8>(headers, i)
+                prints(header)
+                prints("=")
+
+            print_field(vec_get<*u8>(fields, i))
+
+    prints("\n")
+    return 0
+
+# ============================================================================
+# Main
+# ============================================================================
+
+fn main(argc: i32, argv: **u8) -> i32
+    var argparser: ArgParser
+    args_init(&argparser, "csv", "CSV parser and formatter")
+    args_option(&argparser, 'd', "delimiter", "CHAR", "Field delimiter (default: comma)", ",")
+    args_option(&argparser, 'f', "fields", "LIST", "Select specific fields (1-indexed, comma-separated)", "")
+    args_flag(&argparser, 'H', "header", "First row is header")
+    args_flag(&argparser, 't', "tsv", "Use tab as delimiter")
+    args_positional(&argparser, "FILE", "CSV file to process (stdin if omitted)", 0, 1)
+
+    if args_parse(&argparser, argc, argv) != 0
+        return 1
+
+    # Determine delimiter
+    var delimiter: u8 = 44  # comma
+    if args_get_flag(&argparser, 't') != 0
+        delimiter = 9  # tab
+
+    let delim_str: *u8 = args_get_str(&argparser, 'd')
+    if delim_str != null && *delim_str != 0
+        delimiter = *delim_str
+
+    let has_header: i32 = args_get_flag(&argparser, 'H')
+
+    # Parse field selector
+    var selector: FieldSelector
+    let field_spec: *u8 = args_get_str(&argparser, 'f')
+    parse_field_selector(&selector, field_spec)
+
+    # Read input
+    var input: Vec<u8> = vec_new<u8>()
+
+    if argparser.positional_count > 0
+        let path: *u8 = args_get_positional(&argparser, 0)
+        if read_file(path, &input) != 0
+            eprints("csv: cannot read file: ")
+            eprints(path)
+            eprints("\n")
+            return 1
+    else
+        if read_stdin(&input) != 0
+            eprints("csv: cannot read stdin\n")
+            return 1
+
+    # Initialize parser
+    # Pre-allocate buffers to avoid reallocation (which would invalidate pointers)
+    var fields: Vec<*u8> = vec_with_cap<*u8>(64)
+    var field_buf: Vec<u8> = vec_with_cap<u8>(8192)
+    var headers: Vec<*u8> = vec_with_cap<*u8>(64)
+    var header_buf: Vec<u8> = vec_with_cap<u8>(4096)
+
+    var parser: CsvParser
+    csv_init(&parser, input.data, input.len, delimiter, &fields, &field_buf)
+
+    # Process rows
+    var row_num: i32 = 0
+    while csv_eof(&parser) == 0
+        # Reset field buffer for this row (but keep headers)
+        vec_clear<u8>(&field_buf)
+
+        parse_row(&parser)
+
+        if fields.len == 0
+            continue
+
+        if row_num == 0 && has_header != 0
+            # Save header row
+            for i in 0..fields.len
+                let field: *u8 = vec_get<*u8>(&fields, i)
+                let slen: i64 = strlen(field)
+                let start: i64 = header_buf.len
+                vec_push_bytes<u8>(&header_buf, field, slen)
+                vec_push<u8>(&header_buf, 0)
+                vec_push<*u8>(&headers, header_buf.data + start)
+        else
+            # Print data row
+            print_row(&fields, &selector, &headers, has_header)
+
+        row_num += 1
+
+    # Cleanup handled automatically by Drop
+
+    return 0

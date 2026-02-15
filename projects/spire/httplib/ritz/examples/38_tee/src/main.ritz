@@ -1,0 +1,138 @@
+# tee - read from stdin, write to stdout and files
+#
+# Usage: tee [OPTIONS] [FILE]...
+#   Copy standard input to each FILE, and also to standard output.
+#
+# Options:
+#   -a, --append    Append to the given FILEs, do not overwrite
+#   -h, --help      Display this help and exit
+#
+# Exit status:
+#   0 - success
+#   1 - error opening or writing to a file
+#
+# Examples:
+#   echo "hello" | tee file.txt           # write to file and stdout
+#   echo "hello" | tee a.txt b.txt        # write to multiple files
+#   echo "more" | tee -a file.txt         # append to file
+
+# ============================================================================
+# Standard library imports
+# ============================================================================
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.args
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+const BUF_SIZE: i64 = 4096
+const MAX_FILES: i32 = 64
+
+# ============================================================================
+# Helper functions
+# ============================================================================
+
+# Write all bytes to a file descriptor
+# Returns 0 on success, -1 on error
+fn write_all(fd: i32, buf: *u8, count: i64) -> i32
+    var written: i64 = 0
+    while written < count
+        let n: i64 = sys_write(fd, buf + written, count - written)
+        if n < 0
+            return 0 - 1
+        written = written + n
+    return 0
+
+# ============================================================================
+# Main
+# ============================================================================
+
+fn main(argc: i32, argv: **u8) -> i32
+    # Parse arguments
+    var parser: ArgParser
+    args_init(&parser, "tee", "Copy standard input to each FILE, and also to standard output.")
+    args_flag(&parser, 'a', "append", "Append to the given FILEs, do not overwrite")
+    args_flag(&parser, 'h', "help", "Display this help and exit")
+    args_positional(&parser, "FILE", "Output file(s)", 0, 0 - 1)  # 0 to unlimited
+
+    if args_parse(&parser, argc, argv) != 0
+        return 1
+
+    if args_get_flag(&parser, 'h') != 0
+        args_print_help(&parser)
+        return 0
+
+    let append_mode: i32 = args_get_flag(&parser, 'a')
+
+    # Open output files
+    var fds: [64]i32  # MAX_FILES
+    var num_fds: i32 = 0
+    var exit_code: i32 = 0
+
+    var i: i32 = 0
+    while i < parser.positional_count
+        let path: *u8 = args_get_positional(&parser, i)
+
+        # Determine flags for open
+        var flags: i32 = O_WRONLY | O_CREAT
+        if append_mode != 0
+            flags = flags | O_APPEND
+        else
+            flags = flags | O_TRUNC
+
+        # Open with mode 0644 (rw-r--r--)
+        let mode: i32 = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH
+        let fd: i32 = sys_open3(path, flags, mode)
+
+        if fd < 0
+            eprints("tee: ")
+            eprints(path)
+            eprints(": cannot open file\n")
+            exit_code = 1
+        else
+            if num_fds < MAX_FILES
+                fds[num_fds] = fd
+                num_fds = num_fds + 1
+
+        i = i + 1
+
+    # Read from stdin, write to stdout and all files
+    var buf: *mut u8 = __builtin_alloca(BUF_SIZE)
+
+    var done: i32 = 0
+    while done == 0
+        let n: i64 = sys_read(STDIN, buf, BUF_SIZE)
+
+        if n < 0
+            eprints("tee: read error\n")
+            exit_code = 1
+            done = 1
+        else if n == 0
+            # EOF
+            done = 1
+        else
+            # Write to stdout
+            if write_all(STDOUT, buf, n) < 0
+                eprints("tee: write error\n")
+                exit_code = 1
+                done = 1
+
+            # Write to all output files
+            if done == 0
+                var j: i32 = 0
+                while j < num_fds
+                    if write_all(fds[j], buf, n) < 0
+                        eprints("tee: write error\n")
+                        exit_code = 1
+                    j = j + 1
+
+    # Close all output files
+    var k: i32 = 0
+    while k < num_fds
+        sys_close(fds[k])
+        k = k + 1
+
+    return exit_code

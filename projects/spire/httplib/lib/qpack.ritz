@@ -1,0 +1,452 @@
+# lib/qpack.ritz - QPACK Header Compression (RFC 9204)
+#
+# QPACK is designed for HTTP/3 over QUIC with:
+# - Out-of-order delivery tolerance
+# - Required Insert Count for synchronization
+# - Encoder/Decoder streams for table updates
+
+import ritzlib.span
+import lib.qpack_static
+import lib.quic_varint
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+pub const QPACK_MAX_DYNAMIC_TABLE_SIZE: i32 = 4096
+pub const QPACK_MAX_ENTRIES: i32 = 64
+pub const QPACK_ENTRY_OVERHEAD: i32 = 32  # RFC 9204 Section 3.2.1
+
+# ============================================================================
+# Error Codes
+# ============================================================================
+
+pub const QPACK_OK: i32 = 0
+pub const QPACK_ERR_INCOMPLETE: i32 = -1
+pub const QPACK_ERR_INVALID: i32 = -2
+pub const QPACK_ERR_TOO_LARGE: i32 = -3
+pub const QPACK_ERR_BLOCKED: i32 = -4
+
+# ============================================================================
+# Dynamic Table Entry
+# ============================================================================
+
+pub struct QpackDynEntry
+    name: [64]u8
+    name_len: i32
+    value: [256]u8
+    value_len: i32
+    size: i32  # Entry size including overhead
+
+pub fn qpack_dyn_entry_init(entry: *QpackDynEntry)
+    entry.name_len = 0
+    entry.value_len = 0
+    entry.size = 0
+
+# Calculate entry size (name + value + overhead)
+pub fn qpack_entry_size(name_len: i32, value_len: i32) -> i32
+    return name_len + value_len + QPACK_ENTRY_OVERHEAD
+
+# ============================================================================
+# Dynamic Table
+# ============================================================================
+
+pub struct QpackDynamicTable
+    entries: [64]QpackDynEntry
+    count: i32
+    insert_count: i64      # Total insertions (for Required Insert Count)
+    max_size: i32          # Maximum table size
+    current_size: i32      # Current table size
+
+pub fn qpack_dynamic_table_init(table: *QpackDynamicTable)
+    table.count = 0
+    table.insert_count = 0
+    table.max_size = QPACK_MAX_DYNAMIC_TABLE_SIZE
+    table.current_size = 0
+    var i: i32 = 0
+    while i < QPACK_MAX_ENTRIES
+        qpack_dyn_entry_init(@table.entries[i])
+        i = i + 1
+
+# Set maximum table size (may trigger eviction)
+pub fn qpack_dynamic_table_set_max_size(table: *QpackDynamicTable, max_size: i32)
+    table.max_size = max_size
+    # Evict until we're within size
+    while table.current_size > max_size && table.count > 0
+        qpack_dynamic_table_evict(table)
+
+# Insert entry (evicts old entries if needed)
+pub fn qpack_dynamic_table_insert(table: *QpackDynamicTable, name: Span<u8>, value: Span<u8>) -> i32
+    let entry_size: i32 = qpack_entry_size(name.len, value.len)
+
+    # Check if entry fits at all
+    if entry_size > table.max_size
+        return QPACK_ERR_TOO_LARGE
+
+    # Evict until there's room
+    while table.current_size + entry_size > table.max_size && table.count > 0
+        qpack_dynamic_table_evict(table)
+
+    if table.count >= QPACK_MAX_ENTRIES
+        qpack_dynamic_table_evict(table)
+
+    # Shift existing entries (new entry goes at front)
+    var i: i32 = table.count
+    while i > 0
+        # Copy entry i-1 to entry i
+        qpack_copy_entry(@table.entries[i], @table.entries[i - 1])
+        i = i - 1
+
+    # Insert at front
+    var j: i32 = 0
+    while j < name.len && j < 64
+        table.entries[0].name[j] = *(name.ptr + j)
+        j = j + 1
+    table.entries[0].name_len = name.len
+    if name.len > 64
+        table.entries[0].name_len = 64
+
+    j = 0
+    while j < value.len && j < 256
+        table.entries[0].value[j] = *(value.ptr + j)
+        j = j + 1
+    table.entries[0].value_len = value.len
+    if value.len > 256
+        table.entries[0].value_len = 256
+
+    table.entries[0].size = entry_size
+    table.count = table.count + 1
+    table.current_size = table.current_size + entry_size
+    table.insert_count = table.insert_count + 1
+
+    return QPACK_OK
+
+# Evict oldest entry (at the back)
+fn qpack_dynamic_table_evict(table: *QpackDynamicTable)
+    if table.count == 0
+        return
+    table.count = table.count - 1
+    table.current_size = table.current_size - table.entries[table.count].size
+    qpack_dyn_entry_init(@table.entries[table.count])
+
+fn qpack_copy_entry(dst: *QpackDynEntry, src: *QpackDynEntry)
+    dst.name_len = src.name_len
+    dst.value_len = src.value_len
+    dst.size = src.size
+    var i: i32 = 0
+    while i < 64
+        dst.name[i] = src.name[i]
+        i = i + 1
+    i = 0
+    while i < 256
+        dst.value[i] = src.value[i]
+        i = i + 1
+
+# Get entry by absolute index (0 = most recent)
+pub fn qpack_dynamic_table_get(table: *QpackDynamicTable, index: i32, entry: *QpackStaticEntry) -> i32
+    if index < 0 || index >= table.count
+        return -1
+    entry.name.ptr = @table.entries[index].name[0]
+    entry.name.len = table.entries[index].name_len
+    entry.value.ptr = @table.entries[index].value[0]
+    entry.value.len = table.entries[index].value_len
+    return 0
+
+# ============================================================================
+# QPACK Prefix Encoding (RFC 9204 Section 4.5.1)
+# ============================================================================
+
+# Encode integer with prefix
+pub fn qpack_encode_int(value: i64, prefix_bits: i32, buf: *u8, buf_len: i32) -> i32
+    let max_prefix: i64 = (1 << prefix_bits) - 1
+    var pos: i32 = 0
+
+    if value < max_prefix
+        *buf = (*buf & ~(max_prefix as u8)) | (value as u8)
+        return 1
+
+    *buf = (*buf & ~(max_prefix as u8)) | (max_prefix as u8)
+    pos = 1
+    var remaining: i64 = value - max_prefix
+
+    while remaining >= 128
+        if pos >= buf_len
+            return QPACK_ERR_INCOMPLETE
+        *(buf + pos) = ((remaining & 0x7F) | 0x80) as u8
+        remaining = remaining >> 7
+        pos = pos + 1
+
+    if pos >= buf_len
+        return QPACK_ERR_INCOMPLETE
+    *(buf + pos) = (remaining & 0x7F) as u8
+    return pos + 1
+
+# Decode integer with prefix
+pub fn qpack_decode_int(buf: *u8, buf_len: i32, prefix_bits: i32, result: *i64) -> i32
+    if buf_len < 1
+        return QPACK_ERR_INCOMPLETE
+
+    let max_prefix: i64 = (1 << prefix_bits) - 1
+    let first: i64 = (*buf) as i64 & max_prefix
+
+    if first < max_prefix
+        *result = first
+        return 1
+
+    var pos: i32 = 1
+    var value: i64 = max_prefix
+    var shift: i32 = 0
+
+    while pos < buf_len
+        let b: i64 = (*(buf + pos)) as i64 & 0xFF
+        value = value + ((b & 0x7F) << shift)
+        pos = pos + 1
+        if (b & 0x80) == 0
+            *result = value
+            return pos
+        shift = shift + 7
+        if shift > 62
+            return QPACK_ERR_INVALID
+
+    return QPACK_ERR_INCOMPLETE
+
+# ============================================================================
+# QPACK Encoder
+# ============================================================================
+
+pub struct QpackEncoder
+    dynamic_table: QpackDynamicTable
+    max_blocked_streams: i32
+
+pub fn qpack_encoder_init(enc: *QpackEncoder)
+    qpack_dynamic_table_init(@enc.dynamic_table)
+    enc.max_blocked_streams = 0
+
+# Encode a field section prefix (Required Insert Count + Base)
+pub fn qpack_encode_prefix(enc: *QpackEncoder, buf: *u8, buf_len: i32) -> i32
+    # For simple encoding without dynamic table references:
+    # RIC = 0, Delta Base = 0, Sign = 0
+    if buf_len < 2
+        return QPACK_ERR_INCOMPLETE
+
+    buf[0] = 0x00  # Required Insert Count = 0
+    buf[1] = 0x00  # Delta Base = 0 with Sign = 0
+    return 2
+
+# Encode indexed field line (static table)
+pub fn qpack_encode_indexed_static(index: i32, buf: *u8, buf_len: i32) -> i32
+    if buf_len < 1
+        return QPACK_ERR_INCOMPLETE
+
+    # Indexed: 1TNNNNNN (T=1 for static)
+    *buf = 0xC0  # 11xxxxxx
+    return qpack_encode_int(index as i64, 6, buf, buf_len)
+
+# Encode literal with name reference (static table)
+pub fn qpack_encode_literal_name_ref_static(index: i32, value: Span<u8>, buf: *u8, buf_len: i32) -> i32
+    var pos: i32 = 0
+
+    # Literal with name reference: 01NTNNNN (N=0 no Huffman, T=1 static)
+    *buf = 0x50  # 0101xxxx
+    let idx_len: i32 = qpack_encode_int(index as i64, 4, buf, buf_len)
+    if idx_len < 0
+        return idx_len
+    pos = idx_len
+
+    # Value length and data
+    if pos >= buf_len
+        return QPACK_ERR_INCOMPLETE
+    *(buf + pos) = 0x00  # No Huffman
+    let val_len_bytes: i32 = qpack_encode_int(value.len as i64, 7, buf + pos, buf_len - pos)
+    if val_len_bytes < 0
+        return val_len_bytes
+    pos = pos + val_len_bytes
+
+    # Copy value
+    if pos + value.len > buf_len
+        return QPACK_ERR_INCOMPLETE
+    var i: i32 = 0
+    while i < value.len
+        *(buf + pos + i) = *(value.ptr + i)
+        i = i + 1
+    pos = pos + value.len
+
+    return pos
+
+# Encode literal without name reference
+pub fn qpack_encode_literal(name: Span<u8>, value: Span<u8>, buf: *u8, buf_len: i32) -> i32
+    var pos: i32 = 0
+
+    # Literal: 001NNNNN (N=0 no Huffman for name)
+    *buf = 0x20  # 001xxxxx
+    let name_len_bytes: i32 = qpack_encode_int(name.len as i64, 3, buf, buf_len)
+    if name_len_bytes < 0
+        return name_len_bytes
+    pos = name_len_bytes
+
+    # Copy name
+    if pos + name.len > buf_len
+        return QPACK_ERR_INCOMPLETE
+    var i: i32 = 0
+    while i < name.len
+        *(buf + pos + i) = *(name.ptr + i)
+        i = i + 1
+    pos = pos + name.len
+
+    # Value length (no Huffman)
+    if pos >= buf_len
+        return QPACK_ERR_INCOMPLETE
+    *(buf + pos) = 0x00
+    let val_len_bytes: i32 = qpack_encode_int(value.len as i64, 7, buf + pos, buf_len - pos)
+    if val_len_bytes < 0
+        return val_len_bytes
+    pos = pos + val_len_bytes
+
+    # Copy value
+    if pos + value.len > buf_len
+        return QPACK_ERR_INCOMPLETE
+    i = 0
+    while i < value.len
+        *(buf + pos + i) = *(value.ptr + i)
+        i = i + 1
+    pos = pos + value.len
+
+    return pos
+
+# ============================================================================
+# QPACK Decoder
+# ============================================================================
+
+pub struct QpackDecoder
+    dynamic_table: QpackDynamicTable
+    max_blocked_streams: i32
+    known_received_count: i64
+
+pub fn qpack_decoder_init(dec: *QpackDecoder)
+    qpack_dynamic_table_init(@dec.dynamic_table)
+    dec.max_blocked_streams = 0
+    dec.known_received_count = 0
+
+# Decoded header field
+pub struct QpackField
+    name: Span<u8>
+    value: Span<u8>
+
+# Decode field section prefix
+pub fn qpack_decode_prefix(dec: *QpackDecoder, buf: *u8, buf_len: i32, ric: *i64, base: *i64) -> i32
+    var pos: i32 = 0
+
+    # Decode Required Insert Count
+    var ric_encoded: i64 = 0
+    let ric_len: i32 = qpack_decode_int(buf, buf_len, 8, @ric_encoded)
+    if ric_len < 0
+        return ric_len
+    pos = ric_len
+    *ric = ric_encoded
+
+    # Decode Sign and Delta Base
+    if pos >= buf_len
+        return QPACK_ERR_INCOMPLETE
+
+    var delta_base: i64 = 0
+    let base_len: i32 = qpack_decode_int(buf + pos, buf_len - pos, 7, @delta_base)
+    if base_len < 0
+        return base_len
+
+    let sign: i32 = ((*(buf + pos) >> 7) & 1) as i32
+    if sign != 0
+        *base = *ric - delta_base - 1
+    else
+        *base = *ric + delta_base
+
+    pos = pos + base_len
+    return pos
+
+# Decode indexed field (static or dynamic)
+pub fn qpack_decode_indexed(dec: *QpackDecoder, buf: *u8, buf_len: i32, field: *QpackField) -> i32
+    if buf_len < 1
+        return QPACK_ERR_INCOMPLETE
+
+    let first: i32 = (*buf) as i32 & 0xFF
+    let is_static: i32 = (first >> 6) & 1
+
+    var index: i64 = 0
+    let idx_len: i32 = qpack_decode_int(buf, buf_len, 6, @index)
+    if idx_len < 0
+        return idx_len
+
+    if is_static != 0
+        var entry: QpackStaticEntry
+        if qpack_static_get(index as i32, @entry) < 0
+            return QPACK_ERR_INVALID
+        field.name = entry.name
+        field.value = entry.value
+    else
+        var entry: QpackStaticEntry
+        if qpack_dynamic_table_get(@dec.dynamic_table, index as i32, @entry) < 0
+            return QPACK_ERR_INVALID
+        field.name = entry.name
+        field.value = entry.value
+
+    return idx_len
+
+# ============================================================================
+# Stream Management
+# ============================================================================
+
+pub const QPACK_STREAM_ENCODER: i32 = 0
+pub const QPACK_STREAM_DECODER: i32 = 1
+
+# Encoder stream instruction: Set Dynamic Table Capacity
+pub fn qpack_encode_set_capacity(capacity: i64, buf: *u8, buf_len: i32) -> i32
+    *buf = 0x20  # 001xxxxx
+    return qpack_encode_int(capacity, 5, buf, buf_len)
+
+# Encoder stream instruction: Insert with Name Reference
+pub fn qpack_encode_insert_name_ref(is_static: i32, index: i64, value: Span<u8>, buf: *u8, buf_len: i32) -> i32
+    var pos: i32 = 0
+
+    # 1SNNNNNN (S = static)
+    if is_static != 0
+        *buf = 0xC0
+    else
+        *buf = 0x80
+
+    let idx_len: i32 = qpack_encode_int(index, 6, buf, buf_len)
+    if idx_len < 0
+        return idx_len
+    pos = idx_len
+
+    # Value with length
+    if pos >= buf_len
+        return QPACK_ERR_INCOMPLETE
+    *(buf + pos) = 0x00  # No Huffman
+    let val_len: i32 = qpack_encode_int(value.len as i64, 7, buf + pos, buf_len - pos)
+    if val_len < 0
+        return val_len
+    pos = pos + val_len
+
+    if pos + value.len > buf_len
+        return QPACK_ERR_INCOMPLETE
+    var i: i32 = 0
+    while i < value.len
+        *(buf + pos + i) = *(value.ptr + i)
+        i = i + 1
+
+    return pos + value.len
+
+# Decoder stream instruction: Section Acknowledgment
+pub fn qpack_encode_section_ack(stream_id: i64, buf: *u8, buf_len: i32) -> i32
+    *buf = 0x80  # 1xxxxxxx
+    return qpack_encode_int(stream_id, 7, buf, buf_len)
+
+# Decoder stream instruction: Stream Cancellation
+pub fn qpack_encode_stream_cancel(stream_id: i64, buf: *u8, buf_len: i32) -> i32
+    *buf = 0x40  # 01xxxxxx
+    return qpack_encode_int(stream_id, 6, buf, buf_len)
+
+# Decoder stream instruction: Insert Count Increment
+pub fn qpack_encode_insert_count_inc(increment: i64, buf: *u8, buf_len: i32) -> i32
+    *buf = 0x00  # 00xxxxxx
+    return qpack_encode_int(increment, 6, buf, buf_len)
+

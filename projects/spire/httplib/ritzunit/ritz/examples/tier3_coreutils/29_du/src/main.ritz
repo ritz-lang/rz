@@ -1,0 +1,153 @@
+# du - estimate file space usage
+#
+# Usage: du [OPTIONS] [FILE...]
+#   Summarize disk usage of FILE(s), recursively for directories.
+#
+# Options:
+#   -s        display only a total for each argument
+#   -h        human-readable sizes (K, M, G)
+#   -a        show all files, not just directories
+#   -c        produce a grand total
+#
+# Examples:
+#   du                  # current directory
+#   du -sh dir/         # summary, human-readable
+#   du -a file.txt      # single file
+
+# ============================================================================
+# Standard library imports
+# ============================================================================
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+import ritzlib.fs
+import ritzlib.args
+
+# ============================================================================
+# Options
+# ============================================================================
+
+struct DuOptions
+    summary: i32     # -s
+    human: i32       # -h
+    all: i32         # -a
+    total: i32       # -c
+
+# ============================================================================
+# Du functions
+# ============================================================================
+
+fn print_size(blocks: i64, path: *u8, opts: *DuOptions)
+    # Blocks are in 512-byte units, convert to KB
+    let kb: i64 = blocks / 2
+    if opts.human != 0
+        print_size_human(kb * 1024)
+    else
+        print_int(kb)
+    print_char(9)  # tab
+    prints(path)
+    print_char(10)
+
+fn du_path(path: *u8, opts: *DuOptions) -> i64
+    var statbuf: [144]u8
+    if sys_lstat(path, &statbuf[0]) != 0
+        eprints("du: cannot access '")
+        eprints(path)
+        eprints("'\n")
+        return 0
+
+    let blocks: i64 = stat_get_blocks(&statbuf[0])
+
+    if is_directory(path) == 0
+        # Regular file
+        if opts.all != 0 && opts.summary == 0
+            print_size(blocks, path, opts)
+        return blocks
+
+    # Directory: recurse
+    let fd: i32 = sys_open(path, O_DIRECTORY)
+    if fd < 0
+        eprints("du: cannot read directory '")
+        eprints(path)
+        eprints("'\n")
+        return blocks
+
+    var total: i64 = blocks
+    var buf: [8192]u8
+
+    loop
+        let nread: i64 = sys_getdents64(fd, &buf[0], 8192)
+        if nread <= 0
+            break
+
+        var pos: i64 = 0
+        while pos < nread
+            let entry: *u8 = &buf[0] + pos
+            let reclen: i32 = dirent_get_reclen(entry)
+            let name: *u8 = dirent_get_name(entry)
+
+            if streq(name, ".") == 0 && streq(name, "..") == 0
+                var child_path: [4096]u8
+                path_join(path, name, &child_path[0])
+                total += du_path(&child_path[0], opts)
+
+            pos += reclen as i64
+
+    sys_close(fd)
+
+    if opts.summary == 0
+        print_size(total, path, opts)
+
+    return total
+
+# ============================================================================
+# Main
+# ============================================================================
+
+fn main(argc: i32, argv: **u8) -> i32
+    # Set up argument parser
+    var parser: ArgParser
+    args_init(&parser, "du", "Estimate file space usage")
+
+    # Define flags
+    args_flag(&parser, 115, "summary", "Display only a total for each argument")  # 's'
+    args_flag(&parser, 104, "human-readable", "Print sizes in human readable format")  # 'h'
+    args_flag(&parser, 97, "all", "Show all files, not just directories")  # 'a'
+    args_flag(&parser, 99, "total", "Produce a grand total")  # 'c'
+
+    # Define positional arguments (FILE..., optional, unlimited)
+    args_positional(&parser, "FILE", "Files or directories to analyze", 0, -1)
+
+    # Parse arguments
+    if args_parse(&parser, argc, argv) != 0
+        return 1
+
+    # Retrieve flag values
+    var opts: DuOptions
+    opts.summary = args_get_flag(&parser, 115)  # 's'
+    opts.human = args_get_flag(&parser, 104)    # 'h'
+    opts.all = args_get_flag(&parser, 97)       # 'a'
+    opts.total = args_get_flag(&parser, 99)     # 'c'
+
+    var grand_total: i64 = 0
+    let num_args: i32 = parser.positional_count
+
+    if num_args == 0
+        # Default to current directory
+        let t: i64 = du_path(".", &opts)
+        if opts.summary != 0
+            print_size(t, ".", &opts)
+        grand_total = t
+    else
+        for i in 0..num_args
+            let path: *u8 = args_get_positional(&parser, i)
+            let t: i64 = du_path(path, &opts)
+            if opts.summary != 0
+                print_size(t, path, &opts)
+            grand_total += t
+
+    if opts.total != 0 && num_args > 1
+        print_size(grand_total, "total", &opts)
+
+    return 0

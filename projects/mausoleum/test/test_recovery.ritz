@@ -1,0 +1,558 @@
+# test/test_recovery.ritz - Recovery Manager Tests
+#
+# Tests for crash recovery using WAL replay.
+
+import ritzlib.sys
+import ritzlib.str
+import ritzlib.memory
+
+import lib.m7m_types
+import lib.page
+import lib.buffer_pool
+import lib.wal
+import lib.recovery
+
+# ============================================================================
+# Test Helpers
+# ============================================================================
+
+fn make_test_path(suffix: *u8) -> *u8
+    var path: *u8 = malloc(64)
+    let base: *u8 = c"/tmp/m7m_recovery_test_"
+    memcpy(path, base, strlen(base))
+    memcpy(path + strlen(base), suffix, strlen(suffix) + 1)
+    return path
+
+fn cleanup_test_files(base_path: *u8)
+    # Remove WAL files
+    var path_buf: [256]u8
+    let base_len: i64 = strlen(base_path)
+    memcpy(@path_buf[0], base_path, base_len)
+    let suffix: *u8 = c".wal.000000"
+    memcpy(@path_buf[base_len], suffix, 12)
+    sys_unlink(@path_buf[0])
+
+# ============================================================================
+# Recovery Manager Creation Tests
+# ============================================================================
+
+[[test]]
+fn test_recovery_mgr_new() -> i32
+    let base_path: *u8 = make_test_path(c"new")
+    let pool: *BufferPool = buffer_pool_new(16)
+
+    let mgr: *RecoveryManager = recovery_mgr_new(pool, base_path)
+    if mgr == null
+        return 1
+
+    recovery_mgr_destroy(mgr)
+    buffer_pool_destroy(pool)
+    cleanup_test_files(base_path)
+    free(base_path)
+    return 0
+
+[[test]]
+fn test_recovery_mgr_new_null_pool() -> i32
+    let base_path: *u8 = make_test_path(c"null_pool")
+
+    let mgr: *RecoveryManager = recovery_mgr_new(null, base_path)
+    if mgr != null
+        recovery_mgr_destroy(mgr)
+        return 1
+
+    free(base_path)
+    return 0
+
+[[test]]
+fn test_recovery_mgr_new_null_path() -> i32
+    let pool: *BufferPool = buffer_pool_new(16)
+
+    let mgr: *RecoveryManager = recovery_mgr_new(pool, null)
+    if mgr != null
+        recovery_mgr_destroy(mgr)
+        buffer_pool_destroy(pool)
+        return 1
+
+    buffer_pool_destroy(pool)
+    return 0
+
+# ============================================================================
+# WAL Replay Tests - Empty WAL
+# ============================================================================
+
+[[test]]
+fn test_recovery_empty_wal() -> i32
+    let base_path: *u8 = make_test_path(c"empty")
+    let pool: *BufferPool = buffer_pool_new(16)
+    let mgr: *RecoveryManager = recovery_mgr_new(pool, base_path)
+
+    # Recover from empty WAL (no file exists)
+    let result: i32 = recovery_recover(mgr)
+    if result != ERR_OK
+        recovery_mgr_destroy(mgr)
+        buffer_pool_destroy(pool)
+        free(base_path)
+        return 1
+
+    recovery_mgr_destroy(mgr)
+    buffer_pool_destroy(pool)
+    free(base_path)
+    return 0
+
+# ============================================================================
+# WAL Replay Tests - Committed Transaction
+# ============================================================================
+
+[[test]]
+fn test_recovery_single_committed_txn() -> i32
+    let base_path: *u8 = make_test_path(c"committed")
+    let pool: *BufferPool = buffer_pool_new(16)
+
+    # Phase 1: Write a committed transaction to WAL
+    let writer: *WalWriter = wal_writer_new(base_path)
+    wal_writer_open(writer)
+
+    let txn_id: i64 = 1
+    let lsn1: i64 = wal_write_begin(writer, txn_id)
+
+    # Write page data
+    var page_id_tmp: PageId = page_id_new(0, 1)
+    let page_id: i64 = page_id_tmp.value
+    var test_data: [16]u8
+    test_data[0] = 0x42
+    test_data[1] = 0x43
+    let lsn2: i64 = wal_write_insert(writer, txn_id, lsn1, page_id, 0, @test_data[0], 16)
+
+    let lsn3: i64 = wal_write_commit(writer, txn_id, lsn2)
+    wal_writer_destroy(writer)
+
+    # Phase 2: Recover - committed txn should be replayed
+    let mgr: *RecoveryManager = recovery_mgr_new(pool, base_path)
+    let result: i32 = recovery_recover(mgr)
+    if result != ERR_OK
+        recovery_mgr_destroy(mgr)
+        buffer_pool_destroy(pool)
+        cleanup_test_files(base_path)
+        free(base_path)
+        return 1
+
+    # Verify recovery replayed the committed transaction
+    let stats: *RecoveryStats = recovery_stats(mgr)
+    if stats.txns_committed < 1
+        recovery_mgr_destroy(mgr)
+        buffer_pool_destroy(pool)
+        cleanup_test_files(base_path)
+        free(base_path)
+        return 2
+    if stats.txns_aborted != 0
+        recovery_mgr_destroy(mgr)
+        buffer_pool_destroy(pool)
+        cleanup_test_files(base_path)
+        free(base_path)
+        return 3
+
+    recovery_mgr_destroy(mgr)
+    buffer_pool_destroy(pool)
+    cleanup_test_files(base_path)
+    free(base_path)
+    return 0
+
+# ============================================================================
+# WAL Replay Tests - Aborted Transaction
+# ============================================================================
+
+[[test]]
+fn test_recovery_single_aborted_txn() -> i32
+    let base_path: *u8 = make_test_path(c"aborted")
+    let pool: *BufferPool = buffer_pool_new(16)
+
+    # Phase 1: Write an aborted transaction to WAL
+    let writer: *WalWriter = wal_writer_new(base_path)
+    wal_writer_open(writer)
+
+    let txn_id: i64 = 1
+    let lsn1: i64 = wal_write_begin(writer, txn_id)
+
+    var page_id_tmp: PageId = page_id_new(0, 1)
+    let page_id: i64 = page_id_tmp.value
+    var test_data: [16]u8
+    test_data[0] = 0x99
+    let lsn2: i64 = wal_write_insert(writer, txn_id, lsn1, page_id, 0, @test_data[0], 16)
+
+    # Explicitly abort
+    let lsn3: i64 = wal_write_abort(writer, txn_id, lsn2)
+    wal_writer_destroy(writer)
+
+    # Phase 2: Recover - aborted txn should NOT be replayed
+    let mgr: *RecoveryManager = recovery_mgr_new(pool, base_path)
+    let result: i32 = recovery_recover(mgr)
+    if result != ERR_OK
+        recovery_mgr_destroy(mgr)
+        buffer_pool_destroy(pool)
+        cleanup_test_files(base_path)
+        free(base_path)
+        return 1
+
+    let stats: *RecoveryStats = recovery_stats(mgr)
+    if stats.txns_committed != 0
+        recovery_mgr_destroy(mgr)
+        buffer_pool_destroy(pool)
+        cleanup_test_files(base_path)
+        free(base_path)
+        return 2
+    if stats.txns_aborted < 1
+        recovery_mgr_destroy(mgr)
+        buffer_pool_destroy(pool)
+        cleanup_test_files(base_path)
+        free(base_path)
+        return 3
+
+    recovery_mgr_destroy(mgr)
+    buffer_pool_destroy(pool)
+    cleanup_test_files(base_path)
+    free(base_path)
+    return 0
+
+# ============================================================================
+# WAL Replay Tests - Uncommitted Transaction (crash simulation)
+# ============================================================================
+
+[[test]]
+fn test_recovery_uncommitted_txn() -> i32
+    let base_path: *u8 = make_test_path(c"uncommitted")
+    let pool: *BufferPool = buffer_pool_new(16)
+
+    # Phase 1: Write a transaction WITHOUT commit (simulates crash)
+    let writer: *WalWriter = wal_writer_new(base_path)
+    wal_writer_open(writer)
+
+    let txn_id: i64 = 1
+    let lsn1: i64 = wal_write_begin(writer, txn_id)
+
+    var page_id_tmp: PageId = page_id_new(0, 1)
+    let page_id: i64 = page_id_tmp.value
+    var test_data: [16]u8
+    test_data[0] = 0xAA
+    let lsn2: i64 = wal_write_insert(writer, txn_id, lsn1, page_id, 0, @test_data[0], 16)
+
+    # NO COMMIT - simulates crash
+    wal_writer_flush(writer)
+    wal_writer_destroy(writer)
+
+    # Phase 2: Recover - uncommitted txn should be rolled back
+    let mgr: *RecoveryManager = recovery_mgr_new(pool, base_path)
+    let result: i32 = recovery_recover(mgr)
+    if result != ERR_OK
+        recovery_mgr_destroy(mgr)
+        buffer_pool_destroy(pool)
+        cleanup_test_files(base_path)
+        free(base_path)
+        return 1
+
+    let stats: *RecoveryStats = recovery_stats(mgr)
+    if stats.txns_committed != 0
+        recovery_mgr_destroy(mgr)
+        buffer_pool_destroy(pool)
+        cleanup_test_files(base_path)
+        free(base_path)
+        return 2
+    if stats.txns_aborted < 1
+        recovery_mgr_destroy(mgr)
+        buffer_pool_destroy(pool)
+        cleanup_test_files(base_path)
+        free(base_path)
+        return 3
+
+    recovery_mgr_destroy(mgr)
+    buffer_pool_destroy(pool)
+    cleanup_test_files(base_path)
+    free(base_path)
+    return 0
+
+# ============================================================================
+# Checkpoint Tests
+# ============================================================================
+
+[[test]]
+fn test_recovery_checkpoint_basic() -> i32
+    let base_path: *u8 = make_test_path(c"checkpoint")
+    let pool: *BufferPool = buffer_pool_new(16)
+    let mgr: *RecoveryManager = recovery_mgr_new(pool, base_path)
+
+    # Take a checkpoint
+    let result: i32 = recovery_checkpoint(mgr)
+    if result != ERR_OK
+        recovery_mgr_destroy(mgr)
+        buffer_pool_destroy(pool)
+        cleanup_test_files(base_path)
+        free(base_path)
+        return 1
+
+    recovery_mgr_destroy(mgr)
+    buffer_pool_destroy(pool)
+    cleanup_test_files(base_path)
+    free(base_path)
+    return 0
+
+[[test]]
+fn test_recovery_after_checkpoint() -> i32
+    let base_path: *u8 = make_test_path(c"after_ckpt")
+    let pool: *BufferPool = buffer_pool_new(16)
+
+    # Phase 1: Write some transactions, then checkpoint
+    let writer: *WalWriter = wal_writer_new(base_path)
+    wal_writer_open(writer)
+
+    # Committed txn before checkpoint
+    let txn1: i64 = 1
+    var lsn: i64 = wal_write_begin(writer, txn1)
+    lsn = wal_write_commit(writer, txn1, lsn)
+
+    # Checkpoint
+    wal_write_checkpoint(writer)
+
+    # Committed txn after checkpoint
+    let txn2: i64 = 2
+    lsn = wal_write_begin(writer, txn2)
+    var page_id_tmp: PageId = page_id_new(0, 1)
+    let page_id: i64 = page_id_tmp.value
+    var data: [8]u8
+    data[0] = 0xBB
+    lsn = wal_write_insert(writer, txn2, lsn, page_id, 0, @data[0], 8)
+    lsn = wal_write_commit(writer, txn2, lsn)
+
+    wal_writer_destroy(writer)
+
+    # Phase 2: Recover
+    let mgr: *RecoveryManager = recovery_mgr_new(pool, base_path)
+    let result: i32 = recovery_recover(mgr)
+    if result != ERR_OK
+        recovery_mgr_destroy(mgr)
+        buffer_pool_destroy(pool)
+        cleanup_test_files(base_path)
+        free(base_path)
+        return 1
+
+    # Both committed txns should be counted (even pre-checkpoint)
+    let stats: *RecoveryStats = recovery_stats(mgr)
+    if stats.txns_committed < 2
+        recovery_mgr_destroy(mgr)
+        buffer_pool_destroy(pool)
+        cleanup_test_files(base_path)
+        free(base_path)
+        return 2
+
+    recovery_mgr_destroy(mgr)
+    buffer_pool_destroy(pool)
+    cleanup_test_files(base_path)
+    free(base_path)
+    return 0
+
+# ============================================================================
+# Multiple Transactions
+# ============================================================================
+
+[[test]]
+fn test_recovery_multiple_committed() -> i32
+    let base_path: *u8 = make_test_path(c"multi_commit")
+    let pool: *BufferPool = buffer_pool_new(16)
+
+    let writer: *WalWriter = wal_writer_new(base_path)
+    wal_writer_open(writer)
+
+    # Write 5 committed transactions
+    var i: i64 = 0
+    while i < 5
+        let txn_id: i64 = i + 1
+        var lsn: i64 = wal_write_begin(writer, txn_id)
+        lsn = wal_write_commit(writer, txn_id, lsn)
+        i += 1
+
+    wal_writer_destroy(writer)
+
+    let mgr: *RecoveryManager = recovery_mgr_new(pool, base_path)
+    let result: i32 = recovery_recover(mgr)
+    if result != ERR_OK
+        recovery_mgr_destroy(mgr)
+        buffer_pool_destroy(pool)
+        cleanup_test_files(base_path)
+        free(base_path)
+        return 1
+
+    let stats: *RecoveryStats = recovery_stats(mgr)
+    if stats.txns_committed != 5
+        recovery_mgr_destroy(mgr)
+        buffer_pool_destroy(pool)
+        cleanup_test_files(base_path)
+        free(base_path)
+        return 2
+
+    recovery_mgr_destroy(mgr)
+    buffer_pool_destroy(pool)
+    cleanup_test_files(base_path)
+    free(base_path)
+    return 0
+
+[[test]]
+fn test_recovery_mixed_txns() -> i32
+    let base_path: *u8 = make_test_path(c"mixed")
+    let pool: *BufferPool = buffer_pool_new(16)
+
+    let writer: *WalWriter = wal_writer_new(base_path)
+    wal_writer_open(writer)
+
+    # Txn 1: committed
+    var lsn: i64 = wal_write_begin(writer, 1)
+    lsn = wal_write_commit(writer, 1, lsn)
+
+    # Txn 2: aborted
+    lsn = wal_write_begin(writer, 2)
+    lsn = wal_write_abort(writer, 2, lsn)
+
+    # Txn 3: committed
+    lsn = wal_write_begin(writer, 3)
+    lsn = wal_write_commit(writer, 3, lsn)
+
+    # Txn 4: uncommitted (crash)
+    lsn = wal_write_begin(writer, 4)
+
+    wal_writer_flush(writer)
+    wal_writer_destroy(writer)
+
+    let mgr: *RecoveryManager = recovery_mgr_new(pool, base_path)
+    let result: i32 = recovery_recover(mgr)
+    if result != ERR_OK
+        recovery_mgr_destroy(mgr)
+        buffer_pool_destroy(pool)
+        cleanup_test_files(base_path)
+        free(base_path)
+        return 1
+
+    let stats: *RecoveryStats = recovery_stats(mgr)
+    if stats.txns_committed != 2
+        recovery_mgr_destroy(mgr)
+        buffer_pool_destroy(pool)
+        cleanup_test_files(base_path)
+        free(base_path)
+        return 2
+    if stats.txns_aborted != 2
+        recovery_mgr_destroy(mgr)
+        buffer_pool_destroy(pool)
+        cleanup_test_files(base_path)
+        free(base_path)
+        return 3
+
+    recovery_mgr_destroy(mgr)
+    buffer_pool_destroy(pool)
+    cleanup_test_files(base_path)
+    free(base_path)
+    return 0
+
+# ============================================================================
+# Page Recovery Tests
+# ============================================================================
+
+[[test]]
+fn test_recovery_page_write_replay() -> i32
+    let base_path: *u8 = make_test_path(c"page_write")
+    let pool: *BufferPool = buffer_pool_new(16)
+
+    # Create a page with known content
+    var test_page: Page
+    var pid: PageId = page_id_new(0, 1)
+    page_init_heap(@test_page, pid.value)
+    let data: *u8 = page_data(@test_page)
+    data[0] = 0xDE
+    data[1] = 0xAD
+    data[2] = 0xBE
+    data[3] = 0xEF
+
+    # Write full page image to WAL in committed transaction
+    let writer: *WalWriter = wal_writer_new(base_path)
+    wal_writer_open(writer)
+
+    let txn_id: i64 = 1
+    var lsn: i64 = wal_write_begin(writer, txn_id)
+    lsn = wal_write_page(writer, txn_id, lsn, pid.value, @test_page)
+    lsn = wal_write_commit(writer, txn_id, lsn)
+
+    wal_writer_destroy(writer)
+
+    # Recover
+    let mgr: *RecoveryManager = recovery_mgr_new(pool, base_path)
+    let result: i32 = recovery_recover(mgr)
+    if result != ERR_OK
+        recovery_mgr_destroy(mgr)
+        buffer_pool_destroy(pool)
+        cleanup_test_files(base_path)
+        free(base_path)
+        return 1
+
+    let stats: *RecoveryStats = recovery_stats(mgr)
+    if stats.pages_recovered < 1
+        recovery_mgr_destroy(mgr)
+        buffer_pool_destroy(pool)
+        cleanup_test_files(base_path)
+        free(base_path)
+        return 2
+
+    recovery_mgr_destroy(mgr)
+    buffer_pool_destroy(pool)
+    cleanup_test_files(base_path)
+    free(base_path)
+    return 0
+
+# ============================================================================
+# Error Handling Tests
+# ============================================================================
+
+[[test]]
+fn test_recovery_corrupted_wal() -> i32
+    let base_path: *u8 = make_test_path(c"corrupt")
+    let pool: *BufferPool = buffer_pool_new(16)
+
+    # Write garbage to WAL file
+    var path_buf: [256]u8
+    let base_len: i64 = strlen(base_path)
+    memcpy(@path_buf[0], base_path, base_len)
+    let suffix: *u8 = c".wal.000000"
+    memcpy(@path_buf[base_len], suffix, 12)
+
+    let fd: i32 = sys_open3(@path_buf[0], O_RDWR | O_CREAT | O_TRUNC, 420)
+    var garbage: [64]u8
+    garbage[0] = 0xFF
+    garbage[1] = 0xFE
+    garbage[2] = 0xFD
+    sys_write(fd, @garbage[0], 64)
+    sys_close(fd)
+
+    # Recovery should handle corruption gracefully
+    let mgr: *RecoveryManager = recovery_mgr_new(pool, base_path)
+    let result: i32 = recovery_recover(mgr)
+    # Should return error for corrupted WAL
+    if result == ERR_OK
+        recovery_mgr_destroy(mgr)
+        buffer_pool_destroy(pool)
+        cleanup_test_files(base_path)
+        free(base_path)
+        return 1
+
+    recovery_mgr_destroy(mgr)
+    buffer_pool_destroy(pool)
+    cleanup_test_files(base_path)
+    free(base_path)
+    return 0
+
+[[test]]
+fn test_recovery_null_manager() -> i32
+    let result: i32 = recovery_recover(null)
+    if result != ERR_INVALID
+        return 1
+    return 0
+
+[[test]]
+fn test_recovery_checkpoint_null() -> i32
+    let result: i32 = recovery_checkpoint(null)
+    if result != ERR_INVALID
+        return 1
+    return 0

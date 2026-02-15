@@ -1,0 +1,279 @@
+# spire/http/request.ritz
+#
+# HTTP Request type for Spire web framework
+#
+# Provides a high-level request abstraction for web applications.
+# Uses Span<u8> and http types internally for zero-copy efficiency.
+
+import ritzlib.span { Span, span_new, span_from_cstr, span_eq }
+import ritzlib.string { String, string_new, string_from_span }
+
+import http.types { METHOD_GET, METHOD_POST, method_to_span }
+
+# Maximum sizes for fixed-size storage
+const MAX_PARAMS: i64 = 16
+const MAX_PARAM_NAME_LEN: i64 = 64
+const MAX_PARAM_VALUE_LEN: i64 = 256
+const MAX_BODY_SIZE: i64 = 65536
+
+# Route parameter (e.g., :id from /tasks/:id)
+struct ReqParam
+    name: [64]u8
+    name_len: i64
+    value: [256]u8
+    value_len: i64
+
+# HTTP Request
+pub struct Request
+    method: i32                          # METHOD_GET, METHOD_POST, etc.
+    path: [1024]u8                       # URL path (e.g., "/tasks/123")
+    path_len: i64
+    query_string: [1024]u8               # Raw query string
+    query_len: i64
+    # Headers stored inline
+    headers: [64]ReqParam              # Reuse struct for headers
+    header_count: i64
+    # Route params (populated by router)
+    params: [16]ReqParam
+    param_count: i64
+    # Body
+    body: [65536]u8
+    body_len: i64
+
+# Create a new empty request (useful for testing)
+pub fn request_new() -> Request
+    var req: Request
+    req.method = METHOD_GET
+    req.path[0] = 47  # '/'
+    req.path_len = 1
+    req.query_len = 0
+    req.header_count = 0
+    req.param_count = 0
+    req.body_len = 0
+    return req
+
+# Create request with method and path
+pub fn request_with(method: i32, path: *Span<u8>) -> Request
+    var req: Request = request_new()
+    req.method = method
+    # Copy path
+    var i: i64 = 0
+    while i < path.len and i < 1024
+        req.path[i] = *(path.ptr + i)
+        i += 1
+    req.path_len = i
+    return req
+
+# ============================================================================
+# Accessors
+# ============================================================================
+
+# Get HTTP method
+pub fn request_method(self: *Request) -> i32
+    return self.method
+
+# Get path as Span
+pub fn request_path(self: *Request) -> Span<u8>
+    var sp: Span<u8>
+    sp.ptr = @self.path[0]
+    sp.len = self.path_len
+    return sp
+
+# Get a route parameter (e.g., :id from /tasks/:id)
+# Returns 1 if found and writes to out_value, 0 if not found
+pub fn request_param(self: *Request, name: *Span<u8>, out_value: *Span<u8>) -> i32
+    var i: i64 = 0
+    while i < self.param_count
+        # Compare name
+        var param_name: Span<u8>
+        param_name.ptr = @self.params[i].name[0]
+        param_name.len = self.params[i].name_len
+        if span_eq(name, @param_name) == 1
+            out_value.ptr = @self.params[i].value[0]
+            out_value.len = self.params[i].value_len
+            return 1
+        i += 1
+    return 0
+
+# Get a query parameter
+# Returns 1 if found and writes to out_value, 0 if not found
+pub fn request_query_param(self: *Request, name: *Span<u8>, out_value: *Span<u8>) -> i32
+    # TODO: Parse query string lazily
+    return 0
+
+# Get header value
+# Returns 1 if found and writes to out_value, 0 if not found
+pub fn request_header(self: *Request, name: *Span<u8>, out_value: *Span<u8>) -> i32
+    var i: i64 = 0
+    while i < self.header_count
+        var header_name: Span<u8>
+        header_name.ptr = @self.headers[i].name[0]
+        header_name.len = self.headers[i].name_len
+        if span_eq_ci(name, @header_name) == 1
+            out_value.ptr = @self.headers[i].value[0]
+            out_value.len = self.headers[i].value_len
+            return 1
+        i += 1
+    return 0
+
+# Get body as Span (assumes UTF-8)
+pub fn request_body_str(self: *Request) -> Span<u8>
+    var sp: Span<u8>
+    sp.ptr = @self.body[0]
+    sp.len = self.body_len
+    return sp
+
+# Get body length
+pub fn request_body_len(self: *Request) -> i64
+    return self.body_len
+
+# ============================================================================
+# Content negotiation
+# ============================================================================
+
+# Check if client accepts JSON
+pub fn request_wants_json(self: *Request) -> i32
+    let accept_name: Span<u8> = span_from_cstr(c"Accept")
+    var accept_value: Span<u8>
+    if request_header(self, @accept_name, @accept_value) == 1
+        let json_type: Span<u8> = span_from_cstr(c"application/json")
+        let wildcard: Span<u8> = span_from_cstr(c"*/*")
+        if span_contains(@accept_value, @json_type) == 1
+            return 1
+        if span_contains(@accept_value, @wildcard) == 1
+            return 1
+    return 0
+
+# Check if client accepts HTML
+pub fn request_wants_html(self: *Request) -> i32
+    let accept_name: Span<u8> = span_from_cstr(c"Accept")
+    var accept_value: Span<u8>
+    if request_header(self, @accept_name, @accept_value) == 1
+        let html_type: Span<u8> = span_from_cstr(c"text/html")
+        let wildcard: Span<u8> = span_from_cstr(c"*/*")
+        if span_contains(@accept_value, @html_type) == 1
+            return 1
+        if span_contains(@accept_value, @wildcard) == 1
+            return 1
+    return 1  # Default to HTML
+
+# Get content type of request body
+# Returns 1 if found, 0 if not
+pub fn request_content_type(self: *Request, out_ct: *Span<u8>) -> i32
+    let ct_name: Span<u8> = span_from_cstr(c"Content-Type")
+    return request_header(self, @ct_name, out_ct)
+
+# Check if request is JSON
+pub fn request_is_json(self: *Request) -> i32
+    var ct: Span<u8>
+    if request_content_type(self, @ct) == 1
+        let json_type: Span<u8> = span_from_cstr(c"application/json")
+        return span_contains(@ct, @json_type)
+    return 0
+
+# Check if request is form data
+pub fn request_is_form(self: *Request) -> i32
+    var ct: Span<u8>
+    if request_content_type(self, @ct) == 1
+        let form_type: Span<u8> = span_from_cstr(c"application/x-www-form-urlencoded")
+        return span_contains(@ct, @form_type)
+    return 0
+
+# ============================================================================
+# Builder methods (for constructing requests in tests)
+# ============================================================================
+
+pub fn request_set_method(self: *Request, method: i32)
+    self.method = method
+
+pub fn request_set_path(self: *Request, path: *Span<u8>)
+    var i: i64 = 0
+    while i < path.len and i < 1024
+        self.path[i] = *(path.ptr + i)
+        i += 1
+    self.path_len = i
+
+pub fn request_set_header(self: *Request, name: *Span<u8>, value: *Span<u8>)
+    if self.header_count >= 64
+        return
+    let idx: i64 = self.header_count
+    # Copy name
+    var i: i64 = 0
+    while i < name.len and i < 64
+        self.headers[idx].name[i] = *(name.ptr + i)
+        i += 1
+    self.headers[idx].name_len = i
+    # Copy value
+    i = 0
+    while i < value.len and i < 256
+        self.headers[idx].value[i] = *(value.ptr + i)
+        i += 1
+    self.headers[idx].value_len = i
+    self.header_count += 1
+
+pub fn request_set_param(self: *Request, name: *Span<u8>, value: *Span<u8>)
+    if self.param_count >= 16
+        return
+    let idx: i64 = self.param_count
+    # Copy name
+    var i: i64 = 0
+    while i < name.len and i < 64
+        self.params[idx].name[i] = *(name.ptr + i)
+        i += 1
+    self.params[idx].name_len = i
+    # Copy value
+    i = 0
+    while i < value.len and i < 256
+        self.params[idx].value[i] = *(value.ptr + i)
+        i += 1
+    self.params[idx].value_len = i
+    self.param_count += 1
+
+pub fn request_set_body(self: *Request, body: *Span<u8>)
+    var i: i64 = 0
+    while i < body.len and i < MAX_BODY_SIZE
+        self.body[i] = *(body.ptr + i)
+        i += 1
+    self.body_len = i
+
+# ============================================================================
+# Helper functions
+# ============================================================================
+
+# Case-insensitive span comparison
+fn span_eq_ci(a: *Span<u8>, b: *Span<u8>) -> i32
+    if a.len != b.len
+        return 0
+    var i: i64 = 0
+    while i < a.len
+        let ca: u8 = to_lower(*(a.ptr + i))
+        let cb: u8 = to_lower(*(b.ptr + i))
+        if ca != cb
+            return 0
+        i += 1
+    return 1
+
+fn to_lower(c: u8) -> u8
+    if c >= 65 and c <= 90  # A-Z
+        return c + 32
+    return c
+
+# Check if span contains substring
+fn span_contains(haystack: *Span<u8>, needle: *Span<u8>) -> i32
+    if needle.len > haystack.len
+        return 0
+    if needle.len == 0
+        return 1
+    var i: i64 = 0
+    while i <= haystack.len - needle.len
+        var found: i32 = 1
+        var j: i64 = 0
+        while j < needle.len
+            if *(haystack.ptr + i + j) != *(needle.ptr + j)
+                found = 0
+                j = needle.len  # break
+            j += 1
+        if found == 1
+            return 1
+        i += 1
+    return 0

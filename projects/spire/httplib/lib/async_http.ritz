@@ -1,0 +1,316 @@
+# lib/async_http.ritz - Async HTTP helpers using io_uring
+#
+# Provides high-level async HTTP operations built on top of
+# ritzlib's io_uring bindings.
+
+import ritzlib.uring
+import ritzlib.span
+import ritzlib.sys
+import lib.types
+import lib.h1_utils
+import lib.h1_request
+import lib.h1_response
+import lib.h1_writer
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+pub const ASYNC_OK: i32 = 0
+pub const ASYNC_ERR_RING_FULL: i32 = -1
+pub const ASYNC_ERR_SUBMIT: i32 = -2
+pub const ASYNC_ERR_IO: i32 = -3
+pub const ASYNC_ERR_INCOMPLETE: i32 = -4
+pub const ASYNC_ERR_PARSE: i32 = -5
+pub const ASYNC_ERR_CLOSED: i32 = -6
+
+
+# Default buffer sizes
+pub const DEFAULT_READ_BUF_SIZE: i32 = 8192
+pub const DEFAULT_WRITE_BUF_SIZE: i32 = 8192
+
+# User data tag bits for identifying operation types
+pub const OP_TAG_READ: i64 = 0x1000000000000000
+pub const OP_TAG_WRITE: i64 = 0x2000000000000000
+pub const OP_TAG_ACCEPT: i64 = 0x3000000000000000
+pub const OP_TAG_CONNECT: i64 = 0x4000000000000000
+pub const OP_TAG_CLOSE: i64 = 0x5000000000000000
+pub const OP_TAG_MASK: i64 = 0xF000000000000000
+
+# ============================================================================
+# Async HTTP Connection
+# ============================================================================
+
+pub struct AsyncHttpConn
+    fd: i32                    # Socket file descriptor
+    read_buf: [8192]u8         # Receive buffer
+    read_pos: i32              # Current read position
+    read_len: i32              # Valid data length
+    write_buf: [8192]u8        # Send buffer
+    write_pos: i32             # Current write position
+    write_len: i32             # Data to write
+    request: H1Request         # Parsed request (for servers)
+    response: H1Response       # Parsed response (for clients)
+    state: i32                 # Connection state
+    user_data: i64             # User context
+
+# Connection states
+pub const CONN_STATE_IDLE: i32 = 0
+pub const CONN_STATE_READING: i32 = 1
+pub const CONN_STATE_WRITING: i32 = 2
+pub const CONN_STATE_CLOSED: i32 = 3
+
+pub fn async_http_conn_init(conn: *AsyncHttpConn, fd: i32)
+    conn.fd = fd
+    conn.read_pos = 0
+    conn.read_len = 0
+    conn.write_pos = 0
+    conn.write_len = 0
+    h1_request_init(@conn.request)
+    h1_response_init(@conn.response)
+    conn.state = CONN_STATE_IDLE
+    conn.user_data = 0
+
+# ============================================================================
+# Submission Helpers
+# ============================================================================
+
+# Submit a read request for an HTTP connection
+pub fn async_submit_read(ring: *IoUring, conn: *AsyncHttpConn) -> i32
+    var sqe: *IoUringSqe = uring_get_sqe(ring)
+    if sqe == null
+        return ASYNC_ERR_RING_FULL
+
+    let buf_ptr: *u8 = @conn.read_buf[conn.read_len]
+    let buf_remaining: i32 = DEFAULT_READ_BUF_SIZE - conn.read_len
+    let user_data: i64 = OP_TAG_READ | (conn.fd as i64)
+
+    uring_prep_read(sqe, conn.fd, buf_ptr, buf_remaining, 0, user_data)
+    uring_sqe_submit(ring)
+    conn.state = CONN_STATE_READING
+
+    return ASYNC_OK
+
+# Submit a write request for an HTTP connection
+pub fn async_submit_write(ring: *IoUring, conn: *AsyncHttpConn) -> i32
+    if conn.write_len == 0
+        return ASYNC_OK
+
+    var sqe: *IoUringSqe = uring_get_sqe(ring)
+    if sqe == null
+        return ASYNC_ERR_RING_FULL
+
+    let buf_ptr: *u8 = @conn.write_buf[conn.write_pos]
+    let bytes_to_write: i32 = conn.write_len - conn.write_pos
+    let user_data: i64 = OP_TAG_WRITE | (conn.fd as i64)
+
+    uring_prep_write(sqe, conn.fd, buf_ptr, bytes_to_write, 0, user_data)
+    uring_sqe_submit(ring)
+    conn.state = CONN_STATE_WRITING
+
+    return ASYNC_OK
+
+# Submit an accept request
+pub fn async_submit_accept(ring: *IoUring, listen_fd: i32, addr: *u8, addr_len: *i32) -> i32
+    var sqe: *IoUringSqe = uring_get_sqe(ring)
+    if sqe == null
+        return ASYNC_ERR_RING_FULL
+
+    let user_data: i64 = OP_TAG_ACCEPT | (listen_fd as i64)
+    uring_prep_accept(sqe, listen_fd, addr, addr_len, 0, user_data)
+    uring_sqe_submit(ring)
+
+    return ASYNC_OK
+
+# Submit a connect request
+pub fn async_submit_connect(ring: *IoUring, fd: i32, addr: *u8, addr_len: i32) -> i32
+    var sqe: *IoUringSqe = uring_get_sqe(ring)
+    if sqe == null
+        return ASYNC_ERR_RING_FULL
+
+    let user_data: i64 = OP_TAG_CONNECT | (fd as i64)
+    uring_prep_connect(sqe, fd, addr, addr_len, user_data)
+    uring_sqe_submit(ring)
+
+    return ASYNC_OK
+
+# Submit a close request
+pub fn async_submit_close(ring: *IoUring, fd: i32) -> i32
+    var sqe: *IoUringSqe = uring_get_sqe(ring)
+    if sqe == null
+        return ASYNC_ERR_RING_FULL
+
+    let user_data: i64 = OP_TAG_CLOSE | (fd as i64)
+    uring_prep_close(sqe, fd, user_data)
+    uring_sqe_submit(ring)
+
+    return ASYNC_OK
+
+# ============================================================================
+# Completion Handling
+# ============================================================================
+
+# Handle a read completion
+pub fn async_handle_read(conn: *AsyncHttpConn, result: i32) -> i32
+    if result < 0
+        return ASYNC_ERR_IO
+    if result == 0
+        conn.state = CONN_STATE_CLOSED
+        return ASYNC_ERR_CLOSED
+
+    conn.read_len = conn.read_len + result
+    conn.state = CONN_STATE_IDLE
+    return ASYNC_OK
+
+# Handle a write completion
+pub fn async_handle_write(conn: *AsyncHttpConn, result: i32) -> i32
+    if result < 0
+        return ASYNC_ERR_IO
+
+    conn.write_pos = conn.write_pos + result
+    if conn.write_pos >= conn.write_len
+        # All data written
+        conn.write_pos = 0
+        conn.write_len = 0
+
+    conn.state = CONN_STATE_IDLE
+    return ASYNC_OK
+
+# Extract operation type from user_data
+pub fn async_op_type(user_data: i64) -> i64
+    return user_data & OP_TAG_MASK
+
+# Extract fd from user_data
+pub fn async_op_fd(user_data: i64) -> i32
+    return (user_data & 0xFFFFFFFF) as i32
+
+# ============================================================================
+# HTTP Request/Response Helpers
+# ============================================================================
+
+# Try to parse an HTTP request from the connection's read buffer
+pub fn async_try_parse_request(conn: *AsyncHttpConn) -> i32
+    var buf: Span<u8>
+    buf.ptr = @conn.read_buf[0]
+    buf.len = conn.read_len as i64
+
+    let ret: i32 = h1_parse_request(@conn.request, @buf)
+    if ret == H1_ERR_INCOMPLETE
+        return ASYNC_ERR_INCOMPLETE
+    if ret < 0
+        return ASYNC_ERR_PARSE
+
+    # Shift remaining data to beginning of buffer
+    let consumed: i32 = ret
+    var remaining: i32 = conn.read_len - consumed
+    if remaining > 0
+        var i: i32 = 0
+        while i < remaining
+            conn.read_buf[i] = conn.read_buf[consumed + i]
+            i = i + 1
+    conn.read_pos = 0
+    conn.read_len = remaining
+
+    return ASYNC_OK
+
+# Try to parse an HTTP response from the connection's read buffer
+pub fn async_try_parse_response(conn: *AsyncHttpConn) -> i32
+    var buf: Span<u8>
+    buf.ptr = @conn.read_buf[0]
+    buf.len = conn.read_len as i64
+
+    let ret: i32 = h1_parse_response(@conn.response, @buf)
+    if ret == H1_ERR_INCOMPLETE
+        return ASYNC_ERR_INCOMPLETE
+    if ret < 0
+        return ASYNC_ERR_PARSE
+
+    # Shift remaining data
+    let consumed: i32 = ret
+    var remaining: i32 = conn.read_len - consumed
+    if remaining > 0
+        var i: i32 = 0
+        while i < remaining
+            conn.read_buf[i] = conn.read_buf[consumed + i]
+            i = i + 1
+    conn.read_pos = 0
+    conn.read_len = remaining
+
+    return ASYNC_OK
+
+# Write an HTTP response to the connection's write buffer
+pub fn async_write_response(conn: *AsyncHttpConn, status: i32, body: Span<u8>) -> i32
+    var pos: i32 = 0
+
+    # Write status line: HTTP/1.1 {status} {reason}\r\n
+    pos = pos + h1_write_status_line(@conn.write_buf[pos], DEFAULT_WRITE_BUF_SIZE - pos, VERSION_HTTP11, status)
+
+    # Write Content-Length header
+    pos = pos + h1_write_content_length(@conn.write_buf[pos], DEFAULT_WRITE_BUF_SIZE - pos, body.len)
+
+    # Write Connection: close header
+    pos = pos + h1_write_header(@conn.write_buf[pos], DEFAULT_WRITE_BUF_SIZE - pos, c"Connection", c"close")
+
+    # Write empty line (end of headers)
+    pos = pos + h1_write_crlf(@conn.write_buf[pos], DEFAULT_WRITE_BUF_SIZE - pos)
+
+    # Write body
+    var i: i64 = 0
+    while i < body.len
+        conn.write_buf[pos] = *(body.ptr + i)
+        pos = pos + 1
+        i = i + 1
+
+    conn.write_len = pos
+    conn.write_pos = 0
+
+    return ASYNC_OK
+
+# ============================================================================
+# Simple Async Server Loop (single-threaded)
+# ============================================================================
+
+# Callback type for handling completed requests
+# Returns: 0 = keep-alive, <0 = close connection
+# typedef fn(conn: *AsyncHttpConn) -> i32 as RequestHandler
+
+# Process one batch of completions
+pub fn async_process_completions(ring: *IoUring, conns: *AsyncHttpConn, max_conns: i32) -> i32
+    var processed: i32 = 0
+
+    var cqe: *IoUringCqe = uring_peek_cqe(ring)
+    while cqe != null
+        let user_data: i64 = cqe.user_data
+        let result: i32 = cqe.res
+        let op: i64 = async_op_type(user_data)
+        let fd: i32 = async_op_fd(user_data)
+
+        # Find connection by fd
+        var i: i32 = 0
+        while i < max_conns
+            if conns[i].fd == fd
+                if op == OP_TAG_READ
+                    async_handle_read(@conns[i], result)
+                if op == OP_TAG_WRITE
+                    async_handle_write(@conns[i], result)
+                break
+            i = i + 1
+
+        uring_cqe_seen(ring, cqe)
+        processed = processed + 1
+        cqe = uring_peek_cqe(ring)
+
+    return processed
+
+# ============================================================================
+# Ring Management
+# ============================================================================
+
+# Submit all pending SQEs and wait for at least min_complete completions
+pub fn async_submit_and_wait(ring: *IoUring, min_complete: i32) -> i32
+    return uring_submit_and_wait(ring, min_complete)
+
+# Submit all pending SQEs (non-blocking)
+pub fn async_submit(ring: *IoUring) -> i32
+    return uring_submit(ring)
+

@@ -1,0 +1,586 @@
+# lib/wal.ritz - Write-Ahead Log (WAL)
+#
+# The WAL provides durability and atomicity guarantees:
+# - All changes are logged BEFORE being applied to data pages
+# - Transactions can be rolled back by replaying undo records
+# - Crash recovery replays committed transactions from the log
+#
+# WAL Record Types:
+# - BEGIN: Start of transaction
+# - COMMIT: Transaction committed (durability point)
+# - ABORT: Transaction aborted
+# - INSERT: Page insert operation
+# - UPDATE: Page update operation (with before/after images)
+# - DELETE: Page delete operation
+# - CHECKPOINT: Consistency point for recovery
+#
+# WAL File Format:
+# - Sequence of variable-length records
+# - Each record has header + payload
+# - Records are sequential with LSN ordering
+
+import ritzlib.sys
+import ritzlib.str
+import ritzlib.memory
+
+import lib.m7m_types
+import lib.page
+
+# ============================================================================
+# WAL Constants
+# ============================================================================
+
+const WAL_HEADER_SIZE: i64 = 32          # WAL record header size
+const WAL_BUFFER_SIZE: i64 = 65536       # 64KB write buffer
+const WAL_FILE_SIZE: i64 = 16777216      # 16MB per WAL segment
+const WAL_MAGIC: i32 = 0x57414C4D        # "WALM"
+
+# Record types
+const WAL_REC_BEGIN: u8 = 1
+const WAL_REC_COMMIT: u8 = 2
+const WAL_REC_ABORT: u8 = 3
+const WAL_REC_INSERT: u8 = 4
+const WAL_REC_UPDATE: u8 = 5
+const WAL_REC_DELETE: u8 = 6
+const WAL_REC_CHECKPOINT: u8 = 7
+const WAL_REC_PAGE_WRITE: u8 = 8         # Full page write
+
+# ============================================================================
+# WAL Record Header
+# ============================================================================
+# Layout (32 bytes):
+#   lsn:        8 bytes - Log sequence number
+#   txn_id:     8 bytes - Transaction ID
+#   prev_lsn:   8 bytes - Previous LSN for this transaction
+#   len:        4 bytes - Total record length (including header)
+#   type:       1 byte  - Record type
+#   flags:      1 byte  - Flags
+#   checksum:   2 bytes - CRC16 of record
+
+struct WalRecordHeader
+    lsn: i64
+    txn_id: i64
+    prev_lsn: i64
+    len: i32
+    rec_type: u8
+    flags: u8
+    checksum: u16
+
+# ============================================================================
+# WAL Insert Record Payload
+# ============================================================================
+# After header:
+#   page_id:    8 bytes
+#   offset:     4 bytes - Offset within page
+#   data_len:   4 bytes - Length of inserted data
+#   data:       variable - The inserted data
+
+struct WalInsertPayload
+    page_id: i64
+    offset: i32
+    data_len: i32
+    # data follows
+
+# ============================================================================
+# WAL Update Record Payload
+# ============================================================================
+# After header:
+#   page_id:    8 bytes
+#   offset:     4 bytes
+#   old_len:    4 bytes
+#   new_len:    4 bytes
+#   old_data:   variable - Before image
+#   new_data:   variable - After image
+
+struct WalUpdatePayload
+    page_id: i64
+    offset: i32
+    old_len: i32
+    new_len: i32
+    # old_data then new_data follow
+
+# ============================================================================
+# WAL Page Write Record (for full page images)
+# ============================================================================
+# After header:
+#   page_id:    8 bytes
+#   page_data:  4096 bytes - Full page image
+
+struct WalPageWritePayload
+    page_id: i64
+    # page_data follows (PAGE_SIZE bytes)
+
+# ============================================================================
+# WAL Writer Structure
+# ============================================================================
+
+struct WalWriter
+    fd: i32                     # File descriptor
+    buffer: *u8                 # Write buffer
+    buffer_pos: i64             # Current position in buffer
+    current_lsn: i64            # Current LSN counter
+    segment_num: i32            # Current segment number
+    segment_pos: i64            # Position in current segment
+    base_path: *u8              # Base path for WAL files
+    base_path_len: i32          # Length of base path
+
+# ============================================================================
+# WAL Writer Creation/Destruction
+# ============================================================================
+
+# Create a new WAL writer
+pub fn wal_writer_new(base_path: *u8) -> *WalWriter
+    if base_path == null
+        return null
+
+    # Allocate writer
+    let writer: *WalWriter = malloc(64) as *WalWriter
+    if writer == null
+        return null
+
+    # Allocate write buffer
+    let buffer: *u8 = malloc(WAL_BUFFER_SIZE)
+    if buffer == null
+        free(writer as *u8)
+        return null
+
+    # Copy base path
+    let path_len: i64 = strlen(base_path)
+    let path_copy: *u8 = malloc(path_len + 1)
+    if path_copy == null
+        free(buffer)
+        free(writer as *u8)
+        return null
+    memcpy(path_copy, base_path, path_len + 1)
+
+    # Initialize
+    writer.fd = -1
+    writer.buffer = buffer
+    writer.buffer_pos = 0
+    writer.current_lsn = 1
+    writer.segment_num = 0
+    writer.segment_pos = 0
+    writer.base_path = path_copy
+    writer.base_path_len = path_len as i32
+
+    return writer
+
+# Open WAL for writing (creates first segment if needed)
+pub fn wal_writer_open(writer: *WalWriter) -> i32
+    if writer == null
+        return ERR_INVALID
+
+    # Build segment file name
+    var path_buf: [256]u8
+    let base_len: i64 = writer.base_path_len as i64
+    memcpy(@path_buf[0], writer.base_path, base_len)
+
+    # Add segment suffix (e.g., ".wal.000000")
+    let suffix: *u8 = c".wal.000000"
+    memcpy(@path_buf[base_len], suffix, 12)
+    path_buf[base_len + 11] = 0
+
+    # Open file
+    let fd: i32 = sys_open3(@path_buf[0], O_RDWR | O_CREAT | O_APPEND, 420)
+    if fd < 0
+        return ERR_IO
+
+    writer.fd = fd
+    return ERR_OK
+
+# Close WAL writer
+pub fn wal_writer_close(writer: *WalWriter) -> i32
+    if writer == null
+        return ERR_INVALID
+
+    # Flush any remaining data
+    wal_writer_flush(writer)
+
+    if writer.fd >= 0
+        sys_close(writer.fd)
+        writer.fd = -1
+
+    return ERR_OK
+
+# Destroy WAL writer
+pub fn wal_writer_destroy(writer: *WalWriter)
+    if writer == null
+        return
+
+    wal_writer_close(writer)
+
+    if writer.buffer != null
+        free(writer.buffer)
+    if writer.base_path != null
+        free(writer.base_path)
+
+    free(writer as *u8)
+
+# ============================================================================
+# Internal Write Helpers
+# ============================================================================
+
+# CRC16 checksum (simple)
+fn crc16(data: *u8, len: i64) -> u16
+    var crc: i32 = 0xFFFF
+    var i: i64 = 0
+    while i < len
+        crc = crc ^ (data[i] as i32)
+        for j in 0..8
+            if (crc & 1) != 0
+                crc = (crc >> 1) ^ 0xA001
+            else
+                crc = crc >> 1
+        i += 1
+    return crc as u16
+
+# Flush buffer to disk
+pub fn wal_writer_flush(writer: *WalWriter) -> i32
+    if writer == null or writer.fd < 0
+        return ERR_INVALID
+
+    if writer.buffer_pos == 0
+        return ERR_OK
+
+    let written: i64 = sys_write(writer.fd, writer.buffer, writer.buffer_pos)
+    if written != writer.buffer_pos
+        return ERR_IO
+
+    writer.segment_pos += writer.buffer_pos
+    writer.buffer_pos = 0
+    return ERR_OK
+
+# Ensure buffer has space for len bytes
+fn ensure_space(writer: *WalWriter, len: i64) -> i32
+    if writer.buffer_pos + len > WAL_BUFFER_SIZE
+        return wal_writer_flush(writer)
+    return ERR_OK
+
+# Write bytes to buffer
+fn write_bytes(writer: *WalWriter, data: *u8, len: i64) -> i32
+    let err: i32 = ensure_space(writer, len)
+    if err != ERR_OK
+        return err
+
+    memcpy(writer.buffer + writer.buffer_pos, data, len)
+    writer.buffer_pos += len
+    return ERR_OK
+
+# ============================================================================
+# WAL Record Writing
+# ============================================================================
+
+# Write a BEGIN record
+pub fn wal_write_begin(writer: *WalWriter, txn_id: i64) -> i64
+    if writer == null
+        return -1
+
+    var header: WalRecordHeader
+    header.lsn = writer.current_lsn
+    header.txn_id = txn_id
+    header.prev_lsn = 0
+    header.len = WAL_HEADER_SIZE as i32
+    header.rec_type = WAL_REC_BEGIN
+    header.flags = 0
+    header.checksum = 0
+
+    # Calculate checksum (skip checksum field)
+    header.checksum = crc16(@header as *u8, WAL_HEADER_SIZE - 2)
+
+    let err: i32 = write_bytes(writer, @header as *u8, WAL_HEADER_SIZE)
+    if err != ERR_OK
+        return -1
+
+    let lsn: i64 = writer.current_lsn
+    writer.current_lsn += 1
+    return lsn
+
+# Write a COMMIT record
+pub fn wal_write_commit(writer: *WalWriter, txn_id: i64, prev_lsn: i64) -> i64
+    if writer == null
+        return -1
+
+    var header: WalRecordHeader
+    header.lsn = writer.current_lsn
+    header.txn_id = txn_id
+    header.prev_lsn = prev_lsn
+    header.len = WAL_HEADER_SIZE as i32
+    header.rec_type = WAL_REC_COMMIT
+    header.flags = 0
+    header.checksum = 0
+
+    header.checksum = crc16(@header as *u8, WAL_HEADER_SIZE - 2)
+
+    let err: i32 = write_bytes(writer, @header as *u8, WAL_HEADER_SIZE)
+    if err != ERR_OK
+        return -1
+
+    # Flush on commit for durability
+    wal_writer_flush(writer)
+
+    let lsn: i64 = writer.current_lsn
+    writer.current_lsn += 1
+    return lsn
+
+# Write an ABORT record
+pub fn wal_write_abort(writer: *WalWriter, txn_id: i64, prev_lsn: i64) -> i64
+    if writer == null
+        return -1
+
+    var header: WalRecordHeader
+    header.lsn = writer.current_lsn
+    header.txn_id = txn_id
+    header.prev_lsn = prev_lsn
+    header.len = WAL_HEADER_SIZE as i32
+    header.rec_type = WAL_REC_ABORT
+    header.flags = 0
+    header.checksum = 0
+
+    header.checksum = crc16(@header as *u8, WAL_HEADER_SIZE - 2)
+
+    let err: i32 = write_bytes(writer, @header as *u8, WAL_HEADER_SIZE)
+    if err != ERR_OK
+        return -1
+
+    let lsn: i64 = writer.current_lsn
+    writer.current_lsn += 1
+    return lsn
+
+# Write an INSERT record
+pub fn wal_write_insert(w: *WalWriter, tid: i64, prev: i64, pid: i64, off: i32, d: *u8, dlen: i32) -> i64
+    var writer: *WalWriter = w
+    var txn_id: i64 = tid
+    var prev_lsn: i64 = prev
+    var page_id: i64 = pid
+    var offset: i32 = off
+    var data: *u8 = d
+    var data_len: i32 = dlen
+    if writer == null
+        return -1
+
+    let total_len: i32 = WAL_HEADER_SIZE as i32 + 16 + data_len
+
+    var header: WalRecordHeader
+    header.lsn = writer.current_lsn
+    header.txn_id = txn_id
+    header.prev_lsn = prev_lsn
+    header.len = total_len
+    header.rec_type = WAL_REC_INSERT
+    header.flags = 0
+    header.checksum = 0
+
+    var payload: WalInsertPayload
+    payload.page_id = page_id
+    payload.offset = offset
+    payload.data_len = data_len
+
+    # Calculate checksum over header + payload + data
+    var checksum_buf: [64]u8
+    memcpy(@checksum_buf[0], @header as *u8, WAL_HEADER_SIZE - 2)
+    header.checksum = crc16(@checksum_buf[0], WAL_HEADER_SIZE - 2)
+
+    # Write header
+    var err: i32 = write_bytes(writer, @header as *u8, WAL_HEADER_SIZE)
+    if err != ERR_OK
+        return -1
+
+    # Write payload
+    err = write_bytes(writer, @payload as *u8, 16)
+    if err != ERR_OK
+        return -1
+
+    # Write data
+    if data_len > 0
+        err = write_bytes(writer, data, data_len as i64)
+        if err != ERR_OK
+            return -1
+
+    let lsn: i64 = writer.current_lsn
+    writer.current_lsn += 1
+    return lsn
+
+# Write a full page image
+pub fn wal_write_page(w: *WalWriter, tid: i64, prev: i64, pid: i64, p: *Page) -> i64
+    var writer: *WalWriter = w
+    var txn_id: i64 = tid
+    var prev_lsn: i64 = prev
+    var page_id: i64 = pid
+    var page: *Page = p
+    if writer == null or page == null
+        return -1
+
+    let total_len: i32 = WAL_HEADER_SIZE as i32 + 8 + PAGE_SIZE as i32
+
+    var header: WalRecordHeader
+    header.lsn = writer.current_lsn
+    header.txn_id = txn_id
+    header.prev_lsn = prev_lsn
+    header.len = total_len
+    header.rec_type = WAL_REC_PAGE_WRITE
+    header.flags = 0
+    header.checksum = 0
+
+    header.checksum = crc16(@header as *u8, WAL_HEADER_SIZE - 2)
+
+    # Write header
+    var err: i32 = write_bytes(writer, @header as *u8, WAL_HEADER_SIZE)
+    if err != ERR_OK
+        return -1
+
+    # Write page_id
+    err = write_bytes(writer, @page_id as *u8, 8)
+    if err != ERR_OK
+        return -1
+
+    # Write page data
+    err = write_bytes(writer, page as *u8, PAGE_SIZE)
+    if err != ERR_OK
+        return -1
+
+    let lsn: i64 = writer.current_lsn
+    writer.current_lsn += 1
+    return lsn
+
+# Write a CHECKPOINT record
+pub fn wal_write_checkpoint(writer: *WalWriter) -> i64
+    if writer == null
+        return -1
+
+    var header: WalRecordHeader
+    header.lsn = writer.current_lsn
+    header.txn_id = 0
+    header.prev_lsn = 0
+    header.len = WAL_HEADER_SIZE as i32
+    header.rec_type = WAL_REC_CHECKPOINT
+    header.flags = 0
+    header.checksum = 0
+
+    header.checksum = crc16(@header as *u8, WAL_HEADER_SIZE - 2)
+
+    let err: i32 = write_bytes(writer, @header as *u8, WAL_HEADER_SIZE)
+    if err != ERR_OK
+        return -1
+
+    # Always flush checkpoint
+    wal_writer_flush(writer)
+
+    let lsn: i64 = writer.current_lsn
+    writer.current_lsn += 1
+    return lsn
+
+# ============================================================================
+# WAL Reader (for recovery)
+# ============================================================================
+
+struct WalReader
+    fd: i32
+    buffer: *u8
+    buffer_size: i64
+    buffer_pos: i64
+    buffer_len: i64
+    current_lsn: i64
+
+pub fn wal_reader_new() -> *WalReader
+    let reader: *WalReader = malloc(48) as *WalReader
+    if reader == null
+        return null
+
+    let buffer: *u8 = malloc(WAL_BUFFER_SIZE)
+    if buffer == null
+        free(reader as *u8)
+        return null
+
+    reader.fd = -1
+    reader.buffer = buffer
+    reader.buffer_size = WAL_BUFFER_SIZE
+    reader.buffer_pos = 0
+    reader.buffer_len = 0
+    reader.current_lsn = 0
+
+    return reader
+
+pub fn wal_reader_open(reader: *WalReader, path: *u8) -> i32
+    if reader == null or path == null
+        return ERR_INVALID
+
+    let fd: i32 = sys_open(path, O_RDONLY)
+    if fd < 0
+        return ERR_IO
+
+    reader.fd = fd
+    reader.buffer_pos = 0
+    reader.buffer_len = 0
+
+    return ERR_OK
+
+pub fn wal_reader_close(reader: *WalReader) -> i32
+    if reader == null
+        return ERR_INVALID
+
+    if reader.fd >= 0
+        sys_close(reader.fd)
+        reader.fd = -1
+
+    return ERR_OK
+
+pub fn wal_reader_destroy(reader: *WalReader)
+    if reader == null
+        return
+
+    wal_reader_close(reader)
+
+    if reader.buffer != null
+        free(reader.buffer)
+
+    free(reader as *u8)
+
+# Read next record header (returns 0 on success, -1 on EOF, error code otherwise)
+pub fn wal_reader_next(reader: *WalReader, header: *WalRecordHeader) -> i32
+    if reader == null or header == null or reader.fd < 0
+        return ERR_INVALID
+
+    # Try to read header
+    let bytes_read: i64 = sys_read(reader.fd, header as *u8, WAL_HEADER_SIZE)
+    if bytes_read == 0
+        return -1  # EOF
+    if bytes_read != WAL_HEADER_SIZE
+        return ERR_IO
+
+    # Verify checksum
+    let expected: u16 = header.checksum
+    header.checksum = 0
+    let actual: u16 = crc16(header as *u8, WAL_HEADER_SIZE - 2)
+    header.checksum = expected
+
+    if expected != actual
+        return ERR_CHECKSUM
+
+    reader.current_lsn = header.lsn
+    return ERR_OK
+
+# Skip to end of current record (after reading header)
+pub fn wal_reader_skip_payload(reader: *WalReader, header: *WalRecordHeader) -> i32
+    if reader == null or header == null
+        return ERR_INVALID
+
+    let payload_len: i64 = (header.len as i64) - WAL_HEADER_SIZE
+    if payload_len > 0
+        let result: i64 = sys_lseek(reader.fd, payload_len, 1)  # SEEK_CUR = 1
+        if result < 0
+            return ERR_IO
+
+    return ERR_OK
+
+# ============================================================================
+# WAL Statistics
+# ============================================================================
+
+pub fn wal_writer_lsn(writer: *WalWriter) -> i64
+    if writer == null
+        return 0
+    return writer.current_lsn
+
+pub fn wal_writer_segment(writer: *WalWriter) -> i32
+    if writer == null
+        return 0
+    return writer.segment_num

@@ -1,0 +1,267 @@
+# 50_http: Simple HTTP/1.0 server
+#
+# A minimal HTTP server demonstrating:
+# - Socket networking with ritzlib/net.ritz
+# - Request parsing with Span<u8>
+# - Response generation with String
+# - Connection handling
+#
+# Usage: http [port]
+#   Default port: 8080
+#
+# Example:
+#   ./http 8080 &
+#   curl http://localhost:8080/
+#   curl http://localhost:8080/hello
+#
+# Architecture:
+# - Single-threaded, blocking I/O (simple starting point)
+# - HTTP/1.0 (connection closes after each request)
+# - Future: HTTP/1.1 (keep-alive), epoll for async I/O
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+import ritzlib.string
+import ritzlib.gvec
+import ritzlib.span
+import ritzlib.net
+
+# ============================================================================
+# HTTP Request parsing
+# ============================================================================
+
+struct HttpRequest
+    method: Span<u8>      # GET, POST, etc.
+    path: Span<u8>        # /path/to/resource
+    version: Span<u8>     # HTTP/1.0 or HTTP/1.1
+    raw: Vec<u8>          # Raw request data (owns memory)
+
+# Parse HTTP request from raw bytes
+# Returns 1 on success, 0 on failure
+fn parse_request(req: *HttpRequest, data: *Vec<u8>) -> i32
+    # Move raw data ownership
+    req.raw = vec_new<u8>()
+    var i: i64 = 0
+    while i < data.len()
+        req.raw.push(data.get(i))
+        i += 1
+
+    var full: Span<u8> = span_from_vec<u8>(&req.raw)
+
+    # Find first space (end of method)
+    var method_end: i64 = 0
+    while method_end < full.len && span_get<u8>(&full, method_end) != ' '  # ' '
+        method_end += 1
+
+    if method_end >= full.len
+        return 0
+
+    req.method = span_slice<u8>(&full, 0, method_end)
+
+    # Find second space (end of path)
+    var path_start: i64 = method_end + 1
+    var path_end: i64 = path_start
+    while path_end < full.len && span_get<u8>(&full, path_end) != ' '
+        path_end += 1
+
+    if path_end >= full.len
+        return 0
+
+    req.path = span_slice<u8>(&full, path_start, path_end)
+
+    # Find end of version (CR or LF)
+    var version_start: i64 = path_end + 1
+    var version_end: i64 = version_start
+    while version_end < full.len
+        let c: u8 = span_get<u8>(&full, version_end)
+        if c == '\r' || c == '\n'  # CR or LF
+            version_end -= 1
+            version_end += 1
+            break
+        version_end += 1
+
+    req.version = span_slice<u8>(&full, version_start, version_end)
+
+    return 1
+
+# ============================================================================
+# HTTP Response generation
+# ============================================================================
+
+# Send HTTP response
+fn send_response(client: *Socket, status: i32, content_type: *u8, body: *u8, body_len: i64) -> i64
+    var response: String = string_new()
+
+    # Status line
+    response.push_str("HTTP/1.0 ")
+    if status == 200
+        response.push_str("200 OK")
+    else
+        if status == 404
+            response.push_str("404 Not Found")
+        else
+            if status == 400
+                response.push_str("400 Bad Request")
+            else
+                response.push_str("500 Internal Server Error")
+
+    response.push_str("\r\n")
+
+    # Headers
+    response.push_str("Content-Type: ")
+    response.push_str(content_type)
+    response.push_str("\r\n")
+
+    response.push_str("Content-Length: ")
+    response.push_i64(body_len)
+    response.push_str("\r\n")
+
+    response.push_str("Connection: close\r\n")
+    response.push_str("\r\n")
+
+    # Send headers
+    let header_sent: i64 = socket_send(client, string_as_ptr(&response), string_len(&response))
+
+    # Send body
+    var body_sent: i64 = 0
+    if body_len > 0
+        body_sent = socket_send(client, body, body_len)
+
+    return header_sent + body_sent
+
+# ============================================================================
+# Request handlers
+# ============================================================================
+
+fn handle_root(client: *Socket) -> i64
+    let body = "<!DOCTYPE html>\n<html>\n<head><title>Ritz HTTP Server</title></head>\n<body>\n<h1>Welcome to Ritz HTTP Server</h1>\n<p>A high-performance web server written in Ritz.</p>\n<ul>\n<li><a href=\"/hello\">Hello World</a></li>\n<li><a href=\"/info\">Server Info</a></li>\n</ul>\n</body>\n</html>\n"
+    return send_response(client, 200, "text/html", body, strlen(body))
+
+fn handle_hello(client: *Socket) -> i64
+    let body = "Hello, World!\n"
+    return send_response(client, 200, "text/plain", body, strlen(body))
+
+fn handle_info(client: *Socket) -> i64
+    let body = "Ritz HTTP Server v0.1\nHTTP/1.0 compatible\nSingle-threaded, blocking I/O\n"
+    return send_response(client, 200, "text/plain", body, strlen(body))
+
+fn handle_not_found(client: *Socket) -> i64
+    let body = "404 Not Found\n"
+    return send_response(client, 404, "text/plain", body, strlen(body))
+
+fn handle_bad_request(client: *Socket) -> i64
+    let body = "400 Bad Request\n"
+    return send_response(client, 400, "text/plain", body, strlen(body))
+
+# ============================================================================
+# Connection handling
+# ============================================================================
+
+fn handle_connection(client: *Socket)
+    # Read request into buffer
+    var buf: Vec<u8> = vec_with_cap<u8>(4096)
+    var total: i64 = 0
+
+    # Read until we see end of headers (\r\n\r\n)
+    var done: i32 = 0
+    while done == 0 && total < 4096
+        vec_ensure_cap<u8>(&buf, total + 1024)
+        let n: i64 = socket_recv(client, buf.as_ptr() + total, 1024)
+        if n <= 0
+            done = 1
+        else
+            # Update length manually since we wrote directly
+            var i: i64 = 0
+            while i < n
+                buf.push(*(buf.as_ptr() + total + i))
+                i += 1
+            # Wait - we pushed but also wrote directly, fix this:
+            # Actually let's just track manually
+            total += n
+
+            # Check for end of headers
+            if total >= 4
+                let end_ptr: *u8 = buf.as_ptr() + total - 4
+                if *end_ptr == '\r' && *(end_ptr + 1) == '\n' && *(end_ptr + 2) == '\r' && *(end_ptr + 3) == '\n'
+                    done = 1
+
+    # Rebuild buf with correct length
+    var request_data: Vec<u8> = vec_new<u8>()
+    var j: i64 = 0
+    while j < total
+        request_data.push(*(buf.as_ptr() + j))
+        j += 1
+
+    # Parse request
+    var req: HttpRequest
+    if parse_request(&req, &request_data) == 0
+        handle_bad_request(client)
+        return
+
+    # Route request
+    var path_hello: Span<u8> = span_from_cstr("/hello")
+    var path_info: Span<u8> = span_from_cstr("/info")
+    var path_root: Span<u8> = span_from_cstr("/")
+
+    if span_eq(&req.path, &path_root) == 1
+        handle_root(client)
+    else
+        if span_eq(&req.path, &path_hello) == 1
+            handle_hello(client)
+        else
+            if span_eq(&req.path, &path_info) == 1
+                handle_info(client)
+            else
+                handle_not_found(client)
+
+# ============================================================================
+# Main server loop
+# ============================================================================
+
+fn main(argc: i32, argv: **u8) -> i32
+    # Parse port from command line
+    var port: i32 = 8080
+    if argc > 1
+        port = atoi(*(argv + 1))
+        if port <= 0 || port > 65535
+            prints("Invalid port number\n")
+            return 1
+
+    # Create server socket
+    var server: Socket = socket_tcp()
+    if server.valid() == 0
+        prints("Failed to create socket\n")
+        return 1
+
+    # Set socket options
+    if server.set_reuseaddr() < 0
+        prints("Failed to set SO_REUSEADDR\n")
+
+    # Bind to address
+    if server.bind("0.0.0.0", port) < 0
+        prints("Failed to bind to port ")
+        print_int(port)
+        prints("\n")
+        return 1
+
+    # Listen for connections
+    if server.listen(128) < 0
+        prints("Failed to listen\n")
+        return 1
+
+    prints("Ritz HTTP server listening on port ")
+    print_int(port)
+    prints("\n")
+    prints("Press Ctrl+C to stop\n")
+
+    # Accept loop
+    var running: i32 = 1
+    while running == 1
+        var client: Socket = server.accept()
+        if client.valid() == 1
+            handle_connection(&client)
+            client.close()
+
+    server.close()
+    0

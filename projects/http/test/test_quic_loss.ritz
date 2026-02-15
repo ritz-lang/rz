@@ -1,0 +1,437 @@
+# test/test_quic_loss.ritz - Tests for QUIC loss detection and congestion control
+#
+# RFC 9002 defines loss detection and congestion control
+
+import ritzlib.span
+import lib.quic_loss
+
+# ============================================================================
+# RTT Estimation
+# ============================================================================
+
+[[test]]
+fn test_rtt_init() -> i32
+    var rtt: RttEstimate
+    rtt_init(@rtt)
+    if rtt.latest_rtt != 0
+        return 1
+    if rtt.smoothed_rtt != INITIAL_RTT_US
+        return 2
+    if rtt.rttvar != INITIAL_RTT_US / 2
+        return 3
+    if rtt.min_rtt != 0
+        return 4
+    if rtt.first_sample != 0
+        return 5
+    return 0
+
+[[test]]
+fn test_rtt_first_sample() -> i32
+    var rtt: RttEstimate
+    rtt_init(@rtt)
+
+    # First sample: 100ms = 100000us
+    rtt_update(@rtt, 100000, 0, 25000)
+
+    if rtt.first_sample != 1
+        return 1
+    if rtt.latest_rtt != 100000
+        return 2
+    if rtt.smoothed_rtt != 100000
+        return 3
+    if rtt.rttvar != 50000  # sample / 2
+        return 4
+    if rtt.min_rtt != 100000
+        return 5
+    return 0
+
+[[test]]
+fn test_rtt_update_second_sample() -> i32
+    var rtt: RttEstimate
+    rtt_init(@rtt)
+
+    # First sample
+    rtt_update(@rtt, 100000, 0, 25000)
+    # Second sample: 80ms
+    rtt_update(@rtt, 80000, 0, 25000)
+
+    if rtt.latest_rtt != 80000
+        return 1
+    if rtt.min_rtt != 80000  # Should update to smaller
+        return 2
+    # smoothed_rtt = 7/8 * 100000 + 1/8 * 80000 = 87500 + 10000 = 97500
+    if rtt.smoothed_rtt != 97500
+        return 3
+    return 0
+
+[[test]]
+fn test_rtt_min_rtt_tracking() -> i32
+    var rtt: RttEstimate
+    rtt_init(@rtt)
+
+    rtt_update(@rtt, 100000, 0, 25000)
+    rtt_update(@rtt, 50000, 0, 25000)
+    rtt_update(@rtt, 80000, 0, 25000)
+
+    # min_rtt should still be 50000
+    if rtt.min_rtt != 50000
+        return 1
+    return 0
+
+[[test]]
+fn test_rtt_ack_delay_adjustment() -> i32
+    var rtt: RttEstimate
+    rtt_init(@rtt)
+
+    # First sample to establish min_rtt
+    rtt_update(@rtt, 100000, 0, 25000)
+
+    # Second sample with ack_delay
+    # sample = 120000, ack_delay = 10000, min_rtt = 100000
+    # adjusted_rtt = 120000 - 10000 = 110000 (since sample > min_rtt + ack_delay)
+    rtt_update(@rtt, 120000, 10000, 25000)
+
+    if rtt.latest_rtt != 120000
+        return 1
+    # Check smoothed_rtt is based on adjusted value
+    # smoothed_rtt = 7/8 * 100000 + 1/8 * 110000 = 87500 + 13750 = 101250
+    if rtt.smoothed_rtt != 101250
+        return 2
+    return 0
+
+[[test]]
+fn test_rtt_pto() -> i32
+    var rtt: RttEstimate
+    rtt_init(@rtt)
+
+    rtt_update(@rtt, 100000, 0, 25000)
+    # PTO = smoothed_rtt + 4 * rttvar = 100000 + 4 * 50000 = 300000
+    let pto: i64 = rtt_pto(@rtt)
+    if pto != 300000
+        return 1
+    return 0
+
+[[test]]
+fn test_rtt_pto_minimum() -> i32
+    var rtt: RttEstimate
+    rtt_init(@rtt)
+
+    # Use very small RTT
+    rtt_update(@rtt, 100, 0, 25000)
+    # PTO should be at least RTT_GRANULARITY_US
+    let pto: i64 = rtt_pto(@rtt)
+    if pto < RTT_GRANULARITY_US
+        return 1
+    return 0
+
+[[test]]
+fn test_rtt_loss_delay() -> i32
+    var rtt: RttEstimate
+    rtt_init(@rtt)
+
+    rtt_update(@rtt, 100000, 0, 25000)
+    # loss_delay = max(latest_rtt, smoothed_rtt) * 9 / 8
+    # = 100000 * 9 / 8 = 112500
+    let delay: i64 = rtt_loss_delay(@rtt)
+    if delay != 112500
+        return 1
+    return 0
+
+# ============================================================================
+# Congestion Controller
+# ============================================================================
+
+[[test]]
+fn test_cc_init() -> i32
+    var cc: CongestionController
+    cc_init(@cc)
+
+    if cc.cwnd != INITIAL_CWND_PACKETS * MAX_DATAGRAM_SIZE
+        return 1
+    if cc.bytes_in_flight != 0
+        return 2
+    if cc.in_recovery != 0
+        return 3
+    return 0
+
+[[test]]
+fn test_cc_on_packet_sent() -> i32
+    var cc: CongestionController
+    cc_init(@cc)
+
+    cc_on_packet_sent(@cc, 1200)
+    if cc.bytes_in_flight != 1200
+        return 1
+
+    cc_on_packet_sent(@cc, 800)
+    if cc.bytes_in_flight != 2000
+        return 2
+    return 0
+
+[[test]]
+fn test_cc_on_packet_acked_slow_start() -> i32
+    var cc: CongestionController
+    cc_init(@cc)
+
+    let initial_cwnd: i64 = cc.cwnd
+    cc_on_packet_sent(@cc, 1200)
+    cc_on_packet_acked(@cc, 1200, 1000000)
+
+    if cc.bytes_in_flight != 0
+        return 1
+    # In slow start, cwnd increases by sent_bytes
+    if cc.cwnd != initial_cwnd + 1200
+        return 2
+    return 0
+
+[[test]]
+fn test_cc_on_packet_lost() -> i32
+    var cc: CongestionController
+    cc_init(@cc)
+
+    let initial_cwnd: i64 = cc.cwnd
+    cc_on_packet_sent(@cc, 1200)
+    cc_on_packet_lost(@cc, 1200, 2000000)
+
+    if cc.bytes_in_flight != 0
+        return 1
+    if cc.in_recovery != 1
+        return 2
+    # ssthresh and cwnd should be halved
+    if cc.ssthresh != initial_cwnd / 2
+        return 3
+    if cc.cwnd != initial_cwnd / 2
+        return 4
+    return 0
+
+[[test]]
+fn test_cc_can_send() -> i32
+    var cc: CongestionController
+    cc_init(@cc)
+
+    # Can send when bytes_in_flight + bytes <= cwnd
+    if cc_can_send(@cc, 1200) != 1
+        return 1
+
+    # Fill up the cwnd
+    cc.bytes_in_flight = cc.cwnd - 100
+    if cc_can_send(@cc, 100) != 1
+        return 2
+    if cc_can_send(@cc, 200) != 0
+        return 3
+    return 0
+
+[[test]]
+fn test_cc_recovery_no_cwnd_increase() -> i32
+    var cc: CongestionController
+    cc_init(@cc)
+
+    # Enter recovery
+    cc_on_packet_sent(@cc, 1200)
+    cc_on_packet_lost(@cc, 1200, 1000000)
+
+    let cwnd_after_loss: i64 = cc.cwnd
+
+    # Send and ack a packet sent before recovery
+    cc_on_packet_sent(@cc, 1200)
+    cc_on_packet_acked(@cc, 1200, 500000)  # sent_time < recovery_start_time
+
+    # cwnd should not increase
+    if cc.cwnd != cwnd_after_loss
+        return 1
+    return 0
+
+[[test]]
+fn test_cc_exit_recovery() -> i32
+    var cc: CongestionController
+    cc_init(@cc)
+
+    # Enter recovery at time 1000000
+    cc_on_packet_sent(@cc, 1200)
+    cc_on_packet_lost(@cc, 1200, 1000000)
+
+    if cc.in_recovery != 1
+        return 1
+
+    # Ack a packet sent after recovery started
+    cc_on_packet_sent(@cc, 1200)
+    cc_on_packet_acked(@cc, 1200, 2000000)  # sent_time > recovery_start_time
+
+    if cc.in_recovery != 0
+        return 2
+    return 0
+
+# ============================================================================
+# Sent Packet
+# ============================================================================
+
+[[test]]
+fn test_sent_packet_init() -> i32
+    var pkt: SentPacket
+    sent_packet_init(@pkt)
+
+    if pkt.pn != 0
+        return 1
+    if pkt.sent_time != 0
+        return 2
+    if pkt.sent_bytes != 0
+        return 3
+    if pkt.ack_eliciting != 0
+        return 4
+    if pkt.in_flight != 0
+        return 5
+    if pkt.declared_lost != 0
+        return 6
+    return 0
+
+# ============================================================================
+# Sent Packet Tracker
+# ============================================================================
+
+[[test]]
+fn test_sent_tracker_init() -> i32
+    var tracker: SentPacketTracker
+    sent_tracker_init(@tracker)
+
+    if tracker.count != 0
+        return 1
+    if tracker.largest_acked != -1
+        return 2
+    return 0
+
+[[test]]
+fn test_sent_tracker_on_send() -> i32
+    var tracker: SentPacketTracker
+    sent_tracker_init(@tracker)
+
+    let ret: i32 = sent_tracker_on_send(@tracker, 0, 1000000, 1200, 1)
+    if ret != LOSS_OK
+        return 1
+    if tracker.count != 1
+        return 2
+
+    let ret2: i32 = sent_tracker_on_send(@tracker, 1, 2000000, 800, 1)
+    if ret2 != LOSS_OK
+        return 3
+    if tracker.count != 2
+        return 4
+    return 0
+
+[[test]]
+fn test_sent_tracker_on_ack() -> i32
+    var tracker: SentPacketTracker
+    sent_tracker_init(@tracker)
+    var cc: CongestionController
+    cc_init(@cc)
+
+    sent_tracker_on_send(@tracker, 0, 1000000, 1200, 1)
+    cc_on_packet_sent(@cc, 1200)
+
+    let sent_time: i64 = sent_tracker_on_ack(@tracker, 0, @cc)
+    if sent_time != 1000000
+        return 1
+    if tracker.largest_acked != 0
+        return 2
+    if cc.bytes_in_flight != 0
+        return 3
+    return 0
+
+[[test]]
+fn test_sent_tracker_on_ack_not_found() -> i32
+    var tracker: SentPacketTracker
+    sent_tracker_init(@tracker)
+    var cc: CongestionController
+    cc_init(@cc)
+
+    let sent_time: i64 = sent_tracker_on_ack(@tracker, 99, @cc)
+    if sent_time != 0
+        return 1
+    return 0
+
+[[test]]
+fn test_sent_tracker_detect_lost_packet_threshold() -> i32
+    var tracker: SentPacketTracker
+    sent_tracker_init(@tracker)
+    var cc: CongestionController
+    cc_init(@cc)
+
+    # Send packets 0, 1, 2, 3
+    var i: i64 = 0
+    while i < 4
+        sent_tracker_on_send(@tracker, i, 1000000 + i * 1000, 1200, 1)
+        cc_on_packet_sent(@cc, 1200)
+        i = i + 1
+
+    # Ack packet 3 (largest_acked = 3)
+    sent_tracker_on_ack(@tracker, 3, @cc)
+
+    # Detect lost: packets where pn + 3 <= largest_acked
+    # Packet 0: 0 + 3 = 3 <= 3, LOST
+    # Packet 1: 1 + 3 = 4 > 3, not lost
+    # Packet 2: 2 + 3 = 5 > 3, not lost
+    let lost: i32 = sent_tracker_detect_lost(@tracker, 3, 999999999, 5000000, @cc)
+    if lost != 1
+        return 1
+    return 0
+
+[[test]]
+fn test_sent_tracker_detect_lost_time_threshold() -> i32
+    var tracker: SentPacketTracker
+    sent_tracker_init(@tracker)
+    var cc: CongestionController
+    cc_init(@cc)
+
+    # Send packet at time 1000000
+    sent_tracker_on_send(@tracker, 0, 1000000, 1200, 1)
+    cc_on_packet_sent(@cc, 1200)
+
+    # Detect lost with loss_delay = 100000, now = 1200000
+    # sent_time + loss_delay = 1000000 + 100000 = 1100000 <= 1200000, LOST
+    let lost: i32 = sent_tracker_detect_lost(@tracker, 0, 100000, 1200000, @cc)
+    if lost != 1
+        return 1
+    return 0
+
+[[test]]
+fn test_sent_tracker_in_flight_count() -> i32
+    var tracker: SentPacketTracker
+    sent_tracker_init(@tracker)
+    var cc: CongestionController
+    cc_init(@cc)
+
+    sent_tracker_on_send(@tracker, 0, 1000000, 1200, 1)
+    sent_tracker_on_send(@tracker, 1, 2000000, 1200, 1)
+    sent_tracker_on_send(@tracker, 2, 3000000, 1200, 1)
+
+    if sent_tracker_in_flight_count(@tracker) != 3
+        return 1
+
+    sent_tracker_on_ack(@tracker, 1, @cc)
+    if sent_tracker_in_flight_count(@tracker) != 2
+        return 2
+    return 0
+
+[[test]]
+fn test_sent_tracker_earliest_sent_time() -> i32
+    var tracker: SentPacketTracker
+    sent_tracker_init(@tracker)
+
+    sent_tracker_on_send(@tracker, 0, 3000000, 1200, 1)
+    sent_tracker_on_send(@tracker, 1, 1000000, 1200, 1)
+    sent_tracker_on_send(@tracker, 2, 2000000, 1200, 1)
+
+    let earliest: i64 = sent_tracker_earliest_sent_time(@tracker)
+    if earliest != 1000000
+        return 1
+    return 0
+
+[[test]]
+fn test_sent_tracker_earliest_sent_time_empty() -> i32
+    var tracker: SentPacketTracker
+    sent_tracker_init(@tracker)
+
+    let earliest: i64 = sent_tracker_earliest_sent_time(@tracker)
+    if earliest != 0
+        return 1
+    return 0
+

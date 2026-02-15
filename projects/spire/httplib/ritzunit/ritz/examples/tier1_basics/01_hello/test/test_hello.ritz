@@ -1,0 +1,138 @@
+# Tests for 01_hello - basic language features and print builtin
+#
+# The 01_hello example demonstrates:
+# - fn definition with return type
+# - print() builtin
+# - Trailing expression as return value
+#
+# Unit tests: verify language primitives work
+# Integration test: verify ./hello outputs "Hello, Ritz!"
+
+import ritzlib.sys
+# import ritzlib.process  # Temporarily disabled - needs generic monomorphization fix
+# import ritzlib.span
+# import ritzlib.gvec
+
+# Test basic arithmetic
+@test
+fn test_arithmetic() -> i32
+    assert 2 + 3 == 5
+    assert 10 - 4 == 6
+    assert 3 * 4 == 12
+    assert 10 / 2 == 5
+    assert 10 % 3 == 1
+    0
+
+# Test comparison operators
+@test
+fn test_hello_comparison() -> i32
+    assert 5 > 3
+    assert 3 < 5
+    assert 5 >= 5
+    assert 5 <= 5
+    assert 5 == 5
+    assert 5 != 4
+    0
+
+# Test function return via trailing expression
+@test
+fn test_function_return() -> i32
+    let result: i32 = return_42()
+    assert result == 42
+    0
+
+fn return_42() -> i32
+    42
+
+# Test C-string literals
+@test
+fn test_string_literal() -> i32
+    let s: *i8 = c"hello"
+    assert *s == 104       # 'h'
+    assert *(s + 1) == 'e' # 'e'
+    assert *(s + 4) == 111 # 'o'
+    assert *(s + 5) == 0   # null terminator
+    0
+
+# Test escape sequences in C-strings
+@test
+fn test_escape_sequences() -> i32
+    let s: *i8 = c"a\nb\tc"
+    assert *s == 'a'        # 'a'
+    assert *(s + 1) == '\n'  # '\n'
+    assert *(s + 2) == 'b'  # 'b'
+    assert *(s + 3) == '\t'   # '\t'
+    assert *(s + 4) == 'c'  # 'c'
+    0
+
+# Test logical operators
+@test
+fn test_logical_operators() -> i32
+    assert (1 == 1) && (2 == 2)
+    assert (1 == 1) || (1 == 2)
+    assert !(1 == 2)
+    0
+
+# ============================================================================
+# Integration test: verify ./hello outputs "Hello, Ritz!"
+# This replaces test.sh with a native Ritz test using fork/exec directly.
+# No generics needed - uses fixed buffer.
+# ============================================================================
+
+# Simple string comparison helper (private - prefixed to avoid conflicts)
+fn hello_starts_with(buf: *u8, prefix: *u8) -> i32
+    var i: i64 = 0
+    while *(prefix + i) != 0
+        if *(buf + i) != *(prefix + i)
+            return 0
+        i += 1
+    return 1
+
+@test
+fn test_hello_output() -> i32
+    # Create pipe for capturing stdout
+    var pipefd: [2]i32
+    if sys_pipe(&pipefd[0]) < 0
+        return 1  # pipe failed
+
+    let pid: i32 = sys_fork()
+
+    if pid < 0
+        # Fork failed
+        sys_close(pipefd[0])
+        sys_close(pipefd[1])
+        return 2
+
+    if pid == 0
+        # Child: redirect stdout to pipe, exec ./hello
+        sys_dup2(pipefd[1], 1)  # stdout = write end
+        sys_close(pipefd[0])    # close read end
+        sys_close(pipefd[1])    # close original write end
+
+        # Build argv for execve
+        var argv: [2]*u8
+        argv[0] = c"./hello"
+        argv[1] = null
+
+        sys_execve(c"./hello", &argv[0], null)
+        sys_exit(127)  # exec failed
+
+    # Parent: read from pipe
+    sys_close(pipefd[1])  # close write end
+
+    var buf: [256]u8
+    let n: i64 = sys_read(pipefd[0], &buf[0], 255)
+    sys_close(pipefd[0])
+
+    if n <= 0
+        return 3  # read failed
+
+    buf[n] = 0  # null terminate
+
+    # Wait for child
+    var status: i32 = 0
+    sys_wait4(pid, &status, 0, null)
+
+    # Check output starts with "Hello, Ritz!"
+    assert hello_starts_with(&buf[0], c"Hello, Ritz!") == 1, "expected Hello, Ritz!"
+    return 0

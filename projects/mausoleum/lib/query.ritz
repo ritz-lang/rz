@@ -1,0 +1,765 @@
+# lib/query.ritz - Query Builder for Mausoleum
+#
+# Provides a fluent query API for filtering, ordering, and paginating documents:
+# - Filter expressions: eq, ne, gt, lt, gte, lte, is_null, is_not_null
+# - Logical operators: and, or (via filter chaining)
+# - Ordering: asc, desc by field
+# - Pagination: limit, offset
+# - Execution: returns matching documents from a collection
+
+import ritzlib.sys
+import ritzlib.str
+import ritzlib.memory
+
+import lib.m7m_types
+import lib.document
+import lib.collection
+import lib.btree
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+# Maximum filters per query
+const MAX_FILTERS: i32 = 16
+
+# Maximum order clauses per query
+const MAX_ORDERS: i32 = 4
+
+# Maximum results to return
+const MAX_RESULTS: i32 = 1000
+
+# Filter comparison operators
+const FILTER_EQ: i32 = 1        # Equal
+const FILTER_NE: i32 = 2        # Not equal
+const FILTER_GT: i32 = 3        # Greater than
+const FILTER_LT: i32 = 4        # Less than
+const FILTER_GTE: i32 = 5       # Greater than or equal
+const FILTER_LTE: i32 = 6       # Less than or equal
+const FILTER_IS_NULL: i32 = 7   # Field is null
+const FILTER_NOT_NULL: i32 = 8  # Field is not null
+const FILTER_CONTAINS: i32 = 9  # String contains substring
+const FILTER_STARTS: i32 = 10   # String starts with prefix
+const FILTER_HAS_PARENT: i32 = 11  # Document has specific parent
+const FILTER_HAS_LINK: i32 = 12    # Document has link with label
+
+# Order directions
+const ORDER_ASC: i32 = 1
+const ORDER_DESC: i32 = 2
+
+# ============================================================================
+# Filter - A single filter condition
+# ============================================================================
+
+struct Filter
+    field_name: [64]u8     # Field name to filter on
+    op: i32                # Comparison operator
+    value: Field           # Comparison value (for value-based ops)
+    str_value: *u8         # String value for CONTAINS/STARTS
+    str_len: i64
+
+# ============================================================================
+# OrderClause - A single ordering clause
+# ============================================================================
+
+struct OrderClause
+    field_name: [64]u8
+    direction: i32         # ORDER_ASC or ORDER_DESC
+
+# ============================================================================
+# Query - The main query structure
+# ============================================================================
+
+struct Query
+    filters: [16]Filter    # MAX_FILTERS
+    filter_count: i32
+    orders: [4]OrderClause # MAX_ORDERS
+    order_count: i32
+    limit_val: i32
+    offset_val: i32
+
+# ============================================================================
+# QueryResult - Results from query execution
+# ============================================================================
+
+struct QueryResult
+    doc_ids: *i64          # Array of DocumentId.value
+    count: i32
+    capacity: i32
+
+# ============================================================================
+# Query Creation
+# ============================================================================
+
+pub fn query_new() -> Query
+    var q: Query
+    q.filter_count = 0
+    q.order_count = 0
+    q.limit_val = MAX_RESULTS
+    q.offset_val = 0
+    return q
+
+pub fn query_init(q: *Query)
+    q.filter_count = 0
+    q.order_count = 0
+    q.limit_val = MAX_RESULTS
+    q.offset_val = 0
+
+# ============================================================================
+# Filter Builders
+# ============================================================================
+
+# Add equality filter: field == value
+pub fn query_eq(q: *Query, field: *u8, value: *Field) -> i32
+    if q.filter_count >= MAX_FILTERS
+        return ERR_FULL
+
+    var f: *Filter = @q.filters[q.filter_count]
+    strcpy(@f.field_name[0], field)
+    f.op = FILTER_EQ
+    f.value = *value
+    f.str_value = null
+    f.str_len = 0
+    q.filter_count = q.filter_count + 1
+    return ERR_OK
+
+# Add not-equal filter: field != value
+pub fn query_ne(q: *Query, field: *u8, value: *Field) -> i32
+    if q.filter_count >= MAX_FILTERS
+        return ERR_FULL
+
+    var f: *Filter = @q.filters[q.filter_count]
+    strcpy(@f.field_name[0], field)
+    f.op = FILTER_NE
+    f.value = *value
+    f.str_value = null
+    f.str_len = 0
+    q.filter_count = q.filter_count + 1
+    return ERR_OK
+
+# Add greater-than filter: field > value
+pub fn query_gt(q: *Query, field: *u8, value: *Field) -> i32
+    if q.filter_count >= MAX_FILTERS
+        return ERR_FULL
+
+    var f: *Filter = @q.filters[q.filter_count]
+    strcpy(@f.field_name[0], field)
+    f.op = FILTER_GT
+    f.value = *value
+    f.str_value = null
+    f.str_len = 0
+    q.filter_count = q.filter_count + 1
+    return ERR_OK
+
+# Add less-than filter: field < value
+pub fn query_lt(q: *Query, field: *u8, value: *Field) -> i32
+    if q.filter_count >= MAX_FILTERS
+        return ERR_FULL
+
+    var f: *Filter = @q.filters[q.filter_count]
+    strcpy(@f.field_name[0], field)
+    f.op = FILTER_LT
+    f.value = *value
+    f.str_value = null
+    f.str_len = 0
+    q.filter_count = q.filter_count + 1
+    return ERR_OK
+
+# Add greater-than-or-equal filter: field >= value
+pub fn query_gte(q: *Query, field: *u8, value: *Field) -> i32
+    if q.filter_count >= MAX_FILTERS
+        return ERR_FULL
+
+    var f: *Filter = @q.filters[q.filter_count]
+    strcpy(@f.field_name[0], field)
+    f.op = FILTER_GTE
+    f.value = *value
+    f.str_value = null
+    f.str_len = 0
+    q.filter_count = q.filter_count + 1
+    return ERR_OK
+
+# Add less-than-or-equal filter: field <= value
+pub fn query_lte(q: *Query, field: *u8, value: *Field) -> i32
+    if q.filter_count >= MAX_FILTERS
+        return ERR_FULL
+
+    var f: *Filter = @q.filters[q.filter_count]
+    strcpy(@f.field_name[0], field)
+    f.op = FILTER_LTE
+    f.value = *value
+    f.str_value = null
+    f.str_len = 0
+    q.filter_count = q.filter_count + 1
+    return ERR_OK
+
+# Add is-null filter
+pub fn query_is_null(q: *Query, field: *u8) -> i32
+    if q.filter_count >= MAX_FILTERS
+        return ERR_FULL
+
+    var f: *Filter = @q.filters[q.filter_count]
+    strcpy(@f.field_name[0], field)
+    f.op = FILTER_IS_NULL
+    f.value = field_null()
+    f.str_value = null
+    f.str_len = 0
+    q.filter_count = q.filter_count + 1
+    return ERR_OK
+
+# Add is-not-null filter
+pub fn query_not_null(q: *Query, field: *u8) -> i32
+    if q.filter_count >= MAX_FILTERS
+        return ERR_FULL
+
+    var f: *Filter = @q.filters[q.filter_count]
+    strcpy(@f.field_name[0], field)
+    f.op = FILTER_NOT_NULL
+    f.value = field_null()
+    f.str_value = null
+    f.str_len = 0
+    q.filter_count = q.filter_count + 1
+    return ERR_OK
+
+# Add string contains filter
+pub fn query_contains(q: *Query, field: *u8, substr: *u8, substr_len: i64) -> i32
+    if q.filter_count >= MAX_FILTERS
+        return ERR_FULL
+
+    var f: *Filter = @q.filters[q.filter_count]
+    strcpy(@f.field_name[0], field)
+    f.op = FILTER_CONTAINS
+    f.value = field_null()
+    f.str_value = substr
+    f.str_len = substr_len
+    q.filter_count = q.filter_count + 1
+    return ERR_OK
+
+# Add string starts-with filter
+pub fn query_starts_with(q: *Query, field: *u8, prefix: *u8, prefix_len: i64) -> i32
+    if q.filter_count >= MAX_FILTERS
+        return ERR_FULL
+
+    var f: *Filter = @q.filters[q.filter_count]
+    strcpy(@f.field_name[0], field)
+    f.op = FILTER_STARTS
+    f.value = field_null()
+    f.str_value = prefix
+    f.str_len = prefix_len
+    q.filter_count = q.filter_count + 1
+    return ERR_OK
+
+# Add parent filter - matches documents with specific parent
+pub fn query_has_parent(q: *Query, parent_id: *DocumentId) -> i32
+    if q.filter_count >= MAX_FILTERS
+        return ERR_FULL
+
+    var f: *Filter = @q.filters[q.filter_count]
+    f.field_name[0] = 0  # Not used for parent filter
+    f.op = FILTER_HAS_PARENT
+    f.value = field_int(parent_id.value)
+    f.str_value = null
+    f.str_len = 0
+    q.filter_count = q.filter_count + 1
+    return ERR_OK
+
+# Add link filter - matches documents with a specific link label
+pub fn query_has_link(q: *Query, label: *u8) -> i32
+    if q.filter_count >= MAX_FILTERS
+        return ERR_FULL
+
+    var f: *Filter = @q.filters[q.filter_count]
+    strcpy(@f.field_name[0], label)
+    f.op = FILTER_HAS_LINK
+    f.value = field_null()
+    f.str_value = null
+    f.str_len = 0
+    q.filter_count = q.filter_count + 1
+    return ERR_OK
+
+# ============================================================================
+# Convenience Filter Builders (Int)
+# ============================================================================
+
+pub fn query_eq_int(q: *Query, field: *u8, value: i64) -> i32
+    var f: Field = field_int(value)
+    return query_eq(q, field, @f)
+
+pub fn query_ne_int(q: *Query, field: *u8, value: i64) -> i32
+    var f: Field = field_int(value)
+    return query_ne(q, field, @f)
+
+pub fn query_gt_int(q: *Query, field: *u8, value: i64) -> i32
+    var f: Field = field_int(value)
+    return query_gt(q, field, @f)
+
+pub fn query_lt_int(q: *Query, field: *u8, value: i64) -> i32
+    var f: Field = field_int(value)
+    return query_lt(q, field, @f)
+
+pub fn query_gte_int(q: *Query, field: *u8, value: i64) -> i32
+    var f: Field = field_int(value)
+    return query_gte(q, field, @f)
+
+pub fn query_lte_int(q: *Query, field: *u8, value: i64) -> i32
+    var f: Field = field_int(value)
+    return query_lte(q, field, @f)
+
+# ============================================================================
+# Order Builders
+# ============================================================================
+
+pub fn query_order_asc(q: *Query, field: *u8) -> i32
+    if q.order_count >= MAX_ORDERS
+        return ERR_FULL
+
+    var o: *OrderClause = @q.orders[q.order_count]
+    strcpy(@o.field_name[0], field)
+    o.direction = ORDER_ASC
+    q.order_count = q.order_count + 1
+    return ERR_OK
+
+pub fn query_order_desc(q: *Query, field: *u8) -> i32
+    if q.order_count >= MAX_ORDERS
+        return ERR_FULL
+
+    var o: *OrderClause = @q.orders[q.order_count]
+    strcpy(@o.field_name[0], field)
+    o.direction = ORDER_DESC
+    q.order_count = q.order_count + 1
+    return ERR_OK
+
+# ============================================================================
+# Pagination
+# ============================================================================
+
+pub fn query_limit(q: *Query, limit: i32) -> i32
+    if limit < 0 or limit > MAX_RESULTS
+        return ERR_INVALID
+    q.limit_val = limit
+    return ERR_OK
+
+pub fn query_offset(q: *Query, offset: i32) -> i32
+    if offset < 0
+        return ERR_INVALID
+    q.offset_val = offset
+    return ERR_OK
+
+# ============================================================================
+# Filter Matching
+# ============================================================================
+
+# Compare two Field values, returns: <0 if a<b, 0 if a==b, >0 if a>b
+fn field_compare(a: *Field, b: *Field) -> i32
+    # Different types can't be meaningfully compared (except null)
+    if a.ftype != b.ftype
+        if a.ftype == FIELD_NULL
+            return -1
+        if b.ftype == FIELD_NULL
+            return 1
+        return 0  # Incompatible types treated as equal for ordering
+
+    if a.ftype == FIELD_NULL
+        return 0
+
+    if a.ftype == FIELD_INT or a.ftype == FIELD_BOOL or a.ftype == FIELD_FLOAT
+        if a.int_val < b.int_val
+            return -1
+        if a.int_val > b.int_val
+            return 1
+        return 0
+
+    if a.ftype == FIELD_STRING or a.ftype == FIELD_BYTES
+        var min_len: i64 = a.len_val
+        if b.len_val < min_len
+            min_len = b.len_val
+
+        var cmp: i32 = memcmp(a.ptr_val, b.ptr_val, min_len)
+        if cmp != 0
+            return cmp
+
+        if a.len_val < b.len_val
+            return -1
+        if a.len_val > b.len_val
+            return 1
+        return 0
+
+    if a.ftype == FIELD_DOCREF
+        if a.ref_val < b.ref_val
+            return -1
+        if a.ref_val > b.ref_val
+            return 1
+        return 0
+
+    return 0
+
+# Check if a string contains a substring
+fn string_contains(haystack: *u8, haystack_len: i64, needle: *u8, needle_len: i64) -> i32
+    if needle_len == 0
+        return 1
+    if haystack_len < needle_len
+        return 0
+
+    var i: i64 = 0
+    while i <= haystack_len - needle_len
+        if memcmp(haystack + i, needle, needle_len) == 0
+            return 1
+        i = i + 1
+    return 0
+
+# Check if a string starts with a prefix
+fn string_starts_with(str: *u8, str_len: i64, prefix: *u8, prefix_len: i64) -> i32
+    if prefix_len == 0
+        return 1
+    if str_len < prefix_len
+        return 0
+    return memcmp(str, prefix, prefix_len) == 0
+
+# Check if a document has a link with the given label
+fn doc_has_link_label(doc: *Document, label: *u8) -> i32
+    var i: i32 = 0
+    while i < doc.link_count
+        if strcmp(@doc.links[i].label[0], label) == 0
+            return 1
+        i = i + 1
+    return 0
+
+# Check if a single filter matches a document
+fn filter_matches(f: *Filter, doc: *Document) -> i32
+    # Special case: parent filter
+    if f.op == FILTER_HAS_PARENT
+        if doc.parent_id.value == f.value.int_val
+            return 1
+        return 0
+
+    # Special case: link filter
+    if f.op == FILTER_HAS_LINK
+        return doc_has_link_label(doc, @f.field_name[0])
+
+    # Get the field value from the document
+    var field_val: Field
+    var result: i32 = doc_get_field(doc, @f.field_name[0], @field_val)
+
+    # Handle is_null / not_null
+    if f.op == FILTER_IS_NULL
+        if result == ERR_NOT_FOUND
+            return 1
+        if field_val.ftype == FIELD_NULL
+            return 1
+        return 0
+
+    if f.op == FILTER_NOT_NULL
+        if result == ERR_NOT_FOUND
+            return 0
+        if field_val.ftype == FIELD_NULL
+            return 0
+        return 1
+
+    # Field not found - can't match value-based filters
+    if result != ERR_OK
+        return 0
+
+    # String operations
+    if f.op == FILTER_CONTAINS
+        if field_val.ftype != FIELD_STRING
+            return 0
+        return string_contains(field_val.ptr_val, field_val.len_val, f.str_value, f.str_len)
+
+    if f.op == FILTER_STARTS
+        if field_val.ftype != FIELD_STRING
+            return 0
+        return string_starts_with(field_val.ptr_val, field_val.len_val, f.str_value, f.str_len)
+
+    # Comparison operations
+    var cmp: i32 = field_compare(@field_val, @f.value)
+
+    if f.op == FILTER_EQ
+        return cmp == 0
+    if f.op == FILTER_NE
+        return cmp != 0
+    if f.op == FILTER_GT
+        return cmp > 0
+    if f.op == FILTER_LT
+        return cmp < 0
+    if f.op == FILTER_GTE
+        return cmp >= 0
+    if f.op == FILTER_LTE
+        return cmp <= 0
+
+    return 0
+
+# Check if all filters match a document (AND logic)
+fn query_matches(q: *Query, doc: *Document) -> i32
+    var i: i32 = 0
+    while i < q.filter_count
+        if filter_matches(@q.filters[i], doc) == 0
+            return 0
+        i = i + 1
+    return 1
+
+# ============================================================================
+# Query Result Management
+# ============================================================================
+
+pub fn query_result_new(capacity: i32) -> *QueryResult
+    var result: *QueryResult = malloc(24) as *QueryResult
+    if result == null
+        return null
+
+    result.doc_ids = malloc((capacity * 8) as i64) as *i64
+    if result.doc_ids == null
+        free(result as *u8)
+        return null
+
+    result.count = 0
+    result.capacity = capacity
+    return result
+
+pub fn query_result_destroy(result: *QueryResult)
+    if result == null
+        return
+    if result.doc_ids != null
+        free(result.doc_ids as *u8)
+    free(result as *u8)
+
+pub fn query_result_count(result: *QueryResult) -> i32
+    if result == null
+        return 0
+    return result.count
+
+pub fn query_result_get(result: *QueryResult, idx: i32) -> DocumentId
+    var id: DocumentId
+    if result == null or idx < 0 or idx >= result.count
+        id.value = INVALID_DOC_ID
+        return id
+    id.value = result.doc_ids[idx]
+    return id
+
+fn query_result_add(result: *QueryResult, id: *DocumentId) -> i32
+    if result.count >= result.capacity
+        return ERR_FULL
+    result.doc_ids[result.count] = id.value
+    result.count = result.count + 1
+    return ERR_OK
+
+# ============================================================================
+# Sorting
+# ============================================================================
+
+# Get a field value for sorting (handles missing fields)
+fn get_sort_field(doc: *Document, field: *u8, out: *Field) -> i32
+    var result: i32 = doc_get_field(doc, field, out)
+    if result != ERR_OK
+        # Missing field sorts as null
+        *out = field_null()
+    return ERR_OK
+
+# Compare two documents by the ordering clauses
+fn compare_docs_for_sort(q: *Query, a: *Document, b: *Document) -> i32
+    var i: i32 = 0
+    while i < q.order_count
+        var o: *OrderClause = @q.orders[i]
+
+        var a_field: Field
+        var b_field: Field
+        get_sort_field(a, @o.field_name[0], @a_field)
+        get_sort_field(b, @o.field_name[0], @b_field)
+
+        var cmp: i32 = field_compare(@a_field, @b_field)
+
+        if cmp != 0
+            if o.direction == ORDER_DESC
+                return 0 - cmp
+            return cmp
+
+        i = i + 1
+
+    # All equal, sort by ID for stability
+    if a.id.value < b.id.value
+        return -1
+    if a.id.value > b.id.value
+        return 1
+    return 0
+
+# Simple insertion sort for small result sets
+fn sort_results(q: *Query, col: *Collection, result: *QueryResult)
+    if q.order_count == 0 or result.count <= 1
+        return
+
+    var i: i32 = 1
+    while i < result.count
+        var key_id: i64 = result.doc_ids[i]
+        var key_doc: Document
+        var key_doc_id: DocumentId
+        key_doc_id.value = key_id
+        collection_get(col, @key_doc_id, @key_doc)
+
+        var j: i32 = i - 1
+        while j >= 0
+            var j_doc_id: DocumentId
+            j_doc_id.value = result.doc_ids[j]
+            var j_doc: Document
+            collection_get(col, @j_doc_id, @j_doc)
+
+            if compare_docs_for_sort(q, @j_doc, @key_doc) <= 0
+                break
+
+            result.doc_ids[j + 1] = result.doc_ids[j]
+            j = j - 1
+
+        result.doc_ids[j + 1] = key_id
+        i = i + 1
+
+# ============================================================================
+# Query Execution
+# ============================================================================
+
+# Execute query against a collection
+pub fn query_exec(q: *Query, col: *Collection) -> *QueryResult
+    if q == null or col == null
+        return null
+
+    # Allocate result buffer (we'll collect all matches first, then paginate)
+    var result: *QueryResult = query_result_new(MAX_RESULTS)
+    if result == null
+        return null
+
+    # Scan all documents in the collection using B-tree iterator
+    var iter: *BTreeIter = btree_scan(col.tree, null, 0, null, 0)
+    if iter == null
+        query_result_destroy(result)
+        return null
+
+    # Iterate through all documents
+    while btree_iter_valid(iter) != 0
+        # Get the document
+        var key: [8]u8
+        var key_len: i32 = 0
+        btree_iter_key(iter, @key[0], @key_len)
+
+        var val: [2048]u8
+        var val_len: i32 = 0
+        btree_iter_value(iter, @val[0], @val_len)
+
+        # Deserialize the document
+        var doc: Document
+        var err: i32 = doc_deserialize(@val[0], val_len as i64, @doc)
+        if err == ERR_OK
+            # Check if it matches all filters
+            if query_matches(q, @doc) != 0
+                # Add to results (before pagination)
+                if result.count < MAX_RESULTS
+                    query_result_add(result, @doc.id)
+
+        btree_iter_next(iter)
+
+    btree_iter_destroy(iter)
+
+    # Sort results if ordering is specified
+    sort_results(q, col, result)
+
+    # Apply pagination (offset and limit)
+    if q.offset_val > 0 or q.limit_val < result.count
+        var final_count: i32 = result.count - q.offset_val
+        if final_count < 0
+            final_count = 0
+        if final_count > q.limit_val
+            final_count = q.limit_val
+
+        # Shift results to remove offset
+        if q.offset_val > 0 and final_count > 0
+            var i: i32 = 0
+            while i < final_count
+                result.doc_ids[i] = result.doc_ids[i + q.offset_val]
+                i = i + 1
+
+        result.count = final_count
+
+    return result
+
+# ============================================================================
+# Convenience: Execute and get first result
+# ============================================================================
+
+pub fn query_first(q: *Query, col: *Collection, out: *Document) -> i32
+    # Temporarily set limit to 1
+    var saved_limit: i32 = q.limit_val
+    q.limit_val = 1
+
+    var result: *QueryResult = query_exec(q, col)
+    q.limit_val = saved_limit
+
+    if result == null
+        return ERR_NO_MEMORY
+
+    if result.count == 0
+        query_result_destroy(result)
+        return ERR_NOT_FOUND
+
+    var id: DocumentId = query_result_get(result, 0)
+    var err: i32 = collection_get(col, @id, out)
+
+    query_result_destroy(result)
+    return err
+
+# ============================================================================
+# Convenience: Count matching documents
+# ============================================================================
+
+pub fn query_count(q: *Query, col: *Collection) -> i64
+    # Temporarily remove pagination to get true count
+    var saved_limit: i32 = q.limit_val
+    var saved_offset: i32 = q.offset_val
+    q.limit_val = MAX_RESULTS
+    q.offset_val = 0
+
+    var result: *QueryResult = query_exec(q, col)
+
+    q.limit_val = saved_limit
+    q.offset_val = saved_offset
+
+    if result == null
+        return 0
+
+    var count: i64 = result.count as i64
+    query_result_destroy(result)
+    return count
+
+# ============================================================================
+# Index-Aware Query Execution
+# ============================================================================
+
+# Check if a filter can use an index for an equality lookup
+pub fn filter_can_use_index(f: *Filter) -> i32
+    # Only EQ, GT, GTE, LT, LTE can use indexes
+    if f.op == FILTER_EQ
+        return 1
+    if f.op == FILTER_GT or f.op == FILTER_GTE
+        return 1
+    if f.op == FILTER_LT or f.op == FILTER_LTE
+        return 1
+    return 0
+
+# Get the field name from a filter
+pub fn filter_field_name(f: *Filter) -> *u8
+    return @f.field_name[0]
+
+# Get the filter value
+pub fn filter_value(f: *Filter) -> *Field
+    return @f.value
+
+# Get the filter operator
+pub fn filter_op(f: *Filter) -> i32
+    return f.op
+
+# Get filter at index
+pub fn query_get_filter(q: *Query, idx: i32) -> *Filter
+    if q == null or idx < 0 or idx >= q.filter_count
+        return null
+    return @q.filters[idx]
+
+# Get filter count
+pub fn query_filter_count(q: *Query) -> i32
+    if q == null
+        return 0
+    return q.filter_count

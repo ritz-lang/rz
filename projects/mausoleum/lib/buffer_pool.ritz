@@ -1,0 +1,537 @@
+# lib/buffer_pool.ritz - Buffer Pool Manager
+#
+# The buffer pool is a fixed-size in-memory cache of disk pages.
+# It provides page-level access with the following features:
+# - LRU eviction policy
+# - Pin counting for concurrent access
+# - Dirty page tracking
+# - Background flushing support
+#
+# Design:
+# - Fixed number of frame slots (configurable at creation)
+# - Hash table for page_id -> frame lookup
+# - LRU list for eviction candidates (unpinned pages)
+# - Pages are read from disk on cache miss
+# - Dirty pages are written back on eviction or explicit flush
+
+import ritzlib.sys
+import ritzlib.str
+import ritzlib.memory
+
+import lib.m7m_types
+import lib.page
+
+# ============================================================================
+# Buffer Pool Constants
+# ============================================================================
+
+const DEFAULT_POOL_SIZE: i32 = 64      # Default number of frames
+const HASH_BUCKETS: i32 = 128          # Hash table bucket count
+
+# ============================================================================
+# Frame - A slot in the buffer pool holding one page
+# ============================================================================
+
+struct Frame
+    page: Page                  # The actual page data
+    page_id: i64                # Page ID (-1 if unused)
+    pin_count: i32              # Number of active references
+    dirty: i32                  # Has page been modified?
+    lru_prev: i32               # Previous frame in LRU list (-1 if none)
+    lru_next: i32               # Next frame in LRU list (-1 if none)
+    hash_next: i32              # Next frame in hash bucket chain (-1 if none)
+
+# ============================================================================
+# Buffer Pool Structure
+# ============================================================================
+
+struct BufferPool
+    frames: *Frame              # Array of frames
+    num_frames: i32             # Total number of frames
+    hash_table: *i32            # Hash table: bucket -> first frame index
+    lru_head: i32               # Most recently used unpinned frame
+    lru_tail: i32               # Least recently used unpinned frame
+    free_list: i32              # Head of free frame list
+    file_fd: i32                # File descriptor for I/O
+    next_page_id: i64           # Next page ID to allocate
+    stats_hits: i64             # Cache hit count
+    stats_misses: i64           # Cache miss count
+    stats_evictions: i64        # Eviction count
+
+# ============================================================================
+# Buffer Pool Creation/Destruction
+# ============================================================================
+
+# Create a new buffer pool with the given number of frames
+pub fn buffer_pool_new(num_frames: i32) -> *BufferPool
+    if num_frames <= 0
+        return null
+
+    # Allocate pool structure
+    let pool: *BufferPool = malloc(88) as *BufferPool  # sizeof(BufferPool) = 88
+    if pool == null
+        return null
+
+    # Allocate frames array
+    let frame_size: i64 = 4128  # sizeof(Frame) = 4096 (Page) + 32 (metadata)
+    let frames: *Frame = malloc(frame_size * num_frames as i64) as *Frame
+    if frames == null
+        free(pool as *u8)
+        return null
+
+    # Allocate hash table
+    let hash_table: *i32 = malloc(HASH_BUCKETS as i64 * 4) as *i32
+    if hash_table == null
+        free(frames as *u8)
+        free(pool as *u8)
+        return null
+
+    # Initialize hash table to -1 (empty)
+    for i in 0..HASH_BUCKETS
+        *(hash_table + i) = -1
+
+    # Initialize frames and build free list
+    for i in 0..num_frames
+        let frame: *Frame = (frames as i64 + (i as i64 * frame_size)) as *Frame
+        frame.page_id = INVALID_PAGE_ID
+        frame.pin_count = 0
+        frame.dirty = 0
+        frame.lru_prev = -1
+        frame.lru_next = -1
+        frame.hash_next = -1
+
+        # Link into free list (use lru_next for free list chain)
+        if i < num_frames - 1
+            frame.lru_next = i + 1
+        else
+            frame.lru_next = -1
+
+    # Initialize pool
+    pool.frames = frames
+    pool.num_frames = num_frames
+    pool.hash_table = hash_table
+    pool.lru_head = -1
+    pool.lru_tail = -1
+    pool.free_list = 0  # First frame is head of free list
+    pool.file_fd = -1
+    pool.next_page_id = 0
+    pool.stats_hits = 0
+    pool.stats_misses = 0
+    pool.stats_evictions = 0
+
+    return pool
+
+# Create a buffer pool with default size
+pub fn buffer_pool_default() -> *BufferPool
+    return buffer_pool_new(DEFAULT_POOL_SIZE)
+
+# Destroy a buffer pool
+pub fn buffer_pool_destroy(pool: *BufferPool)
+    if pool == null
+        return
+
+    # Flush all dirty pages first
+    buffer_pool_flush_all(pool)
+
+    # Close file if open
+    if pool.file_fd >= 0
+        sys_close(pool.file_fd)
+
+    # Free memory
+    if pool.hash_table != null
+        free(pool.hash_table as *u8)
+    if pool.frames != null
+        free(pool.frames as *u8)
+    free(pool as *u8)
+
+# ============================================================================
+# Internal Helpers
+# ============================================================================
+
+# Get frame by index
+fn get_frame(pool: *BufferPool, idx: i32) -> *Frame
+    if idx < 0 or idx >= pool.num_frames
+        return null
+    let frame_size: i64 = 4128
+    return (pool.frames as i64 + (idx as i64 * frame_size)) as *Frame
+
+# Hash function for page ID
+fn hash_page_id(page_id: i64) -> i32
+    var h: i64 = page_id
+    h = h ^ (h >> 33)
+    h = h * 0xff51afd7ed558ccd
+    h = h ^ (h >> 33)
+    h = h * 0xc4ceb9fe1a85ec53
+    h = h ^ (h >> 33)
+    return (h as i32 & 0x7FFFFFFF) % HASH_BUCKETS
+
+# Find frame index for a page ID (returns -1 if not found)
+fn find_frame(pool: *BufferPool, page_id: i64) -> i32
+    let bucket: i32 = hash_page_id(page_id)
+    var idx: i32 = *(pool.hash_table + bucket)
+
+    while idx >= 0
+        let frame: *Frame = get_frame(pool, idx)
+        if frame.page_id == page_id
+            return idx
+        idx = frame.hash_next
+
+    return -1
+
+# Add frame to hash table
+fn hash_insert(pool: *BufferPool, frame_idx: i32, page_id: i64)
+    let bucket: i32 = hash_page_id(page_id)
+    let frame: *Frame = get_frame(pool, frame_idx)
+
+    frame.hash_next = *(pool.hash_table + bucket)
+    *(pool.hash_table + bucket) = frame_idx
+
+# Remove frame from hash table
+fn hash_remove(pool: *BufferPool, frame_idx: i32, page_id: i64)
+    let bucket: i32 = hash_page_id(page_id)
+    var prev_idx: i32 = -1
+    var idx: i32 = *(pool.hash_table + bucket)
+
+    while idx >= 0
+        let frame: *Frame = get_frame(pool, idx)
+        if idx == frame_idx
+            if prev_idx < 0
+                # Head of chain
+                *(pool.hash_table + bucket) = frame.hash_next
+            else
+                let prev_frame: *Frame = get_frame(pool, prev_idx)
+                prev_frame.hash_next = frame.hash_next
+            frame.hash_next = -1
+            return
+        prev_idx = idx
+        idx = frame.hash_next
+
+# Add frame to LRU list (most recently used position)
+fn lru_add(pool: *BufferPool, frame_idx: i32)
+    let frame: *Frame = get_frame(pool, frame_idx)
+
+    frame.lru_prev = -1
+    frame.lru_next = pool.lru_head
+
+    if pool.lru_head >= 0
+        let head: *Frame = get_frame(pool, pool.lru_head)
+        head.lru_prev = frame_idx
+
+    pool.lru_head = frame_idx
+
+    if pool.lru_tail < 0
+        pool.lru_tail = frame_idx
+
+# Remove frame from LRU list
+fn lru_remove(pool: *BufferPool, frame_idx: i32)
+    let frame: *Frame = get_frame(pool, frame_idx)
+
+    if frame.lru_prev >= 0
+        let prev: *Frame = get_frame(pool, frame.lru_prev)
+        prev.lru_next = frame.lru_next
+    else
+        pool.lru_head = frame.lru_next
+
+    if frame.lru_next >= 0
+        let next: *Frame = get_frame(pool, frame.lru_next)
+        next.lru_prev = frame.lru_prev
+    else
+        pool.lru_tail = frame.lru_prev
+
+    frame.lru_prev = -1
+    frame.lru_next = -1
+
+# Get a free frame (from free list or by eviction)
+fn get_free_frame(pool: *BufferPool) -> i32
+    # Try free list first
+    if pool.free_list >= 0
+        let frame_idx: i32 = pool.free_list
+        let frame: *Frame = get_frame(pool, frame_idx)
+        pool.free_list = frame.lru_next  # Using lru_next for free list chain
+        frame.lru_next = -1
+        return frame_idx
+
+    # Evict from LRU tail (least recently used unpinned page)
+    var victim_idx: i32 = pool.lru_tail
+    while victim_idx >= 0
+        let victim: *Frame = get_frame(pool, victim_idx)
+        if victim.pin_count == 0
+            # Found eviction candidate
+            lru_remove(pool, victim_idx)
+            hash_remove(pool, victim_idx, victim.page_id)
+
+            # Flush if dirty
+            if victim.dirty != 0
+                buffer_pool_flush_frame(pool, victim_idx)
+
+            pool.stats_evictions += 1
+            return victim_idx
+
+        victim_idx = victim.lru_prev
+
+    # No evictable frames (all pinned)
+    return -1
+
+# ============================================================================
+# File I/O Operations
+# ============================================================================
+
+# Open database file
+pub fn buffer_pool_open(pool: *BufferPool, path: *u8) -> i32
+    if pool == null
+        return ERR_INVALID
+
+    # Open file (create if not exists)
+    let fd: i32 = sys_open3(path, O_RDWR | O_CREAT, 420)  # 0644
+    if fd < 0
+        return ERR_IO
+
+    pool.file_fd = fd
+
+    # Get file size to determine next_page_id
+    var stat_buf: Stat
+    if sys_fstat2(fd, @stat_buf) == 0
+        pool.next_page_id = stat_buf.st_size / PAGE_SIZE
+
+    return ERR_OK
+
+# Close database file
+pub fn buffer_pool_close(pool: *BufferPool) -> i32
+    if pool == null
+        return ERR_INVALID
+
+    # Flush all dirty pages
+    buffer_pool_flush_all(pool)
+
+    # Close file
+    if pool.file_fd >= 0
+        sys_close(pool.file_fd)
+        pool.file_fd = -1
+
+    return ERR_OK
+
+# Read a page from disk into a frame
+fn read_page(pool: *BufferPool, frame: *Frame, page_id: i64) -> i32
+    if pool.file_fd < 0
+        return ERR_IO
+
+    let offset: i64 = page_id * PAGE_SIZE
+    let result: i64 = sys_lseek(pool.file_fd, offset, 0)  # SEEK_SET = 0
+    if result < 0
+        return ERR_IO
+
+    let bytes_read: i64 = sys_read(pool.file_fd, @frame.page as *u8, PAGE_SIZE)
+    if bytes_read < PAGE_SIZE
+        # New page - initialize it
+        page_init(@frame.page, PAGE_MAGIC_FREE, page_id)
+        page_update_checksum(@frame.page)
+
+    return ERR_OK
+
+# Write a page from a frame to disk
+fn write_page(pool: *BufferPool, frame: *Frame) -> i32
+    if pool.file_fd < 0
+        return ERR_IO
+
+    let offset: i64 = frame.page_id * PAGE_SIZE
+    let result: i64 = sys_lseek(pool.file_fd, offset, 0)
+    if result < 0
+        return ERR_IO
+
+    let bytes_written: i64 = sys_write(pool.file_fd, @frame.page as *u8, PAGE_SIZE)
+    if bytes_written != PAGE_SIZE
+        return ERR_IO
+
+    return ERR_OK
+
+# ============================================================================
+# Public Page Access API
+# ============================================================================
+
+# Fetch a page (returns pinned page, NULL on error)
+pub fn buffer_pool_fetch(pool: *BufferPool, page_id: i64) -> *Page
+    if pool == null or page_id < 0
+        return null
+
+    # Check if page is already in cache
+    var frame_idx: i32 = find_frame(pool, page_id)
+    if frame_idx >= 0
+        let frame: *Frame = get_frame(pool, frame_idx)
+
+        # Remove from LRU if unpinned (it's being used now)
+        if frame.pin_count == 0
+            lru_remove(pool, frame_idx)
+
+        frame.pin_count += 1
+        pool.stats_hits += 1
+        return @frame.page
+
+    # Cache miss - need to load from disk
+    pool.stats_misses += 1
+
+    # Get a free frame
+    frame_idx = get_free_frame(pool)
+    if frame_idx < 0
+        return null  # Buffer pool full, all pages pinned
+
+    let frame: *Frame = get_frame(pool, frame_idx)
+
+    # Read page from disk
+    let err: i32 = read_page(pool, frame, page_id)
+    if err != ERR_OK
+        # Put frame back on free list
+        frame.lru_next = pool.free_list
+        pool.free_list = frame_idx
+        return null
+
+    # Set up frame
+    frame.page_id = page_id
+    frame.pin_count = 1
+    frame.dirty = 0
+
+    # Add to hash table
+    hash_insert(pool, frame_idx, page_id)
+
+    return @frame.page
+
+# Unpin a page (call when done with page)
+pub fn buffer_pool_unpin(pool: *BufferPool, page_id: i64, dirty: i32)
+    if pool == null
+        return
+
+    let frame_idx: i32 = find_frame(pool, page_id)
+    if frame_idx < 0
+        return
+
+    let frame: *Frame = get_frame(pool, frame_idx)
+
+    if dirty != 0
+        frame.dirty = 1
+
+    if frame.pin_count > 0
+        frame.pin_count -= 1
+
+        # Add to LRU list when fully unpinned
+        if frame.pin_count == 0
+            lru_add(pool, frame_idx)
+
+# Allocate a new page
+pub fn buffer_pool_alloc(pool: *BufferPool, page_type: i32) -> *Page
+    if pool == null
+        return null
+
+    let page_id: i64 = pool.next_page_id
+    pool.next_page_id += 1
+
+    # Get a free frame
+    let frame_idx: i32 = get_free_frame(pool)
+    if frame_idx < 0
+        return null
+
+    let frame: *Frame = get_frame(pool, frame_idx)
+
+    # Initialize the page
+    page_init(@frame.page, page_type, page_id)
+    frame.page_id = page_id
+    frame.pin_count = 1
+    frame.dirty = 1  # New page needs to be written
+
+    # Add to hash table
+    hash_insert(pool, frame_idx, page_id)
+
+    return @frame.page
+
+# Get page ID for a page pointer
+pub fn buffer_pool_page_id(pool: *BufferPool, page: *Page) -> i64
+    if pool == null or page == null
+        return INVALID_PAGE_ID
+
+    # Search all frames for this page
+    let frame_size: i64 = 4128
+    for i in 0..pool.num_frames
+        let frame: *Frame = (pool.frames as i64 + (i as i64 * frame_size)) as *Frame
+        if @frame.page == page
+            return frame.page_id
+
+    return INVALID_PAGE_ID
+
+# ============================================================================
+# Flushing Operations
+# ============================================================================
+
+# Flush a specific frame to disk
+pub fn buffer_pool_flush_frame(pool: *BufferPool, frame_idx: i32) -> i32
+    if pool == null or frame_idx < 0 or frame_idx >= pool.num_frames
+        return ERR_INVALID
+
+    let frame: *Frame = get_frame(pool, frame_idx)
+    if frame.page_id == INVALID_PAGE_ID
+        return ERR_OK  # Nothing to flush
+
+    if frame.dirty == 0
+        return ERR_OK  # Already clean
+
+    # Update checksum before writing
+    page_update_checksum(@frame.page)
+
+    let err: i32 = write_page(pool, frame)
+    if err == ERR_OK
+        frame.dirty = 0
+
+    return err
+
+# Flush a page by page ID
+pub fn buffer_pool_flush(pool: *BufferPool, page_id: i64) -> i32
+    if pool == null
+        return ERR_INVALID
+
+    let frame_idx: i32 = find_frame(pool, page_id)
+    if frame_idx < 0
+        return ERR_NOT_FOUND
+
+    return buffer_pool_flush_frame(pool, frame_idx)
+
+# Flush all dirty pages
+pub fn buffer_pool_flush_all(pool: *BufferPool) -> i32
+    if pool == null
+        return ERR_INVALID
+
+    var err: i32 = ERR_OK
+    let frame_size: i64 = 4128
+
+    for i in 0..pool.num_frames
+        let frame: *Frame = (pool.frames as i64 + (i as i64 * frame_size)) as *Frame
+        if frame.dirty != 0
+            let result: i32 = buffer_pool_flush_frame(pool, i)
+            if result != ERR_OK
+                err = result
+
+    return err
+
+# ============================================================================
+# Statistics
+# ============================================================================
+
+pub fn buffer_pool_hit_count(pool: *BufferPool) -> i64
+    if pool == null
+        return 0
+    return pool.stats_hits
+
+pub fn buffer_pool_miss_count(pool: *BufferPool) -> i64
+    if pool == null
+        return 0
+    return pool.stats_misses
+
+pub fn buffer_pool_eviction_count(pool: *BufferPool) -> i64
+    if pool == null
+        return 0
+    return pool.stats_evictions
+
+pub fn buffer_pool_hit_rate(pool: *BufferPool) -> i64
+    if pool == null
+        return 0
+    let total: i64 = pool.stats_hits + pool.stats_misses
+    if total == 0
+        return 0
+    # Return as percentage * 100 (e.g., 9500 = 95.00%)
+    return (pool.stats_hits * 10000) / total

@@ -1,0 +1,491 @@
+# ritz1/src/borrow.ritz - Borrow Checker
+#
+# Tracks ownership and borrows to enforce Rust-like memory safety:
+# - Each value has exactly one owner
+# - Values can be borrowed (shared &T or exclusive &mut T)
+# - Borrows must not outlive their referent
+# - No mutable borrow while shared borrows exist
+# - No aliasing of mutable borrows
+#
+# Design:
+# - "Place" represents a memory location (variable, field, deref)
+# - "Loan" represents an active borrow of a place
+# - "MoveState" tracks whether a place has been moved
+# - Analysis is scope-based (borrows end at scope exit)
+
+# =============================================================================
+# Constants
+# =============================================================================
+
+# Place kinds - what kind of memory location
+const PLACE_VAR: i32 = 1       # Local variable: x
+const PLACE_FIELD: i32 = 2     # Struct field: x.y
+const PLACE_DEREF: i32 = 3     # Pointer dereference: *x
+const PLACE_INDEX: i32 = 4     # Array/slice index: x[i]
+
+# Loan kinds - type of borrow
+const LOAN_SHARED: i32 = 1     # &T - shared/immutable borrow
+const LOAN_MUT: i32 = 2        # &mut T - exclusive/mutable borrow
+
+# Move state - ownership status
+const MOVE_OWNED: i32 = 0      # Value is owned, can be used
+const MOVE_MOVED: i32 = 1      # Value was moved, cannot be used
+const MOVE_PARTIAL: i32 = 2    # Partially moved (struct with some fields moved)
+
+# Error kinds
+const ERR_USE_AFTER_MOVE: i32 = 1
+const ERR_MOVE_WHILE_BORROWED: i32 = 2
+const ERR_MUT_WHILE_SHARED: i32 = 3
+const ERR_DOUBLE_MUT_BORROW: i32 = 4
+const ERR_ASSIGN_WHILE_BORROWED: i32 = 5
+const ERR_BORROW_MOVED: i32 = 6
+
+# =============================================================================
+# Place - Represents a memory location
+# =============================================================================
+#
+# A "place" is the left-hand side of an assignment or something that can be
+# borrowed. Examples:
+#   x          -> PLACE_VAR, var_id points to symbol
+#   x.y        -> PLACE_FIELD, base is place for x, field_idx is y's index
+#   *x         -> PLACE_DEREF, base is place for x
+#   x[i]       -> PLACE_INDEX, base is place for x
+#
+# Places form a tree rooted at variables.
+
+struct Place
+  kind: i32           # PLACE_VAR, PLACE_FIELD, etc.
+  base: *Place        # Parent place (null for variables)
+  var_name: *i8       # Variable name (for PLACE_VAR)
+  var_name_len: i32   # Length of variable name
+  field_idx: i32      # Field index (for PLACE_FIELD)
+  depth: i32          # Nesting depth (0 for vars, 1 for x.y, etc.)
+  next: *Place        # For linked lists
+
+# =============================================================================
+# Loan - An active borrow
+# =============================================================================
+#
+# When we see `&x` or `&mut x`, we create a Loan tracking:
+# - What place is borrowed
+# - What kind of borrow (shared vs mutable)
+# - What scope it's valid in (loans end when scope ends)
+
+struct Loan
+  place: *Place       # The borrowed place
+  kind: i32           # LOAN_SHARED or LOAN_MUT
+  scope_depth: i32    # Scope where loan was created (for lifetime)
+  expr_id: i32        # Expression ID that created this loan (for errors)
+  next: *Loan         # Next loan in list
+
+# =============================================================================
+# MoveInfo - Tracks move state of a place
+# =============================================================================
+
+struct MoveInfo
+  place: *Place       # The place being tracked
+  state: i32          # MOVE_OWNED, MOVE_MOVED, MOVE_PARTIAL
+  move_expr_id: i32   # Where it was moved (for error messages)
+  next: *MoveInfo     # Next in list
+
+# =============================================================================
+# BorrowError - A borrow check error
+# =============================================================================
+
+struct BorrowError
+  kind: i32           # ERR_USE_AFTER_MOVE, etc.
+  place: *Place       # The problematic place
+  expr_id: i32        # Expression where error occurred
+  loan: *Loan         # Related loan (if applicable)
+  next: *BorrowError  # Next error
+
+# =============================================================================
+# BorrowChecker - Main checker state
+# =============================================================================
+
+struct BorrowChecker
+  # Active loans (borrows that are still live)
+  loans: *Loan
+
+  # Move tracking
+  moves: *MoveInfo
+
+  # Accumulated errors
+  errors: *BorrowError
+  error_count: i32
+
+  # Current scope depth
+  scope_depth: i32
+
+  # Arena for allocations
+  arena: *Arena
+
+  # Source code (for error messages)
+  src: *i8
+
+# =============================================================================
+# Arena struct (from mem.ritz)
+# =============================================================================
+
+struct Arena
+  base: *i8
+  size: i64
+  used: i64
+
+# =============================================================================
+# Arena allocation helpers
+# =============================================================================
+
+fn arena_alloc(arena: *Arena, size: i64) -> *i8
+  let aligned: i64 = (size + 7) & -8
+  if arena.used + aligned > arena.size
+    return 0 as *i8
+  let ptr: *i8 = arena.base + arena.used
+  arena.used = arena.used + aligned
+  ptr
+
+# =============================================================================
+# BorrowChecker Initialization
+# =============================================================================
+
+fn borrow_checker_new(arena: *Arena, src: *i8) -> *BorrowChecker
+  let bc: *BorrowChecker = arena_alloc(arena, 64) as *BorrowChecker
+  bc.loans = 0 as *Loan
+  bc.moves = 0 as *MoveInfo
+  bc.errors = 0 as *BorrowError
+  bc.error_count = 0
+  bc.scope_depth = 0
+  bc.arena = arena
+  bc.src = src
+  bc
+
+# =============================================================================
+# Place Construction
+# =============================================================================
+
+fn place_var(bc: *BorrowChecker, name: *i8, name_len: i32) -> *Place
+  let p: *Place = arena_alloc(bc.arena, 48) as *Place
+  p.kind = PLACE_VAR
+  p.base = 0 as *Place
+  p.var_name = name
+  p.var_name_len = name_len
+  p.field_idx = 0
+  p.depth = 0
+  p.next = 0 as *Place
+  p
+
+fn place_field(bc: *BorrowChecker, base: *Place, field_idx: i32) -> *Place
+  let p: *Place = arena_alloc(bc.arena, 48) as *Place
+  p.kind = PLACE_FIELD
+  p.base = base
+  p.var_name = 0 as *i8
+  p.var_name_len = 0
+  p.field_idx = field_idx
+  p.depth = base.depth + 1
+  p.next = 0 as *Place
+  p
+
+fn place_deref(bc: *BorrowChecker, base: *Place) -> *Place
+  let p: *Place = arena_alloc(bc.arena, 48) as *Place
+  p.kind = PLACE_DEREF
+  p.base = base
+  p.var_name = 0 as *i8
+  p.var_name_len = 0
+  p.field_idx = 0
+  p.depth = base.depth + 1
+  p.next = 0 as *Place
+  p
+
+fn place_index(bc: *BorrowChecker, base: *Place) -> *Place
+  let p: *Place = arena_alloc(bc.arena, 48) as *Place
+  p.kind = PLACE_INDEX
+  p.base = base
+  p.var_name = 0 as *i8
+  p.var_name_len = 0
+  p.field_idx = 0
+  p.depth = base.depth + 1
+  p.next = 0 as *Place
+  p
+
+# =============================================================================
+# Place Comparison
+# =============================================================================
+
+fn names_equal(a: *i8, a_len: i32, b: *i8, b_len: i32) -> i32
+  if a_len != b_len
+    return 0
+  var i: i32 = 0
+  while i < a_len
+    if *(a + i) != *(b + i)
+      return 0
+    i = i + 1
+  1
+
+# Check if two places are the same
+fn place_eq(a: *Place, b: *Place) -> i32
+  if a == 0 as *Place
+    if b == 0 as *Place
+      return 1
+    return 0
+  if b == 0 as *Place
+    return 0
+
+  if a.kind != b.kind
+    return 0
+
+  if a.kind == PLACE_VAR
+    return names_equal(a.var_name, a.var_name_len, b.var_name, b.var_name_len)
+
+  if a.kind == PLACE_FIELD
+    if a.field_idx != b.field_idx
+      return 0
+    return place_eq(a.base, b.base)
+
+  if a.kind == PLACE_DEREF
+    return place_eq(a.base, b.base)
+
+  if a.kind == PLACE_INDEX
+    return place_eq(a.base, b.base)
+
+  0
+
+# Check if place `a` is a prefix of place `b` (or equal)
+# e.g., `x` is prefix of `x.y` and `x.y.z`
+fn place_is_prefix(a: *Place, b: *Place) -> i32
+  if place_eq(a, b) == 1
+    return 1
+
+  # Walk up b's base chain looking for a
+  var current: *Place = b.base
+  while current != 0 as *Place
+    if place_eq(a, current) == 1
+      return 1
+    current = current.base
+
+  0
+
+# Check if places conflict (one is prefix of the other)
+fn place_conflicts(a: *Place, b: *Place) -> i32
+  if place_is_prefix(a, b) == 1
+    return 1
+  if place_is_prefix(b, a) == 1
+    return 1
+  0
+
+# =============================================================================
+# Loan Management
+# =============================================================================
+
+fn add_loan(bc: *BorrowChecker, place: *Place, kind: i32, expr_id: i32) -> *Loan
+  let loan: *Loan = arena_alloc(bc.arena, 32) as *Loan
+  loan.place = place
+  loan.kind = kind
+  loan.scope_depth = bc.scope_depth
+  loan.expr_id = expr_id
+  loan.next = bc.loans
+  bc.loans = loan
+  loan
+
+# Remove all loans at or deeper than given scope depth
+fn expire_loans(bc: *BorrowChecker, min_depth: i32) -> i32
+  var prev: *Loan = 0 as *Loan
+  var current: *Loan = bc.loans
+
+  while current != 0 as *Loan
+    let next: *Loan = current.next
+    if current.scope_depth >= min_depth
+      # Remove this loan
+      if prev == 0 as *Loan
+        bc.loans = next
+      else
+        prev.next = next
+    else
+      prev = current
+    current = next
+  0
+
+# Check if place has any active shared loans
+fn has_shared_loan(bc: *BorrowChecker, place: *Place) -> *Loan
+  var loan: *Loan = bc.loans
+  while loan != 0 as *Loan
+    if loan.kind == LOAN_SHARED
+      if place_conflicts(loan.place, place) == 1
+        return loan
+    loan = loan.next
+  0 as *Loan
+
+# Check if place has any active mutable loans
+fn has_mut_loan(bc: *BorrowChecker, place: *Place) -> *Loan
+  var loan: *Loan = bc.loans
+  while loan != 0 as *Loan
+    if loan.kind == LOAN_MUT
+      if place_conflicts(loan.place, place) == 1
+        return loan
+    loan = loan.next
+  0 as *Loan
+
+# Check if place has any active loans (shared or mutable)
+fn has_any_loan(bc: *BorrowChecker, place: *Place) -> *Loan
+  var loan: *Loan = bc.loans
+  while loan != 0 as *Loan
+    if place_conflicts(loan.place, place) == 1
+      return loan
+    loan = loan.next
+  0 as *Loan
+
+# =============================================================================
+# Move Tracking
+# =============================================================================
+
+fn get_move_info(bc: *BorrowChecker, place: *Place) -> *MoveInfo
+  var info: *MoveInfo = bc.moves
+  while info != 0 as *MoveInfo
+    if place_eq(info.place, place) == 1
+      return info
+    info = info.next
+  0 as *MoveInfo
+
+fn set_move_state(bc: *BorrowChecker, place: *Place, state: i32, expr_id: i32) -> *MoveInfo
+  # Check if we already have info for this place
+  var info: *MoveInfo = get_move_info(bc, place)
+  if info != 0 as *MoveInfo
+    info.state = state
+    info.move_expr_id = expr_id
+    return info
+
+  # Create new move info
+  info = arena_alloc(bc.arena, 24) as *MoveInfo
+  info.place = place
+  info.state = state
+  info.move_expr_id = expr_id
+  info.next = bc.moves
+  bc.moves = info
+  info
+
+fn is_moved(bc: *BorrowChecker, place: *Place) -> i32
+  let info: *MoveInfo = get_move_info(bc, place)
+  if info == 0 as *MoveInfo
+    return 0
+  if info.state == MOVE_MOVED
+    return 1
+  0
+
+fn mark_moved(bc: *BorrowChecker, place: *Place, expr_id: i32) -> i32
+  set_move_state(bc, place, MOVE_MOVED, expr_id)
+  0
+
+fn mark_owned(bc: *BorrowChecker, place: *Place) -> i32
+  set_move_state(bc, place, MOVE_OWNED, 0)
+  0
+
+# =============================================================================
+# Error Reporting
+# =============================================================================
+
+fn add_error(bc: *BorrowChecker, kind: i32, place: *Place, expr_id: i32, loan: *Loan) -> *BorrowError
+  let err: *BorrowError = arena_alloc(bc.arena, 32) as *BorrowError
+  err.kind = kind
+  err.place = place
+  err.expr_id = expr_id
+  err.loan = loan
+  err.next = bc.errors
+  bc.errors = err
+  bc.error_count = bc.error_count + 1
+  err
+
+# =============================================================================
+# Scope Management
+# =============================================================================
+
+fn push_scope(bc: *BorrowChecker) -> i32
+  bc.scope_depth = bc.scope_depth + 1
+  0
+
+fn pop_scope(bc: *BorrowChecker) -> i32
+  # Expire all loans from this scope
+  expire_loans(bc, bc.scope_depth)
+  bc.scope_depth = bc.scope_depth - 1
+  0
+
+# =============================================================================
+# Core Borrow Checking Operations
+# =============================================================================
+
+# Called when a place is read (used)
+# Returns 1 if error, 0 if ok
+fn check_use(bc: *BorrowChecker, place: *Place, expr_id: i32) -> i32
+  # Check if place has been moved
+  if is_moved(bc, place) == 1
+    add_error(bc, ERR_USE_AFTER_MOVE, place, expr_id, 0 as *Loan)
+    return 1
+  0
+
+# Called when a place is moved (ownership transferred)
+# Returns 1 if error, 0 if ok
+fn check_move(bc: *BorrowChecker, place: *Place, expr_id: i32) -> i32
+  # First check if already moved
+  if is_moved(bc, place) == 1
+    add_error(bc, ERR_USE_AFTER_MOVE, place, expr_id, 0 as *Loan)
+    return 1
+
+  # Check if place is borrowed
+  let loan: *Loan = has_any_loan(bc, place)
+  if loan != 0 as *Loan
+    add_error(bc, ERR_MOVE_WHILE_BORROWED, place, expr_id, loan)
+    return 1
+
+  # Mark as moved
+  mark_moved(bc, place, expr_id)
+  0
+
+# Called when creating a shared borrow (&place)
+# Returns 1 if error, 0 if ok
+fn check_shared_borrow(bc: *BorrowChecker, place: *Place, expr_id: i32) -> i32
+  # Check if place has been moved
+  if is_moved(bc, place) == 1
+    add_error(bc, ERR_BORROW_MOVED, place, expr_id, 0 as *Loan)
+    return 1
+
+  # Check for conflicting mutable borrow
+  let mut_loan: *Loan = has_mut_loan(bc, place)
+  if mut_loan != 0 as *Loan
+    add_error(bc, ERR_MUT_WHILE_SHARED, place, expr_id, mut_loan)
+    return 1
+
+  # Add the shared loan
+  add_loan(bc, place, LOAN_SHARED, expr_id)
+  0
+
+# Called when creating a mutable borrow (&mut place)
+# Returns 1 if error, 0 if ok
+fn check_mut_borrow(bc: *BorrowChecker, place: *Place, expr_id: i32) -> i32
+  # Check if place has been moved
+  if is_moved(bc, place) == 1
+    add_error(bc, ERR_BORROW_MOVED, place, expr_id, 0 as *Loan)
+    return 1
+
+  # Check for any conflicting borrows (shared or mutable)
+  let any_loan: *Loan = has_any_loan(bc, place)
+  if any_loan != 0 as *Loan
+    if any_loan.kind == LOAN_MUT
+      add_error(bc, ERR_DOUBLE_MUT_BORROW, place, expr_id, any_loan)
+    else
+      add_error(bc, ERR_MUT_WHILE_SHARED, place, expr_id, any_loan)
+    return 1
+
+  # Add the mutable loan
+  add_loan(bc, place, LOAN_MUT, expr_id)
+  0
+
+# Called when assigning to a place
+# Returns 1 if error, 0 if ok
+fn check_assign(bc: *BorrowChecker, place: *Place, expr_id: i32) -> i32
+  # Check if place is borrowed
+  let loan: *Loan = has_any_loan(bc, place)
+  if loan != 0 as *Loan
+    add_error(bc, ERR_ASSIGN_WHILE_BORROWED, place, expr_id, loan)
+    return 1
+
+  # Assignment reinitializes - clear moved state
+  mark_owned(bc, place)
+  0

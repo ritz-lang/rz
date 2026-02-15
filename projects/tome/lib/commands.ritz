@@ -1,0 +1,1026 @@
+# lib/commands.ritz - Command dispatcher for Tome
+#
+# Maps RESP commands to Store operations. Each command handler
+# takes a parsed RespCommand and writes the response to a buffer.
+#
+# Supported commands:
+#   String: GET, SET, SETEX, DEL, EXISTS, TTL, EXPIRE, PERSIST
+#   List:   LPUSH, RPUSH, LPOP, RPOP, LLEN, LINDEX, LRANGE
+#   Set:    SADD, SREM, SISMEMBER, SCARD, SMEMBERS
+#   Hash:   HSET, HGET, HDEL, HEXISTS, HLEN, HKEYS, HVALS, HGETALL
+#   ZSet:   ZADD, ZREM, ZSCORE, ZRANK, ZREVRANK, ZCARD, ZRANGE, ZREVRANGE
+#   Server: PING, ECHO, COMMAND, INFO, DBSIZE, FLUSHDB
+
+import ritzlib.memory
+import ritzlib.str
+import ritzlib.string
+import ritzlib.strview
+import lib.tome
+import lib.resp
+
+
+# ============================================================================
+# Command result codes
+# ============================================================================
+
+const CMD_OK: i32 = 0           # Command executed successfully
+const CMD_ERR_ARGC: i32 = -1    # Wrong number of arguments
+const CMD_ERR_TYPE: i32 = -2    # Wrong type for operation
+const CMD_ERR_SYNTAX: i32 = -3  # Syntax error
+const CMD_ERR_UNKNOWN: i32 = -4 # Unknown command
+
+
+# ============================================================================
+# Command Context
+# ============================================================================
+# Holds the store and response buffer for command execution.
+
+struct CommandContext
+    store: *Store
+    resp_buf: *u8       # Response output buffer
+    resp_len: i32       # Length of response written
+    resp_cap: i32       # Capacity of buffer
+    password: *u8       # Required password (null = no auth required)
+    is_authenticated: i32   # 1 if client is authenticated, 0 otherwise
+
+
+# Initialize command context (no auth - backwards compatible)
+pub fn cmd_ctx_init(ctx: *CommandContext, store: *Store, buf: *u8, cap: i32)
+    ctx.store = store
+    ctx.resp_buf = buf
+    ctx.resp_len = 0
+    ctx.resp_cap = cap
+    ctx.password = null
+    ctx.is_authenticated = 1  # No auth required = already authenticated
+
+
+# Initialize command context with authentication
+pub fn cmd_ctx_init_auth(ctx: *CommandContext, store: *Store, buf: *u8, cap: i32, password: *u8, is_authenticated: i32)
+    ctx.store = store
+    ctx.resp_buf = buf
+    ctx.resp_len = 0
+    ctx.resp_cap = cap
+    ctx.password = password
+    ctx.is_authenticated = is_authenticated
+
+
+# Write response helpers (C-string versions - for FFI compatibility)
+fn ctx_write_simple(ctx: *CommandContext, s: *u8)
+    ctx.resp_len = resp_write_simple(ctx.resp_buf, s)
+
+fn ctx_write_error(ctx: *CommandContext, s: *u8)
+    ctx.resp_len = resp_write_error(ctx.resp_buf, s)
+
+# Write response helpers (StrView versions - preferred)
+fn ctx_write_simple_sv(ctx: *CommandContext, s: *StrView)
+    ctx.resp_len = resp_write_simple_sv(ctx.resp_buf, s)
+
+fn ctx_write_error_sv(ctx: *CommandContext, s: *StrView)
+    ctx.resp_len = resp_write_error_sv(ctx.resp_buf, s)
+
+fn ctx_write_int(ctx: *CommandContext, n: i64)
+    ctx.resp_len = resp_write_int(ctx.resp_buf, n)
+
+fn ctx_write_bulk(ctx: *CommandContext, data: *u8, len: i64)
+    ctx.resp_len = resp_write_bulk(ctx.resp_buf, data, len)
+
+fn ctx_write_null(ctx: *CommandContext)
+    ctx.resp_len = resp_write_null(ctx.resp_buf)
+
+
+# ============================================================================
+# Individual Command Handlers
+# ============================================================================
+
+# PING [message]
+fn cmd_ping(ctx: *CommandContext, cmd: *RespCommand) -> i32
+    if cmd.argc == 1
+        let pong: StrView = "PONG"
+        ctx_write_simple_sv(ctx, @pong)
+        return CMD_OK
+    if cmd.argc == 2
+        let arg: *RespArg = @cmd.args[1]
+        ctx_write_bulk(ctx, arg.data, arg.len)
+        return CMD_OK
+    let err: StrView = "ERR wrong number of arguments for 'ping' command"
+    ctx_write_error_sv(ctx, @err)
+    return CMD_ERR_ARGC
+
+
+# ECHO message
+fn cmd_echo(ctx: *CommandContext, cmd: *RespCommand) -> i32
+    if cmd.argc != 2
+        let err: StrView = "ERR wrong number of arguments for 'echo' command"
+        ctx_write_error_sv(ctx, @err)
+        return CMD_ERR_ARGC
+    let arg: *RespArg = @cmd.args[1]
+    ctx_write_bulk(ctx, arg.data, arg.len)
+    return CMD_OK
+
+
+# GET key
+fn cmd_get(ctx: *CommandContext, cmd: *RespCommand) -> i32
+    if cmd.argc != 2
+        let err: StrView = "ERR wrong number of arguments for 'get' command"
+        ctx_write_error_sv(ctx, @err)
+        return CMD_ERR_ARGC
+
+    var key: [256]u8
+    resp_arg_copy(@cmd.args[1], @key[0], 256)
+    var key_sv: StrView = strview_from_cstr(@key[0])
+
+    let val: *u8 = store_get(ctx.store, @key_sv)
+    if val == null
+        ctx_write_null(ctx)
+    else
+        let vlen: i64 = strlen(val)
+        ctx_write_bulk(ctx, val, vlen)
+    return CMD_OK
+
+
+# SET key value
+fn cmd_set(ctx: *CommandContext, cmd: *RespCommand) -> i32
+    if cmd.argc < 3
+        let err: StrView = "ERR wrong number of arguments for 'set' command"
+        ctx_write_error_sv(ctx, @err)
+        return CMD_ERR_ARGC
+
+    var key: [256]u8
+    var val: [8192]u8
+    resp_arg_copy(@cmd.args[1], @key[0], 256)
+    resp_arg_copy(@cmd.args[2], @val[0], 8192)
+    var key_sv: StrView = strview_from_cstr(@key[0])
+    var val_sv: StrView = strview_from_cstr(@val[0])
+
+    store_set(ctx.store, @key_sv, @val_sv)
+    let ok: StrView = "OK"
+    ctx_write_simple_sv(ctx, @ok)
+    return CMD_OK
+
+
+# SETEX key seconds value
+fn cmd_setex(ctx: *CommandContext, cmd: *RespCommand) -> i32
+    if cmd.argc != 4
+        let err: StrView = "ERR wrong number of arguments for 'setex' command"
+        ctx_write_error_sv(ctx, @err)
+        return CMD_ERR_ARGC
+
+    var key: [256]u8
+    var val: [8192]u8
+    resp_arg_copy(@cmd.args[1], @key[0], 256)
+    resp_arg_copy(@cmd.args[3], @val[0], 8192)
+    var key_sv: StrView = strview_from_cstr(@key[0])
+    var val_sv: StrView = strview_from_cstr(@val[0])
+
+    var ok: i32 = 0
+    let ttl: i64 = resp_arg_to_int(@cmd.args[2], @ok)
+    if ok == 0 || ttl <= 0
+        let err: StrView = "ERR invalid expire time in 'setex' command"
+        ctx_write_error_sv(ctx, @err)
+        return CMD_ERR_SYNTAX
+
+    store_setex(ctx.store, @key_sv, @val_sv, ttl)
+    let ok: StrView = "OK"
+    ctx_write_simple_sv(ctx, @ok)
+    return CMD_OK
+
+
+# DEL key [key ...]
+fn cmd_del(ctx: *CommandContext, cmd: *RespCommand) -> i32
+    if cmd.argc < 2
+        let err: StrView = "ERR wrong number of arguments for 'del' command"
+        ctx_write_error_sv(ctx, @err)
+        return CMD_ERR_ARGC
+
+    var count: i64 = 0
+    for i in 1..cmd.argc
+        var key: [256]u8
+        resp_arg_copy(@cmd.args[i], @key[0], 256)
+        var key_sv: StrView = strview_from_cstr(@key[0])
+        let deleted: i32 = store_del(ctx.store, @key_sv)
+        if deleted == 1
+            count += 1
+
+    ctx_write_int(ctx, count)
+    return CMD_OK
+
+
+# EXISTS key [key ...]
+fn cmd_exists(ctx: *CommandContext, cmd: *RespCommand) -> i32
+    if cmd.argc < 2
+        let err: StrView = "ERR wrong number of arguments for 'exists' command"
+        ctx_write_error_sv(ctx, @err)
+        return CMD_ERR_ARGC
+
+    var count: i64 = 0
+    for i in 1..cmd.argc
+        var key: [256]u8
+        resp_arg_copy(@cmd.args[i], @key[0], 256)
+        var key_sv: StrView = strview_from_cstr(@key[0])
+        if store_exists(ctx.store, @key_sv) == 1
+            count += 1
+
+    ctx_write_int(ctx, count)
+    return CMD_OK
+
+
+# TTL key
+fn cmd_ttl(ctx: *CommandContext, cmd: *RespCommand) -> i32
+    if cmd.argc != 2
+        let err: StrView = "ERR wrong number of arguments for 'ttl' command"
+        ctx_write_error_sv(ctx, @err)
+        return CMD_ERR_ARGC
+
+    var key: [256]u8
+    resp_arg_copy(@cmd.args[1], @key[0], 256)
+    var key_sv: StrView = strview_from_cstr(@key[0])
+
+    let ttl: i64 = store_ttl(ctx.store, @key_sv)
+    ctx_write_int(ctx, ttl)
+    return CMD_OK
+
+
+# EXPIRE key seconds
+fn cmd_expire(ctx: *CommandContext, cmd: *RespCommand) -> i32
+    if cmd.argc != 3
+        let err: StrView = "ERR wrong number of arguments for 'expire' command"
+        ctx_write_error_sv(ctx, @err)
+        return CMD_ERR_ARGC
+
+    var key: [256]u8
+    resp_arg_copy(@cmd.args[1], @key[0], 256)
+    var key_sv: StrView = strview_from_cstr(@key[0])
+
+    var ok: i32 = 0
+    let ttl: i64 = resp_arg_to_int(@cmd.args[2], @ok)
+    if ok == 0 || ttl <= 0
+        let err: StrView = "ERR invalid expire time in 'expire' command"
+        ctx_write_error_sv(ctx, @err)
+        return CMD_ERR_SYNTAX
+
+    let result: i32 = store_expire(ctx.store, @key_sv, ttl)
+    ctx_write_int(ctx, result as i64)
+    return CMD_OK
+
+
+# PERSIST key
+fn cmd_persist(ctx: *CommandContext, cmd: *RespCommand) -> i32
+    if cmd.argc != 2
+        let err: StrView = "ERR wrong number of arguments for 'persist' command"
+        ctx_write_error_sv(ctx, @err)
+        return CMD_ERR_ARGC
+
+    var key: [256]u8
+    resp_arg_copy(@cmd.args[1], @key[0], 256)
+    var key_sv: StrView = strview_from_cstr(@key[0])
+
+    let result: i32 = store_persist(ctx.store, @key_sv)
+    ctx_write_int(ctx, result as i64)
+    return CMD_OK
+
+
+# ============================================================================
+# List Commands
+# ============================================================================
+
+# LPUSH key value [value ...]
+fn cmd_lpush(ctx: *CommandContext, cmd: *RespCommand) -> i32
+    if cmd.argc < 3
+        let err: StrView = "ERR wrong number of arguments for 'lpush' command"
+        ctx_write_error_sv(ctx, @err)
+        return CMD_ERR_ARGC
+
+    var key: [256]u8
+    resp_arg_copy(@cmd.args[1], @key[0], 256)
+    var key_sv: StrView = strview_from_cstr(@key[0])
+
+    var len: i64 = -1
+    for i in 2..cmd.argc
+        var val: [8192]u8
+        resp_arg_copy(@cmd.args[i], @val[0], 8192)
+        var val_sv: StrView = strview_from_cstr(@val[0])
+        len = store_lpush(ctx.store, @key_sv, @val_sv)
+        if len < 0
+            let wrongtype: StrView = "WRONGTYPE Operation against a key holding the wrong kind of value"
+            ctx_write_error_sv(ctx, @wrongtype)
+            return CMD_ERR_TYPE
+
+    ctx_write_int(ctx, len)
+    return CMD_OK
+
+
+# RPUSH key value [value ...]
+fn cmd_rpush(ctx: *CommandContext, cmd: *RespCommand) -> i32
+    if cmd.argc < 3
+        let err: StrView = "ERR wrong number of arguments for 'rpush' command"
+        ctx_write_error_sv(ctx, @err)
+        return CMD_ERR_ARGC
+
+    var key: [256]u8
+    resp_arg_copy(@cmd.args[1], @key[0], 256)
+    var key_sv: StrView = strview_from_cstr(@key[0])
+
+    var len: i64 = -1
+    for i in 2..cmd.argc
+        var val: [8192]u8
+        resp_arg_copy(@cmd.args[i], @val[0], 8192)
+        var val_sv: StrView = strview_from_cstr(@val[0])
+        len = store_rpush(ctx.store, @key_sv, @val_sv)
+        if len < 0
+            let wrongtype: StrView = "WRONGTYPE Operation against a key holding the wrong kind of value"
+            ctx_write_error_sv(ctx, @wrongtype)
+            return CMD_ERR_TYPE
+
+    ctx_write_int(ctx, len)
+    return CMD_OK
+
+
+# LPOP key
+fn cmd_lpop(ctx: *CommandContext, cmd: *RespCommand) -> i32
+    if cmd.argc != 2
+        let err: StrView = "ERR wrong number of arguments for 'lpop' command"
+        ctx_write_error_sv(ctx, @err)
+        return CMD_ERR_ARGC
+
+    var key: [256]u8
+    resp_arg_copy(@cmd.args[1], @key[0], 256)
+    var key_sv: StrView = strview_from_cstr(@key[0])
+
+    var result: String = store_lpop(ctx.store, @key_sv)
+    if string_len(@result) == 0
+        ctx_write_null(ctx)
+    else
+        let vlen: i64 = string_len(@result)
+        ctx_write_bulk(ctx, string_as_ptr(@result), vlen)
+    string_drop(@result)
+    return CMD_OK
+
+
+# RPOP key
+fn cmd_rpop(ctx: *CommandContext, cmd: *RespCommand) -> i32
+    if cmd.argc != 2
+        let err: StrView = "ERR wrong number of arguments for 'rpop' command"
+        ctx_write_error_sv(ctx, @err)
+        return CMD_ERR_ARGC
+
+    var key: [256]u8
+    resp_arg_copy(@cmd.args[1], @key[0], 256)
+    var key_sv: StrView = strview_from_cstr(@key[0])
+
+    var result: String = store_rpop(ctx.store, @key_sv)
+    if string_len(@result) == 0
+        ctx_write_null(ctx)
+    else
+        let vlen: i64 = string_len(@result)
+        ctx_write_bulk(ctx, string_as_ptr(@result), vlen)
+    string_drop(@result)
+    return CMD_OK
+
+
+# LLEN key
+fn cmd_llen(ctx: *CommandContext, cmd: *RespCommand) -> i32
+    if cmd.argc != 2
+        let err: StrView = "ERR wrong number of arguments for 'llen' command"
+        ctx_write_error_sv(ctx, @err)
+        return CMD_ERR_ARGC
+
+    var key: [256]u8
+    resp_arg_copy(@cmd.args[1], @key[0], 256)
+    var key_sv: StrView = strview_from_cstr(@key[0])
+
+    let len: i64 = store_llen(ctx.store, @key_sv)
+    if len < 0
+        let wrongtype: StrView = "WRONGTYPE Operation against a key holding the wrong kind of value"
+        ctx_write_error_sv(ctx, @wrongtype)
+        return CMD_ERR_TYPE
+
+    ctx_write_int(ctx, len)
+    return CMD_OK
+
+
+# LINDEX key index
+fn cmd_lindex(ctx: *CommandContext, cmd: *RespCommand) -> i32
+    if cmd.argc != 3
+        let err: StrView = "ERR wrong number of arguments for 'lindex' command"
+        ctx_write_error_sv(ctx, @err)
+        return CMD_ERR_ARGC
+
+    var key: [256]u8
+    resp_arg_copy(@cmd.args[1], @key[0], 256)
+    var key_sv: StrView = strview_from_cstr(@key[0])
+
+    var ok: i32 = 0
+    let idx: i64 = resp_arg_to_int(@cmd.args[2], @ok)
+    if ok == 0
+        let notint: StrView = "ERR value is not an integer or out of range"
+        ctx_write_error_sv(ctx, @notint)
+        return CMD_ERR_SYNTAX
+
+    let val: *u8 = store_lindex(ctx.store, @key_sv, idx)
+    if val == null
+        ctx_write_null(ctx)
+    else
+        let vlen: i64 = strlen(val)
+        ctx_write_bulk(ctx, val, vlen)
+    return CMD_OK
+
+
+# LRANGE key start stop
+fn cmd_lrange(ctx: *CommandContext, cmd: *RespCommand) -> i32
+    if cmd.argc != 4
+        let err: StrView = "ERR wrong number of arguments for 'lrange' command"
+        ctx_write_error_sv(ctx, @err)
+        return CMD_ERR_ARGC
+
+    var key: [256]u8
+    resp_arg_copy(@cmd.args[1], @key[0], 256)
+    var key_sv: StrView = strview_from_cstr(@key[0])
+
+    var ok: i32 = 0
+    let start: i64 = resp_arg_to_int(@cmd.args[2], @ok)
+    if ok == 0
+        let notint: StrView = "ERR value is not an integer or out of range"
+        ctx_write_error_sv(ctx, @notint)
+        return CMD_ERR_SYNTAX
+
+    let stop: i64 = resp_arg_to_int(@cmd.args[3], @ok)
+    if ok == 0
+        let notint2: StrView = "ERR value is not an integer or out of range"
+        ctx_write_error_sv(ctx, @notint2)
+        return CMD_ERR_SYNTAX
+
+    var count: i64 = 0
+    let results: **u8 = store_lrange(ctx.store, @key_sv, start, stop, @count)
+
+    # Write array response
+    var pos: i32 = resp_write_array(ctx.resp_buf, count)
+    for i in 0..count
+        let v: *u8 = *(results + i)
+        let vlen: i64 = strlen(v)
+        pos += resp_write_bulk(ctx.resp_buf + pos, v, vlen)
+    ctx.resp_len = pos
+
+    # Free the results array (strings are borrowed, not owned)
+    if results != null
+        free(results as *u8)
+    return CMD_OK
+
+
+# ============================================================================
+# Set Commands
+# ============================================================================
+
+# SADD key member [member ...]
+fn cmd_sadd(ctx: *CommandContext, cmd: *RespCommand) -> i32
+    if cmd.argc < 3
+        let err: StrView = "ERR wrong number of arguments for 'sadd' command"
+        ctx_write_error_sv(ctx, @err)
+        return CMD_ERR_ARGC
+
+    var key: [256]u8
+    resp_arg_copy(@cmd.args[1], @key[0], 256)
+    var key_sv: StrView = strview_from_cstr(@key[0])
+
+    var added: i64 = 0
+    for i in 2..cmd.argc
+        var member: [8192]u8
+        resp_arg_copy(@cmd.args[i], @member[0], 8192)
+        var member_sv: StrView = strview_from_cstr(@member[0])
+        let ret: i64 = store_sadd(ctx.store, @key_sv, @member_sv)
+        if ret < 0
+            let wrongtype: StrView = "WRONGTYPE Operation against a key holding the wrong kind of value"
+            ctx_write_error_sv(ctx, @wrongtype)
+            return CMD_ERR_TYPE
+        added += ret
+
+    ctx_write_int(ctx, added)
+    return CMD_OK
+
+
+# SREM key member [member ...]
+fn cmd_srem(ctx: *CommandContext, cmd: *RespCommand) -> i32
+    if cmd.argc < 3
+        let err: StrView = "ERR wrong number of arguments for 'srem' command"
+        ctx_write_error_sv(ctx, @err)
+        return CMD_ERR_ARGC
+
+    var key: [256]u8
+    resp_arg_copy(@cmd.args[1], @key[0], 256)
+    var key_sv: StrView = strview_from_cstr(@key[0])
+
+    var removed: i64 = 0
+    for i in 2..cmd.argc
+        var member: [8192]u8
+        resp_arg_copy(@cmd.args[i], @member[0], 8192)
+        var member_sv: StrView = strview_from_cstr(@member[0])
+        let ret: i64 = store_srem(ctx.store, @key_sv, @member_sv)
+        if ret < 0
+            let wrongtype: StrView = "WRONGTYPE Operation against a key holding the wrong kind of value"
+            ctx_write_error_sv(ctx, @wrongtype)
+            return CMD_ERR_TYPE
+        removed += ret
+
+    ctx_write_int(ctx, removed)
+    return CMD_OK
+
+
+# SISMEMBER key member
+fn cmd_sismember(ctx: *CommandContext, cmd: *RespCommand) -> i32
+    if cmd.argc != 3
+        let err: StrView = "ERR wrong number of arguments for 'sismember' command"
+        ctx_write_error_sv(ctx, @err)
+        return CMD_ERR_ARGC
+
+    var key: [256]u8
+    var member: [8192]u8
+    resp_arg_copy(@cmd.args[1], @key[0], 256)
+    resp_arg_copy(@cmd.args[2], @member[0], 8192)
+    var key_sv: StrView = strview_from_cstr(@key[0])
+    var member_sv: StrView = strview_from_cstr(@member[0])
+
+    let result: i32 = store_sismember(ctx.store, @key_sv, @member_sv)
+    if result < 0
+        let wrongtype: StrView = "WRONGTYPE Operation against a key holding the wrong kind of value"
+        ctx_write_error_sv(ctx, @wrongtype)
+        return CMD_ERR_TYPE
+
+    ctx_write_int(ctx, result as i64)
+    return CMD_OK
+
+
+# SCARD key
+fn cmd_scard(ctx: *CommandContext, cmd: *RespCommand) -> i32
+    if cmd.argc != 2
+        let err: StrView = "ERR wrong number of arguments for 'scard' command"
+        ctx_write_error_sv(ctx, @err)
+        return CMD_ERR_ARGC
+
+    var key: [256]u8
+    resp_arg_copy(@cmd.args[1], @key[0], 256)
+    var key_sv: StrView = strview_from_cstr(@key[0])
+
+    let count: i64 = store_scard(ctx.store, @key_sv)
+    if count < 0
+        let wrongtype: StrView = "WRONGTYPE Operation against a key holding the wrong kind of value"
+        ctx_write_error_sv(ctx, @wrongtype)
+        return CMD_ERR_TYPE
+
+    ctx_write_int(ctx, count)
+    return CMD_OK
+
+
+# SMEMBERS key
+fn cmd_smembers(ctx: *CommandContext, cmd: *RespCommand) -> i32
+    if cmd.argc != 2
+        let err: StrView = "ERR wrong number of arguments for 'smembers' command"
+        ctx_write_error_sv(ctx, @err)
+        return CMD_ERR_ARGC
+
+    var key: [256]u8
+    resp_arg_copy(@cmd.args[1], @key[0], 256)
+    var key_sv: StrView = strview_from_cstr(@key[0])
+
+    var count: i64 = 0
+    let results: **u8 = store_smembers(ctx.store, @key_sv, @count)
+
+    # Write array response
+    var pos: i32 = resp_write_array(ctx.resp_buf, count)
+    for i in 0..count
+        let v: *u8 = *(results + i)
+        let vlen: i64 = strlen(v)
+        pos += resp_write_bulk(ctx.resp_buf + pos, v, vlen)
+    ctx.resp_len = pos
+
+    if results != null
+        free(results as *u8)
+    return CMD_OK
+
+
+# ============================================================================
+# Hash Commands
+# ============================================================================
+
+# HSET key field value [field value ...]
+fn cmd_hset(ctx: *CommandContext, cmd: *RespCommand) -> i32
+    if cmd.argc < 4 || (cmd.argc - 2) % 2 != 0
+        let err: StrView = "ERR wrong number of arguments for 'hset' command"
+        ctx_write_error_sv(ctx, @err)
+        return CMD_ERR_ARGC
+
+    var key: [256]u8
+    resp_arg_copy(@cmd.args[1], @key[0], 256)
+    var key_sv: StrView = strview_from_cstr(@key[0])
+
+    var added: i64 = 0
+    var i: i32 = 2
+    while i < cmd.argc
+        var field: [256]u8
+        var val: [8192]u8
+        resp_arg_copy(@cmd.args[i], @field[0], 256)
+        resp_arg_copy(@cmd.args[i + 1], @val[0], 8192)
+        var field_sv: StrView = strview_from_cstr(@field[0])
+        var val_sv: StrView = strview_from_cstr(@val[0])
+
+        let ret: i32 = store_hset(ctx.store, @key_sv, @field_sv, @val_sv)
+        if ret < 0
+            let wrongtype: StrView = "WRONGTYPE Operation against a key holding the wrong kind of value"
+            ctx_write_error_sv(ctx, @wrongtype)
+            return CMD_ERR_TYPE
+        added += ret as i64
+        i += 2
+
+    ctx_write_int(ctx, added)
+    return CMD_OK
+
+
+# HGET key field
+fn cmd_hget(ctx: *CommandContext, cmd: *RespCommand) -> i32
+    if cmd.argc != 3
+        let err: StrView = "ERR wrong number of arguments for 'hget' command"
+        ctx_write_error_sv(ctx, @err)
+        return CMD_ERR_ARGC
+
+    var key: [256]u8
+    var field: [256]u8
+    resp_arg_copy(@cmd.args[1], @key[0], 256)
+    resp_arg_copy(@cmd.args[2], @field[0], 256)
+    var key_sv: StrView = strview_from_cstr(@key[0])
+    var field_sv: StrView = strview_from_cstr(@field[0])
+
+    let val: *u8 = store_hget(ctx.store, @key_sv, @field_sv)
+    if val == null
+        ctx_write_null(ctx)
+    else
+        let vlen: i64 = strlen(val)
+        ctx_write_bulk(ctx, val, vlen)
+    return CMD_OK
+
+
+# HDEL key field [field ...]
+fn cmd_hdel(ctx: *CommandContext, cmd: *RespCommand) -> i32
+    if cmd.argc < 3
+        let err: StrView = "ERR wrong number of arguments for 'hdel' command"
+        ctx_write_error_sv(ctx, @err)
+        return CMD_ERR_ARGC
+
+    var key: [256]u8
+    resp_arg_copy(@cmd.args[1], @key[0], 256)
+    var key_sv: StrView = strview_from_cstr(@key[0])
+
+    var deleted: i64 = 0
+    for i in 2..cmd.argc
+        var field: [256]u8
+        resp_arg_copy(@cmd.args[i], @field[0], 256)
+        var field_sv: StrView = strview_from_cstr(@field[0])
+        let ret: i32 = store_hdel(ctx.store, @key_sv, @field_sv)
+        if ret < 0
+            let wrongtype: StrView = "WRONGTYPE Operation against a key holding the wrong kind of value"
+            ctx_write_error_sv(ctx, @wrongtype)
+            return CMD_ERR_TYPE
+        deleted += ret as i64
+
+    ctx_write_int(ctx, deleted)
+    return CMD_OK
+
+
+# HEXISTS key field
+fn cmd_hexists(ctx: *CommandContext, cmd: *RespCommand) -> i32
+    if cmd.argc != 3
+        let err: StrView = "ERR wrong number of arguments for 'hexists' command"
+        ctx_write_error_sv(ctx, @err)
+        return CMD_ERR_ARGC
+
+    var key: [256]u8
+    var field: [256]u8
+    resp_arg_copy(@cmd.args[1], @key[0], 256)
+    resp_arg_copy(@cmd.args[2], @field[0], 256)
+    var key_sv: StrView = strview_from_cstr(@key[0])
+    var field_sv: StrView = strview_from_cstr(@field[0])
+
+    let result: i32 = store_hexists(ctx.store, @key_sv, @field_sv)
+    if result < 0
+        let wrongtype: StrView = "WRONGTYPE Operation against a key holding the wrong kind of value"
+        ctx_write_error_sv(ctx, @wrongtype)
+        return CMD_ERR_TYPE
+
+    ctx_write_int(ctx, result as i64)
+    return CMD_OK
+
+
+# HLEN key
+fn cmd_hlen(ctx: *CommandContext, cmd: *RespCommand) -> i32
+    if cmd.argc != 2
+        let err: StrView = "ERR wrong number of arguments for 'hlen' command"
+        ctx_write_error_sv(ctx, @err)
+        return CMD_ERR_ARGC
+
+    var key: [256]u8
+    resp_arg_copy(@cmd.args[1], @key[0], 256)
+    var key_sv: StrView = strview_from_cstr(@key[0])
+
+    let len: i64 = store_hlen(ctx.store, @key_sv)
+    if len < 0
+        let wrongtype: StrView = "WRONGTYPE Operation against a key holding the wrong kind of value"
+        ctx_write_error_sv(ctx, @wrongtype)
+        return CMD_ERR_TYPE
+
+    ctx_write_int(ctx, len)
+    return CMD_OK
+
+
+# HKEYS key
+fn cmd_hkeys(ctx: *CommandContext, cmd: *RespCommand) -> i32
+    if cmd.argc != 2
+        let err: StrView = "ERR wrong number of arguments for 'hkeys' command"
+        ctx_write_error_sv(ctx, @err)
+        return CMD_ERR_ARGC
+
+    var key: [256]u8
+    resp_arg_copy(@cmd.args[1], @key[0], 256)
+    var key_sv: StrView = strview_from_cstr(@key[0])
+
+    var count: i64 = 0
+    let results: **u8 = store_hkeys(ctx.store, @key_sv, @count)
+
+    var pos: i32 = resp_write_array(ctx.resp_buf, count)
+    for i in 0..count
+        let v: *u8 = *(results + i)
+        let vlen: i64 = strlen(v)
+        pos += resp_write_bulk(ctx.resp_buf + pos, v, vlen)
+    ctx.resp_len = pos
+
+    if results != null
+        free(results as *u8)
+    return CMD_OK
+
+
+# HVALS key
+fn cmd_hvals(ctx: *CommandContext, cmd: *RespCommand) -> i32
+    if cmd.argc != 2
+        let err: StrView = "ERR wrong number of arguments for 'hvals' command"
+        ctx_write_error_sv(ctx, @err)
+        return CMD_ERR_ARGC
+
+    var key: [256]u8
+    resp_arg_copy(@cmd.args[1], @key[0], 256)
+    var key_sv: StrView = strview_from_cstr(@key[0])
+
+    var count: i64 = 0
+    let results: **u8 = store_hvals(ctx.store, @key_sv, @count)
+
+    var pos: i32 = resp_write_array(ctx.resp_buf, count)
+    for i in 0..count
+        let v: *u8 = *(results + i)
+        let vlen: i64 = strlen(v)
+        pos += resp_write_bulk(ctx.resp_buf + pos, v, vlen)
+    ctx.resp_len = pos
+
+    if results != null
+        free(results as *u8)
+    return CMD_OK
+
+
+# HGETALL key
+fn cmd_hgetall(ctx: *CommandContext, cmd: *RespCommand) -> i32
+    if cmd.argc != 2
+        let err: StrView = "ERR wrong number of arguments for 'hgetall' command"
+        ctx_write_error_sv(ctx, @err)
+        return CMD_ERR_ARGC
+
+    var key: [256]u8
+    resp_arg_copy(@cmd.args[1], @key[0], 256)
+    var key_sv: StrView = strview_from_cstr(@key[0])
+
+    var count: i64 = 0
+    # store_hgetall returns interleaved key,val,key,val...
+    let results: **u8 = store_hgetall(ctx.store, @key_sv, @count)
+
+    # Response is array of count elements (already interleaved)
+    var pos: i32 = resp_write_array(ctx.resp_buf, count)
+    for i in 0..count
+        let v: *u8 = *(results + i)
+        let vlen: i64 = strlen(v)
+        pos += resp_write_bulk(ctx.resp_buf + pos, v, vlen)
+    ctx.resp_len = pos
+
+    if results != null
+        free(results as *u8)
+    return CMD_OK
+
+
+# ============================================================================
+# Server Commands
+# ============================================================================
+
+# COMMAND
+fn cmd_command(ctx: *CommandContext, cmd: *RespCommand) -> i32
+    # Return minimal info - list of supported commands
+    let ok: StrView = "OK"
+    ctx_write_simple_sv(ctx, @ok)
+    return CMD_OK
+
+
+# INFO [section]
+fn cmd_info(ctx: *CommandContext, cmd: *RespCommand) -> i32
+    # Return minimal server info
+    let info: StrView = "# Server\r\ntome_version:0.1.0\r\n"
+    ctx_write_bulk(ctx, info.ptr, info.len)
+    return CMD_OK
+
+
+# DBSIZE
+fn cmd_dbsize(ctx: *CommandContext, cmd: *RespCommand) -> i32
+    let size: i64 = store_len(ctx.store)
+    ctx_write_int(ctx, size)
+    return CMD_OK
+
+
+# FLUSHDB
+fn cmd_flushdb(ctx: *CommandContext, cmd: *RespCommand) -> i32
+    store_clear(ctx.store)
+    let ok: StrView = "OK"
+    ctx_write_simple_sv(ctx, @ok)
+    return CMD_OK
+
+
+# AUTH password
+# Authenticate client with password. Returns OK if successful.
+fn cmd_auth(ctx: *CommandContext, cmd: *RespCommand) -> i32
+    if cmd.argc != 2
+        let err: StrView = "ERR wrong number of arguments for 'auth' command"
+        ctx_write_error_sv(ctx, @err)
+        return CMD_ERR_ARGC
+
+    # Check if password is required
+    if ctx.password == null
+        let err: StrView = "ERR Client sent AUTH, but no password is set"
+        ctx_write_error_sv(ctx, @err)
+        return CMD_ERR_SYNTAX
+
+    # Get the provided password
+    var provided: [256]u8
+    resp_arg_copy(@cmd.args[1], @provided[0], 256)
+
+    # Compare with required password
+    if strcmp(@provided[0], ctx.password) == 0
+        ctx.is_authenticated = 1
+        let ok: StrView = "OK"
+        ctx_write_simple_sv(ctx, @ok)
+        return CMD_OK
+    else
+        let err: StrView = "ERR invalid password"
+        ctx_write_error_sv(ctx, @err)
+        return CMD_ERR_SYNTAX
+
+
+# Check if client is authenticated (for use in dispatcher)
+fn require_auth(ctx: *CommandContext) -> i32
+    # No password required = always authenticated
+    if ctx.password == null
+        return 1
+    # Check authentication state
+    return ctx.is_authenticated
+
+
+# ============================================================================
+# Command Dispatcher
+# ============================================================================
+
+# Dispatch a parsed command to the appropriate handler
+pub fn cmd_dispatch(ctx: *CommandContext, cmd: *RespCommand) -> i32
+    if cmd.argc == 0
+        let err: StrView = "ERR empty command"
+        ctx_write_error_sv(ctx, @err)
+        return CMD_ERR_SYNTAX
+
+    let c: *RespArg = @cmd.args[0]
+
+    # AUTH command - always allowed (needed to authenticate)
+    let cmd_auth_name: StrView = "AUTH"
+    if resp_arg_eq_ci_sv(c, @cmd_auth_name) == 1
+        return cmd_auth(ctx, cmd)
+
+    # PING command - always allowed (even before auth, like Redis)
+    let cmd_ping_name: StrView = "PING"
+    if resp_arg_eq_ci_sv(c, @cmd_ping_name) == 1
+        return cmd_ping(ctx, cmd)
+
+    # Check authentication for all other commands
+    if require_auth(ctx) == 0
+        let err: StrView = "NOAUTH Authentication required."
+        ctx_write_error_sv(ctx, @err)
+        return CMD_ERR_SYNTAX
+
+    # Server commands (require auth)
+    let cmd_echo_name: StrView = "ECHO"
+    if resp_arg_eq_ci_sv(c, @cmd_echo_name) == 1
+        return cmd_echo(ctx, cmd)
+    let cmd_command_name: StrView = "COMMAND"
+    if resp_arg_eq_ci_sv(c, @cmd_command_name) == 1
+        return cmd_command(ctx, cmd)
+    let cmd_info_name: StrView = "INFO"
+    if resp_arg_eq_ci_sv(c, @cmd_info_name) == 1
+        return cmd_info(ctx, cmd)
+    let cmd_dbsize_name: StrView = "DBSIZE"
+    if resp_arg_eq_ci_sv(c, @cmd_dbsize_name) == 1
+        return cmd_dbsize(ctx, cmd)
+    let cmd_flushdb_name: StrView = "FLUSHDB"
+    if resp_arg_eq_ci_sv(c, @cmd_flushdb_name) == 1
+        return cmd_flushdb(ctx, cmd)
+
+    # String commands
+    let cmd_get_name: StrView = "GET"
+    if resp_arg_eq_ci_sv(c, @cmd_get_name) == 1
+        return cmd_get(ctx, cmd)
+    let cmd_set_name: StrView = "SET"
+    if resp_arg_eq_ci_sv(c, @cmd_set_name) == 1
+        return cmd_set(ctx, cmd)
+    let cmd_setex_name: StrView = "SETEX"
+    if resp_arg_eq_ci_sv(c, @cmd_setex_name) == 1
+        return cmd_setex(ctx, cmd)
+    let cmd_del_name: StrView = "DEL"
+    if resp_arg_eq_ci_sv(c, @cmd_del_name) == 1
+        return cmd_del(ctx, cmd)
+    let cmd_exists_name: StrView = "EXISTS"
+    if resp_arg_eq_ci_sv(c, @cmd_exists_name) == 1
+        return cmd_exists(ctx, cmd)
+    let cmd_ttl_name: StrView = "TTL"
+    if resp_arg_eq_ci_sv(c, @cmd_ttl_name) == 1
+        return cmd_ttl(ctx, cmd)
+    let cmd_expire_name: StrView = "EXPIRE"
+    if resp_arg_eq_ci_sv(c, @cmd_expire_name) == 1
+        return cmd_expire(ctx, cmd)
+    let cmd_persist_name: StrView = "PERSIST"
+    if resp_arg_eq_ci_sv(c, @cmd_persist_name) == 1
+        return cmd_persist(ctx, cmd)
+
+    # List commands
+    let cmd_lpush_name: StrView = "LPUSH"
+    if resp_arg_eq_ci_sv(c, @cmd_lpush_name) == 1
+        return cmd_lpush(ctx, cmd)
+    let cmd_rpush_name: StrView = "RPUSH"
+    if resp_arg_eq_ci_sv(c, @cmd_rpush_name) == 1
+        return cmd_rpush(ctx, cmd)
+    let cmd_lpop_name: StrView = "LPOP"
+    if resp_arg_eq_ci_sv(c, @cmd_lpop_name) == 1
+        return cmd_lpop(ctx, cmd)
+    let cmd_rpop_name: StrView = "RPOP"
+    if resp_arg_eq_ci_sv(c, @cmd_rpop_name) == 1
+        return cmd_rpop(ctx, cmd)
+    let cmd_llen_name: StrView = "LLEN"
+    if resp_arg_eq_ci_sv(c, @cmd_llen_name) == 1
+        return cmd_llen(ctx, cmd)
+    let cmd_lindex_name: StrView = "LINDEX"
+    if resp_arg_eq_ci_sv(c, @cmd_lindex_name) == 1
+        return cmd_lindex(ctx, cmd)
+    let cmd_lrange_name: StrView = "LRANGE"
+    if resp_arg_eq_ci_sv(c, @cmd_lrange_name) == 1
+        return cmd_lrange(ctx, cmd)
+
+    # Set commands
+    let cmd_sadd_name: StrView = "SADD"
+    if resp_arg_eq_ci_sv(c, @cmd_sadd_name) == 1
+        return cmd_sadd(ctx, cmd)
+    let cmd_srem_name: StrView = "SREM"
+    if resp_arg_eq_ci_sv(c, @cmd_srem_name) == 1
+        return cmd_srem(ctx, cmd)
+    let cmd_sismember_name: StrView = "SISMEMBER"
+    if resp_arg_eq_ci_sv(c, @cmd_sismember_name) == 1
+        return cmd_sismember(ctx, cmd)
+    let cmd_scard_name: StrView = "SCARD"
+    if resp_arg_eq_ci_sv(c, @cmd_scard_name) == 1
+        return cmd_scard(ctx, cmd)
+    let cmd_smembers_name: StrView = "SMEMBERS"
+    if resp_arg_eq_ci_sv(c, @cmd_smembers_name) == 1
+        return cmd_smembers(ctx, cmd)
+
+    # Hash commands
+    let cmd_hset_name: StrView = "HSET"
+    if resp_arg_eq_ci_sv(c, @cmd_hset_name) == 1
+        return cmd_hset(ctx, cmd)
+    let cmd_hget_name: StrView = "HGET"
+    if resp_arg_eq_ci_sv(c, @cmd_hget_name) == 1
+        return cmd_hget(ctx, cmd)
+    let cmd_hdel_name: StrView = "HDEL"
+    if resp_arg_eq_ci_sv(c, @cmd_hdel_name) == 1
+        return cmd_hdel(ctx, cmd)
+    let cmd_hexists_name: StrView = "HEXISTS"
+    if resp_arg_eq_ci_sv(c, @cmd_hexists_name) == 1
+        return cmd_hexists(ctx, cmd)
+    let cmd_hlen_name: StrView = "HLEN"
+    if resp_arg_eq_ci_sv(c, @cmd_hlen_name) == 1
+        return cmd_hlen(ctx, cmd)
+    let cmd_hkeys_name: StrView = "HKEYS"
+    if resp_arg_eq_ci_sv(c, @cmd_hkeys_name) == 1
+        return cmd_hkeys(ctx, cmd)
+    let cmd_hvals_name: StrView = "HVALS"
+    if resp_arg_eq_ci_sv(c, @cmd_hvals_name) == 1
+        return cmd_hvals(ctx, cmd)
+    let cmd_hgetall_name: StrView = "HGETALL"
+    if resp_arg_eq_ci_sv(c, @cmd_hgetall_name) == 1
+        return cmd_hgetall(ctx, cmd)
+
+    # Unknown command
+    let err: StrView = "ERR unknown command"
+    ctx_write_error_sv(ctx, @err)
+    return CMD_ERR_UNKNOWN

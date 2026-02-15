@@ -1,0 +1,863 @@
+# Tests for ritz1 IR emitter
+#
+# Tests LLVM IR text generation
+
+# =============================================================================
+# Minimal Arena (for memory allocation)
+# =============================================================================
+
+const SYS_MMAP: i64 = 9
+const PROT_RW: i64 = 3
+const MAP_PRIVATE_ANON: i64 = 34
+
+fn mmap(addr: i64, length: i64, prot: i64, flags: i64, fd: i64, offset: i64) -> *i8
+  syscall6(SYS_MMAP, addr, length, prot, flags, fd, offset) as *i8
+
+struct Arena
+  base: *i8
+  size: i64
+  used: i64
+
+fn arena_new(capacity: i64) -> *Arena
+  let header_size: i64 = 24
+  let total: i64 = header_size + capacity
+  let mem: *i8 = mmap(0, total, PROT_RW, MAP_PRIVATE_ANON, -1, 0)
+  if mem as i64 < 0
+    return 0 as *Arena
+  let arena: *Arena = mem as *Arena
+  arena.base = mem + header_size
+  arena.size = capacity
+  arena.used = 0
+  arena
+
+fn arena_alloc(arena: *Arena, size: i64) -> *i8
+  # Align to 8 bytes: (size + 7) / 8 * 8
+  let aligned: i64 = ((size + 7) / 8) * 8
+  if arena.used + aligned > arena.size
+    return 0 as *i8
+  let ptr: *i8 = arena.base + arena.used
+  arena.used = arena.used + aligned
+  ptr
+
+# =============================================================================
+# IRBuilder (copied for testing)
+# =============================================================================
+
+struct IRBuilder
+  buf: *i8
+  len: i64
+  cap: i64
+  arena: *Arena
+  next_id: i32
+  indent: i32
+
+fn ir_builder_new(arena: *Arena, capacity: i64) -> *IRBuilder
+  let b: *IRBuilder = arena_alloc(arena, 48) as *IRBuilder
+  b.buf = arena_alloc(arena, capacity)
+  b.len = 0
+  b.cap = capacity
+  b.arena = arena
+  b.next_id = 1
+  b.indent = 0
+  b
+
+fn ir_fresh_id(b: *IRBuilder) -> i32
+  let id: i32 = b.next_id
+  b.next_id = b.next_id + 1
+  id
+
+fn ir_reset_ids(b: *IRBuilder) -> i32
+  b.next_id = 1
+  0
+
+fn ir_put_byte(b: *IRBuilder, ch: i32) -> i32
+  if b.len >= b.cap
+    return -1
+  *(b.buf + b.len) = ch as i8
+  b.len = b.len + 1
+  0
+
+fn ir_put_str(b: *IRBuilder, s: *i8) -> i32
+  var i: i32 = 0
+  while *(s + i) != 0
+    if ir_put_byte(b, *(s + i) as i32) < 0
+      return -1
+    i = i + 1
+  0
+
+fn ir_put_int(b: *IRBuilder, n: i64) -> i32
+  if n < 0
+    ir_put_byte(b, 45)
+    return ir_put_int(b, 0 - n)
+  if n == 0
+    return ir_put_byte(b, 48)
+  var digits: [20]i8 = [0; 20]
+  var count: i32 = 0
+  var val: i64 = n
+  while val > 0
+    let digit: i32 = (val - (val / 10) * 10) as i32
+    digits[count] = (48 + digit) as i8
+    count = count + 1
+    val = val / 10
+  var i: i32 = count - 1
+  while i >= 0
+    if ir_put_byte(b, digits[i] as i32) < 0
+      return -1
+    i = i - 1
+  0
+
+fn ir_newline(b: *IRBuilder) -> i32
+  ir_put_byte(b, 10)
+
+fn ir_put_indent(b: *IRBuilder) -> i32
+  var i: i32 = 0
+  while i < b.indent
+    ir_put_str(b, "  ")
+    i = i + 1
+  0
+
+fn ir_get_buffer(b: *IRBuilder) -> *i8
+  if b.len < b.cap
+    *(b.buf + b.len) = 0
+  b.buf
+
+fn ir_get_length(b: *IRBuilder) -> i64
+  b.len
+
+# Type constants
+const TY_VOID: i32 = 1
+const TY_BOOL: i32 = 2
+const TY_I8: i32 = 3
+const TY_I16: i32 = 4
+const TY_I32: i32 = 5
+const TY_I64: i32 = 6
+
+fn ir_emit_type(b: *IRBuilder, kind: i32) -> i32
+  if kind == TY_VOID
+    ir_put_str(b, "void")
+  else if kind == TY_BOOL
+    ir_put_str(b, "i1")
+  else if kind == TY_I8
+    ir_put_str(b, "i8")
+  else if kind == TY_I16
+    ir_put_str(b, "i16")
+  else if kind == TY_I32
+    ir_put_str(b, "i32")
+  else if kind == TY_I64
+    ir_put_str(b, "i64")
+  else
+    ir_put_str(b, "i64")
+
+fn ir_emit_binop(b: *IRBuilder, op: *i8, ty: i32, result: i32, lhs: i32, rhs: i32) -> i32
+  ir_put_indent(b)
+  ir_put_str(b, "%")
+  ir_put_int(b, result as i64)
+  ir_put_str(b, " = ")
+  ir_put_str(b, op)
+  ir_put_str(b, " ")
+  ir_emit_type(b, ty)
+  ir_put_str(b, " %")
+  ir_put_int(b, lhs as i64)
+  ir_put_str(b, ", %")
+  ir_put_int(b, rhs as i64)
+  ir_newline(b)
+
+fn ir_emit_icmp(b: *IRBuilder, cond: *i8, ty: i32, result: i32, lhs: i32, rhs: i32) -> i32
+  ir_put_indent(b)
+  ir_put_str(b, "%")
+  ir_put_int(b, result as i64)
+  ir_put_str(b, " = icmp ")
+  ir_put_str(b, cond)
+  ir_put_str(b, " ")
+  ir_emit_type(b, ty)
+  ir_put_str(b, " %")
+  ir_put_int(b, lhs as i64)
+  ir_put_str(b, ", %")
+  ir_put_int(b, rhs as i64)
+  ir_newline(b)
+
+fn ir_emit_alloca(b: *IRBuilder, result: i32, ty: i32) -> i32
+  ir_put_indent(b)
+  ir_put_str(b, "%")
+  ir_put_int(b, result as i64)
+  ir_put_str(b, " = alloca ")
+  ir_emit_type(b, ty)
+  ir_newline(b)
+
+fn ir_emit_store_imm(b: *IRBuilder, ty: i32, imm: i64, ptr: i32) -> i32
+  ir_put_indent(b)
+  ir_put_str(b, "store ")
+  ir_emit_type(b, ty)
+  ir_put_str(b, " ")
+  ir_put_int(b, imm)
+  ir_put_str(b, ", ")
+  ir_emit_type(b, ty)
+  ir_put_str(b, "* %")
+  ir_put_int(b, ptr as i64)
+  ir_newline(b)
+
+fn ir_emit_store(b: *IRBuilder, ty: i32, val: i32, ptr: i32) -> i32
+  ir_put_indent(b)
+  ir_put_str(b, "store ")
+  ir_emit_type(b, ty)
+  ir_put_str(b, " %")
+  ir_put_int(b, val as i64)
+  ir_put_str(b, ", ")
+  ir_emit_type(b, ty)
+  ir_put_str(b, "* %")
+  ir_put_int(b, ptr as i64)
+  ir_newline(b)
+
+fn ir_emit_load(b: *IRBuilder, result: i32, ty: i32, ptr: i32) -> i32
+  ir_put_indent(b)
+  ir_put_str(b, "%")
+  ir_put_int(b, result as i64)
+  ir_put_str(b, " = load ")
+  ir_emit_type(b, ty)
+  ir_put_str(b, ", ")
+  ir_emit_type(b, ty)
+  ir_put_str(b, "* %")
+  ir_put_int(b, ptr as i64)
+  ir_newline(b)
+
+fn ir_emit_ret_imm(b: *IRBuilder, ty: i32, imm: i64) -> i32
+  ir_put_indent(b)
+  ir_put_str(b, "ret ")
+  ir_emit_type(b, ty)
+  ir_put_str(b, " ")
+  ir_put_int(b, imm)
+  ir_newline(b)
+
+fn ir_emit_ret(b: *IRBuilder, ty: i32, val: i32) -> i32
+  ir_put_indent(b)
+  ir_put_str(b, "ret ")
+  ir_emit_type(b, ty)
+  ir_put_str(b, " %")
+  ir_put_int(b, val as i64)
+  ir_newline(b)
+
+fn ir_emit_ret_void(b: *IRBuilder) -> i32
+  ir_put_indent(b)
+  ir_put_str(b, "ret void")
+  ir_newline(b)
+
+fn ir_emit_fn_start(b: *IRBuilder, name: *i8, ret_ty: i32) -> i32
+  ir_put_str(b, "define ")
+  ir_emit_type(b, ret_ty)
+  ir_put_str(b, " @\"")
+  ir_put_str(b, name)
+  ir_put_str(b, "\"(")
+  0
+
+fn ir_emit_fn_header_end(b: *IRBuilder) -> i32
+  ir_put_str(b, ")")
+  ir_newline(b)
+  ir_put_str(b, "{")
+  ir_newline(b)
+  ir_put_str(b, "entry:")
+  ir_newline(b)
+  b.indent = 1
+  0
+
+fn ir_emit_fn_end(b: *IRBuilder) -> i32
+  b.indent = 0
+  ir_put_str(b, "}")
+  ir_newline(b)
+  ir_newline(b)
+
+fn ir_emit_module_header(b: *IRBuilder, name: *i8) -> i32
+  ir_put_str(b, "; Ritz compiled module")
+  ir_newline(b)
+  ir_put_str(b, "; ModuleID = \"")
+  ir_put_str(b, name)
+  ir_put_str(b, "\"")
+  ir_newline(b)
+  ir_put_str(b, "target triple = \"x86_64-unknown-linux-gnu\"")
+  ir_newline(b)
+  ir_put_str(b, "target datalayout = \"\"")
+  ir_newline(b)
+  ir_newline(b)
+
+# =============================================================================
+# String comparison helper
+# =============================================================================
+
+fn str_eq(a: *i8, b: *i8) -> i32
+  var i: i32 = 0
+  while *(a + i) != 0
+    if *(a + i) != *(b + i)
+      return 0
+    i = i + 1
+  if *(b + i) != 0
+    return 0
+  1
+
+fn str_starts_with(s: *i8, prefix: *i8) -> i32
+  var i: i32 = 0
+  while *(prefix + i) != 0
+    if *(s + i) != *(prefix + i)
+      return 0
+    i = i + 1
+  1
+
+fn str_contains(s: *i8, needle: *i8) -> i32
+  var i: i32 = 0
+  while *(s + i) != 0
+    if str_starts_with(s + i, needle) == 1
+      return 1
+    i = i + 1
+  0
+
+# =============================================================================
+# Tests
+# =============================================================================
+
+@test
+fn test_ir_builder_creation() -> i32
+  let arena: *Arena = arena_new(4096)
+  let b: *IRBuilder = ir_builder_new(arena, 1024)
+  assert b as i64 != 0, "builder should be created"
+  assert b.len == 0, "length should be 0"
+  assert b.next_id == 1, "next_id should be 1"
+  0
+
+@test
+fn test_ir_put_str() -> i32
+  let arena: *Arena = arena_new(4096)
+  let b: *IRBuilder = ir_builder_new(arena, 1024)
+  ir_put_str(b, "hello")
+  assert b.len == 5, "length should be 5"
+  let buf: *i8 = ir_get_buffer(b)
+  assert str_eq(buf, "hello") == 1, "buffer should be hello"
+  0
+
+@test
+fn test_ir_put_int_positive() -> i32
+  let arena: *Arena = arena_new(4096)
+  let b: *IRBuilder = ir_builder_new(arena, 1024)
+  ir_put_int(b, 42)
+  let buf: *i8 = ir_get_buffer(b)
+  assert str_eq(buf, "42") == 1, "should emit 42"
+  0
+
+@test
+fn test_ir_put_int_zero() -> i32
+  let arena: *Arena = arena_new(4096)
+  let b: *IRBuilder = ir_builder_new(arena, 1024)
+  ir_put_int(b, 0)
+  let buf: *i8 = ir_get_buffer(b)
+  assert str_eq(buf, "0") == 1, "should emit 0"
+  0
+
+@test
+fn test_ir_put_int_negative() -> i32
+  let arena: *Arena = arena_new(4096)
+  let b: *IRBuilder = ir_builder_new(arena, 1024)
+  ir_put_int(b, -123)
+  let buf: *i8 = ir_get_buffer(b)
+  assert str_eq(buf, "-123") == 1, "should emit -123"
+  0
+
+@test
+fn test_ir_fresh_id() -> i32
+  let arena: *Arena = arena_new(4096)
+  let b: *IRBuilder = ir_builder_new(arena, 1024)
+  let id1: i32 = ir_fresh_id(b)
+  let id2: i32 = ir_fresh_id(b)
+  let id3: i32 = ir_fresh_id(b)
+  assert id1 == 1, "first id should be 1"
+  assert id2 == 2, "second id should be 2"
+  assert id3 == 3, "third id should be 3"
+  0
+
+@test
+fn test_ir_emit_type_i32() -> i32
+  let arena: *Arena = arena_new(4096)
+  let b: *IRBuilder = ir_builder_new(arena, 1024)
+  ir_emit_type(b, TY_I32)
+  let buf: *i8 = ir_get_buffer(b)
+  assert str_eq(buf, "i32") == 1, "should emit i32"
+  0
+
+@test
+fn test_ir_emit_type_bool() -> i32
+  let arena: *Arena = arena_new(4096)
+  let b: *IRBuilder = ir_builder_new(arena, 1024)
+  ir_emit_type(b, TY_BOOL)
+  let buf: *i8 = ir_get_buffer(b)
+  assert str_eq(buf, "i1") == 1, "should emit i1 for bool"
+  0
+
+@test
+fn test_ir_emit_binop_add() -> i32
+  let arena: *Arena = arena_new(4096)
+  let b: *IRBuilder = ir_builder_new(arena, 1024)
+  b.indent = 1
+  ir_emit_binop(b, "add", TY_I32, 3, 1, 2)
+  let buf: *i8 = ir_get_buffer(b)
+  # Should produce: "  %3 = add i32 %1, %2\n"
+  assert str_contains(buf, "%3 = add i32 %1, %2") == 1, "should emit add"
+  0
+
+@test
+fn test_ir_emit_alloca() -> i32
+  let arena: *Arena = arena_new(4096)
+  let b: *IRBuilder = ir_builder_new(arena, 1024)
+  b.indent = 1
+  ir_emit_alloca(b, 1, TY_I32)
+  let buf: *i8 = ir_get_buffer(b)
+  assert str_contains(buf, "%1 = alloca i32") == 1, "should emit alloca"
+  0
+
+@test
+fn test_ir_emit_store_load() -> i32
+  let arena: *Arena = arena_new(4096)
+  let b: *IRBuilder = ir_builder_new(arena, 1024)
+  b.indent = 1
+  ir_emit_store_imm(b, TY_I32, 42, 1)
+  ir_emit_load(b, 2, TY_I32, 1)
+  let buf: *i8 = ir_get_buffer(b)
+  assert str_contains(buf, "store i32 42, i32* %1") == 1, "should emit store"
+  assert str_contains(buf, "%2 = load i32, i32* %1") == 1, "should emit load"
+  0
+
+@test
+fn test_ir_emit_ret_imm() -> i32
+  let arena: *Arena = arena_new(4096)
+  let b: *IRBuilder = ir_builder_new(arena, 1024)
+  b.indent = 1
+  ir_emit_ret_imm(b, TY_I32, 0)
+  let buf: *i8 = ir_get_buffer(b)
+  assert str_contains(buf, "ret i32 0") == 1, "should emit ret"
+  0
+
+@test
+fn test_ir_emit_function() -> i32
+  let arena: *Arena = arena_new(4096)
+  let b: *IRBuilder = ir_builder_new(arena, 1024)
+  ir_emit_fn_start(b, "main", TY_I32)
+  ir_emit_fn_header_end(b)
+  ir_emit_ret_imm(b, TY_I32, 42)
+  ir_emit_fn_end(b)
+  let buf: *i8 = ir_get_buffer(b)
+  assert str_contains(buf, "define i32 @\"main\"()") == 1, "should have function def"
+  assert str_contains(buf, "entry:") == 1, "should have entry label"
+  assert str_contains(buf, "ret i32 42") == 1, "should have return"
+  assert str_contains(buf, "}") == 1, "should have closing brace"
+  0
+
+@test
+fn test_ir_emit_module_header() -> i32
+  let arena: *Arena = arena_new(4096)
+  let b: *IRBuilder = ir_builder_new(arena, 1024)
+  ir_emit_module_header(b, "test_module")
+  let buf: *i8 = ir_get_buffer(b)
+  assert str_contains(buf, "; Ritz compiled module") == 1, "should have comment"
+  assert str_contains(buf, "ModuleID = \"test_module\"") == 1, "should have module ID"
+  assert str_contains(buf, "target triple") == 1, "should have target triple"
+  0
+
+@test
+fn test_ir_emit_complete_program() -> i32
+  # Generate IR for: fn main() -> i32 { 42 }
+  let arena: *Arena = arena_new(8192)
+  let b: *IRBuilder = ir_builder_new(arena, 4096)
+
+  ir_emit_module_header(b, "test")
+  ir_emit_fn_start(b, "main", TY_I32)
+  ir_emit_fn_header_end(b)
+  ir_emit_ret_imm(b, TY_I32, 42)
+  ir_emit_fn_end(b)
+
+  let buf: *i8 = ir_get_buffer(b)
+
+  # Verify key parts of the IR
+  assert str_contains(buf, "define i32 @\"main\"()") == 1, "should have main"
+  assert str_contains(buf, "ret i32 42") == 1, "should return 42"
+  0
+
+@test
+fn test_ir_emit_add_function() -> i32
+  # Generate IR for: fn add(a: i32, b: i32) -> i32 { a + b }
+  let arena: *Arena = arena_new(8192)
+  let b: *IRBuilder = ir_builder_new(arena, 4096)
+
+  ir_emit_module_header(b, "test")
+
+  # Function: define i32 @add(i32 %a.arg, i32 %b.arg) {
+  ir_emit_fn_start(b, "add", TY_I32)
+  ir_put_str(b, "i32 %\"a.arg\", i32 %\"b.arg\"")
+  ir_emit_fn_header_end(b)
+
+  # Body:
+  #   %a = alloca i32
+  #   store i32 %a.arg, i32* %a
+  #   %b = alloca i32
+  #   store i32 %b.arg, i32* %b
+  #   %1 = load i32, i32* %a
+  #   %2 = load i32, i32* %b
+  #   %3 = add i32 %1, %2
+  #   ret i32 %3
+
+  ir_emit_alloca(b, 1, TY_I32)  # %1 = alloca for a
+  ir_put_indent(b)
+  ir_put_str(b, "store i32 %\"a.arg\", i32* %1")
+  ir_newline(b)
+
+  ir_emit_alloca(b, 2, TY_I32)  # %2 = alloca for b
+  ir_put_indent(b)
+  ir_put_str(b, "store i32 %\"b.arg\", i32* %2")
+  ir_newline(b)
+
+  ir_emit_load(b, 3, TY_I32, 1)  # %3 = load a
+  ir_emit_load(b, 4, TY_I32, 2)  # %4 = load b
+  ir_emit_binop(b, "add", TY_I32, 5, 3, 4)  # %5 = add
+  ir_emit_ret(b, TY_I32, 5)
+
+  ir_emit_fn_end(b)
+
+  let buf: *i8 = ir_get_buffer(b)
+
+  assert str_contains(buf, "define i32 @\"add\"") == 1, "should have add function"
+  assert str_contains(buf, "alloca i32") == 1, "should have alloca"
+  assert str_contains(buf, "add i32") == 1, "should have add"
+  0
+
+# =============================================================================
+# AST Emission Tests
+# =============================================================================
+
+# Expression kinds (must match emitter.ritz)
+const EXPR_INT_LIT: i32 = 1
+const EXPR_IDENT: i32 = 2
+const EXPR_STRING_LIT: i32 = 3
+const EXPR_BOOL_LIT: i32 = 4
+const EXPR_BIN_OP: i32 = 5
+const EXPR_UNARY_OP: i32 = 6
+const EXPR_CALL: i32 = 7
+const EXPR_INDEX: i32 = 8
+const EXPR_FIELD: i32 = 9
+const EXPR_PAREN: i32 = 10
+const EXPR_CAST: i32 = 11
+
+# Statement kinds
+const STMT_EXPR: i32 = 20
+const STMT_VAR: i32 = 21
+const STMT_LET: i32 = 22
+const STMT_IF: i32 = 23
+const STMT_WHILE: i32 = 24
+const STMT_RETURN: i32 = 26
+
+# Token types for operators (must match tokens.ritz)
+const TOK_PLUS: i32 = 28
+const TOK_MINUS: i32 = 29
+const TOK_LT: i32 = 38
+const TOK_EQEQ: i32 = 43
+
+# AST structures for emission
+struct EmitExpr
+  kind: i32
+  val1: i32
+  val2: i32
+  left: *EmitExpr
+  right: *EmitExpr
+  next: *EmitExpr
+
+struct EmitStmt
+  kind: i32
+  name: *i8
+  name_len: i32
+  type_expr: *i32
+  expr: *EmitExpr
+  stmt: *EmitStmt
+  next: *EmitStmt
+
+struct EmitLocal
+  name: *i8
+  name_len: i32
+  ty: i32
+  slot: i32
+  next: *EmitLocal
+
+struct EmitCtx
+  b: *IRBuilder
+  locals: *EmitLocal
+  arena: *Arena
+  src: *i8
+
+fn emit_ctx_new(arena: *Arena, src: *i8) -> *EmitCtx
+  let ctx: *EmitCtx = arena_alloc(arena, 64) as *EmitCtx
+  ctx.b = ir_builder_new(arena, 4096)  # Use smaller buffer for tests
+  ctx.locals = 0 as *EmitLocal
+  ctx.arena = arena
+  ctx.src = src
+  ctx
+
+fn emit_lookup_local(ctx: *EmitCtx, name: *i8, name_len: i32) -> *EmitLocal
+  var cur: *EmitLocal = ctx.locals
+  while cur != 0 as *EmitLocal
+    if cur.name_len == name_len
+      var matched: i32 = 1
+      var i: i32 = 0
+      while i < name_len
+        if *(cur.name + i) != *(name + i)
+          matched = 0
+        i = i + 1
+      if matched == 1
+        return cur
+    cur = cur.next
+  0 as *EmitLocal
+
+fn emit_add_local(ctx: *EmitCtx, name: *i8, name_len: i32, ty: i32, slot: i32) -> *EmitLocal
+  let local: *EmitLocal = arena_alloc(ctx.arena, 40) as *EmitLocal
+  local.name = name
+  local.name_len = name_len
+  local.ty = ty
+  local.slot = slot
+  local.next = ctx.locals
+  ctx.locals = local
+  local
+
+fn emit_expr(ctx: *EmitCtx, e: *EmitExpr) -> i32
+  let b: *IRBuilder = ctx.b
+
+  if e.kind == EXPR_INT_LIT
+    let slot: i32 = ir_fresh_id(b)
+    ir_emit_alloca(b, slot, TY_I64)
+    ir_emit_store_imm(b, TY_I64, e.val1 as i64, slot)
+    let result: i32 = ir_fresh_id(b)
+    ir_emit_load(b, result, TY_I64, slot)
+    return result
+
+  if e.kind == EXPR_BOOL_LIT
+    let slot: i32 = ir_fresh_id(b)
+    ir_emit_alloca(b, slot, TY_BOOL)
+    ir_emit_store_imm(b, TY_BOOL, e.val1 as i64, slot)
+    let result: i32 = ir_fresh_id(b)
+    ir_emit_load(b, result, TY_BOOL, slot)
+    return result
+
+  if e.kind == EXPR_IDENT
+    let name: *i8 = ctx.src + e.val1
+    let name_len: i32 = e.val2
+    let local: *EmitLocal = emit_lookup_local(ctx, name, name_len)
+    if local == 0 as *EmitLocal
+      return -1
+    let result: i32 = ir_fresh_id(b)
+    ir_emit_load(b, result, local.ty, local.slot)
+    return result
+
+  if e.kind == EXPR_BIN_OP
+    let lhs: i32 = emit_expr(ctx, e.left)
+    let rhs: i32 = emit_expr(ctx, e.right)
+    let result: i32 = ir_fresh_id(b)
+    let op: i32 = e.val2
+
+    if op == TOK_PLUS
+      ir_emit_binop(b, "add", TY_I64, result, lhs, rhs)
+      return result
+    if op == TOK_MINUS
+      ir_emit_binop(b, "sub", TY_I64, result, lhs, rhs)
+      return result
+    if op == TOK_EQEQ
+      ir_emit_icmp(b, "eq", TY_I64, result, lhs, rhs)
+      return result
+    if op == TOK_LT
+      ir_emit_icmp(b, "slt", TY_I64, result, lhs, rhs)
+      return result
+
+    return -1
+
+  if e.kind == EXPR_PAREN
+    return emit_expr(ctx, e.left)
+
+  -1
+
+fn emit_stmt(ctx: *EmitCtx, s: *EmitStmt) -> i32
+  let b: *IRBuilder = ctx.b
+
+  if s.kind == STMT_EXPR
+    emit_expr(ctx, s.expr)
+    return 0
+
+  if s.kind == STMT_VAR
+    let slot: i32 = ir_fresh_id(b)
+    ir_emit_alloca(b, slot, TY_I64)
+    if s.expr != 0 as *EmitExpr
+      let val: i32 = emit_expr(ctx, s.expr)
+      ir_emit_store(b, TY_I64, val, slot)
+    emit_add_local(ctx, s.name, s.name_len, TY_I64, slot)
+    return 0
+
+  if s.kind == STMT_LET
+    let slot: i32 = ir_fresh_id(b)
+    ir_emit_alloca(b, slot, TY_I64)
+    if s.expr != 0 as *EmitExpr
+      let val: i32 = emit_expr(ctx, s.expr)
+      ir_emit_store(b, TY_I64, val, slot)
+    emit_add_local(ctx, s.name, s.name_len, TY_I64, slot)
+    return 0
+
+  if s.kind == STMT_RETURN
+    if s.expr != 0 as *EmitExpr
+      let val: i32 = emit_expr(ctx, s.expr)
+      ir_emit_ret(b, TY_I64, val)
+    else
+      ir_emit_ret_void(b)
+    return 0
+
+  0
+
+@test
+fn test_emit_int_literal() -> i32
+  let arena: *Arena = arena_new(8192)
+  let ctx: *EmitCtx = emit_ctx_new(arena, "")
+
+  # Create int literal node: 42
+  let e: *EmitExpr = arena_alloc(arena, 48) as *EmitExpr
+  e.kind = EXPR_INT_LIT
+  e.val1 = 42
+
+  # Set up function context
+  let b: *IRBuilder = ctx.b
+  ir_emit_fn_start(b, "test", TY_I64)
+  ir_emit_fn_header_end(b)
+
+  let result: i32 = emit_expr(ctx, e)
+  assert result > 0, "should return valid SSA id"
+
+  let buf: *i8 = ir_get_buffer(b)
+  assert str_contains(buf, "alloca i64") == 1, "should have alloca"
+  assert str_contains(buf, "store i64 42") == 1, "should store 42"
+  assert str_contains(buf, "load i64") == 1, "should have load"
+  0
+
+@test
+fn test_emit_binary_add() -> i32
+  let arena: *Arena = arena_new(8192)
+  let ctx: *EmitCtx = emit_ctx_new(arena, "")
+
+  # Create: 10 + 32
+  let left: *EmitExpr = arena_alloc(arena, 48) as *EmitExpr
+  left.kind = EXPR_INT_LIT
+  left.val1 = 10
+
+  let right: *EmitExpr = arena_alloc(arena, 48) as *EmitExpr
+  right.kind = EXPR_INT_LIT
+  right.val1 = 32
+
+  let add: *EmitExpr = arena_alloc(arena, 48) as *EmitExpr
+  add.kind = EXPR_BIN_OP
+  add.val2 = TOK_PLUS
+  add.left = left
+  add.right = right
+
+  let b: *IRBuilder = ctx.b
+  ir_emit_fn_start(b, "test", TY_I64)
+  ir_emit_fn_header_end(b)
+
+  let result: i32 = emit_expr(ctx, add)
+  assert result > 0, "should return valid SSA id"
+
+  let buf: *i8 = ir_get_buffer(b)
+  assert str_contains(buf, "add i64") == 1, "should have add"
+  0
+
+@test
+fn test_emit_let_stmt() -> i32
+  let arena: *Arena = arena_new(8192)
+  let src: *i8 = "x"
+  let ctx: *EmitCtx = emit_ctx_new(arena, src)
+
+  # Create: let x = 42
+  let init: *EmitExpr = arena_alloc(arena, 48) as *EmitExpr
+  init.kind = EXPR_INT_LIT
+  init.val1 = 42
+
+  let stmt: *EmitStmt = arena_alloc(arena, 64) as *EmitStmt
+  stmt.kind = STMT_LET
+  stmt.name = src
+  stmt.name_len = 1
+  stmt.expr = init
+  stmt.next = 0 as *EmitStmt
+
+  let b: *IRBuilder = ctx.b
+  ir_emit_fn_start(b, "test", TY_I64)
+  ir_emit_fn_header_end(b)
+
+  emit_stmt(ctx, stmt)
+
+  let buf: *i8 = ir_get_buffer(b)
+  assert str_contains(buf, "alloca i64") == 1, "should have alloca for x"
+  assert str_contains(buf, "store i64") == 1, "should store to x"
+
+  # Verify local was registered
+  let local: *EmitLocal = emit_lookup_local(ctx, src, 1)
+  assert local != 0 as *EmitLocal, "should have registered local"
+  0
+
+@test
+fn test_emit_var_and_use() -> i32
+  let arena: *Arena = arena_new(8192)
+  let src: *i8 = "x"
+  let ctx: *EmitCtx = emit_ctx_new(arena, src)
+
+  # Create: var x = 10; return x
+  let init: *EmitExpr = arena_alloc(arena, 48) as *EmitExpr
+  init.kind = EXPR_INT_LIT
+  init.val1 = 10
+
+  let var_stmt: *EmitStmt = arena_alloc(arena, 64) as *EmitStmt
+  var_stmt.kind = STMT_VAR
+  var_stmt.name = src
+  var_stmt.name_len = 1
+  var_stmt.expr = init
+
+  let use_x: *EmitExpr = arena_alloc(arena, 48) as *EmitExpr
+  use_x.kind = EXPR_IDENT
+  use_x.val1 = 0  # offset into src where "x" is
+  use_x.val2 = 1  # length
+
+  let ret_stmt: *EmitStmt = arena_alloc(arena, 64) as *EmitStmt
+  ret_stmt.kind = STMT_RETURN
+  ret_stmt.expr = use_x
+
+  var_stmt.next = ret_stmt
+
+  let b: *IRBuilder = ctx.b
+  ir_emit_fn_start(b, "test", TY_I64)
+  ir_emit_fn_header_end(b)
+
+  emit_stmt(ctx, var_stmt)
+  emit_stmt(ctx, ret_stmt)
+
+  let buf: *i8 = ir_get_buffer(b)
+  assert str_contains(buf, "alloca i64") == 1, "should have alloca"
+  assert str_contains(buf, "store i64 10") == 1, "should init to 10"
+  assert str_contains(buf, "load i64") == 1, "should load x"
+  assert str_contains(buf, "ret i64") == 1, "should return"
+  0
+
+@test
+fn test_emit_return_expr() -> i32
+  let arena: *Arena = arena_new(8192)
+  let ctx: *EmitCtx = emit_ctx_new(arena, "")
+
+  # Create: return 42
+  let expr: *EmitExpr = arena_alloc(arena, 48) as *EmitExpr
+  expr.kind = EXPR_INT_LIT
+  expr.val1 = 42
+
+  let stmt: *EmitStmt = arena_alloc(arena, 64) as *EmitStmt
+  stmt.kind = STMT_RETURN
+  stmt.expr = expr
+
+  let b: *IRBuilder = ctx.b
+  ir_emit_fn_start(b, "test", TY_I64)
+  ir_emit_fn_header_end(b)
+
+  emit_stmt(ctx, stmt)
+
+  let buf: *i8 = ir_get_buffer(b)
+  assert str_contains(buf, "ret i64") == 1, "should have return"
+  0

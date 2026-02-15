@@ -1,0 +1,368 @@
+# lib/h2_stream.ritz - HTTP/2 Stream State Machine
+#
+# Implements the stream state machine per RFC 7540 Section 5.1.
+#
+# Stream states:
+#   idle -> open (send/recv HEADERS)
+#   idle -> reserved (local) (send PUSH_PROMISE)
+#   idle -> reserved (remote) (recv PUSH_PROMISE)
+#   reserved (local) -> half-closed (remote) (send HEADERS)
+#   reserved (remote) -> half-closed (local) (recv HEADERS)
+#   open -> half-closed (local) (send END_STREAM)
+#   open -> half-closed (remote) (recv END_STREAM)
+#   open -> closed (send/recv RST_STREAM)
+#   half-closed (local) -> closed (recv END_STREAM or send/recv RST_STREAM)
+#   half-closed (remote) -> closed (send END_STREAM or send/recv RST_STREAM)
+#
+# Error codes are defined in RFC 7540 Section 7.
+
+import ritzlib.span
+import lib.h2_frame
+
+# ============================================================================
+# Stream States
+# ============================================================================
+
+pub const H2_STREAM_IDLE: i32 = 0
+pub const H2_STREAM_RESERVED_LOCAL: i32 = 1
+pub const H2_STREAM_RESERVED_REMOTE: i32 = 2
+pub const H2_STREAM_OPEN: i32 = 3
+pub const H2_STREAM_HALF_CLOSED_LOCAL: i32 = 4
+pub const H2_STREAM_HALF_CLOSED_REMOTE: i32 = 5
+pub const H2_STREAM_CLOSED: i32 = 6
+
+# Error codes are defined in h2_frame.ritz as H2_ERROR_*
+# We import them for use in stream management
+
+# ============================================================================
+# Stream Events (inputs to state machine)
+# ============================================================================
+
+pub const H2_EVENT_SEND_HEADERS: i32 = 0
+pub const H2_EVENT_RECV_HEADERS: i32 = 1
+pub const H2_EVENT_SEND_END_STREAM: i32 = 2
+pub const H2_EVENT_RECV_END_STREAM: i32 = 3
+pub const H2_EVENT_SEND_RST_STREAM: i32 = 4
+pub const H2_EVENT_RECV_RST_STREAM: i32 = 5
+pub const H2_EVENT_SEND_PUSH_PROMISE: i32 = 6
+pub const H2_EVENT_RECV_PUSH_PROMISE: i32 = 7
+
+# ============================================================================
+# Stream Structure
+# ============================================================================
+
+pub struct H2Stream
+    id: i32                     # Stream identifier (odd = client-initiated, even = server-initiated)
+    state: i32                  # Current state (H2_STREAM_*)
+    local_window: i32           # Local flow control window
+    remote_window: i32          # Remote flow control window
+    weight: i32                 # Stream priority weight (1-256)
+    dependency: i32             # Stream dependency (0 = root)
+    exclusive: i32              # Exclusive dependency flag
+
+# Default initial window size per RFC 7540
+pub const H2_DEFAULT_WINDOW_SIZE: i32 = 65535
+
+# Default stream weight
+pub const H2_DEFAULT_WEIGHT: i32 = 16
+
+pub fn h2_stream_init(stream: *H2Stream, id: i32)
+    stream.id = id
+    stream.state = H2_STREAM_IDLE
+    stream.local_window = H2_DEFAULT_WINDOW_SIZE
+    stream.remote_window = H2_DEFAULT_WINDOW_SIZE
+    stream.weight = H2_DEFAULT_WEIGHT
+    stream.dependency = 0
+    stream.exclusive = 0
+
+# ============================================================================
+# State Transition Functions
+# ============================================================================
+
+# Check if a state transition is valid
+# Returns the new state, or -1 if invalid
+pub fn h2_stream_transition(state: i32, event: i32) -> i32
+    if state == H2_STREAM_IDLE
+        if event == H2_EVENT_SEND_HEADERS || event == H2_EVENT_RECV_HEADERS
+            return H2_STREAM_OPEN
+        else if event == H2_EVENT_SEND_PUSH_PROMISE
+            return H2_STREAM_RESERVED_LOCAL
+        else if event == H2_EVENT_RECV_PUSH_PROMISE
+            return H2_STREAM_RESERVED_REMOTE
+        return -1
+
+    else if state == H2_STREAM_RESERVED_LOCAL
+        if event == H2_EVENT_SEND_HEADERS
+            return H2_STREAM_HALF_CLOSED_REMOTE
+        else if event == H2_EVENT_SEND_RST_STREAM || event == H2_EVENT_RECV_RST_STREAM
+            return H2_STREAM_CLOSED
+        return -1
+
+    else if state == H2_STREAM_RESERVED_REMOTE
+        if event == H2_EVENT_RECV_HEADERS
+            return H2_STREAM_HALF_CLOSED_LOCAL
+        else if event == H2_EVENT_SEND_RST_STREAM || event == H2_EVENT_RECV_RST_STREAM
+            return H2_STREAM_CLOSED
+        return -1
+
+    else if state == H2_STREAM_OPEN
+        if event == H2_EVENT_SEND_END_STREAM
+            return H2_STREAM_HALF_CLOSED_LOCAL
+        else if event == H2_EVENT_RECV_END_STREAM
+            return H2_STREAM_HALF_CLOSED_REMOTE
+        else if event == H2_EVENT_SEND_RST_STREAM || event == H2_EVENT_RECV_RST_STREAM
+            return H2_STREAM_CLOSED
+        # DATA frames, continuation, etc. don't change state
+        return state
+
+    else if state == H2_STREAM_HALF_CLOSED_LOCAL
+        if event == H2_EVENT_RECV_END_STREAM
+            return H2_STREAM_CLOSED
+        else if event == H2_EVENT_SEND_RST_STREAM || event == H2_EVENT_RECV_RST_STREAM
+            return H2_STREAM_CLOSED
+        # Can still receive DATA, HEADERS (trailers)
+        return state
+
+    else if state == H2_STREAM_HALF_CLOSED_REMOTE
+        if event == H2_EVENT_SEND_END_STREAM
+            return H2_STREAM_CLOSED
+        else if event == H2_EVENT_SEND_RST_STREAM || event == H2_EVENT_RECV_RST_STREAM
+            return H2_STREAM_CLOSED
+        # Can still send DATA, HEADERS (trailers)
+        return state
+
+    else if state == H2_STREAM_CLOSED
+        # No valid transitions from closed
+        return -1
+
+    return -1
+
+# Apply a state transition to a stream
+# Returns 0 on success, error code on failure
+pub fn h2_stream_apply_event(stream: *H2Stream, event: i32) -> i32
+    let new_state: i32 = h2_stream_transition(stream.state, event)
+    if new_state < 0
+        return H2_ERROR_PROTOCOL_ERROR
+    stream.state = new_state
+    return H2_ERROR_NO_ERROR
+
+# ============================================================================
+# State Query Functions
+# ============================================================================
+
+pub fn h2_stream_is_idle(stream: *H2Stream) -> i32
+    if stream.state == H2_STREAM_IDLE
+        return 1
+    return 0
+
+pub fn h2_stream_is_open(stream: *H2Stream) -> i32
+    if stream.state == H2_STREAM_OPEN
+        return 1
+    return 0
+
+pub fn h2_stream_is_closed(stream: *H2Stream) -> i32
+    if stream.state == H2_STREAM_CLOSED
+        return 1
+    return 0
+
+pub fn h2_stream_is_half_closed_local(stream: *H2Stream) -> i32
+    if stream.state == H2_STREAM_HALF_CLOSED_LOCAL
+        return 1
+    return 0
+
+pub fn h2_stream_is_half_closed_remote(stream: *H2Stream) -> i32
+    if stream.state == H2_STREAM_HALF_CLOSED_REMOTE
+        return 1
+    return 0
+
+# Check if stream can send data
+pub fn h2_stream_can_send(stream: *H2Stream) -> i32
+    if stream.state == H2_STREAM_OPEN
+        return 1
+    if stream.state == H2_STREAM_HALF_CLOSED_REMOTE
+        return 1
+    return 0
+
+# Check if stream can receive data
+pub fn h2_stream_can_recv(stream: *H2Stream) -> i32
+    if stream.state == H2_STREAM_OPEN
+        return 1
+    if stream.state == H2_STREAM_HALF_CLOSED_LOCAL
+        return 1
+    return 0
+
+# ============================================================================
+# Flow Control
+# ============================================================================
+
+# Update local window (we received data)
+# Returns 0 if OK, H2_ERROR_FLOW_CONTROL_ERROR if window would go negative
+pub fn h2_stream_consume_local_window(stream: *H2Stream, size: i32) -> i32
+    if size > stream.local_window
+        return H2_ERROR_FLOW_CONTROL_ERROR
+    stream.local_window -= size
+    return H2_ERROR_NO_ERROR
+
+# Increase local window (we sent WINDOW_UPDATE)
+pub fn h2_stream_increase_local_window(stream: *H2Stream, increment: i32) -> i32
+    # Check for overflow (max window is 2^31 - 1)
+    if stream.local_window > 2147483647 - increment
+        return H2_ERROR_FLOW_CONTROL_ERROR
+    stream.local_window += increment
+    return H2_ERROR_NO_ERROR
+
+# Update remote window (we sent data)
+pub fn h2_stream_consume_remote_window(stream: *H2Stream, size: i32) -> i32
+    if size > stream.remote_window
+        return H2_ERROR_FLOW_CONTROL_ERROR
+    stream.remote_window -= size
+    return H2_ERROR_NO_ERROR
+
+# Increase remote window (we received WINDOW_UPDATE)
+pub fn h2_stream_increase_remote_window(stream: *H2Stream, increment: i32) -> i32
+    if stream.remote_window > 2147483647 - increment
+        return H2_ERROR_FLOW_CONTROL_ERROR
+    stream.remote_window += increment
+    return H2_ERROR_NO_ERROR
+
+# ============================================================================
+# Priority
+# ============================================================================
+
+pub fn h2_stream_set_priority(stream: *H2Stream, dependency: i32, weight: i32, exclusive: i32)
+    stream.dependency = dependency
+    # Weight must be 1-256
+    if weight < 1
+        stream.weight = 1
+    else if weight > 256
+        stream.weight = 256
+    else
+        stream.weight = weight
+    stream.exclusive = exclusive
+
+# ============================================================================
+# Stream Manager (tracks multiple streams)
+# ============================================================================
+
+# Maximum concurrent streams we track
+pub const H2_MAX_STREAMS: i32 = 128
+
+pub struct H2StreamManager
+    streams: [128]H2Stream      # Array of streams
+    count: i32                  # Number of active streams
+    next_client_id: i32         # Next client-initiated stream ID (odd)
+    next_server_id: i32         # Next server-initiated stream ID (even)
+    max_concurrent: i32         # Maximum concurrent streams allowed
+    initial_window_size: i32    # Initial window size for new streams
+
+pub fn h2_stream_manager_init(mgr: *H2StreamManager, is_server: i32)
+    mgr.count = 0
+    mgr.max_concurrent = 100
+    mgr.initial_window_size = H2_DEFAULT_WINDOW_SIZE
+
+    if is_server == 1
+        # Server uses even stream IDs, client starts with 1
+        mgr.next_server_id = 2
+        mgr.next_client_id = 1  # For tracking received streams
+    else
+        # Client uses odd stream IDs, server starts with 2
+        mgr.next_client_id = 1
+        mgr.next_server_id = 2  # For tracking received streams
+
+# Find a stream by ID
+# Returns pointer to stream, or null if not found
+pub fn h2_stream_manager_find(mgr: *H2StreamManager, stream_id: i32) -> *H2Stream
+    var i: i32 = 0
+    while i < mgr.count
+        if mgr.streams[i].id == stream_id
+            return @mgr.streams[i]
+        i += 1
+    return null
+
+# Create a new client-initiated stream
+# Returns pointer to stream, or null if max concurrent exceeded
+pub fn h2_stream_manager_create_client_stream(mgr: *H2StreamManager) -> *H2Stream
+    if mgr.count >= mgr.max_concurrent || mgr.count >= H2_MAX_STREAMS
+        return null
+
+    let idx: i32 = mgr.count
+    h2_stream_init(@mgr.streams[idx], mgr.next_client_id)
+    mgr.streams[idx].local_window = mgr.initial_window_size
+    mgr.streams[idx].remote_window = mgr.initial_window_size
+    mgr.next_client_id += 2  # Odd numbers only
+    mgr.count += 1
+
+    return @mgr.streams[idx]
+
+# Create a new server-initiated stream (push)
+pub fn h2_stream_manager_create_server_stream(mgr: *H2StreamManager) -> *H2Stream
+    if mgr.count >= mgr.max_concurrent || mgr.count >= H2_MAX_STREAMS
+        return null
+
+    let idx: i32 = mgr.count
+    h2_stream_init(@mgr.streams[idx], mgr.next_server_id)
+    mgr.streams[idx].local_window = mgr.initial_window_size
+    mgr.streams[idx].remote_window = mgr.initial_window_size
+    mgr.next_server_id += 2  # Even numbers only
+    mgr.count += 1
+
+    return @mgr.streams[idx]
+
+# Get or create a stream for an incoming request
+# Used when receiving HEADERS on a new stream
+pub fn h2_stream_manager_get_or_create(mgr: *H2StreamManager, stream_id: i32) -> *H2Stream
+    # Check if stream already exists
+    let existing: *H2Stream = h2_stream_manager_find(mgr, stream_id)
+    if existing != null
+        return existing
+
+    # Validate stream ID
+    if stream_id <= 0
+        return null
+
+    # Check capacity
+    if mgr.count >= mgr.max_concurrent || mgr.count >= H2_MAX_STREAMS
+        return null
+
+    # Create new stream
+    let idx: i32 = mgr.count
+    h2_stream_init(@mgr.streams[idx], stream_id)
+    mgr.streams[idx].local_window = mgr.initial_window_size
+    mgr.streams[idx].remote_window = mgr.initial_window_size
+    mgr.count += 1
+
+    return @mgr.streams[idx]
+
+# Count active (non-closed) streams
+pub fn h2_stream_manager_active_count(mgr: *H2StreamManager) -> i32
+    var count: i32 = 0
+    var i: i32 = 0
+    while i < mgr.count
+        if mgr.streams[i].state != H2_STREAM_CLOSED
+            count += 1
+        i += 1
+    return count
+
+# Update initial window size for all streams (from SETTINGS)
+pub fn h2_stream_manager_update_initial_window(mgr: *H2StreamManager, new_size: i32)
+    let delta: i32 = new_size - mgr.initial_window_size
+    mgr.initial_window_size = new_size
+
+    # Update existing streams
+    var i: i32 = 0
+    while i < mgr.count
+        if mgr.streams[i].state != H2_STREAM_CLOSED
+            mgr.streams[i].remote_window += delta
+        i += 1
+
+# Apply WINDOW_UPDATE to a stream (or connection if stream_id == 0)
+pub fn h2_stream_manager_window_update(mgr: *H2StreamManager, stream_id: i32, increment: i32) -> i32
+    if stream_id == 0
+        # Connection-level window update - would need separate tracking
+        return H2_ERROR_NO_ERROR
+
+    let stream: *H2Stream = h2_stream_manager_find(mgr, stream_id)
+    if stream == null
+        return H2_ERROR_PROTOCOL_ERROR
+
+    return h2_stream_increase_remote_window(stream, increment)

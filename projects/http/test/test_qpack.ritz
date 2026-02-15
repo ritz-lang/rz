@@ -1,0 +1,437 @@
+# test/test_qpack.ritz - Tests for QPACK codec
+#
+# RFC 9204 defines QPACK
+
+import ritzlib.span
+import lib.qpack
+import lib.qpack_static
+
+# ============================================================================
+# Dynamic Table Tests
+# ============================================================================
+
+[[test]]
+fn test_qpack_dynamic_table_init() -> i32
+    var table: QpackDynamicTable
+    qpack_dynamic_table_init(@table)
+    if table.count != 0
+        return 1
+    if table.insert_count != 0
+        return 2
+    if table.max_size != QPACK_MAX_DYNAMIC_TABLE_SIZE
+        return 3
+    return 0
+
+[[test]]
+fn test_qpack_dynamic_table_insert() -> i32
+    var table: QpackDynamicTable
+    qpack_dynamic_table_init(@table)
+
+    var name: Span<u8>
+    var value: Span<u8>
+    name.ptr = "custom-header"
+    name.len = 13
+    value.ptr = "custom-value"
+    value.len = 12
+
+    let ret: i32 = qpack_dynamic_table_insert(@table, name, value)
+    if ret != QPACK_OK
+        return 1
+    if table.count != 1
+        return 2
+    if table.insert_count != 1
+        return 3
+    return 0
+
+[[test]]
+fn test_qpack_dynamic_table_get() -> i32
+    var table: QpackDynamicTable
+    qpack_dynamic_table_init(@table)
+
+    var name: Span<u8>
+    var value: Span<u8>
+    name.ptr = "x-test"
+    name.len = 6
+    value.ptr = "test-value"
+    value.len = 10
+
+    qpack_dynamic_table_insert(@table, name, value)
+
+    var entry: QpackStaticEntry
+    let ret: i32 = qpack_dynamic_table_get(@table, 0, @entry)
+    if ret != 0
+        return 1
+    if entry.name.len != 6
+        return 2
+    if entry.value.len != 10
+        return 3
+    return 0
+
+[[test]]
+fn test_qpack_dynamic_table_multiple_inserts() -> i32
+    var table: QpackDynamicTable
+    qpack_dynamic_table_init(@table)
+
+    var name1: Span<u8>
+    var value1: Span<u8>
+    name1.ptr = "header1"
+    name1.len = 7
+    value1.ptr = "value1"
+    value1.len = 6
+
+    var name2: Span<u8>
+    var value2: Span<u8>
+    name2.ptr = "header2"
+    name2.len = 7
+    value2.ptr = "value2"
+    value2.len = 6
+
+    qpack_dynamic_table_insert(@table, name1, value1)
+    qpack_dynamic_table_insert(@table, name2, value2)
+
+    if table.count != 2
+        return 1
+    if table.insert_count != 2
+        return 2
+
+    # Most recent (header2) should be at index 0
+    var entry: QpackStaticEntry
+    qpack_dynamic_table_get(@table, 0, @entry)
+    if entry.name.len != 7
+        return 3
+    return 0
+
+[[test]]
+fn test_qpack_dynamic_table_set_max_size() -> i32
+    var table: QpackDynamicTable
+    qpack_dynamic_table_init(@table)
+
+    var name: Span<u8>
+    var value: Span<u8>
+    name.ptr = "x-header"
+    name.len = 8
+    value.ptr = "x-value"
+    value.len = 7
+
+    var name2: Span<u8>
+    var value2: Span<u8>
+    name2.ptr = "x-header"
+    name2.len = 8
+    value2.ptr = "x-value"
+    value2.len = 7
+
+    # Insert some entries
+    qpack_dynamic_table_insert(@table, name, value)
+    qpack_dynamic_table_insert(@table, name2, value2)
+
+    # Shrink table to force eviction
+    qpack_dynamic_table_set_max_size(@table, 50)
+
+    # Should have evicted entries
+    if table.current_size > 50
+        return 1
+    return 0
+
+# ============================================================================
+# Integer Encoding/Decoding Tests
+# ============================================================================
+
+[[test]]
+fn test_qpack_encode_int_small() -> i32
+    var buf: [8]u8
+    buf[0] = 0
+    let ret: i32 = qpack_encode_int(10, 5, @buf[0], 8)
+    if ret != 1
+        return 1
+    if (buf[0] & 0x1F) != 10
+        return 2
+    return 0
+
+[[test]]
+fn test_qpack_encode_int_max_prefix() -> i32
+    var buf: [8]u8
+    buf[0] = 0
+    # 30 is max single-byte value for 5-bit prefix (31 requires continuation)
+    let ret: i32 = qpack_encode_int(30, 5, @buf[0], 8)
+    if ret != 1
+        return 1
+    if (buf[0] & 0x1F) != 30
+        return 2
+    return 0
+
+[[test]]
+fn test_qpack_encode_int_overflow() -> i32
+    var buf: [8]u8
+    buf[0] = 0
+    # 32 requires continuation (31 + 1)
+    let ret: i32 = qpack_encode_int(32, 5, @buf[0], 8)
+    if ret != 2
+        return 1
+    if (buf[0] & 0x1F) != 31
+        return 2
+    if buf[1] != 1
+        return 3
+    return 0
+
+[[test]]
+fn test_qpack_decode_int_small() -> i32
+    var buf: [8]u8
+    buf[0] = 0x0A  # 10 with 5-bit prefix
+
+    var result: i64 = 0
+    let ret: i32 = qpack_decode_int(@buf[0], 8, 5, @result)
+    if ret != 1
+        return 1
+    if result != 10
+        return 2
+    return 0
+
+[[test]]
+fn test_qpack_decode_int_overflow() -> i32
+    var buf: [8]u8
+    buf[0] = 0x1F  # 31 (max prefix)
+    buf[1] = 0x01  # +1 = 32
+
+    var result: i64 = 0
+    let ret: i32 = qpack_decode_int(@buf[0], 8, 5, @result)
+    if ret != 2
+        return 1
+    if result != 32
+        return 2
+    return 0
+
+[[test]]
+fn test_qpack_int_roundtrip() -> i32
+    var buf: [16]u8
+    buf[0] = 0
+
+    let original: i64 = 1234
+    let enc_len: i32 = qpack_encode_int(original, 6, @buf[0], 16)
+    if enc_len < 0
+        return 1
+
+    var decoded: i64 = 0
+    let dec_len: i32 = qpack_decode_int(@buf[0], 16, 6, @decoded)
+    if dec_len != enc_len
+        return 2
+    if decoded != original
+        return 3
+    return 0
+
+# ============================================================================
+# Encoder Tests
+# ============================================================================
+
+[[test]]
+fn test_qpack_encoder_init() -> i32
+    var enc: QpackEncoder
+    qpack_encoder_init(@enc)
+    if enc.dynamic_table.count != 0
+        return 1
+    return 0
+
+[[test]]
+fn test_qpack_encode_prefix() -> i32
+    var enc: QpackEncoder
+    qpack_encoder_init(@enc)
+
+    var buf: [8]u8
+    let ret: i32 = qpack_encode_prefix(@enc, @buf[0], 8)
+    if ret != 2
+        return 1
+    if buf[0] != 0
+        return 2
+    if buf[1] != 0
+        return 3
+    return 0
+
+[[test]]
+fn test_qpack_encode_indexed_static() -> i32
+    var buf: [8]u8
+    # Encode :status 200 (index 25)
+    let ret: i32 = qpack_encode_indexed_static(25, @buf[0], 8)
+    if ret != 1
+        return 1
+    # Should be 11011001 = 0xD9 (1 1 011001)
+    if buf[0] != 0xD9
+        return 2
+    return 0
+
+[[test]]
+fn test_qpack_encode_literal_name_ref_static() -> i32
+    var buf: [64]u8
+    var value: Span<u8>
+    value.ptr = "/api/users"
+    value.len = 10
+
+    # Encode :path with custom value (index 1)
+    let ret: i32 = qpack_encode_literal_name_ref_static(1, value, @buf[0], 64)
+    if ret < 0
+        return 1
+    # Should start with 0101xxxx pattern
+    if (buf[0] & 0xF0) != 0x50
+        return 2
+    return 0
+
+[[test]]
+fn test_qpack_encode_literal() -> i32
+    var buf: [64]u8
+    var name: Span<u8>
+    var value: Span<u8>
+    name.ptr = "x-custom"
+    name.len = 8
+    value.ptr = "custom-value"
+    value.len = 12
+
+    let ret: i32 = qpack_encode_literal(name, value, @buf[0], 64)
+    if ret < 0
+        return 1
+    # Should start with 001xxxxx pattern
+    if (buf[0] & 0xE0) != 0x20
+        return 2
+    return 0
+
+# ============================================================================
+# Decoder Tests
+# ============================================================================
+
+[[test]]
+fn test_qpack_decoder_init() -> i32
+    var dec: QpackDecoder
+    qpack_decoder_init(@dec)
+    if dec.dynamic_table.count != 0
+        return 1
+    if dec.known_received_count != 0
+        return 2
+    return 0
+
+[[test]]
+fn test_qpack_decode_prefix() -> i32
+    var dec: QpackDecoder
+    qpack_decoder_init(@dec)
+
+    var buf: [8]u8
+    buf[0] = 0x00  # RIC = 0
+    buf[1] = 0x00  # Delta Base = 0
+
+    var ric: i64 = 0
+    var base: i64 = 0
+    let ret: i32 = qpack_decode_prefix(@dec, @buf[0], 8, @ric, @base)
+    if ret != 2
+        return 1
+    if ric != 0
+        return 2
+    if base != 0
+        return 3
+    return 0
+
+[[test]]
+fn test_qpack_decode_indexed_static() -> i32
+    var dec: QpackDecoder
+    qpack_decoder_init(@dec)
+
+    var buf: [8]u8
+    buf[0] = 0xD9  # Indexed, static, index 25 (:status 200)
+
+    var field: QpackField
+    let ret: i32 = qpack_decode_indexed(@dec, @buf[0], 8, @field)
+    if ret != 1
+        return 1
+    if field.name.len != 7  # ":status"
+        return 2
+    if field.value.len != 3  # "200"
+        return 3
+    return 0
+
+[[test]]
+fn test_qpack_decode_indexed_method_get() -> i32
+    var dec: QpackDecoder
+    qpack_decoder_init(@dec)
+
+    var buf: [8]u8
+    buf[0] = 0xD1  # Indexed, static, index 17 (:method GET)
+
+    var field: QpackField
+    let ret: i32 = qpack_decode_indexed(@dec, @buf[0], 8, @field)
+    if ret != 1
+        return 1
+    if field.value.len != 3  # "GET"
+        return 2
+    return 0
+
+# ============================================================================
+# Stream Instruction Tests
+# ============================================================================
+
+[[test]]
+fn test_qpack_encode_set_capacity() -> i32
+    var buf: [8]u8
+    let ret: i32 = qpack_encode_set_capacity(4096, @buf[0], 8)
+    if ret < 0
+        return 1
+    # Should start with 001xxxxx
+    if (buf[0] & 0xE0) != 0x20
+        return 2
+    return 0
+
+[[test]]
+fn test_qpack_encode_section_ack() -> i32
+    var buf: [8]u8
+    let ret: i32 = qpack_encode_section_ack(4, @buf[0], 8)
+    if ret != 1
+        return 1
+    # Should be 10000100 = 0x84
+    if buf[0] != 0x84
+        return 2
+    return 0
+
+[[test]]
+fn test_qpack_encode_stream_cancel() -> i32
+    var buf: [8]u8
+    let ret: i32 = qpack_encode_stream_cancel(8, @buf[0], 8)
+    if ret != 1
+        return 1
+    # Should be 01001000 = 0x48
+    if buf[0] != 0x48
+        return 2
+    return 0
+
+[[test]]
+fn test_qpack_encode_insert_count_inc() -> i32
+    var buf: [8]u8
+    let ret: i32 = qpack_encode_insert_count_inc(5, @buf[0], 8)
+    if ret != 1
+        return 1
+    # Should be 00000101 = 0x05
+    if buf[0] != 0x05
+        return 2
+    return 0
+
+[[test]]
+fn test_qpack_encode_insert_name_ref() -> i32
+    var buf: [32]u8
+    var value: Span<u8>
+    value.ptr = "test"
+    value.len = 4
+
+    # Insert with static name reference
+    let ret: i32 = qpack_encode_insert_name_ref(1, 5, value, @buf[0], 32)
+    if ret < 0
+        return 1
+    # Should start with 11xxxxxx (static)
+    if (buf[0] & 0xC0) != 0xC0
+        return 2
+    return 0
+
+# ============================================================================
+# Entry Size Calculation
+# ============================================================================
+
+[[test]]
+fn test_qpack_entry_size() -> i32
+    let size: i32 = qpack_entry_size(10, 20)
+    # 10 + 20 + 32 (overhead) = 62
+    if size != 62
+        return 1
+    return 0
+

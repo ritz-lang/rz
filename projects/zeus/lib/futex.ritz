@@ -1,0 +1,152 @@
+# lib/futex.ritz - Futex-based signaling for efficient wakeup
+#
+# Linux futex (fast userspace mutex) provides efficient blocking:
+# - No syscall when data is available (just check memory)
+# - Blocks in kernel when waiting
+# - Wake syscall only when needed
+#
+# Strategy: spin briefly, then block
+# Most requests complete quickly, so spinning avoids syscall overhead.
+# For slow requests, we block to avoid wasting CPU.
+
+import ritzlib.sys
+import lib.control
+
+# ============================================================================
+# Syscall numbers and constants
+# ============================================================================
+
+const SYS_FUTEX: i64 = 202
+
+# Futex operations
+const FUTEX_WAIT: i32 = 0
+const FUTEX_WAKE: i32 = 1
+const FUTEX_WAIT_PRIVATE: i32 = 128      # FUTEX_WAIT | FUTEX_PRIVATE_FLAG
+const FUTEX_WAKE_PRIVATE: i32 = 129      # FUTEX_WAKE | FUTEX_PRIVATE_FLAG
+
+# Error codes
+const EAGAIN: i32 = 11
+const ETIMEDOUT: i32 = 110
+
+# ============================================================================
+# Raw Futex Operations
+# ============================================================================
+
+# Wait on a futex word
+# Blocks if *addr == val, until woken or timeout
+# timeout_ns: timeout in nanoseconds (0 = no timeout... actually means immediate return)
+# Returns 0 on wake, -EAGAIN if value doesn't match, -ETIMEDOUT on timeout
+pub fn futex_wait(addr: *i32, val: i32) -> i32
+    # Note: passing null for timeout means wait forever
+    return syscall4(SYS_FUTEX, addr as i64, FUTEX_WAIT_PRIVATE as i64, val as i64, 0) as i32
+
+# Wait on a futex with timeout (milliseconds)
+pub fn futex_wait_timeout(addr: *i32, val: i32, timeout_ms: i64) -> i32
+    if timeout_ms <= 0
+        # Immediate check, no blocking
+        return 0
+
+    # Build timespec on stack
+    # struct timespec { i64 tv_sec; i64 tv_nsec; }
+    var ts: [2]i64
+    ts[0] = timeout_ms / 1000              # seconds
+    ts[1] = (timeout_ms % 1000) * 1000000  # nanoseconds
+
+    return syscall4(SYS_FUTEX, addr as i64, FUTEX_WAIT_PRIVATE as i64, val as i64, @ts[0] as i64) as i32
+
+# Wake waiters on a futex word
+# n: maximum number of waiters to wake
+# Returns number of waiters woken
+pub fn futex_wake(addr: *i32, n: i32) -> i32
+    return syscall3(SYS_FUTEX, addr as i64, FUTEX_WAKE_PRIVATE as i64, n as i64) as i32
+
+# ============================================================================
+# High-Level Signaling
+# ============================================================================
+
+# Signal that a request is available (Valet -> Worker)
+pub fn signal_request_available(cb: *ControlBlock)
+    # Increment futex value (acts as a sequence number)
+    cb.req_futex = cb.req_futex + 1
+
+    # Wake one waiter
+    futex_wake(@cb.req_futex, 1)
+
+# Signal that a response is available (Worker -> Valet)
+pub fn signal_response_available(cb: *ControlBlock)
+    # Increment futex value
+    cb.resp_futex = cb.resp_futex + 1
+
+    # Wake one waiter
+    futex_wake(@cb.resp_futex, 1)
+
+# ============================================================================
+# Spin-then-Wait Pattern
+# ============================================================================
+
+# Wait for a request, spinning briefly then blocking
+# spin_iters: number of spin iterations before blocking
+# timeout_ms: max time to block (0 = forever)
+# Returns 0 if request available, -1 on timeout
+pub fn spin_wait_request(cb: *ControlBlock, spin_iters: i32, timeout_ms: i64) -> i32
+    # Fast path: check if request is already available
+    if control_block_req_empty(cb) == 0
+        return 0
+
+    # Spin phase
+    var i: i32 = 0
+    while i < spin_iters
+        if control_block_req_empty(cb) == 0
+            return 0
+        i = i + 1
+
+    # Block phase: wait on futex
+    let current_val: i32 = cb.req_futex
+
+    # Loop until request available or timeout
+    while control_block_req_empty(cb) != 0
+        let result: i32 = futex_wait_timeout(@cb.req_futex, current_val, timeout_ms)
+
+        # Check for timeout
+        if result == (0 - ETIMEDOUT)
+            if control_block_req_empty(cb) != 0
+                return -1  # Timeout with no request
+            return 0  # Request arrived just in time
+
+        # EAGAIN means value changed, re-check
+        if control_block_req_empty(cb) == 0
+            return 0
+
+    return 0
+
+# Wait for a response, spinning briefly then blocking
+pub fn spin_wait_response(cb: *ControlBlock, spin_iters: i32, timeout_ms: i64) -> i32
+    # Fast path: check if response is already available
+    if control_block_resp_empty(cb) == 0
+        return 0
+
+    # Spin phase
+    var i: i32 = 0
+    while i < spin_iters
+        if control_block_resp_empty(cb) == 0
+            return 0
+        i = i + 1
+
+    # Block phase: wait on futex
+    let current_val: i32 = cb.resp_futex
+
+    # Loop until response available or timeout
+    while control_block_resp_empty(cb) != 0
+        let result: i32 = futex_wait_timeout(@cb.resp_futex, current_val, timeout_ms)
+
+        # Check for timeout
+        if result == (0 - ETIMEDOUT)
+            if control_block_resp_empty(cb) != 0
+                return -1  # Timeout with no response
+            return 0  # Response arrived just in time
+
+        # EAGAIN means value changed, re-check
+        if control_block_resp_empty(cb) == 0
+            return 0
+
+    return 0

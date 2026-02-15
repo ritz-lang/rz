@@ -1,0 +1,298 @@
+# examples/63_executor - Test the async executor with io_uring
+#
+# Minimal test to debug function pointer calls in executor
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.uring
+import ritzlib.executor
+
+# ============================================================================
+# Test 1: Direct function pointer call
+# ============================================================================
+
+struct SimpleFuture
+    value: i32
+
+fn simple_poll(self_ptr: *u8) -> i32
+    prints("simple_poll called\n")
+    let self: *SimpleFuture = self_ptr as *SimpleFuture
+    return self.value
+
+fn test_fn_ptr() -> i32
+    prints("test_fn_ptr... ")
+
+    var future: SimpleFuture
+    future.value = 42
+
+    # Direct call
+    prints("direct call: ")
+    let r1: i32 = simple_poll(&future as *u8)
+    print_int(r1 as i64)
+    prints("\n")
+
+    # Via function pointer
+    prints("via pointer: ")
+    let poll_fn: fn(*u8) -> i32 = simple_poll
+    let r2: i32 = poll_fn(&future as *u8)
+    print_int(r2 as i64)
+    prints("\n")
+
+    if r1 != 42
+        prints("FAIL\n")
+        return 1
+
+    if r2 != 42
+        prints("FAIL\n")
+        return 1
+
+    prints("OK\n")
+    return 0
+
+# ============================================================================
+# Test 2: Simple block_on without io_uring
+# ============================================================================
+
+fn simple_block_on(future_ptr: *u8, poll_fn: fn(*u8) -> i32) -> i32
+    prints("simple_block_on entered\n")
+    let result: i32 = poll_fn(future_ptr)
+    prints("simple_block_on returning\n")
+    return result
+
+fn test_simple_block_on() -> i32
+    prints("test_simple_block_on... ")
+
+    var future: SimpleFuture
+    future.value = 99
+
+    let poll_fn: fn(*u8) -> i32 = simple_poll
+    let result: i32 = simple_block_on(&future as *u8, poll_fn)
+
+    if result != 99
+        prints("FAIL: expected 99, got ")
+        print_int(result as i64)
+        prints("\n")
+        return 1
+
+    prints("OK\n")
+    return 0
+
+# ============================================================================
+# Main
+# ============================================================================
+
+# ============================================================================
+# Test 3: Executor init/destroy
+# ============================================================================
+
+fn test_executor_init() -> i32
+    prints("test_executor_init... ")
+
+    var exec: Executor
+    prints("calling init... ")
+    let ret: i32 = executor_init(&exec)
+    print_int(ret as i64)
+    prints("\n")
+
+    if ret < 0
+        prints("FAIL: init failed\n")
+        return 1
+
+    prints("calling destroy... ")
+    executor_destroy(&exec)
+    prints("done\n")
+
+    prints("OK\n")
+    return 0
+
+# ============================================================================
+# Test 4: block_on with Executor
+# ============================================================================
+
+fn my_block_on(exec: *Executor, future_ptr: *u8, poll_fn: fn(*u8) -> i32) -> i32
+    prints("my_block_on: entering\n")
+    prints("my_block_on: calling poll_fn\n")
+    let result: i32 = poll_fn(future_ptr)
+    prints("my_block_on: poll returned\n")
+    return result
+
+fn test_executor_block_on() -> i32
+    prints("test_executor_block_on... ")
+
+    var exec: Executor
+    let init_ret: i32 = executor_init(&exec)
+    if init_ret < 0
+        prints("FAIL: init failed\n")
+        return 1
+
+    var future: SimpleFuture
+    future.value = 77
+
+    # First test local block_on
+    prints("calling my_block_on... ")
+    let poll_fn1: fn(*u8) -> i32 = simple_poll
+    let result1: i32 = my_block_on(&exec, &future as *u8, poll_fn1)
+    prints("local got ")
+    print_int(result1 as i64)
+    prints("\n")
+
+    # Now test imported block_on
+    future.value = 88  # Different value
+    prints("calling imported block_on... ")
+    let poll_fn2: fn(*u8) -> i32 = simple_poll
+    let result: i32 = block_on(&exec, &future as *u8, poll_fn2)
+    prints("got ")
+    print_int(result as i64)
+    prints("\n")
+
+    executor_destroy(&exec)
+
+    if result != 88
+        prints("FAIL: expected 88, got ")
+        print_int(result as i64)
+        prints("\n")
+        return 1
+
+    prints("OK\n")
+    return 0
+
+# ============================================================================
+# Test 5: Pipe I/O with executor
+# ============================================================================
+
+struct PipeReadFuture
+    state: i32
+    exec: *Executor
+    read_fd: i32
+    buf: [16]u8
+    bytes_read: i32
+
+fn piperead_poll(self_ptr: *u8) -> i32
+    let self: *PipeReadFuture = self_ptr as *PipeReadFuture
+
+    if self.state == 0
+        # State 0: Submit read request
+        let exec_ptr: *Executor = self.exec
+        let fd: i32 = self.read_fd
+        let buf_ptr: *u8 = &self.buf[0]
+        let result: i32 = exec_async_read(exec_ptr, fd, buf_ptr, 16, 0)
+
+        if result == POLL_PENDING
+            self.state = 1
+            return POLL_PENDING
+
+        # Immediate result
+        self.bytes_read = result
+        self.state = 2
+        return result
+
+    if self.state == 1
+        # State 1: Waiting for read completion - check waker_io_result
+        let exec_ptr: *Executor = self.exec
+        let io_res: i32 = exec_ptr.waker_io_result
+        if io_res != 0
+            exec_ptr.waker_io_result = 0
+            self.bytes_read = io_res
+            self.state = 2
+            return io_res
+
+        # Still pending - re-register
+        let fd: i32 = self.read_fd
+        let buf_ptr: *u8 = &self.buf[0]
+        let result: i32 = exec_async_read(exec_ptr, fd, buf_ptr, 16, 0)
+        return result
+
+    # State 2: Already completed
+    return self.bytes_read
+
+fn test_pipe_io() -> i32
+    prints("test_pipe_io... ")
+
+    var exec: Executor
+    let init_ret: i32 = executor_init(&exec)
+    if init_ret < 0
+        prints("FAIL: executor init failed\n")
+        return 1
+
+    # Create a pipe
+    var fds: [2]i32
+    let pipe_ret: i32 = sys_pipe(&fds[0])
+    if pipe_ret < 0
+        prints("FAIL: pipe creation failed\n")
+        executor_destroy(&exec)
+        return 1
+
+    let read_fd: i32 = fds[0]
+    let write_fd: i32 = fds[1]
+
+    # Write some data to the pipe first
+    var write_buf: [8]u8
+    write_buf[0] = 72   # 'H'
+    write_buf[1] = 101  # 'e'
+    write_buf[2] = 108  # 'l'
+    write_buf[3] = 108  # 'l'
+    write_buf[4] = 111  # 'o'
+    write_buf[5] = 0
+    let written: i64 = sys_write(write_fd, &write_buf[0], 5)
+
+    # Create the future
+    var future: PipeReadFuture
+    future.state = 0
+    future.exec = &exec
+    future.read_fd = read_fd
+    future.bytes_read = 0
+
+    # Zero the buffer
+    var i: i32 = 0
+    while i < 16
+        future.buf[i] = 0
+        i += 1
+
+    # Run the future
+    let poll_fn: fn(*u8) -> i32 = piperead_poll
+    let result: i32 = block_on(&exec, &future as *u8, poll_fn)
+
+    # Clean up
+    sys_close(read_fd)
+    sys_close(write_fd)
+    executor_destroy(&exec)
+
+    if result < 0
+        prints("FAIL: read returned error ")
+        print_int(result as i64)
+        prints("\n")
+        return 1
+
+    if result != 5
+        prints("FAIL: expected 5 bytes, got ")
+        print_int(result as i64)
+        prints("\n")
+        return 1
+
+    # Verify data
+    if future.buf[0] != 72
+        prints("FAIL: wrong data read\n")
+        return 1
+
+    prints("OK\n")
+    return 0
+
+fn main() -> i32
+    prints("=== Executor Tests ===\n\n")
+
+    var failures: i32 = 0
+
+    failures += test_fn_ptr()
+    failures += test_simple_block_on()
+    failures += test_executor_init()
+    failures += test_executor_block_on()
+    failures += test_pipe_io()
+
+    prints("\n")
+    if failures > 0
+        print_int(failures as i64)
+        prints(" test(s) FAILED\n")
+        return 1
+
+    prints("All executor tests PASSED!\n")
+    return 0

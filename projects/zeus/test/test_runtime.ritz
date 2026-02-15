@@ -1,0 +1,412 @@
+# test/test_runtime.ritz - Tests for Zeus worker runtime
+#
+# The runtime is the core serve loop that:
+#   - Attaches to shared memory
+#   - Polls for requests (spin-then-wait)
+#   - Dispatches to user handlers
+#   - Writes responses back
+#
+# Design goals:
+#   - Zero allocations in hot path
+#   - No blocking, no locking
+#   - Minimal syscalls (futex only when necessary)
+
+import ritzlib.sys
+import ritzlib.io
+import helpers
+import lib.runtime
+import lib.shm
+import lib.control
+import lib.ring
+import lib.arena
+import lib.worker
+
+# ============================================================================
+# Test: Runtime Configuration
+# ============================================================================
+
+[[test]]
+fn test_runtime_config_defaults() -> i32
+    var cfg: RuntimeConfig
+    runtime_config_init(@cfg)
+
+    if cfg.spin_iterations <= 0
+        "FAIL: spin_iterations should be > 0\n"
+        return 1
+
+    if cfg.poll_timeout_ms <= 0
+        "FAIL: poll_timeout_ms should be > 0\n"
+        return 1
+
+    return 0
+
+[[test]]
+fn test_runtime_config_custom() -> i32
+    var cfg: RuntimeConfig
+    runtime_config_init(@cfg)
+
+    cfg.spin_iterations = 500
+    cfg.poll_timeout_ms = 100
+    cfg.max_batch_size = 16
+
+    let r1: i32 = assert_eq_i32(cfg.spin_iterations, 500)
+    if r1 != 0
+        return r1
+
+    let r2: i32 = assert_eq_i32(cfg.poll_timeout_ms, 100)
+    if r2 != 0
+        return r2
+
+    return 0
+
+# ============================================================================
+# Test: Runtime Context Initialization
+# ============================================================================
+
+[[test]]
+fn test_runtime_context_init() -> i32
+    # Create shm for testing
+    var shm_cfg: ShmConfig
+    shm_config_default(@shm_cfg)
+
+    var region: ShmRegion
+    let shm_result: i32 = shm_create(@region, @shm_cfg)
+    if shm_result < 0
+        "FAIL: shm_create failed\n"
+        return 1
+
+    # Initialize runtime
+    var cfg: RuntimeConfig
+    runtime_config_init(@cfg)
+
+    var rt: RuntimeContext
+    let result: i32 = runtime_init(@rt, @cfg, region.fd, region.size)
+    if result < 0
+        "FAIL: runtime_init failed\n"
+        shm_destroy(@region)
+        return 1
+
+    let r1: i32 = assert_eq_i32(rt.state, RUNTIME_STATE_IDLE)
+    if r1 != 0
+        runtime_destroy(@rt)
+        shm_destroy(@region)
+        return r1
+
+    runtime_destroy(@rt)
+    shm_destroy(@region)
+    return 0
+
+# ============================================================================
+# Test: Handler Registration
+# ============================================================================
+
+# Simple echo handler for testing
+fn echo_handler(ctx: *HandlerContext) -> i32
+    # Just copy request body to response
+    ctx.response.status = 200
+    ctx.response.body_offset = ctx.request.body_offset
+    ctx.response.body_len = ctx.request.body_len
+    return 0
+
+[[test]]
+fn test_runtime_register_handler() -> i32
+    var shm_cfg: ShmConfig
+    shm_config_default(@shm_cfg)
+
+    var region: ShmRegion
+    shm_create(@region, @shm_cfg)
+
+    var cfg: RuntimeConfig
+    runtime_config_init(@cfg)
+
+    var rt: RuntimeContext
+    runtime_init(@rt, @cfg, region.fd, region.size)
+
+    # Register a handler
+    let result: i32 = runtime_register_handler(@rt, c"/echo", echo_handler)
+    if result < 0
+        "FAIL: register_handler failed\n"
+        runtime_destroy(@rt)
+        shm_destroy(@region)
+        return 1
+
+    # Check it's registered
+    let handler: *u8 = runtime_find_handler(@rt, c"/echo", 5)
+    if handler == null
+        "FAIL: handler not found\n"
+        runtime_destroy(@rt)
+        shm_destroy(@region)
+        return 1
+
+    runtime_destroy(@rt)
+    shm_destroy(@region)
+    return 0
+
+[[test]]
+fn test_runtime_default_handler() -> i32
+    var shm_cfg: ShmConfig
+    shm_config_default(@shm_cfg)
+
+    var region: ShmRegion
+    shm_create(@region, @shm_cfg)
+
+    var cfg: RuntimeConfig
+    runtime_config_init(@cfg)
+
+    var rt: RuntimeContext
+    runtime_init(@rt, @cfg, region.fd, region.size)
+
+    # Set default handler
+    runtime_set_default_handler(@rt, echo_handler)
+
+    # Finding unknown path should return default
+    let handler: *u8 = runtime_find_handler(@rt, c"/unknown", 8)
+    if handler == null
+        "FAIL: default handler not returned\n"
+        runtime_destroy(@rt)
+        shm_destroy(@region)
+        return 1
+
+    runtime_destroy(@rt)
+    shm_destroy(@region)
+    return 0
+
+# ============================================================================
+# Test: Request Processing
+# ============================================================================
+
+[[test]]
+fn test_runtime_process_single_request() -> i32
+    var shm_cfg: ShmConfig
+    shm_config_default(@shm_cfg)
+
+    var region: ShmRegion
+    shm_create(@region, @shm_cfg)
+
+    var cfg: RuntimeConfig
+    runtime_config_init(@cfg)
+
+    var rt: RuntimeContext
+    runtime_init(@rt, @cfg, region.fd, region.size)
+    runtime_set_default_handler(@rt, echo_handler)
+
+    # Simulate Valet submitting a request
+    let cb: *ControlBlock = shm_get_control_block(@region)
+    let req_ring: *RequestSlot = shm_get_request_ring(@region)
+
+    var arena: DataArena
+    shm_get_arena(@region, @arena)
+
+    # Write request path
+    let path: *u8 = data_arena_alloc(@arena, 8)
+    *(path + 0) = 0x2F  # '/'
+    *(path + 1) = 0x74  # 't'
+    *(path + 2) = 0x65  # 'e'
+    *(path + 3) = 0x73  # 's'
+    *(path + 4) = 0x74  # 't'
+
+    let slot_idx: i64 = control_block_slot_index(cb, cb.req_write_idx)
+    let slot: *RequestSlot = req_ring + slot_idx
+    request_slot_init(slot)
+    slot.id = 1
+    slot.method = HTTP_METHOD_GET
+    slot.path_offset = data_arena_ptr_to_offset(@arena, path) as u32
+    slot.path_len = 5
+    slot.flags = REQ_FLAG_COMPLETE
+    control_block_req_write_inc(cb)
+
+    # Process one request
+    let processed: i32 = runtime_poll_and_process(@rt, 1)
+    if processed != 1
+        "FAIL: should process 1 request, got {processed}\n"
+        runtime_destroy(@rt)
+        shm_destroy(@region)
+        return 1
+
+    # Check response was written
+    let resp_count: i64 = control_block_resp_count(cb)
+    if resp_count != 1
+        "FAIL: should have 1 response\n"
+        runtime_destroy(@rt)
+        shm_destroy(@region)
+        return 1
+
+    runtime_destroy(@rt)
+    shm_destroy(@region)
+    return 0
+
+[[test]]
+fn test_runtime_batch_processing() -> i32
+    var shm_cfg: ShmConfig
+    shm_config_default(@shm_cfg)
+
+    var region: ShmRegion
+    shm_create(@region, @shm_cfg)
+
+    var cfg: RuntimeConfig
+    runtime_config_init(@cfg)
+    cfg.max_batch_size = 8
+
+    var rt: RuntimeContext
+    runtime_init(@rt, @cfg, region.fd, region.size)
+    runtime_set_default_handler(@rt, echo_handler)
+
+    # Submit 5 requests
+    let cb: *ControlBlock = shm_get_control_block(@region)
+    let req_ring: *RequestSlot = shm_get_request_ring(@region)
+
+    var i: i32 = 0
+    while i < 5
+        let slot_idx: i64 = control_block_slot_index(cb, cb.req_write_idx)
+        let slot: *RequestSlot = req_ring + slot_idx
+        request_slot_init(slot)
+        slot.id = (i + 1) as u64
+        slot.method = HTTP_METHOD_GET
+        slot.flags = REQ_FLAG_COMPLETE
+        control_block_req_write_inc(cb)
+        i = i + 1
+
+    # Process batch
+    let processed: i32 = runtime_poll_and_process(@rt, 10)
+    if processed != 5
+        "FAIL: should process 5 requests, got {processed}\n"
+        runtime_destroy(@rt)
+        shm_destroy(@region)
+        return 1
+
+    # All responses should be written
+    let resp_count: i64 = control_block_resp_count(cb)
+    if resp_count != 5
+        "FAIL: should have 5 responses, got {resp_count}\n"
+        runtime_destroy(@rt)
+        shm_destroy(@region)
+        return 1
+
+    runtime_destroy(@rt)
+    shm_destroy(@region)
+    return 0
+
+# ============================================================================
+# Test: Runtime State Machine
+# ============================================================================
+
+[[test]]
+fn test_runtime_state_transitions() -> i32
+    var shm_cfg: ShmConfig
+    shm_config_default(@shm_cfg)
+
+    var region: ShmRegion
+    shm_create(@region, @shm_cfg)
+
+    var cfg: RuntimeConfig
+    runtime_config_init(@cfg)
+
+    var rt: RuntimeContext
+    runtime_init(@rt, @cfg, region.fd, region.size)
+
+    # Initial state: IDLE
+    let r1: i32 = assert_eq_i32(rt.state, RUNTIME_STATE_IDLE)
+    if r1 != 0
+        runtime_destroy(@rt)
+        shm_destroy(@region)
+        return r1
+
+    # Start: IDLE -> RUNNING
+    runtime_start(@rt)
+    let r2: i32 = assert_eq_i32(rt.state, RUNTIME_STATE_RUNNING)
+    if r2 != 0
+        runtime_destroy(@rt)
+        shm_destroy(@region)
+        return r2
+
+    # Stop: RUNNING -> STOPPING
+    runtime_stop(@rt)
+    let r3: i32 = assert_eq_i32(rt.state, RUNTIME_STATE_STOPPING)
+    if r3 != 0
+        runtime_destroy(@rt)
+        shm_destroy(@region)
+        return r3
+
+    runtime_destroy(@rt)
+    shm_destroy(@region)
+    return 0
+
+# ============================================================================
+# Test: Statistics
+# ============================================================================
+
+[[test]]
+fn test_runtime_stats() -> i32
+    var shm_cfg: ShmConfig
+    shm_config_default(@shm_cfg)
+
+    var region: ShmRegion
+    shm_create(@region, @shm_cfg)
+
+    var cfg: RuntimeConfig
+    runtime_config_init(@cfg)
+
+    var rt: RuntimeContext
+    runtime_init(@rt, @cfg, region.fd, region.size)
+    runtime_set_default_handler(@rt, echo_handler)
+
+    # Submit and process some requests
+    let cb: *ControlBlock = shm_get_control_block(@region)
+    let req_ring: *RequestSlot = shm_get_request_ring(@region)
+
+    var i: i32 = 0
+    while i < 3
+        let slot_idx: i64 = control_block_slot_index(cb, cb.req_write_idx)
+        let slot: *RequestSlot = req_ring + slot_idx
+        request_slot_init(slot)
+        slot.id = (i + 1) as u64
+        slot.method = HTTP_METHOD_GET
+        slot.flags = REQ_FLAG_COMPLETE
+        control_block_req_write_inc(cb)
+        i = i + 1
+
+    runtime_poll_and_process(@rt, 10)
+
+    # Check stats
+    var stats: RuntimeStats
+    runtime_get_stats(@rt, @stats)
+
+    if stats.requests_processed != 3
+        "FAIL: should have 3 requests processed\n"
+        runtime_destroy(@rt)
+        shm_destroy(@region)
+        return 1
+
+    runtime_destroy(@rt)
+    shm_destroy(@region)
+    return 0
+
+# ============================================================================
+# Test: Empty Poll
+# ============================================================================
+
+[[test]]
+fn test_runtime_poll_empty() -> i32
+    var shm_cfg: ShmConfig
+    shm_config_default(@shm_cfg)
+
+    var region: ShmRegion
+    shm_create(@region, @shm_cfg)
+
+    var cfg: RuntimeConfig
+    runtime_config_init(@cfg)
+
+    var rt: RuntimeContext
+    runtime_init(@rt, @cfg, region.fd, region.size)
+
+    # Poll with no requests
+    let processed: i32 = runtime_poll_and_process(@rt, 10)
+    if processed != 0
+        "FAIL: should process 0 requests on empty ring\n"
+        runtime_destroy(@rt)
+        shm_destroy(@region)
+        return 1
+
+    runtime_destroy(@rt)
+    shm_destroy(@region)
+    return 0

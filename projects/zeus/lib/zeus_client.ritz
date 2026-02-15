@@ -1,0 +1,716 @@
+# lib/zeus_client.ritz - Client library for connecting to Zeus daemon
+#
+# The Zeus client connects to the Zeus daemon to:
+#   - Receive worker shm file descriptors via SCM_RIGHTS
+#   - Attach to shared memory regions
+#   - Submit requests via ring buffers
+#   - Collect responses via ring buffers
+#   - Use socket as wakeup mechanism when rings empty
+#
+# Protocol:
+#   Client                              Daemon
+#     |                                    |
+#     |-- HELLO (version) --------------->|
+#     |<-- WELCOME (worker_count) --------|
+#     |                                    |
+#     |<-- WORKER_INFO + fd (x N) --------|
+#     |                                    |
+#     |-- REQUEST_WORKER ---------------->| (if need more workers)
+#     |<-- WORKER_INFO + fd --------------|
+#     |                                    |
+#   [IPC via shared memory rings]
+
+import ritzlib.sys
+import lib.shm
+import lib.control
+import lib.ring
+import lib.arena
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+pub const ZEUS_PROTOCOL_VERSION: u8 = 1
+
+# Client states
+pub const ZEUS_CLIENT_STATE_INIT: i32 = 0
+pub const ZEUS_CLIENT_STATE_CONNECTING: i32 = 1
+pub const ZEUS_CLIENT_STATE_CONNECTED: i32 = 2
+pub const ZEUS_CLIENT_STATE_READY: i32 = 3
+pub const ZEUS_CLIENT_STATE_ERROR: i32 = 4
+pub const ZEUS_CLIENT_STATE_CLOSED: i32 = 5
+
+# Client message types
+pub const CLIENT_MSG_HELLO: u8 = 1
+pub const CLIENT_MSG_REQUEST_WORKER: u8 = 2
+pub const CLIENT_MSG_RELEASE_WORKER: u8 = 3
+pub const CLIENT_MSG_PING: u8 = 4
+pub const CLIENT_MSG_GOODBYE: u8 = 5
+
+# Daemon message types
+pub const DAEMON_MSG_WELCOME: u8 = 1
+pub const DAEMON_MSG_WORKER_INFO: u8 = 2
+pub const DAEMON_MSG_ERROR: u8 = 3
+pub const DAEMON_MSG_PONG: u8 = 4
+pub const DAEMON_MSG_GOODBYE: u8 = 5
+
+# Default config
+const DEFAULT_MAX_WORKERS: i32 = 16
+const DEFAULT_CONNECT_TIMEOUT_MS: i32 = 5000
+
+# Syscall numbers
+const SYS_SOCKET: i64 = 41
+const SYS_CONNECT: i64 = 42
+const SYS_SOCKETPAIR: i64 = 53
+const SYS_SENDMSG: i64 = 46
+const SYS_RECVMSG: i64 = 47
+const SYS_FCNTL: i64 = 72
+const SYS_MEMFD_CREATE: i64 = 319
+
+# Socket constants
+const AF_UNIX: i32 = 1
+const SOCK_STREAM: i32 = 1
+const SOL_SOCKET: i32 = 1
+const SCM_RIGHTS: i32 = 1
+
+# ============================================================================
+# Syscall wrappers for tests
+# ============================================================================
+
+pub fn sys_socketpair(domain: i32, stype: i32, protocol: i32, sv: *i32) -> i32
+    return syscall4(SYS_SOCKETPAIR, domain as i64, stype as i64, protocol as i64, sv as i64) as i32
+
+# Note: sys_memfd_create is in lib/shm.ritz
+
+# ============================================================================
+# Configuration
+# ============================================================================
+
+pub struct ZeusClientConfig
+    max_workers: i32            # Maximum number of workers to manage
+    connect_timeout_ms: i32     # Connection timeout in milliseconds
+
+pub fn zeus_client_config_default(cfg: *ZeusClientConfig)
+    cfg.max_workers = DEFAULT_MAX_WORKERS
+    cfg.connect_timeout_ms = DEFAULT_CONNECT_TIMEOUT_MS
+
+pub fn zeus_client_config_init(cfg: *ZeusClientConfig, max_workers: i32, connect_timeout_ms: i32)
+    cfg.max_workers = max_workers
+    cfg.connect_timeout_ms = connect_timeout_ms
+
+# ============================================================================
+# Worker Handle
+# ============================================================================
+
+pub struct WorkerHandle
+    slot_idx: i32               # Slot index from daemon
+    shm_fd: i32                 # Shared memory fd (received via SCM_RIGHTS)
+    shm_size: i64               # Size of shared memory region
+    shm_base: *u8               # Base address after mmap
+    attached: i32               # 1 if attached to shm, 0 otherwise
+
+pub fn worker_handle_init(handle: *WorkerHandle)
+    handle.slot_idx = -1
+    handle.shm_fd = -1
+    handle.shm_size = 0
+    handle.shm_base = null
+    handle.attached = 0
+
+pub fn worker_handle_destroy(handle: *WorkerHandle)
+    if handle.attached != 0 && handle.shm_base != null
+        sys_munmap(handle.shm_base, handle.shm_size)
+        handle.shm_base = null
+        handle.attached = 0
+
+    if handle.shm_fd >= 0
+        sys_close(handle.shm_fd)
+        handle.shm_fd = -1
+
+    handle.slot_idx = -1
+    handle.shm_size = 0
+
+# ============================================================================
+# Valet Client
+# ============================================================================
+
+pub struct ZeusClient
+    config: ZeusClientConfig   # Configuration
+    state: i32                  # Current state
+    socket_fd: i32              # Connection to daemon
+    _pad1: i32                  # Padding
+
+    workers: *WorkerHandle      # Array of worker handles (mmap'd)
+    worker_count: i32           # Number of attached workers
+    max_workers: i32            # Maximum workers
+
+    next_request_id: u64        # Monotonic request ID counter
+    next_dispatch_idx: i32      # Round-robin index
+    _pad2: i32                  # Padding
+
+# ============================================================================
+# Lifecycle
+# ============================================================================
+
+pub fn zeus_client_init(client: *ZeusClient, cfg: *ZeusClientConfig) -> i32
+    # Copy config
+    client.config.max_workers = cfg.max_workers
+    client.config.connect_timeout_ms = cfg.connect_timeout_ms
+
+    client.state = ZEUS_CLIENT_STATE_INIT
+    client.socket_fd = -1
+    client.worker_count = 0
+    client.max_workers = cfg.max_workers
+    client.next_request_id = 1
+    client.next_dispatch_idx = 0
+
+    # Allocate worker handles
+    let handle_size: i64 = 40  # sizeof(WorkerHandle)
+    let alloc_size: i64 = (cfg.max_workers as i64) * handle_size
+    let mmap_flags: i32 = MAP_PRIVATE + MAP_ANONYMOUS
+    let mmap_prot: i32 = PROT_READ + PROT_WRITE
+
+    let workers: *WorkerHandle = sys_mmap(0, alloc_size, mmap_prot, mmap_flags, -1, 0) as *WorkerHandle
+    if workers == (-1 as *WorkerHandle)
+        return -1
+
+    client.workers = workers
+
+    # Initialize all handles
+    var i: i32 = 0
+    while i < cfg.max_workers
+        worker_handle_init(client.workers + i)
+        i = i + 1
+
+    return 0
+
+pub fn zeus_client_destroy(client: *ZeusClient)
+    # Destroy all worker handles
+    var i: i32 = 0
+    while i < client.max_workers
+        worker_handle_destroy(client.workers + i)
+        i = i + 1
+
+    # Free worker handle array
+    if client.workers != null
+        let handle_size: i64 = 40
+        let alloc_size: i64 = (client.max_workers as i64) * handle_size
+        sys_munmap(client.workers as *u8, alloc_size)
+        client.workers = null
+
+    # Close socket
+    if client.socket_fd >= 0
+        sys_close(client.socket_fd)
+        client.socket_fd = -1
+
+    client.state = ZEUS_CLIENT_STATE_CLOSED
+
+# ============================================================================
+# Connection
+# ============================================================================
+
+# Connect to Zeus daemon
+pub fn zeus_client_connect(client: *ZeusClient, socket_path: *u8) -> i32
+    if client.state != ZEUS_CLIENT_STATE_INIT
+        return -1
+
+    client.state = ZEUS_CLIENT_STATE_CONNECTING
+
+    # Create socket
+    let fd: i32 = syscall3(SYS_SOCKET, AF_UNIX as i64, SOCK_STREAM as i64, 0) as i32
+    if fd < 0
+        client.state = ZEUS_CLIENT_STATE_ERROR
+        return fd
+
+    # Build sockaddr_un
+    var addr: [110]u8
+    var j: i32 = 0
+    while j < 110
+        addr[j] = 0
+        j = j + 1
+
+    addr[0] = AF_UNIX as u8
+    addr[1] = 0
+
+    # Copy path
+    var i: i32 = 0
+    while *(socket_path + i) != 0 && i < 107
+        addr[2 + i] = *(socket_path + i)
+        i = i + 1
+
+    # Connect
+    let result: i32 = syscall3(SYS_CONNECT, fd as i64, @addr[0] as i64, (2 + i) as i64) as i32
+    if result < 0
+        sys_close(fd)
+        client.state = ZEUS_CLIENT_STATE_ERROR
+        return result
+
+    client.socket_fd = fd
+    client.state = ZEUS_CLIENT_STATE_CONNECTED
+    return 0
+
+# ============================================================================
+# Protocol Messages
+# ============================================================================
+
+# Client -> Daemon message
+pub struct ClientMessage
+    msg_type: u8                # CLIENT_MSG_*
+    version: u8                 # Protocol version
+    _reserved: [6]u8            # Reserved for future use
+
+pub fn client_message_init(msg: *ClientMessage, msg_type: u8)
+    msg.msg_type = msg_type
+    msg.version = ZEUS_PROTOCOL_VERSION
+    var i: i32 = 0
+    while i < 6
+        msg._reserved[i] = 0
+        i = i + 1
+
+# Daemon -> Client message
+pub struct DaemonMessage
+    msg_type: u8                # DAEMON_MSG_*
+    _pad1: u8                   # Padding
+    payload_len: u16            # Payload length
+    worker_idx: i32             # Worker slot index (for WORKER_INFO)
+    shm_size: i64               # Shm size (for WORKER_INFO)
+
+# ============================================================================
+# SCM_RIGHTS Support (for receiving file descriptors)
+# ============================================================================
+
+# Control message header (for SCM_RIGHTS)
+pub struct CmsgFd
+    cmsg_len: u64               # Length including header
+    cmsg_level: i32             # SOL_SOCKET
+    cmsg_type: i32              # SCM_RIGHTS
+    fd: i32                     # The file descriptor
+    _pad: i32                   # Padding to 8-byte alignment
+
+pub fn cmsg_fd_init(cmsg: *CmsgFd, fd: i32)
+    # CMSG_LEN(sizeof(int)) on x86-64
+    cmsg.cmsg_len = 20  # sizeof(cmsghdr) + sizeof(int)
+    cmsg.cmsg_level = SOL_SOCKET
+    cmsg.cmsg_type = SCM_RIGHTS
+    cmsg.fd = fd
+    cmsg._pad = 0
+
+# msghdr for sendmsg/recvmsg
+struct MsgHdr
+    msg_name: *u8               # Optional address
+    msg_namelen: u32            # Size of address
+    _pad1: u32                  # Padding
+    msg_iov: *IoVec             # Scatter/gather array
+    msg_iovlen: u64             # Number of elements in iov
+    msg_control: *u8            # Ancillary data
+    msg_controllen: u64         # Ancillary data length
+    msg_flags: i32              # Flags (unused on send)
+    _pad2: i32                  # Padding
+
+struct IoVec
+    iov_base: *u8               # Starting address
+    iov_len: u64                # Number of bytes
+
+# ============================================================================
+# SCM_RIGHTS Send/Receive
+# ============================================================================
+
+# Send a file descriptor over a socket using SCM_RIGHTS
+pub fn scm_rights_send_fd(sock: i32, fd: i32) -> i32
+    # We need to send at least 1 byte of data with the control message
+    var dummy: u8 = 0
+
+    var iov: IoVec
+    iov.iov_base = @dummy
+    iov.iov_len = 1
+
+    # Control message buffer - needs to hold cmsghdr + fd
+    # cmsghdr is 16 bytes (len:8, level:4, type:4), fd is 4 bytes = 20 bytes
+    # But we need CMSG_SPACE which adds alignment padding to 24 bytes
+    var cmsg_buf: [24]u8
+    var i: i32 = 0
+    while i < 24
+        cmsg_buf[i] = 0
+        i = i + 1
+
+    # Fill in cmsghdr: cmsg_len (8 bytes), cmsg_level (4), cmsg_type (4)
+    let cmsg_len: u64 = 20  # CMSG_LEN(sizeof(int))
+    let cmsg_ptr: *u64 = @cmsg_buf[0] as *u64
+    *cmsg_ptr = cmsg_len
+
+    let level_ptr: *i32 = @cmsg_buf[8] as *i32
+    *level_ptr = SOL_SOCKET
+
+    let type_ptr: *i32 = @cmsg_buf[12] as *i32
+    *type_ptr = SCM_RIGHTS
+
+    # Put the fd at offset 16 (after cmsghdr)
+    let fd_ptr: *i32 = @cmsg_buf[16] as *i32
+    *fd_ptr = fd
+
+    var hdr: MsgHdr
+    hdr.msg_name = null
+    hdr.msg_namelen = 0
+    hdr.msg_iov = @iov
+    hdr.msg_iovlen = 1
+    hdr.msg_control = @cmsg_buf[0]
+    hdr.msg_controllen = 24  # CMSG_SPACE(sizeof(int))
+    hdr.msg_flags = 0
+
+    let result: i64 = syscall3(SYS_SENDMSG, sock as i64, @hdr as i64, 0)
+    if result < 0
+        return result as i32
+    return 0
+
+# Receive a file descriptor over a socket using SCM_RIGHTS
+pub fn scm_rights_recv_fd(sock: i32, out_fd: *i32) -> i32
+    *out_fd = -1
+
+    var dummy: u8 = 0
+    var iov: IoVec
+    iov.iov_base = @dummy
+    iov.iov_len = 1
+
+    var cmsg_buf: [24]u8
+    var i: i32 = 0
+    while i < 24
+        cmsg_buf[i] = 0
+        i = i + 1
+
+    var hdr: MsgHdr
+    hdr.msg_name = null
+    hdr.msg_namelen = 0
+    hdr.msg_iov = @iov
+    hdr.msg_iovlen = 1
+    hdr.msg_control = @cmsg_buf[0]
+    hdr.msg_controllen = 24
+    hdr.msg_flags = 0
+
+    let result: i64 = syscall3(SYS_RECVMSG, sock as i64, @hdr as i64, 0)
+    if result < 0
+        return result as i32
+
+    if result == 0
+        return -1  # Connection closed
+
+    # Check if we received a control message
+    if hdr.msg_controllen >= 20
+        # Extract the fd from offset 16
+        let fd_ptr: *i32 = @cmsg_buf[16] as *i32
+        *out_fd = *fd_ptr
+
+    return 0
+
+# ============================================================================
+# Send/Receive Helpers
+# ============================================================================
+
+# Send a message to daemon
+pub fn zeus_client_send(client: *ZeusClient, msg: *ClientMessage) -> i32
+    if client.socket_fd < 0
+        return -1
+
+    let result: i64 = sys_write(client.socket_fd, msg as *u8, 8)  # sizeof(ClientMessage)
+    if result < 0
+        return result as i32
+    return 0
+
+# Receive a message from daemon (may include fd via SCM_RIGHTS)
+pub fn zeus_client_recv(client: *ZeusClient, msg: *DaemonMessage, out_fd: *i32) -> i32
+    if client.socket_fd < 0
+        return -1
+
+    *out_fd = -1
+
+    # Set up iovec for the message
+    var iov: IoVec
+    iov.iov_base = msg as *u8
+    iov.iov_len = 16  # sizeof(DaemonMessage)
+
+    # Set up control buffer for SCM_RIGHTS
+    var cmsg_buf: [32]u8  # Space for CmsgFd + alignment
+    var j: i32 = 0
+    while j < 32
+        cmsg_buf[j] = 0
+        j = j + 1
+
+    # Set up msghdr
+    var hdr: MsgHdr
+    hdr.msg_name = null
+    hdr.msg_namelen = 0
+    hdr.msg_iov = @iov
+    hdr.msg_iovlen = 1
+    hdr.msg_control = @cmsg_buf[0]
+    hdr.msg_controllen = 32
+    hdr.msg_flags = 0
+
+    let result: i64 = syscall3(SYS_RECVMSG, client.socket_fd as i64, @hdr as i64, 0)
+    if result < 0
+        return result as i32
+
+    if result == 0
+        # Connection closed
+        return -1
+
+    # Check for fd in control message
+    if hdr.msg_controllen >= 20
+        let cmsg: *CmsgFd = @cmsg_buf[0] as *CmsgFd
+        if cmsg.cmsg_level == SOL_SOCKET && cmsg.cmsg_type == SCM_RIGHTS
+            *out_fd = cmsg.fd
+
+    return 0
+
+# ============================================================================
+# Handshake
+# ============================================================================
+
+# Perform protocol handshake with daemon
+pub fn zeus_client_handshake(client: *ZeusClient) -> i32
+    if client.state != ZEUS_CLIENT_STATE_CONNECTED
+        return -1
+
+    # Send HELLO
+    var hello: ClientMessage
+    client_message_init(@hello, CLIENT_MSG_HELLO)
+
+    let result: i32 = zeus_client_send(client, @hello)
+    if result < 0
+        return result
+
+    # Receive WELCOME
+    var welcome: DaemonMessage
+    var unused_fd: i32 = -1
+    let recv_result: i32 = zeus_client_recv(client, @welcome, @unused_fd)
+    if recv_result < 0
+        return recv_result
+
+    if welcome.msg_type != DAEMON_MSG_WELCOME
+        return -1
+
+    client.state = ZEUS_CLIENT_STATE_READY
+    return 0
+
+# ============================================================================
+# Worker Management
+# ============================================================================
+
+# Receive and attach a worker from daemon
+pub fn zeus_client_recv_worker(client: *ZeusClient) -> i32
+    if client.state != ZEUS_CLIENT_STATE_READY
+        return -1
+
+    if client.worker_count >= client.max_workers
+        return -1
+
+    # Receive WORKER_INFO message with fd
+    var msg: DaemonMessage
+    var shm_fd: i32 = -1
+    let result: i32 = zeus_client_recv(client, @msg, @shm_fd)
+    if result < 0
+        return result
+
+    if msg.msg_type != DAEMON_MSG_WORKER_INFO
+        if shm_fd >= 0
+            sys_close(shm_fd)
+        return -1
+
+    if shm_fd < 0
+        # No fd received
+        return -1
+
+    # Find free handle slot
+    var i: i32 = 0
+    while i < client.max_workers
+        let handle: *WorkerHandle = client.workers + i
+        if handle.slot_idx < 0
+            # Attach to shm
+            let base: *u8 = sys_mmap(0, msg.shm_size, PROT_READ + PROT_WRITE, MAP_SHARED, shm_fd, 0)
+            if base == (-1 as *u8)
+                sys_close(shm_fd)
+                return -1
+
+            handle.slot_idx = msg.worker_idx
+            handle.shm_fd = shm_fd
+            handle.shm_size = msg.shm_size
+            handle.shm_base = base
+            handle.attached = 1
+
+            client.worker_count = client.worker_count + 1
+            return i
+        i = i + 1
+
+    # No free slots
+    sys_close(shm_fd)
+    return -1
+
+# Get worker handle by local index
+pub fn zeus_client_get_worker(client: *ZeusClient, idx: i32) -> *WorkerHandle
+    if idx < 0 || idx >= client.max_workers
+        return null
+
+    let handle: *WorkerHandle = client.workers + idx
+    if handle.slot_idx < 0
+        return null
+
+    return handle
+
+# ============================================================================
+# Request Dispatch
+# ============================================================================
+
+# Select next worker for dispatch (round-robin)
+pub fn zeus_client_select_worker(client: *ZeusClient) -> i32
+    if client.worker_count == 0
+        return -1
+
+    var attempts: i32 = 0
+    while attempts < client.max_workers
+        let idx: i32 = client.next_dispatch_idx
+        client.next_dispatch_idx = (client.next_dispatch_idx + 1) % client.max_workers
+
+        let handle: *WorkerHandle = client.workers + idx
+        if handle.slot_idx >= 0 && handle.attached != 0
+            return idx
+
+        attempts = attempts + 1
+
+    return -1
+
+# Generate next request ID
+pub fn zeus_client_next_request_id(client: *ZeusClient) -> u64
+    let id: u64 = client.next_request_id
+    client.next_request_id = client.next_request_id + 1
+    return id
+
+# ============================================================================
+# Shared Memory Access
+# ============================================================================
+
+# Calculate offsets (must match shm.ritz layout)
+fn calculate_req_ring_offset(cb: *ControlBlock) -> i64
+    let page_size: i64 = 4096
+    let cb_size: i64 = ((control_block_size() + page_size - 1) / page_size) * page_size
+    return cb_size
+
+fn calculate_resp_ring_offset(cb: *ControlBlock) -> i64
+    let page_size: i64 = 4096
+    let cb_size: i64 = ((control_block_size() + page_size - 1) / page_size) * page_size
+    let req_ring_size: i64 = ((cb.ring_capacity * request_slot_size() + page_size - 1) / page_size) * page_size
+    return cb_size + req_ring_size
+
+fn calculate_arena_offset(cb: *ControlBlock) -> i64
+    let page_size: i64 = 4096
+    let cb_size: i64 = ((control_block_size() + page_size - 1) / page_size) * page_size
+    let req_ring_size: i64 = ((cb.ring_capacity * request_slot_size() + page_size - 1) / page_size) * page_size
+    let resp_ring_size: i64 = ((cb.ring_capacity * response_slot_size() + page_size - 1) / page_size) * page_size
+    return cb_size + req_ring_size + resp_ring_size
+
+# Get control block for a worker
+pub fn worker_handle_get_control_block(handle: *WorkerHandle) -> *ControlBlock
+    if handle.shm_base == null
+        return null
+    return handle.shm_base as *ControlBlock
+
+# Get request ring for a worker
+pub fn worker_handle_get_request_ring(handle: *WorkerHandle) -> *RequestSlot
+    if handle.shm_base == null
+        return null
+
+    let cb: *ControlBlock = handle.shm_base as *ControlBlock
+    let offset: i64 = calculate_req_ring_offset(cb)
+    return (handle.shm_base + offset) as *RequestSlot
+
+# Get response ring for a worker
+pub fn worker_handle_get_response_ring(handle: *WorkerHandle) -> *ResponseSlot
+    if handle.shm_base == null
+        return null
+
+    let cb: *ControlBlock = handle.shm_base as *ControlBlock
+    let offset: i64 = calculate_resp_ring_offset(cb)
+    return (handle.shm_base + offset) as *ResponseSlot
+
+# Get arena for a worker
+pub fn worker_handle_get_arena(handle: *WorkerHandle, arena: *DataArena)
+    if handle.shm_base == null
+        arena.base = null
+        arena.size = 0
+        arena.offset = 0
+        return
+
+    let cb: *ControlBlock = handle.shm_base as *ControlBlock
+    let offset: i64 = calculate_arena_offset(cb)
+    let size: i64 = handle.shm_size - offset
+
+    arena.base = handle.shm_base + offset
+    arena.size = size
+    arena.offset = 0
+
+# ============================================================================
+# Request/Response Operations
+# ============================================================================
+
+# Submit request to a worker
+pub fn zeus_client_submit_request(client: *ZeusClient, worker_idx: i32, req: *RequestSlot) -> i32
+    let handle: *WorkerHandle = zeus_client_get_worker(client, worker_idx)
+    if handle == null
+        return -1
+
+    let cb: *ControlBlock = worker_handle_get_control_block(handle)
+    if cb == null
+        return -1
+
+    # Check if ring is full
+    if control_block_req_full(cb) != 0
+        return -2  # Ring full
+
+    # Get target slot
+    let ring: *RequestSlot = worker_handle_get_request_ring(handle)
+    let ring_idx: i64 = control_block_slot_index(cb, cb.req_write_idx)
+    let target: *RequestSlot = ring + ring_idx
+
+    # Copy request
+    target.id = req.id
+    target.method = req.method
+    target.flags = req.flags
+    target.path_len = req.path_len
+    target.path_offset = req.path_offset
+    target.headers_offset = req.headers_offset
+    target.headers_len = req.headers_len
+    target.body_offset = req.body_offset
+    target.body_len = req.body_len
+
+    # Advance write index
+    control_block_req_write_inc(cb)
+
+    return 0
+
+# Poll for response from any worker
+pub fn zeus_client_poll_response(client: *ZeusClient, resp: *ResponseSlot, worker_idx: *i32) -> i32
+    var i: i32 = 0
+    while i < client.max_workers
+        let handle: *WorkerHandle = client.workers + i
+        if handle.slot_idx >= 0 && handle.attached != 0
+            let cb: *ControlBlock = worker_handle_get_control_block(handle)
+            if cb != null && control_block_resp_empty(cb) == 0
+                # Found a response
+                let ring: *ResponseSlot = worker_handle_get_response_ring(handle)
+                let ring_idx: i64 = control_block_slot_index(cb, cb.resp_read_idx)
+                let src: *ResponseSlot = ring + ring_idx
+
+                # Copy response
+                resp.id = src.id
+                resp.status = src.status
+                resp.flags = src.flags
+                resp.headers_offset = src.headers_offset
+                resp.headers_len = src.headers_len
+                resp.body_offset = src.body_offset
+                resp.body_len = src.body_len
+
+                # Advance read index
+                control_block_resp_read_inc(cb)
+
+                *worker_idx = i
+                return 0
+        i = i + 1
+
+    return -1  # No responses
+

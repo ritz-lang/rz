@@ -1,0 +1,614 @@
+# ritzgen/grammar.ritz - Grammar file parser
+#
+# Parses combined flex/bison-style grammar files with %tokens and %grammar sections.
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+
+import tokens
+import utils
+
+# =============================================================================
+# Grammar Parser
+# =============================================================================
+
+struct GrammarParser
+    input: *u8
+    len: i64
+    pos: i64
+    line: i32
+    col: i32
+    in_skip_section: i32  # 1 if in %skip section
+
+fn gp_init(gp: *GrammarParser, input: *u8, len: i64) -> i32
+    gp.input = input
+    gp.len = len
+    gp.pos = 0
+    gp.line = 1
+    gp.col = 1
+    gp.in_skip_section = 0
+    return 0
+
+fn gp_peek(gp: *GrammarParser) -> u8
+    if gp.pos >= gp.len
+        return 0
+    return *(gp.input + gp.pos)
+
+fn gp_advance(gp: *GrammarParser) -> u8
+    if gp.pos >= gp.len
+        return 0
+    let c: u8 = *(gp.input + gp.pos)
+    gp.pos = gp.pos + 1
+    if c == '\n'
+        gp.line = gp.line + 1
+        gp.col = 1
+    else
+        gp.col = gp.col + 1
+    return c
+
+fn gp_skip_ws(gp: *GrammarParser) -> i32
+    while gp.pos < gp.len
+        let c: u8 = gp_peek(gp)
+        if c == ' ' || c == '\t' || c == '\r'
+            gp_advance(gp)
+        else
+            break
+    return 0
+
+fn gp_skip_line(gp: *GrammarParser) -> i32
+    while gp.pos < gp.len && gp_peek(gp) != '\n'
+        gp_advance(gp)
+    if gp_peek(gp) == '\n'
+        gp_advance(gp)
+    return 0
+
+fn gp_at_eol(gp: *GrammarParser) -> i32
+    let c: u8 = gp_peek(gp)
+    return (c == '\n' || c == 0 || c == '#') as i32  # newline, EOF, or comment
+
+# Note: is_alpha, is_alnum, is_terminal_name are provided by utils.ritz
+
+# Parse identifier (token name)
+fn gp_parse_ident(gp: *GrammarParser, out: *u8, max_len: i32) -> i32
+    var len: i32 = 0
+    while gp.pos < gp.len && is_alnum(gp_peek(gp)) != 0
+        if len < max_len - 1
+            *(out + len) = gp_advance(gp)
+            len += 1
+        else
+            gp_advance(gp)
+    *(out + len) = 0
+    return len
+
+# Parse quoted string literal "..."
+fn gp_parse_string(gp: *GrammarParser, out: *u8, max_len: i32) -> i32
+    if gp_peek(gp) != 34  # '"'
+        return -1
+    gp_advance(gp)  # consume opening quote
+
+    var len: i32 = 0
+    while gp.pos < gp.len
+        let c: u8 = gp_peek(gp)
+        if c == '"'  # closing quote
+            gp_advance(gp)
+            *(out + len) = 0
+            return len
+        if c == '\\'  # backslash
+            gp_advance(gp)
+            let ec: u8 = gp_advance(gp)
+            if len < max_len - 1
+                # Handle escape sequences
+                if ec == 'n'  # \n
+                    *(out + len) = 10
+                else if ec == 't'  # \t
+                    *(out + len) = 9
+                else if ec == 'r'  # \r
+                    *(out + len) = 13
+                else
+                    *(out + len) = ec
+                len += 1
+        else
+            if len < max_len - 1
+                *(out + len) = gp_advance(gp)
+                len += 1
+            else
+                gp_advance(gp)
+    return -1  # Unterminated string
+
+# Parse regex pattern /.../
+fn gp_parse_regex(gp: *GrammarParser, out: *u8, max_len: i32) -> i32
+    if gp_peek(gp) != 47  # '/'
+        return -1
+    gp_advance(gp)  # consume opening /
+
+    var len: i32 = 0
+    while gp.pos < gp.len
+        let c: u8 = gp_peek(gp)
+        if c == '/'  # closing /
+            gp_advance(gp)
+            *(out + len) = 0
+            return len
+        if c == '\\'  # backslash - escape next char
+            if len < max_len - 1
+                *(out + len) = gp_advance(gp)
+                len += 1
+            else
+                gp_advance(gp)
+            if len < max_len - 1 && gp.pos < gp.len
+                *(out + len) = gp_advance(gp)
+                len += 1
+            else if gp.pos < gp.len
+                gp_advance(gp)
+        else
+            if len < max_len - 1
+                *(out + len) = gp_advance(gp)
+                len += 1
+            else
+                gp_advance(gp)
+    return -1  # Unterminated regex
+
+# Parse grammar file and populate token definitions
+# Returns: 0 = success (no grammar section), 1 = success (hit %grammar), -1 = error
+fn parse_grammar(gp: *GrammarParser, defs: *TokenDefs) -> i32
+    defs.count = 0
+    defs.next_id = 10  # Start user tokens at 10
+
+    while gp.pos < gp.len
+        gp_skip_ws(gp)
+        let c: u8 = gp_peek(gp)
+
+        # Skip empty lines and comments
+        if c == '\n'
+            gp_advance(gp)
+            continue
+        if c == '#'  # '#'
+            gp_skip_line(gp)
+            continue
+        if c == 0
+            break
+
+        # Check for directives
+        if c == 37  # '%'
+            gp_advance(gp)
+            var directive: [32]u8
+            let dlen: i32 = gp_parse_ident(gp, &directive[0], 32)
+
+            # Check directive type
+            if streq(&directive[0], "tokens") != 0
+                gp.in_skip_section = 0
+                gp_skip_line(gp)
+                continue
+            if streq(&directive[0], "skip") != 0
+                gp.in_skip_section = 1
+                gp_skip_line(gp)
+                continue
+            if streq(&directive[0], "grammar") != 0
+                gp_skip_line(gp)
+                return 1  # Signal that grammar section follows
+
+            # Unknown directive - skip line
+            gp_skip_line(gp)
+            continue
+
+        # Parse token definition: NAME = "literal" or NAME = /pattern/
+        if is_alpha(c) != 0
+            var name: [64]u8
+            let nlen: i32 = gp_parse_ident(gp, &name[0], 64)
+
+            gp_skip_ws(gp)
+
+            # Expect '='
+            if gp_peek(gp) != 61
+                eprints("Error: expected '=' after token name\n")
+                return -1
+            gp_advance(gp)
+            gp_skip_ws(gp)
+
+            # Parse value (string or regex)
+            var pattern: [256]u8
+            var plen: i32 = 0
+            var is_literal: i32 = 0
+
+            if gp_peek(gp) == '"'  # '"'
+                plen = gp_parse_string(gp, &pattern[0], 256)
+                is_literal = 1
+            else if gp_peek(gp) == '/'  # '/'
+                plen = gp_parse_regex(gp, &pattern[0], 256)
+                is_literal = 0
+            else
+                eprints("Error: expected string or regex after '='\n")
+                return -1
+
+            if plen < 0
+                eprints("Error: unterminated string or regex\n")
+                return -1
+
+            # Add token definition
+            if defs.count < 256
+                let def: *TokenDef = &defs.defs[defs.count]
+
+                # Copy name
+                def.name = sys_mmap(0, (nlen + 1) as i64, 3, 34, -1, 0) as *u8
+                memcpy(def.name, &name[0], (nlen + 1) as i64)
+                def.name_len = nlen
+
+                # Copy pattern
+                def.pattern = sys_mmap(0, (plen + 1) as i64, 3, 34, -1, 0) as *u8
+                memcpy(def.pattern, &pattern[0], (plen + 1) as i64)
+                def.pattern_len = plen
+
+                def.is_literal = is_literal
+                def.is_skip = gp.in_skip_section
+                def.token_id = defs.next_id
+                defs.next_id = defs.next_id + 1
+                defs.count = defs.count + 1
+
+            gp_skip_line(gp)
+            continue
+
+        # Unknown line - skip
+        gp_skip_line(gp)
+
+    return 0
+
+# =============================================================================
+# Grammar rule parsing
+# =============================================================================
+
+# Parse a single symbol (terminal, nonterminal, or grouped expression)
+fn gp_parse_symbol(gp: *GrammarParser, sym: *GrammarSymbol) -> i32
+    gp_skip_ws(gp)
+
+    let c: u8 = gp_peek(gp)
+
+    # Handle grouping: (...)
+    if c == 40  # '('
+        gp_advance(gp)
+        var depth: i32 = 1
+        while gp.pos < gp.len && depth > 0
+            let gc: u8 = gp_advance(gp)
+            if gc == 40
+                depth += 1
+            else if gc == 41
+                depth -= 1
+        sym.kind = SYM_GROUP
+        sym.name = null
+        sym.name_len = 0
+        sym.group_alts = null
+        sym.group_alt_count = 0
+        # Check for quantifier
+        gp_skip_ws(gp)
+        let qc: u8 = gp_peek(gp)
+        if qc == '*'  # '*'
+            gp_advance(gp)
+            sym.kind = SYM_STAR
+        else if qc == '+'  # '+'
+            gp_advance(gp)
+            sym.kind = SYM_PLUS
+        else if qc == 63  # '?'
+            gp_advance(gp)
+            sym.kind = SYM_OPTIONAL
+        return 1
+
+    # Handle identifier (terminal or nonterminal)
+    if is_alpha(c) != 0
+        var name: [64]u8
+        let nlen: i32 = gp_parse_ident(gp, &name[0], 64)
+
+        # Allocate and copy name
+        sym.name = sys_mmap(0, (nlen + 1) as i64, 3, 34, -1, 0) as *u8
+        memcpy(sym.name, &name[0], (nlen + 1) as i64)
+        sym.name_len = nlen
+        sym.group_alts = null
+        sym.group_alt_count = 0
+
+        # Determine if terminal or nonterminal
+        if is_terminal_name(&name[0], nlen) != 0
+            sym.kind = SYM_TERMINAL
+        else
+            sym.kind = SYM_NONTERMINAL
+
+        # Check for quantifier
+        gp_skip_ws(gp)
+        let qc: u8 = gp_peek(gp)
+        if qc == '*'  # '*'
+            gp_advance(gp)
+            sym.kind = SYM_STAR
+        else if qc == '+'  # '+'
+            gp_advance(gp)
+            sym.kind = SYM_PLUS
+        else if qc == 63  # '?'
+            gp_advance(gp)
+            sym.kind = SYM_OPTIONAL
+
+        return 1
+
+    return 0  # No symbol found
+
+# Parse a semantic action block { ... }
+fn gp_parse_action(gp: *GrammarParser, out: *u8, max_len: i32) -> i32
+    if gp_peek(gp) != 123  # '{'
+        return 0
+    gp_advance(gp)  # consume opening {
+
+    var len: i32 = 0
+    var depth: i32 = 1
+    while gp.pos < gp.len && depth > 0
+        let c: u8 = gp_peek(gp)
+        if c == '{'  # '{'
+            depth += 1
+            if len < max_len - 1
+                *(out + len) = gp_advance(gp)
+                len += 1
+            else
+                gp_advance(gp)
+        else if c == '}'  # '}'
+            depth -= 1
+            if depth > 0
+                if len < max_len - 1
+                    *(out + len) = gp_advance(gp)
+                    len += 1
+                else
+                    gp_advance(gp)
+            else
+                gp_advance(gp)  # consume closing }
+        else
+            if len < max_len - 1
+                *(out + len) = gp_advance(gp)
+                len += 1
+            else
+                gp_advance(gp)
+
+    *(out + len) = 0
+    return len
+
+# Parse an alternative (sequence of symbols)
+fn gp_parse_alt(gp: *GrammarParser, alt: *GrammarAlt) -> i32
+    alt.symbol_count = 0
+    alt.action = null
+    alt.action_len = 0
+
+    while gp.pos < gp.len
+        gp_skip_ws(gp)
+        let c: u8 = gp_peek(gp)
+
+        # Stop at end of alternative (but check for action on next line first)
+        if c == 124 || c == ';' || c == 0  # '|', ';', EOF
+            break
+
+        # If newline, look ahead for action or alternative terminator
+        if c == '\n'
+            # Save position
+            let saved_pos: i64 = gp.pos
+            let saved_line: i32 = gp.line
+            let saved_col: i32 = gp.col
+            gp_advance(gp)  # consume newline
+            gp_skip_ws(gp)
+            let next_c: u8 = gp_peek(gp)
+            # If next line starts with {, it's an action
+            if next_c == '{'  # '{'
+                var action_buf: [512]u8
+                let alen: i32 = gp_parse_action(gp, &action_buf[0], 512)
+                if alen > 0
+                    alt.action = sys_mmap(0, (alen + 1) as i64, 3, 34, -1, 0) as *u8
+                    memcpy(alt.action, &action_buf[0], (alen + 1) as i64)
+                    alt.action_len = alen
+                break
+            # Otherwise restore position and stop
+            gp.pos = saved_pos
+            gp.line = saved_line
+            gp.col = saved_col
+            break
+
+        # Check for semantic action { ... }
+        if c == '{'  # '{'
+            var action_buf: [512]u8
+            let alen: i32 = gp_parse_action(gp, &action_buf[0], 512)
+            if alen > 0
+                alt.action = sys_mmap(0, (alen + 1) as i64, 3, 34, -1, 0) as *u8
+                memcpy(alt.action, &action_buf[0], (alen + 1) as i64)
+                alt.action_len = alen
+            break  # Action ends the alternative
+
+        # Parse symbol
+        if alt.symbol_count < 16
+            var sym: GrammarSymbol
+            if gp_parse_symbol(gp, &sym) != 0
+                alt.symbols[alt.symbol_count] = sym
+                alt.symbol_count = alt.symbol_count + 1
+            else
+                break
+        else
+            break
+
+    return alt.symbol_count
+
+# Parse return type annotation: -> Type
+fn gp_parse_return_type(gp: *GrammarParser, out: *u8, max_len: i32) -> i32
+    gp_skip_ws(gp)
+
+    # Check for '->'
+    if gp_peek(gp) != 45  # '-'
+        return 0
+    gp_advance(gp)
+    if gp_peek(gp) != 62  # '>'
+        return -1  # Error: incomplete ->
+    gp_advance(gp)
+    gp_skip_ws(gp)
+
+    # Parse the type (pointer prefix + identifier)
+    var len: i32 = 0
+
+    # Handle pointer prefix (*, **)
+    while gp_peek(gp) == '*'  # '*'
+        if len < max_len - 1
+            *(out + len) = gp_advance(gp)
+            len += 1
+        else
+            gp_advance(gp)
+
+    # Parse type name
+    while gp.pos < gp.len
+        let c: u8 = gp_peek(gp)
+        if is_alnum(c) != 0
+            if len < max_len - 1
+                *(out + len) = gp_advance(gp)
+                len += 1
+            else
+                gp_advance(gp)
+        else
+            break
+
+    *(out + len) = 0
+    return len
+
+# Parse a grammar rule (name and alternatives)
+fn gp_parse_rule(gp: *GrammarParser, rule: *GrammarRule) -> i32
+    gp_skip_ws(gp)
+
+    # Parse rule name
+    if is_alpha(gp_peek(gp)) == 0
+        return 0
+
+    var name: [64]u8
+    let nlen: i32 = gp_parse_ident(gp, &name[0], 64)
+
+    # Allocate and copy name
+    rule.name = sys_mmap(0, (nlen + 1) as i64, 3, 34, -1, 0) as *u8
+    memcpy(rule.name, &name[0], (nlen + 1) as i64)
+    rule.name_len = nlen
+    rule.alt_count = 0
+    rule.return_type = null
+    rule.return_type_len = 0
+
+    gp_skip_ws(gp)
+
+    # Check for optional return type annotation: -> Type
+    if gp_peek(gp) == '-'  # '-'
+        var ret_type: [64]u8
+        let rlen: i32 = gp_parse_return_type(gp, &ret_type[0], 64)
+        if rlen > 0
+            rule.return_type = sys_mmap(0, (rlen + 1) as i64, 3, 34, -1, 0) as *u8
+            memcpy(rule.return_type, &ret_type[0], (rlen + 1) as i64)
+            rule.return_type_len = rlen
+
+    # Skip to ':'
+    gp_skip_ws(gp)
+    while gp.pos < gp.len && gp_peek(gp) == '\n'
+        gp_advance(gp)
+        gp_skip_ws(gp)
+
+    if gp_peek(gp) != 58  # ':'
+        return 0
+    gp_advance(gp)
+
+    # Parse alternatives (max 16 per rule)
+    while gp.pos < gp.len && rule.alt_count < 16
+        gp_skip_ws(gp)
+
+        # Skip newlines
+        while gp_peek(gp) == '\n'
+            gp_advance(gp)
+            gp_skip_ws(gp)
+
+        let c: u8 = gp_peek(gp)
+
+        # End of rule
+        if c == ';'  # ';'
+            gp_advance(gp)
+            break
+
+        # Skip leading '|' for alternatives after the first
+        if c == 124  # '|'
+            gp_advance(gp)
+            gp_skip_ws(gp)
+
+        # Parse alternative (an alternative is valid if it has symbols OR an action)
+        gp_parse_alt(gp, &rule.alts[rule.alt_count])
+        let alt: *GrammarAlt = &rule.alts[rule.alt_count]
+        if alt.symbol_count > 0 || alt.action != null
+            rule.alt_count = rule.alt_count + 1
+        else
+            break
+
+    return 1
+
+# Parse all grammar rules after %grammar directive
+fn parse_grammar_rules(gp: *GrammarParser, grammar: *Grammar) -> i32
+    grammar.rule_count = 0
+
+    while gp.pos < gp.len
+        gp_skip_ws(gp)
+
+        # Skip newlines and comments
+        let c: u8 = gp_peek(gp)
+        if c == '\n'
+            gp_advance(gp)
+            continue
+        if c == '#'  # '#'
+            gp_skip_line(gp)
+            continue
+        if c == 0
+            break
+
+        # Parse rule
+        if is_alpha(c) != 0 && grammar.rule_count < 64
+            if gp_parse_rule(gp, &grammar.rules[grammar.rule_count]) != 0
+                grammar.rule_count = grammar.rule_count + 1
+            else
+                gp_skip_line(gp)
+        else
+            gp_skip_line(gp)
+
+    return 0
+
+# Print grammar for debugging
+fn print_grammar(grammar: *Grammar)
+    prints("\nGrammar rules (")
+    print_int(grammar.rule_count as i64)
+    prints("):\n")
+
+    var i: i32 = 0
+    while i < grammar.rule_count
+        let rule: *GrammarRule = &grammar.rules[i]
+        prints("  ")
+        prints(rule.name)
+        if rule.return_type != null
+            prints(" -> ")
+            prints(rule.return_type)
+        prints("\n")
+
+        var j: i32 = 0
+        while j < rule.alt_count
+            let alt: *GrammarAlt = &rule.alts[j]
+            prints("    ")
+            if j == 0
+                prints(": ")
+            else
+                prints("| ")
+
+            var k: i32 = 0
+            while k < alt.symbol_count
+                let sym: *GrammarSymbol = &alt.symbols[k]
+                if sym.name != null
+                    prints(sym.name)
+                else
+                    prints("(...)")
+                if sym.kind == SYM_STAR
+                    prints("*")
+                else if sym.kind == SYM_PLUS
+                    prints("+")
+                else if sym.kind == SYM_OPTIONAL
+                    prints("?")
+                prints(" ")
+                k += 1
+            # Show action if present
+            if alt.action != null
+                prints("{ ")
+                prints(alt.action)
+                prints(" }")
+            prints("\n")
+            j += 1
+        prints("    ;\n")
+        i += 1

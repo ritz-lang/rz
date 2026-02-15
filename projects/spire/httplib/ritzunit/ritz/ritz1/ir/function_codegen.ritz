@@ -1,0 +1,183 @@
+# ritz1/ir/function_codegen.ritz - Function & Program IR Generation
+#
+# Generates complete LLVM IR modules with functions, _start wrapper, and syscalls.
+
+import mem
+import types
+import ir_builder
+import expr_codegen
+import stmt_codegen
+
+# =============================================================================
+# Function Representation
+# =============================================================================
+
+struct FunctionParam
+  name: *i8
+  ty: i32
+
+struct Function
+  name: *i8
+  ret_type: i32
+  params: *FunctionParam
+  param_count: i32
+  body: *Stmt         # Array of statements (simplified as single stmt for now)
+  body_count: i32
+
+# =============================================================================
+# Function IR Generation
+# =============================================================================
+
+fn emit_function(b: *IRBuilder, func: *Function) -> i32
+  # Reset IDs for new function
+  ir_reset_ids(b)
+
+  # Emit function header
+  ir_emit_fn_start(b, func.name, func.ret_type)
+
+  # Emit parameters
+  for i in 0..func.param_count
+    let param: *FunctionParam = func.params + i
+    var is_first: i32 = 0
+    if i == 0
+      is_first = 1
+    ir_emit_fn_param(b, param.ty, param.name, is_first)
+
+  ir_emit_fn_header_end(b)
+
+  # Create symbol table for function locals
+  var entries: [32]SymbolEntry = [SymbolEntry { name: null, ssa_id: 0, ty: 0 }; 32]
+  var st: SymbolTable = SymbolTable { entries: &entries[0], count: 0, capacity: 32 }
+
+  # Allocate parameters to local allocas (so they can be assigned)
+  for j in 0..func.param_count
+    let param: *FunctionParam = func.params + j
+    let alloca_id: i32 = ir_fresh_id(b)
+    ir_emit_alloca(b, alloca_id, param.ty)
+
+    # Store parameter value to alloca
+    let param_id: i32 = j  # Parameter SSA ID (simplified)
+    # In real impl: %0 = load from %"param.arg", store to %alloca
+    # For now, just add to symbol table
+    symtab_insert(&st, param.name, alloca_id, param.ty)
+
+  # Emit function body
+  if func.body != null
+    emit_stmt(b, func.body, &st)
+
+  # Emit function end
+  ir_emit_fn_end(b)
+  0
+
+# =============================================================================
+# Program Generation (Module with _start)
+# =============================================================================
+
+fn emit_program(arena: *Arena, func: *Function) -> *i8
+  let b: *IRBuilder = ir_builder_new(arena, 16384)
+
+  # Emit module header
+  ir_emit_module_header(b, "ritz_program")
+
+  # Emit the main function
+  emit_function(b, func)
+
+  # Emit _start wrapper
+  ir_emit_fn_start(b, "_start", TY_VOID)
+  ir_emit_fn_header_end(b)
+
+  # Call main and exit with its return value
+  # Use simple inline assembly like ritz0
+  ir_put_indent(b)
+  ir_put(b, "call void asm sideeffect \"")
+  ir_newline(b)
+  ir_put_indent(b)
+  ir_put(b, "  call ")
+  ir_put(b, func.name)
+  ir_newline(b)
+  ir_put_indent(b)
+  ir_put(b, "  movq %rax, %rdi")
+  ir_newline(b)
+  ir_put_indent(b)
+  ir_put(b, "  movq $$60, %rax")
+  ir_newline(b)
+  ir_put_indent(b)
+  ir_put(b, "  syscall")
+  ir_newline(b)
+  ir_put_indent(b)
+  ir_put(b, "\", \"~{rax},~{rdi},~{rcx},~{r11},~{memory}\"()")
+  ir_newline(b)
+
+  ir_put_indent(b)
+  ir_put(b, "unreachable")
+  ir_newline(b)
+
+  ir_emit_fn_end(b)
+
+  # Emit module footer
+  ir_emit_module_footer(b)
+
+  # Return IR output
+  ir_builder_get_output(b)
+
+# =============================================================================
+# Tests
+# =============================================================================
+
+@test
+fn test_emit_function_simple()
+  let arena_buf: *i8 = __builtin_alloca(32768) as *i8
+  var arena: Arena = Arena { base: arena_buf, size: 32768, used: 0 }
+
+  let b: *IRBuilder = ir_builder_new(&arena, 8192)
+
+  # fn add(a: i32, b: i32) -> i32 { return a }
+  var params: [2]FunctionParam = [FunctionParam { name: "a", ty: TY_I32 }, FunctionParam { name: "b", ty: TY_I32 }]
+  var ret_expr: Expr = Expr { kind: EXPR_VAR, int_val: 0, bool_val: 0, var_id: 1, op: 0, left: null, right: null, operand: null, ty: TY_I32, target_ty: 0 }
+  var ret_stmt: Stmt = Stmt { kind: STMT_RETURN, var_name: null, var_ty: 0, var_init: null, lhs: null, rhs: null, ret_val: &ret_expr, condition: null, then_block: null, else_block: null, body: null, expr: null }
+  var func: Function = Function { name: "add", ret_type: TY_I32, params: &params[0], param_count: 2, body: &ret_stmt, body_count: 1 }
+
+  emit_function(b, &func)
+
+  let output: *i8 = ir_builder_get_output(b)
+  assert str_contains(output, "define i32 @add(") == 1, "should have function definition"
+  assert str_contains(output, "i32 %\"a.arg\"") == 1, "should have parameter a"
+  assert str_contains(output, "i32 %\"b.arg\"") == 1, "should have parameter b"
+  assert str_contains(output, "alloca i32") == 1, "should allocate locals for params"
+  assert str_contains(output, "ret i32") == 1, "should have return"
+
+@test
+fn test_emit_program_main()
+  let arena_buf: *i8 = __builtin_alloca(32768) as *i8
+  var arena: Arena = Arena { base: arena_buf, size: 32768, used: 0 }
+
+  # fn main() -> i32 { return 42 }
+  var ret_expr: Expr = Expr { kind: EXPR_VAR, int_val: 42, bool_val: 0, var_id: 1, op: 0, left: null, right: null, operand: null, ty: TY_I32, target_ty: 0 }
+  var ret_stmt: Stmt = Stmt { kind: STMT_RETURN, var_name: null, var_ty: 0, var_init: null, lhs: null, rhs: null, ret_val: &ret_expr, condition: null, then_block: null, else_block: null, body: null, expr: null }
+  var func: Function = Function { name: "main", ret_type: TY_I32, params: null, param_count: 0, body: &ret_stmt, body_count: 1 }
+
+  let output: *i8 = emit_program(&arena, &func)
+
+  assert str_contains(output, "ModuleID") == 1, "should have module header"
+  assert str_contains(output, "define i32 @main()") == 1, "should have main function"
+  assert str_contains(output, "define void @_start()") == 1, "should have _start"
+  assert str_contains(output, "call main") == 1, "should call main from _start"
+  assert str_contains(output, "syscall") == 1, "should have exit syscall"
+  assert str_contains(output, "unreachable") == 1, "should have unreachable after syscall"
+
+# Helper function
+fn str_contains(haystack: *i8, needle: *i8) -> i32
+  var h: i32 = 0
+  while *(haystack + h) != 0
+    var n: i32 = 0
+    var matched: i32 = 1
+    while *(needle + n) != 0
+      let ch: i32 = *(haystack + h + n) as i32 & 255
+      let cn: i32 = *(needle + n) as i32 & 255
+      if ch != cn
+        matched = 0
+      n = n + 1
+    if matched == 1
+      return 1
+    h = h + 1
+  0

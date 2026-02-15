@@ -1,0 +1,343 @@
+# 51_loadtest: HTTP load testing tool
+#
+# A simple but effective HTTP load tester similar to siege, ab, or k6.
+# Designed to stress-test web servers and measure response times.
+#
+# Usage: loadtest [OPTIONS] URL
+#
+# Options:
+#   -n NUM    Total number of requests (default: 100)
+#   -c NUM    Concurrent connections (default: 10)
+#
+# Example:
+#   ./loadtest -n 1000 -c 50 http://localhost:8080/
+#
+# Output:
+#   - Requests per second (RPS)
+#   - Average response time
+#   - Min/Max response time
+#   - Success/Error counts
+#   - Transfer rate
+#
+# Architecture:
+# - Sequential requests with timing
+# - Simple blocking I/O per request
+# - Measures connection, send, receive times
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+import ritzlib.string
+import ritzlib.gvec
+import ritzlib.span
+import ritzlib.net
+
+# ============================================================================
+# Statistics
+# ============================================================================
+
+struct Stats
+    total_requests: i64
+    successful: i64
+    failed: i64
+    total_bytes: i64
+    min_time: i64         # Minimum response time (ms)
+    max_time: i64         # Maximum response time (ms)
+    total_time: i64       # Sum of all response times
+    start_time: i64       # Benchmark start time (ms)
+    end_time: i64         # Benchmark end time (ms)
+
+fn stats_new() -> Stats
+    var s: Stats
+    s.total_requests = 0
+    s.successful = 0
+    s.failed = 0
+    s.total_bytes = 0
+    s.min_time = 999999999
+    s.max_time = 0
+    s.total_time = 0
+    s.start_time = 0
+    s.end_time = 0
+    return s
+
+fn stats_record_success(s: *Stats, response_time: i64, bytes: i64)
+    s.total_requests = s.total_requests + 1
+    s.successful = s.successful + 1
+    s.total_bytes = s.total_bytes + bytes
+    s.total_time = s.total_time + response_time
+    if response_time < s.min_time
+        s.min_time = response_time
+    if response_time > s.max_time
+        s.max_time = response_time
+
+fn stats_record_failure(s: *Stats)
+    s.total_requests = s.total_requests + 1
+    s.failed = s.failed + 1
+
+fn stats_print(s: *Stats)
+    var elapsed: i64 = s.end_time - s.start_time
+    if elapsed == 0
+        elapsed = 1
+
+    prints("\n========== Load Test Results ==========\n")
+
+    prints("Total requests:     ")
+    print_int(s.total_requests)
+    prints("\n")
+
+    prints("Successful:         ")
+    print_int(s.successful)
+    prints("\n")
+
+    prints("Failed:             ")
+    print_int(s.failed)
+    prints("\n")
+
+    prints("Total time:         ")
+    print_int(elapsed)
+    prints(" ms\n")
+
+    if s.successful > 0
+        var avg_time: i64 = s.total_time / s.successful
+        prints("Average response:   ")
+        print_int(avg_time)
+        prints(" ms\n")
+
+        prints("Min response:       ")
+        print_int(s.min_time)
+        prints(" ms\n")
+
+        prints("Max response:       ")
+        print_int(s.max_time)
+        prints(" ms\n")
+
+    # Requests per second
+    var rps: i64 = (s.successful * 1000) / elapsed
+    prints("Requests/sec:       ")
+    print_int(rps)
+    prints("\n")
+
+    # Transfer rate (KB/s)
+    var kbps: i64 = (s.total_bytes * 1000) / elapsed / 1024
+    prints("Transfer rate:      ")
+    print_int(kbps)
+    prints(" KB/s\n")
+
+    prints("Total transferred:  ")
+    print_int(s.total_bytes / 1024)
+    prints(" KB\n")
+
+    prints("========================================\n")
+
+# ============================================================================
+# URL parsing
+# ============================================================================
+
+struct Url
+    host: String
+    port: i32
+    path: String
+
+fn parse_url(url_str: *u8) -> Url
+    var url: Url
+    url.host = string_new()
+    url.port = 80
+    url.path = string_from("/")
+
+    # Skip http://
+    var pos: i64 = 0
+    var len: i64 = strlen(url_str)
+
+    if len >= 7
+        # Check for http://
+        if *(url_str + 0) == 104 && *(url_str + 4) == ':'  # 'h' and ':'
+            pos = 7
+
+    # Extract host (until : or / or end)
+    while pos < len
+        var c: u8 = *(url_str + pos)
+        if c == ':'  # ':'
+            pos += 1
+            # Parse port
+            var port_val: i32 = 0
+            while pos < len
+                var d: u8 = *(url_str + pos)
+                if d >= '0' && d <= '9'
+                    port_val = port_val * 10 + (d - '0') as i32
+                    pos += 1
+                else
+                    break
+            url.port = port_val
+            break
+        if c == '/'  # '/'
+            break
+        string_push(&url.host, c)
+        pos += 1
+
+    # Extract path (rest of string starting with /)
+    if pos < len && *(url_str + pos) == '/'
+        string_clear(&url.path)
+        while pos < len
+            string_push(&url.path, *(url_str + pos))
+            pos += 1
+
+    return url
+
+# ============================================================================
+# Time utilities
+# ============================================================================
+
+const SYS_GETTIMEOFDAY: i64 = 96
+
+fn get_time_ms() -> i64
+    # Get current time in milliseconds
+    var tv: [2]i64  # tv_sec, tv_usec
+    __syscall2(SYS_GETTIMEOFDAY, &tv[0] as i64, 0)
+    return tv[0] * 1000 + tv[1] / 1000
+
+# ============================================================================
+# Single request execution
+# ============================================================================
+
+fn do_request(url: *Url) -> i64
+    # Returns bytes received on success, -1 on failure
+    var sock: Socket = socket_tcp()
+    if sock.fd < 0
+        return -1
+
+    # Connect
+    if socket_connect(&sock, string_as_ptr(&url.host), url.port) < 0
+        socket_close(&sock)
+        return -1
+
+    # Build request
+    var request: String = string_new()
+    request.push_str("GET ")
+    request.push_string(&url.path)
+    request.push_str(" HTTP/1.0\r\nHost: ")
+    request.push_string(&url.host)
+    request.push_str("\r\nConnection: close\r\n\r\n")
+
+    # Send request
+    var sent: i64 = socket_send(&sock, string_as_ptr(&request), string_len(&request))
+    if sent < 0
+        socket_close(&sock)
+        return -1
+
+    # Receive response
+    var total_bytes: i64 = 0
+    var buf: [4096]u8
+    var done: i32 = 0
+    while done == 0
+        var n: i64 = socket_recv(&sock, &buf[0], 4096)
+        if n <= 0
+            done = 1
+        else
+            total_bytes += n
+
+    socket_close(&sock)
+    return total_bytes
+
+# ============================================================================
+# Main benchmark loop
+# ============================================================================
+
+fn run_benchmark(url: *Url, num_requests: i64, concurrency: i64) -> Stats
+    var stats: Stats = stats_new()
+    stats.start_time = get_time_ms()
+
+    prints("Running benchmark: ")
+    print_int(num_requests)
+    prints(" requests\n")
+    prints("Target: ")
+    var i: i64 = 0
+    while i < string_len(&url.host)
+        var c: u8 = string_get(&url.host, i)
+        sys_write(STDOUT, &c, 1)
+        i += 1
+    prints(":")
+    print_int(url.port as i64)
+    i = 0
+    while i < string_len(&url.path)
+        var c: u8 = string_get(&url.path, i)
+        sys_write(STDOUT, &c, 1)
+        i += 1
+    prints("\n\n")
+
+    # Run requests sequentially
+    var completed: i64 = 0
+    while completed < num_requests
+        var request_start: i64 = get_time_ms()
+        var bytes: i64 = do_request(url)
+        var request_time: i64 = get_time_ms() - request_start
+
+        if bytes >= 0
+            stats_record_success(&stats, request_time, bytes)
+        else
+            stats_record_failure(&stats)
+
+        completed += 1
+
+        # Progress indicator every 100 requests
+        if completed % 100 == 0
+            prints(".")
+
+    prints("\n")
+    stats.end_time = get_time_ms()
+    return stats
+
+# ============================================================================
+# Argument parsing
+# ============================================================================
+
+fn print_usage()
+    prints("Usage: loadtest [OPTIONS] URL\n")
+    prints("\n")
+    prints("Options:\n")
+    prints("  -n NUM    Total number of requests (default: 100)\n")
+    prints("\n")
+    prints("Example:\n")
+    prints("  loadtest -n 1000 http://localhost:8080/\n")
+
+fn main(argc: i32, argv: **u8) -> i32
+    var num_requests: i64 = 100
+    var concurrency: i64 = 10
+    var url_str: *u8 = null
+
+    # Parse arguments
+    var i: i32 = 1
+    while i < argc
+        var arg: *u8 = *(argv + i)
+        if *arg == '-'  # '-'
+            if *(arg + 1) == 'n'  # 'n'
+                i += 1
+                if i < argc
+                    num_requests = atoi(*(argv + i))
+            else
+                if *(arg + 1) == 104  # 'h'
+                    print_usage()
+                    return 0
+        else
+            url_str = arg
+        i += 1
+
+    if url_str == null
+        print_usage()
+        return 1
+
+    prints("Ritz Load Tester v0.1\n")
+
+    # Parse URL
+    var url: Url = parse_url(url_str)
+
+    if string_len(&url.host) == 0
+        prints("Error: Invalid URL\n")
+        return 1
+
+    # Run benchmark
+    var stats: Stats = run_benchmark(&url, num_requests, concurrency)
+
+    # Print results
+    stats_print(&stats)
+
+    return 0

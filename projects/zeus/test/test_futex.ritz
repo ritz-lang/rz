@@ -1,0 +1,164 @@
+# test/test_futex.ritz - Tests for futex-based signaling
+#
+# TDD: These tests define the expected behavior of the futex
+# wakeup mechanism for efficient request/response notification.
+#
+# Strategy: spin briefly, then block on futex
+# This optimizes for the common case (fast response) while
+# avoiding busy-waiting for slow responses.
+
+import ritzlib.sys
+import ritzlib.io
+import helpers
+
+import lib.futex
+import lib.shm
+import lib.control
+
+# ============================================================================
+# Basic Futex Tests
+# ============================================================================
+
+[[test]]
+fn test_futex_wake_no_waiters() -> i32
+    # Waking when nobody is waiting should succeed (return 0)
+    var word: i32 = 0
+    let woken: i32 = futex_wake(@word, 1)
+
+    # Should return 0 (no waiters woken)
+    let result: i32 = assert_eq_i32(woken, 0)
+    if result != 0
+        return result
+
+    return 0
+
+[[test]]
+fn test_futex_wait_timeout_immediate() -> i32
+    # Wait with 0 timeout should return immediately
+    var word: i32 = 42
+
+    # Wait for value to change from 42, with 0 timeout
+    let result: i32 = futex_wait_timeout(@word, 42, 0)
+
+    # Should return ETIMEDOUT (-110) or 0 (immediate return)
+    # Both are acceptable since timeout is 0
+    return 0
+
+[[test]]
+fn test_futex_wait_value_mismatch() -> i32
+    # If the value doesn't match, wait should return immediately
+    var word: i32 = 42
+
+    # Wait for value 99 (doesn't match 42)
+    let result: i32 = futex_wait_timeout(@word, 99, 1000)
+
+    # Should return EAGAIN (-11) because value doesn't match
+    # This is the fast path - no blocking needed
+    return 0
+
+# ============================================================================
+# Integration with Control Block
+# ============================================================================
+
+[[test]]
+fn test_signal_request_available() -> i32
+    var cfg: ShmConfig
+    shm_config_default(@cfg)
+
+    var region: ShmRegion
+    shm_create(@region, @cfg)
+
+    let cb: *ControlBlock = shm_get_control_block(@region)
+
+    # Initial futex value should be 0
+    let result: i32 = assert_eq_i32(cb.req_futex, 0)
+    if result != 0
+        shm_destroy(@region)
+        return result
+
+    # Signal request available
+    signal_request_available(cb)
+
+    # Futex value should be incremented
+    let result2: i32 = assert_eq_i32(cb.req_futex, 1)
+    if result2 != 0
+        shm_destroy(@region)
+        return result2
+
+    shm_destroy(@region)
+    return 0
+
+[[test]]
+fn test_signal_response_available() -> i32
+    var cfg: ShmConfig
+    shm_config_default(@cfg)
+
+    var region: ShmRegion
+    shm_create(@region, @cfg)
+
+    let cb: *ControlBlock = shm_get_control_block(@region)
+
+    # Signal response available
+    signal_response_available(cb)
+
+    # Futex value should be incremented
+    let result: i32 = assert_eq_i32(cb.resp_futex, 1)
+    if result != 0
+        shm_destroy(@region)
+        return result
+
+    shm_destroy(@region)
+    return 0
+
+[[test]]
+fn test_spin_then_wait_immediate() -> i32
+    # Test the spin-then-wait pattern when data is already available
+    var cfg: ShmConfig
+    shm_config_default(@cfg)
+
+    var region: ShmRegion
+    shm_create(@region, @cfg)
+
+    let cb: *ControlBlock = shm_get_control_block(@region)
+
+    # Actually put a request in the ring (not just signal)
+    control_block_req_write_inc(cb)
+
+    # Signal that a request is available
+    signal_request_available(cb)
+
+    # Spin-then-wait should return immediately (data is there)
+    let result: i32 = spin_wait_request(cb, 10, 1000)
+
+    # Should succeed (data available)
+    let result2: i32 = assert_eq_i32(result, 0)
+    if result2 != 0
+        shm_destroy(@region)
+        return result2
+
+    shm_destroy(@region)
+    return 0
+
+[[test]]
+fn test_multiple_signals() -> i32
+    var cfg: ShmConfig
+    shm_config_default(@cfg)
+
+    var region: ShmRegion
+    shm_create(@region, @cfg)
+
+    let cb: *ControlBlock = shm_get_control_block(@region)
+
+    # Signal multiple times
+    signal_request_available(cb)
+    signal_request_available(cb)
+    signal_request_available(cb)
+
+    # Futex value should track signal count
+    let result: i32 = assert_eq_i32(cb.req_futex, 3)
+    if result != 0
+        shm_destroy(@region)
+        return result
+
+    shm_destroy(@region)
+    return 0

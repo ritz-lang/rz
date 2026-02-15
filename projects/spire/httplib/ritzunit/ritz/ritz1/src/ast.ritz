@@ -1,0 +1,333 @@
+# ritz1/src/ast.ritz - Abstract Syntax Tree Definitions
+#
+# Simple AST structures for the ritz1 compiler.
+# Designed to be easy to parse and emit to LLVM IR.
+
+import tokens_gen
+
+# Expression kinds
+const EXPR_INT_LIT: i32 = 1
+const EXPR_STRING_LIT: i32 = 2
+const EXPR_NIL_LIT: i32 = 3  # nil literal (null pointer)
+const EXPR_IDENT: i32 = 4
+const EXPR_BINARY: i32 = 5
+const EXPR_UNARY: i32 = 6
+const EXPR_CALL: i32 = 7
+const EXPR_CAST: i32 = 8
+const EXPR_INDEX: i32 = 9  # Array/pointer indexing: expr[index]
+const EXPR_MEMBER: i32 = 10  # Member access: expr.field (TODO: not yet implemented in emitter)
+const EXPR_STRUCT_LIT: i32 = 11  # Struct literal: Type { field: value, ... }
+const EXPR_METHOD: i32 = 12      # Method call: expr.method(args)
+const EXPR_CHAR_LIT: i32 = 13    # Character literal: 'a'
+
+# Binary operators
+const OP_ADD: i32 = 1
+const OP_SUB: i32 = 2
+const OP_MUL: i32 = 3
+const OP_DIV: i32 = 4
+const OP_MOD: i32 = 5
+const OP_EQ: i32 = 6
+const OP_NE: i32 = 7
+const OP_LT: i32 = 8
+const OP_GT: i32 = 9
+const OP_LE: i32 = 10
+const OP_GE: i32 = 11
+const OP_AND: i32 = 12
+const OP_OR: i32 = 13
+
+# Bitwise operators
+const OP_BIT_AND: i32 = 14
+const OP_BIT_OR: i32 = 15
+const OP_BIT_XOR: i32 = 16
+
+# Unary operators
+const OP_NEG: i32 = 20
+const OP_NOT: i32 = 21
+const OP_DEREF: i32 = 22  # Pointer dereference: *expr
+const OP_ADDR: i32 = 23   # Address-of: @expr (where is this @at?)
+const OP_BIT_NOT: i32 = 24  # Bitwise NOT: ~expr
+
+# Statement kinds
+const STMT_VAR_DECL: i32 = 1
+const STMT_ASSIGN: i32 = 2
+const STMT_RETURN: i32 = 3
+const STMT_IF: i32 = 4
+const STMT_WHILE: i32 = 5
+const STMT_EXPR: i32 = 6
+const STMT_MEMBER_ASSIGN: i32 = 7  # ptr.field = value
+const STMT_MEMBER_INDEX_ASSIGN: i32 = 8  # ptr.field[index] = value
+const STMT_INDEX_ASSIGN: i32 = 9  # name[index] = value
+const STMT_BREAK: i32 = 10        # break statement
+const STMT_CONTINUE: i32 = 11     # continue statement (for future use)
+const STMT_LOCAL_FIELD_ASSIGN: i32 = 12  # local_var.field = value
+const STMT_LOCAL_FIELD_INDEX_ASSIGN: i32 = 13  # local_var.field[index] = value
+
+# Type kinds
+const TYPE_VOID: i32 = 0       # No return type (void)
+const TYPE_I32: i32 = 1
+const TYPE_I64: i32 = 2
+const TYPE_U8: i32 = 3
+const TYPE_BOOL: i32 = 4
+const TYPE_PTR: i32 = 5
+const TYPE_PTR_PTR: i32 = 6  # Pointer-to-pointer (**u8, etc.)
+const TYPE_I8: i32 = 7
+const TYPE_U64: i32 = 8       # Unsigned 64-bit integer
+const TYPE_STRUCT: i32 = 100  # Named struct type (100+ reserved for structs)
+const TYPE_ARRAY: i32 = 101   # Array type [N]T - stores size and element type
+const TYPE_REF: i32 = 102     # Immutable reference &T (emits as pointer)
+const TYPE_MUT_REF: i32 = 103 # Mutable reference &mut T (emits as pointer)
+
+# Source location span for DWARF debug info
+struct Span
+  line: i32
+  col: i32
+
+# Expression node
+struct Expr
+  kind: i32
+  span: Span  # Source location for DWARF debug info
+  # For EXPR_INT_LIT
+  int_val: i64
+  # For EXPR_STRING_LIT
+  string_ptr: *u8
+  string_len: i32
+  # For EXPR_IDENT
+  ident_ptr: *u8
+  ident_len: i32
+  # For EXPR_BINARY and EXPR_INDEX
+  op: i32
+  left: *Expr     # Binary: left operand, Index: base expression
+  right: *Expr    # Binary: right operand, Index: index expression
+  # For EXPR_UNARY
+  operand: *Expr
+  # For EXPR_CALL
+  func_name: *u8
+  func_name_len: i32
+  call_type_suffix: *u8       # Type suffix for generic calls, e.g., "$u8" for vec_new<u8>()
+  call_type_suffix_len: i32
+  args: *Expr        # Linked list of args (using 'next' below)
+  # For EXPR_METHOD: receiver in 'left', method name in 'ident_ptr/ident_len', args in 'args'
+  # Linked list
+  next: *Expr
+
+# Statement node
+struct Stmt
+  kind: i32
+  span: Span  # Source location for DWARF debug info
+  # For STMT_VAR_DECL
+  var_name: *u8
+  var_name_len: i32
+  var_type: i32
+  var_type_name: *u8        # Struct name when var_type == TYPE_STRUCT
+  var_type_name_len: i32
+  var_array_size: i32       # Array size when var_type == TYPE_ARRAY
+  var_array_elem_type: i32  # Element type when var_type == TYPE_ARRAY
+  var_pointee_type: i32     # Element type when var_type == TYPE_PTR (e.g., TYPE_U8 for *u8)
+  var_init: *Expr
+  # For STMT_ASSIGN
+  assign_target: *u8
+  assign_target_len: i32
+  assign_value: *Expr
+  # For STMT_RETURN
+  return_value: *Expr
+  # For STMT_IF
+  if_cond: *Expr
+  if_then: *Stmt     # Body (linked list of statements)
+  if_else: *Stmt     # Optional else body
+  # For STMT_WHILE
+  while_cond: *Expr
+  while_body: *Stmt
+  # For STMT_EXPR
+  expr: *Expr
+  # Linked list
+  next: *Stmt
+
+# Generic type parameter (e.g., T in fn vec_new<T>())
+struct TypeParam
+  name: *u8
+  name_len: i32
+  next: *TypeParam  # For multiple params: <K, V>
+
+# Function parameter
+struct Param
+  name: *u8
+  name_len: i32
+  param_type: i32
+  param_type_name: *u8      # Struct name when param_type == TYPE_STRUCT
+  param_type_name_len: i32
+  param_pointee_type: i32   # Element type when param_type == TYPE_PTR
+  next: *Param
+
+# Function definition
+struct FnDef
+  name: *u8
+  name_len: i32
+  params: *Param
+  return_type: i32
+  return_type_name: *u8   # Struct name when return_type == TYPE_STRUCT
+  return_type_name_len: i32
+  body: *Stmt        # Linked list of statements
+  line: i32          # Source line for DWARF debug info
+  next: *FnDef
+  type_params: *TypeParam   # Generic type parameters: <T>, <K, V>, etc. (at end to preserve layout)
+
+# Const declaration
+struct ConstEntry
+  name: *u8
+  name_len: i32
+  const_type: i32   # Type of the constant (TYPE_I32, TYPE_I64, etc.)
+  value: i64        # For now, only support integer constants
+  next: *ConstEntry
+
+# Struct field
+struct StructField
+  name: *u8
+  name_len: i32
+  field_type: i32
+  # For TYPE_STRUCT fields (nested structs):
+  field_type_name: *u8         # Struct name when field_type == TYPE_STRUCT
+  field_type_name_len: i32
+  # For TYPE_ARRAY fields:
+  array_size: i32              # Number of elements (e.g., 16 for [16]i32)
+  array_elem_type: i32         # Element type (e.g., TYPE_I32, TYPE_STRUCT)
+  array_elem_type_name: *u8    # Struct name when array_elem_type == TYPE_STRUCT
+  array_elem_type_name_len: i32
+  next: *StructField
+
+# Struct definition
+struct StructDef
+  name: *u8
+  name_len: i32
+  fields: *StructField
+  next: *StructDef
+  type_params: *TypeParam   # Generic type parameters: <T>, <K, V>, etc. (at end to preserve layout)
+
+# Import path segment (linked list for "ritzlib.sys" -> ["ritzlib", "sys"])
+struct ImportPath
+  segment: *u8       # Pointer to segment in source
+  segment_len: i32   # Length of segment
+  next: *ImportPath  # Next segment
+
+# Import declaration
+struct ImportDecl
+  path: *ImportPath  # Path segments (e.g., ritzlib.sys)
+  next: *ImportDecl  # Next import
+
+# Global variable definition
+struct GlobalVarDef
+  name: *u8
+  name_len: i32
+  var_type: i32          # TYPE_I32, TYPE_I64, TYPE_PTR, TYPE_STRUCT, etc.
+  type_name: *u8         # For struct types
+  type_name_len: i32
+  init_expr: *Expr       # Optional initializer expression (can be 0)
+  next: *GlobalVarDef
+
+# Impl block definition
+# Represents: impl<T> Trait for Type { methods... } or impl<T> Type { methods... }
+# For "impl<T> Drop for Vec<T>":
+#   - trait_name = "Drop" (ptr/len)
+#   - type_name = "Vec" (ptr/len)
+#   - type_params = linked list with T
+#   - methods = linked list of FnDef
+# For inherent impl "impl<T> Vec<T>":
+#   - trait_name = nil (0 ptr)
+#   - type_name = "Vec" (ptr/len)
+struct ImplBlock
+  trait_name: *u8        # Trait name (nil for inherent impl)
+  trait_name_len: i32
+  type_name: *u8         # Type being implemented for (e.g., "Vec", "String")
+  type_name_len: i32
+  type_params: *TypeParam # Generic params: <T>, <K, V>, etc.
+  methods: *FnDef        # Linked list of methods
+  next: *ImplBlock       # Next impl block in module
+
+# Module (top-level)
+struct Module
+  imports: *ImportDecl   # List of import declarations
+  constants: *ConstEntry
+  structs: *StructDef
+  functions: *FnDef
+  globals: *GlobalVarDef # Global variables
+  impls: *ImplBlock      # Impl blocks
+
+# Postfix operation kinds
+const POSTFIX_CALL: i32 = 1
+const POSTFIX_INDEX: i32 = 2
+const POSTFIX_MEMBER: i32 = 3
+const POSTFIX_CAST: i32 = 4
+
+# Binary operation chain (for left-factored grammar)
+# Used to avoid exponential backtracking in expression parsing
+struct BinaryOp
+  op: i32           # OP_ADD, OP_SUB, etc.
+  right: *Expr      # Right operand
+  next: *BinaryOp   # Next operation in chain (for a + b + c)
+
+# Cast operation chain (for left-factored cast expression)
+# Handles: expr as type1 as type2 ...
+struct CastTail
+  cast_type: i32    # TYPE_I32, TYPE_PTR, etc.
+  next: *CastTail   # Next cast in chain
+
+# Postfix operation (for building expression chains)
+struct PostfixOp
+  kind: i32
+  # For POSTFIX_CALL
+  args: *Expr
+  call_type_suffix: *u8      # Type suffix for generic calls, e.g., "$u8" for vec_new<u8>()
+  call_type_suffix_len: i32
+  # For POSTFIX_INDEX
+  index: *Expr
+  # For POSTFIX_MEMBER
+  member_name: *u8
+  member_len: i32
+  # For POSTFIX_CAST
+  cast_type: i32
+  # Linked list
+  next: *PostfixOp
+
+# Field initializer in struct literal
+struct FieldInit
+  name: *u8
+  name_len: i32
+  value: *Expr
+  next: *FieldInit
+
+# Struct literal (list of field initializers)
+struct StructLit
+  fields: *FieldInit
+
+# Token structure is defined in tokens_gen.ritz to avoid duplication
+# Parser state
+struct Parser
+  tokens: *Token
+  token_count: i32
+  pos: i32
+  error: i32
+  error_msg: *u8
+  heap_base: *u8
+  heap_offset: i64
+  module: *Module
+  # For struct return types - stores the last parsed type name
+  last_type_name: *u8
+  last_type_name_len: i32
+  # For pointer types - stores the element type
+  last_pointee_type: i32     # Element type for pointers (e.g., TYPE_U8 for *u8)
+  # For array types - stores the last parsed array info
+  last_array_size: i32       # Size of array (e.g., 16 for [16]i32)
+  last_array_elem_type: i32  # Element type (e.g., TYPE_I32)
+  last_array_elem_type_name: *u8    # Struct name when array_elem_type == TYPE_STRUCT
+  last_array_elem_type_name_len: i32
+  # For function return types - stores the return type name before body parsing overwrites it
+  fn_return_type_name: *u8
+  fn_return_type_name_len: i32
+  # For generic function calls - stores the last parsed generic type arg suffix
+  last_call_type_suffix: *u8       # e.g., "$u8" for vec_with_cap<u8>()
+  last_call_type_suffix_len: i32
+  # For reference types - stores the inner type
+  last_ref_inner_type: i32         # Inner type for &T or &mut T (e.g., TYPE_STRUCT)
+
+# Note: AST construction helpers are in ast_helpers.ritz (with parser allocation)
+# The simpler helpers below are deprecated and were used for early development.
+# They conflict with ast_helpers.ritz functions that have different signatures.

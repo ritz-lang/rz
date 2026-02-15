@@ -1,0 +1,533 @@
+# ritz1/test/test_e2e_typecheck.ritz - End-to-End Type Checking Tests
+#
+# Tests that wire: source code → lexer → parser → checker
+# Verifies the full pipeline works together.
+#
+# Run with:
+# python ritz0/ritz0.py --test ritz1/test/test_e2e_typecheck.ritz
+
+# ============================================================================
+# Type Constants (from types.ritz)
+# ============================================================================
+
+const TY_VOID: i32 = 0
+const TY_BOOL: i32 = 1
+const TY_I8: i32 = 2
+const TY_I16: i32 = 3
+const TY_I32: i32 = 4
+const TY_I64: i32 = 5
+const TY_PTR: i32 = 10
+const TY_STRUCT: i32 = 20
+const TY_ERROR: i32 = 99
+
+# ============================================================================
+# Symbol Constants (from symbols.ritz)
+# ============================================================================
+
+const SYM_VAR: i32 = 1
+const SYM_FN: i32 = 2
+const SYM_TYPE: i32 = 3
+const SYM_PARAM: i32 = 4
+
+# ============================================================================
+# Expression Constants (from parser.ritz)
+# ============================================================================
+
+const EXPR_INT_LIT: i32 = 1
+const EXPR_IDENT: i32 = 2
+const EXPR_STRING_LIT: i32 = 3
+const EXPR_BOOL_LIT: i32 = 4
+const EXPR_BIN_OP: i32 = 5
+
+# Statement kinds
+const STMT_VAR: i32 = 21
+const STMT_LET: i32 = 22
+
+# Token types for operators
+const TOK_PLUS: i32 = 28
+const TOK_LT: i32 = 38
+const TOK_EQEQ: i32 = 43
+
+# ============================================================================
+# Minimal Structures
+# ============================================================================
+
+struct TypeList
+  ty: *Type
+  next: *TypeList
+
+struct Field
+  name: *i8
+  name_len: i32
+  ty: *Type
+  offset: i32
+  next: *Field
+
+struct Type
+  kind: i32
+  is_mut: i32
+  size: i32
+  inner: *Type
+  name: *i8
+  name_len: i32
+  fields: *Field
+  params: *TypeList
+  ret: *Type
+  next: *Type
+
+struct Symbol
+  name: *i8
+  name_len: i32
+  kind: i32
+  ty: *Type
+  is_mut: i32
+  next: *Symbol
+
+struct Scope
+  symbols: *Symbol
+  parent: *Scope
+  depth: i32
+
+struct Expr
+  kind: i32
+  val1: i32        # position in source for IDENT
+  val2: i32        # length for IDENT, operator for BIN_OP
+  left: *i32
+  right: *i32
+  next: *i32
+
+struct Checker
+  global: *Scope
+  current: *Scope
+  errors: i32
+  current_fn: *Type
+  src: *i8
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+fn names_equal(a: *i8, a_len: i32, b: *i8, b_len: i32) -> i32
+  if a_len != b_len
+    return 0
+  var i: i32 = 0
+  while i < a_len
+    let ca: i32 = *(a + i) as i32
+    let cb: i32 = *(b + i) as i32
+    if ca != cb
+      return 0
+    i = i + 1
+  1
+
+fn type_new(kind: i32) -> *Type
+  let ty: *Type = __builtin_alloca(128) as *Type
+  (*ty).kind = kind
+  (*ty).is_mut = 0
+  (*ty).size = 0
+  (*ty).inner = 0 as *Type
+  (*ty).name = 0 as *i8
+  (*ty).name_len = 0
+  (*ty).fields = 0 as *Field
+  (*ty).params = 0 as *TypeList
+  (*ty).ret = 0 as *Type
+  (*ty).next = 0 as *Type
+  ty
+
+fn type_error() -> *Type
+  type_new(TY_ERROR)
+
+fn scope_lookup_local(s: *Scope, name: *i8, name_len: i32) -> *Symbol
+  if s == 0 as *Scope
+    return 0 as *Symbol
+  var sym: *Symbol = (*s).symbols
+  while sym != 0 as *Symbol
+    if names_equal((*sym).name, (*sym).name_len, name, name_len) == 1
+      return sym
+    sym = (*sym).next
+  0 as *Symbol
+
+fn scope_lookup(s: *Scope, name: *i8, name_len: i32) -> *Symbol
+  var current: *Scope = s
+  while current != 0 as *Scope
+    let sym: *Symbol = scope_lookup_local(current, name, name_len)
+    if sym != 0 as *Symbol
+      return sym
+    current = (*current).parent
+  0 as *Symbol
+
+fn scope_insert(s: *Scope, sym: *Symbol) -> *Symbol
+  (*sym).next = (*s).symbols
+  (*s).symbols = sym
+  sym
+
+# ============================================================================
+# Expression Type Checker (minimal version for e2e tests)
+# ============================================================================
+
+fn check_expr(c: *Checker, e: *Expr) -> *Type
+  if e == 0 as *Expr
+    return type_error()
+
+  let kind: i32 = (*e).kind
+
+  if kind == EXPR_INT_LIT
+    return type_new(TY_I32)
+
+  if kind == EXPR_BOOL_LIT
+    return type_new(TY_BOOL)
+
+  if kind == EXPR_STRING_LIT
+    let ty: *Type = type_new(TY_PTR)
+    (*ty).inner = type_new(TY_I8)
+    return ty
+
+  if kind == EXPR_IDENT
+    let name: *i8 = (*c).src + (*e).val1
+    let name_len: i32 = (*e).val2
+    let sym: *Symbol = scope_lookup((*c).current, name, name_len)
+    if sym == 0 as *Symbol
+      (*c).errors = (*c).errors + 1
+      return type_error()
+    return (*sym).ty
+
+  if kind == EXPR_BIN_OP
+    let left_ty: *Type = check_expr(c, (*e).left as *Expr)
+    let right_ty: *Type = check_expr(c, (*e).right as *Expr)
+    let op: i32 = (*e).val2
+
+    # Arithmetic: +
+    if op == TOK_PLUS
+      return left_ty
+
+    # Comparison: <, ==
+    if op == TOK_LT
+      return type_new(TY_BOOL)
+    if op == TOK_EQEQ
+      return type_new(TY_BOOL)
+
+    return left_ty
+
+  (*c).errors = (*c).errors + 1
+  type_error()
+
+# ============================================================================
+# E2E Tests - Manual AST Construction
+# ============================================================================
+
+# These tests manually construct ASTs that would be produced by the parser,
+# then verify the type checker handles them correctly.
+
+@test
+fn test_e2e_let_with_int_literal() -> i32
+  # Simulates: let x: i32 = 42
+  # Source: "let x: i32 = 42"
+  #          0123456789...
+  let src: *i8 = __builtin_alloca(20) as *i8
+  *(src + 0) = 108 as i8   # 'l'
+  *(src + 1) = 101 as i8   # 'e'
+  *(src + 2) = 116 as i8   # 't'
+  *(src + 3) = 32 as i8    # ' '
+  *(src + 4) = 120 as i8   # 'x'  <- identifier at position 4, length 1
+  *(src + 5) = 58 as i8    # ':'
+
+  # Set up checker
+  let scope: *Scope = __builtin_alloca(64) as *Scope
+  (*scope).symbols = 0 as *Symbol
+  (*scope).parent = 0 as *Scope
+  (*scope).depth = 0
+
+  let c: *Checker = __builtin_alloca(64) as *Checker
+  (*c).global = scope
+  (*c).current = scope
+  (*c).errors = 0
+  (*c).current_fn = 0 as *Type
+  (*c).src = src
+
+  # Create expression: 42 (int literal)
+  let lit: *Expr = __builtin_alloca(64) as *Expr
+  (*lit).kind = EXPR_INT_LIT
+  (*lit).val1 = 42
+
+  # Type check the literal
+  let ty: *Type = check_expr(c, lit)
+
+  assert (*ty).kind == TY_I32
+  assert (*c).errors == 0
+
+  # Now add 'x' to scope - inline type to avoid alloca reuse
+  let sym_ty: *Type = __builtin_alloca(128) as *Type
+  (*sym_ty).kind = TY_I32
+  (*sym_ty).is_mut = 0
+  (*sym_ty).inner = 0 as *Type
+  (*sym_ty).fields = 0 as *Field
+
+  let sym: *Symbol = __builtin_alloca(64) as *Symbol
+  (*sym).name = src + 4
+  (*sym).name_len = 1
+  (*sym).kind = SYM_VAR
+  (*sym).ty = sym_ty
+  (*sym).is_mut = 0
+  (*sym).next = 0 as *Symbol
+  scope_insert(scope, sym)
+
+  # Create identifier expression referencing 'x'
+  let id_expr: *Expr = __builtin_alloca(64) as *Expr
+  (*id_expr).kind = EXPR_IDENT
+  (*id_expr).val1 = 4   # position of 'x'
+  (*id_expr).val2 = 1   # length
+
+  let id_ty: *Type = check_expr(c, id_expr)
+  assert (*id_ty).kind == TY_I32
+  assert (*c).errors == 0
+  0
+
+@test
+fn test_e2e_binary_add() -> i32
+  # Simulates: x + y where both are i32
+  # Source: "x + y"
+  #          01234
+  let src: *i8 = __builtin_alloca(8) as *i8
+  *(src + 0) = 120 as i8   # 'x'
+  *(src + 1) = 32 as i8    # ' '
+  *(src + 2) = 43 as i8    # '+'
+  *(src + 3) = 32 as i8    # ' '
+  *(src + 4) = 121 as i8   # 'y'
+
+  let scope: *Scope = __builtin_alloca(64) as *Scope
+  (*scope).symbols = 0 as *Symbol
+  (*scope).parent = 0 as *Scope
+  (*scope).depth = 0
+
+  # Add x and y to scope - inline type allocation
+  let ty_i32: *Type = __builtin_alloca(128) as *Type
+  (*ty_i32).kind = TY_I32
+  (*ty_i32).is_mut = 0
+  (*ty_i32).inner = 0 as *Type
+  (*ty_i32).fields = 0 as *Field
+
+  let sym_x: *Symbol = __builtin_alloca(64) as *Symbol
+  (*sym_x).name = src + 0
+  (*sym_x).name_len = 1
+  (*sym_x).kind = SYM_VAR
+  (*sym_x).ty = ty_i32
+  (*sym_x).is_mut = 0
+  (*sym_x).next = 0 as *Symbol
+  scope_insert(scope, sym_x)
+
+  let sym_y: *Symbol = __builtin_alloca(64) as *Symbol
+  (*sym_y).name = src + 4
+  (*sym_y).name_len = 1
+  (*sym_y).kind = SYM_VAR
+  (*sym_y).ty = ty_i32
+  (*sym_y).is_mut = 0
+  (*sym_y).next = 0 as *Symbol
+  scope_insert(scope, sym_y)
+
+  let c: *Checker = __builtin_alloca(64) as *Checker
+  (*c).global = scope
+  (*c).current = scope
+  (*c).errors = 0
+  (*c).current_fn = 0 as *Type
+  (*c).src = src
+
+  # Create AST: x + y
+  let left: *Expr = __builtin_alloca(64) as *Expr
+  (*left).kind = EXPR_IDENT
+  (*left).val1 = 0
+  (*left).val2 = 1
+
+  let right: *Expr = __builtin_alloca(64) as *Expr
+  (*right).kind = EXPR_IDENT
+  (*right).val1 = 4
+  (*right).val2 = 1
+
+  let binop: *Expr = __builtin_alloca(64) as *Expr
+  (*binop).kind = EXPR_BIN_OP
+  (*binop).val2 = TOK_PLUS
+  (*binop).left = left as *i32
+  (*binop).right = right as *i32
+
+  let result_ty: *Type = check_expr(c, binop)
+
+  assert (*result_ty).kind == TY_I32
+  assert (*c).errors == 0
+  0
+
+@test
+fn test_e2e_comparison_returns_bool() -> i32
+  # Simulates: a < b returns bool
+  let src: *i8 = __builtin_alloca(8) as *i8
+  *(src + 0) = 97 as i8    # 'a'
+  *(src + 1) = 32 as i8    # ' '
+  *(src + 2) = 60 as i8    # '<'
+  *(src + 3) = 32 as i8    # ' '
+  *(src + 4) = 98 as i8    # 'b'
+
+  let scope: *Scope = __builtin_alloca(64) as *Scope
+  (*scope).symbols = 0 as *Symbol
+  (*scope).parent = 0 as *Scope
+  (*scope).depth = 0
+
+  # Inline type allocation
+  let ty_i32: *Type = __builtin_alloca(128) as *Type
+  (*ty_i32).kind = TY_I32
+  (*ty_i32).is_mut = 0
+  (*ty_i32).inner = 0 as *Type
+  (*ty_i32).fields = 0 as *Field
+
+  let sym_a: *Symbol = __builtin_alloca(64) as *Symbol
+  (*sym_a).name = src + 0
+  (*sym_a).name_len = 1
+  (*sym_a).kind = SYM_VAR
+  (*sym_a).ty = ty_i32
+  (*sym_a).is_mut = 0
+  (*sym_a).next = 0 as *Symbol
+  scope_insert(scope, sym_a)
+
+  let sym_b: *Symbol = __builtin_alloca(64) as *Symbol
+  (*sym_b).name = src + 4
+  (*sym_b).name_len = 1
+  (*sym_b).kind = SYM_VAR
+  (*sym_b).ty = ty_i32
+  (*sym_b).is_mut = 0
+  (*sym_b).next = 0 as *Symbol
+  scope_insert(scope, sym_b)
+
+  let c: *Checker = __builtin_alloca(64) as *Checker
+  (*c).global = scope
+  (*c).current = scope
+  (*c).errors = 0
+  (*c).current_fn = 0 as *Type
+  (*c).src = src
+
+  let left: *Expr = __builtin_alloca(64) as *Expr
+  (*left).kind = EXPR_IDENT
+  (*left).val1 = 0
+  (*left).val2 = 1
+
+  let right: *Expr = __builtin_alloca(64) as *Expr
+  (*right).kind = EXPR_IDENT
+  (*right).val1 = 4
+  (*right).val2 = 1
+
+  let binop: *Expr = __builtin_alloca(64) as *Expr
+  (*binop).kind = EXPR_BIN_OP
+  (*binop).val2 = TOK_LT
+  (*binop).left = left as *i32
+  (*binop).right = right as *i32
+
+  let result_ty: *Type = check_expr(c, binop)
+
+  assert (*result_ty).kind == TY_BOOL
+  assert (*c).errors == 0
+  0
+
+@test
+fn test_e2e_undefined_variable_error() -> i32
+  # Simulates: using undefined variable 'z'
+  let src: *i8 = __builtin_alloca(4) as *i8
+  *(src + 0) = 122 as i8   # 'z'
+
+  let scope: *Scope = __builtin_alloca(64) as *Scope
+  (*scope).symbols = 0 as *Symbol
+  (*scope).parent = 0 as *Scope
+  (*scope).depth = 0
+
+  let c: *Checker = __builtin_alloca(64) as *Checker
+  (*c).global = scope
+  (*c).current = scope
+  (*c).errors = 0
+  (*c).current_fn = 0 as *Type
+  (*c).src = src
+
+  let id_expr: *Expr = __builtin_alloca(64) as *Expr
+  (*id_expr).kind = EXPR_IDENT
+  (*id_expr).val1 = 0   # 'z' at position 0
+  (*id_expr).val2 = 1   # length 1
+
+  let result_ty: *Type = check_expr(c, id_expr)
+
+  assert (*result_ty).kind == TY_ERROR
+  assert (*c).errors == 1
+  0
+
+@test
+fn test_e2e_nested_scopes() -> i32
+  # Test that inner scope can access outer scope variables
+  # Outer: x: i32
+  # Inner: y: bool, can access x
+  let src: *i8 = __builtin_alloca(8) as *i8
+  *(src + 0) = 120 as i8   # 'x'
+  *(src + 1) = 32 as i8    # ' '
+  *(src + 2) = 121 as i8   # 'y'
+
+  # Outer scope with 'x'
+  let outer: *Scope = __builtin_alloca(64) as *Scope
+  (*outer).symbols = 0 as *Symbol
+  (*outer).parent = 0 as *Scope
+  (*outer).depth = 0
+
+  # Inline type allocations
+  let ty_i32: *Type = __builtin_alloca(128) as *Type
+  (*ty_i32).kind = TY_I32
+  (*ty_i32).is_mut = 0
+  (*ty_i32).inner = 0 as *Type
+  (*ty_i32).fields = 0 as *Field
+
+  let ty_bool: *Type = __builtin_alloca(128) as *Type
+  (*ty_bool).kind = TY_BOOL
+  (*ty_bool).is_mut = 0
+  (*ty_bool).inner = 0 as *Type
+  (*ty_bool).fields = 0 as *Field
+
+  let sym_x: *Symbol = __builtin_alloca(64) as *Symbol
+  (*sym_x).name = src + 0
+  (*sym_x).name_len = 1
+  (*sym_x).kind = SYM_VAR
+  (*sym_x).ty = ty_i32
+  (*sym_x).is_mut = 0
+  (*sym_x).next = 0 as *Symbol
+  scope_insert(outer, sym_x)
+
+  # Inner scope with 'y', parent is outer
+  let inner: *Scope = __builtin_alloca(64) as *Scope
+  (*inner).symbols = 0 as *Symbol
+  (*inner).parent = outer
+  (*inner).depth = 1
+
+  let sym_y: *Symbol = __builtin_alloca(64) as *Symbol
+  (*sym_y).name = src + 2
+  (*sym_y).name_len = 1
+  (*sym_y).kind = SYM_VAR
+  (*sym_y).ty = ty_bool
+  (*sym_y).is_mut = 0
+  (*sym_y).next = 0 as *Symbol
+  scope_insert(inner, sym_y)
+
+  let c: *Checker = __builtin_alloca(64) as *Checker
+  (*c).global = outer
+  (*c).current = inner  # We're in the inner scope
+  (*c).errors = 0
+  (*c).current_fn = 0 as *Type
+  (*c).src = src
+
+  # Access 'y' from inner scope - should be bool
+  let id_y: *Expr = __builtin_alloca(64) as *Expr
+  (*id_y).kind = EXPR_IDENT
+  (*id_y).val1 = 2
+  (*id_y).val2 = 1
+
+  let ty_y: *Type = check_expr(c, id_y)
+  assert (*ty_y).kind == TY_BOOL
+
+  # Access 'x' from outer scope - should be i32
+  let id_x: *Expr = __builtin_alloca(64) as *Expr
+  (*id_x).kind = EXPR_IDENT
+  (*id_x).val1 = 0
+  (*id_x).val2 = 1
+
+  let ty_x: *Type = check_expr(c, id_x)
+  assert (*ty_x).kind == TY_I32
+
+  assert (*c).errors == 0
+  0

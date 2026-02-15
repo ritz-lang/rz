@@ -1,0 +1,323 @@
+# 52_uring: io_uring async I/O tests
+#
+# Tests the io_uring bindings in ritzlib/uring.ritz:
+# - Ring initialization and teardown
+# - Basic NOP submission
+# - Async file read
+# - Async file write
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.uring
+
+# Test 1: Initialize and destroy an io_uring instance
+fn test_uring_init() -> bool
+    prints("test_uring_init... ")
+
+    var ring: IoUring
+    let ret: i32 = uring_init(&ring, 32)
+
+    if ret < 0
+        prints("FAIL: uring_init returned ")
+        print_int(ret as i64)
+        prints("\n")
+        return false
+
+    # Verify we got a valid ring fd
+    if ring.ring_fd < 0
+        prints("FAIL: invalid ring_fd\n")
+        uring_destroy(&ring)
+        return false
+
+    # Verify queue sizes are reasonable
+    if ring.sq_entries < 32
+        prints("FAIL: sq_entries too small\n")
+        uring_destroy(&ring)
+        return false
+
+    if ring.cq_entries < 32
+        prints("FAIL: cq_entries too small\n")
+        uring_destroy(&ring)
+        return false
+
+    # Clean up
+    uring_destroy(&ring)
+
+    prints("OK\n")
+    return true
+
+# Test 2: Submit a NOP operation
+fn test_uring_nop() -> bool
+    prints("test_uring_nop... ")
+
+    var ring: IoUring
+    let ret: i32 = uring_init(&ring, 32)
+    if ret < 0
+        prints("FAIL: uring_init\n")
+        return false
+
+    # Get an SQE
+    let sqe: *IoUringSqe = uring_get_sqe(&ring)
+    if sqe == (null)
+        prints("FAIL: uring_get_sqe returned null\n")
+        uring_destroy(&ring)
+        return false
+
+    # Prepare a NOP
+    sqe.opcode = IORING_OP_NOP
+    sqe.flags = 0
+    sqe.ioprio = 0
+    sqe.fd = 0
+    sqe.off = 0
+    sqe.addr = 0
+    sqe.len = 0
+    sqe.rw_flags = 0
+    sqe.user_data = 42  # Marker to verify completion
+    sqe.buf_index = 0
+    sqe.personality = 0
+    sqe.splice_fd_in = 0
+    sqe.pad1 = 0
+    sqe.pad2 = 0
+
+    # Advance the tail
+    uring_sqe_submit(&ring)
+
+    # Submit and wait for completion
+    let submit_ret: i32 = uring_submit_and_wait(&ring, 1)
+    if submit_ret < 0
+        prints("FAIL: uring_submit_and_wait returned ")
+        print_int(submit_ret as i64)
+        prints("\n")
+        uring_destroy(&ring)
+        return false
+
+    # Get the completion
+    let cqe: *IoUringCqe = uring_peek_cqe(&ring)
+    if cqe == (null)
+        prints("FAIL: no CQE available\n")
+        uring_destroy(&ring)
+        return false
+
+    # Verify user_data came back correctly
+    if cqe.user_data != 42
+        prints("FAIL: user_data mismatch\n")
+        uring_destroy(&ring)
+        return false
+
+    # NOP should return 0
+    if cqe.res != 0
+        prints("FAIL: NOP result was ")
+        print_int(cqe.res as i64)
+        prints("\n")
+        uring_destroy(&ring)
+        return false
+
+    uring_cqe_seen(&ring)
+    uring_destroy(&ring)
+
+    prints("OK\n")
+    return true
+
+# Test 3: Async write to a file
+fn test_uring_write() -> bool
+    prints("test_uring_write... ")
+
+    # Create a temp file for testing
+    let path = "/tmp/ritz_uring_test.txt"
+    let fd: i32 = sys_open3(path, O_CREAT | O_RDWR | O_TRUNC, 420)
+    if fd < 0
+        prints("FAIL: couldn't create temp file\n")
+        return false
+
+    var ring: IoUring
+    let ret: i32 = uring_init(&ring, 32)
+    if ret < 0
+        prints("FAIL: uring_init\n")
+        sys_close(fd)
+        return false
+
+    # Prepare write data
+    var data: [16]u8
+    data[0] = 72   # H
+    data[1] = 101  # e
+    data[2] = 108  # l
+    data[3] = 108  # l
+    data[4] = 111  # o
+    data[5] = 10   # \n
+
+    # Get SQE and prep write
+    let sqe: *IoUringSqe = uring_get_sqe(&ring)
+    if sqe == (null)
+        prints("FAIL: couldn't get SQE\n")
+        uring_destroy(&ring)
+        sys_close(fd)
+        return false
+
+    uring_prep_write(sqe, fd, &data[0], 6, 0, 100)
+    uring_sqe_submit(&ring)
+
+    # Submit and wait
+    let submit_ret: i32 = uring_submit_and_wait(&ring, 1)
+    if submit_ret < 0
+        prints("FAIL: submit_and_wait\n")
+        uring_destroy(&ring)
+        sys_close(fd)
+        return false
+
+    # Check completion
+    let cqe: *IoUringCqe = uring_peek_cqe(&ring)
+    if cqe == (null)
+        prints("FAIL: no CQE\n")
+        uring_destroy(&ring)
+        sys_close(fd)
+        return false
+
+    if cqe.res != 6
+        prints("FAIL: wrote ")
+        print_int(cqe.res as i64)
+        prints(" bytes instead of 6\n")
+        uring_destroy(&ring)
+        sys_close(fd)
+        sys_unlink(path)
+        return false
+
+    if cqe.user_data != 100
+        prints("FAIL: user_data mismatch\n")
+        uring_destroy(&ring)
+        sys_close(fd)
+        sys_unlink(path)
+        return false
+
+    uring_cqe_seen(&ring)
+    uring_destroy(&ring)
+    sys_close(fd)
+    sys_unlink(path)
+
+    prints("OK\n")
+    return true
+
+# Test 4: Async read from a file
+fn test_uring_read() -> bool
+    prints("test_uring_read... ")
+
+    # Create a temp file with known content
+    let path = "/tmp/ritz_uring_read_test.txt"
+    let fd: i32 = sys_open3(path, O_CREAT | O_RDWR | O_TRUNC, 420)
+    if fd < 0
+        prints("FAIL: couldn't create temp file\n")
+        return false
+
+    # Write some data synchronously first
+    var data: [8]u8
+    data[0] = 84   # T
+    data[1] = 101  # e
+    data[2] = 115  # s
+    data[3] = 116  # t
+    data[4] = 10   # \n
+    sys_write(fd, &data[0], 5)
+
+    # Seek back to beginning
+    sys_lseek(fd, 0, 0)
+
+    # Now read with io_uring
+    var ring: IoUring
+    let ret: i32 = uring_init(&ring, 32)
+    if ret < 0
+        prints("FAIL: uring_init\n")
+        sys_close(fd)
+        sys_unlink(path)
+        return false
+
+    var buf: [16]u8
+    var i: i64 = 0
+    while i < 16
+        buf[i] = 0
+        i += 1
+
+    let sqe: *IoUringSqe = uring_get_sqe(&ring)
+    if sqe == (null)
+        prints("FAIL: couldn't get SQE\n")
+        uring_destroy(&ring)
+        sys_close(fd)
+        sys_unlink(path)
+        return false
+
+    uring_prep_read(sqe, fd, &buf[0], 16, 0, 200)
+    uring_sqe_submit(&ring)
+
+    let submit_ret: i32 = uring_submit_and_wait(&ring, 1)
+    if submit_ret < 0
+        prints("FAIL: submit_and_wait\n")
+        uring_destroy(&ring)
+        sys_close(fd)
+        sys_unlink(path)
+        return false
+
+    let cqe: *IoUringCqe = uring_peek_cqe(&ring)
+    if cqe == (null)
+        prints("FAIL: no CQE\n")
+        uring_destroy(&ring)
+        sys_close(fd)
+        sys_unlink(path)
+        return false
+
+    if cqe.res != 5
+        prints("FAIL: read ")
+        print_int(cqe.res as i64)
+        prints(" bytes instead of 5\n")
+        uring_destroy(&ring)
+        sys_close(fd)
+        sys_unlink(path)
+        return false
+
+    # Verify content
+    if buf[0] != 84 || buf[1] != 101 || buf[2] != 115 || buf[3] != 116
+        prints("FAIL: content mismatch\n")
+        uring_destroy(&ring)
+        sys_close(fd)
+        sys_unlink(path)
+        return false
+
+    uring_cqe_seen(&ring)
+    uring_destroy(&ring)
+    sys_close(fd)
+    sys_unlink(path)
+
+    prints("OK\n")
+    return true
+
+fn main() -> i32
+    prints("=== io_uring tests ===\n")
+
+    var passed: i32 = 0
+    var failed: i32 = 0
+
+    if test_uring_init()
+        passed += 1
+    else
+        failed += 1
+
+    if test_uring_nop()
+        passed += 1
+    else
+        failed += 1
+
+    if test_uring_write()
+        passed += 1
+    else
+        failed += 1
+
+    if test_uring_read()
+        passed += 1
+    else
+        failed += 1
+
+    prints("\nResults: ")
+    print_int(passed as i64)
+    prints(" passed, ")
+    print_int(failed as i64)
+    prints(" failed\n")
+
+    if failed > 0
+        return 1
+    return 0

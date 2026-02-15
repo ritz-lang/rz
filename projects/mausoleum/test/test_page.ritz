@@ -1,0 +1,372 @@
+# test/test_page.ritz - Tests for page structure and operations
+#
+# Tests for page initialization, checksums, and validation
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+import ritzlib.memory
+
+import lib.m7m_types
+import lib.page
+
+# ============================================================================
+# Page Initialization Tests
+# ============================================================================
+
+[[test]]
+fn test_page_init_meta() -> i32
+    var page: Page
+    page_init_meta(@page, 0)
+
+    if page.header.magic != PAGE_MAGIC_META
+        return 1
+    if page.header.page_id != 0
+        return 2
+    if page.header.version != PAGE_VERSION
+        return 3
+    if page.header.flags != 0
+        return 4
+    0
+
+[[test]]
+fn test_page_init_btree_leaf() -> i32
+    var page: Page
+    page_init_btree(@page, 42, 1)
+
+    if page.header.magic != PAGE_MAGIC_BTREE
+        return 1
+    if page.header.page_id != 42
+        return 2
+    if page_is_leaf(@page) != 1
+        return 3
+    0
+
+[[test]]
+fn test_page_init_btree_internal() -> i32
+    var page: Page
+    page_init_btree(@page, 42, 0)
+
+    if page.header.magic != PAGE_MAGIC_BTREE
+        return 1
+    if page_is_leaf(@page) != 0
+        return 2
+    0
+
+[[test]]
+fn test_page_init_heap() -> i32
+    var page: Page
+    page_init_heap(@page, 100)
+
+    if page.header.magic != PAGE_MAGIC_HEAP
+        return 1
+    if page.header.page_id != 100
+        return 2
+    0
+
+[[test]]
+fn test_page_init_free_space() -> i32
+    var page: Page
+    page_init_heap(@page, 0)
+
+    # Fresh page should have all data area as free space
+    if page.header.free_start != 0
+        return 1
+    if page.header.free_end != PAGE_DATA_SIZE as i32
+        return 2
+    if page_free_space(@page) != PAGE_DATA_SIZE as i32
+        return 3
+    0
+
+# ============================================================================
+# Page Type Tests
+# ============================================================================
+
+[[test]]
+fn test_page_type_meta() -> i32
+    var page: Page
+    page_init_meta(@page, 0)
+    if page_type(@page) != PAGE_MAGIC_META
+        return 1
+    0
+
+[[test]]
+fn test_page_type_btree() -> i32
+    var page: Page
+    page_init_btree(@page, 0, 1)
+    if page_type(@page) != PAGE_MAGIC_BTREE
+        return 1
+    0
+
+[[test]]
+fn test_page_type_heap() -> i32
+    var page: Page
+    page_init_heap(@page, 0)
+    if page_type(@page) != PAGE_MAGIC_HEAP
+        return 1
+    0
+
+# ============================================================================
+# Page Dirty Flag Tests
+# ============================================================================
+
+[[test]]
+fn test_page_dirty_initial() -> i32
+    var page: Page
+    page_init_heap(@page, 0)
+    if page_is_dirty(@page) != 0
+        return 1
+    0
+
+[[test]]
+fn test_page_dirty_set() -> i32
+    var page: Page
+    page_init_heap(@page, 0)
+
+    page_set_dirty(@page)
+    if page_is_dirty(@page) != 1
+        return 1
+    0
+
+[[test]]
+fn test_page_dirty_clear() -> i32
+    var page: Page
+    page_init_heap(@page, 0)
+
+    page_set_dirty(@page)
+    page_clear_dirty(@page)
+    if page_is_dirty(@page) != 0
+        return 1
+    0
+
+# ============================================================================
+# Page Data Access Tests
+# ============================================================================
+
+[[test]]
+fn test_page_data_ptr() -> i32
+    var page: Page
+    page_init_heap(@page, 0)
+
+    let data: *u8 = page_data(@page)
+    if data != @page.data[0]
+        return 1
+    0
+
+[[test]]
+fn test_page_data_at_valid() -> i32
+    var page: Page
+    page_init_heap(@page, 0)
+
+    # Write some data
+    page.data[100] = 42
+
+    let ptr: *u8 = page_data_at(@page, 100)
+    if ptr == null
+        return 1
+    if *ptr != 42
+        return 2
+    0
+
+[[test]]
+fn test_page_data_at_invalid() -> i32
+    var page: Page
+    page_init_heap(@page, 0)
+
+    # Negative offset
+    let ptr1: *u8 = page_data_at(@page, -1)
+    if ptr1 != null
+        return 1
+
+    # Beyond data area
+    let ptr2: *u8 = page_data_at(@page, PAGE_DATA_SIZE as i32)
+    if ptr2 != null
+        return 2
+
+    0
+
+# ============================================================================
+# Checksum Tests
+# ============================================================================
+
+[[test]]
+fn test_page_checksum_empty() -> i32
+    var page: Page
+    page_init_heap(@page, 0)
+
+    let crc: i32 = page_calc_checksum(@page)
+    # Just verify it's non-zero (would be astronomically unlikely to be 0)
+    # Actually, 0 is valid, so just verify it's deterministic
+    let crc2: i32 = page_calc_checksum(@page)
+    if crc != crc2
+        return 1
+    0
+
+[[test]]
+fn test_page_checksum_with_data() -> i32
+    var page: Page
+    page_init_heap(@page, 0)
+
+    page.data[0] = 1
+    page.data[1] = 2
+    page.data[2] = 3
+
+    let crc1: i32 = page_calc_checksum(@page)
+
+    # Modify data
+    page.data[0] = 99
+
+    let crc2: i32 = page_calc_checksum(@page)
+
+    # Checksums should differ
+    if crc1 == crc2
+        return 1
+    0
+
+[[test]]
+fn test_page_update_checksum() -> i32
+    var page: Page
+    page_init_heap(@page, 0)
+
+    # Initially checksum is 0
+    if page.header.checksum != 0
+        return 1
+
+    # Update checksum
+    page_update_checksum(@page)
+
+    # Now it should be set
+    let expected: i32 = page_calc_checksum(@page)
+    if page.header.checksum != expected
+        return 2
+    0
+
+[[test]]
+fn test_page_verify_checksum_valid() -> i32
+    var page: Page
+    page_init_heap(@page, 0)
+
+    page.data[0] = 42
+    page_update_checksum(@page)
+
+    if page_verify_checksum(@page) != 1
+        return 1
+    0
+
+[[test]]
+fn test_page_verify_checksum_invalid() -> i32
+    var page: Page
+    page_init_heap(@page, 0)
+
+    page.data[0] = 42
+    page_update_checksum(@page)
+
+    # Corrupt the data
+    page.data[0] = 99
+
+    if page_verify_checksum(@page) != 0
+        return 1
+    0
+
+[[test]]
+fn test_page_checksum_excludes_checksum_field() -> i32
+    var page: Page
+    page_init_heap(@page, 0)
+
+    page.data[0] = 42
+    let crc1: i32 = page_calc_checksum(@page)
+
+    # Change the checksum field
+    page.header.checksum = 0xDEADBEEF
+
+    let crc2: i32 = page_calc_checksum(@page)
+
+    # Checksums should be the same (checksum field excluded)
+    if crc1 != crc2
+        return 1
+    0
+
+# ============================================================================
+# Page Validation Tests
+# ============================================================================
+
+[[test]]
+fn test_page_validate_free() -> i32
+    var page: Page
+    memset(@page as *u8, 0, PAGE_SIZE)
+
+    # Free page (magic = 0) should be valid
+    if page_validate(@page) != 1
+        return 1
+    0
+
+[[test]]
+fn test_page_validate_heap() -> i32
+    var page: Page
+    page_init_heap(@page, 0)
+    page_update_checksum(@page)
+
+    if page_validate(@page) != 1
+        return 1
+    0
+
+[[test]]
+fn test_page_validate_btree() -> i32
+    var page: Page
+    page_init_btree(@page, 0, 1)
+    page_update_checksum(@page)
+
+    if page_validate(@page) != 1
+        return 1
+    0
+
+[[test]]
+fn test_page_validate_bad_magic() -> i32
+    var page: Page
+    page_init_heap(@page, 0)
+    page_update_checksum(@page)
+
+    # Corrupt magic
+    page.header.magic = 0x12345678
+
+    if page_validate(@page) != 0
+        return 1
+    0
+
+[[test]]
+fn test_page_validate_bad_version() -> i32
+    var page: Page
+    page_init_heap(@page, 0)
+    page.header.version = 999
+    page_update_checksum(@page)
+
+    if page_validate(@page) != 0
+        return 1
+    0
+
+[[test]]
+fn test_page_validate_bad_free_space() -> i32
+    var page: Page
+    page_init_heap(@page, 0)
+
+    # Invalid: free_start > free_end
+    page.header.free_start = 1000
+    page.header.free_end = 500
+    page_update_checksum(@page)
+
+    if page_validate(@page) != 0
+        return 1
+    0
+
+[[test]]
+fn test_page_validate_bad_checksum() -> i32
+    var page: Page
+    page_init_heap(@page, 0)
+    page_update_checksum(@page)
+
+    # Corrupt data after checksum
+    page.data[0] = 99
+
+    if page_validate(@page) != 0
+        return 1
+    0

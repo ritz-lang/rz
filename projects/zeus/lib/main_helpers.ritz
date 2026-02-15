@@ -1,0 +1,288 @@
+# lib/main_helpers.ritz - Helper functions for Zeus main entry point
+#
+# This module provides:
+#   - CLI argument parsing
+#   - String utilities
+#   - Worker environment setup
+#
+# The actual main() function is in src/main.ritz
+
+import ritzlib.sys
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+pub const DEFAULT_WORKER_COUNT: i32 = 4
+pub const DEFAULT_SHM_SIZE: i64 = 2097152      # 2 MB
+pub const DEFAULT_RING_CAPACITY: i64 = 256
+
+# ============================================================================
+# Options Structure
+# ============================================================================
+
+pub struct ZeusOptions
+    worker_count: i32           # 0: Number of workers
+    _pad1: i32                  # 4: Padding
+    shm_size: i64               # 8: Shared memory size per worker
+    ring_capacity: i64          # 16: Ring buffer capacity
+    socket_path: *u8            # 24: Unix socket path
+    pid_file: *u8               # 32: PID file path
+    app_module: *u8             # 40: Application module to load
+    foreground: i32             # 48: Run in foreground (don't daemonize)
+    verbose: i32                # 52: Verbose logging
+
+# Initialize with defaults
+pub fn zeus_options_init(opts: *ZeusOptions)
+    opts.worker_count = DEFAULT_WORKER_COUNT
+    opts.shm_size = DEFAULT_SHM_SIZE
+    opts.ring_capacity = DEFAULT_RING_CAPACITY
+    opts.socket_path = c"/run/zeus/zeus.sock"
+    opts.pid_file = c"/run/zeus/zeus.pid"
+    opts.app_module = null
+    opts.foreground = 0
+    opts.verbose = 0
+
+# ============================================================================
+# Argument Parsing
+# ============================================================================
+
+# Parse command line arguments
+# Returns 0 on success, -1 on error
+pub fn zeus_parse_args(opts: *ZeusOptions, argc: i32, argv: **u8) -> i32
+    var i: i32 = 1  # Skip program name
+    while i < argc
+        let arg: *u8 = *(argv + i)
+
+        if str_eq_cstr(arg, c"-w")
+            # Worker count
+            i = i + 1
+            if i >= argc
+                return -1
+            opts.worker_count = str_to_i32(*(argv + i))
+        else if str_eq_cstr(arg, c"-m")
+            # SHM size
+            i = i + 1
+            if i >= argc
+                return -1
+            opts.shm_size = str_to_i64(*(argv + i))
+        else if str_eq_cstr(arg, c"-r")
+            # Ring capacity
+            i = i + 1
+            if i >= argc
+                return -1
+            opts.ring_capacity = str_to_i64(*(argv + i))
+        else if str_eq_cstr(arg, c"-s")
+            # Socket path
+            i = i + 1
+            if i >= argc
+                return -1
+            opts.socket_path = *(argv + i)
+        else if str_eq_cstr(arg, c"-p")
+            # PID file
+            i = i + 1
+            if i >= argc
+                return -1
+            opts.pid_file = *(argv + i)
+        else if str_eq_cstr(arg, c"-f")
+            # Foreground mode
+            opts.foreground = 1
+        else if str_eq_cstr(arg, c"-v")
+            # Verbose
+            opts.verbose = 1
+        else if str_eq_cstr(arg, c"-h") || str_eq_cstr(arg, c"--help")
+            # Help (caller should print usage)
+            return 1
+        else if *arg == 0x2D  # Starts with '-'
+            # Unknown flag
+            return -1
+        else
+            # Positional arg - app module
+            opts.app_module = arg
+
+        i = i + 1
+
+    return 0
+
+# ============================================================================
+# String Utilities
+# ============================================================================
+
+# Compare two C strings
+pub fn str_eq_cstr(a: *u8, b: *u8) -> i32
+    var i: i32 = 0
+    while 1
+        let ca: u8 = *(a + i)
+        let cb: u8 = *(b + i)
+        if ca != cb
+            return 0
+        if ca == 0
+            return 1
+        i = i + 1
+    return 0
+
+# Parse string to i32
+pub fn str_to_i32(s: *u8) -> i32
+    var result: i32 = 0
+    var i: i32 = 0
+    var negative: i32 = 0
+
+    # Check for negative
+    if *s == 0x2D  # '-'
+        negative = 1
+        i = 1
+
+    while *(s + i) != 0
+        let c: u8 = *(s + i)
+        if c >= 0x30 && c <= 0x39  # '0' to '9'
+            result = result * 10 + ((c - 0x30) as i32)
+        else
+            break
+        i = i + 1
+
+    if negative != 0
+        return -result
+    return result
+
+# Parse string to i64
+pub fn str_to_i64(s: *u8) -> i64
+    var result: i64 = 0
+    var i: i32 = 0
+    var negative: i32 = 0
+
+    # Check for negative
+    if *s == 0x2D  # '-'
+        negative = 1
+        i = 1
+
+    while *(s + i) != 0
+        let c: u8 = *(s + i)
+        if c >= 0x30 && c <= 0x39  # '0' to '9'
+            result = result * 10 + ((c - 0x30) as i64)
+        else
+            break
+        i = i + 1
+
+    if negative != 0
+        return -result
+    return result
+
+# ============================================================================
+# Worker Environment
+# ============================================================================
+# Environment passed to worker processes
+
+pub struct WorkerEnv
+    shm_fd: i32                 # 0: Shared memory fd
+    _pad1: i32                  # 4: Padding
+    shm_size: i64               # 8: Shared memory size
+    worker_id: i32              # 16: Worker slot index
+    _pad2: i32                  # 20: Padding
+
+# Initialize worker env
+pub fn worker_env_init(env: *WorkerEnv)
+    env.shm_fd = -1
+    env.shm_size = 0
+    env.worker_id = -1
+
+# Set fd
+pub fn worker_env_set_fd(env: *WorkerEnv, fd: i32)
+    env.shm_fd = fd
+
+# Set size
+pub fn worker_env_set_size(env: *WorkerEnv, size: i64)
+    env.shm_size = size
+
+# Set worker id
+pub fn worker_env_set_id(env: *WorkerEnv, id: i32)
+    env.worker_id = id
+
+# ============================================================================
+# Process Helpers
+# ============================================================================
+
+# Fork and exec a worker process
+# Returns pid on success (in parent), 0 in child, -1 on error
+pub fn spawn_worker(shm_fd: i32, shm_size: i64, worker_id: i32, app_path: *u8) -> i32
+    let pid: i32 = sys_fork()
+    if pid < 0
+        return -1
+    if pid > 0
+        # Parent - return child pid
+        return pid
+
+    # Child process
+    # The fd is inherited, we just need to pass it via environment or args
+    # For now, we'll use a simple approach: fd 3 is always the shm fd
+
+    # Dup shm_fd to fd 3 if it's not already
+    if shm_fd != 3
+        sys_dup2(shm_fd, 3)
+        sys_close(shm_fd)
+
+    # Build argv for exec
+    # zeus-worker <shm_size> <worker_id>
+    var size_str: [20]u8
+    i64_to_str(shm_size, @size_str[0])
+
+    var id_str: [12]u8
+    i32_to_str(worker_id, @id_str[0])
+
+    var argv: [4]*u8
+    argv[0] = app_path
+    argv[1] = @size_str[0]
+    argv[2] = @id_str[0]
+    argv[3] = null
+
+    # Exec (doesn't return on success)
+    sys_execve(app_path, @argv[0], null)
+
+    # If we get here, exec failed
+    sys_exit(127)
+    return -1  # Never reached
+
+# Convert i64 to string
+fn i64_to_str(val: i64, buf: *u8)
+    if val == 0
+        *buf = 0x30  # '0'
+        *(buf + 1) = 0
+        return
+
+    var v: i64 = val
+    var i: i32 = 0
+    var tmp: [20]u8
+
+    while v > 0
+        tmp[i] = (0x30 + (v % 10)) as u8
+        v = v / 10
+        i = i + 1
+
+    # Reverse into buf
+    var j: i32 = 0
+    while i > 0
+        i = i - 1
+        *(buf + j) = tmp[i]
+        j = j + 1
+    *(buf + j) = 0
+
+# Convert i32 to string
+fn i32_to_str(val: i32, buf: *u8)
+    i64_to_str(val as i64, buf)
+
+# ============================================================================
+# Signal Helpers
+# ============================================================================
+
+# Signal numbers
+pub const SIGHUP: i32 = 1
+pub const SIGINT: i32 = 2
+pub const SIGTERM: i32 = 15
+pub const SIGCHLD: i32 = 17
+pub const SIGUSR1: i32 = 10
+pub const SIGUSR2: i32 = 12
+
+# Write signal to self-pipe (async-signal-safe)
+pub fn signal_self_pipe_write(fd: i32, signum: i32)
+    var buf: [1]u8
+    buf[0] = signum as u8
+    sys_write(fd, @buf[0], 1)

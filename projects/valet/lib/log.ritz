@@ -1,0 +1,321 @@
+# valet/lib/log.ritz - Error logging with timestamps
+#
+# Provides structured logging with:
+#   - Timestamps (YYYY-MM-DD HH:MM:SS format)
+#   - Log levels (DEBUG, INFO, WARN, ERROR)
+#   - Thread-safe output to stderr
+#
+# Usage:
+#   log_info("Server started on port 8080")
+#   log_error("Failed to bind socket")
+#   log_warn("Connection timeout")
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+
+# ============================================================================
+# Log levels
+# ============================================================================
+
+const LOG_DEBUG: i32 = 0
+const LOG_INFO: i32 = 1
+const LOG_WARN: i32 = 2
+const LOG_ERROR: i32 = 3
+
+# Current minimum log level (can be changed at runtime)
+# Default is LOG_INFO (1)
+var g_log_level: i32 = 1
+
+
+# ============================================================================
+# Log level control
+# ============================================================================
+
+pub fn log_set_level(level: i32)
+    g_log_level = level
+
+
+pub fn log_get_level() -> i32
+    return g_log_level
+
+
+# ============================================================================
+# Timestamp formatting
+# ============================================================================
+
+# Format a timestamp into a buffer
+# Returns number of bytes written
+pub fn format_timestamp(buf: *u8, buf_len: i32) -> i32
+    var tv: Timeval
+    sys_gettimeofday(@tv, null)
+
+    # Convert Unix timestamp to broken-down time
+    # This is a simplified conversion - doesn't handle leap seconds, etc.
+    let secs: i64 = tv.tv_sec
+
+    # Seconds since midnight
+    let day_secs: i64 = secs % 86400
+    let hours: i64 = day_secs / 3600
+    let mins: i64 = (day_secs % 3600) / 60
+    let seconds: i64 = day_secs % 60
+
+    # Days since epoch (Jan 1, 1970)
+    var days: i64 = secs / 86400
+
+    # Calculate year, month, day
+    # Start from 1970 and count forward
+    var year: i64 = 1970
+    while days >= 365
+        let leap: i64 = is_leap_year(year)
+        let year_days: i64 = 365 + leap
+        if days < year_days
+            break
+        days -= year_days
+        year += 1
+
+    # Calculate month and day
+    var month: i64 = 1
+    while month <= 12
+        let month_days: i64 = log_days_in_month(month, year)
+        if days < month_days
+            break
+        days -= month_days
+        month += 1
+
+    let day: i64 = days + 1
+
+    # Format: YYYY-MM-DD HH:MM:SS
+    var pos: i32 = 0
+
+    # Year
+    pos += format_int(buf + pos, year, 4)
+    *(buf + pos) = '-'
+    pos += 1
+
+    # Month
+    pos += format_int(buf + pos, month, 2)
+    *(buf + pos) = '-'
+    pos += 1
+
+    # Day
+    pos += format_int(buf + pos, day, 2)
+    *(buf + pos) = ' '
+    pos += 1
+
+    # Hour
+    pos += format_int(buf + pos, hours, 2)
+    *(buf + pos) = ':'
+    pos += 1
+
+    # Minute
+    pos += format_int(buf + pos, mins, 2)
+    *(buf + pos) = ':'
+    pos += 1
+
+    # Second
+    pos += format_int(buf + pos, seconds, 2)
+
+    return pos
+
+
+pub fn is_leap_year(year: i64) -> i64
+    if year % 400 == 0
+        return 1
+    if year % 100 == 0
+        return 0
+    if year % 4 == 0
+        return 1
+    return 0
+
+
+pub fn log_days_in_month(month: i64, year: i64) -> i64
+    if month == 2
+        return 28 + is_leap_year(year)
+    if month == 4 || month == 6 || month == 9 || month == 11
+        return 30
+    return 31
+
+
+# Format an integer with leading zeros to specified width
+pub fn format_int(buf: *u8, val: i64, width: i32) -> i32
+    var temp: [16]u8
+    var pos: i32 = 15
+    var v: i64 = val
+
+    if v == 0
+        temp[pos] = '0'
+        pos -= 1
+    else
+        while v > 0
+            temp[pos] = ((v % 10) + 48) as u8
+            pos -= 1
+            v = v / 10
+
+    let digits: i32 = 15 - pos
+
+    # Add leading zeros
+    var out_pos: i32 = 0
+    for i in 0..(width - digits)
+        *(buf + out_pos) = '0'
+        out_pos += 1
+
+    # Copy digits
+    for i in 0..digits
+        *(buf + out_pos) = temp[pos + 1 + i]
+        out_pos += 1
+
+    return out_pos
+
+
+# ============================================================================
+# Core logging functions
+# ============================================================================
+
+pub fn log_write(level: i32, level_str: *u8, msg: *u8)
+    if level < g_log_level
+        return
+
+    # Format: [YYYY-MM-DD HH:MM:SS] [LEVEL] message\n
+    var buf: [512]u8
+    var pos: i32 = 0
+
+    # Opening bracket
+    buf[pos] = '['
+    pos += 1
+
+    # Timestamp
+    pos += format_timestamp(@buf[pos], 256)
+
+    # Close timestamp, open level
+    buf[pos] = ']'
+    pos += 1
+    buf[pos] = ' '
+    pos += 1
+    buf[pos] = '['
+    pos += 1
+
+    # Level string
+    let level_len: i64 = strlen(level_str)
+    for i in 0..level_len
+        buf[pos] = *(level_str + i)
+        pos += 1
+
+    # Close level
+    buf[pos] = ']'
+    pos += 1
+    buf[pos] = ' '
+    pos += 1
+
+    # Message
+    let msg_len: i64 = strlen(msg)
+    var copy_len: i64 = msg_len
+    if pos as i64 + copy_len > 500
+        copy_len = 500 - pos as i64
+
+    for i in 0..copy_len
+        buf[pos] = *(msg + i)
+        pos += 1
+
+    # Newline
+    buf[pos] = '\n'
+    pos += 1
+
+    # Write to stderr
+    sys_write(STDERR, @buf[0], pos as i64)
+
+
+# ============================================================================
+# Convenience logging functions
+# ============================================================================
+
+pub fn log_debug(msg: *u8)
+    log_write(LOG_DEBUG, c"DEBUG", msg)
+
+
+pub fn log_info(msg: *u8)
+    log_write(LOG_INFO, c"INFO", msg)
+
+
+pub fn log_warn(msg: *u8)
+    log_write(LOG_WARN, c"WARN", msg)
+
+
+pub fn log_error(msg: *u8)
+    log_write(LOG_ERROR, c"ERROR", msg)
+
+
+# ============================================================================
+# Formatted logging (with single integer argument)
+# ============================================================================
+
+pub fn log_error_i(msg: *u8, val: i64)
+    var buf: [256]u8
+    var pos: i32 = 0
+
+    let msg_len: i64 = strlen(msg)
+    for i in 0..msg_len
+        buf[pos] = *(msg + i)
+        pos += 1
+
+    # Add integer value
+    var temp: [32]u8
+    var tpos: i32 = 31
+    var v: i64 = val
+    var negative: i32 = 0
+
+    if v < 0
+        negative = 1
+        v = 0 - v
+
+    if v == 0
+        temp[tpos] = '0'
+        tpos -= 1
+    else
+        while v > 0
+            temp[tpos] = ((v % 10) + 48) as u8
+            tpos -= 1
+            v = v / 10
+
+    if negative != 0
+        temp[tpos] = '-'
+        tpos -= 1
+
+    let digits: i32 = 31 - tpos
+    for i in 0..digits
+        buf[pos] = temp[tpos + 1 + i]
+        pos += 1
+
+    buf[pos] = 0
+    log_error(@buf[0])
+
+
+pub fn log_info_i(msg: *u8, val: i64)
+    var buf: [256]u8
+    var pos: i32 = 0
+
+    let msg_len: i64 = strlen(msg)
+    for i in 0..msg_len
+        buf[pos] = *(msg + i)
+        pos += 1
+
+    var temp: [32]u8
+    var tpos: i32 = 31
+    var v: i64 = val
+
+    if v == 0
+        temp[tpos] = '0'
+        tpos -= 1
+    else
+        while v > 0
+            temp[tpos] = ((v % 10) + 48) as u8
+            tpos -= 1
+            v = v / 10
+
+    let digits: i32 = 31 - tpos
+    for i in 0..digits
+        buf[pos] = temp[tpos + 1 + i]
+        pos += 1
+
+    buf[pos] = 0
+    log_info(@buf[0])

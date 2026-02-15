@@ -1,0 +1,508 @@
+# lib/client.ritz - Mausoleum database client
+#
+# Client library for connecting to a mausoleum server.
+# Provides a simple synchronous API for database operations.
+
+import ritzlib.sys
+import ritzlib.str
+import ritzlib.memory
+import ritzlib.net
+
+import lib.protocol
+
+# ============================================================================
+# Client Constants
+# ============================================================================
+
+const CLIENT_BUFFER_SIZE: i32 = 65536  # 64 KB buffer
+
+# ============================================================================
+# Client structure
+# ============================================================================
+
+struct Client
+    sock: Socket              # TCP socket
+    connected: i32            # Connection state (1 = connected)
+    session_id: i64           # Server-assigned session ID
+    next_request_id: i32      # Next request ID
+    send_buf: *MessageBuffer  # Send buffer
+    recv_buf: *u8             # Receive buffer
+    recv_len: i32             # Bytes in receive buffer
+    last_error: i32           # Last error code
+    txn_active: i32           # Transaction active flag
+
+# Create a new client
+pub fn client_new() -> *Client
+    var client: *Client = malloc(80) as *Client
+    if client == null
+        return null
+
+    client.sock.fd = -1
+    client.sock.family = AF_INET
+    client.sock.socktype = SOCK_STREAM
+    client.connected = 0
+    client.session_id = 0
+    client.next_request_id = 1
+    client.send_buf = msgbuf_new(CLIENT_BUFFER_SIZE)
+    if client.send_buf == null
+        free(client as *u8)
+        return null
+    client.recv_buf = malloc(CLIENT_BUFFER_SIZE as i64) as *u8
+    if client.recv_buf == null
+        msgbuf_free(client.send_buf)
+        free(client as *u8)
+        return null
+    client.recv_len = 0
+    client.last_error = PROTO_OK
+    client.txn_active = 0
+
+    return client
+
+# Free client resources
+pub fn client_free(client: *Client)
+    if client == null
+        return
+
+    if client.connected != 0
+        client_disconnect(client)
+
+    if client.send_buf != null
+        msgbuf_free(client.send_buf)
+    if client.recv_buf != null
+        free(client.recv_buf)
+
+    free(client as *u8)
+
+# ============================================================================
+# Connection management
+# ============================================================================
+
+# Connect to a server
+pub fn client_connect(client: *Client, host: *u8, port: i32, collection: *u8, collection_len: i32) -> i32
+    if client == null
+        return -1
+    if client.connected != 0
+        return -2  # Already connected
+
+    # Create socket
+    client.sock = socket_tcp()
+    if client.sock.fd < 0
+        client.last_error = PROTO_ERR_DISCONNECTED
+        return -3
+
+    # Set TCP_NODELAY
+    socket_set_nodelay(@client.sock)
+
+    # Connect to server
+    let result: i32 = socket_connect(@client.sock, host, port)
+    if result < 0
+        socket_close(@client.sock)
+        client.sock.fd = -1
+        client.last_error = PROTO_ERR_DISCONNECTED
+        return -4
+
+    # Send CONNECT message
+    let req_id: i32 = client.next_request_id
+    client.next_request_id += 1
+    build_connect(client.send_buf, req_id, collection, collection_len)
+
+    let send_result: i32 = send_message(client)
+    if send_result < 0
+        socket_close(@client.sock)
+        client.sock.fd = -1
+        client.last_error = PROTO_ERR_DISCONNECTED
+        return -5
+
+    # Receive response
+    var reader: MessageReader
+    let recv_result: i32 = recv_message(client, @reader)
+    if recv_result < 0
+        socket_close(@client.sock)
+        client.sock.fd = -1
+        client.last_error = PROTO_ERR_DISCONNECTED
+        return -6
+
+    # Check response
+    let msg_type: i32 = msgreader_msg_type(@reader)
+    if msg_type == MSG_ERROR
+        let error_code: i32 = msgreader_read_i32(@reader)
+        client.last_error = error_code
+        socket_close(@client.sock)
+        client.sock.fd = -1
+        return -7
+
+    if msg_type != MSG_CONNECTED
+        client.last_error = PROTO_ERR_PROTOCOL
+        socket_close(@client.sock)
+        client.sock.fd = -1
+        return -8
+
+    client.session_id = msgreader_read_i64(@reader)
+    client.connected = 1
+    client.last_error = PROTO_OK
+    return 0
+
+# Disconnect from server
+pub fn client_disconnect(client: *Client) -> i32
+    if client == null
+        return -1
+    if client.connected == 0
+        return 0  # Already disconnected
+
+    # Send DISCONNECT message (best effort)
+    let req_id: i32 = client.next_request_id
+    client.next_request_id += 1
+    msgbuf_start(client.send_buf, MSG_DISCONNECT, req_id)
+    msgbuf_finish(client.send_buf)
+    send_message(client)
+
+    # Close socket
+    socket_close(@client.sock)
+    client.sock.fd = -1
+    client.connected = 0
+    client.session_id = 0
+    client.txn_active = 0
+
+    return 0
+
+# Check if connected
+pub fn client_is_connected(client: *Client) -> i32
+    if client == null
+        return 0
+    return client.connected
+
+# Get session ID
+pub fn client_session_id(client: *Client) -> i64
+    if client == null
+        return 0
+    return client.session_id
+
+# Get last error code
+pub fn client_last_error(client: *Client) -> i32
+    if client == null
+        return PROTO_ERR_INTERNAL
+    return client.last_error
+
+# ============================================================================
+# Internal helpers
+# ============================================================================
+
+# Send the message in send_buf
+fn send_message(client: *Client) -> i32
+    let len: i32 = msgbuf_len(client.send_buf)
+    var data: *u8 = msgbuf_data(client.send_buf)
+
+    var sent: i32 = 0
+    while sent < len
+        let n: i64 = socket_send(@client.sock, data + sent, (len - sent) as i64)
+        if n <= 0
+            return -1
+        sent += n as i32
+
+    return 0
+
+# Receive a complete message into reader
+fn recv_message(client: *Client, reader: *MessageReader) -> i32
+    # First receive the header
+    while client.recv_len < PROTO_HEADER_SIZE
+        let remain: i64 = (CLIENT_BUFFER_SIZE - client.recv_len) as i64
+        let n: i64 = socket_recv(@client.sock, client.recv_buf + client.recv_len, remain)
+        if n <= 0
+            return -1
+        client.recv_len += n as i32
+
+    # Parse message length from header
+    var ptr: *u8 = client.recv_buf
+    var msg_len: i32 = (*(ptr + 4) as i32) << 24
+    msg_len = msg_len | ((*(ptr + 5) as i32) << 16)
+    msg_len = msg_len | ((*(ptr + 6) as i32) << 8)
+    msg_len = msg_len | (*(ptr + 7) as i32)
+
+    if msg_len < PROTO_HEADER_SIZE or msg_len > PROTO_MAX_MESSAGE_SIZE
+        return -2
+
+    # Receive rest of message
+    while client.recv_len < msg_len
+        let remain2: i64 = (CLIENT_BUFFER_SIZE - client.recv_len) as i64
+        let n: i64 = socket_recv(@client.sock, client.recv_buf + client.recv_len, remain2)
+        if n <= 0
+            return -3
+        client.recv_len += n as i32
+
+    # Parse message
+    let result: i32 = msgreader_init(reader, client.recv_buf, msg_len)
+    if result != PROTO_OK
+        return -4
+
+    # Shift any remaining data
+    let remaining: i32 = client.recv_len - msg_len
+    if remaining > 0
+        var i: i32 = 0
+        while i < remaining
+            *(client.recv_buf + i) = *(client.recv_buf + msg_len + i)
+            i += 1
+    client.recv_len = remaining
+
+    return 0
+
+# ============================================================================
+# CRUD operations
+# ============================================================================
+
+# Ping the server
+pub fn client_ping(client: *Client) -> i32
+    if client == null or client.connected == 0
+        return -1
+
+    let req_id: i32 = client.next_request_id
+    client.next_request_id += 1
+    build_ping(client.send_buf, req_id)
+
+    if send_message(client) < 0
+        client.connected = 0
+        client.last_error = PROTO_ERR_DISCONNECTED
+        return -2
+
+    var reader: MessageReader
+    if recv_message(client, @reader) < 0
+        client.connected = 0
+        client.last_error = PROTO_ERR_DISCONNECTED
+        return -3
+
+    let msg_type: i32 = msgreader_msg_type(@reader)
+    if msg_type != MSG_PONG
+        client.last_error = PROTO_ERR_PROTOCOL
+        return -4
+
+    client.last_error = PROTO_OK
+    return 0
+
+# Insert a document (returns document ID, or < 0 on error)
+pub fn client_insert(client: *Client, doc_data: *u8, doc_len: i32) -> i64
+    if client == null or client.connected == 0
+        return -1
+
+    let req_id: i32 = client.next_request_id
+    client.next_request_id += 1
+    build_insert(client.send_buf, req_id, doc_data, doc_len)
+
+    if send_message(client) < 0
+        client.connected = 0
+        client.last_error = PROTO_ERR_DISCONNECTED
+        return -2
+
+    var reader: MessageReader
+    if recv_message(client, @reader) < 0
+        client.connected = 0
+        client.last_error = PROTO_ERR_DISCONNECTED
+        return -3
+
+    let msg_type: i32 = msgreader_msg_type(@reader)
+    if msg_type == MSG_ERROR
+        client.last_error = msgreader_read_i32(@reader)
+        return -4
+
+    if msg_type != MSG_INSERT_OK
+        client.last_error = PROTO_ERR_PROTOCOL
+        return -5
+
+    client.last_error = PROTO_OK
+    return msgreader_read_i64(@reader)
+
+# Get a document by ID (returns 1 if found, 0 if not found, < 0 on error)
+# doc_data and doc_len are output parameters
+pub fn client_get(client: *Client, doc_id: i64, doc_data: **u8, doc_len: *i32) -> i32
+    if client == null or client.connected == 0
+        return -1
+
+    let req_id: i32 = client.next_request_id
+    client.next_request_id += 1
+    build_get(client.send_buf, req_id, doc_id)
+
+    if send_message(client) < 0
+        client.connected = 0
+        client.last_error = PROTO_ERR_DISCONNECTED
+        return -2
+
+    var reader: MessageReader
+    if recv_message(client, @reader) < 0
+        client.connected = 0
+        client.last_error = PROTO_ERR_DISCONNECTED
+        return -3
+
+    let msg_type: i32 = msgreader_msg_type(@reader)
+    if msg_type == MSG_ERROR
+        let error_code: i32 = msgreader_read_i32(@reader)
+        client.last_error = error_code
+        if error_code == PROTO_ERR_NOT_FOUND
+            return 0  # Not found
+        return -4
+
+    if msg_type != MSG_GET_OK
+        client.last_error = PROTO_ERR_PROTOCOL
+        return -5
+
+    # Read document data
+    var len: i32 = 0
+    var data: *u8 = msgreader_read_bytes(@reader, @len)
+    *doc_data = data
+    *doc_len = len
+
+    client.last_error = PROTO_OK
+    return 1
+
+# Delete a document by ID (returns 1 if deleted, 0 if not found, < 0 on error)
+pub fn client_delete(client: *Client, doc_id: i64) -> i32
+    if client == null or client.connected == 0
+        return -1
+
+    let req_id: i32 = client.next_request_id
+    client.next_request_id += 1
+    build_delete(client.send_buf, req_id, doc_id)
+
+    if send_message(client) < 0
+        client.connected = 0
+        client.last_error = PROTO_ERR_DISCONNECTED
+        return -2
+
+    var reader: MessageReader
+    if recv_message(client, @reader) < 0
+        client.connected = 0
+        client.last_error = PROTO_ERR_DISCONNECTED
+        return -3
+
+    let msg_type: i32 = msgreader_msg_type(@reader)
+    if msg_type == MSG_ERROR
+        let error_code: i32 = msgreader_read_i32(@reader)
+        client.last_error = error_code
+        if error_code == PROTO_ERR_NOT_FOUND
+            return 0  # Not found
+        return -4
+
+    if msg_type != MSG_DELETE_OK
+        client.last_error = PROTO_ERR_PROTOCOL
+        return -5
+
+    client.last_error = PROTO_OK
+    return 1
+
+# ============================================================================
+# Transaction operations
+# ============================================================================
+
+# Begin a transaction
+pub fn client_begin_txn(client: *Client) -> i64
+    if client == null or client.connected == 0
+        return -1
+
+    if client.txn_active != 0
+        client.last_error = PROTO_ERR_TXN_CONFLICT
+        return -2  # Already in transaction
+
+    let req_id: i32 = client.next_request_id
+    client.next_request_id += 1
+    build_txn_begin(client.send_buf, req_id)
+
+    if send_message(client) < 0
+        client.connected = 0
+        client.last_error = PROTO_ERR_DISCONNECTED
+        return -3
+
+    var reader: MessageReader
+    if recv_message(client, @reader) < 0
+        client.connected = 0
+        client.last_error = PROTO_ERR_DISCONNECTED
+        return -4
+
+    let msg_type: i32 = msgreader_msg_type(@reader)
+    if msg_type == MSG_ERROR
+        client.last_error = msgreader_read_i32(@reader)
+        return -5
+
+    if msg_type != MSG_TXN_BEGUN
+        client.last_error = PROTO_ERR_PROTOCOL
+        return -6
+
+    client.txn_active = 1
+    client.last_error = PROTO_OK
+    return msgreader_read_i64(@reader)
+
+# Commit the current transaction
+pub fn client_commit_txn(client: *Client) -> i32
+    if client == null or client.connected == 0
+        return -1
+
+    if client.txn_active == 0
+        client.last_error = PROTO_ERR_TXN_NOT_ACTIVE
+        return -2
+
+    let req_id: i32 = client.next_request_id
+    client.next_request_id += 1
+    build_txn_commit(client.send_buf, req_id)
+
+    if send_message(client) < 0
+        client.connected = 0
+        client.last_error = PROTO_ERR_DISCONNECTED
+        return -3
+
+    var reader: MessageReader
+    if recv_message(client, @reader) < 0
+        client.connected = 0
+        client.last_error = PROTO_ERR_DISCONNECTED
+        return -4
+
+    let msg_type: i32 = msgreader_msg_type(@reader)
+    if msg_type == MSG_ERROR
+        client.last_error = msgreader_read_i32(@reader)
+        return -5
+
+    if msg_type != MSG_TXN_COMMITTED
+        client.last_error = PROTO_ERR_PROTOCOL
+        return -6
+
+    client.txn_active = 0
+    client.last_error = PROTO_OK
+    return 0
+
+# Abort the current transaction
+pub fn client_abort_txn(client: *Client) -> i32
+    if client == null or client.connected == 0
+        return -1
+
+    if client.txn_active == 0
+        client.last_error = PROTO_ERR_TXN_NOT_ACTIVE
+        return -2
+
+    let req_id: i32 = client.next_request_id
+    client.next_request_id += 1
+    build_txn_abort(client.send_buf, req_id)
+
+    if send_message(client) < 0
+        client.connected = 0
+        client.last_error = PROTO_ERR_DISCONNECTED
+        return -3
+
+    var reader: MessageReader
+    if recv_message(client, @reader) < 0
+        client.connected = 0
+        client.last_error = PROTO_ERR_DISCONNECTED
+        return -4
+
+    let msg_type: i32 = msgreader_msg_type(@reader)
+    if msg_type == MSG_ERROR
+        client.last_error = msgreader_read_i32(@reader)
+        return -5
+
+    if msg_type != MSG_TXN_ABORTED
+        client.last_error = PROTO_ERR_PROTOCOL
+        return -6
+
+    client.txn_active = 0
+    client.last_error = PROTO_OK
+    return 0
+
+# Check if a transaction is active
+pub fn client_has_txn(client: *Client) -> i32
+    if client == null
+        return 0
+    return client.txn_active

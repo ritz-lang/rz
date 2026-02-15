@@ -1,0 +1,238 @@
+# test/test_memory.ritz - Memory management stress tests
+#
+# These tests verify that memory is properly allocated and freed,
+# ensuring no leaks in our mmap-based allocators.
+
+import ritzlib.sys
+import ritzlib.io
+import helpers
+
+import lib.arena
+import lib.shm
+import lib.control
+
+# ============================================================================
+# Arena Memory Tests
+# ============================================================================
+
+[[test]]
+fn test_arena_repeated_create_destroy() -> i32
+    # Create and destroy arenas many times to ensure no leaks
+    var i: i32 = 0
+    while i < 100
+        var arena: DataArena
+        let result: i32 = data_arena_init(@arena, 65536)
+        if result != 0
+            "FAIL: arena init failed on iteration {i}\n"
+            return 1
+
+        # Use the arena
+        let ptr: *u8 = data_arena_alloc(@arena, 1000)
+        if ptr == null
+            "FAIL: alloc failed on iteration {i}\n"
+            data_arena_destroy(@arena)
+            return 1
+
+        # Write some data
+        *ptr = (i & 255) as u8
+
+        # Destroy
+        data_arena_destroy(@arena)
+        i = i + 1
+
+    return 0
+
+[[test]]
+fn test_arena_alloc_until_exhaustion_and_reset() -> i32
+    var arena: DataArena
+    data_arena_init(@arena, 4096)  # Small arena
+
+    # Fill the arena repeatedly
+    var round: i32 = 0
+    while round < 50
+        # Allocate until exhaustion
+        var count: i32 = 0
+        while data_arena_alloc(@arena, 64) != null
+            count = count + 1
+
+        # Should have allocated some blocks
+        if count < 10
+            "FAIL: too few allocations in round {round}: {count}\n"
+            data_arena_destroy(@arena)
+            return 1
+
+        # Reset and go again
+        data_arena_reset(@arena)
+        round = round + 1
+
+    data_arena_destroy(@arena)
+    return 0
+
+# ============================================================================
+# Shared Memory Tests
+# ============================================================================
+
+[[test]]
+fn test_shm_repeated_create_destroy() -> i32
+    # Create and destroy shared memory regions many times
+    var i: i32 = 0
+    while i < 50
+        var cfg: ShmConfig
+        shm_config_default(@cfg)
+
+        var region: ShmRegion
+        let result: i32 = shm_create(@region, @cfg)
+        if result != 0
+            "FAIL: shm_create failed on iteration {i}: {result}\n"
+            return 1
+
+        # Use the region
+        let cb: *ControlBlock = shm_get_control_block(@region)
+        cb.worker_pid = i
+
+        var arena: DataArena
+        shm_get_arena(@region, @arena)
+        let ptr: *u8 = data_arena_alloc(@arena, 100)
+        if ptr == null
+            "FAIL: arena alloc failed on iteration {i}\n"
+            shm_destroy(@region)
+            return 1
+
+        # Destroy
+        shm_destroy(@region)
+        i = i + 1
+
+    return 0
+
+[[test]]
+fn test_shm_attach_detach_repeated() -> i32
+    var cfg: ShmConfig
+    shm_config_default(@cfg)
+
+    var region: ShmRegion
+    shm_create(@region, @cfg)
+
+    # Attach and detach many times (simulates worker restarts)
+    var i: i32 = 0
+    while i < 100
+        var worker_region: ShmRegion
+        let result: i32 = shm_attach(@worker_region, region.fd, region.size)
+        if result != 0
+            "FAIL: shm_attach failed on iteration {i}: {result}\n"
+            shm_destroy(@region)
+            return 1
+
+        # Access from worker side
+        let cb: *ControlBlock = shm_get_control_block(@worker_region)
+        cb.state = WORKER_STATE_RUNNING
+
+        shm_detach(@worker_region)
+        i = i + 1
+
+    shm_destroy(@region)
+    return 0
+
+[[test]]
+fn test_large_arena_allocation() -> i32
+    # Test with a larger arena (16MB)
+    var arena: DataArena
+    let result: i32 = data_arena_init(@arena, 16777216)
+    if result != 0
+        "FAIL: large arena init failed\n"
+        return 1
+
+    # Allocate large blocks
+    var i: i32 = 0
+    while i < 16
+        let ptr: *u8 = data_arena_alloc(@arena, 1048576)  # 1MB each
+        if ptr == null
+            "FAIL: 1MB alloc failed on iteration {i}\n"
+            data_arena_destroy(@arena)
+            return 1
+        i = i + 1
+
+    # Arena should now be full
+    let ptr: *u8 = data_arena_alloc(@arena, 1)
+    if ptr != null
+        "FAIL: arena should be exhausted\n"
+        data_arena_destroy(@arena)
+        return 1
+
+    data_arena_destroy(@arena)
+    return 0
+
+[[test]]
+fn test_arena_pointer_validity() -> i32
+    # Verify that allocated pointers are within the arena bounds
+    var arena: DataArena
+    data_arena_init(@arena, 4096)
+
+    let base: i64 = arena.base as i64
+    let end: i64 = base + arena.size
+
+    # Allocate several blocks and verify bounds
+    var i: i32 = 0
+    while i < 10
+        let ptr: *u8 = data_arena_alloc(@arena, 100)
+        if ptr == null
+            break
+
+        let addr: i64 = ptr as i64
+        if addr < base || addr >= end
+            "FAIL: pointer out of bounds: {addr} not in [{base}, {end})\n"
+            data_arena_destroy(@arena)
+            return 1
+
+        i = i + 1
+
+    data_arena_destroy(@arena)
+    return 0
+
+[[test]]
+fn test_shm_region_layout() -> i32
+    # Verify the memory layout is correct
+    var cfg: ShmConfig
+    shm_config_init(@cfg, 64, 8192)  # 64 slots, 8KB arena
+
+    var region: ShmRegion
+    shm_create(@region, @cfg)
+
+    let base: i64 = region.base as i64
+    let cb_addr: i64 = (shm_get_control_block(@region)) as i64
+    let req_ring_addr: i64 = (shm_get_request_ring(@region)) as i64
+    let resp_ring_addr: i64 = (shm_get_response_ring(@region)) as i64
+
+    var arena: DataArena
+    shm_get_arena(@region, @arena)
+    let arena_addr: i64 = arena.base as i64
+
+    # Verify ordering: CB < req_ring < resp_ring < arena
+    if cb_addr != base
+        "FAIL: control block not at base\n"
+        shm_destroy(@region)
+        return 1
+
+    if req_ring_addr <= cb_addr
+        "FAIL: req_ring not after control block\n"
+        shm_destroy(@region)
+        return 1
+
+    if resp_ring_addr <= req_ring_addr
+        "FAIL: resp_ring not after req_ring\n"
+        shm_destroy(@region)
+        return 1
+
+    if arena_addr <= resp_ring_addr
+        "FAIL: arena not after resp_ring\n"
+        shm_destroy(@region)
+        return 1
+
+    # Verify arena is within region bounds
+    let region_end: i64 = base + region.size
+    if arena_addr + arena.size > region_end
+        "FAIL: arena exceeds region bounds\n"
+        shm_destroy(@region)
+        return 1
+
+    shm_destroy(@region)
+    return 0

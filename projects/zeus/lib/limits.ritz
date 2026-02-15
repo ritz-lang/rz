@@ -1,0 +1,251 @@
+# lib/limits.ritz - Resource limits per worker
+#
+# Prevents runaway workers from consuming excessive resources.
+#
+# Limit types:
+#   - Memory: Maximum arena allocation per worker
+#   - Requests: Maximum requests before recycle
+#   - Connections: Maximum concurrent connections
+#   - CPU time: Maximum CPU time per request (future)
+#
+# Usage:
+#   1. Configure limits per worker
+#   2. Track resource usage as work proceeds
+#   3. Check limits before/after operations
+#   4. Take action when limits exceeded (recycle, reject, etc.)
+
+import ritzlib.sys
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+# Limit check results
+pub const LIMIT_OK: i32 = 0          # Within limits
+pub const LIMIT_WARNING: i32 = 1     # Approaching limit
+pub const LIMIT_EXCEEDED: i32 = 2    # Over limit
+
+# Default limits
+pub const DEFAULT_MAX_MEMORY: i64 = 67108864       # 64 MB
+pub const DEFAULT_MAX_REQUESTS: i64 = 100000       # 100k requests
+pub const DEFAULT_MAX_CONNECTIONS: i64 = 10000     # 10k connections
+pub const DEFAULT_MAX_CPU_MS: i64 = 30000          # 30 seconds
+pub const DEFAULT_WARNING_PERCENT: i32 = 80        # Warn at 80%
+
+# ============================================================================
+# Resource Limits
+# ============================================================================
+# Configuration for resource limits.
+
+pub struct ResourceLimits
+    max_memory_bytes: i64      # 0: Maximum arena memory
+    max_requests: i64          # 8: Maximum total requests
+    max_connections: i64       # 16: Maximum concurrent connections
+    max_cpu_ms: i64            # 24: Maximum CPU time (ms)
+    warning_threshold_percent: i32  # 32: Warning threshold (0-100)
+    _pad: i32                  # 36: Reserved
+
+# Initialize with defaults
+pub fn resource_limits_init(limits: *ResourceLimits)
+    limits.max_memory_bytes = DEFAULT_MAX_MEMORY
+    limits.max_requests = DEFAULT_MAX_REQUESTS
+    limits.max_connections = DEFAULT_MAX_CONNECTIONS
+    limits.max_cpu_ms = DEFAULT_MAX_CPU_MS
+    limits.warning_threshold_percent = DEFAULT_WARNING_PERCENT
+
+# ============================================================================
+# Resource Usage
+# ============================================================================
+# Tracks current resource consumption.
+
+pub struct ResourceUsage
+    memory_bytes: i64          # 0: Current memory usage
+    memory_peak: i64           # 8: Peak memory usage
+    request_count: i64         # 16: Total requests processed
+    connection_count: i64      # 24: Current connections
+    cpu_time_ms: i64           # 32: CPU time consumed (ms)
+    start_time_ns: i64         # 40: When tracking started
+
+# Initialize usage tracking
+pub fn resource_usage_init(usage: *ResourceUsage)
+    usage.memory_bytes = 0
+    usage.memory_peak = 0
+    usage.request_count = 0
+    usage.connection_count = 0
+    usage.cpu_time_ms = 0
+    usage.start_time_ns = get_time_ns_limits()
+
+# Reset usage (for worker recycling)
+pub fn resource_usage_reset(usage: *ResourceUsage)
+    usage.memory_bytes = 0
+    usage.memory_peak = 0
+    usage.request_count = 0
+    usage.connection_count = 0
+    usage.cpu_time_ms = 0
+    usage.start_time_ns = get_time_ns_limits()
+
+# Time helper
+fn get_time_ns_limits() -> i64
+    var tv: [2]i64
+    syscall2(96, @tv[0] as i64, 0)  # SYS_GETTIMEOFDAY
+    return (tv[0] * 1000000000) + (tv[1] * 1000)
+
+# ============================================================================
+# Usage Tracking
+# ============================================================================
+
+# Add memory usage
+pub fn resource_usage_add_memory(usage: *ResourceUsage, bytes: i64)
+    usage.memory_bytes = usage.memory_bytes + bytes
+    if usage.memory_bytes > usage.memory_peak
+        usage.memory_peak = usage.memory_bytes
+
+# Remove memory usage (e.g., after arena reset)
+pub fn resource_usage_remove_memory(usage: *ResourceUsage, bytes: i64)
+    usage.memory_bytes = usage.memory_bytes - bytes
+    if usage.memory_bytes < 0
+        usage.memory_bytes = 0
+
+# Track a request
+pub fn resource_usage_add_request(usage: *ResourceUsage)
+    usage.request_count = usage.request_count + 1
+
+# Add connection
+pub fn resource_usage_add_connection(usage: *ResourceUsage)
+    usage.connection_count = usage.connection_count + 1
+
+# Remove connection
+pub fn resource_usage_remove_connection(usage: *ResourceUsage)
+    usage.connection_count = usage.connection_count - 1
+    if usage.connection_count < 0
+        usage.connection_count = 0
+
+# Add CPU time
+pub fn resource_usage_add_cpu(usage: *ResourceUsage, ms: i64)
+    usage.cpu_time_ms = usage.cpu_time_ms + ms
+
+# ============================================================================
+# Limit Checking
+# ============================================================================
+
+# Check memory limit
+pub fn resource_check_memory(limits: *ResourceLimits, usage: *ResourceUsage) -> i32
+    if limits.max_memory_bytes <= 0
+        return LIMIT_OK  # Disabled
+    if usage.memory_bytes > limits.max_memory_bytes
+        return LIMIT_EXCEEDED
+    return LIMIT_OK
+
+# Check request limit
+pub fn resource_check_requests(limits: *ResourceLimits, usage: *ResourceUsage) -> i32
+    if limits.max_requests <= 0
+        return LIMIT_OK  # Disabled
+    if usage.request_count > limits.max_requests
+        return LIMIT_EXCEEDED
+    return LIMIT_OK
+
+# Check connection limit
+pub fn resource_check_connections(limits: *ResourceLimits, usage: *ResourceUsage) -> i32
+    if limits.max_connections <= 0
+        return LIMIT_OK  # Disabled
+    if usage.connection_count > limits.max_connections
+        return LIMIT_EXCEEDED
+    return LIMIT_OK
+
+# Check CPU limit
+pub fn resource_check_cpu(limits: *ResourceLimits, usage: *ResourceUsage) -> i32
+    if limits.max_cpu_ms <= 0
+        return LIMIT_OK  # Disabled
+    if usage.cpu_time_ms > limits.max_cpu_ms
+        return LIMIT_EXCEEDED
+    return LIMIT_OK
+
+# Check all limits
+pub fn resource_check_all(limits: *ResourceLimits, usage: *ResourceUsage) -> i32
+    if resource_check_memory(limits, usage) == LIMIT_EXCEEDED
+        return LIMIT_EXCEEDED
+    if resource_check_requests(limits, usage) == LIMIT_EXCEEDED
+        return LIMIT_EXCEEDED
+    if resource_check_connections(limits, usage) == LIMIT_EXCEEDED
+        return LIMIT_EXCEEDED
+    if resource_check_cpu(limits, usage) == LIMIT_EXCEEDED
+        return LIMIT_EXCEEDED
+    return LIMIT_OK
+
+# Check warning threshold (based on memory usage)
+pub fn resource_check_warning(limits: *ResourceLimits, usage: *ResourceUsage) -> i32
+    if limits.max_memory_bytes <= 0
+        return LIMIT_OK
+
+    let threshold: i64 = (limits.max_memory_bytes * (limits.warning_threshold_percent as i64)) / 100
+
+    if usage.memory_bytes >= threshold
+        return LIMIT_WARNING
+
+    return LIMIT_OK
+
+# ============================================================================
+# Worker Limit Context
+# ============================================================================
+# Combines limits and usage for a single worker.
+
+pub struct WorkerLimitContext
+    limits: ResourceLimits     # 0: Configured limits
+    usage: ResourceUsage       # 40: Current usage
+    violations: i32            # 88: Number of limit violations
+    last_check_result: i32     # 92: Result of last check
+
+# Initialize context
+pub fn worker_limit_context_init(ctx: *WorkerLimitContext)
+    resource_limits_init(@ctx.limits)
+    resource_usage_init(@ctx.usage)
+    ctx.violations = 0
+    ctx.last_check_result = LIMIT_OK
+
+# Track memory allocation
+pub fn worker_limit_track_memory(ctx: *WorkerLimitContext, bytes: i64)
+    resource_usage_add_memory(@ctx.usage, bytes)
+
+# Track memory release
+pub fn worker_limit_release_memory(ctx: *WorkerLimitContext, bytes: i64)
+    resource_usage_remove_memory(@ctx.usage, bytes)
+
+# Track request
+pub fn worker_limit_track_request(ctx: *WorkerLimitContext)
+    resource_usage_add_request(@ctx.usage)
+
+# Track connection
+pub fn worker_limit_track_connection(ctx: *WorkerLimitContext)
+    resource_usage_add_connection(@ctx.usage)
+
+# Release connection
+pub fn worker_limit_release_connection(ctx: *WorkerLimitContext)
+    resource_usage_remove_connection(@ctx.usage)
+
+# Check if worker is within limits
+pub fn worker_limit_check(ctx: *WorkerLimitContext) -> i32
+    let result: i32 = resource_check_all(@ctx.limits, @ctx.usage)
+    ctx.last_check_result = result
+
+    if result == LIMIT_EXCEEDED
+        ctx.violations = ctx.violations + 1
+
+    return result
+
+# Check if worker should be recycled
+pub fn worker_should_recycle(ctx: *WorkerLimitContext) -> i32
+    # Recycle if request limit reached or too many violations
+    if ctx.violations > 3
+        return 1
+
+    if ctx.limits.max_requests > 0
+        if ctx.usage.request_count >= ctx.limits.max_requests
+            return 1
+
+    return 0
+
+# Reset for new work cycle
+pub fn worker_limit_reset(ctx: *WorkerLimitContext)
+    resource_usage_reset(@ctx.usage)
+    ctx.violations = 0
+    ctx.last_check_result = LIMIT_OK

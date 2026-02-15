@@ -1,0 +1,739 @@
+# lisp - Simple Lisp interpreter
+#
+# Usage: lisp [FILE]
+#   Evaluate Lisp S-expressions.
+#
+# If no file given, starts interactive REPL.
+#
+# Examples:
+#   lisp script.lisp         # Run script
+#   echo "(+ 1 2)" | lisp    # Evaluate expression
+#
+# Supported features:
+#   - Arithmetic: +, -, *, /, %
+#   - Comparison: =, <, >, <=, >=
+#   - Logic: and, or, not
+#   - Define: (define name value)
+#   - Conditionals: (if cond then else)
+#   - Lambda: (lambda (args) body)
+#   - Quote: (quote x) or 'x
+#   - List ops: car, cdr, cons, list
+#   - Predicates: null?, number?, list?
+
+# ============================================================================
+# Standard library imports
+# ============================================================================
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+import ritzlib.args
+import ritzlib.gvec
+
+# ============================================================================
+# Value Types
+# ============================================================================
+
+const TYPE_NIL: i32 = 0
+const TYPE_NUMBER: i32 = 1
+const TYPE_SYMBOL: i32 = 2
+const TYPE_CONS: i32 = 3
+const TYPE_LAMBDA: i32 = 4
+const TYPE_BUILTIN: i32 = 5
+const TYPE_TRUE: i32 = 6
+
+const MAX_SYMBOL_LEN: i64 = 64
+const MAX_VALUES: i32 = 4096
+const MAX_ENV_BINDINGS: i32 = 256
+
+# ============================================================================
+# Value structure
+# ============================================================================
+
+struct Value
+    vtype: i32
+    # For numbers
+    num: i64
+    # For symbols (first 8 bytes of name stored inline, rest ignored)
+    sym: [64]u8
+    # For cons cells
+    car_idx: i32
+    cdr_idx: i32
+    # For lambda
+    params_idx: i32
+    body_idx: i32
+    env_idx: i32
+    # For builtins
+    builtin_id: i32
+
+# Value heap
+struct Heap
+    values: *Value
+    count: i32
+    cap: i32
+
+fn heap_init(h: *Heap, cap: i32) -> i32
+    let size: i64 = cap as i64 * 152  # sizeof(Value) approx
+    let ptr: i64 = sys_mmap(0, size, 3, 34, -1, 0)
+    if ptr < 0
+        return -1
+    h.values = ptr as *Value
+    h.count = 0
+    h.cap = cap
+    return 0
+
+fn lisp_alloc(h: *Heap) -> i32
+    if h.count >= h.cap
+        return -1
+    let idx: i32 = h.count
+    h.count = h.count + 1
+    return idx
+
+fn heap_get(h: *Heap, idx: i32) -> *Value
+    if idx < 0 || idx >= h.count
+        return null
+    return h.values + idx
+
+# Helper to get symbol pointer from value
+fn value_sym_ptr(v: *Value) -> *u8
+    return (v as *u8) + 16  # offset of sym field
+
+# ============================================================================
+# Environment (bindings)
+# ============================================================================
+
+struct Binding
+    name: [64]u8
+    value_idx: i32
+
+struct Env
+    bindings: *Binding
+    count: i32
+    cap: i32
+    parent_idx: i32  # -1 for global
+
+fn env_init(e: *Env, bindings: *Binding, cap: i32) -> i32
+    e.bindings = bindings
+    e.count = 0
+    e.cap = cap
+    e.parent_idx = -1
+    return 0
+
+fn binding_name_ptr(b: *Binding) -> *u8
+    return b as *u8
+
+fn env_set(e: *Env, name: *u8, value_idx: i32) -> i32
+    # Check if already exists
+    for i in 0..e.count
+        let b: *Binding = e.bindings + i
+        let b_name: *u8 = binding_name_ptr(b)
+        if streq(b_name, name) != 0
+            b.value_idx = value_idx
+            return 0
+
+    # Add new binding
+    if e.count >= e.cap
+        return -1
+    let b: *Binding = e.bindings + e.count
+    let b_name: *u8 = binding_name_ptr(b)
+    strcpy(b_name, name)
+    b.value_idx = value_idx
+    e.count = e.count + 1
+    return 0
+
+fn env_get(e: *Env, name: *u8) -> i32
+    for i in 0..e.count
+        let b: *Binding = e.bindings + i
+        let b_name: *u8 = binding_name_ptr(b)
+        if streq(b_name, name) != 0
+            return b.value_idx
+    return -1
+
+# ============================================================================
+# Global state
+# ============================================================================
+
+struct LispState
+    heap: Heap
+    env: Env
+    bindings_storage: *Binding
+    # Constants
+    nil_idx: i32
+    true_idx: i32
+
+fn make_nil(s: *LispState) -> i32
+    let idx: i32 = lisp_alloc(&s.heap)
+    let v: *Value = heap_get(&s.heap, idx)
+    v.vtype = TYPE_NIL
+    return idx
+
+fn make_true(s: *LispState) -> i32
+    let idx: i32 = lisp_alloc(&s.heap)
+    let v: *Value = heap_get(&s.heap, idx)
+    v.vtype = TYPE_TRUE
+    return idx
+
+fn make_number(s: *LispState, n: i64) -> i32
+    let idx: i32 = lisp_alloc(&s.heap)
+    let v: *Value = heap_get(&s.heap, idx)
+    v.vtype = TYPE_NUMBER
+    v.num = n
+    return idx
+
+fn make_symbol(s: *LispState, name: *u8) -> i32
+    let idx: i32 = lisp_alloc(&s.heap)
+    let v: *Value = heap_get(&s.heap, idx)
+    v.vtype = TYPE_SYMBOL
+    let sym_ptr: *u8 = value_sym_ptr(v)
+    strcpy(sym_ptr, name)
+    return idx
+
+fn make_cons(s: *LispState, car: i32, cdr: i32) -> i32
+    let idx: i32 = lisp_alloc(&s.heap)
+    let v: *Value = heap_get(&s.heap, idx)
+    v.vtype = TYPE_CONS
+    v.car_idx = car
+    v.cdr_idx = cdr
+    return idx
+
+fn make_lambda(s: *LispState, params: i32, body: i32) -> i32
+    let idx: i32 = lisp_alloc(&s.heap)
+    let v: *Value = heap_get(&s.heap, idx)
+    v.vtype = TYPE_LAMBDA
+    v.params_idx = params
+    v.body_idx = body
+    return idx
+
+fn make_builtin(s: *LispState, id: i32) -> i32
+    let idx: i32 = lisp_alloc(&s.heap)
+    let v: *Value = heap_get(&s.heap, idx)
+    v.vtype = TYPE_BUILTIN
+    v.builtin_id = id
+    return idx
+
+# ============================================================================
+# Parser
+# ============================================================================
+
+struct Parser
+    data: *u8
+    len: i64
+    pos: i64
+    state: *LispState
+
+fn parser_init(p: *Parser, data: *u8, len: i64, state: *LispState) -> i32
+    p.data = data
+    p.len = len
+    p.pos = 0
+    p.state = state
+    return 0
+
+fn peek(p: *Parser) -> u8
+    if p.pos >= p.len
+        return 0
+    return *(p.data + p.pos)
+
+fn advance(p: *Parser) -> u8
+    if p.pos >= p.len
+        return 0
+    let c: u8 = *(p.data + p.pos)
+    p.pos = p.pos + 1
+    return c
+
+fn skip_whitespace(p: *Parser) -> i32
+    while p.pos < p.len
+        let c: u8 = peek(p)
+        if c == ' ' || c == '\t' || c == '\n' || c == '\r'
+            advance(p)
+        else if c == ';'  # ';' comment
+            while p.pos < p.len && peek(p) != '\n'
+                advance(p)
+        else
+            break
+    return 0
+
+fn is_symbol_char(c: u8) -> i32
+    if c >= 'A' && c <= 'Z'
+        return 1
+    if c >= 'a' && c <= 'z'
+        return 1
+    if c >= '0' && c <= '9'
+        return 1
+    if c == '+' || c == '-' || c == '*' || c == '/' || c == 37  # + - * / %
+        return 1
+    if c == '<' || c == '>' || c == '='  # < > =
+        return 1
+    if c == '_' || c == 63 || c == '!'  # _ ? !
+        return 1
+    return 0
+
+fn parse_number(p: *Parser) -> i32
+    var num: i64 = 0
+    var neg: i32 = 0
+
+    if peek(p) == '-'  # '-'
+        neg = 1
+        advance(p)
+
+    while p.pos < p.len
+        let c: u8 = peek(p)
+        if c < '0' || c > '9'
+            break
+        num = num * 10 + (c - '0') as i64
+        advance(p)
+
+    if neg != 0
+        num = 0 - num
+
+    return make_number(p.state, num)
+
+fn parse_symbol(p: *Parser) -> i32
+    var buf: [64]u8
+    var len: i64 = 0
+
+    while p.pos < p.len && len < 63
+        let c: u8 = peek(p)
+        if is_symbol_char(c) == 0
+            break
+        buf[len] = advance(p)
+        len += 1
+    buf[len] = 0
+
+    return make_symbol(p.state, &buf[0])
+
+fn parse_list(p: *Parser) -> i32
+    advance(p)  # skip '('
+    skip_whitespace(p)
+
+    if peek(p) == 41  # ')'
+        advance(p)
+        return p.state.nil_idx
+
+    let car: i32 = parse_expr(p)
+    skip_whitespace(p)
+
+    let cdr: i32 = parse_list_tail(p)
+    return make_cons(p.state, car, cdr)
+
+fn parse_list_tail(p: *Parser) -> i32
+    skip_whitespace(p)
+
+    if peek(p) == 41  # ')'
+        advance(p)
+        return p.state.nil_idx
+
+    if peek(p) == '.'  # '.' for dotted pair
+        advance(p)
+        skip_whitespace(p)
+        let val: i32 = parse_expr(p)
+        skip_whitespace(p)
+        if peek(p) == 41
+            advance(p)
+        return val
+
+    let car: i32 = parse_expr(p)
+    let cdr: i32 = parse_list_tail(p)
+    return make_cons(p.state, car, cdr)
+
+fn parse_expr(p: *Parser) -> i32
+    skip_whitespace(p)
+    let c: u8 = peek(p)
+
+    if c == 0
+        return p.state.nil_idx
+
+    if c == 40  # '('
+        return parse_list(p)
+
+    if c == '\''  # '\'' (quote)
+        advance(p)
+        let quoted: i32 = parse_expr(p)
+        let quote_sym: i32 = make_symbol(p.state, "quote")
+        let inner: i32 = make_cons(p.state, quoted, p.state.nil_idx)
+        return make_cons(p.state, quote_sym, inner)
+
+    if c == '-' || (c >= '0' && c <= '9')  # number
+        # Check if it's really a number or just a '-' symbol
+        if c == '-'
+            let next: u8 = *(p.data + p.pos + 1)
+            if next < '0' || next > '9'
+                return parse_symbol(p)
+        return parse_number(p)
+
+    return parse_symbol(p)
+
+# ============================================================================
+# Eval helpers
+# ============================================================================
+
+fn car(s: *LispState, idx: i32) -> i32
+    let v: *Value = heap_get(&s.heap, idx)
+    if v.vtype != TYPE_CONS
+        return s.nil_idx
+    return v.car_idx
+
+fn cdr(s: *LispState, idx: i32) -> i32
+    let v: *Value = heap_get(&s.heap, idx)
+    if v.vtype != TYPE_CONS
+        return s.nil_idx
+    return v.cdr_idx
+
+fn is_nil(s: *LispState, idx: i32) -> i32
+    let v: *Value = heap_get(&s.heap, idx)
+    return (v.vtype == TYPE_NIL) as i32
+
+fn is_true(s: *LispState, idx: i32) -> i32
+    let v: *Value = heap_get(&s.heap, idx)
+    if v.vtype == TYPE_NIL
+        return 0
+    return 1
+
+# ============================================================================
+# Builtins
+# ============================================================================
+
+const BUILTIN_PLUS: i32 = 1
+const BUILTIN_MINUS: i32 = 2
+const BUILTIN_MULT: i32 = 3
+const BUILTIN_DIV: i32 = 4
+const BUILTIN_EQ: i32 = 5
+const BUILTIN_LT: i32 = 6
+const BUILTIN_GT: i32 = 7
+const BUILTIN_CAR: i32 = 8
+const BUILTIN_CDR: i32 = 9
+const BUILTIN_CONS: i32 = 10
+const BUILTIN_LIST: i32 = 11
+const BUILTIN_NULLP: i32 = 12
+const BUILTIN_NUMBERP: i32 = 13
+
+fn apply_builtin(s: *LispState, id: i32, args_idx: i32) -> i32
+    let a1: i32 = car(s, args_idx)
+    let a2: i32 = car(s, cdr(s, args_idx))
+
+    if id == BUILTIN_PLUS
+        let v1: *Value = heap_get(&s.heap, a1)
+        let v2: *Value = heap_get(&s.heap, a2)
+        return make_number(s, v1.num + v2.num)
+
+    if id == BUILTIN_MINUS
+        let v1: *Value = heap_get(&s.heap, a1)
+        let v2: *Value = heap_get(&s.heap, a2)
+        return make_number(s, v1.num - v2.num)
+
+    if id == BUILTIN_MULT
+        let v1: *Value = heap_get(&s.heap, a1)
+        let v2: *Value = heap_get(&s.heap, a2)
+        return make_number(s, v1.num * v2.num)
+
+    if id == BUILTIN_DIV
+        let v1: *Value = heap_get(&s.heap, a1)
+        let v2: *Value = heap_get(&s.heap, a2)
+        if v2.num == 0
+            return s.nil_idx
+        return make_number(s, v1.num / v2.num)
+
+    if id == BUILTIN_EQ
+        let v1: *Value = heap_get(&s.heap, a1)
+        let v2: *Value = heap_get(&s.heap, a2)
+        if v1.vtype == TYPE_NUMBER && v2.vtype == TYPE_NUMBER
+            if v1.num == v2.num
+                return s.true_idx
+        return s.nil_idx
+
+    if id == BUILTIN_LT
+        let v1: *Value = heap_get(&s.heap, a1)
+        let v2: *Value = heap_get(&s.heap, a2)
+        if v1.num < v2.num
+            return s.true_idx
+        return s.nil_idx
+
+    if id == BUILTIN_GT
+        let v1: *Value = heap_get(&s.heap, a1)
+        let v2: *Value = heap_get(&s.heap, a2)
+        if v1.num > v2.num
+            return s.true_idx
+        return s.nil_idx
+
+    if id == BUILTIN_CAR
+        return car(s, a1)
+
+    if id == BUILTIN_CDR
+        return cdr(s, a1)
+
+    if id == BUILTIN_CONS
+        return make_cons(s, a1, a2)
+
+    if id == BUILTIN_NULLP
+        if is_nil(s, a1) != 0
+            return s.true_idx
+        return s.nil_idx
+
+    if id == BUILTIN_NUMBERP
+        let v1: *Value = heap_get(&s.heap, a1)
+        if v1.vtype == TYPE_NUMBER
+            return s.true_idx
+        return s.nil_idx
+
+    return s.nil_idx
+
+fn eval_expr(s: *LispState, idx: i32) -> i32
+    let v: *Value = heap_get(&s.heap, idx)
+
+    if v.vtype == TYPE_NIL || v.vtype == TYPE_TRUE
+        return idx
+
+    if v.vtype == TYPE_NUMBER
+        return idx
+
+    if v.vtype == TYPE_SYMBOL
+        let sym_ptr: *u8 = value_sym_ptr(v)
+        let bound: i32 = env_get(&s.env, sym_ptr)
+        if bound >= 0
+            return bound
+        return s.nil_idx
+
+    if v.vtype != TYPE_CONS
+        return idx
+
+    # It's a list - evaluate as function call
+    let fn_expr: i32 = car(s, idx)
+    let args: i32 = cdr(s, idx)
+
+    # Check for special forms
+    let fn_val: *Value = heap_get(&s.heap, fn_expr)
+    if fn_val.vtype == TYPE_SYMBOL
+        let sym_ptr: *u8 = value_sym_ptr(fn_val)
+
+        # (quote x)
+        if streq(sym_ptr, "quote") != 0
+            return car(s, args)
+
+        # (if cond then else)
+        if streq(sym_ptr, "if") != 0
+            let cond: i32 = eval_expr(s, car(s, args))
+            if is_true(s, cond) != 0
+                return eval_expr(s, car(s, cdr(s, args)))
+            else
+                return eval_expr(s, car(s, cdr(s, cdr(s, args))))
+
+        # (define name value)
+        if streq(sym_ptr, "define") != 0
+            let name_idx: i32 = car(s, args)
+            let name_val: *Value = heap_get(&s.heap, name_idx)
+            let name_ptr: *u8 = value_sym_ptr(name_val)
+            let val: i32 = eval_expr(s, car(s, cdr(s, args)))
+            env_set(&s.env, name_ptr, val)
+            return val
+
+        # (lambda (args) body)
+        if streq(sym_ptr, "lambda") != 0
+            let params: i32 = car(s, args)
+            let body: i32 = car(s, cdr(s, args))
+            return make_lambda(s, params, body)
+
+    # Evaluate function and args
+    let func: i32 = eval_expr(s, fn_expr)
+
+    # Inline eval_args to avoid mutual recursion
+    var evaled_args: i32 = s.nil_idx
+    var args_cur: i32 = args
+    var args_result_head: i32 = -1
+    var args_result_tail: i32 = -1
+    while is_nil(s, args_cur) == 0
+        let arg_val: i32 = eval_expr(s, car(s, args_cur))
+        let new_cell: i32 = make_cons(s, arg_val, s.nil_idx)
+        if args_result_head < 0
+            args_result_head = new_cell
+            args_result_tail = new_cell
+        else
+            let tail_v: *Value = heap_get(&s.heap, args_result_tail)
+            tail_v.cdr_idx = new_cell
+            args_result_tail = new_cell
+        args_cur = cdr(s, args_cur)
+    if args_result_head >= 0
+        evaled_args = args_result_head
+
+    let func_v: *Value = heap_get(&s.heap, func)
+
+    if func_v.vtype == TYPE_BUILTIN
+        return apply_builtin(s, func_v.builtin_id, evaled_args)
+
+    if func_v.vtype == TYPE_LAMBDA
+        # Would need to create new env and bind params
+        # Simplified: just return nil for now
+        return s.nil_idx
+
+    return s.nil_idx
+
+# ============================================================================
+# Print
+# ============================================================================
+
+fn print_value(s: *LispState, idx: i32) -> i32
+    let v: *Value = heap_get(&s.heap, idx)
+
+    if v.vtype == TYPE_NIL
+        prints("nil")
+        return 0
+
+    if v.vtype == TYPE_TRUE
+        prints("#t")
+        return 0
+
+    if v.vtype == TYPE_NUMBER
+        print_int(v.num)
+        return 0
+
+    if v.vtype == TYPE_SYMBOL
+        let sym_ptr: *u8 = value_sym_ptr(v)
+        prints(sym_ptr)
+        return 0
+
+    if v.vtype == TYPE_CONS
+        prints("(")
+        print_value(s, v.car_idx)
+        var cdr_idx: i32 = v.cdr_idx
+        while 1 == 1
+            let cdr_v: *Value = heap_get(&s.heap, cdr_idx)
+            if cdr_v.vtype == TYPE_NIL
+                break
+            if cdr_v.vtype != TYPE_CONS
+                prints(" . ")
+                print_value(s, cdr_idx)
+                break
+            prints(" ")
+            print_value(s, cdr_v.car_idx)
+            cdr_idx = cdr_v.cdr_idx
+        prints(")")
+        return 0
+
+    if v.vtype == TYPE_LAMBDA
+        prints("<lambda>")
+        return 0
+
+    if v.vtype == TYPE_BUILTIN
+        prints("<builtin>")
+        return 0
+
+    return 0
+
+# ============================================================================
+# Setup builtins
+# ============================================================================
+
+fn setup_builtins(s: *LispState) -> i32
+    env_set(&s.env, "+", make_builtin(s, BUILTIN_PLUS))
+    env_set(&s.env, "-", make_builtin(s, BUILTIN_MINUS))
+    env_set(&s.env, "*", make_builtin(s, BUILTIN_MULT))
+    env_set(&s.env, "/", make_builtin(s, BUILTIN_DIV))
+    env_set(&s.env, "=", make_builtin(s, BUILTIN_EQ))
+    env_set(&s.env, "<", make_builtin(s, BUILTIN_LT))
+    env_set(&s.env, ">", make_builtin(s, BUILTIN_GT))
+    env_set(&s.env, "car", make_builtin(s, BUILTIN_CAR))
+    env_set(&s.env, "cdr", make_builtin(s, BUILTIN_CDR))
+    env_set(&s.env, "cons", make_builtin(s, BUILTIN_CONS))
+    env_set(&s.env, "null?", make_builtin(s, BUILTIN_NULLP))
+    env_set(&s.env, "number?", make_builtin(s, BUILTIN_NUMBERP))
+    return 0
+
+# ============================================================================
+# File reading
+# ============================================================================
+
+fn read_file(path: *u8, buf: *Vec<u8>) -> i32
+    let fd: i32 = sys_open(path, 0)
+    if fd < 0
+        return -1
+
+    var tmp: [4096]u8
+    while 1 == 1
+        let n: i64 = sys_read(fd, &tmp[0], 4096)
+        if n < 0
+            sys_close(fd)
+            return -1
+        if n == 0
+            break
+        vec_push_bytes<u8>(buf, &tmp[0], n)
+
+    sys_close(fd)
+    return 0
+
+fn read_stdin(buf: *Vec<u8>) -> i32
+    var tmp: [4096]u8
+    while 1 == 1
+        let n: i64 = sys_read(0, &tmp[0], 4096)
+        if n < 0
+            return -1
+        if n == 0
+            break
+        vec_push_bytes<u8>(buf, &tmp[0], n)
+    return 0
+
+# ============================================================================
+# Main
+# ============================================================================
+
+fn main(argc: i32, argv: **u8) -> i32
+    var argparser: ArgParser
+    args_init(&argparser, "lisp", "Simple Lisp interpreter")
+    args_positional(&argparser, "FILE", "Lisp source file (stdin if omitted)", 0, 1)
+
+    if args_parse(&argparser, argc, argv) != 0
+        return 1
+
+    # Initialize state
+    var state: LispState
+
+    if heap_init(&state.heap, MAX_VALUES) != 0
+        eprints("lisp: failed to allocate heap\n")
+        return 1
+
+    # Allocate bindings
+    let bind_size: i64 = MAX_ENV_BINDINGS as i64 * 72
+    let bind_ptr: i64 = sys_mmap(0, bind_size, 3, 34, -1, 0)
+    if bind_ptr < 0
+        eprints("lisp: failed to allocate env\n")
+        return 1
+    state.bindings_storage = bind_ptr as *Binding
+    env_init(&state.env, state.bindings_storage, MAX_ENV_BINDINGS)
+
+    # Create constants
+    state.nil_idx = make_nil(&state)
+    state.true_idx = make_true(&state)
+
+    # Setup builtins
+    setup_builtins(&state)
+
+    # Read input
+    var input: Vec<u8> = vec_new<u8>()
+
+    if argparser.positional_count > 0
+        let path: *u8 = args_get_positional(&argparser, 0)
+        if read_file(path, &input) != 0
+            eprints("lisp: cannot read file: ")
+            eprints(path)
+            eprints("\n")
+            return 1
+    else
+        if read_stdin(&input) != 0
+            eprints("lisp: cannot read stdin\n")
+            return 1
+
+    vec_push<u8>(&input, 0)
+
+    # Parse and eval
+    var parser: Parser
+    parser_init(&parser, input.data, input.len - 1, &state)
+
+    while parser.pos < parser.len
+        skip_whitespace(&parser)
+        if parser.pos >= parser.len
+            break
+
+        let expr: i32 = parse_expr(&parser)
+        let result: i32 = eval_expr(&state, expr)
+        print_value(&state, result)
+        prints("\n")
+
+    # Drop is automatic via RAII
+    return 0

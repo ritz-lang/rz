@@ -1,0 +1,440 @@
+# lib/encrypted_channel.ritz - Encrypted communication channel
+#
+# Implements a Noise Protocol-like encrypted channel using:
+# - X25519 for key exchange (ECDH)
+# - ChaCha20-Poly1305 for authenticated encryption
+# - HKDF-SHA256 for key derivation
+#
+# Protocol:
+# 1. Client generates ephemeral X25519 keypair
+# 2. Client sends public key (32 bytes)
+# 3. Server generates ephemeral X25519 keypair
+# 4. Server sends public key (32 bytes)
+# 5. Both compute shared secret via ECDH
+# 6. Both derive send/recv keys using HKDF
+# 7. All subsequent messages are encrypted with ChaCha20-Poly1305
+#
+# Message format after handshake:
+# [length: 4 bytes BE][nonce: 12 bytes][ciphertext + tag: N + 16 bytes]
+
+import ritzlib.sys
+import ritzlib.memory
+import ritzlib.str
+import ritzlib.net
+
+import cryptosec.x25519
+import cryptosec.chacha20_poly1305
+import cryptosec.hkdf
+import cryptosec.sha256
+import cryptosec.random
+import cryptosec.mem
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+const CHANNEL_KEY_SIZE: i32 = 32
+const CHANNEL_NONCE_SIZE: i32 = 12
+const CHANNEL_TAG_SIZE: i32 = 16
+const CHANNEL_MAX_MSG_SIZE: i32 = 65536
+
+# Channel states
+pub const CHANNEL_STATE_INIT: i32 = 0
+pub const CHANNEL_STATE_HANDSHAKE: i32 = 1
+pub const CHANNEL_STATE_CONNECTED: i32 = 2
+pub const CHANNEL_STATE_ERROR: i32 = -1
+
+# Error codes
+pub const CHANNEL_OK: i32 = 0
+pub const CHANNEL_ERR_HANDSHAKE: i32 = -1
+pub const CHANNEL_ERR_DECRYPT: i32 = -2
+pub const CHANNEL_ERR_BUFFER: i32 = -3
+pub const CHANNEL_ERR_IO: i32 = -4
+
+# ============================================================================
+# Encrypted Channel Structure
+# ============================================================================
+
+pub struct EncryptedChannel
+    # Socket for communication
+    sock: Socket
+    state: i32
+    last_error: i32
+
+    # Our ephemeral keypair
+    private_key: [32]u8
+    public_key: [32]u8
+
+    # Peer's public key
+    peer_public_key: [32]u8
+
+    # Derived symmetric keys
+    send_key: [32]u8
+    recv_key: [32]u8
+
+    # Nonces (incremented for each message)
+    send_nonce: u64
+    recv_nonce: u64
+
+    # Receive buffer
+    recv_buf: *u8
+    recv_len: i32
+    recv_cap: i32
+
+    # Is this the server side?
+    is_server: i32
+
+# ============================================================================
+# Channel Lifecycle
+# ============================================================================
+
+# Initialize a channel for client use
+pub fn channel_init_client(ch: *EncryptedChannel, sock: Socket) -> i32
+    ch.sock = sock
+    ch.state = CHANNEL_STATE_INIT
+    ch.last_error = CHANNEL_OK
+    ch.is_server = 0
+    ch.send_nonce = 0
+    ch.recv_nonce = 0
+
+    # Generate ephemeral keypair
+    getrandom(@ch.private_key[0], 32, 0)
+    x25519_clamp(@ch.private_key[0])
+    x25519_pubkey(@ch.public_key[0], @ch.private_key[0])
+
+    # Allocate receive buffer
+    ch.recv_buf = malloc(CHANNEL_MAX_MSG_SIZE as i64) as *u8
+    if ch.recv_buf == null
+        ch.state = CHANNEL_STATE_ERROR
+        ch.last_error = CHANNEL_ERR_BUFFER
+        return -1
+
+    ch.recv_len = 0
+    ch.recv_cap = CHANNEL_MAX_MSG_SIZE
+    return 0
+
+# Initialize a channel for server use
+pub fn channel_init_server(ch: *EncryptedChannel, sock: Socket) -> i32
+    ch.sock = sock
+    ch.state = CHANNEL_STATE_INIT
+    ch.last_error = CHANNEL_OK
+    ch.is_server = 1
+    ch.send_nonce = 0
+    ch.recv_nonce = 0
+
+    # Generate ephemeral keypair
+    getrandom(@ch.private_key[0], 32, 0)
+    x25519_clamp(@ch.private_key[0])
+    x25519_pubkey(@ch.public_key[0], @ch.private_key[0])
+
+    # Allocate receive buffer
+    ch.recv_buf = malloc(CHANNEL_MAX_MSG_SIZE as i64) as *u8
+    if ch.recv_buf == null
+        ch.state = CHANNEL_STATE_ERROR
+        ch.last_error = CHANNEL_ERR_BUFFER
+        return -1
+
+    ch.recv_len = 0
+    ch.recv_cap = CHANNEL_MAX_MSG_SIZE
+    return 0
+
+# Free channel resources
+pub fn channel_free(ch: *EncryptedChannel)
+    # Zero sensitive key material
+    mem_zero(@ch.private_key[0], 32)
+    mem_zero(@ch.send_key[0], 32)
+    mem_zero(@ch.recv_key[0], 32)
+
+    if ch.recv_buf != null
+        free(ch.recv_buf)
+        ch.recv_buf = null
+
+    # Close socket
+    if ch.sock.fd >= 0
+        socket_close(@ch.sock)
+        ch.sock.fd = -1
+
+    ch.state = CHANNEL_STATE_ERROR
+
+# ============================================================================
+# Key Derivation
+# ============================================================================
+
+# Derive send and receive keys from shared secret
+fn derive_keys(ch: *EncryptedChannel, shared_secret: *u8)
+    # Use HKDF-SHA256 to derive keys
+    # Salt: empty (per Noise specification)
+    # Info: "mausoleum-v1" for domain separation
+
+    var prk: [32]u8
+    var salt: [1]u8
+    salt[0] = 0
+
+    # Extract: PRK = HKDF-Extract(salt="", IKM=shared_secret)
+    hkdf_extract(@salt[0], 0, shared_secret, 32, @prk[0])
+
+    # Expand: OKM = HKDF-Expand(PRK, info, 64)
+    var okm: [64]u8
+    var info: [12]u8
+    info[0] = 109  # 'm'
+    info[1] = 97   # 'a'
+    info[2] = 117  # 'u'
+    info[3] = 115  # 's'
+    info[4] = 111  # 'o'
+    info[5] = 108  # 'l'
+    info[6] = 101  # 'e'
+    info[7] = 117  # 'u'
+    info[8] = 109  # 'm'
+    info[9] = 45   # '-'
+    info[10] = 118 # 'v'
+    info[11] = 49  # '1'
+
+    hkdf_expand(@prk[0], @info[0], 12, @okm[0], 64)
+
+    # Server and client use opposite keys for send/recv
+    if ch.is_server != 0
+        mem_copy(@ch.send_key[0], @okm[0], 32)
+        mem_copy(@ch.recv_key[0], @okm[32], 32)
+    else
+        mem_copy(@ch.recv_key[0], @okm[0], 32)
+        mem_copy(@ch.send_key[0], @okm[32], 32)
+
+    # Zero intermediate values
+    mem_zero(@prk[0], 32)
+    mem_zero(@okm[0], 64)
+
+# ============================================================================
+# Handshake
+# ============================================================================
+
+# Perform client handshake
+pub fn channel_handshake_client(ch: *EncryptedChannel) -> i32
+    if ch.state != CHANNEL_STATE_INIT
+        ch.last_error = CHANNEL_ERR_HANDSHAKE
+        return -1
+
+    ch.state = CHANNEL_STATE_HANDSHAKE
+
+    # Send our public key
+    var sent: i64 = socket_send(@ch.sock, @ch.public_key[0], 32)
+    if sent != 32
+        ch.state = CHANNEL_STATE_ERROR
+        ch.last_error = CHANNEL_ERR_IO
+        return -2
+
+    # Receive server's public key
+    var received: i32 = 0
+    while received < 32
+        var n: i64 = socket_recv(@ch.sock, @ch.peer_public_key[received], (32 - received) as i64)
+        if n <= 0
+            ch.state = CHANNEL_STATE_ERROR
+            ch.last_error = CHANNEL_ERR_IO
+            return -3
+        received += n as i32
+
+    # Compute shared secret
+    var shared: [32]u8
+    x25519(@shared[0], @ch.private_key[0], @ch.peer_public_key[0])
+
+    # Derive keys
+    derive_keys(ch, @shared[0])
+    mem_zero(@shared[0], 32)
+
+    ch.state = CHANNEL_STATE_CONNECTED
+    return 0
+
+# Perform server handshake
+pub fn channel_handshake_server(ch: *EncryptedChannel) -> i32
+    if ch.state != CHANNEL_STATE_INIT
+        ch.last_error = CHANNEL_ERR_HANDSHAKE
+        return -1
+
+    ch.state = CHANNEL_STATE_HANDSHAKE
+
+    # Receive client's public key
+    var received: i32 = 0
+    while received < 32
+        var n: i64 = socket_recv(@ch.sock, @ch.peer_public_key[received], (32 - received) as i64)
+        if n <= 0
+            ch.state = CHANNEL_STATE_ERROR
+            ch.last_error = CHANNEL_ERR_IO
+            return -2
+        received += n as i32
+
+    # Send our public key
+    var sent: i64 = socket_send(@ch.sock, @ch.public_key[0], 32)
+    if sent != 32
+        ch.state = CHANNEL_STATE_ERROR
+        ch.last_error = CHANNEL_ERR_IO
+        return -3
+
+    # Compute shared secret
+    var shared: [32]u8
+    x25519(@shared[0], @ch.private_key[0], @ch.peer_public_key[0])
+
+    # Derive keys
+    derive_keys(ch, @shared[0])
+    mem_zero(@shared[0], 32)
+
+    ch.state = CHANNEL_STATE_CONNECTED
+    return 0
+
+# ============================================================================
+# Encrypted Send/Receive
+# ============================================================================
+
+# Build nonce from counter
+fn build_nonce(nonce: *u8, counter: u64)
+    # 12-byte nonce: [4 zeros][8-byte LE counter]
+    mem_zero(nonce, 12)
+    nonce[4] = (counter & 0xff) as u8
+    nonce[5] = ((counter >> 8) & 0xff) as u8
+    nonce[6] = ((counter >> 16) & 0xff) as u8
+    nonce[7] = ((counter >> 24) & 0xff) as u8
+    nonce[8] = ((counter >> 32) & 0xff) as u8
+    nonce[9] = ((counter >> 40) & 0xff) as u8
+    nonce[10] = ((counter >> 48) & 0xff) as u8
+    nonce[11] = ((counter >> 56) & 0xff) as u8
+
+# Send encrypted message
+# Returns bytes sent (excluding overhead) or negative on error
+pub fn channel_send(ch: *EncryptedChannel, data: *u8, len: i32) -> i32
+    if ch.state != CHANNEL_STATE_CONNECTED
+        ch.last_error = CHANNEL_ERR_HANDSHAKE
+        return -1
+
+    if len > CHANNEL_MAX_MSG_SIZE - 4 - CHANNEL_NONCE_SIZE - CHANNEL_TAG_SIZE
+        ch.last_error = CHANNEL_ERR_BUFFER
+        return -2
+
+    # Prepare message buffer:
+    # [length: 4 BE][nonce: 12][ciphertext: len][tag: 16]
+    var msg_len: i32 = 4 + CHANNEL_NONCE_SIZE + len + CHANNEL_TAG_SIZE
+    var msg: *u8 = malloc(msg_len as i64) as *u8
+    if msg == null
+        ch.last_error = CHANNEL_ERR_BUFFER
+        return -3
+
+    # Write length (big-endian)
+    let payload_len: i32 = CHANNEL_NONCE_SIZE + len + CHANNEL_TAG_SIZE
+    msg[0] = ((payload_len >> 24) & 0xff) as u8
+    msg[1] = ((payload_len >> 16) & 0xff) as u8
+    msg[2] = ((payload_len >> 8) & 0xff) as u8
+    msg[3] = (payload_len & 0xff) as u8
+
+    # Build nonce
+    var nonce: [12]u8
+    build_nonce(@nonce[0], ch.send_nonce)
+    ch.send_nonce += 1
+
+    # Copy nonce to message
+    mem_copy(msg + 4, @nonce[0], 12)
+
+    # Encrypt with ChaCha20-Poly1305
+    var ciphertext: *u8 = msg + 4 + CHANNEL_NONCE_SIZE
+    var tag: *u8 = ciphertext + len
+    chacha20_poly1305_encrypt(@ch.send_key[0], @nonce[0], null, 0, data, len as i64, ciphertext, tag)
+
+    # Send message
+    var sent: i32 = 0
+    while sent < msg_len
+        var n: i64 = socket_send(@ch.sock, msg + sent, (msg_len - sent) as i64)
+        if n <= 0
+            free(msg)
+            ch.last_error = CHANNEL_ERR_IO
+            return -4
+        sent += n as i32
+
+    free(msg)
+    return len
+
+# Receive encrypted message
+# Returns bytes received (plaintext length) or negative on error
+pub fn channel_recv(ch: *EncryptedChannel, data: *u8, cap: i32) -> i32
+    if ch.state != CHANNEL_STATE_CONNECTED
+        ch.last_error = CHANNEL_ERR_HANDSHAKE
+        return -1
+
+    # Read length prefix (4 bytes)
+    var header: [4]u8
+    var hdr_read: i32 = 0
+    while hdr_read < 4
+        var n: i64 = socket_recv(@ch.sock, @header[hdr_read], (4 - hdr_read) as i64)
+        if n <= 0
+            ch.last_error = CHANNEL_ERR_IO
+            return -2
+        hdr_read += n as i32
+
+    # Parse length (big-endian)
+    var payload_len: i32 = (header[0] as i32) << 24
+    payload_len = payload_len | ((header[1] as i32) << 16)
+    payload_len = payload_len | ((header[2] as i32) << 8)
+    payload_len = payload_len | (header[3] as i32)
+
+    if payload_len < CHANNEL_NONCE_SIZE + CHANNEL_TAG_SIZE
+        ch.last_error = CHANNEL_ERR_DECRYPT
+        return -3
+
+    if payload_len > ch.recv_cap
+        ch.last_error = CHANNEL_ERR_BUFFER
+        return -4
+
+    # Read payload
+    var received: i32 = 0
+    while received < payload_len
+        var n: i64 = socket_recv(@ch.sock, ch.recv_buf + received, (payload_len - received) as i64)
+        if n <= 0
+            ch.last_error = CHANNEL_ERR_IO
+            return -5
+        received += n as i32
+
+    # Extract nonce
+    var nonce: [12]u8
+    mem_copy(@nonce[0], ch.recv_buf, 12)
+
+    # Verify nonce matches expected
+    var expected_nonce: [12]u8
+    build_nonce(@expected_nonce[0], ch.recv_nonce)
+    var nonce_ok: i32 = 1
+    var i: i32 = 0
+    while i < 12
+        if nonce[i] != expected_nonce[i]
+            nonce_ok = 0
+        i += 1
+
+    if nonce_ok == 0
+        ch.last_error = CHANNEL_ERR_DECRYPT
+        return -6
+
+    ch.recv_nonce += 1
+
+    # Extract ciphertext and tag
+    let ct_len: i32 = payload_len - CHANNEL_NONCE_SIZE - CHANNEL_TAG_SIZE
+    var ciphertext: *u8 = ch.recv_buf + CHANNEL_NONCE_SIZE
+    var tag: *u8 = ciphertext + ct_len
+
+    if ct_len > cap
+        ch.last_error = CHANNEL_ERR_BUFFER
+        return -7
+
+    # Decrypt with ChaCha20-Poly1305
+    let result: i32 = chacha20_poly1305_decrypt(@ch.recv_key[0], @nonce[0], null, 0, ciphertext, ct_len as i64, tag, data)
+    if result != 0
+        ch.last_error = CHANNEL_ERR_DECRYPT
+        return -8
+
+    return ct_len
+
+# ============================================================================
+# Utility Functions
+# ============================================================================
+
+# Check if channel is connected
+pub fn channel_is_connected(ch: *EncryptedChannel) -> i32
+    if ch.state == CHANNEL_STATE_CONNECTED
+        return 1
+    return 0
+
+# Get last error code
+pub fn channel_last_error(ch: *EncryptedChannel) -> i32
+    return ch.last_error

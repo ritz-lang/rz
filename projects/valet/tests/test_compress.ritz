@@ -1,0 +1,677 @@
+# tests/test_compress.ritz - Compression module tests
+#
+# Tests for Accept-Encoding parsing, MIME type detection, and gzip compression.
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+import ritzlib.memory
+
+import lib.compress
+
+
+# ============================================================================
+# Accept-Encoding Parser Tests
+# ============================================================================
+
+[[test]]
+fn test_accept_encoding_gzip_only() -> i32
+    let result: i32 = accept_encoding_parse(c"gzip", 4)
+    if (result & ENCODING_GZIP) == 0
+        return 1  # FAIL: should include gzip
+    return 0
+
+[[test]]
+fn test_accept_encoding_deflate_only() -> i32
+    let result: i32 = accept_encoding_parse(c"deflate", 7)
+    if (result & ENCODING_DEFLATE) == 0
+        return 1  # FAIL: should include deflate
+    return 0
+
+[[test]]
+fn test_accept_encoding_gzip_deflate() -> i32
+    let result: i32 = accept_encoding_parse(c"gzip, deflate", 13)
+    if (result & ENCODING_GZIP) == 0
+        return 1  # FAIL: should include gzip
+    if (result & ENCODING_DEFLATE) == 0
+        return 2  # FAIL: should include deflate
+    return 0
+
+[[test]]
+fn test_accept_encoding_with_quality() -> i32
+    let result: i32 = accept_encoding_parse(c"gzip;q=1.0, deflate;q=0.5", 25)
+    if (result & ENCODING_GZIP) == 0
+        return 1  # FAIL: should include gzip
+    if (result & ENCODING_DEFLATE) == 0
+        return 2  # FAIL: should include deflate
+    return 0
+
+[[test]]
+fn test_accept_encoding_wildcard() -> i32
+    let result: i32 = accept_encoding_parse(c"*", 1)
+    if (result & ENCODING_GZIP) == 0
+        return 1  # FAIL: wildcard should include gzip
+    if (result & ENCODING_DEFLATE) == 0
+        return 2  # FAIL: wildcard should include deflate
+    return 0
+
+[[test]]
+fn test_accept_encoding_identity() -> i32
+    let result: i32 = accept_encoding_parse(c"identity", 8)
+    if (result & ENCODING_IDENTITY) == 0
+        return 1  # FAIL: should include identity
+    return 0
+
+[[test]]
+fn test_accept_encoding_case_insensitive() -> i32
+    let result: i32 = accept_encoding_parse(c"GZIP", 4)
+    if (result & ENCODING_GZIP) == 0
+        return 1  # FAIL: should match case-insensitively
+    return 0
+
+[[test]]
+fn test_accept_encoding_null() -> i32
+    let result: i32 = accept_encoding_parse(null, 0)
+    if (result & ENCODING_IDENTITY) == 0
+        return 1  # FAIL: null should default to identity
+    return 0
+
+[[test]]
+fn test_accept_encoding_complex() -> i32
+    # Real-world Chrome header: "gzip, deflate, br, zstd"
+    let result: i32 = accept_encoding_parse(c"gzip, deflate, br, zstd", 23)
+    if (result & ENCODING_GZIP) == 0
+        return 1  # FAIL: should include gzip
+    if (result & ENCODING_DEFLATE) == 0
+        return 2  # FAIL: should include deflate
+    # br and zstd not supported yet, that's fine
+    return 0
+
+
+# ============================================================================
+# Encoding Selection Tests
+# ============================================================================
+
+[[test]]
+fn test_encoding_select_prefers_gzip() -> i32
+    let accepted: i32 = ENCODING_GZIP | ENCODING_DEFLATE
+    let selected: i32 = encoding_select(accepted)
+    if selected != ENCODING_GZIP
+        return 1  # FAIL: should prefer gzip
+    return 0
+
+[[test]]
+fn test_encoding_select_deflate_fallback() -> i32
+    let accepted: i32 = ENCODING_DEFLATE | ENCODING_IDENTITY
+    let selected: i32 = encoding_select(accepted)
+    if selected != ENCODING_DEFLATE
+        return 1  # FAIL: should select deflate when gzip not available
+    return 0
+
+[[test]]
+fn test_encoding_select_identity_only() -> i32
+    let accepted: i32 = ENCODING_IDENTITY
+    let selected: i32 = encoding_select(accepted)
+    if selected != ENCODING_IDENTITY
+        return 1  # FAIL: should select identity
+    return 0
+
+
+# ============================================================================
+# MIME Type Tests
+# ============================================================================
+
+[[test]]
+fn test_should_compress_text_html() -> i32
+    if should_compress_mime(c"text/html") != 1
+        return 1  # FAIL: text/html should be compressed
+    return 0
+
+[[test]]
+fn test_should_compress_text_plain() -> i32
+    if should_compress_mime(c"text/plain") != 1
+        return 1  # FAIL: text/plain should be compressed
+    return 0
+
+[[test]]
+fn test_should_compress_text_css() -> i32
+    if should_compress_mime(c"text/css") != 1
+        return 1  # FAIL: text/css should be compressed
+    return 0
+
+[[test]]
+fn test_should_compress_application_json() -> i32
+    if should_compress_mime(c"application/json") != 1
+        return 1  # FAIL: application/json should be compressed
+    return 0
+
+[[test]]
+fn test_should_compress_application_javascript() -> i32
+    if should_compress_mime(c"application/javascript") != 1
+        return 1  # FAIL: application/javascript should be compressed
+    return 0
+
+[[test]]
+fn test_should_compress_svg() -> i32
+    if should_compress_mime(c"image/svg+xml") != 1
+        return 1  # FAIL: SVG should be compressed
+    return 0
+
+[[test]]
+fn test_should_not_compress_image_png() -> i32
+    if should_compress_mime(c"image/png") != 0
+        return 1  # FAIL: PNG should not be compressed
+    return 0
+
+[[test]]
+fn test_should_not_compress_image_jpeg() -> i32
+    if should_compress_mime(c"image/jpeg") != 0
+        return 1  # FAIL: JPEG should not be compressed
+    return 0
+
+[[test]]
+fn test_should_not_compress_null() -> i32
+    if should_compress_mime(null) != 0
+        return 1  # FAIL: null MIME should not be compressed
+    return 0
+
+
+# ============================================================================
+# Gzip Compression Tests
+# ============================================================================
+
+[[test]]
+fn test_compress_gzip_basic() -> i32
+    # Compress some text
+    let input: *u8 = c"Hello, World! This is a test of gzip compression in Valet."
+    let input_len: i64 = 59
+
+    var output: [256]u8
+    let result: i64 = compress_gzip(input, input_len, @output[0], 256)
+
+    if result < 0
+        return 1  # FAIL: compression failed
+
+    # Gzip output should be smaller for repetitive text
+    # But for small inputs it might be larger due to header overhead
+    # Just check it's positive
+    if result == 0
+        return 2  # FAIL: zero-length output
+
+    return 0
+
+[[test]]
+fn test_compress_gzip_verify_magic() -> i32
+    # Compress and verify gzip magic bytes
+    let input: *u8 = c"Test data for gzip magic verification"
+    let input_len: i64 = 37
+
+    var output: [256]u8
+    let result: i64 = compress_gzip(input, input_len, @output[0], 256)
+
+    if result < 0
+        return 1  # FAIL: compression failed
+
+    # Check gzip magic bytes (0x1f, 0x8b)
+    if output[0] != 0x1f
+        return 2  # FAIL: first magic byte wrong
+    if output[1] != 0x8b
+        return 3  # FAIL: second magic byte wrong
+
+    return 0
+
+
+# ============================================================================
+# compress_if_beneficial Tests
+# ============================================================================
+
+[[test]]
+fn test_compress_if_beneficial_too_small() -> i32
+    # Data smaller than COMPRESS_MIN_SIZE should not be compressed
+    let input: *u8 = c"tiny"
+    let input_len: i64 = 4
+
+    var result: CompressResult
+    let ret: i32 = compress_if_beneficial(input, input_len, ENCODING_GZIP, c"text/plain", @result)
+
+    if ret != 0
+        return 1  # FAIL: should not compress small data
+    if result.allocated != 0
+        return 2  # FAIL: should not allocate for uncompressed
+    if result.data != input
+        return 3  # FAIL: should return original data
+
+    return 0
+
+[[test]]
+fn test_compress_if_beneficial_not_accepted() -> i32
+    # Client doesn't accept gzip
+    var input: [512]u8
+    for i in 0..512
+        input[i] = 'a'
+
+    var result: CompressResult
+    let ret: i32 = compress_if_beneficial(@input[0], 512, ENCODING_IDENTITY, c"text/plain", @result)
+
+    if ret != 0
+        return 1  # FAIL: should not compress when gzip not accepted
+
+    return 0
+
+[[test]]
+fn test_compress_if_beneficial_non_compressible_mime() -> i32
+    # JPEG shouldn't be compressed
+    var input: [512]u8
+    for i in 0..512
+        input[i] = 'a'
+
+    var result: CompressResult
+    let ret: i32 = compress_if_beneficial(@input[0], 512, ENCODING_GZIP, c"image/jpeg", @result)
+
+    if ret != 0
+        return 1  # FAIL: should not compress non-compressible MIME types
+
+    return 0
+
+[[test]]
+fn test_compress_if_beneficial_success() -> i32
+    # Large enough compressible text should be compressed
+    var input: [1024]u8
+    # Fill with repetitive data that compresses well
+    for i in 0..1024
+        input[i] = ('a' as u8) + ((i % 26) as u8)
+
+    var result: CompressResult
+    let ret: i32 = compress_if_beneficial(@input[0], 1024, ENCODING_GZIP, c"text/plain", @result)
+
+    if ret != 1
+        return 1  # FAIL: should compress
+
+    if result.allocated != 1
+        return 2  # FAIL: should be allocated
+
+    if result.encoding != ENCODING_GZIP
+        return 3  # FAIL: should be gzip encoding
+
+    if result.len >= 1024
+        return 4  # FAIL: compressed should be smaller
+
+    # Clean up
+    compress_result_free(@result)
+
+    return 0
+
+
+# ============================================================================
+# Encoding Header Value Tests
+# ============================================================================
+
+[[test]]
+fn test_encoding_header_value_gzip() -> i32
+    let header: *u8 = encoding_header_value(ENCODING_GZIP)
+    if header == null
+        return 1
+    if strcmp(header, c"gzip") != 0
+        return 2
+    return 0
+
+[[test]]
+fn test_encoding_header_value_deflate() -> i32
+    let header: *u8 = encoding_header_value(ENCODING_DEFLATE)
+    if header == null
+        return 1
+    if strcmp(header, c"deflate") != 0
+        return 2
+    return 0
+
+[[test]]
+fn test_encoding_header_value_identity() -> i32
+    let header: *u8 = encoding_header_value(ENCODING_IDENTITY)
+    # Identity doesn't need a Content-Encoding header
+    if header != null
+        return 1
+    return 0
+
+
+# ============================================================================
+# Deflate Compression Tests
+# ============================================================================
+
+[[test]]
+fn test_compress_deflate_basic() -> i32
+    # Basic deflate compression test
+    let input: *u8 = c"Hello, this is test data for deflate compression!"
+    let input_len: i64 = 50
+
+    var output: [256]u8
+    let result: i64 = compress_deflate(@input[0], input_len, @output[0], 256)
+
+    if result < 0
+        return 1  # FAIL: compression failed
+
+    # Deflate should produce some output
+    if result == 0
+        return 2  # FAIL: no output produced
+
+    return 0
+
+
+[[test]]
+fn test_compress_deflate_level() -> i32
+    # Test deflate with different compression levels
+    var input: [512]u8
+    for i in 0..512
+        input[i] = ('a' as u8) + ((i % 26) as u8)
+
+    var output_fast: [600]u8
+    var output_best: [600]u8
+
+    # Level 1 (fast)
+    let result_fast: i64 = compress_deflate_level(@input[0], 512, @output_fast[0], 600, 1)
+    if result_fast < 0
+        return 1  # FAIL: fast compression failed
+
+    # Level 9 (best)
+    let result_best: i64 = compress_deflate_level(@input[0], 512, @output_best[0], 600, 9)
+    if result_best < 0
+        return 2  # FAIL: best compression failed
+
+    # Both should compress - best may be smaller or equal
+    if result_fast == 0 || result_best == 0
+        return 3  # FAIL: no output
+
+    return 0
+
+
+[[test]]
+fn test_compress_if_beneficial_deflate_only() -> i32
+    # Client only accepts deflate, not gzip
+    var input: [1024]u8
+    for i in 0..1024
+        input[i] = ('a' as u8) + ((i % 26) as u8)
+
+    var result: CompressResult
+    let ret: i32 = compress_if_beneficial(@input[0], 1024, ENCODING_DEFLATE, c"text/plain", @result)
+
+    if ret != 1
+        return 1  # FAIL: should compress
+
+    if result.encoding != ENCODING_DEFLATE
+        compress_result_free(@result)
+        return 2  # FAIL: should use deflate encoding
+
+    if result.allocated != 1
+        return 3  # FAIL: should allocate
+
+    compress_result_free(@result)
+    return 0
+
+
+[[test]]
+fn test_compress_deflate_no_gzip_header() -> i32
+    # Deflate output should NOT have gzip magic bytes
+    let input: *u8 = c"Test data for deflate without gzip header"
+    let input_len: i64 = 41
+
+    var output: [256]u8
+    let result: i64 = compress_deflate(input, input_len, @output[0], 256)
+
+    if result < 0
+        return 1  # FAIL: compression failed
+
+    # Gzip magic is 0x1f 0x8b - deflate should NOT have this
+    if output[0] == 0x1f && output[1] == 0x8b
+        return 2  # FAIL: has gzip header when it shouldn't
+
+    return 0
+
+
+# ============================================================================
+# Large Compression Tests (>64KB)
+# ============================================================================
+
+[[test]]
+fn test_compress_large_over_64kb() -> i32
+    # Allocate and fill a 100KB buffer
+    let size: i64 = 102400
+    let input: *u8 = malloc(size as u64) as *u8
+    if input == null
+        return 1  # FAIL: allocation failed
+
+    # Fill with compressible data
+    for i in 0..size
+        *(input + i) = ('a' as u8) + ((i % 26) as u8)
+
+    var result: CompressResult
+    let ret: i32 = compress_large(input, size, ENCODING_GZIP, c"text/plain", @result)
+
+    free(input)
+
+    if ret != 1
+        return 2  # FAIL: should compress
+
+    if result.allocated != 1
+        return 3  # FAIL: should be allocated
+
+    if result.len >= size
+        compress_result_free(@result)
+        return 4  # FAIL: compressed should be smaller
+
+    compress_result_free(@result)
+    return 0
+
+
+[[test]]
+fn test_compress_large_respects_max_size() -> i32
+    # Verify the constant is 1MB
+    if COMPRESS_MAX_HEAP_INPUT != 1048576
+        return 1  # FAIL: expected max to be 1MB
+    return 0
+
+
+# ============================================================================
+# Streaming Compression Tests
+# ============================================================================
+
+[[test]]
+fn test_stream_compressor_init_gzip() -> i32
+    # Test initializing a streaming gzip compressor
+    var sc: StreamCompressor
+    let ret: i32 = stream_compressor_init(@sc, ENCODING_GZIP)
+
+    if ret != 0
+        return 1  # FAIL: init failed
+
+    if sc.encoding != ENCODING_GZIP
+        stream_compressor_free(@sc)
+        return 2  # FAIL: wrong encoding
+
+    if sc.gzip_writer == null
+        stream_compressor_free(@sc)
+        return 3  # FAIL: gzip_writer not allocated
+
+    if sc.compress_buf == null
+        stream_compressor_free(@sc)
+        return 4  # FAIL: compress_buf not allocated
+
+    stream_compressor_free(@sc)
+    return 0
+
+
+[[test]]
+fn test_stream_compressor_init_deflate() -> i32
+    # Test initializing a streaming zlib/deflate compressor
+    var sc: StreamCompressor
+    let ret: i32 = stream_compressor_init(@sc, ENCODING_DEFLATE)
+
+    if ret != 0
+        return 1  # FAIL: init failed
+
+    if sc.encoding != ENCODING_DEFLATE
+        stream_compressor_free(@sc)
+        return 2  # FAIL: wrong encoding
+
+    if sc.zlib_writer == null
+        stream_compressor_free(@sc)
+        return 3  # FAIL: zlib_writer not allocated
+
+    stream_compressor_free(@sc)
+    return 0
+
+
+[[test]]
+fn test_stream_compressor_write_finish_gzip() -> i32
+    # Test full streaming compression cycle with gzip
+    var sc: StreamCompressor
+    let ret: i32 = stream_compressor_init(@sc, ENCODING_GZIP)
+    if ret != 0
+        return 1  # FAIL: init failed
+
+    # Write some data in chunks
+    let chunk1: *u8 = c"Hello, this is the first chunk of data. "
+    let chunk2: *u8 = c"And this is the second chunk for testing. "
+    let chunk3: *u8 = c"Finally, here is the third and last chunk!"
+
+    var total_compressed: i64 = 0
+
+    # Write chunk 1 (output written to internal sc.compress_buf)
+    let out1: i64 = stream_compressor_write(@sc, chunk1, 41)
+    if out1 < 0
+        stream_compressor_free(@sc)
+        return 2  # FAIL: write 1 failed
+    total_compressed = total_compressed + out1
+
+    # Write chunk 2
+    let out2: i64 = stream_compressor_write(@sc, chunk2, 43)
+    if out2 < 0
+        stream_compressor_free(@sc)
+        return 3  # FAIL: write 2 failed
+    total_compressed = total_compressed + out2
+
+    # Write chunk 3
+    let out3: i64 = stream_compressor_write(@sc, chunk3, 43)
+    if out3 < 0
+        stream_compressor_free(@sc)
+        return 4  # FAIL: write 3 failed
+    total_compressed = total_compressed + out3
+
+    # Finish compression
+    let out_finish: i64 = stream_compressor_finish(@sc)
+    if out_finish < 0
+        stream_compressor_free(@sc)
+        return 5  # FAIL: finish failed
+    total_compressed = total_compressed + out_finish
+
+    # Should have produced some compressed output
+    if total_compressed == 0
+        stream_compressor_free(@sc)
+        return 6  # FAIL: no output produced
+
+    stream_compressor_free(@sc)
+    return 0
+
+
+[[test]]
+fn test_stream_compressor_produces_valid_gzip() -> i32
+    # Test that streaming compression produces valid gzip header
+    var sc: StreamCompressor
+    let ret: i32 = stream_compressor_init(@sc, ENCODING_GZIP)
+    if ret != 0
+        return 1
+
+    # Write data (output goes to internal buffer)
+    let data: *u8 = c"Test data for gzip header verification in streaming mode!"
+    let out_len: i64 = stream_compressor_write(@sc, data, 58)
+
+    # Even if write buffered, there should be at least the gzip header
+    # Actually, the header is written on first write
+    if out_len < 10
+        # That's ok - output might be buffered until finish
+        let finish_len: i64 = stream_compressor_finish(@sc)
+        if finish_len < 0
+            stream_compressor_free(@sc)
+            return 2
+
+        # Check magic in compress_buf after finish
+        let buf: *u8 = stream_compressor_output(@sc)
+        if buf[0] != 0x1f || buf[1] != 0x8b
+            stream_compressor_free(@sc)
+            return 3  # FAIL: invalid gzip magic
+    else
+        # Check magic in initial output
+        let buf: *u8 = stream_compressor_output(@sc)
+        if buf[0] != 0x1f || buf[1] != 0x8b
+            stream_compressor_free(@sc)
+            return 4  # FAIL: invalid gzip magic
+
+        stream_compressor_finish(@sc)
+
+    stream_compressor_free(@sc)
+    return 0
+
+
+[[test]]
+fn test_stream_compressor_flush() -> i32
+    # Test that flush forces output
+    var sc: StreamCompressor
+    let ret: i32 = stream_compressor_init(@sc, ENCODING_GZIP)
+    if ret != 0
+        return 1
+
+    # Write some data
+    let data: *u8 = c"Data that should be flushed immediately for chunked encoding!"
+    stream_compressor_write(@sc, data, 61)
+
+    # Flush
+    let flush_len: i64 = stream_compressor_flush(@sc)
+    # Flush may or may not produce output depending on buffered state
+    if flush_len < 0
+        stream_compressor_free(@sc)
+        return 2  # FAIL: flush returned error
+
+    # Finish
+    stream_compressor_finish(@sc)
+    stream_compressor_free(@sc)
+    return 0
+
+
+[[test]]
+fn test_stream_compressor_identity() -> i32
+    # Test identity encoding (no compression)
+    var sc: StreamCompressor
+    let ret: i32 = stream_compressor_init(@sc, ENCODING_IDENTITY)
+    if ret != 0
+        return 1
+
+    if sc.encoding != ENCODING_IDENTITY
+        stream_compressor_free(@sc)
+        return 2
+
+    # For identity, we should just copy data through
+    let data: *u8 = c"Identity test data"
+    let out_len: i64 = stream_compressor_write(@sc, data, 18)
+
+    if out_len != 18
+        stream_compressor_free(@sc)
+        return 3  # FAIL: identity should copy exactly
+
+    stream_compressor_free(@sc)
+    return 0
+
+
+[[test]]
+fn test_needs_streaming_compression() -> i32
+    # Test the threshold for streaming compression
+    if needs_streaming_compression(1024) != 0
+        return 1  # FAIL: 1KB should not need streaming
+
+    if needs_streaming_compression(1048576) != 0
+        return 2  # FAIL: exactly 1MB should not need streaming
+
+    if needs_streaming_compression(1048577) != 1
+        return 3  # FAIL: >1MB should need streaming
+
+    if needs_streaming_compression(10000000) != 1
+        return 4  # FAIL: 10MB should need streaming
+
+    return 0

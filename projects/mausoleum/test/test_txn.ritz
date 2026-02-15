@@ -1,0 +1,590 @@
+# test/test_txn.ritz - Transaction Manager Tests
+#
+# Tests for MVCC transaction management: begin, commit, abort,
+# conflict detection, and snapshot isolation.
+
+import ritzlib.sys
+import ritzlib.str
+import ritzlib.memory
+
+import lib.m7m_types
+import lib.page
+import lib.buffer_pool
+import lib.wal
+import lib.txn
+
+# ============================================================================
+# Test Helpers
+# ============================================================================
+
+fn make_test_path(suffix: *u8) -> *u8
+    var path: *u8 = malloc(64)
+    let base: *u8 = c"/tmp/m7m_txn_test_"
+    memcpy(path, base, strlen(base))
+    memcpy(path + strlen(base), suffix, strlen(suffix) + 1)
+    return path
+
+fn cleanup_test_files(base_path: *u8)
+    var path_buf: [256]u8
+    let base_len: i64 = strlen(base_path)
+    memcpy(@path_buf[0], base_path, base_len)
+    let suffix: *u8 = c".wal.000000"
+    memcpy(@path_buf[base_len], suffix, 12)
+    sys_unlink(@path_buf[0])
+
+# ============================================================================
+# Transaction Manager Creation Tests
+# ============================================================================
+
+[[test]]
+fn test_txn_mgr_new() -> i32
+    let base_path: *u8 = make_test_path(c"new")
+    let pool: *BufferPool = buffer_pool_new(16)
+
+    let mgr: *TxnManager = txn_mgr_new(pool, base_path)
+    if mgr == null
+        return 1
+
+    txn_mgr_destroy(mgr)
+    buffer_pool_destroy(pool)
+    cleanup_test_files(base_path)
+    free(base_path)
+    return 0
+
+[[test]]
+fn test_txn_mgr_new_null_pool() -> i32
+    let base_path: *u8 = make_test_path(c"null_pool")
+
+    let mgr: *TxnManager = txn_mgr_new(null, base_path)
+    if mgr != null
+        txn_mgr_destroy(mgr)
+        return 1
+
+    free(base_path)
+    return 0
+
+[[test]]
+fn test_txn_mgr_new_null_path() -> i32
+    let pool: *BufferPool = buffer_pool_new(16)
+
+    let mgr: *TxnManager = txn_mgr_new(pool, null)
+    if mgr != null
+        txn_mgr_destroy(mgr)
+        buffer_pool_destroy(pool)
+        return 1
+
+    buffer_pool_destroy(pool)
+    return 0
+
+# ============================================================================
+# Transaction Lifecycle Tests
+# ============================================================================
+
+[[test]]
+fn test_txn_begin() -> i32
+    let base_path: *u8 = make_test_path(c"begin")
+    let pool: *BufferPool = buffer_pool_new(16)
+    let mgr: *TxnManager = txn_mgr_new(pool, base_path)
+
+    let txn: *Txn = txn_begin(mgr)
+    if txn == null
+        txn_mgr_destroy(mgr)
+        buffer_pool_destroy(pool)
+        cleanup_test_files(base_path)
+        free(base_path)
+        return 1
+
+    # Transaction should be active
+    if txn_state(txn) != TXN_ACTIVE
+        txn_abort(txn)
+        txn_mgr_destroy(mgr)
+        buffer_pool_destroy(pool)
+        cleanup_test_files(base_path)
+        free(base_path)
+        return 2
+
+    # Transaction should have valid ID
+    if txn_id(txn) <= 0
+        txn_abort(txn)
+        txn_mgr_destroy(mgr)
+        buffer_pool_destroy(pool)
+        cleanup_test_files(base_path)
+        free(base_path)
+        return 3
+
+    txn_abort(txn)
+    txn_mgr_destroy(mgr)
+    buffer_pool_destroy(pool)
+    cleanup_test_files(base_path)
+    free(base_path)
+    return 0
+
+[[test]]
+fn test_txn_commit() -> i32
+    let base_path: *u8 = make_test_path(c"commit")
+    let pool: *BufferPool = buffer_pool_new(16)
+    let mgr: *TxnManager = txn_mgr_new(pool, base_path)
+
+    let txn: *Txn = txn_begin(mgr)
+    if txn == null
+        txn_mgr_destroy(mgr)
+        buffer_pool_destroy(pool)
+        cleanup_test_files(base_path)
+        free(base_path)
+        return 1
+
+    let result: i32 = txn_commit(txn)
+    if result != ERR_OK
+        txn_mgr_destroy(mgr)
+        buffer_pool_destroy(pool)
+        cleanup_test_files(base_path)
+        free(base_path)
+        return 2
+
+    # Transaction should be committed
+    if txn_state(txn) != TXN_COMMITTED
+        txn_mgr_destroy(mgr)
+        buffer_pool_destroy(pool)
+        cleanup_test_files(base_path)
+        free(base_path)
+        return 3
+
+    txn_mgr_destroy(mgr)
+    buffer_pool_destroy(pool)
+    cleanup_test_files(base_path)
+    free(base_path)
+    return 0
+
+[[test]]
+fn test_txn_abort() -> i32
+    let base_path: *u8 = make_test_path(c"abort")
+    let pool: *BufferPool = buffer_pool_new(16)
+    let mgr: *TxnManager = txn_mgr_new(pool, base_path)
+
+    let txn: *Txn = txn_begin(mgr)
+    if txn == null
+        txn_mgr_destroy(mgr)
+        buffer_pool_destroy(pool)
+        cleanup_test_files(base_path)
+        free(base_path)
+        return 1
+
+    let result: i32 = txn_abort(txn)
+    if result != ERR_OK
+        txn_mgr_destroy(mgr)
+        buffer_pool_destroy(pool)
+        cleanup_test_files(base_path)
+        free(base_path)
+        return 2
+
+    # Transaction should be aborted
+    if txn_state(txn) != TXN_ABORTED
+        txn_mgr_destroy(mgr)
+        buffer_pool_destroy(pool)
+        cleanup_test_files(base_path)
+        free(base_path)
+        return 3
+
+    txn_mgr_destroy(mgr)
+    buffer_pool_destroy(pool)
+    cleanup_test_files(base_path)
+    free(base_path)
+    return 0
+
+[[test]]
+fn test_txn_double_commit() -> i32
+    let base_path: *u8 = make_test_path(c"double_commit")
+    let pool: *BufferPool = buffer_pool_new(16)
+    let mgr: *TxnManager = txn_mgr_new(pool, base_path)
+
+    let txn: *Txn = txn_begin(mgr)
+    txn_commit(txn)
+
+    # Second commit should fail
+    let result: i32 = txn_commit(txn)
+    if result == ERR_OK
+        txn_mgr_destroy(mgr)
+        buffer_pool_destroy(pool)
+        cleanup_test_files(base_path)
+        free(base_path)
+        return 1
+
+    txn_mgr_destroy(mgr)
+    buffer_pool_destroy(pool)
+    cleanup_test_files(base_path)
+    free(base_path)
+    return 0
+
+[[test]]
+fn test_txn_commit_after_abort() -> i32
+    let base_path: *u8 = make_test_path(c"commit_after_abort")
+    let pool: *BufferPool = buffer_pool_new(16)
+    let mgr: *TxnManager = txn_mgr_new(pool, base_path)
+
+    let txn: *Txn = txn_begin(mgr)
+    txn_abort(txn)
+
+    # Commit after abort should fail
+    let result: i32 = txn_commit(txn)
+    if result == ERR_OK
+        txn_mgr_destroy(mgr)
+        buffer_pool_destroy(pool)
+        cleanup_test_files(base_path)
+        free(base_path)
+        return 1
+
+    txn_mgr_destroy(mgr)
+    buffer_pool_destroy(pool)
+    cleanup_test_files(base_path)
+    free(base_path)
+    return 0
+
+# ============================================================================
+# Multiple Transaction Tests
+# ============================================================================
+
+[[test]]
+fn test_txn_multiple_concurrent() -> i32
+    let base_path: *u8 = make_test_path(c"multi")
+    let pool: *BufferPool = buffer_pool_new(16)
+    let mgr: *TxnManager = txn_mgr_new(pool, base_path)
+
+    # Start multiple transactions
+    let txn1: *Txn = txn_begin(mgr)
+    let txn2: *Txn = txn_begin(mgr)
+    let txn3: *Txn = txn_begin(mgr)
+
+    if txn1 == null or txn2 == null or txn3 == null
+        txn_mgr_destroy(mgr)
+        buffer_pool_destroy(pool)
+        cleanup_test_files(base_path)
+        free(base_path)
+        return 1
+
+    # All should have unique IDs
+    let id1: i64 = txn_id(txn1)
+    let id2: i64 = txn_id(txn2)
+    let id3: i64 = txn_id(txn3)
+
+    if id1 == id2 or id2 == id3 or id1 == id3
+        txn_abort(txn1)
+        txn_abort(txn2)
+        txn_abort(txn3)
+        txn_mgr_destroy(mgr)
+        buffer_pool_destroy(pool)
+        cleanup_test_files(base_path)
+        free(base_path)
+        return 2
+
+    # Commit/abort in different order
+    txn_commit(txn2)
+    txn_abort(txn1)
+    txn_commit(txn3)
+
+    if txn_state(txn1) != TXN_ABORTED
+        txn_mgr_destroy(mgr)
+        buffer_pool_destroy(pool)
+        cleanup_test_files(base_path)
+        free(base_path)
+        return 3
+
+    if txn_state(txn2) != TXN_COMMITTED
+        txn_mgr_destroy(mgr)
+        buffer_pool_destroy(pool)
+        cleanup_test_files(base_path)
+        free(base_path)
+        return 4
+
+    if txn_state(txn3) != TXN_COMMITTED
+        txn_mgr_destroy(mgr)
+        buffer_pool_destroy(pool)
+        cleanup_test_files(base_path)
+        free(base_path)
+        return 5
+
+    txn_mgr_destroy(mgr)
+    buffer_pool_destroy(pool)
+    cleanup_test_files(base_path)
+    free(base_path)
+    return 0
+
+[[test]]
+fn test_txn_sequential_ids() -> i32
+    let base_path: *u8 = make_test_path(c"seq_ids")
+    let pool: *BufferPool = buffer_pool_new(16)
+    let mgr: *TxnManager = txn_mgr_new(pool, base_path)
+
+    # Transaction IDs should be sequential
+    let txn1: *Txn = txn_begin(mgr)
+    let id1: i64 = txn_id(txn1)
+    txn_commit(txn1)
+
+    let txn2: *Txn = txn_begin(mgr)
+    let id2: i64 = txn_id(txn2)
+    txn_commit(txn2)
+
+    if id2 != id1 + 1
+        txn_mgr_destroy(mgr)
+        buffer_pool_destroy(pool)
+        cleanup_test_files(base_path)
+        free(base_path)
+        return 1
+
+    txn_mgr_destroy(mgr)
+    buffer_pool_destroy(pool)
+    cleanup_test_files(base_path)
+    free(base_path)
+    return 0
+
+# ============================================================================
+# Snapshot/Visibility Tests
+# ============================================================================
+
+[[test]]
+fn test_txn_snapshot_timestamp() -> i32
+    let base_path: *u8 = make_test_path(c"snapshot")
+    let pool: *BufferPool = buffer_pool_new(16)
+    let mgr: *TxnManager = txn_mgr_new(pool, base_path)
+
+    let txn: *Txn = txn_begin(mgr)
+
+    # Snapshot timestamp should be set
+    let snapshot: i64 = txn_snapshot_ts(txn)
+    if snapshot <= 0
+        txn_abort(txn)
+        txn_mgr_destroy(mgr)
+        buffer_pool_destroy(pool)
+        cleanup_test_files(base_path)
+        free(base_path)
+        return 1
+
+    txn_abort(txn)
+    txn_mgr_destroy(mgr)
+    buffer_pool_destroy(pool)
+    cleanup_test_files(base_path)
+    free(base_path)
+    return 0
+
+[[test]]
+fn test_txn_visibility_own_writes() -> i32
+    let base_path: *u8 = make_test_path(c"vis_own")
+    let pool: *BufferPool = buffer_pool_new(16)
+    let mgr: *TxnManager = txn_mgr_new(pool, base_path)
+
+    let txn: *Txn = txn_begin(mgr)
+    let txn_tid: i64 = txn_id(txn)
+
+    # A transaction should see its own writes
+    # (write_ts = txn_id, delete_ts = 0)
+    let visible: i32 = txn_is_visible(txn, txn_tid, 0)
+    if visible != 1
+        txn_abort(txn)
+        txn_mgr_destroy(mgr)
+        buffer_pool_destroy(pool)
+        cleanup_test_files(base_path)
+        free(base_path)
+        return 1
+
+    txn_abort(txn)
+    txn_mgr_destroy(mgr)
+    buffer_pool_destroy(pool)
+    cleanup_test_files(base_path)
+    free(base_path)
+    return 0
+
+[[test]]
+fn test_txn_visibility_committed_before() -> i32
+    let base_path: *u8 = make_test_path(c"vis_committed")
+    let pool: *BufferPool = buffer_pool_new(16)
+    let mgr: *TxnManager = txn_mgr_new(pool, base_path)
+
+    # Txn1 writes and commits
+    let txn1: *Txn = txn_begin(mgr)
+    let tid1: i64 = txn_id(txn1)
+    txn_commit(txn1)
+
+    # Txn2 starts after txn1 committed
+    let txn2: *Txn = txn_begin(mgr)
+
+    # Txn2 should see txn1's committed writes
+    let visible: i32 = txn_is_visible(txn2, tid1, 0)
+    if visible != 1
+        txn_abort(txn2)
+        txn_mgr_destroy(mgr)
+        buffer_pool_destroy(pool)
+        cleanup_test_files(base_path)
+        free(base_path)
+        return 1
+
+    txn_abort(txn2)
+    txn_mgr_destroy(mgr)
+    buffer_pool_destroy(pool)
+    cleanup_test_files(base_path)
+    free(base_path)
+    return 0
+
+[[test]]
+fn test_txn_visibility_uncommitted() -> i32
+    let base_path: *u8 = make_test_path(c"vis_uncommitted")
+    let pool: *BufferPool = buffer_pool_new(16)
+    let mgr: *TxnManager = txn_mgr_new(pool, base_path)
+
+    # Txn1 starts but doesn't commit
+    let txn1: *Txn = txn_begin(mgr)
+    let tid1: i64 = txn_id(txn1)
+
+    # Txn2 starts
+    let txn2: *Txn = txn_begin(mgr)
+
+    # Txn2 should NOT see txn1's uncommitted writes
+    let visible: i32 = txn_is_visible(txn2, tid1, 0)
+    if visible != 0
+        txn_abort(txn1)
+        txn_abort(txn2)
+        txn_mgr_destroy(mgr)
+        buffer_pool_destroy(pool)
+        cleanup_test_files(base_path)
+        free(base_path)
+        return 1
+
+    txn_abort(txn1)
+    txn_abort(txn2)
+    txn_mgr_destroy(mgr)
+    buffer_pool_destroy(pool)
+    cleanup_test_files(base_path)
+    free(base_path)
+    return 0
+
+[[test]]
+fn test_txn_visibility_deleted() -> i32
+    let base_path: *u8 = make_test_path(c"vis_deleted")
+    let pool: *BufferPool = buffer_pool_new(16)
+    let mgr: *TxnManager = txn_mgr_new(pool, base_path)
+
+    # Txn1 writes and commits
+    let txn1: *Txn = txn_begin(mgr)
+    let tid1: i64 = txn_id(txn1)
+    txn_commit(txn1)
+
+    # Txn2 deletes (sets delete_ts) and commits
+    let txn2: *Txn = txn_begin(mgr)
+    let tid2: i64 = txn_id(txn2)
+    txn_commit(txn2)
+
+    # Txn3 starts after deletion
+    let txn3: *Txn = txn_begin(mgr)
+
+    # Txn3 should NOT see deleted row (write_ts=tid1, delete_ts=tid2)
+    let visible: i32 = txn_is_visible(txn3, tid1, tid2)
+    if visible != 0
+        txn_abort(txn3)
+        txn_mgr_destroy(mgr)
+        buffer_pool_destroy(pool)
+        cleanup_test_files(base_path)
+        free(base_path)
+        return 1
+
+    txn_abort(txn3)
+    txn_mgr_destroy(mgr)
+    buffer_pool_destroy(pool)
+    cleanup_test_files(base_path)
+    free(base_path)
+    return 0
+
+# ============================================================================
+# Active Transaction Tracking Tests
+# ============================================================================
+
+[[test]]
+fn test_txn_active_count() -> i32
+    let base_path: *u8 = make_test_path(c"active_count")
+    let pool: *BufferPool = buffer_pool_new(16)
+    let mgr: *TxnManager = txn_mgr_new(pool, base_path)
+
+    if txn_mgr_active_count(mgr) != 0
+        txn_mgr_destroy(mgr)
+        buffer_pool_destroy(pool)
+        cleanup_test_files(base_path)
+        free(base_path)
+        return 1
+
+    let txn1: *Txn = txn_begin(mgr)
+    if txn_mgr_active_count(mgr) != 1
+        txn_abort(txn1)
+        txn_mgr_destroy(mgr)
+        buffer_pool_destroy(pool)
+        cleanup_test_files(base_path)
+        free(base_path)
+        return 2
+
+    let txn2: *Txn = txn_begin(mgr)
+    if txn_mgr_active_count(mgr) != 2
+        txn_abort(txn1)
+        txn_abort(txn2)
+        txn_mgr_destroy(mgr)
+        buffer_pool_destroy(pool)
+        cleanup_test_files(base_path)
+        free(base_path)
+        return 3
+
+    txn_commit(txn1)
+    if txn_mgr_active_count(mgr) != 1
+        txn_abort(txn2)
+        txn_mgr_destroy(mgr)
+        buffer_pool_destroy(pool)
+        cleanup_test_files(base_path)
+        free(base_path)
+        return 4
+
+    txn_abort(txn2)
+    if txn_mgr_active_count(mgr) != 0
+        txn_mgr_destroy(mgr)
+        buffer_pool_destroy(pool)
+        cleanup_test_files(base_path)
+        free(base_path)
+        return 5
+
+    txn_mgr_destroy(mgr)
+    buffer_pool_destroy(pool)
+    cleanup_test_files(base_path)
+    free(base_path)
+    return 0
+
+# ============================================================================
+# Error Handling Tests
+# ============================================================================
+
+[[test]]
+fn test_txn_begin_null_mgr() -> i32
+    let txn: *Txn = txn_begin(null)
+    if txn != null
+        return 1
+    return 0
+
+[[test]]
+fn test_txn_commit_null() -> i32
+    let result: i32 = txn_commit(null)
+    if result != ERR_INVALID
+        return 1
+    return 0
+
+[[test]]
+fn test_txn_abort_null() -> i32
+    let result: i32 = txn_abort(null)
+    if result != ERR_INVALID
+        return 1
+    return 0
+
+[[test]]
+fn test_txn_state_null() -> i32
+    let state: i32 = txn_state(null)
+    if state != TXN_INVALID
+        return 1
+    return 0
+
+[[test]]
+fn test_txn_id_null() -> i32
+    let id: i64 = txn_id(null)
+    if id != 0
+        return 1
+    return 0

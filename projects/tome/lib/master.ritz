@@ -1,0 +1,359 @@
+# lib/master.ritz - Multi-process master server
+#
+# Implements a master process that spawns and manages worker processes.
+# Each worker runs its own io_uring event loop with SO_REUSEPORT for
+# kernel-level load balancing.
+#
+# Architecture:
+#   Master Process
+#     - Spawns N worker processes (default: CPU count)
+#     - Monitors workers via waitpid (WNOHANG)
+#     - Restarts crashed workers
+#     - Handles SIGTERM/SIGINT for graceful shutdown
+#
+#   Worker Processes
+#     - Each has its own Store (partitioned data)
+#     - Each has its own io_uring event loop
+#     - SO_REUSEPORT allows kernel to load-balance connections
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+import ritzlib.memory
+import ritzlib.async_net
+import lib.server
+
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+const MAX_WORKERS: i32 = 8
+const MASTER_DEFAULT_WORKERS: i32 = 4
+
+# Worker states
+const WORKER_STOPPED: i32 = 0
+const WORKER_RUNNING: i32 = 1
+const WORKER_STOPPING: i32 = 2
+
+
+# ============================================================================
+# Global shutdown flag (set by signal handler)
+# ============================================================================
+
+var g_shutdown: i32 = 0
+var g_master_pid: i32 = 0
+
+
+# ============================================================================
+# Worker tracking
+# ============================================================================
+
+struct WorkerInfo
+    pid: i32           # Process ID (0 if not running)
+    state: i32         # WORKER_* state
+    restarts: i32      # Number of times restarted
+
+
+struct MasterServer
+    port: i32
+    num_workers: i32
+    workers: [8]WorkerInfo  # Fixed array of worker info
+    listen_fd: i32           # Shared listening socket
+
+
+# ============================================================================
+# Signal handling
+# ============================================================================
+
+# Signal handler for SIGTERM/SIGINT - just sets flag
+# Note: We can't use a complex signal handler in Ritz yet,
+# so we use a polling approach with WNOHANG
+
+pub fn master_check_signals() -> i32
+    # In a real implementation, we'd install a signal handler
+    # that sets g_shutdown = 1. For now, we rely on the master
+    # polling for child exits and checking if it should stop.
+    return g_shutdown
+
+
+pub fn master_request_shutdown()
+    g_shutdown = 1
+
+
+# ============================================================================
+# Worker process
+# ============================================================================
+
+# This runs in the worker process after fork
+fn worker_main(port: i32, listen_fd: i32, worker_id: i32) -> i32
+    prints("Worker ")
+    print_int(worker_id as i64)
+    prints(" (PID ")
+    print_int(sys_getpid() as i64)
+    prints(") starting...\n")
+
+    # Each worker has its own server and store
+    var server: TomeServer
+    let ret: i32 = tome_server_init_with_fd(@server, port, listen_fd)
+    if ret < 0
+        prints("Worker ")
+        print_int(worker_id as i64)
+        prints(": Failed to initialize (")
+        print_int(ret as i64)
+        prints(")\n")
+        return 1
+
+    prints("Worker ")
+    print_int(worker_id as i64)
+    prints(": Ready\n")
+
+    # Run event loop (blocks until shutdown/error)
+    let run_ret: i32 = tome_server_run(@server)
+    tome_server_destroy(@server)
+    return run_ret
+
+
+# ============================================================================
+# Master initialization
+# ============================================================================
+
+pub fn master_init(m: *MasterServer, port: i32, num_workers: i32) -> i32
+    m.port = port
+
+    # Clamp worker count
+    if num_workers <= 0
+        m.num_workers = MASTER_DEFAULT_WORKERS
+    else if num_workers > MAX_WORKERS
+        m.num_workers = MAX_WORKERS
+    else
+        m.num_workers = num_workers
+
+    # Initialize worker slots
+    var i: i32 = 0
+    while i < MAX_WORKERS
+        m.workers[i].pid = 0
+        m.workers[i].state = WORKER_STOPPED
+        m.workers[i].restarts = 0
+        i += 1
+
+    # Create shared listening socket with SO_REUSEPORT
+    # All workers will inherit this fd after fork
+    let fd: i32 = tcp_socket()
+    if fd < 0
+        return fd
+
+    set_reuseaddr(fd)
+    set_reuseport(fd)  # Critical for multi-process load balancing
+
+    let bind_ret: i32 = tcp_bind(fd, 0, port)
+    if bind_ret < 0
+        sys_close(fd)
+        return bind_ret
+
+    let listen_ret: i32 = tcp_listen(fd, 128)
+    if listen_ret < 0
+        sys_close(fd)
+        return listen_ret
+
+    m.listen_fd = fd
+    g_master_pid = sys_getpid()
+    g_shutdown = 0
+
+    return 0
+
+
+# ============================================================================
+# Worker spawning
+# ============================================================================
+
+fn spawn_worker(m: *MasterServer, worker_id: i32) -> i32
+    # Copy values before fork (to avoid any potential pointer issues in child)
+    let port: i32 = m.port
+    let listen_fd: i32 = m.listen_fd
+
+    let pid: i32 = sys_fork()
+
+    if pid < 0
+        prints("Failed to fork worker ")
+        print_int(worker_id as i64)
+        prints("\n")
+        return pid
+
+    if pid == 0
+        # Child process - become a worker
+        let ret: i32 = worker_main(port, listen_fd, worker_id)
+        sys_exit(ret)
+        # Never returns
+
+    # Parent process - record worker info
+    m.workers[worker_id].pid = pid
+    m.workers[worker_id].state = WORKER_RUNNING
+    return pid
+
+
+pub fn master_spawn_workers(m: *MasterServer) -> i32
+    prints("Spawning ")
+    print_int(m.num_workers as i64)
+    prints(" workers...\n")
+
+    var i: i32 = 0
+    while i < m.num_workers
+        let pid: i32 = spawn_worker(m, i)
+        if pid < 0
+            return pid
+        i += 1
+
+    return 0
+
+
+# ============================================================================
+# Worker monitoring
+# ============================================================================
+
+# Check for exited workers and restart them
+pub fn master_check_workers(m: *MasterServer) -> i32
+    var status: i32 = 0
+    var restarted: i32 = 0
+
+    # Check each worker slot
+    var i: i32 = 0
+    while i < m.num_workers
+        if m.workers[i].state == WORKER_RUNNING
+            # Check if this worker has exited (non-blocking)
+            let ret: i32 = sys_wait4(m.workers[i].pid, @status, WNOHANG, null)
+
+            if ret > 0
+                # Worker exited
+                let exit_code: i32 = (status >> 8) & 255  # WEXITSTATUS
+                let signaled: i32 = status & 127         # WTERMSIG (if non-zero)
+
+                prints("Worker ")
+                print_int(i as i64)
+                prints(" (PID ")
+                print_int(m.workers[i].pid as i64)
+                prints(") exited")
+
+                if signaled != 0
+                    prints(" (signal ")
+                    print_int(signaled as i64)
+                    prints(")")
+                else
+                    prints(" (code ")
+                    print_int(exit_code as i64)
+                    prints(")")
+                prints("\n")
+
+                m.workers[i].state = WORKER_STOPPED
+                m.workers[i].pid = 0
+
+                # Restart unless we're shutting down
+                if g_shutdown == 0
+                    m.workers[i].restarts += 1
+                    prints("Restarting worker ")
+                    print_int(i as i64)
+                    prints(" (restart #")
+                    print_int(m.workers[i].restarts as i64)
+                    prints(")...\n")
+
+                    spawn_worker(m, i)
+                    restarted += 1
+        i += 1
+
+    return restarted
+
+
+# ============================================================================
+# Graceful shutdown
+# ============================================================================
+
+pub fn master_shutdown(m: *MasterServer)
+    prints("Shutting down workers...\n")
+    g_shutdown = 1
+
+    # Send SIGTERM to all workers
+    var i: i32 = 0
+    while i < m.num_workers
+        if m.workers[i].state == WORKER_RUNNING
+            sys_kill(m.workers[i].pid, SIGTERM)
+            m.workers[i].state = WORKER_STOPPING
+        i += 1
+
+    # Wait for all workers to exit (with timeout)
+    var remaining: i32 = m.num_workers
+    var attempts: i32 = 0
+    let max_attempts: i32 = 50  # 5 seconds max
+
+    while remaining > 0 && attempts < max_attempts
+        remaining = 0
+        i = 0
+        while i < m.num_workers
+            if m.workers[i].state != WORKER_STOPPED
+                var status: i32 = 0
+                let ret: i32 = sys_wait4(m.workers[i].pid, @status, WNOHANG, null)
+                if ret > 0
+                    m.workers[i].state = WORKER_STOPPED
+                    m.workers[i].pid = 0
+                else
+                    remaining += 1
+            i += 1
+
+        if remaining > 0
+            # Sleep 100ms
+            var req: [2]i64
+            req[0] = 0           # seconds
+            req[1] = 100000000   # 100ms in nanoseconds
+            sys_nanosleep(@req[0], null)
+            attempts += 1
+
+    # Force kill any remaining workers
+    if remaining > 0
+        prints("Force killing ")
+        print_int(remaining as i64)
+        prints(" workers...\n")
+
+        i = 0
+        while i < m.num_workers
+            if m.workers[i].state != WORKER_STOPPED
+                sys_kill(m.workers[i].pid, SIGKILL)
+                # Reap the zombie
+                var status: i32 = 0
+                sys_wait4(m.workers[i].pid, @status, 0, null)
+                m.workers[i].state = WORKER_STOPPED
+                m.workers[i].pid = 0
+            i += 1
+
+    prints("All workers stopped.\n")
+
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+pub fn master_destroy(m: *MasterServer)
+    if m.listen_fd >= 0
+        sys_close(m.listen_fd)
+        m.listen_fd = -1
+
+
+# ============================================================================
+# Main loop
+# ============================================================================
+
+pub fn master_run(m: *MasterServer) -> i32
+    prints("Master process (PID ")
+    print_int(sys_getpid() as i64)
+    prints(") monitoring workers...\n")
+    prints("Press Ctrl+C to stop.\n\n")
+
+    # Monitor loop - check workers every 100ms
+    while g_shutdown == 0
+        master_check_workers(m)
+
+        # Sleep 100ms
+        var req: [2]i64
+        req[0] = 0           # seconds
+        req[1] = 100000000   # 100ms in nanoseconds
+        sys_nanosleep(@req[0], null)
+
+    return 0

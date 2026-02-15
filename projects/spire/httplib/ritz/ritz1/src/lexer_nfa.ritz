@@ -1,0 +1,467 @@
+# ritz1/src/lexer.ritz - Multi-Pattern NFA Lexer
+#
+# Lexer that uses multiple NFA patterns to tokenize source code.
+# Uses longest-match with first-definition priority (flex-style).
+#
+# Architecture:
+#   1. Each token pattern is compiled to an NFA fragment
+#   2. All fragments are combined into a single NFA with shared start state
+#   3. Each accepting state records its token type and priority
+#   4. Lexer simulates NFA, tracking longest match and best priority
+
+import tokens_gen
+import nfa
+import regex
+
+# Pre-allocated limits
+const MAX_PATTERNS: i32 = 64
+const MAX_TOKEN_LEN: i32 = 4096
+
+# Bracket tokens are defined in tokens.ritz
+# TOK_LPAREN, TOK_RPAREN, TOK_LBRACE, TOK_RBRACE, TOK_LBRACKET, TOK_RBRACKET
+
+# Token pattern with priority
+# NOTE: Using i64 for all non-pointer fields to ensure 8-byte alignment for ritz1 self-hosting
+struct TokenPattern
+  token_type: i64
+  priority: i64       # Lower = higher priority (first defined wins)
+  frag: NFAFragment
+
+# Maximum indentation depth (nested blocks)
+const MAX_INDENT_DEPTH: i32 = 64
+
+# Maximum size for processed string literals
+const MAX_STRING_LEN: i32 = 8192
+
+# Lexer state
+# NOTE: Using i64 for position/length fields to handle large files; i32 elsewhere for efficiency
+struct Lexer
+  src: *u8
+  len: i64                 # File size (use i64 for large files)
+  pos: i64                 # Current position (use i64 for large files)
+  line: i32
+  col: i32
+  nfa: *NFA
+  # Patterns array (external, pre-allocated)
+  patterns: *TokenPattern
+  pattern_count: i32
+  # Indentation tracking - array embedded in struct
+  # NOTE: Using i32 instead of i64 since indent depth is at most 64
+  indent_stack: [64]i32    # Stack of indentation levels
+  indent_depth: i32        # Current depth in indent_stack
+  at_line_start: i32       # 1 if at start of line, 0 otherwise
+  pending_dedents: i32     # Number of DEDENT tokens to emit
+  bracket_depth: i32       # Nesting depth of (), [], {} - suppress INDENT/DEDENT when > 0
+  # String buffer for processed string literals (escapes expanded)
+  string_buf: [8192]i8     # Buffer for cooked string data
+  string_pos: i32          # Current write position in string_buf
+
+# Reset lexer for new source (preserves NFA and patterns, resets state)
+# Use this when reusing a lexer for multiple files to avoid stack overflow
+fn lexer_reset(lex: *Lexer, src: *u8, len: i64) -> i32
+  lex.src = src
+  lex.len = len
+  lex.pos = 0
+  lex.line = 1
+  lex.col = 1
+  # Reset indentation tracking (MUST be 1, not 0!)
+  lex.indent_stack[0] = 0  # Base indentation level is 0
+  lex.indent_depth = 1     # Stack has one element (important!)
+  lex.at_line_start = 1    # Start at beginning of first line
+  lex.pending_dedents = 0
+  lex.bracket_depth = 0    # Not inside any brackets
+  # Reset string buffer
+  lex.string_pos = 0
+  0
+
+# Initialize a lexer with source and pre-allocated NFA/patterns storage
+fn lexer_init(lex: *Lexer, src: *u8, len: i32, nfa: *NFA, patterns: *TokenPattern) -> i32
+  lex.src = src
+  lex.len = len
+  lex.pos = 0
+  lex.line = 1
+  lex.col = 1
+  lex.nfa = nfa
+  lex.patterns = patterns
+  lex.pattern_count = 0
+  # Initialize indentation tracking
+  lex.indent_stack[0] = 0  # Base indentation level is 0
+  lex.indent_depth = 1     # Stack has one element
+  lex.at_line_start = 1    # Start at beginning of first line
+  lex.pending_dedents = 0
+  lex.bracket_depth = 0    # Not inside any brackets
+  # Initialize string buffer
+  lex.string_pos = 0
+  0
+
+# Add a token pattern to the lexer
+# pattern_src: regex pattern string (or quoted literal)
+# pattern_len: length of pattern string
+# token_type: token type constant (e.g., TOK_IDENT)
+# is_literal: 1 if pattern is a quoted literal like "fn", 0 for regex
+fn lexer_add_pattern(lex: *Lexer, pattern_src: *u8, pattern_len: i32, token_type: i32, is_literal: i32) -> i32
+  let idx: i64 = lex.pattern_count
+  let nfa: *NFA = lex.nfa
+
+  # First pattern? Create the shared start state
+  if idx == 0
+    let start: i32 = nfa_add_state(nfa, 0, 0)
+    nfa.start_state = start
+
+  # Build NFA fragment for this pattern
+  var frag: NFAFragment = NFAFragment { start: 0, end: 0 }
+  if is_literal == 1
+    frag = regex_parse_literal(pattern_src, pattern_len, nfa)
+  else
+    frag = regex_parse(pattern_src, pattern_len, nfa)
+
+  # Mark the end state as accepting with this token type
+  # NOTE: NFAState is 3 i64 fields = 24 bytes
+  let end_state: *NFAState = nfa.states + frag.end
+  end_state.is_accept = 1
+  end_state.token_type = token_type
+
+  # Connect this pattern's start to the shared start via epsilon
+  nfa_add_epsilon_trans(nfa, nfa.start_state, frag.start)
+
+  lex.pattern_count = idx + 1
+  (idx) as i32
+
+# Finalize the lexer - no-op now that patterns connect on add
+fn lexer_finalize(lex: *Lexer) -> i32
+  # Patterns are already connected to start state during lexer_add_pattern
+  0
+
+# =============================================================================
+# NFA Simulation for Longest Match
+# =============================================================================
+
+# Try to match from current position, returns (token_type, match_length)
+# Returns token_type = -1 if no match
+# This uses a simple recursive simulation - not optimal but correct
+
+# Helper: Check if we can reach an accepting state from given state
+# Returns the token type if accepting, -1 otherwise
+fn lexer_check_accept(lex: *Lexer, state: i32) -> i32
+  let nfa: *NFA = lex.nfa
+  let state_ptr: *NFAState = nfa.states + state
+
+  if state_ptr.is_accept == 1
+    return state_ptr.token_type
+
+  # Check epsilon transitions
+  let state_i64: i64 = state as i64
+  for i in 0..nfa.trans_count
+    let trans_ptr: *Transition = nfa.transitions + i
+    if trans_ptr.from_state == state_i64 && trans_ptr.kind == TR_EPSILON
+      let result: i32 = lexer_check_accept(lex, trans_ptr.to_state as i32)
+      if result >= 0
+        return result
+
+  return -1
+
+# Recursive match: try to match from state at position, track best match
+# best_type and best_len are pointers to track the best match found so far
+# best_priority tracks which pattern matched (lower priority number = higher priority)
+fn lexer_match_from(lex: *Lexer, state: i32, pos: i64, best_type: *i32, best_len: *i32, best_priority: *i64) -> i32
+  let nfa: *NFA = lex.nfa
+  let state_ptr: *NFAState = nfa.states + state
+  let current_len: i32 = (pos - lex.pos) as i32
+
+  # Check if this state is accepting
+  if state_ptr.is_accept == 1
+    # Update best if this is longer, or same length but LOWER token type
+    # Token numbering: Keywords are 10-26 (lower IDs), Identifiers are 53+ (higher IDs)
+    # So we prefer LOWER token_type values for same-length matches (keywords > ident)
+    # Special case: if best_type is -1 (no match yet), always update
+    if current_len > (*best_len) || (current_len == (*best_len) && ((*best_type) < 0 || state_ptr.token_type < (*best_type)))
+      (*best_type) = state_ptr.token_type
+      (*best_len) = current_len
+      (*best_priority) = 0  # Just reset, not used anymore
+
+  # Try epsilon transitions first (without consuming input)
+  let state_i64: i64 = state as i64
+  for i in 0..nfa.trans_count
+    let trans_ptr: *Transition = nfa.transitions + i
+    if trans_ptr.from_state == state_i64 && trans_ptr.kind == TR_EPSILON
+      lexer_match_from(lex, trans_ptr.to_state as i32, pos, best_type, best_len, best_priority)
+
+  # If at end of input, we're done with character transitions
+  if pos >= lex.len
+    return 0
+
+  # Get current character
+  let ch: i32 = (*(lex.src + pos)) & 255
+
+  # Try character transitions
+  for i in 0..nfa.trans_count
+    let trans_ptr: *Transition = nfa.transitions + i
+    if trans_ptr.from_state == state_i64 && trans_matches(trans_ptr, ch) == 1
+      lexer_match_from(lex, trans_ptr.to_state as i32, pos + 1, best_type, best_len, best_priority)
+
+  0
+
+# Debug: Print NFA structure to stderr
+# NOTE: debug_print/debug_print_int must be defined by the main program
+fn lexer_debug_nfa(debug: i32, nfa: *NFA) -> i32
+  # Disabled for standalone tests - enable in main_new.ritz
+  0
+
+# Helper: get current character at position
+fn lexer_peek_at(lex: *Lexer, offset: i32) -> i32
+  let pos: i64 = lex.pos + offset
+  if pos >= lex.len
+    return 0  # EOF
+  (*(lex.src + pos)) & 255
+
+# Helper: skip a line comment (starting at #)
+fn lexer_skip_comment(lex: *Lexer) -> i32
+  while lex.pos < lex.len
+    let ch: i32 = lexer_peek_at(lex, 0)
+    if ch == 10  # newline
+      return 0
+    lex.pos = lex.pos + 1
+    lex.col = lex.col + 1
+  0
+
+# Handle indentation at line start
+# Returns: 1 if we should return a token, 0 if we should continue scanning
+fn lexer_handle_indent(lex: *Lexer, out_tok: *Token) -> i32
+  # Count leading spaces
+  var indent: i32 = 0
+  while lexer_peek_at(lex, indent) == 32  # space
+    indent = indent + 1
+
+  # Check for tab (error)
+  if lexer_peek_at(lex, indent) == 9  # tab
+    *out_tok = token_new(TOK_ERROR, lex.pos, 1, lex.line, lex.col)
+    return 1
+
+  # Skip blank lines (just newline after spaces)
+  if lexer_peek_at(lex, indent) == 10  # newline
+    lex.pos = lex.pos + indent + 1
+    lex.line = lex.line + 1
+    lex.col = 1
+    # Stay at line start for next line
+    return 0  # Continue scanning
+
+  # Skip comment-only lines (but NOT @attributes)
+  if lexer_peek_at(lex, indent) == 35  # '#'
+    lex.pos = lex.pos + indent
+    lex.col = lex.col + indent
+    lexer_skip_comment(lex)
+    # The main loop will handle the newline
+    return 0  # Continue scanning
+
+  # Advance past leading spaces
+  lex.pos = lex.pos + indent
+  lex.col = lex.col + indent
+
+  # Get current indentation level from stack
+  let current: i32 = lex.indent_stack[lex.indent_depth - 1]
+
+  if indent > current
+    # Deeper indentation - push and emit INDENT
+    lex.indent_stack[lex.indent_depth] = indent
+    lex.indent_depth = lex.indent_depth + 1
+    *out_tok = token_new(TOK_INDENT, lex.pos, 0, lex.line, lex.col)
+    lex.at_line_start = 0
+    return 1
+
+  if indent < current
+    # Shallower indentation - pop and queue DEDENTs
+    var count: i32 = 0
+    while lex.indent_depth > 1
+      if lex.indent_stack[lex.indent_depth - 1] <= indent
+        break
+      lex.indent_depth = lex.indent_depth - 1
+      count = count + 1
+    # Queue all but one DEDENT (we return the first one now)
+    lex.pending_dedents = count - 1
+    *out_tok = token_new(TOK_DEDENT, lex.pos, 0, lex.line, lex.col)
+    lex.at_line_start = 0
+    return 1
+
+  # Same indentation - just continue
+  lex.at_line_start = 0
+  0
+
+# Get next token from the lexer
+# Returns a Token struct
+fn lexer_next(lex: *Lexer) -> Token
+  # First, emit any pending DEDENTs
+  if lex.pending_dedents > 0
+    lex.pending_dedents = lex.pending_dedents - 1
+    return token_new(TOK_DEDENT, lex.pos, 0, lex.line, lex.col)
+
+  # Main lexing loop
+  while lex.pos < lex.len
+    # Handle line start (indentation) - but NOT inside brackets
+    if lex.at_line_start == 1
+      # Inside brackets, just skip leading whitespace, no INDENT/DEDENT
+      if lex.bracket_depth > 0
+        # Skip leading whitespace on this line
+        while lex.pos < lex.len
+          let ws: i32 = lexer_peek_at(lex, 0)
+          if ws == 32  # space
+            lex.pos = lex.pos + 1
+            lex.col = lex.col + 1
+          else
+            break
+        lex.at_line_start = 0
+        continue
+      var indent_tok: Token = token_new(TOK_ERROR, 0, 0, 0, 0)
+      if lexer_handle_indent(lex, &indent_tok) == 1
+        return indent_tok
+      continue  # Line was blank or comment-only, try again
+
+    # Check for newline - emit NEWLINE token (but not inside brackets)
+    let ch: i32 = lexer_peek_at(lex, 0)
+    if ch == 10  # newline
+      let start: i32 = lex.pos
+      let line: i32 = lex.line
+      let col: i32 = lex.col
+      lex.pos = lex.pos + 1
+      lex.line = lex.line + 1
+      lex.col = 1
+      lex.at_line_start = 1
+      # Inside brackets, skip newline (don't emit token) - allows multi-line struct literals
+      if lex.bracket_depth > 0
+        continue
+      var tok: Token = token_new(TOK_NEWLINE, start, 1, line, col)
+      tok.start = lex.src + start
+      return tok
+
+    # Check for inline comment - skip to end of line
+    if ch == 35  # '#'
+      lexer_skip_comment(lex)
+      continue
+
+    # Special case: String literals (workaround for NFA negation bug)
+    # Pattern: "..." (anything except unescaped quotes)
+    # We build a "cooked" string with escape sequences processed
+    if ch == 34  # opening quote
+      let start: i32 = lex.pos
+      let line: i32 = lex.line
+      let col: i32 = lex.col
+      lex.pos = lex.pos + 1  # skip opening quote
+      lex.col = lex.col + 1
+
+      # Reset string buffer position for this string
+      let str_start: i32 = lex.string_pos
+
+      # Scan until closing quote, processing escapes into string_buf
+      var found_close: i32 = 0
+      while lex.pos < lex.len
+        let str_ch: i32 = lexer_peek_at(lex, 0)
+        if str_ch == 34  # closing quote
+          found_close = 1
+          lex.pos = lex.pos + 1
+          lex.col = lex.col + 1
+          break
+        if str_ch == 10  # newline - unterminated string
+          break
+
+        # Check for escape sequence
+        if str_ch == 92  # backslash
+          lex.pos = lex.pos + 1
+          lex.col = lex.col + 1
+          if lex.pos < lex.len
+            let esc_ch: i32 = lexer_peek_at(lex, 0)
+            var cooked: i8 = 0
+            if esc_ch == 110       # \n -> newline
+              cooked = 10
+            else if esc_ch == 116  # \t -> tab
+              cooked = 9
+            else if esc_ch == 114  # \r -> carriage return
+              cooked = 13
+            else if esc_ch == 92   # \\ -> backslash
+              cooked = 92
+            else if esc_ch == 34   # \" -> quote
+              cooked = 34
+            else if esc_ch == 48   # \0 -> null
+              cooked = 0
+            else
+              # Unknown escape - just emit the literal char
+              cooked = esc_ch as i8
+            # Store cooked char in buffer
+            if lex.string_pos < MAX_STRING_LEN
+              lex.string_buf[lex.string_pos] = cooked
+              lex.string_pos = lex.string_pos + 1
+            lex.pos = lex.pos + 1
+            lex.col = lex.col + 1
+        else
+          # Regular character - copy as-is
+          if lex.string_pos < MAX_STRING_LEN
+            lex.string_buf[lex.string_pos] = str_ch as i8
+            lex.string_pos = lex.string_pos + 1
+          lex.pos = lex.pos + 1
+          lex.col = lex.col + 1
+
+      if found_close == 1
+        let len: i32 = lex.pos - start
+        var tok: Token = token_new(TOK_STRING, start, len, line, col)
+        tok.start = lex.src + start
+        # Set cooked string pointer and length
+        tok.string_val = (&lex.string_buf[str_start]) as *u8
+        tok.string_len = lex.string_pos - str_start
+        return tok
+      # If unterminated, fall through to error handling below
+
+    # Try NFA-based pattern matching
+    var best_type: i32 = -1
+    var best_len: i32 = 0
+    var best_priority: i64 = 9999  # Initialize to low priority
+    let start_state_for_match: i32 = (*lex.nfa).start_state
+
+    lexer_match_from(lex, start_state_for_match, lex.pos, &best_type, &best_len, &best_priority)
+
+    # Only accept a match if we consumed at least one character
+    if best_type < 0 || best_len <= 0
+      # No match - return error token for single char
+      let start: i32 = lex.pos
+      let line: i32 = lex.line
+      let col: i32 = lex.col
+      lex.pos = lex.pos + 1
+      lex.col = lex.col + 1
+      var tok: Token = token_new(TOK_ERROR, start, 1, line, col)
+      tok.start = lex.src + start
+      return tok
+
+    # Check if this is a skip token (whitespace, comments)
+    # Skip tokens that should be ignored during parsing
+    if best_type == TOK_SKIP || best_type == TOK_WHITESPACE || best_type == TOK_COMMENT
+      # Skip this token and continue (suppress debug output)
+      lex.pos = lex.pos + best_len
+      lex.col = lex.col + best_len
+      continue
+
+    # Create and return the token
+    let start: i32 = lex.pos
+    let line: i32 = lex.line
+    let col: i32 = lex.col
+
+    # Advance position
+    lex.pos = lex.pos + best_len
+    lex.col = lex.col + best_len
+
+    # Track bracket depth for suppressing INDENT/DEDENT inside brackets
+    if best_type == TOK_LPAREN || best_type == TOK_LBRACKET || best_type == TOK_LBRACE
+      lex.bracket_depth = lex.bracket_depth + 1
+    if best_type == TOK_RPAREN || best_type == TOK_RBRACKET || best_type == TOK_RBRACE
+      if lex.bracket_depth > 0
+        lex.bracket_depth = lex.bracket_depth - 1
+
+    # Create token with proper start pointer
+    var tok: Token = token_new(best_type, start, best_len, line, col)
+    # Set the start pointer to point into the source buffer
+    tok.start = lex.src + start
+    return tok
+
+  # End of input - emit any remaining DEDENTs
+  if lex.indent_depth > 1
+    lex.indent_depth = lex.indent_depth - 1
+    return token_new(TOK_DEDENT, lex.pos, 0, lex.line, lex.col)
+
+  # Finally return EOF
+  token_new(TOK_EOF, lex.pos, 0, lex.line, lex.col)

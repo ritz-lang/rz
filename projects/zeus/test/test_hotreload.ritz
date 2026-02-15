@@ -1,0 +1,311 @@
+# test/test_hotreload.ritz - Tests for hot reload support
+#
+# Hot reload enables updating worker code without dropping connections.
+# The approach:
+#   1. Spawn new worker with updated code
+#   2. Drain pending work from old worker
+#   3. Redirect new requests to new worker
+#   4. Wait for old worker to finish in-flight requests
+#   5. Terminate old worker
+#
+# This module provides coordination primitives for this process.
+
+import ritzlib.sys
+import ritzlib.io
+import helpers
+import lib.hotreload
+import lib.valet
+import lib.control
+import lib.shm
+
+# ============================================================================
+# Test: Reload Coordinator Initialization
+# ============================================================================
+
+[[test]]
+fn test_reload_coordinator_init() -> i32
+    var coord: ReloadCoordinator
+    let result: i32 = reload_coordinator_init(@coord)
+    if result < 0
+        "FAIL: reload_coordinator_init failed\n"
+        return 1
+
+    let r1: i32 = assert_eq_i32(coord.state, RELOAD_STATE_IDLE)
+    if r1 != 0
+        reload_coordinator_destroy(@coord)
+        return r1
+
+    let r2: i32 = assert_eq_i32(coord.pending_reloads, 0)
+    if r2 != 0
+        reload_coordinator_destroy(@coord)
+        return r2
+
+    reload_coordinator_destroy(@coord)
+    return 0
+
+# ============================================================================
+# Test: Reload Request
+# ============================================================================
+
+[[test]]
+fn test_reload_request_create() -> i32
+    var request: ReloadRequest
+    reload_request_init(@request, 0, c"/app/worker.bin", 1)
+
+    let r1: i32 = assert_eq_i32(request.old_slot, 0)
+    if r1 != 0
+        return r1
+
+    let r2: i32 = assert_eq_i32(request.state, RELOAD_REQ_PENDING)
+    if r2 != 0
+        return r2
+
+    return 0
+
+[[test]]
+fn test_reload_request_transition() -> i32
+    var request: ReloadRequest
+    reload_request_init(@request, 0, c"/app/worker.bin", 1)
+
+    # Pending -> Draining
+    reload_request_set_state(@request, RELOAD_REQ_DRAINING)
+    if request.state != RELOAD_REQ_DRAINING
+        "FAIL: should be DRAINING\n"
+        return 1
+
+    # Draining -> Spawning
+    reload_request_set_state(@request, RELOAD_REQ_SPAWNING)
+    if request.state != RELOAD_REQ_SPAWNING
+        "FAIL: should be SPAWNING\n"
+        return 1
+
+    # Spawning -> Complete
+    reload_request_set_state(@request, RELOAD_REQ_COMPLETE)
+    if request.state != RELOAD_REQ_COMPLETE
+        "FAIL: should be COMPLETE\n"
+        return 1
+
+    return 0
+
+# ============================================================================
+# Test: Worker Drain Detection
+# ============================================================================
+
+[[test]]
+fn test_worker_drain_check_empty() -> i32
+    # Create a valet context with a worker
+    var valet_ctx: ValetContext
+    valet_init(@valet_ctx, null)
+
+    let slot_idx: i32 = valet_add_worker_slot(@valet_ctx)
+    valet_mark_worker_running(@valet_ctx, slot_idx)
+
+    # Worker has no pending requests - should be drained
+    let slot: *WorkerSlot = valet_get_worker_slot(@valet_ctx, slot_idx)
+    let drained: i32 = check_worker_drained(slot)
+
+    if drained == 0
+        "FAIL: worker with empty queue should be drained\n"
+        valet_destroy(@valet_ctx)
+        return 1
+
+    valet_destroy(@valet_ctx)
+    return 0
+
+[[test]]
+fn test_worker_drain_check_pending() -> i32
+    var valet_ctx: ValetContext
+    valet_init(@valet_ctx, null)
+
+    let slot_idx: i32 = valet_add_worker_slot(@valet_ctx)
+    valet_mark_worker_running(@valet_ctx, slot_idx)
+
+    # Add a pending request
+    let slot: *WorkerSlot = valet_get_worker_slot(@valet_ctx, slot_idx)
+    let cb: *ControlBlock = shm_get_control_block(@slot.region)
+    control_block_req_write_inc(cb)  # Simulate pending request
+
+    let drained: i32 = check_worker_drained(slot)
+
+    if drained != 0
+        "FAIL: worker with pending request should not be drained\n"
+        valet_destroy(@valet_ctx)
+        return 1
+
+    valet_destroy(@valet_ctx)
+    return 0
+
+# ============================================================================
+# Test: Generation Tracking
+# ============================================================================
+
+[[test]]
+fn test_generation_increment() -> i32
+    var coord: ReloadCoordinator
+    reload_coordinator_init(@coord)
+
+    let gen1: u64 = coord.generation
+    reload_coordinator_increment_generation(@coord)
+    let gen2: u64 = coord.generation
+
+    if gen2 != gen1 + 1
+        "FAIL: generation should increment\n"
+        reload_coordinator_destroy(@coord)
+        return 1
+
+    reload_coordinator_destroy(@coord)
+    return 0
+
+[[test]]
+fn test_slot_generation_tracking() -> i32
+    var coord: ReloadCoordinator
+    reload_coordinator_init(@coord)
+
+    # Mark slot 0 with generation 1
+    reload_coordinator_set_slot_generation(@coord, 0, 1)
+
+    let gen: u64 = reload_coordinator_get_slot_generation(@coord, 0)
+    if gen != 1
+        "FAIL: slot generation should be 1, got {gen}\n"
+        reload_coordinator_destroy(@coord)
+        return 1
+
+    reload_coordinator_destroy(@coord)
+    return 0
+
+# ============================================================================
+# Test: Reload Queue
+# ============================================================================
+
+[[test]]
+fn test_reload_queue_enqueue_dequeue() -> i32
+    var coord: ReloadCoordinator
+    reload_coordinator_init(@coord)
+
+    # Enqueue a reload request
+    var request: ReloadRequest
+    reload_request_init(@request, 0, c"/app/worker.bin", 1)
+
+    let enqueue_result: i32 = reload_coordinator_enqueue(@coord, @request)
+    if enqueue_result != 0
+        "FAIL: enqueue failed\n"
+        reload_coordinator_destroy(@coord)
+        return 1
+
+    if coord.pending_reloads != 1
+        "FAIL: should have 1 pending reload\n"
+        reload_coordinator_destroy(@coord)
+        return 1
+
+    # Dequeue it
+    var dequeued: ReloadRequest
+    let dequeue_result: i32 = reload_coordinator_dequeue(@coord, @dequeued)
+    if dequeue_result != 0
+        "FAIL: dequeue failed\n"
+        reload_coordinator_destroy(@coord)
+        return 1
+
+    if coord.pending_reloads != 0
+        "FAIL: should have 0 pending reloads\n"
+        reload_coordinator_destroy(@coord)
+        return 1
+
+    if dequeued.old_slot != 0
+        "FAIL: dequeued slot should be 0\n"
+        reload_coordinator_destroy(@coord)
+        return 1
+
+    reload_coordinator_destroy(@coord)
+    return 0
+
+[[test]]
+fn test_reload_queue_empty_dequeue() -> i32
+    var coord: ReloadCoordinator
+    reload_coordinator_init(@coord)
+
+    var dequeued: ReloadRequest
+    let result: i32 = reload_coordinator_dequeue(@coord, @dequeued)
+
+    if result == 0
+        "FAIL: dequeue should fail on empty queue\n"
+        reload_coordinator_destroy(@coord)
+        return 1
+
+    reload_coordinator_destroy(@coord)
+    return 0
+
+# ============================================================================
+# Test: Reload State Machine
+# ============================================================================
+
+[[test]]
+fn test_reload_state_transitions() -> i32
+    var coord: ReloadCoordinator
+    reload_coordinator_init(@coord)
+
+    # IDLE -> PREPARING
+    let r1: i32 = reload_coordinator_set_state(@coord, RELOAD_STATE_PREPARING)
+    if r1 != 0 || coord.state != RELOAD_STATE_PREPARING
+        "FAIL: should transition to PREPARING\n"
+        reload_coordinator_destroy(@coord)
+        return 1
+
+    # PREPARING -> DRAINING
+    let r2: i32 = reload_coordinator_set_state(@coord, RELOAD_STATE_DRAINING)
+    if r2 != 0 || coord.state != RELOAD_STATE_DRAINING
+        "FAIL: should transition to DRAINING\n"
+        reload_coordinator_destroy(@coord)
+        return 1
+
+    # DRAINING -> SPAWNING
+    let r3: i32 = reload_coordinator_set_state(@coord, RELOAD_STATE_SPAWNING)
+    if r3 != 0 || coord.state != RELOAD_STATE_SPAWNING
+        "FAIL: should transition to SPAWNING\n"
+        reload_coordinator_destroy(@coord)
+        return 1
+
+    # SPAWNING -> IDLE
+    let r4: i32 = reload_coordinator_set_state(@coord, RELOAD_STATE_IDLE)
+    if r4 != 0 || coord.state != RELOAD_STATE_IDLE
+        "FAIL: should transition to IDLE\n"
+        reload_coordinator_destroy(@coord)
+        return 1
+
+    reload_coordinator_destroy(@coord)
+    return 0
+
+# ============================================================================
+# Test: Multiple Pending Reloads
+# ============================================================================
+
+[[test]]
+fn test_multiple_pending_reloads() -> i32
+    var coord: ReloadCoordinator
+    reload_coordinator_init(@coord)
+
+    # Enqueue 3 reload requests
+    var i: i32 = 0
+    while i < 3
+        var request: ReloadRequest
+        reload_request_init(@request, i, c"/app/worker.bin", 1)
+        reload_coordinator_enqueue(@coord, @request)
+        i = i + 1
+
+    if coord.pending_reloads != 3
+        "FAIL: should have 3 pending reloads\n"
+        reload_coordinator_destroy(@coord)
+        return 1
+
+    # Dequeue and verify order (FIFO)
+    i = 0
+    while i < 3
+        var dequeued: ReloadRequest
+        reload_coordinator_dequeue(@coord, @dequeued)
+        if dequeued.old_slot != i
+            "FAIL: wrong dequeue order at {i}\n"
+            reload_coordinator_destroy(@coord)
+            return 1
+        i = i + 1
+
+    reload_coordinator_destroy(@coord)
+    return 0

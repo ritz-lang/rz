@@ -1,0 +1,453 @@
+# valet/lib/response.ritz - HTTP response building
+#
+# Builds HTTP responses into a fixed buffer without allocations.
+# Also provides zero-copy vectored I/O responses using IoVecBuilder.
+
+import ritzlib.io
+import ritzlib.str
+import ritzlib.iovec
+import ritzlib.span
+import ritzlib.string
+
+
+# ============================================================================
+# Error codes
+# ============================================================================
+
+# All response functions return these on error
+const RESP_OK: i32 = 0                  # Success
+const RESP_ERR_OVERFLOW: i32 = -1       # Buffer overflow, response truncated
+
+
+# ============================================================================
+# HTTP Response
+# ============================================================================
+
+struct Response
+    buf: *u8           # Output buffer (external)
+    cap: i32           # Buffer capacity
+    len: i32           # Current length
+
+
+# Initialize response with external buffer
+#
+# SAFETY: Caller must ensure:
+# - `buf` points to a valid buffer of at least `cap` bytes
+# - `buf` remains valid for the lifetime of the Response
+# - No other code writes to `buf` while Response is in use
+pub fn response_init(res: *Response, buf: *u8, cap: i32)
+    res.buf = buf
+    res.cap = cap
+    res.len = 0
+
+
+# Append a C-string to response (DEPRECATED - use response_append_span)
+#
+# SAFETY: `s` must be a valid null-terminated string.
+# Returns RESP_ERR_OVERFLOW if buffer capacity exceeded.
+pub fn response_append(res: *Response, s: *u8) -> i32
+    let slen: i32 = strlen(s) as i32
+    if res.len + slen > res.cap
+        return -1
+
+    for i in 0..slen
+        *(res.buf + res.len + i) = *(s + i)
+
+    res.len += slen
+    return slen
+
+
+# Append a measured string (Span<u8>) to response - preferred API
+#
+# SAFETY: Span contains both pointer and length, bounds-checked before copy.
+# Returns RESP_ERR_OVERFLOW if buffer capacity exceeded.
+pub fn response_append_span(res: *Response, s: Span<u8>) -> i32
+    let slen: i32 = s.len as i32
+    if res.len + slen > res.cap
+        return -1
+
+    for i in 0..slen
+        *(res.buf + res.len + i) = *(s.ptr + i)
+
+    res.len += slen
+    return slen
+
+
+# Append bytes with explicit length to response
+#
+# SAFETY: Caller must ensure `data` points to at least `len` valid bytes.
+# Returns RESP_ERR_OVERFLOW if buffer capacity exceeded.
+pub fn response_append_bytes(res: *Response, data: *u8, len: i32) -> i32
+    if res.len + len > res.cap
+        return -1
+
+    for i in 0..len
+        *(res.buf + res.len + i) = *(data + i)
+
+    res.len += len
+    return len
+
+
+# Append a byte to response
+pub fn response_append_byte(res: *Response, b: u8) -> i32
+    if res.len + 1 > res.cap
+        return -1
+
+    *(res.buf + res.len) = b
+    res.len += 1
+    return 1
+
+
+# Append an integer as decimal string
+pub fn response_append_int(res: *Response, n: i64) -> i32
+    var buf: [32]u8
+    var pos: i32 = 31
+    var val: i64 = n
+
+    if val == 0
+        buf[pos] = '0'
+        pos -= 1
+    else
+        while val > 0
+            buf[pos] = ((val % 10) + 48) as u8
+            pos -= 1
+            val = val / 10
+
+    let start: i32 = pos + 1
+    let count: i32 = 31 - pos
+
+    if res.len + count > res.cap
+        return -1
+
+    for i in 0..count
+        *(res.buf + res.len + i) = buf[start + i]
+
+    res.len += count
+    return count
+
+
+# HTTP protocol strings (measured, no strlen)
+pub fn S_HTTP11() -> Span<u8>
+    return span_literal(c"HTTP/1.1 ", 9)
+
+pub fn S_200_OK() -> Span<u8>
+    return span_literal(c"200 OK\r\n", 8)
+
+pub fn S_404_NOT_FOUND() -> Span<u8>
+    return span_literal(c"404 Not Found\r\n", 15)
+
+pub fn S_400_BAD_REQUEST() -> Span<u8>
+    return span_literal(c"400 Bad Request\r\n", 17)
+
+pub fn S_500_INTERNAL_ERROR() -> Span<u8>
+    return span_literal(c"500 Internal Server Error\r\n", 27)
+
+pub fn S_COLON_SPACE() -> Span<u8>
+    return span_literal(c": ", 2)
+
+pub fn S_CRLF() -> Span<u8>
+    return span_literal(c"\r\n", 2)
+
+pub fn S_SPACE_CRLF() -> Span<u8>
+    return span_literal(c" \r\n", 3)
+
+pub fn S_CONTENT_LENGTH() -> Span<u8>
+    return span_literal(c"Content-Length: ", 16)
+
+pub fn S_CONTENT_TYPE() -> Span<u8>
+    return span_literal(c"Content-Type", 12)
+
+pub fn S_CONNECTION() -> Span<u8>
+    return span_literal(c"Connection", 10)
+
+pub fn S_TEXT_PLAIN() -> Span<u8>
+    return span_literal(c"text/plain", 10)
+
+pub fn S_TEXT_HTML() -> Span<u8>
+    return span_literal(c"text/html", 9)
+
+pub fn S_APPLICATION_JSON() -> Span<u8>
+    return span_literal(c"application/json", 16)
+
+pub fn S_CLOSE() -> Span<u8>
+    return span_literal(c"close", 5)
+
+pub fn S_KEEP_ALIVE() -> Span<u8>
+    return span_literal(c"keep-alive", 10)
+
+pub fn S_404_BODY() -> Span<u8>
+    return span_literal(c"404 Not Found\n", 14)
+
+pub fn S_HELLO_RESPONSE() -> Span<u8>
+    return span_literal(c"HTTP/1.1 200 OK\r\nContent-Length: 13\r\nConnection: close\r\n\r\nHello, World!", 71)
+
+pub fn S_HELLO_KEEPALIVE_RESPONSE() -> Span<u8>
+    return span_literal(c"HTTP/1.1 200 OK\r\nContent-Length: 13\r\nConnection: keep-alive\r\n\r\nHello, World!", 76)
+
+
+# Write HTTP status line
+pub fn response_status(res: *Response, code: i32) -> i32
+    let r1: i32 = response_append_span(res, S_HTTP11())
+    if r1 < 0
+        return -1
+
+    if code == 200
+        response_append_span(res, S_200_OK())
+    else
+        if code == 404
+            response_append_span(res, S_404_NOT_FOUND())
+        else
+            if code == 400
+                response_append_span(res, S_400_BAD_REQUEST())
+            else
+                if code == 500
+                    response_append_span(res, S_500_INTERNAL_ERROR())
+                else
+                    response_append_int(res, code as i64)
+                    response_append_span(res, S_SPACE_CRLF())
+
+    return 0
+
+
+# Write a header (C-string version - DEPRECATED)
+pub fn response_header(res: *Response, name: *u8, value: *u8) -> i32
+    response_append(res, name)
+    response_append_span(res, S_COLON_SPACE())
+    response_append(res, value)
+    response_append_span(res, S_CRLF())
+    return 0
+
+
+# Write a header (measured string version - preferred)
+pub fn response_header_span(res: *Response, name: Span<u8>, value: Span<u8>) -> i32
+    response_append_span(res, name)
+    response_append_span(res, S_COLON_SPACE())
+    response_append_span(res, value)
+    response_append_span(res, S_CRLF())
+    return 0
+
+
+# Write Content-Length header with integer value
+pub fn response_content_length(res: *Response, len: i64) -> i32
+    response_append_span(res, S_CONTENT_LENGTH())
+    response_append_int(res, len)
+    response_append_span(res, S_CRLF())
+    return 0
+
+
+# End headers and start body
+pub fn response_end_headers(res: *Response) -> i32
+    response_append_span(res, S_CRLF())
+    return 0
+
+
+# Write body content
+pub fn response_body(res: *Response, body: *u8, body_len: i32) -> i32
+    if res.len + body_len > res.cap
+        return -1
+
+    for i in 0..body_len
+        *(res.buf + res.len + i) = *(body + i)
+
+    res.len += body_len
+    return body_len
+
+
+# ============================================================================
+# Convenience functions for common responses
+# ============================================================================
+
+# Build a complete 200 OK response with text body (C-string - DEPRECATED)
+pub fn response_ok(res: *Response, body: *u8) -> i32
+    let body_len: i32 = strlen(body) as i32
+
+    response_status(res, 200)
+    response_header_span(res, S_CONTENT_TYPE(), S_TEXT_PLAIN())
+    response_content_length(res, body_len as i64)
+    response_header_span(res, S_CONNECTION(), S_CLOSE())
+    response_end_headers(res)
+    response_body(res, body, body_len)
+
+    return res.len
+
+
+# Build a complete 200 OK response with measured body
+pub fn response_ok_span(res: *Response, body: Span<u8>) -> i32
+    response_status(res, 200)
+    response_header_span(res, S_CONTENT_TYPE(), S_TEXT_PLAIN())
+    response_content_length(res, body.len)
+    response_header_span(res, S_CONNECTION(), S_CLOSE())
+    response_end_headers(res)
+    response_append_span(res, body)
+
+    return res.len
+
+
+# Build a 404 Not Found response
+pub fn response_not_found(res: *Response) -> i32
+    let body: Span<u8> = S_404_BODY()
+
+    response_status(res, 404)
+    response_header_span(res, S_CONTENT_TYPE(), S_TEXT_PLAIN())
+    response_content_length(res, body.len)
+    response_header_span(res, S_CONNECTION(), S_CLOSE())
+    response_end_headers(res)
+    response_append_span(res, body)
+
+    return res.len
+
+
+# Build a minimal Hello World response (for benchmarking)
+pub fn response_hello(res: *Response) -> i32
+    # Pre-computed minimal response for max speed
+    let resp: Span<u8> = S_HELLO_RESPONSE()
+
+    if resp.len as i32 > res.cap
+        return -1
+
+    for i in 0..resp.len
+        *(res.buf + i) = *(resp.ptr + i)
+
+    res.len = resp.len as i32
+    return res.len
+
+
+# Build a minimal Hello World response with keep-alive
+pub fn response_hello_keepalive(res: *Response) -> i32
+    let resp: Span<u8> = S_HELLO_KEEPALIVE_RESPONSE()
+
+    if resp.len as i32 > res.cap
+        return -1
+
+    for i in 0..resp.len
+        *(res.buf + i) = *(resp.ptr + i)
+
+    res.len = resp.len as i32
+    return res.len
+
+
+# Build a 200 OK response with keep-alive (C-string - DEPRECATED)
+pub fn response_ok_keepalive(res: *Response, body: *u8) -> i32
+    let body_len: i32 = strlen(body) as i32
+
+    response_status(res, 200)
+    response_header_span(res, S_CONTENT_TYPE(), S_TEXT_PLAIN())
+    response_content_length(res, body_len as i64)
+    response_header_span(res, S_CONNECTION(), S_KEEP_ALIVE())
+    response_end_headers(res)
+    response_body(res, body, body_len)
+
+    return res.len
+
+
+# Build a 200 OK response with keep-alive (measured)
+pub fn response_ok_keepalive_span(res: *Response, body: Span<u8>) -> i32
+    response_status(res, 200)
+    response_header_span(res, S_CONTENT_TYPE(), S_TEXT_PLAIN())
+    response_content_length(res, body.len)
+    response_header_span(res, S_CONNECTION(), S_KEEP_ALIVE())
+    response_end_headers(res)
+    response_append_span(res, body)
+
+    return res.len
+
+
+# ============================================================================
+# Zero-copy vectored I/O responses using IoVecBuilder
+# ============================================================================
+#
+# These functions build responses that point directly to static strings
+# in .rodata, avoiding all copying. The IoVecBuilder only copies dynamic
+# data (like integers) to a small pool.
+
+# Build Hello World response with keep-alive using vectored I/O (zero-copy)
+# Uses Str slices with pre-computed lengths - NO strlen() calls!
+# Returns the iovec count
+pub fn response_hello_keepalive_iov(builder: *IoVecBuilder) -> i32
+    iovec_builder_reset(builder)
+
+    # All static strings with pre-computed lengths - NO strlen!
+    iovec_append_str(builder, http_200_ok())             # "HTTP/1.1 200 OK\r\n" (17)
+    iovec_append_bytes(builder, c"Content-Length: 13\r\n", 20)
+    iovec_append_str(builder, http_connection_keepalive())  # "Connection: keep-alive\r\n" (24)
+    iovec_append_str(builder, http_crlf())               # "\r\n" (2)
+    iovec_append_str(builder, http_hello_world())        # "Hello, World!" (13)
+
+    return iovec_count(builder)
+
+
+# Build Hello World response without keep-alive using vectored I/O
+pub fn response_hello_iov(builder: *IoVecBuilder) -> i32
+    iovec_builder_reset(builder)
+
+    iovec_append_str(builder, http_200_ok())
+    iovec_append_bytes(builder, c"Content-Length: 13\r\n", 20)
+    iovec_append_str(builder, http_connection_close())  # "Connection: close\r\n" (19)
+    iovec_append_str(builder, http_crlf())
+    iovec_append_str(builder, http_hello_world())
+
+    return iovec_count(builder)
+
+
+# Build 404 Not Found response using vectored I/O
+pub fn response_not_found_iov(builder: *IoVecBuilder) -> i32
+    iovec_builder_reset(builder)
+
+    iovec_append_str(builder, http_404_not_found())     # "HTTP/1.1 404 Not Found\r\n" (24)
+    iovec_append_str(builder, http_content_type_text()) # "Content-Type: text/plain\r\n" (26)
+    iovec_append_bytes(builder, c"Content-Length: 14\r\n", 20)
+    iovec_append_str(builder, http_connection_close())
+    iovec_append_str(builder, http_crlf())
+    iovec_append_bytes(builder, c"404 Not Found\n", 14)
+
+    return iovec_count(builder)
+
+
+# Build a 200 OK response with custom body and keep-alive using vectored I/O
+# body_len must be provided since we can't strlen in a zero-copy way for dynamic bodies
+pub fn response_ok_keepalive_iov(builder: *IoVecBuilder, body: *u8, body_len: i32) -> i32
+    iovec_builder_reset(builder)
+
+    iovec_append_str(builder, http_200_ok())
+    iovec_append_str(builder, http_content_type_text())
+    iovec_append_str(builder, http_content_length())    # "Content-Length: " (16)
+    iovec_append_int(builder, body_len as i64)          # Dynamic - uses pool
+    iovec_append_str(builder, http_crlf())
+    iovec_append_str(builder, http_connection_keepalive())
+    iovec_append_str(builder, http_crlf())
+    iovec_append_bytes(builder, body, body_len)         # Points to caller's buffer
+
+    return iovec_count(builder)
+
+
+# Build a JSON response with keep-alive using vectored I/O
+# json_data points to a buffer containing JSON (could be static .rodata or read from file)
+pub fn response_json_keepalive_iov(builder: *IoVecBuilder, json_data: *u8, json_len: i32) -> i32
+    iovec_builder_reset(builder)
+
+    iovec_append_str(builder, http_200_ok())
+    iovec_append_str(builder, http_content_type_json()) # "Content-Type: application/json\r\n" (32)
+    iovec_append_str(builder, http_content_length())
+    iovec_append_int(builder, json_len as i64)          # Dynamic - uses pool
+    iovec_append_str(builder, http_crlf())
+    iovec_append_str(builder, http_connection_keepalive())
+    iovec_append_str(builder, http_crlf())
+    iovec_append_bytes(builder, json_data, json_len)    # Points to JSON data
+
+    return iovec_count(builder)
+
+
+# Build a JSON response without keep-alive using vectored I/O
+pub fn response_json_iov(builder: *IoVecBuilder, json_data: *u8, json_len: i32) -> i32
+    iovec_builder_reset(builder)
+
+    iovec_append_str(builder, http_200_ok())
+    iovec_append_str(builder, http_content_type_json())
+    iovec_append_str(builder, http_content_length())
+    iovec_append_int(builder, json_len as i64)
+    iovec_append_str(builder, http_crlf())
+    iovec_append_str(builder, http_connection_close())
+    iovec_append_str(builder, http_crlf())
+    iovec_append_bytes(builder, json_data, json_len)
+
+    return iovec_count(builder)

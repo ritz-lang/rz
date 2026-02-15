@@ -1,0 +1,522 @@
+# lib/server.ritz - Mausoleum database server
+#
+# TCP server that handles client connections and processes protocol messages.
+# Uses epoll for efficient event-driven I/O.
+#
+# Architecture:
+# - Single-threaded event loop (ritz has no threads yet)
+# - Non-blocking sockets with epoll
+# - Per-connection receive buffer for message framing
+# - Request/response correlation via request_id
+
+import ritzlib.sys
+import ritzlib.str
+import ritzlib.memory
+import ritzlib.net
+
+import lib.protocol
+import lib.buffer_pool
+import lib.collection
+import lib.document
+import lib.btree
+
+# ============================================================================
+# Server Constants
+# ============================================================================
+
+const MAX_CONNECTIONS: i32 = 64
+const RECV_BUFFER_SIZE: i32 = 65536   # 64 KB receive buffer per connection
+const SEND_BUFFER_SIZE: i32 = 65536   # 64 KB send buffer
+const BACKLOG: i32 = 128              # Listen backlog
+
+# Connection states
+const CONN_STATE_READING: i32 = 0     # Waiting for request data
+const CONN_STATE_PROCESSING: i32 = 1  # Processing a request
+const CONN_STATE_WRITING: i32 = 2     # Sending response
+const CONN_STATE_CLOSED: i32 = 3      # Connection closed
+
+# ============================================================================
+# Connection structure
+# ============================================================================
+
+struct Connection
+    fd: i32                   # Client socket file descriptor
+    state: i32                # Connection state
+    recv_buf: *u8             # Receive buffer
+    recv_len: i32             # Bytes in receive buffer
+    recv_cap: i32             # Receive buffer capacity
+    send_buf: *u8             # Send buffer
+    send_len: i32             # Bytes to send
+    send_pos: i32             # Current send position
+    session_id: i64           # Session ID (assigned on CONNECT)
+    txn_id: i64               # Active transaction ID (0 if none)
+    collection_id: i32        # Connected collection ID
+
+# Initialize a connection
+pub fn conn_init(conn: *Connection, fd: i32) -> i32
+    conn.fd = fd
+    conn.state = CONN_STATE_READING
+    conn.recv_buf = malloc(RECV_BUFFER_SIZE as i64) as *u8
+    if conn.recv_buf == null
+        return -1
+    conn.recv_len = 0
+    conn.recv_cap = RECV_BUFFER_SIZE
+    conn.send_buf = malloc(SEND_BUFFER_SIZE as i64) as *u8
+    if conn.send_buf == null
+        free(conn.recv_buf)
+        return -1
+    conn.send_len = 0
+    conn.send_pos = 0
+    conn.session_id = 0
+    conn.txn_id = 0
+    conn.collection_id = 0
+    return 0
+
+# Clean up a connection
+pub fn conn_cleanup(conn: *Connection)
+    if conn.recv_buf != null
+        free(conn.recv_buf)
+        conn.recv_buf = null
+    if conn.send_buf != null
+        free(conn.send_buf)
+        conn.send_buf = null
+    if conn.fd >= 0
+        sys_close(conn.fd)
+        conn.fd = -1
+    conn.state = CONN_STATE_CLOSED
+
+# ============================================================================
+# Server structure
+# ============================================================================
+
+struct Server
+    listen_fd: i32            # Listening socket
+    epoll_fd: i32             # Epoll instance
+    connections: *Connection  # Connection array
+    num_connections: i32      # Current connection count
+    max_connections: i32      # Maximum connections
+    next_session_id: i64      # Next session ID to assign
+    pool: *BufferPool         # Buffer pool for storage
+    collection: *Collection   # Main collection
+    running: i32              # Server running flag
+
+# Create a new server
+pub fn server_new(pool: *BufferPool, collection: *Collection) -> *Server
+    var server: *Server = malloc(64) as *Server
+    if server == null
+        return null
+
+    server.listen_fd = -1
+    server.epoll_fd = -1
+    server.connections = malloc(MAX_CONNECTIONS as i64 * 64) as *Connection  # sizeof(Connection) ~ 64
+    if server.connections == null
+        free(server as *u8)
+        return null
+    server.num_connections = 0
+    server.max_connections = MAX_CONNECTIONS
+    server.next_session_id = 1
+    server.pool = pool
+    server.collection = collection
+    server.running = 0
+
+    # Initialize all connection slots
+    var i: i32 = 0
+    while i < MAX_CONNECTIONS
+        var conn: *Connection = server.connections + i
+        conn.fd = -1
+        conn.state = CONN_STATE_CLOSED
+        conn.recv_buf = null
+        conn.send_buf = null
+        i += 1
+
+    return server
+
+# Free server resources
+pub fn server_free(server: *Server)
+    if server == null
+        return
+
+    # Close all connections
+    var i: i32 = 0
+    while i < server.max_connections
+        var conn: *Connection = server.connections + i
+        if conn.state != CONN_STATE_CLOSED
+            conn_cleanup(conn)
+        i += 1
+
+    if server.connections != null
+        free(server.connections as *u8)
+
+    if server.epoll_fd >= 0
+        sys_close(server.epoll_fd)
+
+    if server.listen_fd >= 0
+        sys_close(server.listen_fd)
+
+    free(server as *u8)
+
+# Start listening on the given port
+pub fn server_listen(server: *Server, port: i32) -> i32
+    # Create listening socket
+    var sock: Socket = socket_tcp_nonblock()
+    if sock.fd < 0
+        return -1
+
+    # Set socket options
+    socket_set_reuseaddr(@sock)
+    socket_set_nodelay(@sock)
+
+    # Bind to address
+    let bind_result: i32 = socket_bind_any(@sock, port)
+    if bind_result < 0
+        socket_close(@sock)
+        return -2
+
+    # Listen for connections
+    let listen_result: i32 = socket_listen(@sock, BACKLOG)
+    if listen_result < 0
+        socket_close(@sock)
+        return -3
+
+    server.listen_fd = sock.fd
+
+    # Create epoll instance
+    server.epoll_fd = epoll_create()
+    if server.epoll_fd < 0
+        socket_close(@sock)
+        server.listen_fd = -1
+        return -4
+
+    # Add listen socket to epoll
+    let add_result: i32 = epoll_add(server.epoll_fd, server.listen_fd, EPOLLIN as u32)
+    if add_result < 0
+        sys_close(server.epoll_fd)
+        socket_close(@sock)
+        server.listen_fd = -1
+        server.epoll_fd = -1
+        return -5
+
+    return 0
+
+# Find a free connection slot
+fn find_free_slot(server: *Server) -> *Connection
+    var i: i32 = 0
+    while i < server.max_connections
+        var conn: *Connection = server.connections + i
+        if conn.state == CONN_STATE_CLOSED
+            return conn
+        i += 1
+    return null
+
+# Accept a new connection
+fn accept_connection(server: *Server) -> i32
+    var sock: Socket
+    sock.fd = server.listen_fd
+    sock.family = AF_INET
+    sock.socktype = SOCK_STREAM
+
+    var client: Socket = socket_accept_nonblock(@sock)
+    if client.fd < 0
+        return -1
+
+    # Find free slot
+    var conn: *Connection = find_free_slot(server)
+    if conn == null
+        sys_close(client.fd)
+        return -2
+
+    # Initialize connection
+    if conn_init(conn, client.fd) < 0
+        sys_close(client.fd)
+        return -3
+
+    # Set TCP_NODELAY on client socket
+    socket_set_nodelay(@client)
+
+    # Add to epoll (edge-triggered for efficiency)
+    let add_result: i32 = epoll_add(server.epoll_fd, client.fd, (EPOLLIN | EPOLLET as i32) as u32)
+    if add_result < 0
+        conn_cleanup(conn)
+        return -4
+
+    server.num_connections += 1
+    return 0
+
+# Close a connection
+fn close_connection(server: *Server, conn: *Connection)
+    if conn.fd >= 0
+        epoll_del(server.epoll_fd, conn.fd)
+    conn_cleanup(conn)
+    server.num_connections -= 1
+
+# ============================================================================
+# Message processing
+# ============================================================================
+
+# Process a complete message from a connection
+fn process_message(server: *Server, conn: *Connection, reader: *MessageReader) -> i32
+    let msg_type: i32 = msgreader_msg_type(reader)
+    let request_id: i32 = msgreader_request_id(reader)
+
+    # Create response buffer
+    var resp_buf: *MessageBuffer = msgbuf_new(SEND_BUFFER_SIZE)
+    if resp_buf == null
+        return -1
+
+    # Handle message based on type
+    if msg_type == MSG_PING
+        build_pong(resp_buf, request_id)
+
+    else if msg_type == MSG_CONNECT
+        # Read collection name (for now we only support one collection)
+        var name_len: i32 = 0
+        var name: *u8 = msgreader_read_bytes(reader, @name_len)
+
+        # Assign session ID
+        conn.session_id = server.next_session_id
+        server.next_session_id += 1
+
+        build_connected(resp_buf, request_id, conn.session_id)
+
+    else if msg_type == MSG_DISCONNECT
+        msgbuf_start(resp_buf, MSG_DISCONNECTED, request_id)
+        msgbuf_finish(resp_buf)
+        # Mark connection for closing after sending response
+        conn.state = CONN_STATE_WRITING
+
+    else if msg_type == MSG_INSERT
+        # Read serialized document
+        var doc_len: i32 = 0
+        var doc_data: *u8 = msgreader_read_bytes(reader, @doc_len)
+
+        if doc_data == null or doc_len <= 0
+            build_error(resp_buf, request_id, PROTO_ERR_INVALID_DOCUMENT, c"Invalid document data", 21)
+        else
+            # Deserialize and insert document
+            var doc: Document
+            var invalid_id: DocumentId = doc_id_invalid()
+            doc_init(@doc, @invalid_id)
+
+            # For now, create a simple document
+            # Full deserialization would happen here
+            var out_id: DocumentId
+            let result: i32 = collection_insert(server.collection, @doc, @out_id)
+
+            if result != 0
+                build_error(resp_buf, request_id, PROTO_ERR_INTERNAL, c"Insert failed", 13)
+            else
+                build_insert_ok(resp_buf, request_id, out_id.value)
+
+    else if msg_type == MSG_GET
+        let doc_id: i64 = msgreader_read_i64(reader)
+
+        var doc: Document
+        let found: i32 = collection_get(server.collection, doc_id, @doc)
+
+        if found == 0
+            build_error(resp_buf, request_id, PROTO_ERR_NOT_FOUND, c"Document not found", 18)
+        else
+            # Serialize document for response
+            # For now, just send a placeholder
+            var data: [8]u8
+            memset(@data[0], 0, 8)
+            build_get_ok(resp_buf, request_id, @data[0], 8)
+
+    else if msg_type == MSG_DELETE
+        let doc_id: i64 = msgreader_read_i64(reader)
+
+        let deleted: i32 = collection_delete(server.collection, doc_id)
+
+        if deleted == 0
+            build_error(resp_buf, request_id, PROTO_ERR_NOT_FOUND, c"Document not found", 18)
+        else
+            build_delete_ok(resp_buf, request_id)
+
+    else if msg_type == MSG_TXN_BEGIN
+        # For now, just return a transaction ID
+        conn.txn_id = server.next_session_id
+        server.next_session_id += 1
+        build_txn_begun(resp_buf, request_id, conn.txn_id)
+
+    else if msg_type == MSG_TXN_COMMIT
+        if conn.txn_id == 0
+            build_error(resp_buf, request_id, PROTO_ERR_TXN_NOT_ACTIVE, c"No active transaction", 21)
+        else
+            conn.txn_id = 0
+            build_txn_committed(resp_buf, request_id)
+
+    else if msg_type == MSG_TXN_ABORT
+        if conn.txn_id == 0
+            build_error(resp_buf, request_id, PROTO_ERR_TXN_NOT_ACTIVE, c"No active transaction", 21)
+        else
+            conn.txn_id = 0
+            build_txn_aborted(resp_buf, request_id)
+
+    else
+        build_error(resp_buf, request_id, PROTO_ERR_INVALID_MSG_TYPE, c"Unknown message type", 20)
+
+    # Copy response to connection send buffer
+    let resp_len: i32 = msgbuf_len(resp_buf)
+    if resp_len > 0 and resp_len <= SEND_BUFFER_SIZE
+        memcpy(conn.send_buf, msgbuf_data(resp_buf), resp_len as i64)
+        conn.send_len = resp_len
+        conn.send_pos = 0
+        conn.state = CONN_STATE_WRITING
+
+    msgbuf_free(resp_buf)
+    return 0
+
+# Try to read and process messages from a connection
+fn handle_read(server: *Server, conn: *Connection) -> i32
+    # Read available data
+    let available: i32 = conn.recv_cap - conn.recv_len
+    if available <= 0
+        return -1  # Buffer full
+
+    let n: i64 = sys_read(conn.fd, conn.recv_buf + conn.recv_len, available as i64)
+    if n < 0
+        # EAGAIN/EWOULDBLOCK means no data available
+        if n == -11
+            return 0
+        return -1
+    if n == 0
+        # Connection closed
+        return -2
+
+    conn.recv_len += n as i32
+
+    # Try to parse complete messages
+    while conn.recv_len >= PROTO_HEADER_SIZE
+        # Peek at message length
+        var ptr: *u8 = conn.recv_buf
+        var msg_len: i32 = (*(ptr + 4) as i32) << 24
+        msg_len = msg_len | ((*(ptr + 5) as i32) << 16)
+        msg_len = msg_len | ((*(ptr + 6) as i32) << 8)
+        msg_len = msg_len | (*(ptr + 7) as i32)
+
+        if msg_len < PROTO_HEADER_SIZE or msg_len > PROTO_MAX_MESSAGE_SIZE
+            return -3  # Invalid message
+
+        if conn.recv_len < msg_len
+            break  # Need more data
+
+        # Parse complete message
+        var reader: MessageReader
+        let result: i32 = msgreader_init(@reader, conn.recv_buf, msg_len)
+        if result != PROTO_OK
+            return -4  # Protocol error
+
+        # Process the message
+        conn.state = CONN_STATE_PROCESSING
+        process_message(server, conn, @reader)
+
+        # Shift remaining data to beginning of buffer
+        let remaining: i32 = conn.recv_len - msg_len
+        if remaining > 0
+            # Use memmove for overlapping regions
+            var i: i32 = 0
+            while i < remaining
+                *(conn.recv_buf + i) = *(conn.recv_buf + msg_len + i)
+                i += 1
+        conn.recv_len = remaining
+
+    return 0
+
+# Try to send pending data to a connection
+fn handle_write(server: *Server, conn: *Connection) -> i32
+    if conn.send_len == 0
+        conn.state = CONN_STATE_READING
+        return 0
+
+    let to_send: i32 = conn.send_len - conn.send_pos
+    if to_send <= 0
+        conn.send_len = 0
+        conn.send_pos = 0
+        conn.state = CONN_STATE_READING
+        return 0
+
+    let n: i64 = sys_write(conn.fd, conn.send_buf + conn.send_pos, to_send as i64)
+    if n < 0
+        if n == -11  # EAGAIN
+            return 0
+        return -1
+    if n == 0
+        return -2
+
+    conn.send_pos += n as i32
+
+    if conn.send_pos >= conn.send_len
+        conn.send_len = 0
+        conn.send_pos = 0
+        conn.state = CONN_STATE_READING
+    return 0
+
+# ============================================================================
+# Server main loop
+# ============================================================================
+
+# Run the server event loop
+pub fn server_run(server: *Server) -> i32
+    if server.listen_fd < 0 or server.epoll_fd < 0
+        return -1
+
+    server.running = 1
+
+    # Epoll events buffer
+    var events: [64]EpollEvent
+    memset(@events[0] as *u8, 0, 64 * 12)
+
+    while server.running != 0
+        # Wait for events (timeout 100ms)
+        let num_events: i32 = epoll_wait_events(server.epoll_fd, @events[0], 64, 100)
+
+        if num_events < 0
+            if num_events == -4  # EINTR
+                continue
+            break
+
+        var i: i32 = 0
+        while i < num_events
+            var ev: *EpollEvent = @events[0] + i
+            let fd: i32 = ev.data as i32
+
+            if fd == server.listen_fd
+                # New connection
+                accept_connection(server)
+            else
+                # Find connection by fd
+                var j: i32 = 0
+                while j < server.max_connections
+                    var conn: *Connection = server.connections + j
+                    if conn.fd == fd and conn.state != CONN_STATE_CLOSED
+                        # Handle events
+                        if (ev.events & EPOLLIN as u32) != 0
+                            let read_result: i32 = handle_read(server, conn)
+                            if read_result < 0
+                                close_connection(server, conn)
+
+                        if conn.state == CONN_STATE_WRITING
+                            let write_result: i32 = handle_write(server, conn)
+                            if write_result < 0
+                                close_connection(server, conn)
+
+                        if (ev.events & (EPOLLERR | EPOLLHUP) as u32) != 0
+                            close_connection(server, conn)
+
+                        break
+                    j += 1
+            i += 1
+
+    return 0
+
+# Stop the server
+pub fn server_stop(server: *Server)
+    server.running = 0
+
+# Get number of active connections
+pub fn server_connection_count(server: *Server) -> i32
+    return server.num_connections
+
+# Check if server is running
+pub fn server_is_running(server: *Server) -> i32
+    return server.running

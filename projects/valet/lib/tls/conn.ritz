@@ -1,0 +1,506 @@
+# valet/lib/tls/conn.ritz - TLS 1.3 Connection State Machine
+#
+# Implements the TLS server-side connection handling for Valet.
+# Integrates with Valet's io_uring event loop for async I/O.
+#
+# Usage:
+#   var tls: TlsConn
+#   tls_conn_init(@tls, cert_chain, private_key)
+#
+#   # In connection handler:
+#   let ret: i32 = tls_accept(@tls, socket_fd)
+#   if ret == TLS_WANT_READ
+#       # Schedule read and call again
+#   if ret == TLS_OK
+#       # Handshake complete, can read/write app data
+#
+#   tls_read(@tls, buf, len)
+#   tls_write(@tls, data, len)
+#   tls_close(@tls)
+
+import ritzlib.io
+import ritzlib.str
+
+import lib.tls.record
+import lib.tls.handshake
+import lib.tls.keyschedule
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+# TLS connection states
+const TLS_STATE_INIT: i32 = 0
+const TLS_STATE_WAIT_CLIENT_HELLO: i32 = 1
+const TLS_STATE_SEND_SERVER_HELLO: i32 = 2
+const TLS_STATE_SEND_ENCRYPTED_EXTENSIONS: i32 = 3
+const TLS_STATE_SEND_CERTIFICATE: i32 = 4
+const TLS_STATE_SEND_CERTIFICATE_VERIFY: i32 = 5
+const TLS_STATE_SEND_FINISHED: i32 = 6
+const TLS_STATE_WAIT_FINISHED: i32 = 7
+const TLS_STATE_ESTABLISHED: i32 = 8
+const TLS_STATE_CLOSED: i32 = 9
+const TLS_STATE_ERROR: i32 = 10
+
+# Return values
+const TLS_OK: i32 = 0
+const TLS_WANT_READ: i32 = -1
+const TLS_WANT_WRITE: i32 = -2
+const TLS_ERROR: i32 = -3
+const TLS_CLOSED: i32 = -4
+
+# Buffer sizes
+const TLS_READ_BUF_SIZE: i32 = 32768
+const TLS_WRITE_BUF_SIZE: i32 = 32768
+
+# ============================================================================
+# TLS Connection State
+# ============================================================================
+
+struct TlsConn
+    # Connection state
+    state: i32
+
+    # Key schedule
+    keys: TlsKeySchedule
+
+    # Current handshake messages
+    client_hello: ClientHello
+    server_hello: ServerHello
+
+    # Read/write buffers for record layer
+    read_buf: [32768]u8
+    read_pos: i32
+    read_len: i32
+
+    write_buf: [32768]u8
+    write_pos: i32
+    write_len: i32
+
+    # Decrypted application data buffer
+    app_buf: [16384]u8
+    app_pos: i32
+    app_len: i32
+
+    # Sequence numbers for AEAD nonce
+    read_seq: u64
+    write_seq: u64
+
+    # Error info
+    alert_level: u8
+    alert_desc: u8
+
+    # Certificate and private key (pointers to loaded data)
+    # These would point to DER-encoded certificate chain and private key
+    cert_chain: *u8
+    cert_chain_len: i32
+    private_key: *u8
+    private_key_len: i32
+
+    # Server's ephemeral key pair (X25519)
+    # Note: In production, this should be generated fresh per connection
+    server_privkey: [32]u8
+    server_pubkey: [32]u8
+
+
+# ============================================================================
+# Initialization
+# ============================================================================
+
+fn tls_conn_init(tls: *TlsConn)
+    tls.state = TLS_STATE_INIT
+    tls.read_pos = 0
+    tls.read_len = 0
+    tls.write_pos = 0
+    tls.write_len = 0
+    tls.app_pos = 0
+    tls.app_len = 0
+    tls.read_seq = 0
+    tls.write_seq = 0
+    tls.alert_level = 0
+    tls.alert_desc = 0
+    tls.cert_chain = null
+    tls.cert_chain_len = 0
+    tls.private_key = null
+    tls.private_key_len = 0
+
+
+# Set certificate chain (DER-encoded)
+fn tls_conn_set_cert(tls: *TlsConn, cert: *u8, cert_len: i32)
+    tls.cert_chain = cert
+    tls.cert_chain_len = cert_len
+
+
+# Set private key (DER-encoded)
+fn tls_conn_set_key(tls: *TlsConn, key: *u8, key_len: i32)
+    tls.private_key = key
+    tls.private_key_len = key_len
+
+
+# ============================================================================
+# Handshake State Machine
+# ============================================================================
+
+# Process incoming data and advance handshake
+# Returns TLS_OK when handshake complete, TLS_WANT_READ/WRITE if more I/O needed
+fn tls_handshake(tls: *TlsConn) -> i32
+    # State machine
+    if tls.state == TLS_STATE_INIT
+        tls.state = TLS_STATE_WAIT_CLIENT_HELLO
+        return TLS_WANT_READ
+
+    if tls.state == TLS_STATE_WAIT_CLIENT_HELLO
+        return tls_process_client_hello(tls)
+
+    if tls.state == TLS_STATE_SEND_SERVER_HELLO
+        return tls_send_server_hello(tls)
+
+    if tls.state == TLS_STATE_SEND_ENCRYPTED_EXTENSIONS
+        return tls_send_encrypted_extensions(tls)
+
+    if tls.state == TLS_STATE_SEND_CERTIFICATE
+        return tls_send_certificate(tls)
+
+    if tls.state == TLS_STATE_SEND_CERTIFICATE_VERIFY
+        return tls_send_certificate_verify(tls)
+
+    if tls.state == TLS_STATE_SEND_FINISHED
+        return tls_send_finished(tls)
+
+    if tls.state == TLS_STATE_WAIT_FINISHED
+        return tls_process_client_finished(tls)
+
+    if tls.state == TLS_STATE_ESTABLISHED
+        return TLS_OK
+
+    return TLS_ERROR
+
+
+# Feed received data into the connection
+fn tls_feed_data(tls: *TlsConn, data: *u8, len: i32) -> i32
+    # Append to read buffer
+    if tls.read_len + len > TLS_READ_BUF_SIZE
+        return TLS_ERROR  # Buffer overflow
+
+    for i in 0..len
+        tls.read_buf[tls.read_len + i] = *(data + i)
+    tls.read_len += len
+
+    return TLS_OK
+
+
+# Get data to send
+# Returns pointer to write buffer and sets len to available bytes
+fn tls_get_send_data(tls: *TlsConn, len: *i32) -> *u8
+    *len = tls.write_len - tls.write_pos
+    return @tls.write_buf[tls.write_pos]
+
+
+# Mark bytes as sent
+fn tls_mark_sent(tls: *TlsConn, len: i32)
+    tls.write_pos += len
+    if tls.write_pos >= tls.write_len
+        tls.write_pos = 0
+        tls.write_len = 0
+
+
+# ============================================================================
+# Handshake Steps
+# ============================================================================
+
+fn tls_process_client_hello(tls: *TlsConn) -> i32
+    # Try to read a complete record
+    var rec: TlsRecord
+    let ret: i32 = record_read(@tls.read_buf[0], tls.read_len, @rec)
+
+    if ret == -2
+        return TLS_WANT_READ  # Need more data
+    if ret < 0
+        tls_set_error(tls, ALERT_FATAL, ALERT_DECODE_ERROR)
+        return TLS_ERROR
+
+    # Consume the record from buffer
+    let consumed: i32 = ret
+    tls.read_len -= consumed
+    for i in 0..tls.read_len
+        tls.read_buf[i] = tls.read_buf[consumed + i]
+
+    # Verify it's a handshake record
+    if rec.content_type != CT_HANDSHAKE
+        tls_set_error(tls, ALERT_FATAL, ALERT_UNEXPECTED_MESSAGE)
+        return TLS_ERROR
+
+    # Parse handshake header
+    var hdr: HandshakeHeader
+    if handshake_parse_header(@rec.data[0], rec.length, @hdr) != 0
+        tls_set_error(tls, ALERT_FATAL, ALERT_DECODE_ERROR)
+        return TLS_ERROR
+
+    if hdr.msg_type != HS_CLIENT_HELLO
+        tls_set_error(tls, ALERT_FATAL, ALERT_UNEXPECTED_MESSAGE)
+        return TLS_ERROR
+
+    # Parse ClientHello
+    if client_hello_parse(@rec.data[4], hdr.length, @tls.client_hello) != 0
+        tls_set_error(tls, ALERT_FATAL, ALERT_DECODE_ERROR)
+        return TLS_ERROR
+
+    # Verify TLS 1.3 is supported
+    var tls13_supported: i32 = 0
+    for i in 0..tls.client_hello.supported_version_count
+        if tls.client_hello.supported_versions[i] == 0x0304
+            tls13_supported = 1
+            break
+
+    if tls13_supported == 0
+        tls_set_error(tls, ALERT_FATAL, ALERT_PROTOCOL_VERSION)
+        return TLS_ERROR
+
+    # Select cipher suite (prefer AES-128-GCM, then ChaCha20)
+    var selected_suite: u16 = 0
+    for i in 0..tls.client_hello.cipher_suite_count
+        let suite: u16 = tls.client_hello.cipher_suites[i]
+        if suite == TLS_AES_128_GCM_SHA256
+            selected_suite = suite
+            break
+        if suite == TLS_CHACHA20_POLY1305_SHA256 && selected_suite == 0
+            selected_suite = suite
+
+    if selected_suite == 0
+        tls_set_error(tls, ALERT_FATAL, ALERT_HANDSHAKE_FAILURE)
+        return TLS_ERROR
+
+    # Initialize key schedule with selected suite
+    keyschedule_init(@tls.keys, selected_suite)
+
+    # Update transcript with ClientHello
+    keyschedule_update_transcript(@tls.keys, @rec.data[0], rec.length)
+
+    # TODO: Generate ephemeral key pair (requires X25519 from cryptosec)
+    # For now, we'll use placeholder zeros - this won't work in practice!
+    for i in 0..32
+        tls.server_privkey[i] = 0
+        tls.server_pubkey[i] = 0
+
+    # Move to next state
+    tls.state = TLS_STATE_SEND_SERVER_HELLO
+    tls.server_hello.cipher_suite = selected_suite
+    tls.server_hello.selected_version = 0x0304  # TLS 1.3
+
+    return tls_handshake(tls)
+
+
+fn tls_send_server_hello(tls: *TlsConn) -> i32
+    # Build ServerHello
+    var sh: *ServerHello = @tls.server_hello
+
+    # Generate random (TODO: use cryptosec random)
+    # For now, use zeros - this is insecure!
+    for i in 0..32
+        sh.random[i] = 0
+
+    # Echo session ID
+    sh.session_id_len = tls.client_hello.session_id_len
+    for i in 0..(sh.session_id_len as i32)
+        sh.session_id[i] = tls.client_hello.session_id[i]
+
+    # Key share (X25519 public key)
+    sh.key_share_group = GROUP_X25519
+    sh.key_share_len = 32
+    for i in 0..32
+        sh.key_share_data[i] = tls.server_pubkey[i]
+
+    # Build message
+    var msg_buf: [512]u8
+    let msg_len: i32 = server_hello_build(sh, @msg_buf[0], 512)
+    if msg_len < 0
+        tls_set_error(tls, ALERT_FATAL, ALERT_INTERNAL_ERROR)
+        return TLS_ERROR
+
+    # Update transcript
+    keyschedule_update_transcript(@tls.keys, @msg_buf[0], msg_len)
+
+    # Wrap in record
+    let rec_len: i32 = record_write(@tls.write_buf[tls.write_len],
+                                    TLS_WRITE_BUF_SIZE - tls.write_len,
+                                    CT_HANDSHAKE, @msg_buf[0], msg_len)
+    if rec_len < 0
+        return TLS_ERROR
+    tls.write_len += rec_len
+
+    # TODO: Compute shared secret from ECDHE
+    # This requires X25519 scalar multiplication with client's public key
+    var shared_secret: [32]u8
+    for i in 0..32
+        shared_secret[i] = 0  # Placeholder - insecure!
+
+    # Derive handshake secrets
+    keyschedule_derive_early_secret(@tls.keys, null, 0)
+    keyschedule_derive_handshake_secret(@tls.keys, @shared_secret[0], 32)
+    keyschedule_derive_handshake_traffic_secrets(@tls.keys)
+    keyschedule_derive_handshake_keys(@tls.keys)
+
+    tls.state = TLS_STATE_SEND_ENCRYPTED_EXTENSIONS
+    return TLS_WANT_WRITE
+
+
+fn tls_send_encrypted_extensions(tls: *TlsConn) -> i32
+    # Build EncryptedExtensions (empty for basic server)
+    var msg_buf: [64]u8
+    let msg_len: i32 = encrypted_extensions_build(@msg_buf[0], 64)
+
+    # Update transcript
+    keyschedule_update_transcript(@tls.keys, @msg_buf[0], msg_len)
+
+    # TODO: Encrypt this message with server handshake key
+    # For now, send plaintext (won't work with real clients!)
+    let rec_len: i32 = record_write(@tls.write_buf[tls.write_len],
+                                    TLS_WRITE_BUF_SIZE - tls.write_len,
+                                    CT_APPLICATION_DATA, @msg_buf[0], msg_len)
+    if rec_len < 0
+        return TLS_ERROR
+    tls.write_len += rec_len
+
+    # Skip certificate for now (would need to implement Certificate message)
+    tls.state = TLS_STATE_SEND_FINISHED
+    return TLS_WANT_WRITE
+
+
+fn tls_send_certificate(tls: *TlsConn) -> i32
+    # TODO: Implement Certificate message construction
+    # This requires DER encoding and proper message format
+    tls.state = TLS_STATE_SEND_CERTIFICATE_VERIFY
+    return tls_handshake(tls)
+
+
+fn tls_send_certificate_verify(tls: *TlsConn) -> i32
+    # TODO: Implement CertificateVerify
+    # This requires Ed25519 or RSA signing of transcript hash
+    tls.state = TLS_STATE_SEND_FINISHED
+    return tls_handshake(tls)
+
+
+fn tls_send_finished(tls: *TlsConn) -> i32
+    # Compute verify_data
+    var verify_data: [32]u8
+    keyschedule_compute_finished(@tls.keys, @tls.keys.server_handshake_secret[0], @verify_data[0])
+
+    # Build Finished message
+    var msg_buf: [64]u8
+    let msg_len: i32 = finished_build(@verify_data[0], 32, @msg_buf[0], 64)
+    if msg_len < 0
+        return TLS_ERROR
+
+    # Update transcript
+    keyschedule_update_transcript(@tls.keys, @msg_buf[0], msg_len)
+
+    # TODO: Encrypt with server handshake key
+    let rec_len: i32 = record_write(@tls.write_buf[tls.write_len],
+                                    TLS_WRITE_BUF_SIZE - tls.write_len,
+                                    CT_APPLICATION_DATA, @msg_buf[0], msg_len)
+    if rec_len < 0
+        return TLS_ERROR
+    tls.write_len += rec_len
+
+    # Derive application secrets and keys
+    keyschedule_derive_master_secret(@tls.keys)
+    keyschedule_derive_app_traffic_secrets(@tls.keys)
+    keyschedule_derive_app_keys(@tls.keys)
+
+    tls.state = TLS_STATE_WAIT_FINISHED
+    return TLS_WANT_WRITE
+
+
+fn tls_process_client_finished(tls: *TlsConn) -> i32
+    # TODO: Process client's Finished message
+    # 1. Decrypt the record
+    # 2. Verify the verify_data
+
+    # For now, just transition to established (incomplete!)
+    tls.state = TLS_STATE_ESTABLISHED
+    return TLS_OK
+
+
+# ============================================================================
+# Application Data (after handshake)
+# ============================================================================
+
+# Read decrypted application data
+fn tls_read(tls: *TlsConn, buf: *u8, len: i32) -> i32
+    if tls.state != TLS_STATE_ESTABLISHED
+        return TLS_ERROR
+
+    # TODO: Decrypt incoming records and return plaintext
+    return 0
+
+
+# Write application data (will be encrypted)
+fn tls_write(tls: *TlsConn, data: *u8, len: i32) -> i32
+    if tls.state != TLS_STATE_ESTABLISHED
+        return TLS_ERROR
+
+    # TODO: Encrypt data and queue for sending
+    return 0
+
+
+# Close the connection gracefully
+fn tls_close(tls: *TlsConn) -> i32
+    # Send close_notify alert
+    let rec_len: i32 = record_write_alert(@tls.write_buf[tls.write_len],
+                                          TLS_WRITE_BUF_SIZE - tls.write_len,
+                                          ALERT_WARNING, ALERT_CLOSE_NOTIFY)
+    if rec_len > 0
+        tls.write_len += rec_len
+
+    tls.state = TLS_STATE_CLOSED
+    return TLS_WANT_WRITE
+
+
+# ============================================================================
+# Error handling
+# ============================================================================
+
+fn tls_set_error(tls: *TlsConn, level: u8, desc: u8)
+    tls.alert_level = level
+    tls.alert_desc = desc
+    tls.state = TLS_STATE_ERROR
+
+    # Queue alert message
+    record_write_alert(@tls.write_buf[tls.write_len],
+                       TLS_WRITE_BUF_SIZE - tls.write_len,
+                       level, desc)
+
+
+fn tls_get_error(tls: *TlsConn) -> *u8
+    return alert_description_str(tls.alert_desc)
+
+
+# ============================================================================
+# Debug
+# ============================================================================
+
+fn tls_state_str(state: i32) -> *u8
+    if state == TLS_STATE_INIT
+        return c"INIT"
+    if state == TLS_STATE_WAIT_CLIENT_HELLO
+        return c"WAIT_CLIENT_HELLO"
+    if state == TLS_STATE_SEND_SERVER_HELLO
+        return c"SEND_SERVER_HELLO"
+    if state == TLS_STATE_SEND_ENCRYPTED_EXTENSIONS
+        return c"SEND_ENCRYPTED_EXTENSIONS"
+    if state == TLS_STATE_SEND_CERTIFICATE
+        return c"SEND_CERTIFICATE"
+    if state == TLS_STATE_SEND_CERTIFICATE_VERIFY
+        return c"SEND_CERTIFICATE_VERIFY"
+    if state == TLS_STATE_SEND_FINISHED
+        return c"SEND_FINISHED"
+    if state == TLS_STATE_WAIT_FINISHED
+        return c"WAIT_FINISHED"
+    if state == TLS_STATE_ESTABLISHED
+        return c"ESTABLISHED"
+    if state == TLS_STATE_CLOSED
+        return c"CLOSED"
+    if state == TLS_STATE_ERROR
+        return c"ERROR"
+    return c"UNKNOWN"
+

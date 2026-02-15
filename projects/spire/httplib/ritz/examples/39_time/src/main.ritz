@@ -1,0 +1,228 @@
+# time - time a command execution
+#
+# Usage: time COMMAND [ARGS]...
+#   Runs COMMAND with ARGS and reports the real (wall clock) time elapsed.
+#
+# Output format:
+#   real    0m0.000s
+#
+# Examples:
+#   time sleep 1     # time sleep command
+#   time ls -la      # time ls command
+
+# ============================================================================
+# Standard library imports
+# ============================================================================
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+import ritzlib.env
+
+# ============================================================================
+# Time formatting
+# ============================================================================
+
+fn print_time_component(n: i64)
+    # Print a time component with leading zeros if needed (for 3 digits)
+    if n < 10
+        prints("00")
+        print_int(n)
+    else if n < 100
+        print_char(48)  # '0'
+        print_int(n)
+    else
+        print_int(n)
+
+fn format_time(total_usec: i64)
+    # Format time as Nm.NNNs
+    # total_usec is microseconds
+
+    let total_sec: i64 = total_usec / 1000000
+    let usec_remainder: i64 = total_usec % 1000000
+    let msec: i64 = usec_remainder / 1000
+
+    let minutes: i64 = total_sec / 60
+    let seconds: i64 = total_sec % 60
+
+    # Print: NmN.NNNs
+    print_int(minutes)
+    print_char(109)  # 'm'
+    print_int(seconds)
+    print_char(46)   # '.'
+    print_time_component(msec)
+    print_char(115)  # 's'
+
+# ============================================================================
+# Command execution
+# ============================================================================
+
+fn find_in_path(envp: **u8, name: *u8, result: *u8) -> i32
+    # Find command in PATH, store full path in result
+    # Returns 0 on success, 1 on failure
+
+    # If name contains a '/', use it directly
+    var i: i64 = 0
+    while *(name + i) != 0
+        if *(name + i) == 47  # '/'
+            # Copy name to result
+            var j: i64 = 0
+            while *(name + j) != 0
+                *(result + j) = *(name + j)
+                j = j + 1
+            *(result + j) = 0
+
+            # Check if executable
+            if sys_access(result, X_OK) == 0
+                return 0
+            return 1
+        i = i + 1
+
+    # Get PATH from environment
+    let path_val: *u8 = getenv(envp, "PATH")
+    if path_val == 0 as *u8
+        return 1
+
+    var pos: i64 = 0
+    var path_buf: [4096]u8
+
+    while *(path_val + pos) != 0
+        # Extract next PATH component
+        var len: i64 = 0
+        while *(path_val + pos + len) != 0 && *(path_val + pos + len) != 58  # ':'
+            path_buf[len] = *(path_val + pos + len)
+            len = len + 1
+
+        path_buf[len] = 0
+
+        # Build full path: dir/name
+        var j: i64 = 0
+        while j < len
+            *(result + j) = path_buf[j]
+            j = j + 1
+
+        # Add '/' separator
+        *(result + j) = 47  # '/'
+        j = j + 1
+
+        # Add command name
+        var k: i64 = 0
+        while *(name + k) != 0
+            *(result + j) = *(name + k)
+            j = j + 1
+            k = k + 1
+
+        *(result + j) = 0
+
+        # Check if executable
+        if sys_access(result, X_OK) == 0
+            return 0
+
+        # Move to next PATH component
+        pos = pos + len
+        if *(path_val + pos) == 58  # ':'
+            pos = pos + 1
+
+    return 1
+
+# ============================================================================
+# Main
+# ============================================================================
+
+fn main(argc: i32, argv: **u8, envp: **u8) -> i32
+    # Need at least one argument (the command to run)
+    if argc < 2
+        eprints("Usage: time COMMAND [ARGS]...\n")
+        return 1
+
+    # Get command name
+    let cmd_name: *u8 = *(argv + 1)
+
+    # Find command in PATH
+    var cmd_path: [4096]u8
+    if find_in_path(envp, cmd_name, &cmd_path[0]) != 0
+        eprints("time: ")
+        eprints(cmd_name)
+        eprints(": command not found\n")
+        return 127
+
+    # Build argv for child process (skip our "time" argv[0])
+    # We need to create a new argv array starting from argv[1]
+    var child_argv: [256]*u8
+    var i: i32 = 0
+    while i < argc - 1 && i < 255
+        child_argv[i] = *(argv + 1 + i)
+        i = i + 1
+    child_argv[i] = 0 as *u8
+
+    # Get start time
+    var start_time: Timeval
+    sys_gettimeofday(&start_time, 0 as *u8)
+
+    # Fork
+    let pid: i32 = sys_fork()
+
+    if pid < 0
+        eprints("time: fork failed\n")
+        return 1
+
+    if pid == 0
+        # Child process
+        # Execute the command with its full path
+        sys_execve(&cmd_path[0], &child_argv[0], envp)
+
+        # If execve returns, it failed
+        eprints("time: ")
+        eprints(&cmd_path[0])
+        eprints(": exec failed\n")
+        sys_exit(126)
+
+    # Parent process: wait for child
+    var status: i32 = 0
+    let wait_result: i32 = sys_wait4(pid, &status, 0, 0 as *u8)
+
+    # Get end time
+    var end_time: Timeval
+    sys_gettimeofday(&end_time, 0 as *u8)
+
+    # Calculate elapsed time in microseconds
+    var elapsed_usec: i64 = (end_time.tv_sec - start_time.tv_sec) * 1000000
+    elapsed_usec = elapsed_usec + (end_time.tv_usec - start_time.tv_usec)
+
+    # Print timing (to stderr, like real 'time' does)
+    eprint_char(10)  # newline
+    eprints("real\t")
+    # Need to print to stderr - rewrite format_time to use stderr
+    let total_sec: i64 = elapsed_usec / 1000000
+    let usec_remainder: i64 = elapsed_usec % 1000000
+    let msec: i64 = usec_remainder / 1000
+
+    let minutes: i64 = total_sec / 60
+    let seconds: i64 = total_sec % 60
+
+    eprint_int(minutes)
+    eprint_char(109)  # 'm'
+    eprint_int(seconds)
+    eprint_char(46)   # '.'
+    # Print milliseconds with leading zeros
+    if msec < 10
+        eprints("00")
+        eprint_int(msec)
+    else if msec < 100
+        eprint_char(48)  # '0'
+        eprint_int(msec)
+    else
+        eprint_int(msec)
+    eprint_char(115)  # 's'
+    eprint_char(10)   # newline
+
+    # Extract exit code from status
+    # Status format: bits 0-7 are signal, bits 8-15 are exit code if normal exit
+    # If terminated normally, low 7 bits are 0
+    if (status & 127) == 0
+        # Normal termination - exit code is in upper byte
+        # Divide by 256 to get bits 8-15 (equivalent to >> 8)
+        return (status / 256) & 255
+    else
+        # Killed by signal
+        return 128 + (status & 127)

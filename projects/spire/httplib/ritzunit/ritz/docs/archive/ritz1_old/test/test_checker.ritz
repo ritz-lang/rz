@@ -1,0 +1,520 @@
+# ritz1/test/test_checker.ritz - Type Checker Tests
+#
+# Tests for the type checker.
+
+# ============================================================================
+# Type Kind Constants
+# ============================================================================
+
+const TY_VOID: i32 = 0
+const TY_BOOL: i32 = 1
+const TY_I8: i32 = 2
+const TY_I16: i32 = 3
+const TY_I32: i32 = 4
+const TY_I64: i32 = 5
+const TY_U8: i32 = 6
+const TY_U16: i32 = 7
+const TY_U32: i32 = 8
+const TY_U64: i32 = 9
+const TY_PTR: i32 = 10
+const TY_REF: i32 = 11
+const TY_REF_MUT: i32 = 12
+const TY_ARRAY: i32 = 13
+const TY_SLICE: i32 = 14
+const TY_STRUCT: i32 = 20
+const TY_FN: i32 = 30
+const TY_ERROR: i32 = 99
+
+# Symbol kinds
+const SYM_VAR: i32 = 1
+const SYM_FN: i32 = 2
+const SYM_TYPE: i32 = 3
+const SYM_PARAM: i32 = 4
+
+# Expression kinds
+const EXPR_INT_LIT: i32 = 1
+const EXPR_IDENT: i32 = 2
+const EXPR_STRING_LIT: i32 = 3
+const EXPR_BOOL_LIT: i32 = 4
+const EXPR_BIN_OP: i32 = 5
+const EXPR_UNARY_OP: i32 = 6
+const EXPR_PAREN: i32 = 10
+const EXPR_CAST: i32 = 11
+
+# Statement kinds
+const STMT_VAR: i32 = 21
+const STMT_LET: i32 = 22
+
+# Type expression kinds
+const TYPE_NAMED: i32 = 50
+const TYPE_PTR: i32 = 51
+
+# ============================================================================
+# Structures
+# ============================================================================
+
+struct TypeList
+  ty: *Type
+  next: *TypeList
+
+struct Field
+  name: *i8
+  name_len: i32
+  ty: *Type
+  offset: i32
+  next: *Field
+
+struct Type
+  kind: i32
+  is_mut: i32
+  size: i32
+  inner: *Type
+  name: *i8
+  name_len: i32
+  fields: *Field
+  params: *TypeList
+  ret: *Type
+  next: *Type
+
+struct Symbol
+  name: *i8
+  name_len: i32
+  kind: i32
+  ty: *Type
+  is_mut: i32
+  next: *Symbol
+
+struct Scope
+  symbols: *Symbol
+  parent: *Scope
+  depth: i32
+
+struct Expr
+  kind: i32
+  val1: i64        # Use i64 for pointers (val1 stores name pointer for IDENT)
+  val2: i32        # val2 stores name_len for IDENT
+  left: *i32
+  right: *i32
+  next: *i32
+
+struct TypeExpr
+  kind: i32
+  name: *i8
+  name_len: i32
+  inner: *i32
+  size: i32
+  is_mut: i32
+
+struct Stmt
+  kind: i32
+  name: *i8
+  name_len: i32
+  type_expr: *i32
+  expr: *i32
+  stmt: *i32
+  next: *i32
+
+struct Checker
+  global: *Scope
+  current: *Scope
+  errors: i32
+  current_fn: *Type
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+fn names_equal(a: *i8, a_len: i32, b: *i8, b_len: i32) -> i32
+  if a_len != b_len
+    return 0
+  var i: i32 = 0
+  while i < a_len
+    let ca: i32 = *(a + i) as i32
+    let cb: i32 = *(b + i) as i32
+    if ca != cb
+      return 0
+    i = i + 1
+  1
+
+fn type_new(kind: i32) -> *Type
+  let ty: *Type = __builtin_alloca(128) as *Type
+  (*ty).kind = kind
+  (*ty).is_mut = 0
+  (*ty).size = 0
+  (*ty).inner = 0 as *Type
+  (*ty).name = 0 as *i8
+  (*ty).name_len = 0
+  (*ty).fields = 0 as *Field
+  (*ty).params = 0 as *TypeList
+  (*ty).ret = 0 as *Type
+  (*ty).next = 0 as *Type
+  ty
+
+fn type_error() -> *Type
+  type_new(TY_ERROR)
+
+fn scope_lookup_local(s: *Scope, name: *i8, name_len: i32) -> *Symbol
+  if s == 0 as *Scope
+    return 0 as *Symbol
+  var sym: *Symbol = (*s).symbols
+  while sym != 0 as *Symbol
+    if names_equal((*sym).name, (*sym).name_len, name, name_len) == 1
+      return sym
+    sym = (*sym).next
+  0 as *Symbol
+
+fn scope_lookup(s: *Scope, name: *i8, name_len: i32) -> *Symbol
+  var current: *Scope = s
+  while current != 0 as *Scope
+    let sym: *Symbol = scope_lookup_local(current, name, name_len)
+    if sym != 0 as *Symbol
+      return sym
+    current = (*current).parent
+  0 as *Symbol
+
+fn scope_insert(s: *Scope, sym: *Symbol) -> *Symbol
+  (*sym).next = (*s).symbols
+  (*s).symbols = sym
+  sym
+
+# ============================================================================
+# Checker Functions (reimplemented for tests)
+# ============================================================================
+
+fn resolve_type_named(c: *Checker, name: *i8, len: i32) -> *Type
+  # Check for primitive types
+  if len == 4
+    if names_equal(name, len, "void", 4) == 1
+      return type_new(TY_VOID)
+    if names_equal(name, len, "bool", 4) == 1
+      return type_new(TY_BOOL)
+  if len == 3
+    if names_equal(name, len, "i32", 3) == 1
+      return type_new(TY_I32)
+    if names_equal(name, len, "i64", 3) == 1
+      return type_new(TY_I64)
+  if len == 2
+    if names_equal(name, len, "i8", 2) == 1
+      return type_new(TY_I8)
+  # Unknown
+  (*c).errors = (*c).errors + 1
+  type_error()
+
+fn check_expr(c: *Checker, e: *Expr) -> *Type
+  if e == 0 as *Expr
+    return type_error()
+
+  let kind: i32 = (*e).kind
+
+  if kind == EXPR_INT_LIT
+    return type_new(TY_I32)
+
+  if kind == EXPR_BOOL_LIT
+    return type_new(TY_BOOL)
+
+  if kind == EXPR_STRING_LIT
+    # Inline allocations to avoid alloca reuse issue
+    let ty: *Type = __builtin_alloca(128) as *Type
+    (*ty).kind = TY_PTR
+    (*ty).is_mut = 0
+    (*ty).size = 0
+    (*ty).name = 0 as *i8
+    (*ty).name_len = 0
+    (*ty).fields = 0 as *Field
+    (*ty).params = 0 as *TypeList
+    (*ty).ret = 0 as *Type
+    (*ty).next = 0 as *Type
+
+    let inner: *Type = __builtin_alloca(128) as *Type
+    (*inner).kind = TY_I8
+    (*inner).is_mut = 0
+    (*inner).size = 0
+    (*inner).inner = 0 as *Type
+    (*inner).name = 0 as *i8
+    (*inner).name_len = 0
+    (*inner).fields = 0 as *Field
+    (*inner).params = 0 as *TypeList
+    (*inner).ret = 0 as *Type
+    (*inner).next = 0 as *Type
+
+    (*ty).inner = inner
+    return ty
+
+  if kind == EXPR_IDENT
+    let name: *i8 = (*e).val1 as *i8
+    let name_len: i32 = (*e).val2
+    let sym: *Symbol = scope_lookup((*c).current, name, name_len)
+    if sym == 0 as *Symbol
+      (*c).errors = (*c).errors + 1
+      return type_error()
+    return (*sym).ty
+
+  if kind == EXPR_PAREN
+    let inner: *Expr = (*e).left as *Expr
+    return check_expr(c, inner)
+
+  (*c).errors = (*c).errors + 1
+  type_error()
+
+# ============================================================================
+# Tests - Type Resolution
+# ============================================================================
+
+@test
+fn test_resolve_type_i32() -> i32
+  let c: *Checker = __builtin_alloca(64) as *Checker
+  let scope: *Scope = __builtin_alloca(64) as *Scope
+  (*scope).symbols = 0 as *Symbol
+  (*scope).parent = 0 as *Scope
+  (*scope).depth = 0
+  (*c).current = scope
+  (*c).errors = 0
+
+  let name: *i8 = __builtin_alloca(4) as *i8
+  *(name + 0) = 105 as i8  # 'i'
+  *(name + 1) = 51 as i8   # '3'
+  *(name + 2) = 50 as i8   # '2'
+
+  let ty: *Type = resolve_type_named(c, name, 3)
+  assert (*ty).kind == TY_I32
+  assert (*c).errors == 0
+  0
+
+@test
+fn test_resolve_type_bool() -> i32
+  let c: *Checker = __builtin_alloca(64) as *Checker
+  let scope: *Scope = __builtin_alloca(64) as *Scope
+  (*scope).symbols = 0 as *Symbol
+  (*scope).parent = 0 as *Scope
+  (*scope).depth = 0
+  (*c).current = scope
+  (*c).errors = 0
+
+  let name: *i8 = __builtin_alloca(5) as *i8
+  *(name + 0) = 98 as i8   # 'b'
+  *(name + 1) = 111 as i8  # 'o'
+  *(name + 2) = 111 as i8  # 'o'
+  *(name + 3) = 108 as i8  # 'l'
+
+  let ty: *Type = resolve_type_named(c, name, 4)
+  assert (*ty).kind == TY_BOOL
+  assert (*c).errors == 0
+  0
+
+@test
+fn test_resolve_type_unknown() -> i32
+  let c: *Checker = __builtin_alloca(64) as *Checker
+  let scope: *Scope = __builtin_alloca(64) as *Scope
+  (*scope).symbols = 0 as *Symbol
+  (*scope).parent = 0 as *Scope
+  (*scope).depth = 0
+  (*c).current = scope
+  (*c).errors = 0
+
+  let name: *i8 = __builtin_alloca(8) as *i8
+  *(name + 0) = 85 as i8   # 'U'
+  *(name + 1) = 110 as i8  # 'n'
+  *(name + 2) = 107 as i8  # 'k'
+  *(name + 3) = 110 as i8  # 'n'
+  *(name + 4) = 111 as i8  # 'o'
+  *(name + 5) = 119 as i8  # 'w'
+  *(name + 6) = 110 as i8  # 'n'
+
+  let ty: *Type = resolve_type_named(c, name, 7)
+  assert (*ty).kind == TY_ERROR
+  assert (*c).errors == 1
+  0
+
+# ============================================================================
+# Tests - Expression Type Checking
+# ============================================================================
+
+@test
+fn test_check_expr_int_lit() -> i32
+  let c: *Checker = __builtin_alloca(64) as *Checker
+  let scope: *Scope = __builtin_alloca(64) as *Scope
+  (*scope).symbols = 0 as *Symbol
+  (*scope).parent = 0 as *Scope
+  (*scope).depth = 0
+  (*c).current = scope
+  (*c).errors = 0
+
+  let e: *Expr = __builtin_alloca(64) as *Expr
+  (*e).kind = EXPR_INT_LIT
+  (*e).val1 = 42
+
+  let ty: *Type = check_expr(c, e)
+  assert (*ty).kind == TY_I32
+  assert (*c).errors == 0
+  0
+
+@test
+fn test_check_expr_bool_lit() -> i32
+  let c: *Checker = __builtin_alloca(64) as *Checker
+  let scope: *Scope = __builtin_alloca(64) as *Scope
+  (*scope).symbols = 0 as *Symbol
+  (*scope).parent = 0 as *Scope
+  (*scope).depth = 0
+  (*c).current = scope
+  (*c).errors = 0
+
+  let e: *Expr = __builtin_alloca(64) as *Expr
+  (*e).kind = EXPR_BOOL_LIT
+  (*e).val1 = 1  # true
+
+  let ty: *Type = check_expr(c, e)
+  assert (*ty).kind == TY_BOOL
+  assert (*c).errors == 0
+  0
+
+@test
+fn test_check_expr_string_lit() -> i32
+  let c: *Checker = __builtin_alloca(64) as *Checker
+  let scope: *Scope = __builtin_alloca(64) as *Scope
+  (*scope).symbols = 0 as *Symbol
+  (*scope).parent = 0 as *Scope
+  (*scope).depth = 0
+  (*c).current = scope
+  (*c).errors = 0
+
+  let e: *Expr = __builtin_alloca(64) as *Expr
+  (*e).kind = EXPR_STRING_LIT
+
+  let ty: *Type = check_expr(c, e)
+  assert (*ty).kind == TY_PTR
+  assert (*(*ty).inner).kind == TY_I8
+  assert (*c).errors == 0
+  0
+
+@test
+fn test_check_expr_ident_found() -> i32
+  let c: *Checker = __builtin_alloca(64) as *Checker
+  let scope: *Scope = __builtin_alloca(64) as *Scope
+  (*scope).symbols = 0 as *Symbol
+  (*scope).parent = 0 as *Scope
+  (*scope).depth = 0
+  (*c).current = scope
+  (*c).errors = 0
+
+  # Add 'x' to scope with type i32
+  let name: *i8 = __builtin_alloca(4) as *i8
+  *(name + 0) = 120 as i8  # 'x'
+
+  let ty_i32: *Type = __builtin_alloca(128) as *Type
+  (*ty_i32).kind = TY_I32
+
+  let sym: *Symbol = __builtin_alloca(64) as *Symbol
+  (*sym).name = name
+  (*sym).name_len = 1
+  (*sym).kind = SYM_VAR
+  (*sym).ty = ty_i32
+  (*sym).is_mut = 0
+  (*sym).next = 0 as *Symbol
+  scope_insert(scope, sym)
+
+  # Create identifier expression for 'x'
+  let e: *Expr = __builtin_alloca(64) as *Expr
+  (*e).kind = EXPR_IDENT
+  (*e).val1 = name as i64
+  (*e).val2 = 1
+
+  let result_ty: *Type = check_expr(c, e)
+  assert (*result_ty).kind == TY_I32
+  assert (*c).errors == 0
+  0
+
+@test
+fn test_check_expr_ident_not_found() -> i32
+  let c: *Checker = __builtin_alloca(64) as *Checker
+  let scope: *Scope = __builtin_alloca(64) as *Scope
+  (*scope).symbols = 0 as *Symbol
+  (*scope).parent = 0 as *Scope
+  (*scope).depth = 0
+  (*c).current = scope
+  (*c).errors = 0
+
+  # Create identifier expression for 'y' (not in scope)
+  let name: *i8 = __builtin_alloca(4) as *i8
+  *(name + 0) = 121 as i8  # 'y'
+
+  let e: *Expr = __builtin_alloca(64) as *Expr
+  (*e).kind = EXPR_IDENT
+  (*e).val1 = name as i64
+  (*e).val2 = 1
+
+  let result_ty: *Type = check_expr(c, e)
+  assert (*result_ty).kind == TY_ERROR
+  assert (*c).errors == 1
+  0
+
+@test
+fn test_check_expr_paren() -> i32
+  let c: *Checker = __builtin_alloca(64) as *Checker
+  let scope: *Scope = __builtin_alloca(64) as *Scope
+  (*scope).symbols = 0 as *Symbol
+  (*scope).parent = 0 as *Scope
+  (*scope).depth = 0
+  (*c).current = scope
+  (*c).errors = 0
+
+  # (42) - parenthesized int literal
+  let inner: *Expr = __builtin_alloca(64) as *Expr
+  (*inner).kind = EXPR_INT_LIT
+  (*inner).val1 = 42
+
+  let e: *Expr = __builtin_alloca(64) as *Expr
+  (*e).kind = EXPR_PAREN
+  (*e).left = inner as *i32
+
+  let ty: *Type = check_expr(c, e)
+  assert (*ty).kind == TY_I32
+  assert (*c).errors == 0
+  0
+
+# ============================================================================
+# Tests - Scope Lookup Integration
+# ============================================================================
+
+@test
+fn test_check_expr_ident_parent_scope() -> i32
+  # Lookup identifier in parent scope
+  let global: *Scope = __builtin_alloca(64) as *Scope
+  (*global).symbols = 0 as *Symbol
+  (*global).parent = 0 as *Scope
+  (*global).depth = 0
+
+  let local: *Scope = __builtin_alloca(64) as *Scope
+  (*local).symbols = 0 as *Symbol
+  (*local).parent = global
+  (*local).depth = 1
+
+  # Add 'x' to global scope
+  let name: *i8 = __builtin_alloca(4) as *i8
+  *(name + 0) = 120 as i8  # 'x'
+
+  let ty_i32: *Type = __builtin_alloca(128) as *Type
+  (*ty_i32).kind = TY_I32
+
+  let sym: *Symbol = __builtin_alloca(64) as *Symbol
+  (*sym).name = name
+  (*sym).name_len = 1
+  (*sym).kind = SYM_VAR
+  (*sym).ty = ty_i32
+  (*sym).is_mut = 0
+  (*sym).next = 0 as *Symbol
+  scope_insert(global, sym)
+
+  let c: *Checker = __builtin_alloca(64) as *Checker
+  (*c).current = local  # Current scope is local, not global
+  (*c).errors = 0
+
+  # Create identifier expression for 'x'
+  let e: *Expr = __builtin_alloca(64) as *Expr
+  (*e).kind = EXPR_IDENT
+  (*e).val1 = name as i64
+  (*e).val2 = 1
+
+  let result_ty: *Type = check_expr(c, e)
+  assert (*result_ty).kind == TY_I32
+  assert (*c).errors == 0
+  0

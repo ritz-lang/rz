@@ -1,0 +1,250 @@
+# lib/server.ritz - Tome Server integration with TaskServer
+#
+# Combines RESP protocol, command dispatcher, and TaskServer
+# for high-performance async I/O using io_uring.
+#
+# Architecture:
+#   - Single process, async event loop
+#   - io_uring for non-blocking I/O
+#   - Connection handlers as coroutines
+#
+# Usage:
+#   var server: TomeServer
+#   tome_server_init(@server, 6379)
+#   tome_server_run(@server)
+
+import ritzlib.memory
+import ritzlib.str
+import ritzlib.string
+import ritzlib.strview
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.uring
+import ritzlib.async_net
+import ritzlib.async_tasks
+import lib.tome
+import lib.resp
+import lib.commands
+
+
+# ============================================================================
+# Handler States
+# ============================================================================
+
+const STATE_RECV: i32 = 0
+const STATE_SEND: i32 = 1
+
+
+# ============================================================================
+# Connection State
+# ============================================================================
+# Per-connection state for authentication tracking.
+# Allocated when connection is established, freed when connection closes.
+
+pub struct ConnectionState
+    is_authenticated: i32    # 1 if client has successfully AUTH'd
+
+
+# Initialize connection state
+pub fn conn_state_init(state: *ConnectionState)
+    state.is_authenticated = 0
+
+
+# ============================================================================
+# Global Configuration
+# ============================================================================
+
+var g_password: *u8       # Required password (null = no auth required)
+
+
+# Set server password (call before accepting connections)
+pub fn tome_server_set_password(password: *u8)
+    g_password = password
+
+
+# ============================================================================
+# Global Store
+# ============================================================================
+# Single shared store for all connections.
+# In a multi-process model, each worker would have its own store,
+# or use shared memory (Phase 11).
+
+var g_store: Store
+
+
+# ============================================================================
+# Connection Handler
+# ============================================================================
+# State machine for handling a single client connection.
+# Called by TaskServer when I/O completes.
+#
+# Per-connection authentication state is stored in task.user_data.
+# Allocated on first call, freed when connection closes.
+
+# Helper: Get or create per-connection state
+fn get_conn_state(task: *Task) -> *ConnectionState
+    if task.user_data == null
+        # Allocate new connection state
+        let state: *ConnectionState = malloc(16) as *ConnectionState  # sizeof(ConnectionState)
+        conn_state_init(state)
+        task.user_data = state as *u8
+        return state
+    return task.user_data as *ConnectionState
+
+
+# Helper: Free per-connection state
+fn free_conn_state(task: *Task)
+    if task.user_data != null
+        free(task.user_data)
+        task.user_data = null
+
+
+fn handle_connection(task: *Task) -> i32
+    if task.handler_state == STATE_RECV
+        # Check if recv completed
+        if task.io_result <= 0
+            # Connection closed or error - free connection state
+            free_conn_state(task)
+            return 0  # Complete task
+
+        # Parse the received data
+        task.read_len = task.io_result
+
+        var parser: RespParser
+        resp_parser_init(@parser, @task.read_buf[0], task.read_len as i64)
+
+        let parse_result: i32 = resp_parse(@parser)
+        if parse_result == RESP_INCOMPLETE
+            # Need more data - submit another recv
+            return task_recv(task)
+
+        if parse_result == RESP_ERROR_PARSE
+            # Protocol error - send error and close
+            let err_msg: StrView = "ERR protocol error"
+            let err_len: i32 = resp_write_error_sv(@task.write_buf[0], @err_msg)
+            task.handler_state = STATE_SEND
+            return task_send(task, err_len)
+
+        # Get per-connection auth state
+        let conn_state: *ConnectionState = get_conn_state(task)
+
+        # Execute the command with auth context
+        var ctx: CommandContext
+        cmd_ctx_init_auth(@ctx, @g_store, @task.write_buf[0], TASK_BUFFER_SIZE, g_password, conn_state.is_authenticated)
+        cmd_dispatch(@ctx, @parser.command)
+
+        # Update connection state with any auth changes (AUTH command sets this)
+        conn_state.is_authenticated = ctx.is_authenticated
+
+        # Send response
+        task.handler_state = STATE_SEND
+        return task_send(task, ctx.resp_len)
+
+    else if task.handler_state == STATE_SEND
+        # Check if send completed
+        if task.io_result <= 0
+            # Send error - free connection state
+            free_conn_state(task)
+            return 0  # Complete task
+
+        # Send complete, ready for next command (keep-alive)
+        task.request_count += 1
+        return task_reset_for_recv(task)
+
+    # Unknown state - free connection state and close
+    free_conn_state(task)
+    return 0
+
+
+# ============================================================================
+# Server Initialization
+# ============================================================================
+
+struct TomeServer
+    task_server: TaskServer
+    port: i32
+    listen_fd: i32
+
+
+# Create and configure a listening socket
+fn server_create_listen_socket(port: i32) -> i32
+    # Create TCP socket
+    let fd: i32 = tcp_socket()
+    if fd < 0
+        return fd
+
+    # Set socket options
+    set_reuseaddr(fd)
+    set_reuseport(fd)
+
+    # Bind to all interfaces on the specified port
+    let bind_ret: i32 = tcp_bind(fd, 0, port)
+    if bind_ret < 0
+        sys_close(fd)
+        return bind_ret
+
+    # Start listening with a backlog of 128
+    let listen_ret: i32 = tcp_listen(fd, 128)
+    if listen_ret < 0
+        sys_close(fd)
+        return listen_ret
+
+    return fd
+
+
+pub fn tome_server_init(srv: *TomeServer, port: i32) -> i32
+    srv.port = port
+
+    # Initialize global store
+    g_store = store_new()
+
+    # Create listening socket
+    let listen_fd: i32 = server_create_listen_socket(port)
+    if listen_fd < 0
+        return listen_fd
+    srv.listen_fd = listen_fd
+
+    # Initialize task server
+    let ret: i32 = task_server_init(@srv.task_server, listen_fd)
+    if ret < 0
+        sys_close(listen_fd)
+        return ret
+
+    # Set idle timeout (close connections idle for 60 seconds)
+    task_server_set_idle_timeout(@srv.task_server, 60)
+
+    return 0
+
+
+# Initialize with an existing listen socket (for multi-process workers)
+pub fn tome_server_init_with_fd(srv: *TomeServer, port: i32, listen_fd: i32) -> i32
+    srv.port = port
+    srv.listen_fd = listen_fd
+
+    # Initialize global store (each worker has its own store)
+    g_store = store_new()
+
+    # Initialize task server with inherited listen fd
+    let ret: i32 = task_server_init(@srv.task_server, listen_fd)
+    if ret < 0
+        return ret
+
+    # Set idle timeout (close connections idle for 60 seconds)
+    task_server_set_idle_timeout(@srv.task_server, 60)
+
+    return 0
+
+
+# Run the server (blocking)
+pub fn tome_server_run(srv: *TomeServer) -> i32
+    return task_server_run_multishot(@srv.task_server, handle_connection)
+
+
+# Stop the server
+pub fn tome_server_stop(srv: *TomeServer)
+    task_server_stop(@srv.task_server)
+
+
+# Cleanup
+pub fn tome_server_destroy(srv: *TomeServer)
+    task_server_destroy(@srv.task_server)

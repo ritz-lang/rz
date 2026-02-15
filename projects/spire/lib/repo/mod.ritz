@@ -1,0 +1,173 @@
+# spire/repo/mod.ritz
+#
+# Repository module - Data access abstraction
+#
+# Repositories provide a clean interface between services and storage.
+# This abstraction allows:
+# - Swapping storage backends (Mausoleum, Tome, Mock)
+# - Easy testing with mock implementations
+# - Clear separation of concerns
+#
+# Example:
+#
+#   trait TaskRepository
+#       fn find(self: *Self, id: *Uuid) -> Option<Task>
+#       fn create(self: @mut Self, task: *Task) -> Result<Task, RepoError>
+#
+#   struct MausoleumTaskRepo
+#       db: Db
+#
+#   impl TaskRepository for MausoleumTaskRepo
+#       fn find(self: *MausoleumTaskRepo, id: *Uuid) -> Option<Task>
+#           # query db...
+
+import ritzlib.option
+import ritzlib.strview { StrView }
+import ritzlib.string { String, string_from_strview }
+import ritzlib.gvec { Vec, vec_new }
+
+import lib.model.uuid { Uuid }
+import lib.utils { string_as_strview }
+
+# ============================================================================
+# Repository Errors
+# ============================================================================
+
+pub enum RepoError
+    NotFound(String)
+    DuplicateKey(String)
+    ConnectionFailed(String)
+    QueryFailed(String)
+    TransactionFailed(String)
+    ValidationFailed(String)
+
+pub fn repo_error_message(err: *RepoError) -> StrView
+    match *err
+        NotFound(msg) => string_as_strview(@msg)
+        DuplicateKey(msg) => string_as_strview(@msg)
+        ConnectionFailed(msg) => string_as_strview(@msg)
+        QueryFailed(msg) => string_as_strview(@msg)
+        TransactionFailed(msg) => string_as_strview(@msg)
+        ValidationFailed(msg) => string_as_strview(@msg)
+
+pub fn repo_error_not_found(msg: *StrView) -> RepoError
+    return NotFound(string_from_strview(msg))
+
+pub fn repo_error_duplicate(msg: *StrView) -> RepoError
+    return DuplicateKey(string_from_strview(msg))
+
+pub fn repo_error_query(msg: *StrView) -> RepoError
+    return QueryFailed(string_from_strview(msg))
+
+pub fn repo_error_connection(msg: *StrView) -> RepoError
+    return ConnectionFailed(string_from_strview(msg))
+
+pub fn repo_error_transaction(msg: *StrView) -> RepoError
+    return TransactionFailed(string_from_strview(msg))
+
+pub fn repo_error_validation(msg: *StrView) -> RepoError
+    return ValidationFailed(string_from_strview(msg))
+
+# ============================================================================
+# Query Builder (interface for storage backends)
+# ============================================================================
+
+# Sort direction
+pub enum SortDir
+    Asc
+    Desc
+
+# Query represents a database query being built
+# This is an interface - implementations live in storage backends
+pub struct Query<T>
+    table: String
+    conditions: Vec<Condition>
+    order_by: Option<OrderBy>
+    limit_val: Option<i64>
+    offset_val: Option<i64>
+
+pub struct Condition
+    field: String
+    op: ConditionOp
+    value: String  # Serialized value
+
+pub enum ConditionOp
+    Eq
+    NotEq
+    Lt
+    Lte
+    Gt
+    Gte
+    Like
+    In
+
+pub struct OrderBy
+    field: String
+    direction: SortDir
+
+# Create a new query for table
+pub fn query_new<T>(table: *StrView) -> Query<T>
+    var q: Query<T>
+    q.table = string_from_strview(table)
+    q.conditions = vec_new<Condition>()
+    q.order_by = None
+    q.limit_val = None
+    q.offset_val = None
+    return q
+
+# ============================================================================
+# Base Repository Trait
+# ============================================================================
+#
+# Note: Ritz doesn't have trait generics fully working yet.
+# For now, repositories are concrete per-model.
+# When trait generics work, we can have:
+#
+#   trait Repository<T>
+#       fn find(self: *Self, id: *Uuid) -> Option<T>
+#       fn find_all(self: *Self) -> Vec<T>
+#       fn create(self: @mut Self, item: *T) -> Result<T, RepoError>
+#       fn update(self: @mut Self, item: *T) -> Result<T, RepoError>
+#       fn delete(self: @mut Self, id: *Uuid) -> Result<(), RepoError>
+#
+# For now, define concrete repository traits per model type.
+# Example in your app:
+#
+#   trait TaskRepository
+#       fn find(self: *Self, id: *Uuid) -> Option<Task>
+#       fn find_by_user(self: *Self, user_id: *Uuid) -> Vec<Task>
+#       fn create(self: @mut Self, task: *Task) -> Result<Task, RepoError>
+#       fn update(self: @mut Self, task: *Task) -> Result<Task, RepoError>
+#       fn delete(self: @mut Self, id: *Uuid) -> Result<(), RepoError>
+
+# ============================================================================
+# Mock Repository Helpers
+# ============================================================================
+
+# For testing, you can create mock repositories.
+# Example pattern:
+#
+#   struct MockTaskRepo
+#       tasks: Vec<Task>
+#       next_error: Option<RepoError>
+#
+#   impl TaskRepository for MockTaskRepo
+#       fn find(self: *MockTaskRepo, id: *Uuid) -> Option<Task>
+#           var i: i64 = 0
+#           while i < vec_len<Task>(@self.tasks)
+#               let task: *Task = vec_get_ptr<Task>(@self.tasks, i)
+#               if uuid_eq(@task.id, id) == 1
+#                   return Some(*task)
+#               i += 1
+#           return None
+#
+#       fn create(self: @mut MockTaskRepo, task: *Task) -> Result<Task, RepoError>
+#           match self.next_error
+#               Some(err) =>
+#                   self.next_error = None
+#                   return Err(err)
+#               None =>
+#                   var t: Task = *task
+#                   t.id = uuid_new_v4()
+#                   vec_push<Task>(@self.tasks, t)
+#                   return Ok(t)

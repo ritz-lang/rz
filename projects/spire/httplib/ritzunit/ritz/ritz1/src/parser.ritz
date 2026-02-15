@@ -1,0 +1,1219 @@
+# ritz1/src/parser.ritz - Recursive Descent Parser
+#
+# Parses a token stream into an AST.
+# Uses recursive descent for simplicity and clarity.
+
+# Parser state
+struct Parser
+  tokens: *Token       # Array of tokens
+  token_count: i32
+  pos: i32             # Current position in token array
+  current: Token       # Current token
+  heap_base: *u8       # Base of mmap'd heap region
+  heap_offset: i64     # Current offset into heap
+
+# Initialize parser with token array and heap
+fn parser_init(p: *Parser, tokens: *Token, count: i32, heap_base: *u8)
+  p.tokens = tokens
+  p.token_count = count
+  p.pos = 0
+  p.heap_base = heap_base
+  p.heap_offset = 0
+  if count > 0
+    p.current = *tokens
+
+# Allocate from parser's heap
+fn parser_alloc(p: *Parser, size: i64) -> *u8
+  # Align to 8-byte boundary
+  var aligned_size: i64 = size
+  let remainder: i64 = size - (size / 8) * 8
+  if remainder != 0
+    aligned_size = size + (8 - remainder)
+
+  # Get current offset and bump it
+  let current_offset: i64 = p.heap_offset
+  p.heap_offset = current_offset + aligned_size
+
+  # Return pointer into heap
+  (p.heap_base as i64 + current_offset) as *u8
+
+# Parser error handling
+fn parser_error(p: *Parser, msg: *u8, msg_len: i64)
+  # Write error message to stderr
+  syscall3(1, 2, msg as i64, msg_len)  # SYS_WRITE, STDERR
+
+  # Write token info
+  let line_msg: *u8 = "\nAt line "
+  syscall3(1, 2, line_msg as i64, 9)
+
+  # TODO: Print actual line number
+  # For now, just exit
+
+  let newline: *u8 = "\n"
+  syscall3(1, 2, newline as i64, 1)
+
+  # Exit with error code
+  syscall1(60, 1)  # SYS_EXIT(1)
+
+# Advance to next token
+fn parser_advance(p: *Parser)
+  if p.pos + 1 < p.token_count
+    p.pos = p.pos + 1
+    p.current = *(p.tokens + p.pos)
+
+# Peek at current token kind
+fn parser_peek(p: *Parser) -> i32
+  p.current.kind
+
+# Check if current token matches kind
+fn parser_match(p: *Parser, kind: i32) -> i32
+  if p.current.kind == kind
+    parser_advance(p)
+    return 1
+  0
+
+# Expect a specific token kind, consume it
+fn parser_expect(p: *Parser, kind: i32) -> i32
+  if p.current.kind == kind
+    parser_advance(p)
+    return 1
+  # TODO: Error handling
+  0
+
+# Check if current token is identifier "mut" - for *mut T parsing
+fn parser_check_mut(p: *Parser) -> i32
+  if p.current.kind != TOK_IDENT
+    return 0
+  # Check if identifier is "mut" (3 chars)
+  if p.current.len != 3
+    return 0
+  let s: *u8 = p.current.start
+  if *s == 109 && *(s + 1) == 117 && *(s + 2) == 116  # 'm' 'u' 't'
+    return 1
+  0
+
+# Skip generic type arguments: <T>, <K, V>, <T, U, V>, etc.
+# Called after consuming a type identifier like Vec, Span, HashMap
+fn parser_skip_generic_args(p: *Parser)
+  # DEBUG: Print that we entered this function to stdout (fd 1)
+  let dbg1: *u8 = "[skip_generic kind="
+  syscall3(1, 1, dbg1 as i64, 19)
+  # Print kind as decimal
+  var k: i64 = p.current.kind as i64
+  if k >= 10
+    let d1: u8 = (48 + k / 10) as u8
+    syscall3(1, 1, &d1 as i64, 1)
+  let d2: u8 = (48 + k - (k / 10) * 10) as u8
+  syscall3(1, 1, &d2 as i64, 1)
+  let dbg2: *u8 = "]\n"
+  syscall3(1, 1, dbg2 as i64, 2)
+
+  if p.current.kind == TOK_LT
+    parser_advance(p)  # Consume <
+    # Skip tokens until we find matching >
+    # Handle nested generics like Vec<Option<T>>
+    var depth: i32 = 1
+    while depth > 0 && p.pos < p.token_count
+      if p.current.kind == TOK_LT
+        depth = depth + 1
+      else if p.current.kind == TOK_GT
+        depth = depth - 1
+        if depth == 0
+          parser_advance(p)  # Consume the final > only
+          return
+      parser_advance(p)
+
+# Parse postfix index operation: base[index]
+# Takes a base expression and parses [index], returns new EXPR_INDEX
+fn parser_parse_index_postfix(p: *Parser, base: *Expr) -> *Expr
+  parser_expect(p, TOK_LBRACKET)  # Consume [
+  let index: *Expr = parser_parse_expr(p)
+  parser_expect(p, TOK_RBRACKET)  # Consume ]
+
+  # Create index expression
+  let e: *Expr = parser_alloc(p, 256) as *Expr
+  *e = expr_int(0)  # Initialize
+  e.kind = EXPR_INDEX
+  # Inherit span from base expression
+  e.span.line = base.span.line
+  e.span.col = base.span.col
+  e.left = base    # Base expression
+  e.right = index  # Index expression
+  e
+
+# Parse postfix member access: base.field
+# Takes a base expression and parses .field, returns new EXPR_MEMBER
+fn parser_parse_member_postfix(p: *Parser, base: *Expr) -> *Expr
+  parser_expect(p, TOK_DOT)  # Consume .
+  let field_tok: Token = p.current
+  parser_expect(p, TOK_IDENT)  # Consume field name
+
+  # Create member access expression
+  let e: *Expr = parser_alloc(p, 256) as *Expr
+  *e = expr_int(0)  # Initialize
+  e.kind = EXPR_MEMBER
+  # Inherit span from base expression
+  e.span.line = base.span.line
+  e.span.col = base.span.col
+  e.left = base  # Base expression (e.g., *p in p.x)
+  e.ident_ptr = field_tok.start  # Field name
+  e.ident_len = field_tok.len
+  e
+
+# Parse primary expression: integer, identifier, or parenthesized expression
+fn parser_parse_primary(p: *Parser) -> *Expr
+  let tok: Token = p.current
+
+  # Integer literal
+  if tok.kind == TOK_NUMBER
+    parser_advance(p)
+    # Parse integer from token text
+    var val: i64 = 0
+    for i in 0..tok.len
+      let ch: i32 = *(tok.start + i) as i32
+      if ch >= 48 && ch <= 57  # '0'-'9'
+        val = val * 10 + (ch - 48)
+    # Allocate expression (Expr struct is ~100 bytes, allocate 256 to be safe)
+    let e: *Expr = parser_alloc(p, 256) as *Expr
+    *e = expr_int(val)
+    e.span.line = tok.line
+    e.span.col = tok.col
+    return e
+
+  # Identifier (or function call or struct literal or array index)
+  if tok.kind == TOK_IDENT
+    let name: *u8 = tok.start
+    let name_len: i32 = tok.len
+    parser_advance(p)
+
+    # Declare expression variable once for all branches
+    let e: *Expr = parser_alloc(p, 256) as *Expr
+
+    # Check for struct literal: Type { field: value, ... }
+    if p.current.kind == TOK_LBRACE
+      parser_advance(p)  # Consume {
+
+      # Skip INDENT tokens after opening brace
+      while p.current.kind == TOK_INDENT || p.current.kind == TOK_NEWLINE
+        parser_advance(p)
+
+      # Parse field initializers as linked list of expressions
+      var field_head: *Expr = 0
+      var field_tail: *Expr = 0
+
+      while p.current.kind != TOK_RBRACE && p.current.kind != TOK_EOF
+        # Skip INDENT/NEWLINE tokens
+        while p.current.kind == TOK_INDENT || p.current.kind == TOK_NEWLINE
+          parser_advance(p)
+
+        if p.current.kind == TOK_RBRACE
+          break
+
+        # Parse field_name: value
+        let field_tok: Token = p.current
+        parser_expect(p, TOK_IDENT)  # Field name
+        parser_expect(p, TOK_COLON)  # :
+
+        # Parse field value expression
+        let value: *Expr = parser_parse_expr(p)
+
+        # Create field initializer expression (reuse Expr struct)
+        let field: *Expr = parser_alloc(p, 256) as *Expr
+        *field = expr_int(0)
+        field.ident_ptr = field_tok.start   # Field name
+        field.ident_len = field_tok.len
+        field.operand = value               # Field value
+
+        # Add to linked list
+        if field_head == 0
+          field_head = field
+          field_tail = field
+        else
+          field_tail.next = field
+          field_tail = field
+
+        # Check for comma or closing brace
+        while p.current.kind == TOK_INDENT || p.current.kind == TOK_NEWLINE
+          parser_advance(p)
+
+        if p.current.kind == TOK_COMMA
+          parser_advance(p)
+        else if p.current.kind != TOK_RBRACE
+          break
+
+      # Skip DEDENT tokens before closing brace
+      while p.current.kind == TOK_DEDENT || p.current.kind == TOK_NEWLINE
+        parser_advance(p)
+
+      parser_expect(p, TOK_RBRACE)  # Consume }
+
+      # Create struct literal expression
+      *e = expr_int(0)
+      e.kind = EXPR_STRUCT_LIT
+      e.span.line = tok.line
+      e.span.col = tok.col
+      e.func_name = name        # Struct type name
+      e.func_name_len = name_len
+      e.args = field_head       # Field initializers
+
+      return e
+
+    # Check for function call
+    if p.current.kind == TOK_LPAREN
+      parser_advance(p)  # Consume (
+
+      # Parse comma-separated argument list
+      var args: *Expr = 0
+      var last_arg: *Expr = 0
+
+      if p.current.kind != TOK_RPAREN
+        # Parse first argument
+        args = parser_parse_expr(p)
+        last_arg = args
+
+        # Parse additional arguments separated by commas
+        while p.current.kind == TOK_COMMA
+          parser_advance(p)  # Consume comma
+          let next_arg: *Expr = parser_parse_expr(p)
+          last_arg.next = next_arg
+          last_arg = next_arg
+
+      parser_expect(p, TOK_RPAREN)
+
+      # Create function call expression
+      *e = expr_int(0)  # Placeholder
+      e.kind = EXPR_CALL
+      e.span.line = tok.line
+      e.span.col = tok.col
+      e.func_name = name
+      e.func_name_len = name_len
+      e.args = args
+    else
+      # Create identifier expression
+      *e = expr_ident(name, name_len)
+      e.span.line = tok.line
+      e.span.col = tok.col
+
+    # Check for postfix operations (index and member access)
+    var result: *Expr = e
+    while p.current.kind == TOK_LBRACKET || p.current.kind == TOK_DOT
+      if p.current.kind == TOK_LBRACKET
+        result = parser_parse_index_postfix(p, result)
+      else
+        result = parser_parse_member_postfix(p, result)
+
+    return result
+
+  # String literal
+  if tok.kind == TOK_STRING
+    parser_advance(p)
+    # String token includes quotes - skip them
+    # Token: "hello" -> start points to ", len includes both quotes
+    let str_start: *u8 = tok.start + 1  # Skip opening quote
+    let str_len: i32 = tok.len - 2       # Exclude both quotes
+    let e: *Expr = parser_alloc(p, 256) as *Expr
+    *e = expr_int(0)  # Initialize all fields
+    e.kind = EXPR_STRING_LIT
+    e.span.line = tok.line
+    e.span.col = tok.col
+    e.string_ptr = str_start
+    e.string_len = str_len
+
+    # Check for postfix operations after string literal
+    var result: *Expr = e
+    while p.current.kind == TOK_LBRACKET || p.current.kind == TOK_DOT
+      if p.current.kind == TOK_LBRACKET
+        result = parser_parse_index_postfix(p, result)
+      else
+        result = parser_parse_member_postfix(p, result)
+
+    return result
+
+  # Parenthesized expression
+  if tok.kind == TOK_LPAREN
+    parser_advance(p)  # Consume (
+    let e: *Expr = parser_parse_expr(p)
+    parser_expect(p, TOK_RPAREN)
+
+    # Check for postfix operations after parenthesized expression
+    var result: *Expr = e
+    while p.current.kind == TOK_LBRACKET || p.current.kind == TOK_DOT
+      if p.current.kind == TOK_LBRACKET
+        result = parser_parse_index_postfix(p, result)
+      else
+        result = parser_parse_member_postfix(p, result)
+
+    return result
+
+  # Unary operators: -, !
+  if tok.kind == TOK_MINUS
+    parser_advance(p)  # Consume -
+    let operand_expr: *Expr = parser_parse_primary(p)
+    let e: *Expr = parser_alloc(p, 256) as *Expr
+    *e = expr_int(0)
+    e.kind = EXPR_UNARY
+    e.span.line = tok.line
+    e.span.col = tok.col
+    e.op = OP_NEG
+    e.operand = operand_expr
+    return e
+
+  if tok.kind == TOK_BANG
+    parser_advance(p)  # Consume !
+    let operand_expr: *Expr = parser_parse_primary(p)
+    let e: *Expr = parser_alloc(p, 256) as *Expr
+    *e = expr_int(0)
+    e.kind = EXPR_UNARY
+    e.span.line = tok.line
+    e.span.col = tok.col
+    e.op = OP_NOT
+    e.operand = operand_expr
+    return e
+
+  # Dereference operator: *expr
+  if tok.kind == TOK_STAR
+    parser_advance(p)  # Consume *
+    let operand_expr: *Expr = parser_parse_primary(p)
+    let e: *Expr = parser_alloc(p, 256) as *Expr
+    *e = expr_int(0)
+    e.kind = EXPR_UNARY
+    e.span.line = tok.line
+    e.span.col = tok.col
+    e.op = OP_DEREF
+    e.operand = operand_expr
+    return e
+
+  # Nil literal (null pointer)
+  if tok.kind == TOK_NIL
+    parser_advance(p)
+    let e: *Expr = parser_alloc(p, 256) as *Expr
+    *e = expr_int(0)
+    e.kind = EXPR_NIL_LIT
+    e.span.line = tok.line
+    e.span.col = tok.col
+    return e
+
+  # Unexpected token - report error
+  let err_msg: *u8 = "Parser error: unexpected token in expression"
+  parser_error(p, err_msg, 45)
+  0  # Unreachable
+
+# Get operator precedence (higher number = higher precedence)
+fn get_precedence(op: i32) -> i32
+  if op == OP_MUL
+    return 6
+  if op == OP_DIV
+    return 6
+  if op == OP_MOD
+    return 6
+  if op == OP_ADD
+    return 5
+  if op == OP_SUB
+    return 5
+  if op == OP_LT
+    return 4
+  if op == OP_GT
+    return 4
+  if op == OP_LE
+    return 4
+  if op == OP_GE
+    return 4
+  if op == OP_EQ
+    return 3
+  if op == OP_NE
+    return 3
+  if op == OP_AND
+    return 2
+  if op == OP_OR
+    return 1
+  0  # Unknown operator
+
+# Parse binary expression with precedence climbing
+fn parser_parse_binary_prec(p: *Parser, min_prec: i32) -> *Expr
+  var left: *Expr = parser_parse_primary(p)
+
+  while 1
+    let op_kind: i32 = p.current.kind
+    var op: i32 = -1
+
+    if op_kind == TOK_PLUS
+      op = OP_ADD
+    else if op_kind == TOK_MINUS
+      op = OP_SUB
+    else if op_kind == TOK_STAR
+      op = OP_MUL
+    else if op_kind == TOK_SLASH
+      op = OP_DIV
+    else if op_kind == TOK_PERCENT
+      op = OP_MOD
+    else if op_kind == TOK_EQ_EQ
+      op = OP_EQ
+    else if op_kind == TOK_BANG_EQ
+      op = OP_NE
+    else if op_kind == TOK_LT
+      op = OP_LT
+    else if op_kind == TOK_GT
+      op = OP_GT
+    else if op_kind == TOK_LT_EQ
+      op = OP_LE
+    else if op_kind == TOK_GT_EQ
+      op = OP_GE
+    else if op_kind == TOK_AND_AND
+      op = OP_AND
+    else if op_kind == TOK_OR_OR
+      op = OP_OR
+
+    # Handle 'as' cast operator (highest precedence postfix)
+    if op_kind == TOK_AS
+      parser_advance(p)  # Consume 'as'
+      # Parse target type
+      var target_type: i32 = TYPE_I32
+      if parser_match(p, TOK_I32)
+        target_type = TYPE_I32
+      else if parser_match(p, TOK_I64)
+        target_type = TYPE_I64
+      else if parser_match(p, TOK_U8)
+        target_type = TYPE_U8
+      else if parser_match(p, TOK_BOOL)
+        target_type = TYPE_BOOL
+      else if parser_match(p, TOK_STAR)
+        # Pointer type *T
+        target_type = TYPE_PTR
+        # Consume base type
+        if p.current.kind == TOK_I32 || p.current.kind == TOK_I64 || p.current.kind == TOK_U8 || p.current.kind == TOK_BOOL || p.current.kind == TOK_IDENT
+          parser_advance(p)
+          parser_skip_generic_args(p)  # Skip <T> if present
+      # Create cast expression
+      # Reuse op field to store target type for EXPR_CAST
+      let cast_e: *Expr = parser_alloc(p, 256) as *Expr
+      *cast_e = expr_int(0)
+      cast_e.kind = EXPR_CAST
+      # Inherit span from left operand (where the expression starts)
+      cast_e.span.line = left.span.line
+      cast_e.span.col = left.span.col
+      cast_e.left = left
+      cast_e.op = target_type  # Store cast type in op field
+      left = cast_e
+      continue
+
+    if op < 0
+      break
+
+    let prec: i32 = get_precedence(op)
+    if prec < min_prec
+      break
+
+    parser_advance(p)  # Consume operator
+
+    # Recursively parse right side with higher precedence
+    let right: *Expr = parser_parse_binary_prec(p, prec + 1)
+
+    # Create binary expression
+    let e: *Expr = parser_alloc(p, 256) as *Expr
+    *e = expr_int(0)  # Placeholder
+    e.kind = EXPR_BINARY
+    # Inherit span from left operand (where the expression starts)
+    e.span.line = left.span.line
+    e.span.col = left.span.col
+    e.op = op
+    e.left = left
+    e.right = right
+    left = e
+
+  left
+
+# Parse binary expression with operators (wrapper for precedence climbing)
+fn parser_parse_binary(p: *Parser) -> *Expr
+  parser_parse_binary_prec(p, 0)
+
+# Parse expression (handles binary operations)
+fn parser_parse_expr(p: *Parser) -> *Expr
+  parser_parse_binary(p)
+
+# Parse return statement
+fn parser_parse_return(p: *Parser) -> *Stmt
+  let tok: Token = p.current  # Capture token before consuming
+  parser_expect(p, TOK_RETURN)  # Consume 'return'
+  let value: *Expr = parser_parse_expr(p)
+  let s: *Stmt = parser_alloc(p, 256) as *Stmt  # Heap allocate (outlives function scope)
+  *s = stmt_return(value)
+  s.span.line = tok.line
+  s.span.col = tok.col
+  s.next = 0  # Explicitly ensure next is NULL
+  s
+
+# Parse comparison expression: a < b, a == b, etc.
+fn parser_parse_comparison(p: *Parser) -> *Expr
+  # Parse full binary expression (includes comparisons)
+  parser_parse_binary(p)
+
+# Parse if statement
+fn parser_parse_if(p: *Parser) -> *Stmt
+  let tok: Token = p.current  # Capture token before consuming
+  parser_expect(p, TOK_IF)  # Consume 'if'
+
+  # Parse condition
+  let cond: *Expr = parser_parse_comparison(p)
+
+  # Skip newline after condition
+  if p.current.kind == TOK_NEWLINE
+    parser_advance(p)
+
+  # Parse then body
+  let then_body: *Stmt = parser_parse_body(p)
+
+  # Parse optional else
+  var else_body: *Stmt = 0
+  if p.current.kind == TOK_ELSE
+    parser_advance(p)
+    else_body = parser_parse_body(p)
+
+  let s: *Stmt = parser_alloc(p, 256) as *Stmt
+  *s = stmt_if(cond, then_body, else_body)
+  s.span.line = tok.line
+  s.span.col = tok.col
+  s
+
+# Parse while statement
+fn parser_parse_while(p: *Parser) -> *Stmt
+  let tok: Token = p.current  # Capture token before consuming
+  parser_expect(p, TOK_WHILE)  # Consume 'while'
+
+  # Parse condition
+  let cond: *Expr = parser_parse_comparison(p)
+
+  # Skip newline after condition
+  if p.current.kind == TOK_NEWLINE
+    parser_advance(p)
+
+  # Parse body
+  let body: *Stmt = parser_parse_body(p)
+
+  let s: *Stmt = parser_alloc(p, 256) as *Stmt
+  *s = stmt_while(cond, body)
+  s.span.line = tok.line
+  s.span.col = tok.col
+  s
+
+# Parse assignment: identifier = expression
+fn parser_parse_assignment(p: *Parser) -> *Stmt
+  # We need to check if this is really an assignment
+  # Lookahead to see if we have: IDENT = expr
+  let target_tok: Token = p.current
+  if target_tok.kind == TOK_IDENT
+    # Save current position for potential backtrack
+    let saved_pos: i32 = p.pos
+
+    parser_advance(p)  # Consume identifier
+
+    # Check for =
+    if p.current.kind == TOK_EQ
+      parser_advance(p)  # Consume =
+      let value: *Expr = parser_parse_expr(p)
+      # Create target expression from identifier token
+      let target: *Expr = parser_alloc(p, 256) as *Expr
+      *target = expr_ident(target_tok.start, target_tok.len)
+      target.span.line = target_tok.line
+      target.span.col = target_tok.col
+      let s: *Stmt = parser_alloc(p, 256) as *Stmt
+      *s = stmt_assign(target, value)
+      s.span.line = target_tok.line
+      s.span.col = target_tok.col
+      return s
+
+    # Not an assignment - restore position and parse as expression
+    p.pos = saved_pos
+    p.current = *(p.tokens + saved_pos)
+
+  # Parse as expression statement
+  let expr_tok: Token = p.current  # Capture token for span
+  let value: *Expr = parser_parse_expr(p)
+  let s: *Stmt = parser_alloc(p, 256) as *Stmt
+  *s = stmt_expr(value)
+  # Use the expression's span for the statement
+  s.span.line = value.span.line
+  s.span.col = value.span.col
+  return s
+
+# Parse variable declaration
+fn parser_parse_var_decl(p: *Parser) -> *Stmt
+  parser_expect(p, TOK_VAR)  # Consume 'var'
+
+  # Get variable name
+  let name_tok: Token = p.current
+  parser_expect(p, TOK_IDENT)
+
+  # Expect colon for type annotation
+  parser_expect(p, TOK_COLON)
+
+  # Parse type
+  var var_type: i32 = TYPE_I32  # Default
+  let type_tok: Token = p.current
+  if parser_match(p, TOK_I32)
+    var_type = TYPE_I32
+  else if parser_match(p, TOK_I64)
+    var_type = TYPE_I64
+  else if parser_match(p, TOK_U8)
+    var_type = TYPE_U8
+  else if parser_match(p, TOK_BOOL)
+    var_type = TYPE_BOOL
+  else if parser_match(p, TOK_STAR_STAR)
+    var_type = TYPE_PTR_PTR
+    if p.current.kind == TOK_I32 || p.current.kind == TOK_I64 || p.current.kind == TOK_U8 || p.current.kind == TOK_BOOL || p.current.kind == TOK_IDENT
+      parser_advance(p)
+      parser_skip_generic_args(p)  # Skip <T> if present
+  else if parser_match(p, TOK_STAR)
+    var_type = TYPE_PTR
+    # Skip optional 'mut' keyword for *mut T
+    if parser_check_mut(p) != 0
+      parser_advance(p)
+    if p.current.kind == TOK_I32 || p.current.kind == TOK_I64 || p.current.kind == TOK_U8 || p.current.kind == TOK_BOOL || p.current.kind == TOK_IDENT
+      parser_advance(p)
+      parser_skip_generic_args(p)  # Skip <T> if present
+
+  # Parse initialization (optional)
+  var init: *Expr = 0
+  if parser_match(p, TOK_EQ)
+    init = parser_parse_expr(p)
+
+  let s: *Stmt = parser_alloc(p, 256) as *Stmt
+  *s = stmt_var_decl(name_tok.start, name_tok.len, var_type, init)
+  s
+
+# Parse let declaration (immutable variable)
+fn parser_parse_let_decl(p: *Parser) -> *Stmt
+  parser_expect(p, TOK_LET)  # Consume 'let'
+
+  # Get variable name
+  let name_tok: Token = p.current
+  parser_expect(p, TOK_IDENT)
+
+  # Type annotation is optional for let
+  var var_type: i32 = TYPE_I32  # Default
+  if parser_match(p, TOK_COLON)
+    let type_tok: Token = p.current
+    if parser_match(p, TOK_I32)
+      var_type = TYPE_I32
+    else if parser_match(p, TOK_I64)
+      var_type = TYPE_I64
+    else if parser_match(p, TOK_U8)
+      var_type = TYPE_U8
+    else if parser_match(p, TOK_BOOL)
+      var_type = TYPE_BOOL
+    else if parser_match(p, TOK_STAR_STAR)
+      var_type = TYPE_PTR_PTR
+      if p.current.kind == TOK_I32 || p.current.kind == TOK_I64 || p.current.kind == TOK_U8 || p.current.kind == TOK_BOOL || p.current.kind == TOK_IDENT
+        parser_advance(p)
+        parser_skip_generic_args(p)  # Skip <T> if present
+    else if parser_match(p, TOK_STAR)
+      var_type = TYPE_PTR
+      # Skip optional 'mut' keyword for *mut T
+      if parser_check_mut(p) != 0
+        parser_advance(p)
+      if p.current.kind == TOK_I32 || p.current.kind == TOK_I64 || p.current.kind == TOK_U8 || p.current.kind == TOK_BOOL || p.current.kind == TOK_IDENT
+        parser_advance(p)
+        parser_skip_generic_args(p)  # Skip <T> if present
+
+  # Parse initialization (optional)
+  var init: *Expr = 0
+  if parser_match(p, TOK_EQ)
+    init = parser_parse_expr(p)
+
+  let s: *Stmt = parser_alloc(p, 256) as *Stmt
+  *s = stmt_var_decl(name_tok.start, name_tok.len, var_type, init)
+  s
+
+# Parse const declaration (top-level only)
+# Syntax: const NAME: TYPE = EXPR
+fn parser_parse_const(p: *Parser) -> *ConstEntry
+  parser_expect(p, TOK_CONST)
+
+  # Get const name
+  let name_tok: Token = p.current
+  parser_expect(p, TOK_IDENT)
+
+  # Expect colon for type
+  parser_expect(p, TOK_COLON)
+
+  # Parse type (i32, i64, u8)
+  var const_type: i32 = TYPE_I32
+  if parser_match(p, TOK_I32)
+    const_type = TYPE_I32
+  else if parser_match(p, TOK_I64)
+    const_type = TYPE_I64
+  else if parser_match(p, TOK_U8)
+    const_type = TYPE_U8
+  else
+    let err_msg: *u8 = "Parser error: const must have type i32, i64, or u8"
+    parser_error(p, err_msg, 51)
+    return 0
+
+  # Expect =
+  parser_expect(p, TOK_EQ)
+
+  # Parse value - must be an integer literal for now
+  if p.current.kind != TOK_NUMBER
+    let err_msg: *u8 = "Parser error: const value must be an integer literal"
+    parser_error(p, err_msg, 53)
+    return 0
+
+  # Parse the integer value
+  var value: i64 = 0
+  for i in 0..p.current.len
+    let c: i8 = *(p.current.start + i)
+    value = value * 10 + (c - '0')  # '0' = 48
+
+  parser_advance(p)
+
+  # Allocate and populate ConstEntry
+  let entry: *ConstEntry = parser_alloc(p, 256) as *ConstEntry
+  entry.name = name_tok.start
+  entry.name_len = name_tok.len
+  entry.const_type = const_type
+  entry.value = value
+  entry.next = 0
+  entry
+
+# Parse statement
+fn parser_parse_stmt(p: *Parser) -> *Stmt
+  let kind: i32 = parser_peek(p)
+
+  # Variable declaration
+  if kind == TOK_VAR
+    return parser_parse_var_decl(p)
+
+  # Let declaration
+  if kind == TOK_LET
+    return parser_parse_let_decl(p)
+
+  # Return statement
+  if kind == TOK_RETURN
+    return parser_parse_return(p)
+
+  # If statement
+  if kind == TOK_IF
+    return parser_parse_if(p)
+
+  # While statement
+  if kind == TOK_WHILE
+    return parser_parse_while(p)
+
+  # Const declaration - only allowed at top-level
+  if kind == TOK_CONST
+    let err_msg: *u8 = "Parser error: 'const' only allowed at top-level (before functions)"
+    parser_error(p, err_msg, 63)
+    return 0  # Unreachable
+
+  # Otherwise try to parse as assignment or expression
+  return parser_parse_assignment(p)
+
+# Parse function body (sequence of statements)
+fn parser_parse_body(p: *Parser) -> *Stmt
+  var head: *Stmt = 0
+  var tail: *Stmt = 0
+
+  # Skip INDENT token if present
+  if p.current.kind == TOK_INDENT
+    parser_advance(p)
+
+  # Parse statements until we hit EOF, DEDENT, or closing brace
+  while p.current.kind != TOK_EOF && p.current.kind != TOK_RBRACE && p.current.kind != TOK_DEDENT
+    # Skip newlines between statements
+    while p.current.kind == TOK_NEWLINE
+      parser_advance(p)
+
+    # Check again after skipping newlines
+    if p.current.kind == TOK_EOF || p.current.kind == TOK_RBRACE || p.current.kind == TOK_DEDENT
+      break
+
+    let s: *Stmt = parser_parse_stmt(p)
+    if s != 0
+      if head == 0
+        head = s
+        tail = s
+      else
+        tail.next = s
+        tail = s
+
+  # Skip DEDENT token if present
+  if p.current.kind == TOK_DEDENT
+    parser_advance(p)
+
+  head
+
+# Parse function definition
+# Parse function parameters
+fn parser_parse_params(p: *Parser) -> *Param
+  parser_expect(p, TOK_LPAREN)
+
+  var head: *Param = 0
+  var tail: *Param = 0
+
+  # Parse parameters until closing paren
+  while p.current.kind != TOK_RPAREN && p.current.kind != TOK_EOF
+    # Get parameter name
+    let name_tok: Token = p.current
+    parser_expect(p, TOK_IDENT)
+
+    # Expect colon for type
+    parser_expect(p, TOK_COLON)
+
+    # Parse type
+    var param_type: i32 = TYPE_I32
+    if parser_match(p, TOK_I32)
+      param_type = TYPE_I32
+    else if parser_match(p, TOK_I64)
+      param_type = TYPE_I64
+    else if parser_match(p, TOK_U8)
+      param_type = TYPE_U8
+    else if parser_match(p, TOK_BOOL)
+      param_type = TYPE_BOOL
+    else if parser_match(p, TOK_STAR_STAR)
+      # Pointer-to-pointer type (**T)
+      param_type = TYPE_PTR_PTR
+      # Consume base type (i8, u8, i32, i64, bool, or struct name like Vec<u8>)
+      if p.current.kind == TOK_I32 || p.current.kind == TOK_I64 || p.current.kind == TOK_U8 || p.current.kind == TOK_BOOL || p.current.kind == TOK_IDENT
+        parser_advance(p)
+        parser_skip_generic_args(p)  # Skip <T> if present
+    else if parser_match(p, TOK_STAR)
+      # Pointer type (*T or *mut T)
+      param_type = TYPE_PTR
+      # Skip optional 'mut' keyword for *mut T
+      if parser_check_mut(p) != 0
+        parser_advance(p)
+      # Consume base type (i8, u8, i32, i64, bool, or struct name like Vec<u8>)
+      if p.current.kind == TOK_I32 || p.current.kind == TOK_I64 || p.current.kind == TOK_U8 || p.current.kind == TOK_BOOL || p.current.kind == TOK_IDENT
+        parser_advance(p)
+        parser_skip_generic_args(p)  # Skip <T> if present
+
+    # Create parameter
+    let param: *Param = parser_alloc(p, 128) as *Param
+    param.name = name_tok.start
+    param.name_len = name_tok.len
+    param.param_type = param_type
+    param.next = 0
+
+    if head == 0
+      head = param
+      tail = param
+    else
+      tail.next = param
+      tail = param
+
+    # Check for comma (multiple params)
+    if p.current.kind == TOK_COMMA
+      parser_advance(p)
+
+  parser_expect(p, TOK_RPAREN)
+  head
+
+# Parse extern fn declaration (no body)
+fn parser_parse_extern_fn(p: *Parser) -> *FnDef
+  parser_expect(p, TOK_EXTERN)  # Consume 'extern'
+  parser_expect(p, TOK_FN)      # Consume 'fn'
+
+  # Get function name
+  let name_tok: Token = p.current
+  parser_expect(p, TOK_IDENT)
+
+  # Parse parameters
+  let params: *Param = parser_parse_params(p)
+
+  # Return type
+  var return_type: i32 = TYPE_I32  # Default
+  if parser_match(p, TOK_ARROW)
+    let type_tok: Token = p.current
+    if parser_match(p, TOK_I32)
+      return_type = TYPE_I32
+    else if parser_match(p, TOK_I64)
+      return_type = TYPE_I64
+    else if parser_match(p, TOK_U8)
+      return_type = TYPE_U8
+    else if parser_match(p, TOK_BOOL)
+      return_type = TYPE_BOOL
+    else if parser_match(p, TOK_STAR)
+      # Pointer type (*T)
+      return_type = TYPE_PTR
+      # Skip base type
+      if p.current.kind == TOK_I32 || p.current.kind == TOK_I64 || p.current.kind == TOK_U8 || p.current.kind == TOK_BOOL || p.current.kind == TOK_IDENT
+        parser_advance(p)
+        parser_skip_generic_args(p)  # Skip <T> if present
+    else if parser_match(p, TOK_IDENT)
+      # User-defined type (struct)
+      return_type = TYPE_PTR
+      parser_skip_generic_args(p)  # Skip <T> if present (e.g., Vec<u8>)
+
+  # Extern functions have no body
+  # Create function definition with null body
+  let f: *FnDef = parser_alloc(p, 256) as *FnDef
+  f.name = name_tok.start
+  f.name_len = name_tok.len
+  f.params = params
+  f.return_type = return_type
+  f.body = 0  # No body for extern functions
+  f.line = name_tok.line  # Store source line for DWARF debug info
+  f.next = 0
+
+  f
+
+fn parser_parse_fn(p: *Parser) -> *FnDef
+  parser_expect(p, TOK_FN)  # Consume 'fn'
+
+  # Get function name
+  let name_tok: Token = p.current
+  parser_expect(p, TOK_IDENT)
+
+  # Parse parameters
+  let params: *Param = parser_parse_params(p)
+
+  # Return type
+  var return_type: i32 = TYPE_I32  # Default
+  if parser_match(p, TOK_ARROW)
+    let type_tok: Token = p.current
+    if parser_match(p, TOK_I32)
+      return_type = TYPE_I32
+    else if parser_match(p, TOK_I64)
+      return_type = TYPE_I64
+    else if parser_match(p, TOK_U8)
+      return_type = TYPE_U8
+    else if parser_match(p, TOK_BOOL)
+      return_type = TYPE_BOOL
+    else if parser_match(p, TOK_IDENT)
+      # User-defined type (struct)
+      # For now, treat all user-defined types as TYPE_PTR
+      # TODO: Add proper struct type tracking
+      return_type = TYPE_PTR
+      parser_skip_generic_args(p)  # Skip <T> if present (e.g., Vec<u8>)
+
+  # Skip newline after signature
+  if p.current.kind == TOK_NEWLINE
+    parser_advance(p)
+
+  # Parse body
+  let body: *Stmt = parser_parse_body(p)
+
+  # Create function definition (allocate 256 bytes for FnDef struct)
+  let f: *FnDef = parser_alloc(p, 256) as *FnDef
+  f.name = name_tok.start
+  f.name_len = name_tok.len
+  f.params = params
+  f.return_type = return_type
+  f.body = body
+  f.line = name_tok.line  # Store source line for DWARF debug info
+  f.next = 0
+
+  f
+
+# Parse struct definition
+fn parser_parse_struct(p: *Parser) -> *StructDef
+  parser_expect(p, TOK_STRUCT)  # Consume 'struct'
+
+  # Get struct name
+  let name_tok: Token = p.current
+  parser_expect(p, TOK_IDENT)
+
+  # Skip newline after struct name
+  if p.current.kind == TOK_NEWLINE
+    parser_advance(p)
+
+  # Skip INDENT token if present
+  if p.current.kind == TOK_INDENT
+    parser_advance(p)
+
+  # Parse fields
+  var field_head: *StructField = 0
+  var field_tail: *StructField = 0
+
+  # Parse fields until DEDENT or EOF
+  while p.current.kind != TOK_DEDENT && p.current.kind != TOK_EOF
+    # Skip newlines between fields
+    while p.current.kind == TOK_NEWLINE
+      parser_advance(p)
+
+    # Check again after skipping newlines
+    if p.current.kind == TOK_DEDENT || p.current.kind == TOK_EOF
+      break
+
+    # Get field name
+    let field_tok: Token = p.current
+    parser_expect(p, TOK_IDENT)
+
+    # Expect colon for type
+    parser_expect(p, TOK_COLON)
+
+    # Parse field type
+    var field_type: i32 = TYPE_I32
+    if parser_match(p, TOK_I32)
+      field_type = TYPE_I32
+    else if parser_match(p, TOK_I64)
+      field_type = TYPE_I64
+    else if parser_match(p, TOK_U8)
+      field_type = TYPE_U8
+    else if parser_match(p, TOK_BOOL)
+      field_type = TYPE_BOOL
+    else if parser_match(p, TOK_STAR_STAR)
+      # Pointer-to-pointer type (**T)
+      field_type = TYPE_PTR_PTR
+      # Consume base type (i8, u8, i32, i64, bool, or struct name)
+      if p.current.kind == TOK_I32 || p.current.kind == TOK_I64 || p.current.kind == TOK_U8 || p.current.kind == TOK_BOOL || p.current.kind == TOK_IDENT
+        parser_advance(p)
+        parser_skip_generic_args(p)  # Skip <T> if present
+    else if parser_match(p, TOK_STAR)
+      # Pointer type (*T or *mut T)
+      field_type = TYPE_PTR
+      # Skip optional 'mut' keyword for *mut T
+      if parser_check_mut(p) != 0
+        parser_advance(p)
+      # Consume base type (i8, u8, i32, i64, bool, or struct name)
+      if p.current.kind == TOK_I32 || p.current.kind == TOK_I64 || p.current.kind == TOK_U8 || p.current.kind == TOK_BOOL || p.current.kind == TOK_IDENT
+        parser_advance(p)
+        parser_skip_generic_args(p)  # Skip <T> if present
+
+    # Create field and add to list
+    let field: *StructField = parser_alloc(p, 256) as *StructField
+    field.name = field_tok.start
+    field.name_len = field_tok.len
+    field.field_type = field_type
+    field.next = 0
+
+    if field_head == 0
+      field_head = field
+      field_tail = field
+    else
+      field_tail.next = field
+      field_tail = field
+
+    # Skip newline after field
+    if p.current.kind == TOK_NEWLINE
+      parser_advance(p)
+
+  # Skip DEDENT token if present
+  if p.current.kind == TOK_DEDENT
+    parser_advance(p)
+
+  # Create struct definition
+  let s: *StructDef = parser_alloc(p, 256) as *StructDef
+  s.name = name_tok.start
+  s.name_len = name_tok.len
+  s.fields = field_head
+  s.next = 0
+
+  s
+
+# Parse import statement: import foo.bar.baz
+fn parser_parse_import(p: *Parser) -> *ImportDecl
+  parser_expect(p, TOK_IMPORT)  # Consume 'import'
+
+  # Parse path segments separated by dots: ritzlib.sys
+  var path_head: *ImportPath = 0
+  var path_tail: *ImportPath = 0
+
+  # First segment is required
+  let first_tok: Token = p.current
+  if p.current.kind != TOK_IDENT
+    parser_error(p, "Parser error: expected identifier after 'import'\n", 49)
+    return 0
+  parser_advance(p)
+
+  # Create first path segment
+  let first_seg: *ImportPath = parser_alloc(p, 64) as *ImportPath
+  first_seg.segment = first_tok.start
+  first_seg.segment_len = first_tok.len
+  first_seg.next = 0
+  path_head = first_seg
+  path_tail = first_seg
+
+  # Parse additional segments: .foo .bar ...
+  while p.current.kind == TOK_DOT
+    parser_advance(p)  # Consume '.'
+
+    let seg_tok: Token = p.current
+    if p.current.kind != TOK_IDENT
+      parser_error(p, "Parser error: expected identifier after '.' in import\n", 52)
+      return 0
+    parser_advance(p)
+
+    # Create path segment
+    let seg: *ImportPath = parser_alloc(p, 64) as *ImportPath
+    seg.segment = seg_tok.start
+    seg.segment_len = seg_tok.len
+    seg.next = 0
+    path_tail.next = seg
+    path_tail = seg
+
+  # Create import declaration
+  let imp: *ImportDecl = parser_alloc(p, 64) as *ImportDecl
+  imp.path = path_head
+  imp.next = 0
+
+  imp
+
+# Parse module (struct, const, and function declarations in any order)
+fn parser_parse_module(p: *Parser) -> *Module
+  var import_head: *ImportDecl = 0
+  var import_tail: *ImportDecl = 0
+  var const_head: *ConstEntry = 0
+  var const_tail: *ConstEntry = 0
+  var struct_head: *StructDef = 0
+  var struct_tail: *StructDef = 0
+  var fn_head: *FnDef = 0
+  var fn_tail: *FnDef = 0
+
+  # Skip leading newlines
+  while p.current.kind == TOK_NEWLINE
+    parser_advance(p)
+
+  # Parse all top-level declarations (imports, structs, consts, and functions can be interleaved)
+  while p.current.kind != TOK_EOF
+    if p.current.kind == TOK_IMPORT
+      let i: *ImportDecl = parser_parse_import(p)
+      if import_head == 0
+        import_head = i
+        import_tail = i
+      else
+        import_tail.next = i
+        import_tail = i
+    else if p.current.kind == TOK_STRUCT
+      let s: *StructDef = parser_parse_struct(p)
+      if struct_head == 0
+        struct_head = s
+        struct_tail = s
+      else
+        struct_tail.next = s
+        struct_tail = s
+    else if p.current.kind == TOK_CONST
+      let c: *ConstEntry = parser_parse_const(p)
+      if const_head == 0
+        const_head = c
+        const_tail = c
+      else
+        const_tail.next = c
+        const_tail = c
+    else if p.current.kind == TOK_EXTERN
+      # extern fn ...
+      let f: *FnDef = parser_parse_extern_fn(p)
+      if fn_head == 0
+        fn_head = f
+        fn_tail = f
+      else
+        fn_tail.next = f
+        fn_tail = f
+    else if p.current.kind == TOK_FN
+      let f: *FnDef = parser_parse_fn(p)
+      if fn_head == 0
+        fn_head = f
+        fn_tail = f
+      else
+        fn_tail.next = f
+        fn_tail = f
+    else if p.current.kind == TOK_NEWLINE
+      parser_advance(p)
+    else
+      parser_advance(p)  # Skip unknown tokens
+
+  let m: *Module = parser_alloc(p, 256) as *Module  # Allocate 256 bytes for Module struct
+  m.imports = import_head
+  m.constants = const_head
+  m.structs = struct_head
+  m.functions = fn_head
+  m

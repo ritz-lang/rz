@@ -1,0 +1,187 @@
+# lib/traversal.ritz - Document tree and graph traversal
+#
+# Provides traversal operations for parent/child hierarchies and link graphs
+
+import ritzlib.sys
+import ritzlib.str
+
+import lib.m7m_types
+import lib.buffer_pool
+import lib.btree
+import lib.document
+import lib.collection
+
+# ============================================================================
+# Tree Traversal (Parent/Child relationships)
+# ============================================================================
+
+# Get all children of a document (documents whose parent_id matches)
+# Returns count in out_count, fills results array up to max_results
+pub fn get_children(col: *Collection, parent_id: *DocumentId, results: *DocumentId, max_results: i32, out_count: *i32) -> i32
+    if col == null or parent_id == null or results == null or out_count == null
+        return ERR_INVALID
+
+    *out_count = 0
+
+    # Scan all documents to find children
+    # TODO: Add secondary index for parent_id for O(1) lookup
+    var iter_ptr: *BTreeIter = btree_scan(col.tree, null, 0, null, 0)
+    if iter_ptr == null
+        return ERR_OK
+
+    var key: [8]u8
+    var val: [2048]u8
+    var key_len: i32 = 0
+    var val_len: i32 = 0
+
+    while btree_iter_valid(iter_ptr) == 1 and *out_count < max_results
+        key_len = 0
+        val_len = 0
+        btree_iter_key(iter_ptr, @key[0], @key_len)
+        btree_iter_value(iter_ptr, @val[0], @val_len)
+
+        # Deserialize to check parent
+        var doc: Document
+        if doc_deserialize(@val[0], val_len as i64, @doc) == ERR_OK
+            if doc_has_parent(@doc) == 1
+                var doc_parent: DocumentId = doc_get_parent(@doc)
+                if doc_id_eq(@doc_parent, parent_id) == 1
+                    # Found a child
+                    results[*out_count] = doc.id
+                    *out_count = *out_count + 1
+
+        btree_iter_next(iter_ptr)
+
+    btree_iter_destroy(iter_ptr)
+    return ERR_OK
+
+# Get all ancestors of a document (following parent chain to root)
+# Results are ordered: immediate parent first, then grandparent, etc.
+pub fn get_ancestors(col: *Collection, doc_id: *DocumentId, results: *DocumentId, max_results: i32, out_count: *i32) -> i32
+    if col == null or doc_id == null or results == null or out_count == null
+        return ERR_INVALID
+
+    *out_count = 0
+
+    # Start with the document
+    var current_id: DocumentId = *doc_id
+
+    while *out_count < max_results
+        # Get document
+        var doc: Document
+        var result: i32 = collection_get(col, @current_id, @doc)
+        if result != ERR_OK
+            break
+
+        # Check if it has a parent
+        if doc_has_parent(@doc) == 0
+            break
+
+        # Get parent and move to it
+        current_id = doc_get_parent(@doc)
+
+        # Add to results
+        results[*out_count] = current_id
+        *out_count = *out_count + 1
+
+    return ERR_OK
+
+# Get all descendants of a document (children, grandchildren, etc.)
+# Uses breadth-first traversal
+pub fn get_descendants(col: *Collection, root_id: *DocumentId, results: *DocumentId, max_results: i32, out_count: *i32) -> i32
+    if col == null or root_id == null or results == null or out_count == null
+        return ERR_INVALID
+
+    *out_count = 0
+
+    # Simple approach: keep a queue of nodes to process
+    # We reuse results array as the queue (items already added are processed)
+    var queue_start: i32 = 0
+
+    # First, add all direct children
+    var child_count: i32 = 0
+    get_children(col, root_id, results, max_results, @child_count)
+    *out_count = child_count
+
+    # Process queue
+    while queue_start < *out_count and *out_count < max_results
+        var current: DocumentId = results[queue_start]
+        queue_start = queue_start + 1
+
+        # Get children of current node
+        var children: [16]DocumentId
+        var cc: i32 = 0
+        get_children(col, @current, @children[0], 16, @cc)
+
+        # Add to results/queue
+        var i: i32 = 0
+        while i < cc and *out_count < max_results
+            results[*out_count] = children[i]
+            *out_count = *out_count + 1
+            i = i + 1
+
+    return ERR_OK
+
+# ============================================================================
+# Graph Traversal (Link relationships)
+# ============================================================================
+
+# Get all documents linked FROM this document with a specific label
+pub fn get_linked(col: *Collection, source_id: *DocumentId, label: *u8, results: *DocumentId, max_results: i32, out_count: *i32) -> i32
+    if col == null or source_id == null or label == null or results == null or out_count == null
+        return ERR_INVALID
+
+    *out_count = 0
+
+    # Get the source document
+    var doc: Document
+    var result: i32 = collection_get(col, source_id, @doc)
+    if result != ERR_OK
+        return result
+
+    # Iterate over links and find matching labels
+    var i: i32 = 0
+    while i < doc.link_count and *out_count < max_results
+        if strcmp(@doc.links[i].label[0], label) == 0
+            results[*out_count] = doc.links[i].target
+            *out_count = *out_count + 1
+        i = i + 1
+
+    return ERR_OK
+
+# Get all documents that link TO this document with a specific label (backlinks/reverse links)
+pub fn get_backlinks(col: *Collection, target_id: *DocumentId, label: *u8, results: *DocumentId, max_results: i32, out_count: *i32) -> i32
+    if col == null or target_id == null or label == null or results == null or out_count == null
+        return ERR_INVALID
+
+    *out_count = 0
+
+    # Scan all documents to find backlinks
+    # TODO: Add secondary index for link targets for O(1) lookup
+    var iter_ptr: *BTreeIter = btree_scan(col.tree, null, 0, null, 0)
+    if iter_ptr == null
+        return ERR_OK
+
+    var key: [8]u8
+    var val: [2048]u8
+    var key_len: i32 = 0
+    var val_len: i32 = 0
+
+    while btree_iter_valid(iter_ptr) == 1 and *out_count < max_results
+        key_len = 0
+        val_len = 0
+        btree_iter_key(iter_ptr, @key[0], @key_len)
+        btree_iter_value(iter_ptr, @val[0], @val_len)
+
+        # Deserialize to check links
+        var doc: Document
+        if doc_deserialize(@val[0], val_len as i64, @doc) == ERR_OK
+            # Check if this document links to target with the specified label
+            if doc_has_link(@doc, label, target_id) == 1
+                results[*out_count] = doc.id
+                *out_count = *out_count + 1
+
+        btree_iter_next(iter_ptr)
+
+    btree_iter_destroy(iter_ptr)
+    return ERR_OK

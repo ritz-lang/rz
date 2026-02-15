@@ -1,0 +1,581 @@
+# lib/index.ritz - Secondary Index Implementation
+#
+# Provides secondary indexes for faster queries on document fields:
+# - Index on any field (int, string, bool, etc.)
+# - B-tree backed for efficient range queries
+# - Automatic maintenance on document changes
+# - Unique index support
+# - Composite index support (multiple fields)
+#
+# Index Entry Format:
+#   Key: field_value (serialized)
+#   Value: document_id (8 bytes)
+#
+# For composite indexes:
+#   Key: field1_value or field2_value (concatenated)
+
+import ritzlib.sys
+import ritzlib.str
+import ritzlib.memory
+
+import lib.m7m_types
+import lib.buffer_pool
+import lib.btree
+import lib.document
+import lib.collection
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+# Maximum indexes per collection
+const MAX_INDEXES: i32 = 16
+
+# Maximum fields per composite index
+const MAX_INDEX_FIELDS: i32 = 4
+
+# Maximum field name length
+const MAX_FIELD_NAME: i32 = 64
+
+# Index flags
+const INDEX_FLAG_UNIQUE: i32 = 1
+const INDEX_FLAG_ACTIVE: i32 = 2
+
+# ============================================================================
+# IndexField - A field in an index
+# ============================================================================
+
+struct IndexField
+    name: [64]u8       # Field name
+    descending: i32    # 1 for DESC, 0 for ASC
+
+# ============================================================================
+# Index - A secondary index on a collection
+# ============================================================================
+
+struct Index
+    id: i32                     # Index ID within collection
+    name: [64]u8                # Index name
+    fields: [4]IndexField       # Fields in this index (MAX_INDEX_FIELDS)
+    field_count: i32            # Number of fields
+    flags: i32                  # INDEX_FLAG_*
+    tree: *BTree                # B-tree storing index entries
+    entry_count: i64            # Number of entries in index
+
+# ============================================================================
+# IndexManager - Manages indexes for a collection
+# ============================================================================
+
+struct IndexManager
+    pool: *BufferPool
+    collection: *Collection
+    indexes: [16]Index          # MAX_INDEXES
+    index_count: i32
+    next_index_id: i32
+
+# ============================================================================
+# Index Key Serialization
+# ============================================================================
+
+# Serialize a field value to a key buffer for indexing
+# Returns the number of bytes written, or -1 on error
+fn serialize_field_key(f: *Field, buf: *u8, buf_len: i32) -> i32
+    var pos: i32 = 0
+
+    # First byte: type tag
+    if pos >= buf_len
+        return -1
+    buf[pos] = f.ftype as u8
+    pos = pos + 1
+
+    if f.ftype == FIELD_NULL
+        # Just the type tag
+        return pos
+
+    if f.ftype == FIELD_INT or f.ftype == FIELD_BOOL or f.ftype == FIELD_FLOAT
+        # 8-byte value (big-endian for correct sort order)
+        if pos + 8 > buf_len
+            return -1
+
+        # For signed integers, flip sign bit for correct ordering
+        var val: i64 = f.int_val
+        if f.ftype == FIELD_INT
+            val = val ^ 0x8000000000000000  # Flip sign bit
+
+        var i: i32 = 7
+        while i >= 0
+            buf[pos + (7 - i)] = ((val >> (i * 8)) & 0xFF) as u8
+            i = i - 1
+        pos = pos + 8
+        return pos
+
+    if f.ftype == FIELD_STRING or f.ftype == FIELD_BYTES
+        # Length (2 bytes big-endian) + data
+        var len: i32 = f.len_val as i32
+        if len > 1024
+            len = 1024  # Cap at 1024 bytes for index keys
+
+        if pos + 2 + len > buf_len
+            return -1
+
+        buf[pos] = ((len >> 8) & 0xFF) as u8
+        buf[pos + 1] = (len & 0xFF) as u8
+        pos = pos + 2
+
+        if len > 0
+            memcpy(buf + pos, f.ptr_val, len as i64)
+            pos = pos + len
+        return pos
+
+    if f.ftype == FIELD_DOCREF
+        # 8-byte reference (big-endian)
+        if pos + 8 > buf_len
+            return -1
+        var i: i32 = 7
+        while i >= 0
+            buf[pos + (7 - i)] = ((f.ref_val >> (i * 8)) & 0xFF) as u8
+            i = i - 1
+        pos = pos + 8
+        return pos
+
+    return -1
+
+# Build an index key for a document based on index fields
+# Returns key length, or -1 on error
+fn build_index_key(idx: *Index, doc: *Document, buf: *u8, buf_len: i32) -> i32
+    var pos: i32 = 0
+
+    var i: i32 = 0
+    while i < idx.field_count
+        var field_name: *u8 = @idx.fields[i].name[0]
+        var field_val: Field
+        var err: i32 = doc_get_field(doc, field_name, @field_val)
+
+        if err != ERR_OK
+            # Field not present - use null
+            field_val = field_null()
+
+        var key_len: i32 = serialize_field_key(@field_val, buf + pos, buf_len - pos)
+        if key_len < 0
+            return -1
+
+        pos = pos + key_len
+        i = i + 1
+
+    return pos
+
+# ============================================================================
+# IndexManager Creation
+# ============================================================================
+
+pub fn index_manager_new(pool: *BufferPool, col: *Collection) -> *IndexManager
+    if pool == null or col == null
+        return null
+
+    var mgr: *IndexManager = malloc(sizeof(IndexManager)) as *IndexManager
+    if mgr == null
+        return null
+
+    mgr.pool = pool
+    mgr.collection = col
+    mgr.index_count = 0
+    mgr.next_index_id = 1
+
+    # Zero out indexes array
+    memset(@mgr.indexes[0], 0, (MAX_INDEXES * sizeof(Index)) as i64)
+
+    return mgr
+
+pub fn index_manager_destroy(mgr: *IndexManager)
+    if mgr == null
+        return
+
+    # Destroy all index B-trees
+    var i: i32 = 0
+    while i < mgr.index_count
+        if mgr.indexes[i].tree != null
+            btree_destroy(mgr.indexes[i].tree)
+        i = i + 1
+
+    free(mgr as *u8)
+
+# ============================================================================
+# Index Creation
+# ============================================================================
+
+# Create a single-field index
+pub fn index_create(mgr: *IndexManager, name: *u8, field: *u8, unique: i32) -> i32
+    if mgr == null or name == null or field == null
+        return ERR_INVALID
+
+    if mgr.index_count >= MAX_INDEXES
+        return ERR_FULL
+
+    # Check for duplicate name
+    var i: i32 = 0
+    while i < mgr.index_count
+        if strcmp(@mgr.indexes[i].name[0], name) == 0
+            return ERR_EXISTS
+        i = i + 1
+
+    # Create new index
+    var idx: *Index = @mgr.indexes[mgr.index_count]
+    idx.id = mgr.next_index_id
+    mgr.next_index_id = mgr.next_index_id + 1
+
+    strcpy(@idx.name[0], name)
+    strcpy(@idx.fields[0].name[0], field)
+    idx.fields[0].descending = 0
+    idx.field_count = 1
+
+    idx.flags = INDEX_FLAG_ACTIVE
+    if unique != 0
+        idx.flags = idx.flags | INDEX_FLAG_UNIQUE
+
+    # Create B-tree for index
+    idx.tree = btree_create(mgr.pool)
+    if idx.tree == null
+        return ERR_NO_MEMORY
+
+    idx.entry_count = 0
+    mgr.index_count = mgr.index_count + 1
+
+    # Build index from existing documents
+    var build_err: i32 = index_build(mgr, idx)
+    if build_err != ERR_OK
+        # Rollback
+        btree_destroy(idx.tree)
+        idx.tree = null
+        mgr.index_count = mgr.index_count - 1
+        return build_err
+
+    return ERR_OK
+
+# Create a composite index on multiple fields
+pub fn index_create_composite(mgr: *IndexManager, name: *u8, fields: **u8, field_count: i32, unique: i32) -> i32
+    if mgr == null or name == null or fields == null
+        return ERR_INVALID
+
+    if field_count <= 0 or field_count > MAX_INDEX_FIELDS
+        return ERR_INVALID
+
+    if mgr.index_count >= MAX_INDEXES
+        return ERR_FULL
+
+    # Check for duplicate name
+    var i: i32 = 0
+    while i < mgr.index_count
+        if strcmp(@mgr.indexes[i].name[0], name) == 0
+            return ERR_EXISTS
+        i = i + 1
+
+    # Create new index
+    var idx: *Index = @mgr.indexes[mgr.index_count]
+    idx.id = mgr.next_index_id
+    mgr.next_index_id = mgr.next_index_id + 1
+
+    strcpy(@idx.name[0], name)
+    idx.field_count = field_count
+
+    i = 0
+    while i < field_count
+        strcpy(@idx.fields[i].name[0], fields[i])
+        idx.fields[i].descending = 0
+        i = i + 1
+
+    idx.flags = INDEX_FLAG_ACTIVE
+    if unique != 0
+        idx.flags = idx.flags | INDEX_FLAG_UNIQUE
+
+    # Create B-tree for index
+    idx.tree = btree_create(mgr.pool)
+    if idx.tree == null
+        return ERR_NO_MEMORY
+
+    idx.entry_count = 0
+    mgr.index_count = mgr.index_count + 1
+
+    # Build index from existing documents
+    var build_err: i32 = index_build(mgr, idx)
+    if build_err != ERR_OK
+        btree_destroy(idx.tree)
+        idx.tree = null
+        mgr.index_count = mgr.index_count - 1
+        return build_err
+
+    return ERR_OK
+
+# Build index entries for all existing documents
+fn index_build(mgr: *IndexManager, idx: *Index) -> i32
+    # Scan all documents in the collection
+    var iter: *BTreeIter = btree_scan(mgr.collection.tree, null, 0, null, 0)
+    if iter == null
+        return ERR_OK  # Empty collection is fine
+
+    while btree_iter_valid(iter) != 0
+        # Get document
+        var val: [2048]u8
+        var val_len: i32 = 0
+        btree_iter_value(iter, @val[0], @val_len)
+
+        var doc: Document
+        var err: i32 = doc_deserialize(@val[0], val_len as i64, @doc)
+        if err == ERR_OK
+            # Build index key
+            var key: [256]u8
+            var key_len: i32 = build_index_key(idx, @doc, @key[0], 256)
+            if key_len > 0
+                # Check uniqueness if required
+                if (idx.flags & INDEX_FLAG_UNIQUE) != 0
+                    var existing_val: [8]u8
+                    var existing_len: i32 = 0
+                    var lookup: i32 = btree_get(idx.tree, @key[0], key_len, @existing_val[0], @existing_len)
+                    if lookup == ERR_OK
+                        btree_iter_destroy(iter)
+                        return ERR_EXISTS  # Duplicate value
+
+                # Insert into index: key -> doc_id
+                var doc_id_bytes: [8]u8
+                var doc_id_ptr: *i64 = @doc_id_bytes[0] as *i64
+                *doc_id_ptr = doc.id.value
+
+                err = btree_put(idx.tree, @key[0], key_len, @doc_id_bytes[0], 8)
+                if err == ERR_OK
+                    idx.entry_count = idx.entry_count + 1
+
+        btree_iter_next(iter)
+
+    btree_iter_destroy(iter)
+    return ERR_OK
+
+# ============================================================================
+# Index Deletion
+# ============================================================================
+
+pub fn index_drop(mgr: *IndexManager, name: *u8) -> i32
+    if mgr == null or name == null
+        return ERR_INVALID
+
+    # Find index by name
+    var idx_pos: i32 = -1
+    var i: i32 = 0
+    while i < mgr.index_count
+        if strcmp(@mgr.indexes[i].name[0], name) == 0
+            idx_pos = i
+            break
+        i = i + 1
+
+    if idx_pos < 0
+        return ERR_NOT_FOUND
+
+    # Destroy B-tree
+    if mgr.indexes[idx_pos].tree != null
+        btree_destroy(mgr.indexes[idx_pos].tree)
+
+    # Shift remaining indexes down
+    i = idx_pos
+    while i < mgr.index_count - 1
+        mgr.indexes[i] = mgr.indexes[i + 1]
+        i = i + 1
+
+    mgr.index_count = mgr.index_count - 1
+    return ERR_OK
+
+# ============================================================================
+# Index Lookup
+# ============================================================================
+
+# Find index by name
+pub fn index_get(mgr: *IndexManager, name: *u8) -> *Index
+    if mgr == null or name == null
+        return null
+
+    var i: i32 = 0
+    while i < mgr.index_count
+        if strcmp(@mgr.indexes[i].name[0], name) == 0
+            return @mgr.indexes[i]
+        i = i + 1
+
+    return null
+
+# Find index that can serve a query on a field
+pub fn index_find_for_field(mgr: *IndexManager, field: *u8) -> *Index
+    if mgr == null or field == null
+        return null
+
+    var i: i32 = 0
+    while i < mgr.index_count
+        var idx: *Index = @mgr.indexes[i]
+        # Check if this index's first field matches
+        if idx.field_count > 0
+            if strcmp(@idx.fields[0].name[0], field) == 0
+                return idx
+        i = i + 1
+
+    return null
+
+# ============================================================================
+# Index Maintenance
+# ============================================================================
+
+# Add a document to all indexes
+pub fn index_insert_doc(mgr: *IndexManager, doc: *Document) -> i32
+    if mgr == null or doc == null
+        return ERR_INVALID
+
+    var i: i32 = 0
+    while i < mgr.index_count
+        var idx: *Index = @mgr.indexes[i]
+
+        # Build index key
+        var key: [256]u8
+        var key_len: i32 = build_index_key(idx, doc, @key[0], 256)
+        if key_len <= 0
+            continue
+
+        # Check uniqueness if required
+        if (idx.flags & INDEX_FLAG_UNIQUE) != 0
+            var existing_val: [8]u8
+            var existing_len: i32 = 0
+            var lookup: i32 = btree_get(idx.tree, @key[0], key_len, @existing_val[0], @existing_len)
+            if lookup == ERR_OK
+                return ERR_EXISTS
+
+        # Insert into index
+        var doc_id_bytes: [8]u8
+        var doc_id_ptr: *i64 = @doc_id_bytes[0] as *i64
+        *doc_id_ptr = doc.id.value
+
+        var err: i32 = btree_put(idx.tree, @key[0], key_len, @doc_id_bytes[0], 8)
+        if err == ERR_OK
+            idx.entry_count = idx.entry_count + 1
+
+        i = i + 1
+
+    return ERR_OK
+
+# Remove a document from all indexes
+pub fn index_delete_doc(mgr: *IndexManager, doc: *Document) -> i32
+    if mgr == null or doc == null
+        return ERR_INVALID
+
+    var i: i32 = 0
+    while i < mgr.index_count
+        var idx: *Index = @mgr.indexes[i]
+
+        # Build index key
+        var key: [256]u8
+        var key_len: i32 = build_index_key(idx, doc, @key[0], 256)
+        if key_len <= 0
+            continue
+
+        # Delete from index
+        var err: i32 = btree_delete(idx.tree, @key[0], key_len)
+        if err == ERR_OK
+            idx.entry_count = idx.entry_count - 1
+
+        i = i + 1
+
+    return ERR_OK
+
+# Update a document in all indexes (delete old entry, insert new)
+pub fn index_update_doc(mgr: *IndexManager, old_doc: *Document, new_doc: *Document) -> i32
+    if mgr == null or old_doc == null or new_doc == null
+        return ERR_INVALID
+
+    # Remove old entries
+    index_delete_doc(mgr, old_doc)
+
+    # Insert new entries
+    return index_insert_doc(mgr, new_doc)
+
+# ============================================================================
+# Index Statistics
+# ============================================================================
+
+pub fn index_count(mgr: *IndexManager) -> i32
+    if mgr == null
+        return 0
+    return mgr.index_count
+
+pub fn index_entry_count(idx: *Index) -> i64
+    if idx == null
+        return 0
+    return idx.entry_count
+
+pub fn index_is_unique(idx: *Index) -> i32
+    if idx == null
+        return 0
+    if (idx.flags & INDEX_FLAG_UNIQUE) != 0
+        return 1
+    return 0
+
+pub fn index_field_count(idx: *Index) -> i32
+    if idx == null
+        return 0
+    return idx.field_count
+
+# ============================================================================
+# Index Scan
+# ============================================================================
+
+# Scan an index for a specific value
+# Returns iterator positioned at first matching entry
+pub fn index_scan_eq(idx: *Index, value: *Field) -> *BTreeIter
+    if idx == null or value == null
+        return null
+
+    # Build search key
+    var key: [256]u8
+    var key_len: i32 = serialize_field_key(value, @key[0], 256)
+    if key_len <= 0
+        return null
+
+    return btree_scan(idx.tree, @key[0], key_len, null, 0)
+
+# Scan an index for a range of values
+pub fn index_scan_range(idx: *Index, start: *Field, end: *Field) -> *BTreeIter
+    if idx == null
+        return null
+
+    var start_key: [256]u8
+    var start_len: i32 = 0
+    var end_key: [256]u8
+    var end_len: i32 = 0
+
+    if start != null
+        start_len = serialize_field_key(start, @start_key[0], 256)
+        if start_len < 0
+            start_len = 0
+
+    if end != null
+        end_len = serialize_field_key(end, @end_key[0], 256)
+        if end_len < 0
+            end_len = 0
+
+    var start_ptr: *u8 = null
+    var end_ptr: *u8 = null
+    if start_len > 0
+        start_ptr = @start_key[0]
+    if end_len > 0
+        end_ptr = @end_key[0]
+
+    return btree_scan(idx.tree, start_ptr, start_len, end_ptr, end_len)
+
+# Get document ID from current iterator position
+pub fn index_iter_doc_id(iter: *BTreeIter) -> DocumentId
+    var id: DocumentId
+    id.value = INVALID_DOC_ID
+
+    if iter == null
+        return id
+
+    var val: [8]u8
+    var val_len: i32 = 0
+    btree_iter_value(iter, @val[0], @val_len)
+
+    if val_len == 8
+        var id_ptr: *i64 = @val[0] as *i64
+        id.value = *id_ptr
+
+    return id

@@ -1,0 +1,256 @@
+# valet/lib/request.ritz - HTTP request parsing
+#
+# Zero-copy HTTP/1.1 request parser.
+# Parses directly from a u8 buffer without allocations.
+
+import ritzlib.io
+import ritzlib.str
+
+
+# ============================================================================
+# Error codes for request_parse()
+# ============================================================================
+
+# Return values from request_parse():
+#   > 0: Success, returns number of bytes consumed (including headers + CRLF)
+#   REQ_ERR_INCOMPLETE: Need more data (partial request)
+#   REQ_ERR_MALFORMED: Invalid HTTP request format
+#   REQ_ERR_TOO_LARGE: Request exceeds max_size limit
+const REQ_ERR_INCOMPLETE: i32 = -1      # Incomplete request, need more data
+const REQ_ERR_MALFORMED: i32 = -2       # Malformed HTTP request
+const REQ_ERR_TOO_LARGE: i32 = -3       # Request exceeds size limit
+
+
+# ============================================================================
+# HTTP Request
+# ============================================================================
+
+struct Request
+    # Request line components (pointers into raw buffer)
+    method_ptr: *u8
+    method_len: i32
+    path_ptr: *u8
+    path_len: i32
+    version_ptr: *u8
+    version_len: i32
+
+    # Headers end position (for body access)
+    headers_end: i32
+    content_length: i32
+
+    # Keep-alive flag
+    keep_alive: i32
+
+
+# Initialize a request struct
+pub fn request_init(req: *Request)
+    req.method_ptr = null
+    req.method_len = 0
+    req.path_ptr = null
+    req.path_len = 0
+    req.version_ptr = null
+    req.version_len = 0
+    req.headers_end = 0
+    req.content_length = 0
+    req.keep_alive = 0
+
+
+# Parse HTTP request from buffer
+# Returns bytes consumed on success, REQ_ERR_* on failure.
+#
+# SAFETY: This function performs raw pointer arithmetic on `buf`.
+# - Caller must ensure `buf` points to a valid buffer of at least `len` bytes
+# - Caller must ensure `len` accurately reflects the buffer size
+# - The returned Request contains pointers into `buf` - caller must keep `buf`
+#   alive and unmodified while using the Request
+# - All pointer accesses are bounds-checked against `len` before dereferencing
+pub fn request_parse(req: *Request, buf: *u8, len: i32) -> i32
+    if len < 14  # Minimum: "GET / HTTP/1.0\r\n\r\n"
+        return REQ_ERR_INCOMPLETE
+
+    var pos: i32 = 0
+
+    # Parse method
+    # SAFETY: pos is bounds-checked against len in the while condition
+    req.method_ptr = buf
+    while pos < len
+        if *(buf + pos) == ' '
+            req.method_len = pos
+            pos += 1
+            break
+        pos += 1
+
+    if pos >= len
+        return -1
+
+    # Parse path
+    req.path_ptr = buf + pos
+    let path_start: i32 = pos
+    while pos < len
+        if *(buf + pos) == ' '
+            req.path_len = pos - path_start
+            pos += 1
+            break
+        pos += 1
+
+    if pos >= len
+        return -1
+
+    # Parse version
+    req.version_ptr = buf + pos
+    let version_start: i32 = pos
+    while pos < len
+        if *(buf + pos) == '\r'
+            req.version_len = pos - version_start
+            break
+        pos += 1
+
+    if pos >= len
+        return -1
+
+    # Skip CRLF
+    if pos + 1 >= len
+        return -1
+    if *(buf + pos) != '\r' || *(buf + pos + 1) != '\n'
+        return -2  # Malformed
+    pos += 2
+
+    # Parse headers - look for end of headers and Content-Length
+    req.keep_alive = 1  # HTTP/1.1 default
+
+    while pos < len
+        # Check for end of headers
+        if *(buf + pos) == '\r'
+            if pos + 1 < len && *(buf + pos + 1) == '\n'
+                req.headers_end = pos + 2
+                return req.headers_end
+
+        # Simple header parsing - skip for now, just find end
+        while pos < len
+            if *(buf + pos) == '\r'
+                if pos + 1 < len && *(buf + pos + 1) == '\n'
+                    pos += 2
+                    break
+            pos += 1
+
+    return -1  # Incomplete - didn't find end of headers
+
+
+# Check if method matches
+pub fn request_is_get(req: *Request) -> i32
+    if req.method_len != 3
+        return 0
+    if *(req.method_ptr) != 'G'
+        return 0
+    if *(req.method_ptr + 1) != 'E'
+        return 0
+    if *(req.method_ptr + 2) != 'T'
+        return 0
+    return 1
+
+
+# Check if path matches (simple exact match)
+pub fn request_path_eq(req: *Request, path: *u8) -> i32
+    let path_len: i32 = strlen(path) as i32
+    if req.path_len != path_len
+        return 0
+
+    for i in 0..path_len
+        if *(req.path_ptr + i) != *(path + i)
+            return 0
+
+    return 1
+
+
+# ============================================================================
+# Request size validation
+# ============================================================================
+
+# Check if request buffer size is within limit
+# Returns 0 if OK, -3 if too large
+pub fn request_check_size(len: i32, max_size: i32) -> i32
+    if max_size > 0 && len > max_size
+        return -3  # Request too large
+    return 0
+
+
+# ============================================================================
+# Header search
+# ============================================================================
+
+# Header search result
+struct HeaderResult
+    found: i32       # 1 if header found, 0 otherwise
+    value_ptr: *u8   # Pointer to header value (after ": ")
+    value_len: i32   # Length of header value (excluding CRLF)
+
+
+# Find a header in the raw request buffer (case-insensitive)
+# buf: raw HTTP request buffer
+# buf_len: buffer length
+# name: header name to search for (e.g., "Range")
+# name_len: length of header name
+pub fn request_find_header(buf: *u8, buf_len: i32, name: *u8, name_len: i32) -> HeaderResult
+    var result: HeaderResult
+    result.found = 0
+    result.value_ptr = null
+    result.value_len = 0
+
+    # Find end of request line (first CRLF)
+    var pos: i32 = 0
+    while pos < buf_len - 1
+        if *(buf + pos) == '\r' && *(buf + pos + 1) == '\n'
+            pos += 2
+            break
+        pos += 1
+
+    # Search headers
+    while pos < buf_len - 1
+        # Check for end of headers
+        if *(buf + pos) == '\r' && *(buf + pos + 1) == '\n'
+            return result  # Not found
+
+        # Check if this header matches (case-insensitive)
+        var is_match: i32 = 1
+        if pos + name_len + 1 < buf_len
+            for i in 0..name_len
+                let c1: u8 = *(buf + pos + i)
+                let c2: u8 = *(name + i)
+                # Convert to lowercase for comparison
+                var l1: u8 = c1
+                var l2: u8 = c2
+                if l1 >= 'A' && l1 <= 'Z'
+                    l1 = l1 + 32
+                if l2 >= 'A' && l2 <= 'Z'
+                    l2 = l2 + 32
+                if l1 != l2
+                    is_match = 0
+                    break
+
+            # Check for ": " after header name
+            if is_match == 1 && *(buf + pos + name_len) == ':'
+                # Found header - skip ": " (colon and optional space)
+                let value_start: i32 = pos + name_len + 1
+                var vpos: i32 = value_start
+                # Skip leading whitespace
+                while vpos < buf_len && *(buf + vpos) == ' '
+                    vpos += 1
+
+                # Find end of header value (CRLF)
+                let actual_start: i32 = vpos
+                while vpos < buf_len - 1
+                    if *(buf + vpos) == '\r' && *(buf + vpos + 1) == '\n'
+                        result.found = 1
+                        result.value_ptr = buf + actual_start
+                        result.value_len = vpos - actual_start
+                        return result
+                    vpos += 1
+
+        # Skip to next line
+        while pos < buf_len - 1
+            if *(buf + pos) == '\r' && *(buf + pos + 1) == '\n'
+                pos += 2
+                break
+            pos += 1
+
+    return result

@@ -1,0 +1,415 @@
+# test/test_worker.ritz - Tests for worker protocol
+#
+# TDD: These tests define the expected behavior of the worker process
+# that connects to shared memory and processes requests.
+#
+# Worker lifecycle:
+#   1. Receive fd from parent (Valet)
+#   2. Attach to shared memory
+#   3. Enter serve loop
+#   4. Process requests, write responses
+#   5. Clean shutdown on signal
+
+import ritzlib.sys
+import ritzlib.io
+import helpers
+
+import lib.shm
+import lib.control
+import lib.ring
+import lib.arena
+import lib.worker
+
+# ============================================================================
+# Worker Context Tests
+# ============================================================================
+
+[[test]]
+fn test_worker_context_init() -> i32
+    # Create shared memory (Valet side)
+    var cfg: ShmConfig
+    shm_config_default(@cfg)
+
+    var region: ShmRegion
+    shm_create(@region, @cfg)
+
+    # Initialize worker context (Worker side)
+    var ctx: WorkerContext
+    let result: i32 = worker_init(@ctx, region.fd, region.size)
+    if result != 0
+        "FAIL: worker_init failed: {result}\n"
+        shm_destroy(@region)
+        return 1
+
+    # Verify context is properly set up
+    let result2: i32 = assert_not_null(ctx.region.base)
+    if result2 != 0
+        worker_destroy(@ctx)
+        shm_destroy(@region)
+        return result2
+
+    # Verify we can access the control block
+    let cb: *ControlBlock = worker_get_control_block(@ctx)
+    let result3: i32 = assert_not_null(cb as *u8)
+    if result3 != 0
+        worker_destroy(@ctx)
+        shm_destroy(@region)
+        return result3
+
+    worker_destroy(@ctx)
+    shm_destroy(@region)
+    return 0
+
+[[test]]
+fn test_worker_state_transitions() -> i32
+    var cfg: ShmConfig
+    shm_config_default(@cfg)
+
+    var region: ShmRegion
+    shm_create(@region, @cfg)
+
+    var ctx: WorkerContext
+    worker_init(@ctx, region.fd, region.size)
+
+    # Initial state should be IDLE
+    let cb: *ControlBlock = worker_get_control_block(@ctx)
+    let result: i32 = assert_eq_i32(cb.state, WORKER_STATE_IDLE)
+    if result != 0
+        worker_destroy(@ctx)
+        shm_destroy(@region)
+        return result
+
+    # Mark as running
+    worker_set_running(@ctx)
+    let result2: i32 = assert_eq_i32(cb.state, WORKER_STATE_RUNNING)
+    if result2 != 0
+        worker_destroy(@ctx)
+        shm_destroy(@region)
+        return result2
+
+    # Mark as busy (processing request)
+    worker_set_busy(@ctx)
+    let result3: i32 = assert_eq_i32(cb.state, WORKER_STATE_BUSY)
+    if result3 != 0
+        worker_destroy(@ctx)
+        shm_destroy(@region)
+        return result3
+
+    # Back to running
+    worker_set_running(@ctx)
+    let result4: i32 = assert_eq_i32(cb.state, WORKER_STATE_RUNNING)
+    if result4 != 0
+        worker_destroy(@ctx)
+        shm_destroy(@region)
+        return result4
+
+    worker_destroy(@ctx)
+    shm_destroy(@region)
+    return 0
+
+# ============================================================================
+# Request Processing Tests
+# ============================================================================
+
+[[test]]
+fn test_worker_poll_empty_ring() -> i32
+    var cfg: ShmConfig
+    shm_config_default(@cfg)
+
+    var region: ShmRegion
+    shm_create(@region, @cfg)
+
+    var ctx: WorkerContext
+    worker_init(@ctx, region.fd, region.size)
+
+    # Poll on empty ring should return null
+    let req: *RequestSlot = worker_poll_request(@ctx)
+    if req != null
+        "FAIL: expected null from empty ring\n"
+        worker_destroy(@ctx)
+        shm_destroy(@region)
+        return 1
+
+    worker_destroy(@ctx)
+    shm_destroy(@region)
+    return 0
+
+[[test]]
+fn test_worker_receive_request() -> i32
+    var cfg: ShmConfig
+    shm_config_default(@cfg)
+
+    var region: ShmRegion
+    shm_create(@region, @cfg)
+
+    # Valet side: write a request
+    let cb: *ControlBlock = shm_get_control_block(@region)
+    let req_ring: *RequestSlot = shm_get_request_ring(@region)
+
+    var arena: DataArena
+    shm_get_arena(@region, @arena)
+
+    # Write path to arena
+    let path: *u8 = data_arena_alloc(@arena, 16)
+    *path = 0x2F           # '/'
+    *(path + 1) = 0x61     # 'a'
+    *(path + 2) = 0x70     # 'p'
+    *(path + 3) = 0x69     # 'i'
+    *(path + 4) = 0x00     # null
+
+    let path_offset: i64 = data_arena_ptr_to_offset(@arena, path)
+
+    # Fill slot 0
+    let slot_idx: i64 = control_block_slot_index(cb, cb.req_write_idx)
+    let slot: *RequestSlot = req_ring + slot_idx
+    request_slot_init(slot)
+    slot.id = 1001
+    request_slot_set_method(slot, HTTP_METHOD_GET)
+    request_slot_set_path(slot, path_offset as u32, 4)
+    request_slot_add_flag(slot, REQ_FLAG_COMPLETE)
+
+    # Advance write index
+    control_block_req_write_inc(cb)
+
+    # Worker side: poll for request
+    var ctx: WorkerContext
+    worker_init(@ctx, region.fd, region.size)
+
+    let req: *RequestSlot = worker_poll_request(@ctx)
+    if req == null
+        "FAIL: expected request from ring\n"
+        worker_destroy(@ctx)
+        shm_destroy(@region)
+        return 1
+
+    # Verify request contents
+    let result: i32 = assert_eq_i64(req.id as i64, 1001)
+    if result != 0
+        worker_destroy(@ctx)
+        shm_destroy(@region)
+        return result
+
+    let result2: i32 = assert_eq_u8(req.method, HTTP_METHOD_GET)
+    if result2 != 0
+        worker_destroy(@ctx)
+        shm_destroy(@region)
+        return result2
+
+    worker_destroy(@ctx)
+    shm_destroy(@region)
+    return 0
+
+[[test]]
+fn test_worker_write_response() -> i32
+    var cfg: ShmConfig
+    shm_config_default(@cfg)
+
+    var region: ShmRegion
+    shm_create(@region, @cfg)
+
+    var ctx: WorkerContext
+    worker_init(@ctx, region.fd, region.size)
+
+    # Write a response
+    let resp: *ResponseSlot = worker_begin_response(@ctx, 42)
+    if resp == null
+        "FAIL: couldn't begin response\n"
+        worker_destroy(@ctx)
+        shm_destroy(@region)
+        return 1
+
+    response_slot_set_status(resp, 200)
+
+    # Write body to arena
+    var arena: DataArena
+    worker_get_arena(@ctx, @arena)
+
+    let body: *u8 = data_arena_alloc(@arena, 8)
+    *body = 0x48           # 'H'
+    *(body + 1) = 0x69     # 'i'
+    *(body + 2) = 0x21     # '!'
+    *(body + 3) = 0x00     # null
+
+    let body_offset: i64 = data_arena_ptr_to_offset(@arena, body)
+    response_slot_set_body(resp, body_offset as u32, 3)
+
+    # Commit response
+    worker_commit_response(@ctx)
+
+    # Valet side: check response ring
+    let cb: *ControlBlock = shm_get_control_block(@region)
+    let resp_count: i64 = control_block_resp_count(cb)
+    let result: i32 = assert_eq_i64(resp_count, 1)
+    if result != 0
+        worker_destroy(@ctx)
+        shm_destroy(@region)
+        return result
+
+    # Read response
+    let resp_ring: *ResponseSlot = shm_get_response_ring(@region)
+    let slot_idx: i64 = control_block_slot_index(cb, cb.resp_read_idx)
+    let resp_slot: *ResponseSlot = resp_ring + slot_idx
+
+    let result2: i32 = assert_eq_i64(resp_slot.id as i64, 42)
+    if result2 != 0
+        worker_destroy(@ctx)
+        shm_destroy(@region)
+        return result2
+
+    let result3: i32 = assert_eq_i32(resp_slot.status as i32, 200)
+    if result3 != 0
+        worker_destroy(@ctx)
+        shm_destroy(@region)
+        return result3
+
+    worker_destroy(@ctx)
+    shm_destroy(@region)
+    return 0
+
+[[test]]
+fn test_worker_request_response_roundtrip() -> i32
+    var cfg: ShmConfig
+    shm_config_default(@cfg)
+
+    var region: ShmRegion
+    shm_create(@region, @cfg)
+
+    # === Valet side: submit request ===
+    let cb: *ControlBlock = shm_get_control_block(@region)
+    let req_ring: *RequestSlot = shm_get_request_ring(@region)
+
+    var valet_arena: DataArena
+    shm_get_arena(@region, @valet_arena)
+
+    # Write request path
+    let path: *u8 = data_arena_alloc(@valet_arena, 8)
+    *path = 0x2F           # '/'
+    *(path + 1) = 0x00
+
+    let slot_idx: i64 = control_block_slot_index(cb, cb.req_write_idx)
+    let req_slot: *RequestSlot = req_ring + slot_idx
+    request_slot_init(req_slot)
+    req_slot.id = 999
+    request_slot_set_method(req_slot, HTTP_METHOD_GET)
+    request_slot_set_path(req_slot, data_arena_ptr_to_offset(@valet_arena, path) as u32, 1)
+    request_slot_add_flag(req_slot, REQ_FLAG_COMPLETE)
+
+    control_block_req_write_inc(cb)
+
+    # === Worker side: process request ===
+    var ctx: WorkerContext
+    worker_init(@ctx, region.fd, region.size)
+    worker_set_running(@ctx)
+
+    let req: *RequestSlot = worker_poll_request(@ctx)
+    if req == null
+        "FAIL: no request\n"
+        worker_destroy(@ctx)
+        shm_destroy(@region)
+        return 1
+
+    # Process: echo back the request ID in response
+    worker_set_busy(@ctx)
+
+    let resp: *ResponseSlot = worker_begin_response(@ctx, req.id)
+    response_slot_set_status(resp, 200)
+    response_slot_set_flags(resp, RESP_FLAG_COMPLETE)
+    worker_commit_response(@ctx)
+
+    # Mark request as consumed
+    worker_ack_request(@ctx)
+    worker_set_running(@ctx)
+
+    # === Valet side: read response ===
+    let resp_count: i64 = control_block_resp_count(cb)
+    let result: i32 = assert_eq_i64(resp_count, 1)
+    if result != 0
+        worker_destroy(@ctx)
+        shm_destroy(@region)
+        return result
+
+    let resp_ring: *ResponseSlot = shm_get_response_ring(@region)
+    let resp_idx: i64 = control_block_slot_index(cb, cb.resp_read_idx)
+    let resp_slot: *ResponseSlot = resp_ring + resp_idx
+
+    # Response should have same ID as request
+    let result2: i32 = assert_eq_i64(resp_slot.id as i64, 999)
+    if result2 != 0
+        worker_destroy(@ctx)
+        shm_destroy(@region)
+        return result2
+
+    let result3: i32 = assert_eq_i32(resp_slot.status as i32, 200)
+    if result3 != 0
+        worker_destroy(@ctx)
+        shm_destroy(@region)
+        return result3
+
+    worker_destroy(@ctx)
+    shm_destroy(@region)
+    return 0
+
+[[test]]
+fn test_worker_multiple_requests() -> i32
+    var cfg: ShmConfig
+    shm_config_default(@cfg)
+
+    var region: ShmRegion
+    shm_create(@region, @cfg)
+
+    let cb: *ControlBlock = shm_get_control_block(@region)
+    let req_ring: *RequestSlot = shm_get_request_ring(@region)
+
+    # Submit 5 requests
+    var i: i32 = 0
+    while i < 5
+        let slot_idx: i64 = control_block_slot_index(cb, cb.req_write_idx)
+        let slot: *RequestSlot = req_ring + slot_idx
+        request_slot_init(slot)
+        slot.id = (100 + i) as u64
+        request_slot_set_method(slot, HTTP_METHOD_GET)
+        request_slot_add_flag(slot, REQ_FLAG_COMPLETE)
+        control_block_req_write_inc(cb)
+        i = i + 1
+
+    # Worker processes all 5
+    var ctx: WorkerContext
+    worker_init(@ctx, region.fd, region.size)
+    worker_set_running(@ctx)
+
+    var processed: i32 = 0
+    while processed < 5
+        let req: *RequestSlot = worker_poll_request(@ctx)
+        if req == null
+            "FAIL: expected request {processed}\n"
+            worker_destroy(@ctx)
+            shm_destroy(@region)
+            return 1
+
+        # Verify ID
+        let expected_id: i64 = (100 + processed) as i64
+        if req.id as i64 != expected_id
+            "FAIL: wrong request ID\n"
+            worker_destroy(@ctx)
+            shm_destroy(@region)
+            return 1
+
+        # Write response
+        let resp: *ResponseSlot = worker_begin_response(@ctx, req.id)
+        response_slot_set_status(resp, 200)
+        worker_commit_response(@ctx)
+        worker_ack_request(@ctx)
+
+        processed = processed + 1
+
+    # Verify all responses
+    let resp_count: i64 = control_block_resp_count(cb)
+    let result: i32 = assert_eq_i64(resp_count, 5)
+    if result != 0
+        worker_destroy(@ctx)
+        shm_destroy(@region)
+        return result
+
+    worker_destroy(@ctx)
+    shm_destroy(@region)
+    return 0

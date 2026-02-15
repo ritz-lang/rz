@@ -1,0 +1,448 @@
+# spire/middleware/mod.ritz
+#
+# Middleware - Request/Response processing pipeline
+#
+# Middleware wraps handlers to add cross-cutting concerns like:
+# - CORS headers
+# - Request logging
+# - Authentication
+# - Rate limiting
+# - Compression
+#
+# Example:
+#
+#   # Middleware is applied to handlers
+#   fn home_handler(req: *Request) -> Response
+#       response_ok()
+#
+#   # Apply middleware
+#   let logged_handler: Handler = logging_middleware(home_handler)
+#   let cors_handler: Handler = cors_middleware(logged_handler)
+#
+#   router_get(@router, "/", cors_handler)
+#
+# Note: Until closures are available (Ritz #121), middleware
+# uses function composition with static handlers.
+
+import ritzlib.option
+import ritzlib.strview { StrView, strview_from_ptr, strview_eq as sv_eq }
+import ritzlib.string { String, string_new, string_push, string_from_strview }
+import ritzlib.gvec { Vec, vec_new, vec_push, vec_len, vec_get_ptr }
+
+import lib.http.method { Method, OPTIONS }
+import lib.http.request { Request, request_method, request_path, request_header }
+import lib.http.response { Response, response_new, response_ok, response_unauthorized }
+import lib.http.response { response_header, response_body }
+import lib.http.status { status_ok, status_no_content }
+import lib.http.headers { headers_set, headers_get }
+import lib.utils { string_as_strview }
+
+# ============================================================================
+# CORS Configuration
+# ============================================================================
+
+pub struct CorsConfig
+    # Allowed origins ("*" for any)
+    allow_origin: String
+    # Allowed methods
+    allow_methods: String
+    # Allowed headers
+    allow_headers: String
+    # Expose headers to JavaScript
+    expose_headers: String
+    # Allow credentials (cookies)
+    allow_credentials: i32
+    # Max age for preflight cache (seconds)
+    max_age: i64
+
+# Create default CORS config (permissive)
+pub fn cors_config_default() -> CorsConfig
+    var cfg: CorsConfig
+    let origin: StrView = "*"
+    let methods: StrView = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+    let headers: StrView = "Content-Type, Authorization, X-Request-ID"
+    let expose: StrView = ""
+    cfg.allow_origin = string_from_strview(@origin)
+    cfg.allow_methods = string_from_strview(@methods)
+    cfg.allow_headers = string_from_strview(@headers)
+    cfg.expose_headers = string_from_strview(@expose)
+    cfg.allow_credentials = 0
+    cfg.max_age = 86400  # 24 hours
+    return cfg
+
+# Create restrictive CORS config for production
+pub fn cors_config_restrictive(origin: StrView) -> CorsConfig
+    var cfg: CorsConfig
+    let methods: StrView = "GET, POST, PUT, DELETE"
+    let headers: StrView = "Content-Type, Authorization"
+    let expose: StrView = ""
+    cfg.allow_origin = string_from_strview(@origin)
+    cfg.allow_methods = string_from_strview(@methods)
+    cfg.allow_headers = string_from_strview(@headers)
+    cfg.expose_headers = string_from_strview(@expose)
+    cfg.allow_credentials = 1
+    cfg.max_age = 3600  # 1 hour
+    return cfg
+
+# Apply CORS headers to response
+pub fn cors_apply(response:& Response, config: CorsConfig)
+    let origin_name: StrView = "Access-Control-Allow-Origin"
+    let origin_val: StrView = string_as_strview(@config.allow_origin)
+    response_header(response, @origin_name, @origin_val)
+
+    let methods_name: StrView = "Access-Control-Allow-Methods"
+    let methods_val: StrView = string_as_strview(@config.allow_methods)
+    response_header(response, @methods_name, @methods_val)
+
+    let headers_name: StrView = "Access-Control-Allow-Headers"
+    let headers_val: StrView = string_as_strview(@config.allow_headers)
+    response_header(response, @headers_name, @headers_val)
+
+    if config.allow_credentials != 0
+        let creds_name: StrView = "Access-Control-Allow-Credentials"
+        let creds_val: StrView = "true"
+        response_header(response, @creds_name, @creds_val)
+
+# Handle CORS preflight request
+pub fn cors_preflight(config: CorsConfig) -> Response
+    var resp: Response = response_new(status_no_content())
+    cors_apply(@resp, config)
+
+    # Add max-age for preflight caching
+    let max_age_name: StrView = "Access-Control-Max-Age"
+    var max_age_buf: [20]u8
+    let max_age_val: StrView = i64_to_strview(config.max_age, @max_age_buf)
+    response_header(@resp, @max_age_name, @max_age_val)
+
+    return resp
+
+# Check if request is CORS preflight
+pub fn is_preflight(request: *Request) -> i32
+    let method: Method = request_method(request)
+    match method
+        OPTIONS => 1
+        _ => 0
+
+# ============================================================================
+# Request logging
+# ============================================================================
+
+pub struct RequestLog
+    method: String
+    path: String
+    status: u16
+    duration_us: i64
+    client_ip: String
+    user_agent: String
+
+# Create request log entry
+pub fn request_log_new(request: *Request) -> RequestLog
+    var log: RequestLog
+    let method_sv: StrView = method_to_str(request.method)
+    log.method = string_from_strview(@method_sv)
+
+    let path_sv: StrView = request_path(request)
+    log.path = string_from_strview(@path_sv)
+
+    log.status = 0  # Filled in after response
+    log.duration_us = 0
+
+    # Get client IP
+    let x_forwarded: StrView = "X-Forwarded-For"
+    match request_header(request, @x_forwarded)
+        Some(ip) => log.client_ip = string_from_strview(@ip)
+        None =>
+            let unknown: StrView = "unknown"
+            log.client_ip = string_from_strview(@unknown)
+
+    # Get user agent
+    let ua_header: StrView = "User-Agent"
+    match request_header(request, @ua_header)
+        Some(ua) => log.user_agent = string_from_strview(@ua)
+        None =>
+            let unknown: StrView = "unknown"
+            log.user_agent = string_from_strview(@unknown)
+
+    return log
+
+# Complete log entry with response info
+pub fn request_log_complete(log:& RequestLog, response: *Response, duration_us: i64)
+    log.status = response.status.code
+    log.duration_us = duration_us
+
+# Format log entry as text
+pub fn request_log_format(log: RequestLog) -> String
+    var s: String = string_new()
+
+    # Format: "GET /path 200 1234us"
+    push_strview(@s, string_as_strview(@log.method))
+    string_push(@s, 32)  # space
+    push_strview(@s, string_as_strview(@log.path))
+    string_push(@s, 32)
+    push_u16(@s, log.status)
+    string_push(@s, 32)
+    push_i64(@s, log.duration_us)
+    let us: StrView = "us"
+    push_strview(@s, us)
+
+    return s
+
+# Format log entry as JSON
+pub fn request_log_json(log: RequestLog) -> String
+    var s: String = string_new()
+
+    let prefix: StrView = "{\"method\":\""
+    push_strview(@s, prefix)
+    push_strview(@s, string_as_strview(@log.method))
+
+    let path_prefix: StrView = "\",\"path\":\""
+    push_strview(@s, path_prefix)
+    push_strview_escaped(@s, string_as_strview(@log.path))
+
+    let status_prefix: StrView = "\",\"status\":"
+    push_strview(@s, status_prefix)
+    push_u16(@s, log.status)
+
+    let duration_prefix: StrView = ",\"duration_us\":"
+    push_strview(@s, duration_prefix)
+    push_i64(@s, log.duration_us)
+
+    let suffix: StrView = "}"
+    push_strview(@s, suffix)
+
+    return s
+
+fn method_to_str(m: Method) -> StrView
+    match m
+        GET => "GET"
+        POST => "POST"
+        PUT => "PUT"
+        DELETE => "DELETE"
+        PATCH => "PATCH"
+        HEAD => "HEAD"
+        OPTIONS => "OPTIONS"
+        TRACE => "TRACE"
+        CONNECT => "CONNECT"
+
+# ============================================================================
+# Authentication helpers
+# ============================================================================
+
+pub enum AuthResult
+    Authenticated(String)    # User ID
+    InvalidToken
+    MissingToken
+    Expired
+
+# Check if request has authentication
+pub fn auth_check(request: *Request) -> AuthResult
+    let auth_header: StrView = "Authorization"
+    match request_header(request, @auth_header)
+        Some(value) =>
+            # Check for Bearer token
+            if value.len > 7
+                let bearer: StrView = "Bearer "
+                let prefix: StrView = strview_from_ptr(value.ptr, 7)
+                if sv_eq(@prefix, @bearer) == 1
+                    # Extract token
+                    let token: StrView = strview_from_ptr(value.ptr + 7, value.len - 7)
+                    # Note: Actual validation would go here
+                    # For now, just return the token as user ID
+                    return Authenticated(string_from_strview(@token))
+            return InvalidToken
+        None => MissingToken
+
+# Check if authenticated
+pub fn auth_is_authenticated(result: AuthResult) -> i32
+    match result
+        Authenticated(_) => 1
+        _ => 0
+
+# Get user ID from auth result
+pub fn auth_user_id(result: AuthResult) -> Option<StrView>
+    match result
+        Authenticated(id) => Some(string_as_strview(@id))
+        _ => None
+
+# Response for unauthorized requests
+pub fn auth_unauthorized_response() -> Response
+    var resp: Response = response_unauthorized()
+    let ct: StrView = "Content-Type"
+    let json: StrView = "application/json"
+    response_header(@resp, @ct, @json)
+    let body: StrView = "{\"error\":\"Unauthorized\"}"
+    response_body(@resp, @body)
+    return resp
+
+# ============================================================================
+# Security headers
+# ============================================================================
+
+# Apply security headers to response
+pub fn security_headers_apply(response:& Response)
+    # X-Content-Type-Options
+    let xcto_name: StrView = "X-Content-Type-Options"
+    let xcto_val: StrView = "nosniff"
+    response_header(response, @xcto_name, @xcto_val)
+
+    # X-Frame-Options
+    let xfo_name: StrView = "X-Frame-Options"
+    let xfo_val: StrView = "DENY"
+    response_header(response, @xfo_name, @xfo_val)
+
+    # X-XSS-Protection
+    let xxp_name: StrView = "X-XSS-Protection"
+    let xxp_val: StrView = "1; mode=block"
+    response_header(response, @xxp_name, @xxp_val)
+
+    # Referrer-Policy
+    let rp_name: StrView = "Referrer-Policy"
+    let rp_val: StrView = "strict-origin-when-cross-origin"
+    response_header(response, @rp_name, @rp_val)
+
+# Apply strict security headers (for API responses)
+pub fn security_headers_strict(response:& Response)
+    security_headers_apply(response)
+
+    # Content-Security-Policy for API
+    let csp_name: StrView = "Content-Security-Policy"
+    let csp_val: StrView = "default-src 'none'; frame-ancestors 'none'"
+    response_header(response, @csp_name, @csp_val)
+
+    # Strict-Transport-Security
+    let hsts_name: StrView = "Strict-Transport-Security"
+    let hsts_val: StrView = "max-age=31536000; includeSubDomains"
+    response_header(response, @hsts_name, @hsts_val)
+
+# ============================================================================
+# Rate limiting state
+# ============================================================================
+
+pub struct RateLimitConfig
+    # Requests per window
+    limit: i64
+    # Window size in seconds
+    window_seconds: i64
+
+pub fn rate_limit_config(limit: i64, window_seconds: i64) -> RateLimitConfig
+    var cfg: RateLimitConfig
+    cfg.limit = limit
+    cfg.window_seconds = window_seconds
+    return cfg
+
+# Common rate limit presets
+pub fn rate_limit_relaxed() -> RateLimitConfig
+    return rate_limit_config(1000, 60)  # 1000/min
+
+pub fn rate_limit_standard() -> RateLimitConfig
+    return rate_limit_config(100, 60)  # 100/min
+
+pub fn rate_limit_strict() -> RateLimitConfig
+    return rate_limit_config(10, 60)  # 10/min
+
+# Rate limit response headers
+pub fn rate_limit_headers(response:& Response, limit: i64, remaining: i64, reset_at: i64)
+    let limit_name: StrView = "X-RateLimit-Limit"
+    var limit_buf: [20]u8
+    let limit_val: StrView = i64_to_strview(limit, @limit_buf)
+    response_header(response, @limit_name, @limit_val)
+
+    let remaining_name: StrView = "X-RateLimit-Remaining"
+    var remaining_buf: [20]u8
+    let remaining_val: StrView = i64_to_strview(remaining, @remaining_buf)
+    response_header(response, @remaining_name, @remaining_val)
+
+    let reset_name: StrView = "X-RateLimit-Reset"
+    var reset_buf: [20]u8
+    let reset_val: StrView = i64_to_strview(reset_at, @reset_buf)
+    response_header(response, @reset_name, @reset_val)
+
+# ============================================================================
+# Request ID
+# ============================================================================
+
+# Get or generate request ID
+pub fn get_request_id(request: *Request) -> StrView
+    let header_name: StrView = "X-Request-ID"
+    match request_header(request, @header_name)
+        Some(id) => id
+        None => generate_request_id()
+
+fn generate_request_id() -> StrView
+    # Simple ID generation - in production use UUID
+    # For now, return a placeholder
+    return "req-000000"
+
+# Add request ID to response
+pub fn set_response_request_id(response:& Response, request_id: StrView)
+    let header_name: StrView = "X-Request-ID"
+    response_header(response, @header_name, @request_id)
+
+# ============================================================================
+# Helper functions
+# ============================================================================
+
+fn push_strview(s:& String, sv: StrView)
+    var i: i64 = 0
+    while i < sv.len
+        string_push(s, *(sv.ptr + i))
+        i += 1
+
+fn push_strview_escaped(s:& String, sv: StrView)
+    var i: i64 = 0
+    while i < sv.len
+        let ch: u8 = *(sv.ptr + i)
+        if ch == 34  # '"'
+            string_push(s, 92)  # '\'
+            string_push(s, 34)
+        else if ch == 92  # '\'
+            string_push(s, 92)
+            string_push(s, 92)
+        else
+            string_push(s, ch)
+        i += 1
+
+fn push_u16(s:& String, n: u16)
+    push_i64(s, n as i64)
+
+fn push_i64(s:& String, n: i64)
+    if n < 0
+        string_push(s, 45)  # '-'
+        push_u64(s, (0 - n) as u64)
+    else
+        push_u64(s, n as u64)
+
+fn push_u64(s:& String, n: u64)
+    if n == 0
+        string_push(s, 48)
+        return
+    var digits: [20]u8
+    var count: i64 = 0
+    var val: u64 = n
+    while val > 0
+        digits[count] = (48 + (val % 10)) as u8
+        val = val / 10
+        count += 1
+    while count > 0
+        count -= 1
+        string_push(s, digits[count])
+
+fn i64_to_strview(n: i64, buf: *[20]u8) -> StrView
+    if n == 0
+        (*buf)[0] = 48
+        return strview_from_ptr(&(*buf)[0], 1)
+
+    var val: u64 = if n < 0 then (0 - n) as u64 else n as u64
+    var count: i64 = 0
+
+    # Build digits in reverse
+    while val > 0
+        (*buf)[19 - count] = (48 + (val % 10)) as u8
+        val = val / 10
+        count += 1
+
+    if n < 0
+        count += 1
+        (*buf)[20 - count] = 45  # '-'
+
+    return strview_from_ptr(&(*buf)[20 - count], count)

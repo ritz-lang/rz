@@ -1,0 +1,214 @@
+# ritz1/src/token_dsl.ritz - Token DSL Parser
+#
+# Parses the token definition DSL and builds a multi-pattern lexer.
+#
+# DSL Syntax:
+#   NAME = pattern         - Regular token
+#   @skip NAME = pattern   - Token to skip (whitespace, comments)
+#   @synthetic NAME        - Synthetic token (no pattern)
+#   # comment              - Comment line
+#
+# Example:
+#   INT = [0-9]+
+#   FN = "fn"
+#   @skip WS = [ \t]+
+#   @synthetic INDENT
+
+# DSL flags
+const DSL_FLAG_SKIP: i32 = 1
+const DSL_FLAG_SYNTHETIC: i32 = 2
+const DSL_FLAG_LITERAL: i32 = 4  # Pattern is a quoted literal
+
+# Token definition from DSL
+struct TokenDef
+  name: *i8           # Token name (e.g., "INT")
+  name_len: i32
+  pattern: *i8        # Pattern string (e.g., "[0-9]+")
+  pattern_len: i32
+  flags: i32          # DSL_FLAG_*
+  token_id: i32       # Assigned token type number
+
+# ============================================================================
+# String Utilities
+# ============================================================================
+
+# Copy n bytes from src to dst
+fn dsl_memcpy(dst: *i8, src: *i8, n: i32) -> i32
+  var i: i32 = 0
+  while i < n
+    *(dst + i) = *(src + i)
+    i = i + 1
+  n
+
+# Check if string starts with prefix
+fn dsl_starts_with(s: *i8, slen: i32, prefix: *i8, plen: i32) -> i32
+  if slen < plen
+    return 0
+  var i: i32 = 0
+  while i < plen
+    if (*(s + i)) != (*(prefix + i))
+      return 0
+    i = i + 1
+  1
+
+# Skip whitespace, returns new position
+fn dsl_skip_ws(s: *i8, pos: i32, len: i32) -> i32
+  var p: i32 = pos
+  while p < len
+    let ch: i32 = (*(s + p)) & 255
+    if ch != 32 && ch != 9  # space or tab
+      return p
+    p = p + 1
+  p
+
+# Find character in string from position, returns position or -1
+fn dsl_find_char(s: *i8, pos: i32, len: i32, ch: i32) -> i32
+  var p: i32 = pos
+  while p < len
+    if ((*(s + p)) & 255) == ch
+      return p
+    p = p + 1
+  -1
+
+# Read identifier (alphanumeric + underscore)
+fn dsl_read_ident(s: *i8, pos: i32, len: i32, out: *i8) -> i32
+  let start: i32 = pos
+  var p: i32 = pos
+  while p < len
+    let ch: i32 = (*(s + p)) & 255
+    # A-Z, a-z, 0-9, _
+    if (ch >= 65 && ch <= 90) || (ch >= 97 && ch <= 122) || (ch >= 48 && ch <= 57) || ch == 95
+      *(out + (p - start)) = *(s + p)
+      p = p + 1
+    else
+      return p - start
+  p - start
+
+# ============================================================================
+# DSL Line Parser
+# ============================================================================
+
+# Parse a single DSL line
+# Returns: 1 = token defined, 0 = skip (comment/empty), -1 = error
+fn dsl_parse_line(line: *i8, len: i32, def: *TokenDef) -> i32
+  var pos: i32 = 0
+
+  # Skip leading whitespace
+  pos = dsl_skip_ws(line, pos, len)
+
+  # Empty line or comment
+  if pos >= len
+    return 0
+  let first_ch: i32 = (*(line + pos)) & 255
+  if first_ch == 35  # '#'
+    return 0
+
+  # Check for @skip or @synthetic
+  (*def).flags = 0
+
+  if first_ch == 64  # '@'
+    pos = pos + 1
+    # Check which marker
+    if dsl_starts_with(line + pos, len - pos, "skip", 4) == 1
+      (*def).flags = DSL_FLAG_SKIP
+      pos = pos + 4
+    else
+      if dsl_starts_with(line + pos, len - pos, "synthetic", 9) == 1
+        (*def).flags = DSL_FLAG_SYNTHETIC
+        pos = pos + 9
+      else
+        return -1  # Unknown marker
+    pos = dsl_skip_ws(line, pos, len)
+
+  # Read token name
+  let name_len: i32 = dsl_read_ident(line, pos, len, (*def).name)
+  if name_len == 0
+    return -1  # No name
+  (*def).name_len = name_len
+  pos = pos + name_len
+
+  # For synthetic tokens, we're done (no pattern)
+  if (*def).flags == DSL_FLAG_SYNTHETIC
+    (*def).pattern_len = 0
+    return 1
+
+  # Skip whitespace and expect '='
+  pos = dsl_skip_ws(line, pos, len)
+  if pos >= len
+    return -1
+  if ((*(line + pos)) & 255) != 61  # '='
+    return -1
+  pos = pos + 1
+
+  # Skip whitespace before pattern
+  pos = dsl_skip_ws(line, pos, len)
+  if pos >= len
+    return -1
+
+  # Read pattern (rest of line, trimmed)
+  let pattern_start: i32 = pos
+  # Find end (trim trailing whitespace)
+  var pattern_end: i32 = len
+  while pattern_end > pattern_start
+    let ch: i32 = (*(line + pattern_end - 1)) & 255
+    if ch != 32 && ch != 9 && ch != 10 && ch != 13
+      break  # Non-whitespace found, stop
+    pattern_end = pattern_end - 1
+
+  let pattern_len: i32 = pattern_end - pattern_start
+  dsl_memcpy((*def).pattern, line + pattern_start, pattern_len)
+  (*def).pattern_len = pattern_len
+
+  # Check if it's a literal (starts with ")
+  if pattern_len > 0 && ((*(line + pattern_start)) & 255) == 34  # '"'
+    (*def).flags = (*def).flags | DSL_FLAG_LITERAL
+
+  1
+
+# ============================================================================
+# DSL to Lexer Builder
+# ============================================================================
+
+# Parse DSL and add patterns to lexer
+# Returns number of patterns added, or -1 on error
+fn dsl_build_lexer(lex: *Lexer, dsl: *i8, dsl_len: i32) -> i32
+  let storage: *i8 = __builtin_alloca(256)  # For TokenDef name/pattern
+  var def: TokenDef = TokenDef { name: storage, name_len: 0, pattern: storage + 64, pattern_len: 0, flags: 0, token_id: 0 }
+
+  var count: i32 = 0
+  var pos: i32 = 0
+  var line_start: i32 = 0
+
+  while pos <= dsl_len
+    # Find end of line
+    let is_end: i32 = pos >= dsl_len
+    var is_newline: i32 = 0
+    if is_end == 0
+      if ((*(dsl + pos)) & 255) == 10  # '\n'
+        is_newline = 1
+
+    if is_end == 1 || is_newline == 1
+      # Parse this line
+      let line_len: i32 = pos - line_start
+      if line_len > 0
+        let result: i32 = dsl_parse_line(dsl + line_start, line_len, &def)
+        if result == 1
+          # Add pattern to lexer (skip synthetic tokens)
+          if (def.flags & DSL_FLAG_SYNTHETIC) == 0
+            let is_literal: i32 = 0
+            if (def.flags & DSL_FLAG_LITERAL) != 0
+              lexer_add_pattern(lex, def.pattern, def.pattern_len, count, 1)
+            else
+              lexer_add_pattern(lex, def.pattern, def.pattern_len, count, 0)
+            count = count + 1
+          else
+            count = count + 1  # Still count synthetic for token_id assignment
+        else
+          if result == -1
+            return -1  # Error
+
+      line_start = pos + 1
+
+    pos = pos + 1
+
+  count

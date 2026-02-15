@@ -1,0 +1,155 @@
+# lib/control.ritz - Control block for shared memory coordination
+#
+# The control block is the first structure in shared memory, containing:
+#   - Ring buffer indices (request write/read, response write/read)
+#   - Worker state (IDLE, RUNNING, BUSY, STOPPING)
+#   - Worker PID
+#   - Futex words for signaling
+#
+# Memory-mapped and shared between Valet (producer of requests, consumer of responses)
+# and Zeus Worker (consumer of requests, producer of responses).
+
+import ritzlib.sys
+
+# ============================================================================
+# Worker States
+# ============================================================================
+
+pub const WORKER_STATE_IDLE: i32 = 0      # Worker not processing
+pub const WORKER_STATE_RUNNING: i32 = 1   # Worker ready and waiting
+pub const WORKER_STATE_BUSY: i32 = 2      # Worker processing a request
+pub const WORKER_STATE_STOPPING: i32 = 3  # Worker shutting down
+
+# ============================================================================
+# Control Block Structure
+# ============================================================================
+# Layout optimized for cache line alignment:
+#   - First cache line (64 bytes): indices and state
+#   - Second cache line: futex words and padding
+
+pub struct ControlBlock
+    # Request ring indices (Valet writes, Worker reads)
+    req_write_idx: i64    # 0: Next slot Valet will write to
+    req_read_idx: i64     # 8: Next slot Worker will read from
+
+    # Response ring indices (Worker writes, Valet reads)
+    resp_write_idx: i64   # 16: Next slot Worker will write to
+    resp_read_idx: i64    # 24: Next slot Valet will read from
+
+    # Worker state
+    state: i32            # 32: Current worker state
+    worker_pid: i32       # 36: Worker process ID
+
+    # Futex words for signaling
+    req_futex: i32        # 40: Request available signal
+    resp_futex: i32       # 44: Response available signal
+
+    # Ring capacity (must be power of 2)
+    ring_capacity: i64    # 48: Number of slots in each ring
+    ring_mask: i64        # 56: capacity - 1, for fast modulo
+
+    # Padding to 64 bytes
+    _pad: i64             # 64: Reserved
+
+# ============================================================================
+# Public API
+# ============================================================================
+
+# Return the size of the control block in bytes
+pub fn control_block_size() -> i64
+    # 72 bytes total, but we align to cache line (64) so return 128
+    # to give us two full cache lines
+    return 128
+
+# Initialize a control block to default state
+pub fn control_block_init(cb: *ControlBlock)
+    cb.req_write_idx = 0
+    cb.req_read_idx = 0
+    cb.resp_write_idx = 0
+    cb.resp_read_idx = 0
+    cb.state = WORKER_STATE_IDLE
+    cb.worker_pid = 0
+    cb.req_futex = 0
+    cb.resp_futex = 0
+    cb.ring_capacity = 256  # Default: 256 slots
+    cb.ring_mask = 255      # 256 - 1
+
+# Set the worker state
+pub fn control_block_set_state(cb: *ControlBlock, state: i32)
+    cb.state = state
+
+# Set the worker PID
+pub fn control_block_set_pid(cb: *ControlBlock, pid: i32)
+    cb.worker_pid = pid
+
+# ============================================================================
+# Request Ring Index Operations
+# ============================================================================
+
+# Increment request write index, return old value
+pub fn control_block_req_write_inc(cb: *ControlBlock) -> i64
+    let old: i64 = cb.req_write_idx
+    cb.req_write_idx = cb.req_write_idx + 1
+    return old
+
+# Increment request read index, return old value
+pub fn control_block_req_read_inc(cb: *ControlBlock) -> i64
+    let old: i64 = cb.req_read_idx
+    cb.req_read_idx = cb.req_read_idx + 1
+    return old
+
+# Check if request ring is empty
+pub fn control_block_req_empty(cb: *ControlBlock) -> i32
+    if cb.req_write_idx == cb.req_read_idx
+        return 1
+    return 0
+
+# Get number of pending requests
+pub fn control_block_req_count(cb: *ControlBlock) -> i64
+    return cb.req_write_idx - cb.req_read_idx
+
+# Check if request ring is full
+pub fn control_block_req_full(cb: *ControlBlock) -> i32
+    if (cb.req_write_idx - cb.req_read_idx) >= cb.ring_capacity
+        return 1
+    return 0
+
+# ============================================================================
+# Response Ring Index Operations
+# ============================================================================
+
+# Increment response write index, return old value
+pub fn control_block_resp_write_inc(cb: *ControlBlock) -> i64
+    let old: i64 = cb.resp_write_idx
+    cb.resp_write_idx = cb.resp_write_idx + 1
+    return old
+
+# Increment response read index, return old value
+pub fn control_block_resp_read_inc(cb: *ControlBlock) -> i64
+    let old: i64 = cb.resp_read_idx
+    cb.resp_read_idx = cb.resp_read_idx + 1
+    return old
+
+# Check if response ring is empty
+pub fn control_block_resp_empty(cb: *ControlBlock) -> i32
+    if cb.resp_write_idx == cb.resp_read_idx
+        return 1
+    return 0
+
+# Get number of pending responses
+pub fn control_block_resp_count(cb: *ControlBlock) -> i64
+    return cb.resp_write_idx - cb.resp_read_idx
+
+# Check if response ring is full
+pub fn control_block_resp_full(cb: *ControlBlock) -> i32
+    if (cb.resp_write_idx - cb.resp_read_idx) >= cb.ring_capacity
+        return 1
+    return 0
+
+# ============================================================================
+# Slot Index Calculation
+# ============================================================================
+
+# Get the actual slot index (wrapped) for a given sequence number
+pub fn control_block_slot_index(cb: *ControlBlock, seq: i64) -> i64
+    return seq & cb.ring_mask

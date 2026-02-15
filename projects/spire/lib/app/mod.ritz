@@ -1,0 +1,246 @@
+# spire/app/mod.ritz
+#
+# SpireApp - Application trait for Zeus integration
+#
+# Spire applications implement the SpireApp trait to be hosted by Zeus.
+# Zeus loads Spire apps as shared libraries and calls lifecycle methods.
+#
+# Example:
+#
+#   struct MyApp
+#       router: Router
+#       db: Db
+#
+#   @export
+#   fn app_create() -> *MyApp
+#       let app: *MyApp = alloc<MyApp>()
+#       (*app).router = router_new()
+#       setup_routes(&(*app).router)
+#       return app
+#
+#   @export
+#   fn app_handle(app: *MyApp, request:& Request) -> Response
+#       return router_handle(@app.router, request)
+#
+#   @export
+#   fn app_shutdown(app: *MyApp)
+#       # cleanup
+#
+# Zeus lifecycle:
+#   1. Zeus loads app shared library
+#   2. Zeus calls app_create() -> *App
+#   3. Zeus calls app_init(app, config)
+#   4. For each request: Zeus calls app_handle(app, request)
+#   5. On shutdown: Zeus calls app_shutdown(app)
+#   6. Zeus calls app_destroy(app)
+
+import ritzlib.option
+import ritzlib.strview { StrView }
+import ritzlib.string { String, string_new, string_from_strview }
+import ritzlib.gvec { Vec, vec_new, vec_len, vec_get_ptr }
+
+import lib.http.request { Request }
+import lib.http.response { Response }
+import lib.utils { string_as_strview, strview_eq }
+
+# ============================================================================
+# App Configuration
+# ============================================================================
+
+# Configuration passed to app on init
+pub struct AppConfig
+    # Environment name (development, staging, production)
+    environment: String
+
+    # Database connection string (if configured)
+    database_url: Option<String>
+
+    # Cache connection string (if configured)
+    cache_url: Option<String>
+
+    # Custom config values from zeus.toml
+    values: Vec<ConfigValue>
+
+pub struct ConfigValue
+    key: String
+    value: String
+
+# Create empty config
+pub fn app_config_new() -> AppConfig
+    var cfg: AppConfig
+    cfg.environment = string_new()
+    cfg.database_url = None
+    cfg.cache_url = None
+    cfg.values = vec_new<ConfigValue>()
+    return cfg
+
+# Get a config value by key
+pub fn config_get(config: *AppConfig, key: *StrView) -> Option<StrView>
+    var i: i64 = 0
+    while i < vec_len<ConfigValue>(@config.values)
+        let item: *ConfigValue = vec_get_ptr<ConfigValue>(@config.values, i)
+        let item_key: StrView = string_as_strview(@item.key)
+        if strview_eq(@item_key, key) == 1
+            return Some(string_as_strview(@item.value))
+        i += 1
+    return None
+
+# Get a config value or default
+pub fn config_get_or(config: *AppConfig, key: *StrView, default: *StrView) -> StrView
+    match config_get(config, key)
+        Some(v) => v
+        None => *default
+
+# Check if running in production
+pub fn config_is_production(config: *AppConfig) -> i32
+    let prod: StrView = "production"
+    let env: StrView = string_as_strview(@config.environment)
+    return strview_eq(@env, @prod)
+
+# Check if running in development
+pub fn config_is_development(config: *AppConfig) -> i32
+    let dev: StrView = "development"
+    let env: StrView = string_as_strview(@config.environment)
+    return strview_eq(@env, @dev)
+
+# ============================================================================
+# App Errors
+# ============================================================================
+
+pub enum AppError
+    ConfigError(String)
+    DatabaseError(String)
+    CacheError(String)
+    InitError(String)
+
+pub fn app_error_message(err: *AppError) -> StrView
+    match *err
+        ConfigError(msg) => string_as_strview(@msg)
+        DatabaseError(msg) => string_as_strview(@msg)
+        CacheError(msg) => string_as_strview(@msg)
+        InitError(msg) => string_as_strview(@msg)
+
+pub fn app_error_config(msg: *StrView) -> AppError
+    return ConfigError(string_from_strview(msg))
+
+pub fn app_error_database(msg: *StrView) -> AppError
+    return DatabaseError(string_from_strview(msg))
+
+pub fn app_error_init(msg: *StrView) -> AppError
+    return InitError(string_from_strview(msg))
+
+# ============================================================================
+# SpireApp Trait
+# ============================================================================
+#
+# Note: Ritz doesn't have trait objects (dyn Trait) yet (see issue #122).
+# For now, apps implement the required functions directly and Zeus
+# calls them via function pointers exported from the shared library.
+#
+# Required exports from app shared library:
+#
+#   @export
+#   fn app_create() -> *MyApp
+#
+#   @export
+#   fn app_init(app: *MyApp, config: *AppConfig) -> i32
+#       # Returns 0 on success, non-zero on error
+#
+#   @export
+#   fn app_handle(app: *MyApp, request:& Request) -> Response
+#
+#   @export
+#   fn app_shutdown(app: *MyApp)
+#
+#   @export
+#   fn app_destroy(app: *MyApp)
+#
+# When trait objects are available, we can have:
+#
+#   trait SpireApp
+#       fn init(self:& Self, config: *AppConfig) -> i32
+#       fn handle(self: *Self, request:& Request) -> Response
+#       fn shutdown(self: *Self)
+
+# ============================================================================
+# Request Context
+# ============================================================================
+
+# Context available during request handling
+pub struct RequestContext
+    # Unique request ID for tracing
+    request_id: String
+
+    # Start time of request (for timing)
+    start_time_ns: i64
+
+    # Client IP address
+    client_ip: Option<String>
+
+    # Authenticated user ID (if any)
+    user_id: Option<String>
+
+# Create a new request context
+pub fn request_context_new(request_id: *StrView) -> RequestContext
+    var ctx: RequestContext
+    ctx.request_id = string_from_strview(request_id)
+    ctx.start_time_ns = 0  # Zeus fills this in
+    ctx.client_ip = None
+    ctx.user_id = None
+    return ctx
+
+# Set authenticated user
+pub fn context_set_user(ctx:& RequestContext, user_id: *StrView)
+    ctx.user_id = Some(string_from_strview(user_id))
+
+# Check if user is authenticated
+pub fn context_is_authenticated(ctx: *RequestContext) -> i32
+    match ctx.user_id
+        Some(_) => 1
+        None => 0
+
+# ============================================================================
+# Health Check
+# ============================================================================
+
+# Health status for /health endpoint
+pub enum HealthStatus
+    Healthy
+    Degraded(String)
+    Unhealthy(String)
+
+pub fn health_healthy() -> HealthStatus
+    return Healthy
+
+pub fn health_degraded(reason: *StrView) -> HealthStatus
+    return Degraded(string_from_strview(reason))
+
+pub fn health_unhealthy(reason: *StrView) -> HealthStatus
+    return Unhealthy(string_from_strview(reason))
+
+pub fn health_is_healthy(status: *HealthStatus) -> i32
+    match *status
+        Healthy => 1
+        _ => 0
+
+pub fn health_is_ready(status: *HealthStatus) -> i32
+    match *status
+        Healthy => 1
+        Degraded(_) => 1
+        Unhealthy(_) => 0
+
+# ============================================================================
+# Graceful Shutdown
+# ============================================================================
+
+# Shutdown signal type
+pub enum ShutdownSignal
+    Graceful       # Finish current requests, then stop
+    Immediate      # Stop immediately
+    Restart        # Graceful shutdown, then restart
+
+pub fn shutdown_is_graceful(signal: *ShutdownSignal) -> i32
+    match *signal
+        Graceful => 1
+        Restart => 1
+        Immediate => 0

@@ -1,0 +1,343 @@
+# tests/test_pool.ritz - Unit tests for memory pool
+#
+# Tests the memory pool implementation for correctness.
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+import ritzlib.memory
+
+import lib.pool
+
+
+# ============================================================================
+# Basic allocation tests
+# ============================================================================
+
+[[test]]
+fn test_pool_init_success() -> i32
+    var pool: MemPool
+    let ret: i32 = pool_init(@pool, 16, 256)
+
+    if ret != 0
+        return 1
+    if pool_capacity(@pool) != 16
+        return 2
+    if pool_available(@pool) != 16
+        return 3
+    if pool_used(@pool) != 0
+        return 4
+
+    pool_destroy(@pool)
+    return 0
+
+
+[[test]]
+fn test_pool_init_invalid_count() -> i32
+    var pool: MemPool
+    let ret: i32 = pool_init(@pool, 0, 256)
+
+    if ret != -22  # EINVAL
+        return 1
+    return 0
+
+
+[[test]]
+fn test_pool_init_invalid_size() -> i32
+    var pool: MemPool
+    let ret: i32 = pool_init(@pool, 16, 4)  # Too small
+
+    if ret != -22  # EINVAL
+        return 1
+    return 0
+
+
+[[test]]
+fn test_pool_alloc_single() -> i32
+    var pool: MemPool
+    pool_init(@pool, 8, 128)
+
+    let buf: *u8 = pool_alloc(@pool)
+
+    if buf == null
+        pool_destroy(@pool)
+        return 1
+    if pool_available(@pool) != 7
+        pool_destroy(@pool)
+        return 2
+    if pool_used(@pool) != 1
+        pool_destroy(@pool)
+        return 3
+
+    pool_destroy(@pool)
+    return 0
+
+
+[[test]]
+fn test_pool_alloc_all() -> i32
+    var pool: MemPool
+    pool_init(@pool, 4, 64)
+
+    let b1: *u8 = pool_alloc(@pool)
+    let b2: *u8 = pool_alloc(@pool)
+    let b3: *u8 = pool_alloc(@pool)
+    let b4: *u8 = pool_alloc(@pool)
+
+    if b1 == null || b2 == null || b3 == null || b4 == null
+        pool_destroy(@pool)
+        return 1
+    if pool_available(@pool) != 0
+        pool_destroy(@pool)
+        return 2
+
+    # Next allocation should fail
+    let b5: *u8 = pool_alloc(@pool)
+    if b5 != null
+        pool_destroy(@pool)
+        return 3
+
+    pool_destroy(@pool)
+    return 0
+
+
+[[test]]
+fn test_pool_free_and_reuse() -> i32
+    var pool: MemPool
+    pool_init(@pool, 2, 64)
+
+    let b1: *u8 = pool_alloc(@pool)
+    let b2: *u8 = pool_alloc(@pool)
+
+    if pool_available(@pool) != 0
+        pool_destroy(@pool)
+        return 1
+
+    # Free one
+    pool_free(@pool, b1)
+    if pool_available(@pool) != 1
+        pool_destroy(@pool)
+        return 2
+
+    # Allocate again - should get the freed block
+    let b3: *u8 = pool_alloc(@pool)
+    if b3 == null
+        pool_destroy(@pool)
+        return 3
+    if pool_available(@pool) != 0
+        pool_destroy(@pool)
+        return 4
+
+    pool_destroy(@pool)
+    return 0
+
+
+[[test]]
+fn test_pool_contains() -> i32
+    var pool: MemPool
+    pool_init(@pool, 8, 128)
+
+    let buf: *u8 = pool_alloc(@pool)
+
+    if pool_contains(@pool, buf) != 1
+        pool_destroy(@pool)
+        return 1
+
+    # Stack variable should not be in pool
+    var local: [8]u8
+    if pool_contains(@pool, @local[0]) != 0
+        pool_destroy(@pool)
+        return 2
+
+    pool_destroy(@pool)
+    return 0
+
+
+[[test]]
+fn test_pool_reset() -> i32
+    var pool: MemPool
+    pool_init(@pool, 4, 64)
+
+    # Allocate all
+    pool_alloc(@pool)
+    pool_alloc(@pool)
+    pool_alloc(@pool)
+    pool_alloc(@pool)
+
+    if pool_available(@pool) != 0
+        pool_destroy(@pool)
+        return 1
+
+    # Reset
+    pool_reset(@pool)
+
+    if pool_available(@pool) != 4
+        pool_destroy(@pool)
+        return 2
+
+    # Should be able to allocate again
+    let buf: *u8 = pool_alloc(@pool)
+    if buf == null
+        pool_destroy(@pool)
+        return 3
+
+    pool_destroy(@pool)
+    return 0
+
+
+[[test]]
+fn test_pool_block_size_alignment() -> i32
+    var pool: MemPool
+    pool_init(@pool, 4, 100)  # 100 should align to 104
+
+    # Block size should be 8-byte aligned
+    let size: i32 = pool_block_size(@pool)
+    if size != 104
+        pool_destroy(@pool)
+        return 1
+
+    pool_destroy(@pool)
+    return 0
+
+
+# ============================================================================
+# Connection buffer pool tests
+# ============================================================================
+
+[[test]]
+fn test_conn_pool_init() -> i32
+    var pool: ConnBufferPool
+    let ret: i32 = conn_pool_init(@pool, 16)
+
+    if ret != 0
+        return 1
+    if conn_pool_capacity(@pool) != 16
+        conn_pool_destroy(@pool)
+        return 2
+    if conn_pool_available(@pool) != 16
+        conn_pool_destroy(@pool)
+        return 3
+
+    conn_pool_destroy(@pool)
+    return 0
+
+
+[[test]]
+fn test_conn_pool_alloc() -> i32
+    var pool: ConnBufferPool
+    conn_pool_init(@pool, 4)
+
+    let bufs: ConnBuffers = conn_pool_alloc(@pool)
+
+    if bufs.read_buf == null
+        conn_pool_destroy(@pool)
+        return 1
+    if bufs.write_buf == null
+        conn_pool_destroy(@pool)
+        return 2
+    if conn_pool_available(@pool) != 3
+        conn_pool_destroy(@pool)
+        return 3
+
+    # write_buf should be at offset CONN_READ_BUF_SIZE
+    let read_addr: i64 = bufs.read_buf as i64
+    let write_addr: i64 = bufs.write_buf as i64
+    if write_addr - read_addr != CONN_READ_BUF_SIZE as i64
+        conn_pool_destroy(@pool)
+        return 4
+
+    conn_pool_destroy(@pool)
+    return 0
+
+
+[[test]]
+fn test_conn_pool_free() -> i32
+    var pool: ConnBufferPool
+    conn_pool_init(@pool, 4)
+
+    var bufs: ConnBuffers = conn_pool_alloc(@pool)
+    if conn_pool_available(@pool) != 3
+        conn_pool_destroy(@pool)
+        return 1
+
+    conn_pool_free(@pool, @bufs)
+    if conn_pool_available(@pool) != 4
+        conn_pool_destroy(@pool)
+        return 2
+    if bufs.read_buf != null
+        conn_pool_destroy(@pool)
+        return 3
+    if bufs.write_buf != null
+        conn_pool_destroy(@pool)
+        return 4
+
+    conn_pool_destroy(@pool)
+    return 0
+
+
+[[test]]
+fn test_conn_pool_exhaustion() -> i32
+    var pool: ConnBufferPool
+    conn_pool_init(@pool, 2)
+
+    let b1: ConnBuffers = conn_pool_alloc(@pool)
+    let b2: ConnBuffers = conn_pool_alloc(@pool)
+
+    if b1.read_buf == null || b2.read_buf == null
+        conn_pool_destroy(@pool)
+        return 1
+
+    # Pool exhausted
+    let b3: ConnBuffers = conn_pool_alloc(@pool)
+    if b3.read_buf != null || b3.write_buf != null
+        conn_pool_destroy(@pool)
+        return 2
+
+    conn_pool_destroy(@pool)
+    return 0
+
+
+# ============================================================================
+# Stress tests
+# ============================================================================
+
+[[test]]
+fn test_pool_alloc_free_cycle() -> i32
+    var pool: MemPool
+    pool_init(@pool, 8, 256)
+
+    # Allocate and free repeatedly
+    for i in 0..100
+        let buf: *u8 = pool_alloc(@pool)
+        if buf != null
+            pool_free(@pool, buf)
+
+    # Pool should still be fully available
+    if pool_available(@pool) != 8
+        pool_destroy(@pool)
+        return 1
+
+    pool_destroy(@pool)
+    return 0
+
+
+[[test]]
+fn test_pool_large_block_size() -> i32
+    var pool: MemPool
+    let ret: i32 = pool_init(@pool, 16, 65536)  # 64KB blocks
+
+    if ret != 0
+        return 1
+    if pool_capacity(@pool) != 16
+        pool_destroy(@pool)
+        return 2
+
+    let buf: *u8 = pool_alloc(@pool)
+    if buf == null
+        pool_destroy(@pool)
+        return 3
+
+    # Write to end of block to verify size
+    *(buf + 65535) = 42
+
+    pool_destroy(@pool)
+    return 0

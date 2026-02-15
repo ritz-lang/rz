@@ -1,0 +1,568 @@
+# test/test_valet.ritz - Tests for Valet worker pool management
+#
+# Tests cover:
+#   - ValetContext initialization and destruction
+#   - Worker slot management
+#   - Round-robin dispatch
+#   - Worker health monitoring
+#   - Graceful restart
+
+import ritzlib.sys
+import ritzlib.io
+import helpers
+import lib.valet
+import lib.control
+import lib.ring
+import lib.shm
+
+# ============================================================================
+# Test: ValetContext Initialization
+# ============================================================================
+
+[[test]]
+fn test_valet_init_default_config() -> i32
+    var ctx: ValetContext
+
+    let result: i32 = valet_init(@ctx, null)
+    if result != 0
+        "FAIL: valet_init should succeed\n"
+        return 1
+
+    # Check default config applied
+    let r1: i32 = assert_eq_i32(ctx.max_workers, VALET_DEFAULT_MAX_WORKERS)
+    if r1 != 0
+        valet_destroy(@ctx)
+        return r1
+
+    let r2: i32 = assert_eq_i32(ctx.worker_count, 0)
+    if r2 != 0
+        valet_destroy(@ctx)
+        return r2
+
+    let r3: i32 = assert_eq_i32(ctx.next_dispatch_idx, 0)
+    if r3 != 0
+        valet_destroy(@ctx)
+        return r3
+
+    valet_destroy(@ctx)
+    return 0
+
+[[test]]
+fn test_valet_init_custom_config() -> i32
+    var ctx: ValetContext
+    var cfg: ValetConfig
+
+    valet_config_init(@cfg, 4, 128, 65536)  # 4 workers, 128 slots, 64KB arena
+
+    let result: i32 = valet_init(@ctx, @cfg)
+    if result != 0
+        "FAIL: valet_init should succeed\n"
+        return 1
+
+    let r1: i32 = assert_eq_i32(ctx.max_workers, 4)
+    if r1 != 0
+        valet_destroy(@ctx)
+        return r1
+
+    let r2: i32 = assert_eq_i64(ctx.shm_config.ring_capacity, 128)
+    if r2 != 0
+        valet_destroy(@ctx)
+        return r2
+
+    let r3: i32 = assert_eq_i64(ctx.shm_config.arena_size, 65536)
+    if r3 != 0
+        valet_destroy(@ctx)
+        return r3
+
+    valet_destroy(@ctx)
+    return 0
+
+# ============================================================================
+# Test: Worker Slot Management
+# ============================================================================
+
+[[test]]
+fn test_valet_add_worker_slot() -> i32
+    var ctx: ValetContext
+    valet_init(@ctx, null)
+
+    let slot_idx: i32 = valet_add_worker_slot(@ctx)
+    if slot_idx < 0
+        "FAIL: should allocate slot\n"
+        valet_destroy(@ctx)
+        return 1
+
+    let r1: i32 = assert_eq_i32(ctx.worker_count, 1)
+    if r1 != 0
+        valet_destroy(@ctx)
+        return r1
+
+    # Check the slot has valid shared memory
+    let slot: *WorkerSlot = valet_get_worker_slot(@ctx, slot_idx)
+    if slot == null
+        "FAIL: should get slot\n"
+        valet_destroy(@ctx)
+        return 1
+
+    if slot.region.fd < 0
+        "FAIL: should have valid fd\n"
+        valet_destroy(@ctx)
+        return 1
+
+    let r2: i32 = assert_not_null(slot.region.base)
+    if r2 != 0
+        valet_destroy(@ctx)
+        return r2
+
+    let r3: i32 = assert_eq_i32(slot.state, WORKER_SLOT_IDLE)
+    if r3 != 0
+        valet_destroy(@ctx)
+        return r3
+
+    valet_destroy(@ctx)
+    return 0
+
+[[test]]
+fn test_valet_max_workers_limit() -> i32
+    var ctx: ValetContext
+    var cfg: ValetConfig
+
+    valet_config_init(@cfg, 2, 64, 4096)  # Max 2 workers
+    valet_init(@ctx, @cfg)
+
+    let slot0: i32 = valet_add_worker_slot(@ctx)
+    if slot0 != 0
+        "FAIL: first slot should be 0\n"
+        valet_destroy(@ctx)
+        return 1
+
+    let slot1: i32 = valet_add_worker_slot(@ctx)
+    if slot1 != 1
+        "FAIL: second slot should be 1\n"
+        valet_destroy(@ctx)
+        return 1
+
+    let slot2: i32 = valet_add_worker_slot(@ctx)
+    if slot2 >= 0
+        "FAIL: third slot should fail\n"
+        valet_destroy(@ctx)
+        return 1
+
+    let r: i32 = assert_eq_i32(ctx.worker_count, 2)
+    if r != 0
+        valet_destroy(@ctx)
+        return r
+
+    valet_destroy(@ctx)
+    return 0
+
+[[test]]
+fn test_valet_remove_worker_slot() -> i32
+    var ctx: ValetContext
+    valet_init(@ctx, null)
+
+    let slot_idx: i32 = valet_add_worker_slot(@ctx)
+    let slot: *WorkerSlot = valet_get_worker_slot(@ctx, slot_idx)
+
+    valet_remove_worker_slot(@ctx, slot_idx)
+
+    # Slot should be marked inactive
+    let r1: i32 = assert_eq_i32(slot.state, WORKER_SLOT_EMPTY)
+    if r1 != 0
+        valet_destroy(@ctx)
+        return r1
+
+    let r2: i32 = assert_eq_i32(ctx.worker_count, 0)
+    if r2 != 0
+        valet_destroy(@ctx)
+        return r2
+
+    valet_destroy(@ctx)
+    return 0
+
+# ============================================================================
+# Test: Round-Robin Dispatch
+# ============================================================================
+
+[[test]]
+fn test_valet_round_robin_dispatch() -> i32
+    var ctx: ValetContext
+    var cfg: ValetConfig
+
+    valet_config_init(@cfg, 4, 64, 4096)
+    valet_init(@ctx, @cfg)
+
+    # Add 4 worker slots and mark them running
+    var i: i32 = 0
+    while i < 4
+        let idx: i32 = valet_add_worker_slot(@ctx)
+        valet_mark_worker_running(@ctx, idx)
+        i = i + 1
+
+    # Dispatch should cycle through workers
+    let w0: i32 = valet_select_worker(@ctx)
+    if w0 != 0
+        "FAIL: first dispatch should be worker 0, got {w0}\n"
+        valet_destroy(@ctx)
+        return 1
+
+    let w1: i32 = valet_select_worker(@ctx)
+    if w1 != 1
+        "FAIL: second dispatch should be worker 1, got {w1}\n"
+        valet_destroy(@ctx)
+        return 1
+
+    let w2: i32 = valet_select_worker(@ctx)
+    if w2 != 2
+        "FAIL: third dispatch should be worker 2, got {w2}\n"
+        valet_destroy(@ctx)
+        return 1
+
+    let w3: i32 = valet_select_worker(@ctx)
+    if w3 != 3
+        "FAIL: fourth dispatch should be worker 3, got {w3}\n"
+        valet_destroy(@ctx)
+        return 1
+
+    let w4: i32 = valet_select_worker(@ctx)
+    if w4 != 0
+        "FAIL: fifth dispatch should wrap to worker 0, got {w4}\n"
+        valet_destroy(@ctx)
+        return 1
+
+    valet_destroy(@ctx)
+    return 0
+
+[[test]]
+fn test_valet_skip_non_running_workers() -> i32
+    var ctx: ValetContext
+    var cfg: ValetConfig
+
+    valet_config_init(@cfg, 4, 64, 4096)
+    valet_init(@ctx, @cfg)
+
+    # Add 4 slots, only mark 0 and 2 as running
+    var i: i32 = 0
+    while i < 4
+        valet_add_worker_slot(@ctx)
+        i = i + 1
+
+    valet_mark_worker_running(@ctx, 0)
+    valet_mark_worker_running(@ctx, 2)
+
+    # Should only dispatch to running workers
+    let w0: i32 = valet_select_worker(@ctx)
+    if w0 != 0
+        "FAIL: first dispatch should be worker 0, got {w0}\n"
+        valet_destroy(@ctx)
+        return 1
+
+    let w1: i32 = valet_select_worker(@ctx)
+    if w1 != 2
+        "FAIL: second dispatch should be worker 2 (skips 1), got {w1}\n"
+        valet_destroy(@ctx)
+        return 1
+
+    let w2: i32 = valet_select_worker(@ctx)
+    if w2 != 0
+        "FAIL: third dispatch should wrap to worker 0 (skips 3), got {w2}\n"
+        valet_destroy(@ctx)
+        return 1
+
+    valet_destroy(@ctx)
+    return 0
+
+[[test]]
+fn test_valet_no_workers_returns_negative() -> i32
+    var ctx: ValetContext
+    valet_init(@ctx, null)
+
+    let w: i32 = valet_select_worker(@ctx)
+    if w != -1
+        "FAIL: should return -1 with no workers, got {w}\n"
+        valet_destroy(@ctx)
+        return 1
+
+    valet_destroy(@ctx)
+    return 0
+
+# ============================================================================
+# Test: Request Submission
+# ============================================================================
+
+[[test]]
+fn test_valet_submit_request() -> i32
+    var ctx: ValetContext
+    valet_init(@ctx, null)
+
+    let slot_idx: i32 = valet_add_worker_slot(@ctx)
+    valet_mark_worker_running(@ctx, slot_idx)
+
+    # Submit a request
+    var req: RequestSlot
+    request_slot_init(@req)
+    req.id = 42
+    req.method = HTTP_METHOD_GET
+
+    let result: i32 = valet_submit_request(@ctx, slot_idx, @req, null, 0)
+    if result != 0
+        "FAIL: submit should succeed, got {result}\n"
+        valet_destroy(@ctx)
+        return 1
+
+    # Verify it's in the ring buffer
+    let slot: *WorkerSlot = valet_get_worker_slot(@ctx, slot_idx)
+    let cb: *ControlBlock = shm_get_control_block(@slot.region)
+
+    let count: i64 = control_block_req_count(cb)
+    if count != 1
+        "FAIL: should have 1 request, got {count}\n"
+        valet_destroy(@ctx)
+        return 1
+
+    let ring: *RequestSlot = shm_get_request_ring(@slot.region)
+
+    let r1: i32 = assert_eq_u64(ring[0].id, 42)
+    if r1 != 0
+        valet_destroy(@ctx)
+        return r1
+
+    if ring[0].method != HTTP_METHOD_GET
+        "FAIL: method should be GET\n"
+        valet_destroy(@ctx)
+        return 1
+
+    valet_destroy(@ctx)
+    return 0
+
+# ============================================================================
+# Test: Response Collection
+# ============================================================================
+
+[[test]]
+fn test_valet_poll_response() -> i32
+    var ctx: ValetContext
+    valet_init(@ctx, null)
+
+    let slot_idx: i32 = valet_add_worker_slot(@ctx)
+    valet_mark_worker_running(@ctx, slot_idx)
+
+    # Simulate worker writing a response
+    let slot: *WorkerSlot = valet_get_worker_slot(@ctx, slot_idx)
+    let cb: *ControlBlock = shm_get_control_block(@slot.region)
+    let ring: *ResponseSlot = shm_get_response_ring(@slot.region)
+
+    response_slot_init(@ring[0])
+    ring[0].id = 42
+    ring[0].status = 200
+    control_block_resp_write_inc(cb)
+
+    # Poll for response
+    var resp: ResponseSlot
+    var worker_idx: i32 = 0
+    let result: i32 = valet_poll_response(@ctx, @resp, @worker_idx)
+
+    if result != 0
+        "FAIL: poll should find response\n"
+        valet_destroy(@ctx)
+        return 1
+
+    let r1: i32 = assert_eq_u64(resp.id, 42)
+    if r1 != 0
+        valet_destroy(@ctx)
+        return r1
+
+    if resp.status != 200
+        "FAIL: status should be 200\n"
+        valet_destroy(@ctx)
+        return 1
+
+    let r2: i32 = assert_eq_i32(worker_idx, slot_idx)
+    if r2 != 0
+        valet_destroy(@ctx)
+        return r2
+
+    valet_destroy(@ctx)
+    return 0
+
+[[test]]
+fn test_valet_poll_response_empty() -> i32
+    var ctx: ValetContext
+    valet_init(@ctx, null)
+
+    let slot_idx: i32 = valet_add_worker_slot(@ctx)
+    valet_mark_worker_running(@ctx, slot_idx)
+
+    var resp: ResponseSlot
+    var worker_idx: i32 = 0
+    let result: i32 = valet_poll_response(@ctx, @resp, @worker_idx)
+
+    if result != -1
+        "FAIL: poll should return -1 with no responses\n"
+        valet_destroy(@ctx)
+        return 1
+
+    valet_destroy(@ctx)
+    return 0
+
+# ============================================================================
+# Test: Worker Health Monitoring
+# ============================================================================
+
+[[test]]
+fn test_valet_health_check_ok() -> i32
+    var ctx: ValetContext
+    valet_init(@ctx, null)
+
+    let slot_idx: i32 = valet_add_worker_slot(@ctx)
+    valet_mark_worker_running(@ctx, slot_idx)
+
+    # Set a valid worker PID (use our own PID for testing)
+    let slot: *WorkerSlot = valet_get_worker_slot(@ctx, slot_idx)
+    let cb: *ControlBlock = shm_get_control_block(@slot.region)
+    cb.worker_pid = sys_getpid()
+    cb.state = WORKER_STATE_RUNNING
+
+    let health: i32 = valet_check_worker_health(@ctx, slot_idx)
+    if health != WORKER_HEALTH_OK
+        "FAIL: worker should be healthy, got {health}\n"
+        valet_destroy(@ctx)
+        return 1
+
+    valet_destroy(@ctx)
+    return 0
+
+[[test]]
+fn test_valet_health_check_dead() -> i32
+    var ctx: ValetContext
+    valet_init(@ctx, null)
+
+    let slot_idx: i32 = valet_add_worker_slot(@ctx)
+    valet_mark_worker_running(@ctx, slot_idx)
+
+    # Set an invalid PID (0 means no worker)
+    let slot: *WorkerSlot = valet_get_worker_slot(@ctx, slot_idx)
+    let cb: *ControlBlock = shm_get_control_block(@slot.region)
+    cb.worker_pid = 0
+    cb.state = WORKER_STATE_RUNNING
+
+    let health: i32 = valet_check_worker_health(@ctx, slot_idx)
+    if health != WORKER_HEALTH_DEAD
+        "FAIL: worker should be dead, got {health}\n"
+        valet_destroy(@ctx)
+        return 1
+
+    valet_destroy(@ctx)
+    return 0
+
+[[test]]
+fn test_valet_health_check_stuck() -> i32
+    var ctx: ValetContext
+    valet_init(@ctx, null)
+
+    let slot_idx: i32 = valet_add_worker_slot(@ctx)
+    valet_mark_worker_running(@ctx, slot_idx)
+
+    # Set up a worker that's been busy "too long"
+    let slot: *WorkerSlot = valet_get_worker_slot(@ctx, slot_idx)
+    let cb: *ControlBlock = shm_get_control_block(@slot.region)
+    cb.worker_pid = sys_getpid()
+    cb.state = WORKER_STATE_BUSY
+
+    # Mark it as busy since the beginning of time
+    slot.last_activity_ts = 0
+    slot.busy_since_ts = 0
+
+    # With a 0 timeout, any busy time should be "stuck"
+    let health: i32 = valet_check_worker_health_timeout(@ctx, slot_idx, 0)
+    if health != WORKER_HEALTH_STUCK
+        "FAIL: worker should be stuck, got {health}\n"
+        valet_destroy(@ctx)
+        return 1
+
+    valet_destroy(@ctx)
+    return 0
+
+# ============================================================================
+# Test: Graceful Restart
+# ============================================================================
+
+[[test]]
+fn test_valet_restart_worker() -> i32
+    var ctx: ValetContext
+    valet_init(@ctx, null)
+
+    let slot_idx: i32 = valet_add_worker_slot(@ctx)
+    valet_mark_worker_running(@ctx, slot_idx)
+
+    let result: i32 = valet_restart_worker(@ctx, slot_idx)
+    if result != 0
+        "FAIL: restart should succeed\n"
+        valet_destroy(@ctx)
+        return 1
+
+    let slot: *WorkerSlot = valet_get_worker_slot(@ctx, slot_idx)
+    if slot.state != WORKER_SLOT_RESTARTING
+        "FAIL: slot should be restarting\n"
+        valet_destroy(@ctx)
+        return 1
+
+    valet_destroy(@ctx)
+    return 0
+
+[[test]]
+fn test_valet_get_active_worker_count() -> i32
+    var ctx: ValetContext
+    var cfg: ValetConfig
+
+    valet_config_init(@cfg, 4, 64, 4096)
+    valet_init(@ctx, @cfg)
+
+    # Add 4 slots, mark 2 as running
+    var i: i32 = 0
+    while i < 4
+        valet_add_worker_slot(@ctx)
+        i = i + 1
+
+    valet_mark_worker_running(@ctx, 0)
+    valet_mark_worker_running(@ctx, 2)
+
+    let active: i32 = valet_get_active_worker_count(@ctx)
+    if active != 2
+        "FAIL: should have 2 active workers, got {active}\n"
+        valet_destroy(@ctx)
+        return 1
+
+    valet_destroy(@ctx)
+    return 0
+
+# ============================================================================
+# Test: Request ID Generation
+# ============================================================================
+
+[[test]]
+fn test_valet_request_id_generation() -> i32
+    var ctx: ValetContext
+    valet_init(@ctx, null)
+
+    let id1: u64 = valet_next_request_id(@ctx)
+    let id2: u64 = valet_next_request_id(@ctx)
+    let id3: u64 = valet_next_request_id(@ctx)
+
+    if id1 == id2
+        "FAIL: IDs should be unique (id1 == id2)\n"
+        valet_destroy(@ctx)
+        return 1
+
+    if id2 == id3
+        "FAIL: IDs should be unique (id2 == id3)\n"
+        valet_destroy(@ctx)
+        return 1
+
+    if id3 <= id2
+        "FAIL: IDs should be monotonically increasing\n"
+        valet_destroy(@ctx)
+        return 1
+
+    valet_destroy(@ctx)
+    return 0

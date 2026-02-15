@@ -1,0 +1,347 @@
+# lib/runtime.ritz - Zeus worker runtime
+#
+# The runtime is the core serve loop that:
+#   - Attaches to shared memory
+#   - Polls for requests (spin-then-wait)
+#   - Dispatches to user handlers
+#   - Writes responses back
+#
+# Design goals:
+#   - Zero allocations in hot path
+#   - No blocking, no locking
+#   - Minimal syscalls (futex only when necessary)
+
+import ritzlib.sys
+import lib.shm
+import lib.control
+import lib.ring
+import lib.arena
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+# Runtime states
+pub const RUNTIME_STATE_IDLE: i32 = 0
+pub const RUNTIME_STATE_RUNNING: i32 = 1
+pub const RUNTIME_STATE_STOPPING: i32 = 2
+pub const RUNTIME_STATE_STOPPED: i32 = 3
+
+# Default config values
+pub const DEFAULT_SPIN_ITERATIONS: i32 = 1000
+pub const DEFAULT_POLL_TIMEOUT_MS: i32 = 100
+pub const DEFAULT_MAX_BATCH_SIZE: i32 = 32
+pub const MAX_HANDLERS: i32 = 64
+
+# ============================================================================
+# Handler Types
+# ============================================================================
+
+# Handler context passed to user handlers
+pub struct HandlerContext
+    request: *RequestSlot       # 0: Incoming request
+    response: *ResponseSlot     # 8: Response to fill
+    arena: *DataArena           # 16: Data arena for allocations
+    user_data: *u8              # 24: User-provided context
+
+# Route entry for path-based dispatch
+struct RouteEntry
+    path: *u8                   # 0: Path string
+    path_len: i32               # 8: Path length
+    _pad: i32                   # 12: Padding
+    handler: fn(*HandlerContext) -> i32  # 16: Handler function
+
+# ============================================================================
+# Runtime Configuration
+# ============================================================================
+
+pub struct RuntimeConfig
+    spin_iterations: i32        # 0: Spin count before futex wait
+    poll_timeout_ms: i32        # 4: Timeout for futex wait (ms)
+    max_batch_size: i32         # 8: Max requests per poll cycle
+    _pad: i32                   # 12: Reserved
+
+# Initialize with defaults
+pub fn runtime_config_init(cfg: *RuntimeConfig)
+    cfg.spin_iterations = DEFAULT_SPIN_ITERATIONS
+    cfg.poll_timeout_ms = DEFAULT_POLL_TIMEOUT_MS
+    cfg.max_batch_size = DEFAULT_MAX_BATCH_SIZE
+
+# ============================================================================
+# Runtime Statistics
+# ============================================================================
+
+pub struct RuntimeStats
+    requests_processed: i64     # 0: Total requests handled
+    requests_failed: i64        # 8: Failed requests
+    poll_cycles: i64            # 16: Total poll iterations
+    spin_waits: i64             # 24: Times spin-wait succeeded
+    futex_waits: i64            # 32: Times fell through to futex
+
+# Initialize stats
+pub fn runtime_stats_init(stats: *RuntimeStats)
+    stats.requests_processed = 0
+    stats.requests_failed = 0
+    stats.poll_cycles = 0
+    stats.spin_waits = 0
+    stats.futex_waits = 0
+
+# ============================================================================
+# Runtime Context
+# ============================================================================
+
+pub struct RuntimeContext
+    # Configuration
+    config: RuntimeConfig       # 0: Runtime config
+    state: i32                  # 16: Current state
+    _pad1: i32                  # 20: Padding
+
+    # Shared memory
+    shm_fd: i32                 # 24: Shared memory fd
+    shm_size: i64               # 32: Region size
+    shm_base: *u8               # 40: Mapped base address
+
+    # Accessors
+    control: *ControlBlock      # 48: Control block
+    req_ring: *RequestSlot      # 56: Request ring
+    resp_ring: *ResponseSlot    # 64: Response ring
+    arena: DataArena            # 72: Data arena
+
+    # Handlers
+    routes: *RouteEntry         # 120: Route table (mmap'd)
+    route_count: i32            # 128: Number of routes
+    _pad2: i32                  # 132: Padding
+    default_handler: fn(*HandlerContext) -> i32  # 136: Fallback handler
+
+    # Stats
+    stats: RuntimeStats         # 144: Runtime statistics
+
+# ============================================================================
+# Runtime Lifecycle
+# ============================================================================
+
+# Initialize runtime with shared memory fd
+pub fn runtime_init(rt: *RuntimeContext, cfg: *RuntimeConfig, shm_fd: i32, shm_size: i64) -> i32
+    # Copy config
+    rt.config.spin_iterations = cfg.spin_iterations
+    rt.config.poll_timeout_ms = cfg.poll_timeout_ms
+    rt.config.max_batch_size = cfg.max_batch_size
+
+    rt.state = RUNTIME_STATE_IDLE
+    rt.shm_fd = shm_fd
+    rt.shm_size = shm_size
+
+    # Map shared memory
+    let prot: i64 = 0x01 | 0x02  # PROT_READ | PROT_WRITE
+    let flags: i64 = 0x01       # MAP_SHARED
+    let base: *u8 = syscall6(9, 0, shm_size, prot, flags, shm_fd as i64, 0) as *u8
+    if base == (-1 as *u8)
+        return -1
+
+    rt.shm_base = base
+
+    # Set up accessors - read layout from control block
+    rt.control = base as *ControlBlock
+    let cb: *ControlBlock = rt.control
+
+    # Calculate offsets based on ring capacity (same as shm_create)
+    let page_size: i64 = 4096
+    let cb_size: i64 = ((control_block_size() + page_size - 1) / page_size) * page_size
+    let req_ring_size: i64 = ((cb.ring_capacity * request_slot_size() + page_size - 1) / page_size) * page_size
+    let resp_ring_size: i64 = ((cb.ring_capacity * response_slot_size() + page_size - 1) / page_size) * page_size
+
+    rt.req_ring = (base + cb_size) as *RequestSlot
+    rt.resp_ring = (base + cb_size + req_ring_size) as *ResponseSlot
+
+    # Initialize arena view
+    let arena_offset: i64 = cb_size + req_ring_size + resp_ring_size
+    let arena_base: *u8 = base + arena_offset
+    let arena_size: i64 = shm_size - arena_offset
+    data_arena_attach(@rt.arena, arena_base, arena_size)
+
+    # Allocate route table
+    let route_size: i64 = (MAX_HANDLERS as i64) * 24  # sizeof(RouteEntry) = 24
+    let routes: *RouteEntry = syscall6(9, 0, route_size, 0x03, 0x22, -1, 0) as *RouteEntry
+    if routes == (-1 as *RouteEntry)
+        syscall2(11, rt.shm_base as i64, shm_size)  # munmap
+        return -1
+
+    rt.routes = routes
+    rt.route_count = 0
+
+    # Initialize stats
+    runtime_stats_init(@rt.stats)
+
+    return 0
+
+# Start the runtime
+pub fn runtime_start(rt: *RuntimeContext)
+    rt.state = RUNTIME_STATE_RUNNING
+
+# Request stop
+pub fn runtime_stop(rt: *RuntimeContext)
+    rt.state = RUNTIME_STATE_STOPPING
+
+# Clean up runtime
+pub fn runtime_destroy(rt: *RuntimeContext)
+    # Unmap route table
+    if rt.routes != null
+        let route_size: i64 = (MAX_HANDLERS as i64) * 24
+        syscall2(11, rt.routes as i64, route_size)
+        rt.routes = null
+
+    # Unmap shared memory
+    if rt.shm_base != null
+        syscall2(11, rt.shm_base as i64, rt.shm_size)
+        rt.shm_base = null
+
+    rt.state = RUNTIME_STATE_STOPPED
+
+# ============================================================================
+# Handler Registration
+# ============================================================================
+
+# Register a handler for a path
+pub fn runtime_register_handler(rt: *RuntimeContext, path: *u8, handler: fn(*HandlerContext) -> i32) -> i32
+    if rt.route_count >= MAX_HANDLERS
+        return -1
+
+    let entry: *RouteEntry = rt.routes + rt.route_count
+    entry.path = path
+    entry.path_len = str_len(path)
+    entry.handler = handler
+
+    rt.route_count = rt.route_count + 1
+    return 0
+
+# Set default handler for unmatched paths
+pub fn runtime_set_default_handler(rt: *RuntimeContext, handler: fn(*HandlerContext) -> i32)
+    rt.default_handler = handler
+
+# Find handler for path - returns handler as *u8 (null if not found)
+pub fn runtime_find_handler(rt: *RuntimeContext, path: *u8, path_len: i32) -> *u8
+    var i: i32 = 0
+    while i < rt.route_count
+        let entry: *RouteEntry = rt.routes + i
+        if entry.path_len == path_len
+            if str_eq(entry.path, path, path_len)
+                return entry.handler as *u8
+        i = i + 1
+
+    return rt.default_handler as *u8
+
+# String length helper
+fn str_len(s: *u8) -> i32
+    var len: i32 = 0
+    while *(s + len) != 0
+        len = len + 1
+    return len
+
+# String equality helper
+fn str_eq(a: *u8, b: *u8, len: i32) -> i32
+    var i: i32 = 0
+    while i < len
+        if *(a + i) != *(b + i)
+            return 0
+        i = i + 1
+    return 1
+
+# ============================================================================
+# Request Processing
+# ============================================================================
+
+# Poll for requests and process them
+pub fn runtime_poll_and_process(rt: *RuntimeContext, max_requests: i32) -> i32
+    rt.stats.poll_cycles = rt.stats.poll_cycles + 1
+
+    let cb: *ControlBlock = rt.control
+    var processed: i32 = 0
+    var batch_limit: i32 = max_requests
+    if batch_limit > rt.config.max_batch_size
+        batch_limit = rt.config.max_batch_size
+
+    # Process available requests
+    while processed < batch_limit
+        # Check if any requests available
+        let count: i64 = control_block_req_count(cb)
+        if count <= 0
+            break
+
+        # Get next request
+        let slot_idx: i64 = control_block_slot_index(cb, cb.req_read_idx)
+        let req: *RequestSlot = rt.req_ring + slot_idx
+
+        # Skip if not complete
+        if (req.flags & REQ_FLAG_COMPLETE) == 0
+            break
+
+        # Process request
+        let result: i32 = runtime_process_request(rt, req)
+        if result < 0
+            rt.stats.requests_failed = rt.stats.requests_failed + 1
+        else
+            rt.stats.requests_processed = rt.stats.requests_processed + 1
+
+        # Advance read index
+        control_block_req_read_inc(cb)
+        processed = processed + 1
+
+    return processed
+
+# Process a single request
+fn runtime_process_request(rt: *RuntimeContext, req: *RequestSlot) -> i32
+    let cb: *ControlBlock = rt.control
+
+    # Get response slot
+    let resp_idx: i64 = control_block_slot_index(cb, cb.resp_write_idx)
+    let resp: *ResponseSlot = rt.resp_ring + resp_idx
+    response_slot_init(resp)
+    resp.id = req.id
+
+    # Find handler
+    var handler_ptr: *u8 = null
+    if req.path_len > 0
+        let path: *u8 = data_arena_offset_to_ptr(@rt.arena, req.path_offset as i64)
+        handler_ptr = runtime_find_handler(rt, path, req.path_len as i32)
+    else
+        handler_ptr = rt.default_handler as *u8
+
+    # Invoke handler
+    var result: i32 = 0
+    if handler_ptr != null
+        var ctx: HandlerContext
+        ctx.request = req
+        ctx.response = resp
+        ctx.arena = @rt.arena
+        ctx.user_data = null
+        # Cast back to function pointer type and call
+        let h: fn(*HandlerContext) -> i32 = handler_ptr as fn(*HandlerContext) -> i32
+        result = h(@ctx)
+    else
+        # No handler - return 404
+        resp.status = 404
+        resp.flags = RESP_FLAG_COMPLETE
+
+    # Mark response complete
+    resp.flags = resp.flags | RESP_FLAG_COMPLETE
+
+    # Advance response write index
+    control_block_resp_write_inc(cb)
+
+    return result
+
+# ============================================================================
+# Statistics
+# ============================================================================
+
+# Get current stats
+pub fn runtime_get_stats(rt: *RuntimeContext, stats: *RuntimeStats)
+    stats.requests_processed = rt.stats.requests_processed
+    stats.requests_failed = rt.stats.requests_failed
+    stats.poll_cycles = rt.stats.poll_cycles
+    stats.spin_waits = rt.stats.spin_waits
+    stats.futex_waits = rt.stats.futex_waits
+
+# Reset stats
+pub fn runtime_reset_stats(rt: *RuntimeContext)
+    runtime_stats_init(@rt.stats)

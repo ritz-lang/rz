@@ -1,0 +1,238 @@
+# uniq - report or omit repeated lines
+#
+# Usage: uniq [OPTION]... [INPUT [OUTPUT]]
+#   Filter adjacent matching lines from INPUT (or stdin), writing to OUTPUT (or stdout).
+#   Note: Input should be sorted for uniq to work correctly.
+#
+# Options:
+#   -c    prefix lines by the number of occurrences
+#   -d    only print duplicate lines (appear more than once)
+#   -u    only print unique lines (appear exactly once)
+#   -i    ignore case when comparing (ASCII only)
+#
+# This example exercises:
+#   - Argument parsing with ritzlib.args
+#   - Vec<u8> and Vec<LineBounds> from ritzlib
+#   - Line comparison with options
+#   - Count tracking and formatting
+
+# ============================================================================
+# Standard library imports
+# ============================================================================
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.gvec
+import ritzlib.args
+
+# ============================================================================
+# Options struct
+# ============================================================================
+
+struct UniqOptions
+    count: i32       # -c: prefix with count
+    duplicates: i32  # -d: only print duplicates
+    unique: i32      # -u: only print unique
+    ignore_case: i32 # -i: case insensitive
+
+# ============================================================================
+# String comparison
+# ============================================================================
+
+fn to_lower(c: i32) -> i32
+    # Convert ASCII uppercase to lowercase
+    if c >= 'A' && c <= 'Z'  # 'A' to 'Z'
+        return c + 32
+    return c
+
+fn lines_equal(buf: &Vec<u8>, a: *LineBounds, b: *LineBounds, ignore_case: i32) -> i32
+    # Compare two lines, return 1 if equal, 0 if different
+    # Exclude trailing newline from comparison
+    var a_len: i64 = a.length
+    var b_len: i64 = b.length
+
+    # Strip trailing newlines for comparison
+    if a_len > 0 && *(buf.data + a.start + a_len - 1) == '\n'
+        a_len -= 1
+    if b_len > 0 && *(buf.data + b.start + b_len - 1) == '\n'
+        b_len -= 1
+
+    if a_len != b_len
+        return 0
+
+    var i: i64 = 0
+    while i < a_len
+        var a_byte: i32 = (*(buf.data + a.start + i)) as i32
+        var b_byte: i32 = (*(buf.data + b.start + i)) as i32
+
+        if ignore_case != 0
+            a_byte = to_lower(a_byte)
+            b_byte = to_lower(b_byte)
+
+        if a_byte != b_byte
+            return 0
+        i += 1
+
+    return 1
+
+# ============================================================================
+# Integer to string conversion
+# ============================================================================
+
+fn print_int_fd(fd: i32, n: i64)
+    var buf: [32]u8
+    var i: i32 = 31
+
+    if n == 0
+        buf[i] = 48  # '0'
+        i -= 1
+    else
+        var num: i64 = n
+        while num > 0
+            buf[i] = ((num % 10) + '0') as u8
+            num /= 10
+            i -= 1
+
+    sys_write(fd, &buf[i + 1], (31 - i) as i64)
+
+# ============================================================================
+# Core uniq logic
+# ============================================================================
+
+fn print_line_with_count(fd: i32, buf: &Vec<u8>, bounds: *LineBounds, count: i64, show_count: i32)
+    if show_count != 0
+        # Print right-aligned count (7 chars) followed by space
+        # For simplicity, just print count and space
+        print_int_fd(fd, count)
+        sys_write(fd, " " as *u8, 1)
+
+    sys_write(fd, buf.data + bounds.start, bounds.length)
+
+    # Add newline if line doesn't have one
+    if bounds.length == 0 || *(buf.data + bounds.start + bounds.length - 1) != '\n'
+        sys_write(fd, "\n" as *u8, 1)
+
+fn should_print(count: i64, opts: *UniqOptions) -> i32
+    # Determine if we should print based on count and options
+    # -d: only duplicates (count > 1)
+    # -u: only unique (count == 1)
+    # default: print all
+
+    if opts.duplicates != 0 && opts.unique != 0
+        # Both -d and -u: print nothing (they're mutually exclusive in effect)
+        return 0
+
+    if opts.duplicates != 0
+        if count > 1
+            return 1
+        return 0
+
+    if opts.unique != 0
+        if count == 1
+            return 1
+        return 0
+
+    # Default: print everything
+    return 1
+
+fn process_uniq(buf: &Vec<u8>, lines: &Vec<LineBounds>, opts: *UniqOptions, out_fd: i32)
+    if lines.len == 0
+        return
+
+    var current_start: i64 = 0
+    var count: i64 = 1
+
+    var i: i64 = 1
+    while i < lines.len
+        let prev: *LineBounds = lines.data + i - 1
+        let curr: *LineBounds = lines.data + i
+
+        if lines_equal(buf, prev, curr, opts.ignore_case) != 0
+            # Same as previous, increment count
+            count += 1
+        else
+            # Different line, output the previous group if appropriate
+            let first_of_group: *LineBounds = lines.data + current_start
+            if should_print(count, opts) != 0
+                print_line_with_count(out_fd, buf, first_of_group, count, opts.count)
+
+            # Start new group
+            current_start = i
+            count = 1
+
+        i += 1
+
+    # Output the last group
+    let last_group: *LineBounds = lines.data + current_start
+    if should_print(count, opts) != 0
+        print_line_with_count(out_fd, buf, last_group, count, opts.count)
+
+# ============================================================================
+# Main
+# ============================================================================
+
+fn main(argc: i32, argv: **u8) -> i32
+    # Set up argument parser
+    var parser: ArgParser
+    args_init(&parser, "uniq", "Report or omit repeated lines")
+
+    # Define flags
+    args_flag(&parser, 99, "count", "Prefix lines by the number of occurrences")        # 'c'
+    args_flag(&parser, 100, "repeated", "Only print duplicate lines")                   # 'd'
+    args_flag(&parser, 117, "unique", "Only print unique lines")                        # 'u'
+    args_flag(&parser, 105, "ignore-case", "Ignore case when comparing (ASCII only)")   # 'i'
+
+    # Define positionals: [INPUT [OUTPUT]] - both optional, max 2
+    args_positional(&parser, "[INPUT [OUTPUT]]", "Input and output files (default: stdin/stdout)", 0, 2)
+
+    # Parse arguments
+    if args_parse(&parser, argc, argv) != 0
+        return 1
+
+    # Populate UniqOptions from parsed flags
+    var opts: UniqOptions
+    opts.count = args_get_flag(&parser, 99)        # 'c'
+    opts.duplicates = args_get_flag(&parser, 100)  # 'd'
+    opts.unique = args_get_flag(&parser, 117)      # 'u'
+    opts.ignore_case = args_get_flag(&parser, 105) # 'i'
+
+    # Open input file (or use stdin)
+    var input_fd: i32 = STDIN
+    if parser.positional_count >= 1
+        let input_path: *u8 = args_get_positional(&parser, 0)
+        input_fd = sys_open(input_path, O_RDONLY)
+        if input_fd < 0
+            sys_write(STDERR, "uniq: cannot open input file\n" as *u8, 29)
+            return 1
+
+    # Open output file (or use stdout)
+    var output_fd: i32 = STDOUT
+    if parser.positional_count >= 2
+        let output_path: *u8 = args_get_positional(&parser, 1)
+        # O_WRONLY | O_CREAT | O_TRUNC = 1 | 64 | 512 = 577
+        # Mode 0644 = 420
+        output_fd = sys_open3(output_path, O_WRONLY + O_CREAT + O_TRUNC, 420)
+        if output_fd < 0
+            sys_write(STDERR, "uniq: cannot open output file\n" as *u8, 30)
+            if input_fd != STDIN
+                sys_close(input_fd)
+            return 1
+
+    var buf: Vec<u8> = vec_with_cap<u8>(4096)
+    var lines: Vec<LineBounds> = vec_with_cap<LineBounds>(64)
+
+    let result: i64 = vec_read_all_fd(input_fd, &buf)
+    if result < 0
+        if input_fd != STDIN
+            sys_close(input_fd)
+        return 1
+
+    vec_find_lines(&buf, &lines)
+    process_uniq(&buf, &lines, &opts, output_fd)
+
+    if input_fd != STDIN
+        sys_close(input_fd)
+    if output_fd != STDOUT
+        sys_close(output_fd)
+
+    return 0

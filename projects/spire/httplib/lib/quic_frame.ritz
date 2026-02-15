@@ -1,0 +1,446 @@
+# lib/quic_frame.ritz - QUIC Frame Types (RFC 9000 Section 19)
+#
+# QUIC frames are the fundamental unit of data transmission.
+# Each frame has a type-specific format.
+
+import ritzlib.span
+import lib.quic_varint
+
+# ============================================================================
+# Error Codes
+# ============================================================================
+
+pub const QFRAME_OK: i32 = 0
+pub const QFRAME_ERR_INCOMPLETE: i32 = -1
+pub const QFRAME_ERR_INVALID: i32 = -2
+
+# ============================================================================
+# Frame Types (RFC 9000 Section 19)
+# ============================================================================
+
+pub const QUIC_FRAME_PADDING: i64 = 0x00
+pub const QUIC_FRAME_PING: i64 = 0x01
+pub const QUIC_FRAME_ACK: i64 = 0x02
+pub const QUIC_FRAME_ACK_ECN: i64 = 0x03
+pub const QUIC_FRAME_RESET_STREAM: i64 = 0x04
+pub const QUIC_FRAME_STOP_SENDING: i64 = 0x05
+pub const QUIC_FRAME_CRYPTO: i64 = 0x06
+pub const QUIC_FRAME_NEW_TOKEN: i64 = 0x07
+pub const QUIC_FRAME_STREAM: i64 = 0x08      # 0x08-0x0f are STREAM with different flags
+pub const QUIC_FRAME_STREAM_MAX: i64 = 0x0F
+pub const QUIC_FRAME_MAX_DATA: i64 = 0x10
+pub const QUIC_FRAME_MAX_STREAM_DATA: i64 = 0x11
+pub const QUIC_FRAME_MAX_STREAMS_BIDI: i64 = 0x12
+pub const QUIC_FRAME_MAX_STREAMS_UNI: i64 = 0x13
+pub const QUIC_FRAME_DATA_BLOCKED: i64 = 0x14
+pub const QUIC_FRAME_STREAM_DATA_BLOCKED: i64 = 0x15
+pub const QUIC_FRAME_STREAMS_BLOCKED_BIDI: i64 = 0x16
+pub const QUIC_FRAME_STREAMS_BLOCKED_UNI: i64 = 0x17
+pub const QUIC_FRAME_NEW_CONNECTION_ID: i64 = 0x18
+pub const QUIC_FRAME_RETIRE_CONNECTION_ID: i64 = 0x19
+pub const QUIC_FRAME_PATH_CHALLENGE: i64 = 0x1a
+pub const QUIC_FRAME_PATH_RESPONSE: i64 = 0x1b
+pub const QUIC_FRAME_CONNECTION_CLOSE: i64 = 0x1c
+pub const QUIC_FRAME_CONNECTION_CLOSE_APP: i64 = 0x1d
+pub const QUIC_FRAME_HANDSHAKE_DONE: i64 = 0x1e
+
+# ============================================================================
+# Stream Frame Flags (bits 0-2 of frame type 0x08-0x0f)
+# ============================================================================
+
+pub const STREAM_FLAG_FIN: i64 = 0x01    # Bit 0: FIN (end of stream)
+pub const STREAM_FLAG_LEN: i64 = 0x02    # Bit 1: Length field present
+pub const STREAM_FLAG_OFF: i64 = 0x04    # Bit 2: Offset field present
+
+# ============================================================================
+# Frame Header (common to all frames)
+# ============================================================================
+
+pub struct QuicFrameHeader
+    frame_type: i64
+    bytes_consumed: i32
+
+# ============================================================================
+# PADDING Frame (Type 0x00)
+# ============================================================================
+
+pub struct PaddingFrame
+    count: i64  # Number of PADDING bytes
+
+# ============================================================================
+# ACK Frame (Type 0x02, 0x03)
+# ============================================================================
+
+pub struct AckRange
+    gap: i64
+    ack_range_len: i64
+
+pub struct AckFrame
+    largest_ack: i64
+    ack_delay: i64
+    ack_range_count: i64
+    first_ack_range: i64
+    # ECN counters (only for type 0x03)
+    ect0_count: i64
+    ect1_count: i64
+    ecn_ce_count: i64
+    has_ecn: i32
+    # Additional ranges stored externally
+
+# ============================================================================
+# CRYPTO Frame (Type 0x06)
+# ============================================================================
+
+pub struct CryptoFrame
+    offset: i64
+    length: i64
+    data_offset: i64  # Offset in buffer where data starts
+
+# ============================================================================
+# STREAM Frame (Type 0x08-0x0f)
+# ============================================================================
+
+pub struct StreamFrame
+    stream_id: i64
+    offset: i64      # 0 if OFF bit not set
+    length: i64      # Remaining payload if LEN bit not set
+    fin: i32
+    data_offset: i64 # Offset in buffer where stream data starts
+
+# ============================================================================
+# MAX_DATA Frame (Type 0x10)
+# ============================================================================
+
+pub struct MaxDataFrame
+    max_data: i64
+
+# ============================================================================
+# MAX_STREAM_DATA Frame (Type 0x11)
+# ============================================================================
+
+pub struct MaxStreamDataFrame
+    stream_id: i64
+    max_stream_data: i64
+
+# ============================================================================
+# MAX_STREAMS Frame (Type 0x12, 0x13)
+# ============================================================================
+
+pub struct MaxStreamsFrame
+    max_streams: i64
+    is_bidi: i32
+
+# ============================================================================
+# RESET_STREAM Frame (Type 0x04)
+# ============================================================================
+
+pub struct ResetStreamFrame
+    stream_id: i64
+    error_code: i64
+    final_size: i64
+
+# ============================================================================
+# STOP_SENDING Frame (Type 0x05)
+# ============================================================================
+
+pub struct StopSendingFrame
+    stream_id: i64
+    error_code: i64
+
+# ============================================================================
+# CONNECTION_CLOSE Frame (Type 0x1c, 0x1d)
+# ============================================================================
+
+pub struct ConnectionCloseFrame
+    error_code: i64
+    frame_type: i64       # Only for type 0x1c
+    reason_length: i64
+    reason_offset: i64    # Offset in buffer where reason phrase starts
+    is_app_error: i32     # 1 for type 0x1d
+
+# ============================================================================
+# NEW_CONNECTION_ID Frame (Type 0x18)
+# ============================================================================
+
+pub struct NewConnectionIdFrame
+    sequence_number: i64
+    retire_prior_to: i64
+    cid_length: i32
+    cid: [20]u8
+    stateless_reset_token: [16]u8
+
+# ============================================================================
+# Frame Type Detection
+# ============================================================================
+
+# Check if this is a STREAM frame (0x08-0x0f)
+pub fn is_stream_frame(frame_type: i64) -> i32
+    if frame_type >= QUIC_FRAME_STREAM && frame_type <= QUIC_FRAME_STREAM_MAX
+        return 1
+    return 0
+
+# Get STREAM frame flags from frame type
+pub fn stream_frame_flags(frame_type: i64) -> i64
+    return frame_type & 0x07
+
+# ============================================================================
+# Frame Header Parsing
+# ============================================================================
+
+# Parse frame type (varint)
+pub fn quic_parse_frame_type(buf: *u8, buf_len: i32, header: *QuicFrameHeader) -> i32
+    var vr: VarintResult
+    let ret: i32 = varint_parse(buf, buf_len, @vr)
+    if ret != VARINT_OK
+        return QFRAME_ERR_INCOMPLETE
+    header.frame_type = vr.value
+    header.bytes_consumed = vr.bytes_consumed
+    return QFRAME_OK
+
+# ============================================================================
+# PADDING Frame Parsing
+# ============================================================================
+
+# Count consecutive PADDING frames
+pub fn quic_parse_padding(buf: *u8, buf_len: i32, frame: *PaddingFrame) -> i32
+    var count: i64 = 0
+    var i: i32 = 0
+    while i < buf_len && *(buf + i) == 0x00
+        count = count + 1
+        i = i + 1
+    frame.count = count
+    return i
+
+# ============================================================================
+# ACK Frame Parsing
+# ============================================================================
+
+pub fn quic_parse_ack(buf: *u8, buf_len: i32, has_ecn: i32, frame: *AckFrame) -> i32
+    var pos: i32 = 0
+    var vr: VarintResult
+    var ret: i32
+
+    frame.has_ecn = has_ecn
+    frame.ect0_count = 0
+    frame.ect1_count = 0
+    frame.ecn_ce_count = 0
+
+    # Largest Acknowledged
+    ret = varint_parse(buf + pos, buf_len - pos, @vr)
+    if ret != VARINT_OK
+        return QFRAME_ERR_INCOMPLETE
+    frame.largest_ack = vr.value
+    pos = pos + vr.bytes_consumed
+
+    # ACK Delay
+    ret = varint_parse(buf + pos, buf_len - pos, @vr)
+    if ret != VARINT_OK
+        return QFRAME_ERR_INCOMPLETE
+    frame.ack_delay = vr.value
+    pos = pos + vr.bytes_consumed
+
+    # ACK Range Count
+    ret = varint_parse(buf + pos, buf_len - pos, @vr)
+    if ret != VARINT_OK
+        return QFRAME_ERR_INCOMPLETE
+    frame.ack_range_count = vr.value
+    pos = pos + vr.bytes_consumed
+
+    # First ACK Range
+    ret = varint_parse(buf + pos, buf_len - pos, @vr)
+    if ret != VARINT_OK
+        return QFRAME_ERR_INCOMPLETE
+    frame.first_ack_range = vr.value
+    pos = pos + vr.bytes_consumed
+
+    # Skip additional ACK ranges (gap + range pairs)
+    var i: i64 = 0
+    while i < frame.ack_range_count
+        # Gap
+        ret = varint_parse(buf + pos, buf_len - pos, @vr)
+        if ret != VARINT_OK
+            return QFRAME_ERR_INCOMPLETE
+        pos = pos + vr.bytes_consumed
+
+        # ACK Range Length
+        ret = varint_parse(buf + pos, buf_len - pos, @vr)
+        if ret != VARINT_OK
+            return QFRAME_ERR_INCOMPLETE
+        pos = pos + vr.bytes_consumed
+
+        i = i + 1
+
+    # ECN counters (if present)
+    if has_ecn != 0
+        ret = varint_parse(buf + pos, buf_len - pos, @vr)
+        if ret != VARINT_OK
+            return QFRAME_ERR_INCOMPLETE
+        frame.ect0_count = vr.value
+        pos = pos + vr.bytes_consumed
+
+        ret = varint_parse(buf + pos, buf_len - pos, @vr)
+        if ret != VARINT_OK
+            return QFRAME_ERR_INCOMPLETE
+        frame.ect1_count = vr.value
+        pos = pos + vr.bytes_consumed
+
+        ret = varint_parse(buf + pos, buf_len - pos, @vr)
+        if ret != VARINT_OK
+            return QFRAME_ERR_INCOMPLETE
+        frame.ecn_ce_count = vr.value
+        pos = pos + vr.bytes_consumed
+
+    return pos
+
+# ============================================================================
+# CRYPTO Frame Parsing
+# ============================================================================
+
+pub fn quic_parse_crypto(buf: *u8, buf_len: i32, frame: *CryptoFrame) -> i32
+    var pos: i32 = 0
+    var vr: VarintResult
+    var ret: i32
+
+    # Offset
+    ret = varint_parse(buf + pos, buf_len - pos, @vr)
+    if ret != VARINT_OK
+        return QFRAME_ERR_INCOMPLETE
+    frame.offset = vr.value
+    pos = pos + vr.bytes_consumed
+
+    # Length
+    ret = varint_parse(buf + pos, buf_len - pos, @vr)
+    if ret != VARINT_OK
+        return QFRAME_ERR_INCOMPLETE
+    frame.length = vr.value
+    pos = pos + vr.bytes_consumed
+
+    frame.data_offset = pos as i64
+
+    # Verify we have enough data
+    if buf_len < pos + (frame.length as i32)
+        return QFRAME_ERR_INCOMPLETE
+
+    return pos + (frame.length as i32)
+
+# ============================================================================
+# STREAM Frame Parsing
+# ============================================================================
+
+pub fn quic_parse_stream(buf: *u8, buf_len: i32, frame_type: i64, frame: *StreamFrame, remaining_len: i64) -> i32
+    var pos: i32 = 0
+    var vr: VarintResult
+    var ret: i32
+    let flags: i64 = stream_frame_flags(frame_type)
+
+    frame.fin = ((flags & STREAM_FLAG_FIN) != 0) as i32
+    frame.offset = 0
+
+    # Stream ID
+    ret = varint_parse(buf + pos, buf_len - pos, @vr)
+    if ret != VARINT_OK
+        return QFRAME_ERR_INCOMPLETE
+    frame.stream_id = vr.value
+    pos = pos + vr.bytes_consumed
+
+    # Offset (if OFF flag set)
+    if (flags & STREAM_FLAG_OFF) != 0
+        ret = varint_parse(buf + pos, buf_len - pos, @vr)
+        if ret != VARINT_OK
+            return QFRAME_ERR_INCOMPLETE
+        frame.offset = vr.value
+        pos = pos + vr.bytes_consumed
+
+    # Length (if LEN flag set)
+    if (flags & STREAM_FLAG_LEN) != 0
+        ret = varint_parse(buf + pos, buf_len - pos, @vr)
+        if ret != VARINT_OK
+            return QFRAME_ERR_INCOMPLETE
+        frame.length = vr.value
+        pos = pos + vr.bytes_consumed
+    else
+        # No length field - data extends to end of packet
+        frame.length = remaining_len - pos as i64
+
+    frame.data_offset = pos as i64
+
+    return pos + (frame.length as i32)
+
+# ============================================================================
+# MAX_DATA Frame Parsing
+# ============================================================================
+
+pub fn quic_parse_max_data(buf: *u8, buf_len: i32, frame: *MaxDataFrame) -> i32
+    var vr: VarintResult
+    let ret: i32 = varint_parse(buf, buf_len, @vr)
+    if ret != VARINT_OK
+        return QFRAME_ERR_INCOMPLETE
+    frame.max_data = vr.value
+    return vr.bytes_consumed
+
+# ============================================================================
+# MAX_STREAM_DATA Frame Parsing
+# ============================================================================
+
+pub fn quic_parse_max_stream_data(buf: *u8, buf_len: i32, frame: *MaxStreamDataFrame) -> i32
+    var pos: i32 = 0
+    var vr: VarintResult
+    var ret: i32
+
+    # Stream ID
+    ret = varint_parse(buf + pos, buf_len - pos, @vr)
+    if ret != VARINT_OK
+        return QFRAME_ERR_INCOMPLETE
+    frame.stream_id = vr.value
+    pos = pos + vr.bytes_consumed
+
+    # Max Stream Data
+    ret = varint_parse(buf + pos, buf_len - pos, @vr)
+    if ret != VARINT_OK
+        return QFRAME_ERR_INCOMPLETE
+    frame.max_stream_data = vr.value
+    pos = pos + vr.bytes_consumed
+
+    return pos
+
+# ============================================================================
+# CONNECTION_CLOSE Frame Parsing
+# ============================================================================
+
+pub fn quic_parse_connection_close(buf: *u8, buf_len: i32, is_app: i32, frame: *ConnectionCloseFrame) -> i32
+    var pos: i32 = 0
+    var vr: VarintResult
+    var ret: i32
+
+    frame.is_app_error = is_app
+    frame.frame_type = 0
+
+    # Error Code
+    ret = varint_parse(buf + pos, buf_len - pos, @vr)
+    if ret != VARINT_OK
+        return QFRAME_ERR_INCOMPLETE
+    frame.error_code = vr.value
+    pos = pos + vr.bytes_consumed
+
+    # Frame Type (only for transport close, type 0x1c)
+    if is_app == 0
+        ret = varint_parse(buf + pos, buf_len - pos, @vr)
+        if ret != VARINT_OK
+            return QFRAME_ERR_INCOMPLETE
+        frame.frame_type = vr.value
+        pos = pos + vr.bytes_consumed
+
+    # Reason Phrase Length
+    ret = varint_parse(buf + pos, buf_len - pos, @vr)
+    if ret != VARINT_OK
+        return QFRAME_ERR_INCOMPLETE
+    frame.reason_length = vr.value
+    pos = pos + vr.bytes_consumed
+
+    frame.reason_offset = pos as i64
+
+    # Verify we have enough data for reason phrase
+    if buf_len < pos + (frame.reason_length as i32)
+        return QFRAME_ERR_INCOMPLETE
+
+    return pos + (frame.reason_length as i32)

@@ -1,0 +1,164 @@
+# test/test_server_auth.ritz - Tests for server-level authentication
+#
+# Tests that authentication state is tracked per-connection and
+# that requirepass configuration works correctly.
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+import ritzlib.memory
+import lib.tome
+import lib.resp
+import lib.commands
+import lib.server
+
+
+# ============================================================================
+# Connection State Tests
+# ============================================================================
+
+[[test]]
+fn test_conn_state_init() -> i32
+    var state: ConnectionState
+    conn_state_init(@state)
+
+    # Should start unauthenticated
+    if state.is_authenticated != 0
+        return 1
+
+    return 0
+
+
+[[test]]
+fn test_conn_state_authenticate() -> i32
+    var state: ConnectionState
+    conn_state_init(@state)
+
+    # Mark as authenticated
+    state.is_authenticated = 1
+
+    if state.is_authenticated != 1
+        return 1
+
+    return 0
+
+
+# ============================================================================
+# Server Config Tests
+# ============================================================================
+
+[[test]]
+fn test_server_no_password_allows_all() -> i32
+    # When password is null, all commands should work
+    var store: Store = store_new()
+    var buf: [8192]u8
+
+    var ctx: CommandContext
+    cmd_ctx_init_auth(@ctx, @store, @buf[0], 8192, null, 0)
+
+    # Parse and execute PING
+    var parser: RespParser
+    resp_parser_init(@parser, c"*1\r\n$4\r\nPING\r\n", 14)
+    let parse_result: i32 = resp_parse(@parser)
+    if parse_result != RESP_OK
+        return 1
+
+    cmd_dispatch(@ctx, @parser.command)
+    buf[ctx.resp_len] = 0
+
+    # Should return PONG (not NOAUTH error)
+    if strcmp(@buf[0], c"+PONG\r\n") != 0
+        return 2
+
+    return 0
+
+
+[[test]]
+fn test_server_password_blocks_before_auth() -> i32
+    var store: Store = store_new()
+    var buf: [8192]u8
+
+    # Password set, not authenticated
+    var ctx: CommandContext
+    cmd_ctx_init_auth(@ctx, @store, @buf[0], 8192, c"secret123", 0)
+
+    # Parse and execute PING
+    var parser: RespParser
+    resp_parser_init(@parser, c"*1\r\n$4\r\nPING\r\n", 14)
+    let parse_result: i32 = resp_parse(@parser)
+    if parse_result != RESP_OK
+        return 1
+
+    cmd_dispatch(@ctx, @parser.command)
+    buf[ctx.resp_len] = 0
+
+    # Should return error (starts with -)
+    if buf[0] != 45  # '-'
+        return 2
+
+    return 0
+
+
+[[test]]
+fn test_server_password_allows_after_auth() -> i32
+    var store: Store = store_new()
+    var buf: [8192]u8
+
+    # Password set, IS authenticated
+    var ctx: CommandContext
+    cmd_ctx_init_auth(@ctx, @store, @buf[0], 8192, c"secret123", 1)
+
+    # Parse and execute PING
+    var parser: RespParser
+    resp_parser_init(@parser, c"*1\r\n$4\r\nPING\r\n", 14)
+    let parse_result: i32 = resp_parse(@parser)
+    if parse_result != RESP_OK
+        return 1
+
+    cmd_dispatch(@ctx, @parser.command)
+    buf[ctx.resp_len] = 0
+
+    # Should return PONG
+    if strcmp(@buf[0], c"+PONG\r\n") != 0
+        return 2
+
+    return 0
+
+
+# ============================================================================
+# Auth Command Flow Tests
+# ============================================================================
+
+[[test]]
+fn test_auth_sets_flag() -> i32
+    var store: Store = store_new()
+    var buf: [8192]u8
+
+    # Password set, not authenticated
+    var ctx: CommandContext
+    cmd_ctx_init_auth(@ctx, @store, @buf[0], 8192, c"secret123", 0)
+
+    # Verify initially not authenticated
+    if ctx.is_authenticated != 0
+        return 1
+
+    # Execute AUTH with correct password
+    var parser: RespParser
+    resp_parser_init(@parser, c"*2\r\n$4\r\nAUTH\r\n$9\r\nsecret123\r\n", 32)
+    let parse_result: i32 = resp_parse(@parser)
+    if parse_result != RESP_OK
+        return 2
+
+    cmd_dispatch(@ctx, @parser.command)
+    buf[ctx.resp_len] = 0
+
+    # Should return OK
+    if strcmp(@buf[0], c"+OK\r\n") != 0
+        return 3
+
+    # Flag should now be set
+    if ctx.is_authenticated != 1
+        return 4
+
+    return 0
+

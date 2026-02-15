@@ -1,0 +1,375 @@
+# lib/h2_frame.ritz - HTTP/2 frame types and parsing
+#
+# HTTP/2 binary framing layer per RFC 7540.
+
+import ritzlib.span
+import ritzlib.str
+
+# ============================================================================
+# Error Codes
+# ============================================================================
+
+pub const H2_OK: i32 = 0
+pub const H2_ERR_INCOMPLETE: i32 = -1
+pub const H2_ERR_INVALID: i32 = -2
+pub const H2_ERR_FRAME_SIZE: i32 = -3
+
+# HTTP/2 Error Codes (for RST_STREAM and GOAWAY)
+pub const H2_ERROR_NO_ERROR: i32 = 0x0
+pub const H2_ERROR_PROTOCOL_ERROR: i32 = 0x1
+pub const H2_ERROR_INTERNAL_ERROR: i32 = 0x2
+pub const H2_ERROR_FLOW_CONTROL_ERROR: i32 = 0x3
+pub const H2_ERROR_SETTINGS_TIMEOUT: i32 = 0x4
+pub const H2_ERROR_STREAM_CLOSED: i32 = 0x5
+pub const H2_ERROR_FRAME_SIZE_ERROR: i32 = 0x6
+pub const H2_ERROR_REFUSED_STREAM: i32 = 0x7
+pub const H2_ERROR_CANCEL: i32 = 0x8
+pub const H2_ERROR_COMPRESSION_ERROR: i32 = 0x9
+pub const H2_ERROR_CONNECT_ERROR: i32 = 0xa
+pub const H2_ERROR_ENHANCE_YOUR_CALM: i32 = 0xb
+pub const H2_ERROR_INADEQUATE_SECURITY: i32 = 0xc
+pub const H2_ERROR_HTTP_1_1_REQUIRED: i32 = 0xd
+
+# ============================================================================
+# Frame Types
+# ============================================================================
+
+pub const H2_FRAME_DATA: i32 = 0x0
+pub const H2_FRAME_HEADERS: i32 = 0x1
+pub const H2_FRAME_PRIORITY: i32 = 0x2
+pub const H2_FRAME_RST_STREAM: i32 = 0x3
+pub const H2_FRAME_SETTINGS: i32 = 0x4
+pub const H2_FRAME_PUSH_PROMISE: i32 = 0x5
+pub const H2_FRAME_PING: i32 = 0x6
+pub const H2_FRAME_GOAWAY: i32 = 0x7
+pub const H2_FRAME_WINDOW_UPDATE: i32 = 0x8
+pub const H2_FRAME_CONTINUATION: i32 = 0x9
+
+# ============================================================================
+# Frame Flags
+# ============================================================================
+
+pub const H2_FLAG_END_STREAM: i32 = 0x1
+pub const H2_FLAG_ACK: i32 = 0x1
+pub const H2_FLAG_END_HEADERS: i32 = 0x4
+pub const H2_FLAG_PADDED: i32 = 0x8
+pub const H2_FLAG_PRIORITY: i32 = 0x20
+
+# ============================================================================
+# Settings Identifiers
+# ============================================================================
+
+pub const H2_SETTINGS_HEADER_TABLE_SIZE: i32 = 0x1
+pub const H2_SETTINGS_ENABLE_PUSH: i32 = 0x2
+pub const H2_SETTINGS_MAX_CONCURRENT_STREAMS: i32 = 0x3
+pub const H2_SETTINGS_INITIAL_WINDOW_SIZE: i32 = 0x4
+pub const H2_SETTINGS_MAX_FRAME_SIZE: i32 = 0x5
+pub const H2_SETTINGS_MAX_HEADER_LIST_SIZE: i32 = 0x6
+
+# ============================================================================
+# Frame Header
+# ============================================================================
+
+pub struct H2FrameHeader
+    length: i32
+    frame_type: i32
+    flags: i32
+    stream_id: i32
+
+pub const H2_FRAME_HEADER_SIZE: i32 = 9
+
+pub fn h2_parse_frame_header(buf: *u8, buf_len: i32, header: *H2FrameHeader) -> i32
+    if buf_len < H2_FRAME_HEADER_SIZE
+        return H2_ERR_INCOMPLETE
+
+    # Length: 24-bit big-endian
+    let b0: i32 = *(buf) as i32
+    let b1: i32 = *(buf + 1) as i32
+    let b2: i32 = *(buf + 2) as i32
+    header.length = (b0 << 16) | (b1 << 8) | b2
+
+    header.frame_type = *(buf + 3) as i32
+    header.flags = *(buf + 4) as i32
+
+    # Stream ID: 31 bits
+    let s0: i32 = (*(buf + 5) as i32) & 0x7F
+    let s1: i32 = *(buf + 6) as i32
+    let s2: i32 = *(buf + 7) as i32
+    let s3: i32 = *(buf + 8) as i32
+    header.stream_id = (s0 << 24) | (s1 << 16) | (s2 << 8) | s3
+
+    return H2_OK
+
+pub fn h2_write_frame_header(buf: *u8, buf_len: i32, header: *H2FrameHeader) -> i32
+    if buf_len < H2_FRAME_HEADER_SIZE
+        return H2_ERR_INCOMPLETE
+
+    *(buf) = ((header.length >> 16) & 0xFF) as u8
+    *(buf + 1) = ((header.length >> 8) & 0xFF) as u8
+    *(buf + 2) = (header.length & 0xFF) as u8
+    *(buf + 3) = header.frame_type as u8
+    *(buf + 4) = header.flags as u8
+    *(buf + 5) = ((header.stream_id >> 24) & 0x7F) as u8
+    *(buf + 6) = ((header.stream_id >> 16) & 0xFF) as u8
+    *(buf + 7) = ((header.stream_id >> 8) & 0xFF) as u8
+    *(buf + 8) = (header.stream_id & 0xFF) as u8
+
+    return H2_FRAME_HEADER_SIZE
+
+# ============================================================================
+# Settings
+# ============================================================================
+
+pub struct H2Settings
+    header_table_size: i64
+    enable_push: i32
+    max_concurrent_streams: i64
+    initial_window_size: i64
+    max_frame_size: i64
+    max_header_list_size: i64
+
+pub fn h2_settings_init(settings: *H2Settings)
+    settings.header_table_size = 4096
+    settings.enable_push = 1
+    settings.max_concurrent_streams = 0xFFFFFFFF
+    settings.initial_window_size = 65535
+    settings.max_frame_size = 16384
+    settings.max_header_list_size = 0xFFFFFFFF
+
+pub fn h2_parse_settings(input: *Span<u8>, settings: *H2Settings) -> i32
+    if input.len % 6 != 0
+        return H2_ERR_FRAME_SIZE
+
+    var pos: i64 = 0
+    while pos + 6 <= input.len
+        let id_hi: i32 = *(input.ptr + pos) as i32
+        let id_lo: i32 = *(input.ptr + pos + 1) as i32
+        let id: i32 = (id_hi << 8) | id_lo
+
+        let v0: i64 = (*(input.ptr + pos + 2) as i64) & 0xFF
+        let v1: i64 = (*(input.ptr + pos + 3) as i64) & 0xFF
+        let v2: i64 = (*(input.ptr + pos + 4) as i64) & 0xFF
+        let v3: i64 = (*(input.ptr + pos + 5) as i64) & 0xFF
+        let value: i64 = (v0 << 24) | (v1 << 16) | (v2 << 8) | v3
+
+        if id == H2_SETTINGS_HEADER_TABLE_SIZE
+            settings.header_table_size = value
+        else if id == H2_SETTINGS_ENABLE_PUSH
+            settings.enable_push = value as i32
+        else if id == H2_SETTINGS_MAX_CONCURRENT_STREAMS
+            settings.max_concurrent_streams = value
+        else if id == H2_SETTINGS_INITIAL_WINDOW_SIZE
+            settings.initial_window_size = value
+        else if id == H2_SETTINGS_MAX_FRAME_SIZE
+            settings.max_frame_size = value
+        else if id == H2_SETTINGS_MAX_HEADER_LIST_SIZE
+            settings.max_header_list_size = value
+
+        pos += 6
+
+    return H2_OK
+
+pub fn h2_write_setting(buf: *u8, buf_len: i32, id: i32, value: i64) -> i32
+    if buf_len < 6
+        return H2_ERR_INCOMPLETE
+
+    *(buf) = ((id >> 8) & 0xFF) as u8
+    *(buf + 1) = (id & 0xFF) as u8
+    *(buf + 2) = ((value >> 24) & 0xFF) as u8
+    *(buf + 3) = ((value >> 16) & 0xFF) as u8
+    *(buf + 4) = ((value >> 8) & 0xFF) as u8
+    *(buf + 5) = (value & 0xFF) as u8
+
+    return 6
+
+# ============================================================================
+# Window Update
+# ============================================================================
+
+pub fn h2_parse_window_update(input: *Span<u8>, increment: *i32) -> i32
+    if input.len < 4
+        return H2_ERR_INCOMPLETE
+
+    let b0: i32 = (*(input.ptr) as i32) & 0x7F
+    let b1: i32 = *(input.ptr + 1) as i32
+    let b2: i32 = *(input.ptr + 2) as i32
+    let b3: i32 = *(input.ptr + 3) as i32
+    *increment = (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+
+    if *increment == 0
+        return H2_ERR_INVALID
+
+    return H2_OK
+
+pub fn h2_write_window_update(buf: *u8, buf_len: i32, increment: i32) -> i32
+    if buf_len < 4
+        return H2_ERR_INCOMPLETE
+
+    *(buf) = ((increment >> 24) & 0x7F) as u8
+    *(buf + 1) = ((increment >> 16) & 0xFF) as u8
+    *(buf + 2) = ((increment >> 8) & 0xFF) as u8
+    *(buf + 3) = (increment & 0xFF) as u8
+
+    return 4
+
+# ============================================================================
+# Priority
+# ============================================================================
+
+pub struct H2Priority
+    exclusive: i32
+    stream_dependency: i32
+    weight: i32
+
+pub fn h2_parse_priority(input: *Span<u8>, priority: *H2Priority) -> i32
+    if input.len < 5
+        return H2_ERR_INCOMPLETE
+
+    priority.exclusive = ((*(input.ptr) as i32) >> 7) & 1
+
+    let d0: i32 = (*(input.ptr) as i32) & 0x7F
+    let d1: i32 = *(input.ptr + 1) as i32
+    let d2: i32 = *(input.ptr + 2) as i32
+    let d3: i32 = *(input.ptr + 3) as i32
+    priority.stream_dependency = (d0 << 24) | (d1 << 16) | (d2 << 8) | d3
+
+    priority.weight = (*(input.ptr + 4) as i32) + 1
+
+    return H2_OK
+
+pub fn h2_write_priority(buf: *u8, buf_len: i32, priority: *H2Priority) -> i32
+    if buf_len < 5
+        return H2_ERR_INCOMPLETE
+
+    let excl_bit: i32 = (priority.exclusive << 7) & 0x80
+    let dep_hi: i32 = (priority.stream_dependency >> 24) & 0x7F
+    *(buf) = (excl_bit | dep_hi) as u8
+    *(buf + 1) = ((priority.stream_dependency >> 16) & 0xFF) as u8
+    *(buf + 2) = ((priority.stream_dependency >> 8) & 0xFF) as u8
+    *(buf + 3) = (priority.stream_dependency & 0xFF) as u8
+    *(buf + 4) = ((priority.weight - 1) & 0xFF) as u8
+
+    return 5
+
+# ============================================================================
+# RST_STREAM
+# ============================================================================
+
+pub fn h2_parse_rst_stream(input: *Span<u8>, error_code: *i32) -> i32
+    if input.len < 4
+        return H2_ERR_INCOMPLETE
+
+    let b0: i32 = *(input.ptr) as i32
+    let b1: i32 = *(input.ptr + 1) as i32
+    let b2: i32 = *(input.ptr + 2) as i32
+    let b3: i32 = *(input.ptr + 3) as i32
+    *error_code = (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+
+    return H2_OK
+
+pub fn h2_write_rst_stream(buf: *u8, buf_len: i32, error_code: i32) -> i32
+    if buf_len < 4
+        return H2_ERR_INCOMPLETE
+
+    *(buf) = ((error_code >> 24) & 0xFF) as u8
+    *(buf + 1) = ((error_code >> 16) & 0xFF) as u8
+    *(buf + 2) = ((error_code >> 8) & 0xFF) as u8
+    *(buf + 3) = (error_code & 0xFF) as u8
+
+    return 4
+
+# ============================================================================
+# GOAWAY
+# ============================================================================
+
+pub struct H2Goaway
+    last_stream_id: i32
+    error_code: i32
+    debug_data: Span<u8>
+
+pub fn h2_parse_goaway(input: *Span<u8>, goaway: *H2Goaway) -> i32
+    if input.len < 8
+        return H2_ERR_INCOMPLETE
+
+    let s0: i32 = (*(input.ptr) as i32) & 0x7F
+    let s1: i32 = *(input.ptr + 1) as i32
+    let s2: i32 = *(input.ptr + 2) as i32
+    let s3: i32 = *(input.ptr + 3) as i32
+    goaway.last_stream_id = (s0 << 24) | (s1 << 16) | (s2 << 8) | s3
+
+    let e0: i32 = *(input.ptr + 4) as i32
+    let e1: i32 = *(input.ptr + 5) as i32
+    let e2: i32 = *(input.ptr + 6) as i32
+    let e3: i32 = *(input.ptr + 7) as i32
+    goaway.error_code = (e0 << 24) | (e1 << 16) | (e2 << 8) | e3
+
+    if input.len > 8
+        goaway.debug_data = span_from<u8>(input, 8)
+    else
+        goaway.debug_data.ptr = null
+        goaway.debug_data.len = 0
+
+    return H2_OK
+
+pub fn h2_write_goaway(buf: *u8, buf_len: i32, last_stream_id: i32, error_code: i32) -> i32
+    if buf_len < 8
+        return H2_ERR_INCOMPLETE
+
+    *(buf) = ((last_stream_id >> 24) & 0x7F) as u8
+    *(buf + 1) = ((last_stream_id >> 16) & 0xFF) as u8
+    *(buf + 2) = ((last_stream_id >> 8) & 0xFF) as u8
+    *(buf + 3) = (last_stream_id & 0xFF) as u8
+    *(buf + 4) = ((error_code >> 24) & 0xFF) as u8
+    *(buf + 5) = ((error_code >> 16) & 0xFF) as u8
+    *(buf + 6) = ((error_code >> 8) & 0xFF) as u8
+    *(buf + 7) = (error_code & 0xFF) as u8
+
+    return 8
+
+# ============================================================================
+# PING
+# ============================================================================
+
+pub const H2_PING_PAYLOAD_SIZE: i32 = 8
+
+pub fn h2_write_ping(buf: *u8, buf_len: i32, opaque_data: *u8) -> i32
+    if buf_len < 8
+        return H2_ERR_INCOMPLETE
+
+    var i: i32 = 0
+    while i < 8
+        *(buf + i) = *(opaque_data + i)
+        i += 1
+
+    return 8
+
+# ============================================================================
+# Connection Preface
+# ============================================================================
+
+pub const H2_PREFACE_LEN: i32 = 24
+
+pub fn h2_check_preface(buf: *u8, buf_len: i32) -> i32
+    if buf_len < H2_PREFACE_LEN
+        return H2_ERR_INCOMPLETE
+
+    let preface: *u8 = c"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+    var i: i32 = 0
+    while i < H2_PREFACE_LEN
+        if *(buf + i) != *(preface + i)
+            return H2_ERR_INVALID
+        i += 1
+
+    return H2_OK
+
+pub fn h2_write_preface(buf: *u8, buf_len: i32) -> i32
+    if buf_len < H2_PREFACE_LEN
+        return H2_ERR_INCOMPLETE
+
+    let preface: *u8 = c"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+    var i: i32 = 0
+    while i < H2_PREFACE_LEN
+        *(buf + i) = *(preface + i)
+        i += 1
+
+    return H2_PREFACE_LEN

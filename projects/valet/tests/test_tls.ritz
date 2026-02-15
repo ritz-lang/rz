@@ -1,0 +1,261 @@
+# tests/test_tls.ritz - TLS server tests
+
+import ritzlib.sys
+import ritzlib.io
+import ritzunit.assertions
+import ritzunit.types
+
+import lib.tls
+
+# ============================================================================
+# TLS Server Configuration Tests
+# ============================================================================
+
+[[test]]
+fn test_tls_server_config_init()
+    var cfg: TlsServerConfig
+    tls_server_config_init(@cfg)
+
+    # Default cipher suites
+    assert_eq_i32(cfg.num_cipher_suites, 2)
+    assert_eq_i64(cfg.cipher_suites[0] as i64, TLS_AES_128_GCM_SHA256 as i64)
+    assert_eq_i64(cfg.cipher_suites[1] as i64, TLS_CHACHA20_POLY1305_SHA256 as i64)
+
+# ============================================================================
+# TLS Server Initialization Tests
+# ============================================================================
+
+[[test]]
+fn test_tls_server_init()
+    var cfg: TlsServerConfig
+    tls_server_config_init(@cfg)
+
+    var server: TlsServer
+    tls_server_init(@server, @cfg)
+
+    # Check initial state
+    assert_eq_i32(tls_server_state(@server), TLS_SERVER_STATE_INIT)
+    assert_eq_i32(tls_server_is_connected(@server), 0)
+    assert_eq_i32(tls_server_error(@server), TLS_ERR_NONE)
+
+    tls_server_free(@server)
+
+[[test]]
+fn test_tls_server_generates_keypair()
+    var cfg: TlsServerConfig
+    tls_server_config_init(@cfg)
+
+    var server: TlsServer
+    tls_server_init(@server, @cfg)
+
+    # X25519 public key should be non-zero
+    var is_zero: i32 = 1
+    for i in 0..32
+        if server.x25519_public[i] != 0
+            is_zero = 0
+            break
+
+    assert_eq_i32(is_zero, 0)
+
+    tls_server_free(@server)
+
+# ============================================================================
+# ClientHello Parsing Tests
+# ============================================================================
+
+# Minimal ClientHello for testing (TLS 1.3 with X25519)
+fn build_test_client_hello(out: *u8) -> i64
+    var pos: i64 = 0
+
+    # TLS record header
+    out[pos] = 22  # Handshake
+    out[pos + 1] = 0x03
+    out[pos + 2] = 0x01  # TLS 1.0 (legacy)
+    # Length placeholder at [3,4]
+    pos = 5
+
+    # Handshake header
+    out[pos] = 1  # ClientHello
+    # Length placeholder at [pos+1..pos+3]
+    let hs_start: i64 = pos
+    pos = pos + 4
+
+    # Legacy version
+    out[pos] = 0x03
+    out[pos + 1] = 0x03  # TLS 1.2
+    pos = pos + 2
+
+    # Random (32 bytes)
+    for i in 0..32
+        out[pos + i] = (i + 1) as u8
+    pos = pos + 32
+
+    # Session ID (empty for simplicity in test)
+    out[pos] = 0
+    pos = pos + 1
+
+    # Cipher suites
+    out[pos] = 0x00
+    out[pos + 1] = 0x04  # 4 bytes = 2 suites
+    out[pos + 2] = 0x13
+    out[pos + 3] = 0x01  # TLS_AES_128_GCM_SHA256
+    out[pos + 4] = 0x13
+    out[pos + 5] = 0x03  # TLS_CHACHA20_POLY1305_SHA256
+    pos = pos + 6
+
+    # Compression methods
+    out[pos] = 0x01  # 1 method
+    out[pos + 1] = 0x00  # null
+    pos = pos + 2
+
+    # Extensions
+    let ext_start: i64 = pos + 2
+    var ext_pos: i64 = ext_start
+
+    # supported_versions extension
+    out[ext_pos] = 0x00
+    out[ext_pos + 1] = 0x2b  # Type = 43
+    out[ext_pos + 2] = 0x00
+    out[ext_pos + 3] = 0x03  # Length = 3
+    out[ext_pos + 4] = 0x02  # Versions length = 2
+    out[ext_pos + 5] = 0x03
+    out[ext_pos + 6] = 0x04  # TLS 1.3
+    ext_pos = ext_pos + 7
+
+    # key_share extension
+    out[ext_pos] = 0x00
+    out[ext_pos + 1] = 0x33  # Type = 51
+    out[ext_pos + 2] = 0x00
+    out[ext_pos + 3] = 0x26  # Length = 38
+    out[ext_pos + 4] = 0x00
+    out[ext_pos + 5] = 0x24  # Entries length = 36
+    out[ext_pos + 6] = 0x00
+    out[ext_pos + 7] = 0x1d  # X25519
+    out[ext_pos + 8] = 0x00
+    out[ext_pos + 9] = 0x20  # Key length = 32
+    # Fake X25519 public key (32 bytes)
+    for i in 0..32
+        out[ext_pos + 10 + i] = (0x41 + i) as u8  # 'A', 'B', 'C', ...
+    ext_pos = ext_pos + 42
+
+    # signature_algorithms extension
+    out[ext_pos] = 0x00
+    out[ext_pos + 1] = 0x0d  # Type = 13
+    out[ext_pos + 2] = 0x00
+    out[ext_pos + 3] = 0x04  # Length = 4
+    out[ext_pos + 4] = 0x00
+    out[ext_pos + 5] = 0x02  # Algorithms length = 2
+    out[ext_pos + 6] = 0x08
+    out[ext_pos + 7] = 0x07  # Ed25519
+    ext_pos = ext_pos + 8
+
+    # Extensions length
+    let ext_len: i64 = ext_pos - ext_start
+    out[pos] = ((ext_len >> 8) & 0xff) as u8
+    out[pos + 1] = (ext_len & 0xff) as u8
+    pos = ext_pos
+
+    # Handshake length
+    let hs_len: i64 = pos - hs_start - 4
+    out[hs_start + 1] = ((hs_len >> 16) & 0xff) as u8
+    out[hs_start + 2] = ((hs_len >> 8) & 0xff) as u8
+    out[hs_start + 3] = (hs_len & 0xff) as u8
+
+    # Record length
+    let record_len: i64 = pos - 5
+    out[3] = ((record_len >> 8) & 0xff) as u8
+    out[4] = (record_len & 0xff) as u8
+
+    return pos
+
+[[test]]
+fn test_tls_server_needs_input_initially()
+    var cfg: TlsServerConfig
+    tls_server_config_init(@cfg)
+
+    var server: TlsServer
+    tls_server_init(@server, @cfg)
+
+    # Process with no data
+    var out: [4096]u8
+    var out_len: i64 = 0
+    let result: i32 = tls_server_process(@server, null, 0, @out[0], 4096, @out_len)
+
+    assert_eq_i32(result, TLS_RESULT_NEED_INPUT)
+    assert_eq_i64(out_len, 0)
+
+    tls_server_free(@server)
+
+[[test]]
+fn test_tls_server_partial_record()
+    var cfg: TlsServerConfig
+    tls_server_config_init(@cfg)
+
+    var server: TlsServer
+    tls_server_init(@server, @cfg)
+
+    # Build partial ClientHello (just the first few bytes)
+    var partial: [10]u8
+    partial[0] = 22  # Handshake
+    partial[1] = 0x03
+    partial[2] = 0x01
+    partial[3] = 0x00
+    partial[4] = 0x50  # Claims 80 bytes
+
+    var out: [4096]u8
+    var out_len: i64 = 0
+    let result: i32 = tls_server_process(@server, @partial[0], 5, @out[0], 4096, @out_len)
+
+    # Should need more input
+    assert_eq_i32(result, TLS_RESULT_NEED_INPUT)
+
+    tls_server_free(@server)
+
+# ============================================================================
+# Error Handling Tests
+# ============================================================================
+
+[[test]]
+fn test_tls_server_rejects_non_handshake()
+    var cfg: TlsServerConfig
+    tls_server_config_init(@cfg)
+
+    var server: TlsServer
+    tls_server_init(@server, @cfg)
+
+    # Send Application Data record type instead of Handshake
+    var bad_record: [10]u8
+    bad_record[0] = 23  # Application Data (wrong!)
+    bad_record[1] = 0x03
+    bad_record[2] = 0x01
+    bad_record[3] = 0x00
+    bad_record[4] = 0x01
+    bad_record[5] = 0x00
+
+    var out: [4096]u8
+    var out_len: i64 = 0
+    let result: i32 = tls_server_process(@server, @bad_record[0], 6, @out[0], 4096, @out_len)
+
+    assert_eq_i32(result, TLS_RESULT_ERROR)
+    assert_eq_i32(tls_server_error(@server), TLS_ERR_UNEXPECTED_MESSAGE)
+
+    tls_server_free(@server)
+
+# ============================================================================
+# State Machine Tests
+# ============================================================================
+
+[[test]]
+fn test_tls_server_state_transitions()
+    var cfg: TlsServerConfig
+    tls_server_config_init(@cfg)
+
+    # We need a certificate for full handshake
+    # For this test, just verify initial state
+    var server: TlsServer
+    tls_server_init(@server, @cfg)
+
+    assert_eq_i32(tls_server_state(@server), TLS_SERVER_STATE_INIT)
+    assert_eq_i32(tls_server_is_connected(@server), 0)
+
+    tls_server_free(@server)

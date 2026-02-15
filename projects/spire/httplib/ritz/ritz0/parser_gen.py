@@ -1,0 +1,3176 @@
+"""
+parser_gen.py - Generated Ritz Parser
+
+THIS FILE IS AUTO-GENERATED - DO NOT EDIT
+Generated from grammars/ritz.grammar by tools/ritzgen_py
+"""
+
+import re
+from dataclasses import dataclass, field
+from typing import List, Optional, Any, Tuple
+from enum import IntEnum, auto
+
+# Token types
+class TokenType(IntEnum):
+    EOF = 0
+    ERROR = 1
+    SKIP = 2
+    NEWLINE = 3
+    INDENT = 4
+    DEDENT = 5
+    AS = 6
+    ASSERT = 7
+    BREAK = 8
+    CONST = 9
+    CONTINUE = 10
+    ELSE = 11
+    ENUM = 12
+    EXTERN = 13
+    FALSE = 14
+    FN = 15
+    FOR = 16
+    IF = 17
+    IMPL = 18
+    IMPORT = 19
+    IN = 20
+    LET = 21
+    MATCH = 22
+    MUT = 23
+    NULL = 24
+    PUB = 25
+    RETURN = 26
+    STRUCT = 27
+    TRAIT = 28
+    TRUE = 29
+    TYPE = 30
+    UNSAFE = 31
+    VAR = 32
+    WHILE = 33
+    I8 = 34
+    I16 = 35
+    I32 = 36
+    I64 = 37
+    U8 = 38
+    U16 = 39
+    U32 = 40
+    U64 = 41
+    F32 = 42
+    F64 = 43
+    BOOL = 44
+    ARROW = 45
+    FAT_ARROW = 46
+    DOT_DOT = 47
+    COLON_COLON = 48
+    AND = 49
+    OR = 50
+    EQ = 51
+    NE = 52
+    LE = 53
+    GE = 54
+    SHL = 55
+    SHR = 56
+    PLUS_EQ = 57
+    MINUS_EQ = 58
+    STAR_EQ = 59
+    SLASH_EQ = 60
+    AMP_MUT = 61
+    PLUS = 62
+    MINUS = 63
+    STAR = 64
+    SLASH = 65
+    PERCENT = 66
+    AMP = 67
+    PIPE = 68
+    CARET = 69
+    TILDE = 70
+    BANG = 71
+    LT = 72
+    GT = 73
+    ASSIGN = 74
+    DOT = 75
+    QUESTION = 76
+    AT = 77
+    LPAREN = 78
+    RPAREN = 79
+    LBRACKET = 80
+    RBRACKET = 81
+    LBRACE = 82
+    RBRACE = 83
+    COMMA = 84
+    COLON = 85
+    SEMI = 86
+    IDENT = 87
+    NUMBER = 88
+    HEX_NUMBER = 89
+    BIN_NUMBER = 90
+    FLOAT = 91
+    STRING = 92
+    CHAR = 93
+    CSTRING = 94
+    SPAN_STRING = 95
+    WHITESPACE = 96
+    COMMENT = 97
+
+TOKEN_NAMES = {
+    TokenType.EOF: "EOF",
+    TokenType.ERROR: "ERROR",
+    TokenType.SKIP: "SKIP",
+    TokenType.NEWLINE: "NEWLINE",
+    TokenType.INDENT: "INDENT",
+    TokenType.DEDENT: "DEDENT",
+    TokenType.AS: "AS",
+    TokenType.ASSERT: "ASSERT",
+    TokenType.BREAK: "BREAK",
+    TokenType.CONST: "CONST",
+    TokenType.CONTINUE: "CONTINUE",
+    TokenType.ELSE: "ELSE",
+    TokenType.ENUM: "ENUM",
+    TokenType.EXTERN: "EXTERN",
+    TokenType.FALSE: "FALSE",
+    TokenType.FN: "FN",
+    TokenType.FOR: "FOR",
+    TokenType.IF: "IF",
+    TokenType.IMPL: "IMPL",
+    TokenType.IMPORT: "IMPORT",
+    TokenType.IN: "IN",
+    TokenType.LET: "LET",
+    TokenType.MATCH: "MATCH",
+    TokenType.MUT: "MUT",
+    TokenType.NULL: "NULL",
+    TokenType.PUB: "PUB",
+    TokenType.RETURN: "RETURN",
+    TokenType.STRUCT: "STRUCT",
+    TokenType.TRAIT: "TRAIT",
+    TokenType.TRUE: "TRUE",
+    TokenType.TYPE: "TYPE",
+    TokenType.UNSAFE: "UNSAFE",
+    TokenType.VAR: "VAR",
+    TokenType.WHILE: "WHILE",
+    TokenType.I8: "I8",
+    TokenType.I16: "I16",
+    TokenType.I32: "I32",
+    TokenType.I64: "I64",
+    TokenType.U8: "U8",
+    TokenType.U16: "U16",
+    TokenType.U32: "U32",
+    TokenType.U64: "U64",
+    TokenType.F32: "F32",
+    TokenType.F64: "F64",
+    TokenType.BOOL: "BOOL",
+    TokenType.ARROW: "ARROW",
+    TokenType.FAT_ARROW: "FAT_ARROW",
+    TokenType.DOT_DOT: "DOT_DOT",
+    TokenType.COLON_COLON: "COLON_COLON",
+    TokenType.AND: "AND",
+    TokenType.OR: "OR",
+    TokenType.EQ: "EQ",
+    TokenType.NE: "NE",
+    TokenType.LE: "LE",
+    TokenType.GE: "GE",
+    TokenType.SHL: "SHL",
+    TokenType.SHR: "SHR",
+    TokenType.PLUS_EQ: "PLUS_EQ",
+    TokenType.MINUS_EQ: "MINUS_EQ",
+    TokenType.STAR_EQ: "STAR_EQ",
+    TokenType.SLASH_EQ: "SLASH_EQ",
+    TokenType.AMP_MUT: "AMP_MUT",
+    TokenType.PLUS: "PLUS",
+    TokenType.MINUS: "MINUS",
+    TokenType.STAR: "STAR",
+    TokenType.SLASH: "SLASH",
+    TokenType.PERCENT: "PERCENT",
+    TokenType.AMP: "AMP",
+    TokenType.PIPE: "PIPE",
+    TokenType.CARET: "CARET",
+    TokenType.TILDE: "TILDE",
+    TokenType.BANG: "BANG",
+    TokenType.LT: "LT",
+    TokenType.GT: "GT",
+    TokenType.ASSIGN: "ASSIGN",
+    TokenType.DOT: "DOT",
+    TokenType.QUESTION: "QUESTION",
+    TokenType.AT: "AT",
+    TokenType.LPAREN: "LPAREN",
+    TokenType.RPAREN: "RPAREN",
+    TokenType.LBRACKET: "LBRACKET",
+    TokenType.RBRACKET: "RBRACKET",
+    TokenType.LBRACE: "LBRACE",
+    TokenType.RBRACE: "RBRACE",
+    TokenType.COMMA: "COMMA",
+    TokenType.COLON: "COLON",
+    TokenType.SEMI: "SEMI",
+    TokenType.IDENT: "IDENT",
+    TokenType.NUMBER: "NUMBER",
+    TokenType.HEX_NUMBER: "HEX_NUMBER",
+    TokenType.BIN_NUMBER: "BIN_NUMBER",
+    TokenType.FLOAT: "FLOAT",
+    TokenType.STRING: "STRING",
+    TokenType.CHAR: "CHAR",
+    TokenType.CSTRING: "CSTRING",
+    TokenType.SPAN_STRING: "SPAN_STRING",
+    TokenType.WHITESPACE: "WHITESPACE",
+    TokenType.COMMENT: "COMMENT",
+}
+
+@dataclass
+class Token:
+    kind: TokenType
+    value: str
+    line: int
+    col: int
+    start: int = 0
+    end: int = 0
+
+class Lexer:
+    """Tokenize Ritz source code."""
+
+    # Token patterns - order matters!
+    KEYWORDS = {
+        "as": TokenType.AS,
+        "assert": TokenType.ASSERT,
+        "break": TokenType.BREAK,
+        "const": TokenType.CONST,
+        "continue": TokenType.CONTINUE,
+        "else": TokenType.ELSE,
+        "enum": TokenType.ENUM,
+        "extern": TokenType.EXTERN,
+        "false": TokenType.FALSE,
+        "fn": TokenType.FN,
+        "for": TokenType.FOR,
+        "if": TokenType.IF,
+        "impl": TokenType.IMPL,
+        "import": TokenType.IMPORT,
+        "in": TokenType.IN,
+        "let": TokenType.LET,
+        "match": TokenType.MATCH,
+        "mut": TokenType.MUT,
+        "null": TokenType.NULL,
+        "pub": TokenType.PUB,
+        "return": TokenType.RETURN,
+        "struct": TokenType.STRUCT,
+        "trait": TokenType.TRAIT,
+        "true": TokenType.TRUE,
+        "type": TokenType.TYPE,
+        "unsafe": TokenType.UNSAFE,
+        "var": TokenType.VAR,
+        "while": TokenType.WHILE,
+        "bool": TokenType.BOOL,
+        "&mut": TokenType.AMP_MUT,
+    }
+
+    OPERATORS = [
+        ("i16", TokenType.I16),
+        ("i32", TokenType.I32),
+        ("i64", TokenType.I64),
+        ("u16", TokenType.U16),
+        ("u32", TokenType.U32),
+        ("u64", TokenType.U64),
+        ("f32", TokenType.F32),
+        ("f64", TokenType.F64),
+        ("i8", TokenType.I8),
+        ("u8", TokenType.U8),
+        ("->", TokenType.ARROW),
+        ("=>", TokenType.FAT_ARROW),
+        ("..", TokenType.DOT_DOT),
+        ("::", TokenType.COLON_COLON),
+        ("&&", TokenType.AND),
+        ("||", TokenType.OR),
+        ("==", TokenType.EQ),
+        ("!=", TokenType.NE),
+        ("<=", TokenType.LE),
+        (">=", TokenType.GE),
+        ("<<", TokenType.SHL),
+        (">>", TokenType.SHR),
+        ("+=", TokenType.PLUS_EQ),
+        ("-=", TokenType.MINUS_EQ),
+        ("*=", TokenType.STAR_EQ),
+        ("/=", TokenType.SLASH_EQ),
+        ("+", TokenType.PLUS),
+        ("-", TokenType.MINUS),
+        ("*", TokenType.STAR),
+        ("/", TokenType.SLASH),
+        ("%", TokenType.PERCENT),
+        ("&", TokenType.AMP),
+        ("|", TokenType.PIPE),
+        ("^", TokenType.CARET),
+        ("~", TokenType.TILDE),
+        ("!", TokenType.BANG),
+        ("<", TokenType.LT),
+        (">", TokenType.GT),
+        ("=", TokenType.ASSIGN),
+        (".", TokenType.DOT),
+        ("?", TokenType.QUESTION),
+        ("@", TokenType.AT),
+        ("(", TokenType.LPAREN),
+        (")", TokenType.RPAREN),
+        ("[", TokenType.LBRACKET),
+        ("]", TokenType.RBRACKET),
+        ("{", TokenType.LBRACE),
+        ("}", TokenType.RBRACE),
+        (",", TokenType.COMMA),
+        (":", TokenType.COLON),
+        (";", TokenType.SEMI),
+    ]
+
+    REGEX_PATTERNS = [
+        (re.compile(r"[a-zA-Z_][a-zA-Z0-9_]*"), TokenType.IDENT),
+        (re.compile(r"[0-9]+"), TokenType.NUMBER),
+        (re.compile(r"0x[0-9a-fA-F]+"), TokenType.HEX_NUMBER),
+        (re.compile(r"0b[01]+"), TokenType.BIN_NUMBER),
+        (re.compile(r"[0-9]+\\.[0-9]+"), TokenType.FLOAT),
+        (re.compile(r"\"([^\"\\\\]|\\\\.)*\""), TokenType.STRING),
+        (re.compile(r"'([^'\\\\]|\\\\.)'"), TokenType.CHAR),
+        (re.compile(r"[ \\t\\r]+"), TokenType.WHITESPACE),
+        (re.compile(r"#[^\\n]*"), TokenType.COMMENT),
+    ]
+
+    def __init__(self, source: str):
+        self.source = source
+        self.pos = 0
+        self.line = 1
+        self.col = 1
+        self.indent_stack = [0]
+        self.pending_tokens: List[Token] = []
+        self.at_line_start = True
+
+    def _make_token(self, kind: TokenType, value: str, start: int) -> Token:
+        return Token(kind, value, self.line, self.col, start, self.pos)
+
+    def _advance(self, n: int = 1):
+        for _ in range(n):
+            if self.pos < len(self.source):
+                if self.source[self.pos] == "\n":
+                    self.line += 1
+                    self.col = 1
+                else:
+                    self.col += 1
+                self.pos += 1
+
+    def _skip_whitespace(self) -> bool:
+        """Skip whitespace (not newlines). Returns True if any skipped."""
+        skipped = False
+        while self.pos < len(self.source) and self.source[self.pos] in " \t\r":
+            self._advance()
+            skipped = True
+        return skipped
+
+    def _handle_indent(self):
+        """Handle indentation at line start."""
+        if not self.at_line_start:
+            return
+        self.at_line_start = False
+
+        # Count leading spaces
+        indent = 0
+        while self.pos + indent < len(self.source) and self.source[self.pos + indent] == " ":
+            indent += 1
+
+        # Check what comes after the indentation
+        rest = self.pos + indent
+        if rest >= len(self.source):
+            return  # End of file
+
+        # If this is a blank line or comment-only line, skip it entirely
+        if self.source[rest] == "\n" or self.source[rest] == "#":
+            # Skip to end of line
+            self.pos = rest
+            if self.source[self.pos] == "#":
+                while self.pos < len(self.source) and self.source[self.pos] != "\n":
+                    self.pos += 1
+            # Skip the newline
+            if self.pos < len(self.source) and self.source[self.pos] == "\n":
+                self.pos += 1
+                self.line += 1
+            self.at_line_start = True
+            return  # Will retry on next call
+
+        current_indent = self.indent_stack[-1]
+
+        if indent > current_indent:
+            self.indent_stack.append(indent)
+            self.pending_tokens.append(Token(TokenType.INDENT, "", self.line, self.col, self.pos, self.pos))
+        elif indent < current_indent:
+            while self.indent_stack and self.indent_stack[-1] > indent:
+                self.indent_stack.pop()
+                self.pending_tokens.append(Token(TokenType.DEDENT, "", self.line, self.col, self.pos, self.pos))
+
+    def next_token(self) -> Token:
+        """Return the next token."""
+
+        # Return pending tokens first (INDENT/DEDENT)
+        if self.pending_tokens:
+            return self.pending_tokens.pop(0)
+
+        # Handle indentation at line start (loop to handle blank lines)
+        while self.at_line_start:
+            self._handle_indent()
+            if self.pending_tokens:
+                return self.pending_tokens.pop(0)
+
+        # Skip whitespace (not newlines)
+        self._skip_whitespace()
+
+        # Check for EOF
+        if self.pos >= len(self.source):
+            # Emit remaining DEDENTs
+            while len(self.indent_stack) > 1:
+                self.indent_stack.pop()
+                self.pending_tokens.append(Token(TokenType.DEDENT, "", self.line, self.col, self.pos, self.pos))
+            if self.pending_tokens:
+                return self.pending_tokens.pop(0)
+            return Token(TokenType.EOF, "", self.line, self.col, self.pos, self.pos)
+
+        start = self.pos
+        start_col = self.col
+
+        # Check for comment
+        if self.source[self.pos] == "#":
+            while self.pos < len(self.source) and self.source[self.pos] != "\n":
+                self._advance()
+            return self.next_token()  # Skip comment and get next
+
+        # Check for newline
+        if self.source[self.pos] == "\n":
+            self._advance()
+            self.at_line_start = True
+            return Token(TokenType.NEWLINE, "\n", self.line - 1, start_col, start, self.pos)
+
+        # Check for string literals
+        if self.source[self.pos] in '"\'':
+            return self._lex_string()
+
+        # Check for prefixed strings (c"...", s"...")
+        if self.pos + 1 < len(self.source) and self.source[self.pos] in "cs" and self.source[self.pos + 1] == '"':
+            return self._lex_string()
+
+        # Check for operators (longest match first)
+        for op, kind in self.OPERATORS:
+            if self.source[self.pos:self.pos+len(op)] == op:
+                self._advance(len(op))
+                return Token(kind, op, self.line, start_col, start, self.pos)
+
+        # Check for identifiers and keywords
+        if self.source[self.pos].isalpha() or self.source[self.pos] == "_":
+            return self._lex_identifier()
+
+        # Check for numbers
+        if self.source[self.pos].isdigit():
+            return self._lex_number()
+
+        # Unknown character
+        char = self.source[self.pos]
+        self._advance()
+        return Token(TokenType.ERROR, char, self.line, start_col, start, self.pos)
+
+    def _lex_identifier(self) -> Token:
+        start = self.pos
+        start_col = self.col
+        while self.pos < len(self.source) and (self.source[self.pos].isalnum() or self.source[self.pos] == "_"):
+            self._advance()
+        value = self.source[start:self.pos]
+        kind = self.KEYWORDS.get(value, TokenType.IDENT)
+        return Token(kind, value, self.line, start_col, start, self.pos)
+
+    def _lex_number(self) -> Token:
+        start = self.pos
+        start_col = self.col
+
+        # Check for hex/binary
+        if self.source[self.pos] == "0" and self.pos + 1 < len(self.source):
+            if self.source[self.pos + 1] == "x":
+                self._advance(2)
+                while self.pos < len(self.source) and self.source[self.pos] in "0123456789abcdefABCDEF":
+                    self._advance()
+                return Token(TokenType.HEX_NUMBER, self.source[start:self.pos], self.line, start_col, start, self.pos)
+            elif self.source[self.pos + 1] == "b":
+                self._advance(2)
+                while self.pos < len(self.source) and self.source[self.pos] in "01":
+                    self._advance()
+                return Token(TokenType.BIN_NUMBER, self.source[start:self.pos], self.line, start_col, start, self.pos)
+
+        # Decimal number
+        while self.pos < len(self.source) and self.source[self.pos].isdigit():
+            self._advance()
+
+        # Check for float
+        if self.pos < len(self.source) and self.source[self.pos] == ".":
+            if self.pos + 1 < len(self.source) and self.source[self.pos + 1].isdigit():
+                self._advance()  # skip .
+                while self.pos < len(self.source) and self.source[self.pos].isdigit():
+                    self._advance()
+                return Token(TokenType.FLOAT, self.source[start:self.pos], self.line, start_col, start, self.pos)
+
+        return Token(TokenType.NUMBER, self.source[start:self.pos], self.line, start_col, start, self.pos)
+
+    def _lex_string(self) -> Token:
+        start = self.pos
+        start_col = self.col
+
+        # Handle prefix
+        prefix = None
+        if self.source[self.pos] in "cs":
+            prefix = self.source[self.pos]
+            self._advance()
+
+        quote = self.source[self.pos]
+        self._advance()
+
+        while self.pos < len(self.source):
+            if self.source[self.pos] == "\\":
+                self._advance(2)  # skip escape
+            elif self.source[self.pos] == quote:
+                self._advance()
+                break
+            else:
+                self._advance()
+
+        value = self.source[start:self.pos]
+        # Determine token type based on prefix and quote
+        if quote == "'":
+            kind = TokenType.CHAR
+        elif prefix == "c":
+            kind = TokenType.CSTRING
+        elif prefix == "s":
+            kind = TokenType.SPAN_STRING
+        else:
+            kind = TokenType.STRING
+        return Token(kind, value, self.line, start_col, start, self.pos)
+
+    def tokenize(self) -> List[Token]:
+        """Tokenize entire source, return list of tokens."""
+        tokens = []
+        while True:
+            tok = self.next_token()
+            tokens.append(tok)
+            if tok.kind == TokenType.EOF:
+                break
+        return tokens
+
+class ParseError(Exception):
+    """Parser error with location info."""
+    def __init__(self, msg: str, token: Token):
+        self.msg = msg
+        self.token = token
+        super().__init__(f"{token.line}:{token.col}: {msg}")
+
+class Parser:
+    """Recursive descent parser for Ritz."""
+
+    def __init__(self, tokens: List[Token]):
+        self.tokens = tokens
+        self.pos = 0
+
+    def _peek(self) -> Token:
+        if self.pos < len(self.tokens):
+            return self.tokens[self.pos]
+        return self.tokens[-1]  # EOF
+
+    def _advance(self) -> Token:
+        tok = self._peek()
+        if self.pos < len(self.tokens) - 1:
+            self.pos += 1
+        return tok
+
+    def _check(self, kind: TokenType) -> bool:
+        return self._peek().kind == kind
+
+    def _match(self, *kinds: TokenType) -> Optional[Token]:
+        if self._peek().kind in kinds:
+            return self._advance()
+        return None
+
+    def _expect(self, kind: TokenType) -> Token:
+        tok = self._peek()
+        if tok.kind != kind:
+            raise ParseError(f"expected {TOKEN_NAMES[kind]}, got {TOKEN_NAMES[tok.kind]}", tok)
+        return self._advance()
+
+    def parse_module(self) -> Optional[Any]:
+        """Parse rule: module"""
+        start_pos = self.pos
+
+        # Alternative 1
+        try:
+            result_1 = []
+            while True:
+                item = self.parse_item()
+                if item is None:
+                    break
+                result_1.append(item)
+            return result_1
+        except ParseError:
+            self.pos = start_pos
+
+        return None
+
+    def parse_item(self) -> Optional[Any]:
+        """Parse rule: item"""
+        start_pos = self.pos
+
+        # Alternative 1
+        try:
+            result_1 = self.parse_attrs()
+            result_2 = self.parse_fn_def()
+            if result_2 is None:
+                raise ParseError("expected fn_def", self._peek())
+            return {"_rule": "item", "0": result_1, "1": result_2}
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 2
+        try:
+            result_1 = self.parse_struct_def()
+            if result_1 is None:
+                raise ParseError("expected struct_def", self._peek())
+            return result_1
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 3
+        try:
+            result_1 = self.parse_enum_def()
+            if result_1 is None:
+                raise ParseError("expected enum_def", self._peek())
+            return result_1
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 4
+        try:
+            result_1 = self.parse_const_def()
+            if result_1 is None:
+                raise ParseError("expected const_def", self._peek())
+            return result_1
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 5
+        try:
+            result_1 = self.parse_type_alias()
+            if result_1 is None:
+                raise ParseError("expected type_alias", self._peek())
+            return result_1
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 6
+        try:
+            result_1 = self.parse_trait_def()
+            if result_1 is None:
+                raise ParseError("expected trait_def", self._peek())
+            return result_1
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 7
+        try:
+            result_1 = self.parse_impl_block()
+            if result_1 is None:
+                raise ParseError("expected impl_block", self._peek())
+            return result_1
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 8
+        try:
+            result_1 = self.parse_import_stmt()
+            if result_1 is None:
+                raise ParseError("expected import_stmt", self._peek())
+            return result_1
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 9
+        try:
+            result_1 = self.parse_global_var()
+            if result_1 is None:
+                raise ParseError("expected global_var", self._peek())
+            return result_1
+        except ParseError:
+            self.pos = start_pos
+
+        return None
+
+    def parse_attrs(self) -> Optional[Any]:
+        """Parse rule: attrs"""
+        start_pos = self.pos
+
+        # Alternative 1
+        try:
+            first = self.parse_attr()
+            if first is None:
+                raise ParseError("expected attr", self._peek())
+            result_1 = [first]
+            while True:
+                item = self.parse_attr()
+                if item is None:
+                    break
+                result_1.append(item)
+            return result_1
+        except ParseError:
+            self.pos = start_pos
+
+        return None
+
+    def parse_attr(self) -> Optional[Any]:
+        """Parse rule: attr"""
+        start_pos = self.pos
+
+        # Alternative 1
+        try:
+            result_1 = self._expect(TokenType.AT)
+            result_2 = self._expect(TokenType.IDENT)
+            result_3 = self._match(TokenType.NEWLINE)
+            return {"_rule": "attr", "0": result_1, "1": result_2, "2": result_3}
+        except ParseError:
+            self.pos = start_pos
+
+        return None
+
+    def parse_fn_def(self) -> Optional[Any]:
+        """Parse rule: fn_def"""
+        start_pos = self.pos
+
+        # Alternative 1
+        try:
+            result_1 = self._expect(TokenType.FN)
+            result_2 = self._expect(TokenType.IDENT)
+            result_3 = self.parse_generic_params()
+            result_4 = self._expect(TokenType.LPAREN)
+            result_5 = self.parse_params()
+            result_6 = self._expect(TokenType.RPAREN)
+            result_7 = self.parse_return_type()
+            result_8 = self.parse_block()
+            if result_8 is None:
+                raise ParseError("expected block", self._peek())
+            return {"_rule": "fn_def", "0": result_1, "1": result_2, "2": result_3, "3": result_4, "4": result_5, "5": result_6, "6": result_7, "7": result_8}
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 2
+        try:
+            result_1 = self._expect(TokenType.EXTERN)
+            result_2 = self._expect(TokenType.FN)
+            result_3 = self._expect(TokenType.IDENT)
+            result_4 = self._expect(TokenType.LPAREN)
+            result_5 = self.parse_params()
+            result_6 = self._expect(TokenType.RPAREN)
+            result_7 = self.parse_return_type()
+            result_8 = self._expect(TokenType.NEWLINE)
+            return {"_rule": "fn_def", "0": result_1, "1": result_2, "2": result_3, "3": result_4, "4": result_5, "5": result_6, "6": result_7, "7": result_8}
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 3
+        try:
+            result_1 = self._expect(TokenType.PUB)
+            result_2 = self._expect(TokenType.FN)
+            result_3 = self._expect(TokenType.IDENT)
+            result_4 = self.parse_generic_params()
+            result_5 = self._expect(TokenType.LPAREN)
+            result_6 = self.parse_params()
+            result_7 = self._expect(TokenType.RPAREN)
+            result_8 = self.parse_return_type()
+            result_9 = self.parse_block()
+            if result_9 is None:
+                raise ParseError("expected block", self._peek())
+            return {"_rule": "fn_def", "0": result_1, "1": result_2, "2": result_3, "3": result_4, "4": result_5, "5": result_6, "6": result_7, "7": result_8, "8": result_9}
+        except ParseError:
+            self.pos = start_pos
+
+        return None
+
+    def parse_generic_params(self) -> Optional[Any]:
+        """Parse rule: generic_params"""
+        start_pos = self.pos
+
+        # Alternative 1
+        try:
+            result_1 = self._expect(TokenType.LT)
+            result_2 = self.parse_generic_param_list()
+            if result_2 is None:
+                raise ParseError("expected generic_param_list", self._peek())
+            result_3 = self._expect(TokenType.GT)
+            return result_2
+        except ParseError:
+            self.pos = start_pos
+
+        return None
+
+    def parse_generic_param_list(self) -> Optional[Any]:
+        """Parse rule: generic_param_list"""
+        start_pos = self.pos
+
+        # Alternative 1
+        try:
+            result_1 = self._expect(TokenType.IDENT)
+            result_2 = self._expect(TokenType.COMMA)
+            result_3 = self.parse_generic_param_list()
+            if result_3 is None:
+                raise ParseError("expected generic_param_list", self._peek())
+            return {"_rule": "generic_param_list", "0": result_1, "1": result_2, "2": result_3}
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 2
+        try:
+            result_1 = self._expect(TokenType.IDENT)
+            return result_1
+        except ParseError:
+            self.pos = start_pos
+
+        return None
+
+    def parse_params(self) -> Optional[Any]:
+        """Parse rule: params (binary expression, optimized)"""
+
+        # Parse left operand (param)
+        left = self.parse_param()
+        if left is None:
+            return None
+
+        # Check for operator
+        op = self._match(TokenType.COMMA)
+        if op is None:
+            return left  # No operator, just return base
+
+        # Parse right operand (params)
+        right = self.parse_params()
+        if right is None:
+            raise ParseError("expected params after operator", self._peek())
+
+        return {"_rule": "params", "left": left, "op": op, "right": right}
+
+    def parse_param(self) -> Optional[Any]:
+        """Parse rule: param"""
+        start_pos = self.pos
+
+        # Alternative 1
+        try:
+            result_1 = self._expect(TokenType.IDENT)
+            result_2 = self._expect(TokenType.COLON)
+            result_3 = self.parse_type()
+            if result_3 is None:
+                raise ParseError("expected type", self._peek())
+            return {"_rule": "param", "0": result_1, "1": result_2, "2": result_3}
+        except ParseError:
+            self.pos = start_pos
+
+        return None
+
+    def parse_return_type(self) -> Optional[Any]:
+        """Parse rule: return_type"""
+        start_pos = self.pos
+
+        # Alternative 1
+        try:
+            result_1 = self._expect(TokenType.ARROW)
+            result_2 = self.parse_type()
+            if result_2 is None:
+                raise ParseError("expected type", self._peek())
+            return result_2
+        except ParseError:
+            self.pos = start_pos
+
+        return None
+
+    def parse_struct_def(self) -> Optional[Any]:
+        """Parse rule: struct_def"""
+        start_pos = self.pos
+
+        # Alternative 1
+        try:
+            result_1 = self._expect(TokenType.STRUCT)
+            result_2 = self._expect(TokenType.IDENT)
+            result_3 = self.parse_generic_params()
+            result_4 = self._expect(TokenType.NEWLINE)
+            result_5 = self._expect(TokenType.INDENT)
+            result_6 = self.parse_struct_fields()
+            result_7 = self._expect(TokenType.DEDENT)
+            return {"_rule": "struct_def", "0": result_1, "1": result_2, "2": result_3, "3": result_4, "4": result_5, "5": result_6, "6": result_7}
+        except ParseError:
+            self.pos = start_pos
+
+        return None
+
+    def parse_struct_fields(self) -> Optional[Any]:
+        """Parse rule: struct_fields"""
+        start_pos = self.pos
+
+        # Alternative 1
+        try:
+            result_1 = self.parse_struct_field()
+            if result_1 is None:
+                raise ParseError("expected struct_field", self._peek())
+            result_2 = self.parse_struct_fields()
+            return {"_rule": "struct_fields", "0": result_1, "1": result_2}
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 2
+        try:
+            return None
+        except ParseError:
+            self.pos = start_pos
+
+        return None
+
+    def parse_struct_field(self) -> Optional[Any]:
+        """Parse rule: struct_field"""
+        start_pos = self.pos
+
+        # Alternative 1
+        try:
+            result_1 = self._expect(TokenType.IDENT)
+            result_2 = self._expect(TokenType.COLON)
+            result_3 = self.parse_type()
+            if result_3 is None:
+                raise ParseError("expected type", self._peek())
+            result_4 = self._expect(TokenType.NEWLINE)
+            return {"_rule": "struct_field", "0": result_1, "1": result_2, "2": result_3, "3": result_4}
+        except ParseError:
+            self.pos = start_pos
+
+        return None
+
+    def parse_enum_def(self) -> Optional[Any]:
+        """Parse rule: enum_def"""
+        start_pos = self.pos
+
+        # Alternative 1
+        try:
+            result_1 = self._expect(TokenType.ENUM)
+            result_2 = self._expect(TokenType.IDENT)
+            result_3 = self.parse_generic_params()
+            result_4 = self._expect(TokenType.NEWLINE)
+            result_5 = self._expect(TokenType.INDENT)
+            result_6 = self.parse_enum_variants()
+            result_7 = self._expect(TokenType.DEDENT)
+            return {"_rule": "enum_def", "0": result_1, "1": result_2, "2": result_3, "3": result_4, "4": result_5, "5": result_6, "6": result_7}
+        except ParseError:
+            self.pos = start_pos
+
+        return None
+
+    def parse_enum_variants(self) -> Optional[Any]:
+        """Parse rule: enum_variants"""
+        start_pos = self.pos
+
+        # Alternative 1
+        try:
+            result_1 = self.parse_enum_variant()
+            if result_1 is None:
+                raise ParseError("expected enum_variant", self._peek())
+            result_2 = self.parse_enum_variants()
+            return {"_rule": "enum_variants", "0": result_1, "1": result_2}
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 2
+        try:
+            return None
+        except ParseError:
+            self.pos = start_pos
+
+        return None
+
+    def parse_enum_variant(self) -> Optional[Any]:
+        """Parse rule: enum_variant"""
+        start_pos = self.pos
+
+        # Alternative 1
+        try:
+            result_1 = self._expect(TokenType.IDENT)
+            result_2 = self._expect(TokenType.LPAREN)
+            result_3 = self.parse_type()
+            if result_3 is None:
+                raise ParseError("expected type", self._peek())
+            result_4 = self._expect(TokenType.RPAREN)
+            result_5 = self._expect(TokenType.NEWLINE)
+            return {"_rule": "enum_variant", "0": result_1, "1": result_2, "2": result_3, "3": result_4, "4": result_5}
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 2
+        try:
+            result_1 = self._expect(TokenType.IDENT)
+            result_2 = self._expect(TokenType.NEWLINE)
+            return {"_rule": "enum_variant", "0": result_1, "1": result_2}
+        except ParseError:
+            self.pos = start_pos
+
+        return None
+
+    def parse_type_alias(self) -> Optional[Any]:
+        """Parse rule: type_alias"""
+        start_pos = self.pos
+
+        # Alternative 1
+        try:
+            result_1 = self._expect(TokenType.TYPE)
+            result_2 = self._expect(TokenType.IDENT)
+            result_3 = self.parse_generic_params()
+            result_4 = self._expect(TokenType.ASSIGN)
+            result_5 = self.parse_type()
+            if result_5 is None:
+                raise ParseError("expected type", self._peek())
+            result_6 = self._expect(TokenType.NEWLINE)
+            return {"_rule": "type_alias", "0": result_1, "1": result_2, "2": result_3, "3": result_4, "4": result_5, "5": result_6}
+        except ParseError:
+            self.pos = start_pos
+
+        return None
+
+    def parse_trait_def(self) -> Optional[Any]:
+        """Parse rule: trait_def"""
+        start_pos = self.pos
+
+        # Alternative 1
+        try:
+            result_1 = self._expect(TokenType.TRAIT)
+            result_2 = self._expect(TokenType.IDENT)
+            result_3 = self._expect(TokenType.NEWLINE)
+            result_4 = self._expect(TokenType.INDENT)
+            result_5 = self.parse_trait_methods()
+            result_6 = self._expect(TokenType.DEDENT)
+            return {"_rule": "trait_def", "0": result_1, "1": result_2, "2": result_3, "3": result_4, "4": result_5, "5": result_6}
+        except ParseError:
+            self.pos = start_pos
+
+        return None
+
+    def parse_trait_methods(self) -> Optional[Any]:
+        """Parse rule: trait_methods"""
+        start_pos = self.pos
+
+        # Alternative 1
+        try:
+            result_1 = self.parse_trait_method()
+            if result_1 is None:
+                raise ParseError("expected trait_method", self._peek())
+            result_2 = self.parse_trait_methods()
+            return {"_rule": "trait_methods", "0": result_1, "1": result_2}
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 2
+        try:
+            return None
+        except ParseError:
+            self.pos = start_pos
+
+        return None
+
+    def parse_trait_method(self) -> Optional[Any]:
+        """Parse rule: trait_method"""
+        start_pos = self.pos
+
+        # Alternative 1
+        try:
+            result_1 = self._expect(TokenType.FN)
+            result_2 = self._expect(TokenType.IDENT)
+            result_3 = self._expect(TokenType.LPAREN)
+            result_4 = self.parse_params()
+            result_5 = self._expect(TokenType.RPAREN)
+            result_6 = self.parse_return_type()
+            result_7 = self._expect(TokenType.NEWLINE)
+            return {"_rule": "trait_method", "0": result_1, "1": result_2, "2": result_3, "3": result_4, "4": result_5, "5": result_6, "6": result_7}
+        except ParseError:
+            self.pos = start_pos
+
+        return None
+
+    def parse_impl_block(self) -> Optional[Any]:
+        """Parse rule: impl_block"""
+        start_pos = self.pos
+
+        # Alternative 1
+        try:
+            result_1 = self._expect(TokenType.IMPL)
+            result_2 = self.parse_generic_params()
+            result_3 = self.parse_type_name()
+            if result_3 is None:
+                raise ParseError("expected type_name", self._peek())
+            result_4 = self._expect(TokenType.FOR)
+            result_5 = self.parse_type_name()
+            if result_5 is None:
+                raise ParseError("expected type_name", self._peek())
+            result_6 = self._expect(TokenType.NEWLINE)
+            result_7 = self._expect(TokenType.INDENT)
+            result_8 = self.parse_impl_methods()
+            result_9 = self._expect(TokenType.DEDENT)
+            return {"_rule": "impl_block", "0": result_1, "1": result_2, "2": result_3, "3": result_4, "4": result_5, "5": result_6, "6": result_7, "7": result_8, "8": result_9}
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 2
+        try:
+            result_1 = self._expect(TokenType.IMPL)
+            result_2 = self.parse_generic_params()
+            result_3 = self.parse_type_name()
+            if result_3 is None:
+                raise ParseError("expected type_name", self._peek())
+            result_4 = self._expect(TokenType.NEWLINE)
+            result_5 = self._expect(TokenType.INDENT)
+            result_6 = self.parse_impl_methods()
+            result_7 = self._expect(TokenType.DEDENT)
+            return {"_rule": "impl_block", "0": result_1, "1": result_2, "2": result_3, "3": result_4, "4": result_5, "5": result_6, "6": result_7}
+        except ParseError:
+            self.pos = start_pos
+
+        return None
+
+    def parse_impl_methods(self) -> Optional[Any]:
+        """Parse rule: impl_methods"""
+        start_pos = self.pos
+
+        # Alternative 1
+        try:
+            result_1 = self.parse_fn_def()
+            if result_1 is None:
+                raise ParseError("expected fn_def", self._peek())
+            result_2 = self.parse_impl_methods()
+            return {"_rule": "impl_methods", "0": result_1, "1": result_2}
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 2
+        try:
+            return None
+        except ParseError:
+            self.pos = start_pos
+
+        return None
+
+    def parse_import_stmt(self) -> Optional[Any]:
+        """Parse rule: import_stmt"""
+        start_pos = self.pos
+
+        # Alternative 1
+        try:
+            result_1 = self._expect(TokenType.IMPORT)
+            result_2 = self.parse_module_path()
+            if result_2 is None:
+                raise ParseError("expected module_path", self._peek())
+            result_3 = self._expect(TokenType.NEWLINE)
+            return {"_rule": "import_stmt", "0": result_1, "1": result_2, "2": result_3}
+        except ParseError:
+            self.pos = start_pos
+
+        return None
+
+    def parse_module_path(self) -> Optional[Any]:
+        """Parse rule: module_path"""
+        start_pos = self.pos
+
+        # Alternative 1
+        try:
+            result_1 = self._expect(TokenType.IDENT)
+            result_2 = self._expect(TokenType.DOT)
+            result_3 = self.parse_module_path()
+            if result_3 is None:
+                raise ParseError("expected module_path", self._peek())
+            return {"_rule": "module_path", "0": result_1, "1": result_2, "2": result_3}
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 2
+        try:
+            result_1 = self._expect(TokenType.IDENT)
+            return result_1
+        except ParseError:
+            self.pos = start_pos
+
+        return None
+
+    def parse_const_def(self) -> Optional[Any]:
+        """Parse rule: const_def"""
+        start_pos = self.pos
+
+        # Alternative 1
+        try:
+            result_1 = self._expect(TokenType.CONST)
+            result_2 = self._expect(TokenType.IDENT)
+            result_3 = self._expect(TokenType.COLON)
+            result_4 = self.parse_type()
+            if result_4 is None:
+                raise ParseError("expected type", self._peek())
+            result_5 = self._expect(TokenType.ASSIGN)
+            result_6 = self.parse_expr()
+            if result_6 is None:
+                raise ParseError("expected expr", self._peek())
+            result_7 = self._expect(TokenType.NEWLINE)
+            return {"_rule": "const_def", "0": result_1, "1": result_2, "2": result_3, "3": result_4, "4": result_5, "5": result_6, "6": result_7}
+        except ParseError:
+            self.pos = start_pos
+
+        return None
+
+    def parse_global_var(self) -> Optional[Any]:
+        """Parse rule: global_var"""
+        start_pos = self.pos
+
+        # Alternative 1
+        try:
+            result_1 = self._expect(TokenType.VAR)
+            result_2 = self._expect(TokenType.IDENT)
+            result_3 = self._expect(TokenType.COLON)
+            result_4 = self.parse_type()
+            if result_4 is None:
+                raise ParseError("expected type", self._peek())
+            result_5 = self._expect(TokenType.ASSIGN)
+            result_6 = self.parse_expr()
+            if result_6 is None:
+                raise ParseError("expected expr", self._peek())
+            result_7 = self._expect(TokenType.NEWLINE)
+            return {"_rule": "global_var", "0": result_1, "1": result_2, "2": result_3, "3": result_4, "4": result_5, "5": result_6, "6": result_7}
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 2
+        try:
+            result_1 = self._expect(TokenType.VAR)
+            result_2 = self._expect(TokenType.IDENT)
+            result_3 = self._expect(TokenType.COLON)
+            result_4 = self.parse_type()
+            if result_4 is None:
+                raise ParseError("expected type", self._peek())
+            result_5 = self._expect(TokenType.NEWLINE)
+            return {"_rule": "global_var", "0": result_1, "1": result_2, "2": result_3, "3": result_4, "4": result_5}
+        except ParseError:
+            self.pos = start_pos
+
+        return None
+
+    def parse_type(self) -> Optional[Any]:
+        """Parse rule: type (left-recursion eliminated)"""
+
+        # Parse base case
+        start_pos = self.pos
+        result = None
+
+        try:
+            base_1 = self.parse_primitive_type()
+            if base_1 is None:
+                raise ParseError("expected primitive_type", self._peek())
+            result = base_1
+        except ParseError:
+            pass
+        if result is None:
+            self.pos = start_pos
+            try:
+                base_1 = self.parse_type_name()
+                if base_1 is None:
+                    raise ParseError("expected type_name", self._peek())
+                result = base_1
+            except ParseError:
+                pass
+        if result is None:
+            self.pos = start_pos
+            try:
+                base_1 = self._expect(TokenType.STAR)
+                base_2 = self.parse_type()
+                if base_2 is None:
+                    raise ParseError("expected type", self._peek())
+                result = {"_rule": "type", "0": base_1, "1": base_2}
+            except ParseError:
+                pass
+        if result is None:
+            self.pos = start_pos
+            try:
+                base_1 = self._expect(TokenType.STAR)
+                base_2 = self._expect(TokenType.MUT)
+                base_3 = self.parse_type()
+                if base_3 is None:
+                    raise ParseError("expected type", self._peek())
+                result = {"_rule": "type", "0": base_1, "1": base_2, "2": base_3}
+            except ParseError:
+                pass
+        if result is None:
+            self.pos = start_pos
+            try:
+                base_1 = self._expect(TokenType.AMP)
+                base_2 = self.parse_type()
+                if base_2 is None:
+                    raise ParseError("expected type", self._peek())
+                result = {"_rule": "type", "0": base_1, "1": base_2}
+            except ParseError:
+                pass
+        if result is None:
+            self.pos = start_pos
+            try:
+                base_1 = self._expect(TokenType.AMP_MUT)
+                base_2 = self.parse_type()
+                if base_2 is None:
+                    raise ParseError("expected type", self._peek())
+                result = {"_rule": "type", "0": base_1, "1": base_2}
+            except ParseError:
+                pass
+        if result is None:
+            self.pos = start_pos
+            try:
+                base_1 = self._expect(TokenType.LBRACKET)
+                base_2 = self._expect(TokenType.NUMBER)
+                base_3 = self._expect(TokenType.RBRACKET)
+                base_4 = self.parse_type()
+                if base_4 is None:
+                    raise ParseError("expected type", self._peek())
+                result = {"_rule": "type", "0": base_1, "1": base_2, "2": base_3, "3": base_4}
+            except ParseError:
+                pass
+        if result is None:
+            self.pos = start_pos
+            try:
+                base_1 = self._expect(TokenType.LBRACKET)
+                base_2 = self._expect(TokenType.RBRACKET)
+                base_3 = self.parse_type()
+                if base_3 is None:
+                    raise ParseError("expected type", self._peek())
+                result = {"_rule": "type", "0": base_1, "1": base_2, "2": base_3}
+            except ParseError:
+                pass
+        if result is None:
+            self.pos = start_pos
+            try:
+                base_1 = self._expect(TokenType.LPAREN)
+                base_2 = self.parse_type()
+                if base_2 is None:
+                    raise ParseError("expected type", self._peek())
+                base_3 = self._expect(TokenType.RPAREN)
+                result = {"_rule": "type", "0": base_1, "1": base_2, "2": base_3}
+            except ParseError:
+                pass
+
+        if result is None:
+            return None
+
+        # Parse recursive suffixes
+        while True:
+            suffix_pos = self.pos
+            matched = False
+
+            try:
+                suffix_1 = self._expect(TokenType.PIPE)
+                suffix_2 = self.parse_type()
+                if suffix_2 is None:
+                    raise ParseError("expected type", self._peek())
+                result = {"_rule": "type", "0": result, "1": suffix_1, "2": suffix_2}
+                matched = True
+            except ParseError:
+                pass
+
+            if not matched:
+                self.pos = suffix_pos
+                break
+
+        return result
+
+    def parse_type_name(self) -> Optional[Any]:
+        """Parse rule: type_name"""
+        start_pos = self.pos
+
+        # Alternative 1
+        try:
+            result_1 = self._expect(TokenType.IDENT)
+            result_2 = self.parse_generic_args()
+            return {"_rule": "type_name", "0": result_1, "1": result_2}
+        except ParseError:
+            self.pos = start_pos
+
+        return None
+
+    def parse_generic_args(self) -> Optional[Any]:
+        """Parse rule: generic_args"""
+        start_pos = self.pos
+
+        # Alternative 1
+        try:
+            result_1 = self._expect(TokenType.LT)
+            result_2 = self.parse_type_list()
+            if result_2 is None:
+                raise ParseError("expected type_list", self._peek())
+            result_3 = self._expect(TokenType.GT)
+            return result_2
+        except ParseError:
+            self.pos = start_pos
+
+        return None
+
+    def parse_type_list(self) -> Optional[Any]:
+        """Parse rule: type_list (binary expression, optimized)"""
+
+        # Parse left operand (type)
+        left = self.parse_type()
+        if left is None:
+            return None
+
+        # Check for operator
+        op = self._match(TokenType.COMMA)
+        if op is None:
+            return left  # No operator, just return base
+
+        # Parse right operand (type_list)
+        right = self.parse_type_list()
+        if right is None:
+            raise ParseError("expected type_list after operator", self._peek())
+
+        return {"_rule": "type_list", "left": left, "op": op, "right": right}
+
+    def parse_primitive_type(self) -> Optional[Any]:
+        """Parse rule: primitive_type"""
+        start_pos = self.pos
+
+        # Alternative 1
+        try:
+            result_1 = self._expect(TokenType.I8)
+            return result_1
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 2
+        try:
+            result_1 = self._expect(TokenType.I16)
+            return result_1
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 3
+        try:
+            result_1 = self._expect(TokenType.I32)
+            return result_1
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 4
+        try:
+            result_1 = self._expect(TokenType.I64)
+            return result_1
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 5
+        try:
+            result_1 = self._expect(TokenType.U8)
+            return result_1
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 6
+        try:
+            result_1 = self._expect(TokenType.U16)
+            return result_1
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 7
+        try:
+            result_1 = self._expect(TokenType.U32)
+            return result_1
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 8
+        try:
+            result_1 = self._expect(TokenType.U64)
+            return result_1
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 9
+        try:
+            result_1 = self._expect(TokenType.F32)
+            return result_1
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 10
+        try:
+            result_1 = self._expect(TokenType.F64)
+            return result_1
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 11
+        try:
+            result_1 = self._expect(TokenType.BOOL)
+            return result_1
+        except ParseError:
+            self.pos = start_pos
+
+        return None
+
+    def parse_block(self) -> Optional[Any]:
+        """Parse rule: block"""
+        start_pos = self.pos
+
+        # Alternative 1
+        try:
+            result_1 = self._expect(TokenType.NEWLINE)
+            result_2 = self._expect(TokenType.INDENT)
+            result_3 = self.parse_stmts()
+            result_4 = self._expect(TokenType.DEDENT)
+            return {"_rule": "block", "0": result_1, "1": result_2, "2": result_3, "3": result_4}
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 2
+        try:
+            result_1 = self.parse_stmt()
+            if result_1 is None:
+                raise ParseError("expected stmt", self._peek())
+            return result_1
+        except ParseError:
+            self.pos = start_pos
+
+        return None
+
+    def parse_stmts(self) -> Optional[Any]:
+        """Parse rule: stmts"""
+        start_pos = self.pos
+
+        # Alternative 1
+        try:
+            result_1 = self.parse_stmt()
+            if result_1 is None:
+                raise ParseError("expected stmt", self._peek())
+            result_2 = self.parse_stmts()
+            return {"_rule": "stmts", "0": result_1, "1": result_2}
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 2
+        try:
+            return None
+        except ParseError:
+            self.pos = start_pos
+
+        return None
+
+    def parse_stmt(self) -> Optional[Any]:
+        """Parse rule: stmt"""
+        start_pos = self.pos
+
+        # Alternative 1
+        try:
+            result_1 = self.parse_let_stmt()
+            if result_1 is None:
+                raise ParseError("expected let_stmt", self._peek())
+            return result_1
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 2
+        try:
+            result_1 = self.parse_var_stmt()
+            if result_1 is None:
+                raise ParseError("expected var_stmt", self._peek())
+            return result_1
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 3
+        try:
+            result_1 = self.parse_return_stmt()
+            if result_1 is None:
+                raise ParseError("expected return_stmt", self._peek())
+            return result_1
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 4
+        try:
+            result_1 = self.parse_if_stmt()
+            if result_1 is None:
+                raise ParseError("expected if_stmt", self._peek())
+            return result_1
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 5
+        try:
+            result_1 = self.parse_while_stmt()
+            if result_1 is None:
+                raise ParseError("expected while_stmt", self._peek())
+            return result_1
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 6
+        try:
+            result_1 = self.parse_for_stmt()
+            if result_1 is None:
+                raise ParseError("expected for_stmt", self._peek())
+            return result_1
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 7
+        try:
+            result_1 = self.parse_match_stmt()
+            if result_1 is None:
+                raise ParseError("expected match_stmt", self._peek())
+            return result_1
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 8
+        try:
+            result_1 = self.parse_break_stmt()
+            if result_1 is None:
+                raise ParseError("expected break_stmt", self._peek())
+            return result_1
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 9
+        try:
+            result_1 = self.parse_continue_stmt()
+            if result_1 is None:
+                raise ParseError("expected continue_stmt", self._peek())
+            return result_1
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 10
+        try:
+            result_1 = self.parse_assert_stmt()
+            if result_1 is None:
+                raise ParseError("expected assert_stmt", self._peek())
+            return result_1
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 11
+        try:
+            result_1 = self.parse_assign_stmt()
+            if result_1 is None:
+                raise ParseError("expected assign_stmt", self._peek())
+            return result_1
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 12
+        try:
+            result_1 = self.parse_expr_stmt()
+            if result_1 is None:
+                raise ParseError("expected expr_stmt", self._peek())
+            return result_1
+        except ParseError:
+            self.pos = start_pos
+
+        return None
+
+    def parse_assert_stmt(self) -> Optional[Any]:
+        """Parse rule: assert_stmt"""
+        start_pos = self.pos
+
+        # Alternative 1
+        try:
+            result_1 = self._expect(TokenType.ASSERT)
+            result_2 = self.parse_expr()
+            if result_2 is None:
+                raise ParseError("expected expr", self._peek())
+            result_3 = self._expect(TokenType.COMMA)
+            result_4 = self._expect(TokenType.STRING)
+            result_5 = self._expect(TokenType.NEWLINE)
+            return {"_rule": "assert_stmt", "0": result_1, "1": result_2, "2": result_3, "3": result_4, "4": result_5}
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 2
+        try:
+            result_1 = self._expect(TokenType.ASSERT)
+            result_2 = self.parse_expr()
+            if result_2 is None:
+                raise ParseError("expected expr", self._peek())
+            result_3 = self._expect(TokenType.NEWLINE)
+            return {"_rule": "assert_stmt", "0": result_1, "1": result_2, "2": result_3}
+        except ParseError:
+            self.pos = start_pos
+
+        return None
+
+    def parse_let_stmt(self) -> Optional[Any]:
+        """Parse rule: let_stmt"""
+        start_pos = self.pos
+
+        # Alternative 1
+        try:
+            result_1 = self._expect(TokenType.LET)
+            result_2 = self._expect(TokenType.IDENT)
+            result_3 = self._expect(TokenType.COLON)
+            result_4 = self.parse_type()
+            if result_4 is None:
+                raise ParseError("expected type", self._peek())
+            result_5 = self._expect(TokenType.ASSIGN)
+            result_6 = self.parse_expr()
+            if result_6 is None:
+                raise ParseError("expected expr", self._peek())
+            result_7 = self._expect(TokenType.NEWLINE)
+            return {"_rule": "let_stmt", "0": result_1, "1": result_2, "2": result_3, "3": result_4, "4": result_5, "5": result_6, "6": result_7}
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 2
+        try:
+            result_1 = self._expect(TokenType.LET)
+            result_2 = self._expect(TokenType.IDENT)
+            result_3 = self._expect(TokenType.ASSIGN)
+            result_4 = self.parse_expr()
+            if result_4 is None:
+                raise ParseError("expected expr", self._peek())
+            result_5 = self._expect(TokenType.NEWLINE)
+            return {"_rule": "let_stmt", "0": result_1, "1": result_2, "2": result_3, "3": result_4, "4": result_5}
+        except ParseError:
+            self.pos = start_pos
+
+        return None
+
+    def parse_var_stmt(self) -> Optional[Any]:
+        """Parse rule: var_stmt"""
+        start_pos = self.pos
+
+        # Alternative 1
+        try:
+            result_1 = self._expect(TokenType.VAR)
+            result_2 = self._expect(TokenType.IDENT)
+            result_3 = self._expect(TokenType.COLON)
+            result_4 = self.parse_type()
+            if result_4 is None:
+                raise ParseError("expected type", self._peek())
+            result_5 = self._expect(TokenType.ASSIGN)
+            result_6 = self.parse_expr()
+            if result_6 is None:
+                raise ParseError("expected expr", self._peek())
+            result_7 = self._expect(TokenType.NEWLINE)
+            return {"_rule": "var_stmt", "0": result_1, "1": result_2, "2": result_3, "3": result_4, "4": result_5, "5": result_6, "6": result_7}
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 2
+        try:
+            result_1 = self._expect(TokenType.VAR)
+            result_2 = self._expect(TokenType.IDENT)
+            result_3 = self._expect(TokenType.COLON)
+            result_4 = self.parse_type()
+            if result_4 is None:
+                raise ParseError("expected type", self._peek())
+            result_5 = self._expect(TokenType.NEWLINE)
+            return {"_rule": "var_stmt", "0": result_1, "1": result_2, "2": result_3, "3": result_4, "4": result_5}
+        except ParseError:
+            self.pos = start_pos
+
+        return None
+
+    def parse_return_stmt(self) -> Optional[Any]:
+        """Parse rule: return_stmt"""
+        start_pos = self.pos
+
+        # Alternative 1
+        try:
+            result_1 = self._expect(TokenType.RETURN)
+            result_2 = self.parse_expr()
+            if result_2 is None:
+                raise ParseError("expected expr", self._peek())
+            result_3 = self._expect(TokenType.NEWLINE)
+            return {"_rule": "return_stmt", "0": result_1, "1": result_2, "2": result_3}
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 2
+        try:
+            result_1 = self._expect(TokenType.RETURN)
+            result_2 = self._expect(TokenType.NEWLINE)
+            return {"_rule": "return_stmt", "0": result_1, "1": result_2}
+        except ParseError:
+            self.pos = start_pos
+
+        return None
+
+    def parse_if_stmt(self) -> Optional[Any]:
+        """Parse rule: if_stmt"""
+        start_pos = self.pos
+
+        # Alternative 1
+        try:
+            result_1 = self._expect(TokenType.IF)
+            result_2 = self.parse_expr()
+            if result_2 is None:
+                raise ParseError("expected expr", self._peek())
+            result_3 = self.parse_block()
+            if result_3 is None:
+                raise ParseError("expected block", self._peek())
+            result_4 = self.parse_else_clause()
+            return {"_rule": "if_stmt", "0": result_1, "1": result_2, "2": result_3, "3": result_4}
+        except ParseError:
+            self.pos = start_pos
+
+        return None
+
+    def parse_else_clause(self) -> Optional[Any]:
+        """Parse rule: else_clause"""
+        start_pos = self.pos
+
+        # Alternative 1
+        try:
+            result_1 = self._expect(TokenType.ELSE)
+            result_2 = self.parse_block()
+            if result_2 is None:
+                raise ParseError("expected block", self._peek())
+            return result_2
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 2
+        try:
+            result_1 = self._expect(TokenType.ELSE)
+            result_2 = self.parse_if_stmt()
+            if result_2 is None:
+                raise ParseError("expected if_stmt", self._peek())
+            return {"_rule": "else_clause", "0": result_1, "1": result_2}
+        except ParseError:
+            self.pos = start_pos
+
+        return None
+
+    def parse_while_stmt(self) -> Optional[Any]:
+        """Parse rule: while_stmt"""
+        start_pos = self.pos
+
+        # Alternative 1
+        try:
+            result_1 = self._expect(TokenType.WHILE)
+            result_2 = self.parse_expr()
+            if result_2 is None:
+                raise ParseError("expected expr", self._peek())
+            result_3 = self.parse_block()
+            if result_3 is None:
+                raise ParseError("expected block", self._peek())
+            return {"_rule": "while_stmt", "0": result_1, "1": result_2, "2": result_3}
+        except ParseError:
+            self.pos = start_pos
+
+        return None
+
+    def parse_for_stmt(self) -> Optional[Any]:
+        """Parse rule: for_stmt"""
+        start_pos = self.pos
+
+        # Alternative 1
+        try:
+            result_1 = self._expect(TokenType.FOR)
+            result_2 = self._expect(TokenType.IDENT)
+            result_3 = self._expect(TokenType.IN)
+            result_4 = self.parse_expr()
+            if result_4 is None:
+                raise ParseError("expected expr", self._peek())
+            result_5 = self.parse_block()
+            if result_5 is None:
+                raise ParseError("expected block", self._peek())
+            return {"_rule": "for_stmt", "0": result_1, "1": result_2, "2": result_3, "3": result_4, "4": result_5}
+        except ParseError:
+            self.pos = start_pos
+
+        return None
+
+    def parse_match_stmt(self) -> Optional[Any]:
+        """Parse rule: match_stmt"""
+        start_pos = self.pos
+
+        # Alternative 1
+        try:
+            result_1 = self._expect(TokenType.MATCH)
+            result_2 = self.parse_expr()
+            if result_2 is None:
+                raise ParseError("expected expr", self._peek())
+            result_3 = self._expect(TokenType.NEWLINE)
+            result_4 = self._expect(TokenType.INDENT)
+            result_5 = self.parse_match_arms()
+            result_6 = self._expect(TokenType.DEDENT)
+            return {"_rule": "match_stmt", "0": result_1, "1": result_2, "2": result_3, "3": result_4, "4": result_5, "5": result_6}
+        except ParseError:
+            self.pos = start_pos
+
+        return None
+
+    def parse_match_arms(self) -> Optional[Any]:
+        """Parse rule: match_arms"""
+        start_pos = self.pos
+
+        # Alternative 1
+        try:
+            result_1 = self.parse_match_arm()
+            if result_1 is None:
+                raise ParseError("expected match_arm", self._peek())
+            result_2 = self.parse_match_arms()
+            return {"_rule": "match_arms", "0": result_1, "1": result_2}
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 2
+        try:
+            return None
+        except ParseError:
+            self.pos = start_pos
+
+        return None
+
+    def parse_match_arm(self) -> Optional[Any]:
+        """Parse rule: match_arm"""
+        start_pos = self.pos
+
+        # Alternative 1
+        try:
+            result_1 = self.parse_pattern()
+            if result_1 is None:
+                raise ParseError("expected pattern", self._peek())
+            result_2 = self._expect(TokenType.FAT_ARROW)
+            result_3 = self.parse_expr()
+            if result_3 is None:
+                raise ParseError("expected expr", self._peek())
+            result_4 = self._expect(TokenType.NEWLINE)
+            return {"_rule": "match_arm", "0": result_1, "1": result_2, "2": result_3, "3": result_4}
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 2
+        try:
+            result_1 = self.parse_pattern()
+            if result_1 is None:
+                raise ParseError("expected pattern", self._peek())
+            result_2 = self._expect(TokenType.FAT_ARROW)
+            result_3 = self.parse_block()
+            if result_3 is None:
+                raise ParseError("expected block", self._peek())
+            return {"_rule": "match_arm", "0": result_1, "1": result_2, "2": result_3}
+        except ParseError:
+            self.pos = start_pos
+
+        return None
+
+    def parse_pattern(self) -> Optional[Any]:
+        """Parse rule: pattern"""
+        start_pos = self.pos
+
+        # Alternative 1
+        try:
+            result_1 = self._expect(TokenType.IDENT)
+            result_2 = self._expect(TokenType.LPAREN)
+            result_3 = self.parse_pattern()
+            if result_3 is None:
+                raise ParseError("expected pattern", self._peek())
+            result_4 = self._expect(TokenType.RPAREN)
+            return {"_rule": "pattern", "0": result_1, "1": result_2, "2": result_3, "3": result_4}
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 2
+        try:
+            result_1 = self._expect(TokenType.IDENT)
+            return result_1
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 3
+        try:
+            result_1 = self._expect(TokenType.NUMBER)
+            return result_1
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 4
+        try:
+            result_1 = self._expect(TokenType.TRUE)
+            return result_1
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 5
+        try:
+            result_1 = self._expect(TokenType.FALSE)
+            return result_1
+        except ParseError:
+            self.pos = start_pos
+
+        return None
+
+    def parse_break_stmt(self) -> Optional[Any]:
+        """Parse rule: break_stmt"""
+        start_pos = self.pos
+
+        # Alternative 1
+        try:
+            result_1 = self._expect(TokenType.BREAK)
+            result_2 = self._expect(TokenType.NEWLINE)
+            return {"_rule": "break_stmt", "0": result_1, "1": result_2}
+        except ParseError:
+            self.pos = start_pos
+
+        return None
+
+    def parse_continue_stmt(self) -> Optional[Any]:
+        """Parse rule: continue_stmt"""
+        start_pos = self.pos
+
+        # Alternative 1
+        try:
+            result_1 = self._expect(TokenType.CONTINUE)
+            result_2 = self._expect(TokenType.NEWLINE)
+            return {"_rule": "continue_stmt", "0": result_1, "1": result_2}
+        except ParseError:
+            self.pos = start_pos
+
+        return None
+
+    def parse_assign_stmt(self) -> Optional[Any]:
+        """Parse rule: assign_stmt"""
+        start_pos = self.pos
+
+        # Alternative 1
+        try:
+            result_1 = self.parse_lvalue()
+            if result_1 is None:
+                raise ParseError("expected lvalue", self._peek())
+            result_2 = self._expect(TokenType.ASSIGN)
+            result_3 = self.parse_expr()
+            if result_3 is None:
+                raise ParseError("expected expr", self._peek())
+            result_4 = self._expect(TokenType.NEWLINE)
+            return {"_rule": "assign_stmt", "0": result_1, "1": result_2, "2": result_3, "3": result_4}
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 2
+        try:
+            result_1 = self.parse_lvalue()
+            if result_1 is None:
+                raise ParseError("expected lvalue", self._peek())
+            result_2 = self._expect(TokenType.PLUS_EQ)
+            result_3 = self.parse_expr()
+            if result_3 is None:
+                raise ParseError("expected expr", self._peek())
+            result_4 = self._expect(TokenType.NEWLINE)
+            return {"_rule": "assign_stmt", "0": result_1, "1": result_2, "2": result_3, "3": result_4}
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 3
+        try:
+            result_1 = self.parse_lvalue()
+            if result_1 is None:
+                raise ParseError("expected lvalue", self._peek())
+            result_2 = self._expect(TokenType.MINUS_EQ)
+            result_3 = self.parse_expr()
+            if result_3 is None:
+                raise ParseError("expected expr", self._peek())
+            result_4 = self._expect(TokenType.NEWLINE)
+            return {"_rule": "assign_stmt", "0": result_1, "1": result_2, "2": result_3, "3": result_4}
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 4
+        try:
+            result_1 = self.parse_lvalue()
+            if result_1 is None:
+                raise ParseError("expected lvalue", self._peek())
+            result_2 = self._expect(TokenType.STAR_EQ)
+            result_3 = self.parse_expr()
+            if result_3 is None:
+                raise ParseError("expected expr", self._peek())
+            result_4 = self._expect(TokenType.NEWLINE)
+            return {"_rule": "assign_stmt", "0": result_1, "1": result_2, "2": result_3, "3": result_4}
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 5
+        try:
+            result_1 = self.parse_lvalue()
+            if result_1 is None:
+                raise ParseError("expected lvalue", self._peek())
+            result_2 = self._expect(TokenType.SLASH_EQ)
+            result_3 = self.parse_expr()
+            if result_3 is None:
+                raise ParseError("expected expr", self._peek())
+            result_4 = self._expect(TokenType.NEWLINE)
+            return {"_rule": "assign_stmt", "0": result_1, "1": result_2, "2": result_3, "3": result_4}
+        except ParseError:
+            self.pos = start_pos
+
+        return None
+
+    def parse_lvalue(self) -> Optional[Any]:
+        """Parse rule: lvalue (left-recursion eliminated)"""
+
+        # Parse base case
+        start_pos = self.pos
+        result = None
+
+        try:
+            base_1 = self._expect(TokenType.IDENT)
+            result = base_1
+        except ParseError:
+            pass
+        if result is None:
+            self.pos = start_pos
+            try:
+                base_1 = self._expect(TokenType.STAR)
+                base_2 = self.parse_expr()
+                if base_2 is None:
+                    raise ParseError("expected expr", self._peek())
+                result = {"_rule": "lvalue", "0": base_1, "1": base_2}
+            except ParseError:
+                pass
+
+        if result is None:
+            return None
+
+        # Parse recursive suffixes
+        while True:
+            suffix_pos = self.pos
+            matched = False
+
+            try:
+                suffix_1 = self._expect(TokenType.LBRACKET)
+                suffix_2 = self.parse_expr()
+                if suffix_2 is None:
+                    raise ParseError("expected expr", self._peek())
+                suffix_3 = self._expect(TokenType.RBRACKET)
+                result = {"_rule": "lvalue", "0": result, "1": suffix_1, "2": suffix_2, "3": suffix_3}
+                matched = True
+            except ParseError:
+                pass
+            if not matched:
+                self.pos = suffix_pos
+                try:
+                    suffix_1 = self._expect(TokenType.DOT)
+                    suffix_2 = self._expect(TokenType.IDENT)
+                    result = {"_rule": "lvalue", "0": result, "1": suffix_1, "2": suffix_2}
+                    matched = True
+                except ParseError:
+                    pass
+
+            if not matched:
+                self.pos = suffix_pos
+                break
+
+        return result
+
+    def parse_expr_stmt(self) -> Optional[Any]:
+        """Parse rule: expr_stmt"""
+        start_pos = self.pos
+
+        # Alternative 1
+        try:
+            result_1 = self.parse_expr()
+            if result_1 is None:
+                raise ParseError("expected expr", self._peek())
+            result_2 = self._expect(TokenType.NEWLINE)
+            return {"_rule": "expr_stmt", "0": result_1, "1": result_2}
+        except ParseError:
+            self.pos = start_pos
+
+        return None
+
+    def parse_expr(self) -> Optional[Any]:
+        """Parse rule: expr"""
+        start_pos = self.pos
+
+        # Alternative 1
+        try:
+            result_1 = self.parse_or_expr()
+            if result_1 is None:
+                raise ParseError("expected or_expr", self._peek())
+            return result_1
+        except ParseError:
+            self.pos = start_pos
+
+        return None
+
+    def parse_or_expr(self) -> Optional[Any]:
+        """Parse rule: or_expr (binary expression, optimized)"""
+
+        # Parse left operand (and_expr)
+        left = self.parse_and_expr()
+        if left is None:
+            return None
+
+        # Check for operator
+        op = self._match(TokenType.OR)
+        if op is None:
+            return left  # No operator, just return base
+
+        # Parse right operand (or_expr)
+        right = self.parse_or_expr()
+        if right is None:
+            raise ParseError("expected or_expr after operator", self._peek())
+
+        return {"_rule": "or_expr", "left": left, "op": op, "right": right}
+
+    def parse_and_expr(self) -> Optional[Any]:
+        """Parse rule: and_expr (binary expression, optimized)"""
+
+        # Parse left operand (cmp_expr)
+        left = self.parse_cmp_expr()
+        if left is None:
+            return None
+
+        # Check for operator
+        op = self._match(TokenType.AND)
+        if op is None:
+            return left  # No operator, just return base
+
+        # Parse right operand (and_expr)
+        right = self.parse_and_expr()
+        if right is None:
+            raise ParseError("expected and_expr after operator", self._peek())
+
+        return {"_rule": "and_expr", "left": left, "op": op, "right": right}
+
+    def parse_cmp_expr(self) -> Optional[Any]:
+        """Parse rule: cmp_expr (optional suffix, optimized)"""
+
+        # Parse base (bit_or_expr)
+        base = self.parse_bit_or_expr()
+        if base is None:
+            return None
+
+        # Try to parse optional suffix
+        suffix_pos = self.pos
+        try:
+            suffix_1 = self.parse_cmp_op()
+            if suffix_1 is None:
+                raise ParseError("expected cmp_op", self._peek())
+            suffix_2 = self.parse_bit_or_expr()
+            if suffix_2 is None:
+                raise ParseError("expected bit_or_expr", self._peek())
+            return {"_rule": "cmp_expr", "0": base, "1": suffix_1, "2": suffix_2}
+        except ParseError:
+            self.pos = suffix_pos
+
+        return base
+
+    def parse_cmp_op(self) -> Optional[int]:
+        """Parse rule: cmp_op"""
+        start_pos = self.pos
+
+        # Alternative 1
+        try:
+            result_1 = self._expect(TokenType.EQ)
+            return result_1
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 2
+        try:
+            result_1 = self._expect(TokenType.NE)
+            return result_1
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 3
+        try:
+            result_1 = self._expect(TokenType.LT)
+            return result_1
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 4
+        try:
+            result_1 = self._expect(TokenType.LE)
+            return result_1
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 5
+        try:
+            result_1 = self._expect(TokenType.GT)
+            return result_1
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 6
+        try:
+            result_1 = self._expect(TokenType.GE)
+            return result_1
+        except ParseError:
+            self.pos = start_pos
+
+        return None
+
+    def parse_bit_or_expr(self) -> Optional[Any]:
+        """Parse rule: bit_or_expr (binary expression, optimized)"""
+
+        # Parse left operand (range_expr)
+        left = self.parse_range_expr()
+        if left is None:
+            return None
+
+        # Check for operator
+        op = self._match(TokenType.PIPE)
+        if op is None:
+            return left  # No operator, just return base
+
+        # Parse right operand (bit_or_expr)
+        right = self.parse_bit_or_expr()
+        if right is None:
+            raise ParseError("expected bit_or_expr after operator", self._peek())
+
+        return {"_rule": "bit_or_expr", "left": left, "op": op, "right": right}
+
+    def parse_range_expr(self) -> Optional[Any]:
+        """Parse rule: range_expr (optional suffix, optimized)"""
+
+        # Parse base (bit_xor_expr)
+        base = self.parse_bit_xor_expr()
+        if base is None:
+            return None
+
+        # Try to match suffix starting with DOT_DOT
+        suffix_tok = self._match(TokenType.DOT_DOT)
+        if suffix_tok is not None:
+            suffix_2 = self.parse_bit_xor_expr()
+            if suffix_2 is None:
+                raise ParseError("expected bit_xor_expr", self._peek())
+            return {"_rule": "range_expr", "0": base, "1": suffix_tok, "2": suffix_2}
+
+        return base
+
+    def parse_bit_xor_expr(self) -> Optional[Any]:
+        """Parse rule: bit_xor_expr (binary expression, optimized)"""
+
+        # Parse left operand (bit_and_expr)
+        left = self.parse_bit_and_expr()
+        if left is None:
+            return None
+
+        # Check for operator
+        op = self._match(TokenType.CARET)
+        if op is None:
+            return left  # No operator, just return base
+
+        # Parse right operand (bit_xor_expr)
+        right = self.parse_bit_xor_expr()
+        if right is None:
+            raise ParseError("expected bit_xor_expr after operator", self._peek())
+
+        return {"_rule": "bit_xor_expr", "left": left, "op": op, "right": right}
+
+    def parse_bit_and_expr(self) -> Optional[Any]:
+        """Parse rule: bit_and_expr (binary expression, optimized)"""
+
+        # Parse left operand (shift_expr)
+        left = self.parse_shift_expr()
+        if left is None:
+            return None
+
+        # Check for operator
+        op = self._match(TokenType.AMP)
+        if op is None:
+            return left  # No operator, just return base
+
+        # Parse right operand (bit_and_expr)
+        right = self.parse_bit_and_expr()
+        if right is None:
+            raise ParseError("expected bit_and_expr after operator", self._peek())
+
+        return {"_rule": "bit_and_expr", "left": left, "op": op, "right": right}
+
+    def parse_shift_expr(self) -> Optional[Any]:
+        """Parse rule: shift_expr (binary expression, optimized)"""
+
+        # Parse left operand (add_expr)
+        left = self.parse_add_expr()
+        if left is None:
+            return None
+
+        # Check for operator
+        op = self._match(TokenType.SHL, TokenType.SHR)
+        if op is None:
+            return left  # No operator, just return base
+
+        # Parse right operand (shift_expr)
+        right = self.parse_shift_expr()
+        if right is None:
+            raise ParseError("expected shift_expr after operator", self._peek())
+
+        return {"_rule": "shift_expr", "left": left, "op": op, "right": right}
+
+    def parse_add_expr(self) -> Optional[Any]:
+        """Parse rule: add_expr (binary expression, optimized)"""
+
+        # Parse left operand (mul_expr)
+        left = self.parse_mul_expr()
+        if left is None:
+            return None
+
+        # Check for operator
+        op = self._match(TokenType.PLUS, TokenType.MINUS)
+        if op is None:
+            return left  # No operator, just return base
+
+        # Parse right operand (add_expr)
+        right = self.parse_add_expr()
+        if right is None:
+            raise ParseError("expected add_expr after operator", self._peek())
+
+        return {"_rule": "add_expr", "left": left, "op": op, "right": right}
+
+    def parse_mul_expr(self) -> Optional[Any]:
+        """Parse rule: mul_expr (binary expression, optimized)"""
+
+        # Parse left operand (cast_expr)
+        left = self.parse_cast_expr()
+        if left is None:
+            return None
+
+        # Check for operator
+        op = self._match(TokenType.STAR, TokenType.SLASH, TokenType.PERCENT)
+        if op is None:
+            return left  # No operator, just return base
+
+        # Parse right operand (mul_expr)
+        right = self.parse_mul_expr()
+        if right is None:
+            raise ParseError("expected mul_expr after operator", self._peek())
+
+        return {"_rule": "mul_expr", "left": left, "op": op, "right": right}
+
+    def parse_cast_expr(self) -> Optional[Any]:
+        """Parse rule: cast_expr (optional suffix, optimized)"""
+
+        # Parse base (unary_expr)
+        base = self.parse_unary_expr()
+        if base is None:
+            return None
+
+        # Try to match suffix starting with AS
+        suffix_tok = self._match(TokenType.AS)
+        if suffix_tok is not None:
+            suffix_2 = self.parse_type()
+            if suffix_2 is None:
+                raise ParseError("expected type", self._peek())
+            return {"_rule": "cast_expr", "0": base, "1": suffix_tok, "2": suffix_2}
+
+        return base
+
+    def parse_unary_expr(self) -> Optional[Any]:
+        """Parse rule: unary_expr"""
+        start_pos = self.pos
+
+        # Alternative 1
+        try:
+            result_1 = self._expect(TokenType.MINUS)
+            result_2 = self.parse_unary_expr()
+            if result_2 is None:
+                raise ParseError("expected unary_expr", self._peek())
+            return {"_rule": "unary_expr", "0": result_1, "1": result_2}
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 2
+        try:
+            result_1 = self._expect(TokenType.BANG)
+            result_2 = self.parse_unary_expr()
+            if result_2 is None:
+                raise ParseError("expected unary_expr", self._peek())
+            return {"_rule": "unary_expr", "0": result_1, "1": result_2}
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 3
+        try:
+            result_1 = self._expect(TokenType.TILDE)
+            result_2 = self.parse_unary_expr()
+            if result_2 is None:
+                raise ParseError("expected unary_expr", self._peek())
+            return {"_rule": "unary_expr", "0": result_1, "1": result_2}
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 4
+        try:
+            result_1 = self._expect(TokenType.STAR)
+            result_2 = self.parse_unary_expr()
+            if result_2 is None:
+                raise ParseError("expected unary_expr", self._peek())
+            return {"_rule": "unary_expr", "0": result_1, "1": result_2}
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 5
+        try:
+            result_1 = self._expect(TokenType.AMP)
+            result_2 = self.parse_unary_expr()
+            if result_2 is None:
+                raise ParseError("expected unary_expr", self._peek())
+            return {"_rule": "unary_expr", "0": result_1, "1": result_2}
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 6
+        try:
+            result_1 = self._expect(TokenType.AMP_MUT)
+            result_2 = self.parse_unary_expr()
+            if result_2 is None:
+                raise ParseError("expected unary_expr", self._peek())
+            return {"_rule": "unary_expr", "0": result_1, "1": result_2}
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 7
+        try:
+            result_1 = self.parse_try_expr()
+            if result_1 is None:
+                raise ParseError("expected try_expr", self._peek())
+            return result_1
+        except ParseError:
+            self.pos = start_pos
+
+        return None
+
+    def parse_try_expr(self) -> Optional[Any]:
+        """Parse rule: try_expr (optional suffix, optimized)"""
+
+        # Parse base (postfix_expr)
+        base = self.parse_postfix_expr()
+        if base is None:
+            return None
+
+        # Try to match suffix starting with QUESTION
+        suffix_tok = self._match(TokenType.QUESTION)
+        if suffix_tok is not None:
+            return {"_rule": "try_expr", "0": base, "1": suffix_tok}
+
+        return base
+
+    def parse_postfix_expr(self) -> Optional[Any]:
+        """Parse rule: postfix_expr"""
+        start_pos = self.pos
+
+        # Alternative 1
+        try:
+            result_1 = self.parse_primary_expr()
+            if result_1 is None:
+                raise ParseError("expected primary_expr", self._peek())
+            result_2 = []
+            while True:
+                item = self.parse_postfix_op()
+                if item is None:
+                    break
+                result_2.append(item)
+            return {"_rule": "postfix_expr", "0": result_1, "1": result_2}
+        except ParseError:
+            self.pos = start_pos
+
+        return None
+
+    def parse_postfix_op(self) -> Optional[Any]:
+        """Parse rule: postfix_op"""
+        start_pos = self.pos
+
+        # Alternative 1
+        try:
+            result_1 = self._expect(TokenType.LPAREN)
+            result_2 = self.parse_args()
+            result_3 = self._expect(TokenType.RPAREN)
+            return {"_rule": "postfix_op", "0": result_1, "1": result_2, "2": result_3}
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 2
+        try:
+            result_1 = self._expect(TokenType.LBRACKET)
+            result_2 = self.parse_expr()
+            if result_2 is None:
+                raise ParseError("expected expr", self._peek())
+            result_3 = self._expect(TokenType.RBRACKET)
+            return {"_rule": "postfix_op", "0": result_1, "1": result_2, "2": result_3}
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 3
+        try:
+            result_1 = self._expect(TokenType.DOT)
+            result_2 = self._expect(TokenType.IDENT)
+            result_3 = self.parse_generic_args()
+            return {"_rule": "postfix_op", "0": result_1, "1": result_2, "2": result_3}
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 4
+        try:
+            result_1 = self._expect(TokenType.DOT)
+            result_2 = self._expect(TokenType.NUMBER)
+            return {"_rule": "postfix_op", "0": result_1, "1": result_2}
+        except ParseError:
+            self.pos = start_pos
+
+        return None
+
+    def parse_args(self) -> Optional[Any]:
+        """Parse rule: args (binary expression, optimized)"""
+
+        # Parse left operand (expr)
+        left = self.parse_expr()
+        if left is None:
+            return None
+
+        # Check for operator
+        op = self._match(TokenType.COMMA)
+        if op is None:
+            return left  # No operator, just return base
+
+        # Parse right operand (args)
+        right = self.parse_args()
+        if right is None:
+            raise ParseError("expected args after operator", self._peek())
+
+        return {"_rule": "args", "left": left, "op": op, "right": right}
+
+    def parse_primary_expr(self) -> Optional[Any]:
+        """Parse rule: primary_expr"""
+        start_pos = self.pos
+
+        # Alternative 1
+        try:
+            result_1 = self._expect(TokenType.NUMBER)
+            return result_1
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 2
+        try:
+            result_1 = self._expect(TokenType.HEX_NUMBER)
+            return result_1
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 3
+        try:
+            result_1 = self._expect(TokenType.BIN_NUMBER)
+            return result_1
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 4
+        try:
+            result_1 = self._expect(TokenType.FLOAT)
+            return result_1
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 5
+        try:
+            result_1 = self._expect(TokenType.STRING)
+            return result_1
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 6
+        try:
+            result_1 = self._expect(TokenType.CHAR)
+            return result_1
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 7
+        try:
+            result_1 = self._expect(TokenType.CSTRING)
+            return result_1
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 8
+        try:
+            result_1 = self._expect(TokenType.SPAN_STRING)
+            return result_1
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 11
+        try:
+            result_1 = self._expect(TokenType.TRUE)
+            return result_1
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 8
+        try:
+            result_1 = self._expect(TokenType.FALSE)
+            return result_1
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 11
+        try:
+            result_1 = self._expect(TokenType.NULL)
+            return result_1
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 12
+        try:
+            result_1 = self._expect(TokenType.IDENT)
+            result_2 = self.parse_struct_lit()
+            return {"_rule": "primary_expr", "0": result_1, "1": result_2}
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 13
+        try:
+            result_1 = self._expect(TokenType.IDENT)
+            result_2 = self.parse_generic_args()
+            if result_2 is None:
+                raise ParseError("expected generic_args", self._peek())
+            result_3 = self._expect(TokenType.LPAREN)
+            result_4 = self.parse_args()
+            result_5 = self._expect(TokenType.RPAREN)
+            return {"_rule": "primary_expr", "0": result_1, "1": result_2, "2": result_3, "3": result_4, "4": result_5}
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 14
+        try:
+            result_1 = self._expect(TokenType.LPAREN)
+            result_2 = self.parse_expr()
+            if result_2 is None:
+                raise ParseError("expected expr", self._peek())
+            result_3 = self._expect(TokenType.RPAREN)
+            return result_2
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 15
+        try:
+            result_1 = self._expect(TokenType.LBRACKET)
+            result_2 = self.parse_array_items()
+            result_3 = self._expect(TokenType.RBRACKET)
+            return {"_rule": "primary_expr", "0": result_1, "1": result_2, "2": result_3}
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 16
+        try:
+            result_1 = self._expect(TokenType.LBRACKET)
+            result_2 = self.parse_expr()
+            if result_2 is None:
+                raise ParseError("expected expr", self._peek())
+            result_3 = self._expect(TokenType.SEMI)
+            result_4 = self._expect(TokenType.NUMBER)
+            result_5 = self._expect(TokenType.RBRACKET)
+            return {"_rule": "primary_expr", "0": result_1, "1": result_2, "2": result_3, "3": result_4, "4": result_5}
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 17
+        try:
+            result_1 = self.parse_if_expr()
+            if result_1 is None:
+                raise ParseError("expected if_expr", self._peek())
+            return result_1
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 18
+        try:
+            result_1 = self.parse_block_expr()
+            if result_1 is None:
+                raise ParseError("expected block_expr", self._peek())
+            return result_1
+        except ParseError:
+            self.pos = start_pos
+
+        return None
+
+    def parse_struct_lit(self) -> Optional[Any]:
+        """Parse rule: struct_lit"""
+        start_pos = self.pos
+
+        # Alternative 1
+        try:
+            result_1 = self._expect(TokenType.LBRACE)
+            result_2 = self.parse_field_inits()
+            result_3 = self._expect(TokenType.RBRACE)
+            return result_2
+        except ParseError:
+            self.pos = start_pos
+
+        return None
+
+    def parse_field_inits(self) -> Optional[Any]:
+        """Parse rule: field_inits"""
+        start_pos = self.pos
+
+        # Alternative 1
+        try:
+            result_1 = self.parse_field_init()
+            if result_1 is None:
+                raise ParseError("expected field_init", self._peek())
+            result_2 = self._expect(TokenType.COMMA)
+            result_3 = self.parse_field_inits()
+            return {"_rule": "field_inits", "0": result_1, "1": result_2, "2": result_3}
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 2
+        try:
+            result_1 = self.parse_field_init()
+            if result_1 is None:
+                raise ParseError("expected field_init", self._peek())
+            return result_1
+        except ParseError:
+            self.pos = start_pos
+
+        # Try next alternative
+        self.pos = start_pos
+
+        # Alternative 3
+        try:
+            return None
+        except ParseError:
+            self.pos = start_pos
+
+        return None
+
+    def parse_field_init(self) -> Optional[Any]:
+        """Parse rule: field_init"""
+        start_pos = self.pos
+
+        # Alternative 1
+        try:
+            result_1 = self._expect(TokenType.IDENT)
+            result_2 = self._expect(TokenType.COLON)
+            result_3 = self.parse_expr()
+            if result_3 is None:
+                raise ParseError("expected expr", self._peek())
+            return {"_rule": "field_init", "0": result_1, "1": result_2, "2": result_3}
+        except ParseError:
+            self.pos = start_pos
+
+        return None
+
+    def parse_array_items(self) -> Optional[Any]:
+        """Parse rule: array_items (binary expression, optimized)"""
+
+        # Parse left operand (expr)
+        left = self.parse_expr()
+        if left is None:
+            return None
+
+        # Check for operator
+        op = self._match(TokenType.COMMA)
+        if op is None:
+            return left  # No operator, just return base
+
+        # Parse right operand (array_items)
+        right = self.parse_array_items()
+        if right is None:
+            raise ParseError("expected array_items after operator", self._peek())
+
+        return {"_rule": "array_items", "left": left, "op": op, "right": right}
+
+    def parse_if_expr(self) -> Optional[Any]:
+        """Parse rule: if_expr"""
+        start_pos = self.pos
+
+        # Alternative 1
+        try:
+            result_1 = self._expect(TokenType.IF)
+            result_2 = self.parse_expr()
+            if result_2 is None:
+                raise ParseError("expected expr", self._peek())
+            result_3 = self.parse_block()
+            if result_3 is None:
+                raise ParseError("expected block", self._peek())
+            result_4 = self.parse_else_clause()
+            if result_4 is None:
+                raise ParseError("expected else_clause", self._peek())
+            return {"_rule": "if_expr", "0": result_1, "1": result_2, "2": result_3, "3": result_4}
+        except ParseError:
+            self.pos = start_pos
+
+        return None
+
+    def parse_block_expr(self) -> Optional[Any]:
+        """Parse rule: block_expr"""
+        start_pos = self.pos
+
+        # Alternative 1
+        try:
+            result_1 = self._expect(TokenType.LBRACE)
+            result_2 = self.parse_stmts()
+            result_3 = self.parse_expr()
+            result_4 = self._expect(TokenType.RBRACE)
+            return {"_rule": "block_expr", "0": result_1, "1": result_2, "2": result_3, "3": result_4}
+        except ParseError:
+            self.pos = start_pos
+
+        return None
+

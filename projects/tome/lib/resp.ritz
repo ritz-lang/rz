@@ -1,0 +1,663 @@
+# lib/resp.ritz - Redis Serialization Protocol (RESP) implementation
+#
+# RESP is the wire protocol used by Redis. This module implements:
+#   - RESP2 parser for incoming commands
+#   - RESP2 encoder for responses
+#
+# RESP Data Types:
+#   +<string>\r\n           - Simple String
+#   -<error>\r\n            - Error
+#   :<integer>\r\n          - Integer
+#   $<len>\r\n<data>\r\n    - Bulk String ($-1\r\n for null)
+#   *<count>\r\n...         - Array (*-1\r\n for null, elements follow)
+#
+# Commands arrive as arrays of bulk strings:
+#   *3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n  -> ["SET", "foo", "bar"]
+
+import ritzlib.memory
+import ritzlib.str
+import ritzlib.string
+import ritzlib.strview
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+const RESP_SIMPLE_STRING: i32 = 43     # '+'
+const RESP_ERROR: i32 = 45             # '-'
+const RESP_INTEGER: i32 = 58           # ':'
+const RESP_BULK_STRING: i32 = 36       # '$'
+const RESP_ARRAY: i32 = 42             # '*'
+
+# Parse result codes
+const RESP_OK: i32 = 0                 # Complete message parsed
+const RESP_INCOMPLETE: i32 = -1        # Need more data
+const RESP_ERROR_PARSE: i32 = -2       # Invalid protocol
+
+# Maximum argument count and size for safety
+const RESP_MAX_ARGS: i32 = 128
+const RESP_MAX_BULK_LEN: i64 = 536870912  # 512MB
+
+
+# ============================================================================
+# Parsed Command
+# ============================================================================
+# A command is an array of bulk strings (arguments).
+# We store pointers into the original buffer to avoid copying.
+
+struct RespArg
+    data: *u8           # Pointer to start of argument data
+    len: i64            # Length of argument
+
+struct RespCommand
+    args: [128]RespArg  # Fixed-size array of arguments
+    argc: i32           # Number of arguments
+
+
+# ============================================================================
+# RESP Parser
+# ============================================================================
+# Parser state for incremental parsing across recv() calls.
+
+struct RespParser
+    buf: *u8            # Buffer being parsed
+    len: i64            # Total length of buffer
+    pos: i64            # Current parse position
+    command: RespCommand # Parsed command output
+
+
+# Initialize parser with a buffer
+pub fn resp_parser_init(p: *RespParser, buf: *u8, len: i64)
+    p.buf = buf
+    p.len = len
+    p.pos = 0
+    p.command.argc = 0
+
+
+# Reset parser for next command (same buffer)
+pub fn resp_parser_reset(p: *RespParser)
+    p.pos = 0
+    p.command.argc = 0
+
+
+# Check if there's at least n bytes available
+fn resp_available(p: *RespParser, n: i64) -> i32
+    if p.pos + n <= p.len
+        return 1
+    return 0
+
+
+# Read a byte without advancing
+fn resp_peek(p: *RespParser) -> i32
+    if p.pos >= p.len
+        return -1
+    let ptr: *u8 = p.buf + p.pos
+    return *ptr as i32
+
+
+# Read a byte and advance
+fn resp_read_byte(p: *RespParser) -> i32
+    if p.pos >= p.len
+        return -1
+    let ptr: *u8 = p.buf + p.pos
+    p.pos += 1
+    return *ptr as i32
+
+
+# Skip past \r\n, returns 0 on success, -1 if not found
+fn resp_read_crlf(p: *RespParser) -> i32
+    if resp_available(p, 2) == 0
+        return -1
+    let ptr: *u8 = p.buf + p.pos
+    let c1: u8 = *ptr
+    let c2: u8 = *(ptr + 1)
+    if c1 == 13 && c2 == 10  # \r\n
+        p.pos += 2
+        return 0
+    return -1
+
+
+# Read an integer from text up to \r\n
+# Returns the integer value, advances past \r\n
+# Sets *ok to 1 on success, 0 on failure
+fn resp_read_int(p: *RespParser, ok: *i32) -> i64
+    *ok = 0
+    var val: i64 = 0
+    var negative: i32 = 0
+
+    # Check for negative sign
+    let first: i32 = resp_peek(p)
+    if first == 45  # '-'
+        negative = 1
+        p.pos += 1
+
+    # Read digits until \r
+    var digits: i32 = 0
+    loop
+        if p.pos >= p.len
+            return 0  # Incomplete
+        let ptr: *u8 = p.buf + p.pos
+        let c: u8 = *ptr
+        if c == 13  # \r
+            break
+        if c < 48 || c > 57  # Not a digit
+            return 0  # Parse error
+        val = val * 10 + (c - 48) as i64
+        p.pos += 1
+        digits += 1
+
+    if digits == 0
+        return 0  # No digits found
+
+    # Expect \r\n
+    if resp_read_crlf(p) < 0
+        return 0
+
+    *ok = 1
+    if negative != 0
+        return -val
+    return val
+
+
+# Parse a bulk string: $<len>\r\n<data>\r\n
+# Returns RESP_OK, RESP_INCOMPLETE, or RESP_ERROR_PARSE
+fn resp_parse_bulk(p: *RespParser, arg: *RespArg) -> i32
+    let start_pos: i64 = p.pos
+
+    # Skip the $ prefix
+    let prefix: i32 = resp_read_byte(p)
+    if prefix == -1
+        # End of buffer - incomplete
+        return RESP_INCOMPLETE
+    if prefix != RESP_BULK_STRING
+        p.pos = start_pos
+        return RESP_ERROR_PARSE
+
+    # Read length
+    var ok: i32 = 0
+    let len: i64 = resp_read_int(p, @ok)
+    if ok == 0
+        p.pos = start_pos
+        return RESP_INCOMPLETE
+
+    # Null bulk string
+    if len == -1
+        arg.data = null
+        arg.len = 0
+        return RESP_OK
+
+    # Validate length
+    if len < 0 || len > RESP_MAX_BULK_LEN
+        return RESP_ERROR_PARSE
+
+    # Check if we have enough data
+    if resp_available(p, len + 2) == 0
+        p.pos = start_pos
+        return RESP_INCOMPLETE
+
+    # Store pointer to data
+    arg.data = p.buf + p.pos
+    arg.len = len
+    p.pos += len
+
+    # Expect trailing \r\n
+    if resp_read_crlf(p) < 0
+        p.pos = start_pos
+        return RESP_ERROR_PARSE
+
+    return RESP_OK
+
+
+# Parse an array: *<count>\r\n followed by bulk strings
+# Returns RESP_OK, RESP_INCOMPLETE, or RESP_ERROR_PARSE
+pub fn resp_parse(p: *RespParser) -> i32
+    let start_pos: i64 = p.pos
+    p.command.argc = 0
+
+    # Check for empty buffer
+    if p.len == 0
+        return RESP_INCOMPLETE
+
+    # Expect array prefix
+    let prefix: i32 = resp_read_byte(p)
+    if prefix != RESP_ARRAY
+        # Could be inline command (space-separated)
+        p.pos = start_pos
+        return resp_parse_inline(p)
+
+    # Read element count
+    var ok: i32 = 0
+    let count: i64 = resp_read_int(p, @ok)
+    if ok == 0
+        p.pos = start_pos
+        return RESP_INCOMPLETE
+
+    # Null array
+    if count == -1
+        return RESP_OK
+
+    # Validate count
+    if count < 0 || count > RESP_MAX_ARGS as i64
+        return RESP_ERROR_PARSE
+
+    # Parse each bulk string element
+    for i in 0..count as i32
+        let arg: *RespArg = @p.command.args[i]
+        let result: i32 = resp_parse_bulk(p, arg)
+        if result != RESP_OK
+            p.pos = start_pos
+            return result
+        p.command.argc = i + 1
+
+    return RESP_OK
+
+
+# Parse inline command (space-separated, no RESP framing)
+# Example: "GET foo\r\n" -> ["GET", "foo"]
+fn resp_parse_inline(p: *RespParser) -> i32
+    let start_pos: i64 = p.pos
+    p.command.argc = 0
+
+    # Find the \r\n at end of line
+    var end: i64 = p.pos
+    while end < p.len
+        let ptr: *u8 = p.buf + end
+        if *ptr == 13  # \r
+            break
+        end += 1
+
+    # Check if we found \r\n
+    if end >= p.len
+        return RESP_INCOMPLETE
+    if end + 1 >= p.len
+        return RESP_INCOMPLETE
+    let next_ptr: *u8 = p.buf + end + 1
+    if *next_ptr != 10  # \n
+        return RESP_ERROR_PARSE
+
+    # Parse space-separated tokens
+    var token_start: i64 = p.pos
+    var in_token: i32 = 0
+    var i: i64 = p.pos
+
+    while i < end
+        let ptr: *u8 = p.buf + i
+        let c: u8 = *ptr
+
+        if c == 32 || c == 9  # space or tab
+            if in_token != 0
+                # End of token
+                if p.command.argc < RESP_MAX_ARGS
+                    let arg: *RespArg = @p.command.args[p.command.argc]
+                    arg.data = p.buf + token_start
+                    arg.len = i - token_start
+                    p.command.argc += 1
+                in_token = 0
+        else
+            if in_token == 0
+                # Start of token
+                token_start = i
+                in_token = 1
+        i += 1
+
+    # Handle last token
+    if in_token != 0
+        if p.command.argc < RESP_MAX_ARGS
+            let arg: *RespArg = @p.command.args[p.command.argc]
+            arg.data = p.buf + token_start
+            arg.len = end - token_start
+            p.command.argc += 1
+
+    # Skip past \r\n
+    p.pos = end + 2
+
+    return RESP_OK
+
+
+# ============================================================================
+# RESP Encoder
+# ============================================================================
+# Functions to write RESP-encoded responses into a buffer.
+
+# Write a simple string: +<string>\r\n
+# Returns bytes written
+pub fn resp_write_simple(buf: *u8, s: *u8) -> i32
+    var pos: i32 = 0
+    let ptr0: *u8 = buf + pos
+    *ptr0 = 43  # '+'
+    pos += 1
+
+    let len: i64 = strlen(s)
+    memcpy(buf + pos, s, len)
+    pos += len as i32
+
+    let ptr1: *u8 = buf + pos
+    *ptr1 = 13  # '\r'
+    pos += 1
+    let ptr2: *u8 = buf + pos
+    *ptr2 = 10  # '\n'
+    pos += 1
+
+    return pos
+
+
+# Write a simple string from StrView: +<string>\r\n
+# Returns bytes written
+pub fn resp_write_simple_sv(buf: *u8, s: *StrView) -> i32
+    var pos: i32 = 0
+    let ptr0: *u8 = buf + pos
+    *ptr0 = 43  # '+'
+    pos += 1
+
+    memcpy(buf + pos, s.ptr, s.len)
+    pos += s.len as i32
+
+    let ptr1: *u8 = buf + pos
+    *ptr1 = 13  # '\r'
+    pos += 1
+    let ptr2: *u8 = buf + pos
+    *ptr2 = 10  # '\n'
+    pos += 1
+
+    return pos
+
+
+# Write an error: -<error>\r\n
+pub fn resp_write_error(buf: *u8, s: *u8) -> i32
+    var pos: i32 = 0
+    let ptr0: *u8 = buf + pos
+    *ptr0 = 45  # '-'
+    pos += 1
+
+    let len: i64 = strlen(s)
+    memcpy(buf + pos, s, len)
+    pos += len as i32
+
+    let ptr1: *u8 = buf + pos
+    *ptr1 = 13  # '\r'
+    pos += 1
+    let ptr2: *u8 = buf + pos
+    *ptr2 = 10  # '\n'
+    pos += 1
+
+    return pos
+
+
+# Write an error from StrView: -<error>\r\n
+pub fn resp_write_error_sv(buf: *u8, s: *StrView) -> i32
+    var pos: i32 = 0
+    let ptr0: *u8 = buf + pos
+    *ptr0 = 45  # '-'
+    pos += 1
+
+    memcpy(buf + pos, s.ptr, s.len)
+    pos += s.len as i32
+
+    let ptr1: *u8 = buf + pos
+    *ptr1 = 13  # '\r'
+    pos += 1
+    let ptr2: *u8 = buf + pos
+    *ptr2 = 10  # '\n'
+    pos += 1
+
+    return pos
+
+
+# Write an integer: :<integer>\r\n
+pub fn resp_write_int(buf: *u8, n: i64) -> i32
+    var pos: i32 = 0
+    let ptr0: *u8 = buf + pos
+    *ptr0 = 58  # ':'
+    pos += 1
+
+    # Handle negative
+    var val: i64 = n
+    if n < 0
+        let ptr: *u8 = buf + pos
+        *ptr = 45  # '-'
+        pos += 1
+        val = -n
+
+    # Convert to digits (write in reverse, then flip)
+    var digits: [20]u8
+    var digit_count: i32 = 0
+
+    if val == 0
+        digits[0] = 48  # '0'
+        digit_count = 1
+    else
+        while val > 0
+            digits[digit_count] = (48 + (val % 10)) as u8
+            digit_count += 1
+            val = val / 10
+
+    # Write digits in correct order
+    for i in 0..digit_count
+        let d: u8 = digits[digit_count - 1 - i]
+        let ptr: *u8 = buf + pos
+        *ptr = d
+        pos += 1
+
+    let ptr1: *u8 = buf + pos
+    *ptr1 = 13  # '\r'
+    pos += 1
+    let ptr2: *u8 = buf + pos
+    *ptr2 = 10  # '\n'
+    pos += 1
+
+    return pos
+
+
+# Write a bulk string: $<len>\r\n<data>\r\n
+pub fn resp_write_bulk(buf: *u8, data: *u8, len: i64) -> i32
+    var pos: i32 = 0
+    let ptr0: *u8 = buf + pos
+    *ptr0 = 36  # '$'
+    pos += 1
+
+    # Write length
+    pos += resp_write_int_digits(buf + pos, len)
+
+    let ptr1: *u8 = buf + pos
+    *ptr1 = 13  # '\r'
+    pos += 1
+    let ptr2: *u8 = buf + pos
+    *ptr2 = 10  # '\n'
+    pos += 1
+
+    # Write data
+    memcpy(buf + pos, data, len)
+    pos += len as i32
+
+    let ptr3: *u8 = buf + pos
+    *ptr3 = 13  # '\r'
+    pos += 1
+    let ptr4: *u8 = buf + pos
+    *ptr4 = 10  # '\n'
+    pos += 1
+
+    return pos
+
+
+# Write null bulk string: $-1\r\n
+pub fn resp_write_null(buf: *u8) -> i32
+    let ptr0: *u8 = buf
+    *ptr0 = 36  # '$'
+    let ptr1: *u8 = buf + 1
+    *ptr1 = 45  # '-'
+    let ptr2: *u8 = buf + 2
+    *ptr2 = 49  # '1'
+    let ptr3: *u8 = buf + 3
+    *ptr3 = 13  # '\r'
+    let ptr4: *u8 = buf + 4
+    *ptr4 = 10  # '\n'
+    return 5
+
+
+# Write array header: *<count>\r\n
+pub fn resp_write_array(buf: *u8, count: i64) -> i32
+    var pos: i32 = 0
+    let ptr0: *u8 = buf + pos
+    *ptr0 = 42  # '*'
+    pos += 1
+
+    pos += resp_write_int_digits(buf + pos, count)
+
+    let ptr1: *u8 = buf + pos
+    *ptr1 = 13  # '\r'
+    pos += 1
+    let ptr2: *u8 = buf + pos
+    *ptr2 = 10  # '\n'
+    pos += 1
+
+    return pos
+
+
+# Write null array: *-1\r\n
+pub fn resp_write_null_array(buf: *u8) -> i32
+    let ptr0: *u8 = buf
+    *ptr0 = 42  # '*'
+    let ptr1: *u8 = buf + 1
+    *ptr1 = 45  # '-'
+    let ptr2: *u8 = buf + 2
+    *ptr2 = 49  # '1'
+    let ptr3: *u8 = buf + 3
+    *ptr3 = 13  # '\r'
+    let ptr4: *u8 = buf + 4
+    *ptr4 = 10  # '\n'
+    return 5
+
+
+# Helper: write integer digits without the : prefix
+fn resp_write_int_digits(buf: *u8, n: i64) -> i32
+    var pos: i32 = 0
+    var val: i64 = n
+
+    if n < 0
+        let ptr: *u8 = buf + pos
+        *ptr = 45  # '-'
+        pos += 1
+        val = -n
+
+    var digits: [20]u8
+    var digit_count: i32 = 0
+
+    if val == 0
+        digits[0] = 48  # '0'
+        digit_count = 1
+    else
+        while val > 0
+            digits[digit_count] = (48 + (val % 10)) as u8
+            digit_count += 1
+            val = val / 10
+
+    for i in 0..digit_count
+        let d: u8 = digits[digit_count - 1 - i]
+        let ptr: *u8 = buf + pos
+        *ptr = d
+        pos += 1
+
+    return pos
+
+
+# ============================================================================
+# Argument helpers
+# ============================================================================
+
+# Compare an argument to a string (case-insensitive)
+pub fn resp_arg_eq_ci(arg: *RespArg, s: *u8) -> i32
+    let slen: i64 = strlen(s)
+    if arg.len != slen
+        return 0
+
+    for i in 0..slen
+        let a_ptr: *u8 = arg.data + i
+        let s_ptr: *u8 = s + i
+        var a: u8 = *a_ptr
+        var b: u8 = *s_ptr
+        # Convert to uppercase
+        if a >= 97 && a <= 122
+            a = a - 32
+        if b >= 97 && b <= 122
+            b = b - 32
+        if a != b
+            return 0
+    return 1
+
+
+# Compare an argument to a StrView (case-insensitive)
+pub fn resp_arg_eq_ci_sv(arg: *RespArg, s: *StrView) -> i32
+    if arg.len != s.len
+        return 0
+
+    for i in 0..s.len
+        let a_ptr: *u8 = arg.data + i
+        let s_ptr: *u8 = s.ptr + i
+        var a: u8 = *a_ptr
+        var b: u8 = *s_ptr
+        # Convert to uppercase
+        if a >= 97 && a <= 122
+            a = a - 32
+        if b >= 97 && b <= 122
+            b = b - 32
+        if a != b
+            return 0
+    return 1
+
+
+# Compare an argument to a string (exact match)
+pub fn resp_arg_eq(arg: *RespArg, s: *u8) -> i32
+    let slen: i64 = strlen(s)
+    if arg.len != slen
+        return 0
+
+    for i in 0..slen
+        let a_ptr: *u8 = arg.data + i
+        let s_ptr: *u8 = s + i
+        if *a_ptr != *s_ptr
+            return 0
+    return 1
+
+
+# Get argument as null-terminated string (copies to buffer)
+pub fn resp_arg_copy(arg: *RespArg, buf: *u8, buflen: i64) -> i32
+    var len: i64 = arg.len
+    if len >= buflen
+        len = buflen - 1
+    memcpy(buf, arg.data, len)
+    let term: *u8 = buf + len
+    *term = 0
+    return len as i32
+
+
+# Parse argument as integer (returns 0 on parse error, ok=1 on success)
+pub fn resp_arg_to_int(arg: *RespArg, ok: *i32) -> i64
+    *ok = 0
+    if arg.len == 0
+        return 0
+
+    var val: i64 = 0
+    var negative: i32 = 0
+    var start: i64 = 0
+
+    let first_ptr: *u8 = arg.data
+    if *first_ptr == 45  # '-'
+        negative = 1
+        start = 1
+
+    if start >= arg.len
+        return 0  # Just a minus sign
+
+    for i in start..arg.len
+        let ptr: *u8 = arg.data + i
+        let c: u8 = *ptr
+        if c < 48 || c > 57
+            return 0  # Not a digit
+        val = val * 10 + (c - 48) as i64
+
+    *ok = 1
+    if negative != 0
+        return -val
+    return val
+
+

@@ -1,0 +1,1232 @@
+# ritz1/src/parser.ritz - Ritz Parser
+#
+# Recursive descent parser with Pratt parsing for expressions.
+# Uses the NFA-based lexer to tokenize source code.
+#
+# AST Node Design:
+# - All nodes are structs with a 'kind' field indicating node type
+# - Nodes are allocated and linked via pointers
+# - Memory is managed by caller (typically stack allocation)
+
+# ============================================================================
+# AST Node Kind Constants
+# ============================================================================
+
+# Expression kinds
+const EXPR_INT_LIT: i32 = 1
+const EXPR_IDENT: i32 = 2
+const EXPR_STRING_LIT: i32 = 3
+const EXPR_BOOL_LIT: i32 = 4
+const EXPR_BIN_OP: i32 = 5
+const EXPR_UNARY_OP: i32 = 6
+const EXPR_CALL: i32 = 7
+const EXPR_INDEX: i32 = 8
+const EXPR_FIELD: i32 = 9
+const EXPR_PAREN: i32 = 10
+const EXPR_CAST: i32 = 11
+const EXPR_STRUCT_LIT: i32 = 12
+const EXPR_FIELD_INIT: i32 = 13  # Field initializer in struct literal
+const EXPR_ARRAY_REPEAT: i32 = 14  # Array repeat literal [value; count]
+
+# Statement kinds
+const STMT_EXPR: i32 = 20
+const STMT_VAR: i32 = 21
+const STMT_LET: i32 = 22
+const STMT_IF: i32 = 23
+const STMT_WHILE: i32 = 24
+const STMT_FOR: i32 = 25
+const STMT_RETURN: i32 = 26
+const STMT_BLOCK: i32 = 27
+const STMT_BREAK: i32 = 28
+const STMT_CONTINUE: i32 = 29
+const STMT_ASSIGN: i32 = 30
+
+# Definition kinds
+const DEF_FN: i32 = 40
+const DEF_STRUCT: i32 = 41
+
+# Type kinds
+const TYPE_NAMED: i32 = 50     # i32, bool, MyStruct
+const TYPE_PTR: i32 = 51       # *T
+const TYPE_REF: i32 = 52       # &T
+const TYPE_REF_MUT: i32 = 53   # &mut T
+const TYPE_ARRAY: i32 = 54     # [N]T
+const TYPE_SLICE: i32 = 55     # [T]
+
+# ============================================================================
+# AST Structures
+# ============================================================================
+
+# Base expression (generic container)
+# Use void pointers to avoid self-reference issues
+# NOTE: Using i64 for all fields to ensure 8-byte alignment for ritz1 self-hosting
+#
+# Field semantics by kind:
+# +-----------------+------------------------+------------------------+---------------+---------------+
+# | kind            | val1                   | val2                   | left          | right         |
+# +-----------------+------------------------+------------------------+---------------+---------------+
+# | INT_LIT         | integer value          | -                      | -             | -             |
+# | IDENT           | source position        | name length            | -             | -             |
+# | STRING_LIT      | source position        | string length          | -             | -             |
+# | BOOL_LIT        | 1=true, 0=false        | -                      | -             | -             |
+# | BIN_OP          | -                      | operator TOK_* type    | left operand  | right operand |
+# | UNARY_OP        | operator TOK_* type    | -                      | operand       | -             |
+# | CALL            | -                      | -                      | callee expr   | args (linked) |
+# | INDEX           | -                      | -                      | array expr    | index expr    |
+# | FIELD           | field name position    | field name length      | struct expr   | -             |
+# | PAREN           | -                      | -                      | inner expr    | -             |
+# | CAST            | -                      | -                      | expr to cast  | target type   |
+# | STRUCT_LIT      | type name position     | type name length       | field inits   | -             |
+# | FIELD_INIT      | field name position    | field name length      | value expr    | -             |
+# | ARRAY_REPEAT    | -                      | -                      | value expr    | count expr    |
+# +-----------------+------------------------+------------------------+---------------+---------------+
+#
+struct Expr
+  kind: i64
+  val1: i64        # See table above
+  val2: i64        # See table above
+  left: *i32       # Pointer to Expr (cast as needed)
+  right: *i32      # Pointer to Expr (cast as needed)
+  next: *i32       # Pointer to next Expr in list
+
+# Type expression
+# NOTE: Using i64 for all non-pointer fields to ensure 8-byte alignment for ritz1 self-hosting
+struct TypeExpr
+  kind: i64        # TYPE_NAMED, TYPE_PTR, etc.
+  name: *i8        # For TYPE_NAMED: type name (i32, MyStruct)
+  name_len: i64    # Length of type name
+  inner: *i32      # For TYPE_PTR/REF: pointer to inner TypeExpr
+  size: i64        # For TYPE_ARRAY: array size
+  is_mut: i64      # For TYPE_PTR/REF: 1 if mutable
+
+# Statement (generic container)
+# NOTE: Using i64 for all non-pointer fields to ensure 8-byte alignment for ritz1 self-hosting
+struct Stmt
+  kind: i64
+  # Data varies by kind
+  name: *i8        # For VAR, LET, FN: variable/function name
+  name_len: i64
+  type_expr: *i32  # Pointer to TypeExpr (for typed declarations)
+  expr: *i32       # Pointer to Expr
+  stmt: *i32       # Pointer to Stmt for blocks/bodies
+  next: *i32       # Pointer to next Stmt in list
+
+# Function parameter
+# NOTE: Using i64 for all non-pointer fields to ensure 8-byte alignment for ritz1 self-hosting
+struct Param
+  name: *i8
+  name_len: i64
+  type_expr: *TypeExpr
+  next: *Param
+
+# Function definition
+# NOTE: Using i64 for all non-pointer fields to ensure 8-byte alignment for ritz1 self-hosting
+struct FnDef
+  name: *i8
+  name_len: i64
+  params: *Param       # Linked list of parameters
+  ret_type: *TypeExpr  # Return type (or 0 for void)
+  body: *Stmt
+  next: *FnDef         # Next function in module
+
+# Struct field definition
+# NOTE: Using i64 for all non-pointer fields to ensure 8-byte alignment for ritz1 self-hosting
+struct StructField
+  name: *i8
+  name_len: i64
+  type_expr: *TypeExpr
+  next: *StructField
+
+# Struct definition
+# NOTE: Using i64 for all non-pointer fields to ensure 8-byte alignment for ritz1 self-hosting
+struct StructDef
+  name: *i8
+  name_len: i64
+  fields: *StructField   # Linked list of fields
+  field_count: i64
+  next: *StructDef
+
+# Constant definition
+# NOTE: Using i64 for all non-pointer fields to ensure 8-byte alignment for ritz1 self-hosting
+struct ConstDef
+  name: *i8
+  name_len: i64
+  value: i64         # Integer value (for now, only support integer constants)
+  next: *ConstDef
+
+# Module (collection of definitions)
+# NOTE: Using i64 for all non-pointer fields to ensure 8-byte alignment for ritz1 self-hosting
+struct Module
+  items: *Stmt
+  fns: *FnDef        # Linked list of function definitions
+  fn_count: i64      # Number of functions
+  consts: *ConstDef  # Linked list of constant definitions
+  structs: *StructDef  # Linked list of struct definitions
+
+# Parser state
+struct Parser
+  lex: *Lexer
+  arena: *Arena
+  current: Token
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+# Parse an integer value from source text
+fn parser_parse_int(src: *i8, len: i32) -> i64
+  var result: i64 = 0
+  var i: i32 = 0
+  var negative: i32 = 0
+  if len > 0
+    if *(src + 0) == 45  # '-'
+      negative = 1
+      i = 1
+  while i < len
+    let c: i8 = *(src + i)
+    if c >= 48 && c <= 57
+      result = result * 10 + (c - 48) as i64
+    i = i + 1
+  if negative == 1
+    return 0 - result
+  result
+
+# ============================================================================
+# Parser Initialization
+# ============================================================================
+
+fn parser_init(lex: *Lexer, arena: *Arena) -> Parser
+  let tok: Token = lexer_next(lex)
+  Parser { lex: lex, arena: arena, current: tok }
+
+fn parser_current(p: *Parser) -> Token
+  (*p).current
+
+fn parser_advance(p: *Parser) -> Token
+  let old: Token = (*p).current
+  (*p).current = lexer_next((*p).lex)
+  old
+
+fn parser_expect(p: *Parser, tok_type: i32) -> i32
+  if (*p).current.type != tok_type
+    return -1  # Error
+  parser_advance(p)
+  0
+
+fn parser_at(p: *Parser, tok_type: i32) -> i32
+  if (*p).current.type == tok_type
+    return 1
+  0
+
+# Parse integer value from source text at given position and length
+fn parse_int_value(p: *Parser, start: i32, len: i32) -> i32
+  let lex: *Lexer = (*p).lex
+  let src: *i8 = (*lex).src
+  var result: i32 = 0
+  var i: i32 = 0
+  while i < len
+    let ch: i8 = *(src + start + i)
+    if ch >= 48  # '0'
+      if ch <= 57  # '9'
+        result = result * 10 + (ch - 48) as i32
+    i = i + 1
+  result
+
+# ============================================================================
+# Type Parsing
+# ============================================================================
+
+# Parse a type expression: i32, *T, &T, &mut T, [N]T
+fn parse_type(p: *Parser) -> *TypeExpr
+  let tok: Token = parser_current(p)
+  let ty: *TypeExpr = arena_alloc((*p).arena, 80) as *TypeExpr
+
+  # Pointer type: *T or *mut T
+  if tok.type == TOK_STAR
+    parser_advance(p)
+    (*ty).kind = TYPE_PTR
+    (*ty).is_mut = 0
+    # Check for *mut
+    if parser_at(p, TOK_MUT) == 1
+      parser_advance(p)
+      (*ty).is_mut = 1
+    let inner: *TypeExpr = parse_type(p)
+    (*ty).inner = inner as *i32
+    return ty
+
+  # Reference type: &T or &mut T
+  if tok.type == TOK_AMP
+    parser_advance(p)
+    # Check for &mut
+    if parser_at(p, TOK_MUT) == 1
+      parser_advance(p)
+      (*ty).kind = TYPE_REF_MUT
+    else
+      (*ty).kind = TYPE_REF
+    (*ty).is_mut = 0
+    let inner: *TypeExpr = parse_type(p)
+    (*ty).inner = inner as *i32
+    return ty
+
+  # Array type: [N]T or slice [T]
+  if tok.type == TOK_LBRACKET
+    parser_advance(p)
+    let size_tok: Token = parser_current(p)
+    if size_tok.type == TOK_INT
+      # Fixed-size array [N]T
+      parser_advance(p)
+      if parser_at(p, TOK_RBRACKET) == 0
+        return 0
+      parser_advance(p)
+      (*ty).kind = TYPE_ARRAY
+      (*ty).size = size_tok.start  # TODO: parse actual int value
+      let inner: *TypeExpr = parse_type(p)
+      (*ty).inner = inner as *i32
+      return ty
+    else
+      # Slice type [T] - no size
+      (*ty).kind = TYPE_SLICE
+      (*ty).size = 0
+      let inner: *TypeExpr = parse_type(p)
+      (*ty).inner = inner as *i32
+      if parser_at(p, TOK_RBRACKET) == 0
+        return 0
+      parser_advance(p)
+      return ty
+
+  # Named type: identifier (i32, bool, MyStruct)
+  if tok.type == TOK_IDENT
+    parser_advance(p)
+    (*ty).kind = TYPE_NAMED
+    (*ty).name = 0  # TODO: store name pointer
+    (*ty).name_len = tok.len
+    (*ty).inner = 0
+    (*ty).size = 0
+    (*ty).is_mut = 0
+    return ty
+
+  # Invalid type
+  0
+
+# ============================================================================
+# Parameter Parsing
+# ============================================================================
+
+# Parse a single function parameter: name: Type
+fn parse_param(p: *Parser) -> *Param
+  # Expect identifier (parameter name)
+  let name_tok: Token = parser_current(p)
+  if name_tok.type != TOK_IDENT
+    return 0
+  parser_advance(p)
+
+  # Expect colon
+  if parser_at(p, TOK_COLON) == 0
+    return 0
+  parser_advance(p)
+
+  # Parse type
+  let type_expr: *TypeExpr = parse_type(p)
+  if type_expr == 0
+    return 0
+
+  let param: *Param = arena_alloc((*p).arena, 40) as *Param
+  # Get pointer to name in source buffer
+  (*param).name = (*(*p).lex).src + name_tok.start
+  (*param).name_len = name_tok.len
+  (*param).type_expr = type_expr
+  (*param).next = 0 as *Param
+  param
+
+# ============================================================================
+# Operator Precedence
+# ============================================================================
+
+# Returns precedence for infix operators (0 if not an infix operator)
+fn get_infix_precedence(tok_type: i32) -> i32
+  if tok_type == TOK_PIPEPIPE
+    return 1
+  if tok_type == TOK_AMPAMP
+    return 2
+  if tok_type == TOK_EQEQ
+    return 3
+  if tok_type == TOK_NEQ
+    return 3
+  if tok_type == TOK_LT
+    return 4
+  if tok_type == TOK_GT
+    return 4
+  if tok_type == TOK_LEQ
+    return 4
+  if tok_type == TOK_GEQ
+    return 4
+  if tok_type == TOK_PIPE
+    return 5
+  if tok_type == TOK_CARET
+    return 6
+  if tok_type == TOK_AMP
+    return 7
+  if tok_type == TOK_PLUS
+    return 8
+  if tok_type == TOK_MINUS
+    return 8
+  if tok_type == TOK_STAR
+    return 9
+  if tok_type == TOK_SLASH
+    return 9
+  if tok_type == TOK_PERCENT
+    return 9
+  if tok_type == TOK_DOTDOT
+    return 10
+  if tok_type == TOK_AS
+    return 12
+  # Postfix operators (function call, index, field access) have highest precedence
+  if tok_type == TOK_LPAREN
+    return 15
+  if tok_type == TOK_LBRACKET
+    return 15
+  if tok_type == TOK_DOT
+    return 15
+  0
+
+# Prefix operators have precedence higher than all binary operators
+fn get_prefix_precedence() -> i32
+  11
+
+# ============================================================================
+# Primary Expression Parsing
+# ============================================================================
+
+# Parse primary (lowest level) expression: literals, identifiers, parens
+fn parse_primary(p: *Parser) -> *Expr
+  let tok: Token = parser_current(p)
+  let expr: *Expr = arena_alloc((*p).arena, 80) as *Expr
+
+  if tok.type == TOK_INT
+    # Integer literal - parse the actual value
+    (*expr).kind = EXPR_INT_LIT
+    (*expr).val1 = parse_int_value(p, tok.start, tok.len)
+    parser_advance(p)
+    return expr
+
+  if tok.type == TOK_IDENT
+    # Identifier - could be a variable or struct literal
+    let name_tok: Token = tok
+    parser_advance(p)
+
+    # Check for struct literal: Name { field: value, ... }
+    if parser_at(p, TOK_LBRACE) == 1
+      parser_advance(p)  # consume {
+
+      # Parse field initializers
+      var first_field: *Expr = 0 as *Expr
+      var last_field: *Expr = 0 as *Expr
+
+      while parser_at(p, TOK_RBRACE) == 0
+        # Skip any NEWLINE tokens inside struct literal
+        while parser_at(p, TOK_NEWLINE) == 1
+          parser_advance(p)
+        # Check for end of struct literal after skipping newlines
+        if parser_at(p, TOK_RBRACE) == 1
+          break
+        # Parse field name
+        let field_tok: Token = parser_current(p)
+        if field_tok.type != TOK_IDENT
+          return 0
+        parser_advance(p)
+
+        # Expect colon
+        if parser_at(p, TOK_COLON) == 0
+          return 0
+        parser_advance(p)
+
+        # Parse field value
+        let value: *Expr = parse_expr(p, 0)
+        if value == 0
+          return 0
+
+        # Create field initializer node
+        let field: *Expr = arena_alloc((*p).arena, 80) as *Expr
+        (*field).kind = EXPR_FIELD_INIT
+        (*field).val1 = field_tok.start  # field name position
+        (*field).val2 = field_tok.len    # field name length
+        (*field).right = value as *i32
+        (*field).next = 0
+
+        # Link into list
+        if first_field == 0 as *Expr
+          first_field = field
+        else
+          (*last_field).next = field as *i32
+        last_field = field
+
+        # Check for comma
+        if parser_at(p, TOK_COMMA) == 1
+          parser_advance(p)
+
+      parser_advance(p)  # consume }
+
+      (*expr).kind = EXPR_STRUCT_LIT
+      (*expr).val1 = name_tok.start  # struct name position
+      (*expr).val2 = name_tok.len    # struct name length
+      (*expr).left = first_field as *i32  # field list
+      return expr
+
+    # Plain identifier
+    (*expr).kind = EXPR_IDENT
+    (*expr).val1 = name_tok.start  # Position of identifier in source
+    (*expr).val2 = name_tok.len    # Length of identifier
+    return expr
+
+  if tok.type == TOK_STRING
+    # String literal
+    (*expr).kind = EXPR_STRING_LIT
+    (*expr).val1 = tok.start
+    (*expr).val2 = tok.len
+    parser_advance(p)
+    return expr
+
+  if tok.type == TOK_TRUE
+    # Boolean true
+    (*expr).kind = EXPR_BOOL_LIT
+    (*expr).val1 = 1
+    parser_advance(p)
+    return expr
+
+  if tok.type == TOK_FALSE
+    # Boolean false
+    (*expr).kind = EXPR_BOOL_LIT
+    (*expr).val1 = 0
+    parser_advance(p)
+    return expr
+
+  if tok.type == TOK_LPAREN
+    # Parenthesized expression
+    parser_advance(p)
+    let inner: *Expr = parse_expr(p, 0)
+    if parser_at(p, TOK_RPAREN) == 0
+      # Error: expected )
+      return 0
+    parser_advance(p)
+    return inner
+
+  if tok.type == TOK_MINUS
+    # Unary minus
+    let op_tok: Token = tok
+    parser_advance(p)
+    let operand: *Expr = parse_expr(p, get_prefix_precedence())
+    (*expr).kind = EXPR_UNARY_OP
+    (*expr).val2 = op_tok.type
+    (*expr).left = operand
+    return expr
+
+  if tok.type == TOK_BANG
+    # Logical not
+    let op_tok: Token = tok
+    parser_advance(p)
+    let operand: *Expr = parse_expr(p, get_prefix_precedence())
+    (*expr).kind = EXPR_UNARY_OP
+    (*expr).val2 = op_tok.type
+    (*expr).left = operand
+    return expr
+
+  if tok.type == TOK_STAR
+    # Dereference
+    let op_tok: Token = tok
+    parser_advance(p)
+    let operand: *Expr = parse_expr(p, get_prefix_precedence())
+    (*expr).kind = EXPR_UNARY_OP
+    (*expr).val2 = op_tok.type
+    (*expr).left = operand
+    return expr
+
+  if tok.type == TOK_AMP
+    # Address-of
+    let op_tok: Token = tok
+    parser_advance(p)
+    let operand: *Expr = parse_expr(p, get_prefix_precedence())
+    (*expr).kind = EXPR_UNARY_OP
+    (*expr).val2 = op_tok.type
+    (*expr).left = operand
+    return expr
+
+  if tok.type == TOK_LBRACKET
+    # Array repeat literal: [value; count]
+    parser_advance(p)  # consume [
+    let value: *Expr = parse_expr(p, 0)
+    if value == 0
+      return 0
+    if parser_at(p, TOK_SEMI) == 0
+      return 0
+    parser_advance(p)  # consume ;
+    let count_tok: Token = parser_current(p)
+    if count_tok.type != TOK_INT
+      return 0
+    let count: i32 = parse_int_value(p, count_tok.start, count_tok.len)
+    parser_advance(p)  # consume count
+    if parser_at(p, TOK_RBRACKET) == 0
+      return 0
+    parser_advance(p)  # consume ]
+    (*expr).kind = EXPR_ARRAY_REPEAT
+    (*expr).val1 = count
+    (*expr).left = value
+    return expr
+
+  # No valid primary expression
+  0
+
+# ============================================================================
+# Expression Parsing (Pratt Algorithm)
+# ============================================================================
+
+fn parse_expr(p: *Parser, min_prec: i32) -> *Expr
+  var left: *Expr = parse_primary(p)
+  if left == 0
+    return 0
+
+  # Now handle infix operators
+  while true
+    let tok: Token = parser_current(p)
+    let prec: i32 = get_infix_precedence(tok.type)
+
+    if prec == 0
+      break
+    if prec < min_prec
+      break
+
+    # Check for postfix operators (function calls, indexing, field access)
+    if tok.type == TOK_LPAREN
+      # Function call
+      parser_advance(p)
+      let expr: *Expr = arena_alloc((*p).arena, 80) as *Expr
+      (*expr).kind = EXPR_CALL
+      (*expr).left = left
+      (*expr).right = 0 as *i32  # Args list starts as null
+
+      # Parse argument list
+      var first_arg: *Expr = 0 as *Expr
+      var last_arg: *Expr = 0 as *Expr
+      while parser_at(p, TOK_RPAREN) == 0
+        let arg: *Expr = parse_expr(p, 0)
+        if arg == 0 as *Expr
+          return 0 as *Expr
+        (*arg).next = 0 as *i32
+        if first_arg == 0 as *Expr
+          first_arg = arg
+        else
+          (*last_arg).next = arg as *i32
+        last_arg = arg
+        # Check for comma or end
+        if parser_at(p, TOK_COMMA) == 1
+          parser_advance(p)
+        else if parser_at(p, TOK_RPAREN) == 0
+          return 0 as *Expr  # Error: expected , or )
+      (*expr).right = first_arg as *i32
+      parser_advance(p)  # consume )
+      left = expr
+      continue
+
+    if tok.type == TOK_LBRACKET
+      # Array indexing
+      parser_advance(p)
+      let index_expr: *Expr = parse_expr(p, 0)
+      let expr: *Expr = arena_alloc((*p).arena, 80) as *Expr
+      (*expr).kind = EXPR_INDEX
+      (*expr).left = left
+      (*expr).right = index_expr
+      if parser_at(p, TOK_RBRACKET) == 0
+        return 0
+      parser_advance(p)
+      left = expr
+      continue
+
+    if tok.type == TOK_DOT
+      # Field access
+      parser_advance(p)
+      let field_tok: Token = parser_current(p)
+      if field_tok.type != TOK_IDENT
+        return 0
+      parser_advance(p)
+      let expr: *Expr = arena_alloc((*p).arena, 80) as *Expr
+      (*expr).kind = EXPR_FIELD
+      (*expr).left = left
+      (*expr).val1 = field_tok.start  # Position of field name
+      (*expr).val2 = field_tok.len    # Length of field name
+      left = expr
+      continue
+
+    if tok.type == TOK_AS
+      # Cast expression: expr as Type
+      parser_advance(p)
+      let target_type: *TypeExpr = parse_type(p)
+      if target_type == 0
+        return 0
+
+      let expr: *Expr = arena_alloc((*p).arena, 80) as *Expr
+      (*expr).kind = EXPR_CAST
+      (*expr).left = left                   # source expression
+      (*expr).right = target_type as *i32   # target type
+      left = expr
+      continue
+
+    # Binary operator
+    let op_tok: Token = tok
+    parser_advance(p)
+    let right: *Expr = parse_expr(p, prec + 1)
+    if right == 0
+      return 0
+
+    let expr: *Expr = arena_alloc((*p).arena, 80) as *Expr
+    (*expr).kind = EXPR_BIN_OP
+    (*expr).val2 = op_tok.type  # Store operator type
+    (*expr).left = left
+    (*expr).right = right
+    left = expr
+
+  left
+
+# ============================================================================
+# Statement Parsing
+# ============================================================================
+
+# Parse a list of statements until we hit DEDENT or EOF
+# Returns linked list via stmt.next pointers
+# Note: Uses forward reference to parse_stmt (defined below) - ritz0 handles this
+fn parse_stmt_list(p: *Parser) -> *Stmt
+  var first: *Stmt = 0 as *Stmt
+  var last: *Stmt = 0 as *Stmt
+
+  while parser_at(p, TOK_DEDENT) == 0
+    if parser_at(p, TOK_EOF) == 1
+      return first  # EOF before dedent
+
+    # Skip any NEWLINE tokens between statements
+    if parser_at(p, TOK_NEWLINE) == 1
+      parser_advance(p)
+      continue
+
+    let stmt: *Stmt = parse_stmt(p)
+    if stmt == 0
+      return first  # Parse error - return what we have
+
+    # Link into list
+    if first == 0 as *Stmt
+      first = stmt
+    else
+      (*last).next = stmt as *i32
+    last = stmt
+
+  first
+
+fn parse_stmt(p: *Parser) -> *Stmt
+  let tok: Token = parser_current(p)
+
+  if tok.type == TOK_VAR
+    # Variable declaration
+    parser_advance(p)
+    let name_tok: Token = parser_current(p)
+    if name_tok.type != TOK_IDENT
+      return 0
+    parser_advance(p)
+
+    let stmt: *Stmt = arena_alloc((*p).arena, 80) as *Stmt
+    (*stmt).kind = STMT_VAR
+    (*stmt).name = (*(*p).lex).src + name_tok.start
+    (*stmt).name_len = name_tok.len
+    (*stmt).type_expr = 0
+    (*stmt).next = 0 as *i32
+
+    # Optional type annotation
+    if parser_at(p, TOK_COLON) == 1
+      parser_advance(p)
+      let ty: *TypeExpr = parse_type(p)
+      (*stmt).type_expr = ty as *i32
+
+    # Optional initialization
+    if parser_at(p, TOK_EQ) == 1
+      parser_advance(p)
+      let expr: *Expr = parse_expr(p, 0)
+      (*stmt).expr = expr as *i32
+
+    return stmt
+
+  if tok.type == TOK_LET
+    # Let binding
+    parser_advance(p)
+    let name_tok: Token = parser_current(p)
+    if name_tok.type != TOK_IDENT
+      return 0
+    parser_advance(p)
+
+    let stmt: *Stmt = arena_alloc((*p).arena, 80) as *Stmt
+    (*stmt).kind = STMT_LET
+    (*stmt).name = (*(*p).lex).src + name_tok.start
+    (*stmt).name_len = name_tok.len
+    (*stmt).next = 0 as *i32
+    (*stmt).type_expr = 0
+
+    # Optional type annotation
+    if parser_at(p, TOK_COLON) == 1
+      parser_advance(p)
+      let ty: *TypeExpr = parse_type(p)
+      (*stmt).type_expr = ty as *i32
+
+    # Required initialization
+    if parser_at(p, TOK_EQ) == 0
+      return 0
+    parser_advance(p)
+
+    let expr: *Expr = parse_expr(p, 0)
+    (*stmt).expr = expr as *i32
+    return stmt
+
+  if tok.type == TOK_RETURN
+    # Return statement
+    parser_advance(p)
+    let stmt: *Stmt = arena_alloc((*p).arena, 80) as *Stmt
+    (*stmt).kind = STMT_RETURN
+    (*stmt).next = 0 as *i32
+
+    # Check for optional return value
+    let next_tok: Token = parser_current(p)
+    if next_tok.type != TOK_NEWLINE
+      if next_tok.type != TOK_EOF
+        if next_tok.type != TOK_RBRACE
+          let expr: *Expr = parse_expr(p, 0)
+          (*stmt).expr = expr
+
+    return stmt
+
+  if tok.type == TOK_IF
+    # If statement
+    parser_advance(p)
+
+    # Parse condition
+    let cond: *Expr = parse_expr(p, 0)
+    if cond == 0
+      return 0
+
+    # Skip newlines before body
+    while parser_at(p, TOK_NEWLINE) == 1
+      parser_advance(p)
+
+    # Parse then block (indent-delimited)
+    if parser_at(p, TOK_INDENT) == 0
+      return 0
+    parser_advance(p)
+
+    # Parse then body statements
+    let then_body: *Stmt = parse_stmt_list(p)
+
+    # Consume dedent
+    if parser_at(p, TOK_DEDENT) == 1
+      parser_advance(p)
+
+    # Check for else clause
+    var else_body: *Stmt = 0 as *Stmt
+    if parser_at(p, TOK_ELSE) == 1
+      parser_advance(p)
+
+      # Skip newlines before else body
+      while parser_at(p, TOK_NEWLINE) == 1
+        parser_advance(p)
+
+      # Check for else if
+      if parser_at(p, TOK_IF) == 1
+        else_body = parse_stmt(p)  # Recursive: else if ...
+      else
+        # Plain else block (indent-delimited)
+        if parser_at(p, TOK_INDENT) == 0
+          return 0
+        parser_advance(p)
+        # Parse else body statements
+        else_body = parse_stmt_list(p)
+        # Consume dedent
+        if parser_at(p, TOK_DEDENT) == 1
+          parser_advance(p)
+
+    let stmt: *Stmt = arena_alloc((*p).arena, 80) as *Stmt
+    (*stmt).kind = STMT_IF
+    (*stmt).expr = cond as *i32      # condition
+    (*stmt).stmt = then_body as *i32 # then block
+    (*stmt).type_expr = else_body as *i32 # else block (using type_expr which is unused for if)
+    (*stmt).next = 0 as *i32
+    return stmt
+
+  if tok.type == TOK_WHILE
+    # While statement
+    parser_advance(p)
+
+    # Parse condition
+    let cond: *Expr = parse_expr(p, 0)
+    if cond == 0
+      return 0
+
+    # Skip newlines before body
+    while parser_at(p, TOK_NEWLINE) == 1
+      parser_advance(p)
+
+    # Parse body (indent-delimited)
+    if parser_at(p, TOK_INDENT) == 0
+      return 0
+    parser_advance(p)
+
+    # Parse body statements
+    let body: *Stmt = parse_stmt_list(p)
+
+    # Consume dedent
+    if parser_at(p, TOK_DEDENT) == 1
+      parser_advance(p)
+
+    let stmt: *Stmt = arena_alloc((*p).arena, 80) as *Stmt
+    (*stmt).kind = STMT_WHILE
+    (*stmt).expr = cond as *i32
+    (*stmt).stmt = body as *i32
+    (*stmt).next = 0 as *i32
+    return stmt
+
+  if tok.type == TOK_FOR
+    # For statement: for x in expr { ... }
+    parser_advance(p)
+
+    # Parse loop variable name
+    let var_tok: Token = parser_current(p)
+    if var_tok.type != TOK_IDENT
+      return 0
+    parser_advance(p)
+
+    # Expect 'in' keyword
+    if parser_at(p, TOK_IN) == 0
+      return 0
+    parser_advance(p)
+
+    # Parse iterable expression
+    let iter_expr: *Expr = parse_expr(p, 0)
+    if iter_expr == 0
+      return 0
+
+    # Parse body (brace-delimited for now)
+    if parser_at(p, TOK_LBRACE) == 0
+      return 0
+    parser_advance(p)
+
+    # Parse body statements
+    let body: *Stmt = parse_stmt_list(p)
+
+    if parser_at(p, TOK_RBRACE) == 0
+      return 0
+    parser_advance(p)
+
+    let stmt: *Stmt = arena_alloc((*p).arena, 80) as *Stmt
+    (*stmt).kind = STMT_FOR
+    (*stmt).name = 0 as *i8
+    (*stmt).name_len = var_tok.len
+    (*stmt).expr = iter_expr as *i32
+    (*stmt).stmt = body as *i32
+    (*stmt).next = 0 as *i32
+    return stmt
+
+  if tok.type == TOK_BREAK
+    parser_advance(p)
+    let stmt: *Stmt = arena_alloc((*p).arena, 80) as *Stmt
+    (*stmt).kind = STMT_BREAK
+    (*stmt).next = 0 as *i32
+    return stmt
+
+  if tok.type == TOK_CONTINUE
+    parser_advance(p)
+    let stmt: *Stmt = arena_alloc((*p).arena, 80) as *Stmt
+    (*stmt).kind = STMT_CONTINUE
+    (*stmt).next = 0 as *i32
+    return stmt
+
+  if tok.type == TOK_LBRACE
+    # Block statement
+    parser_advance(p)
+    let stmt: *Stmt = arena_alloc((*p).arena, 80) as *Stmt
+    (*stmt).kind = STMT_BLOCK
+    (*stmt).next = 0 as *i32
+    (*stmt).stmt = parse_stmt_list(p) as *i32
+
+    if parser_at(p, TOK_RBRACE) == 0
+      return 0
+    parser_advance(p)
+    return stmt
+
+  # Otherwise, try to parse as expression statement or assignment
+  let expr: *Expr = parse_expr(p, 0)
+  if expr == 0
+    return 0
+
+  # Check for assignment: expr = value
+  if parser_at(p, TOK_EQ) == 1
+    parser_advance(p)  # consume =
+    let value: *Expr = parse_expr(p, 0)
+    if value == 0
+      return 0
+    let stmt: *Stmt = arena_alloc((*p).arena, 80) as *Stmt
+    (*stmt).kind = STMT_ASSIGN
+    (*stmt).expr = expr as *i32  # target (LHS)
+    (*stmt).stmt = value as *i32 # value (RHS) - reusing stmt field
+    (*stmt).next = 0 as *i32
+    return stmt
+
+  let stmt: *Stmt = arena_alloc((*p).arena, 80) as *Stmt
+  (*stmt).kind = STMT_EXPR
+  (*stmt).expr = expr
+  (*stmt).next = 0 as *i32
+  stmt
+
+# ============================================================================
+# Function Definition Parsing
+# ============================================================================
+
+fn parse_fn_def(p: *Parser) -> *FnDef
+  if parser_at(p, TOK_FN) == 0
+    return 0
+  parser_advance(p)
+
+  let name_tok: Token = parser_current(p)
+  if name_tok.type != TOK_IDENT
+    return 0
+  parser_advance(p)
+
+  let fn_def: *FnDef = arena_alloc((*p).arena, 48) as *FnDef
+  # Extract function name from source text
+  let name_ptr: *i8 = arena_alloc((*p).arena, name_tok.len + 1) as *i8
+  let lex: *Lexer = (*p).lex
+  let src: *i8 = (*lex).src
+  var i: i32 = 0
+  while i < name_tok.len
+    *(name_ptr + i) = *(src + name_tok.start + i)
+    i = i + 1
+  *(name_ptr + name_tok.len) = 0  # Null-terminate
+  (*fn_def).name = name_ptr
+  (*fn_def).name_len = name_tok.len
+  (*fn_def).params = 0 as *Param
+  (*fn_def).ret_type = 0 as *TypeExpr
+  (*fn_def).body = 0 as *Stmt
+  (*fn_def).next = 0 as *FnDef
+
+  # Parse parameter list
+  if parser_at(p, TOK_LPAREN) == 0
+    return 0
+  parser_advance(p)
+
+  # Parse parameters (comma-separated list)
+  var first_param: *Param = 0 as *Param
+  var last_param: *Param = 0 as *Param
+
+  while parser_at(p, TOK_RPAREN) == 0
+    let param: *Param = parse_param(p)
+    if param == 0
+      return 0
+
+    # Link into list
+    if first_param == 0 as *Param
+      first_param = param
+    else
+      (*last_param).next = param
+    last_param = param
+
+    # Check for comma or end
+    if parser_at(p, TOK_COMMA) == 1
+      parser_advance(p)
+
+  parser_advance(p)  # consume RPAREN
+  (*fn_def).params = first_param
+
+  # Parse return type (optional: -> Type)
+  if parser_at(p, TOK_ARROW) == 1
+    parser_advance(p)
+    let ret_type: *TypeExpr = parse_type(p)
+    (*fn_def).ret_type = ret_type
+
+  # Skip newlines before body
+  while parser_at(p, TOK_NEWLINE) == 1
+    parser_advance(p)
+
+  # Parse body - expect INDENT for function body
+  if parser_at(p, TOK_INDENT) == 0
+    return 0
+  parser_advance(p)
+
+  # Parse body statements
+  (*fn_def).body = parse_stmt_list(p)
+
+  # Consume DEDENT
+  if parser_at(p, TOK_DEDENT) == 1
+    parser_advance(p)
+
+  fn_def
+
+# ============================================================================
+# Module Parsing
+# ============================================================================
+
+fn parse_module(p: *Parser) -> *Module
+  let module: *Module = arena_alloc((*p).arena, 48) as *Module
+  (*module).items = 0 as *Stmt
+  (*module).fns = 0 as *FnDef
+  (*module).fn_count = 0
+  (*module).consts = 0 as *ConstDef
+  (*module).structs = 0 as *StructDef
+
+  var first_fn: *FnDef = 0 as *FnDef
+  var last_fn: *FnDef = 0 as *FnDef
+  var first_const: *ConstDef = 0 as *ConstDef
+  var last_const: *ConstDef = 0 as *ConstDef
+  var first_struct: *StructDef = 0 as *StructDef
+  var last_struct: *StructDef = 0 as *StructDef
+
+  while parser_at(p, TOK_EOF) == 0
+    # Skip newlines between items
+    if parser_at(p, TOK_NEWLINE) == 1
+      parser_advance(p)
+      continue
+
+    if parser_at(p, TOK_FN) == 1
+      let fn_def: *FnDef = parse_fn_def(p)
+      if fn_def != 0 as *FnDef
+        # Link function into list
+        if first_fn == 0 as *FnDef
+          first_fn = fn_def
+        else
+          (*last_fn).next = fn_def
+        last_fn = fn_def
+        (*module).fn_count = (*module).fn_count + 1
+    else if parser_at(p, TOK_EXTERN) == 1
+      # Skip extern declarations for now (just advance past them)
+      parser_advance(p)  # extern
+      if parser_at(p, TOK_FN) == 1
+        parser_advance(p)  # fn
+        parser_advance(p)  # name
+        if parser_at(p, TOK_LPAREN) == 1
+          parser_advance(p)  # (
+          while parser_at(p, TOK_RPAREN) == 0
+            if parser_at(p, TOK_EOF) == 1
+              break
+            parser_advance(p)
+          if parser_at(p, TOK_RPAREN) == 1
+            parser_advance(p)  # )
+        if parser_at(p, TOK_ARROW) == 1
+          parser_advance(p)  # ->
+          parser_advance(p)  # type
+    else if parser_at(p, TOK_CONST) == 1
+      # Parse const declaration: const NAME: TYPE = VALUE
+      parser_advance(p)  # consume 'const'
+      let tok: Token = (*p).current
+      if tok.type == TOK_IDENT
+        let name: *i8 = (*(*p).lex).src + tok.start
+        let name_len: i32 = tok.len
+        parser_advance(p)  # consume name
+        # Skip optional type annotation
+        if parser_at(p, TOK_COLON) == 1
+          parser_advance(p)  # :
+          parser_advance(p)  # type
+        if parser_at(p, TOK_EQ) == 1
+          parser_advance(p)  # =
+          # Parse the value - for now only handle integer literals
+          let val_tok: Token = (*p).current
+          if val_tok.type == TOK_INT
+            # Parse integer value from source
+            let val: i64 = parser_parse_int((*(*p).lex).src + val_tok.start, val_tok.len)
+            parser_advance(p)  # consume int
+            # Create ConstDef
+            let cdef: *ConstDef = arena_alloc((*p).arena, 32) as *ConstDef
+            (*cdef).name = name
+            (*cdef).name_len = name_len
+            (*cdef).value = val
+            (*cdef).next = 0 as *ConstDef
+            # Link into list
+            if first_const == 0 as *ConstDef
+              first_const = cdef
+            else
+              (*last_const).next = cdef
+            last_const = cdef
+          else
+            # Skip non-integer constant value
+            while parser_at(p, TOK_NEWLINE) == 0
+              if parser_at(p, TOK_EOF) == 1
+                break
+              parser_advance(p)
+        else
+          # Skip rest of declaration
+          while parser_at(p, TOK_NEWLINE) == 0
+            if parser_at(p, TOK_EOF) == 1
+              break
+            parser_advance(p)
+      else
+        # Skip malformed const
+        while parser_at(p, TOK_NEWLINE) == 0
+          if parser_at(p, TOK_EOF) == 1
+            break
+          parser_advance(p)
+    else if parser_at(p, TOK_STRUCT) == 1
+      # Parse struct definition: struct Name NEWLINE INDENT fields... DEDENT
+      parser_advance(p)  # consume 'struct'
+      let name_tok: Token = parser_current(p)
+      if name_tok.type == TOK_IDENT
+        let struct_def: *StructDef = arena_alloc((*p).arena, 40) as *StructDef
+        (*struct_def).name = (*(*p).lex).src + name_tok.start
+        (*struct_def).name_len = name_tok.len
+        (*struct_def).fields = 0 as *StructField
+        (*struct_def).field_count = 0
+        (*struct_def).next = 0 as *StructDef
+        parser_advance(p)  # name
+        # Skip newlines before indent
+        while parser_at(p, TOK_NEWLINE) == 1
+          parser_advance(p)
+        if parser_at(p, TOK_INDENT) == 1
+          parser_advance(p)  # consume INDENT
+          var first_field: *StructField = 0 as *StructField
+          var last_field: *StructField = 0 as *StructField
+          var field_count: i32 = 0
+          # Parse fields until DEDENT
+          while parser_at(p, TOK_DEDENT) == 0
+            if parser_at(p, TOK_EOF) == 1
+              break
+            if parser_at(p, TOK_NEWLINE) == 1
+              parser_advance(p)
+              continue
+            # Parse field: name: Type
+            let field_tok: Token = parser_current(p)
+            if field_tok.type == TOK_IDENT
+              let field: *StructField = arena_alloc((*p).arena, 32) as *StructField
+              (*field).name = (*(*p).lex).src + field_tok.start
+              (*field).name_len = field_tok.len
+              (*field).type_expr = 0 as *TypeExpr
+              (*field).next = 0 as *StructField
+              parser_advance(p)  # name
+              if parser_at(p, TOK_COLON) == 1
+                parser_advance(p)  # :
+                (*field).type_expr = parse_type(p)
+              # Link field
+              if first_field == 0 as *StructField
+                first_field = field
+              else
+                (*last_field).next = field
+              last_field = field
+              field_count = field_count + 1
+            else
+              parser_advance(p)  # skip unknown token
+          if parser_at(p, TOK_DEDENT) == 1
+            parser_advance(p)
+          (*struct_def).fields = first_field
+          (*struct_def).field_count = field_count
+        # Link struct into list
+        if first_struct == 0 as *StructDef
+          first_struct = struct_def
+        else
+          (*last_struct).next = struct_def
+        last_struct = struct_def
+      else
+        parser_advance(p)  # skip if not an identifier
+    else
+      # Unknown token - skip
+      parser_advance(p)
+
+  (*module).fns = first_fn
+  (*module).consts = first_const
+  (*module).structs = first_struct
+  module

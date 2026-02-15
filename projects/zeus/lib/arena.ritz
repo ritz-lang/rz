@@ -1,0 +1,104 @@
+# lib/arena.ritz - Shared data arena for request/response payloads
+#
+# Bump allocator for storing HTTP bodies, headers, and paths.
+# Shared between Valet and Worker via mmap.
+#
+# Key properties:
+#   - Fast allocation (just bump offset)
+#   - No per-allocation overhead
+#   - Reset all allocations at once
+#   - 8-byte aligned for performance
+
+import ritzlib.sys
+
+# ============================================================================
+# Data Arena Structure
+# ============================================================================
+
+pub struct DataArena
+    base: *u8      # Base pointer of mmap'd region
+    size: i64      # Total size of arena
+    offset: i64    # Current allocation offset (next free byte)
+
+# ============================================================================
+# Public API
+# ============================================================================
+
+# Initialize a data arena with the given size
+# Uses mmap for allocation (MAP_PRIVATE for testing, MAP_SHARED for real use)
+# Returns 0 on success, -1 on failure
+pub fn data_arena_init(arena: *DataArena, size: i64) -> i32
+    let base: *u8 = sys_mmap(0, size, PROT_READ + PROT_WRITE, MAP_PRIVATE + MAP_ANONYMOUS, -1, 0)
+    if base == (-1) as *u8
+        arena.base = null
+        arena.size = 0
+        arena.offset = 0
+        return -1
+
+    arena.base = base
+    arena.size = size
+    arena.offset = 0
+    return 0
+
+# Destroy a data arena (munmap the memory)
+pub fn data_arena_destroy(arena: *DataArena)
+    if arena.base != null && arena.size > 0
+        sys_munmap(arena.base, arena.size)
+    arena.base = null
+    arena.size = 0
+    arena.offset = 0
+
+# Allocate bytes from the arena
+# Returns pointer to allocated memory, or null if exhausted
+pub fn data_arena_alloc(arena: *DataArena, size: i64) -> *u8
+    if size <= 0
+        return null
+
+    # Align to 8 bytes
+    let aligned_size: i64 = (size + 7) & (0 - 8)
+
+    # Check for space
+    if arena.offset + aligned_size > arena.size
+        return null
+
+    # Allocate
+    let ptr: *u8 = arena.base + arena.offset
+    arena.offset = arena.offset + aligned_size
+    return ptr
+
+# Reset the arena (free all allocations, keep the memory)
+pub fn data_arena_reset(arena: *DataArena)
+    arena.offset = 0
+
+# Get remaining capacity
+pub fn data_arena_remaining(arena: *DataArena) -> i64
+    return arena.size - arena.offset
+
+# Get current usage
+pub fn data_arena_used(arena: *DataArena) -> i64
+    return arena.offset
+
+# Convert a pointer to an offset (for storing in ring slots)
+pub fn data_arena_ptr_to_offset(arena: *DataArena, ptr: *u8) -> i64
+    return (ptr as i64) - (arena.base as i64)
+
+# Convert an offset to a pointer (for accessing data from ring slots)
+pub fn data_arena_offset_to_ptr(arena: *DataArena, offset: i64) -> *u8
+    return arena.base + offset
+
+# ============================================================================
+# Shared Memory Arena (for real IPC)
+# ============================================================================
+
+# Initialize arena from existing shared memory region
+# Used by worker to attach to Valet's shared memory
+pub fn data_arena_attach(arena: *DataArena, base: *u8, size: i64)
+    arena.base = base
+    arena.size = size
+    arena.offset = 0
+
+# Detach from arena (don't munmap - we don't own it)
+pub fn data_arena_detach(arena: *DataArena)
+    arena.base = null
+    arena.size = 0
+    arena.offset = 0

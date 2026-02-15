@@ -1,0 +1,221 @@
+# valet/lib/tls/record.ritz - TLS 1.3 record layer
+#
+# Implements the TLS record protocol for framing application data
+# and handshake messages over TCP.
+#
+# TLS 1.3 Record Format:
+#   ContentType (1 byte): 20=ChangeCipherSpec, 21=Alert, 22=Handshake, 23=ApplicationData
+#   LegacyVersion (2 bytes): 0x0303 (TLS 1.2 for compatibility)
+#   Length (2 bytes): Big-endian payload length (max 16384 + 256 for expansion)
+#   Fragment (variable): Encrypted or plaintext data
+#
+# For encrypted records (after handshake):
+#   - Payload is AEAD-encrypted
+#   - Actual content type is at end of decrypted plaintext
+#   - Outer content type is always ApplicationData (23)
+
+import ritzlib.io
+import ritzlib.str
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+# Content types
+const CT_CHANGE_CIPHER_SPEC: u8 = 20
+const CT_ALERT: u8 = 21
+const CT_HANDSHAKE: u8 = 22
+const CT_APPLICATION_DATA: u8 = 23
+
+# Legacy version (always 0x0303 in TLS 1.3)
+const TLS_LEGACY_VERSION: u16 = 0x0303
+
+# Maximum record sizes
+const TLS_MAX_PLAINTEXT: i32 = 16384        # 2^14
+const TLS_MAX_CIPHERTEXT: i32 = 16640       # 2^14 + 256 (AEAD expansion)
+const TLS_RECORD_HEADER_SIZE: i32 = 5       # type(1) + version(2) + length(2)
+
+# Alert levels
+const ALERT_WARNING: u8 = 1
+const ALERT_FATAL: u8 = 2
+
+# Alert descriptions
+const ALERT_CLOSE_NOTIFY: u8 = 0
+const ALERT_UNEXPECTED_MESSAGE: u8 = 10
+const ALERT_BAD_RECORD_MAC: u8 = 20
+const ALERT_RECORD_OVERFLOW: u8 = 22
+const ALERT_HANDSHAKE_FAILURE: u8 = 40
+const ALERT_BAD_CERTIFICATE: u8 = 42
+const ALERT_CERTIFICATE_EXPIRED: u8 = 45
+const ALERT_UNKNOWN_CA: u8 = 48
+const ALERT_DECODE_ERROR: u8 = 50
+const ALERT_DECRYPT_ERROR: u8 = 51
+const ALERT_PROTOCOL_VERSION: u8 = 70
+const ALERT_INTERNAL_ERROR: u8 = 80
+
+# ============================================================================
+# TLS Record structure
+# ============================================================================
+
+struct TlsRecord
+    content_type: u8            # Content type (plaintext or outer encrypted type)
+    inner_type: u8              # Inner content type (after decryption, 0 if plaintext)
+    length: i32                 # Payload length
+    data: [16640]u8             # Record data (max ciphertext size)
+
+
+# ============================================================================
+# Record reading/writing
+# ============================================================================
+
+# Parse a TLS record header from a buffer
+# Returns 0 on success, -1 on error, -2 if need more data
+# Sets record.length to the payload length (not including header)
+fn record_parse_header(buf: *u8, buf_len: i32, rec: *TlsRecord) -> i32
+    # Need at least 5 bytes for header
+    if buf_len < TLS_RECORD_HEADER_SIZE
+        return -2  # Need more data
+
+    # Content type
+    rec.content_type = *buf
+    rec.inner_type = 0
+
+    # Validate content type
+    if rec.content_type < 20 || rec.content_type > 23
+        return -1  # Invalid content type
+
+    # Legacy version (skip validation, just read)
+    # let version_hi: u8 = *(buf + 1)
+    # let version_lo: u8 = *(buf + 2)
+
+    # Length (big-endian)
+    let len_hi: u8 = *(buf + 3)
+    let len_lo: u8 = *(buf + 4)
+    rec.length = ((len_hi as i32) << 8) | (len_lo as i32)
+
+    # Validate length
+    if rec.length > TLS_MAX_CIPHERTEXT
+        return -1  # Record overflow
+
+    return 0
+
+
+# Read a complete TLS record from buffer
+# Returns total bytes consumed (header + payload), -1 on error, -2 if need more data
+fn record_read(buf: *u8, buf_len: i32, rec: *TlsRecord) -> i32
+    # Parse header first
+    let ret: i32 = record_parse_header(buf, buf_len, rec)
+    if ret != 0
+        return ret
+
+    # Check if we have the full payload
+    let total_len: i32 = TLS_RECORD_HEADER_SIZE + rec.length
+    if buf_len < total_len
+        return -2  # Need more data
+
+    # Copy payload
+    let src: *u8 = buf + TLS_RECORD_HEADER_SIZE
+    for i in 0..rec.length
+        rec.data[i] = *(src + i)
+
+    return total_len
+
+
+# Write a TLS record header to buffer
+# Returns bytes written (always 5), or -1 if buffer too small
+fn record_write_header(buf: *u8, buf_len: i32, content_type: u8, payload_len: i32) -> i32
+    if buf_len < TLS_RECORD_HEADER_SIZE
+        return -1
+
+    # Content type
+    *buf = content_type
+
+    # Legacy version (0x0303)
+    *(buf + 1) = 0x03
+    *(buf + 2) = 0x03
+
+    # Length (big-endian)
+    *(buf + 3) = ((payload_len >> 8) & 0xFF) as u8
+    *(buf + 4) = (payload_len & 0xFF) as u8
+
+    return TLS_RECORD_HEADER_SIZE
+
+
+# Write a complete TLS record to buffer
+# Returns total bytes written, or -1 if buffer too small
+fn record_write(buf: *u8, buf_len: i32, content_type: u8, data: *u8, data_len: i32) -> i32
+    let total_len: i32 = TLS_RECORD_HEADER_SIZE + data_len
+    if buf_len < total_len
+        return -1
+
+    if data_len > TLS_MAX_CIPHERTEXT
+        return -1  # Too large
+
+    # Write header
+    record_write_header(buf, buf_len, content_type, data_len)
+
+    # Copy payload
+    let dst: *u8 = buf + TLS_RECORD_HEADER_SIZE
+    for i in 0..data_len
+        *(dst + i) = *(data + i)
+
+    return total_len
+
+
+# ============================================================================
+# Alert handling
+# ============================================================================
+
+struct TlsAlert
+    level: u8
+    description: u8
+
+
+# Create an alert record
+fn record_write_alert(buf: *u8, buf_len: i32, level: u8, description: u8) -> i32
+    var alert_data: [2]u8
+    alert_data[0] = level
+    alert_data[1] = description
+    return record_write(buf, buf_len, CT_ALERT, @alert_data[0], 2)
+
+
+# Parse an alert from record data
+fn record_parse_alert(rec: *TlsRecord, alert: *TlsAlert) -> i32
+    if rec.content_type != CT_ALERT
+        return -1
+    if rec.length < 2
+        return -1
+
+    alert.level = rec.data[0]
+    alert.description = rec.data[1]
+    return 0
+
+
+# Get alert description string (for logging)
+fn alert_description_str(desc: u8) -> *u8
+    if desc == ALERT_CLOSE_NOTIFY
+        return c"close_notify"
+    if desc == ALERT_UNEXPECTED_MESSAGE
+        return c"unexpected_message"
+    if desc == ALERT_BAD_RECORD_MAC
+        return c"bad_record_mac"
+    if desc == ALERT_RECORD_OVERFLOW
+        return c"record_overflow"
+    if desc == ALERT_HANDSHAKE_FAILURE
+        return c"handshake_failure"
+    if desc == ALERT_BAD_CERTIFICATE
+        return c"bad_certificate"
+    if desc == ALERT_CERTIFICATE_EXPIRED
+        return c"certificate_expired"
+    if desc == ALERT_UNKNOWN_CA
+        return c"unknown_ca"
+    if desc == ALERT_DECODE_ERROR
+        return c"decode_error"
+    if desc == ALERT_DECRYPT_ERROR
+        return c"decrypt_error"
+    if desc == ALERT_PROTOCOL_VERSION
+        return c"protocol_version"
+    if desc == ALERT_INTERNAL_ERROR
+        return c"internal_error"
+    return c"unknown"
+

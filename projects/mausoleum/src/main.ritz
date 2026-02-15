@@ -1,0 +1,472 @@
+# src/main.ritz - Mausoleum Database Server Entry Point
+#
+# "Where data is entombed forever."
+#
+# Mausoleum is an embedded database engine for Ritz with:
+# - Document storage with flexible schemas
+# - Tree-native hierarchical relationships
+# - MVCC versioning (Git-like history)
+# - Graph-capable traversal
+# - Append-only storage with compaction
+# - Full SQL support (planned)
+#
+# Usage:
+#   mausoleum serve [--port PORT]     Start the encrypted database server
+#   mausoleum shell [--host HOST] [--port PORT]  Connect to server with interactive shell
+#   mausoleum version                 Print version information
+#   mausoleum help                    Print help
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+import ritzlib.memory
+import ritzlib.net
+
+import lib.m7m_types
+import lib.page
+import lib.buffer_pool
+import lib.collection
+import lib.server
+import lib.client
+import lib.protocol
+import lib.encrypted_channel
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+const VERSION: i32 = 1
+const DEFAULT_PORT: i32 = 7777
+const POOL_SIZE: i32 = 1024    # 1024 pages = 4MB buffer pool
+
+fn default_host() -> *u8
+    return c"127.0.0.1"
+
+# ============================================================================
+# Argument Parsing
+# ============================================================================
+
+struct Args
+    command: i32        # 0=help, 1=version, 2=serve, 3=shell
+    port: i32
+    host: *u8
+
+const CMD_HELP: i32 = 0
+const CMD_VERSION: i32 = 1
+const CMD_SERVE: i32 = 2
+const CMD_SHELL: i32 = 3
+
+fn parse_args(argc: i32, argv: **u8, args: *Args)
+    args.command = CMD_HELP
+    args.port = DEFAULT_PORT
+    args.host = default_host()
+
+    if argc < 2
+        return
+
+    var cmd: *u8 = *(argv + 1)
+
+    if streq(cmd, c"help") != 0 or streq(cmd, c"--help") != 0 or streq(cmd, c"-h") != 0
+        args.command = CMD_HELP
+        return
+
+    if streq(cmd, c"version") != 0 or streq(cmd, c"--version") != 0 or streq(cmd, c"-v") != 0
+        args.command = CMD_VERSION
+        return
+
+    if streq(cmd, c"serve") != 0
+        args.command = CMD_SERVE
+        # Parse --port
+        var i: i32 = 2
+        while i < argc
+            var arg: *u8 = *(argv + i)
+            if streq(arg, c"--port") != 0 or streq(arg, c"-p") != 0
+                if i + 1 < argc
+                    args.port = parse_int(*(argv + i + 1))
+                    i += 2
+                else
+                    i += 1
+            else
+                i += 1
+        return
+
+    if streq(cmd, c"shell") != 0
+        args.command = CMD_SHELL
+        # Parse --host and --port
+        var i: i32 = 2
+        while i < argc
+            var arg: *u8 = *(argv + i)
+            if streq(arg, c"--port") != 0 or streq(arg, c"-p") != 0
+                if i + 1 < argc
+                    args.port = parse_int(*(argv + i + 1))
+                    i += 2
+                else
+                    i += 1
+            else if streq(arg, c"--host") != 0 or streq(arg, c"-h") != 0
+                if i + 1 < argc
+                    args.host = *(argv + i + 1)
+                    i += 2
+                else
+                    i += 1
+            else
+                i += 1
+        return
+
+    # Unknown command - show help
+    args.command = CMD_HELP
+
+fn parse_int(s: *u8) -> i32
+    var n: i32 = 0
+    var i: i64 = 0
+    while *(s + i) != 0
+        var c: u8 = *(s + i)
+        if c >= 48 and c <= 57
+            n = n * 10 + (c - 48) as i32
+        i += 1
+    return n
+
+# ============================================================================
+# Print Helpers
+# ============================================================================
+
+fn print_banner()
+    prints("Mausoleum v0.1.0\n")
+    prints("Where data is entombed forever.\n")
+    prints("\n")
+
+fn print_help()
+    prints("Mausoleum - An encrypted document database\n")
+    prints("\n")
+    prints("Usage:\n")
+    prints("  mausoleum serve [--port PORT]           Start the encrypted server (default: 7777)\n")
+    prints("  mausoleum shell [--host H] [--port P]   Connect to server with interactive shell\n")
+    prints("  mausoleum version                       Print version information\n")
+    prints("  mausoleum help                          Print this help\n")
+    prints("\n")
+    prints("Security:\n")
+    prints("  All connections use X25519 key exchange and ChaCha20-Poly1305 encryption.\n")
+    prints("  Perfect forward secrecy via ephemeral keys per connection.\n")
+    prints("\n")
+    prints("Examples:\n")
+    prints("  mausoleum serve --port 8888             Start server on port 8888\n")
+    prints("  mausoleum shell --host 192.168.1.5      Connect to remote server\n")
+    prints("\n")
+
+fn print_version()
+    prints("Mausoleum v0.1.0\n")
+    prints("Ritz Database Engine\n")
+    prints("Protocol: M7SP v1 (encrypted)\n")
+    prints("Crypto: X25519 + ChaCha20-Poly1305\n")
+
+fn print_int(n: i32)
+    if n == 0
+        print_char(48)
+        return
+    var buf: [16]u8
+    var i: i32 = 0
+    var v: i32 = n
+    if v < 0
+        print_char(45)  # '-'
+        v = -v
+    while v > 0
+        buf[i] = (48 + (v % 10)) as u8
+        v = v / 10
+        i += 1
+    while i > 0
+        i -= 1
+        print_char(buf[i])
+
+# ============================================================================
+# Serve Command - Encrypted Database Server
+# ============================================================================
+
+fn cmd_serve(port: i32) -> i32
+    prints("Starting Mausoleum server...\n")
+    prints("  Port: ")
+    print_int(port)
+    prints("\n")
+    prints("  Encryption: X25519 + ChaCha20-Poly1305\n")
+    prints("\n")
+
+    # Create buffer pool (in-memory for now)
+    var pool: *BufferPool = buffer_pool_new(POOL_SIZE)
+    if pool == null
+        prints("Error: Failed to allocate buffer pool\n")
+        return 1
+
+    # Create collection
+    var collection: Collection
+    let col_result: i32 = collection_init(@collection, pool, 1)
+    if col_result < 0
+        prints("Error: Failed to create collection\n")
+        buffer_pool_destroy(pool)
+        return 1
+
+    # Create TCP socket
+    var sock: Socket = socket_tcp_nonblock()
+    if sock.fd < 0
+        prints("Error: Failed to create socket\n")
+        collection_destroy(@collection)
+        buffer_pool_destroy(pool)
+        return 1
+
+    socket_set_reuseaddr(@sock)
+
+    # Bind to port
+    let bind_result: i32 = socket_bind_any(@sock, port)
+    if bind_result < 0
+        prints("Error: Failed to bind to port ")
+        print_int(port)
+        prints("\n")
+        socket_close(@sock)
+        collection_destroy(@collection)
+        buffer_pool_destroy(pool)
+        return 1
+
+    # Start listening
+    let listen_result: i32 = socket_listen(@sock, 128)
+    if listen_result < 0
+        prints("Error: Failed to listen on socket\n")
+        socket_close(@sock)
+        collection_destroy(@collection)
+        buffer_pool_destroy(pool)
+        return 1
+
+    prints("Server listening on 0.0.0.0:")
+    print_int(port)
+    prints("\n")
+    prints("Press Ctrl+C to stop.\n")
+    prints("\n")
+
+    # Accept loop with encrypted channels
+    serve_loop(sock.fd, pool, @collection)
+
+    # Cleanup
+    socket_close(@sock)
+    collection_destroy(@collection)
+    buffer_pool_destroy(pool)
+
+    prints("Server stopped.\n")
+    return 0
+
+# Server main loop - handles encrypted connections
+fn serve_loop(listen_fd: i32, pool: *BufferPool, collection: *Collection)
+    loop
+        # Accept new connection
+        var client_sock: Socket
+        client_sock.fd = -1
+
+        # Use blocking accept for simplicity in this demo
+        # (Production would use epoll)
+        var client_fd: i32 = sys_accept(listen_fd, null, null) as i32
+        if client_fd < 0
+            continue
+
+        client_sock.fd = client_fd
+        client_sock.family = AF_INET
+        client_sock.socktype = SOCK_STREAM
+
+        prints("New connection, performing encrypted handshake...\n")
+
+        # Initialize encrypted channel
+        var channel: EncryptedChannel
+        if channel_init_server(@channel, client_sock) < 0
+            prints("  Error: Channel init failed\n")
+            sys_close(client_fd)
+            continue
+
+        # Perform handshake
+        if channel_handshake_server(@channel) < 0
+            prints("  Error: Handshake failed\n")
+            channel_free(@channel)
+            sys_close(client_fd)
+            continue
+
+        prints("  Encrypted session established.\n")
+
+        # Handle commands
+        handle_encrypted_session(@channel, pool, collection)
+
+        # Cleanup
+        channel_free(@channel)
+        sys_close(client_fd)
+        prints("Connection closed.\n")
+
+# Handle a single encrypted session
+fn handle_encrypted_session(ch: *EncryptedChannel, pool: *BufferPool, collection: *Collection)
+    var buf: [4096]u8
+
+    loop
+        # Receive encrypted message
+        let n: i32 = channel_recv(ch, @buf[0], 4096)
+        if n <= 0
+            break
+
+        # Parse and handle M7SP message
+        var reader: MessageReader
+        let result: i32 = msgreader_init(@reader, @buf[0], n)
+        if result != PROTO_OK
+            continue
+
+        let msg_type: i32 = msgreader_msg_type(@reader)
+        let request_id: i32 = msgreader_request_id(@reader)
+
+        # Handle message
+        var resp: MessageBuffer
+        msgbuf_init(@resp, @buf[0] + 2048, 2048)
+
+        if msg_type == MSG_PING
+            build_pong(@resp, request_id)
+        else if msg_type == MSG_DISCONNECT
+            build_disconnected(@resp, request_id)
+            let resp_len: i32 = msgbuf_len(@resp)
+            channel_send(ch, msgbuf_data(@resp), resp_len)
+            break
+        else
+            build_pong(@resp, request_id)  # Default response
+
+        # Send encrypted response
+        let resp_len: i32 = msgbuf_len(@resp)
+        if resp_len > 0
+            channel_send(ch, msgbuf_data(@resp), resp_len)
+
+# ============================================================================
+# Shell Command - Interactive Client
+# ============================================================================
+
+fn cmd_shell(host: *u8, port: i32) -> i32
+    prints("Mausoleum Shell\n")
+    prints("Connecting to ")
+    prints_cstr(host)
+    prints(":")
+    print_int(port)
+    prints(" (encrypted)...\n")
+
+    # Create socket
+    var sock: Socket = socket_tcp()
+    if sock.fd < 0
+        prints("Error: Failed to create socket\n")
+        return 1
+
+    # Connect to server
+    let result: i32 = socket_connect(@sock, host, port)
+    if result < 0
+        prints("Error: Failed to connect to server\n")
+        socket_close(@sock)
+        return 1
+
+    # Initialize encrypted channel (channel takes ownership of socket)
+    var channel: EncryptedChannel
+    let sock_fd: i32 = sock.fd
+    if channel_init_client(@channel, sock) < 0
+        prints("Error: Channel init failed\n")
+        sys_close(sock_fd)
+        return 1
+
+    # Perform handshake
+    prints("Performing encrypted handshake...\n")
+    if channel_handshake_client(@channel) < 0
+        prints("Error: Handshake failed\n")
+        channel_free(@channel)
+        return 1
+
+    prints("Encrypted session established.\n")
+    prints("\n")
+    prints("Commands: ping, quit\n")
+    prints("\n")
+
+    # Interactive loop
+    shell_loop(@channel)
+
+    # Cleanup (channel_free closes the socket)
+    channel_free(@channel)
+
+    prints("Disconnected.\n")
+    return 0
+
+fn shell_loop(ch: *EncryptedChannel)
+    var line_buf: [256]u8
+    var request_id: i32 = 1
+    var msg_buf: [512]u8
+
+    loop
+        # Print prompt
+        prints("m7m> ")
+
+        # Read line from stdin
+        let n: i64 = sys_read(STDIN, @line_buf[0], 255)
+        if n <= 0
+            break
+
+        # Null-terminate and strip newlines
+        var len: i32 = n as i32
+        line_buf[len] = 0
+
+        # Strip trailing newline/carriage return
+        while len > 0 and (line_buf[len - 1] == 10 or line_buf[len - 1] == 13)
+            len -= 1
+            line_buf[len] = 0
+
+        # Parse command
+        if streq(@line_buf[0], c"quit") != 0 or streq(@line_buf[0], c"exit") != 0
+            # Send disconnect
+            var resp: MessageBuffer
+            msgbuf_init(@resp, @msg_buf[0], 512)
+            build_disconnect(@resp, request_id)
+            channel_send(ch, msgbuf_data(@resp), msgbuf_len(@resp))
+            break
+
+        else if streq(@line_buf[0], c"ping") != 0
+            # Send ping
+            var req: MessageBuffer
+            msgbuf_init(@req, @msg_buf[0], 512)
+            build_ping(@req, request_id)
+            request_id += 1
+
+            if channel_send(ch, msgbuf_data(@req), msgbuf_len(@req)) < 0
+                prints("Error: Send failed\n")
+                break
+
+            # Receive response
+            var recv_buf: [512]u8
+            let recv_n: i32 = channel_recv(ch, @recv_buf[0], 512)
+            if recv_n < 0
+                prints("Error: Receive failed\n")
+                break
+
+            var reader: MessageReader
+            if msgreader_init(@reader, @recv_buf[0], recv_n) == PROTO_OK
+                let msg_type: i32 = msgreader_msg_type(@reader)
+                if msg_type == MSG_PONG
+                    prints("PONG received.\n")
+                else
+                    prints("Unexpected response.\n")
+            else
+                prints("Parse error.\n")
+
+        else if line_buf[0] != 0
+            prints("Unknown command. Try: ping, quit\n")
+
+# ============================================================================
+# Main Entry Point
+# ============================================================================
+
+pub fn main(argc: i32, argv: **u8) -> i32
+    var args: Args
+    parse_args(argc, argv, @args)
+
+    if args.command == CMD_HELP
+        print_help()
+        return 0
+
+    if args.command == CMD_VERSION
+        print_version()
+        return 0
+
+    if args.command == CMD_SERVE
+        return cmd_serve(args.port)
+
+    if args.command == CMD_SHELL
+        return cmd_shell(args.host, args.port)
+
+    return 0

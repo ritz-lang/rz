@@ -1,0 +1,153 @@
+# spire/model/uuid.ritz
+#
+# UUID type for model identifiers
+#
+# Implements UUIDv4 (random) per RFC 4122. UUIDs are 128-bit identifiers
+# commonly used as primary keys in databases.
+#
+# Format: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx (36 characters with hyphens)
+# Example: 550e8400-e29b-41d4-a716-446655440000
+
+import ritzlib.option
+import ritzlib.strview { StrView, strview_len }
+import ritzlib.string { String, string_new, string_with_cap, string_push }
+import ritzlib.sys { open, read, close }
+
+# UUID stored as 16 bytes (128 bits)
+pub struct Uuid
+    bytes: [16]u8
+
+# ============================================================================
+# Constructors
+# ============================================================================
+
+# Create a zero UUID (00000000-0000-0000-0000-000000000000)
+# Useful as a sentinel value or for initialization.
+pub fn uuid_zero() -> Uuid
+    var uuid: Uuid
+    var i: i64 = 0
+    while i < 16
+        uuid.bytes[i] = 0
+        i += 1
+    return uuid
+
+# Create a new random UUIDv4 using /dev/urandom.
+# Returns a zero UUID if random number generation fails.
+# Caller should use uuid_is_zero() to check for failure if needed.
+pub fn uuid_new_v4() -> Uuid
+    var uuid: Uuid = uuid_zero()  # Initialize to zero first
+
+    # Read random bytes from /dev/urandom
+    # SAFETY: c"/dev/urandom" is a valid path for the open syscall
+    let fd: i64 = open(c"/dev/urandom", 0, 0)
+    if fd >= 0
+        read(fd, @uuid.bytes[0], 16)
+        close(fd)
+        # Set version (4) and variant (RFC 4122)
+        uuid.bytes[6] = (uuid.bytes[6] & 0x0f) | 0x40  # Version 4
+        uuid.bytes[8] = (uuid.bytes[8] & 0x3f) | 0x80  # Variant 1
+
+    # If /dev/urandom failed, uuid remains zero (caller should check)
+    return uuid
+
+# ============================================================================
+# Parsing
+# ============================================================================
+
+# Parse UUID from string in standard format (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)
+# Returns None if the string is not a valid UUID format.
+pub fn uuid_from_str(s: *StrView) -> Option<Uuid>
+    if s.len != 36
+        return None
+
+    # Validate hyphens at positions 8, 13, 18, 23
+    if *(s.ptr + 8) != 45 or *(s.ptr + 13) != 45 or *(s.ptr + 18) != 45 or *(s.ptr + 23) != 45
+        return None
+
+    var uuid: Uuid
+    var byte_idx: i64 = 0
+    var char_idx: i64 = 0
+
+    while char_idx < 36
+        # Skip hyphens
+        if char_idx == 8 or char_idx == 13 or char_idx == 18 or char_idx == 23
+            char_idx += 1
+            continue
+
+        # Parse two hex chars into one byte
+        let high: i32 = hex_char_to_val(*(s.ptr + char_idx))
+        let low: i32 = hex_char_to_val(*(s.ptr + char_idx + 1))
+
+        if high < 0 or low < 0
+            return None
+
+        uuid.bytes[byte_idx] = ((high << 4) | low) as u8
+        byte_idx += 1
+        char_idx += 2
+
+    return Some(uuid)
+
+# ============================================================================
+# Conversion
+# ============================================================================
+
+# Convert UUID to lowercase hex string with hyphens.
+# Returns a 36-character String: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+pub fn uuid_to_string(uuid: *Uuid) -> String
+    var s: String = string_with_cap(36)
+
+    var i: i64 = 0
+    while i < 16
+        if i == 4 or i == 6 or i == 8 or i == 10
+            string_push(@s, 45)  # '-'
+
+        let b: u8 = uuid.bytes[i]
+        string_push(@s, val_to_hex_char((b >> 4) & 0x0f))
+        string_push(@s, val_to_hex_char(b & 0x0f))
+        i += 1
+
+    return s
+
+# ============================================================================
+# Comparison
+# ============================================================================
+
+# Check if two UUIDs are equal. Returns 1 if equal, 0 if not.
+pub fn uuid_eq(a: *Uuid, b: *Uuid) -> i32
+    var i: i64 = 0
+    while i < 16
+        if a.bytes[i] != b.bytes[i]
+            return 0
+        i += 1
+    return 1
+
+# Check if UUID is the zero UUID (00000000-0000-0000-0000-000000000000).
+# Useful for checking if uuid_new_v4() failed.
+# Returns 1 if zero, 0 if not.
+pub fn uuid_is_zero(uuid: *Uuid) -> i32
+    var i: i64 = 0
+    while i < 16
+        if uuid.bytes[i] != 0
+            return 0
+        i += 1
+    return 1
+
+# ============================================================================
+# Internal Helpers
+# ============================================================================
+
+# Helper: hex char to value
+fn hex_char_to_val(c: u8) -> i32
+    if c >= 48 and c <= 57  # '0'-'9'
+        return (c - 48) as i32
+    if c >= 97 and c <= 102  # 'a'-'f'
+        return (c - 97 + 10) as i32
+    if c >= 65 and c <= 70   # 'A'-'F'
+        return (c - 65 + 10) as i32
+    return -1
+
+# Helper: value to hex char
+fn val_to_hex_char(v: u8) -> u8
+    if v < 10
+        return 48 + v  # '0' + v
+    return 97 + (v - 10)  # 'a' + (v - 10)

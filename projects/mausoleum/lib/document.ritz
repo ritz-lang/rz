@@ -1,0 +1,396 @@
+# lib/document.ritz - Document layer for Mausoleum
+#
+# Provides flexible document storage with:
+# - Arbitrary key-value fields (schema-flexible)
+# - Multiple field types (null, int, bool, float, string, bytes, docref)
+# - Parent/child relationships for tree traversal
+# - Links/edges for graph relationships
+# - Version tracking for history
+
+import ritzlib.sys
+import ritzlib.str
+
+import lib.m7m_types
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+# Maximum fields per document
+const MAX_FIELDS: i64 = 64
+
+# Maximum key length
+const MAX_KEY_LEN: i64 = 63
+
+# Maximum links per document
+const MAX_LINKS: i64 = 32
+
+# Maximum link label length
+const MAX_LINK_LABEL_LEN: i64 = 31
+
+# Invalid document ID sentinel
+const INVALID_DOC_ID: i64 = -1
+
+# ============================================================================
+# Field Types
+# ============================================================================
+
+const FIELD_NULL: i32 = 0
+const FIELD_INT: i32 = 1
+const FIELD_BOOL: i32 = 2
+const FIELD_FLOAT: i32 = 3
+const FIELD_STRING: i32 = 4
+const FIELD_BYTES: i32 = 5
+const FIELD_DOCREF: i32 = 6
+
+# ============================================================================
+# DocumentId - Unique identifier for a document
+# ============================================================================
+
+# DocumentId: collection_id (high 32 bits) | sequence (low 32 bits)
+struct DocumentId
+    value: i64
+
+pub fn doc_id_new(collection_id: i32, sequence: i32) -> DocumentId
+    var id: DocumentId
+    id.value = ((collection_id as i64) << 32) | (sequence as i64 & 0xFFFFFFFF)
+    return id
+
+pub fn doc_id_collection(id: *DocumentId) -> i32
+    return (id.value >> 32) as i32
+
+pub fn doc_id_sequence(id: *DocumentId) -> i32
+    return (id.value & 0xFFFFFFFF) as i32
+
+pub fn doc_id_is_valid(id: *DocumentId) -> i32
+    if id.value == INVALID_DOC_ID
+        return 0
+    return 1
+
+pub fn doc_id_invalid() -> DocumentId
+    var id: DocumentId
+    id.value = INVALID_DOC_ID
+    return id
+
+pub fn doc_id_eq(a: *DocumentId, b: *DocumentId) -> i32
+    if a.value == b.value
+        return 1
+    return 0
+
+# ============================================================================
+# Field - A typed value in a document
+# ============================================================================
+
+# Field stores the type tag and a union-like value
+# For variable-length data (string, bytes), we store ptr + len
+# Note: Float support requires Ritz float literal support (not yet implemented)
+struct Field
+    ftype: i32
+    # Union storage (largest member wins)
+    int_val: i64      # For FIELD_INT, FIELD_BOOL, FIELD_FLOAT (as fixed-point)
+    ptr_val: *u8      # For FIELD_STRING, FIELD_BYTES
+    len_val: i64      # Length for STRING/BYTES
+    ref_val: i64      # For FIELD_DOCREF (DocumentId.value)
+
+pub fn field_null() -> Field
+    var f: Field
+    f.ftype = FIELD_NULL
+    f.int_val = 0
+    f.ptr_val = null
+    f.len_val = 0
+    f.ref_val = 0
+    return f
+
+pub fn field_int(value: i64) -> Field
+    var f: Field
+    f.ftype = FIELD_INT
+    f.int_val = value
+    f.ptr_val = null
+    f.len_val = 0
+    f.ref_val = 0
+    return f
+
+pub fn field_bool(value: i32) -> Field
+    var f: Field
+    f.ftype = FIELD_BOOL
+    if value != 0
+        f.int_val = 1
+    else
+        f.int_val = 0
+    f.ptr_val = null
+    f.len_val = 0
+    f.ref_val = 0
+    return f
+
+# Fixed-point float: value * 1000000 stored as i64
+# e.g., 3.14 stored as 3140000
+pub fn field_fixed(value: i64) -> Field
+    var f: Field
+    f.ftype = FIELD_FLOAT
+    f.int_val = value
+    f.ptr_val = null
+    f.len_val = 0
+    f.ref_val = 0
+    return f
+
+pub fn field_string(ptr: *u8, len: i64) -> Field
+    var f: Field
+    f.ftype = FIELD_STRING
+    f.int_val = 0
+    f.ptr_val = ptr
+    f.len_val = len
+    f.ref_val = 0
+    return f
+
+pub fn field_bytes(ptr: *u8, len: i64) -> Field
+    var f: Field
+    f.ftype = FIELD_BYTES
+    f.int_val = 0
+    f.ptr_val = ptr
+    f.len_val = len
+    f.ref_val = 0
+    return f
+
+pub fn field_docref(ref_id: *DocumentId) -> Field
+    var f: Field
+    f.ftype = FIELD_DOCREF
+    f.int_val = 0
+    f.ptr_val = null
+    f.len_val = 0
+    f.ref_val = ref_id.value
+    return f
+
+pub fn field_type(f: *Field) -> i32
+    return f.ftype
+
+pub fn field_is_null(f: *Field) -> i32
+    if f.ftype == FIELD_NULL
+        return 1
+    return 0
+
+pub fn field_as_int(f: *Field) -> i64
+    return f.int_val
+
+pub fn field_as_bool(f: *Field) -> i32
+    if f.int_val != 0
+        return 1
+    return 0
+
+# Returns fixed-point value (multiply by 1000000 to get original)
+pub fn field_as_fixed(f: *Field) -> i64
+    return f.int_val
+
+pub fn field_string_ptr(f: *Field) -> *u8
+    return f.ptr_val
+
+pub fn field_string_len(f: *Field) -> i64
+    return f.len_val
+
+pub fn field_bytes_ptr(f: *Field) -> *u8
+    return f.ptr_val
+
+pub fn field_bytes_len(f: *Field) -> i64
+    return f.len_val
+
+pub fn field_as_docref(f: *Field) -> DocumentId
+    var id: DocumentId
+    id.value = f.ref_val
+    return id
+
+# ============================================================================
+# FieldEntry - Named field in a document
+# ============================================================================
+
+struct FieldEntry
+    key: [64]u8    # Null-terminated key name (max 63 chars)
+    value: Field
+
+# ============================================================================
+# Link - Labeled edge to another document
+# ============================================================================
+
+struct Link
+    label: [32]u8       # Null-terminated label (max 31 chars)
+    target: DocumentId
+
+# ============================================================================
+# Document - The main document structure
+# ============================================================================
+
+struct Document
+    id: DocumentId
+    parent_id: DocumentId  # Parent document (invalid if no parent)
+    version: i64
+    created_at: Timestamp
+    updated_at: Timestamp
+    field_count: i32
+    fields: [64]FieldEntry  # MAX_FIELDS
+    link_count: i32
+    links: [32]Link         # MAX_LINKS
+
+pub fn doc_init(doc: *Document, id: *DocumentId)
+    doc.id = *id
+    doc.parent_id = doc_id_invalid()
+    doc.version = 1
+    doc.created_at = timestamp_now()
+    doc.updated_at = doc.created_at
+    doc.field_count = 0
+    doc.link_count = 0
+    # Zero out field and link arrays
+    memset(@doc.fields[0], 0, 64 * sizeof(FieldEntry))
+    memset(@doc.links[0], 0, 32 * sizeof(Link))
+
+# ============================================================================
+# Field Operations
+# ============================================================================
+
+# Find field index by key, returns -1 if not found
+fn doc_find_field_index(doc: *Document, key: *u8) -> i32
+    var i: i32 = 0
+    while i < doc.field_count
+        if strcmp(@doc.fields[i].key[0], key) == 0
+            return i
+        i = i + 1
+    return -1
+
+pub fn doc_set_field(doc: *Document, key: *u8, value: *Field) -> i32
+    # Check if field exists
+    var idx: i32 = doc_find_field_index(doc, key)
+    if idx >= 0
+        # Update existing field
+        doc.fields[idx].value = *value
+        doc.updated_at = timestamp_now()
+        return ERR_OK
+
+    # Add new field
+    if doc.field_count >= MAX_FIELDS as i32
+        return ERR_FULL
+
+    var key_len: i64 = strlen(key)
+    if key_len > MAX_KEY_LEN
+        return ERR_INVALID
+
+    # Copy key
+    strcpy(@doc.fields[doc.field_count].key[0], key)
+    doc.fields[doc.field_count].value = *value
+    doc.field_count = doc.field_count + 1
+    doc.updated_at = timestamp_now()
+    return ERR_OK
+
+pub fn doc_get_field(doc: *Document, key: *u8, out: *Field) -> i32
+    var idx: i32 = doc_find_field_index(doc, key)
+    if idx < 0
+        return ERR_NOT_FOUND
+    *out = doc.fields[idx].value
+    return ERR_OK
+
+pub fn doc_remove_field(doc: *Document, key: *u8) -> i32
+    var idx: i32 = doc_find_field_index(doc, key)
+    if idx < 0
+        return ERR_NOT_FOUND
+
+    # Shift remaining fields down
+    var i: i32 = idx
+    while i < doc.field_count - 1
+        doc.fields[i] = doc.fields[i + 1]
+        i = i + 1
+
+    doc.field_count = doc.field_count - 1
+    doc.updated_at = timestamp_now()
+    return ERR_OK
+
+pub fn doc_has_field(doc: *Document, key: *u8) -> i32
+    if doc_find_field_index(doc, key) >= 0
+        return 1
+    return 0
+
+# ============================================================================
+# Parent/Child Relationships
+# ============================================================================
+
+pub fn doc_has_parent(doc: *Document) -> i32
+    return doc_id_is_valid(@doc.parent_id)
+
+pub fn doc_set_parent(doc: *Document, parent: *DocumentId)
+    doc.parent_id = *parent
+    doc.updated_at = timestamp_now()
+
+pub fn doc_get_parent(doc: *Document) -> DocumentId
+    return doc.parent_id
+
+pub fn doc_clear_parent(doc: *Document)
+    doc.parent_id = doc_id_invalid()
+    doc.updated_at = timestamp_now()
+
+# ============================================================================
+# Version Operations
+# ============================================================================
+
+pub fn doc_increment_version(doc: *Document)
+    doc.version = doc.version + 1
+    doc.updated_at = timestamp_now()
+
+pub fn doc_touch(doc: *Document)
+    doc.updated_at = timestamp_now()
+
+# ============================================================================
+# Link/Edge Operations
+# ============================================================================
+
+# Find link index by label and target, returns -1 if not found
+fn doc_find_link_index(doc: *Document, label: *u8, target: *DocumentId) -> i32
+    var i: i32 = 0
+    while i < doc.link_count
+        if strcmp(@doc.links[i].label[0], label) == 0
+            if doc_id_eq(@doc.links[i].target, target) == 1
+                return i
+        i = i + 1
+    return -1
+
+pub fn doc_add_link(doc: *Document, label: *u8, target: *DocumentId) -> i32
+    # Check if link already exists
+    var idx: i32 = doc_find_link_index(doc, label, target)
+    if idx >= 0
+        return ERR_EXISTS
+
+    if doc.link_count >= MAX_LINKS as i32
+        return ERR_FULL
+
+    var label_len: i64 = strlen(label)
+    if label_len > MAX_LINK_LABEL_LEN
+        return ERR_INVALID
+
+    strcpy(@doc.links[doc.link_count].label[0], label)
+    doc.links[doc.link_count].target = *target
+    doc.link_count = doc.link_count + 1
+    doc.updated_at = timestamp_now()
+    return ERR_OK
+
+pub fn doc_has_link(doc: *Document, label: *u8, target: *DocumentId) -> i32
+    if doc_find_link_index(doc, label, target) >= 0
+        return 1
+    return 0
+
+pub fn doc_remove_link(doc: *Document, label: *u8, target: *DocumentId) -> i32
+    var idx: i32 = doc_find_link_index(doc, label, target)
+    if idx < 0
+        return ERR_NOT_FOUND
+
+    # Shift remaining links down
+    var i: i32 = idx
+    while i < doc.link_count - 1
+        doc.links[i] = doc.links[i + 1]
+        i = i + 1
+
+    doc.link_count = doc.link_count - 1
+    doc.updated_at = timestamp_now()
+    return ERR_OK
+
+pub fn doc_link_count_by_label(doc: *Document, label: *u8) -> i32
+    var count: i32 = 0
+    var i: i32 = 0
+    while i < doc.link_count
+        if strcmp(@doc.links[i].label[0], label) == 0
+            count = count + 1
+        i = i + 1
+    return count

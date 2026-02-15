@@ -1,0 +1,396 @@
+# ritz1/test/test_symbols.ritz - Symbol table tests
+#
+# Tests for symbol table and scope management.
+
+# ============================================================================
+# Constants (from symbols.ritz)
+# ============================================================================
+
+const SYM_VAR: i32 = 1
+const SYM_FN: i32 = 2
+const SYM_TYPE: i32 = 3
+const SYM_PARAM: i32 = 4
+const SYM_CONST: i32 = 5
+
+# Type kinds (from types.ritz)
+const TY_I32: i32 = 4
+const TY_BOOL: i32 = 1
+
+# ============================================================================
+# Structures (from symbols.ritz and types.ritz)
+# ============================================================================
+
+struct Type
+  kind: i32
+  is_mut: i32
+  size: i32
+  inner: *Type
+  name: *i8
+  name_len: i32
+  fields: *i32
+  params: *i32
+  ret: *Type
+  next: *Type
+
+struct Symbol
+  name: *i8
+  name_len: i32
+  kind: i32
+  ty: *Type
+  is_mut: i32
+  next: *Symbol
+
+struct Scope
+  symbols: *Symbol
+  parent: *Scope
+  depth: i32
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+fn type_new(kind: i32) -> *Type
+  let ty: *Type = __builtin_alloca(128) as *Type
+  (*ty).kind = kind
+  (*ty).is_mut = 0
+  (*ty).size = 0
+  (*ty).inner = 0 as *Type
+  (*ty).name = 0 as *i8
+  (*ty).name_len = 0
+  (*ty).fields = 0 as *i32
+  (*ty).params = 0 as *i32
+  (*ty).ret = 0 as *Type
+  (*ty).next = 0 as *Type
+  ty
+
+fn scope_new(parent: *Scope) -> *Scope
+  let s: *Scope = __builtin_alloca(64) as *Scope
+  (*s).symbols = 0 as *Symbol
+  (*s).parent = parent
+  if parent == 0 as *Scope
+    (*s).depth = 0
+  else
+    (*s).depth = (*parent).depth + 1
+  s
+
+fn symbol_new(name: *i8, name_len: i32, kind: i32, ty: *Type) -> *Symbol
+  let sym: *Symbol = __builtin_alloca(64) as *Symbol
+  (*sym).name = name
+  (*sym).name_len = name_len
+  (*sym).kind = kind
+  (*sym).ty = ty
+  (*sym).is_mut = 0
+  (*sym).next = 0 as *Symbol
+  sym
+
+fn scope_insert(s: *Scope, sym: *Symbol) -> *Symbol
+  if s == 0 as *Scope
+    return sym
+  (*sym).next = (*s).symbols
+  (*s).symbols = sym
+  sym
+
+fn names_equal(a: *i8, a_len: i32, b: *i8, b_len: i32) -> i32
+  if a_len != b_len
+    return 0
+  var i: i32 = 0
+  while i < a_len
+    let ca: i32 = *(a + i) as i32
+    let cb: i32 = *(b + i) as i32
+    if ca != cb
+      return 0
+    i = i + 1
+  1
+
+fn scope_lookup_local(s: *Scope, name: *i8, name_len: i32) -> *Symbol
+  if s == 0 as *Scope
+    return 0 as *Symbol
+  var sym: *Symbol = (*s).symbols
+  while sym != 0 as *Symbol
+    if names_equal((*sym).name, (*sym).name_len, name, name_len) == 1
+      return sym
+    sym = (*sym).next
+  0 as *Symbol
+
+fn scope_lookup(s: *Scope, name: *i8, name_len: i32) -> *Symbol
+  var current: *Scope = s
+  while current != 0 as *Scope
+    let sym: *Symbol = scope_lookup_local(current, name, name_len)
+    if sym != 0 as *Symbol
+      return sym
+    current = (*current).parent
+  0 as *Symbol
+
+# ============================================================================
+# Tests
+# ============================================================================
+
+@test
+fn test_symbol_kind_constants() -> i32
+  assert SYM_VAR == 1
+  assert SYM_FN == 2
+  assert SYM_TYPE == 3
+  assert SYM_PARAM == 4
+  assert SYM_CONST == 5
+  0
+
+@test
+fn test_scope_new_global() -> i32
+  let s: *Scope = scope_new(0 as *Scope)
+  assert (*s).symbols == 0 as *Symbol
+  assert (*s).parent == 0 as *Scope
+  assert (*s).depth == 0
+  0
+
+@test
+fn test_scope_new_nested() -> i32
+  # Inline allocs to avoid stack frame issues
+  let global: *Scope = __builtin_alloca(64) as *Scope
+  (*global).symbols = 0 as *Symbol
+  (*global).parent = 0 as *Scope
+  (*global).depth = 0
+
+  let fn_scope: *Scope = __builtin_alloca(64) as *Scope
+  (*fn_scope).symbols = 0 as *Symbol
+  (*fn_scope).parent = global
+  (*fn_scope).depth = 1
+
+  let block_scope: *Scope = __builtin_alloca(64) as *Scope
+  (*block_scope).symbols = 0 as *Symbol
+  (*block_scope).parent = fn_scope
+  (*block_scope).depth = 2
+
+  assert (*global).depth == 0
+  assert (*fn_scope).depth == 1
+  assert (*block_scope).depth == 2
+  assert (*fn_scope).parent == global
+  assert (*block_scope).parent == fn_scope
+  0
+
+@test
+fn test_symbol_new() -> i32
+  let ty: *Type = type_new(TY_I32)
+  let sym: *Symbol = symbol_new(0 as *i8, 3, SYM_VAR, ty)
+
+  assert (*sym).name_len == 3
+  assert (*sym).kind == SYM_VAR
+  assert (*sym).ty == ty
+  assert (*sym).is_mut == 0
+  assert (*sym).next == 0 as *Symbol
+  0
+
+@test
+fn test_scope_insert() -> i32
+  let s: *Scope = scope_new(0 as *Scope)
+  let ty: *Type = type_new(TY_I32)
+  let sym: *Symbol = symbol_new(0 as *i8, 1, SYM_VAR, ty)
+
+  scope_insert(s, sym)
+
+  assert (*s).symbols == sym
+  0
+
+@test
+fn test_scope_insert_multiple() -> i32
+  let s: *Scope = scope_new(0 as *Scope)
+  let ty: *Type = type_new(TY_I32)
+
+  let sym1: *Symbol = symbol_new(0 as *i8, 1, SYM_VAR, ty)
+  let sym2: *Symbol = symbol_new(0 as *i8, 1, SYM_VAR, ty)
+  let sym3: *Symbol = symbol_new(0 as *i8, 1, SYM_VAR, ty)
+
+  scope_insert(s, sym1)
+  scope_insert(s, sym2)
+  scope_insert(s, sym3)
+
+  # Most recently inserted is at head
+  assert (*s).symbols == sym3
+  assert (*(*s).symbols).next == sym2
+  assert (*(*(*s).symbols).next).next == sym1
+  0
+
+@test
+fn test_names_equal_same() -> i32
+  # Test with string literal addresses - use known pattern
+  # We'll test the logic with a simple case
+  let a: *i8 = __builtin_alloca(4) as *i8
+  let b: *i8 = __builtin_alloca(4) as *i8
+
+  # Set both to "abc"
+  *(a + 0) = 97 as i8  # 'a'
+  *(a + 1) = 98 as i8  # 'b'
+  *(a + 2) = 99 as i8  # 'c'
+
+  *(b + 0) = 97 as i8  # 'a'
+  *(b + 1) = 98 as i8  # 'b'
+  *(b + 2) = 99 as i8  # 'c'
+
+  assert names_equal(a, 3, b, 3) == 1
+  0
+
+@test
+fn test_names_equal_different() -> i32
+  let a: *i8 = __builtin_alloca(4) as *i8
+  let b: *i8 = __builtin_alloca(4) as *i8
+
+  *(a + 0) = 97 as i8  # 'a'
+  *(a + 1) = 98 as i8  # 'b'
+  *(a + 2) = 99 as i8  # 'c'
+
+  *(b + 0) = 120 as i8  # 'x'
+  *(b + 1) = 121 as i8  # 'y'
+  *(b + 2) = 122 as i8  # 'z'
+
+  assert names_equal(a, 3, b, 3) == 0
+  0
+
+@test
+fn test_names_equal_different_length() -> i32
+  let a: *i8 = __builtin_alloca(4) as *i8
+  let b: *i8 = __builtin_alloca(4) as *i8
+
+  assert names_equal(a, 3, b, 4) == 0
+  0
+
+@test
+fn test_scope_lookup_local_found() -> i32
+  # Inline all allocations to avoid stack reuse between function calls
+  let s: *Scope = __builtin_alloca(64) as *Scope
+  (*s).symbols = 0 as *Symbol
+  (*s).parent = 0 as *Scope
+  (*s).depth = 0
+
+  let ty: *Type = __builtin_alloca(128) as *Type
+  (*ty).kind = TY_I32
+
+  let name: *i8 = __builtin_alloca(4) as *i8
+  *(name + 0) = 120 as i8  # 'x'
+
+  let sym: *Symbol = __builtin_alloca(64) as *Symbol
+  (*sym).name = name
+  (*sym).name_len = 1
+  (*sym).kind = SYM_VAR
+  (*sym).ty = ty
+  (*sym).is_mut = 0
+  (*sym).next = 0 as *Symbol
+
+  scope_insert(s, sym)
+
+  let found: *Symbol = scope_lookup_local(s, name, 1)
+  assert found == sym
+  0
+
+@test
+fn test_scope_lookup_local_not_found() -> i32
+  let s: *Scope = scope_new(0 as *Scope)
+  let ty: *Type = type_new(TY_I32)
+
+  let name_x: *i8 = __builtin_alloca(4) as *i8
+  let name_y: *i8 = __builtin_alloca(4) as *i8
+  *(name_x + 0) = 120 as i8  # 'x'
+  *(name_y + 0) = 121 as i8  # 'y'
+
+  let sym: *Symbol = symbol_new(name_x, 1, SYM_VAR, ty)
+  scope_insert(s, sym)
+
+  let found: *Symbol = scope_lookup_local(s, name_y, 1)
+  assert found == 0 as *Symbol
+  0
+
+@test
+fn test_scope_lookup_parent() -> i32
+  # Inline all allocations to avoid stack reuse between function calls
+  let global: *Scope = __builtin_alloca(64) as *Scope
+  (*global).symbols = 0 as *Symbol
+  (*global).parent = 0 as *Scope
+  (*global).depth = 0
+
+  let local: *Scope = __builtin_alloca(64) as *Scope
+  (*local).symbols = 0 as *Symbol
+  (*local).parent = global
+  (*local).depth = 1
+
+  let ty: *Type = __builtin_alloca(128) as *Type
+  (*ty).kind = TY_I32
+
+  let name_x: *i8 = __builtin_alloca(4) as *i8
+  *(name_x + 0) = 120 as i8  # 'x'
+
+  # Define x in global scope
+  let sym: *Symbol = __builtin_alloca(64) as *Symbol
+  (*sym).name = name_x
+  (*sym).name_len = 1
+  (*sym).kind = SYM_VAR
+  (*sym).ty = ty
+  (*sym).is_mut = 0
+  (*sym).next = 0 as *Symbol
+  scope_insert(global, sym)
+
+  # Lookup from local scope should find it in parent
+  let found: *Symbol = scope_lookup(local, name_x, 1)
+  assert found == sym
+  0
+
+@test
+fn test_scope_lookup_shadowing() -> i32
+  # Inline all allocations to avoid stack reuse between function calls
+  let global: *Scope = __builtin_alloca(64) as *Scope
+  (*global).symbols = 0 as *Symbol
+  (*global).parent = 0 as *Scope
+  (*global).depth = 0
+
+  let local: *Scope = __builtin_alloca(64) as *Scope
+  (*local).symbols = 0 as *Symbol
+  (*local).parent = global
+  (*local).depth = 1
+
+  let ty: *Type = __builtin_alloca(128) as *Type
+  (*ty).kind = TY_I32
+
+  let name_x: *i8 = __builtin_alloca(4) as *i8
+  *(name_x + 0) = 120 as i8  # 'x'
+
+  # Define x in global scope
+  let global_sym: *Symbol = __builtin_alloca(64) as *Symbol
+  (*global_sym).name = name_x
+  (*global_sym).name_len = 1
+  (*global_sym).kind = SYM_VAR
+  (*global_sym).ty = ty
+  (*global_sym).is_mut = 0
+  (*global_sym).next = 0 as *Symbol
+  scope_insert(global, global_sym)
+
+  # Define x in local scope
+  let local_sym: *Symbol = __builtin_alloca(64) as *Symbol
+  (*local_sym).name = name_x
+  (*local_sym).name_len = 1
+  (*local_sym).kind = SYM_VAR
+  (*local_sym).ty = ty
+  (*local_sym).is_mut = 0
+  (*local_sym).next = 0 as *Symbol
+  scope_insert(local, local_sym)
+
+  # Lookup from local should find local (shadowing)
+  let found: *Symbol = scope_lookup(local, name_x, 1)
+  assert found == local_sym
+  0
+
+@test
+fn test_scope_pop() -> i32
+  let global: *Scope = scope_new(0 as *Scope)
+  let local: *Scope = scope_new(global)
+
+  # Pop returns parent
+  let parent: *Scope = (*local).parent
+  assert parent == global
+  0
+
+@test
+fn test_symbol_is_mut() -> i32
+  let ty: *Type = type_new(TY_I32)
+  let sym: *Symbol = symbol_new(0 as *i8, 3, SYM_VAR, ty)
+
+  (*sym).is_mut = 1
+
+  assert (*sym).is_mut == 1
+  0

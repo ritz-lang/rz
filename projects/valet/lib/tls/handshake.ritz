@@ -1,0 +1,473 @@
+# valet/lib/tls/handshake.ritz - TLS 1.3 Handshake Messages
+#
+# Implements TLS 1.3 handshake message parsing and construction
+# per RFC 8446 Section 4.
+#
+# Handshake Message Format:
+#   HandshakeType (1 byte)
+#   Length (3 bytes, big-endian)
+#   Body (variable)
+#
+# Full Handshake Flow (Server):
+#   Client                                Server
+#   ------                                ------
+#   ClientHello         ------->
+#                                         ServerHello
+#                                         EncryptedExtensions
+#                                         Certificate*
+#                                         CertificateVerify*
+#                       <-------          Finished
+#   Finished            ------->
+#                       <======>          Application Data
+
+import ritzlib.io
+import ritzlib.str
+
+# ============================================================================
+# Handshake Types (RFC 8446 Section 4)
+# ============================================================================
+
+const HS_CLIENT_HELLO: u8 = 1
+const HS_SERVER_HELLO: u8 = 2
+const HS_NEW_SESSION_TICKET: u8 = 4
+const HS_END_OF_EARLY_DATA: u8 = 5
+const HS_ENCRYPTED_EXTENSIONS: u8 = 8
+const HS_CERTIFICATE: u8 = 11
+const HS_CERTIFICATE_REQUEST: u8 = 13
+const HS_CERTIFICATE_VERIFY: u8 = 15
+const HS_FINISHED: u8 = 20
+const HS_KEY_UPDATE: u8 = 24
+const HS_MESSAGE_HASH: u8 = 254
+
+# ============================================================================
+# Extension Types (RFC 8446 Section 4.2)
+# ============================================================================
+
+const EXT_SERVER_NAME: u16 = 0
+const EXT_MAX_FRAGMENT_LENGTH: u16 = 1
+const EXT_STATUS_REQUEST: u16 = 5
+const EXT_SUPPORTED_GROUPS: u16 = 10
+const EXT_EC_POINT_FORMATS: u16 = 11
+const EXT_SIGNATURE_ALGORITHMS: u16 = 13
+const EXT_ALPN: u16 = 16
+const EXT_HEARTBEAT: u16 = 15
+const EXT_SIGNED_CERT_TIMESTAMP: u16 = 18
+const EXT_PADDING: u16 = 21
+const EXT_PRE_SHARED_KEY: u16 = 41
+const EXT_EARLY_DATA: u16 = 42
+const EXT_SUPPORTED_VERSIONS: u16 = 43
+const EXT_COOKIE: u16 = 44
+const EXT_PSK_KEY_EXCHANGE_MODES: u16 = 45
+const EXT_CERTIFICATE_AUTHORITIES: u16 = 47
+const EXT_OID_FILTERS: u16 = 48
+const EXT_POST_HANDSHAKE_AUTH: u16 = 49
+const EXT_SIGNATURE_ALGORITHMS_CERT: u16 = 50
+const EXT_KEY_SHARE: u16 = 51
+
+# Named Groups (for key exchange)
+const GROUP_SECP256R1: u16 = 23
+const GROUP_SECP384R1: u16 = 24
+const GROUP_SECP521R1: u16 = 25
+const GROUP_X25519: u16 = 29
+const GROUP_X448: u16 = 30
+
+# Signature Algorithms
+const SIG_RSA_PKCS1_SHA256: u16 = 0x0401
+const SIG_RSA_PKCS1_SHA384: u16 = 0x0501
+const SIG_RSA_PKCS1_SHA512: u16 = 0x0601
+const SIG_ECDSA_SECP256R1_SHA256: u16 = 0x0403
+const SIG_ECDSA_SECP384R1_SHA384: u16 = 0x0503
+const SIG_RSA_PSS_RSAE_SHA256: u16 = 0x0804
+const SIG_RSA_PSS_RSAE_SHA384: u16 = 0x0805
+const SIG_ED25519: u16 = 0x0807
+const SIG_ED448: u16 = 0x0808
+
+# ============================================================================
+# Handshake Message Header
+# ============================================================================
+
+struct HandshakeHeader
+    msg_type: u8
+    length: i32         # 24-bit length
+
+
+# Parse handshake header from buffer
+# Returns 0 on success, -1 on error, -2 if need more data
+fn handshake_parse_header(buf: *u8, buf_len: i32, hdr: *HandshakeHeader) -> i32
+    if buf_len < 4
+        return -2
+
+    hdr.msg_type = *buf
+    hdr.length = ((*(buf + 1) as i32) << 16) |
+                 ((*(buf + 2) as i32) << 8) |
+                 (*(buf + 3) as i32)
+
+    return 0
+
+
+# Write handshake header
+fn handshake_write_header(buf: *u8, msg_type: u8, length: i32) -> i32
+    *buf = msg_type
+    *(buf + 1) = ((length >> 16) & 0xFF) as u8
+    *(buf + 2) = ((length >> 8) & 0xFF) as u8
+    *(buf + 3) = (length & 0xFF) as u8
+    return 4
+
+
+# ============================================================================
+# ClientHello
+# ============================================================================
+
+struct ClientHello
+    legacy_version: u16                 # Should be 0x0303
+    random: [32]u8                      # 32 bytes of random
+    session_id: [32]u8                  # Legacy session ID
+    session_id_len: u8
+    cipher_suites: [32]u16              # Up to 32 cipher suites
+    cipher_suite_count: i32
+    # Extensions (parsed separately)
+    supported_versions: [8]u16          # From supported_versions extension
+    supported_version_count: i32
+    key_share_group: u16                # From key_share extension
+    key_share_data: [256]u8             # Key share public key
+    key_share_len: i32
+    server_name: [256]u8                # From server_name extension
+    server_name_len: i32
+
+
+# Parse ClientHello from buffer (after handshake header)
+fn client_hello_parse(buf: *u8, len: i32, ch: *ClientHello) -> i32
+    if len < 34  # Minimum: version(2) + random(32)
+        return -1
+
+    var pos: i32 = 0
+
+    # Legacy version
+    ch.legacy_version = ((*(buf + pos) as u16) << 8) | (*(buf + pos + 1) as u16)
+    pos += 2
+
+    # Random
+    for i in 0..32
+        ch.random[i] = *(buf + pos + i)
+    pos += 32
+
+    # Session ID
+    if pos >= len
+        return -1
+    ch.session_id_len = *(buf + pos)
+    pos += 1
+    if ch.session_id_len > 32 || pos + (ch.session_id_len as i32) > len
+        return -1
+    for i in 0..(ch.session_id_len as i32)
+        ch.session_id[i] = *(buf + pos + i)
+    pos += ch.session_id_len as i32
+
+    # Cipher suites
+    if pos + 2 > len
+        return -1
+    let cs_len: i32 = ((*(buf + pos) as i32) << 8) | (*(buf + pos + 1) as i32)
+    pos += 2
+    if pos + cs_len > len || cs_len % 2 != 0
+        return -1
+
+    ch.cipher_suite_count = cs_len / 2
+    if ch.cipher_suite_count > 32
+        ch.cipher_suite_count = 32
+    for i in 0..ch.cipher_suite_count
+        let offset: i32 = pos + i * 2
+        ch.cipher_suites[i] = ((*(buf + offset) as u16) << 8) | (*(buf + offset + 1) as u16)
+    pos += cs_len
+
+    # Compression methods (should be single null byte in TLS 1.3)
+    if pos + 1 > len
+        return -1
+    let comp_len: i32 = *(buf + pos) as i32
+    pos += 1
+    if pos + comp_len > len
+        return -1
+    pos += comp_len
+
+    # Extensions
+    if pos + 2 > len
+        return 0  # No extensions (technically invalid for TLS 1.3)
+
+    let ext_len: i32 = ((*(buf + pos) as i32) << 8) | (*(buf + pos + 1) as i32)
+    pos += 2
+
+    # Initialize extension fields
+    ch.supported_version_count = 0
+    ch.key_share_group = 0
+    ch.key_share_len = 0
+    ch.server_name_len = 0
+
+    # Parse extensions
+    let ext_end: i32 = pos + ext_len
+    while pos + 4 <= ext_end
+        let ext_type: u16 = ((*(buf + pos) as u16) << 8) | (*(buf + pos + 1) as u16)
+        pos += 2
+        let ext_data_len: i32 = ((*(buf + pos) as i32) << 8) | (*(buf + pos + 1) as i32)
+        pos += 2
+
+        if pos + ext_data_len > ext_end
+            return -1
+
+        # Parse specific extensions
+        if ext_type == EXT_SUPPORTED_VERSIONS
+            parse_supported_versions(buf + pos, ext_data_len, ch)
+        else
+            if ext_type == EXT_KEY_SHARE
+                parse_key_share_ch(buf + pos, ext_data_len, ch)
+            else
+                if ext_type == EXT_SERVER_NAME
+                    parse_server_name(buf + pos, ext_data_len, ch)
+
+        pos += ext_data_len
+
+    return 0
+
+
+# Parse supported_versions extension
+fn parse_supported_versions(buf: *u8, len: i32, ch: *ClientHello) -> i32
+    if len < 1
+        return -1
+    let list_len: i32 = *buf as i32
+    if 1 + list_len > len || list_len % 2 != 0
+        return -1
+
+    ch.supported_version_count = list_len / 2
+    if ch.supported_version_count > 8
+        ch.supported_version_count = 8
+
+    for i in 0..ch.supported_version_count
+        let offset: i32 = 1 + i * 2
+        ch.supported_versions[i] = ((*(buf + offset) as u16) << 8) | (*(buf + offset + 1) as u16)
+
+    return 0
+
+
+# Parse key_share extension from ClientHello
+fn parse_key_share_ch(buf: *u8, len: i32, ch: *ClientHello) -> i32
+    if len < 2
+        return -1
+
+    let entries_len: i32 = ((*(buf) as i32) << 8) | (*(buf + 1) as i32)
+    if 2 + entries_len > len
+        return -1
+
+    # Parse first key share entry (we only support one for now)
+    var pos: i32 = 2
+    if pos + 4 > 2 + entries_len
+        return 0  # No entries
+
+    ch.key_share_group = ((*(buf + pos) as u16) << 8) | (*(buf + pos + 1) as u16)
+    pos += 2
+    let key_len: i32 = ((*(buf + pos) as i32) << 8) | (*(buf + pos + 1) as i32)
+    pos += 2
+
+    if pos + key_len > 2 + entries_len || key_len > 256
+        return -1
+
+    ch.key_share_len = key_len
+    for i in 0..key_len
+        ch.key_share_data[i] = *(buf + pos + i)
+
+    return 0
+
+
+# Parse server_name extension
+fn parse_server_name(buf: *u8, len: i32, ch: *ClientHello) -> i32
+    if len < 5
+        return -1
+
+    let list_len: i32 = ((*(buf) as i32) << 8) | (*(buf + 1) as i32)
+    if 2 + list_len > len
+        return -1
+
+    # Parse first entry (hostname)
+    var pos: i32 = 2
+    if pos + 3 > 2 + list_len
+        return 0
+
+    let name_type: u8 = *(buf + pos)
+    pos += 1
+    if name_type != 0  # host_name
+        return 0
+
+    let name_len: i32 = ((*(buf + pos) as i32) << 8) | (*(buf + pos + 1) as i32)
+    pos += 2
+
+    if pos + name_len > 2 + list_len || name_len > 255
+        return -1
+
+    ch.server_name_len = name_len
+    for i in 0..name_len
+        ch.server_name[i] = *(buf + pos + i)
+    ch.server_name[name_len] = 0  # Null terminate
+
+    return 0
+
+
+# ============================================================================
+# ServerHello
+# ============================================================================
+
+struct ServerHello
+    legacy_version: u16                 # 0x0303
+    random: [32]u8                      # 32 bytes
+    session_id: [32]u8                  # Echo of client's session ID
+    session_id_len: u8
+    cipher_suite: u16                   # Selected cipher suite
+    compression_method: u8              # Always 0
+    # Extensions
+    selected_version: u16               # From supported_versions (0x0304 for TLS 1.3)
+    key_share_group: u16                # Selected group
+    key_share_data: [256]u8             # Server's public key
+    key_share_len: i32
+
+
+# Build ServerHello message
+# Returns length of message (including handshake header), or -1 on error
+fn server_hello_build(sh: *ServerHello, buf: *u8, buf_len: i32) -> i32
+    var pos: i32 = 4  # Reserve space for handshake header
+
+    # Legacy version
+    *(buf + pos) = 0x03
+    *(buf + pos + 1) = 0x03
+    pos += 2
+
+    # Random
+    for i in 0..32
+        *(buf + pos + i) = sh.random[i]
+    pos += 32
+
+    # Session ID (echo client's)
+    *(buf + pos) = sh.session_id_len
+    pos += 1
+    for i in 0..(sh.session_id_len as i32)
+        *(buf + pos + i) = sh.session_id[i]
+    pos += sh.session_id_len as i32
+
+    # Cipher suite
+    *(buf + pos) = ((sh.cipher_suite >> 8) & 0xFF) as u8
+    *(buf + pos + 1) = (sh.cipher_suite & 0xFF) as u8
+    pos += 2
+
+    # Compression method (always 0)
+    *(buf + pos) = 0
+    pos += 1
+
+    # Extensions
+    let ext_start: i32 = pos
+    pos += 2  # Reserve space for extensions length
+
+    # supported_versions extension (mandatory in TLS 1.3)
+    *(buf + pos) = ((EXT_SUPPORTED_VERSIONS >> 8) & 0xFF) as u8
+    *(buf + pos + 1) = (EXT_SUPPORTED_VERSIONS & 0xFF) as u8
+    pos += 2
+    *(buf + pos) = 0  # Extension length high byte
+    *(buf + pos + 1) = 2  # Extension length low byte (2 bytes for version)
+    pos += 2
+    *(buf + pos) = 0x03  # TLS 1.3 = 0x0304
+    *(buf + pos + 1) = 0x04
+    pos += 2
+
+    # key_share extension
+    *(buf + pos) = ((EXT_KEY_SHARE >> 8) & 0xFF) as u8
+    *(buf + pos + 1) = (EXT_KEY_SHARE & 0xFF) as u8
+    pos += 2
+    let ks_ext_len: i32 = 4 + sh.key_share_len  # group(2) + key_len(2) + key_data
+    *(buf + pos) = ((ks_ext_len >> 8) & 0xFF) as u8
+    *(buf + pos + 1) = (ks_ext_len & 0xFF) as u8
+    pos += 2
+    *(buf + pos) = ((sh.key_share_group >> 8) & 0xFF) as u8
+    *(buf + pos + 1) = (sh.key_share_group & 0xFF) as u8
+    pos += 2
+    *(buf + pos) = ((sh.key_share_len >> 8) & 0xFF) as u8
+    *(buf + pos + 1) = (sh.key_share_len & 0xFF) as u8
+    pos += 2
+    for i in 0..sh.key_share_len
+        *(buf + pos + i) = sh.key_share_data[i]
+    pos += sh.key_share_len
+
+    # Write extensions length
+    let ext_len: i32 = pos - ext_start - 2
+    *(buf + ext_start) = ((ext_len >> 8) & 0xFF) as u8
+    *(buf + ext_start + 1) = (ext_len & 0xFF) as u8
+
+    # Write handshake header
+    let body_len: i32 = pos - 4
+    handshake_write_header(buf, HS_SERVER_HELLO, body_len)
+
+    return pos
+
+
+# ============================================================================
+# EncryptedExtensions (minimal - empty for basic handshake)
+# ============================================================================
+
+fn encrypted_extensions_build(buf: *u8, buf_len: i32) -> i32
+    var pos: i32 = 4  # Reserve for header
+
+    # Extensions length (0 for empty)
+    *(buf + pos) = 0
+    *(buf + pos + 1) = 0
+    pos += 2
+
+    # Write header
+    handshake_write_header(buf, HS_ENCRYPTED_EXTENSIONS, pos - 4)
+
+    return pos
+
+
+# ============================================================================
+# Finished
+# ============================================================================
+
+fn finished_build(verify_data: *u8, verify_data_len: i32, buf: *u8, buf_len: i32) -> i32
+    if buf_len < 4 + verify_data_len
+        return -1
+
+    # Write verify_data after header
+    for i in 0..verify_data_len
+        *(buf + 4 + i) = *(verify_data + i)
+
+    # Write header
+    handshake_write_header(buf, HS_FINISHED, verify_data_len)
+
+    return 4 + verify_data_len
+
+
+# Parse Finished message
+fn finished_parse(buf: *u8, len: i32, verify_data: *u8, verify_data_len: i32) -> i32
+    if len != verify_data_len
+        return -1
+
+    for i in 0..len
+        *(verify_data + i) = *(buf + i)
+
+    return 0
+
+
+# ============================================================================
+# Debug helpers
+# ============================================================================
+
+fn handshake_type_str(msg_type: u8) -> *u8
+    if msg_type == HS_CLIENT_HELLO
+        return c"ClientHello"
+    if msg_type == HS_SERVER_HELLO
+        return c"ServerHello"
+    if msg_type == HS_ENCRYPTED_EXTENSIONS
+        return c"EncryptedExtensions"
+    if msg_type == HS_CERTIFICATE
+        return c"Certificate"
+    if msg_type == HS_CERTIFICATE_VERIFY
+        return c"CertificateVerify"
+    if msg_type == HS_FINISHED
+        return c"Finished"
+    if msg_type == HS_NEW_SESSION_TICKET
+        return c"NewSessionTicket"
+    if msg_type == HS_KEY_UPDATE
+        return c"KeyUpdate"
+    return c"Unknown"
+

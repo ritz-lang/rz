@@ -1,0 +1,967 @@
+# valet/lib/static.ritz - Static file serving
+#
+# Provides static file serving with:
+#   - MIME type detection based on file extension
+#   - sendfile() zero-copy transfer
+#   - Directory traversal protection
+#   - Directory listing for directories
+#   - 404 for missing files
+#
+# Usage:
+#   valet_static(@app, "/static/*", "./public")
+#   # Then requests to /static/css/style.css serve ./public/css/style.css
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+import ritzlib.fs
+import ritzlib.memory
+
+import lib.log
+
+# ============================================================================
+# MIME type detection
+# ============================================================================
+
+# Get MIME type from file extension
+# Returns pointer to static string
+pub fn mime_type_for_ext(ext: *u8, ext_len: i32) -> *u8
+    # HTML
+    if ext_len == 4 && strneq(ext, c"html", 4) != 0
+        return c"text/html"
+    if ext_len == 3 && strneq(ext, c"htm", 3) != 0
+        return c"text/html"
+
+    # CSS
+    if ext_len == 3 && strneq(ext, c"css", 3) != 0
+        return c"text/css"
+
+    # JavaScript
+    if ext_len == 2 && strneq(ext, c"js", 2) != 0
+        return c"application/javascript"
+    if ext_len == 3 && strneq(ext, c"mjs", 3) != 0
+        return c"application/javascript"
+
+    # JSON
+    if ext_len == 4 && strneq(ext, c"json", 4) != 0
+        return c"application/json"
+
+    # Images
+    if ext_len == 3 && strneq(ext, c"png", 3) != 0
+        return c"image/png"
+    if ext_len == 3 && strneq(ext, c"jpg", 3) != 0
+        return c"image/jpeg"
+    if ext_len == 4 && strneq(ext, c"jpeg", 4) != 0
+        return c"image/jpeg"
+    if ext_len == 3 && strneq(ext, c"gif", 3) != 0
+        return c"image/gif"
+    if ext_len == 3 && strneq(ext, c"svg", 3) != 0
+        return c"image/svg+xml"
+    if ext_len == 3 && strneq(ext, c"ico", 3) != 0
+        return c"image/x-icon"
+    if ext_len == 4 && strneq(ext, c"webp", 4) != 0
+        return c"image/webp"
+
+    # Fonts
+    if ext_len == 4 && strneq(ext, c"woff", 4) != 0
+        return c"font/woff"
+    if ext_len == 5 && strneq(ext, c"woff2", 5) != 0
+        return c"font/woff2"
+    if ext_len == 3 && strneq(ext, c"ttf", 3) != 0
+        return c"font/ttf"
+    if ext_len == 3 && strneq(ext, c"otf", 3) != 0
+        return c"font/otf"
+    if ext_len == 3 && strneq(ext, c"eot", 3) != 0
+        return c"application/vnd.ms-fontobject"
+
+    # Documents
+    if ext_len == 3 && strneq(ext, c"pdf", 3) != 0
+        return c"application/pdf"
+    if ext_len == 3 && strneq(ext, c"txt", 3) != 0
+        return c"text/plain"
+    if ext_len == 3 && strneq(ext, c"xml", 3) != 0
+        return c"application/xml"
+
+    # Media
+    if ext_len == 3 && strneq(ext, c"mp3", 3) != 0
+        return c"audio/mpeg"
+    if ext_len == 3 && strneq(ext, c"mp4", 3) != 0
+        return c"video/mp4"
+    if ext_len == 4 && strneq(ext, c"webm", 4) != 0
+        return c"video/webm"
+
+    # Archives
+    if ext_len == 3 && strneq(ext, c"zip", 3) != 0
+        return c"application/zip"
+    if ext_len == 2 && strneq(ext, c"gz", 2) != 0
+        return c"application/gzip"
+    if ext_len == 3 && strneq(ext, c"tar", 3) != 0
+        return c"application/x-tar"
+
+    # Default
+    return c"application/octet-stream"
+
+
+# Get MIME type from filename by finding the extension
+pub fn mime_type_for_file(filename: *u8, filename_len: i32) -> *u8
+    # Find last dot
+    var dot_pos: i32 = -1
+    for i in 0..filename_len
+        if *(filename + i) == '.'
+            dot_pos = i
+
+    if dot_pos < 0 || dot_pos >= filename_len - 1
+        return c"application/octet-stream"
+
+    let ext: *u8 = filename + dot_pos + 1
+    let ext_len: i32 = filename_len - dot_pos - 1
+
+    return mime_type_for_ext(ext, ext_len)
+
+
+# ============================================================================
+# Path security
+# ============================================================================
+
+# Check if path contains directory traversal attempt
+# Returns 1 if path is safe, 0 if it contains ".."
+#
+# SECURITY: This function prevents directory traversal attacks by rejecting:
+# - Paths containing ".." (parent directory references)
+# - Paths containing null bytes (C string termination attacks)
+# Always call this before using user-supplied paths with the filesystem.
+pub fn path_is_safe(path: *u8, path_len: i32) -> i32
+    # Look for ".." in path
+    for i in 0..(path_len - 1)
+        if *(path + i) == '.' && *(path + i + 1) == '.'
+            return 0
+
+    # Check for null bytes
+    for i in 0..path_len
+        if *(path + i) == 0
+            return 0
+
+    return 1
+
+
+# ============================================================================
+# Range request parsing
+# ============================================================================
+
+# Range request result
+struct RangeResult
+    valid: i32       # 1 if range is valid, 0 otherwise
+    start: i64       # Start byte (inclusive)
+    end: i64         # End byte (inclusive)
+
+
+# Parse Range header value: "bytes=start-end" or "bytes=start-" or "bytes=-suffix"
+# Returns valid=1 if parsed successfully
+pub fn parse_range(range_hdr: *u8, range_len: i32, file_size: i64) -> RangeResult
+    var result: RangeResult
+    result.valid = 0
+    result.start = 0
+    result.end = file_size - 1
+
+    # Check for "bytes=" prefix (6 chars)
+    if range_len < 7
+        return result
+    if *(range_hdr + 0) != 'b' || *(range_hdr + 1) != 'y' || *(range_hdr + 2) != 't'
+        return result
+    if *(range_hdr + 3) != 'e' || *(range_hdr + 4) != 's' || *(range_hdr + 5) != '='
+        return result
+
+    let spec_start: i32 = 6
+    var pos: i32 = spec_start
+
+    # Check for suffix range: bytes=-500 (last 500 bytes)
+    if *(range_hdr + pos) == '-'
+        pos += 1
+        var suffix_len: i64 = 0
+        while pos < range_len
+            let c: u8 = *(range_hdr + pos)
+            if c >= '0' && c <= '9'
+                suffix_len = suffix_len * 10 + (c - '0') as i64
+            else
+                return result  # Invalid char
+            pos += 1
+        if suffix_len == 0
+            return result
+        if suffix_len > file_size
+            suffix_len = file_size
+        result.start = file_size - suffix_len
+        result.end = file_size - 1
+        result.valid = 1
+        return result
+
+    # Parse start
+    var start: i64 = 0
+    while pos < range_len && *(range_hdr + pos) != '-'
+        let c: u8 = *(range_hdr + pos)
+        if c >= '0' && c <= '9'
+            start = start * 10 + (c - '0') as i64
+        else
+            return result  # Invalid char
+        pos += 1
+
+    if pos >= range_len || *(range_hdr + pos) != '-'
+        return result  # No hyphen found
+    pos += 1  # Skip hyphen
+
+    # Parse end (optional)
+    if pos >= range_len
+        # Open-ended range: bytes=start-
+        result.start = start
+        result.end = file_size - 1
+        result.valid = 1
+        return result
+
+    var end: i64 = 0
+    while pos < range_len
+        let c: u8 = *(range_hdr + pos)
+        if c >= '0' && c <= '9'
+            end = end * 10 + (c - '0') as i64
+        else
+            return result  # Invalid char
+        pos += 1
+
+    # Validate range
+    if start > end
+        return result
+    if start >= file_size
+        return result
+    if end >= file_size
+        end = file_size - 1
+
+    result.start = start
+    result.end = end
+    result.valid = 1
+    return result
+
+
+# ============================================================================
+# ETag generation and validation
+# ============================================================================
+
+# Generate ETag from file stat info (inode-size-mtime format)
+# Writes ETag to buf including quotes, returns length
+pub fn generate_etag(buf: *u8, buf_size: i32, statbuf: *Stat) -> i32
+    var pos: i32 = 0
+
+    # Opening quote
+    *(buf + pos) = '"'
+    pos += 1
+
+    # Format: inode-size-mtime_sec
+    # inode (hex)
+    pos += format_hex64(buf + pos, buf_size - pos, statbuf.st_ino)
+
+    *(buf + pos) = '-'
+    pos += 1
+
+    # size (hex)
+    pos += format_hex64(buf + pos, buf_size - pos, statbuf.st_size)
+
+    *(buf + pos) = '-'
+    pos += 1
+
+    # mtime seconds (hex)
+    pos += format_hex64(buf + pos, buf_size - pos, statbuf.st_mtime)
+
+    # Closing quote
+    *(buf + pos) = '"'
+    pos += 1
+
+    return pos
+
+
+# Format int64 as hex into buffer, returns chars written
+pub fn format_hex64(buf: *u8, buf_size: i32, value: i64) -> i32
+    if value == 0
+        *buf = '0'
+        return 1
+
+    var temp: [16]u8
+    var temp_pos: i32 = 15
+    var v: i64 = value
+    let hex_chars = c"0123456789abcdef"
+
+    while v > 0
+        temp[temp_pos] = *(hex_chars + (v & 15))
+        temp_pos -= 1
+        v = v >> 4
+
+    let digits: i32 = 15 - temp_pos
+    if digits > buf_size
+        return 0
+
+    for i in 0..digits
+        *(buf + i) = temp[temp_pos + 1 + i]
+
+    return digits
+
+
+# Check if If-None-Match header matches ETag
+# Returns 1 if match (should return 304), 0 otherwise
+pub fn etag_matches(if_none_match: *u8, if_none_match_len: i32, etag: *u8, etag_len: i32) -> i32
+    # Handle "*" wildcard
+    if if_none_match_len == 1 && *if_none_match == '*'
+        return 1
+
+    # Simple substring search for the ETag in the If-None-Match value
+    # (If-None-Match can contain multiple ETags separated by commas)
+    if if_none_match_len < etag_len
+        return 0
+
+    var pos: i32 = 0
+    while pos <= if_none_match_len - etag_len
+        var found: i32 = 1
+        for i in 0..etag_len
+            if *(if_none_match + pos + i) != *(etag + i)
+                found = 0
+                break
+        if found != 0
+            return 1
+        pos += 1
+
+    return 0
+
+
+# ============================================================================
+# Static file serving
+# ============================================================================
+
+# Build full filesystem path from root and URL path
+# Build filesystem path from root directory and URL path
+# Returns length written to buf, or -1 on error
+#
+# SAFETY:
+# - `root` must be a valid null-terminated string
+# - `url_path` must point to at least `url_path_len` valid bytes
+# - `buf` must have capacity of at least `buf_len` bytes
+# - Result is null-terminated if successful
+# - Does NOT validate for directory traversal - caller must use path_is_safe()
+pub fn static_build_path(buf: *u8, buf_len: i32, root: *u8, url_path: *u8, url_path_len: i32) -> i32
+    let root_len: i64 = strlen(root)
+    var pos: i32 = 0
+
+    # Copy root
+    if root_len as i32 >= buf_len
+        return -1
+
+    for i in 0..root_len
+        *(buf + pos) = *(root + i)
+        pos += 1
+
+    # Ensure there's a separator
+    if pos > 0 && *(buf + pos - 1) != '/'
+        if pos >= buf_len
+            return -1
+        *(buf + pos) = '/'
+        pos += 1
+
+    # Copy URL path (skip leading /)
+    var skip: i32 = 0
+    if url_path_len > 0 && *url_path == '/'
+        skip = 1
+
+    for i in skip..url_path_len
+        if pos >= buf_len - 1
+            return -1
+        *(buf + pos) = *(url_path + i)
+        pos += 1
+
+    # Null terminate
+    *(buf + pos) = 0
+    return pos
+
+
+# Serve a static file
+# fd: socket to write to
+# path: full filesystem path to file
+# Returns: bytes sent on success, negative on error
+pub fn static_serve_file(fd: i32, path: *u8) -> i64
+    # Open the file
+    let file_fd: i32 = sys_open(path, O_RDONLY)
+    if file_fd < 0
+        return -1  # File not found or permission denied
+
+    # Get file size using fstat
+    var statbuf: Stat
+    if sys_fstat2(file_fd, @statbuf) != 0
+        sys_close(file_fd)
+        return -2
+
+    let file_size: i64 = statbuf.st_size
+
+    # Check if it's a regular file
+    if (statbuf.st_mode & S_IFMT) != S_IFREG
+        sys_close(file_fd)
+        return -3  # Not a regular file
+
+    # Get MIME type
+    let path_len: i64 = strlen(path)
+    let mime: *u8 = mime_type_for_file(path, path_len as i32)
+
+    # Build HTTP response headers
+    var headers: [512]u8
+    var pos: i32 = 0
+
+    # Status line: "HTTP/1.1 200 OK\r\n" (17 bytes)
+    let status = c"HTTP/1.1 200 OK\r\n"
+    for i in 0..17
+        headers[pos] = *(status + i)
+        pos += 1
+
+    # Content-Type header: "Content-Type: " (14 bytes)
+    let ct = c"Content-Type: "
+    for i in 0..14
+        headers[pos] = *(ct + i)
+        pos += 1
+
+    let mime_len: i64 = strlen(mime)
+    for i in 0..mime_len
+        headers[pos] = *(mime + i)
+        pos += 1
+
+    headers[pos] = '\r'
+    pos += 1
+    headers[pos] = '\n'
+    pos += 1
+
+    # Content-Length header: "Content-Length: " (16 bytes)
+    let cl = c"Content-Length: "
+    for i in 0..16
+        headers[pos] = *(cl + i)
+        pos += 1
+
+    # Format file size
+    var size_buf: [32]u8
+    var size_pos: i32 = 31
+    var sz: i64 = file_size
+
+    if sz == 0
+        size_buf[size_pos] = '0'
+        size_pos -= 1
+    else
+        while sz > 0
+            size_buf[size_pos] = ((sz % 10) + 48) as u8
+            size_pos -= 1
+            sz = sz / 10
+
+    let size_digits: i32 = 31 - size_pos
+    for i in 0..size_digits
+        headers[pos] = size_buf[size_pos + 1 + i]
+        pos += 1
+
+    headers[pos] = '\r'
+    pos += 1
+    headers[pos] = '\n'
+    pos += 1
+
+    # Connection header: "Connection: keep-alive\r\n" (24 bytes)
+    let conn = c"Connection: keep-alive\r\n"
+    for i in 0..24
+        headers[pos] = *(conn + i)
+        pos += 1
+
+    # End of headers
+    headers[pos] = '\r'
+    pos += 1
+    headers[pos] = '\n'
+    pos += 1
+
+    # Send headers
+    let header_sent: i64 = sys_write(fd, @headers[0], pos as i64)
+    if header_sent < 0
+        sys_close(file_fd)
+        return header_sent
+
+    # Send file content using sendfile (zero-copy)
+    var offset: i64 = 0
+    var remaining: i64 = file_size
+    var total_sent: i64 = 0
+
+    while remaining > 0
+        let sent: i64 = sys_sendfile(fd, file_fd, @offset, remaining)
+        if sent <= 0
+            if sent < 0
+                log_error(c"sendfile failed")
+            break
+        remaining -= sent
+        total_sent += sent
+
+    sys_close(file_fd)
+    return header_sent + total_sent
+
+
+# Helper to format an integer into a buffer, returns digits written
+pub fn format_int64(buf: *u8, buf_size: i32, value: i64) -> i32
+    if value == 0
+        *buf = '0'
+        return 1
+
+    var temp: [32]u8
+    var temp_pos: i32 = 31
+    var v: i64 = value
+
+    while v > 0
+        temp[temp_pos] = ((v % 10) + 48) as u8
+        temp_pos -= 1
+        v = v / 10
+
+    let digits: i32 = 31 - temp_pos
+    if digits > buf_size
+        return 0
+
+    for i in 0..digits
+        *(buf + i) = temp[temp_pos + 1 + i]
+
+    return digits
+
+
+# Serve a static file with Range and ETag support
+# fd: socket to write to
+# path: full filesystem path to file
+# range_hdr: Range header value (can be null)
+# range_len: Length of range header
+# if_none_match: If-None-Match header value (can be null)
+# if_none_match_len: Length of If-None-Match header
+# Returns: bytes sent on success, negative on error
+pub fn static_serve_file_full(fd: i32, path: *u8, range_hdr: *u8, range_len: i32, if_none_match: *u8, if_none_match_len: i32) -> i64
+    # Open the file
+    let file_fd: i32 = sys_open(path, O_RDONLY)
+    if file_fd < 0
+        return -1  # File not found or permission denied
+
+    # Get file size using fstat
+    var statbuf: Stat
+    if sys_fstat2(file_fd, @statbuf) != 0
+        sys_close(file_fd)
+        return -2
+
+    let file_size: i64 = statbuf.st_size
+
+    # Check if it's a regular file
+    if (statbuf.st_mode & S_IFMT) != S_IFREG
+        sys_close(file_fd)
+        return -3  # Not a regular file
+
+    # Generate ETag from file metadata
+    var etag_buf: [64]u8
+    let etag_len: i32 = generate_etag(@etag_buf[0], 64, @statbuf)
+
+    # Check If-None-Match for conditional request
+    if if_none_match != null && if_none_match_len > 0
+        if etag_matches(if_none_match, if_none_match_len, @etag_buf[0], etag_len) != 0
+            sys_close(file_fd)
+            # Return 304 Not Modified
+            return static_send_304(fd, @etag_buf[0], etag_len)
+
+    # Parse range if provided
+    var send_start: i64 = 0
+    var send_end: i64 = file_size - 1
+    var partial: i32 = 0
+
+    if range_hdr != null && range_len > 0
+        let range: RangeResult = parse_range(range_hdr, range_len, file_size)
+        if range.valid != 0
+            send_start = range.start
+            send_end = range.end
+            partial = 1
+
+    let content_len: i64 = send_end - send_start + 1
+
+    # Get MIME type
+    let path_len: i64 = strlen(path)
+    let mime: *u8 = mime_type_for_file(path, path_len as i32)
+
+    # Build HTTP response headers
+    var headers: [1024]u8
+    var pos: i32 = 0
+
+    # Status line
+    if partial != 0
+        # 206 Partial Content
+        let status = c"HTTP/1.1 206 Partial Content\r\n"
+        for i in 0..30
+            headers[pos] = *(status + i)
+            pos += 1
+    else
+        # 200 OK
+        let status = c"HTTP/1.1 200 OK\r\n"
+        for i in 0..17
+            headers[pos] = *(status + i)
+            pos += 1
+
+    # Content-Type header
+    let ct = c"Content-Type: "
+    for i in 0..14
+        headers[pos] = *(ct + i)
+        pos += 1
+
+    let mime_len: i64 = strlen(mime)
+    for i in 0..mime_len
+        headers[pos] = *(mime + i)
+        pos += 1
+
+    headers[pos] = '\r'
+    pos += 1
+    headers[pos] = '\n'
+    pos += 1
+
+    # Content-Length header
+    let cl = c"Content-Length: "
+    for i in 0..16
+        headers[pos] = *(cl + i)
+        pos += 1
+
+    pos += format_int64(@headers[0] + pos, 32, content_len)
+
+    headers[pos] = '\r'
+    pos += 1
+    headers[pos] = '\n'
+    pos += 1
+
+    # ETag header
+    let etag_hdr = c"ETag: "
+    for i in 0..6
+        headers[pos] = *(etag_hdr + i)
+        pos += 1
+    for i in 0..etag_len
+        headers[pos] = etag_buf[i]
+        pos += 1
+    headers[pos] = '\r'
+    pos += 1
+    headers[pos] = '\n'
+    pos += 1
+
+    # Content-Range header for partial content
+    if partial != 0
+        # "Content-Range: bytes start-end/total\r\n"
+        let cr = c"Content-Range: bytes "
+        for i in 0..21
+            headers[pos] = *(cr + i)
+            pos += 1
+
+        pos += format_int64(@headers[0] + pos, 32, send_start)
+
+        headers[pos] = '-'
+        pos += 1
+
+        pos += format_int64(@headers[0] + pos, 32, send_end)
+
+        headers[pos] = '/'
+        pos += 1
+
+        pos += format_int64(@headers[0] + pos, 32, file_size)
+
+        headers[pos] = '\r'
+        pos += 1
+        headers[pos] = '\n'
+        pos += 1
+
+    # Accept-Ranges header (always)
+    let ar = c"Accept-Ranges: bytes\r\n"
+    for i in 0..22
+        headers[pos] = *(ar + i)
+        pos += 1
+
+    # Connection header
+    let conn = c"Connection: keep-alive\r\n"
+    for i in 0..24
+        headers[pos] = *(conn + i)
+        pos += 1
+
+    # End of headers
+    headers[pos] = '\r'
+    pos += 1
+    headers[pos] = '\n'
+    pos += 1
+
+    # Send headers
+    let header_sent: i64 = sys_write(fd, @headers[0], pos as i64)
+    if header_sent < 0
+        sys_close(file_fd)
+        return header_sent
+
+    # Send file content using sendfile (zero-copy)
+    var offset: i64 = send_start
+    var remaining: i64 = content_len
+    var total_sent: i64 = 0
+
+    while remaining > 0
+        let sent: i64 = sys_sendfile(fd, file_fd, @offset, remaining)
+        if sent <= 0
+            if sent < 0
+                log_error(c"sendfile failed")
+            break
+        remaining -= sent
+        total_sent += sent
+
+    sys_close(file_fd)
+    return header_sent + total_sent
+
+
+# Send a 304 Not Modified response with ETag
+pub fn static_send_304(fd: i32, etag: *u8, etag_len: i32) -> i64
+    var resp: [256]u8
+    var pos: i32 = 0
+
+    # Status line and headers
+    let hdr = c"HTTP/1.1 304 Not Modified\r\nETag: "
+    for i in 0..33
+        resp[pos] = *(hdr + i)
+        pos += 1
+
+    # Copy ETag
+    for i in 0..etag_len
+        resp[pos] = *(etag + i)
+        pos += 1
+
+    # End headers (304 has no body)
+    let end = c"\r\nConnection: keep-alive\r\n\r\n"
+    for i in 0..28
+        resp[pos] = *(end + i)
+        pos += 1
+
+    return sys_write(fd, @resp[0], pos as i64)
+
+
+# Backward-compatible wrapper that calls full version
+pub fn static_serve_file_range(fd: i32, path: *u8, range_hdr: *u8, range_len: i32) -> i64
+    return static_serve_file_full(fd, path, range_hdr, range_len, null, 0)
+
+
+# Send a 416 Range Not Satisfiable response
+pub fn static_send_416(fd: i32, file_size: i64) -> i64
+    var resp: [256]u8
+    var pos: i32 = 0
+
+    # Status and headers
+    let hdr = c"HTTP/1.1 416 Range Not Satisfiable\r\nContent-Type: text/plain\r\nContent-Length: 22\r\nContent-Range: bytes */"
+    for i in 0..104
+        resp[pos] = *(hdr + i)
+        pos += 1
+
+    pos += format_int64(@resp[0] + pos, 32, file_size)
+
+    let end = c"\r\nConnection: close\r\n\r\nRange Not Satisfiable\n"
+    for i in 0..45
+        resp[pos] = *(end + i)
+        pos += 1
+
+    return sys_write(fd, @resp[0], pos as i64)
+
+
+# Send a 404 Not Found response
+# Response is 114 bytes total
+pub fn static_send_404(fd: i32) -> i64
+    let resp = c"HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: 14\r\nConnection: keep-alive\r\n\r\n404 Not Found\n"
+    return sys_write(fd, resp, 114)
+
+
+# Send a 403 Forbidden response
+# Response is 110 bytes total
+pub fn static_send_403(fd: i32) -> i64
+    let resp = c"HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: 14\r\nConnection: close\r\n\r\n403 Forbidden\n"
+    return sys_write(fd, resp, 110)
+
+
+# ============================================================================
+# Directory listing
+# ============================================================================
+
+# Check if path is a directory
+pub fn static_is_directory(path: *u8) -> i32
+    var statbuf: Stat
+    if sys_stat2(path, @statbuf) != 0
+        return 0
+    return ((statbuf.st_mode & S_IFMT) == S_IFDIR) as i32
+
+
+# Serve a directory listing as HTML
+# fd: socket to write to
+# path: full filesystem path to directory
+# url_path: URL path (for display and links)
+# Returns: bytes sent on success, negative on error
+pub fn static_serve_directory(fd: i32, path: *u8, url_path: *u8, url_path_len: i32) -> i64
+    # Open directory
+    let dir_fd: i32 = sys_open(path, O_RDONLY | O_DIRECTORY)
+    if dir_fd < 0
+        return -1
+
+    # Buffer for directory entries
+    var dirent_buf: [4096]u8
+
+    # Buffer for building HTML response (max 64KB)
+    let html_buf: *u8 = malloc(65536)
+    if html_buf == null
+        sys_close(dir_fd)
+        return -2
+    var html_pos: i64 = 0
+
+    # Start HTML document
+    let html_start = c"<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n<title>Index of "
+    let start_len: i64 = 69
+    memcpy(html_buf + html_pos, html_start, start_len)
+    html_pos += start_len
+
+    # Copy URL path for title
+    for i in 0..url_path_len
+        *(html_buf + html_pos) = *(url_path + i)
+        html_pos += 1
+
+    let html_head = c"</title>\n<style>body{font-family:monospace;margin:20px}a{text-decoration:none}a:hover{text-decoration:underline}li{margin:5px 0}</style>\n</head>\n<body>\n<h1>Index of "
+    let head_len: i64 = 165
+    memcpy(html_buf + html_pos, html_head, head_len)
+    html_pos += head_len
+
+    # Copy URL path for heading
+    for i in 0..url_path_len
+        *(html_buf + html_pos) = *(url_path + i)
+        html_pos += 1
+
+    let list_start = c"</h1>\n<ul>\n"
+    memcpy(html_buf + html_pos, list_start, 11)
+    html_pos += 11
+
+    # Add parent directory link if not at root
+    if url_path_len > 1
+        let parent = c"<li><a href=\"..\">..</a> (parent directory)</li>\n"
+        memcpy(html_buf + html_pos, parent, 48)
+        html_pos += 48
+
+    # Read and list directory entries
+    var bytes_read: i64 = sys_getdents64(dir_fd, @dirent_buf[0], 4096)
+    while bytes_read > 0
+        var offset: i64 = 0
+        while offset < bytes_read
+            let entry: *u8 = @dirent_buf[0] + offset
+            let reclen: i32 = dirent_get_reclen(entry)
+            let d_type: u8 = dirent_get_type(entry)
+            let name: *u8 = dirent_get_name(entry)
+            let name_len: i64 = strlen(name)
+
+            # Skip . and ..
+            if !(name_len == 1 && *name == '.') && !(name_len == 2 && *name == '.' && *(name + 1) == '.')
+                # Check buffer space (need ~200 bytes per entry max)
+                if html_pos + 200 + name_len * 2 > 65000
+                    break
+
+                # <li><a href="
+                let li_start = c"<li><a href=\""
+                memcpy(html_buf + html_pos, li_start, 13)
+                html_pos += 13
+
+                # Copy filename (URL-safe chars only for now)
+                for i in 0..name_len
+                    *(html_buf + html_pos) = *(name + i)
+                    html_pos += 1
+
+                # Add trailing slash for directories
+                if d_type == DT_DIR
+                    *(html_buf + html_pos) = '/'
+                    html_pos += 1
+
+                # ">
+                *(html_buf + html_pos) = '"'
+                html_pos += 1
+                *(html_buf + html_pos) = '>'
+                html_pos += 1
+
+                # Copy filename again for display
+                for i in 0..name_len
+                    *(html_buf + html_pos) = *(name + i)
+                    html_pos += 1
+
+                # Add / suffix for directories in display
+                if d_type == DT_DIR
+                    *(html_buf + html_pos) = '/'
+                    html_pos += 1
+
+                # </a></li>\n
+                let li_end = c"</a></li>\n"
+                memcpy(html_buf + html_pos, li_end, 10)
+                html_pos += 10
+
+            offset += reclen as i64
+
+        bytes_read = sys_getdents64(dir_fd, @dirent_buf[0], 4096)
+
+    sys_close(dir_fd)
+
+    # End HTML document (61 bytes including trailing newline)
+    let html_end = c"</ul>\n<hr>\n<p><em>Valet HTTP Server</em></p>\n</body>\n</html>\n"
+    let end_len: i64 = 61
+    memcpy(html_buf + html_pos, html_end, end_len)
+    html_pos += end_len
+
+    # Build HTTP response headers
+    var headers: [256]u8
+    var hpos: i32 = 0
+
+    # Status line
+    let status = c"HTTP/1.1 200 OK\r\n"
+    for i in 0..17
+        headers[hpos] = *(status + i)
+        hpos += 1
+
+    # Content-Type
+    let ct = c"Content-Type: text/html; charset=utf-8\r\n"
+    for i in 0..40
+        headers[hpos] = *(ct + i)
+        hpos += 1
+
+    # Content-Length
+    let cl = c"Content-Length: "
+    for i in 0..16
+        headers[hpos] = *(cl + i)
+        hpos += 1
+
+    # Format content length
+    var size_buf: [32]u8
+    var size_pos: i32 = 31
+    var sz: i64 = html_pos
+    if sz == 0
+        size_buf[size_pos] = '0'
+        size_pos -= 1
+    else
+        while sz > 0
+            size_buf[size_pos] = ((sz % 10) + 48) as u8
+            size_pos -= 1
+            sz = sz / 10
+    let size_digits: i32 = 31 - size_pos
+    for i in 0..size_digits
+        headers[hpos] = size_buf[size_pos + 1 + i]
+        hpos += 1
+
+    # CRLF after Content-Length
+    headers[hpos] = '\r'
+    hpos += 1
+    headers[hpos] = '\n'
+    hpos += 1
+
+    # Connection header
+    let conn = c"Connection: keep-alive\r\n"
+    for i in 0..24
+        headers[hpos] = *(conn + i)
+        hpos += 1
+
+    # End of headers
+    headers[hpos] = '\r'
+    hpos += 1
+    headers[hpos] = '\n'
+    hpos += 1
+
+    # Send headers
+    let header_sent: i64 = sys_write(fd, @headers[0], hpos as i64)
+    if header_sent < 0
+        free(html_buf)
+        return header_sent
+
+    # Send body
+    let body_sent: i64 = sys_write(fd, html_buf, html_pos)
+    free(html_buf)
+
+    return header_sent + body_sent

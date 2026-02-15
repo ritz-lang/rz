@@ -1,0 +1,300 @@
+# test/run_tests.ritz - Simple test runner for Tome
+#
+# Runs all test functions and reports results.
+#
+# Updated to use _cstr wrapper functions for C string compatibility.
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+import lib.tome
+import lib.resp
+import lib.commands
+import lib.server
+
+fn run_test(name: *u8, result: i32, passed: *i32, failed: *i32)
+    prints("  ")
+    prints_cstr(name)
+    if result == 0
+        prints(" ... OK\n")
+        *passed += 1
+    else
+        prints(" ... FAIL (code ")
+        print_int(result as i64)
+        prints(")\n")
+        *failed += 1
+
+# ============================================================================
+# Basic Store Tests (inline)
+# ============================================================================
+
+fn test_basic_set_get() -> i32
+    var store: Store = store_new()
+    store_set_cstr(@store, c"hello", c"world")
+    let val: *u8 = store_get_cstr(@store, c"hello")
+    if val == null
+        return 1
+    if strcmp(val, c"world") != 0
+        return 2
+    return 0
+
+fn test_basic_del() -> i32
+    var store: Store = store_new()
+    store_set_cstr(@store, c"key", c"value")
+    if store_exists_cstr(@store, c"key") != 1
+        return 1
+    let deleted: i32 = store_del_cstr(@store, c"key")
+    if deleted != 1
+        return 2
+    if store_exists_cstr(@store, c"key") != 0
+        return 3
+    return 0
+
+fn test_basic_list() -> i32
+    var store: Store = store_new()
+    store_lpush_cstr(@store, c"mylist", c"a")
+    store_rpush_cstr(@store, c"mylist", c"b")
+    store_lpush_cstr(@store, c"mylist", c"c")
+    # List is now: c, a, b
+    if store_llen_cstr(@store, c"mylist") != 3
+        return 1
+    let first: String = store_lpop_cstr(@store, c"mylist")
+    if strcmp(string_as_ptr(@first), c"c") != 0
+        return 2
+    return 0
+
+fn test_basic_set() -> i32
+    var store: Store = store_new()
+    store_sadd_cstr(@store, c"myset", c"a")
+    store_sadd_cstr(@store, c"myset", c"b")
+    store_sadd_cstr(@store, c"myset", c"a")  # Duplicate
+    if store_scard_cstr(@store, c"myset") != 2
+        return 1
+    if store_sismember_cstr(@store, c"myset", c"a") != 1
+        return 2
+    if store_sismember_cstr(@store, c"myset", c"c") != 0
+        return 3
+    return 0
+
+fn test_basic_hash() -> i32
+    var store: Store = store_new()
+    store_hset_cstr(@store, c"myhash", c"field1", c"value1")
+    store_hset_cstr(@store, c"myhash", c"field2", c"value2")
+    let val: *u8 = store_hget_cstr(@store, c"myhash", c"field1")
+    if val == null
+        return 1
+    if strcmp(val, c"value1") != 0
+        return 2
+    if store_hlen_cstr(@store, c"myhash") != 2
+        return 3
+    return 0
+
+# ============================================================================
+# Authentication Tests (Phase 10)
+# ============================================================================
+
+fn test_conn_state_init() -> i32
+    var state: ConnectionState
+    conn_state_init(@state)
+    # Should start unauthenticated
+    if state.is_authenticated != 0
+        return 1
+    return 0
+
+fn test_conn_state_authenticate() -> i32
+    var state: ConnectionState
+    conn_state_init(@state)
+    state.is_authenticated = 1
+    if state.is_authenticated != 1
+        return 1
+    return 0
+
+fn test_no_password_allows_all() -> i32
+    # When password is null, all commands should work
+    var store: Store = store_new()
+    var buf: [8192]u8
+
+    var ctx: CommandContext
+    cmd_ctx_init_auth(@ctx, @store, @buf[0], 8192, null, 0)
+
+    # Parse and execute SET (which requires auth when password is set)
+    var parser: RespParser
+    resp_parser_init(@parser, c"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n", 33)
+    let parse_result: i32 = resp_parse(@parser)
+    if parse_result != RESP_OK
+        return 1
+
+    cmd_dispatch(@ctx, @parser.command)
+    buf[ctx.resp_len] = 0
+
+    # Should return OK (not NOAUTH error)
+    if strcmp(@buf[0], c"+OK\r\n") != 0
+        return 2
+
+    return 0
+
+fn test_password_blocks_before_auth() -> i32
+    var store: Store = store_new()
+    var buf: [8192]u8
+
+    # Password set, not authenticated
+    var ctx: CommandContext
+    cmd_ctx_init_auth(@ctx, @store, @buf[0], 8192, c"secret123", 0)
+
+    # Parse and execute SET
+    var parser: RespParser
+    resp_parser_init(@parser, c"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n", 33)
+    let parse_result: i32 = resp_parse(@parser)
+    if parse_result != RESP_OK
+        return 1
+
+    cmd_dispatch(@ctx, @parser.command)
+    buf[ctx.resp_len] = 0
+
+    # Should return error (starts with -)
+    if buf[0] != 45  # '-'
+        return 2
+
+    return 0
+
+fn test_password_allows_after_auth() -> i32
+    var store: Store = store_new()
+    var buf: [8192]u8
+
+    # Password set, IS authenticated
+    var ctx: CommandContext
+    cmd_ctx_init_auth(@ctx, @store, @buf[0], 8192, c"secret123", 1)
+
+    # Parse and execute SET
+    var parser: RespParser
+    resp_parser_init(@parser, c"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n", 33)
+    let parse_result: i32 = resp_parse(@parser)
+    if parse_result != RESP_OK
+        return 1
+
+    cmd_dispatch(@ctx, @parser.command)
+    buf[ctx.resp_len] = 0
+
+    # Should return OK
+    if strcmp(@buf[0], c"+OK\r\n") != 0
+        return 2
+
+    return 0
+
+fn test_auth_command_sets_flag() -> i32
+    var store: Store = store_new()
+    var buf: [8192]u8
+
+    # Password set, not authenticated
+    var ctx: CommandContext
+    cmd_ctx_init_auth(@ctx, @store, @buf[0], 8192, c"secret123", 0)
+
+    # Verify initially not authenticated
+    if ctx.is_authenticated != 0
+        return 1
+
+    # Execute AUTH with correct password
+    var parser: RespParser
+    resp_parser_init(@parser, c"*2\r\n$4\r\nAUTH\r\n$9\r\nsecret123\r\n", 32)
+    let parse_result: i32 = resp_parse(@parser)
+    if parse_result != RESP_OK
+        return 2
+
+    cmd_dispatch(@ctx, @parser.command)
+    buf[ctx.resp_len] = 0
+
+    # Should return OK
+    if strcmp(@buf[0], c"+OK\r\n") != 0
+        return 3
+
+    # Flag should now be set
+    if ctx.is_authenticated != 1
+        return 4
+
+    return 0
+
+fn test_auth_wrong_password() -> i32
+    var store: Store = store_new()
+    var buf: [8192]u8
+
+    var ctx: CommandContext
+    cmd_ctx_init_auth(@ctx, @store, @buf[0], 8192, c"secret123", 0)
+
+    # Execute AUTH with wrong password
+    var parser: RespParser
+    resp_parser_init(@parser, c"*2\r\n$4\r\nAUTH\r\n$5\r\nwrong\r\n", 28)
+    let parse_result: i32 = resp_parse(@parser)
+    if parse_result != RESP_OK
+        return 1
+
+    cmd_dispatch(@ctx, @parser.command)
+    buf[ctx.resp_len] = 0
+
+    # Should return error
+    if buf[0] != 45  # '-'
+        return 2
+
+    # Should still be unauthenticated
+    if ctx.is_authenticated != 0
+        return 3
+
+    return 0
+
+fn test_ping_always_allowed() -> i32
+    var store: Store = store_new()
+    var buf: [8192]u8
+
+    # Password set, NOT authenticated
+    var ctx: CommandContext
+    cmd_ctx_init_auth(@ctx, @store, @buf[0], 8192, c"secret123", 0)
+
+    # PING should work even without auth (like Redis)
+    var parser: RespParser
+    resp_parser_init(@parser, c"*1\r\n$4\r\nPING\r\n", 14)
+    let parse_result: i32 = resp_parse(@parser)
+    if parse_result != RESP_OK
+        return 1
+
+    cmd_dispatch(@ctx, @parser.command)
+    buf[ctx.resp_len] = 0
+
+    # Should return PONG
+    if strcmp(@buf[0], c"+PONG\r\n") != 0
+        return 2
+
+    return 0
+
+pub fn main() -> i32
+    var passed: i32 = 0
+    var failed: i32 = 0
+
+    prints("=================================\n")
+    prints("  Tome Test Suite (RERITZ)\n")
+    prints("=================================\n\n")
+
+    prints("--- Store Tests ---\n")
+    run_test(c"test_basic_set_get", test_basic_set_get(), @passed, @failed)
+    run_test(c"test_basic_del", test_basic_del(), @passed, @failed)
+    run_test(c"test_basic_list", test_basic_list(), @passed, @failed)
+    run_test(c"test_basic_set", test_basic_set(), @passed, @failed)
+    run_test(c"test_basic_hash", test_basic_hash(), @passed, @failed)
+
+    prints("\n--- Auth Tests (Phase 10) ---\n")
+    run_test(c"test_conn_state_init", test_conn_state_init(), @passed, @failed)
+    run_test(c"test_conn_state_authenticate", test_conn_state_authenticate(), @passed, @failed)
+    run_test(c"test_no_password_allows_all", test_no_password_allows_all(), @passed, @failed)
+    run_test(c"test_password_blocks_before_auth", test_password_blocks_before_auth(), @passed, @failed)
+    run_test(c"test_password_allows_after_auth", test_password_allows_after_auth(), @passed, @failed)
+    run_test(c"test_auth_command_sets_flag", test_auth_command_sets_flag(), @passed, @failed)
+    run_test(c"test_auth_wrong_password", test_auth_wrong_password(), @passed, @failed)
+    run_test(c"test_ping_always_allowed", test_ping_always_allowed(), @passed, @failed)
+
+    prints("\n=================================\n")
+    prints("  Results: ")
+    print_int(passed as i64)
+    prints(" passed, ")
+    print_int(failed as i64)
+    prints(" failed\n")
+    prints("=================================\n")
+
+    return failed

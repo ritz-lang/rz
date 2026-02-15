@@ -1,0 +1,449 @@
+# valet/lib/config.ritz - Configuration file parsing
+#
+# Loads and parses JSON configuration files for Valet.
+# Supports runtime reloading via SIGHUP signal.
+#
+# Signal handling: Uses a global flag set by signal handler.
+# The main event loop should periodically check config_should_reload()
+# and call config_reload() when true.
+#
+# Config file format (valet.json):
+# {
+#   "server": {
+#     "port": 8080,
+#     "workers": 4,
+#     "multishot": true,
+#     "backlog": 1024
+#   },
+#   "limits": {
+#     "max_connections": 10000,
+#     "max_request_size": 1048576,
+#     "keepalive_requests": 100,
+#     "idle_timeout": 60
+#   },
+#   "static": {
+#     "prefix": "/static/",
+#     "root": "./public"
+#   },
+#   "tls": {
+#     "enabled": false,
+#     "cert": "/etc/valet/cert.pem",
+#     "key": "/etc/valet/key.pem"
+#   }
+# }
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+import ritzlib.memory
+import ritzlib.json
+
+# ============================================================================
+# Configuration struct
+# ============================================================================
+
+struct ValetConfig
+    # Server settings
+    port: i32
+    workers: i32
+    multishot: i32           # 0 or 1
+    use_send_zc: i32         # 0 or 1 - zero-copy send (kernel 6.0+)
+    backlog: i32
+
+    # Connection limits
+    max_connections: i32
+    max_request_size: i32
+    keepalive_requests: i32
+    idle_timeout: i32        # seconds
+
+    # Static file serving
+    static_enabled: i32      # 0 or 1
+    static_prefix: [256]u8   # URL prefix (e.g., "/static/")
+    static_root: [256]u8     # Filesystem path
+
+    # TLS settings (for future use)
+    tls_enabled: i32         # 0 or 1
+    tls_cert: [256]u8        # Certificate path
+    tls_key: [256]u8         # Private key path
+
+    # Config file path (for reload)
+    config_path: [256]u8
+
+
+# ============================================================================
+# Default configuration
+# ============================================================================
+
+pub fn config_default(cfg: *ValetConfig)
+    # Server defaults
+    cfg.port = 8080
+    cfg.workers = 1
+    cfg.multishot = 0
+    cfg.use_send_zc = 0
+    cfg.backlog = 1024
+
+    # Limit defaults
+    cfg.max_connections = 10000
+    cfg.max_request_size = 1048576   # 1MB
+    cfg.keepalive_requests = 100
+    cfg.idle_timeout = 60
+
+    # Static serving disabled by default
+    cfg.static_enabled = 0
+    cfg.static_prefix[0] = 0
+    cfg.static_root[0] = 0
+
+    # TLS disabled by default
+    cfg.tls_enabled = 0
+    cfg.tls_cert[0] = 0
+    cfg.tls_key[0] = 0
+
+    # No config file path
+    cfg.config_path[0] = 0
+
+
+# ============================================================================
+# JSON parsing helpers
+# ============================================================================
+
+# Copy a JSON string value into a fixed-size buffer
+pub fn config_copy_string(dst: *u8, max_len: i32, json_val: *JsonValue) -> i32
+    if json_val == null
+        return 0
+    if json_val.kind != JSON_STRING
+        return 0
+    if json_val.str_val == null
+        return 0
+
+    let src_len: i64 = json_val.str_len
+    var copy_len: i64 = src_len
+    if copy_len >= max_len as i64
+        copy_len = (max_len - 1) as i64
+
+    memcpy(dst, json_val.str_val, copy_len)
+    *(dst + copy_len) = 0
+    return 1
+
+
+# Get an integer from a JSON value with a default
+pub fn config_get_int(json_val: *JsonValue, default_val: i32) -> i32
+    if json_val == null
+        return default_val
+    if json_val.kind != JSON_NUMBER
+        return default_val
+    return json_val.num_val as i32
+
+
+# Get a boolean from a JSON value with a default
+pub fn config_get_bool(json_val: *JsonValue, default_val: i32) -> i32
+    if json_val == null
+        return default_val
+    if json_val.kind != JSON_BOOL
+        return default_val
+    return json_val.bool_val
+
+
+# ============================================================================
+# Configuration parsing
+# ============================================================================
+
+# Parse server section
+pub fn config_parse_server(cfg: *ValetConfig, server_obj: *JsonValue)
+    if server_obj == null
+        return
+    if server_obj.kind != JSON_OBJECT
+        return
+
+    cfg.port = config_get_int(json_get_field(server_obj, c"port"), cfg.port)
+    cfg.workers = config_get_int(json_get_field(server_obj, c"workers"), cfg.workers)
+    cfg.multishot = config_get_bool(json_get_field(server_obj, c"multishot"), cfg.multishot)
+    cfg.use_send_zc = config_get_bool(json_get_field(server_obj, c"use_send_zc"), cfg.use_send_zc)
+    cfg.backlog = config_get_int(json_get_field(server_obj, c"backlog"), cfg.backlog)
+
+
+# Parse limits section
+pub fn config_parse_limits(cfg: *ValetConfig, limits_obj: *JsonValue)
+    if limits_obj == null
+        return
+    if limits_obj.kind != JSON_OBJECT
+        return
+
+    cfg.max_connections = config_get_int(json_get_field(limits_obj, c"max_connections"), cfg.max_connections)
+    cfg.max_request_size = config_get_int(json_get_field(limits_obj, c"max_request_size"), cfg.max_request_size)
+    cfg.keepalive_requests = config_get_int(json_get_field(limits_obj, c"keepalive_requests"), cfg.keepalive_requests)
+    cfg.idle_timeout = config_get_int(json_get_field(limits_obj, c"idle_timeout"), cfg.idle_timeout)
+
+
+# Parse static section
+pub fn config_parse_static(cfg: *ValetConfig, static_obj: *JsonValue)
+    if static_obj == null
+        return
+    if static_obj.kind != JSON_OBJECT
+        return
+
+    let prefix_val: *JsonValue = json_get_field(static_obj, c"prefix")
+    let root_val: *JsonValue = json_get_field(static_obj, c"root")
+
+    if config_copy_string(@cfg.static_prefix[0], 256, prefix_val) != 0
+        if config_copy_string(@cfg.static_root[0], 256, root_val) != 0
+            cfg.static_enabled = 1
+
+
+# Parse TLS section
+pub fn config_parse_tls(cfg: *ValetConfig, tls_obj: *JsonValue)
+    if tls_obj == null
+        return
+    if tls_obj.kind != JSON_OBJECT
+        return
+
+    cfg.tls_enabled = config_get_bool(json_get_field(tls_obj, c"enabled"), cfg.tls_enabled)
+
+    if cfg.tls_enabled != 0
+        config_copy_string(@cfg.tls_cert[0], 256, json_get_field(tls_obj, c"cert"))
+        config_copy_string(@cfg.tls_key[0], 256, json_get_field(tls_obj, c"key"))
+
+
+# ============================================================================
+# Main config loading
+# ============================================================================
+
+# Parse a JSON string into config
+# Returns 0 on success, negative on error
+pub fn config_parse_json(cfg: *ValetConfig, json_str: *u8, json_len: i64) -> i32
+    let result: JsonResult = json_parse(json_str, json_len)
+    if result.ok == 0
+        eprints("config: JSON parse error at position ")
+        print_int(result.error_pos)
+        eprints("\n")
+        return -1
+
+    let root: *JsonValue = result.value
+    if root.kind != JSON_OBJECT
+        eprints("config: root must be an object\n")
+        json_free(root)
+        return -2
+
+    # Parse each section
+    config_parse_server(cfg, json_get_field(root, c"server"))
+    config_parse_limits(cfg, json_get_field(root, c"limits"))
+    config_parse_static(cfg, json_get_field(root, c"static"))
+    config_parse_tls(cfg, json_get_field(root, c"tls"))
+
+    json_free(root)
+    return 0
+
+
+# Load config from a file
+# Returns 0 on success, negative on error
+pub fn config_load(cfg: *ValetConfig, path: *u8) -> i32
+    # Open file
+    let fd: i32 = sys_open(path, O_RDONLY)
+    if fd < 0
+        eprints("config: cannot open ")
+        eprints_cstr(path)
+        eprints("\n")
+        return -1
+
+    # Get file size
+    var statbuf: [144]u8
+    if sys_fstat(fd, @statbuf[0]) != 0
+        sys_close(fd)
+        eprints("config: cannot stat ")
+        eprints_cstr(path)
+        eprints("\n")
+        return -2
+
+    # Read file size from stat buffer (offset 48 = st_size)
+    let size: i64 = *((@statbuf[0] + 48) as *i64)
+
+    if size > 65536
+        sys_close(fd)
+        eprints("config: file too large (max 64KB)\n")
+        return -3
+
+    # Allocate buffer
+    let buf: *u8 = malloc(size + 1)
+    if buf == null
+        sys_close(fd)
+        eprints("config: out of memory\n")
+        return -4
+
+    # Read file contents
+    let bytes_read: i64 = sys_read(fd, buf, size)
+    sys_close(fd)
+
+    if bytes_read != size
+        free(buf)
+        eprints("config: read error\n")
+        return -5
+
+    *(buf + size) = 0  # null terminate
+
+    # Store config path for reload
+    let path_len: i64 = strlen(path)
+    if path_len < 256
+        memcpy(@cfg.config_path[0], path, path_len + 1)
+
+    # Parse JSON
+    let ret: i32 = config_parse_json(cfg, buf, size)
+    free(buf)
+
+    return ret
+
+
+# Reload configuration from stored path
+# Returns 0 on success, negative on error
+pub fn config_reload(cfg: *ValetConfig) -> i32
+    if cfg.config_path[0] == 0
+        eprints("config: no config file path stored\n")
+        return -1
+
+    # Create temporary config to parse into
+    var new_cfg: ValetConfig
+    config_default(@new_cfg)
+
+    let ret: i32 = config_load(@new_cfg, @cfg.config_path[0])
+    if ret < 0
+        eprints("config: reload failed, keeping current config\n")
+        return ret
+
+    # Copy new values to existing config
+    # Note: Some settings (port, workers) may require restart
+    cfg.port = new_cfg.port
+    cfg.workers = new_cfg.workers
+    cfg.multishot = new_cfg.multishot
+    cfg.use_send_zc = new_cfg.use_send_zc
+    cfg.backlog = new_cfg.backlog
+    cfg.max_connections = new_cfg.max_connections
+    cfg.max_request_size = new_cfg.max_request_size
+    cfg.keepalive_requests = new_cfg.keepalive_requests
+    cfg.idle_timeout = new_cfg.idle_timeout
+    cfg.static_enabled = new_cfg.static_enabled
+    memcpy(@cfg.static_prefix[0], @new_cfg.static_prefix[0], 256)
+    memcpy(@cfg.static_root[0], @new_cfg.static_root[0], 256)
+    cfg.tls_enabled = new_cfg.tls_enabled
+    memcpy(@cfg.tls_cert[0], @new_cfg.tls_cert[0], 256)
+    memcpy(@cfg.tls_key[0], @new_cfg.tls_key[0], 256)
+
+    prints("config: reloaded successfully\n")
+    return 0
+
+
+# ============================================================================
+# Debug output
+# ============================================================================
+
+pub fn config_print(cfg: *ValetConfig)
+    prints("Configuration:\n")
+    prints("  Server:\n")
+    prints("    port: ")
+    print_int(cfg.port as i64)
+    prints("\n")
+    prints("    workers: ")
+    print_int(cfg.workers as i64)
+    prints("\n")
+    prints("    multishot: ")
+    if cfg.multishot != 0
+        prints("true\n")
+    else
+        prints("false\n")
+    prints("    use_send_zc: ")
+    if cfg.use_send_zc != 0
+        prints("true\n")
+    else
+        prints("false\n")
+    prints("    backlog: ")
+    print_int(cfg.backlog as i64)
+    prints("\n")
+
+    prints("  Limits:\n")
+    prints("    max_connections: ")
+    print_int(cfg.max_connections as i64)
+    prints("\n")
+    prints("    max_request_size: ")
+    print_int(cfg.max_request_size as i64)
+    prints("\n")
+    prints("    keepalive_requests: ")
+    print_int(cfg.keepalive_requests as i64)
+    prints("\n")
+    prints("    idle_timeout: ")
+    print_int(cfg.idle_timeout as i64)
+    prints("s\n")
+
+    if cfg.static_enabled != 0
+        prints("  Static:\n")
+        prints("    prefix: ")
+        prints_cstr(@cfg.static_prefix[0])
+        prints("\n")
+        prints("    root: ")
+        prints_cstr(@cfg.static_root[0])
+        prints("\n")
+
+    if cfg.tls_enabled != 0
+        prints("  TLS:\n")
+        prints("    cert: ")
+        prints_cstr(@cfg.tls_cert[0])
+        prints("\n")
+        prints("    key: ")
+        prints_cstr(@cfg.tls_key[0])
+        prints("\n")
+
+
+# ============================================================================
+# Signal handling for reload
+# ============================================================================
+
+# Global reload flag (set by signal handler, cleared after reload)
+# Note: Using i32 instead of bool for atomic operations
+var g_reload_flag: i32 = 0
+
+# Global shutdown flag for graceful termination
+var g_shutdown_flag: i32 = 0
+
+
+# Check if reload has been requested
+pub fn config_should_reload() -> i32
+    return g_reload_flag
+
+
+# Clear the reload flag (call after successful reload)
+pub fn config_clear_reload_flag()
+    g_reload_flag = 0
+
+
+# Request a config reload (can be called from signal handler or elsewhere)
+pub fn config_request_reload()
+    g_reload_flag = 1
+
+
+# Check if shutdown has been requested
+pub fn config_should_shutdown() -> i32
+    return g_shutdown_flag
+
+
+# Request graceful shutdown
+pub fn config_request_shutdown()
+    g_shutdown_flag = 1
+
+
+# Setup signal handlers for SIGHUP (reload) and SIGTERM/SIGINT (shutdown)
+# Note: This uses a simple polling approach since Ritz doesn't have
+# proper signal handler support with restorer yet.
+#
+# For now, we'll use signalfd or a self-pipe trick in the event loop,
+# or the user can send SIGUSR1 which we can catch more easily.
+#
+# Returns 0 on success, negative on error
+pub fn config_setup_signals() -> i32
+    # Ignore SIGPIPE (common for network servers)
+    let ret: i32 = signal_ignore(SIGPIPE)
+    if ret < 0
+        return ret
+
+    # For SIGHUP/SIGTERM, we'd need proper signal handler setup
+    # which requires assembly for the restorer trampoline.
+    # For now, document that users should use:
+    #   kill -USR1 <pid>  to trigger reload check
+    #   kill -TERM <pid>  for graceful shutdown
+
+    return 0

@@ -1,0 +1,310 @@
+# lib/worksteal.ritz - Work stealing for load balancing
+#
+# Implements a work-stealing deque (Chase-Lev style) for each worker.
+# - Owner pushes/pops from bottom (LIFO for cache locality)
+# - Thieves steal from top (FIFO for fairness)
+#
+# This enables idle workers to help busy workers by stealing
+# pending requests from their queues.
+#
+# Architecture:
+#   StealPool
+#     ├── WorkDeque[0] ── Worker 0's private deque
+#     ├── WorkDeque[1] ── Worker 1's private deque
+#     └── WorkDeque[N] ── Worker N's private deque
+#
+# Note: This implementation is single-threaded safe but not fully
+# lock-free for simplicity. In a real multi-process scenario,
+# you'd need atomic CAS operations on shared memory.
+
+import ritzlib.sys
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+pub const WORK_STEAL_SUCCESS: i32 = 0
+pub const WORK_STEAL_EMPTY: i32 = -1
+pub const WORK_STEAL_ABORT: i32 = -2
+pub const WORK_STEAL_FULL: i32 = -3
+
+# ============================================================================
+# Work Item
+# ============================================================================
+# Represents a unit of work that can be stolen.
+
+pub struct WorkItem
+    request_id: u64     # 0: Request ID
+    worker_slot: i32    # 8: Original worker slot
+    priority: i32       # 12: Priority (higher = more important)
+    arena_offset: u64   # 16: Offset to request data in arena
+    timestamp: i64      # 24: When work was enqueued
+
+# Size of WorkItem
+pub fn work_item_size() -> i64
+    return 32
+
+# ============================================================================
+# Work Deque
+# ============================================================================
+# Double-ended queue for a single worker.
+
+pub struct WorkDeque
+    items: *WorkItem    # 0: Array of work items
+    capacity: i32       # 8: Size of array (power of 2)
+    mask: i32           # 12: capacity - 1 for fast modulo
+    top: i64            # 16: Index for stealing (grows up)
+    bottom: i64         # 24: Index for push/pop (grows up)
+
+# Initialize a work deque
+pub fn work_deque_init(deque: *WorkDeque, capacity: i32) -> i32
+    # Round up to power of 2
+    var cap: i32 = capacity
+    if cap < 4
+        cap = 4
+    cap = next_power_of_2_ws(cap)
+
+    # Allocate items array
+    let size: i64 = (cap as i64) * work_item_size()
+    let prot: i32 = PROT_READ + PROT_WRITE
+    let flags: i32 = MAP_PRIVATE + MAP_ANONYMOUS
+    let items: *WorkItem = sys_mmap(0, size, prot, flags, -1, 0) as *WorkItem
+    if items == (-1) as *WorkItem
+        return -1
+
+    deque.items = items
+    deque.capacity = cap
+    deque.mask = cap - 1
+    deque.top = 0
+    deque.bottom = 0
+
+    return 0
+
+# Destroy a work deque
+pub fn work_deque_destroy(deque: *WorkDeque)
+    if deque.items != null
+        let size: i64 = (deque.capacity as i64) * work_item_size()
+        sys_munmap(deque.items as *u8, size)
+        deque.items = null
+
+# Check if deque is empty
+pub fn work_deque_empty(deque: *WorkDeque) -> i32
+    if deque.bottom <= deque.top
+        return 1
+    return 0
+
+# Get number of items in deque
+pub fn work_deque_count(deque: *WorkDeque) -> i64
+    let count: i64 = deque.bottom - deque.top
+    if count < 0
+        return 0
+    return count
+
+# Helper: round up to next power of 2
+fn next_power_of_2_ws(n: i32) -> i32
+    var v: i32 = n - 1
+    v = v | (v >> 1)
+    v = v | (v >> 2)
+    v = v | (v >> 4)
+    v = v | (v >> 8)
+    v = v | (v >> 16)
+    return v + 1
+
+# ============================================================================
+# Owner Operations (Push/Pop from bottom)
+# ============================================================================
+
+# Push a work item (owner only)
+pub fn work_deque_push(deque: *WorkDeque, item: *WorkItem) -> i32
+    let b: i64 = deque.bottom
+    let t: i64 = deque.top
+
+    # Check if full
+    if (b - t) >= (deque.capacity as i64)
+        return WORK_STEAL_FULL
+
+    # Calculate slot index
+    let idx: i32 = (b & (deque.mask as i64)) as i32
+    let slot: *WorkItem = deque.items + idx
+
+    # Copy item
+    slot.request_id = item.request_id
+    slot.worker_slot = item.worker_slot
+    slot.priority = item.priority
+    slot.arena_offset = item.arena_offset
+    slot.timestamp = item.timestamp
+
+    # Increment bottom
+    deque.bottom = b + 1
+
+    return WORK_STEAL_SUCCESS
+
+# Pop a work item (owner only, LIFO)
+pub fn work_deque_pop(deque: *WorkDeque, item: *WorkItem) -> i32
+    let b: i64 = deque.bottom - 1
+    deque.bottom = b
+
+    let t: i64 = deque.top
+
+    if t > b
+        # Deque was empty
+        deque.bottom = t  # Reset
+        return WORK_STEAL_EMPTY
+
+    # Calculate slot index
+    let idx: i32 = (b & (deque.mask as i64)) as i32
+    let slot: *WorkItem = deque.items + idx
+
+    # Copy item out
+    item.request_id = slot.request_id
+    item.worker_slot = slot.worker_slot
+    item.priority = slot.priority
+    item.arena_offset = slot.arena_offset
+    item.timestamp = slot.timestamp
+
+    if t == b
+        # This was the last item, race with stealers
+        # In a real implementation, use CAS here
+        deque.bottom = t + 1
+        deque.top = t + 1
+
+    return WORK_STEAL_SUCCESS
+
+# ============================================================================
+# Thief Operations (Steal from top)
+# ============================================================================
+
+# Steal a work item (thief, FIFO)
+pub fn work_deque_steal(deque: *WorkDeque, item: *WorkItem) -> i32
+    let t: i64 = deque.top
+    let b: i64 = deque.bottom
+
+    if t >= b
+        # Deque is empty
+        return WORK_STEAL_EMPTY
+
+    # Calculate slot index
+    let idx: i32 = (t & (deque.mask as i64)) as i32
+    let slot: *WorkItem = deque.items + idx
+
+    # Copy item out
+    item.request_id = slot.request_id
+    item.worker_slot = slot.worker_slot
+    item.priority = slot.priority
+    item.arena_offset = slot.arena_offset
+    item.timestamp = slot.timestamp
+
+    # In a real implementation, use CAS to increment top
+    # For now, just increment (single-threaded safe)
+    deque.top = t + 1
+
+    return WORK_STEAL_SUCCESS
+
+# ============================================================================
+# Steal Pool
+# ============================================================================
+# Manages work deques for multiple workers.
+
+pub struct StealPool
+    deques: *WorkDeque  # 0: Array of work deques
+    worker_count: i32   # 8: Number of workers
+    _pad: i32           # 12: Reserved
+
+# Initialize steal pool
+pub fn steal_pool_init(pool: *StealPool, worker_count: i32, deque_capacity: i32) -> i32
+    # Allocate deques array
+    let deque_size: i64 = 32  # sizeof(WorkDeque)
+    let size: i64 = (worker_count as i64) * deque_size
+    let prot: i32 = PROT_READ + PROT_WRITE
+    let flags: i32 = MAP_PRIVATE + MAP_ANONYMOUS
+    let deques: *WorkDeque = sys_mmap(0, size, prot, flags, -1, 0) as *WorkDeque
+    if deques == (-1) as *WorkDeque
+        return -1
+
+    pool.deques = deques
+    pool.worker_count = worker_count
+
+    # Initialize each deque
+    var i: i32 = 0
+    while i < worker_count
+        let result: i32 = work_deque_init(deques + i, deque_capacity)
+        if result < 0
+            # Cleanup and fail
+            var j: i32 = 0
+            while j < i
+                work_deque_destroy(deques + j)
+                j = j + 1
+            sys_munmap(deques as *u8, size)
+            return -1
+        i = i + 1
+
+    return 0
+
+# Destroy steal pool
+pub fn steal_pool_destroy(pool: *StealPool)
+    if pool.deques == null
+        return
+
+    var i: i32 = 0
+    while i < pool.worker_count
+        work_deque_destroy(pool.deques + i)
+        i = i + 1
+
+    let deque_size: i64 = 32
+    let size: i64 = (pool.worker_count as i64) * deque_size
+    sys_munmap(pool.deques as *u8, size)
+    pool.deques = null
+    pool.worker_count = 0
+
+# Push work to a worker's deque
+pub fn steal_pool_push(pool: *StealPool, worker_idx: i32, item: *WorkItem) -> i32
+    if worker_idx < 0 || worker_idx >= pool.worker_count
+        return -1
+    return work_deque_push(pool.deques + worker_idx, item)
+
+# Pop work from a worker's own deque
+pub fn steal_pool_pop(pool: *StealPool, worker_idx: i32, item: *WorkItem) -> i32
+    if worker_idx < 0 || worker_idx >= pool.worker_count
+        return -1
+    return work_deque_pop(pool.deques + worker_idx, item)
+
+# Steal work from another worker's deque
+pub fn steal_pool_steal(pool: *StealPool, thief_idx: i32, victim_idx: i32, item: *WorkItem) -> i32
+    if victim_idx < 0 || victim_idx >= pool.worker_count
+        return -1
+    if thief_idx == victim_idx
+        return -1  # Can't steal from self
+    return work_deque_steal(pool.deques + victim_idx, item)
+
+# Find the best victim to steal from (worker with most work)
+pub fn steal_pool_find_victim(pool: *StealPool, thief_idx: i32) -> i32
+    var best_victim: i32 = -1
+    var best_count: i64 = 0
+
+    var i: i32 = 0
+    while i < pool.worker_count
+        if i != thief_idx
+            let count: i64 = work_deque_count(pool.deques + i)
+            if count > best_count
+                best_count = count
+                best_victim = i
+        i = i + 1
+
+    return best_victim
+
+# Try to steal from any worker with work
+pub fn steal_pool_try_steal_any(pool: *StealPool, thief_idx: i32, item: *WorkItem) -> i32
+    let victim: i32 = steal_pool_find_victim(pool, thief_idx)
+    if victim < 0
+        return WORK_STEAL_EMPTY
+
+    return steal_pool_steal(pool, thief_idx, victim, item)
+
+# Get total work across all workers
+pub fn steal_pool_total_work(pool: *StealPool) -> i64
+    var total: i64 = 0
+    var i: i32 = 0
+    while i < pool.worker_count
+        total = total + work_deque_count(pool.deques + i)
+        i = i + 1
+    return total

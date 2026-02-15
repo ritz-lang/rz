@@ -1,0 +1,244 @@
+# test/test_main.ritz - Tests for Zeus main entry point helpers
+#
+# The main entry point handles:
+#   - CLI argument parsing
+#   - Worker process spawning (fork/exec)
+#   - Signal handling
+#   - Event loop
+#
+# Note: We can't easily test fork/exec or signal handlers in unit tests,
+# so we focus on the helper functions and argument parsing.
+
+import ritzlib.sys
+import ritzlib.io
+import helpers
+import lib.main_helpers
+
+# ============================================================================
+# Test: CLI Argument Parsing
+# ============================================================================
+
+[[test]]
+fn test_parse_args_defaults() -> i32
+    var opts: ZeusOptions
+    zeus_options_init(@opts)
+
+    # Check defaults
+    if opts.worker_count != 4
+        "FAIL: default worker_count should be 4\n"
+        return 1
+
+    if opts.socket_path == null
+        "FAIL: socket_path should have default\n"
+        return 1
+
+    return 0
+
+[[test]]
+fn test_parse_args_worker_count() -> i32
+    var opts: ZeusOptions
+    zeus_options_init(@opts)
+
+    # Simulate: zeus -w 8
+    var argv: [3]*u8
+    argv[0] = c"zeus"
+    argv[1] = c"-w"
+    argv[2] = c"8"
+
+    let result: i32 = zeus_parse_args(@opts, 3, @argv[0])
+    if result < 0
+        "FAIL: parse_args failed\n"
+        return 1
+
+    if opts.worker_count != 8
+        "FAIL: worker_count should be 8\n"
+        return 1
+
+    return 0
+
+[[test]]
+fn test_parse_args_socket_path() -> i32
+    var opts: ZeusOptions
+    zeus_options_init(@opts)
+
+    # Simulate: zeus -s /run/zeus.sock
+    var argv: [3]*u8
+    argv[0] = c"zeus"
+    argv[1] = c"-s"
+    argv[2] = c"/run/zeus.sock"
+
+    let result: i32 = zeus_parse_args(@opts, 3, @argv[0])
+    if result < 0
+        "FAIL: parse_args failed\n"
+        return 1
+
+    # Check socket path was set (compare first char)
+    if opts.socket_path == null
+        "FAIL: socket_path should be set\n"
+        return 1
+
+    return 0
+
+[[test]]
+fn test_parse_args_shm_size() -> i32
+    var opts: ZeusOptions
+    zeus_options_init(@opts)
+
+    # Simulate: zeus -m 4194304 (4MB)
+    var argv: [3]*u8
+    argv[0] = c"zeus"
+    argv[1] = c"-m"
+    argv[2] = c"4194304"
+
+    let result: i32 = zeus_parse_args(@opts, 3, @argv[0])
+    if result < 0
+        "FAIL: parse_args failed\n"
+        return 1
+
+    if opts.shm_size != 4194304
+        "FAIL: shm_size should be 4194304\n"
+        return 1
+
+    return 0
+
+[[test]]
+fn test_parse_args_multiple() -> i32
+    var opts: ZeusOptions
+    zeus_options_init(@opts)
+
+    # Simulate: zeus -w 16 -m 8388608 -s /tmp/z.sock
+    var argv: [7]*u8
+    argv[0] = c"zeus"
+    argv[1] = c"-w"
+    argv[2] = c"16"
+    argv[3] = c"-m"
+    argv[4] = c"8388608"
+    argv[5] = c"-s"
+    argv[6] = c"/tmp/z.sock"
+
+    let result: i32 = zeus_parse_args(@opts, 7, @argv[0])
+    if result < 0
+        "FAIL: parse_args failed\n"
+        return 1
+
+    if opts.worker_count != 16
+        "FAIL: worker_count should be 16\n"
+        return 1
+
+    if opts.shm_size != 8388608
+        "FAIL: shm_size should be 8388608\n"
+        return 1
+
+    return 0
+
+[[test]]
+fn test_parse_args_invalid() -> i32
+    var opts: ZeusOptions
+    zeus_options_init(@opts)
+
+    # Simulate: zeus -x (unknown flag)
+    var argv: [2]*u8
+    argv[0] = c"zeus"
+    argv[1] = c"-x"
+
+    let result: i32 = zeus_parse_args(@opts, 2, @argv[0])
+    if result >= 0
+        "FAIL: should fail on unknown flag\n"
+        return 1
+
+    return 0
+
+# ============================================================================
+# Test: String to Integer Conversion
+# ============================================================================
+
+[[test]]
+fn test_str_to_i32() -> i32
+    let r1: i32 = str_to_i32(c"123")
+    if r1 != 123
+        "FAIL: expected 123, got {r1}\n"
+        return 1
+
+    let r2: i32 = str_to_i32(c"0")
+    if r2 != 0
+        "FAIL: expected 0\n"
+        return 1
+
+    let r3: i32 = str_to_i32(c"65536")
+    if r3 != 65536
+        "FAIL: expected 65536\n"
+        return 1
+
+    return 0
+
+[[test]]
+fn test_str_to_i64() -> i32
+    let r1: i64 = str_to_i64(c"1048576")
+    if r1 != 1048576
+        "FAIL: expected 1048576\n"
+        return 1
+
+    let r2: i64 = str_to_i64(c"4294967296")
+    if r2 != 4294967296
+        "FAIL: expected 4294967296\n"
+        return 1
+
+    return 0
+
+# ============================================================================
+# Test: String Comparison
+# ============================================================================
+
+[[test]]
+fn test_str_eq_cstr() -> i32
+    if str_eq_cstr(c"-w", c"-w") != 1
+        "FAIL: -w should equal -w\n"
+        return 1
+
+    if str_eq_cstr(c"-w", c"-s") != 0
+        "FAIL: -w should not equal -s\n"
+        return 1
+
+    if str_eq_cstr(c"hello", c"hello") != 1
+        "FAIL: hello should equal hello\n"
+        return 1
+
+    return 0
+
+# ============================================================================
+# Test: Worker Process Helpers
+# ============================================================================
+
+[[test]]
+fn test_build_worker_env() -> i32
+    var env: WorkerEnv
+    worker_env_init(@env)
+
+    worker_env_set_fd(@env, 5)
+    worker_env_set_size(@env, 2097152)
+
+    if env.shm_fd != 5
+        "FAIL: shm_fd should be 5\n"
+        return 1
+
+    if env.shm_size != 2097152
+        "FAIL: shm_size should be 2097152\n"
+        return 1
+
+    return 0
+
+# ============================================================================
+# Test: Pid File
+# ============================================================================
+
+[[test]]
+fn test_pid_file_path() -> i32
+    var opts: ZeusOptions
+    zeus_options_init(@opts)
+
+    # Default pid file should be set
+    if opts.pid_file == null
+        "FAIL: pid_file should have default\n"
+        return 1
+
+    return 0

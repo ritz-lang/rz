@@ -1,0 +1,257 @@
+# lib/page.ritz - Page structure and operations
+#
+# Pages are the fundamental unit of storage in Mausoleum.
+# Every page is PAGE_SIZE (4KB) bytes with a standard header.
+#
+# Page Layout (4096 bytes):
+# ┌─────────────────────────────────────────────────────────────┐
+# │ Header (64 bytes)                                           │
+# │   magic:     4 bytes  - Page type magic number              │
+# │   checksum:  4 bytes  - CRC32 of page data                  │
+# │   page_id:   8 bytes  - Page identifier                     │
+# │   lsn:       8 bytes  - Last LSN that modified this page    │
+# │   version:   4 bytes  - Page format version                 │
+# │   flags:     4 bytes  - Page flags                          │
+# │   prev_page: 8 bytes  - Previous page in chain (if any)     │
+# │   next_page: 8 bytes  - Next page in chain (if any)         │
+# │   free_start:4 bytes  - Start of free space                 │
+# │   free_end:  4 bytes  - End of free space                   │
+# │   slot_count:4 bytes  - Number of slots                     │
+# │   reserved:  4 bytes  - Reserved for future use             │
+# ├─────────────────────────────────────────────────────────────┤
+# │ Data Area (4032 bytes)                                      │
+# │   Type-specific content (B-tree node, heap page, etc.)      │
+# └─────────────────────────────────────────────────────────────┘
+
+import ritzlib.sys
+import ritzlib.str
+import ritzlib.memory
+
+import lib.m7m_types
+
+# ============================================================================
+# Page Header Constants
+# ============================================================================
+
+const PAGE_HEADER_SIZE: i64 = 64
+const PAGE_DATA_SIZE: i64 = 4032  # PAGE_SIZE - PAGE_HEADER_SIZE
+
+# Page type magic numbers
+const PAGE_MAGIC_FREE: i32 = 0x00000000     # Free/unused page
+const PAGE_MAGIC_META: i32 = 0x4D375044     # "M7PD" - Metadata page
+const PAGE_MAGIC_BTREE: i32 = 0x42545245    # "BTRE" - B-tree node
+const PAGE_MAGIC_HEAP: i32 = 0x48454150     # "HEAP" - Heap page
+const PAGE_MAGIC_OVERFLOW: i32 = 0x4F564552 # "OVER" - Overflow page
+const PAGE_MAGIC_WAL: i32 = 0x57414C47      # "WALG" - WAL page
+
+# Page flags
+const PAGE_FLAG_DIRTY: i32 = 1      # Page has been modified
+const PAGE_FLAG_LEAF: i32 = 2       # B-tree leaf node
+const PAGE_FLAG_ROOT: i32 = 4       # B-tree root node
+const PAGE_FLAG_PINNED: i32 = 8     # Page is pinned in buffer pool
+
+# Page version (format version, not MVCC version)
+const PAGE_VERSION: i32 = 1
+
+# ============================================================================
+# Page Header Structure
+# ============================================================================
+
+struct PageHeader
+    magic: i32          # Page type magic number
+    checksum: i32       # CRC32 checksum
+    page_id: i64        # Page identifier
+    lsn: i64            # Last modification LSN
+    version: i32        # Page format version
+    flags: i32          # Page flags
+    prev_page: i64      # Previous page in chain
+    next_page: i64      # Next page in chain
+    free_start: i32     # Start of free space (offset from data start)
+    free_end: i32       # End of free space (offset from data start)
+    slot_count: i32     # Number of slots
+    reserved: i32       # Reserved
+
+# ============================================================================
+# Page Structure
+# ============================================================================
+
+struct Page
+    header: PageHeader
+    data: [4032]u8
+
+# ============================================================================
+# Page Operations
+# ============================================================================
+
+# Initialize a new page with the given type
+pub fn page_init(page: *Page, magic: i32, page_id: i64)
+    # Clear the entire page
+    memset(page as *u8, 0, PAGE_SIZE)
+
+    # Initialize header
+    page.header.magic = magic
+    page.header.checksum = 0
+    page.header.page_id = page_id
+    page.header.lsn = 0
+    page.header.version = PAGE_VERSION
+    page.header.flags = 0
+    page.header.prev_page = INVALID_PAGE_ID
+    page.header.next_page = INVALID_PAGE_ID
+    page.header.free_start = 0
+    page.header.free_end = PAGE_DATA_SIZE as i32
+    page.header.slot_count = 0
+    page.header.reserved = 0
+
+# Initialize a metadata page
+pub fn page_init_meta(page: *Page, page_id: i64)
+    page_init(page, PAGE_MAGIC_META, page_id)
+
+# Initialize a B-tree page
+pub fn page_init_btree(page: *Page, page_id: i64, is_leaf: i32)
+    page_init(page, PAGE_MAGIC_BTREE, page_id)
+    if is_leaf != 0
+        page.header.flags = page.header.flags | PAGE_FLAG_LEAF
+
+# Initialize a heap page
+pub fn page_init_heap(page: *Page, page_id: i64)
+    page_init(page, PAGE_MAGIC_HEAP, page_id)
+
+# Get the page type
+pub fn page_type(page: *Page) -> i32
+    return page.header.magic
+
+# Check if page is a B-tree leaf
+pub fn page_is_leaf(page: *Page) -> i32
+    if (page.header.flags & PAGE_FLAG_LEAF) != 0
+        return 1
+    return 0
+
+# Check if page is dirty
+pub fn page_is_dirty(page: *Page) -> i32
+    if (page.header.flags & PAGE_FLAG_DIRTY) != 0
+        return 1
+    return 0
+
+# Mark page as dirty
+pub fn page_set_dirty(page: *Page)
+    page.header.flags = page.header.flags | PAGE_FLAG_DIRTY
+
+# Clear dirty flag
+pub fn page_clear_dirty(page: *Page)
+    page.header.flags = page.header.flags & (0 - 1 - PAGE_FLAG_DIRTY)
+
+# Get free space in the page
+pub fn page_free_space(page: *Page) -> i32
+    return page.header.free_end - page.header.free_start
+
+# Get a pointer to the data area
+pub fn page_data(page: *Page) -> *u8
+    return @page.data[0]
+
+# Get a pointer to data at a specific offset
+pub fn page_data_at(page: *Page, offset: i32) -> *u8
+    if offset < 0 or offset >= PAGE_DATA_SIZE as i32
+        return null
+    return @page.data[offset]
+
+# ============================================================================
+# Checksum Operations (Simple CRC32 for now)
+# ============================================================================
+
+# CRC32 lookup table
+var crc32_table: [256]i32
+var crc32_initialized: i32 = 0
+
+fn crc32_init_table()
+    if crc32_initialized != 0
+        return
+
+    for i in 0..256
+        var c: i32 = i
+        for j in 0..8
+            if (c & 1) != 0
+                c = 0xEDB88320 ^ ((c >> 1) & 0x7FFFFFFF)
+            else
+                c = (c >> 1) & 0x7FFFFFFF
+        crc32_table[i] = c
+
+    crc32_initialized = 1
+
+fn crc32_update(crc: i32, data: *u8, len: i64) -> i32
+    crc32_init_table()
+
+    var c: i32 = crc ^ 0xFFFFFFFF
+    var i: i64 = 0
+    while i < len
+        let index: i32 = (c ^ (data[i] as i32)) & 0xFF
+        c = crc32_table[index] ^ ((c >> 8) & 0x00FFFFFF)
+        i += 1
+
+    return c ^ 0xFFFFFFFF
+
+# Calculate checksum for a page (excludes checksum field itself)
+pub fn page_calc_checksum(page: *Page) -> i32
+    # Checksum covers: magic + rest of header (skipping checksum field) + data
+    var crc: i32 = 0
+
+    # Hash magic (bytes 0-3)
+    crc = crc32_update(crc, page as *u8, 4)
+
+    # Skip checksum field (bytes 4-7), hash rest of header (bytes 8-63)
+    crc = crc32_update(crc, (page as *u8) + 8, PAGE_HEADER_SIZE - 8)
+
+    # Hash data area
+    crc = crc32_update(crc, @page.data[0], PAGE_DATA_SIZE)
+
+    return crc
+
+# Update checksum in page header
+pub fn page_update_checksum(page: *Page)
+    page.header.checksum = page_calc_checksum(page)
+
+# Verify page checksum
+pub fn page_verify_checksum(page: *Page) -> i32
+    let expected: i32 = page_calc_checksum(page)
+    if page.header.checksum == expected
+        return 1
+    return 0
+
+# ============================================================================
+# Page Validation
+# ============================================================================
+
+# Validate page structure
+pub fn page_validate(page: *Page) -> i32
+    # Check magic number
+    if page.header.magic == PAGE_MAGIC_FREE
+        return 1  # Free pages are always valid
+
+    var valid_magic: i32 = 0
+    if page.header.magic == PAGE_MAGIC_META
+        valid_magic = 1
+    if page.header.magic == PAGE_MAGIC_BTREE
+        valid_magic = 1
+    if page.header.magic == PAGE_MAGIC_HEAP
+        valid_magic = 1
+    if page.header.magic == PAGE_MAGIC_OVERFLOW
+        valid_magic = 1
+    if page.header.magic == PAGE_MAGIC_WAL
+        valid_magic = 1
+
+    if valid_magic == 0
+        return 0
+
+    # Check version
+    if page.header.version != PAGE_VERSION
+        return 0
+
+    # Check free space bounds
+    if page.header.free_start < 0
+        return 0
+    if page.header.free_end > PAGE_DATA_SIZE as i32
+        return 0
+    if page.header.free_start > page.header.free_end
+        return 0
+
+    # Verify checksum
+    return page_verify_checksum(page)

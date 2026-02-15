@@ -1,0 +1,462 @@
+# lib/valet.ritz - Valet-side worker pool management
+#
+# The Valet is the HTTP server process that:
+#   - Manages a pool of worker processes
+#   - Creates shared memory regions for each worker
+#   - Dispatches requests using round-robin
+#   - Monitors worker health
+#   - Handles worker restart on failure
+#
+# Architecture:
+#   Valet (parent)
+#     ├── WorkerSlot[0] ─── shm ─── Worker process 0
+#     ├── WorkerSlot[1] ─── shm ─── Worker process 1
+#     └── WorkerSlot[N] ─── shm ─── Worker process N
+#
+# Each WorkerSlot contains:
+#   - ShmRegion: shared memory for communication
+#   - State: IDLE, RUNNING, BUSY, RESTARTING, etc.
+#   - Health tracking timestamps
+
+import ritzlib.sys
+import lib.control
+import lib.ring
+import lib.shm
+import lib.arena
+
+# ============================================================================
+# Time Helpers
+# ============================================================================
+
+# Timeval structure for gettimeofday (must match sys.ritz layout)
+struct ValetTimeval
+    tv_sec: i64
+    tv_usec: i64
+
+# Get current time in nanoseconds (approximation using gettimeofday)
+fn get_time_ns() -> i64
+    var tv: ValetTimeval
+    # Call gettimeofday syscall directly since Timeval is not public
+    let result: i32 = syscall2(96, @tv as i64, 0) as i32  # SYS_GETTIMEOFDAY = 96
+    if result < 0
+        return 0
+    return (tv.tv_sec * 1000000000) + (tv.tv_usec * 1000)
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+pub const VALET_DEFAULT_MAX_WORKERS: i32 = 16
+pub const VALET_DEFAULT_RING_CAPACITY: i64 = 256
+pub const VALET_DEFAULT_ARENA_SIZE: i64 = 1048576  # 1 MB
+
+# Worker slot states (Valet's view)
+pub const WORKER_SLOT_EMPTY: i32 = 0       # Slot not allocated
+pub const WORKER_SLOT_IDLE: i32 = 1        # Slot allocated, no worker attached
+pub const WORKER_SLOT_RUNNING: i32 = 2     # Worker is running and accepting work
+pub const WORKER_SLOT_RESTARTING: i32 = 3  # Worker is being restarted
+
+# Worker health status
+pub const WORKER_HEALTH_OK: i32 = 0        # Worker is healthy
+pub const WORKER_HEALTH_DEAD: i32 = 1      # Worker process died
+pub const WORKER_HEALTH_STUCK: i32 = 2     # Worker is unresponsive
+pub const WORKER_HEALTH_UNKNOWN: i32 = 3   # Cannot determine health
+
+# ============================================================================
+# Worker Slot
+# ============================================================================
+
+pub struct WorkerSlot
+    region: ShmRegion        # Shared memory region for this worker
+    state: i32               # WORKER_SLOT_* state
+    worker_pid: i32          # PID of worker process (0 if none)
+    last_activity_ts: i64    # Timestamp of last activity (nanoseconds)
+    busy_since_ts: i64       # When worker became busy (0 if not busy)
+    requests_dispatched: u64 # Total requests sent to this worker
+    responses_received: u64  # Total responses received
+
+# ============================================================================
+# Valet Configuration
+# ============================================================================
+
+pub struct ValetConfig
+    max_workers: i32         # Maximum number of worker slots
+    ring_capacity: i64       # Ring buffer capacity per worker
+    arena_size: i64          # Arena size per worker
+
+# Initialize config with default values
+pub fn valet_config_default(cfg: *ValetConfig)
+    cfg.max_workers = VALET_DEFAULT_MAX_WORKERS
+    cfg.ring_capacity = VALET_DEFAULT_RING_CAPACITY
+    cfg.arena_size = VALET_DEFAULT_ARENA_SIZE
+
+# Initialize config with custom values
+pub fn valet_config_init(cfg: *ValetConfig, max_workers: i32, ring_capacity: i64, arena_size: i64)
+    cfg.max_workers = max_workers
+    cfg.ring_capacity = ring_capacity
+    cfg.arena_size = arena_size
+
+# ============================================================================
+# Valet Context
+# ============================================================================
+
+pub struct ValetContext
+    workers: *WorkerSlot     # Array of worker slots (heap allocated)
+    max_workers: i32         # Maximum slots
+    worker_count: i32        # Currently allocated slots
+    next_dispatch_idx: i32   # Next worker for round-robin
+    next_request_id: u64     # Monotonic request ID counter
+    shm_config: ShmConfig    # Shared memory config for workers
+
+# ============================================================================
+# Initialization / Destruction
+# ============================================================================
+
+# Initialize Valet context
+# cfg: configuration (null for defaults)
+# Returns 0 on success, negative on error
+pub fn valet_init(ctx: *ValetContext, cfg: *ValetConfig) -> i32
+    # Apply config
+    var config: ValetConfig
+    if cfg == null
+        valet_config_default(@config)
+    else
+        config.max_workers = cfg.max_workers
+        config.ring_capacity = cfg.ring_capacity
+        config.arena_size = cfg.arena_size
+
+    # Allocate worker slots array
+    let slot_size: i64 = 64  # sizeof(WorkerSlot) - approximate
+    let alloc_size: i64 = (config.max_workers as i64) * slot_size
+
+    let prot: i32 = PROT_READ + PROT_WRITE
+    let flags: i32 = MAP_PRIVATE + MAP_ANONYMOUS
+    let workers: *WorkerSlot = sys_mmap(0, alloc_size, prot, flags, -1, 0) as *WorkerSlot
+    if workers == (-1) as *WorkerSlot
+        return -1
+
+    # Initialize context
+    ctx.workers = workers
+    ctx.max_workers = config.max_workers
+    ctx.worker_count = 0
+    ctx.next_dispatch_idx = 0
+    ctx.next_request_id = 1
+
+    # Store shm config for creating worker regions
+    ctx.shm_config.ring_capacity = config.ring_capacity
+    ctx.shm_config.arena_size = config.arena_size
+
+    # Initialize all slots as empty
+    var i: i32 = 0
+    while i < config.max_workers
+        let slot: *WorkerSlot = ctx.workers + i
+        slot.state = WORKER_SLOT_EMPTY
+        slot.worker_pid = 0
+        slot.last_activity_ts = 0
+        slot.busy_since_ts = 0
+        slot.requests_dispatched = 0
+        slot.responses_received = 0
+        i = i + 1
+
+    return 0
+
+# Destroy Valet context
+pub fn valet_destroy(ctx: *ValetContext)
+    if ctx.workers == null
+        return
+
+    # Destroy all worker slots
+    var i: i32 = 0
+    while i < ctx.max_workers
+        let slot: *WorkerSlot = ctx.workers + i
+        if slot.state != WORKER_SLOT_EMPTY
+            shm_destroy(@slot.region)
+        i = i + 1
+
+    # Free worker array
+    let slot_size: i64 = 64
+    let alloc_size: i64 = (ctx.max_workers as i64) * slot_size
+    sys_munmap(ctx.workers as *u8, alloc_size)
+
+    ctx.workers = null
+    ctx.worker_count = 0
+
+# ============================================================================
+# Worker Slot Management
+# ============================================================================
+
+# Add a new worker slot (allocates shared memory)
+# Returns slot index on success, negative on error
+pub fn valet_add_worker_slot(ctx: *ValetContext) -> i32
+    if ctx.worker_count >= ctx.max_workers
+        return -1  # At capacity
+
+    # Find first empty slot
+    var i: i32 = 0
+    while i < ctx.max_workers
+        let slot: *WorkerSlot = ctx.workers + i
+        if slot.state == WORKER_SLOT_EMPTY
+            # Create shared memory region
+            let result: i32 = shm_create(@slot.region, @ctx.shm_config)
+            if result < 0
+                return result
+
+            # Initialize slot
+            slot.state = WORKER_SLOT_IDLE
+            slot.worker_pid = 0
+            slot.last_activity_ts = get_time_ns()
+            slot.busy_since_ts = 0
+            slot.requests_dispatched = 0
+            slot.responses_received = 0
+
+            ctx.worker_count = ctx.worker_count + 1
+            return i
+        i = i + 1
+
+    return -1  # No empty slots (shouldn't happen if worker_count is accurate)
+
+# Remove a worker slot (frees shared memory)
+pub fn valet_remove_worker_slot(ctx: *ValetContext, slot_idx: i32)
+    if slot_idx < 0 || slot_idx >= ctx.max_workers
+        return
+
+    let slot: *WorkerSlot = ctx.workers + slot_idx
+    if slot.state == WORKER_SLOT_EMPTY
+        return
+
+    # Destroy shared memory
+    shm_destroy(@slot.region)
+
+    # Mark slot as empty
+    slot.state = WORKER_SLOT_EMPTY
+    slot.worker_pid = 0
+
+    ctx.worker_count = ctx.worker_count - 1
+
+# Get a worker slot by index
+pub fn valet_get_worker_slot(ctx: *ValetContext, slot_idx: i32) -> *WorkerSlot
+    if slot_idx < 0 || slot_idx >= ctx.max_workers
+        return null
+    return ctx.workers + slot_idx
+
+# Mark a worker slot as running (worker has attached)
+pub fn valet_mark_worker_running(ctx: *ValetContext, slot_idx: i32)
+    if slot_idx < 0 || slot_idx >= ctx.max_workers
+        return
+
+    let slot: *WorkerSlot = ctx.workers + slot_idx
+    slot.state = WORKER_SLOT_RUNNING
+    slot.last_activity_ts = get_time_ns()
+
+# ============================================================================
+# Round-Robin Dispatch
+# ============================================================================
+
+# Select next worker for dispatch (round-robin, skips non-running workers)
+# Returns slot index, or -1 if no workers available
+pub fn valet_select_worker(ctx: *ValetContext) -> i32
+    if ctx.worker_count == 0
+        return -1
+
+    # Try each slot starting from next_dispatch_idx
+    var attempts: i32 = 0
+    while attempts < ctx.max_workers
+        let idx: i32 = ctx.next_dispatch_idx
+        ctx.next_dispatch_idx = (ctx.next_dispatch_idx + 1) % ctx.max_workers
+
+        let slot: *WorkerSlot = ctx.workers + idx
+        if slot.state == WORKER_SLOT_RUNNING
+            return idx
+
+        attempts = attempts + 1
+
+    return -1  # No running workers
+
+# ============================================================================
+# Request Submission
+# ============================================================================
+
+# Submit a request to a specific worker
+# slot_idx: target worker slot
+# req: request metadata
+# body: optional body data (can be null)
+# body_len: length of body data
+# Returns 0 on success, negative on error
+pub fn valet_submit_request(ctx: *ValetContext, slot_idx: i32, req: *RequestSlot, body: *u8, body_len: i64) -> i32
+    if slot_idx < 0 || slot_idx >= ctx.max_workers
+        return -1
+
+    let slot: *WorkerSlot = ctx.workers + slot_idx
+    if slot.state != WORKER_SLOT_RUNNING
+        return -2  # Worker not running
+
+    # Get control block and check if ring is full
+    let cb: *ControlBlock = shm_get_control_block(@slot.region)
+    if control_block_req_full(cb) != 0
+        return -3  # Ring full
+
+    # Get request ring and target slot
+    let ring: *RequestSlot = shm_get_request_ring(@slot.region)
+    let ring_idx: i64 = control_block_slot_index(cb, cb.req_write_idx)
+    let target: *RequestSlot = ring + ring_idx
+
+    # Copy request metadata
+    target.id = req.id
+    target.method = req.method
+    target.flags = req.flags
+    target.path_len = req.path_len
+    target.path_offset = req.path_offset
+    target.headers_offset = req.headers_offset
+    target.headers_len = req.headers_len
+    target.body_offset = req.body_offset
+    target.body_len = req.body_len
+
+    # If body provided, copy to arena
+    if body != null && body_len > 0
+        var arena: DataArena
+        shm_get_arena(@slot.region, @arena)
+        let dest: *u8 = data_arena_alloc(@arena, body_len)
+        if dest != null
+            # Copy body
+            var i: i64 = 0
+            while i < body_len
+                *(dest + i) = *(body + i)
+                i = i + 1
+            target.body_offset = data_arena_ptr_to_offset(@arena, dest) as u32
+            target.body_len = body_len as u32
+
+    # Advance write index
+    control_block_req_write_inc(cb)
+
+    # Update stats
+    slot.requests_dispatched = slot.requests_dispatched + 1
+    slot.last_activity_ts = get_time_ns()
+
+    return 0
+
+# ============================================================================
+# Response Collection
+# ============================================================================
+
+# Poll for a response from any worker
+# resp: output response slot
+# worker_idx: output worker index that produced the response
+# Returns 0 if response found, -1 if no responses
+pub fn valet_poll_response(ctx: *ValetContext, resp: *ResponseSlot, worker_idx: *i32) -> i32
+    # Check each running worker for responses
+    var i: i32 = 0
+    while i < ctx.max_workers
+        let slot: *WorkerSlot = ctx.workers + i
+        if slot.state == WORKER_SLOT_RUNNING
+            let cb: *ControlBlock = shm_get_control_block(@slot.region)
+
+            if control_block_resp_empty(cb) == 0
+                # Found a response
+                let ring: *ResponseSlot = shm_get_response_ring(@slot.region)
+                let ring_idx: i64 = control_block_slot_index(cb, cb.resp_read_idx)
+                let src: *ResponseSlot = ring + ring_idx
+
+                # Copy response
+                resp.id = src.id
+                resp.status = src.status
+                resp.flags = src.flags
+                resp.headers_offset = src.headers_offset
+                resp.headers_len = src.headers_len
+                resp.body_offset = src.body_offset
+                resp.body_len = src.body_len
+
+                # Advance read index
+                control_block_resp_read_inc(cb)
+
+                # Update stats
+                slot.responses_received = slot.responses_received + 1
+                slot.last_activity_ts = get_time_ns()
+
+                *worker_idx = i
+                return 0
+        i = i + 1
+
+    return -1  # No responses
+
+# ============================================================================
+# Health Monitoring
+# ============================================================================
+
+# Check worker health (uses control block state and PID)
+pub fn valet_check_worker_health(ctx: *ValetContext, slot_idx: i32) -> i32
+    # Default timeout: 30 seconds
+    return valet_check_worker_health_timeout(ctx, slot_idx, 30000000000)
+
+# Check worker health with custom stuck timeout (nanoseconds)
+pub fn valet_check_worker_health_timeout(ctx: *ValetContext, slot_idx: i32, stuck_timeout_ns: i64) -> i32
+    if slot_idx < 0 || slot_idx >= ctx.max_workers
+        return WORKER_HEALTH_UNKNOWN
+
+    let slot: *WorkerSlot = ctx.workers + slot_idx
+    if slot.state == WORKER_SLOT_EMPTY
+        return WORKER_HEALTH_UNKNOWN
+
+    let cb: *ControlBlock = shm_get_control_block(@slot.region)
+
+    # Check if worker PID is set
+    if cb.worker_pid == 0
+        return WORKER_HEALTH_DEAD
+
+    # Check if process is still alive (kill 0 tests existence)
+    let exists: i32 = sys_kill(cb.worker_pid, 0)
+    if exists < 0
+        return WORKER_HEALTH_DEAD
+
+    # Check if worker is stuck (busy too long)
+    if cb.state == WORKER_STATE_BUSY
+        let now: i64 = get_time_ns()
+        let busy_duration: i64 = now - slot.busy_since_ts
+
+        if stuck_timeout_ns >= 0 && busy_duration > stuck_timeout_ns
+            return WORKER_HEALTH_STUCK
+
+    return WORKER_HEALTH_OK
+
+# ============================================================================
+# Graceful Restart
+# ============================================================================
+
+# Initiate graceful restart of a worker
+# Returns 0 on success, negative on error
+pub fn valet_restart_worker(ctx: *ValetContext, slot_idx: i32) -> i32
+    if slot_idx < 0 || slot_idx >= ctx.max_workers
+        return -1
+
+    let slot: *WorkerSlot = ctx.workers + slot_idx
+    if slot.state == WORKER_SLOT_EMPTY
+        return -1
+
+    # Mark as restarting
+    slot.state = WORKER_SLOT_RESTARTING
+
+    # Signal worker to stop gracefully via control block
+    let cb: *ControlBlock = shm_get_control_block(@slot.region)
+    cb.state = WORKER_STATE_STOPPING
+
+    return 0
+
+# ============================================================================
+# Statistics
+# ============================================================================
+
+# Get count of active (running) workers
+pub fn valet_get_active_worker_count(ctx: *ValetContext) -> i32
+    var count: i32 = 0
+    var i: i32 = 0
+    while i < ctx.max_workers
+        let slot: *WorkerSlot = ctx.workers + i
+        if slot.state == WORKER_SLOT_RUNNING
+            count = count + 1
+        i = i + 1
+    return count
+
+# Generate next request ID
+pub fn valet_next_request_id(ctx: *ValetContext) -> u64
+    let id: u64 = ctx.next_request_id
+    ctx.next_request_id = ctx.next_request_id + 1
+    return id

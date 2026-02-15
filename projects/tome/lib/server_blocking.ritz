@@ -1,0 +1,180 @@
+# lib/server_blocking.ritz - Blocking Tome Server (no io_uring)
+#
+# A simple blocking server for environments where io_uring is not available
+# (e.g., WSL, older kernels). Uses standard blocking sockets.
+#
+# Architecture:
+#   - Single process, single-threaded
+#   - Blocking accept/recv/send syscalls
+#   - One connection at a time (for simplicity)
+#
+# Usage:
+#   var server: TomeServerBlocking
+#   tome_server_blocking_init(@server, 6379)
+#   tome_server_blocking_run(@server)
+#
+# Note: For production use on native Linux, prefer server.ritz with io_uring.
+
+import ritzlib.memory
+import ritzlib.str
+import ritzlib.string
+import ritzlib.strview
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.async_net
+import lib.tome
+import lib.resp
+import lib.commands
+
+
+# ============================================================================
+# Connection State (same as server.ritz)
+# ============================================================================
+
+pub struct ConnectionState
+    is_authenticated: i32
+
+pub fn conn_state_init(state: *ConnectionState)
+    state.is_authenticated = 0
+
+
+# ============================================================================
+# Global Configuration
+# ============================================================================
+
+var g_password: *u8       # Required password (null = no auth required)
+var g_store: Store        # Global store
+
+
+# Set server password
+pub fn tome_server_blocking_set_password(password: *u8)
+    g_password = password
+
+
+# ============================================================================
+# Server Structure
+# ============================================================================
+
+pub struct TomeServerBlocking
+    port: i32
+    listen_fd: i32
+    running: i32
+
+
+# ============================================================================
+# Server Lifecycle
+# ============================================================================
+
+pub fn tome_server_blocking_init(srv: *TomeServerBlocking, port: i32) -> i32
+    srv.port = port
+    srv.running = 0
+
+    # Initialize global store
+    g_store = store_new()
+
+    # Create TCP socket
+    let fd: i32 = tcp_socket()
+    if fd < 0
+        return fd
+
+    # Set socket options
+    set_reuseaddr(fd)
+
+    # Bind to all interfaces
+    let bind_ret: i32 = tcp_bind(fd, 0, port)
+    if bind_ret < 0
+        sys_close(fd)
+        return bind_ret
+
+    # Start listening
+    let listen_ret: i32 = tcp_listen(fd, 128)
+    if listen_ret < 0
+        sys_close(fd)
+        return listen_ret
+
+    srv.listen_fd = fd
+    return 0
+
+
+pub fn tome_server_blocking_run(srv: *TomeServerBlocking) -> i32
+    srv.running = 1
+
+    while srv.running == 1
+        # Accept connection (blocking)
+        let client_fd: i32 = tcp_accept(srv.listen_fd)
+        if client_fd < 0
+            # Accept failed, try again
+            continue
+
+        # Handle this connection
+        handle_client(client_fd)
+
+    return 0
+
+
+pub fn tome_server_blocking_stop(srv: *TomeServerBlocking)
+    srv.running = 0
+
+
+pub fn tome_server_blocking_destroy(srv: *TomeServerBlocking)
+    if srv.listen_fd >= 0
+        sys_close(srv.listen_fd)
+        srv.listen_fd = -1
+
+
+# ============================================================================
+# Client Handler
+# ============================================================================
+
+fn handle_client(fd: i32)
+    var read_buf: [8192]u8
+    var write_buf: [8192]u8
+    var state: ConnectionState
+    conn_state_init(@state)
+
+    # Set TCP_NODELAY for low latency
+    set_nodelay(fd)
+
+    loop
+        # Read from client (blocking)
+        # Using sys_read/sys_write instead of sys_recv/sys_send for WSL compatibility
+        let n: i64 = sys_read(fd, @read_buf[0], 8192)
+        if n <= 0
+            # Connection closed or error
+            break
+
+        # Parse RESP command
+        var parser: RespParser
+        resp_parser_init(@parser, @read_buf[0], n)
+
+        let parse_result: i32 = resp_parse(@parser)
+
+        if parse_result == RESP_INCOMPLETE
+            # Need more data - for simplicity, send error
+            # A production server would buffer and read more
+            let err: StrView = "ERR incomplete command"
+            let err_len: i32 = resp_write_error_sv(@write_buf[0], @err)
+            sys_write(fd, @write_buf[0], err_len as i64)
+            continue
+
+        if parse_result == RESP_ERROR_PARSE
+            let err: StrView = "ERR protocol error"
+            let err_len: i32 = resp_write_error_sv(@write_buf[0], @err)
+            sys_write(fd, @write_buf[0], err_len as i64)
+            break
+
+        # Execute command with auth context
+        var ctx: CommandContext
+        cmd_ctx_init_auth(@ctx, @g_store, @write_buf[0], 8192, g_password, state.is_authenticated)
+        cmd_dispatch(@ctx, @parser.command)
+
+        # Update auth state
+        state.is_authenticated = ctx.is_authenticated
+
+        # Send response (blocking) - using sys_write for WSL compatibility
+        let sent: i64 = sys_write(fd, @write_buf[0], ctx.resp_len as i64)
+        if sent <= 0
+            break
+
+    # Close connection
+    sys_close(fd)

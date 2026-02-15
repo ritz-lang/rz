@@ -1,0 +1,431 @@
+# spire/form/mod.ritz
+#
+# Form Parsing and Validation
+#
+# Handles URL-encoded form data and multipart/form-data parsing.
+# Provides validation utilities for form fields.
+#
+# Example:
+#
+#   # Parse URL-encoded form
+#   let body: StrView = request_body_str(@request)
+#   let form: FormData = form_parse(@body)
+#
+#   # Get fields
+#   let name: Option<StrView> = form_get(@form, "name")
+#   let email: Option<StrView> = form_get(@form, "email")
+#
+#   # Validate
+#   var errors: ValidationErrors = validation_errors_new()
+#   validate_required(@errors, "name", @name)
+#   validate_email(@errors, "email", @email)
+#   if validation_has_errors(@errors)
+#       return response_error_bad_request(validation_error_json(@errors))
+
+import ritzlib.option
+import ritzlib.strview { StrView, strview_from_ptr, strview_len }
+import ritzlib.string { String, string_new, string_push, string_from_strview }
+import ritzlib.gvec { Vec, vec_new, vec_push, vec_len, vec_get_ptr, vec_with_cap }
+import ritzlib.hashmap { HashMap, hashmap_new, hashmap_get, hashmap_set }
+
+import lib.utils { string_as_strview, strview_eq }
+import lib.json { JsonBuilder, json_builder_new, json_object_start, json_object_end }
+import lib.json { json_field_str, json_field_array, json_array_end, json_elem_str }
+import lib.json { json_builder_finish }
+
+# ============================================================================
+# FormData - Parsed form fields
+# ============================================================================
+
+pub struct FormData
+    fields: Vec<FormField>
+
+pub struct FormField
+    name: String
+    value: String
+
+# Create empty form data
+pub fn form_data_new() -> FormData
+    var fd: FormData
+    fd.fields = vec_new<FormField>()
+    return fd
+
+# Parse URL-encoded form body
+pub fn form_parse(body: StrView) -> FormData
+    var fd: FormData = form_data_new()
+
+    if body.len == 0
+        return fd
+
+    var i: i64 = 0
+    var start: i64 = 0
+    var key: String = string_new()
+    var in_key: i32 = 1
+
+    while i <= body.len
+        let at_end: i32 = (i >= body.len) as i32
+        let ch: u8 = if at_end != 0 then 0 else *(body.ptr + i)
+
+        if at_end != 0 or ch == 38  # '&'
+            # End of field
+            if in_key == 0 and string_len(@key) > 0
+                let value_sv: StrView = strview_from_ptr(body.ptr + start, i - start)
+                let value: String = url_decode(@value_sv)
+                var field: FormField
+                field.name = key
+                field.value = value
+                vec_push<FormField>(@fd.fields, field)
+                key = string_new()
+            in_key = 1
+            start = i + 1
+        else if ch == 61 and in_key != 0  # '='
+            let key_sv: StrView = strview_from_ptr(body.ptr + start, i - start)
+            key = url_decode(@key_sv)
+            in_key = 0
+            start = i + 1
+
+        i += 1
+
+    return fd
+
+# Get field value by name (first match)
+pub fn form_get(form: FormData, name: StrView) -> Option<StrView>
+    var i: i64 = 0
+    while i < vec_len<FormField>(@form.fields)
+        let field: *FormField = vec_get_ptr<FormField>(@form.fields, i)
+        let field_name: StrView = string_as_strview(@field.name)
+        if strview_eq(@field_name, @name) == 1
+            return Some(string_as_strview(@field.value))
+        i += 1
+    return None
+
+# Get all values for a field (for multi-select, checkboxes)
+pub fn form_get_all(form: FormData, name: StrView) -> Vec<StrView>
+    var result: Vec<StrView> = vec_new<StrView>()
+    var i: i64 = 0
+    while i < vec_len<FormField>(@form.fields)
+        let field: *FormField = vec_get_ptr<FormField>(@form.fields, i)
+        let field_name: StrView = string_as_strview(@field.name)
+        if strview_eq(@field_name, @name) == 1
+            vec_push<StrView>(@result, string_as_strview(@field.value))
+        i += 1
+    return result
+
+# Check if field exists
+pub fn form_has(form: FormData, name: StrView) -> i32
+    match form_get(form, name)
+        Some(_) => 1
+        None => 0
+
+# ============================================================================
+# URL Decoding
+# ============================================================================
+
+fn url_decode(s: StrView) -> String
+    var result: String = string_new()
+    var i: i64 = 0
+
+    while i < s.len
+        let ch: u8 = *(s.ptr + i)
+
+        if ch == 37 and i + 2 < s.len  # '%'
+            let hi: u8 = *(s.ptr + i + 1)
+            let lo: u8 = *(s.ptr + i + 2)
+            let decoded: u8 = (hex_digit(hi) * 16 + hex_digit(lo)) as u8
+            string_push(@result, decoded)
+            i += 3
+        else if ch == 43  # '+'
+            string_push(@result, 32)  # space
+            i += 1
+        else
+            string_push(@result, ch)
+            i += 1
+
+    return result
+
+fn hex_digit(c: u8) -> i32
+    if c >= 48 and c <= 57  # '0'-'9'
+        return (c - 48) as i32
+    if c >= 65 and c <= 70  # 'A'-'F'
+        return (c - 55) as i32
+    if c >= 97 and c <= 102  # 'a'-'f'
+        return (c - 87) as i32
+    return 0
+
+# ============================================================================
+# URL Encoding
+# ============================================================================
+
+pub fn url_encode(s: StrView) -> String
+    var result: String = string_new()
+    var i: i64 = 0
+
+    while i < s.len
+        let ch: u8 = *(s.ptr + i)
+
+        if is_url_safe(ch) != 0
+            string_push(@result, ch)
+        else if ch == 32  # space
+            string_push(@result, 43)  # '+'
+        else
+            string_push(@result, 37)  # '%'
+            string_push(@result, hex_char((ch / 16) as i32))
+            string_push(@result, hex_char((ch % 16) as i32))
+
+        i += 1
+
+    return result
+
+fn is_url_safe(c: u8) -> i32
+    # A-Z, a-z, 0-9, -, _, ., ~
+    if c >= 65 and c <= 90
+        return 1
+    if c >= 97 and c <= 122
+        return 1
+    if c >= 48 and c <= 57
+        return 1
+    if c == 45 or c == 95 or c == 46 or c == 126
+        return 1
+    return 0
+
+fn hex_char(n: i32) -> u8
+    if n < 10
+        return (48 + n) as u8
+    return (55 + n) as u8  # A-F
+
+# ============================================================================
+# ValidationErrors
+# ============================================================================
+
+pub struct ValidationErrors
+    errors: Vec<FieldError>
+
+pub struct FieldError
+    field: String
+    message: String
+
+# Create empty validation errors
+pub fn validation_errors_new() -> ValidationErrors
+    var ve: ValidationErrors
+    ve.errors = vec_new<FieldError>()
+    return ve
+
+# Add an error
+pub fn validation_add_error(self:& ValidationErrors, field: StrView, message: StrView)
+    var fe: FieldError
+    fe.field = string_from_strview(@field)
+    fe.message = string_from_strview(@message)
+    vec_push<FieldError>(@self.errors, fe)
+
+# Check if there are errors
+pub fn validation_has_errors(self: ValidationErrors) -> i32
+    return (vec_len<FieldError>(@self.errors) > 0) as i32
+
+# Get error count
+pub fn validation_error_count(self: ValidationErrors) -> i64
+    return vec_len<FieldError>(@self.errors)
+
+# Get first error for a field
+pub fn validation_get_error(self: ValidationErrors, field: StrView) -> Option<StrView>
+    var i: i64 = 0
+    while i < vec_len<FieldError>(@self.errors)
+        let err: *FieldError = vec_get_ptr<FieldError>(@self.errors, i)
+        let err_field: StrView = string_as_strview(@err.field)
+        if strview_eq(@err_field, @field) == 1
+            return Some(string_as_strview(@err.message))
+        i += 1
+    return None
+
+# Convert errors to JSON
+pub fn validation_error_json(self: ValidationErrors) -> StrView
+    var builder: JsonBuilder = json_builder_new()
+    json_object_start(@builder)
+
+    let errors_field: StrView = "errors"
+    json_field_array(@builder, errors_field)
+
+    var i: i64 = 0
+    while i < vec_len<FieldError>(@self.errors)
+        let err: *FieldError = vec_get_ptr<FieldError>(@self.errors, i)
+        json_object_start(@builder)
+        let field_name: StrView = "field"
+        let msg_name: StrView = "message"
+        json_field_str(@builder, field_name, string_as_strview(@err.field))
+        json_field_str(@builder, msg_name, string_as_strview(@err.message))
+        json_object_end(@builder)
+        i += 1
+
+    json_array_end(@builder)
+    json_object_end(@builder)
+
+    return json_builder_finish(@builder)
+
+# ============================================================================
+# Validation functions
+# ============================================================================
+
+# Required field validation
+pub fn validate_required(errors:& ValidationErrors, field: StrView, value: Option<StrView>)
+    match value
+        Some(v) =>
+            if v.len == 0
+                let msg: StrView = "is required"
+                validation_add_error(errors, field, msg)
+        None =>
+            let msg: StrView = "is required"
+            validation_add_error(errors, field, msg)
+
+# Min length validation
+pub fn validate_min_length(errors:& ValidationErrors, field: StrView, value: Option<StrView>, min: i64)
+    match value
+        Some(v) =>
+            if v.len < min
+                let msg: StrView = "is too short"
+                validation_add_error(errors, field, msg)
+        None => ()  # Skip if not present (use required separately)
+
+# Max length validation
+pub fn validate_max_length(errors:& ValidationErrors, field: StrView, value: Option<StrView>, max: i64)
+    match value
+        Some(v) =>
+            if v.len > max
+                let msg: StrView = "is too long"
+                validation_add_error(errors, field, msg)
+        None => ()
+
+# Email format validation (basic)
+pub fn validate_email(errors:& ValidationErrors, field: StrView, value: Option<StrView>)
+    match value
+        Some(v) =>
+            if is_valid_email(@v) == 0
+                let msg: StrView = "is not a valid email"
+                validation_add_error(errors, field, msg)
+        None => ()
+
+fn is_valid_email(email: StrView) -> i32
+    # Basic validation: must have @, something before and after
+    var at_pos: i64 = -1
+    var i: i64 = 0
+    while i < email.len
+        if *(email.ptr + i) == 64  # '@'
+            if at_pos >= 0
+                return 0  # Multiple @
+            at_pos = i
+        i += 1
+
+    if at_pos <= 0
+        return 0  # No @ or nothing before it
+    if at_pos >= email.len - 1
+        return 0  # Nothing after @
+
+    # Check for dot after @
+    i = at_pos + 1
+    var has_dot: i32 = 0
+    while i < email.len
+        if *(email.ptr + i) == 46  # '.'
+            has_dot = 1
+        i += 1
+
+    return has_dot
+
+# Numeric validation (string is a number)
+pub fn validate_numeric(errors:& ValidationErrors, field: StrView, value: Option<StrView>)
+    match value
+        Some(v) =>
+            if is_numeric(@v) == 0
+                let msg: StrView = "must be a number"
+                validation_add_error(errors, field, msg)
+        None => ()
+
+fn is_numeric(s: StrView) -> i32
+    if s.len == 0
+        return 0
+    var i: i64 = 0
+    # Allow leading minus
+    if *(s.ptr) == 45  # '-'
+        i = 1
+        if s.len == 1
+            return 0
+
+    while i < s.len
+        let ch: u8 = *(s.ptr + i)
+        if ch < 48 or ch > 57  # '0'-'9'
+            return 0
+        i += 1
+    return 1
+
+# Range validation for numeric strings
+pub fn validate_range(errors:& ValidationErrors, field: StrView, value: Option<StrView>, min: i64, max: i64)
+    match value
+        Some(v) =>
+            if is_numeric(@v) != 0
+                let n: i64 = parse_i64(@v)
+                if n < min or n > max
+                    let msg: StrView = "is out of range"
+                    validation_add_error(errors, field, msg)
+        None => ()
+
+fn parse_i64(s: StrView) -> i64
+    var result: i64 = 0
+    var negative: i32 = 0
+    var i: i64 = 0
+
+    if s.len > 0 and *(s.ptr) == 45  # '-'
+        negative = 1
+        i = 1
+
+    while i < s.len
+        let ch: u8 = *(s.ptr + i)
+        if ch >= 48 and ch <= 57
+            result = result * 10 + (ch - 48) as i64
+        i += 1
+
+    if negative != 0
+        return 0 - result
+    return result
+
+# Matches validation (e.g., password confirmation)
+pub fn validate_matches(errors:& ValidationErrors, field: StrView, value: Option<StrView>, other: Option<StrView>, other_name: StrView)
+    match value
+        Some(v) =>
+            match other
+                Some(o) =>
+                    if strview_eq(@v, @o) == 0
+                        # Build message "must match {other_name}"
+                        let msg: StrView = "does not match"
+                        validation_add_error(errors, field, msg)
+                None =>
+                    let msg: StrView = "does not match"
+                    validation_add_error(errors, field, msg)
+        None => ()
+
+# ============================================================================
+# Parse helpers
+# ============================================================================
+
+# Parse form field as i64
+pub fn form_get_i64(form: FormData, name: StrView) -> Option<i64>
+    match form_get(form, name)
+        Some(v) =>
+            if is_numeric(@v) != 0
+                return Some(parse_i64(@v))
+            return None
+        None => None
+
+# Parse form field as bool (presence check or "true"/"1")
+pub fn form_get_bool(form: FormData, name: StrView) -> i32
+    match form_get(form, name)
+        Some(v) =>
+            if v.len == 0
+                return 1  # Present but empty = checked
+            let t: StrView = "true"
+            let one: StrView = "1"
+            let on: StrView = "on"
+            if strview_eq(@v, @t) == 1
+                return 1
+            if strview_eq(@v, @one) == 1
+                return 1
+            if strview_eq(@v, @on) == 1
+                return 1
+            return 0
+        None => 0

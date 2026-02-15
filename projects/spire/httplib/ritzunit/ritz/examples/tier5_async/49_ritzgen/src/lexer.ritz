@@ -1,0 +1,507 @@
+# ritzgen/lexer.ritz - Token and Lexer definitions
+#
+# This module provides the Token structure and Lexer for tokenizing Ritz source.
+
+import tokens
+import utils
+import ritzlib.str
+
+# =============================================================================
+# Token structure
+# =============================================================================
+
+struct Token
+    kind: i32
+    start: *u8
+    len: i32
+    line: i32
+    col: i32
+
+# =============================================================================
+# Lexer structure
+# =============================================================================
+
+struct Lexer
+    input: *u8
+    len: i64
+    pos: i64
+    line: i32
+    col: i32
+    defs: *TokenDefs
+    # Indentation tracking
+    indent_stack: [64]i32
+    indent_depth: i32
+    pending_dedents: i32
+    at_line_start: i32
+
+fn lexer_init(lex: *Lexer, input: *u8, len: i64, defs: *TokenDefs) -> i32
+    lex.input = input
+    lex.len = len
+    lex.pos = 0
+    lex.line = 1
+    lex.col = 1
+    lex.defs = defs
+    lex.indent_stack[0] = 0
+    lex.indent_depth = 0
+    lex.pending_dedents = 0
+    lex.at_line_start = 1
+    return 0
+
+fn lex_peek(lex: *Lexer) -> u8
+    if lex.pos >= lex.len
+        return 0
+    return *(lex.input + lex.pos)
+
+fn lex_advance(lex: *Lexer) -> u8
+    if lex.pos >= lex.len
+        return 0
+    let c: u8 = *(lex.input + lex.pos)
+    lex.pos = lex.pos + 1
+    if c == '\n'
+        lex.line = lex.line + 1
+        lex.col = 1
+    else
+        lex.col = lex.col + 1
+    return c
+
+# Note: is_alpha and is_alnum are provided by utils.ritz
+
+# =============================================================================
+# Token matching helpers
+# =============================================================================
+
+# Try to match a literal string at current position
+fn try_match_literal(lex: *Lexer, pattern: *u8, plen: i32) -> i32
+    if lex.pos + plen as i64 > lex.len
+        return 0
+
+    var i: i32 = 0
+    while i < plen
+        if *(lex.input + lex.pos + i as i64) != *(pattern + i)
+            return 0
+        i += 1
+
+    # For keywords, check that next char is not alphanumeric
+    if plen > 0 && is_alpha(*pattern) != 0
+        if lex.pos + plen as i64 < lex.len
+            let next: u8 = *(lex.input + lex.pos + plen as i64)
+            if is_alnum(next) != 0
+                return 0
+
+    return 1
+
+# Try to match a string literal "..." at current position
+# Returns match length or 0 if no match
+fn try_match_string(lex: *Lexer) -> i32
+    if lex.pos >= lex.len
+        return 0
+    if *(lex.input + lex.pos) != 34  # '"'
+        return 0
+
+    var i: i64 = 1  # skip opening quote
+    while lex.pos + i < lex.len
+        let c: u8 = *(lex.input + lex.pos + i)
+        if c == '"'  # closing quote
+            return (i + 1) as i32  # include both quotes
+        if c == '\\'  # backslash - skip next char
+            i += 1
+            if lex.pos + i < lex.len
+                i += 1
+        else if c == '\n'  # newline - unterminated string
+            return 0
+        else
+            i += 1
+    return 0  # unterminated
+
+# Try to match a char literal '.' at current position
+# Returns match length or 0 if no match
+fn try_match_char(lex: *Lexer) -> i32
+    if lex.pos >= lex.len
+        return 0
+    if *(lex.input + lex.pos) != '\''  # '\''
+        return 0
+
+    var i: i64 = 1  # skip opening quote
+    if lex.pos + i >= lex.len
+        return 0
+
+    let c: u8 = *(lex.input + lex.pos + i)
+    if c == '\\'  # backslash escape
+        i += 2  # skip escape sequence
+    else
+        i += 1  # skip char
+
+    if lex.pos + i < lex.len && *(lex.input + lex.pos + i) == '\''  # closing quote
+        return (i + 1) as i32
+    return 0
+
+# Try to match a regex pattern at current position
+# Returns match length or 0 if no match
+fn try_match_pattern(lex: *Lexer, pattern: *u8, plen: i32) -> i32
+    # Handle special patterns with dedicated matchers
+    # STRING pattern: "([^"\\]|\\.)*"
+    if plen >= 5 && *pattern == '"'  # starts with "
+        return try_match_string(lex)
+    # CHAR pattern: '([^'\\]|\\.)'
+    if plen >= 5 && *pattern == '\''  # starts with '
+        return try_match_char(lex)
+
+    # Simplified pattern matching:
+    # [a-zA-Z_]  - character class
+    # [0-9]      - digit class
+    # *          - zero or more of previous
+    # +          - one or more of previous
+    # ?          - optional
+    # .          - any character
+    # (...)      - grouping (basic)
+    # |          - alternation (basic)
+
+    let start: i64 = lex.pos
+    var pp: i32 = 0  # pattern position
+    var matched: i64 = 0  # total chars matched
+
+    while pp < plen
+        let pc: u8 = *(pattern + pp)
+
+        if pc == '['  # '[' - character class
+            pp += 1
+            var negated: i32 = 0
+            if pp < plen && *(pattern + pp) == 94  # '^'
+                negated = 1
+                pp += 1
+
+            var char_matched: i32 = 0
+            var curr_char: u8 = 0
+            if start + matched < lex.len
+                curr_char = *(lex.input + start + matched)
+
+            while pp < plen && *(pattern + pp) != 93  # ']'
+                let cc: u8 = *(pattern + pp)
+
+                # Check for range a-z
+                if pp + 2 < plen && *(pattern + pp + 1) == '-'  # '-'
+                    let lo: u8 = cc
+                    let hi: u8 = *(pattern + pp + 2)
+                    if curr_char >= lo && curr_char <= hi
+                        char_matched = 1
+                    pp += 3
+                else
+                    if curr_char == cc
+                        char_matched = 1
+                    pp += 1
+
+            if pp < plen
+                pp += 1  # skip ']'
+
+            if negated != 0
+                char_matched = (char_matched == 0) as i32
+
+            # Check for quantifier
+            var min_match: i32 = 1
+            var max_match: i32 = 1
+            if pp < plen
+                let quant: u8 = *(pattern + pp)
+                if quant == '*'  # '*'
+                    min_match = 0
+                    max_match = 999999
+                    pp += 1
+                else if quant == '+'  # '+'
+                    min_match = 1
+                    max_match = 999999
+                    pp += 1
+                else if quant == 63  # '?'
+                    min_match = 0
+                    max_match = 1
+                    pp += 1
+
+            if char_matched != 0
+                matched += 1
+                # Continue matching for * or +
+                if max_match > 1
+                    while start + matched < lex.len
+                        let nc: u8 = *(lex.input + start + matched)
+                        # Re-check character class (simplified - need to re-parse class)
+                        # For now, handle common cases
+                        var nc_matched: i32 = 0
+
+                        # Quick check: is alphanumeric or underscore
+                        if is_alnum(nc) != 0 && negated == 0
+                            nc_matched = 1
+                        else if negated != 0 && is_alnum(nc) == 0 && nc != '\n'
+                            nc_matched = 1
+
+                        if nc_matched == 0
+                            break
+                        matched += 1
+            else if min_match > 0
+                return 0  # Required match failed
+
+        else if pc == 40  # '(' - grouping for alternation
+            # Handle string patterns like /"([^"\\]|\\.)*"/
+            # This is simplified - just handle the quoted string case
+            pp += 1
+            # Skip to closing paren for now (simplified)
+            var depth: i32 = 1
+            while pp < plen && depth > 0
+                if *(pattern + pp) == 40
+                    depth += 1
+                else if *(pattern + pp) == 41
+                    depth -= 1
+                pp += 1
+
+            # Check for quantifier
+            if pp < plen && *(pattern + pp) == '*'  # '*'
+                pp += 1
+
+        else if pc == '.'  # '.' - any character
+            pp += 1
+            if start + matched < lex.len
+                matched += 1
+            else
+                return 0
+
+        else if pc == '\\'  # '\' - escape
+            pp += 1
+            if pp < plen
+                let ec: u8 = *(pattern + pp)
+                var expected: u8 = ec
+                if ec == 'n'
+                    expected = 10  # \n
+                else if ec == 't'
+                    expected = 9   # \t
+                else if ec == 'r'
+                    expected = 13  # \r
+
+                if start + matched < lex.len && *(lex.input + start + matched) == expected
+                    matched += 1
+                    pp += 1
+                else
+                    return 0
+        else
+            # Literal character
+            if start + matched < lex.len && *(lex.input + start + matched) == pc
+                matched += 1
+                pp += 1
+            else
+                return 0
+
+    return matched as i32
+
+# =============================================================================
+# Main lexer function
+# =============================================================================
+
+# Get next token
+fn lexer_next(lex: *Lexer, tok: *Token) -> i32
+    # Handle pending dedents
+    if lex.pending_dedents > 0
+        lex.pending_dedents = lex.pending_dedents - 1
+        tok.kind = TOK_DEDENT
+        tok.start = lex.input + lex.pos
+        tok.len = 0
+        tok.line = lex.line
+        tok.col = lex.col
+        return 0
+
+    # Handle indentation at start of line
+    if lex.at_line_start != 0
+        lex.at_line_start = 0
+
+        # Count leading spaces
+        var spaces: i32 = 0
+        while lex.pos < lex.len
+            let c: u8 = lex_peek(lex)
+            if c == ' '
+                spaces += 1
+                lex_advance(lex)
+            else if c == '\t'
+                spaces += 4
+                lex_advance(lex)
+            else
+                break
+
+        # Skip blank lines and comments
+        let c: u8 = lex_peek(lex)
+        if c == '\n' || c == '#'  # newline or comment
+            # Blank line - don't change indentation
+            if c == '#'
+                while lex.pos < lex.len && lex_peek(lex) != '\n'
+                    lex_advance(lex)
+            if lex_peek(lex) == '\n'
+                lex_advance(lex)
+            lex.at_line_start = 1
+            tok.kind = TOK_NEWLINE
+            tok.start = lex.input + lex.pos - 1
+            tok.len = 1
+            tok.line = lex.line - 1
+            tok.col = 1
+            return 0
+
+        if c == 0
+            # EOF - emit dedents
+            while lex.indent_depth > 0
+                lex.indent_depth = lex.indent_depth - 1
+                lex.pending_dedents = lex.pending_dedents + 1
+            if lex.pending_dedents > 0
+                return lexer_next(lex, tok)
+            tok.kind = TOK_EOF
+            tok.start = lex.input + lex.pos
+            tok.len = 0
+            tok.line = lex.line
+            tok.col = lex.col
+            return 0
+
+        # Compare with current indentation
+        let current_indent: i32 = lex.indent_stack[lex.indent_depth]
+
+        if spaces > current_indent
+            # Indent
+            lex.indent_depth = lex.indent_depth + 1
+            lex.indent_stack[lex.indent_depth] = spaces
+            tok.kind = TOK_INDENT
+            tok.start = lex.input + lex.pos
+            tok.len = 0
+            tok.line = lex.line
+            tok.col = 1
+            return 0
+        else if spaces < current_indent
+            # Dedent(s)
+            while lex.indent_depth > 0 && lex.indent_stack[lex.indent_depth] > spaces
+                lex.indent_depth = lex.indent_depth - 1
+                lex.pending_dedents = lex.pending_dedents + 1
+            if lex.pending_dedents > 0
+                return lexer_next(lex, tok)
+
+    # Skip whitespace (not newlines)
+    while lex.pos < lex.len
+        let c: u8 = lex_peek(lex)
+        if c == ' ' || c == '\t' || c == '\r'
+            lex_advance(lex)
+        else
+            break
+
+    # Check for EOF
+    if lex.pos >= lex.len
+        # Emit remaining dedents
+        while lex.indent_depth > 0
+            lex.indent_depth = lex.indent_depth - 1
+            lex.pending_dedents = lex.pending_dedents + 1
+        if lex.pending_dedents > 0
+            return lexer_next(lex, tok)
+        tok.kind = TOK_EOF
+        tok.start = lex.input + lex.pos
+        tok.len = 0
+        tok.line = lex.line
+        tok.col = lex.col
+        return 0
+
+    # Check for comment
+    if lex_peek(lex) == '#'  # '#'
+        let start: i64 = lex.pos
+        while lex.pos < lex.len && lex_peek(lex) != '\n'
+            lex_advance(lex)
+        # Skip comments by recursing
+        return lexer_next(lex, tok)
+
+    # Check for newline
+    if lex_peek(lex) == '\n'
+        let start: i64 = lex.pos
+        lex_advance(lex)
+        lex.at_line_start = 1
+        tok.kind = TOK_NEWLINE
+        tok.start = lex.input + start
+        tok.len = 1
+        tok.line = lex.line - 1
+        tok.col = lex.col
+        return 0
+
+    # Try to match tokens from definitions
+    let start_pos: i64 = lex.pos
+    let start_line: i32 = lex.line
+    let start_col: i32 = lex.col
+
+    var best_match: i32 = 0
+    var best_len: i32 = 0
+    var best_is_skip: i32 = 0
+
+    var i: i32 = 0
+    while i < lex.defs.count
+        let def: *TokenDef = &lex.defs.defs[i]
+        var match_len: i32 = 0
+
+        if def.is_literal != 0
+            if try_match_literal(lex, def.pattern, def.pattern_len) != 0
+                match_len = def.pattern_len
+        else
+            match_len = try_match_pattern(lex, def.pattern, def.pattern_len)
+
+        # Take longest match (or first if equal - keywords before idents)
+        if match_len > best_len
+            best_match = def.token_id
+            best_len = match_len
+            best_is_skip = def.is_skip
+
+        i += 1
+
+    if best_len > 0
+        # Advance past matched token
+        var j: i32 = 0
+        while j < best_len
+            lex_advance(lex)
+            j += 1
+
+        # Skip tokens marked as skip
+        if best_is_skip != 0
+            return lexer_next(lex, tok)
+
+        tok.kind = best_match
+        tok.start = lex.input + start_pos
+        tok.len = best_len
+        tok.line = start_line
+        tok.col = start_col
+        return 0
+
+    # No match - error token
+    tok.kind = TOK_ERROR
+    tok.start = lex.input + start_pos
+    tok.len = 1
+    tok.line = start_line
+    tok.col = start_col
+    lex_advance(lex)
+    return 0
+
+# =============================================================================
+# Token name lookup
+# =============================================================================
+
+fn get_token_name(defs: *TokenDefs, kind: i32, buf: *u8, max_len: i32) -> i32
+    if kind == TOK_EOF
+        strcpy(buf, "EOF")
+        return 3
+    if kind == TOK_ERROR
+        strcpy(buf, "ERROR")
+        return 5
+    if kind == TOK_SKIP
+        strcpy(buf, "SKIP")
+        return 4
+    if kind == TOK_NEWLINE
+        strcpy(buf, "NEWLINE")
+        return 7
+    if kind == TOK_INDENT
+        strcpy(buf, "INDENT")
+        return 6
+    if kind == TOK_DEDENT
+        strcpy(buf, "DEDENT")
+        return 6
+
+    var i: i32 = 0
+    while i < defs.count
+        if defs.defs[i].token_id == kind
+            let len: i32 = defs.defs[i].name_len
+            if len < max_len
+                memcpy(buf, defs.defs[i].name, (len + 1) as i64)
+                return len
+        i += 1
+
+    strcpy(buf, "???")
+    return 3

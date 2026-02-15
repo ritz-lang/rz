@@ -1,0 +1,379 @@
+# lib/txn.ritz - Transaction Manager (MVCC)
+#
+# Implements Multi-Version Concurrency Control (MVCC) for snapshot isolation:
+# - Each transaction gets a snapshot timestamp at BEGIN
+# - Transactions only see data committed before their snapshot
+# - Write conflicts are detected at commit time
+#
+# Transaction States:
+# - ACTIVE: Transaction is in progress
+# - COMMITTED: Transaction has successfully committed
+# - ABORTED: Transaction has been rolled back
+#
+# Visibility Rules:
+# - A row is visible if:
+#   1. write_ts <= snapshot_ts AND write transaction is committed, AND
+#   2. (delete_ts == 0 OR delete_ts > snapshot_ts OR delete txn uncommitted)
+# - A transaction always sees its own uncommitted writes
+
+import ritzlib.sys
+import ritzlib.str
+import ritzlib.memory
+
+import lib.m7m_types
+import lib.page
+import lib.buffer_pool
+import lib.wal
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+const MAX_ACTIVE_TXNS: i64 = 256    # Max concurrent transactions
+
+# Transaction states
+const TXN_INVALID: i32 = 0          # Invalid/uninitialized
+const TXN_ACTIVE: i32 = 1           # In progress
+const TXN_COMMITTED: i32 = 2        # Successfully committed
+const TXN_ABORTED: i32 = 3          # Rolled back
+
+# ============================================================================
+# Transaction Structure
+# ============================================================================
+
+struct Txn
+    id: i64                 # Unique transaction ID
+    state: i32              # TXN_ACTIVE, TXN_COMMITTED, TXN_ABORTED
+    snapshot_ts: i64        # Snapshot timestamp (sees commits before this)
+    start_lsn: i64          # LSN of BEGIN record
+    last_lsn: i64           # LSN of last operation
+    mgr: *TxnManager        # Back-reference to manager
+
+# ============================================================================
+# Transaction Manager Structure
+# ============================================================================
+
+struct TxnManager
+    pool: *BufferPool               # Buffer pool for page access
+    wal_writer: *WalWriter          # WAL for durability
+    wal_path: *u8                   # Base path for WAL files
+    wal_path_len: i32
+
+    next_txn_id: i64                # Next transaction ID to assign
+    commit_ts: i64                  # Global commit timestamp counter
+
+    # Active transaction tracking
+    active_txns: *Txn               # Array of active transaction slots
+    active_count: i64               # Number of active transactions
+
+    # Committed transaction tracking (for visibility)
+    committed_txns: *i64            # Array of committed txn IDs
+    committed_count: i64            # Number of committed txns tracked
+    committed_capacity: i64         # Capacity of committed array
+
+# ============================================================================
+# Transaction Manager Creation/Destruction
+# ============================================================================
+
+pub fn txn_mgr_new(pool: *BufferPool, wal_path: *u8) -> *TxnManager
+    if pool == null or wal_path == null
+        return null
+
+    let mgr: *TxnManager = malloc(128) as *TxnManager
+    if mgr == null
+        return null
+
+    # Copy WAL path
+    let path_len: i64 = strlen(wal_path)
+    let path_copy: *u8 = malloc(path_len + 1)
+    if path_copy == null
+        free(mgr as *u8)
+        return null
+    memcpy(path_copy, wal_path, path_len + 1)
+
+    # Allocate active transaction slots
+    let active_size: i64 = MAX_ACTIVE_TXNS * 48  # sizeof(Txn) ~ 48 bytes
+    let active_txns: *Txn = malloc(active_size) as *Txn
+    if active_txns == null
+        free(path_copy)
+        free(mgr as *u8)
+        return null
+    memset(active_txns as *u8, 0, active_size)
+
+    # Allocate committed transaction tracking
+    let committed_capacity: i64 = 1024
+    let committed_txns: *i64 = malloc(committed_capacity * 8) as *i64
+    if committed_txns == null
+        free(active_txns as *u8)
+        free(path_copy)
+        free(mgr as *u8)
+        return null
+
+    # Create WAL writer
+    let wal_writer: *WalWriter = wal_writer_new(wal_path)
+    if wal_writer == null
+        free(committed_txns as *u8)
+        free(active_txns as *u8)
+        free(path_copy)
+        free(mgr as *u8)
+        return null
+
+    let open_result: i32 = wal_writer_open(wal_writer)
+    if open_result != ERR_OK
+        wal_writer_destroy(wal_writer)
+        free(committed_txns as *u8)
+        free(active_txns as *u8)
+        free(path_copy)
+        free(mgr as *u8)
+        return null
+
+    # Initialize
+    mgr.pool = pool
+    mgr.wal_writer = wal_writer
+    mgr.wal_path = path_copy
+    mgr.wal_path_len = path_len as i32
+    mgr.next_txn_id = 1
+    mgr.commit_ts = 1
+    mgr.active_txns = active_txns
+    mgr.active_count = 0
+    mgr.committed_txns = committed_txns
+    mgr.committed_count = 0
+    mgr.committed_capacity = committed_capacity
+
+    return mgr
+
+pub fn txn_mgr_destroy(mgr: *TxnManager)
+    if mgr == null
+        return
+
+    # Abort any active transactions
+    var i: i64 = 0
+    while i < MAX_ACTIVE_TXNS
+        let txn: *Txn = mgr.active_txns + i
+        if txn.state == TXN_ACTIVE
+            txn.state = TXN_ABORTED
+        i += 1
+
+    if mgr.wal_writer != null
+        wal_writer_destroy(mgr.wal_writer)
+
+    if mgr.committed_txns != null
+        free(mgr.committed_txns as *u8)
+
+    if mgr.active_txns != null
+        free(mgr.active_txns as *u8)
+
+    if mgr.wal_path != null
+        free(mgr.wal_path)
+
+    free(mgr as *u8)
+
+# ============================================================================
+# Transaction Lifecycle
+# ============================================================================
+
+pub fn txn_begin(mgr: *TxnManager) -> *Txn
+    if mgr == null
+        return null
+
+    # Find a free slot
+    var slot: *Txn = null
+    var i: i64 = 0
+    while i < MAX_ACTIVE_TXNS
+        let candidate: *Txn = mgr.active_txns + i
+        if candidate.state == TXN_INVALID or candidate.state == TXN_COMMITTED or candidate.state == TXN_ABORTED
+            slot = candidate
+            i = MAX_ACTIVE_TXNS  # Break
+        i += 1
+
+    if slot == null
+        return null  # No free slots
+
+    # Assign transaction ID
+    let txn_id: i64 = mgr.next_txn_id
+    mgr.next_txn_id += 1
+
+    # Get snapshot timestamp (current commit timestamp)
+    let snapshot_ts: i64 = mgr.commit_ts
+
+    # Write BEGIN to WAL
+    let begin_lsn: i64 = wal_write_begin(mgr.wal_writer, txn_id)
+    if begin_lsn < 0
+        return null
+
+    # Initialize transaction
+    slot.id = txn_id
+    slot.state = TXN_ACTIVE
+    slot.snapshot_ts = snapshot_ts
+    slot.start_lsn = begin_lsn
+    slot.last_lsn = begin_lsn
+    slot.mgr = mgr
+
+    mgr.active_count += 1
+
+    return slot
+
+pub fn txn_commit(txn: *Txn) -> i32
+    if txn == null
+        return ERR_INVALID
+
+    if txn.state != TXN_ACTIVE
+        return ERR_INVALID  # Can only commit active transactions
+
+    let mgr: *TxnManager = txn.mgr
+    if mgr == null
+        return ERR_INVALID
+
+    # Write COMMIT to WAL
+    let commit_lsn: i64 = wal_write_commit(mgr.wal_writer, txn.id, txn.last_lsn)
+    if commit_lsn < 0
+        return ERR_IO
+
+    # Update transaction state
+    txn.state = TXN_COMMITTED
+    txn.last_lsn = commit_lsn
+    mgr.active_count -= 1
+
+    # Advance commit timestamp
+    mgr.commit_ts += 1
+
+    # Track as committed for visibility
+    if mgr.committed_count < mgr.committed_capacity
+        mgr.committed_txns[mgr.committed_count] = txn.id
+        mgr.committed_count += 1
+
+    return ERR_OK
+
+pub fn txn_abort(txn: *Txn) -> i32
+    if txn == null
+        return ERR_INVALID
+
+    if txn.state != TXN_ACTIVE
+        return ERR_INVALID  # Can only abort active transactions
+
+    let mgr: *TxnManager = txn.mgr
+    if mgr == null
+        return ERR_INVALID
+
+    # Write ABORT to WAL
+    let abort_lsn: i64 = wal_write_abort(mgr.wal_writer, txn.id, txn.last_lsn)
+    if abort_lsn < 0
+        # Even if WAL write fails, mark as aborted
+        txn.state = TXN_ABORTED
+        mgr.active_count -= 1
+        return ERR_IO
+
+    # Update transaction state
+    txn.state = TXN_ABORTED
+    txn.last_lsn = abort_lsn
+    mgr.active_count -= 1
+
+    return ERR_OK
+
+# ============================================================================
+# Transaction Accessors
+# ============================================================================
+
+pub fn txn_id(txn: *Txn) -> i64
+    if txn == null
+        return 0
+    return txn.id
+
+pub fn txn_state(txn: *Txn) -> i32
+    if txn == null
+        return TXN_INVALID
+    return txn.state
+
+pub fn txn_snapshot_ts(txn: *Txn) -> i64
+    if txn == null
+        return 0
+    return txn.snapshot_ts
+
+# ============================================================================
+# Visibility Checking (MVCC)
+# ============================================================================
+
+# Check if a row version is visible to this transaction
+# write_ts: Transaction ID that created this version
+# delete_ts: Transaction ID that deleted this version (0 if not deleted)
+pub fn txn_is_visible(txn: *Txn, write_ts: i64, delete_ts: i64) -> i32
+    if txn == null
+        return 0
+
+    # Always see own writes
+    if write_ts == txn.id
+        # But not if we deleted it ourselves
+        if delete_ts == txn.id
+            return 0
+        return 1
+
+    # Check if write transaction is committed and visible
+    if not is_committed_before(txn, write_ts)
+        return 0
+
+    # Check deletion
+    if delete_ts == 0
+        # Not deleted
+        return 1
+
+    # If deleted by our transaction, not visible
+    if delete_ts == txn.id
+        return 0
+
+    # If deleted by a committed transaction before our snapshot, not visible
+    if is_committed_before(txn, delete_ts)
+        return 0
+
+    # Deletion is not yet visible (uncommitted or after our snapshot)
+    return 1
+
+# Check if txn_id is committed and was committed before this transaction's snapshot
+fn is_committed_before(txn: *Txn, check_tid: i64) -> i32
+    if txn == null
+        return 0
+
+    let mgr: *TxnManager = txn.mgr
+    if mgr == null
+        return 0
+
+    # If check_tid is >= our snapshot, it's not visible (started after us)
+    if check_tid >= txn.snapshot_ts
+        return 0
+
+    # Check if it's in the committed list
+    var i: i64 = 0
+    while i < mgr.committed_count
+        if mgr.committed_txns[i] == check_tid
+            return 1
+        i += 1
+
+    # Also check active transactions - if it's active, it's not committed
+    i = 0
+    while i < MAX_ACTIVE_TXNS
+        let active: *Txn = mgr.active_txns + i
+        if active.id == check_tid and active.state == TXN_ACTIVE
+            return 0
+        i += 1
+
+    # For transactions before our snapshot that are neither active nor
+    # in committed list, assume committed (they may have been garbage collected)
+    return 1
+
+# ============================================================================
+# Manager Accessors
+# ============================================================================
+
+pub fn txn_mgr_active_count(mgr: *TxnManager) -> i64
+    if mgr == null
+        return 0
+    return mgr.active_count
+
+pub fn txn_mgr_next_id(mgr: *TxnManager) -> i64
+    if mgr == null
+        return 0
+    return mgr.next_txn_id
+
+pub fn txn_mgr_commit_ts(mgr: *TxnManager) -> i64
+    if mgr == null
+        return 0
+    return mgr.commit_ts

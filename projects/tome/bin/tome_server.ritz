@@ -1,0 +1,176 @@
+# bin/tome_server.ritz - Tome Server binary
+#
+# Usage:
+#   ./tome-server                    # Single-process mode on port 6379
+#   ./tome-server -w 4               # Multi-process with 4 workers
+#   ./tome-server --port 7000 -w 8   # Port 7000 with 8 workers
+#   ./tome-server -h                 # Show help
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+import ritzlib.memory
+import lib.server
+import lib.master
+
+
+const DEFAULT_PORT: i32 = 6379
+const DEFAULT_WORKERS: i32 = 0  # 0 = single-process mode
+
+
+fn print_help()
+    prints("Tome - In-memory key-value store\n")
+    prints("\n")
+    prints("Usage: tome-server [OPTIONS]\n")
+    prints("\n")
+    prints("Options:\n")
+    prints("  -p, --port PORT      Port to listen on (default: 6379)\n")
+    prints("  -w, --workers N      Number of worker processes (default: single-process)\n")
+    prints("  -h, --help           Show this help message\n")
+    prints("\n")
+    prints("Examples:\n")
+    prints("  tome-server                    # Single-process mode\n")
+    prints("  tome-server -w 4               # 4 worker processes\n")
+    prints("  tome-server -p 7000 -w 8       # Port 7000 with 8 workers\n")
+    prints("\n")
+    prints("Multi-process mode:\n")
+    prints("  - Each worker has its own data store (partitioned)\n")
+    prints("  - SO_REUSEPORT for kernel-level load balancing\n")
+    prints("  - Workers auto-restart on crash\n")
+    prints("  - Graceful shutdown with SIGTERM\n")
+    prints("\n")
+
+
+fn parse_int(s: *u8) -> i32
+    var val: i32 = 0
+    var i: i32 = 0
+    loop
+        let ptr: *u8 = s + i
+        let c: u8 = *ptr
+        if c == 0
+            break
+        if c < 48 || c > 57
+            return -1  # Invalid digit
+        val = val * 10 + (c - 48) as i32
+        i += 1
+    return val
+
+
+fn print_banner(workers: i32)
+    prints("========================================\n")
+    prints("          Tome Server v0.2.0\n")
+    prints("   Redis-compatible in-memory store\n")
+    if workers > 0
+        prints("        Multi-process mode\n")
+    prints("========================================\n")
+    prints("\n")
+
+
+fn run_single_process(port: i32) -> i32
+    prints("Starting single-process server on port ")
+    print_int(port as i64)
+    prints("...\n")
+
+    var server: TomeServer
+    let init_ret: i32 = tome_server_init(@server, port)
+    if init_ret < 0
+        prints("Error: failed to initialize server (code: ")
+        print_int(init_ret as i64)
+        prints(")\n")
+        return 1
+
+    prints("Server ready. Press Ctrl+C to stop.\n\n")
+
+    let run_ret: i32 = tome_server_run(@server)
+    if run_ret < 0
+        prints("Error: server error (code: ")
+        print_int(run_ret as i64)
+        prints(")\n")
+        tome_server_destroy(@server)
+        return 1
+
+    prints("Server stopped.\n")
+    tome_server_destroy(@server)
+    return 0
+
+
+fn run_multi_process(port: i32, workers: i32) -> i32
+    prints("Starting multi-process server on port ")
+    print_int(port as i64)
+    prints(" with ")
+    print_int(workers as i64)
+    prints(" workers...\n")
+
+    var master: MasterServer
+    let init_ret: i32 = master_init(@master, port, workers)
+    if init_ret < 0
+        prints("Error: failed to initialize master (code: ")
+        print_int(init_ret as i64)
+        prints(")\n")
+        return 1
+
+    # Spawn worker processes
+    let spawn_ret: i32 = master_spawn_workers(@master)
+    if spawn_ret < 0
+        prints("Error: failed to spawn workers (code: ")
+        print_int(spawn_ret as i64)
+        prints(")\n")
+        master_destroy(@master)
+        return 1
+
+    # Run master monitoring loop
+    let run_ret: i32 = master_run(@master)
+
+    # Shutdown workers gracefully
+    master_shutdown(@master)
+    master_destroy(@master)
+
+    prints("Server stopped.\n")
+    return run_ret
+
+
+pub fn main(argc: i32, argv: **u8) -> i32
+    var port: i32 = DEFAULT_PORT
+    var workers: i32 = DEFAULT_WORKERS
+
+    # Parse command line arguments
+    var i: i32 = 1  # Skip program name
+    while i < argc
+        let arg: *u8 = *(argv + i)
+
+        if strcmp(arg, c"-h") == 0 || strcmp(arg, c"--help") == 0
+            print_help()
+            return 0
+
+        if strcmp(arg, c"-p") == 0 || strcmp(arg, c"--port") == 0
+            if i + 1 >= argc
+                prints("Error: --port requires a value\n")
+                return 1
+            i += 1
+            let port_str: *u8 = *(argv + i)
+            port = parse_int(port_str)
+            if port <= 0 || port > 65535
+                prints("Error: invalid port number\n")
+                return 1
+
+        else if strcmp(arg, c"-w") == 0 || strcmp(arg, c"--workers") == 0
+            if i + 1 >= argc
+                prints("Error: --workers requires a value\n")
+                return 1
+            i += 1
+            let workers_str: *u8 = *(argv + i)
+            workers = parse_int(workers_str)
+            if workers < 0 || workers > 64
+                prints("Error: invalid worker count (must be 0-64)\n")
+                return 1
+
+        i += 1
+
+    # Print banner
+    print_banner(workers)
+
+    # Run in appropriate mode
+    if workers > 0
+        return run_multi_process(port, workers)
+    else
+        return run_single_process(port)

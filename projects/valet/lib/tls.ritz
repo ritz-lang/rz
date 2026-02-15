@@ -1,0 +1,1143 @@
+# lib/tls.ritz - TLS 1.3 Server Implementation for Valet
+#
+# This module provides TLS 1.3 server support using cryptosec primitives.
+# Designed for io_uring integration with non-blocking handshake processing.
+#
+# Usage:
+#   var server: TlsServer
+#   tls_server_init(@server, @config)
+#
+#   # On incoming connection:
+#   let result = tls_server_process(@server, data, len, out, cap, @out_len)
+#   # Send out[:out_len] to client
+#   # Continue until result == TLS_RESULT_COMPLETE
+#
+#   # Application data:
+#   let encrypted_len = tls_server_write(@server, plaintext, len, out, cap)
+#   let plaintext_len = tls_server_read(@server, ciphertext, len, out, cap)
+
+import ritzlib.sys
+
+# Import cryptosec primitives (via ritz.toml dependency)
+import cryptosec.mem
+import cryptosec.random
+import cryptosec.sha256
+import cryptosec.hmac
+import cryptosec.hkdf
+import cryptosec.aes_gcm
+import cryptosec.x25519
+import cryptosec.tls13_kdf
+import cryptosec.tls13_record
+import cryptosec.tls13_handshake
+import cryptosec.pem
+import cryptosec.x509
+import cryptosec.ed25519
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+# Server connection states
+pub const TLS_SERVER_STATE_INIT: i32 = 0
+pub const TLS_SERVER_STATE_CLIENT_HELLO_RECEIVED: i32 = 1
+pub const TLS_SERVER_STATE_SERVER_HELLO_SENT: i32 = 2
+pub const TLS_SERVER_STATE_ENCRYPTED_EXTENSIONS_SENT: i32 = 3
+pub const TLS_SERVER_STATE_CERTIFICATE_SENT: i32 = 4
+pub const TLS_SERVER_STATE_CERTIFICATE_VERIFY_SENT: i32 = 5
+pub const TLS_SERVER_STATE_FINISHED_SENT: i32 = 6
+pub const TLS_SERVER_STATE_CLIENT_FINISHED_RECEIVED: i32 = 7
+pub const TLS_SERVER_STATE_CONNECTED: i32 = 8
+pub const TLS_SERVER_STATE_CLOSING: i32 = 9
+pub const TLS_SERVER_STATE_CLOSED: i32 = 10
+pub const TLS_SERVER_STATE_ERROR: i32 = -1
+
+# Handshake processing results
+pub const TLS_RESULT_NEED_INPUT: i32 = 0
+pub const TLS_RESULT_HAVE_OUTPUT: i32 = 1
+pub const TLS_RESULT_COMPLETE: i32 = 2
+pub const TLS_RESULT_ERROR: i32 = -1
+
+# Error codes
+pub const TLS_ERR_NONE: i32 = 0
+pub const TLS_ERR_INVALID_STATE: i32 = -1
+pub const TLS_ERR_PARSE_ERROR: i32 = -2
+pub const TLS_ERR_UNEXPECTED_MESSAGE: i32 = -3
+pub const TLS_ERR_VERSION_MISMATCH: i32 = -4
+pub const TLS_ERR_NO_KEY_SHARE: i32 = -5
+pub const TLS_ERR_DECRYPT_FAILED: i32 = -6
+pub const TLS_ERR_VERIFY_FAILED: i32 = -7
+pub const TLS_ERR_CERTIFICATE_INVALID: i32 = -8
+pub const TLS_ERR_FINISHED_MISMATCH: i32 = -9
+pub const TLS_ERR_BUFFER_TOO_SMALL: i32 = -10
+pub const TLS_ERR_NO_COMMON_CIPHER: i32 = -11
+pub const TLS_ERR_NO_CERTIFICATE: i32 = -12
+pub const TLS_ERR_NO_PRIVATE_KEY: i32 = -13
+
+# Key types
+pub const TLS_KEY_TYPE_ED25519: i32 = 0
+pub const TLS_KEY_TYPE_RSA: i32 = 1
+
+# Maximum sizes
+const MAX_RECORD_SIZE: i64 = 16384
+const MAX_CERT_SIZE: i64 = 8192
+
+# ============================================================================
+# TLS Server Configuration
+# ============================================================================
+
+pub struct TlsServerConfig
+    # Certificate chain (DER encoded, concatenated)
+    cert_chain: *u8
+    cert_chain_len: i64
+    num_certs: i32
+    cert_offsets: [8]i64   # Offset of each cert in chain
+    cert_lens: [8]i64      # Length of each cert
+
+    # Private key
+    key_type: i32          # TLS_KEY_TYPE_ED25519 or TLS_KEY_TYPE_RSA
+    ed25519_private: [64]u8  # Ed25519 expanded private key (seed + public)
+    rsa_private: *u8       # RSA private key (DER)
+    rsa_private_len: i64
+
+    # Preferred cipher suites
+    cipher_suites: [4]u16
+    num_cipher_suites: i32
+
+# Initialize config with defaults
+pub fn tls_server_config_init(cfg: *TlsServerConfig)
+    mem_zero(cfg as *u8, 200 as u64)
+
+    # Default cipher suites (server preference order)
+    cfg.cipher_suites[0] = TLS_AES_128_GCM_SHA256
+    cfg.cipher_suites[1] = TLS_CHACHA20_POLY1305_SHA256
+    cfg.num_cipher_suites = 2
+
+# Load certificate from PEM file content
+# Returns 0 on success, -1 on error
+pub fn tls_server_config_load_cert(cfg: *TlsServerConfig, pem_data: *u8, pem_len: i64, der_buf: *u8, der_cap: i64) -> i32
+    var iter: PemIterator
+    pem_iterator_init(@iter, pem_data, pem_len)
+
+    cfg.cert_chain = der_buf
+    cfg.cert_chain_len = 0
+    cfg.num_certs = 0
+
+    var offset: i64 = 0
+
+    while cfg.num_certs < 8
+        var entry: PemEntry
+        var entry_der_buf: *u8 = der_buf + offset
+        let remaining: i64 = der_cap - offset
+
+        let result: i32 = pem_iterator_next(@iter, @entry, entry_der_buf, remaining)
+        if result <= 0
+            break
+
+        # Check if it's a certificate
+        if entry.type_len == 11  # "CERTIFICATE"
+            if entry.type_label[0] == 'C' && entry.type_label[1] == 'E' && entry.type_label[2] == 'R'
+                cfg.cert_offsets[cfg.num_certs] = offset
+                cfg.cert_lens[cfg.num_certs] = entry.der_len
+                offset = offset + entry.der_len
+                cfg.num_certs = cfg.num_certs + 1
+
+    cfg.cert_chain_len = offset
+
+    if cfg.num_certs == 0
+        return -1
+
+    return 0
+
+# Load Ed25519 private key from PEM
+# Returns 0 on success, -1 on error
+pub fn tls_server_config_load_ed25519_key(cfg: *TlsServerConfig, pem_data: *u8, pem_len: i64) -> i32
+    var entry: PemEntry
+    var der_buf: [128]u8
+
+    let result: i64 = pem_parse_entry(pem_data, pem_len, @entry, @der_buf[0], 128)
+    if result <= 0
+        return -1
+
+    # Ed25519 private key in PKCS#8 format is typically:
+    # SEQUENCE { version, algorithm, privateKey }
+    # The actual 32-byte seed is nested inside
+
+    # For now, assume raw 32-byte seed (simplified)
+    # TODO: Parse PKCS#8 properly
+    if entry.der_len >= 32
+        # Expand Ed25519 seed to full private key
+        var pubkey: [32]u8
+        ed25519_keygen(@pubkey[0], @cfg.ed25519_private[0], @der_buf[0])
+        cfg.key_type = TLS_KEY_TYPE_ED25519
+        return 0
+
+    return -1
+
+# ============================================================================
+# Parsed ClientHello (server-side)
+# ============================================================================
+
+struct ParsedClientHello
+    # Client random (32 bytes)
+    random: [32]u8
+
+    # Session ID (to echo back)
+    session_id: [32]u8
+    session_id_len: i32
+
+    # Client's offered cipher suites
+    cipher_suites: [16]u16
+    num_cipher_suites: i32
+
+    # Client's X25519 key share
+    has_key_share: i32
+    x25519_public: [32]u8
+
+    # SNI hostname
+    hostname: [256]u8
+    hostname_len: i32
+
+    # Supported versions
+    supports_tls13: i32
+
+    # Signature algorithms
+    sig_algs: [16]u16
+    num_sig_algs: i32
+
+# ============================================================================
+# TLS Server Connection State
+# ============================================================================
+
+pub struct TlsServer
+    # Connection state
+    state: i32
+    last_error: i32
+
+    # Configuration (pointer, not owned)
+    config: *TlsServerConfig
+
+    # Parsed ClientHello
+    client_hello: ParsedClientHello
+
+    # Server's X25519 key pair
+    x25519_private: [32]u8
+    x25519_public: [32]u8
+
+    # Shared secret from X25519
+    shared_secret: [32]u8
+
+    # Selected cipher suite
+    cipher_suite: u16
+
+    # Transcript hash
+    transcript: Transcript
+
+    # Key schedule
+    key_schedule: TLS13KeySchedule
+
+    # Record layer states
+    read_state: TlsRecordState
+    write_state: TlsRecordState
+
+    # Receive buffer (for fragmented records)
+    recv_buf: [4096]u8
+    recv_len: i64
+
+    # Send buffer (for building handshake messages)
+    send_buf: [4096]u8
+    send_len: i64
+
+    # Handshake complete flag
+    handshake_complete: i32
+
+# ============================================================================
+# Server Lifecycle
+# ============================================================================
+
+# Initialize TLS server connection
+pub fn tls_server_init(server: *TlsServer, config: *TlsServerConfig)
+    mem_zero(server as *u8, 8192 as u64)
+
+    server.config = config
+    server.state = TLS_SERVER_STATE_INIT
+
+    # Generate server's ephemeral X25519 key pair
+    random_bytes(@server.x25519_private[0], 32)
+    x25519_clamp(@server.x25519_private[0])
+    x25519_pubkey(@server.x25519_public[0], @server.x25519_private[0])
+
+    # Initialize transcript hash
+    transcript_init(@server.transcript)
+
+    # Initialize key schedule
+    tls13_key_schedule_init(@server.key_schedule)
+
+# Free server resources (zero sensitive data)
+pub fn tls_server_free(server: *TlsServer)
+    mem_zero(@server.x25519_private[0], 32)
+    mem_zero(@server.shared_secret[0], 32)
+    mem_zero(@server.key_schedule as *u8, 296 as u64)
+
+# ============================================================================
+# ClientHello Parsing
+# ============================================================================
+
+# Parse ClientHello message
+# data points to handshake message body (after 4-byte header)
+pub fn parse_client_hello(data: *u8, len: i64, ch: *ParsedClientHello) -> i32
+    mem_zero(ch as *u8, 400 as u64)
+
+    if len < 38  # Minimum: version(2) + random(32) + session_id_len(1) + ...
+        return -1
+
+    var pos: i64 = 0
+
+    # Legacy version (2 bytes) - ignore, check supported_versions extension
+    pos = pos + 2
+
+    # Random (32 bytes)
+    mem_copy(@ch.random[0], data + pos, 32)
+    pos = pos + 32
+
+    # Session ID
+    let session_id_len: i32 = data[pos] as i32
+    pos = pos + 1
+    if session_id_len > 32 || pos + session_id_len > len
+        return -1
+    if session_id_len > 0
+        mem_copy(@ch.session_id[0], data + pos, session_id_len as u64)
+    ch.session_id_len = session_id_len
+    pos = pos + session_id_len
+
+    # Cipher suites
+    if pos + 2 > len
+        return -1
+    let cs_len: i64 = ((data[pos] as i64) << 8) | (data[pos + 1] as i64)
+    pos = pos + 2
+    if pos + cs_len > len
+        return -1
+
+    ch.num_cipher_suites = 0
+    var cs_pos: i64 = 0
+    while cs_pos + 2 <= cs_len && ch.num_cipher_suites < 16
+        ch.cipher_suites[ch.num_cipher_suites] = ((data[pos + cs_pos] as u16) << 8) | (data[pos + cs_pos + 1] as u16)
+        ch.num_cipher_suites = ch.num_cipher_suites + 1
+        cs_pos = cs_pos + 2
+    pos = pos + cs_len
+
+    # Compression methods (legacy, must include null)
+    if pos + 1 > len
+        return -1
+    let comp_len: i64 = data[pos] as i64
+    pos = pos + 1 + comp_len
+
+    # Extensions
+    if pos + 2 > len
+        return 0  # No extensions is valid (but TLS 1.3 requires them)
+
+    let ext_len: i64 = ((data[pos] as i64) << 8) | (data[pos + 1] as i64)
+    pos = pos + 2
+
+    let ext_end: i64 = pos + ext_len
+    if ext_end > len
+        return -1
+
+    while pos + 4 <= ext_end
+        let ext_type: u16 = ((data[pos] as u16) << 8) | (data[pos + 1] as u16)
+        let ext_data_len: i64 = ((data[pos + 2] as i64) << 8) | (data[pos + 3] as i64)
+        pos = pos + 4
+
+        if pos + ext_data_len > ext_end
+            return -1
+
+        # Parse known extensions
+        if ext_type == EXT_SUPPORTED_VERSIONS
+            # supported_versions extension
+            parse_supported_versions(data + pos, ext_data_len, ch)
+
+        if ext_type == EXT_KEY_SHARE
+            # key_share extension
+            parse_key_share_client(data + pos, ext_data_len, ch)
+
+        if ext_type == EXT_SERVER_NAME
+            # SNI extension
+            parse_server_name(data + pos, ext_data_len, ch)
+
+        if ext_type == EXT_SIGNATURE_ALGORITHMS
+            # signature_algorithms extension
+            parse_signature_algorithms(data + pos, ext_data_len, ch)
+
+        pos = pos + ext_data_len
+
+    return 0
+
+# Parse supported_versions extension (client offers)
+pub fn parse_supported_versions(data: *u8, len: i64, ch: *ParsedClientHello)
+    if len < 1
+        return
+    let list_len: i32 = data[0] as i32
+    if list_len + 1 > len
+        return
+
+    var i: i32 = 0
+    while i < list_len
+        let version: u16 = ((data[1 + i] as u16) << 8) | (data[2 + i] as u16)
+        if version == TLS_VERSION_13
+            ch.supports_tls13 = 1
+        i = i + 2
+
+# Parse key_share extension (client offers)
+pub fn parse_key_share_client(data: *u8, len: i64, ch: *ParsedClientHello)
+    if len < 2
+        return
+    let entries_len: i64 = ((data[0] as i64) << 8) | (data[1] as i64)
+    if entries_len + 2 > len
+        return
+
+    var pos: i64 = 2
+    while pos + 4 <= 2 + entries_len
+        let group: u16 = ((data[pos] as u16) << 8) | (data[pos + 1] as u16)
+        let key_len: i64 = ((data[pos + 2] as i64) << 8) | (data[pos + 3] as i64)
+        pos = pos + 4
+
+        if pos + key_len > 2 + entries_len
+            return
+
+        if group == GROUP_X25519 && key_len == 32
+            mem_copy(@ch.x25519_public[0], data + pos, 32)
+            ch.has_key_share = 1
+
+        pos = pos + key_len
+
+# Parse server_name (SNI) extension
+pub fn parse_server_name(data: *u8, len: i64, ch: *ParsedClientHello)
+    if len < 5
+        return
+    let list_len: i64 = ((data[0] as i64) << 8) | (data[1] as i64)
+    if list_len + 2 > len
+        return
+
+    var pos: i64 = 2
+    while pos + 3 <= 2 + list_len
+        let name_type: u8 = data[pos]
+        let name_len: i64 = ((data[pos + 1] as i64) << 8) | (data[pos + 2] as i64)
+        pos = pos + 3
+
+        if name_type == 0 && name_len <= 255  # host_name
+            if pos + name_len <= 2 + list_len
+                mem_copy(@ch.hostname[0], data + pos, name_len as u64)
+                ch.hostname_len = name_len as i32
+
+        pos = pos + name_len
+
+# Parse signature_algorithms extension
+pub fn parse_signature_algorithms(data: *u8, len: i64, ch: *ParsedClientHello)
+    if len < 2
+        return
+    let list_len: i64 = ((data[0] as i64) << 8) | (data[1] as i64)
+    if list_len + 2 > len
+        return
+
+    ch.num_sig_algs = 0
+    var pos: i64 = 2
+    while pos + 2 <= 2 + list_len && ch.num_sig_algs < 16
+        ch.sig_algs[ch.num_sig_algs] = ((data[pos] as u16) << 8) | (data[pos + 1] as u16)
+        ch.num_sig_algs = ch.num_sig_algs + 1
+        pos = pos + 2
+
+# ============================================================================
+# ServerHello Serialization
+# ============================================================================
+
+# Serialize ServerHello
+# Returns bytes written (including handshake header), or -1 on error
+pub fn serialize_server_hello(server: *TlsServer, out: *u8, cap: i64) -> i64
+    if cap < 200
+        return -1
+
+    var pos: i64 = 4  # Reserve space for handshake header
+
+    # Legacy version = 0x0303 (TLS 1.2)
+    out[pos] = 0x03
+    out[pos + 1] = 0x03
+    pos = pos + 2
+
+    # Random (32 bytes)
+    var server_random: [32]u8
+    random_bytes(@server_random[0], 32)
+    mem_copy(out + pos, @server_random[0], 32)
+    pos = pos + 32
+
+    # Echo session ID from ClientHello
+    out[pos] = server.client_hello.session_id_len as u8
+    pos = pos + 1
+    if server.client_hello.session_id_len > 0
+        mem_copy(out + pos, @server.client_hello.session_id[0], server.client_hello.session_id_len as u64)
+        pos = pos + server.client_hello.session_id_len
+
+    # Cipher suite (2 bytes)
+    out[pos] = ((server.cipher_suite >> 8) & 0xff) as u8
+    out[pos + 1] = (server.cipher_suite & 0xff) as u8
+    pos = pos + 2
+
+    # Compression method (null)
+    out[pos] = 0
+    pos = pos + 1
+
+    # Extensions
+    let ext_start: i64 = pos + 2  # Reserve 2 bytes for extensions length
+    var ext_pos: i64 = ext_start
+
+    # supported_versions extension (required for TLS 1.3)
+    out[ext_pos] = 0x00
+    out[ext_pos + 1] = 0x2b  # EXT_SUPPORTED_VERSIONS
+    out[ext_pos + 2] = 0x00
+    out[ext_pos + 3] = 0x02  # Length = 2
+    out[ext_pos + 4] = 0x03
+    out[ext_pos + 5] = 0x04  # TLS 1.3
+    ext_pos = ext_pos + 6
+
+    # key_share extension
+    out[ext_pos] = 0x00
+    out[ext_pos + 1] = 0x33  # EXT_KEY_SHARE
+    out[ext_pos + 2] = 0x00
+    out[ext_pos + 3] = 0x24  # Length = 36 (2 + 2 + 32)
+    out[ext_pos + 4] = 0x00
+    out[ext_pos + 5] = 0x1d  # GROUP_X25519
+    out[ext_pos + 6] = 0x00
+    out[ext_pos + 7] = 0x20  # Key length = 32
+    mem_copy(out + ext_pos + 8, @server.x25519_public[0], 32)
+    ext_pos = ext_pos + 40
+
+    # Write extensions length
+    let ext_len: i64 = ext_pos - ext_start
+    out[pos] = ((ext_len >> 8) & 0xff) as u8
+    out[pos + 1] = (ext_len & 0xff) as u8
+    pos = ext_pos
+
+    # Write handshake header
+    let body_len: i64 = pos - 4
+    out[0] = HS_SERVER_HELLO
+    out[1] = ((body_len >> 16) & 0xff) as u8
+    out[2] = ((body_len >> 8) & 0xff) as u8
+    out[3] = (body_len & 0xff) as u8
+
+    return pos
+
+# ============================================================================
+# EncryptedExtensions Serialization
+# ============================================================================
+
+pub fn serialize_encrypted_extensions(out: *u8, cap: i64) -> i64
+    if cap < 6
+        return -1
+
+    # Handshake header + empty extensions
+    out[0] = HS_ENCRYPTED_EXTENSIONS
+    out[1] = 0x00
+    out[2] = 0x00
+    out[3] = 0x02  # Length = 2 (just extensions length field)
+    out[4] = 0x00
+    out[5] = 0x00  # Extensions length = 0
+
+    return 6
+
+# ============================================================================
+# Certificate Serialization
+# ============================================================================
+
+pub fn serialize_certificate(server: *TlsServer, out: *u8, cap: i64) -> i64
+    let cfg: *TlsServerConfig = server.config
+    if cfg.num_certs == 0
+        return -1
+
+    var pos: i64 = 4  # Reserve for handshake header
+
+    # Request context (empty for server certificate)
+    out[pos] = 0x00
+    pos = pos + 1
+
+    # Certificate list length (3 bytes) - placeholder
+    let cert_list_start: i64 = pos
+    pos = pos + 3
+
+    # Add each certificate
+    var cert_idx: i32 = 0
+    while cert_idx < cfg.num_certs
+        let cert_data: *u8 = cfg.cert_chain + cfg.cert_offsets[cert_idx]
+        let cert_len: i64 = cfg.cert_lens[cert_idx]
+
+        # Certificate length (3 bytes)
+        out[pos] = ((cert_len >> 16) & 0xff) as u8
+        out[pos + 1] = ((cert_len >> 8) & 0xff) as u8
+        out[pos + 2] = (cert_len & 0xff) as u8
+        pos = pos + 3
+
+        # Certificate data
+        if pos + cert_len > cap
+            return -1
+        mem_copy(out + pos, cert_data, cert_len as u64)
+        pos = pos + cert_len
+
+        # Extensions for this certificate (none)
+        out[pos] = 0x00
+        out[pos + 1] = 0x00
+        pos = pos + 2
+
+        cert_idx = cert_idx + 1
+
+    # Write certificate list length
+    let cert_list_len: i64 = pos - cert_list_start - 3
+    out[cert_list_start] = ((cert_list_len >> 16) & 0xff) as u8
+    out[cert_list_start + 1] = ((cert_list_len >> 8) & 0xff) as u8
+    out[cert_list_start + 2] = (cert_list_len & 0xff) as u8
+
+    # Write handshake header
+    let body_len: i64 = pos - 4
+    out[0] = HS_CERTIFICATE
+    out[1] = ((body_len >> 16) & 0xff) as u8
+    out[2] = ((body_len >> 8) & 0xff) as u8
+    out[3] = (body_len & 0xff) as u8
+
+    return pos
+
+# ============================================================================
+# CertificateVerify Serialization
+# ============================================================================
+
+# TLS 1.3 CertificateVerify context string
+const CV_SERVER_CONTEXT_LEN: i32 = 98
+
+pub fn build_cv_context(transcript_hash: *u8, out: *u8)
+    # 64 spaces
+    var i: i32 = 0
+    while i < 64
+        out[i] = 0x20
+        i = i + 1
+
+    # "TLS 1.3, server CertificateVerify" (33 bytes including null)
+    let label = c"TLS 1.3, server CertificateVerify"
+    mem_copy(out + 64, label, 33)
+
+    # Null byte
+    out[97] = 0x00
+
+    # Transcript hash (32 bytes for SHA-256)
+    mem_copy(out + 98, transcript_hash, 32)
+
+pub fn serialize_certificate_verify(server: *TlsServer, out: *u8, cap: i64) -> i64
+    let cfg: *TlsServerConfig = server.config
+
+    if cfg.key_type != TLS_KEY_TYPE_ED25519
+        # TODO: RSA support
+        return -1
+
+    # Get current transcript hash
+    var transcript_hash: [32]u8
+    transcript_hash(@server.transcript, @transcript_hash[0])
+
+    # Build context for signing
+    var cv_content: [130]u8  # 64 + 33 + 1 + 32 = 130
+    build_cv_context(@transcript_hash[0], @cv_content[0])
+
+    # Sign with Ed25519
+    var signature: [64]u8
+    ed25519_sign(@signature[0], @cv_content[0], 130, @cfg.ed25519_private[0])
+
+    # Build CertificateVerify message
+    var pos: i64 = 4  # Reserve for handshake header
+
+    # Signature algorithm (2 bytes) - Ed25519
+    out[pos] = 0x08
+    out[pos + 1] = 0x07  # SIG_ED25519
+    pos = pos + 2
+
+    # Signature length (2 bytes)
+    out[pos] = 0x00
+    out[pos + 1] = 0x40  # 64 bytes
+    pos = pos + 2
+
+    # Signature
+    mem_copy(out + pos, @signature[0], 64)
+    pos = pos + 64
+
+    # Write handshake header
+    let body_len: i64 = pos - 4
+    out[0] = HS_CERTIFICATE_VERIFY
+    out[1] = ((body_len >> 16) & 0xff) as u8
+    out[2] = ((body_len >> 8) & 0xff) as u8
+    out[3] = (body_len & 0xff) as u8
+
+    return pos
+
+# ============================================================================
+# Finished Message
+# ============================================================================
+
+pub fn serialize_finished(server: *TlsServer, out: *u8, cap: i64) -> i64
+    if cap < 36
+        return -1
+
+    # Get current transcript hash
+    var th: [32]u8
+    transcript_hash(@server.transcript, @th[0])
+
+    # Compute verify_data
+    var verify_data: [32]u8
+    finished_compute(@server.key_schedule.server_handshake_traffic_secret[0], @th[0], @verify_data[0])
+
+    # Handshake header + verify_data
+    out[0] = HS_FINISHED
+    out[1] = 0x00
+    out[2] = 0x00
+    out[3] = 0x20  # 32 bytes
+    mem_copy(out + 4, @verify_data[0], 32)
+
+    return 36
+
+# ============================================================================
+# Main Processing Function
+# ============================================================================
+
+# Process incoming TLS data
+# Returns: TLS_RESULT_NEED_INPUT, TLS_RESULT_HAVE_OUTPUT, TLS_RESULT_COMPLETE, or TLS_RESULT_ERROR
+pub fn tls_server_process(server: *TlsServer, data: *u8, data_len: i64, out: *u8, out_cap: i64, out_len: *i64) -> i32
+    *out_len = 0
+
+    if server.state == TLS_SERVER_STATE_ERROR
+        return TLS_RESULT_ERROR
+
+    if server.state == TLS_SERVER_STATE_CONNECTED
+        return TLS_RESULT_COMPLETE
+
+    # Accumulate data
+    if data_len > 0
+        if server.recv_len + data_len > 4096
+            server.last_error = TLS_ERR_BUFFER_TOO_SMALL
+            server.state = TLS_SERVER_STATE_ERROR
+            return TLS_RESULT_ERROR
+        mem_copy(@server.recv_buf[server.recv_len], data, data_len as u64)
+        server.recv_len = server.recv_len + data_len
+
+    # Process based on state
+    if server.state == TLS_SERVER_STATE_INIT
+        return process_client_hello(server, out, out_cap, out_len)
+
+    if server.state == TLS_SERVER_STATE_FINISHED_SENT
+        return process_client_finished(server, out, out_cap, out_len)
+
+    server.last_error = TLS_ERR_INVALID_STATE
+    server.state = TLS_SERVER_STATE_ERROR
+    return TLS_RESULT_ERROR
+
+# ============================================================================
+# State Processing Functions
+# ============================================================================
+
+pub fn process_client_hello(server: *TlsServer, out: *u8, out_cap: i64, out_len: *i64) -> i32
+    # Need at least TLS record header (5 bytes)
+    if server.recv_len < 5
+        return TLS_RESULT_NEED_INPUT
+
+    # Parse TLS record header
+    let content_type: u8 = server.recv_buf[0]
+    let record_len: i64 = ((server.recv_buf[3] as i64) << 8) | (server.recv_buf[4] as i64)
+
+    # Check for complete record
+    if server.recv_len < 5 + record_len
+        return TLS_RESULT_NEED_INPUT
+
+    # Expect Handshake content type
+    if content_type != 22
+        server.last_error = TLS_ERR_UNEXPECTED_MESSAGE
+        server.state = TLS_SERVER_STATE_ERROR
+        return TLS_RESULT_ERROR
+
+    # Parse handshake header
+    var hdr: HandshakeHeader
+    if handshake_header_parse(@server.recv_buf[5], record_len, @hdr) != 0
+        server.last_error = TLS_ERR_PARSE_ERROR
+        server.state = TLS_SERVER_STATE_ERROR
+        return TLS_RESULT_ERROR
+
+    if hdr.msg_type != HS_CLIENT_HELLO
+        server.last_error = TLS_ERR_UNEXPECTED_MESSAGE
+        server.state = TLS_SERVER_STATE_ERROR
+        return TLS_RESULT_ERROR
+
+    # Parse ClientHello
+    if parse_client_hello(@server.recv_buf[9], hdr.length, @server.client_hello) != 0
+        server.last_error = TLS_ERR_PARSE_ERROR
+        server.state = TLS_SERVER_STATE_ERROR
+        return TLS_RESULT_ERROR
+
+    # Verify TLS 1.3 support
+    if server.client_hello.supports_tls13 != 1
+        server.last_error = TLS_ERR_VERSION_MISMATCH
+        server.state = TLS_SERVER_STATE_ERROR
+        return TLS_RESULT_ERROR
+
+    # Verify key share
+    if server.client_hello.has_key_share != 1
+        server.last_error = TLS_ERR_NO_KEY_SHARE
+        server.state = TLS_SERVER_STATE_ERROR
+        return TLS_RESULT_ERROR
+
+    # Select cipher suite
+    if select_cipher_suite(server) != 0
+        server.last_error = TLS_ERR_NO_COMMON_CIPHER
+        server.state = TLS_SERVER_STATE_ERROR
+        return TLS_RESULT_ERROR
+
+    # Update transcript with ClientHello
+    let ch_total: i64 = 4 + hdr.length
+    transcript_update(@server.transcript, @server.recv_buf[5], ch_total)
+
+    # Compute shared secret
+    x25519(@server.shared_secret[0], @server.x25519_private[0], @server.client_hello.x25519_public[0])
+
+    # Build response messages
+    return build_server_flight(server, out, out_cap, out_len)
+
+pub fn select_cipher_suite(server: *TlsServer) -> i32
+    let cfg: *TlsServerConfig = server.config
+    let ch: *ParsedClientHello = @server.client_hello
+
+    # Server preference order
+    var s: i32 = 0
+    while s < cfg.num_cipher_suites
+        let server_suite: u16 = cfg.cipher_suites[s]
+        var c: i32 = 0
+        while c < ch.num_cipher_suites
+            if ch.cipher_suites[c] == server_suite
+                server.cipher_suite = server_suite
+                return 0
+            c = c + 1
+        s = s + 1
+
+    return -1
+
+pub fn build_server_flight(server: *TlsServer, out: *u8, out_cap: i64, out_len: *i64) -> i32
+    var pos: i64 = 0
+
+    # 1. ServerHello (plaintext)
+    var sh_buf: [256]u8
+    let sh_len: i64 = serialize_server_hello(server, @sh_buf[0], 256)
+    if sh_len < 0
+        server.last_error = TLS_ERR_PARSE_ERROR
+        server.state = TLS_SERVER_STATE_ERROR
+        return TLS_RESULT_ERROR
+
+    # Wrap ServerHello in TLS record
+    if pos + 5 + sh_len > out_cap
+        server.last_error = TLS_ERR_BUFFER_TOO_SMALL
+        server.state = TLS_SERVER_STATE_ERROR
+        return TLS_RESULT_ERROR
+
+    out[pos] = 22  # Handshake
+    out[pos + 1] = 0x03
+    out[pos + 2] = 0x03  # TLS 1.2 (legacy)
+    out[pos + 3] = ((sh_len >> 8) & 0xff) as u8
+    out[pos + 4] = (sh_len & 0xff) as u8
+    mem_copy(out + pos + 5, @sh_buf[0], sh_len as u64)
+    pos = pos + 5 + sh_len
+
+    # Update transcript with ServerHello
+    transcript_update(@server.transcript, @sh_buf[0], sh_len)
+
+    # Derive handshake keys
+    var th: [32]u8
+    transcript_hash(@server.transcript, @th[0])
+    tls13_key_schedule_derive_handshake(@server.key_schedule, @server.shared_secret[0], 32, @th[0])
+    tls13_key_schedule_derive_handshake_keys(@server.key_schedule, 16, 12)  # AES-128-GCM
+
+    # Initialize record states
+    tls_record_state_init(@server.read_state)
+    tls_record_state_init(@server.write_state)
+    tls_record_state_set_keys(@server.read_state, @server.key_schedule.client_write_key[0], @server.key_schedule.client_write_iv[0], @server.key_schedule.server_write_key[0], @server.key_schedule.server_write_iv[0], 16)
+    tls_record_state_set_keys(@server.write_state, @server.key_schedule.client_write_key[0], @server.key_schedule.client_write_iv[0], @server.key_schedule.server_write_key[0], @server.key_schedule.server_write_iv[0], 16)
+
+    # 2. EncryptedExtensions (encrypted)
+    var ee_buf: [64]u8
+    let ee_len: i64 = serialize_encrypted_extensions(@ee_buf[0], 64)
+    transcript_update(@server.transcript, @ee_buf[0], ee_len)
+
+    # 3. Certificate (encrypted)
+    var cert_buf: [MAX_CERT_SIZE]u8
+    let cert_len: i64 = serialize_certificate(server, @cert_buf[0], MAX_CERT_SIZE)
+    if cert_len < 0
+        server.last_error = TLS_ERR_NO_CERTIFICATE
+        server.state = TLS_SERVER_STATE_ERROR
+        return TLS_RESULT_ERROR
+    transcript_update(@server.transcript, @cert_buf[0], cert_len)
+
+    # 4. CertificateVerify (encrypted)
+    var cv_buf: [128]u8
+    let cv_len: i64 = serialize_certificate_verify(server, @cv_buf[0], 128)
+    if cv_len < 0
+        server.last_error = TLS_ERR_NO_PRIVATE_KEY
+        server.state = TLS_SERVER_STATE_ERROR
+        return TLS_RESULT_ERROR
+    transcript_update(@server.transcript, @cv_buf[0], cv_len)
+
+    # 5. Finished (encrypted)
+    var fin_buf: [64]u8
+    let fin_len: i64 = serialize_finished(server, @fin_buf[0], 64)
+
+    # Concatenate encrypted messages for single record
+    var encrypted_hs: [MAX_CERT_SIZE + 256]u8
+    var hs_len: i64 = 0
+    mem_copy(@encrypted_hs[hs_len], @ee_buf[0], ee_len as u64)
+    hs_len = hs_len + ee_len
+    mem_copy(@encrypted_hs[hs_len], @cert_buf[0], cert_len as u64)
+    hs_len = hs_len + cert_len
+    mem_copy(@encrypted_hs[hs_len], @cv_buf[0], cv_len as u64)
+    hs_len = hs_len + cv_len
+    mem_copy(@encrypted_hs[hs_len], @fin_buf[0], fin_len as u64)
+    hs_len = hs_len + fin_len
+
+    # Encrypt the concatenated handshake messages
+    var encrypted: [MAX_CERT_SIZE + 512]u8
+    let encrypt_result: i32 = tls_record_state_server_encrypt(@server.write_state, @encrypted_hs[0], hs_len as i32, 22, @encrypted[0], (MAX_CERT_SIZE + 512) as i32)
+    if encrypt_result < 0
+        server.last_error = TLS_ERR_PARSE_ERROR
+        server.state = TLS_SERVER_STATE_ERROR
+        return TLS_RESULT_ERROR
+
+    let encrypted_len: i64 = encrypt_result as i64
+
+    # Wrap in TLS record
+    if pos + 5 + encrypted_len > out_cap
+        server.last_error = TLS_ERR_BUFFER_TOO_SMALL
+        server.state = TLS_SERVER_STATE_ERROR
+        return TLS_RESULT_ERROR
+
+    out[pos] = 23  # Application Data (encrypted)
+    out[pos + 1] = 0x03
+    out[pos + 2] = 0x03
+    out[pos + 3] = ((encrypted_len >> 8) & 0xff) as u8
+    out[pos + 4] = (encrypted_len & 0xff) as u8
+    mem_copy(out + pos + 5, @encrypted[0], encrypted_len as u64)
+    pos = pos + 5 + encrypted_len
+
+    # Update transcript with Finished
+    transcript_update(@server.transcript, @fin_buf[0], fin_len)
+
+    # Consume ClientHello from receive buffer
+    let ch_record_len: i64 = 5 + ((server.recv_buf[3] as i64) << 8) + (server.recv_buf[4] as i64)
+    shift_recv_buf(server, ch_record_len)
+
+    server.state = TLS_SERVER_STATE_FINISHED_SENT
+    *out_len = pos
+
+    return TLS_RESULT_HAVE_OUTPUT
+
+pub fn process_client_finished(server: *TlsServer, out: *u8, out_cap: i64, out_len: *i64) -> i32
+    # Need at least TLS record header
+    if server.recv_len < 5
+        return TLS_RESULT_NEED_INPUT
+
+    # Parse TLS record header
+    let content_type: u8 = server.recv_buf[0]
+    let record_len: i64 = ((server.recv_buf[3] as i64) << 8) | (server.recv_buf[4] as i64)
+
+    if server.recv_len < 5 + record_len
+        return TLS_RESULT_NEED_INPUT
+
+    # Expect Application Data (encrypted)
+    if content_type != 23
+        server.last_error = TLS_ERR_UNEXPECTED_MESSAGE
+        server.state = TLS_SERVER_STATE_ERROR
+        return TLS_RESULT_ERROR
+
+    # Decrypt record
+    var plaintext: [256]u8
+    var inner_type: u8 = 0
+    let decrypt_result: i32 = tls_record_state_client_decrypt(@server.read_state, @server.recv_buf[5], record_len as i32, @plaintext[0], 256, @inner_type)
+
+    if decrypt_result < 0
+        server.last_error = TLS_ERR_DECRYPT_FAILED
+        server.state = TLS_SERVER_STATE_ERROR
+        return TLS_RESULT_ERROR
+
+    # Expect Handshake content
+    if inner_type != 22
+        server.last_error = TLS_ERR_UNEXPECTED_MESSAGE
+        server.state = TLS_SERVER_STATE_ERROR
+        return TLS_RESULT_ERROR
+
+    # Parse handshake header
+    if decrypt_result < 4
+        server.last_error = TLS_ERR_PARSE_ERROR
+        server.state = TLS_SERVER_STATE_ERROR
+        return TLS_RESULT_ERROR
+
+    if plaintext[0] != HS_FINISHED
+        server.last_error = TLS_ERR_UNEXPECTED_MESSAGE
+        server.state = TLS_SERVER_STATE_ERROR
+        return TLS_RESULT_ERROR
+
+    # Verify client's Finished
+    var expected_transcript: [32]u8
+    transcript_hash(@server.transcript, @expected_transcript[0])
+
+    let verify_result: i32 = finished_verify(@server.key_schedule.client_handshake_traffic_secret[0], @expected_transcript[0], @plaintext[4])
+
+    if verify_result != 1
+        server.last_error = TLS_ERR_FINISHED_MISMATCH
+        server.state = TLS_SERVER_STATE_ERROR
+        return TLS_RESULT_ERROR
+
+    # Update transcript with client Finished
+    transcript_update(@server.transcript, @plaintext[0], decrypt_result as i64)
+
+    # Derive application keys
+    var final_transcript: [32]u8
+    transcript_hash(@server.transcript, @final_transcript[0])
+    tls13_key_schedule_derive_application(@server.key_schedule, @final_transcript[0])
+    tls13_key_schedule_derive_application_keys(@server.key_schedule, 16, 12)
+
+    # Reset record states for application data
+    tls_record_state_set_keys(@server.read_state, @server.key_schedule.client_write_key[0], @server.key_schedule.client_write_iv[0], @server.key_schedule.server_write_key[0], @server.key_schedule.server_write_iv[0], 16)
+    server.read_state.client_seq = 0
+    server.read_state.server_seq = 0
+
+    tls_record_state_set_keys(@server.write_state, @server.key_schedule.client_write_key[0], @server.key_schedule.client_write_iv[0], @server.key_schedule.server_write_key[0], @server.key_schedule.server_write_iv[0], 16)
+    server.write_state.client_seq = 0
+    server.write_state.server_seq = 0
+
+    # Consume record
+    shift_recv_buf(server, 5 + record_len)
+
+    server.handshake_complete = 1
+    server.state = TLS_SERVER_STATE_CONNECTED
+
+    return TLS_RESULT_COMPLETE
+
+# ============================================================================
+# Application Data
+# ============================================================================
+
+# Encrypt and send application data
+# Returns bytes written to out, or negative on error
+pub fn tls_server_write(server: *TlsServer, data: *u8, data_len: i64, out: *u8, out_cap: i64) -> i64
+    if server.state != TLS_SERVER_STATE_CONNECTED
+        return -1
+
+    var encrypted: [16500]u8
+    let result: i32 = tls_record_state_server_encrypt(@server.write_state, data, data_len as i32, 23, @encrypted[0], 16500)
+
+    if result < 0
+        return -1
+
+    let encrypted_len: i64 = result as i64
+
+    if out_cap < 5 + encrypted_len
+        return -1
+
+    out[0] = 23  # Application Data
+    out[1] = 0x03
+    out[2] = 0x03
+    out[3] = ((encrypted_len >> 8) & 0xff) as u8
+    out[4] = (encrypted_len & 0xff) as u8
+    mem_copy(out + 5, @encrypted[0], encrypted_len as u64)
+
+    return 5 + encrypted_len
+
+# Decrypt received application data
+# Returns bytes written to out, or negative on error
+pub fn tls_server_read(server: *TlsServer, data: *u8, data_len: i64, out: *u8, out_cap: i64) -> i64
+    if server.state != TLS_SERVER_STATE_CONNECTED
+        return -1
+
+    if data_len < 5
+        return 0
+
+    let content_type: u8 = data[0]
+    let record_len: i64 = ((data[3] as i64) << 8) | (data[4] as i64)
+
+    if data_len < 5 + record_len
+        return 0
+
+    if content_type != 23
+        return -1
+
+    var plaintext: [16500]u8
+    var inner_type: u8 = 0
+
+    let result: i32 = tls_record_state_client_decrypt(@server.read_state, data + 5, record_len as i32, @plaintext[0], 16500, @inner_type)
+
+    if result < 0
+        return -1
+
+    if inner_type != 23
+        return -1
+
+    let plaintext_len: i64 = result as i64
+
+    if plaintext_len > out_cap
+        return -1
+
+    mem_copy(out, @plaintext[0], plaintext_len as u64)
+    return plaintext_len
+
+# ============================================================================
+# Close Connection
+# ============================================================================
+
+pub fn tls_server_close(server: *TlsServer, out: *u8, out_cap: i64) -> i64
+    if server.state != TLS_SERVER_STATE_CONNECTED
+        return 0
+
+    # Send close_notify alert
+    var alert: [2]u8
+    alert[0] = 1  # Warning
+    alert[1] = 0  # close_notify
+
+    var encrypted: [64]u8
+    let result: i32 = tls_record_state_server_encrypt(@server.write_state, @alert[0], 2, 21, @encrypted[0], 64)
+
+    if result < 0
+        return 0
+
+    let encrypted_len: i64 = result as i64
+
+    if out_cap < 5 + encrypted_len
+        return 0
+
+    out[0] = 23
+    out[1] = 0x03
+    out[2] = 0x03
+    out[3] = ((encrypted_len >> 8) & 0xff) as u8
+    out[4] = (encrypted_len & 0xff) as u8
+    mem_copy(out + 5, @encrypted[0], encrypted_len as u64)
+
+    server.state = TLS_SERVER_STATE_CLOSING
+    return 5 + encrypted_len
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+pub fn shift_recv_buf(server: *TlsServer, amount: i64)
+    if amount >= server.recv_len
+        server.recv_len = 0
+        return
+
+    var i: i64 = 0
+    while i < server.recv_len - amount
+        server.recv_buf[i] = server.recv_buf[i + amount]
+        i = i + 1
+    server.recv_len = server.recv_len - amount
+
+# Get current state
+pub fn tls_server_state(server: *TlsServer) -> i32
+    return server.state
+
+# Get last error
+pub fn tls_server_error(server: *TlsServer) -> i32
+    return server.last_error
+
+# Check if handshake is complete
+pub fn tls_server_is_connected(server: *TlsServer) -> i32
+    return server.handshake_complete

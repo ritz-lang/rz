@@ -1,0 +1,143 @@
+# 11_grep: Fixed-string search utility
+#
+# Usage: grep PATTERN [FILE...]
+#
+# Searches for PATTERN in each FILE (or stdin if no files given).
+# Prints lines that contain PATTERN.
+#
+# Features demonstrated:
+# - Span<u8> for efficient byte slice views
+# - Vec<u8> for buffered I/O
+# - Method syntax (UFCS)
+# - Line-by-line file reading
+# - Substring search
+
+# ============================================================================
+# Standard library imports
+# ============================================================================
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+import ritzlib.args
+import ritzlib.gvec
+import ritzlib.span
+
+# ===== I/O with Vec<u8> =====
+
+# Write a line from a Vec<u8> to stdout
+fn write_line(line: *Vec<u8>)
+    if line.len() > 0
+        sys_write(STDOUT, line.as_ptr(), line.len())
+    sys_write(STDOUT, "\n" as *u8, 1)
+
+# ===== Grep implementation =====
+
+# Process a file descriptor, printing lines that match pattern
+# Returns number of matching lines
+fn grep_fd(fd: i32, pattern: *Span<u8>) -> i64
+    var matches: i64 = 0
+
+    # Read buffer for file I/O
+    var read_buf: Vec<u8> = vec_with_cap<u8>(65536)
+
+    # Line accumulator
+    var line: Vec<u8> = vec_new<u8>()
+
+    # Read in chunks
+    var done: i32 = 0
+    while done == 0
+        # Ensure we have space to read
+        vec_ensure_cap<u8>(&read_buf, 4096)
+
+        # Read directly into the Vec's buffer
+        let n: i64 = sys_read(fd, read_buf.as_ptr() + read_buf.len(), 4096)
+        if n <= 0
+            done = 1
+        else
+            # Process bytes read
+            let start_pos: i64 = read_buf.len()
+            for i in 0..n
+                let c: u8 = *(read_buf.as_ptr() + start_pos + i)
+                if c == '\n'  # '\n'
+                    # Check if line matches pattern
+                    var line_span: Span<u8> = span_from_vec<u8>(&line)
+                    if span_contains(&line_span, pattern) == 1
+                        write_line(&line)
+                        matches += 1
+                    # Reset line
+                    line.clear()
+                else
+                    line.push(c)
+
+    # Handle final partial line (no trailing newline)
+    if line.len() > 0
+        var line_span: Span<u8> = span_from_vec<u8>(&line)
+        if span_contains(&line_span, pattern) == 1
+            write_line(&line)
+            matches += 1
+
+    # Vec<u8> cleanup is automatic via Drop trait
+    matches
+
+# Process a file by path
+fn grep_file(path: *u8, pattern: *Span<u8>) -> i64
+    let fd: i32 = sys_open(path, O_RDONLY)
+    if fd < 0
+        # Error opening file - print error message
+        sys_write(STDERR, "grep: " as *u8, 6)
+        sys_write(STDERR, path, strlen(path))
+        sys_write(STDERR, ": No such file\n" as *u8, 15)
+        return -1
+
+    let matches: i64 = grep_fd(fd, pattern)
+    sys_close(fd)
+    matches
+
+# ===== Main =====
+
+fn main(argc: i32, argv: **u8) -> i32
+    # Initialize argument parser
+    var parser: ArgParser
+    args_init(&parser, "grep", "Search for PATTERN in files")
+
+    # Define positionals: PATTERN required, then optional FILE(s)
+    # min=1 (PATTERN required), max=-1 (unlimited files after)
+    args_positional(&parser, "PATTERN [FILE...]", "Pattern and files to search", 1, -1)
+
+    # Parse arguments
+    if args_parse(&parser, argc, argv) != 0
+        return 1
+
+    # Get pattern from parsed arguments as a Span
+    let pattern_str: *u8 = args_get_positional(&parser, 0)
+    var pattern: Span<u8> = span_from_cstr(pattern_str)
+
+    var total_matches: i64 = 0
+    var had_error: i32 = 0
+
+    let num_files: i32 = parser.positional_count - 1  # Subtract 1 for PATTERN
+
+    if num_files == 0
+        # No files - read from stdin
+        let matches: i64 = grep_fd(STDIN, &pattern)
+        if matches < 0
+            had_error = 1
+        else
+            total_matches += matches
+    else
+        # Process each file
+        for i in 0..num_files
+            let path: *u8 = args_get_positional(&parser, i + 1)  # +1 to skip PATTERN
+            let matches: i64 = grep_file(path, &pattern)
+            if matches < 0
+                had_error = 1
+            else
+                total_matches += matches
+
+    # Return 0 if any matches, 1 if no matches, 2 on error
+    if had_error == 1
+        return 2
+    if total_matches == 0
+        return 1
+    0

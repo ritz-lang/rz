@@ -1,0 +1,275 @@
+# spire/test/test_utils.ritz
+#
+# Test utilities for Spire framework testing
+#
+# Provides helpers for:
+# - Building test requests
+# - Asserting response properties
+# - Common test fixtures
+#
+# Usage:
+#
+#   import test.test_utils { request_builder, assert_status, assert_json }
+#
+#   @test
+#   fn test_my_handler() -> i32
+#       var req: Request = request_get("/api/tasks")
+#       let resp: Response = my_handler(&req)
+#       assert_status_ok(&resp)
+#       assert_content_type_json(&resp)
+#       0
+
+import ritzlib.strview { StrView, strview_from_ptr }
+import ritzlib.string { String, string_new, string_from_strview }
+import ritzlib.gvec { Vec, vec_new, vec_len, vec_push }
+import ritzlib.hashmap { hashmap_new }
+
+import spire.http.method { Method, GET, POST, PUT, PATCH, DELETE }
+import spire.http.request { Request, request_new, request_with }
+import spire.http.request { request_set_header, request_set_param }
+import spire.http.response { Response, response_status_code, response_body_len }
+import spire.http.headers { headers_new, headers_get }
+import spire.utils { string_as_strview, strview_eq }
+
+# ============================================================================
+# Request Builders
+# ============================================================================
+
+# Create a GET request to given path
+pub fn request_get(path: *StrView) -> Request
+    return request_with(GET, path)
+
+# Create a POST request to given path
+pub fn request_post(path: *StrView) -> Request
+    return request_with(POST, path)
+
+# Create a PUT request to given path
+pub fn request_put(path: *StrView) -> Request
+    return request_with(PUT, path)
+
+# Create a PATCH request to given path
+pub fn request_patch(path: *StrView) -> Request
+    return request_with(PATCH, path)
+
+# Create a DELETE request to given path
+pub fn request_delete(path: *StrView) -> Request
+    return request_with(DELETE, path)
+
+# Create a POST request with JSON body
+pub fn request_post_json(path: *StrView, body: *StrView) -> Request
+    var req: Request = request_with(POST, path)
+    let ct_name: StrView = "Content-Type"
+    let ct_value: StrView = "application/json"
+    request_set_header(&req, &ct_name, &ct_value)
+    # Copy body bytes
+    var i: i64 = 0
+    while i < body.len
+        vec_push<u8>(&req.body, *(body.ptr + i))
+        i += 1
+    return req
+
+# Create a PUT request with JSON body
+pub fn request_put_json(path: *StrView, body: *StrView) -> Request
+    var req: Request = request_with(PUT, path)
+    let ct_name: StrView = "Content-Type"
+    let ct_value: StrView = "application/json"
+    request_set_header(&req, &ct_name, &ct_value)
+    var i: i64 = 0
+    while i < body.len
+        vec_push<u8>(&req.body, *(body.ptr + i))
+        i += 1
+    return req
+
+# Add Accept: application/json header
+pub fn request_accept_json(req:& Request)
+    let name: StrView = "Accept"
+    let value: StrView = "application/json"
+    request_set_header(req, &name, &value)
+
+# Add Accept: text/html header
+pub fn request_accept_html(req:& Request)
+    let name: StrView = "Accept"
+    let value: StrView = "text/html"
+    request_set_header(req, &name, &value)
+
+# Add Authorization header
+pub fn request_auth(req:& Request, token: *StrView)
+    let name: StrView = "Authorization"
+    request_set_header(req, &name, token)
+
+# Add Bearer token authorization
+pub fn request_bearer(req:& Request, token: *StrView)
+    let name: StrView = "Authorization"
+    # Build "Bearer <token>"
+    var value: String = string_new()
+    let prefix: StrView = "Bearer "
+    var i: i64 = 0
+    while i < prefix.len
+        vec_push<u8>(&value.data, *(prefix.ptr + i))
+        i += 1
+    i = 0
+    while i < token.len
+        vec_push<u8>(&value.data, *(token.ptr + i))
+        i += 1
+    let value_sv: StrView = string_as_strview(&value)
+    request_set_header(req, &name, &value_sv)
+
+# ============================================================================
+# Response Assertions
+# ============================================================================
+
+# Assert response has specific status code
+pub fn assert_status(resp: *Response, expected: u16) -> i32
+    let actual: u16 = response_status_code(resp)
+    if actual != expected
+        return 1  # fail
+    return 0
+
+# Assert response is 200 OK
+pub fn assert_status_ok(resp: *Response) -> i32
+    return assert_status(resp, 200)
+
+# Assert response is 201 Created
+pub fn assert_status_created(resp: *Response) -> i32
+    return assert_status(resp, 201)
+
+# Assert response is 204 No Content
+pub fn assert_status_no_content(resp: *Response) -> i32
+    return assert_status(resp, 204)
+
+# Assert response is 400 Bad Request
+pub fn assert_status_bad_request(resp: *Response) -> i32
+    return assert_status(resp, 400)
+
+# Assert response is 401 Unauthorized
+pub fn assert_status_unauthorized(resp: *Response) -> i32
+    return assert_status(resp, 401)
+
+# Assert response is 403 Forbidden
+pub fn assert_status_forbidden(resp: *Response) -> i32
+    return assert_status(resp, 403)
+
+# Assert response is 404 Not Found
+pub fn assert_status_not_found(resp: *Response) -> i32
+    return assert_status(resp, 404)
+
+# Assert response is 500 Internal Server Error
+pub fn assert_status_internal_error(resp: *Response) -> i32
+    return assert_status(resp, 500)
+
+# Assert response has Content-Type: application/json
+pub fn assert_content_type_json(resp: *Response) -> i32
+    let ct_name: StrView = "Content-Type"
+    match headers_get(&resp.headers, &ct_name)
+        Some(ct) =>
+            let expected: StrView = "application/json"
+            if strview_contains_check(&ct, &expected) == 1
+                return 0
+            return 1
+        None => 1
+
+# Assert response has Content-Type: text/html
+pub fn assert_content_type_html(resp: *Response) -> i32
+    let ct_name: StrView = "Content-Type"
+    match headers_get(&resp.headers, &ct_name)
+        Some(ct) =>
+            let expected: StrView = "text/html"
+            if strview_contains_check(&ct, &expected) == 1
+                return 0
+            return 1
+        None => 1
+
+# Assert response body is non-empty
+pub fn assert_body_not_empty(resp: *Response) -> i32
+    if response_body_len(resp) > 0
+        return 0
+    return 1
+
+# Assert response body length
+pub fn assert_body_len(resp: *Response, expected: i64) -> i32
+    let actual: i64 = response_body_len(resp)
+    if actual == expected
+        return 0
+    return 1
+
+# Assert response has specific header
+pub fn assert_has_header(resp: *Response, name: *StrView) -> i32
+    match headers_get(&resp.headers, name)
+        Some(_) => 0
+        None => 1
+
+# Assert response header has specific value
+pub fn assert_header_value(resp: *Response, name: *StrView, expected: *StrView) -> i32
+    match headers_get(&resp.headers, name)
+        Some(actual) =>
+            if strview_eq(&actual, expected) == 1
+                return 0
+            return 1
+        None => 1
+
+# ============================================================================
+# Body Assertions
+# ============================================================================
+
+# Get response body as StrView
+pub fn response_body_str(resp: *Response) -> StrView
+    return strview_from_ptr(resp.body.data, vec_len<u8>(&resp.body))
+
+# Assert body contains substring
+pub fn assert_body_contains(resp: *Response, needle: *StrView) -> i32
+    let body: StrView = response_body_str(resp)
+    if strview_contains_check(&body, needle) == 1
+        return 0
+    return 1
+
+# Assert body equals exact string
+pub fn assert_body_equals(resp: *Response, expected: *StrView) -> i32
+    let body: StrView = response_body_str(resp)
+    if strview_eq(&body, expected) == 1
+        return 0
+    return 1
+
+# ============================================================================
+# JSON Assertions (simple checks until we have proper JSON parser)
+# ============================================================================
+
+# Assert JSON body contains key (simple string check)
+pub fn assert_json_has_key(resp: *Response, key: *StrView) -> i32
+    let body: StrView = response_body_str(resp)
+    # Look for "key" pattern
+    # This is a simple check - real JSON parsing comes later
+    return strview_contains_check(&body, key) == 1
+
+# Assert JSON body contains key-value (simple pattern check)
+# e.g., assert_json_value(resp, "status", "ok") checks for "status":"ok"
+pub fn assert_json_value(resp: *Response, key: *StrView, value: *StrView) -> i32
+    let body: StrView = response_body_str(resp)
+    # Build pattern: "key":"value"
+    # This is a simple check - real JSON parsing comes later
+    # For now, just check both key and value are present
+    if strview_contains_check(&body, key) == 1
+        if strview_contains_check(&body, value) == 1
+            return 0
+    return 1
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+# Check if haystack contains needle
+fn strview_contains_check(haystack: *StrView, needle: *StrView) -> i32
+    if needle.len > haystack.len
+        return 0
+    if needle.len == 0
+        return 1
+    var i: i64 = 0
+    while i <= haystack.len - needle.len
+        var j: i64 = 0
+        while j < needle.len
+            if *(haystack.ptr + i + j) != *(needle.ptr + j)
+                break
+            j += 1
+        if j == needle.len
+            return 1
+        i += 1
+    return 0

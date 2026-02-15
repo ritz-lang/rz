@@ -1,0 +1,403 @@
+# valet/lib/tls/keyschedule.ritz - TLS 1.3 Key Schedule
+#
+# Implements the TLS 1.3 key derivation functions per RFC 8446 Section 7.
+#
+# Key Schedule Overview:
+#   PSK (or 0) -> HKDF-Extract -> Early Secret
+#                                    |
+#                      Derive-Secret(., "derived", "")
+#                                    v
+#   (EC)DHE -> HKDF-Extract -> Handshake Secret
+#                                    |
+#                      Derive-Secret(., "derived", "")
+#                                    v
+#   0 -> HKDF-Extract -> Master Secret
+#
+# Each secret is used to derive traffic keys via:
+#   Derive-Secret(Secret, Label, Hash(Messages))
+#
+# Key Types (client/server for each):
+#   - client_handshake_traffic_secret / server_handshake_traffic_secret
+#   - client_application_traffic_secret_0 / server_application_traffic_secret_0
+#
+# Traffic keys derived from these:
+#   - key = HKDF-Expand-Label(Secret, "key", "", key_length)
+#   - iv  = HKDF-Expand-Label(Secret, "iv", "", iv_length)
+
+import ritzlib.io
+import ritzlib.str
+
+# Import cryptosec primitives (via ritz.toml dependency)
+import cryptosec.sha256
+import cryptosec.hkdf
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+const SHA256_DIGEST_SIZE: i32 = 32
+const TLS_AES_128_GCM_SHA256_KEY_LEN: i32 = 16
+const TLS_AES_256_GCM_SHA384_KEY_LEN: i32 = 32
+const TLS_CHACHA20_POLY1305_KEY_LEN: i32 = 32
+const TLS_IV_LEN: i32 = 12
+
+# Cipher suite identifiers
+const TLS_AES_128_GCM_SHA256: u16 = 0x1301
+const TLS_AES_256_GCM_SHA384: u16 = 0x1302
+const TLS_CHACHA20_POLY1305_SHA256: u16 = 0x1303
+
+# ============================================================================
+# Key Schedule State
+# ============================================================================
+
+struct TlsKeySchedule
+    # Current secrets (32 bytes each for SHA-256 based suites)
+    early_secret: [32]u8
+    handshake_secret: [32]u8
+    master_secret: [32]u8
+
+    # Handshake traffic secrets
+    client_handshake_secret: [32]u8
+    server_handshake_secret: [32]u8
+
+    # Application traffic secrets
+    client_app_secret: [32]u8
+    server_app_secret: [32]u8
+
+    # Derived traffic keys
+    client_key: [32]u8
+    server_key: [32]u8
+    client_iv: [12]u8
+    server_iv: [12]u8
+
+    # Key lengths (depend on cipher suite)
+    key_len: i32
+    iv_len: i32
+
+    # Transcript hash state
+    transcript: Sha256
+    transcript_hash: [32]u8
+
+    # Cipher suite
+    cipher_suite: u16
+
+
+# ============================================================================
+# Helper: HKDF-Expand-Label (RFC 8446 Section 7.1)
+# ============================================================================
+
+# HKDF-Expand-Label(Secret, Label, Context, Length) =
+#     HKDF-Expand(Secret, HkdfLabel, Length)
+#
+# struct HkdfLabel {
+#     uint16 length = Length;
+#     opaque label<7..255> = "tls13 " + Label;
+#     opaque context<0..255> = Context;
+# };
+fn hkdf_expand_label(secret: *u8, label: *u8, label_len: i32,
+                     context: *u8, context_len: i32,
+                     out: *u8, out_len: i32) -> i32
+    # Build HkdfLabel structure
+    var hkdf_label: [512]u8
+    var pos: i32 = 0
+
+    # Length (2 bytes, big-endian)
+    hkdf_label[pos] = ((out_len >> 8) & 0xFF) as u8
+    pos += 1
+    hkdf_label[pos] = (out_len & 0xFF) as u8
+    pos += 1
+
+    # Label length (1 byte) - includes "tls13 " prefix (6 bytes)
+    let full_label_len: i32 = 6 + label_len
+    hkdf_label[pos] = full_label_len as u8
+    pos += 1
+
+    # Label prefix "tls13 "
+    hkdf_label[pos] = 't'
+    pos += 1
+    hkdf_label[pos] = 'l'
+    pos += 1
+    hkdf_label[pos] = 's'
+    pos += 1
+    hkdf_label[pos] = '1'
+    pos += 1
+    hkdf_label[pos] = '3'
+    pos += 1
+    hkdf_label[pos] = ' '
+    pos += 1
+
+    # Label
+    for i in 0..label_len
+        hkdf_label[pos] = *(label + i)
+        pos += 1
+
+    # Context length (1 byte)
+    hkdf_label[pos] = context_len as u8
+    pos += 1
+
+    # Context
+    for i in 0..context_len
+        hkdf_label[pos] = *(context + i)
+        pos += 1
+
+    # HKDF-Expand with the constructed info
+    return hkdf_expand(@secret[0], SHA256_DIGEST_SIZE, @hkdf_label[0], pos, out, out_len)
+
+
+# ============================================================================
+# Derive-Secret (RFC 8446 Section 7.1)
+# ============================================================================
+
+# Derive-Secret(Secret, Label, Messages) =
+#     HKDF-Expand-Label(Secret, Label, Transcript-Hash(Messages), Hash.length)
+fn derive_secret(ks: *TlsKeySchedule, label: *u8, label_len: i32, out: *u8) -> i32
+    # Get current transcript hash
+    var hash: [32]u8
+    var ctx_copy: Sha256
+
+    # Copy context and finalize to get hash without modifying original
+    for i in 0..104  # sizeof(Sha256) approximately
+        let src: *u8 = @ks.transcript as *u8
+        let dst: *u8 = @ctx_copy as *u8
+        *(dst + i) = *(src + i)
+
+    sha256_final(@ctx_copy, @hash[0])
+
+    return hkdf_expand_label(@ks.handshake_secret[0], label, label_len,
+                             @hash[0], SHA256_DIGEST_SIZE,
+                             out, SHA256_DIGEST_SIZE)
+
+
+# ============================================================================
+# Key Schedule Operations
+# ============================================================================
+
+# Initialize key schedule with cipher suite
+fn keyschedule_init(ks: *TlsKeySchedule, cipher_suite: u16) -> i32
+    ks.cipher_suite = cipher_suite
+
+    # Set key/IV lengths based on cipher suite
+    if cipher_suite == TLS_AES_128_GCM_SHA256
+        ks.key_len = TLS_AES_128_GCM_SHA256_KEY_LEN
+        ks.iv_len = TLS_IV_LEN
+    else
+        if cipher_suite == TLS_AES_256_GCM_SHA384
+            ks.key_len = TLS_AES_256_GCM_SHA384_KEY_LEN
+            ks.iv_len = TLS_IV_LEN
+        else
+            if cipher_suite == TLS_CHACHA20_POLY1305_SHA256
+                ks.key_len = TLS_CHACHA20_POLY1305_KEY_LEN
+                ks.iv_len = TLS_IV_LEN
+            else
+                return -1  # Unsupported cipher suite
+
+    # Initialize transcript hash
+    sha256_init(@ks.transcript)
+
+    # Zero all secrets
+    for i in 0..32
+        ks.early_secret[i] = 0
+        ks.handshake_secret[i] = 0
+        ks.master_secret[i] = 0
+        ks.client_handshake_secret[i] = 0
+        ks.server_handshake_secret[i] = 0
+        ks.client_app_secret[i] = 0
+        ks.server_app_secret[i] = 0
+        ks.client_key[i] = 0
+        ks.server_key[i] = 0
+
+    for i in 0..12
+        ks.client_iv[i] = 0
+        ks.server_iv[i] = 0
+
+    return 0
+
+
+# Update transcript hash with handshake message
+fn keyschedule_update_transcript(ks: *TlsKeySchedule, data: *u8, len: i32)
+    sha256_update(@ks.transcript, data, len as u64)
+
+
+# Get current transcript hash (for Finished verification)
+fn keyschedule_get_transcript_hash(ks: *TlsKeySchedule, out: *u8)
+    # Copy and finalize without modifying original
+    var ctx_copy: Sha256
+    for i in 0..104
+        let src: *u8 = @ks.transcript as *u8
+        let dst: *u8 = @ctx_copy as *u8
+        *(dst + i) = *(src + i)
+
+    sha256_final(@ctx_copy, out)
+
+
+# Derive Early Secret from PSK (or zeros for no PSK)
+fn keyschedule_derive_early_secret(ks: *TlsKeySchedule, psk: *u8, psk_len: i32) -> i32
+    var salt: [1]u8
+    salt[0] = 0
+    var zero_ikm: [32]u8
+    for i in 0..32
+        zero_ikm[i] = 0
+
+    # If no PSK, use zeros
+    var ikm: *u8 = @zero_ikm[0]
+    var ikm_len: i32 = SHA256_DIGEST_SIZE
+    if psk != null && psk_len > 0
+        ikm = psk
+        ikm_len = psk_len
+
+    # Early Secret = HKDF-Extract(0, PSK)
+    # Note: salt is empty (zero-length), not a single zero byte
+    return hkdf_extract(null, 0, ikm, ikm_len as u64, @ks.early_secret[0])
+
+
+# Derive Handshake Secret from shared secret (ECDHE result)
+fn keyschedule_derive_handshake_secret(ks: *TlsKeySchedule, shared_secret: *u8, secret_len: i32) -> i32
+    # Derive salt: Derive-Secret(Early, "derived", "")
+    var derived_secret: [32]u8
+    let derived_label = c"derived"
+    var empty_hash: [32]u8
+
+    # Hash of empty string
+    sha256(null, 0, @empty_hash[0])
+
+    hkdf_expand_label(@ks.early_secret[0], derived_label, 7,
+                      @empty_hash[0], SHA256_DIGEST_SIZE,
+                      @derived_secret[0], SHA256_DIGEST_SIZE)
+
+    # Handshake Secret = HKDF-Extract(derived_secret, shared_secret)
+    return hkdf_extract(@derived_secret[0], SHA256_DIGEST_SIZE as u64,
+                        shared_secret, secret_len as u64,
+                        @ks.handshake_secret[0])
+
+
+# Derive handshake traffic secrets
+fn keyschedule_derive_handshake_traffic_secrets(ks: *TlsKeySchedule) -> i32
+    let c_hs_label = c"c hs traffic"
+    let s_hs_label = c"s hs traffic"
+
+    # Get current transcript hash
+    var hash: [32]u8
+    keyschedule_get_transcript_hash(ks, @hash[0])
+
+    # client_handshake_traffic_secret
+    hkdf_expand_label(@ks.handshake_secret[0], c_hs_label, 12,
+                      @hash[0], SHA256_DIGEST_SIZE,
+                      @ks.client_handshake_secret[0], SHA256_DIGEST_SIZE)
+
+    # server_handshake_traffic_secret
+    hkdf_expand_label(@ks.handshake_secret[0], s_hs_label, 12,
+                      @hash[0], SHA256_DIGEST_SIZE,
+                      @ks.server_handshake_secret[0], SHA256_DIGEST_SIZE)
+
+    return 0
+
+
+# Derive traffic keys from a traffic secret
+fn keyschedule_derive_traffic_keys(secret: *u8, key: *u8, key_len: i32, iv: *u8, iv_len: i32) -> i32
+    let key_label = c"key"
+    let iv_label = c"iv"
+
+    # key = HKDF-Expand-Label(Secret, "key", "", key_length)
+    hkdf_expand_label(secret, key_label, 3, null, 0, key, key_len)
+
+    # iv = HKDF-Expand-Label(Secret, "iv", "", iv_length)
+    hkdf_expand_label(secret, iv_label, 2, null, 0, iv, iv_len)
+
+    return 0
+
+
+# Derive handshake keys (call after derive_handshake_traffic_secrets)
+fn keyschedule_derive_handshake_keys(ks: *TlsKeySchedule) -> i32
+    # Client handshake key/IV
+    keyschedule_derive_traffic_keys(@ks.client_handshake_secret[0],
+                                    @ks.client_key[0], ks.key_len,
+                                    @ks.client_iv[0], ks.iv_len)
+
+    # Server handshake key/IV
+    keyschedule_derive_traffic_keys(@ks.server_handshake_secret[0],
+                                    @ks.server_key[0], ks.key_len,
+                                    @ks.server_iv[0], ks.iv_len)
+
+    return 0
+
+
+# Derive Master Secret
+fn keyschedule_derive_master_secret(ks: *TlsKeySchedule) -> i32
+    # Derive salt from handshake secret
+    var derived_secret: [32]u8
+    let derived_label = c"derived"
+    var empty_hash: [32]u8
+
+    sha256(null, 0, @empty_hash[0])
+
+    hkdf_expand_label(@ks.handshake_secret[0], derived_label, 7,
+                      @empty_hash[0], SHA256_DIGEST_SIZE,
+                      @derived_secret[0], SHA256_DIGEST_SIZE)
+
+    # Master Secret = HKDF-Extract(derived_secret, 0)
+    var zero_ikm: [32]u8
+    for i in 0..32
+        zero_ikm[i] = 0
+
+    return hkdf_extract(@derived_secret[0], SHA256_DIGEST_SIZE as u64,
+                        @zero_ikm[0], SHA256_DIGEST_SIZE as u64,
+                        @ks.master_secret[0])
+
+
+# Derive application traffic secrets
+fn keyschedule_derive_app_traffic_secrets(ks: *TlsKeySchedule) -> i32
+    let c_app_label = c"c ap traffic"
+    let s_app_label = c"s ap traffic"
+
+    # Get current transcript hash (should be after server Finished)
+    var hash: [32]u8
+    keyschedule_get_transcript_hash(ks, @hash[0])
+
+    # client_application_traffic_secret_0
+    hkdf_expand_label(@ks.master_secret[0], c_app_label, 12,
+                      @hash[0], SHA256_DIGEST_SIZE,
+                      @ks.client_app_secret[0], SHA256_DIGEST_SIZE)
+
+    # server_application_traffic_secret_0
+    hkdf_expand_label(@ks.master_secret[0], s_app_label, 12,
+                      @hash[0], SHA256_DIGEST_SIZE,
+                      @ks.server_app_secret[0], SHA256_DIGEST_SIZE)
+
+    return 0
+
+
+# Derive application keys (call after derive_app_traffic_secrets)
+fn keyschedule_derive_app_keys(ks: *TlsKeySchedule) -> i32
+    # Client application key/IV
+    keyschedule_derive_traffic_keys(@ks.client_app_secret[0],
+                                    @ks.client_key[0], ks.key_len,
+                                    @ks.client_iv[0], ks.iv_len)
+
+    # Server application key/IV
+    keyschedule_derive_traffic_keys(@ks.server_app_secret[0],
+                                    @ks.server_key[0], ks.key_len,
+                                    @ks.server_iv[0], ks.iv_len)
+
+    return 0
+
+
+# Compute Finished verify_data
+# verify_data = HMAC(finished_key, transcript_hash)
+# finished_key = HKDF-Expand-Label(BaseKey, "finished", "", Hash.length)
+fn keyschedule_compute_finished(ks: *TlsKeySchedule, base_key: *u8, verify_data: *u8) -> i32
+    var finished_key: [32]u8
+    let finished_label = c"finished"
+
+    # finished_key = HKDF-Expand-Label(BaseKey, "finished", "", 32)
+    hkdf_expand_label(base_key, finished_label, 8, null, 0,
+                      @finished_key[0], SHA256_DIGEST_SIZE)
+
+    # Get transcript hash
+    var hash: [32]u8
+    keyschedule_get_transcript_hash(ks, @hash[0])
+
+    # verify_data = HMAC-SHA256(finished_key, transcript_hash)
+    return hmac_sha256(@finished_key[0], SHA256_DIGEST_SIZE as u64,
+                       @hash[0], SHA256_DIGEST_SIZE as u64,
+                       verify_data)
+

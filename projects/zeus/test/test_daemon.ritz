@@ -1,0 +1,514 @@
+# test/test_daemon.ritz - Tests for Zeus daemon
+#
+# The daemon is the main entry point that:
+#   - Parses CLI args (worker count, shm size, socket path)
+#   - Creates shared memory regions
+#   - Spawns and manages worker processes
+#   - Handles signals (SIGTERM, SIGHUP)
+#   - Listens for Valet connections
+#
+# Design goals:
+#   - Lightweight process supervisor
+#   - Zero-downtime restarts via SIGHUP
+#   - Minimal syscalls in hot path
+
+import ritzlib.sys
+import ritzlib.io
+import helpers
+import lib.daemon
+import lib.shm
+import lib.control
+
+# ============================================================================
+# Test: Daemon Configuration
+# ============================================================================
+
+[[test]]
+fn test_daemon_config_defaults() -> i32
+    var cfg: DaemonConfig
+    daemon_config_init(@cfg)
+
+    if cfg.worker_count <= 0
+        "FAIL: worker_count should be > 0\n"
+        return 1
+
+    if cfg.shm_size <= 0
+        "FAIL: shm_size should be > 0\n"
+        return 1
+
+    if cfg.ring_capacity <= 0
+        "FAIL: ring_capacity should be > 0\n"
+        return 1
+
+    return 0
+
+[[test]]
+fn test_daemon_config_custom() -> i32
+    var cfg: DaemonConfig
+    daemon_config_init(@cfg)
+
+    cfg.worker_count = 8
+    cfg.shm_size = 4194304  # 4 MB
+    cfg.ring_capacity = 512
+
+    let r1: i32 = assert_eq_i32(cfg.worker_count, 8)
+    if r1 != 0
+        return r1
+
+    let r2: i32 = assert_eq_i64(cfg.shm_size, 4194304)
+    if r2 != 0
+        return r2
+
+    let r3: i32 = assert_eq_i64(cfg.ring_capacity, 512)
+    if r3 != 0
+        return r3
+
+    return 0
+
+# ============================================================================
+# Test: Daemon Context Initialization
+# ============================================================================
+
+[[test]]
+fn test_daemon_context_init() -> i32
+    var cfg: DaemonConfig
+    daemon_config_init(@cfg)
+    cfg.worker_count = 2
+
+    var ctx: DaemonContext
+    let result: i32 = daemon_init(@ctx, @cfg)
+    if result < 0
+        "FAIL: daemon_init failed\n"
+        return 1
+
+    let r1: i32 = assert_eq_i32(ctx.state, DAEMON_STATE_IDLE)
+    if r1 != 0
+        daemon_destroy(@ctx)
+        return r1
+
+    let r2: i32 = assert_eq_i32(ctx.worker_count, 0)  # No workers spawned yet
+    if r2 != 0
+        daemon_destroy(@ctx)
+        return r2
+
+    daemon_destroy(@ctx)
+    return 0
+
+[[test]]
+fn test_daemon_context_destroy() -> i32
+    var cfg: DaemonConfig
+    daemon_config_init(@cfg)
+
+    var ctx: DaemonContext
+    daemon_init(@ctx, @cfg)
+
+    daemon_destroy(@ctx)
+
+    # Should be in stopped state
+    if ctx.state != DAEMON_STATE_STOPPED
+        "FAIL: state should be STOPPED after destroy\n"
+        return 1
+
+    return 0
+
+# ============================================================================
+# Test: Worker Slot Allocation
+# ============================================================================
+
+[[test]]
+fn test_daemon_alloc_worker_slot() -> i32
+    var cfg: DaemonConfig
+    daemon_config_init(@cfg)
+    cfg.worker_count = 4
+
+    var ctx: DaemonContext
+    daemon_init(@ctx, @cfg)
+
+    # Allocate a worker slot
+    let slot_idx: i32 = daemon_alloc_worker_slot(@ctx)
+    if slot_idx < 0
+        "FAIL: failed to alloc worker slot\n"
+        daemon_destroy(@ctx)
+        return 1
+
+    # Slot should have shm created
+    let slot: *WorkerSlot = daemon_get_worker_slot(@ctx, slot_idx)
+    if slot == null
+        "FAIL: slot is null\n"
+        daemon_destroy(@ctx)
+        return 1
+
+    if slot.shm.fd < 0
+        "FAIL: shm fd should be valid\n"
+        daemon_destroy(@ctx)
+        return 1
+
+    daemon_destroy(@ctx)
+    return 0
+
+[[test]]
+fn test_daemon_alloc_max_workers() -> i32
+    var cfg: DaemonConfig
+    daemon_config_init(@cfg)
+    cfg.worker_count = 2
+
+    var ctx: DaemonContext
+    daemon_init(@ctx, @cfg)
+
+    # Allocate all slots
+    let s1: i32 = daemon_alloc_worker_slot(@ctx)
+    let s2: i32 = daemon_alloc_worker_slot(@ctx)
+
+    if s1 < 0 || s2 < 0
+        "FAIL: should allocate 2 slots\n"
+        daemon_destroy(@ctx)
+        return 1
+
+    # Third should fail
+    let s3: i32 = daemon_alloc_worker_slot(@ctx)
+    if s3 >= 0
+        "FAIL: should not allocate beyond max\n"
+        daemon_destroy(@ctx)
+        return 1
+
+    daemon_destroy(@ctx)
+    return 0
+
+[[test]]
+fn test_daemon_free_worker_slot() -> i32
+    var cfg: DaemonConfig
+    daemon_config_init(@cfg)
+    cfg.worker_count = 2
+
+    var ctx: DaemonContext
+    daemon_init(@ctx, @cfg)
+
+    let slot_idx: i32 = daemon_alloc_worker_slot(@ctx)
+    daemon_free_worker_slot(@ctx, slot_idx)
+
+    # Should be able to allocate again
+    let slot_idx2: i32 = daemon_alloc_worker_slot(@ctx)
+    if slot_idx2 < 0
+        "FAIL: should reuse freed slot\n"
+        daemon_destroy(@ctx)
+        return 1
+
+    daemon_destroy(@ctx)
+    return 0
+
+# ============================================================================
+# Test: Worker Spawning (unit tests - no actual fork)
+# ============================================================================
+
+[[test]]
+fn test_daemon_prepare_worker() -> i32
+    var cfg: DaemonConfig
+    daemon_config_init(@cfg)
+    cfg.worker_count = 2
+
+    var ctx: DaemonContext
+    daemon_init(@ctx, @cfg)
+
+    let slot_idx: i32 = daemon_alloc_worker_slot(@ctx)
+
+    # Prepare worker (sets up shm, doesn't fork)
+    let result: i32 = daemon_prepare_worker(@ctx, slot_idx)
+    if result < 0
+        "FAIL: prepare_worker failed\n"
+        daemon_destroy(@ctx)
+        return 1
+
+    let slot: *WorkerSlot = daemon_get_worker_slot(@ctx, slot_idx)
+    if slot.state != WORKER_SLOT_PREPARED
+        "FAIL: slot should be PREPARED\n"
+        daemon_destroy(@ctx)
+        return 1
+
+    daemon_destroy(@ctx)
+    return 0
+
+[[test]]
+fn test_daemon_mark_worker_running() -> i32
+    var cfg: DaemonConfig
+    daemon_config_init(@cfg)
+    cfg.worker_count = 2
+
+    var ctx: DaemonContext
+    daemon_init(@ctx, @cfg)
+
+    let slot_idx: i32 = daemon_alloc_worker_slot(@ctx)
+    daemon_prepare_worker(@ctx, slot_idx)
+
+    # Simulate worker started (normally done after fork)
+    daemon_mark_worker_running(@ctx, slot_idx, 12345)  # fake PID
+
+    let slot: *WorkerSlot = daemon_get_worker_slot(@ctx, slot_idx)
+    if slot.state != WORKER_SLOT_RUNNING
+        "FAIL: slot should be RUNNING\n"
+        daemon_destroy(@ctx)
+        return 1
+
+    if slot.pid != 12345
+        "FAIL: pid should be 12345\n"
+        daemon_destroy(@ctx)
+        return 1
+
+    daemon_destroy(@ctx)
+    return 0
+
+# ============================================================================
+# Test: Worker Lifecycle
+# ============================================================================
+
+[[test]]
+fn test_daemon_request_worker_stop() -> i32
+    var cfg: DaemonConfig
+    daemon_config_init(@cfg)
+    cfg.worker_count = 2
+
+    var ctx: DaemonContext
+    daemon_init(@ctx, @cfg)
+
+    let slot_idx: i32 = daemon_alloc_worker_slot(@ctx)
+    daemon_prepare_worker(@ctx, slot_idx)
+    daemon_mark_worker_running(@ctx, slot_idx, 12345)
+
+    # Request stop
+    daemon_request_worker_stop(@ctx, slot_idx)
+
+    let slot: *WorkerSlot = daemon_get_worker_slot(@ctx, slot_idx)
+    if slot.state != WORKER_SLOT_STOPPING
+        "FAIL: slot should be STOPPING\n"
+        daemon_destroy(@ctx)
+        return 1
+
+    # Control block should signal stop
+    let cb: *ControlBlock = shm_get_control_block(@slot.shm)
+    if cb.state != WORKER_STATE_STOPPING
+        "FAIL: control block should signal STOPPING\n"
+        daemon_destroy(@ctx)
+        return 1
+
+    daemon_destroy(@ctx)
+    return 0
+
+[[test]]
+fn test_daemon_get_running_worker_count() -> i32
+    var cfg: DaemonConfig
+    daemon_config_init(@cfg)
+    cfg.worker_count = 4
+
+    var ctx: DaemonContext
+    daemon_init(@ctx, @cfg)
+
+    # Initially 0
+    if daemon_get_running_worker_count(@ctx) != 0
+        "FAIL: should have 0 running workers\n"
+        daemon_destroy(@ctx)
+        return 1
+
+    # Add 2 running workers
+    let s1: i32 = daemon_alloc_worker_slot(@ctx)
+    daemon_prepare_worker(@ctx, s1)
+    daemon_mark_worker_running(@ctx, s1, 1001)
+
+    let s2: i32 = daemon_alloc_worker_slot(@ctx)
+    daemon_prepare_worker(@ctx, s2)
+    daemon_mark_worker_running(@ctx, s2, 1002)
+
+    if daemon_get_running_worker_count(@ctx) != 2
+        "FAIL: should have 2 running workers\n"
+        daemon_destroy(@ctx)
+        return 1
+
+    daemon_destroy(@ctx)
+    return 0
+
+# ============================================================================
+# Test: Daemon State Machine
+# ============================================================================
+
+[[test]]
+fn test_daemon_state_transitions() -> i32
+    var cfg: DaemonConfig
+    daemon_config_init(@cfg)
+
+    var ctx: DaemonContext
+    daemon_init(@ctx, @cfg)
+
+    # IDLE -> STARTING
+    daemon_start(@ctx)
+    if ctx.state != DAEMON_STATE_STARTING
+        "FAIL: state should be STARTING\n"
+        daemon_destroy(@ctx)
+        return 1
+
+    # STARTING -> RUNNING (called after workers are up)
+    daemon_set_running(@ctx)
+    if ctx.state != DAEMON_STATE_RUNNING
+        "FAIL: state should be RUNNING\n"
+        daemon_destroy(@ctx)
+        return 1
+
+    # RUNNING -> STOPPING
+    daemon_stop(@ctx)
+    if ctx.state != DAEMON_STATE_STOPPING
+        "FAIL: state should be STOPPING\n"
+        daemon_destroy(@ctx)
+        return 1
+
+    daemon_destroy(@ctx)
+    return 0
+
+# ============================================================================
+# Test: Socket Listener
+# ============================================================================
+
+[[test]]
+fn test_daemon_create_socket() -> i32
+    var cfg: DaemonConfig
+    daemon_config_init(@cfg)
+
+    var ctx: DaemonContext
+    daemon_init(@ctx, @cfg)
+
+    # Create unix socket
+    let result: i32 = daemon_create_socket(@ctx, c"/tmp/zeus_test.sock")
+    if result < 0
+        "FAIL: create_socket failed\n"
+        daemon_destroy(@ctx)
+        return 1
+
+    if ctx.listen_fd < 0
+        "FAIL: listen_fd should be valid\n"
+        daemon_destroy(@ctx)
+        return 1
+
+    # Clean up socket file
+    sys_unlink(c"/tmp/zeus_test.sock")
+    daemon_destroy(@ctx)
+    return 0
+
+[[test]]
+fn test_daemon_socket_cleanup() -> i32
+    var cfg: DaemonConfig
+    daemon_config_init(@cfg)
+
+    var ctx: DaemonContext
+    daemon_init(@ctx, @cfg)
+
+    daemon_create_socket(@ctx, c"/tmp/zeus_test2.sock")
+
+    # Destroy should close socket
+    let fd: i32 = ctx.listen_fd
+    daemon_destroy(@ctx)
+
+    if ctx.listen_fd != -1
+        "FAIL: listen_fd should be -1 after destroy\n"
+        return 1
+
+    # Clean up socket file
+    sys_unlink(c"/tmp/zeus_test2.sock")
+    return 0
+
+# ============================================================================
+# Test: Signal Handling Setup
+# ============================================================================
+
+[[test]]
+fn test_daemon_signal_pipe() -> i32
+    var cfg: DaemonConfig
+    daemon_config_init(@cfg)
+
+    var ctx: DaemonContext
+    daemon_init(@ctx, @cfg)
+
+    # Signal pipe should be created
+    if ctx.signal_read_fd < 0
+        "FAIL: signal_read_fd should be valid\n"
+        daemon_destroy(@ctx)
+        return 1
+
+    if ctx.signal_write_fd < 0
+        "FAIL: signal_write_fd should be valid\n"
+        daemon_destroy(@ctx)
+        return 1
+
+    daemon_destroy(@ctx)
+    return 0
+
+[[test]]
+fn test_daemon_notify_signal() -> i32
+    var cfg: DaemonConfig
+    daemon_config_init(@cfg)
+
+    var ctx: DaemonContext
+    daemon_init(@ctx, @cfg)
+
+    # Write to signal pipe (simulates signal handler)
+    daemon_notify_signal(@ctx, 15)  # SIGTERM
+
+    # Read it back
+    var buf: [1]u8
+    let n: i64 = sys_read(ctx.signal_read_fd, @buf[0], 1)
+    if n != 1
+        "FAIL: should read 1 byte\n"
+        daemon_destroy(@ctx)
+        return 1
+
+    if buf[0] != 15
+        "FAIL: should read SIGTERM (15)\n"
+        daemon_destroy(@ctx)
+        return 1
+
+    daemon_destroy(@ctx)
+    return 0
+
+# ============================================================================
+# Test: Worker Registration for Valet
+# ============================================================================
+
+[[test]]
+fn test_daemon_get_worker_shm_fd() -> i32
+    var cfg: DaemonConfig
+    daemon_config_init(@cfg)
+    cfg.worker_count = 2
+
+    var ctx: DaemonContext
+    daemon_init(@ctx, @cfg)
+
+    let slot_idx: i32 = daemon_alloc_worker_slot(@ctx)
+    daemon_prepare_worker(@ctx, slot_idx)
+    daemon_mark_worker_running(@ctx, slot_idx, 1001)
+
+    # Get shm fd for Valet
+    let fd: i32 = daemon_get_worker_shm_fd(@ctx, slot_idx)
+    if fd < 0
+        "FAIL: should get valid shm fd\n"
+        daemon_destroy(@ctx)
+        return 1
+
+    daemon_destroy(@ctx)
+    return 0
+
+[[test]]
+fn test_daemon_get_worker_shm_size() -> i32
+    var cfg: DaemonConfig
+    daemon_config_init(@cfg)
+    cfg.worker_count = 2
+
+    var ctx: DaemonContext
+    daemon_init(@ctx, @cfg)
+
+    let slot_idx: i32 = daemon_alloc_worker_slot(@ctx)
+    daemon_prepare_worker(@ctx, slot_idx)
+
+    # Get shm size for Valet to attach
+    let size: i64 = daemon_get_worker_shm_size(@ctx, slot_idx)
+    if size <= 0
+        "FAIL: should get valid shm size\n"
+        daemon_destroy(@ctx)
+        return 1
+
+    daemon_destroy(@ctx)
+    return 0

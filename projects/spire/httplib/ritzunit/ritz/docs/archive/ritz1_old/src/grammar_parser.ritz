@@ -1,0 +1,373 @@
+# ritz1/src/grammar_parser.ritz - Grammar File Parser
+#
+# Parses the combined grammar.ritz file and extracts token definitions.
+# Token rules are identified by UPPERCASE names and build the lexer.
+# Grammar rules (lowercase) are parsed but not yet used for parser generation.
+#
+# Token syntax:
+#   NAME.PRIORITY = "literal"    - Literal token with priority
+#   NAME.PRIORITY = /regex/      - Regex token with priority
+#   NAME = "literal"             - Literal token (priority 0)
+#   NAME = /regex/               - Regex token (priority 0)
+#   @skip NAME = pattern         - Token to skip
+#   @synthetic NAME              - Synthetic token (no pattern)
+#
+# Grammar syntax (parsed but not yet used):
+#   name: rule1 | rule2          - Grammar rule
+#   name: TOKEN other_rule       - References tokens and rules
+#
+# Note: This file has no dependencies on lexer.ritz or nfa.ritz.
+# The grammar_builder.ritz file contains functions that use those.
+
+# ============================================================================
+# String Utilities (must come first for use by other functions)
+# ============================================================================
+
+# Compare two strings for equality
+fn grammar_streq(a: *i8, alen: i32, b: *i8, blen: i32) -> i32
+  if alen != blen
+    return 0
+  var i: i32 = 0
+  while i < alen
+    if (*(a + i)) != (*(b + i))
+      return 0
+    i = i + 1
+  1
+
+# Check if character is uppercase A-Z
+fn grammar_is_upper(ch: i32) -> i32
+  if ch >= 65 && ch <= 90
+    return 1
+  0
+
+# Check if character is lowercase a-z
+fn grammar_is_lower(ch: i32) -> i32
+  if ch >= 97 && ch <= 122
+    return 1
+  0
+
+# Check if character is alphanumeric or underscore
+fn grammar_is_alnum(ch: i32) -> i32
+  if ch >= 65 && ch <= 90
+    return 1
+  if ch >= 97 && ch <= 122
+    return 1
+  if ch >= 48 && ch <= 57
+    return 1
+  if ch == 95
+    return 1
+  0
+
+# Check if character is digit
+fn grammar_is_digit(ch: i32) -> i32
+  if ch >= 48 && ch <= 57
+    return 1
+  0
+
+# Skip whitespace (space and tab only, not newline)
+fn grammar_skip_ws(src: *i8, pos: i32, len: i32) -> i32
+  var p: i32 = pos
+  while p < len
+    let ch: i32 = (*(src + p)) & 255
+    if ch != 32 && ch != 9
+      return p
+    p = p + 1
+  p
+
+# ============================================================================
+# Token Name to ID Mapping
+# ============================================================================
+
+# Map token name string to token ID
+# Returns -1 if unknown
+fn grammar_token_id(name: *i8, len: i32) -> i32
+  if grammar_streq(name, len, "INT", 3) == 1
+    return TOK_INT
+  if grammar_streq(name, len, "FLOAT", 5) == 1
+    return TOK_FLOAT
+  if grammar_streq(name, len, "STRING", 6) == 1
+    return TOK_STRING
+  if grammar_streq(name, len, "CHAR", 4) == 1
+    return TOK_CHAR
+  if grammar_streq(name, len, "IDENT", 5) == 1
+    return TOK_IDENT
+
+  # Keywords
+  if grammar_streq(name, len, "FN", 2) == 1
+    return TOK_FN
+  if grammar_streq(name, len, "LET", 3) == 1
+    return TOK_LET
+  if grammar_streq(name, len, "VAR", 3) == 1
+    return TOK_VAR
+  if grammar_streq(name, len, "IF", 2) == 1
+    return TOK_IF
+  if grammar_streq(name, len, "ELSE", 4) == 1
+    return TOK_ELSE
+  if grammar_streq(name, len, "WHILE", 5) == 1
+    return TOK_WHILE
+  if grammar_streq(name, len, "FOR", 3) == 1
+    return TOK_FOR
+  if grammar_streq(name, len, "IN", 2) == 1
+    return TOK_IN
+  if grammar_streq(name, len, "MATCH", 5) == 1
+    return TOK_MATCH
+  if grammar_streq(name, len, "RETURN", 6) == 1
+    return TOK_RETURN
+  if grammar_streq(name, len, "STRUCT", 6) == 1
+    return TOK_STRUCT
+  if grammar_streq(name, len, "ENUM", 4) == 1
+    return TOK_ENUM
+  if grammar_streq(name, len, "IMPORT", 6) == 1
+    return TOK_IMPORT
+  if grammar_streq(name, len, "EXTERN", 6) == 1
+    return TOK_EXTERN
+  if grammar_streq(name, len, "TRUE", 4) == 1
+    return TOK_TRUE
+  if grammar_streq(name, len, "FALSE", 5) == 1
+    return TOK_FALSE
+  if grammar_streq(name, len, "UNSAFE", 6) == 1
+    return TOK_UNSAFE
+  if grammar_streq(name, len, "CONST", 5) == 1
+    return TOK_CONST
+  if grammar_streq(name, len, "ASSERT", 6) == 1
+    return TOK_ASSERT
+  if grammar_streq(name, len, "BREAK", 5) == 1
+    return TOK_BREAK
+  if grammar_streq(name, len, "CONTINUE", 8) == 1
+    return TOK_CONTINUE
+  if grammar_streq(name, len, "MUT", 3) == 1
+    return TOK_MUT
+
+  # Single-char operators
+  if grammar_streq(name, len, "PLUS", 4) == 1
+    return TOK_PLUS
+  if grammar_streq(name, len, "MINUS", 5) == 1
+    return TOK_MINUS
+  if grammar_streq(name, len, "STAR", 4) == 1
+    return TOK_STAR
+  if grammar_streq(name, len, "SLASH", 5) == 1
+    return TOK_SLASH
+  if grammar_streq(name, len, "PERCENT", 7) == 1
+    return TOK_PERCENT
+  if grammar_streq(name, len, "AMP", 3) == 1
+    return TOK_AMP
+  if grammar_streq(name, len, "PIPE", 4) == 1
+    return TOK_PIPE
+  if grammar_streq(name, len, "CARET", 5) == 1
+    return TOK_CARET
+  if grammar_streq(name, len, "TILDE", 5) == 1
+    return TOK_TILDE
+  if grammar_streq(name, len, "BANG", 4) == 1
+    return TOK_BANG
+  if grammar_streq(name, len, "LT", 2) == 1
+    return TOK_LT
+  if grammar_streq(name, len, "GT", 2) == 1
+    return TOK_GT
+  if grammar_streq(name, len, "EQ", 2) == 1
+    return TOK_EQ
+  if grammar_streq(name, len, "DOT", 3) == 1
+    return TOK_DOT
+  if grammar_streq(name, len, "QUESTION", 8) == 1
+    return TOK_QUESTION
+
+  # Multi-char operators
+  if grammar_streq(name, len, "EQEQ", 4) == 1
+    return TOK_EQEQ
+  if grammar_streq(name, len, "NEQ", 3) == 1
+    return TOK_NEQ
+  if grammar_streq(name, len, "LEQ", 3) == 1
+    return TOK_LEQ
+  if grammar_streq(name, len, "GEQ", 3) == 1
+    return TOK_GEQ
+  if grammar_streq(name, len, "ARROW", 5) == 1
+    return TOK_ARROW
+  if grammar_streq(name, len, "FATARROW", 8) == 1
+    return TOK_FATARROW
+  if grammar_streq(name, len, "DOTDOT", 6) == 1
+    return TOK_DOTDOT
+  if grammar_streq(name, len, "AMPAMP", 6) == 1
+    return TOK_AMPAMP
+  if grammar_streq(name, len, "PIPEPIPE", 8) == 1
+    return TOK_PIPEPIPE
+  if grammar_streq(name, len, "PLUSEQ", 6) == 1
+    return TOK_PLUSEQ
+  if grammar_streq(name, len, "MINUSEQ", 7) == 1
+    return TOK_MINUSEQ
+  if grammar_streq(name, len, "STAREQ", 6) == 1
+    return TOK_STAREQ
+  if grammar_streq(name, len, "SLASHEQ", 7) == 1
+    return TOK_SLASHEQ
+  if grammar_streq(name, len, "COLONCOLON", 10) == 1
+    return TOK_COLONCOLON
+
+  # Delimiters
+  if grammar_streq(name, len, "LPAREN", 6) == 1
+    return TOK_LPAREN
+  if grammar_streq(name, len, "RPAREN", 6) == 1
+    return TOK_RPAREN
+  if grammar_streq(name, len, "LBRACKET", 8) == 1
+    return TOK_LBRACKET
+  if grammar_streq(name, len, "RBRACKET", 8) == 1
+    return TOK_RBRACKET
+  if grammar_streq(name, len, "LBRACE", 6) == 1
+    return TOK_LBRACE
+  if grammar_streq(name, len, "RBRACE", 6) == 1
+    return TOK_RBRACE
+  if grammar_streq(name, len, "COMMA", 5) == 1
+    return TOK_COMMA
+  if grammar_streq(name, len, "COLON", 5) == 1
+    return TOK_COLON
+  if grammar_streq(name, len, "SEMI", 4) == 1
+    return TOK_SEMI
+  if grammar_streq(name, len, "AT", 2) == 1
+    return TOK_AT
+
+  # Synthetic/special
+  if grammar_streq(name, len, "NEWLINE", 7) == 1
+    return TOK_NEWLINE
+  if grammar_streq(name, len, "INDENT", 6) == 1
+    return TOK_INDENT
+  if grammar_streq(name, len, "DEDENT", 6) == 1
+    return TOK_DEDENT
+  if grammar_streq(name, len, "WS", 2) == 1
+    return TOK_SKIP
+  if grammar_streq(name, len, "COMMENT", 7) == 1
+    return TOK_SKIP
+
+  -1
+
+# ============================================================================
+# Token Definition Parser
+# ============================================================================
+
+# Parsed token definition
+struct GrammarToken
+  name: *i8
+  name_len: i32
+  priority: i32
+  pattern: *i8
+  pattern_len: i32
+  is_literal: i32
+  is_skip: i32
+  is_synthetic: i32
+
+# Parse a token definition line
+# Format: NAME.PRIORITY = "literal" or NAME = /regex/ or @skip/@synthetic
+# Returns: 1 = token parsed, 0 = not a token line, -1 = error
+fn grammar_parse_token_line(src: *i8, len: i32, tok: *GrammarToken) -> i32
+  var pos: i32 = 0
+
+  # Initialize
+  (*tok).priority = 0
+  (*tok).is_literal = 0
+  (*tok).is_skip = 0
+  (*tok).is_synthetic = 0
+  (*tok).pattern_len = 0
+
+  # Skip leading whitespace
+  pos = grammar_skip_ws(src, pos, len)
+  if pos >= len
+    return 0
+
+  let first_ch: i32 = (*(src + pos)) & 255
+
+  # Comment line
+  if first_ch == 35
+    return 0
+
+  # Check for @skip or @synthetic
+  if first_ch == 64
+    pos = pos + 1
+    if pos + 4 <= len && grammar_streq(src + pos, 4, "skip", 4) == 1
+      (*tok).is_skip = 1
+      pos = pos + 4
+    else
+      if pos + 9 <= len && grammar_streq(src + pos, 9, "synthetic", 9) == 1
+        (*tok).is_synthetic = 1
+        pos = pos + 9
+      else
+        return 0
+    pos = grammar_skip_ws(src, pos, len)
+
+  # Check if this is a token rule (starts with uppercase)
+  if pos >= len
+    return 0
+  let name_start_ch: i32 = (*(src + pos)) & 255
+  if grammar_is_upper(name_start_ch) == 0
+    return 0
+
+  # Read token name
+  let name_start: i32 = pos
+  while pos < len && grammar_is_alnum((*(src + pos)) & 255) == 1
+    pos = pos + 1
+
+  (*tok).name = src + name_start
+  (*tok).name_len = pos - name_start
+
+  # Check for .PRIORITY suffix
+  if pos < len && ((*(src + pos)) & 255) == 46
+    pos = pos + 1
+    let prio_start: i32 = pos
+    while pos < len && grammar_is_digit((*(src + pos)) & 255) == 1
+      pos = pos + 1
+    var prio: i32 = 0
+    var pi: i32 = prio_start
+    while pi < pos
+      prio = prio * 10 + (((*(src + pi)) & 255) - 48)
+      pi = pi + 1
+    (*tok).priority = prio
+
+  # For synthetic tokens, we're done
+  if (*tok).is_synthetic == 1
+    return 1
+
+  # Skip whitespace and expect '='
+  pos = grammar_skip_ws(src, pos, len)
+  if pos >= len
+    return -1
+  if ((*(src + pos)) & 255) != 61
+    return -1
+  pos = pos + 1
+
+  # Skip whitespace before pattern
+  pos = grammar_skip_ws(src, pos, len)
+  if pos >= len
+    return -1
+
+  # Parse pattern: "literal" or /regex/
+  # For literals, we include the quotes so regex_parse_literal can handle them
+  let delim: i32 = (*(src + pos)) & 255
+  if delim == 34
+    (*tok).is_literal = 1
+    let pat_start: i32 = pos
+    pos = pos + 1
+    while pos < len
+      let ch: i32 = (*(src + pos)) & 255
+      if ch == 34
+        pos = pos + 1
+        break
+      if ch == 92
+        pos = pos + 2
+      else
+        pos = pos + 1
+    (*tok).pattern = src + pat_start
+    (*tok).pattern_len = pos - pat_start
+    return 1
+
+  if delim == 47
+    (*tok).is_literal = 0
+    pos = pos + 1
+    let pat_start: i32 = pos
+    while pos < len
+      let ch: i32 = (*(src + pos)) & 255
+      if ch == 47
+        break
+      if ch == 92
+        pos = pos + 2
+      else
+        pos = pos + 1
+    (*tok).pattern = src + pat_start
+    (*tok).pattern_len = pos - pat_start
+    return 1
+
+  -1

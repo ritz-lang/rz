@@ -1,0 +1,3495 @@
+# lib/tome.ritz - In-memory key-value store
+#
+# Core data structures and operations for Tome.
+# Uses string keys and supports multiple value types.
+#
+# Usage:
+#   var store: Store = store_new()
+#   store_set(@store, "key", "value")
+#   let val: *u8 = store_get(@store, "key")
+#   store_del(@store, "key")
+
+import ritzlib.memory
+import ritzlib.hash
+import ritzlib.str
+import ritzlib.string
+import ritzlib.strview
+import ritzlib.drop
+import ritzlib.sys
+
+# ============================================================================
+# Value Types
+# ============================================================================
+# Tome supports multiple value types, similar to Redis.
+# For now, we start with strings (binary-safe byte sequences).
+
+const VALUE_NONE: i32 = 0
+const VALUE_STRING: i32 = 1
+const VALUE_LIST: i32 = 2
+const VALUE_SET: i32 = 3
+const VALUE_ZSET: i32 = 4
+const VALUE_HASH: i32 = 5
+
+# Skip list constants for Sorted Set
+const ZSET_MAX_LEVEL: i32 = 16
+
+# ============================================================================
+# Time utilities for TTL
+# ============================================================================
+
+# Get current time as Unix timestamp (seconds since epoch)
+fn time_now_secs() -> i64
+    var tv: Timeval
+    let ret: i32 = sys_gettimeofday(@tv, null)
+    if ret < 0
+        return 0
+    return tv.tv_sec
+
+# ============================================================================
+# List Type - Doubly Linked List (defined early for use in Store Drop)
+# ============================================================================
+# Each element is a string value stored in a doubly-linked node.
+# Supports O(1) push/pop from both ends, O(n) range access.
+
+struct ListNode
+    value: String        # The string value (owned)
+    prev: *ListNode      # Previous node (null for head)
+    next: *ListNode      # Next node (null for tail)
+
+struct List
+    head: *ListNode      # First node (null if empty)
+    tail: *ListNode      # Last node (null if empty)
+    len: i64             # Number of elements
+
+# Free a list and all its nodes
+pub fn list_drop(list: *List)
+    if list == null
+        return
+    var node: *ListNode = list.head
+    while node != null
+        let next: *ListNode = node.next
+        string_drop(@node.value)
+        free(node as *u8)
+        node = next
+    free(list as *u8)
+
+# ============================================================================
+# Set Type - Hash Set (defined early for use in Store Drop)
+# ============================================================================
+# A set is an unordered collection of unique string members.
+# Uses open addressing with linear probing (same as Store).
+
+struct SetEntry
+    value: String        # The member value (owned)
+    state: i32           # 0=empty, 1=occupied, 2=tombstone
+
+struct Set
+    entries: *SetEntry   # Array of entries
+    cap: i64             # Capacity (power of 2)
+    len: i64             # Number of members
+    tombstones: i64      # Number of tombstones
+
+# Free a set and all its entries
+pub fn set_drop(set: *Set)
+    if set == null
+        return
+    if set.entries != null
+        for i in 0..set.cap
+            let entry: *SetEntry = set.entries + i
+            if entry.state == 1  # OCCUPIED
+                string_drop(@entry.value)
+        free(set.entries as *u8)
+    free(set as *u8)
+
+# ============================================================================
+# Sorted Set Type - Skip List (defined early for use in Store Drop)
+# ============================================================================
+# A sorted set associates a score (i64) with each unique member (string).
+# Members are sorted by score, then lexicographically for equal scores.
+# Uses a skip list for O(log n) insert/delete/rank operations.
+# Also maintains a hash table for O(1) score lookup by member.
+
+# Skip list node - each node has a member, score, and forward pointers
+struct ZSetNode
+    member: String           # The member value (owned)
+    score: i64               # The score for sorting
+    forward: **ZSetNode      # Array of forward pointers (one per level)
+    level: i32               # Number of levels this node participates in
+
+# Hash entry for O(1) member->node lookup
+struct ZSetHashEntry
+    member: String           # Copy of member for hash lookup (owned)
+    node: *ZSetNode          # Pointer to skip list node
+    state: i32               # 0=empty, 1=occupied, 2=tombstone
+
+struct ZSet
+    header: *ZSetNode        # Skip list header (sentinel node)
+    level: i32               # Current max level of skip list
+    len: i64                 # Number of elements
+    # Hash table for O(1) lookup
+    hash_entries: *ZSetHashEntry
+    hash_cap: i64
+    hash_tombstones: i64
+
+# Free a sorted set and all its nodes
+pub fn zset_drop(zset: *ZSet)
+    if zset == null
+        return
+
+    # Free all skip list nodes
+    if zset.header != null
+        var node: *ZSetNode = zset.header.forward[0]
+        while node != null
+            let next: *ZSetNode = node.forward[0]
+            string_drop(@node.member)
+            free(node.forward as *u8)
+            free(node as *u8)
+            node = next
+        # Free header node
+        free(zset.header.forward as *u8)
+        free(zset.header as *u8)
+
+    # Free hash table entries (just the member strings, nodes already freed)
+    if zset.hash_entries != null
+        for i in 0..zset.hash_cap
+            let entry: *ZSetHashEntry = zset.hash_entries + i
+            if entry.state == 1
+                string_drop(@entry.member)
+        free(zset.hash_entries as *u8)
+
+    free(zset as *u8)
+
+# ============================================================================
+# Hash Type - Field-Value Hash Map (defined early for use in Store Drop)
+# ============================================================================
+# A hash is a map from string fields to string values.
+# Uses open addressing with linear probing (same as Store and Set).
+
+struct HashEntry
+    field: String        # The field name (owned)
+    value: String        # The field value (owned)
+    state: i32           # 0=empty, 1=occupied, 2=tombstone
+
+struct Hash
+    entries: *HashEntry  # Array of entries
+    cap: i64             # Capacity (power of 2)
+    len: i64             # Number of fields
+    tombstones: i64      # Number of tombstones
+
+# Free a hash and all its entries
+pub fn hash_drop(h: *Hash)
+    if h == null
+        return
+    if h.entries != null
+        for i in 0..h.cap
+            let entry: *HashEntry = h.entries + i
+            if entry.state == 1  # OCCUPIED
+                string_drop(@entry.field)
+                string_drop(@entry.value)
+        free(h.entries as *u8)
+    free(h as *u8)
+
+# ============================================================================
+# Entry - A single key-value pair with metadata
+# ============================================================================
+
+struct Entry
+    key: String          # The key (owned string)
+    value: String        # The value (owned string, for VALUE_STRING)
+    value_ptr: *u8       # Pointer to complex value (for LIST, SET, etc.)
+    value_type: i32      # Type tag (VALUE_NONE, VALUE_STRING, etc.)
+    expires_at: i64      # Unix timestamp for expiration (0 = never)
+    last_access: i64     # Unix timestamp of last access (for LRU)
+    state: i32           # 0=empty, 1=occupied, 2=tombstone
+
+# ============================================================================
+# Eviction Policies
+# ============================================================================
+
+const EVICT_NONE: i32 = 0        # No eviction, return error when full
+const EVICT_LRU: i32 = 1         # Evict least recently used keys
+const EVICT_RANDOM: i32 = 2      # Evict random keys
+const EVICT_VOLATILE_LRU: i32 = 3   # Evict LRU among keys with TTL
+const EVICT_VOLATILE_RANDOM: i32 = 4  # Evict random among keys with TTL
+const EVICT_VOLATILE_TTL: i32 = 5    # Evict keys closest to expiration
+
+# ============================================================================
+# Store - The main key-value store
+# ============================================================================
+# Uses open addressing with linear probing (like HashMapI64).
+
+struct Store
+    entries: *Entry      # Array of entries
+    cap: i64             # Capacity (power of 2)
+    len: i64             # Number of occupied entries
+    tombstones: i64      # Number of tombstones
+    used_memory: i64     # Total memory used by keys and values (bytes)
+    maxmemory: i64       # Maximum memory limit (0 = unlimited)
+    eviction_policy: i32 # Eviction policy when maxmemory reached
+    rng_state: u64       # Random state for EVICT_RANDOM
+
+# ============================================================================
+# Drop trait implementation
+# ============================================================================
+
+impl Drop for Store
+    fn drop(self: @&Store)
+        # Free all entries' owned strings, lists, sets, and zsets
+        if self.entries != null
+            for i in 0..self.cap
+                let entry: *Entry = self.entries + i
+                if entry.state == 1  # OCCUPIED
+                    string_drop(@entry.key)
+                    if entry.value_type == VALUE_STRING
+                        string_drop(@entry.value)
+                    else if entry.value_type == VALUE_LIST
+                        list_drop(entry.value_ptr as *List)
+                    else if entry.value_type == VALUE_SET
+                        set_drop(entry.value_ptr as *Set)
+                    else if entry.value_type == VALUE_ZSET
+                        zset_drop(entry.value_ptr as *ZSet)
+                    else if entry.value_type == VALUE_HASH
+                        hash_drop(entry.value_ptr as *Hash)
+            free(self.entries as *u8)
+        self.entries = null
+        self.cap = 0
+        self.len = 0
+        self.tombstones = 0
+
+# ============================================================================
+# Constructor
+# ============================================================================
+
+pub fn store_new() -> Store
+    return store_with_cap(16)
+
+pub fn store_with_cap(cap: i64) -> Store
+    var s: Store
+    s.entries = null
+    s.cap = 0
+    s.len = 0
+    s.tombstones = 0
+    s.used_memory = 0
+    s.maxmemory = 0          # No limit by default
+    s.eviction_policy = EVICT_NONE
+    s.rng_state = 12345      # Initial seed for random eviction
+
+    # Round up to power of 2
+    var actual_cap: i64 = 16
+    while actual_cap < cap
+        actual_cap *= 2
+
+    let size: i64 = actual_cap * sizeof(Entry)
+    s.entries = malloc(size) as *Entry
+    s.cap = actual_cap
+
+    # Initialize all entries to empty
+    for i in 0..actual_cap
+        let entry: *Entry = s.entries + i
+        entry.state = 0  # EMPTY
+        entry.value_type = VALUE_NONE
+        entry.value_ptr = null
+        entry.expires_at = 0
+        entry.last_access = 0
+
+    return s
+
+# ============================================================================
+# Memory Management
+# ============================================================================
+
+# Calculate memory used by a String
+fn string_memory(s: @String) -> i64
+    return string_len(s) + 1  # Length + null terminator
+
+# Calculate memory used by an entry's value
+fn entry_value_memory(entry: *Entry) -> i64
+    if entry.value_type == VALUE_STRING
+        return string_memory(@entry.value)
+    else if entry.value_type == VALUE_LIST
+        let list: *List = entry.value_ptr as *List
+        if list == null
+            return 0
+        # List memory: struct + nodes + string data
+        var mem: i64 = 24  # List struct
+        var node: *ListNode = list.head
+        while node != null
+            mem += 40  # ListNode struct (String + 2 pointers)
+            mem += string_memory(@node.value)
+            node = node.next
+        return mem
+    else if entry.value_type == VALUE_SET
+        let set: *Set = entry.value_ptr as *Set
+        if set == null
+            return 0
+        # Set memory: struct + entries array + string data
+        var mem: i64 = 32  # Set struct
+        mem += set.cap * 24  # SetEntry array
+        for i in 0..set.cap
+            let se: *SetEntry = set.entries + i
+            if se.state == 1
+                mem += string_memory(@se.value)
+        return mem
+    else if entry.value_type == VALUE_ZSET
+        let zset: *ZSet = entry.value_ptr as *ZSet
+        if zset == null
+            return 0
+        # ZSet memory: struct + skip list nodes + hash entries + strings
+        var mem: i64 = 48  # ZSet struct estimate
+        mem += zset.hash_cap * 32  # Hash entries
+        # Skip list nodes (estimate based on length)
+        mem += zset.len * 64  # Average node size with forward pointers
+        return mem
+    else if entry.value_type == VALUE_HASH
+        let h: *Hash = entry.value_ptr as *Hash
+        if h == null
+            return 0
+        # Hash memory: struct + entries array + string data
+        var mem: i64 = 32  # Hash struct
+        mem += h.cap * 36  # HashEntry array (field + value + state)
+        for i in 0..h.cap
+            let he: *HashEntry = h.entries + i
+            if he.state == 1
+                mem += string_memory(@he.field)
+                mem += string_memory(@he.value)
+        return mem
+    return 0
+
+# Calculate total memory used by an entry
+fn entry_memory(entry: *Entry) -> i64
+    var mem: i64 = string_memory(@entry.key)
+    mem += entry_value_memory(entry)
+    return mem
+
+# Simple LCG random number generator
+fn store_random(s: *Store) -> u64
+    s.rng_state = s.rng_state * 6364136223846793005 + 1442695040888963407
+    return s.rng_state
+
+# Set maximum memory limit
+pub fn store_set_maxmemory(s: *Store, bytes: i64)
+    s.maxmemory = bytes
+
+# Set eviction policy
+pub fn store_set_eviction_policy(s: *Store, policy: i32)
+    s.eviction_policy = policy
+
+# Get current memory usage
+pub fn store_memory_usage(s: *Store) -> i64
+    return s.used_memory
+
+# Get maximum memory limit
+pub fn store_get_maxmemory(s: *Store) -> i64
+    return s.maxmemory
+
+# Find a key to evict based on policy. Returns index or -1 if none found.
+fn store_find_evict_candidate(s: *Store) -> i64
+    if s.eviction_policy == EVICT_NONE
+        return -1
+
+    if s.len == 0
+        return -1
+
+    let now: i64 = time_now_secs()
+
+    if s.eviction_policy == EVICT_RANDOM
+        # Random eviction - sample up to 5 keys and pick one
+        var attempts: i32 = 0
+        while attempts < 20
+            let idx: i64 = (store_random(s) as i64) % s.cap
+            if idx < 0
+                continue
+            let entry: *Entry = s.entries + idx
+            if entry.state == 1
+                return idx
+            attempts += 1
+        return -1
+
+    if s.eviction_policy == EVICT_LRU
+        # LRU - sample 5 keys and evict the oldest access
+        var oldest_idx: i64 = -1
+        var oldest_time: i64 = 9223372036854775807  # i64 max
+        var samples: i32 = 0
+        var attempts: i32 = 0
+        while samples < 5 && attempts < 20
+            let idx: i64 = (store_random(s) as i64) % s.cap
+            if idx < 0
+                attempts += 1
+                continue
+            let entry: *Entry = s.entries + idx
+            if entry.state == 1
+                if entry.last_access < oldest_time
+                    oldest_time = entry.last_access
+                    oldest_idx = idx
+                samples += 1
+            attempts += 1
+        return oldest_idx
+
+    if s.eviction_policy == EVICT_VOLATILE_LRU
+        # LRU among keys with TTL
+        var oldest_idx: i64 = -1
+        var oldest_time: i64 = 9223372036854775807
+        var samples: i32 = 0
+        var attempts: i32 = 0
+        while samples < 5 && attempts < 50
+            let idx: i64 = (store_random(s) as i64) % s.cap
+            if idx < 0
+                attempts += 1
+                continue
+            let entry: *Entry = s.entries + idx
+            if entry.state == 1 && entry.expires_at > 0
+                if entry.last_access < oldest_time
+                    oldest_time = entry.last_access
+                    oldest_idx = idx
+                samples += 1
+            attempts += 1
+        return oldest_idx
+
+    if s.eviction_policy == EVICT_VOLATILE_RANDOM
+        # Random among keys with TTL
+        var attempts: i32 = 0
+        while attempts < 50
+            let idx: i64 = (store_random(s) as i64) % s.cap
+            if idx < 0
+                attempts += 1
+                continue
+            let entry: *Entry = s.entries + idx
+            if entry.state == 1 && entry.expires_at > 0
+                return idx
+            attempts += 1
+        return -1
+
+    if s.eviction_policy == EVICT_VOLATILE_TTL
+        # Evict key closest to expiration
+        var best_idx: i64 = -1
+        var earliest_expire: i64 = 9223372036854775807
+        var samples: i32 = 0
+        var attempts: i32 = 0
+        while samples < 5 && attempts < 50
+            let idx: i64 = (store_random(s) as i64) % s.cap
+            if idx < 0
+                attempts += 1
+                continue
+            let entry: *Entry = s.entries + idx
+            if entry.state == 1 && entry.expires_at > 0
+                if entry.expires_at < earliest_expire
+                    earliest_expire = entry.expires_at
+                    best_idx = idx
+                samples += 1
+            attempts += 1
+        return best_idx
+
+    return -1
+
+# Evict keys until we're under maxmemory. Returns number of keys evicted.
+fn store_evict_if_needed(s: *Store) -> i64
+    if s.maxmemory <= 0
+        return 0  # No limit
+
+    var evicted: i64 = 0
+    while s.used_memory > s.maxmemory
+        let idx: i64 = store_find_evict_candidate(s)
+        if idx < 0
+            break  # Can't evict anything
+
+        let entry: *Entry = s.entries + idx
+        let mem: i64 = entry_memory(entry)
+
+        # Free the entry
+        string_drop(@entry.key)
+        if entry.value_type == VALUE_STRING
+            string_drop(@entry.value)
+        else if entry.value_type == VALUE_LIST
+            list_drop(entry.value_ptr as *List)
+        else if entry.value_type == VALUE_SET
+            set_drop(entry.value_ptr as *Set)
+        else if entry.value_type == VALUE_ZSET
+            zset_drop(entry.value_ptr as *ZSet)
+        else if entry.value_type == VALUE_HASH
+            hash_drop(entry.value_ptr as *Hash)
+
+        entry.state = 2  # TOMBSTONE
+        entry.value_type = VALUE_NONE
+        entry.value_ptr = null
+        s.len -= 1
+        s.tombstones += 1
+        s.used_memory -= mem
+        evicted += 1
+
+    return evicted
+
+# ============================================================================
+# Hash function for string keys
+# ============================================================================
+
+# Hash a StrView (uses length, not null-terminator)
+fn hash_strview(key: *StrView) -> u64
+    var h: u64 = fnv1a_init()
+    for i in 0..key.len
+        h = fnv1a_byte(h, *(key.ptr + i))
+    return h
+
+# Hash a C-string (null-terminated) - used by internal functions
+fn hash_cstr(key: *u8) -> u64
+    var h: u64 = fnv1a_init()
+    var p: *u8 = key
+    while *p != 0
+        h = fnv1a_byte(h, *p)
+        p += 1
+    return h
+
+# Compare a String to a StrView for equality
+fn string_eq_strview(s: *String, sv: *StrView) -> i32
+    let slen: i64 = string_len(s)
+    if slen != sv.len
+        return 0
+    let sptr: *u8 = string_as_ptr(s)
+    for i in 0..slen
+        if *(sptr + i) != *(sv.ptr + i)
+            return 0
+    return 1
+
+# ============================================================================
+# Find slot for key
+# ============================================================================
+
+fn store_find_slot(s: *Store, key: *StrView) -> i64
+    let h: u64 = hash_strview(key)
+    let mask: i64 = s.cap - 1
+    var idx: i64 = (h as i64) & mask
+    var first_tombstone: i64 = -1
+
+    var i: i64 = 0
+    while i < s.cap
+        let entry: *Entry = s.entries + idx
+
+        if entry.state == 0  # EMPTY
+            if first_tombstone >= 0
+                return first_tombstone
+            return idx
+
+        if entry.state == 2  # TOMBSTONE
+            if first_tombstone < 0
+                first_tombstone = idx
+
+        if entry.state == 1  # OCCUPIED
+            if string_eq_strview(@entry.key, key) == 1
+                return idx  # Found!
+
+        # Linear probe
+        idx = (idx + 1) & mask
+        i += 1
+
+    if first_tombstone >= 0
+        return first_tombstone
+    return -1
+
+# ============================================================================
+# Grow the store
+# ============================================================================
+
+fn store_grow(s: *Store)
+    let old_entries: *Entry = s.entries
+    let old_cap: i64 = s.cap
+
+    # Allocate new table with double capacity
+    let new_cap: i64 = old_cap * 2
+    let size: i64 = new_cap * sizeof(Entry)
+    s.entries = malloc(size) as *Entry
+    s.cap = new_cap
+    s.len = 0
+    s.tombstones = 0
+
+    # Initialize new entries to empty
+    for i in 0..new_cap
+        let entry: *Entry = s.entries + i
+        entry.state = 0
+        entry.value_type = VALUE_NONE
+        entry.value_ptr = null
+        entry.expires_at = 0
+
+    # Rehash all occupied entries from old table
+    for i in 0..old_cap
+        let old_entry: *Entry = old_entries + i
+        if old_entry.state == 1  # OCCUPIED
+            # Find new slot - create StrView from the key string
+            var key_sv: StrView = strview_from_cstr(string_as_ptr(@old_entry.key))
+            let new_idx: i64 = store_find_slot(s, @key_sv)
+            let new_entry: *Entry = s.entries + new_idx
+
+            # Move ownership (shallow copy of String structs and pointers)
+            new_entry.key = old_entry.key
+            new_entry.value = old_entry.value
+            new_entry.value_ptr = old_entry.value_ptr
+            new_entry.value_type = old_entry.value_type
+            new_entry.expires_at = old_entry.expires_at
+            new_entry.state = 1
+            s.len += 1
+
+    # Free old table (but NOT the strings/lists - they were moved)
+    free(old_entries as *u8)
+
+# ============================================================================
+# Core operations
+# ============================================================================
+
+# Set a key to a string value.
+pub fn store_set(s: *Store, key: *StrView, value: *StrView)
+    # Check load factor and resize if needed (> 75%)
+    let load: i64 = (s.len + s.tombstones + 1) * 100 / s.cap
+    if load > 75
+        store_grow(s)
+
+    let idx: i64 = store_find_slot(s, key)
+    if idx < 0
+        return
+
+    let entry: *Entry = s.entries + idx
+    let now: i64 = time_now_secs()
+
+    if entry.state == 1  # Update existing
+        # Track old memory
+        let old_mem: i64 = entry_value_memory(entry)
+        # Free old value, set new
+        if entry.value_type == VALUE_STRING
+            string_drop(@entry.value)
+        entry.value = string_from_strview(value)
+        entry.value_type = VALUE_STRING
+        entry.last_access = now
+        # Update memory tracking
+        let new_mem: i64 = entry_value_memory(entry)
+        s.used_memory += new_mem - old_mem
+    else
+        # New entry
+        if entry.state == 2  # Was tombstone
+            s.tombstones -= 1
+        entry.key = string_from_strview(key)
+        entry.value = string_from_strview(value)
+        entry.value_type = VALUE_STRING
+        entry.expires_at = 0
+        entry.last_access = now
+        entry.state = 1
+        s.len += 1
+        # Track memory
+        s.used_memory += entry_memory(entry)
+
+    # Evict if needed
+    store_evict_if_needed(s)
+
+# Get a value by key. Returns null if not found or expired.
+# NOTE: Returns a borrowed pointer - valid until key is modified/deleted.
+# Implements lazy expiration - expired keys are deleted on access.
+pub fn store_get(s: *Store, key: *StrView) -> *u8
+    let h: u64 = hash_strview(key)
+    let mask: i64 = s.cap - 1
+    var idx: i64 = (h as i64) & mask
+    let now: i64 = time_now_secs()
+
+    var i: i64 = 0
+    while i < s.cap
+        let entry: *Entry = s.entries + idx
+
+        if entry.state == 0  # EMPTY - not found
+            return null
+
+        if entry.state == 1  # OCCUPIED
+            if string_eq_strview(@entry.key, key) == 1
+                # Check expiration (lazy expiration)
+                if entry.expires_at > 0
+                    if now >= entry.expires_at
+                        # Key has expired - delete it
+                        let mem: i64 = entry_memory(entry)
+                        string_drop(@entry.key)
+                        if entry.value_type == VALUE_STRING
+                            string_drop(@entry.value)
+                        entry.state = 2  # TOMBSTONE
+                        entry.value_type = VALUE_NONE
+                        s.len -= 1
+                        s.tombstones += 1
+                        s.used_memory -= mem
+                        return null
+
+                # Update access time for LRU
+                entry.last_access = now
+
+                if entry.value_type == VALUE_STRING
+                    return string_as_ptr(@entry.value)
+                return null
+
+        idx = (idx + 1) & mask
+        i += 1
+
+    return null
+
+# Check if a key exists (not expired).
+# NOTE: This is a const operation - does not trigger lazy expiration.
+# Use store_get() if you want expired keys to be cleaned up.
+pub fn store_exists(s: *Store, key: *StrView) -> i32
+    let h: u64 = hash_strview(key)
+    let mask: i64 = s.cap - 1
+    var idx: i64 = (h as i64) & mask
+
+    var i: i64 = 0
+    while i < s.cap
+        let entry: *Entry = s.entries + idx
+
+        if entry.state == 0
+            return 0
+
+        if entry.state == 1
+            if string_eq_strview(@entry.key, key) == 1
+                # Check if expired
+                if entry.expires_at > 0
+                    let now: i64 = time_now_secs()
+                    if now >= entry.expires_at
+                        return 0  # Expired
+                return 1
+
+        idx = (idx + 1) & mask
+        i += 1
+
+    return 0
+
+# Delete a key. Returns 1 if deleted, 0 if not found.
+pub fn store_del(s: *Store, key: *StrView) -> i32
+    let h: u64 = hash_strview(key)
+    let mask: i64 = s.cap - 1
+    var idx: i64 = (h as i64) & mask
+
+    var i: i64 = 0
+    while i < s.cap
+        let entry: *Entry = s.entries + idx
+
+        if entry.state == 0
+            return 0
+
+        if entry.state == 1
+            if string_eq_strview(@entry.key, key) == 1
+                # Track memory before freeing
+                let mem: i64 = entry_memory(entry)
+                # Free the key and value
+                string_drop(@entry.key)
+                if entry.value_type == VALUE_STRING
+                    string_drop(@entry.value)
+                else if entry.value_type == VALUE_LIST
+                    list_drop(entry.value_ptr as *List)
+                else if entry.value_type == VALUE_SET
+                    set_drop(entry.value_ptr as *Set)
+                else if entry.value_type == VALUE_ZSET
+                    zset_drop(entry.value_ptr as *ZSet)
+                else if entry.value_type == VALUE_HASH
+                    hash_drop(entry.value_ptr as *Hash)
+                entry.state = 2  # TOMBSTONE
+                entry.value_type = VALUE_NONE
+                entry.value_ptr = null
+                s.len -= 1
+                s.tombstones += 1
+                s.used_memory -= mem
+                return 1
+
+        idx = (idx + 1) & mask
+        i += 1
+
+    return 0
+
+# Get the number of keys in the store.
+pub fn store_len(s: *Store) -> i64
+    return s.len
+
+# Check if the store is empty.
+pub fn store_is_empty(s: *Store) -> i32
+    if s.len == 0
+        return 1
+    return 0
+
+
+# Clear all keys from the store.
+pub fn store_clear(s: *Store)
+    # Delete all entries
+    for i in 0..s.cap
+        let entry: *Entry = s.entries + i
+        if entry.state == 1  # OCCUPIED
+            # Free the key
+            string_drop(@entry.key)
+            # Free value based on type
+            if entry.value_type == VALUE_STRING
+                string_drop(@entry.value)
+            else if entry.value_type == VALUE_LIST
+                list_drop(entry.value_ptr as *List)
+            else if entry.value_type == VALUE_SET
+                set_drop(entry.value_ptr as *Set)
+            else if entry.value_type == VALUE_ZSET
+                zset_drop(entry.value_ptr as *ZSet)
+            else if entry.value_type == VALUE_HASH
+                hash_drop(entry.value_ptr as *Hash)
+            entry.state = 0
+    s.len = 0
+    s.tombstones = 0
+    s.used_memory = 0
+
+
+# ============================================================================
+# TTL Operations
+# ============================================================================
+
+# Set a key with an expiration time (in seconds from now).
+# Similar to Redis SETEX.
+pub fn store_setex(s: *Store, key: *StrView, value: *StrView, ttl_secs: i64)
+    # First, do a normal set
+    store_set(s, key, value)
+
+    # Then find the entry and set expiration
+    let h: u64 = hash_strview(key)
+    let mask: i64 = s.cap - 1
+    var idx: i64 = (h as i64) & mask
+
+    var i: i64 = 0
+    while i < s.cap
+        let entry: *Entry = s.entries + idx
+
+        if entry.state == 0
+            return  # Not found (shouldn't happen after set)
+
+        if entry.state == 1
+            if string_eq_strview(@entry.key, key) == 1
+                if ttl_secs > 0
+                    entry.expires_at = time_now_secs() + ttl_secs
+                else
+                    entry.expires_at = 0  # No expiration
+                return
+
+        idx = (idx + 1) & mask
+        i += 1
+
+# Set expiration on an existing key. Returns 1 if key exists, 0 otherwise.
+# Similar to Redis EXPIRE.
+pub fn store_expire(s: *Store, key: *StrView, ttl_secs: i64) -> i32
+    let h: u64 = hash_strview(key)
+    let mask: i64 = s.cap - 1
+    var idx: i64 = (h as i64) & mask
+
+    var i: i64 = 0
+    while i < s.cap
+        let entry: *Entry = s.entries + idx
+
+        if entry.state == 0
+            return 0  # Key not found
+
+        if entry.state == 1
+            if string_eq_strview(@entry.key, key) == 1
+                # Check if already expired
+                if entry.expires_at > 0
+                    let now: i64 = time_now_secs()
+                    if now >= entry.expires_at
+                        # Lazy delete expired key
+                        string_drop(@entry.key)
+                        if entry.value_type == VALUE_STRING
+                            string_drop(@entry.value)
+                        entry.state = 2
+                        entry.value_type = VALUE_NONE
+                        s.len -= 1
+                        s.tombstones += 1
+                        return 0
+
+                if ttl_secs > 0
+                    entry.expires_at = time_now_secs() + ttl_secs
+                else
+                    entry.expires_at = 0  # Remove expiration
+                return 1
+
+        idx = (idx + 1) & mask
+        i += 1
+
+    return 0
+
+# Get the remaining TTL for a key in seconds.
+# Returns: -2 if key doesn't exist, -1 if no expiration, >= 0 for TTL.
+# Similar to Redis TTL.
+pub fn store_ttl(s: *Store, key: *StrView) -> i64
+    let h: u64 = hash_strview(key)
+    let mask: i64 = s.cap - 1
+    var idx: i64 = (h as i64) & mask
+
+    var i: i64 = 0
+    while i < s.cap
+        let entry: *Entry = s.entries + idx
+
+        if entry.state == 0
+            return -2  # Key does not exist
+
+        if entry.state == 1
+            if string_eq_strview(@entry.key, key) == 1
+                if entry.expires_at == 0
+                    return -1  # Key exists but has no expiration
+
+                let now: i64 = time_now_secs()
+                if now >= entry.expires_at
+                    return -2  # Expired (treat as non-existent)
+
+                return entry.expires_at - now
+
+        idx = (idx + 1) & mask
+        i += 1
+
+    return -2
+
+# Remove expiration from a key. Returns 1 if key exists and had TTL, 0 otherwise.
+# Similar to Redis PERSIST.
+pub fn store_persist(s: *Store, key: *StrView) -> i32
+    let h: u64 = hash_strview(key)
+    let mask: i64 = s.cap - 1
+    var idx: i64 = (h as i64) & mask
+
+    var i: i64 = 0
+    while i < s.cap
+        let entry: *Entry = s.entries + idx
+
+        if entry.state == 0
+            return 0
+
+        if entry.state == 1
+            if string_eq_strview(@entry.key, key) == 1
+                # Check if already expired
+                if entry.expires_at > 0
+                    let now: i64 = time_now_secs()
+                    if now >= entry.expires_at
+                        return 0  # Already expired
+
+                    entry.expires_at = 0
+                    return 1
+                return 0  # No TTL to remove
+
+        idx = (idx + 1) & mask
+        i += 1
+
+    return 0
+
+# Active expiration: scan and delete expired keys.
+# Returns the number of keys deleted.
+# Call this periodically (e.g., every 100ms) for background cleanup.
+pub fn store_expire_sweep(s: *Store) -> i64
+    var deleted: i64 = 0
+    let now: i64 = time_now_secs()
+
+    for i in 0..s.cap
+        let entry: *Entry = s.entries + i
+        if entry.state == 1  # OCCUPIED
+            if entry.expires_at > 0
+                if now >= entry.expires_at
+                    # Delete expired entry
+                    string_drop(@entry.key)
+                    if entry.value_type == VALUE_STRING
+                        string_drop(@entry.value)
+                    entry.state = 2  # TOMBSTONE
+                    entry.value_type = VALUE_NONE
+                    s.len -= 1
+                    s.tombstones += 1
+                    deleted += 1
+
+    return deleted
+
+# ============================================================================
+# C-string convenience wrappers
+# ============================================================================
+# These functions accept *u8 (null-terminated C strings) for backward
+# compatibility with existing code. They wrap the *StrView-based API.
+
+pub fn store_set_cstr(s: *Store, key: *u8, value: *u8)
+    var key_sv: StrView = strview_from_cstr(key)
+    var val_sv: StrView = strview_from_cstr(value)
+    store_set(s, @key_sv, @val_sv)
+
+pub fn store_get_cstr(s: *Store, key: *u8) -> *u8
+    var key_sv: StrView = strview_from_cstr(key)
+    return store_get(s, @key_sv)
+
+pub fn store_del_cstr(s: *Store, key: *u8) -> i32
+    var key_sv: StrView = strview_from_cstr(key)
+    return store_del(s, @key_sv)
+
+pub fn store_exists_cstr(s: *Store, key: *u8) -> i32
+    var key_sv: StrView = strview_from_cstr(key)
+    return store_exists(s, @key_sv)
+
+pub fn store_setex_cstr(s: *Store, key: *u8, value: *u8, ttl_secs: i64)
+    var key_sv: StrView = strview_from_cstr(key)
+    var val_sv: StrView = strview_from_cstr(value)
+    store_setex(s, @key_sv, @val_sv, ttl_secs)
+
+pub fn store_expire_cstr(s: *Store, key: *u8, ttl_secs: i64) -> i32
+    var key_sv: StrView = strview_from_cstr(key)
+    return store_expire(s, @key_sv, ttl_secs)
+
+pub fn store_ttl_cstr(s: *Store, key: *u8) -> i64
+    var key_sv: StrView = strview_from_cstr(key)
+    return store_ttl(s, @key_sv)
+
+pub fn store_persist_cstr(s: *Store, key: *u8) -> i32
+    var key_sv: StrView = strview_from_cstr(key)
+    return store_persist(s, @key_sv)
+
+# List wrappers
+pub fn store_lpush_cstr(s: *Store, key: *u8, value: *u8) -> i64
+    var key_sv: StrView = strview_from_cstr(key)
+    var val_sv: StrView = strview_from_cstr(value)
+    return store_lpush(s, @key_sv, @val_sv)
+
+pub fn store_rpush_cstr(s: *Store, key: *u8, value: *u8) -> i64
+    var key_sv: StrView = strview_from_cstr(key)
+    var val_sv: StrView = strview_from_cstr(value)
+    return store_rpush(s, @key_sv, @val_sv)
+
+pub fn store_lpop_cstr(s: *Store, key: *u8) -> String
+    var key_sv: StrView = strview_from_cstr(key)
+    return store_lpop(s, @key_sv)
+
+pub fn store_rpop_cstr(s: *Store, key: *u8) -> String
+    var key_sv: StrView = strview_from_cstr(key)
+    return store_rpop(s, @key_sv)
+
+pub fn store_llen_cstr(s: *Store, key: *u8) -> i64
+    var key_sv: StrView = strview_from_cstr(key)
+    return store_llen(s, @key_sv)
+
+pub fn store_lindex_cstr(s: *Store, key: *u8, idx: i64) -> *u8
+    var key_sv: StrView = strview_from_cstr(key)
+    return store_lindex(s, @key_sv, idx)
+
+pub fn store_lrange_cstr(s: *Store, key: *u8, start: i64, stop: i64, out_count: @&i64) -> **u8
+    var key_sv: StrView = strview_from_cstr(key)
+    return store_lrange(s, @key_sv, start, stop, out_count)
+
+# Set wrappers
+pub fn store_sadd_cstr(s: *Store, key: *u8, member: *u8) -> i64
+    var key_sv: StrView = strview_from_cstr(key)
+    var member_sv: StrView = strview_from_cstr(member)
+    return store_sadd(s, @key_sv, @member_sv)
+
+pub fn store_srem_cstr(s: *Store, key: *u8, member: *u8) -> i64
+    var key_sv: StrView = strview_from_cstr(key)
+    var member_sv: StrView = strview_from_cstr(member)
+    return store_srem(s, @key_sv, @member_sv)
+
+pub fn store_sismember_cstr(s: *Store, key: *u8, member: *u8) -> i32
+    var key_sv: StrView = strview_from_cstr(key)
+    var member_sv: StrView = strview_from_cstr(member)
+    return store_sismember(s, @key_sv, @member_sv)
+
+pub fn store_scard_cstr(s: *Store, key: *u8) -> i64
+    var key_sv: StrView = strview_from_cstr(key)
+    return store_scard(s, @key_sv)
+
+pub fn store_smembers_cstr(s: *Store, key: *u8, out_count: @&i64) -> **u8
+    var key_sv: StrView = strview_from_cstr(key)
+    return store_smembers(s, @key_sv, out_count)
+
+pub fn store_sunion_cstr(s: *Store, key1: *u8, key2: *u8) -> *Set
+    var k1_sv: StrView = strview_from_cstr(key1)
+    var k2_sv: StrView = strview_from_cstr(key2)
+    return store_sunion(s, @k1_sv, @k2_sv)
+
+pub fn store_sinter_cstr(s: *Store, key1: *u8, key2: *u8) -> *Set
+    var k1_sv: StrView = strview_from_cstr(key1)
+    var k2_sv: StrView = strview_from_cstr(key2)
+    return store_sinter(s, @k1_sv, @k2_sv)
+
+pub fn store_sdiff_cstr(s: *Store, key1: *u8, key2: *u8) -> *Set
+    var k1_sv: StrView = strview_from_cstr(key1)
+    var k2_sv: StrView = strview_from_cstr(key2)
+    return store_sdiff(s, @k1_sv, @k2_sv)
+
+# ZSet wrappers
+pub fn store_zadd_cstr(s: *Store, key: *u8, score: i64, member: *u8) -> i64
+    var key_sv: StrView = strview_from_cstr(key)
+    var member_sv: StrView = strview_from_cstr(member)
+    return store_zadd(s, @key_sv, score, @member_sv)
+
+pub fn store_zrem_cstr(s: *Store, key: *u8, member: *u8) -> i64
+    var key_sv: StrView = strview_from_cstr(key)
+    var member_sv: StrView = strview_from_cstr(member)
+    return store_zrem(s, @key_sv, @member_sv)
+
+pub fn store_zscore_cstr(s: *Store, key: *u8, member: *u8, out_score: @&i64) -> i32
+    var key_sv: StrView = strview_from_cstr(key)
+    var member_sv: StrView = strview_from_cstr(member)
+    return store_zscore(s, @key_sv, @member_sv, out_score)
+
+pub fn store_zrank_cstr(s: *Store, key: *u8, member: *u8) -> i64
+    var key_sv: StrView = strview_from_cstr(key)
+    var member_sv: StrView = strview_from_cstr(member)
+    return store_zrank(s, @key_sv, @member_sv)
+
+pub fn store_zrevrank_cstr(s: *Store, key: *u8, member: *u8) -> i64
+    var key_sv: StrView = strview_from_cstr(key)
+    var member_sv: StrView = strview_from_cstr(member)
+    return store_zrevrank(s, @key_sv, @member_sv)
+
+pub fn store_zcard_cstr(s: *Store, key: *u8) -> i64
+    var key_sv: StrView = strview_from_cstr(key)
+    return store_zcard(s, @key_sv)
+
+pub fn store_zrange_cstr(s: *Store, key: *u8, start: i64, stop: i64, out_count: @&i64) -> **u8
+    var key_sv: StrView = strview_from_cstr(key)
+    return store_zrange(s, @key_sv, start, stop, out_count)
+
+pub fn store_zrevrange_cstr(s: *Store, key: *u8, start: i64, stop: i64, out_count: @&i64) -> **u8
+    var key_sv: StrView = strview_from_cstr(key)
+    return store_zrevrange(s, @key_sv, start, stop, out_count)
+
+# Hash wrappers
+pub fn store_hset_cstr(s: *Store, key: *u8, field: *u8, value: *u8) -> i32
+    var key_sv: StrView = strview_from_cstr(key)
+    var field_sv: StrView = strview_from_cstr(field)
+    var val_sv: StrView = strview_from_cstr(value)
+    return store_hset(s, @key_sv, @field_sv, @val_sv)
+
+pub fn store_hget_cstr(s: *Store, key: *u8, field: *u8) -> *u8
+    var key_sv: StrView = strview_from_cstr(key)
+    var field_sv: StrView = strview_from_cstr(field)
+    return store_hget(s, @key_sv, @field_sv)
+
+pub fn store_hdel_cstr(s: *Store, key: *u8, field: *u8) -> i32
+    var key_sv: StrView = strview_from_cstr(key)
+    var field_sv: StrView = strview_from_cstr(field)
+    return store_hdel(s, @key_sv, @field_sv)
+
+pub fn store_hexists_cstr(s: *Store, key: *u8, field: *u8) -> i32
+    var key_sv: StrView = strview_from_cstr(key)
+    var field_sv: StrView = strview_from_cstr(field)
+    return store_hexists(s, @key_sv, @field_sv)
+
+pub fn store_hlen_cstr(s: *Store, key: *u8) -> i64
+    var key_sv: StrView = strview_from_cstr(key)
+    return store_hlen(s, @key_sv)
+
+pub fn store_hkeys_cstr(s: *Store, key: *u8, out_count: @&i64) -> **u8
+    var key_sv: StrView = strview_from_cstr(key)
+    return store_hkeys(s, @key_sv, out_count)
+
+pub fn store_hvals_cstr(s: *Store, key: *u8, out_count: @&i64) -> **u8
+    var key_sv: StrView = strview_from_cstr(key)
+    return store_hvals(s, @key_sv, out_count)
+
+pub fn store_hgetall_cstr(s: *Store, key: *u8, out_count: @&i64) -> **u8
+    var key_sv: StrView = strview_from_cstr(key)
+    return store_hgetall(s, @key_sv, out_count)
+
+# ============================================================================
+# Method syntax support
+# ============================================================================
+
+impl Store
+    fn len(self: @Store) -> i64
+        return self.len
+
+    fn is_empty(self: @Store) -> i32
+        if self.len == 0
+            return 1
+        return 0
+
+    fn set(self: @&Store, key: *u8, value: *u8)
+        store_set_cstr(self, key, value)
+
+    fn get(self: @&Store, key: *u8) -> *u8
+        return store_get_cstr(self, key)
+
+    fn exists(self: @Store, key: *u8) -> i32
+        return store_exists_cstr(self, key)
+
+    fn del(self: @&Store, key: *u8) -> i32
+        return store_del_cstr(self, key)
+
+    fn setex(self: @&Store, key: *u8, value: *u8, ttl_secs: i64)
+        store_setex_cstr(self, key, value, ttl_secs)
+
+    fn expire(self: @&Store, key: *u8, ttl_secs: i64) -> i32
+        return store_expire_cstr(self, key, ttl_secs)
+
+    fn ttl(self: @Store, key: *u8) -> i64
+        return store_ttl_cstr(self, key)
+
+    fn persist(self: @&Store, key: *u8) -> i32
+        return store_persist_cstr(self, key)
+
+    fn expire_sweep(self: @&Store) -> i64
+        return store_expire_sweep(self)
+
+# ============================================================================
+# List Operations
+# ============================================================================
+
+# Create a new empty list
+fn list_new() -> *List
+    let list: *List = malloc(sizeof(List)) as *List
+    list.head = null
+    list.tail = null
+    list.len = 0
+    return list
+
+# Push a value to the left (head) of the list. Returns new length.
+fn list_lpush(list: *List, value: *StrView) -> i64
+    let node: *ListNode = malloc(sizeof(ListNode)) as *ListNode
+    node.value = string_from_strview(value)
+    node.prev = null
+    node.next = list.head
+
+    if list.head != null
+        list.head.prev = node
+    else
+        # List was empty, new node is also tail
+        list.tail = node
+
+    list.head = node
+    list.len += 1
+    return list.len
+
+# Push a value to the right (tail) of the list. Returns new length.
+fn list_rpush(list: *List, value: *StrView) -> i64
+    let node: *ListNode = malloc(sizeof(ListNode)) as *ListNode
+    node.value = string_from_strview(value)
+    node.prev = list.tail
+    node.next = null
+
+    if list.tail != null
+        list.tail.next = node
+    else
+        # List was empty, new node is also head
+        list.head = node
+
+    list.tail = node
+    list.len += 1
+    return list.len
+
+# Pop a value from the left (head). Returns owned string, caller must drop.
+# Returns empty string if list is empty.
+fn list_lpop(list: *List) -> String
+    if list.head == null
+        return string_new()
+
+    let node: *ListNode = list.head
+    let result: String = node.value  # Move ownership
+
+    list.head = node.next
+    if list.head != null
+        list.head.prev = null
+    else
+        list.tail = null
+
+    list.len -= 1
+    free(node as *u8)
+    return result
+
+# Pop a value from the right (tail). Returns owned string, caller must drop.
+# Returns empty string if list is empty.
+fn list_rpop(list: *List) -> String
+    if list.tail == null
+        return string_new()
+
+    let node: *ListNode = list.tail
+    let result: String = node.value  # Move ownership
+
+    list.tail = node.prev
+    if list.tail != null
+        list.tail.next = null
+    else
+        list.head = null
+
+    list.len -= 1
+    free(node as *u8)
+    return result
+
+# Get list length
+fn list_len(list: *List) -> i64
+    if list == null
+        return 0
+    return list.len
+
+# Get element at index (0-based). Returns borrowed pointer, null if out of bounds.
+# Negative indices count from end (-1 = last).
+fn list_index(list: *List, index: i64) -> *u8
+    if list == null || list.len == 0
+        return null
+
+    # Normalize negative index
+    var idx: i64 = index
+    if idx < 0
+        idx = list.len + idx
+
+    if idx < 0 || idx >= list.len
+        return null
+
+    # Traverse from nearest end
+    var node: *ListNode = null
+    if idx <= list.len / 2
+        # Traverse from head
+        node = list.head
+        var i: i64 = 0
+        while i < idx
+            node = node.next
+            i += 1
+    else
+        # Traverse from tail
+        node = list.tail
+        var i: i64 = list.len - 1
+        while i > idx
+            node = node.prev
+            i -= 1
+
+    return string_as_ptr(@node.value)
+
+# ============================================================================
+# Store List Operations
+# ============================================================================
+
+# Helper: Get or create list for key. Returns null if key exists with wrong type.
+fn store_get_or_create_list(s: *Store, key: *StrView) -> *List
+    # Check load factor
+    let load: i64 = (s.len + s.tombstones + 1) * 100 / s.cap
+    if load > 75
+        store_grow(s)
+
+    let idx: i64 = store_find_slot(s, key)
+    if idx < 0
+        return null
+
+    let entry: *Entry = s.entries + idx
+
+    if entry.state == 1  # Occupied
+        # Check type
+        if entry.value_type == VALUE_LIST
+            return entry.value_ptr as *List
+        # Wrong type
+        return null
+
+    # Create new list
+    let list: *List = list_new()
+    let now: i64 = time_now_secs()
+
+    if entry.state == 2  # Was tombstone
+        s.tombstones -= 1
+
+    entry.key = string_from_strview(key)
+    entry.value_ptr = list as *u8
+    entry.value_type = VALUE_LIST
+    entry.expires_at = 0
+    entry.last_access = now
+    entry.state = 1
+    s.len += 1
+
+    # Track initial memory (key + empty list struct)
+    s.used_memory += entry_memory(entry)
+
+    return list
+
+# Helper: Get existing list for key (read-only). Returns null if not found or wrong type.
+fn store_get_list(s: *Store, key: *StrView) -> *List
+    let h: u64 = hash_strview(key)
+    let mask: i64 = s.cap - 1
+    var idx: i64 = (h as i64) & mask
+
+    var i: i64 = 0
+    while i < s.cap
+        let entry: *Entry = s.entries + idx
+
+        if entry.state == 0
+            return null
+
+        if entry.state == 1
+            if string_eq_strview(@entry.key, key) == 1
+                # Check expiration
+                if entry.expires_at > 0
+                    let now: i64 = time_now_secs()
+                    if now >= entry.expires_at
+                        return null  # Expired
+                if entry.value_type == VALUE_LIST
+                    return entry.value_ptr as *List
+                return null  # Wrong type
+
+        idx = (idx + 1) & mask
+        i += 1
+
+    return null
+
+# LPUSH: Push value(s) to head of list. Returns new length.
+# Creates list if key doesn't exist.
+pub fn store_lpush(s: *Store, key: *StrView, value: *StrView) -> i64
+    let list: *List = store_get_or_create_list(s, key)
+    if list == null
+        return -1  # Key exists with wrong type
+    return list_lpush(list, value)
+
+# RPUSH: Push value(s) to tail of list. Returns new length.
+# Creates list if key doesn't exist.
+pub fn store_rpush(s: *Store, key: *StrView, value: *StrView) -> i64
+    let list: *List = store_get_or_create_list(s, key)
+    if list == null
+        return -1  # Key exists with wrong type
+    return list_rpush(list, value)
+
+# LPOP: Remove and return head element. Returns owned string (caller drops).
+# Returns empty string if key doesn't exist or is empty.
+pub fn store_lpop(s: *Store, key: *StrView) -> String
+    let list: *List = store_get_list(s, key)
+    if list == null
+        return string_new()
+    return list_lpop(list)
+
+# RPOP: Remove and return tail element. Returns owned string (caller drops).
+# Returns empty string if key doesn't exist or is empty.
+pub fn store_rpop(s: *Store, key: *StrView) -> String
+    let list: *List = store_get_list(s, key)
+    if list == null
+        return string_new()
+    return list_rpop(list)
+
+# LLEN: Get length of list. Returns 0 if key doesn't exist.
+# Returns -1 if key exists with wrong type.
+pub fn store_llen(s: *Store, key: *StrView) -> i64
+    # First check if key exists with wrong type
+    let h: u64 = hash_strview(key)
+    let mask: i64 = s.cap - 1
+    var idx: i64 = (h as i64) & mask
+
+    var i: i64 = 0
+    while i < s.cap
+        let entry: *Entry = s.entries + idx
+
+        if entry.state == 0
+            return 0  # Key not found
+
+        if entry.state == 1
+            if string_eq_strview(@entry.key, key) == 1
+                # Check expiration
+                if entry.expires_at > 0
+                    let now: i64 = time_now_secs()
+                    if now >= entry.expires_at
+                        return 0  # Expired
+                if entry.value_type == VALUE_LIST
+                    let list: *List = entry.value_ptr as *List
+                    return list.len
+                return -1  # Wrong type
+
+        idx = (idx + 1) & mask
+        i += 1
+
+    return 0
+
+# LINDEX: Get element at index. Returns borrowed pointer, null if out of bounds.
+# Negative indices: -1 = last, -2 = second to last, etc.
+pub fn store_lindex(s: *Store, key: *StrView, index: i64) -> *u8
+    let list: *List = store_get_list(s, key)
+    if list == null
+        return null
+    return list_index(list, index)
+
+# LRANGE: Get elements from start to stop (inclusive). Returns array of borrowed pointers.
+# Negative indices supported. Out of range indices are clamped.
+# Caller must free the returned array (but not the strings - they're borrowed).
+# Returns count via out parameter.
+pub fn store_lrange(s: *Store, key: *StrView, start: i64, stop: i64, out_count: @&i64) -> **u8
+    *out_count = 0
+
+    let list: *List = store_get_list(s, key)
+    if list == null || list.len == 0
+        return null
+
+    # Normalize indices
+    var s_idx: i64 = start
+    var e_idx: i64 = stop
+
+    if s_idx < 0
+        s_idx = list.len + s_idx
+    if e_idx < 0
+        e_idx = list.len + e_idx
+
+    # Clamp to valid range
+    if s_idx < 0
+        s_idx = 0
+    if e_idx >= list.len
+        e_idx = list.len - 1
+    if s_idx > e_idx
+        return null
+
+    let count: i64 = e_idx - s_idx + 1
+    let result: **u8 = malloc(count * 8) as **u8  # Array of pointers
+
+    # Traverse to start
+    var node: *ListNode = list.head
+    var i: i64 = 0
+    while i < s_idx
+        node = node.next
+        i += 1
+
+    # Collect elements
+    var j: i64 = 0
+    while j < count && node != null
+        *(result + j) = string_as_ptr(@node.value)
+        node = node.next
+        j += 1
+
+    *out_count = count
+    return result
+
+# ============================================================================
+# Set Operations
+# ============================================================================
+
+# Create a new empty set with initial capacity
+fn set_new() -> *Set
+    return set_with_cap(16)
+
+fn set_with_cap(cap: i64) -> *Set
+    let set: *Set = malloc(sizeof(Set)) as *Set
+    set.entries = null
+    set.cap = 0
+    set.len = 0
+    set.tombstones = 0
+
+    # Round up to power of 2
+    var actual_cap: i64 = 16
+    while actual_cap < cap
+        actual_cap *= 2
+
+    let size: i64 = actual_cap * sizeof(SetEntry)
+    set.entries = malloc(size) as *SetEntry
+    set.cap = actual_cap
+
+    # Initialize all entries to empty
+    for i in 0..actual_cap
+        let entry: *SetEntry = set.entries + i
+        entry.state = 0  # EMPTY
+
+    return set
+
+# Find slot for a value in the set
+fn set_find_slot(set: *Set, value: *u8) -> i64
+    let h: u64 = hash_cstr(value)
+    let mask: i64 = set.cap - 1
+    var idx: i64 = (h as i64) & mask
+    var first_tombstone: i64 = -1
+
+    var i: i64 = 0
+    while i < set.cap
+        let entry: *SetEntry = set.entries + idx
+
+        if entry.state == 0  # EMPTY
+            if first_tombstone >= 0
+                return first_tombstone
+            return idx
+
+        if entry.state == 2  # TOMBSTONE
+            if first_tombstone < 0
+                first_tombstone = idx
+
+        if entry.state == 1  # OCCUPIED
+            if string_eq_cstr(@entry.value, value) == 1
+                return idx  # Found!
+
+        # Linear probe
+        idx = (idx + 1) & mask
+        i += 1
+
+    if first_tombstone >= 0
+        return first_tombstone
+    return -1
+
+# Grow the set when load factor exceeds threshold
+fn set_grow(set: *Set)
+    let old_entries: *SetEntry = set.entries
+    let old_cap: i64 = set.cap
+
+    let new_cap: i64 = old_cap * 2
+    let size: i64 = new_cap * sizeof(SetEntry)
+    set.entries = malloc(size) as *SetEntry
+    set.cap = new_cap
+    set.len = 0
+    set.tombstones = 0
+
+    # Initialize new entries to empty
+    for i in 0..new_cap
+        let entry: *SetEntry = set.entries + i
+        entry.state = 0
+
+    # Rehash all occupied entries
+    for i in 0..old_cap
+        let old_entry: *SetEntry = old_entries + i
+        if old_entry.state == 1  # OCCUPIED
+            let new_idx: i64 = set_find_slot(set, string_as_ptr(@old_entry.value))
+            let new_entry: *SetEntry = set.entries + new_idx
+            new_entry.value = old_entry.value  # Move ownership
+            new_entry.state = 1
+            set.len += 1
+
+    free(old_entries as *u8)
+
+# Add a member to the set. Returns 1 if added, 0 if already present.
+fn set_add(set: *Set, value: *u8) -> i32
+    # Check load factor and resize if needed (> 75%)
+    let load: i64 = (set.len + set.tombstones + 1) * 100 / set.cap
+    if load > 75
+        set_grow(set)
+
+    let idx: i64 = set_find_slot(set, value)
+    if idx < 0
+        return 0
+
+    let entry: *SetEntry = set.entries + idx
+
+    if entry.state == 1  # Already present
+        return 0
+
+    if entry.state == 2  # Was tombstone
+        set.tombstones -= 1
+
+    entry.value = string_from_cstr(value)
+    entry.state = 1
+    set.len += 1
+    return 1
+
+# Remove a member from the set. Returns 1 if removed, 0 if not found.
+fn set_remove(set: *Set, value: *u8) -> i32
+    let h: u64 = hash_cstr(value)
+    let mask: i64 = set.cap - 1
+    var idx: i64 = (h as i64) & mask
+
+    var i: i64 = 0
+    while i < set.cap
+        let entry: *SetEntry = set.entries + idx
+
+        if entry.state == 0
+            return 0  # Not found
+
+        if entry.state == 1
+            if string_eq_cstr(@entry.value, value) == 1
+                string_drop(@entry.value)
+                entry.state = 2  # TOMBSTONE
+                set.len -= 1
+                set.tombstones += 1
+                return 1
+
+        idx = (idx + 1) & mask
+        i += 1
+
+    return 0
+
+# Check if a value is in the set. Returns 1 if present, 0 if not.
+pub fn set_contains(set: *Set, value: *u8) -> i32
+    let h: u64 = hash_cstr(value)
+    let mask: i64 = set.cap - 1
+    var idx: i64 = (h as i64) & mask
+
+    var i: i64 = 0
+    while i < set.cap
+        let entry: *SetEntry = set.entries + idx
+
+        if entry.state == 0
+            return 0  # Not found
+
+        if entry.state == 1
+            if string_eq_cstr(@entry.value, value) == 1
+                return 1  # Found
+
+        idx = (idx + 1) & mask
+        i += 1
+
+    return 0
+
+# Get the number of members in the set
+pub fn set_len(set: *Set) -> i64
+    if set == null
+        return 0
+    return set.len
+
+# Get all members of the set. Returns array of borrowed pointers.
+# Caller must free the returned array (but not the strings - they're borrowed).
+fn set_members(set: *Set, out_count: @&i64) -> **u8
+    *out_count = 0
+    if set == null || set.len == 0
+        return null
+
+    let result: **u8 = malloc(set.len * 8) as **u8
+    var j: i64 = 0
+
+    for i in 0..set.cap
+        let entry: *SetEntry = set.entries + i
+        if entry.state == 1
+            *(result + j) = string_as_ptr(@entry.value)
+            j += 1
+
+    *out_count = set.len
+    return result
+
+# ============================================================================
+# Store Set Operations
+# ============================================================================
+
+# Helper: Get or create set for key. Returns null if key exists with wrong type.
+fn store_get_or_create_set(s: *Store, key: *StrView) -> *Set
+    # Check load factor
+    let load: i64 = (s.len + s.tombstones + 1) * 100 / s.cap
+    if load > 75
+        store_grow(s)
+
+    let idx: i64 = store_find_slot(s, key)
+    if idx < 0
+        return null
+
+    let entry: *Entry = s.entries + idx
+
+    if entry.state == 1  # Occupied
+        if entry.value_type == VALUE_SET
+            return entry.value_ptr as *Set
+        return null  # Wrong type
+
+    # Create new set
+    let set: *Set = set_new()
+    let now: i64 = time_now_secs()
+
+    if entry.state == 2  # Was tombstone
+        s.tombstones -= 1
+
+    entry.key = string_from_strview(key)
+    entry.value_ptr = set as *u8
+    entry.value_type = VALUE_SET
+    entry.expires_at = 0
+    entry.last_access = now
+    entry.state = 1
+    s.len += 1
+
+    # Track initial memory
+    s.used_memory += entry_memory(entry)
+
+    return set
+
+# Helper: Get existing set for key (read-only). Returns null if not found or wrong type.
+fn store_get_set(s: *Store, key: *StrView) -> *Set
+    let h: u64 = hash_strview(key)
+    let mask: i64 = s.cap - 1
+    var idx: i64 = (h as i64) & mask
+
+    var i: i64 = 0
+    while i < s.cap
+        let entry: *Entry = s.entries + idx
+
+        if entry.state == 0
+            return null
+
+        if entry.state == 1
+            if string_eq_strview(@entry.key, key) == 1
+                # Check expiration
+                if entry.expires_at > 0
+                    let now: i64 = time_now_secs()
+                    if now >= entry.expires_at
+                        return null  # Expired
+                if entry.value_type == VALUE_SET
+                    return entry.value_ptr as *Set
+                return null  # Wrong type
+
+        idx = (idx + 1) & mask
+        i += 1
+
+    return null
+
+# SADD: Add member(s) to set. Returns number of elements added.
+# Creates set if key doesn't exist. Returns -1 if key exists with wrong type.
+pub fn store_sadd(s: *Store, key: *StrView, member: *StrView) -> i64
+    let set: *Set = store_get_or_create_set(s, key)
+    if set == null
+        return -1  # Key exists with wrong type
+    return set_add(set, strview_as_ptr(member)) as i64
+
+# SREM: Remove member(s) from set. Returns number of elements removed.
+# Returns 0 if key doesn't exist. Returns -1 if key exists with wrong type.
+pub fn store_srem(s: *Store, key: *StrView, member: *StrView) -> i64
+    let set: *Set = store_get_set(s, key)
+    if set == null
+        # Check if key exists with wrong type
+        let h: u64 = hash_strview(key)
+        let mask: i64 = s.cap - 1
+        var idx: i64 = (h as i64) & mask
+        var i: i64 = 0
+        while i < s.cap
+            let entry: *Entry = s.entries + idx
+            if entry.state == 0
+                return 0  # Key not found
+            if entry.state == 1
+                if string_eq_strview(@entry.key, key) == 1
+                    return -1  # Wrong type
+            idx = (idx + 1) & mask
+            i += 1
+        return 0
+    return set_remove(set, strview_as_ptr(member)) as i64
+
+# SISMEMBER: Check if member is in set. Returns 1 if present, 0 if not.
+# Returns 0 if key doesn't exist.
+pub fn store_sismember(s: *Store, key: *StrView, member: *StrView) -> i32
+    let set: *Set = store_get_set(s, key)
+    if set == null
+        return 0
+    return set_contains(set, strview_as_ptr(member))
+
+# SCARD: Get cardinality (number of members) of set.
+# Returns 0 if key doesn't exist. Returns -1 if key exists with wrong type.
+pub fn store_scard(s: *Store, key: *StrView) -> i64
+    let h: u64 = hash_strview(key)
+    let mask: i64 = s.cap - 1
+    var idx: i64 = (h as i64) & mask
+
+    var i: i64 = 0
+    while i < s.cap
+        let entry: *Entry = s.entries + idx
+
+        if entry.state == 0
+            return 0  # Key not found
+
+        if entry.state == 1
+            if string_eq_strview(@entry.key, key) == 1
+                # Check expiration
+                if entry.expires_at > 0
+                    let now: i64 = time_now_secs()
+                    if now >= entry.expires_at
+                        return 0  # Expired
+                if entry.value_type == VALUE_SET
+                    let set: *Set = entry.value_ptr as *Set
+                    return set.len
+                return -1  # Wrong type
+
+        idx = (idx + 1) & mask
+        i += 1
+
+    return 0
+
+# SMEMBERS: Get all members of set. Returns array of borrowed pointers.
+# Caller must free the returned array (but not the strings - they're borrowed).
+pub fn store_smembers(s: *Store, key: *StrView, out_count: @&i64) -> **u8
+    *out_count = 0
+    let set: *Set = store_get_set(s, key)
+    if set == null
+        return null
+    return set_members(set, out_count)
+
+# SUNION: Return union of two sets as a new Set.
+# Returns a new Set that caller must free with set_drop().
+# Returns null if both sets don't exist.
+pub fn store_sunion(s: *Store, key1: *StrView, key2: *StrView) -> *Set
+    let set1: *Set = store_get_set(s, key1)
+    let set2: *Set = store_get_set(s, key2)
+
+    # If both null, return null
+    if set1 == null && set2 == null
+        return null
+
+    # Create result set for union
+    var result_set: *Set = set_new()
+
+    # Add all from set1
+    if set1 != null
+        for i in 0..set1.cap
+            let entry: *SetEntry = set1.entries + i
+            if entry.state == 1
+                set_add(result_set, string_as_ptr(@entry.value))
+
+    # Add all from set2
+    if set2 != null
+        for i in 0..set2.cap
+            let entry: *SetEntry = set2.entries + i
+            if entry.state == 1
+                set_add(result_set, string_as_ptr(@entry.value))
+
+    return result_set
+
+# SINTER: Return intersection of two sets as a new Set.
+# Returns a new Set that caller must free with set_drop().
+# Returns null if either set doesn't exist.
+pub fn store_sinter(s: *Store, key1: *StrView, key2: *StrView) -> *Set
+    let set1: *Set = store_get_set(s, key1)
+    let set2: *Set = store_get_set(s, key2)
+
+    # If either null, intersection is empty
+    if set1 == null || set2 == null
+        return null
+
+    # Create result set for intersection
+    var result_set: *Set = set_new()
+
+    # Add items from set1 that are also in set2
+    for i in 0..set1.cap
+        let entry: *SetEntry = set1.entries + i
+        if entry.state == 1
+            if set_contains(set2, string_as_ptr(@entry.value)) == 1
+                set_add(result_set, string_as_ptr(@entry.value))
+
+    return result_set
+
+# SDIFF: Return set difference (set1 - set2) as a new Set.
+# Returns a new Set that caller must free with set_drop().
+# Returns null if set1 doesn't exist.
+pub fn store_sdiff(s: *Store, key1: *StrView, key2: *StrView) -> *Set
+    let set1: *Set = store_get_set(s, key1)
+    let set2: *Set = store_get_set(s, key2)
+
+    # If set1 null, difference is empty
+    if set1 == null
+        return null
+
+    # Create result set for difference
+    var result_set: *Set = set_new()
+
+    # Add items from set1 that are NOT in set2
+    for i in 0..set1.cap
+        let entry: *SetEntry = set1.entries + i
+        if entry.state == 1
+            var in_set2: i32 = 0
+            if set2 != null
+                in_set2 = set_contains(set2, string_as_ptr(@entry.value))
+            if in_set2 == 0
+                set_add(result_set, string_as_ptr(@entry.value))
+
+    return result_set
+
+# ============================================================================
+# Sorted Set Operations
+# ============================================================================
+
+# Simple pseudo-random number generator for skip list levels
+var zset_rand_seed: u64 = 12345
+
+fn zset_rand() -> u64
+    # Linear congruential generator
+    zset_rand_seed = zset_rand_seed * 1103515245 + 12345
+    return zset_rand_seed
+
+# Generate a random level for a new skip list node
+fn zset_random_level() -> i32
+    var level: i32 = 1
+    # Probability P = 0.25 means we promote with 25% chance
+    # We use (rand() & 0xFFFF) < (0xFFFF * 0.25)
+    while (zset_rand() & 0xFFFF) < 16383 && level < ZSET_MAX_LEVEL
+        level += 1
+    return level
+
+# Create a new skip list node
+fn zset_create_node(level: i32, member: *u8, score: i64) -> *ZSetNode
+    let node: *ZSetNode = malloc(sizeof(ZSetNode)) as *ZSetNode
+    node.member = string_from_cstr(member)
+    node.score = score
+    node.level = level
+    # Allocate forward array
+    node.forward = malloc(level * 8) as **ZSetNode
+    for i in 0..level
+        node.forward[i] = null
+    return node
+
+# Create a new sorted set
+fn zset_new() -> *ZSet
+    let zset: *ZSet = malloc(sizeof(ZSet)) as *ZSet
+    zset.level = 1
+    zset.len = 0
+
+    # Create header node (sentinel)
+    zset.header = malloc(sizeof(ZSetNode)) as *ZSetNode
+    zset.header.score = 0
+    zset.header.level = ZSET_MAX_LEVEL
+    zset.header.forward = malloc(ZSET_MAX_LEVEL * 8) as **ZSetNode
+    for i in 0..ZSET_MAX_LEVEL
+        zset.header.forward[i] = null
+
+    # Initialize hash table
+    zset.hash_cap = 16
+    zset.hash_tombstones = 0
+    zset.hash_entries = malloc(zset.hash_cap * sizeof(ZSetHashEntry)) as *ZSetHashEntry
+    for i in 0..zset.hash_cap
+        let entry: *ZSetHashEntry = zset.hash_entries + i
+        entry.state = 0
+        entry.node = null
+
+    return zset
+
+# Find slot in hash table
+fn zset_hash_find_slot(zset: *ZSet, member: *u8) -> i64
+    let h: u64 = hash_cstr(member)
+    let mask: i64 = zset.hash_cap - 1
+    var idx: i64 = (h as i64) & mask
+    var first_tombstone: i64 = -1
+
+    var i: i64 = 0
+    while i < zset.hash_cap
+        let entry: *ZSetHashEntry = zset.hash_entries + idx
+
+        if entry.state == 0  # EMPTY
+            if first_tombstone >= 0
+                return first_tombstone
+            return idx
+
+        if entry.state == 2  # TOMBSTONE
+            if first_tombstone < 0
+                first_tombstone = idx
+
+        if entry.state == 1  # OCCUPIED
+            if string_eq_cstr(@entry.member, member) == 1
+                return idx  # Found!
+
+        idx = (idx + 1) & mask
+        i += 1
+
+    if first_tombstone >= 0
+        return first_tombstone
+    return -1
+
+# Grow hash table
+fn zset_hash_grow(zset: *ZSet)
+    let old_entries: *ZSetHashEntry = zset.hash_entries
+    let old_cap: i64 = zset.hash_cap
+
+    let new_cap: i64 = old_cap * 2
+    zset.hash_entries = malloc(new_cap * sizeof(ZSetHashEntry)) as *ZSetHashEntry
+    zset.hash_cap = new_cap
+    zset.hash_tombstones = 0
+
+    for i in 0..new_cap
+        let entry: *ZSetHashEntry = zset.hash_entries + i
+        entry.state = 0
+        entry.node = null
+
+    # Rehash (count reset since we're rebuilding)
+    var count: i64 = 0
+    for i in 0..old_cap
+        let old_entry: *ZSetHashEntry = old_entries + i
+        if old_entry.state == 1
+            let new_idx: i64 = zset_hash_find_slot(zset, string_as_ptr(@old_entry.member))
+            let new_entry: *ZSetHashEntry = zset.hash_entries + new_idx
+            new_entry.member = old_entry.member  # Move ownership
+            new_entry.node = old_entry.node
+            new_entry.state = 1
+            count += 1
+
+    free(old_entries as *u8)
+
+# Get node from hash table
+fn zset_hash_get(zset: *ZSet, member: *u8) -> *ZSetNode
+    let h: u64 = hash_cstr(member)
+    let mask: i64 = zset.hash_cap - 1
+    var idx: i64 = (h as i64) & mask
+
+    var i: i64 = 0
+    while i < zset.hash_cap
+        let entry: *ZSetHashEntry = zset.hash_entries + idx
+
+        if entry.state == 0
+            return null
+
+        if entry.state == 1
+            if string_eq_cstr(@entry.member, member) == 1
+                return entry.node
+
+        idx = (idx + 1) & mask
+        i += 1
+
+    return null
+
+# Add or update member in hash table
+fn zset_hash_set(zset: *ZSet, member: *u8, node: *ZSetNode)
+    # Check load factor
+    let load: i64 = (zset.len + zset.hash_tombstones + 1) * 100 / zset.hash_cap
+    if load > 75
+        zset_hash_grow(zset)
+
+    let idx: i64 = zset_hash_find_slot(zset, member)
+    let entry: *ZSetHashEntry = zset.hash_entries + idx
+
+    if entry.state == 1  # Update existing
+        entry.node = node
+    else
+        if entry.state == 2
+            zset.hash_tombstones -= 1
+        entry.member = string_from_cstr(member)
+        entry.node = node
+        entry.state = 1
+
+# Remove member from hash table
+fn zset_hash_remove(zset: *ZSet, member: *u8)
+    let h: u64 = hash_cstr(member)
+    let mask: i64 = zset.hash_cap - 1
+    var idx: i64 = (h as i64) & mask
+
+    var i: i64 = 0
+    while i < zset.hash_cap
+        let entry: *ZSetHashEntry = zset.hash_entries + idx
+
+        if entry.state == 0
+            return  # Not found
+
+        if entry.state == 1
+            if string_eq_cstr(@entry.member, member) == 1
+                string_drop(@entry.member)
+                entry.state = 2  # TOMBSTONE
+                zset.hash_tombstones += 1
+                return
+
+        idx = (idx + 1) & mask
+        i += 1
+
+# Compare (score, member) pairs for ordering
+# Returns: -1 if a < b, 0 if equal, 1 if a > b
+fn zset_compare(score_a: i64, member_a: *u8, score_b: i64, member_b: *u8) -> i32
+    if score_a < score_b
+        return -1
+    if score_a > score_b
+        return 1
+    # Scores equal - compare lexicographically
+    return strcmp(member_a, member_b)
+
+# Add member with score to sorted set. Returns 1 if added, 0 if updated.
+pub fn zset_add(zset: *ZSet, member: *u8, score: i64) -> i32
+    # Check if member already exists
+    let existing: *ZSetNode = zset_hash_get(zset, member)
+    if existing != null
+        # Member exists - need to update score
+        if existing.score == score
+            return 0  # No change
+
+        # Need to remove and re-insert with new score
+        zset_remove(zset, member)
+
+    # Find insert position using skip list
+    var update: [16]*ZSetNode  # ZSET_MAX_LEVEL
+    var x: *ZSetNode = zset.header
+
+    var i: i32 = zset.level - 1
+    while i >= 0
+        while x.forward[i] != null
+            let cmp: i32 = zset_compare(x.forward[i].score, string_as_ptr(@x.forward[i].member), score, member)
+            if cmp >= 0
+                break
+            x = x.forward[i]
+        update[i] = x
+        i -= 1
+
+    # Create new node with random level
+    let level: i32 = zset_random_level()
+    let new_node: *ZSetNode = zset_create_node(level, member, score)
+
+    # Update skip list level if needed
+    if level > zset.level
+        var j: i32 = zset.level
+        while j < level
+            update[j] = zset.header
+            j += 1
+        zset.level = level
+
+    # Insert node at each level
+    var k: i32 = 0
+    while k < level
+        new_node.forward[k] = update[k].forward[k]
+        update[k].forward[k] = new_node
+        k += 1
+
+    zset.len += 1
+
+    # Add to hash table
+    zset_hash_set(zset, member, new_node)
+
+    if existing != null
+        return 0  # Updated
+    return 1  # Added
+
+# Remove member from sorted set. Returns 1 if removed, 0 if not found.
+pub fn zset_remove(zset: *ZSet, member: *u8) -> i32
+    # Find the node
+    let node: *ZSetNode = zset_hash_get(zset, member)
+    if node == null
+        return 0
+
+    let score: i64 = node.score
+
+    # Find position in skip list
+    var update: [16]*ZSetNode
+    var x: *ZSetNode = zset.header
+
+    var i: i32 = zset.level - 1
+    while i >= 0
+        while x.forward[i] != null
+            let cmp: i32 = zset_compare(x.forward[i].score, string_as_ptr(@x.forward[i].member), score, member)
+            if cmp >= 0
+                break
+            x = x.forward[i]
+        update[i] = x
+        i -= 1
+
+    # Verify we found the right node
+    x = x.forward[0]
+    if x == null || string_eq_cstr(@x.member, member) != 1
+        return 0  # Not found (shouldn't happen if hash lookup succeeded)
+
+    # Remove from skip list at each level
+    var k: i32 = 0
+    while k < zset.level
+        if update[k].forward[k] == x
+            update[k].forward[k] = x.forward[k]
+        k += 1
+
+    # Update skip list level
+    while zset.level > 1 && zset.header.forward[zset.level - 1] == null
+        zset.level -= 1
+
+    # Remove from hash table
+    zset_hash_remove(zset, member)
+
+    # Free node
+    string_drop(@x.member)
+    free(x.forward as *u8)
+    free(x as *u8)
+
+    zset.len -= 1
+    return 1
+
+# Get score for member. Returns score via out param, returns 1 if found, 0 if not.
+pub fn zset_score(zset: *ZSet, member: *u8, out_score: @&i64) -> i32
+    let node: *ZSetNode = zset_hash_get(zset, member)
+    if node == null
+        return 0
+    *out_score = node.score
+    return 1
+
+# Get rank of member (0-indexed, lowest score = 0). Returns -1 if not found.
+pub fn zset_rank(zset: *ZSet, member: *u8) -> i64
+    let target: *ZSetNode = zset_hash_get(zset, member)
+    if target == null
+        return -1
+
+    let score: i64 = target.score
+
+    # Count nodes before this one
+    var rank: i64 = 0
+    var x: *ZSetNode = zset.header.forward[0]
+
+    while x != null
+        let cmp: i32 = zset_compare(x.score, string_as_ptr(@x.member), score, member)
+        if cmp == 0
+            return rank
+        if cmp > 0
+            break  # Shouldn't happen
+        rank += 1
+        x = x.forward[0]
+
+    return -1  # Not found
+
+# Get reverse rank (highest score = 0). Returns -1 if not found.
+pub fn zset_revrank(zset: *ZSet, member: *u8) -> i64
+    let rank: i64 = zset_rank(zset, member)
+    if rank < 0
+        return -1
+    return zset.len - 1 - rank
+
+# Get length
+pub fn zset_len(zset: *ZSet) -> i64
+    if zset == null
+        return 0
+    return zset.len
+
+# Get range by rank [start, stop] (inclusive, 0-indexed).
+# Returns array of borrowed member pointers. Caller must free array.
+pub fn zset_range(zset: *ZSet, start: i64, stop: i64, out_count: @&i64) -> **u8
+    *out_count = 0
+    if zset == null || zset.len == 0
+        return null
+
+    # Normalize indices
+    var s_idx: i64 = start
+    var e_idx: i64 = stop
+
+    if s_idx < 0
+        s_idx = zset.len + s_idx
+    if e_idx < 0
+        e_idx = zset.len + e_idx
+
+    # Clamp
+    if s_idx < 0
+        s_idx = 0
+    if e_idx >= zset.len
+        e_idx = zset.len - 1
+    if s_idx > e_idx
+        return null
+
+    let count: i64 = e_idx - s_idx + 1
+    let result: **u8 = malloc(count * 8) as **u8
+
+    # Skip to start position
+    var node: *ZSetNode = zset.header.forward[0]
+    var i: i64 = 0
+    while i < s_idx && node != null
+        node = node.forward[0]
+        i += 1
+
+    # Collect elements
+    var j: i64 = 0
+    while j < count && node != null
+        *(result + j) = string_as_ptr(@node.member)
+        node = node.forward[0]
+        j += 1
+
+    *out_count = j
+    return result
+
+# Get reverse range by rank [start, stop] (highest scores first).
+# Returns array of borrowed member pointers. Caller must free array.
+pub fn zset_revrange(zset: *ZSet, start: i64, stop: i64, out_count: @&i64) -> **u8
+    *out_count = 0
+    if zset == null || zset.len == 0
+        return null
+
+    # Normalize indices (in reverse order)
+    var s_idx: i64 = start
+    var e_idx: i64 = stop
+
+    if s_idx < 0
+        s_idx = zset.len + s_idx
+    if e_idx < 0
+        e_idx = zset.len + e_idx
+
+    # Clamp
+    if s_idx < 0
+        s_idx = 0
+    if e_idx >= zset.len
+        e_idx = zset.len - 1
+    if s_idx > e_idx
+        return null
+
+    let count: i64 = e_idx - s_idx + 1
+
+    # Get forward range and reverse it
+    # Forward indices: from (len - 1 - stop) to (len - 1 - start)
+    let fwd_start: i64 = zset.len - 1 - e_idx
+    let fwd_stop: i64 = zset.len - 1 - s_idx
+
+    var fwd_count: i64 = 0
+    let fwd: **u8 = zset_range(zset, fwd_start, fwd_stop, @fwd_count)
+    if fwd == null
+        return null
+
+    # Reverse the array
+    let result: **u8 = malloc(count * 8) as **u8
+    var i: i64 = 0
+    while i < fwd_count
+        *(result + i) = *(fwd + (fwd_count - 1 - i))
+        i += 1
+
+    free(fwd as *u8)
+    *out_count = fwd_count
+    return result
+
+# ============================================================================
+# Store Sorted Set Operations
+# ============================================================================
+
+# Helper: Get or create zset for key. Returns null if key exists with wrong type.
+fn store_get_or_create_zset(s: *Store, key: *StrView) -> *ZSet
+    # Check load factor
+    let load: i64 = (s.len + s.tombstones + 1) * 100 / s.cap
+    if load > 75
+        store_grow(s)
+
+    let idx: i64 = store_find_slot(s, key)
+    if idx < 0
+        return null
+
+    let entry: *Entry = s.entries + idx
+
+    if entry.state == 1  # Occupied
+        if entry.value_type == VALUE_ZSET
+            return entry.value_ptr as *ZSet
+        return null  # Wrong type
+
+    # Create new zset
+    let zset: *ZSet = zset_new()
+
+    if entry.state == 2  # Was tombstone
+        s.tombstones -= 1
+
+    entry.key = string_from_strview(key)
+    entry.value_ptr = zset as *u8
+    entry.value_type = VALUE_ZSET
+    entry.expires_at = 0
+    entry.state = 1
+    s.len += 1
+
+    return zset
+
+# Helper: Get existing zset for key. Returns null if not found or wrong type.
+fn store_get_zset(s: *Store, key: *StrView) -> *ZSet
+    let h: u64 = hash_strview(key)
+    let mask: i64 = s.cap - 1
+    var idx: i64 = (h as i64) & mask
+
+    var i: i64 = 0
+    while i < s.cap
+        let entry: *Entry = s.entries + idx
+
+        if entry.state == 0
+            return null
+
+        if entry.state == 1
+            if string_eq_strview(@entry.key, key) == 1
+                # Check expiration
+                if entry.expires_at > 0
+                    let now: i64 = time_now_secs()
+                    if now >= entry.expires_at
+                        return null  # Expired
+                if entry.value_type == VALUE_ZSET
+                    return entry.value_ptr as *ZSet
+                return null  # Wrong type
+
+        idx = (idx + 1) & mask
+        i += 1
+
+    return null
+
+# ZADD: Add member with score. Returns 1 if added, 0 if updated.
+# Creates zset if key doesn't exist. Returns -1 if key exists with wrong type.
+pub fn store_zadd(s: *Store, key: *StrView, score: i64, member: *StrView) -> i64
+    let zset: *ZSet = store_get_or_create_zset(s, key)
+    if zset == null
+        return -1  # Key exists with wrong type
+    return zset_add(zset, strview_as_ptr(member), score) as i64
+
+# ZREM: Remove member. Returns 1 if removed, 0 if not found.
+# Returns -1 if key exists with wrong type.
+pub fn store_zrem(s: *Store, key: *StrView, member: *StrView) -> i64
+    let zset: *ZSet = store_get_zset(s, key)
+    if zset == null
+        # Check if wrong type
+        let h: u64 = hash_strview(key)
+        let mask: i64 = s.cap - 1
+        var idx: i64 = (h as i64) & mask
+        var i: i64 = 0
+        while i < s.cap
+            let entry: *Entry = s.entries + idx
+            if entry.state == 0
+                return 0
+            if entry.state == 1
+                if string_eq_strview(@entry.key, key) == 1
+                    return -1  # Wrong type
+            idx = (idx + 1) & mask
+            i += 1
+        return 0
+    return zset_remove(zset, strview_as_ptr(member)) as i64
+
+# ZSCORE: Get score for member. Returns 1 if found (score in out param), 0 if not.
+pub fn store_zscore(s: *Store, key: *StrView, member: *StrView, out_score: @&i64) -> i32
+    let zset: *ZSet = store_get_zset(s, key)
+    if zset == null
+        return 0
+    return zset_score(zset, strview_as_ptr(member), out_score)
+
+# ZRANK: Get rank of member (0-indexed). Returns -1 if not found.
+# Returns -2 if key exists with wrong type.
+pub fn store_zrank(s: *Store, key: *StrView, member: *StrView) -> i64
+    let zset: *ZSet = store_get_zset(s, key)
+    if zset == null
+        # Check if wrong type
+        let h: u64 = hash_strview(key)
+        let mask: i64 = s.cap - 1
+        var idx: i64 = (h as i64) & mask
+        var i: i64 = 0
+        while i < s.cap
+            let entry: *Entry = s.entries + idx
+            if entry.state == 0
+                return -1
+            if entry.state == 1
+                if string_eq_strview(@entry.key, key) == 1
+                    return -2  # Wrong type
+            idx = (idx + 1) & mask
+            i += 1
+        return -1
+    return zset_rank(zset, strview_as_ptr(member))
+
+# ZREVRANK: Get reverse rank (highest score = 0). Returns -1 if not found.
+pub fn store_zrevrank(s: *Store, key: *StrView, member: *StrView) -> i64
+    let zset: *ZSet = store_get_zset(s, key)
+    if zset == null
+        return -1
+    return zset_revrank(zset, strview_as_ptr(member))
+
+# ZCARD: Get cardinality. Returns 0 if key doesn't exist, -1 if wrong type.
+pub fn store_zcard(s: *Store, key: *StrView) -> i64
+    let h: u64 = hash_strview(key)
+    let mask: i64 = s.cap - 1
+    var idx: i64 = (h as i64) & mask
+
+    var i: i64 = 0
+    while i < s.cap
+        let entry: *Entry = s.entries + idx
+
+        if entry.state == 0
+            return 0
+
+        if entry.state == 1
+            if string_eq_strview(@entry.key, key) == 1
+                if entry.expires_at > 0
+                    let now: i64 = time_now_secs()
+                    if now >= entry.expires_at
+                        return 0
+                if entry.value_type == VALUE_ZSET
+                    let zset: *ZSet = entry.value_ptr as *ZSet
+                    return zset.len
+                return -1  # Wrong type
+
+        idx = (idx + 1) & mask
+        i += 1
+
+    return 0
+
+# ZRANGE: Get range by rank. Returns array of borrowed pointers.
+pub fn store_zrange(s: *Store, key: *StrView, start: i64, stop: i64, out_count: @&i64) -> **u8
+    *out_count = 0
+    let zset: *ZSet = store_get_zset(s, key)
+    if zset == null
+        return null
+    return zset_range(zset, start, stop, out_count)
+
+# ZREVRANGE: Get reverse range by rank. Returns array of borrowed pointers.
+pub fn store_zrevrange(s: *Store, key: *StrView, start: i64, stop: i64, out_count: @&i64) -> **u8
+    *out_count = 0
+    let zset: *ZSet = store_get_zset(s, key)
+    if zset == null
+        return null
+    return zset_revrange(zset, start, stop, out_count)
+
+# ============================================================================
+# Hash Operations (internal functions)
+# ============================================================================
+
+# Create a new hash with initial capacity
+fn hash_new() -> *Hash
+    let h: *Hash = malloc(32) as *Hash  # size of Hash struct
+    h.cap = 8
+    h.len = 0
+    h.tombstones = 0
+    let size: i64 = h.cap * 24  # size of HashEntry (field:16 + value:16 + state:4, padded)
+    h.entries = malloc(size) as *HashEntry
+    for i in 0..h.cap
+        let entry: *HashEntry = h.entries + i
+        entry.state = 0  # EMPTY
+    return h
+
+# Resize hash when load factor too high
+fn hash_resize(h: *Hash)
+    let old_entries: *HashEntry = h.entries
+    let old_cap: i64 = h.cap
+
+    # Double capacity
+    h.cap = old_cap * 2
+    h.len = 0
+    h.tombstones = 0
+    let size: i64 = h.cap * 24
+    h.entries = malloc(size) as *HashEntry
+    for i in 0..h.cap
+        let entry: *HashEntry = h.entries + i
+        entry.state = 0
+
+    # Rehash all entries
+    for i in 0..old_cap
+        let old: *HashEntry = old_entries + i
+        if old.state == 1  # OCCUPIED
+            # Insert into new table
+            let hash_val: u64 = string_hash(@old.field)
+            let mask: i64 = h.cap - 1
+            var idx: i64 = (hash_val as i64) & mask
+            var j: i64 = 0
+            while j < h.cap
+                let entry: *HashEntry = h.entries + idx
+                if entry.state != 1  # EMPTY or TOMBSTONE
+                    entry.field = old.field
+                    entry.value = old.value
+                    entry.state = 1
+                    h.len += 1
+                    break
+                idx = (idx + 1) & mask
+                j += 1
+
+    free(old_entries as *u8)
+
+# Set a field in the hash. Returns 1 if new field, 0 if updated existing.
+fn hash_set(h: *Hash, field: *u8, value: *u8) -> i32
+    # Check load factor (> 70%)
+    if (h.len + h.tombstones) * 10 > h.cap * 7
+        hash_resize(h)
+
+    let hash_val: u64 = hash_cstr(field)
+    let mask: i64 = h.cap - 1
+    var idx: i64 = (hash_val as i64) & mask
+    var first_tombstone: i64 = -1
+    var i: i64 = 0
+
+    while i < h.cap
+        let entry: *HashEntry = h.entries + idx
+
+        if entry.state == 0  # EMPTY - insert here or at tombstone
+            var insert_idx: i64 = idx
+            if first_tombstone >= 0
+                insert_idx = first_tombstone
+                h.tombstones -= 1
+            let target: *HashEntry = h.entries + insert_idx
+            target.field = string_from_cstr(field)
+            target.value = string_from_cstr(value)
+            target.state = 1
+            h.len += 1
+            return 1
+
+        if entry.state == 2  # TOMBSTONE
+            if first_tombstone < 0
+                first_tombstone = idx
+
+        if entry.state == 1  # OCCUPIED
+            if string_eq_cstr(@entry.field, field) == 1
+                # Update existing field
+                string_drop(@entry.value)
+                entry.value = string_from_cstr(value)
+                return 0
+
+        idx = (idx + 1) & mask
+        i += 1
+
+    # Table full (shouldn't happen with proper resize)
+    return -1
+
+# Get a field value from the hash. Returns null if not found.
+fn hash_get(h: *Hash, field: *u8) -> *u8
+    if h.len == 0
+        return null
+
+    let hash_val: u64 = hash_cstr(field)
+    let mask: i64 = h.cap - 1
+    var idx: i64 = (hash_val as i64) & mask
+    var i: i64 = 0
+
+    while i < h.cap
+        let entry: *HashEntry = h.entries + idx
+
+        if entry.state == 0
+            return null
+
+        if entry.state == 1
+            if string_eq_cstr(@entry.field, field) == 1
+                return string_as_ptr(@entry.value)
+
+        idx = (idx + 1) & mask
+        i += 1
+
+    return null
+
+# Check if field exists in hash. Returns 1 if exists, 0 if not.
+fn hash_exists(h: *Hash, field: *u8) -> i32
+    if hash_get(h, field) != null
+        return 1
+    return 0
+
+# Delete a field from the hash. Returns 1 if deleted, 0 if not found.
+fn hash_del(h: *Hash, field: *u8) -> i32
+    if h.len == 0
+        return 0
+
+    let hash_val: u64 = hash_cstr(field)
+    let mask: i64 = h.cap - 1
+    var idx: i64 = (hash_val as i64) & mask
+    var i: i64 = 0
+
+    while i < h.cap
+        let entry: *HashEntry = h.entries + idx
+
+        if entry.state == 0
+            return 0
+
+        if entry.state == 1
+            if string_eq_cstr(@entry.field, field) == 1
+                string_drop(@entry.field)
+                string_drop(@entry.value)
+                entry.state = 2  # TOMBSTONE
+                h.len -= 1
+                h.tombstones += 1
+                return 1
+
+        idx = (idx + 1) & mask
+        i += 1
+
+    return 0
+
+# Get number of fields in hash
+fn hash_len(h: *Hash) -> i64
+    return h.len
+
+# Get all fields. Returns array of borrowed pointers. Caller must free the array.
+fn hash_keys(h: *Hash, out_count: @&i64) -> **u8
+    *out_count = 0
+    if h.len == 0
+        return null
+
+    let arr: **u8 = malloc(h.len * 8) as **u8
+    var j: i64 = 0
+    for i in 0..h.cap
+        let entry: *HashEntry = h.entries + i
+        if entry.state == 1
+            *(arr + j) = string_as_ptr(@entry.field)
+            j += 1
+            if j >= h.len
+                break
+
+    *out_count = j
+    return arr
+
+# Get all values. Returns array of borrowed pointers. Caller must free the array.
+fn hash_vals(h: *Hash, out_count: @&i64) -> **u8
+    *out_count = 0
+    if h.len == 0
+        return null
+
+    let arr: **u8 = malloc(h.len * 8) as **u8
+    var j: i64 = 0
+    for i in 0..h.cap
+        let entry: *HashEntry = h.entries + i
+        if entry.state == 1
+            *(arr + j) = string_as_ptr(@entry.value)
+            j += 1
+            if j >= h.len
+                break
+
+    *out_count = j
+    return arr
+
+# Get all field-value pairs. Returns interleaved array [field, value, field, value, ...].
+# Caller must free the array.
+fn hash_getall(h: *Hash, out_count: @&i64) -> **u8
+    *out_count = 0
+    if h.len == 0
+        return null
+
+    let arr: **u8 = malloc(h.len * 16) as **u8  # 2 pointers per entry
+    var j: i64 = 0
+    for i in 0..h.cap
+        let entry: *HashEntry = h.entries + i
+        if entry.state == 1
+            *(arr + j) = string_as_ptr(@entry.field)
+            *(arr + j + 1) = string_as_ptr(@entry.value)
+            j += 2
+            if j >= h.len * 2
+                break
+
+    *out_count = j
+    return arr
+
+# ============================================================================
+# Hash Store Operations
+# ============================================================================
+
+# Helper to get or create a hash for a key
+fn store_get_or_create_hash(s: *Store, key: *StrView) -> *Hash
+    # Check if key already exists
+    let hash_val: u64 = hash_strview(key)
+    let mask: i64 = s.cap - 1
+    var idx: i64 = (hash_val as i64) & mask
+    var i: i64 = 0
+
+    while i < s.cap
+        let entry: *Entry = s.entries + idx
+
+        if entry.state == 0
+            break
+
+        if entry.state == 1
+            if string_eq_strview(@entry.key, key) == 1
+                # Check expiration
+                if entry.expires_at > 0
+                    let now: i64 = time_now_secs()
+                    if now >= entry.expires_at
+                        # Expired - clean up and treat as new
+                        let mem: i64 = entry_memory(entry)
+                        string_drop(@entry.key)
+                        if entry.value_type == VALUE_STRING
+                            string_drop(@entry.value)
+                        else if entry.value_type == VALUE_LIST
+                            list_drop(entry.value_ptr as *List)
+                        else if entry.value_type == VALUE_SET
+                            set_drop(entry.value_ptr as *Set)
+                        else if entry.value_type == VALUE_ZSET
+                            zset_drop(entry.value_ptr as *ZSet)
+                        else if entry.value_type == VALUE_HASH
+                            hash_drop(entry.value_ptr as *Hash)
+                        entry.state = 2  # TOMBSTONE
+                        entry.value_type = VALUE_NONE
+                        s.len -= 1
+                        s.tombstones += 1
+                        s.used_memory -= mem
+                        break
+                # Return existing hash
+                if entry.value_type == VALUE_HASH
+                    return entry.value_ptr as *Hash
+                # Wrong type - return null
+                return null
+
+        idx = (idx + 1) & mask
+        i += 1
+
+    # Key doesn't exist - create new hash
+    # Check load factor and resize if needed (> 75%)
+    let load: i64 = (s.len + s.tombstones + 1) * 100 / s.cap
+    if load > 75
+        store_grow(s)
+
+    let h: *Hash = hash_new()
+
+    # Insert new entry
+    let new_hash: u64 = hash_strview(key)
+    let new_mask: i64 = s.cap - 1
+    var new_idx: i64 = (new_hash as i64) & new_mask
+    var first_tombstone: i64 = -1
+    var j: i64 = 0
+
+    while j < s.cap
+        let entry: *Entry = s.entries + new_idx
+
+        if entry.state == 0  # EMPTY
+            var insert_idx: i64 = new_idx
+            if first_tombstone >= 0
+                insert_idx = first_tombstone
+                s.tombstones -= 1
+            let target: *Entry = s.entries + insert_idx
+            let now: i64 = time_now_secs()
+            target.key = string_from_strview(key)
+            target.value_ptr = h as *u8
+            target.value_type = VALUE_HASH
+            target.expires_at = 0
+            target.last_access = now
+            target.state = 1
+            s.len += 1
+            # Track initial memory
+            s.used_memory += entry_memory(target)
+            return h
+
+        if entry.state == 2  # TOMBSTONE
+            if first_tombstone < 0
+                first_tombstone = new_idx
+
+        new_idx = (new_idx + 1) & new_mask
+        j += 1
+
+    # Shouldn't happen
+    hash_drop(h)
+    return null
+
+# Helper to get existing hash for a key
+fn store_get_hash(s: *Store, key: *StrView) -> *Hash
+    if s.len == 0
+        return null
+
+    let hash_val: u64 = hash_strview(key)
+    let mask: i64 = s.cap - 1
+    var idx: i64 = (hash_val as i64) & mask
+    var i: i64 = 0
+
+    while i < s.cap
+        let entry: *Entry = s.entries + idx
+
+        if entry.state == 0
+            return null
+
+        if entry.state == 1
+            if string_eq_strview(@entry.key, key) == 1
+                if entry.expires_at > 0
+                    let now: i64 = time_now_secs()
+                    if now >= entry.expires_at
+                        return null
+                if entry.value_type == VALUE_HASH
+                    return entry.value_ptr as *Hash
+                return null
+
+        idx = (idx + 1) & mask
+        i += 1
+
+    return null
+
+# HSET: Set field in hash. Returns 1 if new, 0 if updated, -1 if wrong type.
+pub fn store_hset(s: *Store, key: *StrView, field: *StrView, value: *StrView) -> i32
+    # Check if key exists with wrong type
+    if s.len > 0
+        let hash_val: u64 = hash_strview(key)
+        let mask: i64 = s.cap - 1
+        var idx: i64 = (hash_val as i64) & mask
+        var i: i64 = 0
+        while i < s.cap
+            let entry: *Entry = s.entries + idx
+            if entry.state == 0
+                break
+            if entry.state == 1
+                if string_eq_strview(@entry.key, key) == 1
+                    if entry.expires_at > 0
+                        let now: i64 = time_now_secs()
+                        if now >= entry.expires_at
+                            break  # Expired, will be overwritten
+                    if entry.value_type != VALUE_HASH
+                        return -1  # Wrong type
+                    break
+            idx = (idx + 1) & mask
+            i += 1
+
+    let h: *Hash = store_get_or_create_hash(s, key)
+    if h == null
+        return -1
+    return hash_set(h, strview_as_ptr(field), strview_as_ptr(value))
+
+# HGET: Get field value. Returns null if not found or wrong type.
+pub fn store_hget(s: *Store, key: *StrView, field: *StrView) -> *u8
+    let h: *Hash = store_get_hash(s, key)
+    if h == null
+        return null
+    return hash_get(h, strview_as_ptr(field))
+
+# HDEL: Delete field from hash. Returns 1 if deleted, 0 if not found, -1 if wrong type.
+pub fn store_hdel(s: *Store, key: *StrView, field: *StrView) -> i32
+    # Check if key exists
+    if s.len == 0
+        return 0
+
+    let hash_val: u64 = hash_strview(key)
+    let mask: i64 = s.cap - 1
+    var idx: i64 = (hash_val as i64) & mask
+    var i: i64 = 0
+
+    while i < s.cap
+        let entry: *Entry = s.entries + idx
+
+        if entry.state == 0
+            return 0
+
+        if entry.state == 1
+            if string_eq_strview(@entry.key, key) == 1
+                if entry.expires_at > 0
+                    let now: i64 = time_now_secs()
+                    if now >= entry.expires_at
+                        return 0
+                if entry.value_type != VALUE_HASH
+                    return -1
+                let h: *Hash = entry.value_ptr as *Hash
+                return hash_del(h, strview_as_ptr(field))
+
+        idx = (idx + 1) & mask
+        i += 1
+
+    return 0
+
+# HEXISTS: Check if field exists. Returns 1 if exists, 0 if not, -1 if wrong type.
+pub fn store_hexists(s: *Store, key: *StrView, field: *StrView) -> i32
+    # Check if key exists
+    if s.len == 0
+        return 0
+
+    let hash_val: u64 = hash_strview(key)
+    let mask: i64 = s.cap - 1
+    var idx: i64 = (hash_val as i64) & mask
+    var i: i64 = 0
+
+    while i < s.cap
+        let entry: *Entry = s.entries + idx
+
+        if entry.state == 0
+            return 0
+
+        if entry.state == 1
+            if string_eq_strview(@entry.key, key) == 1
+                if entry.expires_at > 0
+                    let now: i64 = time_now_secs()
+                    if now >= entry.expires_at
+                        return 0
+                if entry.value_type != VALUE_HASH
+                    return -1
+                let h: *Hash = entry.value_ptr as *Hash
+                return hash_exists(h, strview_as_ptr(field))
+
+        idx = (idx + 1) & mask
+        i += 1
+
+    return 0
+
+# HLEN: Get number of fields. Returns count, 0 if not found, -1 if wrong type.
+pub fn store_hlen(s: *Store, key: *StrView) -> i64
+    if s.len == 0
+        return 0
+
+    let hash_val: u64 = hash_strview(key)
+    let mask: i64 = s.cap - 1
+    var idx: i64 = (hash_val as i64) & mask
+    var i: i64 = 0
+
+    while i < s.cap
+        let entry: *Entry = s.entries + idx
+
+        if entry.state == 0
+            return 0
+
+        if entry.state == 1
+            if string_eq_strview(@entry.key, key) == 1
+                if entry.expires_at > 0
+                    let now: i64 = time_now_secs()
+                    if now >= entry.expires_at
+                        return 0
+                if entry.value_type != VALUE_HASH
+                    return -1
+                let h: *Hash = entry.value_ptr as *Hash
+                return hash_len(h)
+
+        idx = (idx + 1) & mask
+        i += 1
+
+    return 0
+
+# HKEYS: Get all field names. Returns array of borrowed pointers.
+pub fn store_hkeys(s: *Store, key: *StrView, out_count: @&i64) -> **u8
+    *out_count = 0
+    let h: *Hash = store_get_hash(s, key)
+    if h == null
+        return null
+    return hash_keys(h, out_count)
+
+# HVALS: Get all field values. Returns array of borrowed pointers.
+pub fn store_hvals(s: *Store, key: *StrView, out_count: @&i64) -> **u8
+    *out_count = 0
+    let h: *Hash = store_get_hash(s, key)
+    if h == null
+        return null
+    return hash_vals(h, out_count)
+
+# HGETALL: Get all field-value pairs. Returns interleaved array.
+pub fn store_hgetall(s: *Store, key: *StrView, out_count: @&i64) -> **u8
+    *out_count = 0
+    let h: *Hash = store_get_hash(s, key)
+    if h == null
+        return null
+    return hash_getall(h, out_count)
+
+# ============================================================================
+# Pub/Sub System
+# ============================================================================
+# Pub/Sub allows publishing messages to channels and subscribing to receive them.
+# Subscribers register callbacks that are invoked when messages arrive.
+# Pattern subscriptions use glob-style matching (* = any characters).
+
+# Callback type: fn(channel: *u8, message: *u8, context: *u8) -> i32
+# Returns 0 to continue receiving, non-zero to auto-unsubscribe
+
+# A single subscriber entry in a channel's subscriber list
+struct Subscriber
+    callback: fn(*u8, *u8, *u8) -> i32   # (channel, message, ctx)
+    context: *u8                          # User-provided context
+    next: *Subscriber                     # Next subscriber in list
+
+# A channel entry in the channel hash table
+struct ChannelEntry
+    name: String                 # Channel name (owned)
+    subscribers: *Subscriber     # Linked list of subscribers
+    state: i32                   # 0=empty, 1=occupied, 2=tombstone
+
+# A pattern subscription entry
+struct PatternEntry
+    pattern: String              # Glob pattern (owned)
+    callback: fn(*u8, *u8, *u8) -> i32
+    context: *u8
+    next: *PatternEntry          # Next pattern in list
+
+# The Pub/Sub registry
+struct PubSub
+    channels: *ChannelEntry      # Hash table of channels
+    channel_cap: i64             # Capacity
+    channel_len: i64             # Number of channels
+    channel_tombstones: i64      # Number of tombstones
+    patterns: *PatternEntry      # Linked list of pattern subscriptions
+    pattern_count: i64           # Number of pattern subscriptions
+
+# ============================================================================
+# Pub/Sub Constructor and Destructor
+# ============================================================================
+
+pub fn pubsub_new() -> PubSub
+    var ps: PubSub
+    ps.channel_cap = 16
+    ps.channel_len = 0
+    ps.channel_tombstones = 0
+    let size: i64 = ps.channel_cap * 32  # ChannelEntry size estimate
+    ps.channels = malloc(size) as *ChannelEntry
+    for i in 0..ps.channel_cap
+        let entry: *ChannelEntry = ps.channels + i
+        entry.state = 0
+    ps.patterns = null
+    ps.pattern_count = 0
+    return ps
+
+pub fn pubsub_drop(ps: @&PubSub)
+    # Free all channels and their subscribers
+    if ps.channels != null
+        for i in 0..ps.channel_cap
+            let entry: *ChannelEntry = ps.channels + i
+            if entry.state == 1
+                string_drop(@entry.name)
+                # Free subscriber list
+                var sub: *Subscriber = entry.subscribers
+                while sub != null
+                    let next: *Subscriber = sub.next
+                    free(sub as *u8)
+                    sub = next
+        free(ps.channels as *u8)
+    ps.channels = null
+
+    # Free all pattern subscriptions
+    var pat: *PatternEntry = ps.patterns
+    while pat != null
+        let next: *PatternEntry = pat.next
+        string_drop(@pat.pattern)
+        free(pat as *u8)
+        pat = next
+    ps.patterns = null
+
+# ============================================================================
+# Channel Operations
+# ============================================================================
+
+# Grow the channel hash table
+fn pubsub_grow_channels(ps: @&PubSub)
+    let old_channels: *ChannelEntry = ps.channels
+    let old_cap: i64 = ps.channel_cap
+
+    ps.channel_cap = old_cap * 2
+    ps.channel_len = 0
+    ps.channel_tombstones = 0
+    let size: i64 = ps.channel_cap * 32
+    ps.channels = malloc(size) as *ChannelEntry
+    for i in 0..ps.channel_cap
+        let entry: *ChannelEntry = ps.channels + i
+        entry.state = 0
+
+    # Rehash existing entries
+    for i in 0..old_cap
+        let old: *ChannelEntry = old_channels + i
+        if old.state == 1
+            let h: u64 = string_hash(@old.name)
+            let mask: i64 = ps.channel_cap - 1
+            var idx: i64 = (h as i64) & mask
+            var j: i64 = 0
+            while j < ps.channel_cap
+                let entry: *ChannelEntry = ps.channels + idx
+                if entry.state == 0
+                    entry.name = old.name
+                    entry.subscribers = old.subscribers
+                    entry.state = 1
+                    ps.channel_len += 1
+                    break
+                idx = (idx + 1) & mask
+                j += 1
+
+    free(old_channels as *u8)
+
+# Get or create a channel entry
+fn pubsub_get_or_create_channel(ps: @&PubSub, channel: *u8) -> *ChannelEntry
+    # Check load factor
+    let load: i64 = (ps.channel_len + ps.channel_tombstones + 1) * 100 / ps.channel_cap
+    if load > 75
+        pubsub_grow_channels(ps)
+
+    let h: u64 = hash_cstr(channel)
+    let mask: i64 = ps.channel_cap - 1
+    var idx: i64 = (h as i64) & mask
+    var first_tombstone: i64 = -1
+    var i: i64 = 0
+
+    while i < ps.channel_cap
+        let entry: *ChannelEntry = ps.channels + idx
+
+        if entry.state == 0  # Empty - insert here
+            var insert_idx: i64 = idx
+            if first_tombstone >= 0
+                insert_idx = first_tombstone
+                ps.channel_tombstones -= 1
+            let target: *ChannelEntry = ps.channels + insert_idx
+            target.name = string_from_cstr(channel)
+            target.subscribers = null
+            target.state = 1
+            ps.channel_len += 1
+            return target
+
+        if entry.state == 2  # Tombstone
+            if first_tombstone < 0
+                first_tombstone = idx
+
+        if entry.state == 1  # Occupied
+            if string_eq_cstr(@entry.name, channel) == 1
+                return entry
+
+        idx = (idx + 1) & mask
+        i += 1
+
+    return null
+
+# Find a channel (don't create)
+fn pubsub_find_channel(ps: @PubSub, channel: *u8) -> *ChannelEntry
+    if ps.channel_len == 0
+        return null
+
+    let h: u64 = hash_cstr(channel)
+    let mask: i64 = ps.channel_cap - 1
+    var idx: i64 = (h as i64) & mask
+    var i: i64 = 0
+
+    while i < ps.channel_cap
+        let entry: *ChannelEntry = ps.channels + idx
+
+        if entry.state == 0
+            return null
+
+        if entry.state == 1
+            if string_eq_cstr(@entry.name, channel) == 1
+                return entry
+
+        idx = (idx + 1) & mask
+        i += 1
+
+    return null
+
+# ============================================================================
+# Subscribe Operations
+# ============================================================================
+
+# Subscribe to a channel with a callback
+pub fn pubsub_subscribe(ps: @&PubSub, channel: *u8, callback: fn(*u8, *u8, *u8) -> i32, context: *u8) -> i32
+    let entry: *ChannelEntry = pubsub_get_or_create_channel(ps, channel)
+    if entry == null
+        return -1
+
+    # Check if already subscribed (same callback + context)
+    var sub: *Subscriber = entry.subscribers
+    while sub != null
+        if sub.callback == callback && sub.context == context
+            return 0  # Already subscribed
+        sub = sub.next
+
+    # Add new subscriber at head
+    let new_sub: *Subscriber = malloc(24) as *Subscriber  # 8+8+8 bytes
+    new_sub.callback = callback
+    new_sub.context = context
+    new_sub.next = entry.subscribers
+    entry.subscribers = new_sub
+    return 1
+
+# Unsubscribe from a channel
+pub fn pubsub_unsubscribe(ps: @&PubSub, channel: *u8, callback: fn(*u8, *u8, *u8) -> i32, context: *u8) -> i32
+    let entry: *ChannelEntry = pubsub_find_channel(ps, channel)
+    if entry == null
+        return 0
+
+    var prev: *Subscriber = null
+    var sub: *Subscriber = entry.subscribers
+    while sub != null
+        if sub.callback == callback && sub.context == context
+            # Remove from list
+            if prev == null
+                entry.subscribers = sub.next
+            else
+                prev.next = sub.next
+            free(sub as *u8)
+            return 1
+        prev = sub
+        sub = sub.next
+
+    return 0
+
+# ============================================================================
+# Pattern Subscribe Operations
+# ============================================================================
+
+# Subscribe to a pattern (glob-style)
+pub fn pubsub_psubscribe(ps: @&PubSub, pattern: *u8, callback: fn(*u8, *u8, *u8) -> i32, context: *u8) -> i32
+    # Check if already subscribed
+    var pat: *PatternEntry = ps.patterns
+    while pat != null
+        if string_eq_cstr(@pat.pattern, pattern) == 1
+            if pat.callback == callback && pat.context == context
+                return 0  # Already subscribed
+        pat = pat.next
+
+    # Add new pattern at head
+    let new_pat: *PatternEntry = malloc(40) as *PatternEntry  # String(16) + fn(8) + ctx(8) + next(8)
+    new_pat.pattern = string_from_cstr(pattern)
+    new_pat.callback = callback
+    new_pat.context = context
+    new_pat.next = ps.patterns
+    ps.patterns = new_pat
+    ps.pattern_count += 1
+    return 1
+
+# Unsubscribe from a pattern
+pub fn pubsub_punsubscribe(ps: @&PubSub, pattern: *u8, callback: fn(*u8, *u8, *u8) -> i32, context: *u8) -> i32
+    var prev: *PatternEntry = null
+    var pat: *PatternEntry = ps.patterns
+    while pat != null
+        if string_eq_cstr(@pat.pattern, pattern) == 1
+            if pat.callback == callback && pat.context == context
+                # Remove from list
+                if prev == null
+                    ps.patterns = pat.next
+                else
+                    prev.next = pat.next
+                string_drop(@pat.pattern)
+                free(pat as *u8)
+                ps.pattern_count -= 1
+                return 1
+        prev = pat
+        pat = pat.next
+
+    return 0
+
+# ============================================================================
+# Pattern Matching (glob-style)
+# ============================================================================
+
+# Match a string against a glob pattern
+# Supports: * (any chars), ? (any single char)
+fn tome_glob_match(pattern: *u8, str: *u8) -> i32
+    var p: *u8 = pattern
+    var s: *u8 = str
+    var star_p: *u8 = null    # Position after last * in pattern
+    var star_s: *u8 = null    # Position in str when we matched *
+
+    while *s != 0
+        if *p == 42  # '*'
+            # Skip consecutive stars
+            while *p == 42
+                p = p + 1
+            if *p == 0
+                return 1  # Trailing * matches everything
+            star_p = p
+            star_s = s
+        else if *p == 63 || *p == *s  # '?' or exact match
+            p = p + 1
+            s = s + 1
+        else if star_p != null
+            # Backtrack: try matching * with one more char
+            p = star_p
+            star_s = star_s + 1
+            s = star_s
+        else
+            return 0  # No match
+
+    # Skip trailing stars in pattern
+    while *p == 42
+        p = p + 1
+
+    if *p == 0
+        return 1
+    return 0
+
+# ============================================================================
+# Publish Operation
+# ============================================================================
+
+# Publish a message to a channel
+# Returns number of subscribers that received the message
+pub fn pubsub_publish(ps: @&PubSub, channel: *u8, message: *u8) -> i64
+    var count: i64 = 0
+
+    # Direct channel subscribers
+    let entry: *ChannelEntry = pubsub_find_channel(ps, channel)
+    if entry != null
+        var prev: *Subscriber = null
+        var sub: *Subscriber = entry.subscribers
+        while sub != null
+            let cb: fn(*u8, *u8, *u8) -> i32 = sub.callback
+            let result: i32 = cb(channel, message, sub.context)
+            count += 1
+
+            if result != 0
+                # Subscriber wants to unsubscribe
+                let next: *Subscriber = sub.next
+                if prev == null
+                    entry.subscribers = next
+                else
+                    prev.next = next
+                free(sub as *u8)
+                sub = next
+            else
+                prev = sub
+                sub = sub.next
+
+    # Pattern subscribers
+    var prev_pat: *PatternEntry = null
+    var pat: *PatternEntry = ps.patterns
+    while pat != null
+        if tome_glob_match(string_as_ptr(@pat.pattern), channel) == 1
+            let pcb: fn(*u8, *u8, *u8) -> i32 = pat.callback
+            let result: i32 = pcb(channel, message, pat.context)
+            count += 1
+
+            if result != 0
+                # Subscriber wants to unsubscribe
+                let next: *PatternEntry = pat.next
+                if prev_pat == null
+                    ps.patterns = next
+                else
+                    prev_pat.next = next
+                string_drop(@pat.pattern)
+                free(pat as *u8)
+                ps.pattern_count -= 1
+                pat = next
+            else
+                prev_pat = pat
+                pat = pat.next
+        else
+            prev_pat = pat
+            pat = pat.next
+
+    return count
+
+# ============================================================================
+# Pub/Sub Query Operations
+# ============================================================================
+
+# Get count of subscribers to a specific channel
+pub fn pubsub_numsub(ps: @PubSub, channel: *u8) -> i64
+    let entry: *ChannelEntry = pubsub_find_channel(ps, channel)
+    if entry == null
+        return 0
+
+    var count: i64 = 0
+    var sub: *Subscriber = entry.subscribers
+    while sub != null
+        count += 1
+        sub = sub.next
+    return count
+
+# Get count of pattern subscriptions
+pub fn pubsub_numpat(ps: @PubSub) -> i64
+    return ps.pattern_count
+
+# Get list of channels with subscribers. Returns array of borrowed pointers.
+pub fn pubsub_channels(ps: @PubSub, out_count: @&i64) -> **u8
+    *out_count = 0
+    if ps.channel_len == 0
+        return null
+
+    # Count channels with actual subscribers
+    var active: i64 = 0
+    for i in 0..ps.channel_cap
+        let entry: *ChannelEntry = ps.channels + i
+        if entry.state == 1 && entry.subscribers != null
+            active += 1
+
+    if active == 0
+        return null
+
+    let arr: **u8 = malloc(active * 8) as **u8
+    var j: i64 = 0
+    for i in 0..ps.channel_cap
+        let entry: *ChannelEntry = ps.channels + i
+        if entry.state == 1 && entry.subscribers != null
+            *(arr + j) = string_as_ptr(@entry.name)
+            j += 1
+            if j >= active
+                break
+
+    *out_count = j
+    return arr

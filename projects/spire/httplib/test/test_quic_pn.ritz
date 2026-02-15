@@ -1,0 +1,366 @@
+# test/test_quic_pn.ritz - Tests for QUIC packet number encoding/decoding
+#
+# RFC 9000 Appendix A defines packet number encoding
+
+import ritzlib.span
+import lib.quic_pn
+
+# ============================================================================
+# Packet Number Encoding Length
+# ============================================================================
+
+[[test]]
+fn test_pn_encoded_len_1_byte() -> i32
+    # Small delta from largest_acked needs 1 byte
+    if pn_encoded_len(10, 5) != 1
+        return 1
+    if pn_encoded_len(100, 50) != 1
+        return 2
+    return 0
+
+[[test]]
+fn test_pn_encoded_len_2_bytes() -> i32
+    # Delta >= 128 needs 2 bytes
+    if pn_encoded_len(200, 0) != 2
+        return 1
+    if pn_encoded_len(1000, 0) != 2
+        return 2
+    return 0
+
+[[test]]
+fn test_pn_encoded_len_3_bytes() -> i32
+    # Delta >= 16384 needs 3 bytes
+    if pn_encoded_len(20000, 0) != 3
+        return 1
+    return 0
+
+[[test]]
+fn test_pn_encoded_len_4_bytes() -> i32
+    # Delta >= 2097152 needs 4 bytes
+    if pn_encoded_len(3000000, 0) != 4
+        return 1
+    return 0
+
+# ============================================================================
+# Packet Number Encoding
+# ============================================================================
+
+[[test]]
+fn test_pn_encode_1_byte() -> i32
+    var buf: [8]u8
+    let ret: i32 = pn_encode(42, 1, @buf[0], 8)
+    if ret != 1
+        return 1
+    if buf[0] != 42
+        return 2
+    return 0
+
+[[test]]
+fn test_pn_encode_2_bytes() -> i32
+    var buf: [8]u8
+    let ret: i32 = pn_encode(0x1234, 2, @buf[0], 8)
+    if ret != 2
+        return 1
+    if buf[0] != 0x12
+        return 2
+    if buf[1] != 0x34
+        return 3
+    return 0
+
+[[test]]
+fn test_pn_encode_3_bytes() -> i32
+    var buf: [8]u8
+    let ret: i32 = pn_encode(0x123456, 3, @buf[0], 8)
+    if ret != 3
+        return 1
+    if buf[0] != 0x12
+        return 2
+    if buf[1] != 0x34
+        return 3
+    if buf[2] != 0x56
+        return 4
+    return 0
+
+[[test]]
+fn test_pn_encode_4_bytes() -> i32
+    var buf: [8]u8
+    let ret: i32 = pn_encode(0x12345678, 4, @buf[0], 8)
+    if ret != 4
+        return 1
+    if buf[0] != 0x12
+        return 2
+    if buf[1] != 0x34
+        return 3
+    if buf[2] != 0x56
+        return 4
+    if buf[3] != 0x78
+        return 5
+    return 0
+
+[[test]]
+fn test_pn_encode_buffer_too_small() -> i32
+    var buf: [2]u8
+    let ret: i32 = pn_encode(1000, 4, @buf[0], 2)
+    if ret != PN_ERR_INCOMPLETE
+        return 1
+    return 0
+
+[[test]]
+fn test_pn_encode_invalid_len() -> i32
+    var buf: [8]u8
+    let ret: i32 = pn_encode(100, 5, @buf[0], 8)
+    if ret != PN_ERR_INVALID
+        return 1
+    return 0
+
+# ============================================================================
+# Packet Number Parsing
+# ============================================================================
+
+[[test]]
+fn test_pn_parse_1_byte() -> i32
+    var buf: [8]u8
+    buf[0] = 42
+
+    let pn: i64 = pn_parse(@buf[0], 1)
+    if pn != 42
+        return 1
+    return 0
+
+[[test]]
+fn test_pn_parse_2_bytes() -> i32
+    var buf: [8]u8
+    buf[0] = 0x12
+    buf[1] = 0x34
+
+    let pn: i64 = pn_parse(@buf[0], 2)
+    if pn != 0x1234
+        return 1
+    return 0
+
+[[test]]
+fn test_pn_parse_3_bytes() -> i32
+    var buf: [8]u8
+    buf[0] = 0x12
+    buf[1] = 0x34
+    buf[2] = 0x56
+
+    let pn: i64 = pn_parse(@buf[0], 3)
+    if pn != 0x123456
+        return 1
+    return 0
+
+[[test]]
+fn test_pn_parse_4_bytes() -> i32
+    var buf: [8]u8
+    buf[0] = 0x12
+    buf[1] = 0x34
+    buf[2] = 0x56
+    buf[3] = 0x78
+
+    let pn: i64 = pn_parse(@buf[0], 4)
+    if pn != 0x12345678
+        return 1
+    return 0
+
+# ============================================================================
+# Packet Number Decoding (Truncated to Full)
+# ============================================================================
+
+[[test]]
+fn test_pn_decode_simple() -> i32
+    # Truncated=5, len=1, largest=3 -> Full=5
+    let full: i64 = pn_decode(5, 1, 3)
+    if full != 5
+        return 1
+    return 0
+
+[[test]]
+fn test_pn_decode_wraparound_up() -> i32
+    # Example from RFC 9000:
+    # Truncated=0xa82f9b32, len=4, largest=0xa82f30ea
+    # Expected full = 0xa82f9b32
+    let full: i64 = pn_decode(0x9b32, 2, 0xa82f30ea)
+    # Should decode to 0xa82f9b32
+    if full != 0xa82f9b32
+        return 1
+    return 0
+
+[[test]]
+fn test_pn_decode_near_boundary() -> i32
+    # When truncated is 0 and largest is 255, should decode to 256
+    let full: i64 = pn_decode(0, 1, 255)
+    if full != 256
+        return 1
+    return 0
+
+[[test]]
+fn test_pn_decode_2_byte() -> i32
+    # Truncated = 0x1234, len=2, largest = 0x10FF
+    # Expected range is around 0x10FF+1 = 0x1100
+    # High bits: 0x1100 & ~0xFFFF = 0x0000
+    # Combined: 0x0000 | 0x1234 = 0x1234
+    let full: i64 = pn_decode(0x1234, 2, 0x10FF)
+    if full != 0x1234
+        return 1
+    return 0
+
+# ============================================================================
+# Packet Number Roundtrip
+# ============================================================================
+
+[[test]]
+fn test_pn_roundtrip_1_byte() -> i32
+    let original: i64 = 42
+    let largest: i64 = 30
+    let len: i32 = pn_encoded_len(original, largest)
+
+    var buf: [8]u8
+    pn_encode(original, len, @buf[0], 8)
+
+    let truncated: i64 = pn_parse(@buf[0], len)
+    let decoded: i64 = pn_decode(truncated, len, largest)
+
+    if decoded != original
+        return 1
+    return 0
+
+[[test]]
+fn test_pn_roundtrip_2_byte() -> i32
+    let original: i64 = 1000
+    let largest: i64 = 500
+    let len: i32 = pn_encoded_len(original, largest)
+
+    var buf: [8]u8
+    pn_encode(original, len, @buf[0], 8)
+
+    let truncated: i64 = pn_parse(@buf[0], len)
+    let decoded: i64 = pn_decode(truncated, len, largest)
+
+    if decoded != original
+        return 1
+    return 0
+
+[[test]]
+fn test_pn_roundtrip_large() -> i32
+    let original: i64 = 0x12345678
+    let largest: i64 = 0x12345600
+    let len: i32 = pn_encoded_len(original, largest)
+
+    var buf: [8]u8
+    pn_encode(original, len, @buf[0], 8)
+
+    let truncated: i64 = pn_parse(@buf[0], len)
+    let decoded: i64 = pn_decode(truncated, len, largest)
+
+    if decoded != original
+        return 1
+    return 0
+
+# ============================================================================
+# Packet Number Space
+# ============================================================================
+
+[[test]]
+fn test_pn_space_init() -> i32
+    var space: PnSpace
+    pn_space_init(@space)
+    if space.next_pn != 0
+        return 1
+    if space.largest_acked != -1
+        return 2
+    if space.largest_recv != -1
+        return 3
+    if space.has_recv != 0
+        return 4
+    return 0
+
+[[test]]
+fn test_pn_space_next() -> i32
+    var space: PnSpace
+    pn_space_init(@space)
+
+    let pn1: i64 = pn_space_next(@space)
+    let pn2: i64 = pn_space_next(@space)
+    let pn3: i64 = pn_space_next(@space)
+
+    if pn1 != 0
+        return 1
+    if pn2 != 1
+        return 2
+    if pn3 != 2
+        return 3
+    if space.next_pn != 3
+        return 4
+    return 0
+
+[[test]]
+fn test_pn_space_ack() -> i32
+    var space: PnSpace
+    pn_space_init(@space)
+
+    pn_space_ack(@space, 5)
+    if space.largest_acked != 5
+        return 1
+
+    pn_space_ack(@space, 3)  # Should not decrease
+    if space.largest_acked != 5
+        return 2
+
+    pn_space_ack(@space, 10)
+    if space.largest_acked != 10
+        return 3
+    return 0
+
+[[test]]
+fn test_pn_space_recv() -> i32
+    var space: PnSpace
+    pn_space_init(@space)
+
+    pn_space_recv(@space, 7)
+    if space.has_recv != 1
+        return 1
+    if space.largest_recv != 7
+        return 2
+    return 0
+
+[[test]]
+fn test_pn_space_encode_len() -> i32
+    var space: PnSpace
+    pn_space_init(@space)
+
+    # First packet, no acks yet
+    let len: i32 = pn_space_encode_len(@space)
+    if len != 1
+        return 1
+    return 0
+
+# ============================================================================
+# Packet Number Manager
+# ============================================================================
+
+[[test]]
+fn test_pn_manager_init() -> i32
+    var mgr: PnManager
+    pn_manager_init(@mgr)
+
+    var space: *PnSpace = pn_manager_get_space(@mgr, PN_SPACE_INITIAL)
+    if space == null
+        return 1
+    if space.next_pn != 0
+        return 2
+
+    space = pn_manager_get_space(@mgr, PN_SPACE_APPLICATION)
+    if space == null
+        return 3
+    return 0
+
+[[test]]
+fn test_pn_manager_get_space_invalid() -> i32
+    var mgr: PnManager
+    pn_manager_init(@mgr)
+
+    var space: *PnSpace = pn_manager_get_space(@mgr, 5)
+    if space != null
+        return 1
+    return 0

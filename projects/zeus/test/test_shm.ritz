@@ -1,0 +1,293 @@
+# test/test_shm.ritz - Tests for shared memory region
+#
+# TDD: These tests define the expected behavior of the shared memory
+# region that houses the control block, ring buffers, and data arena.
+#
+# Shared memory layout:
+#   [Control Block][Request Ring][Response Ring][Data Arena]
+#
+# The region is created by Valet and attached by Workers via memfd + mmap.
+
+import ritzlib.sys
+import ritzlib.io
+import helpers
+
+# Import our library
+import lib.shm
+import lib.control
+import lib.ring
+import lib.arena
+
+# ============================================================================
+# Shared Memory Config Tests
+# ============================================================================
+
+[[test]]
+fn test_shm_config_defaults() -> i32
+    var cfg: ShmConfig
+    shm_config_default(@cfg)
+
+    # Check reasonable defaults
+    let result: i32 = assert_ge(cfg.ring_capacity, 64)
+    if result != 0
+        return result
+
+    let result2: i32 = assert_ge(cfg.arena_size, 65536)
+    if result2 != 0
+        return result2
+
+    return 0
+
+[[test]]
+fn test_shm_config_custom() -> i32
+    var cfg: ShmConfig
+    shm_config_init(@cfg, 512, 1048576)  # 512 slots, 1MB arena
+
+    let result: i32 = assert_eq_i64(cfg.ring_capacity, 512)
+    if result != 0
+        return result
+
+    let result2: i32 = assert_eq_i64(cfg.arena_size, 1048576)
+    if result2 != 0
+        return result2
+
+    return 0
+
+[[test]]
+fn test_shm_total_size() -> i32
+    var cfg: ShmConfig
+    shm_config_default(@cfg)
+
+    let total: i64 = shm_calculate_size(@cfg)
+
+    # Should be: control block + 2 * ring_capacity * slot_size + arena_size
+    let expected_min: i64 = 128 + (2 * cfg.ring_capacity * 48) + cfg.arena_size
+    let result: i32 = assert_ge(total, expected_min)
+    if result != 0
+        return result
+
+    return 0
+
+# ============================================================================
+# Shared Memory Region Tests
+# ============================================================================
+
+[[test]]
+fn test_shm_create() -> i32
+    var cfg: ShmConfig
+    shm_config_default(@cfg)
+
+    var region: ShmRegion
+    let result: i32 = shm_create(@region, @cfg)
+    if result != 0
+        "FAIL: shm_create failed with code {result}\n"
+        return 1
+
+    # Check region is valid
+    let result2: i32 = assert_not_null(region.base)
+    if result2 != 0
+        shm_destroy(@region)
+        return result2
+
+    let result3: i32 = assert_ge(region.size, 0)
+    if result3 != 0
+        shm_destroy(@region)
+        return result3
+
+    # Check fd is valid (>= 0)
+    if region.fd < 0
+        "FAIL: invalid fd: {region.fd}\n"
+        shm_destroy(@region)
+        return 1
+
+    shm_destroy(@region)
+    return 0
+
+[[test]]
+fn test_shm_control_block_access() -> i32
+    var cfg: ShmConfig
+    shm_config_default(@cfg)
+
+    var region: ShmRegion
+    shm_create(@region, @cfg)
+
+    # Get control block pointer
+    let cb: *ControlBlock = shm_get_control_block(@region)
+    let result: i32 = assert_not_null(cb as *u8)
+    if result != 0
+        shm_destroy(@region)
+        return result
+
+    # Control block should be initialized
+    let result2: i32 = assert_eq_i32(cb.state, WORKER_STATE_IDLE)
+    if result2 != 0
+        shm_destroy(@region)
+        return result2
+
+    shm_destroy(@region)
+    return 0
+
+[[test]]
+fn test_shm_ring_access() -> i32
+    var cfg: ShmConfig
+    shm_config_default(@cfg)
+
+    var region: ShmRegion
+    shm_create(@region, @cfg)
+
+    # Get request ring pointer
+    let req_ring: *RequestSlot = shm_get_request_ring(@region)
+    let result: i32 = assert_not_null(req_ring as *u8)
+    if result != 0
+        shm_destroy(@region)
+        return result
+
+    # Get response ring pointer
+    let resp_ring: *ResponseSlot = shm_get_response_ring(@region)
+    let result2: i32 = assert_not_null(resp_ring as *u8)
+    if result2 != 0
+        shm_destroy(@region)
+        return result2
+
+    # Rings should be at different addresses
+    if (req_ring as i64) == (resp_ring as i64)
+        "FAIL: request and response rings at same address\n"
+        shm_destroy(@region)
+        return 1
+
+    shm_destroy(@region)
+    return 0
+
+[[test]]
+fn test_shm_arena_access() -> i32
+    var cfg: ShmConfig
+    shm_config_default(@cfg)
+
+    var region: ShmRegion
+    shm_create(@region, @cfg)
+
+    # Get arena
+    var arena: DataArena
+    shm_get_arena(@region, @arena)
+
+    let result: i32 = assert_not_null(arena.base)
+    if result != 0
+        shm_destroy(@region)
+        return result
+
+    let result2: i32 = assert_eq_i64(arena.size, cfg.arena_size)
+    if result2 != 0
+        shm_destroy(@region)
+        return result2
+
+    shm_destroy(@region)
+    return 0
+
+[[test]]
+fn test_shm_write_read_data() -> i32
+    var cfg: ShmConfig
+    shm_config_default(@cfg)
+
+    var region: ShmRegion
+    shm_create(@region, @cfg)
+
+    # Get arena and write some data
+    var arena: DataArena
+    shm_get_arena(@region, @arena)
+
+    let ptr: *u8 = data_arena_alloc(@arena, 4)
+    *ptr = 0x48        # 'H'
+    *(ptr + 1) = 0x69  # 'i'
+    *(ptr + 2) = 0x21  # '!'
+    *(ptr + 3) = 0x00  # null
+
+    # Read back
+    if *ptr != 0x48
+        "FAIL: byte 0 mismatch\n"
+        shm_destroy(@region)
+        return 1
+
+    if *(ptr + 1) != 0x69
+        "FAIL: byte 1 mismatch\n"
+        shm_destroy(@region)
+        return 1
+
+    shm_destroy(@region)
+    return 0
+
+[[test]]
+fn test_shm_request_slot_usage() -> i32
+    var cfg: ShmConfig
+    shm_config_default(@cfg)
+
+    var region: ShmRegion
+    shm_create(@region, @cfg)
+
+    # Get control block and request ring
+    let cb: *ControlBlock = shm_get_control_block(@region)
+    let req_ring: *RequestSlot = shm_get_request_ring(@region)
+
+    # Write a request to slot 0
+    let slot_idx: i64 = control_block_slot_index(cb, 0)
+    let slot: *RequestSlot = req_ring + slot_idx
+
+    request_slot_init(slot)
+    slot.id = 42
+    request_slot_set_method(slot, HTTP_METHOD_GET)
+    request_slot_set_path(slot, 100, 10)
+
+    # Increment write index
+    control_block_req_write_inc(cb)
+
+    # Read back
+    let result: i32 = assert_eq_i64(slot.id as i64, 42)
+    if result != 0
+        shm_destroy(@region)
+        return result
+
+    let result2: i32 = assert_eq_i32(slot.method as i32, HTTP_METHOD_GET as i32)
+    if result2 != 0
+        shm_destroy(@region)
+        return result2
+
+    shm_destroy(@region)
+    return 0
+
+# ============================================================================
+# Shared Memory Attach Tests (simulates worker attaching)
+# ============================================================================
+
+[[test]]
+fn test_shm_attach_detach() -> i32
+    var cfg: ShmConfig
+    shm_config_default(@cfg)
+
+    # Create region (Valet side)
+    var region: ShmRegion
+    shm_create(@region, @cfg)
+
+    # Attach to same region (simulates Worker, but in same process for testing)
+    var worker_region: ShmRegion
+    let result: i32 = shm_attach(@worker_region, region.fd, region.size)
+    if result != 0
+        "FAIL: shm_attach failed with code {result}\n"
+        shm_destroy(@region)
+        return 1
+
+    # Both should see the same control block data
+    let cb1: *ControlBlock = shm_get_control_block(@region)
+    let cb2: *ControlBlock = shm_get_control_block(@worker_region)
+
+    # Write from "valet"
+    cb1.worker_pid = 12345
+
+    # Read from "worker"
+    let result2: i32 = assert_eq_i32(cb2.worker_pid, 12345)
+    if result2 != 0
+        shm_detach(@worker_region)
+        shm_destroy(@region)
+        return result2
+
+    shm_detach(@worker_region)
+    shm_destroy(@region)
+    return 0

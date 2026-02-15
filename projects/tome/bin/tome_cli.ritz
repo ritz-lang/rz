@@ -1,0 +1,344 @@
+# bin/tome_cli.ritz - Tome CLI client binary
+#
+# Usage:
+#   ./tome-cli                     # Connect to localhost:6379
+#   ./tome-cli -h localhost -p 7000  # Connect to specific host/port
+#   echo "PING" | ./tome-cli       # Pipe mode
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+import ritzlib.memory
+import ritzlib.async_net
+import lib.resp
+import lib.client
+
+
+const DEFAULT_PORT: i32 = 6379
+const MAX_INPUT: i32 = 4096
+
+
+fn print_help()
+    prints("Tome CLI - Command-line client for Tome server\n")
+    prints("\n")
+    prints("Usage: tome-cli [OPTIONS]\n")
+    prints("\n")
+    prints("Options:\n")
+    prints("  -h, --host HOST    Server host (default: 127.0.0.1)\n")
+    prints("  -p, --port PORT    Server port (default: 6379)\n")
+    prints("  -c CMD             Execute command and exit\n")
+    prints("  --help             Show this help message\n")
+    prints("\n")
+    prints("Commands are entered interactively or via stdin pipe.\n")
+    prints("Type 'quit' to exit.\n")
+    prints("\n")
+
+
+fn parse_port(s: *u8) -> i32
+    var val: i32 = 0
+    var i: i32 = 0
+    loop
+        let ptr: *u8 = s + i
+        let c: u8 = *ptr
+        if c == 0
+            break
+        if c < 48 || c > 57
+            return -1  # Invalid digit
+        val = val * 10 + (c - 48) as i32
+        i += 1
+    return val
+
+
+# Parse host string to IP address (only supports dotted-decimal for now)
+# Returns IP in network byte order, or 0 on error
+fn parse_host(s: *u8) -> i32
+    # Check for "localhost"
+    if strcmp(s, c"localhost") == 0
+        return 0x0100007F  # 127.0.0.1 in network byte order
+
+    # Parse dotted decimal (a.b.c.d)
+    var octets: [4]i32
+    var octet_idx: i32 = 0
+    var current: i32 = 0
+    var i: i32 = 0
+
+    loop
+        let ptr: *u8 = s + i
+        let c: u8 = *ptr
+
+        if c == 0 || c == 46  # NUL or '.'
+            if octet_idx >= 4
+                return 0
+            octets[octet_idx] = current
+            octet_idx += 1
+            current = 0
+            if c == 0
+                break
+        else if c >= 48 && c <= 57
+            current = current * 10 + (c - 48) as i32
+            if current > 255
+                return 0
+        else
+            return 0
+
+        i += 1
+
+    if octet_idx != 4
+        return 0
+
+    # Convert to network byte order (little-endian to big-endian for IP)
+    return octets[0] | (octets[1] << 8) | (octets[2] << 16) | (octets[3] << 24)
+
+
+# Read a line of input from stdin
+# Returns length of line (excluding newline), or -1 on EOF
+fn read_line(buf: *u8, max_len: i32) -> i32
+    var i: i32 = 0
+    while i < max_len - 1
+        var ch: u8 = 0
+        let ret: i64 = sys_read(0, @ch, 1)
+        if ret <= 0
+            if i == 0
+                return -1  # EOF with no input
+            break
+        if ch == 10  # newline
+            break
+        let ptr: *u8 = buf + i
+        *ptr = ch
+        i += 1
+
+    # Null terminate
+    let end: *u8 = buf + i
+    *end = 0
+    return i
+
+
+# Check if input is a quit command
+fn is_quit_cmd(s: *u8) -> i32
+    if strcmp(s, c"quit") == 0
+        return 1
+    if strcmp(s, c"QUIT") == 0
+        return 1
+    if strcmp(s, c"exit") == 0
+        return 1
+    if strcmp(s, c"EXIT") == 0
+        return 1
+    return 0
+
+
+# Skip leading whitespace, return pointer to first non-space char
+fn skip_whitespace(s: *u8) -> *u8
+    var p: *u8 = s
+    loop
+        let c: u8 = *p
+        if c != 32 && c != 9  # space, tab
+            break
+        p = p + 1
+    return p
+
+
+# Parse inline command into tokens
+# Returns number of tokens parsed
+fn tokenize(input: *u8, tokens: **u8, max_tokens: i32) -> i32
+    var count: i32 = 0
+    var p: *u8 = skip_whitespace(input)
+
+    while *p != 0 && count < max_tokens
+        let c: u8 = *p
+
+        if c == 34  # Double quote
+            # Quoted string
+            p = p + 1  # Skip opening quote
+            *(tokens + count) = p
+            count += 1
+
+            # Find closing quote
+            while *p != 0 && *p != 34
+                p = p + 1
+            if *p == 34
+                *p = 0  # Null-terminate the token
+                p = p + 1
+        else
+            # Unquoted token
+            *(tokens + count) = p
+            count += 1
+
+            # Find end of token
+            while *p != 0 && *p != 32 && *p != 9
+                p = p + 1
+            if *p != 0
+                *p = 0  # Null-terminate
+                p = p + 1
+
+        p = skip_whitespace(p)
+
+    return count
+
+
+# Send command and print response
+fn execute_command(client: *TomeClient, tokens: **u8, token_count: i32) -> i32
+    if token_count == 0
+        return 0
+
+    var sent: i64 = 0
+
+    if token_count == 1
+        sent = client_send_cmd0(client, *(tokens + 0))
+    else if token_count == 2
+        sent = client_send_cmd1(client, *(tokens + 0), *(tokens + 1))
+    else if token_count == 3
+        sent = client_send_cmd2(client, *(tokens + 0), *(tokens + 1), *(tokens + 2))
+    else if token_count == 4
+        sent = client_send_cmd3(client, *(tokens + 0), *(tokens + 1), *(tokens + 2), *(tokens + 3))
+    else
+        prints("(error) Too many arguments (max 4 supported)\n")
+        return 0
+
+    if sent < 0
+        prints("(error) Failed to send command\n")
+        return -1
+
+    # Receive response
+    let recv_ret: i32 = client_recv(client)
+    if recv_ret <= 0
+        prints("(error) Connection closed by server\n")
+        return -1
+
+    # Print formatted response
+    client_print_response(client)
+    return 0
+
+
+fn print_prompt(host: *u8, port: i32)
+    prints_cstr(host)
+    prints(":")
+    print_int(port as i64)
+    prints("> ")
+
+
+fn is_tty() -> i32
+    # Check if stdin is a TTY using isatty syscall
+    # This is a simplification - just check if TERM env exists
+    # For now, assume interactive if we can read from stdin
+    return 1
+
+
+pub fn main(argc: i32, argv: **u8) -> i32
+    var host: *u8 = c"127.0.0.1"
+    var port: i32 = DEFAULT_PORT
+    var single_cmd: *u8 = null
+
+    # Parse command line arguments
+    var i: i32 = 1
+    while i < argc
+        let arg: *u8 = *(argv + i)
+
+        if strcmp(arg, c"--help") == 0
+            print_help()
+            return 0
+
+        if strcmp(arg, c"-h") == 0 || strcmp(arg, c"--host") == 0
+            if i + 1 >= argc
+                prints("Error: --host requires a value\n")
+                return 1
+            i += 1
+            host = *(argv + i)
+
+        else if strcmp(arg, c"-p") == 0 || strcmp(arg, c"--port") == 0
+            if i + 1 >= argc
+                prints("Error: --port requires a value\n")
+                return 1
+            i += 1
+            let port_str: *u8 = *(argv + i)
+            port = parse_port(port_str)
+            if port <= 0 || port > 65535
+                prints("Error: invalid port number\n")
+                return 1
+
+        else if strcmp(arg, c"-c") == 0
+            if i + 1 >= argc
+                prints("Error: -c requires a command\n")
+                return 1
+            i += 1
+            single_cmd = *(argv + i)
+
+        i += 1
+
+    # Parse host to IP
+    let host_ip: i32 = parse_host(host)
+    if host_ip == 0
+        prints("Error: invalid host address\n")
+        return 1
+
+    # Connect to server
+    prints("Connecting to ")
+    prints_cstr(host)
+    prints(":")
+    print_int(port as i64)
+    prints("...\n")
+
+    var client: TomeClient = client_new()
+    let conn_ret: i32 = client_connect(@client, host_ip, port)
+    if conn_ret < 0
+        prints("Error: could not connect to server (code: ")
+        print_int(conn_ret as i64)
+        prints(")\n")
+        return 1
+
+    # Input buffer and token array
+    var input_buf: [4096]u8
+    var tokens: [16]*u8
+
+    # Single command mode (-c)
+    if single_cmd != null
+        # Copy command to input buffer for tokenization
+        var j: i32 = 0
+        while j < 4095
+            let src: *u8 = single_cmd + j
+            if *src == 0
+                break
+            let dst: *u8 = @input_buf[0] + j
+            *dst = *src
+            j += 1
+        let term: *u8 = @input_buf[0] + j
+        *term = 0
+
+        let token_count: i32 = tokenize(@input_buf[0], @tokens[0], 16)
+        if token_count > 0
+            execute_command(@client, @tokens[0], token_count)
+        client_disconnect(@client)
+        return 0
+
+    # Interactive mode
+    prints("Connected. Type 'quit' to exit.\n")
+    prints("\n")
+
+    # REPL loop
+    loop
+        print_prompt(host, port)
+
+        let line_len: i32 = read_line(@input_buf[0], MAX_INPUT)
+        if line_len < 0
+            # EOF
+            prints("\n")
+            break
+
+        if line_len == 0
+            continue
+
+        # Check for quit
+        if is_quit_cmd(@input_buf[0])
+            break
+
+        # Parse and execute command
+        let token_count: i32 = tokenize(@input_buf[0], @tokens[0], 16)
+        if token_count > 0
+            let exec_ret: i32 = execute_command(@client, @tokens[0], token_count)
+            if exec_ret < 0
+                # Connection lost
+                break
+
+    # Disconnect
+    client_disconnect(@client)
+    prints("Goodbye.\n")
+    return 0

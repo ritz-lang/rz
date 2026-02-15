@@ -1,0 +1,511 @@
+# test/test_streaming.ritz - Tests for streaming request/response bodies
+#
+# Streaming allows large payloads to be sent in chunks without
+# blocking the entire ring buffer or requiring huge arena allocations.
+#
+# Design:
+#   - StreamSlot in ring buffer references a ChunkRing in arena
+#   - ChunkRing is a circular buffer of chunk descriptors
+#   - Each chunk points to data elsewhere in arena
+#   - Producer writes chunks, consumer reads and acknowledges
+#   - Backpressure via full chunk ring
+
+import ritzlib.sys
+import ritzlib.io
+import helpers
+import lib.streaming
+import lib.arena
+import lib.shm
+import lib.control
+
+# ============================================================================
+# Test: ChunkRing Initialization
+# ============================================================================
+
+[[test]]
+fn test_chunk_ring_init() -> i32
+    # Create arena for chunk ring
+    var arena: DataArena
+    data_arena_init(@arena, 4096)
+
+    # Allocate and initialize chunk ring
+    let ring: *ChunkRing = chunk_ring_create(@arena, 8)  # 8 slots
+    if ring == null
+        "FAIL: chunk_ring_create returned null\n"
+        data_arena_destroy(@arena)
+        return 1
+
+    let r1: i32 = assert_eq_i32(ring.capacity, 8)
+    if r1 != 0
+        data_arena_destroy(@arena)
+        return r1
+
+    let r2: i32 = assert_eq_i64(ring.write_idx, 0)
+    if r2 != 0
+        data_arena_destroy(@arena)
+        return r2
+
+    let r3: i32 = assert_eq_i64(ring.read_idx, 0)
+    if r3 != 0
+        data_arena_destroy(@arena)
+        return r3
+
+    let r4: i32 = assert_eq_i32(ring.state, STREAM_STATE_OPEN)
+    if r4 != 0
+        data_arena_destroy(@arena)
+        return r4
+
+    data_arena_destroy(@arena)
+    return 0
+
+[[test]]
+fn test_chunk_ring_empty_full() -> i32
+    var arena: DataArena
+    data_arena_init(@arena, 4096)
+
+    let ring: *ChunkRing = chunk_ring_create(@arena, 4)
+
+    # Initially empty
+    if chunk_ring_empty(ring) == 0
+        "FAIL: should be empty initially\n"
+        data_arena_destroy(@arena)
+        return 1
+
+    if chunk_ring_full(ring) != 0
+        "FAIL: should not be full initially\n"
+        data_arena_destroy(@arena)
+        return 1
+
+    # Add 4 chunks to fill it
+    var i: i32 = 0
+    while i < 4
+        let chunk: *ChunkDesc = chunk_ring_reserve(ring)
+        if chunk == null
+            "FAIL: reserve failed at {i}\n"
+            data_arena_destroy(@arena)
+            return 1
+        chunk.data_offset = (i * 100) as u32
+        chunk.data_len = 100
+        chunk_ring_commit(ring)
+        i = i + 1
+
+    # Now full
+    if chunk_ring_full(ring) == 0
+        "FAIL: should be full after 4 writes\n"
+        data_arena_destroy(@arena)
+        return 1
+
+    if chunk_ring_empty(ring) != 0
+        "FAIL: should not be empty when full\n"
+        data_arena_destroy(@arena)
+        return 1
+
+    data_arena_destroy(@arena)
+    return 0
+
+# ============================================================================
+# Test: Chunk Write/Read
+# ============================================================================
+
+[[test]]
+fn test_chunk_ring_write_read() -> i32
+    var arena: DataArena
+    data_arena_init(@arena, 4096)
+
+    let ring: *ChunkRing = chunk_ring_create(@arena, 8)
+
+    # Write a chunk
+    let chunk: *ChunkDesc = chunk_ring_reserve(ring)
+    if chunk == null
+        "FAIL: reserve failed\n"
+        data_arena_destroy(@arena)
+        return 1
+
+    chunk.data_offset = 1000
+    chunk.data_len = 256
+    chunk.flags = CHUNK_FLAG_NONE
+    chunk_ring_commit(ring)
+
+    # Read it back
+    let read_chunk: *ChunkDesc = chunk_ring_peek(ring)
+    if read_chunk == null
+        "FAIL: peek failed\n"
+        data_arena_destroy(@arena)
+        return 1
+
+    let r1: i32 = assert_eq_u32(read_chunk.data_offset, 1000)
+    if r1 != 0
+        data_arena_destroy(@arena)
+        return r1
+
+    let r2: i32 = assert_eq_u32(read_chunk.data_len, 256)
+    if r2 != 0
+        data_arena_destroy(@arena)
+        return r2
+
+    # Consume it
+    chunk_ring_consume(ring)
+
+    # Should be empty now
+    if chunk_ring_empty(ring) == 0
+        "FAIL: should be empty after consume\n"
+        data_arena_destroy(@arena)
+        return 1
+
+    data_arena_destroy(@arena)
+    return 0
+
+[[test]]
+fn test_chunk_ring_multiple_chunks() -> i32
+    var arena: DataArena
+    data_arena_init(@arena, 8192)
+
+    let ring: *ChunkRing = chunk_ring_create(@arena, 8)
+
+    # Write 5 chunks
+    var i: i32 = 0
+    while i < 5
+        let chunk: *ChunkDesc = chunk_ring_reserve(ring)
+        chunk.data_offset = (i * 100) as u32
+        chunk.data_len = (50 + i) as u32
+        chunk_ring_commit(ring)
+        i = i + 1
+
+    # Read and verify each
+    i = 0
+    while i < 5
+        let chunk: *ChunkDesc = chunk_ring_peek(ring)
+        if chunk == null
+            "FAIL: peek failed at {i}\n"
+            data_arena_destroy(@arena)
+            return 1
+
+        if chunk.data_offset != (i * 100) as u32
+            "FAIL: wrong offset at {i}\n"
+            data_arena_destroy(@arena)
+            return 1
+
+        if chunk.data_len != (50 + i) as u32
+            "FAIL: wrong len at {i}\n"
+            data_arena_destroy(@arena)
+            return 1
+
+        chunk_ring_consume(ring)
+        i = i + 1
+
+    data_arena_destroy(@arena)
+    return 0
+
+# ============================================================================
+# Test: Stream Completion
+# ============================================================================
+
+[[test]]
+fn test_chunk_ring_end_of_stream() -> i32
+    var arena: DataArena
+    data_arena_init(@arena, 4096)
+
+    let ring: *ChunkRing = chunk_ring_create(@arena, 8)
+
+    # Write some data
+    let chunk1: *ChunkDesc = chunk_ring_reserve(ring)
+    chunk1.data_offset = 0
+    chunk1.data_len = 100
+    chunk1.flags = CHUNK_FLAG_NONE
+    chunk_ring_commit(ring)
+
+    # Write final chunk with EOS flag
+    let chunk2: *ChunkDesc = chunk_ring_reserve(ring)
+    chunk2.data_offset = 100
+    chunk2.data_len = 50
+    chunk2.flags = CHUNK_FLAG_EOS
+    chunk_ring_commit(ring)
+
+    # Mark stream as closed
+    chunk_ring_close(ring)
+
+    let r1: i32 = assert_eq_i32(ring.state, STREAM_STATE_CLOSED)
+    if r1 != 0
+        data_arena_destroy(@arena)
+        return r1
+
+    # Read chunks and verify EOS
+    let c1: *ChunkDesc = chunk_ring_peek(ring)
+    if (c1.flags & CHUNK_FLAG_EOS) != 0
+        "FAIL: first chunk should not have EOS\n"
+        data_arena_destroy(@arena)
+        return 1
+    chunk_ring_consume(ring)
+
+    let c2: *ChunkDesc = chunk_ring_peek(ring)
+    if (c2.flags & CHUNK_FLAG_EOS) == 0
+        "FAIL: second chunk should have EOS\n"
+        data_arena_destroy(@arena)
+        return 1
+    chunk_ring_consume(ring)
+
+    data_arena_destroy(@arena)
+    return 0
+
+# ============================================================================
+# Test: Stream with Shared Memory
+# ============================================================================
+
+[[test]]
+fn test_streaming_with_shm() -> i32
+    # Create shared memory region
+    var cfg: ShmConfig
+    shm_config_init(@cfg, 64, 65536)  # 64KB arena for streaming
+
+    var region: ShmRegion
+    let result: i32 = shm_create(@region, @cfg)
+    if result < 0
+        "FAIL: shm_create failed\n"
+        return 1
+
+    # Get arena from shm
+    var arena: DataArena
+    shm_get_arena(@region, @arena)
+
+    # Create chunk ring in shared arena
+    let ring: *ChunkRing = chunk_ring_create(@arena, 16)
+    if ring == null
+        "FAIL: chunk_ring_create failed\n"
+        shm_destroy(@region)
+        return 1
+
+    # Simulate producer writing chunks
+    var total_written: i64 = 0
+    var i: i32 = 0
+    while i < 10
+        let chunk: *ChunkDesc = chunk_ring_reserve(ring)
+        if chunk == null
+            "FAIL: reserve failed at {i}\n"
+            shm_destroy(@region)
+            return 1
+
+        # Allocate data in arena
+        let data: *u8 = data_arena_alloc(@arena, 1024)
+        if data == null
+            "FAIL: arena alloc failed\n"
+            shm_destroy(@region)
+            return 1
+
+        # Fill with pattern
+        var j: i32 = 0
+        while j < 1024
+            *(data + j) = ((i + j) % 256) as u8
+            j = j + 1
+
+        chunk.data_offset = data_arena_ptr_to_offset(@arena, data) as u32
+        chunk.data_len = 1024
+        chunk.flags = CHUNK_FLAG_NONE
+
+        chunk_ring_commit(ring)
+        total_written = total_written + 1024
+        i = i + 1
+
+    # Mark end of stream
+    let final_chunk: *ChunkDesc = chunk_ring_reserve(ring)
+    final_chunk.data_offset = 0
+    final_chunk.data_len = 0
+    final_chunk.flags = CHUNK_FLAG_EOS
+    chunk_ring_commit(ring)
+    chunk_ring_close(ring)
+
+    # Simulate consumer reading chunks
+    var total_read: i64 = 0
+    var chunks_read: i32 = 0
+    while chunk_ring_empty(ring) == 0
+        let chunk: *ChunkDesc = chunk_ring_peek(ring)
+
+        if chunk.data_len > 0
+            # Verify data
+            let data: *u8 = data_arena_offset_to_ptr(@arena, chunk.data_offset as i64)
+            let expected: u8 = ((chunks_read) % 256) as u8
+            if *data != expected
+                "FAIL: data mismatch at chunk {chunks_read}\n"
+                shm_destroy(@region)
+                return 1
+
+            total_read = total_read + (chunk.data_len as i64)
+
+        if (chunk.flags & CHUNK_FLAG_EOS) != 0
+            chunk_ring_consume(ring)
+            break
+
+        chunk_ring_consume(ring)
+        chunks_read = chunks_read + 1
+
+    # Verify totals
+    if total_read != total_written
+        "FAIL: read {total_read} but wrote {total_written}\n"
+        shm_destroy(@region)
+        return 1
+
+    shm_destroy(@region)
+    return 0
+
+# ============================================================================
+# Test: Backpressure
+# ============================================================================
+
+[[test]]
+fn test_chunk_ring_backpressure() -> i32
+    var arena: DataArena
+    data_arena_init(@arena, 4096)
+
+    let ring: *ChunkRing = chunk_ring_create(@arena, 4)  # Small ring
+
+    # Fill the ring
+    var i: i32 = 0
+    while i < 4
+        let chunk: *ChunkDesc = chunk_ring_reserve(ring)
+        chunk.data_offset = 0
+        chunk.data_len = 10
+        chunk_ring_commit(ring)
+        i = i + 1
+
+    # Next reserve should fail (backpressure)
+    let overflow: *ChunkDesc = chunk_ring_reserve(ring)
+    if overflow != null
+        "FAIL: reserve should fail when full\n"
+        data_arena_destroy(@arena)
+        return 1
+
+    # Consume one
+    chunk_ring_consume(ring)
+
+    # Now reserve should work
+    let after_consume: *ChunkDesc = chunk_ring_reserve(ring)
+    if after_consume == null
+        "FAIL: reserve should succeed after consume\n"
+        data_arena_destroy(@arena)
+        return 1
+
+    data_arena_destroy(@arena)
+    return 0
+
+# ============================================================================
+# Test: Stream Descriptor
+# ============================================================================
+
+[[test]]
+fn test_stream_descriptor() -> i32
+    var arena: DataArena
+    data_arena_init(@arena, 8192)
+
+    # Create a stream (combines chunk ring with metadata)
+    var stream: StreamDesc
+    let result: i32 = stream_init(@stream, @arena, 8)
+    if result < 0
+        "FAIL: stream_init failed\n"
+        data_arena_destroy(@arena)
+        return 1
+
+    # Stream should be open and empty
+    if stream_is_open(@stream) == 0
+        "FAIL: stream should be open\n"
+        data_arena_destroy(@arena)
+        return 1
+
+    # Write some data
+    var data: [8]u8
+    data[0] = 0x48  # 'H'
+    data[1] = 0x65  # 'e'
+    data[2] = 0x6C  # 'l'
+    data[3] = 0x6C  # 'l'
+    data[4] = 0x6F  # 'o'
+    data[5] = 0x21  # '!'
+    data[6] = 0x0A  # '\n'
+    data[7] = 0x00
+    let written: i32 = stream_write(@stream, @arena, @data[0], 7)
+    if written != 7
+        "FAIL: stream_write returned {written}\n"
+        data_arena_destroy(@arena)
+        return 1
+
+    # Read it back
+    var buf: [16]u8
+    let read_len: i32 = stream_read(@stream, @arena, @buf[0], 16)
+    if read_len != 7
+        "FAIL: stream_read returned {read_len}\n"
+        data_arena_destroy(@arena)
+        return 1
+
+    # Verify content
+    if buf[0] != 0x48 || buf[1] != 0x65
+        "FAIL: content mismatch\n"
+        data_arena_destroy(@arena)
+        return 1
+
+    # Close stream
+    stream_close(@stream)
+
+    if stream_is_open(@stream) != 0
+        "FAIL: stream should be closed\n"
+        data_arena_destroy(@arena)
+        return 1
+
+    data_arena_destroy(@arena)
+    return 0
+
+# ============================================================================
+# Test: Large Streaming Transfer
+# ============================================================================
+
+[[test]]
+fn test_large_streaming_transfer() -> i32
+    var arena: DataArena
+    data_arena_init(@arena, 131072)  # 128KB arena
+
+    var stream: StreamDesc
+    stream_init(@stream, @arena, 16)
+
+    # Write 64KB in 4KB chunks
+    var total_written: i64 = 0
+    var chunk_num: i32 = 0
+    while total_written < 65536
+        # Create 4KB chunk with pattern
+        var chunk_data: [4096]u8
+        var i: i32 = 0
+        while i < 4096
+            chunk_data[i] = ((chunk_num + i) % 256) as u8
+            i = i + 1
+
+        let written: i32 = stream_write(@stream, @arena, @chunk_data[0], 4096)
+        if written != 4096
+            "FAIL: write returned {written} at chunk {chunk_num}\n"
+            data_arena_destroy(@arena)
+            return 1
+
+        total_written = total_written + 4096
+        chunk_num = chunk_num + 1
+
+    # Read back and verify
+    var total_read: i64 = 0
+    chunk_num = 0
+    while total_read < 65536
+        var read_buf: [4096]u8
+        let read_len: i32 = stream_read(@stream, @arena, @read_buf[0], 4096)
+        if read_len <= 0
+            "FAIL: read returned {read_len} at chunk {chunk_num}\n"
+            data_arena_destroy(@arena)
+            return 1
+
+        # Verify pattern
+        var i: i32 = 0
+        while i < read_len
+            let expected: u8 = ((chunk_num + i) % 256) as u8
+            if read_buf[i] != expected
+                "FAIL: data mismatch at chunk {chunk_num} offset {i}\n"
+                data_arena_destroy(@arena)
+                return 1
+            i = i + 1
+
+        total_read = total_read + (read_len as i64)
+        chunk_num = chunk_num + 1
+
+    stream_close(@stream)
+    data_arena_destroy(@arena)
+    return 0

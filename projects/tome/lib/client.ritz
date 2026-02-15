@@ -1,0 +1,328 @@
+# lib/client.ritz - Tome CLI client
+#
+# RESP client for connecting to a Tome server.
+# Handles connection, command encoding, and response parsing.
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+import ritzlib.memory
+import ritzlib.async_net
+import lib.resp
+
+
+# ============================================================================
+# Client Connection
+# ============================================================================
+
+struct TomeClient
+    fd: i32             # Socket file descriptor
+    connected: i32      # Connection status
+    read_buf: [8192]u8  # Buffer for receiving responses
+    read_len: i32       # Bytes in read buffer
+
+
+# Initialize client (not connected yet)
+pub fn client_new() -> TomeClient
+    var c: TomeClient
+    c.fd = -1
+    c.connected = 0
+    c.read_len = 0
+    return c
+
+
+# Connect to a Tome server
+# Returns 0 on success, negative error code on failure
+pub fn client_connect(c: *TomeClient, host: i32, port: i32) -> i32
+    # Create socket
+    let fd: i32 = tcp_socket()
+    if fd < 0
+        return fd
+
+    # Connect to server
+    let ret: i32 = tcp_connect(fd, host, port)
+    if ret < 0
+        sys_close(fd)
+        return ret
+
+    c.fd = fd
+    c.connected = 1
+    c.read_len = 0
+    return 0
+
+
+# Disconnect from server
+pub fn client_disconnect(c: *TomeClient)
+    if c.fd >= 0
+        sys_close(c.fd)
+        c.fd = -1
+    c.connected = 0
+
+
+# Check if connected
+pub fn client_is_connected(c: *TomeClient) -> i32
+    return c.connected
+
+
+# ============================================================================
+# Command Sending
+# ============================================================================
+
+# Send a raw RESP-encoded command
+# Returns bytes sent or negative error
+pub fn client_send_raw(c: *TomeClient, data: *u8, len: i64) -> i64
+    if c.connected == 0
+        return -1
+    # Using sys_write instead of sys_send for WSL compatibility
+    return sys_write(c.fd, data, len)
+
+
+# Send a simple command with no arguments (e.g., PING)
+pub fn client_send_cmd0(c: *TomeClient, cmd: *u8) -> i64
+    var buf: [256]u8
+    var pos: i32 = 0
+
+    # *1\r\n$<len>\r\n<cmd>\r\n
+    pos += resp_write_array(@buf[0], 1)
+    let cmd_len: i64 = strlen(cmd)
+    pos += resp_write_bulk(@buf[0] + pos, cmd, cmd_len)
+
+    return client_send_raw(c, @buf[0], pos as i64)
+
+
+# Send a command with 1 argument (e.g., GET key)
+pub fn client_send_cmd1(c: *TomeClient, cmd: *u8, arg1: *u8) -> i64
+    var buf: [512]u8
+    var pos: i32 = 0
+
+    pos += resp_write_array(@buf[0], 2)
+    let cmd_len: i64 = strlen(cmd)
+    pos += resp_write_bulk(@buf[0] + pos, cmd, cmd_len)
+    let arg1_len: i64 = strlen(arg1)
+    pos += resp_write_bulk(@buf[0] + pos, arg1, arg1_len)
+
+    return client_send_raw(c, @buf[0], pos as i64)
+
+
+# Send a command with 2 arguments (e.g., SET key value)
+pub fn client_send_cmd2(c: *TomeClient, cmd: *u8, arg1: *u8, arg2: *u8) -> i64
+    var buf: [8192]u8
+    var pos: i32 = 0
+
+    pos += resp_write_array(@buf[0], 3)
+    let cmd_len: i64 = strlen(cmd)
+    pos += resp_write_bulk(@buf[0] + pos, cmd, cmd_len)
+    let arg1_len: i64 = strlen(arg1)
+    pos += resp_write_bulk(@buf[0] + pos, arg1, arg1_len)
+    let arg2_len: i64 = strlen(arg2)
+    pos += resp_write_bulk(@buf[0] + pos, arg2, arg2_len)
+
+    return client_send_raw(c, @buf[0], pos as i64)
+
+
+# Send a command with 3 arguments
+pub fn client_send_cmd3(c: *TomeClient, cmd: *u8, arg1: *u8, arg2: *u8, arg3: *u8) -> i64
+    var buf: [8192]u8
+    var pos: i32 = 0
+
+    pos += resp_write_array(@buf[0], 4)
+    let cmd_len: i64 = strlen(cmd)
+    pos += resp_write_bulk(@buf[0] + pos, cmd, cmd_len)
+    let arg1_len: i64 = strlen(arg1)
+    pos += resp_write_bulk(@buf[0] + pos, arg1, arg1_len)
+    let arg2_len: i64 = strlen(arg2)
+    pos += resp_write_bulk(@buf[0] + pos, arg2, arg2_len)
+    let arg3_len: i64 = strlen(arg3)
+    pos += resp_write_bulk(@buf[0] + pos, arg3, arg3_len)
+
+    return client_send_raw(c, @buf[0], pos as i64)
+
+
+# ============================================================================
+# Response Receiving
+# ============================================================================
+
+# Receive response from server
+# Returns bytes received or negative error
+pub fn client_recv(c: *TomeClient) -> i32
+    if c.connected == 0
+        return -1
+
+    # Using sys_read instead of sys_recv for WSL compatibility
+    let ret: i64 = sys_read(c.fd, @c.read_buf[0], 8192)
+    if ret <= 0
+        c.connected = 0
+        return ret as i32
+
+    c.read_len = ret as i32
+    return c.read_len
+
+
+# Get pointer to read buffer
+pub fn client_get_response(c: *TomeClient) -> *u8
+    return @c.read_buf[0]
+
+
+# Get length of response
+pub fn client_get_response_len(c: *TomeClient) -> i32
+    return c.read_len
+
+
+# ============================================================================
+# Response Printing
+# ============================================================================
+
+# Print a RESP response in human-readable format
+pub fn client_print_response(c: *TomeClient)
+    if c.read_len <= 0
+        prints("(empty response)\n")
+        return
+
+    let buf: *u8 = @c.read_buf[0]
+    let first: u8 = *buf
+
+    if first == 43  # '+' Simple string
+        # Print without the + prefix and \r\n suffix
+        var i: i32 = 1
+        while i < c.read_len - 2
+            let ch: *u8 = buf + i
+            print_char(*ch)
+            i += 1
+        print_char(10)  # newline
+
+    else if first == 45  # '-' Error
+        prints("(error) ")
+        var i: i32 = 1
+        while i < c.read_len - 2
+            let ch: *u8 = buf + i
+            print_char(*ch)
+            i += 1
+        print_char(10)
+
+    else if first == 58  # ':' Integer
+        prints("(integer) ")
+        var i: i32 = 1
+        while i < c.read_len - 2
+            let ch: *u8 = buf + i
+            print_char(*ch)
+            i += 1
+        print_char(10)
+
+    else if first == 36  # '$' Bulk string
+        # Check for null: $-1\r\n
+        let second: *u8 = buf + 1
+        if *second == 45  # '-'
+            prints("(nil)\n")
+            return
+
+        # Find the \r\n after length
+        var len_end: i32 = 1
+        while len_end < c.read_len
+            let ch: *u8 = buf + len_end
+            if *ch == 13  # \r
+                break
+            len_end += 1
+
+        # Print the data (starts after \r\n)
+        prints("\"")
+        var i: i32 = len_end + 2  # Skip \r\n
+        while i < c.read_len - 2  # Stop before trailing \r\n
+            let ch: *u8 = buf + i
+            print_char(*ch)
+            i += 1
+        prints("\"\n")
+
+    else if first == 42  # '*' Array
+        # Check for null array: *-1\r\n
+        let second: *u8 = buf + 1
+        if *second == 45
+            prints("(empty array)\n")
+            return
+
+        # Parse array count
+        var count: i64 = 0
+        var i: i32 = 1
+        while i < c.read_len
+            let ch: *u8 = buf + i
+            if *ch == 13
+                break
+            count = count * 10 + (*ch - 48) as i64
+            i += 1
+
+        # Simple array printing - show count
+        prints("(array with ")
+        print_int(count)
+        prints(" elements)\n")
+
+        # Parse and print each element
+        i += 2  # Skip \r\n
+        var elem: i64 = 0
+        while elem < count && i < c.read_len
+            let type_char: *u8 = buf + i
+
+            if *type_char == 36  # Bulk string
+                i += 1
+                # Check null
+                let next: *u8 = buf + i
+                if *next == 45
+                    print_int(elem + 1)
+                    prints(") (nil)\n")
+                    i += 4  # Skip -1\r\n
+                    elem += 1
+                    continue
+
+                # Parse length
+                var blen: i64 = 0
+                while i < c.read_len
+                    let ch: *u8 = buf + i
+                    if *ch == 13
+                        break
+                    blen = blen * 10 + (*ch - 48) as i64
+                    i += 1
+                i += 2  # Skip \r\n
+
+                # Print element
+                print_int(elem + 1)
+                prints(") \"")
+                var j: i64 = 0
+                while j < blen && i < c.read_len
+                    let ch: *u8 = buf + i
+                    print_char(*ch)
+                    i += 1
+                    j += 1
+                prints("\"\n")
+                i += 2  # Skip trailing \r\n
+
+            else if *type_char == 58  # Integer
+                i += 1
+                print_int(elem + 1)
+                prints(") (integer) ")
+                while i < c.read_len
+                    let ch: *u8 = buf + i
+                    if *ch == 13
+                        break
+                    print_char(*ch)
+                    i += 1
+                print_char(10)
+                i += 2
+
+            else
+                # Unknown type, skip
+                break
+
+            elem += 1
+
+    else
+        # Unknown format, print raw
+        prints("(raw) ")
+        var i: i32 = 0
+        while i < c.read_len
+            let ch: *u8 = buf + i
+            if *ch == 13
+                prints("\\r")
+            else if *ch == 10
+                prints("\\n")
+            else
+                print_char(*ch)
+            i += 1
+        print_char(10)

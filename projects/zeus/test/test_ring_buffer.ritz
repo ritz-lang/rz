@@ -1,0 +1,257 @@
+# test/test_ring_buffer.ritz - Tests for SPSC ring buffer
+#
+# TDD: These tests define the expected behavior of the single-producer
+# single-consumer ring buffer used for request/response communication.
+#
+# Ring buffer properties:
+#   - Fixed size (power of 2 for fast modulo via bitmask)
+#   - Lock-free SPSC (one writer, one reader)
+#   - Slots contain offsets into data arena, not actual data
+#   - Zero-copy: data stays in arena, ring just passes references
+
+import ritzlib.sys
+import ritzlib.io
+import helpers
+
+# Import our library
+import lib.ring
+
+# ============================================================================
+# Request Slot Tests
+# ============================================================================
+
+[[test]]
+fn test_request_slot_size() -> i32
+    # RequestSlot should be compact but aligned
+    # id(8) + method(1) + pad(1) + path_len(2) + path_offset(4) +
+    # headers_offset(4) + headers_len(2) + pad(2) + body_offset(4) +
+    # body_len(4) + flags(1) + pad(3) = 36 bytes, aligned to 40 or 48
+    let size: i64 = request_slot_size()
+    if size < 32
+        "FAIL: request slot too small: {size}\n"
+        return 1
+    if size > 64
+        "FAIL: request slot too large: {size}\n"
+        return 1
+    return 0
+
+[[test]]
+fn test_request_slot_init() -> i32
+    var slot: RequestSlot
+    request_slot_init(@slot)
+
+    let result: i32 = assert_eq_u64(slot.id, 0)
+    if result != 0
+        return result
+
+    let result2: i32 = assert_eq_u8(slot.method, 0)
+    if result2 != 0
+        return result2
+
+    let result3: i32 = assert_eq_u8(slot.flags, 0)
+    if result3 != 0
+        return result3
+
+    return 0
+
+[[test]]
+fn test_request_slot_set_method() -> i32
+    var slot: RequestSlot
+    request_slot_init(@slot)
+
+    # Set to GET (method code 1)
+    request_slot_set_method(@slot, HTTP_METHOD_GET)
+    let result: i32 = assert_eq_u8(slot.method, HTTP_METHOD_GET)
+    if result != 0
+        return result
+
+    # Set to POST (method code 2)
+    request_slot_set_method(@slot, HTTP_METHOD_POST)
+    let result2: i32 = assert_eq_u8(slot.method, HTTP_METHOD_POST)
+    if result2 != 0
+        return result2
+
+    return 0
+
+[[test]]
+fn test_request_slot_set_path() -> i32
+    var slot: RequestSlot
+    request_slot_init(@slot)
+
+    # Set path to arena offset 1024, length 32
+    request_slot_set_path(@slot, 1024, 32)
+    let result: i32 = assert_eq_i32(slot.path_offset as i32, 1024)
+    if result != 0
+        return result
+
+    let result2: i32 = assert_eq_i32(slot.path_len as i32, 32)
+    if result2 != 0
+        return result2
+
+    return 0
+
+[[test]]
+fn test_request_slot_set_body() -> i32
+    var slot: RequestSlot
+    request_slot_init(@slot)
+
+    # Set body to arena offset 2048, length 4096
+    request_slot_set_body(@slot, 2048, 4096)
+    let result: i32 = assert_eq_i32(slot.body_offset as i32, 2048)
+    if result != 0
+        return result
+
+    let result2: i32 = assert_eq_i32(slot.body_len as i32, 4096)
+    if result2 != 0
+        return result2
+
+    return 0
+
+# ============================================================================
+# Response Slot Tests
+# ============================================================================
+
+[[test]]
+fn test_response_slot_size() -> i32
+    # Similar to request slot
+    let size: i64 = response_slot_size()
+    if size < 32
+        "FAIL: response slot too small: {size}\n"
+        return 1
+    if size > 64
+        "FAIL: response slot too large: {size}\n"
+        return 1
+    return 0
+
+[[test]]
+fn test_response_slot_init() -> i32
+    var slot: ResponseSlot
+    response_slot_init(@slot)
+
+    let result: i32 = assert_eq_u64(slot.id, 0)
+    if result != 0
+        return result
+
+    let result2: i32 = assert_eq_i32(slot.status as i32, 0)
+    if result2 != 0
+        return result2
+
+    return 0
+
+[[test]]
+fn test_response_slot_set_status() -> i32
+    var slot: ResponseSlot
+    response_slot_init(@slot)
+
+    response_slot_set_status(@slot, 200)
+    let result: i32 = assert_eq_i32(slot.status as i32, 200)
+    if result != 0
+        return result
+
+    response_slot_set_status(@slot, 404)
+    let result2: i32 = assert_eq_i32(slot.status as i32, 404)
+    if result2 != 0
+        return result2
+
+    return 0
+
+# ============================================================================
+# Ring Buffer Operations Tests
+# ============================================================================
+
+[[test]]
+fn test_ring_capacity() -> i32
+    # Ring capacity should be power of 2
+    let capacity: i64 = ring_default_capacity()
+    # Check it's a power of 2: (n & (n-1)) == 0
+    let is_power_of_2: i32 = ((capacity & (capacity - 1)) == 0) as i32
+    let result: i32 = assert_true(is_power_of_2)
+    if result != 0
+        return result
+
+    # Should be reasonable (at least 64, at most 4096)
+    if capacity < 64
+        "FAIL: ring capacity too small: {capacity}\n"
+        return 1
+    if capacity > 4096
+        "FAIL: ring capacity too large: {capacity}\n"
+        return 1
+
+    return 0
+
+[[test]]
+fn test_ring_mask() -> i32
+    # Mask should be capacity - 1 (for fast modulo)
+    let capacity: i64 = ring_default_capacity()
+    let mask: i64 = ring_default_mask()
+    let result: i32 = assert_eq_i64(mask, capacity - 1)
+    if result != 0
+        return result
+    return 0
+
+[[test]]
+fn test_ring_index_wrap() -> i32
+    # Index wrapping: index & mask
+    let mask: i64 = 255  # capacity 256
+    let idx: i64 = 300
+    let wrapped: i64 = idx & mask
+    let result: i32 = assert_eq_i64(wrapped, 44)  # 300 - 256 = 44
+    if result != 0
+        return result
+    return 0
+
+[[test]]
+fn test_ring_full_detection() -> i32
+    # Ring is full when (write - read) == capacity
+    # Using a small test capacity
+    let capacity: i64 = 4
+    var write_idx: i64 = 0
+    var read_idx: i64 = 0
+
+    # Fill the ring
+    while write_idx - read_idx < capacity
+        write_idx = write_idx + 1
+
+    # Should be full now
+    let is_full: i32 = ((write_idx - read_idx) == capacity) as i32
+    let result: i32 = assert_true(is_full)
+    if result != 0
+        return result
+
+    # Read one item
+    read_idx = read_idx + 1
+
+    # Should not be full
+    let is_full2: i32 = ((write_idx - read_idx) == capacity) as i32
+    let result2: i32 = assert_false(is_full2)
+    if result2 != 0
+        return result2
+
+    return 0
+
+[[test]]
+fn test_slot_access_by_index() -> i32
+    # Allocate a small ring buffer on stack for testing
+    var slots: [4]RequestSlot
+
+    # Initialize all slots
+    var i: i64 = 0
+    while i < 4
+        request_slot_init(@slots[i])
+        i = i + 1
+
+    # Set different IDs
+    slots[0].id = 100
+    slots[1].id = 101
+    slots[2].id = 102
+    slots[3].id = 103
+
+    # Access by wrapped index
+    let mask: i64 = 3  # capacity 4
+    let idx: i64 = 5  # should wrap to 1
+    let wrapped: i64 = idx & mask
+    let result: i32 = assert_eq_u64(slots[wrapped].id, 101)
+    if result != 0
+        return result
+
+    return 0

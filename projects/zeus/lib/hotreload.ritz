@@ -1,0 +1,251 @@
+# lib/hotreload.ritz - Hot reload coordination
+#
+# Enables updating worker code without dropping connections.
+#
+# Reload Process:
+#   1. PREPARING: Validate new binary, prepare resources
+#   2. DRAINING: Stop sending new requests to old worker
+#   3. SPAWNING: Start new worker with new code
+#   4. SWITCHING: Wait for old worker to finish in-flight requests
+#   5. CLEANUP: Terminate old worker, free resources
+#
+# Key concepts:
+#   - Generation: Monotonic version number for workers
+#   - ReloadRequest: Single worker reload operation
+#   - ReloadCoordinator: Manages pending reloads and state
+
+import ritzlib.sys
+import lib.valet
+import lib.control
+import lib.shm
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+# Coordinator states
+pub const RELOAD_STATE_IDLE: i32 = 0       # No reload in progress
+pub const RELOAD_STATE_PREPARING: i32 = 1  # Validating new binary
+pub const RELOAD_STATE_DRAINING: i32 = 2   # Draining old workers
+pub const RELOAD_STATE_SPAWNING: i32 = 3   # Spawning new workers
+pub const RELOAD_STATE_SWITCHING: i32 = 4  # Switching traffic
+
+# Reload request states
+pub const RELOAD_REQ_PENDING: i32 = 0      # Waiting to start
+pub const RELOAD_REQ_DRAINING: i32 = 1     # Old worker draining
+pub const RELOAD_REQ_SPAWNING: i32 = 2     # New worker starting
+pub const RELOAD_REQ_COMPLETE: i32 = 3     # Reload finished
+pub const RELOAD_REQ_FAILED: i32 = 4       # Reload failed
+
+# Maximum pending reloads
+pub const MAX_PENDING_RELOADS: i32 = 32
+
+# ============================================================================
+# Reload Request
+# ============================================================================
+# Represents a single worker reload operation.
+
+pub struct ReloadRequest
+    old_slot: i32        # 0: Slot of worker being replaced
+    new_slot: i32        # 4: Slot for new worker (-1 if not assigned)
+    state: i32           # 8: RELOAD_REQ_* state
+    generation: u64      # 12: Target generation for new worker
+    binary_path: *u8     # 20: Path to new worker binary
+    timestamp: i64       # 28: When reload was requested
+    error_code: i32      # 36: Error code if failed
+    _pad: i32            # 40: Reserved
+
+# Initialize a reload request
+pub fn reload_request_init(req: *ReloadRequest, slot: i32, binary_path: *u8, generation: u64)
+    req.old_slot = slot
+    req.new_slot = -1
+    req.state = RELOAD_REQ_PENDING
+    req.generation = generation
+    req.binary_path = binary_path
+    req.timestamp = get_time_ns_reload()
+    req.error_code = 0
+
+# Set reload request state
+pub fn reload_request_set_state(req: *ReloadRequest, state: i32)
+    req.state = state
+
+# Check if reload request is complete
+pub fn reload_request_is_done(req: *ReloadRequest) -> i32
+    if req.state == RELOAD_REQ_COMPLETE || req.state == RELOAD_REQ_FAILED
+        return 1
+    return 0
+
+# ============================================================================
+# Reload Coordinator
+# ============================================================================
+# Manages hot reload operations.
+
+pub struct ReloadCoordinator
+    state: i32                              # 0: RELOAD_STATE_*
+    generation: u64                         # 4: Current generation
+    pending_reloads: i32                    # 12: Number of pending requests
+    queue_head: i32                         # 16: Queue head index
+    queue_tail: i32                         # 20: Queue tail index
+    slot_generations: [16]u64               # 24: Generation per slot
+    queue: [32]ReloadRequest                # Ring buffer of requests
+
+# Time helper
+fn get_time_ns_reload() -> i64
+    var tv: [2]i64  # Timeval: tv_sec, tv_usec
+    syscall2(96, @tv[0] as i64, 0)  # SYS_GETTIMEOFDAY
+    return (tv[0] * 1000000000) + (tv[1] * 1000)
+
+# Initialize reload coordinator
+pub fn reload_coordinator_init(coord: *ReloadCoordinator) -> i32
+    coord.state = RELOAD_STATE_IDLE
+    coord.generation = 1
+    coord.pending_reloads = 0
+    coord.queue_head = 0
+    coord.queue_tail = 0
+
+    # Initialize slot generations to 0
+    var i: i32 = 0
+    while i < 16
+        coord.slot_generations[i] = 0
+        i = i + 1
+
+    return 0
+
+# Destroy reload coordinator
+pub fn reload_coordinator_destroy(coord: *ReloadCoordinator)
+    coord.state = RELOAD_STATE_IDLE
+    coord.pending_reloads = 0
+
+# Set coordinator state
+pub fn reload_coordinator_set_state(coord: *ReloadCoordinator, state: i32) -> i32
+    coord.state = state
+    return 0
+
+# Increment generation
+pub fn reload_coordinator_increment_generation(coord: *ReloadCoordinator)
+    coord.generation = coord.generation + 1
+
+# Set slot generation
+pub fn reload_coordinator_set_slot_generation(coord: *ReloadCoordinator, slot: i32, gen: u64)
+    if slot >= 0 && slot < 16
+        coord.slot_generations[slot] = gen
+
+# Get slot generation
+pub fn reload_coordinator_get_slot_generation(coord: *ReloadCoordinator, slot: i32) -> u64
+    if slot >= 0 && slot < 16
+        return coord.slot_generations[slot]
+    return 0
+
+# ============================================================================
+# Reload Queue Operations
+# ============================================================================
+
+# Enqueue a reload request
+pub fn reload_coordinator_enqueue(coord: *ReloadCoordinator, req: *ReloadRequest) -> i32
+    if coord.pending_reloads >= MAX_PENDING_RELOADS
+        return -1  # Queue full
+
+    # Copy request to queue
+    let idx: i32 = coord.queue_tail % MAX_PENDING_RELOADS
+    let slot: *ReloadRequest = @coord.queue[idx]
+
+    slot.old_slot = req.old_slot
+    slot.new_slot = req.new_slot
+    slot.state = req.state
+    slot.generation = req.generation
+    slot.binary_path = req.binary_path
+    slot.timestamp = req.timestamp
+    slot.error_code = req.error_code
+
+    coord.queue_tail = coord.queue_tail + 1
+    coord.pending_reloads = coord.pending_reloads + 1
+
+    return 0
+
+# Dequeue a reload request
+pub fn reload_coordinator_dequeue(coord: *ReloadCoordinator, req: *ReloadRequest) -> i32
+    if coord.pending_reloads == 0
+        return -1  # Queue empty
+
+    let idx: i32 = coord.queue_head % MAX_PENDING_RELOADS
+    let slot: *ReloadRequest = @coord.queue[idx]
+
+    # Copy to output
+    req.old_slot = slot.old_slot
+    req.new_slot = slot.new_slot
+    req.state = slot.state
+    req.generation = slot.generation
+    req.binary_path = slot.binary_path
+    req.timestamp = slot.timestamp
+    req.error_code = slot.error_code
+
+    coord.queue_head = coord.queue_head + 1
+    coord.pending_reloads = coord.pending_reloads - 1
+
+    return 0
+
+# Peek at next reload request without removing
+pub fn reload_coordinator_peek(coord: *ReloadCoordinator) -> *ReloadRequest
+    if coord.pending_reloads == 0
+        return null
+
+    let idx: i32 = coord.queue_head % MAX_PENDING_RELOADS
+    return @coord.queue[idx]
+
+# ============================================================================
+# Worker Drain Detection
+# ============================================================================
+
+# Check if a worker has drained all pending requests
+pub fn check_worker_drained(slot: *WorkerSlot) -> i32
+    if slot == null
+        return 1
+
+    if slot.state == WORKER_SLOT_EMPTY
+        return 1
+
+    # Get control block
+    let cb: *ControlBlock = shm_get_control_block(@slot.region)
+    if cb == null
+        return 1
+
+    # Check if request queue is empty
+    if control_block_req_empty(cb) != 0
+        # Also check if worker is idle (not processing)
+        if cb.state == WORKER_STATE_IDLE || cb.state == WORKER_STATE_RUNNING
+            return 1
+
+    return 0
+
+# ============================================================================
+# Reload Helpers
+# ============================================================================
+
+# Request reload of a specific worker slot
+pub fn request_worker_reload(coord: *ReloadCoordinator, slot: i32, binary_path: *u8) -> i32
+    if coord.pending_reloads >= MAX_PENDING_RELOADS
+        return -1
+
+    var req: ReloadRequest
+    reload_request_init(@req, slot, binary_path, coord.generation + 1)
+
+    return reload_coordinator_enqueue(coord, @req)
+
+# Check if any reloads are in progress
+pub fn reload_in_progress(coord: *ReloadCoordinator) -> i32
+    if coord.state != RELOAD_STATE_IDLE
+        return 1
+    if coord.pending_reloads > 0
+        return 1
+    return 0
+
+# Get number of pending reloads
+pub fn reload_pending_count(coord: *ReloadCoordinator) -> i32
+    return coord.pending_reloads
+
+# Cancel all pending reloads
+pub fn reload_cancel_all(coord: *ReloadCoordinator)
+    coord.pending_reloads = 0
+    coord.queue_head = 0
+    coord.queue_tail = 0
+    coord.state = RELOAD_STATE_IDLE

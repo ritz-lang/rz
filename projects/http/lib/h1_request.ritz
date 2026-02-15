@@ -1,0 +1,259 @@
+# lib/h1_request.ritz - HTTP/1.x request parser
+#
+# Zero-copy request parsing using Span<u8>.
+# All parsed data points into the original buffer - no allocations.
+#
+# API:
+# - H1Request: Parsed request structure
+# - h1_request_init: Initialize request structure
+# - h1_parse_request_line: Parse "METHOD /path HTTP/1.x\r\n"
+# - h1_parse_header: Parse a single header line
+# - h1_parse_request: Parse full request (line + headers + body)
+# - h1_request_get_header: Get header value by name (case-insensitive)
+# - h1_request_is_keep_alive: Check if connection should be kept alive
+
+import ritzlib.span
+import ritzlib.str
+import lib.types
+import lib.h1_utils
+import lib.limits
+
+# Error codes re-exported from h1_utils for backward compatibility
+
+# ============================================================================
+# H1Header - Single header name/value pair
+# ============================================================================
+
+struct H1Header
+    name: Span<u8>
+    value: Span<u8>
+
+# ============================================================================
+# H1Request - Parsed HTTP/1.x request
+# ============================================================================
+
+pub struct H1Request
+    # Request line
+    method: i32         # METHOD_GET, METHOD_POST, etc.
+    path: Span<u8>      # /path/to/resource?query=value
+    version: i32        # VERSION_HTTP10, VERSION_HTTP11
+
+    # Headers (stored inline, no allocation)
+    headers: [64]H1Header
+    header_count: i32
+
+    # Parsed header values (for quick access)
+    content_length: i64
+    connection_close: i32   # 1 if Connection: close
+
+    # Body (if Content-Length present)
+    body: Span<u8>
+
+# ============================================================================
+# Request Initialization
+# ============================================================================
+
+pub fn h1_request_init(req: *H1Request)
+    req.method = METHOD_UNKNOWN
+    req.path.ptr = null
+    req.path.len = 0
+    req.version = VERSION_UNKNOWN
+    req.header_count = 0
+    req.content_length = 0
+    req.connection_close = 0
+    req.body.ptr = null
+    req.body.len = 0
+
+# ============================================================================
+# Request Line Parsing
+# ============================================================================
+
+# Parse request line: "METHOD /path HTTP/1.x\r\n"
+# Returns bytes consumed on success, negative on error
+pub fn h1_parse_request_line(req: *H1Request, input: *Span<u8>) -> i32
+    if input.len == 0
+        return H1_ERR_INCOMPLETE
+
+    var pos: i64 = 0
+
+    # Find first space (end of method)
+    let method_end: i64 = find_byte(input, pos, ' ')
+    if method_end < 0
+        return H1_ERR_INVALID
+
+    # Parse method
+    var method_span: Span<u8> = span_slice<u8>(input, pos, method_end)
+    req.method = method_from_span(@method_span)
+    if req.method == METHOD_UNKNOWN
+        return H1_ERR_INVALID
+
+    pos = method_end + 1
+
+    # Find second space (end of path)
+    let path_end: i64 = find_byte(input, pos, ' ')
+    if path_end < 0
+        return H1_ERR_INVALID
+
+    req.path = span_slice<u8>(input, pos, path_end)
+    pos = path_end + 1
+
+    # Find CRLF (end of version)
+    let crlf_pos: i64 = find_crlf(input, pos)
+    if crlf_pos < 0
+        return H1_ERR_INCOMPLETE
+
+    # Parse version
+    var version_span: Span<u8> = span_slice<u8>(input, pos, crlf_pos)
+    req.version = version_from_span(@version_span)
+    if req.version == VERSION_UNKNOWN
+        return H1_ERR_INVALID
+
+    # Return bytes consumed (including CRLF)
+    return (crlf_pos + 2) as i32
+
+# ============================================================================
+# Header Parsing
+# ============================================================================
+
+# Parse a single header line: "Name: Value\r\n"
+# Returns bytes consumed on success
+# Returns 0 for empty line (end of headers)
+# Returns negative on error
+pub fn h1_parse_header(input: *Span<u8>, name: *Span<u8>, value: *Span<u8>) -> i32
+    if input.len == 0
+        return H1_ERR_INCOMPLETE
+
+    # Check for empty line (end of headers)
+    if input.len >= 2 && *(input.ptr) == '\r' && *(input.ptr + 1) == '\n'
+        name.ptr = null
+        name.len = 0
+        value.ptr = null
+        value.len = 0
+        return 0  # Signal end of headers
+
+    # Find colon
+    let colon_pos: i64 = find_byte(input, 0, ':')
+    if colon_pos < 0
+        return H1_ERR_INVALID
+
+    # Extract name (no leading/trailing spaces in header names)
+    *name = span_slice<u8>(input, 0, colon_pos)
+
+    # Find CRLF
+    let crlf_pos: i64 = find_crlf(input, colon_pos)
+    if crlf_pos < 0
+        return H1_ERR_INCOMPLETE
+
+    # Extract value (skip colon and whitespace)
+    var value_start: i64 = colon_pos + 1
+
+    # Skip leading whitespace
+    while value_start < crlf_pos && is_whitespace(*(input.ptr + value_start))
+        value_start += 1
+
+    # Find end (trim trailing whitespace)
+    var value_end: i64 = crlf_pos
+    while value_end > value_start && is_whitespace(*(input.ptr + value_end - 1))
+        value_end -= 1
+
+    *value = span_slice<u8>(input, value_start, value_end)
+
+    return (crlf_pos + 2) as i32
+
+# ============================================================================
+# Full Request Parsing
+# ============================================================================
+
+# Parse complete HTTP/1.x request
+# Returns total bytes consumed on success, negative on error
+pub fn h1_parse_request(req: *H1Request, input: *Span<u8>) -> i32
+    h1_request_init(req)
+
+    var pos: i64 = 0
+    var remaining: Span<u8> = *input
+
+    # Parse request line
+    let line_result: i32 = h1_parse_request_line(req, @remaining)
+    if line_result < 0
+        return line_result
+
+    pos = line_result as i64
+    remaining = span_from<u8>(input, pos)
+
+    # Parse headers
+    var headers_done: i32 = 0
+    while headers_done == 0
+        if req.header_count >= H1_MAX_HEADERS
+            return H1_ERR_TOO_MANY_HEADERS
+
+        var name: Span<u8>
+        var value: Span<u8>
+        let header_result: i32 = h1_parse_header(@remaining, @name, @value)
+
+        if header_result < 0
+            return header_result
+
+        if header_result == 0
+            # Empty line - end of headers
+            pos += 2  # Skip CRLF
+            headers_done = 1
+        else
+            # Store header
+            let idx: i32 = req.header_count
+            req.headers[idx].name = name
+            req.headers[idx].value = value
+            req.header_count += 1
+
+            # Check for special headers (use stored refs)
+            if span_eq_cstr_ci(@req.headers[idx].name, c"Content-Length")
+                req.content_length = parse_content_length(@req.headers[idx].value)
+            else if span_eq_cstr_ci(@req.headers[idx].name, c"Connection")
+                if span_eq_cstr_ci(@req.headers[idx].value, c"close")
+                    req.connection_close = 1
+
+            pos += header_result as i64
+            remaining = span_from<u8>(input, pos)
+
+    # Extract body if Content-Length present
+    if req.content_length > 0
+        let body_available: i64 = input.len - pos
+        if body_available < req.content_length
+            return H1_ERR_INCOMPLETE
+
+        req.body = span_slice<u8>(input, pos, pos + req.content_length)
+        pos += req.content_length
+
+    return pos as i32
+
+# ============================================================================
+# Header Access
+# ============================================================================
+
+# Get header value by name (case-insensitive)
+# Returns empty span if not found
+pub fn h1_request_get_header(req: *H1Request, name: *u8) -> Span<u8>
+    var i: i32 = 0
+    while i < req.header_count
+        if span_eq_cstr_ci(@req.headers[i].name, name) == 1
+            return req.headers[i].value
+        i += 1
+
+    var empty: Span<u8>
+    empty.ptr = null
+    empty.len = 0
+    return empty
+
+# Check if connection should be kept alive
+pub fn h1_request_is_keep_alive(req: *H1Request) -> i32
+    # Explicit Connection: close takes precedence
+    if req.connection_close == 1
+        return 0
+
+    # HTTP/1.1 defaults to keep-alive
+    if req.version == VERSION_HTTP11
+        return 1
+
+    # HTTP/1.0 defaults to close (unless Connection: keep-alive, but we don't check that yet)
+    return 0
+
+# Helper functions are imported from lib.h1_utils

@@ -1,0 +1,354 @@
+# spire/service/mod.ritz
+#
+# Service Layer - Business Logic Patterns
+#
+# Services contain the business logic of your application.
+# They orchestrate repositories, handle validation, and
+# implement domain rules.
+#
+# Example:
+#
+#   struct TaskService
+#       repo: TaskRepository
+#
+#   fn task_service_create(
+#       svc: *TaskService,
+#       input: *CreateTaskInput
+#   ) -> Result<Task, ServiceError>
+#       # Validate input
+#       if input.title.len == 0
+#           return Err(validation_error("title", "is required"))
+#
+#       # Create task via repository
+#       var task: Task
+#       task.id = uuid_new_v4()
+#       task.title = input.title
+#       task.completed = 0
+#       task.created_at = timestamp_now()
+#
+#       match svc.repo.create(@task)
+#           Ok(created) => Ok(created)
+#           Err(e) => Err(from_repo_error(e))
+
+import ritzlib.option
+import ritzlib.strview { StrView, strview_from_ptr }
+import ritzlib.string { String, string_new, string_push, string_from_strview, string_len }
+import ritzlib.gvec { Vec, vec_new, vec_push, vec_len, vec_get_ptr }
+
+import lib.utils { string_as_strview, strview_eq }
+
+# ============================================================================
+# Service Errors
+# ============================================================================
+
+pub enum ServiceError
+    # Validation failure with field-level errors
+    ValidationError(ValidationErrors)
+    # Resource not found
+    NotFoundError(String)
+    # Permission denied
+    ForbiddenError(String)
+    # Conflict (e.g., duplicate)
+    ConflictError(String)
+    # External service failure
+    ExternalError(String)
+    # Internal error
+    InternalError(String)
+
+# Validation error container (field -> messages)
+pub struct ValidationErrors
+    errors: Vec<FieldValidationError>
+
+pub struct FieldValidationError
+    field: String
+    messages: Vec<String>
+
+# Create empty validation errors
+pub fn validation_errors_new() -> ValidationErrors
+    var ve: ValidationErrors
+    ve.errors = vec_new<FieldValidationError>()
+    return ve
+
+# Add validation error for a field
+pub fn validation_add(errors:& ValidationErrors, field: StrView, message: StrView)
+    # Check if field already exists
+    var i: i64 = 0
+    while i < vec_len<FieldValidationError>(@errors.errors)
+        let fve: *FieldValidationError = vec_get_ptr<FieldValidationError>(@errors.errors, i)
+        let fve_field: StrView = string_as_strview(@fve.field)
+        if strview_eq(@fve_field, @field) == 1
+            # Add message to existing field
+            vec_push<String>(@fve.messages, string_from_strview(@message))
+            return
+        i += 1
+
+    # Create new field entry
+    var fve: FieldValidationError
+    fve.field = string_from_strview(@field)
+    fve.messages = vec_new<String>()
+    vec_push<String>(@fve.messages, string_from_strview(@message))
+    vec_push<FieldValidationError>(@errors.errors, fve)
+
+# Check if there are validation errors
+pub fn validation_has_errors(errors: ValidationErrors) -> i32
+    return (vec_len<FieldValidationError>(@errors.errors) > 0) as i32
+
+# ============================================================================
+# Error constructors
+# ============================================================================
+
+pub fn service_validation_error(errors: ValidationErrors) -> ServiceError
+    return ValidationError(errors)
+
+pub fn service_not_found(resource: StrView) -> ServiceError
+    return NotFoundError(string_from_strview(@resource))
+
+pub fn service_forbidden(reason: StrView) -> ServiceError
+    return ForbiddenError(string_from_strview(@reason))
+
+pub fn service_conflict(reason: StrView) -> ServiceError
+    return ConflictError(string_from_strview(@reason))
+
+pub fn service_external_error(reason: StrView) -> ServiceError
+    return ExternalError(string_from_strview(@reason))
+
+pub fn service_internal_error(reason: StrView) -> ServiceError
+    return InternalError(string_from_strview(@reason))
+
+# Quick validation error for single field
+pub fn validation_error(field: StrView, message: StrView) -> ServiceError
+    var errors: ValidationErrors = validation_errors_new()
+    validation_add(@errors, field, message)
+    return ValidationError(errors)
+
+# ============================================================================
+# Error inspection
+# ============================================================================
+
+pub fn service_error_is_validation(err: ServiceError) -> i32
+    match err
+        ValidationError(_) => 1
+        _ => 0
+
+pub fn service_error_is_not_found(err: ServiceError) -> i32
+    match err
+        NotFoundError(_) => 1
+        _ => 0
+
+pub fn service_error_is_forbidden(err: ServiceError) -> i32
+    match err
+        ForbiddenError(_) => 1
+        _ => 0
+
+pub fn service_error_is_conflict(err: ServiceError) -> i32
+    match err
+        ConflictError(_) => 1
+        _ => 0
+
+# Get HTTP status code for error
+pub fn service_error_status_code(err: ServiceError) -> u16
+    match err
+        ValidationError(_) => 422  # Unprocessable Entity
+        NotFoundError(_) => 404
+        ForbiddenError(_) => 403
+        ConflictError(_) => 409
+        ExternalError(_) => 502  # Bad Gateway
+        InternalError(_) => 500
+
+# ============================================================================
+# Service Result helpers
+# ============================================================================
+
+# Common result type alias (when generics work better)
+# type ServiceResult<T> = Result<T, ServiceError>
+
+# Map repo error to service error
+# pub fn from_repo_error(err: RepoError) -> ServiceError
+#     match err
+#         NotFound(msg) => NotFoundError(msg)
+#         DuplicateKey(msg) => ConflictError(msg)
+#         _ => InternalError(...)
+
+# ============================================================================
+# Pagination
+# ============================================================================
+
+pub struct PageRequest
+    # Current page (1-indexed)
+    page: i64
+    # Items per page
+    per_page: i64
+
+pub struct PageInfo
+    # Current page
+    page: i64
+    # Items per page
+    per_page: i64
+    # Total items
+    total_items: i64
+    # Total pages
+    total_pages: i64
+    # Has more pages
+    has_next: i32
+    # Has previous pages
+    has_prev: i32
+
+# Create page request with defaults
+pub fn page_request_default() -> PageRequest
+    var pr: PageRequest
+    pr.page = 1
+    pr.per_page = 20
+    return pr
+
+# Create page request
+pub fn page_request(page: i64, per_page: i64) -> PageRequest
+    var pr: PageRequest
+    pr.page = if page < 1 then 1 else page
+    pr.per_page = if per_page < 1 then 20 else if per_page > 100 then 100 else per_page
+    return pr
+
+# Calculate offset from page request
+pub fn page_offset(pr: PageRequest) -> i64
+    return (pr.page - 1) * pr.per_page
+
+# Create page info from results
+pub fn page_info(pr: PageRequest, total_items: i64) -> PageInfo
+    var pi: PageInfo
+    pi.page = pr.page
+    pi.per_page = pr.per_page
+    pi.total_items = total_items
+    pi.total_pages = (total_items + pr.per_page - 1) / pr.per_page
+    if pi.total_pages < 1
+        pi.total_pages = 1
+    pi.has_next = (pr.page < pi.total_pages) as i32
+    pi.has_prev = (pr.page > 1) as i32
+    return pi
+
+# ============================================================================
+# Sorting
+# ============================================================================
+
+pub enum SortDirection
+    Ascending
+    Descending
+
+pub struct SortRequest
+    field: String
+    direction: SortDirection
+
+# Create sort request
+pub fn sort_by(field: StrView, direction: SortDirection) -> SortRequest
+    var sr: SortRequest
+    sr.field = string_from_strview(@field)
+    sr.direction = direction
+    return sr
+
+# Create ascending sort
+pub fn sort_asc(field: StrView) -> SortRequest
+    return sort_by(field, Ascending)
+
+# Create descending sort
+pub fn sort_desc(field: StrView) -> SortRequest
+    return sort_by(field, Descending)
+
+# ============================================================================
+# Filtering
+# ============================================================================
+
+pub struct FilterCriteria
+    filters: Vec<Filter>
+
+pub struct Filter
+    field: String
+    op: FilterOp
+    value: String
+
+pub enum FilterOp
+    Equals
+    NotEquals
+    Contains
+    StartsWith
+    EndsWith
+    GreaterThan
+    LessThan
+    GreaterOrEqual
+    LessOrEqual
+    In
+    NotIn
+    IsNull
+    IsNotNull
+
+# Create empty filter criteria
+pub fn filter_new() -> FilterCriteria
+    var fc: FilterCriteria
+    fc.filters = vec_new<Filter>()
+    return fc
+
+# Add filter
+pub fn filter_add(fc:& FilterCriteria, field: StrView, op: FilterOp, value: StrView)
+    var f: Filter
+    f.field = string_from_strview(@field)
+    f.op = op
+    f.value = string_from_strview(@value)
+    vec_push<Filter>(@fc.filters, f)
+
+# Convenience filter methods
+pub fn filter_eq(fc:& FilterCriteria, field: StrView, value: StrView)
+    filter_add(fc, field, Equals, value)
+
+pub fn filter_ne(fc:& FilterCriteria, field: StrView, value: StrView)
+    filter_add(fc, field, NotEquals, value)
+
+pub fn filter_contains(fc:& FilterCriteria, field: StrView, value: StrView)
+    filter_add(fc, field, Contains, value)
+
+pub fn filter_gt(fc:& FilterCriteria, field: StrView, value: StrView)
+    filter_add(fc, field, GreaterThan, value)
+
+pub fn filter_lt(fc:& FilterCriteria, field: StrView, value: StrView)
+    filter_add(fc, field, LessThan, value)
+
+pub fn filter_null(fc:& FilterCriteria, field: StrView)
+    let empty: StrView = ""
+    filter_add(fc, field, IsNull, empty)
+
+pub fn filter_not_null(fc:& FilterCriteria, field: StrView)
+    let empty: StrView = ""
+    filter_add(fc, field, IsNotNull, empty)
+
+# ============================================================================
+# Transaction context (placeholder)
+# ============================================================================
+
+# Transaction status
+pub enum TxStatus
+    Active
+    Committed
+    RolledBack
+
+# Transaction context - passed through service calls
+pub struct TxContext
+    id: String
+    status: TxStatus
+
+# Create new transaction context
+pub fn tx_new() -> TxContext
+    var tx: TxContext
+    let id: StrView = "tx-000000"  # Would be generated
+    tx.id = string_from_strview(@id)
+    tx.status = Active
+    return tx
+
+# Check if transaction is active
+pub fn tx_is_active(tx: TxContext) -> i32
+    match tx.status
+        Active => 1
+        _ => 0
+
+# Mark transaction as committed
+pub fn tx_commit(tx:& TxContext)
+    tx.status = Committed
+
+# Mark transaction as rolled back
+pub fn tx_rollback(tx:& TxContext)
+    tx.status = RolledBack

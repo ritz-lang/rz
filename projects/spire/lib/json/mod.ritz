@@ -1,0 +1,417 @@
+# spire/json/mod.ritz
+#
+# JSON Serialization and Deserialization for Spire
+#
+# This module provides ergonomic JSON handling built on top of ritzlib's
+# JSON parser. It adds:
+# - JsonBuilder for fluent JSON construction
+# - Type-safe serialization helpers
+# - Integration with Spire's model types
+#
+# Example:
+#
+#   # Building JSON
+#   var builder: JsonBuilder = json_builder_new()
+#   json_object_start(@builder)
+#   json_field_str(@builder, "name", "Alice")
+#   json_field_i64(@builder, "age", 30)
+#   json_object_end(@builder)
+#   let json_str: StrView = json_builder_finish(@builder)
+#
+#   # Parsing JSON
+#   let result: Result<*JsonValue, JsonError> = json_parse(input)
+#   match result
+#       Ok(root) =>
+#           let name: Option<StrView> = json_get_str(root, "name")
+#           json_free(root)
+#       Err(err) =>
+#           # Handle error
+
+import ritzlib.strview { StrView, strview_from_ptr }
+import ritzlib.string { String, string_new, string_push, string_len }
+import ritzlib.gvec { Vec, vec_new, vec_push, vec_len, vec_with_cap }
+import ritzlib.json { JsonValue, JsonError, JsonParser }
+import ritzlib.json { json_parse2, json_free, json_alloc_value }
+import ritzlib.json { json_get_field, json_get_index, json_get_string, json_get_number }
+import ritzlib.json { json_get_bool, json_is_null, json_array_len, json_object_len }
+import ritzlib.json { json_emit_value, json_emit_string, json_to_string }
+import ritzlib.json { JSON_NULL, JSON_BOOL, JSON_NUMBER, JSON_STRING, JSON_ARRAY, JSON_OBJECT }
+
+import lib.model.uuid { Uuid, uuid_to_string }
+import lib.model.timestamp { Timestamp, timestamp_to_iso8601 }
+import lib.utils { string_as_strview }
+
+# Re-export core types from ritzlib
+pub import ritzlib.json { JsonValue, JsonError }
+pub import ritzlib.json { json_parse2, json_free }
+pub import ritzlib.json { json_get_field, json_get_index, json_get_string, json_get_number }
+pub import ritzlib.json { json_get_bool, json_is_null, json_array_len, json_object_len }
+
+# ============================================================================
+# JsonBuilder - Fluent JSON construction
+# ============================================================================
+
+pub struct JsonBuilder
+    buffer: Vec<u8>
+    depth: i64            # Current nesting depth
+    needs_comma: Vec<i32> # Stack of "needs comma before next item" flags
+
+# Create a new JSON builder
+pub fn json_builder_new() -> JsonBuilder
+    var b: JsonBuilder
+    b.buffer = vec_with_cap<u8>(256)
+    b.depth = 0
+    b.needs_comma = vec_new<i32>()
+    return b
+
+# Get result as string view (builder is consumed)
+pub fn json_builder_finish(self:& JsonBuilder) -> StrView
+    return strview_from_ptr(self.buffer.data, vec_len<u8>(@self.buffer))
+
+# Get result as owned string
+pub fn json_builder_to_string(self:& JsonBuilder) -> String
+    var s: String = string_new()
+    var i: i64 = 0
+    while i < vec_len<u8>(@self.buffer)
+        string_push(@s, *(self.buffer.data + i))
+        i += 1
+    return s
+
+# ============================================================================
+# Object building
+# ============================================================================
+
+pub fn json_object_start(self:& JsonBuilder)
+    maybe_comma(self)
+    vec_push<u8>(@self.buffer, 123)  # '{'
+    self.depth += 1
+    vec_push<i32>(@self.needs_comma, 0)
+
+pub fn json_object_end(self:& JsonBuilder)
+    vec_push<u8>(@self.buffer, 125)  # '}'
+    self.depth -= 1
+    if vec_len<i32>(@self.needs_comma) > 0
+        # Pop last element (simplified - just adjust len)
+        self.needs_comma.len -= 1
+    set_needs_comma(self)
+
+# ============================================================================
+# Array building
+# ============================================================================
+
+pub fn json_array_start(self:& JsonBuilder)
+    maybe_comma(self)
+    vec_push<u8>(@self.buffer, 91)  # '['
+    self.depth += 1
+    vec_push<i32>(@self.needs_comma, 0)
+
+pub fn json_array_end(self:& JsonBuilder)
+    vec_push<u8>(@self.buffer, 93)  # ']'
+    self.depth -= 1
+    if vec_len<i32>(@self.needs_comma) > 0
+        self.needs_comma.len -= 1
+    set_needs_comma(self)
+
+# ============================================================================
+# Field writing
+# ============================================================================
+
+# Write field name (used internally)
+fn write_field_name(self:& JsonBuilder, name: StrView)
+    maybe_comma(self)
+    vec_push<u8>(@self.buffer, 34)  # '"'
+    var i: i64 = 0
+    while i < name.len
+        let ch: u8 = *(name.ptr + i)
+        if ch == 34  # '"'
+            vec_push<u8>(@self.buffer, 92)  # '\'
+        else if ch == 92  # '\'
+            vec_push<u8>(@self.buffer, 92)
+        vec_push<u8>(@self.buffer, ch)
+        i += 1
+    vec_push<u8>(@self.buffer, 34)  # '"'
+    vec_push<u8>(@self.buffer, 58)  # ':'
+
+# String field
+pub fn json_field_str(self:& JsonBuilder, name: StrView, value: StrView)
+    write_field_name(self, name)
+    write_string_value(self, value)
+    set_needs_comma(self)
+
+# Integer field (i64)
+pub fn json_field_i64(self:& JsonBuilder, name: StrView, value: i64)
+    write_field_name(self, name)
+    write_i64_value(self, value)
+    set_needs_comma(self)
+
+# Boolean field
+pub fn json_field_bool(self:& JsonBuilder, name: StrView, value: i32)
+    write_field_name(self, name)
+    if value != 0
+        push_bytes(self, "true")
+    else
+        push_bytes(self, "false")
+    set_needs_comma(self)
+
+# Null field
+pub fn json_field_null(self:& JsonBuilder, name: StrView)
+    write_field_name(self, name)
+    push_bytes(self, "null")
+    set_needs_comma(self)
+
+# UUID field
+pub fn json_field_uuid(self:& JsonBuilder, name: StrView, value: Uuid)
+    write_field_name(self, name)
+    let uuid_str: String = uuid_to_string(@value)
+    let sv: StrView = string_as_strview(@uuid_str)
+    write_string_value(self, sv)
+    set_needs_comma(self)
+
+# Timestamp field (ISO 8601)
+pub fn json_field_timestamp(self:& JsonBuilder, name: StrView, value: Timestamp)
+    write_field_name(self, name)
+    let ts_str: String = timestamp_to_iso8601(@value)
+    let sv: StrView = string_as_strview(@ts_str)
+    write_string_value(self, sv)
+    set_needs_comma(self)
+
+# Nested object field (returns builder in object state)
+pub fn json_field_object(self:& JsonBuilder, name: StrView)
+    write_field_name(self, name)
+    json_object_start(self)
+
+# Array field
+pub fn json_field_array(self:& JsonBuilder, name: StrView)
+    write_field_name(self, name)
+    json_array_start(self)
+
+# ============================================================================
+# Array element writing
+# ============================================================================
+
+pub fn json_elem_str(self:& JsonBuilder, value: StrView)
+    maybe_comma(self)
+    write_string_value(self, value)
+    set_needs_comma(self)
+
+pub fn json_elem_i64(self:& JsonBuilder, value: i64)
+    maybe_comma(self)
+    write_i64_value(self, value)
+    set_needs_comma(self)
+
+pub fn json_elem_bool(self:& JsonBuilder, value: i32)
+    maybe_comma(self)
+    if value != 0
+        push_bytes(self, "true")
+    else
+        push_bytes(self, "false")
+    set_needs_comma(self)
+
+pub fn json_elem_null(self:& JsonBuilder)
+    maybe_comma(self)
+    push_bytes(self, "null")
+    set_needs_comma(self)
+
+pub fn json_elem_uuid(self:& JsonBuilder, value: Uuid)
+    maybe_comma(self)
+    let uuid_str: String = uuid_to_string(@value)
+    let sv: StrView = string_as_strview(@uuid_str)
+    write_string_value(self, sv)
+    set_needs_comma(self)
+
+pub fn json_elem_object(self:& JsonBuilder)
+    maybe_comma(self)
+    json_object_start(self)
+
+# ============================================================================
+# Raw value insertion
+# ============================================================================
+
+# Insert raw JSON (must be valid!)
+pub fn json_raw(self:& JsonBuilder, raw: StrView)
+    maybe_comma(self)
+    var i: i64 = 0
+    while i < raw.len
+        vec_push<u8>(@self.buffer, *(raw.ptr + i))
+        i += 1
+    set_needs_comma(self)
+
+# Insert raw JSON as field value
+pub fn json_field_raw(self:& JsonBuilder, name: StrView, raw: StrView)
+    write_field_name(self, name)
+    var i: i64 = 0
+    while i < raw.len
+        vec_push<u8>(@self.buffer, *(raw.ptr + i))
+        i += 1
+    set_needs_comma(self)
+
+# ============================================================================
+# Helper functions
+# ============================================================================
+
+fn maybe_comma(self:& JsonBuilder)
+    let len: i64 = vec_len<i32>(@self.needs_comma)
+    if len > 0
+        if *(self.needs_comma.data + len - 1) != 0
+            vec_push<u8>(@self.buffer, 44)  # ','
+
+fn set_needs_comma(self:& JsonBuilder)
+    let len: i64 = vec_len<i32>(@self.needs_comma)
+    if len > 0
+        *(self.needs_comma.data + len - 1) = 1
+
+fn write_string_value(self:& JsonBuilder, s: StrView)
+    vec_push<u8>(@self.buffer, 34)  # '"'
+    var i: i64 = 0
+    while i < s.len
+        let ch: u8 = *(s.ptr + i)
+        if ch == 34  # '"'
+            vec_push<u8>(@self.buffer, 92)  # '\'
+            vec_push<u8>(@self.buffer, 34)
+        else if ch == 92  # '\'
+            vec_push<u8>(@self.buffer, 92)
+            vec_push<u8>(@self.buffer, 92)
+        else if ch == 10  # '\n'
+            vec_push<u8>(@self.buffer, 92)
+            vec_push<u8>(@self.buffer, 110)  # 'n'
+        else if ch == 13  # '\r'
+            vec_push<u8>(@self.buffer, 92)
+            vec_push<u8>(@self.buffer, 114)  # 'r'
+        else if ch == 9  # '\t'
+            vec_push<u8>(@self.buffer, 92)
+            vec_push<u8>(@self.buffer, 116)  # 't'
+        else
+            vec_push<u8>(@self.buffer, ch)
+        i += 1
+    vec_push<u8>(@self.buffer, 34)  # '"'
+
+fn write_i64_value(self:& JsonBuilder, n: i64)
+    if n < 0
+        vec_push<u8>(@self.buffer, 45)  # '-'
+        write_u64_value(self, (0 - n) as u64)
+    else
+        write_u64_value(self, n as u64)
+
+fn write_u64_value(self:& JsonBuilder, n: u64)
+    if n == 0
+        vec_push<u8>(@self.buffer, 48)  # '0'
+        return
+
+    # Build digits in reverse
+    var digits: [20]u8
+    var count: i64 = 0
+    var val: u64 = n
+    while val > 0
+        digits[count] = (48 + (val % 10)) as u8
+        val = val / 10
+        count += 1
+
+    # Write in correct order
+    while count > 0
+        count -= 1
+        vec_push<u8>(@self.buffer, digits[count])
+
+fn push_bytes(self:& JsonBuilder, s: StrView)
+    var i: i64 = 0
+    while i < s.len
+        vec_push<u8>(@self.buffer, *(s.ptr + i))
+        i += 1
+
+# ============================================================================
+# Parsing helpers - Type-safe accessors
+# ============================================================================
+
+# Get string field from parsed JSON
+pub fn json_get_str(obj: *JsonValue, field: StrView) -> Option<StrView>
+    let val: *JsonValue = json_get_field(obj, field.ptr as *u8)
+    if val == null
+        return None
+    let s: *u8 = json_get_string(val)
+    if s == null
+        return None
+    # Calculate length
+    var len: i64 = 0
+    while *(s + len) != 0
+        len += 1
+    return Some(strview_from_ptr(s, len))
+
+# Get i64 field from parsed JSON
+pub fn json_get_i64(obj: *JsonValue, field: StrView) -> Option<i64>
+    let val: *JsonValue = json_get_field(obj, field.ptr as *u8)
+    if val == null
+        return None
+    if val.kind != JSON_NUMBER
+        return None
+    return Some(json_get_number(val))
+
+# Get bool field from parsed JSON
+pub fn json_get_boolean(obj: *JsonValue, field: StrView) -> Option<i32>
+    let val: *JsonValue = json_get_field(obj, field.ptr as *u8)
+    if val == null
+        return None
+    if val.kind != JSON_BOOL
+        return None
+    return Some(json_get_bool(val))
+
+# Check if field is null
+pub fn json_field_is_null(obj: *JsonValue, field: StrView) -> i32
+    let val: *JsonValue = json_get_field(obj, field.ptr as *u8)
+    if val == null
+        return 1
+    return json_is_null(val)
+
+# Get array field
+pub fn json_get_arr(obj: *JsonValue, field: StrView) -> *JsonValue
+    let val: *JsonValue = json_get_field(obj, field.ptr as *u8)
+    if val == null
+        return null
+    if val.kind != JSON_ARRAY
+        return null
+    return val
+
+# Get object field
+pub fn json_get_obj(obj: *JsonValue, field: StrView) -> *JsonValue
+    let val: *JsonValue = json_get_field(obj, field.ptr as *u8)
+    if val == null
+        return null
+    if val.kind != JSON_OBJECT
+        return null
+    return val
+
+# ============================================================================
+# Error formatting
+# ============================================================================
+
+pub fn json_error_to_string(err: JsonError) -> String
+    var s: String = string_new()
+    push_str(@s, "JSON parse error at position ")
+    push_i64(@s, err.pos)
+    return s
+
+fn push_str(s:& String, text: StrView)
+    var i: i64 = 0
+    while i < text.len
+        string_push(s, *(text.ptr + i))
+        i += 1
+
+fn push_i64(s:& String, n: i64)
+    if n < 0
+        string_push(s, 45)  # '-'
+        push_u64(s, (0 - n) as u64)
+    else
+        push_u64(s, n as u64)
+
+fn push_u64(s:& String, n: u64)
+    if n == 0
+        string_push(s, 48)
+        return
+    var digits: [20]u8
+    var count: i64 = 0
+    var val: u64 = n
+    while val > 0
+        digits[count] = (48 + (val % 10)) as u8
+        val = val / 10
+        count += 1
+    while count > 0
+        count -= 1
+        string_push(s, digits[count])

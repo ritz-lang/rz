@@ -1,0 +1,360 @@
+# spire/test/test_integration.ritz
+#
+# Integration tests for Spire framework
+#
+# These tests exercise the full request/response cycle including:
+# - Router setup
+# - Request handling
+# - Response generation
+# - Content negotiation
+
+import ritzlib.strview { StrView }
+import ritzlib.string { String, string_from_strview }
+import ritzlib.gvec { Vec, vec_new, vec_push }
+import ritzlib.option
+
+import spire.http.method { Method, GET, POST, PUT, DELETE }
+import spire.http.request { Request, request_new, request_with }
+import spire.http.request { request_set_header, request_set_param }
+import spire.http.response { Response, response_ok, response_created, response_not_found }
+import spire.http.response { response_json_str, response_html, response_text }
+import spire.http.response { response_status_code, response_body_len }
+import spire.http.headers { headers_get }
+import spire.router { Router, router_new, router_get, router_post, router_put, router_delete }
+import spire.router { router_handle }
+import spire.utils { strview_eq }
+import test.test_utils { request_get, request_post, request_post_json }
+import test.test_utils { request_accept_json, request_accept_html }
+import test.test_utils { assert_status_ok, assert_status_created, assert_status_not_found }
+import test.test_utils { assert_content_type_json, assert_content_type_html }
+import test.test_utils { assert_body_contains }
+
+# ============================================================================
+# Test Handlers
+# ============================================================================
+
+fn handler_home(req: *Request) -> Response
+    var resp: Response = response_ok()
+    let html: StrView = "<h1>Welcome to Spire</h1>"
+    response_html(&resp, &html)
+    resp
+
+fn handler_api_status(req: *Request) -> Response
+    var resp: Response = response_ok()
+    let json: StrView = "{\"status\": \"ok\"}"
+    response_json_str(&resp, &json)
+    resp
+
+fn handler_tasks_list(req: *Request) -> Response
+    var resp: Response = response_ok()
+    let json: StrView = "{\"tasks\": []}"
+    response_json_str(&resp, &json)
+    resp
+
+fn handler_tasks_create(req: *Request) -> Response
+    var resp: Response = response_created()
+    let json: StrView = "{\"id\": \"123\", \"title\": \"New Task\"}"
+    response_json_str(&resp, &json)
+    resp
+
+fn handler_task_show(req: *Request) -> Response
+    var resp: Response = response_ok()
+    # In a real app, we'd use the :id param
+    let json: StrView = "{\"id\": \"123\", \"title\": \"Task\"}"
+    response_json_str(&resp, &json)
+    resp
+
+fn handler_task_update(req: *Request) -> Response
+    var resp: Response = response_ok()
+    let json: StrView = "{\"id\": \"123\", \"title\": \"Updated Task\"}"
+    response_json_str(&resp, &json)
+    resp
+
+fn handler_task_delete(req: *Request) -> Response
+    var resp: Response = response_ok()
+    resp.status.code = 204  # No Content
+    resp
+
+fn handler_users_show(req: *Request) -> Response
+    var resp: Response = response_ok()
+    let json: StrView = "{\"id\": \"user123\", \"name\": \"Test User\"}"
+    response_json_str(&resp, &json)
+    resp
+
+fn handler_custom_404(req: *Request) -> Response
+    var resp: Response = response_not_found()
+    let json: StrView = "{\"error\": \"Resource not found\"}"
+    response_json_str(&resp, &json)
+    resp
+
+# ============================================================================
+# Helper: Create test router
+# ============================================================================
+
+fn create_test_router() -> Router
+    var r: Router = router_new()
+
+    # Home page
+    let home_path: StrView = "/"
+    router_get(&r, &home_path, handler_home)
+
+    # API status
+    let status_path: StrView = "/api/status"
+    router_get(&r, &status_path, handler_api_status)
+
+    # Tasks CRUD
+    let tasks_path: StrView = "/api/tasks"
+    router_get(&r, &tasks_path, handler_tasks_list)
+    router_post(&r, &tasks_path, handler_tasks_create)
+
+    let task_path: StrView = "/api/tasks/:id"
+    router_get(&r, &task_path, handler_task_show)
+    router_put(&r, &task_path, handler_task_update)
+    router_delete(&r, &task_path, handler_task_delete)
+
+    # Users
+    let user_path: StrView = "/api/users/:id"
+    router_get(&r, &user_path, handler_users_show)
+
+    r
+
+# ============================================================================
+# Basic routing tests
+# ============================================================================
+
+[[test]]
+fn test_integration_home_page() -> i32
+    var router: Router = create_test_router()
+    let path: StrView = "/"
+    var req: Request = request_get(&path)
+    let resp: Response = router_handle(&router, &req)
+
+    assert response_status_code(&resp) == 200
+    assert response_body_len(&resp) > 0
+    0
+
+[[test]]
+fn test_integration_api_status() -> i32
+    var router: Router = create_test_router()
+    let path: StrView = "/api/status"
+    var req: Request = request_get(&path)
+    let resp: Response = router_handle(&router, &req)
+
+    assert response_status_code(&resp) == 200
+    # Should return JSON
+    let ct_name: StrView = "Content-Type"
+    match headers_get(&resp.headers, &ct_name)
+        Some(ct) =>
+            let expected: StrView = "application/json"
+            assert strview_eq(&ct, &expected) == 1
+        None => return 1
+    0
+
+# ============================================================================
+# CRUD operation tests
+# ============================================================================
+
+[[test]]
+fn test_integration_list_tasks() -> i32
+    var router: Router = create_test_router()
+    let path: StrView = "/api/tasks"
+    var req: Request = request_get(&path)
+    let resp: Response = router_handle(&router, &req)
+
+    assert response_status_code(&resp) == 200
+    0
+
+[[test]]
+fn test_integration_create_task() -> i32
+    var router: Router = create_test_router()
+    let path: StrView = "/api/tasks"
+    let body: StrView = "{\"title\": \"New Task\"}"
+    var req: Request = request_post_json(&path, &body)
+    let resp: Response = router_handle(&router, &req)
+
+    assert response_status_code(&resp) == 201
+    0
+
+[[test]]
+fn test_integration_show_task() -> i32
+    var router: Router = create_test_router()
+    let path: StrView = "/api/tasks/123"
+    var req: Request = request_get(&path)
+    let resp: Response = router_handle(&router, &req)
+
+    assert response_status_code(&resp) == 200
+    0
+
+[[test]]
+fn test_integration_update_task() -> i32
+    var router: Router = create_test_router()
+    let path: StrView = "/api/tasks/123"
+    var req: Request = request_with(PUT, &path)
+    let ct_name: StrView = "Content-Type"
+    let ct_value: StrView = "application/json"
+    request_set_header(&req, &ct_name, &ct_value)
+    let resp: Response = router_handle(&router, &req)
+
+    assert response_status_code(&resp) == 200
+    0
+
+[[test]]
+fn test_integration_delete_task() -> i32
+    var router: Router = create_test_router()
+    let path: StrView = "/api/tasks/123"
+    var req: Request = request_with(DELETE, &path)
+    let resp: Response = router_handle(&router, &req)
+
+    assert response_status_code(&resp) == 204
+    0
+
+# ============================================================================
+# Path parameter extraction tests
+# ============================================================================
+
+[[test]]
+fn test_integration_task_param_extraction() -> i32
+    var router: Router = create_test_router()
+    let path: StrView = "/api/tasks/abc-123"
+    var req: Request = request_get(&path)
+    let resp: Response = router_handle(&router, &req)
+
+    # Handler should have received the :id param
+    assert response_status_code(&resp) == 200
+    0
+
+[[test]]
+fn test_integration_user_param_extraction() -> i32
+    var router: Router = create_test_router()
+    let path: StrView = "/api/users/user-456"
+    var req: Request = request_get(&path)
+    let resp: Response = router_handle(&router, &req)
+
+    assert response_status_code(&resp) == 200
+    0
+
+# ============================================================================
+# 404 handling tests
+# ============================================================================
+
+[[test]]
+fn test_integration_not_found() -> i32
+    var router: Router = create_test_router()
+    let path: StrView = "/api/nonexistent"
+    var req: Request = request_get(&path)
+    let resp: Response = router_handle(&router, &req)
+
+    assert response_status_code(&resp) == 404
+    0
+
+[[test]]
+fn test_integration_wrong_method() -> i32
+    var router: Router = create_test_router()
+    # Try POST on a GET-only route
+    let path: StrView = "/api/status"
+    var req: Request = request_with(POST, &path)
+    let resp: Response = router_handle(&router, &req)
+
+    assert response_status_code(&resp) == 404
+    0
+
+# ============================================================================
+# Content negotiation tests
+# ============================================================================
+
+[[test]]
+fn test_integration_home_returns_html() -> i32
+    var router: Router = create_test_router()
+    let path: StrView = "/"
+    var req: Request = request_get(&path)
+    request_accept_html(&req)
+    let resp: Response = router_handle(&router, &req)
+
+    let ct_name: StrView = "Content-Type"
+    match headers_get(&resp.headers, &ct_name)
+        Some(ct) =>
+            let expected: StrView = "text/html"
+            assert strview_eq(&ct, &expected) == 1
+            0
+        None => 1
+
+[[test]]
+fn test_integration_api_returns_json() -> i32
+    var router: Router = create_test_router()
+    let path: StrView = "/api/tasks"
+    var req: Request = request_get(&path)
+    request_accept_json(&req)
+    let resp: Response = router_handle(&router, &req)
+
+    let ct_name: StrView = "Content-Type"
+    match headers_get(&resp.headers, &ct_name)
+        Some(ct) =>
+            let expected: StrView = "application/json"
+            assert strview_eq(&ct, &expected) == 1
+            0
+        None => 1
+
+# ============================================================================
+# Multiple requests to same router
+# ============================================================================
+
+[[test]]
+fn test_integration_multiple_requests() -> i32
+    var router: Router = create_test_router()
+
+    # First request
+    let path1: StrView = "/api/tasks"
+    var req1: Request = request_get(&path1)
+    let resp1: Response = router_handle(&router, &req1)
+    assert response_status_code(&resp1) == 200
+
+    # Second request
+    let path2: StrView = "/api/users/123"
+    var req2: Request = request_get(&path2)
+    let resp2: Response = router_handle(&router, &req2)
+    assert response_status_code(&resp2) == 200
+
+    # Third request
+    let path3: StrView = "/"
+    var req3: Request = request_get(&path3)
+    let resp3: Response = router_handle(&router, &req3)
+    assert response_status_code(&resp3) == 200
+
+    0
+
+# ============================================================================
+# Edge cases
+# ============================================================================
+
+[[test]]
+fn test_integration_root_only() -> i32
+    var router: Router = router_new()
+    let path: StrView = "/"
+    router_get(&router, &path, handler_home)
+
+    let req_path: StrView = "/"
+    var req: Request = request_get(&req_path)
+    let resp: Response = router_handle(&router, &req)
+
+    assert response_status_code(&resp) == 200
+    0
+
+[[test]]
+fn test_integration_nested_paths() -> i32
+    var router: Router = router_new()
+
+    let path1: StrView = "/a"
+    let path2: StrView = "/a/b"
+    let path3: StrView = "/a/b/c"
+
+    router_get(&router, &path1, handler_api_status)
+    router_get(&router, &path2, handler_api_status)
+    router_get(&router, &path3, handler_api_status)
+
+    # Test each level
+    let req_path: StrView = "/a/b"
+    var req: Request = request_get(&req_path)
+    let resp: Response = router_handle(&router, &req)
+
+    assert response_status_code(&resp) == 200
+    0

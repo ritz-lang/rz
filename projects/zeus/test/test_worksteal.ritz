@@ -1,0 +1,447 @@
+# test/test_worksteal.ritz - Tests for work stealing between workers
+#
+# Work stealing allows idle workers to steal requests from busy workers'
+# queues, improving load balancing and reducing tail latency.
+#
+# Design:
+#   - Each worker has a deque (double-ended queue) for requests
+#   - Owner pushes/pops from "bottom" (LIFO for locality)
+#   - Thieves steal from "top" (FIFO for fairness)
+#   - Lock-free using compare-and-swap for top index
+
+import ritzlib.sys
+import ritzlib.io
+import helpers
+import lib.worksteal
+import lib.arena
+
+# ============================================================================
+# Test: Work Deque Initialization
+# ============================================================================
+
+[[test]]
+fn test_work_deque_init() -> i32
+    var deque: WorkDeque
+    let result: i32 = work_deque_init(@deque, 16)
+    if result < 0
+        "FAIL: work_deque_init failed\n"
+        return 1
+
+    let r1: i32 = assert_eq_i32(deque.capacity, 16)
+    if r1 != 0
+        work_deque_destroy(@deque)
+        return r1
+
+    let r2: i32 = assert_eq_i64(deque.top, 0)
+    if r2 != 0
+        work_deque_destroy(@deque)
+        return r2
+
+    let r3: i32 = assert_eq_i64(deque.bottom, 0)
+    if r3 != 0
+        work_deque_destroy(@deque)
+        return r3
+
+    work_deque_destroy(@deque)
+    return 0
+
+[[test]]
+fn test_work_deque_empty() -> i32
+    var deque: WorkDeque
+    work_deque_init(@deque, 8)
+
+    if work_deque_empty(@deque) == 0
+        "FAIL: should be empty initially\n"
+        work_deque_destroy(@deque)
+        return 1
+
+    work_deque_destroy(@deque)
+    return 0
+
+# ============================================================================
+# Test: Owner Operations (Push/Pop)
+# ============================================================================
+
+[[test]]
+fn test_work_deque_push_pop() -> i32
+    var deque: WorkDeque
+    work_deque_init(@deque, 8)
+
+    # Push some work items
+    var item1: WorkItem
+    item1.request_id = 100
+    item1.worker_slot = 0
+    item1.priority = 1
+
+    let push_result: i32 = work_deque_push(@deque, @item1)
+    if push_result != 0
+        "FAIL: push failed\n"
+        work_deque_destroy(@deque)
+        return 1
+
+    if work_deque_empty(@deque) != 0
+        "FAIL: should not be empty after push\n"
+        work_deque_destroy(@deque)
+        return 1
+
+    # Pop it back (LIFO)
+    var popped: WorkItem
+    let pop_result: i32 = work_deque_pop(@deque, @popped)
+    if pop_result != 0
+        "FAIL: pop failed\n"
+        work_deque_destroy(@deque)
+        return 1
+
+    let r1: i32 = assert_eq_u64(popped.request_id, 100)
+    if r1 != 0
+        work_deque_destroy(@deque)
+        return r1
+
+    if work_deque_empty(@deque) == 0
+        "FAIL: should be empty after pop\n"
+        work_deque_destroy(@deque)
+        return 1
+
+    work_deque_destroy(@deque)
+    return 0
+
+[[test]]
+fn test_work_deque_lifo_order() -> i32
+    var deque: WorkDeque
+    work_deque_init(@deque, 8)
+
+    # Push 3 items
+    var i: i32 = 0
+    while i < 3
+        var item: WorkItem
+        item.request_id = (100 + i) as u64
+        item.worker_slot = 0
+        item.priority = 1
+        work_deque_push(@deque, @item)
+        i = i + 1
+
+    # Pop should return in reverse order (LIFO)
+    var popped: WorkItem
+
+    work_deque_pop(@deque, @popped)
+    if popped.request_id != 102
+        "FAIL: first pop should be 102, got {popped.request_id}\n"
+        work_deque_destroy(@deque)
+        return 1
+
+    work_deque_pop(@deque, @popped)
+    if popped.request_id != 101
+        "FAIL: second pop should be 101, got {popped.request_id}\n"
+        work_deque_destroy(@deque)
+        return 1
+
+    work_deque_pop(@deque, @popped)
+    if popped.request_id != 100
+        "FAIL: third pop should be 100, got {popped.request_id}\n"
+        work_deque_destroy(@deque)
+        return 1
+
+    work_deque_destroy(@deque)
+    return 0
+
+# ============================================================================
+# Test: Steal Operations
+# ============================================================================
+
+[[test]]
+fn test_work_deque_steal() -> i32
+    var deque: WorkDeque
+    work_deque_init(@deque, 8)
+
+    # Push items
+    var i: i32 = 0
+    while i < 3
+        var item: WorkItem
+        item.request_id = (100 + i) as u64
+        item.worker_slot = 0
+        item.priority = 1
+        work_deque_push(@deque, @item)
+        i = i + 1
+
+    # Steal takes from top (FIFO)
+    var stolen: WorkItem
+
+    let steal_result: i32 = work_deque_steal(@deque, @stolen)
+    if steal_result != 0
+        "FAIL: steal failed\n"
+        work_deque_destroy(@deque)
+        return 1
+
+    # Steal should get the oldest item (100)
+    if stolen.request_id != 100
+        "FAIL: stolen should be 100, got {stolen.request_id}\n"
+        work_deque_destroy(@deque)
+        return 1
+
+    # Second steal should get 101
+    work_deque_steal(@deque, @stolen)
+    if stolen.request_id != 101
+        "FAIL: stolen should be 101, got {stolen.request_id}\n"
+        work_deque_destroy(@deque)
+        return 1
+
+    work_deque_destroy(@deque)
+    return 0
+
+[[test]]
+fn test_work_deque_steal_empty() -> i32
+    var deque: WorkDeque
+    work_deque_init(@deque, 8)
+
+    var stolen: WorkItem
+    let result: i32 = work_deque_steal(@deque, @stolen)
+
+    if result == 0
+        "FAIL: steal should fail on empty deque\n"
+        work_deque_destroy(@deque)
+        return 1
+
+    work_deque_destroy(@deque)
+    return 0
+
+[[test]]
+fn test_work_deque_pop_empty() -> i32
+    var deque: WorkDeque
+    work_deque_init(@deque, 8)
+
+    var popped: WorkItem
+    let result: i32 = work_deque_pop(@deque, @popped)
+
+    if result == 0
+        "FAIL: pop should fail on empty deque\n"
+        work_deque_destroy(@deque)
+        return 1
+
+    work_deque_destroy(@deque)
+    return 0
+
+# ============================================================================
+# Test: Mixed Push/Pop/Steal
+# ============================================================================
+
+[[test]]
+fn test_work_deque_mixed_operations() -> i32
+    var deque: WorkDeque
+    work_deque_init(@deque, 16)
+
+    # Push 5 items
+    var i: i32 = 0
+    while i < 5
+        var item: WorkItem
+        item.request_id = (i + 1) as u64
+        item.worker_slot = 0
+        item.priority = 1
+        work_deque_push(@deque, @item)
+        i = i + 1
+
+    # State: [1, 2, 3, 4, 5] (top=0, bottom=5)
+
+    # Steal 2 from top
+    var stolen: WorkItem
+    work_deque_steal(@deque, @stolen)  # Gets 1
+    work_deque_steal(@deque, @stolen)  # Gets 2
+
+    # State: [_, _, 3, 4, 5] (top=2, bottom=5)
+
+    # Pop 1 from bottom
+    var popped: WorkItem
+    work_deque_pop(@deque, @popped)  # Gets 5
+
+    # State: [_, _, 3, 4, _] (top=2, bottom=4)
+
+    # Push 2 more
+    var item6: WorkItem
+    item6.request_id = 6
+    item6.worker_slot = 0
+    item6.priority = 1
+    work_deque_push(@deque, @item6)
+
+    var item7: WorkItem
+    item7.request_id = 7
+    item7.worker_slot = 0
+    item7.priority = 1
+    work_deque_push(@deque, @item7)
+
+    # State: [_, _, 3, 4, 6, 7] (top=2, bottom=6)
+
+    # Count should be 4
+    let count: i64 = work_deque_count(@deque)
+    if count != 4
+        "FAIL: count should be 4, got {count}\n"
+        work_deque_destroy(@deque)
+        return 1
+
+    work_deque_destroy(@deque)
+    return 0
+
+# ============================================================================
+# Test: Work Stealing Pool
+# ============================================================================
+
+[[test]]
+fn test_steal_pool_init() -> i32
+    var pool: StealPool
+    let result: i32 = steal_pool_init(@pool, 4, 16)  # 4 workers, 16 items each
+    if result < 0
+        "FAIL: steal_pool_init failed\n"
+        return 1
+
+    let r1: i32 = assert_eq_i32(pool.worker_count, 4)
+    if r1 != 0
+        steal_pool_destroy(@pool)
+        return r1
+
+    steal_pool_destroy(@pool)
+    return 0
+
+[[test]]
+fn test_steal_pool_push_pop() -> i32
+    var pool: StealPool
+    steal_pool_init(@pool, 4, 16)
+
+    # Worker 0 pushes work
+    var item: WorkItem
+    item.request_id = 42
+    item.worker_slot = 0
+    item.priority = 1
+
+    let push_result: i32 = steal_pool_push(@pool, 0, @item)
+    if push_result != 0
+        "FAIL: push failed\n"
+        steal_pool_destroy(@pool)
+        return 1
+
+    # Worker 0 pops it back
+    var popped: WorkItem
+    let pop_result: i32 = steal_pool_pop(@pool, 0, @popped)
+    if pop_result != 0
+        "FAIL: pop failed\n"
+        steal_pool_destroy(@pool)
+        return 1
+
+    let r: i32 = assert_eq_u64(popped.request_id, 42)
+    if r != 0
+        steal_pool_destroy(@pool)
+        return r
+
+    steal_pool_destroy(@pool)
+    return 0
+
+[[test]]
+fn test_steal_pool_steal_from_other() -> i32
+    var pool: StealPool
+    steal_pool_init(@pool, 4, 16)
+
+    # Worker 0 pushes 3 items
+    var i: i32 = 0
+    while i < 3
+        var item: WorkItem
+        item.request_id = (100 + i) as u64
+        item.worker_slot = 0
+        item.priority = 1
+        steal_pool_push(@pool, 0, @item)
+        i = i + 1
+
+    # Worker 1 steals from worker 0
+    var stolen: WorkItem
+    let steal_result: i32 = steal_pool_steal(@pool, 1, 0, @stolen)
+    if steal_result != 0
+        "FAIL: steal failed\n"
+        steal_pool_destroy(@pool)
+        return 1
+
+    # Should get oldest item (100)
+    if stolen.request_id != 100
+        "FAIL: should steal 100, got {stolen.request_id}\n"
+        steal_pool_destroy(@pool)
+        return 1
+
+    steal_pool_destroy(@pool)
+    return 0
+
+[[test]]
+fn test_steal_pool_find_victim() -> i32
+    var pool: StealPool
+    steal_pool_init(@pool, 4, 16)
+
+    # Worker 2 has the most work (5 items)
+    var i: i32 = 0
+    while i < 5
+        var item: WorkItem
+        item.request_id = (200 + i) as u64
+        item.worker_slot = 2
+        item.priority = 1
+        steal_pool_push(@pool, 2, @item)
+        i = i + 1
+
+    # Worker 0 has 2 items
+    i = 0
+    while i < 2
+        var item: WorkItem
+        item.request_id = (100 + i) as u64
+        item.worker_slot = 0
+        item.priority = 1
+        steal_pool_push(@pool, 0, @item)
+        i = i + 1
+
+    # Worker 1 (empty) finds a victim
+    let victim: i32 = steal_pool_find_victim(@pool, 1)
+
+    # Should find worker 2 (most work)
+    if victim != 2
+        "FAIL: should find worker 2 as victim, got {victim}\n"
+        steal_pool_destroy(@pool)
+        return 1
+
+    steal_pool_destroy(@pool)
+    return 0
+
+[[test]]
+fn test_steal_pool_try_steal_any() -> i32
+    var pool: StealPool
+    steal_pool_init(@pool, 4, 16)
+
+    # Worker 3 has some work
+    var item: WorkItem
+    item.request_id = 999
+    item.worker_slot = 3
+    item.priority = 1
+    steal_pool_push(@pool, 3, @item)
+
+    # Worker 0 tries to steal from anyone
+    var stolen: WorkItem
+    let result: i32 = steal_pool_try_steal_any(@pool, 0, @stolen)
+    if result != 0
+        "FAIL: try_steal_any failed\n"
+        steal_pool_destroy(@pool)
+        return 1
+
+    if stolen.request_id != 999
+        "FAIL: should steal 999\n"
+        steal_pool_destroy(@pool)
+        return 1
+
+    steal_pool_destroy(@pool)
+    return 0
+
+[[test]]
+fn test_steal_pool_no_work_available() -> i32
+    var pool: StealPool
+    steal_pool_init(@pool, 4, 16)
+
+    # All workers empty
+    var stolen: WorkItem
+    let result: i32 = steal_pool_try_steal_any(@pool, 0, @stolen)
+
+    if result == 0
+        "FAIL: should fail when no work available\n"
+        steal_pool_destroy(@pool)
+        return 1
+
+    steal_pool_destroy(@pool)
+    return 0

@@ -1,0 +1,206 @@
+# lib/shm.ritz - Shared memory region for Valet-Worker IPC
+#
+# Creates and manages a shared memory region containing:
+#   - Control block (indices, state, futex words)
+#   - Request ring (slots with arena offsets)
+#   - Response ring (slots with arena offsets)
+#   - Data arena (request/response bodies, headers)
+#
+# Uses memfd_create for anonymous shared memory (Linux 3.17+).
+# The fd can be passed to worker processes via fork() or unix socket.
+
+import ritzlib.sys
+import lib.control
+import lib.ring
+import lib.arena
+
+# ============================================================================
+# Syscall additions
+# ============================================================================
+
+const SYS_MEMFD_CREATE: i64 = 319
+
+# memfd_create flags
+const MFD_CLOEXEC: i32 = 1
+const MFD_ALLOW_SEALING: i32 = 2
+
+# memfd_create wrapper
+fn sys_memfd_create(name: *u8, flags: i32) -> i32
+    return syscall2(SYS_MEMFD_CREATE, name as i64, flags as i64) as i32
+
+# ============================================================================
+# Configuration
+# ============================================================================
+
+pub struct ShmConfig
+    ring_capacity: i64    # Number of slots in each ring (must be power of 2)
+    arena_size: i64       # Size of data arena in bytes
+
+# Initialize config with default values
+pub fn shm_config_default(cfg: *ShmConfig)
+    cfg.ring_capacity = 256      # 256 slots per ring
+    cfg.arena_size = 1048576     # 1 MB arena
+
+# Initialize config with custom values
+pub fn shm_config_init(cfg: *ShmConfig, ring_capacity: i64, arena_size: i64)
+    cfg.ring_capacity = ring_capacity
+    cfg.arena_size = arena_size
+
+# Calculate total shared memory size
+pub fn shm_calculate_size(cfg: *ShmConfig) -> i64
+    let cb_size: i64 = control_block_size()
+    let req_ring_size: i64 = cfg.ring_capacity * request_slot_size()
+    let resp_ring_size: i64 = cfg.ring_capacity * response_slot_size()
+
+    # Align each section to page boundary for cleaner layout
+    let page_size: i64 = 4096
+    let cb_aligned: i64 = ((cb_size + page_size - 1) / page_size) * page_size
+    let req_aligned: i64 = ((req_ring_size + page_size - 1) / page_size) * page_size
+    let resp_aligned: i64 = ((resp_ring_size + page_size - 1) / page_size) * page_size
+    let arena_aligned: i64 = ((cfg.arena_size + page_size - 1) / page_size) * page_size
+
+    return cb_aligned + req_aligned + resp_aligned + arena_aligned
+
+# ============================================================================
+# Shared Memory Region
+# ============================================================================
+
+pub struct ShmRegion
+    base: *u8             # Base pointer of mmap'd region
+    size: i64             # Total size of region
+    fd: i32               # File descriptor (memfd)
+    config: ShmConfig     # Configuration used to create this region
+
+    # Cached offsets for fast access
+    req_ring_offset: i64
+    resp_ring_offset: i64
+    arena_offset: i64
+
+# ============================================================================
+# Public API
+# ============================================================================
+
+# Create a new shared memory region (Valet side)
+# Returns 0 on success, negative error code on failure
+pub fn shm_create(region: *ShmRegion, cfg: *ShmConfig) -> i32
+    # Calculate sizes
+    let page_size: i64 = 4096
+    let cb_size: i64 = ((control_block_size() + page_size - 1) / page_size) * page_size
+    let req_ring_size: i64 = ((cfg.ring_capacity * request_slot_size() + page_size - 1) / page_size) * page_size
+    let resp_ring_size: i64 = ((cfg.ring_capacity * response_slot_size() + page_size - 1) / page_size) * page_size
+    let arena_size: i64 = ((cfg.arena_size + page_size - 1) / page_size) * page_size
+
+    let total_size: i64 = cb_size + req_ring_size + resp_ring_size + arena_size
+
+    # Create memfd
+    let fd: i32 = sys_memfd_create(c"zeus_shm", MFD_CLOEXEC)
+    if fd < 0
+        return fd
+
+    # Set size
+    let ret: i32 = sys_ftruncate(fd, total_size)
+    if ret < 0
+        sys_close(fd)
+        return ret
+
+    # Map the memory
+    let base: *u8 = sys_mmap(0, total_size, PROT_READ + PROT_WRITE, MAP_SHARED, fd, 0)
+    if base == (-1) as *u8
+        sys_close(fd)
+        return -1
+
+    # Store region info
+    region.base = base
+    region.size = total_size
+    region.fd = fd
+    region.config.ring_capacity = cfg.ring_capacity
+    region.config.arena_size = cfg.arena_size
+
+    # Calculate offsets
+    region.req_ring_offset = cb_size
+    region.resp_ring_offset = cb_size + req_ring_size
+    region.arena_offset = cb_size + req_ring_size + resp_ring_size
+
+    # Initialize control block
+    let cb: *ControlBlock = region.base as *ControlBlock
+    control_block_init(cb)
+    cb.ring_capacity = cfg.ring_capacity
+    cb.ring_mask = cfg.ring_capacity - 1
+
+    # Zero out ring buffers
+    var i: i64 = 0
+    while i < req_ring_size + resp_ring_size
+        *(region.base + region.req_ring_offset + i) = 0
+        i = i + 1
+
+    return 0
+
+# Attach to an existing shared memory region (Worker side)
+# Takes fd received from Valet
+pub fn shm_attach(region: *ShmRegion, fd: i32, size: i64) -> i32
+    # Map the shared memory
+    let base: *u8 = sys_mmap(0, size, PROT_READ + PROT_WRITE, MAP_SHARED, fd, 0)
+    if base == (-1) as *u8
+        return -1
+
+    # Read config from control block
+    let cb: *ControlBlock = base as *ControlBlock
+
+    region.base = base
+    region.size = size
+    region.fd = fd
+    region.config.ring_capacity = cb.ring_capacity
+    region.config.arena_size = 0  # Will calculate from offsets
+
+    # Calculate offsets (must match shm_create layout)
+    let page_size: i64 = 4096
+    let cb_size: i64 = ((control_block_size() + page_size - 1) / page_size) * page_size
+    let req_ring_size: i64 = ((cb.ring_capacity * request_slot_size() + page_size - 1) / page_size) * page_size
+    let resp_ring_size: i64 = ((cb.ring_capacity * response_slot_size() + page_size - 1) / page_size) * page_size
+
+    region.req_ring_offset = cb_size
+    region.resp_ring_offset = cb_size + req_ring_size
+    region.arena_offset = cb_size + req_ring_size + resp_ring_size
+    region.config.arena_size = size - region.arena_offset
+
+    return 0
+
+# Destroy a shared memory region (Valet side - owns the fd)
+pub fn shm_destroy(region: *ShmRegion)
+    if region.base != null && region.size > 0
+        sys_munmap(region.base, region.size)
+    if region.fd >= 0
+        sys_close(region.fd)
+    region.base = null
+    region.size = 0
+    region.fd = -1
+
+# Detach from a shared memory region (Worker side - doesn't own fd)
+pub fn shm_detach(region: *ShmRegion)
+    if region.base != null && region.size > 0
+        sys_munmap(region.base, region.size)
+    region.base = null
+    region.size = 0
+    # Don't close fd - we don't own it
+
+# ============================================================================
+# Accessors
+# ============================================================================
+
+# Get pointer to control block
+pub fn shm_get_control_block(region: *ShmRegion) -> *ControlBlock
+    return region.base as *ControlBlock
+
+# Get pointer to request ring (array of RequestSlot)
+pub fn shm_get_request_ring(region: *ShmRegion) -> *RequestSlot
+    return (region.base + region.req_ring_offset) as *RequestSlot
+
+# Get pointer to response ring (array of ResponseSlot)
+pub fn shm_get_response_ring(region: *ShmRegion) -> *ResponseSlot
+    return (region.base + region.resp_ring_offset) as *ResponseSlot
+
+# Initialize a DataArena pointing to the arena region
+pub fn shm_get_arena(region: *ShmRegion, arena: *DataArena)
+    arena.base = region.base + region.arena_offset
+    arena.size = region.config.arena_size
+    arena.offset = 0

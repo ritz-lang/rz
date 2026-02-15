@@ -1,0 +1,270 @@
+# lib/h1_response.ritz - HTTP/1.x response parser
+#
+# Zero-copy response parsing using Span<u8>.
+# All parsed data points into the original buffer - no allocations.
+#
+# API:
+# - H1Response: Parsed response structure
+# - h1_response_init: Initialize response structure
+# - h1_parse_status_line: Parse "HTTP/1.x NNN Reason\r\n"
+# - h1_parse_response: Parse full response (line + headers + body)
+# - h1_response_get_header: Get header value by name (case-insensitive)
+# - h1_response_is_keep_alive: Check if connection should be kept alive
+
+import ritzlib.span
+import ritzlib.str
+import lib.types
+import lib.h1_utils
+import lib.limits
+
+# Error codes re-exported from h1_utils for backward compatibility
+
+# ============================================================================
+# H1Header - Single header name/value pair
+# ============================================================================
+
+struct H1Header
+    name: Span<u8>
+    value: Span<u8>
+
+# ============================================================================
+# H1Response - Parsed HTTP/1.x response
+# ============================================================================
+
+pub struct H1Response
+    # Status line
+    version: i32        # VERSION_HTTP10, VERSION_HTTP11
+    status: i32         # Status code (200, 404, etc.)
+    reason: Span<u8>    # Reason phrase
+
+    # Headers (stored inline, no allocation)
+    headers: [64]H1Header
+    header_count: i32
+
+    # Parsed header values
+    content_length: i64
+    connection_close: i32   # 1 if Connection: close
+    is_chunked: i32         # 1 if Transfer-Encoding: chunked
+
+    # Body (if Content-Length present)
+    body: Span<u8>
+
+# ============================================================================
+# Response Initialization
+# ============================================================================
+
+pub fn h1_response_init(resp: *H1Response)
+    resp.version = VERSION_UNKNOWN
+    resp.status = 0
+    resp.reason.ptr = null
+    resp.reason.len = 0
+    resp.header_count = 0
+    resp.content_length = 0
+    resp.connection_close = 0
+    resp.is_chunked = 0
+    resp.body.ptr = null
+    resp.body.len = 0
+
+# ============================================================================
+# Status Line Parsing
+# ============================================================================
+
+# Parse status line: "HTTP/1.x NNN Reason\r\n"
+# Returns bytes consumed on success, negative on error
+pub fn h1_parse_status_line(resp: *H1Response, input: *Span<u8>) -> i32
+    if input.len == 0
+        return H1_ERR_INCOMPLETE
+
+    var pos: i64 = 0
+
+    # Find first space (end of version)
+    let version_end: i64 = find_byte(input, pos, ' ')
+    if version_end < 0
+        return H1_ERR_INVALID
+
+    # Parse version
+    var version_span: Span<u8> = span_slice<u8>(input, pos, version_end)
+    resp.version = version_from_span(@version_span)
+    if resp.version == VERSION_UNKNOWN
+        return H1_ERR_INVALID
+
+    pos = version_end + 1
+
+    # Parse status code (3 digits)
+    if pos + 3 > input.len
+        return H1_ERR_INCOMPLETE
+
+    resp.status = parse_status_code(input.ptr + pos)
+    if resp.status == 0
+        return H1_ERR_INVALID
+
+    pos += 3
+
+    # Skip space after status code
+    if pos >= input.len || *(input.ptr + pos) != ' '
+        return H1_ERR_INVALID
+    pos += 1
+
+    # Find CRLF (end of reason)
+    let crlf_pos: i64 = find_crlf(input, pos)
+    if crlf_pos < 0
+        return H1_ERR_INCOMPLETE
+
+    resp.reason = span_slice<u8>(input, pos, crlf_pos)
+
+    # Return bytes consumed (including CRLF)
+    return (crlf_pos + 2) as i32
+
+# ============================================================================
+# Full Response Parsing
+# ============================================================================
+
+# Parse complete HTTP/1.x response
+# Returns total bytes consumed on success, negative on error
+pub fn h1_parse_response(resp: *H1Response, input: *Span<u8>) -> i32
+    h1_response_init(resp)
+
+    var pos: i64 = 0
+    var remaining: Span<u8> = *input
+
+    # Parse status line
+    let line_result: i32 = h1_parse_status_line(resp, @remaining)
+    if line_result < 0
+        return line_result
+
+    pos = line_result as i64
+    remaining = span_from<u8>(input, pos)
+
+    # Parse headers
+    var headers_done: i32 = 0
+    while headers_done == 0
+        if resp.header_count >= H1_MAX_HEADERS
+            return H1_ERR_TOO_MANY_HEADERS
+
+        var name: Span<u8>
+        var value: Span<u8>
+        let header_result: i32 = parse_header(@remaining, @name, @value)
+
+        if header_result < 0
+            return header_result
+
+        if header_result == 0
+            # Empty line - end of headers
+            pos += 2  # Skip CRLF
+            headers_done = 1
+        else
+            # Store header
+            let idx: i32 = resp.header_count
+            resp.headers[idx].name = name
+            resp.headers[idx].value = value
+            resp.header_count += 1
+
+            # Check for special headers
+            if span_eq_cstr_ci(@resp.headers[idx].name, c"Content-Length")
+                resp.content_length = parse_content_length(@resp.headers[idx].value)
+            else if span_eq_cstr_ci(@resp.headers[idx].name, c"Connection")
+                if span_eq_cstr_ci(@resp.headers[idx].value, c"close")
+                    resp.connection_close = 1
+            else if span_eq_cstr_ci(@resp.headers[idx].name, c"Transfer-Encoding")
+                if span_eq_cstr_ci(@resp.headers[idx].value, c"chunked")
+                    resp.is_chunked = 1
+
+            pos += header_result as i64
+            remaining = span_from<u8>(input, pos)
+
+    # Extract body if Content-Length present (and not chunked)
+    if resp.content_length > 0 && resp.is_chunked == 0
+        let body_available: i64 = input.len - pos
+        if body_available < resp.content_length
+            return H1_ERR_INCOMPLETE
+
+        resp.body = span_slice<u8>(input, pos, pos + resp.content_length)
+        pos += resp.content_length
+
+    return pos as i32
+
+# ============================================================================
+# Header Access
+# ============================================================================
+
+# Get header value by name (case-insensitive)
+# Returns empty span if not found
+pub fn h1_response_get_header(resp: *H1Response, name: *u8) -> Span<u8>
+    var i: i32 = 0
+    while i < resp.header_count
+        if span_eq_cstr_ci(@resp.headers[i].name, name) == 1
+            return resp.headers[i].value
+        i += 1
+
+    var empty: Span<u8>
+    empty.ptr = null
+    empty.len = 0
+    return empty
+
+# Check if connection should be kept alive
+pub fn h1_response_is_keep_alive(resp: *H1Response) -> i32
+    # Explicit Connection: close takes precedence
+    if resp.connection_close == 1
+        return 0
+
+    # HTTP/1.1 defaults to keep-alive
+    if resp.version == VERSION_HTTP11
+        return 1
+
+    # HTTP/1.0 defaults to close
+    return 0
+
+# Helper functions (find_byte, find_crlf, is_whitespace, etc.) are imported from lib.h1_utils
+
+# Parse a single header line
+fn parse_header(input: *Span<u8>, name: *Span<u8>, value: *Span<u8>) -> i32
+    if input.len == 0
+        return H1_ERR_INCOMPLETE
+
+    # Check for empty line (end of headers)
+    if input.len >= 2 && *(input.ptr) == '\r' && *(input.ptr + 1) == '\n'
+        name.ptr = null
+        name.len = 0
+        value.ptr = null
+        value.len = 0
+        return 0  # Signal end of headers
+
+    # Find colon
+    let colon_pos: i64 = find_byte(input, 0, ':')
+    if colon_pos < 0
+        return H1_ERR_INVALID
+
+    *name = span_slice<u8>(input, 0, colon_pos)
+
+    # Find CRLF
+    let crlf_pos: i64 = find_crlf(input, colon_pos)
+    if crlf_pos < 0
+        return H1_ERR_INCOMPLETE
+
+    # Extract value (skip colon and whitespace)
+    var value_start: i64 = colon_pos + 1
+    while value_start < crlf_pos && is_whitespace(*(input.ptr + value_start))
+        value_start += 1
+
+    var value_end: i64 = crlf_pos
+    while value_end > value_start && is_whitespace(*(input.ptr + value_end - 1))
+        value_end -= 1
+
+    *value = span_slice<u8>(input, value_start, value_end)
+
+    return (crlf_pos + 2) as i32
+
+# Parse 3-digit status code
+fn parse_status_code(ptr: *u8) -> i32
+    let c0: u8 = *ptr
+    let c1: u8 = *(ptr + 1)
+    let c2: u8 = *(ptr + 2)
+
+    if c0 < '0' || c0 > '9'
+        return 0
+    if c1 < '0' || c1 > '9'
+        return 0
+    if c2 < '0' || c2 > '9'
+        return 0
+
+    return ((c0 - '0') as i32) * 100 + ((c1 - '0') as i32) * 10 + ((c2 - '0') as i32)

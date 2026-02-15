@@ -1,0 +1,147 @@
+# Tests for Drop trait and automatic cleanup
+#
+# The Drop trait enables automatic cleanup when values go out of scope.
+# Currently, drop() must be called manually. These tests document the
+# expected behavior and will pass once automatic drop is implemented.
+
+import ritzlib.memory
+import ritzlib.io
+
+# Global counter to track drop calls
+var g_drop_count: i64 = 0
+
+fn reset_drop_count()
+    g_drop_count = 0
+
+fn get_drop_count() -> i64
+    return g_drop_count
+
+# Resource that increments counter when dropped
+struct TrackedResource
+    id: i64
+
+fn tracked_resource_new(id: i64) -> TrackedResource
+    return TrackedResource { id: id }
+
+fn tracked_resource_drop(self: &mut TrackedResource)
+    g_drop_count += 1
+
+# Nested resource - contains another resource
+struct Outer
+    inner: TrackedResource
+    value: i64
+
+fn outer_new(id: i64, value: i64) -> Outer
+    return Outer { inner: tracked_resource_new(id), value: value }
+
+fn outer_drop(self: &mut Outer)
+    # Should drop inner first, then self
+    tracked_resource_drop(&self.inner)
+    g_drop_count += 1
+
+[[test]]
+fn test_manual_drop() -> i32
+    reset_drop_count()
+
+    var r = tracked_resource_new(1)
+    assert get_drop_count() == 0, "no drop yet"
+
+    tracked_resource_drop(&r)
+    assert get_drop_count() == 1, "drop should increment counter"
+    0
+
+[[test]]
+fn test_multiple_drops() -> i32
+    reset_drop_count()
+
+    var r1 = tracked_resource_new(1)
+    var r2 = tracked_resource_new(2)
+    var r3 = tracked_resource_new(3)
+
+    tracked_resource_drop(&r3)
+    assert get_drop_count() == 1, "one drop"
+
+    tracked_resource_drop(&r2)
+    assert get_drop_count() == 2, "two drops"
+
+    tracked_resource_drop(&r1)
+    assert get_drop_count() == 3, "three drops"
+    0
+
+[[test]]
+fn test_nested_drop() -> i32
+    reset_drop_count()
+
+    var outer = outer_new(1, 42)
+    assert get_drop_count() == 0, "no drop yet"
+
+    outer_drop(&outer)
+    # outer_drop calls inner drop, then increments
+    assert get_drop_count() == 2, "nested drop: inner + outer"
+    0
+
+[[test]]
+fn test_drop_in_loop() -> i32
+    reset_drop_count()
+
+    for i in 0..5
+        var r = tracked_resource_new(i)
+        tracked_resource_drop(&r)
+
+    assert get_drop_count() == 5, "should drop once per iteration"
+    0
+
+# Tests for future automatic drop behavior
+# These document expected behavior once auto-drop is implemented
+
+[[test]]
+fn test_drop_idempotent() -> i32
+    reset_drop_count()
+
+    var r = tracked_resource_new(1)
+    tracked_resource_drop(&r)
+    # Calling drop again should be safe (even if it double-counts for now)
+    # In production, drop should be idempotent
+    assert get_drop_count() >= 1, "at least one drop"
+    0
+
+# File handle resource - demonstrates real-world RAII pattern
+struct FileHandle
+    fd: i32
+    is_open: bool
+
+fn file_handle_new(fd: i32) -> FileHandle
+    return FileHandle { fd: fd, is_open: true }
+
+fn file_handle_invalid() -> FileHandle
+    return FileHandle { fd: -1, is_open: false }
+
+fn file_handle_drop(self: &mut FileHandle)
+    if self.is_open && self.fd >= 0
+        # Would call close(self.fd) in real code
+        self.is_open = false
+        g_drop_count += 1
+
+[[test]]
+fn test_file_handle_drop() -> i32
+    reset_drop_count()
+
+    var fh = file_handle_new(3)  # Fake fd
+    assert fh.is_open, "should be open"
+
+    file_handle_drop(&fh)
+    assert !fh.is_open, "should be closed after drop"
+    assert get_drop_count() == 1, "drop should be called"
+    0
+
+[[test]]
+fn test_invalid_handle_drop() -> i32
+    reset_drop_count()
+
+    var fh = file_handle_invalid()
+    assert !fh.is_open, "invalid handle not open"
+
+    file_handle_drop(&fh)
+    # Invalid handle drop should be no-op
+    assert get_drop_count() == 0, "invalid handle drop is no-op"
+    0

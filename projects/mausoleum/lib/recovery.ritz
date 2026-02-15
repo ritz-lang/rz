@@ -1,0 +1,430 @@
+# lib/recovery.ritz - Recovery Manager
+#
+# Implements crash recovery using Write-Ahead Logging (WAL).
+#
+# Recovery Strategy (simplified ARIES):
+# 1. Analysis Pass: Scan WAL to identify active transactions
+# 2. Redo Pass: Replay all changes from committed transactions
+# 3. Undo Pass: Roll back uncommitted transactions
+#
+# Key invariants:
+# - Only committed transactions' changes are visible after recovery
+# - Uncommitted transactions are rolled back (their changes discarded)
+# - Checkpoints mark known-good states (optimization for recovery start point)
+
+import ritzlib.sys
+import ritzlib.str
+import ritzlib.memory
+
+import lib.m7m_types
+import lib.page
+import lib.buffer_pool
+import lib.wal
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+const MAX_ACTIVE_TXNS: i64 = 256    # Max concurrent transactions during recovery
+
+# Transaction states during recovery
+const TXN_STATE_ACTIVE: u8 = 1      # Transaction started, not yet committed/aborted
+const TXN_STATE_COMMITTED: u8 = 2   # Transaction committed
+const TXN_STATE_ABORTED: u8 = 3     # Transaction aborted
+
+# ============================================================================
+# Recovery Statistics
+# ============================================================================
+
+struct RecoveryStats
+    records_scanned: i64        # Total WAL records scanned
+    txns_committed: i64         # Transactions that were committed
+    txns_aborted: i64           # Transactions that were aborted/rolled back
+    pages_recovered: i64        # Pages that were recovered
+    checkpoint_lsn: i64         # LSN of last checkpoint found
+    recovery_lsn: i64           # LSN where recovery started
+
+# ============================================================================
+# Active Transaction Entry (for tracking during recovery)
+# ============================================================================
+
+struct TxnEntry
+    txn_id: i64
+    state: u8
+    first_lsn: i64              # LSN of BEGIN record
+    last_lsn: i64               # LSN of last record for this txn
+
+# ============================================================================
+# Recovery Manager
+# ============================================================================
+
+struct RecoveryManager
+    pool: *BufferPool           # Buffer pool for page recovery
+    wal_writer: *WalWriter      # WAL writer (for checkpoints)
+    wal_path: *u8               # Base path for WAL files
+    wal_path_len: i32
+
+    # Active transaction table
+    txn_table: *TxnEntry        # Array of active transactions
+    txn_count: i64              # Number of entries in txn_table
+
+    # Recovery stats
+    stats: RecoveryStats
+
+# ============================================================================
+# Recovery Manager Creation/Destruction
+# ============================================================================
+
+pub fn recovery_mgr_new(pool: *BufferPool, wal_path: *u8) -> *RecoveryManager
+    if pool == null or wal_path == null
+        return null
+
+    let mgr: *RecoveryManager = malloc(128) as *RecoveryManager
+    if mgr == null
+        return null
+
+    # Copy WAL path
+    let path_len: i64 = strlen(wal_path)
+    let path_copy: *u8 = malloc(path_len + 1)
+    if path_copy == null
+        free(mgr as *u8)
+        return null
+    memcpy(path_copy, wal_path, path_len + 1)
+
+    # Allocate transaction table
+    let txn_table: *TxnEntry = malloc(MAX_ACTIVE_TXNS * 24) as *TxnEntry
+    if txn_table == null
+        free(path_copy)
+        free(mgr as *u8)
+        return null
+
+    # Initialize
+    mgr.pool = pool
+    mgr.wal_writer = null
+    mgr.wal_path = path_copy
+    mgr.wal_path_len = path_len as i32
+    mgr.txn_table = txn_table
+    mgr.txn_count = 0
+
+    # Zero stats
+    mgr.stats.records_scanned = 0
+    mgr.stats.txns_committed = 0
+    mgr.stats.txns_aborted = 0
+    mgr.stats.pages_recovered = 0
+    mgr.stats.checkpoint_lsn = 0
+    mgr.stats.recovery_lsn = 0
+
+    return mgr
+
+pub fn recovery_mgr_destroy(mgr: *RecoveryManager)
+    if mgr == null
+        return
+
+    if mgr.wal_writer != null
+        wal_writer_destroy(mgr.wal_writer)
+
+    if mgr.txn_table != null
+        free(mgr.txn_table as *u8)
+
+    if mgr.wal_path != null
+        free(mgr.wal_path)
+
+    free(mgr as *u8)
+
+# ============================================================================
+# Transaction Table Operations
+# ============================================================================
+
+# Find transaction entry by ID (returns null if not found)
+fn find_txn(mgr: *RecoveryManager, txn_id: i64) -> *TxnEntry
+    var i: i64 = 0
+    while i < mgr.txn_count
+        let entry: *TxnEntry = mgr.txn_table + i
+        if entry.txn_id == txn_id
+            return entry
+        i += 1
+    return null
+
+# Add or update transaction entry
+fn upsert_txn(mgr: *RecoveryManager, txn_id: i64, state: u8, lsn: i64) -> *TxnEntry
+    # Try to find existing
+    let existing: *TxnEntry = find_txn(mgr, txn_id)
+    if existing != null
+        existing.state = state
+        existing.last_lsn = lsn
+        return existing
+
+    # Add new entry
+    if mgr.txn_count >= MAX_ACTIVE_TXNS
+        return null  # Table full
+
+    let entry: *TxnEntry = mgr.txn_table + mgr.txn_count
+    entry.txn_id = txn_id
+    entry.state = state
+    entry.first_lsn = lsn
+    entry.last_lsn = lsn
+    mgr.txn_count += 1
+    return entry
+
+# ============================================================================
+# Recovery - Main Entry Point
+# ============================================================================
+
+pub fn recovery_recover(mgr: *RecoveryManager) -> i32
+    if mgr == null
+        return ERR_INVALID
+
+    # Reset stats
+    mgr.stats.records_scanned = 0
+    mgr.stats.txns_committed = 0
+    mgr.stats.txns_aborted = 0
+    mgr.stats.pages_recovered = 0
+    mgr.txn_count = 0
+
+    # Build WAL file path
+    var path_buf: [256]u8
+    let base_len: i64 = mgr.wal_path_len as i64
+    memcpy(@path_buf[0], mgr.wal_path, base_len)
+    let suffix: *u8 = c".wal.000000"
+    memcpy(@path_buf[base_len], suffix, 12)
+
+    # Try to open WAL file
+    let reader: *WalReader = wal_reader_new()
+    if reader == null
+        return ERR_NO_MEMORY
+
+    let open_result: i32 = wal_reader_open(reader, @path_buf[0])
+    if open_result != ERR_OK
+        # No WAL file = nothing to recover
+        wal_reader_destroy(reader)
+        return ERR_OK
+
+    # Phase 1: Analysis - scan WAL and build transaction table
+    let analysis_result: i32 = recovery_analysis_pass(mgr, reader)
+    if analysis_result != ERR_OK
+        wal_reader_destroy(reader)
+        return analysis_result
+
+    # Seek back to beginning for redo pass
+    wal_reader_close(reader)
+    wal_reader_open(reader, @path_buf[0])
+
+    # Phase 2: Redo - replay committed transaction changes
+    let redo_result: i32 = recovery_redo_pass(mgr, reader)
+    if redo_result != ERR_OK
+        wal_reader_destroy(reader)
+        return redo_result
+
+    # Phase 3: Mark uncommitted transactions as aborted
+    var i: i64 = 0
+    while i < mgr.txn_count
+        let entry: *TxnEntry = mgr.txn_table + i
+        if entry.state == TXN_STATE_ACTIVE
+            entry.state = TXN_STATE_ABORTED
+            mgr.stats.txns_aborted += 1
+        i += 1
+
+    wal_reader_destroy(reader)
+    return ERR_OK
+
+# ============================================================================
+# Analysis Pass
+# ============================================================================
+
+fn recovery_analysis_pass(mgr: *RecoveryManager, reader: *WalReader) -> i32
+    var header: WalRecordHeader
+
+    # Scan all records
+    var result: i32 = wal_reader_next(reader, @header)
+    while result == ERR_OK
+        mgr.stats.records_scanned += 1
+
+        if header.rec_type == WAL_REC_BEGIN
+            # Start tracking this transaction
+            upsert_txn(mgr, header.txn_id, TXN_STATE_ACTIVE, header.lsn)
+
+        else if header.rec_type == WAL_REC_COMMIT
+            # Mark transaction as committed
+            let entry: *TxnEntry = find_txn(mgr, header.txn_id)
+            if entry != null
+                entry.state = TXN_STATE_COMMITTED
+                entry.last_lsn = header.lsn
+                mgr.stats.txns_committed += 1
+
+        else if header.rec_type == WAL_REC_ABORT
+            # Mark transaction as aborted
+            let entry: *TxnEntry = find_txn(mgr, header.txn_id)
+            if entry != null
+                entry.state = TXN_STATE_ABORTED
+                entry.last_lsn = header.lsn
+                mgr.stats.txns_aborted += 1
+
+        else if header.rec_type == WAL_REC_CHECKPOINT
+            mgr.stats.checkpoint_lsn = header.lsn
+
+        else if header.rec_type == WAL_REC_INSERT or header.rec_type == WAL_REC_UPDATE or header.rec_type == WAL_REC_PAGE_WRITE
+            # Update last LSN for this transaction
+            let entry: *TxnEntry = find_txn(mgr, header.txn_id)
+            if entry != null
+                entry.last_lsn = header.lsn
+
+        # Skip payload if any
+        wal_reader_skip_payload(reader, @header)
+
+        result = wal_reader_next(reader, @header)
+
+    # EOF (-1) is normal, other errors are failures
+    if result != -1
+        return result
+
+    return ERR_OK
+
+# ============================================================================
+# Redo Pass
+# ============================================================================
+
+fn recovery_redo_pass(mgr: *RecoveryManager, reader: *WalReader) -> i32
+    var header: WalRecordHeader
+
+    var result: i32 = wal_reader_next(reader, @header)
+    while result == ERR_OK
+        # Only redo changes from committed transactions
+        let entry: *TxnEntry = find_txn(mgr, header.txn_id)
+        let is_committed: bool = entry != null and entry.state == TXN_STATE_COMMITTED
+
+        if header.rec_type == WAL_REC_PAGE_WRITE and is_committed
+            # Read page write payload
+            var payload: WalPageWritePayload
+            let bytes_read: i64 = sys_read(reader.fd, @payload as *u8, 8)
+            if bytes_read != 8
+                return ERR_IO
+
+            # Read full page
+            var page_data: [4096]u8
+            let page_read: i64 = sys_read(reader.fd, @page_data[0], PAGE_SIZE)
+            if page_read != PAGE_SIZE
+                return ERR_IO
+
+            # Apply page to buffer pool
+            let apply_result: i32 = recovery_apply_page(mgr, payload.page_id, @page_data[0])
+            if apply_result == ERR_OK
+                mgr.stats.pages_recovered += 1
+
+        else if header.rec_type == WAL_REC_INSERT and is_committed
+            # Read insert payload
+            var payload: WalInsertPayload
+            let bytes_read: i64 = sys_read(reader.fd, @payload as *u8, 16)
+            if bytes_read != 16
+                return ERR_IO
+
+            # Read insert data
+            if payload.data_len > 0
+                var data_buf: [4096]u8
+                let data_len: i64 = payload.data_len as i64
+                if data_len > 4096
+                    return ERR_INVALID
+                let data_read: i64 = sys_read(reader.fd, @data_buf[0], data_len)
+                if data_read != data_len
+                    return ERR_IO
+
+                # Apply insert to page
+                let apply_result: i32 = recovery_apply_insert(mgr, payload.page_id, payload.offset, @data_buf[0], payload.data_len)
+                if apply_result == ERR_OK
+                    mgr.stats.pages_recovered += 1
+
+        else
+            # Skip payload for non-redo records or uncommitted transactions
+            wal_reader_skip_payload(reader, @header)
+
+        result = wal_reader_next(reader, @header)
+
+    if result != -1
+        return result
+
+    return ERR_OK
+
+# ============================================================================
+# Page Recovery Helpers
+# ============================================================================
+
+fn recovery_apply_page(mgr: *RecoveryManager, rec_page_id: i64, page_data: *u8) -> i32
+    # Allocate a new page in buffer pool
+    let page: *Page = buffer_pool_alloc(mgr.pool, PAGE_MAGIC_HEAP)
+    if page == null
+        return ERR_NO_MEMORY
+
+    # Get the allocated page's ID
+    let alloc_page_id: i64 = buffer_pool_page_id(mgr.pool, page)
+
+    # Copy page data
+    memcpy(page as *u8, page_data, PAGE_SIZE)
+
+    # Mark page as dirty (needs to be written back eventually)
+    page_set_dirty(page)
+
+    # Unpin page (dirty=1 since we modified it)
+    buffer_pool_unpin(mgr.pool, alloc_page_id, 1)
+    return ERR_OK
+
+fn recovery_apply_insert(mgr: *RecoveryManager, rec_page_id: i64, offset: i32, data: *u8, data_len: i32) -> i32
+    # For inserts, we need to fetch/create the page and apply the data
+    # This is a simplified implementation - real DBs would handle this more carefully
+
+    let page: *Page = buffer_pool_alloc(mgr.pool, PAGE_MAGIC_HEAP)
+    if page == null
+        return ERR_NO_MEMORY
+
+    # Get the allocated page's ID
+    let alloc_page_id: i64 = buffer_pool_page_id(mgr.pool, page)
+
+    # Apply insert data to page
+    let pg_data: *u8 = page_data(page)
+    let off: i64 = offset as i64
+    let len: i64 = data_len as i64
+
+    if off + len <= PAGE_DATA_SIZE
+        memcpy(pg_data + off, data, len)
+        page_set_dirty(page)
+
+    # Unpin page (dirty=1 since we modified it)
+    buffer_pool_unpin(mgr.pool, alloc_page_id, 1)
+    return ERR_OK
+
+# ============================================================================
+# Checkpoint
+# ============================================================================
+
+pub fn recovery_checkpoint(mgr: *RecoveryManager) -> i32
+    if mgr == null
+        return ERR_INVALID
+
+    # Create WAL writer if needed
+    if mgr.wal_writer == null
+        mgr.wal_writer = wal_writer_new(mgr.wal_path)
+        if mgr.wal_writer == null
+            return ERR_NO_MEMORY
+        let open_result: i32 = wal_writer_open(mgr.wal_writer)
+        if open_result != ERR_OK
+            wal_writer_destroy(mgr.wal_writer)
+            mgr.wal_writer = null
+            return open_result
+
+    # Flush all dirty pages in buffer pool
+    # (In a real implementation, this would iterate dirty pages)
+
+    # Write checkpoint record to WAL
+    let lsn: i64 = wal_write_checkpoint(mgr.wal_writer)
+    if lsn < 0
+        return ERR_IO
+
+    mgr.stats.checkpoint_lsn = lsn
+    return ERR_OK
+
+# ============================================================================
+# Stats Access
+# ============================================================================
+
+pub fn recovery_stats(mgr: *RecoveryManager) -> *RecoveryStats
+    if mgr == null
+        return null
+    return @mgr.stats

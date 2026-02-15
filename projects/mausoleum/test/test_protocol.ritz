@@ -1,0 +1,783 @@
+# test/test_protocol.ritz - Tests for wire protocol
+
+import ritzlib.memory
+import ritzlib.str
+import lib.protocol
+
+# ============================================================================
+# Protocol constants tests
+# ============================================================================
+
+[[test]]
+fn test_protocol_magic() -> i32
+    # Magic should be "M7SP" = 0x4D375350
+    assert PROTO_MAGIC == 0x4D375350
+    0
+
+[[test]]
+fn test_protocol_version() -> i32
+    assert PROTO_VERSION == 1
+    0
+
+[[test]]
+fn test_protocol_header_size() -> i32
+    assert PROTO_HEADER_SIZE == 16
+    0
+
+[[test]]
+fn test_protocol_max_message_size() -> i32
+    assert PROTO_MAX_MESSAGE_SIZE == 16777216
+    0
+
+# ============================================================================
+# Message type tests
+# ============================================================================
+
+[[test]]
+fn test_request_message_types() -> i32
+    assert MSG_PING == 0x01
+    assert MSG_CONNECT == 0x02
+    assert MSG_DISCONNECT == 0x03
+    assert MSG_INSERT == 0x10
+    assert MSG_GET == 0x11
+    assert MSG_UPDATE == 0x12
+    assert MSG_DELETE == 0x13
+    assert MSG_QUERY == 0x20
+    assert MSG_TXN_BEGIN == 0x40
+    assert MSG_TXN_COMMIT == 0x41
+    assert MSG_TXN_ABORT == 0x42
+    0
+
+[[test]]
+fn test_response_message_types() -> i32
+    assert MSG_PONG == 0x81
+    assert MSG_CONNECTED == 0x82
+    assert MSG_INSERT_OK == 0x90
+    assert MSG_GET_OK == 0x91
+    assert MSG_DELETE_OK == 0x93
+    assert MSG_TXN_BEGUN == 0xC0
+    assert MSG_TXN_COMMITTED == 0xC1
+    assert MSG_TXN_ABORTED == 0xC2
+    assert MSG_ERROR == 0xFF
+    0
+
+[[test]]
+fn test_is_response() -> i32
+    # Request types should return 0
+    assert is_response(MSG_PING) == 0
+    assert is_response(MSG_INSERT) == 0
+    assert is_response(MSG_GET) == 0
+    # Response types should return 1
+    assert is_response(MSG_PONG) == 1
+    assert is_response(MSG_INSERT_OK) == 1
+    assert is_response(MSG_ERROR) == 1
+    0
+
+[[test]]
+fn test_response_to_request() -> i32
+    assert response_to_request(MSG_PONG) == MSG_PING
+    assert response_to_request(MSG_CONNECTED) == MSG_CONNECT
+    assert response_to_request(MSG_INSERT_OK) == MSG_INSERT
+    assert response_to_request(MSG_GET_OK) == MSG_GET
+    0
+
+[[test]]
+fn test_request_to_response() -> i32
+    assert request_to_response(MSG_PING) == MSG_PONG
+    assert request_to_response(MSG_CONNECT) == MSG_CONNECTED
+    assert request_to_response(MSG_INSERT) == MSG_INSERT_OK
+    assert request_to_response(MSG_GET) == MSG_GET_OK
+    0
+
+# ============================================================================
+# MessageHeader tests
+# ============================================================================
+
+[[test]]
+fn test_header_init() -> i32
+    var header: MessageHeader
+    header_init(@header, MSG_PING, 42)
+
+    assert header.magic == PROTO_MAGIC
+    assert header.length == PROTO_HEADER_SIZE
+    assert header.version == PROTO_VERSION
+    assert header.msg_type == MSG_PING
+    assert header.flags == FLAG_NONE
+    assert header.request_id == 42
+    0
+
+[[test]]
+fn test_header_validate_valid() -> i32
+    var header: MessageHeader
+    header_init(@header, MSG_PING, 1)
+
+    let result: i32 = header_validate(@header)
+    assert result == PROTO_OK
+    0
+
+[[test]]
+fn test_header_validate_bad_magic() -> i32
+    var header: MessageHeader
+    header_init(@header, MSG_PING, 1)
+    header.magic = 0x12345678  # Wrong magic
+
+    let result: i32 = header_validate(@header)
+    assert result == PROTO_ERR_PROTOCOL
+    0
+
+[[test]]
+fn test_header_validate_bad_version() -> i32
+    var header: MessageHeader
+    header_init(@header, MSG_PING, 1)
+    header.version = 99  # Wrong version
+
+    let result: i32 = header_validate(@header)
+    assert result == PROTO_ERR_PROTOCOL
+    0
+
+[[test]]
+fn test_header_validate_length_too_small() -> i32
+    var header: MessageHeader
+    header_init(@header, MSG_PING, 1)
+    header.length = 8  # Less than header size
+
+    let result: i32 = header_validate(@header)
+    assert result == PROTO_ERR_PROTOCOL
+    0
+
+[[test]]
+fn test_header_validate_length_too_large() -> i32
+    var header: MessageHeader
+    header_init(@header, MSG_PING, 1)
+    header.length = PROTO_MAX_MESSAGE_SIZE + 1
+
+    let result: i32 = header_validate(@header)
+    assert result == PROTO_ERR_MESSAGE_TOO_LARGE
+    0
+
+# ============================================================================
+# MessageBuffer tests
+# ============================================================================
+
+[[test]]
+fn test_msgbuf_new() -> i32
+    var buf: *MessageBuffer = msgbuf_new(1024)
+    assert buf != null
+    assert buf.capacity == 1024
+    assert buf.length == 0
+
+    msgbuf_free(buf)
+    0
+
+[[test]]
+fn test_msgbuf_start() -> i32
+    var buf: *MessageBuffer = msgbuf_new(1024)
+    msgbuf_start(buf, MSG_INSERT, 123)
+
+    assert buf.header.magic == PROTO_MAGIC
+    assert buf.header.msg_type == MSG_INSERT
+    assert buf.header.request_id == 123
+    assert buf.length == PROTO_HEADER_SIZE
+
+    msgbuf_free(buf)
+    0
+
+[[test]]
+fn test_msgbuf_write_i8() -> i32
+    var buf: *MessageBuffer = msgbuf_new(1024)
+    msgbuf_start(buf, MSG_PING, 1)
+
+    let result: i32 = msgbuf_write_i8(buf, 42)
+    assert result == 0
+    assert buf.length == PROTO_HEADER_SIZE + 1
+
+    msgbuf_free(buf)
+    0
+
+[[test]]
+fn test_msgbuf_write_i32() -> i32
+    var buf: *MessageBuffer = msgbuf_new(1024)
+    msgbuf_start(buf, MSG_PING, 1)
+
+    let result: i32 = msgbuf_write_i32(buf, 0x12345678)
+    assert result == 0
+    assert buf.length == PROTO_HEADER_SIZE + 4
+
+    # Verify big-endian encoding
+    var ptr: *u8 = buf.data + PROTO_HEADER_SIZE
+    assert *(ptr + 0) == 0x12 as u8
+    assert *(ptr + 1) == 0x34 as u8
+    assert *(ptr + 2) == 0x56 as u8
+    assert *(ptr + 3) == 0x78 as u8
+
+    msgbuf_free(buf)
+    0
+
+[[test]]
+fn test_msgbuf_write_i64() -> i32
+    var buf: *MessageBuffer = msgbuf_new(1024)
+    msgbuf_start(buf, MSG_PING, 1)
+
+    let result: i32 = msgbuf_write_i64(buf, 0x123456789ABCDEF0)
+    assert result == 0
+    assert buf.length == PROTO_HEADER_SIZE + 8
+
+    # Verify big-endian encoding
+    var ptr: *u8 = buf.data + PROTO_HEADER_SIZE
+    assert *(ptr + 0) == 0x12 as u8
+    assert *(ptr + 1) == 0x34 as u8
+    assert *(ptr + 2) == 0x56 as u8
+    assert *(ptr + 3) == 0x78 as u8
+    assert *(ptr + 4) == 0x9A as u8
+    assert *(ptr + 5) == 0xBC as u8
+    assert *(ptr + 6) == 0xDE as u8
+    assert *(ptr + 7) == 0xF0 as u8
+
+    msgbuf_free(buf)
+    0
+
+[[test]]
+fn test_msgbuf_write_bytes() -> i32
+    var buf: *MessageBuffer = msgbuf_new(1024)
+    msgbuf_start(buf, MSG_PING, 1)
+
+    var data: [4]u8
+    data[0] = 'A' as u8
+    data[1] = 'B' as u8
+    data[2] = 'C' as u8
+    data[3] = 'D' as u8
+
+    let result: i32 = msgbuf_write_bytes(buf, @data[0], 4)
+    assert result == 0
+    # Length prefix (4 bytes) + data (4 bytes)
+    assert buf.length == PROTO_HEADER_SIZE + 8
+
+    msgbuf_free(buf)
+    0
+
+[[test]]
+fn test_msgbuf_finish() -> i32
+    var buf: *MessageBuffer = msgbuf_new(1024)
+    msgbuf_start(buf, MSG_PING, 42)
+    msgbuf_write_i32(buf, 123)
+    msgbuf_finish(buf)
+
+    # Verify header is written correctly
+    var ptr: *u8 = buf.data
+
+    # Magic bytes (big-endian)
+    assert *(ptr + 0) == 0x4D as u8  # 'M'
+    assert *(ptr + 1) == 0x37 as u8  # '7'
+    assert *(ptr + 2) == 0x53 as u8  # 'S'
+    assert *(ptr + 3) == 0x50 as u8  # 'P'
+
+    # Message type
+    assert *(ptr + 9) == MSG_PING as u8
+
+    # Request ID (big-endian, 42 = 0x0000002A)
+    assert *(ptr + 15) == 42 as u8
+
+    msgbuf_free(buf)
+    0
+
+[[test]]
+fn test_msgbuf_reset() -> i32
+    var buf: *MessageBuffer = msgbuf_new(1024)
+    msgbuf_start(buf, MSG_PING, 1)
+    msgbuf_write_i32(buf, 123)
+
+    let len_before: i32 = buf.length
+    assert len_before > PROTO_HEADER_SIZE
+
+    msgbuf_reset(buf)
+    assert buf.length == 0
+
+    msgbuf_free(buf)
+    0
+
+[[test]]
+fn test_msgbuf_overflow() -> i32
+    # Create a small buffer
+    var buf: *MessageBuffer = msgbuf_new(20)
+    msgbuf_start(buf, MSG_PING, 1)  # Uses 16 bytes
+
+    # Try to write more than capacity
+    let result: i32 = msgbuf_write_i64(buf, 123)  # Needs 8 more bytes
+    assert result == -1  # Should fail
+
+    msgbuf_free(buf)
+    0
+
+# ============================================================================
+# MessageReader tests
+# ============================================================================
+
+[[test]]
+fn test_msgreader_init_valid() -> i32
+    # Build a valid message
+    var buf: *MessageBuffer = msgbuf_new(1024)
+    msgbuf_start(buf, MSG_PING, 42)
+    msgbuf_finish(buf)
+
+    var reader: MessageReader
+    let result: i32 = msgreader_init(@reader, buf.data, buf.length)
+    assert result == PROTO_OK
+    assert reader.header.magic == PROTO_MAGIC
+    assert reader.header.msg_type == MSG_PING
+    assert reader.header.request_id == 42
+    assert reader.pos == PROTO_HEADER_SIZE
+
+    msgbuf_free(buf)
+    0
+
+[[test]]
+fn test_msgreader_init_too_short() -> i32
+    var data: [8]u8
+    memset(@data[0], 0, 8)
+
+    var reader: MessageReader
+    let result: i32 = msgreader_init(@reader, @data[0], 8)
+    assert result == PROTO_ERR_PROTOCOL
+    0
+
+[[test]]
+fn test_msgreader_read_i32() -> i32
+    var buf: *MessageBuffer = msgbuf_new(1024)
+    msgbuf_start(buf, MSG_PING, 1)
+    msgbuf_write_i32(buf, 0x12345678)
+    msgbuf_finish(buf)
+
+    var reader: MessageReader
+    msgreader_init(@reader, buf.data, buf.length)
+
+    let value: i32 = msgreader_read_i32(@reader)
+    assert value == 0x12345678
+
+    msgbuf_free(buf)
+    0
+
+[[test]]
+fn test_msgreader_read_i64() -> i32
+    var buf: *MessageBuffer = msgbuf_new(1024)
+    msgbuf_start(buf, MSG_PING, 1)
+    msgbuf_write_i64(buf, 0x123456789ABCDEF0)
+    msgbuf_finish(buf)
+
+    var reader: MessageReader
+    msgreader_init(@reader, buf.data, buf.length)
+
+    let value: i64 = msgreader_read_i64(@reader)
+    assert value == 0x123456789ABCDEF0
+
+    msgbuf_free(buf)
+    0
+
+[[test]]
+fn test_msgreader_read_bytes() -> i32
+    var buf: *MessageBuffer = msgbuf_new(1024)
+    msgbuf_start(buf, MSG_PING, 1)
+
+    var data: [4]u8
+    data[0] = 'T' as u8
+    data[1] = 'E' as u8
+    data[2] = 'S' as u8
+    data[3] = 'T' as u8
+    msgbuf_write_bytes(buf, @data[0], 4)
+    msgbuf_finish(buf)
+
+    var reader: MessageReader
+    msgreader_init(@reader, buf.data, buf.length)
+
+    var out_len: i32 = 0
+    var result: *u8 = msgreader_read_bytes(@reader, @out_len)
+    assert out_len == 4
+    assert result != null
+    assert *result == 'T' as u8
+    assert *(result + 1) == 'E' as u8
+    assert *(result + 2) == 'S' as u8
+    assert *(result + 3) == 'T' as u8
+
+    msgbuf_free(buf)
+    0
+
+[[test]]
+fn test_msgreader_remaining() -> i32
+    var buf: *MessageBuffer = msgbuf_new(1024)
+    msgbuf_start(buf, MSG_PING, 1)
+    msgbuf_write_i32(buf, 123)
+    msgbuf_write_i32(buf, 456)
+    msgbuf_finish(buf)
+
+    var reader: MessageReader
+    msgreader_init(@reader, buf.data, buf.length)
+
+    assert msgreader_remaining(@reader) == 8  # Two i32s
+
+    msgreader_read_i32(@reader)
+    assert msgreader_remaining(@reader) == 4  # One i32 left
+
+    msgreader_read_i32(@reader)
+    assert msgreader_remaining(@reader) == 0  # Nothing left
+
+    msgbuf_free(buf)
+    0
+
+[[test]]
+fn test_msgreader_msg_type() -> i32
+    var buf: *MessageBuffer = msgbuf_new(1024)
+    msgbuf_start(buf, MSG_INSERT, 1)
+    msgbuf_finish(buf)
+
+    var reader: MessageReader
+    msgreader_init(@reader, buf.data, buf.length)
+
+    assert msgreader_msg_type(@reader) == MSG_INSERT
+
+    msgbuf_free(buf)
+    0
+
+[[test]]
+fn test_msgreader_request_id() -> i32
+    var buf: *MessageBuffer = msgbuf_new(1024)
+    msgbuf_start(buf, MSG_PING, 99999)
+    msgbuf_finish(buf)
+
+    var reader: MessageReader
+    msgreader_init(@reader, buf.data, buf.length)
+
+    assert msgreader_request_id(@reader) == 99999
+
+    msgbuf_free(buf)
+    0
+
+# ============================================================================
+# Roundtrip tests
+# ============================================================================
+
+[[test]]
+fn test_roundtrip_ping_pong() -> i32
+    var buf: *MessageBuffer = msgbuf_new(1024)
+
+    # Build PING
+    build_ping(buf, 123)
+
+    var reader: MessageReader
+    let err: i32 = msgreader_init(@reader, buf.data, buf.length)
+    assert err == PROTO_OK
+    assert msgreader_msg_type(@reader) == MSG_PING
+    assert msgreader_request_id(@reader) == 123
+
+    # Build PONG
+    build_pong(buf, 123)
+
+    msgreader_init(@reader, buf.data, buf.length)
+    assert msgreader_msg_type(@reader) == MSG_PONG
+    assert msgreader_request_id(@reader) == 123
+
+    msgbuf_free(buf)
+    0
+
+[[test]]
+fn test_roundtrip_connect() -> i32
+    var buf: *MessageBuffer = msgbuf_new(1024)
+
+    # Build CONNECT with collection name
+    build_connect(buf, 1, c"users", 5)
+
+    var reader: MessageReader
+    msgreader_init(@reader, buf.data, buf.length)
+    assert msgreader_msg_type(@reader) == MSG_CONNECT
+
+    var len: i32 = 0
+    var name: *u8 = msgreader_read_bytes(@reader, @len)
+    assert len == 5
+    assert *name == 'u' as u8
+
+    msgbuf_free(buf)
+    0
+
+[[test]]
+fn test_roundtrip_connected() -> i32
+    var buf: *MessageBuffer = msgbuf_new(1024)
+
+    build_connected(buf, 1, 0x123456789ABCDEF0)
+
+    var reader: MessageReader
+    msgreader_init(@reader, buf.data, buf.length)
+    assert msgreader_msg_type(@reader) == MSG_CONNECTED
+
+    let session_id: i64 = msgreader_read_i64(@reader)
+    assert session_id == 0x123456789ABCDEF0
+
+    msgbuf_free(buf)
+    0
+
+[[test]]
+fn test_roundtrip_error() -> i32
+    var buf: *MessageBuffer = msgbuf_new(1024)
+
+    build_error(buf, 42, PROTO_ERR_NOT_FOUND, c"Document not found", 18)
+
+    var reader: MessageReader
+    msgreader_init(@reader, buf.data, buf.length)
+    assert msgreader_msg_type(@reader) == MSG_ERROR
+    assert msgreader_request_id(@reader) == 42
+
+    let error_code: i32 = msgreader_read_i32(@reader)
+    assert error_code == PROTO_ERR_NOT_FOUND
+
+    var msg_len: i32 = 0
+    var msg: *u8 = msgreader_read_bytes(@reader, @msg_len)
+    assert msg_len == 18
+    assert *msg == 'D' as u8
+
+    msgbuf_free(buf)
+    0
+
+[[test]]
+fn test_roundtrip_insert() -> i32
+    var buf: *MessageBuffer = msgbuf_new(1024)
+
+    # Simulated serialized document
+    var doc_data: [16]u8
+    memset(@doc_data[0], 0xAB as i32, 16)
+
+    build_insert(buf, 100, @doc_data[0], 16)
+
+    var reader: MessageReader
+    msgreader_init(@reader, buf.data, buf.length)
+    assert msgreader_msg_type(@reader) == MSG_INSERT
+    assert msgreader_request_id(@reader) == 100
+
+    var doc_len: i32 = 0
+    var doc: *u8 = msgreader_read_bytes(@reader, @doc_len)
+    assert doc_len == 16
+    assert *doc == 0xAB as u8
+
+    msgbuf_free(buf)
+    0
+
+[[test]]
+fn test_roundtrip_insert_ok() -> i32
+    var buf: *MessageBuffer = msgbuf_new(1024)
+
+    build_insert_ok(buf, 100, 42)
+
+    var reader: MessageReader
+    msgreader_init(@reader, buf.data, buf.length)
+    assert msgreader_msg_type(@reader) == MSG_INSERT_OK
+
+    let doc_id: i64 = msgreader_read_i64(@reader)
+    assert doc_id == 42
+
+    msgbuf_free(buf)
+    0
+
+[[test]]
+fn test_roundtrip_get() -> i32
+    var buf: *MessageBuffer = msgbuf_new(1024)
+
+    build_get(buf, 5, 12345)
+
+    var reader: MessageReader
+    msgreader_init(@reader, buf.data, buf.length)
+    assert msgreader_msg_type(@reader) == MSG_GET
+
+    let doc_id: i64 = msgreader_read_i64(@reader)
+    assert doc_id == 12345
+
+    msgbuf_free(buf)
+    0
+
+[[test]]
+fn test_roundtrip_delete() -> i32
+    var buf: *MessageBuffer = msgbuf_new(1024)
+
+    build_delete(buf, 7, 999)
+
+    var reader: MessageReader
+    msgreader_init(@reader, buf.data, buf.length)
+    assert msgreader_msg_type(@reader) == MSG_DELETE
+
+    let doc_id: i64 = msgreader_read_i64(@reader)
+    assert doc_id == 999
+
+    msgbuf_free(buf)
+    0
+
+[[test]]
+fn test_roundtrip_txn_begin() -> i32
+    var buf: *MessageBuffer = msgbuf_new(1024)
+
+    build_txn_begin(buf, 1)
+
+    var reader: MessageReader
+    msgreader_init(@reader, buf.data, buf.length)
+    assert msgreader_msg_type(@reader) == MSG_TXN_BEGIN
+    assert msgreader_remaining(@reader) == 0
+
+    msgbuf_free(buf)
+    0
+
+[[test]]
+fn test_roundtrip_txn_begun() -> i32
+    var buf: *MessageBuffer = msgbuf_new(1024)
+
+    build_txn_begun(buf, 1, 555)
+
+    var reader: MessageReader
+    msgreader_init(@reader, buf.data, buf.length)
+    assert msgreader_msg_type(@reader) == MSG_TXN_BEGUN
+
+    let txn_id: i64 = msgreader_read_i64(@reader)
+    assert txn_id == 555
+
+    msgbuf_free(buf)
+    0
+
+[[test]]
+fn test_roundtrip_txn_commit() -> i32
+    var buf: *MessageBuffer = msgbuf_new(1024)
+
+    build_txn_commit(buf, 10)
+
+    var reader: MessageReader
+    msgreader_init(@reader, buf.data, buf.length)
+    assert msgreader_msg_type(@reader) == MSG_TXN_COMMIT
+    assert msgreader_request_id(@reader) == 10
+
+    msgbuf_free(buf)
+    0
+
+[[test]]
+fn test_roundtrip_txn_abort() -> i32
+    var buf: *MessageBuffer = msgbuf_new(1024)
+
+    build_txn_abort(buf, 11)
+
+    var reader: MessageReader
+    msgreader_init(@reader, buf.data, buf.length)
+    assert msgreader_msg_type(@reader) == MSG_TXN_ABORT
+    assert msgreader_request_id(@reader) == 11
+
+    msgbuf_free(buf)
+    0
+
+# ============================================================================
+# Error codes tests
+# ============================================================================
+
+[[test]]
+fn test_error_codes() -> i32
+    assert PROTO_OK == 0
+    assert PROTO_ERR_PROTOCOL == 1
+    assert PROTO_ERR_MESSAGE_TOO_LARGE == 2
+    assert PROTO_ERR_INVALID_MSG_TYPE == 3
+    assert PROTO_ERR_NOT_FOUND == 4
+    assert PROTO_ERR_ALREADY_EXISTS == 5
+    assert PROTO_ERR_INVALID_DOCUMENT == 6
+    assert PROTO_ERR_TXN_CONFLICT == 7
+    assert PROTO_ERR_TXN_NOT_ACTIVE == 8
+    assert PROTO_ERR_INTERNAL == 9
+    assert PROTO_ERR_DISCONNECTED == 10
+    0
+
+# ============================================================================
+# Flag tests
+# ============================================================================
+
+[[test]]
+fn test_flags() -> i32
+    assert FLAG_NONE == 0
+    assert FLAG_COMPRESSED == 1
+    assert FLAG_MORE_DATA == 2
+    assert FLAG_IN_TXN == 4
+    0
+
+[[test]]
+fn test_msgreader_flags() -> i32
+    var buf: *MessageBuffer = msgbuf_new(1024)
+    msgbuf_start(buf, MSG_INSERT, 1)
+    buf.header.flags = FLAG_IN_TXN
+    msgbuf_finish(buf)
+
+    var reader: MessageReader
+    msgreader_init(@reader, buf.data, buf.length)
+    assert msgreader_flags(@reader) == FLAG_IN_TXN
+
+    msgbuf_free(buf)
+    0
+
+# ============================================================================
+# Edge cases
+# ============================================================================
+
+[[test]]
+fn test_empty_bytes() -> i32
+    var buf: *MessageBuffer = msgbuf_new(1024)
+    msgbuf_start(buf, MSG_PING, 1)
+    msgbuf_write_bytes(buf, null, 0)
+    msgbuf_finish(buf)
+
+    var reader: MessageReader
+    msgreader_init(@reader, buf.data, buf.length)
+
+    var len: i32 = 0
+    var data: *u8 = msgreader_read_bytes(@reader, @len)
+    assert len == 0
+    assert data == null
+
+    msgbuf_free(buf)
+    0
+
+[[test]]
+fn test_multiple_writes() -> i32
+    var buf: *MessageBuffer = msgbuf_new(1024)
+    msgbuf_start(buf, MSG_PING, 1)
+    msgbuf_write_i32(buf, 111)
+    msgbuf_write_i64(buf, 222)
+    msgbuf_write_i32(buf, 333)
+    msgbuf_finish(buf)
+
+    var reader: MessageReader
+    msgreader_init(@reader, buf.data, buf.length)
+
+    let v1: i32 = msgreader_read_i32(@reader)
+    let v2: i64 = msgreader_read_i64(@reader)
+    let v3: i32 = msgreader_read_i32(@reader)
+
+    assert v1 == 111
+    assert v2 == 222
+    assert v3 == 333
+
+    msgbuf_free(buf)
+    0
+
+[[test]]
+fn test_null_buffer() -> i32
+    # msgbuf_new with zero should still work
+    var buf: *MessageBuffer = msgbuf_new(0)
+    # Don't crash on free
+    if buf != null
+        msgbuf_free(buf)
+    0
+
+[[test]]
+fn test_buffer_reuse() -> i32
+    var buf: *MessageBuffer = msgbuf_new(1024)
+
+    # First message
+    build_ping(buf, 1)
+    var reader: MessageReader
+    msgreader_init(@reader, buf.data, buf.length)
+    assert msgreader_msg_type(@reader) == MSG_PING
+    assert msgreader_request_id(@reader) == 1
+
+    # Reuse for second message
+    build_get(buf, 2, 999)
+    msgreader_init(@reader, buf.data, buf.length)
+    assert msgreader_msg_type(@reader) == MSG_GET
+    assert msgreader_request_id(@reader) == 2
+
+    msgbuf_free(buf)
+    0

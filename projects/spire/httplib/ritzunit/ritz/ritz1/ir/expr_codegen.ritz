@@ -1,0 +1,272 @@
+# ritz1/ir/expr_codegen.ritz - Expression IR Generation
+#
+# Generates LLVM IR for expressions using the IR builder.
+# This is the core of the code generator - turns AST expressions into SSA IR.
+
+import mem
+import types
+import ir_builder
+
+# =============================================================================
+# Expression Representation (Simplified AST)
+# =============================================================================
+
+# Expression kinds
+const EXPR_INT: i32 = 1
+const EXPR_BOOL: i32 = 2
+const EXPR_VAR: i32 = 3
+const EXPR_BINOP: i32 = 4
+const EXPR_UNOP: i32 = 5
+const EXPR_CALL: i32 = 6
+const EXPR_CAST: i32 = 7
+
+# Binary operators
+const OP_ADD: i32 = 1
+const OP_SUB: i32 = 2
+const OP_MUL: i32 = 3
+const OP_DIV: i32 = 4
+const OP_EQ: i32 = 5
+const OP_NEQ: i32 = 6
+const OP_LT: i32 = 7
+const OP_GT: i32 = 8
+const OP_LEQ: i32 = 9
+const OP_GEQ: i32 = 10
+const OP_AND: i32 = 11
+const OP_OR: i32 = 12
+
+# Unary operators
+const UNOP_NEG: i32 = 1   # -
+const UNOP_NOT: i32 = 2   # !
+const UNOP_DEREF: i32 = 3 # *
+const UNOP_ADDR: i32 = 4  # &
+
+# Simplified expression representation for testing
+struct Expr
+  kind: i32        # EXPR_* constant
+  int_val: i64     # For EXPR_INT
+  bool_val: i32    # For EXPR_BOOL
+  var_id: i32      # For EXPR_VAR (SSA value ID)
+  op: i32          # For EXPR_BINOP/UNOP (operator)
+  left: *Expr      # For EXPR_BINOP
+  right: *Expr     # For EXPR_BINOP
+  operand: *Expr   # For EXPR_UNOP, EXPR_CAST
+  ty: i32          # Type (TY_* constant)
+  target_ty: i32   # For EXPR_CAST
+
+# =============================================================================
+# Expression IR Generation
+# =============================================================================
+
+# Generate IR for an expression, returning the SSA value ID
+fn emit_expr(b: *IRBuilder, e: *Expr) -> i32
+  let kind: i32 = e.kind
+
+  if kind == EXPR_INT
+    # Integer literal: just use the value directly (no instruction needed)
+    # Return a magic ID indicating this is an immediate value
+    # Real codegen would track this differently
+    return -1  # Placeholder for "immediate value"
+
+  else if kind == EXPR_BOOL
+    # Boolean literal: i1 immediate
+    return -1  # Placeholder
+
+  else if kind == EXPR_VAR
+    # Variable reference: load from alloca
+    let var_ptr: i32 = e.var_id  # The alloca pointer
+    let result: i32 = ir_fresh_id(b)
+    ir_emit_load(b, result, e.ty, var_ptr)
+    return result
+
+  else if kind == EXPR_BINOP
+    # Binary operation
+    let left_val: i32 = emit_expr(b, e.left)
+    let right_val: i32 = emit_expr(b, e.right)
+    let result: i32 = ir_fresh_id(b)
+    let op_kind: i32 = e.op
+
+    if op_kind == OP_ADD
+      ir_emit_binop(b, "add", e.ty, result, left_val, right_val)
+    else if op_kind == OP_SUB
+      ir_emit_binop(b, "sub", e.ty, result, left_val, right_val)
+    else if op_kind == OP_MUL
+      ir_emit_binop(b, "mul", e.ty, result, left_val, right_val)
+    else if op_kind == OP_DIV
+      ir_emit_binop(b, "sdiv", e.ty, result, left_val, right_val)
+    else if op_kind == OP_EQ
+      ir_emit_icmp(b, "eq", e.ty, result, left_val, right_val)
+    else if op_kind == OP_NEQ
+      ir_emit_icmp(b, "ne", e.ty, result, left_val, right_val)
+    else if op_kind == OP_LT
+      ir_emit_icmp(b, "slt", e.ty, result, left_val, right_val)
+    else if op_kind == OP_GT
+      ir_emit_icmp(b, "sgt", e.ty, result, left_val, right_val)
+    else if op_kind == OP_LEQ
+      ir_emit_icmp(b, "sle", e.ty, result, left_val, right_val)
+    else if op_kind == OP_GEQ
+      ir_emit_icmp(b, "sge", e.ty, result, left_val, right_val)
+    else if op_kind == OP_AND
+      ir_emit_binop(b, "and", TY_BOOL, result, left_val, right_val)
+    else if op_kind == OP_OR
+      ir_emit_binop(b, "or", TY_BOOL, result, left_val, right_val)
+
+    return result
+
+  else if kind == EXPR_UNOP
+    let operand_val: i32 = emit_expr(b, e.operand)
+    let result: i32 = ir_fresh_id(b)
+    let op_kind: i32 = e.op
+
+    if op_kind == UNOP_NEG
+      # Negate: 0 - x
+      ir_emit_binop_imm(b, "sub", e.ty, result, 0, 0)  # TODO: fix this
+    else if op_kind == UNOP_NOT
+      # Logical not: xor with 1
+      ir_emit_binop_imm(b, "xor", TY_BOOL, result, operand_val, 1)
+
+    return result
+
+  # Unknown expression kind
+  return 0
+
+# =============================================================================
+# Tests
+# =============================================================================
+
+@test
+fn test_emit_var_load()
+  let arena_buf: *i8 = __builtin_alloca(8192) as *i8
+  var arena: Arena = Arena { base: arena_buf, size: 8192, used: 0 }
+
+  let b: *IRBuilder = ir_builder_new(&arena, 2048)
+  b.indent = 1
+
+  # Create a variable reference expression: load from %1 (an alloca)
+  var e: Expr = Expr {
+    kind: EXPR_VAR,
+    int_val: 0,
+    bool_val: 0,
+    var_id: 1,   # SSA ID of the alloca
+    op: 0,
+    left: null,
+    right: null,
+    operand: null,
+    ty: TY_I32,
+    target_ty: 0
+  }
+
+  let result: i32 = emit_expr(b, &e)
+
+  let output: *i8 = ir_builder_get_output(b)
+  assert str_contains(output, "load i32, ptr %1") == 1, "should emit load from %1"
+  assert result == 1, "should return fresh SSA ID"
+
+@test
+fn test_emit_binop_add()
+  let arena_buf: *i8 = __builtin_alloca(8192) as *i8
+  var arena: Arena = Arena { base: arena_buf, size: 8192, used: 0 }
+
+  let b: *IRBuilder = ir_builder_new(&arena, 2048)
+  b.indent = 1
+
+  # Create two variable expressions
+  var left: Expr = Expr { kind: EXPR_VAR, int_val: 0, bool_val: 0, var_id: 1, op: 0, left: null, right: null, operand: null, ty: TY_I32, target_ty: 0 }
+  var right: Expr = Expr { kind: EXPR_VAR, int_val: 0, bool_val: 0, var_id: 2, op: 0, left: null, right: null, operand: null, ty: TY_I32, target_ty: 0 }
+
+  # Create binop: left + right
+  var e: Expr = Expr {
+    kind: EXPR_BINOP,
+    int_val: 0,
+    bool_val: 0,
+    var_id: 0,
+    op: OP_ADD,
+    left: &left,
+    right: &right,
+    operand: null,
+    ty: TY_I32,
+    target_ty: 0
+  }
+
+  let result: i32 = emit_expr(b, &e)
+
+  let output: *i8 = ir_builder_get_output(b)
+  assert str_contains(output, "load i32, ptr %1") == 1, "should load left operand"
+  assert str_contains(output, "load i32, ptr %2") == 1, "should load right operand"
+  assert str_contains(output, "add i32") == 1, "should emit add instruction"
+
+@test
+fn test_emit_icmp()
+  let arena_buf: *i8 = __builtin_alloca(8192) as *i8
+  var arena: Arena = Arena { base: arena_buf, size: 8192, used: 0 }
+
+  let b: *IRBuilder = ir_builder_new(&arena, 2048)
+  b.indent = 1
+
+  var left: Expr = Expr { kind: EXPR_VAR, int_val: 0, bool_val: 0, var_id: 1, op: 0, left: null, right: null, operand: null, ty: TY_I32, target_ty: 0 }
+  var right: Expr = Expr { kind: EXPR_VAR, int_val: 0, bool_val: 0, var_id: 2, op: 0, left: null, right: null, operand: null, ty: TY_I32, target_ty: 0 }
+
+  # Create comparison: left < right
+  var e: Expr = Expr {
+    kind: EXPR_BINOP,
+    int_val: 0,
+    bool_val: 0,
+    var_id: 0,
+    op: OP_LT,
+    left: &left,
+    right: &right,
+    operand: null,
+    ty: TY_I32,
+    target_ty: 0
+  }
+
+  let result: i32 = emit_expr(b, &e)
+
+  let output: *i8 = ir_builder_get_output(b)
+  assert str_contains(output, "icmp slt i32") == 1, "should emit icmp slt"
+
+@test
+fn test_emit_unop_not()
+  let arena_buf: *i8 = __builtin_alloca(8192) as *i8
+  var arena: Arena = Arena { base: arena_buf, size: 8192, used: 0 }
+
+  let b: *IRBuilder = ir_builder_new(&arena, 2048)
+  b.indent = 1
+
+  var operand: Expr = Expr { kind: EXPR_VAR, int_val: 0, bool_val: 0, var_id: 1, op: 0, left: null, right: null, operand: null, ty: TY_BOOL, target_ty: 0 }
+
+  # Create unary op: !operand
+  var e: Expr = Expr {
+    kind: EXPR_UNOP,
+    int_val: 0,
+    bool_val: 0,
+    var_id: 0,
+    op: UNOP_NOT,
+    left: null,
+    right: null,
+    operand: &operand,
+    ty: TY_BOOL,
+    target_ty: 0
+  }
+
+  let result: i32 = emit_expr(b, &e)
+
+  let output: *i8 = ir_builder_get_output(b)
+  assert str_contains(output, "load i1, ptr %1") == 1, "should load operand"
+  assert str_contains(output, "xor i1") == 1, "should emit xor for not"
+
+# Helper function
+fn str_contains(haystack: *i8, needle: *i8) -> i32
+  var h: i32 = 0
+  while *(haystack + h) != 0
+    var n: i32 = 0
+    var matched: i32 = 1
+    while *(needle + n) != 0
+      let ch: i32 = *(haystack + h + n) as i32 & 255
+      let cn: i32 = *(needle + n) as i32 & 255
+      if ch != cn
+        matched = 0
+      n = n + 1
+    if matched == 1
+      return 1
+    h = h + 1
+  0

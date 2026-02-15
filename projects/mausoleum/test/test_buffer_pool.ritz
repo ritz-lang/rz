@@ -1,0 +1,390 @@
+# test/test_buffer_pool.ritz - Tests for buffer pool manager
+#
+# Tests for buffer pool creation, page fetching, pinning, and eviction
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+import ritzlib.memory
+
+import lib.m7m_types
+import lib.page
+import lib.buffer_pool
+
+# ============================================================================
+# Buffer Pool Creation Tests
+# ============================================================================
+
+[[test]]
+fn test_buffer_pool_new() -> i32
+    var pool: *BufferPool = buffer_pool_new(16)
+    if pool == null
+        return 1
+
+    buffer_pool_destroy(pool)
+    0
+
+[[test]]
+fn test_buffer_pool_default() -> i32
+    var pool: *BufferPool = buffer_pool_default()
+    if pool == null
+        return 1
+
+    buffer_pool_destroy(pool)
+    0
+
+[[test]]
+fn test_buffer_pool_new_invalid() -> i32
+    # Zero frames
+    var pool1: *BufferPool = buffer_pool_new(0)
+    if pool1 != null
+        return 1
+
+    # Negative frames
+    var pool2: *BufferPool = buffer_pool_new(-1)
+    if pool2 != null
+        return 2
+
+    0
+
+# ============================================================================
+# Page Allocation Tests (in-memory only, no file)
+# ============================================================================
+
+[[test]]
+fn test_buffer_pool_alloc_single() -> i32
+    var pool: *BufferPool = buffer_pool_new(8)
+    if pool == null
+        return 1
+
+    var page: *Page = buffer_pool_alloc(pool, PAGE_MAGIC_HEAP)
+    if page == null
+        buffer_pool_destroy(pool)
+        return 2
+
+    # Check page is initialized
+    if page_type(page) != PAGE_MAGIC_HEAP
+        buffer_pool_destroy(pool)
+        return 3
+
+    # Get page ID
+    var page_id: i64 = buffer_pool_page_id(pool, page)
+    if page_id != 0
+        buffer_pool_destroy(pool)
+        return 4
+
+    buffer_pool_unpin(pool, page_id, 0)
+    buffer_pool_destroy(pool)
+    0
+
+[[test]]
+fn test_buffer_pool_alloc_multiple() -> i32
+    var pool: *BufferPool = buffer_pool_new(8)
+    if pool == null
+        return 1
+
+    var page1: *Page = buffer_pool_alloc(pool, PAGE_MAGIC_HEAP)
+    var page2: *Page = buffer_pool_alloc(pool, PAGE_MAGIC_BTREE)
+    var page3: *Page = buffer_pool_alloc(pool, PAGE_MAGIC_META)
+
+    if page1 == null or page2 == null or page3 == null
+        buffer_pool_destroy(pool)
+        return 2
+
+    var id1: i64 = buffer_pool_page_id(pool, page1)
+    var id2: i64 = buffer_pool_page_id(pool, page2)
+    var id3: i64 = buffer_pool_page_id(pool, page3)
+
+    # Page IDs should be sequential
+    if id1 != 0 or id2 != 1 or id3 != 2
+        buffer_pool_destroy(pool)
+        return 3
+
+    buffer_pool_unpin(pool, id1, 0)
+    buffer_pool_unpin(pool, id2, 0)
+    buffer_pool_unpin(pool, id3, 0)
+    buffer_pool_destroy(pool)
+    0
+
+[[test]]
+fn test_buffer_pool_alloc_fills_pool() -> i32
+    var pool: *BufferPool = buffer_pool_new(4)
+    if pool == null
+        return 1
+
+    # Allocate 4 pages (fills the pool)
+    for i in 0..4
+        var page: *Page = buffer_pool_alloc(pool, PAGE_MAGIC_HEAP)
+        if page == null
+            buffer_pool_destroy(pool)
+            return 2
+
+    # All pages are pinned, so 5th allocation should fail
+    var page5: *Page = buffer_pool_alloc(pool, PAGE_MAGIC_HEAP)
+    if page5 != null
+        buffer_pool_destroy(pool)
+        return 3
+
+    buffer_pool_destroy(pool)
+    0
+
+[[test]]
+fn test_buffer_pool_unpin_allows_eviction() -> i32
+    var pool: *BufferPool = buffer_pool_new(4)
+    if pool == null
+        return 1
+
+    # Allocate 4 pages
+    var page_ids: [4]i64
+    for i in 0..4
+        var page: *Page = buffer_pool_alloc(pool, PAGE_MAGIC_HEAP)
+        if page == null
+            buffer_pool_destroy(pool)
+            return 2
+        page_ids[i] = buffer_pool_page_id(pool, page)
+
+    # Unpin one page
+    buffer_pool_unpin(pool, page_ids[0], 0)
+
+    # Now we can allocate another (evicts the unpinned page)
+    var page5: *Page = buffer_pool_alloc(pool, PAGE_MAGIC_HEAP)
+    if page5 == null
+        buffer_pool_destroy(pool)
+        return 3
+
+    buffer_pool_destroy(pool)
+    0
+
+# ============================================================================
+# Statistics Tests
+# ============================================================================
+
+[[test]]
+fn test_buffer_pool_stats_initial() -> i32
+    var pool: *BufferPool = buffer_pool_new(8)
+    if pool == null
+        return 1
+
+    if buffer_pool_hit_count(pool) != 0
+        buffer_pool_destroy(pool)
+        return 2
+
+    if buffer_pool_miss_count(pool) != 0
+        buffer_pool_destroy(pool)
+        return 3
+
+    if buffer_pool_eviction_count(pool) != 0
+        buffer_pool_destroy(pool)
+        return 4
+
+    buffer_pool_destroy(pool)
+    0
+
+[[test]]
+fn test_buffer_pool_eviction_stats() -> i32
+    var pool: *BufferPool = buffer_pool_new(2)
+    if pool == null
+        return 1
+
+    # Allocate 2 pages
+    var page1: *Page = buffer_pool_alloc(pool, PAGE_MAGIC_HEAP)
+    var page2: *Page = buffer_pool_alloc(pool, PAGE_MAGIC_HEAP)
+    var id1: i64 = buffer_pool_page_id(pool, page1)
+    var id2: i64 = buffer_pool_page_id(pool, page2)
+
+    # Unpin both
+    buffer_pool_unpin(pool, id1, 0)
+    buffer_pool_unpin(pool, id2, 0)
+
+    # Allocate a third - should evict one
+    var page3: *Page = buffer_pool_alloc(pool, PAGE_MAGIC_HEAP)
+    if page3 == null
+        buffer_pool_destroy(pool)
+        return 2
+
+    # Check eviction happened
+    if buffer_pool_eviction_count(pool) != 1
+        buffer_pool_destroy(pool)
+        return 3
+
+    buffer_pool_destroy(pool)
+    0
+
+# ============================================================================
+# Dirty Page Tests
+# ============================================================================
+
+[[test]]
+fn test_buffer_pool_dirty_tracking() -> i32
+    var pool: *BufferPool = buffer_pool_new(4)
+    if pool == null
+        return 1
+
+    var page: *Page = buffer_pool_alloc(pool, PAGE_MAGIC_HEAP)
+    var page_id: i64 = buffer_pool_page_id(pool, page)
+
+    # Modify the page
+    page.data[0] = 42
+
+    # Unpin as dirty
+    buffer_pool_unpin(pool, page_id, 1)
+
+    # Fetch again - should get same page with our data
+    var page2: *Page = buffer_pool_fetch(pool, page_id)
+    if page2 == null
+        buffer_pool_destroy(pool)
+        return 2
+
+    if page2.data[0] != 42
+        buffer_pool_destroy(pool)
+        return 3
+
+    buffer_pool_unpin(pool, page_id, 0)
+    buffer_pool_destroy(pool)
+    0
+
+# ============================================================================
+# Fetch Tests (in-memory)
+# ============================================================================
+
+[[test]]
+fn test_buffer_pool_fetch_allocated() -> i32
+    var pool: *BufferPool = buffer_pool_new(4)
+    if pool == null
+        return 1
+
+    var page: *Page = buffer_pool_alloc(pool, PAGE_MAGIC_HEAP)
+    var page_id: i64 = buffer_pool_page_id(pool, page)
+    page.data[0] = 99
+
+    # Unpin
+    buffer_pool_unpin(pool, page_id, 1)
+
+    # Fetch the same page
+    var fetched: *Page = buffer_pool_fetch(pool, page_id)
+    if fetched == null
+        buffer_pool_destroy(pool)
+        return 2
+
+    # Should have our data
+    if fetched.data[0] != 99
+        buffer_pool_destroy(pool)
+        return 3
+
+    # Check cache hit
+    if buffer_pool_hit_count(pool) != 1
+        buffer_pool_destroy(pool)
+        return 4
+
+    buffer_pool_unpin(pool, page_id, 0)
+    buffer_pool_destroy(pool)
+    0
+
+[[test]]
+fn test_buffer_pool_fetch_null_pool() -> i32
+    var page: *Page = buffer_pool_fetch(null, 0)
+    if page != null
+        return 1
+    0
+
+[[test]]
+fn test_buffer_pool_fetch_negative_id() -> i32
+    var pool: *BufferPool = buffer_pool_new(4)
+    if pool == null
+        return 1
+
+    var page: *Page = buffer_pool_fetch(pool, -1)
+    if page != null
+        buffer_pool_destroy(pool)
+        return 2
+
+    buffer_pool_destroy(pool)
+    0
+
+# ============================================================================
+# LRU Eviction Order Tests
+# ============================================================================
+
+[[test]]
+fn test_buffer_pool_lru_eviction_order() -> i32
+    var pool: *BufferPool = buffer_pool_new(2)
+    if pool == null
+        return 1
+
+    # Allocate page 0
+    var page0: *Page = buffer_pool_alloc(pool, PAGE_MAGIC_HEAP)
+    var id0: i64 = buffer_pool_page_id(pool, page0)
+    page0.data[0] = 10
+    buffer_pool_unpin(pool, id0, 1)
+
+    # Allocate page 1
+    var page1: *Page = buffer_pool_alloc(pool, PAGE_MAGIC_HEAP)
+    var id1: i64 = buffer_pool_page_id(pool, page1)
+    page1.data[0] = 20
+    buffer_pool_unpin(pool, id1, 1)
+
+    # Re-fetch page 0 (makes it most recently used)
+    var refetched0: *Page = buffer_pool_fetch(pool, id0)
+    buffer_pool_unpin(pool, id0, 0)
+
+    # Now allocate page 2 - should evict page 1 (LRU)
+    var page2: *Page = buffer_pool_alloc(pool, PAGE_MAGIC_HEAP)
+    if page2 == null
+        buffer_pool_destroy(pool)
+        return 2
+
+    # Page 0 should still be in cache (was MRU)
+    var check0: *Page = buffer_pool_fetch(pool, id0)
+    if check0 == null
+        buffer_pool_destroy(pool)
+        return 3
+
+    if check0.data[0] != 10
+        buffer_pool_destroy(pool)
+        return 4
+
+    buffer_pool_destroy(pool)
+    0
+
+# ============================================================================
+# Pin Count Tests
+# ============================================================================
+
+[[test]]
+fn test_buffer_pool_multiple_pins() -> i32
+    var pool: *BufferPool = buffer_pool_new(2)
+    if pool == null
+        return 1
+
+    # Allocate a page
+    var page: *Page = buffer_pool_alloc(pool, PAGE_MAGIC_HEAP)
+    var page_id: i64 = buffer_pool_page_id(pool, page)
+
+    # Fetch it again (should increase pin count)
+    var page2: *Page = buffer_pool_fetch(pool, page_id)
+
+    # Both should point to the same page
+    if page != page2
+        buffer_pool_destroy(pool)
+        return 2
+
+    # Unpin once
+    buffer_pool_unpin(pool, page_id, 0)
+
+    # Allocate another page - first page still pinned, so use other frame
+    var page3: *Page = buffer_pool_alloc(pool, PAGE_MAGIC_HEAP)
+    var id3: i64 = buffer_pool_page_id(pool, page3)
+    buffer_pool_unpin(pool, id3, 0)
+
+    # Try to allocate third - both frames occupied, one pinned
+    # Unpin the first completely
+    buffer_pool_unpin(pool, page_id, 0)
+
+    # Now allocation should work
+    var page4: *Page = buffer_pool_alloc(pool, PAGE_MAGIC_HEAP)
+    if page4 == null
+        buffer_pool_destroy(pool)
+        return 3
+
+    buffer_pool_destroy(pool)
+    0

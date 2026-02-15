@@ -1,0 +1,396 @@
+# test/test_zeus_client.ritz - Tests for Zeus client adapter
+#
+# TDD: These tests define the expected behavior of the Zeus client
+# that connects to the Zeus daemon to receive worker shm fds.
+#
+# Protocol:
+#   1. Client connects to Zeus daemon via Unix socket
+#   2. Daemon sends worker info + shm fd via SCM_RIGHTS
+#   3. Client attaches to shm and uses ring buffers for IPC
+#   4. Socket serves as wakeup mechanism when rings are empty
+
+import ritzlib.sys
+import ritzlib.io
+import helpers
+
+# Import our library
+import lib.zeus_client
+import lib.shm
+import lib.control
+import lib.ring
+import lib.arena
+
+# ============================================================================
+# Client Configuration Tests
+# ============================================================================
+
+[[test]]
+fn test_zeus_client_config_defaults() -> i32
+    var cfg: ZeusClientConfig
+    zeus_client_config_default(@cfg)
+
+    # Check reasonable defaults
+    let result: i32 = assert_eq_i32(cfg.max_workers, 16)
+    if result != 0
+        return result
+
+    let result2: i32 = assert_eq_i32(cfg.connect_timeout_ms, 5000)
+    if result2 != 0
+        return result2
+
+    return 0
+
+[[test]]
+fn test_zeus_client_config_custom() -> i32
+    var cfg: ZeusClientConfig
+    zeus_client_config_init(@cfg, 8, 10000)
+
+    let result: i32 = assert_eq_i32(cfg.max_workers, 8)
+    if result != 0
+        return result
+
+    let result2: i32 = assert_eq_i32(cfg.connect_timeout_ms, 10000)
+    if result2 != 0
+        return result2
+
+    return 0
+
+# ============================================================================
+# Client Context Tests
+# ============================================================================
+
+[[test]]
+fn test_zeus_client_init_destroy() -> i32
+    var cfg: ZeusClientConfig
+    zeus_client_config_default(@cfg)
+
+    var client: ZeusClient
+    let result: i32 = zeus_client_init(@client, @cfg)
+    if result != 0
+        "FAIL: zeus_client_init failed with code {result}\n"
+        return 1
+
+    # Check initial state
+    let result2: i32 = assert_eq_i32(client.state, ZEUS_CLIENT_STATE_INIT)
+    if result2 != 0
+        zeus_client_destroy(@client)
+        return result2
+
+    let result3: i32 = assert_eq_i32(client.socket_fd, -1)
+    if result3 != 0
+        zeus_client_destroy(@client)
+        return result3
+
+    let result4: i32 = assert_eq_i32(client.worker_count, 0)
+    if result4 != 0
+        zeus_client_destroy(@client)
+        return result4
+
+    zeus_client_destroy(@client)
+    return 0
+
+# ============================================================================
+# Worker Handle Tests
+# ============================================================================
+
+[[test]]
+fn test_worker_handle_init() -> i32
+    var handle: WorkerHandle
+    worker_handle_init(@handle)
+
+    let result: i32 = assert_eq_i32(handle.slot_idx, -1)
+    if result != 0
+        return result
+
+    let result2: i32 = assert_eq_i32(handle.shm_fd, -1)
+    if result2 != 0
+        return result2
+
+    let result3: i32 = assert_null(handle.shm_base as *u8)
+    if result3 != 0
+        return result3
+
+    return 0
+
+# ============================================================================
+# Message Protocol Tests
+# ============================================================================
+
+[[test]]
+fn test_client_message_encode() -> i32
+    var msg: ClientMessage
+    client_message_init(@msg, CLIENT_MSG_HELLO)
+
+    let result: i32 = assert_eq_i32(msg.msg_type as i32, CLIENT_MSG_HELLO as i32)
+    if result != 0
+        return result
+
+    let result2: i32 = assert_eq_i32(msg.version as i32, ZEUS_PROTOCOL_VERSION as i32)
+    if result2 != 0
+        return result2
+
+    return 0
+
+[[test]]
+fn test_daemon_message_parse() -> i32
+    # Simulate a daemon response message
+    var msg: DaemonMessage
+    msg.msg_type = DAEMON_MSG_WORKER_INFO
+    msg.payload_len = 8
+    msg.worker_idx = 0
+    msg.shm_size = 2097152
+
+    let result: i32 = assert_eq_i32(msg.msg_type as i32, DAEMON_MSG_WORKER_INFO as i32)
+    if result != 0
+        return result
+
+    let result2: i32 = assert_eq_i64(msg.shm_size, 2097152)
+    if result2 != 0
+        return result2
+
+    return 0
+
+# ============================================================================
+# Request/Response Round-trip Tests (using existing valet.ritz logic)
+# ============================================================================
+
+[[test]]
+fn test_client_can_use_attached_shm() -> i32
+    # Create a fake shm region to simulate what daemon would send
+    var shm_cfg: ShmConfig
+    shm_config_default(@shm_cfg)
+
+    var region: ShmRegion
+    let result: i32 = shm_create(@region, @shm_cfg)
+    if result != 0
+        "FAIL: shm_create failed\n"
+        return 1
+
+    # Simulate client attaching (normally via received fd)
+    var client_region: ShmRegion
+    let attach_result: i32 = shm_attach(@client_region, region.fd, region.size)
+    if attach_result != 0
+        "FAIL: shm_attach failed\n"
+        shm_destroy(@region)
+        return 1
+
+    # Client can access control block
+    let cb: *ControlBlock = shm_get_control_block(@client_region)
+    let result2: i32 = assert_not_null(cb as *u8)
+    if result2 != 0
+        shm_detach(@client_region)
+        shm_destroy(@region)
+        return result2
+
+    # Client can access request ring
+    let req_ring: *RequestSlot = shm_get_request_ring(@client_region)
+    let result3: i32 = assert_not_null(req_ring as *u8)
+    if result3 != 0
+        shm_detach(@client_region)
+        shm_destroy(@region)
+        return result3
+
+    # Client can write a request
+    let ring_idx: i64 = control_block_slot_index(cb, cb.req_write_idx)
+    let slot: *RequestSlot = req_ring + ring_idx
+    request_slot_init(slot)
+    slot.id = 1
+    request_slot_set_method(slot, HTTP_METHOD_GET)
+    control_block_req_write_inc(cb)
+
+    # Verify request is readable
+    if control_block_req_empty(cb) != 0
+        "FAIL: request ring should not be empty\n"
+        shm_detach(@client_region)
+        shm_destroy(@region)
+        return 1
+
+    shm_detach(@client_region)
+    shm_destroy(@region)
+    return 0
+
+# ============================================================================
+# Worker Selection Tests
+# ============================================================================
+
+[[test]]
+fn test_client_select_worker_none_available() -> i32
+    var cfg: ZeusClientConfig
+    zeus_client_config_default(@cfg)
+
+    var client: ZeusClient
+    zeus_client_init(@client, @cfg)
+
+    # No workers registered, should return -1
+    let idx: i32 = zeus_client_select_worker(@client)
+    let result: i32 = assert_eq_i32(idx, -1)
+
+    zeus_client_destroy(@client)
+    return result
+
+# ============================================================================
+# Request ID Generation Tests
+# ============================================================================
+
+[[test]]
+fn test_client_request_id_generation() -> i32
+    var cfg: ZeusClientConfig
+    zeus_client_config_default(@cfg)
+
+    var client: ZeusClient
+    zeus_client_init(@client, @cfg)
+
+    let id1: u64 = zeus_client_next_request_id(@client)
+    let id2: u64 = zeus_client_next_request_id(@client)
+    let id3: u64 = zeus_client_next_request_id(@client)
+
+    # IDs should be monotonically increasing
+    let result: i32 = assert_eq_u64(id1, 1)
+    if result != 0
+        zeus_client_destroy(@client)
+        return result
+
+    let result2: i32 = assert_eq_u64(id2, 2)
+    if result2 != 0
+        zeus_client_destroy(@client)
+        return result2
+
+    let result3: i32 = assert_eq_u64(id3, 3)
+    if result3 != 0
+        zeus_client_destroy(@client)
+        return result3
+
+    zeus_client_destroy(@client)
+    return 0
+
+# ============================================================================
+# SCM_RIGHTS Integration Tests
+# ============================================================================
+
+[[test]]
+fn test_scm_rights_message_layout() -> i32
+    # Test that SCM_RIGHTS message structures are correctly sized
+    var cmsg: CmsgFd
+    cmsg_fd_init(@cmsg, -1)
+
+    # cmsg_len should account for header + fd
+    # CMSG_LEN(sizeof(int)) = CMSG_ALIGN(sizeof(struct cmsghdr)) + sizeof(int)
+    # On x86-64: 16 + 4 = 20
+    let result: i32 = assert_ge(cmsg.cmsg_len as i32, 20)
+    if result != 0
+        return result
+
+    return 0
+
+# ============================================================================
+# SCM_RIGHTS Actual FD Passing Test
+# ============================================================================
+
+[[test]]
+fn test_scm_rights_send_recv_fd() -> i32
+    # Create a socketpair for testing
+    var sv: [2]i32
+    let sp_result: i32 = sys_socketpair(1, 1, 0, @sv[0])  # AF_UNIX, SOCK_STREAM
+    if sp_result < 0
+        "FAIL: socketpair failed\n"
+        return 1
+
+    # Create shm region to get an fd to send
+    var shm_cfg: ShmConfig
+    shm_config_default(@shm_cfg)
+
+    var region: ShmRegion
+    let create_result: i32 = shm_create(@region, @shm_cfg)
+    if create_result < 0
+        "FAIL: shm_create failed\n"
+        sys_close(sv[0])
+        sys_close(sv[1])
+        return 1
+
+    # Write magic byte to the shm region
+    let test_data: *u8 = region.base
+    *test_data = 0x42  # Magic byte
+
+    # Send the fd via SCM_RIGHTS
+    let send_result: i32 = scm_rights_send_fd(sv[0], region.fd)
+    if send_result < 0
+        "FAIL: scm_rights_send_fd failed\n"
+        shm_destroy(@region)
+        sys_close(sv[0])
+        sys_close(sv[1])
+        return 1
+
+    # Receive the fd via SCM_RIGHTS
+    var received_fd: i32 = -1
+    let recv_result: i32 = scm_rights_recv_fd(sv[1], @received_fd)
+    if recv_result < 0
+        "FAIL: scm_rights_recv_fd failed\n"
+        shm_destroy(@region)
+        sys_close(sv[0])
+        sys_close(sv[1])
+        return 1
+
+    # Verify we got a valid fd
+    if received_fd < 0
+        "FAIL: received_fd is invalid\n"
+        shm_destroy(@region)
+        sys_close(sv[0])
+        sys_close(sv[1])
+        return 1
+
+    # Map the received fd and check the magic byte
+    let recv_data: *u8 = sys_mmap(0, region.size, PROT_READ, MAP_SHARED, received_fd, 0)
+    if recv_data == (-1 as *u8)
+        "FAIL: mmap of received fd failed\n"
+        sys_close(received_fd)
+        shm_destroy(@region)
+        sys_close(sv[0])
+        sys_close(sv[1])
+        return 1
+
+    if *recv_data != 0x42
+        "FAIL: magic byte mismatch\n"
+        sys_munmap(recv_data, region.size)
+        sys_close(received_fd)
+        shm_destroy(@region)
+        sys_close(sv[0])
+        sys_close(sv[1])
+        return 1
+
+    # Cleanup
+    sys_munmap(recv_data, region.size)
+    sys_close(received_fd)
+    shm_destroy(@region)
+    sys_close(sv[0])
+    sys_close(sv[1])
+    return 0
+
+# ============================================================================
+# Connection State Tests
+# ============================================================================
+
+[[test]]
+fn test_client_state_transitions() -> i32
+    var cfg: ZeusClientConfig
+    zeus_client_config_default(@cfg)
+
+    var client: ZeusClient
+    zeus_client_init(@client, @cfg)
+
+    # Initial state
+    let result: i32 = assert_eq_i32(client.state, ZEUS_CLIENT_STATE_INIT)
+    if result != 0
+        zeus_client_destroy(@client)
+        return result
+
+    # Manually set connected (normally done by connect)
+    client.state = ZEUS_CLIENT_STATE_CONNECTED
+
+    let result2: i32 = assert_eq_i32(client.state, ZEUS_CLIENT_STATE_CONNECTED)
+    if result2 != 0
+        zeus_client_destroy(@client)
+        return result2
+
+    zeus_client_destroy(@client)
+    return 0
+

@@ -1,0 +1,364 @@
+# lib/h3_frame.ritz - HTTP/3 Frame Types (RFC 9114)
+#
+# HTTP/3 frames are simpler than HTTP/2:
+# - Variable-length type and length fields (QUIC varints)
+# - No padding or priority in frames
+# - Different frame types for QUIC transport
+
+import ritzlib.span
+import lib.quic_varint
+
+# ============================================================================
+# Frame Type Constants (RFC 9114 Section 7.2)
+# ============================================================================
+
+pub const H3_FRAME_DATA: i64 = 0x00
+pub const H3_FRAME_HEADERS: i64 = 0x01
+pub const H3_FRAME_CANCEL_PUSH: i64 = 0x03
+pub const H3_FRAME_SETTINGS: i64 = 0x04
+pub const H3_FRAME_PUSH_PROMISE: i64 = 0x05
+pub const H3_FRAME_GOAWAY: i64 = 0x07
+pub const H3_FRAME_MAX_PUSH_ID: i64 = 0x0D
+
+# Reserved frame types (must be ignored)
+pub const H3_FRAME_RESERVED_MIN: i64 = 0x21
+# Reserved frames follow pattern: 0x1f * N + 0x21
+
+# ============================================================================
+# Settings Identifiers (RFC 9114 Section 7.2.4.1)
+# ============================================================================
+
+pub const H3_SETTINGS_QPACK_MAX_TABLE_CAPACITY: i64 = 0x01
+pub const H3_SETTINGS_MAX_FIELD_SECTION_SIZE: i64 = 0x06
+pub const H3_SETTINGS_QPACK_BLOCKED_STREAMS: i64 = 0x07
+
+# Reserved settings (MUST NOT be sent, grease)
+pub const H3_SETTINGS_RESERVED_MIN: i64 = 0x21
+
+# ============================================================================
+# Error Codes (RFC 9114 Section 8.1)
+# ============================================================================
+
+pub const H3_NO_ERROR: i64 = 0x100
+pub const H3_GENERAL_PROTOCOL_ERROR: i64 = 0x101
+pub const H3_INTERNAL_ERROR: i64 = 0x102
+pub const H3_STREAM_CREATION_ERROR: i64 = 0x103
+pub const H3_CLOSED_CRITICAL_STREAM: i64 = 0x104
+pub const H3_FRAME_UNEXPECTED: i64 = 0x105
+pub const H3_FRAME_ERROR: i64 = 0x106
+pub const H3_EXCESSIVE_LOAD: i64 = 0x107
+pub const H3_ID_ERROR: i64 = 0x108
+pub const H3_SETTINGS_ERROR: i64 = 0x109
+pub const H3_MISSING_SETTINGS: i64 = 0x10A
+pub const H3_REQUEST_REJECTED: i64 = 0x10B
+pub const H3_REQUEST_CANCELLED: i64 = 0x10C
+pub const H3_REQUEST_INCOMPLETE: i64 = 0x10D
+pub const H3_MESSAGE_ERROR: i64 = 0x10E
+pub const H3_CONNECT_ERROR: i64 = 0x10F
+pub const H3_VERSION_FALLBACK: i64 = 0x110
+
+# ============================================================================
+# Parse Result Codes
+# ============================================================================
+
+pub const H3_OK: i32 = 0
+pub const H3_ERR_INCOMPLETE: i32 = -1
+pub const H3_ERR_INVALID: i32 = -2
+pub const H3_ERR_TOO_LARGE: i32 = -3
+
+# ============================================================================
+# Frame Header
+# ============================================================================
+
+pub struct H3FrameHeader
+    frame_type: i64
+    length: i64
+
+pub fn h3_frame_header_init(hdr: *H3FrameHeader)
+    hdr.frame_type = 0
+    hdr.length = 0
+
+# Parse frame header (type + length as varints)
+# Returns bytes consumed on success, negative on error
+pub fn h3_parse_frame_header(buf: *u8, buf_len: i32, hdr: *H3FrameHeader) -> i32
+    if buf_len < 2
+        return H3_ERR_INCOMPLETE
+
+    var pos: i32 = 0
+
+    # Parse frame type
+    var type_result: VarintResult
+    let type_ret: i32 = varint_parse(buf, buf_len, @type_result)
+    if type_ret < 0
+        return type_ret
+    pos = pos + type_result.bytes_consumed
+
+    # Parse length
+    var len_result: VarintResult
+    let len_ret: i32 = varint_parse(buf + pos, buf_len - pos, @len_result)
+    if len_ret < 0
+        return len_ret
+    pos = pos + len_result.bytes_consumed
+
+    hdr.frame_type = type_result.value
+    hdr.length = len_result.value
+    return pos
+
+# Write frame header
+# Returns bytes written on success, negative on error
+pub fn h3_write_frame_header(buf: *u8, buf_len: i32, frame_type: i64, length: i64) -> i32
+    let type_size: i32 = varint_encoded_len(frame_type)
+    let len_size: i32 = varint_encoded_len(length)
+    let total: i32 = type_size + len_size
+
+    if buf_len < total
+        return H3_ERR_INCOMPLETE
+
+    var pos: i32 = 0
+    pos = pos + varint_encode(frame_type, buf, buf_len)
+    pos = pos + varint_encode(length, buf + pos, buf_len - pos)
+    return pos
+
+# ============================================================================
+# DATA Frame (0x00)
+# ============================================================================
+
+pub struct H3DataFrame
+    data: Span<u8>
+
+pub fn h3_data_frame_init(frame: *H3DataFrame)
+    frame.data.ptr = null
+    frame.data.len = 0
+
+# Parse DATA frame payload (just a reference to data)
+pub fn h3_parse_data_frame(buf: *u8, length: i64, frame: *H3DataFrame) -> i32
+    frame.data.ptr = buf
+    frame.data.len = length as i32
+    return length as i32
+
+# ============================================================================
+# HEADERS Frame (0x01)
+# ============================================================================
+
+pub struct H3HeadersFrame
+    encoded_field_section: Span<u8>
+
+pub fn h3_headers_frame_init(frame: *H3HeadersFrame)
+    frame.encoded_field_section.ptr = null
+    frame.encoded_field_section.len = 0
+
+# Parse HEADERS frame payload (QPACK-encoded field section)
+pub fn h3_parse_headers_frame(buf: *u8, length: i64, frame: *H3HeadersFrame) -> i32
+    frame.encoded_field_section.ptr = buf
+    frame.encoded_field_section.len = length as i32
+    return length as i32
+
+# ============================================================================
+# CANCEL_PUSH Frame (0x03)
+# ============================================================================
+
+pub struct H3CancelPushFrame
+    push_id: i64
+
+pub fn h3_cancel_push_frame_init(frame: *H3CancelPushFrame)
+    frame.push_id = 0
+
+# Parse CANCEL_PUSH frame payload
+pub fn h3_parse_cancel_push_frame(buf: *u8, length: i64, frame: *H3CancelPushFrame) -> i32
+    var result: VarintResult
+    let ret: i32 = varint_parse(buf, length as i32, @result)
+    if ret < 0
+        return ret
+    frame.push_id = result.value
+    return result.bytes_consumed
+
+# ============================================================================
+# SETTINGS Frame (0x04)
+# ============================================================================
+
+pub const H3_MAX_SETTINGS: i32 = 16
+
+pub struct H3SettingEntry
+    identifier: i64
+    value: i64
+
+pub struct H3SettingsFrame
+    settings: [16]H3SettingEntry
+    count: i32
+
+pub fn h3_settings_frame_init(frame: *H3SettingsFrame)
+    frame.count = 0
+    var i: i32 = 0
+    while i < H3_MAX_SETTINGS
+        frame.settings[i].identifier = 0
+        frame.settings[i].value = 0
+        i = i + 1
+
+# Parse SETTINGS frame payload
+pub fn h3_parse_settings_frame(buf: *u8, length: i64, frame: *H3SettingsFrame) -> i32
+    var pos: i32 = 0
+    let end: i32 = length as i32
+    frame.count = 0
+
+    while pos < end
+        if frame.count >= H3_MAX_SETTINGS
+            return H3_ERR_TOO_LARGE
+
+        # Parse identifier
+        var id_result: VarintResult
+        let id_ret: i32 = varint_parse(buf + pos, end - pos, @id_result)
+        if id_ret < 0
+            return id_ret
+        pos = pos + id_result.bytes_consumed
+
+        # Parse value
+        var val_result: VarintResult
+        let val_ret: i32 = varint_parse(buf + pos, end - pos, @val_result)
+        if val_ret < 0
+            return val_ret
+        pos = pos + val_result.bytes_consumed
+
+        frame.settings[frame.count].identifier = id_result.value
+        frame.settings[frame.count].value = val_result.value
+        frame.count = frame.count + 1
+
+    return pos
+
+# Write SETTINGS frame (just the payload, not header)
+pub fn h3_write_settings_payload(buf: *u8, buf_len: i32, frame: *H3SettingsFrame) -> i32
+    var pos: i32 = 0
+    var i: i32 = 0
+
+    while i < frame.count
+        let id_size: i32 = varint_encoded_len(frame.settings[i].identifier)
+        let val_size: i32 = varint_encoded_len(frame.settings[i].value)
+
+        if pos + id_size + val_size > buf_len
+            return H3_ERR_INCOMPLETE
+
+        pos = pos + varint_encode(frame.settings[i].identifier, buf + pos, buf_len - pos)
+        pos = pos + varint_encode(frame.settings[i].value, buf + pos, buf_len - pos)
+        i = i + 1
+
+    return pos
+
+# Get a setting value by identifier (returns -1 if not found)
+pub fn h3_settings_get(frame: *H3SettingsFrame, identifier: i64) -> i64
+    var i: i32 = 0
+    while i < frame.count
+        if frame.settings[i].identifier == identifier
+            return frame.settings[i].value
+        i = i + 1
+    return -1
+
+# Set a setting value
+pub fn h3_settings_set(frame: *H3SettingsFrame, identifier: i64, value: i64) -> i32
+    # Check if already exists
+    var i: i32 = 0
+    while i < frame.count
+        if frame.settings[i].identifier == identifier
+            frame.settings[i].value = value
+            return H3_OK
+        i = i + 1
+
+    # Add new
+    if frame.count >= H3_MAX_SETTINGS
+        return H3_ERR_TOO_LARGE
+
+    frame.settings[frame.count].identifier = identifier
+    frame.settings[frame.count].value = value
+    frame.count = frame.count + 1
+    return H3_OK
+
+# ============================================================================
+# PUSH_PROMISE Frame (0x05)
+# ============================================================================
+
+pub struct H3PushPromiseFrame
+    push_id: i64
+    encoded_field_section: Span<u8>
+
+pub fn h3_push_promise_frame_init(frame: *H3PushPromiseFrame)
+    frame.push_id = 0
+    frame.encoded_field_section.ptr = null
+    frame.encoded_field_section.len = 0
+
+# Parse PUSH_PROMISE frame payload
+pub fn h3_parse_push_promise_frame(buf: *u8, length: i64, frame: *H3PushPromiseFrame) -> i32
+    var result: VarintResult
+    let ret: i32 = varint_parse(buf, length as i32, @result)
+    if ret < 0
+        return ret
+
+    frame.push_id = result.value
+    frame.encoded_field_section.ptr = buf + result.bytes_consumed
+    frame.encoded_field_section.len = (length as i32) - result.bytes_consumed
+    return length as i32
+
+# ============================================================================
+# GOAWAY Frame (0x07)
+# ============================================================================
+
+pub struct H3GoawayFrame
+    stream_id: i64
+
+pub fn h3_goaway_frame_init(frame: *H3GoawayFrame)
+    frame.stream_id = 0
+
+# Parse GOAWAY frame payload
+pub fn h3_parse_goaway_frame(buf: *u8, length: i64, frame: *H3GoawayFrame) -> i32
+    var result: VarintResult
+    let ret: i32 = varint_parse(buf, length as i32, @result)
+    if ret < 0
+        return ret
+    frame.stream_id = result.value
+    return result.bytes_consumed
+
+# ============================================================================
+# MAX_PUSH_ID Frame (0x0D)
+# ============================================================================
+
+pub struct H3MaxPushIdFrame
+    push_id: i64
+
+pub fn h3_max_push_id_frame_init(frame: *H3MaxPushIdFrame)
+    frame.push_id = 0
+
+# Parse MAX_PUSH_ID frame payload
+pub fn h3_parse_max_push_id_frame(buf: *u8, length: i64, frame: *H3MaxPushIdFrame) -> i32
+    var result: VarintResult
+    let ret: i32 = varint_parse(buf, length as i32, @result)
+    if ret < 0
+        return ret
+    frame.push_id = result.value
+    return result.bytes_consumed
+
+# ============================================================================
+# Stream Types (RFC 9114 Section 6.2)
+# ============================================================================
+
+pub const H3_STREAM_CONTROL: i64 = 0x00
+pub const H3_STREAM_PUSH: i64 = 0x01
+pub const H3_STREAM_QPACK_ENCODER: i64 = 0x02
+pub const H3_STREAM_QPACK_DECODER: i64 = 0x03
+
+# Check if frame type is reserved (grease)
+pub fn h3_is_reserved_frame_type(frame_type: i64) -> i32
+    # Reserved: 0x1f * N + 0x21 for N >= 0
+    if frame_type < H3_FRAME_RESERVED_MIN
+        return 0
+    let adjusted: i64 = frame_type - 0x21
+    if adjusted % 0x1f == 0
+        return 1
+    return 0
+
+# Check if settings identifier is reserved (grease)
+pub fn h3_is_reserved_setting(identifier: i64) -> i32
+    # Reserved: 0x1f * N + 0x21 for N >= 0
+    if identifier < H3_SETTINGS_RESERVED_MIN
+        return 0
+    let adjusted: i64 = identifier - 0x21
+    if adjusted % 0x1f == 0
+        return 1
+    return 0
+

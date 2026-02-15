@@ -1,0 +1,344 @@
+# lib/quic_migration.ritz - QUIC Connection Migration (RFC 9000 Section 9)
+#
+# Implements:
+# - Path validation (PATH_CHALLENGE/PATH_RESPONSE)
+# - Address change detection
+# - Path state tracking
+# - Anti-amplification limits
+
+import ritzlib.span
+import lib.quic_cid
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+# Path states
+pub const PATH_STATE_UNUSED: i32 = 0
+pub const PATH_STATE_VALIDATING: i32 = 1
+pub const PATH_STATE_VALIDATED: i32 = 2
+pub const PATH_STATE_FAILED: i32 = 3
+
+# Maximum paths tracked
+pub const MAX_PATHS: i32 = 4
+
+# Path challenge data size (8 bytes per RFC 9000)
+pub const PATH_CHALLENGE_SIZE: i32 = 8
+
+# Anti-amplification limit (3x received)
+pub const AMPLIFICATION_FACTOR: i64 = 3
+
+# Validation timeout (initial PTO, ~1 second default)
+pub const VALIDATION_TIMEOUT_US: i64 = 1000000
+
+# ============================================================================
+# Error Codes
+# ============================================================================
+
+pub const MIGRATION_OK: i32 = 0
+pub const MIGRATION_ERR_LIMIT: i32 = -1
+pub const MIGRATION_ERR_FULL: i32 = -2
+pub const MIGRATION_ERR_NOT_FOUND: i32 = -3
+pub const MIGRATION_ERR_INVALID: i32 = -4
+
+# ============================================================================
+# Address (simplified IPv4/IPv6 storage)
+# ============================================================================
+
+pub struct Address
+    # Address bytes (up to 16 for IPv6)
+    data: [16]u8
+    len: i32       # 4 for IPv4, 16 for IPv6
+    port: i32      # Port number
+
+pub fn address_init(addr: *Address)
+    addr.len = 0
+    addr.port = 0
+    var i: i32 = 0
+    while i < 16
+        addr.data[i] = 0
+        i = i + 1
+
+pub fn address_set_ipv4(addr: *Address, a: u8, b: u8, c: u8, d: u8, port: i32)
+    addr.data[0] = a
+    addr.data[1] = b
+    addr.data[2] = c
+    addr.data[3] = d
+    addr.len = 4
+    addr.port = port
+
+pub fn address_copy(dst: *Address, src: *Address)
+    dst.len = src.len
+    dst.port = src.port
+    var i: i32 = 0
+    while i < 16
+        dst.data[i] = src.data[i]
+        i = i + 1
+
+pub fn address_equals(a: *Address, b: *Address) -> i32
+    if a.len != b.len
+        return 0
+    if a.port != b.port
+        return 0
+    var i: i32 = 0
+    while i < a.len
+        if a.data[i] != b.data[i]
+            return 0
+        i = i + 1
+    return 1
+
+pub fn address_is_empty(addr: *Address) -> i32
+    if addr.len == 0
+        return 1
+    return 0
+
+# ============================================================================
+# Path
+# ============================================================================
+
+pub struct Path
+    # Local and remote addresses
+    local: Address
+    remote: Address
+    # Path state
+    state: i32
+    # Validation
+    challenge_data: [8]u8     # Sent challenge
+    challenge_pending: i32     # Waiting for response?
+    challenge_sent_time: i64   # When challenge sent
+    challenge_attempts: i32    # Number of attempts
+    # Anti-amplification
+    bytes_sent: i64
+    bytes_recv: i64
+    # Is this the active path?
+    is_active: i32
+
+pub fn path_init(path: *Path)
+    address_init(@path.local)
+    address_init(@path.remote)
+    path.state = PATH_STATE_UNUSED
+    path.challenge_pending = 0
+    path.challenge_sent_time = 0
+    path.challenge_attempts = 0
+    path.bytes_sent = 0
+    path.bytes_recv = 0
+    path.is_active = 0
+    var i: i32 = 0
+    while i < PATH_CHALLENGE_SIZE
+        path.challenge_data[i] = 0
+        i = i + 1
+
+pub fn path_is_validated(path: *Path) -> i32
+    if path.state == PATH_STATE_VALIDATED
+        return 1
+    return 0
+
+pub fn path_is_validating(path: *Path) -> i32
+    if path.state == PATH_STATE_VALIDATING
+        return 1
+    return 0
+
+# Check anti-amplification limit
+# Returns 1 if we can send 'bytes' more data
+pub fn path_can_send(path: *Path, bytes: i64) -> i32
+    # Validated paths have no limit
+    if path.state == PATH_STATE_VALIDATED
+        return 1
+    # Unvalidated: can send up to 3x what we received
+    let limit: i64 = path.bytes_recv * AMPLIFICATION_FACTOR
+    if path.bytes_sent + bytes <= limit
+        return 1
+    return 0
+
+pub fn path_on_bytes_sent(path: *Path, bytes: i64)
+    path.bytes_sent = path.bytes_sent + bytes
+
+pub fn path_on_bytes_recv(path: *Path, bytes: i64)
+    path.bytes_recv = path.bytes_recv + bytes
+
+# ============================================================================
+# Path Manager
+# ============================================================================
+
+pub struct PathManager
+    paths: [4]Path
+    count: i32
+    active_idx: i32  # Index of active path (-1 if none)
+
+pub fn path_manager_init(mgr: *PathManager)
+    mgr.count = 0
+    mgr.active_idx = -1
+    var i: i32 = 0
+    while i < MAX_PATHS
+        path_init(@mgr.paths[i])
+        i = i + 1
+
+# Add a new path (from local/remote address pair)
+pub fn path_add(mgr: *PathManager, local: *Address, remote: *Address) -> i32
+    if mgr.count >= MAX_PATHS
+        return MIGRATION_ERR_FULL
+
+    let idx: i32 = mgr.count
+    address_copy(@mgr.paths[idx].local, local)
+    address_copy(@mgr.paths[idx].remote, remote)
+    mgr.paths[idx].state = PATH_STATE_UNUSED
+    mgr.paths[idx].is_active = 0
+    mgr.count = mgr.count + 1
+    return idx
+
+# Find path by remote address
+pub fn path_find_by_remote(mgr: *PathManager, remote: *Address) -> i32
+    var i: i32 = 0
+    while i < mgr.count
+        if address_equals(@mgr.paths[i].remote, remote) != 0
+            return i
+        i = i + 1
+    return -1
+
+# Get active path
+pub fn path_get_active(mgr: *PathManager) -> *Path
+    if mgr.active_idx < 0 || mgr.active_idx >= mgr.count
+        return null
+    return @mgr.paths[mgr.active_idx]
+
+# Get path by index
+pub fn path_get(mgr: *PathManager, idx: i32) -> *Path
+    if idx < 0 || idx >= mgr.count
+        return null
+    return @mgr.paths[idx]
+
+# Set active path (must be validated)
+pub fn path_set_active(mgr: *PathManager, idx: i32) -> i32
+    if idx < 0 || idx >= mgr.count
+        return MIGRATION_ERR_NOT_FOUND
+    if mgr.paths[idx].state != PATH_STATE_VALIDATED
+        return MIGRATION_ERR_INVALID
+
+    # Deactivate old path
+    if mgr.active_idx >= 0
+        mgr.paths[mgr.active_idx].is_active = 0
+
+    # Activate new path
+    mgr.active_idx = idx
+    mgr.paths[idx].is_active = 1
+    return MIGRATION_OK
+
+# ============================================================================
+# Path Validation
+# ============================================================================
+
+# Start path validation by sending PATH_CHALLENGE
+# challenge_data should be 8 random bytes
+pub fn path_start_validation(mgr: *PathManager, idx: i32, challenge: *u8, now: i64) -> i32
+    if idx < 0 || idx >= mgr.count
+        return MIGRATION_ERR_NOT_FOUND
+
+    var i: i32 = 0
+    while i < PATH_CHALLENGE_SIZE
+        mgr.paths[idx].challenge_data[i] = *(challenge + i)
+        i = i + 1
+
+    mgr.paths[idx].state = PATH_STATE_VALIDATING
+    mgr.paths[idx].challenge_pending = 1
+    mgr.paths[idx].challenge_sent_time = now
+    mgr.paths[idx].challenge_attempts = mgr.paths[idx].challenge_attempts + 1
+    return MIGRATION_OK
+
+# Handle received PATH_RESPONSE
+pub fn path_on_response(mgr: *PathManager, idx: i32, response: *u8) -> i32
+    if idx < 0 || idx >= mgr.count
+        return MIGRATION_ERR_NOT_FOUND
+    if mgr.paths[idx].challenge_pending == 0
+        return MIGRATION_ERR_INVALID
+
+    # Verify response matches challenge
+    var i: i32 = 0
+    while i < PATH_CHALLENGE_SIZE
+        if mgr.paths[idx].challenge_data[i] != *(response + i)
+            return MIGRATION_ERR_INVALID
+        i = i + 1
+
+    # Path is now validated
+    mgr.paths[idx].state = PATH_STATE_VALIDATED
+    mgr.paths[idx].challenge_pending = 0
+    return MIGRATION_OK
+
+# Handle received PATH_CHALLENGE (store for response)
+# Returns the response data to send back
+pub fn path_on_challenge(mgr: *PathManager, idx: i32, challenge: *u8, response: *u8) -> i32
+    if idx < 0 || idx >= mgr.count
+        return MIGRATION_ERR_NOT_FOUND
+
+    # Echo the challenge back as response
+    var i: i32 = 0
+    while i < PATH_CHALLENGE_SIZE
+        *(response + i) = *(challenge + i)
+        i = i + 1
+
+    return MIGRATION_OK
+
+# Check for validation timeout
+pub fn path_check_timeout(mgr: *PathManager, idx: i32, now: i64, timeout: i64) -> i32
+    if idx < 0 || idx >= mgr.count
+        return 0
+    if mgr.paths[idx].challenge_pending == 0
+        return 0
+
+    if now - mgr.paths[idx].challenge_sent_time > timeout
+        return 1
+    return 0
+
+# Mark path validation as failed
+pub fn path_validation_failed(mgr: *PathManager, idx: i32) -> i32
+    if idx < 0 || idx >= mgr.count
+        return MIGRATION_ERR_NOT_FOUND
+
+    mgr.paths[idx].state = PATH_STATE_FAILED
+    mgr.paths[idx].challenge_pending = 0
+    return MIGRATION_OK
+
+# ============================================================================
+# Connection Migration Detection
+# ============================================================================
+
+# Check if a packet from 'remote' represents a migration
+# Returns: 0 = same path, positive = new path index, negative = error
+pub fn path_detect_migration(mgr: *PathManager, remote: *Address) -> i32
+    # Check if this matches the active path
+    if mgr.active_idx >= 0
+        if address_equals(@mgr.paths[mgr.active_idx].remote, remote) != 0
+            return 0  # Same path, no migration
+
+    # Check if this matches any known path
+    let existing: i32 = path_find_by_remote(mgr, remote)
+    if existing >= 0
+        return existing  # Existing non-active path
+
+    # This is a new path - create it
+    var local: Address
+    address_init(@local)
+    let new_idx: i32 = path_add(mgr, @local, remote)
+    if new_idx < 0
+        return new_idx  # Error
+    return new_idx
+
+# Count validated paths
+pub fn path_count_validated(mgr: *PathManager) -> i32
+    var count: i32 = 0
+    var i: i32 = 0
+    while i < mgr.count
+        if mgr.paths[i].state == PATH_STATE_VALIDATED
+            count = count + 1
+        i = i + 1
+    return count
+
+# Count paths being validated
+pub fn path_count_validating(mgr: *PathManager) -> i32
+    var count: i32 = 0
+    var i: i32 = 0
+    while i < mgr.count
+        if mgr.paths[i].state == PATH_STATE_VALIDATING
+            count = count + 1
+        i = i + 1
+    return count
+

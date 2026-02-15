@@ -1,0 +1,370 @@
+# test/test_traversal.ritz - Tests for document tree and graph traversal
+#
+# Tests for ancestor/descendant traversal and link-based graph traversal
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+
+import lib.m7m_types
+import lib.buffer_pool
+import lib.btree
+import lib.document
+import lib.collection
+import lib.traversal
+
+# ============================================================================
+# Tree Traversal Tests (Parent/Child)
+# ============================================================================
+
+[[test]]
+fn test_get_children_none() -> i32
+    var pool: *BufferPool = buffer_pool_new(64)
+    var col: Collection
+    collection_init(@col, pool, 1)
+
+    # Insert a document with no children
+    var doc: Document
+    var id: DocumentId = doc_id_invalid()
+    doc_init(@doc, @id)
+    var new_id: DocumentId
+    collection_insert(@col, @doc, @new_id)
+
+    # Get children - should be empty
+    var children: [16]DocumentId
+    var count: i32 = 0
+    var result: i32 = get_children(@col, @new_id, @children[0], 16, @count)
+    if result != ERR_OK
+        return 1
+    if count != 0
+        return 2
+    0
+
+[[test]]
+fn test_get_children_single() -> i32
+    var pool: *BufferPool = buffer_pool_new(64)
+    var col: Collection
+    collection_init(@col, pool, 1)
+
+    # Insert parent
+    var parent: Document
+    var id: DocumentId = doc_id_invalid()
+    doc_init(@parent, @id)
+    var parent_id: DocumentId
+    collection_insert(@col, @parent, @parent_id)
+
+    # Insert child with parent reference
+    var child: Document
+    doc_init(@child, @id)
+    doc_set_parent(@child, @parent_id)
+    var child_id: DocumentId
+    collection_insert(@col, @child, @child_id)
+
+    # Get children of parent
+    var children: [16]DocumentId
+    var count: i32 = 0
+    var result: i32 = get_children(@col, @parent_id, @children[0], 16, @count)
+    if result != ERR_OK
+        return 1
+    if count != 1
+        return 2
+    if doc_id_eq(@children[0], @child_id) != 1
+        return 3
+    0
+
+[[test]]
+fn test_get_children_multiple() -> i32
+    var pool: *BufferPool = buffer_pool_new(64)
+    var col: Collection
+    collection_init(@col, pool, 1)
+
+    # Insert parent
+    var parent: Document
+    var id: DocumentId = doc_id_invalid()
+    doc_init(@parent, @id)
+    var parent_id: DocumentId
+    collection_insert(@col, @parent, @parent_id)
+
+    # Insert 3 children
+    var c1: Document
+    var c2: Document
+    var c3: Document
+    doc_init(@c1, @id)
+    doc_init(@c2, @id)
+    doc_init(@c3, @id)
+    doc_set_parent(@c1, @parent_id)
+    doc_set_parent(@c2, @parent_id)
+    doc_set_parent(@c3, @parent_id)
+
+    var c1_id: DocumentId
+    var c2_id: DocumentId
+    var c3_id: DocumentId
+    collection_insert(@col, @c1, @c1_id)
+    collection_insert(@col, @c2, @c2_id)
+    collection_insert(@col, @c3, @c3_id)
+
+    # Get children
+    var children: [16]DocumentId
+    var count: i32 = 0
+    get_children(@col, @parent_id, @children[0], 16, @count)
+    if count != 3
+        return 1
+    0
+
+[[test]]
+fn test_get_ancestors_none() -> i32
+    var pool: *BufferPool = buffer_pool_new(64)
+    var col: Collection
+    collection_init(@col, pool, 1)
+
+    # Insert root document (no parent)
+    var doc: Document
+    var id: DocumentId = doc_id_invalid()
+    doc_init(@doc, @id)
+    var new_id: DocumentId
+    collection_insert(@col, @doc, @new_id)
+
+    # Get ancestors - should be empty
+    var ancestors: [16]DocumentId
+    var count: i32 = 0
+    var result: i32 = get_ancestors(@col, @new_id, @ancestors[0], 16, @count)
+    if result != ERR_OK
+        return 1
+    if count != 0
+        return 2
+    0
+
+[[test]]
+fn test_get_ancestors_chain() -> i32
+    var pool: *BufferPool = buffer_pool_new(64)
+    var col: Collection
+    collection_init(@col, pool, 1)
+
+    # Build chain: grandparent -> parent -> child
+    var gp: Document
+    var p: Document
+    var c: Document
+    var id: DocumentId = doc_id_invalid()
+
+    doc_init(@gp, @id)
+    var gp_id: DocumentId
+    collection_insert(@col, @gp, @gp_id)
+
+    doc_init(@p, @id)
+    doc_set_parent(@p, @gp_id)
+    var p_id: DocumentId
+    collection_insert(@col, @p, @p_id)
+
+    doc_init(@c, @id)
+    doc_set_parent(@c, @p_id)
+    var c_id: DocumentId
+    collection_insert(@col, @c, @c_id)
+
+    # Get ancestors of child - should be [parent, grandparent]
+    var ancestors: [16]DocumentId
+    var count: i32 = 0
+    get_ancestors(@col, @c_id, @ancestors[0], 16, @count)
+    if count != 2
+        return 1
+    # Ancestors in order: immediate parent first
+    if doc_id_eq(@ancestors[0], @p_id) != 1
+        return 2
+    if doc_id_eq(@ancestors[1], @gp_id) != 1
+        return 3
+    0
+
+[[test]]
+fn test_get_descendants_all() -> i32
+    var pool: *BufferPool = buffer_pool_new(64)
+    var col: Collection
+    collection_init(@col, pool, 1)
+
+    # Build tree: root -> [child1, child2] -> [grandchild]
+    var root: Document
+    var id: DocumentId = doc_id_invalid()
+    doc_init(@root, @id)
+    var root_id: DocumentId
+    collection_insert(@col, @root, @root_id)
+
+    var c1: Document
+    var c2: Document
+    doc_init(@c1, @id)
+    doc_init(@c2, @id)
+    doc_set_parent(@c1, @root_id)
+    doc_set_parent(@c2, @root_id)
+    var c1_id: DocumentId
+    var c2_id: DocumentId
+    collection_insert(@col, @c1, @c1_id)
+    collection_insert(@col, @c2, @c2_id)
+
+    var gc: Document
+    doc_init(@gc, @id)
+    doc_set_parent(@gc, @c1_id)
+    var gc_id: DocumentId
+    collection_insert(@col, @gc, @gc_id)
+
+    # Get all descendants of root
+    var descendants: [16]DocumentId
+    var count: i32 = 0
+    get_descendants(@col, @root_id, @descendants[0], 16, @count)
+    # Should have child1, child2, grandchild = 3
+    if count != 3
+        return 1
+    0
+
+# ============================================================================
+# Graph Traversal Tests (Links)
+# ============================================================================
+
+[[test]]
+fn test_get_linked_none() -> i32
+    var pool: *BufferPool = buffer_pool_new(64)
+    var col: Collection
+    collection_init(@col, pool, 1)
+
+    # Insert document with no links
+    var doc: Document
+    var id: DocumentId = doc_id_invalid()
+    doc_init(@doc, @id)
+    var new_id: DocumentId
+    collection_insert(@col, @doc, @new_id)
+
+    # Get links by label
+    var linked: [16]DocumentId
+    var count: i32 = 0
+    var result: i32 = get_linked(@col, @new_id, c"related", @linked[0], 16, @count)
+    if result != ERR_OK
+        return 1
+    if count != 0
+        return 2
+    0
+
+[[test]]
+fn test_get_linked_single() -> i32
+    var pool: *BufferPool = buffer_pool_new(64)
+    var col: Collection
+    collection_init(@col, pool, 1)
+
+    # Insert target document
+    var target: Document
+    var id: DocumentId = doc_id_invalid()
+    doc_init(@target, @id)
+    var target_id: DocumentId
+    collection_insert(@col, @target, @target_id)
+
+    # Insert source with link to target
+    var source: Document
+    doc_init(@source, @id)
+    doc_add_link(@source, c"related", @target_id)
+    var source_id: DocumentId
+    collection_insert(@col, @source, @source_id)
+
+    # Get linked documents
+    var linked: [16]DocumentId
+    var count: i32 = 0
+    get_linked(@col, @source_id, c"related", @linked[0], 16, @count)
+    if count != 1
+        return 1
+    if doc_id_eq(@linked[0], @target_id) != 1
+        return 2
+    0
+
+[[test]]
+fn test_get_linked_multiple_labels() -> i32
+    var pool: *BufferPool = buffer_pool_new(64)
+    var col: Collection
+    collection_init(@col, pool, 1)
+
+    # Insert targets
+    var t1: Document
+    var t2: Document
+    var t3: Document
+    var id: DocumentId = doc_id_invalid()
+    doc_init(@t1, @id)
+    doc_init(@t2, @id)
+    doc_init(@t3, @id)
+    var t1_id: DocumentId
+    var t2_id: DocumentId
+    var t3_id: DocumentId
+    collection_insert(@col, @t1, @t1_id)
+    collection_insert(@col, @t2, @t2_id)
+    collection_insert(@col, @t3, @t3_id)
+
+    # Insert source with different link types
+    var source: Document
+    doc_init(@source, @id)
+    doc_add_link(@source, c"child", @t1_id)
+    doc_add_link(@source, c"child", @t2_id)
+    doc_add_link(@source, c"reference", @t3_id)
+    var source_id: DocumentId
+    collection_insert(@col, @source, @source_id)
+
+    # Get only "child" links
+    var linked: [16]DocumentId
+    var count: i32 = 0
+    get_linked(@col, @source_id, c"child", @linked[0], 16, @count)
+    if count != 2
+        return 1
+
+    # Get only "reference" links
+    count = 0
+    get_linked(@col, @source_id, c"reference", @linked[0], 16, @count)
+    if count != 1
+        return 2
+    0
+
+[[test]]
+fn test_get_backlinks_none() -> i32
+    var pool: *BufferPool = buffer_pool_new(64)
+    var col: Collection
+    collection_init(@col, pool, 1)
+
+    # Insert document with no incoming links
+    var doc: Document
+    var id: DocumentId = doc_id_invalid()
+    doc_init(@doc, @id)
+    var new_id: DocumentId
+    collection_insert(@col, @doc, @new_id)
+
+    # Get backlinks
+    var backlinks: [16]DocumentId
+    var count: i32 = 0
+    var result: i32 = get_backlinks(@col, @new_id, c"related", @backlinks[0], 16, @count)
+    if result != ERR_OK
+        return 1
+    if count != 0
+        return 2
+    0
+
+[[test]]
+fn test_get_backlinks_found() -> i32
+    var pool: *BufferPool = buffer_pool_new(64)
+    var col: Collection
+    collection_init(@col, pool, 1)
+
+    # Insert target document
+    var target: Document
+    var id: DocumentId = doc_id_invalid()
+    doc_init(@target, @id)
+    var target_id: DocumentId
+    collection_insert(@col, @target, @target_id)
+
+    # Insert two sources that link to target
+    var s1: Document
+    var s2: Document
+    doc_init(@s1, @id)
+    doc_init(@s2, @id)
+    doc_add_link(@s1, c"related", @target_id)
+    doc_add_link(@s2, c"related", @target_id)
+    var s1_id: DocumentId
+    var s2_id: DocumentId
+    collection_insert(@col, @s1, @s1_id)
+    collection_insert(@col, @s2, @s2_id)
+
+    # Get backlinks to target
+    var backlinks: [16]DocumentId
+    var count: i32 = 0
+    get_backlinks(@col, @target_id, c"related", @backlinks[0], 16, @count)
+    if count != 2
+        return 1
+    0

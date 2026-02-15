@@ -1,0 +1,395 @@
+# spire/test/mod.ritz
+#
+# Testing utilities for Spire applications
+#
+# Provides helpers for:
+# - Creating test requests
+# - Asserting response properties
+# - Mock repositories
+# - Test fixtures
+#
+# Example:
+#
+#   [[test]]
+#   fn test_create_task() -> i32
+#       # Arrange
+#       let body: StrView = "{\"title\": \"Test task\"}"
+#       var req: Request = test_request_post("/tasks", body)
+#
+#       # Act
+#       var app: MyApp = app_create()
+#       let resp: Response = app_handle(@app, @req)
+#
+#       # Assert
+#       assert_status(@resp, 201)
+#       assert_json_field(@resp, "id")
+#       0
+
+import ritzlib.option
+import ritzlib.strview { StrView, strview_from_ptr }
+import ritzlib.string { String, string_new, string_push, string_from_strview, string_len }
+import ritzlib.gvec { Vec, vec_new, vec_push, vec_len, vec_get_ptr }
+
+import lib.http.method { Method, GET, POST, PUT, PATCH, DELETE }
+import lib.http.request { Request, request_new, request_with }
+import lib.http.request { request_set_method, request_set_path, request_set_header }
+import lib.http.response { Response, response_status_code, response_body_len }
+import lib.http.headers { headers_set, headers_get }
+import lib.model.uuid { Uuid, uuid_new_v4, uuid_zero }
+import lib.utils { string_as_strview, strview_eq }
+
+# ============================================================================
+# Test Request builders
+# ============================================================================
+
+# Create a GET request
+pub fn test_request_get(path: StrView) -> Request
+    let path_ref: StrView = path
+    var req: Request = request_with(GET, @path_ref)
+    set_default_headers(@req)
+    return req
+
+# Create a POST request with JSON body
+pub fn test_request_post(path: StrView, body: StrView) -> Request
+    let path_ref: StrView = path
+    var req: Request = request_with(POST, @path_ref)
+    set_default_headers(@req)
+    set_json_body(@req, body)
+    return req
+
+# Create a PUT request with JSON body
+pub fn test_request_put(path: StrView, body: StrView) -> Request
+    let path_ref: StrView = path
+    var req: Request = request_with(PUT, @path_ref)
+    set_default_headers(@req)
+    set_json_body(@req, body)
+    return req
+
+# Create a PATCH request with JSON body
+pub fn test_request_patch(path: StrView, body: StrView) -> Request
+    let path_ref: StrView = path
+    var req: Request = request_with(PATCH, @path_ref)
+    set_default_headers(@req)
+    set_json_body(@req, body)
+    return req
+
+# Create a DELETE request
+pub fn test_request_delete(path: StrView) -> Request
+    let path_ref: StrView = path
+    var req: Request = request_with(DELETE, @path_ref)
+    set_default_headers(@req)
+    return req
+
+fn set_default_headers(req:& Request)
+    let accept_name: StrView = "Accept"
+    let accept_val: StrView = "application/json"
+    request_set_header(req, @accept_name, @accept_val)
+
+    let ua_name: StrView = "User-Agent"
+    let ua_val: StrView = "Spire-Test/1.0"
+    request_set_header(req, @ua_name, @ua_val)
+
+fn set_json_body(req:& Request, body: StrView)
+    let ct_name: StrView = "Content-Type"
+    let ct_val: StrView = "application/json"
+    request_set_header(req, @ct_name, @ct_val)
+
+    # Copy body bytes
+    var i: i64 = 0
+    while i < body.len
+        vec_push<u8>(@req.body, *(body.ptr + i))
+        i += 1
+
+# Add authorization header
+pub fn test_request_auth(req:& Request, token: StrView)
+    let auth_name: StrView = "Authorization"
+    var auth_val: String = string_new()
+    let bearer: StrView = "Bearer "
+    push_strview(@auth_val, bearer)
+    push_strview(@auth_val, token)
+    let auth_sv: StrView = string_as_strview(@auth_val)
+    request_set_header(req, @auth_name, @auth_sv)
+
+# Add custom header
+pub fn test_request_header(req:& Request, name: StrView, value: StrView)
+    request_set_header(req, @name, @value)
+
+# ============================================================================
+# Test Assertions
+# ============================================================================
+
+pub struct TestResult
+    passed: i32
+    message: String
+
+pub fn test_ok() -> TestResult
+    var r: TestResult
+    r.passed = 1
+    r.message = string_new()
+    return r
+
+pub fn test_fail(message: StrView) -> TestResult
+    var r: TestResult
+    r.passed = 0
+    r.message = string_from_strview(@message)
+    return r
+
+# Assert response status code
+pub fn assert_status(resp: *Response, expected: u16) -> TestResult
+    let actual: u16 = response_status_code(resp)
+    if actual == expected
+        return test_ok()
+    var msg: String = string_new()
+    let prefix: StrView = "Expected status "
+    push_strview(@msg, prefix)
+    push_u16(@msg, expected)
+    let mid: StrView = " but got "
+    push_strview(@msg, mid)
+    push_u16(@msg, actual)
+    return test_fail(string_as_strview(@msg))
+
+# Assert response is success (2xx)
+pub fn assert_success(resp: *Response) -> TestResult
+    let code: u16 = response_status_code(resp)
+    if code >= 200 and code < 300
+        return test_ok()
+    var msg: String = string_new()
+    let prefix: StrView = "Expected success status but got "
+    push_strview(@msg, prefix)
+    push_u16(@msg, code)
+    return test_fail(string_as_strview(@msg))
+
+# Assert response is error (4xx or 5xx)
+pub fn assert_error(resp: *Response) -> TestResult
+    let code: u16 = response_status_code(resp)
+    if code >= 400
+        return test_ok()
+    var msg: String = string_new()
+    let prefix: StrView = "Expected error status but got "
+    push_strview(@msg, prefix)
+    push_u16(@msg, code)
+    return test_fail(string_as_strview(@msg))
+
+# Assert response has body
+pub fn assert_has_body(resp: *Response) -> TestResult
+    if response_body_len(resp) > 0
+        return test_ok()
+    let msg: StrView = "Expected response to have body"
+    return test_fail(msg)
+
+# Assert response is empty
+pub fn assert_empty_body(resp: *Response) -> TestResult
+    if response_body_len(resp) == 0
+        return test_ok()
+    let msg: StrView = "Expected response to have empty body"
+    return test_fail(msg)
+
+# Assert body contains substring
+pub fn assert_body_contains(resp: *Response, expected: StrView) -> TestResult
+    let body: StrView = response_body_strview(resp)
+    if strview_contains(@body, @expected) == 1
+        return test_ok()
+    var msg: String = string_new()
+    let prefix: StrView = "Expected body to contain: "
+    push_strview(@msg, prefix)
+    push_strview(@msg, expected)
+    return test_fail(string_as_strview(@msg))
+
+fn response_body_strview(resp: *Response) -> StrView
+    return strview_from_ptr(resp.body.data, vec_len<u8>(@resp.body))
+
+fn strview_contains(haystack: *StrView, needle: *StrView) -> i32
+    if needle.len > haystack.len
+        return 0
+    if needle.len == 0
+        return 1
+
+    var i: i64 = 0
+    while i <= haystack.len - needle.len
+        var j: i64 = 0
+        while j < needle.len
+            if *(haystack.ptr + i + j) != *(needle.ptr + j)
+                break
+            j += 1
+        if j == needle.len
+            return 1
+        i += 1
+    return 0
+
+# ============================================================================
+# Test Fixtures
+# ============================================================================
+
+# Generate random test data
+pub fn test_uuid() -> Uuid
+    return uuid_new_v4()
+
+pub fn test_email() -> String
+    var s: String = string_new()
+    let prefix: StrView = "test-"
+    push_strview(@s, prefix)
+    push_random_hex(@s, 8)
+    let suffix: StrView = "@example.com"
+    push_strview(@s, suffix)
+    return s
+
+pub fn test_username() -> String
+    var s: String = string_new()
+    let prefix: StrView = "user-"
+    push_strview(@s, prefix)
+    push_random_hex(@s, 6)
+    return s
+
+fn push_random_hex(s:& String, count: i64)
+    # Simple pseudo-random (not cryptographically secure)
+    var state: u64 = 0x12345678  # Would use proper seed
+    var i: i64 = 0
+    while i < count
+        state = state * 1103515245 + 12345
+        let hex: u8 = hex_char(((state / 65536) % 16) as i32)
+        string_push(s, hex)
+        i += 1
+
+fn hex_char(n: i32) -> u8
+    if n < 10
+        return (48 + n) as u8
+    return (87 + n) as u8  # a-f
+
+# ============================================================================
+# Test Context
+# ============================================================================
+
+pub struct TestContext
+    # Test name
+    name: String
+    # Collected assertions
+    assertions: Vec<TestResult>
+    # Setup/teardown flags
+    setup_done: i32
+    teardown_done: i32
+
+# Create test context
+pub fn test_context_new(name: StrView) -> TestContext
+    var ctx: TestContext
+    ctx.name = string_from_strview(@name)
+    ctx.assertions = vec_new<TestResult>()
+    ctx.setup_done = 0
+    ctx.teardown_done = 0
+    return ctx
+
+# Add assertion
+pub fn test_assert(ctx:& TestContext, result: TestResult)
+    vec_push<TestResult>(@ctx.assertions, result)
+
+# Check if all assertions passed
+pub fn test_passed(ctx: TestContext) -> i32
+    var i: i64 = 0
+    while i < vec_len<TestResult>(@ctx.assertions)
+        let r: *TestResult = vec_get_ptr<TestResult>(@ctx.assertions, i)
+        if r.passed == 0
+            return 0
+        i += 1
+    return 1
+
+# Get failure count
+pub fn test_failures(ctx: TestContext) -> i64
+    var count: i64 = 0
+    var i: i64 = 0
+    while i < vec_len<TestResult>(@ctx.assertions)
+        let r: *TestResult = vec_get_ptr<TestResult>(@ctx.assertions, i)
+        if r.passed == 0
+            count += 1
+        i += 1
+    return count
+
+# ============================================================================
+# Assertion macros (function-style until macros exist)
+# ============================================================================
+
+# Assert equality
+pub fn assert_eq_i64(actual: i64, expected: i64) -> TestResult
+    if actual == expected
+        return test_ok()
+    var msg: String = string_new()
+    let prefix: StrView = "Expected "
+    push_strview(@msg, prefix)
+    push_i64(@msg, expected)
+    let mid: StrView = " but got "
+    push_strview(@msg, mid)
+    push_i64(@msg, actual)
+    return test_fail(string_as_strview(@msg))
+
+pub fn assert_eq_str(actual: StrView, expected: StrView) -> TestResult
+    if strview_eq(@actual, @expected) == 1
+        return test_ok()
+    var msg: String = string_new()
+    let prefix: StrView = "Expected \""
+    push_strview(@msg, prefix)
+    push_strview(@msg, expected)
+    let mid: StrView = "\" but got \""
+    push_strview(@msg, mid)
+    push_strview(@msg, actual)
+    let suffix: StrView = "\""
+    push_strview(@msg, suffix)
+    return test_fail(string_as_strview(@msg))
+
+pub fn assert_true(condition: i32) -> TestResult
+    if condition != 0
+        return test_ok()
+    let msg: StrView = "Expected true but got false"
+    return test_fail(msg)
+
+pub fn assert_false(condition: i32) -> TestResult
+    if condition == 0
+        return test_ok()
+    let msg: StrView = "Expected false but got true"
+    return test_fail(msg)
+
+pub fn assert_some<T>(opt: Option<T>) -> TestResult
+    match opt
+        Some(_) => test_ok()
+        None =>
+            let msg: StrView = "Expected Some but got None"
+            test_fail(msg)
+
+pub fn assert_none<T>(opt: Option<T>) -> TestResult
+    match opt
+        Some(_) =>
+            let msg: StrView = "Expected None but got Some"
+            test_fail(msg)
+        None => test_ok()
+
+# ============================================================================
+# Helper functions
+# ============================================================================
+
+fn push_strview(s:& String, sv: StrView)
+    var i: i64 = 0
+    while i < sv.len
+        string_push(s, *(sv.ptr + i))
+        i += 1
+
+fn push_u16(s:& String, n: u16)
+    push_i64(s, n as i64)
+
+fn push_i64(s:& String, n: i64)
+    if n < 0
+        string_push(s, 45)  # '-'
+        push_u64(s, (0 - n) as u64)
+    else
+        push_u64(s, n as u64)
+
+fn push_u64(s:& String, n: u64)
+    if n == 0
+        string_push(s, 48)
+        return
+    var digits: [20]u8
+    var count: i64 = 0
+    var val: u64 = n
+    while val > 0
+        digits[count] = (48 + (val % 10)) as u8
+        val = val / 10
+        count += 1
+    while count > 0
+        count -= 1
+        string_push(s, digits[count])
