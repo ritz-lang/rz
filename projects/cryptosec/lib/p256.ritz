@@ -1,0 +1,1700 @@
+# lib/p256.ritz - NIST P-256 (secp256r1) Elliptic Curve
+#
+# Implements P-256 curve operations for ECDSA signature verification.
+#
+# Curve parameters:
+#   p = 2^256 - 2^224 + 2^192 + 2^96 - 1
+#     = 0xFFFFFFFF00000001000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFF
+#   a = -3 (mod p)
+#   b = 0x5AC635D8AA3A93E7B3EBBD55769886BC651D06B0CC53B0F63BCE3C3E27D2604B
+#   n = 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551 (group order)
+#   G = generator point (see below)
+#
+# References:
+#   - NIST FIPS 186-4
+#   - SEC 2: Recommended Elliptic Curve Domain Parameters
+#   - RFC 6979: Deterministic ECDSA
+
+import lib.mem
+import lib.u128
+import lib.hmac
+import lib.sha256
+
+# ============================================================================
+# Field Element: FeP256 - Element of GF(p)
+# ============================================================================
+# 256-bit integers mod p, stored as 4 x 64-bit limbs in little-endian order
+
+pub struct FeP256
+    limbs: [4]u64   # limbs[0] is least significant
+
+# ============================================================================
+# P-256 Prime Constant
+# ============================================================================
+# p = 0xFFFFFFFF00000001000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFF
+# In limbs (little-endian): [0xFFFFFFFFFFFFFFFF, 0x00000000FFFFFFFF, 0x0000000000000000, 0xFFFFFFFF00000001]
+
+# Get prime modulus p
+fn get_p256_prime(p: *FeP256)
+    p.limbs[0] = 0xFFFFFFFFFFFFFFFF  # bits 0-63
+    p.limbs[1] = 0x00000000FFFFFFFF  # bits 64-127
+    p.limbs[2] = 0x0000000000000000  # bits 128-191
+    p.limbs[3] = 0xFFFFFFFF00000001  # bits 192-255
+
+# ============================================================================
+# Group Order n (for scalars in ECDSA)
+# ============================================================================
+# n = 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
+# In limbs (little-endian): [0xF3B9CAC2FC632551, 0xBCE6FAADA7179E84, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFF00000000]
+
+pub struct Scalar256
+    limbs: [4]u64   # limbs[0] is least significant
+
+# Get group order n
+pub fn get_p256_order(n: *Scalar256)
+    n.limbs[0] = 0xF3B9CAC2FC632551
+    n.limbs[1] = 0xBCE6FAADA7179E84
+    n.limbs[2] = 0xFFFFFFFFFFFFFFFF
+    n.limbs[3] = 0xFFFFFFFF00000000
+
+# ============================================================================
+# Scalar Operations (mod n)
+# ============================================================================
+
+pub fn scalar256_zero(a: *Scalar256)
+    a.limbs[0] = 0
+    a.limbs[1] = 0
+    a.limbs[2] = 0
+    a.limbs[3] = 0
+
+pub fn scalar256_one(a: *Scalar256)
+    a.limbs[0] = 1
+    a.limbs[1] = 0
+    a.limbs[2] = 0
+    a.limbs[3] = 0
+
+pub fn scalar256_copy(dst: *Scalar256, src: *Scalar256)
+    dst.limbs[0] = src.limbs[0]
+    dst.limbs[1] = src.limbs[1]
+    dst.limbs[2] = src.limbs[2]
+    dst.limbs[3] = src.limbs[3]
+
+pub fn scalar256_is_zero(a: *Scalar256) -> i32
+    if a.limbs[0] != 0
+        return 0
+    if a.limbs[1] != 0
+        return 0
+    if a.limbs[2] != 0
+        return 0
+    if a.limbs[3] != 0
+        return 0
+    return 1
+
+# Compare: returns -1 if a < b, 0 if a == b, 1 if a > b
+pub fn scalar256_cmp(a: *Scalar256, b: *Scalar256) -> i32
+    if a.limbs[3] > b.limbs[3]
+        return 1
+    if a.limbs[3] < b.limbs[3]
+        return -1
+    if a.limbs[2] > b.limbs[2]
+        return 1
+    if a.limbs[2] < b.limbs[2]
+        return -1
+    if a.limbs[1] > b.limbs[1]
+        return 1
+    if a.limbs[1] < b.limbs[1]
+        return -1
+    if a.limbs[0] > b.limbs[0]
+        return 1
+    if a.limbs[0] < b.limbs[0]
+        return -1
+    return 0
+
+# Load scalar from big-endian bytes (32 bytes)
+pub fn scalar256_from_bytes(a: *Scalar256, data: *u8)
+    a.limbs[3] = load_u64_be(&data[0])
+    a.limbs[2] = load_u64_be(&data[8])
+    a.limbs[1] = load_u64_be(&data[16])
+    a.limbs[0] = load_u64_be(&data[24])
+
+# Store scalar to big-endian bytes (32 bytes)
+pub fn scalar256_to_bytes(a: *Scalar256, out: *u8)
+    out[0] = (a.limbs[3] >> 56) as u8
+    out[1] = (a.limbs[3] >> 48) as u8
+    out[2] = (a.limbs[3] >> 40) as u8
+    out[3] = (a.limbs[3] >> 32) as u8
+    out[4] = (a.limbs[3] >> 24) as u8
+    out[5] = (a.limbs[3] >> 16) as u8
+    out[6] = (a.limbs[3] >> 8) as u8
+    out[7] = a.limbs[3] as u8
+    out[8] = (a.limbs[2] >> 56) as u8
+    out[9] = (a.limbs[2] >> 48) as u8
+    out[10] = (a.limbs[2] >> 40) as u8
+    out[11] = (a.limbs[2] >> 32) as u8
+    out[12] = (a.limbs[2] >> 24) as u8
+    out[13] = (a.limbs[2] >> 16) as u8
+    out[14] = (a.limbs[2] >> 8) as u8
+    out[15] = a.limbs[2] as u8
+    out[16] = (a.limbs[1] >> 56) as u8
+    out[17] = (a.limbs[1] >> 48) as u8
+    out[18] = (a.limbs[1] >> 40) as u8
+    out[19] = (a.limbs[1] >> 32) as u8
+    out[20] = (a.limbs[1] >> 24) as u8
+    out[21] = (a.limbs[1] >> 16) as u8
+    out[22] = (a.limbs[1] >> 8) as u8
+    out[23] = a.limbs[1] as u8
+    out[24] = (a.limbs[0] >> 56) as u8
+    out[25] = (a.limbs[0] >> 48) as u8
+    out[26] = (a.limbs[0] >> 40) as u8
+    out[27] = (a.limbs[0] >> 32) as u8
+    out[28] = (a.limbs[0] >> 24) as u8
+    out[29] = (a.limbs[0] >> 16) as u8
+    out[30] = (a.limbs[0] >> 8) as u8
+    out[31] = a.limbs[0] as u8
+
+# Add two scalars, returning carry
+fn scalar256_add_raw(c: *Scalar256, a: *Scalar256, b: *Scalar256) -> u64
+    var carry: u64 = 0
+    let sum0: u64 = a.limbs[0] + b.limbs[0]
+    let c0: u64 = (sum0 < a.limbs[0]) as u64
+    c.limbs[0] = sum0
+    let sum1a: u64 = a.limbs[1] + b.limbs[1]
+    let c1a: u64 = (sum1a < a.limbs[1]) as u64
+    let sum1b: u64 = sum1a + c0
+    let c1b: u64 = (sum1b < sum1a) as u64
+    c.limbs[1] = sum1b
+    carry = c1a + c1b
+    let sum2a: u64 = a.limbs[2] + b.limbs[2]
+    let c2a: u64 = (sum2a < a.limbs[2]) as u64
+    let sum2b: u64 = sum2a + carry
+    let c2b: u64 = (sum2b < sum2a) as u64
+    c.limbs[2] = sum2b
+    carry = c2a + c2b
+    let sum3a: u64 = a.limbs[3] + b.limbs[3]
+    let c3a: u64 = (sum3a < a.limbs[3]) as u64
+    let sum3b: u64 = sum3a + carry
+    let c3b: u64 = (sum3b < sum3a) as u64
+    c.limbs[3] = sum3b
+    return c3a + c3b
+
+# Subtract b from a, returning borrow
+fn scalar256_sub_raw(c: *Scalar256, a: *Scalar256, b: *Scalar256) -> u64
+    var borrow: u64 = 0
+    let d0: u64 = a.limbs[0] - b.limbs[0]
+    let b0: u64 = (a.limbs[0] < b.limbs[0]) as u64
+    c.limbs[0] = d0
+    let d1a: u64 = a.limbs[1] - b.limbs[1]
+    let b1a: u64 = (a.limbs[1] < b.limbs[1]) as u64
+    let d1b: u64 = d1a - b0
+    let b1b: u64 = (d1a < b0) as u64
+    c.limbs[1] = d1b
+    borrow = b1a + b1b
+    let d2a: u64 = a.limbs[2] - b.limbs[2]
+    let b2a: u64 = (a.limbs[2] < b.limbs[2]) as u64
+    let d2b: u64 = d2a - borrow
+    let b2b: u64 = (d2a < borrow) as u64
+    c.limbs[2] = d2b
+    borrow = b2a + b2b
+    let d3a: u64 = a.limbs[3] - b.limbs[3]
+    let b3a: u64 = (a.limbs[3] < b.limbs[3]) as u64
+    let d3b: u64 = d3a - borrow
+    let b3b: u64 = (d3a < borrow) as u64
+    c.limbs[3] = d3b
+    return b3a + b3b
+
+# Reduce c to canonical form [0, n)
+pub fn scalar256_reduce(c: *Scalar256)
+    var n: Scalar256
+    get_p256_order(&n)
+    if scalar256_cmp(c, &n) >= 0
+        scalar256_sub_raw(c, c, &n)
+
+# Modular addition: c = (a + b) mod n
+pub fn scalar256_add(c: *Scalar256, a: *Scalar256, b: *Scalar256)
+    let carry: u64 = scalar256_add_raw(c, a, b)
+    var n: Scalar256
+    get_p256_order(&n)
+    if carry != 0 || scalar256_cmp(c, &n) >= 0
+        scalar256_sub_raw(c, c, &n)
+
+# Modular subtraction: c = (a - b) mod n
+pub fn scalar256_sub(c: *Scalar256, a: *Scalar256, b: *Scalar256)
+    let borrow: u64 = scalar256_sub_raw(c, a, b)
+    if borrow != 0
+        var n: Scalar256
+        get_p256_order(&n)
+        scalar256_add_raw(c, c, &n)
+
+# Modular negation: c = -a mod n
+pub fn scalar256_neg(c: *Scalar256, a: *Scalar256)
+    if scalar256_is_zero(a) == 1
+        scalar256_zero(c)
+        return
+    var n: Scalar256
+    get_p256_order(&n)
+    scalar256_sub_raw(c, &n, a)
+
+# Modular multiplication: c = (a * b) mod n
+pub fn scalar256_mul(c: *Scalar256, a: *Scalar256, b: *Scalar256)
+    # Full 512-bit product
+    var prod: [8]u64
+    var i: i32 = 0
+    while i < 8
+        prod[i] = 0
+        i += 1
+
+    var ai: i32 = 0
+    while ai < 4
+        var carry: u64 = 0
+        var bi: i32 = 0
+        while bi < 4
+            var lo: u64 = 0
+            var hi: u64 = 0
+            mul64(a.limbs[ai], b.limbs[bi], &lo, &hi)
+            let idx: i32 = ai + bi
+            carry = add64_carry(prod[idx], lo, carry, &prod[idx])
+            carry = carry + hi
+            bi += 1
+        var k: i32 = ai + 4
+        while carry != 0 && k < 8
+            carry = add64_carry(prod[k], 0, carry, &prod[k])
+            k += 1
+        ai += 1
+
+    # Reduce mod n using Barrett reduction or simple repeated subtraction
+    scalar256_reduce_512(&prod[0], c)
+
+# Reduce 512-bit value mod n
+fn scalar256_reduce_512(prod: *u64, r: *Scalar256)
+    # Simple method: shift and subtract
+    # Copy high 256 bits
+    var hi: Scalar256
+    hi.limbs[0] = prod[4]
+    hi.limbs[1] = prod[5]
+    hi.limbs[2] = prod[6]
+    hi.limbs[3] = prod[7]
+
+    var lo: Scalar256
+    lo.limbs[0] = prod[0]
+    lo.limbs[1] = prod[1]
+    lo.limbs[2] = prod[2]
+    lo.limbs[3] = prod[3]
+
+    var n: Scalar256
+    get_p256_order(&n)
+
+    # Reduce lo first
+    while scalar256_cmp(&lo, &n) >= 0
+        scalar256_sub_raw(&lo, &lo, &n)
+
+    # Process hi bits: for each set bit in hi, add 2^(256+bit_pos) mod n
+    # 2^256 mod n = n - (2^256 - n) = we need to compute 2^256 mod n
+    # n = FFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
+    # 2^256 mod n = 2^256 - n = 0x00000000FFFFFFFF00000000000000004319055258E8617B0C46353D039CDAAF
+
+    var pow256_mod_n: Scalar256
+    pow256_mod_n.limbs[0] = 0x0C46353D039CDAAF
+    pow256_mod_n.limbs[1] = 0x4319055258E8617B
+    pow256_mod_n.limbs[2] = 0x0000000000000000
+    pow256_mod_n.limbs[3] = 0x00000000FFFFFFFF
+
+    # Multiply hi by 2^256 mod n
+    if scalar256_is_zero(&hi) != 1
+        var hi_reduced: Scalar256
+        scalar256_mul_simple(&hi_reduced, &hi, &pow256_mod_n, &n)
+        scalar256_add(r, &lo, &hi_reduced)
+    else
+        scalar256_copy(r, &lo)
+
+# Simple multiplication for reduction (already reduced inputs)
+fn scalar256_mul_simple(c: *Scalar256, a: *Scalar256, b: *Scalar256, n: *Scalar256)
+    # Full product
+    var prod: [8]u64
+    var i: i32 = 0
+    while i < 8
+        prod[i] = 0
+        i += 1
+
+    var ai: i32 = 0
+    while ai < 4
+        var carry: u64 = 0
+        var bi: i32 = 0
+        while bi < 4
+            var lo: u64 = 0
+            var hi: u64 = 0
+            mul64(a.limbs[ai], b.limbs[bi], &lo, &hi)
+            let idx: i32 = ai + bi
+            carry = add64_carry(prod[idx], lo, carry, &prod[idx])
+            carry = carry + hi
+            bi += 1
+        var k: i32 = ai + 4
+        while carry != 0 && k < 8
+            carry = add64_carry(prod[k], 0, carry, &prod[k])
+            k += 1
+        ai += 1
+
+    # Direct reduction by repeated subtraction
+    c.limbs[0] = prod[0]
+    c.limbs[1] = prod[1]
+    c.limbs[2] = prod[2]
+    c.limbs[3] = prod[3]
+
+    # Handle overflow from upper limbs
+    var overflow: Scalar256
+    overflow.limbs[0] = prod[4]
+    overflow.limbs[1] = prod[5]
+    overflow.limbs[2] = prod[6]
+    overflow.limbs[3] = prod[7]
+
+    # Reduce lower part
+    while scalar256_cmp(c, n) >= 0
+        scalar256_sub_raw(c, c, n)
+
+    # Add overflow * 2^256 mod n recursively
+    if scalar256_is_zero(&overflow) != 1
+        var pow256: Scalar256
+        pow256.limbs[0] = 0x0C46353D039CDAAF
+        pow256.limbs[1] = 0x4319055258E8617B
+        pow256.limbs[2] = 0x0000000000000000
+        pow256.limbs[3] = 0x00000000FFFFFFFF
+
+        var contrib: Scalar256
+        scalar256_mul_simple(&contrib, &overflow, &pow256, n)
+        scalar256_add(c, c, &contrib)
+
+# Modular inversion: c = a^(-1) mod n using Fermat's Little Theorem
+# a^(-1) = a^(n-2) mod n
+pub fn scalar256_inv(c: *Scalar256, a: *Scalar256)
+    # n - 2 as bytes (big-endian)
+    var exp: [32]u8
+    exp[0] = 0xFF
+    exp[1] = 0xFF
+    exp[2] = 0xFF
+    exp[3] = 0xFF
+    exp[4] = 0x00
+    exp[5] = 0x00
+    exp[6] = 0x00
+    exp[7] = 0x00
+    exp[8] = 0xFF
+    exp[9] = 0xFF
+    exp[10] = 0xFF
+    exp[11] = 0xFF
+    exp[12] = 0xFF
+    exp[13] = 0xFF
+    exp[14] = 0xFF
+    exp[15] = 0xFF
+    exp[16] = 0xBC
+    exp[17] = 0xE6
+    exp[18] = 0xFA
+    exp[19] = 0xAD
+    exp[20] = 0xA7
+    exp[21] = 0x17
+    exp[22] = 0x9E
+    exp[23] = 0x84
+    exp[24] = 0xF3
+    exp[25] = 0xB9
+    exp[26] = 0xCA
+    exp[27] = 0xC2
+    exp[28] = 0xFC
+    exp[29] = 0x63
+    exp[30] = 0x25
+    exp[31] = 0x4F  # n - 2
+
+    var result: Scalar256
+    scalar256_one(&result)
+
+    var base: Scalar256
+    scalar256_copy(&base, a)
+
+    var byte_idx: i32 = 31
+    while byte_idx >= 0
+        var bit: i32 = 0
+        while bit < 8
+            let b: u8 = (exp[byte_idx] >> bit) & 1
+            if b == 1
+                scalar256_mul(&result, &result, &base)
+            scalar256_mul(&base, &base, &base)
+            bit += 1
+        byte_idx -= 1
+
+    scalar256_copy(c, &result)
+
+# ============================================================================
+# Field Element Operations
+# ============================================================================
+
+# Zero
+pub fn fep256_zero(a: *FeP256)
+    a.limbs[0] = 0
+    a.limbs[1] = 0
+    a.limbs[2] = 0
+    a.limbs[3] = 0
+
+# One
+pub fn fep256_one(a: *FeP256)
+    a.limbs[0] = 1
+    a.limbs[1] = 0
+    a.limbs[2] = 0
+    a.limbs[3] = 0
+
+# Copy
+pub fn fep256_copy(dst: *FeP256, src: *FeP256)
+    dst.limbs[0] = src.limbs[0]
+    dst.limbs[1] = src.limbs[1]
+    dst.limbs[2] = src.limbs[2]
+    dst.limbs[3] = src.limbs[3]
+
+# Check if zero
+pub fn fep256_is_zero(a: *FeP256) -> i32
+    if a.limbs[0] != 0
+        return 0
+    if a.limbs[1] != 0
+        return 0
+    if a.limbs[2] != 0
+        return 0
+    if a.limbs[3] != 0
+        return 0
+    return 1
+
+# Compare: returns -1 if a < b, 0 if a == b, 1 if a > b
+pub fn fep256_cmp(a: *FeP256, b: *FeP256) -> i32
+    # Compare from most significant limb
+    if a.limbs[3] > b.limbs[3]
+        return 1
+    if a.limbs[3] < b.limbs[3]
+        return -1
+    if a.limbs[2] > b.limbs[2]
+        return 1
+    if a.limbs[2] < b.limbs[2]
+        return -1
+    if a.limbs[1] > b.limbs[1]
+        return 1
+    if a.limbs[1] < b.limbs[1]
+        return -1
+    if a.limbs[0] > b.limbs[0]
+        return 1
+    if a.limbs[0] < b.limbs[0]
+        return -1
+    return 0
+
+# ============================================================================
+# Byte Conversion
+# ============================================================================
+
+# Load a u64 from 8 big-endian bytes
+fn load_u64_be(data: *u8) -> u64
+    var r: u64 = (data[0] as u64) << 56
+    r = r | ((data[1] as u64) << 48)
+    r = r | ((data[2] as u64) << 40)
+    r = r | ((data[3] as u64) << 32)
+    r = r | ((data[4] as u64) << 24)
+    r = r | ((data[5] as u64) << 16)
+    r = r | ((data[6] as u64) << 8)
+    r = r | (data[7] as u64)
+    return r
+
+# Load from big-endian bytes (32 bytes)
+pub fn fep256_from_bytes(a: *FeP256, data: *u8)
+    # Big-endian: data[0] is most significant byte
+    a.limbs[3] = load_u64_be(&data[0])
+    a.limbs[2] = load_u64_be(&data[8])
+    a.limbs[1] = load_u64_be(&data[16])
+    a.limbs[0] = load_u64_be(&data[24])
+
+# Store to big-endian bytes (32 bytes)
+pub fn fep256_to_bytes(a: *FeP256, out: *u8)
+    # limbs[3] -> data[0..7], etc.
+    out[0] = (a.limbs[3] >> 56) as u8
+    out[1] = (a.limbs[3] >> 48) as u8
+    out[2] = (a.limbs[3] >> 40) as u8
+    out[3] = (a.limbs[3] >> 32) as u8
+    out[4] = (a.limbs[3] >> 24) as u8
+    out[5] = (a.limbs[3] >> 16) as u8
+    out[6] = (a.limbs[3] >> 8) as u8
+    out[7] = a.limbs[3] as u8
+
+    out[8] = (a.limbs[2] >> 56) as u8
+    out[9] = (a.limbs[2] >> 48) as u8
+    out[10] = (a.limbs[2] >> 40) as u8
+    out[11] = (a.limbs[2] >> 32) as u8
+    out[12] = (a.limbs[2] >> 24) as u8
+    out[13] = (a.limbs[2] >> 16) as u8
+    out[14] = (a.limbs[2] >> 8) as u8
+    out[15] = a.limbs[2] as u8
+
+    out[16] = (a.limbs[1] >> 56) as u8
+    out[17] = (a.limbs[1] >> 48) as u8
+    out[18] = (a.limbs[1] >> 40) as u8
+    out[19] = (a.limbs[1] >> 32) as u8
+    out[20] = (a.limbs[1] >> 24) as u8
+    out[21] = (a.limbs[1] >> 16) as u8
+    out[22] = (a.limbs[1] >> 8) as u8
+    out[23] = a.limbs[1] as u8
+
+    out[24] = (a.limbs[0] >> 56) as u8
+    out[25] = (a.limbs[0] >> 48) as u8
+    out[26] = (a.limbs[0] >> 40) as u8
+    out[27] = (a.limbs[0] >> 32) as u8
+    out[28] = (a.limbs[0] >> 24) as u8
+    out[29] = (a.limbs[0] >> 16) as u8
+    out[30] = (a.limbs[0] >> 8) as u8
+    out[31] = a.limbs[0] as u8
+
+# ============================================================================
+# Addition and Subtraction (without reduction)
+# ============================================================================
+
+# Add two field elements, returning carry
+fn fep256_add_raw(c: *FeP256, a: *FeP256, b: *FeP256) -> u64
+    var carry: u64 = 0
+
+    # Limb 0
+    let sum0: u64 = a.limbs[0] + b.limbs[0]
+    let c0: u64 = (sum0 < a.limbs[0]) as u64
+    c.limbs[0] = sum0
+
+    # Limb 1
+    let sum1a: u64 = a.limbs[1] + b.limbs[1]
+    let c1a: u64 = (sum1a < a.limbs[1]) as u64
+    let sum1b: u64 = sum1a + c0
+    let c1b: u64 = (sum1b < sum1a) as u64
+    c.limbs[1] = sum1b
+    carry = c1a + c1b
+
+    # Limb 2
+    let sum2a: u64 = a.limbs[2] + b.limbs[2]
+    let c2a: u64 = (sum2a < a.limbs[2]) as u64
+    let sum2b: u64 = sum2a + carry
+    let c2b: u64 = (sum2b < sum2a) as u64
+    c.limbs[2] = sum2b
+    carry = c2a + c2b
+
+    # Limb 3
+    let sum3a: u64 = a.limbs[3] + b.limbs[3]
+    let c3a: u64 = (sum3a < a.limbs[3]) as u64
+    let sum3b: u64 = sum3a + carry
+    let c3b: u64 = (sum3b < sum3a) as u64
+    c.limbs[3] = sum3b
+
+    return c3a + c3b
+
+# Subtract b from a, returning borrow (1 if a < b, 0 otherwise)
+fn fep256_sub_raw(c: *FeP256, a: *FeP256, b: *FeP256) -> u64
+    var borrow: u64 = 0
+
+    # Limb 0
+    let d0: u64 = a.limbs[0] - b.limbs[0]
+    let b0: u64 = (a.limbs[0] < b.limbs[0]) as u64
+    c.limbs[0] = d0
+
+    # Limb 1
+    let d1a: u64 = a.limbs[1] - b.limbs[1]
+    let b1a: u64 = (a.limbs[1] < b.limbs[1]) as u64
+    let d1b: u64 = d1a - b0
+    let b1b: u64 = (d1a < b0) as u64
+    c.limbs[1] = d1b
+    borrow = b1a + b1b
+
+    # Limb 2
+    let d2a: u64 = a.limbs[2] - b.limbs[2]
+    let b2a: u64 = (a.limbs[2] < b.limbs[2]) as u64
+    let d2b: u64 = d2a - borrow
+    let b2b: u64 = (d2a < borrow) as u64
+    c.limbs[2] = d2b
+    borrow = b2a + b2b
+
+    # Limb 3
+    let d3a: u64 = a.limbs[3] - b.limbs[3]
+    let b3a: u64 = (a.limbs[3] < b.limbs[3]) as u64
+    let d3b: u64 = d3a - borrow
+    let b3b: u64 = (d3a < borrow) as u64
+    c.limbs[3] = d3b
+
+    return b3a + b3b
+
+# ============================================================================
+# Reduction modulo p
+# ============================================================================
+
+# Reduce c (possibly >= p) to canonical form [0, p)
+# Uses the special structure of p = 2^256 - 2^224 + 2^192 + 2^96 - 1
+pub fn fep256_reduce(c: *FeP256)
+    var p: FeP256
+    get_p256_prime(&p)
+
+    # If c >= p, subtract p
+    if fep256_cmp(c, &p) >= 0
+        fep256_sub_raw(c, c, &p)
+
+# ============================================================================
+# Modular Addition: c = (a + b) mod p
+# ============================================================================
+
+pub fn fep256_add(c: *FeP256, a: *FeP256, b: *FeP256)
+    let carry: u64 = fep256_add_raw(c, a, b)
+
+    var p: FeP256
+    get_p256_prime(&p)
+
+    # If carry or c >= p, subtract p
+    if carry != 0 || fep256_cmp(c, &p) >= 0
+        fep256_sub_raw(c, c, &p)
+
+# ============================================================================
+# Modular Subtraction: c = (a - b) mod p
+# ============================================================================
+
+pub fn fep256_sub(c: *FeP256, a: *FeP256, b: *FeP256)
+    let borrow: u64 = fep256_sub_raw(c, a, b)
+
+    # If borrow, add p
+    if borrow != 0
+        var p: FeP256
+        get_p256_prime(&p)
+        fep256_add_raw(c, c, &p)
+
+# ============================================================================
+# Modular Negation: c = -a mod p = p - a
+# ============================================================================
+
+pub fn fep256_neg(c: *FeP256, a: *FeP256)
+    if fep256_is_zero(a) == 1
+        fep256_zero(c)
+        return
+
+    var p: FeP256
+    get_p256_prime(&p)
+    fep256_sub_raw(c, &p, a)
+
+# ============================================================================
+# 64-bit Multiplication Helper (produces 128-bit result)
+# ============================================================================
+
+# Multiply two 64-bit values, return low and high parts
+fn mul64(a: u64, b: u64, lo: *u64, hi: *u64)
+    # Split into 32-bit halves for cross-multiplication
+    let a_lo: u64 = a & 0xFFFFFFFF
+    let a_hi: u64 = a >> 32
+    let b_lo: u64 = b & 0xFFFFFFFF
+    let b_hi: u64 = b >> 32
+
+    # Partial products
+    let p0: u64 = a_lo * b_lo           # Low * Low
+    let p1: u64 = a_lo * b_hi           # Low * High
+    let p2: u64 = a_hi * b_lo           # High * Low
+    let p3: u64 = a_hi * b_hi           # High * High
+
+    # Combine with carry propagation
+    let mid: u64 = p1 + p2
+    let mid_carry: u64 = ((mid < p1) as u64) << 32  # Overflow to high
+
+    let lo_part: u64 = p0 + (mid << 32)
+    let lo_carry: u64 = (lo_part < p0) as u64
+
+    *lo = lo_part
+    *hi = p3 + (mid >> 32) + mid_carry + lo_carry
+
+# Add 64-bit value with carry, return new carry
+fn add64_carry(a: u64, b: u64, carry_in: u64, result: *u64) -> u64
+    let sum1: u64 = a + b
+    let c1: u64 = (sum1 < a) as u64
+    let sum2: u64 = sum1 + carry_in
+    let c2: u64 = (sum2 < sum1) as u64
+    *result = sum2
+    return c1 + c2
+
+# ============================================================================
+# Modular Multiplication: c = (a * b) mod p
+# ============================================================================
+
+# Multiply and reduce modulo p using the special prime structure
+pub fn fep256_mul(c: *FeP256, a: *FeP256, b: *FeP256)
+    # Full 512-bit product in 8 limbs
+    var prod: [8]u64
+    var i: i32 = 0
+    while i < 8
+        prod[i] = 0
+        i += 1
+
+    # Schoolbook multiplication
+    var ai: i32 = 0
+    while ai < 4
+        var carry: u64 = 0
+        var bi: i32 = 0
+        while bi < 4
+            var lo: u64 = 0
+            var hi: u64 = 0
+            mul64(a.limbs[ai], b.limbs[bi], &lo, &hi)
+
+            # Add to accumulator
+            let idx: i32 = ai + bi
+            carry = add64_carry(prod[idx], lo, carry, &prod[idx])
+            carry = carry + hi
+            bi += 1
+
+        # Propagate remaining carry
+        var k: i32 = ai + 4
+        while carry != 0 && k < 8
+            carry = add64_carry(prod[k], 0, carry, &prod[k])
+            k += 1
+        ai += 1
+
+    # Reduce modulo p using the P-256 reduction formula
+    # p = 2^256 - 2^224 + 2^192 + 2^96 - 1
+    # So 2^256 ≡ 2^224 - 2^192 - 2^96 + 1 (mod p)
+    fep256_reduce_512(&prod[0], c)
+
+# ============================================================================
+# P-256 Specific Reduction
+# ============================================================================
+
+# Reduce a 512-bit value (8 limbs) modulo p
+# Uses the NIST P-256 fast reduction method
+# p = 2^256 - 2^224 + 2^192 + 2^96 - 1
+fn fep256_reduce_512(prod: *u64, r: *FeP256)
+    # The reduction uses these 256-bit terms (32-bit word indices):
+    # Let c7,c6,c5,c4,c3,c2,c1,c0 be the 32-bit words of the 512-bit product
+    # where c0 is least significant.
+    # In our 64-bit representation:
+    #   prod[0] = c1:c0, prod[1] = c3:c2, prod[2] = c5:c4, prod[3] = c7:c6
+    #   prod[4] = c9:c8, prod[5] = c11:c10, prod[6] = c13:c12, prod[7] = c15:c14
+
+    # Extract 32-bit words for the NIST reduction formula
+    let c0: u64 = prod[0] & 0xFFFFFFFF
+    let c1: u64 = prod[0] >> 32
+    let c2: u64 = prod[1] & 0xFFFFFFFF
+    let c3: u64 = prod[1] >> 32
+    let c4: u64 = prod[2] & 0xFFFFFFFF
+    let c5: u64 = prod[2] >> 32
+    let c6: u64 = prod[3] & 0xFFFFFFFF
+    let c7: u64 = prod[3] >> 32
+    let c8: u64 = prod[4] & 0xFFFFFFFF
+    let c9: u64 = prod[4] >> 32
+    let c10: u64 = prod[5] & 0xFFFFFFFF
+    let c11: u64 = prod[5] >> 32
+    let c12: u64 = prod[6] & 0xFFFFFFFF
+    let c13: u64 = prod[6] >> 32
+    let c14: u64 = prod[7] & 0xFFFFFFFF
+    let c15: u64 = prod[7] >> 32
+
+    # NIST P-256 reduction: c mod p = T + 2*S1 + 2*S2 + S3 + S4 - D1 - D2 - D3 - D4
+    # Where (all 256-bit):
+    # T  = (c7, c6, c5, c4, c3, c2, c1, c0)
+    # S1 = (c15, c14, c13, c12, c11, 0, 0, 0)
+    # S2 = (0, c15, c14, c13, c12, 0, 0, 0)
+    # S3 = (c15, c14, 0, 0, 0, c10, c9, c8)
+    # S4 = (c8, c13, c15, c14, c13, c11, c10, c9)
+    # D1 = (c10, c8, 0, 0, 0, c13, c12, c11)
+    # D2 = (c11, c9, 0, 0, c15, c14, c13, c12)
+    # D3 = (c12, 0, c10, c9, c8, c15, c14, c13)
+    # D4 = (c13, 0, c11, c10, c9, 0, c15, c14)
+
+    var acc: [8]i64
+    var i: i32 = 0
+    while i < 8
+        acc[i] = 0
+        i += 1
+
+    # T = low 256 bits
+    acc[0] = c0 as i64
+    acc[1] = c1 as i64
+    acc[2] = c2 as i64
+    acc[3] = c3 as i64
+    acc[4] = c4 as i64
+    acc[5] = c5 as i64
+    acc[6] = c6 as i64
+    acc[7] = c7 as i64
+
+    # + 2*S1 = 2*(c15, c14, c13, c12, c11, 0, 0, 0)
+    acc[3] = acc[3] + 2 * (c11 as i64)
+    acc[4] = acc[4] + 2 * (c12 as i64)
+    acc[5] = acc[5] + 2 * (c13 as i64)
+    acc[6] = acc[6] + 2 * (c14 as i64)
+    acc[7] = acc[7] + 2 * (c15 as i64)
+
+    # + 2*S2 = 2*(0, c15, c14, c13, c12, 0, 0, 0)
+    acc[3] = acc[3] + 2 * (c12 as i64)
+    acc[4] = acc[4] + 2 * (c13 as i64)
+    acc[5] = acc[5] + 2 * (c14 as i64)
+    acc[6] = acc[6] + 2 * (c15 as i64)
+
+    # + S3 = (c15, c14, 0, 0, 0, c10, c9, c8)
+    acc[0] = acc[0] + (c8 as i64)
+    acc[1] = acc[1] + (c9 as i64)
+    acc[2] = acc[2] + (c10 as i64)
+    acc[6] = acc[6] + (c14 as i64)
+    acc[7] = acc[7] + (c15 as i64)
+
+    # + S4 = (c8, c13, c15, c14, c13, c11, c10, c9)
+    acc[0] = acc[0] + (c9 as i64)
+    acc[1] = acc[1] + (c10 as i64)
+    acc[2] = acc[2] + (c11 as i64)
+    acc[3] = acc[3] + (c13 as i64)
+    acc[4] = acc[4] + (c14 as i64)
+    acc[5] = acc[5] + (c15 as i64)
+    acc[6] = acc[6] + (c13 as i64)
+    acc[7] = acc[7] + (c8 as i64)
+
+    # - D1 = (c10, c8, 0, 0, 0, c13, c12, c11)
+    acc[0] = acc[0] - (c11 as i64)
+    acc[1] = acc[1] - (c12 as i64)
+    acc[2] = acc[2] - (c13 as i64)
+    acc[6] = acc[6] - (c8 as i64)
+    acc[7] = acc[7] - (c10 as i64)
+
+    # - D2 = (c11, c9, 0, 0, c15, c14, c13, c12)
+    acc[0] = acc[0] - (c12 as i64)
+    acc[1] = acc[1] - (c13 as i64)
+    acc[2] = acc[2] - (c14 as i64)
+    acc[3] = acc[3] - (c15 as i64)
+    acc[6] = acc[6] - (c9 as i64)
+    acc[7] = acc[7] - (c11 as i64)
+
+    # - D3 = (c12, 0, c10, c9, c8, c15, c14, c13)
+    acc[0] = acc[0] - (c13 as i64)
+    acc[1] = acc[1] - (c14 as i64)
+    acc[2] = acc[2] - (c15 as i64)
+    acc[3] = acc[3] - (c8 as i64)
+    acc[4] = acc[4] - (c9 as i64)
+    acc[5] = acc[5] - (c10 as i64)
+    acc[7] = acc[7] - (c12 as i64)
+
+    # - D4 = (c13, 0, c11, c10, c9, 0, c15, c14)
+    acc[0] = acc[0] - (c14 as i64)
+    acc[1] = acc[1] - (c15 as i64)
+    acc[3] = acc[3] - (c9 as i64)
+    acc[4] = acc[4] - (c10 as i64)
+    acc[5] = acc[5] - (c11 as i64)
+    acc[7] = acc[7] - (c13 as i64)
+
+    # Propagate carries through 32-bit words
+    var carry: i64 = 0
+    i = 0
+    while i < 8
+        acc[i] = acc[i] + carry
+        carry = acc[i] >> 32
+        acc[i] = acc[i] & 0xFFFFFFFF
+        i += 1
+
+    # Recombine into 64-bit limbs
+    r.limbs[0] = (acc[0] as u64) | ((acc[1] as u64) << 32)
+    r.limbs[1] = (acc[2] as u64) | ((acc[3] as u64) << 32)
+    r.limbs[2] = (acc[4] as u64) | ((acc[5] as u64) << 32)
+    r.limbs[3] = (acc[6] as u64) | ((acc[7] as u64) << 32)
+
+    # Handle final carry/borrow
+    var p: FeP256
+    get_p256_prime(&p)
+
+    while carry > 0
+        fep256_sub_raw(r, r, &p)
+        carry -= 1
+    while carry < 0
+        fep256_add_raw(r, r, &p)
+        carry += 1
+
+    # Final reduction to ensure result < p
+    fep256_reduce(r)
+
+# ============================================================================
+# Modular Squaring: c = a^2 mod p
+# ============================================================================
+
+pub fn fep256_sqr(c: *FeP256, a: *FeP256)
+    # For simplicity, use multiplication
+    # TODO: Optimize with specialized squaring (fewer multiplications)
+    fep256_mul(c, a, a)
+
+# ============================================================================
+# Modular Inversion: c = a^(-1) mod p using Fermat's Little Theorem
+# ============================================================================
+# a^(-1) = a^(p-2) mod p
+
+pub fn fep256_inv(c: *FeP256, a: *FeP256)
+    # p - 2 = 0xFFFFFFFF00000001000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFD
+    # We use an addition chain optimized for P-256
+
+    var t1: FeP256
+    var t2: FeP256
+    var t3: FeP256
+
+    # Build up powers using squaring and multiplication
+    # This uses the standard binary exponentiation with some optimizations
+
+    # t1 = a^2
+    fep256_sqr(&t1, a)
+    # t2 = a^3 = t1 * a
+    fep256_mul(&t2, &t1, a)
+    # t1 = a^6 = (a^3)^2
+    fep256_sqr(&t1, &t2)
+    # t3 = a^7 = a^6 * a
+    fep256_mul(&t3, &t1, a)
+    # t1 = a^14
+    fep256_sqr(&t1, &t3)
+    # t2 = a^15 = a^14 * a
+    fep256_mul(&t2, &t1, a)
+
+    # Continue building up the exponent
+    # Square 4 times to get a^(15 * 16) = a^240
+    var i: i32 = 0
+    fep256_copy(&t1, &t2)
+    while i < 4
+        fep256_sqr(&t1, &t1)
+        i += 1
+    # Multiply by a^15 to get a^255
+    fep256_mul(&t1, &t1, &t2)
+
+    # Continue with more squarings and multiplications
+    # This is an abbreviated version - for production, use optimized addition chain
+
+    # a^(2^32 - 1) via repeated squaring and multiplying
+    fep256_copy(&t3, &t1)
+    i = 0
+    while i < 8
+        fep256_sqr(&t3, &t3)
+        i += 1
+    fep256_mul(&t3, &t3, &t1)  # a^(2^16 - 1) * 2^8 + a^255 = a^(2^16 - 1 - 256 + 255)?
+
+    # This simplified version does full binary exponentiation
+    # For better performance, use an optimized addition chain
+    fep256_pow_p_minus_2(c, a)
+
+# Full binary exponentiation for a^(p-2)
+fn fep256_pow_p_minus_2(c: *FeP256, a: *FeP256)
+    # p - 2 as bytes (big-endian)
+    # = FFFFFFFF00000001000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFD
+    var exp: [32]u8
+    exp[0] = 0xFF
+    exp[1] = 0xFF
+    exp[2] = 0xFF
+    exp[3] = 0xFF
+    exp[4] = 0x00
+    exp[5] = 0x00
+    exp[6] = 0x00
+    exp[7] = 0x01
+    exp[8] = 0x00
+    exp[9] = 0x00
+    exp[10] = 0x00
+    exp[11] = 0x00
+    exp[12] = 0x00
+    exp[13] = 0x00
+    exp[14] = 0x00
+    exp[15] = 0x00
+    exp[16] = 0x00
+    exp[17] = 0x00
+    exp[18] = 0x00
+    exp[19] = 0x00
+    exp[20] = 0xFF
+    exp[21] = 0xFF
+    exp[22] = 0xFF
+    exp[23] = 0xFF
+    exp[24] = 0xFF
+    exp[25] = 0xFF
+    exp[26] = 0xFF
+    exp[27] = 0xFF
+    exp[28] = 0xFF
+    exp[29] = 0xFF
+    exp[30] = 0xFF
+    exp[31] = 0xFD  # p - 2
+
+    var result: FeP256
+    fep256_one(&result)
+
+    var base: FeP256
+    fep256_copy(&base, a)
+
+    # Process from least significant bit
+    var byte_idx: i32 = 31
+    while byte_idx >= 0
+        var bit: i32 = 0
+        while bit < 8
+            let b: u8 = (exp[byte_idx] >> bit) & 1
+            if b == 1
+                fep256_mul(&result, &result, &base)
+            fep256_sqr(&base, &base)
+            bit += 1
+        byte_idx -= 1
+
+    fep256_copy(c, &result)
+
+# ============================================================================
+# Curve Constant b
+# ============================================================================
+# b = 0x5AC635D8AA3A93E7B3EBBD55769886BC651D06B0CC53B0F63BCE3C3E27D2604B
+
+pub fn fep256_set_b(b: *FeP256)
+    b.limbs[0] = 0x3BCE3C3E27D2604B
+    b.limbs[1] = 0x651D06B0CC53B0F6
+    b.limbs[2] = 0xB3EBBD55769886BC
+    b.limbs[3] = 0x5AC635D8AA3A93E7
+
+# ============================================================================
+# Generator Point Gx coordinate
+# ============================================================================
+# Gx = 0x6B17D1F2E12C4247F8BCE6E563A440F277037D812DEB33A0F4A13945D898C296
+
+pub fn fep256_set_gx(gx: *FeP256)
+    gx.limbs[0] = 0xF4A13945D898C296
+    gx.limbs[1] = 0x77037D812DEB33A0
+    gx.limbs[2] = 0xF8BCE6E563A440F2
+    gx.limbs[3] = 0x6B17D1F2E12C4247
+
+# ============================================================================
+# Generator Point Gy coordinate
+# ============================================================================
+# Gy = 0x4FE342E2FE1A7F9B8EE7EB4A7C0F9E162BCE33576B315ECECBB6406837BF51F5
+
+pub fn fep256_set_gy(gy: *FeP256)
+    gy.limbs[0] = 0xCBB6406837BF51F5
+    gy.limbs[1] = 0x2BCE33576B315ECE
+    gy.limbs[2] = 0x8EE7EB4A7C0F9E16
+    gy.limbs[3] = 0x4FE342E2FE1A7F9B
+
+# ============================================================================
+# Point Representation: Jacobian Coordinates
+# ============================================================================
+# Using Jacobian coordinates (X, Y, Z) where:
+#   x = X/Z^2
+#   y = Y/Z^3
+# Point at infinity has Z = 0
+
+pub struct P256Point
+    x: FeP256
+    y: FeP256
+    z: FeP256
+
+# Initialize point to the point at infinity (neutral element)
+pub fn p256_point_identity(p: *P256Point)
+    fep256_one(&p.x)
+    fep256_one(&p.y)
+    fep256_zero(&p.z)
+
+# Check if point is the identity (point at infinity)
+pub fn p256_point_is_identity(p: *P256Point) -> i32
+    return fep256_is_zero(&p.z)
+
+# Copy point
+pub fn p256_point_copy(dst: *P256Point, src: *P256Point)
+    fep256_copy(&dst.x, &src.x)
+    fep256_copy(&dst.y, &src.y)
+    fep256_copy(&dst.z, &src.z)
+
+# Set point to the generator G
+pub fn p256_point_generator(g: *P256Point)
+    fep256_set_gx(&g.x)
+    fep256_set_gy(&g.y)
+    fep256_one(&g.z)
+
+# Set point from affine coordinates (x, y)
+pub fn p256_point_from_affine(p: *P256Point, x: *FeP256, y: *FeP256)
+    fep256_copy(&p.x, x)
+    fep256_copy(&p.y, y)
+    fep256_one(&p.z)
+
+# Convert from Jacobian to affine coordinates
+# Returns 1 on success, 0 if point is at infinity
+pub fn p256_point_to_affine(p: *P256Point, x: *FeP256, y: *FeP256) -> i32
+    if p256_point_is_identity(p) == 1
+        return 0
+
+    var z_inv: FeP256
+    var z2: FeP256
+    var z3: FeP256
+
+    # z_inv = z^(-1)
+    fep256_inv(&z_inv, &p.z)
+
+    # z2 = z^(-2)
+    fep256_sqr(&z2, &z_inv)
+
+    # z3 = z^(-3)
+    fep256_mul(&z3, &z2, &z_inv)
+
+    # x_affine = X * z^(-2)
+    fep256_mul(x, &p.x, &z2)
+
+    # y_affine = Y * z^(-3)
+    fep256_mul(y, &p.y, &z3)
+
+    return 1
+
+# ============================================================================
+# Point Negation: -P = (X, -Y, Z)
+# ============================================================================
+
+pub fn p256_point_neg(r: *P256Point, p: *P256Point)
+    fep256_copy(&r.x, &p.x)
+    fep256_neg(&r.y, &p.y)
+    fep256_copy(&r.z, &p.z)
+
+# ============================================================================
+# Point Doubling: R = 2*P (Jacobian coordinates)
+# ============================================================================
+# Using the formula for a = -3:
+# S = 4*X*Y^2
+# M = 3*X^2 + a*Z^4 = 3*(X - Z^2)*(X + Z^2) for a = -3
+# X' = M^2 - 2*S
+# Y' = M*(S - X') - 8*Y^4
+# Z' = 2*Y*Z
+
+pub fn p256_point_double(r: *P256Point, p: *P256Point)
+    if p256_point_is_identity(p) == 1
+        p256_point_identity(r)
+        return
+
+    var s: FeP256
+    var m: FeP256
+    var t1: FeP256
+    var t2: FeP256
+    var y2: FeP256
+    var z2: FeP256
+
+    # y2 = Y^2
+    fep256_sqr(&y2, &p.y)
+
+    # s = 4*X*Y^2
+    fep256_mul(&s, &p.x, &y2)
+    fep256_add(&s, &s, &s)
+    fep256_add(&s, &s, &s)  # s = 4*X*Y^2
+
+    # For a = -3: M = 3*(X - Z^2)*(X + Z^2)
+    fep256_sqr(&z2, &p.z)
+
+    # t1 = X - Z^2
+    fep256_sub(&t1, &p.x, &z2)
+
+    # t2 = X + Z^2
+    fep256_add(&t2, &p.x, &z2)
+
+    # m = t1 * t2
+    fep256_mul(&m, &t1, &t2)
+
+    # m = 3 * m
+    fep256_add(&t1, &m, &m)
+    fep256_add(&m, &t1, &m)  # m = 3*(X - Z^2)*(X + Z^2)
+
+    # X' = M^2 - 2*S
+    fep256_sqr(&t1, &m)
+    fep256_sub(&r.x, &t1, &s)
+    fep256_sub(&r.x, &r.x, &s)
+
+    # Y' = M*(S - X') - 8*Y^4
+    fep256_sub(&t1, &s, &r.x)
+    fep256_mul(&t1, &m, &t1)
+
+    # 8*Y^4 = 2 * 4*Y^4 = 2 * (2*Y^2)^2
+    fep256_add(&t2, &y2, &y2)  # 2*Y^2
+    fep256_sqr(&t2, &t2)       # 4*Y^4
+    fep256_add(&t2, &t2, &t2)  # 8*Y^4
+
+    fep256_sub(&r.y, &t1, &t2)
+
+    # Z' = 2*Y*Z
+    fep256_mul(&r.z, &p.y, &p.z)
+    fep256_add(&r.z, &r.z, &r.z)
+
+# ============================================================================
+# Point Addition: R = P + Q (Jacobian coordinates)
+# ============================================================================
+# Using the standard formula:
+# U1 = X1*Z2^2, U2 = X2*Z1^2
+# S1 = Y1*Z2^3, S2 = Y2*Z1^3
+# H = U2 - U1
+# R = S2 - S1
+# X3 = R^2 - H^3 - 2*U1*H^2
+# Y3 = R*(U1*H^2 - X3) - S1*H^3
+# Z3 = H*Z1*Z2
+
+pub fn p256_point_add(r: *P256Point, p: *P256Point, q: *P256Point)
+    # Handle identity cases
+    if p256_point_is_identity(p) == 1
+        p256_point_copy(r, q)
+        return
+    if p256_point_is_identity(q) == 1
+        p256_point_copy(r, p)
+        return
+
+    var u1: FeP256
+    var u2: FeP256
+    var s1: FeP256
+    var s2: FeP256
+    var h: FeP256
+    var rr: FeP256
+    var t1: FeP256
+    var t2: FeP256
+    var z1z1: FeP256
+    var z2z2: FeP256
+    var h2: FeP256
+    var h3: FeP256
+
+    # Z1^2, Z2^2
+    fep256_sqr(&z1z1, &p.z)
+    fep256_sqr(&z2z2, &q.z)
+
+    # U1 = X1*Z2^2, U2 = X2*Z1^2
+    fep256_mul(&u1, &p.x, &z2z2)
+    fep256_mul(&u2, &q.x, &z1z1)
+
+    # S1 = Y1*Z2^3, S2 = Y2*Z1^3
+    fep256_mul(&t1, &z2z2, &q.z)  # Z2^3
+    fep256_mul(&s1, &p.y, &t1)
+    fep256_mul(&t1, &z1z1, &p.z)  # Z1^3
+    fep256_mul(&s2, &q.y, &t1)
+
+    # H = U2 - U1
+    fep256_sub(&h, &u2, &u1)
+
+    # R = S2 - S1
+    fep256_sub(&rr, &s2, &s1)
+
+    # Check for special cases
+    if fep256_is_zero(&h) == 1
+        if fep256_is_zero(&rr) == 1
+            # P == Q, do doubling
+            p256_point_double(r, p)
+            return
+        else
+            # P == -Q, result is identity
+            p256_point_identity(r)
+            return
+
+    # H^2, H^3
+    fep256_sqr(&h2, &h)
+    fep256_mul(&h3, &h2, &h)
+
+    # U1*H^2
+    fep256_mul(&t1, &u1, &h2)
+
+    # X3 = R^2 - H^3 - 2*U1*H^2
+    fep256_sqr(&r.x, &rr)
+    fep256_sub(&r.x, &r.x, &h3)
+    fep256_sub(&r.x, &r.x, &t1)
+    fep256_sub(&r.x, &r.x, &t1)
+
+    # Y3 = R*(U1*H^2 - X3) - S1*H^3
+    fep256_sub(&t2, &t1, &r.x)
+    fep256_mul(&t2, &rr, &t2)
+    fep256_mul(&t1, &s1, &h3)
+    fep256_sub(&r.y, &t2, &t1)
+
+    # Z3 = H*Z1*Z2
+    fep256_mul(&r.z, &h, &p.z)
+    fep256_mul(&r.z, &r.z, &q.z)
+
+# ============================================================================
+# Scalar Multiplication: R = k * P
+# ============================================================================
+# Using double-and-add method
+
+pub fn p256_scalar_mult(r: *P256Point, k: *u8, k_len: i32, p: *P256Point)
+    p256_point_identity(r)
+
+    # Process scalar from most significant byte to least
+    var byte_idx: i32 = 0
+    while byte_idx < k_len
+        var bit: i32 = 7
+        while bit >= 0
+            # Double
+            var doubled: P256Point
+            p256_point_double(&doubled, r)
+            p256_point_copy(r, &doubled)
+
+            # Add if bit is set
+            let b: u8 = (k[byte_idx] >> bit) & 1
+            if b == 1
+                var sum: P256Point
+                p256_point_add(&sum, r, p)
+                p256_point_copy(r, &sum)
+            bit -= 1
+        byte_idx += 1
+
+# ============================================================================
+# Check if point is on the curve: y^2 = x^3 + ax + b (mod p)
+# ============================================================================
+
+# Check if affine point (x, y) is on curve
+pub fn p256_affine_on_curve(x: *FeP256, y: *FeP256) -> i32
+    # Compute y^2
+    var y2: FeP256
+    fep256_sqr(&y2, y)
+
+    # Compute x^3 + ax + b where a = -3
+    var x2: FeP256
+    var x3: FeP256
+    var t: FeP256
+    var rhs: FeP256
+
+    # x^2, x^3
+    fep256_sqr(&x2, x)
+    fep256_mul(&x3, &x2, x)
+
+    # -3x (since a = -3)
+    fep256_add(&t, x, x)
+    fep256_add(&t, &t, x)  # 3x
+    fep256_neg(&t, &t)      # -3x
+
+    # x^3 - 3x
+    fep256_add(&rhs, &x3, &t)
+
+    # x^3 - 3x + b
+    var b: FeP256
+    fep256_set_b(&b)
+    fep256_add(&rhs, &rhs, &b)
+
+    # Check y^2 == x^3 - 3x + b
+    return fep256_cmp(&y2, &rhs) == 0
+
+# Check if Jacobian point is on the curve
+# For Z=1 points (affine), this is efficient
+# For Z!=1 points, we check: Y^2 = X^3 + aXZ^4 + bZ^6
+pub fn p256_point_on_curve(p: *P256Point) -> i32
+    if p256_point_is_identity(p) == 1
+        return 1  # Identity is on the curve
+
+    # For Z=1 (affine), do direct check
+    var one: FeP256
+    fep256_one(&one)
+    if fep256_cmp(&p.z, &one) == 0
+        return p256_affine_on_curve(&p.x, &p.y)
+
+    # For Z!=1, check: Y^2 = X^3 + a*X*Z^4 + b*Z^6
+    var z2: FeP256
+    var z4: FeP256
+    var z6: FeP256
+    var y2: FeP256
+    var x3: FeP256
+    var t1: FeP256
+    var t2: FeP256
+    var rhs: FeP256
+    var b: FeP256
+
+    # Z^2, Z^4, Z^6
+    fep256_sqr(&z2, &p.z)
+    fep256_sqr(&z4, &z2)
+    fep256_mul(&z6, &z4, &z2)
+
+    # Y^2
+    fep256_sqr(&y2, &p.y)
+
+    # X^3
+    fep256_sqr(&t1, &p.x)
+    fep256_mul(&x3, &t1, &p.x)
+
+    # a*X*Z^4 where a = -3
+    fep256_mul(&t1, &p.x, &z4)
+    fep256_add(&t2, &t1, &t1)
+    fep256_add(&t2, &t2, &t1)  # 3*X*Z^4
+    fep256_neg(&t2, &t2)        # -3*X*Z^4
+
+    # b*Z^6
+    fep256_set_b(&b)
+    fep256_mul(&t1, &b, &z6)
+
+    # RHS = X^3 + (-3*X*Z^4) + b*Z^6
+    fep256_add(&rhs, &x3, &t2)
+    fep256_add(&rhs, &rhs, &t1)
+
+    return fep256_cmp(&y2, &rhs) == 0
+
+# ============================================================================
+# ECDSA Signature Structure
+# ============================================================================
+
+pub struct EcdsaSignature
+    r: Scalar256
+    s: Scalar256
+
+# ============================================================================
+# RFC 6979: Deterministic ECDSA
+# ============================================================================
+# Generate deterministic k value for ECDSA using HMAC-DRBG
+#
+# Algorithm:
+# 1. h1 = H(m) (already provided as hash)
+# 2. V = 0x01 repeated 32 times
+# 3. K = 0x00 repeated 32 times
+# 4. K = HMAC_K(V || 0x00 || int2octets(x) || bits2octets(h1))
+# 5. V = HMAC_K(V)
+# 6. K = HMAC_K(V || 0x01 || int2octets(x) || bits2octets(h1))
+# 7. V = HMAC_K(V)
+# 8. Loop: T = HMAC_K(V), if T in [1, n-1], return T, else K = HMAC_K(V || 0x00), V = HMAC_K(V)
+
+fn rfc6979_generate_k(k: *Scalar256, priv_key: *Scalar256, hash: *u8)
+    # Initialize V = 0x01...01 (32 bytes)
+    var v: [32]u8
+    var i: i32 = 0
+    while i < 32
+        v[i] = 0x01
+        i += 1
+
+    # Initialize K = 0x00...00 (32 bytes)
+    var key: [32]u8
+    i = 0
+    while i < 32
+        key[i] = 0x00
+        i += 1
+
+    # Convert private key to bytes
+    var x_bytes: [32]u8
+    scalar256_to_bytes(priv_key, &x_bytes[0])
+
+    # Build message: V || 0x00 || x || h1
+    var msg1: [97]u8  # 32 + 1 + 32 + 32
+    i = 0
+    while i < 32
+        msg1[i] = v[i]
+        i += 1
+    msg1[32] = 0x00
+    i = 0
+    while i < 32
+        msg1[33 + i] = x_bytes[i]
+        i += 1
+    i = 0
+    while i < 32
+        msg1[65 + i] = hash[i]
+        i += 1
+
+    # K = HMAC_K(V || 0x00 || x || h1)
+    hmac_sha256(&key[0], 32, &msg1[0], 97, &key[0])
+
+    # V = HMAC_K(V)
+    hmac_sha256(&key[0], 32, &v[0], 32, &v[0])
+
+    # Build message: V || 0x01 || x || h1
+    i = 0
+    while i < 32
+        msg1[i] = v[i]
+        i += 1
+    msg1[32] = 0x01
+
+    # K = HMAC_K(V || 0x01 || x || h1)
+    hmac_sha256(&key[0], 32, &msg1[0], 97, &key[0])
+
+    # V = HMAC_K(V)
+    hmac_sha256(&key[0], 32, &v[0], 32, &v[0])
+
+    # Generate k
+    var n: Scalar256
+    get_p256_order(&n)
+
+    var tries: i32 = 0
+    while tries < 100  # Safety limit
+        # V = HMAC_K(V)
+        hmac_sha256(&key[0], 32, &v[0], 32, &v[0])
+
+        # T = V as scalar
+        scalar256_from_bytes(k, &v[0])
+
+        # Check if k is valid: 1 <= k < n
+        if scalar256_is_zero(k) == 0 && scalar256_cmp(k, &n) < 0
+            return
+
+        # Invalid k, update K and V
+        # msg = V || 0x00
+        var msg2: [33]u8
+        i = 0
+        while i < 32
+            msg2[i] = v[i]
+            i += 1
+        msg2[32] = 0x00
+        hmac_sha256(&key[0], 32, &msg2[0], 33, &key[0])
+        hmac_sha256(&key[0], 32, &v[0], 32, &v[0])
+
+        tries += 1
+
+    # Should never reach here for valid inputs
+    scalar256_zero(k)
+
+# ============================================================================
+# ECDSA Signature Generation
+# ============================================================================
+# Sign a message hash using ECDSA with RFC 6979 deterministic k
+#
+# Input:
+#   - hash: 32-byte SHA-256 hash of the message
+#   - priv_key: private key (scalar d where Q = d*G)
+#
+# Output:
+#   - sig: signature (r, s)
+#
+# Returns: 1 on success, 0 on failure
+
+pub fn ecdsa_p256_sign(sig: *EcdsaSignature, hash: *u8, priv_key: *Scalar256) -> i32
+    var n: Scalar256
+    get_p256_order(&n)
+
+    # Convert hash to scalar z (may need truncation for larger hashes)
+    var z: Scalar256
+    scalar256_from_bytes(&z, hash)
+    # Reduce z mod n if necessary
+    if scalar256_cmp(&z, &n) >= 0
+        scalar256_sub(&z, &z, &n)
+
+    # Generate deterministic k using RFC 6979
+    var k: Scalar256
+    rfc6979_generate_k(&k, priv_key, hash)
+
+    if scalar256_is_zero(&k) == 1
+        return 0  # Failed to generate valid k
+
+    # Compute R = k * G
+    var k_bytes: [32]u8
+    scalar256_to_bytes(&k, &k_bytes[0])
+
+    var R: P256Point
+    var G: P256Point
+    p256_point_generator(&G)
+    p256_scalar_mult(&R, &k_bytes[0], 32, &G)
+
+    if p256_point_is_identity(&R) == 1
+        return 0
+
+    # Convert R to affine coordinates
+    var rx: FeP256
+    var ry: FeP256
+    if p256_point_to_affine(&R, &rx, &ry) == 0
+        return 0
+
+    # r = rx mod n
+    var rx_bytes: [32]u8
+    fep256_to_bytes(&rx, &rx_bytes[0])
+    scalar256_from_bytes(&sig.r, &rx_bytes[0])
+    scalar256_reduce(&sig.r)
+
+    if scalar256_is_zero(&sig.r) == 1
+        return 0
+
+    # s = k^(-1) * (z + r * d) mod n
+    var k_inv: Scalar256
+    scalar256_inv(&k_inv, &k)
+
+    var rd: Scalar256
+    scalar256_mul(&rd, &sig.r, priv_key)
+
+    var z_rd: Scalar256
+    scalar256_add(&z_rd, &z, &rd)
+
+    scalar256_mul(&sig.s, &k_inv, &z_rd)
+
+    if scalar256_is_zero(&sig.s) == 1
+        return 0
+
+    # Zero sensitive data
+    mem_zero(&k_bytes[0], 32)
+    scalar256_zero(&k)
+    scalar256_zero(&k_inv)
+
+    return 1
+
+# ============================================================================
+# ECDSA Signature Verification
+# ============================================================================
+# Verify an ECDSA signature
+#
+# Input:
+#   - hash: 32-byte SHA-256 hash of the message
+#   - sig: signature (r, s)
+#   - pub_key: public key point Q
+#
+# Returns: 1 if valid, 0 if invalid
+
+pub fn ecdsa_p256_verify(hash: *u8, sig: *EcdsaSignature, pub_key: *P256Point) -> i32
+    var n: Scalar256
+    get_p256_order(&n)
+
+    # Check r, s are in [1, n-1]
+    if scalar256_is_zero(&sig.r) == 1
+        return 0
+    if scalar256_cmp(&sig.r, &n) >= 0
+        return 0
+    if scalar256_is_zero(&sig.s) == 1
+        return 0
+    if scalar256_cmp(&sig.s, &n) >= 0
+        return 0
+
+    # Convert hash to scalar z
+    var z: Scalar256
+    scalar256_from_bytes(&z, hash)
+    if scalar256_cmp(&z, &n) >= 0
+        scalar256_sub(&z, &z, &n)
+
+    # w = s^(-1) mod n
+    var w: Scalar256
+    scalar256_inv(&w, &sig.s)
+
+    # u1 = z * w mod n
+    var u1: Scalar256
+    scalar256_mul(&u1, &z, &w)
+
+    # u2 = r * w mod n
+    var u2: Scalar256
+    scalar256_mul(&u2, &sig.r, &w)
+
+    # Compute R' = u1*G + u2*Q
+    var u1_bytes: [32]u8
+    var u2_bytes: [32]u8
+    scalar256_to_bytes(&u1, &u1_bytes[0])
+    scalar256_to_bytes(&u2, &u2_bytes[0])
+
+    var G: P256Point
+    p256_point_generator(&G)
+
+    var u1G: P256Point
+    var u2Q: P256Point
+    p256_scalar_mult(&u1G, &u1_bytes[0], 32, &G)
+    p256_scalar_mult(&u2Q, &u2_bytes[0], 32, pub_key)
+
+    var R_prime: P256Point
+    p256_point_add(&R_prime, &u1G, &u2Q)
+
+    if p256_point_is_identity(&R_prime) == 1
+        return 0
+
+    # Convert R' to affine
+    var rx: FeP256
+    var ry: FeP256
+    if p256_point_to_affine(&R_prime, &rx, &ry) == 0
+        return 0
+
+    # v = rx mod n
+    var rx_bytes: [32]u8
+    fep256_to_bytes(&rx, &rx_bytes[0])
+    var v: Scalar256
+    scalar256_from_bytes(&v, &rx_bytes[0])
+    scalar256_reduce(&v)
+
+    # Check v == r
+    if scalar256_cmp(&v, &sig.r) == 0
+        return 1
+    return 0
+
+# ============================================================================
+# Key Generation
+# ============================================================================
+
+# Generate public key from private key
+# Q = d * G
+pub fn ecdsa_p256_pubkey_from_privkey(pub_key: *P256Point, priv_key: *Scalar256)
+    var priv_bytes: [32]u8
+    scalar256_to_bytes(priv_key, &priv_bytes[0])
+
+    var G: P256Point
+    p256_point_generator(&G)
+
+    p256_scalar_mult(pub_key, &priv_bytes[0], 32, &G)
+
+    mem_zero(&priv_bytes[0], 32)
+
+# ============================================================================
+# Signature Serialization
+# ============================================================================
+
+# Serialize signature to bytes (r || s, 64 bytes total)
+pub fn ecdsa_sig_to_bytes(sig: *EcdsaSignature, out: *u8)
+    scalar256_to_bytes(&sig.r, &out[0])
+    scalar256_to_bytes(&sig.s, &out[32])
+
+# Deserialize signature from bytes
+pub fn ecdsa_sig_from_bytes(sig: *EcdsaSignature, data: *u8)
+    scalar256_from_bytes(&sig.r, &data[0])
+    scalar256_from_bytes(&sig.s, &data[32])

@@ -1,0 +1,467 @@
+# test/test_inflate.ritz - Tests for Deflate decompression
+#
+# Deflate (RFC 1951) block types:
+# - Type 0: Stored (no compression)
+# - Type 1: Fixed Huffman codes
+# - Type 2: Dynamic Huffman codes
+#
+# Block header format (3 bits):
+# - BFINAL (1 bit): 1 if this is the last block
+# - BTYPE (2 bits): 00=stored, 01=fixed, 10=dynamic, 11=reserved
+#
+# Test data generated with Python:
+#   import zlib
+#   zlib.compress(data, level=0)  # stored
+#   zlib.compress(data, level=1)  # fixed huffman (often)
+#   zlib.compress(data, level=6)  # dynamic huffman (often)
+
+import ritzlib.sys
+import ritzlib.io
+
+import lib.inflate
+
+
+# ============================================================================
+# Stored Block Tests (Type 0)
+# ============================================================================
+
+[[test]]
+fn test_inflate_stored_empty() -> i32
+    # Empty deflate stream: BFINAL=1, BTYPE=00 (stored), LEN=0, NLEN=0xFFFF
+    # Header: 0b00000001 = 0x01
+    # Followed by LEN (2 bytes LE) = 0x0000
+    # Followed by NLEN (2 bytes LE) = 0xFFFF (one's complement of LEN)
+    var input: [5]u8
+    input[0] = 0x01  # BFINAL=1, BTYPE=00
+    input[1] = 0x00  # LEN low byte
+    input[2] = 0x00  # LEN high byte
+    input[3] = 0xFF  # NLEN low byte
+    input[4] = 0xFF  # NLEN high byte
+
+    var output: [16]u8 = [0; 16]
+    let result: i64 = inflate(@input[0], 5, @output[0], 16)
+
+    if result != 0
+        print(c"FAIL: test_inflate_stored_empty - expected 0 bytes, got ")
+        print_int(result)
+        print(c"\n")
+        return 1
+
+    0
+
+
+[[test]]
+fn test_inflate_stored_hello() -> i32
+    # Stored block containing "hello" (5 bytes)
+    # Header: BFINAL=1, BTYPE=00 -> 0x01
+    # LEN=5, NLEN=0xFFFA (one's complement)
+    var input: [10]u8
+    input[0] = 0x01  # BFINAL=1, BTYPE=00
+    input[1] = 0x05  # LEN low byte = 5
+    input[2] = 0x00  # LEN high byte = 0
+    input[3] = 0xFA  # NLEN low byte = 0xFA
+    input[4] = 0xFF  # NLEN high byte = 0xFF
+    input[5] = 'h' as u8
+    input[6] = 'e' as u8
+    input[7] = 'l' as u8
+    input[8] = 'l' as u8
+    input[9] = 'o' as u8
+
+    var output: [16]u8 = [0; 16]
+    let result: i64 = inflate(@input[0], 10, @output[0], 16)
+
+    if result != 5
+        print(c"FAIL: test_inflate_stored_hello - expected 5 bytes, got ")
+        print_int(result)
+        print(c"\n")
+        return 1
+
+    if output[0] != 'h' as u8
+        print(c"FAIL: test_inflate_stored_hello - byte 0\n")
+        return 1
+    if output[1] != 'e' as u8
+        print(c"FAIL: test_inflate_stored_hello - byte 1\n")
+        return 1
+    if output[2] != 'l' as u8
+        print(c"FAIL: test_inflate_stored_hello - byte 2\n")
+        return 1
+    if output[3] != 'l' as u8
+        print(c"FAIL: test_inflate_stored_hello - byte 3\n")
+        return 1
+    if output[4] != 'o' as u8
+        print(c"FAIL: test_inflate_stored_hello - byte 4\n")
+        return 1
+
+    0
+
+
+[[test]]
+fn test_inflate_stored_multi_block() -> i32
+    # Two stored blocks: "hel" + "lo"
+    # Block 1: BFINAL=0, BTYPE=00, LEN=3
+    # Block 2: BFINAL=1, BTYPE=00, LEN=2
+    var input: [15]u8
+    # Block 1
+    input[0] = 0x00  # BFINAL=0, BTYPE=00
+    input[1] = 0x03  # LEN = 3
+    input[2] = 0x00
+    input[3] = 0xFC  # NLEN = 0xFFFC
+    input[4] = 0xFF
+    input[5] = 'h' as u8
+    input[6] = 'e' as u8
+    input[7] = 'l' as u8
+    # Block 2
+    input[8] = 0x01  # BFINAL=1, BTYPE=00
+    input[9] = 0x02  # LEN = 2
+    input[10] = 0x00
+    input[11] = 0xFD  # NLEN = 0xFFFD
+    input[12] = 0xFF
+    input[13] = 'l' as u8
+    input[14] = 'o' as u8
+
+    var output: [16]u8 = [0; 16]
+    let result: i64 = inflate(@input[0], 15, @output[0], 16)
+
+    if result != 5
+        print(c"FAIL: test_inflate_stored_multi_block - expected 5 bytes, got ")
+        print_int(result)
+        print(c"\n")
+        return 1
+
+    0
+
+
+# ============================================================================
+# Fixed Huffman Tests (Type 1)
+# ============================================================================
+
+[[test]]
+fn test_inflate_fixed_literal_only() -> i32
+    # Fixed Huffman block with just "ab" (no back-references)
+    # Python: zlib.compress(b'ab', level=6)[2:-4]
+    # Result: 4B 4C 02 00
+
+    var input: [4]u8
+    input[0] = 0x4B
+    input[1] = 0x4C
+    input[2] = 0x02
+    input[3] = 0x00
+
+    var output: [16]u8 = [0; 16]
+    let result: i64 = inflate(@input[0], 4, @output[0], 16)
+
+    if result != 2
+        print(c"FAIL: test_inflate_fixed_literal_only - expected 2 bytes, got ")
+        print_int(result)
+        print(c"\n")
+        return 1
+
+    if output[0] != 'a' as u8
+        print(c"FAIL: test_inflate_fixed_literal_only - byte 0\n")
+        return 1
+    if output[1] != 'b' as u8
+        print(c"FAIL: test_inflate_fixed_literal_only - byte 1\n")
+        return 1
+
+    0
+
+
+[[test]]
+fn test_inflate_fixed_from_zlib() -> i32
+    # Test with actual zlib-compressed data
+    # Python: zlib.compress(b'hello', level=6)
+    # Result: 78 9c cb 48 cd c9 c9 07 00 06 2c 02 15
+    # Strip zlib header (78 9c) and trailer (adler32 = 06 2c 02 15)
+    # Deflate data: cb 48 cd c9 c9 07 00
+    #
+    # Let me decode this manually:
+    # cb = 0b11001011
+    # Bits: 1 (BFINAL=1) + 01 (BTYPE=fixed) + 11001 (start of first symbol)
+    # ... complex, but this is the actual compressed "hello"
+
+    var input: [7]u8
+    input[0] = 0xCB
+    input[1] = 0x48
+    input[2] = 0xCD
+    input[3] = 0xC9
+    input[4] = 0xC9
+    input[5] = 0x07
+    input[6] = 0x00
+
+    var output: [16]u8 = [0; 16]
+    let result: i64 = inflate(@input[0], 7, @output[0], 16)
+
+    if result != 5
+        print(c"FAIL: test_inflate_fixed_from_zlib - expected 5 bytes, got ")
+        print_int(result)
+        print(c"\n")
+        return 1
+
+    if output[0] != 'h' as u8
+        print(c"FAIL: test_inflate_fixed_from_zlib - byte 0\n")
+        return 1
+    if output[1] != 'e' as u8
+        print(c"FAIL: test_inflate_fixed_from_zlib - byte 1\n")
+        return 1
+    if output[2] != 'l' as u8
+        print(c"FAIL: test_inflate_fixed_from_zlib - byte 2\n")
+        return 1
+    if output[3] != 'l' as u8
+        print(c"FAIL: test_inflate_fixed_from_zlib - byte 3\n")
+        return 1
+    if output[4] != 'o' as u8
+        print(c"FAIL: test_inflate_fixed_from_zlib - byte 4\n")
+        return 1
+
+    0
+
+
+# ============================================================================
+# LZ77 Back-Reference Tests
+# ============================================================================
+
+[[test]]
+fn test_inflate_with_backreference() -> i32
+    # Test decompression of data with LZ77 back-references
+    # "abcabc" = "abc" + <length=3, distance=3>
+    #
+    # Python: zlib.compress(b'abcabc', level=6)[2:-4]
+    # Result: 4B 4C 4A 4E 4C 4A 06 00
+
+    var input: [8]u8
+    input[0] = 0x4B
+    input[1] = 0x4C
+    input[2] = 0x4A
+    input[3] = 0x4E
+    input[4] = 0x4C
+    input[5] = 0x4A
+    input[6] = 0x06
+    input[7] = 0x00
+
+    var output: [16]u8 = [0; 16]
+    let result: i64 = inflate(@input[0], 8, @output[0], 16)
+
+    if result != 6
+        print(c"FAIL: test_inflate_with_backreference - expected 6 bytes, got ")
+        print_int(result)
+        print(c"\n")
+        return 1
+
+    # Verify "abcabc"
+    if output[0] != 'a' as u8
+        print(c"FAIL: test_inflate_with_backreference - byte 0\n")
+        return 1
+    if output[1] != 'b' as u8
+        print(c"FAIL: test_inflate_with_backreference - byte 1\n")
+        return 1
+    if output[2] != 'c' as u8
+        print(c"FAIL: test_inflate_with_backreference - byte 2\n")
+        return 1
+    if output[3] != 'a' as u8
+        print(c"FAIL: test_inflate_with_backreference - byte 3\n")
+        return 1
+    if output[4] != 'b' as u8
+        print(c"FAIL: test_inflate_with_backreference - byte 4\n")
+        return 1
+    if output[5] != 'c' as u8
+        print(c"FAIL: test_inflate_with_backreference - byte 5\n")
+        return 1
+
+    0
+
+
+[[test]]
+fn test_inflate_long_match() -> i32
+    # Test longer back-reference matches
+    # "aaaaaaaa" (8 a's) = "a" + <length=7, distance=1>
+    #
+    # Python: zlib.compress(b'aaaaaaaa', level=6)[2:-4]
+    # Result: 4B 4C 84 00 00
+
+    var input: [5]u8
+    input[0] = 0x4B
+    input[1] = 0x4C
+    input[2] = 0x84
+    input[3] = 0x00
+    input[4] = 0x00
+
+    var output: [16]u8 = [0; 16]
+    let result: i64 = inflate(@input[0], 5, @output[0], 16)
+
+    if result != 8
+        print(c"FAIL: test_inflate_long_match - expected 8 bytes, got ")
+        print_int(result)
+        print(c"\n")
+        return 1
+
+    # Verify all 8 bytes are 'a'
+    for i in 0..8
+        if output[i] != 'a' as u8
+            print(c"FAIL: test_inflate_long_match - byte ")
+            print_int(i as i64)
+            print(c"\n")
+            return 1
+
+    0
+
+
+# ============================================================================
+# Dynamic Huffman Tests (Type 2)
+# ============================================================================
+
+[[test]]
+fn test_inflate_dynamic_simple() -> i32
+    # Dynamic Huffman - "The quick brown fox jumps over the lazy dog. The quick brown fox!"
+    # Python: zlib.compress(data, level=9)[2:-4]
+    # Length: 50 bytes
+
+    var input: [50]u8
+    input[0] = 0x0B
+    input[1] = 0xC9
+    input[2] = 0x48
+    input[3] = 0x55
+    input[4] = 0x28
+    input[5] = 0x2C
+    input[6] = 0xCD
+    input[7] = 0x4C
+    input[8] = 0xCE
+    input[9] = 0x56
+    input[10] = 0x48
+    input[11] = 0x2A
+    input[12] = 0xCA
+    input[13] = 0x2F
+    input[14] = 0xCF
+    input[15] = 0x53
+    input[16] = 0x48
+    input[17] = 0xCB
+    input[18] = 0xAF
+    input[19] = 0x50
+    input[20] = 0xC8
+    input[21] = 0x2A
+    input[22] = 0xCD
+    input[23] = 0x2D
+    input[24] = 0x28
+    input[25] = 0x56
+    input[26] = 0xC8
+    input[27] = 0x2F
+    input[28] = 0x4B
+    input[29] = 0x2D
+    input[30] = 0x52
+    input[31] = 0x28
+    input[32] = 0x01
+    input[33] = 0x4A
+    input[34] = 0xE7
+    input[35] = 0x24
+    input[36] = 0x56
+    input[37] = 0x55
+    input[38] = 0x2A
+    input[39] = 0xA4
+    input[40] = 0xE4
+    input[41] = 0xA7
+    input[42] = 0xEB
+    input[43] = 0x29
+    input[44] = 0x84
+    input[45] = 0x60
+    input[46] = 0x2A
+    input[47] = 0x56
+    input[48] = 0x04
+    input[49] = 0x00
+
+    var output: [80]u8 = [0; 80]
+    let result: i64 = inflate(@input[0], 50, @output[0], 80)
+
+    # Expected: "The quick brown fox jumps over the lazy dog. The quick brown fox!" (65 bytes)
+    if result != 65
+        print(c"FAIL: test_inflate_dynamic_simple - expected 65 bytes, got ")
+        print_int(result)
+        print(c"\n")
+        return 1
+
+    # Verify first few bytes: "The "
+    if output[0] != 'T' as u8
+        print(c"FAIL: test_inflate_dynamic_simple - byte 0\n")
+        return 1
+    if output[1] != 'h' as u8
+        print(c"FAIL: test_inflate_dynamic_simple - byte 1\n")
+        return 1
+    if output[2] != 'e' as u8
+        print(c"FAIL: test_inflate_dynamic_simple - byte 2\n")
+        return 1
+    if output[3] != ' ' as u8
+        print(c"FAIL: test_inflate_dynamic_simple - byte 3\n")
+        return 1
+
+    0
+
+
+# ============================================================================
+# Error Handling Tests
+# ============================================================================
+
+[[test]]
+fn test_inflate_invalid_block_type() -> i32
+    # BTYPE=11 is reserved and should error
+    var input: [1]u8
+    input[0] = 0x07  # BFINAL=1, BTYPE=11 (invalid)
+
+    var output: [16]u8 = [0; 16]
+    let result: i64 = inflate(@input[0], 1, @output[0], 16)
+
+    # Should return negative error code
+    if result >= 0
+        print(c"FAIL: test_inflate_invalid_block_type - expected error\n")
+        return 1
+
+    0
+
+
+[[test]]
+fn test_inflate_truncated_stored() -> i32
+    # Stored block with LEN but truncated data
+    var input: [6]u8
+    input[0] = 0x01  # BFINAL=1, BTYPE=00
+    input[1] = 0x05  # LEN = 5
+    input[2] = 0x00
+    input[3] = 0xFA  # NLEN
+    input[4] = 0xFF
+    input[5] = 'h' as u8  # Only 1 byte, but LEN says 5
+
+    var output: [16]u8 = [0; 16]
+    let result: i64 = inflate(@input[0], 6, @output[0], 16)
+
+    # Should return negative error code
+    if result >= 0
+        print(c"FAIL: test_inflate_truncated_stored - expected error\n")
+        return 1
+
+    0
+
+
+[[test]]
+fn test_inflate_nlen_mismatch() -> i32
+    # Stored block with invalid NLEN (not one's complement of LEN)
+    var input: [10]u8
+    input[0] = 0x01  # BFINAL=1, BTYPE=00
+    input[1] = 0x05  # LEN = 5
+    input[2] = 0x00
+    input[3] = 0x00  # NLEN should be 0xFFFA, but we put 0x0000
+    input[4] = 0x00
+    input[5] = 'h' as u8
+    input[6] = 'e' as u8
+    input[7] = 'l' as u8
+    input[8] = 'l' as u8
+    input[9] = 'o' as u8
+
+    var output: [16]u8 = [0; 16]
+    let result: i64 = inflate(@input[0], 10, @output[0], 16)
+
+    # Should return negative error code
+    if result >= 0
+        print(c"FAIL: test_inflate_nlen_mismatch - expected error\n")
+        return 1
+
+    0
+
+
+# Note: Tests are automatically discovered and run by ritzunit.
+# Each @test function is found via ELF symbol table scanning.

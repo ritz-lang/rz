@@ -1,0 +1,176 @@
+# ritzunit/src/junit_reporter.ritz - JUnit XML output for test results
+#
+# Outputs test results in JUnit XML format for CI/CD integration.
+# Compatible with Jenkins, GitLab CI, and other CI systems.
+#
+# Format:
+# <?xml version="1.0" encoding="UTF-8"?>
+# <testsuite name="ritzunit" tests="N" failures="N" errors="N" time="0.123">
+#   <testcase name="test_foo" time="0.001"/>
+#   <testcase name="test_bar" time="0.002">
+#     <failure message="exit code 1">Test failed</failure>
+#   </testcase>
+# </testsuite>
+
+import ritzlib.io
+import ritzlib.str
+import ritzlib.sys
+import ritzlib.strview
+
+# ============================================================================
+# JUnit Test Result Storage
+# ============================================================================
+
+# Status constants
+const JUNIT_PASS: i32 = 0
+const JUNIT_FAIL: i32 = 1
+const JUNIT_ERROR: i32 = 2  # crash or timeout
+
+# Single test result
+struct JunitTestResult
+    name: StrView
+    status: i32          # JUNIT_PASS, JUNIT_FAIL, or JUNIT_ERROR
+    duration_ms: i64
+    exit_code: i32
+    signal: i32
+    message: StrView     # Error message for failures
+
+# Global array for collecting results
+var g_junit_results: [1024]JunitTestResult
+var g_junit_result_count: i32 = 0
+
+# ============================================================================
+# Result Collection
+# ============================================================================
+
+fn junit_record_result(name: @StrView, status: i32, duration_ms: i64, exit_code: i32, signal: i32, message: @StrView)
+    if g_junit_result_count >= 1024
+        return
+    g_junit_results[g_junit_result_count].name = *name
+    g_junit_results[g_junit_result_count].status = status
+    g_junit_results[g_junit_result_count].duration_ms = duration_ms
+    g_junit_results[g_junit_result_count].exit_code = exit_code
+    g_junit_results[g_junit_result_count].signal = signal
+    g_junit_results[g_junit_result_count].message = *message
+    g_junit_result_count += 1
+
+pub fn junit_record_pass(name: @StrView, duration_ms: i64)
+    var empty: StrView = strview_empty()
+    junit_record_result(name, JUNIT_PASS, duration_ms, 0, 0, @empty)
+
+pub fn junit_record_fail(name: @StrView, duration_ms: i64, exit_code: i32)
+    var msg: StrView = strview_from_cstr(c"Test assertion failed")
+    junit_record_result(name, JUNIT_FAIL, duration_ms, exit_code, 0, @msg)
+
+pub fn junit_record_crash(name: @StrView, duration_ms: i64, signal: i32, signal_name: @StrView)
+    junit_record_result(name, JUNIT_ERROR, duration_ms, 0, signal, signal_name)
+
+pub fn junit_record_timeout(name: @StrView, duration_ms: i64)
+    var msg: StrView = strview_from_cstr(c"Test timed out")
+    junit_record_result(name, JUNIT_ERROR, duration_ms, 0, 0, @msg)
+
+# ============================================================================
+# XML Output Helpers
+# ============================================================================
+
+# Print a character
+fn jprint_char(c: u8)
+    var buf: [2]u8
+    buf[0] = c
+    buf[1] = 0
+    prints_cstr(&buf[0])
+
+# Print XML-escaped StrView (handles <, >, &, ", ')
+fn print_xml_escaped_sv(s: @StrView)
+    if s.len == 0
+        return
+    for i in 0..s.len
+        let c: u8 = strview_get(s, i)
+        if c == '<'
+            prints("&lt;")
+        else if c == '>'
+            prints("&gt;")
+        else if c == '&'
+            prints("&amp;")
+        else if c == 34  # "
+            prints("&quot;")
+        else if c == 39  # '
+            prints("&apos;")
+        else
+            jprint_char(c)
+
+# Print time in seconds with 3 decimal places (e.g., "0.123")
+fn print_time_seconds(ms: i64)
+    let seconds: i64 = ms / 1000
+    let millis: i64 = ms % 1000
+
+    print_int(seconds)
+    jprint_char('.')
+
+    # Print milliseconds with leading zeros
+    if millis < 100
+        jprint_char('0')
+    if millis < 10
+        jprint_char('0')
+    print_int(millis)
+
+# ============================================================================
+# JUnit XML Output
+# ============================================================================
+
+# Print full JUnit XML report
+pub fn junit_print_report(total: i32, passed: i32, failed: i32, errors: i32, duration_ms: i64)
+    # XML declaration
+    prints("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n")
+
+    # Testsuite element
+    prints("<testsuite name=\"ritzunit\" tests=\"")
+    print_int(total as i64)
+    prints("\" failures=\"")
+    print_int(failed as i64)
+    prints("\" errors=\"")
+    print_int(errors as i64)
+    prints("\" time=\"")
+    print_time_seconds(duration_ms)
+    prints("\">\n")
+
+    # Individual test cases
+    for i in 0..g_junit_result_count
+        let r: *JunitTestResult = &g_junit_results[i]
+
+        prints("  <testcase name=\"")
+        print_xml_escaped_sv(@r.name)
+        prints("\" time=\"")
+        print_time_seconds(r.duration_ms)
+        prints("\"")
+
+        if r.status == JUNIT_PASS
+            # Self-closing tag for passing tests
+            prints("/>\n")
+        else if r.status == JUNIT_FAIL
+            prints(">\n")
+            prints("    <failure message=\"exit code ")
+            print_int(r.exit_code as i64)
+            prints("\">")
+            print_xml_escaped_sv(@r.message)
+            prints("</failure>\n")
+            prints("  </testcase>\n")
+        else
+            # JUNIT_ERROR (crash or timeout)
+            prints(">\n")
+            prints("    <error message=\"")
+            if r.signal != 0
+                prints("signal ")
+                print_int(r.signal as i64)
+            else
+                prints("timeout")
+            prints("\">")
+            print_xml_escaped_sv(@r.message)
+            prints("</error>\n")
+            prints("  </testcase>\n")
+
+    prints("</testsuite>\n")
+
+# Reset collector for next run
+pub fn junit_reset()
+    g_junit_result_count = 0

@@ -1,0 +1,885 @@
+# lib/deflate.ritz - Deflate compression (RFC 1951)
+#
+# Implements the DEFLATE algorithm for compressing data streams.
+#
+# Compression levels:
+# - Level 0: Stored (no compression, fastest)
+# - Level 1-3: Fast (short hash chains, greedy matching)
+# - Level 4-6: Default (balanced speed/compression)
+# - Level 7-9: Best (longer chains, lazy matching)
+#
+# API:
+# - deflate(input, len, output, cap, level) -> compressed bytes or error
+
+import ritzlib.sys
+import ritzlib.io
+
+import bits
+import huffman
+
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+const DEFLATE_OK: i64 = 0
+const DEFLATE_ERR_OUTPUT_FULL: i64 = -1
+const DEFLATE_ERR_INVALID_LEVEL: i64 = -2
+
+const DEFLATE_BLOCK_STORED: i32 = 0
+const DEFLATE_BLOCK_FIXED: i32 = 1
+const DEFLATE_BLOCK_DYNAMIC: i32 = 2
+
+# LZ77 parameters
+const MIN_MATCH: i32 = 3           # Minimum match length
+const MAX_MATCH: i32 = 258         # Maximum match length
+const WINDOW_SIZE: i32 = 32768     # 32KB sliding window
+const HASH_BITS: i32 = 15
+const HASH_SIZE: i32 = 32768       # 2^HASH_BITS
+const HASH_MASK: i32 = 32767       # HASH_SIZE - 1
+
+# Max stored block size (65535 bytes per RFC 1951)
+const MAX_STORED_BLOCK: i32 = 65535
+
+
+# ============================================================================
+# Fixed Huffman Encode Tables
+# ============================================================================
+
+var g_fixed_litlen_enc: HuffmanEncodeTable
+var g_fixed_dist_enc: HuffmanEncodeTable
+var g_fixed_enc_init: i32 = 0
+
+fn init_fixed_encode_tables()
+    if g_fixed_enc_init != 0
+        return
+
+    # Build literal/length encode table (same lengths as decode)
+    var litlen_lengths: [288]u8
+    for i in 0..144
+        litlen_lengths[i] = 8
+    for i in 144..256
+        litlen_lengths[i] = 9
+    for i in 256..280
+        litlen_lengths[i] = 7
+    for i in 280..288
+        litlen_lengths[i] = 8
+
+    huffman_build_encode_table(@g_fixed_litlen_enc, @litlen_lengths[0], 288)
+
+    # Build distance encode table (all 5 bits)
+    var dist_lengths: [32]u8
+    for i in 0..32
+        dist_lengths[i] = 5
+
+    huffman_build_encode_table(@g_fixed_dist_enc, @dist_lengths[0], 32)
+
+    g_fixed_enc_init = 1
+    return
+
+
+# ============================================================================
+# Length and Distance Code Tables
+# ============================================================================
+
+# Length base values for codes 257-285
+const DEF_LENGTH_BASE: [29]i32 = [
+    3, 4, 5, 6, 7, 8, 9, 10,
+    11, 13, 15, 17,
+    19, 23, 27, 31,
+    35, 43, 51, 59,
+    67, 83, 99, 115,
+    131, 163, 195, 227,
+    258
+]
+
+# Extra bits for length codes 257-285
+const DEF_LENGTH_EXTRA: [29]i32 = [
+    0, 0, 0, 0, 0, 0, 0, 0,
+    1, 1, 1, 1,
+    2, 2, 2, 2,
+    3, 3, 3, 3,
+    4, 4, 4, 4,
+    5, 5, 5, 5,
+    0
+]
+
+# Distance base values for codes 0-29
+const DEF_DIST_BASE: [30]i32 = [
+    1, 2, 3, 4,
+    5, 7, 9, 13,
+    17, 25, 33, 49,
+    65, 97, 129, 193,
+    257, 385, 513, 769,
+    1025, 1537, 2049, 3073,
+    4097, 6145, 8193, 12289,
+    16385, 24577
+]
+
+# Extra bits for distance codes 0-29
+const DEF_DIST_EXTRA: [30]i32 = [
+    0, 0, 0, 0,
+    1, 1, 2, 2,
+    3, 3, 4, 4,
+    5, 5, 6, 6,
+    7, 7, 8, 8,
+    9, 9, 10, 10,
+    11, 11, 12, 12,
+    13, 13
+]
+
+
+# Get length code (257-285) for a given match length (3-258)
+fn get_length_code(length: i32) -> i32
+    if length < 3
+        return 257
+    if length == 258
+        return 285
+
+    # Search for the right code
+    for i in 0..28
+        if length < DEF_LENGTH_BASE[i + 1]
+            return 257 + i
+
+    return 285
+
+
+# Get distance code (0-29) for a given distance (1-32768)
+# Uses binary search for O(log n) instead of O(n) linear search
+fn get_distance_code(dist: i32) -> i32
+    # Binary search for the code where DEF_DIST_BASE[code] <= dist < DEF_DIST_BASE[code+1]
+    var lo: i32 = 0
+    var hi: i32 = 29
+
+    while lo < hi
+        let mid: i32 = (lo + hi + 1) / 2
+        if DEF_DIST_BASE[mid] <= dist
+            lo = mid
+        else
+            hi = mid - 1
+
+    return lo
+
+
+# ============================================================================
+# Hash Function for LZ77 Match Finding
+# ============================================================================
+
+# Hash 3 bytes into a hash table index
+fn hash3(data: *u8, pos: i64) -> i32
+    let b0: u32 = data[pos] as u32
+    let b1: u32 = data[pos + 1] as u32
+    let b2: u32 = data[pos + 2] as u32
+    # Simple multiplicative hash
+    let h: u32 = ((b0 << 10) ^ (b1 << 5) ^ b2) & (HASH_MASK as u32)
+    return h as i32
+
+
+# ============================================================================
+# Main Deflate Function
+# ============================================================================
+
+# Compress data using Deflate algorithm.
+# Returns number of bytes written to output, or negative error code.
+#
+# Levels:
+# 0 = stored (no compression)
+# 1-9 = compressed (higher = better but slower)
+pub fn deflate(input: *u8, input_len: i64, output: *u8, output_cap: i64, level: i32) -> i64
+    if level < 0
+        return DEFLATE_ERR_INVALID_LEVEL
+    if level > 9
+        return DEFLATE_ERR_INVALID_LEVEL
+
+    if level == 0
+        return deflate_stored(input, input_len, output, output_cap)
+    else
+        return deflate_compressed(input, input_len, output, output_cap, level)
+
+
+# ============================================================================
+# Stored Block Compression (Level 0)
+# ============================================================================
+
+fn deflate_stored(input: *u8, input_len: i64, output: *u8, output_cap: i64) -> i64
+    var out_pos: i64 = 0
+    var in_pos: i64 = 0
+
+    while in_pos < input_len
+        # Calculate block size (max 65535)
+        var block_len: i64 = input_len - in_pos
+        if block_len > MAX_STORED_BLOCK as i64
+            block_len = MAX_STORED_BLOCK as i64
+
+        # Is this the final block?
+        var is_final: i32 = 0
+        if in_pos + block_len >= input_len
+            is_final = 1
+
+        # Check output space: 1 header + 2 LEN + 2 NLEN + data
+        if out_pos + 5 + block_len > output_cap
+            return DEFLATE_ERR_OUTPUT_FULL
+
+        # Write block header: BFINAL + BTYPE=00
+        output[out_pos] = is_final as u8
+        out_pos = out_pos + 1
+
+        # Write LEN (little-endian)
+        output[out_pos] = (block_len & 0xFF) as u8
+        out_pos = out_pos + 1
+        output[out_pos] = ((block_len >> 8) & 0xFF) as u8
+        out_pos = out_pos + 1
+
+        # Write NLEN (one's complement of LEN)
+        let nlen: i64 = block_len ^ 0xFFFF
+        output[out_pos] = (nlen & 0xFF) as u8
+        out_pos = out_pos + 1
+        output[out_pos] = ((nlen >> 8) & 0xFF) as u8
+        out_pos = out_pos + 1
+
+        # Copy data
+        for i in 0..block_len
+            output[out_pos] = input[in_pos]
+            out_pos = out_pos + 1
+            in_pos = in_pos + 1
+
+    # Handle empty input - need to write an empty stored block
+    if input_len == 0
+        if output_cap < 5
+            return DEFLATE_ERR_OUTPUT_FULL
+
+        output[0] = 0x01  # BFINAL=1, BTYPE=00
+        output[1] = 0x00  # LEN low
+        output[2] = 0x00  # LEN high
+        output[3] = 0xFF  # NLEN low
+        output[4] = 0xFF  # NLEN high
+        return 5
+
+    return out_pos
+
+
+# ============================================================================
+# Compressed Block (Levels 1-9)
+# ============================================================================
+
+fn deflate_compressed(input: *u8, input_len: i64, output: *u8, output_cap: i64, level: i32) -> i64
+    init_fixed_encode_tables()
+
+    # For now, use fixed Huffman encoding (Type 1)
+    # Dynamic Huffman (Type 2) can be added later for better compression
+
+    var writer: BitWriter = bits_writer_init(output, output_cap)
+
+    # Write block header: BFINAL=1, BTYPE=01 (fixed Huffman)
+    bits_write(@writer, 1, 1)   # BFINAL = 1
+    bits_write(@writer, 1, 2)   # BTYPE = 01 (fixed)
+
+    # Build hash table for LZ77 match finding
+    var head: [32768]i32       # Head of hash chains
+    var prev: [32768]i32       # Previous positions in chain
+
+    # Initialize hash table to -1 (no entry)
+    for i in 0..32768
+        head[i] = -1
+        prev[i] = 0
+
+    # Determine max chain length based on compression level
+    var max_chain: i32 = 4
+    if level >= 4
+        max_chain = 16
+    if level >= 7
+        max_chain = 128
+
+    var pos: i64 = 0
+
+    while pos < input_len
+        # Try to find a match
+        var best_len: i32 = 0
+        var best_dist: i32 = 0
+
+        if pos + 2 < input_len
+            let h: i32 = hash3(input, pos)
+            var chain_pos: i32 = head[h]
+            var chain_count: i32 = 0
+
+            while chain_pos >= 0
+                if chain_count >= max_chain
+                    break
+
+                let dist: i64 = pos - chain_pos as i64
+                if dist > WINDOW_SIZE as i64
+                    break
+
+                # Check match length at this position
+                var match_len: i32 = 0
+                let max_len: i64 = input_len - pos
+                var max_match_len: i32 = MAX_MATCH
+                if max_len < MAX_MATCH as i64
+                    max_match_len = max_len as i32
+
+                while match_len < max_match_len
+                    if input[chain_pos as i64 + match_len as i64] != input[pos + match_len as i64]
+                        break
+                    match_len = match_len + 1
+
+                if match_len >= MIN_MATCH
+                    if match_len > best_len
+                        best_len = match_len
+                        best_dist = dist as i32
+
+                # Move to previous position in chain
+                let prev_idx: i32 = chain_pos & (WINDOW_SIZE - 1)
+                chain_pos = prev[prev_idx]
+                chain_count = chain_count + 1
+
+            # Update hash chain
+            let curr_idx: i32 = (pos as i32) & (WINDOW_SIZE - 1)
+            prev[curr_idx] = head[h]
+            head[h] = pos as i32
+
+        if best_len >= MIN_MATCH
+            # Emit length/distance pair
+            let len_code: i32 = get_length_code(best_len)
+            huffman_encode(@g_fixed_litlen_enc, len_code, @writer)
+
+            # Write length extra bits
+            let len_idx: i32 = len_code - 257
+            let len_extra: i32 = DEF_LENGTH_EXTRA[len_idx]
+            if len_extra > 0
+                let len_base: i32 = DEF_LENGTH_BASE[len_idx]
+                bits_write(@writer, (best_len - len_base) as u32, len_extra)
+
+            # Emit distance code
+            let dist_code: i32 = get_distance_code(best_dist)
+            huffman_encode(@g_fixed_dist_enc, dist_code, @writer)
+
+            # Write distance extra bits
+            let dist_extra: i32 = DEF_DIST_EXTRA[dist_code]
+            if dist_extra > 0
+                let dist_base: i32 = DEF_DIST_BASE[dist_code]
+                bits_write(@writer, (best_dist - dist_base) as u32, dist_extra)
+
+            # Update hash chains for all bytes in match
+            for i in 1..best_len
+                let mpos: i64 = pos + i as i64
+                if mpos + 2 < input_len
+                    let mh: i32 = hash3(input, mpos)
+                    let midx: i32 = (mpos as i32) & (WINDOW_SIZE - 1)
+                    prev[midx] = head[mh]
+                    head[mh] = mpos as i32
+
+            pos = pos + best_len as i64
+        else
+            # Emit literal
+            let byte: i32 = input[pos] as i32
+            huffman_encode(@g_fixed_litlen_enc, byte, @writer)
+            pos = pos + 1
+
+    # Write end-of-block marker (symbol 256)
+    huffman_encode(@g_fixed_litlen_enc, 256, @writer)
+
+    # Flush remaining bits
+    bits_flush(@writer)
+
+    let written: i64 = bits_written(@writer)
+    if written > output_cap
+        return DEFLATE_ERR_OUTPUT_FULL
+
+    return written
+
+
+# ============================================================================
+# Dynamic Huffman Encoding (Type 2 blocks)
+# ============================================================================
+
+# Code length alphabet order per RFC 1951
+const CL_ORDER: [19]i32 = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15]
+
+# Build code lengths from symbol frequencies using a simple greedy algorithm
+# Returns the number of symbols actually used (with non-zero frequency)
+fn build_code_lengths(freqs: *i32, num_symbols: i32, lengths: *u8, max_bits: i32) -> i32
+    # Count symbols with non-zero frequency
+    var num_used: i32 = 0
+    for i in 0..num_symbols
+        if freqs[i] > 0
+            num_used = num_used + 1
+
+    # Handle edge cases
+    if num_used == 0
+        # No symbols used - assign length 1 to first symbol
+        lengths[0] = 1
+        return 1
+
+    if num_used == 1
+        # Only one symbol - find it and assign length 1
+        for i in 0..num_symbols
+            if freqs[i] > 0
+                lengths[i] = 1
+                # Also need a second code for valid Huffman tree
+                if i == 0
+                    lengths[1] = 1
+                else
+                    lengths[0] = 1
+                return 2
+
+    # Build Huffman tree using package-merge algorithm approximation
+    # For simplicity, use frequency-based length assignment
+
+    # Find total frequency
+    var total_freq: i64 = 0
+    for i in 0..num_symbols
+        total_freq = total_freq + freqs[i] as i64
+
+    # Assign lengths based on frequency (simple heuristic)
+    # More frequent symbols get shorter codes
+    for i in 0..num_symbols
+        if freqs[i] == 0
+            lengths[i] = 0
+        else
+            # Calculate ideal length: -log2(freq/total)
+            # Approximate with simple formula
+            var freq_ratio: i64 = (total_freq * 256) / (freqs[i] as i64)
+            var len: i32 = 1
+            while freq_ratio > 256
+                freq_ratio = freq_ratio / 2
+                len = len + 1
+            if len > max_bits
+                len = max_bits
+            if len < 1
+                len = 1
+            lengths[i] = len as u8
+
+    # Enforce Kraft inequality and adjust lengths
+    limit_code_lengths(lengths, num_symbols, max_bits)
+
+    return num_used
+
+
+# Limit code lengths to max_bits and ensure valid Huffman code via Kraft inequality
+fn limit_code_lengths(lengths: *u8, num_symbols: i32, max_bits: i32)
+    # Count symbols at each length
+    var count: [16]i32 = [0; 16]
+    for i in 0..num_symbols
+        let len: i32 = lengths[i] as i32
+        if len > 0
+            if len > max_bits
+                lengths[i] = max_bits as u8
+                count[max_bits] = count[max_bits] + 1
+            else
+                count[len] = count[len] + 1
+
+    # Calculate Kraft sum: sum of 2^(max_bits - len) for each symbol
+    # Must equal 2^max_bits for a complete code
+    var kraft: i32 = 0
+    for len in 1..(max_bits + 1)
+        kraft = kraft + count[len] * (1 << (max_bits - len))
+
+    let target: i32 = 1 << max_bits
+
+    # Adjust if Kraft sum is wrong
+    if kraft < target
+        # Under-full: shorten some codes (give more codes)
+        # Find longest codes and shorten them
+        # Note: Use while loop - Ritz for loops don't support descending ranges
+        var adj_len: i32 = max_bits
+        while adj_len > 0
+            while count[adj_len] > 0
+                if kraft >= target
+                    break
+                if adj_len > 1
+                    # Move one symbol from adj_len to adj_len-1
+                    count[adj_len] = count[adj_len] - 1
+                    count[adj_len - 1] = count[adj_len - 1] + 1
+                    # Kraft change: remove 2^(max-adj_len), add 2^(max-adj_len+1)
+                    kraft = kraft - (1 << (max_bits - adj_len))
+                    kraft = kraft + (1 << (max_bits - adj_len + 1))
+                else
+                    break
+            if kraft >= target
+                break
+            adj_len = adj_len - 1
+
+    if kraft > target
+        # Over-full: lengthen some codes
+        for len in 1..(max_bits + 1)
+            while count[len] > 0
+                if kraft <= target
+                    break
+                if len < max_bits
+                    # Move one symbol from len to len+1
+                    count[len] = count[len] - 1
+                    count[len + 1] = count[len + 1] + 1
+                    # Kraft change: remove 2^(max-len), add 2^(max-len-1)
+                    kraft = kraft - (1 << (max_bits - len))
+                    kraft = kraft + (1 << (max_bits - len - 1))
+            if kraft <= target
+                break
+
+    # Now reassign lengths based on adjusted counts
+    # Sort symbols by original length, then reassign
+    var new_lengths: [320]u8 = [0; 320]
+    var len_idx: [16]i32 = [0; 16]
+
+    # Calculate starting index for each length
+    var start: i32 = 0
+    for len in 1..(max_bits + 1)
+        len_idx[len] = start
+        start = start + count[len]
+
+    # Place symbols in order
+    var symbol_order: [320]i32 = [0; 320]
+    var order_pos: i32 = 0
+
+    for len in 1..(max_bits + 1)
+        for i in 0..num_symbols
+            if lengths[i] as i32 == len
+                symbol_order[order_pos] = i
+                order_pos = order_pos + 1
+
+    # Reassign lengths based on counts
+    var pos: i32 = 0
+    for len in 1..(max_bits + 1)
+        for c in 0..count[len]
+            if pos < order_pos
+                new_lengths[symbol_order[pos] ] = len as u8
+                pos = pos + 1
+
+    # Copy back
+    for i in 0..num_symbols
+        lengths[i] = new_lengths[i]
+
+    return
+
+
+# RLE encode code lengths using codes 16, 17, 18
+# Returns number of RLE symbols written
+fn rle_encode_lengths(lengths: *u8, num_lengths: i32, rle_syms: *i32, rle_extra: *i32) -> i32
+    var out_pos: i32 = 0
+    var i: i32 = 0
+
+    while i < num_lengths
+        let len: i32 = lengths[i] as i32
+
+        if len == 0
+            # Count consecutive zeros
+            var run: i32 = 1
+            while i + run < num_lengths
+                if lengths[i + run] as i32 == 0
+                    run = run + 1
+                else
+                    break
+
+            # Encode zero runs
+            while run > 0
+                if run >= 11
+                    # Code 18: repeat 0 for 11-138 times
+                    var repeat: i32 = run
+                    if repeat > 138
+                        repeat = 138
+                    rle_syms[out_pos] = 18
+                    rle_extra[out_pos] = repeat - 11
+                    out_pos = out_pos + 1
+                    run = run - repeat
+                    i = i + repeat
+                else
+                    if run >= 3
+                        # Code 17: repeat 0 for 3-10 times
+                        rle_syms[out_pos] = 17
+                        rle_extra[out_pos] = run - 3
+                        out_pos = out_pos + 1
+                        i = i + run
+                        run = 0
+                    else
+                        # Output literal zeros
+                        while run > 0
+                            rle_syms[out_pos] = 0
+                            rle_extra[out_pos] = 0
+                            out_pos = out_pos + 1
+                            run = run - 1
+                            i = i + 1
+        else
+            # Non-zero length - output it
+            rle_syms[out_pos] = len
+            rle_extra[out_pos] = 0
+            out_pos = out_pos + 1
+            i = i + 1
+
+            # Check for repeats of this length (code 16)
+            var run: i32 = 0
+            while i + run < num_lengths
+                if lengths[i + run] as i32 == len
+                    run = run + 1
+                else
+                    break
+
+            while run >= 3
+                var repeat: i32 = run
+                if repeat > 6
+                    repeat = 6
+                rle_syms[out_pos] = 16
+                rle_extra[out_pos] = repeat - 3
+                out_pos = out_pos + 1
+                run = run - repeat
+                i = i + repeat
+
+    return out_pos
+
+
+# Compute HCLEN - minimum number of code length codes needed
+fn compute_hclen(cl_lengths: *u8) -> i32
+    # Find last non-zero code length in CL_ORDER
+    var hclen: i32 = 4  # Minimum is 4
+    for i in 0..19
+        let idx: i32 = CL_ORDER[i]
+        if cl_lengths[idx] > 0
+            if i + 1 > hclen
+                hclen = i + 1
+
+    if hclen < 4
+        hclen = 4
+
+    return hclen
+
+
+# Compress data using dynamic Huffman encoding
+# Returns number of bytes written to output, or negative error code
+pub fn deflate_dynamic(input: *u8, input_len: i64, output: *u8, output_cap: i64, level: i32) -> i64
+    if input_len == 0
+        # Empty input - use stored block
+        return deflate_stored(input, input_len, output, output_cap)
+
+    # Phase 1: LZ77 pass to collect symbols and count frequencies
+    var litlen_freq: [286]i32 = [0; 286]
+    var dist_freq: [30]i32 = [0; 30]
+
+    # Store LZ77 output temporarily
+    # Each entry is either a literal (0-255) or length/distance pair
+    var lz_symbols: [65536]i32 = [0; 65536]  # Symbol type: literal or length code
+    var lz_extra: [65536]i32 = [0; 65536]    # Extra bits value for length
+    var lz_dist: [65536]i32 = [0; 65536]     # Distance code
+    var lz_dist_extra: [65536]i32 = [0; 65536]  # Extra bits for distance
+    var lz_count: i32 = 0
+
+    # Build hash table for LZ77 match finding
+    var head: [32768]i32
+    var prev: [32768]i32
+
+    for i in 0..32768
+        head[i] = -1
+        prev[i] = 0
+
+    # Determine max chain length based on compression level
+    var max_chain: i32 = 4
+    if level >= 4
+        max_chain = 16
+    if level >= 7
+        max_chain = 128
+
+    var pos: i64 = 0
+
+    while pos < input_len
+        if lz_count >= 65535
+            break  # Safety limit
+
+        var best_len: i32 = 0
+        var best_dist: i32 = 0
+
+        if pos + 2 < input_len
+            let h: i32 = hash3(input, pos)
+            var chain_pos: i32 = head[h]
+            var chain_count: i32 = 0
+
+            while chain_pos >= 0
+                if chain_count >= max_chain
+                    break
+
+                let dist: i64 = pos - chain_pos as i64
+                if dist > WINDOW_SIZE as i64
+                    break
+
+                var match_len: i32 = 0
+                let max_len: i64 = input_len - pos
+                var max_match_len: i32 = MAX_MATCH
+                if max_len < MAX_MATCH as i64
+                    max_match_len = max_len as i32
+
+                while match_len < max_match_len
+                    if input[chain_pos as i64 + match_len as i64] != input[pos + match_len as i64]
+                        break
+                    match_len = match_len + 1
+
+                if match_len >= MIN_MATCH
+                    if match_len > best_len
+                        best_len = match_len
+                        best_dist = dist as i32
+
+                let prev_idx: i32 = chain_pos & (WINDOW_SIZE - 1)
+                chain_pos = prev[prev_idx]
+                chain_count = chain_count + 1
+
+            let curr_idx: i32 = (pos as i32) & (WINDOW_SIZE - 1)
+            prev[curr_idx] = head[h]
+            head[h] = pos as i32
+
+        if best_len >= MIN_MATCH
+            let len_code: i32 = get_length_code(best_len)
+            let len_idx: i32 = len_code - 257
+            let len_extra: i32 = DEF_LENGTH_EXTRA[len_idx]
+            let len_base: i32 = DEF_LENGTH_BASE[len_idx]
+
+            let dist_code: i32 = get_distance_code(best_dist)
+            let dist_extra: i32 = DEF_DIST_EXTRA[dist_code]
+            let dist_base: i32 = DEF_DIST_BASE[dist_code]
+
+            lz_symbols[lz_count] = len_code
+            lz_extra[lz_count] = best_len - len_base
+            lz_dist[lz_count] = dist_code
+            lz_dist_extra[lz_count] = best_dist - dist_base
+            lz_count = lz_count + 1
+
+            litlen_freq[len_code] = litlen_freq[len_code] + 1
+            dist_freq[dist_code] = dist_freq[dist_code] + 1
+
+            # Update hash chains for match bytes
+            for i in 1..best_len
+                let mpos: i64 = pos + i as i64
+                if mpos + 2 < input_len
+                    let mh: i32 = hash3(input, mpos)
+                    let midx: i32 = (mpos as i32) & (WINDOW_SIZE - 1)
+                    prev[midx] = head[mh]
+                    head[mh] = mpos as i32
+
+            pos = pos + best_len as i64
+        else
+            let byte: i32 = input[pos] as i32
+            lz_symbols[lz_count] = byte
+            lz_extra[lz_count] = -1  # Marker for literal
+            lz_count = lz_count + 1
+
+            litlen_freq[byte] = litlen_freq[byte] + 1
+            pos = pos + 1
+
+    # Add end-of-block marker
+    litlen_freq[256] = 1
+
+    # Phase 2: Build Huffman codes from frequencies
+    var litlen_lengths: [286]u8 = [0; 286]
+    var dist_lengths: [30]u8 = [0; 30]
+
+    build_code_lengths(@litlen_freq[0], 286, @litlen_lengths[0], 15)
+    build_code_lengths(@dist_freq[0], 30, @dist_lengths[0], 15)
+
+    # Ensure EOB (256) has a code
+    if litlen_lengths[256] == 0
+        litlen_lengths[256] = 1
+
+    # Find HLIT and HDIST
+    var hlit: i32 = 286
+    while hlit > 257
+        if litlen_lengths[hlit - 1] != 0
+            break
+        hlit = hlit - 1
+
+    var hdist: i32 = 30
+    while hdist > 1
+        if dist_lengths[hdist - 1] != 0
+            break
+        hdist = hdist - 1
+
+    # Phase 3: RLE encode combined code lengths
+    var combined_lengths: [316]u8 = [0; 316]
+    for i in 0..hlit
+        combined_lengths[i] = litlen_lengths[i]
+    for i in 0..hdist
+        combined_lengths[hlit + i] = dist_lengths[i]
+
+    var rle_syms: [512]i32 = [0; 512]
+    var rle_extra: [512]i32 = [0; 512]
+    let nlen: i32 = hlit + hdist
+    let rle_count: i32 = rle_encode_lengths(@combined_lengths[0], nlen, @rle_syms[0], @rle_extra[0])
+
+    # Count code length symbol frequencies
+    var cl_freq: [19]i32 = [0; 19]
+    for i in 0..rle_count
+        cl_freq[rle_syms[i] ] = cl_freq[rle_syms[i] ] + 1
+
+    # Build code length Huffman code
+    var cl_lengths: [19]u8 = [0; 19]
+    build_code_lengths(@cl_freq[0], 19, @cl_lengths[0], 7)
+
+    let hclen: i32 = compute_hclen(@cl_lengths[0])
+
+    # Build encode tables
+    var litlen_enc: HuffmanEncodeTable
+    var dist_enc: HuffmanEncodeTable
+    var cl_enc: HuffmanEncodeTable
+
+    huffman_build_encode_table(@litlen_enc, @litlen_lengths[0], hlit)
+    huffman_build_encode_table(@dist_enc, @dist_lengths[0], hdist)
+    huffman_build_encode_table(@cl_enc, @cl_lengths[0], 19)
+
+    # Phase 4: Write output
+    var writer: BitWriter = bits_writer_init(output, output_cap)
+
+    # Block header: BFINAL=1, BTYPE=10 (dynamic)
+    bits_write(@writer, 1, 1)   # BFINAL = 1
+    bits_write(@writer, 2, 2)   # BTYPE = 10 (dynamic)
+
+    # Write HLIT, HDIST, HCLEN
+    bits_write(@writer, (hlit - 257) as u32, 5)
+    bits_write(@writer, (hdist - 1) as u32, 5)
+    bits_write(@writer, (hclen - 4) as u32, 4)
+
+    # Write code length code lengths in CL_ORDER
+    for i in 0..hclen
+        let idx: i32 = CL_ORDER[i]
+        bits_write(@writer, cl_lengths[idx] as u32, 3)
+
+    # Write RLE-encoded code lengths
+    for i in 0..rle_count
+        let sym: i32 = rle_syms[i]
+        huffman_encode(@cl_enc, sym, @writer)
+
+        # Write extra bits for repeat codes
+        if sym == 16
+            bits_write(@writer, rle_extra[i] as u32, 2)
+        else
+            if sym == 17
+                bits_write(@writer, rle_extra[i] as u32, 3)
+            else
+                if sym == 18
+                    bits_write(@writer, rle_extra[i] as u32, 7)
+
+    # Phase 5: Write compressed data
+    for i in 0..lz_count
+        if lz_extra[i] == -1
+            # Literal
+            huffman_encode(@litlen_enc, lz_symbols[i], @writer)
+        else
+            # Length/distance pair
+            let len_code: i32 = lz_symbols[i]
+            huffman_encode(@litlen_enc, len_code, @writer)
+
+            let len_idx: i32 = len_code - 257
+            let len_extra_bits: i32 = DEF_LENGTH_EXTRA[len_idx]
+            if len_extra_bits > 0
+                bits_write(@writer, lz_extra[i] as u32, len_extra_bits)
+
+            let dist_code: i32 = lz_dist[i]
+            huffman_encode(@dist_enc, dist_code, @writer)
+
+            let dist_extra_bits: i32 = DEF_DIST_EXTRA[dist_code]
+            if dist_extra_bits > 0
+                bits_write(@writer, lz_dist_extra[i] as u32, dist_extra_bits)
+
+    # Write end-of-block marker (256)
+    huffman_encode(@litlen_enc, 256, @writer)
+
+    # Flush remaining bits
+    bits_flush(@writer)
+
+    let written: i64 = bits_written(@writer)
+    if written > output_cap
+        return DEFLATE_ERR_OUTPUT_FULL
+
+    return written

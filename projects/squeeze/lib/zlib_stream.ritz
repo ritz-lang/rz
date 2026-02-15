@@ -1,0 +1,674 @@
+# lib/zlib_stream.ritz - Streaming Zlib compression/decompression (RFC 1950)
+#
+# Implements streaming API for zlib format:
+# - ZlibWriter: incremental compression with persistent LZ77 state
+# - ZlibReader: incremental decompression with buffering
+#
+# Zlib differs from gzip:
+# - 2-byte header (CMF + FLG) instead of 10-byte gzip header
+# - Adler-32 checksum instead of CRC32
+# - Big-endian trailer instead of little-endian
+#
+# API:
+# - zlib_writer_init(w, level) -> Initialize compressor
+# - zlib_writer_write(w, data, len, out, cap) -> Write and maybe produce output
+# - zlib_writer_flush(w, out, cap) -> Force output of pending data
+# - zlib_writer_finish(w, out, cap) -> Finalize and write trailer
+# - zlib_writer_free(w) -> Clean up resources
+#
+# - zlib_reader_init(r) -> Initialize decompressor
+# - zlib_reader_read(r, data, len, out, cap) -> Read compressed data
+# - zlib_reader_finish(r) -> Verify checksum
+# - zlib_reader_free(r) -> Clean up resources
+
+import ritzlib.sys
+import ritzlib.io
+
+import bits
+import adler32
+import huffman
+import inflate
+
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+pub const ZLIB_STREAM_OK: i64 = 0
+pub const ZLIB_STREAM_ERR_OUTPUT_FULL: i64 = -1
+pub const ZLIB_STREAM_ERR_INVALID_LEVEL: i64 = -2
+pub const ZLIB_STREAM_ERR_NOT_FINISHED: i64 = -3
+pub const ZLIB_STREAM_ERR_CHECKSUM_MISMATCH: i64 = -4
+pub const ZLIB_STREAM_ERR_INVALID_HEADER: i64 = -5
+pub const ZLIB_STREAM_ERR_INFLATE_FAILED: i64 = -6
+
+# Zlib header constants
+const ZLIB_CM_DEFLATE: u8 = 8
+const ZLIB_CINFO_32K: u8 = 7
+const ZLIB_HEADER_SIZE: i64 = 2
+const ZLIB_TRAILER_SIZE: i64 = 4
+
+# LZ77 parameters
+const WINDOW_SIZE: i32 = 32768
+const WINDOW_MASK: i32 = 32767
+const HASH_SIZE: i32 = 32768
+const HASH_MASK: i32 = 32767
+const MIN_MATCH: i32 = 3
+const MAX_MATCH: i32 = 258
+
+# Writer states
+const STATE_INIT: i32 = 0
+const STATE_HEADER_WRITTEN: i32 = 1
+const STATE_COMPRESSING: i32 = 2
+const STATE_FINISHED: i32 = 3
+
+# Reader states
+const RSTATE_HEADER: i32 = 0
+const RSTATE_DATA: i32 = 1
+const RSTATE_TRAILER: i32 = 2
+const RSTATE_DONE: i32 = 3
+
+
+# ============================================================================
+# Fixed Huffman Encode Tables (shared)
+# ============================================================================
+
+var g_zstream_litlen_enc: HuffmanEncodeTable
+var g_zstream_dist_enc: HuffmanEncodeTable
+var g_zstream_enc_init: i32 = 0
+
+fn init_zstream_encode_tables()
+    if g_zstream_enc_init != 0
+        return
+
+    # Build literal/length encode table
+    var litlen_lengths: [288]u8
+    for i in 0..144
+        litlen_lengths[i] = 8
+    for i in 144..256
+        litlen_lengths[i] = 9
+    for i in 256..280
+        litlen_lengths[i] = 7
+    for i in 280..288
+        litlen_lengths[i] = 8
+
+    huffman_build_encode_table(@g_zstream_litlen_enc, @litlen_lengths[0], 288)
+
+    # Build distance encode table (all 5 bits)
+    var dist_lengths: [32]u8
+    for i in 0..32
+        dist_lengths[i] = 5
+
+    huffman_build_encode_table(@g_zstream_dist_enc, @dist_lengths[0], 32)
+
+    g_zstream_enc_init = 1
+    return
+
+
+# ============================================================================
+# Length and Distance Code Tables
+# ============================================================================
+
+const ZS_LENGTH_BASE: [29]i32 = [
+    3, 4, 5, 6, 7, 8, 9, 10,
+    11, 13, 15, 17,
+    19, 23, 27, 31,
+    35, 43, 51, 59,
+    67, 83, 99, 115,
+    131, 163, 195, 227,
+    258
+]
+
+const ZS_LENGTH_EXTRA: [29]i32 = [
+    0, 0, 0, 0, 0, 0, 0, 0,
+    1, 1, 1, 1,
+    2, 2, 2, 2,
+    3, 3, 3, 3,
+    4, 4, 4, 4,
+    5, 5, 5, 5,
+    0
+]
+
+const ZS_DIST_BASE: [30]i32 = [
+    1, 2, 3, 4,
+    5, 7, 9, 13,
+    17, 25, 33, 49,
+    65, 97, 129, 193,
+    257, 385, 513, 769,
+    1025, 1537, 2049, 3073,
+    4097, 6145, 8193, 12289,
+    16385, 24577
+]
+
+const ZS_DIST_EXTRA: [30]i32 = [
+    0, 0, 0, 0,
+    1, 1, 2, 2,
+    3, 3, 4, 4,
+    5, 5, 6, 6,
+    7, 7, 8, 8,
+    9, 9, 10, 10,
+    11, 11, 12, 12,
+    13, 13
+]
+
+
+fn zlib_get_length_code(length: i32) -> i32
+    if length < 3
+        return 257
+    if length == 258
+        return 285
+    for i in 0..28
+        if length < ZS_LENGTH_BASE[i + 1]
+            return 257 + i
+    return 285
+
+
+fn zlib_get_distance_code(dist: i32) -> i32
+    var lo: i32 = 0
+    var hi: i32 = 29
+    while lo < hi
+        let mid: i32 = (lo + hi + 1) / 2
+        if ZS_DIST_BASE[mid] <= dist
+            lo = mid
+        else
+            hi = mid - 1
+    return lo
+
+
+# ============================================================================
+# ZlibWriter - Streaming Compression
+# ============================================================================
+
+pub struct ZlibWriter
+    # State
+    state: i32                      # Current writer state
+    level: i32                      # Compression level (1-9)
+
+    # LZ77 sliding window
+    window: [32768]u8               # 32KB window
+    window_pos: i64                 # Position in window (mod WINDOW_SIZE)
+    window_fill: i64                # How much of window is valid
+
+    # Hash chains for match finding
+    head: [32768]i32                # Head of hash chains
+    prev: [32768]i32                # Previous positions in chain
+
+    # Bit writer state
+    out_buf: *u8                    # Current output buffer
+    out_pos: i64                    # Position in output buffer
+    out_cap: i64                    # Output buffer capacity
+    bit_buf: u32                    # Bit buffer (pending bits)
+    bit_count: i32                  # Number of bits in buffer
+
+    # Checksum state
+    adler: u32                      # Running Adler-32
+    total_in: i64                   # Total bytes input
+
+
+# Initialize a ZlibWriter
+pub fn zlib_writer_init(w: *ZlibWriter, level: i32) -> i32
+    if level < 0
+        return -1
+    if level > 9
+        return -1
+
+    w.state = STATE_INIT
+    w.level = level
+    w.window_pos = 0
+    w.window_fill = 0
+    w.bit_buf = 0
+    w.bit_count = 0
+    w.adler = adler32_init()
+    w.total_in = 0
+
+    # Initialize hash chains to -1 (no entry)
+    for i in 0..HASH_SIZE
+        w.head[i] = -1
+        w.prev[i] = 0
+
+    init_zstream_encode_tables()
+
+    return 0
+
+
+# Write zlib header to output
+fn write_zlib_header(w: *ZlibWriter, out: *u8, cap: i64) -> i64
+    if cap < ZLIB_HEADER_SIZE
+        return ZLIB_STREAM_ERR_OUTPUT_FULL
+
+    # CMF byte: CINFO=7 (32K window), CM=8 (deflate)
+    let cmf: u8 = (ZLIB_CINFO_32K << 4) | ZLIB_CM_DEFLATE  # 0x78
+
+    # FLG byte: FLEVEL=2, FDICT=0, FCHECK calculated
+    let flevel: u8 = 2 << 6  # 0x80 (default compression)
+    let base_flg: u8 = flevel
+
+    # Calculate FCHECK
+    let header_base: u32 = ((cmf as u32) << 8) | (base_flg as u32)
+    let remainder: u32 = header_base % 31
+    var fcheck: u8 = 0
+    if remainder != 0
+        fcheck = (31 - remainder) as u8
+
+    let flg: u8 = base_flg | fcheck
+
+    out[0] = cmf
+    out[1] = flg
+
+    return ZLIB_HEADER_SIZE
+
+
+# Hash 3 bytes
+fn zlib_hash3(data: *u8, pos: i64) -> i32
+    let b0: u32 = data[pos] as u32
+    let b1: u32 = data[pos + 1] as u32
+    let b2: u32 = data[pos + 2] as u32
+    let h: u32 = ((b0 << 10) ^ (b1 << 5) ^ b2) & (HASH_MASK as u32)
+    return h as i32
+
+
+# Write bits to output
+fn zlib_write_bits(w: *ZlibWriter, value: u32, n: i32)
+    w.bit_buf = w.bit_buf | (value << w.bit_count)
+    w.bit_count = w.bit_count + n
+
+    while w.bit_count >= 8
+        if w.out_pos < w.out_cap
+            w.out_buf[w.out_pos] = (w.bit_buf & 0xFF) as u8
+            w.out_pos = w.out_pos + 1
+        w.bit_buf = w.bit_buf >> 8
+        w.bit_count = w.bit_count - 8
+
+    return
+
+
+# Flush any remaining bits
+fn zlib_flush_bits(w: *ZlibWriter)
+    if w.bit_count > 0
+        if w.out_pos < w.out_cap
+            w.out_buf[w.out_pos] = (w.bit_buf & 0xFF) as u8
+            w.out_pos = w.out_pos + 1
+        w.bit_buf = 0
+        w.bit_count = 0
+    return
+
+
+# Encode a literal byte
+fn zlib_encode_literal(w: *ZlibWriter, byte: i32)
+    let code: u32 = g_zstream_litlen_enc.codes[byte] as u32
+    let len: i32 = g_zstream_litlen_enc.lengths[byte] as i32
+    zlib_write_bits(w, code, len)
+    return
+
+
+# Encode a length/distance pair
+fn zlib_encode_match(w: *ZlibWriter, length: i32, distance: i32)
+    # Encode length
+    let len_code: i32 = zlib_get_length_code(length)
+    let lcode: u32 = g_zstream_litlen_enc.codes[len_code] as u32
+    let llen: i32 = g_zstream_litlen_enc.lengths[len_code] as i32
+    zlib_write_bits(w, lcode, llen)
+
+    # Length extra bits
+    let len_idx: i32 = len_code - 257
+    let len_extra: i32 = ZS_LENGTH_EXTRA[len_idx]
+    if len_extra > 0
+        let len_base: i32 = ZS_LENGTH_BASE[len_idx]
+        zlib_write_bits(w, (length - len_base) as u32, len_extra)
+
+    # Encode distance
+    let dist_code: i32 = zlib_get_distance_code(distance)
+    let dcode: u32 = g_zstream_dist_enc.codes[dist_code] as u32
+    let dlen: i32 = g_zstream_dist_enc.lengths[dist_code] as i32
+    zlib_write_bits(w, dcode, dlen)
+
+    # Distance extra bits
+    let dist_extra: i32 = ZS_DIST_EXTRA[dist_code]
+    if dist_extra > 0
+        let dist_base: i32 = ZS_DIST_BASE[dist_code]
+        zlib_write_bits(w, (distance - dist_base) as u32, dist_extra)
+
+    return
+
+
+# Write data to the compressor
+pub fn zlib_writer_write(w: *ZlibWriter, data: *u8, len: i64, out: *u8, out_cap: i64) -> i64
+    var out_start: i64 = 0
+
+    # Write header on first write
+    if w.state == STATE_INIT
+        let header_len: i64 = write_zlib_header(w, out, out_cap)
+        if header_len < 0
+            return header_len
+        out_start = header_len
+
+        # Write deflate block header: BFINAL=0, BTYPE=01 (fixed Huffman)
+        w.out_buf = out
+        w.out_pos = out_start
+        w.out_cap = out_cap
+        zlib_write_bits(w, 0, 1)   # BFINAL = 0
+        zlib_write_bits(w, 1, 2)   # BTYPE = 01 (fixed)
+
+        w.state = STATE_COMPRESSING
+
+    w.out_buf = out
+    w.out_pos = out_start
+    w.out_cap = out_cap
+
+    # Update Adler-32
+    w.adler = adler32_update(w.adler, data, len)
+    w.total_in = w.total_in + len
+
+    # Determine max chain length based on level
+    var max_chain: i32 = 4
+    if w.level >= 4
+        max_chain = 16
+    if w.level >= 7
+        max_chain = 128
+
+    # Process input data
+    var pos: i64 = 0
+
+    while pos < len
+        # Copy byte to window
+        let win_idx: i32 = (w.window_pos as i32) & WINDOW_MASK
+        w.window[win_idx] = data[pos]
+
+        # Try to find a match
+        var best_len: i32 = 0
+        var best_dist: i32 = 0
+
+        if w.window_fill >= (MIN_MATCH - 1) as i64
+            if pos + 2 < len
+                let h: i32 = zlib_hash3(data, pos)
+                var chain_pos: i32 = w.head[h]
+                var chain_count: i32 = 0
+
+                while chain_pos >= 0
+                    if chain_count >= max_chain
+                        break
+
+                    let dist: i64 = w.window_pos - chain_pos as i64
+                    if dist <= 0
+                        break
+                    if dist > WINDOW_SIZE as i64
+                        break
+
+                    var match_len: i32 = 0
+                    let max_len: i64 = len - pos
+                    var max_match_len: i32 = MAX_MATCH
+                    if max_len < MAX_MATCH as i64
+                        max_match_len = max_len as i32
+
+                    while match_len < max_match_len
+                        let win_match_idx: i32 = (chain_pos + match_len) & WINDOW_MASK
+                        if w.window[win_match_idx] != data[pos + match_len as i64]
+                            break
+                        match_len = match_len + 1
+
+                    if match_len >= MIN_MATCH
+                        if match_len > best_len
+                            best_len = match_len
+                            best_dist = dist as i32
+
+                    let prev_idx: i32 = chain_pos & WINDOW_MASK
+                    chain_pos = w.prev[prev_idx]
+                    chain_count = chain_count + 1
+
+                w.prev[win_idx] = w.head[h]
+                w.head[h] = w.window_pos as i32
+
+        if best_len >= MIN_MATCH
+            zlib_encode_match(w, best_len, best_dist)
+
+            for i in 1..best_len
+                pos = pos + 1
+                if pos < len
+                    let next_win_idx: i32 = ((w.window_pos + 1) as i32) & WINDOW_MASK
+                    w.window[next_win_idx] = data[pos]
+                    w.window_pos = w.window_pos + 1
+                    if w.window_fill < WINDOW_SIZE as i64
+                        w.window_fill = w.window_fill + 1
+
+                    if pos + 2 < len
+                        let nh: i32 = zlib_hash3(data, pos)
+                        w.prev[next_win_idx] = w.head[nh]
+                        w.head[nh] = w.window_pos as i32 - 1
+
+            pos = pos + 1
+            w.window_pos = w.window_pos + 1
+            if w.window_fill < WINDOW_SIZE as i64
+                w.window_fill = w.window_fill + 1
+        else
+            let byte: i32 = data[pos] as i32
+            zlib_encode_literal(w, byte)
+            pos = pos + 1
+            w.window_pos = w.window_pos + 1
+            if w.window_fill < WINDOW_SIZE as i64
+                w.window_fill = w.window_fill + 1
+
+    return w.out_pos
+
+
+# Flush pending data
+# This ends the current deflate block and starts a new non-final block
+# Note: The bit stream is NOT byte-aligned after flush - this is intentional
+pub fn zlib_writer_flush(w: *ZlibWriter, out: *u8, out_cap: i64) -> i64
+    if w.state != STATE_COMPRESSING
+        return 0
+
+    w.out_buf = out
+    w.out_pos = 0
+    w.out_cap = out_cap
+
+    # End current block with end-of-block marker
+    let eob_code: u32 = g_zstream_litlen_enc.codes[256] as u32
+    let eob_len: i32 = g_zstream_litlen_enc.lengths[256] as i32
+    zlib_write_bits(w, eob_code, eob_len)
+
+    # Start a new non-final block
+    zlib_write_bits(w, 0, 1)   # BFINAL = 0
+    zlib_write_bits(w, 1, 2)   # BTYPE = 01 (fixed)
+
+    # Return the bytes we've written so far (not flushing pending bits)
+    return w.out_pos
+
+
+# Finish compression and write trailer
+pub fn zlib_writer_finish(w: *ZlibWriter, out: *u8, out_cap: i64) -> i64
+    var out_start: i64 = 0
+
+    if w.state == STATE_INIT
+        let header_len: i64 = write_zlib_header(w, out, out_cap)
+        if header_len < 0
+            return header_len
+        out_start = header_len
+
+        w.out_buf = out
+        w.out_pos = out_start
+        w.out_cap = out_cap
+
+        # Write empty deflate block
+        zlib_write_bits(w, 1, 1)   # BFINAL = 1
+        zlib_write_bits(w, 1, 2)   # BTYPE = 01 (fixed)
+
+        # End-of-block
+        let eob_code: u32 = g_zstream_litlen_enc.codes[256] as u32
+        let eob_len: i32 = g_zstream_litlen_enc.lengths[256] as i32
+        zlib_write_bits(w, eob_code, eob_len)
+
+        zlib_flush_bits(w)
+        w.state = STATE_FINISHED
+    else if w.state == STATE_COMPRESSING
+        w.out_buf = out
+        w.out_pos = 0
+        w.out_cap = out_cap
+
+        # End current block and write final block
+        let eob_code: u32 = g_zstream_litlen_enc.codes[256] as u32
+        let eob_len: i32 = g_zstream_litlen_enc.lengths[256] as i32
+        zlib_write_bits(w, eob_code, eob_len)
+
+        # Write final empty block
+        zlib_write_bits(w, 1, 1)   # BFINAL = 1
+        zlib_write_bits(w, 1, 2)   # BTYPE = 01 (fixed)
+        zlib_write_bits(w, eob_code, eob_len)
+
+        zlib_flush_bits(w)
+        w.state = STATE_FINISHED
+    else
+        return 0
+
+    # Write Adler-32 trailer (big-endian!)
+    if w.out_pos + ZLIB_TRAILER_SIZE > w.out_cap
+        return ZLIB_STREAM_ERR_OUTPUT_FULL
+
+    let checksum: u32 = w.adler
+
+    w.out_buf[w.out_pos] = ((checksum >> 24) & 0xFF) as u8
+    w.out_pos = w.out_pos + 1
+    w.out_buf[w.out_pos] = ((checksum >> 16) & 0xFF) as u8
+    w.out_pos = w.out_pos + 1
+    w.out_buf[w.out_pos] = ((checksum >> 8) & 0xFF) as u8
+    w.out_pos = w.out_pos + 1
+    w.out_buf[w.out_pos] = (checksum & 0xFF) as u8
+    w.out_pos = w.out_pos + 1
+
+    return w.out_pos
+
+
+# Free resources
+pub fn zlib_writer_free(w: *ZlibWriter)
+    w.state = STATE_INIT
+    return
+
+
+# ============================================================================
+# ZlibReader - Streaming Decompression
+# ============================================================================
+
+pub struct ZlibReader
+    # State
+    state: i32                      # Current reader state
+
+    # Input buffering
+    in_buf: [256]u8                 # Buffer for partial input
+    in_buf_len: i64                 # Valid bytes in buffer
+
+    # Output buffer pointer (set on first read with non-null output)
+    out_buf: *u8
+    out_cap: i64
+
+    # Decompression state
+    adler: u32                      # Running Adler-32
+    total_out: i64                  # Total bytes output
+
+    # Expected values from trailer
+    expected_adler: u32
+
+
+# Initialize a ZlibReader
+pub fn zlib_reader_init(r: *ZlibReader) -> i32
+    r.state = RSTATE_HEADER
+    r.in_buf_len = 0
+    r.out_buf = nil
+    r.out_cap = 0
+    r.adler = adler32_init()
+    r.total_out = 0
+    r.expected_adler = 0
+    return 0
+
+
+# Read compressed data into internal buffer
+# Returns 0 while buffering, or bytes decompressed on success
+# For chunked input, call multiple times then finish()
+pub fn zlib_reader_read(r: *ZlibReader, data: *u8, len: i64, out: *u8, out_cap: i64) -> i64
+    # Save output buffer info for finish()
+    if r.out_buf == nil
+        r.out_buf = out
+        r.out_cap = out_cap
+
+    # Copy data to internal buffer
+    for i in 0..len
+        if r.in_buf_len < 256
+            r.in_buf[r.in_buf_len] = data[i]
+            r.in_buf_len = r.in_buf_len + 1
+
+    # Parse header if needed
+    if r.state == RSTATE_HEADER
+        if r.in_buf_len < ZLIB_HEADER_SIZE
+            return 0
+
+        let cmf: u8 = r.in_buf[0]
+        let cm: u8 = cmf & 0x0F
+        let cinfo: u8 = cmf >> 4
+
+        if cm != ZLIB_CM_DEFLATE
+            return ZLIB_STREAM_ERR_INVALID_HEADER
+        if cinfo > 7
+            return ZLIB_STREAM_ERR_INVALID_HEADER
+
+        let flg: u8 = r.in_buf[1]
+
+        # Verify checksum
+        let header_check: u32 = ((cmf as u32) << 8) | (flg as u32)
+        if header_check % 31 != 0
+            return ZLIB_STREAM_ERR_INVALID_HEADER
+
+        # Check FDICT (not supported)
+        if (flg & 0x20) != 0
+            return ZLIB_STREAM_ERR_INVALID_HEADER
+
+        r.state = RSTATE_DATA
+
+    # Return 0 while buffering - actual decompression happens in finish()
+    return 0
+
+
+# Finish decompression and verify checksum
+# This is where actual decompression happens
+pub fn zlib_reader_finish(r: *ZlibReader) -> i32
+    if r.state == RSTATE_DONE
+        # Already finished
+        if r.adler != r.expected_adler
+            return -2
+        return 0
+
+    if r.state != RSTATE_DATA
+        return -1  # Not enough data for header
+
+    # Calculate deflate data length
+    let deflate_len: i64 = r.in_buf_len - ZLIB_HEADER_SIZE - ZLIB_TRAILER_SIZE
+    if deflate_len < 0
+        return -1  # Need more data
+
+    # Decompress
+    let result: i64 = inflate(@r.in_buf[ZLIB_HEADER_SIZE], deflate_len, r.out_buf, r.out_cap)
+    if result < 0
+        return -3  # Decompression failed
+
+    # Compute Adler-32 checksum
+    r.adler = adler32(r.out_buf, result)
+    r.total_out = result
+
+    # Read trailer (big-endian)
+    let trailer_pos: i64 = r.in_buf_len - ZLIB_TRAILER_SIZE
+    let adler_b0: u32 = r.in_buf[trailer_pos] as u32
+    let adler_b1: u32 = r.in_buf[trailer_pos + 1] as u32
+    let adler_b2: u32 = r.in_buf[trailer_pos + 2] as u32
+    let adler_b3: u32 = r.in_buf[trailer_pos + 3] as u32
+    r.expected_adler = (adler_b0 << 24) | (adler_b1 << 16) | (adler_b2 << 8) | adler_b3
+
+    r.state = RSTATE_DONE
+
+    # Verify checksum
+    if r.adler != r.expected_adler
+        return -2
+
+    return 0
+
+
+# Free resources
+pub fn zlib_reader_free(r: *ZlibReader)
+    r.state = RSTATE_HEADER
+    return

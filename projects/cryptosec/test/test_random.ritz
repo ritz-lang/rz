@@ -1,0 +1,262 @@
+# test/test_random.ritz - Tests for CSPRNG
+#
+# Tests for lib/random.ritz:
+# - getrandom syscall works
+# - random_bytes fills buffer
+# - random_u64/u32 return values
+# - Statistical sanity checks
+
+import ritzlib.sys
+import ritzlib.io
+
+import lib.random
+import lib.mem
+
+# ============================================================================
+# Basic functionality tests
+# ============================================================================
+
+[[test]]
+fn test_getrandom_syscall() -> i32
+    var buf: [32]u8
+    # Zero the buffer first
+    var i: i32 = 0
+    while i < 32
+        buf[i] = 0
+        i += 1
+
+    let result: i64 = getrandom(&buf[0], 32, 0)
+
+    # Should return 32 (bytes written)
+    if result != 32
+        return 1
+
+    # Buffer should not be all zeros (statistically impossible)
+    let is_zero: i32 = mem_is_zero(&buf[0], 32)
+    if is_zero == 1
+        return 2
+
+    0
+
+[[test]]
+fn test_random_bytes_fills_buffer() -> i32
+    var buf: [64]u8
+    # Zero the buffer
+    var i: i32 = 0
+    while i < 64
+        buf[i] = 0
+        i += 1
+
+    let result: i32 = random_bytes(&buf[0], 64)
+
+    # Should succeed
+    if result != 0
+        return 1
+
+    # Should not be all zeros
+    if mem_is_zero(&buf[0], 64) == 1
+        return 2
+
+    0
+
+[[test]]
+fn test_random_bytes_zero_length() -> i32
+    var buf: [8]u8
+    buf[0] = 42  # Sentinel value
+
+    let result: i32 = random_bytes(&buf[0], 0)
+
+    # Should succeed with 0 length
+    if result != 0
+        return 1
+
+    # Buffer should be unchanged
+    if buf[0] != 42
+        return 2
+
+    0
+
+[[test]]
+fn test_random_u64_nonzero() -> i32
+    # Get multiple random values - at least one should be non-zero
+    let a: u64 = random_u64()
+    let b: u64 = random_u64()
+    let c: u64 = random_u64()
+
+    # All three being zero is essentially impossible
+    if a == 0
+        if b == 0
+            if c == 0
+                return 1
+
+    0
+
+[[test]]
+fn test_random_u32_nonzero() -> i32
+    let a: u32 = random_u32()
+    let b: u32 = random_u32()
+    let c: u32 = random_u32()
+
+    if a == 0
+        if b == 0
+            if c == 0
+                return 1
+
+    0
+
+# ============================================================================
+# Uniqueness tests
+# ============================================================================
+
+[[test]]
+fn test_random_u64_unique() -> i32
+    # Two random u64 values should be different (collision probability ~2^-64)
+    let a: u64 = random_u64()
+    let b: u64 = random_u64()
+
+    if a == b
+        return 1
+
+    0
+
+[[test]]
+fn test_random_bytes_different_calls() -> i32
+    var buf1: [32]u8
+    var buf2: [32]u8
+
+    random_bytes(&buf1[0], 32)
+    random_bytes(&buf2[0], 32)
+
+    # Buffers should be different
+    if mem_eq(&buf1[0], &buf2[0], 32) == 1
+        return 1
+
+    0
+
+# ============================================================================
+# Distribution sanity checks
+# ============================================================================
+
+[[test]]
+fn test_random_bytes_distribution() -> i32
+    # Statistical test: count bytes in upper vs lower half
+    # Should be roughly 50/50 with high probability
+    var buf: [256]u8
+    random_bytes(&buf[0], 256)
+
+    var upper_count: i32 = 0
+    var i: i32 = 0
+    while i < 256
+        if buf[i] >= 128
+            upper_count += 1
+        i += 1
+
+    # Expect ~128 in upper half, allow significant deviation
+    # Using range [64, 192] which should fail < 0.001% of the time
+    if upper_count < 64
+        return 1
+    if upper_count > 192
+        return 2
+
+    0
+
+[[test]]
+fn test_random_u64_high_bits_set() -> i32
+    # Over multiple samples, at least one should have high bits set
+    var any_high: i32 = 0
+    var i: i32 = 0
+
+    while i < 10
+        let r: u64 = random_u64()
+        # Check if bit 63 or 62 is set
+        if r >= 0x4000000000000000
+            any_high = 1
+        i += 1
+
+    # Probability of none having high bits in 10 samples is ~(0.75)^10 < 6%
+    # We'll accept occasional test failures for simplicity
+    if any_high == 0
+        return 1
+
+    0
+
+[[test]]
+fn test_random_u64_low_bits_set() -> i32
+    # Over multiple samples, at least one should have low bits set
+    var any_low: i32 = 0
+    var i: i32 = 0
+
+    while i < 10
+        let r: u64 = random_u64()
+        # Check if any of lower 4 bits is set
+        if (r & 0xF) != 0
+            any_low = 1
+        i += 1
+
+    # Probability of all having 0 in lower 4 bits is (1/16)^10 ~= 0
+    if any_low == 0
+        return 1
+
+    0
+
+# ============================================================================
+# Large buffer test
+# ============================================================================
+
+[[test]]
+fn test_random_bytes_large_buffer() -> i32
+    # Test that we can fill a larger buffer (tests the loop in random_bytes)
+    # getrandom typically returns up to 256 bytes per call
+    var buf: [512]u8
+
+    # Zero the buffer
+    var i: i32 = 0
+    while i < 512
+        buf[i] = 0
+        i += 1
+
+    let result: i32 = random_bytes(&buf[0], 512)
+
+    if result != 0
+        return 1
+
+    # Check that the buffer is not all zeros
+    if mem_is_zero(&buf[0], 512) == 1
+        return 2
+
+    # Check that different parts of the buffer are different
+    # (not just repeating the same pattern)
+    if mem_eq(&buf[0], &buf[256], 256) == 1
+        return 3
+
+    0
+
+# ============================================================================
+# Edge cases
+# ============================================================================
+
+[[test]]
+fn test_random_range_zero() -> i32
+    let r: u64 = random_range_u64(0)
+    if r != 0
+        return 1
+    0
+
+[[test]]
+fn test_random_range_one() -> i32
+    let r: u64 = random_range_u64(1)
+    if r != 0
+        return 1
+    0
+
+[[test]]
+fn test_random_range_bounded() -> i32
+    # Check that random_range_u64 stays within bounds
+    var i: i32 = 0
+    while i < 100
+        let r: u64 = random_range_u64(100)
+        if r >= 100
+            return 1
+        i += 1
+    0
+

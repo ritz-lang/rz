@@ -1,0 +1,234 @@
+# lib/u128.ritz - 128-bit unsigned integer emulation
+#
+# Provides U128 type for cryptographic operations requiring 128-bit integers.
+# Implemented as a struct with two u64 fields (lo, hi).
+#
+# Operations:
+# - Construction: u128_zero, u128_from_u64, u128_from_parts
+# - Arithmetic: u128_add, u128_sub, u128_mul
+# - Bitwise: u128_shl, u128_shr, u128_and, u128_or, u128_xor
+# - Comparison: u128_eq, u128_lt, u128_gt
+
+import ritzlib.sys
+
+# 128-bit unsigned integer: lo is bits 0-63, hi is bits 64-127
+struct U128
+    lo: u64
+    hi: u64
+
+# ============================================================================
+# Construction
+# ============================================================================
+
+pub fn u128_zero() -> U128
+    return U128 { lo: 0, hi: 0 }
+
+pub fn u128_from_u64(val: u64) -> U128
+    return U128 { lo: val, hi: 0 }
+
+pub fn u128_from_parts(lo: u64, hi: u64) -> U128
+    return U128 { lo: lo, hi: hi }
+
+# ============================================================================
+# Helper: constant-time carry/borrow detection
+# ============================================================================
+
+# Returns 1 if a + b overflowed (result < a), 0 otherwise
+fn u64_add_carry(a: u64, b: u64) -> u64
+    let sum: u64 = a + b
+    # If sum < a, we overflowed and need carry
+    # Convert bool to u64: (sum < a) gives 0 or 1
+    if sum < a
+        return 1
+    return 0
+
+# Returns 1 if a < b (subtraction would borrow), 0 otherwise
+fn u64_sub_borrow(a: u64, b: u64) -> u64
+    if a < b
+        return 1
+    return 0
+
+# ============================================================================
+# Arithmetic operations
+# ============================================================================
+
+pub fn u128_add(a: U128, b: U128) -> U128
+    let lo: u64 = a.lo + b.lo
+    let carry: u64 = u64_add_carry(a.lo, b.lo)
+    let hi: u64 = a.hi + b.hi + carry
+    return U128 { lo: lo, hi: hi }
+
+pub fn u128_sub(a: U128, b: U128) -> U128
+    let lo: u64 = a.lo - b.lo
+    let borrow: u64 = u64_sub_borrow(a.lo, b.lo)
+    let hi: u64 = a.hi - b.hi - borrow
+    return U128 { lo: lo, hi: hi }
+
+pub fn u128_mul(a: U128, b: U128) -> U128
+    # Multiply using 32-bit chunks to avoid overflow
+    # a = a3*2^96 + a2*2^64 + a1*2^32 + a0
+    # b = b3*2^96 + b2*2^64 + b1*2^32 + b0
+    # We only need results that fit in 128 bits
+
+    let mask32: u64 = 0xFFFFFFFF
+
+    # Split a.lo and b.lo into 32-bit parts
+    let a0: u64 = a.lo & mask32
+    let a1: u64 = a.lo >> 32
+    let a2: u64 = a.hi & mask32
+    let a3: u64 = a.hi >> 32
+
+    let b0: u64 = b.lo & mask32
+    let b1: u64 = b.lo >> 32
+    let b2: u64 = b.hi & mask32
+    let b3: u64 = b.hi >> 32
+
+    # Compute partial products that contribute to bits 0-127
+    # p00 contributes to bits 0-63
+    # p01, p10 contribute to bits 32-95
+    # p02, p11, p20 contribute to bits 64-127
+    # p03, p12, p21, p30 contribute to bits 96-127+
+
+    let p00: u64 = a0 * b0                    # bits 0-63
+    let p01: u64 = a0 * b1                    # bits 32-95
+    let p10: u64 = a1 * b0                    # bits 32-95
+    let p02: u64 = a0 * b2                    # bits 64-127
+    let p11: u64 = a1 * b1                    # bits 64-127
+    let p20: u64 = a2 * b0                    # bits 64-127
+
+    # For hi bits only (we don't need full precision here)
+    let p03: u64 = a0 * b3                    # bits 96-127
+    let p12: u64 = a1 * b2                    # bits 96-127
+    let p21: u64 = a2 * b1                    # bits 96-127
+    let p30: u64 = a3 * b0                    # bits 96-127
+
+    # Build result
+    # lo = p00 + (p01 + p10) << 32
+    # hi = (p01 + p10) >> 32 + p02 + p11 + p20 + (p03 + p12 + p21 + p30) << 32
+
+    let mid: u64 = p01 + p10                  # might overflow, but that's ok
+    let mid_lo: u64 = mid << 32
+    let mid_hi: u64 = mid >> 32
+
+    # Compute lo with carry tracking
+    let lo: u64 = p00 + mid_lo
+    let carry: u64 = u64_add_carry(p00, mid_lo)
+
+    # Compute hi
+    let hi: u64 = mid_hi + p02 + p11 + p20 + carry
+    let hi_extra: u64 = (p03 + p12 + p21 + p30) << 32
+    let hi_final: u64 = hi + hi_extra
+
+    return U128 { lo: lo, hi: hi_final }
+
+# Multiply two u64 values to produce a full 128-bit result
+pub fn u128_mul_u64(a: u64, b: u64) -> U128
+    # Split into 32-bit halves to avoid overflow
+    let mask32: u64 = 0xFFFFFFFF
+    let a0: u64 = a & mask32
+    let a1: u64 = a >> 32
+    let b0: u64 = b & mask32
+    let b1: u64 = b >> 32
+
+    # Compute partial products
+    let p00: u64 = a0 * b0    # bits 0-63
+    let p01: u64 = a0 * b1    # bits 32-95
+    let p10: u64 = a1 * b0    # bits 32-95
+    let p11: u64 = a1 * b1    # bits 64-127
+
+    # Combine with proper carry propagation
+    let mid: u64 = p01 + p10
+    let mid_lo: u64 = mid << 32
+    let mid_hi: u64 = mid >> 32
+
+    # Check for overflow in mid = p01 + p10
+    var mid_carry: u64 = 0
+    if mid < p01
+        mid_carry = 1
+
+    let lo: u64 = p00 + mid_lo
+    var carry: u64 = 0
+    if lo < p00
+        carry = 1
+
+    let hi: u64 = p11 + mid_hi + carry + (mid_carry << 32)
+    return U128 { lo: lo, hi: hi }
+
+# Add a u64 to a U128
+pub fn u128_add_u64(a: U128, b: u64) -> U128
+    let lo: u64 = a.lo + b
+    var carry: u64 = 0
+    if lo < a.lo
+        carry = 1
+    let hi: u64 = a.hi + carry
+    return U128 { lo: lo, hi: hi }
+
+# ============================================================================
+# Shift operations
+# ============================================================================
+
+pub fn u128_shl(a: U128, shift: u64) -> U128
+    if shift == 0
+        return a
+    if shift >= 128
+        return U128 { lo: 0, hi: 0 }
+    if shift >= 64
+        # All bits move to hi
+        let hi: u64 = a.lo << (shift - 64)
+        return U128 { lo: 0, hi: hi }
+    # shift < 64: some bits stay in lo, some move to hi
+    let lo: u64 = a.lo << shift
+    let hi: u64 = (a.hi << shift) | (a.lo >> (64 - shift))
+    return U128 { lo: lo, hi: hi }
+
+pub fn u128_shr(a: U128, shift: u64) -> U128
+    if shift == 0
+        return a
+    if shift >= 128
+        return U128 { lo: 0, hi: 0 }
+    if shift >= 64
+        # All bits come from hi
+        let lo: u64 = a.hi >> (shift - 64)
+        return U128 { lo: lo, hi: 0 }
+    # shift < 64: some bits stay in hi, some move from hi to lo
+    let lo: u64 = (a.lo >> shift) | (a.hi << (64 - shift))
+    let hi: u64 = a.hi >> shift
+    return U128 { lo: lo, hi: hi }
+
+# ============================================================================
+# Bitwise operations
+# ============================================================================
+
+pub fn u128_and(a: U128, b: U128) -> U128
+    return U128 { lo: a.lo & b.lo, hi: a.hi & b.hi }
+
+pub fn u128_or(a: U128, b: U128) -> U128
+    return U128 { lo: a.lo | b.lo, hi: a.hi | b.hi }
+
+pub fn u128_xor(a: U128, b: U128) -> U128
+    return U128 { lo: a.lo ^ b.lo, hi: a.hi ^ b.hi }
+
+# ============================================================================
+# Comparison operations
+# ============================================================================
+
+pub fn u128_eq(a: U128, b: U128) -> i32
+    if a.lo == b.lo
+        if a.hi == b.hi
+            return 1
+    return 0
+
+pub fn u128_lt(a: U128, b: U128) -> i32
+    # Compare hi first
+    if a.hi < b.hi
+        return 1
+    if a.hi > b.hi
+        return 0
+    # hi equal, compare lo
+    if a.lo < b.lo
+        return 1
+    return 0
+
+pub fn u128_gt(a: U128, b: U128) -> i32
+    # a > b is equivalent to b < a
+    return u128_lt(b, a)

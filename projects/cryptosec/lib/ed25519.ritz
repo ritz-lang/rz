@@ -1,0 +1,755 @@
+# lib/ed25519.ritz - Ed25519 signatures (RFC 8032)
+#
+# Twisted Edwards curve: -x^2 + y^2 = 1 + d*x^2*y^2
+# where d = -121665/121666 (mod p)
+# p = 2^255 - 19
+# Group order l = 2^252 + 27742317777372353535851937790883648493
+#
+# Uses extended homogeneous coordinates (X, Y, Z, T) where:
+#   x = X/Z, y = Y/Z, x*y = T/Z
+#
+# This representation allows unified addition formulas.
+
+import mem
+import u128
+import x25519
+import sha512
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+# Group order L as bytes (little-endian):
+# L = 2^252 + 27742317777372353535851937790883648493
+# Used for scalar reduction in sc_reduce
+const L_BYTES: [32]i64 = [
+    0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58,
+    0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9, 0xde, 0x14,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10,
+]
+
+# d = -121665/121666 (mod p)
+# In radix-2^51 representation
+fn fe_d(out: *Fe25519)
+    out.l0 = 929955233495203
+    out.l1 = 466365720129213
+    out.l2 = 1662059464998953
+    out.l3 = 2033849074728123
+    out.l4 = 1442794654840575
+
+# 2*d for addition formula
+fn fe_2d(out: *Fe25519)
+    out.l0 = 1859910466990425
+    out.l1 = 932731440258426
+    out.l2 = 1072319116312658
+    out.l3 = 1815898335770999
+    out.l4 = 633789495995903
+
+# sqrt(-1) mod p (for point decompression)
+fn fe_sqrtm1(out: *Fe25519)
+    out.l0 = 1718705420411056
+    out.l1 = 234908883556509
+    out.l2 = 2233514472574048
+    out.l3 = 2117202627021982
+    out.l4 = 765476049583133
+
+# ============================================================================
+# Extended Edwards point representation
+# ============================================================================
+
+# Point in extended homogeneous coordinates (X, Y, Z, T)
+# Represents (x, y) where x = X/Z, y = Y/Z, xy = T/Z
+struct Ge25519
+    X: Fe25519
+    Y: Fe25519
+    Z: Fe25519
+    T: Fe25519
+
+# ============================================================================
+# Point operations
+# ============================================================================
+
+pub fn ge_zero(p: *Ge25519)
+    # Neutral element: (0, 1) = (X=0, Y=1, Z=1, T=0)
+    fe_zero(&p.X)
+    fe_one(&p.Y)
+    fe_one(&p.Z)
+    fe_zero(&p.T)
+
+fn ge_copy(out: *Ge25519, p: *Ge25519)
+    fe_copy(&out.X, &p.X)
+    fe_copy(&out.Y, &p.Y)
+    fe_copy(&out.Z, &p.Z)
+    fe_copy(&out.T, &p.T)
+
+# Point negation: -(x, y) = (-x, y)
+pub fn ge_neg(out: *Ge25519, p: *Ge25519)
+    var zero: Fe25519
+    fe_zero(&zero)
+    fe_sub(&out.X, &zero, &p.X)
+    fe_copy(&out.Y, &p.Y)
+    fe_copy(&out.Z, &p.Z)
+    var t_zero: Fe25519
+    fe_zero(&t_zero)
+    fe_sub(&out.T, &t_zero, &p.T)
+
+# Point addition using extended coordinates
+# Formula from https://hyperelliptic.org/EFD/g1p/auto-twisted-extended.html
+pub fn ge_add(r: *Ge25519, p: *Ge25519, q: *Ge25519)
+    var d_const: Fe25519
+    fe_2d(&d_const)  # Use 2d for the formula
+
+    var A: Fe25519
+    var B: Fe25519
+    var C: Fe25519
+    var D: Fe25519
+    var E: Fe25519
+    var F: Fe25519
+    var G: Fe25519
+    var H: Fe25519
+
+    # A = (Y1-X1)*(Y2-X2)
+    var t1: Fe25519
+    var t2: Fe25519
+    fe_sub(&t1, &p.Y, &p.X)
+    fe_sub(&t2, &q.Y, &q.X)
+    fe_mul(&A, &t1, &t2)
+
+    # B = (Y1+X1)*(Y2+X2)
+    fe_add(&t1, &p.Y, &p.X)
+    fe_add(&t2, &q.Y, &q.X)
+    fe_mul(&B, &t1, &t2)
+
+    # C = T1*2d*T2
+    fe_mul(&t1, &p.T, &d_const)
+    fe_mul(&C, &t1, &q.T)
+
+    # D = Z1*2*Z2
+    fe_mul(&t1, &p.Z, &q.Z)
+    fe_add(&D, &t1, &t1)
+
+    # E = B-A
+    fe_sub(&E, &B, &A)
+
+    # F = D-C
+    fe_sub(&F, &D, &C)
+
+    # G = D+C
+    fe_add(&G, &D, &C)
+
+    # H = B+A
+    fe_add(&H, &B, &A)
+
+    # X3 = E*F
+    fe_mul(&r.X, &E, &F)
+
+    # Y3 = G*H
+    fe_mul(&r.Y, &G, &H)
+
+    # T3 = E*H
+    fe_mul(&r.T, &E, &H)
+
+    # Z3 = F*G
+    fe_mul(&r.Z, &F, &G)
+
+# Point doubling using extended coordinates
+pub fn ge_double(r: *Ge25519, p: *Ge25519)
+    var A: Fe25519
+    var B: Fe25519
+    var C: Fe25519
+    var D: Fe25519
+    var E: Fe25519
+    var F: Fe25519
+    var G: Fe25519
+    var H: Fe25519
+
+    # A = X1^2
+    fe_sq(&A, &p.X)
+
+    # B = Y1^2
+    fe_sq(&B, &p.Y)
+
+    # C = 2*Z1^2
+    fe_sq(&C, &p.Z)
+    fe_add(&C, &C, &C)
+
+    # D = -A (for twisted Edwards with a=-1)
+    var zero: Fe25519
+    fe_zero(&zero)
+    fe_sub(&D, &zero, &A)
+
+    # E = (X1+Y1)^2 - A - B
+    var t: Fe25519
+    fe_add(&t, &p.X, &p.Y)
+    fe_sq(&E, &t)
+    fe_sub(&E, &E, &A)
+    fe_sub(&E, &E, &B)
+
+    # G = D+B
+    fe_add(&G, &D, &B)
+
+    # F = G-C
+    fe_sub(&F, &G, &C)
+
+    # H = D-B
+    fe_sub(&H, &D, &B)
+
+    # X3 = E*F
+    fe_mul(&r.X, &E, &F)
+
+    # Y3 = G*H
+    fe_mul(&r.Y, &G, &H)
+
+    # T3 = E*H
+    fe_mul(&r.T, &E, &H)
+
+    # Z3 = F*G
+    fe_mul(&r.Z, &F, &G)
+
+# ============================================================================
+# Scalar multiplication
+# ============================================================================
+
+# Scalar multiplication using double-and-add
+pub fn ge_scalarmult(r: *Ge25519, s: *u8, p: *Ge25519)
+    ge_zero(r)
+
+    var i: i32 = 255
+    while i >= 0
+        ge_double(r, r)
+
+        let byte_idx: i32 = i / 8
+        let bit_idx: i32 = i % 8
+        # NOTE: Must use intermediate variable due to Ritz compiler bug
+        let byte: u8 = s[byte_idx]
+        let bit: u64 = ((byte >> (bit_idx as u8)) & 1) as u64
+
+        if bit == 1
+            var t: Ge25519
+            ge_add(&t, r, p)
+            ge_copy(r, &t)
+
+        i -= 1
+
+# ============================================================================
+# Base point
+# ============================================================================
+
+# Ed25519 base point B = (x, 4/5) where x is positive
+# x = 15112221349535807912866137220509078935008241517919938459256...
+# y = 46316835694926478169428394003475163141307993866256225615783...
+
+pub fn ge_basepoint(B: *Ge25519)
+    # X coordinate of base point (radix-2^51)
+    B.X.l0 = 1738742601995546
+    B.X.l1 = 1146398526822698
+    B.X.l2 = 2070867633025821
+    B.X.l3 = 562264141797630
+    B.X.l4 = 587772402128613
+
+    # Y coordinate = 4/5 (radix-2^51)
+    B.Y.l0 = 1801439850948184
+    B.Y.l1 = 1351079888211148
+    B.Y.l2 = 450359962737049
+    B.Y.l3 = 900719925474099
+    B.Y.l4 = 1801439850948198
+
+    # Z = 1
+    fe_one(&B.Z)
+
+    # T = X*Y
+    fe_mul(&B.T, &B.X, &B.Y)
+
+# Base point scalar multiplication
+pub fn ge_scalarmult_base(r: *Ge25519, s: *u8)
+    var B: Ge25519
+    ge_basepoint(&B)
+    ge_scalarmult(r, s, &B)
+
+# ============================================================================
+# Point encoding/decoding (RFC 8032)
+# ============================================================================
+
+# Encode point to 32 bytes
+# Encoding: y-coordinate with sign bit of x in MSB
+pub fn ge_tobytes(out: *u8, p: *Ge25519)
+    var z_inv: Fe25519
+    fe_invert(&z_inv, &p.Z)
+
+    var x: Fe25519
+    var y: Fe25519
+    fe_mul(&x, &p.X, &z_inv)
+    fe_mul(&y, &p.Y, &z_inv)
+
+    fe_reduce(&x)
+    fe_reduce(&y)
+
+    fe_tobytes(out, &y)
+
+    # Set sign bit: out[31] |= (x.l0 & 1) << 7
+    let x_sign: u8 = (x.l0 & 1) as u8
+    out[31] = out[31] | (x_sign << 7)
+
+# Check if field element is negative (LSB == 1)
+fn fe_isnegative(f: *Fe25519) -> i32
+    var bytes: [32]u8
+    fe_tobytes(&bytes[0], f)
+    return (bytes[0] & 1) as i32
+
+# Square root mod p (if it exists)
+# Uses Tonelli-Shanks for p ≡ 5 (mod 8)
+# sqrt(a) = a^((p+3)/8) or i*a^((p+3)/8) where i = sqrt(-1)
+pub fn fe_sqrt(out: *Fe25519, a: *Fe25519) -> i32
+    # Compute a^((p+3)/8) where (p+3)/8 = 2^252 - 2
+    # For p = 2^255 - 19, p ≡ 5 (mod 8)
+    #
+    # The exponent (p+3)/8 = (2^255 - 16)/8 = 2^252 - 2
+    #
+    # We use the same addition chain as fe_invert, which computes a^(p-2)
+    # But stop at 2^252 - 2 instead of p-2 = 2^255 - 21
+
+    var t0: Fe25519  # a^1
+    fe_copy(&t0, a)
+
+    var t1: Fe25519
+    fe_sq(&t1, &t0)  # a^2
+
+    var t2: Fe25519
+    fe_sq(&t2, &t1)  # a^4
+    fe_sq(&t2, &t2)  # a^8
+    fe_mul(&t2, &t2, &t0)  # a^9
+
+    fe_mul(&t1, &t1, &t2)  # a^11
+
+    var t3: Fe25519
+    fe_sq(&t3, &t1)  # a^22
+    fe_mul(&t2, &t2, &t3)  # a^31 = 2^5 - 1
+
+    fe_sq(&t3, &t2)  # (2^5-1) * 2
+    var i: i32 = 0
+    while i < 4
+        fe_sq(&t3, &t3)
+        i += 1
+    # Now t3 = a^(31 * 32) = a^(2^10 - 32)
+    fe_mul(&t2, &t3, &t2)  # a^(2^10 - 1)
+
+    fe_sq(&t3, &t2)
+    i = 0
+    while i < 9
+        fe_sq(&t3, &t3)
+        i += 1
+    # t3 = a^((2^10-1) * 2^10) = a^(2^20 - 2^10)
+    fe_mul(&t3, &t3, &t2)  # a^(2^20 - 1)
+
+    var t4: Fe25519
+    fe_sq(&t4, &t3)
+    i = 0
+    while i < 19
+        fe_sq(&t4, &t4)
+        i += 1
+    # t4 = a^((2^20-1) * 2^20)
+    fe_mul(&t3, &t4, &t3)  # a^(2^40 - 1)
+
+    fe_sq(&t3, &t3)
+    i = 0
+    while i < 9
+        fe_sq(&t3, &t3)
+        i += 1
+    # t3 = a^((2^40-1) * 2^10)
+    fe_mul(&t2, &t3, &t2)  # a^(2^50 - 1)
+
+    fe_sq(&t3, &t2)
+    i = 0
+    while i < 49
+        fe_sq(&t3, &t3)
+        i += 1
+    fe_mul(&t3, &t3, &t2)  # a^(2^100 - 1)
+
+    fe_sq(&t4, &t3)
+    i = 0
+    while i < 99
+        fe_sq(&t4, &t4)
+        i += 1
+    fe_mul(&t3, &t4, &t3)  # a^(2^200 - 1)
+
+    fe_sq(&t3, &t3)
+    i = 0
+    while i < 49
+        fe_sq(&t3, &t3)
+        i += 1
+    fe_mul(&t2, &t3, &t2)  # a^(2^250 - 1)
+
+    # t2 = a^(2^250 - 1)
+    # t1 = a^2 (since we updated it at line 306)
+    # We need a^(2^252 - 2)
+    #
+    # 2^252 - 2 = 4 * 2^250 - 2 = 4 * (2^250 - 1) + 4 - 2 = 4*(2^250-1) + 2
+    # So a^(2^252 - 2) = (a^(2^250-1))^4 * a^2
+
+    var t1_save: Fe25519
+    fe_sq(&t1_save, &t0)  # a^2 (recalculate since t1 was clobbered)
+
+    fe_sq(&t2, &t2)  # a^(2*(2^250-1)) = a^(2^251 - 2)
+    fe_sq(&t2, &t2)  # a^(2^252 - 4)
+    fe_mul(&t2, &t2, &t1_save)  # a^(2^252 - 4 + 2) = a^(2^252 - 2)
+
+    # t2 is now the candidate sqrt = a^((p+3)/8)
+
+    # Verify: check if t2^2 == a
+    var check: Fe25519
+    fe_sq(&check, &t2)
+    fe_reduce(&check)
+
+    var a_r: Fe25519
+    fe_copy(&a_r, a)
+    fe_reduce(&a_r)
+
+    # Compare
+    if check.l0 == a_r.l0
+        if check.l1 == a_r.l1
+            if check.l2 == a_r.l2
+                if check.l3 == a_r.l3
+                    if check.l4 == a_r.l4
+                        fe_copy(out, &t2)
+                        return 0
+
+    # Try sqrt(-1) * t2 (for case where -a is a QR)
+    var sqrtm1: Fe25519
+    fe_sqrtm1(&sqrtm1)
+    fe_mul(&t2, &t2, &sqrtm1)
+
+    fe_sq(&check, &t2)
+    fe_reduce(&check)
+
+    if check.l0 == a_r.l0
+        if check.l1 == a_r.l1
+            if check.l2 == a_r.l2
+                if check.l3 == a_r.l3
+                    if check.l4 == a_r.l4
+                        fe_copy(out, &t2)
+                        return 0
+
+    # No square root exists
+    return -1
+
+# Decode 32 bytes to point
+pub fn ge_frombytes(p: *Ge25519, bytes: *u8) -> i32
+    # Extract y coordinate (clear sign bit)
+    var y_bytes: [32]u8
+    mem_copy(&y_bytes[0], bytes, 32)
+    let x_sign: i32 = ((y_bytes[31] >> 7) & 1) as i32
+    y_bytes[31] = y_bytes[31] & 0x7f
+
+    var y: Fe25519
+    fe_frombytes(&y, &y_bytes[0])
+
+    # Compute x from curve equation: x^2 = (y^2 - 1) / (d*y^2 + 1)
+    var y2: Fe25519
+    fe_sq(&y2, &y)
+
+    # u = y^2 - 1
+    var one: Fe25519
+    fe_one(&one)
+    var u: Fe25519
+    fe_sub(&u, &y2, &one)
+
+    # v = d*y^2 + 1
+    var d_const: Fe25519
+    fe_d(&d_const)
+    var v: Fe25519
+    fe_mul(&v, &d_const, &y2)
+    fe_add(&v, &v, &one)
+
+    # x^2 = u * v^(-1)
+    var v_inv: Fe25519
+    fe_invert(&v_inv, &v)
+    var x2: Fe25519
+    fe_mul(&x2, &u, &v_inv)
+
+    # x = sqrt(x^2)
+    var x: Fe25519
+    let sqrt_ok: i32 = fe_sqrt(&x, &x2)
+    if sqrt_ok != 0
+        return -1
+
+    # Adjust sign of x
+    fe_reduce(&x)
+    let computed_sign: i32 = (x.l0 & 1) as i32
+    if computed_sign != x_sign
+        var zero: Fe25519
+        fe_zero(&zero)
+        fe_sub(&x, &zero, &x)
+
+    # Set point coordinates
+    fe_copy(&p.X, &x)
+    fe_copy(&p.Y, &y)
+    fe_one(&p.Z)
+    fe_mul(&p.T, &x, &y)
+
+    return 0
+
+# ============================================================================
+# Scalar arithmetic mod l
+# ============================================================================
+
+# Group order l = 2^252 + 27742317777372353535851937790883648493
+# In bytes (little-endian):
+# L = ed d3 f5 5c 1a 63 12 58 d6 9c f7 a2 de f9 de 14 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 10
+#
+# We use byte-wise representation following TweetNaCl's modL algorithm
+# for simplicity and correctness.
+
+# L constant as bytes (little-endian) - uses const array L_BYTES
+pub fn L(i: i32) -> i64
+    return L_BYTES[i as u64]
+
+# Reduce 64-byte value mod l using TweetNaCl's algorithm
+# Input: 64 bytes (s[0..63]) representing a 512-bit number
+# Output: writes result to s[0..31], clears s[32..63]
+pub fn sc_reduce(s: *u8)
+    # Convert to i64 for intermediate arithmetic
+    # NOTE: Must use intermediate variable due to Ritz compiler bug with
+    # direct cast from pointer dereference to i64
+    var x: [64]i64
+    var idx: i32 = 0
+    while idx < 64
+        let byte: u8 = s[idx]
+        x[idx] = byte as i64
+        idx += 1
+
+    # Main reduction loop: eliminate high bytes
+    # For each byte from 63 down to 32, reduce by subtracting L * x[i]
+    var outer: i32 = 63
+    while outer >= 32
+        var c1: i64 = 0
+        var inner: i32 = outer - 32
+
+        while inner < outer - 12
+            let L_idx: i32 = inner - (outer - 32)
+            x[inner] = x[inner] + c1 - 16 * x[outer] * L(L_idx)
+            c1 = (x[inner] + 128) >> 8
+            x[inner] = x[inner] - (c1 << 8)
+            inner += 1
+
+        x[inner] = x[inner] + c1
+        x[outer] = 0
+        outer -= 1
+
+    # First cleanup pass
+    # Read x[31] >> 4 ONCE before the loop modifies x[31]
+    let x31_div16: i64 = x[31] >> 4
+    var c2: i64 = 0
+    var k: i32 = 0
+    while k < 32
+        x[k] = x[k] + c2 - x31_div16 * L(k)
+        c2 = x[k] >> 8
+        x[k] = x[k] & 255
+        k += 1
+
+    # Second cleanup pass
+    var m: i32 = 0
+    while m < 32
+        x[m] = x[m] - c2 * L(m)
+        m += 1
+
+    # Final carry propagation and store
+    var n: i32 = 0
+    while n < 32
+        x[n + 1] = x[n + 1] + (x[n] >> 8)
+        s[n] = (x[n] & 255) as u8
+        n += 1
+
+    # Clear high bytes
+    var p: i32 = 32
+    while p < 64
+        s[p] = 0
+        p += 1
+
+# Scalar multiply-add: out = a*b + c (mod l)
+pub fn sc_muladd(out: *u8, a: *u8, b: *u8, c: *u8)
+    # Use i64 for intermediate results
+    # NOTE: Must use intermediate variables due to Ritz compiler bug with
+    # direct cast from pointer dereference to i64
+    var x: [64]i64
+    var i: i32 = 0
+    while i < 64
+        x[i] = 0
+        i += 1
+
+    # Initialize with c
+    i = 0
+    while i < 32
+        let cb: u8 = c[i]
+        x[i] = cb as i64
+        i += 1
+
+    # Schoolbook multiplication: x += a * b
+    i = 0
+    while i < 32
+        let ab: u8 = a[i]
+        let ai: i64 = ab as i64
+        var j: i32 = 0
+        while j < 32
+            let bb: u8 = b[j]
+            let bi: i64 = bb as i64
+            x[i + j] = x[i + j] + ai * bi
+            j += 1
+        i += 1
+
+    # Now reduce using modL algorithm
+    i = 63
+    while i >= 32
+        var carry: i64 = 0
+        var j: i32 = i - 32
+
+        while j < i - 12
+            x[j] = x[j] + carry - 16 * x[i] * L(j - (i - 32))
+            carry = (x[j] + 128) >> 8
+            x[j] = x[j] - (carry << 8)
+            j += 1
+
+        x[j] = x[j] + carry
+        x[i] = 0
+        i -= 1
+
+    var carry: i64 = 0
+    var j: i32 = 0
+    while j < 32
+        x[j] = x[j] + carry - (x[31] >> 4) * L(j)
+        carry = x[j] >> 8
+        x[j] = x[j] & 255
+        j += 1
+
+    j = 0
+    while j < 32
+        x[j] = x[j] - carry * L(j)
+        j += 1
+
+    j = 0
+    while j < 32
+        x[j + 1] = x[j + 1] + (x[j] >> 8)
+        out[j] = (x[j] & 255) as u8
+        j += 1
+
+# ============================================================================
+# Ed25519 API
+# ============================================================================
+
+# Generate Ed25519 keypair from 32-byte seed
+pub fn ed25519_keygen(pubkey: *u8, privkey: *u8, seed: *u8)
+    # Private key is the seed
+    mem_copy(privkey, seed, 32)
+
+    # Hash the seed - sha512(data, len, out)
+    var hash: [64]u8
+    sha512(seed, 32, &hash[0])
+
+    # Clamp the first 32 bytes (RFC 8032 Section 5.1.5)
+    # Clear lowest 3 bits of first byte
+    hash[0] = hash[0] & 0xf8
+    # Clear highest bit and set second highest bit of last byte
+    hash[31] = hash[31] & 0x7f
+    hash[31] = hash[31] | 0x40
+
+    # Public key = hash[0:32] * B
+    var A: Ge25519
+    ge_scalarmult_base(&A, &hash[0])
+    ge_tobytes(pubkey, &A)
+
+# Sign a message
+pub fn ed25519_sign(sig: *u8, msg: *u8, msg_len: u64, privkey: *u8)
+    # Hash the private key - sha512(data, len, out)
+    var hash: [64]u8
+    sha512(privkey, 32, &hash[0])
+
+    # Clamp scalar a (RFC 8032 Section 5.1.5)
+    hash[0] = hash[0] & 0xf8
+    hash[31] = hash[31] & 0x7f
+    hash[31] = hash[31] | 0x40
+
+    # Compute public key A
+    var A: Ge25519
+    ge_scalarmult_base(&A, &hash[0])
+    var pubkey: [32]u8
+    ge_tobytes(&pubkey[0], &A)
+
+    # r = SHA512(prefix || msg) mod l
+    # prefix = hash[32:64]
+    var r_hash: [64]u8
+
+    # Hash prefix || msg
+    var ctx: Sha512
+    sha512_init(&ctx)
+    sha512_update(&ctx, &hash[32], 32)
+    sha512_update(&ctx, msg, msg_len)
+    sha512_final(&ctx, &r_hash[0])
+
+    sc_reduce(&r_hash[0])
+
+    # R = r * B
+    var R: Ge25519
+    ge_scalarmult_base(&R, &r_hash[0])
+    ge_tobytes(sig, &R)  # sig[0:32] = R
+
+    # k = SHA512(R || A || msg) mod l
+    var k_hash: [64]u8
+    sha512_init(&ctx)
+    sha512_update(&ctx, sig, 32)  # R
+    sha512_update(&ctx, &pubkey[0], 32)  # A
+    sha512_update(&ctx, msg, msg_len)
+    sha512_final(&ctx, &k_hash[0])
+    sc_reduce(&k_hash[0])
+
+    # s = r + k * a mod l
+    sc_muladd(&sig[32], &k_hash[0], &hash[0], &r_hash[0])
+
+# Verify a signature
+pub fn ed25519_verify(sig: *u8, msg: *u8, msg_len: u64, pubkey: *u8) -> i32
+    # Decode public key A
+    var A: Ge25519
+    if ge_frombytes(&A, pubkey) != 0
+        return -1
+
+    # Decode R from signature
+    var R: Ge25519
+    if ge_frombytes(&R, sig) != 0
+        return -1
+
+    # s is in sig[32:64]
+    # Check s < l (TODO: proper check)
+
+    # k = SHA512(R || A || msg) mod l
+    var k_hash: [64]u8
+    var ctx: Sha512
+    sha512_init(&ctx)
+    sha512_update(&ctx, sig, 32)  # R
+    sha512_update(&ctx, pubkey, 32)  # A
+    sha512_update(&ctx, msg, msg_len)
+    sha512_final(&ctx, &k_hash[0])
+    sc_reduce(&k_hash[0])
+
+    # Verify: [s]B = R + [k]A
+    # Equivalently: [s]B - [k]A = R
+
+    # Compute [s]B
+    var sB: Ge25519
+    ge_scalarmult_base(&sB, &sig[32])
+
+    # Compute [k]A
+    var kA: Ge25519
+    ge_scalarmult(&kA, &k_hash[0], &A)
+
+    # Negate kA
+    var neg_kA: Ge25519
+    ge_neg(&neg_kA, &kA)
+
+    # sB - kA
+    var check: Ge25519
+    ge_add(&check, &sB, &neg_kA)
+
+    # Compare with R
+    var check_bytes: [32]u8
+    ge_tobytes(&check_bytes[0], &check)
+
+    return mem_eq(&check_bytes[0], sig, 32) - 1

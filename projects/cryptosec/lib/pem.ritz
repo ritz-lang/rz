@@ -1,0 +1,307 @@
+# lib/pem.ritz - PEM (Privacy-Enhanced Mail) format parsing
+#
+# PEM format: -----BEGIN TYPE-----\n<base64>\n-----END TYPE-----
+#
+# Used for encoding certificates, keys, and other cryptographic data.
+# Common types:
+#   - CERTIFICATE
+#   - X509 CRL
+#   - RSA PRIVATE KEY
+#   - RSA PUBLIC KEY
+#   - EC PRIVATE KEY
+#   - PUBLIC KEY
+#   - PRIVATE KEY (PKCS#8)
+#
+# References:
+#   - RFC 7468 (Textual Encodings of PKIX, PKCS, and CMS Structures)
+
+import mem
+import base64
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+# Maximum type label length (e.g., "CERTIFICATE", "RSA PRIVATE KEY")
+const PEM_MAX_TYPE_LEN: i32 = 64
+
+# Maximum size of decoded DER data (4KB should cover most certificates)
+const PEM_MAX_DER_SIZE: i32 = 4096
+
+# PEM markers
+const PEM_BEGIN_PREFIX_LEN: i32 = 11  # "-----BEGIN "
+const PEM_END_PREFIX_LEN: i32 = 9     # "-----END "
+const PEM_SUFFIX_LEN: i32 = 5         # "-----"
+
+# ============================================================================
+# PEM Entry Structure
+# ============================================================================
+
+# A single PEM entry (decoded)
+pub struct PemEntry
+    type_label: [64]u8     # Type string (e.g., "CERTIFICATE")
+    type_len: i32          # Length of type string
+    der_data: *u8          # Pointer to decoded DER data (caller-provided buffer)
+    der_len: i64           # Length of decoded DER data
+
+# Initialize a PEM entry
+pub fn pem_entry_init(entry: *PemEntry)
+    mem_zero(&entry.type_label[0], 64)
+    entry.type_len = 0
+    entry.der_data = null
+    entry.der_len = 0
+
+# ============================================================================
+# String Utilities
+# ============================================================================
+
+# Compare memory regions
+fn mem_cmp(a: *u8, b: *u8, len: i32) -> i32
+    var i: i32 = 0
+    while i < len
+        if a[i] != b[i]
+            return 1
+        i += 1
+    return 0
+
+# Find newline in buffer, returns offset or -1
+fn find_newline(data: *u8, start: i64, end: i64) -> i64
+    var i: i64 = start
+    while i < end
+        if data[i] == 10  # '\n'
+            return i
+        i += 1
+    return -1
+
+# Check if line starts with "-----BEGIN "
+fn is_begin_line(line: *u8, line_len: i64) -> i32
+    if line_len < 16  # "-----BEGIN X-----" minimum
+        return 0
+    if line[0] != '-' || line[1] != '-' || line[2] != '-' || line[3] != '-' || line[4] != '-'
+        return 0
+    if line[5] != 'B' || line[6] != 'E' || line[7] != 'G' || line[8] != 'I' || line[9] != 'N' || line[10] != ' '
+        return 0
+    return 1
+
+# Check if line starts with "-----END "
+fn is_end_line(line: *u8, line_len: i64) -> i32
+    if line_len < 14  # "-----END X-----" minimum
+        return 0
+    if line[0] != '-' || line[1] != '-' || line[2] != '-' || line[3] != '-' || line[4] != '-'
+        return 0
+    if line[5] != 'E' || line[6] != 'N' || line[7] != 'D' || line[8] != ' '
+        return 0
+    return 1
+
+# Extract type from BEGIN line: "-----BEGIN CERTIFICATE-----" -> "CERTIFICATE"
+fn extract_type(line: *u8, line_len: i64, type_out: *u8, max_len: i32) -> i32
+    # Skip "-----BEGIN "
+    var start: i64 = 11
+
+    # Find end "-----"
+    var end_pos: i64 = line_len - 1
+    while end_pos > start && line[end_pos] == '-'
+        end_pos -= 1
+
+    # Also skip trailing CR if present
+    while end_pos > start && (line[end_pos] == 13 || line[end_pos] == ' ')
+        end_pos -= 1
+
+    end_pos += 1
+
+    let type_len: i64 = end_pos - start
+    if type_len <= 0 || type_len > max_len as i64
+        return 0
+
+    # Copy type string
+    var i: i64 = 0
+    while i < type_len
+        type_out[i] = line[start + i]
+        i += 1
+
+    return type_len as i32
+
+# ============================================================================
+# PEM Parsing
+# ============================================================================
+
+# Parse a single PEM entry from a buffer
+#
+# Parameters:
+#   data:       Input buffer containing PEM data
+#   data_len:   Length of input buffer
+#   entry:      Output PEM entry structure
+#   der_buf:    Buffer for decoded DER data
+#   der_cap:    Capacity of DER buffer
+#
+# Returns:
+#   > 0: Number of bytes consumed from input (position after this entry)
+#   0:   No PEM entry found
+#   -1:  Error (malformed PEM, buffer too small, etc.)
+pub fn pem_parse_entry(data: *u8, data_len: i64, entry: *PemEntry, der_buf: *u8, der_cap: i64) -> i64
+    pem_entry_init(entry)
+
+    var pos: i64 = 0
+    var begin_found: i32 = 0
+    var base64_start: i64 = 0
+    var base64_end: i64 = 0
+
+    # Find BEGIN line
+    while pos < data_len
+        let line_end: i64 = find_newline(data, pos, data_len)
+        var line_len: i64 = 0
+
+        if line_end < 0
+            line_len = data_len - pos
+        else
+            line_len = line_end - pos
+
+        # Skip CR at end of line (Windows line endings)
+        var actual_line_len: i64 = line_len
+        if actual_line_len > 0 && data[pos + actual_line_len - 1] == 13
+            actual_line_len -= 1
+
+        if begin_found == 0
+            if is_begin_line(&data[pos], actual_line_len) == 1
+                # Extract type
+                let type_len: i32 = extract_type(&data[pos], actual_line_len, &entry.type_label[0], PEM_MAX_TYPE_LEN)
+                if type_len <= 0
+                    return -1  # Invalid type
+                entry.type_len = type_len
+                begin_found = 1
+
+                if line_end >= 0
+                    base64_start = line_end + 1
+                else
+                    base64_start = data_len
+        else
+            # Look for END line
+            if is_end_line(&data[pos], actual_line_len) == 1
+                # Found END, decode base64
+                base64_end = pos
+
+                # Decode base64 content
+                let base64_len: i64 = base64_end - base64_start
+                let decoded_len: i64 = base64_decode(&data[base64_start], base64_len, der_buf, der_cap)
+
+                if decoded_len < 0
+                    return -1  # Decode error
+
+                entry.der_data = der_buf
+                entry.der_len = decoded_len
+
+                # Return position after this entry
+                if line_end >= 0
+                    return line_end + 1
+                else
+                    return data_len
+
+        # Move to next line
+        if line_end >= 0
+            pos = line_end + 1
+        else
+            break
+
+    if begin_found != 0
+        return -1  # BEGIN without END
+
+    return 0  # No entry found
+
+# Check if entry type matches expected type (case-sensitive)
+pub fn pem_type_is(entry: *PemEntry, expected: *u8, expected_len: i32) -> i32
+    if entry.type_len != expected_len
+        return 0
+    return mem_cmp(&entry.type_label[0], expected, expected_len) == 0
+
+# ============================================================================
+# PEM Bundle Iterator
+# ============================================================================
+
+# Iterator state for parsing multiple PEM entries
+pub struct PemIterator
+    data: *u8              # Input buffer
+    data_len: i64          # Total length
+    pos: i64               # Current position
+    entry_count: i32       # Number of entries parsed so far
+
+# Initialize iterator
+pub fn pem_iterator_init(iter: *PemIterator, data: *u8, data_len: i64)
+    iter.data = data
+    iter.data_len = data_len
+    iter.pos = 0
+    iter.entry_count = 0
+
+# Get next PEM entry
+# Returns: 1 if entry found, 0 if no more entries, -1 on error
+pub fn pem_iterator_next(iter: *PemIterator, entry: *PemEntry, der_buf: *u8, der_cap: i64) -> i32
+    if iter.pos >= iter.data_len
+        return 0
+
+    let remaining: i64 = iter.data_len - iter.pos
+    let result: i64 = pem_parse_entry(&iter.data[iter.pos], remaining, entry, der_buf, der_cap)
+
+    if result > 0
+        iter.pos = iter.pos + result
+        iter.entry_count = iter.entry_count + 1
+        return 1
+    else if result == 0
+        return 0  # No more entries
+    else
+        return -1  # Error
+
+# Count certificates in a PEM bundle
+pub fn pem_count_certificates(data: *u8, data_len: i64) -> i32
+    var count: i32 = 0
+    var pos: i64 = 0
+
+    while pos < data_len
+        let line_end: i64 = find_newline(data, pos, data_len)
+        var line_len: i64 = 0
+
+        if line_end < 0
+            line_len = data_len - pos
+        else
+            line_len = line_end - pos
+
+        # Check for BEGIN CERTIFICATE
+        if is_begin_line(&data[pos], line_len) == 1
+            # Check if it's a CERTIFICATE type
+            var type_buf: [64]u8
+            let type_len: i32 = extract_type(&data[pos], line_len, &type_buf[0], 64)
+            if type_len == 11
+                # "CERTIFICATE" is 11 chars
+                if type_buf[0] == 'C' && type_buf[1] == 'E' && type_buf[2] == 'R'
+                    if type_buf[3] == 'T' && type_buf[4] == 'I' && type_buf[5] == 'F'
+                        if type_buf[6] == 'I' && type_buf[7] == 'C' && type_buf[8] == 'A'
+                            if type_buf[9] == 'T' && type_buf[10] == 'E'
+                                count += 1
+
+        if line_end >= 0
+            pos = line_end + 1
+        else
+            break
+
+    return count
+
+# ============================================================================
+# Convenience Functions
+# ============================================================================
+
+# Parse a single certificate from PEM
+# Returns: 1 on success, 0 on error
+pub fn pem_parse_certificate(pem_data: *u8, pem_len: i64, der_out: *u8, der_cap: i64, der_len_out: *i64) -> i32
+    var entry: PemEntry
+    let result: i64 = pem_parse_entry(pem_data, pem_len, &entry, der_out, der_cap)
+
+    if result <= 0
+        return 0
+
+    # Verify it's a certificate
+    if entry.type_len != 11
+        return 0
+    if entry.type_label[0] != 'C' || entry.type_label[1] != 'E'
+        return 0
+    # Good enough check
+
+    *der_len_out = entry.der_len
+    return 1

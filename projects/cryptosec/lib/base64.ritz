@@ -1,0 +1,216 @@
+# lib/base64.ritz - Base64 encoding/decoding for PEM certificate parsing
+#
+# RFC 4648 standard base64 alphabet: A-Za-z0-9+/=
+#
+# This module provides buffer-to-buffer operations suitable for
+# parsing PEM-encoded certificates, which contain base64 with
+# line breaks and whitespace.
+
+import mem
+
+# ============================================================================
+# Base64 Alphabet
+# ============================================================================
+
+# Decode single base64 character to 6-bit value
+# Returns: 0-63 for valid chars, -1 for padding '=', -2 for whitespace/invalid
+pub fn base64_decode_char(c: u8) -> i32
+    if c >= 'A' && c <= 'Z'
+        return (c - 65) as i32
+    if c >= 'a' && c <= 'z'
+        return (c - 97 + 26) as i32
+    if c >= '0' && c <= '9'
+        return (c - 48 + 52) as i32
+    if c == '+'
+        return 62
+    if c == '/'
+        return 63
+    if c == '='
+        return -1  # Padding marker
+    # Whitespace and invalid chars (skip these)
+    return -2
+
+# Encode 6-bit value (0-63) to base64 character
+# ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/
+pub fn base64_encode_char(val: i32) -> u8
+    if val < 0 || val >= 64
+        return '?'
+    if val < 26
+        return (65 + val) as u8  # A-Z
+    if val < 52
+        return (97 + val - 26) as u8  # a-z
+    if val < 62
+        return (48 + val - 52) as u8  # 0-9
+    if val == 62
+        return '+'
+    # val == 63
+    return '/'
+
+# ============================================================================
+# Decoding Functions
+# ============================================================================
+
+# Decode base64 data to binary
+# Skips whitespace (newlines, spaces, tabs) as found in PEM files
+#
+# Parameters:
+#   input:     Base64-encoded data (may contain whitespace)
+#   input_len: Length of input
+#   output:    Buffer for decoded binary data
+#   output_cap: Capacity of output buffer
+#
+# Returns:
+#   >= 0: Number of bytes written to output
+#   -1:   Output buffer too small
+#   -2:   Invalid base64 character (non-whitespace, non-base64)
+pub fn base64_decode(input: *u8, input_len: i64, output: *u8, output_cap: i64) -> i64
+    var out_pos: i64 = 0
+
+    # Accumulator for 4 base64 characters
+    var accum: [4]i32
+    var accum_count: i32 = 0
+
+    var i: i64 = 0
+    while i < input_len
+        let c: u8 = input[i]
+        let val: i32 = base64_decode_char(c)
+
+        if val == -2
+            # Skip whitespace and invalid chars
+            i += 1
+            continue
+
+        accum[accum_count] = val
+        accum_count += 1
+
+        if accum_count == 4
+            # Decode 4 base64 chars to up to 3 bytes
+            let v0: i32 = accum[0]
+            let v1: i32 = accum[1]
+            let v2: i32 = accum[2]
+            let v3: i32 = accum[3]
+
+            # Check buffer capacity
+            var bytes_needed: i64 = 1
+            if v2 != -1
+                bytes_needed = 2
+            if v3 != -1
+                bytes_needed = 3
+
+            if out_pos + bytes_needed > output_cap
+                return -1  # Buffer too small
+
+            # First byte (always present)
+            output[out_pos] = ((v0 * 4) + (v1 / 16)) as u8
+            out_pos += 1
+
+            # Second byte (if v2 is not padding)
+            if v2 != -1
+                output[out_pos] = (((v1 % 16) * 16) + (v2 / 4)) as u8
+                out_pos += 1
+
+            # Third byte (if v3 is not padding)
+            if v3 != -1
+                output[out_pos] = (((v2 % 4) * 64) + v3) as u8
+                out_pos += 1
+
+            accum_count = 0
+
+        i += 1
+
+    return out_pos
+
+# Calculate decoded length from base64 input
+# Accounts for padding and whitespace
+pub fn base64_decoded_length(input: *u8, input_len: i64) -> i64
+    # Count valid base64 characters (excluding whitespace)
+    var valid_chars: i64 = 0
+    var padding: i64 = 0
+
+    var i: i64 = 0
+    while i < input_len
+        let c: u8 = input[i]
+        let val: i32 = base64_decode_char(c)
+
+        if val >= 0
+            valid_chars += 1
+        else if val == -1  # padding
+            padding += 1
+        # val == -2 is whitespace, skip
+
+        i += 1
+
+    # Each 4 chars = 3 bytes, minus padding
+    let total_chars: i64 = valid_chars + padding
+    if total_chars == 0
+        return 0
+
+    let groups: i64 = total_chars / 4
+    let decoded: i64 = groups * 3 - padding
+
+    return decoded
+
+# ============================================================================
+# Encoding Functions
+# ============================================================================
+
+# Encode binary data to base64
+# Does NOT add line breaks (caller can add if needed for PEM)
+#
+# Parameters:
+#   input:     Binary data to encode
+#   input_len: Length of input
+#   output:    Buffer for base64-encoded output
+#   output_cap: Capacity of output buffer
+#
+# Returns:
+#   >= 0: Number of characters written to output
+#   -1:   Output buffer too small
+pub fn base64_encode(input: *u8, input_len: i64, output: *u8, output_cap: i64) -> i64
+    # Calculate required output size: ceil(input_len / 3) * 4
+    var encoded_len: i64 = ((input_len + 2) / 3) * 4
+
+    if encoded_len > output_cap
+        return -1  # Buffer too small
+
+    var out_pos: i64 = 0
+    var i: i64 = 0
+
+    # Process full 3-byte groups
+    while i + 2 < input_len
+        let b0: i32 = input[i] as i32
+        let b1: i32 = input[i + 1] as i32
+        let b2: i32 = input[i + 2] as i32
+
+        output[out_pos] = base64_encode_char(b0 / 4)
+        output[out_pos + 1] = base64_encode_char(((b0 % 4) * 16) + (b1 / 16))
+        output[out_pos + 2] = base64_encode_char(((b1 % 16) * 4) + (b2 / 64))
+        output[out_pos + 3] = base64_encode_char(b2 % 64)
+
+        out_pos = out_pos + 4
+        i = i + 3
+
+    # Handle remaining bytes (0, 1, or 2)
+    let remaining: i64 = input_len - i
+
+    if remaining == 1
+        let b0: i32 = input[i] as i32
+        output[out_pos] = base64_encode_char(b0 / 4)
+        output[out_pos + 1] = base64_encode_char((b0 % 4) * 16)
+        output[out_pos + 2] = '='
+        output[out_pos + 3] = '='
+        out_pos = out_pos + 4
+    else if remaining == 2
+        let b0: i32 = input[i] as i32
+        let b1: i32 = input[i + 1] as i32
+        output[out_pos] = base64_encode_char(b0 / 4)
+        output[out_pos + 1] = base64_encode_char(((b0 % 4) * 16) + (b1 / 16))
+        output[out_pos + 2] = base64_encode_char((b1 % 16) * 4)
+        output[out_pos + 3] = '='
+        out_pos = out_pos + 4
+
+    return out_pos
+
+# Calculate encoded length from binary input
+pub fn base64_encoded_length(input_len: i64) -> i64
+    return ((input_len + 2) / 3) * 4

@@ -1,0 +1,351 @@
+# test/test_rsa.ritz - Tests for RSA signature verification
+
+import lib.rsa
+import lib.bigint
+import lib.mem
+
+# ============================================================================
+# RSA Public Key Parsing Tests
+# ============================================================================
+
+[[test]]
+fn test_rsa_pubkey_init()
+    var key: RsaPublicKey
+    rsa_pubkey_init(&key)
+    assert key.n_len == 0
+    assert key.e == 0
+
+[[test]]
+fn test_rsa_parse_raw_pubkey()
+    # Minimal RSA public key in raw RSAPublicKey format:
+    # SEQUENCE {
+    #   INTEGER (modulus = 0x00d5) - 2 bytes with leading 0
+    #   INTEGER (exponent = 3)
+    # }
+    # DER: 30 08 02 03 00 00 d5 02 01 03
+    var der: [10]u8
+    der[0] = 0x30
+    der[1] = 0x08
+    der[2] = 0x02
+    der[3] = 0x03
+    der[4] = 0x00
+    der[5] = 0x00
+    der[6] = 0xd5
+    der[7] = 0x02
+    der[8] = 0x01
+    der[9] = 0x03
+
+    var key: RsaPublicKey
+    let result: i32 = rsa_parse_public_key(&der[0], 10, &key)
+    assert result == 0
+    assert key.e == 3
+    # Modulus should be 0xd5 = 213 (leading zeros stripped)
+    assert key.n_len == 1
+    assert key.n[0] == 0xd5
+
+[[test]]
+fn test_rsa_parse_pubkey_65537()
+    # RSA key with e = 65537 (0x010001), common public exponent
+    # SEQUENCE {
+    #   INTEGER (modulus = 0x0101) - just a small test modulus
+    #   INTEGER (exponent = 65537 = 0x010001)
+    # }
+    # DER: 30 09 02 02 01 01 02 03 01 00 01
+    var der: [11]u8
+    der[0] = 0x30
+    der[1] = 0x09
+    der[2] = 0x02
+    der[3] = 0x02
+    der[4] = 0x01
+    der[5] = 0x01
+    der[6] = 0x02
+    der[7] = 0x03
+    der[8] = 0x01
+    der[9] = 0x00
+    der[10] = 0x01
+
+    var key: RsaPublicKey
+    let result: i32 = rsa_parse_public_key(&der[0], 11, &key)
+    assert result == 0
+    assert key.e == 65537
+    assert key.n_len == 2
+    assert key.n[0] == 0x01
+    assert key.n[1] == 0x01
+
+# ============================================================================
+# PKCS#1 v1.5 Padding Verification Tests
+# ============================================================================
+
+[[test]]
+fn test_rsa_verify_sha256_basic()
+    # Test that modular exponentiation works for RSA
+    var base: BigInt
+    var n: BigInt
+    var result: BigInt
+
+    # Use known test values
+    # n = 0xbb (187 = 11 * 17), e = 3
+    bigint_from_u64(&base, 100)
+    bigint_from_u64(&n, 187)
+    bigint_mod_exp_u32(&result, &base, 3, &n)
+    # 100^3 mod 187 = 1000000 mod 187 = 111
+    assert result.limbs[0] == 111
+
+# ============================================================================
+# DigestInfo Prefix Tests
+# ============================================================================
+
+[[test]]
+fn test_sha256_digest_info_prefix()
+    var prefix: [19]u8
+    let len: i32 = get_sha256_digest_info_prefix(&prefix[0])
+    assert len == 19
+    # Verify DER encoding
+    assert prefix[0] == 0x30
+    assert prefix[1] == 0x31
+    assert prefix[2] == 0x30
+    assert prefix[3] == 0x0d
+    assert prefix[4] == 0x06
+    assert prefix[5] == 0x09
+    assert prefix[6] == 0x60
+    assert prefix[7] == 0x86
+    assert prefix[8] == 0x48
+    assert prefix[9] == 0x01
+    assert prefix[10] == 0x65
+    assert prefix[11] == 0x03
+    assert prefix[12] == 0x04
+    assert prefix[13] == 0x02
+    assert prefix[14] == 0x01
+    assert prefix[15] == 0x05
+    assert prefix[16] == 0x00
+    assert prefix[17] == 0x04
+    assert prefix[18] == 0x20
+
+[[test]]
+fn test_sha384_digest_info_prefix()
+    var prefix: [19]u8
+    let len: i32 = get_sha384_digest_info_prefix(&prefix[0])
+    assert len == 19
+    # DER: 30 41 30 0d 06 09 60 86 48 01 65 03 04 02 02 05 00 04 30
+    assert prefix[0] == 0x30
+    assert prefix[1] == 0x41
+    assert prefix[14] == 0x02
+    assert prefix[18] == 0x30
+
+[[test]]
+fn test_sha512_digest_info_prefix()
+    var prefix: [19]u8
+    let len: i32 = get_sha512_digest_info_prefix(&prefix[0])
+    assert len == 19
+    # DER: 30 51 30 0d 06 09 60 86 48 01 65 03 04 02 03 05 00 04 40
+    assert prefix[0] == 0x30
+    assert prefix[1] == 0x51
+    assert prefix[14] == 0x03
+    assert prefix[18] == 0x40
+
+# ============================================================================
+# RSA-2048 Test Vector
+# ============================================================================
+
+[[test]]
+fn test_rsa_256bit_modexp()
+    # Test with 256-bit values
+    var a: BigInt
+    var n: BigInt
+    var result: BigInt
+
+    var a_bytes: [32]u8
+    var n_bytes: [32]u8
+
+    # a = 0x123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0
+    a_bytes[0] = 0x12
+    a_bytes[1] = 0x34
+    a_bytes[2] = 0x56
+    a_bytes[3] = 0x78
+    a_bytes[4] = 0x9a
+    a_bytes[5] = 0xbc
+    a_bytes[6] = 0xde
+    a_bytes[7] = 0xf0
+    a_bytes[8] = 0x12
+    a_bytes[9] = 0x34
+    a_bytes[10] = 0x56
+    a_bytes[11] = 0x78
+    a_bytes[12] = 0x9a
+    a_bytes[13] = 0xbc
+    a_bytes[14] = 0xde
+    a_bytes[15] = 0xf0
+    a_bytes[16] = 0x12
+    a_bytes[17] = 0x34
+    a_bytes[18] = 0x56
+    a_bytes[19] = 0x78
+    a_bytes[20] = 0x9a
+    a_bytes[21] = 0xbc
+    a_bytes[22] = 0xde
+    a_bytes[23] = 0xf0
+    a_bytes[24] = 0x12
+    a_bytes[25] = 0x34
+    a_bytes[26] = 0x56
+    a_bytes[27] = 0x78
+    a_bytes[28] = 0x9a
+    a_bytes[29] = 0xbc
+    a_bytes[30] = 0xde
+    a_bytes[31] = 0xf0
+
+    # n = 0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543211
+    n_bytes[0] = 0xfe
+    n_bytes[1] = 0xdc
+    n_bytes[2] = 0xba
+    n_bytes[3] = 0x98
+    n_bytes[4] = 0x76
+    n_bytes[5] = 0x54
+    n_bytes[6] = 0x32
+    n_bytes[7] = 0x10
+    n_bytes[8] = 0xfe
+    n_bytes[9] = 0xdc
+    n_bytes[10] = 0xba
+    n_bytes[11] = 0x98
+    n_bytes[12] = 0x76
+    n_bytes[13] = 0x54
+    n_bytes[14] = 0x32
+    n_bytes[15] = 0x10
+    n_bytes[16] = 0xfe
+    n_bytes[17] = 0xdc
+    n_bytes[18] = 0xba
+    n_bytes[19] = 0x98
+    n_bytes[20] = 0x76
+    n_bytes[21] = 0x54
+    n_bytes[22] = 0x32
+    n_bytes[23] = 0x10
+    n_bytes[24] = 0xfe
+    n_bytes[25] = 0xdc
+    n_bytes[26] = 0xba
+    n_bytes[27] = 0x98
+    n_bytes[28] = 0x76
+    n_bytes[29] = 0x54
+    n_bytes[30] = 0x32
+    n_bytes[31] = 0x11
+
+    bigint_from_bytes(&a, &a_bytes[0], 32)
+    bigint_from_bytes(&n, &n_bytes[0], 32)
+
+    # Compute a^65537 mod n
+    bigint_mod_exp_u32(&result, &a, 65537, &n)
+
+    # Result should be some value < n
+    assert bigint_lt(&result, &n) == 1
+    assert bigint_is_zero(&result) == 0
+
+# ============================================================================
+# Invalid Signature Tests
+# ============================================================================
+
+[[test]]
+fn test_rsa_invalid_signature_length()
+    var key: RsaPublicKey
+    rsa_pubkey_init(&key)
+
+    # Set up a minimal key with 128-byte modulus
+    key.n_len = 128
+    key.e = 65537
+    var i: i32 = 0
+    while i < 128
+        key.n[i] = 0xff
+        i += 1
+
+    # Signature with wrong length should fail
+    var msg: [4]u8
+    msg[0] = 0x74
+    msg[1] = 0x65
+    msg[2] = 0x73
+    msg[3] = 0x74
+
+    var sig: [64]u8
+    i = 0
+    while i < 64
+        sig[i] = 0
+        i += 1
+
+    let result: i32 = rsa_verify_pkcs1_sha256(&key, &msg[0], 4, &sig[0], 64)
+    assert result == 0
+
+[[test]]
+fn test_rsa_signature_too_large()
+    var key: RsaPublicKey
+    rsa_pubkey_init(&key)
+
+    # Small modulus
+    key.n[0] = 0x10
+    key.n_len = 1
+    key.e = 3
+
+    # Signature larger than modulus
+    var msg: [4]u8
+    msg[0] = 0x74
+    msg[1] = 0x65
+    msg[2] = 0x73
+    msg[3] = 0x74
+
+    var sig: [1]u8
+    sig[0] = 0xff
+
+    # This should fail because modulus is too small (< 128 bytes)
+    let result: i32 = rsa_verify_pkcs1_sha256(&key, &msg[0], 4, &sig[0], 1)
+    assert result == 0
+
+# ============================================================================
+# RSA Signature Round-Trip Test (using tiny test key)
+# ============================================================================
+
+[[test]]
+fn test_rsa_signature_roundtrip_tiny()
+    # Use a tiny 512-bit modulus (64 bytes) for testing the full flow
+    # In reality, 512-bit RSA is broken - this is just for testing the code path
+    # We need a modulus >= 128 bytes for the PKCS#1 padding check, so use 128 bytes
+
+    # For a 1024-bit (128-byte) key with e=3:
+    # We manually construct what a valid signature would look like
+    #
+    # PKCS#1 v1.5 format: 00 01 FF...FF 00 DigestInfo
+    # DigestInfo for SHA-256 = 19 bytes prefix + 32 bytes hash = 51 bytes
+    # Total: 2 + PS + 1 + 51 = 128 bytes, so PS = 74 bytes minimum
+    #
+    # For this test, we verify the structure checking works by creating
+    # an invalid signature and confirming it's rejected.
+
+    var key: RsaPublicKey
+    rsa_pubkey_init(&key)
+    key.n_len = 128
+    key.e = 3
+
+    # Set modulus to all 0xFF (large prime-ish)
+    var i: i32 = 0
+    while i < 128
+        key.n[i] = 0xff
+        i += 1
+
+    # Create a "signature" that is all zeros - should fail padding check
+    var msg: [5]u8
+    msg[0] = 0x68  # "hello"
+    msg[1] = 0x65
+    msg[2] = 0x6c
+    msg[3] = 0x6c
+    msg[4] = 0x6f
+
+    var bad_sig: [128]u8
+    i = 0
+    while i < 128
+        bad_sig[i] = 0
+        i += 1
+
+    # This should fail because the decrypted signature won't have valid PKCS#1 padding
+    let result: i32 = rsa_verify_pkcs1_sha256(&key, &msg[0], 5, &bad_sig[0], 128)
+    assert result == 0
+
+    # Create another invalid signature - random-looking data
+    i = 0
+    while i < 128
+        bad_sig[i] = (i * 17 + 5) as u8
+        i += 1
+
+    let result2: i32 = rsa_verify_pkcs1_sha256(&key, &msg[0], 5, &bad_sig[0], 128)
+    assert result2 == 0

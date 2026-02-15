@@ -1,0 +1,365 @@
+# test/test_zlib.ritz - Zlib format tests (RFC 1950)
+#
+# Tests for zlib compression and decompression, including:
+# - Header parsing (CMF, FLG, FCHECK)
+# - Trailer validation (Adler-32)
+# - Round-trip compression/decompression
+# - Error handling (invalid headers, checksum mismatch)
+
+import ritzlib.sys
+import ritzlib.io
+
+import lib.zlib
+
+
+# ============================================================================
+# Decompression Tests
+# ============================================================================
+
+[[test]]
+fn test_zlib_decompress_hello() -> i32
+    # "hello" compressed with zlib (Python: zlib.compress(b"hello"))
+    # Header: 78 9c (CMF=0x78, FLG=0x9c)
+    # Trailer: Adler-32 = 0x062c0215 (big-endian)
+    var input: [13]u8 = [
+        0x78, 0x9c,              # Header: CMF + FLG
+        # Deflate data
+        0xcb, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00,
+        # Trailer: Adler-32 (big-endian)
+        0x06, 0x2c, 0x02, 0x15
+    ]
+    var output: [64]u8
+    let result: i64 = zlib_decompress(@input[0], 13, @output[0], 64)
+
+    if result != 5
+        print(c"Expected 5 bytes, got ")
+        print_i64(result)
+        print(c"\n")
+        return 1
+
+    # Verify content: "hello"
+    if output[0] != 'h'
+        print(c"Content mismatch at 0\n")
+        return 1
+    if output[1] != 'e'
+        print(c"Content mismatch at 1\n")
+        return 1
+    if output[2] != 'l'
+        print(c"Content mismatch at 2\n")
+        return 1
+    if output[3] != 'l'
+        print(c"Content mismatch at 3\n")
+        return 1
+    if output[4] != 'o'
+        print(c"Content mismatch at 4\n")
+        return 1
+
+    return 0
+
+
+[[test]]
+fn test_zlib_decompress_empty() -> i32
+    # Empty input compressed with zlib
+    # Python: zlib.compress(b"") = 78 9c 03 00 00 00 00 01
+    var input: [8]u8 = [
+        0x78, 0x9c,              # Header: CMF + FLG
+        0x03, 0x00,              # Empty deflate block
+        0x00, 0x00, 0x00, 0x01   # Adler-32 = 1 (big-endian)
+    ]
+    var output: [64]u8
+    let result: i64 = zlib_decompress(@input[0], 8, @output[0], 64)
+
+    if result != 0
+        print(c"Expected 0 bytes, got ")
+        print_i64(result)
+        print(c"\n")
+        return 1
+
+    return 0
+
+
+[[test]]
+fn test_zlib_decompress_hello_world() -> i32
+    # "hello world\n" compressed (Python: zlib.compress(b"hello world\n"))
+    var input: [20]u8 = [
+        0x78, 0x9c,              # Header
+        0xcb, 0x48, 0xcd, 0xc9, 0xc9, 0x57, 0x28, 0xcf,
+        0x2f, 0xca, 0x49, 0xe1, 0x02, 0x00,
+        0x1e, 0x72, 0x04, 0x67   # Adler-32 = 0x1e720467
+    ]
+    var output: [64]u8
+    let result: i64 = zlib_decompress(@input[0], 20, @output[0], 64)
+
+    if result != 12
+        print(c"Expected 12 bytes, got ")
+        print_i64(result)
+        print(c"\n")
+        return 1
+
+    # Verify content
+    if output[0] != 'h'
+        print(c"Content mismatch at 0\n")
+        return 1
+    if output[5] != ' '
+        print(c"Content mismatch at 5\n")
+        return 1
+    if output[11] != '\n'
+        print(c"Content mismatch at 11\n")
+        return 1
+
+    return 0
+
+
+[[test]]
+fn test_zlib_decompress_invalid_cm() -> i32
+    # Invalid compression method (CM != 8)
+    # CMF=0x76: CM=6 (invalid), CINFO=7
+    # FLG=0x11: Valid FCHECK so header check passes, CM check fails
+    # (0x76 << 8 | 0x11) = 0x7611, 0x7611 % 31 = 0
+    var bad_cm: [8]u8 = [
+        0x76, 0x11,              # CM = 6 (invalid), CINFO = 7, valid FCHECK
+        0x03, 0x00,
+        0x00, 0x00, 0x00, 0x01
+    ]
+    var output: [64]u8
+    let result: i64 = zlib_decompress(@bad_cm[0], 8, @output[0], 64)
+
+    if result != ZLIB_ERR_BAD_CM
+        print(c"Expected ZLIB_ERR_BAD_CM, got ")
+        print_i64(result)
+        print(c"\n")
+        return 1
+
+    return 0
+
+
+[[test]]
+fn test_zlib_decompress_invalid_fcheck() -> i32
+    # Invalid FCHECK (header checksum fails)
+    # 0x78 0x00 -> (0x78 << 8 | 0x00) = 0x7800, 0x7800 % 31 = 8 (not 0)
+    var bad_fcheck: [8]u8 = [
+        0x78, 0x00,              # Bad FCHECK
+        0x03, 0x00,
+        0x00, 0x00, 0x00, 0x01
+    ]
+    var output: [64]u8
+    let result: i64 = zlib_decompress(@bad_fcheck[0], 8, @output[0], 64)
+
+    if result != ZLIB_ERR_BAD_FCHECK
+        print(c"Expected ZLIB_ERR_BAD_FCHECK, got ")
+        print_i64(result)
+        print(c"\n")
+        return 1
+
+    return 0
+
+
+[[test]]
+fn test_zlib_decompress_truncated() -> i32
+    # Truncated input (only header, no data or trailer)
+    var truncated: [2]u8 = [0x78, 0x9c]
+    var output: [64]u8
+    let result: i64 = zlib_decompress(@truncated[0], 2, @output[0], 64)
+
+    if result >= 0
+        print(c"Expected error for truncated input, got ")
+        print_i64(result)
+        print(c"\n")
+        return 1
+
+    return 0
+
+
+[[test]]
+fn test_zlib_decompress_adler32_mismatch() -> i32
+    # "hello" compressed, but with corrupted Adler-32
+    var bad_adler: [13]u8 = [
+        0x78, 0x9c,
+        0xcb, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00,
+        0xFF, 0xFF, 0xFF, 0xFF   # Corrupted Adler-32
+    ]
+    var output: [64]u8
+    let result: i64 = zlib_decompress(@bad_adler[0], 13, @output[0], 64)
+
+    if result != ZLIB_ERR_CHECKSUM_MISMATCH
+        print(c"Expected ZLIB_ERR_CHECKSUM_MISMATCH, got ")
+        print_i64(result)
+        print(c"\n")
+        return 1
+
+    return 0
+
+
+[[test]]
+fn test_zlib_decompress_fdict_set() -> i32
+    # FDICT bit set (preset dictionary) - we don't support this
+    var with_dict: [8]u8 = [
+        0x78, 0xbb,              # FLG with FDICT=1 (and valid FCHECK)
+        0x03, 0x00,
+        0x00, 0x00, 0x00, 0x01
+    ]
+    var output: [64]u8
+    let result: i64 = zlib_decompress(@with_dict[0], 8, @output[0], 64)
+
+    if result != ZLIB_ERR_DICT_UNSUPPORTED
+        print(c"Expected ZLIB_ERR_DICT_UNSUPPORTED, got ")
+        print_i64(result)
+        print(c"\n")
+        return 1
+
+    return 0
+
+
+# ============================================================================
+# Compression Tests
+# ============================================================================
+
+[[test]]
+fn test_zlib_compress_hello() -> i32
+    var input: [5]u8 = ['h', 'e', 'l', 'l', 'o']
+    var output: [128]u8
+    let result: i64 = zlib_compress(@input[0], 5, @output[0], 128)
+
+    if result < 0
+        print(c"Compression failed: ")
+        print_i64(result)
+        print(c"\n")
+        return 1
+
+    # Verify header
+    if output[0] != 0x78
+        print(c"Bad CMF byte\n")
+        return 1
+
+    # Check FLG FCHECK: (CMF << 8 | FLG) % 31 == 0
+    let cmf: i64 = output[0] as i64
+    let flg: i64 = output[1] as i64
+    let header_check: i64 = (cmf << 8) | flg
+    if header_check % 31 != 0
+        print(c"Bad FCHECK\n")
+        return 1
+
+    return 0
+
+
+[[test]]
+fn test_zlib_compress_empty() -> i32
+    var input: [1]u8
+    var output: [128]u8
+    let result: i64 = zlib_compress(@input[0], 0, @output[0], 128)
+
+    if result < 0
+        print(c"Compression failed: ")
+        print_i64(result)
+        print(c"\n")
+        return 1
+
+    # Should have header (2) + deflate data (at least 2) + trailer (4) = 8 minimum
+    if result < 8
+        print(c"Output too small: ")
+        print_i64(result)
+        print(c"\n")
+        return 1
+
+    return 0
+
+
+# ============================================================================
+# Round-trip Tests
+# ============================================================================
+
+[[test]]
+fn test_zlib_roundtrip_hello() -> i32
+    var input: [5]u8 = ['h', 'e', 'l', 'l', 'o']
+    var compressed: [128]u8
+    var decompressed: [64]u8
+
+    let comp_len: i64 = zlib_compress(@input[0], 5, @compressed[0], 128)
+    if comp_len < 0
+        print(c"Compression failed\n")
+        return 1
+
+    let decomp_len: i64 = zlib_decompress(@compressed[0], comp_len, @decompressed[0], 64)
+    if decomp_len != 5
+        print(c"Decompression length mismatch: ")
+        print_i64(decomp_len)
+        print(c"\n")
+        return 1
+
+    # Verify content
+    for i in 0..5
+        if decompressed[i] != input[i]
+            print(c"Content mismatch at position ")
+            print_i64(i)
+            print(c"\n")
+            return 1
+
+    return 0
+
+
+[[test]]
+fn test_zlib_roundtrip_text() -> i32
+    var input: [43]u8 = [
+        'T', 'h', 'e', ' ', 'q', 'u', 'i', 'c', 'k', ' ',
+        'b', 'r', 'o', 'w', 'n', ' ', 'f', 'o', 'x', ' ',
+        'j', 'u', 'm', 'p', 's', ' ', 'o', 'v', 'e', 'r',
+        ' ', 't', 'h', 'e', ' ', 'l', 'a', 'z', 'y', ' ',
+        'd', 'o', 'g'
+    ]
+    var compressed: [256]u8
+    var decompressed: [64]u8
+
+    let comp_len: i64 = zlib_compress(@input[0], 43, @compressed[0], 256)
+    if comp_len < 0
+        print(c"Compression failed\n")
+        return 1
+
+    let decomp_len: i64 = zlib_decompress(@compressed[0], comp_len, @decompressed[0], 64)
+    if decomp_len != 43
+        print(c"Decompression length mismatch: ")
+        print_i64(decomp_len)
+        print(c"\n")
+        return 1
+
+    # Verify content
+    for i in 0..43
+        if decompressed[i] != input[i]
+            print(c"Content mismatch at position ")
+            print_i64(i)
+            print(c"\n")
+            return 1
+
+    return 0
+
+
+[[test]]
+fn test_zlib_roundtrip_binary() -> i32
+    # Binary data with all byte values 0-255
+    var input: [256]u8
+    for i in 0..256
+        input[i] = i as u8
+
+    var compressed: [512]u8
+    var decompressed: [512]u8
+
+    let comp_len: i64 = zlib_compress(@input[0], 256, @compressed[0], 512)
+    if comp_len < 0
+        print(c"Compression failed\n")
+        return 1
+
+    let decomp_len: i64 = zlib_decompress(@compressed[0], comp_len, @decompressed[0], 512)
+    if decomp_len != 256
+        print(c"Decompression length mismatch: ")
+        print_i64(decomp_len)
+        print(c"\n")
+        return 1
+
+    # Verify content
+    for i in 0..256
+        if decompressed[i] != input[i]
+            print(c"Content mismatch at position ")
+            print_i64(i)
+            print(c"\n")
+            return 1
+
+    return 0

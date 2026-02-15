@@ -1,0 +1,609 @@
+# inventory/test/test_inventory.ritz - Unit tests for the inventory system
+#
+# Simplified implementation using fixed-size name buffers.
+# This avoids the complexity of nested Vec<u8> inside structs.
+#
+# Tests cover:
+# - Creating empty inventories
+# - Adding items (new and existing)
+# - Removing items (success and failure cases)
+# - Querying items (count, has, len)
+# - Edge cases (missing items, insufficient quantity)
+
+import ritzlib.gvec
+import ritzlib.str
+import ritzlib.sys
+import ritzlib.memory
+import ritzlib.io
+
+# ============================================================================
+# Item - A named item with a quantity
+# ============================================================================
+# Use fixed-size name buffer to avoid nested Vec complexity.
+
+const MAX_NAME_LEN: i64 = 32
+
+struct Item
+    name: [32]u8       # Fixed-size name buffer
+    name_len: i64      # Actual name length
+    quantity: i32      # Current quantity
+
+# ============================================================================
+# Inventory - Collection of items
+# ============================================================================
+
+struct Inventory
+    items: Vec<Item>   # Dynamic array of items
+
+# ============================================================================
+# Constructors
+# ============================================================================
+
+fn inventory_new() -> Inventory
+    var inv: Inventory
+    inv.items = vec_new<Item>()
+    return inv
+
+fn inventory_drop(inv:&Inventory)
+    vec_drop<Item>(&inv.items)
+
+# ============================================================================
+# String helpers
+# ============================================================================
+
+# Copy null-terminated string into fixed buffer, return length
+fn copy_name(dst: *u8, src: *u8) -> i64
+    var i: i64 = 0
+    while *(src + i) != 0 && i < MAX_NAME_LEN - 1
+        *(dst + i) = *(src + i)
+        i += 1
+    *(dst + i) = 0  # Null terminate
+    return i
+
+# Compare item name with null-terminated string
+fn name_eq(item: *Item, name: *u8) -> i32
+    var i: i64 = 0
+    while i < item.name_len
+        if *(name + i) == 0
+            return 0  # name ended early
+        if item.name[i] != *(name + i)
+            return 0  # mismatch
+        i += 1
+    # Check name is also at end
+    if *(name + i) == 0
+        return 1
+    return 0
+
+# ============================================================================
+# Core Operations
+# ============================================================================
+
+fn inventory_add(inv:&Inventory, name: *u8, qty: i32) -> i32
+    # Search for existing item
+    var i: i64 = 0
+    while i < inv.items.len
+        let item: *Item = vec_get_ptr<Item>(&inv.items, i)
+        if name_eq(item, name) == 1
+            item.quantity = item.quantity + qty
+            return 0
+        i += 1
+
+    # Not found - create new item
+    var new_item: Item
+    new_item.name_len = copy_name(&new_item.name[0], name)
+    new_item.quantity = qty
+
+    vec_push<Item>(&inv.items, new_item)
+    return 0
+
+fn inventory_remove(inv:&Inventory, name: *u8, qty: i32) -> i32
+    var i: i64 = 0
+    while i < inv.items.len
+        let item: *Item = vec_get_ptr<Item>(&inv.items, i)
+        if name_eq(item, name) == 1
+            if item.quantity < qty
+                return -1  # Insufficient quantity
+            item.quantity = item.quantity - qty
+            return 0
+        i += 1
+    return -1  # Not found
+
+fn inventory_count(inv:&Inventory, name: *u8) -> i32
+    var i: i64 = 0
+    while i < inv.items.len
+        let item: *Item = vec_get_ptr<Item>(&inv.items, i)
+        if name_eq(item, name) == 1
+            return item.quantity
+        i += 1
+    return 0
+
+fn inventory_has(inv:&Inventory, name: *u8) -> i32
+    if inventory_count(inv, name) > 0
+        return 1
+    return 0
+
+fn inventory_len(inv:&Inventory) -> i64
+    return inv.items.len
+
+fn inventory_clear(inv:&Inventory)
+    vec_clear<Item>(&inv.items)
+
+fn inventory_total_quantity(inv:&Inventory) -> i32
+    var total: i32 = 0
+    var i: i64 = 0
+    while i < inv.items.len
+        let item: *Item = vec_get_ptr<Item>(&inv.items, i)
+        total = total + item.quantity
+        i += 1
+    return total
+
+# ============================================================================
+# JSON Serialization
+# ============================================================================
+
+# Helper to print a character
+fn emit_char(buf: *Vec<u8>, c: u8)
+    vec_push<u8>(buf, c)
+
+# Helper to print a string into buffer
+fn emit_str(buf: *Vec<u8>, s: *u8)
+    var i: i64 = 0
+    while *(s + i) != 0
+        vec_push<u8>(buf, *(s + i))
+        i += 1
+
+# Helper to emit integer
+fn emit_int(buf: *Vec<u8>, n: i32)
+    if n < 0
+        emit_char(buf, 45)  # '-'
+        n = 0 - n
+    if n == 0
+        emit_char(buf, 48)  # '0'
+        return
+    # Build digits backwards
+    var tmp: [12]u8
+    var len: i64 = 0
+    while n > 0
+        tmp[len] = (48 + (n % 10)) as u8
+        n = n / 10
+        len += 1
+    # Emit in reverse
+    var i: i64 = len - 1
+    while i >= 0
+        emit_char(buf, tmp[i])
+        i -= 1
+
+# Serialize inventory to JSON string
+# Format: {"items":[{"name":"sword","quantity":5},...],"count":N}
+fn inventory_to_json(inv:&Inventory, buf: *Vec<u8>)
+    emit_char(buf, 123)  # {
+    emit_char(buf, 34)   # "
+    emit_str(buf, c"items")
+    emit_char(buf, 34)   # "
+    emit_char(buf, 58)   # :
+    emit_char(buf, 91)   # [
+
+    var i: i64 = 0
+    while i < inv.items.len
+        if i > 0
+            emit_char(buf, 44)  # ,
+        let item: *Item = vec_get_ptr<Item>(&inv.items, i)
+
+        emit_char(buf, 123)  # {
+        emit_char(buf, 34)   # "
+        emit_str(buf, c"name")
+        emit_char(buf, 34)   # "
+        emit_char(buf, 58)   # :
+        emit_char(buf, 34)   # "
+        # Emit name
+        var j: i64 = 0
+        while j < item.name_len
+            emit_char(buf, item.name[j])
+            j += 1
+        emit_char(buf, 34)   # "
+        emit_char(buf, 44)   # ,
+        emit_char(buf, 34)   # "
+        emit_str(buf, c"quantity")
+        emit_char(buf, 34)   # "
+        emit_char(buf, 58)   # :
+        emit_int(buf, item.quantity)
+        emit_char(buf, 125)  # }
+        i += 1
+
+    emit_char(buf, 93)   # ]
+    emit_char(buf, 44)   # ,
+    emit_char(buf, 34)   # "
+    emit_str(buf, c"count")
+    emit_char(buf, 34)   # "
+    emit_char(buf, 58)   # :
+    emit_int(buf, inv.items.len as i32)
+    emit_char(buf, 125)  # }
+    emit_char(buf, 0)    # null terminator
+
+# Compare two strings
+fn str_eq(a: *u8, b: *u8) -> i32
+    var i: i64 = 0
+    while *(a + i) != 0 && *(b + i) != 0
+        if *(a + i) != *(b + i)
+            return 0
+        i += 1
+    return (*(a + i) == *(b + i)) as i32
+
+# ============================================================================
+# Basic Inventory Tests
+# ============================================================================
+
+[[test]]
+fn test_new_inventory_is_empty() -> i32
+    var inv: Inventory = inventory_new()
+    let len: i64 = inventory_len(&inv)
+    inventory_drop(&inv)
+
+    if len != 0
+        return 1  # FAIL: expected empty inventory
+    return 0  # PASS
+
+[[test]]
+fn test_add_single_item() -> i32
+    var inv: Inventory = inventory_new()
+    inventory_add(&inv, c"sword", 1)
+
+    let has_it: i32 = inventory_has(&inv, c"sword")
+    let count: i32 = inventory_count(&inv, c"sword")
+    inventory_drop(&inv)
+
+    if has_it != 1
+        return 1  # FAIL: should have sword
+    if count != 1
+        return 2  # FAIL: should have quantity 1
+    return 0  # PASS
+
+[[test]]
+fn test_add_increments_quantity() -> i32
+    var inv: Inventory = inventory_new()
+    inventory_add(&inv, c"arrow", 10)
+    inventory_add(&inv, c"arrow", 5)
+
+    let count: i32 = inventory_count(&inv, c"arrow")
+    inventory_drop(&inv)
+
+    if count != 15
+        return 1  # FAIL: should have 15 arrows
+    return 0  # PASS
+
+[[test]]
+fn test_add_multiple_different_items() -> i32
+    var inv: Inventory = inventory_new()
+    inventory_add(&inv, c"sword", 1)
+    inventory_add(&inv, c"shield", 1)
+    inventory_add(&inv, c"potion", 5)
+
+    let len: i64 = inventory_len(&inv)
+    let has_sword: i32 = inventory_has(&inv, c"sword")
+    let has_shield: i32 = inventory_has(&inv, c"shield")
+    let has_potion: i32 = inventory_has(&inv, c"potion")
+    inventory_drop(&inv)
+
+    if len != 3
+        return 1  # FAIL: should have 3 unique items
+    if has_sword != 1
+        return 2
+    if has_shield != 1
+        return 3
+    if has_potion != 1
+        return 4
+    return 0  # PASS
+
+# ============================================================================
+# Remove Tests
+# ============================================================================
+
+[[test]]
+fn test_remove_decrements_quantity() -> i32
+    var inv: Inventory = inventory_new()
+    inventory_add(&inv, c"coin", 100)
+    inventory_remove(&inv, c"coin", 30)
+
+    let count: i32 = inventory_count(&inv, c"coin")
+    inventory_drop(&inv)
+
+    if count != 70
+        return 1  # FAIL: should have 70 coins
+    return 0  # PASS
+
+[[test]]
+fn test_remove_insufficient_returns_error() -> i32
+    var inv: Inventory = inventory_new()
+    inventory_add(&inv, c"gem", 5)
+
+    let result: i32 = inventory_remove(&inv, c"gem", 10)
+    let count: i32 = inventory_count(&inv, c"gem")
+    inventory_drop(&inv)
+
+    if result != -1
+        return 1  # FAIL: should return error
+    if count != 5
+        return 2  # FAIL: quantity should be unchanged
+    return 0  # PASS
+
+[[test]]
+fn test_remove_nonexistent_returns_error() -> i32
+    var inv: Inventory = inventory_new()
+
+    let result: i32 = inventory_remove(&inv, c"phantom", 1)
+    inventory_drop(&inv)
+
+    if result != -1
+        return 1  # FAIL: should return error for missing item
+    return 0  # PASS
+
+[[test]]
+fn test_remove_exact_quantity() -> i32
+    var inv: Inventory = inventory_new()
+    inventory_add(&inv, c"scroll", 3)
+    inventory_remove(&inv, c"scroll", 3)
+
+    let count: i32 = inventory_count(&inv, c"scroll")
+    let has_it: i32 = inventory_has(&inv, c"scroll")
+    inventory_drop(&inv)
+
+    if count != 0
+        return 1  # FAIL: should have 0
+    if has_it != 0
+        return 2  # FAIL: has should return false for 0 quantity
+    return 0  # PASS
+
+# ============================================================================
+# Query Tests
+# ============================================================================
+
+[[test]]
+fn test_has_returns_false_for_missing() -> i32
+    var inv: Inventory = inventory_new()
+    inventory_add(&inv, c"key", 1)
+
+    let has_it: i32 = inventory_has(&inv, c"lock")
+    inventory_drop(&inv)
+
+    if has_it != 0
+        return 1  # FAIL: should not have lock
+    return 0  # PASS
+
+[[test]]
+fn test_has_returns_false_for_zero_quantity() -> i32
+    var inv: Inventory = inventory_new()
+    inventory_add(&inv, c"torch", 1)
+    inventory_remove(&inv, c"torch", 1)
+
+    let has_it: i32 = inventory_has(&inv, c"torch")
+    inventory_drop(&inv)
+
+    if has_it != 0
+        return 1  # FAIL: has should return false when quantity is 0
+    return 0  # PASS
+
+[[test]]
+fn test_count_returns_zero_for_missing() -> i32
+    var inv: Inventory = inventory_new()
+
+    let count: i32 = inventory_count(&inv, c"nothing")
+    inventory_drop(&inv)
+
+    if count != 0
+        return 1  # FAIL: count should be 0 for missing item
+    return 0  # PASS
+
+[[test]]
+fn test_len_tracks_unique_items() -> i32
+    var inv: Inventory = inventory_new()
+    inventory_add(&inv, c"a", 1)
+    inventory_add(&inv, c"b", 1)
+    inventory_add(&inv, c"a", 1)  # Same item, shouldn't increase len
+
+    let len: i64 = inventory_len(&inv)
+    inventory_drop(&inv)
+
+    if len != 2
+        return 1  # FAIL: should have 2 unique items
+    return 0  # PASS
+
+[[test]]
+fn test_clear_removes_all_items() -> i32
+    var inv: Inventory = inventory_new()
+    inventory_add(&inv, c"x", 10)
+    inventory_add(&inv, c"y", 20)
+    inventory_add(&inv, c"z", 30)
+    inventory_clear(&inv)
+
+    let len: i64 = inventory_len(&inv)
+    inventory_drop(&inv)
+
+    if len != 0
+        return 1  # FAIL: should be empty after clear
+    return 0  # PASS
+
+# ============================================================================
+# Total Quantity Tests
+# ============================================================================
+
+[[test]]
+fn test_total_quantity() -> i32
+    var inv: Inventory = inventory_new()
+    inventory_add(&inv, c"a", 10)
+    inventory_add(&inv, c"b", 20)
+    inventory_add(&inv, c"c", 30)
+
+    let total: i32 = inventory_total_quantity(&inv)
+    inventory_drop(&inv)
+
+    if total != 60
+        return 1  # FAIL: total should be 60
+    return 0  # PASS
+
+[[test]]
+fn test_total_quantity_empty() -> i32
+    var inv: Inventory = inventory_new()
+
+    let total: i32 = inventory_total_quantity(&inv)
+    inventory_drop(&inv)
+
+    if total != 0
+        return 1  # FAIL: total should be 0 for empty inventory
+    return 0  # PASS
+
+# ============================================================================
+# Edge Cases
+# ============================================================================
+
+[[test]]
+fn test_add_zero_quantity() -> i32
+    var inv: Inventory = inventory_new()
+    inventory_add(&inv, c"nothing", 0)
+
+    let count: i32 = inventory_count(&inv, c"nothing")
+    let has_it: i32 = inventory_has(&inv, c"nothing")
+    inventory_drop(&inv)
+
+    # Adding 0 quantity still creates the item
+    if count != 0
+        return 1
+    if has_it != 0
+        return 2  # FAIL: has should return false for 0 quantity
+    return 0  # PASS
+
+[[test]]
+fn test_large_quantities() -> i32
+    var inv: Inventory = inventory_new()
+    inventory_add(&inv, c"big", 1000000)
+    inventory_add(&inv, c"big", 1000000)
+
+    let count: i32 = inventory_count(&inv, c"big")
+    inventory_drop(&inv)
+
+    if count != 2000000
+        return 1  # FAIL: should handle large quantities
+    return 0  # PASS
+
+# ============================================================================
+# Serialization Tests
+# ============================================================================
+
+[[test]]
+fn test_to_json_empty() -> i32
+    var inv: Inventory = inventory_new()
+    var buf: Vec<u8> = vec_new<u8>()
+    inventory_to_json(&inv, &buf)
+
+    # Expected: {"items":[],"count":0}
+    let expected: *u8 = c"{\"items\":[],\"count\":0}"
+    let result: i32 = str_eq(buf.data, expected)
+
+    vec_drop<u8>(&buf)
+    inventory_drop(&inv)
+
+    if result != 1
+        return 1  # FAIL: JSON doesn't match expected
+    return 0  # PASS
+
+[[test]]
+fn test_to_json_single_item() -> i32
+    var inv: Inventory = inventory_new()
+    inventory_add(&inv, c"sword", 1)
+    var buf: Vec<u8> = vec_new<u8>()
+    inventory_to_json(&inv, &buf)
+
+    # Expected: {"items":[{"name":"sword","quantity":1}],"count":1}
+    let expected: *u8 = c"{\"items\":[{\"name\":\"sword\",\"quantity\":1}],\"count\":1}"
+    let result: i32 = str_eq(buf.data, expected)
+
+    vec_drop<u8>(&buf)
+    inventory_drop(&inv)
+
+    if result != 1
+        return 1  # FAIL: JSON doesn't match expected
+    return 0  # PASS
+
+[[test]]
+fn test_to_json_multiple_items() -> i32
+    var inv: Inventory = inventory_new()
+    inventory_add(&inv, c"a", 10)
+    inventory_add(&inv, c"b", 20)
+    var buf: Vec<u8> = vec_new<u8>()
+    inventory_to_json(&inv, &buf)
+
+    # Check the JSON starts correctly and has count:2
+    # Expected pattern: {"items":[...}],"count":2}
+    # Since order matters, check specific format
+    let expected: *u8 = c"{\"items\":[{\"name\":\"a\",\"quantity\":10},{\"name\":\"b\",\"quantity\":20}],\"count\":2}"
+    let result: i32 = str_eq(buf.data, expected)
+
+    vec_drop<u8>(&buf)
+    inventory_drop(&inv)
+
+    if result != 1
+        return 1  # FAIL: JSON doesn't match expected
+    return 0  # PASS
+
+[[test]]
+fn test_to_json_with_quantities() -> i32
+    var inv: Inventory = inventory_new()
+    inventory_add(&inv, c"gold", 999)
+    var buf: Vec<u8> = vec_new<u8>()
+    inventory_to_json(&inv, &buf)
+
+    # Expected: {"items":[{"name":"gold","quantity":999}],"count":1}
+    let expected: *u8 = c"{\"items\":[{\"name\":\"gold\",\"quantity\":999}],\"count\":1}"
+    let result: i32 = str_eq(buf.data, expected)
+
+    vec_drop<u8>(&buf)
+    inventory_drop(&inv)
+
+    if result != 1
+        return 1  # FAIL: JSON doesn't match expected
+    return 0  # PASS
+
+# ============================================================================
+# Example Tests for Attribute Filtering
+# ============================================================================
+# These demonstrate @slow and @ignore attributes via naming convention.
+
+[[test]]
+fn test_slow_inventory_stress() -> i32
+    # This test is marked as "slow" via naming convention
+    var inv: Inventory = inventory_new()
+
+    # Add many items to stress test
+    for i in 0..100
+        inventory_add(&inv, c"item", 1)
+
+    let total: i32 = inventory_total_quantity(&inv)
+    inventory_drop(&inv)
+
+    if total != 100
+        return 1
+    return 0
+
+[[test]]
+fn test_ignore_placeholder() -> i32
+    # This test is marked as "ignore" via naming convention
+    # It's a placeholder for future functionality
+    return 0
+
+[[test]]
+fn test_slow_serialization_large() -> i32
+    # Another slow test - serializing large inventory
+    var inv: Inventory = inventory_new()
+    for i in 0..50
+        inventory_add(&inv, c"loot", i)
+
+    var buf: Vec<u8> = vec_new<u8>()
+    inventory_to_json(&inv, &buf)
+
+    let len: i64 = strlen(buf.data) as i64
+    vec_drop<u8>(&buf)
+    inventory_drop(&inv)
+
+    # Should produce a non-trivial JSON string
+    if len < 50
+        return 1
+    return 0

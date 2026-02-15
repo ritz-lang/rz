@@ -1,0 +1,190 @@
+# lib/cpuid.ritz - CPU feature detection via CPUID instruction
+#
+# Provides detection of CPU features needed for hardware-accelerated
+# cryptographic operations:
+#   - SHA-NI (SHA extensions for SHA-256)
+#   - AES-NI (AES encryption/decryption)
+#   - AVX2 (256-bit SIMD)
+#   - AVX-512F (512-bit SIMD foundation)
+#   - PCLMULQDQ (carryless multiply for GHASH)
+#
+# References:
+#   - Intel 64 and IA-32 Architectures Software Developer's Manual
+#   - AMD64 Architecture Programmer's Manual
+
+# ============================================================================
+# CPUID Leaf/Subleaf Constants
+# ============================================================================
+
+# Leaf 0: Vendor string
+const CPUID_VENDOR: i32 = 0
+
+# Leaf 1: Feature information
+const CPUID_FEATURES: i32 = 1
+
+# Leaf 7: Extended features (subleaf 0)
+const CPUID_EXT_FEATURES: i32 = 7
+
+# ============================================================================
+# Feature Bit Positions
+# ============================================================================
+
+# Leaf 1, ECX bits
+const CPUID_ECX_PCLMULQDQ: i32 = 1   # Bit 1: PCLMULQDQ
+const CPUID_ECX_AES: i32 = 25        # Bit 25: AES-NI
+const CPUID_ECX_XSAVE: i32 = 26      # Bit 26: XSAVE
+const CPUID_ECX_OSXSAVE: i32 = 27    # Bit 27: OSXSAVE
+const CPUID_ECX_AVX: i32 = 28        # Bit 28: AVX
+
+# Leaf 7, EBX bits (subleaf 0)
+const CPUID_EBX_AVX2: i32 = 5        # Bit 5: AVX2
+const CPUID_EBX_SHA: i32 = 29        # Bit 29: SHA extensions
+
+# Leaf 7, EBX bits for AVX-512
+const CPUID_EBX_AVX512F: i32 = 16    # Bit 16: AVX-512 Foundation
+
+# ============================================================================
+# Cached Feature Flags
+# ============================================================================
+
+# Global cache for detected features (initialized on first use)
+# Using separate vars since we don't have static initialization
+var g_cpuid_initialized: i32 = 0
+var g_has_aes_ni: i32 = 0
+var g_has_sha_ni: i32 = 0
+var g_has_avx: i32 = 0
+var g_has_avx2: i32 = 0
+var g_has_avx512f: i32 = 0
+var g_has_pclmulqdq: i32 = 0
+var g_has_osxsave: i32 = 0
+
+# ============================================================================
+# Low-level CPUID Access
+# ============================================================================
+
+# Raw CPUID call - uses the compiler builtin cpuid_raw directly.
+# Note: cpuid_raw is a magic function name handled by the emitter.
+# We provide do_cpuid as a pub wrapper for external use.
+pub fn do_cpuid(leaf: i32, subleaf: i32, eax: *i32, ebx: *i32, ecx: *i32, edx: *i32)
+    cpuid_raw(leaf, subleaf, eax, ebx, ecx, edx)
+
+# ============================================================================
+# Feature Detection (Internal)
+# ============================================================================
+
+# Initialize CPU feature detection
+fn cpuid_init()
+    if g_cpuid_initialized != 0
+        return
+
+    var eax: i32 = 0
+    var ebx: i32 = 0
+    var ecx: i32 = 0
+    var edx: i32 = 0
+
+    # First check maximum supported CPUID leaf
+    cpuid_raw(CPUID_VENDOR, 0, &eax, &ebx, &ecx, &edx)
+    let max_leaf: i32 = eax
+
+    # Leaf 1: Basic features (AES-NI, AVX, PCLMULQDQ, OSXSAVE)
+    if max_leaf >= 1
+        cpuid_raw(CPUID_FEATURES, 0, &eax, &ebx, &ecx, &edx)
+
+        # AES-NI: ECX bit 25
+        if (ecx >> CPUID_ECX_AES) & 1 == 1
+            g_has_aes_ni = 1
+
+        # PCLMULQDQ: ECX bit 1
+        if (ecx >> CPUID_ECX_PCLMULQDQ) & 1 == 1
+            g_has_pclmulqdq = 1
+
+        # AVX: ECX bit 28
+        if (ecx >> CPUID_ECX_AVX) & 1 == 1
+            g_has_avx = 1
+
+        # OSXSAVE: ECX bit 27 (needed to verify OS supports AVX state)
+        if (ecx >> CPUID_ECX_OSXSAVE) & 1 == 1
+            g_has_osxsave = 1
+
+    # Leaf 7: Extended features (AVX2, SHA-NI, AVX-512F)
+    if max_leaf >= 7
+        cpuid_raw(CPUID_EXT_FEATURES, 0, &eax, &ebx, &ecx, &edx)
+
+        # AVX2: EBX bit 5
+        if (ebx >> CPUID_EBX_AVX2) & 1 == 1
+            g_has_avx2 = 1
+
+        # SHA-NI: EBX bit 29
+        if (ebx >> CPUID_EBX_SHA) & 1 == 1
+            g_has_sha_ni = 1
+
+        # AVX-512F: EBX bit 16
+        if (ebx >> CPUID_EBX_AVX512F) & 1 == 1
+            g_has_avx512f = 1
+
+    g_cpuid_initialized = 1
+
+# ============================================================================
+# Public Feature Detection API
+# ============================================================================
+
+# Check if CPU supports AES-NI (AES encryption instructions)
+pub fn cpu_has_aes_ni() -> i32
+    cpuid_init()
+    return g_has_aes_ni
+
+# Check if CPU supports SHA-NI (SHA-256 hardware acceleration)
+pub fn cpu_has_sha_ni() -> i32
+    cpuid_init()
+    return g_has_sha_ni
+
+# Check if CPU supports AVX (256-bit SIMD, needed for AVX2)
+pub fn cpu_has_avx() -> i32
+    cpuid_init()
+    return g_has_avx
+
+# Check if CPU supports AVX2 (256-bit integer SIMD)
+pub fn cpu_has_avx2() -> i32
+    cpuid_init()
+    # AVX2 requires AVX and OS support (OSXSAVE)
+    if g_has_avx == 0 || g_has_osxsave == 0
+        return 0
+    return g_has_avx2
+
+# Check if CPU supports AVX-512F (512-bit SIMD foundation)
+pub fn cpu_has_avx512() -> i32
+    cpuid_init()
+    # AVX-512 requires AVX/AVX2 and OS support
+    if g_has_avx == 0 || g_has_osxsave == 0
+        return 0
+    return g_has_avx512f
+
+# Check if CPU supports PCLMULQDQ (carryless multiply for GHASH)
+pub fn cpu_has_pclmulqdq() -> i32
+    cpuid_init()
+    return g_has_pclmulqdq
+
+# ============================================================================
+# Feature Structure
+# ============================================================================
+
+# All detected CPU features in one structure
+pub struct CpuFeatures
+    has_aes_ni: i32
+    has_sha_ni: i32
+    has_avx: i32
+    has_avx2: i32
+    has_avx512f: i32
+    has_pclmulqdq: i32
+    has_osxsave: i32
+
+# Detect all CPU features at once
+pub fn cpu_detect_features(features: *CpuFeatures)
+    cpuid_init()
+    features.has_aes_ni = g_has_aes_ni
+    features.has_sha_ni = g_has_sha_ni
+    features.has_avx = g_has_avx
+    features.has_avx2 = g_has_avx2
+    features.has_avx512f = g_has_avx512f
+    features.has_pclmulqdq = g_has_pclmulqdq
+    features.has_osxsave = g_has_osxsave

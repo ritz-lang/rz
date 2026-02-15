@@ -1,0 +1,745 @@
+# X.509 Certificate Parser
+#
+# Parses X.509 v3 certificates as defined in RFC 5280.
+# Built on top of the ASN.1/DER parser.
+#
+# Certificate structure (simplified):
+#
+# Certificate ::= SEQUENCE {
+#     tbsCertificate       TBSCertificate,
+#     signatureAlgorithm   AlgorithmIdentifier,
+#     signatureValue       BIT STRING
+# }
+#
+# TBSCertificate ::= SEQUENCE {
+#     version         [0]  EXPLICIT Version DEFAULT v1,
+#     serialNumber         CertificateSerialNumber,
+#     signature            AlgorithmIdentifier,
+#     issuer               Name,
+#     validity             Validity,
+#     subject              Name,
+#     subjectPublicKeyInfo SubjectPublicKeyInfo,
+#     ...extensions...
+# }
+#
+# References:
+# - RFC 5280 (Internet X.509 PKI Certificate and CRL Profile)
+
+import ritzlib.sys
+import ritzlib.io
+import asn1
+import mem
+
+# ============================================================================
+# X.509 Certificate Structures
+# ============================================================================
+
+# Maximum lengths for certificate fields
+const X509_MAX_NAME_LEN: i32 = 256
+const X509_MAX_SERIAL_LEN: i32 = 20
+const X509_MAX_PUBKEY_LEN: i32 = 512
+const X509_MAX_SIG_LEN: i32 = 512
+
+# Public key types
+const PUBKEY_TYPE_UNKNOWN: u8   = 0
+const PUBKEY_TYPE_RSA: u8       = 1
+const PUBKEY_TYPE_EC: u8        = 2
+const PUBKEY_TYPE_ED25519: u8   = 3
+
+# EC curve types
+const EC_CURVE_UNKNOWN: u8  = 0
+const EC_CURVE_P256: u8     = 1
+const EC_CURVE_P384: u8     = 2
+
+# Signature algorithm types
+const SIG_ALG_UNKNOWN: u8       = 0
+const SIG_ALG_SHA256_RSA: u8    = 1
+const SIG_ALG_SHA384_RSA: u8    = 2
+const SIG_ALG_SHA512_RSA: u8    = 3
+const SIG_ALG_ECDSA_SHA256: u8  = 4
+const SIG_ALG_ECDSA_SHA384: u8  = 5
+const SIG_ALG_ED25519: u8       = 6
+
+# Validity period (times as Unix timestamps)
+struct X509Validity
+    not_before: i64
+    not_after: i64
+
+# Distinguished Name (simplified - just stores common fields)
+struct X509Name
+    common_name: [64]u8
+    common_name_len: u8
+    organization: [64]u8
+    organization_len: u8
+    country: [3]u8
+    country_len: u8
+    # Raw DER encoding for comparison
+    der_data: *u8
+    der_len: u64
+
+# Subject Public Key Info
+struct X509PublicKey
+    algorithm: u8           # PUBKEY_TYPE_*
+    curve: u8               # EC_CURVE_* (for EC keys)
+    key_data: [512]u8       # Raw public key bytes
+    key_len: u64
+
+# Parsed X.509 Certificate
+struct X509Certificate
+    version: u8             # 1, 2, or 3
+    serial: [20]u8          # Serial number (up to 20 bytes)
+    serial_len: u8
+    sig_algorithm: u8       # SIG_ALG_*
+    issuer: X509Name
+    validity: X509Validity
+    subject: X509Name
+    public_key: X509PublicKey
+
+    # Extensions (basic subset)
+    is_ca: u8               # From basicConstraints
+    key_usage: u16          # From keyUsage
+
+    # Signature
+    signature: [512]u8
+    signature_len: u64
+
+    # Raw TBS (to-be-signed) data for verification
+    tbs_data: *u8
+    tbs_len: u64
+
+# ============================================================================
+# Algorithm Identifier Parsing
+# ============================================================================
+
+# Parse AlgorithmIdentifier and return algorithm type
+# Returns: algorithm type constant, or 0 on error/unknown
+pub fn x509_parse_sig_algorithm(parser: *DerParser) -> u8
+    var seq: DerElement
+    if der_parse_element(parser, &seq) != 0
+        return SIG_ALG_UNKNOWN
+
+    if der_is_sequence(&seq) != 1
+        return SIG_ALG_UNKNOWN
+
+    var seq_parser: DerParser
+    if der_enter_sequence(&seq, &seq_parser) != 0
+        return SIG_ALG_UNKNOWN
+
+    # Parse OID
+    var oid_elem: DerElement
+    if der_parse_element(&seq_parser, &oid_elem) != 0
+        return SIG_ALG_UNKNOWN
+
+    var oid: Oid
+    if der_decode_oid(&oid_elem, &oid) != 0
+        return SIG_ALG_UNKNOWN
+
+    # Match against known algorithms
+    if oid_is_sha256_rsa(&oid) == 1
+        return SIG_ALG_SHA256_RSA
+    if oid_is_sha384_rsa(&oid) == 1
+        return SIG_ALG_SHA384_RSA
+    if oid_is_sha512_rsa(&oid) == 1
+        return SIG_ALG_SHA512_RSA
+    if oid_is_ecdsa_sha256(&oid) == 1
+        return SIG_ALG_ECDSA_SHA256
+    if oid_is_ecdsa_sha384(&oid) == 1
+        return SIG_ALG_ECDSA_SHA384
+    if oid_is_ed25519(&oid) == 1
+        return SIG_ALG_ED25519
+
+    return SIG_ALG_UNKNOWN
+
+# ============================================================================
+# Name (Distinguished Name) Parsing
+# ============================================================================
+
+# Parse a single RDN attribute value (OID + value)
+fn x509_parse_rdn_attribute(parser: *DerParser, name: *X509Name) -> i32
+    var seq: DerElement
+    if der_parse_element(parser, &seq) != 0
+        return -1
+
+    if der_is_sequence(&seq) != 1
+        return -1
+
+    var attr_parser: DerParser
+    if der_enter_sequence(&seq, &attr_parser) != 0
+        return -1
+
+    # Parse attribute type OID
+    var oid_elem: DerElement
+    if der_parse_element(&attr_parser, &oid_elem) != 0
+        return -1
+
+    var oid: Oid
+    if der_decode_oid(&oid_elem, &oid) != 0
+        return -1
+
+    # Parse attribute value (string)
+    var value_elem: DerElement
+    if der_parse_element(&attr_parser, &value_elem) != 0
+        return -1
+
+    # Copy value to appropriate field based on OID
+    if oid_is_common_name(&oid) == 1
+        var copy_len: u64 = value_elem.content_len
+        if copy_len > 63
+            copy_len = 63
+        mem_copy(&name.common_name[0], value_elem.content, copy_len)
+        name.common_name_len = copy_len as u8
+
+    if oid_is_org_name(&oid) == 1
+        var copy_len: u64 = value_elem.content_len
+        if copy_len > 63
+            copy_len = 63
+        mem_copy(&name.organization[0], value_elem.content, copy_len)
+        name.organization_len = copy_len as u8
+
+    if oid_is_country_name(&oid) == 1
+        var copy_len: u64 = value_elem.content_len
+        if copy_len > 2
+            copy_len = 2
+        mem_copy(&name.country[0], value_elem.content, copy_len)
+        name.country_len = copy_len as u8
+
+    return 0
+
+# Parse Name (sequence of RDNs)
+fn x509_parse_name(parser: *DerParser, name: *X509Name) -> i32
+    # Initialize
+    name.common_name_len = 0
+    name.organization_len = 0
+    name.country_len = 0
+
+    var seq: DerElement
+    if der_parse_element(parser, &seq) != 0
+        return -1
+
+    if der_is_sequence(&seq) != 1
+        return -1
+
+    # Save raw DER for later comparison
+    name.der_data = seq.content - seq.header_len
+    name.der_len = seq.header_len + seq.content_len
+
+    var name_parser: DerParser
+    if der_enter_sequence(&seq, &name_parser) != 0
+        return -1
+
+    # Parse each RDN (SET of AttributeTypeAndValue)
+    while der_parser_eof(&name_parser) != 1
+        var rdn_set: DerElement
+        if der_parse_element(&name_parser, &rdn_set) != 0
+            return -1
+
+        if der_is_set(&rdn_set) != 1
+            return -1
+
+        var rdn_parser: DerParser
+        if der_enter_set(&rdn_set, &rdn_parser) != 0
+            return -1
+
+        # Parse attributes in this RDN
+        while der_parser_eof(&rdn_parser) != 1
+            if x509_parse_rdn_attribute(&rdn_parser, name) != 0
+                return -1
+
+    return 0
+
+# Compare two X509Names by their raw DER encoding
+pub fn x509_name_equals(a: *X509Name, b: *X509Name) -> i32
+    if a.der_len != b.der_len
+        return 0
+
+    if mem_eq(a.der_data, b.der_data, a.der_len) == 1
+        return 1
+
+    return 0
+
+# ============================================================================
+# Time Parsing
+# ============================================================================
+
+# Parse 2-digit decimal
+fn parse_2digit(s: *u8) -> i32
+    let d1: i32 = (s[0] - 0x30) as i32
+    let d2: i32 = (s[1] - 0x30) as i32
+    return d1 * 10 + d2
+
+# Parse 4-digit decimal
+fn parse_4digit(s: *u8) -> i32
+    let d1: i32 = (s[0] - 0x30) as i32
+    let d2: i32 = (s[1] - 0x30) as i32
+    let d3: i32 = (s[2] - 0x30) as i32
+    let d4: i32 = (s[3] - 0x30) as i32
+    return d1 * 1000 + d2 * 100 + d3 * 10 + d4
+
+# Days in months (non-leap year)
+fn days_in_month(month: i32, year: i32) -> i32
+    if month == 2
+        # Leap year check
+        if (year % 4) == 0
+            if (year % 100) == 0
+                if (year % 400) == 0
+                    return 29
+                return 28
+            return 29
+        return 28
+
+    if month == 4
+        return 30
+    if month == 6
+        return 30
+    if month == 9
+        return 30
+    if month == 11
+        return 30
+
+    return 31
+
+# Convert calendar time to Unix timestamp (seconds since 1970-01-01 00:00:00 UTC)
+# Simplified - assumes UTC
+pub fn calendar_to_unix(year: i32, month: i32, day: i32, hour: i32, min: i32, sec: i32) -> i64
+    # Days from 1970 to year
+    var days: i64 = 0
+    var y: i32 = 1970
+    while y < year
+        if (y % 4) == 0
+            if (y % 100) == 0
+                if (y % 400) == 0
+                    days = days + 366
+                else
+                    days = days + 365
+            else
+                days = days + 366
+        else
+            days = days + 365
+        y += 1
+
+    # Days in months
+    var m: i32 = 1
+    while m < month
+        days = days + (days_in_month(m, year) as i64)
+        m += 1
+
+    # Days
+    days = days + ((day - 1) as i64)
+
+    # Convert to seconds
+    var result: i64 = days * 86400
+    result = result + ((hour as i64) * 3600)
+    result = result + ((min as i64) * 60)
+    result = result + (sec as i64)
+
+    return result
+
+# Parse UTCTime: YYMMDDhhmmssZ
+pub fn x509_parse_utc_time(elem: *DerElement, out: *i64) -> i32
+    if der_is_utc_time(elem) != 1
+        return -1
+
+    if elem.content_len < 13
+        return -1
+
+    let yy: i32 = parse_2digit(&elem.content[0])
+    let mm: i32 = parse_2digit(&elem.content[2])
+    let dd: i32 = parse_2digit(&elem.content[4])
+    let hh: i32 = parse_2digit(&elem.content[6])
+    let mi: i32 = parse_2digit(&elem.content[8])
+    let ss: i32 = parse_2digit(&elem.content[10])
+
+    # Y2K handling: 00-49 -> 2000-2049, 50-99 -> 1950-1999
+    var year: i32 = 0
+    if yy < 50
+        year = 2000 + yy
+    else
+        year = 1900 + yy
+
+    *out = calendar_to_unix(year, mm, dd, hh, mi, ss)
+    return 0
+
+# Parse GeneralizedTime: YYYYMMDDhhmmssZ
+pub fn x509_parse_generalized_time(elem: *DerElement, out: *i64) -> i32
+    if der_is_generalized_time(elem) != 1
+        return -1
+
+    if elem.content_len < 15
+        return -1
+
+    let year: i32 = parse_4digit(&elem.content[0])
+    let mm: i32 = parse_2digit(&elem.content[4])
+    let dd: i32 = parse_2digit(&elem.content[6])
+    let hh: i32 = parse_2digit(&elem.content[8])
+    let mi: i32 = parse_2digit(&elem.content[10])
+    let ss: i32 = parse_2digit(&elem.content[12])
+
+    *out = calendar_to_unix(year, mm, dd, hh, mi, ss)
+    return 0
+
+# Parse either UTCTime or GeneralizedTime
+fn x509_parse_time(elem: *DerElement, out: *i64) -> i32
+    if der_is_utc_time(elem) == 1
+        return x509_parse_utc_time(elem, out)
+    if der_is_generalized_time(elem) == 1
+        return x509_parse_generalized_time(elem, out)
+    return -1
+
+# Parse Validity sequence
+pub fn x509_parse_validity(parser: *DerParser, validity: *X509Validity) -> i32
+    var seq: DerElement
+    if der_parse_element(parser, &seq) != 0
+        return -1
+
+    if der_is_sequence(&seq) != 1
+        return -1
+
+    var val_parser: DerParser
+    if der_enter_sequence(&seq, &val_parser) != 0
+        return -1
+
+    # Parse notBefore
+    var not_before: DerElement
+    if der_parse_element(&val_parser, &not_before) != 0
+        return -1
+
+    if x509_parse_time(&not_before, &validity.not_before) != 0
+        return -1
+
+    # Parse notAfter
+    var not_after: DerElement
+    if der_parse_element(&val_parser, &not_after) != 0
+        return -1
+
+    if x509_parse_time(&not_after, &validity.not_after) != 0
+        return -1
+
+    return 0
+
+# ============================================================================
+# Subject Public Key Info Parsing
+# ============================================================================
+
+pub fn x509_parse_public_key(parser: *DerParser, pubkey: *X509PublicKey) -> i32
+    var seq: DerElement
+    if der_parse_element(parser, &seq) != 0
+        return -1
+
+    if der_is_sequence(&seq) != 1
+        return -1
+
+    var spki_parser: DerParser
+    if der_enter_sequence(&seq, &spki_parser) != 0
+        return -1
+
+    # Parse AlgorithmIdentifier
+    var alg_seq: DerElement
+    if der_parse_element(&spki_parser, &alg_seq) != 0
+        return -1
+
+    if der_is_sequence(&alg_seq) != 1
+        return -1
+
+    var alg_parser: DerParser
+    if der_enter_sequence(&alg_seq, &alg_parser) != 0
+        return -1
+
+    var oid_elem: DerElement
+    if der_parse_element(&alg_parser, &oid_elem) != 0
+        return -1
+
+    var oid: Oid
+    if der_decode_oid(&oid_elem, &oid) != 0
+        return -1
+
+    # Determine key type
+    if oid_is_rsa(&oid) == 1
+        pubkey.algorithm = PUBKEY_TYPE_RSA
+        pubkey.curve = EC_CURVE_UNKNOWN
+    else
+        if oid_is_ec_public_key(&oid) == 1
+            pubkey.algorithm = PUBKEY_TYPE_EC
+
+            # Parse curve OID from parameters
+            var curve_elem: DerElement
+            if der_parse_element(&alg_parser, &curve_elem) != 0
+                return -1
+
+            var curve_oid: Oid
+            if der_decode_oid(&curve_elem, &curve_oid) != 0
+                return -1
+
+            if oid_is_p256(&curve_oid) == 1
+                pubkey.curve = EC_CURVE_P256
+            else
+                if oid_is_p384(&curve_oid) == 1
+                    pubkey.curve = EC_CURVE_P384
+                else
+                    pubkey.curve = EC_CURVE_UNKNOWN
+        else
+            if oid_is_ed25519(&oid) == 1
+                pubkey.algorithm = PUBKEY_TYPE_ED25519
+                pubkey.curve = EC_CURVE_UNKNOWN
+            else
+                pubkey.algorithm = PUBKEY_TYPE_UNKNOWN
+                pubkey.curve = EC_CURVE_UNKNOWN
+
+    # Parse subjectPublicKey BIT STRING
+    var pk_bits: DerElement
+    if der_parse_element(&spki_parser, &pk_bits) != 0
+        return -1
+
+    var pk_data: *u8 = null
+    var pk_len: u64 = 0
+    var unused: u8 = 0
+
+    if der_bit_string_content(&pk_bits, &pk_data, &pk_len, &unused) != 0
+        return -1
+
+    if pk_len > 512
+        pk_len = 512
+
+    mem_copy(&pubkey.key_data[0], pk_data, pk_len)
+    pubkey.key_len = pk_len
+
+    return 0
+
+# ============================================================================
+# Extensions Parsing
+# ============================================================================
+
+fn x509_parse_extensions(parser: *DerParser, cert: *X509Certificate) -> i32
+    # Extensions are wrapped in [3] context tag
+    var wrapper: DerElement
+    if der_parse_element(parser, &wrapper) != 0
+        return -1
+
+    if der_is_context_tag(&wrapper, 3) != 1
+        return -1
+
+    var wrapper_parser: DerParser
+    if der_enter_constructed(&wrapper, &wrapper_parser) != 0
+        return -1
+
+    # Extensions is a SEQUENCE
+    var ext_seq: DerElement
+    if der_parse_element(&wrapper_parser, &ext_seq) != 0
+        return -1
+
+    if der_is_sequence(&ext_seq) != 1
+        return -1
+
+    var ext_parser: DerParser
+    if der_enter_sequence(&ext_seq, &ext_parser) != 0
+        return -1
+
+    # Parse each extension
+    while der_parser_eof(&ext_parser) != 1
+        var ext: DerElement
+        if der_parse_element(&ext_parser, &ext) != 0
+            break
+
+        if der_is_sequence(&ext) != 1
+            continue
+
+        var ext_inner: DerParser
+        if der_enter_sequence(&ext, &ext_inner) != 0
+            continue
+
+        # Extension OID
+        var ext_oid_elem: DerElement
+        if der_parse_element(&ext_inner, &ext_oid_elem) != 0
+            continue
+
+        var ext_oid: Oid
+        if der_decode_oid(&ext_oid_elem, &ext_oid) != 0
+            continue
+
+        # Critical flag (optional BOOLEAN)
+        var next_elem: DerElement
+        if der_parse_element(&ext_inner, &next_elem) != 0
+            continue
+
+        var ext_value: *DerElement = &next_elem
+
+        # Check if it's a BOOLEAN (critical flag)
+        if next_elem.tag_class == TAG_CLASS_UNIVERSAL
+            if next_elem.tag_number == (TAG_BOOLEAN as u32)
+                # Skip critical flag, parse actual value
+                var actual_value: DerElement
+                if der_parse_element(&ext_inner, &actual_value) != 0
+                    continue
+                ext_value = &actual_value
+
+        # Process known extensions
+        if oid_is_basic_constraints(&ext_oid) == 1
+            # Parse basicConstraints
+            if der_is_octet_string(ext_value) == 1
+                var bc_parser: DerParser
+                der_parser_init(&bc_parser, ext_value.content, ext_value.content_len)
+
+                var bc_seq: DerElement
+                if der_parse_element(&bc_parser, &bc_seq) == 0
+                    if der_is_sequence(&bc_seq) == 1
+                        var bc_inner: DerParser
+                        if der_enter_sequence(&bc_seq, &bc_inner) == 0
+                            if der_parser_eof(&bc_inner) != 1
+                                var ca_elem: DerElement
+                                if der_parse_element(&bc_inner, &ca_elem) == 0
+                                    if ca_elem.tag_number == (TAG_BOOLEAN as u32)
+                                        if ca_elem.content_len > 0
+                                            if ca_elem.content[0] != 0
+                                                cert.is_ca = 1
+
+    return 0
+
+# ============================================================================
+# Main Certificate Parsing
+# ============================================================================
+
+# Parse a DER-encoded X.509 certificate
+# Returns: 0 on success, negative error code on failure
+pub fn x509_parse_certificate(der_data: *u8, der_len: u64, cert: *X509Certificate) -> i32
+    # Initialize certificate
+    mem_zero(cert as *u8, 1200)  # sizeof(X509Certificate) approximately
+
+    var parser: DerParser
+    der_parser_init(&parser, der_data, der_len)
+
+    # Certificate ::= SEQUENCE
+    var cert_seq: DerElement
+    if der_parse_element(&parser, &cert_seq) != 0
+        return -1
+
+    if der_is_sequence(&cert_seq) != 1
+        return -2
+
+    var cert_parser: DerParser
+    if der_enter_sequence(&cert_seq, &cert_parser) != 0
+        return -3
+
+    # TBSCertificate
+    var tbs: DerElement
+    if der_parse_element(&cert_parser, &tbs) != 0
+        return -4
+
+    if der_is_sequence(&tbs) != 1
+        return -5
+
+    # Save TBS for signature verification
+    cert.tbs_data = tbs.content - tbs.header_len
+    cert.tbs_len = tbs.header_len + tbs.content_len
+
+    var tbs_parser: DerParser
+    if der_enter_sequence(&tbs, &tbs_parser) != 0
+        return -6
+
+    # Version [0] EXPLICIT (optional, default v1)
+    var first_elem: DerElement
+    if der_parse_element(&tbs_parser, &first_elem) != 0
+        return -7
+
+    if der_is_context_tag(&first_elem, 0) == 1
+        # Explicit version tag
+        var ver_parser: DerParser
+        if der_enter_constructed(&first_elem, &ver_parser) != 0
+            return -8
+
+        var ver_int: DerElement
+        if der_parse_element(&ver_parser, &ver_int) != 0
+            return -9
+
+        var version: i64 = 0
+        if der_integer_to_i64(&ver_int, &version) != 0
+            return -10
+
+        cert.version = (version + 1) as u8  # 0 = v1, 1 = v2, 2 = v3
+
+        # Parse serial number (next element)
+        if der_parse_element(&tbs_parser, &first_elem) != 0
+            return -11
+    else
+        # No explicit version, default to v1
+        cert.version = 1
+
+    # Serial number (reusing first_elem)
+    if der_is_integer(&first_elem) != 1
+        return -12
+
+    var serial_len: u64 = first_elem.content_len
+    if serial_len > 20
+        serial_len = 20
+    mem_copy(&cert.serial[0], first_elem.content, serial_len)
+    cert.serial_len = serial_len as u8
+
+    # Signature algorithm (in TBS)
+    cert.sig_algorithm = x509_parse_sig_algorithm(&tbs_parser)
+
+    # Issuer
+    if x509_parse_name(&tbs_parser, &cert.issuer) != 0
+        return -13
+
+    # Validity
+    if x509_parse_validity(&tbs_parser, &cert.validity) != 0
+        return -14
+
+    # Subject
+    if x509_parse_name(&tbs_parser, &cert.subject) != 0
+        return -15
+
+    # Subject Public Key Info
+    if x509_parse_public_key(&tbs_parser, &cert.public_key) != 0
+        return -16
+
+    # Extensions (v3 only)
+    if cert.version == 3
+        if der_parser_eof(&tbs_parser) != 1
+            # Try to parse extensions, but don't fail if we can't
+            x509_parse_extensions(&tbs_parser, cert)
+
+    # Signature Algorithm (outer)
+    var outer_alg: u8 = x509_parse_sig_algorithm(&cert_parser)
+    # Should match inner algorithm
+    if outer_alg != cert.sig_algorithm
+        if outer_alg != SIG_ALG_UNKNOWN
+            if cert.sig_algorithm != SIG_ALG_UNKNOWN
+                return -17
+
+    # Signature Value
+    var sig_bits: DerElement
+    if der_parse_element(&cert_parser, &sig_bits) != 0
+        return -18
+
+    var sig_data: *u8 = null
+    var sig_len: u64 = 0
+    var unused: u8 = 0
+
+    if der_bit_string_content(&sig_bits, &sig_data, &sig_len, &unused) != 0
+        return -19
+
+    if sig_len > 512
+        sig_len = 512
+    mem_copy(&cert.signature[0], sig_data, sig_len)
+    cert.signature_len = sig_len
+
+    return 0
+
+# ============================================================================
+# Certificate Validation Helpers
+# ============================================================================
+
+# Check if certificate is currently valid (time-wise)
+pub fn x509_is_valid_time(cert: *X509Certificate, current_time: i64) -> i32
+    if current_time < cert.validity.not_before
+        return 0
+    if current_time > cert.validity.not_after
+        return 0
+    return 1
+
+# Check if issuer matches subject (for chain validation)
+pub fn x509_is_issued_by(cert: *X509Certificate, issuer: *X509Certificate) -> i32
+    return x509_name_equals(&cert.issuer, &issuer.subject)
+
+# Check if certificate is self-signed
+pub fn x509_is_self_signed(cert: *X509Certificate) -> i32
+    return x509_name_equals(&cert.issuer, &cert.subject)

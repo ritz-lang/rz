@@ -1,0 +1,629 @@
+# test/test_bits.ritz - Tests for bit stream reader/writer
+#
+# Deflate uses LSB-first (little-endian) bit ordering:
+# - Bits are read from low to high within each byte
+# - Multi-bit values have LSB first
+#
+# Example: byte 0b10110100 (0xB4)
+#   bits_read(3) -> 0b100 = 4 (bits 0,1,2)
+#   bits_read(5) -> 0b10110 = 22 (bits 3,4,5,6,7)
+
+import ritzlib.sys
+import ritzlib.io
+
+import lib.bits
+
+
+# ============================================================================
+# BitReader - Single Byte Tests
+# ============================================================================
+
+[[test]]
+fn test_bits_read_single_bit() -> i32
+    # Byte 0b00000001 (0x01) - LSB is 1
+    var data: [1]u8
+    data[0] = 0x01
+    var reader: BitReader = bits_reader_init(@data[0], 1)
+
+    let bit: u32 = bits_read(@reader, 1)
+    if bit != 1
+        print(c"FAIL: test_bits_read_single_bit\n")
+        return 1
+    0
+
+
+[[test]]
+fn test_bits_read_lsb_first() -> i32
+    # Byte 0b10110100 (0xB4)
+    # LSB-first: read 3 bits -> bits 0,1,2 = 0b100 = 4
+    var data: [1]u8
+    data[0] = 0xB4
+    var reader: BitReader = bits_reader_init(@data[0], 1)
+
+    let bits3: u32 = bits_read(@reader, 3)
+    if bits3 != 4
+        print(c"FAIL: test_bits_read_lsb_first - got ")
+        print_int(bits3 as i64)
+        print(c", expected 4\n")
+        return 1
+    0
+
+
+[[test]]
+fn test_bits_read_full_byte() -> i32
+    # Read 8 bits from 0xB4 -> should get 0xB4
+    var data: [1]u8
+    data[0] = 0xB4
+    var reader: BitReader = bits_reader_init(@data[0], 1)
+
+    let byte: u32 = bits_read(@reader, 8)
+    if byte != 0xB4
+        print(c"FAIL: test_bits_read_full_byte\n")
+        return 1
+    0
+
+
+[[test]]
+fn test_bits_read_sequential() -> i32
+    # Byte 0xB4 = 0b10110100
+    # Read 3 bits: 0b100 = 4
+    # Read 5 bits: 0b10110 = 22
+    var data: [1]u8
+    data[0] = 0xB4
+    var reader: BitReader = bits_reader_init(@data[0], 1)
+
+    let first: u32 = bits_read(@reader, 3)
+    let second: u32 = bits_read(@reader, 5)
+
+    if first != 4
+        print(c"FAIL: test_bits_read_sequential - first\n")
+        return 1
+    if second != 22
+        print(c"FAIL: test_bits_read_sequential - second\n")
+        return 1
+    0
+
+
+# ============================================================================
+# BitReader - Multi-Byte Tests
+# ============================================================================
+
+[[test]]
+fn test_bits_read_cross_byte() -> i32
+    # Two bytes: 0xF0, 0x0F
+    # Binary: 11110000 00001111
+    # Read 4 bits: 0000 = 0
+    # Read 8 bits crosses boundary: should get 11110000 shifted + 1111 = 0xFF
+    var data: [2]u8
+    data[0] = 0xF0
+    data[1] = 0x0F
+    var reader: BitReader = bits_reader_init(@data[0], 2)
+
+    let first4: u32 = bits_read(@reader, 4)  # bits 0-3 of first byte: 0
+    let cross8: u32 = bits_read(@reader, 8)  # bits 4-7 of first + 0-3 of second: 0xFF
+
+    if first4 != 0
+        print(c"FAIL: test_bits_read_cross_byte - first4\n")
+        return 1
+    if cross8 != 0xFF
+        print(c"FAIL: test_bits_read_cross_byte - cross8 got ")
+        print_int(cross8 as i64)
+        print(c" expected 255\n")
+        return 1
+    0
+
+
+[[test]]
+fn test_bits_read_16bits() -> i32
+    # Two bytes: 0x34, 0x12 (little-endian 0x1234)
+    # Reading 16 bits LSB-first should give 0x1234
+    var data: [2]u8
+    data[0] = 0x34
+    data[1] = 0x12
+    var reader: BitReader = bits_reader_init(@data[0], 2)
+
+    let val16: u32 = bits_read(@reader, 16)
+    if val16 != 0x1234
+        print(c"FAIL: test_bits_read_16bits - got ")
+        print_int(val16 as i64)
+        print(c" expected 4660\n")
+        return 1
+    0
+
+
+# ============================================================================
+# BitReader - Peek Tests
+# ============================================================================
+
+[[test]]
+fn test_bits_peek_no_advance() -> i32
+    # Peek should not advance position
+    var data: [1]u8
+    data[0] = 0xAB
+    var reader: BitReader = bits_reader_init(@data[0], 1)
+
+    let peek1: u32 = bits_peek(@reader, 4)
+    let peek2: u32 = bits_peek(@reader, 4)
+    let read1: u32 = bits_read(@reader, 4)
+
+    if peek1 != peek2
+        print(c"FAIL: test_bits_peek_no_advance - peek values differ\n")
+        return 1
+    if peek1 != read1
+        print(c"FAIL: test_bits_peek_no_advance - peek != read\n")
+        return 1
+    0
+
+
+[[test]]
+fn test_bits_peek_then_read() -> i32
+    var data: [1]u8
+    data[0] = 0xCD
+    var reader: BitReader = bits_reader_init(@data[0], 1)
+
+    let peeked: u32 = bits_peek(@reader, 8)
+    let read_val: u32 = bits_read(@reader, 8)
+
+    if peeked != 0xCD
+        print(c"FAIL: test_bits_peek_then_read - peek\n")
+        return 1
+    if read_val != 0xCD
+        print(c"FAIL: test_bits_peek_then_read - read\n")
+        return 1
+    0
+
+
+# ============================================================================
+# BitReader - Skip Tests
+# ============================================================================
+
+[[test]]
+fn test_bits_skip() -> i32
+    # Skip some bits then read
+    var data: [1]u8
+    data[0] = 0xF3  # 0b11110011
+    var reader: BitReader = bits_reader_init(@data[0], 1)
+
+    bits_skip(@reader, 4)  # Skip bits 0-3
+    let remaining: u32 = bits_read(@reader, 4)  # Read bits 4-7: 0b1111 = 15
+
+    if remaining != 15
+        print(c"FAIL: test_bits_skip - got ")
+        print_int(remaining as i64)
+        print(c" expected 15\n")
+        return 1
+    0
+
+
+[[test]]
+fn test_bits_skip_to_byte_boundary() -> i32
+    # Skip partial byte, then byte-align
+    var data: [2]u8
+    data[0] = 0xFF
+    data[1] = 0xAB
+    var reader: BitReader = bits_reader_init(@data[0], 2)
+
+    bits_read(@reader, 3)    # Read 3 bits
+    bits_skip(@reader, 5)    # Skip to byte boundary
+    let byte2: u32 = bits_read(@reader, 8)
+
+    if byte2 != 0xAB
+        print(c"FAIL: test_bits_skip_to_byte_boundary\n")
+        return 1
+    0
+
+
+# ============================================================================
+# BitWriter - Basic Tests
+# ============================================================================
+
+[[test]]
+fn test_bits_write_single_bit() -> i32
+    var buf: [8]u8 = [0; 8]
+    var writer: BitWriter = bits_writer_init(@buf[0], 8)
+
+    bits_write(@writer, 1, 1)  # Write bit value 1
+    bits_flush(@writer)
+
+    if buf[0] != 0x01
+        print(c"FAIL: test_bits_write_single_bit\n")
+        return 1
+    0
+
+
+[[test]]
+fn test_bits_write_lsb_first() -> i32
+    # Write 4 (0b100) in 3 bits -> byte should be 0b00000100 = 0x04
+    var buf: [8]u8 = [0; 8]
+    var writer: BitWriter = bits_writer_init(@buf[0], 8)
+
+    bits_write(@writer, 4, 3)  # Write 4 in 3 bits
+    bits_flush(@writer)
+
+    if buf[0] != 0x04
+        print(c"FAIL: test_bits_write_lsb_first - got ")
+        print_int(buf[0] as i64)
+        print(c" expected 4\n")
+        return 1
+    0
+
+
+[[test]]
+fn test_bits_write_full_byte() -> i32
+    var buf: [8]u8 = [0; 8]
+    var writer: BitWriter = bits_writer_init(@buf[0], 8)
+
+    bits_write(@writer, 0xB4, 8)
+    bits_flush(@writer)
+
+    if buf[0] != 0xB4
+        print(c"FAIL: test_bits_write_full_byte\n")
+        return 1
+    0
+
+
+[[test]]
+fn test_bits_write_sequential() -> i32
+    # Write 4 in 3 bits, then 22 in 5 bits -> should get 0xB4
+    var buf: [8]u8 = [0; 8]
+    var writer: BitWriter = bits_writer_init(@buf[0], 8)
+
+    bits_write(@writer, 4, 3)   # 0b100
+    bits_write(@writer, 22, 5)  # 0b10110
+    bits_flush(@writer)
+
+    # Combined: 0b10110_100 = 0xB4
+    if buf[0] != 0xB4
+        print(c"FAIL: test_bits_write_sequential - got ")
+        print_int(buf[0] as i64)
+        print(c" expected 180\n")
+        return 1
+    0
+
+
+[[test]]
+fn test_bits_write_cross_byte() -> i32
+    # Write values that cross byte boundary
+    var buf: [8]u8 = [0; 8]
+    var writer: BitWriter = bits_writer_init(@buf[0], 8)
+
+    bits_write(@writer, 0, 4)      # 4 bits of zeros
+    bits_write(@writer, 0xFF, 8)   # 8 bits spanning bytes
+    bits_flush(@writer)
+
+    # Byte 0: 0000 + lower 4 bits of 0xFF = 0xF0
+    # Byte 1: upper 4 bits of 0xFF = 0x0F
+    if buf[0] != 0xF0
+        print(c"FAIL: test_bits_write_cross_byte - buf[0]\n")
+        return 1
+    if buf[1] != 0x0F
+        print(c"FAIL: test_bits_write_cross_byte - buf[1]\n")
+        return 1
+    0
+
+
+[[test]]
+fn test_bits_write_16bits() -> i32
+    # Write 0x1234 in 16 bits
+    var buf: [8]u8 = [0; 8]
+    var writer: BitWriter = bits_writer_init(@buf[0], 8)
+
+    bits_write(@writer, 0x1234, 16)
+    bits_flush(@writer)
+
+    # LSB-first: buf[0]=0x34, buf[1]=0x12
+    if buf[0] != 0x34
+        print(c"FAIL: test_bits_write_16bits - buf[0]\n")
+        return 1
+    if buf[1] != 0x12
+        print(c"FAIL: test_bits_write_16bits - buf[1]\n")
+        return 1
+    0
+
+
+# ============================================================================
+# Round-Trip Tests
+# ============================================================================
+
+[[test]]
+fn test_bits_roundtrip() -> i32
+    # Write some values, then read them back
+    var buf: [8]u8 = [0; 8]
+    var writer: BitWriter = bits_writer_init(@buf[0], 8)
+
+    bits_write(@writer, 5, 3)    # 0b101
+    bits_write(@writer, 13, 4)   # 0b1101
+    bits_write(@writer, 1, 1)    # 0b1
+    bits_flush(@writer)
+
+    var reader: BitReader = bits_reader_init(@buf[0], 8)
+    let v1: u32 = bits_read(@reader, 3)
+    let v2: u32 = bits_read(@reader, 4)
+    let v3: u32 = bits_read(@reader, 1)
+
+    if v1 != 5
+        print(c"FAIL: test_bits_roundtrip - v1\n")
+        return 1
+    if v2 != 13
+        print(c"FAIL: test_bits_roundtrip - v2\n")
+        return 1
+    if v3 != 1
+        print(c"FAIL: test_bits_roundtrip - v3\n")
+        return 1
+    0
+
+
+# ============================================================================
+# Edge Cases
+# ============================================================================
+
+[[test]]
+fn test_bits_read_zero_bits() -> i32
+    var data: [1]u8
+    data[0] = 0xFF
+    var reader: BitReader = bits_reader_init(@data[0], 1)
+
+    let zero: u32 = bits_read(@reader, 0)
+    if zero != 0
+        print(c"FAIL: test_bits_read_zero_bits\n")
+        return 1
+
+    # Position should not change
+    let byte: u32 = bits_read(@reader, 8)
+    if byte != 0xFF
+        print(c"FAIL: test_bits_read_zero_bits - position changed\n")
+        return 1
+    0
+
+
+[[test]]
+fn test_bits_available() -> i32
+    var data: [2]u8
+    data[0] = 0xAA
+    data[1] = 0xBB
+    var reader: BitReader = bits_reader_init(@data[0], 2)
+
+    let initial: i64 = bits_available(@reader)
+    if initial != 16
+        print(c"FAIL: test_bits_available - initial\n")
+        return 1
+
+    bits_read(@reader, 5)
+    let after5: i64 = bits_available(@reader)
+    if after5 != 11
+        print(c"FAIL: test_bits_available - after 5 bits\n")
+        return 1
+    0
+
+
+# ============================================================================
+# Safe Functions - Bounds Checking Tests
+# ============================================================================
+
+[[test]]
+fn test_bits_read_safe_success() -> i32
+    var data: [2]u8
+    data[0] = 0x34
+    data[1] = 0x12
+    var reader: BitReader = bits_reader_init(@data[0], 2)
+
+    let result: i64 = bits_read_safe(@reader, 16)
+    if result != 0x1234
+        print(c"FAIL: test_bits_read_safe_success - got ")
+        print_int(result)
+        print(c" expected 4660\n")
+        return 1
+    0
+
+
+[[test]]
+fn test_bits_read_safe_overflow() -> i32
+    var data: [1]u8
+    data[0] = 0xFF
+    var reader: BitReader = bits_reader_init(@data[0], 1)
+
+    # Try to read 16 bits from 8-bit buffer -> should fail
+    let result: i64 = bits_read_safe(@reader, 16)
+    if result != -1
+        print(c"FAIL: test_bits_read_safe_overflow - expected -1\n")
+        return 1
+    0
+
+
+[[test]]
+fn test_bits_read_safe_negative_n() -> i32
+    var data: [1]u8
+    data[0] = 0xFF
+    var reader: BitReader = bits_reader_init(@data[0], 1)
+
+    let result: i64 = bits_read_safe(@reader, -1)
+    if result != -1
+        print(c"FAIL: test_bits_read_safe_negative_n - expected -1\n")
+        return 1
+    0
+
+
+[[test]]
+fn test_bits_read_safe_too_many_bits() -> i32
+    var data: [8]u8 = [0xFF; 8]
+    var reader: BitReader = bits_reader_init(@data[0], 8)
+
+    # n > 32 should fail
+    let result: i64 = bits_read_safe(@reader, 33)
+    if result != -1
+        print(c"FAIL: test_bits_read_safe_too_many_bits - expected -1\n")
+        return 1
+    0
+
+
+[[test]]
+fn test_bits_peek_safe_success() -> i32
+    var data: [1]u8
+    data[0] = 0xAB
+    var reader: BitReader = bits_reader_init(@data[0], 1)
+
+    let result: i64 = bits_peek_safe(@reader, 8)
+    if result != 0xAB
+        print(c"FAIL: test_bits_peek_safe_success\n")
+        return 1
+
+    # Position should not change
+    let avail: i64 = bits_available(@reader)
+    if avail != 8
+        print(c"FAIL: test_bits_peek_safe_success - position changed\n")
+        return 1
+    0
+
+
+[[test]]
+fn test_bits_peek_safe_overflow() -> i32
+    var data: [1]u8
+    data[0] = 0xFF
+    var reader: BitReader = bits_reader_init(@data[0], 1)
+
+    let result: i64 = bits_peek_safe(@reader, 16)
+    if result != -1
+        print(c"FAIL: test_bits_peek_safe_overflow - expected -1\n")
+        return 1
+    0
+
+
+[[test]]
+fn test_bits_skip_safe_success() -> i32
+    var data: [2]u8
+    data[0] = 0xAA
+    data[1] = 0xBB
+    var reader: BitReader = bits_reader_init(@data[0], 2)
+
+    let result: i32 = bits_skip_safe(@reader, 8)
+    if result != 0
+        print(c"FAIL: test_bits_skip_safe_success - expected 0\n")
+        return 1
+
+    let avail: i64 = bits_available(@reader)
+    if avail != 8
+        print(c"FAIL: test_bits_skip_safe_success - wrong position\n")
+        return 1
+    0
+
+
+[[test]]
+fn test_bits_skip_safe_overflow() -> i32
+    var data: [1]u8
+    data[0] = 0xFF
+    var reader: BitReader = bits_reader_init(@data[0], 1)
+
+    let result: i32 = bits_skip_safe(@reader, 16)
+    if result != -1
+        print(c"FAIL: test_bits_skip_safe_overflow - expected -1\n")
+        return 1
+
+    # Position should not change on failure
+    let avail: i64 = bits_available(@reader)
+    if avail != 8
+        print(c"FAIL: test_bits_skip_safe_overflow - position changed\n")
+        return 1
+    0
+
+
+[[test]]
+fn test_bits_at_end() -> i32
+    var data: [1]u8
+    data[0] = 0xFF
+    var reader: BitReader = bits_reader_init(@data[0], 1)
+
+    # Should not be at end initially
+    let avail1: i64 = bits_available(@reader)
+    if avail1 <= 0
+        print(c"FAIL: test_bits_at_end - should not be at end\n")
+        return 1
+
+    bits_read(@reader, 8)  # Read all bits
+
+    # Now should be at end
+    if bits_at_end(@reader) != true
+        print(c"FAIL: test_bits_at_end - should be at end\n")
+        return 1
+    0
+
+
+[[test]]
+fn test_bits_write_safe_success() -> i32
+    var buf: [8]u8 = [0; 8]
+    var writer: BitWriter = bits_writer_init(@buf[0], 8)
+
+    let result: i32 = bits_write_safe(@writer, 0x1234, 16)
+    if result != 0
+        print(c"FAIL: test_bits_write_safe_success - expected 0\n")
+        return 1
+
+    bits_flush(@writer)
+    if buf[0] != 0x34
+        print(c"FAIL: test_bits_write_safe_success - wrong data buf[0]\n")
+        return 1
+    if buf[1] != 0x12
+        print(c"FAIL: test_bits_write_safe_success - wrong data buf[1]\n")
+        return 1
+    0
+
+
+[[test]]
+fn test_bits_write_safe_overflow() -> i32
+    var buf: [1]u8 = [0; 1]
+    var writer: BitWriter = bits_writer_init(@buf[0], 1)
+
+    # Try to write 16 bits to 1-byte buffer -> should fail
+    let result: i32 = bits_write_safe(@writer, 0xFFFF, 16)
+    if result != -1
+        print(c"FAIL: test_bits_write_safe_overflow - expected -1\n")
+        return 1
+    0
+
+
+[[test]]
+fn test_bits_write_safe_negative_n() -> i32
+    var buf: [8]u8 = [0; 8]
+    var writer: BitWriter = bits_writer_init(@buf[0], 8)
+
+    let result: i32 = bits_write_safe(@writer, 0, -1)
+    if result != -1
+        print(c"FAIL: test_bits_write_safe_negative_n - expected -1\n")
+        return 1
+    0
+
+
+[[test]]
+fn test_bits_capacity_remaining() -> i32
+    var buf: [8]u8 = [0; 8]
+    var writer: BitWriter = bits_writer_init(@buf[0], 8)
+
+    let initial: i64 = bits_capacity_remaining(@writer)
+    if initial != 8
+        print(c"FAIL: test_bits_capacity_remaining - initial\n")
+        return 1
+
+    bits_write(@writer, 0xFF, 8)  # Write one byte
+    bits_flush(@writer)
+
+    let after1: i64 = bits_capacity_remaining(@writer)
+    if after1 != 7
+        print(c"FAIL: test_bits_capacity_remaining - after 1 byte\n")
+        return 1
+    0
+
+
+[[test]]
+fn test_bits_flush_safe_success() -> i32
+    var buf: [8]u8 = [0; 8]
+    var writer: BitWriter = bits_writer_init(@buf[0], 8)
+
+    bits_write(@writer, 5, 3)  # Partial byte
+    let result: i32 = bits_flush_safe(@writer)
+    if result != 0
+        print(c"FAIL: test_bits_flush_safe_success - expected 0\n")
+        return 1
+    0
+
+
+# Note: Tests are automatically discovered and run by ritzunit.
+# Each @test function is found via ELF symbol table scanning.

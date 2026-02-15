@@ -1,0 +1,494 @@
+# test/test_zlib_stream.ritz - Streaming Zlib compression/decompression tests
+#
+# Tests for the streaming API:
+# - ZlibWriter: init/write/flush/finish/free
+# - ZlibReader: init/read/finish/free
+#
+# Zlib uses Adler-32 instead of CRC32 (like gzip)
+
+import ritzlib.sys
+import ritzlib.io
+
+import lib.zlib
+import lib.zlib_stream
+
+
+# ============================================================================
+# ZlibWriter Tests
+# ============================================================================
+
+[[test]]
+fn test_zlib_writer_init() -> i32
+    # Test that ZlibWriter initializes correctly
+    var writer: ZlibWriter
+    let result: i32 = zlib_writer_init(@writer, 6)
+
+    if result != 0
+        print(c"zlib_writer_init failed: ")
+        print_i64(result as i64)
+        print(c"\n")
+        return 1
+
+    zlib_writer_free(@writer)
+    return 0
+
+
+[[test]]
+fn test_zlib_writer_simple() -> i32
+    # Compress "hello" in one write call
+    var writer: ZlibWriter
+    zlib_writer_init(@writer, 6)
+
+    var input: [5]u8 = ['h', 'e', 'l', 'l', 'o']
+    var output: [128]u8
+    var out_pos: i64 = 0
+
+    # Write data
+    let write_result: i64 = zlib_writer_write(@writer, @input[0], 5, @output[0], 128)
+    if write_result < 0
+        print(c"zlib_writer_write failed: ")
+        print_i64(write_result)
+        print(c"\n")
+        zlib_writer_free(@writer)
+        return 1
+    out_pos = out_pos + write_result
+
+    # Finish compression
+    let finish_result: i64 = zlib_writer_finish(@writer, @output[out_pos], 128 - out_pos)
+    if finish_result < 0
+        print(c"zlib_writer_finish failed: ")
+        print_i64(finish_result)
+        print(c"\n")
+        zlib_writer_free(@writer)
+        return 1
+    out_pos = out_pos + finish_result
+
+    # Verify by decompressing
+    var decompressed: [64]u8
+    let decomp_len: i64 = zlib_decompress(@output[0], out_pos, @decompressed[0], 64)
+
+    if decomp_len != 5
+        print(c"Decompressed length mismatch: ")
+        print_i64(decomp_len)
+        print(c"\n")
+        zlib_writer_free(@writer)
+        return 1
+
+    # Verify content
+    for i in 0..5
+        if decompressed[i] != input[i]
+            print(c"Content mismatch at position ")
+            print_i64(i)
+            print(c"\n")
+            zlib_writer_free(@writer)
+            return 1
+
+    zlib_writer_free(@writer)
+    return 0
+
+
+[[test]]
+fn test_zlib_writer_multiple_writes() -> i32
+    # Compress "hello world" in three separate writes
+    var writer: ZlibWriter
+    zlib_writer_init(@writer, 6)
+
+    var output: [256]u8
+    var out_pos: i64 = 0
+
+    # Write "hello"
+    var part1: [5]u8 = ['h', 'e', 'l', 'l', 'o']
+    let r1: i64 = zlib_writer_write(@writer, @part1[0], 5, @output[out_pos], 256 - out_pos)
+    if r1 < 0
+        print(c"Write 1 failed\n")
+        zlib_writer_free(@writer)
+        return 1
+    out_pos = out_pos + r1
+
+    # Write " "
+    var part2: [1]u8 = [' ']
+    let r2: i64 = zlib_writer_write(@writer, @part2[0], 1, @output[out_pos], 256 - out_pos)
+    if r2 < 0
+        print(c"Write 2 failed\n")
+        zlib_writer_free(@writer)
+        return 1
+    out_pos = out_pos + r2
+
+    # Write "world"
+    var part3: [5]u8 = ['w', 'o', 'r', 'l', 'd']
+    let r3: i64 = zlib_writer_write(@writer, @part3[0], 5, @output[out_pos], 256 - out_pos)
+    if r3 < 0
+        print(c"Write 3 failed\n")
+        zlib_writer_free(@writer)
+        return 1
+    out_pos = out_pos + r3
+
+    # Finish
+    let rf: i64 = zlib_writer_finish(@writer, @output[out_pos], 256 - out_pos)
+    if rf < 0
+        print(c"Finish failed\n")
+        zlib_writer_free(@writer)
+        return 1
+    out_pos = out_pos + rf
+
+    # Verify by decompressing
+    var decompressed: [64]u8
+    let decomp_len: i64 = zlib_decompress(@output[0], out_pos, @decompressed[0], 64)
+
+    if decomp_len != 11
+        print(c"Decompressed length mismatch: ")
+        print_i64(decomp_len)
+        print(c"\n")
+        zlib_writer_free(@writer)
+        return 1
+
+    # Verify content "hello world"
+    var expected: [11]u8 = ['h', 'e', 'l', 'l', 'o', ' ', 'w', 'o', 'r', 'l', 'd']
+    for i in 0..11
+        if decompressed[i] != expected[i]
+            print(c"Content mismatch at position ")
+            print_i64(i)
+            print(c"\n")
+            zlib_writer_free(@writer)
+            return 1
+
+    zlib_writer_free(@writer)
+    return 0
+
+
+[[test]]
+fn test_zlib_writer_flush() -> i32
+    # Test flush produces valid partial output
+    var writer: ZlibWriter
+    zlib_writer_init(@writer, 6)
+
+    var output: [256]u8
+    var out_pos: i64 = 0
+
+    # Write some data
+    var part1: [5]u8 = ['h', 'e', 'l', 'l', 'o']
+    let r1: i64 = zlib_writer_write(@writer, @part1[0], 5, @output[out_pos], 256 - out_pos)
+    out_pos = out_pos + r1
+
+    # Flush - should produce some output
+    let flush_result: i64 = zlib_writer_flush(@writer, @output[out_pos], 256 - out_pos)
+    if flush_result < 0
+        print(c"Flush failed: ")
+        print_i64(flush_result)
+        print(c"\n")
+        zlib_writer_free(@writer)
+        return 1
+    out_pos = out_pos + flush_result
+
+    # Write more data
+    var part2: [5]u8 = ['w', 'o', 'r', 'l', 'd']
+    let r2: i64 = zlib_writer_write(@writer, @part2[0], 5, @output[out_pos], 256 - out_pos)
+    out_pos = out_pos + r2
+
+    # Finish
+    let rf: i64 = zlib_writer_finish(@writer, @output[out_pos], 256 - out_pos)
+    out_pos = out_pos + rf
+
+    # Verify by decompressing
+    var decompressed: [64]u8
+    let decomp_len: i64 = zlib_decompress(@output[0], out_pos, @decompressed[0], 64)
+
+    if decomp_len != 10
+        print(c"Decompressed length mismatch: ")
+        print_i64(decomp_len)
+        print(c"\n")
+        zlib_writer_free(@writer)
+        return 1
+
+    zlib_writer_free(@writer)
+    return 0
+
+
+[[test]]
+fn test_zlib_writer_empty() -> i32
+    # Compress empty input
+    var writer: ZlibWriter
+    zlib_writer_init(@writer, 6)
+
+    var output: [128]u8
+
+    # Finish immediately (no writes)
+    let rf: i64 = zlib_writer_finish(@writer, @output[0], 128)
+    if rf < 0
+        print(c"Finish failed: ")
+        print_i64(rf)
+        print(c"\n")
+        zlib_writer_free(@writer)
+        return 1
+
+    # Verify by decompressing
+    var decompressed: [64]u8
+    let decomp_len: i64 = zlib_decompress(@output[0], rf, @decompressed[0], 64)
+
+    if decomp_len != 0
+        print(c"Expected 0 bytes, got ")
+        print_i64(decomp_len)
+        print(c"\n")
+        zlib_writer_free(@writer)
+        return 1
+
+    zlib_writer_free(@writer)
+    return 0
+
+
+[[test]]
+fn test_zlib_writer_large_input() -> i32
+    # Compress 1KB of data in chunks
+    var writer: ZlibWriter
+    zlib_writer_init(@writer, 6)
+
+    var input: [1024]u8
+    for i in 0..1024
+        input[i] = (i % 256) as u8
+
+    var output: [2048]u8
+    var out_pos: i64 = 0
+
+    # Write in 256-byte chunks
+    for chunk in 0..4
+        let start: i64 = chunk * 256
+        let cap: i64 = 2048 - out_pos
+        let r: i64 = zlib_writer_write(@writer, @input[start], 256, @output[out_pos], cap)
+        if r < 0
+            print(c"Write chunk failed\n")
+            zlib_writer_free(@writer)
+            return 1
+        out_pos = out_pos + r
+
+    # Finish
+    let rf: i64 = zlib_writer_finish(@writer, @output[out_pos], 2048 - out_pos)
+    if rf < 0
+        print(c"Finish failed\n")
+        zlib_writer_free(@writer)
+        return 1
+    out_pos = out_pos + rf
+
+    # Verify by decompressing
+    var decompressed: [2048]u8
+    let decomp_len: i64 = zlib_decompress(@output[0], out_pos, @decompressed[0], 2048)
+
+    if decomp_len != 1024
+        print(c"Decompressed length mismatch: ")
+        print_i64(decomp_len)
+        print(c"\n")
+        zlib_writer_free(@writer)
+        return 1
+
+    # Verify content
+    for i in 0..1024
+        if decompressed[i] != input[i]
+            print(c"Content mismatch at position ")
+            print_i64(i)
+            print(c"\n")
+            zlib_writer_free(@writer)
+            return 1
+
+    zlib_writer_free(@writer)
+    return 0
+
+
+# ============================================================================
+# ZlibReader Tests
+# ============================================================================
+
+[[test]]
+fn test_zlib_reader_init() -> i32
+    # Test that ZlibReader initializes correctly
+    var reader: ZlibReader
+    let result: i32 = zlib_reader_init(@reader)
+
+    if result != 0
+        print(c"zlib_reader_init failed: ")
+        print_i64(result as i64)
+        print(c"\n")
+        return 1
+
+    zlib_reader_free(@reader)
+    return 0
+
+
+[[test]]
+fn test_zlib_reader_simple() -> i32
+    # First compress "hello" then decompress with streaming reader
+    var input: [5]u8 = ['h', 'e', 'l', 'l', 'o']
+    var compressed: [64]u8
+    let comp_len: i64 = zlib_compress(@input[0], 5, @compressed[0], 64)
+
+    if comp_len < 0
+        print(c"Initial compression failed\n")
+        return 1
+
+    var reader: ZlibReader
+    zlib_reader_init(@reader)
+
+    var output: [64]u8
+    let result: i64 = zlib_reader_read(@reader, @compressed[0], comp_len, @output[0], 64)
+    if result < 0
+        print(c"zlib_reader_read failed: ")
+        print_i64(result)
+        print(c"\n")
+        zlib_reader_free(@reader)
+        return 1
+
+    let finish_result: i32 = zlib_reader_finish(@reader)
+    if finish_result != 0
+        print(c"zlib_reader_finish failed: ")
+        print_i64(finish_result as i64)
+        print(c"\n")
+        zlib_reader_free(@reader)
+        return 1
+
+    # Check decompressed length from reader.total_out (set by finish)
+    if reader.total_out != 5
+        print(c"Decompressed length mismatch: ")
+        print_i64(reader.total_out)
+        print(c"\n")
+        zlib_reader_free(@reader)
+        return 1
+
+    # Verify content
+    for i in 0..5
+        if output[i] != input[i]
+            print(c"Content mismatch at position ")
+            print_i64(i)
+            print(c"\n")
+            zlib_reader_free(@reader)
+            return 1
+
+    zlib_reader_free(@reader)
+    return 0
+
+
+[[test]]
+fn test_zlib_reader_chunked() -> i32
+    # Compress then decompress with chunked input
+    var input: [11]u8 = ['h', 'e', 'l', 'l', 'o', ' ', 'w', 'o', 'r', 'l', 'd']
+    var compressed: [64]u8
+    let comp_len: i64 = zlib_compress(@input[0], 11, @compressed[0], 64)
+
+    if comp_len < 0
+        print(c"Initial compression failed\n")
+        return 1
+
+    var reader: ZlibReader
+    zlib_reader_init(@reader)
+
+    var output: [64]u8
+    var out_pos: i64 = 0
+    var in_pos: i64 = 0
+
+    # Feed in small chunks (3 bytes at a time)
+    while in_pos < comp_len
+        var chunk_len: i64 = 3
+        if in_pos + chunk_len > comp_len
+            chunk_len = comp_len - in_pos
+
+        let cap: i64 = 64 - out_pos
+        let src: *u8 = @compressed[in_pos]
+        let dst: *u8 = @output[out_pos]
+        let result: i64 = zlib_reader_read(@reader, src, chunk_len, dst, cap)
+        if result < 0
+            print(c"zlib_reader_read failed at pos ")
+            print_i64(in_pos)
+            print(c": ")
+            print_i64(result)
+            print(c"\n")
+            zlib_reader_free(@reader)
+            return 1
+        out_pos = out_pos + result
+        in_pos = in_pos + chunk_len
+
+    # Finish - this is where decompression happens
+    let finish_result: i32 = zlib_reader_finish(@reader)
+    if finish_result != 0
+        print(c"zlib_reader_finish failed, code=")
+        print_i64(finish_result as i64)
+        print(c" adler=")
+        print_hex(reader.adler as i64)
+        print(c" expected=")
+        print_hex(reader.expected_adler as i64)
+        print(c"\n")
+        zlib_reader_free(@reader)
+        return 1
+
+    # Check decompressed length from reader.total_out (set by finish)
+    if reader.total_out != 11
+        print(c"Decompressed length mismatch: ")
+        print_i64(reader.total_out)
+        print(c"\n")
+        zlib_reader_free(@reader)
+        return 1
+
+    zlib_reader_free(@reader)
+    return 0
+
+
+[[test]]
+fn test_zlib_roundtrip_streaming() -> i32
+    # Full round-trip: stream compress then stream decompress
+    var input: [43]u8 = [
+        'T', 'h', 'e', ' ', 'q', 'u', 'i', 'c', 'k', ' ',
+        'b', 'r', 'o', 'w', 'n', ' ', 'f', 'o', 'x', ' ',
+        'j', 'u', 'm', 'p', 's', ' ', 'o', 'v', 'e', 'r',
+        ' ', 't', 'h', 'e', ' ', 'l', 'a', 'z', 'y', ' ',
+        'd', 'o', 'g'
+    ]
+
+    # Compress
+    var writer: ZlibWriter
+    zlib_writer_init(@writer, 6)
+
+    var compressed: [256]u8
+    var comp_pos: i64 = 0
+
+    # Write in two chunks
+    let r1: i64 = zlib_writer_write(@writer, @input[0], 20, @compressed[comp_pos], 256 - comp_pos)
+    comp_pos = comp_pos + r1
+    let r2: i64 = zlib_writer_write(@writer, @input[20], 23, @compressed[comp_pos], 256 - comp_pos)
+    comp_pos = comp_pos + r2
+    let rf: i64 = zlib_writer_finish(@writer, @compressed[comp_pos], 256 - comp_pos)
+    comp_pos = comp_pos + rf
+    zlib_writer_free(@writer)
+
+    # Decompress
+    var reader: ZlibReader
+    zlib_reader_init(@reader)
+
+    var decompressed: [64]u8
+    let src: *u8 = @compressed[0]
+    let dst: *u8 = @decompressed[0]
+    let decomp_result: i64 = zlib_reader_read(@reader, src, comp_pos, dst, 64)
+    if decomp_result < 0
+        print(c"Decompression failed\n")
+        zlib_reader_free(@reader)
+        return 1
+
+    let finish: i32 = zlib_reader_finish(@reader)
+    if finish != 0
+        print(c"Finish failed\n")
+        zlib_reader_free(@reader)
+        return 1
+
+    if reader.total_out != 43
+        print(c"Length mismatch: ")
+        print_i64(reader.total_out)
+        print(c"\n")
+        zlib_reader_free(@reader)
+        return 1
+
+    # Verify content
+    for i in 0..43
+        if decompressed[i] != input[i]
+            print(c"Content mismatch at position ")
+            print_i64(i)
+            print(c"\n")
+            zlib_reader_free(@reader)
+            return 1
+
+    zlib_reader_free(@reader)
+    return 0

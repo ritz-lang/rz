@@ -1,0 +1,374 @@
+# ritzunit/src/filter.ritz - Test filter expressions
+#
+# Supports:
+#   - Substring matching (default): "add" matches "test_add_item"
+#   - Glob patterns: "test_add*" matches "test_add_item", "test_add_multiple"
+#   - Suite::test syntax: "inventory::test_add" matches specific suite tests
+#   - Boolean expressions: "test_add* and not *slow*", "test_a or test_b"
+#
+# Glob pattern syntax:
+#   *     - matches any sequence of characters (except ::)
+#   ?     - matches any single character
+#   [abc] - matches any character in brackets (not implemented yet)
+#
+# Boolean operators (case-sensitive, must be surrounded by spaces):
+#   and   - both expressions must match
+#   or    - either expression must match
+#   not   - negate the following expression
+#
+# Attribute markers (based on naming convention):
+#   @ignore - matches tests with "ignore" in name (test_ignore_*, *_ignore_*)
+#   @slow   - matches tests with "slow" in name (test_slow_*, *_slow_*)
+#   @skip   - alias for @ignore
+#   @fast   - matches tests NOT marked as @slow
+
+import ritzlib.strview
+
+# ============================================================================
+# Filter Expression Types
+# ============================================================================
+
+# Filter type constants
+const FILTER_NONE: i32 = 0       # No filter (match all)
+const FILTER_SUBSTRING: i32 = 1  # Simple substring match
+const FILTER_GLOB: i32 = 2       # Glob pattern (* and ?)
+const FILTER_SUITE: i32 = 3      # suite::test syntax
+const FILTER_BOOL: i32 = 4       # Boolean expression (and, or, not)
+const FILTER_ATTR: i32 = 5       # Attribute filter (@ignore, @slow, etc.)
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+# Check if a character is a space
+fn is_space(c: u8) -> i32
+    return (c == ' ' || c == '\t') as i32
+
+# Check if StrView starts with a keyword followed by space or end
+fn starts_with_keyword(s: @StrView, keyword: @StrView) -> i32
+    if s.len < keyword.len
+        return 0
+    # Check prefix matches
+    if strview_starts_with(s, keyword) == 0
+        return 0
+    # Check next char is space or end
+    if s.len == keyword.len
+        return 1
+    let next: u8 = strview_get(s, keyword.len)
+    return is_space(next)
+
+# Find keyword in StrView (must be surrounded by spaces or at boundaries)
+# Returns position or -1
+fn find_keyword(s: @StrView, keyword: @StrView) -> i64
+    var pos: i64 = 0
+    while pos <= s.len - keyword.len
+        # Check if previous char is space or start
+        if pos > 0
+            let prev: u8 = strview_get(s, pos - 1)
+            if is_space(prev) == 0
+                pos += 1
+                continue
+
+        # Check keyword matches at this position
+        var sub: StrView = strview_slice(s, pos, pos + keyword.len)
+        if strview_eq(@sub, keyword) != 0
+            # Check next char is space or end
+            if pos + keyword.len >= s.len
+                return pos
+            let next: u8 = strview_get(s, pos + keyword.len)
+            if is_space(next) != 0
+                return pos
+
+        pos += 1
+
+    return -1
+
+# Find " and " in StrView
+fn find_and(s: @StrView) -> i64
+    var kw: StrView = strview_from_cstr(c"and")
+    return find_keyword(s, @kw)
+
+# Find " or " in StrView
+fn find_or(s: @StrView) -> i64
+    var kw: StrView = strview_from_cstr(c"or")
+    return find_keyword(s, @kw)
+
+# Check if StrView starts with "not " (after trimming)
+fn starts_with_not(s: @StrView) -> i32
+    var trimmed: StrView = strview_trim_start(s)
+    var kw: StrView = strview_from_cstr(c"not")
+    return starts_with_keyword(@trimmed, @kw)
+
+# Check if pattern contains boolean operators
+fn has_bool_operators(pattern: @StrView) -> i32
+    if find_and(pattern) >= 0
+        return 1
+    if find_or(pattern) >= 0
+        return 1
+    if starts_with_not(pattern) != 0
+        return 1
+    return 0
+
+# Check if pattern contains glob characters
+fn has_glob_chars(pattern: @StrView) -> i32
+    if strview_find_byte(pattern, '*') >= 0
+        return 1
+    if strview_find_byte(pattern, '?') >= 0
+        return 1
+    return 0
+
+# Check if pattern contains :: (suite separator)
+fn has_suite_separator(pattern: @StrView) -> i32
+    # Look for ':' and check if next char is also ':'
+    var pos: i64 = 0
+    while pos < pattern.len - 1
+        if strview_get(pattern, pos) == ':' && strview_get(pattern, pos + 1) == ':'
+            return 1
+        pos += 1
+    return 0
+
+# ============================================================================
+# Attribute Matching
+# ============================================================================
+# Attributes are detected by naming convention: test_slow_*, *_ignore_*, etc.
+
+# Check if pattern is an attribute (starts with @)
+fn is_attribute(pattern: @StrView) -> i32
+    var trimmed: StrView = strview_trim_start(pattern)
+    if trimmed.len == 0
+        return 0
+    return (strview_get(@trimmed, 0) == '@') as i32
+
+# Check if test name contains a substring
+fn contains_substring(haystack: @StrView, needle: @StrView) -> i32
+    return (strview_find(haystack, needle) >= 0) as i32
+
+# Match an attribute against a test name
+# @ignore - matches tests with "ignore" in name
+# @slow   - matches tests with "slow" in name
+# @skip   - alias for @ignore
+# @fast   - matches tests NOT marked as @slow
+fn match_attribute(attr: @StrView, test_name: @StrView) -> i32
+    # Skip leading whitespace and @
+    var trimmed: StrView = strview_trim_start(attr)
+    if trimmed.len > 0 && strview_get(@trimmed, 0) == '@'
+        trimmed = strview_skip(@trimmed, 1)
+
+    # @ignore or @skip
+    if strview_starts_with_cstr(@trimmed, c"ignore") != 0 || strview_starts_with_cstr(@trimmed, c"skip") != 0
+        var needle: StrView = strview_from_cstr(c"ignore")
+        return contains_substring(test_name, @needle)
+
+    # @slow
+    if strview_starts_with_cstr(@trimmed, c"slow") != 0
+        var needle: StrView = strview_from_cstr(c"slow")
+        return contains_substring(test_name, @needle)
+
+    # @fast = not slow
+    if strview_starts_with_cstr(@trimmed, c"fast") != 0
+        var needle: StrView = strview_from_cstr(c"slow")
+        return (contains_substring(test_name, @needle) == 0) as i32
+
+    # Unknown attribute - no match
+    return 0
+
+# ============================================================================
+# Glob Pattern Matching
+# ============================================================================
+
+# Check if a string matches a glob pattern.
+# Supports * (any chars) and ? (single char).
+# Returns 1 if match, 0 otherwise.
+pub fn glob_match(pattern: @StrView, text: @StrView) -> i32
+    var p: i64 = 0  # pattern index
+    var t: i64 = 0  # text index
+    var star_p: i64 = -1  # position of last * in pattern
+    var star_t: i64 = -1  # position in text when * was matched
+
+    while t < text.len
+        var pc: u8 = 0
+        if p < pattern.len
+            pc = strview_get(pattern, p)
+        let tc: u8 = strview_get(text, t)
+
+        if pc == '*'
+            # Star: remember position and skip
+            star_p = p
+            star_t = t
+            p += 1
+        else if pc == '?' || pc == tc
+            # Match single char
+            p += 1
+            t += 1
+        else if star_p >= 0
+            # Backtrack: try matching one more char with *
+            p = star_p + 1
+            star_t += 1
+            t = star_t
+        else
+            # No match
+            return 0
+
+    # Skip trailing stars in pattern
+    while p < pattern.len && strview_get(pattern, p) == '*'
+        p += 1
+
+    # Match if we consumed entire pattern
+    return (p >= pattern.len) as i32
+
+# ============================================================================
+# Suite::Test Pattern Matching
+# ============================================================================
+
+# Match "suite::test" pattern against test name.
+# Suite is extracted from test path/file, test is matched against name.
+# For now, we match the test part against the full test name.
+fn match_suite_pattern(pattern: @StrView, test_name: @StrView) -> i32
+    # Find :: separator
+    var sep_pos: i64 = -1
+    var i: i64 = 0
+    while i < pattern.len - 1
+        if strview_get(pattern, i) == ':' && strview_get(pattern, i + 1) == ':'
+            sep_pos = i
+            break
+        i += 1
+
+    if sep_pos < 0
+        # No separator found, treat as substring
+        return contains_substring(test_name, pattern)
+
+    # Get test part (after ::)
+    var test_pattern: StrView = strview_skip(pattern, sep_pos + 2)
+
+    # For now, just match the test part as a glob or substring
+    if has_glob_chars(@test_pattern) != 0
+        return glob_match(@test_pattern, test_name)
+
+    # Substring match
+    return contains_substring(test_name, @test_pattern)
+
+# ============================================================================
+# Boolean Expression Support
+# ============================================================================
+
+# Match a simple pattern (not a boolean expr) against test name
+fn match_simple_pattern(pattern: @StrView, test_name: @StrView) -> i32
+    # Trim whitespace
+    var trimmed: StrView = strview_trim(pattern)
+
+    if trimmed.len == 0
+        return 1  # Empty pattern matches all
+
+    # Check for attribute
+    if is_attribute(@trimmed) != 0
+        return match_attribute(@trimmed, test_name)
+
+    # Determine type and match
+    if has_glob_chars(@trimmed) != 0
+        return glob_match(@trimmed, test_name)
+    if has_suite_separator(@trimmed) != 0
+        return match_suite_pattern(@trimmed, test_name)
+
+    # Substring match
+    return contains_substring(test_name, @trimmed)
+
+# Match boolean expression against test name (recursive)
+pub fn match_bool_expr(pattern: @StrView, test_name: @StrView) -> i32
+    if pattern.len == 0
+        return 1
+
+    # Check for "or" first (lowest precedence)
+    let or_pos: i64 = find_or(pattern)
+    if or_pos >= 0
+        var left: StrView = strview_slice(pattern, 0, or_pos)
+        var right: StrView = strview_skip(pattern, or_pos + 2)  # skip "or"
+        if match_bool_expr(@left, test_name) != 0
+            return 1
+        return match_bool_expr(@right, test_name)
+
+    # Check for "and" (higher precedence than or)
+    let and_pos: i64 = find_and(pattern)
+    if and_pos >= 0
+        var left: StrView = strview_slice(pattern, 0, and_pos)
+        var right: StrView = strview_skip(pattern, and_pos + 3)  # skip "and"
+        if match_bool_expr(@left, test_name) == 0
+            return 0
+        return match_bool_expr(@right, test_name)
+
+    # Check for "not" prefix (highest precedence)
+    if starts_with_not(pattern) != 0
+        var trimmed: StrView = strview_trim_start(pattern)
+        var rest: StrView = strview_skip(@trimmed, 3)  # skip "not"
+        return (match_bool_expr(@rest, test_name) == 0) as i32
+
+    # No boolean operators - match as simple pattern
+    return match_simple_pattern(pattern, test_name)
+
+# ============================================================================
+# Filter Type Detection
+# ============================================================================
+
+# Determine filter type from pattern
+pub fn filter_type_sv(pattern: @StrView) -> i32
+    if pattern.len == 0
+        return FILTER_NONE
+    if has_bool_operators(pattern) != 0
+        return FILTER_BOOL
+    if is_attribute(pattern) != 0
+        return FILTER_ATTR
+    if has_suite_separator(pattern) != 0
+        return FILTER_SUITE
+    if has_glob_chars(pattern) != 0
+        return FILTER_GLOB
+    return FILTER_SUBSTRING
+
+# ============================================================================
+# Main Filter Matching
+# ============================================================================
+
+# Match a test name against a filter pattern (StrView version).
+# Returns 1 if match, 0 otherwise.
+pub fn filter_match_sv(pattern: @StrView, test_name: @StrView) -> i32
+    if pattern.len == 0
+        return 1  # No filter = match all
+
+    let ftype: i32 = filter_type_sv(pattern)
+
+    if ftype == FILTER_NONE
+        return 1
+
+    if ftype == FILTER_BOOL
+        return match_bool_expr(pattern, test_name)
+
+    if ftype == FILTER_ATTR
+        return match_attribute(pattern, test_name)
+
+    if ftype == FILTER_SUBSTRING
+        return contains_substring(test_name, pattern)
+
+    if ftype == FILTER_GLOB
+        return glob_match(pattern, test_name)
+
+    if ftype == FILTER_SUITE
+        return match_suite_pattern(pattern, test_name)
+
+    return 0
+
+# ============================================================================
+# Legacy API (for compatibility with *u8 callers)
+# ============================================================================
+
+# Convert *u8 to StrView and delegate
+pub fn filter_match(pattern: *u8, test_name: *u8) -> i32
+    if pattern == null
+        return 1  # No filter = match all
+
+    var pat_sv: StrView = strview_from_cstr(pattern)
+    var name_sv: StrView = strview_from_cstr(test_name)
+    return filter_match_sv(@pat_sv, @name_sv)
+
+pub fn filter_type(pattern: *u8) -> i32
+    if pattern == null
+        return FILTER_NONE
+    var pat_sv: StrView = strview_from_cstr(pattern)
+    return filter_type_sv(@pat_sv)

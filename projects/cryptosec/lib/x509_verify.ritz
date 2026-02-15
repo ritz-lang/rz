@@ -1,0 +1,317 @@
+# lib/x509_verify.ritz - X.509 Certificate Chain Validation
+#
+# Implements certificate signature verification and chain validation
+# for TLS 1.3 server certificate verification.
+#
+# References:
+# - RFC 5280 (X.509 PKI Certificate and CRL Profile)
+# - RFC 6125 (Hostname Verification)
+
+import x509
+import asn1
+import mem
+import rsa
+import sha256
+import sha512
+
+# ============================================================================
+# Signature Verification
+# ============================================================================
+
+# Verify certificate signature using issuer's public key
+# Returns: 1 if valid, 0 if invalid
+pub fn x509_verify_signature(cert: *X509Certificate, issuer_key: *X509PublicKey) -> i32
+    # Check that we have TBS data and signature
+    if cert.tbs_data == null
+        return 0
+    if cert.tbs_len == 0
+        return 0
+    if cert.signature_len == 0
+        return 0
+
+    # Verify based on signature algorithm
+    if cert.sig_algorithm == SIG_ALG_SHA256_RSA
+        return x509_verify_rsa_sha256(cert, issuer_key)
+
+    if cert.sig_algorithm == SIG_ALG_SHA384_RSA
+        return x509_verify_rsa_sha384(cert, issuer_key)
+
+    if cert.sig_algorithm == SIG_ALG_SHA512_RSA
+        return x509_verify_rsa_sha512(cert, issuer_key)
+
+    # TODO: ECDSA and Ed25519 verification
+    # if cert.sig_algorithm == SIG_ALG_ECDSA_SHA256
+    #     return x509_verify_ecdsa_sha256(cert, issuer_key)
+    # if cert.sig_algorithm == SIG_ALG_ED25519
+    #     return x509_verify_ed25519(cert, issuer_key)
+
+    return 0  # Unknown or unsupported algorithm
+
+# Verify RSA-SHA256 signature
+fn x509_verify_rsa_sha256(cert: *X509Certificate, issuer_key: *X509PublicKey) -> i32
+    if issuer_key.algorithm != PUBKEY_TYPE_RSA
+        return 0
+
+    if issuer_key.key_len == 0
+        return 0
+
+    # Parse issuer's RSA public key from SubjectPublicKeyInfo
+    var rsa_key: RsaPublicKey
+    let parse_result: i32 = rsa_parse_public_key(&issuer_key.key_data[0], issuer_key.key_len as i32, &rsa_key)
+    if parse_result != 0
+        return 0
+
+    # Hash the TBS data
+    var hash: [32]u8
+    sha256(cert.tbs_data, cert.tbs_len as i64, &hash[0])
+
+    # Verify signature
+    return rsa_verify_pkcs1_sha256_hash(&rsa_key, &hash[0], &cert.signature[0], cert.signature_len as i32)
+
+# Verify RSA-SHA384 signature
+fn x509_verify_rsa_sha384(cert: *X509Certificate, issuer_key: *X509PublicKey) -> i32
+    if issuer_key.algorithm != PUBKEY_TYPE_RSA
+        return 0
+
+    if issuer_key.key_len == 0
+        return 0
+
+    var rsa_key: RsaPublicKey
+    let parse_result: i32 = rsa_parse_public_key(&issuer_key.key_data[0], issuer_key.key_len as i32, &rsa_key)
+    if parse_result != 0
+        return 0
+
+    var hash: [48]u8
+    sha384(cert.tbs_data, cert.tbs_len as i64, &hash[0])
+
+    return rsa_verify_pkcs1_sha384_hash(&rsa_key, &hash[0], &cert.signature[0], cert.signature_len as i32)
+
+# Verify RSA-SHA512 signature
+fn x509_verify_rsa_sha512(cert: *X509Certificate, issuer_key: *X509PublicKey) -> i32
+    if issuer_key.algorithm != PUBKEY_TYPE_RSA
+        return 0
+
+    if issuer_key.key_len == 0
+        return 0
+
+    var rsa_key: RsaPublicKey
+    let parse_result: i32 = rsa_parse_public_key(&issuer_key.key_data[0], issuer_key.key_len as i32, &rsa_key)
+    if parse_result != 0
+        return 0
+
+    var hash: [64]u8
+    sha512(cert.tbs_data, cert.tbs_len as i64, &hash[0])
+
+    return rsa_verify_pkcs1_sha512_hash(&rsa_key, &hash[0], &cert.signature[0], cert.signature_len as i32)
+
+# ============================================================================
+# Certificate Chain Validation
+# ============================================================================
+
+# Maximum chain depth
+const X509_MAX_CHAIN_DEPTH: i32 = 10
+
+# Verify a certificate chain
+# chain: array of certificate pointers, leaf first, root last
+# chain_len: number of certificates in chain
+# trusted_roots: array of trusted root CA certificates (can be null for TOFU)
+# roots_len: number of trusted roots
+# Returns: 1 if valid, 0 if invalid
+pub fn x509_verify_chain(chain: **X509Certificate, chain_len: i32, trusted_roots: **X509Certificate, roots_len: i32) -> i32
+    if chain_len == 0
+        return 0
+
+    if chain_len > X509_MAX_CHAIN_DEPTH
+        return 0
+
+    # Validate each certificate in the chain
+    var i: i32 = 0
+    while i < chain_len - 1
+        let cert: *X509Certificate = chain[i]
+        let issuer: *X509Certificate = chain[i + 1]
+
+        if cert == null || issuer == null
+            return 0
+
+        # Check that cert's issuer matches issuer's subject
+        if x509_is_issued_by(cert, issuer) != 1
+            return 0
+
+        # Verify cert's signature with issuer's public key
+        if x509_verify_signature(cert, &issuer.public_key) != 1
+            return 0
+
+        # Check that issuer is a CA (can sign certificates)
+        if issuer.is_ca != 1
+            # Allow if it's the last cert and is self-signed (root)
+            if i + 1 < chain_len - 1
+                return 0
+
+        i += 1
+
+    # Verify the root certificate
+    let root: *X509Certificate = chain[chain_len - 1]
+    if root == null
+        return 0
+
+    # Root should be self-signed
+    if x509_is_self_signed(root) != 1
+        # Not self-signed - need to find issuer in trusted roots
+        if trusted_roots == null || roots_len == 0
+            return 0
+
+        # Find issuer in trusted roots
+        var found: i32 = 0
+        var j: i32 = 0
+        while j < roots_len
+            let trusted: *X509Certificate = trusted_roots[j]
+            if trusted != null
+                if x509_is_issued_by(root, trusted) == 1
+                    if x509_verify_signature(root, &trusted.public_key) == 1
+                        found = 1
+                        break
+            j += 1
+
+        if found != 1
+            return 0
+    else
+        # Self-signed root - verify its own signature
+        if x509_verify_signature(root, &root.public_key) != 1
+            return 0
+
+        # Check if root is in trusted store (if provided)
+        if trusted_roots != null && roots_len > 0
+            var found: i32 = 0
+            var j: i32 = 0
+            while j < roots_len
+                let trusted: *X509Certificate = trusted_roots[j]
+                if trusted != null
+                    # Compare by subject DN
+                    if x509_name_equals(&root.subject, &trusted.subject) == 1
+                        found = 1
+                        break
+                j += 1
+
+            if found != 1
+                return 0
+
+    return 1
+
+# Verify a certificate chain with time checking
+pub fn x509_verify_chain_at_time(chain: **X509Certificate, chain_len: i32, trusted_roots: **X509Certificate, roots_len: i32, current_time: i64) -> i32
+    # First do basic chain validation
+    if x509_verify_chain(chain, chain_len, trusted_roots, roots_len) != 1
+        return 0
+
+    # Then check validity periods
+    var i: i32 = 0
+    while i < chain_len
+        let cert: *X509Certificate = chain[i]
+        if cert != null
+            if x509_is_valid_time(cert, current_time) != 1
+                return 0
+        i += 1
+
+    return 1
+
+# ============================================================================
+# Hostname Verification
+# ============================================================================
+
+# Convert ASCII character to lowercase
+fn to_lower(c: u8) -> u8
+    if c >= 0x41 && c <= 0x5a
+        return c + 32
+    return c
+
+# Case-insensitive byte comparison
+fn bytes_equal_ci(a: *u8, a_len: i32, b: *u8, b_len: i32) -> i32
+    if a_len != b_len
+        return 0
+
+    var i: i32 = 0
+    while i < a_len
+        if to_lower(a[i]) != to_lower(b[i])
+            return 0
+        i += 1
+
+    return 1
+
+# Find character in string, returns position or -1
+fn find_char(s: *u8, len: i32, c: u8) -> i32
+    var i: i32 = 0
+    while i < len
+        if s[i] == c
+            return i
+        i += 1
+    return -1
+
+# Match hostname against certificate name pattern
+# Supports wildcard matching (*.example.com)
+# Returns: 1 if matches, 0 if not
+pub fn x509_hostname_match(pattern: *u8, pattern_len: i32, hostname: *u8, hostname_len: i32) -> i32
+    if pattern_len == 0 || hostname_len == 0
+        return 0
+
+    # Check for wildcard pattern
+    if pattern_len >= 2 && pattern[0] == 0x2a && pattern[1] == 0x2e
+        # Wildcard: *.domain.com
+        # Must have at least one character before the dot in hostname
+        let hostname_dot: i32 = find_char(hostname, hostname_len, 0x2e)
+        if hostname_dot <= 0
+            return 0  # No dot or dot at start = no match
+
+        # The part after the wildcard must match exactly
+        let pattern_suffix: *u8 = &pattern[1]  # ".domain.com"
+        let pattern_suffix_len: i32 = pattern_len - 1
+
+        let hostname_suffix: *u8 = &hostname[hostname_dot]
+        let hostname_suffix_len: i32 = hostname_len - hostname_dot
+
+        return bytes_equal_ci(pattern_suffix, pattern_suffix_len, hostname_suffix, hostname_suffix_len)
+
+    # Exact match (case-insensitive)
+    return bytes_equal_ci(pattern, pattern_len, hostname, hostname_len)
+
+# Verify hostname against certificate
+# Checks SubjectAltName (dNSName) first, then falls back to CN
+# Returns: 1 if matches, 0 if not
+pub fn x509_verify_hostname(cert: *X509Certificate, hostname: *u8, hostname_len: i32) -> i32
+    # TODO: Parse SubjectAltName extension for dNSName entries
+    # For now, just check Common Name
+
+    if cert.subject.common_name_len == 0
+        return 0
+
+    return x509_hostname_match(&cert.subject.common_name[0], cert.subject.common_name_len as i32, hostname, hostname_len)
+
+# ============================================================================
+# Simplified Verification for TLS
+# ============================================================================
+
+# One-shot certificate chain verification for TLS
+# chain: certificate chain (leaf first)
+# chain_len: number of certs
+# hostname: expected server hostname
+# hostname_len: length of hostname
+# current_time: current Unix timestamp
+# trusted_roots: trusted root store (can be null for TOFU)
+# roots_len: number of trusted roots
+# Returns: 1 if valid, 0 if invalid
+pub fn x509_verify_server_cert(chain: **X509Certificate, chain_len: i32, hostname: *u8, hostname_len: i32, current_time: i64, trusted_roots: **X509Certificate, roots_len: i32) -> i32
+    if chain_len == 0
+        return 0
+
+    # Verify the chain cryptographically
+    if x509_verify_chain_at_time(chain, chain_len, trusted_roots, roots_len, current_time) != 1
+        return 0
+
+    # Verify hostname matches the leaf certificate
+    let leaf: *X509Certificate = chain[0]
+    if leaf == null
+        return 0
+
+    if x509_verify_hostname(leaf, hostname, hostname_len) != 1
+        return 0
+
+    return 1

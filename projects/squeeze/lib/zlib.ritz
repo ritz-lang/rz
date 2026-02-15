@@ -1,0 +1,198 @@
+# lib/zlib.ritz - Zlib container format (RFC 1950)
+#
+# Implements the zlib wrapper around deflate-compressed data. The zlib format
+# is commonly used for in-memory compression and as the base for PNG images.
+#
+# Data Format:
+#   +---+---+---+---+---+---+---+---+---+---+
+#   |CMF|FLG|          DEFLATE data...      |
+#   +---+---+---+---+---+---+---+---+---+---+
+#   |            ADLER32            |
+#   +---+---+---+---+---+---+---+---+
+#
+# Header structure (2 bytes):
+#   CMF byte: CINFO (bits 7-4) | CM (bits 3-0)
+#     CM = 8 for deflate
+#     CINFO = log2(window_size) - 8, typically 7 (32K window)
+#   FLG byte: FLEVEL (bits 7-6) | FDICT (bit 5) | FCHECK (bits 4-0)
+#     FCHECK: checksum so (CMF << 8 | FLG) % 31 == 0
+#     FDICT: preset dictionary flag (not supported here)
+#     FLEVEL: compression level hint (0-3)
+#
+# Common CMF|FLG combinations:
+#   78 01 - No compression
+#   78 5E - Fast compression
+#   78 9C - Default compression
+#   78 DA - Best compression
+#
+# Trailer: Adler-32 checksum of uncompressed data (big-endian, 4 bytes)
+#
+# API:
+#   zlib_decompress(input, len, output, cap) -> decompressed bytes or error
+#   zlib_compress(input, len, output, cap)   -> compressed bytes or error
+#
+# Error codes (ZLIB_ERR_*): bad CM, bad CINFO, bad FCHECK, dict unsupported,
+# truncated, checksum mismatch, inflate/deflate failure, output full.
+#
+# For streaming compression/decompression, see lib/zlib_stream.ritz.
+
+import ritzlib.sys
+import ritzlib.io
+
+import adler32
+import deflate
+import inflate
+
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+pub const ZLIB_OK: i64 = 0
+pub const ZLIB_ERR_BAD_CM: i64 = -1
+pub const ZLIB_ERR_BAD_CINFO: i64 = -2
+pub const ZLIB_ERR_BAD_FCHECK: i64 = -3
+pub const ZLIB_ERR_DICT_UNSUPPORTED: i64 = -4
+pub const ZLIB_ERR_TRUNCATED: i64 = -5
+pub const ZLIB_ERR_CHECKSUM_MISMATCH: i64 = -6
+pub const ZLIB_ERR_INFLATE_FAILED: i64 = -7
+pub const ZLIB_ERR_DEFLATE_FAILED: i64 = -8
+pub const ZLIB_ERR_OUTPUT_FULL: i64 = -9
+
+# Compression method (8 = deflate)
+const ZLIB_CM_DEFLATE: u8 = 8
+
+# Default CINFO (7 = 32K window)
+const ZLIB_CINFO_32K: u8 = 7
+
+# FDICT flag bit
+const ZLIB_FDICT: u8 = 0x20
+
+# Header size
+const ZLIB_HEADER_SIZE: i64 = 2
+
+# Trailer size (Adler-32)
+const ZLIB_TRAILER_SIZE: i64 = 4
+
+
+# ============================================================================
+# Decompression
+# ============================================================================
+
+# Decompress zlib data.
+# Returns number of bytes written to output, or negative error code.
+pub fn zlib_decompress(input: *u8, input_len: i64, output: *u8, output_cap: i64) -> i64
+    # Minimum size: header (2) + empty deflate (2) + trailer (4) = 8
+    if input_len < 8
+        return ZLIB_ERR_TRUNCATED
+
+    # Read CMF byte
+    let cmf: u8 = input[0]
+    let cm: u8 = cmf & 0x0F       # Compression method (bits 3-0)
+    let cinfo: u8 = cmf >> 4      # Window size info (bits 7-4)
+
+    # Check compression method
+    if cm != ZLIB_CM_DEFLATE
+        return ZLIB_ERR_BAD_CM
+
+    # Check window size (CINFO must be <= 7 for deflate)
+    if cinfo > 7
+        return ZLIB_ERR_BAD_CINFO
+
+    # Read FLG byte
+    let flg: u8 = input[1]
+
+    # Verify header checksum: (CMF << 8 | FLG) % 31 == 0
+    let header_check: u32 = ((cmf as u32) << 8) | (flg as u32)
+    if header_check % 31 != 0
+        return ZLIB_ERR_BAD_FCHECK
+
+    # Check FDICT flag (preset dictionary not supported)
+    if (flg & ZLIB_FDICT) != 0
+        return ZLIB_ERR_DICT_UNSUPPORTED
+
+    # Calculate deflate data length
+    let deflate_len: i64 = input_len - ZLIB_HEADER_SIZE - ZLIB_TRAILER_SIZE
+    if deflate_len < 0
+        return ZLIB_ERR_TRUNCATED
+
+    # Decompress the deflate data
+    let deflate_data: *u8 = @input[ZLIB_HEADER_SIZE]
+    let result: i64 = inflate(deflate_data, deflate_len, output, output_cap)
+
+    if result < 0
+        return ZLIB_ERR_INFLATE_FAILED
+
+    let decompressed_len: i64 = result
+
+    # Read Adler-32 from trailer (big-endian!)
+    let trailer_pos: i64 = input_len - ZLIB_TRAILER_SIZE
+    let adler_b0: u32 = input[trailer_pos] as u32
+    let adler_b1: u32 = input[trailer_pos + 1] as u32
+    let adler_b2: u32 = input[trailer_pos + 2] as u32
+    let adler_b3: u32 = input[trailer_pos + 3] as u32
+    let expected_adler: u32 = (adler_b0 << 24) | (adler_b1 << 16) | (adler_b2 << 8) | adler_b3
+
+    # Verify Adler-32 checksum
+    let actual_adler: u32 = adler32(output, decompressed_len)
+    if actual_adler != expected_adler
+        return ZLIB_ERR_CHECKSUM_MISMATCH
+
+    return decompressed_len
+
+
+# ============================================================================
+# Compression
+# ============================================================================
+
+# Compress data to zlib format.
+# Returns number of bytes written to output, or negative error code.
+pub fn zlib_compress(input: *u8, input_len: i64, output: *u8, output_cap: i64) -> i64
+    # Need at least space for header + trailer
+    if output_cap < ZLIB_HEADER_SIZE + ZLIB_TRAILER_SIZE + 2
+        return ZLIB_ERR_OUTPUT_FULL
+
+    var pos: i64 = 0
+
+    # Write CMF byte: CINFO=7 (32K window), CM=8 (deflate)
+    let cmf: u8 = (ZLIB_CINFO_32K << 4) | ZLIB_CM_DEFLATE  # 0x78
+
+    # Calculate FLG byte
+    # FLEVEL = 2 (default compression), FDICT = 0
+    # FCHECK calculated so (CMF << 8 | FLG) % 31 == 0
+    let flevel: u8 = 2 << 6  # 0x80 (default compression)
+    let base_flg: u8 = flevel  # 0x80
+
+    # Calculate FCHECK: find value 0-31 such that (CMF << 8 | (base_flg | fcheck)) % 31 == 0
+    let header_base: u32 = ((cmf as u32) << 8) | (base_flg as u32)
+    let remainder: u32 = header_base % 31
+    var fcheck: u8 = 0
+    if remainder != 0
+        fcheck = (31 - remainder) as u8
+
+    let flg: u8 = base_flg | fcheck
+
+    output[0] = cmf
+    output[1] = flg
+    pos = ZLIB_HEADER_SIZE
+
+    # Compress using deflate (level 6 = default)
+    let deflate_cap: i64 = output_cap - pos - ZLIB_TRAILER_SIZE
+    let deflate_result: i64 = deflate(input, input_len, @output[pos], deflate_cap, 6)
+
+    if deflate_result < 0
+        return ZLIB_ERR_DEFLATE_FAILED
+
+    pos = pos + deflate_result
+
+    # Write Adler-32 checksum (big-endian!)
+    if pos + ZLIB_TRAILER_SIZE > output_cap
+        return ZLIB_ERR_OUTPUT_FULL
+
+    let checksum: u32 = adler32(input, input_len)
+    output[pos] = ((checksum >> 24) & 0xFF) as u8
+    output[pos + 1] = ((checksum >> 16) & 0xFF) as u8
+    output[pos + 2] = ((checksum >> 8) & 0xFF) as u8
+    output[pos + 3] = (checksum & 0xFF) as u8
+
+    return pos + ZLIB_TRAILER_SIZE

@@ -1,0 +1,136 @@
+# lib/adler32_simd.ritz - SIMD-accelerated Adler-32 checksum
+#
+# Uses SSE2 SIMD instructions to vectorize Adler-32 computation.
+# The key insight is that we can use PSADBW (simd_sad) to sum bytes
+# efficiently - it computes sum of absolute differences, and when
+# one operand is zero, it becomes a horizontal byte sum.
+#
+# For the B component, we need weighted sums (byte[i] * (n-i)), which
+# we handle by processing blocks and using SIMD for the unweighted sums.
+#
+# API (drop-in replacement for adler32.ritz):
+# - adler32_simd_init() -> initial state
+# - adler32_simd_update(state, data, len) -> updated state
+# - adler32_simd_final(state) -> checksum
+# - adler32_simd(data, len) -> one-shot
+
+import ritzlib.sys
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+const ADLER32_MOD: u32 = 65521
+const ADLER32_NMAX: i64 = 5552
+
+# ============================================================================
+# SIMD Helper: Sum 16 bytes using PSADBW
+# ============================================================================
+
+# Sum all bytes in a 16-byte block using SIMD.
+# PSADBW with zero vector gives us horizontal byte sums in two 64-bit lanes.
+fn simd_sum_bytes(data: *u8) -> u32
+    # Load 16 bytes (cast to *i8 for SIMD intrinsics)
+    let data_i8: *i8 = data as *i8
+    let v: v16i8 = simd_loadu(data_i8)
+
+    # Create zero vector for SAD
+    var zeros: [16]i8
+    var i: i64 = 0
+    while i < 16
+        zeros[i] = 0 as i8
+        i = i + 1
+    let zero_vec: v16i8 = simd_loadu(@zeros[0])
+
+    # SAD with zero gives sum of bytes (absolute value, but bytes are positive)
+    let sums: v2i64 = simd_sad(v, zero_vec)
+
+    # Extract and add both halves (each contains sum of 8 bytes)
+    let lo: i64 = simd_extract(sums, 0)
+    let hi: i64 = simd_extract(sums, 1)
+
+    return (lo + hi) as u32
+
+# ============================================================================
+# Streaming API
+# ============================================================================
+
+pub fn adler32_simd_init() -> u32
+    return 1
+
+pub fn adler32_simd_update(state: u32, data: *u8, len: i64) -> u32
+    if len == 0
+        return state
+
+    var a: u32 = state & 0xFFFF
+    var b: u32 = (state >> 16) & 0xFFFF
+
+    var pos: i64 = 0
+
+    while pos < len
+        # Process in chunks to avoid overflow
+        var chunk_len: i64 = len - pos
+        if chunk_len > ADLER32_NMAX
+            chunk_len = ADLER32_NMAX
+
+        let chunk_end: i64 = pos + chunk_len
+
+        # Process 16-byte SIMD blocks within the chunk
+        # For B, we need: b += 16*a + (16*d[0] + 15*d[1] + ... + 1*d[15])
+        # This is complex, so we use a simpler approach:
+        # Process in smaller blocks where we can track weights
+
+        while pos + 16 <= chunk_end
+            # For each 16-byte block:
+            # A += sum(bytes)
+            # B += 16*A_before + weighted_sum
+            #
+            # The weighted sum is: 16*d[0] + 15*d[1] + ... + 1*d[15]
+            # We can compute this as:
+            #   sum(d[0..16]) * 16 - (0*d[0] + 1*d[1] + 2*d[2] + ... + 15*d[15])
+            # But that's still complex.
+            #
+            # Simpler: use SIMD for the byte sum, scalar for the running B update
+
+            # Get byte sum using SIMD
+            let ptr: *u8 = @data[pos]
+            let byte_sum: u32 = simd_sum_bytes(ptr)
+
+            # Update B with weighted contribution
+            # B += 16*a + (16*d0 + 15*d1 + ... + 1*d15)
+            # We compute the weighted sum with scalar ops for correctness
+            var weighted: u32 = 0
+            var j: i64 = 0
+            while j < 16
+                let weight: u32 = (16 - j) as u32
+                weighted = weighted + (weight * (data[pos + j] as u32))
+                j = j + 1
+
+            b = b + (16 as u32 * a) + weighted
+            a = a + byte_sum
+
+            pos = pos + 16
+
+        # Handle remaining bytes (less than 16) with scalar
+        while pos < chunk_end
+            a = a + (data[pos] as u32)
+            b = b + a
+            pos = pos + 1
+
+        # Reduce modulo
+        a = a % ADLER32_MOD
+        b = b % ADLER32_MOD
+
+    return (b << 16) | a
+
+pub fn adler32_simd_final(state: u32) -> u32
+    return state
+
+# ============================================================================
+# One-shot API
+# ============================================================================
+
+pub fn adler32_simd(data: *u8, len: i64) -> u32
+    let state: u32 = adler32_simd_init()
+    let updated: u32 = adler32_simd_update(state, data, len)
+    return adler32_simd_final(updated)

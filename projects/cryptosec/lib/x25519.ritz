@@ -1,0 +1,697 @@
+# lib/x25519.ritz - X25519 key exchange (RFC 7748)
+#
+# Curve25519 ECDH using Montgomery ladder.
+# Field: GF(2^255 - 19)
+# Curve: y^2 = x^3 + 486662*x^2 + x
+#
+# Implementation uses radix-2^51 representation (5 limbs of 51 bits each)
+# for efficient arithmetic without overflow in 64-bit operations.
+
+import mem
+import u128
+
+# ============================================================================
+# Field element representation
+# ============================================================================
+
+# Field element in radix-2^51
+# Each limb holds up to 51 bits (with some slack for lazy reduction)
+struct Fe25519
+    l0: u64
+    l1: u64
+    l2: u64
+    l3: u64
+    l4: u64
+
+# The prime p = 2^255 - 19
+# In radix-2^51: p = 2251799813685247 + 2251799813685247*2^51 + ... - but easier to work with 2^255-19 directly
+
+# ============================================================================
+# Field element basic operations
+# ============================================================================
+
+pub fn fe_zero(out: *Fe25519)
+    out.l0 = 0
+    out.l1 = 0
+    out.l2 = 0
+    out.l3 = 0
+    out.l4 = 0
+
+pub fn fe_one(out: *Fe25519)
+    out.l0 = 1
+    out.l1 = 0
+    out.l2 = 0
+    out.l3 = 0
+    out.l4 = 0
+
+pub fn fe_copy(out: *Fe25519, a: *Fe25519)
+    out.l0 = a.l0
+    out.l1 = a.l1
+    out.l2 = a.l2
+    out.l3 = a.l3
+    out.l4 = a.l4
+
+# ============================================================================
+# Load/store (little-endian, 32 bytes)
+# ============================================================================
+
+fn fe_load32_le(bytes: *u8, offset: i64) -> u64
+    # NOTE: Must use intermediate variables due to Ritz compiler bug with
+    # direct cast from pointer dereference to wider integer types
+    let t0: u8 = bytes[offset]
+    let t1: u8 = bytes[offset + 1]
+    let t2: u8 = bytes[offset + 2]
+    let t3: u8 = bytes[offset + 3]
+    let b0: u64 = t0 as u64
+    let b1: u64 = t1 as u64
+    let b2: u64 = t2 as u64
+    let b3: u64 = t3 as u64
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+
+fn fe_load64_le(bytes: *u8, offset: i64) -> u64
+    let lo: u64 = fe_load32_le(bytes, offset)
+    let hi: u64 = fe_load32_le(bytes, offset + 4)
+    return lo | (hi << 32)
+
+pub fn fe_frombytes(out: *Fe25519, bytes: *u8)
+    # Load 256 bits as 5 x 51-bit limbs
+    # Load 4 aligned 64-bit words
+    let h0: u64 = fe_load64_le(bytes, 0)
+    let h1: u64 = fe_load64_le(bytes, 8)
+    let h2: u64 = fe_load64_le(bytes, 16)
+    let h3: u64 = fe_load64_le(bytes, 24)
+
+    let mask51: u64 = 0x7ffffffffffff  # 2^51 - 1
+
+    # Extract 51-bit limbs from 256-bit value
+    # l0 = bits 0-50 from h0
+    # l1 = bits 51-101: 13 bits from h0, 38 bits from h1
+    # l2 = bits 102-152: 26 bits from h1, 25 bits from h2
+    # l3 = bits 153-203: 39 bits from h2, 12 bits from h3
+    # l4 = bits 204-254: 51 bits from h3
+
+    out.l0 = h0 & mask51
+    out.l1 = ((h0 >> 51) | (h1 << 13)) & mask51
+    out.l2 = ((h1 >> 38) | (h2 << 26)) & mask51
+    out.l3 = ((h2 >> 25) | (h3 << 39)) & mask51
+    out.l4 = (h3 >> 12) & mask51  # Clear high bit for safety
+
+pub fn fe_tobytes(bytes: *u8, a: *Fe25519)
+    # First fully reduce
+    var t: Fe25519
+    fe_copy(&t, a)
+    fe_reduce(&t)
+
+    # Convert from 5 x 51-bit limbs to 32 bytes
+    # Limb layout: bits 0-50 in l0, 51-101 in l1, 102-152 in l2, 153-203 in l3, 204-254 in l4
+
+    let l0: u64 = t.l0
+    let l1: u64 = t.l1
+    let l2: u64 = t.l2
+    let l3: u64 = t.l3
+    let l4: u64 = t.l4
+
+    # Build 4 x 64-bit words then extract bytes
+    # h0 = bits 0-63 = l0[0:51] + l1[0:12] << 51
+    # h1 = bits 64-127 = l1[12:51] + l2[0:25] << 39
+    # h2 = bits 128-191 = l2[25:51] + l3[0:38] << 26
+    # h3 = bits 192-255 = l3[38:51] + l4[0:51] << 13
+
+    let h0: u64 = l0 | (l1 << 51)
+    let h1: u64 = (l1 >> 13) | (l2 << 38)
+    let h2: u64 = (l2 >> 26) | (l3 << 25)
+    let h3: u64 = (l3 >> 39) | (l4 << 12)
+
+    # Extract bytes in little-endian order
+    bytes[0] = (h0 & 0xff) as u8
+    bytes[1] = ((h0 >> 8) & 0xff) as u8
+    bytes[2] = ((h0 >> 16) & 0xff) as u8
+    bytes[3] = ((h0 >> 24) & 0xff) as u8
+    bytes[4] = ((h0 >> 32) & 0xff) as u8
+    bytes[5] = ((h0 >> 40) & 0xff) as u8
+    bytes[6] = ((h0 >> 48) & 0xff) as u8
+    bytes[7] = ((h0 >> 56) & 0xff) as u8
+
+    bytes[8] = (h1 & 0xff) as u8
+    bytes[9] = ((h1 >> 8) & 0xff) as u8
+    bytes[10] = ((h1 >> 16) & 0xff) as u8
+    bytes[11] = ((h1 >> 24) & 0xff) as u8
+    bytes[12] = ((h1 >> 32) & 0xff) as u8
+    bytes[13] = ((h1 >> 40) & 0xff) as u8
+    bytes[14] = ((h1 >> 48) & 0xff) as u8
+    bytes[15] = ((h1 >> 56) & 0xff) as u8
+
+    bytes[16] = (h2 & 0xff) as u8
+    bytes[17] = ((h2 >> 8) & 0xff) as u8
+    bytes[18] = ((h2 >> 16) & 0xff) as u8
+    bytes[19] = ((h2 >> 24) & 0xff) as u8
+    bytes[20] = ((h2 >> 32) & 0xff) as u8
+    bytes[21] = ((h2 >> 40) & 0xff) as u8
+    bytes[22] = ((h2 >> 48) & 0xff) as u8
+    bytes[23] = ((h2 >> 56) & 0xff) as u8
+
+    bytes[24] = (h3 & 0xff) as u8
+    bytes[25] = ((h3 >> 8) & 0xff) as u8
+    bytes[26] = ((h3 >> 16) & 0xff) as u8
+    bytes[27] = ((h3 >> 24) & 0xff) as u8
+    bytes[28] = ((h3 >> 32) & 0xff) as u8
+    bytes[29] = ((h3 >> 40) & 0xff) as u8
+    bytes[30] = ((h3 >> 48) & 0xff) as u8
+    bytes[31] = ((h3 >> 56) & 0xff) as u8
+
+# ============================================================================
+# Field arithmetic
+# ============================================================================
+
+pub fn fe_add(out: *Fe25519, a: *Fe25519, b: *Fe25519)
+    out.l0 = a.l0 + b.l0
+    out.l1 = a.l1 + b.l1
+    out.l2 = a.l2 + b.l2
+    out.l3 = a.l3 + b.l3
+    out.l4 = a.l4 + b.l4
+
+pub fn fe_sub(out: *Fe25519, a: *Fe25519, b: *Fe25519)
+    # Add 2p to avoid underflow, then subtract
+    # 2p = 2*(2^255 - 19) = 2^256 - 38
+    # In radix-2^51 with overflow: (2^52-38, 2^52-2, 2^52-2, 2^52-2, 2^52-2) ≡ 0 (mod p)
+    # This ensures no underflow when subtracting any valid limb value
+    out.l0 = (a.l0 + 0xfffffffffffda) - b.l0
+    out.l1 = (a.l1 + 0xffffffffffffe) - b.l1
+    out.l2 = (a.l2 + 0xffffffffffffe) - b.l2
+    out.l3 = (a.l3 + 0xffffffffffffe) - b.l3
+    out.l4 = (a.l4 + 0xffffffffffffe) - b.l4
+
+pub fn fe_reduce(a: *Fe25519)
+    # Reduce limbs to canonical form (0 <= result < p)
+    let mask51: u64 = 0x7ffffffffffff
+
+    # First pass: propagate carries
+    var c: u64 = a.l0 >> 51
+    a.l0 = a.l0 & mask51
+    a.l1 = a.l1 + c
+
+    c = a.l1 >> 51
+    a.l1 = a.l1 & mask51
+    a.l2 = a.l2 + c
+
+    c = a.l2 >> 51
+    a.l2 = a.l2 & mask51
+    a.l3 = a.l3 + c
+
+    c = a.l3 >> 51
+    a.l3 = a.l3 & mask51
+    a.l4 = a.l4 + c
+
+    c = a.l4 >> 51
+    a.l4 = a.l4 & mask51
+    # c * 2^255 = c * 19 (mod p)
+    a.l0 = a.l0 + (c * 19)
+
+    # Second pass to handle any overflow from the *19
+    c = a.l0 >> 51
+    a.l0 = a.l0 & mask51
+    a.l1 = a.l1 + c
+
+    c = a.l1 >> 51
+    a.l1 = a.l1 & mask51
+    a.l2 = a.l2 + c
+
+    c = a.l2 >> 51
+    a.l2 = a.l2 & mask51
+    a.l3 = a.l3 + c
+
+    c = a.l3 >> 51
+    a.l3 = a.l3 & mask51
+    a.l4 = a.l4 + c
+
+    c = a.l4 >> 51
+    a.l4 = a.l4 & mask51
+    a.l0 = a.l0 + (c * 19)
+
+    # Propagate one more time
+    c = a.l0 >> 51
+    a.l0 = a.l0 & mask51
+    a.l1 = a.l1 + c
+
+    # Final conditional subtraction of p if value >= p
+    # p in limbs: l0 >= 2^51-19, l1-l4 == 2^51-1 (mask51)
+    # Check if we need to subtract p:
+    # Condition: (l4 == mask51) && (l3 == mask51) && (l2 == mask51) && (l1 == mask51) && (l0 >= mask51 - 18)
+    # If so, subtract: l0 -= (mask51 - 18), l1-l4 -= mask51 (i.e., set to 0)
+    # This is equivalent to: l0 += 19, l1-l4 += 1, then carry propagate
+
+    # Use constant-time approach: compute mask that's all 1s if >= p, all 0s otherwise
+    # ge_p = (l0 >= 2^51 - 19) when l1-l4 are all mask51
+    let p_l0: u64 = mask51 - 18  # 2^51 - 19
+
+    # Check if l4, l3, l2, l1 are all exactly mask51
+    var eq_mask51: u64 = 0
+    if a.l4 == mask51
+        if a.l3 == mask51
+            if a.l2 == mask51
+                if a.l1 == mask51
+                    eq_mask51 = 1
+
+    # Check if l0 >= p_l0 (which is 2^51 - 19)
+    var l0_ge_p: u64 = 0
+    if a.l0 >= p_l0
+        l0_ge_p = 1
+
+    # ge_p = eq_mask51 && l0_ge_p
+    let ge_p: u64 = eq_mask51 & l0_ge_p
+
+    # If ge_p, subtract p: l0 -= (2^51-19), l1-l4 -= (2^51-1)
+    # Equivalently: l0 = l0 - p_l0, l1-l4 = 0
+    # Using mask: subtract ge_p * p_l0 from l0, subtract ge_p * mask51 from l1-l4
+    a.l0 = a.l0 - (ge_p * p_l0)
+    a.l1 = a.l1 - (ge_p * mask51)
+    a.l2 = a.l2 - (ge_p * mask51)
+    a.l3 = a.l3 - (ge_p * mask51)
+    a.l4 = a.l4 - (ge_p * mask51)
+
+pub fn fe_mul(out: *Fe25519, a: *Fe25519, b: *Fe25519)
+    # Schoolbook multiplication with reduction mod p = 2^255 - 19
+    # Uses U128 for proper 128-bit accumulation to avoid overflow
+
+    let a0: u64 = a.l0
+    let a1: u64 = a.l1
+    let a2: u64 = a.l2
+    let a3: u64 = a.l3
+    let a4: u64 = a.l4
+
+    let b0: u64 = b.l0
+    let b1: u64 = b.l1
+    let b2: u64 = b.l2
+    let b3: u64 = b.l3
+    let b4: u64 = b.l4
+
+    # For wrap-around terms, multiply by 19 (since 2^255 ≡ 19 mod p)
+    let b1_19: u64 = b1 * 19
+    let b2_19: u64 = b2 * 19
+    let b3_19: u64 = b3 * 19
+    let b4_19: u64 = b4 * 19
+
+    # Compute each output limb using 128-bit accumulation
+    # t0 = a0*b0 + a1*b4*19 + a2*b3*19 + a3*b2*19 + a4*b1*19
+    var acc0: U128 = u128_mul_u64(a0, b0)
+    acc0 = u128_add(acc0, u128_mul_u64(a1, b4_19))
+    acc0 = u128_add(acc0, u128_mul_u64(a2, b3_19))
+    acc0 = u128_add(acc0, u128_mul_u64(a3, b2_19))
+    acc0 = u128_add(acc0, u128_mul_u64(a4, b1_19))
+
+    # t1 = a0*b1 + a1*b0 + a2*b4*19 + a3*b3*19 + a4*b2*19
+    var acc1: U128 = u128_mul_u64(a0, b1)
+    acc1 = u128_add(acc1, u128_mul_u64(a1, b0))
+    acc1 = u128_add(acc1, u128_mul_u64(a2, b4_19))
+    acc1 = u128_add(acc1, u128_mul_u64(a3, b3_19))
+    acc1 = u128_add(acc1, u128_mul_u64(a4, b2_19))
+
+    # t2 = a0*b2 + a1*b1 + a2*b0 + a3*b4*19 + a4*b3*19
+    var acc2: U128 = u128_mul_u64(a0, b2)
+    acc2 = u128_add(acc2, u128_mul_u64(a1, b1))
+    acc2 = u128_add(acc2, u128_mul_u64(a2, b0))
+    acc2 = u128_add(acc2, u128_mul_u64(a3, b4_19))
+    acc2 = u128_add(acc2, u128_mul_u64(a4, b3_19))
+
+    # t3 = a0*b3 + a1*b2 + a2*b1 + a3*b0 + a4*b4*19
+    var acc3: U128 = u128_mul_u64(a0, b3)
+    acc3 = u128_add(acc3, u128_mul_u64(a1, b2))
+    acc3 = u128_add(acc3, u128_mul_u64(a2, b1))
+    acc3 = u128_add(acc3, u128_mul_u64(a3, b0))
+    acc3 = u128_add(acc3, u128_mul_u64(a4, b4_19))
+
+    # t4 = a0*b4 + a1*b3 + a2*b2 + a3*b1 + a4*b0
+    var acc4: U128 = u128_mul_u64(a0, b4)
+    acc4 = u128_add(acc4, u128_mul_u64(a1, b3))
+    acc4 = u128_add(acc4, u128_mul_u64(a2, b2))
+    acc4 = u128_add(acc4, u128_mul_u64(a3, b1))
+    acc4 = u128_add(acc4, u128_mul_u64(a4, b0))
+
+    # Reduce: extract 51-bit limbs and propagate carries
+    let mask51: u64 = 0x7ffffffffffff
+
+    # Extract t0 and carry
+    var t0: u64 = acc0.lo & mask51
+    let c0: U128 = u128_shr(acc0, 51)
+    acc1 = u128_add(acc1, c0)
+
+    var t1: u64 = acc1.lo & mask51
+    let c1: U128 = u128_shr(acc1, 51)
+    acc2 = u128_add(acc2, c1)
+
+    var t2: u64 = acc2.lo & mask51
+    let c2: U128 = u128_shr(acc2, 51)
+    acc3 = u128_add(acc3, c2)
+
+    var t3: u64 = acc3.lo & mask51
+    let c3: U128 = u128_shr(acc3, 51)
+    acc4 = u128_add(acc4, c3)
+
+    var t4: u64 = acc4.lo & mask51
+    let c4: U128 = u128_shr(acc4, 51)
+    # c4 * 2^255 ≡ c4 * 19 (mod p)
+    t0 = t0 + (c4.lo * 19)
+
+    # Second pass for final carry
+    var carry: u64 = t0 >> 51
+    t0 = t0 & mask51
+    t1 = t1 + carry
+
+    carry = t1 >> 51
+    t1 = t1 & mask51
+    t2 = t2 + carry
+
+    carry = t2 >> 51
+    t2 = t2 & mask51
+    t3 = t3 + carry
+
+    carry = t3 >> 51
+    t3 = t3 & mask51
+    t4 = t4 + carry
+
+    out.l0 = t0
+    out.l1 = t1
+    out.l2 = t2
+    out.l3 = t3
+    out.l4 = t4
+
+pub fn fe_sq(out: *Fe25519, a: *Fe25519)
+    # Squaring (slightly optimized over mul)
+    fe_mul(out, a, a)
+
+fn fe_mul_a24(out: *Fe25519, a: *Fe25519)
+    # Multiply by a24 = (A-2)/4 = (486662-2)/4 = 121665
+    # Used in the Montgomery ladder for Curve25519
+    #
+    # NOTE: Uses U128 arithmetic because limb * 121665 can overflow 64 bits.
+    # Even after reduction, limbs can be up to 2^51 - 1 (51 bits).
+    # 51 bits + 17 bits (121665) = 68 bits, which overflows u64.
+    let c: u64 = 121665
+
+    # Reduce input to ensure limbs are < 2^51
+    var a_r: Fe25519
+    fe_copy(&a_r, a)
+    fe_reduce(&a_r)
+
+    # Use 128-bit arithmetic for the multiplications
+    var acc0: U128 = u128_mul_u64(a_r.l0, c)
+    var acc1: U128 = u128_mul_u64(a_r.l1, c)
+    var acc2: U128 = u128_mul_u64(a_r.l2, c)
+    var acc3: U128 = u128_mul_u64(a_r.l3, c)
+    var acc4: U128 = u128_mul_u64(a_r.l4, c)
+
+    let mask51: u64 = 0x7ffffffffffff
+
+    # Extract 51-bit limbs and propagate carries
+    var t0: u64 = acc0.lo & mask51
+    let c0: U128 = u128_shr(acc0, 51)
+    acc1 = u128_add(acc1, c0)
+
+    var t1: u64 = acc1.lo & mask51
+    let c1: U128 = u128_shr(acc1, 51)
+    acc2 = u128_add(acc2, c1)
+
+    var t2: u64 = acc2.lo & mask51
+    let c2: U128 = u128_shr(acc2, 51)
+    acc3 = u128_add(acc3, c2)
+
+    var t3: u64 = acc3.lo & mask51
+    let c3: U128 = u128_shr(acc3, 51)
+    acc4 = u128_add(acc4, c3)
+
+    var t4: u64 = acc4.lo & mask51
+    let c4: U128 = u128_shr(acc4, 51)
+    # c4 * 2^255 ≡ c4 * 19 (mod p)
+    t0 = t0 + (c4.lo * 19)
+
+    # Final carry propagation
+    var carry: u64 = t0 >> 51
+    t0 = t0 & mask51
+    t1 = t1 + carry
+
+    carry = t1 >> 51
+    t1 = t1 & mask51
+    t2 = t2 + carry
+
+    carry = t2 >> 51
+    t2 = t2 & mask51
+    t3 = t3 + carry
+
+    carry = t3 >> 51
+    t3 = t3 & mask51
+    t4 = t4 + carry
+
+    out.l0 = t0
+    out.l1 = t1
+    out.l2 = t2
+    out.l3 = t3
+    out.l4 = t4
+
+# ============================================================================
+# Field inversion using Fermat's little theorem
+# a^(-1) = a^(p-2) mod p
+# p-2 = 2^255 - 21 = (2^255 - 19) - 2
+# ============================================================================
+
+pub fn fe_invert(out: *Fe25519, z: *Fe25519)
+    # Compute z^(p-2) using addition chain
+    # p-2 = 2^255 - 21
+    # = 2^255 - 16 - 4 - 1 = 2^255 - 2^4 - 2^2 - 1
+    # Binary: 0111...11101011 (255 bits, all 1s except bits 0, 2, 4)
+    # Actually: 2^255 - 21 = 2^255 - 16 - 5 = binary ...11101011
+
+    # Use the standard addition chain for 2^255 - 21
+    var t0: Fe25519
+    var t1: Fe25519
+    var t2: Fe25519
+    var t3: Fe25519
+
+    # z^2
+    fe_sq(&t0, z)
+    # z^4
+    fe_sq(&t1, &t0)
+    # z^8
+    fe_sq(&t1, &t1)
+    # z^9 = z^8 * z
+    fe_mul(&t1, &t1, z)
+    # z^11 = z^9 * z^2
+    fe_mul(&t0, &t1, &t0)
+    # z^22
+    fe_sq(&t2, &t0)
+    # z^31 = z^22 * z^9
+    fe_mul(&t1, &t2, &t1)
+    # z^2^5
+    fe_sq(&t2, &t1)
+    # z^2^10
+    var i: i32 = 1
+    while i < 5
+        fe_sq(&t2, &t2)
+        i += 1
+    # z^(2^10 - 1) = z^(2^10 - 2^5) * z^(2^5 - 1)
+    fe_mul(&t1, &t2, &t1)
+    # z^2^20
+    fe_sq(&t2, &t1)
+    i = 1
+    while i < 10
+        fe_sq(&t2, &t2)
+        i += 1
+    # z^(2^20 - 1)
+    fe_mul(&t2, &t2, &t1)
+    # z^2^40
+    fe_sq(&t3, &t2)
+    i = 1
+    while i < 20
+        fe_sq(&t3, &t3)
+        i += 1
+    # z^(2^40 - 1)
+    fe_mul(&t2, &t3, &t2)
+    # z^2^50
+    fe_sq(&t2, &t2)
+    i = 1
+    while i < 10
+        fe_sq(&t2, &t2)
+        i += 1
+    # z^(2^50 - 1)
+    fe_mul(&t1, &t2, &t1)
+    # z^2^100
+    fe_sq(&t2, &t1)
+    i = 1
+    while i < 50
+        fe_sq(&t2, &t2)
+        i += 1
+    # z^(2^100 - 1)
+    fe_mul(&t2, &t2, &t1)
+    # z^2^200
+    fe_sq(&t3, &t2)
+    i = 1
+    while i < 100
+        fe_sq(&t3, &t3)
+        i += 1
+    # z^(2^200 - 1)
+    fe_mul(&t2, &t3, &t2)
+    # z^2^250
+    fe_sq(&t2, &t2)
+    i = 1
+    while i < 50
+        fe_sq(&t2, &t2)
+        i += 1
+    # z^(2^250 - 1)
+    fe_mul(&t1, &t2, &t1)
+    # z^2^255
+    fe_sq(&t1, &t1)
+    fe_sq(&t1, &t1)
+    fe_sq(&t1, &t1)
+    fe_sq(&t1, &t1)
+    fe_sq(&t1, &t1)
+    # z^(2^255 - 32) * z^11 = z^(2^255 - 21)
+    fe_mul(out, &t1, &t0)
+
+# ============================================================================
+# Conditional swap (constant-time)
+# ============================================================================
+
+fn fe_cswap(a: *Fe25519, b: *Fe25519, swap: u64)
+    # swap is 0 or 1
+    # If swap == 1, exchange a and b; otherwise do nothing
+    # Constant-time: mask = -swap (all 1s if swap==1, all 0s if swap==0)
+    let mask: u64 = 0 - swap
+
+    var t: u64 = mask & (a.l0 ^ b.l0)
+    a.l0 = a.l0 ^ t
+    b.l0 = b.l0 ^ t
+
+    t = mask & (a.l1 ^ b.l1)
+    a.l1 = a.l1 ^ t
+    b.l1 = b.l1 ^ t
+
+    t = mask & (a.l2 ^ b.l2)
+    a.l2 = a.l2 ^ t
+    b.l2 = b.l2 ^ t
+
+    t = mask & (a.l3 ^ b.l3)
+    a.l3 = a.l3 ^ t
+    b.l3 = b.l3 ^ t
+
+    t = mask & (a.l4 ^ b.l4)
+    a.l4 = a.l4 ^ t
+    b.l4 = b.l4 ^ t
+
+# ============================================================================
+# X25519 scalar multiplication (Montgomery ladder)
+# ============================================================================
+
+fn x25519_scalarmult(out: *u8, scalar: *u8, point: *u8)
+    # Clamp scalar per RFC 7748
+    var k: [32]u8
+    mem_copy(&k[0], scalar, 32)
+    k[0] = k[0] & 0xf8
+    k[31] = k[31] & 0x7f
+    k[31] = k[31] | 0x40
+
+    # Load point u-coordinate
+    var u: Fe25519
+    fe_frombytes(&u, point)
+
+    # Montgomery ladder
+    var x1: Fe25519
+    fe_copy(&x1, &u)
+
+    var x2: Fe25519
+    fe_one(&x2)
+
+    var z2: Fe25519
+    fe_zero(&z2)
+
+    var x3: Fe25519
+    fe_copy(&x3, &u)
+
+    var z3: Fe25519
+    fe_one(&z3)
+
+    var swap: u64 = 0
+
+    # Process bits from high to low
+    var pos: i32 = 254
+    while pos >= 0
+        let byte_idx: i32 = pos / 8
+        let bit_idx: i32 = pos % 8
+        let ki: u64 = ((k[byte_idx] >> (bit_idx as u8)) & 1) as u64
+
+        swap = swap ^ ki
+        fe_cswap(&x2, &x3, swap)
+        fe_cswap(&z2, &z3, swap)
+        swap = ki
+
+        # Montgomery ladder step
+        var A: Fe25519
+        var AA: Fe25519
+        var B: Fe25519
+        var BB: Fe25519
+        var E: Fe25519
+        var C: Fe25519
+        var D: Fe25519
+        var DA: Fe25519
+        var CB: Fe25519
+
+        fe_add(&A, &x2, &z2)
+        fe_sq(&AA, &A)
+        fe_sub(&B, &x2, &z2)
+        fe_sq(&BB, &B)
+        fe_sub(&E, &AA, &BB)
+        fe_add(&C, &x3, &z3)
+        fe_sub(&D, &x3, &z3)
+        fe_mul(&DA, &D, &A)
+        fe_mul(&CB, &C, &B)
+
+        var t1: Fe25519
+        var t2: Fe25519
+        fe_add(&t1, &DA, &CB)
+        fe_sq(&x3, &t1)
+        fe_sub(&t2, &DA, &CB)
+        fe_sq(&t1, &t2)
+        fe_mul(&z3, &t1, &x1)
+
+        fe_mul(&x2, &AA, &BB)
+        fe_mul_a24(&t1, &E)
+        fe_add(&t1, &AA, &t1)
+        fe_mul(&z2, &E, &t1)
+
+        pos -= 1
+
+    fe_cswap(&x2, &x3, swap)
+    fe_cswap(&z2, &z3, swap)
+
+    # Compute result: x2 * z2^(-1)
+    var z2_inv: Fe25519
+    fe_invert(&z2_inv, &z2)
+
+    var result: Fe25519
+    fe_mul(&result, &x2, &z2_inv)
+
+    fe_tobytes(out, &result)
+
+# ============================================================================
+# Public API
+# ============================================================================
+
+# Clamp a scalar for use with X25519
+pub fn x25519_clamp(scalar: *u8)
+    scalar[0] = scalar[0] & 0xf8
+    scalar[31] = scalar[31] & 0x7f
+    scalar[31] = scalar[31] | 0x40
+
+# Main X25519 function: out = scalar * point
+pub fn x25519(out: *u8, scalar: *u8, point: *u8)
+    x25519_scalarmult(out, scalar, point)
+
+# Generate public key from private key: pubkey = scalar * basepoint
+pub fn x25519_pubkey(pubkey: *u8, privkey: *u8)
+    # Basepoint is u=9
+    var basepoint: [32]u8
+    basepoint[0] = 9
+    var i: i32 = 1
+    while i < 32
+        basepoint[i] = 0
+        i += 1
+
+    x25519_scalarmult(pubkey, privkey, &basepoint[0])

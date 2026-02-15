@@ -1,0 +1,628 @@
+# ASN.1/DER Parser for X.509 Certificates
+#
+# Implements a minimal DER (Distinguished Encoding Rules) decoder
+# sufficient for parsing X.509 certificates as needed for TLS 1.3.
+#
+# DER is a strict subset of BER with canonical encoding rules:
+# - Lengths must use definite form (no indefinite lengths)
+# - Constructed types must use constructed encoding
+# - SET elements must be sorted
+#
+# References:
+# - ITU-T X.680 (ASN.1 notation)
+# - ITU-T X.690 (BER/DER encoding rules)
+# - RFC 5280 (X.509 PKI Certificate Profile)
+
+import ritzlib.sys
+import ritzlib.io
+
+# ============================================================================
+# ASN.1 Tag Classes and Types
+# ============================================================================
+
+# Tag class (bits 7-6 of first byte)
+const TAG_CLASS_UNIVERSAL: u8   = 0x00  # 0b00xxxxxx
+const TAG_CLASS_APPLICATION: u8 = 0x40  # 0b01xxxxxx
+const TAG_CLASS_CONTEXT: u8     = 0x80  # 0b10xxxxxx
+const TAG_CLASS_PRIVATE: u8     = 0xc0  # 0b11xxxxxx
+const TAG_CLASS_MASK: u8        = 0xc0
+
+# Constructed flag (bit 5)
+const TAG_CONSTRUCTED: u8       = 0x20  # 0b00100000
+const TAG_PRIMITIVE: u8         = 0x00
+
+# Universal tag numbers (bits 4-0)
+const TAG_EOC: u8               = 0x00  # End-of-contents
+const TAG_BOOLEAN: u8           = 0x01
+const TAG_INTEGER: u8           = 0x02
+const TAG_BIT_STRING: u8        = 0x03
+const TAG_OCTET_STRING: u8      = 0x04
+const TAG_NULL: u8              = 0x05
+const TAG_OID: u8               = 0x06  # Object Identifier
+const TAG_OBJECT_DESCRIPTOR: u8 = 0x07
+const TAG_EXTERNAL: u8          = 0x08
+const TAG_REAL: u8              = 0x09
+const TAG_ENUMERATED: u8        = 0x0a
+const TAG_EMBEDDED_PDV: u8      = 0x0b
+const TAG_UTF8_STRING: u8       = 0x0c
+const TAG_RELATIVE_OID: u8      = 0x0d
+const TAG_SEQUENCE: u8          = 0x10  # SEQUENCE and SEQUENCE OF
+const TAG_SET: u8               = 0x11  # SET and SET OF
+const TAG_NUMERIC_STRING: u8    = 0x12
+const TAG_PRINTABLE_STRING: u8  = 0x13
+const TAG_T61_STRING: u8        = 0x14  # TeletexString
+const TAG_VIDEOTEX_STRING: u8   = 0x15
+const TAG_IA5_STRING: u8        = 0x16
+const TAG_UTC_TIME: u8          = 0x17
+const TAG_GENERALIZED_TIME: u8  = 0x18
+const TAG_GRAPHIC_STRING: u8    = 0x19
+const TAG_VISIBLE_STRING: u8    = 0x1a
+const TAG_GENERAL_STRING: u8    = 0x1b
+const TAG_UNIVERSAL_STRING: u8  = 0x1c
+const TAG_CHARACTER_STRING: u8  = 0x1d
+const TAG_BMP_STRING: u8        = 0x1e
+
+# Tag number mask for single-byte tags
+const TAG_NUMBER_MASK: u8       = 0x1f
+
+# ============================================================================
+# DER Parser State
+# ============================================================================
+
+# DerParser - holds parsing state for a DER-encoded buffer
+struct DerParser
+    data: *u8       # Pointer to DER data
+    len: u64        # Total length of data
+    pos: u64        # Current position
+
+# DerElement - represents a parsed ASN.1 element
+struct DerElement
+    tag: u8             # Raw tag byte
+    tag_class: u8       # Extracted class (UNIVERSAL, APPLICATION, CONTEXT, PRIVATE)
+    tag_number: u32     # Tag number (may be multi-byte)
+    constructed: u8     # 1 if constructed, 0 if primitive
+    content: *u8        # Pointer to content bytes
+    content_len: u64    # Length of content
+    header_len: u64     # Length of tag + length bytes
+
+# ============================================================================
+# Parser Initialization
+# ============================================================================
+
+pub fn der_parser_init(parser: *DerParser, data: *u8, len: u64)
+    parser.data = data
+    parser.len = len
+    parser.pos = 0
+
+pub fn der_parser_remaining(parser: *DerParser) -> u64
+    if parser.pos >= parser.len
+        return 0
+    return parser.len - parser.pos
+
+pub fn der_parser_eof(parser: *DerParser) -> i32
+    if parser.pos >= parser.len
+        return 1
+    return 0
+
+# ============================================================================
+# Core DER Decoding
+# ============================================================================
+
+# Parse tag byte(s)
+# Returns: tag number, or -1 on error
+# Sets tag_class and constructed flags in element
+fn der_parse_tag(parser: *DerParser, elem: *DerElement) -> i32
+    if der_parser_eof(parser) == 1
+        return -1
+
+    let first_byte: u8 = parser.data[parser.pos]
+    parser.pos = parser.pos + 1
+
+    elem.tag = first_byte
+    elem.tag_class = first_byte & TAG_CLASS_MASK
+
+    if (first_byte & TAG_CONSTRUCTED) != 0
+        elem.constructed = 1
+    else
+        elem.constructed = 0
+
+    let tag_num: u8 = first_byte & TAG_NUMBER_MASK
+
+    # Check for multi-byte tag (tag number >= 31)
+    if tag_num == 0x1f
+        # Multi-byte tag encoding
+        var result: u32 = 0
+        var cont: i32 = 1
+        while cont == 1
+            if der_parser_eof(parser) == 1
+                return -1
+            let b: u8 = parser.data[parser.pos]
+            parser.pos = parser.pos + 1
+            result = (result << 7) | ((b & 0x7f) as u32)
+            if (b & 0x80) == 0
+                cont = 0
+            # Overflow check
+            if result > 0x00ffffff
+                return -1
+        elem.tag_number = result
+    else
+        elem.tag_number = tag_num as u32
+
+    return 0
+
+# Parse length field
+# Returns: content length, or -1 on error
+fn der_parse_length(parser: *DerParser) -> i64
+    if der_parser_eof(parser) == 1
+        return -1
+
+    let first_byte: u8 = parser.data[parser.pos]
+    parser.pos = parser.pos + 1
+
+    # Short form: length <= 127, single byte
+    if (first_byte & 0x80) == 0
+        return first_byte as i64
+
+    # Long form: first byte encodes number of following length bytes
+    let num_bytes: u8 = first_byte & 0x7f
+
+    # DER forbids indefinite length (0x80 with no following bytes)
+    if num_bytes == 0
+        return -1
+
+    # Limit to 4 bytes (32-bit length, ~4GB max)
+    if num_bytes > 4
+        return -1
+
+    var length: u64 = 0
+    var i: u8 = 0
+    while i < num_bytes
+        if der_parser_eof(parser) == 1
+            return -1
+        let b: u8 = parser.data[parser.pos]
+        parser.pos = parser.pos + 1
+        length = (length << 8) | (b as u64)
+        i += 1
+
+    # DER requires minimal encoding - check leading zeros
+    # (first byte of multi-byte length must be > 0x7f)
+    if num_bytes > 1
+        # This check ensures we're using minimal encoding
+        if length < 128
+            return -1
+
+    return length as i64
+
+# Parse a complete DER element (tag + length + content)
+# Returns: 0 on success, -1 on error
+pub fn der_parse_element(parser: *DerParser, elem: *DerElement) -> i32
+    let start_pos: u64 = parser.pos
+
+    # Parse tag
+    if der_parse_tag(parser, elem) != 0
+        return -1
+
+    # Parse length
+    let content_len: i64 = der_parse_length(parser)
+    if content_len < 0
+        return -1
+
+    elem.content_len = content_len as u64
+    elem.header_len = parser.pos - start_pos
+
+    # Bounds check
+    if parser.pos + elem.content_len > parser.len
+        return -1
+
+    # Set content pointer
+    elem.content = &parser.data[parser.pos]
+
+    # Advance past content
+    parser.pos = parser.pos + elem.content_len
+
+    return 0
+
+# ============================================================================
+# Element Type Checking
+# ============================================================================
+
+pub fn der_is_sequence(elem: *DerElement) -> i32
+    if elem.tag_class == TAG_CLASS_UNIVERSAL
+        if elem.tag_number == (TAG_SEQUENCE as u32)
+            if elem.constructed == 1
+                return 1
+    return 0
+
+pub fn der_is_set(elem: *DerElement) -> i32
+    if elem.tag_class == TAG_CLASS_UNIVERSAL
+        if elem.tag_number == (TAG_SET as u32)
+            if elem.constructed == 1
+                return 1
+    return 0
+
+pub fn der_is_integer(elem: *DerElement) -> i32
+    if elem.tag_class == TAG_CLASS_UNIVERSAL
+        if elem.tag_number == (TAG_INTEGER as u32)
+            if elem.constructed == 0
+                return 1
+    return 0
+
+pub fn der_is_bit_string(elem: *DerElement) -> i32
+    if elem.tag_class == TAG_CLASS_UNIVERSAL
+        if elem.tag_number == (TAG_BIT_STRING as u32)
+            return 1
+    return 0
+
+pub fn der_is_octet_string(elem: *DerElement) -> i32
+    if elem.tag_class == TAG_CLASS_UNIVERSAL
+        if elem.tag_number == (TAG_OCTET_STRING as u32)
+            return 1
+    return 0
+
+pub fn der_is_null(elem: *DerElement) -> i32
+    if elem.tag_class == TAG_CLASS_UNIVERSAL
+        if elem.tag_number == (TAG_NULL as u32)
+            if elem.content_len == 0
+                return 1
+    return 0
+
+pub fn der_is_oid(elem: *DerElement) -> i32
+    if elem.tag_class == TAG_CLASS_UNIVERSAL
+        if elem.tag_number == (TAG_OID as u32)
+            if elem.constructed == 0
+                return 1
+    return 0
+
+pub fn der_is_utc_time(elem: *DerElement) -> i32
+    if elem.tag_class == TAG_CLASS_UNIVERSAL
+        if elem.tag_number == (TAG_UTC_TIME as u32)
+            return 1
+    return 0
+
+pub fn der_is_generalized_time(elem: *DerElement) -> i32
+    if elem.tag_class == TAG_CLASS_UNIVERSAL
+        if elem.tag_number == (TAG_GENERALIZED_TIME as u32)
+            return 1
+    return 0
+
+pub fn der_is_printable_string(elem: *DerElement) -> i32
+    if elem.tag_class == TAG_CLASS_UNIVERSAL
+        if elem.tag_number == (TAG_PRINTABLE_STRING as u32)
+            return 1
+    return 0
+
+pub fn der_is_utf8_string(elem: *DerElement) -> i32
+    if elem.tag_class == TAG_CLASS_UNIVERSAL
+        if elem.tag_number == (TAG_UTF8_STRING as u32)
+            return 1
+    return 0
+
+pub fn der_is_ia5_string(elem: *DerElement) -> i32
+    if elem.tag_class == TAG_CLASS_UNIVERSAL
+        if elem.tag_number == (TAG_IA5_STRING as u32)
+            return 1
+    return 0
+
+# Check for context-specific tag [n]
+pub fn der_is_context_tag(elem: *DerElement, n: u32) -> i32
+    if elem.tag_class == TAG_CLASS_CONTEXT
+        if elem.tag_number == n
+            return 1
+    return 0
+
+# ============================================================================
+# Value Extraction
+# ============================================================================
+
+# Parse INTEGER content to i64 (for small integers)
+# Returns: 0 on success, -1 on overflow/error
+pub fn der_integer_to_i64(elem: *DerElement, out: *i64) -> i32
+    if der_is_integer(elem) != 1
+        return -1
+
+    if elem.content_len == 0
+        return -1
+
+    if elem.content_len > 8
+        return -1  # Too large for i64
+
+    # First byte determines sign
+    let first_byte: u8 = elem.content[0]
+    var result: i64 = 0
+
+    # Sign extend if negative
+    if (first_byte & 0x80) != 0
+        result = -1  # All 1s
+
+    var i: u64 = 0
+    while i < elem.content_len
+        let b: u8 = elem.content[i]
+        result = (result << 8) | (b as i64)
+        i += 1
+
+    *out = result
+    return 0
+
+# Parse INTEGER content to u64 (for positive integers)
+# Returns: 0 on success, -1 on error
+pub fn der_integer_to_u64(elem: *DerElement, out: *u64) -> i32
+    if der_is_integer(elem) != 1
+        return -1
+
+    if elem.content_len == 0
+        return -1
+
+    # Check for negative (sign bit set)
+    let first_byte: u8 = elem.content[0]
+    if (first_byte & 0x80) != 0
+        return -1  # Negative integer
+
+    # Skip leading zero byte (used for positive numbers with high bit set)
+    var start: u64 = 0
+    if first_byte == 0
+        if elem.content_len > 1
+            start = 1
+
+    let effective_len: u64 = elem.content_len - start
+    if effective_len > 8
+        return -1  # Too large for u64
+
+    var result: u64 = 0
+    var i: u64 = start
+    while i < elem.content_len
+        let b: u8 = elem.content[i]
+        result = (result << 8) | (b as u64)
+        i += 1
+
+    *out = result
+    return 0
+
+# Get BIT STRING content (returns pointer to content after unused-bits byte)
+# unused_bits: output for number of unused bits in last byte (0-7)
+# Returns: 0 on success, -1 on error
+pub fn der_bit_string_content(elem: *DerElement, data: **u8, data_len: *u64, unused_bits: *u8) -> i32
+    if der_is_bit_string(elem) != 1
+        return -1
+
+    if elem.content_len < 1
+        return -1
+
+    let ub: u8 = elem.content[0]
+    if ub > 7
+        return -1  # Invalid unused bits count
+
+    *unused_bits = ub
+    *data = &elem.content[1]
+    *data_len = elem.content_len - 1
+
+    return 0
+
+# ============================================================================
+# OID Decoding
+# ============================================================================
+
+# Maximum OID components we support
+const OID_MAX_COMPONENTS: i32 = 16
+
+# OID structure for decoded object identifiers
+struct Oid
+    components: [16]u32     # Up to 16 components
+    num_components: i32
+
+# Decode OID from DER element
+# Returns: 0 on success, -1 on error
+pub fn der_decode_oid(elem: *DerElement, oid: *Oid) -> i32
+    if der_is_oid(elem) != 1
+        return -1
+
+    if elem.content_len == 0
+        return -1
+
+    oid.num_components = 0
+
+    # First byte encodes first two components: value = 40*c1 + c2
+    let first_byte: u8 = elem.content[0]
+    let c1: u32 = (first_byte / 40) as u32
+    let c2: u32 = (first_byte % 40) as u32
+
+    oid.components[0] = c1
+    oid.components[1] = c2
+    oid.num_components = 2
+
+    # Remaining bytes are base-128 encoded components
+    var pos: u64 = 1
+    while pos < elem.content_len
+        var value: u32 = 0
+        var cont: i32 = 1
+        while cont == 1
+            if pos >= elem.content_len
+                return -1  # Truncated
+            let b: u8 = elem.content[pos]
+            pos += 1
+            value = (value << 7) | ((b & 0x7f) as u32)
+            if (b & 0x80) == 0
+                cont = 0
+            # Overflow check
+            if value > 0x0fffffff
+                return -1
+
+        if oid.num_components >= OID_MAX_COMPONENTS
+            return -1  # Too many components
+
+        oid.components[oid.num_components] = value
+        oid.num_components = oid.num_components + 1
+
+    return 0
+
+# Compare two OIDs
+# Returns: 1 if equal, 0 if different
+pub fn oid_equals(a: *Oid, b: *Oid) -> i32
+    if a.num_components != b.num_components
+        return 0
+
+    var i: i32 = 0
+    while i < a.num_components
+        if a.components[i] != b.components[i]
+            return 0
+        i += 1
+
+    return 1
+
+# Compare OID against inline components
+fn oid_equals_inline(oid: *Oid, c0: u32, c1: u32, c2: u32, c3: u32, c4: u32, c5: u32, c6: u32, c7: u32, c8: u32, num: i32) -> i32
+    if oid.num_components != num
+        return 0
+
+    if num >= 1
+        if oid.components[0] != c0
+            return 0
+    if num >= 2
+        if oid.components[1] != c1
+            return 0
+    if num >= 3
+        if oid.components[2] != c2
+            return 0
+    if num >= 4
+        if oid.components[3] != c3
+            return 0
+    if num >= 5
+        if oid.components[4] != c4
+            return 0
+    if num >= 6
+        if oid.components[5] != c5
+            return 0
+    if num >= 7
+        if oid.components[6] != c6
+            return 0
+    if num >= 8
+        if oid.components[7] != c7
+            return 0
+    if num >= 9
+        if oid.components[8] != c8
+            return 0
+
+    return 1
+
+# ============================================================================
+# Nested Structure Parsing
+# ============================================================================
+
+# Create a sub-parser for a constructed element's content
+pub fn der_enter_sequence(elem: *DerElement, sub: *DerParser) -> i32
+    if der_is_sequence(elem) != 1
+        return -1
+
+    der_parser_init(sub, elem.content, elem.content_len)
+    return 0
+
+pub fn der_enter_set(elem: *DerElement, sub: *DerParser) -> i32
+    if der_is_set(elem) != 1
+        return -1
+
+    der_parser_init(sub, elem.content, elem.content_len)
+    return 0
+
+# Enter any constructed element (for context-tagged wrappers)
+pub fn der_enter_constructed(elem: *DerElement, sub: *DerParser) -> i32
+    if elem.constructed != 1
+        return -1
+
+    der_parser_init(sub, elem.content, elem.content_len)
+    return 0
+
+# ============================================================================
+# Well-Known OIDs
+# ============================================================================
+
+# Signature algorithms
+# 1.2.840.113549.1.1.11 = sha256WithRSAEncryption
+pub fn oid_is_sha256_rsa(oid: *Oid) -> i32
+    return oid_equals_inline(oid, 1, 2, 840, 113549, 1, 1, 11, 0, 0, 7)
+
+# 1.2.840.113549.1.1.12 = sha384WithRSAEncryption
+pub fn oid_is_sha384_rsa(oid: *Oid) -> i32
+    return oid_equals_inline(oid, 1, 2, 840, 113549, 1, 1, 12, 0, 0, 7)
+
+# 1.2.840.113549.1.1.13 = sha512WithRSAEncryption
+pub fn oid_is_sha512_rsa(oid: *Oid) -> i32
+    return oid_equals_inline(oid, 1, 2, 840, 113549, 1, 1, 13, 0, 0, 7)
+
+# 1.2.840.10045.4.3.2 = ecdsa-with-SHA256
+pub fn oid_is_ecdsa_sha256(oid: *Oid) -> i32
+    return oid_equals_inline(oid, 1, 2, 840, 10045, 4, 3, 2, 0, 0, 7)
+
+# 1.2.840.10045.4.3.3 = ecdsa-with-SHA384
+pub fn oid_is_ecdsa_sha384(oid: *Oid) -> i32
+    return oid_equals_inline(oid, 1, 2, 840, 10045, 4, 3, 3, 0, 0, 7)
+
+# 1.3.101.112 = Ed25519
+pub fn oid_is_ed25519(oid: *Oid) -> i32
+    return oid_equals_inline(oid, 1, 3, 101, 112, 0, 0, 0, 0, 0, 4)
+
+# Public key algorithms
+# 1.2.840.113549.1.1.1 = rsaEncryption
+pub fn oid_is_rsa(oid: *Oid) -> i32
+    return oid_equals_inline(oid, 1, 2, 840, 113549, 1, 1, 1, 0, 0, 7)
+
+# 1.2.840.10045.2.1 = ecPublicKey
+pub fn oid_is_ec_public_key(oid: *Oid) -> i32
+    return oid_equals_inline(oid, 1, 2, 840, 10045, 2, 1, 0, 0, 0, 6)
+
+# Curves
+# 1.2.840.10045.3.1.7 = prime256v1 (P-256)
+pub fn oid_is_p256(oid: *Oid) -> i32
+    return oid_equals_inline(oid, 1, 2, 840, 10045, 3, 1, 7, 0, 0, 7)
+
+# 1.3.132.0.34 = secp384r1 (P-384)
+pub fn oid_is_p384(oid: *Oid) -> i32
+    return oid_equals_inline(oid, 1, 3, 132, 0, 34, 0, 0, 0, 0, 5)
+
+# X.500 distinguished name attributes
+# 2.5.4.3 = commonName (CN)
+pub fn oid_is_common_name(oid: *Oid) -> i32
+    return oid_equals_inline(oid, 2, 5, 4, 3, 0, 0, 0, 0, 0, 4)
+
+# 2.5.4.6 = countryName (C)
+pub fn oid_is_country_name(oid: *Oid) -> i32
+    return oid_equals_inline(oid, 2, 5, 4, 6, 0, 0, 0, 0, 0, 4)
+
+# 2.5.4.7 = localityName (L)
+pub fn oid_is_locality_name(oid: *Oid) -> i32
+    return oid_equals_inline(oid, 2, 5, 4, 7, 0, 0, 0, 0, 0, 4)
+
+# 2.5.4.8 = stateOrProvinceName (ST)
+pub fn oid_is_state_name(oid: *Oid) -> i32
+    return oid_equals_inline(oid, 2, 5, 4, 8, 0, 0, 0, 0, 0, 4)
+
+# 2.5.4.10 = organizationName (O)
+pub fn oid_is_org_name(oid: *Oid) -> i32
+    return oid_equals_inline(oid, 2, 5, 4, 10, 0, 0, 0, 0, 0, 4)
+
+# 2.5.4.11 = organizationalUnitName (OU)
+pub fn oid_is_org_unit_name(oid: *Oid) -> i32
+    return oid_equals_inline(oid, 2, 5, 4, 11, 0, 0, 0, 0, 0, 4)
+
+# X.509 extensions
+# 2.5.29.14 = subjectKeyIdentifier
+pub fn oid_is_subject_key_id(oid: *Oid) -> i32
+    return oid_equals_inline(oid, 2, 5, 29, 14, 0, 0, 0, 0, 0, 4)
+
+# 2.5.29.15 = keyUsage
+pub fn oid_is_key_usage(oid: *Oid) -> i32
+    return oid_equals_inline(oid, 2, 5, 29, 15, 0, 0, 0, 0, 0, 4)
+
+# 2.5.29.17 = subjectAltName
+pub fn oid_is_subject_alt_name(oid: *Oid) -> i32
+    return oid_equals_inline(oid, 2, 5, 29, 17, 0, 0, 0, 0, 0, 4)
+
+# 2.5.29.19 = basicConstraints
+pub fn oid_is_basic_constraints(oid: *Oid) -> i32
+    return oid_equals_inline(oid, 2, 5, 29, 19, 0, 0, 0, 0, 0, 4)
+
+# 2.5.29.35 = authorityKeyIdentifier
+pub fn oid_is_authority_key_id(oid: *Oid) -> i32
+    return oid_equals_inline(oid, 2, 5, 29, 35, 0, 0, 0, 0, 0, 4)
+
+# 2.5.29.37 = extKeyUsage
+pub fn oid_is_ext_key_usage(oid: *Oid) -> i32
+    return oid_equals_inline(oid, 2, 5, 29, 37, 0, 0, 0, 0, 0, 4)

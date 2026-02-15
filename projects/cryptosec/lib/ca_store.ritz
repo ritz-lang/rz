@@ -1,0 +1,302 @@
+# lib/ca_store.ritz - Root CA Certificate Store
+#
+# Provides loading and management of trusted root CA certificates
+# from PEM bundle files (like /etc/ssl/certs/ca-certificates.crt).
+#
+# The CA store uses arena allocation for efficient batch loading
+# of potentially hundreds of root certificates.
+#
+# Usage:
+#   var store: CaStore
+#   ca_store_init(&store)
+#   let loaded: i32 = ca_store_load_pem_file(&store, "/etc/ssl/certs/ca-certificates.crt")
+#   # ... use store for certificate verification ...
+#   ca_store_destroy(&store)
+#
+# References:
+#   - RFC 5280 (X.509 PKI)
+
+import ritzlib.sys
+import ritzlib.io
+
+import lib.mem
+import lib.pem
+import lib.x509
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+# Maximum certificates in store (can be increased if needed)
+const CA_STORE_MAX_CERTS: i32 = 256
+
+# Default arena size (4MB should hold ~256 certificates)
+const CA_STORE_ARENA_SIZE: i64 = 4194304
+
+# Maximum PEM file size to load (10MB)
+const CA_STORE_MAX_FILE_SIZE: i64 = 10485760
+
+# Buffer size for DER decoding
+const CA_STORE_DER_BUFFER_SIZE: i64 = 8192
+
+# mmap flags for portable usage
+const PROT_READ_WRITE: i32 = 3      # PROT_READ | PROT_WRITE
+const MAP_PRIVATE_ANON: i32 = 34    # MAP_PRIVATE | MAP_ANONYMOUS
+
+# ============================================================================
+# CA Store Structure
+# ============================================================================
+
+# Root CA certificate store
+pub struct CaStore
+    # Certificate storage - array of pointers to parsed certificates
+    certs: [256]*X509Certificate
+    cert_count: i32
+
+    # Arena for certificate data
+    arena_base: *u8
+    arena_size: i64
+    arena_offset: i64
+
+# ============================================================================
+# Arena Helpers (inline for CA store)
+# ============================================================================
+
+# Allocate from store's arena
+fn ca_arena_alloc(store: *CaStore, size: i64) -> *u8
+    if size <= 0
+        return null
+
+    # Align to 8 bytes
+    let aligned_size: i64 = (size + 7) & (0 - 8)
+
+    if store.arena_offset + aligned_size > store.arena_size
+        return null
+
+    let ptr: *u8 = store.arena_base + store.arena_offset
+    store.arena_offset = store.arena_offset + aligned_size
+    return ptr
+
+# Allocate a certificate struct from arena
+fn ca_alloc_cert(store: *CaStore) -> *X509Certificate
+    # X509Certificate is approximately 1200 bytes
+    let cert: *u8 = ca_arena_alloc(store, 1200)
+    if cert == null
+        return null
+    # Zero initialize
+    mem_zero(cert, 1200)
+    return cert as *X509Certificate
+
+# ============================================================================
+# Public API
+# ============================================================================
+
+# Initialize an empty CA store
+pub fn ca_store_init(store: *CaStore)
+    # Zero the certificate pointers
+    var i: i32 = 0
+    while i < CA_STORE_MAX_CERTS
+        store.certs[i] = null
+        i += 1
+    store.cert_count = 0
+
+    # Allocate arena
+    store.arena_base = sys_mmap(0, CA_STORE_ARENA_SIZE, PROT_READ_WRITE, MAP_PRIVATE_ANON, -1, 0)
+    if store.arena_base == (-1) as *u8
+        store.arena_base = null
+        store.arena_size = 0
+    else
+        store.arena_size = CA_STORE_ARENA_SIZE
+    store.arena_offset = 0
+
+# Destroy CA store and free memory
+pub fn ca_store_destroy(store: *CaStore)
+    if store.arena_base != null && store.arena_size > 0
+        sys_munmap(store.arena_base, store.arena_size)
+    store.arena_base = null
+    store.arena_size = 0
+    store.arena_offset = 0
+    store.cert_count = 0
+
+# Check if store is valid (arena allocated)
+pub fn ca_store_valid(store: *CaStore) -> i32
+    if store.arena_base != null
+        return 1
+    return 0
+
+# Get number of certificates in store
+pub fn ca_store_count(store: *CaStore) -> i32
+    return store.cert_count
+
+# Add a single certificate to the store (from DER bytes)
+# Returns: 1 on success, 0 on failure
+pub fn ca_store_add_cert_der(store: *CaStore, der_data: *u8, der_len: i64) -> i32
+    if store.cert_count >= CA_STORE_MAX_CERTS
+        return 0
+
+    # Allocate certificate struct
+    let cert: *X509Certificate = ca_alloc_cert(store)
+    if cert == null
+        return 0
+
+    # We need to copy DER data to arena since x509_parse_certificate stores
+    # pointers into the DER buffer (for tbs_data, der_data fields)
+    let der_copy: *u8 = ca_arena_alloc(store, der_len)
+    if der_copy == null
+        return 0
+    mem_copy(der_copy, der_data, der_len as u64)
+
+    # Parse certificate
+    let result: i32 = x509_parse_certificate(der_copy, der_len as u64, cert)
+    if result != 0
+        return 0
+
+    # Add to store
+    store.certs[store.cert_count] = cert
+    store.cert_count = store.cert_count + 1
+    return 1
+
+# Add a certificate from PEM data
+# Returns: 1 on success, 0 on failure
+pub fn ca_store_add_cert_pem(store: *CaStore, pem_data: *u8, pem_len: i64) -> i32
+    # Allocate DER buffer from arena temporarily
+    var der_buf: [8192]u8
+    var der_len: i64 = 0
+
+    let result: i32 = pem_parse_certificate(pem_data, pem_len, &der_buf[0], 8192, &der_len)
+    if result != 1
+        return 0
+
+    return ca_store_add_cert_der(store, &der_buf[0], der_len)
+
+# Load certificates from PEM bundle data (multiple certificates)
+# Returns: number of certificates loaded (>= 0)
+pub fn ca_store_load_pem_bundle(store: *CaStore, pem_data: *u8, pem_len: i64) -> i32
+    var iter: PemIterator
+    pem_iterator_init(&iter, pem_data, pem_len)
+
+    var loaded: i32 = 0
+    var entry: PemEntry
+    var der_buf: [8192]u8
+
+    while 1
+        let result: i32 = pem_iterator_next(&iter, &entry, &der_buf[0], 8192)
+        if result <= 0
+            break
+
+        # Check if this is a certificate
+        if entry.type_len != 11
+            continue
+        if entry.type_label[0] != 'C' || entry.type_label[1] != 'E' || entry.type_label[2] != 'R'
+            continue
+        if entry.type_label[3] != 'T' || entry.type_label[4] != 'I' || entry.type_label[5] != 'F'
+            continue
+        if entry.type_label[6] != 'I' || entry.type_label[7] != 'C' || entry.type_label[8] != 'A'
+            continue
+        if entry.type_label[9] != 'T' || entry.type_label[10] != 'E'
+            continue
+
+        # Add certificate to store
+        if ca_store_add_cert_der(store, entry.der_data, entry.der_len) == 1
+            loaded += 1
+
+        # Check capacity
+        if store.cert_count >= CA_STORE_MAX_CERTS
+            break
+
+    return loaded
+
+# Load certificates from a PEM bundle file
+# Returns: number of certificates loaded, or -1 on file error
+pub fn ca_store_load_pem_file(store: *CaStore, path: *u8, path_len: i32) -> i32
+    # Open file
+    # Need null-terminated path for sys_open
+    var path_buf: [256]u8
+    if path_len >= 255
+        return -1
+    var i: i32 = 0
+    while i < path_len
+        path_buf[i] = path[i]
+        i += 1
+    path_buf[path_len] = 0
+
+    let fd: i32 = sys_open(&path_buf[0], 0)  # O_RDONLY
+    if fd < 0
+        return -1
+
+    # Get file size via lseek
+    let size: i64 = sys_lseek(fd, 0, 2)  # SEEK_END
+    if size < 0 || size > CA_STORE_MAX_FILE_SIZE
+        sys_close(fd)
+        return -1
+
+    # Seek back to start
+    sys_lseek(fd, 0, 0)  # SEEK_SET
+
+    # Allocate buffer for file content
+    let file_buf: *u8 = sys_mmap(0, size, PROT_READ_WRITE, MAP_PRIVATE_ANON, -1, 0)
+    if file_buf == (-1) as *u8
+        sys_close(fd)
+        return -1
+
+    # Read file
+    var total_read: i64 = 0
+    while total_read < size
+        let to_read: i64 = size - total_read
+        let n: i64 = sys_read(fd, file_buf + total_read, to_read)
+        if n <= 0
+            break
+        total_read = total_read + n
+
+    sys_close(fd)
+
+    if total_read != size
+        sys_munmap(file_buf, size)
+        return -1
+
+    # Parse PEM bundle
+    let loaded: i32 = ca_store_load_pem_bundle(store, file_buf, size)
+
+    # Free file buffer
+    sys_munmap(file_buf, size)
+
+    return loaded
+
+# ============================================================================
+# Certificate Lookup
+# ============================================================================
+
+# Find a certificate by subject (for issuer lookup)
+# Returns: pointer to certificate, or null if not found
+pub fn ca_store_find_by_subject(store: *CaStore, subject: *X509Name) -> *X509Certificate
+    var i: i32 = 0
+    while i < store.cert_count
+        let cert: *X509Certificate = store.certs[i]
+        if cert != null
+            if x509_name_equals(&cert.subject, subject) == 1
+                return cert
+        i += 1
+    return null
+
+# Check if a certificate is in the store (by subject match)
+# Returns: 1 if found, 0 if not
+pub fn ca_store_contains(store: *CaStore, cert: *X509Certificate) -> i32
+    let found: *X509Certificate = ca_store_find_by_subject(store, &cert.subject)
+    if found != null
+        return 1
+    return 0
+
+# Get certificate at index
+pub fn ca_store_get(store: *CaStore, index: i32) -> *X509Certificate
+    if index < 0 || index >= store.cert_count
+        return null
+    return store.certs[index]
+
+# ============================================================================
+# Integration with x509_verify
+# ============================================================================
+
+# Get the certificate array for x509_verify_chain
+# Returns: pointer to array of certificate pointers
+pub fn ca_store_as_array(store: *CaStore) -> **X509Certificate
+    return &store.certs[0]

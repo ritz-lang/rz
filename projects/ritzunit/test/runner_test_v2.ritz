@@ -1,0 +1,257 @@
+# Standalone runner test v2 - with PIE base address handling
+#
+# For PIE executables, symbol values are virtual addresses relative to
+# the load base. We need to find the base address to compute real addresses.
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.memory
+import ritzlib.elf
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+const MAX_TESTS: i32 = 1024
+const SEEK_SET: i32 = 0
+const SEEK_END: i32 = 2
+
+# ============================================================================
+# Test Entry & Registry
+# ============================================================================
+
+struct TestEntry
+    name: *u8           # Pointer to name in string table
+    addr: i64           # Function virtual address from ELF
+
+var g_tests: [1024]TestEntry
+var g_test_count: i32 = 0
+var g_base_addr: i64 = 0  # PIE load base address
+
+# ============================================================================
+# PIE Base Address Detection
+# ============================================================================
+
+# For PIE executables, we need to find the load base.
+# We can do this by taking the address of a known function at runtime
+# and subtracting its virtual address from the symbol table.
+#
+# But we don't easily have access to both at this point in the code.
+# Alternative: Parse /proc/self/maps to find the text segment base.
+
+fn detect_base_address() -> i64
+    # Read /proc/self/maps
+    let fd: i32 = sys_open(c"/proc/self/maps", O_RDONLY)
+    if fd < 0
+        return 0
+
+    var buf: [4096]u8
+    let n: i64 = sys_read(fd, &buf as *u8, 4096)
+    sys_close(fd)
+
+    if n <= 0
+        return 0
+
+    # Parse first line to get the base address
+    # Format: 55aabc000000-55aabc001000 r--p 00000000 ...
+    # We just need the first hex number
+    var addr: i64 = 0
+    for i in 0..n
+        let c: u8 = buf[i]
+        if c == '-'
+            # End of first address
+            return addr
+        if c >= '0' && c <= '9'
+            addr = addr * 16 + (c - '0') as i64
+        else if c >= 'a' && c <= 'f'
+            addr = addr * 16 + (c - 'a' + 10) as i64
+
+    return addr
+
+# ============================================================================
+# Test Name Check
+# ============================================================================
+
+fn is_test_name(name: *u8) -> i32
+    if *name != 't'
+        return 0
+    if *(name + 1) != 'e'
+        return 0
+    if *(name + 2) != 's'
+        return 0
+    if *(name + 3) != 't'
+        return 0
+    if *(name + 4) != '_'
+        return 0
+    return 1
+
+# ============================================================================
+# Test Discovery
+# ============================================================================
+
+fn discover_tests() -> i32
+    # First, detect the PIE base address
+    g_base_addr = detect_base_address()
+
+    prints("PIE base address: 0x")
+    # Print base addr in hex would be nice, but let's just print decimal
+    print_int(g_base_addr)
+    prints("\n")
+
+    let fd: i32 = sys_open(c"/proc/self/exe", O_RDONLY)
+    if fd < 0
+        eprints("Error: failed to open /proc/self/exe\n")
+        return -1
+
+    let size: i64 = sys_lseek(fd, 0, SEEK_END)
+    sys_lseek(fd, 0, SEEK_SET)
+
+    if size <= 0
+        sys_close(fd)
+        eprints("Error: failed to get binary size\n")
+        return -1
+
+    let data: *u8 = malloc(size)
+    if data == null
+        sys_close(fd)
+        eprints("Error: failed to allocate memory\n")
+        return -1
+
+    let bytes_read: i64 = sys_read(fd, data, size)
+    sys_close(fd)
+
+    if bytes_read != size
+        free(data)
+        eprints("Error: failed to read binary\n")
+        return -1
+
+    var reader: ElfReader
+    if elf_init(&reader, data, size) != 0
+        free(data)
+        eprints("Error: not a valid ELF64 binary\n")
+        return -1
+
+    if elf_parse_sections(&reader) != 0
+        free(data)
+        eprints("Error: failed to parse ELF sections\n")
+        return -1
+
+    g_test_count = 0
+    var i: i64 = 0
+
+    while i < reader.symtab_count && g_test_count < MAX_TESTS
+        let info: u8 = elf_get_symbol_info(&reader, i)
+
+        if elf_is_function(info) != 0 && elf_is_global(info) != 0
+            let name: *u8 = elf_get_symbol_name(&reader, i)
+            if name != null && is_test_name(name) != 0
+                let sym_ptr: *u8 = (reader.symtab as *u8) + (i * 24)
+                let st_value: i64 = read_u64(sym_ptr + 8)
+
+                g_tests[g_test_count].name = name
+                g_tests[g_test_count].addr = st_value  # Store VA from symbol table
+                g_test_count += 1
+
+        i += 1
+
+    return g_test_count
+
+# ============================================================================
+# Test Execution
+# ============================================================================
+
+fn run_test(entry: *TestEntry) -> i32
+    # Compute actual runtime address: base + virtual_address
+    let runtime_addr: i64 = g_base_addr + entry.addr
+
+    prints("  Symbol VA=0x")
+    print_int(entry.addr)
+    prints(" + base -> runtime=0x")
+    print_int(runtime_addr)
+    prints("\n")
+
+    let test_fn: fn() -> i32 = runtime_addr as fn() -> i32
+    return test_fn()
+
+# ============================================================================
+# Main Runner
+# ============================================================================
+
+fn run_all_tests() -> i32
+    prints("=== ritzunit self-discovery test v2 ===\n\n")
+
+    let count: i32 = discover_tests()
+    if count < 0
+        return 1
+
+    if count == 0
+        prints("No tests found.\n")
+        return 0
+
+    prints("Discovered ")
+    print_int(count)
+    prints(" test(s):\n\n")
+
+    var passed: i32 = 0
+    var failed: i32 = 0
+
+    for i in 0..count
+        let entry: *TestEntry = &g_tests[i]
+        let name: *u8 = entry.name
+
+        prints("Running: ")
+        prints_cstr(name)
+        prints("\n")
+
+        let result: i32 = run_test(entry)
+
+        if result == 0
+            prints("  -> OK\n")
+            passed += 1
+        else
+            prints("  -> FAIL\n")
+            failed += 1
+
+    prints("\n")
+    print_int(passed)
+    prints(" passed, ")
+    print_int(failed)
+    prints(" failed\n")
+
+    return failed
+
+# ============================================================================
+# Actual Tests
+# ============================================================================
+
+fn test_simple_pass() -> i32
+    return 0
+
+fn test_addition() -> i32
+    let result: i32 = 2 + 2
+    if result == 4
+        return 0
+    return 1
+
+fn test_comparison() -> i32
+    if 5 > 3
+        return 0
+    return 1
+
+fn test_memory_ops() -> i32
+    var x: i32 = 42
+    var y: i32 = x * 2
+    if y == 84
+        return 0
+    return 1
+
+# Non-test helper
+fn helper() -> i32
+    return 99
+
+# ============================================================================
+# Entry Point
+# ============================================================================
+
+fn main() -> i32
+    return run_all_tests()

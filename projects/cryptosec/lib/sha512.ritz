@@ -1,0 +1,724 @@
+# lib/sha512.ritz - SHA-512 and SHA-384 implementation
+#
+# Implementation of SHA-512 and SHA-384 (FIPS 180-4) for cryptographic hashing.
+# SHA-512 uses 64-bit state words and 80 rounds.
+# SHA-384 is SHA-512 with different IV and truncated output.
+#
+# API:
+# - Sha512/Sha384 struct: hash context (state + buffer)
+# - sha512_init(ctx): Initialize context for SHA-512
+# - sha384_init(ctx): Initialize context for SHA-384
+# - sha512_update(ctx, data, len): Process data
+# - sha512_final(ctx, out): Finalize and output 64-byte hash
+# - sha384_final(ctx, out): Finalize and output 48-byte hash
+# - sha512(data, len, out): One-shot convenience function (64-byte output)
+# - sha384(data, len, out): One-shot convenience function (48-byte output)
+
+import ritzlib.sys
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+# SHA-512 block size in bytes (1024 bits)
+const SHA512_BLOCK_SIZE: u64 = 128
+
+# SHA-512 digest size in bytes
+const SHA512_DIGEST_SIZE: u64 = 64
+
+# SHA-384 digest size in bytes
+const SHA384_DIGEST_SIZE: u64 = 48
+
+# SHA-512 Initial hash values (first 64 bits of fractional parts of square roots of first 8 primes)
+const H512_0_INIT: u64 = 0x6a09e667f3bcc908
+const H512_1_INIT: u64 = 0xbb67ae8584caa73b
+const H512_2_INIT: u64 = 0x3c6ef372fe94f82b
+const H512_3_INIT: u64 = 0xa54ff53a5f1d36f1
+const H512_4_INIT: u64 = 0x510e527fade682d1
+const H512_5_INIT: u64 = 0x9b05688c2b3e6c1f
+const H512_6_INIT: u64 = 0x1f83d9abfb41bd6b
+const H512_7_INIT: u64 = 0x5be0cd19137e2179
+
+# SHA-384 Initial hash values (first 64 bits of fractional parts of square roots of 9th-16th primes)
+const H384_0_INIT: u64 = 0xcbbb9d5dc1059ed8
+const H384_1_INIT: u64 = 0x629a292a367cd507
+const H384_2_INIT: u64 = 0x9159015a3070dd17
+const H384_3_INIT: u64 = 0x152fecd8f70e5939
+const H384_4_INIT: u64 = 0x67332667ffc00b31
+const H384_5_INIT: u64 = 0x8eb44a8768581511
+const H384_6_INIT: u64 = 0xdb0c2e0d64f98fa7
+const H384_7_INIT: u64 = 0x47b5481dbefa4fa4
+
+# ============================================================================
+# SHA-512 Context
+# ============================================================================
+
+struct Sha512
+    # Hash state (8 x 64-bit words)
+    h0: u64
+    h1: u64
+    h2: u64
+    h3: u64
+    h4: u64
+    h5: u64
+    h6: u64
+    h7: u64
+    # Message buffer (128 bytes = 1024 bits = 1 block)
+    buffer: [128]u8
+    # Number of bytes in buffer
+    buflen: u64
+    # Total message length in bytes (low 64 bits - sufficient for most uses)
+    total_len: u64
+
+# SHA-384 uses same structure, just different IV and truncated output
+struct Sha384
+    h0: u64
+    h1: u64
+    h2: u64
+    h3: u64
+    h4: u64
+    h5: u64
+    h6: u64
+    h7: u64
+    buffer: [128]u8
+    buflen: u64
+    total_len: u64
+
+# ============================================================================
+# Bit operations (64-bit)
+# ============================================================================
+
+# Right rotate
+fn rotr64(x: u64, n: u64) -> u64
+    return (x >> n) | (x << (64 - n))
+
+# SHA-512 sigma functions
+fn sigma0_512(x: u64) -> u64
+    return rotr64(x, 28) ^ rotr64(x, 34) ^ rotr64(x, 39)
+
+fn sigma1_512(x: u64) -> u64
+    return rotr64(x, 14) ^ rotr64(x, 18) ^ rotr64(x, 41)
+
+fn gamma0_512(x: u64) -> u64
+    return rotr64(x, 1) ^ rotr64(x, 8) ^ (x >> 7)
+
+fn gamma1_512(x: u64) -> u64
+    return rotr64(x, 19) ^ rotr64(x, 61) ^ (x >> 6)
+
+# Choice: (x AND y) XOR (NOT x AND z)
+fn ch64(x: u64, y: u64, z: u64) -> u64
+    return (x & y) ^ ((~x) & z)
+
+# Majority: (x AND y) XOR (x AND z) XOR (y AND z)
+fn maj64(x: u64, y: u64, z: u64) -> u64
+    return (x & y) ^ (x & z) ^ (y & z)
+
+# ============================================================================
+# Round constants (K) - 80 constants for SHA-512
+# ============================================================================
+
+fn get_k512(i: i32) -> u64
+    if i == 0
+        return 0x428a2f98d728ae22
+    if i == 1
+        return 0x7137449123ef65cd
+    if i == 2
+        return 0xb5c0fbcfec4d3b2f
+    if i == 3
+        return 0xe9b5dba58189dbbc
+    if i == 4
+        return 0x3956c25bf348b538
+    if i == 5
+        return 0x59f111f1b605d019
+    if i == 6
+        return 0x923f82a4af194f9b
+    if i == 7
+        return 0xab1c5ed5da6d8118
+    if i == 8
+        return 0xd807aa98a3030242
+    if i == 9
+        return 0x12835b0145706fbe
+    if i == 10
+        return 0x243185be4ee4b28c
+    if i == 11
+        return 0x550c7dc3d5ffb4e2
+    if i == 12
+        return 0x72be5d74f27b896f
+    if i == 13
+        return 0x80deb1fe3b1696b1
+    if i == 14
+        return 0x9bdc06a725c71235
+    if i == 15
+        return 0xc19bf174cf692694
+    if i == 16
+        return 0xe49b69c19ef14ad2
+    if i == 17
+        return 0xefbe4786384f25e3
+    if i == 18
+        return 0x0fc19dc68b8cd5b5
+    if i == 19
+        return 0x240ca1cc77ac9c65
+    if i == 20
+        return 0x2de92c6f592b0275
+    if i == 21
+        return 0x4a7484aa6ea6e483
+    if i == 22
+        return 0x5cb0a9dcbd41fbd4
+    if i == 23
+        return 0x76f988da831153b5
+    if i == 24
+        return 0x983e5152ee66dfab
+    if i == 25
+        return 0xa831c66d2db43210
+    if i == 26
+        return 0xb00327c898fb213f
+    if i == 27
+        return 0xbf597fc7beef0ee4
+    if i == 28
+        return 0xc6e00bf33da88fc2
+    if i == 29
+        return 0xd5a79147930aa725
+    if i == 30
+        return 0x06ca6351e003826f
+    if i == 31
+        return 0x142929670a0e6e70
+    if i == 32
+        return 0x27b70a8546d22ffc
+    if i == 33
+        return 0x2e1b21385c26c926
+    if i == 34
+        return 0x4d2c6dfc5ac42aed
+    if i == 35
+        return 0x53380d139d95b3df
+    if i == 36
+        return 0x650a73548baf63de
+    if i == 37
+        return 0x766a0abb3c77b2a8
+    if i == 38
+        return 0x81c2c92e47edaee6
+    if i == 39
+        return 0x92722c851482353b
+    if i == 40
+        return 0xa2bfe8a14cf10364
+    if i == 41
+        return 0xa81a664bbc423001
+    if i == 42
+        return 0xc24b8b70d0f89791
+    if i == 43
+        return 0xc76c51a30654be30
+    if i == 44
+        return 0xd192e819d6ef5218
+    if i == 45
+        return 0xd69906245565a910
+    if i == 46
+        return 0xf40e35855771202a
+    if i == 47
+        return 0x106aa07032bbd1b8
+    if i == 48
+        return 0x19a4c116b8d2d0c8
+    if i == 49
+        return 0x1e376c085141ab53
+    if i == 50
+        return 0x2748774cdf8eeb99
+    if i == 51
+        return 0x34b0bcb5e19b48a8
+    if i == 52
+        return 0x391c0cb3c5c95a63
+    if i == 53
+        return 0x4ed8aa4ae3418acb
+    if i == 54
+        return 0x5b9cca4f7763e373
+    if i == 55
+        return 0x682e6ff3d6b2b8a3
+    if i == 56
+        return 0x748f82ee5defb2fc
+    if i == 57
+        return 0x78a5636f43172f60
+    if i == 58
+        return 0x84c87814a1f0ab72
+    if i == 59
+        return 0x8cc702081a6439ec
+    if i == 60
+        return 0x90befffa23631e28
+    if i == 61
+        return 0xa4506cebde82bde9
+    if i == 62
+        return 0xbef9a3f7b2c67915
+    if i == 63
+        return 0xc67178f2e372532b
+    if i == 64
+        return 0xca273eceea26619c
+    if i == 65
+        return 0xd186b8c721c0c207
+    if i == 66
+        return 0xeada7dd6cde0eb1e
+    if i == 67
+        return 0xf57d4f7fee6ed178
+    if i == 68
+        return 0x06f067aa72176fba
+    if i == 69
+        return 0x0a637dc5a2c898a6
+    if i == 70
+        return 0x113f9804bef90dae
+    if i == 71
+        return 0x1b710b35131c471b
+    if i == 72
+        return 0x28db77f523047d84
+    if i == 73
+        return 0x32caab7b40c72493
+    if i == 74
+        return 0x3c9ebe0a15c9bebc
+    if i == 75
+        return 0x431d67c49c100d4c
+    if i == 76
+        return 0x4cc5d4becb3e42b6
+    if i == 77
+        return 0x597f299cfc657e2a
+    if i == 78
+        return 0x5fcb6fab3ad6faec
+    if i == 79
+        return 0x6c44198c4a475817
+    return 0
+
+# ============================================================================
+# Block processing
+# ============================================================================
+
+# Process a single 128-byte block (used internally for both SHA-512 and SHA-384)
+fn sha512_transform_internal(h0: *u64, h1: *u64, h2: *u64, h3: *u64, h4: *u64, h5: *u64, h6: *u64, h7: *u64, block: *u8)
+    # Message schedule (80 words)
+    var w: [80]u64
+
+    # Load first 16 words from block (big-endian)
+    # NOTE: Must use intermediate variables due to Ritz compiler bug with
+    # direct cast from pointer dereference to wider integer types
+    var i: i32 = 0
+    while i < 16
+        let offset: i32 = i * 8
+        let t0: u8 = block[offset]
+        let t1: u8 = block[offset + 1]
+        let t2: u8 = block[offset + 2]
+        let t3: u8 = block[offset + 3]
+        let t4: u8 = block[offset + 4]
+        let t5: u8 = block[offset + 5]
+        let t6: u8 = block[offset + 6]
+        let t7: u8 = block[offset + 7]
+        let b0: u64 = t0 as u64
+        let b1: u64 = t1 as u64
+        let b2: u64 = t2 as u64
+        let b3: u64 = t3 as u64
+        let b4: u64 = t4 as u64
+        let b5: u64 = t5 as u64
+        let b6: u64 = t6 as u64
+        let b7: u64 = t7 as u64
+        w[i] = (b0 << 56) | (b1 << 48) | (b2 << 40) | (b3 << 32) | (b4 << 24) | (b5 << 16) | (b6 << 8) | b7
+        i += 1
+
+    # Extend to 80 words
+    while i < 80
+        w[i] = gamma1_512(w[i - 2]) + w[i - 7] + gamma0_512(w[i - 15]) + w[i - 16]
+        i += 1
+
+    # Working variables
+    var a: u64 = *h0
+    var b: u64 = *h1
+    var c: u64 = *h2
+    var d: u64 = *h3
+    var e: u64 = *h4
+    var f: u64 = *h5
+    var g: u64 = *h6
+    var h: u64 = *h7
+
+    # 80 rounds
+    i = 0
+    while i < 80
+        let t1: u64 = h + sigma1_512(e) + ch64(e, f, g) + get_k512(i) + w[i]
+        let t2: u64 = sigma0_512(a) + maj64(a, b, c)
+        h = g
+        g = f
+        f = e
+        e = d + t1
+        d = c
+        c = b
+        b = a
+        a = t1 + t2
+        i += 1
+
+    # Add to hash state
+    *h0 = *h0 + a
+    *h1 = *h1 + b
+    *h2 = *h2 + c
+    *h3 = *h3 + d
+    *h4 = *h4 + e
+    *h5 = *h5 + f
+    *h6 = *h6 + g
+    *h7 = *h7 + h
+
+# Transform wrapper for Sha512
+fn sha512_transform(ctx: *Sha512, block: *u8)
+    sha512_transform_internal(&ctx.h0, &ctx.h1, &ctx.h2, &ctx.h3, &ctx.h4, &ctx.h5, &ctx.h6, &ctx.h7, block)
+
+# Transform wrapper for Sha384
+fn sha384_transform(ctx: *Sha384, block: *u8)
+    sha512_transform_internal(&ctx.h0, &ctx.h1, &ctx.h2, &ctx.h3, &ctx.h4, &ctx.h5, &ctx.h6, &ctx.h7, block)
+
+# ============================================================================
+# Public API - SHA-512
+# ============================================================================
+
+# Create new SHA-512 context (uninitialized)
+pub fn sha512_new() -> Sha512
+    var ctx: Sha512
+    ctx.h0 = 0
+    ctx.h1 = 0
+    ctx.h2 = 0
+    ctx.h3 = 0
+    ctx.h4 = 0
+    ctx.h5 = 0
+    ctx.h6 = 0
+    ctx.h7 = 0
+    ctx.buflen = 0
+    ctx.total_len = 0
+    return ctx
+
+# Initialize SHA-512 context
+pub fn sha512_init(ctx: *Sha512)
+    ctx.h0 = H512_0_INIT
+    ctx.h1 = H512_1_INIT
+    ctx.h2 = H512_2_INIT
+    ctx.h3 = H512_3_INIT
+    ctx.h4 = H512_4_INIT
+    ctx.h5 = H512_5_INIT
+    ctx.h6 = H512_6_INIT
+    ctx.h7 = H512_7_INIT
+    ctx.buflen = 0
+    ctx.total_len = 0
+
+    # Zero the buffer
+    var i: i32 = 0
+    while i < 128
+        ctx.buffer[i] = 0
+        i += 1
+
+# Update SHA-512 context with data
+pub fn sha512_update(ctx: *Sha512, data: *u8, len: u64)
+    if len == 0
+        return
+
+    ctx.total_len = ctx.total_len + len
+
+    var offset: u64 = 0
+
+    # If we have buffered data, try to complete a block
+    if ctx.buflen > 0
+        let space: u64 = 128 - ctx.buflen
+        var to_copy: u64 = len
+        if len > space
+            to_copy = space
+
+        # Copy to buffer
+        var i: u64 = 0
+        while i < to_copy
+            ctx.buffer[ctx.buflen + i] = data[i]
+            i += 1
+        ctx.buflen = ctx.buflen + to_copy
+        offset = to_copy
+
+        # If buffer is full, process it
+        if ctx.buflen == 128
+            sha512_transform(ctx, &ctx.buffer[0])
+            ctx.buflen = 0
+
+    # Process full blocks directly from input
+    while offset + 128 <= len
+        sha512_transform(ctx, (data as u64 + offset) as *u8)
+        offset = offset + 128
+
+    # Buffer remaining bytes
+    while offset < len
+        ctx.buffer[ctx.buflen] = data[offset]
+        ctx.buflen = ctx.buflen + 1
+        offset += 1
+
+# Finalize SHA-512 and output 64-byte hash
+pub fn sha512_final(ctx: *Sha512, out: *u8)
+    # Padding: append 1 bit, then zeros, then 128-bit length
+    let total_bits: u64 = ctx.total_len * 8
+
+    # Append 0x80 (1 bit followed by zeros)
+    ctx.buffer[ctx.buflen] = 0x80
+    ctx.buflen = ctx.buflen + 1
+
+    # If not enough room for length (need 16 bytes), pad and process
+    if ctx.buflen > 112
+        while ctx.buflen < 128
+            ctx.buffer[ctx.buflen] = 0
+            ctx.buflen = ctx.buflen + 1
+        sha512_transform(ctx, &ctx.buffer[0])
+        ctx.buflen = 0
+
+    # Pad with zeros up to length field
+    while ctx.buflen < 112
+        ctx.buffer[ctx.buflen] = 0
+        ctx.buflen = ctx.buflen + 1
+
+    # Append length in bits (big-endian, 128 bits - upper 64 bits are 0 for us)
+    ctx.buffer[112] = 0
+    ctx.buffer[113] = 0
+    ctx.buffer[114] = 0
+    ctx.buffer[115] = 0
+    ctx.buffer[116] = 0
+    ctx.buffer[117] = 0
+    ctx.buffer[118] = 0
+    ctx.buffer[119] = 0
+    ctx.buffer[120] = (total_bits >> 56) as u8
+    ctx.buffer[121] = (total_bits >> 48) as u8
+    ctx.buffer[122] = (total_bits >> 40) as u8
+    ctx.buffer[123] = (total_bits >> 32) as u8
+    ctx.buffer[124] = (total_bits >> 24) as u8
+    ctx.buffer[125] = (total_bits >> 16) as u8
+    ctx.buffer[126] = (total_bits >> 8) as u8
+    ctx.buffer[127] = total_bits as u8
+
+    # Process final block
+    sha512_transform(ctx, &ctx.buffer[0])
+
+    # Output hash (big-endian)
+    out[0] = (ctx.h0 >> 56) as u8
+    out[1] = (ctx.h0 >> 48) as u8
+    out[2] = (ctx.h0 >> 40) as u8
+    out[3] = (ctx.h0 >> 32) as u8
+    out[4] = (ctx.h0 >> 24) as u8
+    out[5] = (ctx.h0 >> 16) as u8
+    out[6] = (ctx.h0 >> 8) as u8
+    out[7] = ctx.h0 as u8
+    out[8] = (ctx.h1 >> 56) as u8
+    out[9] = (ctx.h1 >> 48) as u8
+    out[10] = (ctx.h1 >> 40) as u8
+    out[11] = (ctx.h1 >> 32) as u8
+    out[12] = (ctx.h1 >> 24) as u8
+    out[13] = (ctx.h1 >> 16) as u8
+    out[14] = (ctx.h1 >> 8) as u8
+    out[15] = ctx.h1 as u8
+    out[16] = (ctx.h2 >> 56) as u8
+    out[17] = (ctx.h2 >> 48) as u8
+    out[18] = (ctx.h2 >> 40) as u8
+    out[19] = (ctx.h2 >> 32) as u8
+    out[20] = (ctx.h2 >> 24) as u8
+    out[21] = (ctx.h2 >> 16) as u8
+    out[22] = (ctx.h2 >> 8) as u8
+    out[23] = ctx.h2 as u8
+    out[24] = (ctx.h3 >> 56) as u8
+    out[25] = (ctx.h3 >> 48) as u8
+    out[26] = (ctx.h3 >> 40) as u8
+    out[27] = (ctx.h3 >> 32) as u8
+    out[28] = (ctx.h3 >> 24) as u8
+    out[29] = (ctx.h3 >> 16) as u8
+    out[30] = (ctx.h3 >> 8) as u8
+    out[31] = ctx.h3 as u8
+    out[32] = (ctx.h4 >> 56) as u8
+    out[33] = (ctx.h4 >> 48) as u8
+    out[34] = (ctx.h4 >> 40) as u8
+    out[35] = (ctx.h4 >> 32) as u8
+    out[36] = (ctx.h4 >> 24) as u8
+    out[37] = (ctx.h4 >> 16) as u8
+    out[38] = (ctx.h4 >> 8) as u8
+    out[39] = ctx.h4 as u8
+    out[40] = (ctx.h5 >> 56) as u8
+    out[41] = (ctx.h5 >> 48) as u8
+    out[42] = (ctx.h5 >> 40) as u8
+    out[43] = (ctx.h5 >> 32) as u8
+    out[44] = (ctx.h5 >> 24) as u8
+    out[45] = (ctx.h5 >> 16) as u8
+    out[46] = (ctx.h5 >> 8) as u8
+    out[47] = ctx.h5 as u8
+    out[48] = (ctx.h6 >> 56) as u8
+    out[49] = (ctx.h6 >> 48) as u8
+    out[50] = (ctx.h6 >> 40) as u8
+    out[51] = (ctx.h6 >> 32) as u8
+    out[52] = (ctx.h6 >> 24) as u8
+    out[53] = (ctx.h6 >> 16) as u8
+    out[54] = (ctx.h6 >> 8) as u8
+    out[55] = ctx.h6 as u8
+    out[56] = (ctx.h7 >> 56) as u8
+    out[57] = (ctx.h7 >> 48) as u8
+    out[58] = (ctx.h7 >> 40) as u8
+    out[59] = (ctx.h7 >> 32) as u8
+    out[60] = (ctx.h7 >> 24) as u8
+    out[61] = (ctx.h7 >> 16) as u8
+    out[62] = (ctx.h7 >> 8) as u8
+    out[63] = ctx.h7 as u8
+
+# One-shot SHA-512 hash function
+pub fn sha512(data: *u8, len: u64, out: *u8)
+    var ctx: Sha512
+    sha512_init(&ctx)
+    sha512_update(&ctx, data, len)
+    sha512_final(&ctx, out)
+
+# ============================================================================
+# Public API - SHA-384
+# ============================================================================
+
+# Create new SHA-384 context (uninitialized)
+pub fn sha384_new() -> Sha384
+    var ctx: Sha384
+    ctx.h0 = 0
+    ctx.h1 = 0
+    ctx.h2 = 0
+    ctx.h3 = 0
+    ctx.h4 = 0
+    ctx.h5 = 0
+    ctx.h6 = 0
+    ctx.h7 = 0
+    ctx.buflen = 0
+    ctx.total_len = 0
+    return ctx
+
+# Initialize SHA-384 context
+pub fn sha384_init(ctx: *Sha384)
+    ctx.h0 = H384_0_INIT
+    ctx.h1 = H384_1_INIT
+    ctx.h2 = H384_2_INIT
+    ctx.h3 = H384_3_INIT
+    ctx.h4 = H384_4_INIT
+    ctx.h5 = H384_5_INIT
+    ctx.h6 = H384_6_INIT
+    ctx.h7 = H384_7_INIT
+    ctx.buflen = 0
+    ctx.total_len = 0
+
+    # Zero the buffer
+    var i: i32 = 0
+    while i < 128
+        ctx.buffer[i] = 0
+        i += 1
+
+# Update SHA-384 context with data
+pub fn sha384_update(ctx: *Sha384, data: *u8, len: u64)
+    if len == 0
+        return
+
+    ctx.total_len = ctx.total_len + len
+
+    var offset: u64 = 0
+
+    if ctx.buflen > 0
+        let space: u64 = 128 - ctx.buflen
+        var to_copy: u64 = len
+        if len > space
+            to_copy = space
+
+        var i: u64 = 0
+        while i < to_copy
+            ctx.buffer[ctx.buflen + i] = data[i]
+            i += 1
+        ctx.buflen = ctx.buflen + to_copy
+        offset = to_copy
+
+        if ctx.buflen == 128
+            sha384_transform(ctx, &ctx.buffer[0])
+            ctx.buflen = 0
+
+    while offset + 128 <= len
+        sha384_transform(ctx, (data as u64 + offset) as *u8)
+        offset = offset + 128
+
+    while offset < len
+        ctx.buffer[ctx.buflen] = data[offset]
+        ctx.buflen = ctx.buflen + 1
+        offset += 1
+
+# Finalize SHA-384 and output 48-byte hash (truncated SHA-512)
+pub fn sha384_final(ctx: *Sha384, out: *u8)
+    let total_bits: u64 = ctx.total_len * 8
+
+    ctx.buffer[ctx.buflen] = 0x80
+    ctx.buflen = ctx.buflen + 1
+
+    if ctx.buflen > 112
+        while ctx.buflen < 128
+            ctx.buffer[ctx.buflen] = 0
+            ctx.buflen = ctx.buflen + 1
+        sha384_transform(ctx, &ctx.buffer[0])
+        ctx.buflen = 0
+
+    while ctx.buflen < 112
+        ctx.buffer[ctx.buflen] = 0
+        ctx.buflen = ctx.buflen + 1
+
+    ctx.buffer[112] = 0
+    ctx.buffer[113] = 0
+    ctx.buffer[114] = 0
+    ctx.buffer[115] = 0
+    ctx.buffer[116] = 0
+    ctx.buffer[117] = 0
+    ctx.buffer[118] = 0
+    ctx.buffer[119] = 0
+    ctx.buffer[120] = (total_bits >> 56) as u8
+    ctx.buffer[121] = (total_bits >> 48) as u8
+    ctx.buffer[122] = (total_bits >> 40) as u8
+    ctx.buffer[123] = (total_bits >> 32) as u8
+    ctx.buffer[124] = (total_bits >> 24) as u8
+    ctx.buffer[125] = (total_bits >> 16) as u8
+    ctx.buffer[126] = (total_bits >> 8) as u8
+    ctx.buffer[127] = total_bits as u8
+
+    sha384_transform(ctx, &ctx.buffer[0])
+
+    # Output first 6 words (48 bytes) - truncate h6 and h7
+    out[0] = (ctx.h0 >> 56) as u8
+    out[1] = (ctx.h0 >> 48) as u8
+    out[2] = (ctx.h0 >> 40) as u8
+    out[3] = (ctx.h0 >> 32) as u8
+    out[4] = (ctx.h0 >> 24) as u8
+    out[5] = (ctx.h0 >> 16) as u8
+    out[6] = (ctx.h0 >> 8) as u8
+    out[7] = ctx.h0 as u8
+    out[8] = (ctx.h1 >> 56) as u8
+    out[9] = (ctx.h1 >> 48) as u8
+    out[10] = (ctx.h1 >> 40) as u8
+    out[11] = (ctx.h1 >> 32) as u8
+    out[12] = (ctx.h1 >> 24) as u8
+    out[13] = (ctx.h1 >> 16) as u8
+    out[14] = (ctx.h1 >> 8) as u8
+    out[15] = ctx.h1 as u8
+    out[16] = (ctx.h2 >> 56) as u8
+    out[17] = (ctx.h2 >> 48) as u8
+    out[18] = (ctx.h2 >> 40) as u8
+    out[19] = (ctx.h2 >> 32) as u8
+    out[20] = (ctx.h2 >> 24) as u8
+    out[21] = (ctx.h2 >> 16) as u8
+    out[22] = (ctx.h2 >> 8) as u8
+    out[23] = ctx.h2 as u8
+    out[24] = (ctx.h3 >> 56) as u8
+    out[25] = (ctx.h3 >> 48) as u8
+    out[26] = (ctx.h3 >> 40) as u8
+    out[27] = (ctx.h3 >> 32) as u8
+    out[28] = (ctx.h3 >> 24) as u8
+    out[29] = (ctx.h3 >> 16) as u8
+    out[30] = (ctx.h3 >> 8) as u8
+    out[31] = ctx.h3 as u8
+    out[32] = (ctx.h4 >> 56) as u8
+    out[33] = (ctx.h4 >> 48) as u8
+    out[34] = (ctx.h4 >> 40) as u8
+    out[35] = (ctx.h4 >> 32) as u8
+    out[36] = (ctx.h4 >> 24) as u8
+    out[37] = (ctx.h4 >> 16) as u8
+    out[38] = (ctx.h4 >> 8) as u8
+    out[39] = ctx.h4 as u8
+    out[40] = (ctx.h5 >> 56) as u8
+    out[41] = (ctx.h5 >> 48) as u8
+    out[42] = (ctx.h5 >> 40) as u8
+    out[43] = (ctx.h5 >> 32) as u8
+    out[44] = (ctx.h5 >> 24) as u8
+    out[45] = (ctx.h5 >> 16) as u8
+    out[46] = (ctx.h5 >> 8) as u8
+    out[47] = ctx.h5 as u8
+
+# One-shot SHA-384 hash function
+pub fn sha384(data: *u8, len: u64, out: *u8)
+    var ctx: Sha384
+    sha384_init(&ctx)
+    sha384_update(&ctx, data, len)
+    sha384_final(&ctx, out)

@@ -1,0 +1,294 @@
+# Poly1305 Message Authentication Code
+# RFC 8439 compliant
+#
+# Poly1305 is a one-time authenticator designed by Daniel J. Bernstein.
+# It produces a 16-byte tag from a message and a one-time 32-byte key.
+#
+# This implementation uses radix-2^26 representation (5 limbs) for
+# easier arithmetic without overflow.
+
+import mem
+
+# =============================================================================
+# Poly1305 Context
+# =============================================================================
+
+# Using 5 x 26-bit limbs for accumulator (h) and multiplier (r)
+# This fits within 32-bit values and allows multiplication without overflow
+struct Poly1305
+    h0: u32
+    h1: u32
+    h2: u32
+    h3: u32
+    h4: u32
+    r0: u32
+    r1: u32
+    r2: u32
+    r3: u32
+    r4: u32
+    s: [16]u8    # Final addition value
+    buf: [16]u8  # Buffer for partial blocks
+    buf_len: i64 # Number of bytes in buffer
+
+# =============================================================================
+# Helper Functions
+# =============================================================================
+
+fn poly_load32_le(src: *u8) -> u32
+    (src[0] as u32) | ((src[1] as u32) << 8) | ((src[2] as u32) << 16) | ((src[3] as u32) << 24)
+
+fn poly_store32_le(dst: *u8, val: u32) -> void
+    dst[0] = (val & 0xff) as u8
+    dst[1] = ((val >> 8) & 0xff) as u8
+    dst[2] = ((val >> 16) & 0xff) as u8
+    dst[3] = ((val >> 24) & 0xff) as u8
+
+# =============================================================================
+# Poly1305 Implementation
+# =============================================================================
+
+pub fn poly1305_init(ctx: *Poly1305, key: *u8) -> void
+    # Load r and clamp
+    var t0: u32 = poly_load32_le(&key[0])
+    var t1: u32 = poly_load32_le(&key[4])
+    var t2: u32 = poly_load32_le(&key[8])
+    var t3: u32 = poly_load32_le(&key[12])
+
+    # Clamp r according to RFC 8439
+    # r[3], r[7], r[11], r[15] are ANDed with 0x0f
+    # r[4], r[8], r[12] are ANDed with 0xfc
+    t0 = t0 & 0x0fffffff
+    t1 = t1 & 0x0ffffffc
+    t2 = t2 & 0x0ffffffc
+    t3 = t3 & 0x0ffffffc
+
+    # Convert to radix-2^26
+    ctx.r0 = t0 & 0x3ffffff
+    ctx.r1 = ((t0 >> 26) | (t1 << 6)) & 0x3ffffff
+    ctx.r2 = ((t1 >> 20) | (t2 << 12)) & 0x3ffffff
+    ctx.r3 = ((t2 >> 14) | (t3 << 18)) & 0x3ffffff
+    ctx.r4 = t3 >> 8
+
+    # Initialize accumulator to zero
+    ctx.h0 = 0
+    ctx.h1 = 0
+    ctx.h2 = 0
+    ctx.h3 = 0
+    ctx.h4 = 0
+
+    # Store s (second half of key)
+    mem_copy(&ctx.s[0], &key[16], 16)
+
+    # Initialize buffer
+    ctx.buf_len = 0
+
+# Helper function to process a single 17-byte block (16 data bytes + terminator)
+fn poly_process_block(ctx: *Poly1305, block: *u8) -> void
+    # Load into 32-bit words
+    let t0: u32 = poly_load32_le(&block[0])
+    let t1: u32 = poly_load32_le(&block[4])
+    let t2: u32 = poly_load32_le(&block[8])
+    let t3: u32 = poly_load32_le(&block[12])
+    let t4: u32 = block[16] as u32  # Terminator byte (0x01 for full blocks)
+
+    # Convert to radix-2^26 and add to h
+    var h0: u64 = (ctx.h0 as u64) + ((t0 & 0x3ffffff) as u64)
+    var h1: u64 = (ctx.h1 as u64) + ((((t0 >> 26) | (t1 << 6)) & 0x3ffffff) as u64)
+    var h2: u64 = (ctx.h2 as u64) + ((((t1 >> 20) | (t2 << 12)) & 0x3ffffff) as u64)
+    var h3: u64 = (ctx.h3 as u64) + ((((t2 >> 14) | (t3 << 18)) & 0x3ffffff) as u64)
+    var h4: u64 = (ctx.h4 as u64) + (((t3 >> 8) | (t4 << 24)) as u64)
+
+    # Precompute r * 5 for reduction
+    let s1: u32 = ctx.r1 * 5
+    let s2: u32 = ctx.r2 * 5
+    let s3: u32 = ctx.r3 * 5
+    let s4: u32 = ctx.r4 * 5
+
+    # Multiply h by r
+    var d0: u64 = h0*(ctx.r0 as u64) + h1*(s4 as u64) + h2*(s3 as u64) + h3*(s2 as u64) + h4*(s1 as u64)
+    var d1: u64 = h0*(ctx.r1 as u64) + h1*(ctx.r0 as u64) + h2*(s4 as u64) + h3*(s3 as u64) + h4*(s2 as u64)
+    var d2: u64 = h0*(ctx.r2 as u64) + h1*(ctx.r1 as u64) + h2*(ctx.r0 as u64) + h3*(s4 as u64) + h4*(s3 as u64)
+    var d3: u64 = h0*(ctx.r3 as u64) + h1*(ctx.r2 as u64) + h2*(ctx.r1 as u64) + h3*(ctx.r0 as u64) + h4*(s4 as u64)
+    var d4: u64 = h0*(ctx.r4 as u64) + h1*(ctx.r3 as u64) + h2*(ctx.r2 as u64) + h3*(ctx.r1 as u64) + h4*(ctx.r0 as u64)
+
+    # Partial reduction mod 2^130-5
+    var c: u64 = d0 >> 26
+    ctx.h0 = (d0 & 0x3ffffff) as u32
+    d1 = d1 + c
+
+    c = d1 >> 26
+    ctx.h1 = (d1 & 0x3ffffff) as u32
+    d2 = d2 + c
+
+    c = d2 >> 26
+    ctx.h2 = (d2 & 0x3ffffff) as u32
+    d3 = d3 + c
+
+    c = d3 >> 26
+    ctx.h3 = (d3 & 0x3ffffff) as u32
+    d4 = d4 + c
+
+    c = d4 >> 26
+    ctx.h4 = (d4 & 0x3ffffff) as u32
+
+    # Final reduction: c * 5 added back to h0
+    ctx.h0 = ctx.h0 + ((c * 5) as u32)
+    c = (ctx.h0 >> 26) as u64
+    ctx.h0 = ctx.h0 & 0x3ffffff
+    ctx.h1 = ctx.h1 + (c as u32)
+
+pub fn poly1305_update(ctx: *Poly1305, data: *u8, len: i64) -> void
+    var offset: i64 = 0
+
+    # Fill buffer first if it has partial data
+    if ctx.buf_len > 0
+        var space: i64 = 16 - ctx.buf_len
+        var to_copy: i64 = len
+        if to_copy > space
+            to_copy = space
+
+        mem_copy(&ctx.buf[ctx.buf_len], data, to_copy)
+        ctx.buf_len = ctx.buf_len + to_copy
+        offset = to_copy
+
+        # Process block if buffer is full
+        if ctx.buf_len == 16
+            var block: [17]u8
+            mem_copy(&block[0], &ctx.buf[0], 16)
+            block[16] = 1  # Add 0x01 byte after the 16 bytes
+            poly_process_block(ctx, &block[0])
+            ctx.buf_len = 0
+
+    # Process remaining data
+    while offset < len
+        var remaining: i64 = len - offset
+        if remaining >= 16
+            # Process full block
+            var block: [17]u8
+            mem_copy(&block[0], &data[offset], 16)
+            block[16] = 1  # Add 0x01 byte
+            poly_process_block(ctx, &block[0])
+            offset = offset + 16
+        else
+            # Buffer partial block
+            mem_copy(&ctx.buf[0], &data[offset], remaining)
+            ctx.buf_len = remaining
+            offset = len
+
+pub fn poly1305_final(ctx: *Poly1305, out: *u8) -> void
+    # Process any remaining buffered data
+    if ctx.buf_len > 0
+        # Create a block with the buffered data and add the 0x01 terminator
+        var block: [17]u8
+        mem_zero(&block[0], 17)
+        mem_copy(&block[0], &ctx.buf[0], ctx.buf_len)
+        block[ctx.buf_len] = 1  # Add 0x01 after the partial block
+        poly_process_block(ctx, &block[0])
+
+    # Full reduction - propagate carries through all limbs
+    var h0: u32 = ctx.h0
+    var h1: u32 = ctx.h1
+    var h2: u32 = ctx.h2
+    var h3: u32 = ctx.h3
+    var h4: u32 = ctx.h4
+
+    # First pass: propagate carries
+    var c: u32 = h0 >> 26
+    h0 = h0 & 0x3ffffff
+    h1 = h1 + c
+
+    c = h1 >> 26
+    h1 = h1 & 0x3ffffff
+    h2 = h2 + c
+
+    c = h2 >> 26
+    h2 = h2 & 0x3ffffff
+    h3 = h3 + c
+
+    c = h3 >> 26
+    h3 = h3 & 0x3ffffff
+    h4 = h4 + c
+
+    c = h4 >> 26
+    h4 = h4 & 0x3ffffff
+    h0 = h0 + c * 5
+
+    c = h0 >> 26
+    h0 = h0 & 0x3ffffff
+    h1 = h1 + c
+
+    # Compute h + (-p) to check if h >= p
+    # -p = 5 - 2^130 in our representation
+    var g0: u32 = h0 + 5
+    c = g0 >> 26
+    g0 = g0 & 0x3ffffff
+
+    var g1: u32 = h1 + c
+    c = g1 >> 26
+    g1 = g1 & 0x3ffffff
+
+    var g2: u32 = h2 + c
+    c = g2 >> 26
+    g2 = g2 & 0x3ffffff
+
+    var g3: u32 = h3 + c
+    c = g3 >> 26
+    g3 = g3 & 0x3ffffff
+
+    var g4: u32 = h4 + c
+    g4 = g4 - (1 << 26)  # Subtract 2^26
+
+    # If g4's high bit is 0, h >= p, so use g
+    # mask = (g4 >> 31) - 1 = all 1s if g4 >= 0, all 0s if g4 < 0
+    let mask: u32 = (g4 >> 31) - 1
+    let nmask: u32 = mask ^ 0xffffffff
+
+    h0 = (h0 & nmask) | (g0 & mask)
+    h1 = (h1 & nmask) | (g1 & mask)
+    h2 = (h2 & nmask) | (g2 & mask)
+    h3 = (h3 & nmask) | (g3 & mask)
+    h4 = (h4 & nmask) | (g4 & mask)
+
+    # Convert from radix-2^26 back to 32-bit words
+    # h = h0*2^0 + h1*2^26 + h2*2^52 + h3*2^78 + h4*2^104
+    # We need to extract the low 128 bits as four 32-bit words
+    #
+    # Each limb is exactly 26 bits after full reduction, so:
+    # f0 = bits 0-31  = h0[0:26] | h1[0:6]<<26
+    # f1 = bits 32-63 = h1[6:26] | h2[0:12]<<20
+    # f2 = bits 64-95 = h2[12:26] | h3[0:18]<<14
+    # f3 = bits 96-127 = h3[18:26] | h4[0:24]<<8
+    #
+    # Use OR (not addition) since the bit ranges don't overlap
+
+    var f0: u64 = ((h0 & 0x3ffffff) as u64) | (((h1 & 0x3f) as u64) << 26)
+    var f1: u64 = (((h1 >> 6) & 0xfffff) as u64) | (((h2 & 0xfff) as u64) << 20)
+    var f2: u64 = (((h2 >> 12) & 0x3fff) as u64) | (((h3 & 0x3ffff) as u64) << 14)
+    var f3: u64 = (((h3 >> 18) & 0xff) as u64) | (((h4 & 0xffffff) as u64) << 8)
+
+    # Add s (the final one-time-pad addition)
+    f0 = f0 + (poly_load32_le(&ctx.s[0]) as u64)
+    f1 = f1 + (poly_load32_le(&ctx.s[4]) as u64)
+    f2 = f2 + (poly_load32_le(&ctx.s[8]) as u64)
+    f3 = f3 + (poly_load32_le(&ctx.s[12]) as u64)
+
+    # Propagate carries from addition
+    f1 = f1 + (f0 >> 32)
+    f2 = f2 + (f1 >> 32)
+    f3 = f3 + (f2 >> 32)
+
+    poly_store32_le(&out[0], (f0 & 0xffffffff) as u32)
+    poly_store32_le(&out[4], (f1 & 0xffffffff) as u32)
+    poly_store32_le(&out[8], (f2 & 0xffffffff) as u32)
+    poly_store32_le(&out[12], (f3 & 0xffffffff) as u32)
+
+# =============================================================================
+# One-shot API
+# =============================================================================
+
+pub fn poly1305_mac(key: *u8, data: *u8, len: i64, out: *u8) -> void
+    var ctx: Poly1305
+    poly1305_init(&ctx, key)
+    if len > 0
+        poly1305_update(&ctx, data, len)
+    poly1305_final(&ctx, out)

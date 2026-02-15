@@ -1,0 +1,444 @@
+# lib/huffman.ritz - Huffman coding for Deflate
+#
+# Implements canonical Huffman codes as used by Deflate (RFC 1951).
+#
+# Canonical Huffman codes are built from code lengths:
+# 1. Count codes of each length
+# 2. Assign codes in order, shorter codes first
+# 3. Within same length, assign in symbol order
+#
+# Deflate uses LSB-first bit ordering when reading codes from the bit stream.
+#
+# API:
+# - HuffmanTable: Decode table (lookup + overflow for long codes)
+# - HuffmanEncodeTable: Encode table (code + length per symbol)
+# - huffman_build_decode_table(): Build from code lengths
+# - huffman_decode(): Decode single symbol from bit stream
+# - huffman_decode_multi(): Decode multiple symbols in batch
+# - huffman_build_encode_table(): Build encode table from lengths
+# - huffman_encode(): Encode single symbol to bit stream
+# - huffman_count_frequencies(): Count symbol occurrences
+
+import ritzlib.sys
+
+import bits
+
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+const HUFFMAN_MAX_BITS: i32 = 15        # Max code length for Deflate
+const HUFFMAN_LOOKUP_BITS: i32 = 9      # Primary lookup table bits
+const HUFFMAN_LOOKUP_SIZE: i32 = 512    # 2^9 entries
+const HUFFMAN_MAX_SYMBOLS: i32 = 288    # Max symbols in Deflate litlen table
+
+# Multi-symbol decode constants
+# With 9-bit lookup, codes <= 4 bits can decode up to 2 symbols per lookup
+# Codes <= 2 bits can decode up to 4 symbols per lookup
+const HUFFMAN_MULTI_MAX_SYMBOLS: i32 = 4     # Max symbols per multi-decode entry
+
+
+# ============================================================================
+# Decode Table
+# ============================================================================
+
+# Primary lookup: 9-bit table
+# Entry format: symbol (16 bits) | length (8 bits) | flags (8 bits)
+# If code is longer than 9 bits, use overflow table
+
+struct HuffmanTable
+    # Primary lookup table (9 bits)
+    # Entry format: symbol (16 bits) | length (8 bits) | flags (8 bits)
+    lookup: [512]u32        # HUFFMAN_LOOKUP_SIZE entries
+
+    # Multi-symbol decode lookup table (9 bits)
+    # Entry format in multi_lookup (u64):
+    #   bits 0-3:   count (number of symbols, 1-4)
+    #   bits 4-7:   total_bits (total bits consumed)
+    #   bits 8-17:  sym1 (10 bits)
+    #   bits 18-21: len1 (4 bits)
+    #   bits 22-31: sym2 (10 bits)
+    #   bits 32-35: len2 (4 bits)
+    #   bits 36-45: sym3 (10 bits)
+    #   bits 46-49: len3 (4 bits)
+    #   bits 50-59: sym4 (10 bits)
+    #   bits 60-63: len4 (4 bits)
+    multi_lookup: [512]u64  # Multi-symbol entries
+
+    # Overflow for codes > 9 bits
+    overflow: [512]u32      # Secondary table for long codes
+    overflow_count: i32
+
+    # Code length info for building
+    max_code: i32           # Maximum code value
+    max_bits: i32           # Maximum code length
+    min_code_len: i32       # Minimum code length (for multi-symbol optimization)
+
+
+# ============================================================================
+# Encode Table
+# ============================================================================
+
+struct HuffmanEncodeTable
+    codes: [288]u16         # Code for each symbol (LSB-first)
+    lengths: [288]u8        # Length of code for each symbol
+    num_symbols: i32
+
+
+# ============================================================================
+# Build Decode Table from Code Lengths
+# ============================================================================
+
+# Build a decode table from an array of code lengths.
+# Returns 0 on success, -1 on error.
+#
+# Algorithm (canonical Huffman):
+# 1. Count codes of each length
+# 2. Compute first code for each length
+# 3. Assign codes in symbol order
+# 4. Build lookup table
+# 5. Build multi-symbol lookup table
+pub fn huffman_build_decode_table(table: *HuffmanTable, lengths: *u8, num_symbols: i32) -> i32
+    # Clear lookup tables
+    for i in 0..HUFFMAN_LOOKUP_SIZE
+        table.lookup[i] = 0
+        table.multi_lookup[i] = 0
+    table.overflow_count = 0
+    table.min_code_len = HUFFMAN_MAX_BITS
+
+    # Count number of codes of each length
+    var bl_count: [16]i32 = [0; 16]  # HUFFMAN_MAX_BITS + 1
+    var max_len: i32 = 0
+    var min_len: i32 = HUFFMAN_MAX_BITS
+
+    for i in 0..num_symbols
+        let len: i32 = lengths[i] as i32
+        if len > 0
+            bl_count[len] = bl_count[len] + 1
+            if len > max_len
+                max_len = len
+            if len < min_len
+                min_len = len
+
+    table.max_bits = max_len
+    table.min_code_len = min_len
+
+    # Compute first code for each length
+    # next_code[len] = first code of length len
+    var next_code: [16]u32 = [0; 16]
+    var code: u32 = 0
+
+    for bits in 1..(max_len + 1)
+        code = (code + bl_count[bits - 1] as u32) << 1
+        next_code[bits] = code
+
+    table.max_code = code as i32
+
+    # Assign codes to symbols and build lookup table
+    for sym in 0..num_symbols
+        let len: i32 = lengths[sym] as i32
+        if len == 0
+            continue
+
+        # Get the canonical code for this symbol
+        let sym_code: u32 = next_code[len]
+        next_code[len] = next_code[len] + 1
+
+        # Reverse the code bits for LSB-first storage
+        let rev_code: u32 = reverse_bits(sym_code, len)
+
+        # Build lookup table entry
+        # Entry format: symbol | (length << 16)
+        let entry: u32 = (sym as u32) | ((len as u32) << 16)
+
+        if len <= HUFFMAN_LOOKUP_BITS
+            # Fill all lookup entries that match this code prefix
+            let fill_count: i32 = 1 << (HUFFMAN_LOOKUP_BITS - len)
+            for j in 0..fill_count
+                let idx: i32 = (rev_code as i32) | (j << len)
+                table.lookup[idx] = entry
+        else
+            # Code is too long, use overflow table
+            # For now, just put it in the primary table (simplified)
+            let idx: i32 = rev_code as i32 & (HUFFMAN_LOOKUP_SIZE - 1)
+            table.lookup[idx] = entry
+
+    # Build multi-symbol lookup table for faster batch decoding
+    huffman_build_multi_table(table)
+
+    return 0
+
+
+# ============================================================================
+# Build Multi-Symbol Decode Table
+# ============================================================================
+
+# Build the multi-symbol lookup table.
+# For each 9-bit input pattern, precompute how many symbols can be decoded
+# and their values.
+#
+# Entry format in multi_lookup (u64):
+#   bits 0-3:   count (number of symbols, 1-4)
+#   bits 4-7:   total_bits (total bits consumed)
+#   bits 8-17:  sym1 (10 bits)
+#   bits 18-21: len1 (4 bits)
+#   bits 22-31: sym2 (10 bits)
+#   bits 32-35: len2 (4 bits)
+#   bits 36-45: sym3 (10 bits)
+#   bits 46-49: len3 (4 bits)
+#   bits 50-59: sym4 (10 bits)
+#   bits 60-63: len4 (4 bits)
+fn huffman_build_multi_table(table: *HuffmanTable)
+    # For each possible 9-bit pattern, determine multi-symbol decode info
+    for pattern in 0..HUFFMAN_LOOKUP_SIZE
+        # Start decoding symbols from this pattern
+        var bits_used: i32 = 0
+        var count: i32 = 0
+        var entry: u64 = 0
+        var remaining: u32 = pattern as u32
+
+        # Try to decode up to 4 symbols
+        var done: bool = false
+        while done == false
+            if count >= HUFFMAN_MULTI_MAX_SYMBOLS
+                done = true
+            else if bits_used >= HUFFMAN_LOOKUP_BITS
+                done = true
+            else
+                # Look up the current partial code in the primary table
+                let lookup_bits: u32 = remaining & 0x1FF  # 9 bits
+                let lookup_entry: u32 = table.lookup[lookup_bits as i32]
+
+                if lookup_entry == 0
+                    # Invalid code, can't continue
+                    done = true
+                else
+                    let sym: i32 = (lookup_entry & 0xFFFF) as i32
+                    let len: i32 = ((lookup_entry >> 16) & 0xFF) as i32
+
+                    # Check if this symbol's code fits in remaining bits
+                    if bits_used + len > HUFFMAN_LOOKUP_BITS
+                        # Code extends beyond 9 bits, can't include it
+                        done = true
+                    else
+                        # Pack symbol and length into entry
+                        # Each symbol takes 14 bits: 10 for sym, 4 for len
+                        let sym_shift: i32 = 8 + count * 14
+                        entry = entry | ((sym as u64) << sym_shift)
+                        entry = entry | ((len as u64) << (sym_shift + 10))
+
+                        bits_used = bits_used + len
+                        count = count + 1
+
+                        # Shift out the consumed bits from remaining pattern
+                        remaining = remaining >> len
+
+        # Pack count and total_bits into entry
+        entry = entry | (count as u64)
+        entry = entry | ((bits_used as u64) << 4)
+
+        table.multi_lookup[pattern] = entry
+
+
+# Reverse the bits in a code (for LSB-first ordering)
+fn reverse_bits(code: u32, len: i32) -> u32
+    var result: u32 = 0
+    var c: u32 = code
+
+    for i in 0..len
+        result = (result << 1) | (c & 1)
+        c = c >> 1
+
+    return result
+
+
+# ============================================================================
+# Decode Single Symbol
+# ============================================================================
+
+# Decode one symbol from the bit stream.
+# Returns the symbol value (0-287 for Deflate), or -1 on error.
+#
+# Uses the lookup table for fast decoding:
+# 1. Peek HUFFMAN_LOOKUP_BITS bits
+# 2. Look up entry in table
+# 3. Extract symbol and code length
+# 4. Advance reader by code length
+pub fn huffman_decode(table: *HuffmanTable, reader: *BitReader) -> i32
+    # Peek enough bits for lookup
+    let bits: u32 = bits_peek(reader, HUFFMAN_LOOKUP_BITS)
+
+    # Look up in table
+    let entry: u32 = table.lookup[bits as i32]
+
+    if entry == 0
+        # Invalid code
+        return -1
+
+    # Extract symbol and length from entry
+    let symbol: i32 = (entry & 0xFFFF) as i32
+    let length: i32 = ((entry >> 16) & 0xFF) as i32
+
+    # Advance reader by actual code length
+    bits_skip(reader, length)
+
+    return symbol
+
+
+# ============================================================================
+# Multi-Symbol Decode
+# ============================================================================
+
+# Decode multiple symbols from the bit stream in a single operation.
+# This is an optimization for short Huffman codes that can pack multiple
+# symbols into a single 9-bit lookup.
+#
+# Parameters:
+#   table      - Huffman decode table
+#   reader     - Bit reader positioned at start of encoded data
+#   out     - Array to store decoded symbol values
+#   max - Maximum number of symbols to decode
+#
+# Returns:
+#   Number of symbols decoded (0 to max)
+#   Returns 0 if no symbols could be decoded (error or end of data)
+#
+# The function uses the multi_lookup table to decode up to 4 symbols
+# per lookup when codes are short enough. For longer codes, it falls
+# back to single-symbol decode.
+pub fn huffman_decode_multi(table: *HuffmanTable, reader: *BitReader, out: *i32, max: i32) -> i32
+    var decoded: i32 = 0
+
+    while decoded < max
+        # Check if we have enough bits for a lookup
+        let avail: i64 = bits_available(reader)
+        if avail < 1
+            # No more bits available
+            return decoded
+
+        # Peek up to 9 bits for multi-symbol lookup
+        var peek_bits: i32 = HUFFMAN_LOOKUP_BITS
+        if avail < peek_bits as i64
+            peek_bits = avail as i32
+
+        let bits: u32 = bits_peek(reader, peek_bits)
+
+        # For short available bits, fall back to single decode
+        if peek_bits < HUFFMAN_LOOKUP_BITS
+            let sym: i32 = huffman_decode(table, reader)
+            if sym < 0
+                return decoded
+            out[decoded] = sym
+            decoded = decoded + 1
+        else
+            # Use multi-symbol lookup
+            let entry: u64 = table.multi_lookup[bits as i32]
+
+            let count: i32 = (entry & 0xF) as i32
+            let total_bits: i32 = ((entry >> 4) & 0xF) as i32
+
+            if count == 0
+                # Invalid entry, try single decode
+                let sym: i32 = huffman_decode(table, reader)
+                if sym < 0
+                    return decoded
+                out[decoded] = sym
+                decoded = decoded + 1
+            else
+                # Determine how many symbols we can decode (limited by max)
+                var symbols_to_decode: i32 = count
+                if decoded + symbols_to_decode > max
+                    symbols_to_decode = max - decoded
+
+                # Extract symbols from the entry
+                var bits_consumed: i32 = 0
+                for i in 0..symbols_to_decode
+                    let sym_shift: i32 = 8 + i * 14
+                    let sym: i32 = ((entry >> sym_shift) & 0x3FF) as i32
+                    let len: i32 = ((entry >> (sym_shift + 10)) & 0xF) as i32
+
+                    out[decoded] = sym
+                    decoded = decoded + 1
+                    bits_consumed = bits_consumed + len
+
+                # Advance the reader by the bits we consumed
+                bits_skip(reader, bits_consumed)
+
+    return decoded
+
+
+# ============================================================================
+# Build Encode Table from Code Lengths
+# ============================================================================
+
+# Build an encode table from code lengths.
+# Generates canonical Huffman codes (same algorithm as decode table).
+pub fn huffman_build_encode_table(table: *HuffmanEncodeTable, lengths: *u8, num_symbols: i32)
+    table.num_symbols = num_symbols
+
+    # Clear table
+    for i in 0..288
+        table.codes[i] = 0
+        table.lengths[i] = 0
+
+    # Count number of codes of each length
+    var bl_count: [16]i32 = [0; 16]
+    var max_len: i32 = 0
+
+    for i in 0..num_symbols
+        let len: i32 = lengths[i] as i32
+        if len > 0
+            bl_count[len] = bl_count[len] + 1
+            if len > max_len
+                max_len = len
+
+    # Compute first code for each length
+    var next_code: [16]u32 = [0; 16]
+    var code: u32 = 0
+
+    for bits in 1..(max_len + 1)
+        code = (code + bl_count[bits - 1] as u32) << 1
+        next_code[bits] = code
+
+    # Assign codes to symbols
+    for sym in 0..num_symbols
+        let len: i32 = lengths[sym] as i32
+        if len == 0
+            continue
+
+        # Get canonical code and reverse for LSB-first
+        let sym_code: u32 = next_code[len]
+        next_code[len] = next_code[len] + 1
+
+        # Store reversed code for LSB-first out
+        table.codes[sym] = reverse_bits(sym_code, len) as u16
+        table.lengths[sym] = len as u8
+
+    return
+
+
+# ============================================================================
+# Encode Single Symbol
+# ============================================================================
+
+# Encode one symbol to the bit stream.
+pub fn huffman_encode(table: *HuffmanEncodeTable, symbol: i32, writer: *BitWriter)
+    let code: u32 = table.codes[symbol] as u32
+    let len: i32 = table.lengths[symbol] as i32
+
+    # Write the code bits (already in LSB-first order)
+    bits_write(writer, code, len)
+    return
+
+
+# ============================================================================
+# Count Symbol Frequencies
+# ============================================================================
+
+# Count occurrences of each byte value in data.
+pub fn huffman_count_frequencies(data: *u8, len: i64, freqs: *u32)
+    for i in 0..len
+        let byte: i32 = data[i] as i32
+        freqs[byte] = freqs[byte] + 1
+    return

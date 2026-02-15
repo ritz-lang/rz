@@ -1,0 +1,181 @@
+# ritzunit/src/json_reporter.ritz - JSON output for test results
+#
+# Outputs test results in JSON format for CI/CD integration.
+# Format:
+# {
+#   "version": "0.1.0",
+#   "summary": { "total": N, "passed": N, "failed": N, ... },
+#   "tests": [
+#     { "name": "test_foo", "status": "pass", "duration_ms": N },
+#     ...
+#   ]
+# }
+
+import ritzlib.io
+import ritzlib.str
+import ritzlib.gvec
+import ritzlib.sys
+import ritzlib.strview
+
+# ============================================================================
+# JSON Test Result Storage
+# ============================================================================
+
+# Status string getters
+fn status_pass() -> StrView
+    return strview_from_cstr(c"pass")
+
+fn status_fail() -> StrView
+    return strview_from_cstr(c"fail")
+
+fn status_crash() -> StrView
+    return strview_from_cstr(c"crash")
+
+fn status_timeout() -> StrView
+    return strview_from_cstr(c"timeout")
+
+fn status_skip() -> StrView
+    return strview_from_cstr(c"skip")
+
+# Single test result for JSON array
+struct JsonTestResult
+    name: StrView
+    status: StrView
+    duration_ms: i64
+    exit_code: i32
+    signal: i32
+
+# Global array for collecting results
+var g_json_results: [1024]JsonTestResult
+var g_json_result_count: i32 = 0
+
+# ============================================================================
+# Result Collection
+# ============================================================================
+
+pub fn json_record_result(name: @StrView, status: @StrView, duration_ms: i64, exit_code: i32, signal: i32)
+    if g_json_result_count >= 1024
+        return
+    g_json_results[g_json_result_count].name = *name
+    g_json_results[g_json_result_count].status = *status
+    g_json_results[g_json_result_count].duration_ms = duration_ms
+    g_json_results[g_json_result_count].exit_code = exit_code
+    g_json_results[g_json_result_count].signal = signal
+    g_json_result_count += 1
+
+pub fn json_record_pass(name: @StrView, duration_ms: i64)
+    var st: StrView = status_pass()
+    json_record_result(name, @st, duration_ms, 0, 0)
+
+pub fn json_record_fail(name: @StrView, duration_ms: i64, exit_code: i32)
+    var st: StrView = status_fail()
+    json_record_result(name, @st, duration_ms, exit_code, 0)
+
+pub fn json_record_crash(name: @StrView, duration_ms: i64, signal: i32)
+    var st: StrView = status_crash()
+    json_record_result(name, @st, duration_ms, 0, signal)
+
+pub fn json_record_timeout(name: @StrView, duration_ms: i64)
+    var st: StrView = status_timeout()
+    json_record_result(name, @st, duration_ms, 0, 0)
+
+# ============================================================================
+# JSON Output Helpers
+# ============================================================================
+
+# Print a single character
+fn json_print_char(c: u8)
+    var buf: [2]u8
+    buf[0] = c
+    buf[1] = 0
+    prints_cstr(&buf[0])
+
+# Print a double-quote character
+fn print_quote()
+    json_print_char(34)  # ASCII for "
+
+# Print escaped JSON string from StrView (handles " and \ and newlines)
+fn print_json_string_sv(s: @StrView)
+    print_quote()
+    for i in 0..s.len
+        let c: u8 = strview_get(s, i)
+        if c == 34  # "
+            json_print_char(92)  # \
+            json_print_char(34)  # "
+        else if c == 92  # \
+            json_print_char(92)
+            json_print_char(92)
+        else if c == 10  # newline
+            json_print_char(92)
+            json_print_char(110)  # n
+        else if c == 9  # tab
+            json_print_char(92)
+            json_print_char(116)  # t
+        else
+            json_print_char(c)
+    print_quote()
+
+# ============================================================================
+# JSON Output
+# ============================================================================
+
+# Print full JSON report
+pub fn json_print_report(total: i32, passed: i32, failed: i32, crashed: i32, timeout: i32, skipped: i32, duration_ms: i64)
+    # Use {{ to escape literal braces in RERITZ strings
+    prints("{{\n")
+    prints("  \"version\": \"0.1.0\",\n")
+
+    # Summary
+    prints("  \"summary\": {{\n")
+
+    prints("    \"total\": ")
+    print_int(total as i64)
+
+    prints(",\n    \"passed\": ")
+    print_int(passed as i64)
+
+    prints(",\n    \"failed\": ")
+    print_int(failed as i64)
+
+    prints(",\n    \"crashed\": ")
+    print_int(crashed as i64)
+
+    prints(",\n    \"timeout\": ")
+    print_int(timeout as i64)
+
+    prints(",\n    \"skipped\": ")
+    print_int(skipped as i64)
+
+    prints(",\n    \"duration_ms\": ")
+    print_int(duration_ms)
+
+    prints("\n  }},\n")
+
+    # Tests array
+    prints("  \"tests\": [\n")
+
+    for i in 0..g_json_result_count
+        let r: *JsonTestResult = &g_json_results[i]
+        prints("    {{\"name\": ")
+        print_json_string_sv(@r.name)
+        prints(", \"status\": ")
+        print_json_string_sv(@r.status)
+        prints(", \"duration_ms\": ")
+        print_int(r.duration_ms)
+        if r.exit_code != 0
+            prints(", \"exit_code\": ")
+            print_int(r.exit_code as i64)
+        if r.signal != 0
+            prints(", \"signal\": ")
+            print_int(r.signal as i64)
+        prints("}}")
+        if i < g_json_result_count - 1
+            prints(",")
+        prints("\n")
+
+    prints("  ]\n")
+    prints("}}\n")
+
+# Reset collector for next run
+pub fn json_reset()
+    g_json_result_count = 0

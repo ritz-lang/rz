@@ -1,0 +1,447 @@
+# test/test_pem.ritz - Tests for PEM parsing and Base64 decoding
+#
+# PEM format: -----BEGIN TYPE-----\n<base64>\n-----END TYPE-----
+
+import ritzlib.sys
+
+import lib.mem
+import lib.base64
+import lib.pem
+
+# ============================================================================
+# Base64 Decoding Tests
+# ============================================================================
+
+[[test]]
+fn test_base64_decode_empty() -> i32
+    # Empty input -> empty output
+    var out: [16]u8
+    let len: i64 = base64_decode(c"", 0, &out[0], 16)
+    if len != 0
+        return 1
+    return 0
+
+[[test]]
+fn test_base64_decode_simple() -> i32
+    # "TWFu" -> "Man" (classic base64 example)
+    var out: [16]u8
+    let len: i64 = base64_decode(c"TWFu", 4, &out[0], 16)
+    if len != 3
+        return 1
+    if out[0] != 77  # 'M'
+        return 2
+    if out[1] != 97  # 'a'
+        return 3
+    if out[2] != 110 # 'n'
+        return 4
+    return 0
+
+[[test]]
+fn test_base64_decode_padding_1() -> i32
+    # "TWE=" -> "Ma" (1 padding byte)
+    var out: [16]u8
+    let len: i64 = base64_decode(c"TWE=", 4, &out[0], 16)
+    if len != 2
+        return 1
+    if out[0] != 77  # 'M'
+        return 2
+    if out[1] != 97  # 'a'
+        return 3
+    return 0
+
+[[test]]
+fn test_base64_decode_padding_2() -> i32
+    # "TQ==" -> "M" (2 padding bytes)
+    var out: [16]u8
+    let len: i64 = base64_decode(c"TQ==", 4, &out[0], 16)
+    if len != 1
+        return 1
+    if out[0] != 77  # 'M'
+        return 2
+    return 0
+
+[[test]]
+fn test_base64_decode_with_newlines() -> i32
+    # Base64 in PEM files has line breaks
+    # "SGVs\nbG8=" -> "Hello"
+    var input: [16]u8
+    input[0] = 'S'
+    input[1] = 'G'
+    input[2] = 'V'
+    input[3] = 's'
+    input[4] = 10  # \n
+    input[5] = 'b'
+    input[6] = 'G'
+    input[7] = '8'
+    input[8] = '='
+
+    var out: [16]u8
+    let len: i64 = base64_decode(&input[0], 9, &out[0], 16)
+    if len != 5
+        return 1
+    if out[0] != 'H'
+        return 2
+    if out[1] != 'e'
+        return 3
+    if out[2] != 'l'
+        return 4
+    if out[3] != 'l'
+        return 5
+    if out[4] != 'o'
+        return 6
+    return 0
+
+[[test]]
+fn test_base64_decode_buffer_too_small() -> i32
+    # Output buffer too small should return error
+    var out: [2]u8
+    let len: i64 = base64_decode(c"TWFu", 4, &out[0], 2)  # needs 3 bytes
+    if len != -1
+        return 1
+    return 0
+
+[[test]]
+fn test_base64_decode_hello_world() -> i32
+    # "SGVsbG8gV29ybGQ=" -> "Hello World"
+    var out: [16]u8
+    let len: i64 = base64_decode(c"SGVsbG8gV29ybGQ=", 16, &out[0], 16)
+    if len != 11
+        return 1
+    if out[0] != 'H'
+        return 2
+    if out[10] != 'd'
+        return 3
+    return 0
+
+[[test]]
+fn test_base64_encode_simple() -> i32
+    # "Man" -> "TWFu"
+    var input: [3]u8
+    input[0] = 'M'
+    input[1] = 'a'
+    input[2] = 'n'
+
+    var out: [16]u8
+    let len: i64 = base64_encode(&input[0], 3, &out[0], 16)
+    if len != 4
+        return 1
+    if out[0] != 'T'
+        return 2
+    if out[1] != 'W'
+        return 3
+    if out[2] != 'F'
+        return 4
+    if out[3] != 'u'
+        return 5
+    return 0
+
+[[test]]
+fn test_base64_encode_padding_1() -> i32
+    # "Ma" -> "TWE="
+    var input: [2]u8
+    input[0] = 'M'
+    input[1] = 'a'
+
+    var out: [16]u8
+    let len: i64 = base64_encode(&input[0], 2, &out[0], 16)
+    if len != 4
+        return 1
+    if out[0] != 'T'
+        return 2
+    if out[1] != 'W'
+        return 3
+    if out[2] != 'E'
+        return 4
+    if out[3] != '='
+        return 5
+    return 0
+
+[[test]]
+fn test_base64_encode_padding_2() -> i32
+    # "M" -> "TQ=="
+    var input: [1]u8
+    input[0] = 'M'
+
+    var out: [16]u8
+    let len: i64 = base64_encode(&input[0], 1, &out[0], 16)
+    if len != 4
+        return 1
+    if out[0] != 'T'
+        return 2
+    if out[1] != 'Q'
+        return 3
+    if out[2] != '='
+        return 4
+    if out[3] != '='
+        return 5
+    return 0
+
+[[test]]
+fn test_base64_roundtrip() -> i32
+    # Encode then decode should match original
+    var original: [8]u8
+    original[0] = 0xDE
+    original[1] = 0xAD
+    original[2] = 0xBE
+    original[3] = 0xEF
+    original[4] = 0xCA
+    original[5] = 0xFE
+    original[6] = 0xBA
+    original[7] = 0xBE
+
+    var encoded: [16]u8
+    let enc_len: i64 = base64_encode(&original[0], 8, &encoded[0], 16)
+    if enc_len != 12
+        return 1
+
+    var decoded: [16]u8
+    let dec_len: i64 = base64_decode(&encoded[0], enc_len, &decoded[0], 16)
+    if dec_len != 8
+        return 2
+
+    if mem_eq(&original[0], &decoded[0], 8) != 1
+        return 3
+
+    return 0
+
+[[test]]
+fn test_base64_decoded_length() -> i32
+    # "TWFu" (no padding) -> 3 bytes
+    let len1: i64 = base64_decoded_length(c"TWFu", 4)
+    if len1 != 3
+        return 1
+
+    # "TWE=" (1 padding) -> 2 bytes
+    let len2: i64 = base64_decoded_length(c"TWE=", 4)
+    if len2 != 2
+        return 2
+
+    # "TQ==" (2 padding) -> 1 byte
+    let len3: i64 = base64_decoded_length(c"TQ==", 4)
+    if len3 != 1
+        return 3
+
+    return 0
+
+# ============================================================================
+# PEM Parsing Tests
+# ============================================================================
+
+[[test]]
+fn test_pem_parse_simple() -> i32
+    # "-----BEGIN TEST-----\nVGVzdA==\n-----END TEST-----\n"
+    # Base64 of "Test" is "VGVzdA=="
+    let pem: *u8 = c"-----BEGIN TEST-----\nVGVzdA==\n-----END TEST-----\n"
+    var entry: PemEntry
+    var der_buf: [64]u8
+
+    let result: i64 = pem_parse_entry(pem, 52, &entry, &der_buf[0], 64)
+    if result <= 0
+        return 1
+
+    if entry.type_len != 4
+        return 2
+
+    if entry.type_label[0] != 'T'
+        return 3
+    if entry.type_label[1] != 'E'
+        return 4
+    if entry.type_label[2] != 'S'
+        return 5
+    if entry.type_label[3] != 'T'
+        return 6
+
+    if entry.der_len != 4
+        return 7
+
+    if der_buf[0] != 'T'
+        return 8
+    if der_buf[1] != 'e'
+        return 9
+    if der_buf[2] != 's'
+        return 10
+    if der_buf[3] != 't'
+        return 11
+
+    return 0
+
+[[test]]
+fn test_pem_parse_certificate_type() -> i32
+    # "CERTIFICATE" type extraction
+    let pem: *u8 = c"-----BEGIN CERTIFICATE-----\nVGVzdA==\n-----END CERTIFICATE-----\n"
+    var entry: PemEntry
+    var der_buf: [64]u8
+
+    let result: i64 = pem_parse_entry(pem, 62, &entry, &der_buf[0], 64)
+    if result <= 0
+        return 1
+
+    if entry.type_len != 11
+        return 2
+
+    # Check "CERTIFICATE"
+    if entry.type_label[0] != 'C'
+        return 3
+    if entry.type_label[10] != 'E'
+        return 4
+
+    return 0
+
+[[test]]
+fn test_pem_iterator() -> i32
+    # Two PEM entries back-to-back
+    let pem: *u8 = c"-----BEGIN A-----\nYQ==\n-----END A-----\n-----BEGIN B-----\nYg==\n-----END B-----\n"
+
+    var iter: PemIterator
+    pem_iterator_init(&iter, pem, 82)
+
+    var entry: PemEntry
+    var der_buf: [64]u8
+
+    # First entry: "A" -> "a"
+    let r1: i32 = pem_iterator_next(&iter, &entry, &der_buf[0], 64)
+    if r1 != 1
+        return 1
+    if entry.type_label[0] != 'A'
+        return 2
+    if der_buf[0] != 'a'
+        return 3
+
+    # Second entry: "B" -> "b"
+    let r2: i32 = pem_iterator_next(&iter, &entry, &der_buf[0], 64)
+    if r2 != 1
+        return 4
+    if entry.type_label[0] != 'B'
+        return 5
+    if der_buf[0] != 'b'
+        return 6
+
+    # No more entries
+    let r3: i32 = pem_iterator_next(&iter, &entry, &der_buf[0], 64)
+    if r3 != 0
+        return 7
+
+    return 0
+
+[[test]]
+fn test_pem_count_certificates() -> i32
+    # Two CERTIFICATE entries
+    let pem: *u8 = c"-----BEGIN CERTIFICATE-----\nYQ==\n-----END CERTIFICATE-----\n-----BEGIN CERTIFICATE-----\nYg==\n-----END CERTIFICATE-----\n"
+
+    let count: i32 = pem_count_certificates(pem, 124)
+    if count != 2
+        return 1
+
+    return 0
+
+[[test]]
+fn test_pem_parse_no_entry() -> i32
+    # No PEM data
+    let pem: *u8 = c"This is not PEM data\n"
+    var entry: PemEntry
+    var der_buf: [64]u8
+
+    let result: i64 = pem_parse_entry(pem, 22, &entry, &der_buf[0], 64)
+    if result != 0
+        return 1
+
+    return 0
+
+[[test]]
+fn test_pem_parse_missing_end() -> i32
+    # BEGIN without END
+    let pem: *u8 = c"-----BEGIN TEST-----\nVGVzdA==\n"
+    var entry: PemEntry
+    var der_buf: [64]u8
+
+    let result: i64 = pem_parse_entry(pem, 31, &entry, &der_buf[0], 64)
+    if result != -1
+        return 1
+
+    return 0
+
+[[test]]
+fn test_pem_parse_with_crlf() -> i32
+    # Windows-style line endings (\r\n)
+    var pem: [60]u8
+    var i: i32 = 0
+
+    # "-----BEGIN T-----\r\nYQ==\r\n-----END T-----\r\n"
+    let header: *u8 = c"-----BEGIN T-----"
+    while i < 17
+        pem[i] = header[i]
+        i += 1
+    pem[i] = 13  # \r
+    i += 1
+    pem[i] = 10  # \n
+    i += 1
+    pem[i] = 'Y'
+    i += 1
+    pem[i] = 'Q'
+    i += 1
+    pem[i] = '='
+    i += 1
+    pem[i] = '='
+    i += 1
+    pem[i] = 13  # \r
+    i += 1
+    pem[i] = 10  # \n
+    i += 1
+
+    let footer: *u8 = c"-----END T-----"
+    var j: i32 = 0
+    while j < 15
+        pem[i] = footer[j]
+        i += 1
+        j += 1
+    pem[i] = 13  # \r
+    i += 1
+    pem[i] = 10  # \n
+    i += 1
+
+    var entry: PemEntry
+    var der_buf: [64]u8
+
+    let result: i64 = pem_parse_entry(&pem[0], i as i64, &entry, &der_buf[0], 64)
+    if result <= 0
+        return 1
+
+    if entry.type_label[0] != 'T'
+        return 2
+
+    if der_buf[0] != 'a'
+        return 3
+
+    return 0
+
+[[test]]
+fn test_pem_empty_content() -> i32
+    # PEM with empty base64 content
+    let pem: *u8 = c"-----BEGIN EMPTY-----\n-----END EMPTY-----\n"
+    var entry: PemEntry
+    var der_buf: [64]u8
+
+    let result: i64 = pem_parse_entry(pem, 43, &entry, &der_buf[0], 64)
+    if result <= 0
+        return 1
+
+    if entry.der_len != 0
+        return 2
+
+    return 0
+
+[[test]]
+fn test_pem_type_is() -> i32
+    let pem: *u8 = c"-----BEGIN CERTIFICATE-----\nYQ==\n-----END CERTIFICATE-----\n"
+    var entry: PemEntry
+    var der_buf: [64]u8
+
+    pem_parse_entry(pem, 57, &entry, &der_buf[0], 64)
+
+    if pem_type_is(&entry, c"CERTIFICATE", 11) != 1
+        return 1
+
+    if pem_type_is(&entry, c"KEY", 3) != 0
+        return 2
+
+    return 0

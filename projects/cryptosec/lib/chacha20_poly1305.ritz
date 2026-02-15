@@ -1,0 +1,135 @@
+# ChaCha20-Poly1305 AEAD Implementation
+# RFC 8439 compliant
+#
+# ChaCha20-Poly1305 is an Authenticated Encryption with Associated Data (AEAD)
+# construction combining ChaCha20 stream cipher with Poly1305 MAC.
+
+import chacha20
+import poly1305
+import mem
+
+# =============================================================================
+# Helper Functions
+# =============================================================================
+
+# Pad to 16-byte boundary for Poly1305
+fn pad16_len(len: i64) -> i64
+    let rem: i64 = len % 16
+    if rem == 0
+        0
+    else
+        16 - rem
+
+# Store 64-bit little-endian
+fn store64_le(dst: *u8, val: u64) -> void
+    dst[0] = (val & 0xff) as u8
+    dst[1] = ((val >> 8) & 0xff) as u8
+    dst[2] = ((val >> 16) & 0xff) as u8
+    dst[3] = ((val >> 24) & 0xff) as u8
+    dst[4] = ((val >> 32) & 0xff) as u8
+    dst[5] = ((val >> 40) & 0xff) as u8
+    dst[6] = ((val >> 48) & 0xff) as u8
+    dst[7] = ((val >> 56) & 0xff) as u8
+
+# =============================================================================
+# ChaCha20-Poly1305 AEAD
+# =============================================================================
+
+# AEAD construction as per RFC 8439 Section 2.8:
+# 1. Generate Poly1305 key from ChaCha20 block with counter=0
+# 2. Encrypt plaintext with ChaCha20 starting at counter=1
+# 3. Construct Poly1305 input: AAD || pad(AAD) || ciphertext || pad(ciphertext) || len(AAD) || len(ciphertext)
+# 4. Compute Poly1305 tag
+
+pub fn chacha20_poly1305_encrypt(key: *u8, nonce: *u8, aad: *u8, aad_len: i64, pt: *u8, pt_len: i64, ct: *u8, tag: *u8) -> i64
+    var poly_key: [64]u8
+
+    # Generate Poly1305 one-time key (first 32 bytes of ChaCha20 block 0)
+    chacha20_block(key, 0, nonce, &poly_key[0])
+
+    # Encrypt plaintext starting at counter=1
+    chacha20_xor(key, nonce, 1, pt, pt_len, ct)
+
+    # Compute Poly1305 tag
+    var poly_ctx: Poly1305
+    poly1305_init(&poly_ctx, &poly_key[0])
+
+    # Process AAD
+    if aad_len > 0
+        poly1305_update(&poly_ctx, aad, aad_len)
+
+    # Pad AAD to 16-byte boundary
+    var pad_aad: i64 = pad16_len(aad_len)
+    if pad_aad > 0
+        var zeros: [16]u8
+        mem_zero(&zeros[0], 16)
+        poly1305_update(&poly_ctx, &zeros[0], pad_aad)
+
+    # Process ciphertext
+    if pt_len > 0
+        poly1305_update(&poly_ctx, ct, pt_len)
+
+    # Pad ciphertext to 16-byte boundary
+    var pad_ct: i64 = pad16_len(pt_len)
+    if pad_ct > 0
+        var zeros: [16]u8
+        mem_zero(&zeros[0], 16)
+        poly1305_update(&poly_ctx, &zeros[0], pad_ct)
+
+    # Add lengths as 64-bit little-endian
+    var lens: [16]u8
+    store64_le(&lens[0], aad_len as u64)
+    store64_le(&lens[8], pt_len as u64)
+    poly1305_update(&poly_ctx, &lens[0], 16)
+
+    # Finalize tag
+    poly1305_final(&poly_ctx, tag)
+
+    pt_len
+
+pub fn chacha20_poly1305_decrypt(key: *u8, nonce: *u8, aad: *u8, aad_len: i64, ct: *u8, ct_len: i64, tag: *u8, pt: *u8) -> i32
+    var poly_key: [64]u8
+    var computed_tag: [16]u8
+
+    # Generate Poly1305 one-time key
+    chacha20_block(key, 0, nonce, &poly_key[0])
+
+    # Verify tag first
+    var poly_ctx: Poly1305
+    poly1305_init(&poly_ctx, &poly_key[0])
+
+    # Process AAD
+    if aad_len > 0
+        poly1305_update(&poly_ctx, aad, aad_len)
+
+    var pad_aad: i64 = pad16_len(aad_len)
+    if pad_aad > 0
+        var zeros: [16]u8
+        mem_zero(&zeros[0], 16)
+        poly1305_update(&poly_ctx, &zeros[0], pad_aad)
+
+    # Process ciphertext
+    if ct_len > 0
+        poly1305_update(&poly_ctx, ct, ct_len)
+
+    var pad_ct: i64 = pad16_len(ct_len)
+    if pad_ct > 0
+        var zeros: [16]u8
+        mem_zero(&zeros[0], 16)
+        poly1305_update(&poly_ctx, &zeros[0], pad_ct)
+
+    var lens: [16]u8
+    store64_le(&lens[0], aad_len as u64)
+    store64_le(&lens[8], ct_len as u64)
+    poly1305_update(&poly_ctx, &lens[0], 16)
+
+    poly1305_final(&poly_ctx, &computed_tag[0])
+
+    # Constant-time tag comparison
+    if mem_eq(&computed_tag[0], tag, 16) == 0
+        return 0
+
+    # Decrypt ciphertext
+    chacha20_xor(key, nonce, 1, ct, ct_len, pt)
+
+    1

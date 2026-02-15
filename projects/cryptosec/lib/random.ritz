@@ -1,0 +1,103 @@
+# lib/random.ritz - Cryptographically Secure Pseudo-Random Number Generator
+#
+# Provides secure random number generation using Linux's getrandom syscall.
+# This is the recommended way to get cryptographic random bytes since Linux 3.17.
+#
+# Operations:
+# - getrandom(buf, len, flags) - Raw syscall wrapper
+# - random_bytes(buf, len) - Fill buffer with random bytes (blocking)
+# - random_u64() - Get random 64-bit value
+# - random_u32() - Get random 32-bit value
+
+import ritzlib.sys
+
+# ============================================================================
+# getrandom syscall (Linux 3.17+)
+# ============================================================================
+
+# Syscall number for getrandom on x86-64
+const SYS_GETRANDOM: i64 = 318
+
+# getrandom flags
+const GRND_NONBLOCK: i32 = 1    # Don't block waiting for entropy
+const GRND_RANDOM: i32 = 2       # Use /dev/random instead of /dev/urandom
+
+# Raw getrandom syscall wrapper
+# Returns number of bytes written, or negative error code
+pub fn getrandom(buf: *u8, len: u64, flags: i32) -> i64
+    return syscall3(SYS_GETRANDOM, buf as i64, len as i64, flags as i64)
+
+# ============================================================================
+# High-level random functions
+# ============================================================================
+
+# Fill buffer with cryptographically secure random bytes
+# This function blocks until the CSPRNG is seeded (only on first boot)
+# Returns 0 on success, -1 on error
+pub fn random_bytes(buf: *u8, len: u64) -> i32
+    if len == 0
+        return 0
+
+    var remaining: u64 = len
+    var ptr: *u8 = buf
+
+    # getrandom can return fewer bytes than requested (up to 256 bytes per call)
+    # so we loop until we get all requested bytes
+    while remaining > 0
+        let result: i64 = getrandom(ptr, remaining, 0)
+        if result < 0
+            return -1  # Error
+        let got: u64 = result as u64
+        remaining = remaining - got
+        ptr = (ptr as u64 + got) as *u8
+
+    return 0
+
+# Get a single random u64
+pub fn random_u64() -> u64
+    var buf: [8]u8
+    let result: i32 = random_bytes(&buf[0], 8)
+    if result < 0
+        # Fallback: return 0 on error (should never happen on healthy system)
+        return 0
+
+    # Assemble from bytes (little-endian)
+    let b0: u64 = buf[0] as u64
+    let b1: u64 = buf[1] as u64
+    let b2: u64 = buf[2] as u64
+    let b3: u64 = buf[3] as u64
+    let b4: u64 = buf[4] as u64
+    let b5: u64 = buf[5] as u64
+    let b6: u64 = buf[6] as u64
+    let b7: u64 = buf[7] as u64
+
+    let lo: u64 = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+    let hi: u64 = (b4 << 32) | (b5 << 40) | (b6 << 48) | (b7 << 56)
+    return lo | hi
+
+# Get a single random u32
+pub fn random_u32() -> u32
+    var buf: [4]u8
+    let result: i32 = random_bytes(&buf[0], 4)
+    if result < 0
+        return 0
+
+    # Assemble from bytes (little-endian)
+    let b0: u32 = buf[0] as u32
+    let b1: u32 = buf[1] as u32
+    let b2: u32 = buf[2] as u32
+    let b3: u32 = buf[3] as u32
+
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+
+# Get a random value in range [0, max) - not constant-time!
+# For cryptographic use, use rejection sampling with ct_select
+pub fn random_range_u64(max: u64) -> u64
+    if max == 0
+        return 0
+    if max == 1
+        return 0
+
+    # Simple modulo (has slight bias for non-power-of-2 max)
+    # For production crypto, should use rejection sampling
+    return random_u64() % max

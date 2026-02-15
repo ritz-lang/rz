@@ -1,0 +1,173 @@
+# ChaCha20 Stream Cipher Implementation
+# RFC 8439 compliant
+#
+# ChaCha20 is a stream cipher designed by Daniel J. Bernstein.
+# It operates on 512-bit blocks and uses a 256-bit key and 96-bit nonce.
+
+import mem
+
+# =============================================================================
+# ChaCha20 Constants
+# =============================================================================
+
+# "expand 32-byte k" in ASCII (little-endian u32 words)
+const SIGMA0: u32 = 0x61707865  # "expa"
+const SIGMA1: u32 = 0x3320646e  # "nd 3"
+const SIGMA2: u32 = 0x79622d32  # "2-by"
+const SIGMA3: u32 = 0x6b206574  # "te k"
+
+# =============================================================================
+# Helper Functions
+# =============================================================================
+
+# Little-endian load
+fn load32_le(src: *u8) -> u32
+    (src[0] as u32) | ((src[1] as u32) << 8) | ((src[2] as u32) << 16) | ((src[3] as u32) << 24)
+
+# Little-endian store
+fn store32_le(dst: *u8, val: u32) -> void
+    dst[0] = (val & 0xff) as u8
+    dst[1] = ((val >> 8) & 0xff) as u8
+    dst[2] = ((val >> 16) & 0xff) as u8
+    dst[3] = ((val >> 24) & 0xff) as u8
+
+# =============================================================================
+# ChaCha20 Core
+# =============================================================================
+
+# Quarter round function - uses built-in .rotl() intrinsic for efficiency
+fn quarter_round(state: *u32, a: i64, b: i64, c: i64, d: i64) -> void
+    state[a] = state[a] + state[b]
+    state[d] = (state[d] ^ state[a]).rotl(16)
+
+    state[c] = state[c] + state[d]
+    state[b] = (state[b] ^ state[c]).rotl(12)
+
+    state[a] = state[a] + state[b]
+    state[d] = (state[d] ^ state[a]).rotl(8)
+
+    state[c] = state[c] + state[d]
+    state[b] = (state[b] ^ state[c]).rotl(7)
+
+# ChaCha20 block function - generates 64 bytes of keystream
+pub fn chacha20_block(key: *u8, counter: u32, nonce: *u8, out: *u8) -> void
+    var state: [16]u32
+    var working: [16]u32
+
+    # Initialize state
+    # Constants
+    state[0] = SIGMA0
+    state[1] = SIGMA1
+    state[2] = SIGMA2
+    state[3] = SIGMA3
+
+    # Key (8 words)
+    state[4] = load32_le(&key[0])
+    state[5] = load32_le(&key[4])
+    state[6] = load32_le(&key[8])
+    state[7] = load32_le(&key[12])
+    state[8] = load32_le(&key[16])
+    state[9] = load32_le(&key[20])
+    state[10] = load32_le(&key[24])
+    state[11] = load32_le(&key[28])
+
+    # Counter (1 word)
+    state[12] = counter
+
+    # Nonce (3 words)
+    state[13] = load32_le(&nonce[0])
+    state[14] = load32_le(&nonce[4])
+    state[15] = load32_le(&nonce[8])
+
+    # Copy to working state
+    var i: i64 = 0
+    while i < 16
+        working[i] = state[i]
+        i += 1
+
+    # 20 rounds (10 double rounds)
+    i = 0
+    while i < 10
+        # Column rounds
+        quarter_round(&working[0], 0, 4, 8, 12)
+        quarter_round(&working[0], 1, 5, 9, 13)
+        quarter_round(&working[0], 2, 6, 10, 14)
+        quarter_round(&working[0], 3, 7, 11, 15)
+
+        # Diagonal rounds
+        quarter_round(&working[0], 0, 5, 10, 15)
+        quarter_round(&working[0], 1, 6, 11, 12)
+        quarter_round(&working[0], 2, 7, 8, 13)
+        quarter_round(&working[0], 3, 4, 9, 14)
+
+        i += 1
+
+    # Add working state to original state
+    i = 0
+    while i < 16
+        working[i] = working[i] + state[i]
+        i += 1
+
+    # Serialize to output
+    i = 0
+    while i < 16
+        store32_le(&out[i * 4], working[i])
+        i += 1
+
+# =============================================================================
+# ChaCha20 Context and API
+# =============================================================================
+
+struct ChaCha20
+    key: [32]u8
+    nonce: [12]u8
+    counter: u32
+
+pub fn chacha20_init(ctx: *ChaCha20, key: *u8, nonce: *u8) -> void
+    mem_copy(&ctx.key[0], key, 32)
+    mem_copy(&ctx.nonce[0], nonce, 12)
+    ctx.counter = 0
+
+pub fn chacha20_set_counter(ctx: *ChaCha20, counter: u32) -> void
+    ctx.counter = counter
+
+pub fn chacha20_encrypt(ctx: *ChaCha20, pt: *u8, pt_len: i64, ct: *u8) -> void
+    var block: [64]u8
+    var i: i64 = 0
+
+    while i < pt_len
+        # Generate keystream block
+        chacha20_block(&ctx.key[0], ctx.counter, &ctx.nonce[0], &block[0])
+        ctx.counter = ctx.counter + 1
+
+        # XOR with plaintext
+        var j: i64 = 0
+        while j < 64 && (i + j) < pt_len
+            ct[i + j] = pt[i + j] ^ block[j]
+            j += 1
+
+        i = i + 64
+
+# Decrypt is same as encrypt for stream ciphers
+pub fn chacha20_decrypt(ctx: *ChaCha20, ct: *u8, ct_len: i64, pt: *u8) -> void
+    chacha20_encrypt(ctx, ct, ct_len, pt)
+
+# =============================================================================
+# Single-shot API (for AEAD use)
+# =============================================================================
+
+pub fn chacha20_xor(key: *u8, nonce: *u8, counter: u32, input: *u8, len: i64, output: *u8) -> void
+    var block: [64]u8
+    var ctr: u32 = counter
+    var i: i64 = 0
+
+    while i < len
+        chacha20_block(key, ctr, nonce, &block[0])
+        ctr += 1
+
+        var j: i64 = 0
+        while j < 64 && (i + j) < len
+            output[i + j] = input[i + j] ^ block[j]
+            j += 1
+
+        i = i + 64

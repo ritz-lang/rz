@@ -1,0 +1,710 @@
+# ASN.1/DER Parser Tests
+#
+# TDD tests for the ASN.1/DER decoder module.
+
+import ritzlib.sys
+import ritzlib.io
+import lib.asn1
+import lib.mem
+
+# ============================================================================
+# Tag Parsing Tests
+# ============================================================================
+
+[[test]]
+fn test_parse_integer_tag() -> i32
+    # DER encoding of INTEGER 0
+    var data: [3]u8
+    data[0] = 0x02  # INTEGER tag
+    data[1] = 0x01  # length 1
+    data[2] = 0x00  # value 0
+
+    var parser: DerParser
+    der_parser_init(&parser, &data[0], 3)
+
+    var elem: DerElement
+    if der_parse_element(&parser, &elem) != 0
+        return 1
+
+    if der_is_integer(&elem) != 1
+        return 2
+
+    if elem.content_len != 1
+        return 3
+
+    if elem.content[0] != 0
+        return 4
+
+    return 0
+
+[[test]]
+fn test_parse_sequence_tag() -> i32
+    # DER encoding: SEQUENCE { INTEGER 1 }
+    var data: [5]u8
+    data[0] = 0x30  # SEQUENCE tag (constructed)
+    data[1] = 0x03  # length 3
+    data[2] = 0x02  # INTEGER tag
+    data[3] = 0x01  # length 1
+    data[4] = 0x01  # value 1
+
+    var parser: DerParser
+    der_parser_init(&parser, &data[0], 5)
+
+    var elem: DerElement
+    if der_parse_element(&parser, &elem) != 0
+        return 1
+
+    if der_is_sequence(&elem) != 1
+        return 2
+
+    if elem.constructed != 1
+        return 3
+
+    if elem.content_len != 3
+        return 4
+
+    return 0
+
+[[test]]
+fn test_parse_context_tag() -> i32
+    # Context-specific [0] implicit tag
+    var data: [3]u8
+    data[0] = 0xa0  # Context [0], constructed
+    data[1] = 0x01  # length 1
+    data[2] = 0x05  # content
+
+    var parser: DerParser
+    der_parser_init(&parser, &data[0], 3)
+
+    var elem: DerElement
+    if der_parse_element(&parser, &elem) != 0
+        return 1
+
+    if der_is_context_tag(&elem, 0) != 1
+        return 2
+
+    if elem.constructed != 1
+        return 3
+
+    return 0
+
+# ============================================================================
+# Length Encoding Tests
+# ============================================================================
+
+[[test]]
+fn test_short_length() -> i32
+    # Short form: length 5 (single byte)
+    var data: [7]u8
+    data[0] = 0x04  # OCTET STRING
+    data[1] = 0x05  # length 5
+    data[2] = 0x01
+    data[3] = 0x02
+    data[4] = 0x03
+    data[5] = 0x04
+    data[6] = 0x05
+
+    var parser: DerParser
+    der_parser_init(&parser, &data[0], 7)
+
+    var elem: DerElement
+    if der_parse_element(&parser, &elem) != 0
+        return 1
+
+    if elem.content_len != 5
+        return 2
+
+    return 0
+
+[[test]]
+fn test_long_length_one_byte() -> i32
+    # Long form with 1 byte: length 128
+    # 0x81 0x80 means "1 length byte follows, value is 128"
+    var data: [131]u8
+    data[0] = 0x04  # OCTET STRING
+    data[1] = 0x81  # Long form, 1 byte follows
+    data[2] = 0x80  # length = 128
+
+    # Fill content
+    var i: i32 = 0
+    while i < 128
+        data[3 + i] = (i & 0xff) as u8
+        i += 1
+
+    var parser: DerParser
+    der_parser_init(&parser, &data[0], 131)
+
+    var elem: DerElement
+    if der_parse_element(&parser, &elem) != 0
+        return 1
+
+    if elem.content_len != 128
+        return 2
+
+    if elem.header_len != 3
+        return 3
+
+    return 0
+
+[[test]]
+fn test_long_length_two_bytes() -> i32
+    # Long form with 2 bytes: length 256
+    var data: [260]u8
+    data[0] = 0x04  # OCTET STRING
+    data[1] = 0x82  # Long form, 2 bytes follow
+    data[2] = 0x01  # high byte = 1
+    data[3] = 0x00  # low byte = 0 -> 256
+
+    var i: i32 = 0
+    while i < 256
+        data[4 + i] = (i & 0xff) as u8
+        i += 1
+
+    var parser: DerParser
+    der_parser_init(&parser, &data[0], 260)
+
+    var elem: DerElement
+    if der_parse_element(&parser, &elem) != 0
+        return 1
+
+    if elem.content_len != 256
+        return 2
+
+    if elem.header_len != 4
+        return 3
+
+    return 0
+
+# ============================================================================
+# Integer Value Tests
+# ============================================================================
+
+[[test]]
+fn test_integer_zero() -> i32
+    var data: [3]u8
+    data[0] = 0x02  # INTEGER
+    data[1] = 0x01  # length 1
+    data[2] = 0x00  # value 0
+
+    var parser: DerParser
+    der_parser_init(&parser, &data[0], 3)
+
+    var elem: DerElement
+    if der_parse_element(&parser, &elem) != 0
+        return 1
+
+    var value: i64 = 0
+    if der_integer_to_i64(&elem, &value) != 0
+        return 2
+
+    if value != 0
+        return 3
+
+    return 0
+
+[[test]]
+fn test_integer_positive() -> i32
+    # INTEGER 127 (0x7f)
+    var data: [3]u8
+    data[0] = 0x02
+    data[1] = 0x01
+    data[2] = 0x7f
+
+    var parser: DerParser
+    der_parser_init(&parser, &data[0], 3)
+
+    var elem: DerElement
+    if der_parse_element(&parser, &elem) != 0
+        return 1
+
+    var value: i64 = 0
+    if der_integer_to_i64(&elem, &value) != 0
+        return 2
+
+    if value != 127
+        return 3
+
+    return 0
+
+[[test]]
+fn test_integer_negative() -> i32
+    # INTEGER -1 (0xff in two's complement)
+    var data: [3]u8
+    data[0] = 0x02
+    data[1] = 0x01
+    data[2] = 0xff
+
+    var parser: DerParser
+    der_parser_init(&parser, &data[0], 3)
+
+    var elem: DerElement
+    if der_parse_element(&parser, &elem) != 0
+        return 1
+
+    var value: i64 = 0
+    if der_integer_to_i64(&elem, &value) != 0
+        return 2
+
+    if value != -1
+        return 3
+
+    return 0
+
+[[test]]
+fn test_integer_128() -> i32
+    # INTEGER 128 needs 2 bytes: 0x00 0x80 (leading zero to indicate positive)
+    var data: [4]u8
+    data[0] = 0x02
+    data[1] = 0x02  # length 2
+    data[2] = 0x00  # leading zero
+    data[3] = 0x80  # 128
+
+    var parser: DerParser
+    der_parser_init(&parser, &data[0], 4)
+
+    var elem: DerElement
+    if der_parse_element(&parser, &elem) != 0
+        return 1
+
+    var value: u64 = 0
+    if der_integer_to_u64(&elem, &value) != 0
+        return 2
+
+    if value != 128
+        return 3
+
+    return 0
+
+[[test]]
+fn test_integer_large() -> i32
+    # INTEGER 65537 (0x010001) - common RSA exponent
+    var data: [6]u8
+    data[0] = 0x02
+    data[1] = 0x03  # length 3
+    data[2] = 0x01
+    data[3] = 0x00
+    data[4] = 0x01
+
+    var parser: DerParser
+    der_parser_init(&parser, &data[0], 5)
+
+    var elem: DerElement
+    if der_parse_element(&parser, &elem) != 0
+        return 1
+
+    var value: u64 = 0
+    if der_integer_to_u64(&elem, &value) != 0
+        return 2
+
+    if value != 65537
+        return 3
+
+    return 0
+
+# ============================================================================
+# OID Tests
+# ============================================================================
+
+[[test]]
+fn test_oid_rsa() -> i32
+    # OID 1.2.840.113549.1.1.1 (rsaEncryption)
+    # Encoded: 2a 86 48 86 f7 0d 01 01 01
+    var data: [11]u8
+    data[0] = 0x06  # OID tag
+    data[1] = 0x09  # length 9
+    data[2] = 0x2a  # 1*40 + 2 = 42
+    data[3] = 0x86
+    data[4] = 0x48  # 840
+    data[5] = 0x86
+    data[6] = 0xf7
+    data[7] = 0x0d  # 113549
+    data[8] = 0x01  # 1
+    data[9] = 0x01  # 1
+    data[10] = 0x01 # 1
+
+    var parser: DerParser
+    der_parser_init(&parser, &data[0], 11)
+
+    var elem: DerElement
+    if der_parse_element(&parser, &elem) != 0
+        return 1
+
+    if der_is_oid(&elem) != 1
+        return 2
+
+    var oid: Oid
+    if der_decode_oid(&elem, &oid) != 0
+        return 3
+
+    if oid.num_components != 7
+        return 4
+
+    if oid.components[0] != 1
+        return 5
+    if oid.components[1] != 2
+        return 6
+    if oid.components[2] != 840
+        return 7
+    if oid.components[3] != 113549
+        return 8
+    if oid.components[4] != 1
+        return 9
+    if oid.components[5] != 1
+        return 10
+    if oid.components[6] != 1
+        return 11
+
+    if oid_is_rsa(&oid) != 1
+        return 12
+
+    return 0
+
+[[test]]
+fn test_oid_sha256_rsa() -> i32
+    # OID 1.2.840.113549.1.1.11 (sha256WithRSAEncryption)
+    var data: [11]u8
+    data[0] = 0x06
+    data[1] = 0x09
+    data[2] = 0x2a  # 1.2
+    data[3] = 0x86
+    data[4] = 0x48  # .840
+    data[5] = 0x86
+    data[6] = 0xf7
+    data[7] = 0x0d  # .113549
+    data[8] = 0x01  # .1
+    data[9] = 0x01  # .1
+    data[10] = 0x0b # .11
+
+    var parser: DerParser
+    der_parser_init(&parser, &data[0], 11)
+
+    var elem: DerElement
+    if der_parse_element(&parser, &elem) != 0
+        return 1
+
+    var oid: Oid
+    if der_decode_oid(&elem, &oid) != 0
+        return 2
+
+    if oid_is_sha256_rsa(&oid) != 1
+        return 3
+
+    return 0
+
+[[test]]
+fn test_oid_ed25519() -> i32
+    # OID 1.3.101.112 (Ed25519)
+    # Encoded: 2b 65 70
+    var data: [5]u8
+    data[0] = 0x06
+    data[1] = 0x03
+    data[2] = 0x2b  # 1*40 + 3 = 43
+    data[3] = 0x65  # 101
+    data[4] = 0x70  # 112
+
+    var parser: DerParser
+    der_parser_init(&parser, &data[0], 5)
+
+    var elem: DerElement
+    if der_parse_element(&parser, &elem) != 0
+        return 1
+
+    var oid: Oid
+    if der_decode_oid(&elem, &oid) != 0
+        return 2
+
+    if oid.num_components != 4
+        return 3
+
+    if oid_is_ed25519(&oid) != 1
+        return 4
+
+    return 0
+
+[[test]]
+fn test_oid_common_name() -> i32
+    # OID 2.5.4.3 (commonName)
+    # Encoded: 55 04 03
+    var data: [5]u8
+    data[0] = 0x06
+    data[1] = 0x03
+    data[2] = 0x55  # 2*40 + 5 = 85
+    data[3] = 0x04  # 4
+    data[4] = 0x03  # 3
+
+    var parser: DerParser
+    der_parser_init(&parser, &data[0], 5)
+
+    var elem: DerElement
+    if der_parse_element(&parser, &elem) != 0
+        return 1
+
+    var oid: Oid
+    if der_decode_oid(&elem, &oid) != 0
+        return 2
+
+    if oid_is_common_name(&oid) != 1
+        return 3
+
+    return 0
+
+# ============================================================================
+# Nested Structure Tests
+# ============================================================================
+
+[[test]]
+fn test_nested_sequence() -> i32
+    # SEQUENCE { SEQUENCE { INTEGER 42 } }
+    var data: [9]u8
+    data[0] = 0x30  # outer SEQUENCE
+    data[1] = 0x07
+    data[2] = 0x30  # inner SEQUENCE
+    data[3] = 0x05
+    data[4] = 0x02  # INTEGER
+    data[5] = 0x03
+    data[6] = 0x00  # leading zero for positive
+    data[7] = 0x00
+    data[8] = 0x2a  # 42
+
+    var parser: DerParser
+    der_parser_init(&parser, &data[0], 9)
+
+    var outer: DerElement
+    if der_parse_element(&parser, &outer) != 0
+        return 1
+
+    if der_is_sequence(&outer) != 1
+        return 2
+
+    var inner_parser: DerParser
+    if der_enter_sequence(&outer, &inner_parser) != 0
+        return 3
+
+    var inner: DerElement
+    if der_parse_element(&inner_parser, &inner) != 0
+        return 4
+
+    if der_is_sequence(&inner) != 1
+        return 5
+
+    var int_parser: DerParser
+    if der_enter_sequence(&inner, &int_parser) != 0
+        return 6
+
+    var int_elem: DerElement
+    if der_parse_element(&int_parser, &int_elem) != 0
+        return 7
+
+    var value: u64 = 0
+    if der_integer_to_u64(&int_elem, &value) != 0
+        return 8
+
+    if value != 42
+        return 9
+
+    return 0
+
+# ============================================================================
+# BIT STRING Tests
+# ============================================================================
+
+[[test]]
+fn test_bit_string() -> i32
+    # BIT STRING with 0 unused bits
+    var data: [5]u8
+    data[0] = 0x03  # BIT STRING
+    data[1] = 0x03  # length 3
+    data[2] = 0x00  # 0 unused bits
+    data[3] = 0xab
+    data[4] = 0xcd
+
+    var parser: DerParser
+    der_parser_init(&parser, &data[0], 5)
+
+    var elem: DerElement
+    if der_parse_element(&parser, &elem) != 0
+        return 1
+
+    if der_is_bit_string(&elem) != 1
+        return 2
+
+    var bits: *u8 = null
+    var bits_len: u64 = 0
+    var unused: u8 = 0
+
+    if der_bit_string_content(&elem, &bits, &bits_len, &unused) != 0
+        return 3
+
+    if unused != 0
+        return 4
+
+    if bits_len != 2
+        return 5
+
+    if bits[0] != 0xab
+        return 6
+
+    if bits[1] != 0xcd
+        return 7
+
+    return 0
+
+# ============================================================================
+# NULL Tests
+# ============================================================================
+
+[[test]]
+fn test_null() -> i32
+    var data: [2]u8
+    data[0] = 0x05  # NULL
+    data[1] = 0x00  # length 0
+
+    var parser: DerParser
+    der_parser_init(&parser, &data[0], 2)
+
+    var elem: DerElement
+    if der_parse_element(&parser, &elem) != 0
+        return 1
+
+    if der_is_null(&elem) != 1
+        return 2
+
+    return 0
+
+# ============================================================================
+# Error Handling Tests
+# ============================================================================
+
+[[test]]
+fn test_truncated_data() -> i32
+    # Incomplete element - length says 5 but only 2 bytes follow
+    var data: [4]u8
+    data[0] = 0x04  # OCTET STRING
+    data[1] = 0x05  # length 5
+    data[2] = 0x01
+    data[3] = 0x02
+
+    var parser: DerParser
+    der_parser_init(&parser, &data[0], 4)
+
+    var elem: DerElement
+    # Should fail due to insufficient data
+    if der_parse_element(&parser, &elem) == 0
+        return 1  # Should have failed
+
+    return 0
+
+[[test]]
+fn test_empty_parser() -> i32
+    var parser: DerParser
+    der_parser_init(&parser, null, 0)
+
+    if der_parser_eof(&parser) != 1
+        return 1
+
+    if der_parser_remaining(&parser) != 0
+        return 2
+
+    return 0
+
+# ============================================================================
+# AlgorithmIdentifier Test (common X.509 structure)
+# ============================================================================
+
+[[test]]
+fn test_algorithm_identifier_rsa() -> i32
+    # AlgorithmIdentifier ::= SEQUENCE { algorithm OID, parameters ANY }
+    # rsaEncryption: SEQUENCE { OID 1.2.840.113549.1.1.1, NULL }
+    var data: [15]u8
+    data[0] = 0x30  # SEQUENCE
+    data[1] = 0x0d  # length 13
+    data[2] = 0x06  # OID
+    data[3] = 0x09
+    data[4] = 0x2a
+    data[5] = 0x86
+    data[6] = 0x48
+    data[7] = 0x86
+    data[8] = 0xf7
+    data[9] = 0x0d
+    data[10] = 0x01
+    data[11] = 0x01
+    data[12] = 0x01
+    data[13] = 0x05  # NULL
+    data[14] = 0x00
+
+    var parser: DerParser
+    der_parser_init(&parser, &data[0], 15)
+
+    var seq: DerElement
+    if der_parse_element(&parser, &seq) != 0
+        return 1
+
+    if der_is_sequence(&seq) != 1
+        return 2
+
+    var seq_parser: DerParser
+    if der_enter_sequence(&seq, &seq_parser) != 0
+        return 3
+
+    # Parse OID
+    var oid_elem: DerElement
+    if der_parse_element(&seq_parser, &oid_elem) != 0
+        return 4
+
+    var oid: Oid
+    if der_decode_oid(&oid_elem, &oid) != 0
+        return 5
+
+    if oid_is_rsa(&oid) != 1
+        return 6
+
+    # Parse NULL parameters
+    var null_elem: DerElement
+    if der_parse_element(&seq_parser, &null_elem) != 0
+        return 7
+
+    if der_is_null(&null_elem) != 1
+        return 8
+
+    # Should be at end
+    if der_parser_eof(&seq_parser) != 1
+        return 9
+
+    return 0
+
+# ============================================================================
+# Multi-byte Tag Test
+# ============================================================================
+
+[[test]]
+fn test_multi_byte_tag() -> i32
+    # Tag number 31 or higher uses multi-byte encoding
+    # Tag class = context (0x80), constructed (0x20), tag number >= 31 (0x1f)
+    # So 0xbf 0x21 = context-specific constructed tag [33]
+    var data: [5]u8
+    data[0] = 0xbf  # context + constructed + "more bytes follow"
+    data[1] = 0x21  # tag number 33 (0x21 with high bit clear)
+    data[2] = 0x02  # length 2
+    data[3] = 0xab
+    data[4] = 0xcd
+
+    var parser: DerParser
+    der_parser_init(&parser, &data[0], 5)
+
+    var elem: DerElement
+    if der_parse_element(&parser, &elem) != 0
+        return 1
+
+    if elem.tag_class != TAG_CLASS_CONTEXT
+        return 2
+
+    if elem.constructed != 1
+        return 3
+
+    if elem.tag_number != 33
+        return 4
+
+    if elem.content_len != 2
+        return 5
+
+    return 0

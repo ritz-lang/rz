@@ -1,0 +1,425 @@
+# lib/rsa.ritz - RSA Signature Verification
+#
+# Implements RSA signature verification with PKCS#1 v1.5 padding.
+# Used for verifying X.509 certificate chains (most certificates use RSA).
+#
+# References:
+# - RFC 8017 (PKCS#1 v2.2)
+# - RFC 3447 (PKCS#1 v2.1)
+
+import mem
+import bigint
+import sha256
+import sha512
+import asn1
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+const RSA_MAX_MODULUS_BYTES: i32 = 512   # 4096 bits max
+const RSA_MIN_MODULUS_BYTES: i32 = 128   # 1024 bits min (though 2048+ recommended)
+
+# PKCS#1 v1.5 DigestInfo prefixes (DER-encoded AlgorithmIdentifier + hash)
+# SHA-256: 30 31 30 0d 06 09 60 86 48 01 65 03 04 02 01 05 00 04 20
+const PKCS1_SHA256_PREFIX_LEN: i32 = 19
+# SHA-384: 30 41 30 0d 06 09 60 86 48 01 65 03 04 02 02 05 00 04 30
+const PKCS1_SHA384_PREFIX_LEN: i32 = 19
+# SHA-512: 30 51 30 0d 06 09 60 86 48 01 65 03 04 02 03 05 00 04 40
+const PKCS1_SHA512_PREFIX_LEN: i32 = 19
+
+# ============================================================================
+# RSA Public Key Structure
+# ============================================================================
+
+pub struct RsaPublicKey
+    n: [512]u8          # Modulus (big-endian, up to 4096 bits)
+    n_len: i32          # Modulus length in bytes
+    e: u32              # Public exponent (usually 65537)
+
+pub fn rsa_pubkey_init(key: *RsaPublicKey)
+    mem_zero(&key.n[0], 512)
+    key.n_len = 0
+    key.e = 0
+
+# ============================================================================
+# RSA Public Key Parsing (from DER)
+# ============================================================================
+
+# Parse RSA public key from DER-encoded SubjectPublicKeyInfo or RSAPublicKey
+# SubjectPublicKeyInfo ::= SEQUENCE {
+#   algorithm AlgorithmIdentifier,
+#   subjectPublicKey BIT STRING (containing RSAPublicKey)
+# }
+# RSAPublicKey ::= SEQUENCE {
+#   modulus INTEGER,
+#   publicExponent INTEGER
+# }
+pub fn rsa_parse_public_key(der: *u8, der_len: i32, key: *RsaPublicKey) -> i32
+    rsa_pubkey_init(key)
+
+    var parser: DerParser
+    der_parser_init(&parser, der, der_len as u64)
+
+    var outer: DerElement
+    if der_parse_element(&parser, &outer) != 0
+        return -1
+
+    if der_is_sequence(&outer) != 1
+        return -1
+
+    # Parse inside the sequence
+    var inner_parser: DerParser
+    der_parser_init(&inner_parser, outer.content, outer.content_len)
+
+    var first: DerElement
+    if der_parse_element(&inner_parser, &first) != 0
+        return -1
+
+    # Check if this is SubjectPublicKeyInfo (first elem is SEQUENCE for algorithm)
+    # or raw RSAPublicKey (first elem is INTEGER for modulus)
+    if der_is_sequence(&first) == 1
+        # SubjectPublicKeyInfo format - skip AlgorithmIdentifier, get BIT STRING
+        var bit_string: DerElement
+        if der_parse_element(&inner_parser, &bit_string) != 0
+            return -2
+
+        if der_is_bit_string(&bit_string) != 1
+            return -3
+
+        # BIT STRING content: first byte is unused bits count
+        if bit_string.content_len < 2
+            return -4
+
+        let unused_bits: u8 = bit_string.content[0]
+        if unused_bits != 0
+            return -5  # RSA keys should have 0 unused bits
+
+        # Parse the RSAPublicKey inside the BIT STRING
+        var rsa_parser: DerParser
+        der_parser_init(&rsa_parser, &bit_string.content[1], bit_string.content_len - 1)
+
+        var rsa_seq: DerElement
+        if der_parse_element(&rsa_parser, &rsa_seq) != 0
+            return -6
+
+        if der_is_sequence(&rsa_seq) != 1
+            return -7
+
+        return rsa_parse_pubkey_sequence(rsa_seq.content, rsa_seq.content_len as i32, key)
+
+    else if der_is_integer(&first) == 1
+        # Raw RSAPublicKey format - first is already the modulus
+        # Parse modulus from first element
+        if first.content_len > RSA_MAX_MODULUS_BYTES as u64
+            return -10
+
+        # Copy modulus - strip ALL leading zeros
+        var start: u64 = 0
+        while start < first.content_len - 1 && first.content[start] == 0
+            start += 1
+
+        let mod_len: u64 = first.content_len - start
+        if mod_len > RSA_MAX_MODULUS_BYTES as u64
+            return -11
+
+        mem_copy(&key.n[0], &first.content[start], mod_len)
+        key.n_len = mod_len as i32
+
+        # Parse exponent
+        var exp_elem: DerElement
+        if der_parse_element(&inner_parser, &exp_elem) != 0
+            return -12
+
+        if der_is_integer(&exp_elem) != 1
+            return -13
+
+        var exp_val: u64 = 0
+        if der_integer_to_u64(&exp_elem, &exp_val) != 0
+            return -14
+
+        if exp_val > 0xffffffff
+            return -15  # Exponent too large
+
+        key.e = exp_val as u32
+        return 0
+
+    return -20  # Unknown format
+
+# Parse RSAPublicKey SEQUENCE content
+fn rsa_parse_pubkey_sequence(data: *u8, len: i32, key: *RsaPublicKey) -> i32
+    var parser: DerParser
+    der_parser_init(&parser, data, len as u64)
+
+    # Parse modulus
+    var mod_elem: DerElement
+    if der_parse_element(&parser, &mod_elem) != 0
+        return -30
+
+    if der_is_integer(&mod_elem) != 1
+        return -31
+
+    if mod_elem.content_len > RSA_MAX_MODULUS_BYTES as u64
+        return -32
+
+    # Copy modulus - strip ALL leading zeros
+    var start: u64 = 0
+    while start < mod_elem.content_len - 1 && mod_elem.content[start] == 0
+        start += 1
+
+    let mod_len: u64 = mod_elem.content_len - start
+    if mod_len > RSA_MAX_MODULUS_BYTES as u64
+        return -33
+
+    mem_copy(&key.n[0], &mod_elem.content[start], mod_len)
+    key.n_len = mod_len as i32
+
+    # Parse exponent
+    var exp_elem: DerElement
+    if der_parse_element(&parser, &exp_elem) != 0
+        return -34
+
+    if der_is_integer(&exp_elem) != 1
+        return -35
+
+    var exp_val: u64 = 0
+    if der_integer_to_u64(&exp_elem, &exp_val) != 0
+        return -36
+
+    if exp_val > 0xffffffff
+        return -37
+
+    key.e = exp_val as u32
+    return 0
+
+# ============================================================================
+# PKCS#1 v1.5 Signature Verification
+# ============================================================================
+
+# Verify RSA signature with PKCS#1 v1.5 padding
+# sig = m^e mod n, where m is PKCS#1 padded message
+# Padding format: 0x00 || 0x01 || PS || 0x00 || DigestInfo
+# PS = 0xff bytes (at least 8)
+# DigestInfo = AlgorithmIdentifier || hash
+fn rsa_verify_pkcs1(key: *RsaPublicKey, hash: *u8, hash_len: i32, hash_oid_prefix: *u8, prefix_len: i32, sig: *u8, sig_len: i32) -> i32
+    # Signature length must match modulus length
+    if sig_len != key.n_len
+        return 0
+
+    if key.n_len < RSA_MIN_MODULUS_BYTES
+        return 0
+
+    # Convert signature to BigInt
+    var s: BigInt
+    bigint_from_bytes(&s, sig, sig_len)
+
+    # Convert modulus to BigInt
+    var n: BigInt
+    bigint_from_bytes(&n, &key.n[0], key.n_len)
+
+    # Check s < n
+    if bigint_ge(&s, &n) == 1
+        return 0
+
+    # Compute m = s^e mod n
+    var m: BigInt
+    bigint_mod_exp_u32(&m, &s, key.e, &n)
+
+    # Convert result to bytes (same length as modulus)
+    var em: [512]u8
+    bigint_to_bytes_fixed(&m, &em[0], key.n_len)
+
+    # Verify PKCS#1 v1.5 padding: 0x00 || 0x01 || PS || 0x00 || DigestInfo
+    # DigestInfo length = prefix_len + hash_len
+    let digest_info_len: i32 = prefix_len + hash_len
+    let min_ps_len: i32 = 8
+    let min_em_len: i32 = 3 + min_ps_len + digest_info_len
+
+    if key.n_len < min_em_len
+        return 0
+
+    # Check 0x00 || 0x01
+    if em[0] != 0x00
+        return 0
+    if em[1] != 0x01
+        return 0
+
+    # Find end of PS (first 0x00 after position 2)
+    var ps_end: i32 = 2
+    while ps_end < key.n_len
+        if em[ps_end] == 0x00
+            break
+        if em[ps_end] != 0xff
+            return 0  # PS must be all 0xff
+        ps_end += 1
+
+    if ps_end >= key.n_len
+        return 0  # No 0x00 terminator found
+
+    let ps_len: i32 = ps_end - 2
+    if ps_len < min_ps_len
+        return 0  # PS too short
+
+    # Position after 0x00 separator
+    let digest_info_start: i32 = ps_end + 1
+
+    # Check remaining length
+    if key.n_len - digest_info_start != digest_info_len
+        return 0
+
+    # Verify DigestInfo prefix (algorithm OID)
+    var i: i32 = 0
+    while i < prefix_len
+        if em[digest_info_start + i] != hash_oid_prefix[i]
+            return 0
+        i += 1
+
+    # Verify hash value
+    i = 0
+    while i < hash_len
+        if em[digest_info_start + prefix_len + i] != hash[i]
+            return 0
+        i += 1
+
+    return 1  # Signature valid
+
+# ============================================================================
+# SHA-256 Signature Verification
+# ============================================================================
+
+# DigestInfo for SHA-256:
+# SEQUENCE {
+#   SEQUENCE {
+#     OID 2.16.840.1.101.3.4.2.1 (sha256)
+#     NULL
+#   }
+#   OCTET STRING (32 bytes hash)
+# }
+# DER: 30 31 30 0d 06 09 60 86 48 01 65 03 04 02 01 05 00 04 20
+
+pub fn get_sha256_digest_info_prefix(out: *u8) -> i32
+    out[0] = 0x30
+    out[1] = 0x31
+    out[2] = 0x30
+    out[3] = 0x0d
+    out[4] = 0x06
+    out[5] = 0x09
+    out[6] = 0x60
+    out[7] = 0x86
+    out[8] = 0x48
+    out[9] = 0x01
+    out[10] = 0x65
+    out[11] = 0x03
+    out[12] = 0x04
+    out[13] = 0x02
+    out[14] = 0x01
+    out[15] = 0x05
+    out[16] = 0x00
+    out[17] = 0x04
+    out[18] = 0x20
+    return 19
+
+# Verify RSA-SHA256 signature (PKCS#1 v1.5)
+# Returns 1 if valid, 0 if invalid
+pub fn rsa_verify_pkcs1_sha256(key: *RsaPublicKey, msg: *u8, msg_len: i64, sig: *u8, sig_len: i32) -> i32
+    # Hash the message
+    var hash: [32]u8
+    sha256(msg, msg_len, &hash[0])
+
+    # Get DigestInfo prefix
+    var prefix: [19]u8
+    let prefix_len: i32 = get_sha256_digest_info_prefix(&prefix[0])
+
+    return rsa_verify_pkcs1(key, &hash[0], 32, &prefix[0], prefix_len, sig, sig_len)
+
+# Verify RSA-SHA256 signature with pre-computed hash
+pub fn rsa_verify_pkcs1_sha256_hash(key: *RsaPublicKey, hash: *u8, sig: *u8, sig_len: i32) -> i32
+    var prefix: [19]u8
+    let prefix_len: i32 = get_sha256_digest_info_prefix(&prefix[0])
+    return rsa_verify_pkcs1(key, hash, 32, &prefix[0], prefix_len, sig, sig_len)
+
+# ============================================================================
+# SHA-384 Signature Verification
+# ============================================================================
+
+# DigestInfo for SHA-384:
+# DER: 30 41 30 0d 06 09 60 86 48 01 65 03 04 02 02 05 00 04 30
+
+pub fn get_sha384_digest_info_prefix(out: *u8) -> i32
+    out[0] = 0x30
+    out[1] = 0x41
+    out[2] = 0x30
+    out[3] = 0x0d
+    out[4] = 0x06
+    out[5] = 0x09
+    out[6] = 0x60
+    out[7] = 0x86
+    out[8] = 0x48
+    out[9] = 0x01
+    out[10] = 0x65
+    out[11] = 0x03
+    out[12] = 0x04
+    out[13] = 0x02
+    out[14] = 0x02
+    out[15] = 0x05
+    out[16] = 0x00
+    out[17] = 0x04
+    out[18] = 0x30
+    return 19
+
+pub fn rsa_verify_pkcs1_sha384(key: *RsaPublicKey, msg: *u8, msg_len: i64, sig: *u8, sig_len: i32) -> i32
+    var hash: [48]u8
+    sha384(msg, msg_len, &hash[0])
+
+    var prefix: [19]u8
+    let prefix_len: i32 = get_sha384_digest_info_prefix(&prefix[0])
+
+    return rsa_verify_pkcs1(key, &hash[0], 48, &prefix[0], prefix_len, sig, sig_len)
+
+pub fn rsa_verify_pkcs1_sha384_hash(key: *RsaPublicKey, hash: *u8, sig: *u8, sig_len: i32) -> i32
+    var prefix: [19]u8
+    let prefix_len: i32 = get_sha384_digest_info_prefix(&prefix[0])
+    return rsa_verify_pkcs1(key, hash, 48, &prefix[0], prefix_len, sig, sig_len)
+
+# ============================================================================
+# SHA-512 Signature Verification
+# ============================================================================
+
+# DigestInfo for SHA-512:
+# DER: 30 51 30 0d 06 09 60 86 48 01 65 03 04 02 03 05 00 04 40
+
+pub fn get_sha512_digest_info_prefix(out: *u8) -> i32
+    out[0] = 0x30
+    out[1] = 0x51
+    out[2] = 0x30
+    out[3] = 0x0d
+    out[4] = 0x06
+    out[5] = 0x09
+    out[6] = 0x60
+    out[7] = 0x86
+    out[8] = 0x48
+    out[9] = 0x01
+    out[10] = 0x65
+    out[11] = 0x03
+    out[12] = 0x04
+    out[13] = 0x02
+    out[14] = 0x03
+    out[15] = 0x05
+    out[16] = 0x00
+    out[17] = 0x04
+    out[18] = 0x40
+    return 19
+
+pub fn rsa_verify_pkcs1_sha512(key: *RsaPublicKey, msg: *u8, msg_len: i64, sig: *u8, sig_len: i32) -> i32
+    var hash: [64]u8
+    sha512(msg, msg_len, &hash[0])
+
+    var prefix: [19]u8
+    let prefix_len: i32 = get_sha512_digest_info_prefix(&prefix[0])
+
+    return rsa_verify_pkcs1(key, &hash[0], 64, &prefix[0], prefix_len, sig, sig_len)
+
+pub fn rsa_verify_pkcs1_sha512_hash(key: *RsaPublicKey, hash: *u8, sig: *u8, sig_len: i32) -> i32
+    var prefix: [19]u8
+    let prefix_len: i32 = get_sha512_digest_info_prefix(&prefix[0])
+    return rsa_verify_pkcs1(key, hash, 64, &prefix[0], prefix_len, sig, sig_len)

@@ -1,0 +1,133 @@
+# lib/mem.ritz - Secure memory utilities
+#
+# Provides constant-time memory operations for cryptographic use.
+# All functions are designed to resist timing side-channel attacks.
+#
+# Key functions:
+# - mem_zero: Zero memory (compiler cannot optimize away)
+# - mem_eq: Constant-time memory comparison
+# - mem_copy: Safe memory copy
+# - ct_select_*: Constant-time conditional select
+# - ct_is_zero_*: Constant-time zero check
+
+import ritzlib.sys
+
+# ============================================================================
+# Constant-time memory zeroing
+# ============================================================================
+# Uses volatile semantics to prevent compiler from optimizing away.
+# This is critical for clearing sensitive data like keys.
+
+pub fn mem_zero(ptr: *u8, len: i64)
+    # TODO: Add volatile semantics when asm syntax is finalized
+    # For now, use a simple loop. At -O0 this won't be optimized away.
+    # In production, we may need to use an extern "C" memset_s or
+    # explicit_bzero from libc, or use compiler intrinsics.
+    for i in 0..len
+        *(ptr + i) = 0
+
+# ============================================================================
+# Constant-time memory comparison
+# ============================================================================
+# Compares two buffers in constant time regardless of where they differ.
+# Returns 1 if equal, 0 if different.
+#
+# CRITICAL: This must NOT early-exit on first difference!
+# We accumulate XOR of all byte differences, then convert to 0/1.
+
+pub fn mem_eq(a: *u8, b: *u8, len: i64) -> i32
+    var diff: u64 = 0
+
+    # Accumulate XOR of all byte pairs
+    # If any byte differs, diff will have non-zero bits
+    for i in 0..len
+        let xa: u64 = *(a + i) as u64
+        let xb: u64 = *(b + i) as u64
+        diff = diff | (xa ^ xb)
+
+    # Convert to 0 (different) or 1 (equal)
+    # If diff == 0, all bytes matched
+    return ct_is_zero_u64(diff)
+
+# ============================================================================
+# Memory copy
+# ============================================================================
+
+pub fn mem_copy(dst: *u8, src: *u8, len: i64)
+    for i in 0..len
+        *(dst + i) = *(src + i)
+
+# ============================================================================
+# Constant-time conditional select
+# ============================================================================
+# Returns a if condition is non-zero, b otherwise.
+# MUST execute in constant time regardless of condition.
+#
+# Algorithm: Use bitwise operations to select without branching.
+# mask = 0xFFFF...FF if condition != 0, else 0x0000...00
+# result = (a & mask) | (b & ~mask)
+
+pub fn ct_select_u8(a: u8, b: u8, condition: i32) -> u8
+    # Create mask: all 1s if condition != 0, all 0s otherwise
+    #
+    # Cast to u32 first to avoid sign extension, then to u64
+    let c32: u32 = condition as u32
+    let c64: u64 = c32 as u64
+
+    # Compute: (c | -c) has MSB set iff c != 0
+    # Then shift to isolate MSB -> gives 1 if nonzero, 0 if zero
+    let ored: u64 = c64 | (0 - c64)
+    let norm: u64 = ored >> 63  # 1 if nonzero, 0 if zero (logical shift on u64)
+    let mask: u64 = 0 - norm  # All 1s if nonzero, all 0s if zero
+
+    let a64: u64 = a as u64
+    let b64: u64 = b as u64
+
+    let result: u64 = (a64 & mask) | (b64 & (~mask))
+    return result as u8
+
+pub fn ct_select_u64(a: u64, b: u64, condition: i32) -> u64
+    # Cast to u32 first to avoid sign extension, then to u64
+    let c32: u32 = condition as u32
+    let c64: u64 = c32 as u64
+
+    let ored: u64 = c64 | (0 - c64)
+    let norm: u64 = ored >> 63
+    let mask: u64 = 0 - norm
+
+    return (a & mask) | (b & (~mask))
+
+# ============================================================================
+# Constant-time zero check
+# ============================================================================
+# Returns 1 if value is zero, 0 otherwise.
+# MUST execute in constant time.
+#
+# Algorithm: (x | -x) has MSB = 1 iff x != 0
+# Shift MSB to LSB, then XOR with 1 to invert
+
+pub fn ct_is_zero_u64(x: u64) -> i32
+    # If x != 0, then (x | -x) will have the MSB set
+    # If x == 0, then (0 | 0) = 0
+    let v: u64 = x | (0 - x)
+    # Arithmetic right shift would propagate sign, but we use logical
+    # So we shift right by 63 to get the MSB into the LSB position
+    let msb: u64 = v >> 63
+    # Invert: if msb=1 (nonzero), return 0; if msb=0 (zero), return 1
+    return (1 - msb) as i32
+
+# ============================================================================
+# Check if memory is all zeros
+# ============================================================================
+# Returns 1 if all bytes are zero, 0 otherwise.
+# Uses constant-time accumulation.
+
+pub fn mem_is_zero(ptr: *u8, len: i64) -> i32
+    if len == 0
+        return 1
+
+    var acc: u64 = 0
+    for i in 0..len
+        acc = acc | (*(ptr + i) as u64)
+
+    return ct_is_zero_u64(acc)

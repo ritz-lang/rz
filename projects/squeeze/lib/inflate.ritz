@@ -1,0 +1,480 @@
+# lib/inflate.ritz - Deflate decompression (RFC 1951)
+#
+# Implements the INFLATE algorithm for decompressing Deflate streams.
+#
+# Deflate block types:
+# - Type 0: Stored (no compression)
+# - Type 1: Fixed Huffman codes
+# - Type 2: Dynamic Huffman codes
+#
+# Block header format (3 bits):
+# - BFINAL (1 bit): 1 if this is the last block
+# - BTYPE (2 bits): 00=stored, 01=fixed, 10=dynamic, 11=reserved
+#
+# API:
+# - inflate(input, input_len, output, output_cap) -> bytes written or error
+
+import ritzlib.sys
+
+import bits
+import huffman
+
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+const INFLATE_OK: i64 = 0
+const INFLATE_ERR_INVALID_BLOCK: i64 = -1
+const INFLATE_ERR_TRUNCATED: i64 = -2
+const INFLATE_ERR_NLEN_MISMATCH: i64 = -3
+const INFLATE_ERR_OUTPUT_FULL: i64 = -4
+const INFLATE_ERR_INVALID_CODE: i64 = -5
+const INFLATE_ERR_INVALID_DISTANCE: i64 = -6
+
+const DEFLATE_BLOCK_STORED: i32 = 0
+const DEFLATE_BLOCK_FIXED: i32 = 1
+const DEFLATE_BLOCK_DYNAMIC: i32 = 2
+
+# Window size for LZ77 back-references
+const WINDOW_SIZE: i32 = 32768  # 32KB
+
+# Code length code order (RFC 1951 Section 3.2.7)
+const CODE_LENGTH_ORDER: [19]i32 = [
+    16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15
+]
+
+
+# ============================================================================
+# Huffman Table Pair (litlen + distance)
+# ============================================================================
+
+struct HuffTables
+    litlen: @HuffmanTable
+    dist: @HuffmanTable
+
+
+# ============================================================================
+# Fixed Huffman Tables (Type 1)
+# ============================================================================
+
+# Deflate fixed literal/length code lengths (RFC 1951 Section 3.2.6):
+#   0-143:   8 bits
+#   144-255: 9 bits
+#   256-279: 7 bits
+#   280-287: 8 bits
+var g_fixed_litlen_lengths: [288]u8
+var g_fixed_litlen_table: HuffmanTable
+var g_fixed_dist_lengths: [32]u8
+var g_fixed_dist_table: HuffmanTable
+var g_fixed_tables_init: i32 = 0
+
+fn init_fixed_huffman_tables()
+    if g_fixed_tables_init != 0
+        return
+
+    # Literal/length code lengths
+    for i in 0..144
+        g_fixed_litlen_lengths[i] = 8
+    for i in 144..256
+        g_fixed_litlen_lengths[i] = 9
+    for i in 256..280
+        g_fixed_litlen_lengths[i] = 7
+    for i in 280..288
+        g_fixed_litlen_lengths[i] = 8
+
+    # Build decode table
+    huffman_build_decode_table(@g_fixed_litlen_table, @g_fixed_litlen_lengths[0], 288)
+
+    # Distance code lengths (all 5 bits)
+    for i in 0..32
+        g_fixed_dist_lengths[i] = 5
+
+    huffman_build_decode_table(@g_fixed_dist_table, @g_fixed_dist_lengths[0], 32)
+
+    g_fixed_tables_init = 1
+    return
+
+
+# ============================================================================
+# Length and Distance Extra Bits Tables
+# ============================================================================
+
+# Length codes 257-285 map to lengths 3-258
+# Base length for each code
+const LENGTH_BASE: [29]i32 = [
+    3, 4, 5, 6, 7, 8, 9, 10,      # 257-264
+    11, 13, 15, 17,               # 265-268
+    19, 23, 27, 31,               # 269-272
+    35, 43, 51, 59,               # 273-276
+    67, 83, 99, 115,              # 277-280
+    131, 163, 195, 227,           # 281-284
+    258                           # 285
+]
+
+# Extra bits for length codes
+const LENGTH_EXTRA: [29]i32 = [
+    0, 0, 0, 0, 0, 0, 0, 0,       # 257-264
+    1, 1, 1, 1,                   # 265-268
+    2, 2, 2, 2,                   # 269-272
+    3, 3, 3, 3,                   # 273-276
+    4, 4, 4, 4,                   # 277-280
+    5, 5, 5, 5,                   # 281-284
+    0                             # 285
+]
+
+# Distance codes 0-29 map to distances 1-32768
+const DIST_BASE: [30]i32 = [
+    1, 2, 3, 4,                   # 0-3
+    5, 7, 9, 13,                  # 4-7
+    17, 25, 33, 49,               # 8-11
+    65, 97, 129, 193,             # 12-15
+    257, 385, 513, 769,           # 16-19
+    1025, 1537, 2049, 3073,       # 20-23
+    4097, 6145, 8193, 12289,      # 24-27
+    16385, 24577                  # 28-29
+]
+
+const DIST_EXTRA: [30]i32 = [
+    0, 0, 0, 0,                   # 0-3
+    1, 1, 2, 2,                   # 4-7
+    3, 3, 4, 4,                   # 8-11
+    5, 5, 6, 6,                   # 12-15
+    7, 7, 8, 8,                   # 16-19
+    9, 9, 10, 10,                 # 20-23
+    11, 11, 12, 12,               # 24-27
+    13, 13                        # 28-29
+]
+
+
+# ============================================================================
+# Main Inflate Function
+# ============================================================================
+
+# Decompress a raw Deflate stream (RFC 1951).
+#
+# A Deflate stream consists of one or more blocks, each with a 3-bit header:
+#   BFINAL (1 bit): 1 if this is the last block
+#   BTYPE (2 bits): Block type (00=stored, 01=fixed Huffman, 10=dynamic Huffman)
+#
+# Parameters:
+#   input      - Pointer to compressed data
+#   input_len  - Length of compressed data in bytes
+#   output     - Pointer to output buffer
+#   output_cap - Capacity of output buffer in bytes
+#
+# Returns:
+#   >= 0 : Number of bytes written to output
+#   < 0  : Error code (INFLATE_ERR_*)
+#
+# Error codes:
+#   INFLATE_ERR_INVALID_BLOCK  (-1) : Reserved block type encountered
+#   INFLATE_ERR_TRUNCATED      (-2) : Input ended unexpectedly
+#   INFLATE_ERR_NLEN_MISMATCH  (-3) : Stored block NLEN != ~LEN
+#   INFLATE_ERR_OUTPUT_FULL    (-4) : Output buffer too small
+#   INFLATE_ERR_INVALID_CODE   (-5) : Invalid Huffman code
+#   INFLATE_ERR_INVALID_DISTANCE (-6) : Invalid distance reference
+pub fn inflate(input: *u8, input_len: i64, output: *u8, output_cap: i64) -> i64
+    if input_len == 0
+        return 0
+
+    # Initialize bit reader
+    var reader: BitReader = bits_reader_init(input, input_len)
+
+    var out_pos: i64 = 0
+    var bfinal: i32 = 0
+
+    # Process blocks until BFINAL=1
+    while bfinal == 0
+        # Check we have bits for block header
+        if bits_available(@reader) < 3
+            return INFLATE_ERR_TRUNCATED
+
+        # Read block header
+        bfinal = bits_read(@reader, 1) as i32
+        let btype: i32 = bits_read(@reader, 2) as i32
+
+        if btype == DEFLATE_BLOCK_STORED
+            # Type 0: Stored block
+            let result: i64 = inflate_stored(@reader, output, output_cap, out_pos)
+            if result < 0
+                return result
+            out_pos = result
+
+        else if btype == DEFLATE_BLOCK_FIXED
+            # Type 1: Fixed Huffman
+            let result: i64 = inflate_fixed(@reader, output, output_cap, out_pos)
+            if result < 0
+                return result
+            out_pos = result
+
+        else if btype == DEFLATE_BLOCK_DYNAMIC
+            # Type 2: Dynamic Huffman
+            let result: i64 = inflate_dynamic(@reader, output, output_cap, out_pos)
+            if result < 0
+                return result
+            out_pos = result
+
+        else
+            # Type 3: Reserved (invalid)
+            return INFLATE_ERR_INVALID_BLOCK
+
+    return out_pos
+
+
+# ============================================================================
+# Type 0: Stored Block
+# ============================================================================
+
+fn inflate_stored(reader: *BitReader, output: *u8, output_cap: i64, out_pos: i64) -> i64
+    # Skip to next byte boundary
+    let bit_offset: i32 = reader.bit_pos
+    if bit_offset > 0
+        bits_skip(reader, 8 - bit_offset)
+
+    # Check we have enough bytes for LEN and NLEN
+    if bits_available(reader) < 32
+        return INFLATE_ERR_TRUNCATED
+
+    # Read LEN (2 bytes, little-endian)
+    let len_lo: u32 = bits_read(reader, 8)
+    let len_hi: u32 = bits_read(reader, 8)
+    let len: i32 = (len_lo | (len_hi << 8)) as i32
+
+    # Read NLEN (2 bytes, little-endian)
+    let nlen_lo: u32 = bits_read(reader, 8)
+    let nlen_hi: u32 = bits_read(reader, 8)
+    let nlen: i32 = (nlen_lo | (nlen_hi << 8)) as i32
+
+    # Verify NLEN is one's complement of LEN
+    if (len ^ nlen) != 0xFFFF
+        return INFLATE_ERR_NLEN_MISMATCH
+
+    # Check we have enough input data
+    if bits_available(reader) < (len as i64 * 8)
+        return INFLATE_ERR_TRUNCATED
+
+    # Check output has enough space
+    if out_pos + len as i64 > output_cap
+        return INFLATE_ERR_OUTPUT_FULL
+
+    # Copy data directly
+    var pos: i64 = out_pos
+    for i in 0..len
+        output[pos] = bits_read(reader, 8) as u8
+        pos = pos + 1
+
+    return pos
+
+
+# ============================================================================
+# Type 1: Fixed Huffman
+# ============================================================================
+
+fn inflate_fixed(reader: *BitReader, output: *u8, output_cap: i64, out_pos: i64) -> i64
+    # Initialize fixed tables if needed
+    init_fixed_huffman_tables()
+
+    # Decode using fixed tables
+    var tables: HuffTables
+    tables.litlen = @g_fixed_litlen_table
+    tables.dist = @g_fixed_dist_table
+    return inflate_huff(reader, @tables, output, output_cap, out_pos)
+
+
+# ============================================================================
+# Type 2: Dynamic Huffman
+# ============================================================================
+
+# Read code lengths using run-length encoding (RFC 1951 Section 3.2.7)
+#
+# Code length alphabet:
+#   0-15  : Represent code lengths of 0-15
+#   16    : Copy the previous code length 3-6 times (2 extra bits)
+#   17    : Repeat a code length of 0 for 3-10 times (3 extra bits)
+#   18    : Repeat a code length of 0 for 11-138 times (7 extra bits)
+#
+# Returns 0 on success, negative error code on failure.
+fn read_code_lens(reader: *BitReader, cl: *HuffmanTable, lens: *u8, n: i32) -> i32
+    var i: i32 = 0
+
+    while i < n
+        let sym: i32 = huffman_decode(cl, reader)
+        if sym < 0
+            return INFLATE_ERR_INVALID_CODE as i32
+
+        if sym < 16
+            # Literal length value (0-15)
+            lens[i] = sym as u8
+            i = i + 1
+
+        else if sym == 16
+            # Copy previous length 3-6 times (needs 2 extra bits)
+            if i == 0
+                return INFLATE_ERR_INVALID_CODE as i32
+            let repeat: i32 = 3 + (bits_read(reader, 2) as i32)
+            let prev: u8 = lens[i - 1]
+            for j in 0..repeat
+                if i >= n
+                    return INFLATE_ERR_INVALID_CODE as i32
+                lens[i] = prev
+                i = i + 1
+
+        else if sym == 17
+            # Repeat zero 3-10 times (needs 3 extra bits)
+            let repeat: i32 = 3 + (bits_read(reader, 3) as i32)
+            for j in 0..repeat
+                if i >= n
+                    return INFLATE_ERR_INVALID_CODE as i32
+                lens[i] = 0
+                i = i + 1
+
+        else if sym == 18
+            # Repeat zero 11-138 times (needs 7 extra bits)
+            let repeat: i32 = 11 + (bits_read(reader, 7) as i32)
+            for j in 0..repeat
+                if i >= n
+                    return INFLATE_ERR_INVALID_CODE as i32
+                lens[i] = 0
+                i = i + 1
+
+        else
+            return INFLATE_ERR_INVALID_CODE as i32
+
+    return 0
+
+
+# Decompress a dynamic Huffman block (BTYPE=10).
+#
+# Dynamic blocks contain custom Huffman tables encoded at the start:
+# 1. Header: HLIT (5 bits), HDIST (5 bits), HCLEN (4 bits)
+# 2. Code length code lengths: HCLEN * 3 bits in permuted order
+# 3. Literal/length code lengths: HLIT values, RLE-encoded
+# 4. Distance code lengths: HDIST values, RLE-encoded
+# 5. Compressed data using the custom tables
+fn inflate_dynamic(reader: *BitReader, output: *u8, output_cap: i64, out_pos: i64) -> i64
+    # -------------------------------------------------------------------------
+    # Step 1: Read header - number of codes in each alphabet
+    # -------------------------------------------------------------------------
+    if bits_available(reader) < 14
+        return INFLATE_ERR_TRUNCATED
+
+    let hlit: i32 = (bits_read(reader, 5) as i32) + 257   # 257-286 literal/length codes
+    let hdist: i32 = (bits_read(reader, 5) as i32) + 1    # 1-32 distance codes
+    let hclen: i32 = (bits_read(reader, 4) as i32) + 4    # 4-19 code length codes
+
+    # -------------------------------------------------------------------------
+    # Step 2: Read code length code lengths (in permuted order)
+    # -------------------------------------------------------------------------
+    var cl_lengths: [19]u8 = [0; 19]
+    for i in 0..hclen
+        if bits_available(reader) < 3
+            return INFLATE_ERR_TRUNCATED
+        # CODE_LENGTH_ORDER gives the permuted order from RFC 1951
+        cl_lengths[CODE_LENGTH_ORDER[i] ] = bits_read(reader, 3) as u8
+
+    # Build Huffman table for code lengths
+    var cl_table: HuffmanTable
+    huffman_build_decode_table(@cl_table, @cl_lengths[0], 19)
+
+    # -------------------------------------------------------------------------
+    # Step 3: Read literal/length and distance code lengths (RLE-encoded)
+    # -------------------------------------------------------------------------
+    var lengths: [320]u8 = [0; 320]  # Max: 286 + 32 = 318, rounded up
+    let total_codes: i32 = hlit + hdist
+
+    let err: i32 = read_code_lens(reader, @cl_table, @lengths[0], total_codes)
+    if err != 0
+        return err as i64
+
+    # -------------------------------------------------------------------------
+    # Step 4: Build Huffman tables and decode compressed data
+    # -------------------------------------------------------------------------
+    var litlen_table: HuffmanTable
+    var dist_table: HuffmanTable
+
+    huffman_build_decode_table(@litlen_table, @lengths[0], hlit)
+    huffman_build_decode_table(@dist_table, @lengths[hlit], hdist)
+
+    var tables: HuffTables
+    tables.litlen = @litlen_table
+    tables.dist = @dist_table
+    return inflate_huff(reader, @tables, output, output_cap, out_pos)
+
+
+# ============================================================================
+# Huffman Block Decoding (shared by Type 1 and Type 2)
+# ============================================================================
+
+# Decode Huffman-compressed data from a Deflate block.
+#
+# The literal/length alphabet has 286 symbols:
+#   0-255   : Literal bytes (output directly)
+#   256     : End of block marker
+#   257-285 : Length codes (followed by distance code)
+#
+# Length codes use extra bits to encode lengths 3-258.
+# Distance codes (0-29) use extra bits to encode distances 1-32768.
+#
+# LZ77 back-references may overlap with the output (for RLE patterns),
+# so we copy byte-by-byte from the sliding window.
+fn inflate_huff(r: *BitReader, t: *HuffTables, out: *u8, cap: i64, pos: i64) -> i64
+    var cur: i64 = pos
+
+    while true
+        # Decode next literal/length symbol
+        let sym: i32 = huffman_decode(t.litlen, r)
+
+        if sym < 0
+            return INFLATE_ERR_INVALID_CODE
+
+        if sym < 256
+            # ---- Literal byte: out directly ----
+            if cur >= cap
+                return INFLATE_ERR_OUTPUT_FULL
+            out[cur] = sym as u8
+            cur = cur + 1
+
+        else if sym == 256
+            # ---- End of block ----
+            return cur
+
+        else
+            # ---- Length/distance pair (LZ77 back-reference) ----
+            let len_idx: i32 = sym - 257
+            if len_idx >= 29
+                return INFLATE_ERR_INVALID_CODE
+
+            # Decode length: base value + extra bits
+            let len_extra: i32 = bits_read(r, LENGTH_EXTRA[len_idx]) as i32
+            let length: i32 = LENGTH_BASE[len_idx] + len_extra
+
+            # Decode distance symbol
+            let dist_sym: i32 = huffman_decode(t.dist, r)
+            if dist_sym < 0
+                return INFLATE_ERR_INVALID_CODE
+            if dist_sym >= 30
+                return INFLATE_ERR_INVALID_DISTANCE
+
+            # Decode distance: base value + extra bits
+            let dist_extra: i32 = bits_read(r, DIST_EXTRA[dist_sym]) as i32
+            let distance: i32 = DIST_BASE[dist_sym] + dist_extra
+
+            # Validate distance doesn't exceed already-written data
+            if distance as i64 > cur
+                return INFLATE_ERR_INVALID_DISTANCE
+
+            # Check output buffer has space
+            if cur + length as i64 > cap
+                return INFLATE_ERR_OUTPUT_FULL
+
+            # Copy bytes from sliding window
+            # Note: Must be byte-by-byte for overlapping copies (RLE patterns)
+            var src: i64 = cur - distance as i64
+            for i in 0..length
+                out[cur] = out[src]
+                cur = cur + 1
+                src = src + 1
+
+    # Unreachable (loop exits via return)
+    return cur

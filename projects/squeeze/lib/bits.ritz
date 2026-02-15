@@ -1,0 +1,297 @@
+# lib/bits.ritz - Bit stream reader/writer for Deflate
+#
+# Deflate uses LSB-first (little-endian) bit ordering:
+# - Bits are read from low to high within each byte
+# - When reading n bits, the result has LSB first
+#
+# API:
+# - BitReader: Read bits from a byte buffer
+#   - bits_reader_init(data, len) -> BitReader
+#   - bits_read(reader, n) -> u32           Read n bits (unchecked)
+#   - bits_read_safe(reader, n) -> i64      Read n bits with bounds check (-1 on error)
+#   - bits_peek(reader, n) -> u32           Peek n bits without advancing
+#   - bits_skip(reader, n)                  Skip n bits
+#   - bits_available(reader) -> i64         Return bits remaining
+#   - bits_at_end(reader) -> bool           Check if all bits consumed
+#
+# - BitWriter: Write bits to a byte buffer
+#   - bits_writer_init(data, cap) -> BitWriter
+#   - bits_write(writer, value, n)          Write n bits (unchecked)
+#   - bits_write_safe(writer, value, n) -> i32  Write n bits with bounds check (-1 on error)
+#   - bits_flush(writer)                    Flush pending partial byte
+#   - bits_written(writer) -> i64           Return bytes written
+#   - bits_capacity_remaining(writer) -> i64  Return bytes remaining
+#
+# References:
+# - RFC 1951 Section 3.1.1: Packing into bytes
+
+import ritzlib.sys
+
+# ============================================================================
+# BitReader - Read bits from a buffer
+# ============================================================================
+
+struct BitReader
+    data: *u8       # Pointer to data buffer
+    len: i64        # Total length in bytes
+    byte_pos: i64   # Current byte position
+    bit_pos: i32    # Current bit position within byte (0-7)
+
+
+# Initialize a BitReader
+pub fn bits_reader_init(data: *u8, len: i64) -> BitReader
+    var reader: BitReader
+    reader.data = data
+    reader.len = len
+    reader.byte_pos = 0
+    reader.bit_pos = 0
+    return reader
+
+
+# Read n bits (1-32), LSB-first
+# Deflate uses LSB-first: first bit read goes to bit 0 of result
+pub fn bits_read(reader: *BitReader, n: i32) -> u32
+    if n == 0
+        return 0
+
+    var result: u32 = 0
+    var bits_consumed: i32 = 0
+
+    while bits_consumed < n
+        # Get current byte
+        let byte: u32 = reader.data[reader.byte_pos] as u32
+
+        # How many bits are available in current byte?
+        let bits_in_byte: i32 = 8 - reader.bit_pos
+
+        # How many bits do we still need?
+        let bits_needed: i32 = n - bits_consumed
+
+        # How many bits can we take from this byte? (min of available and needed)
+        var bits_to_take: i32 = bits_in_byte
+        if bits_needed < bits_in_byte
+            bits_to_take = bits_needed
+
+        # Extract bits from current byte (LSB-first)
+        # Shift byte right by bit_pos to get the bits we want at position 0
+        let mask: u32 = ((1 << bits_to_take) - 1) as u32
+        let extracted: u32 = (byte >> reader.bit_pos) & mask
+
+        # Place extracted bits into result at the correct position
+        result = result | (extracted << bits_consumed)
+
+        # Advance position
+        reader.bit_pos = reader.bit_pos + bits_to_take
+        bits_consumed = bits_consumed + bits_to_take
+
+        # Move to next byte if needed
+        if reader.bit_pos >= 8
+            reader.bit_pos = 0
+            reader.byte_pos = reader.byte_pos + 1
+
+    return result
+
+
+# Peek n bits without advancing
+# Save position, read, restore position
+pub fn bits_peek(reader: *BitReader, n: i32) -> u32
+    let saved_byte_pos: i64 = reader.byte_pos
+    let saved_bit_pos: i32 = reader.bit_pos
+
+    let result: u32 = bits_read(reader, n)
+
+    reader.byte_pos = saved_byte_pos
+    reader.bit_pos = saved_bit_pos
+
+    return result
+
+
+# Skip n bits
+# Efficient: just advance position without extracting values
+pub fn bits_skip(reader: *BitReader, n: i32)
+    # Add bits to current position
+    let total_bits: i32 = reader.bit_pos + n
+
+    # Calculate new byte and bit positions
+    reader.byte_pos = reader.byte_pos + (total_bits / 8) as i64
+    reader.bit_pos = total_bits % 8
+
+    return
+
+
+# Return number of bits still available
+pub fn bits_available(reader: *BitReader) -> i64
+    let total_bits: i64 = reader.len * 8
+    let consumed_bits: i64 = reader.byte_pos * 8 + reader.bit_pos as i64
+    return total_bits - consumed_bits
+
+
+# Check if reader has consumed all bits
+pub fn bits_at_end(reader: *BitReader) -> bool
+    return bits_available(reader) <= 0
+
+
+# Read n bits with bounds checking
+# Returns the value as i64 (0 to 2^32-1) on success, or -1 if not enough bits
+# This is the safe alternative to bits_read for untrusted input
+pub fn bits_read_safe(reader: *BitReader, n: i32) -> i64
+    if n < 0
+        return -1
+    if n > 32
+        return -1
+    if n == 0
+        return 0
+
+    # Check we have enough bits
+    if bits_available(reader) < n as i64
+        return -1
+
+    # Safe to read
+    return bits_read(reader, n) as i64
+
+
+# Peek n bits with bounds checking
+# Returns -1 if not enough bits available
+pub fn bits_peek_safe(reader: *BitReader, n: i32) -> i64
+    if n < 0
+        return -1
+    if n > 32
+        return -1
+    if bits_available(reader) < n as i64
+        return -1
+
+    return bits_peek(reader, n) as i64
+
+
+# Skip n bits with bounds checking
+# Returns 0 on success, -1 if would skip past end
+pub fn bits_skip_safe(reader: *BitReader, n: i32) -> i32
+    if n < 0
+        return -1
+    if bits_available(reader) < n as i64
+        return -1
+
+    bits_skip(reader, n)
+    return 0
+
+
+# ============================================================================
+# BitWriter - Write bits to a buffer
+# ============================================================================
+
+struct BitWriter
+    data: *u8       # Pointer to output buffer
+    cap: i64        # Buffer capacity in bytes
+    byte_pos: i64   # Current byte position
+    bit_pos: i32    # Current bit position within byte (0-7)
+    current: u8     # Current byte being built
+
+
+# Initialize a BitWriter
+pub fn bits_writer_init(data: *u8, cap: i64) -> BitWriter
+    var writer: BitWriter
+    writer.data = data
+    writer.cap = cap
+    writer.byte_pos = 0
+    writer.bit_pos = 0
+    writer.current = 0
+    return writer
+
+
+# Write n bits (1-32), LSB-first
+# Deflate uses LSB-first: bit 0 of value goes to first bit written
+pub fn bits_write(writer: *BitWriter, value: u32, n: i32)
+    if n == 0
+        return
+
+    var val: u32 = value
+    var bits_emitted: i32 = 0
+
+    while bits_emitted < n
+        # How many bits can we write to current byte?
+        let bits_in_byte: i32 = 8 - writer.bit_pos
+
+        # How many bits do we still need to write?
+        let bits_remaining: i32 = n - bits_emitted
+
+        # How many bits will we write to this byte? (min of available and needed)
+        var bits_to_write: i32 = bits_in_byte
+        if bits_remaining < bits_in_byte
+            bits_to_write = bits_remaining
+
+        # Extract the bits we'll write (LSB-first)
+        let mask: u32 = ((1 << bits_to_write) - 1) as u32
+        let bits: u32 = val & mask
+
+        # Place bits into current byte at bit_pos
+        writer.current = writer.current | ((bits << writer.bit_pos) as u8)
+
+        # Advance
+        writer.bit_pos = writer.bit_pos + bits_to_write
+        bits_emitted = bits_emitted + bits_to_write
+        val = val >> bits_to_write
+
+        # Flush byte if full
+        if writer.bit_pos >= 8
+            writer.data[writer.byte_pos] = writer.current
+            writer.byte_pos = writer.byte_pos + 1
+            writer.bit_pos = 0
+            writer.current = 0
+
+    return
+
+
+# Flush any pending bits to the buffer
+# Writes the current partial byte if any bits are pending
+pub fn bits_flush(writer: *BitWriter)
+    if writer.bit_pos > 0
+        writer.data[writer.byte_pos] = writer.current
+        writer.byte_pos = writer.byte_pos + 1
+        writer.bit_pos = 0
+        writer.current = 0
+    return
+
+
+# Return number of bytes written (including partial)
+pub fn bits_written(writer: *BitWriter) -> i64
+    if writer.bit_pos > 0
+        return writer.byte_pos + 1
+    return writer.byte_pos
+
+
+# Return number of bytes remaining in buffer capacity
+pub fn bits_capacity_remaining(writer: *BitWriter) -> i64
+    return writer.cap - writer.byte_pos
+
+
+# Write n bits with bounds checking
+# Returns 0 on success, -1 if would overflow buffer
+pub fn bits_write_safe(writer: *BitWriter, value: u32, n: i32) -> i32
+    if n < 0
+        return -1
+    if n > 32
+        return -1
+    if n == 0
+        return 0
+
+    # Calculate how many bytes we might need
+    # Current partial byte plus new bits
+    let total_bits: i32 = writer.bit_pos + n
+    let bytes_needed: i64 = ((total_bits + 7) / 8) as i64
+
+    # Check if we have space
+    if writer.byte_pos + bytes_needed > writer.cap
+        return -1
+
+    # Safe to write
+    bits_write(writer, value, n)
+    return 0
+
+
+# Flush with bounds checking (always safe since we're writing to current position)
+pub fn bits_flush_safe(writer: *BitWriter) -> i32
+    if writer.bit_pos > 0
+        if writer.byte_pos >= writer.cap
+            return -1
+    bits_flush(writer)
+    return 0

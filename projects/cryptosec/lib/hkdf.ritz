@@ -1,0 +1,132 @@
+# lib/hkdf.ritz - HKDF (HMAC-based Key Derivation Function)
+#
+# Implementation of HKDF as defined in RFC 5869.
+# Uses HMAC-SHA-256 as the underlying PRF.
+#
+# HKDF consists of two stages:
+#   1. Extract: PRK = HMAC-Hash(salt, IKM)
+#   2. Expand:  OKM = T(1) || T(2) || ... || T(N)
+#              where T(i) = HMAC-Hash(PRK, T(i-1) || info || i)
+
+import ritzlib.sys
+
+import hmac
+import mem
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+const HKDF_SHA256_HASH_LEN: u64 = 32
+
+# ============================================================================
+# HKDF-Extract
+# ============================================================================
+
+# Extract a pseudorandom key (PRK) from input keying material
+# salt: optional salt value (can be null, defaults to hash_len zeros)
+# salt_len: length of salt in bytes
+# ikm: input keying material
+# ikm_len: length of IKM in bytes
+# prk: output buffer for PRK (must be 32 bytes for SHA-256)
+pub fn hkdf_extract(salt: *u8, salt_len: u64, ikm: *u8, ikm_len: u64, prk: *u8)
+    if salt == null || salt_len == 0
+        # Use a string of hash_len zeros as salt
+        var zero_salt: [32]u8
+        mem_zero(&zero_salt[0], 32)
+        hmac_sha256(&zero_salt[0], 32, ikm, ikm_len, prk)
+    else
+        hmac_sha256(salt, salt_len, ikm, ikm_len, prk)
+
+# ============================================================================
+# HKDF-Expand
+# ============================================================================
+
+# Expand a pseudorandom key into output keying material
+# prk: pseudorandom key (from extract, 32 bytes)
+# info: optional context/application-specific info (can be null)
+# info_len: length of info in bytes
+# okm: output keying material buffer
+# okm_len: desired length of OKM in bytes (max 255 * hash_len = 8160)
+pub fn hkdf_expand(prk: *u8, info: *u8, info_len: u64, okm: *u8, okm_len: u64)
+    # N = ceil(okm_len / hash_len)
+    var hash_len: u64 = 32
+    var n: u64 = (okm_len + hash_len - 1) / hash_len
+
+    # T(0) = empty string
+    # T(i) = HMAC-Hash(PRK, T(i-1) || info || i)
+
+    var t_prev: [32]u8
+    var t_prev_len: u64 = 0  # T(0) is empty
+
+    var offset: u64 = 0
+    var i: u64 = 1
+    while i <= n
+        # Build input: T(i-1) || info || i
+        # Max size: 32 (T) + info_len + 1 (counter)
+        var input: [256]u8  # Should be enough for reasonable info
+        var input_len: u64 = 0
+
+        # Copy T(i-1)
+        if t_prev_len > 0
+            mem_copy(&input[0], &t_prev[0], t_prev_len)
+            input_len = t_prev_len
+
+        # Copy info
+        if info != null && info_len > 0
+            mem_copy(&input[input_len], info, info_len)
+            input_len = input_len + info_len
+
+        # Append counter byte
+        input[input_len] = i as u8
+        input_len += 1
+
+        # T(i) = HMAC-Hash(PRK, input)
+        var t_current: [32]u8
+        hmac_sha256(prk, 32, &input[0], input_len, &t_current[0])
+
+        # Copy to output (may be partial for last block)
+        var to_copy: u64 = hash_len
+        if offset + to_copy > okm_len
+            to_copy = okm_len - offset
+
+        mem_copy(&okm[offset], &t_current[0], to_copy)
+        offset = offset + to_copy
+
+        # T(i-1) = T(i) for next iteration
+        mem_copy(&t_prev[0], &t_current[0], 32)
+        t_prev_len = 32
+
+        # Zero sensitive data
+        mem_zero(&t_current[0], 32)
+        mem_zero(&input[0], input_len)
+
+        i += 1
+
+    # Zero sensitive data
+    mem_zero(&t_prev[0], 32)
+
+# ============================================================================
+# Combined HKDF
+# ============================================================================
+
+# Combined extract-then-expand operation
+# salt: optional salt (can be null)
+# salt_len: length of salt
+# ikm: input keying material
+# ikm_len: length of IKM
+# info: optional context info (can be null)
+# info_len: length of info
+# okm: output buffer
+# okm_len: desired output length
+pub fn hkdf_sha256(salt: *u8, salt_len: u64, ikm: *u8, ikm_len: u64, info: *u8, info_len: u64, okm: *u8, okm_len: u64)
+    # Extract
+    var prk: [32]u8
+    hkdf_extract(salt, salt_len, ikm, ikm_len, &prk[0])
+
+    # Expand
+    hkdf_expand(&prk[0], info, info_len, okm, okm_len)
+
+    # Zero PRK
+    mem_zero(&prk[0], 32)
+

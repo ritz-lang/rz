@@ -1,0 +1,62 @@
+# sizeof_generic_bug.ritz - Reproduces ritz0 sizeof(T) bug in generics
+#
+# BUG: sizeof(T) in generic functions uses pointer size (8) instead of actual type size
+#
+# Example: For Vec<Item> where Item is 48 bytes, vec_grow computes:
+#   new_size = new_cap * sizeof(T)
+#   
+# But the generated LLVM IR shows:
+#   %".17" = mul i64 %".16", 8   <-- 8 instead of 48!
+#
+# This causes heap buffer overflow when pushing elements larger than a pointer.
+#
+# IMPACT: Vec<T> corrupts heap for any T larger than 8 bytes
+#
+# Discovered via valgrind on ritzunit inventory tests:
+#   Invalid write of size 4
+#   Address 0x48958f8 is 24 bytes after a block of size 64
+#
+# WORKAROUND: None - compiler fix required in ritz0 generic monomorphization
+
+import ritzlib.gvec
+import ritzlib.io
+import ritzlib.sys
+import ritzlib.memory
+
+struct BigStruct
+    a: i64
+    b: i64
+    c: i64
+    d: i64   # Total: 32 bytes
+
+fn main() -> i32
+    prints("sizeof(BigStruct) = ")
+    print_int(sizeof(BigStruct))  # Should print 32
+    prints("\n")
+    
+    # This will corrupt memory because Vec allocates 8 bytes per element
+    # instead of 32 bytes per element
+    var v: Vec<BigStruct> = vec_new<BigStruct>()
+    
+    var item: BigStruct
+    item.a = 1
+    item.b = 2  
+    item.c = 3
+    item.d = 4
+    
+    # First push works (initial alloc of 8 * 8 = 64 bytes)
+    vec_push<BigStruct>(&v, item)
+    prints("Pushed first item\n")
+    
+    # Second push works (64 bytes can hold 2 * 32 = 64)
+    vec_push<BigStruct>(&v, item)
+    prints("Pushed second item\n")
+    
+    # Third push will overflow! 
+    # vec_grow(8) allocates 8 * 8 = 64 bytes
+    # but we need 3 * 32 = 96 bytes
+    vec_push<BigStruct>(&v, item)
+    prints("Pushed third item - heap corrupted!\n")
+    
+    vec_drop<BigStruct>(&v)
+    return 0

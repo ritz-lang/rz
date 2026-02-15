@@ -1,0 +1,226 @@
+# lib/crc32_simd.ritz - SIMD-accelerated CRC-32 using PCLMULQDQ
+#
+# Uses the carryless multiply instruction (PCLMULQDQ) for fast CRC32 computation.
+# Based on Intel's fast CRC folding algorithm and zlib's crc32_simd.c
+#
+# References:
+# - Intel white paper: "Fast CRC Computation Using PCLMULQDQ"
+# - https://github.com/neurolabusc/simd_crc/blob/master/crc32_simd.c
+
+import ritzlib.sys
+import crc32
+
+# ============================================================================
+# Constants for CRC-32 (ISO 3309, polynomial 0x04C11DB7)
+# ============================================================================
+# Bit-reflected domain constants from Intel paper
+
+# k1k2: x^(512+32) mod P(x) << 1, x^(512-32) mod P(x) << 1
+const K1: i64 = 5708721108   # 0x154442bd4
+const K2: i64 = 7631803798   # 0x1c6e41596
+
+# k3k4: x^(128+32) mod P(x) << 1, x^(128-32) mod P(x) << 1
+const K3: i64 = 6259578832   # 0x1751997d0
+const K4: i64 = 3433693342   # 0x0ccaa009e
+
+# k5k0: x^64 mod P(x) << 1, 0 (for 128->64 fold)
+const K5: i64 = 5969371428   # 0x163cd6124
+const K0: i64 = 0
+
+# poly: P(x) << 1, mu << 1 (Barrett reduction)
+const POLY_LO: i64 = 7976584769   # 0x1db710641 (P(x) << 1)
+const POLY_HI: i64 = 8439010881   # 0x1f7011641 (mu << 1)
+
+const CRC_INIT: u32 = 0xFFFFFFFF
+const SIMD_THRESHOLD: i64 = 64
+
+# ============================================================================
+# Vector helpers
+# ============================================================================
+
+fn make_vec(lo: i64, hi: i64) -> v2i64
+    var arr: [2]i64
+    arr[0] = lo
+    arr[1] = hi
+    return simd_loadu(@arr[0])
+
+fn load_vec(data: *u8) -> v2i64
+    return simd_loadu(data as *i64)
+
+fn xor_vec(a: v2i64, b: v2i64) -> v2i64
+    let a0: i64 = simd_extract(a, 0)
+    let a1: i64 = simd_extract(a, 1)
+    let b0: i64 = simd_extract(b, 0)
+    let b1: i64 = simd_extract(b, 1)
+    return make_vec(a0 ^ b0, a1 ^ b1)
+
+# Fold 128 bits: result = clmul(data.lo, k.lo) XOR clmul(data.hi, k.hi)
+fn fold_vec(data: v2i64, k: v2i64) -> v2i64
+    let lo: v2i64 = simd_clmul(data, k, 0x00 as i8)  # data[0] * k[0]
+    let hi: v2i64 = simd_clmul(data, k, 0x11 as i8)  # data[1] * k[1]
+    return xor_vec(lo, hi)
+
+# ============================================================================
+# SIMD CRC32 core
+# ============================================================================
+
+fn crc32_simd_fold(crc: u32, buf: *u8, len: i64) -> u32
+    if len < 64
+        var state: u32 = crc ^ CRC_INIT
+        state = crc32_update(state, buf, len)
+        return state ^ CRC_INIT
+
+    let k1k2: v2i64 = make_vec(K1, K2)
+    let k3k4: v2i64 = make_vec(K3, K4)
+    let k5k0: v2i64 = make_vec(K5, K0)
+    let poly: v2i64 = make_vec(POLY_LO, POLY_HI)
+
+    # Load first 64 bytes
+    var x1: v2i64 = load_vec(buf)
+    var x2: v2i64 = load_vec(@buf[16])
+    var x3: v2i64 = load_vec(@buf[32])
+    var x4: v2i64 = load_vec(@buf[48])
+
+    # XOR initial CRC into x1 (low 32 bits)
+    # zlib XORs with ~crc (complement), so when crc=0, it XORs with 0xFFFFFFFF
+    # Use u64 cast to avoid sign extension
+    let init_xor: u64 = (crc ^ CRC_INIT) as u64
+    x1 = xor_vec(x1, make_vec(init_xor as i64, 0))
+
+    var pos: i64 = 64
+
+    # Fold 64 bytes at a time (4 parallel blocks)
+    while pos + 64 <= len
+        x1 = xor_vec(fold_vec(x1, k1k2), load_vec(@buf[pos]))
+        x2 = xor_vec(fold_vec(x2, k1k2), load_vec(@buf[pos + 16]))
+        x3 = xor_vec(fold_vec(x3, k1k2), load_vec(@buf[pos + 32]))
+        x4 = xor_vec(fold_vec(x4, k1k2), load_vec(@buf[pos + 48]))
+        pos = pos + 64
+
+    # Fold 4 vectors to 1 using k3k4
+    x1 = xor_vec(fold_vec(x1, k3k4), x2)
+    x1 = xor_vec(fold_vec(x1, k3k4), x3)
+    x1 = xor_vec(fold_vec(x1, k3k4), x4)
+
+    # Fold remaining 16-byte chunks
+    while pos + 16 <= len
+        x1 = xor_vec(fold_vec(x1, k3k4), load_vec(@buf[pos]))
+        pos = pos + 16
+
+    # ========================================================================
+    # Fold 128-bits to 96-bits
+    # ========================================================================
+    # zlib: x2 = clmul(x1, k3k4, 0x10) = x1.lo * k4
+    #       x1 = (x1 >> 64) XOR x2
+
+    # clmul with imm=0x10 means: x1.lo * k3k4.hi = x1.lo * K4
+    let fold128: v2i64 = simd_clmul(x1, k3k4, 0x10 as i8)
+    let fold128_lo: i64 = simd_extract(fold128, 0)
+    let fold128_hi: i64 = simd_extract(fold128, 1)
+
+    # x1 >> 64: new_lo = x1.hi, new_hi = 0
+    let x1_hi: i64 = simd_extract(x1, 1)
+    x1 = make_vec(x1_hi ^ fold128_lo, fold128_hi)
+
+    # ========================================================================
+    # Fold 96-bits to 64-bits
+    # ========================================================================
+    # zlib: x2 = x1 >> 32
+    #       x1 = x1 & mask32 (keep bits 0-31)
+    #       x1 = clmul(x1, k5k0, 0x00) = x1.lo * k5
+    #       x1 = x1 XOR x2
+
+    let v_lo: i64 = simd_extract(x1, 0)
+    let v_hi: i64 = simd_extract(x1, 1)
+
+    # x1 >> 32: shift right by 32 bits (using unsigned to avoid sign extension)
+    let v_lo_u: u64 = v_lo as u64
+    let v_hi_u: u64 = v_hi as u64
+    let shifted_lo: i64 = ((v_lo_u >> 32) | ((v_hi_u & 0xFFFFFFFF) << 32)) as i64
+    let shifted_hi: i64 = (v_hi_u >> 32) as i64
+
+    # x1 & mask32: keep only bits 0-31
+    let masked: i64 = v_lo & 0xFFFFFFFF
+    let masked_vec: v2i64 = make_vec(masked, 0)
+
+    # clmul(masked, k5)
+    let fold96: v2i64 = simd_clmul(masked_vec, k5k0, 0x00 as i8)
+    let fold96_lo: i64 = simd_extract(fold96, 0)
+    let fold96_hi: i64 = simd_extract(fold96, 1)
+
+    # XOR: x1 = fold_result XOR shifted
+    let x64_lo: i64 = fold96_lo ^ shifted_lo
+    let x64_hi: i64 = fold96_hi ^ shifted_hi
+    x1 = make_vec(x64_lo, x64_hi)
+
+    # ========================================================================
+    # Barrett reduction: 64-bits to 32-bits
+    # ========================================================================
+    # zlib: x2 = x1 & mask32
+    #       x2 = clmul(x2, poly, 0x10) = x2.lo * mu
+    #       x2 = x2 & mask32 (keep bits 0-31)
+    #       x2 = clmul(x2, poly, 0x00) = x2.lo * P
+    #       x1 = x1 XOR x2
+    #       result = x1[32:63]
+
+    # x2 = x1 & mask32 (keep bits 0-31)
+    let x64_lo: i64 = simd_extract(x1, 0)
+    let x2_masked: i64 = x64_lo & 0xFFFFFFFF
+    let x2_vec: v2i64 = make_vec(x2_masked, 0)
+
+    # x2 = clmul(x2, poly, 0x10) = x2.lo * poly.hi (mu)
+    let t1_vec: v2i64 = simd_clmul(x2_vec, poly, 0x10 as i8)
+    let t1_lo: i64 = simd_extract(t1_vec, 0)
+
+    # x2 = x2 & mask32 (keep bits 0-31)
+    let t1_masked: i64 = t1_lo & 0xFFFFFFFF
+    let t1_masked_vec: v2i64 = make_vec(t1_masked, 0)
+
+    # x2 = clmul(x2, poly, 0x00) = t1 * poly.lo (P)
+    let t2_vec: v2i64 = simd_clmul(t1_masked_vec, poly, 0x00 as i8)
+    let t2_lo: i64 = simd_extract(t2_vec, 0)
+
+    # x1 = x1 XOR x2
+    let final_lo: i64 = x64_lo ^ t2_lo
+
+    # Result is bits 32-63
+    let result32: u32 = ((final_lo >> 32) & 0xFFFFFFFF) as u32
+
+    # Handle remaining bytes with scalar
+    if pos < len
+        # result32 is already in inverted form (running state)
+        # Pass directly to crc32_update
+        var state: u32 = crc32_update(result32, @buf[pos], len - pos)
+        return state
+
+    # result32 is already in inverted form
+    return result32
+
+# ============================================================================
+# Public API
+# ============================================================================
+
+pub fn crc32_simd_init() -> u32
+    crc32_init_table()
+    return CRC_INIT
+
+pub fn crc32_simd_update(state: u32, data: *u8, len: i64) -> u32
+    if len == 0
+        return state
+
+    if len < SIMD_THRESHOLD
+        return crc32_update(state, data, len)
+
+    let crc: u32 = state ^ CRC_INIT
+    let result: u32 = crc32_simd_fold(crc, data, len)
+    # Return in inverted form (consistent with scalar CRC32 state)
+    # crc32_simd_final will do the final XOR
+    return result
+
+pub fn crc32_simd_final(state: u32) -> u32
+    return state ^ CRC_INIT
+
+pub fn crc32_simd(data: *u8, len: i64) -> u32
+    let state: u32 = crc32_simd_init()
+    let updated: u32 = crc32_simd_update(state, data, len)
+    return crc32_simd_final(updated)
