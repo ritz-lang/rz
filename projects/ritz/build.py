@@ -318,6 +318,30 @@ class DependencySpec:
     path: Path          # Path to dependency root (absolute)
     sources: list[str]  # Source directories within dependency (default: ["src"])
 
+
+@dataclass
+class BinaryConfig:
+    """Complete configuration for a binary target.
+
+    Supports both standard hosted builds and freestanding kernel builds.
+    """
+    name: str                    # Binary name
+    src_path: Path               # Main source file
+    additional_sources: list[Path]  # Extra sources (deprecated)
+    freestanding: bool = False   # If True, no runtime, custom linker
+    target: str = ""             # Target triple (e.g., "x86_64-none-elf")
+    linker_script: Path | None = None  # Custom linker script
+    asm_files: list[Path] | None = None  # Assembly files to compile
+    code_model: str = ""         # LLC code model (e.g., "kernel")
+    no_red_zone: bool = False    # Disable red zone (for kernels)
+    bin_sources: list[str] | None = None  # Per-binary source directories
+
+    def __post_init__(self):
+        if self.asm_files is None:
+            self.asm_files = []
+        if self.bin_sources is None:
+            self.bin_sources = []
+
     def resolve_import(self, module_parts: list[str]) -> Path | None:
         """Resolve an import path within this dependency.
 
@@ -523,14 +547,21 @@ def find_packages() -> list[tuple[Path, dict]]:
     return find_all_packages()
 
 
-def get_binaries(pkg_dir: Path, config: dict) -> list[tuple[str, Path, list[Path]]]:
-    """Get list of (binary_name, main_source_path, additional_sources) for a package.
+def get_binaries(pkg_dir: Path, config: dict) -> list[BinaryConfig]:
+    """Get list of BinaryConfig objects for all binary targets in a package.
 
     Returns empty list for test-only packages (no binary to build).
 
     Supports both RFC #109 syntax and legacy syntax:
     - RFC #109: entry = "module::main"  → resolves to src/module.ritz
     - Legacy:   path = "src/main.ritz"  → direct file path
+
+    Also supports freestanding builds with:
+    - freestanding = true
+    - target = "x86_64-none-elf"
+    - [bin.NAME.linker] script = "linker.ld"
+    - [bin.NAME.asm] files = ["boot.s", "isr.s"]
+    - [bin.NAME.flags] code-model = "kernel", no-red-zone = true
     """
     binaries = []
 
@@ -555,7 +586,11 @@ def get_binaries(pkg_dir: Path, config: dict) -> list[tuple[str, Path, list[Path
             # RFC #109: entry = "module::function"
             if "entry" in bin_entry:
                 entry = bin_entry["entry"]
-                result = resolve_entry_point(entry, pkg_dir, pkg_sources)
+                # Use bin-specific sources if provided, else package-level
+                bin_sources_list = bin_entry.get("sources", pkg_sources)
+                if isinstance(bin_sources_list, str):
+                    bin_sources_list = [bin_sources_list]
+                result = resolve_entry_point(entry, pkg_dir, bin_sources_list)
                 if result is None:
                     print(f"  ⚠ Could not resolve entry point: {entry}", file=sys.stderr)
                     continue
@@ -569,15 +604,62 @@ def get_binaries(pkg_dir: Path, config: dict) -> list[tuple[str, Path, list[Path
 
             # Get additional sources if specified (legacy, deprecated)
             additional_sources = []
-            if "sources" in bin_entry:
+            if "sources" in bin_entry and isinstance(bin_entry["sources"], list):
+                # Check if these are paths or directory specs
                 for src in bin_entry["sources"]:
-                    additional_sources.append(pkg_dir / src)
-            binaries.append((name, src_path, additional_sources))
+                    src_path_check = pkg_dir / src
+                    if src_path_check.is_file():
+                        additional_sources.append(src_path_check)
+
+            # Parse freestanding build options
+            freestanding = bin_entry.get("freestanding", False)
+            target = bin_entry.get("target", "")
+
+            # Parse [bin.NAME.linker] section
+            # TOML puts [bin.harland.linker] as bin_entry["harland"]["linker"]
+            nested_config = bin_entry.get(name, {})
+            linker_config = nested_config.get("linker", {})
+            linker_script = None
+            if linker_config.get("script"):
+                linker_script = pkg_dir / linker_config["script"]
+
+            # Parse [bin.NAME.asm] section
+            asm_config = nested_config.get("asm", {})
+            asm_files = []
+            for asm_file in asm_config.get("files", []):
+                asm_files.append(pkg_dir / asm_file)
+
+            # Parse [bin.NAME.flags] section
+            flags_config = nested_config.get("flags", {})
+            code_model = flags_config.get("code-model", "")
+            no_red_zone = flags_config.get("no-red-zone", False)
+
+            # Per-binary source directories
+            bin_sources = bin_entry.get("sources", [])
+            if isinstance(bin_sources, str):
+                bin_sources = [bin_sources]
+
+            binaries.append(BinaryConfig(
+                name=name,
+                src_path=src_path,
+                additional_sources=additional_sources,
+                freestanding=freestanding,
+                target=target,
+                linker_script=linker_script,
+                asm_files=asm_files,
+                code_model=code_model,
+                no_red_zone=no_red_zone,
+                bin_sources=bin_sources,
+            ))
     else:
         # Default: single binary with package name
         name = config["package"]["name"]
         src_path = pkg_dir / "src" / "main.ritz"
-        binaries.append((name, src_path, []))
+        binaries.append(BinaryConfig(
+            name=name,
+            src_path=src_path,
+            additional_sources=[],
+        ))
 
     return binaries
 
@@ -805,6 +887,214 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
             shutil.rmtree(artifact_dir, ignore_errors=True)
 
 
+def find_llvm_tool(name: str) -> str:
+    """Find LLVM tool, trying versioned names."""
+    import shutil as shutil_mod
+    # For lld, prefer ld.lld over the generic wrapper
+    if name == "lld":
+        if shutil_mod.which("ld.lld"):
+            return "ld.lld"
+        for ver in ["20", "19", "18", "17", "16", "15"]:
+            if shutil_mod.which(f"ld.lld-{ver}"):
+                return f"ld.lld-{ver}"
+    # Try unversioned first
+    if shutil_mod.which(name):
+        return name
+    # Try common version suffixes
+    for ver in ["20", "19", "18", "17", "16", "15", "14"]:
+        versioned = f"{name}-{ver}"
+        if shutil_mod.which(versioned):
+            return versioned
+    # Not found
+    return name  # Will fail later with helpful error
+
+
+def compile_freestanding_binary(
+    bin_config: BinaryConfig,
+    out_dir: Path,
+    pkg_dir: Path,
+    keep_artifacts: bool = False,
+    use_cache: bool = True,
+    profile: dict = None,
+    dependencies: dict[str, DependencySpec] = None,
+) -> Path:
+    """Compile a freestanding binary (kernel, bootloader, etc.).
+
+    Unlike compile_binary(), this:
+    - Does NOT link with Ritz runtime
+    - Uses llc to compile to object files with custom target triple
+    - Assembles .s files
+    - Links with ld.lld using custom linker script
+
+    Args:
+        bin_config: BinaryConfig with freestanding options
+        out_dir: Output directory
+        pkg_dir: Package directory
+        keep_artifacts: Keep .ll, .o files
+        use_cache: Use build cache
+        profile: Build profile
+        dependencies: RFC #109 dependencies
+    """
+    import json
+    import shutil as shutil_mod
+
+    if profile is None:
+        profile = {"name": "debug", "opt_level": 0, "debug": True, "lto": False}
+
+    name = bin_config.name
+    src_path = bin_config.src_path
+    target = bin_config.target or "x86_64-none-elf"
+    linker_script = bin_config.linker_script
+    asm_files = bin_config.asm_files or []
+    code_model = bin_config.code_model
+    no_red_zone = bin_config.no_red_zone
+
+    # Output binary path (ELF for kernels)
+    bin_path = out_dir / f"{name}.elf"
+
+    # Artifact directory
+    if keep_artifacts:
+        artifact_dir = out_dir / "obj"
+        artifact_dir.mkdir(exist_ok=True)
+    else:
+        artifact_dir = Path(tempfile.mkdtemp())
+
+    # Find LLVM tools
+    llc = find_llvm_tool("llc")
+    lld = find_llvm_tool("lld")
+
+    # Collect object files to link
+    object_files = []
+
+    try:
+        # Step 1: Discover all Ritz source files via imports
+        list_deps_script = RITZ0_DIR / "list_deps.py"
+        cmd = [sys.executable, str(list_deps_script), str(src_path)]
+        cmd.extend(["--project-root", str(pkg_dir)])
+        if dependencies:
+            deps_json = {
+                dep_name: {"path": str(spec.path), "sources": spec.sources}
+                for dep_name, spec in dependencies.items()
+            }
+            cmd.extend(["--deps", json.dumps(deps_json)])
+
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"  ✗ import resolution failed: {result.stderr}", file=sys.stderr)
+            return None
+
+        all_sources = [Path(f.strip()) for f in result.stdout.strip().split('\n') if f.strip()]
+
+        # Step 2: Compile each Ritz source to LLVM IR, then to object file
+        print(f"  Compiling {len(all_sources)} Ritz source file(s)...")
+        for src in all_sources:
+            import hashlib
+            path_hash = hashlib.md5(str(src).encode()).hexdigest()[:8]
+            src_name = f"{src.stem}_{path_hash}"
+            ll_path = artifact_dir / f"{src_name}.ll"
+            obj_path = artifact_dir / f"{src_name}.o"
+
+            # Compile Ritz to LLVM IR
+            compile_cmd = [
+                sys.executable, str(RITZ0), str(src),
+                "-o", str(ll_path),
+                "--no-runtime"
+            ]
+            if dependencies:
+                deps_json = {
+                    dep_name: {"path": str(spec.path), "sources": spec.sources}
+                    for dep_name, spec in dependencies.items()
+                }
+                compile_cmd.extend(["--deps", json.dumps(deps_json)])
+
+            result = subprocess.run(compile_cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                print(f"  ✗ ritz0 failed for {src.name}: {result.stderr}", file=sys.stderr)
+                return None
+
+            # Compile LLVM IR to object file with target-specific options
+            llc_cmd = [
+                llc,
+                "-filetype=obj",
+                f"-mtriple={target}",
+                "-relocation-model=static",
+            ]
+            if code_model:
+                llc_cmd.append(f"-code-model={code_model}")
+            if no_red_zone:
+                llc_cmd.append("-mattr=+no-red-zone")
+
+            llc_cmd.extend([str(ll_path), "-o", str(obj_path)])
+
+            result = subprocess.run(llc_cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                print(f"  ✗ llc failed for {src.name}: {result.stderr}", file=sys.stderr)
+                return None
+
+            object_files.append(obj_path)
+
+        # Step 3: Assemble .s files
+        if asm_files:
+            print(f"  Assembling {len(asm_files)} assembly file(s)...")
+            for asm_file in asm_files:
+                if not asm_file.exists():
+                    print(f"  ⚠ Assembly file not found: {asm_file}")
+                    continue
+
+                # Special case: user_elf.s includes an ELF binary that might not exist yet
+                # Read the file to check for .incbin directives
+                asm_content = asm_file.read_text()
+                skip_file = False
+                for line in asm_content.split('\n'):
+                    if '.incbin' in line:
+                        # Extract the path from .incbin "path"
+                        import re
+                        match = re.search(r'\.incbin\s+"([^"]+)"', line)
+                        if match:
+                            inc_path = pkg_dir / match.group(1)
+                            if not inc_path.exists():
+                                print(f"  ⚠ Skipping {asm_file.name}: missing {match.group(1)}")
+                                skip_file = True
+                                break
+                if skip_file:
+                    continue
+
+                obj_name = f"{asm_file.stem}.o"
+                obj_path = artifact_dir / obj_name
+
+                # Use GNU as for assembly (supports .code32/.code64 directives)
+                as_cmd = ["as", "--64", "-o", str(obj_path), str(asm_file)]
+                result = subprocess.run(as_cmd, capture_output=True, text=True)
+                if result.returncode != 0:
+                    print(f"  ✗ as failed for {asm_file.name}: {result.stderr}", file=sys.stderr)
+                    return None
+
+                object_files.append(obj_path)
+
+        # Step 4: Link with ld.lld
+        print(f"  ⚡ Linking {len(object_files)} object files...")
+        link_cmd = [lld]
+
+        if linker_script and linker_script.exists():
+            link_cmd.extend(["-T", str(linker_script)])
+
+        link_cmd.extend(["-o", str(bin_path)])
+        link_cmd.extend([str(obj) for obj in object_files])
+
+        result = subprocess.run(link_cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"  ✗ ld.lld linking failed: {result.stderr}", file=sys.stderr)
+            return None
+
+        return bin_path
+
+    finally:
+        # Clean up temp directory if not keeping artifacts
+        if not keep_artifacts and artifact_dir.exists():
+            import shutil
+            shutil.rmtree(artifact_dir, ignore_errors=True)
+
+
 def build_package(pkg_dir: Path, config: dict, keep_artifacts: bool = False, use_cache: bool = True, profile_name: str = None) -> list[Path]:
     """Build all binaries in a package.
 
@@ -842,23 +1132,40 @@ def build_package(pkg_dir: Path, config: dict, keep_artifacts: bool = False, use
     binaries = get_binaries(pkg_dir, config)
     built = []
 
-    for bin_name, src_path, additional_sources in binaries:
+    for bin_config in binaries:
         # Show source files being compiled
         try:
-            src_rel = src_path.relative_to(pkg_dir)
+            src_rel = bin_config.src_path.relative_to(pkg_dir)
         except ValueError:
-            src_rel = src_path
+            src_rel = bin_config.src_path
 
-        if additional_sources:
-            all_srcs = [src_rel] + [s.relative_to(pkg_dir) for s in additional_sources]
-            src_display = ", ".join(str(s) for s in all_srcs)
-            print(f"  🔨 {bin_name} <- [{src_display}]", end="")
+        if bin_config.freestanding:
+            # Freestanding build (kernel, bootloader)
+            asm_count = len(bin_config.asm_files) if bin_config.asm_files else 0
+            target_info = bin_config.target or "freestanding"
+            print(f"  🔨 {bin_config.name} <- {src_rel} ({target_info}, {asm_count} asm files)", end="")
+
+            bin_path = compile_freestanding_binary(
+                bin_config=bin_config,
+                out_dir=out_dir,
+                pkg_dir=pkg_dir,
+                keep_artifacts=keep_artifacts,
+                use_cache=use_cache,
+                profile=profile,
+                dependencies=dependencies,
+            )
         else:
-            print(f"  🔨 {bin_name} <- {src_rel}", end="")
+            # Standard hosted build
+            if bin_config.additional_sources:
+                all_srcs = [src_rel] + [s.relative_to(pkg_dir) for s in bin_config.additional_sources]
+                src_display = ", ".join(str(s) for s in all_srcs)
+                print(f"  🔨 {bin_config.name} <- [{src_display}]", end="")
+            else:
+                print(f"  🔨 {bin_config.name} <- {src_rel}", end="")
 
         bin_path = compile_binary(
-            bin_name, src_path, out_dir,
-            additional_sources=additional_sources,
+            bin_config.name, bin_config.src_path, out_dir,
+            additional_sources=bin_config.additional_sources,
             keep_artifacts=keep_artifacts,
             use_cache=use_cache,
             profile=profile,
@@ -879,7 +1186,7 @@ def build_package(pkg_dir: Path, config: dict, keep_artifacts: bool = False, use
             print(f"\n  ✓ {rel_path}")
             built.append(bin_path)
         else:
-            print(f"\n  ✗ Failed to build {bin_name}")
+            print(f"\n  ✗ Failed to build {bin_config.name}")
 
     return built
 
