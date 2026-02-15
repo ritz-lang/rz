@@ -1,20 +1,22 @@
 # ritz1/src/ast_helpers.ritz - AST Helper Functions for Generated Parser
 #
 # These functions are called by the parser generated from ritz1.grammar.
-# They allocate AST nodes using malloc from ritzlib.memory.
+# They allocate AST nodes using bump allocation from the parser arena.
 
-# Import AST types and memory allocator
+# Import AST types only - no ritzlib dependencies for standalone compilation
 import ast
-import ritzlib.memory
 
 # =============================================================================
-# Parser allocation (using malloc)
+# Parser allocation (bump allocator using parser's arena)
 # =============================================================================
 
-fn parser_alloc(p: *Parser, size: i64) -> *u8
-    # Use malloc instead of bump allocation
-    # malloc already handles alignment
-    return malloc(size)
+pub fn parser_alloc(p: *Parser, size: i64) -> *u8
+    # Bump allocator using the parser's heap arena
+    # Align to 8-byte boundary for pointers
+    let aligned_offset: i64 = (p.heap_offset + 7) & (0 - 8)
+    let result: *u8 = p.heap_base + aligned_offset
+    p.heap_offset = aligned_offset + size
+    return result
 
 # =============================================================================
 # Module helpers
@@ -22,10 +24,10 @@ fn parser_alloc(p: *Parser, size: i64) -> *u8
 
 var g_fn_count: i32 = 0
 
-fn get_fn_count() -> i32
+pub fn get_fn_count() -> i32
     g_fn_count
 
-fn module_new(p: *Parser) -> *Module
+pub fn module_new(p: *Parser) -> *Module
     let m: *Module = parser_alloc(p, 56) as *Module  # Increased for impls field
     m.imports = null
     m.constants = null
@@ -36,7 +38,7 @@ fn module_new(p: *Parser) -> *Module
     p.module = m
     return m
 
-fn module_add_fn(m: *Module, f: *FnDef)
+pub fn module_add_fn(m: *Module, f: *FnDef)
     g_fn_count = g_fn_count + 1
     if m.functions == null
         m.functions = f
@@ -47,7 +49,7 @@ fn module_add_fn(m: *Module, f: *FnDef)
             curr = curr.next
         curr.next = f
 
-fn module_add_struct(m: *Module, s: *StructDef)
+pub fn module_add_struct(m: *Module, s: *StructDef)
     if m.structs == null
         m.structs = s
     else
@@ -56,7 +58,7 @@ fn module_add_struct(m: *Module, s: *StructDef)
             curr = curr.next
         curr.next = s
 
-fn module_add_const(m: *Module, c: *ConstEntry)
+pub fn module_add_const(m: *Module, c: *ConstEntry)
     if m.constants == null
         m.constants = c
     else
@@ -65,7 +67,7 @@ fn module_add_const(m: *Module, c: *ConstEntry)
             curr = curr.next
         curr.next = c
 
-fn module_add_import(m: *Module, i: *ImportDecl)
+pub fn module_add_import(m: *Module, i: *ImportDecl)
     if m.imports == null
         m.imports = i
     else
@@ -74,7 +76,7 @@ fn module_add_import(m: *Module, i: *ImportDecl)
             curr = curr.next
         curr.next = i
 
-fn module_add_global(m: *Module, g: *GlobalVarDef)
+pub fn module_add_global(m: *Module, g: *GlobalVarDef)
     if m.globals == null
         m.globals = g
     else
@@ -84,10 +86,10 @@ fn module_add_global(m: *Module, g: *GlobalVarDef)
         curr.next = g
 
 # Alias for generated parser (grammar uses module_add_global_var)
-fn module_add_global_var(m: *Module, g: *GlobalVarDef)
+pub fn module_add_global_var(m: *Module, g: *GlobalVarDef)
     module_add_global(m, g)
 
-fn module_add_impl(m: *Module, impl_block: *ImplBlock)
+pub fn module_add_impl(m: *Module, impl_block: *ImplBlock)
     if m.impls == null
         m.impls = impl_block
     else
@@ -103,7 +105,7 @@ fn module_add_impl(m: *Module, impl_block: *ImplBlock)
 # Create a new impl block
 # For "impl<T> Drop for Vec<T>": trait_name="Drop", type_name="Vec", type_params=<T>
 # For "impl<T> Vec<T>": trait_name=nil, type_name="Vec", type_params=<T>
-fn impl_block_new(p: *Parser, trait_name: *u8, trait_len: i32, type_name: *u8, type_len: i32, type_params: *TypeParam, methods: *FnDef) -> *ImplBlock
+pub fn impl_block_new(p: *Parser, trait_name: *u8, trait_len: i32, type_name: *u8, type_len: i32, type_params: *TypeParam, methods: *FnDef) -> *ImplBlock
     let ib: *ImplBlock = parser_alloc(p, 56) as *ImplBlock
     ib.trait_name = trait_name
     ib.trait_name_len = trait_len
@@ -119,7 +121,7 @@ fn impl_block_new(p: *Parser, trait_name: *u8, trait_len: i32, type_name: *u8, t
 # =============================================================================
 
 # Grammar signature: global_var_new(p, name, len, var_type, init_expr, line, col)
-fn global_var_new(p: *Parser, name: *u8, len: i32, var_type: i32, init_expr: *Expr, line: i32, col: i32) -> *GlobalVarDef
+pub fn global_var_new(p: *Parser, name: *u8, len: i32, var_type: i32, init_expr: *Expr, line: i32, col: i32) -> *GlobalVarDef
     let g: *GlobalVarDef = parser_alloc(p, 56) as *GlobalVarDef  # Size of GlobalVarDef struct
     g.name = name as *u8
     g.name_len = len
@@ -140,13 +142,13 @@ fn global_var_new(p: *Parser, name: *u8, len: i32, var_type: i32, init_expr: *Ex
 # =============================================================================
 
 # Link two FnDef nodes - used for building method lists in impl blocks
-fn fn_link(first: *FnDef, rest: *FnDef) -> *FnDef
+pub fn fn_link(first: *FnDef, rest: *FnDef) -> *FnDef
     if first == null
         return rest
     first.next = rest
     return first
 
-fn fn_def_new(p: *Parser, name: *u8, len: i32, params: *Param, ret: i32, body: *Stmt, line: i32, col: i32) -> *FnDef
+pub fn fn_def_new(p: *Parser, name: *u8, len: i32, params: *Param, ret: i32, body: *Stmt, line: i32, col: i32) -> *FnDef
     let f: *FnDef = parser_alloc(p, 96) as *FnDef  # Increased for type_params field
     f.name = name as *u8
     f.name_len = len
@@ -173,7 +175,7 @@ fn fn_def_new(p: *Parser, name: *u8, len: i32, params: *Param, ret: i32, body: *
     return f
 
 # Extern function declaration (no body) - forward declaration
-fn extern_fn_def_new(p: *Parser, name: *u8, len: i32, params: *Param, ret: i32, line: i32, col: i32) -> *FnDef
+pub fn extern_fn_def_new(p: *Parser, name: *u8, len: i32, params: *Param, ret: i32, line: i32, col: i32) -> *FnDef
     let f: *FnDef = parser_alloc(p, 96) as *FnDef  # Increased for type_params field
     f.name = name as *u8
     f.name_len = len
@@ -200,7 +202,7 @@ fn extern_fn_def_new(p: *Parser, name: *u8, len: i32, params: *Param, ret: i32, 
 # Parameter helpers
 # =============================================================================
 
-fn param_new(p: *Parser, name: *u8, len: i32, ty: i32, line: i32, col: i32) -> *Param
+pub fn param_new(p: *Parser, name: *u8, len: i32, ty: i32, line: i32, col: i32) -> *Param
     let param: *Param = parser_alloc(p, 56) as *Param
     param.name = name as *u8
     param.name_len = len
@@ -223,7 +225,7 @@ fn param_new(p: *Parser, name: *u8, len: i32, ty: i32, line: i32, col: i32) -> *
     param.next = null
     return param
 
-fn param_link(first: *Param, rest: *Param) -> *Param
+pub fn param_link(first: *Param, rest: *Param) -> *Param
     first.next = rest
     return first
 
@@ -231,7 +233,7 @@ fn param_link(first: *Param, rest: *Param) -> *Param
 # Struct definition helpers
 # =============================================================================
 
-fn struct_def_new(p: *Parser, name: *u8, len: i32, fields: *StructField, line: i32, col: i32) -> *StructDef
+pub fn struct_def_new(p: *Parser, name: *u8, len: i32, fields: *StructField, line: i32, col: i32) -> *StructDef
     let s: *StructDef = parser_alloc(p, 48) as *StructDef  # Increased for type_params field
     s.name = name as *u8
     s.name_len = len
@@ -240,7 +242,7 @@ fn struct_def_new(p: *Parser, name: *u8, len: i32, fields: *StructField, line: i
     s.type_params = null  # Non-generic struct (field at end to preserve layout)
     return s
 
-fn field_new(p: *Parser, name: *u8, len: i32, ty: i32, line: i32, col: i32) -> *StructField
+pub fn field_new(p: *Parser, name: *u8, len: i32, ty: i32, line: i32, col: i32) -> *StructField
     let f: *StructField = parser_alloc(p, 72) as *StructField  # Updated size for new fields
     f.name = name as *u8
     f.name_len = len
@@ -267,19 +269,19 @@ fn field_new(p: *Parser, name: *u8, len: i32, ty: i32, line: i32, col: i32) -> *
     return f
 
 # Type parameter helpers (for generics)
-fn type_param_new(p: *Parser, name: *u8, len: i32) -> *TypeParam
+pub fn type_param_new(p: *Parser, name: *u8, len: i32) -> *TypeParam
     let tp: *TypeParam = parser_alloc(p, 24) as *TypeParam
     tp.name = name as *u8
     tp.name_len = len
     tp.next = null
     return tp
 
-fn type_param_link(first: *TypeParam, rest: *TypeParam) -> *TypeParam
+pub fn type_param_link(first: *TypeParam, rest: *TypeParam) -> *TypeParam
     first.next = rest
     return first
 
 # Generic function definition (with type parameters)
-fn generic_fn_def_new(p: *Parser, name: *u8, len: i32, type_params: *TypeParam, params: *Param, ret: i32, body: *Stmt, line: i32, col: i32) -> *FnDef
+pub fn generic_fn_def_new(p: *Parser, name: *u8, len: i32, type_params: *TypeParam, params: *Param, ret: i32, body: *Stmt, line: i32, col: i32) -> *FnDef
     let f: *FnDef = parser_alloc(p, 96) as *FnDef
     f.name = name as *u8
     f.name_len = len
@@ -303,7 +305,7 @@ fn generic_fn_def_new(p: *Parser, name: *u8, len: i32, type_params: *TypeParam, 
     return f
 
 # Generic struct definition (with type parameters)
-fn generic_struct_def_new(p: *Parser, name: *u8, len: i32, type_params: *TypeParam, fields: *StructField, line: i32, col: i32) -> *StructDef
+pub fn generic_struct_def_new(p: *Parser, name: *u8, len: i32, type_params: *TypeParam, fields: *StructField, line: i32, col: i32) -> *StructDef
     let s: *StructDef = parser_alloc(p, 48) as *StructDef
     s.name = name as *u8
     s.name_len = len
@@ -312,7 +314,7 @@ fn generic_struct_def_new(p: *Parser, name: *u8, len: i32, type_params: *TypePar
     s.type_params = type_params  # Generic type parameters (field at end to preserve layout)
     return s
 
-fn field_link(first: *StructField, rest: *StructField) -> *StructField
+pub fn field_link(first: *StructField, rest: *StructField) -> *StructField
     first.next = rest
     return first
 
@@ -320,7 +322,7 @@ fn field_link(first: *StructField, rest: *StructField) -> *StructField
 # Const definition helpers
 # =============================================================================
 
-fn const_new(p: *Parser, name: *u8, len: i32, ty: i32, val: *Expr, line: i32, col: i32) -> *ConstEntry
+pub fn const_new(p: *Parser, name: *u8, len: i32, ty: i32, val: *Expr, line: i32, col: i32) -> *ConstEntry
     let c: *ConstEntry = parser_alloc(p, 40) as *ConstEntry
     c.name = name as *u8
     c.name_len = len
@@ -337,13 +339,13 @@ fn const_new(p: *Parser, name: *u8, len: i32, ty: i32, val: *Expr, line: i32, co
 # Import helpers
 # =============================================================================
 
-fn import_new(p: *Parser, path: *ImportPath) -> *ImportDecl
+pub fn import_new(p: *Parser, path: *ImportPath) -> *ImportDecl
     let i: *ImportDecl = parser_alloc(p, 24) as *ImportDecl
     i.path = path
     i.next = null
     return i
 
-fn path_new(p: *Parser, seg: *u8, len: i32, rest: *ImportPath) -> *ImportPath
+pub fn path_new(p: *Parser, seg: *u8, len: i32, rest: *ImportPath) -> *ImportPath
     let path: *ImportPath = parser_alloc(p, 24) as *ImportPath
     path.segment = seg as *u8
     path.segment_len = len
@@ -354,7 +356,7 @@ fn path_new(p: *Parser, seg: *u8, len: i32, rest: *ImportPath) -> *ImportPath
 # Type helpers
 # =============================================================================
 
-fn type_named(p: *Parser, name: *u8, len: i32) -> i32
+pub fn type_named(p: *Parser, name: *u8, len: i32) -> i32
     # Store the type name in parser state for later retrieval by fn_def_new
     p.last_type_name = name
     p.last_type_name_len = len
@@ -362,7 +364,7 @@ fn type_named(p: *Parser, name: *u8, len: i32) -> i32
 
 # Capture the return type name after parsing return_type but before parsing block.
 # This prevents last_type_name from being overwritten by type_spec calls in the function body.
-fn capture_fn_return_type(p: *Parser, ret: i32) -> i32
+pub fn capture_fn_return_type(p: *Parser, ret: i32) -> i32
     if ret == TYPE_STRUCT
         p.fn_return_type_name = p.last_type_name
         p.fn_return_type_name_len = p.last_type_name_len
@@ -372,7 +374,7 @@ fn capture_fn_return_type(p: *Parser, ret: i32) -> i32
     return ret
 
 # Parse array size from digit string and store array info in parser state
-fn type_array(p: *Parser, size_str: *u8, size_len: i32, elem_type: i32) -> i32
+pub fn type_array(p: *Parser, size_str: *u8, size_len: i32, elem_type: i32) -> i32
     # Parse the size string to an integer
     var size: i32 = 0
     for i in 0..size_len
@@ -392,30 +394,33 @@ fn type_array(p: *Parser, size_str: *u8, size_len: i32, elem_type: i32) -> i32
 
 # Handle pointer type *T
 # Stores the pointee type and preserves type name if pointing to struct/generic
-fn type_ptr(p: *Parser, inner_type: i32) -> i32
+pub fn type_ptr(p: *Parser, inner_type: i32) -> i32
     # Store pointee type for emitter
     p.last_pointee_type = inner_type
     # Note: last_type_name/len was already set by parsing inner_type if it's a struct/generic
     # No need to modify it - stmt_var_decl will read both
+    # Return TYPE_PTR_PTR for pointer-to-pointer types
+    if inner_type == TYPE_PTR or inner_type == TYPE_PTR_PTR
+        return TYPE_PTR_PTR
     return TYPE_PTR
 
 # Handle immutable reference type @T
 # References are semantically pointers for now - store the inner type info
-fn type_ref(p: *Parser, inner_type: i32) -> i32
+pub fn type_ref(p: *Parser, inner_type: i32) -> i32
     # Store inner type information for emitter
     p.last_ref_inner_type = inner_type
     return TYPE_REF
 
 # Handle mutable reference type @@T
 # References are semantically pointers for now - store the inner type info
-fn type_mut_ref(p: *Parser, inner_type: i32) -> i32
+pub fn type_mut_ref(p: *Parser, inner_type: i32) -> i32
     # Store inner type information for emitter
     p.last_ref_inner_type = inner_type
     return TYPE_MUT_REF
 
 # Handle generic type like Vec<u8>
 # Returns TYPE_STRUCT and stores mangled name (e.g., "Vec$u8") in parser state
-fn type_generic(p: *Parser, base_name: *u8, base_len: i32, type_arg: i32) -> i32
+pub fn type_generic(p: *Parser, base_name: *u8, base_len: i32, type_arg: i32) -> i32
     # Allocate space for the mangled name in parser heap
     # Format: base_name + "$" + type_name (e.g., "Vec$u8")
     var mangled: *u8 = parser_alloc(p, 64) as *u8
@@ -470,14 +475,18 @@ fn type_generic(p: *Parser, base_name: *u8, base_len: i32, type_arg: i32) -> i32
 # Statement helpers
 # =============================================================================
 
-fn stmt_var_decl(p: *Parser, name: *u8, len: i32, ty: i32, init: *Expr, line: i32, col: i32) -> *Stmt
+pub fn stmt_var_decl(p: *Parser, name: *u8, len: i32, ty: i32, init: *Expr, line: i32, col: i32) -> *Stmt
     let s: *Stmt = parser_alloc(p, 160) as *Stmt
     s.kind = STMT_VAR_DECL
     s.span.line = line
     s.span.col = col
     s.var_name = name as *u8
     s.var_name_len = len
-    s.var_type = ty
+    # Default to i64 for type inference (when ty == 0 aka TYPE_VOID)
+    if ty == 0
+        s.var_type = TYPE_I64
+    else
+        s.var_type = ty
     # Copy struct type name from parser state
     # For TYPE_STRUCT: the variable itself is a struct
     # For TYPE_PTR with pointee TYPE_STRUCT: it's a pointer to a struct
@@ -507,7 +516,7 @@ fn stmt_var_decl(p: *Parser, name: *u8, len: i32, ty: i32, init: *Expr, line: i3
     s.next = null
     return s
 
-fn stmt_return(p: *Parser, val: *Expr, line: i32, col: i32) -> *Stmt
+pub fn stmt_return(p: *Parser, val: *Expr, line: i32, col: i32) -> *Stmt
     let s: *Stmt = parser_alloc(p, 160) as *Stmt
     s.kind = STMT_RETURN
     s.span.line = line
@@ -516,7 +525,7 @@ fn stmt_return(p: *Parser, val: *Expr, line: i32, col: i32) -> *Stmt
     s.next = null
     return s
 
-fn stmt_break(p: *Parser, line: i32, col: i32) -> *Stmt
+pub fn stmt_break(p: *Parser, line: i32, col: i32) -> *Stmt
     let s: *Stmt = parser_alloc(p, 160) as *Stmt
     s.kind = STMT_BREAK
     s.span.line = line
@@ -524,7 +533,7 @@ fn stmt_break(p: *Parser, line: i32, col: i32) -> *Stmt
     s.next = null
     return s
 
-fn stmt_continue(p: *Parser, line: i32, col: i32) -> *Stmt
+pub fn stmt_continue(p: *Parser, line: i32, col: i32) -> *Stmt
     let s: *Stmt = parser_alloc(p, 160) as *Stmt
     s.kind = STMT_CONTINUE
     s.span.line = line
@@ -532,7 +541,7 @@ fn stmt_continue(p: *Parser, line: i32, col: i32) -> *Stmt
     s.next = null
     return s
 
-fn stmt_if(p: *Parser, cond: *Expr, then_body: *Stmt, else_body: *Stmt, line: i32, col: i32) -> *Stmt
+pub fn stmt_if(p: *Parser, cond: *Expr, then_body: *Stmt, else_body: *Stmt, line: i32, col: i32) -> *Stmt
     let s: *Stmt = parser_alloc(p, 160) as *Stmt
     s.kind = STMT_IF
     s.span.line = line
@@ -543,7 +552,7 @@ fn stmt_if(p: *Parser, cond: *Expr, then_body: *Stmt, else_body: *Stmt, line: i3
     s.next = null
     return s
 
-fn stmt_while(p: *Parser, cond: *Expr, body: *Stmt, line: i32, col: i32) -> *Stmt
+pub fn stmt_while(p: *Parser, cond: *Expr, body: *Stmt, line: i32, col: i32) -> *Stmt
     let s: *Stmt = parser_alloc(p, 160) as *Stmt
     s.kind = STMT_WHILE
     s.span.line = line
@@ -553,7 +562,7 @@ fn stmt_while(p: *Parser, cond: *Expr, body: *Stmt, line: i32, col: i32) -> *Stm
     s.next = null
     return s
 
-fn stmt_assign_name(p: *Parser, name: *u8, len: i32, val: *Expr, line: i32, col: i32) -> *Stmt
+pub fn stmt_assign_name(p: *Parser, name: *u8, len: i32, val: *Expr, line: i32, col: i32) -> *Stmt
     let s: *Stmt = parser_alloc(p, 160) as *Stmt
     s.kind = STMT_ASSIGN
     s.span.line = line
@@ -564,7 +573,7 @@ fn stmt_assign_name(p: *Parser, name: *u8, len: i32, val: *Expr, line: i32, col:
     s.next = null
     return s
 
-fn stmt_assign_index(p: *Parser, name: *u8, len: i32, idx: *Expr, val: *Expr, line: i32, col: i32) -> *Stmt
+pub fn stmt_assign_index(p: *Parser, name: *u8, len: i32, idx: *Expr, val: *Expr, line: i32, col: i32) -> *Stmt
     let s: *Stmt = parser_alloc(p, 160) as *Stmt
     s.kind = STMT_INDEX_ASSIGN
     s.span.line = line
@@ -577,7 +586,7 @@ fn stmt_assign_index(p: *Parser, name: *u8, len: i32, idx: *Expr, val: *Expr, li
     s.next = null
     return s
 
-fn stmt_assign_deref(p: *Parser, target: *Expr, val: *Expr, line: i32, col: i32) -> *Stmt
+pub fn stmt_assign_deref(p: *Parser, target: *Expr, val: *Expr, line: i32, col: i32) -> *Stmt
     let s: *Stmt = parser_alloc(p, 160) as *Stmt
     s.kind = STMT_ASSIGN
     s.span.line = line
@@ -593,7 +602,7 @@ fn stmt_assign_deref(p: *Parser, target: *Expr, val: *Expr, line: i32, col: i32)
     return s
 
 # Member assignment through pointer: ptr.field = value
-fn stmt_assign_member(p: *Parser, ptr_expr: *Expr, field: *u8, field_len: i32, val: *Expr, line: i32, col: i32) -> *Stmt
+pub fn stmt_assign_member(p: *Parser, ptr_expr: *Expr, field: *u8, field_len: i32, val: *Expr, line: i32, col: i32) -> *Stmt
     let s: *Stmt = parser_alloc(p, 160) as *Stmt
     s.kind = STMT_MEMBER_ASSIGN
     s.span.line = line
@@ -609,7 +618,7 @@ fn stmt_assign_member(p: *Parser, ptr_expr: *Expr, field: *u8, field_len: i32, v
     return s
 
 # Indexed member assignment through pointer: ptr.field[index] = value
-fn stmt_assign_member_index(p: *Parser, ptr_expr: *Expr, field: *u8, field_len: i32, idx: *Expr, val: *Expr, line: i32, col: i32) -> *Stmt
+pub fn stmt_assign_member_index(p: *Parser, ptr_expr: *Expr, field: *u8, field_len: i32, idx: *Expr, val: *Expr, line: i32, col: i32) -> *Stmt
     let s: *Stmt = parser_alloc(p, 160) as *Stmt
     s.kind = STMT_MEMBER_INDEX_ASSIGN
     s.span.line = line
@@ -628,7 +637,7 @@ fn stmt_assign_member_index(p: *Parser, ptr_expr: *Expr, field: *u8, field_len: 
 
 # General expression assignment: expr = value
 # This handles nested member access like r.origin.x = 10
-fn stmt_assign_expr(p: *Parser, target: *Expr, val: *Expr, line: i32, col: i32) -> *Stmt
+pub fn stmt_assign_expr(p: *Parser, target: *Expr, val: *Expr, line: i32, col: i32) -> *Stmt
     let s: *Stmt = parser_alloc(p, 160) as *Stmt
     s.kind = STMT_ASSIGN
     s.span.line = line
@@ -644,7 +653,7 @@ fn stmt_assign_expr(p: *Parser, target: *Expr, val: *Expr, line: i32, col: i32) 
     return s
 
 # Local struct field assignment: var.field = value
-fn stmt_assign_local_field(p: *Parser, var_name: *u8, var_len: i32, field: *u8, field_len: i32, val: *Expr, line: i32, col: i32) -> *Stmt
+pub fn stmt_assign_local_field(p: *Parser, var_name: *u8, var_len: i32, field: *u8, field_len: i32, val: *Expr, line: i32, col: i32) -> *Stmt
     let s: *Stmt = parser_alloc(p, 160) as *Stmt
     s.kind = STMT_LOCAL_FIELD_ASSIGN
     s.span.line = line
@@ -661,7 +670,7 @@ fn stmt_assign_local_field(p: *Parser, var_name: *u8, var_len: i32, field: *u8, 
     return s
 
 # Local struct field array assignment: var.field[index] = value
-fn stmt_assign_local_field_index(p: *Parser, var_name: *u8, var_len: i32, field: *u8, field_len: i32, idx: *Expr, val: *Expr, line: i32, col: i32) -> *Stmt
+pub fn stmt_assign_local_field_index(p: *Parser, var_name: *u8, var_len: i32, field: *u8, field_len: i32, idx: *Expr, val: *Expr, line: i32, col: i32) -> *Stmt
     let s: *Stmt = parser_alloc(p, 160) as *Stmt
     s.kind = STMT_LOCAL_FIELD_INDEX_ASSIGN
     s.span.line = line
@@ -679,7 +688,38 @@ fn stmt_assign_local_field_index(p: *Parser, var_name: *u8, var_len: i32, field:
     s.next = null
     return s
 
-fn stmt_expr(p: *Parser, e: *Expr, line: i32, col: i32) -> *Stmt
+# Desugar compound assignment: `name op= val` -> `name = name op val`
+# op should be OP_ADD, OP_SUB, OP_MUL, OP_DIV
+pub fn stmt_compound_assign(p: *Parser, name: *u8, len: i32, op: i32, val: *Expr, line: i32, col: i32) -> *Stmt
+    # Create identifier expression for the variable
+    let ident: *Expr = parser_alloc(p, 120) as *Expr
+    ident.kind = EXPR_IDENT
+    ident.span.line = line
+    ident.span.col = col
+    ident.ident_ptr = name
+    ident.ident_len = len
+    ident.next = null
+    # Create binary expression: name op val
+    let binary: *Expr = parser_alloc(p, 120) as *Expr
+    binary.kind = EXPR_BINARY
+    binary.span.line = line
+    binary.span.col = col
+    binary.op = op
+    binary.left = ident
+    binary.right = val
+    binary.next = null
+    # Create assignment statement: name = (name op val)
+    let s: *Stmt = parser_alloc(p, 160) as *Stmt
+    s.kind = STMT_ASSIGN
+    s.span.line = line
+    s.span.col = col
+    s.assign_target = name
+    s.assign_target_len = len
+    s.assign_value = binary
+    s.next = null
+    return s
+
+pub fn stmt_expr(p: *Parser, e: *Expr, line: i32, col: i32) -> *Stmt
     let s: *Stmt = parser_alloc(p, 160) as *Stmt
     s.kind = STMT_EXPR
     s.span.line = line
@@ -688,7 +728,7 @@ fn stmt_expr(p: *Parser, e: *Expr, line: i32, col: i32) -> *Stmt
     s.next = null
     return s
 
-fn stmt_link(first: *Stmt, rest: *Stmt) -> *Stmt
+pub fn stmt_link(first: *Stmt, rest: *Stmt) -> *Stmt
     first.next = rest
     return first
 
@@ -696,7 +736,7 @@ fn stmt_link(first: *Stmt, rest: *Stmt) -> *Stmt
 # Expression helpers
 # =============================================================================
 
-fn expr_int(p: *Parser, val: i64, line: i32, col: i32) -> *Expr
+pub fn expr_int(p: *Parser, val: i64, line: i32, col: i32) -> *Expr
     let e: *Expr = parser_alloc(p, 128) as *Expr
     e.kind = EXPR_INT_LIT
     e.span.line = line
@@ -705,7 +745,7 @@ fn expr_int(p: *Parser, val: i64, line: i32, col: i32) -> *Expr
     e.next = null
     return e
 
-fn expr_string(p: *Parser, tok: Token) -> *Expr
+pub fn expr_string(p: *Parser, tok: Token) -> *Expr
     let e: *Expr = parser_alloc(p, 128) as *Expr
     e.kind = EXPR_STRING_LIT
     e.span.line = tok.line
@@ -716,7 +756,7 @@ fn expr_string(p: *Parser, tok: Token) -> *Expr
     e.next = null
     return e
 
-fn expr_char(p: *Parser, tok: Token) -> *Expr
+pub fn expr_char(p: *Parser, tok: Token) -> *Expr
     let e: *Expr = parser_alloc(p, 128) as *Expr
     e.kind = EXPR_CHAR_LIT
     e.span.line = tok.line
@@ -749,7 +789,7 @@ fn expr_char(p: *Parser, tok: Token) -> *Expr
     e.next = null
     return e
 
-fn expr_nil(p: *Parser, line: i32, col: i32) -> *Expr
+pub fn expr_nil(p: *Parser, line: i32, col: i32) -> *Expr
     let e: *Expr = parser_alloc(p, 128) as *Expr
     e.kind = EXPR_NIL_LIT
     e.span.line = line
@@ -758,7 +798,7 @@ fn expr_nil(p: *Parser, line: i32, col: i32) -> *Expr
     e.next = null
     return e
 
-fn expr_ident(p: *Parser, name: *u8, len: i32, line: i32, col: i32) -> *Expr
+pub fn expr_ident(p: *Parser, name: *u8, len: i32, line: i32, col: i32) -> *Expr
     let e: *Expr = parser_alloc(p, 128) as *Expr
     e.kind = EXPR_IDENT
     e.span.line = line
@@ -768,7 +808,7 @@ fn expr_ident(p: *Parser, name: *u8, len: i32, line: i32, col: i32) -> *Expr
     e.next = null
     return e
 
-fn expr_binary(p: *Parser, op: i32, left: *Expr, right: *Expr) -> *Expr
+pub fn expr_binary(p: *Parser, op: i32, left: *Expr, right: *Expr) -> *Expr
     let e: *Expr = parser_alloc(p, 128) as *Expr
     e.kind = EXPR_BINARY
     # Inherit span from left operand
@@ -780,7 +820,7 @@ fn expr_binary(p: *Parser, op: i32, left: *Expr, right: *Expr) -> *Expr
     e.next = null
     return e
 
-fn expr_unary(p: *Parser, op: i32, operand: *Expr, line: i32, col: i32) -> *Expr
+pub fn expr_unary(p: *Parser, op: i32, operand: *Expr, line: i32, col: i32) -> *Expr
     let e: *Expr = parser_alloc(p, 128) as *Expr
     e.kind = EXPR_UNARY
     e.span.line = line
@@ -790,7 +830,7 @@ fn expr_unary(p: *Parser, op: i32, operand: *Expr, line: i32, col: i32) -> *Expr
     e.next = null
     return e
 
-fn expr_cast(p: *Parser, left: *Expr, target_type: i32) -> *Expr
+pub fn expr_cast(p: *Parser, left: *Expr, target_type: i32) -> *Expr
     let e: *Expr = parser_alloc(p, 128) as *Expr
     e.kind = EXPR_CAST
     e.span = left.span
@@ -799,7 +839,7 @@ fn expr_cast(p: *Parser, left: *Expr, target_type: i32) -> *Expr
     e.next = null
     return e
 
-fn expr_call(p: *Parser, name: *u8, len: i32, args: *Expr, line: i32, col: i32) -> *Expr
+pub fn expr_call(p: *Parser, name: *u8, len: i32, args: *Expr, line: i32, col: i32) -> *Expr
     let e: *Expr = parser_alloc(p, 128) as *Expr
     e.kind = EXPR_CALL
     e.span.line = line
@@ -814,7 +854,7 @@ fn expr_call(p: *Parser, name: *u8, len: i32, args: *Expr, line: i32, col: i32) 
 
 # Generic function call: name<type>(args) -> mangled_name(args)
 # Mangles the function name like type_generic does for types
-fn expr_generic_call(p: *Parser, name: *u8, len: i32, type_arg: i32, args: *Expr, line: i32, col: i32) -> *Expr
+pub fn expr_generic_call(p: *Parser, name: *u8, len: i32, type_arg: i32, args: *Expr, line: i32, col: i32) -> *Expr
     # Build mangled name: name$type (e.g., vec_new$u8)
     var mangled: *u8 = parser_alloc(p, 64) as *u8
     var pos: i32 = 0
@@ -872,7 +912,7 @@ fn expr_generic_call(p: *Parser, name: *u8, len: i32, type_arg: i32, args: *Expr
     e.next = null
     return e
 
-fn expr_link(first: *Expr, rest: *Expr) -> *Expr
+pub fn expr_link(first: *Expr, rest: *Expr) -> *Expr
     first.next = rest
     return first
 
@@ -880,7 +920,7 @@ fn expr_link(first: *Expr, rest: *Expr) -> *Expr
 # Binary operation chain helpers (for left-factored grammar)
 # =============================================================================
 
-fn binary_op_new(p: *Parser, op: i32, right: *Expr, next: *BinaryOp) -> *BinaryOp
+pub fn binary_op_new(p: *Parser, op: i32, right: *Expr, next: *BinaryOp) -> *BinaryOp
     let b: *BinaryOp = parser_alloc(p, 24) as *BinaryOp
     b.op = op
     b.right = right
@@ -888,7 +928,7 @@ fn binary_op_new(p: *Parser, op: i32, right: *Expr, next: *BinaryOp) -> *BinaryO
     return b
 
 # Apply binary operation chain with parser for allocations
-fn apply_binary_opt_p(p: *Parser, left: *Expr, chain: *BinaryOp) -> *Expr
+pub fn apply_binary_opt_p(p: *Parser, left: *Expr, chain: *BinaryOp) -> *Expr
     if chain == null
         return left
 
@@ -903,13 +943,13 @@ fn apply_binary_opt_p(p: *Parser, left: *Expr, chain: *BinaryOp) -> *Expr
 # Cast tail helpers (for cast expression parsing)
 # =============================================================================
 
-fn cast_tail_new(p: *Parser, ty: i32, next: *CastTail) -> *CastTail
+pub fn cast_tail_new(p: *Parser, ty: i32, next: *CastTail) -> *CastTail
     let ct: *CastTail = parser_alloc(p, 16) as *CastTail
     ct.cast_type = ty
     ct.next = next
     return ct
 
-fn apply_cast_tail(p: *Parser, expr: *Expr, tail: *CastTail) -> *Expr
+pub fn apply_cast_tail(p: *Parser, expr: *Expr, tail: *CastTail) -> *Expr
     if tail == null
         return expr
     var result: *Expr = expr
@@ -923,7 +963,7 @@ fn apply_cast_tail(p: *Parser, expr: *Expr, tail: *CastTail) -> *Expr
 # Postfix operation helpers
 # =============================================================================
 
-fn postfix_call(p: *Parser, args: *Expr) -> *PostfixOp
+pub fn postfix_call(p: *Parser, args: *Expr) -> *PostfixOp
     let op: *PostfixOp = parser_alloc(p, 80) as *PostfixOp
     op.kind = POSTFIX_CALL
     op.args = args
@@ -936,7 +976,7 @@ fn postfix_call(p: *Parser, args: *Expr) -> *PostfixOp
 # Generic function call - creates a call with type suffix from the type token
 # The type_tok is the token for the type name (e.g., "u8", "String", etc.)
 # Builds a suffix like "$u8" to be appended to the function name
-fn postfix_generic_call(p: *Parser, type_tok: Token, args: *Expr) -> *PostfixOp
+pub fn postfix_generic_call(p: *Parser, type_tok: Token, args: *Expr) -> *PostfixOp
     let op: *PostfixOp = parser_alloc(p, 80) as *PostfixOp
     op.kind = POSTFIX_CALL
     op.args = args
@@ -950,14 +990,14 @@ fn postfix_generic_call(p: *Parser, type_tok: Token, args: *Expr) -> *PostfixOp
     op.next = null
     return op
 
-fn postfix_index(p: *Parser, index: *Expr) -> *PostfixOp
+pub fn postfix_index(p: *Parser, index: *Expr) -> *PostfixOp
     let op: *PostfixOp = parser_alloc(p, 64) as *PostfixOp
     op.kind = POSTFIX_INDEX
     op.index = index
     op.next = null
     return op
 
-fn postfix_member(p: *Parser, name: *u8, len: i32) -> *PostfixOp
+pub fn postfix_member(p: *Parser, name: *u8, len: i32) -> *PostfixOp
     let op: *PostfixOp = parser_alloc(p, 64) as *PostfixOp
     op.kind = POSTFIX_MEMBER
     op.member_name = name as *u8
@@ -965,23 +1005,23 @@ fn postfix_member(p: *Parser, name: *u8, len: i32) -> *PostfixOp
     op.next = null
     return op
 
-fn postfix_cast(p: *Parser, ty: i32) -> *PostfixOp
+pub fn postfix_cast(p: *Parser, ty: i32) -> *PostfixOp
     let op: *PostfixOp = parser_alloc(p, 64) as *PostfixOp
     op.kind = POSTFIX_CAST
     op.cast_type = ty
     op.next = null
     return op
 
-fn postfix_link(first: *PostfixOp, rest: *PostfixOp) -> *PostfixOp
+pub fn postfix_link(first: *PostfixOp, rest: *PostfixOp) -> *PostfixOp
     first.next = rest
     return first
 
 # Old apply_postfix kept for reference - use apply_postfix_p instead
-fn apply_postfix(base: *Expr, ops: *PostfixOp) -> *Expr
+pub fn apply_postfix(base: *Expr, ops: *PostfixOp) -> *Expr
     return base
 
 # Apply postfix operations with parser for allocation
-fn apply_postfix_p(p: *Parser, base: *Expr, ops: *PostfixOp) -> *Expr
+pub fn apply_postfix_p(p: *Parser, base: *Expr, ops: *PostfixOp) -> *Expr
     if ops == null
         return base
 
@@ -1042,7 +1082,7 @@ fn apply_postfix_p(p: *Parser, base: *Expr, ops: *PostfixOp) -> *Expr
 # Struct literal helpers
 # =============================================================================
 
-fn field_init_new(p: *Parser, name: *u8, len: i32, val: *Expr) -> *FieldInit
+pub fn field_init_new(p: *Parser, name: *u8, len: i32, val: *Expr) -> *FieldInit
     let f: *FieldInit = parser_alloc(p, 32) as *FieldInit
     f.name = name as *u8
     f.name_len = len
@@ -1050,11 +1090,11 @@ fn field_init_new(p: *Parser, name: *u8, len: i32, val: *Expr) -> *FieldInit
     f.next = null
     return f
 
-fn field_init_link(first: *FieldInit, rest: *FieldInit) -> *FieldInit
+pub fn field_init_link(first: *FieldInit, rest: *FieldInit) -> *FieldInit
     first.next = rest
     return first
 
-fn ident_or_struct(p: *Parser, tok: Token, lit: *StructLit) -> *Expr
+pub fn ident_or_struct(p: *Parser, tok: Token, lit: *StructLit) -> *Expr
     if lit == null
         # Just an identifier
         return expr_ident(p, tok.start, tok.len, tok.line, tok.col)
@@ -1073,7 +1113,7 @@ fn ident_or_struct(p: *Parser, tok: Token, lit: *StructLit) -> *Expr
 
 # Generic struct literal: Pair<i32> { first: 1, second: 2 }
 # The type_spec rule (via type_generic) has already set p.last_type_name to "Pair$i32"
-fn generic_struct_lit(p: *Parser, tok: Token, type_kind: i32, lit: *StructLit) -> *Expr
+pub fn generic_struct_lit(p: *Parser, tok: Token, type_kind: i32, lit: *StructLit) -> *Expr
     let e: *Expr = parser_alloc(p, 128) as *Expr
     e.kind = EXPR_STRUCT_LIT
     e.span.line = tok.line
@@ -1090,7 +1130,7 @@ fn generic_struct_lit(p: *Parser, tok: Token, type_kind: i32, lit: *StructLit) -
 # Numeric parsing
 # =============================================================================
 
-fn parse_int(start: *u8, len: i32) -> i64
+pub fn parse_int(start: *u8, len: i32) -> i64
     # Check for hex prefix (0x or 0X)
     if len >= 3 and *start == 48  # '0'
         let prefix: i32 = *(start + 1) as i32
@@ -1106,7 +1146,7 @@ fn parse_int(start: *u8, len: i32) -> i64
             val = val * 10 + (ch - 48) as i64
     return val
 
-fn parse_hex(start: *u8, len: i32) -> i64
+pub fn parse_hex(start: *u8, len: i32) -> i64
     var val: i64 = 0
     for i in 0..len
         let ch: i32 = *(start + i) as i32
@@ -1120,7 +1160,7 @@ fn parse_hex(start: *u8, len: i32) -> i64
         val = val * 16 + digit
     return val
 
-fn parse_binary(start: *u8, len: i32) -> i64
+pub fn parse_binary(start: *u8, len: i32) -> i64
     var val: i64 = 0
     for i in 0..len
         let ch: i32 = *(start + i) as i32
