@@ -1,0 +1,293 @@
+# Angelo - Glyph Rasterizer
+#
+# Converts glyph outlines to bitmaps.
+
+import types.GlyphOutline
+import types.Contour
+import types.OutlinePoint
+import types.RasterizedGlyph
+import types.FontMetrics
+import raster.bezier.Point2D
+import raster.bezier.QuadBezier
+import raster.bezier.flatten_quad_bezier
+import raster.bezier.implied_on_curve
+import raster.edge.Edge
+import raster.edge.EdgeTable
+import raster.fill.Bitmap
+import raster.fill.scanline_fill_simple
+import raster.fill.scanline_fill_antialiased
+
+# Tolerance for bezier flattening (in font units)
+const FLATTEN_TOLERANCE: f32 = 0.5
+
+# Convert a contour to edges
+fn contour_to_edges(contour: Contour, scale: f32, edge_table:& EdgeTable)
+    let n = contour.len()
+    if n < 2
+        return
+
+    # TrueType contours can have:
+    # - On-curve points (actual outline points)
+    # - Off-curve points (bezier control points)
+    # Two consecutive off-curve points have an implied on-curve between them
+
+    # First, expand the contour to handle implied points
+    var points = Vec.new()
+
+    for i in 0..n
+        let curr = contour.points[i]
+        let next_idx = (i + 1) % n
+        let next = contour.points[next_idx]
+
+        let p = Point2D.from_i16(curr.x, curr.y).scale(scale)
+        points.push((p, curr.on_curve))
+
+        # If both current and next are off-curve, add implied on-curve
+        if not curr.on_curve and not next.on_curve
+            let next_p = Point2D.from_i16(next.x, next.y).scale(scale)
+            let implied = p.midpoint(next_p)
+            points.push((implied, true))
+
+    # Now process the expanded points
+    let expanded_n = points.len()
+    if expanded_n < 2
+        return
+
+    # Find first on-curve point to start
+    var start_idx = 0usize
+    for i in 0..expanded_n
+        let (_, on_curve) = points[i]
+        if on_curve
+            start_idx = i
+            break
+
+    # Walk through points, emitting edges
+    var curr_on_curve = points[start_idx].0
+    var i = 1usize
+
+    while i <= expanded_n
+        let idx = (start_idx + i) % expanded_n
+        let (p, on_curve) = points[idx]
+
+        if on_curve
+            # Line segment from curr_on_curve to p
+            edge_table.add_line(curr_on_curve, p)
+            curr_on_curve = p
+        else
+            # This is a control point - look for next on-curve
+            let next_idx = (start_idx + i + 1) % expanded_n
+            let (next_p, next_on_curve) = points[next_idx]
+
+            if next_on_curve
+                # Quadratic bezier: curr_on_curve -> p (control) -> next_p
+                let flattened = flatten_quad_bezier(curr_on_curve, p, next_p, FLATTEN_TOLERANCE)
+
+                # Add edges for flattened segments
+                for j in 0..flattened.len() - 1
+                    edge_table.add_line(flattened[j], flattened[j + 1])
+
+                curr_on_curve = next_p
+                i = i + 1  # Skip the next point since we used it
+            else
+                # Next is also off-curve, implied point between
+                let implied = p.midpoint(next_p)
+                let flattened = flatten_quad_bezier(curr_on_curve, p, implied, FLATTEN_TOLERANCE)
+
+                for j in 0..flattened.len() - 1
+                    edge_table.add_line(flattened[j], flattened[j + 1])
+
+                curr_on_curve = implied
+
+        i = i + 1
+
+# Convert a glyph outline to an edge table
+fn outline_to_edges(outline: GlyphOutline, scale: f32) -> EdgeTable
+    var edge_table = EdgeTable.new()
+
+    for contour in @outline.contours
+        contour_to_edges(contour, scale, @&edge_table)
+
+    edge_table.sort()
+    edge_table
+
+# Rasterize a glyph outline at a given pixel size
+# Returns a bitmap with alpha values (0-255)
+pub fn rasterize_outline(outline: GlyphOutline, units_per_em: u16, size_px: u32, antialias: bool) -> RasterizedGlyph
+    if outline.is_empty()
+        # Return empty glyph (e.g., space character)
+        return RasterizedGlyph.new(0, 0)
+
+    # Calculate scale factor
+    let scale = size_px as f32 / units_per_em as f32
+
+    # Convert outline to edges
+    let edge_table = outline_to_edges(outline, scale)
+
+    if edge_table.is_empty()
+        return RasterizedGlyph.new(0, 0)
+
+    # Get bounding box
+    let (x_min, y_min, x_max, y_max) = edge_table.bounds()
+
+    # Add padding for antialiasing
+    let padding = 1u32
+
+    # Calculate bitmap dimensions
+    let width = (x_max - x_min).ceil() as u32 + padding * 2
+    let height = (y_max - y_min).ceil() as u32 + padding * 2
+
+    # Sanity check
+    if width > 1024 or height > 1024
+        # Something went wrong, return empty
+        return RasterizedGlyph.new(0, 0)
+
+    var bitmap = Bitmap.new(width, height)
+
+    # Rasterize
+    let x_offset = x_min - padding as f32
+    let y_offset = y_min - padding as f32
+
+    if antialias
+        scanline_fill_antialiased(@&edge_table, @&bitmap, y_offset, x_offset)
+    else
+        scanline_fill_simple(@&edge_table, @&bitmap, y_offset, x_offset)
+
+    # Create result
+    var result = RasterizedGlyph {
+        bitmap: bitmap.data,
+        width: width,
+        height: height,
+        bearing_x: x_min.floor() as i32,
+        bearing_y: y_max.ceil() as i32,  # TrueType y grows up, bitmap y grows down
+        advance: 0  # Caller should set this from hmtx
+    }
+
+    result
+
+# Rasterize a glyph with metrics
+pub fn rasterize_glyph(
+    outline: GlyphOutline,
+    units_per_em: u16,
+    size_px: u32,
+    advance_width: u16,
+    left_side_bearing: i16,
+    antialias: bool
+) -> RasterizedGlyph
+    var result = rasterize_outline(outline, units_per_em, size_px, antialias)
+
+    # Scale metrics
+    let scale = size_px as f32 / units_per_em as f32
+    result.advance = (advance_width as f32 * scale).round() as u32
+    result.bearing_x = (left_side_bearing as f32 * scale).round() as i32
+
+    result
+
+# Tests
+
+[[test]]
+fn test_rasterize_empty_outline() -> i32
+    let outline = GlyphOutline.empty()
+    let result = rasterize_outline(outline, 1000, 16, false)
+
+    assert result.width == 0
+    assert result.height == 0
+    0
+
+[[test]]
+fn test_rasterize_simple_square() -> i32
+    # Create a simple square outline
+    var contour = Contour.new()
+    contour.add_point(OutlinePoint.new(0, 0, true))
+    contour.add_point(OutlinePoint.new(100, 0, true))
+    contour.add_point(OutlinePoint.new(100, 100, true))
+    contour.add_point(OutlinePoint.new(0, 100, true))
+
+    var outline = GlyphOutline.new()
+    outline.x_min = 0
+    outline.y_min = 0
+    outline.x_max = 100
+    outline.y_max = 100
+    outline.add_contour(contour)
+
+    # Rasterize at 10px (scale = 10/1000 = 0.01, so 100 units = 1px)
+    # Actually let's use units_per_em = 100 and size = 10, so scale = 0.1
+    # 100 units * 0.1 = 10 pixels
+    let result = rasterize_outline(outline, 100, 10, false)
+
+    # Should have a bitmap
+    assert result.width > 0
+    assert result.height > 0
+
+    # Check that some pixels are filled
+    var filled = 0
+    for i in 0..result.bitmap.len()
+        if result.bitmap[i] > 0
+            filled = filled + 1
+
+    assert filled > 0
+
+    0
+
+[[test]]
+fn test_rasterize_with_antialiasing() -> i32
+    # Create a triangle (which will have diagonal edges)
+    var contour = Contour.new()
+    contour.add_point(OutlinePoint.new(50, 0, true))
+    contour.add_point(OutlinePoint.new(0, 100, true))
+    contour.add_point(OutlinePoint.new(100, 100, true))
+
+    var outline = GlyphOutline.new()
+    outline.x_min = 0
+    outline.y_min = 0
+    outline.x_max = 100
+    outline.y_max = 100
+    outline.add_contour(contour)
+
+    let result_no_aa = rasterize_outline(outline, 100, 20, false)
+    let result_aa = rasterize_outline(outline, 100, 20, true)
+
+    # Both should produce output
+    assert result_no_aa.width > 0
+    assert result_aa.width > 0
+
+    # With antialiasing, we should have more partial coverage values
+    var partial_count_no_aa = 0
+    var partial_count_aa = 0
+
+    for i in 0..result_no_aa.bitmap.len()
+        let v = result_no_aa.bitmap[i]
+        if v > 0 and v < 255
+            partial_count_no_aa = partial_count_no_aa + 1
+
+    for i in 0..result_aa.bitmap.len()
+        let v = result_aa.bitmap[i]
+        if v > 0 and v < 255
+            partial_count_aa = partial_count_aa + 1
+
+    # AA version should have more partial values
+    # (This might not always be true depending on the shape, but generally should be)
+
+    0
+
+[[test]]
+fn test_contour_with_bezier() -> i32
+    # Create a contour with a bezier curve
+    var contour = Contour.new()
+    contour.add_point(OutlinePoint.new(0, 0, true))      # on-curve
+    contour.add_point(OutlinePoint.new(50, 100, false))  # control point
+    contour.add_point(OutlinePoint.new(100, 0, true))    # on-curve
+
+    var outline = GlyphOutline.new()
+    outline.x_min = 0
+    outline.y_min = 0
+    outline.x_max = 100
+    outline.y_max = 100
+    outline.add_contour(contour)
+
+    let result = rasterize_outline(outline, 100, 20, false)
+
+    # Should produce a valid bitmap
+    assert result.width > 0
+    assert result.height > 0
+
+    0

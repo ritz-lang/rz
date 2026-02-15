@@ -1,0 +1,179 @@
+# protocol.ritz - LSP Protocol Message Handling
+#
+# Handles JSON-RPC 2.0 messages for LSP communication.
+# Parses incoming requests and builds responses.
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+import ritzlib.memory
+import ritzlib.gvec
+import ritzlib.json
+
+# =============================================================================
+# JSON Value Types (mirrored from ritzlib/json.ritz)
+# =============================================================================
+
+const JSON_NULL: i32 = 0
+const JSON_BOOL: i32 = 1
+const JSON_NUMBER: i32 = 2
+const JSON_STRING: i32 = 3
+const JSON_ARRAY: i32 = 4
+const JSON_OBJECT: i32 = 5
+
+# =============================================================================
+# Message Types
+# =============================================================================
+
+const MSG_REQUEST: i32 = 1      # Has "id" and "method"
+const MSG_RESPONSE: i32 = 2     # Has "id" and "result" or "error"
+const MSG_NOTIFICATION: i32 = 3 # Has "method" but no "id"
+
+struct LspMessage
+    kind: i32               # MSG_* type
+    id: i64                 # Request/response ID (-1 if notification)
+    id_is_string: i32       # 1 if ID was a string
+    method: *u8             # Method name (owned, null for responses)
+    params: *JsonValue      # Parameters (borrowed from parsed JSON)
+    result: *JsonValue      # Result (for responses)
+    error_code: i32         # Error code (for error responses)
+    error_msg: *u8          # Error message (for error responses)
+    json_root: *JsonValue   # Root JSON (owned, for cleanup)
+
+pub fn lsp_message_new() -> LspMessage
+    return LspMessage {
+        kind: 0,
+        id: -1,
+        id_is_string: 0,
+        method: null,
+        params: null,
+        result: null,
+        error_code: 0,
+        error_msg: null,
+        json_root: null
+    }
+
+pub fn lsp_message_free(msg: *LspMessage)
+    if msg.method != null
+        free(msg.method)
+    if msg.json_root != null
+        json_free(msg.json_root)
+
+# =============================================================================
+# Message Parsing
+# =============================================================================
+
+# Parse a JSON-RPC message
+pub fn parse_message(json_str: *u8) -> LspMessage
+    var msg: LspMessage = lsp_message_new()
+
+    let len: i64 = strlen(json_str)
+    let result: JsonResult = json_parse(json_str, len)
+
+    if result.ok == 0
+        eprints_cstr(c"[ritz-lsp] JSON parse error at position ")
+        eprint_int(result.error_pos)
+        eprints_cstr(c"\n")
+        return msg
+
+    msg.json_root = result.value
+
+    # Check for "jsonrpc": "2.0"
+    let version: *JsonValue = json_get_field(result.value, c"jsonrpc")
+    if version == null
+        eprints_cstr(c"[ritz-lsp] Missing jsonrpc field\n")
+        return msg
+
+    # Get ID if present
+    let id_val: *JsonValue = json_get_field(result.value, c"id")
+    if id_val != null
+        if id_val.kind == JSON_NUMBER
+            msg.id = id_val.num_val
+        else if id_val.kind == JSON_STRING
+            msg.id_is_string = 1
+            # For string IDs, store as number (hash or just use 0)
+            msg.id = 0
+
+    # Get method if present
+    let method_val: *JsonValue = json_get_field(result.value, c"method")
+    if method_val != null && method_val.kind == JSON_STRING
+        # Copy method string
+        let method_len: i64 = method_val.str_len
+        msg.method = malloc(method_len + 1)
+        if msg.method != null
+            memcpy(msg.method, method_val.str_val, method_len + 1)
+
+    # Get params if present
+    msg.params = json_get_field(result.value, c"params")
+
+    # Get result if present (for responses)
+    msg.result = json_get_field(result.value, c"result")
+
+    # Determine message type
+    if msg.method != null
+        if msg.id >= 0 || id_val != null
+            msg.kind = MSG_REQUEST
+        else
+            msg.kind = MSG_NOTIFICATION
+    else if msg.result != null || json_get_field(result.value, c"error") != null
+        msg.kind = MSG_RESPONSE
+
+    return msg
+
+# =============================================================================
+# Response Building
+# =============================================================================
+
+# Build a success response
+pub fn build_response(id: i64, result_json: *u8, buf: *Vec<u8>)
+    vec_clear<u8>(buf)
+    vec_push_str(buf, c"{\"jsonrpc\":\"2.0\",\"id\":")
+
+    # Add ID
+    var id_buf: [32]u8
+    itoa(id, &id_buf[0])
+    vec_push_str(buf, &id_buf[0])
+
+    vec_push_str(buf, c",\"result\":")
+    vec_push_str(buf, result_json)
+    vec_push<u8>(buf, '}')
+
+# Build an error response
+pub fn build_error_response(id: i64, code: i32, message: *u8, buf: *Vec<u8>)
+    vec_clear<u8>(buf)
+    vec_push_str(buf, c"{\"jsonrpc\":\"2.0\",\"id\":")
+
+    var id_buf: [32]u8
+    itoa(id, &id_buf[0])
+    vec_push_str(buf, &id_buf[0])
+
+    vec_push_str(buf, c",\"error\":{\"code\":")
+
+    var code_buf: [32]u8
+    itoa(code as i64, &code_buf[0])
+    vec_push_str(buf, &code_buf[0])
+
+    vec_push_str(buf, c",\"message\":\"")
+    vec_push_str(buf, message)
+    vec_push_str(buf, c"\"}}")
+
+# Build a notification (no ID, no response expected)
+pub fn build_notification(method: *u8, params_json: *u8, buf: *Vec<u8>)
+    vec_clear<u8>(buf)
+    vec_push_str(buf, c"{\"jsonrpc\":\"2.0\",\"method\":\"")
+    vec_push_str(buf, method)
+    vec_push_str(buf, c"\",\"params\":")
+    vec_push_str(buf, params_json)
+    vec_push<u8>(buf, '}')
+
+# =============================================================================
+# LSP Error Codes
+# =============================================================================
+
+const LSP_ERR_PARSE: i32 = -32700
+const LSP_ERR_INVALID_REQUEST: i32 = -32600
+const LSP_ERR_METHOD_NOT_FOUND: i32 = -32601
+const LSP_ERR_INVALID_PARAMS: i32 = -32602
+const LSP_ERR_INTERNAL: i32 = -32603
+const LSP_ERR_SERVER_NOT_INITIALIZED: i32 = -32002
+const LSP_ERR_REQUEST_CANCELLED: i32 = -32800

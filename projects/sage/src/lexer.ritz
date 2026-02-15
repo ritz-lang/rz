@@ -1,0 +1,574 @@
+# JavaScript Lexer
+# Transforms source text into a stream of tokens
+
+import ritzlib.strview
+import ritzlib.gvec
+import src.token
+
+# Lexer state
+struct Lexer
+    source: StrView     # Source text (zero-copy reference)
+    pos: i64            # Current position in source
+    line: i64           # Current line number (1-indexed)
+    column: i64         # Current column number (1-indexed)
+    line_start: i64     # Position where current line started
+
+# Create a new lexer for the given source
+fn lexer_new(source: StrView) -> Lexer
+    Lexer {
+        source: source,
+        pos: 0,
+        line: 1,
+        column: 1,
+        line_start: 0
+    }
+
+# Check if we've reached the end of input
+fn lexer_is_eof(lex: @Lexer) -> i32
+    if lex.pos >= strview_len(@lex.source)
+        return 1
+    0
+
+# Peek at the current character without consuming it
+fn lexer_peek(lex: @Lexer) -> u8
+    if lexer_is_eof(lex) == 1
+        return 0
+    strview_get(@lex.source, lex.pos)
+
+# Peek at the next character (one ahead)
+fn lexer_peek_next(lex: @Lexer) -> u8
+    let next_pos = lex.pos + 1
+    if next_pos >= strview_len(@lex.source)
+        return 0
+    strview_get(@lex.source, next_pos)
+
+# Peek at character n positions ahead
+fn lexer_peek_n(lex: @Lexer, n: i64) -> u8
+    let target_pos = lex.pos + n
+    if target_pos >= strview_len(@lex.source)
+        return 0
+    strview_get(@lex.source, target_pos)
+
+# Advance the lexer by one character
+fn lexer_advance(lex: @&Lexer) -> u8
+    let c = lexer_peek(lex)
+    lex.pos = lex.pos + 1
+    lex.column = lex.column + 1
+    c
+
+# Advance if current char matches expected
+fn lexer_match(lex: @&Lexer, expected: u8) -> i32
+    if lexer_is_eof(lex) == 1
+        return 0
+    if lexer_peek(lex) != expected
+        return 0
+    lexer_advance(lex)
+    1
+
+# Skip whitespace and comments
+fn lexer_skip_whitespace(lex: @&Lexer)
+    while lexer_is_eof(lex) == 0
+        let c = lexer_peek(lex)
+
+        # Space, tab, carriage return
+        if c == 32 or c == 9 or c == 13
+            lexer_advance(lex)
+        # Newline
+        else if c == 10
+            lexer_advance(lex)
+            lex.line = lex.line + 1
+            lex.column = 1
+            lex.line_start = lex.pos
+        # Comments
+        else if c == 47  # '/'
+            let next = lexer_peek_next(lex)
+            # Single-line comment
+            if next == 47
+                lexer_advance(lex)
+                lexer_advance(lex)
+                while lexer_is_eof(lex) == 0 and lexer_peek(lex) != 10
+                    lexer_advance(lex)
+            # Multi-line comment
+            else if next == 42  # '*'
+                lexer_advance(lex)
+                lexer_advance(lex)
+                while lexer_is_eof(lex) == 0
+                    if lexer_peek(lex) == 42 and lexer_peek_next(lex) == 47
+                        lexer_advance(lex)
+                        lexer_advance(lex)
+                        break
+                    if lexer_peek(lex) == 10
+                        lex.line = lex.line + 1
+                        lex.column = 0
+                        lex.line_start = lex.pos + 1
+                    lexer_advance(lex)
+            else
+                return
+        else
+            return
+
+# Check if character is a digit
+fn is_digit(c: u8) -> i32
+    if c >= 48 and c <= 57
+        return 1
+    0
+
+# Check if character is a letter or underscore
+fn is_alpha(c: u8) -> i32
+    if c >= 65 and c <= 90   # A-Z
+        return 1
+    if c >= 97 and c <= 122  # a-z
+        return 1
+    if c == 95  # _
+        return 1
+    if c == 36  # $
+        return 1
+    0
+
+# Check if character is alphanumeric or underscore
+fn is_alnum(c: u8) -> i32
+    if is_alpha(c) == 1
+        return 1
+    is_digit(c)
+
+# Scan a number literal
+fn lexer_scan_number(lex: @&Lexer, start: i64, start_line: i64, start_col: i64) -> Token
+    # Integer part
+    while is_digit(lexer_peek(lex)) == 1
+        lexer_advance(lex)
+
+    # Decimal part
+    if lexer_peek(lex) == 46 and is_digit(lexer_peek_next(lex)) == 1
+        lexer_advance(lex)  # consume '.'
+        while is_digit(lexer_peek(lex)) == 1
+            lexer_advance(lex)
+
+    # Exponent part
+    let c = lexer_peek(lex)
+    if c == 101 or c == 69  # 'e' or 'E'
+        lexer_advance(lex)
+        let sign = lexer_peek(lex)
+        if sign == 43 or sign == 45  # '+' or '-'
+            lexer_advance(lex)
+        while is_digit(lexer_peek(lex)) == 1
+            lexer_advance(lex)
+
+    token_new(TOKEN_NUMBER, start, lex.pos - start, start_line, start_col)
+
+# Scan a string literal
+fn lexer_scan_string(lex: @&Lexer, quote: u8, start: i64, start_line: i64, start_col: i64) -> Token
+    while lexer_is_eof(lex) == 0
+        let c = lexer_peek(lex)
+
+        # End of string
+        if c == quote
+            lexer_advance(lex)
+            return token_new(TOKEN_STRING, start, lex.pos - start, start_line, start_col)
+
+        # Escape sequence
+        if c == 92  # '\'
+            lexer_advance(lex)
+            if lexer_is_eof(lex) == 0
+                lexer_advance(lex)
+        # Newline (unterminated string)
+        else if c == 10
+            return token_error(start, start_line, start_col)
+        else
+            lexer_advance(lex)
+
+    # Unterminated string
+    token_error(start, start_line, start_col)
+
+# Check if identifier matches a keyword
+fn check_keyword(source: StrView, start: i64, length: i64) -> i32
+    # Extract the identifier text
+    let text = strview_slice(@source, start, start + length)
+
+    # Two-character keywords
+    if length == 2
+        if strview_eq_cstr(@text, c"if")
+            return TOKEN_IF
+        if strview_eq_cstr(@text, c"in")
+            return TOKEN_IN
+        if strview_eq_cstr(@text, c"of")
+            return TOKEN_OF
+        if strview_eq_cstr(@text, c"do")
+            return TOKEN_DO
+
+    # Three-character keywords
+    if length == 3
+        if strview_eq_cstr(@text, c"let")
+            return TOKEN_LET
+        if strview_eq_cstr(@text, c"var")
+            return TOKEN_VAR
+        if strview_eq_cstr(@text, c"for")
+            return TOKEN_FOR
+        if strview_eq_cstr(@text, c"new")
+            return TOKEN_NEW
+        if strview_eq_cstr(@text, c"try")
+            return TOKEN_TRY
+        if strview_eq_cstr(@text, c"get")
+            return TOKEN_GET
+        if strview_eq_cstr(@text, c"set")
+            return TOKEN_SET
+
+    # Four-character keywords
+    if length == 4
+        if strview_eq_cstr(@text, c"else")
+            return TOKEN_ELSE
+        if strview_eq_cstr(@text, c"true")
+            return TOKEN_TRUE
+        if strview_eq_cstr(@text, c"null")
+            return TOKEN_NULL
+        if strview_eq_cstr(@text, c"this")
+            return TOKEN_THIS
+        if strview_eq_cstr(@text, c"void")
+            return TOKEN_VOID
+        if strview_eq_cstr(@text, c"with")
+            return TOKEN_WITH
+        if strview_eq_cstr(@text, c"case")
+            return TOKEN_CASE
+
+    # Five-character keywords
+    if length == 5
+        if strview_eq_cstr(@text, c"const")
+            return TOKEN_CONST
+        if strview_eq_cstr(@text, c"while")
+            return TOKEN_WHILE
+        if strview_eq_cstr(@text, c"false")
+            return TOKEN_FALSE
+        if strview_eq_cstr(@text, c"break")
+            return TOKEN_BREAK
+        if strview_eq_cstr(@text, c"catch")
+            return TOKEN_CATCH
+        if strview_eq_cstr(@text, c"class")
+            return TOKEN_CLASS
+        if strview_eq_cstr(@text, c"super")
+            return TOKEN_SUPER
+        if strview_eq_cstr(@text, c"throw")
+            return TOKEN_THROW
+        if strview_eq_cstr(@text, c"yield")
+            return TOKEN_YIELD
+        if strview_eq_cstr(@text, c"async")
+            return TOKEN_ASYNC
+        if strview_eq_cstr(@text, c"await")
+            return TOKEN_AWAIT
+
+    # Six-character keywords
+    if length == 6
+        if strview_eq_cstr(@text, c"return")
+            return TOKEN_RETURN
+        if strview_eq_cstr(@text, c"typeof")
+            return TOKEN_TYPEOF
+        if strview_eq_cstr(@text, c"delete")
+            return TOKEN_DELETE
+        if strview_eq_cstr(@text, c"switch")
+            return TOKEN_SWITCH
+        if strview_eq_cstr(@text, c"export")
+            return TOKEN_EXPORT
+        if strview_eq_cstr(@text, c"import")
+            return TOKEN_IMPORT
+        if strview_eq_cstr(@text, c"static")
+            return TOKEN_STATIC
+
+    # Seven-character keywords
+    if length == 7
+        if strview_eq_cstr(@text, c"default")
+            return TOKEN_DEFAULT
+        if strview_eq_cstr(@text, c"extends")
+            return TOKEN_EXTENDS
+        if strview_eq_cstr(@text, c"finally")
+            return TOKEN_FINALLY
+
+    # Eight-character keywords
+    if length == 8
+        if strview_eq_cstr(@text, c"function")
+            return TOKEN_FUNCTION
+        if strview_eq_cstr(@text, c"continue")
+            return TOKEN_CONTINUE
+        if strview_eq_cstr(@text, c"debugger")
+            return TOKEN_DEBUGGER
+
+    # Nine-character keywords
+    if length == 9
+        if strview_eq_cstr(@text, c"undefined")
+            return TOKEN_UNDEFINED
+
+    # Ten-character keywords
+    if length == 10
+        if strview_eq_cstr(@text, c"instanceof")
+            return TOKEN_INSTANCEOF
+
+    TOKEN_IDENTIFIER
+
+# Scan an identifier or keyword
+fn lexer_scan_identifier(lex: @&Lexer, start: i64, start_line: i64, start_col: i64) -> Token
+    while is_alnum(lexer_peek(lex)) == 1
+        lexer_advance(lex)
+
+    let end_pos = lex.pos
+    let length = end_pos - start
+    let typ = check_keyword(lex.source, start, length)
+    token_new(typ, start, end_pos - start, start_line, start_col)
+
+# Scan the next token
+fn lexer_next(lex: @&Lexer) -> Token
+    lexer_skip_whitespace(lex)
+
+    if lexer_is_eof(lex) == 1
+        return token_eof(lex.pos, lex.line, lex.column)
+
+    let start = lex.pos
+    let start_line = lex.line
+    let start_col = lex.column
+    let c = lexer_advance(lex)
+
+    # Numbers
+    if is_digit(c) == 1
+        return lexer_scan_number(lex, start, start_line, start_col)
+
+    # Identifiers and keywords
+    if is_alpha(c) == 1
+        return lexer_scan_identifier(lex, start, start_line, start_col)
+
+    # Strings
+    if c == 34 or c == 39  # '"' or '\''
+        return lexer_scan_string(lex, c, start, start_line, start_col)
+
+    # Single-character tokens
+    if c == 40  # '('
+        return token_new(TOKEN_LPAREN, start, 1, start_line, start_col)
+    if c == 41  # ')'
+        return token_new(TOKEN_RPAREN, start, 1, start_line, start_col)
+    if c == 123  # '{'
+        return token_new(TOKEN_LBRACE, start, 1, start_line, start_col)
+    if c == 125  # '}'
+        return token_new(TOKEN_RBRACE, start, 1, start_line, start_col)
+    if c == 91  # '['
+        return token_new(TOKEN_LBRACKET, start, 1, start_line, start_col)
+    if c == 93  # ']'
+        return token_new(TOKEN_RBRACKET, start, 1, start_line, start_col)
+    if c == 59  # ';'
+        return token_new(TOKEN_SEMICOLON, start, 1, start_line, start_col)
+    if c == 44  # ','
+        return token_new(TOKEN_COMMA, start, 1, start_line, start_col)
+    if c == 58  # ':'
+        return token_new(TOKEN_COLON, start, 1, start_line, start_col)
+    if c == 126  # '~'
+        return token_new(TOKEN_TILDE, start, 1, start_line, start_col)
+
+    # Dot or ellipsis
+    if c == 46  # '.'
+        if lexer_peek(lex) == 46 and lexer_peek_next(lex) == 46
+            lexer_advance(lex)
+            lexer_advance(lex)
+            return token_new(TOKEN_ELLIPSIS, start, 3, start_line, start_col)
+        return token_new(TOKEN_DOT, start, 1, start_line, start_col)
+
+    # Plus operators
+    if c == 43  # '+'
+        if lexer_match(lex, 43) == 1  # '++'
+            return token_new(TOKEN_PLUS_PLUS, start, 2, start_line, start_col)
+        if lexer_match(lex, 61) == 1  # '+='
+            return token_new(TOKEN_PLUS_EQ, start, 2, start_line, start_col)
+        return token_new(TOKEN_PLUS, start, 1, start_line, start_col)
+
+    # Minus operators
+    if c == 45  # '-'
+        if lexer_match(lex, 45) == 1  # '--'
+            return token_new(TOKEN_MINUS_MINUS, start, 2, start_line, start_col)
+        if lexer_match(lex, 61) == 1  # '-='
+            return token_new(TOKEN_MINUS_EQ, start, 2, start_line, start_col)
+        return token_new(TOKEN_MINUS, start, 1, start_line, start_col)
+
+    # Star operators
+    if c == 42  # '*'
+        if lexer_match(lex, 42) == 1  # '**'
+            if lexer_match(lex, 61) == 1  # '**='
+                return token_new(TOKEN_STAR_STAR_EQ, start, 3, start_line, start_col)
+            return token_new(TOKEN_STAR_STAR, start, 2, start_line, start_col)
+        if lexer_match(lex, 61) == 1  # '*='
+            return token_new(TOKEN_STAR_EQ, start, 2, start_line, start_col)
+        return token_new(TOKEN_STAR, start, 1, start_line, start_col)
+
+    # Slash operators
+    if c == 47  # '/'
+        if lexer_match(lex, 61) == 1  # '/='
+            return token_new(TOKEN_SLASH_EQ, start, 2, start_line, start_col)
+        return token_new(TOKEN_SLASH, start, 1, start_line, start_col)
+
+    # Percent operators
+    if c == 37  # '%'
+        if lexer_match(lex, 61) == 1  # '%='
+            return token_new(TOKEN_PERCENT_EQ, start, 2, start_line, start_col)
+        return token_new(TOKEN_PERCENT, start, 1, start_line, start_col)
+
+    # Equals operators
+    if c == 61  # '='
+        if lexer_match(lex, 61) == 1  # '=='
+            if lexer_match(lex, 61) == 1  # '==='
+                return token_new(TOKEN_EQ_EQ_EQ, start, 3, start_line, start_col)
+            return token_new(TOKEN_EQ_EQ, start, 2, start_line, start_col)
+        if lexer_match(lex, 62) == 1  # '=>'
+            return token_new(TOKEN_ARROW, start, 2, start_line, start_col)
+        return token_new(TOKEN_EQ, start, 1, start_line, start_col)
+
+    # Bang operators
+    if c == 33  # '!'
+        if lexer_match(lex, 61) == 1  # '!='
+            if lexer_match(lex, 61) == 1  # '!=='
+                return token_new(TOKEN_BANG_EQ_EQ, start, 3, start_line, start_col)
+            return token_new(TOKEN_BANG_EQ, start, 2, start_line, start_col)
+        return token_new(TOKEN_BANG, start, 1, start_line, start_col)
+
+    # Less-than operators
+    if c == 60  # '<'
+        if lexer_match(lex, 60) == 1  # '<<'
+            if lexer_match(lex, 61) == 1  # '<<='
+                return token_new(TOKEN_LT_LT_EQ, start, 3, start_line, start_col)
+            return token_new(TOKEN_LT_LT, start, 2, start_line, start_col)
+        if lexer_match(lex, 61) == 1  # '<='
+            return token_new(TOKEN_LT_EQ, start, 2, start_line, start_col)
+        return token_new(TOKEN_LT, start, 1, start_line, start_col)
+
+    # Greater-than operators
+    if c == 62  # '>'
+        if lexer_match(lex, 62) == 1  # '>>'
+            if lexer_match(lex, 62) == 1  # '>>>'
+                if lexer_match(lex, 61) == 1  # '>>>='
+                    return token_new(TOKEN_GT_GT_GT_EQ, start, 4, start_line, start_col)
+                return token_new(TOKEN_GT_GT_GT, start, 3, start_line, start_col)
+            if lexer_match(lex, 61) == 1  # '>>='
+                return token_new(TOKEN_GT_GT_EQ, start, 3, start_line, start_col)
+            return token_new(TOKEN_GT_GT, start, 2, start_line, start_col)
+        if lexer_match(lex, 61) == 1  # '>='
+            return token_new(TOKEN_GT_EQ, start, 2, start_line, start_col)
+        return token_new(TOKEN_GT, start, 1, start_line, start_col)
+
+    # Ampersand operators
+    if c == 38  # '&'
+        if lexer_match(lex, 38) == 1  # '&&'
+            if lexer_match(lex, 61) == 1  # '&&='
+                return token_new(TOKEN_AMP_AMP_EQ, start, 3, start_line, start_col)
+            return token_new(TOKEN_AMP_AMP, start, 2, start_line, start_col)
+        if lexer_match(lex, 61) == 1  # '&='
+            return token_new(TOKEN_AMP_EQ, start, 2, start_line, start_col)
+        return token_new(TOKEN_AMP, start, 1, start_line, start_col)
+
+    # Pipe operators
+    if c == 124  # '|'
+        if lexer_match(lex, 124) == 1  # '||'
+            if lexer_match(lex, 61) == 1  # '||='
+                return token_new(TOKEN_PIPE_PIPE_EQ, start, 3, start_line, start_col)
+            return token_new(TOKEN_PIPE_PIPE, start, 2, start_line, start_col)
+        if lexer_match(lex, 61) == 1  # '|='
+            return token_new(TOKEN_PIPE_EQ, start, 2, start_line, start_col)
+        return token_new(TOKEN_PIPE, start, 1, start_line, start_col)
+
+    # Caret operators
+    if c == 94  # '^'
+        if lexer_match(lex, 61) == 1  # '^='
+            return token_new(TOKEN_CARET_EQ, start, 2, start_line, start_col)
+        return token_new(TOKEN_CARET, start, 1, start_line, start_col)
+
+    # Question mark operators
+    if c == 63  # '?'
+        if lexer_match(lex, 63) == 1  # '??'
+            if lexer_match(lex, 61) == 1  # '??='
+                return token_new(TOKEN_QUESTION_QUESTION_EQ, start, 3, start_line, start_col)
+            return token_new(TOKEN_QUESTION_QUESTION, start, 2, start_line, start_col)
+        if lexer_match(lex, 46) == 1  # '?.'
+            return token_new(TOKEN_OPTIONAL_CHAIN, start, 2, start_line, start_col)
+        return token_new(TOKEN_QUESTION, start, 1, start_line, start_col)
+
+    # Unknown character
+    token_error(start, start_line, start_col)
+
+# Tokenize entire source into a vector of tokens
+fn lexer_tokenize(source: StrView) -> Vec<Token>
+    var lex = lexer_new(source)
+    var tokens: Vec<Token> = vec_new<Token>()
+
+    while 1 == 1
+        let tok = lexer_next(@&lex)
+        let tok_typ = tok.typ
+        vec_push<Token>(@&tokens, tok)
+        if tok_typ == TOKEN_EOF or tok_typ == TOKEN_ERROR
+            break
+
+    tokens
+
+# Get the text of a token from the source
+fn token_text(source: StrView, tok: @Token) -> StrView
+    strview_slice(@source, tok.start, tok.start + tok.length)
+
+# Parse a StrView as a floating point number
+# Simple implementation using lookup table to avoid i64->f64 cast (not supported in ritz0 yet)
+pub fn strview_to_f64(s: @StrView) -> f64
+    var result: f64 = 0.0
+    let len: i64 = strview_len(s)
+
+    for i in 0..len
+        let c: u8 = strview_get(s, i)
+        # Check if digit '0'-'9' (48-57)
+        if c == 48
+            result = result * 10.0
+        else if c == 49
+            result = result * 10.0 + 1.0
+        else if c == 50
+            result = result * 10.0 + 2.0
+        else if c == 51
+            result = result * 10.0 + 3.0
+        else if c == 52
+            result = result * 10.0 + 4.0
+        else if c == 53
+            result = result * 10.0 + 5.0
+        else if c == 54
+            result = result * 10.0 + 6.0
+        else if c == 55
+            result = result * 10.0 + 7.0
+        else if c == 56
+            result = result * 10.0 + 8.0
+        else if c == 57
+            result = result * 10.0 + 9.0
+        else if c == 46
+            # Decimal point - parse fractional part
+            var frac: f64 = 0.1
+            for j in (i + 1)..len
+                let c2: u8 = strview_get(s, j)
+                if c2 == 48
+                    frac = frac * 0.1
+                else if c2 == 49
+                    result = result + frac
+                    frac = frac * 0.1
+                else if c2 == 50
+                    result = result + frac * 2.0
+                    frac = frac * 0.1
+                else if c2 == 51
+                    result = result + frac * 3.0
+                    frac = frac * 0.1
+                else if c2 == 52
+                    result = result + frac * 4.0
+                    frac = frac * 0.1
+                else if c2 == 53
+                    result = result + frac * 5.0
+                    frac = frac * 0.1
+                else if c2 == 54
+                    result = result + frac * 6.0
+                    frac = frac * 0.1
+                else if c2 == 55
+                    result = result + frac * 7.0
+                    frac = frac * 0.1
+                else if c2 == 56
+                    result = result + frac * 8.0
+                    frac = frac * 0.1
+                else if c2 == 57
+                    result = result + frac * 9.0
+                    frac = frac * 0.1
+                else
+                    break
+            break
+        else
+            break
+
+    result

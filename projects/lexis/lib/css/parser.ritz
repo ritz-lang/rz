@@ -1,0 +1,647 @@
+# lib/css/parser.ritz - CSS Parser
+#
+# Parses CSS tokens into stylesheet, rules, selectors, and declarations.
+
+import lib.css.token
+import lib.css.tokenizer { CssTokenizer, css_tokenizer_new, css_tokenizer_next }
+import lib.css.selector
+import lib.css.value
+import lib.css.rule
+
+# =============================================================================
+# Parser State
+# =============================================================================
+
+pub struct CssParser
+    tokenizer: CssTokenizer
+    current: token.CssToken
+    rule_order: u32
+
+# =============================================================================
+# Initialization
+# =============================================================================
+
+pub fn css_parser_new(input: StrView) -> CssParser
+    var p: CssParser
+    p.tokenizer = css_tokenizer_new(input)
+    p.current = css_tokenizer_next(p.tokenizer)
+    p.rule_order = 0
+    p
+
+# =============================================================================
+# Token Helpers
+# =============================================================================
+
+fn advance(p:& CssParser)
+    p.current = css_tokenizer_next(p.tokenizer)
+
+fn skip_whitespace(p:& CssParser)
+    while p.current.kind == token.CSS_TOKEN_WHITESPACE
+        advance(p)
+
+fn expect(p:& CssParser, kind: i32) -> i32
+    if p.current.kind == kind
+        advance(p)
+        return 1
+    0
+
+# =============================================================================
+# Main Parsing Entry Point
+# =============================================================================
+
+pub fn css_parse_stylesheet(p:& CssParser) -> rule.Stylesheet
+    var sheet = rule.stylesheet_new()
+
+    loop
+        skip_whitespace(p)
+
+        if p.current.kind == token.CSS_TOKEN_EOF
+            break
+
+        if p.current.kind == token.CSS_TOKEN_CDO or p.current.kind == token.CSS_TOKEN_CDC
+            # Skip HTML comment markers
+            advance(p)
+            continue
+
+        if p.current.kind == token.CSS_TOKEN_AT_KEYWORD
+            # Parse at-rule
+            let at_rule = parse_at_rule(p)
+            # For now, skip at-rules
+            continue
+
+        # Try to parse a style rule
+        let style_rule = parse_style_rule(p)
+        if style_rule.selectors.selector_count > 0
+            let css_rule = rule.css_rule_style(style_rule.selectors, style_rule.declarations, p.rule_order)
+            rule.stylesheet_add_rule(sheet, css_rule)
+            p.rule_order = p.rule_order + 1
+
+    sheet
+
+# =============================================================================
+# Style Rule Parsing
+# =============================================================================
+
+fn parse_style_rule(p:& CssParser) -> rule.StyleRule
+    let selectors = parse_selector_list(p)
+
+    skip_whitespace(p)
+
+    var declarations = rule.declaration_block_new()
+
+    if p.current.kind == token.CSS_TOKEN_OPEN_CURLY
+        advance(p)
+        declarations = parse_declaration_block(p)
+
+        skip_whitespace(p)
+        if p.current.kind == token.CSS_TOKEN_CLOSE_CURLY
+            advance(p)
+
+    rule.style_rule_new(selectors, declarations, 0)
+
+# =============================================================================
+# Selector Parsing
+# =============================================================================
+
+fn parse_selector_list(p:& CssParser) -> selector.SelectorList
+    var list = selector.selector_list_new()
+
+    loop
+        skip_whitespace(p)
+
+        let complex = parse_complex_selector(p)
+        if complex.compound_count > 0
+            selector.selector_list_add(list, complex)
+
+        skip_whitespace(p)
+
+        if p.current.kind == token.CSS_TOKEN_COMMA
+            advance(p)
+            continue
+
+        # End of selector list (hit { or other)
+        break
+
+    list
+
+fn parse_complex_selector(p:& CssParser) -> selector.ComplexSelector
+    var complex = selector.complex_selector_new()
+
+    loop
+        skip_whitespace(p)
+
+        let compound = parse_compound_selector(p)
+        if compound.simple_count == 0
+            break
+
+        # Determine combinator
+        var combinator = selector.COMBINATOR_NONE
+
+        skip_whitespace(p)
+
+        if p.current.kind == token.CSS_TOKEN_DELIM
+            if p.current.delim == 62  # >
+                combinator = selector.COMBINATOR_CHILD
+                advance(p)
+            else if p.current.delim == 43  # +
+                combinator = selector.COMBINATOR_NEXT_SIBLING
+                advance(p)
+            else if p.current.delim == 126  # ~
+                combinator = selector.COMBINATOR_SUBSEQUENT_SIBLING
+                advance(p)
+            else
+                # Some other delim, end of selector
+                selector.complex_selector_add(complex, compound, selector.COMBINATOR_NONE)
+                break
+        else if p.current.kind == token.CSS_TOKEN_WHITESPACE
+            # Whitespace could be descendant combinator or just spacing
+            skip_whitespace(p)
+            # Check if next is another selector component
+            if is_selector_start(p) == 1
+                combinator = selector.COMBINATOR_DESCENDANT
+            else
+                selector.complex_selector_add(complex, compound, selector.COMBINATOR_NONE)
+                break
+
+        selector.complex_selector_add(complex, compound, combinator)
+
+        # If no combinator and no whitespace, we're done
+        if combinator == selector.COMBINATOR_NONE
+            break
+
+    complex
+
+fn parse_compound_selector(p:& CssParser) -> selector.CompoundSelector
+    var compound = selector.compound_selector_new()
+
+    loop
+        skip_whitespace(p)
+
+        if p.current.kind == token.CSS_TOKEN_IDENT
+            # Type selector
+            let simple = selector.simple_selector_type(token.css_token_value_str(p.current))
+            selector.compound_selector_add(compound, simple)
+            advance(p)
+
+        else if p.current.kind == token.CSS_TOKEN_DELIM and p.current.delim == 42  # *
+            # Universal selector
+            let simple = selector.simple_selector_universal()
+            selector.compound_selector_add(compound, simple)
+            advance(p)
+
+        else if p.current.kind == token.CSS_TOKEN_HASH
+            # ID selector
+            let simple = selector.simple_selector_id(token.css_token_value_str(p.current))
+            selector.compound_selector_add(compound, simple)
+            advance(p)
+
+        else if p.current.kind == token.CSS_TOKEN_DELIM and p.current.delim == 46  # .
+            # Class selector
+            advance(p)
+            if p.current.kind == token.CSS_TOKEN_IDENT
+                let simple = selector.simple_selector_class(token.css_token_value_str(p.current))
+                selector.compound_selector_add(compound, simple)
+                advance(p)
+
+        else if p.current.kind == token.CSS_TOKEN_OPEN_SQUARE
+            # Attribute selector
+            let simple = parse_attribute_selector(p)
+            selector.compound_selector_add(compound, simple)
+
+        else if p.current.kind == token.CSS_TOKEN_COLON
+            # Pseudo-class or pseudo-element
+            advance(p)
+            if p.current.kind == token.CSS_TOKEN_COLON
+                # ::pseudo-element
+                advance(p)
+                if p.current.kind == token.CSS_TOKEN_IDENT
+                    var simple = selector.simple_selector_universal()
+                    simple.kind = selector.SELECTOR_PSEUDO_ELEMENT
+                    copy_token_value(simple, p.current)
+                    selector.compound_selector_add(compound, simple)
+                    advance(p)
+            else if p.current.kind == token.CSS_TOKEN_IDENT
+                # :pseudo-class
+                var simple = selector.simple_selector_universal()
+                simple.kind = selector.SELECTOR_PSEUDO_CLASS
+                copy_token_value(simple, p.current)
+                selector.compound_selector_add(compound, simple)
+                advance(p)
+            else if p.current.kind == token.CSS_TOKEN_FUNCTION
+                # :pseudo-class(...)
+                var simple = selector.simple_selector_universal()
+                simple.kind = selector.SELECTOR_PSEUDO_CLASS
+                copy_token_value(simple, p.current)
+                advance(p)
+                # Skip function contents for now
+                skip_until_close_paren(p)
+                selector.compound_selector_add(compound, simple)
+
+        else
+            break
+
+    compound
+
+fn parse_attribute_selector(p:& CssParser) -> selector.SimpleSelector
+    var simple = selector.simple_selector_universal()
+    simple.kind = selector.SELECTOR_ATTRIBUTE
+
+    advance(p)  # [
+    skip_whitespace(p)
+
+    if p.current.kind == token.CSS_TOKEN_IDENT
+        copy_token_value(simple, p.current)
+        advance(p)
+
+    skip_whitespace(p)
+
+    # Check for matcher
+    simple.attr_matcher = selector.ATTR_EXISTS
+
+    if p.current.kind == token.CSS_TOKEN_DELIM
+        if p.current.delim == 61  # =
+            simple.attr_matcher = selector.ATTR_EQUALS
+            advance(p)
+        else if p.current.delim == 126  # ~
+            advance(p)
+            if p.current.kind == token.CSS_TOKEN_DELIM and p.current.delim == 61
+                simple.attr_matcher = selector.ATTR_INCLUDES
+                advance(p)
+        else if p.current.delim == 124  # |
+            advance(p)
+            if p.current.kind == token.CSS_TOKEN_DELIM and p.current.delim == 61
+                simple.attr_matcher = selector.ATTR_DASH_MATCH
+                advance(p)
+        else if p.current.delim == 94  # ^
+            advance(p)
+            if p.current.kind == token.CSS_TOKEN_DELIM and p.current.delim == 61
+                simple.attr_matcher = selector.ATTR_PREFIX
+                advance(p)
+        else if p.current.delim == 36  # $
+            advance(p)
+            if p.current.kind == token.CSS_TOKEN_DELIM and p.current.delim == 61
+                simple.attr_matcher = selector.ATTR_SUFFIX
+                advance(p)
+        else if p.current.delim == 42  # *
+            advance(p)
+            if p.current.kind == token.CSS_TOKEN_DELIM and p.current.delim == 61
+                simple.attr_matcher = selector.ATTR_SUBSTRING
+                advance(p)
+
+    skip_whitespace(p)
+
+    # Get value if present
+    if simple.attr_matcher != selector.ATTR_EXISTS
+        if p.current.kind == token.CSS_TOKEN_IDENT or p.current.kind == token.CSS_TOKEN_STRING
+            copy_token_to_attr_value(simple, p.current)
+            advance(p)
+
+    skip_whitespace(p)
+
+    # Check for case-insensitive flag
+    if p.current.kind == token.CSS_TOKEN_IDENT
+        let s = token.css_token_value_str(p.current)
+        if s == "i" or s == "I"
+            simple.attr_case_insensitive = 1
+            advance(p)
+
+    skip_whitespace(p)
+
+    if p.current.kind == token.CSS_TOKEN_CLOSE_SQUARE
+        advance(p)
+
+    simple
+
+# =============================================================================
+# Declaration Block Parsing
+# =============================================================================
+
+fn parse_declaration_block(p:& CssParser) -> rule.DeclarationBlock
+    var block = rule.declaration_block_new()
+
+    loop
+        skip_whitespace(p)
+
+        if p.current.kind == token.CSS_TOKEN_CLOSE_CURLY or p.current.kind == token.CSS_TOKEN_EOF
+            break
+
+        let decl = parse_declaration(p)
+        if decl.property_len > 0
+            rule.declaration_block_add(block, decl)
+
+        skip_whitespace(p)
+
+        # Expect semicolon or end of block
+        if p.current.kind == token.CSS_TOKEN_SEMICOLON
+            advance(p)
+
+    block
+
+fn parse_declaration(p:& CssParser) -> rule.Declaration
+    var decl: rule.Declaration
+    decl.property_len = 0
+    decl.important = 0
+
+    skip_whitespace(p)
+
+    # Property name
+    if p.current.kind != token.CSS_TOKEN_IDENT
+        # Skip to next semicolon or close curly
+        skip_invalid_declaration(p)
+        return decl
+
+    let prop = token.css_token_value_str(p.current)
+    copy_property_to_decl(decl, prop)
+    advance(p)
+
+    skip_whitespace(p)
+
+    # Colon
+    if p.current.kind != token.CSS_TOKEN_COLON
+        skip_invalid_declaration(p)
+        return decl
+    advance(p)
+
+    skip_whitespace(p)
+
+    # Value
+    decl.value = parse_value(p)
+
+    # Check for !important
+    if decl.value.important == 1
+        decl.important = 1
+
+    decl
+
+fn parse_value(p:& CssParser) -> value.CssValue
+    skip_whitespace(p)
+
+    var val: value.CssValue
+    val.kind = value.CSS_VALUE_KEYWORD
+    val.string_len = 0
+    val.number = 0.0
+    val.unit = value.UNIT_PX
+    val.color_r = 0
+    val.color_g = 0
+    val.color_b = 0
+    val.color_a = 255
+    val.important = 0
+
+    if p.current.kind == token.CSS_TOKEN_IDENT
+        val = value.css_value_keyword(token.css_token_value_str(p.current))
+        advance(p)
+
+    else if p.current.kind == token.CSS_TOKEN_NUMBER
+        val = value.css_value_number(p.current.number)
+        advance(p)
+
+    else if p.current.kind == token.CSS_TOKEN_DIMENSION
+        let unit = value.parse_length_unit(token.css_token_value_str(p.current))
+        val = value.css_value_length(p.current.number, unit)
+        advance(p)
+
+    else if p.current.kind == token.CSS_TOKEN_PERCENTAGE
+        val = value.css_value_length(p.current.number, value.UNIT_PERCENT)
+        advance(p)
+
+    else if p.current.kind == token.CSS_TOKEN_HASH
+        # Color
+        val = parse_hex_color(p)
+
+    else if p.current.kind == token.CSS_TOKEN_FUNCTION
+        val = parse_function_value(p)
+
+    else if p.current.kind == token.CSS_TOKEN_STRING
+        val = value.css_value_string(token.css_token_value_str(p.current))
+        advance(p)
+
+    else if p.current.kind == token.CSS_TOKEN_URL
+        val = value.css_value_url(token.css_token_value_str(p.current))
+        advance(p)
+
+    # Check for !important
+    skip_whitespace(p)
+    if p.current.kind == token.CSS_TOKEN_DELIM and p.current.delim == 33  # !
+        advance(p)
+        skip_whitespace(p)
+        if p.current.kind == token.CSS_TOKEN_IDENT
+            let s = token.css_token_value_str(p.current)
+            if s == "important"
+                val.important = 1
+                advance(p)
+
+    val
+
+fn parse_hex_color(p:& CssParser) -> value.CssValue
+    let hex = token.css_token_value_str(p.current)
+    advance(p)
+
+    # Parse #RGB, #RGBA, #RRGGBB, #RRGGBBAA
+    var r: u8 = 0
+    var g: u8 = 0
+    var b: u8 = 0
+    var a: u8 = 255
+
+    if hex.len == 3
+        r = hex_digit(hex.data[0]) * 17
+        g = hex_digit(hex.data[1]) * 17
+        b = hex_digit(hex.data[2]) * 17
+    else if hex.len == 4
+        r = hex_digit(hex.data[0]) * 17
+        g = hex_digit(hex.data[1]) * 17
+        b = hex_digit(hex.data[2]) * 17
+        a = hex_digit(hex.data[3]) * 17
+    else if hex.len == 6
+        r = hex_digit(hex.data[0]) * 16 + hex_digit(hex.data[1])
+        g = hex_digit(hex.data[2]) * 16 + hex_digit(hex.data[3])
+        b = hex_digit(hex.data[4]) * 16 + hex_digit(hex.data[5])
+    else if hex.len == 8
+        r = hex_digit(hex.data[0]) * 16 + hex_digit(hex.data[1])
+        g = hex_digit(hex.data[2]) * 16 + hex_digit(hex.data[3])
+        b = hex_digit(hex.data[4]) * 16 + hex_digit(hex.data[5])
+        a = hex_digit(hex.data[6]) * 16 + hex_digit(hex.data[7])
+
+    value.css_value_color_rgba(r, g, b, a)
+
+fn hex_digit(c: u8) -> u8
+    if c >= 48 and c <= 57
+        return c - 48
+    if c >= 65 and c <= 70
+        return c - 55
+    if c >= 97 and c <= 102
+        return c - 87
+    0
+
+fn parse_function_value(p:& CssParser) -> value.CssValue
+    let name = token.css_token_value_str(p.current)
+    advance(p)
+
+    # Handle rgb() and rgba()
+    if name == "rgb" or name == "rgba"
+        return parse_rgb_function(p)
+
+    # Skip other functions for now
+    skip_until_close_paren(p)
+
+    value.css_value_keyword("unset")
+
+fn parse_rgb_function(p:& CssParser) -> value.CssValue
+    skip_whitespace(p)
+
+    var r: f64 = 0.0
+    var g: f64 = 0.0
+    var b: f64 = 0.0
+    var a: f64 = 1.0
+
+    # R
+    if p.current.kind == token.CSS_TOKEN_NUMBER
+        r = p.current.number
+        advance(p)
+    else if p.current.kind == token.CSS_TOKEN_PERCENTAGE
+        r = p.current.number * 2.55
+        advance(p)
+
+    skip_whitespace(p)
+    if p.current.kind == token.CSS_TOKEN_COMMA
+        advance(p)
+    skip_whitespace(p)
+
+    # G
+    if p.current.kind == token.CSS_TOKEN_NUMBER
+        g = p.current.number
+        advance(p)
+    else if p.current.kind == token.CSS_TOKEN_PERCENTAGE
+        g = p.current.number * 2.55
+        advance(p)
+
+    skip_whitespace(p)
+    if p.current.kind == token.CSS_TOKEN_COMMA
+        advance(p)
+    skip_whitespace(p)
+
+    # B
+    if p.current.kind == token.CSS_TOKEN_NUMBER
+        b = p.current.number
+        advance(p)
+    else if p.current.kind == token.CSS_TOKEN_PERCENTAGE
+        b = p.current.number * 2.55
+        advance(p)
+
+    skip_whitespace(p)
+    if p.current.kind == token.CSS_TOKEN_COMMA
+        advance(p)
+    skip_whitespace(p)
+
+    # A (optional)
+    if p.current.kind == token.CSS_TOKEN_NUMBER
+        a = p.current.number
+        advance(p)
+    else if p.current.kind == token.CSS_TOKEN_PERCENTAGE
+        a = p.current.number / 100.0
+        advance(p)
+
+    skip_whitespace(p)
+    if p.current.kind == token.CSS_TOKEN_CLOSE_PAREN
+        advance(p)
+
+    value.css_value_color_rgba(r as u8, g as u8, b as u8, (a * 255.0) as u8)
+
+# =============================================================================
+# At-Rule Parsing (stub)
+# =============================================================================
+
+fn parse_at_rule(p:& CssParser) -> i32
+    # Skip the at-keyword
+    advance(p)
+
+    # Skip until { or ;
+    loop
+        if p.current.kind == token.CSS_TOKEN_EOF
+            break
+        if p.current.kind == token.CSS_TOKEN_SEMICOLON
+            advance(p)
+            break
+        if p.current.kind == token.CSS_TOKEN_OPEN_CURLY
+            advance(p)
+            skip_until_close_curly(p)
+            break
+        advance(p)
+
+    0
+
+# =============================================================================
+# Helpers
+# =============================================================================
+
+fn is_selector_start(p: CssParser) -> i32
+    if p.current.kind == token.CSS_TOKEN_IDENT
+        return 1
+    if p.current.kind == token.CSS_TOKEN_HASH
+        return 1
+    if p.current.kind == token.CSS_TOKEN_COLON
+        return 1
+    if p.current.kind == token.CSS_TOKEN_OPEN_SQUARE
+        return 1
+    if p.current.kind == token.CSS_TOKEN_DELIM
+        if p.current.delim == 42 or p.current.delim == 46  # * or .
+            return 1
+    0
+
+fn skip_until_close_paren(p:& CssParser)
+    var depth = 1
+    loop
+        if p.current.kind == token.CSS_TOKEN_EOF
+            break
+        if p.current.kind == token.CSS_TOKEN_OPEN_PAREN
+            depth = depth + 1
+        if p.current.kind == token.CSS_TOKEN_CLOSE_PAREN
+            depth = depth - 1
+            if depth == 0
+                advance(p)
+                break
+        advance(p)
+
+fn skip_until_close_curly(p:& CssParser)
+    var depth = 1
+    loop
+        if p.current.kind == token.CSS_TOKEN_EOF
+            break
+        if p.current.kind == token.CSS_TOKEN_OPEN_CURLY
+            depth = depth + 1
+        if p.current.kind == token.CSS_TOKEN_CLOSE_CURLY
+            depth = depth - 1
+            if depth == 0
+                advance(p)
+                break
+        advance(p)
+
+fn skip_invalid_declaration(p:& CssParser)
+    loop
+        if p.current.kind == token.CSS_TOKEN_EOF
+            break
+        if p.current.kind == token.CSS_TOKEN_SEMICOLON
+            break
+        if p.current.kind == token.CSS_TOKEN_CLOSE_CURLY
+            break
+        advance(p)
+
+fn copy_token_value(simple:& selector.SimpleSelector, tok: token.CssToken)
+    var i: u32 = 0
+    while i < tok.value_len and i < 256
+        simple.value[i] = tok.value[i]
+        i = i + 1
+    simple.value_len = i
+
+fn copy_token_to_attr_value(simple:& selector.SimpleSelector, tok: token.CssToken)
+    var i: u32 = 0
+    while i < tok.value_len and i < 256
+        simple.attr_value[i] = tok.value[i]
+        i = i + 1
+    simple.attr_value_len = i
+
+fn copy_property_to_decl(decl:& rule.Declaration, prop: StrView)
+    var i: u64 = 0
+    while i < prop.len and i < 64
+        decl.property[i] = prop.data[i]
+        i = i + 1
+    decl.property_len = i as u32

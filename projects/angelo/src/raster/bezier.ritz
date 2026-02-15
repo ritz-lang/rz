@@ -1,0 +1,219 @@
+# Angelo - Bezier Curve Utilities
+#
+# TrueType fonts use quadratic bezier curves.
+# We need to flatten these into line segments for scanline rasterization.
+#
+# A quadratic bezier is defined by 3 points: P0 (start), P1 (control), P2 (end)
+# B(t) = (1-t)²P0 + 2(1-t)t·P1 + t²P2, for t ∈ [0,1]
+
+# A 2D point with floating-point coordinates
+pub struct Point2D
+    x: f32
+    y: f32
+
+impl Point2D
+    pub fn new(x: f32, y: f32) -> Point2D
+        Point2D { x: x, y: y }
+
+    pub fn from_i16(x: i16, y: i16) -> Point2D
+        Point2D { x: x as f32, y: y as f32 }
+
+    pub fn zero() -> Point2D
+        Point2D { x: 0.0, y: 0.0 }
+
+    pub fn add(self, other: Point2D) -> Point2D
+        Point2D { x: self.x + other.x, y: self.y + other.y }
+
+    pub fn sub(self, other: Point2D) -> Point2D
+        Point2D { x: self.x - other.x, y: self.y - other.y }
+
+    pub fn scale(self, s: f32) -> Point2D
+        Point2D { x: self.x * s, y: self.y * s }
+
+    pub fn midpoint(self, other: Point2D) -> Point2D
+        Point2D {
+            x: (self.x + other.x) * 0.5,
+            y: (self.y + other.y) * 0.5
+        }
+
+    pub fn lerp(self, other: Point2D, t: f32) -> Point2D
+        Point2D {
+            x: self.x + (other.x - self.x) * t,
+            y: self.y + (other.y - self.y) * t
+        }
+
+    pub fn distance_squared(self, other: Point2D) -> f32
+        let dx = self.x - other.x
+        let dy = self.y - other.y
+        dx * dx + dy * dy
+
+# A line segment
+pub struct LineSegment
+    p0: Point2D
+    p1: Point2D
+
+impl LineSegment
+    pub fn new(p0: Point2D, p1: Point2D) -> LineSegment
+        LineSegment { p0: p0, p1: p1 }
+
+# Quadratic bezier curve (3 control points)
+pub struct QuadBezier
+    p0: Point2D  # start
+    p1: Point2D  # control
+    p2: Point2D  # end
+
+impl QuadBezier
+    pub fn new(p0: Point2D, p1: Point2D, p2: Point2D) -> QuadBezier
+        QuadBezier { p0: p0, p1: p1, p2: p2 }
+
+    # Evaluate the curve at parameter t
+    pub fn eval(self, t: f32) -> Point2D
+        let t1 = 1.0 - t
+        let t1_sq = t1 * t1
+        let t_sq = t * t
+        let t1_t_2 = 2.0 * t1 * t
+
+        Point2D {
+            x: t1_sq * self.p0.x + t1_t_2 * self.p1.x + t_sq * self.p2.x,
+            y: t1_sq * self.p0.y + t1_t_2 * self.p1.y + t_sq * self.p2.y
+        }
+
+    # Split curve at t into two curves
+    pub fn split(self, t: f32) -> (QuadBezier, QuadBezier)
+        let q0 = self.p0.lerp(self.p1, t)
+        let q1 = self.p1.lerp(self.p2, t)
+        let r = q0.lerp(q1, t)
+
+        let left = QuadBezier.new(self.p0, q0, r)
+        let right = QuadBezier.new(r, q1, self.p2)
+        (left, right)
+
+    # Flatten to line segments using recursive subdivision
+    # tolerance: maximum distance from curve to line approximation
+    pub fn flatten(self, tolerance: f32, out:& Vec<Point2D>)
+        self.flatten_recursive(tolerance * tolerance, out)
+
+    fn flatten_recursive(self, tolerance_sq: f32, out:& Vec<Point2D>)
+        # Check if curve is flat enough
+        # Use distance from control point to line p0-p2
+        let midpoint = self.p0.midpoint(self.p2)
+        let deviation_sq = self.p1.distance_squared(midpoint)
+
+        if deviation_sq <= tolerance_sq
+            # Flat enough, emit endpoint
+            out.push(self.p2)
+        else
+            # Subdivide
+            let (left, right) = self.split(0.5)
+            left.flatten_recursive(tolerance_sq, out)
+            right.flatten_recursive(tolerance_sq, out)
+
+# Flatten a quadratic bezier curve to line segments
+# Returns points along the curve (including endpoints)
+pub fn flatten_quad_bezier(p0: Point2D, p1: Point2D, p2: Point2D, tolerance: f32) -> Vec<Point2D>
+    var points = Vec.new()
+    points.push(p0)
+
+    let curve = QuadBezier.new(p0, p1, p2)
+    curve.flatten(tolerance, @&points)
+
+    points
+
+# For TrueType: when two consecutive off-curve points, implied on-curve between them
+pub fn implied_on_curve(p1: Point2D, p2: Point2D) -> Point2D
+    p1.midpoint(p2)
+
+# Tests
+
+[[test]]
+fn test_point2d_midpoint() -> i32
+    let p1 = Point2D.new(0.0, 0.0)
+    let p2 = Point2D.new(10.0, 10.0)
+    let mid = p1.midpoint(p2)
+
+    # Allow small floating point tolerance
+    assert mid.x > 4.9 and mid.x < 5.1
+    assert mid.y > 4.9 and mid.y < 5.1
+    0
+
+[[test]]
+fn test_point2d_lerp() -> i32
+    let p1 = Point2D.new(0.0, 0.0)
+    let p2 = Point2D.new(10.0, 20.0)
+
+    let quarter = p1.lerp(p2, 0.25)
+    assert quarter.x > 2.4 and quarter.x < 2.6
+    assert quarter.y > 4.9 and quarter.y < 5.1
+
+    let half = p1.lerp(p2, 0.5)
+    assert half.x > 4.9 and half.x < 5.1
+    assert half.y > 9.9 and half.y < 10.1
+
+    0
+
+[[test]]
+fn test_quad_bezier_endpoints() -> i32
+    let p0 = Point2D.new(0.0, 0.0)
+    let p1 = Point2D.new(50.0, 100.0)
+    let p2 = Point2D.new(100.0, 0.0)
+
+    let curve = QuadBezier.new(p0, p1, p2)
+
+    # At t=0, should be p0
+    let start = curve.eval(0.0)
+    assert start.x < 0.1
+    assert start.y < 0.1
+
+    # At t=1, should be p2
+    let end = curve.eval(1.0)
+    assert end.x > 99.9 and end.x < 100.1
+    assert end.y < 0.1
+
+    0
+
+[[test]]
+fn test_quad_bezier_midpoint() -> i32
+    let p0 = Point2D.new(0.0, 0.0)
+    let p1 = Point2D.new(50.0, 100.0)
+    let p2 = Point2D.new(100.0, 0.0)
+
+    let curve = QuadBezier.new(p0, p1, p2)
+    let mid = curve.eval(0.5)
+
+    # Midpoint should be at x=50, y=50 for this symmetric curve
+    assert mid.x > 49.9 and mid.x < 50.1
+    assert mid.y > 49.9 and mid.y < 50.1
+
+    0
+
+[[test]]
+fn test_flatten_line() -> i32
+    # A "curve" that's actually a straight line should flatten to just 2 points
+    let p0 = Point2D.new(0.0, 0.0)
+    let p1 = Point2D.new(50.0, 50.0)  # control point on the line
+    let p2 = Point2D.new(100.0, 100.0)
+
+    let points = flatten_quad_bezier(p0, p1, p2, 1.0)
+
+    # Should have start point + maybe a few subdivisions + end
+    assert points.len() >= 2
+    # First point is p0
+    assert points[0].x < 0.1
+    # Last point is p2
+    assert points[points.len() - 1].x > 99.9
+
+    0
+
+[[test]]
+fn test_flatten_curve() -> i32
+    # A real curve should have more points
+    let p0 = Point2D.new(0.0, 0.0)
+    let p1 = Point2D.new(0.0, 100.0)  # control point far from line
+    let p2 = Point2D.new(100.0, 100.0)
+
+    let points = flatten_quad_bezier(p0, p1, p2, 1.0)
+
+    # Should have several points due to curvature
+    assert points.len() > 2
+
+    0

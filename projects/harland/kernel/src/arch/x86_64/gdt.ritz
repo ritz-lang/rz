@@ -1,0 +1,289 @@
+# Harland GDT (Global Descriptor Table) Implementation
+#
+# x86-64 GDT with:
+# - Null descriptor (required)
+# - Kernel code segment (64-bit)
+# - Kernel data segment
+# - User code segment (64-bit)
+# - User data segment
+# - TSS descriptor (16 bytes, for task state segment)
+#
+# In 64-bit mode, most of the GDT fields are ignored, but we still
+# need valid entries for segmentation to work.
+
+# ============================================================================
+# GDT Segment Selectors
+# ============================================================================
+
+# Selector format: Index (13 bits) | TI (1 bit) | RPL (2 bits)
+# TI=0 means GDT, RPL is the requested privilege level
+
+const GDT_NULL: u16 = 0x00          # Null segment
+const GDT_KERNEL_CODE: u16 = 0x08   # Index 1, ring 0
+const GDT_KERNEL_DATA: u16 = 0x10   # Index 2, ring 0
+const GDT_USER_CODE: u16 = 0x1B     # Index 3, ring 3 (0x18 | 3)
+const GDT_USER_DATA: u16 = 0x23     # Index 4, ring 3 (0x20 | 3)
+const GDT_TSS: u16 = 0x28           # Index 5, TSS
+
+# ============================================================================
+# GDT Access Byte Flags
+# ============================================================================
+
+const GDT_ACCESS_PRESENT: u8 = 0x80     # Segment is present
+const GDT_ACCESS_RING0: u8 = 0x00       # Ring 0 (kernel)
+const GDT_ACCESS_RING3: u8 = 0x60       # Ring 3 (user)
+const GDT_ACCESS_CODE: u8 = 0x1A        # Executable, readable
+const GDT_ACCESS_DATA: u8 = 0x12        # Writable
+const GDT_ACCESS_TSS: u8 = 0x89         # 64-bit TSS (available)
+
+# ============================================================================
+# GDT Flags (high nibble of flags_limit byte)
+# ============================================================================
+
+const GDT_FLAG_LONG: u8 = 0x20          # 64-bit code segment
+const GDT_FLAG_GRANULARITY: u8 = 0x80   # 4KB page granularity
+
+# ============================================================================
+# GDT Entry Structure (8 bytes)
+# ============================================================================
+
+struct GdtEntry
+    limit_low: u16      # Bits 0-15 of limit
+    base_low: u16       # Bits 0-15 of base
+    base_mid: u8        # Bits 16-23 of base
+    access: u8          # Access flags
+    flags_limit: u8     # High nibble = flags, low nibble = bits 16-19 of limit
+    base_high: u8       # Bits 24-31 of base
+
+# ============================================================================
+# TSS Entry Structure (16 bytes - spans two GDT slots)
+# ============================================================================
+
+struct TssEntry
+    limit_low: u16
+    base_low: u16
+    base_mid: u8
+    access: u8
+    flags_limit: u8
+    base_high: u8
+    base_upper: u32     # Bits 32-63 of base (x86-64 extension)
+    reserved: u32
+
+# ============================================================================
+# GDT Descriptor (for LGDT instruction)
+# ============================================================================
+
+struct GdtDescriptor
+    size: u16           # Size of GDT minus 1
+    offset: u64         # Linear address of GDT
+
+# ============================================================================
+# Task State Segment (TSS)
+# ============================================================================
+
+struct Tss
+    reserved0: u32
+    rsp0: u64           # Ring 0 stack pointer
+    rsp1: u64           # Ring 1 stack pointer (unused)
+    rsp2: u64           # Ring 2 stack pointer (unused)
+    reserved1: u64
+    ist1: u64           # Interrupt Stack Table entry 1
+    ist2: u64           # IST entry 2
+    ist3: u64           # IST entry 3
+    ist4: u64           # IST entry 4
+    ist5: u64           # IST entry 5
+    ist6: u64           # IST entry 6
+    ist7: u64           # IST entry 7
+    reserved2: u64
+    reserved3: u16
+    iopb_offset: u16    # I/O permission bitmap offset
+
+# ============================================================================
+# Global GDT and TSS Storage
+# ============================================================================
+
+# GDT with 6 entries: null, kernel code, kernel data, user code, user data, TSS (2 slots)
+var gdt: [7]GdtEntry
+
+# TSS structure
+var tss: Tss
+
+# GDT descriptor for LGDT
+var gdt_descriptor: GdtDescriptor
+
+# Kernel stack for ring 0 (used when transitioning from ring 3)
+var kernel_stack: [4096]u8
+
+# Interrupt stack for double faults and NMI
+var interrupt_stack: [4096]u8
+
+# ============================================================================
+# GDT Helper Functions
+# ============================================================================
+
+fn make_gdt_entry(base: u32, limit: u32, access: u8, flags: u8) -> GdtEntry
+    var entry: GdtEntry
+    entry.limit_low = (limit & 0xFFFF) as u16
+    entry.base_low = (base & 0xFFFF) as u16
+    entry.base_mid = ((base >> 16) & 0xFF) as u8
+    entry.access = access
+    entry.flags_limit = ((limit >> 16) & 0x0F) as u8 | (flags & 0xF0)
+    entry.base_high = ((base >> 24) & 0xFF) as u8
+    return entry
+
+fn set_tss_entry(gdt_index: i32, tss_addr: u64)
+    # TSS descriptor spans two GDT entries in 64-bit mode
+    let base: u64 = tss_addr
+    let limit: u32 = 103  # Size of TSS minus 1 (104 bytes)
+
+    # First 8 bytes (standard GDT entry format)
+    gdt[gdt_index].limit_low = (limit & 0xFFFF) as u16
+    gdt[gdt_index].base_low = (base & 0xFFFF) as u16
+    gdt[gdt_index].base_mid = ((base >> 16) & 0xFF) as u8
+    gdt[gdt_index].access = GDT_ACCESS_TSS
+    gdt[gdt_index].flags_limit = ((limit >> 16) & 0x0F) as u8
+    gdt[gdt_index].base_high = ((base >> 24) & 0xFF) as u8
+
+    # Second 8 bytes (upper 32 bits of base + reserved)
+    # We need to access the next entry as raw bytes
+    let next_entry: *u8 = &gdt[gdt_index + 1] as *u8
+
+    # Write upper 32 bits of base address
+    let base_upper: u32 = ((base >> 32) & 0xFFFFFFFF) as u32
+    *(next_entry as *u32) = base_upper
+
+    # Write reserved (must be 0)
+    *((next_entry + 4) as *u32) = 0
+
+# ============================================================================
+# GDT Initialization
+# ============================================================================
+
+pub fn gdt_init() -> i32
+    # Entry 0: Null descriptor (required)
+    gdt[0] = make_gdt_entry(0, 0, 0, 0)
+
+    # Entry 1: Kernel code segment (64-bit)
+    # Base = 0, Limit = 0xFFFFF (4GB with granularity)
+    # Access: Present | Ring 0 | Code segment
+    # Flags: Long mode (64-bit)
+    gdt[1] = make_gdt_entry(0, 0xFFFFF,
+        GDT_ACCESS_PRESENT | GDT_ACCESS_RING0 | GDT_ACCESS_CODE,
+        GDT_FLAG_LONG | GDT_FLAG_GRANULARITY)
+
+    # Entry 2: Kernel data segment
+    # Access: Present | Ring 0 | Data segment
+    gdt[2] = make_gdt_entry(0, 0xFFFFF,
+        GDT_ACCESS_PRESENT | GDT_ACCESS_RING0 | GDT_ACCESS_DATA,
+        GDT_FLAG_GRANULARITY)
+
+    # Entry 3: User code segment (64-bit)
+    # Access: Present | Ring 3 | Code segment
+    gdt[3] = make_gdt_entry(0, 0xFFFFF,
+        GDT_ACCESS_PRESENT | GDT_ACCESS_RING3 | GDT_ACCESS_CODE,
+        GDT_FLAG_LONG | GDT_FLAG_GRANULARITY)
+
+    # Entry 4: User data segment
+    # Access: Present | Ring 3 | Data segment
+    gdt[4] = make_gdt_entry(0, 0xFFFFF,
+        GDT_ACCESS_PRESENT | GDT_ACCESS_RING3 | GDT_ACCESS_DATA,
+        GDT_FLAG_GRANULARITY)
+
+    # Initialize TSS
+    tss_init()
+
+    # Entry 5-6: TSS (16 bytes, spans two entries)
+    let tss_addr: u64 = &tss as u64
+    set_tss_entry(5, tss_addr)
+
+    # Set up GDT descriptor
+    gdt_descriptor.size = (7 * 8 - 1) as u16  # 7 entries * 8 bytes - 1
+    gdt_descriptor.offset = &gdt[0] as u64
+
+    # Load the GDT
+    gdt_load()
+
+    # Load the TSS
+    tss_load()
+
+    return 0
+
+fn tss_init() -> i32
+    # Zero out the TSS
+    let tss_ptr: *u8 = &tss as *u8
+    var i: i32 = 0
+    while i < 104
+        *(tss_ptr + i as i64) = 0
+        i = i + 1
+
+    # Set up ring 0 stack (used when switching from ring 3 to ring 0)
+    let stack_top: u64 = (&kernel_stack[0] as u64) + 4096
+    tss.rsp0 = stack_top
+
+    # Set up IST1 for double fault and NMI handlers
+    let ist_top: u64 = (&interrupt_stack[0] as u64) + 4096
+    tss.ist1 = ist_top
+
+    # I/O permission bitmap offset (beyond TSS = no IOPB)
+    tss.iopb_offset = 104
+
+    return 0
+
+# ============================================================================
+# Assembly Routines
+# ============================================================================
+
+fn gdt_load() -> i32
+    # Load GDT and reload segment registers
+    let gdt_ptr: *GdtDescriptor = &gdt_descriptor
+    var gdt_ptr_val: u64 = gdt_ptr as u64
+
+    asm x86_64:
+        # Load GDT
+        movq {gdt_ptr_val}, %rax
+        lgdt (%rax)
+
+        # Reload data segments with kernel data selector (0x10)
+        movw $0x10, %ax
+        movw %ax, %ds
+        movw %ax, %es
+        movw %ax, %fs
+        movw %ax, %gs
+        movw %ax, %ss
+
+        # Far jump to reload CS with kernel code selector (0x08)
+        # We use a push/retfq trick since we can't do a direct far jump easily
+        pushq $0x08
+        leaq 1f(%rip), %rax
+        pushq %rax
+        lretq
+    1:
+
+    return 0
+
+fn tss_load() -> i32
+    # Load TSS selector into TR register
+    asm x86_64:
+        movw $0x28, %ax
+        ltr %ax
+    return 0
+
+# ============================================================================
+# Public API
+# ============================================================================
+
+pub fn gdt_get_kernel_code_selector() -> u16
+    return GDT_KERNEL_CODE
+
+pub fn gdt_get_kernel_data_selector() -> u16
+    return GDT_KERNEL_DATA
+
+pub fn gdt_get_user_code_selector() -> u16
+    return GDT_USER_CODE
+
+pub fn gdt_get_user_data_selector() -> u16
+    return GDT_USER_DATA
+
+pub fn gdt_set_kernel_stack(stack_top: u64) -> i32
+    tss.rsp0 = stack_top
+    return 0

@@ -1,0 +1,499 @@
+# lib/css/tokenizer.ritz - CSS Tokenizer
+#
+# Tokenizes CSS source per CSS Syntax Module Level 3.
+# Reference: https://www.w3.org/TR/css-syntax-3/#tokenization
+
+import lib.css.token
+
+# =============================================================================
+# Character Classification
+# =============================================================================
+
+fn is_whitespace(c: u8) -> i32
+    if c == 32 or c == 9 or c == 10 or c == 13 or c == 12
+        return 1
+    0
+
+fn is_digit(c: u8) -> i32
+    if c >= 48 and c <= 57
+        return 1
+    0
+
+fn is_hex_digit(c: u8) -> i32
+    if c >= 48 and c <= 57
+        return 1
+    if c >= 65 and c <= 70
+        return 1
+    if c >= 97 and c <= 102
+        return 1
+    0
+
+fn is_letter(c: u8) -> i32
+    if c >= 65 and c <= 90
+        return 1
+    if c >= 97 and c <= 122
+        return 1
+    0
+
+fn is_non_ascii(c: u8) -> i32
+    if c >= 128
+        return 1
+    0
+
+fn is_name_start(c: u8) -> i32
+    if is_letter(c) == 1
+        return 1
+    if is_non_ascii(c) == 1
+        return 1
+    if c == 95  # _
+        return 1
+    0
+
+fn is_name_char(c: u8) -> i32
+    if is_name_start(c) == 1
+        return 1
+    if is_digit(c) == 1
+        return 1
+    if c == 45  # -
+        return 1
+    0
+
+# =============================================================================
+# Tokenizer State
+# =============================================================================
+
+pub struct CssTokenizer
+    input: StrView
+    pos: u64
+    line: u32
+    col: u32
+
+# =============================================================================
+# Initialization
+# =============================================================================
+
+pub fn css_tokenizer_new(input: StrView) -> CssTokenizer
+    CssTokenizer {
+        input: input,
+        pos: 0,
+        line: 1,
+        col: 1
+    }
+
+# =============================================================================
+# Input Navigation
+# =============================================================================
+
+fn peek(t: CssTokenizer) -> i32
+    if t.pos >= t.input.len
+        return -1
+    t.input.data[t.pos] as i32
+
+fn peek_n(t: CssTokenizer, n: u64) -> i32
+    if t.pos + n >= t.input.len
+        return -1
+    t.input.data[t.pos + n] as i32
+
+fn consume(t:& CssTokenizer) -> i32
+    if t.pos >= t.input.len
+        return -1
+    let c = t.input.data[t.pos] as i32
+    t.pos = t.pos + 1
+    if c == 10
+        t.line = t.line + 1
+        t.col = 1
+    else
+        t.col = t.col + 1
+    c
+
+fn reconsume(t:& CssTokenizer)
+    if t.pos > 0
+        t.pos = t.pos - 1
+        if t.col > 1
+            t.col = t.col - 1
+
+# =============================================================================
+# Main Tokenization
+# =============================================================================
+
+pub fn css_tokenizer_next(t:& CssTokenizer) -> token.CssToken
+    consume_comments(t)
+
+    let c = peek(@t)
+
+    if c == -1
+        return token.css_token_eof()
+
+    # Whitespace
+    if is_whitespace(c as u8) == 1
+        consume_whitespace(t)
+        return token.css_token_whitespace()
+
+    # String
+    if c == 34 or c == 39  # " or '
+        return consume_string(t, c as u8)
+
+    # Hash
+    if c == 35  # #
+        consume(t)
+        return consume_hash(t)
+
+    # Numeric
+    if is_digit(c as u8) == 1
+        return consume_numeric(t)
+
+    if c == 43 or c == 45  # + or -
+        if would_start_number(t) == 1
+            return consume_numeric(t)
+        consume(t)
+        return token.css_token_delim(c as u8)
+
+    if c == 46  # .
+        if would_start_number(t) == 1
+            return consume_numeric(t)
+        consume(t)
+        return token.css_token_delim(c as u8)
+
+    # Ident-like
+    if is_name_start(c as u8) == 1 or c == 45
+        return consume_ident_like(t)
+
+    # At-keyword
+    if c == 64  # @
+        consume(t)
+        return consume_at_keyword(t)
+
+    # Punctuation
+    if c == 58  # :
+        consume(t)
+        return token.css_token_colon()
+
+    if c == 59  # ;
+        consume(t)
+        return token.css_token_semicolon()
+
+    if c == 44  # ,
+        consume(t)
+        return token.css_token_comma()
+
+    if c == 123  # {
+        consume(t)
+        return token.css_token_open_curly()
+
+    if c == 125  # }
+        consume(t)
+        return token.css_token_close_curly()
+
+    if c == 40  # (
+        consume(t)
+        return token.css_token_open_paren()
+
+    if c == 41  # )
+        consume(t)
+        return token.css_token_close_paren()
+
+    if c == 91  # [
+        consume(t)
+        return token.css_token_open_square()
+
+    if c == 93  # ]
+        consume(t)
+        return token.css_token_close_square()
+
+    # CDO <!--
+    if c == 60  # <
+        if peek_n(@t, 1) == 33 and peek_n(@t, 2) == 45 and peek_n(@t, 3) == 45
+            consume(t)
+            consume(t)
+            consume(t)
+            consume(t)
+            var tok = token.css_token_eof()
+            tok.kind = token.CSS_TOKEN_CDO
+            return tok
+
+    # CDC -->
+    if c == 45  # -
+        if peek_n(@t, 1) == 45 and peek_n(@t, 2) == 62
+            consume(t)
+            consume(t)
+            consume(t)
+            var tok = token.css_token_eof()
+            tok.kind = token.CSS_TOKEN_CDC
+            return tok
+
+    # Anything else is a delim token
+    consume(t)
+    token.css_token_delim(c as u8)
+
+# =============================================================================
+# Token Consumers
+# =============================================================================
+
+fn consume_comments(t:& CssTokenizer)
+    loop
+        if peek(@t) == 47 and peek_n(@t, 1) == 42  # /*
+            consume(t)
+            consume(t)
+            loop
+                let c = consume(t)
+                if c == -1
+                    return
+                if c == 42 and peek(@t) == 47  # */
+                    consume(t)
+                    break
+        else
+            return
+
+fn consume_whitespace(t:& CssTokenizer)
+    loop
+        let c = peek(@t)
+        if c == -1
+            return
+        if is_whitespace(c as u8) == 0
+            return
+        consume(t)
+
+fn consume_string(t:& CssTokenizer, quote: u8) -> token.CssToken
+    consume(t)  # Opening quote
+
+    var tok = token.css_token_eof()
+    tok.kind = token.CSS_TOKEN_STRING
+
+    loop
+        let c = peek(@t)
+
+        if c == -1
+            # Parse error: EOF in string
+            return tok
+
+        if c as u8 == quote
+            consume(t)
+            return tok
+
+        if c == 10  # newline
+            # Parse error: newline in string
+            tok.kind = token.CSS_TOKEN_BAD_STRING
+            return tok
+
+        if c == 92  # backslash
+            consume(t)
+            let next = peek(@t)
+            if next == -1
+                # EOF after backslash, ignore
+                0
+            else if next == 10
+                # Escaped newline, skip
+                consume(t)
+            else
+                # Escaped character
+                let escaped = consume(t)
+                if tok.value_len < 4096
+                    tok.value[tok.value_len] = escaped as u8
+                    tok.value_len = tok.value_len + 1
+        else
+            consume(t)
+            if tok.value_len < 4096
+                tok.value[tok.value_len] = c as u8
+                tok.value_len = tok.value_len + 1
+
+fn consume_hash(t:& CssTokenizer) -> token.CssToken
+    var tok = token.css_token_eof()
+    tok.kind = token.CSS_TOKEN_HASH
+    tok.hash_type = token.HASH_UNRESTRICTED
+
+    # Check if would start an identifier
+    let c = peek(@t)
+    if is_name_char(c as u8) == 1 or c == 92  # backslash (escape)
+        # Check for valid ID
+        if is_name_start(c as u8) == 1 or c == 45 or c == 92
+            tok.hash_type = token.HASH_ID
+
+    # Consume name
+    consume_name_into(t, tok)
+
+    tok
+
+fn consume_name_into(t:& CssTokenizer, tok:& token.CssToken)
+    loop
+        let c = peek(@t)
+        if c == -1
+            return
+
+        if is_name_char(c as u8) == 1
+            consume(t)
+            if tok.value_len < 4096
+                tok.value[tok.value_len] = c as u8
+                tok.value_len = tok.value_len + 1
+        else if c == 92  # backslash
+            consume(t)
+            let escaped = consume(t)
+            if escaped != -1 and tok.value_len < 4096
+                tok.value[tok.value_len] = escaped as u8
+                tok.value_len = tok.value_len + 1
+        else
+            return
+
+fn consume_ident_like(t:& CssTokenizer) -> token.CssToken
+    var tok = token.css_token_eof()
+    tok.kind = token.CSS_TOKEN_IDENT
+
+    consume_name_into(t, tok)
+
+    # Check if it's a function (followed by '(')
+    if peek(@t) == 40  # (
+        consume(t)
+        # Check for url(
+        if tok.value_len == 3 and (tok.value[0] == 117 or tok.value[0] == 85) and (tok.value[1] == 114 or tok.value[1] == 82) and (tok.value[2] == 108 or tok.value[2] == 76)
+            # It's url( - could be URL token
+            consume_whitespace(t)
+            let c = peek(@t)
+            if c == 34 or c == 39  # " or '
+                # url("...") - function token
+                tok.kind = token.CSS_TOKEN_FUNCTION
+            else
+                # url(...) - URL token
+                return consume_url(t)
+        else
+            tok.kind = token.CSS_TOKEN_FUNCTION
+
+    tok
+
+fn consume_url(t:& CssTokenizer) -> token.CssToken
+    var tok = token.css_token_eof()
+    tok.kind = token.CSS_TOKEN_URL
+
+    consume_whitespace(t)
+
+    loop
+        let c = peek(@t)
+
+        if c == -1
+            return tok
+
+        if c == 41  # )
+            consume(t)
+            return tok
+
+        if is_whitespace(c as u8) == 1
+            consume_whitespace(t)
+            if peek(@t) == 41
+                consume(t)
+                return tok
+            # Whitespace not followed by ) - bad URL
+            consume_bad_url_remnants(t)
+            tok.kind = token.CSS_TOKEN_BAD_URL
+            return tok
+
+        if c == 34 or c == 39 or c == 40  # " ' (
+            # Bad URL
+            consume_bad_url_remnants(t)
+            tok.kind = token.CSS_TOKEN_BAD_URL
+            return tok
+
+        if c == 92  # backslash
+            consume(t)
+            let next = consume(t)
+            if next != -1 and tok.value_len < 4096
+                tok.value[tok.value_len] = next as u8
+                tok.value_len = tok.value_len + 1
+        else
+            consume(t)
+            if tok.value_len < 4096
+                tok.value[tok.value_len] = c as u8
+                tok.value_len = tok.value_len + 1
+
+fn consume_bad_url_remnants(t:& CssTokenizer)
+    loop
+        let c = consume(t)
+        if c == -1 or c == 41  # EOF or )
+            return
+        if c == 92  # backslash
+            consume(t)  # Consume escaped character
+
+fn consume_at_keyword(t:& CssTokenizer) -> token.CssToken
+    var tok = token.css_token_eof()
+    tok.kind = token.CSS_TOKEN_AT_KEYWORD
+
+    consume_name_into(t, tok)
+
+    tok
+
+fn consume_numeric(t:& CssTokenizer) -> token.CssToken
+    var tok = token.css_token_eof()
+    tok.kind = token.CSS_TOKEN_NUMBER
+    tok.number_type = token.NUMBER_INTEGER
+
+    # Consume sign
+    let sign: f64 = 1.0
+    let c = peek(@t)
+    if c == 43  # +
+        consume(t)
+    else if c == 45  # -
+        consume(t)
+        # sign = -1.0  # TODO: handle negative
+
+    # Consume integer part
+    var integer_part: f64 = 0.0
+    loop
+        let d = peek(@t)
+        if d == -1 or is_digit(d as u8) == 0
+            break
+        consume(t)
+        integer_part = integer_part * 10.0 + (d - 48) as f64
+
+    # Check for decimal
+    if peek(@t) == 46 and is_digit(peek_n(@t, 1) as u8) == 1
+        consume(t)  # .
+        tok.number_type = token.NUMBER_FLOAT
+
+        var decimal_part: f64 = 0.0
+        var decimal_places: f64 = 0.1
+        loop
+            let d = peek(@t)
+            if d == -1 or is_digit(d as u8) == 0
+                break
+            consume(t)
+            decimal_part = decimal_part + (d - 48) as f64 * decimal_places
+            decimal_places = decimal_places * 0.1
+
+        tok.number = sign * (integer_part + decimal_part)
+    else
+        tok.number = sign * integer_part
+
+    # TODO: Handle exponent (e/E)
+
+    # Check what follows: %, dimension unit, or nothing
+    let next = peek(@t)
+
+    if next == 37  # %
+        consume(t)
+        tok.kind = token.CSS_TOKEN_PERCENTAGE
+
+    else if is_name_start(next as u8) == 1 or next == 45
+        # Dimension - consume unit
+        tok.kind = token.CSS_TOKEN_DIMENSION
+        consume_name_into(t, tok)
+
+    tok
+
+fn would_start_number(t: CssTokenizer) -> i32
+    let c1 = peek(t)
+    let c2 = peek_n(t, 1)
+    let c3 = peek_n(t, 2)
+
+    if c1 == 43 or c1 == 45  # + or -
+        if is_digit(c2 as u8) == 1
+            return 1
+        if c2 == 46 and is_digit(c3 as u8) == 1
+            return 1
+        return 0
+
+    if c1 == 46  # .
+        if is_digit(c2 as u8) == 1
+            return 1
+        return 0
+
+    if is_digit(c1 as u8) == 1
+        return 1
+
+    0

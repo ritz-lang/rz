@@ -1,0 +1,165 @@
+# Prism - Damage Tracking
+#
+# Tracks which regions of the screen need to be redrawn.
+
+import types { Rect }
+
+# A damage region with metadata
+pub struct DamageRegion
+    rect: Rect
+    source_window: u64      # WindowId.raw() that caused this damage, or 0 for compositor
+
+impl DamageRegion
+    pub fn new(rect: Rect, source: u64) -> DamageRegion
+        DamageRegion { rect: rect, source_window: source }
+
+    pub fn from_rect(rect: Rect) -> DamageRegion
+        DamageRegion { rect: rect, source_window: 0 }
+
+# Collects and manages damage regions for a frame
+pub struct DamageTracker
+    # Pending damage regions for current frame
+    regions: Vec<DamageRegion>
+
+    # Screen bounds for clipping
+    screen_width: u32
+    screen_height: u32
+
+    # Statistics
+    total_damage_area: u64
+    regions_merged: u64
+
+impl DamageTracker
+    pub fn new(width: u32, height: u32) -> DamageTracker
+        DamageTracker {
+            regions: Vec<DamageRegion>.new(),
+            screen_width: width,
+            screen_height: height,
+            total_damage_area: 0,
+            regions_merged: 0
+        }
+
+    # Add a damage region
+    pub fn add_damage(self:&, rect: Rect, source: u64)
+        # Clip to screen bounds
+        let screen = Rect.full(self.screen_width, self.screen_height)
+        let clipped = rect.intersection(screen)
+
+        if not clipped.is_empty()
+            # Check if we can merge with an existing region
+            var merged = false
+            var i: u64 = 0
+            while i < self.regions.len()
+                let existing = self.regions[i].rect
+                if should_merge(existing, clipped)
+                    # Merge into existing region
+                    self.regions[i].rect = existing.union(clipped)
+                    self.regions_merged += 1
+                    merged = true
+                    break
+                i += 1
+
+            if not merged
+                self.regions.push(DamageRegion.new(clipped, source))
+
+            self.total_damage_area += clipped.area()
+
+    # Add damage for the entire screen
+    pub fn damage_all(self:&)
+        self.regions.clear()
+        self.regions.push(DamageRegion.from_rect(
+            Rect.full(self.screen_width, self.screen_height)
+        ))
+        self.total_damage_area = self.screen_width as u64 * self.screen_height as u64
+
+    # Get the bounding box of all damage
+    pub fn bounding_box(self) -> Rect
+        if self.regions.len() == 0
+            Rect.zero()
+        else
+            var bounds = self.regions[0].rect
+            var i: u64 = 1
+            while i < self.regions.len()
+                bounds = bounds.union(self.regions[i].rect)
+                i += 1
+            bounds
+
+    # Get all damage regions
+    pub fn get_regions(self) -> @Vec<DamageRegion>
+        @self.regions
+
+    # Get the number of damage regions
+    pub fn region_count(self) -> u64
+        self.regions.len()
+
+    # Check if there's any damage
+    pub fn has_damage(self) -> bool
+        self.regions.len() > 0
+
+    # Check if the entire screen is damaged
+    pub fn is_full_damage(self) -> bool
+        if self.regions.len() == 1
+            let r = self.regions[0].rect
+            r.x == 0 and r.y == 0 and
+            r.width == self.screen_width and
+            r.height == self.screen_height
+        else
+            false
+
+    # Clear all damage (after a frame is rendered)
+    pub fn clear(self:&)
+        self.regions.clear()
+        self.total_damage_area = 0
+
+    # Reset statistics
+    pub fn reset_stats(self:&)
+        self.regions_merged = 0
+
+    # --- Occlusion Culling ---
+
+    # Subtract an occluding rectangle from all damage regions
+    # This is used when a window fully covers damage - no need to redraw behind it
+    pub fn subtract_occlusion(self:&, occluder: Rect)
+        var new_regions = Vec<DamageRegion>.new()
+
+        for region in self.regions
+            # If occluder fully contains this region, skip it entirely
+            if occluder.contains_rect(region.rect)
+                continue
+
+            # If no intersection, keep the region as-is
+            if not occluder.intersects(region.rect)
+                new_regions.push(region)
+                continue
+
+            # Partial overlap - split the region
+            # This is a simplification; full implementation would generate
+            # up to 4 non-overlapping rects. For now, we just keep the region
+            # (conservative - may overdraw, but correct)
+            new_regions.push(region)
+
+        self.regions = new_regions
+
+# Should two rectangles be merged?
+# Merge if they overlap or are adjacent and merging doesn't waste much area
+fn should_merge(a: Rect, b: Rect) -> bool
+    # Always merge if they overlap
+    if a.intersects(b)
+        return true
+
+    # Check if they're adjacent (touching edges)
+    let h_adjacent = (a.right() == b.x or b.right() == a.x) and
+                     a.y < b.bottom() and b.y < a.bottom()
+    let v_adjacent = (a.bottom() == b.y or b.bottom() == a.y) and
+                     a.x < b.right() and b.x < a.right()
+
+    if h_adjacent or v_adjacent
+        # Check if merging doesn't waste too much area
+        let merged = a.union(b)
+        let merged_area = merged.area()
+        let combined_area = a.area() + b.area()
+
+        # Merge if the merged area is at most 50% larger than the sum
+        merged_area <= combined_area + combined_area / 2
+    else
+        false

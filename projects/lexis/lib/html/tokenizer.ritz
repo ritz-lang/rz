@@ -1,0 +1,1059 @@
+# lib/html/tokenizer.ritz - HTML5 Tokenizer
+#
+# A streaming state machine tokenizer implementing the HTML5 parsing spec.
+# Converts a character stream into HTML tokens.
+#
+# Reference: https://html.spec.whatwg.org/multipage/parsing.html#tokenization
+
+import lib.html.token
+import lib.dom.attribute { Attribute, attribute_new }
+
+# =============================================================================
+# Tokenizer States
+# =============================================================================
+
+# Main states
+pub const STATE_DATA: i32 = 0
+pub const STATE_RCDATA: i32 = 1
+pub const STATE_RAWTEXT: i32 = 2
+pub const STATE_SCRIPT_DATA: i32 = 3
+pub const STATE_PLAINTEXT: i32 = 4
+pub const STATE_TAG_OPEN: i32 = 5
+pub const STATE_END_TAG_OPEN: i32 = 6
+pub const STATE_TAG_NAME: i32 = 7
+pub const STATE_RCDATA_LESS_THAN_SIGN: i32 = 8
+pub const STATE_RCDATA_END_TAG_OPEN: i32 = 9
+pub const STATE_RCDATA_END_TAG_NAME: i32 = 10
+pub const STATE_RAWTEXT_LESS_THAN_SIGN: i32 = 11
+pub const STATE_RAWTEXT_END_TAG_OPEN: i32 = 12
+pub const STATE_RAWTEXT_END_TAG_NAME: i32 = 13
+pub const STATE_SCRIPT_DATA_LESS_THAN_SIGN: i32 = 14
+pub const STATE_SCRIPT_DATA_END_TAG_OPEN: i32 = 15
+pub const STATE_SCRIPT_DATA_END_TAG_NAME: i32 = 16
+pub const STATE_SCRIPT_DATA_ESCAPE_START: i32 = 17
+pub const STATE_SCRIPT_DATA_ESCAPE_START_DASH: i32 = 18
+pub const STATE_SCRIPT_DATA_ESCAPED: i32 = 19
+pub const STATE_SCRIPT_DATA_ESCAPED_DASH: i32 = 20
+pub const STATE_SCRIPT_DATA_ESCAPED_DASH_DASH: i32 = 21
+pub const STATE_SCRIPT_DATA_ESCAPED_LESS_THAN_SIGN: i32 = 22
+pub const STATE_SCRIPT_DATA_ESCAPED_END_TAG_OPEN: i32 = 23
+pub const STATE_SCRIPT_DATA_ESCAPED_END_TAG_NAME: i32 = 24
+pub const STATE_SCRIPT_DATA_DOUBLE_ESCAPE_START: i32 = 25
+pub const STATE_SCRIPT_DATA_DOUBLE_ESCAPED: i32 = 26
+pub const STATE_SCRIPT_DATA_DOUBLE_ESCAPED_DASH: i32 = 27
+pub const STATE_SCRIPT_DATA_DOUBLE_ESCAPED_DASH_DASH: i32 = 28
+pub const STATE_SCRIPT_DATA_DOUBLE_ESCAPED_LESS_THAN_SIGN: i32 = 29
+pub const STATE_SCRIPT_DATA_DOUBLE_ESCAPE_END: i32 = 30
+pub const STATE_BEFORE_ATTRIBUTE_NAME: i32 = 31
+pub const STATE_ATTRIBUTE_NAME: i32 = 32
+pub const STATE_AFTER_ATTRIBUTE_NAME: i32 = 33
+pub const STATE_BEFORE_ATTRIBUTE_VALUE: i32 = 34
+pub const STATE_ATTRIBUTE_VALUE_DOUBLE_QUOTED: i32 = 35
+pub const STATE_ATTRIBUTE_VALUE_SINGLE_QUOTED: i32 = 36
+pub const STATE_ATTRIBUTE_VALUE_UNQUOTED: i32 = 37
+pub const STATE_AFTER_ATTRIBUTE_VALUE_QUOTED: i32 = 38
+pub const STATE_SELF_CLOSING_START_TAG: i32 = 39
+pub const STATE_BOGUS_COMMENT: i32 = 40
+pub const STATE_MARKUP_DECLARATION_OPEN: i32 = 41
+pub const STATE_COMMENT_START: i32 = 42
+pub const STATE_COMMENT_START_DASH: i32 = 43
+pub const STATE_COMMENT: i32 = 44
+pub const STATE_COMMENT_LESS_THAN_SIGN: i32 = 45
+pub const STATE_COMMENT_LESS_THAN_SIGN_BANG: i32 = 46
+pub const STATE_COMMENT_LESS_THAN_SIGN_BANG_DASH: i32 = 47
+pub const STATE_COMMENT_LESS_THAN_SIGN_BANG_DASH_DASH: i32 = 48
+pub const STATE_COMMENT_END_DASH: i32 = 49
+pub const STATE_COMMENT_END: i32 = 50
+pub const STATE_COMMENT_END_BANG: i32 = 51
+pub const STATE_DOCTYPE: i32 = 52
+pub const STATE_BEFORE_DOCTYPE_NAME: i32 = 53
+pub const STATE_DOCTYPE_NAME: i32 = 54
+pub const STATE_AFTER_DOCTYPE_NAME: i32 = 55
+pub const STATE_AFTER_DOCTYPE_PUBLIC_KEYWORD: i32 = 56
+pub const STATE_BEFORE_DOCTYPE_PUBLIC_ID: i32 = 57
+pub const STATE_DOCTYPE_PUBLIC_ID_DOUBLE_QUOTED: i32 = 58
+pub const STATE_DOCTYPE_PUBLIC_ID_SINGLE_QUOTED: i32 = 59
+pub const STATE_AFTER_DOCTYPE_PUBLIC_ID: i32 = 60
+pub const STATE_BETWEEN_DOCTYPE_PUBLIC_AND_SYSTEM: i32 = 61
+pub const STATE_AFTER_DOCTYPE_SYSTEM_KEYWORD: i32 = 62
+pub const STATE_BEFORE_DOCTYPE_SYSTEM_ID: i32 = 63
+pub const STATE_DOCTYPE_SYSTEM_ID_DOUBLE_QUOTED: i32 = 64
+pub const STATE_DOCTYPE_SYSTEM_ID_SINGLE_QUOTED: i32 = 65
+pub const STATE_AFTER_DOCTYPE_SYSTEM_ID: i32 = 66
+pub const STATE_BOGUS_DOCTYPE: i32 = 67
+pub const STATE_CDATA_SECTION: i32 = 68
+pub const STATE_CDATA_SECTION_BRACKET: i32 = 69
+pub const STATE_CDATA_SECTION_END: i32 = 70
+pub const STATE_CHARACTER_REFERENCE: i32 = 71
+pub const STATE_NAMED_CHARACTER_REFERENCE: i32 = 72
+pub const STATE_AMBIGUOUS_AMPERSAND: i32 = 73
+pub const STATE_NUMERIC_CHARACTER_REFERENCE: i32 = 74
+pub const STATE_HEXADECIMAL_CHARACTER_REFERENCE_START: i32 = 75
+pub const STATE_DECIMAL_CHARACTER_REFERENCE_START: i32 = 76
+pub const STATE_HEXADECIMAL_CHARACTER_REFERENCE: i32 = 77
+pub const STATE_DECIMAL_CHARACTER_REFERENCE: i32 = 78
+pub const STATE_NUMERIC_CHARACTER_REFERENCE_END: i32 = 79
+
+# =============================================================================
+# Character Classification
+# =============================================================================
+
+fn is_ascii_alpha(c: u8) -> i32
+    if c >= 65 and c <= 90   # A-Z
+        return 1
+    if c >= 97 and c <= 122  # a-z
+        return 1
+    return 0
+
+fn is_ascii_upper(c: u8) -> i32
+    if c >= 65 and c <= 90   # A-Z
+        return 1
+    return 0
+
+fn is_ascii_digit(c: u8) -> i32
+    if c >= 48 and c <= 57   # 0-9
+        return 1
+    return 0
+
+fn is_ascii_hex(c: u8) -> i32
+    if c >= 48 and c <= 57   # 0-9
+        return 1
+    if c >= 65 and c <= 70   # A-F
+        return 1
+    if c >= 97 and c <= 102  # a-f
+        return 1
+    return 0
+
+fn is_ascii_alphanumeric(c: u8) -> i32
+    if is_ascii_alpha(c) == 1
+        return 1
+    if is_ascii_digit(c) == 1
+        return 1
+    return 0
+
+fn is_whitespace(c: u8) -> i32
+    if c == 9    # tab
+        return 1
+    if c == 10   # newline
+        return 1
+    if c == 12   # form feed
+        return 1
+    if c == 32   # space
+        return 1
+    return 0
+
+fn to_lower(c: u8) -> u8
+    if c >= 65 and c <= 90
+        return c + 32
+    return c
+
+# =============================================================================
+# Tokenizer Buffer
+# =============================================================================
+
+# Maximum sizes for buffers
+const MAX_TAG_NAME_LEN: u32 = 256
+const MAX_ATTR_NAME_LEN: u32 = 256
+const MAX_ATTR_VALUE_LEN: u32 = 4096
+const MAX_ATTRS: u32 = 64
+const MAX_COMMENT_LEN: u32 = 65536
+
+# =============================================================================
+# Tokenizer State
+# =============================================================================
+
+pub struct Tokenizer
+    # Input
+    input: StrView
+    pos: u64
+    line: u32
+    col: u32
+
+    # State machine
+    state: i32
+    return_state: i32       # State to return to after character reference
+
+    # Current token being built
+    # Tag name buffer
+    tag_name: [MAX_TAG_NAME_LEN]u8
+    tag_name_len: u32
+    is_end_tag: i32
+
+    # Attribute buffers
+    attr_name: [MAX_ATTR_NAME_LEN]u8
+    attr_name_len: u32
+    attr_value: [MAX_ATTR_VALUE_LEN]u8
+    attr_value_len: u32
+
+    # Attribute storage
+    attrs: [MAX_ATTRS]Attribute
+    attr_count: u32
+
+    # Self-closing flag
+    self_closing: i32
+
+    # Comment buffer
+    comment_data: [MAX_COMMENT_LEN]u8
+    comment_len: u32
+
+    # DOCTYPE data
+    doctype_name: [MAX_TAG_NAME_LEN]u8
+    doctype_name_len: u32
+    doctype_public_id: [MAX_ATTR_VALUE_LEN]u8
+    doctype_public_id_len: u32
+    doctype_system_id: [MAX_ATTR_VALUE_LEN]u8
+    doctype_system_id_len: u32
+    doctype_force_quirks: i32
+
+    # Temporary buffer for checking end tag names in raw text modes
+    temp_buffer: [MAX_TAG_NAME_LEN]u8
+    temp_buffer_len: u32
+
+    # Character reference decoding
+    char_ref_code: u32
+
+    # Last emitted start tag name (for end tag matching in raw text)
+    last_start_tag: [MAX_TAG_NAME_LEN]u8
+    last_start_tag_len: u32
+
+# =============================================================================
+# Tokenizer Initialization
+# =============================================================================
+
+pub fn tokenizer_new(input: StrView) -> Tokenizer
+    # Create with zero-initialized arrays
+    # Note: In Ritz, we'd need proper array initialization
+    var t: Tokenizer
+
+    t.input = input
+    t.pos = 0
+    t.line = 1
+    t.col = 1
+
+    t.state = STATE_DATA
+    t.return_state = STATE_DATA
+
+    t.tag_name_len = 0
+    t.is_end_tag = 0
+    t.attr_name_len = 0
+    t.attr_value_len = 0
+    t.attr_count = 0
+    t.self_closing = 0
+
+    t.comment_len = 0
+
+    t.doctype_name_len = 0
+    t.doctype_public_id_len = 0
+    t.doctype_system_id_len = 0
+    t.doctype_force_quirks = 0
+
+    t.temp_buffer_len = 0
+    t.char_ref_code = 0
+    t.last_start_tag_len = 0
+
+    t
+
+# =============================================================================
+# Input Handling
+# =============================================================================
+
+fn peek_char(t: Tokenizer) -> i32
+    if t.pos >= t.input.len
+        return -1  # EOF
+    return t.input.data[t.pos] as i32
+
+fn consume_char(t:& Tokenizer) -> i32
+    if t.pos >= t.input.len
+        return -1
+    let c = t.input.data[t.pos] as i32
+    t.pos = t.pos + 1
+
+    # Track line/column
+    if c == 10  # newline
+        t.line = t.line + 1
+        t.col = 1
+    else
+        t.col = t.col + 1
+
+    c
+
+fn unconsume_char(t:& Tokenizer)
+    if t.pos > 0
+        t.pos = t.pos - 1
+        # Note: line/col tracking gets tricky with unconsume
+        # For now, accept minor inaccuracy on unconsume
+        if t.col > 1
+            t.col = t.col - 1
+
+# =============================================================================
+# Token Building Helpers
+# =============================================================================
+
+fn clear_tag(t:& Tokenizer)
+    t.tag_name_len = 0
+    t.is_end_tag = 0
+    t.attr_count = 0
+    t.self_closing = 0
+
+fn append_to_tag_name(t:& Tokenizer, c: u8)
+    if t.tag_name_len < MAX_TAG_NAME_LEN
+        t.tag_name[t.tag_name_len] = to_lower(c)
+        t.tag_name_len = t.tag_name_len + 1
+
+fn clear_attr(t:& Tokenizer)
+    t.attr_name_len = 0
+    t.attr_value_len = 0
+
+fn append_to_attr_name(t:& Tokenizer, c: u8)
+    if t.attr_name_len < MAX_ATTR_NAME_LEN
+        t.attr_name[t.attr_name_len] = to_lower(c)
+        t.attr_name_len = t.attr_name_len + 1
+
+fn append_to_attr_value(t:& Tokenizer, c: u8)
+    if t.attr_value_len < MAX_ATTR_VALUE_LEN
+        t.attr_value[t.attr_value_len] = c
+        t.attr_value_len = t.attr_value_len + 1
+
+fn finish_attr(t:& Tokenizer)
+    if t.attr_name_len > 0 and t.attr_count < MAX_ATTRS
+        # Check for duplicate attribute
+        # HTML5 says: "When the user agent leaves the attribute name state
+        # (and before emitting the tag token, if appropriate), if there is
+        # already an attribute on the token with the exact same name, then
+        # this is a duplicate-attribute parse error and the new attribute
+        # must be removed from the token."
+
+        # For now, just add it (TODO: check duplicates)
+        let name = StrView {
+            data: @t.attr_name[0],
+            len: t.attr_name_len as u64
+        }
+        let value = StrView {
+            data: @t.attr_value[0],
+            len: t.attr_value_len as u64
+        }
+        t.attrs[t.attr_count] = attribute_new(name, value)
+        t.attr_count = t.attr_count + 1
+
+fn append_to_comment(t:& Tokenizer, c: u8)
+    if t.comment_len < MAX_COMMENT_LEN
+        t.comment_data[t.comment_len] = c
+        t.comment_len = t.comment_len + 1
+
+fn clear_comment(t:& Tokenizer)
+    t.comment_len = 0
+
+fn append_to_temp_buffer(t:& Tokenizer, c: u8)
+    if t.temp_buffer_len < MAX_TAG_NAME_LEN
+        t.temp_buffer[t.temp_buffer_len] = c
+        t.temp_buffer_len = t.temp_buffer_len + 1
+
+fn clear_temp_buffer(t:& Tokenizer)
+    t.temp_buffer_len = 0
+
+# =============================================================================
+# Token Emission
+# =============================================================================
+
+fn emit_character(t:& Tokenizer, c: u32) -> token.Token
+    var tok = token.token_eof()
+    tok.kind = token.TOKEN_CHARACTER
+    tok.character = token.character_token_new(c)
+    tok
+
+fn emit_start_tag(t:& Tokenizer) -> token.Token
+    var tok = token.token_eof()
+    tok.kind = token.TOKEN_START_TAG
+    tok.start_tag.name = StrView {
+        data: @t.tag_name[0],
+        len: t.tag_name_len as u64
+    }
+    tok.start_tag.attrs = @t.attrs[0]
+    tok.start_tag.attr_count = t.attr_count
+    tok.start_tag.self_closing = t.self_closing
+
+    # Remember last start tag for end tag matching
+    var i: u32 = 0
+    while i < t.tag_name_len and i < MAX_TAG_NAME_LEN
+        t.last_start_tag[i] = t.tag_name[i]
+        i = i + 1
+    t.last_start_tag_len = t.tag_name_len
+
+    tok
+
+fn emit_end_tag(t:& Tokenizer) -> token.Token
+    var tok = token.token_eof()
+    tok.kind = token.TOKEN_END_TAG
+    tok.end_tag.name = StrView {
+        data: @t.tag_name[0],
+        len: t.tag_name_len as u64
+    }
+    tok
+
+fn emit_comment(t:& Tokenizer) -> token.Token
+    var tok = token.token_eof()
+    tok.kind = token.TOKEN_COMMENT
+    tok.comment.data = StrView {
+        data: @t.comment_data[0],
+        len: t.comment_len as u64
+    }
+    tok
+
+fn emit_doctype(t:& Tokenizer) -> token.Token
+    var tok = token.token_eof()
+    tok.kind = token.TOKEN_DOCTYPE
+    tok.doctype.name = StrView {
+        data: @t.doctype_name[0],
+        len: t.doctype_name_len as u64
+    }
+    tok.doctype.public_id = StrView {
+        data: @t.doctype_public_id[0],
+        len: t.doctype_public_id_len as u64
+    }
+    tok.doctype.system_id = StrView {
+        data: @t.doctype_system_id[0],
+        len: t.doctype_system_id_len as u64
+    }
+    tok.doctype.force_quirks = t.doctype_force_quirks
+    tok
+
+fn emit_eof(t:& Tokenizer) -> token.Token
+    token.token_eof()
+
+# =============================================================================
+# Main Tokenizer Loop
+# =============================================================================
+
+# Get the next token from the input stream
+pub fn tokenizer_next(t:& Tokenizer) -> token.Token
+    loop
+        let c = peek_char(@t)
+
+        if t.state == STATE_DATA
+            if c == -1
+                return emit_eof(t)
+            else if c == 38  # &
+                t.return_state = STATE_DATA
+                t.state = STATE_CHARACTER_REFERENCE
+                consume_char(t)
+            else if c == 60  # <
+                t.state = STATE_TAG_OPEN
+                consume_char(t)
+            else if c == 0
+                # Parse error: unexpected-null-character
+                consume_char(t)
+                return emit_character(t, 65533)  # U+FFFD
+            else
+                consume_char(t)
+                return emit_character(t, c as u32)
+
+        else if t.state == STATE_TAG_OPEN
+            if c == 33  # !
+                t.state = STATE_MARKUP_DECLARATION_OPEN
+                consume_char(t)
+            else if c == 47  # /
+                t.state = STATE_END_TAG_OPEN
+                consume_char(t)
+            else if is_ascii_alpha(c as u8) == 1
+                clear_tag(t)
+                t.state = STATE_TAG_NAME
+                # Don't consume - let TAG_NAME handle it
+            else if c == 63  # ?
+                # Parse error: unexpected-question-mark-instead-of-tag-name
+                clear_comment(t)
+                t.state = STATE_BOGUS_COMMENT
+                # Don't consume
+            else if c == -1
+                # Parse error: eof-before-tag-name
+                return emit_character(t, 60)  # <
+            else
+                # Parse error: invalid-first-character-of-tag-name
+                t.state = STATE_DATA
+                return emit_character(t, 60)  # <
+
+        else if t.state == STATE_END_TAG_OPEN
+            if is_ascii_alpha(c as u8) == 1
+                clear_tag(t)
+                t.is_end_tag = 1
+                t.state = STATE_TAG_NAME
+            else if c == 62  # >
+                # Parse error: missing-end-tag-name
+                t.state = STATE_DATA
+                consume_char(t)
+            else if c == -1
+                # Parse error: eof-before-tag-name
+                # Emit "<" and "/" characters, then EOF
+                return emit_character(t, 60)  # TODO: need to queue multiple tokens
+            else
+                # Parse error: invalid-first-character-of-tag-name
+                clear_comment(t)
+                t.state = STATE_BOGUS_COMMENT
+
+        else if t.state == STATE_TAG_NAME
+            if is_whitespace(c as u8) == 1
+                t.state = STATE_BEFORE_ATTRIBUTE_NAME
+                consume_char(t)
+            else if c == 47  # /
+                t.state = STATE_SELF_CLOSING_START_TAG
+                consume_char(t)
+            else if c == 62  # >
+                t.state = STATE_DATA
+                consume_char(t)
+                if t.is_end_tag == 1
+                    return emit_end_tag(t)
+                else
+                    return emit_start_tag(t)
+            else if is_ascii_upper(c as u8) == 1
+                append_to_tag_name(t, c as u8)
+                consume_char(t)
+            else if c == 0
+                # Parse error
+                append_to_tag_name(t, 0xFD)  # Part of U+FFFD in UTF-8
+                consume_char(t)
+            else if c == -1
+                # Parse error: eof-in-tag
+                return emit_eof(t)
+            else
+                append_to_tag_name(t, c as u8)
+                consume_char(t)
+
+        else if t.state == STATE_BEFORE_ATTRIBUTE_NAME
+            if is_whitespace(c as u8) == 1
+                consume_char(t)
+                # Stay in this state
+            else if c == 47 or c == 62 or c == -1  # / > EOF
+                t.state = STATE_AFTER_ATTRIBUTE_NAME
+                # Reconsume
+            else if c == 61  # =
+                # Parse error: unexpected-equals-sign-before-attribute-name
+                clear_attr(t)
+                append_to_attr_name(t, c as u8)
+                t.state = STATE_ATTRIBUTE_NAME
+                consume_char(t)
+            else
+                clear_attr(t)
+                t.state = STATE_ATTRIBUTE_NAME
+                # Reconsume
+
+        else if t.state == STATE_ATTRIBUTE_NAME
+            if is_whitespace(c as u8) == 1 or c == 47 or c == 62 or c == -1
+                t.state = STATE_AFTER_ATTRIBUTE_NAME
+                # Reconsume
+            else if c == 61  # =
+                t.state = STATE_BEFORE_ATTRIBUTE_VALUE
+                consume_char(t)
+            else if is_ascii_upper(c as u8) == 1
+                append_to_attr_name(t, c as u8)
+                consume_char(t)
+            else if c == 0
+                # Parse error
+                append_to_attr_name(t, 0xFD)
+                consume_char(t)
+            else if c == 34 or c == 39 or c == 60  # " ' <
+                # Parse error
+                append_to_attr_name(t, c as u8)
+                consume_char(t)
+            else
+                append_to_attr_name(t, c as u8)
+                consume_char(t)
+
+        else if t.state == STATE_AFTER_ATTRIBUTE_NAME
+            if is_whitespace(c as u8) == 1
+                consume_char(t)
+            else if c == 47  # /
+                t.state = STATE_SELF_CLOSING_START_TAG
+                consume_char(t)
+            else if c == 61  # =
+                t.state = STATE_BEFORE_ATTRIBUTE_VALUE
+                consume_char(t)
+            else if c == 62  # >
+                finish_attr(t)
+                t.state = STATE_DATA
+                consume_char(t)
+                if t.is_end_tag == 1
+                    return emit_end_tag(t)
+                else
+                    return emit_start_tag(t)
+            else if c == -1
+                # Parse error: eof-in-tag
+                return emit_eof(t)
+            else
+                finish_attr(t)
+                clear_attr(t)
+                t.state = STATE_ATTRIBUTE_NAME
+                # Reconsume
+
+        else if t.state == STATE_BEFORE_ATTRIBUTE_VALUE
+            if is_whitespace(c as u8) == 1
+                consume_char(t)
+            else if c == 34  # "
+                t.state = STATE_ATTRIBUTE_VALUE_DOUBLE_QUOTED
+                consume_char(t)
+            else if c == 39  # '
+                t.state = STATE_ATTRIBUTE_VALUE_SINGLE_QUOTED
+                consume_char(t)
+            else if c == 62  # >
+                # Parse error: missing-attribute-value
+                finish_attr(t)
+                t.state = STATE_DATA
+                consume_char(t)
+                if t.is_end_tag == 1
+                    return emit_end_tag(t)
+                else
+                    return emit_start_tag(t)
+            else
+                t.state = STATE_ATTRIBUTE_VALUE_UNQUOTED
+                # Reconsume
+
+        else if t.state == STATE_ATTRIBUTE_VALUE_DOUBLE_QUOTED
+            if c == 34  # "
+                finish_attr(t)
+                t.state = STATE_AFTER_ATTRIBUTE_VALUE_QUOTED
+                consume_char(t)
+            else if c == 38  # &
+                t.return_state = STATE_ATTRIBUTE_VALUE_DOUBLE_QUOTED
+                t.state = STATE_CHARACTER_REFERENCE
+                consume_char(t)
+            else if c == 0
+                # Parse error
+                append_to_attr_value(t, 0xFD)
+                consume_char(t)
+            else if c == -1
+                # Parse error: eof-in-tag
+                return emit_eof(t)
+            else
+                append_to_attr_value(t, c as u8)
+                consume_char(t)
+
+        else if t.state == STATE_ATTRIBUTE_VALUE_SINGLE_QUOTED
+            if c == 39  # '
+                finish_attr(t)
+                t.state = STATE_AFTER_ATTRIBUTE_VALUE_QUOTED
+                consume_char(t)
+            else if c == 38  # &
+                t.return_state = STATE_ATTRIBUTE_VALUE_SINGLE_QUOTED
+                t.state = STATE_CHARACTER_REFERENCE
+                consume_char(t)
+            else if c == 0
+                append_to_attr_value(t, 0xFD)
+                consume_char(t)
+            else if c == -1
+                return emit_eof(t)
+            else
+                append_to_attr_value(t, c as u8)
+                consume_char(t)
+
+        else if t.state == STATE_ATTRIBUTE_VALUE_UNQUOTED
+            if is_whitespace(c as u8) == 1
+                finish_attr(t)
+                t.state = STATE_BEFORE_ATTRIBUTE_NAME
+                consume_char(t)
+            else if c == 38  # &
+                t.return_state = STATE_ATTRIBUTE_VALUE_UNQUOTED
+                t.state = STATE_CHARACTER_REFERENCE
+                consume_char(t)
+            else if c == 62  # >
+                finish_attr(t)
+                t.state = STATE_DATA
+                consume_char(t)
+                if t.is_end_tag == 1
+                    return emit_end_tag(t)
+                else
+                    return emit_start_tag(t)
+            else if c == 0
+                append_to_attr_value(t, 0xFD)
+                consume_char(t)
+            else if c == 34 or c == 39 or c == 60 or c == 61 or c == 96
+                # " ' < = `
+                # Parse error
+                append_to_attr_value(t, c as u8)
+                consume_char(t)
+            else if c == -1
+                return emit_eof(t)
+            else
+                append_to_attr_value(t, c as u8)
+                consume_char(t)
+
+        else if t.state == STATE_AFTER_ATTRIBUTE_VALUE_QUOTED
+            if is_whitespace(c as u8) == 1
+                t.state = STATE_BEFORE_ATTRIBUTE_NAME
+                consume_char(t)
+            else if c == 47  # /
+                t.state = STATE_SELF_CLOSING_START_TAG
+                consume_char(t)
+            else if c == 62  # >
+                t.state = STATE_DATA
+                consume_char(t)
+                if t.is_end_tag == 1
+                    return emit_end_tag(t)
+                else
+                    return emit_start_tag(t)
+            else if c == -1
+                return emit_eof(t)
+            else
+                # Parse error: missing-whitespace-between-attributes
+                t.state = STATE_BEFORE_ATTRIBUTE_NAME
+                # Reconsume
+
+        else if t.state == STATE_SELF_CLOSING_START_TAG
+            if c == 62  # >
+                t.self_closing = 1
+                t.state = STATE_DATA
+                consume_char(t)
+                if t.is_end_tag == 1
+                    return emit_end_tag(t)
+                else
+                    return emit_start_tag(t)
+            else if c == -1
+                return emit_eof(t)
+            else
+                # Parse error: unexpected-solidus-in-tag
+                t.state = STATE_BEFORE_ATTRIBUTE_NAME
+                # Reconsume
+
+        else if t.state == STATE_MARKUP_DECLARATION_OPEN
+            # Check for "--" (comment), "DOCTYPE", or "[CDATA["
+            # For simplicity, we'll peek ahead
+
+            # Check for "--"
+            if c == 45  # -
+                consume_char(t)
+                let c2 = peek_char(@t)
+                if c2 == 45  # -
+                    consume_char(t)
+                    clear_comment(t)
+                    t.state = STATE_COMMENT_START
+                else
+                    # Parse error
+                    clear_comment(t)
+                    t.state = STATE_BOGUS_COMMENT
+                    unconsume_char(t)
+            else
+                # Check for "DOCTYPE" (case-insensitive)
+                # For now, simplify - check if it starts with 'd' or 'D'
+                if c == 68 or c == 100  # D or d
+                    # Would need to peek ahead more to confirm DOCTYPE
+                    # For now, assume DOCTYPE
+                    consume_char(t)
+                    # Skip "OCTYPE" (6 more chars)
+                    var i = 0
+                    while i < 6
+                        consume_char(t)
+                        i = i + 1
+                    t.doctype_name_len = 0
+                    t.doctype_public_id_len = 0
+                    t.doctype_system_id_len = 0
+                    t.doctype_force_quirks = 0
+                    t.state = STATE_DOCTYPE
+                else
+                    # Parse error: incorrectly-opened-comment
+                    clear_comment(t)
+                    t.state = STATE_BOGUS_COMMENT
+
+        else if t.state == STATE_COMMENT_START
+            if c == 45  # -
+                t.state = STATE_COMMENT_START_DASH
+                consume_char(t)
+            else if c == 62  # >
+                # Parse error: abrupt-closing-of-empty-comment
+                t.state = STATE_DATA
+                consume_char(t)
+                return emit_comment(t)
+            else
+                t.state = STATE_COMMENT
+                # Reconsume
+
+        else if t.state == STATE_COMMENT_START_DASH
+            if c == 45  # -
+                t.state = STATE_COMMENT_END
+                consume_char(t)
+            else if c == 62  # >
+                # Parse error
+                t.state = STATE_DATA
+                consume_char(t)
+                return emit_comment(t)
+            else if c == -1
+                return emit_comment(t)
+            else
+                append_to_comment(t, 45)  # -
+                t.state = STATE_COMMENT
+                # Reconsume
+
+        else if t.state == STATE_COMMENT
+            if c == 60  # <
+                append_to_comment(t, c as u8)
+                t.state = STATE_COMMENT_LESS_THAN_SIGN
+                consume_char(t)
+            else if c == 45  # -
+                t.state = STATE_COMMENT_END_DASH
+                consume_char(t)
+            else if c == 0
+                # Parse error
+                append_to_comment(t, 0xFD)
+                consume_char(t)
+            else if c == -1
+                return emit_comment(t)
+            else
+                append_to_comment(t, c as u8)
+                consume_char(t)
+
+        else if t.state == STATE_COMMENT_END_DASH
+            if c == 45  # -
+                t.state = STATE_COMMENT_END
+                consume_char(t)
+            else if c == -1
+                return emit_comment(t)
+            else
+                append_to_comment(t, 45)  # -
+                t.state = STATE_COMMENT
+                # Reconsume
+
+        else if t.state == STATE_COMMENT_END
+            if c == 62  # >
+                t.state = STATE_DATA
+                consume_char(t)
+                return emit_comment(t)
+            else if c == 33  # !
+                t.state = STATE_COMMENT_END_BANG
+                consume_char(t)
+            else if c == 45  # -
+                append_to_comment(t, 45)
+                consume_char(t)
+            else if c == -1
+                return emit_comment(t)
+            else
+                append_to_comment(t, 45)
+                append_to_comment(t, 45)
+                t.state = STATE_COMMENT
+                # Reconsume
+
+        else if t.state == STATE_DOCTYPE
+            if is_whitespace(c as u8) == 1
+                t.state = STATE_BEFORE_DOCTYPE_NAME
+                consume_char(t)
+            else if c == 62  # >
+                t.state = STATE_BEFORE_DOCTYPE_NAME
+                # Reconsume
+            else if c == -1
+                t.doctype_force_quirks = 1
+                return emit_doctype(t)
+            else
+                # Parse error
+                t.state = STATE_BEFORE_DOCTYPE_NAME
+                # Reconsume
+
+        else if t.state == STATE_BEFORE_DOCTYPE_NAME
+            if is_whitespace(c as u8) == 1
+                consume_char(t)
+            else if is_ascii_upper(c as u8) == 1
+                t.doctype_name[0] = to_lower(c as u8)
+                t.doctype_name_len = 1
+                t.state = STATE_DOCTYPE_NAME
+                consume_char(t)
+            else if c == 0
+                # Parse error
+                t.doctype_name[0] = 0xFD
+                t.doctype_name_len = 1
+                t.state = STATE_DOCTYPE_NAME
+                consume_char(t)
+            else if c == 62  # >
+                # Parse error: missing-doctype-name
+                t.doctype_force_quirks = 1
+                t.state = STATE_DATA
+                consume_char(t)
+                return emit_doctype(t)
+            else if c == -1
+                t.doctype_force_quirks = 1
+                return emit_doctype(t)
+            else
+                t.doctype_name[0] = c as u8
+                t.doctype_name_len = 1
+                t.state = STATE_DOCTYPE_NAME
+                consume_char(t)
+
+        else if t.state == STATE_DOCTYPE_NAME
+            if is_whitespace(c as u8) == 1
+                t.state = STATE_AFTER_DOCTYPE_NAME
+                consume_char(t)
+            else if c == 62  # >
+                t.state = STATE_DATA
+                consume_char(t)
+                return emit_doctype(t)
+            else if is_ascii_upper(c as u8) == 1
+                if t.doctype_name_len < MAX_TAG_NAME_LEN
+                    t.doctype_name[t.doctype_name_len] = to_lower(c as u8)
+                    t.doctype_name_len = t.doctype_name_len + 1
+                consume_char(t)
+            else if c == 0
+                if t.doctype_name_len < MAX_TAG_NAME_LEN
+                    t.doctype_name[t.doctype_name_len] = 0xFD
+                    t.doctype_name_len = t.doctype_name_len + 1
+                consume_char(t)
+            else if c == -1
+                t.doctype_force_quirks = 1
+                return emit_doctype(t)
+            else
+                if t.doctype_name_len < MAX_TAG_NAME_LEN
+                    t.doctype_name[t.doctype_name_len] = c as u8
+                    t.doctype_name_len = t.doctype_name_len + 1
+                consume_char(t)
+
+        else if t.state == STATE_AFTER_DOCTYPE_NAME
+            if is_whitespace(c as u8) == 1
+                consume_char(t)
+            else if c == 62  # >
+                t.state = STATE_DATA
+                consume_char(t)
+                return emit_doctype(t)
+            else if c == -1
+                t.doctype_force_quirks = 1
+                return emit_doctype(t)
+            else
+                # Could be PUBLIC or SYSTEM keyword
+                # For MVP, skip to bogus
+                t.state = STATE_BOGUS_DOCTYPE
+                consume_char(t)
+
+        else if t.state == STATE_BOGUS_DOCTYPE
+            if c == 62  # >
+                t.state = STATE_DATA
+                consume_char(t)
+                return emit_doctype(t)
+            else if c == 0
+                consume_char(t)
+            else if c == -1
+                return emit_doctype(t)
+            else
+                consume_char(t)
+
+        else if t.state == STATE_BOGUS_COMMENT
+            if c == 62  # >
+                t.state = STATE_DATA
+                consume_char(t)
+                return emit_comment(t)
+            else if c == -1
+                return emit_comment(t)
+            else if c == 0
+                append_to_comment(t, 0xFD)
+                consume_char(t)
+            else
+                append_to_comment(t, c as u8)
+                consume_char(t)
+
+        else if t.state == STATE_CHARACTER_REFERENCE
+            # Simplified character reference handling
+            # Full implementation needs named entity lookup
+            clear_temp_buffer(t)
+            append_to_temp_buffer(t, 38)  # &
+
+            if c == 35  # #
+                append_to_temp_buffer(t, c as u8)
+                t.state = STATE_NUMERIC_CHARACTER_REFERENCE
+                consume_char(t)
+            else if is_ascii_alphanumeric(c as u8) == 1
+                t.state = STATE_NAMED_CHARACTER_REFERENCE
+                # Reconsume
+            else
+                # Not a character reference, flush temp buffer
+                t.state = t.return_state
+                # Emit "&" character
+                return emit_character(t, 38)
+
+        else if t.state == STATE_NAMED_CHARACTER_REFERENCE
+            # Simplified: just emit & and return
+            # Full implementation needs entity table lookup
+            t.state = t.return_state
+            return emit_character(t, 38)
+
+        else if t.state == STATE_NUMERIC_CHARACTER_REFERENCE
+            t.char_ref_code = 0
+            if c == 120 or c == 88  # x or X
+                append_to_temp_buffer(t, c as u8)
+                t.state = STATE_HEXADECIMAL_CHARACTER_REFERENCE_START
+                consume_char(t)
+            else
+                t.state = STATE_DECIMAL_CHARACTER_REFERENCE_START
+                # Reconsume
+
+        else if t.state == STATE_HEXADECIMAL_CHARACTER_REFERENCE_START
+            if is_ascii_hex(c as u8) == 1
+                t.state = STATE_HEXADECIMAL_CHARACTER_REFERENCE
+                # Reconsume
+            else
+                # Parse error
+                t.state = t.return_state
+                return emit_character(t, 38)
+
+        else if t.state == STATE_DECIMAL_CHARACTER_REFERENCE_START
+            if is_ascii_digit(c as u8) == 1
+                t.state = STATE_DECIMAL_CHARACTER_REFERENCE
+                # Reconsume
+            else
+                t.state = t.return_state
+                return emit_character(t, 38)
+
+        else if t.state == STATE_HEXADECIMAL_CHARACTER_REFERENCE
+            if is_ascii_digit(c as u8) == 1
+                t.char_ref_code = t.char_ref_code * 16 + (c as u32 - 48)
+                consume_char(t)
+            else if c >= 65 and c <= 70  # A-F
+                t.char_ref_code = t.char_ref_code * 16 + (c as u32 - 55)
+                consume_char(t)
+            else if c >= 97 and c <= 102  # a-f
+                t.char_ref_code = t.char_ref_code * 16 + (c as u32 - 87)
+                consume_char(t)
+            else if c == 59  # ;
+                t.state = STATE_NUMERIC_CHARACTER_REFERENCE_END
+                consume_char(t)
+            else
+                # Parse error: missing semicolon
+                t.state = STATE_NUMERIC_CHARACTER_REFERENCE_END
+                # Reconsume
+
+        else if t.state == STATE_DECIMAL_CHARACTER_REFERENCE
+            if is_ascii_digit(c as u8) == 1
+                t.char_ref_code = t.char_ref_code * 10 + (c as u32 - 48)
+                consume_char(t)
+            else if c == 59  # ;
+                t.state = STATE_NUMERIC_CHARACTER_REFERENCE_END
+                consume_char(t)
+            else
+                t.state = STATE_NUMERIC_CHARACTER_REFERENCE_END
+                # Reconsume
+
+        else if t.state == STATE_NUMERIC_CHARACTER_REFERENCE_END
+            # Validate and convert code point
+            var code = t.char_ref_code
+
+            # Check for invalid code points
+            if code == 0
+                code = 0xFFFD
+            else if code > 0x10FFFF
+                code = 0xFFFD
+            else if code >= 0xD800 and code <= 0xDFFF
+                code = 0xFFFD
+
+            t.state = t.return_state
+
+            # If in attribute value, append to value
+            # Otherwise emit as character
+            if t.return_state == STATE_ATTRIBUTE_VALUE_DOUBLE_QUOTED or t.return_state == STATE_ATTRIBUTE_VALUE_SINGLE_QUOTED or t.return_state == STATE_ATTRIBUTE_VALUE_UNQUOTED
+                # Append to attribute value (UTF-8 encoding needed)
+                if code < 0x80
+                    append_to_attr_value(t, code as u8)
+                else
+                    # Simplified: just use replacement char for non-ASCII
+                    append_to_attr_value(t, 0xFD)
+            else
+                return emit_character(t, code)
+
+        else
+            # For other/unhandled states, just advance
+            consume_char(t)
+
+# =============================================================================
+# Set Tokenizer State (for tree builder to switch modes)
+# =============================================================================
+
+pub fn tokenizer_set_state(t:& Tokenizer, state: i32)
+    t.state = state

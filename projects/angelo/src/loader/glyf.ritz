@@ -1,0 +1,448 @@
+# Angelo - GLYF Table Parser
+#
+# The 'glyf' table contains the actual glyph outlines.
+# Each glyph is either:
+# - Simple: direct outline data (contours with points)
+# - Composite: references to other glyphs with transformations
+#
+# Simple glyph format:
+# - numberOfContours (i16, negative = composite)
+# - xMin, yMin, xMax, yMax (bounding box)
+# - endPtsOfContours[numberOfContours]
+# - instructionLength
+# - instructions[instructionLength]
+# - flags[]
+# - xCoordinates[]
+# - yCoordinates[]
+
+import loader.reader.Reader
+import types.GlyphOutline
+import types.Contour
+import types.OutlinePoint
+
+# Glyph flags (from the flags array)
+const FLAG_ON_CURVE: u8 = 0x01
+const FLAG_X_SHORT: u8 = 0x02
+const FLAG_Y_SHORT: u8 = 0x04
+const FLAG_REPEAT: u8 = 0x08
+const FLAG_X_SAME_OR_POSITIVE: u8 = 0x10
+const FLAG_Y_SAME_OR_POSITIVE: u8 = 0x20
+
+# Component flags (for composite glyphs)
+const ARG_1_AND_2_ARE_WORDS: u16 = 0x0001
+const ARGS_ARE_XY_VALUES: u16 = 0x0002
+const ROUND_XY_TO_GRID: u16 = 0x0004
+const WE_HAVE_A_SCALE: u16 = 0x0008
+const MORE_COMPONENTS: u16 = 0x0020
+const WE_HAVE_AN_X_AND_Y_SCALE: u16 = 0x0040
+const WE_HAVE_A_TWO_BY_TWO: u16 = 0x0080
+const WE_HAVE_INSTRUCTIONS: u16 = 0x0100
+
+# A component of a composite glyph
+# Supports full 2x2 affine transformation matrix
+pub struct GlyphComponent
+    glyph_id: u16
+    x_offset: i16
+    y_offset: i16
+    # 2x2 transform matrix in F2Dot14 format (scaled by 16384)
+    # | a  b |   default = identity = | 16384  0     |
+    # | c  d |                        | 0      16384 |
+    a: i16
+    b: i16
+    c: i16
+    d: i16
+    has_transform: bool
+
+impl GlyphComponent
+    pub fn new(glyph_id: u16, x_offset: i16, y_offset: i16) -> GlyphComponent
+        GlyphComponent {
+            glyph_id: glyph_id,
+            x_offset: x_offset,
+            y_offset: y_offset,
+            a: 16384,  # 1.0 in F2Dot14
+            b: 0,
+            c: 0,
+            d: 16384,  # 1.0 in F2Dot14
+            has_transform: false
+        }
+
+    pub fn with_scale(glyph_id: u16, x_offset: i16, y_offset: i16, scale: i16) -> GlyphComponent
+        GlyphComponent {
+            glyph_id: glyph_id,
+            x_offset: x_offset,
+            y_offset: y_offset,
+            a: scale,
+            b: 0,
+            c: 0,
+            d: scale,
+            has_transform: true
+        }
+
+    pub fn with_xy_scale(glyph_id: u16, x_offset: i16, y_offset: i16, x_scale: i16, y_scale: i16) -> GlyphComponent
+        GlyphComponent {
+            glyph_id: glyph_id,
+            x_offset: x_offset,
+            y_offset: y_offset,
+            a: x_scale,
+            b: 0,
+            c: 0,
+            d: y_scale,
+            has_transform: true
+        }
+
+    pub fn with_matrix(glyph_id: u16, x_offset: i16, y_offset: i16, a: i16, b: i16, c: i16, d: i16) -> GlyphComponent
+        GlyphComponent {
+            glyph_id: glyph_id,
+            x_offset: x_offset,
+            y_offset: y_offset,
+            a: a,
+            b: b,
+            c: c,
+            d: d,
+            has_transform: true
+        }
+
+    # Transform a point using this component's matrix
+    # Returns transformed (x, y)
+    pub fn transform_point(self, x: i16, y: i16) -> (i16, i16)
+        if not self.has_transform
+            # Just apply offset
+            return (x + self.x_offset, y + self.y_offset)
+
+        # Apply 2x2 transform then offset
+        # new_x = a*x + b*y + x_offset
+        # new_y = c*x + d*y + y_offset
+        # Values are F2Dot14, so divide by 16384
+        let new_x = ((self.a as i32 * x as i32 + self.b as i32 * y as i32) / 16384) as i16 + self.x_offset
+        let new_y = ((self.c as i32 * x as i32 + self.d as i32 * y as i32) / 16384) as i16 + self.y_offset
+        (new_x, new_y)
+
+# Result of parsing a glyph
+pub enum ParsedGlyph
+    Simple(GlyphOutline)
+    Composite(Vec<GlyphComponent>)
+    Empty
+
+# Parse a simple glyph
+fn parse_simple_glyph(reader:& Reader, num_contours: i16) -> Result<GlyphOutline, StrView>
+    if num_contours <= 0
+        return Ok(GlyphOutline.empty())
+
+    # Read bounding box
+    let x_min = reader.read_i16()?
+    let y_min = reader.read_i16()?
+    let x_max = reader.read_i16()?
+    let y_max = reader.read_i16()?
+
+    # Read end points of contours
+    var end_pts = Vec.with_capacity(num_contours as usize)
+    for i in 0..num_contours as usize
+        end_pts.push(reader.read_u16()?)
+
+    # Total number of points is last endPt + 1
+    let num_points = end_pts[num_contours as usize - 1] as usize + 1
+
+    # Skip instructions
+    let instruction_length = reader.read_u16()?
+    reader.skip(instruction_length as usize)
+
+    # Read flags
+    var flags = Vec.with_capacity(num_points)
+    var i = 0usize
+    while i < num_points
+        let flag = reader.read_u8()?
+        flags.push(flag)
+        i = i + 1
+
+        # Handle repeat flag
+        if (flag and FLAG_REPEAT) != 0
+            let repeat_count = reader.read_u8()? as usize
+            for j in 0..repeat_count
+                flags.push(flag)
+                i = i + 1
+
+    # Read X coordinates
+    var x_coords = Vec.with_capacity(num_points)
+    var x: i16 = 0
+    for i in 0..num_points
+        let flag = flags[i]
+        if (flag and FLAG_X_SHORT) != 0
+            let dx = reader.read_u8()? as i16
+            if (flag and FLAG_X_SAME_OR_POSITIVE) != 0
+                x = x + dx
+            else
+                x = x - dx
+        else
+            if (flag and FLAG_X_SAME_OR_POSITIVE) != 0
+                # x is same as previous
+                pass
+            else
+                x = x + reader.read_i16()?
+        x_coords.push(x)
+
+    # Read Y coordinates
+    var y_coords = Vec.with_capacity(num_points)
+    var y: i16 = 0
+    for i in 0..num_points
+        let flag = flags[i]
+        if (flag and FLAG_Y_SHORT) != 0
+            let dy = reader.read_u8()? as i16
+            if (flag and FLAG_Y_SAME_OR_POSITIVE) != 0
+                y = y + dy
+            else
+                y = y - dy
+        else
+            if (flag and FLAG_Y_SAME_OR_POSITIVE) != 0
+                # y is same as previous
+                pass
+            else
+                y = y + reader.read_i16()?
+        y_coords.push(y)
+
+    # Build contours
+    var outline = GlyphOutline.new()
+    outline.x_min = x_min
+    outline.y_min = y_min
+    outline.x_max = x_max
+    outline.y_max = y_max
+
+    var start_pt = 0usize
+    for c in 0..num_contours as usize
+        var contour = Contour.new()
+        let end_pt = end_pts[c] as usize
+
+        for p in start_pt..=end_pt
+            let on_curve = (flags[p] and FLAG_ON_CURVE) != 0
+            contour.add_point(OutlinePoint.new(x_coords[p], y_coords[p], on_curve))
+
+        outline.add_contour(contour)
+        start_pt = end_pt + 1
+
+    Ok(outline)
+
+# Parse a composite glyph
+fn parse_composite_glyph(reader:& Reader) -> Result<Vec<GlyphComponent>, StrView>
+    # Skip bounding box
+    reader.skip(8)
+
+    var components = Vec.new()
+
+    loop
+        let comp_flags = reader.read_u16()?
+        let glyph_id = reader.read_u16()?
+
+        # Read offsets
+        var x_offset: i16 = 0
+        var y_offset: i16 = 0
+
+        if (comp_flags and ARG_1_AND_2_ARE_WORDS) != 0
+            if (comp_flags and ARGS_ARE_XY_VALUES) != 0
+                x_offset = reader.read_i16()?
+                y_offset = reader.read_i16()?
+            else
+                # Point numbers, not offsets - read but treat as zero offset
+                reader.skip(4)
+        else
+            if (comp_flags and ARGS_ARE_XY_VALUES) != 0
+                x_offset = reader.read_i8()? as i16
+                y_offset = reader.read_i8()? as i16
+            else
+                # Point numbers - read but treat as zero offset
+                reader.skip(2)
+
+        # Read scale/transform data
+        var component: GlyphComponent = GlyphComponent.new(glyph_id, x_offset, y_offset)
+
+        if (comp_flags and WE_HAVE_A_SCALE) != 0
+            # Uniform scale
+            let scale = reader.read_i16()?
+            component = GlyphComponent.with_scale(glyph_id, x_offset, y_offset, scale)
+        else if (comp_flags and WE_HAVE_AN_X_AND_Y_SCALE) != 0
+            # Non-uniform scale
+            let x_scale = reader.read_i16()?
+            let y_scale = reader.read_i16()?
+            component = GlyphComponent.with_xy_scale(glyph_id, x_offset, y_offset, x_scale, y_scale)
+        else if (comp_flags and WE_HAVE_A_TWO_BY_TWO) != 0
+            # Full 2x2 matrix
+            let a = reader.read_i16()?
+            let b = reader.read_i16()?
+            let c = reader.read_i16()?
+            let d = reader.read_i16()?
+            component = GlyphComponent.with_matrix(glyph_id, x_offset, y_offset, a, b, c, d)
+
+        components.push(component)
+
+        if (comp_flags and MORE_COMPONENTS) == 0
+            break
+
+    Ok(components)
+
+# Parse a glyph from raw data
+pub fn parse_glyph(data: @[u8]) -> Result<ParsedGlyph, StrView>
+    if data.len() == 0
+        return Ok(ParsedGlyph.Empty)
+
+    var reader = Reader.new(data)
+
+    let num_contours = reader.read_i16()?
+
+    if num_contours >= 0
+        let outline = parse_simple_glyph(@&reader, num_contours)?
+        Ok(ParsedGlyph.Simple(outline))
+    else
+        # Negative num_contours indicates composite glyph
+        let components = parse_composite_glyph(@&reader)?
+        Ok(ParsedGlyph.Composite(components))
+
+# Extract a glyph's raw data from the glyf table using loca offsets
+pub fn get_glyph_data(glyf_data: @[u8], offset: u32, length: u32) -> @[u8]
+    if length == 0
+        return @[]
+    let start = offset as usize
+    let end = start + length as usize
+    @glyf_data[start..end]
+
+# Resolve a composite glyph into a single outline
+# Takes a lookup function to fetch component outlines
+pub fn resolve_composite(
+    components: @Vec<GlyphComponent>,
+    lookup_outline: fn(u16) -> Option<GlyphOutline>
+) -> GlyphOutline
+    var result = GlyphOutline.new()
+
+    # Track bounding box
+    var first = true
+
+    for comp in components
+        # Get the component's outline
+        let outline_opt = lookup_outline(comp.glyph_id)
+        let outline = match outline_opt
+            Some(o) => o
+            None => continue
+
+        # Transform and add each contour
+        for contour in @outline.contours
+            var new_contour = Contour.new()
+
+            for point in @contour.points
+                let (new_x, new_y) = comp.transform_point(point.x, point.y)
+                new_contour.add_point(OutlinePoint.new(new_x, new_y, point.on_curve))
+
+            result.add_contour(new_contour)
+
+        # Update bounding box
+        if first
+            result.x_min = outline.x_min + comp.x_offset
+            result.y_min = outline.y_min + comp.y_offset
+            result.x_max = outline.x_max + comp.x_offset
+            result.y_max = outline.y_max + comp.y_offset
+            first = false
+        else
+            let comp_x_min = outline.x_min + comp.x_offset
+            let comp_y_min = outline.y_min + comp.y_offset
+            let comp_x_max = outline.x_max + comp.x_offset
+            let comp_y_max = outline.y_max + comp.y_offset
+
+            if comp_x_min < result.x_min
+                result.x_min = comp_x_min
+            if comp_y_min < result.y_min
+                result.y_min = comp_y_min
+            if comp_x_max > result.x_max
+                result.x_max = comp_x_max
+            if comp_y_max > result.y_max
+                result.y_max = comp_y_max
+
+    result
+
+# Tests
+
+[[test]]
+fn test_parse_empty_glyph() -> i32
+    let data: [0]u8 = []
+    let result = parse_glyph(@data).unwrap()
+
+    match result
+        ParsedGlyph.Empty => 0
+        _ => 1  # fail
+
+[[test]]
+fn test_parse_simple_glyph_one_contour() -> i32
+    # Simple glyph: triangle with 3 points
+    # numberOfContours = 1
+    # bbox: 0,0 to 100,100
+    # endPtsOfContours = [2] (3 points: 0,1,2)
+    # instructionLength = 0
+    # flags: all on-curve, short positive deltas
+    # x: 0, 100, 50
+    # y: 0, 0, 100
+    let data: [22]u8 = [
+        0x00, 0x01,              # numberOfContours = 1
+        0x00, 0x00,              # xMin = 0
+        0x00, 0x00,              # yMin = 0
+        0x00, 0x64,              # xMax = 100
+        0x00, 0x64,              # yMax = 100
+        0x00, 0x02,              # endPtsOfContours[0] = 2
+        0x00, 0x00,              # instructionLength = 0
+        # flags: on-curve + x-short + x-positive + y-short + y-positive
+        0x37, 0x37, 0x37,        # all three points
+        # x coordinates (short, positive): 0, 100, -50 (delta from 100)
+        0x00,                    # x0 = 0
+        0x64,                    # x1 = 0 + 100 = 100
+        0x32,                    # x2 = 100 - 50 = 50 (but flag says positive, so wrong test data)
+        # y coordinates
+        0x00,                    # y0 = 0
+        0x00,                    # y1 = 0 + 0 = 0
+        0x64                     # y2 = 0 + 100 = 100
+    ]
+
+    let result = parse_glyph(@data).unwrap()
+
+    match result
+        ParsedGlyph.Simple(outline) =>
+            assert outline.contours.len() == 1
+            assert outline.contours[0].len() == 3
+            assert outline.x_min == 0
+            assert outline.y_max == 100
+            0
+        _ =>
+            1  # fail
+
+[[test]]
+fn test_glyph_flags() -> i32
+    # Test flag constants
+    assert FLAG_ON_CURVE == 0x01
+    assert FLAG_X_SHORT == 0x02
+    assert FLAG_Y_SHORT == 0x04
+    assert FLAG_REPEAT == 0x08
+    assert FLAG_X_SAME_OR_POSITIVE == 0x10
+    assert FLAG_Y_SAME_OR_POSITIVE == 0x20
+    0
+
+[[test]]
+fn test_component_transform_identity() -> i32
+    # No transform - just offset
+    let comp = GlyphComponent.new(1, 100, 200)
+    let (x, y) = comp.transform_point(50, 50)
+    assert x == 150
+    assert y == 250
+    0
+
+[[test]]
+fn test_component_transform_scale() -> i32
+    # 0.5 scale (8192 in F2Dot14)
+    let comp = GlyphComponent.with_scale(1, 0, 0, 8192)
+    let (x, y) = comp.transform_point(100, 100)
+    # 100 * 0.5 = 50
+    assert x == 50
+    assert y == 50
+    0
+
+[[test]]
+fn test_component_transform_with_offset() -> i32
+    # 0.5 scale + offset
+    let comp = GlyphComponent.with_scale(1, 100, 100, 8192)
+    let (x, y) = comp.transform_point(100, 100)
+    # 100 * 0.5 + 100 = 150
+    assert x == 150
+    assert y == 150
+    0

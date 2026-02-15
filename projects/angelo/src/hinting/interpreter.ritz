@@ -1,0 +1,456 @@
+# Angelo - TrueType Interpreter
+#
+# The interpreter executes hinting bytecode to adjust glyph outlines.
+# This is a stub implementation - full hinting is a significant undertaking.
+
+import hinting.state.GraphicsState
+import hinting.state.Zone
+import hinting.state.Vector2
+import hinting.instructions
+
+# Hinting mode - controls how aggressively hinting is applied
+pub enum HintingMode
+    None      # No hinting (use raw outlines)
+    Light     # Light hinting (preserves more of original shape)
+    Normal    # Normal hinting (typical TrueType behavior)
+    Grayscale # Optimized for grayscale rendering
+
+# Point in the glyph outline (for hinting)
+pub struct HintPoint
+    x: i32      # F26Dot6 fixed point (current)
+    y: i32
+    orig_x: i32 # Original unhinted position
+    orig_y: i32
+    on_curve: bool
+    touched_x: bool  # Has been moved in X
+    touched_y: bool  # Has been moved in Y
+
+impl HintPoint
+    pub fn new(x: i32, y: i32, on_curve: bool) -> HintPoint
+        HintPoint {
+            x: x,
+            y: y,
+            orig_x: x,
+            orig_y: y,
+            on_curve: on_curve,
+            touched_x: false,
+            touched_y: false
+        }
+
+# The hinting interpreter
+pub struct Interpreter
+    # Graphics state
+    gs: GraphicsState
+
+    # Interpreter stack (values are F26Dot6 or integers)
+    stack: Vec<i32>
+    max_stack: usize
+
+    # Control value table (scaled font-level values)
+    cvt: Vec<i32>
+
+    # Storage area (general purpose)
+    storage: Vec<i32>
+
+    # Function definitions (bytecode offsets)
+    functions: Vec<(u32, u32)>  # (start, length)
+
+    # Twilight zone points
+    twilight: Vec<HintPoint>
+
+    # Current glyph zone points
+    glyph_points: Vec<HintPoint>
+
+    # Program counter
+    pc: usize
+
+    # Hinting mode
+    mode: HintingMode
+
+    # Pixels per em (current size)
+    ppem: u16
+
+impl Interpreter
+    pub fn new(mode: HintingMode) -> Interpreter
+        Interpreter {
+            gs: GraphicsState.new(),
+            stack: Vec.with_capacity(256),
+            max_stack: 256,
+            cvt: Vec.new(),
+            storage: Vec.with_capacity(64),
+            functions: Vec.new(),
+            twilight: Vec.with_capacity(16),
+            glyph_points: Vec.new(),
+            pc: 0,
+            mode: mode,
+            ppem: 0
+        }
+
+    # Initialize with font-level data
+    pub fn init(self:&, cvt: Vec<i32>, storage_size: usize, max_twilight: usize)
+        self.cvt = cvt
+        self.storage = Vec.with_capacity(storage_size)
+        for i in 0..storage_size
+            self.storage.push(0)
+        self.twilight = Vec.with_capacity(max_twilight)
+        for i in 0..max_twilight
+            self.twilight.push(HintPoint.new(0, 0, false))
+
+    # Set rendering size
+    pub fn set_size(self:&, ppem: u16)
+        self.ppem = ppem
+
+    # Execute the 'prep' program (preparation, runs once per size)
+    pub fn run_prep(self:&, program: @[u8]) -> Result<(), StrView>
+        self.gs.reset()
+        self.execute(program)
+
+    # Execute the 'fpgm' program (font program, runs once per font)
+    pub fn run_fpgm(self:&, program: @[u8]) -> Result<(), StrView>
+        # Font program typically just defines functions
+        self.execute(program)
+
+    # Hint a glyph
+    pub fn hint_glyph(self:&, program: @[u8], points:& Vec<HintPoint>) -> Result<(), StrView>
+        self.gs.reset()
+        self.glyph_points = points.clone()
+        self.execute(program)?
+
+        # Copy back hinted points
+        for i in 0..self.glyph_points.len()
+            points[i] = self.glyph_points[i]
+
+        Ok(())
+
+    # Main execution loop
+    fn execute(self:&, program: @[u8]) -> Result<(), StrView>
+        self.pc = 0
+        self.stack.clear()
+
+        while self.pc < program.len()
+            let opcode = program[self.pc]
+            self.pc = self.pc + 1
+
+            self.execute_instruction(opcode, program)?
+
+        Ok(())
+
+    # Execute a single instruction
+    fn execute_instruction(self:&, opcode: u8, program: @[u8]) -> Result<(), StrView>
+        # Push instructions
+        if opcode >= 0xB0 and opcode <= 0xB7
+            # PUSHB[n]: push n+1 bytes
+            let n = (opcode - 0xB0 + 1) as usize
+            for i in 0..n
+                let byte = program[self.pc] as i32
+                self.push(byte)?
+                self.pc = self.pc + 1
+            return Ok(())
+
+        if opcode >= 0xB8 and opcode <= 0xBF
+            # PUSHW[n]: push n+1 words
+            let n = (opcode - 0xB8 + 1) as usize
+            for i in 0..n
+                let hi = program[self.pc] as i32
+                let lo = program[self.pc + 1] as i32
+                let word = (hi << 8) or lo
+                # Sign extend
+                let word = if word > 32767 then word - 65536 else word
+                self.push(word)?
+                self.pc = self.pc + 2
+            return Ok(())
+
+        if opcode == instructions.NPUSHB
+            let n = program[self.pc] as usize
+            self.pc = self.pc + 1
+            for i in 0..n
+                let byte = program[self.pc] as i32
+                self.push(byte)?
+                self.pc = self.pc + 1
+            return Ok(())
+
+        if opcode == instructions.NPUSHW
+            let n = program[self.pc] as usize
+            self.pc = self.pc + 1
+            for i in 0..n
+                let hi = program[self.pc] as i32
+                let lo = program[self.pc + 1] as i32
+                let word = (hi << 8) or lo
+                let word = if word > 32767 then word - 65536 else word
+                self.push(word)?
+                self.pc = self.pc + 2
+            return Ok(())
+
+        # Stack operations
+        match opcode
+            instructions.POP => self.pop()?
+            instructions.DUP =>
+                let v = self.pop()?
+                self.push(v)?
+                self.push(v)?
+            instructions.SWAP =>
+                let a = self.pop()?
+                let b = self.pop()?
+                self.push(a)?
+                self.push(b)?
+            instructions.CLEAR => self.stack.clear()
+            instructions.DEPTH => self.push(self.stack.len() as i32)?
+
+            # Arithmetic
+            instructions.ADD =>
+                let a = self.pop()?
+                let b = self.pop()?
+                self.push(a + b)?
+            instructions.SUB =>
+                let a = self.pop()?
+                let b = self.pop()?
+                self.push(b - a)?
+            instructions.MUL =>
+                let a = self.pop()?
+                let b = self.pop()?
+                # F26Dot6 multiply: (a * b) / 64
+                self.push((a as i64 * b as i64 / 64) as i32)?
+            instructions.DIV =>
+                let a = self.pop()?
+                let b = self.pop()?
+                if a == 0
+                    return Err("division by zero")
+                # F26Dot6 divide: (b * 64) / a
+                self.push((b as i64 * 64 / a as i64) as i32)?
+            instructions.ABS =>
+                let v = self.pop()?
+                self.push(if v < 0 then -v else v)?
+            instructions.NEG =>
+                let v = self.pop()?
+                self.push(-v)?
+            instructions.FLOOR =>
+                let v = self.pop()?
+                self.push(v and not 63)?  # Clear lower 6 bits
+            instructions.CEILING =>
+                let v = self.pop()?
+                self.push((v + 63) and not 63)?
+
+            # Comparisons
+            instructions.LT =>
+                let a = self.pop()?
+                let b = self.pop()?
+                self.push(if b < a then 1 else 0)?
+            instructions.LTEQ =>
+                let a = self.pop()?
+                let b = self.pop()?
+                self.push(if b <= a then 1 else 0)?
+            instructions.GT =>
+                let a = self.pop()?
+                let b = self.pop()?
+                self.push(if b > a then 1 else 0)?
+            instructions.GTEQ =>
+                let a = self.pop()?
+                let b = self.pop()?
+                self.push(if b >= a then 1 else 0)?
+            instructions.EQ =>
+                let a = self.pop()?
+                let b = self.pop()?
+                self.push(if a == b then 1 else 0)?
+            instructions.NEQ =>
+                let a = self.pop()?
+                let b = self.pop()?
+                self.push(if a != b then 1 else 0)?
+            instructions.AND =>
+                let a = self.pop()?
+                let b = self.pop()?
+                self.push(if a != 0 and b != 0 then 1 else 0)?
+            instructions.OR =>
+                let a = self.pop()?
+                let b = self.pop()?
+                self.push(if a != 0 or b != 0 then 1 else 0)?
+            instructions.NOT =>
+                let v = self.pop()?
+                self.push(if v == 0 then 1 else 0)?
+
+            # Graphics state
+            instructions.SRP0 =>
+                let p = self.pop()? as u16
+                self.gs.rp0 = p
+            instructions.SRP1 =>
+                let p = self.pop()? as u16
+                self.gs.rp1 = p
+            instructions.SRP2 =>
+                let p = self.pop()? as u16
+                self.gs.rp2 = p
+            instructions.SLOOP =>
+                let n = self.pop()? as u32
+                self.gs.loop_count = n
+
+            # CVT access
+            instructions.RCVT =>
+                let idx = self.pop()? as usize
+                if idx < self.cvt.len()
+                    self.push(self.cvt[idx])?
+                else
+                    self.push(0)?
+            instructions.WCVTP =>
+                let val = self.pop()?
+                let idx = self.pop()? as usize
+                if idx < self.cvt.len()
+                    self.cvt[idx] = val
+
+            # Storage access
+            instructions.RS =>
+                let idx = self.pop()? as usize
+                if idx < self.storage.len()
+                    self.push(self.storage[idx])?
+                else
+                    self.push(0)?
+            instructions.WS =>
+                let val = self.pop()?
+                let idx = self.pop()? as usize
+                if idx < self.storage.len()
+                    self.storage[idx] = val
+
+            # Measurements
+            instructions.MPPEM =>
+                self.push(self.ppem as i32)?
+            instructions.MPS =>
+                # Point size - approximate as ppem
+                self.push(self.ppem as i32)?
+
+            # Control flow
+            instructions.IF =>
+                let cond = self.pop()?
+                if cond == 0
+                    self.skip_to_else_or_eif(program)?
+            instructions.ELSE =>
+                # If we reach ELSE during execution, skip to EIF
+                self.skip_to_eif(program)?
+            instructions.EIF =>
+                pass  # End of conditional block
+
+            # Default: unimplemented instruction
+            _ =>
+                # For now, just skip unknown instructions
+                # A full implementation would handle all ~200 opcodes
+                pass
+
+        Ok(())
+
+    # Stack helpers
+    fn push(self:&, value: i32) -> Result<(), StrView>
+        if self.stack.len() >= self.max_stack
+            return Err("stack overflow")
+        self.stack.push(value)
+        Ok(())
+
+    fn pop(self:&) -> Result<i32, StrView>
+        match self.stack.pop()
+            Some(v) => Ok(v)
+            None => Err("stack underflow")
+
+    # Control flow helpers
+    fn skip_to_else_or_eif(self:&, program: @[u8]) -> Result<(), StrView>
+        var depth = 1
+        while self.pc < program.len() and depth > 0
+            let op = program[self.pc]
+            self.pc = self.pc + 1
+
+            if op == instructions.IF
+                depth = depth + 1
+            else if op == instructions.EIF
+                depth = depth - 1
+            else if op == instructions.ELSE and depth == 1
+                return Ok(())
+
+            # Skip instruction data
+            self.skip_instruction_data(op, program)
+
+        Ok(())
+
+    fn skip_to_eif(self:&, program: @[u8]) -> Result<(), StrView>
+        var depth = 1
+        while self.pc < program.len() and depth > 0
+            let op = program[self.pc]
+            self.pc = self.pc + 1
+
+            if op == instructions.IF
+                depth = depth + 1
+            else if op == instructions.EIF
+                depth = depth - 1
+
+            self.skip_instruction_data(op, program)
+
+        Ok(())
+
+    fn skip_instruction_data(self:&, opcode: u8, program: @[u8])
+        # Skip any data bytes following the instruction
+        if opcode >= 0xB0 and opcode <= 0xB7
+            let n = (opcode - 0xB0 + 1) as usize
+            self.pc = self.pc + n
+        else if opcode >= 0xB8 and opcode <= 0xBF
+            let n = (opcode - 0xB8 + 1) as usize * 2
+            self.pc = self.pc + n
+        else if opcode == instructions.NPUSHB and self.pc < program.len()
+            let n = program[self.pc] as usize
+            self.pc = self.pc + 1 + n
+        else if opcode == instructions.NPUSHW and self.pc < program.len()
+            let n = program[self.pc] as usize
+            self.pc = self.pc + 1 + n * 2
+
+# Tests
+
+[[test]]
+fn test_interpreter_creation() -> i32
+    let interp = Interpreter.new(HintingMode.Normal)
+    assert interp.stack.len() == 0
+    assert interp.ppem == 0
+    0
+
+[[test]]
+fn test_interpreter_push_pop() -> i32
+    var interp = Interpreter.new(HintingMode.Normal)
+
+    interp.push(42).unwrap()
+    interp.push(100).unwrap()
+    interp.push(-5).unwrap()
+
+    assert interp.stack.len() == 3
+    assert interp.pop().unwrap() == -5
+    assert interp.pop().unwrap() == 100
+    assert interp.pop().unwrap() == 42
+    assert interp.stack.len() == 0
+
+    0
+
+[[test]]
+fn test_interpreter_arithmetic() -> i32
+    var interp = Interpreter.new(HintingMode.Normal)
+
+    # Test ADD: 10 + 20 = 30
+    let program: [5]u8 = [
+        0xB1,  # PUSHB[2]
+        10,    # first value
+        20,    # second value
+        0x60,  # ADD
+        0     # padding
+    ]
+
+    interp.execute(@program).unwrap()
+    assert interp.pop().unwrap() == 30
+
+    0
+
+[[test]]
+fn test_interpreter_comparison() -> i32
+    var interp = Interpreter.new(HintingMode.Normal)
+
+    # Test LT: 10 < 20 = true
+    let program: [5]u8 = [
+        0xB1,  # PUSHB[2]
+        10,    # first value (pushed second, so on bottom)
+        20,    # second value (pushed first, so on top)
+        0x50,  # LT
+        0      # padding
+    ]
+
+    interp.execute(@program).unwrap()
+    assert interp.pop().unwrap() == 1  # true
+
+    0

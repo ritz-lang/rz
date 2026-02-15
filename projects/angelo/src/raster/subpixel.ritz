@@ -1,0 +1,354 @@
+# Angelo - Subpixel Rendering
+#
+# LCD-optimized glyph rendering using RGB subpixel antialiasing.
+# Renders at 3x horizontal resolution, then filters down to RGB.
+#
+# Subpixel rendering takes advantage of LCD panel structure:
+# Each pixel is composed of 3 vertical stripes (R, G, B).
+# By rendering at 3x resolution and assigning to color channels,
+# we effectively get 3x horizontal resolution.
+
+import types.GlyphOutline
+import types.RasterizedGlyph
+import types.Contour
+import types.OutlinePoint
+import raster.bezier.Point2D
+import raster.bezier.flatten_quad_bezier
+import raster.edge.EdgeTable
+import raster.fill.Bitmap
+import raster.fill.scanline_fill_antialiased
+
+# Subpixel order for different LCD panel types
+pub enum SubpixelOrder
+    RGB     # Most common: Red-Green-Blue left to right
+    BGR     # Blue-Green-Red
+    None    # No subpixel rendering (grayscale)
+
+# Rasterized glyph with RGB data
+pub struct SubpixelGlyph
+    # RGB data: 3 bytes per pixel (R, G, B)
+    # Stored as interleaved: [R0,G0,B0, R1,G1,B1, ...]
+    rgb_data: Vec<u8>
+    width: u32
+    height: u32
+    bearing_x: i32
+    bearing_y: i32
+    advance: u32
+
+impl SubpixelGlyph
+    pub fn new(width: u32, height: u32) -> SubpixelGlyph
+        let size = width * height * 3  # 3 bytes per pixel
+        var rgb_data = Vec.with_capacity(size as usize)
+        for i in 0..size
+            rgb_data.push(0)
+        SubpixelGlyph {
+            rgb_data: rgb_data,
+            width: width,
+            height: height,
+            bearing_x: 0,
+            bearing_y: 0,
+            advance: 0
+        }
+
+    # Get pixel color at (x, y)
+    # Returns (R, G, B)
+    pub fn get_pixel(self, x: u32, y: u32) -> (u8, u8, u8)
+        let idx = ((y * self.width + x) * 3) as usize
+        (self.rgb_data[idx], self.rgb_data[idx + 1], self.rgb_data[idx + 2])
+
+    # Set pixel color at (x, y)
+    pub fn set_pixel(self:&, x: u32, y: u32, r: u8, g: u8, b: u8)
+        let idx = ((y * self.width + x) * 3) as usize
+        self.rgb_data[idx] = r
+        self.rgb_data[idx + 1] = g
+        self.rgb_data[idx + 2] = b
+
+# FreeType-style subpixel filter coefficients
+# These reduce color fringing by spreading coverage across neighbors
+const FILTER_LIGHT: [5]u8 = [0, 85, 86, 85, 0]     # Very light filtering
+const FILTER_DEFAULT: [5]u8 = [8, 77, 86, 77, 8]   # Balanced filter
+const FILTER_LEGACY: [5]u8 = [16, 64, 96, 64, 16]  # Stronger filtering
+
+# Rasterize a glyph with subpixel antialiasing
+pub fn rasterize_subpixel(
+    outline: GlyphOutline,
+    units_per_em: u16,
+    size_px: u32,
+    order: SubpixelOrder
+) -> SubpixelGlyph
+    match order
+        SubpixelOrder.None =>
+            # Fall back to grayscale
+            rasterize_subpixel_grayscale(outline, units_per_em, size_px)
+        SubpixelOrder.RGB =>
+            rasterize_subpixel_rgb(outline, units_per_em, size_px, false)
+        SubpixelOrder.BGR =>
+            rasterize_subpixel_rgb(outline, units_per_em, size_px, true)
+
+# Grayscale fallback - just convert to RGB
+fn rasterize_subpixel_grayscale(
+    outline: GlyphOutline,
+    units_per_em: u16,
+    size_px: u32
+) -> SubpixelGlyph
+    import raster.render.rasterize_outline
+
+    let gray = rasterize_outline(outline, units_per_em, size_px, true)
+
+    var result = SubpixelGlyph.new(gray.width, gray.height)
+    result.bearing_x = gray.bearing_x
+    result.bearing_y = gray.bearing_y
+    result.advance = gray.advance
+
+    # Convert grayscale to RGB
+    for y in 0..gray.height
+        for x in 0..gray.width
+            let alpha = gray.bitmap[(y * gray.width + x) as usize]
+            result.set_pixel(x, y, alpha, alpha, alpha)
+
+    result
+
+# Rasterize with horizontal subpixel antialiasing
+fn rasterize_subpixel_rgb(
+    outline: GlyphOutline,
+    units_per_em: u16,
+    size_px: u32,
+    bgr: bool
+) -> SubpixelGlyph
+    if outline.is_empty()
+        return SubpixelGlyph.new(0, 0)
+
+    # Scale at 3x horizontal resolution
+    let scale = size_px as f32 / units_per_em as f32
+    let scale_x = scale * 3.0  # 3x for subpixels
+    let scale_y = scale
+
+    # Convert outline to edges at 3x horizontal scale
+    var edge_table = EdgeTable.new()
+
+    for contour in @outline.contours
+        contour_to_edges_scaled(contour, scale_x, scale_y, @&edge_table)
+
+    edge_table.sort()
+
+    if edge_table.is_empty()
+        return SubpixelGlyph.new(0, 0)
+
+    # Get bounding box
+    let (x_min, y_min, x_max, y_max) = edge_table.bounds()
+
+    # Calculate dimensions
+    let padding = 3u32  # Extra pixels for filtering
+    let width_3x = (x_max - x_min).ceil() as u32 + padding * 2
+    let height = (y_max - y_min).ceil() as u32 + padding * 2
+
+    # Sanity check
+    if width_3x > 4096 or height > 1024
+        return SubpixelGlyph.new(0, 0)
+
+    # Render at 3x resolution
+    var bitmap_3x = Bitmap.new(width_3x, height)
+    let x_offset = x_min - padding as f32
+    let y_offset = y_min - padding as f32
+
+    scanline_fill_antialiased(@&edge_table, @&bitmap_3x, y_offset, x_offset)
+
+    # Downsample to RGB with filtering
+    let final_width = width_3x / 3
+    var result = SubpixelGlyph.new(final_width, height)
+
+    # Scale bearing back
+    result.bearing_x = (x_min / 3.0).floor() as i32
+    result.bearing_y = y_max.ceil() as i32
+
+    # Apply filter and downsample
+    for y in 0..height
+        for x in 0..final_width
+            let x3 = x * 3
+
+            # Sample 3 subpixels with filtering
+            let r = filter_sample(@&bitmap_3x, x3, y, width_3x)
+            let g = filter_sample(@&bitmap_3x, x3 + 1, y, width_3x)
+            let b = filter_sample(@&bitmap_3x, x3 + 2, y, width_3x)
+
+            if bgr
+                result.set_pixel(x, y, b, g, r)
+            else
+                result.set_pixel(x, y, r, g, b)
+
+    result
+
+# Sample with 5-tap filter for smoother transitions
+fn filter_sample(bitmap: @Bitmap, x: u32, y: u32, width: u32) -> u8
+    # 5-tap filter centered on x
+    var sum: u32 = 0
+
+    for i in 0..5
+        let filter_x = x as i32 + i as i32 - 2
+        if filter_x >= 0 and filter_x < width as i32
+            let sample = bitmap.get(filter_x as u32, y)
+            sum = sum + sample as u32 * FILTER_DEFAULT[i] as u32
+
+    # Filter weights sum to 256, so divide by 256
+    (sum / 256) as u8
+
+# Convert contour to edges with separate X/Y scaling
+fn contour_to_edges_scaled(contour: Contour, scale_x: f32, scale_y: f32, edge_table:& EdgeTable)
+    let n = contour.len()
+    if n < 2
+        return
+
+    # Build expanded point list
+    var points = Vec.new()
+
+    for i in 0..n
+        let curr = contour.points[i]
+        let next_idx = (i + 1) % n
+        let next = contour.points[next_idx]
+
+        let p = Point2D.new(curr.x as f32 * scale_x, curr.y as f32 * scale_y)
+        points.push((p, curr.on_curve))
+
+        # If both current and next are off-curve, add implied on-curve
+        if not curr.on_curve and not next.on_curve
+            let next_p = Point2D.new(next.x as f32 * scale_x, next.y as f32 * scale_y)
+            let implied = p.midpoint(next_p)
+            points.push((implied, true))
+
+    let expanded_n = points.len()
+    if expanded_n < 2
+        return
+
+    # Find first on-curve point
+    var start_idx = 0usize
+    for i in 0..expanded_n
+        let (_, on_curve) = points[i]
+        if on_curve
+            start_idx = i
+            break
+
+    # Walk through points, emitting edges
+    var curr_on_curve = points[start_idx].0
+    var i = 1usize
+
+    let tolerance = 0.5f32 * scale_x  # Adjust tolerance for scale
+
+    while i <= expanded_n
+        let idx = (start_idx + i) % expanded_n
+        let (p, on_curve) = points[idx]
+
+        if on_curve
+            edge_table.add_line(curr_on_curve, p)
+            curr_on_curve = p
+        else
+            let next_idx = (start_idx + i + 1) % expanded_n
+            let (next_p, next_on_curve) = points[next_idx]
+
+            if next_on_curve
+                let flattened = flatten_quad_bezier(curr_on_curve, p, next_p, tolerance)
+                for j in 0..flattened.len() - 1
+                    edge_table.add_line(flattened[j], flattened[j + 1])
+                curr_on_curve = next_p
+                i = i + 1
+            else
+                let implied = p.midpoint(next_p)
+                let flattened = flatten_quad_bezier(curr_on_curve, p, implied, tolerance)
+                for j in 0..flattened.len() - 1
+                    edge_table.add_line(flattened[j], flattened[j + 1])
+                curr_on_curve = implied
+
+        i = i + 1
+
+# Tests
+
+[[test]]
+fn test_subpixel_glyph_creation() -> i32
+    let glyph = SubpixelGlyph.new(10, 10)
+    assert glyph.width == 10
+    assert glyph.height == 10
+    assert glyph.rgb_data.len() == 300  # 10 * 10 * 3
+    0
+
+[[test]]
+fn test_subpixel_pixel_access() -> i32
+    var glyph = SubpixelGlyph.new(5, 5)
+    glyph.set_pixel(2, 3, 255, 128, 64)
+
+    let (r, g, b) = glyph.get_pixel(2, 3)
+    assert r == 255
+    assert g == 128
+    assert b == 64
+    0
+
+[[test]]
+fn test_filter_coefficients_sum() -> i32
+    # Filter weights should sum to 256 for proper normalization
+    var sum: u32 = 0
+    for i in 0..5
+        sum = sum + FILTER_DEFAULT[i] as u32
+    assert sum == 256
+    0
+
+[[test]]
+fn test_subpixel_grayscale_fallback() -> i32
+    # Simple square
+    var contour = Contour.new()
+    contour.add_point(OutlinePoint.new(0, 0, true))
+    contour.add_point(OutlinePoint.new(100, 0, true))
+    contour.add_point(OutlinePoint.new(100, 100, true))
+    contour.add_point(OutlinePoint.new(0, 100, true))
+
+    var outline = GlyphOutline.new()
+    outline.x_min = 0
+    outline.y_min = 0
+    outline.x_max = 100
+    outline.y_max = 100
+    outline.add_contour(contour)
+
+    let result = rasterize_subpixel(outline, 100, 10, SubpixelOrder.None)
+
+    # Should produce valid output
+    assert result.width > 0
+    assert result.height > 0
+
+    # Grayscale means R = G = B for all pixels
+    for y in 0..result.height
+        for x in 0..result.width
+            let (r, g, b) = result.get_pixel(x, y)
+            assert r == g and g == b
+
+    0
+
+[[test]]
+fn test_subpixel_rgb_rendering() -> i32
+    # Simple square
+    var contour = Contour.new()
+    contour.add_point(OutlinePoint.new(0, 0, true))
+    contour.add_point(OutlinePoint.new(100, 0, true))
+    contour.add_point(OutlinePoint.new(100, 100, true))
+    contour.add_point(OutlinePoint.new(0, 100, true))
+
+    var outline = GlyphOutline.new()
+    outline.x_min = 0
+    outline.y_min = 0
+    outline.x_max = 100
+    outline.y_max = 100
+    outline.add_contour(contour)
+
+    let result = rasterize_subpixel(outline, 100, 12, SubpixelOrder.RGB)
+
+    # Should produce valid output
+    assert result.width > 0
+    assert result.height > 0
+
+    # Should have RGB data (not all zeros)
+    var has_color = false
+    for y in 0..result.height
+        for x in 0..result.width
+            let (r, g, b) = result.get_pixel(x, y)
+            if r > 0 or g > 0 or b > 0
+                has_color = true
+                break
+
+    assert has_color
+    0

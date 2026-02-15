@@ -1,0 +1,192 @@
+# BlobStore - Content Storage Backend
+#
+# BlobStore is the trait for storing and retrieving content blobs.
+# Implementations: MemoryBlobStore (G1), DiskBlobStore (G2)
+
+import ritzlib.sys { write }
+import blob_id { BlobId, blob_id_eq, blob_id_zero, blob_id_is_zero, blob_id_compute, blob_id_copy }
+import error { Error, ErrorCode, error_new }
+
+# Maximum blob size (1GB)
+pub const BLOB_MAX_SIZE: u64 = 1073741824
+
+# Initial capacity for memory store
+const INITIAL_CAPACITY: i32 = 64
+
+# A stored blob entry
+struct BlobEntry
+    id: BlobId
+    data: *u8
+    size: u64
+    used: bool
+
+# In-memory blob store
+# Uses a simple linear array for now
+# TODO: Replace with HashMap when available in ritzlib
+pub struct MemoryBlobStore
+    entries: *BlobEntry
+    capacity: i32
+    count: i32
+    total_size: u64
+
+# Create a new empty memory blob store
+pub fn memory_store_new() -> MemoryBlobStore
+    # Allocate initial entry array
+    let entry_size: u64 = 56  # sizeof(BlobEntry) - approximate
+    let alloc_size: u64 = entry_size * INITIAL_CAPACITY as u64
+
+    # TODO: Use proper allocator
+    # For now, use mmap
+    import ritzlib.sys { mmap }
+    let entries: *BlobEntry = mmap(
+        0 as *u8,
+        alloc_size,
+        3,    # PROT_READ | PROT_WRITE
+        34,   # MAP_PRIVATE | MAP_ANONYMOUS
+        -1,
+        0
+    ) as *BlobEntry
+
+    # Initialize all entries as unused
+    var i: i32 = 0
+    while i < INITIAL_CAPACITY
+        let entry: *BlobEntry = entries + i
+        (*entry).used = false
+        i = i + 1
+
+    MemoryBlobStore {
+        entries: entries,
+        capacity: INITIAL_CAPACITY,
+        count: 0,
+        total_size: 0
+    }
+
+# Find an entry by BlobId
+fn store_find(store: MemoryBlobStore, id: BlobId) -> *BlobEntry
+    var i: i32 = 0
+    while i < store.capacity
+        let entry: *BlobEntry = store.entries + i
+        if (*entry).used and blob_id_eq((*entry).id, id)
+            return entry
+        i = i + 1
+    0 as *BlobEntry
+
+# Check if a blob exists
+pub fn memory_store_exists(store: MemoryBlobStore, id: BlobId) -> bool
+    let entry: *BlobEntry = store_find(store, id)
+    entry != 0 as *BlobEntry
+
+# Get a blob's data
+# Returns null if not found
+pub fn memory_store_get(store: MemoryBlobStore, id: BlobId) -> *u8
+    let entry: *BlobEntry = store_find(store, id)
+    if entry == 0 as *BlobEntry
+        return 0 as *u8
+    (*entry).data
+
+# Get a blob's size
+# Returns 0 if not found
+pub fn memory_store_get_size(store: MemoryBlobStore, id: BlobId) -> u64
+    let entry: *BlobEntry = store_find(store, id)
+    if entry == 0 as *BlobEntry
+        return 0
+    (*entry).size
+
+# Store a blob, returns its BlobId
+# If blob already exists, returns existing ID (deduplication)
+pub fn memory_store_put(store:& MemoryBlobStore, data: *u8, size: u64) -> BlobId
+    # Compute content hash
+    let id: BlobId = blob_id_compute(data, size)
+
+    # Check if already exists (deduplication)
+    if memory_store_exists(*store, id)
+        return id
+
+    # Find a free slot
+    var slot: *BlobEntry = 0 as *BlobEntry
+    var i: i32 = 0
+    while i < store.capacity
+        let entry: *BlobEntry = store.entries + i
+        if not (*entry).used
+            slot = entry
+            break
+        i = i + 1
+
+    # TODO: Grow array if no free slot
+    if slot == 0 as *BlobEntry
+        # Return zero ID to indicate failure
+        return blob_id_zero()
+
+    # Allocate storage for data
+    import ritzlib.sys { mmap }
+    let data_copy: *u8 = mmap(
+        0 as *u8,
+        size,
+        3,    # PROT_READ | PROT_WRITE
+        34,   # MAP_PRIVATE | MAP_ANONYMOUS
+        -1,
+        0
+    ) as *u8
+
+    # Copy data
+    var j: u64 = 0
+    while j < size
+        *(data_copy + j) = *(data + j)
+        j = j + 1
+
+    # Store entry
+    (*slot).id = id
+    (*slot).data = data_copy
+    (*slot).size = size
+    (*slot).used = true
+
+    store.count = store.count + 1
+    store.total_size = store.total_size + size
+
+    id
+
+# Delete a blob
+pub fn memory_store_delete(store:& MemoryBlobStore, id: BlobId) -> bool
+    let entry: *BlobEntry = store_find(*store, id)
+    if entry == 0 as *BlobEntry
+        return false
+
+    # Free data
+    import ritzlib.sys { munmap }
+    munmap((*entry).data, (*entry).size)
+
+    # Mark as unused
+    store.total_size = store.total_size - (*entry).size
+    store.count = store.count - 1
+    (*entry).used = false
+
+    true
+
+# Get total number of blobs
+pub fn memory_store_count(store: MemoryBlobStore) -> i32
+    store.count
+
+# Get total size of all blobs
+pub fn memory_store_total_size(store: MemoryBlobStore) -> u64
+    store.total_size
+
+# Free the blob store
+pub fn memory_store_free(store:& MemoryBlobStore)
+    # Free all blob data
+    var i: i32 = 0
+    while i < store.capacity
+        let entry: *BlobEntry = store.entries + i
+        if (*entry).used
+            import ritzlib.sys { munmap }
+            munmap((*entry).data, (*entry).size)
+        i = i + 1
+
+    # Free entry array
+    import ritzlib.sys { munmap }
+    let entry_size: u64 = 56
+    munmap(store.entries as *u8, entry_size * store.capacity as u64)
+
+    store.entries = 0 as *BlobEntry
+    store.capacity = 0
+    store.count = 0
+    store.total_size = 0

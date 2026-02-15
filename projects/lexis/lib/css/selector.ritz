@@ -1,0 +1,250 @@
+# lib/css/selector.ritz - CSS Selector Types and Parsing
+#
+# Represents parsed CSS selectors for matching against DOM elements.
+
+# =============================================================================
+# Selector Component Types
+# =============================================================================
+
+pub const SELECTOR_UNIVERSAL: i32 = 0       # *
+pub const SELECTOR_TYPE: i32 = 1            # div, p, span
+pub const SELECTOR_ID: i32 = 2              # #foo
+pub const SELECTOR_CLASS: i32 = 3           # .bar
+pub const SELECTOR_ATTRIBUTE: i32 = 4       # [attr], [attr=val]
+pub const SELECTOR_PSEUDO_CLASS: i32 = 5    # :hover, :first-child
+pub const SELECTOR_PSEUDO_ELEMENT: i32 = 6  # ::before, ::after
+
+# Combinator types
+pub const COMBINATOR_NONE: i32 = 0          # No combinator (compound selector)
+pub const COMBINATOR_DESCENDANT: i32 = 1    # space
+pub const COMBINATOR_CHILD: i32 = 2         # >
+pub const COMBINATOR_NEXT_SIBLING: i32 = 3  # +
+pub const COMBINATOR_SUBSEQUENT_SIBLING: i32 = 4  # ~
+
+# Attribute matcher types
+pub const ATTR_EXISTS: i32 = 0              # [attr]
+pub const ATTR_EQUALS: i32 = 1              # [attr=val]
+pub const ATTR_INCLUDES: i32 = 2            # [attr~=val]
+pub const ATTR_DASH_MATCH: i32 = 3          # [attr|=val]
+pub const ATTR_PREFIX: i32 = 4              # [attr^=val]
+pub const ATTR_SUFFIX: i32 = 5              # [attr$=val]
+pub const ATTR_SUBSTRING: i32 = 6           # [attr*=val]
+
+# =============================================================================
+# Simple Selector
+# =============================================================================
+
+const MAX_SELECTOR_VALUE_LEN: u32 = 256
+
+pub struct SimpleSelector
+    kind: i32               # SELECTOR_* constant
+
+    # Value (tag name, class name, id, attr name, pseudo name)
+    value: [MAX_SELECTOR_VALUE_LEN]u8
+    value_len: u32
+
+    # For attribute selectors
+    attr_matcher: i32       # ATTR_* constant
+    attr_value: [MAX_SELECTOR_VALUE_LEN]u8
+    attr_value_len: u32
+    attr_case_insensitive: i32  # 1 if [attr=val i]
+
+    # For :nth-* pseudo-classes
+    nth_a: i32              # In an+b, the a coefficient
+    nth_b: i32              # In an+b, the b constant
+
+# =============================================================================
+# Compound Selector
+# =============================================================================
+
+# A compound selector is a sequence of simple selectors (no combinators)
+# e.g., "div.foo#bar" is three simple selectors
+
+const MAX_SIMPLE_SELECTORS: u32 = 16
+
+pub struct CompoundSelector
+    simple: [MAX_SIMPLE_SELECTORS]SimpleSelector
+    simple_count: u32
+
+# =============================================================================
+# Complex Selector
+# =============================================================================
+
+# A complex selector is compound selectors joined by combinators
+# e.g., "div.foo > p.bar span" is three compound selectors with combinators
+
+const MAX_COMPOUND_SELECTORS: u32 = 16
+
+pub struct ComplexSelector
+    compounds: [MAX_COMPOUND_SELECTORS]CompoundSelector
+    combinators: [MAX_COMPOUND_SELECTORS]i32  # COMBINATOR_* between compounds
+    compound_count: u32
+
+# =============================================================================
+# Selector List
+# =============================================================================
+
+# A selector list is comma-separated complex selectors
+# e.g., "div, p, .foo" is three complex selectors
+
+const MAX_COMPLEX_SELECTORS: u32 = 32
+
+pub struct SelectorList
+    selectors: [MAX_COMPLEX_SELECTORS]ComplexSelector
+    selector_count: u32
+
+# =============================================================================
+# Specificity
+# =============================================================================
+
+# Specificity is (a, b, c) where:
+# a = count of ID selectors
+# b = count of class, attribute, pseudo-class selectors
+# c = count of type, pseudo-element selectors
+
+pub struct Specificity
+    id_count: u32       # a
+    class_count: u32    # b
+    type_count: u32     # c
+
+pub fn specificity_zero() -> Specificity
+    Specificity {
+        id_count: 0,
+        class_count: 0,
+        type_count: 0
+    }
+
+pub fn specificity_compare(a: Specificity, b: Specificity) -> i32
+    # Returns: negative if a < b, 0 if equal, positive if a > b
+    if a.id_count != b.id_count
+        return a.id_count as i32 - b.id_count as i32
+    if a.class_count != b.class_count
+        return a.class_count as i32 - b.class_count as i32
+    a.type_count as i32 - b.type_count as i32
+
+pub fn specificity_add(a:& Specificity, b: Specificity)
+    a.id_count = a.id_count + b.id_count
+    a.class_count = a.class_count + b.class_count
+    a.type_count = a.type_count + b.type_count
+
+# Calculate specificity of a simple selector
+pub fn simple_selector_specificity(sel: SimpleSelector) -> Specificity
+    var spec = specificity_zero()
+
+    if sel.kind == SELECTOR_ID
+        spec.id_count = 1
+    else if sel.kind == SELECTOR_CLASS
+        spec.class_count = 1
+    else if sel.kind == SELECTOR_ATTRIBUTE
+        spec.class_count = 1
+    else if sel.kind == SELECTOR_PSEUDO_CLASS
+        spec.class_count = 1
+    else if sel.kind == SELECTOR_TYPE
+        spec.type_count = 1
+    else if sel.kind == SELECTOR_PSEUDO_ELEMENT
+        spec.type_count = 1
+    else if sel.kind == _
+        0  # Universal has no specificity
+
+    spec
+
+# Calculate specificity of a compound selector
+pub fn compound_selector_specificity(sel: CompoundSelector) -> Specificity
+    var spec = specificity_zero()
+    var i: u32 = 0
+    while i < sel.simple_count
+        let simple_spec = simple_selector_specificity(sel.simple[i])
+        specificity_add(spec, simple_spec)
+        i = i + 1
+    spec
+
+# Calculate specificity of a complex selector
+pub fn complex_selector_specificity(sel: ComplexSelector) -> Specificity
+    var spec = specificity_zero()
+    var i: u32 = 0
+    while i < sel.compound_count
+        let compound_spec = compound_selector_specificity(sel.compounds[i])
+        specificity_add(spec, compound_spec)
+        i = i + 1
+    spec
+
+# =============================================================================
+# Selector Constructors
+# =============================================================================
+
+pub fn simple_selector_universal() -> SimpleSelector
+    var sel: SimpleSelector
+    sel.kind = SELECTOR_UNIVERSAL
+    sel.value_len = 0
+    sel.attr_matcher = ATTR_EXISTS
+    sel.attr_value_len = 0
+    sel.attr_case_insensitive = 0
+    sel.nth_a = 0
+    sel.nth_b = 0
+    sel
+
+pub fn simple_selector_type(name: StrView) -> SimpleSelector
+    var sel = simple_selector_universal()
+    sel.kind = SELECTOR_TYPE
+    copy_to_buffer(name, sel.value[0], sel.value_len)
+    sel
+
+pub fn simple_selector_id(name: StrView) -> SimpleSelector
+    var sel = simple_selector_universal()
+    sel.kind = SELECTOR_ID
+    copy_to_buffer(name, sel.value[0], sel.value_len)
+    sel
+
+pub fn simple_selector_class(name: StrView) -> SimpleSelector
+    var sel = simple_selector_universal()
+    sel.kind = SELECTOR_CLASS
+    copy_to_buffer(name, sel.value[0], sel.value_len)
+    sel
+
+pub fn compound_selector_new() -> CompoundSelector
+    var sel: CompoundSelector
+    sel.simple_count = 0
+    sel
+
+pub fn compound_selector_add(sel:& CompoundSelector, simple: SimpleSelector)
+    if sel.simple_count < MAX_SIMPLE_SELECTORS
+        sel.simple[sel.simple_count] = simple
+        sel.simple_count = sel.simple_count + 1
+
+pub fn complex_selector_new() -> ComplexSelector
+    var sel: ComplexSelector
+    sel.compound_count = 0
+    sel
+
+pub fn complex_selector_add(sel:& ComplexSelector, compound: CompoundSelector, combinator: i32)
+    if sel.compound_count < MAX_COMPOUND_SELECTORS
+        sel.compounds[sel.compound_count] = compound
+        sel.combinators[sel.compound_count] = combinator
+        sel.compound_count = sel.compound_count + 1
+
+pub fn selector_list_new() -> SelectorList
+    var list: SelectorList
+    list.selector_count = 0
+    list
+
+pub fn selector_list_add(list:& SelectorList, selector: ComplexSelector)
+    if list.selector_count < MAX_COMPLEX_SELECTORS
+        list.selectors[list.selector_count] = selector
+        list.selector_count = list.selector_count + 1
+
+# =============================================================================
+# Helpers
+# =============================================================================
+
+fn copy_to_buffer(src: StrView, dst:& u8, len:& u32)
+    var i: u64 = 0
+    while i < src.len and i < MAX_SELECTOR_VALUE_LEN as u64
+        dst[i] = src.data[i]
+        i = i + 1
+    @len = i as u32
+
+pub fn simple_selector_value(sel: SimpleSelector) -> StrView
+    StrView {
+        data: @sel.value[0],
+        len: sel.value_len as u64
+    }

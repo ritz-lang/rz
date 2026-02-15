@@ -1,0 +1,364 @@
+# lib/iris.ritz - Main Iris API
+#
+# Iris is the rendering engine for the Tempest browser.
+# It receives styled DOM events from Tempest, performs layout,
+# and paints to Prism surfaces.
+#
+# Main responsibilities:
+# - Maintain render tree (mirrors visible DOM)
+# - Perform CSS layout (block, inline, flex, grid)
+# - Paint to Prism draw context
+# - Handle hit testing for input events
+# - Manage compositing layers
+#
+# Usage:
+#   import lib.iris { Iris, iris_new, iris_process_event, iris_render_frame }
+
+import prism.api { PrismClient, DrawContext, Size, Point, Rect, Color }
+import lib.style {
+    NodeId, node_id_is_valid, node_id_eq,
+    StyleEvent, NodeCreatedEvent, NodeRemovedEvent, NodeMovedEvent,
+    StyleChangedEvent, TextChangedEvent, ImageChangedEvent,
+    ComputedStyle, ElementTag
+}
+import lib.tree {
+    RenderTree, RenderNode, RenderContent,
+    render_tree_new, render_tree_get, render_tree_get_mut,
+    render_tree_insert, render_tree_remove, render_tree_set_root,
+    render_node_new, render_node_new_text,
+    dirty_flags_all, dirty_flags_none
+}
+import lib.layout {
+    LayoutConstraints, layout_constraints_new,
+    layout_block
+}
+import lib.composite {
+    LayerTree, LayerId,
+    layer_tree_new, layer_tree_create_root, layer_tree_mark_dirty
+}
+import lib.hit {
+    HitTestResult, hit_test, hit_test_result_empty, hit_test_result_is_hit
+}
+import lib.paint {
+    PaintContext, paint_context_new, paint_tree
+}
+
+# =============================================================================
+# Scroll Listener
+# =============================================================================
+
+# Callback type for scroll notifications
+pub type ScrollCallback = fn(node_id: NodeId, offset: Point)
+
+# =============================================================================
+# Iris State
+# =============================================================================
+
+pub struct Iris
+    # Trees
+    render_tree: RenderTree
+    layer_tree: LayerTree
+
+    # Viewport
+    viewport_width: u32
+    viewport_height: u32
+
+    # Frame state
+    needs_layout: bool
+    needs_paint: bool
+
+    # Event queue (pending mutations from Tempest)
+    pending_events: Vec<StyleEvent>
+
+    # Scroll listeners (for JS onscroll)
+    scroll_listeners: Vec<ScrollCallback>
+
+    # Root font size (for rem units)
+    root_font_size: f32
+
+    # Hover state (for mouseenter/leave events)
+    hover_node: NodeId
+
+pub fn iris_new(viewport_width: u32, viewport_height: u32) -> Iris
+    Iris {
+        render_tree: render_tree_new(),
+        layer_tree: layer_tree_new(),
+        viewport_width: viewport_width,
+        viewport_height: viewport_height,
+        needs_layout: false,
+        needs_paint: false,
+        pending_events: Vec.new(),
+        scroll_listeners: Vec.new(),
+        root_font_size: 16.0,
+        hover_node: node_id_invalid()
+    }
+
+# =============================================================================
+# Event Processing
+# =============================================================================
+
+# Queue a style event for processing on next frame
+pub fn iris_queue_event(iris:& Iris, event: StyleEvent)
+    iris.pending_events.push(event)
+
+# Process all queued events (called at frame boundary)
+pub fn iris_process_events(iris:& Iris)
+    for i in 0..iris.pending_events.len()
+        let event = iris.pending_events[i]
+        process_style_event(iris, event)
+    iris.pending_events.clear()
+
+fn process_style_event(iris:& Iris, event: StyleEvent)
+    match event
+        StyleEvent.NodeCreated(e) => handle_node_created(iris, e)
+        StyleEvent.NodeRemoved(e) => handle_node_removed(iris, e)
+        StyleEvent.NodeMoved(e) => handle_node_moved(iris, e)
+        StyleEvent.StyleChanged(e) => handle_style_changed(iris, e)
+        StyleEvent.TextChanged(e) => handle_text_changed(iris, e)
+        StyleEvent.ImageChanged(e) => handle_image_changed(iris, e)
+        StyleEvent.BatchEnd => ()  # Batch marker, no action needed
+
+fn handle_node_created(iris:& Iris, event: NodeCreatedEvent)
+    # Create render node
+    let node = render_node_new(event.id, event.tag, event.style)
+    render_tree_insert(@&iris.render_tree, node)
+
+    # Set parent relationship
+    if node_id_is_valid(event.parent)
+        attach_child(iris, event.parent, event.id, event.index)
+    else
+        # This is the root node
+        render_tree_set_root(@&iris.render_tree, event.id)
+
+    iris.needs_layout = true
+    iris.needs_paint = true
+
+fn handle_node_removed(iris:& Iris, event: NodeRemovedEvent)
+    # Detach from parent
+    match render_tree_get(iris.render_tree, event.id)
+        Option.Some(node) =>
+            if node_id_is_valid(node.parent)
+                detach_child(iris, node.parent, event.id)
+        Option.None => ()
+
+    # Remove from tree
+    render_tree_remove(@&iris.render_tree, event.id)
+
+    iris.needs_layout = true
+    iris.needs_paint = true
+
+fn handle_node_moved(iris:& Iris, event: NodeMovedEvent)
+    # Detach from old parent
+    match render_tree_get(iris.render_tree, event.id)
+        Option.Some(node) =>
+            if node_id_is_valid(node.parent)
+                detach_child(iris, node.parent, event.id)
+        Option.None => return
+
+    # Attach to new parent
+    attach_child(iris, event.new_parent, event.id, event.new_index)
+
+    iris.needs_layout = true
+    iris.needs_paint = true
+
+fn handle_style_changed(iris:& Iris, event: StyleChangedEvent)
+    match render_tree_get_mut(@&iris.render_tree, event.id)
+        Option.Some(node) =>
+            node.style = event.style
+            node.dirty = dirty_flags_all()
+        Option.None => ()
+
+    iris.needs_layout = true
+    iris.needs_paint = true
+
+fn handle_text_changed(iris:& Iris, event: TextChangedEvent)
+    match render_tree_get_mut(@&iris.render_tree, event.id)
+        Option.Some(node) =>
+            node.content = RenderContent.Text(event.text)
+            node.dirty = dirty_flags_all()
+        Option.None => ()
+
+    iris.needs_layout = true
+    iris.needs_paint = true
+
+fn handle_image_changed(iris:& Iris, event: ImageChangedEvent)
+    match render_tree_get_mut(@&iris.render_tree, event.id)
+        Option.Some(node) =>
+            node.content = RenderContent.Image {
+                width: event.width,
+                height: event.height,
+                loaded: event.loaded
+            }
+            node.dirty = dirty_flags_all()
+        Option.None => ()
+
+    iris.needs_layout = true
+    iris.needs_paint = true
+
+# =============================================================================
+# Tree Manipulation Helpers
+# =============================================================================
+
+fn attach_child(iris:& Iris, parent_id: NodeId, child_id: NodeId, index: u32)
+    match render_tree_get_mut(@&iris.render_tree, child_id)
+        Option.Some(child) =>
+            child.parent = parent_id
+        Option.None => return
+
+    match render_tree_get_mut(@&iris.render_tree, parent_id)
+        Option.Some(parent) =>
+            # TODO: insert at correct index (currently appends)
+            if not node_id_is_valid(parent.first_child)
+                parent.first_child = child_id
+                parent.last_child = child_id
+            else
+                # Append to end
+                let old_last = parent.last_child
+                match render_tree_get_mut(@&iris.render_tree, old_last)
+                    Option.Some(last) =>
+                        last.next_sibling = child_id
+                    Option.None => ()
+                match render_tree_get_mut(@&iris.render_tree, child_id)
+                    Option.Some(child) =>
+                        child.prev_sibling = old_last
+                    Option.None => ()
+                parent.last_child = child_id
+            parent.child_count = parent.child_count + 1
+        Option.None => ()
+
+fn detach_child(iris:& Iris, parent_id: NodeId, child_id: NodeId)
+    match render_tree_get(@&iris.render_tree, child_id)
+        Option.Some(child) =>
+            let prev = child.prev_sibling
+            let next = child.next_sibling
+
+            # Update previous sibling
+            if node_id_is_valid(prev)
+                match render_tree_get_mut(@&iris.render_tree, prev)
+                    Option.Some(prev_node) =>
+                        prev_node.next_sibling = next
+                    Option.None => ()
+
+            # Update next sibling
+            if node_id_is_valid(next)
+                match render_tree_get_mut(@&iris.render_tree, next)
+                    Option.Some(next_node) =>
+                        next_node.prev_sibling = prev
+                    Option.None => ()
+
+            # Update parent's first/last child
+            match render_tree_get_mut(@&iris.render_tree, parent_id)
+                Option.Some(parent) =>
+                    if node_id_eq(parent.first_child, child_id)
+                        parent.first_child = next
+                    if node_id_eq(parent.last_child, child_id)
+                        parent.last_child = prev
+                    parent.child_count = parent.child_count - 1
+                Option.None => ()
+        Option.None => ()
+
+    # Clear child's links
+    match render_tree_get_mut(@&iris.render_tree, child_id)
+        Option.Some(child) =>
+            child.parent = node_id_invalid()
+            child.prev_sibling = node_id_invalid()
+            child.next_sibling = node_id_invalid()
+        Option.None => ()
+
+# =============================================================================
+# Layout
+# =============================================================================
+
+pub fn iris_layout(iris:& Iris)
+    if not iris.needs_layout
+        return
+
+    let viewport = Size.new(iris.viewport_width, iris.viewport_height)
+    let constraints = layout_constraints_new(viewport, iris.root_font_size)
+
+    # Layout from root
+    match render_tree_root(iris.render_tree)
+        Option.Some(root) =>
+            layout_block(@&iris.render_tree, root.id, constraints)
+        Option.None => ()
+
+    iris.needs_layout = false
+    iris.needs_paint = true  # Layout changes require repaint
+
+# =============================================================================
+# Painting
+# =============================================================================
+
+pub fn iris_paint(iris:& Iris, draw_ctx:& DrawContext)
+    if not iris.needs_paint
+        return
+
+    let viewport = Size.new(iris.viewport_width, iris.viewport_height)
+    var paint_ctx = paint_context_new(draw_ctx, viewport)
+
+    paint_tree(iris.render_tree, iris.layer_tree, @&paint_ctx)
+
+    iris.needs_paint = false
+
+# =============================================================================
+# Frame Rendering (main entry point)
+# =============================================================================
+
+# Process pending events, layout if needed, paint if needed
+pub fn iris_render_frame(iris:& Iris, draw_ctx:& DrawContext)
+    # 1. Process queued style events
+    iris_process_events(iris)
+
+    # 2. Layout if dirty
+    iris_layout(iris)
+
+    # 3. Paint if dirty
+    iris_paint(iris, draw_ctx)
+
+# =============================================================================
+# Viewport Management
+# =============================================================================
+
+pub fn iris_resize(iris:& Iris, width: u32, height: u32)
+    if iris.viewport_width != width or iris.viewport_height != height
+        iris.viewport_width = width
+        iris.viewport_height = height
+        iris.needs_layout = true
+        iris.needs_paint = true
+
+# =============================================================================
+# Hit Testing
+# =============================================================================
+
+pub fn iris_hit_test(iris: Iris, point: Point) -> HitTestResult
+    hit_test(iris.render_tree, iris.layer_tree, point)
+
+# =============================================================================
+# Scrolling
+# =============================================================================
+
+pub fn iris_scroll(iris:& Iris, node_id: NodeId, offset: Point)
+    # Find the layer for this node and update scroll offset
+    # TODO: implement layer lookup by node_id
+    # layer_tree_scroll(@&iris.layer_tree, layer_id, offset)
+
+    # Notify scroll listeners
+    for i in 0..iris.scroll_listeners.len()
+        let callback = iris.scroll_listeners[i]
+        callback(node_id, offset)
+
+    iris.needs_paint = true
+
+pub fn iris_add_scroll_listener(iris:& Iris, callback: ScrollCallback)
+    iris.scroll_listeners.push(callback)
+
+# =============================================================================
+# Layout Queries (for JS APIs like getBoundingClientRect)
+# =============================================================================
+
+pub fn iris_get_bounding_rect(iris: Iris, node_id: NodeId) -> Option<Rect>
+    match render_tree_get(iris.render_tree, node_id)
+        Option.Some(node) =>
+            Option.Some(render_node_absolute_rect(*node, iris.render_tree))
+        Option.None =>
+            Option.None

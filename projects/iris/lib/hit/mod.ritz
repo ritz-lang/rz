@@ -1,0 +1,232 @@
+# lib/hit/mod.ritz - Hit testing module
+#
+# Hit testing determines which render node is at a given screen coordinate.
+# Used for mouse clicks, hover states, and touch events.
+#
+# Algorithm:
+# 1. Start from root layer, traverse in reverse paint order (front to back)
+# 2. For each layer, check if point is within bounds
+# 3. For layers with transforms, apply inverse transform to point
+# 4. Return the frontmost (highest z-order) node that contains the point
+#
+# Usage:
+#   import lib.hit.mod
+
+import ritzlib.sys
+import lib.style.types
+import lib.tree.render_node
+import lib.composite.layer
+
+# =============================================================================
+# Hit Point
+# =============================================================================
+
+pub struct HitPoint
+    x: i32
+    y: i32
+
+pub fn hit_point_new(x: i32, y: i32) -> HitPoint
+    HitPoint { x: x, y: y }
+
+pub fn hit_point_zero() -> HitPoint
+    HitPoint { x: 0, y: 0 }
+
+# =============================================================================
+# Hit Test Result
+# =============================================================================
+
+pub struct HitTestResult
+    # The node that was hit (invalid if nothing hit)
+    node_id: NodeId
+    # Point relative to the hit node's content box
+    local_x: i32
+    local_y: i32
+    # The layer containing the hit node
+    layer_id: LayerId
+    # Whether the hit node is scrollable (0 = no, 1 = yes)
+    scrollable: i32
+
+pub fn hit_test_result_empty() -> HitTestResult
+    HitTestResult {
+        node_id: node_id_invalid(),
+        local_x: 0,
+        local_y: 0,
+        layer_id: layer_id_invalid(),
+        scrollable: 0
+    }
+
+pub fn hit_test_result_is_hit(result: @HitTestResult) -> i32
+    node_id_is_valid(result.node_id)
+
+# =============================================================================
+# Pointer Event Types
+# =============================================================================
+
+const POINTER_EVENT_DOWN: i32 = 0
+const POINTER_EVENT_UP: i32 = 1
+const POINTER_EVENT_MOVE: i32 = 2
+const POINTER_EVENT_ENTER: i32 = 3
+const POINTER_EVENT_LEAVE: i32 = 4
+const POINTER_EVENT_CANCEL: i32 = 5
+
+# Mouse buttons
+const BUTTON_LEFT: u8 = 0
+const BUTTON_MIDDLE: u8 = 1
+const BUTTON_RIGHT: u8 = 2
+
+# Modifier keys (bitmask)
+const MOD_SHIFT: u8 = 1
+const MOD_CTRL: u8 = 2
+const MOD_ALT: u8 = 4
+const MOD_META: u8 = 8
+
+pub struct PointerEvent
+    event_type: i32
+    x: i32
+    y: i32
+    button: u8              # Which button triggered this event
+    buttons: u8             # Bitmask of currently pressed buttons
+    modifiers: u8           # Shift, Ctrl, Alt, Meta
+
+pub fn pointer_event_new(event_type: i32, x: i32, y: i32) -> PointerEvent
+    PointerEvent {
+        event_type: event_type,
+        x: x,
+        y: y,
+        button: 0,
+        buttons: 0,
+        modifiers: 0
+    }
+
+# =============================================================================
+# Rect Helper for Hit Testing
+# =============================================================================
+
+# Check if a point is inside a rectangle
+fn point_in_rect(px: i32, py: i32, rx: i32, ry: i32, rw: u32, rh: u32) -> i32
+    if px < rx
+        return 0
+    if py < ry
+        return 0
+    if px >= rx + rw as i32
+        return 0
+    if py >= ry + rh as i32
+        return 0
+    return 1
+
+# =============================================================================
+# Hit Testing - Node Level
+# =============================================================================
+
+# Hit test a render node and its children
+fn hit_test_node(tree: @RenderTree, node: @RenderNode, px: i32, py: i32) -> HitTestResult
+    # Check visibility
+    if node.style.visibility != VISIBILITY_VISIBLE
+        return hit_test_result_empty()
+
+    # Get border box for hit testing
+    let border_x = node.layout.x - node.layout.padding_left as i32 - node.layout.border_left as i32
+    let border_y = node.layout.y - node.layout.padding_top as i32 - node.layout.border_top as i32
+    let border_w = node.layout.width + node.layout.padding_left + node.layout.padding_right + node.layout.border_left + node.layout.border_right
+    let border_h = node.layout.height + node.layout.padding_top + node.layout.padding_bottom + node.layout.border_top + node.layout.border_bottom
+
+    # Check if point is within border box
+    if point_in_rect(px, py, border_x, border_y, border_w, border_h) == 0
+        return hit_test_result_empty()
+
+    # Check children first (reverse order for front-to-back)
+    # TODO: respect z-index ordering
+    var child_id = node.last_child
+    while node_id_is_valid(@child_id) != 0
+        let child = render_tree_get(tree, @child_id)
+        if child != null
+            # Transform point to child's coordinate space
+            let child_px = px - node.layout.x - node.layout.padding_left as i32 - node.layout.border_left as i32
+            let child_py = py - node.layout.y - node.layout.padding_top as i32 - node.layout.border_top as i32
+            let child_result = hit_test_node(tree, child, child_px, child_py)
+            if hit_test_result_is_hit(@child_result) != 0
+                return child_result
+            child_id = child.prev_sibling
+        else
+            child_id = node_id_invalid()
+
+    # No child was hit, this node is the target
+    let local_x = px - node.layout.x
+    let local_y = py - node.layout.y
+
+    HitTestResult {
+        node_id: node.id,
+        local_x: local_x,
+        local_y: local_y,
+        layer_id: layer_id_invalid(),  # Will be filled by caller
+        scrollable: 0
+    }
+
+# =============================================================================
+# Hit Testing - Layer Level
+# =============================================================================
+
+# Hit test within a layer and its children
+fn hit_test_layer(rtree: @RenderTree, ltree: @LayerTree, layer: @Layer, px: i32, py: i32) -> HitTestResult
+    # Check if point is within layer bounds
+    if point_in_rect(px, py, layer.bounds.x, layer.bounds.y, layer.bounds.width, layer.bounds.height) == 0
+        return hit_test_result_empty()
+
+    # Transform point to layer-local coordinates
+    var local_x = px - layer.bounds.x
+    var local_y = py - layer.bounds.y
+
+    # Apply inverse transform if layer has one
+    # TODO: implement proper matrix inversion
+    # For now, just handle translation
+    let tx: i32 = layer.transform.e as i32
+    let ty: i32 = layer.transform.f as i32
+    local_x = local_x - tx
+    local_y = local_y - ty
+
+    # Apply scroll offset for scrollable layers
+    local_x = local_x + layer.scroll_offset.x
+    local_y = local_y + layer.scroll_offset.y
+
+    # Check children layers first (front to back = last to first)
+    var child_id = layer.last_child
+    while layer_id_is_valid(@child_id) != 0
+        let child_layer = layer_tree_get(ltree, @child_id)
+        if child_layer != null
+            let child_result = hit_test_layer(rtree, ltree, child_layer, px, py)
+            if hit_test_result_is_hit(@child_result) != 0
+                # Found a hit in child layer
+                return child_result
+            child_id = child_layer.prev_sibling
+        else
+            child_id = layer_id_invalid()
+
+    # No child layer hit, check nodes in this layer
+    if node_id_is_valid(@layer.node_id) != 0
+        let node = render_tree_get(rtree, @layer.node_id)
+        if node != null
+            let node_result = hit_test_node(rtree, node, local_x, local_y)
+            if hit_test_result_is_hit(@node_result) != 0
+                # Update with layer info
+                var result = node_result
+                result.layer_id = layer.id
+                result.scrollable = layer_is_scrollable(layer)
+                return result
+
+    hit_test_result_empty()
+
+# =============================================================================
+# Main Hit Test Entry Point
+# =============================================================================
+
+pub fn hit_test(rtree: @RenderTree, ltree: @LayerTree, px: i32, py: i32) -> HitTestResult
+    let root_layer = layer_tree_root(ltree)
+    if root_layer != null
+        return hit_test_layer(rtree, ltree, root_layer, px, py)
+    hit_test_result_empty()
+
+# Dispatch a pointer event to the appropriate node
+pub fn dispatch_pointer_event(rtree: @RenderTree, ltree: @LayerTree, event: @PointerEvent) -> HitTestResult
+    # First, hit test to find the target
+    hit_test(rtree, ltree, event.x, event.y)
+    # TODO: maintain hover state, fire enter/leave events

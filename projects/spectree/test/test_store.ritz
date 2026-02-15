@@ -1,0 +1,327 @@
+# test/test_store.ritz - Tests for in-memory store
+#
+# Tests for lib/store.ritz:
+# - Store creation
+# - Node CRUD operations
+# - Link operations
+# - Agent operations
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.gvec
+
+import lib.types
+import lib.uuid { uuid_generate }
+import lib.store
+
+# ============================================================================
+# Store Creation Tests
+# ============================================================================
+
+[[test]]
+fn test_store_new() -> i32
+    var s: Store = store_new()
+    assert store_count(@s) == 0, "new store should be empty"
+    0
+
+# ============================================================================
+# Node Creation Tests
+# ============================================================================
+
+[[test]]
+fn test_store_create_root() -> i32
+    var s: Store = store_new()
+    var zero: Uuid = uuid_zero()
+
+    var id: Uuid = store_create(@&s, NODE_ORG, @zero)
+
+    # ID should be generated (not zero)
+    assert uuid_eq(@id, @zero) == 0, "created node should have non-zero ID"
+    assert store_count(@s) == 1, "store should have 1 node"
+    0
+
+[[test]]
+fn test_store_create_with_parent() -> i32
+    var s: Store = store_new()
+    var zero: Uuid = uuid_zero()
+
+    # Create parent
+    var parent_id: Uuid = store_create(@&s, NODE_ORG, @zero)
+
+    # Create child
+    var child_id: Uuid = store_create(@&s, NODE_SPEC, @parent_id)
+
+    assert store_count(@s) == 2, "store should have 2 nodes"
+
+    # Verify child's parent
+    var child: *Node = store_get(@&s, @child_id)
+    let child_ptr: i64 = child as i64
+    assert child_ptr != 0, "child should exist"
+    assert uuid_eq(@child.parent_id, @parent_id) == 1, "child should have correct parent"
+    0
+
+[[test]]
+fn test_store_create_multiple_children() -> i32
+    var s: Store = store_new()
+    var zero: Uuid = uuid_zero()
+
+    var parent_id: Uuid = store_create(@&s, NODE_ORG, @zero)
+    var child1_id: Uuid = store_create(@&s, NODE_SPEC, @parent_id)
+    var child2_id: Uuid = store_create(@&s, NODE_SPEC, @parent_id)
+    var child3_id: Uuid = store_create(@&s, NODE_PLAN, @parent_id)
+
+    # Check parent's children
+    let count: i64 = store_children_count(@&s, @parent_id)
+    assert count == 3, "parent should have 3 children"
+    0
+
+# ============================================================================
+# Node Retrieval Tests
+# ============================================================================
+
+[[test]]
+fn test_store_get_existing() -> i32
+    var s: Store = store_new()
+    var zero: Uuid = uuid_zero()
+
+    var id: Uuid = store_create(@&s, NODE_SPEC, @zero)
+    var node: *Node = store_get(@&s, @id)
+
+    let node_ptr: i64 = node as i64
+    assert node_ptr != 0, "should find existing node"
+    assert node.kind == NODE_SPEC, "node should have correct kind"
+    0
+
+[[test]]
+fn test_store_get_nonexistent() -> i32
+    var s: Store = store_new()
+    var fake_id: Uuid = uuid_generate()
+
+    var node: *Node = store_get(@&s, @fake_id)
+    let node_ptr: i64 = node as i64
+    assert node_ptr == 0, "should not find nonexistent node"
+    0
+
+# ============================================================================
+# Node Update Tests
+# ============================================================================
+
+[[test]]
+fn test_store_update_status() -> i32
+    var s: Store = store_new()
+    var zero: Uuid = uuid_zero()
+
+    var id: Uuid = store_create(@&s, NODE_SPEC, @zero)
+
+    # Initial status should be DRAFT
+    var node1: *Node = store_get(@&s, @id)
+    assert node1.status == STATUS_DRAFT, "initial status should be DRAFT"
+
+    # Update to IN_PROGRESS
+    let result: i32 = store_update_status(@&s, @id, STATUS_IN_PROGRESS)
+    assert result == 0, "update should succeed"
+
+    var node2: *Node = store_get(@&s, @id)
+    assert node2.status == STATUS_IN_PROGRESS, "status should be updated"
+    0
+
+[[test]]
+fn test_store_update_title() -> i32
+    var s: Store = store_new()
+    var zero: Uuid = uuid_zero()
+
+    var id: Uuid = store_create(@&s, NODE_SPEC, @zero)
+
+    # Create title
+    var title: Vec<u8> = vec_new<u8>()
+    vec_push<u8>(@&title, 'T')
+    vec_push<u8>(@&title, 'e')
+    vec_push<u8>(@&title, 's')
+    vec_push<u8>(@&title, 't')
+
+    let result: i32 = store_update_title(@&s, @id, @title)
+    assert result == 0, "update should succeed"
+
+    var node: *Node = store_get(@&s, @id)
+    assert vec_len<u8>(@node.title) == 4, "title should have 4 chars"
+    0
+
+[[test]]
+fn test_store_update_content() -> i32
+    var s: Store = store_new()
+    var zero: Uuid = uuid_zero()
+
+    var id: Uuid = store_create(@&s, NODE_SPEC, @zero)
+
+    var content: Vec<u8> = vec_new<u8>()
+    vec_push<u8>(@&content, '#')
+    vec_push<u8>(@&content, ' ')
+    vec_push<u8>(@&content, 'H')
+    vec_push<u8>(@&content, 'i')
+
+    let result: i32 = store_update_content(@&s, @id, @content)
+    assert result == 0, "update should succeed"
+
+    var node: *Node = store_get(@&s, @id)
+    assert vec_len<u8>(@node.content) == 4, "content should have 4 chars"
+    0
+
+# ============================================================================
+# Node Move Tests
+# ============================================================================
+
+[[test]]
+fn test_store_move_node() -> i32
+    var s: Store = store_new()
+    var zero: Uuid = uuid_zero()
+
+    # Create two parents
+    var parent1_id: Uuid = store_create(@&s, NODE_ORG, @zero)
+    var parent2_id: Uuid = store_create(@&s, NODE_ORG, @zero)
+
+    # Create child under parent1
+    var child_id: Uuid = store_create(@&s, NODE_SPEC, @parent1_id)
+
+    # Move to parent2
+    let result: i32 = store_move(@&s, @child_id, @parent2_id)
+    assert result == 0, "move should succeed"
+
+    # Verify child's new parent
+    var child: *Node = store_get(@&s, @child_id)
+    assert uuid_eq(@child.parent_id, @parent2_id) == 1, "child should have new parent"
+
+    # Verify parent1 no longer has child
+    assert store_children_count(@&s, @parent1_id) == 0, "parent1 should have no children"
+
+    # Verify parent2 has child
+    assert store_children_count(@&s, @parent2_id) == 1, "parent2 should have 1 child"
+    0
+
+# ============================================================================
+# Node Delete Tests
+# ============================================================================
+
+[[test]]
+fn test_store_delete_node() -> i32
+    var s: Store = store_new()
+    var zero: Uuid = uuid_zero()
+
+    var id: Uuid = store_create(@&s, NODE_SPEC, @zero)
+    assert store_count(@s) == 1, "store should have 1 node"
+
+    let result: i32 = store_delete(@&s, @id)
+    assert result == 0, "delete should succeed"
+    assert store_count(@s) == 0, "store should be empty"
+    0
+
+[[test]]
+fn test_store_delete_removes_from_parent() -> i32
+    var s: Store = store_new()
+    var zero: Uuid = uuid_zero()
+
+    var parent_id: Uuid = store_create(@&s, NODE_ORG, @zero)
+    var child_id: Uuid = store_create(@&s, NODE_SPEC, @parent_id)
+
+    # Verify parent has child
+    assert store_children_count(@&s, @parent_id) == 1, "parent should have 1 child"
+
+    # Delete child
+    store_delete(@&s, @child_id)
+
+    # Verify parent no longer has child
+    assert store_children_count(@&s, @parent_id) == 0, "parent should have no children"
+    0
+
+# ============================================================================
+# Link Tests
+# ============================================================================
+
+[[test]]
+fn test_store_add_link() -> i32
+    var s: Store = store_new()
+    var zero: Uuid = uuid_zero()
+
+    var spec_id: Uuid = store_create(@&s, NODE_SPEC, @zero)
+    var plan_id: Uuid = store_create(@&s, NODE_PLAN, @zero)
+
+    # Plan implements spec
+    let result: i32 = store_add_link(@&s, @plan_id, @spec_id, LINK_IMPLEMENTS)
+    assert result == 0, "add link should succeed"
+
+    assert store_links_count(@&s, @plan_id) == 1, "plan should have 1 link"
+    0
+
+[[test]]
+fn test_store_remove_link() -> i32
+    var s: Store = store_new()
+    var zero: Uuid = uuid_zero()
+
+    var spec_id: Uuid = store_create(@&s, NODE_SPEC, @zero)
+    var plan_id: Uuid = store_create(@&s, NODE_PLAN, @zero)
+
+    store_add_link(@&s, @plan_id, @spec_id, LINK_IMPLEMENTS)
+
+    # Remove link
+    let result: i32 = store_remove_link(@&s, @plan_id, @spec_id)
+    assert result == 0, "remove link should succeed"
+
+    assert store_links_count(@&s, @plan_id) == 0, "plan should have no links"
+    0
+
+[[test]]
+fn test_store_add_link_invalid_target() -> i32
+    var s: Store = store_new()
+    var zero: Uuid = uuid_zero()
+
+    var spec_id: Uuid = store_create(@&s, NODE_SPEC, @zero)
+    var fake_id: Uuid = uuid_generate()
+
+    # Try to link to nonexistent node
+    let result: i32 = store_add_link(@&s, @spec_id, @fake_id, LINK_DEPENDS_ON)
+    assert result == -1, "linking to nonexistent node should fail"
+    0
+
+# ============================================================================
+# Agent Tests
+# ============================================================================
+
+[[test]]
+fn test_store_assign_agent() -> i32
+    var s: Store = store_new()
+    var zero: Uuid = uuid_zero()
+
+    var node_id: Uuid = store_create(@&s, NODE_PLAN, @zero)
+
+    var agent_id: Vec<u8> = vec_new<u8>()
+    vec_push<u8>(@&agent_id, 'a')
+    vec_push<u8>(@&agent_id, 'd')
+    vec_push<u8>(@&agent_id, 'e')
+    vec_push<u8>(@&agent_id, 'l')
+    vec_push<u8>(@&agent_id, 'e')
+
+    let result: i32 = store_assign_agent(@&s, @node_id, @agent_id, AGENT_OWNER)
+    assert result == 0, "assign agent should succeed"
+
+    assert store_agents_count(@&s, @node_id) == 1, "node should have 1 agent"
+    0
+
+[[test]]
+fn test_store_multiple_agents() -> i32
+    var s: Store = store_new()
+    var zero: Uuid = uuid_zero()
+
+    var node_id: Uuid = store_create(@&s, NODE_PLAN, @zero)
+
+    var agent1: Vec<u8> = vec_new<u8>()
+    vec_push<u8>(@&agent1, 'a')
+    vec_push<u8>(@&agent1, '1')
+
+    var agent2: Vec<u8> = vec_new<u8>()
+    vec_push<u8>(@&agent2, 'a')
+    vec_push<u8>(@&agent2, '2')
+
+    store_assign_agent(@&s, @node_id, @agent1, AGENT_OWNER)
+    store_assign_agent(@&s, @node_id, @agent2, AGENT_REVIEWER)
+
+    assert store_agents_count(@&s, @node_id) == 2, "node should have 2 agents"
+    0

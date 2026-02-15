@@ -1,0 +1,377 @@
+# Prism - Drawing API
+#
+# Core drawing primitives that clients (like Iris) use to render content.
+# These commands are serializable for remote display support.
+
+import types { Point, Size, Rect, Color }
+import api.text { GlyphRun }
+import api.image { ImageHandle }
+
+# Drawing context bound to a surface
+# Accumulates draw commands for a frame
+pub struct DrawContext
+    surface_id: u64
+    commands: Vec<DrawCommand>
+    clip_stack: Vec<Rect>
+    transform_stack: Vec<Transform2D>
+
+impl DrawContext
+    # --- Basic Shapes ---
+
+    # Fill a rectangle with solid color
+    pub fn fill_rect(self:&, rect: Rect, color: Color)
+        self.commands.push(DrawCommand.FillRect(FillRectOp {
+            rect: self.apply_transform(rect),
+            color: color
+        }))
+
+    # Stroke (outline) a rectangle
+    pub fn stroke_rect(self:&, rect: Rect, color: Color, width: f32)
+        self.commands.push(DrawCommand.StrokeRect(StrokeRectOp {
+            rect: self.apply_transform(rect),
+            color: color,
+            width: width
+        }))
+
+    # Fill a rounded rectangle
+    pub fn fill_rounded_rect(self:&, rect: Rect, radius: f32, color: Color)
+        self.commands.push(DrawCommand.FillRoundedRect(FillRoundedRectOp {
+            rect: self.apply_transform(rect),
+            radius: radius,
+            color: color
+        }))
+
+    # Stroke a rounded rectangle
+    pub fn stroke_rounded_rect(self:&, rect: Rect, radius: f32, color: Color, width: f32)
+        self.commands.push(DrawCommand.StrokeRoundedRect(StrokeRoundedRectOp {
+            rect: self.apply_transform(rect),
+            radius: radius,
+            color: color,
+            width: width
+        }))
+
+    # --- Lines ---
+
+    # Draw a line between two points
+    pub fn draw_line(self:&, from: Point, to: Point, color: Color, width: f32)
+        self.commands.push(DrawCommand.Line(LineOp {
+            from: self.transform_point(from),
+            to: self.transform_point(to),
+            color: color,
+            width: width
+        }))
+
+    # --- Paths (for complex shapes like borders with different radii) ---
+
+    # Fill a path
+    pub fn fill_path(self:&, path: Path, color: Color)
+        self.commands.push(DrawCommand.FillPath(FillPathOp {
+            path: path,
+            color: color
+        }))
+
+    # Stroke a path
+    pub fn stroke_path(self:&, path: Path, color: Color, width: f32, style: StrokeStyle)
+        self.commands.push(DrawCommand.StrokePath(StrokePathOp {
+            path: path,
+            color: color,
+            width: width,
+            style: style
+        }))
+
+    # --- Text ---
+
+    # Draw pre-shaped text (glyphs from Angelo)
+    pub fn draw_glyphs(self:&, glyphs: GlyphRun, origin: Point, color: Color)
+        self.commands.push(DrawCommand.Glyphs(GlyphsOp {
+            glyphs: glyphs,
+            origin: self.transform_point(origin),
+            color: color
+        }))
+
+    # --- Images ---
+
+    # Draw an image
+    pub fn draw_image(self:&, image: ImageHandle, dest: Rect)
+        self.commands.push(DrawCommand.Image(ImageOp {
+            image: image,
+            src: Rect.full(image.width(), image.height()),
+            dest: self.apply_transform(dest)
+        }))
+
+    # Draw a portion of an image (for sprites, nine-patch, etc.)
+    pub fn draw_image_rect(self:&, image: ImageHandle, src: Rect, dest: Rect)
+        self.commands.push(DrawCommand.Image(ImageOp {
+            image: image,
+            src: src,
+            dest: self.apply_transform(dest)
+        }))
+
+    # --- Gradients ---
+
+    # Fill with a linear gradient
+    pub fn fill_linear_gradient(self:&, rect: Rect, start: Point, end: Point, stops: Vec<GradientStop>)
+        self.commands.push(DrawCommand.LinearGradient(LinearGradientOp {
+            rect: self.apply_transform(rect),
+            start: start,
+            end: end,
+            stops: stops
+        }))
+
+    # Fill with a radial gradient
+    pub fn fill_radial_gradient(self:&, rect: Rect, center: Point, radius: f32, stops: Vec<GradientStop>)
+        self.commands.push(DrawCommand.RadialGradient(RadialGradientOp {
+            rect: self.apply_transform(rect),
+            center: center,
+            radius: radius,
+            stops: stops
+        }))
+
+    # --- Clipping ---
+
+    # Push a clip rect (intersects with current clip)
+    pub fn push_clip(self:&, rect: Rect)
+        let transformed = self.apply_transform(rect)
+        let clipped = if self.clip_stack.len() > 0
+            let current = self.clip_stack[self.clip_stack.len() - 1]
+            current.intersection(transformed)
+        else
+            transformed
+        self.clip_stack.push(clipped)
+        self.commands.push(DrawCommand.PushClip(clipped))
+
+    # Pop clip rect
+    pub fn pop_clip(self:&)
+        if self.clip_stack.len() > 0
+            self.clip_stack.pop()
+            self.commands.push(DrawCommand.PopClip)
+
+    # --- Transforms ---
+
+    # Push a transform matrix
+    pub fn push_transform(self:&, transform: Transform2D)
+        self.transform_stack.push(transform)
+
+    # Pop transform
+    pub fn pop_transform(self:&)
+        if self.transform_stack.len() > 0
+            self.transform_stack.pop()
+
+    # --- Shadows (for box-shadow) ---
+
+    # Draw a box shadow
+    pub fn draw_box_shadow(self:&, rect: Rect, shadow: BoxShadow)
+        self.commands.push(DrawCommand.BoxShadow(BoxShadowOp {
+            rect: self.apply_transform(rect),
+            shadow: shadow
+        }))
+
+    # --- Helpers ---
+
+    fn apply_transform(self, rect: Rect) -> Rect
+        # TODO: Apply transform stack
+        rect
+
+    fn transform_point(self, p: Point) -> Point
+        # TODO: Apply transform stack
+        p
+
+    # Finish drawing and get the command list
+    pub fn finish(self:&) -> Vec<DrawCommand>
+        let cmds = self.commands
+        self.commands = Vec<DrawCommand>.new()
+        cmds
+
+# All drawing operations as an enum (serializable)
+pub enum DrawCommand
+    FillRect(FillRectOp)
+    StrokeRect(StrokeRectOp)
+    FillRoundedRect(FillRoundedRectOp)
+    StrokeRoundedRect(StrokeRoundedRectOp)
+    Line(LineOp)
+    FillPath(FillPathOp)
+    StrokePath(StrokePathOp)
+    Glyphs(GlyphsOp)
+    Image(ImageOp)
+    LinearGradient(LinearGradientOp)
+    RadialGradient(RadialGradientOp)
+    BoxShadow(BoxShadowOp)
+    PushClip(Rect)
+    PopClip
+
+# --- Operation Structs ---
+
+pub struct FillRectOp
+    rect: Rect
+    color: Color
+
+pub struct StrokeRectOp
+    rect: Rect
+    color: Color
+    width: f32
+
+pub struct FillRoundedRectOp
+    rect: Rect
+    radius: f32
+    color: Color
+
+pub struct StrokeRoundedRectOp
+    rect: Rect
+    radius: f32
+    color: Color
+    width: f32
+
+pub struct LineOp
+    from: Point
+    to: Point
+    color: Color
+    width: f32
+
+pub struct FillPathOp
+    path: Path
+    color: Color
+
+pub struct StrokePathOp
+    path: Path
+    color: Color
+    width: f32
+    style: StrokeStyle
+
+pub struct GlyphsOp
+    glyphs: GlyphRun
+    origin: Point
+    color: Color
+
+pub struct ImageOp
+    image: ImageHandle
+    src: Rect
+    dest: Rect
+
+pub struct LinearGradientOp
+    rect: Rect
+    start: Point
+    end: Point
+    stops: Vec<GradientStop>
+
+pub struct RadialGradientOp
+    rect: Rect
+    center: Point
+    radius: f32
+    stops: Vec<GradientStop>
+
+pub struct BoxShadowOp
+    rect: Rect
+    shadow: BoxShadow
+
+# --- Supporting Types ---
+
+pub struct GradientStop
+    offset: f32     # 0.0 to 1.0
+    color: Color
+
+pub struct BoxShadow
+    offset_x: f32
+    offset_y: f32
+    blur: f32
+    spread: f32
+    color: Color
+    inset: bool
+
+pub struct StrokeStyle
+    line_cap: LineCap
+    line_join: LineJoin
+    dash_array: Vec<f32>
+    dash_offset: f32
+
+pub enum LineCap
+    Butt
+    Round
+    Square
+
+pub enum LineJoin
+    Miter
+    Round
+    Bevel
+
+# 2D affine transform matrix
+pub struct Transform2D
+    a: f32  # scale x
+    b: f32  # skew y
+    c: f32  # skew x
+    d: f32  # scale y
+    e: f32  # translate x
+    f: f32  # translate y
+
+impl Transform2D
+    pub fn identity() -> Transform2D
+        Transform2D { a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: 0.0, f: 0.0 }
+
+    pub fn translate(x: f32, y: f32) -> Transform2D
+        Transform2D { a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: x, f: y }
+
+    pub fn scale(sx: f32, sy: f32) -> Transform2D
+        Transform2D { a: sx, b: 0.0, c: 0.0, d: sy, e: 0.0, f: 0.0 }
+
+    pub fn rotate(angle: f32) -> Transform2D
+        let cos = cos_f32(angle)
+        let sin = sin_f32(angle)
+        Transform2D { a: cos, b: sin, c: -sin, d: cos, e: 0.0, f: 0.0 }
+
+# Path for complex shapes
+pub struct Path
+    commands: Vec<PathCommand>
+
+pub enum PathCommand
+    MoveTo(Point)
+    LineTo(Point)
+    QuadTo(Point, Point)           # control, end
+    CubicTo(Point, Point, Point)   # control1, control2, end
+    ArcTo(Point, f32, bool, bool)  # end, radius, large_arc, sweep
+    Close
+
+# Path builder for ergonomic path construction
+pub struct PathBuilder
+    commands: Vec<PathCommand>
+
+impl PathBuilder
+    pub fn new() -> PathBuilder
+        PathBuilder { commands: Vec<PathCommand>.new() }
+
+    pub fn move_to(self:&, x: f32, y: f32) -> @&PathBuilder
+        self.commands.push(PathCommand.MoveTo(Point.new(x as i32, y as i32)))
+        self
+
+    pub fn line_to(self:&, x: f32, y: f32) -> @&PathBuilder
+        self.commands.push(PathCommand.LineTo(Point.new(x as i32, y as i32)))
+        self
+
+    pub fn quad_to(self:&, cx: f32, cy: f32, x: f32, y: f32) -> @&PathBuilder
+        self.commands.push(PathCommand.QuadTo(
+            Point.new(cx as i32, cy as i32),
+            Point.new(x as i32, y as i32)
+        ))
+        self
+
+    pub fn cubic_to(self:&, c1x: f32, c1y: f32, c2x: f32, c2y: f32, x: f32, y: f32) -> @&PathBuilder
+        self.commands.push(PathCommand.CubicTo(
+            Point.new(c1x as i32, c1y as i32),
+            Point.new(c2x as i32, c2y as i32),
+            Point.new(x as i32, y as i32)
+        ))
+        self
+
+    pub fn close(self:&) -> @&PathBuilder
+        self.commands.push(PathCommand.Close)
+        self
+
+    pub fn build(self) -> Path
+        Path { commands: self.commands }
+
+# Placeholder for trig functions (would be in ritzlib.math)
+fn cos_f32(angle: f32) -> f32
+    # TODO: Implement
+    1.0
+
+fn sin_f32(angle: f32) -> f32
+    # TODO: Implement
+    0.0

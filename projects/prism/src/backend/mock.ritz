@@ -1,0 +1,336 @@
+# Prism - Mock Backend
+#
+# A software framebuffer for testing. Provides:
+# - Triple-buffered pixel arrays
+# - Pixel inspection for test assertions
+# - Damage tracking history
+
+import types { Size, Rect, Color }
+
+# Triple buffer indices
+const BUFFER_COUNT: u32 = 3
+
+# Mock backend for testing without actual display hardware
+pub struct MockBackend
+    width: u32
+    height: u32
+
+    # Triple buffer: each is width * height pixels (RGBA as u32)
+    buffer_0: Vec<u32>
+    buffer_1: Vec<u32>
+    buffer_2: Vec<u32>
+
+    # Buffer state
+    front_idx: u32      # Currently "displayed"
+    back_idx: u32       # Ready for next swap
+    draw_idx: u32       # Currently being drawn to
+
+    # Statistics
+    frame_count: u64
+    total_pixels_drawn: u64
+
+    # Damage tracking for tests
+    damage_history: Vec<DamageRecord>
+
+# Record of a damage/redraw event for testing
+pub struct DamageRecord
+    frame: u64
+    rect: Rect
+
+impl MockBackend
+    pub fn new(width: u32, height: u32) -> MockBackend
+        let pixel_count = width * height
+        let clear_color = Color.black().to_argb()
+
+        # Initialize all buffers to black
+        var buffer_0 = Vec<u32>.with_capacity(pixel_count as u64)
+        var buffer_1 = Vec<u32>.with_capacity(pixel_count as u64)
+        var buffer_2 = Vec<u32>.with_capacity(pixel_count as u64)
+
+        var i: u32 = 0
+        while i < pixel_count
+            buffer_0.push(clear_color)
+            buffer_1.push(clear_color)
+            buffer_2.push(clear_color)
+            i += 1
+
+        MockBackend {
+            width: width,
+            height: height,
+            buffer_0: buffer_0,
+            buffer_1: buffer_1,
+            buffer_2: buffer_2,
+            front_idx: 0,
+            back_idx: 1,
+            draw_idx: 2,
+            frame_count: 0,
+            total_pixels_drawn: 0,
+            damage_history: Vec<DamageRecord>.new()
+        }
+
+    # Get the buffer we're currently drawing to
+    fn get_draw_buffer_ref(self:&) -> @&Vec<u32>
+        if self.draw_idx == 0
+            @&self.buffer_0
+        else if self.draw_idx == 1
+            @&self.buffer_1
+        else
+            @&self.buffer_2
+
+    # Get dimensions
+    pub fn dimensions(self) -> (u32, u32)
+        (self.width, self.height)
+
+    pub fn size(self) -> Size
+        Size { width: self.width, height: self.height }
+
+    pub fn width(self) -> u32
+        self.width
+
+    pub fn height(self) -> u32
+        self.height
+
+    # Get the pending buffer for external rendering (like text)
+    pub fn pending_buffer_mut(self:&) -> @&Vec<u32>
+        self.get_draw_buffer_ref()
+
+    # Shorthand for swap_buffers
+    pub fn swap(self:&)
+        self.swap_buffers()
+
+    # Swap buffers: draw -> back -> front -> draw
+    pub fn swap_buffers(self:&)
+        let old_front = self.front_idx
+        self.front_idx = self.back_idx
+        self.back_idx = self.draw_idx
+        self.draw_idx = old_front
+
+        self.frame_count += 1
+
+    pub fn frame_count(self) -> u64
+        self.frame_count
+
+    # Fill a rectangle with a color
+    pub fn fill_rect(self:&, rect: Rect, color: Color)
+        let buf = self.get_draw_buffer_ref()
+        let pixel = color.to_argb()
+
+        # Clip to screen bounds
+        let x_start = if rect.x < 0
+            0 as u32
+        else
+            rect.x as u32
+
+        let y_start = if rect.y < 0
+            0 as u32
+        else
+            rect.y as u32
+
+        let x_end = if rect.right() > self.width as i32
+            self.width
+        else
+            rect.right() as u32
+
+        let y_end = if rect.bottom() > self.height as i32
+            self.height
+        else
+            rect.bottom() as u32
+
+        # Fill pixels
+        var y = y_start
+        while y < y_end
+            var x = x_start
+            while x < x_end
+                let idx = y * self.width + x
+                buf[idx] = pixel
+                self.total_pixels_drawn += 1
+                x += 1
+            y += 1
+
+        # Record damage for testing
+        self.damage_history.push(DamageRecord {
+            frame: self.frame_count,
+            rect: rect
+        })
+
+    # Clear the entire draw buffer to a color
+    pub fn clear(self:&, color: Color)
+        self.fill_rect(
+            Rect.full(self.width, self.height),
+            color
+        )
+
+    # --- Test inspection methods ---
+
+    # Get a pixel from the FRONT buffer (what would be displayed)
+    pub fn pixel_at(self, x: u32, y: u32) -> u32
+        if x >= self.width or y >= self.height
+            0  # Out of bounds
+        else
+            let idx = y * self.width + x
+            if self.front_idx == 0
+                self.buffer_0[idx]
+            else if self.front_idx == 1
+                self.buffer_1[idx]
+            else
+                self.buffer_2[idx]
+
+    # Get a pixel as a Color
+    pub fn color_at(self, x: u32, y: u32) -> Color
+        Color.from_argb(self.pixel_at(x, y))
+
+    # Check if a rectangle has a specific color (all pixels)
+    pub fn rect_has_color(self, rect: Rect, expected: Color) -> bool
+        let expected_pixel = expected.to_argb()
+
+        var y = rect.y as u32
+        while y < rect.bottom() as u32 and y < self.height
+            var x = rect.x as u32
+            while x < rect.right() as u32 and x < self.width
+                if self.pixel_at(x, y) != expected_pixel
+                    return false
+                x += 1
+            y += 1
+
+        true
+
+    # Check if a region was touched since a given frame
+    pub fn region_touched_since(self, rect: Rect, since_frame: u64) -> bool
+        for record in self.damage_history
+            if record.frame >= since_frame and rect.intersects(record.rect)
+                return true
+        false
+
+    # Get total damage records
+    pub fn damage_count(self) -> u64
+        self.damage_history.len()
+
+    # Clear damage history (for fresh test state)
+    pub fn clear_damage_history(self:&)
+        self.damage_history.clear()
+
+    # --- Drawing Primitives ---
+
+    # Stroke (outline) a rectangle
+    pub fn stroke_rect(self:&, rect: Rect, color: Color, width: u32)
+        if width == 0
+            return
+
+        # Top edge
+        self.fill_rect(
+            Rect.new(rect.x, rect.y, rect.width, width),
+            color
+        )
+
+        # Bottom edge
+        let bottom_y = rect.bottom() - width as i32
+        if bottom_y > rect.y + width as i32
+            self.fill_rect(
+                Rect.new(rect.x, bottom_y, rect.width, width),
+                color
+            )
+
+        # Left edge (between top and bottom)
+        let inner_height = rect.height - width * 2
+        if inner_height > 0
+            self.fill_rect(
+                Rect.new(rect.x, rect.y + width as i32, width, inner_height),
+                color
+            )
+
+        # Right edge (between top and bottom)
+        let right_x = rect.right() - width as i32
+        if right_x > rect.x + width as i32 and inner_height > 0
+            self.fill_rect(
+                Rect.new(right_x, rect.y + width as i32, width, inner_height),
+                color
+            )
+
+    # Draw a line between two points using Bresenham's algorithm
+    pub fn draw_line(self:&, x0: i32, y0: i32, x1: i32, y1: i32, color: Color, width: u32)
+        let buf = self.get_draw_buffer_ref()
+        let pixel = color.to_argb()
+
+        # Bresenham's line algorithm
+        var dx = abs_i32(x1 - x0)
+        var dy = abs_i32(y1 - y0)
+        var sx: i32 = if x0 < x1 { 1 } else { -1 }
+        var sy: i32 = if y0 < y1 { 1 } else { -1 }
+        var err = dx - dy
+
+        var x = x0
+        var y = y0
+
+        loop
+            # Draw pixel (with width if > 1)
+            if width <= 1
+                self.set_pixel(x, y, pixel)
+            else
+                # Draw a filled circle at each point for thick lines
+                self.fill_circle(x, y, width / 2, pixel)
+
+            if x == x1 and y == y1
+                break
+
+            let e2 = 2 * err
+            if e2 > -dy
+                err -= dy
+                x += sx
+            if e2 < dx
+                err += dx
+                y += sy
+
+        # Record damage
+        let min_x = min_i32(x0, x1)
+        let min_y = min_i32(y0, y1)
+        let max_x = max_i32(x0, x1)
+        let max_y = max_i32(y0, y1)
+        let half_width = (width / 2) as i32
+        self.damage_history.push(DamageRecord {
+            frame: self.frame_count,
+            rect: Rect.new(
+                min_x - half_width,
+                min_y - half_width,
+                (max_x - min_x) as u32 + width,
+                (max_y - min_y) as u32 + width
+            )
+        })
+
+    # Set a single pixel (with bounds checking)
+    fn set_pixel(self:&, x: i32, y: i32, pixel: u32)
+        if x >= 0 and y >= 0 and x < self.width as i32 and y < self.height as i32
+            let buf = self.get_draw_buffer_ref()
+            let idx = y as u32 * self.width + x as u32
+            buf[idx] = pixel
+            self.total_pixels_drawn += 1
+
+    # Fill a circle (for thick lines)
+    fn fill_circle(self:&, cx: i32, cy: i32, radius: u32, pixel: u32)
+        let r = radius as i32
+        var dy: i32 = -r
+        while dy <= r
+            var dx: i32 = -r
+            while dx <= r
+                if dx * dx + dy * dy <= r * r
+                    self.set_pixel(cx + dx, cy + dy, pixel)
+                dx += 1
+            dy += 1
+
+# Helper functions
+fn abs_i32(x: i32) -> i32
+    if x < 0
+        -x
+    else
+        x
+
+fn min_i32(a: i32, b: i32) -> i32
+    if a < b
+        a
+    else
+        b
+
+fn max_i32(a: i32, b: i32) -> i32
+    if a > b
+        a
+    else
+        b

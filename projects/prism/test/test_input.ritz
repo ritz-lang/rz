@@ -1,0 +1,344 @@
+# Prism - Input System Tests
+#
+# Tests for keyboard, mouse, and input routing.
+
+import types { Point, Rect, WindowId }
+import input { InputRouter, InputState }
+import input.keyboard { KeyboardState }
+import input.mouse { MouseState }
+import input.router { HotkeyAction }
+import protocol.event { KeyCode, Modifiers, MouseButton, WindowEvent }
+
+# --- Keyboard State Tests ---
+
+[[test]]
+fn test_keyboard_key_down_up() -> i32
+    var kbd = KeyboardState.new()
+
+    # Initially no keys pressed
+    assert not kbd.is_key_down(KeyCode.A)
+
+    # Press key
+    let press_event = kbd.key_down(KeyCode.A)
+    assert kbd.is_key_down(KeyCode.A)
+    assert not press_event.repeat  # First press is not repeat
+
+    # Press again (should be repeat)
+    let repeat_event = kbd.key_down(KeyCode.A)
+    assert repeat_event.repeat
+
+    # Release key
+    let release_event = kbd.key_up(KeyCode.A)
+    assert not kbd.is_key_down(KeyCode.A)
+    assert not release_event.repeat
+
+    0
+
+[[test]]
+fn test_keyboard_modifiers() -> i32
+    var kbd = KeyboardState.new()
+
+    # No modifiers initially
+    assert not kbd.is_shift_pressed()
+    assert not kbd.is_ctrl_pressed()
+    assert not kbd.is_alt_pressed()
+    assert not kbd.is_meta_pressed()
+
+    # Press Shift
+    kbd.key_down(KeyCode.ShiftLeft)
+    assert kbd.is_shift_pressed()
+
+    # Press Ctrl
+    kbd.key_down(KeyCode.CtrlLeft)
+    assert kbd.is_ctrl_pressed()
+    assert kbd.is_shift_pressed()  # Still held
+
+    # Release Shift
+    kbd.key_up(KeyCode.ShiftLeft)
+    assert not kbd.is_shift_pressed()
+    assert kbd.is_ctrl_pressed()  # Still held
+
+    # Press Meta
+    kbd.key_down(KeyCode.MetaLeft)
+    assert kbd.is_meta_pressed()
+
+    0
+
+[[test]]
+fn test_keyboard_modifier_in_events() -> i32
+    var kbd = KeyboardState.new()
+
+    # Press Ctrl
+    kbd.key_down(KeyCode.CtrlLeft)
+
+    # Press 'A' while Ctrl held
+    let event = kbd.key_down(KeyCode.A)
+    assert event.mods.ctrl
+    assert not event.mods.shift
+    assert not event.mods.alt
+
+    # Add Shift
+    kbd.key_down(KeyCode.ShiftLeft)
+    let event2 = kbd.key_down(KeyCode.B)
+    assert event2.mods.ctrl
+    assert event2.mods.shift
+
+    0
+
+# --- Mouse State Tests ---
+
+[[test]]
+fn test_mouse_move() -> i32
+    var mouse = MouseState.new()
+
+    # Initial position
+    assert mouse.x() == 0
+    assert mouse.y() == 0
+
+    # Move to position
+    let event = mouse.move_to(100, 200)
+    assert mouse.x() == 100
+    assert mouse.y() == 200
+    assert event.pos.x == 100
+    assert event.pos.y == 200
+
+    # Move by delta
+    let event2 = mouse.move_by(50, -30)
+    assert mouse.x() == 150
+    assert mouse.y() == 170
+
+    # Check delta
+    assert mouse.delta_x() == 50
+    assert mouse.delta_y() == -30
+
+    0
+
+[[test]]
+fn test_mouse_buttons() -> i32
+    var mouse = MouseState.new()
+
+    # No buttons pressed initially
+    assert not mouse.is_left_down()
+    assert not mouse.is_right_down()
+    assert not mouse.any_button_down()
+
+    # Press left button
+    let down_event = mouse.button_down(MouseButton.Left)
+    assert down_event.pressed
+    assert mouse.is_left_down()
+    assert mouse.any_button_down()
+
+    # Press right button too
+    mouse.button_down(MouseButton.Right)
+    assert mouse.is_left_down()
+    assert mouse.is_right_down()
+
+    # Release left
+    let up_event = mouse.button_up(MouseButton.Left)
+    assert not up_event.pressed
+    assert not mouse.is_left_down()
+    assert mouse.is_right_down()  # Still held
+    assert mouse.any_button_down()
+
+    0
+
+[[test]]
+fn test_mouse_enter_leave() -> i32
+    var mouse = MouseState.new()
+
+    let bounds = Rect.new(50, 50, 100, 100)
+
+    # Start outside
+    mouse.move_to(25, 25)
+    assert mouse.check_leave(bounds) == false
+
+    # Move inside
+    mouse.move_to(75, 75)
+    let enter = mouse.check_enter(bounds)
+    assert enter.is_some()
+
+    # Move within bounds
+    mouse.move_to(100, 100)
+    let no_enter = mouse.check_enter(bounds)
+    assert no_enter.is_none()
+    assert mouse.check_leave(bounds) == false
+
+    # Move outside
+    mouse.move_to(200, 200)
+    assert mouse.check_leave(bounds) == true
+
+    0
+
+# --- Input Router Tests ---
+
+[[test]]
+fn test_router_keyboard_routing() -> i32
+    var router = InputRouter.new()
+
+    # Create a "window" and focus it
+    let win_id = WindowId.new(1)
+    router.set_focused_window(win_id)
+
+    # Clear any focus events
+    router.take_pending_events()
+
+    # Press a key
+    router.handle_key_down(KeyCode.A)
+
+    # Should have generated an event for the focused window
+    let events = router.take_pending_events()
+    assert events.len() == 1
+
+    let routed = events[0]
+    assert routed.target.raw() == 1
+
+    match routed.event
+        WindowEvent.KeyPress(key_event) =>
+            assert true  # Got expected event type
+        _ =>
+            assert false  # Wrong event type
+
+    0
+
+[[test]]
+fn test_router_focus_events() -> i32
+    var router = InputRouter.new()
+
+    let win1 = WindowId.new(1)
+    let win2 = WindowId.new(2)
+
+    # Focus window 1
+    router.set_focused_window(win1)
+    let events1 = router.take_pending_events()
+
+    # Should have focus gained for win1
+    assert events1.len() == 1
+    match events1[0].event
+        WindowEvent.Focus(focus) =>
+            assert focus.focused == true
+        _ =>
+            assert false
+
+    # Focus window 2
+    router.set_focused_window(win2)
+    let events2 = router.take_pending_events()
+
+    # Should have focus lost for win1, focus gained for win2
+    assert events2.len() == 2
+
+    0
+
+[[test]]
+fn test_router_mouse_click_focuses() -> i32
+    var router = InputRouter.new()
+
+    let win1 = WindowId.new(1)
+    let win2 = WindowId.new(2)
+
+    # Focus win1 initially
+    router.set_focused_window(win1)
+    router.take_pending_events()
+
+    # Set win2 as hovered (mouse is over it)
+    router.set_hovered_window(win2)
+
+    # Click - should focus win2
+    router.handle_mouse_button_down(MouseButton.Left)
+
+    assert router.focused_window().unwrap().raw() == 2
+
+    0
+
+[[test]]
+fn test_router_global_hotkeys() -> i32
+    var router = InputRouter.new()
+
+    # Focus a window so we have somewhere to route
+    let win = WindowId.new(1)
+    router.set_focused_window(win)
+    router.take_pending_events()
+
+    # Press Meta key
+    router.handle_key_down(KeyCode.MetaLeft)
+
+    # Press Enter while Meta held -> should trigger command prompt
+    let action = router.handle_key_down(KeyCode.Enter)
+
+    assert action.is_some()
+    match action.unwrap()
+        HotkeyAction.OpenCommandPrompt =>
+            assert true
+        _ =>
+            assert false
+
+    # The keypress should NOT be routed to the window (consumed by hotkey)
+    let events = router.take_pending_events()
+    # Only the Meta keypress should be there, Enter was consumed
+    assert events.len() == 1
+
+    0
+
+[[test]]
+fn test_router_alt_tab() -> i32
+    var router = InputRouter.new()
+
+    # Press Alt
+    router.handle_key_down(KeyCode.AltLeft)
+
+    # Press Tab -> should trigger CycleWindows
+    let action = router.handle_key_down(KeyCode.Tab)
+
+    assert action.is_some()
+    match action.unwrap()
+        HotkeyAction.CycleWindows =>
+            assert true
+        _ =>
+            assert false
+
+    0
+
+[[test]]
+fn test_router_scroll_to_hovered() -> i32
+    var router = InputRouter.new()
+
+    let focused = WindowId.new(1)
+    let hovered = WindowId.new(2)
+
+    router.set_focused_window(focused)
+    router.set_hovered_window(hovered)
+    router.take_pending_events()
+
+    # Scroll should go to hovered window, not focused
+    router.handle_scroll(0, -3)
+
+    let events = router.take_pending_events()
+    assert events.len() == 1
+    assert events[0].target.raw() == 2  # hovered, not focused
+
+    0
+
+[[test]]
+fn test_router_drag_stays_with_focused() -> i32
+    var router = InputRouter.new()
+
+    let focused = WindowId.new(1)
+    let other = WindowId.new(2)
+
+    router.set_focused_window(focused)
+    router.set_hovered_window(focused)
+    router.take_pending_events()
+
+    # Start drag in focused window
+    router.handle_mouse_button_down(MouseButton.Left)
+    router.take_pending_events()
+
+    # Move mouse "over" another window while dragging
+    router.set_hovered_window(other)
+    router.handle_mouse_move(500, 500)
+
+    let events = router.take_pending_events()
+    # Mouse move should still go to focused (dragging), not hovered
+    assert events.len() == 1
+    assert events[0].target.raw() == 1
+
+    0

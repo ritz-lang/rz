@@ -1,0 +1,153 @@
+# Angelo - HMTX Table Parser
+#
+# The 'hmtx' table contains horizontal metrics for each glyph:
+# - advanceWidth: how far to move after drawing this glyph
+# - leftSideBearing: offset from origin to left edge of glyph
+#
+# The table has two parts:
+# 1. Full metrics (advanceWidth + lsb) for first numberOfHMetrics glyphs
+# 2. Just lsb values for remaining glyphs (they share the last advanceWidth)
+
+import loader.reader.Reader
+import types.GlyphMetrics
+
+# Parsed hmtx table
+pub struct HmtxTable
+    # Full metrics for first num_hmetrics glyphs
+    advance_widths: Vec<u16>
+    left_side_bearings: Vec<i16>
+    # For glyphs after num_hmetrics, they all use the last advance width
+    num_hmetrics: u16
+    num_glyphs: u16
+
+impl HmtxTable
+    # Get metrics for a glyph
+    pub fn get_metrics(self, glyph_id: u16) -> Option<GlyphMetrics>
+        if glyph_id >= self.num_glyphs
+            return None
+
+        let idx = glyph_id as usize
+
+        # Get advance width
+        let advance_width = if glyph_id < self.num_hmetrics
+            self.advance_widths[idx]
+        else
+            # Use the last advance width
+            self.advance_widths[self.num_hmetrics as usize - 1]
+
+        # Get left side bearing
+        let lsb = if idx < self.left_side_bearings.len()
+            self.left_side_bearings[idx]
+        else
+            0
+
+        Some(GlyphMetrics.new(advance_width, lsb))
+
+    # Get just the advance width
+    pub fn get_advance_width(self, glyph_id: u16) -> Option<u16>
+        if glyph_id >= self.num_glyphs
+            return None
+
+        if glyph_id < self.num_hmetrics
+            Some(self.advance_widths[glyph_id as usize])
+        else
+            Some(self.advance_widths[self.num_hmetrics as usize - 1])
+
+    # Get just the left side bearing
+    pub fn get_left_side_bearing(self, glyph_id: u16) -> Option<i16>
+        let idx = glyph_id as usize
+        if idx < self.left_side_bearings.len()
+            Some(self.left_side_bearings[idx])
+        else
+            None
+
+# Parse hmtx table
+pub fn parse_hmtx(data: @[u8], num_glyphs: u16, num_hmetrics: u16) -> Result<HmtxTable, StrView>
+    var reader = Reader.new(data)
+
+    var advance_widths = Vec.with_capacity(num_hmetrics as usize)
+    var left_side_bearings = Vec.with_capacity(num_glyphs as usize)
+
+    # Read full metrics (advanceWidth + lsb) for first num_hmetrics glyphs
+    for i in 0..num_hmetrics
+        let advance_width = reader.read_u16()?
+        let lsb = reader.read_i16()?
+        advance_widths.push(advance_width)
+        left_side_bearings.push(lsb)
+
+    # Read just lsb for remaining glyphs
+    let remaining = num_glyphs - num_hmetrics
+    for i in 0..remaining
+        let lsb = reader.read_i16()?
+        left_side_bearings.push(lsb)
+
+    Ok(HmtxTable {
+        advance_widths: advance_widths,
+        left_side_bearings: left_side_bearings,
+        num_hmetrics: num_hmetrics,
+        num_glyphs: num_glyphs
+    })
+
+# Tests
+
+[[test]]
+fn test_hmtx_all_full_metrics() -> i32
+    # 3 glyphs, all with full metrics
+    let data: [12]u8 = [
+        0x02, 0x00, 0x00, 0x10,  # glyph 0: advance=512, lsb=16
+        0x02, 0x80, 0x00, 0x20,  # glyph 1: advance=640, lsb=32
+        0x01, 0x00, 0xFF, 0xF0   # glyph 2: advance=256, lsb=-16
+    ]
+
+    let hmtx = parse_hmtx(@data, 3, 3).unwrap()
+
+    let m0 = hmtx.get_metrics(0).unwrap()
+    assert m0.advance_width == 512
+    assert m0.left_side_bearing == 16
+
+    let m1 = hmtx.get_metrics(1).unwrap()
+    assert m1.advance_width == 640
+    assert m1.left_side_bearing == 32
+
+    let m2 = hmtx.get_metrics(2).unwrap()
+    assert m2.advance_width == 256
+    assert m2.left_side_bearing == -16
+
+    0
+
+[[test]]
+fn test_hmtx_shared_advance() -> i32
+    # 4 glyphs, but only 2 with full metrics
+    # Glyphs 2 and 3 share advance width of glyph 1
+    let data: [12]u8 = [
+        0x02, 0x00, 0x00, 0x10,  # glyph 0: advance=512, lsb=16
+        0x02, 0x80, 0x00, 0x20,  # glyph 1: advance=640, lsb=32
+        0x00, 0x30,              # glyph 2: lsb=48 (advance=640)
+        0x00, 0x40               # glyph 3: lsb=64 (advance=640)
+    ]
+
+    let hmtx = parse_hmtx(@data, 4, 2).unwrap()
+
+    # Check glyph 2 uses glyph 1's advance
+    assert hmtx.get_advance_width(2).unwrap() == 640
+    assert hmtx.get_left_side_bearing(2).unwrap() == 48
+
+    # Check glyph 3 uses glyph 1's advance
+    assert hmtx.get_advance_width(3).unwrap() == 640
+    assert hmtx.get_left_side_bearing(3).unwrap() == 64
+
+    0
+
+[[test]]
+fn test_hmtx_out_of_bounds() -> i32
+    let data: [4]u8 = [
+        0x02, 0x00, 0x00, 0x10   # glyph 0: advance=512, lsb=16
+    ]
+
+    let hmtx = parse_hmtx(@data, 1, 1).unwrap()
+
+    assert hmtx.get_metrics(0).is_some()
+    assert hmtx.get_metrics(1).is_none()  # out of bounds
+    assert hmtx.get_metrics(100).is_none()
+
+    0

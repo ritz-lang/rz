@@ -1,0 +1,216 @@
+# Angelo - Hinting Graphics State
+#
+# The TrueType interpreter maintains a graphics state that controls
+# how instructions behave. This includes vectors, reference points,
+# zone pointers, and various thresholds.
+
+# 2D vector in F2Dot14 format (2.14 fixed point)
+pub struct Vector2
+    x: i16  # -2.0 to ~2.0, unit = 1/16384
+    y: i16
+
+impl Vector2
+    pub fn zero() -> Vector2
+        Vector2 { x: 0, y: 0 }
+
+    pub fn x_axis() -> Vector2
+        Vector2 { x: 16384, y: 0 }  # 1.0, 0.0
+
+    pub fn y_axis() -> Vector2
+        Vector2 { x: 0, y: 16384 }  # 0.0, 1.0
+
+    # Normalize a vector
+    pub fn normalize(self) -> Vector2
+        let len_sq = self.x as i32 * self.x as i32 + self.y as i32 * self.y as i32
+        if len_sq == 0
+            return Vector2.x_axis()
+
+        # Approximate normalization using Newton-Raphson
+        let len = sqrt_approx(len_sq)
+        Vector2 {
+            x: ((self.x as i32 * 16384) / len) as i16,
+            y: ((self.y as i32 * 16384) / len) as i16
+        }
+
+# Approximate integer square root using Newton-Raphson
+fn sqrt_approx(n: i32) -> i32
+    if n <= 0
+        return 0
+    if n == 1
+        return 1
+
+    var x = n
+    var y = (x + 1) / 2
+
+    while y < x
+        x = y
+        y = (x + n / x) / 2
+
+    x
+
+# Rounding mode for point movements
+pub enum RoundingMode
+    ToHalfGrid    # Round to nearest half pixel
+    ToGrid        # Round to nearest pixel
+    ToDoubleGrid  # Round to nearest 2 pixels
+    DownToGrid    # Floor to grid
+    UpToGrid      # Ceiling to grid
+    Off           # No rounding
+    Super         # Programmable rounding
+    Super45       # Programmable 45° rounding
+
+# Zone (original or twilight)
+pub enum Zone
+    Glyph     # Zone 1: Current glyph outline
+    Twilight  # Zone 0: Scratch space for setup
+
+# Graphics state - controls interpreter behavior
+pub struct GraphicsState
+    # Freedom vector: direction along which points can move
+    freedom_vector: Vector2
+
+    # Projection vector: direction for measuring distances
+    projection_vector: Vector2
+
+    # Dual projection vector: for original outlines
+    dual_projection_vector: Vector2
+
+    # Reference points (indices into point array)
+    rp0: u16
+    rp1: u16
+    rp2: u16
+
+    # Zone pointers (which zone each instruction operates on)
+    zp0: Zone
+    zp1: Zone
+    zp2: Zone
+
+    # Loop count for certain instructions
+    loop_count: u32
+
+    # Rounding state
+    round_state: RoundingMode
+    round_period: i32      # For super rounding
+    round_phase: i32
+    round_threshold: i32
+
+    # Minimum distance for movements
+    minimum_distance: i32  # In F26Dot6
+
+    # Control value table cut-in
+    cvt_cutin: i32  # Threshold for CVT usage
+
+    # Single width cut-in
+    single_width_cutin: i32
+    single_width_value: i32
+
+    # Auto-flip (automatic negation of CVT values)
+    auto_flip: bool
+
+    # Delta base and shift for DELTA instructions
+    delta_base: u16
+    delta_shift: u16
+
+    # Instruction control flags
+    scan_control: bool
+    scan_type: u8
+    instruct_control: u8
+
+impl GraphicsState
+    pub fn new() -> GraphicsState
+        GraphicsState {
+            # Default: both vectors point along X axis
+            freedom_vector: Vector2.x_axis(),
+            projection_vector: Vector2.x_axis(),
+            dual_projection_vector: Vector2.x_axis(),
+
+            # Reference points start at 0
+            rp0: 0,
+            rp1: 0,
+            rp2: 0,
+
+            # Zone pointers default to glyph zone
+            zp0: Zone.Glyph,
+            zp1: Zone.Glyph,
+            zp2: Zone.Glyph,
+
+            loop_count: 1,
+
+            # Default rounding
+            round_state: RoundingMode.ToGrid,
+            round_period: 64,   # 1 pixel in F26Dot6
+            round_phase: 0,
+            round_threshold: 32, # 0.5 pixel
+
+            # Distance thresholds (F26Dot6)
+            minimum_distance: 64,     # 1 pixel
+            cvt_cutin: 68,            # 17/16 pixel
+            single_width_cutin: 0,
+            single_width_value: 0,
+
+            auto_flip: true,
+
+            delta_base: 9,
+            delta_shift: 3,
+
+            scan_control: false,
+            scan_type: 0,
+            instruct_control: 0
+        }
+
+    # Reset to default state (called before each glyph)
+    pub fn reset(self:&)
+        self.loop_count = 1
+        self.rp0 = 0
+        self.rp1 = 0
+        self.rp2 = 0
+        self.zp0 = Zone.Glyph
+        self.zp1 = Zone.Glyph
+        self.zp2 = Zone.Glyph
+
+# Tests
+
+[[test]]
+fn test_vector_axis() -> i32
+    let x_axis = Vector2.x_axis()
+    assert x_axis.x == 16384
+    assert x_axis.y == 0
+
+    let y_axis = Vector2.y_axis()
+    assert y_axis.x == 0
+    assert y_axis.y == 16384
+
+    0
+
+[[test]]
+fn test_graphics_state_default() -> i32
+    let gs = GraphicsState.new()
+
+    # Default vectors
+    assert gs.freedom_vector.x == 16384
+    assert gs.projection_vector.x == 16384
+
+    # Default reference points
+    assert gs.rp0 == 0
+    assert gs.rp1 == 0
+    assert gs.rp2 == 0
+
+    # Auto-flip on by default
+    assert gs.auto_flip
+
+    0
+
+[[test]]
+fn test_sqrt_approx() -> i32
+    assert sqrt_approx(0) == 0
+    assert sqrt_approx(1) == 1
+    assert sqrt_approx(4) == 2
+    assert sqrt_approx(9) == 3
+    assert sqrt_approx(100) == 10
+    assert sqrt_approx(16384) == 128
+
+    # Check approximate values
+    let s = sqrt_approx(50)
+    assert s >= 7 and s <= 8  # sqrt(50) ≈ 7.07
+
+    0

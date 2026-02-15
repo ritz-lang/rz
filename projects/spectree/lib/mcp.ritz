@@ -1,0 +1,254 @@
+# lib/mcp.ritz - MCP Server Interface
+#
+# Defines the MCP (Model Context Protocol) interface for spectree.
+# This module provides the API that agents like Adele use to interact
+# with the specification tree.
+#
+# MCP Operations:
+# - Node: get, list_children, create, update, move, delete
+# - Link: link_nodes, unlink_nodes
+# - Agent: claim_ownership, release_ownership
+# - Conversation: create, get, list, append_message, get_messages
+
+import ritzlib.gvec
+
+import lib.types { Node, Uuid, Link, AgentRef, Message, Conversation, uuid_eq, uuid_zero }
+import lib.store
+import lib.conversation
+
+# ============================================================================
+# MCP Result Codes
+# ============================================================================
+
+pub const MCP_OK: i32 = 0
+pub const MCP_ERR_NOT_FOUND: i32 = -1
+pub const MCP_ERR_INVALID_ID: i32 = -2
+pub const MCP_ERR_INVALID_KIND: i32 = -3
+pub const MCP_ERR_INVALID_STATUS: i32 = -4
+pub const MCP_ERR_INVALID_LINK: i32 = -5
+pub const MCP_ERR_AGENT_EXISTS: i32 = -6
+pub const MCP_ERR_AGENT_NOT_FOUND: i32 = -7
+
+# ============================================================================
+# MCP Server
+# ============================================================================
+# Wraps the store and provides the MCP API.
+
+pub struct McpServer
+    store: Store
+    conversations: ConversationStore
+
+pub fn mcp_server_new() -> McpServer
+    var server: McpServer
+    server.store = store_new()
+    server.conversations = conv_store_new()
+    return server
+
+# ============================================================================
+# Node Operations
+# ============================================================================
+
+# Get a node by ID
+# Returns null if not found
+pub fn mcp_get_node(server: @&McpServer, node_id: @Uuid) -> *Node
+    return store_get(@&server.store, node_id)
+
+# List children of a node
+# Returns count of children, fills child_ids array (up to max_count)
+pub fn mcp_list_children(server: @&McpServer, parent_id: @Uuid, child_ids: *Uuid, max_count: i64) -> i64
+    var count: i64 = store_children_count(@&server.store, parent_id)
+    var result_count: i64 = count
+    if result_count > max_count
+        result_count = max_count
+
+    for i in 0..result_count
+        var child_ptr: *Uuid = store_get_child(@&server.store, parent_id, i)
+        if child_ptr != 0 as *Uuid
+            *(child_ids + i) = *child_ptr
+
+    return count
+
+# Create a new node
+# Returns the new node's UUID
+pub fn mcp_create_node(server: @&McpServer, parent_id: @Uuid, kind: i32, title: *Vec<u8>, content: *Vec<u8>) -> Uuid
+    # Create the node
+    var node_id: Uuid = store_create(@&server.store, kind, parent_id)
+
+    # Set title and content if provided
+    var zero: Uuid = uuid_zero()
+    if uuid_eq(@node_id, @zero) == 0
+        let title_ptr: i64 = title as i64
+        let content_ptr: i64 = content as i64
+        if title_ptr != 0
+            store_update_title(@&server.store, @node_id, title)
+        if content_ptr != 0
+            store_update_content(@&server.store, @node_id, content)
+
+    return node_id
+
+# Update a node's title
+pub fn mcp_update_title(server: @&McpServer, node_id: @Uuid, title: @Vec<u8>) -> i32
+    var result: i32 = store_update_title(@&server.store, node_id, title)
+    if result < 0
+        return MCP_ERR_NOT_FOUND
+    return MCP_OK
+
+# Update a node's content
+pub fn mcp_update_content(server: @&McpServer, node_id: @Uuid, content: @Vec<u8>) -> i32
+    var result: i32 = store_update_content(@&server.store, node_id, content)
+    if result < 0
+        return MCP_ERR_NOT_FOUND
+    return MCP_OK
+
+# Update a node's status
+pub fn mcp_update_status(server: @&McpServer, node_id: @Uuid, status: i32) -> i32
+    var result: i32 = store_update_status(@&server.store, node_id, status)
+    if result < 0
+        return MCP_ERR_NOT_FOUND
+    return MCP_OK
+
+# Move a node to a new parent
+pub fn mcp_move_node(server: @&McpServer, node_id: @Uuid, new_parent_id: @Uuid) -> i32
+    var result: i32 = store_move(@&server.store, node_id, new_parent_id)
+    if result < 0
+        return MCP_ERR_NOT_FOUND
+    return MCP_OK
+
+# Delete a node
+pub fn mcp_delete_node(server: @&McpServer, node_id: @Uuid) -> i32
+    var result: i32 = store_delete(@&server.store, node_id)
+    if result < 0
+        return MCP_ERR_NOT_FOUND
+    return MCP_OK
+
+# ============================================================================
+# Link Operations
+# ============================================================================
+
+# Link two nodes
+pub fn mcp_link_nodes(server: @&McpServer, from_id: @Uuid, to_id: @Uuid, kind: i32) -> i32
+    var result: i32 = store_add_link(@&server.store, from_id, to_id, kind)
+    if result < 0
+        return MCP_ERR_INVALID_LINK
+    return MCP_OK
+
+# Unlink two nodes
+pub fn mcp_unlink_nodes(server: @&McpServer, from_id: @Uuid, to_id: @Uuid) -> i32
+    var result: i32 = store_remove_link(@&server.store, from_id, to_id)
+    if result < 0
+        return MCP_ERR_NOT_FOUND
+    return MCP_OK
+
+# Get links for a node
+# Returns count of links, fills links array (up to max_count)
+pub fn mcp_get_links(server: @&McpServer, node_id: @Uuid, links: *Link, max_count: i64) -> i64
+    var count: i64 = store_links_count(@&server.store, node_id)
+    var result_count: i64 = count
+    if result_count > max_count
+        result_count = max_count
+
+    for i in 0..result_count
+        var link_ptr: *Link = store_get_link(@&server.store, node_id, i)
+        if link_ptr != 0 as *Link
+            *(links + i) = *link_ptr
+
+    return count
+
+# ============================================================================
+# Agent Operations
+# ============================================================================
+
+# Claim ownership of a node
+pub fn mcp_claim_ownership(server: @&McpServer, node_id: @Uuid, agent_id: @Vec<u8>) -> i32
+    # Check if node exists
+    var node: *Node = store_get(@&server.store, node_id)
+    if node == 0 as *Node
+        return MCP_ERR_NOT_FOUND
+
+    # Assign agent as owner (role = AGENT_OWNER = 0)
+    var result: i32 = store_assign_agent(@&server.store, node_id, agent_id, 0)
+    if result < 0
+        return MCP_ERR_NOT_FOUND
+    return MCP_OK
+
+# Release ownership of a node
+# Note: Currently just returns OK - proper implementation would remove agent
+pub fn mcp_release_ownership(server: @&McpServer, node_id: @Uuid, agent_id: @Vec<u8>) -> i32
+    # Check if node exists
+    var node: *Node = store_get(@&server.store, node_id)
+    if node == 0 as *Node
+        return MCP_ERR_NOT_FOUND
+
+    # TODO: Implement agent removal from store
+    # For now, just return OK
+    return MCP_OK
+
+# Get agents assigned to a node
+# Returns count of agents
+pub fn mcp_get_agents_count(server: @&McpServer, node_id: @Uuid) -> i64
+    return store_agents_count(@&server.store, node_id)
+
+# Get a specific agent by index
+pub fn mcp_get_agent(server: @&McpServer, node_id: @Uuid, idx: i64) -> *AgentRef
+    return store_get_agent(@&server.store, node_id, idx)
+
+# ============================================================================
+# Conversation Operations
+# ============================================================================
+
+# Create a new conversation for a node
+# Returns the conversation UUID
+pub fn mcp_create_conversation(server: @&McpServer, node_id: @Uuid) -> Uuid
+    # Verify node exists
+    var node: *Node = store_get(@&server.store, node_id)
+    if node == 0 as *Node
+        return uuid_zero()
+
+    return conv_create(@&server.conversations, node_id)
+
+# Get a conversation by ID
+pub fn mcp_get_conversation(server: @&McpServer, conv_id: @Uuid) -> *Conversation
+    return conv_get(@&server.conversations, conv_id)
+
+# Count conversations for a node
+pub fn mcp_conversation_count(server: @&McpServer, node_id: @Uuid) -> i64
+    return conv_count_for_node(@&server.conversations, node_id)
+
+# Get conversation for node by index
+pub fn mcp_get_conversation_for_node(server: @&McpServer, node_id: @Uuid, idx: i64) -> *Conversation
+    return conv_get_for_node(@&server.conversations, node_id, idx)
+
+# Append a message to a conversation
+# Returns MCP_OK on success, MCP_ERR_NOT_FOUND if conversation doesn't exist
+pub fn mcp_append_message(server: @&McpServer, conv_id: @Uuid, role: i32, content: @Vec<u8>) -> i32
+    var result: i32 = conv_append_message(@&server.conversations, conv_id, role, content)
+    if result < 0
+        return MCP_ERR_NOT_FOUND
+    return MCP_OK
+
+# Get message count for a conversation
+pub fn mcp_message_count(server: @&McpServer, conv_id: @Uuid) -> i64
+    return conv_message_count(@&server.conversations, conv_id)
+
+# Get message by index
+pub fn mcp_get_message(server: @&McpServer, conv_id: @Uuid, idx: i64) -> *Message
+    return conv_get_message(@&server.conversations, conv_id, idx)
+
+# Delete a conversation
+pub fn mcp_delete_conversation(server: @&McpServer, conv_id: @Uuid) -> i32
+    var result: i32 = conv_delete(@&server.conversations, conv_id)
+    if result < 0
+        return MCP_ERR_NOT_FOUND
+    return MCP_OK
+
+# ============================================================================
+# Server Stats
+# ============================================================================
+
+# Get total node count
+pub fn mcp_node_count(server: @McpServer) -> i64
+    return store_count(@server.store)
+
+# Get total conversation count
+pub fn mcp_total_conversation_count(server: @McpServer) -> i64
+    return conv_store_count(@server.conversations)

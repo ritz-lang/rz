@@ -1,0 +1,287 @@
+# Angelo - Scanline Fill Algorithm
+#
+# Uses the non-zero winding rule to fill glyph outlines.
+# For each scanline, we track edge crossings and fill between them.
+
+import raster.bezier.Point2D
+import raster.edge.Edge
+import raster.edge.EdgeTable
+import raster.edge.ActiveEdgeTable
+
+# A bitmap buffer for rasterization
+pub struct Bitmap
+    data: Vec<u8>
+    width: u32
+    height: u32
+
+impl Bitmap
+    pub fn new(width: u32, height: u32) -> Bitmap
+        let size = width * height
+        var data = Vec.with_capacity(size as usize)
+        for i in 0..size
+            data.push(0)
+        Bitmap {
+            data: data,
+            width: width,
+            height: height
+        }
+
+    pub fn get(self, x: u32, y: u32) -> u8
+        if x >= self.width or y >= self.height
+            return 0
+        let idx = y * self.width + x
+        self.data[idx as usize]
+
+    pub fn set(self:& Bitmap, x: u32, y: u32, value: u8)
+        if x >= self.width or y >= self.height
+            return
+        let idx = y * self.width + x
+        self.data[idx as usize] = value
+
+    # Add value to pixel (for antialiasing)
+    pub fn add(self:& Bitmap, x: u32, y: u32, value: u8)
+        if x >= self.width or y >= self.height
+            return
+        let idx = (y * self.width + x) as usize
+        let current = self.data[idx] as u32
+        let new_val = current + value as u32
+        if new_val > 255
+            self.data[idx] = 255
+        else
+            self.data[idx] = new_val as u8
+
+    pub fn clear(self:& Bitmap)
+        for i in 0..self.data.len()
+            self.data[i] = 0
+
+# Fill a span (horizontal line segment) in the bitmap
+fn fill_span(bitmap:& Bitmap, y: u32, x_start: f32, x_end: f32, value: u8)
+    # Ensure x_start <= x_end
+    let (x0, x1) = if x_start <= x_end
+        (x_start, x_end)
+    else
+        (x_end, x_start)
+
+    # Convert to integer coordinates
+    let start = if x0 < 0.0
+        0u32
+    else
+        x0 as u32
+
+    let end = if x1 >= bitmap.width as f32
+        bitmap.width
+    else
+        (x1 + 1.0) as u32
+
+    # Fill pixels
+    for x in start..end
+        bitmap.set(x, y, value)
+
+# Simple scanline fill (no antialiasing)
+# Uses the even-odd rule: toggle fill state at each edge crossing
+pub fn scanline_fill_simple(edge_table:& EdgeTable, bitmap:& Bitmap, y_offset: f32, x_offset: f32)
+    if edge_table.is_empty()
+        return
+
+    let (_, y_min, _, y_max) = edge_table.bounds()
+
+    var aet = ActiveEdgeTable.new()
+    var edge_idx = 0usize
+
+    # Process each scanline
+    let start_y = y_min.floor() as i32
+    let end_y = y_max.ceil() as i32
+
+    for scanline in start_y..end_y
+        let y = scanline as f32 + 0.5  # Sample at pixel center
+
+        # Add new edges that start at this scanline
+        while edge_idx < edge_table.len() and edge_table.edges[edge_idx].y_min <= y
+            if edge_table.edges[edge_idx].y_max > y
+                var edge = edge_table.edges[edge_idx]
+                # Adjust x to correct position at this y
+                let dy = y - edge.y_min
+                edge.step_by(dy)
+                aet.add(edge)
+            edge_idx = edge_idx + 1
+
+        # Remove expired edges
+        aet.remove_expired(y)
+
+        # Sort by x
+        aet.sort_by_x()
+
+        # Fill between pairs of edges (even-odd rule)
+        var i = 0usize
+        while i + 1 < aet.len()
+            let x0 = aet.edges[i].x - x_offset
+            let x1 = aet.edges[i + 1].x - x_offset
+            let bitmap_y = (scanline as f32 - y_offset) as i32
+
+            if bitmap_y >= 0 and bitmap_y < bitmap.height as i32
+                fill_span(bitmap, bitmap_y as u32, x0, x1, 255)
+
+            i = i + 2
+
+        # Step all edges
+        aet.step_all()
+
+# Supersampled antialiasing
+# Render at higher resolution and downsample
+const AA_SAMPLES: u32 = 4  # 4x supersampling
+
+pub fn scanline_fill_antialiased(edge_table:& EdgeTable, bitmap:& Bitmap, y_offset: f32, x_offset: f32)
+    if edge_table.is_empty()
+        return
+
+    let (_, y_min, _, y_max) = edge_table.bounds()
+
+    var aet = ActiveEdgeTable.new()
+    var edge_idx = 0usize
+
+    # For each pixel row, sample multiple times
+    let start_y = y_min.floor() as i32
+    let end_y = y_max.ceil() as i32
+
+    for pixel_y in start_y..end_y
+        let bitmap_y = (pixel_y as f32 - y_offset) as i32
+        if bitmap_y < 0 or bitmap_y >= bitmap.height as i32
+            continue
+
+        # Sample at multiple sub-pixel positions
+        for sample in 0..AA_SAMPLES
+            let y = pixel_y as f32 + (sample as f32 + 0.5) / AA_SAMPLES as f32
+
+            # Reset AET for each sample row (simplified approach)
+            aet.clear()
+            var local_edge_idx = 0usize
+
+            # Add edges active at this y
+            while local_edge_idx < edge_table.len()
+                let edge = @edge_table.edges[local_edge_idx]
+                if edge.y_min <= y and edge.y_max > y
+                    var e = edge_table.edges[local_edge_idx]
+                    let dy = y - e.y_min
+                    e.step_by(dy)
+                    aet.add(e)
+                local_edge_idx = local_edge_idx + 1
+
+            aet.sort_by_x()
+
+            # Calculate coverage for this sample
+            var i = 0usize
+            while i + 1 < aet.len()
+                let x0 = aet.edges[i].x - x_offset
+                let x1 = aet.edges[i + 1].x - x_offset
+
+                # For each pixel in the span, add coverage
+                let start_x = if x0 < 0.0
+                    0i32
+                else
+                    x0.floor() as i32
+
+                let end_x = if x1 >= bitmap.width as f32
+                    bitmap.width as i32 - 1
+                else
+                    x1.ceil() as i32
+
+                for pixel_x in start_x..=end_x
+                    if pixel_x >= 0 and pixel_x < bitmap.width as i32
+                        # Calculate how much of this pixel is covered
+                        let px_left = pixel_x as f32
+                        let px_right = px_left + 1.0
+
+                        let covered_left = if x0 > px_left
+                            x0
+                        else
+                            px_left
+
+                        let covered_right = if x1 < px_right
+                            x1
+                        else
+                            px_right
+
+                        let coverage = covered_right - covered_left
+                        if coverage > 0.0
+                            # Add coverage contribution (255 / AA_SAMPLES per full sample)
+                            let contrib = (coverage * 255.0 / AA_SAMPLES as f32) as u8
+                            bitmap.add(pixel_x as u32, bitmap_y as u32, contrib)
+
+                i = i + 2
+
+# Tests
+
+[[test]]
+fn test_bitmap_creation() -> i32
+    let bitmap = Bitmap.new(10, 10)
+    assert bitmap.width == 10
+    assert bitmap.height == 10
+    assert bitmap.data.len() == 100
+
+    # All zeros initially
+    assert bitmap.get(0, 0) == 0
+    assert bitmap.get(5, 5) == 0
+
+    0
+
+[[test]]
+fn test_bitmap_set_get() -> i32
+    var bitmap = Bitmap.new(10, 10)
+
+    bitmap.set(3, 4, 128)
+    assert bitmap.get(3, 4) == 128
+
+    bitmap.set(0, 0, 255)
+    assert bitmap.get(0, 0) == 255
+
+    # Out of bounds should be safe
+    bitmap.set(100, 100, 50)  # Should not crash
+    assert bitmap.get(100, 100) == 0
+
+    0
+
+[[test]]
+fn test_bitmap_add() -> i32
+    var bitmap = Bitmap.new(10, 10)
+
+    bitmap.add(5, 5, 100)
+    assert bitmap.get(5, 5) == 100
+
+    bitmap.add(5, 5, 100)
+    assert bitmap.get(5, 5) == 200
+
+    # Should saturate at 255
+    bitmap.add(5, 5, 100)
+    assert bitmap.get(5, 5) == 255
+
+    0
+
+[[test]]
+fn test_fill_simple_triangle() -> i32
+    # Create a simple triangle
+    var edge_table = EdgeTable.new()
+
+    # Triangle: (5,0) -> (0,10) -> (10,10) -> (5,0)
+    edge_table.add_line(Point2D.new(5.0, 0.0), Point2D.new(0.0, 10.0))
+    edge_table.add_line(Point2D.new(0.0, 10.0), Point2D.new(10.0, 10.0))
+    edge_table.add_line(Point2D.new(10.0, 10.0), Point2D.new(5.0, 0.0))
+
+    edge_table.sort()
+
+    var bitmap = Bitmap.new(12, 12)
+    scanline_fill_simple(@&edge_table, @&bitmap, 0.0, 0.0)
+
+    # Check that something was filled
+    var filled_count = 0
+    for y in 0..12
+        for x in 0..12
+            if bitmap.get(x, y) > 0
+                filled_count = filled_count + 1
+
+    # Should have filled some pixels
+    assert filled_count > 0
+
+    # Center of triangle should be filled
+    assert bitmap.get(5, 5) > 0
+
+    0

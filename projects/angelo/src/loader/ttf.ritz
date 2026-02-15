@@ -1,0 +1,311 @@
+# Angelo - TrueType Font Parser
+#
+# Parses TrueType (.ttf) font files.
+# OpenType (.otf) with TrueType outlines uses the same format.
+
+import types.Tag
+import types.TAG_HEAD
+import types.TAG_HHEA
+import types.TAG_HMTX
+import types.TAG_CMAP
+import types.TAG_MAXP
+import types.TAG_LOCA
+import types.TAG_GLYF
+import types.FontMetrics
+import loader.reader.Reader
+
+# TrueType sfnt version (0x00010000)
+pub const SFNT_VERSION_TRUETYPE: u32 = 0x00010000
+
+# OpenType with CFF outlines uses 'OTTO' (0x4F54544F)
+pub const SFNT_VERSION_OPENTYPE_CFF: u32 = 0x4F54544F
+
+# Magic number in the 'head' table (per TrueType spec)
+pub const HEAD_TABLE_MAGIC: u32 = 0x5F0F3CF5
+
+# Entry in the table directory
+pub struct TableEntry
+    tag: Tag
+    checksum: u32
+    offset: u32
+    length: u32
+
+impl TableEntry
+    pub fn new(tag: Tag, checksum: u32, offset: u32, length: u32) -> TableEntry
+        TableEntry {
+            tag: tag,
+            checksum: checksum,
+            offset: offset,
+            length: length
+        }
+
+# Offset subtable (file header)
+pub struct OffsetTable
+    sfnt_version: u32
+    num_tables: u16
+    search_range: u16
+    entry_selector: u16
+    range_shift: u16
+
+impl OffsetTable
+    pub fn is_truetype(self) -> bool
+        self.sfnt_version == SFNT_VERSION_TRUETYPE
+
+    pub fn is_opentype_cff(self) -> bool
+        self.sfnt_version == SFNT_VERSION_OPENTYPE_CFF
+
+# A parsed font file
+pub struct FontFile
+    data: Vec<u8>           # owned copy of font data
+    offset_table: OffsetTable
+    tables: Vec<TableEntry>
+    metrics: FontMetrics
+    num_glyphs: u16
+    index_to_loc_format: i16  # 0 = short offsets, 1 = long offsets
+
+impl FontFile
+    # Get a table's raw data slice
+    pub fn get_table(self, tag: Tag) -> Option<@[u8]>
+        for entry in @self.tables
+            if entry.tag.eq(tag)
+                let start = entry.offset as usize
+                let end = start + entry.length as usize
+                if end <= self.data.len()
+                    return Some(@self.data[start..end])
+        None
+
+    # Check if a table exists
+    pub fn has_table(self, tag: Tag) -> bool
+        self.get_table(tag).is_some()
+
+    # Get font metrics
+    pub fn metrics(self) -> FontMetrics
+        self.metrics
+
+    # Get number of glyphs
+    pub fn num_glyphs(self) -> u16
+        self.num_glyphs
+
+# Parse the offset table (file header)
+fn parse_offset_table(reader:& Reader) -> Result<OffsetTable, StrView>
+    let sfnt_version = reader.read_u32()?
+    let num_tables = reader.read_u16()?
+    let search_range = reader.read_u16()?
+    let entry_selector = reader.read_u16()?
+    let range_shift = reader.read_u16()?
+
+    Ok(OffsetTable {
+        sfnt_version: sfnt_version,
+        num_tables: num_tables,
+        search_range: search_range,
+        entry_selector: entry_selector,
+        range_shift: range_shift
+    })
+
+# Parse the table directory
+fn parse_table_directory(reader:& Reader, num_tables: u16) -> Result<Vec<TableEntry>, StrView>
+    var tables = Vec.with_capacity(num_tables as usize)
+
+    for i in 0..num_tables as usize
+        let tag = reader.read_tag()?
+        let checksum = reader.read_u32()?
+        let offset = reader.read_u32()?
+        let length = reader.read_u32()?
+
+        tables.push(TableEntry.new(tag, checksum, offset, length))
+
+    Ok(tables)
+
+# Parse the 'head' table
+fn parse_head_table(data: @[u8], metrics:& FontMetrics) -> Result<i16, StrView>
+    var reader = Reader.new(data)
+
+    # Skip: majorVersion, minorVersion
+    reader.skip(4)
+    # Skip: fontRevision (Fixed)
+    reader.skip(4)
+    # Skip: checksumAdjustment
+    reader.skip(4)
+    # Validate magic number
+    let magic = reader.read_u32()?
+    if magic != HEAD_TABLE_MAGIC
+        return Err("invalid head table magic number")
+    # Skip: flags
+    reader.skip(2)
+    # unitsPerEm
+    metrics.units_per_em = reader.read_u16()?
+    # Skip: created, modified (8 bytes each)
+    reader.skip(16)
+    # xMin, yMin, xMax, yMax
+    metrics.x_min = reader.read_i16()?
+    metrics.y_min = reader.read_i16()?
+    metrics.x_max = reader.read_i16()?
+    metrics.y_max = reader.read_i16()?
+    # Skip: macStyle, lowestRecPPEM, fontDirectionHint
+    reader.skip(6)
+    # indexToLocFormat
+    let index_to_loc_format = reader.read_i16()?
+
+    Ok(index_to_loc_format)
+
+# Parse the 'hhea' table
+fn parse_hhea_table(data: @[u8], metrics:& FontMetrics) -> Result<u16, StrView>
+    var reader = Reader.new(data)
+
+    # Skip: majorVersion, minorVersion
+    reader.skip(4)
+    # ascender, descender, lineGap
+    metrics.ascender = reader.read_i16()?
+    metrics.descender = reader.read_i16()?
+    metrics.line_gap = reader.read_i16()?
+    # Skip: advanceWidthMax, minLeftSideBearing, minRightSideBearing
+    reader.skip(6)
+    # Skip: xMaxExtent, caretSlopeRise, caretSlopeRun, caretOffset
+    reader.skip(8)
+    # Skip: reserved (4 i16)
+    reader.skip(8)
+    # Skip: metricDataFormat
+    reader.skip(2)
+    # numberOfHMetrics
+    let num_hmetrics = reader.read_u16()?
+
+    Ok(num_hmetrics)
+
+# Parse the 'maxp' table
+fn parse_maxp_table(data: @[u8]) -> Result<u16, StrView>
+    var reader = Reader.new(data)
+
+    # Skip: version
+    reader.skip(4)
+    # numGlyphs
+    let num_glyphs = reader.read_u16()?
+
+    Ok(num_glyphs)
+
+# Load a font from raw data
+pub fn load_font_from_data(data:= Vec<u8>) -> Result<FontFile, StrView>
+    var reader = Reader.new(@data)
+
+    # Parse offset table
+    let offset_table = parse_offset_table(@&reader)?
+
+    # Validate sfnt version
+    if not offset_table.is_truetype() and not offset_table.is_opentype_cff()
+        return Err("unsupported font format")
+
+    # Parse table directory
+    let tables = parse_table_directory(@&reader, offset_table.num_tables)?
+
+    # Create initial font file
+    var font = FontFile {
+        data: data,
+        offset_table: offset_table,
+        tables: tables,
+        metrics: FontMetrics.new(),
+        num_glyphs: 0,
+        index_to_loc_format: 0
+    }
+
+    # Parse essential tables
+    # head table
+    match font.get_table(TAG_HEAD)
+        Some(head_data) =>
+            font.index_to_loc_format = parse_head_table(head_data, @&font.metrics)?
+        None =>
+            return Err("missing required 'head' table")
+
+    # hhea table
+    match font.get_table(TAG_HHEA)
+        Some(hhea_data) =>
+            let _ = parse_hhea_table(hhea_data, @&font.metrics)?
+        None =>
+            return Err("missing required 'hhea' table")
+
+    # maxp table
+    match font.get_table(TAG_MAXP)
+        Some(maxp_data) =>
+            font.num_glyphs = parse_maxp_table(maxp_data)?
+        None =>
+            return Err("missing required 'maxp' table")
+
+    Ok(font)
+
+# Load a font from a file path
+# TODO: implement when we have file I/O
+# pub fn load_font(path: StrView) -> Result<FontFile, StrView>
+#     let data = read_file(path)?
+#     load_font_from_data(data)
+
+# Tests
+[[test]]
+fn test_offset_table_truetype() -> i32
+    let ot = OffsetTable {
+        sfnt_version: SFNT_VERSION_TRUETYPE,
+        num_tables: 10,
+        search_range: 128,
+        entry_selector: 3,
+        range_shift: 32
+    }
+    assert ot.is_truetype()
+    assert not ot.is_opentype_cff()
+    0
+
+[[test]]
+fn test_offset_table_opentype() -> i32
+    let ot = OffsetTable {
+        sfnt_version: SFNT_VERSION_OPENTYPE_CFF,
+        num_tables: 10,
+        search_range: 128,
+        entry_selector: 3,
+        range_shift: 32
+    }
+    assert not ot.is_truetype()
+    assert ot.is_opentype_cff()
+    0
+
+[[test]]
+fn test_parse_offset_table() -> i32
+    # Minimal TTF header: sfnt_version + numTables + searchRange + entrySelector + rangeShift
+    let data: [12]u8 = [
+        0x00, 0x01, 0x00, 0x00,  # sfnt_version = 0x00010000 (TrueType)
+        0x00, 0x02,               # numTables = 2
+        0x00, 0x20,               # searchRange = 32
+        0x00, 0x01,               # entrySelector = 1
+        0x00, 0x00                # rangeShift = 0
+    ]
+    var reader = Reader.new(@data)
+    let ot = parse_offset_table(@&reader).unwrap()
+
+    assert ot.sfnt_version == SFNT_VERSION_TRUETYPE
+    assert ot.num_tables == 2
+    assert ot.search_range == 32
+    assert ot.entry_selector == 1
+    assert ot.range_shift == 0
+    0
+
+[[test]]
+fn test_parse_table_directory() -> i32
+    # Two table entries: head and cmap
+    let data: [32]u8 = [
+        # Entry 1: head
+        0x68, 0x65, 0x61, 0x64,  # tag = "head"
+        0x12, 0x34, 0x56, 0x78,  # checksum
+        0x00, 0x00, 0x00, 0x40,  # offset = 64
+        0x00, 0x00, 0x00, 0x36,  # length = 54
+        # Entry 2: cmap
+        0x63, 0x6D, 0x61, 0x70,  # tag = "cmap"
+        0xAB, 0xCD, 0xEF, 0x01,  # checksum
+        0x00, 0x00, 0x00, 0x80,  # offset = 128
+        0x00, 0x00, 0x01, 0x00   # length = 256
+    ]
+    var reader = Reader.new(@data)
+    let tables = parse_table_directory(@&reader, 2).unwrap()
+
+    assert tables.len() == 2
+    assert tables[0].tag.eq(TAG_HEAD)
+    assert tables[0].offset == 64
+    assert tables[0].length == 54
+    assert tables[1].tag.eq(TAG_CMAP)
+    assert tables[1].offset == 128
+    assert tables[1].length == 256
+    0

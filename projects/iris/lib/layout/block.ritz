@@ -1,0 +1,184 @@
+# lib/layout/block.ritz - Block formatting context layout
+#
+# Implements block-level layout: vertical stacking of block boxes,
+# margin collapsing, and containing block establishment.
+#
+# Block Formatting Context (BFC):
+# - Block boxes stack vertically
+# - Each box's left edge touches container's left edge
+# - Vertical margins collapse between siblings
+# - Contains floats (not implemented yet)
+#
+# Usage:
+#   import lib.layout.block { layout_block }
+
+import prism.api { Size, Rect }
+import lib.style { ComputedStyle, Display, Position, dimension_is_auto }
+import lib.tree { RenderTree, RenderNode, LayoutResult, render_tree_get, render_tree_get_mut }
+import lib.layout.box {
+    LayoutConstraints,
+    BoxDimensions,
+    resolve_box_model,
+    resolve_dimension,
+    box_dimensions_margin_height
+}
+
+# =============================================================================
+# Block Layout
+# =============================================================================
+
+# Layout a block-level element and its children
+pub fn layout_block(
+    tree:& RenderTree,
+    node_id: NodeId,
+    constraints: LayoutConstraints
+) -> LayoutResult
+    match render_tree_get_mut(tree, node_id)
+        Option.Some(node) =>
+            layout_block_node(tree, node, constraints)
+        Option.None =>
+            layout_result_empty()
+
+fn layout_block_node(
+    tree:& RenderTree,
+    node:& RenderNode,
+    constraints: LayoutConstraints
+) -> LayoutResult
+    # Resolve box model dimensions
+    let box = resolve_box_model(node.style, constraints)
+
+    # Calculate content width
+    var content_width = box.content_width
+    if dimension_is_auto(node.style.width)
+        # Block boxes expand to fill available width
+        let h_extra = box.padding_left + box.padding_right +
+                      box.border_left + box.border_right +
+                      box.margin_left + box.margin_right
+        content_width = constraints.available_width - h_extra
+        if content_width < 0.0
+            content_width = 0.0
+
+    # Create constraints for children
+    let child_constraints = LayoutConstraints {
+        available_width: content_width,
+        available_height: constraints.available_height,  # TODO: subtract padding/border
+        width_definite: true,
+        height_definite: dimension_is_auto(node.style.height) == false,
+        viewport_width: constraints.viewport_width,
+        viewport_height: constraints.viewport_height,
+        font_size: node.style.text.font_size,
+        root_font_size: constraints.root_font_size
+    }
+
+    # Layout children and accumulate height
+    var content_height: f32 = 0.0
+    var prev_margin_bottom: f32 = 0.0
+    var child_id = node.first_child
+
+    while node_id_is_valid(child_id)
+        match render_tree_get_mut(tree, child_id)
+            Option.Some(child) =>
+                # Layout the child
+                let child_result = layout_block_child(tree, child, child_constraints)
+
+                # Margin collapsing: take max of adjacent margins
+                let collapsed_margin = margin_collapse(prev_margin_bottom, child_result.margin_top as f32)
+
+                # Position child
+                child.layout.x = (box.margin_left + box.border_left + box.padding_left) as i32
+                child.layout.y = content_height as i32 + collapsed_margin as i32
+
+                # Advance Y position
+                content_height = content_height + collapsed_margin +
+                                child_result.height as f32 +
+                                child_result.padding_top as f32 +
+                                child_result.padding_bottom as f32 +
+                                child_result.border_top as f32 +
+                                child_result.border_bottom as f32
+
+                prev_margin_bottom = child_result.margin_bottom as f32
+                child_id = child.next_sibling
+            Option.None =>
+                break
+
+    # Use explicit height if specified, otherwise content height
+    if not dimension_is_auto(node.style.height)
+        content_height = box.content_height
+
+    # Build layout result
+    LayoutResult {
+        x: 0,  # Position set by parent
+        y: 0,
+        width: content_width as u32,
+        height: content_height as u32,
+        padding_top: box.padding_top as i32,
+        padding_right: box.padding_right as i32,
+        padding_bottom: box.padding_bottom as i32,
+        padding_left: box.padding_left as i32,
+        border_top: box.border_top as i32,
+        border_right: box.border_right as i32,
+        border_bottom: box.border_bottom as i32,
+        border_left: box.border_left as i32,
+        margin_top: box.margin_top as i32,
+        margin_right: box.margin_right as i32,
+        margin_bottom: box.margin_bottom as i32,
+        margin_left: box.margin_left as i32,
+        baseline: 0  # TODO: calculate baseline
+    }
+
+fn layout_block_child(
+    tree:& RenderTree,
+    child:& RenderNode,
+    constraints: LayoutConstraints
+) -> LayoutResult
+    # Dispatch based on display type
+    match child.style.display
+        Display.Block => layout_block_node(tree, child, constraints)
+        Display.Flex => layout_block_node(tree, child, constraints)  # TODO: flex layout
+        Display.Grid => layout_block_node(tree, child, constraints)  # TODO: grid layout
+        Display.Inline => layout_inline(tree, child, constraints)
+        Display.InlineBlock => layout_inline_block(tree, child, constraints)
+        _ => layout_result_empty()
+
+# =============================================================================
+# Margin Collapsing
+# =============================================================================
+
+# CSS margin collapsing: adjacent vertical margins collapse to the larger one
+fn margin_collapse(margin1: f32, margin2: f32) -> f32
+    # Both positive: take larger
+    if margin1 >= 0.0 and margin2 >= 0.0
+        if margin1 > margin2
+            margin1
+        else
+            margin2
+    # Both negative: take more negative (smaller)
+    else if margin1 < 0.0 and margin2 < 0.0
+        if margin1 < margin2
+            margin1
+        else
+            margin2
+    # Mixed: sum them (positive cancels negative)
+    else
+        margin1 + margin2
+
+# =============================================================================
+# Inline Layout (stub - to be expanded)
+# =============================================================================
+
+fn layout_inline(
+    tree:& RenderTree,
+    node:& RenderNode,
+    constraints: LayoutConstraints
+) -> LayoutResult
+    # TODO: proper inline layout with line breaking
+    layout_result_empty()
+
+fn layout_inline_block(
+    tree:& RenderTree,
+    node:& RenderNode,
+    constraints: LayoutConstraints
+) -> LayoutResult
+    # Inline-block: layout as block, position as inline
+    # TODO: integrate with line layout
+    layout_block_node(tree, node, constraints)

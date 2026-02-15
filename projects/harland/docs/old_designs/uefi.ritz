@@ -1,0 +1,212 @@
+# Harland UEFI Bootloader
+#
+# Minimal UEFI application that:
+# 1. Gets memory map from UEFI
+# 2. Exits boot services
+# 3. Jumps directly to kernel (already 64-bit!)
+#
+# UEFI is nice because we're already in 64-bit long mode!
+
+# ============================================================================
+# UEFI Types and Constants
+# ============================================================================
+
+const EFI_SUCCESS: u64 = 0
+const EFI_BUFFER_TOO_SMALL: u64 = 5
+
+# Memory types we care about
+const EFI_CONVENTIONAL_MEMORY: u32 = 7
+const EFI_LOADER_CODE: u32 = 1
+const EFI_LOADER_DATA: u32 = 2
+
+# ============================================================================
+# UEFI Structures
+# ============================================================================
+
+struct EfiTableHeader
+    signature: u64
+    revision: u32
+    header_size: u32
+    crc32: u32
+    reserved: u32
+
+struct EfiSystemTable
+    hdr: EfiTableHeader
+    firmware_vendor: *u16
+    firmware_revision: u32
+    _pad1: u32
+    console_in_handle: u64
+    con_in: *u8
+    console_out_handle: u64
+    con_out: *EfiSimpleTextOutput
+    stderr_handle: u64
+    std_err: *u8
+    runtime_services: *u8
+    boot_services: *EfiBootServices
+    number_of_table_entries: u64
+    configuration_table: *u8
+
+struct EfiSimpleTextOutput
+    reset: *u8
+    output_string: *u8
+    test_string: *u8
+    query_mode: *u8
+    set_mode: *u8
+    set_attribute: *u8
+    clear_screen: *u8
+    set_cursor_position: *u8
+    enable_cursor: *u8
+    mode: *u8
+
+struct EfiBootServices
+    hdr: EfiTableHeader
+    raise_tpl: *u8
+    restore_tpl: *u8
+    allocate_pages: *u8
+    free_pages: *u8
+    get_memory_map: *u8
+    allocate_pool: *u8
+    free_pool: *u8
+    create_event: *u8
+    set_timer: *u8
+    wait_for_event: *u8
+    signal_event: *u8
+    close_event: *u8
+    check_event: *u8
+    install_protocol_interface: *u8
+    reinstall_protocol_interface: *u8
+    uninstall_protocol_interface: *u8
+    handle_protocol: *u8
+    reserved: *u8
+    register_protocol_notify: *u8
+    locate_handle: *u8
+    locate_device_path: *u8
+    install_configuration_table: *u8
+    load_image: *u8
+    start_image: *u8
+    exit: *u8
+    unload_image: *u8
+    exit_boot_services: *u8
+
+struct EfiMemoryDescriptor
+    mem_type: u32
+    _pad: u32
+    physical_start: u64
+    virtual_start: u64
+    number_of_pages: u64
+    attribute: u64
+
+# ============================================================================
+# Boot Info for Kernel (matches kernel/src/main.ritz)
+# ============================================================================
+
+struct BootInfo
+    magic: u32
+    version: u32
+    memory_map: *MemoryMapEntry
+    memory_map_entries: u32
+    framebuffer: *Framebuffer
+    initrd_start: u64
+    initrd_size: u64
+    kernel_phys: u64
+    kernel_virt: u64
+    pml4_phys: u64
+
+struct MemoryMapEntry
+    base: u64
+    length: u64
+    mem_type: u32
+    reserved: u32
+
+struct Framebuffer
+    addr: u64
+    width: u32
+    height: u32
+    pitch: u32
+    bpp: u8
+
+const BOOT_MAGIC: u32 = 0x4841524C
+
+# ============================================================================
+# Serial Port (for debug output before kernel)
+# ============================================================================
+
+const COM1: u16 = 0x3F8
+
+fn outb(port: u16, value: u8) -> i32
+    asm x86_64:
+        movw {port}, %dx
+        movb {value}, %al
+        outb %al, %dx
+    return 0
+
+fn inb(port: u16) -> u8
+    var result: u8 = 0
+    asm x86_64:
+        movw {port}, %dx
+        inb %dx, %al
+        movb %al, {result}
+    return result
+
+fn serial_init() -> i32
+    outb(0x3F9, 0x00)      # Disable interrupts
+    outb(0x3FB, 0x80)      # Enable DLAB
+    outb(0x3F8, 0x01)      # Divisor low (115200 baud)
+    outb(0x3F9, 0x00)      # Divisor high
+    outb(0x3FB, 0x03)      # 8N1
+    outb(0x3FA, 0xC7)      # Enable FIFO
+    outb(0x3FC, 0x0B)      # Enable IRQs, RTS/DSR
+    return 0
+
+fn serial_write_byte(c: u8) -> i32
+    while (inb(0x3FD) & 0x20) == 0
+        asm x86_64:
+            pause
+    outb(0x3F8, c)
+    return 0
+
+fn serial_print(s: *u8) -> i32
+    var p: *u8 = s
+    while *p != 0
+        serial_write_byte(*p)
+        p = p + 1
+    return 0
+
+# ============================================================================
+# Embedded Kernel Binary
+# ============================================================================
+
+# The kernel is embedded directly in the bootloader binary
+# This is set by the linker
+extern fn _kernel_start() -> i32
+extern fn _kernel_end() -> i32
+
+# ============================================================================
+# UEFI Entry Point
+# ============================================================================
+
+# Microsoft x64 calling convention: RCX, RDX, R8, R9
+# image_handle in RCX, system_table in RDX
+pub fn efi_main(image_handle: u64, system_table: *EfiSystemTable) -> u64
+    # Initialize serial for early debug
+    serial_init()
+    serial_print(c"Harland UEFI Bootloader\n")
+    serial_print(c"  Serial initialized\n")
+
+    # For now, just call the kernel directly
+    # The kernel is linked at a known address
+    serial_print(c"  Jumping to kernel...\n\n")
+
+    # Call kernel_main with null boot_info for now
+    # We'll fill this in properly later
+    let kernel_entry: *u8 = 0x100000 as *u8
+
+    # Jump to kernel (it's at 1MB)
+    asm x86_64:
+        xorq %rdi, %rdi
+        movq $0x101000, %rax
+        callq *%rax
+
+    # Should never return
+    serial_print(c"ERROR: Kernel returned!\n")
+    return 1

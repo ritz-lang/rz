@@ -1,0 +1,295 @@
+# Angelo - CMAP Table Parser
+#
+# The 'cmap' table maps character codes (Unicode) to glyph indices.
+# We support the most common formats:
+# - Format 4: Segment mapping to delta values (BMP Unicode)
+# - Format 12: Segmented coverage (full Unicode)
+
+import types.Tag
+import types.TAG_CMAP
+import loader.reader.Reader
+
+# A parsed cmap table
+pub struct CmapTable
+    format: u16
+    data: @[u8]
+    # Format 4 specific
+    seg_count: u16
+    end_codes: Vec<u16>
+    start_codes: Vec<u16>
+    id_deltas: Vec<i16>
+    id_range_offsets: Vec<u16>
+    glyph_id_array_offset: usize
+    # Format 12 specific
+    num_groups: u32
+    groups_offset: usize
+
+impl CmapTable
+    # Look up a glyph ID for a Unicode codepoint
+    pub fn lookup(self, codepoint: u32) -> Option<u16>
+        if self.format == 4
+            self.lookup_format4(codepoint)
+        else if self.format == 12
+            self.lookup_format12(codepoint)
+        else
+            None
+
+    fn lookup_format4(self, codepoint: u32) -> Option<u16>
+        # Format 4 only handles BMP (0x0000 - 0xFFFF)
+        if codepoint > 0xFFFF
+            return None
+
+        let code = codepoint as u16
+
+        # Binary search for the segment
+        var low = 0u16
+        var high = self.seg_count
+
+        while low < high
+            let mid = (low + high) / 2
+            if self.end_codes[mid as usize] < code
+                low = mid + 1
+            else
+                high = mid
+
+        let seg = low as usize
+        if seg >= self.seg_count as usize
+            return None
+
+        # Check if code is in this segment
+        if code < self.start_codes[seg] or code > self.end_codes[seg]
+            return None
+
+        let id_range_offset = self.id_range_offsets[seg]
+        if id_range_offset == 0
+            # Use delta directly
+            let glyph_id = (code as i32 + self.id_deltas[seg] as i32) as u16
+            Some(glyph_id)
+        else
+            # Use glyph ID array
+            # Calculate offset into glyph ID array
+            let offset = id_range_offset as usize / 2 + (code - self.start_codes[seg]) as usize
+            let array_index = self.glyph_id_array_offset + offset * 2 - (self.seg_count as usize - seg) * 2
+
+            if array_index + 2 > self.data.len()
+                return None
+
+            var reader = Reader.at_offset(self.data, array_index)
+            match reader.read_u16()
+                Ok(glyph_id) =>
+                    if glyph_id == 0
+                        Some(0)
+                    else
+                        Some((glyph_id as i32 + self.id_deltas[seg] as i32) as u16)
+                Err(_) =>
+                    None
+
+    fn lookup_format12(self, codepoint: u32) -> Option<u16>
+        # Binary search through groups
+        var reader = Reader.at_offset(self.data, self.groups_offset)
+
+        var low = 0u32
+        var high = self.num_groups
+
+        while low < high
+            let mid = (low + high) / 2
+            let group_offset = self.groups_offset + mid as usize * 12
+
+            var r = Reader.at_offset(self.data, group_offset)
+            let start_char = r.read_u32().unwrap_or(0)
+            let end_char = r.read_u32().unwrap_or(0)
+
+            if codepoint < start_char
+                high = mid
+            else if codepoint > end_char
+                low = mid + 1
+            else
+                # Found! Calculate glyph ID
+                let start_glyph = r.read_u32().unwrap_or(0)
+                let glyph_id = start_glyph + (codepoint - start_char)
+                return Some(glyph_id as u16)
+
+        None
+
+# Parse cmap table header and find best subtable
+pub fn parse_cmap(data: @[u8]) -> Result<CmapTable, StrView>
+    var reader = Reader.new(data)
+
+    let version = reader.read_u16()?
+    if version != 0
+        return Err("unsupported cmap version")
+
+    let num_tables = reader.read_u16()?
+
+    # Find the best encoding subtable
+    # Prefer: Format 12 (full Unicode) > Format 4 (BMP)
+    # Platform 0 = Unicode, Platform 3 = Windows
+    var best_offset: u32 = 0
+    var best_format: u16 = 0
+    var best_score: i32 = 0
+
+    for i in 0..num_tables
+        let platform_id = reader.read_u16()?
+        let encoding_id = reader.read_u16()?
+        let offset = reader.read_u32()?
+
+        # Score the subtable
+        var score: i32 = 0
+
+        # Unicode platform
+        if platform_id == 0
+            if encoding_id == 3 or encoding_id == 4  # BMP or full Unicode
+                score = 100
+            else if encoding_id == 1
+                score = 80
+
+        # Windows platform
+        if platform_id == 3
+            if encoding_id == 10  # Full Unicode
+                score = 90
+            else if encoding_id == 1  # BMP
+                score = 70
+
+        if score > best_score
+            best_score = score
+            best_offset = offset
+
+            # Peek at format
+            if offset as usize + 2 <= data.len()
+                var format_reader = Reader.at_offset(data, offset as usize)
+                best_format = format_reader.read_u16().unwrap_or(0)
+
+    if best_offset == 0
+        return Err("no suitable cmap subtable found")
+
+    # Parse the selected subtable
+    if best_format == 4
+        parse_cmap_format4(data, best_offset as usize)
+    else if best_format == 12
+        parse_cmap_format12(data, best_offset as usize)
+    else
+        Err("unsupported cmap format")
+
+fn parse_cmap_format4(data: @[u8], offset: usize) -> Result<CmapTable, StrView>
+    var reader = Reader.at_offset(data, offset)
+
+    let format = reader.read_u16()?
+    if format != 4
+        return Err("expected cmap format 4")
+
+    let length = reader.read_u16()?
+    let language = reader.read_u16()?
+    let seg_count_x2 = reader.read_u16()?
+    let seg_count = seg_count_x2 / 2
+    let search_range = reader.read_u16()?
+    let entry_selector = reader.read_u16()?
+    let range_shift = reader.read_u16()?
+
+    # Read arrays
+    var end_codes = Vec.with_capacity(seg_count as usize)
+    for i in 0..seg_count
+        end_codes.push(reader.read_u16()?)
+
+    # Reserved pad
+    let reserved = reader.read_u16()?
+
+    var start_codes = Vec.with_capacity(seg_count as usize)
+    for i in 0..seg_count
+        start_codes.push(reader.read_u16()?)
+
+    var id_deltas = Vec.with_capacity(seg_count as usize)
+    for i in 0..seg_count
+        id_deltas.push(reader.read_i16()?)
+
+    let id_range_offsets_start = reader.position()
+    var id_range_offsets = Vec.with_capacity(seg_count as usize)
+    for i in 0..seg_count
+        id_range_offsets.push(reader.read_u16()?)
+
+    let glyph_id_array_offset = reader.position()
+
+    Ok(CmapTable {
+        format: 4,
+        data: data,
+        seg_count: seg_count,
+        end_codes: end_codes,
+        start_codes: start_codes,
+        id_deltas: id_deltas,
+        id_range_offsets: id_range_offsets,
+        glyph_id_array_offset: glyph_id_array_offset,
+        num_groups: 0,
+        groups_offset: 0
+    })
+
+fn parse_cmap_format12(data: @[u8], offset: usize) -> Result<CmapTable, StrView>
+    var reader = Reader.at_offset(data, offset)
+
+    let format = reader.read_u16()?
+    if format != 12
+        return Err("expected cmap format 12")
+
+    let reserved = reader.read_u16()?
+    let length = reader.read_u32()?
+    let language = reader.read_u32()?
+    let num_groups = reader.read_u32()?
+
+    let groups_offset = reader.position()
+
+    Ok(CmapTable {
+        format: 12,
+        data: data,
+        seg_count: 0,
+        end_codes: Vec.new(),
+        start_codes: Vec.new(),
+        id_deltas: Vec.new(),
+        id_range_offsets: Vec.new(),
+        glyph_id_array_offset: 0,
+        num_groups: num_groups,
+        groups_offset: groups_offset
+    })
+
+# Tests
+
+[[test]]
+fn test_cmap_format4_simple() -> i32
+    # Minimal format 4 cmap with one segment mapping 'A' (0x41) to glyph 1
+    # Segment: startCode=0x41, endCode=0x41, idDelta=1-0x41=-64, idRangeOffset=0
+    let data: [32]u8 = [
+        # Format 4 header
+        0x00, 0x04,  # format = 4
+        0x00, 0x20,  # length = 32
+        0x00, 0x00,  # language = 0
+        0x00, 0x04,  # segCountX2 = 4 (2 segments including end marker)
+        0x00, 0x02,  # searchRange
+        0x00, 0x00,  # entrySelector
+        0x00, 0x02,  # rangeShift
+        # endCodes
+        0x00, 0x41,  # segment 0: endCode = 0x41 ('A')
+        0xFF, 0xFF,  # segment 1: endCode = 0xFFFF (end marker)
+        # reserved
+        0x00, 0x00,
+        # startCodes
+        0x00, 0x41,  # segment 0: startCode = 0x41
+        0xFF, 0xFF,  # segment 1: startCode = 0xFFFF
+        # idDeltas
+        0xFF, 0xC0,  # segment 0: idDelta = -64 (so 0x41 + (-64) = 1)
+        0x00, 0x01,  # segment 1: idDelta = 1
+        # idRangeOffsets
+        0x00, 0x00,  # segment 0: 0 (use delta)
+        0x00, 0x00   # segment 1: 0
+    ]
+
+    let cmap = parse_cmap_format4(@data, 0).unwrap()
+    assert cmap.format == 4
+    assert cmap.seg_count == 2
+
+    # Look up 'A'
+    let glyph = cmap.lookup(0x41)
+    assert glyph.is_some()
+    assert glyph.unwrap() == 1
+
+    # Look up something not in the table
+    let missing = cmap.lookup(0x42)
+    assert missing.is_none()
+
+    0

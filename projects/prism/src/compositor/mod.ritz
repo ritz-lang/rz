@@ -1,0 +1,285 @@
+# Prism - Compositor module
+#
+# Core compositing functionality.
+
+pub import compositor.window { Window, WindowState, compare_z_order }
+pub import compositor.damage { DamageTracker, DamageRegion }
+# pub import compositor.scheduler { ScanlineScheduler }  # Future
+# pub import compositor.renderer { Renderer }  # Future
+
+import types { Rect, Color, WindowId, IdGenerator }
+import backend.mock { MockBackend }
+import protocol.command { RenderCommand, FillRectCmd, StrokeRectCmd, DrawLineCmd }
+
+# The main compositor
+pub struct Compositor
+    # Window management
+    windows: Vec<Window>
+    id_gen: IdGenerator
+    focused_window: u64     # WindowId.raw() of focused window, or 0
+
+    # Damage tracking
+    damage: DamageTracker
+
+    # Backend (for now, always MockBackend)
+    backend: MockBackend
+
+    # Frame state
+    frame_count: u64
+
+impl Compositor
+    pub fn new(width: u32, height: u32) -> Compositor
+        Compositor {
+            windows: Vec<Window>.new(),
+            id_gen: IdGenerator.new(),
+            focused_window: 0,
+            damage: DamageTracker.new(width, height),
+            backend: MockBackend.new(width, height),
+            frame_count: 0
+        }
+
+    # --- Window Management ---
+
+    pub fn create_window(self:&, x: i32, y: i32, width: u32, height: u32) -> WindowId
+        let id = self.id_gen.next_window_id()
+        let window = Window.new(id, x, y, width, height)
+
+        # New window gets highest z-order
+        var max_z: i32 = 0
+        for w in self.windows
+            if w.z_order > max_z
+                max_z = w.z_order
+
+        var new_window = window
+        new_window.z_order = max_z + 1
+
+        self.windows.push(new_window)
+
+        # Damage the new window's area
+        self.damage.add_damage(new_window.bounds(), id.raw())
+
+        id
+
+    pub fn destroy_window(self:&, id: WindowId)
+        var i: u64 = 0
+        while i < self.windows.len()
+            if self.windows[i].id.raw() == id.raw()
+                # Damage the area before removing
+                self.damage.add_damage(self.windows[i].bounds(), 0)
+
+                # Remove from list
+                self.windows.remove(i)
+
+                # Clear focus if this was the focused window
+                if self.focused_window == id.raw()
+                    self.focused_window = 0
+
+                return
+            i += 1
+
+    pub fn window_count(self) -> u64
+        self.windows.len()
+
+    pub fn get_window(self:&, id: WindowId) -> Option<@&Window>
+        for window in self.windows
+            if window.id.raw() == id.raw()
+                return Some(@&window)
+        None
+
+    # --- Focus ---
+
+    pub fn focus_window(self:&, id: WindowId)
+        # Unfocus previous
+        if self.focused_window != 0
+            for window in self.windows
+                if window.id.raw() == self.focused_window
+                    window.set_state(WindowState.Normal)
+                    window.mark_dirty_all()
+
+        # Focus new
+        self.focused_window = id.raw()
+        for window in self.windows
+            if window.id.raw() == id.raw()
+                window.set_state(WindowState.Focused)
+                window.mark_dirty_all()
+
+    pub fn focused_window_id(self) -> Option<WindowId>
+        if self.focused_window == 0
+            None
+        else
+            Some(WindowId.new(self.focused_window))
+
+    # --- Command Processing ---
+
+    # Process a render command for a window
+    pub fn process_command(self:&, window_id: WindowId, cmd: RenderCommand)
+        match cmd
+            RenderCommand.FillRect(fill_cmd) =>
+                self.handle_fill_rect(window_id, fill_cmd)
+
+            RenderCommand.StrokeRect(stroke_cmd) =>
+                self.handle_stroke_rect(window_id, stroke_cmd)
+
+            RenderCommand.DrawLine(line_cmd) =>
+                self.handle_draw_line(window_id, line_cmd)
+
+            RenderCommand.Invalidate(inv_cmd) =>
+                for window in self.windows
+                    if window.id.raw() == window_id.raw()
+                        window.mark_dirty(inv_cmd.region)
+
+            RenderCommand.Nop =>
+                # Do nothing
+                ()
+
+            _ =>
+                # TODO: Handle other commands
+                ()
+
+    fn handle_fill_rect(self:&, window_id: WindowId, cmd: FillRectCmd)
+        # Find the window and get its screen position
+        var window_bounds = Rect.zero()
+        for window in self.windows
+            if window.id.raw() == window_id.raw()
+                window_bounds = window.bounds()
+                break
+
+        if window_bounds.is_empty()
+            return
+
+        # Offset the rect to screen coordinates
+        let screen_rect = cmd.rect.offset(window_bounds.x, window_bounds.y)
+
+        # Clip to window bounds
+        let clipped = screen_rect.intersection(window_bounds)
+        if clipped.is_empty()
+            return
+
+        # Draw to backend
+        self.backend.fill_rect(clipped, cmd.color)
+
+        # Mark as damaged
+        self.damage.add_damage(clipped, window_id.raw())
+
+    fn handle_stroke_rect(self:&, window_id: WindowId, cmd: StrokeRectCmd)
+        # Find the window and get its screen position
+        var window_bounds = Rect.zero()
+        for window in self.windows
+            if window.id.raw() == window_id.raw()
+                window_bounds = window.bounds()
+                break
+
+        if window_bounds.is_empty()
+            return
+
+        # Offset the rect to screen coordinates
+        let screen_rect = cmd.rect.offset(window_bounds.x, window_bounds.y)
+
+        # Clip to window bounds
+        let clipped = screen_rect.intersection(window_bounds)
+        if clipped.is_empty()
+            return
+
+        # Draw to backend
+        self.backend.stroke_rect(clipped, cmd.color, cmd.width)
+
+        # Mark as damaged
+        self.damage.add_damage(clipped, window_id.raw())
+
+    fn handle_draw_line(self:&, window_id: WindowId, cmd: DrawLineCmd)
+        # Find the window and get its screen position
+        var window_bounds = Rect.zero()
+        for window in self.windows
+            if window.id.raw() == window_id.raw()
+                window_bounds = window.bounds()
+                break
+
+        if window_bounds.is_empty()
+            return
+
+        # Offset line points to screen coordinates
+        let x0 = cmd.from.x + window_bounds.x
+        let y0 = cmd.from.y + window_bounds.y
+        let x1 = cmd.to.x + window_bounds.x
+        let y1 = cmd.to.y + window_bounds.y
+
+        # Draw to backend
+        self.backend.draw_line(x0, y0, x1, y1, cmd.color, cmd.width)
+
+        # Calculate damage rect (bounding box of line)
+        let min_x = if x0 < x1 { x0 } else { x1 }
+        let min_y = if y0 < y1 { y0 } else { y1 }
+        let max_x = if x0 > x1 { x0 } else { x1 }
+        let max_y = if y0 > y1 { y0 } else { y1 }
+        let half_width = (cmd.width / 2) as i32
+
+        let damage_rect = Rect.new(
+            min_x - half_width,
+            min_y - half_width,
+            (max_x - min_x) as u32 + cmd.width,
+            (max_y - min_y) as u32 + cmd.width
+        )
+        self.damage.add_damage(damage_rect.intersection(window_bounds), window_id.raw())
+
+    # --- Rendering ---
+
+    # Render a complete frame
+    pub fn render_frame(self:&)
+        # Sort windows by z-order
+        self.sort_windows_by_z()
+
+        # Collect damage from all dirty windows
+        for window in self.windows
+            if window.is_dirty() and window.is_visible()
+                # Convert window damage to screen coordinates
+                let bounds = window.bounds()
+                for region in window.dirty_regions
+                    let screen_rect = region.offset(bounds.x, bounds.y)
+                    self.damage.add_damage(screen_rect, window.id.raw())
+
+        # If no damage, nothing to do
+        if not self.damage.has_damage()
+            return
+
+        # For now, just swap buffers
+        # Full implementation would:
+        # 1. Use damage regions to minimize redraw
+        # 2. Composite windows in z-order
+        # 3. Handle transparency/blending
+        self.backend.swap_buffers()
+
+        # Clear damage for next frame
+        self.damage.clear()
+        for window in self.windows
+            window.clear_dirty()
+
+        self.frame_count += 1
+
+    # Simple bubble sort by z-order (good enough for small window counts)
+    fn sort_windows_by_z(self:&)
+        let n = self.windows.len()
+        if n < 2
+            return
+
+        var i: u64 = 0
+        while i < n - 1
+            var j: u64 = 0
+            while j < n - i - 1
+                if self.windows[j].z_order > self.windows[j + 1].z_order
+                    # Swap
+                    let temp = self.windows[j]
+                    self.windows[j] = self.windows[j + 1]
+                    self.windows[j + 1] = temp
+                j += 1
+            i += 1
+
+    # --- Accessors for Testing ---
+
+    pub fn backend(self:&) -> @&MockBackend
+        @&self.backend
+
+    pub fn frame_count(self) -> u64
+        self.frame_count
+
+    pub fn damage_tracker(self:&) -> @&DamageTracker
+        @&self.damage

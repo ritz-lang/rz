@@ -1,0 +1,241 @@
+# Angelo - Edge Table
+#
+# For scanline rasterization, we convert the outline to a list of edges.
+# Each edge represents a line segment that we'll use to determine
+# which pixels are inside the glyph.
+
+import raster.bezier.Point2D
+
+# An edge for scanline rasterization
+# Edges are sorted by y_min for efficient processing
+pub struct Edge
+    x: f32          # current x intersection with scanline
+    y_min: f32      # top of edge (smaller y)
+    y_max: f32      # bottom of edge (larger y)
+    dx_dy: f32      # change in x per unit y (inverse slope)
+
+impl Edge
+    pub fn new(p0: Point2D, p1: Point2D) -> Edge
+        # Ensure p0 is the top point (smaller y)
+        let (top, bot) = if p0.y <= p1.y
+            (p0, p1)
+        else
+            (p1, p0)
+
+        let dy = bot.y - top.y
+        let dx_dy = if dy > 0.0001
+            (bot.x - top.x) / dy
+        else
+            0.0
+
+        Edge {
+            x: top.x,
+            y_min: top.y,
+            y_max: bot.y,
+            dx_dy: dx_dy
+        }
+
+    # Check if edge is active at scanline y
+    pub fn is_active_at(self, y: f32) -> bool
+        y >= self.y_min and y < self.y_max
+
+    # Step edge to next scanline
+    pub fn step(self:& Edge)
+        self.x = self.x + self.dx_dy
+
+    # Step edge by fractional amount
+    pub fn step_by(self:& Edge, dy: f32)
+        self.x = self.x + self.dx_dy * dy
+
+# Edge table: list of edges sorted by y_min
+pub struct EdgeTable
+    edges: Vec<Edge>
+
+impl EdgeTable
+    pub fn new() -> EdgeTable
+        EdgeTable { edges: Vec.new() }
+
+    pub fn add_edge(self:& EdgeTable, edge: Edge)
+        # Skip horizontal edges (they don't contribute to fill)
+        if edge.y_max - edge.y_min < 0.0001
+            return
+
+        self.edges.push(edge)
+
+    pub fn add_line(self:& EdgeTable, p0: Point2D, p1: Point2D)
+        self.add_edge(Edge.new(p0, p1))
+
+    # Sort edges by y_min
+    pub fn sort(self:& EdgeTable)
+        # Simple insertion sort (edges are usually not too many)
+        let n = self.edges.len()
+        for i in 1..n
+            var j = i
+            while j > 0 and self.edges[j - 1].y_min > self.edges[j].y_min
+                # Swap
+                let temp = self.edges[j - 1]
+                self.edges[j - 1] = self.edges[j]
+                self.edges[j] = temp
+                j = j - 1
+
+    pub fn len(self) -> usize
+        self.edges.len()
+
+    pub fn is_empty(self) -> bool
+        self.edges.len() == 0
+
+    # Get bounding box of all edges
+    pub fn bounds(self) -> (f32, f32, f32, f32)
+        if self.edges.len() == 0
+            return (0.0, 0.0, 0.0, 0.0)
+
+        var x_min = self.edges[0].x
+        var x_max = self.edges[0].x
+        var y_min = self.edges[0].y_min
+        var y_max = self.edges[0].y_max
+
+        for edge in @self.edges
+            if edge.x < x_min
+                x_min = edge.x
+            # Check both endpoints for x bounds
+            let x_at_bottom = edge.x + edge.dx_dy * (edge.y_max - edge.y_min)
+            if x_at_bottom < x_min
+                x_min = x_at_bottom
+            if edge.x > x_max
+                x_max = edge.x
+            if x_at_bottom > x_max
+                x_max = x_at_bottom
+            if edge.y_min < y_min
+                y_min = edge.y_min
+            if edge.y_max > y_max
+                y_max = edge.y_max
+
+        (x_min, y_min, x_max, y_max)
+
+# Active Edge Table: edges currently intersecting the scanline
+pub struct ActiveEdgeTable
+    edges: Vec<Edge>
+
+impl ActiveEdgeTable
+    pub fn new() -> ActiveEdgeTable
+        ActiveEdgeTable { edges: Vec.new() }
+
+    pub fn clear(self:& ActiveEdgeTable)
+        self.edges.clear()
+
+    pub fn add(self:& ActiveEdgeTable, edge: Edge)
+        self.edges.push(edge)
+
+    # Remove edges that end at or before scanline y
+    pub fn remove_expired(self:& ActiveEdgeTable, y: f32)
+        var i = 0usize
+        while i < self.edges.len()
+            if self.edges[i].y_max <= y
+                # Remove by swapping with last and popping
+                let last_idx = self.edges.len() - 1
+                if i < last_idx
+                    self.edges[i] = self.edges[last_idx]
+                self.edges.pop()
+            else
+                i = i + 1
+
+    # Sort active edges by x intersection
+    pub fn sort_by_x(self:& ActiveEdgeTable)
+        let n = self.edges.len()
+        for i in 1..n
+            var j = i
+            while j > 0 and self.edges[j - 1].x > self.edges[j].x
+                let temp = self.edges[j - 1]
+                self.edges[j - 1] = self.edges[j]
+                self.edges[j] = temp
+                j = j - 1
+
+    # Step all edges to next scanline
+    pub fn step_all(self:& ActiveEdgeTable)
+        for i in 0..self.edges.len()
+            self.edges[i].step()
+
+    pub fn len(self) -> usize
+        self.edges.len()
+
+# Tests
+
+[[test]]
+fn test_edge_creation() -> i32
+    let p0 = Point2D.new(0.0, 0.0)
+    let p1 = Point2D.new(10.0, 10.0)
+
+    let edge = Edge.new(p0, p1)
+
+    # y_min should be 0 (top)
+    assert edge.y_min < 0.1
+    # y_max should be 10 (bottom)
+    assert edge.y_max > 9.9 and edge.y_max < 10.1
+    # dx/dy should be 1.0
+    assert edge.dx_dy > 0.99 and edge.dx_dy < 1.01
+
+    0
+
+[[test]]
+fn test_edge_ordering() -> i32
+    # Points given bottom-to-top should still work
+    let p0 = Point2D.new(10.0, 10.0)
+    let p1 = Point2D.new(0.0, 0.0)
+
+    let edge = Edge.new(p0, p1)
+
+    # y_min should still be 0
+    assert edge.y_min < 0.1
+    assert edge.y_max > 9.9
+
+    0
+
+[[test]]
+fn test_edge_is_active() -> i32
+    let p0 = Point2D.new(0.0, 5.0)
+    let p1 = Point2D.new(10.0, 15.0)
+
+    let edge = Edge.new(p0, p1)
+
+    assert not edge.is_active_at(4.0)  # before edge
+    assert edge.is_active_at(5.0)      # at start
+    assert edge.is_active_at(10.0)     # middle
+    assert edge.is_active_at(14.9)     # near end
+    assert not edge.is_active_at(15.0) # at end (exclusive)
+    assert not edge.is_active_at(20.0) # after edge
+
+    0
+
+[[test]]
+fn test_edge_step() -> i32
+    let p0 = Point2D.new(0.0, 0.0)
+    let p1 = Point2D.new(10.0, 10.0)
+
+    var edge = Edge.new(p0, p1)
+    assert edge.x < 0.1
+
+    edge.step()
+    assert edge.x > 0.99 and edge.x < 1.01
+
+    edge.step()
+    assert edge.x > 1.99 and edge.x < 2.01
+
+    0
+
+[[test]]
+fn test_edge_table_sort() -> i32
+    var table = EdgeTable.new()
+
+    # Add edges out of order
+    table.add_line(Point2D.new(0.0, 10.0), Point2D.new(10.0, 20.0))
+    table.add_line(Point2D.new(0.0, 0.0), Point2D.new(10.0, 10.0))
+    table.add_line(Point2D.new(0.0, 5.0), Point2D.new(10.0, 15.0))
+
+    table.sort()
+
+    # Should be sorted by y_min
+    assert table.edges[0].y_min < 1.0   # 0
+    assert table.edges[1].y_min > 4.0 and table.edges[1].y_min < 6.0  # 5
+    assert table.edges[2].y_min > 9.0   # 10
+
+    0

@@ -1,0 +1,202 @@
+# lib/uuid.ritz - UUID generation and utilities
+#
+# Provides UUID v4 (random) generation using the kernel's random source.
+
+import ritzlib.sys
+import ritzlib.span
+
+import lib.types { Uuid, uuid_zero, uuid_eq }
+
+# Syscall number for getrandom on x86-64
+const SYS_GETRANDOM: i64 = 318
+
+# ============================================================================
+# UUID Generation
+# ============================================================================
+# Generate a UUID v4 (random) identifier using getrandom syscall.
+
+pub fn uuid_generate() -> Uuid
+    var buf: [16]u8
+
+    # Get 16 random bytes using getrandom syscall
+    let n: i64 = syscall3(SYS_GETRANDOM, &buf[0] as i64, 16, 0)
+    if n != 16
+        return uuid_zero()
+
+    # Set version (4) and variant (RFC 4122)
+    buf[6] = (buf[6] & 0x0F) | 0x40  # Version 4
+    buf[8] = (buf[8] & 0x3F) | 0x80  # Variant 1
+
+    # Pack into Uuid struct
+    var u: Uuid
+    u.high = 0
+    u.low = 0
+
+    # High 64 bits: bytes 0-7
+    for i in 0..8
+        u.high = (u.high << 8) | (buf[i] as u64)
+
+    # Low 64 bits: bytes 8-15
+    for i in 8..16
+        u.low = (u.low << 8) | (buf[i] as u64)
+
+    return u
+
+# ============================================================================
+# UUID Formatting
+# ============================================================================
+# Format UUID as standard hex string: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+
+fn hex_char(v: u8) -> u8
+    let idx: i32 = (v & 0x0F) as i32
+    if idx < 10
+        return '0' + idx as u8
+    return 'a' + (idx - 10) as u8
+
+pub fn uuid_format(u: @Uuid, out: *u8) -> i32
+    # Format: 8-4-4-4-12 = 36 chars + null
+    var buf: [37]u8
+    var pos: i32 = 0
+
+    # Bytes 0-3 (from high)
+    for i in 0..4
+        let shift: i32 = (7 - i) * 8
+        let b: u8 = ((u.high >> shift as u64) & 0xFF) as u8
+        buf[pos] = hex_char(b >> 4)
+        buf[pos + 1] = hex_char(b)
+        pos = pos + 2
+
+    buf[pos] = '-'
+    pos = pos + 1
+
+    # Bytes 4-5
+    for i in 4..6
+        let shift: i32 = (7 - i) * 8
+        let b: u8 = ((u.high >> shift as u64) & 0xFF) as u8
+        buf[pos] = hex_char(b >> 4)
+        buf[pos + 1] = hex_char(b)
+        pos = pos + 2
+
+    buf[pos] = '-'
+    pos = pos + 1
+
+    # Bytes 6-7
+    for i in 6..8
+        let shift: i32 = (7 - i) * 8
+        let b: u8 = ((u.high >> shift as u64) & 0xFF) as u8
+        buf[pos] = hex_char(b >> 4)
+        buf[pos + 1] = hex_char(b)
+        pos = pos + 2
+
+    buf[pos] = '-'
+    pos = pos + 1
+
+    # Bytes 8-9 (from low)
+    for i in 0..2
+        let shift: i32 = (7 - i) * 8
+        let b: u8 = ((u.low >> shift as u64) & 0xFF) as u8
+        buf[pos] = hex_char(b >> 4)
+        buf[pos + 1] = hex_char(b)
+        pos = pos + 2
+
+    buf[pos] = '-'
+    pos = pos + 1
+
+    # Bytes 10-15
+    for i in 2..8
+        let shift: i32 = (7 - i) * 8
+        let b: u8 = ((u.low >> shift as u64) & 0xFF) as u8
+        buf[pos] = hex_char(b >> 4)
+        buf[pos + 1] = hex_char(b)
+        pos = pos + 2
+
+    buf[36] = 0
+
+    # Copy to output
+    for i in 0..37
+        *(out + i as i64) = buf[i]
+
+    return 36
+
+# ============================================================================
+# UUID Parsing
+# ============================================================================
+# Parse a UUID from standard hex string format.
+
+fn hex_value(c: u8) -> i32
+    if c >= '0' && c <= '9'
+        return (c - '0') as i32
+    if c >= 'a' && c <= 'f'
+        return (c - 'a' + 10) as i32
+    if c >= 'A' && c <= 'F'
+        return (c - 'A' + 10) as i32
+    return -1
+
+pub fn uuid_parse(s: @Span<u8>, out:& Uuid) -> i32
+    # Validate format: 8-4-4-4-12 = 36 chars
+    if s.len < 36
+        return -1
+
+    var high: u64 = 0
+    var low: u64 = 0
+    var pos: i64 = 0
+
+    # Parse bytes 0-3 (8 hex chars)
+    for i in 0..8
+        let v: i32 = hex_value(span_get<u8>(s, pos))
+        if v < 0
+            return -1
+        high = (high << 4) | (v as u64)
+        pos = pos + 1
+
+    if span_get<u8>(s, pos) != '-'
+        return -1
+    pos = pos + 1
+
+    # Parse bytes 4-5 (4 hex chars)
+    for i in 0..4
+        let v: i32 = hex_value(span_get<u8>(s, pos))
+        if v < 0
+            return -1
+        high = (high << 4) | (v as u64)
+        pos = pos + 1
+
+    if span_get<u8>(s, pos) != '-'
+        return -1
+    pos = pos + 1
+
+    # Parse bytes 6-7 (4 hex chars)
+    for i in 0..4
+        let v: i32 = hex_value(span_get<u8>(s, pos))
+        if v < 0
+            return -1
+        high = (high << 4) | (v as u64)
+        pos = pos + 1
+
+    if span_get<u8>(s, pos) != '-'
+        return -1
+    pos = pos + 1
+
+    # Parse bytes 8-9 (4 hex chars)
+    for i in 0..4
+        let v: i32 = hex_value(span_get<u8>(s, pos))
+        if v < 0
+            return -1
+        low = (low << 4) | (v as u64)
+        pos = pos + 1
+
+    if span_get<u8>(s, pos) != '-'
+        return -1
+    pos = pos + 1
+
+    # Parse bytes 10-15 (12 hex chars)
+    for i in 0..12
+        let v: i32 = hex_value(span_get<u8>(s, pos))
+        if v < 0
+            return -1
+        low = (low << 4) | (v as u64)
+        pos = pos + 1
+
+    out.high = high
+    out.low = low
+    return 0

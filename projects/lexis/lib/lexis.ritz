@@ -1,0 +1,224 @@
+# lib/lexis.ritz - Main Lexis API
+#
+# HTML5 and CSS parser for the Tempest web browser.
+#
+# Usage:
+#   import lexis { HtmlParser, CssEngine, StyleResolver }
+#
+#   # Parse HTML (emits events to your sink)
+#   let parser = html_parser_new(source, event_sink)
+#   html_parser_run(parser)
+#
+#   # Parse CSS
+#   let stylesheet = css_parse(css_source)
+#
+#   # Style resolution
+#   let engine = style_engine_new()
+#   style_engine_add_stylesheet(engine, stylesheet, ORIGIN_AUTHOR)
+#   let computed = style_engine_compute(engine, element_info, parent_style)
+#
+# Lexis is a streaming parser that emits DOM events as it parses.
+# Tempest receives these events to build/update its DOM tree.
+
+# =============================================================================
+# Re-exports
+# =============================================================================
+
+# DOM types
+pub import lib.dom.tag
+pub import lib.dom.attribute
+pub import lib.dom.node
+
+# HTML parsing
+pub import lib.html.token
+pub import lib.html.tokenizer
+pub import lib.html.tree_builder
+
+# CSS parsing
+pub import lib.css.token
+pub import lib.css.tokenizer
+pub import lib.css.parser
+pub import lib.css.selector
+pub import lib.css.rule
+pub import lib.css.value
+
+# Style engine
+pub import lib.style.bloom
+pub import lib.style.selector_map
+pub import lib.style.matching
+pub import lib.style.cascade
+
+# Events
+pub import lib.event
+
+# =============================================================================
+# Version
+# =============================================================================
+
+pub const VERSION_MAJOR: i32 = 0
+pub const VERSION_MINOR: i32 = 1
+pub const VERSION_PATCH: i32 = 0
+
+# =============================================================================
+# Imports
+# =============================================================================
+
+import lib.html.tokenizer { Tokenizer, tokenizer_new, tokenizer_next }
+import lib.html.token { TOKEN_EOF, TOKEN_START_TAG, TOKEN_END_TAG, TOKEN_CHARACTER }
+import lib.html.tree_builder { TreeBuilder, tree_builder_new, tree_builder_process_token }
+import lib.event { EventHandler }
+
+import lib.css.tokenizer { CssTokenizer, css_tokenizer_new }
+import lib.css.parser { CssParser, css_parser_new, css_parse_stylesheet }
+import lib.css.rule { Stylesheet, DeclarationBlock }
+import lib.css.selector { Specificity }
+
+import lib.style.bloom { BloomFilter, bloom_filter_new }
+import lib.style.selector_map { SelectorMap, selector_map_new, selector_map_add_rule, selector_map_get_candidates }
+import lib.style.matching { ElementInfo, selector_matches }
+import lib.style.cascade { ORIGIN_USER_AGENT, ORIGIN_USER, ORIGIN_AUTHOR, MatchedRule, matched_rule_new, matched_rule_list_new, matched_rule_list_add, matched_rule_list_sort, cascade_apply, apply_inheritance, get_initial_value }
+
+# =============================================================================
+# HTML Parser (Streaming)
+# =============================================================================
+
+pub struct HtmlParser
+    tokenizer: Tokenizer
+    tree_builder: TreeBuilder
+
+pub fn html_parser_new(input: StrView, sink: EventHandler) -> HtmlParser
+    HtmlParser {
+        tokenizer: tokenizer_new(input),
+        tree_builder: tree_builder_new(sink)
+    }
+
+pub fn html_parser_run(parser:& HtmlParser)
+    # Tokenize and build tree
+    loop
+        let tok = tokenizer_next(parser.tokenizer)
+        tree_builder_process_token(parser.tree_builder, tok)
+
+        if tok.kind == TOKEN_EOF
+            break
+
+# =============================================================================
+# CSS Parsing
+# =============================================================================
+
+pub fn css_parse(input: StrView) -> Stylesheet
+    let parser = css_parser_new(input)
+    css_parse_stylesheet(parser)
+
+# =============================================================================
+# Style Engine
+# =============================================================================
+
+# The style engine collects stylesheets and computes styles for elements.
+# It maintains:
+# - User-agent stylesheet (browser defaults)
+# - User stylesheet (user preferences)
+# - Author stylesheets (page CSS)
+# - Selector map for fast rule lookup
+
+pub struct StyleEngine
+    ua_map: SelectorMap      # User-agent rules
+    user_map: SelectorMap    # User rules
+    author_map: SelectorMap  # Author rules
+
+pub fn style_engine_new() -> StyleEngine
+    StyleEngine {
+        ua_map: selector_map_new(),
+        user_map: selector_map_new(),
+        author_map: selector_map_new()
+    }
+
+pub fn style_engine_add_stylesheet(engine:& StyleEngine, sheet: Stylesheet, origin: i32)
+    # Add all rules from stylesheet to appropriate map
+    var i: u32 = 0
+    while i < sheet.rule_count
+        let rule = sheet.rules[i]
+
+        # Add to appropriate selector map based on origin
+        if origin == ORIGIN_USER_AGENT
+            selector_map_add_rule(engine.ua_map, rule, i)
+        else if origin == ORIGIN_USER
+            selector_map_add_rule(engine.user_map, rule, i)
+        else
+            selector_map_add_rule(engine.author_map, rule, i)
+
+        i = i + 1
+
+pub fn style_engine_compute(engine: StyleEngine, elem: ElementInfo, parent: DeclarationBlock) -> DeclarationBlock
+    # 1. Collect matching rules from all origins
+    let matched = matched_rule_list_new()
+
+    # Get candidates from each map
+    let ua_candidates = selector_map_get_candidates(engine.ua_map, elem.id, elem.classes, elem.tag)
+    let user_candidates = selector_map_get_candidates(engine.user_map, elem.id, elem.classes, elem.tag)
+    let author_candidates = selector_map_get_candidates(engine.author_map, elem.id, elem.classes, elem.tag)
+
+    # Match UA rules
+    var i: u32 = 0
+    while i < ua_candidates.count
+        let entry = ua_candidates.entries[i]
+        if selector_matches(entry.selector, elem) == 1
+            matched_rule_list_add(matched, matched_rule_new(entry, ORIGIN_USER_AGENT))
+        i = i + 1
+
+    # Match user rules
+    i = 0
+    while i < user_candidates.count
+        let entry = user_candidates.entries[i]
+        if selector_matches(entry.selector, elem) == 1
+            matched_rule_list_add(matched, matched_rule_new(entry, ORIGIN_USER))
+        i = i + 1
+
+    # Match author rules
+    i = 0
+    while i < author_candidates.count
+        let entry = author_candidates.entries[i]
+        if selector_matches(entry.selector, elem) == 1
+            matched_rule_list_add(matched, matched_rule_new(entry, ORIGIN_AUTHOR))
+        i = i + 1
+
+    # 2. Apply cascade to get computed values
+    let computed = cascade_apply(matched)
+
+    # 3. Apply inheritance from parent
+    apply_inheritance(computed, parent)
+
+    computed
+
+# =============================================================================
+# Convenience Functions
+# =============================================================================
+
+# Quick HTML tokenization for testing/debugging
+pub fn tokenize_html(input: StrView)
+    let t = tokenizer_new(input)
+
+    loop
+        let tok = tokenizer_next(t)
+
+        if tok.kind == TOKEN_EOF
+            break
+        # Processing happens in calling code
+
+# Quick CSS tokenization for testing/debugging
+pub fn tokenize_css(input: StrView)
+    var t = css_tokenizer_new(input)
+
+    loop
+        let tok = lib.css.tokenizer.css_tokenizer_next(t)
+
+        if tok.kind == lib.css.token.CSS_TOKEN_EOF
+            break
+        # Processing happens in calling code
+
+# =============================================================================
+# Default User-Agent Stylesheet
+# =============================================================================
+
+# Minimal browser defaults (per HTML5 spec rendering section)
+pub fn get_default_ua_stylesheet() -> StrView
+    "html, body {{ display: block; }} head, title, meta, link, script, style {{ display: none; }} div, p, h1, h2, h3, h4, h5, h6, ul, ol, li, header, footer, main, section, article, nav, aside, figure, figcaption, blockquote, pre, address, form, fieldset, legend {{ display: block; }} h1 {{ font-size: 2em; font-weight: bold; margin: 0.67em 0; }} h2 {{ font-size: 1.5em; font-weight: bold; margin: 0.83em 0; }} h3 {{ font-size: 1.17em; font-weight: bold; margin: 1em 0; }} h4 {{ font-weight: bold; margin: 1.33em 0; }} h5 {{ font-size: 0.83em; font-weight: bold; margin: 1.67em 0; }} h6 {{ font-size: 0.67em; font-weight: bold; margin: 2.33em 0; }} p {{ margin: 1em 0; }} a {{ color: blue; text-decoration: underline; }} a:visited {{ color: purple; }} b, strong {{ font-weight: bold; }} i, em {{ font-style: italic; }} u {{ text-decoration: underline; }} s, strike, del {{ text-decoration: line-through; }} pre, code, kbd, samp, tt {{ font-family: monospace; }} pre {{ white-space: pre; }} ul, ol {{ padding-left: 40px; }} li {{ display: list-item; }} ul {{ list-style-type: disc; }} ol {{ list-style-type: decimal; }} table {{ display: table; border-collapse: separate; border-spacing: 2px; }} tr {{ display: table-row; }} td, th {{ display: table-cell; padding: 1px; }} th {{ font-weight: bold; text-align: center; }} img {{ display: inline; }} input, button, select, textarea {{ display: inline-block; }}"

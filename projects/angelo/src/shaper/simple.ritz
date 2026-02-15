@@ -1,0 +1,200 @@
+# Angelo - Simple Text Shaper
+#
+# Basic text shaping: maps characters to glyphs with positioning.
+# This is a simple left-to-right shaper without complex features.
+# Future: Add HarfBuzz-style shaping for ligatures, kerning, RTL, etc.
+
+import font.Font
+import shaper.types.ShapedGlyph
+import shaper.types.GlyphRun
+import shaper.types.BoundsRect
+
+# Text shaper with caching
+pub struct TextShaper
+    # Nothing for now - could cache font lookups
+    _placeholder: u8
+
+impl TextShaper
+    pub fn new() -> TextShaper
+        TextShaper { _placeholder: 0 }
+
+    # Shape a text string into a glyph run
+    pub fn shape(self, font:& Font, text: StrView, font_id: u32, font_size: f32) -> GlyphRun
+        shape_text(font, text, font_id, font_size)
+
+# Shape text into a glyph run
+# Simple left-to-right shaping
+pub fn shape_text(font:& Font, text: StrView, font_id: u32, font_size: f32) -> GlyphRun
+    var run = GlyphRun.new(font_id, font_size)
+
+    let metrics = font.metrics()
+    let scale = font_size / metrics.units_per_em as f32
+
+    var cluster: u32 = 0
+    var pen_x: f32 = 0.0
+    var min_y: f32 = 0.0
+    var max_y: f32 = 0.0
+
+    # Iterate over text with UTF-8 decoding
+    let bytes = text.as_bytes()
+    var i = 0usize
+
+    while i < bytes.len()
+        let byte = bytes[i]
+
+        # Simple UTF-8 handling
+        let (codepoint, advance) = decode_utf8_char(bytes, i)
+        i = i + advance
+
+        # Look up glyph
+        let glyph_id_opt = font.glyph_id(codepoint)
+        let glyph_id = match glyph_id_opt
+            Some(id) => id
+            None => 0  # .notdef
+
+        # Get metrics
+        let glyph_metrics = font.glyph_metrics(glyph_id as u16)
+        let advance_width = match glyph_metrics
+            Some(m) => m.advance_width as f32 * scale
+            None => font_size * 0.5  # Fallback
+
+        # Create shaped glyph
+        let shaped = ShapedGlyph.simple(glyph_id as u32, advance_width, cluster)
+        run.add_glyph(shaped)
+
+        pen_x = pen_x + advance_width
+        cluster = cluster + 1
+
+    # Set bounds (approximate)
+    let ascender = metrics.ascender as f32 * scale
+    let descender = metrics.descender as f32 * scale
+    run.set_bounds(BoundsRect.new(0.0, descender, pen_x, ascender - descender))
+
+    run
+
+# UTF-8 encoding constants
+const UTF8_CONT_MASK: u8 = 0x3F       # Continuation byte data mask (10xxxxxx)
+const UTF8_1BYTE_MAX: u8 = 0x7F       # ASCII range (0xxxxxxx)
+const UTF8_2BYTE_MASK: u8 = 0xE0      # 2-byte sequence test mask
+const UTF8_2BYTE_PREFIX: u8 = 0xC0    # 2-byte sequence prefix (110xxxxx)
+const UTF8_2BYTE_DATA: u8 = 0x1F      # 2-byte first byte data mask
+const UTF8_3BYTE_MASK: u8 = 0xF0      # 3-byte sequence test mask
+const UTF8_3BYTE_PREFIX: u8 = 0xE0    # 3-byte sequence prefix (1110xxxx)
+const UTF8_3BYTE_DATA: u8 = 0x0F      # 3-byte first byte data mask
+const UTF8_4BYTE_MASK: u8 = 0xF8      # 4-byte sequence test mask
+const UTF8_4BYTE_PREFIX: u8 = 0xF0    # 4-byte sequence prefix (11110xxx)
+const UTF8_4BYTE_DATA: u8 = 0x07      # 4-byte first byte data mask
+const UNICODE_REPLACEMENT: u32 = 0xFFFD  # Unicode replacement character
+
+# Decode a UTF-8 character from bytes
+# Returns (codepoint, bytes_consumed)
+fn decode_utf8_char(bytes: @[u8], offset: usize) -> (u32, usize)
+    if offset >= bytes.len()
+        return (0, 1)
+
+    let b0 = bytes[offset]
+
+    # ASCII (0xxxxxxx)
+    if b0 <= UTF8_1BYTE_MAX
+        return (b0 as u32, 1)
+
+    # 2-byte (110xxxxx 10xxxxxx)
+    if (b0 and UTF8_2BYTE_MASK) == UTF8_2BYTE_PREFIX
+        if offset + 1 >= bytes.len()
+            return (UNICODE_REPLACEMENT, 1)
+        let b1 = bytes[offset + 1]
+        let cp = ((b0 and UTF8_2BYTE_DATA) as u32 << 6) or (b1 and UTF8_CONT_MASK) as u32
+        return (cp, 2)
+
+    # 3-byte (1110xxxx 10xxxxxx 10xxxxxx)
+    if (b0 and UTF8_3BYTE_MASK) == UTF8_3BYTE_PREFIX
+        if offset + 2 >= bytes.len()
+            return (UNICODE_REPLACEMENT, 1)
+        let b1 = bytes[offset + 1]
+        let b2 = bytes[offset + 2]
+        let cp = ((b0 and UTF8_3BYTE_DATA) as u32 << 12) or
+                 ((b1 and UTF8_CONT_MASK) as u32 << 6) or
+                 (b2 and UTF8_CONT_MASK) as u32
+        return (cp, 3)
+
+    # 4-byte (11110xxx 10xxxxxx 10xxxxxx 10xxxxxx)
+    if (b0 and UTF8_4BYTE_MASK) == UTF8_4BYTE_PREFIX
+        if offset + 3 >= bytes.len()
+            return (UNICODE_REPLACEMENT, 1)
+        let b1 = bytes[offset + 1]
+        let b2 = bytes[offset + 2]
+        let b3 = bytes[offset + 3]
+        let cp = ((b0 and UTF8_4BYTE_DATA) as u32 << 18) or
+                 ((b1 and UTF8_CONT_MASK) as u32 << 12) or
+                 ((b2 and UTF8_CONT_MASK) as u32 << 6) or
+                 (b3 and UTF8_CONT_MASK) as u32
+        return (cp, 4)
+
+    # Invalid UTF-8
+    (UNICODE_REPLACEMENT, 1)
+
+# Measure text width without full shaping
+pub fn measure_text_width(font:& Font, text: StrView, font_size: f32) -> f32
+    let metrics = font.metrics()
+    let scale = font_size / metrics.units_per_em as f32
+
+    var width: f32 = 0.0
+    let bytes = text.as_bytes()
+    var i = 0usize
+
+    while i < bytes.len()
+        let (codepoint, advance) = decode_utf8_char(bytes, i)
+        i = i + advance
+
+        let glyph_id_opt = font.glyph_id(codepoint)
+        let glyph_id = match glyph_id_opt
+            Some(id) => id
+            None => 0
+
+        let glyph_metrics = font.glyph_metrics(glyph_id as u16)
+        let advance_width = match glyph_metrics
+            Some(m) => m.advance_width as f32 * scale
+            None => font_size * 0.5
+
+        width = width + advance_width
+
+    width
+
+# Tests
+
+[[test]]
+fn test_decode_utf8_ascii() -> i32
+    let text = "ABC"
+    let bytes = text.as_bytes()
+
+    let (c0, len0) = decode_utf8_char(bytes, 0)
+    assert c0 == 0x41  # 'A'
+    assert len0 == 1
+
+    let (c1, len1) = decode_utf8_char(bytes, 1)
+    assert c1 == 0x42  # 'B'
+    assert len1 == 1
+
+    0
+
+[[test]]
+fn test_decode_utf8_multibyte() -> i32
+    # "é" = U+00E9 = 0xC3 0xA9 in UTF-8
+    let bytes: [2]u8 = [0xC3, 0xA9]
+
+    let (cp, len) = decode_utf8_char(@bytes, 0)
+    assert cp == 0xE9
+    assert len == 2
+
+    0
+
+[[test]]
+fn test_decode_utf8_emoji() -> i32
+    # "😀" = U+1F600 = 0xF0 0x9F 0x98 0x80 in UTF-8
+    let bytes: [4]u8 = [0xF0, 0x9F, 0x98, 0x80]
+
+    let (cp, len) = decode_utf8_char(@bytes, 0)
+    assert cp == 0x1F600
+    assert len == 4
+
+    0

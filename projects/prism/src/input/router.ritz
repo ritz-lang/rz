@@ -1,0 +1,257 @@
+# Prism - Input Router
+#
+# Routes input events to the appropriate windows.
+
+import types { Point, Rect, WindowId }
+import input.keyboard { KeyboardState }
+import input.mouse { MouseState }
+import protocol.event {
+    WindowEvent, KeyEvent, KeyCode, Modifiers,
+    MouseMoveEvent, MouseButtonEvent, MouseButton
+}
+
+# Combined input state
+pub struct InputState
+    keyboard: KeyboardState
+    mouse: MouseState
+
+impl InputState
+    pub fn new() -> InputState
+        InputState {
+            keyboard: KeyboardState.new(),
+            mouse: MouseState.new()
+        }
+
+# Represents a routed event (event + target window)
+pub struct RoutedEvent
+    target: WindowId
+    event: WindowEvent
+
+impl RoutedEvent
+    pub fn new(target: WindowId, event: WindowEvent) -> RoutedEvent
+        RoutedEvent { target: target, event: event }
+
+# Global hotkey definition
+pub struct GlobalHotkey
+    key: KeyCode
+    modifiers: Modifiers
+    action: HotkeyAction
+
+pub enum HotkeyAction
+    OpenCommandPrompt      # Meta+Enter
+    FocusWindow            # Meta+Space
+    SplayWindows           # Meta+Shift+Space (or gesture)
+    CycleWindows           # Alt+Tab
+    CloseWindow            # Alt+F4
+    Custom(u32)            # User-defined action ID
+
+# The input router manages input state and routes events
+pub struct InputRouter
+    state: InputState
+
+    # Focused window (receives keyboard input)
+    focused_window: u64     # WindowId.raw(), or 0 for none
+
+    # Window under mouse cursor
+    hovered_window: u64     # WindowId.raw(), or 0 for none
+
+    # Global hotkeys
+    hotkeys: Vec<GlobalHotkey>
+
+    # Pending events to be delivered
+    pending_events: Vec<RoutedEvent>
+
+    # For detecting global hotkey triggers
+    hotkey_triggered: Option<HotkeyAction>
+
+impl InputRouter
+    pub fn new() -> InputRouter
+        var router = InputRouter {
+            state: InputState.new(),
+            focused_window: 0,
+            hovered_window: 0,
+            hotkeys: Vec<GlobalHotkey>.new(),
+            pending_events: Vec<RoutedEvent>.new(),
+            hotkey_triggered: None
+        }
+
+        # Register default hotkeys
+        router.register_default_hotkeys()
+        router
+
+    fn register_default_hotkeys(self:&)
+        # Meta+Enter -> Command prompt
+        self.hotkeys.push(GlobalHotkey {
+            key: KeyCode.Enter,
+            modifiers: Modifiers.none().with_meta(),
+            action: HotkeyAction.OpenCommandPrompt
+        })
+
+        # Meta+Space -> Focus/maximize current window
+        self.hotkeys.push(GlobalHotkey {
+            key: KeyCode.Space,
+            modifiers: Modifiers.none().with_meta(),
+            action: HotkeyAction.FocusWindow
+        })
+
+        # Meta+Shift+Space -> Splay windows
+        self.hotkeys.push(GlobalHotkey {
+            key: KeyCode.Space,
+            modifiers: Modifiers.none().with_meta().with_shift(),
+            action: HotkeyAction.SplayWindows
+        })
+
+        # Alt+Tab -> Cycle windows
+        self.hotkeys.push(GlobalHotkey {
+            key: KeyCode.Tab,
+            modifiers: Modifiers.none().with_alt(),
+            action: HotkeyAction.CycleWindows
+        })
+
+    # --- Focus Management ---
+
+    pub fn set_focused_window(self:&, window_id: WindowId)
+        let old_focused = self.focused_window
+        self.focused_window = window_id.raw()
+
+        # Generate focus lost event for old window
+        if old_focused != 0 and old_focused != window_id.raw()
+            self.pending_events.push(RoutedEvent.new(
+                WindowId.new(old_focused),
+                WindowEvent.Focus(protocol.event.FocusEvent.lost())
+            ))
+
+        # Generate focus gained event for new window
+        if window_id.raw() != 0
+            self.pending_events.push(RoutedEvent.new(
+                window_id,
+                WindowEvent.Focus(protocol.event.FocusEvent.gained())
+            ))
+
+    pub fn focused_window(self) -> Option<WindowId>
+        if self.focused_window == 0
+            None
+        else
+            Some(WindowId.new(self.focused_window))
+
+    pub fn set_hovered_window(self:&, window_id: WindowId)
+        self.hovered_window = window_id.raw()
+
+    # --- Keyboard Input ---
+
+    # Process a key press, returns any triggered hotkey action
+    pub fn handle_key_down(self:&, key: KeyCode) -> Option<HotkeyAction>
+        let event = self.state.keyboard.key_down(key)
+
+        # Check for global hotkeys first
+        for hotkey in self.hotkeys
+            if hotkey.key == key and self.modifiers_match(hotkey.modifiers)
+                self.hotkey_triggered = Some(hotkey.action)
+                return Some(hotkey.action)
+
+        # Route to focused window
+        if self.focused_window != 0
+            self.pending_events.push(RoutedEvent.new(
+                WindowId.new(self.focused_window),
+                WindowEvent.KeyPress(event)
+            ))
+
+        None
+
+    pub fn handle_key_up(self:&, key: KeyCode)
+        let event = self.state.keyboard.key_up(key)
+
+        # Route to focused window
+        if self.focused_window != 0
+            self.pending_events.push(RoutedEvent.new(
+                WindowId.new(self.focused_window),
+                WindowEvent.KeyRelease(event)
+            ))
+
+    fn modifiers_match(self, required: Modifiers) -> bool
+        let current = self.state.keyboard.modifiers()
+        current.shift == required.shift and
+        current.ctrl == required.ctrl and
+        current.alt == required.alt and
+        current.meta == required.meta
+
+    # --- Mouse Input ---
+
+    pub fn handle_mouse_move(self:&, x: i32, y: i32)
+        let event = self.state.mouse.move_to(x, y)
+
+        # Route to hovered window (or focused if dragging)
+        let target = if self.state.mouse.any_button_down()
+            self.focused_window
+        else
+            self.hovered_window
+
+        if target != 0
+            self.pending_events.push(RoutedEvent.new(
+                WindowId.new(target),
+                WindowEvent.MouseMove(event)
+            ))
+
+    pub fn handle_mouse_button_down(self:&, button: MouseButton)
+        let event = self.state.mouse.button_down(button)
+
+        # Click on window brings it to focus
+        if self.hovered_window != 0 and self.hovered_window != self.focused_window
+            self.set_focused_window(WindowId.new(self.hovered_window))
+
+        if self.focused_window != 0
+            self.pending_events.push(RoutedEvent.new(
+                WindowId.new(self.focused_window),
+                WindowEvent.MouseButton(event)
+            ))
+
+    pub fn handle_mouse_button_up(self:&, button: MouseButton)
+        let event = self.state.mouse.button_up(button)
+
+        if self.focused_window != 0
+            self.pending_events.push(RoutedEvent.new(
+                WindowId.new(self.focused_window),
+                WindowEvent.MouseButton(event)
+            ))
+
+    pub fn handle_scroll(self:&, delta_x: i32, delta_y: i32)
+        let event = self.state.mouse.scroll(delta_x, delta_y)
+
+        # Scroll goes to hovered window
+        if self.hovered_window != 0
+            self.pending_events.push(RoutedEvent.new(
+                WindowId.new(self.hovered_window),
+                WindowEvent.MouseScroll(event)
+            ))
+
+    # --- Event Dispatch ---
+
+    # Get and clear pending events
+    pub fn take_pending_events(self:&) -> Vec<RoutedEvent>
+        let events = self.pending_events
+        self.pending_events = Vec<RoutedEvent>.new()
+        events
+
+    # Get number of pending events
+    pub fn pending_event_count(self) -> u64
+        self.pending_events.len()
+
+    # Check and clear any triggered hotkey
+    pub fn take_triggered_hotkey(self:&) -> Option<HotkeyAction>
+        let action = self.hotkey_triggered
+        self.hotkey_triggered = None
+        action
+
+    # --- State Accessors ---
+
+    pub fn keyboard_state(self:&) -> @&KeyboardState
+        @&self.state.keyboard
+
+    pub fn mouse_state(self:&) -> @&MouseState
+        @&self.state.mouse
+
+    pub fn mouse_position(self) -> Point
+        self.state.mouse.position()
+
+    pub fn current_modifiers(self) -> Modifiers
+        self.state.keyboard.modifiers()

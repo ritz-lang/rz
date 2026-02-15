@@ -1,0 +1,301 @@
+# src/repos/wiki_page_repo.ritz - WikiPage repository
+#
+# Data access layer for wiki pages stored in Mausoleum.
+# Handles serialization, caching (Tome), and database operations.
+
+import ritzlib.str { String, str_from_view, str_concat }
+import ritzlib.vec { Vec }
+import ritzlib.memory { malloc, free }
+
+import mausoleum.client {
+    Client,
+    client_new,
+    client_connect,
+    client_disconnect,
+    client_insert,
+    client_get,
+    client_delete,
+    client_is_connected
+}
+import mausoleum.document { DocumentId, doc_id_new }
+import mausoleum.m7m_types { Timestamp, timestamp_now }
+
+import models { WikiPage, wiki_page_new }
+import errors.repo_error { RepoError }
+
+
+# Collection name for wiki pages
+const PAGES_COLLECTION: *u8 = c"nexus_pages"
+const PAGES_COLLECTION_LEN: i32 = 11
+
+
+# WikiPage repository - handles persistence to Mausoleum
+pub struct WikiPageRepository
+    client: *Client           # Mausoleum client connection
+    connected: bool
+
+
+# Create a new repository (not yet connected)
+pub fn wiki_page_repo_new() -> WikiPageRepository
+    WikiPageRepository {
+        client: null,
+        connected: false
+    }
+
+
+# Connect to Mausoleum server
+pub fn wiki_page_repo_connect(repo: *WikiPageRepository, host: *u8, port: i32) -> Result<(), RepoError>
+    if repo.connected
+        return Ok(())
+
+    repo.client = client_new()
+    if repo.client == null
+        return Err(RepoError.DatabaseError(str_from_view(s"Failed to create client")))
+
+    let result = client_connect(repo.client, host, port, PAGES_COLLECTION, PAGES_COLLECTION_LEN)
+    if result < 0
+        client_free(repo.client)
+        repo.client = null
+        return Err(RepoError.NetworkError(str_from_view(s"Connection failed")))
+
+    repo.connected = true
+    Ok(())
+
+
+# Disconnect from Mausoleum
+pub fn wiki_page_repo_disconnect(repo: *WikiPageRepository)
+    if repo.connected and repo.client != null
+        client_disconnect(repo.client)
+        client_free(repo.client)
+        repo.client = null
+        repo.connected = false
+
+
+# Check if connected
+pub fn wiki_page_repo_is_connected(repo: *WikiPageRepository) -> bool
+    repo.connected and repo.client != null and client_is_connected(repo.client) == 1
+
+
+# Get a page by its document ID
+pub fn wiki_page_repo_get_by_id(repo: *WikiPageRepository, id: DocumentId) -> Result<WikiPage, RepoError>
+    if not wiki_page_repo_is_connected(repo)
+        return Err(RepoError.NetworkError(str_from_view(s"Not connected")))
+
+    var doc_data: *u8 = null
+    var doc_len: i32 = 0
+    let result = client_get(repo.client, id.value, @doc_data, @doc_len)
+
+    if result == 0
+        return Err(RepoError.NotFound)
+    if result < 0
+        return Err(RepoError.DatabaseError(str_from_view(s"Get failed")))
+
+    # Deserialize document to WikiPage
+    let page = deserialize_wiki_page(doc_data, doc_len)?
+    Ok(page)
+
+
+# Get a page by its slug (e.g., "language/syntax")
+pub fn wiki_page_repo_get_by_slug(repo: *WikiPageRepository, slug: Span<u8>) -> Result<WikiPage, RepoError>
+    if not wiki_page_repo_is_connected(repo)
+        return Err(RepoError.NetworkError(str_from_view(s"Not connected")))
+
+    # Query by slug using secondary index
+    # For now, we'd need a query operation - this is a placeholder
+    # TODO: Implement actual slug-based query when mausoleum supports secondary indexes
+    Err(RepoError.InvalidQuery(str_from_view(s"Slug query not yet implemented")))
+
+
+# Save a new page (insert)
+pub fn wiki_page_repo_insert(repo: *WikiPageRepository, page: *WikiPage) -> Result<DocumentId, RepoError>
+    if not wiki_page_repo_is_connected(repo)
+        return Err(RepoError.NetworkError(str_from_view(s"Not connected")))
+
+    # Serialize page to document format
+    var buf: [4096]u8
+    let len = serialize_wiki_page(page, @buf)
+
+    let doc_id = client_insert(repo.client, @buf as *u8, len)
+    if doc_id < 0
+        return Err(RepoError.DatabaseError(str_from_view(s"Insert failed")))
+
+    # Update the page's ID with the assigned value
+    page.id = doc_id_new(0, doc_id as i32)
+    Ok(page.id)
+
+
+# Update an existing page
+pub fn wiki_page_repo_update(repo: *WikiPageRepository, page: *WikiPage) -> Result<(), RepoError>
+    if not wiki_page_repo_is_connected(repo)
+        return Err(RepoError.NetworkError(str_from_view(s"Not connected")))
+
+    # For now, delete and re-insert (Mausoleum will support proper update)
+    let delete_result = client_delete(repo.client, page.id.value)
+    if delete_result < 0
+        return Err(RepoError.DatabaseError(str_from_view(s"Update failed (delete)")))
+
+    var buf: [4096]u8
+    let len = serialize_wiki_page(page, @buf)
+
+    let doc_id = client_insert(repo.client, @buf as *u8, len)
+    if doc_id < 0
+        return Err(RepoError.DatabaseError(str_from_view(s"Update failed (insert)")))
+
+    Ok(())
+
+
+# Delete a page by ID
+pub fn wiki_page_repo_delete(repo: *WikiPageRepository, id: DocumentId) -> Result<(), RepoError>
+    if not wiki_page_repo_is_connected(repo)
+        return Err(RepoError.NetworkError(str_from_view(s"Not connected")))
+
+    let result = client_delete(repo.client, id.value)
+    if result == 0
+        return Err(RepoError.NotFound)
+    if result < 0
+        return Err(RepoError.DatabaseError(str_from_view(s"Delete failed")))
+
+    Ok(())
+
+
+# List all pages (for admin/debug)
+pub fn wiki_page_repo_list_all(repo: *WikiPageRepository) -> Result<Vec<WikiPage>, RepoError>
+    if not wiki_page_repo_is_connected(repo)
+        return Err(RepoError.NetworkError(str_from_view(s"Not connected")))
+
+    # TODO: Implement scan/list operation when available
+    Err(RepoError.InvalidQuery(str_from_view(s"List all not yet implemented")))
+
+
+# ============================================================================
+# Serialization helpers
+# ============================================================================
+
+# Serialize a WikiPage to a byte buffer
+# Format: [slug_len:u16][slug][title_len:u16][title][content_len:u32][content][version:u64][...]
+fn serialize_wiki_page(page: *WikiPage, buf: *[4096]u8) -> i32
+    var pos: i32 = 0
+    var ptr: *u8 = buf as *u8
+
+    # Write slug
+    let slug_view = page.slug.as_view()
+    let slug_len = slug_view.len() as u16
+    *(ptr + pos) = (slug_len >> 8) as u8
+    *(ptr + pos + 1) = (slug_len & 0xFF) as u8
+    pos += 2
+    memcpy(ptr + pos, slug_view.ptr(), slug_len as i64)
+    pos += slug_len as i32
+
+    # Write title
+    let title_view = page.title.as_view()
+    let title_len = title_view.len() as u16
+    *(ptr + pos) = (title_len >> 8) as u8
+    *(ptr + pos + 1) = (title_len & 0xFF) as u8
+    pos += 2
+    memcpy(ptr + pos, title_view.ptr(), title_len as i64)
+    pos += title_len as i32
+
+    # Write content
+    let content_view = page.content.as_view()
+    let content_len = content_view.len() as u32
+    *(ptr + pos) = ((content_len >> 24) & 0xFF) as u8
+    *(ptr + pos + 1) = ((content_len >> 16) & 0xFF) as u8
+    *(ptr + pos + 2) = ((content_len >> 8) & 0xFF) as u8
+    *(ptr + pos + 3) = (content_len & 0xFF) as u8
+    pos += 4
+    memcpy(ptr + pos, content_view.ptr(), content_len as i64)
+    pos += content_len as i32
+
+    # Write version
+    let version = page.version
+    var i: i32 = 0
+    while i < 8
+        *(ptr + pos + (7 - i)) = ((version >> (i * 8)) & 0xFF) as u8
+        i += 1
+    pos += 8
+
+    # Write timestamps (nanos)
+    let created = page.created_at.nanos
+    i = 0
+    while i < 8
+        *(ptr + pos + (7 - i)) = ((created >> (i * 8)) & 0xFF) as u8
+        i += 1
+    pos += 8
+
+    let updated = page.updated_at.nanos
+    i = 0
+    while i < 8
+        *(ptr + pos + (7 - i)) = ((updated >> (i * 8)) & 0xFF) as u8
+        i += 1
+    pos += 8
+
+    pos
+
+
+# Deserialize a byte buffer to WikiPage
+fn deserialize_wiki_page(data: *u8, len: i32) -> Result<WikiPage, RepoError>
+    if len < 12  # Minimum: 2 + 2 + 4 + 8 = 16 for empty strings
+        return Err(RepoError.SerializationError)
+
+    var pos: i32 = 0
+
+    # Read slug
+    let slug_len = ((*(data + pos) as u16) << 8) | (*(data + pos + 1) as u16)
+    pos += 2
+    let slug = str_from_bytes(data + pos, slug_len as i64)
+    pos += slug_len as i32
+
+    # Read title
+    let title_len = ((*(data + pos) as u16) << 8) | (*(data + pos + 1) as u16)
+    pos += 2
+    let title = str_from_bytes(data + pos, title_len as i64)
+    pos += title_len as i32
+
+    # Read content
+    let content_len = ((*(data + pos) as u32) << 24) |
+                      ((*(data + pos + 1) as u32) << 16) |
+                      ((*(data + pos + 2) as u32) << 8) |
+                      (*(data + pos + 3) as u32)
+    pos += 4
+    let content = str_from_bytes(data + pos, content_len as i64)
+    pos += content_len as i32
+
+    # Read version
+    var version: u64 = 0
+    var i: i32 = 0
+    while i < 8
+        version = (version << 8) | (*(data + pos + i) as u64)
+        i += 1
+    pos += 8
+
+    # Read timestamps
+    var created_nanos: i64 = 0
+    i = 0
+    while i < 8
+        created_nanos = (created_nanos << 8) | (*(data + pos + i) as i64)
+        i += 1
+    pos += 8
+
+    var updated_nanos: i64 = 0
+    i = 0
+    while i < 8
+        updated_nanos = (updated_nanos << 8) | (*(data + pos + i) as i64)
+        i += 1
+    pos += 8
+
+    var page = wiki_page_new(slug, title, content)
+    page.version = version
+    page.created_at.nanos = created_nanos
+    page.updated_at.nanos = updated_nanos
+
+    Ok(page)
+
+
+# Helper to create string from bytes
+fn str_from_bytes(data: *u8, len: i64) -> String
+    var s = String.with_capacity(len as u64)
+    var i: i64 = 0
+    while i < len
+        s.push_byte(*(data + i))
+        i += 1
+    s

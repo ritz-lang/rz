@@ -1,0 +1,138 @@
+# Angelo - LOCA Table Parser
+#
+# The 'loca' table stores offsets into the 'glyf' table for each glyph.
+# It comes in two formats:
+# - Short format (indexToLocFormat=0): offsets are u16, divided by 2
+# - Long format (indexToLocFormat=1): offsets are u32
+
+import loader.reader.Reader
+
+# Parsed loca table - provides glyph offsets
+pub struct LocaTable
+    offsets: Vec<u32>  # Always stored as u32 internally
+    num_glyphs: u16
+
+impl LocaTable
+    # Get the offset of a glyph in the glyf table
+    pub fn get_offset(self, glyph_id: u16) -> Option<u32>
+        if glyph_id as usize >= self.offsets.len()
+            None
+        else
+            Some(self.offsets[glyph_id as usize])
+
+    # Get the length of a glyph's data
+    # (difference between this glyph's offset and the next)
+    pub fn get_length(self, glyph_id: u16) -> Option<u32>
+        let idx = glyph_id as usize
+        if idx + 1 >= self.offsets.len()
+            None
+        else
+            let start = self.offsets[idx]
+            let end = self.offsets[idx + 1]
+            Some(end - start)
+
+    # Check if a glyph has outline data (length > 0)
+    pub fn has_outline(self, glyph_id: u16) -> bool
+        match self.get_length(glyph_id)
+            Some(len) => len > 0
+            None => false
+
+    pub fn num_glyphs(self) -> u16
+        self.num_glyphs
+
+# Parse loca table
+# index_to_loc_format: 0 = short (u16), 1 = long (u32)
+pub fn parse_loca(data: @[u8], num_glyphs: u16, index_to_loc_format: i16) -> Result<LocaTable, StrView>
+    var reader = Reader.new(data)
+
+    # loca has num_glyphs + 1 entries (extra entry gives length of last glyph)
+    let num_entries = num_glyphs as usize + 1
+    var offsets = Vec.with_capacity(num_entries)
+
+    if index_to_loc_format == 0
+        # Short format: offsets are u16, actual offset = value * 2
+        for i in 0..num_entries
+            let short_offset = reader.read_u16()?
+            offsets.push(short_offset as u32 * 2)
+    else if index_to_loc_format == 1
+        # Long format: offsets are u32
+        for i in 0..num_entries
+            let long_offset = reader.read_u32()?
+            offsets.push(long_offset)
+    else
+        return Err("invalid indexToLocFormat")
+
+    Ok(LocaTable {
+        offsets: offsets,
+        num_glyphs: num_glyphs
+    })
+
+# Tests
+
+[[test]]
+fn test_loca_short_format() -> i32
+    # Short format loca with 3 glyphs
+    # Offsets (after *2): 0, 100, 150, 200
+    let data: [8]u8 = [
+        0x00, 0x00,  # glyph 0: offset 0
+        0x00, 0x32,  # glyph 1: offset 50*2 = 100
+        0x00, 0x4B,  # glyph 2: offset 75*2 = 150
+        0x00, 0x64   # end marker: offset 100*2 = 200
+    ]
+
+    let loca = parse_loca(@data, 3, 0).unwrap()
+
+    assert loca.num_glyphs() == 3
+    assert loca.get_offset(0).unwrap() == 0
+    assert loca.get_offset(1).unwrap() == 100
+    assert loca.get_offset(2).unwrap() == 150
+
+    assert loca.get_length(0).unwrap() == 100
+    assert loca.get_length(1).unwrap() == 50
+    assert loca.get_length(2).unwrap() == 50
+
+    assert loca.has_outline(0)
+    assert loca.has_outline(1)
+    assert loca.has_outline(2)
+
+    0
+
+[[test]]
+fn test_loca_long_format() -> i32
+    # Long format loca with 2 glyphs
+    let data: [12]u8 = [
+        0x00, 0x00, 0x00, 0x00,  # glyph 0: offset 0
+        0x00, 0x00, 0x01, 0x00,  # glyph 1: offset 256
+        0x00, 0x00, 0x02, 0x00   # end marker: offset 512
+    ]
+
+    let loca = parse_loca(@data, 2, 1).unwrap()
+
+    assert loca.num_glyphs() == 2
+    assert loca.get_offset(0).unwrap() == 0
+    assert loca.get_offset(1).unwrap() == 256
+
+    assert loca.get_length(0).unwrap() == 256
+    assert loca.get_length(1).unwrap() == 256
+
+    0
+
+[[test]]
+fn test_loca_empty_glyph() -> i32
+    # Glyph 1 has no outline (same offset as glyph 2)
+    let data: [8]u8 = [
+        0x00, 0x00,  # glyph 0: offset 0
+        0x00, 0x32,  # glyph 1: offset 100
+        0x00, 0x32,  # glyph 2: offset 100 (same = empty glyph 1)
+        0x00, 0x64   # end marker: offset 200
+    ]
+
+    let loca = parse_loca(@data, 3, 0).unwrap()
+
+    assert loca.has_outline(0)
+    assert not loca.has_outline(1)  # empty!
+    assert loca.has_outline(2)
+
+    assert loca.get_length(1).unwrap() == 0
+
+    0

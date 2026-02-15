@@ -1,0 +1,305 @@
+# ============================================================================
+# DESIGN DOCUMENT - NOT COMPILABLE CODE
+# ============================================================================
+#
+# This is a DESIGN SKETCH for a future UEFI bootloader written in Ritz.
+# The syntax here is outdated pseudo-code, NOT valid Ritz syntax.
+#
+# Current Status: We use GRUB Multiboot2 via kernel/boot.s
+# Future Work: This could be converted to real Ritz once UEFI support is added
+#
+# Syntax differences from actual Ritz:
+#   - `@packed @class` should be `[[packed]] struct`
+#   - `@extern fn_name():` (no colon, no return arrow) should be:
+#       - `extern fn fn_name()` - for declaring external functions (assembly/C)
+#       - `pub fn fn_name()` - for defining exported Ritz functions
+#   - `ptr[T]` should be `*T`
+#   - `pass` is not a Ritz keyword
+#   - `range(0, n)` should be `0..n`
+#   - `&` for address is correct in Ritz (not `@`)
+#
+# ============================================================================
+#
+# Harland Stage 1 UEFI Bootloader Design
+#
+# Inspired by BOOTBOOT: https://gitlab.com/bztsrc/bootboot
+#
+# This bootloader would:
+# 1. Run as a UEFI application (64-bit)
+# 2. Get memory map from UEFI
+# 3. Load kernel ELF from filesystem
+# 4. Exit boot services
+# 5. Set up identity + higher-half page tables
+# 6. Jump to kernel
+
+# ============================================================================
+# UEFI Type Definitions
+# ============================================================================
+
+# UEFI uses Microsoft x64 calling convention, not System V
+# RCX, RDX, R8, R9 for first 4 args, then stack
+
+EFI_SUCCESS: u64 = 0
+EFI_LOAD_ERROR: u64 = 1
+EFI_BUFFER_TOO_SMALL: u64 = 5
+
+@packed @class
+EfiTableHeader:
+    signature: u64
+    revision: u32
+    header_size: u32
+    crc32: u32
+    reserved: u32
+
+@packed @class
+EfiSystemTable:
+    hdr: EfiTableHeader
+    firmware_vendor: ptr[u16]    # UCS-2 string
+    firmware_revision: u32
+    _pad1: u32
+    console_in_handle: u64
+    con_in: ptr[void]
+    console_out_handle: u64
+    con_out: ptr[EfiSimpleTextOutput]
+    stderr_handle: u64
+    std_err: ptr[void]
+    runtime_services: ptr[void]
+    boot_services: ptr[EfiBootServices]
+    number_of_table_entries: u64
+    configuration_table: ptr[void]
+
+@packed @class
+EfiSimpleTextOutput:
+    reset: ptr[void]
+    output_string: ptr[void]     # fn(this, string) -> status
+    test_string: ptr[void]
+    query_mode: ptr[void]
+    set_mode: ptr[void]
+    set_attribute: ptr[void]
+    clear_screen: ptr[void]
+    set_cursor_position: ptr[void]
+    enable_cursor: ptr[void]
+    mode: ptr[void]
+
+@packed @class
+EfiBootServices:
+    hdr: EfiTableHeader
+    # Task Priority Services
+    raise_tpl: ptr[void]
+    restore_tpl: ptr[void]
+    # Memory Services
+    allocate_pages: ptr[void]
+    free_pages: ptr[void]
+    get_memory_map: ptr[void]    # The important one!
+    allocate_pool: ptr[void]
+    free_pool: ptr[void]
+    # Event & Timer Services
+    create_event: ptr[void]
+    set_timer: ptr[void]
+    wait_for_event: ptr[void]
+    signal_event: ptr[void]
+    close_event: ptr[void]
+    check_event: ptr[void]
+    # Protocol Handler Services
+    install_protocol_interface: ptr[void]
+    reinstall_protocol_interface: ptr[void]
+    uninstall_protocol_interface: ptr[void]
+    handle_protocol: ptr[void]
+    reserved: ptr[void]
+    register_protocol_notify: ptr[void]
+    locate_handle: ptr[void]
+    locate_device_path: ptr[void]
+    install_configuration_table: ptr[void]
+    # Image Services
+    load_image: ptr[void]
+    start_image: ptr[void]
+    exit: ptr[void]
+    unload_image: ptr[void]
+    exit_boot_services: ptr[void]  # The other important one!
+    # ... more services we don't need yet
+
+@packed @class
+EfiMemoryDescriptor:
+    type_: u32
+    _pad: u32
+    physical_start: u64
+    virtual_start: u64
+    number_of_pages: u64
+    attribute: u64
+
+# Memory types
+EFI_CONVENTIONAL_MEMORY: u32 = 7
+EFI_LOADER_CODE: u32 = 1
+EFI_LOADER_DATA: u32 = 2
+
+# ============================================================================
+# Boot Information for Kernel
+# ============================================================================
+
+@packed @class
+BootInfo:
+    magic: u32 = 0x4841524C      # "HARL"
+    version: u32 = 1
+    memory_map: ptr[MemoryMap]
+    memory_map_entries: u32
+    framebuffer: ptr[Framebuffer]
+    initrd_start: u64
+    initrd_size: u64
+    kernel_phys: u64
+    kernel_virt: u64
+    pml4_phys: u64
+
+@packed @class
+MemoryMap:
+    base: u64
+    length: u64
+    type_: u32
+    _reserved: u32
+
+@packed @class
+Framebuffer:
+    addr: u64
+    width: u32
+    height: u32
+    pitch: u32
+    bpp: u8
+
+# ============================================================================
+# Global State
+# ============================================================================
+
+# Allocated during boot, passed to kernel
+boot_info: BootInfo
+pml4: ptr[u64]
+
+# ============================================================================
+# Console Output (UEFI)
+# ============================================================================
+
+efi_print(system_table: ptr[EfiSystemTable], msg: ptr[u8]):
+    # Convert ASCII to UCS-2 and print via UEFI
+    # This is a simplified version - real code needs proper conversion
+    con_out = system_table.con_out
+    # TODO: Call con_out.output_string via UEFI ABI
+    pass
+
+# ============================================================================
+# Page Table Setup
+# ============================================================================
+
+# Page table entry flags
+PTE_PRESENT: u64 = 1 << 0
+PTE_WRITABLE: u64 = 1 << 1
+PTE_USER: u64 = 1 << 2
+PTE_WRITE_THROUGH: u64 = 1 << 3
+PTE_CACHE_DISABLE: u64 = 1 << 4
+PTE_HUGE: u64 = 1 << 7
+
+setup_page_tables(memory_map: ptr[EfiMemoryDescriptor], map_entries: u32):
+    # Allocate PML4 (4KB aligned)
+    # For now, use UEFI's AllocatePages
+
+    # Identity map first 4GB (for bootloader code)
+    # Map kernel to higher half (0xFFFFFFFF80000000)
+
+    # TODO: Implement proper page table setup
+    pass
+
+load_pml4(pml4_phys: u64):
+    asm x86_64:
+        mov rax, {pml4_phys}
+        mov cr3, rax
+
+# ============================================================================
+# ELF Loader
+# ============================================================================
+
+# ELF64 Header
+@packed @class
+Elf64Header:
+    e_ident: [u8; 16]    # Magic number and other info
+    e_type: u16          # Object file type
+    e_machine: u16       # Architecture
+    e_version: u32       # Object file version
+    e_entry: u64         # Entry point virtual address
+    e_phoff: u64         # Program header table file offset
+    e_shoff: u64         # Section header table file offset
+    e_flags: u32         # Processor-specific flags
+    e_ehsize: u16        # ELF header size
+    e_phentsize: u16     # Program header table entry size
+    e_phnum: u16         # Program header table entry count
+    e_shentsize: u16     # Section header table entry size
+    e_shnum: u16         # Section header table entry count
+    e_shstrndx: u16      # Section header string table index
+
+@packed @class
+Elf64ProgramHeader:
+    p_type: u32          # Segment type
+    p_flags: u32         # Segment flags
+    p_offset: u64        # Segment file offset
+    p_vaddr: u64         # Segment virtual address
+    p_paddr: u64         # Segment physical address
+    p_filesz: u64        # Segment size in file
+    p_memsz: u64         # Segment size in memory
+    p_align: u64         # Segment alignment
+
+PT_LOAD: u32 = 1
+
+load_kernel_elf(kernel_data: ptr[u8], kernel_size: u64) -> u64:
+    # Parse ELF header
+    elf = kernel_data as ptr[Elf64Header]
+
+    # Verify ELF magic
+    if elf.e_ident[0] != 0x7F or elf.e_ident[1] != 0x45:  # 'E'
+        return 0  # Invalid ELF
+
+    # Load each PT_LOAD segment
+    for i in range(0, elf.e_phnum):
+        ph_offset = elf.e_phoff + (i as u64) * (elf.e_phentsize as u64)
+        ph = (kernel_data + ph_offset) as ptr[Elf64ProgramHeader]
+
+        if ph.p_type == PT_LOAD:
+            # Copy segment to physical address
+            # TODO: Implement memcpy
+            pass
+
+    return elf.e_entry
+
+# ============================================================================
+# Main Entry Point
+# ============================================================================
+
+@extern
+efi_main(image_handle: u64, system_table: ptr[EfiSystemTable]) -> u64:
+    # Print startup message
+    # TODO: efi_print(system_table, "Harland Stage 1 Bootloader\n")
+
+    # Get memory map from UEFI
+    # TODO: Call GetMemoryMap
+
+    # Load kernel from filesystem
+    # TODO: Locate and load harland.elf
+
+    # Load initrd
+    # TODO: Locate and load initrd.tar
+
+    # Setup page tables
+    # TODO: setup_page_tables(...)
+
+    # Fill in boot info structure
+    boot_info.magic = 0x4841524C
+    boot_info.version = 1
+    # TODO: Fill rest of boot_info
+
+    # Exit boot services (no more UEFI after this!)
+    # TODO: Call ExitBootServices
+
+    # Load our page tables
+    # TODO: load_pml4(pml4_phys)
+
+    # Jump to kernel!
+    # kernel_entry = boot_info.kernel_virt
+    # TODO: Jump to kernel with boot_info pointer in RDI
+
+    # Should never reach here
+    return EFI_LOAD_ERROR

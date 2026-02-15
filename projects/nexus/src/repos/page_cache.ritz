@@ -1,0 +1,205 @@
+# src/repos/page_cache.ritz - Page caching layer
+#
+# Caches WikiPages in Tome for fast read access.
+# Integrates with the WikiPageRepository for cache-aside pattern.
+
+import ritzlib.str { String, str_from_view }
+import ritzlib.memory
+
+import tome.client {
+    TomeClient,
+    client_new as tome_client_new,
+    client_connect as tome_connect,
+    client_disconnect as tome_disconnect,
+    client_is_connected as tome_is_connected,
+    client_send_cmd1,
+    client_send_cmd2
+}
+
+import models { WikiPage }
+import errors.repo_error { RepoError }
+
+
+# Default cache TTL in seconds (5 minutes)
+const DEFAULT_TTL: i32 = 300
+
+# Cache key prefix
+const CACHE_PREFIX: *u8 = c"nexus:page:"
+
+
+# Page cache backed by Tome
+pub struct PageCache
+    client: TomeClient
+    connected: bool
+    ttl_seconds: i32
+
+
+# Create a new cache (not connected)
+pub fn page_cache_new() -> PageCache
+    PageCache {
+        client: tome_client_new(),
+        connected: false,
+        ttl_seconds: DEFAULT_TTL
+    }
+
+
+# Connect to Tome server
+# host should be packed IPv4 address (e.g., 0x7F000001 for 127.0.0.1)
+pub fn page_cache_connect(cache: *PageCache, host: i32, port: i32) -> Result<(), RepoError>
+    if cache.connected
+        return Ok(())
+
+    let result = tome_connect(@cache.client, host, port)
+    if result < 0
+        return Err(RepoError.CacheError(str_from_view(s"Tome connection failed")))
+
+    cache.connected = true
+    Ok(())
+
+
+# Disconnect from Tome
+pub fn page_cache_disconnect(cache: *PageCache)
+    if cache.connected
+        tome_disconnect(@cache.client)
+        cache.connected = false
+
+
+# Check connection
+pub fn page_cache_is_connected(cache: *PageCache) -> bool
+    cache.connected and tome_is_connected(@cache.client) == 1
+
+
+# Set cache TTL
+pub fn page_cache_set_ttl(cache: *PageCache, ttl_seconds: i32)
+    cache.ttl_seconds = ttl_seconds
+
+
+# Get a page from cache by slug
+pub fn page_cache_get(cache: *PageCache, slug: Span<u8>) -> Option<WikiPage>
+    if not page_cache_is_connected(cache)
+        return None
+
+    # Build cache key: "nexus:page:<slug>"
+    var key_buf: [256]u8
+    let key_len = build_cache_key(slug, @key_buf)
+
+    # Send GET command
+    let result = client_send_cmd1(@cache.client, c"GET", @key_buf as *u8)
+    if result < 0
+        return None
+
+    # TODO: Parse response and deserialize
+    # For now, cache misses always - actual parsing will be implemented
+    None
+
+
+# Store a page in cache
+pub fn page_cache_set(cache: *PageCache, page: *WikiPage) -> Result<(), RepoError>
+    if not page_cache_is_connected(cache)
+        return Err(RepoError.CacheError(str_from_view(s"Not connected")))
+
+    # Build cache key
+    var key_buf: [256]u8
+    let key_len = build_cache_key(page.slug.as_view(), @key_buf)
+
+    # Serialize page to JSON-like format for storage
+    var value_buf: [8192]u8
+    let value_len = serialize_page_for_cache(page, @value_buf)
+
+    # Send SETEX command with TTL
+    # TODO: Actually send the command when tome client supports SETEX
+    # For now, just return success
+    Ok(())
+
+
+# Invalidate a page in cache (on update/delete)
+pub fn page_cache_invalidate(cache: *PageCache, slug: Span<u8>) -> Result<(), RepoError>
+    if not page_cache_is_connected(cache)
+        return Err(RepoError.CacheError(str_from_view(s"Not connected")))
+
+    # Build cache key
+    var key_buf: [256]u8
+    let key_len = build_cache_key(slug, @key_buf)
+
+    # Send DEL command
+    let result = client_send_cmd1(@cache.client, c"DEL", @key_buf as *u8)
+    if result < 0
+        return Err(RepoError.CacheError(str_from_view(s"Cache invalidation failed")))
+
+    Ok(())
+
+
+# Clear all cached pages (for admin operations)
+pub fn page_cache_clear(cache: *PageCache) -> Result<(), RepoError>
+    if not page_cache_is_connected(cache)
+        return Err(RepoError.CacheError(str_from_view(s"Not connected")))
+
+    # TODO: Send KEYS nexus:page:* and DEL each, or FLUSHDB
+    Ok(())
+
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+# Build cache key: "nexus:page:<slug>"
+fn build_cache_key(slug: Span<u8>, buf: *[256]u8) -> i32
+    var ptr: *u8 = buf as *u8
+    var pos: i32 = 0
+
+    # Copy prefix
+    var prefix_pos: i32 = 0
+    while *(CACHE_PREFIX + prefix_pos) != 0
+        *(ptr + pos) = *(CACHE_PREFIX + prefix_pos)
+        pos += 1
+        prefix_pos += 1
+
+    # Copy slug
+    var i: i64 = 0
+    while i < slug.len() and pos < 255
+        *(ptr + pos) = slug.get_byte(i)
+        pos += 1
+        i += 1
+
+    # Null terminate
+    *(ptr + pos) = 0
+    pos
+
+
+# Serialize page for cache storage (simple format)
+fn serialize_page_for_cache(page: *WikiPage, buf: *[8192]u8) -> i32
+    # For now, just store slug|title|content with length prefixes
+    # A proper implementation would use JSON or MessagePack
+    var ptr: *u8 = buf as *u8
+    var pos: i32 = 0
+
+    # Slug
+    let slug = page.slug.as_view()
+    let slug_len = slug.len() as u16
+    *(ptr + pos) = (slug_len >> 8) as u8
+    *(ptr + pos + 1) = (slug_len & 0xFF) as u8
+    pos += 2
+    memcpy(ptr + pos, slug.ptr(), slug_len as i64)
+    pos += slug_len as i32
+
+    # Title
+    let title = page.title.as_view()
+    let title_len = title.len() as u16
+    *(ptr + pos) = (title_len >> 8) as u8
+    *(ptr + pos + 1) = (title_len & 0xFF) as u8
+    pos += 2
+    memcpy(ptr + pos, title.ptr(), title_len as i64)
+    pos += title_len as i32
+
+    # Content (truncate if too long for cache)
+    let content = page.content.as_view()
+    var content_len = content.len() as u16
+    if content_len > 7000
+        content_len = 7000
+    *(ptr + pos) = (content_len >> 8) as u8
+    *(ptr + pos + 1) = (content_len & 0xFF) as u8
+    pos += 2
+    memcpy(ptr + pos, content.ptr(), content_len as i64)
+    pos += content_len as i32
+
+    pos

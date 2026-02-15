@@ -1,0 +1,259 @@
+# tests/test_html_tokenizer.ritz - HTML tokenizer tests
+
+import lib.html.tokenizer { Tokenizer, tokenizer_new, tokenizer_next }
+import lib.html.token
+
+# =============================================================================
+# Test Helpers
+# =============================================================================
+
+fn expect_start_tag(t:& Tokenizer, expected_name: StrView) -> i32
+    let tok = tokenizer_next(t)
+    if tok.kind != token.TOKEN_START_TAG
+        return 1
+    if tok.start_tag.name != expected_name
+        return 1
+    return 0
+
+fn expect_end_tag(t:& Tokenizer, expected_name: StrView) -> i32
+    let tok = tokenizer_next(t)
+    if tok.kind != token.TOKEN_END_TAG
+        return 1
+    if tok.end_tag.name != expected_name
+        return 1
+    return 0
+
+fn expect_eof(t:& Tokenizer) -> i32
+    let tok = tokenizer_next(t)
+    if tok.kind != token.TOKEN_EOF
+        return 1
+    return 0
+
+fn skip_whitespace_chars(t:& Tokenizer)
+    loop
+        let tok = tokenizer_next(t)
+        if tok.kind != token.TOKEN_CHARACTER
+            # TODO: Need to "unconsume" this token
+            # For now, tests are designed to not need this
+            break
+        let c = tok.character.char
+        if c != 32 and c != 10 and c != 9 and c != 13
+            break
+
+# =============================================================================
+# Basic Tests
+# =============================================================================
+
+[[test]]
+fn test_empty_input() -> i32
+    var t = tokenizer_new("")
+    expect_eof(t)
+
+[[test]]
+fn test_simple_tag() -> i32
+    var t = tokenizer_new("<div></div>")
+
+    if expect_start_tag(t, "div") != 0
+        return 1
+
+    if expect_end_tag(t, "div") != 0
+        return 1
+
+    expect_eof(t)
+
+[[test]]
+fn test_nested_tags() -> i32
+    var t = tokenizer_new("<div><span></span></div>")
+
+    if expect_start_tag(t, "div") != 0
+        return 1
+    if expect_start_tag(t, "span") != 0
+        return 1
+    if expect_end_tag(t, "span") != 0
+        return 1
+    if expect_end_tag(t, "div") != 0
+        return 1
+
+    expect_eof(t)
+
+[[test]]
+fn test_self_closing_tag() -> i32
+    var t = tokenizer_new("<br/>")
+
+    let tok = tokenizer_next(t)
+    if tok.kind != token.TOKEN_START_TAG
+        return 1
+    if tok.start_tag.name != "br"
+        return 1
+    if tok.start_tag.self_closing != 1
+        return 1
+
+    expect_eof(t)
+
+[[test]]
+fn test_tag_with_attribute() -> i32
+    var t = tokenizer_new("<div class=\"test\"></div>")
+
+    let tok = tokenizer_next(t)
+    if tok.kind != token.TOKEN_START_TAG
+        return 1
+    if tok.start_tag.name != "div"
+        return 1
+    if tok.start_tag.attr_count != 1
+        return 1
+    # Would check attribute name/value here
+
+    if expect_end_tag(t, "div") != 0
+        return 1
+
+    expect_eof(t)
+
+[[test]]
+fn test_multiple_attributes() -> i32
+    var t = tokenizer_new("<a href=\"/page\" class=\"link\" id=\"nav\"></a>")
+
+    let tok = tokenizer_next(t)
+    if tok.kind != token.TOKEN_START_TAG
+        return 1
+    if tok.start_tag.name != "a"
+        return 1
+    if tok.start_tag.attr_count != 3
+        return 1
+
+    if expect_end_tag(t, "a") != 0
+        return 1
+
+    expect_eof(t)
+
+[[test]]
+fn test_text_content() -> i32
+    var t = tokenizer_new("<p>Hello</p>")
+
+    if expect_start_tag(t, "p") != 0
+        return 1
+
+    # Should get character tokens for "Hello"
+    var char_count = 0
+    loop
+        let tok = tokenizer_next(t)
+        if tok.kind == token.TOKEN_CHARACTER
+            char_count = char_count + 1
+        else if tok.kind == token.TOKEN_END_TAG
+            break
+        else
+            return 1  # Unexpected token
+
+    if char_count != 5  # "Hello" = 5 chars
+        return 1
+
+    expect_eof(t)
+
+[[test]]
+fn test_comment() -> i32
+    var t = tokenizer_new("<!-- comment -->")
+
+    let tok = tokenizer_next(t)
+    if tok.kind != token.TOKEN_COMMENT
+        return 1
+    if tok.comment.data != " comment "
+        return 1
+
+    expect_eof(t)
+
+[[test]]
+fn test_doctype() -> i32
+    var t = tokenizer_new("<!DOCTYPE html>")
+
+    let tok = tokenizer_next(t)
+    if tok.kind != token.TOKEN_DOCTYPE
+        return 1
+    if tok.doctype.name != "html"
+        return 1
+
+    expect_eof(t)
+
+[[test]]
+fn test_uppercase_tags() -> i32
+    # Tag names should be lowercased
+    var t = tokenizer_new("<DIV></DIV>")
+
+    if expect_start_tag(t, "div") != 0
+        return 1
+    if expect_end_tag(t, "div") != 0
+        return 1
+
+    expect_eof(t)
+
+[[test]]
+fn test_unquoted_attribute() -> i32
+    var t = tokenizer_new("<div class=test></div>")
+
+    let tok = tokenizer_next(t)
+    if tok.kind != token.TOKEN_START_TAG
+        return 1
+    if tok.start_tag.attr_count != 1
+        return 1
+
+    if expect_end_tag(t, "div") != 0
+        return 1
+
+    expect_eof(t)
+
+[[test]]
+fn test_single_quoted_attribute() -> i32
+    var t = tokenizer_new("<div class='test'></div>")
+
+    let tok = tokenizer_next(t)
+    if tok.kind != token.TOKEN_START_TAG
+        return 1
+    if tok.start_tag.attr_count != 1
+        return 1
+
+    if expect_end_tag(t, "div") != 0
+        return 1
+
+    expect_eof(t)
+
+[[test]]
+fn test_numeric_entity() -> i32
+    var t = tokenizer_new("&#65;")  # Should be 'A'
+
+    let tok = tokenizer_next(t)
+    if tok.kind != token.TOKEN_CHARACTER
+        return 1
+    if tok.character.char != 65  # 'A'
+        return 1
+
+    expect_eof(t)
+
+[[test]]
+fn test_hex_entity() -> i32
+    var t = tokenizer_new("&#x41;")  # Should be 'A'
+
+    let tok = tokenizer_next(t)
+    if tok.kind != token.TOKEN_CHARACTER
+        return 1
+    if tok.character.char != 65  # 'A'
+        return 1
+
+    expect_eof(t)
+
+[[test]]
+fn test_void_elements() -> i32
+    # Void elements like <br>, <hr>, <img> shouldn't need closing tags
+    var t = tokenizer_new("<br><hr><img src=\"test.png\">")
+
+    if expect_start_tag(t, "br") != 0
+        return 1
+    if expect_start_tag(t, "hr") != 0
+        return 1
+
+    let tok = tokenizer_next(t)
+    if tok.kind != token.TOKEN_START_TAG
+        return 1
+    if tok.start_tag.name != "img"
+        return 1
+    if tok.start_tag.attr_count != 1
+        return 1
+
+    expect_eof(t)

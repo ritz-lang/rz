@@ -1,0 +1,193 @@
+# Harland Kernel - Process Management
+#
+# Minimal process support for running user programs.
+# For now, we support a single process with a simple flat memory model.
+
+# ============================================================================
+# Process Structure
+# ============================================================================
+
+pub struct Process
+    pid: u64                    # Process ID
+    state: u64                  # 0=ready, 1=running, 2=blocked, 3=exited
+    entry_point: u64            # User code entry point
+    user_stack_top: u64         # Top of user stack
+    kernel_stack_top: u64       # Top of kernel stack (for syscalls)
+    page_table: u64             # CR3 value (PML4 physical address)
+
+# Process states
+const PROCESS_READY: u64 = 0
+const PROCESS_RUNNING: u64 = 1
+const PROCESS_BLOCKED: u64 = 2
+const PROCESS_EXITED: u64 = 3
+
+# ============================================================================
+# Memory Layout for User Process
+# ============================================================================
+#
+# Virtual address space layout:
+#   0x0000_0000_0040_0000 - 0x0000_0000_0080_0000 : User code (4MB)
+#   0x0000_7FFF_FFFF_0000 - 0x0000_7FFF_FFFF_FFFF : User stack (64KB)
+#
+# For now, we'll map a simple flat region for the user program.
+
+const USER_CODE_START: u64 = 0x400000         # 4MB - typical ELF base
+const USER_CODE_SIZE: u64 = 0x400000          # 4MB
+const USER_STACK_TOP: u64 = 0x7FFFFFFFFFFF    # Just below 128TB
+const USER_STACK_SIZE: u64 = 0x10000          # 64KB
+
+# ============================================================================
+# User Program Storage
+# ============================================================================
+
+# Simple embedded user program (will be replaced with ELF loader later)
+# This is raw x86-64 machine code that:
+# 1. Writes "Hello from userspace!\n" via syscall
+# 2. Calls exit(0)
+
+# Syscall numbers (must match syscall.ritz)
+const SYS_WRITE: u64 = 1
+const SYS_EXIT: u64 = 20
+const SYS_DEBUG_PRINT: u64 = 255
+
+# ============================================================================
+# Inline User Program Machine Code
+# ============================================================================
+
+# We'll write the user program in assembly and include it as bytes.
+# For now, let's create a minimal test that makes a syscall.
+#
+# User program assembly:
+#   mov rax, 255          # SYS_DEBUG_PRINT
+#   lea rdi, [rip+msg]    # buf = message
+#   mov rsi, 22           # len = 22
+#   syscall
+#   mov rax, 20           # SYS_EXIT
+#   xor rdi, rdi          # code = 0
+#   syscall
+#   hlt
+# msg: "Hello from userspace!\n"
+
+# For simplicity, we'll define the user program in the assembly file
+# and reference it as an external symbol.
+
+extern fn user_program_start()
+extern fn user_program_end()
+
+# ============================================================================
+# Process Creation
+# ============================================================================
+
+# Global process table (just one process for now)
+var current_process: Process
+
+# External function to jump to userspace (defined in syscall_entry.s)
+extern fn jump_to_userspace(entry: u64, stack: u64)
+
+pub fn process_create_init() -> i32
+    # Create the initial user process
+
+    # Set up process structure
+    current_process.pid = 1
+    current_process.state = PROCESS_READY
+    current_process.entry_point = USER_CODE_START
+    current_process.user_stack_top = USER_STACK_TOP
+    # Use current page table for now (identity mapped)
+    # TODO: Create separate user page table
+
+    prints("[process] Creating init process\n")
+    prints("  Entry point: 0x")
+    serial_print_hex(USER_CODE_START)
+    prints("\n")
+    prints("  Stack top: 0x")
+    serial_print_hex(USER_STACK_TOP)
+    prints("\n")
+
+    return 0
+
+# ============================================================================
+# Process Execution
+# ============================================================================
+
+pub fn process_run_init() -> i32
+    # Copy user program to USER_CODE_START
+    # For now, assume identity mapping and program is already there
+    # TODO: Actually copy the embedded program
+
+    prints("[process] Preparing to jump to userspace\n")
+
+    # Mark as running
+    current_process.state = PROCESS_RUNNING
+
+    # Calculate user stack pointer (grows down)
+    let user_rsp: u64 = USER_STACK_TOP - 8  # Align and leave some space
+
+    prints("[process] Jumping to Ring 3...\n")
+
+    # Jump to userspace!
+    # This function never returns
+    jump_to_userspace(current_process.entry_point, user_rsp)
+
+    # Never reached
+    return 0
+
+# ============================================================================
+# Serial Output (duplicate for now - TODO: import from main)
+# ============================================================================
+
+const COM1_DATA: u16 = 0x3F8
+const COM1_LSR: u16 = 0x3FD
+const LSR_THRE: u8 = 0x20
+
+fn outb(port: u16, value: u8) -> i32
+    asm x86_64:
+        movw {port}, %dx
+        movb {value}, %al
+        outb %al, %dx
+    return 0
+
+fn inb(port: u16) -> u8
+    var result: u8 = 0
+    asm x86_64:
+        movw {port}, %dx
+        inb %dx, %al
+        movb %al, {result}
+    return result
+
+fn serial_write_byte(c: u8) -> i32
+    while (inb(COM1_LSR) & LSR_THRE) == 0
+        asm x86_64:
+            pause
+    outb(COM1_DATA, c)
+    return 0
+
+fn serial_print(s: *u8) -> i32
+    var p: *u8 = s
+    while *p != 0
+        serial_write_byte(*p)
+        p = p + 1
+    return 0
+
+# StrView - Zero-copy string view (matches main.ritz layout)
+pub struct StrView
+    ptr: *u8
+    len: i64
+
+fn serial_write(buf: *u8, len: i64) -> i32
+    var i: i64 = 0
+    while i < len
+        serial_write_byte(*(buf + i))
+        i = i + 1
+    return 0
+
+fn prints(s: StrView) -> i32
+    return serial_write(s.ptr, s.len)
+
+fn serial_print_hex(value: u64) -> i32
+    let hex_chars: *u8 = c"0123456789ABCDEF"
+    var i: i32 = 15
+    while i >= 0
+        let nibble: u8 = ((value >> (i * 4)) & 0xF) as u8
+        serial_write_byte(*(hex_chars + nibble as i64))
+        i = i - 1
+    return 0

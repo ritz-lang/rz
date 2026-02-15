@@ -1,0 +1,286 @@
+# lib/composite/layer.ritz - Compositing layer management
+#
+# Layers enable efficient compositing, scrolling, and animations.
+# Some render nodes require their own layers (transforms, opacity, fixed position).
+#
+# Usage:
+#   import lib.composite.layer
+
+import ritzlib.sys
+import ritzlib.memory
+import ritzlib.gvec
+import ritzlib.hashmap
+import lib.style.types
+
+# =============================================================================
+# Layer Identification
+# =============================================================================
+
+pub struct LayerId
+    value: u64
+
+pub fn layer_id_new(value: u64) -> LayerId
+    LayerId { value: value }
+
+pub fn layer_id_invalid() -> LayerId
+    LayerId { value: 0 }
+
+pub fn layer_id_is_valid(id: @LayerId) -> i32
+    if id.value != 0
+        return 1
+    return 0
+
+pub fn layer_id_eq(a: @LayerId, b: @LayerId) -> i32
+    if a.value == b.value
+        return 1
+    return 0
+
+# =============================================================================
+# Layer Reasons (why a node was promoted to its own layer)
+# =============================================================================
+
+const LAYER_REASON_ROOT: i32 = 0
+const LAYER_REASON_TRANSFORM_3D: i32 = 1
+const LAYER_REASON_TRANSFORM_2D: i32 = 2
+const LAYER_REASON_OPACITY: i32 = 3
+const LAYER_REASON_FILTER: i32 = 4
+const LAYER_REASON_POSITION_FIXED: i32 = 5
+const LAYER_REASON_POSITION_STICKY: i32 = 6
+const LAYER_REASON_OVERFLOW_SCROLL: i32 = 7
+const LAYER_REASON_WILL_CHANGE: i32 = 8
+const LAYER_REASON_VIDEO: i32 = 9
+const LAYER_REASON_CANVAS: i32 = 10
+
+# =============================================================================
+# Blend Mode
+# =============================================================================
+
+const BLEND_MODE_NORMAL: i32 = 0
+const BLEND_MODE_MULTIPLY: i32 = 1
+const BLEND_MODE_SCREEN: i32 = 2
+const BLEND_MODE_OVERLAY: i32 = 3
+
+# =============================================================================
+# Simple Rect for layer bounds
+# =============================================================================
+
+pub struct LayerRect
+    x: i32
+    y: i32
+    width: u32
+    height: u32
+
+pub fn layer_rect_new(x: i32, y: i32, width: u32, height: u32) -> LayerRect
+    LayerRect { x: x, y: y, width: width, height: height }
+
+pub fn layer_rect_zero() -> LayerRect
+    LayerRect { x: 0, y: 0, width: 0, height: 0 }
+
+# =============================================================================
+# Simple Point for scroll offset
+# =============================================================================
+
+pub struct LayerPoint
+    x: i32
+    y: i32
+
+pub fn layer_point_new(x: i32, y: i32) -> LayerPoint
+    LayerPoint { x: x, y: y }
+
+pub fn layer_point_zero() -> LayerPoint
+    LayerPoint { x: 0, y: 0 }
+
+# =============================================================================
+# Layer
+# =============================================================================
+
+pub struct Layer
+    id: LayerId
+    # Associated render node (invalid for synthetic layers)
+    node_id: NodeId
+    # Why this layer exists
+    reason: i32
+
+    # Layer tree structure
+    parent: LayerId
+    first_child: LayerId
+    last_child: LayerId
+    prev_sibling: LayerId
+    next_sibling: LayerId
+
+    # Geometry (relative to parent layer)
+    bounds: LayerRect
+
+    # Transform applied to this layer
+    transform: Transform
+
+    # Visual properties
+    opacity: f64
+    blend_mode: i32
+
+    # Scrolling (for overflow: scroll layers)
+    scroll_offset: LayerPoint
+    scroll_bounds: LayerRect
+
+    # Dirty state
+    needs_repaint: i32
+    needs_composite: i32
+
+    # Prism surface (if allocated)
+    surface_id: u64
+
+pub fn layer_new(id: LayerId, node_id: NodeId, reason: i32) -> Layer
+    Layer {
+        id: id,
+        node_id: node_id,
+        reason: reason,
+        parent: layer_id_invalid(),
+        first_child: layer_id_invalid(),
+        last_child: layer_id_invalid(),
+        prev_sibling: layer_id_invalid(),
+        next_sibling: layer_id_invalid(),
+        bounds: layer_rect_zero(),
+        transform: transform_identity(),
+        opacity: 1.0,
+        blend_mode: BLEND_MODE_NORMAL,
+        scroll_offset: layer_point_zero(),
+        scroll_bounds: layer_rect_zero(),
+        needs_repaint: 1,
+        needs_composite: 1,
+        surface_id: 0
+    }
+
+pub fn layer_is_scrollable(layer: @Layer) -> i32
+    if layer.reason == LAYER_REASON_OVERFLOW_SCROLL
+        return 1
+    return 0
+
+pub fn layer_has_transform(layer: @Layer) -> i32
+    if transform_is_identity(layer.transform) == 0
+        return 1
+    return 0
+
+pub fn layer_is_opaque(layer: @Layer) -> i32
+    if layer.opacity >= 1.0
+        if layer.blend_mode == BLEND_MODE_NORMAL
+            return 1
+    return 0
+
+# =============================================================================
+# Layer Tree
+# =============================================================================
+
+pub struct LayerTree
+    layers: Vec<Layer>
+    id_to_index: HashMapI64
+    root: LayerId
+    next_id: u64
+
+pub fn layer_tree_new() -> LayerTree
+    LayerTree {
+        layers: vec_new<Layer>(),
+        id_to_index: hashmap_i64_new(),
+        root: layer_id_invalid(),
+        next_id: 1
+    }
+
+pub fn layer_tree_create_root(tree: @&LayerTree, node_id: NodeId, bounds: LayerRect) -> LayerId
+    let id_val = tree.next_id
+    tree.next_id = tree.next_id + 1
+
+    let id = layer_id_new(tree.next_id - 1)
+    var layer = layer_new(id, node_id, LAYER_REASON_ROOT)
+    layer.bounds = bounds
+
+    let index = tree.layers.len
+    hashmap_i64_insert(@tree.id_to_index, (tree.next_id - 1) as i64, index)
+    vec_push<Layer>(@tree.layers, layer)
+    tree.root = layer_id_new(tree.next_id - 1)
+
+    layer_id_new(tree.next_id - 1)
+
+pub fn layer_tree_create(tree: @&LayerTree, node_id: NodeId, reason: i32) -> LayerId
+    let id_val = tree.next_id
+    tree.next_id = tree.next_id + 1
+
+    let id = layer_id_new(tree.next_id - 1)
+    let layer = layer_new(id, node_id, reason)
+
+    let index = tree.layers.len
+    hashmap_i64_insert(@tree.id_to_index, (tree.next_id - 1) as i64, index)
+    vec_push<Layer>(@tree.layers, layer)
+
+    layer_id_new(tree.next_id - 1)
+
+pub fn layer_tree_get(tree: @LayerTree, id: @LayerId) -> @Layer
+    let index = hashmap_i64_get(@tree.id_to_index, id.value as i64)
+    if index < 0
+        return null
+    if index >= tree.layers.len
+        return null
+    return tree.layers.data + index
+
+pub fn layer_tree_get_mut(tree: @&LayerTree, id: @LayerId) -> @&Layer
+    let index = hashmap_i64_get(@tree.id_to_index, id.value as i64)
+    if index < 0
+        return null
+    if index >= tree.layers.len
+        return null
+    return tree.layers.data + index
+
+pub fn layer_tree_root(tree: @LayerTree) -> @Layer
+    layer_tree_get(tree, @tree.root)
+
+pub fn layer_tree_count(tree: @LayerTree) -> u32
+    tree.id_to_index.len as u32
+
+# Mark layer as needing repaint
+pub fn layer_tree_mark_dirty(tree: @&LayerTree, id: @LayerId)
+    let layer = layer_tree_get_mut(tree, id)
+    if layer != null
+        layer.needs_repaint = 1
+        layer.needs_composite = 1
+
+# Mark all layers clean after compositing
+pub fn layer_tree_clear_dirty(tree: @&LayerTree)
+    var i: i64 = 0
+    while i < tree.layers.len
+        let layer: @&Layer = tree.layers.data + i
+        layer.needs_repaint = 0
+        layer.needs_composite = 0
+        i = i + 1
+
+# Update scroll offset for a scrollable layer
+pub fn layer_tree_scroll(tree: @&LayerTree, id: @LayerId, offset_x: i32, offset_y: i32)
+    let layer = layer_tree_get_mut(tree, id)
+    if layer != null
+        if layer_is_scrollable(layer) != 0
+            layer.scroll_offset.x = offset_x
+            layer.scroll_offset.y = offset_y
+            layer.needs_composite = 1
+
+# =============================================================================
+# Layer Creation Logic
+# =============================================================================
+
+# Determine if a render node should create a layer
+# Returns the layer reason, or -1 if no layer needed
+pub fn should_create_layer(style: @ComputedStyle) -> i32
+    # Check for layer-creating properties
+    if style.opacity < 1.0
+        return LAYER_REASON_OPACITY
+
+    if transform_is_identity(style.transform) == 0
+        return LAYER_REASON_TRANSFORM_2D
+
+    if style.position == POSITION_FIXED
+        return LAYER_REASON_POSITION_FIXED
+
+    if style.position == POSITION_STICKY
+        return LAYER_REASON_POSITION_STICKY
+
+    # TODO: check overflow: scroll
+    # TODO: check will-change
+    # TODO: check filters
+
+    return -1  # No layer needed

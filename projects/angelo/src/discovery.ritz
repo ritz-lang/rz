@@ -1,0 +1,272 @@
+# Angelo - Font Discovery
+#
+# Find fonts installed on the system.
+# Searches common font directories and indexes available fonts.
+
+import font.Font
+import font.load_font
+
+# Platform-specific font directories
+const LINUX_FONT_DIRS: [4]StrView = [
+    "/usr/share/fonts",
+    "/usr/local/share/fonts",
+    "~/.fonts",
+    "~/.local/share/fonts"
+]
+
+# Font file extensions we support
+const FONT_EXTENSIONS: [4]StrView = [
+    ".ttf",
+    ".otf",
+    ".TTF",
+    ".OTF"
+]
+
+# A discovered font entry
+pub struct FontEntry
+    path: String
+    family: String
+    style: String
+
+impl FontEntry
+    pub fn new(path: String, family: String, style: String) -> FontEntry
+        FontEntry {
+            path: path,
+            family: family,
+            style: style
+        }
+
+    pub fn path(self) -> @String
+        @self.path
+
+    pub fn family(self) -> @String
+        @self.family
+
+    pub fn style(self) -> @String
+        @self.style
+
+# Font registry - indexes discovered fonts
+pub struct FontRegistry
+    fonts: Vec<FontEntry>
+    by_family: Map<String, Vec<usize>>  # family name -> indices
+
+impl FontRegistry
+    pub fn new() -> FontRegistry
+        FontRegistry {
+            fonts: Vec.new(),
+            by_family: Map.new()
+        }
+
+    # Add a font entry
+    pub fn add(self:&, entry:= FontEntry)
+        let idx = self.fonts.len()
+        let family = entry.family.clone()
+        self.fonts.push(entry)
+
+        # Index by family
+        match self.by_family.get(@&family)
+            Some(indices) => indices.push(idx)
+            None =>
+                var indices = Vec.new()
+                indices.push(idx)
+                self.by_family.insert(family, indices)
+
+    # Get number of fonts
+    pub fn len(self) -> usize
+        self.fonts.len()
+
+    # Get all fonts
+    pub fn fonts(self) -> @Vec<FontEntry>
+        @self.fonts
+
+    # Find fonts by family name (case-insensitive)
+    pub fn find_by_family(self, name: StrView) -> Vec<@FontEntry>
+        var results = Vec.new()
+        let lower_name = name.to_lowercase()
+
+        for entry in @self.fonts
+            if entry.family.to_lowercase() == lower_name
+                results.push(entry)
+
+        results
+
+    # Find first font matching family name
+    pub fn find_first(self, name: StrView) -> Option<@FontEntry>
+        let matches = self.find_by_family(name)
+        if matches.len() > 0
+            Some(matches[0])
+        else
+            None
+
+    # Find a font with specific family and style
+    pub fn find_exact(self, family: StrView, style: StrView) -> Option<@FontEntry>
+        let lower_family = family.to_lowercase()
+        let lower_style = style.to_lowercase()
+
+        for entry in @self.fonts
+            if entry.family.to_lowercase() == lower_family and
+               entry.style.to_lowercase() == lower_style
+                return Some(entry)
+
+        None
+
+# Scan system font directories and build a registry
+pub fn discover_system_fonts() -> FontRegistry
+    var registry = FontRegistry.new()
+
+    for dir in LINUX_FONT_DIRS
+        let expanded = expand_path(dir)
+        scan_directory(@expanded, @&registry)
+
+    registry
+
+# Expand ~ to home directory
+fn expand_path(path: StrView) -> String
+    if path.starts_with("~")
+        match get_home_dir()
+            Some(home) =>
+                let rest = path.slice(1, path.len())
+                home.concat(rest)
+            None =>
+                String.from(path)
+    else
+        String.from(path)
+
+# Get home directory from environment
+fn get_home_dir() -> Option<String>
+    # TODO: Ritz needs env var access
+    # For now, hardcode /home lookup
+    Some(String.from("/home"))
+
+# Recursively scan a directory for fonts
+fn scan_directory(path: @String, registry:& FontRegistry)
+    # TODO: Ritz needs directory listing
+    # This is a placeholder - real implementation would:
+    # 1. Open directory
+    # 2. Iterate entries
+    # 3. Recurse into subdirectories
+    # 4. Parse font files to extract family/style
+    pass
+
+# Extract font metadata from a font file
+pub fn extract_font_info(path: StrView) -> Option<FontEntry>
+    match load_font(path)
+        Ok(font) =>
+            # TODO: Parse 'name' table for family/style
+            # For now, extract from filename
+            let (family, style) = parse_font_filename(path)
+            Some(FontEntry.new(
+                String.from(path),
+                family,
+                style
+            ))
+        Err(_) => None
+
+# Parse family and style from filename
+# e.g., "DejaVuSans-Bold.ttf" -> ("DejaVu Sans", "Bold")
+fn parse_font_filename(path: StrView) -> (String, String)
+    # Get basename
+    var name = path
+    if let Some(idx) = path.rfind("/")
+        name = path.slice(idx + 1, path.len())
+
+    # Remove extension
+    for ext in FONT_EXTENSIONS
+        if name.ends_with(ext)
+            name = name.slice(0, name.len() - ext.len())
+            break
+
+    # Split on hyphen for style
+    if let Some(idx) = name.rfind("-")
+        let family = name.slice(0, idx)
+        let style = name.slice(idx + 1, name.len())
+        (expand_camel_case(family), String.from(style))
+    else
+        (expand_camel_case(name), String.from("Regular"))
+
+# Expand CamelCase to "Camel Case"
+fn expand_camel_case(s: StrView) -> String
+    var result = String.new()
+    var prev_lower = false
+
+    for i in 0..s.len()
+        let c = s.char_at(i)
+        if c.is_uppercase() and prev_lower
+            result.push(' ')
+        result.push(c)
+        prev_lower = c.is_lowercase()
+
+    result
+
+# Well-known font family aliases
+const FONT_ALIASES: [(StrView, StrView); 6] = [
+    ("sans-serif", "DejaVu Sans"),
+    ("serif", "DejaVu Serif"),
+    ("monospace", "DejaVu Sans Mono"),
+    ("sans", "DejaVu Sans"),
+    ("mono", "DejaVu Sans Mono"),
+    ("system-ui", "DejaVu Sans")
+]
+
+# Resolve a font family name (handles aliases)
+pub fn resolve_family_name(name: StrView) -> String
+    let lower = name.to_lowercase()
+    for (alias, target) in FONT_ALIASES
+        if lower == alias
+            return String.from(target)
+    String.from(name)
+
+# Tests
+
+[[test]]
+fn test_parse_font_filename_simple() -> i32
+    let (family, style) = parse_font_filename("DejaVuSans.ttf")
+    assert family == "Deja Vu Sans"
+    assert style == "Regular"
+    0
+
+[[test]]
+fn test_parse_font_filename_with_style() -> i32
+    let (family, style) = parse_font_filename("DejaVuSans-Bold.ttf")
+    assert family == "Deja Vu Sans"
+    assert style == "Bold"
+    0
+
+[[test]]
+fn test_parse_font_filename_with_path() -> i32
+    let (family, style) = parse_font_filename("/usr/share/fonts/truetype/DejaVuSans-Italic.ttf")
+    assert family == "Deja Vu Sans"
+    assert style == "Italic"
+    0
+
+[[test]]
+fn test_resolve_family_alias() -> i32
+    let name = resolve_family_name("sans-serif")
+    assert name == "DejaVu Sans"
+
+    let name2 = resolve_family_name("monospace")
+    assert name2 == "DejaVu Sans Mono"
+    0
+
+[[test]]
+fn test_registry_find() -> i32
+    var registry = FontRegistry.new()
+    registry.add(FontEntry.new(
+        String.from("/path/to/DejaVuSans.ttf"),
+        String.from("DejaVu Sans"),
+        String.from("Regular")
+    ))
+    registry.add(FontEntry.new(
+        String.from("/path/to/DejaVuSans-Bold.ttf"),
+        String.from("DejaVu Sans"),
+        String.from("Bold")
+    ))
+
+    let matches = registry.find_by_family("dejavu sans")
+    assert matches.len() == 2
+
+    match registry.find_exact("DejaVu Sans", "Bold")
+        Some(entry) => assert entry.style() == "Bold"
+        None => return 1  # fail
+
+    0

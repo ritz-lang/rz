@@ -1,0 +1,235 @@
+# server.ritz - LSP Server Core
+#
+# Main server loop and request dispatch.
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+import ritzlib.memory
+import ritzlib.gvec
+import ritzlib.json
+
+import transport
+import protocol
+import documents
+
+# =============================================================================
+# Server State
+# =============================================================================
+
+struct Server
+    initialized: i32
+    shutdown_requested: i32
+    documents: DocumentStore
+    response_buf: Vec<u8>
+
+pub fn server_new() -> Server
+    return Server {
+        initialized: 0,
+        shutdown_requested: 0,
+        documents: document_store_new(),
+        response_buf: vec_with_cap<u8>(4096)
+    }
+
+pub fn server_drop(s: *Server)
+    document_store_drop(&s.documents)
+    vec_drop<u8>(&s.response_buf)
+
+# =============================================================================
+# Request Handlers
+# =============================================================================
+
+# Handle initialize request
+fn handle_initialize(s: *Server, msg: *LspMessage)
+    eprints_cstr(c"[ritz-lsp] Handling initialize\n")
+
+    # Build capabilities response
+    # For MVP: text sync, hover, goto definition (placeholders)
+    let result: *u8 = c"{\"capabilities\":{\"textDocumentSync\":1,\"hoverProvider\":true,\"definitionProvider\":true},\"serverInfo\":{\"name\":\"ritz-lsp\",\"version\":\"0.1.0\"}}"
+
+    build_response(msg.id, result, &s.response_buf)
+    write_message_vec(&s.response_buf)
+
+    s.initialized = 1
+
+# Handle initialized notification
+fn handle_initialized(s: *Server, msg: *LspMessage)
+    eprints_cstr(c"[ritz-lsp] Client initialized\n")
+    # No response needed for notifications
+
+# Handle shutdown request
+fn handle_shutdown(s: *Server, msg: *LspMessage)
+    eprints_cstr(c"[ritz-lsp] Handling shutdown\n")
+    s.shutdown_requested = 1
+
+    build_response(msg.id, c"null", &s.response_buf)
+    write_message_vec(&s.response_buf)
+
+# Handle exit notification
+fn handle_exit(s: *Server, msg: *LspMessage) -> i32
+    eprints_cstr(c"[ritz-lsp] Handling exit\n")
+    if s.shutdown_requested != 0
+        return 0  # Clean exit
+    return 1  # Error exit (exit without shutdown)
+
+# Handle textDocument/didOpen
+fn handle_did_open(s: *Server, msg: *LspMessage)
+    if msg.params == null
+        return
+
+    let text_doc: *JsonValue = json_get_field(msg.params, c"textDocument")
+    if text_doc == null
+        return
+
+    let uri_val: *JsonValue = json_get_field(text_doc, c"uri")
+    let text_val: *JsonValue = json_get_field(text_doc, c"text")
+    let version_val: *JsonValue = json_get_field(text_doc, c"version")
+
+    if uri_val == null || text_val == null
+        return
+
+    let uri: *u8 = json_get_string(uri_val)
+    let text: *u8 = json_get_string(text_val)
+    let version: i64 = json_get_number(version_val)
+
+    eprints_cstr(c"[ritz-lsp] Document opened: ")
+    eprints_cstr(uri)
+    eprints_cstr(c"\n")
+
+    document_open(&s.documents, uri, text, version)
+
+    # TODO: Run diagnostics and publish
+
+# Handle textDocument/didChange
+fn handle_did_change(s: *Server, msg: *LspMessage)
+    if msg.params == null
+        return
+
+    let text_doc: *JsonValue = json_get_field(msg.params, c"textDocument")
+    if text_doc == null
+        return
+
+    let uri_val: *JsonValue = json_get_field(text_doc, c"uri")
+    let version_val: *JsonValue = json_get_field(text_doc, c"version")
+
+    # Get content changes (full sync mode - single change with full text)
+    let changes: *JsonValue = json_get_field(msg.params, c"contentChanges")
+    if changes == null || changes.kind != JSON_ARRAY || changes.count == 0
+        return
+
+    let first_change: *JsonValue = json_get_index(changes, 0)
+    if first_change == null
+        return
+
+    let text_val: *JsonValue = json_get_field(first_change, c"text")
+    if text_val == null
+        return
+
+    let uri: *u8 = json_get_string(uri_val)
+    let text: *u8 = json_get_string(text_val)
+    let version: i64 = json_get_number(version_val)
+
+    eprints_cstr(c"[ritz-lsp] Document changed: ")
+    eprints_cstr(uri)
+    eprints_cstr(c"\n")
+
+    document_change(&s.documents, uri, text, version)
+
+    # TODO: Run diagnostics and publish
+
+# Handle textDocument/didClose
+fn handle_did_close(s: *Server, msg: *LspMessage)
+    if msg.params == null
+        return
+
+    let text_doc: *JsonValue = json_get_field(msg.params, c"textDocument")
+    if text_doc == null
+        return
+
+    let uri_val: *JsonValue = json_get_field(text_doc, c"uri")
+    if uri_val == null
+        return
+
+    let uri: *u8 = json_get_string(uri_val)
+
+    eprints_cstr(c"[ritz-lsp] Document closed: ")
+    eprints_cstr(uri)
+    eprints_cstr(c"\n")
+
+    document_close(&s.documents, uri)
+
+# Handle textDocument/hover
+fn handle_hover(s: *Server, msg: *LspMessage)
+    # TODO: Implement hover - for now return null
+    build_response(msg.id, c"null", &s.response_buf)
+    write_message_vec(&s.response_buf)
+
+# Handle textDocument/definition
+fn handle_definition(s: *Server, msg: *LspMessage)
+    # TODO: Implement go to definition - for now return null
+    build_response(msg.id, c"null", &s.response_buf)
+    write_message_vec(&s.response_buf)
+
+# =============================================================================
+# Request Dispatch
+# =============================================================================
+
+pub fn dispatch_message(s: *Server, msg: *LspMessage) -> i32
+    if msg.method == null
+        return 0
+
+    # Check method and dispatch
+    if streq(msg.method, c"initialize") != 0
+        handle_initialize(s, msg)
+    else if streq(msg.method, c"initialized") != 0
+        handle_initialized(s, msg)
+    else if streq(msg.method, c"shutdown") != 0
+        handle_shutdown(s, msg)
+    else if streq(msg.method, c"exit") != 0
+        return handle_exit(s, msg)
+    else if streq(msg.method, c"textDocument/didOpen") != 0
+        handle_did_open(s, msg)
+    else if streq(msg.method, c"textDocument/didChange") != 0
+        handle_did_change(s, msg)
+    else if streq(msg.method, c"textDocument/didClose") != 0
+        handle_did_close(s, msg)
+    else if streq(msg.method, c"textDocument/hover") != 0
+        handle_hover(s, msg)
+    else if streq(msg.method, c"textDocument/definition") != 0
+        handle_definition(s, msg)
+    else
+        eprints_cstr(c"[ritz-lsp] Unknown method: ")
+        eprints_cstr(msg.method)
+        eprints_cstr(c"\n")
+
+        # Return method not found for requests
+        if msg.kind == MSG_REQUEST
+            build_error_response(msg.id, LSP_ERR_METHOD_NOT_FOUND, c"Method not found", &s.response_buf)
+            write_message_vec(&s.response_buf)
+
+    return 0
+
+# =============================================================================
+# Main Server Loop
+# =============================================================================
+
+pub fn server_run(s: *Server) -> i32
+    eprints_cstr(c"[ritz-lsp] Server starting...\n")
+
+    loop
+        let json_str: *u8 = read_message()
+        if json_str == null
+            eprints_cstr(c"[ritz-lsp] Connection closed\n")
+            break
+
+        var msg: LspMessage = parse_message(json_str)
+
+        let exit_code: i32 = dispatch_message(s, &msg)
+
+        lsp_message_free(&msg)
+        free(json_str)
+
+        if s.shutdown_requested != 0 && streq(msg.method, c"exit") != 0
+            return exit_code
+
+    return 0

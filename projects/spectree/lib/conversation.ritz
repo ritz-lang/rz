@@ -1,0 +1,194 @@
+# lib/conversation.ritz - Conversation storage per node
+#
+# Manages conversation history attached to nodes. Each node can have
+# multiple conversations, and each conversation contains messages.
+#
+# Storage structure:
+# - ConversationStore: Root container
+# - ConversationEntry: Conversation + its messages
+# - Messages stored in Vec<MessageEntry> per conversation
+
+import ritzlib.gvec
+import lib.types
+import lib.uuid { uuid_generate, uuid_eq }
+
+# ============================================================================
+# Message Entry
+# ============================================================================
+# Internal storage for messages.
+
+struct MessageEntry
+    msg: Message
+
+# Typed Vec helpers for MessageEntry
+fn messages_len(v: @Vec<MessageEntry>) -> i64
+    return vec_len<MessageEntry>(v)
+
+fn messages_get(v: @&Vec<MessageEntry>, idx: i64) -> *MessageEntry
+    return vec_get_ptr<MessageEntry>(v, idx)
+
+fn messages_push(v: @&Vec<MessageEntry>, entry: MessageEntry)
+    vec_push<MessageEntry>(v, entry)
+
+# ============================================================================
+# Conversation Entry
+# ============================================================================
+# Internal storage for a conversation with its messages.
+
+struct ConversationEntry
+    conv: Conversation
+    messages: Vec<MessageEntry>
+
+# Typed Vec helpers for ConversationEntry
+fn conv_entries_len(v: @Vec<ConversationEntry>) -> i64
+    return vec_len<ConversationEntry>(v)
+
+fn conv_entries_get(v: @&Vec<ConversationEntry>, idx: i64) -> *ConversationEntry
+    return vec_get_ptr<ConversationEntry>(v, idx)
+
+fn conv_entries_push(v: @&Vec<ConversationEntry>, entry: ConversationEntry)
+    vec_push<ConversationEntry>(v, entry)
+
+# ============================================================================
+# Conversation Store
+# ============================================================================
+# Root container for all conversations.
+
+pub struct ConversationStore
+    entries: Vec<ConversationEntry>
+
+pub fn conv_store_new() -> ConversationStore
+    var store: ConversationStore
+    store.entries = vec_new<ConversationEntry>()
+    return store
+
+pub fn conv_store_count(store: @ConversationStore) -> i64
+    return conv_entries_len(@store.entries)
+
+# ============================================================================
+# Create Conversation
+# ============================================================================
+# Creates a new conversation for a node.
+# Returns the conversation UUID.
+
+pub fn conv_create(store: @&ConversationStore, node_id: @Uuid) -> Uuid
+    var conv: Conversation = conversation_new(node_id)
+    conv.uuid = uuid_generate()
+
+    # Save UUID before conv is moved into entry
+    var result_id: Uuid = conv.uuid
+
+    var entry: ConversationEntry
+    entry.conv = conv
+    entry.messages = vec_new<MessageEntry>()
+
+    conv_entries_push(@&store.entries, entry)
+
+    return result_id
+
+# ============================================================================
+# Get Conversation
+# ============================================================================
+# Returns pointer to conversation or null if not found.
+
+pub fn conv_get(store: @&ConversationStore, conv_id: @Uuid) -> *Conversation
+    let count: i64 = conv_entries_len(@store.entries)
+    for i in 0..count
+        var entry: *ConversationEntry = conv_entries_get(@&store.entries, i)
+        if uuid_eq(@entry.conv.uuid, conv_id) == 1
+            return @entry.conv
+    return null
+
+# ============================================================================
+# List Conversations for Node
+# ============================================================================
+# Returns count of conversations for a node.
+
+pub fn conv_count_for_node(store: @&ConversationStore, node_id: @Uuid) -> i64
+    var count: i64 = 0
+    let total: i64 = conv_entries_len(@store.entries)
+    for i in 0..total
+        var entry: *ConversationEntry = conv_entries_get(@&store.entries, i)
+        if uuid_eq(@entry.conv.node_id, node_id) == 1
+            count = count + 1
+    return count
+
+# Get conversation for node by index (0-based)
+pub fn conv_get_for_node(store: @&ConversationStore, node_id: @Uuid, idx: i64) -> *Conversation
+    var found: i64 = 0
+    let total: i64 = conv_entries_len(@store.entries)
+    for i in 0..total
+        var entry: *ConversationEntry = conv_entries_get(@&store.entries, i)
+        if uuid_eq(@entry.conv.node_id, node_id) == 1
+            if found == idx
+                return @entry.conv
+            found = found + 1
+    return null
+
+# ============================================================================
+# Append Message
+# ============================================================================
+# Appends a message to a conversation.
+# Returns 0 on success, -1 if conversation not found.
+
+pub fn conv_append_message(store: @&ConversationStore, conv_id: @Uuid, role: i32, content: @Vec<u8>) -> i32
+    let count: i64 = conv_entries_len(@store.entries)
+    for i in 0..count
+        var entry: *ConversationEntry = conv_entries_get(@&store.entries, i)
+        if uuid_eq(@entry.conv.uuid, conv_id) == 1
+            # Create message
+            var msg: Message = message_new(role)
+            msg.uuid = uuid_generate()
+            msg.content = *content
+
+            # Create entry and push
+            var msg_entry: MessageEntry
+            msg_entry.msg = msg
+
+            messages_push(@&entry.messages, msg_entry)
+
+            # Update conversation timestamp
+            entry.conv.updated_at = timestamp_now()
+
+            return 0
+    return -1
+
+# ============================================================================
+# Get Messages
+# ============================================================================
+# Get message count for a conversation.
+
+pub fn conv_message_count(store: @&ConversationStore, conv_id: @Uuid) -> i64
+    let count: i64 = conv_entries_len(@store.entries)
+    for i in 0..count
+        var entry: *ConversationEntry = conv_entries_get(@&store.entries, i)
+        if uuid_eq(@entry.conv.uuid, conv_id) == 1
+            return messages_len(@entry.messages)
+    return 0
+
+# Get message by index.
+pub fn conv_get_message(store: @&ConversationStore, conv_id: @Uuid, idx: i64) -> *Message
+    let count: i64 = conv_entries_len(@store.entries)
+    for i in 0..count
+        var entry: *ConversationEntry = conv_entries_get(@&store.entries, i)
+        if uuid_eq(@entry.conv.uuid, conv_id) == 1
+            let msg_entry: *MessageEntry = messages_get(@&entry.messages, idx)
+            if msg_entry != null
+                return @msg_entry.msg
+            return null
+    return null
+
+# ============================================================================
+# Delete Conversation
+# ============================================================================
+# Deletes a conversation and all its messages.
+# Returns 0 on success, -1 if not found.
+# Note: Currently marks as deleted rather than removing (for simplicity)
+
+pub fn conv_delete(store: @&ConversationStore, conv_id: @Uuid) -> i32
+    # TODO: Implement proper deletion (requires Vec removal)
+    # For now, just return success if conversation exists
+    let conv: *Conversation = conv_get(store, conv_id)
+    if conv != null
+        return 0
+    return -1

@@ -1,0 +1,879 @@
+# lib/html/tree_builder.ritz - HTML5 Tree Builder
+#
+# Implements HTML5 tree construction algorithm with insertion modes.
+# Receives tokens from tokenizer, emits DOM events to Tempest.
+#
+# Reference: https://html.spec.whatwg.org/multipage/parsing.html#tree-construction
+
+import lib.html.token { Token, TOKEN_START_TAG, TOKEN_END_TAG, TOKEN_CHARACTER, TOKEN_COMMENT, TOKEN_DOCTYPE, TOKEN_EOF }
+import lib.dom.tag { Tag, tag_from_name, tag_is_void, tag_is_formatting, tag_is_special }
+import lib.dom.attribute { Attribute }
+import lib.event { EventHandler, emit_document_start, emit_document_end, emit_element_start, emit_element_end, emit_text, emit_comment, emit_doctype }
+
+# =============================================================================
+# Insertion Modes
+# =============================================================================
+
+pub const MODE_INITIAL: i32 = 0
+pub const MODE_BEFORE_HTML: i32 = 1
+pub const MODE_BEFORE_HEAD: i32 = 2
+pub const MODE_IN_HEAD: i32 = 3
+pub const MODE_IN_HEAD_NOSCRIPT: i32 = 4
+pub const MODE_AFTER_HEAD: i32 = 5
+pub const MODE_IN_BODY: i32 = 6
+pub const MODE_TEXT: i32 = 7
+pub const MODE_IN_TABLE: i32 = 8
+pub const MODE_IN_TABLE_TEXT: i32 = 9
+pub const MODE_IN_CAPTION: i32 = 10
+pub const MODE_IN_COLUMN_GROUP: i32 = 11
+pub const MODE_IN_TABLE_BODY: i32 = 12
+pub const MODE_IN_ROW: i32 = 13
+pub const MODE_IN_CELL: i32 = 14
+pub const MODE_IN_SELECT: i32 = 15
+pub const MODE_IN_SELECT_IN_TABLE: i32 = 16
+pub const MODE_IN_TEMPLATE: i32 = 17
+pub const MODE_AFTER_BODY: i32 = 18
+pub const MODE_IN_FRAMESET: i32 = 19
+pub const MODE_AFTER_FRAMESET: i32 = 20
+pub const MODE_AFTER_AFTER_BODY: i32 = 21
+pub const MODE_AFTER_AFTER_FRAMESET: i32 = 22
+
+# =============================================================================
+# Stack Entry
+# =============================================================================
+
+const MAX_STACK_DEPTH: u32 = 512
+
+pub struct StackEntry
+    tag: Tag
+    # TODO: namespace for SVG/MathML
+
+# =============================================================================
+# Active Formatting Elements
+# =============================================================================
+
+const MAX_FORMATTING_ELEMENTS: u32 = 128
+
+pub const FORMATTING_MARKER: i32 = 0
+pub const FORMATTING_ELEMENT: i32 = 1
+
+pub struct FormattingEntry
+    kind: i32               # FORMATTING_MARKER or FORMATTING_ELEMENT
+    tag: Tag
+    attrs: *Attribute
+    attr_count: u32
+
+# =============================================================================
+# Tree Builder State
+# =============================================================================
+
+pub struct TreeBuilder
+    # Event sink for DOM events
+    sink: EventHandler
+
+    # Current insertion mode
+    mode: i32
+    original_mode: i32      # For returning from TEXT mode
+
+    # Stack of open elements
+    stack: [MAX_STACK_DEPTH]StackEntry
+    stack_len: u32
+
+    # Active formatting elements
+    formatting: [MAX_FORMATTING_ELEMENTS]FormattingEntry
+    formatting_len: u32
+
+    # Special pointers
+    head_element_idx: i32   # -1 if not set
+    form_element_idx: i32   # -1 if not set
+
+    # Flags
+    frameset_ok: i32
+    scripting: i32          # Is scripting enabled?
+    fragment_context: i32   # Are we parsing a fragment?
+
+    # Pending text accumulator
+    pending_text: [4096]u8
+    pending_text_len: u32
+
+# =============================================================================
+# Initialization
+# =============================================================================
+
+pub fn tree_builder_new(sink: EventHandler) -> TreeBuilder
+    var tb: TreeBuilder
+
+    tb.sink = sink
+    tb.mode = MODE_INITIAL
+    tb.original_mode = MODE_INITIAL
+    tb.stack_len = 0
+    tb.formatting_len = 0
+    tb.head_element_idx = -1
+    tb.form_element_idx = -1
+    tb.frameset_ok = 1
+    tb.scripting = 0
+    tb.fragment_context = 0
+    tb.pending_text_len = 0
+
+    tb
+
+# =============================================================================
+# Stack Operations
+# =============================================================================
+
+fn push_element(tb:& TreeBuilder, tag: Tag)
+    if tb.stack_len < MAX_STACK_DEPTH
+        tb.stack[tb.stack_len].tag = tag
+        tb.stack_len = tb.stack_len + 1
+
+fn pop_element(tb:& TreeBuilder) -> Tag
+    if tb.stack_len > 0
+        tb.stack_len = tb.stack_len - 1
+        return tb.stack[tb.stack_len].tag
+    Tag.Unknown("")
+
+fn current_node(tb: TreeBuilder) -> Tag
+    if tb.stack_len > 0
+        return tb.stack[tb.stack_len - 1].tag
+    Tag.Unknown("")
+
+fn stack_has_element_in_scope(tb: TreeBuilder, target: Tag) -> i32
+    # Walk stack from top, check if target is in scope
+    # Scope is bounded by certain elements (table, html, etc.)
+    # TODO: Implement proper scope checking
+    var i = tb.stack_len
+    while i > 0
+        i = i - 1
+        # Simplified: just check if tag matches
+        # Real impl needs scope boundary checking
+        # if tb.stack[i].tag is target
+        #     return 1
+        0  # placeholder
+
+    0
+
+# =============================================================================
+# Formatting Elements
+# =============================================================================
+
+fn push_formatting_element(tb:& TreeBuilder, tag: Tag, attrs: *Attribute, attr_count: u32)
+    if tb.formatting_len < MAX_FORMATTING_ELEMENTS
+        tb.formatting[tb.formatting_len].kind = FORMATTING_ELEMENT
+        tb.formatting[tb.formatting_len].tag = tag
+        tb.formatting[tb.formatting_len].attrs = attrs
+        tb.formatting[tb.formatting_len].attr_count = attr_count
+        tb.formatting_len = tb.formatting_len + 1
+
+fn push_formatting_marker(tb:& TreeBuilder)
+    if tb.formatting_len < MAX_FORMATTING_ELEMENTS
+        tb.formatting[tb.formatting_len].kind = FORMATTING_MARKER
+        tb.formatting_len = tb.formatting_len + 1
+
+fn clear_formatting_to_marker(tb:& TreeBuilder)
+    while tb.formatting_len > 0
+        tb.formatting_len = tb.formatting_len - 1
+        if tb.formatting[tb.formatting_len].kind == FORMATTING_MARKER
+            break
+
+fn reconstruct_active_formatting(tb:& TreeBuilder)
+    # TODO: Implement adoption agency adjacent algorithm
+    # For now, stub
+    0
+
+# =============================================================================
+# Pending Text
+# =============================================================================
+
+fn flush_pending_text(tb:& TreeBuilder)
+    if tb.pending_text_len > 0
+        let text = StrView {
+            data: @tb.pending_text[0],
+            len: tb.pending_text_len as u64
+        }
+        emit_text(tb.sink, text)
+        tb.pending_text_len = 0
+
+fn append_pending_text(tb:& TreeBuilder, c: u8)
+    if tb.pending_text_len < 4096
+        tb.pending_text[tb.pending_text_len] = c
+        tb.pending_text_len = tb.pending_text_len + 1
+
+# =============================================================================
+# Token Processing - Main Entry Point
+# =============================================================================
+
+pub fn tree_builder_process_token(tb:& TreeBuilder, token: Token)
+    match tb.mode
+        MODE_INITIAL => process_initial(tb, token)
+        MODE_BEFORE_HTML => process_before_html(tb, token)
+        MODE_BEFORE_HEAD => process_before_head(tb, token)
+        MODE_IN_HEAD => process_in_head(tb, token)
+        MODE_AFTER_HEAD => process_after_head(tb, token)
+        MODE_IN_BODY => process_in_body(tb, token)
+        MODE_TEXT => process_text(tb, token)
+        MODE_IN_TABLE => process_in_table(tb, token)
+        MODE_IN_TABLE_BODY => process_in_table_body(tb, token)
+        MODE_IN_ROW => process_in_row(tb, token)
+        MODE_IN_CELL => process_in_cell(tb, token)
+        MODE_IN_SELECT => process_in_select(tb, token)
+        MODE_AFTER_BODY => process_after_body(tb, token)
+        MODE_AFTER_AFTER_BODY => process_after_after_body(tb, token)
+        _ => process_in_body(tb, token)  # Default fallback
+
+# =============================================================================
+# Insertion Mode Handlers
+# =============================================================================
+
+fn process_initial(tb:& TreeBuilder, token: Token)
+    if token.kind == TOKEN_DOCTYPE
+        emit_doctype(tb.sink, token.doctype.name, token.doctype.public_id, token.doctype.system_id)
+        tb.mode = MODE_BEFORE_HTML
+    else if token.kind == TOKEN_CHARACTER
+        # Ignore whitespace
+        let c = token.character.char
+        if c == 32 or c == 9 or c == 10 or c == 13 or c == 12
+            return
+        # Otherwise, reprocess in before_html
+        tb.mode = MODE_BEFORE_HTML
+        process_before_html(tb, token)
+    else
+        # Missing DOCTYPE, but continue anyway
+        tb.mode = MODE_BEFORE_HTML
+        process_before_html(tb, token)
+
+fn process_before_html(tb:& TreeBuilder, token: Token)
+    if token.kind == TOKEN_DOCTYPE
+        # Parse error, ignore
+        return
+    else if token.kind == TOKEN_COMMENT
+        emit_comment(tb.sink, token.comment.data)
+    else if token.kind == TOKEN_CHARACTER
+        let c = token.character.char
+        if c == 32 or c == 9 or c == 10 or c == 13 or c == 12
+            return  # Ignore whitespace
+        # Fall through to insert html element
+        insert_html_element(tb)
+        tb.mode = MODE_BEFORE_HEAD
+        process_before_head(tb, token)
+    else if token.kind == TOKEN_START_TAG
+        if token.start_tag.name == "html"
+            emit_element_start(tb.sink, Tag.Html, token.start_tag.attrs, token.start_tag.attr_count, 0)
+            push_element(tb, Tag.Html)
+            tb.mode = MODE_BEFORE_HEAD
+        else
+            insert_html_element(tb)
+            tb.mode = MODE_BEFORE_HEAD
+            process_before_head(tb, token)
+    else if token.kind == TOKEN_END_TAG
+        let name = token.end_tag.name
+        if name == "head" or name == "body" or name == "html" or name == "br"
+            insert_html_element(tb)
+            tb.mode = MODE_BEFORE_HEAD
+            process_before_head(tb, token)
+        # else: parse error, ignore
+    else if token.kind == TOKEN_EOF
+        insert_html_element(tb)
+        tb.mode = MODE_BEFORE_HEAD
+        process_before_head(tb, token)
+
+fn insert_html_element(tb:& TreeBuilder)
+    emit_element_start(tb.sink, Tag.Html, null, 0, 0)
+    push_element(tb, Tag.Html)
+
+fn process_before_head(tb:& TreeBuilder, token: Token)
+    if token.kind == TOKEN_CHARACTER
+        let c = token.character.char
+        if c == 32 or c == 9 or c == 10 or c == 13 or c == 12
+            return
+        # Fall through
+        insert_head_element(tb)
+        tb.mode = MODE_IN_HEAD
+        process_in_head(tb, token)
+    else if token.kind == TOKEN_COMMENT
+        emit_comment(tb.sink, token.comment.data)
+    else if token.kind == TOKEN_DOCTYPE
+        # Parse error, ignore
+        return
+    else if token.kind == TOKEN_START_TAG
+        if token.start_tag.name == "html"
+            process_in_body(tb, token)
+        else if token.start_tag.name == "head"
+            emit_element_start(tb.sink, Tag.Head, token.start_tag.attrs, token.start_tag.attr_count, 0)
+            push_element(tb, Tag.Head)
+            tb.head_element_idx = tb.stack_len as i32 - 1
+            tb.mode = MODE_IN_HEAD
+        else
+            insert_head_element(tb)
+            tb.mode = MODE_IN_HEAD
+            process_in_head(tb, token)
+    else if token.kind == TOKEN_END_TAG
+        let name = token.end_tag.name
+        if name == "head" or name == "body" or name == "html" or name == "br"
+            insert_head_element(tb)
+            tb.mode = MODE_IN_HEAD
+            process_in_head(tb, token)
+    else
+        insert_head_element(tb)
+        tb.mode = MODE_IN_HEAD
+        process_in_head(tb, token)
+
+fn insert_head_element(tb:& TreeBuilder)
+    emit_element_start(tb.sink, Tag.Head, null, 0, 0)
+    push_element(tb, Tag.Head)
+    tb.head_element_idx = tb.stack_len as i32 - 1
+
+fn process_in_head(tb:& TreeBuilder, token: Token)
+    if token.kind == TOKEN_CHARACTER
+        let c = token.character.char
+        if c == 32 or c == 9 or c == 10 or c == 13 or c == 12
+            append_pending_text(tb, c as u8)
+            return
+        # Non-whitespace falls through
+        pop_head_and_continue(tb, token)
+    else if token.kind == TOKEN_COMMENT
+        emit_comment(tb.sink, token.comment.data)
+    else if token.kind == TOKEN_DOCTYPE
+        # Parse error, ignore
+        return
+    else if token.kind == TOKEN_START_TAG
+        let name = token.start_tag.name
+        let tag = tag_from_name(name)
+
+        if name == "html"
+            process_in_body(tb, token)
+        else if name == "base" or name == "basefont" or name == "bgsound" or name == "link"
+            # Self-closing head elements
+            emit_element_start(tb.sink, tag, token.start_tag.attrs, token.start_tag.attr_count, 1)
+        else if name == "meta"
+            emit_element_start(tb.sink, Tag.Meta, token.start_tag.attrs, token.start_tag.attr_count, 1)
+        else if name == "title"
+            # Parse RCDATA
+            emit_element_start(tb.sink, Tag.Title, token.start_tag.attrs, token.start_tag.attr_count, 0)
+            push_element(tb, Tag.Title)
+            # TODO: Switch tokenizer to RCDATA mode
+            tb.original_mode = MODE_IN_HEAD
+            tb.mode = MODE_TEXT
+        else if name == "style"
+            emit_element_start(tb.sink, Tag.Style, token.start_tag.attrs, token.start_tag.attr_count, 0)
+            push_element(tb, Tag.Style)
+            tb.original_mode = MODE_IN_HEAD
+            tb.mode = MODE_TEXT
+        else if name == "script"
+            emit_element_start(tb.sink, Tag.Script, token.start_tag.attrs, token.start_tag.attr_count, 0)
+            push_element(tb, Tag.Script)
+            tb.original_mode = MODE_IN_HEAD
+            tb.mode = MODE_TEXT
+        else if name == "noscript"
+            if tb.scripting == 1
+                # TODO: Handle scripting enabled case
+                0
+            else
+                emit_element_start(tb.sink, Tag.Noscript, token.start_tag.attrs, token.start_tag.attr_count, 0)
+                push_element(tb, Tag.Noscript)
+                tb.mode = MODE_IN_HEAD_NOSCRIPT
+        else if name == "head"
+            # Parse error, ignore
+            return
+        else
+            pop_head_and_continue(tb, token)
+
+    else if token.kind == TOKEN_END_TAG
+        let name = token.end_tag.name
+        if name == "head"
+            flush_pending_text(tb)
+            emit_element_end(tb.sink, Tag.Head)
+            pop_element(tb)
+            tb.mode = MODE_AFTER_HEAD
+        else if name == "body" or name == "html" or name == "br"
+            pop_head_and_continue(tb, token)
+        else
+            # Parse error, ignore
+            return
+    else
+        pop_head_and_continue(tb, token)
+
+fn pop_head_and_continue(tb:& TreeBuilder, token: Token)
+    flush_pending_text(tb)
+    emit_element_end(tb.sink, Tag.Head)
+    pop_element(tb)
+    tb.mode = MODE_AFTER_HEAD
+    process_after_head(tb, token)
+
+fn process_after_head(tb:& TreeBuilder, token: Token)
+    if token.kind == TOKEN_CHARACTER
+        let c = token.character.char
+        if c == 32 or c == 9 or c == 10 or c == 13 or c == 12
+            append_pending_text(tb, c as u8)
+            return
+        insert_body_and_continue(tb, token)
+    else if token.kind == TOKEN_COMMENT
+        emit_comment(tb.sink, token.comment.data)
+    else if token.kind == TOKEN_DOCTYPE
+        # Parse error, ignore
+        return
+    else if token.kind == TOKEN_START_TAG
+        let name = token.start_tag.name
+        if name == "html"
+            process_in_body(tb, token)
+        else if name == "body"
+            flush_pending_text(tb)
+            emit_element_start(tb.sink, Tag.Body, token.start_tag.attrs, token.start_tag.attr_count, 0)
+            push_element(tb, Tag.Body)
+            tb.frameset_ok = 0
+            tb.mode = MODE_IN_BODY
+        else if name == "frameset"
+            flush_pending_text(tb)
+            emit_element_start(tb.sink, Tag.Frameset, token.start_tag.attrs, token.start_tag.attr_count, 0)
+            push_element(tb, Tag.Frameset)
+            tb.mode = MODE_IN_FRAMESET
+        else if name == "base" or name == "basefont" or name == "bgsound" or name == "link" or name == "meta" or name == "noframes" or name == "script" or name == "style" or name == "template" or name == "title"
+            # Parse error: element in wrong place
+            # Push back to head and process
+            tb.mode = MODE_IN_HEAD
+            process_in_head(tb, token)
+        else if name == "head"
+            # Parse error, ignore
+            return
+        else
+            insert_body_and_continue(tb, token)
+    else if token.kind == TOKEN_END_TAG
+        let name = token.end_tag.name
+        if name == "template"
+            process_in_head(tb, token)
+        else if name == "body" or name == "html" or name == "br"
+            insert_body_and_continue(tb, token)
+        else
+            # Parse error, ignore
+            return
+    else
+        insert_body_and_continue(tb, token)
+
+fn insert_body_and_continue(tb:& TreeBuilder, token: Token)
+    flush_pending_text(tb)
+    emit_element_start(tb.sink, Tag.Body, null, 0, 0)
+    push_element(tb, Tag.Body)
+    tb.frameset_ok = 1
+    tb.mode = MODE_IN_BODY
+    process_in_body(tb, token)
+
+fn process_in_body(tb:& TreeBuilder, token: Token)
+    if token.kind == TOKEN_CHARACTER
+        let c = token.character.char
+        if c == 0
+            # Parse error, ignore null
+            return
+        reconstruct_active_formatting(tb)
+        append_pending_text(tb, c as u8)
+        if c != 32 and c != 9 and c != 10 and c != 13 and c != 12
+            tb.frameset_ok = 0
+
+    else if token.kind == TOKEN_COMMENT
+        flush_pending_text(tb)
+        emit_comment(tb.sink, token.comment.data)
+
+    else if token.kind == TOKEN_DOCTYPE
+        # Parse error, ignore
+        return
+
+    else if token.kind == TOKEN_START_TAG
+        flush_pending_text(tb)
+        process_start_tag_in_body(tb, token)
+
+    else if token.kind == TOKEN_END_TAG
+        flush_pending_text(tb)
+        process_end_tag_in_body(tb, token)
+
+    else if token.kind == TOKEN_EOF
+        flush_pending_text(tb)
+        # Check for unclosed elements
+        # For now, just emit document end
+        close_all_elements(tb)
+
+fn process_start_tag_in_body(tb:& TreeBuilder, token: Token)
+    let name = token.start_tag.name
+    let tag = tag_from_name(name)
+
+    if name == "html"
+        # Merge attributes into existing html element
+        # For now, ignore
+        return
+
+    else if name == "base" or name == "basefont" or name == "bgsound" or name == "link" or name == "meta" or name == "noframes" or name == "script" or name == "style" or name == "template" or name == "title"
+        process_in_head(tb, token)
+
+    else if name == "body"
+        # Parse error: second body
+        # Merge attributes
+        return
+
+    else if name == "frameset"
+        # Complex rules for frameset
+        return
+
+    else if name == "address" or name == "article" or name == "aside" or name == "blockquote" or name == "center" or name == "details" or name == "dialog" or name == "dir" or name == "div" or name == "dl" or name == "fieldset" or name == "figcaption" or name == "figure" or name == "footer" or name == "header" or name == "hgroup" or name == "main" or name == "menu" or name == "nav" or name == "ol" or name == "p" or name == "search" or name == "section" or name == "summary" or name == "ul"
+        # Close any open <p> in button scope
+        if has_p_in_button_scope(tb) == 1
+            close_p_element(tb)
+        emit_element_start(tb.sink, tag, token.start_tag.attrs, token.start_tag.attr_count, 0)
+        push_element(tb, tag)
+
+    else if name == "h1" or name == "h2" or name == "h3" or name == "h4" or name == "h5" or name == "h6"
+        if has_p_in_button_scope(tb) == 1
+            close_p_element(tb)
+        # Check for nesting h1-h6
+        emit_element_start(tb.sink, tag, token.start_tag.attrs, token.start_tag.attr_count, 0)
+        push_element(tb, tag)
+
+    else if name == "pre" or name == "listing"
+        if has_p_in_button_scope(tb) == 1
+            close_p_element(tb)
+        emit_element_start(tb.sink, tag, token.start_tag.attrs, token.start_tag.attr_count, 0)
+        push_element(tb, tag)
+        tb.frameset_ok = 0
+        # TODO: Skip next newline
+
+    else if name == "form"
+        if tb.form_element_idx >= 0 and stack_has_template(tb) == 0
+            # Parse error, ignore
+            return
+        if has_p_in_button_scope(tb) == 1
+            close_p_element(tb)
+        emit_element_start(tb.sink, Tag.Form, token.start_tag.attrs, token.start_tag.attr_count, 0)
+        push_element(tb, Tag.Form)
+        if stack_has_template(tb) == 0
+            tb.form_element_idx = tb.stack_len as i32 - 1
+
+    else if name == "li"
+        tb.frameset_ok = 0
+        # TODO: Close previous <li> if any
+        if has_p_in_button_scope(tb) == 1
+            close_p_element(tb)
+        emit_element_start(tb.sink, Tag.Li, token.start_tag.attrs, token.start_tag.attr_count, 0)
+        push_element(tb, Tag.Li)
+
+    else if name == "dd" or name == "dt"
+        tb.frameset_ok = 0
+        # TODO: Close previous <dd>/<dt> if any
+        if has_p_in_button_scope(tb) == 1
+            close_p_element(tb)
+        emit_element_start(tb.sink, tag, token.start_tag.attrs, token.start_tag.attr_count, 0)
+        push_element(tb, tag)
+
+    else if name == "a"
+        # TODO: Check for existing <a> in formatting elements
+        reconstruct_active_formatting(tb)
+        emit_element_start(tb.sink, Tag.A, token.start_tag.attrs, token.start_tag.attr_count, 0)
+        push_element(tb, Tag.A)
+        push_formatting_element(tb, Tag.A, token.start_tag.attrs, token.start_tag.attr_count)
+
+    else if name == "b" or name == "big" or name == "code" or name == "em" or name == "font" or name == "i" or name == "s" or name == "small" or name == "strike" or name == "strong" or name == "tt" or name == "u"
+        reconstruct_active_formatting(tb)
+        emit_element_start(tb.sink, tag, token.start_tag.attrs, token.start_tag.attr_count, 0)
+        push_element(tb, tag)
+        push_formatting_element(tb, tag, token.start_tag.attrs, token.start_tag.attr_count)
+
+    else if name == "nobr"
+        reconstruct_active_formatting(tb)
+        # TODO: Check for nobr in scope, run adoption agency
+        emit_element_start(tb.sink, tag, token.start_tag.attrs, token.start_tag.attr_count, 0)
+        push_element(tb, tag)
+        push_formatting_element(tb, tag, token.start_tag.attrs, token.start_tag.attr_count)
+
+    else if name == "table"
+        # TODO: Close <p> in button scope if not quirks mode
+        if has_p_in_button_scope(tb) == 1
+            close_p_element(tb)
+        emit_element_start(tb.sink, Tag.Table, token.start_tag.attrs, token.start_tag.attr_count, 0)
+        push_element(tb, Tag.Table)
+        tb.frameset_ok = 0
+        tb.mode = MODE_IN_TABLE
+
+    else if name == "area" or name == "br" or name == "embed" or name == "img" or name == "keygen" or name == "wbr"
+        reconstruct_active_formatting(tb)
+        emit_element_start(tb.sink, tag, token.start_tag.attrs, token.start_tag.attr_count, 1)
+        tb.frameset_ok = 0
+
+    else if name == "input"
+        reconstruct_active_formatting(tb)
+        emit_element_start(tb.sink, Tag.Input, token.start_tag.attrs, token.start_tag.attr_count, 1)
+        # Check if type=hidden, affects frameset_ok
+        tb.frameset_ok = 0
+
+    else if name == "hr"
+        if has_p_in_button_scope(tb) == 1
+            close_p_element(tb)
+        emit_element_start(tb.sink, Tag.Hr, token.start_tag.attrs, token.start_tag.attr_count, 1)
+        tb.frameset_ok = 0
+
+    else if name == "textarea"
+        emit_element_start(tb.sink, Tag.Textarea, token.start_tag.attrs, token.start_tag.attr_count, 0)
+        push_element(tb, Tag.Textarea)
+        # TODO: Skip next newline, switch to RCDATA
+        tb.frameset_ok = 0
+        tb.original_mode = tb.mode
+        tb.mode = MODE_TEXT
+
+    else if name == "iframe"
+        tb.frameset_ok = 0
+        emit_element_start(tb.sink, Tag.Iframe, token.start_tag.attrs, token.start_tag.attr_count, 0)
+        push_element(tb, Tag.Iframe)
+        tb.original_mode = tb.mode
+        tb.mode = MODE_TEXT
+
+    else if name == "select"
+        reconstruct_active_formatting(tb)
+        emit_element_start(tb.sink, Tag.Select, token.start_tag.attrs, token.start_tag.attr_count, 0)
+        push_element(tb, Tag.Select)
+        tb.frameset_ok = 0
+        if tb.mode == MODE_IN_TABLE or tb.mode == MODE_IN_CAPTION or tb.mode == MODE_IN_TABLE_BODY or tb.mode == MODE_IN_ROW or tb.mode == MODE_IN_CELL
+            tb.mode = MODE_IN_SELECT_IN_TABLE
+        else
+            tb.mode = MODE_IN_SELECT
+
+    else if name == "optgroup" or name == "option"
+        # Close previous option if open
+        emit_element_start(tb.sink, tag, token.start_tag.attrs, token.start_tag.attr_count, 0)
+        push_element(tb, tag)
+
+    else
+        # Generic element
+        reconstruct_active_formatting(tb)
+        emit_element_start(tb.sink, tag, token.start_tag.attrs, token.start_tag.attr_count, 0)
+        push_element(tb, tag)
+
+fn process_end_tag_in_body(tb:& TreeBuilder, token: Token)
+    let name = token.end_tag.name
+    let tag = tag_from_name(name)
+
+    if name == "template"
+        process_in_head(tb, token)
+
+    else if name == "body"
+        if stack_has_element_in_scope(tb, Tag.Body) == 0
+            # Parse error, ignore
+            return
+        tb.mode = MODE_AFTER_BODY
+
+    else if name == "html"
+        if stack_has_element_in_scope(tb, Tag.Body) == 0
+            return
+        tb.mode = MODE_AFTER_BODY
+        process_after_body(tb, token)
+
+    else if name == "address" or name == "article" or name == "aside" or name == "blockquote" or name == "button" or name == "center" or name == "details" or name == "dialog" or name == "dir" or name == "div" or name == "dl" or name == "fieldset" or name == "figcaption" or name == "figure" or name == "footer" or name == "header" or name == "hgroup" or name == "listing" or name == "main" or name == "menu" or name == "nav" or name == "ol" or name == "pre" or name == "search" or name == "section" or name == "summary" or name == "ul"
+        # Close element
+        if stack_has_element_in_scope(tb, tag) == 0
+            # Parse error, ignore
+            return
+        # Pop until we find matching tag
+        close_element(tb, tag)
+
+    else if name == "form"
+        # Complex form handling
+        if stack_has_template(tb) == 0
+            # No template case
+            tb.form_element_idx = -1
+        close_element(tb, Tag.Form)
+
+    else if name == "p"
+        if has_p_in_button_scope(tb) == 0
+            # Parse error, insert empty p
+            emit_element_start(tb.sink, Tag.P, null, 0, 0)
+            push_element(tb, Tag.P)
+        close_p_element(tb)
+
+    else if name == "li"
+        if stack_has_element_in_list_scope(tb, Tag.Li) == 0
+            return
+        close_element(tb, Tag.Li)
+
+    else if name == "dd" or name == "dt"
+        if stack_has_element_in_scope(tb, tag) == 0
+            return
+        close_element(tb, tag)
+
+    else if name == "h1" or name == "h2" or name == "h3" or name == "h4" or name == "h5" or name == "h6"
+        # Check if any h1-h6 in scope
+        close_element(tb, tag)
+
+    else if name == "a" or name == "b" or name == "big" or name == "code" or name == "em" or name == "font" or name == "i" or name == "nobr" or name == "s" or name == "small" or name == "strike" or name == "strong" or name == "tt" or name == "u"
+        # Adoption agency algorithm
+        run_adoption_agency(tb, tag)
+
+    else if name == "br"
+        # Parse error: </br> treated as <br>
+        reconstruct_active_formatting(tb)
+        emit_element_start(tb.sink, Tag.Br, null, 0, 1)
+        tb.frameset_ok = 0
+
+    else
+        # Any other end tag - walk up stack
+        close_element_any(tb, tag)
+
+fn process_text(tb:& TreeBuilder, token: Token)
+    if token.kind == TOKEN_CHARACTER
+        append_pending_text(tb, token.character.char as u8)
+    else if token.kind == TOKEN_EOF
+        # Parse error
+        flush_pending_text(tb)
+        pop_element(tb)
+        tb.mode = tb.original_mode
+        tree_builder_process_token(tb, token)
+    else if token.kind == TOKEN_END_TAG
+        flush_pending_text(tb)
+        let tag = current_node(@tb)
+        emit_element_end(tb.sink, tag)
+        pop_element(tb)
+        tb.mode = tb.original_mode
+
+fn process_in_table(tb:& TreeBuilder, token: Token)
+    # TODO: Implement table parsing
+    # For now, foster parent into body
+    process_in_body(tb, token)
+
+fn process_in_table_body(tb:& TreeBuilder, token: Token)
+    # TODO: Implement
+    process_in_body(tb, token)
+
+fn process_in_row(tb:& TreeBuilder, token: Token)
+    # TODO: Implement
+    process_in_body(tb, token)
+
+fn process_in_cell(tb:& TreeBuilder, token: Token)
+    # TODO: Implement
+    process_in_body(tb, token)
+
+fn process_in_select(tb:& TreeBuilder, token: Token)
+    # TODO: Implement
+    if token.kind == TOKEN_CHARACTER
+        append_pending_text(tb, token.character.char as u8)
+    else if token.kind == TOKEN_START_TAG
+        let name = token.start_tag.name
+        if name == "option"
+            # Close previous option
+            emit_element_start(tb.sink, Tag.Option, token.start_tag.attrs, token.start_tag.attr_count, 0)
+            push_element(tb, Tag.Option)
+    else if token.kind == TOKEN_END_TAG
+        let name = token.end_tag.name
+        if name == "select"
+            flush_pending_text(tb)
+            close_element(tb, Tag.Select)
+            tb.mode = MODE_IN_BODY
+
+fn process_after_body(tb:& TreeBuilder, token: Token)
+    if token.kind == TOKEN_CHARACTER
+        let c = token.character.char
+        if c == 32 or c == 9 or c == 10 or c == 13 or c == 12
+            process_in_body(tb, token)
+            return
+        tb.mode = MODE_IN_BODY
+        process_in_body(tb, token)
+    else if token.kind == TOKEN_COMMENT
+        emit_comment(tb.sink, token.comment.data)
+    else if token.kind == TOKEN_DOCTYPE
+        # Parse error, ignore
+        return
+    else if token.kind == TOKEN_START_TAG
+        if token.start_tag.name == "html"
+            process_in_body(tb, token)
+        else
+            tb.mode = MODE_IN_BODY
+            process_in_body(tb, token)
+    else if token.kind == TOKEN_END_TAG
+        if token.end_tag.name == "html"
+            tb.mode = MODE_AFTER_AFTER_BODY
+        else
+            tb.mode = MODE_IN_BODY
+            process_in_body(tb, token)
+    else if token.kind == TOKEN_EOF
+        close_all_elements(tb)
+
+fn process_after_after_body(tb:& TreeBuilder, token: Token)
+    if token.kind == TOKEN_COMMENT
+        emit_comment(tb.sink, token.comment.data)
+    else if token.kind == TOKEN_DOCTYPE
+        process_in_body(tb, token)
+    else if token.kind == TOKEN_CHARACTER
+        let c = token.character.char
+        if c == 32 or c == 9 or c == 10 or c == 13 or c == 12
+            process_in_body(tb, token)
+            return
+        tb.mode = MODE_IN_BODY
+        process_in_body(tb, token)
+    else if token.kind == TOKEN_START_TAG
+        if token.start_tag.name == "html"
+            process_in_body(tb, token)
+        else
+            tb.mode = MODE_IN_BODY
+            process_in_body(tb, token)
+    else if token.kind == TOKEN_EOF
+        close_all_elements(tb)
+
+# =============================================================================
+# Helper Functions
+# =============================================================================
+
+fn has_p_in_button_scope(tb: TreeBuilder) -> i32
+    # Walk stack looking for <p>, bounded by button scope elements
+    var i = tb.stack_len
+    while i > 0
+        i = i - 1
+        let tag = tb.stack[i].tag
+        if tag == Tag.P
+            return 1
+        if tag == Tag.Button or tag == Tag.Address or tag == Tag.Div
+            return 0
+    0
+
+fn stack_has_template(tb: TreeBuilder) -> i32
+    var i = tb.stack_len
+    while i > 0
+        i = i - 1
+            Tag.Template => return 1
+            _ => 0
+    0
+
+fn stack_has_element_in_list_scope(tb: TreeBuilder, target: Tag) -> i32
+    # Similar to scope but with list-specific boundaries
+    stack_has_element_in_scope(tb, target)
+
+fn close_p_element(tb:& TreeBuilder)
+    # Pop elements until we pop <p>
+    emit_element_end(tb.sink, Tag.P)
+    while tb.stack_len > 0
+        let tag = pop_element(tb)
+            Tag.P => break
+            _ =>
+                emit_element_end(tb.sink, tag)
+
+fn close_element(tb:& TreeBuilder, target: Tag)
+    # Pop until we find target
+    while tb.stack_len > 0
+        let tag = current_node(@tb)
+        emit_element_end(tb.sink, tag)
+        pop_element(tb)
+        # TODO: proper tag comparison
+        break  # Simplified
+
+fn close_element_any(tb:& TreeBuilder, target: Tag)
+    # Walk up stack, pop if found
+    close_element(tb, target)
+
+fn run_adoption_agency(tb:& TreeBuilder, tag: Tag)
+    # TODO: Implement full adoption agency algorithm
+    # For now, just close the element
+    close_element(tb, tag)
+
+fn close_all_elements(tb:& TreeBuilder)
+    while tb.stack_len > 0
+        let tag = pop_element(tb)
+        emit_element_end(tb.sink, tag)
+    emit_document_end(tb.sink)
+
+# =============================================================================
+# High-Level API
+# =============================================================================
+
+pub fn tree_builder_finish(tb:& TreeBuilder)
+    flush_pending_text(tb)
+    close_all_elements(tb)

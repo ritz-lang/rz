@@ -1,0 +1,353 @@
+# src/presenters/page_presenter.ritz - Page HTTP handlers
+#
+# HTTP handlers for wiki page operations.
+# These functions are registered as Valet route handlers.
+
+import ritzlib.sys { print, prints }
+import ritzlib.str { String, str_from_view }
+import ritzlib.memory
+
+import valet.valet {
+    get_g_ctx,
+    HandlerContext
+}
+import valet.response {
+    Response,
+    response_status,
+    response_header,
+    response_body,
+    response_body_html,
+    response_body_json
+}
+import valet.router { route_match_param }
+
+import services {
+    WikiService,
+    wiki_service_get_page,
+    wiki_service_create_page,
+    wiki_service_update_content,
+    wiki_service_delete_page
+}
+import errors.nexus_error { nexus_error_status_code, nexus_error_message }
+import errors.service_error { ServiceError }
+
+
+# Global wiki service pointer (set during initialization)
+var g_wiki_service: i64 = 0
+
+# Set the global wiki service
+pub fn page_presenter_init(svc: *WikiService)
+    g_wiki_service = svc as i64
+
+
+# Get the global wiki service
+fn get_service() -> *WikiService
+    g_wiki_service as *WikiService
+
+
+# ============================================================================
+# Route handlers
+# ============================================================================
+
+# GET / - Home page
+pub fn handle_index(buf: *u8, len: i32) -> i32
+    let ctx = get_g_ctx()
+    if ctx == null
+        return -1
+
+    # Render home page HTML
+    let html = s"<!DOCTYPE html>
+<html>
+<head>
+    <meta charset=\"UTF-8\">
+    <title>Nexus - The Ritz Knowledge Base</title>
+    <style>
+        body { font-family: system-ui, sans-serif; max-width: 800px; margin: 2rem auto; padding: 0 1rem; }
+        h1 { color: #333; }
+        a { color: #0066cc; }
+        .status { background: #f0f0f0; padding: 1rem; border-radius: 4px; }
+    </style>
+</head>
+<body>
+    <h1>Nexus</h1>
+    <p>Welcome to Nexus, the Ritz Knowledge Base.</p>
+    <div class=\"status\">
+        <h2>Stack Status</h2>
+        <ul>
+            <li>Valet (HTTP) - Running</li>
+            <li>Mausoleum (Storage) - Connected</li>
+            <li>Tome (Cache) - Connected</li>
+        </ul>
+    </div>
+    <h2>Documentation</h2>
+    <ul>
+        <li><a href=\"/language\">Language Reference</a></li>
+        <li><a href=\"/stdlib\">Standard Library</a></li>
+        <li><a href=\"/ecosystem\">Ecosystem Projects</a></li>
+    </ul>
+</body>
+</html>"
+
+    response_status(ctx.res, 200)
+    response_body_html(ctx.res, html.ptr() as *u8, html.len() as i32)
+    0
+
+
+# GET /:slug - View a wiki page
+pub fn handle_page_view(buf: *u8, len: i32) -> i32
+    let ctx = get_g_ctx()
+    if ctx == null
+        return -1
+
+    # Extract slug from route parameters
+    var slug_ptr: *u8 = null
+    var slug_len: i32 = 0
+    let found = route_match_param(ctx.route_result, c"slug", @slug_ptr, @slug_len)
+    if found == 0
+        response_status(ctx.res, 400)
+        response_body(ctx.res, c"Missing slug parameter", 22)
+        return 0
+
+    let slug = span_from_raw(slug_ptr, slug_len)
+
+    # Get page from service
+    let svc = get_service()
+    match wiki_service_get_page(svc, slug)
+        Ok(page) =>
+            render_page(ctx.res, @page)
+        Err(ServiceError.NotFound) =>
+            render_not_found(ctx.res, slug)
+        Err(e) =>
+            render_error(ctx.res, @e)
+
+    0
+
+
+# GET /:slug/edit - Edit page form
+pub fn handle_page_edit(buf: *u8, len: i32) -> i32
+    let ctx = get_g_ctx()
+    if ctx == null
+        return -1
+
+    var slug_ptr: *u8 = null
+    var slug_len: i32 = 0
+    let found = route_match_param(ctx.route_result, c"slug", @slug_ptr, @slug_len)
+    if found == 0
+        response_status(ctx.res, 400)
+        response_body(ctx.res, c"Missing slug parameter", 22)
+        return 0
+
+    let slug = span_from_raw(slug_ptr, slug_len)
+    let svc = get_service()
+
+    match wiki_service_get_page(svc, slug)
+        Ok(page) =>
+            render_edit_form(ctx.res, @page)
+        Err(ServiceError.NotFound) =>
+            # Show create form for new page
+            render_create_form(ctx.res, slug)
+        Err(e) =>
+            render_error(ctx.res, @e)
+
+    0
+
+
+# POST /:slug - Save page content
+pub fn handle_page_save(buf: *u8, len: i32) -> i32
+    let ctx = get_g_ctx()
+    if ctx == null
+        return -1
+
+    var slug_ptr: *u8 = null
+    var slug_len: i32 = 0
+    let found = route_match_param(ctx.route_result, c"slug", @slug_ptr, @slug_len)
+    if found == 0
+        response_status(ctx.res, 400)
+        response_body(ctx.res, c"Missing slug parameter", 22)
+        return 0
+
+    let slug = span_from_raw(slug_ptr, slug_len)
+
+    # TODO: Parse form body for title and content
+    # For now, return 501 Not Implemented
+    response_status(ctx.res, 501)
+    response_body(ctx.res, c"Form parsing not yet implemented", 33)
+    0
+
+
+# DELETE /:slug - Delete a page
+pub fn handle_page_delete(buf: *u8, len: i32) -> i32
+    let ctx = get_g_ctx()
+    if ctx == null
+        return -1
+
+    var slug_ptr: *u8 = null
+    var slug_len: i32 = 0
+    let found = route_match_param(ctx.route_result, c"slug", @slug_ptr, @slug_len)
+    if found == 0
+        response_status(ctx.res, 400)
+        response_body(ctx.res, c"Missing slug parameter", 22)
+        return 0
+
+    let slug = span_from_raw(slug_ptr, slug_len)
+    let svc = get_service()
+
+    match wiki_service_delete_page(svc, slug)
+        Ok(_) =>
+            response_status(ctx.res, 204)  # No Content
+        Err(ServiceError.NotFound) =>
+            response_status(ctx.res, 404)
+            response_body(ctx.res, c"Page not found", 14)
+        Err(e) =>
+            render_error(ctx.res, @e)
+
+    0
+
+
+# GET /health - Health check endpoint
+pub fn handle_health(buf: *u8, len: i32) -> i32
+    let ctx = get_g_ctx()
+    if ctx == null
+        return -1
+
+    response_status(ctx.res, 200)
+    response_body(ctx.res, c"OK", 2)
+    0
+
+
+# ============================================================================
+# Rendering helpers
+# ============================================================================
+
+# Render a wiki page as HTML
+fn render_page(res: *Response, page: *WikiPage)
+    # TODO: Implement proper Markdown rendering
+    # For now, just wrap content in basic HTML
+
+    var html_buf: [16384]u8
+    var pos: i32 = 0
+
+    # Header
+    let header = s"<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"UTF-8\">\n<title>"
+    memcpy(@html_buf as *u8 + pos, header.ptr(), header.len() as i64)
+    pos += header.len() as i32
+
+    # Title
+    let title = page.title.as_view()
+    memcpy(@html_buf as *u8 + pos, title.ptr(), title.len() as i64)
+    pos += title.len() as i32
+
+    let header2 = s"</title>\n<style>body{font-family:system-ui;max-width:800px;margin:2rem auto;padding:0 1rem;}</style>\n</head>\n<body>\n<h1>"
+    memcpy(@html_buf as *u8 + pos, header2.ptr(), header2.len() as i64)
+    pos += header2.len() as i32
+
+    # Title in body
+    memcpy(@html_buf as *u8 + pos, title.ptr(), title.len() as i64)
+    pos += title.len() as i32
+
+    let h1_close = s"</h1>\n<div class=\"content\">\n<pre>"
+    memcpy(@html_buf as *u8 + pos, h1_close.ptr(), h1_close.len() as i64)
+    pos += h1_close.len() as i32
+
+    # Content (pre-formatted for now)
+    let content = page.content.as_view()
+    var content_len = content.len() as i32
+    if content_len > 14000
+        content_len = 14000  # Truncate to fit buffer
+    memcpy(@html_buf as *u8 + pos, content.ptr(), content_len as i64)
+    pos += content_len
+
+    let footer = s"</pre>\n</div>\n<p><a href=\""
+    memcpy(@html_buf as *u8 + pos, footer.ptr(), footer.len() as i64)
+    pos += footer.len() as i32
+
+    # Edit link
+    let slug = page.slug.as_view()
+    *((@html_buf as *u8) + pos) = '/' as u8
+    pos += 1
+    memcpy(@html_buf as *u8 + pos, slug.ptr(), slug.len() as i64)
+    pos += slug.len() as i32
+
+    let edit_link = s"/edit\">Edit this page</a></p>\n</body>\n</html>"
+    memcpy(@html_buf as *u8 + pos, edit_link.ptr(), edit_link.len() as i64)
+    pos += edit_link.len() as i32
+
+    response_status(res, 200)
+    response_body_html(res, @html_buf as *u8, pos)
+
+
+# Render 404 page
+fn render_not_found(res: *Response, slug: Span<u8>)
+    let html = s"<!DOCTYPE html>
+<html>
+<head><title>Page Not Found</title></head>
+<body>
+<h1>Page Not Found</h1>
+<p>The page you requested does not exist.</p>
+<p><a href=\"/\">Return to home</a></p>
+</body>
+</html>"
+
+    response_status(res, 404)
+    response_body_html(res, html.ptr() as *u8, html.len() as i32)
+
+
+# Render edit form
+fn render_edit_form(res: *Response, page: *WikiPage)
+    # TODO: Implement proper edit form
+    let html = s"<!DOCTYPE html>
+<html>
+<head><title>Edit Page</title></head>
+<body>
+<h1>Edit Page</h1>
+<p>Form editing not yet implemented.</p>
+<p><a href=\"/\">Return to home</a></p>
+</body>
+</html>"
+
+    response_status(res, 200)
+    response_body_html(res, html.ptr() as *u8, html.len() as i32)
+
+
+# Render create form
+fn render_create_form(res: *Response, slug: Span<u8>)
+    let html = s"<!DOCTYPE html>
+<html>
+<head><title>Create Page</title></head>
+<body>
+<h1>Create New Page</h1>
+<p>Page creation form not yet implemented.</p>
+<p><a href=\"/\">Return to home</a></p>
+</body>
+</html>"
+
+    response_status(res, 200)
+    response_body_html(res, html.ptr() as *u8, html.len() as i32)
+
+
+# Render error page
+fn render_error(res: *Response, err: *ServiceError)
+    let html = s"<!DOCTYPE html>
+<html>
+<head><title>Error</title></head>
+<body>
+<h1>Error</h1>
+<p>An error occurred processing your request.</p>
+<p><a href=\"/\">Return to home</a></p>
+</body>
+</html>"
+
+    response_status(res, 500)
+    response_body_html(res, html.ptr() as *u8, html.len() as i32)
+
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+fn span_from_raw(ptr: *u8, len: i32) -> Span<u8>
+    Span<u8> { ptr: ptr, len: len as u64 }
+
+
+# Import WikiPage for render functions
+import models { WikiPage }

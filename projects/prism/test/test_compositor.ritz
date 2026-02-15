@@ -1,0 +1,206 @@
+# Prism - Compositor Tests
+#
+# Integration tests for the compositor.
+
+import types { Rect, Color, WindowId }
+import compositor { Compositor, WindowState }
+import protocol.command { RenderCommand, CommandBuilder }
+
+[[test]]
+fn test_create_window() -> i32
+    var comp = Compositor.new(800, 600)
+
+    let win_id = comp.create_window(100, 100, 200, 150)
+
+    assert win_id.is_valid()
+    assert comp.window_count() == 1
+
+    0
+
+[[test]]
+fn test_create_multiple_windows() -> i32
+    var comp = Compositor.new(800, 600)
+
+    let win1 = comp.create_window(0, 0, 100, 100)
+    let win2 = comp.create_window(50, 50, 100, 100)
+    let win3 = comp.create_window(100, 100, 100, 100)
+
+    assert comp.window_count() == 3
+
+    # Windows should have different IDs
+    assert win1.raw() != win2.raw()
+    assert win2.raw() != win3.raw()
+
+    0
+
+[[test]]
+fn test_destroy_window() -> i32
+    var comp = Compositor.new(800, 600)
+
+    let win1 = comp.create_window(0, 0, 100, 100)
+    let win2 = comp.create_window(50, 50, 100, 100)
+
+    assert comp.window_count() == 2
+
+    comp.destroy_window(win1)
+
+    assert comp.window_count() == 1
+
+    0
+
+[[test]]
+fn test_window_focus() -> i32
+    var comp = Compositor.new(800, 600)
+
+    let win1 = comp.create_window(0, 0, 100, 100)
+    let win2 = comp.create_window(50, 50, 100, 100)
+
+    # Initially no focus
+    assert comp.focused_window_id().is_none()
+
+    # Focus win1
+    comp.focus_window(win1)
+    let focused = comp.focused_window_id()
+    assert focused.is_some()
+    assert focused.unwrap().raw() == win1.raw()
+
+    # Focus win2
+    comp.focus_window(win2)
+    let focused2 = comp.focused_window_id()
+    assert focused2.unwrap().raw() == win2.raw()
+
+    0
+
+[[test]]
+fn test_fill_rect_command() -> i32
+    var comp = Compositor.new(800, 600)
+
+    let win_id = comp.create_window(100, 100, 200, 150)
+
+    # Fill window with red
+    let cmd = CommandBuilder.fill_rect(
+        Rect.new(0, 0, 200, 150),
+        Color.red()
+    )
+    comp.process_command(win_id, cmd)
+    comp.render_frame()
+
+    # Check pixels in the window area
+    let backend = comp.backend()
+
+    # Inside window (offset by window position)
+    let inside = backend.color_at(150, 125)
+    assert inside.r == 255
+    assert inside.g == 0
+    assert inside.b == 0
+
+    # Outside window should still be black (default)
+    let outside = backend.color_at(50, 50)
+    assert outside.r == 0
+    assert outside.g == 0
+    assert outside.b == 0
+
+    0
+
+[[test]]
+fn test_window_occlusion() -> i32
+    var comp = Compositor.new(800, 600)
+
+    # Create two overlapping windows
+    let win_back = comp.create_window(0, 0, 100, 100)
+    let win_front = comp.create_window(50, 50, 100, 100)  # Higher z-order
+
+    # Fill back window with red
+    let red_cmd = CommandBuilder.fill_rect(
+        Rect.new(0, 0, 100, 100),
+        Color.red()
+    )
+    comp.process_command(win_back, red_cmd)
+
+    # Fill front window with blue
+    let blue_cmd = CommandBuilder.fill_rect(
+        Rect.new(0, 0, 100, 100),
+        Color.blue()
+    )
+    comp.process_command(win_front, blue_cmd)
+
+    comp.render_frame()
+
+    let backend = comp.backend()
+
+    # Back window's non-overlapped region should be red
+    let back_only = backend.color_at(25, 25)
+    assert back_only.r == 255
+    assert back_only.b == 0
+
+    # Front window should be blue
+    let front_area = backend.color_at(100, 100)
+    assert front_area.r == 0
+    assert front_area.b == 255
+
+    # The overlap area depends on z-order rendering
+    # Front window (win_front) was created second, so it should be on top
+
+    0
+
+[[test]]
+fn test_damage_tracking() -> i32
+    var comp = Compositor.new(800, 600)
+
+    # Initially no damage
+    assert not comp.damage_tracker().has_damage()
+
+    # Create a window adds damage
+    let win_id = comp.create_window(100, 100, 200, 150)
+    assert comp.damage_tracker().has_damage()
+
+    # Render clears damage
+    comp.render_frame()
+    assert not comp.damage_tracker().has_damage()
+
+    # Process a command adds damage
+    let cmd = CommandBuilder.fill_rect(
+        Rect.new(0, 0, 50, 50),
+        Color.red()
+    )
+    comp.process_command(win_id, cmd)
+    assert comp.damage_tracker().has_damage()
+
+    0
+
+[[test]]
+fn test_frame_counting() -> i32
+    var comp = Compositor.new(800, 600)
+
+    assert comp.frame_count() == 0
+
+    comp.render_frame()
+    assert comp.frame_count() == 1
+
+    comp.render_frame()
+    comp.render_frame()
+    assert comp.frame_count() == 3
+
+    0
+
+[[test]]
+fn test_get_window() -> i32
+    var comp = Compositor.new(800, 600)
+
+    let win_id = comp.create_window(100, 100, 200, 150)
+
+    let win = comp.get_window(win_id)
+    assert win.is_some()
+
+    let w = win.unwrap()
+    assert w.bounds().x == 100
+    assert w.bounds().y == 100
+    assert w.bounds().width == 200
+    assert w.bounds().height == 150
+
+    # Non-existent window
+    let fake_id = WindowId.new(9999)
+    let not_found = comp.get_window(fake_id)
+    assert not_found.is_none()
+
+    0

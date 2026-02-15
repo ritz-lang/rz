@@ -1,0 +1,342 @@
+# Prism - Text Rendering Tests
+#
+# Tests for text rendering using Angelo integration.
+
+import types { Point, Rect, Color }
+import text { FontManager, TextRenderer, FontId }
+import backend.mock { MockBackend }
+import angelo { Font, load_font, GlyphRun, ShapedGlyph }
+
+# Path to test font (relative to project root)
+const TEST_FONT_PATH: StrView = "../angelo/tests/fixtures/aadhunik.ttf"
+
+# --- Font Manager Tests ---
+
+[[test]]
+fn test_font_manager_load_font() -> i32
+    var mgr = FontManager.new()
+
+    let font_id = mgr.load_from_file(TEST_FONT_PATH)
+    assert font_id.is_some()
+
+    let id = font_id.unwrap()
+    assert id.is_valid()
+    assert mgr.font_count() == 1
+    assert mgr.default_font().is_some()
+
+    0
+
+[[test]]
+fn test_font_manager_get_font() -> i32
+    var mgr = FontManager.new()
+
+    let font_id = mgr.load_from_file(TEST_FONT_PATH).unwrap()
+
+    # Should be able to get the font back
+    let font = mgr.get(font_id)
+    assert font.is_some()
+
+    # Should get metrics
+    let metrics = mgr.metrics(font_id)
+    assert metrics.is_some()
+
+    0
+
+[[test]]
+fn test_font_manager_invalid_path() -> i32
+    var mgr = FontManager.new()
+
+    let result = mgr.load_from_file("/nonexistent/path/font.ttf")
+    assert result.is_none()
+    assert mgr.font_count() == 0
+
+    0
+
+# --- Text Renderer Tests ---
+
+[[test]]
+fn test_text_renderer_creation() -> i32
+    let renderer = TextRenderer.new()
+    # Just verify it creates without crashing
+    0
+
+[[test]]
+fn test_text_renderer_shape_text() -> i32
+    var mgr = FontManager.new()
+    let font_id = mgr.load_from_file(TEST_FONT_PATH).unwrap()
+    let font = mgr.get_mut(font_id).unwrap()
+
+    var renderer = TextRenderer.new()
+    let run = renderer.shape(font, "Hello", font_id, 16.0)
+
+    # Should have shaped glyphs
+    assert run.glyph_count() == 5  # H-e-l-l-o
+
+    # Total advance should be positive
+    let advance = run.total_advance()
+    assert advance > 0.0
+
+    0
+
+[[test]]
+fn test_text_renderer_render_to_buffer() -> i32
+    var mgr = FontManager.new()
+    let font_id = mgr.load_from_file(TEST_FONT_PATH).unwrap()
+    let font = mgr.get_mut(font_id).unwrap()
+
+    var renderer = TextRenderer.new()
+
+    # Create a pixel buffer
+    let width: u32 = 200
+    let height: u32 = 50
+    var buffer = Vec<u32>.new()
+    for i in 0..(width * height)
+        buffer.push(0xFF000000)  # Black background
+
+    # Render text
+    let damage = renderer.render_text(
+        font,
+        font_id,
+        "Hello",
+        10,          # x
+        30,          # y (baseline)
+        16,          # size_px
+        Color.white(),
+        @&buffer,
+        width,
+        height
+    )
+
+    # Should have rendered something
+    assert not damage.is_empty()
+    assert damage.width > 0
+    assert damage.height > 0
+
+    # Check that some pixels changed from black
+    var changed = 0
+    for i in 0..(width * height) as usize
+        if buffer[i] != 0xFF000000
+            changed = changed + 1
+
+    assert changed > 0
+
+    0
+
+[[test]]
+fn test_text_renderer_antialias() -> i32
+    var mgr = FontManager.new()
+    let font_id = mgr.load_from_file(TEST_FONT_PATH).unwrap()
+    let font = mgr.get_mut(font_id).unwrap()
+
+    let width: u32 = 200
+    let height: u32 = 50
+
+    # Render with antialiasing
+    var renderer_aa = TextRenderer.new()
+    renderer_aa.set_antialias(true)
+
+    var buffer_aa = Vec<u32>.new()
+    for i in 0..(width * height)
+        buffer_aa.push(0xFF000000)
+
+    renderer_aa.render_text(
+        font, font_id, "Test", 10, 30, 24,
+        Color.white(), @&buffer_aa, width, height
+    )
+
+    # Render without antialiasing
+    var renderer_no_aa = TextRenderer.new()
+    renderer_no_aa.set_antialias(false)
+
+    var buffer_no_aa = Vec<u32>.new()
+    for i in 0..(width * height)
+        buffer_no_aa.push(0xFF000000)
+
+    renderer_no_aa.render_text(
+        font, font_id, "Test", 10, 30, 24,
+        Color.white(), @&buffer_no_aa, width, height
+    )
+
+    # Count non-black, non-white pixels (gray = antialiased)
+    var gray_aa = 0
+    var gray_no_aa = 0
+
+    for i in 0..(width * height) as usize
+        let c_aa = buffer_aa[i]
+        let c_no_aa = buffer_no_aa[i]
+
+        # Check if pixel is gray (between black and white)
+        let r_aa = (c_aa >> 16) and 0xFF
+        if r_aa > 0 and r_aa < 255
+            gray_aa = gray_aa + 1
+
+        let r_no_aa = (c_no_aa >> 16) and 0xFF
+        if r_no_aa > 0 and r_no_aa < 255
+            gray_no_aa = gray_no_aa + 1
+
+    # Antialiased should have more gray pixels
+    assert gray_aa >= gray_no_aa
+
+    0
+
+# --- Integration with MockBackend ---
+
+[[test]]
+fn test_render_text_to_mock_backend() -> i32
+    # This tests the full pipeline: font loading -> shaping -> rendering -> display
+
+    var mgr = FontManager.new()
+    let font_id = mgr.load_from_file(TEST_FONT_PATH).unwrap()
+    let font = mgr.get_mut(font_id).unwrap()
+
+    # Create a mock backend
+    var backend = MockBackend.new(400, 100)
+
+    # Clear to dark gray
+    backend.clear(Color.rgb(30, 30, 30))
+
+    # Get the pending buffer to render into
+    let buffer = backend.pending_buffer_mut()
+    let (width, height) = backend.dimensions()
+
+    # Render text
+    var renderer = TextRenderer.new()
+    let damage = renderer.render_text(
+        font,
+        font_id,
+        "Hello, Prism!",
+        20,          # x
+        60,          # y (baseline)
+        32,          # size_px (nice and big)
+        Color.rgb(255, 200, 100),  # Golden color
+        buffer,
+        width,
+        height
+    )
+
+    # Swap to make it "visible"
+    backend.swap()
+
+    # Verify something was rendered
+    assert not damage.is_empty()
+
+    # Check some pixels in the rendered area
+    var non_background = 0
+    for y in damage.y..(damage.y + damage.height as i32)
+        for x in damage.x..(damage.x + damage.width as i32)
+            let c = backend.color_at(x as u32, y as u32)
+            if c.r() != 30 or c.g() != 30 or c.b() != 30
+                non_background = non_background + 1
+
+    # Should have changed some pixels
+    assert non_background > 0
+
+    0
+
+[[test]]
+fn test_render_multiple_lines() -> i32
+    var mgr = FontManager.new()
+    let font_id = mgr.load_from_file(TEST_FONT_PATH).unwrap()
+    let font = mgr.get_mut(font_id).unwrap()
+
+    var backend = MockBackend.new(400, 200)
+    backend.clear(Color.rgb(20, 20, 40))
+
+    var renderer = TextRenderer.new()
+    let (width, height) = backend.dimensions()
+    let buffer = backend.pending_buffer_mut()
+
+    let font_size: u32 = 24
+    let line_height: i32 = 30
+
+    # Render multiple lines
+    renderer.render_text(font, font_id, "Line 1: Hello", 10, 40, font_size, Color.white(), buffer, width, height)
+    renderer.render_text(font, font_id, "Line 2: World", 10, 40 + line_height, font_size, Color.white(), buffer, width, height)
+    renderer.render_text(font, font_id, "Line 3: Prism!", 10, 40 + line_height * 2, font_size, Color.white(), buffer, width, height)
+
+    backend.swap()
+
+    # Check that each line has rendered content
+    # (We check at approximate y positions)
+    var line1_pixels = 0
+    var line2_pixels = 0
+    var line3_pixels = 0
+
+    for x in 10..300u32
+        let y1 = 35
+        let y2 = 35 + line_height as u32
+        let y3 = 35 + (line_height * 2) as u32
+
+        if backend.color_at(x, y1).r() > 30
+            line1_pixels = line1_pixels + 1
+        if backend.color_at(x, y2).r() > 30
+            line2_pixels = line2_pixels + 1
+        if backend.color_at(x, y3).r() > 30
+            line3_pixels = line3_pixels + 1
+
+    assert line1_pixels > 0
+    assert line2_pixels > 0
+    assert line3_pixels > 0
+
+    0
+
+[[test]]
+fn test_render_colored_text() -> i32
+    var mgr = FontManager.new()
+    let font_id = mgr.load_from_file(TEST_FONT_PATH).unwrap()
+    let font = mgr.get_mut(font_id).unwrap()
+
+    var backend = MockBackend.new(400, 100)
+    backend.clear(Color.black())
+
+    var renderer = TextRenderer.new()
+    let (width, height) = backend.dimensions()
+    let buffer = backend.pending_buffer_mut()
+
+    # Render with a specific color
+    let text_color = Color.rgb(255, 0, 0)  # Pure red
+    renderer.render_text(font, font_id, "RED", 50, 50, 32, text_color, buffer, width, height)
+
+    backend.swap()
+
+    # Find a pixel that was rendered and verify it's reddish
+    var found_red = false
+    for y in 30..70u32
+        for x in 50..150u32
+            let c = backend.color_at(x, y)
+            # With antialiasing, partially covered pixels will have some red
+            if c.r() > 100 and c.g() < 50 and c.b() < 50
+                found_red = true
+                break
+        if found_red
+            break
+
+    assert found_red
+
+    0
+
+[[test]]
+fn test_render_at_different_sizes() -> i32
+    var mgr = FontManager.new()
+    let font_id = mgr.load_from_file(TEST_FONT_PATH).unwrap()
+    let font = mgr.get_mut(font_id).unwrap()
+
+    var backend = MockBackend.new(600, 200)
+    backend.clear(Color.black())
+
+    var renderer = TextRenderer.new()
+    let (width, height) = backend.dimensions()
+    let buffer = backend.pending_buffer_mut()
+
+    # Render "A" at different sizes
+    let damage_12 = renderer.render_text(font, font_id, "A", 10, 50, 12, Color.white(), buffer, width, height)
+    let damage_24 = renderer.render_text(font, font_id, "A", 100, 80, 24, Color.white(), buffer, width, height)
+    let damage_48 = renderer.render_text(font, font_id, "A", 200, 120, 48, Color.white(), buffer, width, height)
+
+    # Larger sizes should produce larger damage rects
+    assert damage_24.width > damage_12.width
+    assert damage_24.height > damage_12.height
+    assert damage_48.width > damage_24.width
+    assert damage_48.height > damage_24.height
+
+    0

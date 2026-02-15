@@ -1,0 +1,421 @@
+# Angelo - Glyph Cache
+#
+# LRU cache for rasterized glyphs.
+# Caches rendered glyphs to avoid re-rasterizing the same glyph multiple times.
+
+import types.RasterizedGlyph
+import types.GlyphCacheKey
+import raster.subpixel.SubpixelGlyph
+import raster.subpixel.SubpixelOrder
+
+# Extended cache key that includes subpixel mode
+pub struct SubpixelCacheKey
+    font_id: u32
+    glyph_id: u16
+    size_px: u16
+    subpixel_order: u8  # 0=None, 1=RGB, 2=BGR
+
+impl SubpixelCacheKey
+    pub fn new(font_id: u32, glyph_id: u16, size_px: u16, order: SubpixelOrder) -> SubpixelCacheKey
+        let order_val: u8 = match order
+            None => 0
+            RGB => 1
+            BGR => 2
+
+        SubpixelCacheKey {
+            font_id: font_id,
+            glyph_id: glyph_id,
+            size_px: size_px,
+            subpixel_order: order_val
+        }
+
+    pub fn hash(self) -> u64
+        let h = self.font_id as u64
+        let h = (h << 16) or self.glyph_id as u64
+        let h = (h << 16) or self.size_px as u64
+        let h = (h << 8) or self.subpixel_order as u64
+        h
+
+# Cache entry with LRU tracking
+struct CacheEntry
+    key: GlyphCacheKey
+    glyph: RasterizedGlyph
+    access_count: u64  # For LRU tracking
+
+# Glyph cache with LRU eviction
+pub struct GlyphCache
+    entries: Vec<CacheEntry>
+    max_entries: usize
+    access_counter: u64
+    # Stats
+    hits: u64
+    misses: u64
+
+impl GlyphCache
+    pub fn new(max_entries: usize) -> GlyphCache
+        GlyphCache {
+            entries: Vec.with_capacity(max_entries),
+            max_entries: max_entries,
+            access_counter: 0,
+            hits: 0,
+            misses: 0
+        }
+
+    pub fn with_default_size() -> GlyphCache
+        # Default to 1024 entries
+        GlyphCache.new(1024)
+
+    # Look up a cached glyph
+    pub fn get(self:& GlyphCache, key: GlyphCacheKey) -> Option<@RasterizedGlyph>
+        let key_hash = key.hash()
+
+        for i in 0..self.entries.len()
+            let entry = @self.entries[i]
+            if entry.key.hash() == key_hash
+                # Found - update LRU
+                self.access_counter = self.access_counter + 1
+                self.entries[i].access_count = self.access_counter
+                self.hits = self.hits + 1
+                return Some(@self.entries[i].glyph)
+
+        self.misses = self.misses + 1
+        None
+
+    # Insert a glyph into the cache
+    pub fn insert(self:& GlyphCache, key: GlyphCacheKey, glyph:= RasterizedGlyph)
+        self.access_counter = self.access_counter + 1
+
+        # Check if we need to evict
+        if self.entries.len() >= self.max_entries
+            self.evict_lru()
+
+        let entry = CacheEntry {
+            key: key,
+            glyph: glyph,
+            access_count: self.access_counter
+        }
+
+        self.entries.push(entry)
+
+    # Get or insert a glyph
+    # render_fn is called if the glyph is not in cache
+    # TODO: Once Ritz supports closures, make this take a render function
+    pub fn get_or_insert(self:& GlyphCache, key: GlyphCacheKey, glyph:= RasterizedGlyph) -> @RasterizedGlyph
+        # Check cache first
+        let key_hash = key.hash()
+
+        for i in 0..self.entries.len()
+            if self.entries[i].key.hash() == key_hash
+                self.access_counter = self.access_counter + 1
+                self.entries[i].access_count = self.access_counter
+                self.hits = self.hits + 1
+                return @self.entries[i].glyph
+
+        # Not found - insert
+        self.misses = self.misses + 1
+        self.insert(key, glyph)
+
+        # Return reference to just-inserted entry
+        @self.entries[self.entries.len() - 1].glyph
+
+    # Evict the least recently used entry
+    fn evict_lru(self:& GlyphCache)
+        if self.entries.len() == 0
+            return
+
+        # Find entry with lowest access_count
+        var lru_idx = 0usize
+        var lru_count = self.entries[0].access_count
+
+        for i in 1..self.entries.len()
+            if self.entries[i].access_count < lru_count
+                lru_count = self.entries[i].access_count
+                lru_idx = i
+
+        # Remove by swapping with last and popping
+        let last_idx = self.entries.len() - 1
+        if lru_idx < last_idx
+            self.entries[lru_idx] = self.entries[last_idx]
+        self.entries.pop()
+
+    # Clear the cache
+    pub fn clear(self:& GlyphCache)
+        self.entries.clear()
+        self.hits = 0
+        self.misses = 0
+
+    # Get cache stats
+    pub fn hit_rate(self) -> f32
+        let total = self.hits + self.misses
+        if total == 0
+            0.0
+        else
+            self.hits as f32 / total as f32
+
+    pub fn len(self) -> usize
+        self.entries.len()
+
+    pub fn is_empty(self) -> bool
+        self.entries.len() == 0
+
+# Tests
+
+[[test]]
+fn test_cache_creation() -> i32
+    let cache = GlyphCache.new(100)
+    assert cache.len() == 0
+    assert cache.is_empty()
+    assert cache.max_entries == 100
+    0
+
+[[test]]
+fn test_cache_insert_and_get() -> i32
+    var cache = GlyphCache.new(100)
+
+    let key = GlyphCacheKey.new(1, 65, 16)
+    let glyph = RasterizedGlyph.new(10, 10)
+
+    cache.insert(key, glyph)
+    assert cache.len() == 1
+
+    let result = cache.get(key)
+    assert result.is_some()
+
+    let retrieved = result.unwrap()
+    assert retrieved.width == 10
+    assert retrieved.height == 10
+
+    0
+
+[[test]]
+fn test_cache_miss() -> i32
+    var cache = GlyphCache.new(100)
+
+    let key1 = GlyphCacheKey.new(1, 65, 16)
+    let key2 = GlyphCacheKey.new(1, 66, 16)  # Different glyph
+
+    let glyph = RasterizedGlyph.new(10, 10)
+    cache.insert(key1, glyph)
+
+    let result = cache.get(key2)
+    assert result.is_none()
+
+    0
+
+[[test]]
+fn test_cache_eviction() -> i32
+    var cache = GlyphCache.new(3)  # Small cache
+
+    # Insert 3 entries
+    for i in 0..3
+        let key = GlyphCacheKey.new(1, i as u16, 16)
+        let glyph = RasterizedGlyph.new(i as u32 + 1, i as u32 + 1)
+        cache.insert(key, glyph)
+
+    assert cache.len() == 3
+
+    # Access entry 1 to make it more recent
+    let key1 = GlyphCacheKey.new(1, 1, 16)
+    let _ = cache.get(key1)
+
+    # Insert a 4th entry - should evict LRU (entry 0)
+    let key3 = GlyphCacheKey.new(1, 99, 16)
+    let glyph3 = RasterizedGlyph.new(99, 99)
+    cache.insert(key3, glyph3)
+
+    assert cache.len() == 3
+
+    # Entry 0 should be evicted
+    let key0 = GlyphCacheKey.new(1, 0, 16)
+    let result0 = cache.get(key0)
+    assert result0.is_none()
+
+    # Entry 1 should still be there
+    let result1 = cache.get(key1)
+    assert result1.is_some()
+
+    # New entry should be there
+    let result3 = cache.get(key3)
+    assert result3.is_some()
+
+    0
+
+[[test]]
+fn test_cache_hit_rate() -> i32
+    var cache = GlyphCache.new(100)
+
+    let key = GlyphCacheKey.new(1, 65, 16)
+    let glyph = RasterizedGlyph.new(10, 10)
+    cache.insert(key, glyph)
+
+    # Miss for unknown key
+    let key2 = GlyphCacheKey.new(1, 66, 16)
+    let _ = cache.get(key2)
+
+    # Hit for known key
+    let _ = cache.get(key)
+    let _ = cache.get(key)
+
+    # 2 hits, 1 miss = 66% hit rate
+    let rate = cache.hit_rate()
+    assert rate > 0.6 and rate < 0.7
+
+    0
+
+[[test]]
+fn test_cache_clear() -> i32
+    var cache = GlyphCache.new(100)
+
+    for i in 0..10
+        let key = GlyphCacheKey.new(1, i as u16, 16)
+        let glyph = RasterizedGlyph.new(10, 10)
+        cache.insert(key, glyph)
+
+    assert cache.len() == 10
+
+    cache.clear()
+
+    assert cache.len() == 0
+    assert cache.is_empty()
+
+    0
+
+[[test]]
+fn test_cache_different_sizes() -> i32
+    var cache = GlyphCache.new(100)
+
+    # Same glyph at different sizes should be different entries
+    let key16 = GlyphCacheKey.new(1, 65, 16)
+    let key24 = GlyphCacheKey.new(1, 65, 24)
+    let key32 = GlyphCacheKey.new(1, 65, 32)
+
+    cache.insert(key16, RasterizedGlyph.new(16, 16))
+    cache.insert(key24, RasterizedGlyph.new(24, 24))
+    cache.insert(key32, RasterizedGlyph.new(32, 32))
+
+    assert cache.len() == 3
+
+    let r16 = cache.get(key16).unwrap()
+    assert r16.width == 16
+
+    let r24 = cache.get(key24).unwrap()
+    assert r24.width == 24
+
+    let r32 = cache.get(key32).unwrap()
+    assert r32.width == 32
+
+    0
+
+# Subpixel glyph cache
+struct SubpixelCacheEntry
+    key: SubpixelCacheKey
+    glyph: SubpixelGlyph
+    access_count: u64
+
+pub struct SubpixelGlyphCache
+    entries: Vec<SubpixelCacheEntry>
+    max_entries: usize
+    access_counter: u64
+    hits: u64
+    misses: u64
+
+impl SubpixelGlyphCache
+    pub fn new(max_entries: usize) -> SubpixelGlyphCache
+        SubpixelGlyphCache {
+            entries: Vec.with_capacity(max_entries),
+            max_entries: max_entries,
+            access_counter: 0,
+            hits: 0,
+            misses: 0
+        }
+
+    pub fn with_default_size() -> SubpixelGlyphCache
+        SubpixelGlyphCache.new(1024)
+
+    pub fn get(self:& SubpixelGlyphCache, key: SubpixelCacheKey) -> Option<@SubpixelGlyph>
+        let key_hash = key.hash()
+
+        for i in 0..self.entries.len()
+            let entry = @self.entries[i]
+            if entry.key.hash() == key_hash
+                self.access_counter = self.access_counter + 1
+                self.entries[i].access_count = self.access_counter
+                self.hits = self.hits + 1
+                return Some(@self.entries[i].glyph)
+
+        self.misses = self.misses + 1
+        None
+
+    pub fn insert(self:& SubpixelGlyphCache, key: SubpixelCacheKey, glyph:= SubpixelGlyph)
+        self.access_counter = self.access_counter + 1
+
+        if self.entries.len() >= self.max_entries
+            self.evict_lru()
+
+        let entry = SubpixelCacheEntry {
+            key: key,
+            glyph: glyph,
+            access_count: self.access_counter
+        }
+
+        self.entries.push(entry)
+
+    fn evict_lru(self:& SubpixelGlyphCache)
+        if self.entries.len() == 0
+            return
+
+        var lru_idx = 0usize
+        var lru_count = self.entries[0].access_count
+
+        for i in 1..self.entries.len()
+            if self.entries[i].access_count < lru_count
+                lru_count = self.entries[i].access_count
+                lru_idx = i
+
+        let last_idx = self.entries.len() - 1
+        if lru_idx < last_idx
+            self.entries[lru_idx] = self.entries[last_idx]
+        self.entries.pop()
+
+    pub fn clear(self:& SubpixelGlyphCache)
+        self.entries.clear()
+        self.hits = 0
+        self.misses = 0
+
+    pub fn hit_rate(self) -> f32
+        let total = self.hits + self.misses
+        if total == 0
+            0.0
+        else
+            self.hits as f32 / total as f32
+
+    pub fn len(self) -> usize
+        self.entries.len()
+
+[[test]]
+fn test_subpixel_cache_key() -> i32
+    let key1 = SubpixelCacheKey.new(1, 65, 16, SubpixelOrder.RGB)
+    let key2 = SubpixelCacheKey.new(1, 65, 16, SubpixelOrder.BGR)
+    let key3 = SubpixelCacheKey.new(1, 65, 16, SubpixelOrder.RGB)
+
+    # Different orders should have different hashes
+    assert key1.hash() != key2.hash()
+    # Same parameters should have same hash
+    assert key1.hash() == key3.hash()
+    0
+
+[[test]]
+fn test_subpixel_cache_insert_get() -> i32
+    var cache = SubpixelGlyphCache.new(100)
+
+    let key = SubpixelCacheKey.new(1, 65, 16, SubpixelOrder.RGB)
+    let glyph = SubpixelGlyph.new(10, 10)
+    cache.insert(key, glyph)
+
+    assert cache.len() == 1
+
+    let result = cache.get(key)
+    assert result.is_some()
+    assert result.unwrap().width == 10
+
+    0

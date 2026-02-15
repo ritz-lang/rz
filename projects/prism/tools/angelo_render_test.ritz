@@ -1,0 +1,255 @@
+# angelo_render_test.ritz - Render text using Angelo font library
+#
+# Loads a TTF font, shapes text, rasterizes glyphs, and writes to PPM.
+# This demonstrates proper anti-aliased text rendering.
+
+import ritzlib.sys
+import angelo.font { Font, load_font }
+import angelo.raster.render { rasterize_glyph }
+import angelo.types { RasterizedGlyph, GlyphOutline }
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+const WIDTH: u32 = 400
+const HEIGHT: u32 = 100
+const BUFFER_SIZE: i64 = 120000  # 400 * 100 * 3 = 120000 bytes for RGB
+
+# Colors (RGB format for PPM)
+const BG_R: u8 = 45    # Dark gray background
+const BG_G: u8 = 45
+const BG_B: u8 = 45
+const TEXT_R: u8 = 255  # White text
+const TEXT_G: u8 = 255
+const TEXT_B: u8 = 255
+
+# ============================================================================
+# Pixel buffer operations
+# ============================================================================
+
+fn set_pixel(buffer: *u8, x: u32, y: u32, r: u8, g: u8, b: u8)
+    if x >= WIDTH or y >= HEIGHT
+        return
+
+    let offset: i64 = ((y * WIDTH + x) * 3) as i64
+    *(buffer + offset) = r
+    *(buffer + offset + 1) = g
+    *(buffer + offset + 2) = b
+
+fn fill_background(buffer: *u8)
+    var y: u32 = 0
+    while y < HEIGHT
+        var x: u32 = 0
+        while x < WIDTH
+            set_pixel(buffer, x, y, BG_R, BG_G, BG_B)
+            x = x + 1
+        y = y + 1
+
+fn blend_pixel(buffer: *u8, x: u32, y: u32, alpha: u8, fg_r: u8, fg_g: u8, fg_b: u8)
+    if x >= WIDTH or y >= HEIGHT
+        return
+    if alpha as u32 == 0
+        return
+
+    let offset: i64 = ((y * WIDTH + x) * 3) as i64
+
+    if alpha as u32 == 255
+        # Fully opaque - just write
+        *(buffer + offset) = fg_r
+        *(buffer + offset + 1) = fg_g
+        *(buffer + offset + 2) = fg_b
+    else
+        # Alpha blend
+        let bg_r: u32 = (*(buffer + offset)) as u32
+        let bg_g: u32 = (*(buffer + offset + 1)) as u32
+        let bg_b: u32 = (*(buffer + offset + 2)) as u32
+        let a: u32 = alpha as u32
+        let inv_a: u32 = 255 - a
+
+        let new_r: u8 = ((fg_r as u32 * a + bg_r * inv_a) / 255) as u8
+        let new_g: u8 = ((fg_g as u32 * a + bg_g * inv_a) / 255) as u8
+        let new_b: u8 = ((fg_b as u32 * a + bg_b * inv_a) / 255) as u8
+
+        *(buffer + offset) = new_r
+        *(buffer + offset + 1) = new_g
+        *(buffer + offset + 2) = new_b
+
+fn blit_glyph(buffer: *u8, glyph: RasterizedGlyph, x: i32, y: i32)
+    var gy: u32 = 0
+    while gy < glyph.height
+        let dst_y: i32 = y + gy as i32
+        if dst_y >= 0 and dst_y < HEIGHT as i32
+            var gx: u32 = 0
+            while gx < glyph.width
+                let dst_x: i32 = x + gx as i32
+                if dst_x >= 0 and dst_x < WIDTH as i32
+                    let idx: usize = (gy * glyph.width + gx) as usize
+                    let alpha: u8 = glyph.bitmap[idx]
+                    blend_pixel(buffer, dst_x as u32, dst_y as u32, alpha, TEXT_R, TEXT_G, TEXT_B)
+                gx = gx + 1
+        gy = gy + 1
+
+# ============================================================================
+# PPM file writing (same as before)
+# ============================================================================
+
+fn write_ppm_header(fd: i32, width: u32, height: u32)
+    var header: [3]u8
+    header[0] = 80   # 'P'
+    header[1] = 54   # '6'
+    header[2] = 10   # '\n'
+    sys_write(fd, @header[0], 3)
+
+    write_number(fd, width)
+
+    var space: u8 = 32
+    sys_write(fd, @space, 1)
+
+    write_number(fd, height)
+
+    var trailer: [5]u8
+    trailer[0] = 10   # '\n'
+    trailer[1] = 50   # '2'
+    trailer[2] = 53   # '5'
+    trailer[3] = 53   # '5'
+    trailer[4] = 10   # '\n'
+    sys_write(fd, @trailer[0], 5)
+
+fn write_number(fd: i32, n: u32)
+    if n == 0
+        var zero: u8 = 48
+        sys_write(fd, @zero, 1)
+        return
+
+    var buf: [10]u8
+    var temp: u32 = n
+    var count: i64 = 0
+
+    while temp > 0
+        buf[count] = (48 + (temp % 10)) as u8
+        temp = temp / 10
+        count = count + 1
+
+    while count > 0
+        count = count - 1
+        sys_write(fd, @buf[count], 1)
+
+# ============================================================================
+# Main
+# ============================================================================
+
+pub fn main() -> i32
+    # Allocate pixel buffer
+    let buffer: *u8 = sys_mmap(0, BUFFER_SIZE, 3, 34, -1, 0)
+    if buffer as i64 < 0
+        return 1
+
+    # Fill background
+    fill_background(buffer)
+
+    # Load font
+    let font_result = load_font("/home/aaron/dev/ritz-lang/angelo/aadhunik.ttf")
+    if font_result.is_err()
+        sys_munmap(buffer, BUFFER_SIZE)
+        return 2
+    var font: Font = font_result.unwrap()
+
+    let metrics = font.metrics()
+    let font_size: u32 = 48
+
+    # Draw "Hello World!"
+    # Characters: H e l l o   W o r l d !
+    var text: [12]u32
+    text[0] = 72    # 'H'
+    text[1] = 101   # 'e'
+    text[2] = 108   # 'l'
+    text[3] = 108   # 'l'
+    text[4] = 111   # 'o'
+    text[5] = 32    # ' '
+    text[6] = 87    # 'W'
+    text[7] = 111   # 'o'
+    text[8] = 114   # 'r'
+    text[9] = 108   # 'l'
+    text[10] = 100  # 'd'
+    text[11] = 33   # '!'
+
+    var pen_x: i32 = 20
+    let baseline: i32 = 70  # Y position of baseline
+
+    var i: i64 = 0
+    while i < 12
+        let codepoint: u32 = text[i]
+
+        # Look up glyph ID
+        let glyph_id_opt = font.glyph_id(codepoint)
+        if glyph_id_opt.is_none()
+            i = i + 1
+            continue
+        let glyph_id: u16 = glyph_id_opt.unwrap()
+
+        # Get glyph outline
+        let outline_opt = font.glyph_outline(glyph_id)
+        if outline_opt.is_none()
+            i = i + 1
+            continue
+        let outline: GlyphOutline = outline_opt.unwrap()
+
+        # Get glyph metrics
+        let glyph_metrics_opt = font.glyph_metrics(glyph_id)
+        var advance_width: u16 = 0
+        var lsb: i16 = 0
+        if glyph_metrics_opt.is_some()
+            let m = glyph_metrics_opt.unwrap()
+            advance_width = m.advance_width
+            lsb = m.left_side_bearing
+
+        # Rasterize with antialiasing
+        let rasterized: RasterizedGlyph = rasterize_glyph(outline, metrics.units_per_em, font_size, advance_width, lsb, true)
+
+        # Calculate glyph position
+        # bearing_x is the offset from pen position to left edge of glyph
+        # bearing_y is the offset from baseline to top of glyph
+        let glyph_x: i32 = pen_x + rasterized.bearing_x
+        let glyph_y: i32 = baseline - rasterized.bearing_y
+
+        # Blit the glyph
+        blit_glyph(buffer, rasterized, glyph_x, glyph_y)
+
+        # Advance pen position
+        pen_x = pen_x + rasterized.advance as i32
+
+        i = i + 1
+
+    # Write output file
+    var path: [32]u8
+    path[0] = 104   # 'h'
+    path[1] = 101   # 'e'
+    path[2] = 108   # 'l'
+    path[3] = 108   # 'l'
+    path[4] = 111   # 'o'
+    path[5] = 95    # '_'
+    path[6] = 97    # 'a'
+    path[7] = 110   # 'n'
+    path[8] = 103   # 'g'
+    path[9] = 101   # 'e'
+    path[10] = 108  # 'l'
+    path[11] = 111  # 'o'
+    path[12] = 46   # '.'
+    path[13] = 112  # 'p'
+    path[14] = 112  # 'p'
+    path[15] = 109  # 'm'
+    path[16] = 0    # null terminator
+
+    let fd: i32 = sys_open3(@path[0], 577, 420)
+    if fd < 0
+        sys_munmap(buffer, BUFFER_SIZE)
+        return 3
+
+    write_ppm_header(fd, WIDTH, HEIGHT)
+    sys_write(fd, buffer, BUFFER_SIZE)
+
+    sys_close(fd)
+    sys_munmap(buffer, BUFFER_SIZE)
+
+    return 0

@@ -1,0 +1,413 @@
+# lib/style/matching.ritz - Selector Matching
+#
+# Implements right-to-left selector matching against elements.
+# This is the core algorithm for determining if a CSS selector matches an element.
+
+import lib.css.selector { ComplexSelector, CompoundSelector, SimpleSelector,
+                          SELECTOR_UNIVERSAL, SELECTOR_TYPE, SELECTOR_ID, SELECTOR_CLASS,
+                          SELECTOR_ATTRIBUTE, SELECTOR_PSEUDO_CLASS, SELECTOR_PSEUDO_ELEMENT,
+                          COMBINATOR_NONE, COMBINATOR_DESCENDANT, COMBINATOR_CHILD,
+                          COMBINATOR_NEXT_SIBLING, COMBINATOR_SUBSEQUENT_SIBLING,
+                          ATTR_EXISTS, ATTR_EQUALS, ATTR_INCLUDES, ATTR_DASH_MATCH,
+                          ATTR_PREFIX, ATTR_SUFFIX, ATTR_SUBSTRING,
+                          simple_selector_value }
+import lib.style.bloom { BloomFilter, bloom_filter_might_contain_str }
+import lib.dom.tag { Tag, tag_name }
+
+# =============================================================================
+# Element Interface
+# =============================================================================
+
+# For selector matching, we need to query elements for:
+# - Tag name
+# - ID
+# - Classes
+# - Attributes
+# - Parent element
+# - Previous sibling
+# - Ancestor filter (bloom filter)
+
+# Since we don't own the DOM (Tempest does), we use callbacks/trait
+# For now, we define a simple interface struct
+
+pub struct ElementInfo
+    tag: StrView
+    id: StrView
+    classes: StrView           # Space-separated
+    get_attribute: fn(name: StrView) -> StrView
+    parent: *ElementInfo       # null if root
+    prev_sibling: *ElementInfo # null if first child
+    ancestor_filter: BloomFilter
+
+pub fn element_info_has_class(elem: ElementInfo, class: StrView) -> i32
+    # Check if element has the given class
+    if elem.classes.len == 0
+        return 0
+
+    var start: u64 = 0
+    var i: u64 = 0
+    while i <= elem.classes.len
+        if i == elem.classes.len or elem.classes.data[i] == 32  # space
+            if i > start
+                let class_name = StrView {
+                    data: @elem.classes.data[start],
+                    len: i - start
+                }
+                if str_eq(class_name, class) == 1
+                    return 1
+            start = i + 1
+        i = i + 1
+    0
+
+fn str_eq(a: StrView, b: StrView) -> i32
+    if a.len != b.len
+        return 0
+    var i: u64 = 0
+    while i < a.len
+        if a.data[i] != b.data[i]
+            return 0
+        i = i + 1
+    1
+
+fn str_eq_ignore_case(a: StrView, b: StrView) -> i32
+    if a.len != b.len
+        return 0
+    var i: u64 = 0
+    while i < a.len
+        var ca = a.data[i]
+        var cb = b.data[i]
+        # Lowercase both
+        if ca >= 65 and ca <= 90
+            ca = ca + 32
+        if cb >= 65 and cb <= 90
+            cb = cb + 32
+        if ca != cb
+            return 0
+        i = i + 1
+    1
+
+# =============================================================================
+# Main Matching Function
+# =============================================================================
+
+pub fn selector_matches(selector: ComplexSelector, element: ElementInfo) -> i32
+    # Right-to-left matching
+    # Start with rightmost compound selector, match against element
+    # Then walk left through combinators and ancestors
+
+    if selector.compound_count == 0
+        return 0
+
+    # Match key (rightmost) selector
+    let key_idx = selector.compound_count - 1
+    if compound_matches(selector.compounds[key_idx], element) == 0
+        return 0
+
+    # If only one compound, we're done
+    if selector.compound_count == 1
+        return 1
+
+    # Match rest of selector against ancestors/siblings
+    var current_element = element
+    var selector_idx = key_idx
+
+    while selector_idx > 0
+        selector_idx = selector_idx - 1
+        let compound = selector.compounds[selector_idx]
+        let combinator = selector.combinators[selector_idx + 1]
+
+        if combinator == COMBINATOR_DESCENDANT
+            # Must find matching ancestor
+            # Use bloom filter for fast rejection
+            let key_simple = get_key_simple(compound)
+            if key_simple.kind == SELECTOR_CLASS or key_simple.kind == SELECTOR_ID or key_simple.kind == SELECTOR_TYPE
+                let key_value = simple_selector_value(key_simple)
+                if bloom_filter_might_contain_str(current_element.ancestor_filter, key_value) == 0
+                    return 0  # Definitely not in ancestors
+
+            # Walk ancestors
+            var found = 0
+            var ancestor = current_element.parent
+            while ancestor != null
+                if compound_matches(compound, @ancestor) == 1
+                    current_element = @ancestor
+                    found = 1
+                    break
+                ancestor = (@ancestor).parent
+
+            if found == 0
+                return 0
+
+        else if combinator == COMBINATOR_CHILD
+            # Must match immediate parent
+            if current_element.parent == null
+                return 0
+            if compound_matches(compound, @current_element.parent) == 0
+                return 0
+            current_element = @current_element.parent
+
+        else if combinator == COMBINATOR_NEXT_SIBLING
+            # Must match immediate previous sibling
+            if current_element.prev_sibling == null
+                return 0
+            if compound_matches(compound, @current_element.prev_sibling) == 0
+                return 0
+            current_element = @current_element.prev_sibling
+
+        else if combinator == COMBINATOR_SUBSEQUENT_SIBLING
+            # Must match any previous sibling
+            var found = 0
+            var sibling = current_element.prev_sibling
+            while sibling != null
+                if compound_matches(compound, @sibling) == 1
+                    current_element = @sibling
+                    found = 1
+                    break
+                sibling = (@sibling).prev_sibling
+
+            if found == 0
+                return 0
+
+        else if combinator == _
+            0  # No combinator
+
+    1
+
+# =============================================================================
+# Compound Selector Matching
+# =============================================================================
+
+fn compound_matches(compound: CompoundSelector, element: ElementInfo) -> i32
+    # All simple selectors must match
+    var i: u32 = 0
+    while i < compound.simple_count
+        if simple_matches(compound.simple[i], element) == 0
+            return 0
+        i = i + 1
+    1
+
+# =============================================================================
+# Simple Selector Matching
+# =============================================================================
+
+fn simple_matches(simple: SimpleSelector, element: ElementInfo) -> i32
+    if simple.kind == SELECTOR_UNIVERSAL
+        1  # Always matches
+
+    else if simple.kind == SELECTOR_TYPE
+        let sel_tag = simple_selector_value(simple)
+        str_eq_ignore_case(element.tag, sel_tag)
+
+    else if simple.kind == SELECTOR_ID
+        let sel_id = simple_selector_value(simple)
+        str_eq(element.id, sel_id)
+
+    else if simple.kind == SELECTOR_CLASS
+        let sel_class = simple_selector_value(simple)
+        element_info_has_class(element, sel_class)
+
+    else if simple.kind == SELECTOR_ATTRIBUTE
+        attribute_matches(simple, element)
+
+    else if simple.kind == SELECTOR_PSEUDO_CLASS
+        pseudo_class_matches(simple, element)
+
+    else if simple.kind == SELECTOR_PSEUDO_ELEMENT
+        # Pseudo-elements are handled specially
+        # For now, return 1 (they don't affect element matching)
+        1
+
+    else if simple.kind == _
+        0
+
+fn attribute_matches(simple: SimpleSelector, element: ElementInfo) -> i32
+    let attr_name = simple_selector_value(simple)
+    let attr_value = element.get_attribute(attr_name)
+
+    if simple.attr_matcher == ATTR_EXISTS
+        # Just check if attribute exists
+        if attr_value.len > 0 or attr_value.data != null
+            return 1
+        0
+
+    else if simple.attr_matcher == ATTR_EQUALS
+        let expected = StrView {
+            data: @simple.attr_value[0],
+            len: simple.attr_value_len as u64
+        }
+        if simple.attr_case_insensitive == 1
+            str_eq_ignore_case(attr_value, expected)
+        else
+            str_eq(attr_value, expected)
+
+    else if simple.attr_matcher == ATTR_INCLUDES
+        # Space-separated list contains value
+        let expected = StrView {
+            data: @simple.attr_value[0],
+            len: simple.attr_value_len as u64
+        }
+        attr_includes_word(attr_value, expected)
+
+    else if simple.attr_matcher == ATTR_DASH_MATCH
+        # Equals or starts with value followed by -
+        let expected = StrView {
+            data: @simple.attr_value[0],
+            len: simple.attr_value_len as u64
+        }
+        attr_dash_match(attr_value, expected)
+
+    else if simple.attr_matcher == ATTR_PREFIX
+        let expected = StrView {
+            data: @simple.attr_value[0],
+            len: simple.attr_value_len as u64
+        }
+        str_starts_with(attr_value, expected)
+
+    else if simple.attr_matcher == ATTR_SUFFIX
+        let expected = StrView {
+            data: @simple.attr_value[0],
+            len: simple.attr_value_len as u64
+        }
+        str_ends_with(attr_value, expected)
+
+    else if simple.attr_matcher == ATTR_SUBSTRING
+        let expected = StrView {
+            data: @simple.attr_value[0],
+            len: simple.attr_value_len as u64
+        }
+        str_contains(attr_value, expected)
+
+    else if simple.attr_matcher == _
+        0
+
+fn attr_includes_word(haystack: StrView, needle: StrView) -> i32
+    var start: u64 = 0
+    var i: u64 = 0
+    while i <= haystack.len
+        if i == haystack.len or haystack.data[i] == 32
+            if i - start == needle.len
+                var match = 1
+                var j: u64 = 0
+                while j < needle.len
+                    if haystack.data[start + j] != needle.data[j]
+                        match = 0
+                        break
+                    j = j + 1
+                if match == 1
+                    return 1
+            start = i + 1
+        i = i + 1
+    0
+
+fn attr_dash_match(haystack: StrView, needle: StrView) -> i32
+    if haystack.len == needle.len
+        return str_eq(haystack, needle)
+    if haystack.len > needle.len and haystack.data[needle.len] == 45  # -
+        var i: u64 = 0
+        while i < needle.len
+            if haystack.data[i] != needle.data[i]
+                return 0
+            i = i + 1
+        return 1
+    0
+
+fn str_starts_with(haystack: StrView, needle: StrView) -> i32
+    if haystack.len < needle.len
+        return 0
+    var i: u64 = 0
+    while i < needle.len
+        if haystack.data[i] != needle.data[i]
+            return 0
+        i = i + 1
+    1
+
+fn str_ends_with(haystack: StrView, needle: StrView) -> i32
+    if haystack.len < needle.len
+        return 0
+    let offset = haystack.len - needle.len
+    var i: u64 = 0
+    while i < needle.len
+        if haystack.data[offset + i] != needle.data[i]
+            return 0
+        i = i + 1
+    1
+
+fn str_contains(haystack: StrView, needle: StrView) -> i32
+    if haystack.len < needle.len
+        return 0
+    var i: u64 = 0
+    while i <= haystack.len - needle.len
+        var match = 1
+        var j: u64 = 0
+        while j < needle.len
+            if haystack.data[i + j] != needle.data[j]
+                match = 0
+                break
+            j = j + 1
+        if match == 1
+            return 1
+        i = i + 1
+    0
+
+fn pseudo_class_matches(simple: SimpleSelector, element: ElementInfo) -> i32
+    let name = simple_selector_value(simple)
+
+    # TODO: Implement pseudo-class matching
+    # :hover, :active, :focus need element state
+    # :first-child, :last-child need sibling info
+    # :nth-child needs index calculation
+    # :not() needs recursive matching
+
+    # For now, return 1 for structural pseudo-classes we can check
+    # and 0 for dynamic ones (hover, focus, etc.)
+
+    if str_eq(name, "first-child") == 1
+        if element.prev_sibling == null
+            return 1
+        return 0
+
+    if str_eq(name, "root") == 1
+        if element.parent == null
+            return 1
+        return 0
+
+    if str_eq(name, "empty") == 1
+        # Would need to check for children
+        return 0
+
+    # Dynamic pseudo-classes (need element state from Tempest)
+    if str_eq(name, "hover") == 1
+        return 0
+    if str_eq(name, "active") == 1
+        return 0
+    if str_eq(name, "focus") == 1
+        return 0
+    if str_eq(name, "visited") == 1
+        return 0
+    if str_eq(name, "link") == 1
+        return 0
+
+    # Unknown pseudo-class
+    0
+
+# =============================================================================
+# Helpers
+# =============================================================================
+
+fn get_key_simple(compound: CompoundSelector) -> SimpleSelector
+    # Get the most restrictive simple selector (for bloom filter check)
+    var i: u32 = 0
+    while i < compound.simple_count
+        let simple = compound.simple[i]
+        if simple.kind == SELECTOR_ID
+            return simple
+        if simple.kind == SELECTOR_CLASS
+            return simple
+        if simple.kind == SELECTOR_TYPE
+            return simple
+        i = i + 1
+    # Return universal if nothing else
+    var universal: SimpleSelector
+    universal.kind = SELECTOR_UNIVERSAL
+    universal.value_len = 0
+    universal

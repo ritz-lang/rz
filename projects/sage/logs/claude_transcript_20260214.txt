@@ -1,0 +1,192 @@
+[2026-02-14T20:53:00.535238] [CHAT] user_1: Hey there!  We are starting out the project.  Wanna check the docs, read up on things, and get ready to discuss things and do a design / architecture / project planning session for this project?!
+[2026-02-14T20:54:07.106437] Claude: Absolutely, let's dive in! I'm excited to help bootstrap the Sage JavaScript engine project. Let me explore what we have so far and gather context.This is great! Here's what I found:
+
+## Current State: Fresh Start! 🚀
+
+**Sage exists only as a spec right now** - just `AGENT.md` and git initialized. No source code, no `ritz.toml`, no tests. We're building from scratch!
+
+## Where Sage Fits in the Ecosystem
+
+Sage is the **JavaScript engine** for the Tempest browser stack:
+
+```
+Tempest (Browser)
+├── Lexis   → HTML/CSS parsing
+├── Iris    → Layout & Rendering  
+├── Sage    → JavaScript execution ← WE ARE HERE
+└── Valet   → HTTP client
+```
+
+**Key insight**: Sage is *self-contained*. We handle JS parsing, compilation, execution, and runtime - but DOM APIs come from browser integration, not us.
+
+## What We Need to Build
+
+```
+src/
+├── lexer.ritz         # Tokenization
+├── parser.ritz        # AST generation  
+├── ast.ritz           # AST types
+├── compiler.ritz      # Bytecode generation
+├── bytecode.ritz      # Bytecode definitions
+├── vm.ritz            # Virtual machine
+├── runtime/
+│   ├── object.ritz    # JS objects
+│   ├── array.ritz     # JS arrays
+│   ├── string.ritz    # JS strings
+│   └── function.ritz  # JS functions
+└── gc.ritz            # Garbage collector
+```
+
+---
+
+## Ready for the Planning Session! 
+
+Let's discuss architecture and planning. Some questions to kick things off:
+
+1. **Implementation Order** - I'd suggest: Lexer → AST → Parser → Bytecode → Compiler → VM → Runtime → GC. Does that order make sense to you?
+
+2. **Initial Scope** - What subset of JavaScript should we target first? I'm thinking:
+   - **Phase 1**: Expressions, literals, basic operators (`2 + 2`, `"hello"`)
+   - **Phase 2**: Variables, functions, control flow
+   - **Phase 3**: Objects, arrays, closures
+   - **Phase 4**: Full ES6+ features
+
+3. **VM Architecture** - Stack-based (simpler, like the JVM) or register-based (faster, like Lua)? I'd lean stack-based initially.
+
+4. **GC Strategy** - Mark-and-sweep is simplest. Start there and evolve to generational later?
+
+5. **Test Strategy** - Should we run against Test262 (the official JS conformance suite) eventually?
+
+What are your thoughts? Any particular areas you want to dive deeper into first?
+[2026-02-14T23:42:42.990161] [CHAT] user_1: I think this looks great, and obviously I think register-based is better.  If we can do generational in 1 pass with significantly less work than doing both mark & sweep then generational incrementally then lets just start with the gold standard for GC.
+[2026-02-14T23:43:46.055590] Claude: Love it! Register-based VM and aiming for generational GC from the start - let's do this right the first time.
+
+Let me do a quick research dive on generational GC complexity to see if we can skip mark-and-sweep entirely:Great research findings! Here's the verdict:
+
+## GC Strategy Decision
+
+**Recommendation: Start with generational, but use a simpler hybrid approach**
+
+The research shows that generational GC requires:
+1. **Write barriers** - tracking when old gen objects point to young gen
+2. **Remembered sets / card tables** - data structures for inter-generational pointers
+3. **Two collection algorithms** - semi-space copying for young gen, mark-sweep for old gen
+
+That's ~2-3x the complexity of pure mark-sweep. BUT there's a smart middle ground that V8 and other engines use:
+
+### Proposed Sage GC Architecture
+
+```
+┌─────────────────────────────────────────────────────┐
+│                    YOUNG GEN                         │
+│    Semi-space copying (Cheney's algorithm)          │
+│    Fast bump allocation, frequent collection         │
+└────────────────────────┬────────────────────────────┘
+                         │ survives 2 GCs
+                         ▼
+┌─────────────────────────────────────────────────────┐
+│                     OLD GEN                          │
+│    Mark-sweep (non-moving, simpler)                 │
+│    Infrequent collection                            │
+└─────────────────────────────────────────────────────┘
+```
+
+This is exactly what V8 does - and it's elegant because:
+- Young gen uses fast copying collector (most objects die young)
+- Old gen uses simpler mark-sweep (they rarely move anyway)
+- We still need write barriers, but avoid complex compaction
+
+**Effort estimate**: ~40% more work than pure mark-sweep, but we get 80% of the benefit.
+
+---
+
+## Updated Project Architecture
+
+Let me draft the full architecture now:
+
+### Register-Based VM Design
+
+```
+┌─────────────────────────────────────────────────────┐
+│                  REGISTER FILE                       │
+│  r0  r1  r2  r3  r4  r5  r6  r7  ... r255           │
+│  (256 registers per function frame)                 │
+└─────────────────────────────────────────────────────┘
+
+Bytecode format: [opcode: u8][dst: u8][src1: u8][src2: u8]
+Example: ADD r0, r1, r2  →  0x01 0x00 0x01 0x02
+```
+
+**Why 256 registers?** Fits in a byte, enough for any reasonable function.
+
+### Bytecode Instruction Set (Initial)
+
+| Opcode | Mnemonic | Description |
+|--------|----------|-------------|
+| 0x00 | `LOAD_CONST` | Load constant into register |
+| 0x01 | `ADD` | r[dst] = r[a] + r[b] |
+| 0x02 | `SUB` | r[dst] = r[a] - r[b] |
+| 0x03 | `MUL` | r[dst] = r[a] * r[b] |
+| 0x04 | `DIV` | r[dst] = r[a] / r[b] |
+| 0x05 | `MOV` | r[dst] = r[src] |
+| 0x06 | `RET` | Return r[src] |
+| ... | ... | ... |
+
+---
+
+## Revised Implementation Phases
+
+### Phase 1: Core Pipeline (MVP)
+1. **Lexer** - Tokenize JS source
+2. **AST** - Define node types  
+3. **Parser** - Build AST from tokens
+4. **Bytecode** - Define instruction set
+5. **Compiler** - AST → bytecode
+6. **VM** - Register-based interpreter
+7. **Value** - JS value representation (NaN-boxing?)
+
+**Goal**: `2 + 2` evaluates to `4`
+
+### Phase 2: Variables & Functions
+- Local variables (register allocation)
+- Global variables
+- Function definitions & calls
+- Return values
+
+### Phase 3: Control Flow
+- `if`/`else`
+- `while`/`for` loops
+- Comparison operators
+
+### Phase 4: Objects & GC
+- Object representation
+- Property access
+- **Generational GC** (young gen + old gen)
+- Write barriers
+
+### Phase 5: Full Runtime
+- Arrays, strings, closures
+- Built-in functions (`console.log`, `Math.*`)
+- Error handling (`try`/`catch`)
+
+### Phase 6: ES6+
+- Arrow functions, `let`/`const`
+- Classes, destructuring
+- Iterators, generators
+- Eventually: async/await
+
+---
+
+## Key Design Questions Remaining
+
+1. **Value Representation** - NaN-boxing (pack type + value in 64 bits) or tagged pointers?
+2. **String Interning** - Intern all strings or just identifiers?
+3. **Object Layout** - Hidden classes (like V8) or hash maps initially?
+
+What do you think of this architecture? Ready to start coding, or want to nail down any of these details first?
+
+**Sources:**
+- [V8 Orinoco GC](https://v8.dev/blog/trash-talk)
+- [A Tour of V8 GC](https://jayconrod.com/posts/55/a-tour-of-v8-garbage-collection)
+- [Visualizing GC Algorithms](https://spin.atomicobject.com/visualizing-garbage-collection-algorithms/)
+- [Cornell CS3110 - GC Lecture](https://www.cs.cornell.edu/courses/cs3110/2012sp/lectures/lec26-gc/lec26.html)

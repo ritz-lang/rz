@@ -1,0 +1,96 @@
+# Harland Kernel - Serial Port Driver
+#
+# Serial port output for early boot debugging.
+# Uses COM1 (0x3F8) at 115200 baud.
+
+import kernel.arch.x86_64.io
+
+# ============================================================================
+# Serial Port Constants
+# ============================================================================
+
+const COM1: u16 = 0x3F8
+const COM1_DATA: u16 = 0x3F8          # Data register (R/W)
+const COM1_IER: u16 = 0x3F9           # Interrupt Enable Register
+const COM1_FCR: u16 = 0x3FA           # FIFO Control Register
+const COM1_LCR: u16 = 0x3FB           # Line Control Register
+const COM1_MCR: u16 = 0x3FC           # Modem Control Register
+const COM1_LSR: u16 = 0x3FD           # Line Status Register
+
+# Line Status Register bits
+const LSR_DATA_READY: u8 = 0x01
+const LSR_THRE: u8 = 0x20             # Transmitter Holding Register Empty
+
+# ============================================================================
+# Serial Port Driver
+# ============================================================================
+
+pub fn serial_init() -> i32
+    # Disable interrupts
+    io.outb(COM1_IER, 0x00)
+
+    # Set baud rate divisor (115200 baud = divisor 1)
+    io.outb(COM1_LCR, 0x80)           # Enable DLAB (Divisor Latch Access Bit)
+    io.outb(COM1_DATA, 0x01)          # Divisor low byte
+    io.outb(COM1_IER, 0x00)           # Divisor high byte
+
+    # Configure: 8 bits, no parity, 1 stop bit (8N1)
+    io.outb(COM1_LCR, 0x03)
+
+    # Enable FIFO, clear them, with 14-byte threshold
+    io.outb(COM1_FCR, 0xC7)
+
+    # Enable IRQs, set RTS/DSR
+    io.outb(COM1_MCR, 0x0B)
+
+    return 0
+
+pub fn serial_write_byte(c: u8) -> i32
+    # Wait for transmit buffer to be empty
+    while (io.inb(COM1_LSR) & LSR_THRE) == 0
+        # Spin - CPU hint for spin loops
+        asm x86_64:
+            pause
+    io.outb(COM1_DATA, c)
+    return 0
+
+pub fn serial_print(s: *u8) -> i32
+    var p: *u8 = s
+    while *p != 0
+        serial_write_byte(*p)
+        p = p + 1
+    return 0
+
+pub fn serial_print_hex(value: u64) -> i32
+    let hex_chars: *u8 = c"0123456789ABCDEF"
+    var i: i32 = 15
+    while i >= 0
+        let nibble: u8 = ((value >> (i * 4)) & 0xF) as u8
+        serial_write_byte(*(hex_chars + nibble as i64))
+        i = i - 1
+    return 0
+
+pub fn serial_print_dec(value: u64) -> i32
+    if value == 0
+        serial_write_byte(48)  # '0'
+        return 0
+
+    var buf: [20]u8  # Max u64 is 20 digits
+    var i: i32 = 0
+    var v: u64 = value
+
+    while v > 0
+        buf[i] = ((v % 10) + 48) as u8  # '0' = 48
+        v = v / 10
+        i = i + 1
+
+    # Print in reverse order
+    while i > 0
+        i = i - 1
+        serial_write_byte(buf[i])
+
+    return 0
+
+pub fn serial_newline() -> i32
+    serial_write_byte(10)  # '\n'
+    return 0

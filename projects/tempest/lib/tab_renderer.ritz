@@ -1,0 +1,276 @@
+# lib/tab_renderer.ritz - Tab Renderer Process Core
+#
+# The isolated process that renders a single tab:
+# - Owns DOM tree for this tab
+# - Runs Lexis for HTML/CSS parsing
+# - Runs Sage for JavaScript execution
+# - Runs Iris for layout and rendering
+# - Communicates with browser process via IPC
+
+import ritzlib.io { prints, printi }
+import ritzlib.strview { StrView }
+import ritzlib.gvec { Vec, vec_new }
+
+import lib.ipc { IpcChannel, BrowserToTabMsg, TabToBrowserMsg, ipc_recv_from_browser, ipc_send_to_browser }
+import lib.document { Document, document_new, NodeId }
+import lib.iris_bridge { IrisClient, iris_connect, iris_send_events, StyleEvent }
+import lib.lexis_bridge { LexisParser, lexis_parser_new, lexis_feed, lexis_poll_event, ParseEvent }
+import lib.sage_bridge { SageContext, sage_context_new, sage_execute }
+import lib.history { TabHistory, tab_history_new }
+
+## Tab renderer state (runs in isolated tab process).
+pub struct TabRenderer
+    # IPC channel to browser process
+    channel:& IpcChannel
+
+    # Document state
+    document: Document
+    current_url: String
+
+    # Per-tab history
+    history: TabHistory
+
+    # Component integrations
+    iris: IrisClient
+    parser: LexisParser
+    js_context: SageContext
+
+    # Pending style events to send to Iris
+    pending_events: Vec<StyleEvent>
+
+    # State
+    running: i32
+    is_loading: i32
+
+## Create a new tab renderer.
+pub fn tab_renderer_new(channel:& IpcChannel) -> TabRenderer
+    var renderer: TabRenderer
+    renderer.channel = channel
+    renderer.document = document_new()
+    renderer.history = tab_history_new()
+
+    # Initialize components
+    renderer.iris = iris_connect()
+    renderer.parser = lexis_parser_new()
+    renderer.js_context = sage_context_new()
+
+    renderer.pending_events = vec_new<StyleEvent>()
+    renderer.running = 1
+    renderer.is_loading = 0
+
+    return renderer
+
+## Run the tab renderer event loop. Returns exit code.
+pub fn tab_renderer_run(renderer:& TabRenderer) -> i32
+    prints("Tab renderer starting event loop\n")
+
+    while renderer.running == 1
+        # Process IPC messages from browser
+        process_browser_messages(renderer)
+
+        # Process parse events from Lexis
+        process_parse_events(renderer)
+
+        # Process JS timers
+        process_js_timers(renderer)
+
+        # Flush style events to Iris
+        flush_style_events(renderer)
+
+        # TODO: Sleep or wait on io_uring events
+        # For now, just exit after one iteration
+        renderer.running = 0
+
+    prints("Tab renderer shutting down\n")
+    return 0
+
+# ============================================================================
+# IPC Message Processing
+# ============================================================================
+
+fn process_browser_messages(renderer:& TabRenderer)
+    var done: i32 = 0
+    while done == 0
+        match ipc_recv_from_browser(renderer.channel)
+            Some(msg) => handle_browser_message(renderer, msg)
+            None => done = 1
+
+fn handle_browser_message(renderer:& TabRenderer, msg: BrowserToTabMsg)
+    match msg
+        Navigate(url) =>
+            start_navigation(renderer, @url)
+
+        Stop =>
+            stop_loading(renderer)
+
+        GoBack =>
+            go_back(renderer)
+
+        GoForward =>
+            go_forward(renderer)
+
+        Reload(bypass_cache) =>
+            reload(renderer, bypass_cache)
+
+        ExecuteScript(script) =>
+            execute_script(renderer, @script)
+
+        SetViewport(width, height) =>
+            set_viewport(renderer, width, height)
+
+        MouseMove(x, y) =>
+            handle_mouse_move(renderer, x, y)
+
+        MouseButton(x, y, button, pressed) =>
+            handle_mouse_button(renderer, x, y, button, pressed)
+
+        KeyDown(key_code, modifiers) =>
+            handle_key_down(renderer, key_code, modifiers)
+
+        KeyUp(key_code, modifiers) =>
+            handle_key_up(renderer, key_code, modifiers)
+
+        TextInput(text) =>
+            handle_text_input(renderer, @text)
+
+        Scroll(delta_x, delta_y) =>
+            handle_scroll(renderer, delta_x, delta_y)
+
+        Shutdown =>
+            renderer.running = 0
+
+# ============================================================================
+# Navigation
+# ============================================================================
+
+fn start_navigation(renderer:& TabRenderer, url: String)
+    prints("Starting navigation to URL\n")
+    renderer.is_loading = 1
+
+    # Notify browser that load started
+    let msg = LoadStarted(url)
+    ipc_send_to_browser(renderer.channel, msg)
+
+    # TODO: Request page from browser's network manager
+    # Browser will send content back via IPC
+
+fn stop_loading(renderer:& TabRenderer)
+    renderer.is_loading = 0
+
+fn go_back(renderer:& TabRenderer)
+    # TODO: Use tab history
+    pass
+
+fn go_forward(renderer:& TabRenderer)
+    # TODO: Use tab history
+    pass
+
+fn reload(renderer:& TabRenderer, bypass_cache: i32)
+    # TODO: Re-request current URL
+    pass
+
+# ============================================================================
+# HTML Parsing
+# ============================================================================
+
+fn process_parse_events(renderer:& TabRenderer)
+    var done: i32 = 0
+    while done == 0
+        match lexis_poll_event(@renderer.parser)
+            Some(event) => handle_parse_event(renderer, event)
+            None => done = 1
+
+fn handle_parse_event(renderer:& TabRenderer, event: ParseEvent)
+    match event
+        DocumentStart =>
+            # Reset document
+            renderer.document = document_new()
+
+        DocumentEnd =>
+            # Parsing complete
+            renderer.is_loading = 0
+            let msg = LoadComplete
+            ipc_send_to_browser(renderer.channel, msg)
+
+        ElementStart(tag, attributes) =>
+            # Create element node
+            # TODO: document_create_element, add to tree
+            # TODO: Queue StyleEvent.NodeCreated
+            pass
+
+        ElementEnd(tag) =>
+            # Pop element stack
+            pass
+
+        Text(content) =>
+            # Create text node
+            # TODO: document_create_text, add to tree
+            # TODO: Queue StyleEvent.TextChanged
+            pass
+
+        ParseError(message, line, column) =>
+            # Log to console
+            let log_msg = ConsoleLog(2, message)
+            ipc_send_to_browser(renderer.channel, log_msg)
+
+        _ =>
+            pass
+
+# ============================================================================
+# JavaScript Execution
+# ============================================================================
+
+fn execute_script(renderer:& TabRenderer, script: String)
+    # TODO: Convert String to StrView
+    # sage_execute(@renderer.js_context, script.as_strview())
+    pass
+
+fn process_js_timers(renderer:& TabRenderer)
+    # TODO: Check for expired timers, fire callbacks
+    pass
+
+# ============================================================================
+# Input Handling
+# ============================================================================
+
+fn handle_mouse_move(renderer:& TabRenderer, x: i32, y: i32)
+    # TODO: Hit test via Iris, update hover state
+    pass
+
+fn handle_mouse_button(renderer:& TabRenderer, x: i32, y: i32, button: i32, pressed: i32)
+    if pressed == 1
+        # TODO: Hit test, dispatch click event to DOM
+        pass
+
+fn handle_key_down(renderer:& TabRenderer, key_code: i32, modifiers: i32)
+    # TODO: Dispatch keyboard event
+    pass
+
+fn handle_key_up(renderer:& TabRenderer, key_code: i32, modifiers: i32)
+    # TODO: Dispatch keyboard event
+    pass
+
+fn handle_text_input(renderer:& TabRenderer, text: String)
+    # TODO: Insert text into focused input
+    pass
+
+fn handle_scroll(renderer:& TabRenderer, delta_x: i32, delta_y: i32)
+    # TODO: Scroll content
+    pass
+
+# ============================================================================
+# Viewport
+# ============================================================================
+
+fn set_viewport(renderer:& TabRenderer, width: u32, height: u32)
+    iris_set_viewport(@renderer.iris, width, height)
+
+# ============================================================================
+# Style Events
+# ============================================================================
+
+fn flush_style_events(renderer:& TabRenderer)
+    # Send pending style events to Iris
+    if vec_len<StyleEvent>(@renderer.pending_events) > 0
+        iris_send_events(@renderer.iris, @renderer.pending_events)
+        renderer.pending_events = vec_new<StyleEvent>()

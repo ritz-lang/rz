@@ -1,0 +1,393 @@
+# lib/paint/mod.ritz - Painting module
+#
+# Generates paint commands from the render tree.
+# Paint commands are data structures that can be sent to Prism for rendering.
+#
+# Painting traverses the render tree and emits drawing primitives
+# (rectangles, text, images) for each visible node.
+#
+# Usage:
+#   import lib.paint.mod
+
+import ritzlib.sys
+import ritzlib.memory
+import ritzlib.gvec
+import lib.style.types
+import lib.tree.render_node
+
+# =============================================================================
+# Color Helper Functions
+# =============================================================================
+
+# Use Color from lib.style.types
+
+pub fn paint_color_with_opacity(c: @Color, opacity: f64) -> Color
+    let a_val: u8 = c.a
+    let a_i32: i32 = a_val as i32
+    let a_f64: f64 = a_i32 as f64
+    let new_a_f64: f64 = a_f64 * opacity
+    let new_a_i32: i32 = new_a_f64 as i32
+    let new_a: u8 = new_a_i32 as u8
+    color_rgba(c.r, c.g, c.b, new_a)
+
+# =============================================================================
+# Paint Rectangle
+# =============================================================================
+
+pub struct PaintRect
+    x: i32
+    y: i32
+    width: u32
+    height: u32
+
+pub fn paint_rect_new(x: i32, y: i32, width: u32, height: u32) -> PaintRect
+    PaintRect { x: x, y: y, width: width, height: height }
+
+pub fn paint_rect_zero() -> PaintRect
+    PaintRect { x: 0, y: 0, width: 0, height: 0 }
+
+pub fn paint_rect_is_empty(r: @PaintRect) -> i32
+    if r.width == 0
+        return 1
+    if r.height == 0
+        return 1
+    return 0
+
+# Check if two rectangles intersect
+pub fn paint_rect_intersects(a: @PaintRect, b: @PaintRect) -> i32
+    let a_right = a.x + a.width as i32
+    let a_bottom = a.y + a.height as i32
+    let b_right = b.x + b.width as i32
+    let b_bottom = b.y + b.height as i32
+
+    if a.x >= b_right
+        return 0
+    if b.x >= a_right
+        return 0
+    if a.y >= b_bottom
+        return 0
+    if b.y >= a_bottom
+        return 0
+    return 1
+
+# =============================================================================
+# Paint Commands
+# =============================================================================
+
+const PAINT_CMD_FILL_RECT: i32 = 0
+const PAINT_CMD_STROKE_RECT: i32 = 1
+const PAINT_CMD_DRAW_TEXT: i32 = 2
+const PAINT_CMD_DRAW_IMAGE: i32 = 3
+const PAINT_CMD_PUSH_CLIP: i32 = 4
+const PAINT_CMD_POP_CLIP: i32 = 5
+const PAINT_CMD_PUSH_OPACITY: i32 = 6
+const PAINT_CMD_POP_OPACITY: i32 = 7
+
+pub struct PaintCommand
+    cmd_type: i32
+    rect: PaintRect
+    color: Color
+    # For stroke commands
+    stroke_width: f64
+    # For opacity
+    opacity: f64
+    # For text (placeholder - would need string storage)
+    # For images (placeholder - would need image handle)
+
+pub fn paint_cmd_fill_rect(rect: PaintRect, color: Color) -> PaintCommand
+    PaintCommand {
+        cmd_type: PAINT_CMD_FILL_RECT,
+        rect: rect,
+        color: color,
+        stroke_width: 0.0,
+        opacity: 1.0
+    }
+
+pub fn paint_cmd_stroke_rect(rect: PaintRect, color: Color, width: f64) -> PaintCommand
+    PaintCommand {
+        cmd_type: PAINT_CMD_STROKE_RECT,
+        rect: rect,
+        color: color,
+        stroke_width: width,
+        opacity: 1.0
+    }
+
+pub fn paint_cmd_push_clip(rect: PaintRect) -> PaintCommand
+    PaintCommand {
+        cmd_type: PAINT_CMD_PUSH_CLIP,
+        rect: rect,
+        color: color_transparent(),
+        stroke_width: 0.0,
+        opacity: 1.0
+    }
+
+pub fn paint_cmd_pop_clip() -> PaintCommand
+    PaintCommand {
+        cmd_type: PAINT_CMD_POP_CLIP,
+        rect: paint_rect_zero(),
+        color: color_transparent(),
+        stroke_width: 0.0,
+        opacity: 1.0
+    }
+
+pub fn paint_cmd_push_opacity(opacity: f64) -> PaintCommand
+    PaintCommand {
+        cmd_type: PAINT_CMD_PUSH_OPACITY,
+        rect: paint_rect_zero(),
+        color: color_transparent(),
+        stroke_width: 0.0,
+        opacity: opacity
+    }
+
+pub fn paint_cmd_pop_opacity() -> PaintCommand
+    PaintCommand {
+        cmd_type: PAINT_CMD_POP_OPACITY,
+        rect: paint_rect_zero(),
+        color: color_transparent(),
+        stroke_width: 0.0,
+        opacity: 1.0
+    }
+
+# =============================================================================
+# Paint List (collects commands)
+# =============================================================================
+
+pub struct PaintList
+    commands: Vec<PaintCommand>
+
+pub fn paint_list_new() -> PaintList
+    PaintList { commands: vec_new<PaintCommand>() }
+
+pub fn paint_list_push(list: @&PaintList, cmd: PaintCommand)
+    vec_push<PaintCommand>(@list.commands, cmd)
+
+pub fn paint_list_count(list: @PaintList) -> u32
+    list.commands.len as u32
+
+pub fn paint_list_clear(list: @&PaintList)
+    list.commands.len = 0
+
+# =============================================================================
+# Paint Context
+# =============================================================================
+
+pub struct PaintContext
+    # Output command list
+    commands: @&PaintList
+    # Current clip rectangle (in absolute coordinates)
+    clip_x: i32
+    clip_y: i32
+    clip_width: u32
+    clip_height: u32
+    # Current transform offset (for nested positioning)
+    offset_x: i32
+    offset_y: i32
+    # Current opacity (inherited, multiplied down the tree)
+    opacity: f64
+
+pub fn paint_context_new(commands: @&PaintList, viewport_width: u32, viewport_height: u32) -> PaintContext
+    PaintContext {
+        commands: commands,
+        clip_x: 0,
+        clip_y: 0,
+        clip_width: viewport_width,
+        clip_height: viewport_height,
+        offset_x: 0,
+        offset_y: 0,
+        opacity: 1.0
+    }
+
+# =============================================================================
+# Node Painting
+# =============================================================================
+
+# Paint a single render node
+pub fn paint_node(tree: @RenderTree, node: @RenderNode, ctx: @&PaintContext)
+    # Skip invisible nodes
+    if node.style.visibility != VISIBILITY_VISIBLE
+        return
+
+    # Skip display: none
+    if node.style.display == DISPLAY_NONE
+        return
+
+    # Calculate absolute position
+    let abs_x = ctx.offset_x + node.layout.x
+    let abs_y = ctx.offset_y + node.layout.y
+
+    # Calculate border box
+    let border_x = abs_x - node.layout.padding_left - node.layout.border_left
+    let border_y = abs_y - node.layout.padding_top - node.layout.border_top
+    let pl: u32 = node.layout.padding_left as u32
+    let pr: u32 = node.layout.padding_right as u32
+    let bl: u32 = node.layout.border_left as u32
+    let br: u32 = node.layout.border_right as u32
+    let pt: u32 = node.layout.padding_top as u32
+    let pb: u32 = node.layout.padding_bottom as u32
+    let bt: u32 = node.layout.border_top as u32
+    let bb: u32 = node.layout.border_bottom as u32
+    let border_w = node.layout.width + pl + pr + bl + br
+    let border_h = node.layout.height + pt + pb + bt + bb
+
+    let border_rect = paint_rect_new(border_x, border_y, border_w, border_h)
+    let clip_rect = paint_rect_new(ctx.clip_x, ctx.clip_y, ctx.clip_width, ctx.clip_height)
+
+    # Check if visible (intersects clip)
+    if paint_rect_intersects(@border_rect, @clip_rect) == 0
+        return
+
+    # Paint background
+    paint_background(node, @border_rect, ctx)
+
+    # Paint borders
+    paint_borders(node, @border_rect, ctx)
+
+    # Paint content based on type
+    if node.content_type == CONTENT_TEXT
+        paint_text_placeholder(node, abs_x, abs_y, ctx)
+    else if node.content_type == CONTENT_IMAGE
+        paint_image_placeholder(node, abs_x, abs_y, node.layout.width, node.layout.height, ctx)
+    else if node.content_type == CONTENT_ELEMENT
+        # Paint children
+        paint_children(tree, node, abs_x, abs_y, ctx)
+
+# Paint all children of a node
+fn paint_children(tree: @RenderTree, node: @RenderNode, parent_x: i32, parent_y: i32, ctx: @&PaintContext)
+    # Calculate content area offset
+    let content_x = parent_x + node.layout.padding_left as i32 + node.layout.border_left as i32
+    let content_y = parent_y + node.layout.padding_top as i32 + node.layout.border_top as i32
+
+    # Save current context state
+    let saved_offset_x = ctx.offset_x
+    let saved_offset_y = ctx.offset_y
+    let saved_opacity = ctx.opacity
+
+    # Update context for children
+    ctx.offset_x = content_x
+    ctx.offset_y = content_y
+    ctx.opacity = ctx.opacity * node.style.opacity
+
+    # TODO: handle overflow clipping
+    # if node.style.overflow_x == OVERFLOW_HIDDEN ...
+
+    # Paint each child
+    var child_id = node.first_child
+    while node_id_is_valid(@child_id) != 0
+        let child = render_tree_get(tree, @child_id)
+        if child != null
+            paint_node(tree, child, ctx)
+            child_id = child.next_sibling
+        else
+            child_id = node_id_invalid()
+
+    # Restore context
+    ctx.offset_x = saved_offset_x
+    ctx.offset_y = saved_offset_y
+    ctx.opacity = saved_opacity
+
+# =============================================================================
+# Background Painting
+# =============================================================================
+
+fn paint_background(node: @RenderNode, rect: @PaintRect, ctx: @&PaintContext)
+    let bg = node.style.background_color
+    if color_is_transparent(@bg) != 0
+        return
+
+    # Apply inherited opacity
+    var color: Color
+    if ctx.opacity < 1.0
+        color = paint_color_with_opacity(@bg, ctx.opacity)
+    else
+        color = color_rgba(bg.r, bg.g, bg.b, bg.a)
+
+    let rect_copy = paint_rect_new(rect.x, rect.y, rect.width, rect.height)
+    let cmd = paint_cmd_fill_rect(rect_copy, color)
+    paint_list_push(ctx.commands, cmd)
+
+# =============================================================================
+# Border Painting
+# =============================================================================
+
+fn paint_borders(node: @RenderNode, border_rect: @PaintRect, ctx: @&PaintContext)
+    let border = node.style.border
+
+    # Top border
+    if border.top.width > 0.0
+        if border.top.style != BORDER_STYLE_NONE
+            let tw_u32: u32 = border.top.width as u32
+            let top_rect = paint_rect_new(border_rect.x, border_rect.y, border_rect.width, tw_u32)
+            var color = border.top.color
+            if ctx.opacity < 1.0
+                color = paint_color_with_opacity(@border.top.color, ctx.opacity)
+            let cmd = paint_cmd_fill_rect(top_rect, color)
+            paint_list_push(ctx.commands, cmd)
+
+    # Right border
+    if border.right.width > 0.0
+        if border.right.style != BORDER_STYLE_NONE
+            let rw_i32: i32 = border.right.width as i32
+            let rx = border_rect.x + border_rect.width as i32 - rw_i32
+            let rw_u32: u32 = border.right.width as u32
+            let right_rect = paint_rect_new(rx, border_rect.y, rw_u32, border_rect.height)
+            var color = border.right.color
+            if ctx.opacity < 1.0
+                color = paint_color_with_opacity(@border.right.color, ctx.opacity)
+            let cmd = paint_cmd_fill_rect(right_rect, color)
+            paint_list_push(ctx.commands, cmd)
+
+    # Bottom border
+    if border.bottom.width > 0.0
+        if border.bottom.style != BORDER_STYLE_NONE
+            let bw_i32: i32 = border.bottom.width as i32
+            let by = border_rect.y + border_rect.height as i32 - bw_i32
+            let bw_u32: u32 = border.bottom.width as u32
+            let bottom_rect = paint_rect_new(border_rect.x, by, border_rect.width, bw_u32)
+            var color = border.bottom.color
+            if ctx.opacity < 1.0
+                color = paint_color_with_opacity(@border.bottom.color, ctx.opacity)
+            let cmd = paint_cmd_fill_rect(bottom_rect, color)
+            paint_list_push(ctx.commands, cmd)
+
+    # Left border
+    if border.left.width > 0.0
+        if border.left.style != BORDER_STYLE_NONE
+            let lw_u32: u32 = border.left.width as u32
+            let left_rect = paint_rect_new(border_rect.x, border_rect.y, lw_u32, border_rect.height)
+            var color = border.left.color
+            if ctx.opacity < 1.0
+                color = paint_color_with_opacity(@border.left.color, ctx.opacity)
+            let cmd = paint_cmd_fill_rect(left_rect, color)
+            paint_list_push(ctx.commands, cmd)
+
+# =============================================================================
+# Text Painting (placeholder)
+# =============================================================================
+
+fn paint_text_placeholder(node: @RenderNode, x: i32, y: i32, ctx: @&PaintContext)
+    # TODO: integrate with Angelo for text shaping and rendering
+    # For now, we'd emit a text draw command
+    # Real implementation would use Angelo to shape text and draw glyphs
+    return
+
+# =============================================================================
+# Image Painting (placeholder)
+# =============================================================================
+
+fn paint_image_placeholder(node: @RenderNode, x: i32, y: i32, width: u32, height: u32, ctx: @&PaintContext)
+    # Draw a gray placeholder box for unloaded images
+    let placeholder_color = color_rgb(200, 200, 200)
+    let rect = paint_rect_new(x, y, width, height)
+    let cmd = paint_cmd_fill_rect(rect, placeholder_color)
+    paint_list_push(ctx.commands, cmd)
+
+# =============================================================================
+# Main Paint Entry
+# =============================================================================
+
+pub fn paint_tree(tree: @RenderTree, commands: @&PaintList, viewport_width: u32, viewport_height: u32)
+    var ctx = paint_context_new(commands, viewport_width, viewport_height)
+
+    let root = render_tree_root(tree)
+    if root != null
+        paint_node(tree, root, @&ctx)

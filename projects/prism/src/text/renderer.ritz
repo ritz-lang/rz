@@ -1,0 +1,236 @@
+# Prism - Text Renderer
+#
+# Renders text using Angelo for shaping and rasterization.
+# Blits glyph bitmaps to the framebuffer with alpha blending.
+
+import types { Point, Rect, Color }
+import text.font_manager { FontManager, FontId }
+import text.glyph_cache { GlyphCache, CachedGlyph }
+import angelo { Font, TextShaper, shape_text, rasterize_glyph }
+import angelo.shaper { GlyphRun, ShapedGlyph }
+import angelo.types { RasterizedGlyph, GlyphCacheKey }
+
+# Text renderer with caching
+pub struct TextRenderer
+    shaper: TextShaper
+    cache: GlyphCache
+    antialias: bool
+
+impl TextRenderer
+    pub fn new() -> TextRenderer
+        TextRenderer {
+            shaper: TextShaper.new(),
+            cache: GlyphCache.with_default_size(),
+            antialias: true
+        }
+
+    pub fn with_cache_size(capacity: usize) -> TextRenderer
+        TextRenderer {
+            shaper: TextShaper.new(),
+            cache: GlyphCache.new(capacity),
+            antialias: true
+        }
+
+    pub fn set_antialias(self:&, enabled: bool)
+        self.antialias = enabled
+
+    # Shape text into a glyph run
+    pub fn shape(self:&, font:& Font, text: StrView, font_id: FontId, font_size: f32) -> GlyphRun
+        shape_text(font, text, font_id.raw(), font_size)
+
+    # Render text to a pixel buffer
+    # Returns the damage rect (bounding box of rendered text)
+    pub fn render_text(
+        self:&,
+        font:& Font,
+        font_id: FontId,
+        text: StrView,
+        x: i32,
+        y: i32,          # baseline position
+        size_px: u32,
+        color: Color,
+        buffer:& Vec<u32>,
+        buffer_width: u32,
+        buffer_height: u32
+    ) -> Rect
+        # Shape the text
+        let run = self.shape(font, text, font_id, size_px as f32)
+
+        # Render the glyph run
+        self.render_glyph_run(font, font_id, @run, x, y, size_px, color, buffer, buffer_width, buffer_height)
+
+    # Render a pre-shaped glyph run
+    pub fn render_glyph_run(
+        self:&,
+        font:& Font,
+        font_id: FontId,
+        run: GlyphRun,
+        x: i32,
+        y: i32,          # baseline position
+        size_px: u32,
+        color: Color,
+        buffer:& Vec<u32>,
+        buffer_width: u32,
+        buffer_height: u32
+    ) -> Rect
+        let metrics = font.metrics()
+
+        var pen_x = x as f32
+        var min_x = x
+        var min_y = y
+        var max_x = x
+        var max_y = y
+
+        for shaped in @run.glyphs
+            # Get or render the glyph
+            let key = GlyphCacheKey.new(font_id.raw(), shaped.glyph_id as u16, size_px as u16)
+
+            # Check cache first, otherwise rasterize
+            let glyph_opt = font.glyph_outline(shaped.glyph_id as u16)
+            match glyph_opt
+                Some(outline) =>
+                    let glyph_metrics_opt = font.glyph_metrics(shaped.glyph_id as u16)
+                    let (adv_width, lsb) = match glyph_metrics_opt
+                        Some(m) => (m.advance_width, m.left_side_bearing)
+                        None => (0u16, 0i16)
+
+                    let rasterized = rasterize_glyph(
+                        outline,
+                        metrics.units_per_em,
+                        size_px,
+                        adv_width,
+                        lsb,
+                        self.antialias
+                    )
+
+                    # Calculate glyph position
+                    let glyph_x = (pen_x + shaped.x_offset).round() as i32 + rasterized.bearing_x
+                    let glyph_y = y - rasterized.bearing_y
+
+                    # Blit the glyph with alpha blending
+                    self.blit_glyph(
+                        @rasterized,
+                        glyph_x,
+                        glyph_y,
+                        color,
+                        buffer,
+                        buffer_width,
+                        buffer_height
+                    )
+
+                    # Update bounds
+                    if glyph_x < min_x
+                        min_x = glyph_x
+                    if glyph_y < min_y
+                        min_y = glyph_y
+                    let right = glyph_x + rasterized.width as i32
+                    let bottom = glyph_y + rasterized.height as i32
+                    if right > max_x
+                        max_x = right
+                    if bottom > max_y
+                        max_y = bottom
+
+                None =>
+                    # No outline (e.g., space character)
+                    ()
+
+            pen_x = pen_x + shaped.x_advance
+
+        # Return damage rect
+        if max_x > min_x and max_y > min_y
+            Rect.new(min_x, min_y, (max_x - min_x) as u32, (max_y - min_y) as u32)
+        else
+            Rect.zero()
+
+    # Blit a rasterized glyph to the buffer with alpha blending
+    fn blit_glyph(
+        self,
+        glyph: @RasterizedGlyph,
+        x: i32,
+        y: i32,
+        color: Color,
+        buffer:& Vec<u32>,
+        buffer_width: u32,
+        buffer_height: u32
+    )
+        for gy in 0..glyph.height
+            let dst_y = y + gy as i32
+            if dst_y < 0 or dst_y >= buffer_height as i32
+                continue
+
+            for gx in 0..glyph.width
+                let dst_x = x + gx as i32
+                if dst_x < 0 or dst_x >= buffer_width as i32
+                    continue
+
+                let alpha = glyph.bitmap[(gy * glyph.width + gx) as usize]
+                if alpha == 0
+                    continue
+
+                let dst_idx = (dst_y as u32 * buffer_width + dst_x as u32) as usize
+
+                if alpha == 255
+                    # Fully opaque - just write the color
+                    buffer[dst_idx] = color.to_argb()
+                else
+                    # Alpha blend
+                    let dst_color = Color.from_argb(buffer[dst_idx])
+                    let blended = blend_alpha(color, dst_color, alpha)
+                    buffer[dst_idx] = blended.to_argb()
+
+    # Get cache hit rate for stats
+    pub fn cache_hit_rate(self) -> f32
+        self.cache.hit_rate()
+
+    pub fn clear_cache(self:&)
+        self.cache.clear()
+
+# Alpha blend source color over destination
+# alpha is 0-255 coverage of the source
+fn blend_alpha(src: Color, dst: Color, alpha: u8) -> Color
+    let a = alpha as u32
+    let inv_a = 255 - a
+
+    let r = (src.r() as u32 * a + dst.r() as u32 * inv_a) / 255
+    let g = (src.g() as u32 * a + dst.g() as u32 * inv_a) / 255
+    let b = (src.b() as u32 * a + dst.b() as u32 * inv_a) / 255
+
+    Color.rgb(r as u8, g as u8, b as u8)
+
+# Tests
+
+[[test]]
+fn test_text_renderer_creation() -> i32
+    let renderer = TextRenderer.new()
+    assert renderer.cache_hit_rate() < 0.01
+    0
+
+[[test]]
+fn test_blend_alpha_opaque() -> i32
+    let src = Color.rgb(255, 0, 0)
+    let dst = Color.rgb(0, 255, 0)
+    let result = blend_alpha(src, dst, 255)
+    assert result.r() == 255
+    assert result.g() == 0
+    assert result.b() == 0
+    0
+
+[[test]]
+fn test_blend_alpha_transparent() -> i32
+    let src = Color.rgb(255, 0, 0)
+    let dst = Color.rgb(0, 255, 0)
+    let result = blend_alpha(src, dst, 0)
+    assert result.r() == 0
+    assert result.g() == 255
+    assert result.b() == 0
+    0
+
+[[test]]
+fn test_blend_alpha_half() -> i32
+    let src = Color.rgb(255, 0, 0)
+    let dst = Color.rgb(0, 255, 0)
+    let result = blend_alpha(src, dst, 128)
+    # Should be roughly half-way
+    assert result.r() > 100 and result.r() < 156
+    assert result.g() > 100 and result.g() < 156
+    0

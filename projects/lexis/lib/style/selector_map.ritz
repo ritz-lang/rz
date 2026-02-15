@@ -1,0 +1,267 @@
+# lib/style/selector_map.ritz - Indexed Selector Storage
+#
+# Indexes CSS rules by their key (rightmost) selector for fast lookup.
+# Instead of checking every rule against every element, we only check
+# rules that could possibly match based on the element's ID, classes, or tag.
+#
+# Example: For element <div class="foo bar" id="main">, we check:
+#   - id_rules["main"]
+#   - class_rules["foo"]
+#   - class_rules["bar"]
+#   - tag_rules["div"]
+#   - universal_rules
+
+import lib.css.selector { ComplexSelector, CompoundSelector, SimpleSelector, Specificity,
+                          SELECTOR_ID, SELECTOR_CLASS, SELECTOR_TYPE, SELECTOR_UNIVERSAL,
+                          complex_selector_specificity, simple_selector_value }
+import lib.css.rule { StyleRule, Declaration, DeclarationBlock }
+
+# =============================================================================
+# Rule Entry
+# =============================================================================
+
+# A single rule entry in the index
+pub struct RuleEntry
+    selector: ComplexSelector
+    declarations: DeclarationBlock
+    specificity: Specificity
+    source_order: u32
+
+pub fn rule_entry_new(selector: ComplexSelector, declarations: DeclarationBlock, order: u32) -> RuleEntry
+    RuleEntry {
+        selector: selector,
+        declarations: declarations,
+        specificity: complex_selector_specificity(selector),
+        source_order: order
+    }
+
+# =============================================================================
+# Rule Bucket (for hash map entries)
+# =============================================================================
+
+const MAX_RULES_PER_BUCKET: u32 = 256
+
+pub struct RuleBucket
+    rules: [MAX_RULES_PER_BUCKET]RuleEntry
+    count: u32
+
+pub fn rule_bucket_new() -> RuleBucket
+    var bucket: RuleBucket
+    bucket.count = 0
+    bucket
+
+pub fn rule_bucket_add(bucket:& RuleBucket, entry: RuleEntry)
+    if bucket.count < MAX_RULES_PER_BUCKET
+        bucket.rules[bucket.count] = entry
+        bucket.count = bucket.count + 1
+
+# =============================================================================
+# Hash Map for Rule Storage
+# =============================================================================
+
+const HASH_MAP_SIZE: u32 = 256
+
+fn hash_string(s: StrView) -> u32
+    var hash: u32 = 5381
+    var i: u64 = 0
+    while i < s.len
+        hash = ((hash << 5) + hash) + s.data[i] as u32
+        i = i + 1
+    hash % HASH_MAP_SIZE
+
+# =============================================================================
+# Selector Map
+# =============================================================================
+
+pub struct SelectorMap
+    # Index by ID
+    id_rules: [HASH_MAP_SIZE]RuleBucket
+    id_keys: [HASH_MAP_SIZE][64]u8
+    id_key_lens: [HASH_MAP_SIZE]u32
+
+    # Index by class
+    class_rules: [HASH_MAP_SIZE]RuleBucket
+    class_keys: [HASH_MAP_SIZE][64]u8
+    class_key_lens: [HASH_MAP_SIZE]u32
+
+    # Index by tag name
+    tag_rules: [HASH_MAP_SIZE]RuleBucket
+    tag_keys: [HASH_MAP_SIZE][64]u8
+    tag_key_lens: [HASH_MAP_SIZE]u32
+
+    # Universal selector rules (match everything)
+    universal_rules: RuleBucket
+
+pub fn selector_map_new() -> SelectorMap
+    var map: SelectorMap
+
+    var i: u32 = 0
+    while i < HASH_MAP_SIZE
+        map.id_rules[i] = rule_bucket_new()
+        map.id_key_lens[i] = 0
+        map.class_rules[i] = rule_bucket_new()
+        map.class_key_lens[i] = 0
+        map.tag_rules[i] = rule_bucket_new()
+        map.tag_key_lens[i] = 0
+        i = i + 1
+
+    map.universal_rules = rule_bucket_new()
+
+    map
+
+# =============================================================================
+# Indexing Rules
+# =============================================================================
+
+pub fn selector_map_add_rule(map:& SelectorMap, rule: StyleRule)
+    # For each selector in the rule
+    var sel_idx: u32 = 0
+    while sel_idx < rule.selectors.selector_count
+        let complex = rule.selectors.selectors[sel_idx]
+        let entry = rule_entry_new(complex, rule.declarations, rule.source_order)
+
+        # Get the key selector (rightmost compound selector)
+        if complex.compound_count > 0
+            let key_compound = complex.compounds[complex.compound_count - 1]
+            index_by_key_selector(map, entry, key_compound)
+
+        sel_idx = sel_idx + 1
+
+fn index_by_key_selector(map:& SelectorMap, entry: RuleEntry, compound: CompoundSelector)
+    # Find the most restrictive simple selector to index by
+    # Priority: ID > class > tag > universal
+
+    var found_id = 0
+    var found_class = 0
+    var found_tag = 0
+
+    var i: u32 = 0
+    while i < compound.simple_count
+        let simple = compound.simple[i]
+
+        if simple.kind == SELECTOR_ID and found_id == 0
+            # Index by ID
+            let id_value = simple_selector_value(simple)
+            let hash = hash_string(id_value)
+            rule_bucket_add(map.id_rules[hash], entry)
+            copy_key(map.id_keys[hash][0], map.id_key_lens[hash], id_value)
+            found_id = 1
+            return  # ID is most specific, done
+
+        else if simple.kind == SELECTOR_CLASS and found_class == 0
+            # Will index by class
+            let class_value = simple_selector_value(simple)
+            let hash = hash_string(class_value)
+            rule_bucket_add(map.class_rules[hash], entry)
+            copy_key(map.class_keys[hash][0], map.class_key_lens[hash], class_value)
+            found_class = 1
+
+        else if simple.kind == SELECTOR_TYPE and found_tag == 0
+            # Will index by tag
+            let tag_value = simple_selector_value(simple)
+            let hash = hash_string(tag_value)
+            rule_bucket_add(map.tag_rules[hash], entry)
+            copy_key(map.tag_keys[hash][0], map.tag_key_lens[hash], tag_value)
+            found_tag = 1
+
+        i = i + 1
+
+    # If we found class or tag, we're done
+    if found_class == 1 or found_tag == 1
+        return
+
+    # Universal selector - goes in universal bucket
+    rule_bucket_add(map.universal_rules, entry)
+
+fn copy_key(dst:& u8, len:& u32, src: StrView)
+    var i: u64 = 0
+    while i < src.len and i < 64
+        dst[i] = src.data[i]
+        i = i + 1
+    @len = i as u32
+
+# =============================================================================
+# Looking Up Rules
+# =============================================================================
+
+# Get rules that might match an element with given ID, classes, and tag
+# Caller should then do full selector matching on these candidates
+
+const MAX_CANDIDATE_RULES: u32 = 512
+
+pub struct RuleCandidates
+    rules: [MAX_CANDIDATE_RULES]RuleEntry
+    count: u32
+
+pub fn rule_candidates_new() -> RuleCandidates
+    var c: RuleCandidates
+    c.count = 0
+    c
+
+pub fn selector_map_get_candidates(map: SelectorMap, id: StrView, classes: StrView, tag: StrView) -> RuleCandidates
+    var candidates = rule_candidates_new()
+
+    # Add ID rules
+    if id.len > 0
+        let hash = hash_string(id)
+        add_bucket_to_candidates(candidates, map.id_rules[hash])
+
+    # Add class rules (need to split classes by space)
+    if classes.len > 0
+        # For each class in the space-separated list
+        var start: u64 = 0
+        var i: u64 = 0
+        while i <= classes.len
+            if i == classes.len or classes.data[i] == 32  # space
+                if i > start
+                    let class_name = StrView {
+                        data: @classes.data[start],
+                        len: i - start
+                    }
+                    let hash = hash_string(class_name)
+                    add_bucket_to_candidates(candidates, map.class_rules[hash])
+                start = i + 1
+            i = i + 1
+
+    # Add tag rules
+    if tag.len > 0
+        let hash = hash_string(tag)
+        add_bucket_to_candidates(candidates, map.tag_rules[hash])
+
+    # Add universal rules
+    add_bucket_to_candidates(candidates, map.universal_rules)
+
+    candidates
+
+fn add_bucket_to_candidates(candidates:& RuleCandidates, bucket: RuleBucket)
+    var i: u32 = 0
+    while i < bucket.count and candidates.count < MAX_CANDIDATE_RULES
+        candidates.rules[candidates.count] = bucket.rules[i]
+        candidates.count = candidates.count + 1
+        i = i + 1
+
+# =============================================================================
+# Statistics (for debugging)
+# =============================================================================
+
+pub struct SelectorMapStats
+    id_rule_count: u32
+    class_rule_count: u32
+    tag_rule_count: u32
+    universal_rule_count: u32
+
+pub fn selector_map_stats(map: SelectorMap) -> SelectorMapStats
+    var stats: SelectorMapStats
+    stats.id_rule_count = 0
+    stats.class_rule_count = 0
+    stats.tag_rule_count = 0
+    stats.universal_rule_count = map.universal_rules.count
+
+    var i: u32 = 0
+    while i < HASH_MAP_SIZE
+        stats.id_rule_count = stats.id_rule_count + map.id_rules[i].count
+        stats.class_rule_count = stats.class_rule_count + map.class_rules[i].count
+        stats.tag_rule_count = stats.tag_rule_count + map.tag_rules[i].count
+        i = i + 1
+
+    stats

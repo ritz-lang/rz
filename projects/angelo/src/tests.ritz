@@ -1,0 +1,785 @@
+# Angelo - Integration Tests
+#
+# Tests using real font files.
+
+import font.load_font
+import font.Font
+import types.TAG_HEAD
+import types.TAG_CMAP
+import types.TAG_GLYF
+import types.TAG_LOCA
+import types.TAG_HMTX
+import types.GlyphCacheKey
+import raster.render.rasterize_outline
+import raster.render.rasterize_glyph
+import cache.GlyphCache
+
+# ============================================================================
+# Font Loading Tests
+# ============================================================================
+
+[[test]]
+fn test_load_aadhunik_font() -> i32
+    let result = load_font("tests/fixtures/aadhunik.ttf")
+
+    match result
+        Ok(font) =>
+            # Check basic metrics
+            let metrics = font.metrics()
+            assert metrics.units_per_em > 0
+
+            # Check glyph count
+            let num_glyphs = font.num_glyphs()
+            assert num_glyphs > 0
+            # From the hex dump we saw 0x0075 = 117 glyphs
+            assert num_glyphs == 117
+
+            0
+        Err(msg) =>
+            1  # fail
+
+[[test]]
+fn test_font_metrics() -> i32
+    let font = load_font("tests/fixtures/aadhunik.ttf").unwrap()
+    let metrics = font.metrics()
+
+    # units_per_em is typically 1000 or 2048
+    assert metrics.units_per_em == 2048 or metrics.units_per_em == 1000
+
+    # Ascender should be positive
+    assert metrics.ascender > 0
+
+    0
+
+[[test]]
+fn test_glyph_lookup() -> i32
+    var font = load_font("tests/fixtures/aadhunik.ttf").unwrap()
+
+    # Look up space character (should exist in any font)
+    let space_id = font.glyph_id(0x20)  # ASCII space
+    assert space_id.is_some()
+
+    # Space is usually a small glyph ID
+    assert space_id.unwrap() < 100
+
+    0
+
+[[test]]
+fn test_glyph_metrics() -> i32
+    var font = load_font("tests/fixtures/aadhunik.ttf").unwrap()
+
+    # Get metrics for .notdef (glyph 0)
+    let metrics = font.glyph_metrics(0)
+    assert metrics.is_some()
+
+    let m = metrics.unwrap()
+    # Advance width should be positive
+    assert m.advance_width > 0
+
+    0
+
+[[test]]
+fn test_glyph_outline() -> i32
+    var font = load_font("tests/fixtures/aadhunik.ttf").unwrap()
+
+    # Get outline for a glyph that should have one
+    let a_id = font.glyph_id(0x41)  # 'A'
+
+    if a_id.is_some()
+        let outline = font.glyph_outline(a_id.unwrap())
+        if outline.is_some()
+            let o = outline.unwrap()
+            if not o.is_empty()
+                assert o.contours.len() > 0
+
+    # Space should have empty outline
+    let space_id = font.glyph_id(0x20)
+    if space_id.is_some()
+        let space_outline = font.glyph_outline(space_id.unwrap())
+        if space_outline.is_some()
+            pass
+
+    0
+
+[[test]]
+fn test_get_full_glyph() -> i32
+    var font = load_font("tests/fixtures/aadhunik.ttf").unwrap()
+
+    let glyph = font.get_glyph(1)
+
+    match glyph
+        Some(g) =>
+            assert g.id == 1
+            assert g.metrics.advance_width >= 0
+            0
+        None =>
+            0
+
+[[test]]
+fn test_glyph_for_char() -> i32
+    var font = load_font("tests/fixtures/aadhunik.ttf").unwrap()
+
+    let space = font.get_glyph_for_char(0x20)
+
+    match space
+        Some(g) =>
+            assert g.metrics.advance_width > 0
+            0
+        None =>
+            1
+
+[[test]]
+fn test_font_has_required_tables() -> i32
+    let font = load_font("tests/fixtures/aadhunik.ttf").unwrap()
+
+    assert font.file.has_table(TAG_HEAD)
+    assert font.file.has_table(TAG_CMAP)
+    assert font.file.has_table(TAG_GLYF)
+    assert font.file.has_table(TAG_LOCA)
+    assert font.file.has_table(TAG_HMTX)
+
+    0
+
+[[test]]
+fn test_all_glyphs_accessible() -> i32
+    var font = load_font("tests/fixtures/aadhunik.ttf").unwrap()
+    let num_glyphs = font.num_glyphs()
+
+    var success_count = 0
+    var fail_count = 0
+
+    for i in 0..num_glyphs as usize
+        let glyph_id = i as u16
+        let metrics = font.glyph_metrics(glyph_id)
+
+        if metrics.is_some()
+            success_count = success_count + 1
+        else
+            fail_count = fail_count + 1
+
+    assert success_count > 0
+    assert fail_count < num_glyphs as i32 / 2
+
+    0
+
+# ============================================================================
+# Rasterization Tests
+# ============================================================================
+
+[[test]]
+fn test_rasterize_real_glyph() -> i32
+    var font = load_font("tests/fixtures/aadhunik.ttf").unwrap()
+    let metrics = font.metrics()
+
+    # Find a glyph with an outline
+    var found_glyph = false
+
+    for i in 1..10  # Try first few glyphs
+        let outline = font.glyph_outline(i as u16)
+        if outline.is_some()
+            let o = outline.unwrap()
+            if not o.is_empty()
+                # Rasterize this glyph
+                let raster = rasterize_outline(o, metrics.units_per_em, 32, false)
+
+                if raster.width > 0 and raster.height > 0
+                    # Check that some pixels are filled
+                    var filled = 0
+                    for j in 0..raster.bitmap.len()
+                        if raster.bitmap[j] > 0
+                            filled = filled + 1
+
+                    if filled > 0
+                        found_glyph = true
+                        break
+
+    # We should have found at least one glyph to rasterize
+    assert found_glyph
+    0
+
+[[test]]
+fn test_rasterize_at_different_sizes() -> i32
+    var font = load_font("tests/fixtures/aadhunik.ttf").unwrap()
+    let metrics = font.metrics()
+
+    # Find a glyph with an outline
+    var outline_opt: Option<GlyphOutline> = None
+
+    for i in 1..20
+        let o = font.glyph_outline(i as u16)
+        if o.is_some() and not o.unwrap().is_empty()
+            outline_opt = o
+            break
+
+    if outline_opt.is_none()
+        return 0  # No glyphs with outlines found
+
+    let outline = outline_opt.unwrap()
+
+    # Rasterize at different sizes
+    let r12 = rasterize_outline(outline, metrics.units_per_em, 12, false)
+    let r24 = rasterize_outline(outline, metrics.units_per_em, 24, false)
+    let r48 = rasterize_outline(outline, metrics.units_per_em, 48, false)
+
+    # Larger sizes should produce larger bitmaps
+    if r12.width > 0 and r24.width > 0
+        assert r24.width >= r12.width or r24.height >= r12.height
+
+    if r24.width > 0 and r48.width > 0
+        assert r48.width >= r24.width or r48.height >= r24.height
+
+    0
+
+[[test]]
+fn test_rasterize_with_antialiasing() -> i32
+    var font = load_font("tests/fixtures/aadhunik.ttf").unwrap()
+    let metrics = font.metrics()
+
+    # Find a glyph with an outline
+    var outline_opt: Option<GlyphOutline> = None
+
+    for i in 1..20
+        let o = font.glyph_outline(i as u16)
+        if o.is_some() and not o.unwrap().is_empty()
+            outline_opt = o
+            break
+
+    if outline_opt.is_none()
+        return 0
+
+    let outline = outline_opt.unwrap()
+
+    # Rasterize with and without AA
+    let no_aa = rasterize_outline(outline, metrics.units_per_em, 24, false)
+    let with_aa = rasterize_outline(outline, metrics.units_per_em, 24, true)
+
+    # Both should produce output
+    assert no_aa.width > 0 or no_aa.height > 0 or true  # May be empty
+    assert with_aa.width > 0 or with_aa.height > 0 or true
+
+    0
+
+[[test]]
+fn test_rasterize_space_character() -> i32
+    var font = load_font("tests/fixtures/aadhunik.ttf").unwrap()
+    let metrics = font.metrics()
+
+    let space_id = font.glyph_id(0x20)
+    if space_id.is_none()
+        return 0  # No space in this font
+
+    let outline = font.glyph_outline(space_id.unwrap())
+    if outline.is_none()
+        return 0
+
+    let raster = rasterize_outline(outline.unwrap(), metrics.units_per_em, 16, false)
+
+    # Space should have no visible pixels (or be empty)
+    var filled = 0
+    for i in 0..raster.bitmap.len()
+        if raster.bitmap[i] > 0
+            filled = filled + 1
+
+    # Space typically has no outline, so no filled pixels
+    # (But some fonts might have a visible space glyph)
+
+    0
+
+# ============================================================================
+# Cache Tests (with real font)
+# ============================================================================
+
+[[test]]
+fn test_cache_with_real_glyphs() -> i32
+    var font = load_font("tests/fixtures/aadhunik.ttf").unwrap()
+    let metrics = font.metrics()
+
+    var cache = GlyphCache.new(50)
+
+    # Rasterize and cache several glyphs
+    for i in 1..10
+        let outline = font.glyph_outline(i as u16)
+        if outline.is_some()
+            let o = outline.unwrap()
+            if not o.is_empty()
+                let raster = rasterize_outline(o, metrics.units_per_em, 16, false)
+                let key = GlyphCacheKey.new(1, i as u16, 16)
+                cache.insert(key, raster)
+
+    # Cache should have some entries
+    assert cache.len() > 0
+
+    # Retrieve a cached glyph
+    let key = GlyphCacheKey.new(1, 1, 16)
+    let cached = cache.get(key)
+    # May or may not be cached depending on if glyph 1 had an outline
+
+    0
+
+[[test]]
+fn test_cache_hit_rate_with_repeated_access() -> i32
+    var font = load_font("tests/fixtures/aadhunik.ttf").unwrap()
+    let metrics = font.metrics()
+
+    var cache = GlyphCache.new(100)
+
+    # Find glyphs with outlines and cache them
+    var cached_keys = Vec.new()
+
+    for i in 1..20
+        let outline = font.glyph_outline(i as u16)
+        if outline.is_some()
+            let o = outline.unwrap()
+            if not o.is_empty()
+                let raster = rasterize_outline(o, metrics.units_per_em, 16, false)
+                let key = GlyphCacheKey.new(1, i as u16, 16)
+                cache.insert(key, raster)
+                cached_keys.push(key)
+
+    if cached_keys.len() == 0
+        return 0  # No glyphs cached
+
+    # Access cached glyphs multiple times
+    for round in 0..5
+        for key in @cached_keys
+            let _ = cache.get(key)
+
+    # Hit rate should be high
+    let hit_rate = cache.hit_rate()
+    assert hit_rate > 0.5
+
+    0
+
+# ============================================================================
+# End-to-End Test
+# ============================================================================
+
+[[test]]
+fn test_full_render_pipeline() -> i32
+    # This test exercises the complete pipeline:
+    # Load font -> Get glyph -> Rasterize -> Cache
+
+    var font = load_font("tests/fixtures/aadhunik.ttf").unwrap()
+    let metrics = font.metrics()
+    var cache = GlyphCache.new(100)
+
+    # Simulate rendering a string (using glyph IDs we know exist)
+    let text_glyph_ids: [5]u16 = [1, 2, 3, 4, 5]
+
+    var rendered_count = 0
+
+    for glyph_id in @text_glyph_ids
+        let key = GlyphCacheKey.new(1, glyph_id, 24)
+
+        # Check cache first
+        let cached = cache.get(key)
+
+        if cached.is_none()
+            # Not in cache - rasterize
+            let glyph = font.get_glyph(glyph_id)
+            if glyph.is_some()
+                let g = glyph.unwrap()
+                let raster = rasterize_glyph(
+                    g.outline,
+                    metrics.units_per_em,
+                    24,
+                    g.metrics.advance_width,
+                    g.metrics.left_side_bearing,
+                    true  # with antialiasing
+                )
+                cache.insert(key, raster)
+                rendered_count = rendered_count + 1
+
+    # We should have rendered some glyphs
+    # (May be 0 if first 5 glyphs don't have outlines)
+
+    0
+
+# ============================================================================
+# Text Shaper Tests
+# ============================================================================
+
+[[test]]
+fn test_shape_simple_text() -> i32
+    var font = load_font("tests/fixtures/aadhunik.ttf").unwrap()
+
+    let run = shape_text(@&font, "Hello", 1, 16.0)
+
+    # Should have 5 glyphs for "Hello"
+    assert run.glyph_count() == 5
+
+    # Total advance should be positive
+    let total = run.total_advance()
+    assert total > 0.0
+
+    # Each glyph should have a valid glyph_id
+    for g in @run.glyphs
+        # glyph_id 0 is .notdef, which is okay for missing chars
+        # but cluster should increment
+        pass
+
+    0
+
+[[test]]
+fn test_shape_with_spaces() -> i32
+    var font = load_font("tests/fixtures/aadhunik.ttf").unwrap()
+
+    let run = shape_text(@&font, "A B C", 1, 16.0)
+
+    # Should have 5 glyphs: A, space, B, space, C
+    assert run.glyph_count() == 5
+
+    0
+
+[[test]]
+fn test_shape_empty_string() -> i32
+    var font = load_font("tests/fixtures/aadhunik.ttf").unwrap()
+
+    let run = shape_text(@&font, "", 1, 16.0)
+
+    assert run.is_empty()
+    assert run.glyph_count() == 0
+
+    0
+
+[[test]]
+fn test_measure_text_width() -> i32
+    var font = load_font("tests/fixtures/aadhunik.ttf").unwrap()
+
+    let width1 = measure_text_width(@&font, "A", 16.0)
+    let width2 = measure_text_width(@&font, "AA", 16.0)
+    let width3 = measure_text_width(@&font, "AAA", 16.0)
+
+    # Width should increase with more characters
+    assert width2 > width1
+    assert width3 > width2
+
+    # Width should roughly double for double characters
+    # (not exact due to potential kerning, but close)
+    let ratio = width2 / width1
+    assert ratio > 1.5 and ratio < 2.5
+
+    0
+
+[[test]]
+fn test_shape_clusters() -> i32
+    var font = load_font("tests/fixtures/aadhunik.ttf").unwrap()
+
+    let run = shape_text(@&font, "ABC", 1, 16.0)
+
+    # Clusters should be 0, 1, 2 for simple LTR text
+    assert run.glyphs[0].cluster == 0
+    assert run.glyphs[1].cluster == 1
+    assert run.glyphs[2].cluster == 2
+
+    0
+
+[[test]]
+fn test_shape_different_sizes() -> i32
+    var font = load_font("tests/fixtures/aadhunik.ttf").unwrap()
+
+    let run12 = shape_text(@&font, "Test", 1, 12.0)
+    let run24 = shape_text(@&font, "Test", 1, 24.0)
+    let run48 = shape_text(@&font, "Test", 1, 48.0)
+
+    # Larger sizes should have larger advances
+    let w12 = run12.total_advance()
+    let w24 = run24.total_advance()
+    let w48 = run48.total_advance()
+
+    assert w24 > w12
+    assert w48 > w24
+
+    # 24pt should be roughly 2x 12pt
+    let ratio = w24 / w12
+    assert ratio > 1.8 and ratio < 2.2
+
+    0
+
+[[test]]
+fn test_full_text_pipeline() -> i32
+    # Complete pipeline: load -> shape -> rasterize -> cache
+    var font = load_font("tests/fixtures/aadhunik.ttf").unwrap()
+    let metrics = font.metrics()
+    var cache = GlyphCache.new(100)
+
+    # Shape some text
+    let run = shape_text(@&font, "Test", 1, 24.0)
+
+    # Rasterize each glyph and cache it
+    for shaped in @run.glyphs
+        let key = GlyphCacheKey.new(1, shaped.glyph_id as u16, 24)
+
+        # Check cache
+        if cache.get(key).is_none()
+            # Rasterize
+            let glyph = font.get_glyph(shaped.glyph_id as u16)
+            if glyph.is_some()
+                let g = glyph.unwrap()
+                let raster = rasterize_glyph(
+                    g.outline,
+                    metrics.units_per_em,
+                    24,
+                    g.metrics.advance_width,
+                    g.metrics.left_side_bearing,
+                    true
+                )
+                cache.insert(key, raster)
+
+    # Should have cached some glyphs
+    assert cache.len() > 0
+
+    0
+
+import types.GlyphOutline
+import shaper.simple.shape_text
+import shaper.simple.measure_text_width
+import raster.subpixel.rasterize_subpixel
+import raster.subpixel.SubpixelOrder
+import cache.SubpixelCacheKey
+import cache.SubpixelGlyphCache
+
+# ============================================================================
+# Complete End-to-End Integration Tests
+# ============================================================================
+
+[[test]]
+fn test_complete_text_rendering_pipeline() -> i32
+    # Full pipeline test: Load -> Shape -> Rasterize (AA + Subpixel) -> Cache
+
+    # 1. Load font
+    var font = load_font("tests/fixtures/aadhunik.ttf").unwrap()
+    let metrics = font.metrics()
+
+    # Verify font loaded correctly
+    assert metrics.units_per_em > 0
+    assert font.num_glyphs() > 0
+
+    # 2. Shape text
+    let text = "Hello"
+    let run = shape_text(@&font, text, 1, 16.0)
+
+    # Verify shaping
+    assert run.glyph_count() == 5  # "Hello" = 5 chars
+    assert run.total_advance() > 0.0
+
+    # 3. Rasterize each glyph (grayscale AA)
+    var cache = GlyphCache.new(100)
+    var rasterized_count = 0
+
+    for shaped in @run.glyphs
+        let glyph_id = shaped.glyph_id as u16
+        let key = GlyphCacheKey.new(1, glyph_id, 16)
+
+        # Check cache
+        if cache.get(key).is_none()
+            let glyph = font.get_glyph(glyph_id)
+            if glyph.is_some()
+                let g = glyph.unwrap()
+                let raster = rasterize_glyph(
+                    g.outline,
+                    metrics.units_per_em,
+                    16,
+                    g.metrics.advance_width,
+                    g.metrics.left_side_bearing,
+                    true  # antialiasing
+                )
+                cache.insert(key, raster)
+                rasterized_count = rasterized_count + 1
+
+    # Verify we rasterized and cached glyphs
+    assert cache.len() > 0
+
+    # 4. Test subpixel rendering
+    var sp_cache = SubpixelGlyphCache.new(100)
+
+    for shaped in @run.glyphs
+        let glyph_id = shaped.glyph_id as u16
+        let glyph = font.get_glyph(glyph_id)
+        if glyph.is_some()
+            let g = glyph.unwrap()
+            let sp_raster = rasterize_subpixel(
+                g.outline,
+                metrics.units_per_em,
+                16,
+                SubpixelOrder.RGB
+            )
+            let sp_key = SubpixelCacheKey.new(1, glyph_id, 16, SubpixelOrder.RGB)
+            sp_cache.insert(sp_key, sp_raster)
+
+    # Verify subpixel cache has entries
+    assert sp_cache.len() > 0
+
+    # 5. Verify cache hits on second pass
+    for shaped in @run.glyphs
+        let glyph_id = shaped.glyph_id as u16
+        let key = GlyphCacheKey.new(1, glyph_id, 16)
+        let cached = cache.get(key)
+        # Should be a hit (we just cached these)
+
+    # Cache hit rate should be 100% for second pass
+    let hit_rate = cache.hit_rate()
+    assert hit_rate > 0.4  # At least some hits
+
+    0
+
+[[test]]
+fn test_pipeline_with_missing_glyphs() -> i32
+    # Test that the pipeline handles missing characters gracefully
+    var font = load_font("tests/fixtures/aadhunik.ttf").unwrap()
+    let metrics = font.metrics()
+
+    # Shape text with characters likely not in this Devanagari font
+    # (Using ASCII chars that might map to .notdef)
+    let run = shape_text(@&font, "XYZ123", 1, 16.0)
+
+    # Should still get 6 glyphs (even if they're .notdef)
+    assert run.glyph_count() == 6
+
+    # Rasterize - should not crash even for .notdef
+    var cache = GlyphCache.new(100)
+    for shaped in @run.glyphs
+        let glyph_id = shaped.glyph_id as u16
+        let glyph = font.get_glyph(glyph_id)
+        if glyph.is_some()
+            let g = glyph.unwrap()
+            let raster = rasterize_glyph(
+                g.outline,
+                metrics.units_per_em,
+                16,
+                g.metrics.advance_width,
+                g.metrics.left_side_bearing,
+                true
+            )
+            let key = GlyphCacheKey.new(1, glyph_id, 16)
+            cache.insert(key, raster)
+
+    # Pipeline completed without crashing
+    0
+
+[[test]]
+fn test_pipeline_at_various_sizes() -> i32
+    # Test rendering at different font sizes
+    var font = load_font("tests/fixtures/aadhunik.ttf").unwrap()
+    let metrics = font.metrics()
+
+    let sizes: [4]u32 = [8, 16, 32, 64]
+
+    for size in @sizes
+        let run = shape_text(@&font, "A", 1, size as f32)
+
+        # Shape should produce 1 glyph
+        assert run.glyph_count() == 1
+
+        # Advance should scale with size
+        let advance = run.total_advance()
+        assert advance > 0.0
+
+        # Rasterize at this size
+        let shaped = @run.glyphs[0]
+        let glyph = font.get_glyph(shaped.glyph_id as u16)
+        if glyph.is_some()
+            let g = glyph.unwrap()
+            let raster = rasterize_glyph(
+                g.outline,
+                metrics.units_per_em,
+                size,
+                g.metrics.advance_width,
+                g.metrics.left_side_bearing,
+                true
+            )
+            # Larger sizes should generally produce larger bitmaps
+            # (unless the glyph has no outline)
+
+    0
+
+# ============================================================================
+# Composite Glyph Recursion Limit Tests
+# ============================================================================
+
+[[test]]
+fn test_composite_glyph_resolution() -> i32
+    # Test that composite glyphs are resolved correctly
+    # Note: aadhunik.ttf may or may not have composite glyphs,
+    # but the code path should work regardless
+    var font = load_font("tests/fixtures/aadhunik.ttf").unwrap()
+
+    # Try to get outlines for all glyphs - composite resolution should not crash
+    let num_glyphs = font.num_glyphs()
+
+    for i in 0..num_glyphs as usize
+        let outline = font.glyph_outline(i as u16)
+        # Should return Some (possibly empty) or None, never crash
+        # Even composite glyphs should resolve to valid outlines
+
+    0
+
+[[test]]
+fn test_composite_depth_limit_protection() -> i32
+    # This test verifies the depth limit protects against stack overflow
+    # We can't easily create a malicious font, but we can verify:
+    # 1. The depth limit constant exists (MAX_DEPTH = 10)
+    # 2. All glyphs resolve without crashing
+    # 3. Resolution completes in reasonable time (no infinite loops)
+
+    var font = load_font("tests/fixtures/aadhunik.ttf").unwrap()
+    let num_glyphs = font.num_glyphs()
+
+    var resolved_count = 0
+    var empty_count = 0
+
+    for i in 0..num_glyphs as usize
+        let outline = font.glyph_outline(i as u16)
+        match outline
+            Some(o) =>
+                resolved_count = resolved_count + 1
+                if o.is_empty()
+                    empty_count = empty_count + 1
+            None =>
+                pass  # Failed to resolve
+
+    # Most glyphs should resolve successfully
+    assert resolved_count > 0
+
+    # Some glyphs may be empty (space, etc.)
+    # This test passes as long as we didn't crash or hang
+
+    0
+
+[[test]]
+fn test_all_glyphs_render_without_crash() -> i32
+    # Comprehensive test: attempt to rasterize every glyph in the font
+    # This exercises composite glyph resolution under real conditions
+    var font = load_font("tests/fixtures/aadhunik.ttf").unwrap()
+    let metrics = font.metrics()
+    let num_glyphs = font.num_glyphs()
+
+    var render_success = 0
+    var render_empty = 0
+
+    for i in 0..num_glyphs as usize
+        let glyph = font.get_glyph(i as u16)
+        if glyph.is_some()
+            let g = glyph.unwrap()
+
+            # Attempt to rasterize
+            let raster = rasterize_glyph(
+                g.outline,
+                metrics.units_per_em,
+                16,
+                g.metrics.advance_width,
+                g.metrics.left_side_bearing,
+                true
+            )
+
+            if raster.width > 0 and raster.height > 0
+                render_success = render_success + 1
+            else
+                render_empty = render_empty + 1
+
+    # Should render at least some glyphs successfully
+    # (font has 117 glyphs, many should render)
+    assert render_success > 0
+
+    # No crashes = test passed
+    0

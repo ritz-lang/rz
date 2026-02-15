@@ -1,0 +1,335 @@
+# lib/tree/render_node.ritz - Render tree node structure
+#
+# The render tree mirrors the visible DOM structure. Each RenderNode corresponds
+# to a DOM element with display != none. The render tree is owned by Iris and
+# updated incrementally as StyleEvents arrive from Tempest.
+#
+# Usage:
+#   import lib.tree.render_node
+
+import ritzlib.sys
+import ritzlib.memory
+import ritzlib.gvec
+import ritzlib.hashmap
+import lib.style.types
+
+# =============================================================================
+# Render Content Types (using integers since enums have limited support)
+# =============================================================================
+
+const CONTENT_ELEMENT: i32 = 0      # Element with potential children
+const CONTENT_TEXT: i32 = 1         # Text content (leaf node)
+const CONTENT_IMAGE: i32 = 2        # Image placeholder (leaf node)
+const CONTENT_REPLACED: i32 = 3     # Replaced content (video, canvas, etc.)
+
+# =============================================================================
+# Dirty Flags
+# =============================================================================
+
+# Tracks what needs recomputation
+pub struct DirtyFlags
+    # Tree structure changed (children added/removed/moved)
+    structure: i32
+    # Computed style changed (may affect layout)
+    style: i32
+    # Layout needs recalculation
+    layout: i32
+    # Needs repaint (visual change only)
+    paint: i32
+
+pub fn dirty_flags_none() -> DirtyFlags
+    DirtyFlags { structure: 0, style: 0, layout: 0, paint: 0 }
+
+pub fn dirty_flags_all() -> DirtyFlags
+    DirtyFlags { structure: 1, style: 1, layout: 1, paint: 1 }
+
+pub fn dirty_flags_is_clean(flags: DirtyFlags) -> i32
+    if flags.structure != 0
+        return 0
+    if flags.style != 0
+        return 0
+    if flags.layout != 0
+        return 0
+    if flags.paint != 0
+        return 0
+    return 1
+
+pub fn dirty_flags_needs_layout(flags: DirtyFlags) -> i32
+    if flags.structure != 0
+        return 1
+    if flags.style != 0
+        return 1
+    if flags.layout != 0
+        return 1
+    return 0
+
+pub fn dirty_flags_needs_paint(flags: DirtyFlags) -> i32
+    if flags.structure != 0
+        return 1
+    if flags.style != 0
+        return 1
+    if flags.layout != 0
+        return 1
+    if flags.paint != 0
+        return 1
+    return 0
+
+# =============================================================================
+# Layout Result
+# =============================================================================
+
+# Result of layout calculation - where this node's box is positioned
+pub struct LayoutResult
+    # Content box position (relative to parent's content box)
+    x: i32
+    y: i32
+    # Content box size
+    width: u32
+    height: u32
+    # Resolved padding (in pixels)
+    padding_top: i32
+    padding_right: i32
+    padding_bottom: i32
+    padding_left: i32
+    # Resolved border widths (in pixels)
+    border_top: i32
+    border_right: i32
+    border_bottom: i32
+    border_left: i32
+    # Resolved margin (in pixels)
+    margin_top: i32
+    margin_right: i32
+    margin_bottom: i32
+    margin_left: i32
+    # Baseline offset from top of content box (for inline alignment)
+    baseline: i32
+
+pub fn layout_result_empty() -> LayoutResult
+    LayoutResult {
+        x: 0, y: 0, width: 0, height: 0,
+        padding_top: 0, padding_right: 0, padding_bottom: 0, padding_left: 0,
+        border_top: 0, border_right: 0, border_bottom: 0, border_left: 0,
+        margin_top: 0, margin_right: 0, margin_bottom: 0, margin_left: 0,
+        baseline: 0
+    }
+
+# Get total width including padding and border
+pub fn layout_result_outer_width(layout: LayoutResult) -> u32
+    let extra = layout.padding_left + layout.padding_right + layout.border_left + layout.border_right
+    layout.width + extra as u32
+
+# Get total height including padding and border
+pub fn layout_result_outer_height(layout: LayoutResult) -> u32
+    let extra = layout.padding_top + layout.padding_bottom + layout.border_top + layout.border_bottom
+    layout.height + extra as u32
+
+# =============================================================================
+# Render Node
+# =============================================================================
+
+# Element tag constants
+const TAG_DIV: i32 = 0
+const TAG_SPAN: i32 = 1
+const TAG_P: i32 = 2
+const TAG_H1: i32 = 3
+const TAG_H2: i32 = 4
+const TAG_H3: i32 = 5
+const TAG_A: i32 = 6
+const TAG_IMG: i32 = 7
+const TAG_INPUT: i32 = 8
+const TAG_BUTTON: i32 = 9
+const TAG_TEXT: i32 = 100  # Pseudo-tag for text nodes
+
+pub struct RenderNode
+    # Identity
+    id: NodeId              # Matches DOM node ID from Tempest
+    tag: i32                # Element tag (TAG_* constants)
+
+    # Content type
+    content_type: i32       # CONTENT_* constants
+
+    # For text nodes: pointer to text content
+    text_ptr: *u8
+    text_len: i32
+
+    # For image nodes: dimensions and loaded state
+    img_width: u32
+    img_height: u32
+    img_loaded: i32
+
+    # Style (from Lexis via Tempest)
+    style: ComputedStyle
+
+    # Tree structure
+    parent: NodeId          # Parent node ID (invalid for root)
+    first_child: NodeId     # First child (invalid if no children)
+    last_child: NodeId      # Last child (invalid if no children)
+    prev_sibling: NodeId    # Previous sibling (invalid if first)
+    next_sibling: NodeId    # Next sibling (invalid if last)
+    child_count: u32        # Number of children
+
+    # Layout result (computed during layout phase)
+    layout: LayoutResult
+
+    # Dirty tracking
+    dirty: DirtyFlags
+
+    # Layer assignment (set during compositing)
+    layer_id: u64           # 0 = no dedicated layer
+
+pub fn render_node_new(id: NodeId, tag: i32, style: ComputedStyle) -> RenderNode
+    RenderNode {
+        id: id,
+        tag: tag,
+        content_type: CONTENT_ELEMENT,
+        text_ptr: null,
+        text_len: 0,
+        img_width: 0,
+        img_height: 0,
+        img_loaded: 0,
+        style: style,
+        parent: node_id_invalid(),
+        first_child: node_id_invalid(),
+        last_child: node_id_invalid(),
+        prev_sibling: node_id_invalid(),
+        next_sibling: node_id_invalid(),
+        child_count: 0,
+        layout: layout_result_empty(),
+        dirty: dirty_flags_all(),
+        layer_id: 0
+    }
+
+pub fn render_node_new_text(id: NodeId, text_ptr: *u8, text_len: i32, style: ComputedStyle) -> RenderNode
+    var node = render_node_new(id, TAG_TEXT, style)
+    node.content_type = CONTENT_TEXT
+    node.text_ptr = text_ptr
+    node.text_len = text_len
+    node
+
+pub fn render_node_is_text(node: RenderNode) -> i32
+    if node.content_type == CONTENT_TEXT
+        return 1
+    return 0
+
+pub fn render_node_is_replaced(node: RenderNode) -> i32
+    if node.content_type == CONTENT_IMAGE
+        return 1
+    if node.content_type == CONTENT_REPLACED
+        return 1
+    return 0
+
+pub fn render_node_has_children(node: RenderNode) -> i32
+    if node.child_count > 0
+        return 1
+    return 0
+
+pub fn render_node_is_block(node: RenderNode) -> i32
+    let d = node.style.display
+    if d == DISPLAY_BLOCK
+        return 1
+    if d == DISPLAY_FLEX
+        return 1
+    if d == DISPLAY_GRID
+        return 1
+    return 0
+
+pub fn render_node_is_inline(node: RenderNode) -> i32
+    let d = node.style.display
+    if d == DISPLAY_INLINE
+        return 1
+    if d == DISPLAY_INLINE_BLOCK
+        return 1
+    if d == DISPLAY_INLINE_FLEX
+        return 1
+    if d == DISPLAY_INLINE_GRID
+        return 1
+    return 0
+
+pub fn render_node_generates_layer(node: RenderNode) -> i32
+    # Check if this node requires its own compositing layer
+    if node.style.opacity < 1.0
+        return 1
+    if transform_is_identity(node.style.transform) == 0
+        return 1
+    if node.style.position == POSITION_FIXED
+        return 1
+    if node.style.position == POSITION_STICKY
+        return 1
+    return 0
+
+# =============================================================================
+# Render Tree
+# =============================================================================
+
+# The render tree stores all render nodes in a flat array for cache efficiency.
+# Tree structure is maintained via parent/child/sibling IDs.
+pub struct RenderTree
+    nodes: Vec<RenderNode>      # All nodes, indexed by position
+    id_to_index: HashMapI64     # NodeId.value -> array index
+    root: NodeId                # Root node ID
+
+pub fn render_tree_new() -> RenderTree
+    RenderTree {
+        nodes: vec_new<RenderNode>(),
+        id_to_index: hashmap_i64_new(),
+        root: node_id_invalid()
+    }
+
+pub fn render_tree_get(tree: @RenderTree, id: @NodeId) -> @RenderNode
+    # Returns null if not found
+    let index = hashmap_i64_get(@tree.id_to_index, id.value as i64)
+    if index < 0
+        return null
+    if index >= tree.nodes.len
+        return null
+    return tree.nodes.data + index
+
+pub fn render_tree_get_mut(tree: @&RenderTree, id: @NodeId) -> @&RenderNode
+    # Returns null if not found
+    let index = hashmap_i64_get(@tree.id_to_index, id.value as i64)
+    if index < 0
+        return null
+    if index >= tree.nodes.len
+        return null
+    return tree.nodes.data + index
+
+pub fn render_tree_insert(tree: @&RenderTree, node: RenderNode)
+    let index = tree.nodes.len
+    hashmap_i64_insert(@tree.id_to_index, node.id.value as i64, index)
+    vec_push<RenderNode>(@tree.nodes, node)
+
+pub fn render_tree_set_root(tree: @&RenderTree, id: NodeId)
+    tree.root = id
+
+pub fn render_tree_root(tree: @RenderTree) -> @RenderNode
+    render_tree_get(tree, tree.root)
+
+pub fn render_tree_count(tree: @RenderTree) -> u32
+    tree.id_to_index.len as u32
+
+pub fn render_tree_is_empty(tree: @RenderTree) -> i32
+    if node_id_is_valid(tree.root) != 0
+        return 0
+    return 1
+
+# Mark a node dirty (simplified version - does NOT propagate to ancestors yet)
+# TODO: implement ancestor propagation when ownership issues are resolved
+pub fn render_tree_mark_dirty(tree: @&RenderTree, id: NodeId, flags: DirtyFlags)
+    let node = render_tree_get_mut(tree, id)
+    if node == null
+        return
+    # Merge dirty flags
+    if flags.structure != 0
+        node.dirty.structure = 1
+    if flags.style != 0
+        node.dirty.style = 1
+    if flags.layout != 0
+        node.dirty.layout = 1
+    if flags.paint != 0
+        node.dirty.paint = 1
+
+# Clear dirty flags after processing
+pub fn render_tree_clear_dirty(tree: @&RenderTree, id: NodeId)
+    let node = render_tree_get_mut(tree, id)
+    if node != null
+        node.dirty = dirty_flags_none()

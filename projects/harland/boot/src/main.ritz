@@ -1,0 +1,1385 @@
+# Harland UEFI Bootloader
+#
+# A minimal UEFI bootloader written in Ritz that:
+# 1. Initializes serial for debug output
+# 2. Gets memory map from UEFI
+# 3. Sets up higher-half page tables
+# 4. Exits boot services
+# 5. Jumps to kernel at higher-half address
+#
+# UEFI is nice because we're already in 64-bit long mode!
+#
+# This code is compiled with clang for Windows/UEFI target, so it uses
+# Microsoft x64 calling convention (RCX, RDX, R8, R9). UEFI also uses
+# MS x64, so we can call UEFI services directly without wrappers!
+#
+# At the end, we use inline assembly to jump to the kernel with
+# System V calling convention (RDI, RSI, RDX, RCX, R8, R9).
+
+# ============================================================================
+# UEFI Types and Constants
+# ============================================================================
+
+const EFI_SUCCESS: u64 = 0
+const EFI_LOAD_ERROR: u64 = 1
+const EFI_INVALID_PARAMETER: u64 = 2
+const EFI_UNSUPPORTED: u64 = 3
+const EFI_BAD_BUFFER_SIZE: u64 = 4
+const EFI_BUFFER_TOO_SMALL: u64 = 5
+const EFI_NOT_READY: u64 = 6
+const EFI_DEVICE_ERROR: u64 = 7
+const EFI_OUT_OF_RESOURCES: u64 = 9
+const EFI_NOT_FOUND: u64 = 14
+
+# Memory types
+const EFI_RESERVED_MEMORY: u32 = 0
+const EFI_LOADER_CODE: u32 = 1
+const EFI_LOADER_DATA: u32 = 2
+const EFI_BOOT_SERVICES_CODE: u32 = 3
+const EFI_BOOT_SERVICES_DATA: u32 = 4
+const EFI_RUNTIME_SERVICES_CODE: u32 = 5
+const EFI_RUNTIME_SERVICES_DATA: u32 = 6
+const EFI_CONVENTIONAL_MEMORY: u32 = 7
+const EFI_UNUSABLE_MEMORY: u32 = 8
+const EFI_ACPI_RECLAIM_MEMORY: u32 = 9
+const EFI_ACPI_MEMORY_NVS: u32 = 10
+const EFI_MEMORY_MAPPED_IO: u32 = 11
+const EFI_MEMORY_MAPPED_IO_PORT: u32 = 12
+const EFI_PAL_CODE: u32 = 13
+
+# Allocation types
+const ALLOCATE_ANY_PAGES: u32 = 0
+const ALLOCATE_MAX_ADDRESS: u32 = 1
+const ALLOCATE_ADDRESS: u32 = 2
+
+# ============================================================================
+# UEFI Structures
+# ============================================================================
+
+[[packed]]
+struct EfiTableHeader
+    signature: u64
+    revision: u32
+    header_size: u32
+    crc32: u32
+    reserved: u32
+
+[[packed]]
+struct EfiSystemTable
+    hdr: EfiTableHeader
+    firmware_vendor: *u16
+    firmware_revision: u32
+    _pad1: u32
+    console_in_handle: u64
+    con_in: *u8
+    console_out_handle: u64
+    con_out: *EfiSimpleTextOutput
+    stderr_handle: u64
+    std_err: *u8
+    runtime_services: *u8
+    boot_services: *EfiBootServices
+    number_of_table_entries: u64
+    configuration_table: *u8
+
+[[packed]]
+struct EfiSimpleTextOutput
+    reset: *u8
+    output_string: *u8
+    test_string: *u8
+    query_mode: *u8
+    set_mode: *u8
+    set_attribute: *u8
+    clear_screen: *u8
+    set_cursor_position: *u8
+    enable_cursor: *u8
+    mode: *u8
+
+# EfiBootServices - we only define the fields we need
+# Full table is much larger, but we access by offset
+[[packed]]
+struct EfiBootServices
+    hdr: EfiTableHeader              # 0-23 (24 bytes)
+    raise_tpl: *u8                   # 24
+    restore_tpl: *u8                 # 32
+    allocate_pages: *u8              # 40
+    free_pages: *u8                  # 48
+    get_memory_map: *u8              # 56
+    allocate_pool: *u8               # 64
+    free_pool: *u8                   # 72
+    create_event: *u8                # 80
+    set_timer: *u8                   # 88
+    wait_for_event: *u8              # 96
+    signal_event: *u8                # 104
+    close_event: *u8                 # 112
+    check_event: *u8                 # 120
+    install_protocol_interface: *u8  # 128
+    reinstall_protocol_interface: *u8 # 136
+    uninstall_protocol_interface: *u8 # 144
+    handle_protocol: *u8             # 152
+    reserved: *u8                    # 160
+    register_protocol_notify: *u8    # 168
+    locate_handle: *u8               # 176
+    locate_device_path: *u8          # 184
+    install_configuration_table: *u8 # 192
+    load_image: *u8                  # 200
+    start_image: *u8                 # 208
+    exit: *u8                        # 216
+    unload_image: *u8                # 224
+    exit_boot_services: *u8          # 232
+    get_next_monotonic_count: *u8    # 240
+    stall: *u8                       # 248
+    set_watchdog_timer: *u8          # 256
+    connect_controller: *u8          # 264
+    disconnect_controller: *u8       # 272
+    open_protocol: *u8               # 280
+    close_protocol: *u8              # 288
+    open_protocol_information: *u8   # 296
+    protocols_per_handle: *u8        # 304
+    locate_handle_buffer: *u8        # 312
+    locate_protocol: *u8             # 320
+
+[[packed]]
+struct EfiMemoryDescriptor
+    mem_type: u32
+    _pad: u32
+    physical_start: u64
+    virtual_start: u64
+    number_of_pages: u64
+    attribute: u64
+
+# ============================================================================
+# UEFI Filesystem Protocol Structures
+# ============================================================================
+
+# EFI_LOADED_IMAGE_PROTOCOL - to find the device we booted from
+[[packed]]
+struct EfiLoadedImage
+    revision: u32
+    _pad: u32
+    parent_handle: u64
+    system_table: *u8
+    device_handle: u64          # The device we loaded from!
+    file_path: *u8
+    reserved: *u8
+    load_options_size: u32
+    _pad2: u32
+    load_options: *u8
+    image_base: *u8
+    image_size: u64
+    image_code_type: u32
+    image_data_type: u32
+    unload: *u8
+
+# GUID for Loaded Image Protocol
+# {5B1B31A1-9562-11D2-8E3F-00A0C969723B}
+var loaded_image_guid: EfiGuid
+
+# GUID for Simple File System Protocol
+# {0964E5B22-6459-11D2-8E39-00A0C969723B}
+
+# File open modes
+const EFI_FILE_MODE_READ: u64 = 0x0000000000000001
+const EFI_FILE_MODE_WRITE: u64 = 0x0000000000000002
+const EFI_FILE_MODE_CREATE: u64 = 0x8000000000000000
+
+# File attributes
+const EFI_FILE_READ_ONLY: u64 = 0x0000000000000001
+const EFI_FILE_DIRECTORY: u64 = 0x0000000000000010
+
+# EFI_GUID structure
+[[packed]]
+struct EfiGuid
+    data1: u32
+    data2: u16
+    data3: u16
+    data4: [8]u8
+
+# EFI_CONFIGURATION_TABLE entry
+[[packed]]
+struct EfiConfigurationTable
+    vendor_guid: EfiGuid
+    vendor_table: u64
+
+# ACPI 2.0 RSDP GUID: {8868E871-E4F1-11D3-BC22-0080C73C8881}
+var acpi20_guid: EfiGuid
+
+# ACPI 1.0 RSDP GUID: {EB9D2D30-2D88-11D3-9A16-0090273FC14D}
+var acpi10_guid: EfiGuid
+
+# EFI_SIMPLE_FILE_SYSTEM_PROTOCOL
+[[packed]]
+struct EfiSimpleFileSystem
+    revision: u64
+    open_volume: *u8              # EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_OPEN_VOLUME
+
+# EFI_FILE_PROTOCOL - file handle operations
+[[packed]]
+struct EfiFile
+    revision: u64
+    open: *u8                     # EFI_FILE_OPEN
+    close: *u8                    # EFI_FILE_CLOSE
+    delete: *u8                   # EFI_FILE_DELETE
+    read: *u8                     # EFI_FILE_READ
+    write: *u8                    # EFI_FILE_WRITE
+    get_position: *u8             # EFI_FILE_GET_POSITION
+    set_position: *u8             # EFI_FILE_SET_POSITION
+    get_info: *u8                 # EFI_FILE_GET_INFO
+    set_info: *u8                 # EFI_FILE_SET_INFO
+    flush: *u8                    # EFI_FILE_FLUSH
+
+# EFI_FILE_INFO structure (variable size due to filename at end)
+[[packed]]
+struct EfiFileInfo
+    size: u64
+    file_size: u64
+    physical_size: u64
+    create_time: [16]u8           # EFI_TIME
+    last_access_time: [16]u8      # EFI_TIME
+    modification_time: [16]u8     # EFI_TIME
+    attribute: u64
+    # filename: [...]u16 follows (variable length, null-terminated UCS-2)
+
+# ============================================================================
+# ELF Header Structures
+# ============================================================================
+
+const ELF_MAGIC: u32 = 0x464C457F  # "\x7FELF"
+
+const ET_EXEC: u16 = 2             # Executable file
+const ET_DYN: u16 = 3              # Shared object
+
+const PT_NULL: u32 = 0             # Unused segment
+const PT_LOAD: u32 = 1             # Loadable segment
+const PT_DYNAMIC: u32 = 2          # Dynamic linking info
+const PT_INTERP: u32 = 3           # Interpreter path
+const PT_NOTE: u32 = 4             # Auxiliary info
+const PT_PHDR: u32 = 6             # Program header table
+
+const PF_X: u32 = 1                # Execute
+const PF_W: u32 = 2                # Write
+const PF_R: u32 = 4                # Read
+
+# ELF64 header (64 bytes)
+[[packed]]
+struct Elf64Header
+    e_ident: [16]u8               # ELF identification
+    e_type: u16                   # Object file type
+    e_machine: u16                # Machine type
+    e_version: u32                # Object file version
+    e_entry: u64                  # Entry point address
+    e_phoff: u64                  # Program header offset
+    e_shoff: u64                  # Section header offset
+    e_flags: u32                  # Processor-specific flags
+    e_ehsize: u16                 # ELF header size
+    e_phentsize: u16              # Program header entry size
+    e_phnum: u16                  # Number of program headers
+    e_shentsize: u16              # Section header entry size
+    e_shnum: u16                  # Number of section headers
+    e_shstrndx: u16               # Section name string table index
+
+# ELF64 program header (56 bytes)
+[[packed]]
+struct Elf64ProgramHeader
+    p_type: u32                   # Segment type
+    p_flags: u32                  # Segment flags
+    p_offset: u64                 # Offset in file
+    p_vaddr: u64                  # Virtual address
+    p_paddr: u64                  # Physical address
+    p_filesz: u64                 # Size in file
+    p_memsz: u64                  # Size in memory
+    p_align: u64                  # Alignment
+
+# ELF64 section header (64 bytes)
+[[packed]]
+struct Elf64SectionHeader
+    sh_name: u32                  # Section name (string table index)
+    sh_type: u32                  # Section type
+    sh_flags: u64                 # Section flags
+    sh_addr: u64                  # Virtual address
+    sh_offset: u64                # File offset
+    sh_size: u64                  # Section size
+    sh_link: u32                  # Link to another section
+    sh_info: u32                  # Additional info
+    sh_addralign: u64             # Alignment
+    sh_entsize: u64               # Entry size if table
+
+# ELF64 symbol table entry (24 bytes)
+[[packed]]
+struct Elf64Symbol
+    st_name: u32                  # Symbol name (string table index)
+    st_info: u8                   # Type and binding
+    st_other: u8                  # Visibility
+    st_shndx: u16                 # Section index
+    st_value: u64                 # Symbol value (address)
+    st_size: u64                  # Symbol size
+
+# Section types
+const SHT_NULL: u32 = 0
+const SHT_SYMTAB: u32 = 2         # Symbol table
+const SHT_STRTAB: u32 = 3         # String table
+
+# Symbol types (lower 4 bits of st_info)
+const STT_FUNC: u8 = 2            # Function
+
+# ============================================================================
+# Boot Info for Kernel
+# ============================================================================
+
+[[packed]]
+struct BootInfo
+    magic: u32                       # 0x4841524C ("HARL")
+    version: u32                     # Boot protocol version
+    memory_map: *MemoryMapEntry      # Simplified memory map
+    memory_map_entries: u32          # Number of entries
+    _pad1: u32
+    framebuffer_addr: u64            # Framebuffer address (0 if none)
+    framebuffer_width: u32
+    framebuffer_height: u32
+    framebuffer_pitch: u32
+    framebuffer_bpp: u8
+    _pad2: [3]u8
+    rsdp_addr: u64                   # ACPI RSDP address
+    kernel_phys: u64                 # Kernel physical address
+    kernel_size: u64                 # Kernel size in bytes
+    pml4_phys: u64                   # Page table physical address
+
+[[packed]]
+struct MemoryMapEntry
+    base: u64
+    length: u64
+    mem_type: u32                    # 1 = usable, 2 = reserved, 3 = ACPI
+    reserved: u32
+
+const BOOT_MAGIC: u32 = 0x4841524C   # "HARL"
+const BOOT_VERSION: u32 = 1
+
+# Memory types for our simplified map
+const MEM_USABLE: u32 = 1
+const MEM_RESERVED: u32 = 2
+const MEM_ACPI_RECLAIMABLE: u32 = 3
+
+# ============================================================================
+# Page Table Constants
+# ============================================================================
+
+const PTE_PRESENT: u64 = 1
+const PTE_WRITABLE: u64 = 2
+const PTE_USER: u64 = 4
+const PTE_WRITE_THROUGH: u64 = 8
+const PTE_CACHE_DISABLE: u64 = 16
+const PTE_HUGE: u64 = 128            # 2MB page
+const PTE_GLOBAL: u64 = 256
+const PTE_NO_EXECUTE: u64 = 0x8000000000000000
+
+const KERNEL_VIRT_BASE: u64 = 0xFFFFFFFF80000000
+const KERNEL_PHYS_BASE: u64 = 0x100000
+
+# ============================================================================
+# Serial Port (for debug output)
+# ============================================================================
+
+const COM1: u16 = 0x3F8
+
+fn outb(port: u16, value: u8) -> i32
+    asm x86_64:
+        movw {port}, %dx
+        movb {value}, %al
+        outb %al, %dx
+    return 0
+
+# inb - read byte from I/O port
+fn inb(port: u16) -> u8
+    var result: u8 = 0
+    asm x86_64:
+        movw {port}, %dx
+        inb %dx, %al
+        movb %al, {result}
+    return result
+
+fn serial_init() -> i32
+    outb(0x3F9, 0x00)      # Disable interrupts
+    outb(0x3FB, 0x80)      # Enable DLAB
+    outb(0x3F8, 0x01)      # Divisor low (115200 baud)
+    outb(0x3F9, 0x00)      # Divisor high
+    outb(0x3FB, 0x03)      # 8N1
+    outb(0x3FA, 0xC7)      # Enable FIFO
+    outb(0x3FC, 0x0B)      # Enable IRQs, RTS/DSR
+    return 0
+
+fn serial_putc(c: u8) -> i32
+    # Wait for transmit buffer to be ready
+    while (inb(0x3FD) & 0x20) == 0
+        asm x86_64:
+            pause
+    outb(0x3F8, c)
+    return 0
+
+fn serial_print(s: *u8) -> i32
+    var p: *u8 = s
+    while *p != 0
+        serial_putc(*p)
+        p = p + 1
+    return 0
+
+# StrView - Zero-copy string view (matches ritzlib layout)
+# Enables using "hello" string literals which produce StrView with compile-time length.
+pub struct StrView
+    ptr: *u8
+    len: i64
+
+fn serial_write(buf: *u8, len: i64) -> i32
+    var i: i64 = 0
+    while i < len
+        serial_putc(*(buf + i))
+        i = i + 1
+    return 0
+
+# Preferred: StrView wrapper (use "..." literals - compile-time length)
+fn prints(s: StrView) -> i32
+    return serial_write(s.ptr, s.len)
+
+fn serial_print_hex(val: u64) -> i32
+    prints("0x")
+    var i: i32 = 60
+    var started: i32 = 0
+    while i >= 0
+        let nibble: u64 = (val >> (i as u64)) & 0xF
+        if nibble != 0 || started != 0 || i == 0
+            started = 1
+            if nibble < 10
+                serial_putc((0x30 + nibble) as u8)
+            else
+                serial_putc((0x41 + nibble - 10) as u8)
+        i = i - 4
+    return 0
+
+fn serial_print_dec(val: u64) -> i32
+    if val == 0
+        serial_putc(0x30)
+        return 0
+    var buf: [20]u8 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    var i: i32 = 0
+    var v: u64 = val
+    while v > 0
+        buf[i] = (0x30 + (v % 10)) as u8
+        v = v / 10
+        i = i + 1
+    while i > 0
+        i = i - 1
+        serial_putc(buf[i])
+    return 0
+
+# ============================================================================
+# UEFI Service Calls via Inline Assembly
+#
+# Since we're compiled for Windows target, Ritz code uses MS x64 ABI.
+# UEFI also uses MS x64, but we can't directly call function pointers
+# because Ritz doesn't support arbitrary function pointer types yet.
+#
+# So we use inline assembly to make the calls with proper register setup.
+# ============================================================================
+
+# Global state
+var g_image_handle: u64 = 0
+var g_system_table: *EfiSystemTable = 0 as *EfiSystemTable
+var g_boot_services: *EfiBootServices = 0 as *EfiBootServices
+
+# Call a UEFI function with 2 arguments (MS x64: RCX, RDX)
+fn uefi_call2(fn_ptr: u64, arg1: u64, arg2: u64) -> u64
+    var result: u64 = 0
+    asm x86_64:
+        movq {arg1}, %rcx
+        movq {arg2}, %rdx
+        subq $40, %rsp
+        movq {fn_ptr}, %rax
+        call *%rax
+        addq $40, %rsp
+        movq %rax, {result}
+    return result
+
+# Call a UEFI function with 4 arguments (MS x64: RCX, RDX, R8, R9)
+fn uefi_call4(fn_ptr: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> u64
+    var result: u64 = 0
+    asm x86_64:
+        movq {arg1}, %rcx
+        movq {arg2}, %rdx
+        movq {arg3}, %r8
+        movq {arg4}, %r9
+        subq $40, %rsp
+        movq {fn_ptr}, %rax
+        call *%rax
+        addq $40, %rsp
+        movq %rax, {result}
+    return result
+
+# Call a UEFI function with 3 arguments (MS x64: RCX, RDX, R8)
+fn uefi_call3(fn_ptr: u64, arg1: u64, arg2: u64, arg3: u64) -> u64
+    var result: u64 = 0
+    asm x86_64:
+        movq {arg1}, %rcx
+        movq {arg2}, %rdx
+        movq {arg3}, %r8
+        subq $40, %rsp
+        movq {fn_ptr}, %rax
+        call *%rax
+        addq $40, %rsp
+        movq %rax, {result}
+    return result
+
+# Call a UEFI function with 5 arguments (MS x64: RCX, RDX, R8, R9, stack)
+fn uefi_call5(fn_ptr: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> u64
+    var result: u64 = 0
+    asm x86_64:
+        movq {arg1}, %rcx
+        movq {arg2}, %rdx
+        movq {arg3}, %r8
+        movq {arg4}, %r9
+        subq $48, %rsp
+        movq {arg5}, %rax
+        movq %rax, 32(%rsp)
+        movq {fn_ptr}, %rax
+        call *%rax
+        addq $48, %rsp
+        movq %rax, {result}
+    return result
+
+# ============================================================================
+# UEFI Service Wrappers
+# ============================================================================
+
+fn efi_get_memory_map(map_size: *u64, memory_map: *u8, map_key: *u64, desc_size: *u64, desc_version: *u32) -> u64
+    let fn_ptr: u64 = g_boot_services.get_memory_map as u64
+    return uefi_call5(fn_ptr, map_size as u64, memory_map as u64, map_key as u64, desc_size as u64, desc_version as u64)
+
+fn efi_exit_boot_services(map_key: u64) -> u64
+    let fn_ptr: u64 = g_boot_services.exit_boot_services as u64
+    return uefi_call2(fn_ptr, g_image_handle, map_key)
+
+fn efi_allocate_pages(alloc_type: u32, mem_type: u32, pages: u64, addr: *u64) -> u64
+    let fn_ptr: u64 = g_boot_services.allocate_pages as u64
+    return uefi_call4(fn_ptr, alloc_type as u64, mem_type as u64, pages, addr as u64)
+
+# ============================================================================
+# Page Table Setup
+# ============================================================================
+
+var pml4_addr: u64 = 0
+var pdpt_identity_addr: u64 = 0
+var pdpt_highhalf_addr: u64 = 0
+var pd_addr: u64 = 0
+
+fn allocate_page_tables() -> i32
+    prints("  Allocating page tables...\n")
+    var addr: u64 = 0
+    var status: u64 = efi_allocate_pages(ALLOCATE_ANY_PAGES, EFI_LOADER_DATA, 4, @addr)
+    if status != EFI_SUCCESS
+        prints("    ERROR: Failed to allocate page tables\n")
+        return -1
+    pml4_addr = addr
+    pdpt_identity_addr = addr + 0x1000
+    pdpt_highhalf_addr = addr + 0x2000
+    pd_addr = addr + 0x3000
+    prints("    PML4 at ")
+    serial_print_hex(pml4_addr)
+    prints("\n")
+    var p: *u64 = pml4_addr as *u64
+    var i: i32 = 0
+    while i < 2048
+        *p = 0
+        p = p + 1
+        i = i + 1
+    return 0
+
+fn setup_page_tables() -> i32
+    prints("  Setting up page tables...\n")
+    let flags: u64 = PTE_PRESENT | PTE_WRITABLE
+    let huge_flags: u64 = PTE_PRESENT | PTE_WRITABLE | PTE_HUGE
+
+    # PML4[0] -> pdpt_identity (for identity mapping)
+    let pml4: *u64 = pml4_addr as *u64
+    *pml4 = pdpt_identity_addr | flags
+
+    # PML4[511] -> pdpt_highhalf (for higher-half kernel at 0xFFFFFFFF80000000)
+    let pml4_511: *u64 = (pml4_addr + 511 * 8) as *u64
+    *pml4_511 = pdpt_highhalf_addr | flags
+
+    # PDPT[0] for identity -> PD (covers 0-1GB)
+    let pdpt_id: *u64 = pdpt_identity_addr as *u64
+    *pdpt_id = pd_addr | flags
+
+    # PDPT[510] for higher-half -> same PD (0xFFFFFFFF80000000 maps to physical 0)
+    let pdpt_hh_510: *u64 = (pdpt_highhalf_addr + 510 * 8) as *u64
+    *pdpt_hh_510 = pd_addr | flags
+
+    # Fill PD with 2MB huge pages
+    # Only map what we need:
+    # - First 16MB: kernel code at 0x100000
+    # - Up to 256MB: bootloader data and boot_info structure
+    # 256MB = 128 × 2MB pages
+    let num_pages: i32 = 128  # 256MB (was 512 for 1GB)
+    var pd: *u64 = pd_addr as *u64
+    var phys: u64 = 0
+    var j: i32 = 0
+    while j < num_pages
+        *pd = phys | huge_flags
+        pd = pd + 1
+        phys = phys + 0x200000
+        j = j + 1
+
+    # Zero remaining PD entries (important for security)
+    while j < 512
+        *pd = 0
+        pd = pd + 1
+        j = j + 1
+
+    prints("    Identity map: 0-256MB -> 0-256MB\n")
+    prints("    Higher-half:  0xFFFFFFFF80000000 -> 0-256MB\n")
+    return 0
+
+fn load_page_tables() -> i32
+    prints("  Loading page tables into CR3...\n")
+    asm x86_64:
+        movq {pml4_addr}, %rax
+        movq %rax, %cr3
+    return 0
+
+# ============================================================================
+# Memory Map Processing
+# ============================================================================
+
+var memory_map_buffer: [16384]u8
+var memory_map_size: u64 = 16384
+var memory_map_key: u64 = 0
+var memory_map_desc_size: u64 = 0
+var memory_map_desc_version: u32 = 0
+
+fn get_memory_map() -> i32
+    prints("  Getting memory map...\n")
+    memory_map_size = 16384
+    let map_ptr: *u8 = @memory_map_buffer[0]
+    let status: u64 = efi_get_memory_map(@memory_map_size, map_ptr, @memory_map_key, @memory_map_desc_size, @memory_map_desc_version)
+    if status != EFI_SUCCESS
+        prints("    ERROR: GetMemoryMap failed with status ")
+        serial_print_hex(status)
+        prints("\n")
+        return -1
+    let num_entries: u64 = memory_map_size / memory_map_desc_size
+    prints("    Got ")
+    serial_print_dec(num_entries)
+    prints(" memory map entries\n")
+    prints("    Descriptor size: ")
+    serial_print_dec(memory_map_desc_size)
+    prints(" bytes\n")
+    var usable_pages: u64 = 0
+    var i: u64 = 0
+    while i < num_entries
+        let desc: *EfiMemoryDescriptor = (@memory_map_buffer[0] + i * memory_map_desc_size) as *EfiMemoryDescriptor
+        if desc.mem_type == EFI_CONVENTIONAL_MEMORY
+            usable_pages = usable_pages + desc.number_of_pages
+        i = i + 1
+    let usable_mb: u64 = (usable_pages * 4096) / (1024 * 1024)
+    prints("    Usable memory: ")
+    serial_print_dec(usable_mb)
+    prints(" MB\n")
+    return 0
+
+# ============================================================================
+# UEFI Filesystem Loading
+# ============================================================================
+
+# Simple File System Protocol GUID
+var fs_guid: EfiGuid
+
+fn init_guids() -> i32
+    # Loaded Image Protocol GUID: {5B1B31A1-9562-11D2-8E3F-00A0C969723B}
+    loaded_image_guid.data1 = 0x5B1B31A1
+    loaded_image_guid.data2 = 0x9562
+    loaded_image_guid.data3 = 0x11D2
+    loaded_image_guid.data4[0] = 0x8E
+    loaded_image_guid.data4[1] = 0x3F
+    loaded_image_guid.data4[2] = 0x00
+    loaded_image_guid.data4[3] = 0xA0
+    loaded_image_guid.data4[4] = 0xC9
+    loaded_image_guid.data4[5] = 0x69
+    loaded_image_guid.data4[6] = 0x72
+    loaded_image_guid.data4[7] = 0x3B
+
+    # Simple File System Protocol GUID: {964E5B22-6459-11D2-8E39-00A0C969723B}
+    fs_guid.data1 = 0x964e5b22
+    fs_guid.data2 = 0x6459
+    fs_guid.data3 = 0x11d2
+    fs_guid.data4[0] = 0x8e
+    fs_guid.data4[1] = 0x39
+    fs_guid.data4[2] = 0x00
+    fs_guid.data4[3] = 0xa0
+    fs_guid.data4[4] = 0xc9
+    fs_guid.data4[5] = 0x69
+    fs_guid.data4[6] = 0x72
+    fs_guid.data4[7] = 0x3b
+
+    # ACPI 2.0 RSDP GUID: {8868E871-E4F1-11D3-BC22-0080C73C8881}
+    acpi20_guid.data1 = 0x8868E871
+    acpi20_guid.data2 = 0xE4F1
+    acpi20_guid.data3 = 0x11D3
+    acpi20_guid.data4[0] = 0xBC
+    acpi20_guid.data4[1] = 0x22
+    acpi20_guid.data4[2] = 0x00
+    acpi20_guid.data4[3] = 0x80
+    acpi20_guid.data4[4] = 0xC7
+    acpi20_guid.data4[5] = 0x3C
+    acpi20_guid.data4[6] = 0x88
+    acpi20_guid.data4[7] = 0x81
+
+    # ACPI 1.0 RSDP GUID: {EB9D2D30-2D88-11D3-9A16-0090273FC14D}
+    acpi10_guid.data1 = 0xEB9D2D30
+    acpi10_guid.data2 = 0x2D88
+    acpi10_guid.data3 = 0x11D3
+    acpi10_guid.data4[0] = 0x9A
+    acpi10_guid.data4[1] = 0x16
+    acpi10_guid.data4[2] = 0x00
+    acpi10_guid.data4[3] = 0x90
+    acpi10_guid.data4[4] = 0x27
+    acpi10_guid.data4[5] = 0x3F
+    acpi10_guid.data4[6] = 0xC1
+    acpi10_guid.data4[7] = 0x4D
+
+    return 0
+
+# Handle protocol wrapper
+fn efi_handle_protocol(handle: u64, protocol: *EfiGuid, iface: *u64) -> u64
+    let fn_ptr: u64 = g_boot_services.handle_protocol as u64
+    return uefi_call3(fn_ptr, handle, protocol as u64, iface as u64)
+
+# Locate protocol wrapper (finds first handle supporting a protocol)
+fn efi_locate_protocol(protocol: *EfiGuid, registration: u64, iface: *u64) -> u64
+    let fn_ptr: u64 = g_boot_services.locate_protocol as u64
+    return uefi_call3(fn_ptr, protocol as u64, registration, iface as u64)
+
+# LocateHandleBuffer wrapper - finds all handles supporting a protocol
+# ByProtocol search type = 2
+fn efi_locate_handle_buffer(protocol: *EfiGuid, num_handles: *u64, buffer: *u64) -> u64
+    let fn_ptr: u64 = g_boot_services.locate_handle_buffer as u64
+    # LocateHandleBuffer(SearchType, Protocol, SearchKey, NoHandles, Buffer)
+    # SearchType=2 (ByProtocol), SearchKey=NULL
+    return uefi_call5(fn_ptr, 2, protocol as u64, 0, num_handles as u64, buffer as u64)
+
+# ============================================================================
+# ACPI RSDP Discovery from UEFI Configuration Table
+# ============================================================================
+
+fn guid_equals(a: *EfiGuid, b: *EfiGuid) -> i32
+    if (*a).data1 != (*b).data1
+        return 0
+    if (*a).data2 != (*b).data2
+        return 0
+    if (*a).data3 != (*b).data3
+        return 0
+    var i: i32 = 0
+    while i < 8
+        if (*a).data4[i] != (*b).data4[i]
+            return 0
+        i = i + 1
+    return 1
+
+var rsdp_address: u64 = 0
+
+fn find_rsdp_from_uefi() -> i32
+    prints("  Finding ACPI RSDP from UEFI...\n")
+
+    let num_entries: u64 = g_system_table.number_of_table_entries
+    let config_table: *EfiConfigurationTable = g_system_table.configuration_table as *EfiConfigurationTable
+
+    prints("    Configuration table entries: ")
+    serial_print_dec(num_entries)
+    prints("\n")
+
+    var i: u64 = 0
+    while i < num_entries
+        let entry: *EfiConfigurationTable = config_table + i
+
+        # Check for ACPI 2.0 RSDP first (preferred)
+        if guid_equals(@(*entry).vendor_guid, @acpi20_guid) == 1
+            rsdp_address = (*entry).vendor_table
+            prints("    Found ACPI 2.0 RSDP at: ")
+            serial_print_hex(rsdp_address)
+            prints("\n")
+            return 0
+
+        # Fall back to ACPI 1.0 RSDP
+        if guid_equals(@(*entry).vendor_guid, @acpi10_guid) == 1
+            rsdp_address = (*entry).vendor_table
+            prints("    Found ACPI 1.0 RSDP at: ")
+            serial_print_hex(rsdp_address)
+            prints("\n")
+            return 0
+
+        i = i + 1
+
+    prints("    WARNING: No ACPI RSDP found in configuration table\n")
+    return -1
+
+# ============================================================================
+# BootInfo Population
+# ============================================================================
+
+# Global BootInfo struct that will be passed to kernel
+var boot_info: BootInfo
+
+# Memory map entries for BootInfo (max 128 entries)
+var boot_memory_map: [128]MemoryMapEntry
+var boot_memory_map_count: u32 = 0
+
+fn convert_efi_memory_type(efi_type: u32) -> u32
+    if efi_type == EFI_CONVENTIONAL_MEMORY
+        return MEM_USABLE
+    if efi_type == EFI_ACPI_RECLAIM_MEMORY
+        return MEM_ACPI_RECLAIMABLE
+    # Everything else is reserved
+    return MEM_RESERVED
+
+fn build_boot_info() -> i32
+    prints("  Building BootInfo structure...\n")
+
+    # Set magic and version
+    boot_info.magic = BOOT_MAGIC
+    boot_info.version = BOOT_VERSION
+
+    # Convert UEFI memory map to our format
+    let num_entries: u64 = memory_map_size / memory_map_desc_size
+    boot_memory_map_count = 0
+
+    var i: u64 = 0
+    while i < num_entries && boot_memory_map_count < 128
+        let desc: *EfiMemoryDescriptor = (@memory_map_buffer[0] + i * memory_map_desc_size) as *EfiMemoryDescriptor
+
+        # Only include usable and ACPI reclaimable memory in our map
+        # (kernel needs to know about usable memory for PMM)
+        let our_type: u32 = convert_efi_memory_type(desc.mem_type)
+
+        boot_memory_map[boot_memory_map_count].base = desc.physical_start
+        boot_memory_map[boot_memory_map_count].length = desc.number_of_pages * 4096
+        boot_memory_map[boot_memory_map_count].mem_type = our_type
+        boot_memory_map[boot_memory_map_count].reserved = 0
+        boot_memory_map_count = boot_memory_map_count + 1
+
+        i = i + 1
+
+    boot_info.memory_map = @boot_memory_map[0]
+    boot_info.memory_map_entries = boot_memory_map_count
+
+    prints("    Memory map entries: ")
+    serial_print_dec(boot_memory_map_count as u64)
+    prints("\n")
+
+    # Set RSDP address
+    boot_info.rsdp_addr = rsdp_address
+
+    # Set kernel info
+    boot_info.kernel_phys = kernel_entry
+    boot_info.kernel_size = kernel_size
+
+    # Set page table info
+    boot_info.pml4_phys = pml4_addr
+
+    # No framebuffer for now
+    boot_info.framebuffer_addr = 0
+    boot_info.framebuffer_width = 0
+    boot_info.framebuffer_height = 0
+    boot_info.framebuffer_pitch = 0
+    boot_info.framebuffer_bpp = 0
+
+    prints("    BootInfo ready at: ")
+    serial_print_hex(@boot_info as u64)
+    prints("\n")
+
+    return 0
+
+# Kernel path as UCS-2 string: L"\\harland\\kernel.elf"
+# Each character is 2 bytes, null-terminated
+var kernel_path: [32]u16
+
+fn init_kernel_path() -> i32
+    # "\\harland\\kernel.elf" in UCS-2
+    kernel_path[0] = 0x5C    # '\'
+    kernel_path[1] = 0x68    # 'h'
+    kernel_path[2] = 0x61    # 'a'
+    kernel_path[3] = 0x72    # 'r'
+    kernel_path[4] = 0x6C    # 'l'
+    kernel_path[5] = 0x61    # 'a'
+    kernel_path[6] = 0x6E    # 'n'
+    kernel_path[7] = 0x64    # 'd'
+    kernel_path[8] = 0x5C    # '\'
+    kernel_path[9] = 0x6B    # 'k'
+    kernel_path[10] = 0x65   # 'e'
+    kernel_path[11] = 0x72   # 'r'
+    kernel_path[12] = 0x6E   # 'n'
+    kernel_path[13] = 0x65   # 'e'
+    kernel_path[14] = 0x6C   # 'l'
+    kernel_path[15] = 0x2E   # '.'
+    kernel_path[16] = 0x65   # 'e'
+    kernel_path[17] = 0x6C   # 'l'
+    kernel_path[18] = 0x66   # 'f'
+    kernel_path[19] = 0      # null terminator
+    return 0
+
+# Buffer to hold loaded kernel
+var kernel_buffer: *u8 = 0 as *u8
+var kernel_size: u64 = 0
+var kernel_entry: u64 = 0
+
+# File read buffer (also used for file info)
+var file_info_buffer: [256]u8
+
+fn load_kernel_from_fs() -> i32
+    prints("  Loading kernel from filesystem...\n")
+    init_guids()
+    init_kernel_path()
+
+    # Find filesystem handles using LocateHandleBuffer
+    var num_handles: u64 = 0
+    var handle_buffer: u64 = 0
+    let lhb_status: u64 = efi_locate_handle_buffer(@fs_guid, @num_handles, @handle_buffer)
+    if lhb_status != EFI_SUCCESS
+        prints("    ERROR: Failed to locate filesystem handles: ")
+        serial_print_hex(lhb_status)
+        prints("\n")
+        return -1
+
+    prints("    Found ")
+    serial_print_dec(num_handles)
+    prints(" filesystem handle(s)\n")
+
+    if num_handles == 0
+        prints("    ERROR: No filesystems found\n")
+        return -1
+
+    # Try each filesystem handle to find our kernel
+    var handles: *u64 = handle_buffer as *u64
+    var fs_protocol: u64 = 0
+    var found_fs: i32 = 0
+
+    var i: u64 = 0
+    while i < num_handles && found_fs == 0
+        let handle: u64 = *(handles + i)
+        prints("    Trying handle ")
+        serial_print_dec(i)
+        prints(": ")
+        serial_print_hex(handle)
+
+        # Get filesystem protocol from this handle
+        var fs_iface: u64 = 0
+        let fs_status: u64 = efi_handle_protocol(handle, @fs_guid, @fs_iface)
+        if fs_status == EFI_SUCCESS
+            fs_protocol = fs_iface
+            found_fs = 1
+            prints(" OK\n")
+        else
+            prints(" FAIL\n")
+
+        i = i + 1
+
+    if found_fs == 0
+        prints("    ERROR: Could not get filesystem protocol from any handle\n")
+        return -1
+
+    prints("    Got filesystem protocol at ")
+    serial_print_hex(fs_protocol)
+    prints("\n")
+
+    let fs: *EfiSimpleFileSystem = fs_protocol as *EfiSimpleFileSystem
+
+    # Open the root volume
+    var root_file: u64 = 0
+    let open_volume_fn: u64 = fs.open_volume as u64
+    let status2: u64 = uefi_call2(open_volume_fn, fs_protocol, @root_file as u64)
+    if status2 != EFI_SUCCESS
+        prints("    ERROR: Failed to open root volume: ")
+        serial_print_hex(status2)
+        prints("\n")
+        return -1
+
+    prints("    Opened root volume\n")
+
+    let root: *EfiFile = root_file as *EfiFile
+
+    # Open the kernel file
+    var kernel_file: u64 = 0
+    let open_fn: u64 = root.open as u64
+    # EFI_FILE_OPEN: Open(This, NewHandle, FileName, OpenMode, Attributes)
+    let kpath_ptr: u64 = @kernel_path[0] as u64
+    let kfile_ptr: u64 = @kernel_file as u64
+    let status3: u64 = uefi_call5(open_fn, root_file, kfile_ptr, kpath_ptr, EFI_FILE_MODE_READ, 0)
+    if status3 != EFI_SUCCESS
+        prints("    ERROR: Failed to open \\harland\\kernel.elf: ")
+        serial_print_hex(status3)
+        prints("\n")
+        return -1
+
+    prints("    Opened kernel file: \\harland\\kernel.elf\n")
+
+    let kfile: *EfiFile = kernel_file as *EfiFile
+
+    # Get file size using GetInfo
+    # We need EFI_FILE_INFO_GUID and call GetInfo
+    # For simplicity, let's read in chunks and track size
+    # Or we can use SetPosition to end and GetPosition
+
+    # Seek to end to get file size
+    let set_pos_fn: u64 = kfile.set_position as u64
+    let get_pos_fn: u64 = kfile.get_position as u64
+
+    # SetPosition to 0xFFFFFFFFFFFFFFFF means end of file
+    let status4: u64 = uefi_call2(set_pos_fn, kernel_file, 0xFFFFFFFFFFFFFFFF)
+    if status4 != EFI_SUCCESS
+        prints("    ERROR: Failed to seek to end: ")
+        serial_print_hex(status4)
+        prints("\n")
+        return -1
+
+    var file_size: u64 = 0
+    let status5: u64 = uefi_call2(get_pos_fn, kernel_file, @file_size as u64)
+    if status5 != EFI_SUCCESS
+        prints("    ERROR: Failed to get file size: ")
+        serial_print_hex(status5)
+        prints("\n")
+        return -1
+
+    prints("    Kernel file size: ")
+    serial_print_dec(file_size)
+    prints(" bytes\n")
+
+    kernel_size = file_size
+
+    # Seek back to beginning
+    let status6: u64 = uefi_call2(set_pos_fn, kernel_file, 0)
+    if status6 != EFI_SUCCESS
+        prints("    ERROR: Failed to seek to start: ")
+        serial_print_hex(status6)
+        prints("\n")
+        return -1
+
+    # Allocate memory for kernel (round up to pages)
+    let pages_needed: u64 = (file_size + 4095) / 4096
+    var kernel_addr: u64 = 0
+    let status7: u64 = efi_allocate_pages(ALLOCATE_ANY_PAGES, EFI_LOADER_DATA, pages_needed, @kernel_addr)
+    if status7 != EFI_SUCCESS
+        prints("    ERROR: Failed to allocate kernel buffer: ")
+        serial_print_hex(status7)
+        prints("\n")
+        return -1
+
+    kernel_buffer = kernel_addr as *u8
+    prints("    Allocated ")
+    serial_print_dec(pages_needed)
+    prints(" pages at ")
+    serial_print_hex(kernel_addr)
+    prints("\n")
+
+    # Read the kernel file
+    var bytes_to_read: u64 = file_size
+    let read_fn: u64 = kfile.read as u64
+    let status8: u64 = uefi_call3(read_fn, kernel_file, @bytes_to_read as u64, kernel_addr)
+    if status8 != EFI_SUCCESS
+        prints("    ERROR: Failed to read kernel: ")
+        serial_print_hex(status8)
+        prints("\n")
+        return -1
+
+    prints("    Read ")
+    serial_print_dec(bytes_to_read)
+    prints(" bytes\n")
+
+    # Close kernel file
+    let close_fn: u64 = kfile.close as u64
+    uefi_call1(close_fn, kernel_file)
+
+    # Close root
+    let root_close_fn: u64 = root.close as u64
+    uefi_call1(root_close_fn, root_file)
+
+    prints("    Kernel loaded successfully!\n")
+    return 0
+
+# Call a UEFI function with 1 argument (for close)
+fn uefi_call1(fn_ptr: u64, arg1: u64) -> u64
+    var result: u64 = 0
+    asm x86_64:
+        movq {arg1}, %rcx
+        subq $40, %rsp
+        movq {fn_ptr}, %rax
+        call *%rax
+        addq $40, %rsp
+        movq %rax, {result}
+    return result
+
+# ============================================================================
+# ELF Loading
+# ============================================================================
+
+# Compare two null-terminated C strings
+fn streq(a: *u8, b: *u8) -> i32
+    var i: u64 = 0
+    while true
+        let ca: u8 = *(a + i)
+        let cb: u8 = *(b + i)
+        if ca != cb
+            return 0
+        if ca == 0
+            return 1
+        i = i + 1
+    return 0
+
+# Find a symbol by name in the ELF symbol table
+# Returns the symbol value (address), or 0 if not found
+fn elf_find_symbol(elf_data: *u8, name: *u8) -> u64
+    let elf: *Elf64Header = elf_data as *Elf64Header
+
+    # Need section headers to find symbol table
+    if elf.e_shoff == 0 || elf.e_shnum == 0
+        prints("    No section headers\n")
+        return 0
+
+    var symtab_offset: u64 = 0
+    var symtab_size: u64 = 0
+    var symtab_entsize: u64 = 0
+    var strtab_offset: u64 = 0
+
+    # Find .symtab and its linked .strtab
+    var i: u16 = 0
+    while i < elf.e_shnum
+        let sh_off: u64 = elf.e_shoff + (i as u64) * (elf.e_shentsize as u64)
+        let sh: *Elf64SectionHeader = (elf_data + sh_off) as *Elf64SectionHeader
+
+        if sh.sh_type == SHT_SYMTAB
+            symtab_offset = sh.sh_offset
+            symtab_size = sh.sh_size
+            symtab_entsize = sh.sh_entsize
+
+            # sh_link points to the string table section
+            let strtab_idx: u32 = sh.sh_link
+            let strtab_sh_off: u64 = elf.e_shoff + (strtab_idx as u64) * (elf.e_shentsize as u64)
+            let strtab_sh: *Elf64SectionHeader = (elf_data + strtab_sh_off) as *Elf64SectionHeader
+            strtab_offset = strtab_sh.sh_offset
+            break
+
+        i = i + 1
+
+    if symtab_offset == 0
+        prints("    No symbol table found\n")
+        return 0
+
+    # Search for the symbol
+    let num_symbols: u64 = symtab_size / symtab_entsize
+    var j: u64 = 0
+    while j < num_symbols
+        let sym_off: u64 = symtab_offset + j * symtab_entsize
+        let sym: *Elf64Symbol = (elf_data + sym_off) as *Elf64Symbol
+
+        # Get symbol name from string table
+        let sym_name: *u8 = elf_data + strtab_offset + (sym.st_name as u64)
+
+        if streq(sym_name, name) == 1
+            return sym.st_value
+
+        j = j + 1
+
+    return 0
+
+fn parse_and_load_elf() -> i32
+    prints("  Parsing ELF kernel...\n")
+
+    if kernel_buffer == 0 as *u8
+        prints("    ERROR: No kernel loaded\n")
+        return -1
+
+    let elf: *Elf64Header = kernel_buffer as *Elf64Header
+
+    # Check ELF magic
+    let magic: u32 = *(kernel_buffer as *u32)
+    if magic != ELF_MAGIC
+        prints("    ERROR: Invalid ELF magic: ")
+        serial_print_hex(magic as u64)
+        prints("\n")
+        return -1
+
+    prints("    Valid ELF header\n")
+    prints("    ELF entry point: ")
+    serial_print_hex(elf.e_entry)
+    prints("\n")
+    prints("    Program headers: ")
+    serial_print_dec(elf.e_phnum as u64)
+    prints(" at offset ")
+    serial_print_hex(elf.e_phoff)
+    prints("\n")
+
+    # Find kernel_main in the symbol table
+    # This is proper 64-bit code we can jump to directly from UEFI
+    kernel_entry = elf_find_symbol(kernel_buffer, c"kernel_main")
+    if kernel_entry == 0
+        prints("    ERROR: kernel_main symbol not found!\n")
+        return -1
+
+    prints("    kernel_main found at: ")
+    serial_print_hex(kernel_entry)
+    prints("\n")
+
+    # Process program headers and load segments
+    var i: u16 = 0
+    while i < elf.e_phnum
+        let ph_offset: u64 = elf.e_phoff + (i as u64) * (elf.e_phentsize as u64)
+        let ph: *Elf64ProgramHeader = (kernel_buffer + ph_offset) as *Elf64ProgramHeader
+
+        if ph.p_type == PT_LOAD
+            prints("    LOAD segment: vaddr=")
+            serial_print_hex(ph.p_vaddr)
+            prints(" paddr=")
+            serial_print_hex(ph.p_paddr)
+            prints(" filesz=")
+            serial_print_dec(ph.p_filesz)
+            prints(" memsz=")
+            serial_print_dec(ph.p_memsz)
+            prints("\n")
+
+            # Copy segment to physical address
+            let src: *u8 = kernel_buffer + ph.p_offset
+            let dst: *u8 = ph.p_paddr as *u8
+
+            # Copy file contents
+            var j: u64 = 0
+            while j < ph.p_filesz
+                *(dst + j) = *(src + j)
+                j = j + 1
+
+            # Zero BSS (memsz > filesz)
+            while j < ph.p_memsz
+                *(dst + j) = 0
+                j = j + 1
+
+        i = i + 1
+
+    prints("    ELF segments loaded\n")
+    return 0
+
+# ============================================================================
+# Kernel Jump
+# ============================================================================
+
+fn jump_to_kernel() -> i32
+    prints("\n========================================\n")
+    prints("  Jumping to kernel at higher-half!\n")
+    prints("========================================\n\n")
+
+    # Use ELF entry point if kernel was loaded from filesystem
+    # Otherwise fall back to default (for testing bootloader alone)
+    var kernel_virt: u64 = kernel_entry
+    if kernel_virt == 0
+        # No kernel loaded - use default fallback at higher-half
+        kernel_virt = KERNEL_VIRT_BASE + 0x101000
+
+    # Check if this is already a higher-half address (true higher-half kernel)
+    # or a physical address (flat/legacy kernel that needs translation)
+    if kernel_virt < KERNEL_VIRT_BASE
+        # Legacy flat kernel - convert physical to virtual
+        prints("  Kernel entry (physical): ")
+        serial_print_hex(kernel_virt)
+        prints("\n")
+        kernel_virt = KERNEL_VIRT_BASE + kernel_virt
+
+    prints("  Kernel entry (virtual):  ")
+    serial_print_hex(kernel_virt)
+    prints("\n")
+
+    # Pass BootInfo address to kernel
+    let boot_info_addr: u64 = @boot_info as u64
+    prints("  BootInfo at:     ")
+    serial_print_hex(boot_info_addr)
+    prints("\n")
+
+    # Jump to kernel with System V calling convention (RDI = boot_info)
+    # The kernel uses System V, but we've been using MS x64 (Windows target)
+    # So we use inline asm to set up the registers correctly
+    asm x86_64:
+        movq {boot_info_addr}, %rdi
+        movq {kernel_virt}, %rax
+        jmpq *%rax
+    return 0
+
+# ============================================================================
+# EFI Main Entry Point
+# ============================================================================
+
+# UEFI entry: ImageHandle in RCX, SystemTable in RDX (MS x64 ABI)
+# Since we compile for Windows target, our function receives these correctly
+pub fn efi_main(image_handle: u64, system_table: *EfiSystemTable) -> u64
+    serial_init()
+    prints("\n")
+    prints("========================================\n")
+    prints("    Harland UEFI Bootloader\n")
+    prints("========================================\n")
+    prints("\n")
+    g_image_handle = image_handle
+    g_system_table = system_table
+    g_boot_services = system_table.boot_services
+    prints("UEFI handles saved:\n")
+    prints("  ImageHandle:   ")
+    serial_print_hex(image_handle)
+    prints("\n")
+    prints("  SystemTable:   ")
+    serial_print_hex(system_table as u64)
+    prints("\n")
+    prints("  BootServices:  ")
+    serial_print_hex(g_boot_services as u64)
+    prints("\n\n")
+    prints("Initialization:\n")
+
+    # Initialize GUIDs for protocol lookups
+    init_guids()
+
+    # Find ACPI RSDP from UEFI configuration table (must happen before ExitBootServices)
+    find_rsdp_from_uefi()
+
+    # Load kernel from filesystem (must happen before ExitBootServices)
+    if load_kernel_from_fs() != 0
+        prints("  WARNING: Kernel not found on filesystem\n")
+        prints("  (Bootloader test mode - no kernel to load)\n")
+    else
+        if parse_and_load_elf() != 0
+            prints("FATAL: Failed to parse/load kernel ELF\n")
+            return 1
+
+    if get_memory_map() != 0
+        prints("FATAL: Failed to get memory map\n")
+        return 1
+    if allocate_page_tables() != 0
+        prints("FATAL: Failed to allocate page tables\n")
+        return 1
+    if setup_page_tables() != 0
+        prints("FATAL: Failed to set up page tables\n")
+        return 1
+
+    # Get final memory map (needed for ExitBootServices and BootInfo)
+    if get_memory_map() != 0
+        prints("FATAL: Failed to get final memory map\n")
+        return 1
+
+    # Build BootInfo structure with memory map and RSDP
+    build_boot_info()
+
+    prints("\n  Exiting boot services...\n")
+    let status: u64 = efi_exit_boot_services(memory_map_key)
+    if status != EFI_SUCCESS
+        prints("    WARNING: ExitBootServices failed, retrying...\n")
+        memory_map_size = 16384
+        let map_ptr2: *u8 = @memory_map_buffer[0]
+        let s2: u64 = efi_get_memory_map(@memory_map_size, map_ptr2, @memory_map_key, @memory_map_desc_size, @memory_map_desc_version)
+        if s2 == EFI_SUCCESS
+            # Rebuild BootInfo with updated memory map
+            build_boot_info()
+            let s3: u64 = efi_exit_boot_services(memory_map_key)
+            if s3 != EFI_SUCCESS
+                prints("    FATAL: ExitBootServices failed twice!\n")
+                return 1
+    prints("    Boot services exited successfully\n")
+    load_page_tables()
+    jump_to_kernel()
+    return 0

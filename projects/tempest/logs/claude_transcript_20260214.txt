@@ -1,0 +1,732 @@
+[2026-02-14T20:53:10.483906] [CHAT] user_1: Hey there!  We are starting out the project.  Wanna check the docs, read up on things, and get ready to discuss things and do a design / architecture / project planning session for this project?!
+[2026-02-14T20:54:51.831427] Claude: Absolutely! Let me dive into the Ritz ecosystem documentation and understand what we're working with. I'll explore the relevant projects and gather context for our design session.Let me try again with the exploration:So Tempest is truly a fresh start! Let me explore the key dependency projects to understand what we have to build on:Excellent! Now let me get the rest of the key dependencies:Now let me check out what exists in the more mature projects (Valet, Cryptosec, Squeeze, Ritz itself) to understand actual implementation patterns:Let me check the actual implementation status of Valet and read some key files to understand patterns:Now let me check the language documentation and some key ritzlib modules to understand capabilities:This is excellent! I now have a comprehensive understanding. Let me present what I've learned and we can discuss the design.
+
+---
+
+# 🌊 Tempest Browser - Project Overview & Design Session
+
+## What We Have to Build On
+
+### The Ritz Ecosystem
+
+**Core Language (Ritz)** - A mature systems language with:
+- Clean Python-like syntax, no semicolons/braces
+- Rust-style ownership semantics with simpler surface syntax (`:`, `:&`, `:=`)
+- No libc - direct Linux syscalls
+- io_uring for async I/O
+- LLVM backend
+- Comprehensive ritzlib: `sys`, `io`, `str`, `gvec`, `hashmap`, `json`, `async_tasks`, `uring`, `net`, `fs`, etc.
+
+### Existing Infrastructure (Production-Ready)
+
+| Project | Status | Description |
+|---------|--------|-------------|
+| **Valet** | ✅ Mature | HTTP/1.1 server, TLS 1.3, compression, routing, static files |
+| **Squeeze** | ✅ Mature | gzip/deflate compression, streaming |
+| **Cryptosec** | ✅ Mature | SHA, AES-GCM, ChaCha20-Poly1305, X25519, Ed25519, TLS 1.3 |
+
+### Stub Projects (Architecture Defined, Not Implemented)
+
+| Project | Status | Description |
+|---------|--------|-------------|
+| **Iris** | 📋 Stub | Rendering engine (layout, painting, compositing) |
+| **Sage** | 📋 Stub | JavaScript engine (lexer → parser → bytecode → VM) |
+| **Lexis** | 📋 Stub | HTML5/CSS parser, DOM tree, style resolution |
+| **Prism** | 📋 Stub | Display server for Harland (virtio-gpu, window management) |
+| **Tempest** | 📋 Empty | Browser shell (us!) |
+
+---
+
+## Tempest Architecture Vision
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                          TEMPEST                                 │
+│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────────────┐   │
+│  │   Tabs   │ │ History  │ │Bookmarks │ │    Downloads     │   │
+│  └──────────┘ └──────────┘ └──────────┘ └──────────────────┘   │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │                      Browser UI                             │ │
+│  │   [◀][▶][🔄][🏠]  [___________________URL_______________▼] │ │
+│  └────────────────────────────────────────────────────────────┘ │
+│                              │                                   │
+│  ┌───────────────────────────┴───────────────────────────────┐ │
+│  │                     Web View / Tab Content                 │ │
+│  │   ┌─────────────────────────────────────────────────────┐ │ │
+│  │   │                    Page Frame                        │ │ │
+│  │   │  (DOM + JS bindings + Rendered output)               │ │ │
+│  │   └─────────────────────────────────────────────────────┘ │ │
+│  └───────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────┘
+                                │
+        ┌───────────────────────┼───────────────────────┐
+        ▼                       ▼                       ▼
+   ┌─────────┐            ┌─────────┐            ┌─────────┐
+   │  LEXIS  │───────────▶│  IRIS   │            │  SAGE   │
+   │HTML/CSS │  Document  │ Render  │◀───────────│   JS    │
+   │ Parser  │   Tree     │ Engine  │  DOM APIs  │ Engine  │
+   └─────────┘            └─────────┘            └─────────┘
+        ▲
+        │
+   ┌────┴────────────────────────────────────────────────────┐
+   │                    NETWORK STACK                         │
+   │  ┌─────────┐  ┌───────────┐  ┌─────────┐               │
+   │  │  VALET  │←─│ CRYPTOSEC │←─│ SQUEEZE │               │
+   │  │  HTTP   │  │   TLS     │  │  gzip   │               │
+   │  └─────────┘  └───────────┘  └─────────┘               │
+   └──────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+   ┌──────────────────────────────────────────────────────────┐
+   │                      PRISM                                │
+   │               (Display Server / Window)                   │
+   └──────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Key Design Questions
+
+### 1. **What's our target scope?**
+
+Options:
+- **A) Minimal Viable Browser** - Load and render HTML/CSS pages
+- **B) Full Featured** - Tabs, history, bookmarks, downloads, dev tools
+- **C) Full + JS** - Everything above + JavaScript execution
+
+### 2. **Platform targets?**
+
+Options:
+- **A) Harland-first** - Build for Harland/Prism display server
+- **B) Linux framebuffer** - Direct `/dev/fb0` rendering (simpler)
+- **C) X11/Wayland** - Standard desktop Linux (wider audience)
+- **D) All of the above** - Abstract rendering backend
+
+### 3. **Build order strategy?**
+
+The dependency chain is: Tempest → Lexis → Iris → Prism
+
+Options:
+- **A) Bottom-up** - Build Prism → Iris → Lexis → Tempest
+- **B) Top-down stubs** - Build Tempest shell with stub deps, fill in later
+- **C) Parallel** - Define interfaces, build all simultaneously
+- **D) Network-first** - HTTP client (Valet-client), then HTML parsing
+
+### 4. **Multi-process architecture?**
+
+Modern browsers use process isolation:
+- Chrome model: Browser process + renderer processes + GPU process
+- Firefox model: Similar but with more shared memory
+
+For Tempest:
+- **A) Single process** - Simple, good for embedded/Harland
+- **B) Multi-process** - Each tab isolated (security + stability)
+- **C) Hybrid** - Main process + sandbox for JS execution
+
+---
+
+## What Would You Like to Discuss?
+
+I'm ready to dive deep on any of these:
+
+1. **Detailed architecture** for any component
+2. **Interface definitions** between modules
+3. **Implementation priorities** and phasing
+4. **Technical deep-dives** (rendering pipeline, DOM model, etc.)
+5. **Project structure** and file organization
+6. **Testing strategy**
+
+What's most interesting to you? What direction do you want to take Tempest?
+[2026-02-14T22:56:46.370270] [CHAT] user_1: Can you read `iris` room conversation which is the browsers rendering engine?  We just did a design session & it has a lot of good info for you.
+[2026-02-14T22:58:20.116504] Claude: Excellent! This is incredibly valuable context. Let me read the actual transcript to get all the details:This is incredibly valuable! Let me get the rest of the transcript:Now let me also check the Prism room for the display server design:This is fantastic context! Let me also check the current state of the Prism API contract:Now I have the complete picture! Let me synthesize everything for our Tempest design session.
+
+---
+
+# 🌊 Tempest Browser - Design Session Summary
+
+## What We Learned from the Iris & Prism Sessions
+
+### Architecture Decisions Already Made
+
+The ecosystem has made key architectural decisions that Tempest must work with:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         TEMPEST                                  │
+│              (Browser Shell - THIS PROJECT)                      │
+│                                                                  │
+│  Owns: DOM tree, navigation, tab management, JS orchestration   │
+│  Coordinates: Lexis (parsing), Sage (JS), Iris (rendering)     │
+└─────────────────────────┬───────────────────────────────────────┘
+                          │ StyleEvent stream (DOM changes)
+                          ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                          IRIS                                    │
+│              (Rendering Engine - embedded library)               │
+│                                                                  │
+│  Owns: Render tree, layer tree, layout, painting                │
+│  Receives: StyleEvents from Tempest                              │
+│  Produces: Draw commands to Prism                                │
+│  Handles: Hit testing, scrolling, damage tracking               │
+└─────────────────────────┬───────────────────────────────────────┘
+                          │ Prism Protocol (ritzlib.ipc ringbuffers)
+                          ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                          PRISM                                   │
+│              (Display Server - separate process)                 │
+│                                                                  │
+│  Provides: DrawContext, Layers, Input events                    │
+│  Uses: Angelo (fonts), MockBackend/VirtioGPU                    │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Key Design Decisions from Iris Session
+
+1. **Tempest owns the DOM** - Iris receives StyleEvents describing changes
+2. **Iris builds a separate render tree** - Mirrors visible DOM, optimized for layout
+3. **Frame-based batching** - Mutations batched at 60fps, not immediate layout
+4. **Iris does hit testing** - Since it owns render tree with positions
+5. **Iris handles scrolling** - Fast path at 60fps, notifies Tempest for JS `onscroll`
+
+### Key Interfaces
+
+**Tempest → Iris (StyleEvent):**
+```ritz
+enum StyleEvent
+    NodeCreated { id: NodeId, parent: NodeId, index: u32, tag: Tag }
+    NodeRemoved { id: NodeId }
+    NodeMoved { id: NodeId, new_parent: NodeId, new_index: u32 }
+    StyleChanged { id: NodeId, style: ComputedStyle }
+    TextChanged { id: NodeId, text: StrView }
+```
+
+**Iris → Tempest (Callbacks):**
+```ritz
+struct HitTestResult
+    node_id: NodeId
+    point: Point            # Relative to node
+
+struct ScrollNotification
+    node_id: NodeId         # Scrolling container
+    offset: Point           # New scroll position
+```
+
+### Prism API Contract (Stable)
+
+Iris uses these types from Prism:
+- `Point { x: i32, y: i32 }`
+- `Size { width: u32, height: u32 }`
+- `Rect` with rich geometry API
+- `Color { r, g, b, a: u8 }`
+- `DrawContext` - fill_rect, stroke_rect, draw_glyphs, draw_image, etc.
+- `Layer` - for CSS transforms, opacity, scroll containers
+- `GlyphRun` - shaped text from Angelo
+
+---
+
+## Tempest's Role
+
+Given these decisions, Tempest is the **orchestrator**. It:
+
+1. **Owns the DOM tree** - The canonical source of page structure
+2. **Coordinates parsing** - Uses Lexis for HTML/CSS parsing
+3. **Runs JavaScript** - Uses Sage for execution, handles DOM mutations
+4. **Manages navigation** - URLs, history, back/forward
+5. **Manages tabs** - Multiple browser contexts
+6. **Dispatches events** - Receives from Iris, routes to DOM event handlers
+7. **Sends StyleEvents** - Tells Iris what changed
+
+### Tempest Does NOT:
+- Parse HTML/CSS directly (Lexis)
+- Execute JavaScript directly (Sage)
+- Layout or paint (Iris)
+- Draw pixels (Prism)
+
+---
+
+## Proposed Tempest Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         TEMPEST                                  │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────────┐│
+│  │                      UI SHELL                                ││
+│  │  Tabs bar, URL bar, back/forward, bookmarks                 ││
+│  │  (Could be Prism widgets or HTML-rendered)                  ││
+│  └─────────────────────────────────────────────────────────────┘│
+│                              │                                   │
+│  ┌───────────────────────────┴───────────────────────────────┐  │
+│  │                      TAB MANAGER                           │  │
+│  │  Vec<BrowserContext>                                       │  │
+│  │  - Active tab                                              │  │
+│  │  - Tab switching                                           │  │
+│  │  - Tab creation/destruction                                │  │
+│  └─────────────────────────────────────────────────────────────┘│
+│                              │                                   │
+│  ┌───────────────────────────┴───────────────────────────────┐  │
+│  │                    BROWSER CONTEXT (per tab)               │  │
+│  │  ┌──────────────┐ ┌──────────────┐ ┌──────────────────┐   │  │
+│  │  │  Navigator   │ │  Document    │ │  Script Context  │   │  │
+│  │  │  (history,   │ │  (DOM tree,  │ │  (Sage VM,       │   │  │
+│  │  │   URL)       │ │   events)    │ │   bindings)      │   │  │
+│  │  └──────────────┘ └──────────────┘ └──────────────────┘   │  │
+│  │            │              │               │                │  │
+│  │            └──────────────┴───────────────┘                │  │
+│  │                           │                                 │  │
+│  │  ┌────────────────────────┴────────────────────────────┐   │  │
+│  │  │                   DOCUMENT                           │   │  │
+│  │  │  - DOM tree (owned by Tempest)                      │   │  │
+│  │  │  - Event listeners                                   │   │  │
+│  │  │  - Style computation (via Lexis)                    │   │  │
+│  │  │  → Sends StyleEvents to Iris                        │   │  │
+│  │  └──────────────────────────────────────────────────────┘   │  │
+│  └─────────────────────────────────────────────────────────────┘│
+│                              │                                   │
+│  ┌───────────────────────────┴───────────────────────────────┐  │
+│  │                    NETWORK MANAGER                         │  │
+│  │  HTTP client using Valet, TLS via Cryptosec               │  │
+│  │  Cookie jar, caching, resource loading                    │  │
+│  └─────────────────────────────────────────────────────────────┘│
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## What Questions Do You Want to Explore?
+
+Based on all this context, here are the key decisions for Tempest:
+
+### 1. **Single vs Multi-Process?**
+- **Single process**: Tempest + Iris in same process, Prism separate (IPC)
+- **Multi-process**: Each tab in its own process (Chrome-like isolation)
+- **Recommendation**: Start single, architect for multi
+
+### 2. **UI Shell Implementation?**
+- **Option A**: Browser chrome (tabs, URL bar) rendered as HTML via Iris
+- **Option B**: Browser chrome as native Prism widgets
+- **Recommendation**: Start with Prism widgets (simpler), can add HTML chrome later
+
+### 3. **DOM Storage Format?**
+- Need efficient DOM tree that supports:
+  - Fast mutations (from JS)
+  - StyleEvent generation
+  - Event bubbling/capture
+  - Query selectors
+
+### 4. **Lexis Integration?**
+- Lexis produces DOM + handles CSS cascade → ComputedStyle
+- Tempest owns the resulting DOM tree
+- How do we stream parse results?
+
+### 5. **Sage Integration?**
+- Sage runs JS, needs DOM bindings
+- Tempest mediates: JS → DOM mutation → StyleEvent → Iris
+
+### 6. **Network Stack?**
+- Valet is currently a server - need HTTP client
+- Should we extend Valet or create separate client?
+
+---
+
+## Phased Development Plan
+
+### Phase 0: Foundation
+- [ ] Project structure (ritz.toml, src/, tests/)
+- [ ] Core types (URL, NodeId, Tab)
+- [ ] Stub integrations (Iris, Lexis, Sage interfaces)
+
+### Phase 1: Static Page Loading
+- [ ] Network manager (HTTP GET using Valet-client or custom)
+- [ ] Lexis integration (parse HTML → DOM)
+- [ ] Iris integration (send StyleEvents, receive hit tests)
+- [ ] **Goal**: Load and display a static HTML page
+
+### Phase 2: Navigation
+- [ ] URL bar input
+- [ ] History (back/forward)
+- [ ] Link clicking (hit test → navigate)
+
+### Phase 3: Multiple Tabs
+- [ ] Tab bar UI
+- [ ] BrowserContext per tab
+- [ ] Tab switching
+
+### Phase 4: JavaScript
+- [ ] Sage integration
+- [ ] DOM bindings (document.getElementById, etc.)
+- [ ] Event dispatch (onclick, etc.)
+
+### Phase 5: Forms & Interaction
+- [ ] Form elements
+- [ ] Text input
+- [ ] Form submission
+
+### Phase 6: Advanced
+- [ ] Bookmarks
+- [ ] Downloads
+- [ ] Dev tools (inspector)
+
+---
+
+Where would you like to dive deeper? Ready to start laying out code structure?
+[2026-02-14T23:07:35.266569] [CHAT] user_1: 1) Multi-process for each tempest process.  If we are running javascript, I want to isolate the f out of their execution environments.
+2) Browser chrome should be done as native prism widgets by tempest (just discussed in the `lexus` conversation room).
+3) yeah... 
+4) Read over lexus' conversation to get context and get back to me if you have questions
+5) Sounds good, can we get it 'leaner'?
+6) Valet is a server.  We have an `http` library, the client should be in that.  Valet uses `http` library.  Take a look at the room or project on github.
+[2026-02-14T23:08:59.013933] Claude: Let me check the Lexis conversation and the HTTP library:I see! Spire has the HTTP types. Let me check if there's an HTTP client or if we need to find/create one:I see - Spire has HTTP types for server-side (Request/Response), but I don't see an HTTP client yet. Let me check if there's any client implementation or if we need to create one:Now I have a complete picture. Let me synthesize everything:
+
+---
+
+# 🌊 Tempest - Updated Design Summary
+
+## Key Decisions Made
+
+Based on your answers and the ecosystem exploration:
+
+### 1. **Multi-Process Architecture** ✅
+- Each tab runs in its own process for JS isolation
+- Tempest browser process orchestrates tabs
+- Iris is embedded per-tab process
+- Prism is separate (IPC via ritzlib.ipc ringbuffers)
+
+### 2. **Browser Chrome** ✅ 
+- Native Prism widgets (decided in Lexis conversation)
+- Tempest owns the debug console
+- Tabs, URL bar, back/forward as Prism controls
+
+### 3. **DOM Storage** 
+- Tempest owns DOM tree
+- Efficient for mutations, StyleEvent generation, event bubbling
+- Query selectors needed for JS
+
+### 4. **Lexis Integration** ✅
+- Streaming/incremental parsing
+- Event-based feeding into DOM
+- Imports from Iris for `ComputedStyle`
+- Error output to Tempest's console stream
+
+### 5. **Sage Integration** 
+- Sage runs JS, needs DOM bindings
+- Multi-process means isolated JS contexts per tab
+- Tempest mediates: JS → DOM mutation → StyleEvent → Iris
+
+### 6. **Network Stack** ✅
+- **Spire** has `spire.http` module with Request/Response types
+- **ritzlib.net** has raw socket support (`socket_connect`, etc.)
+- Need to build HTTP client in Spire's `http` module or create separate module
+- TLS via Cryptosec
+
+---
+
+## Architecture Diagram (Multi-Process)
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     TEMPEST BROWSER PROCESS                      │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────────┐│
+│  │                   BROWSER CHROME                             ││
+│  │  (Prism Widgets: Tabs, URL bar, bookmarks, console)         ││
+│  └─────────────────────────────────────────────────────────────┘│
+│                              │                                   │
+│  ┌───────────────────────────┴───────────────────────────────┐  │
+│  │                      TAB MANAGER                           │  │
+│  │  Spawns/manages child processes for each tab               │  │
+│  │  IPC to tab processes                                      │  │
+│  └─────────────────────────────────────────────────────────────┘│
+│                              │                                   │
+│  ┌───────────────────────────┴───────────────────────────────┐  │
+│  │                    NETWORK MANAGER                         │  │
+│  │  HTTP client (spire.http + ritzlib.net + cryptosec)       │  │
+│  │  Cookie jar, cache, resource loader                        │  │
+│  └─────────────────────────────────────────────────────────────┘│
+└──────────────────────────────┼──────────────────────────────────┘
+                               │ IPC (ritzlib.ipc ringbuffer)
+        ┌──────────────────────┼──────────────────────────────────┐
+        │                      │                                  │
+        ▼                      ▼                                  ▼
+┌───────────────┐      ┌───────────────┐               ┌───────────────┐
+│  TAB PROCESS  │      │  TAB PROCESS  │               │  TAB PROCESS  │
+│    (Tab 1)    │      │    (Tab 2)    │      ...      │    (Tab N)    │
+│               │      │               │               │               │
+│ ┌───────────┐ │      │ ┌───────────┐ │               │ ┌───────────┐ │
+│ │ Document  │ │      │ │ Document  │ │               │ │ Document  │ │
+│ │ (DOM tree)│ │      │ │ (DOM tree)│ │               │ │ (DOM tree)│ │
+│ └─────┬─────┘ │      │ └─────┬─────┘ │               │ └─────┬─────┘ │
+│       │       │      │       │       │               │       │       │
+│ ┌─────┴─────┐ │      │ ┌─────┴─────┐ │               │ ┌─────┴─────┐ │
+│ │   SAGE    │ │      │ │   SAGE    │ │               │ │   SAGE    │ │
+│ │(JS engine)│ │      │ │(JS engine)│ │               │ │(JS engine)│ │
+│ └───────────┘ │      │ └───────────┘ │               │ └───────────┘ │
+│       │       │      │       │       │               │       │       │
+│ ┌─────┴─────┐ │      │ ┌─────┴─────┐ │               │ ┌─────┴─────┐ │
+│ │   IRIS    │ │      │ │   IRIS    │ │               │ │   IRIS    │ │
+│ │ (render)  │ │      │ │ (render)  │ │               │ │ (render)  │ │
+│ └─────┬─────┘ │      │ └─────┬─────┘ │               │ └─────┬─────┘ │
+└───────┼───────┘      └───────┼───────┘               └───────┼───────┘
+        │                      │                                │
+        └──────────────────────┴────────────────────────────────┘
+                               │ IPC (ritzlib.ipc ringbuffer)
+                               ▼
+                    ┌───────────────────┐
+                    │      PRISM        │
+                    │  (Display Server) │
+                    └───────────────────┘
+```
+
+---
+
+## Leaner Sage Integration
+
+You asked to make it "leaner". Here's what I'm thinking:
+
+### Minimal DOM Binding Surface
+
+Instead of full WebIDL, Tempest provides a thin layer:
+
+```ritz
+# Tempest provides these to Sage:
+trait DOMBridge
+    # Core tree operations
+    fn get_element_by_id(id: StrView) -> Option<NodeId>
+    fn query_selector(selector: StrView) -> Option<NodeId>
+    fn query_selector_all(selector: StrView) -> Vec<NodeId>
+    
+    # Node operations
+    fn get_parent(node: NodeId) -> Option<NodeId>
+    fn get_children(node: NodeId) -> Vec<NodeId>
+    fn get_tag_name(node: NodeId) -> StrView
+    fn get_text_content(node: NodeId) -> StrView
+    fn set_text_content(node: NodeId, text: StrView)
+    
+    # Attributes
+    fn get_attribute(node: NodeId, name: StrView) -> Option<StrView>
+    fn set_attribute(node: NodeId, name: StrView, value: StrView)
+    
+    # Style (read-only for now)
+    fn get_computed_style(node: NodeId) -> ComputedStyle
+    
+    # Events (registration only - Tempest handles dispatch)
+    fn add_event_listener(node: NodeId, event: StrView, handler_id: u64)
+    fn remove_event_listener(node: NodeId, event: StrView, handler_id: u64)
+
+# Sage calls these, Tempest implements them
+```
+
+### Event Flow (Lean)
+
+```
+User Click
+    │
+    ▼
+PRISM → WindowEvent.MouseButton(x, y, button)
+    │
+    ▼
+IRIS → hit_test(x, y) → NodeId
+    │
+    ▼
+TEMPEST → dispatch_event(node_id, "click", event_data)
+    │
+    ▼
+SAGE → call registered JS handlers
+    │
+    ▼
+JS modifies DOM → TEMPEST captures mutations
+    │
+    ▼
+TEMPEST → StyleEvents → IRIS
+```
+
+---
+
+## HTTP Client Location
+
+You mentioned Valet is server, HTTP client should be in an `http` library that Valet uses. Looking at the codebase:
+
+- **spire.http** - Has Request/Response types (server-focused currently)
+- **ritzlib.net** - Has `socket_connect`, raw TCP
+
+**Proposal:** Add HTTP client to `spire.http`:
+
+```ritz
+# spire.http.client (NEW)
+import ritzlib.net { Socket, socket_tcp, socket_connect }
+import cryptosec.tls { TlsClient }
+
+struct HttpClient
+    # Config
+    timeout_ms: i32
+    follow_redirects: i32
+    max_redirects: i32
+
+pub fn http_get(url: StrView) -> Result<Response, HttpError>
+pub fn http_post(url: StrView, body: StrView) -> Result<Response, HttpError>
+pub fn http_request(req: Request) -> Result<Response, HttpError>
+```
+
+Or should this be a separate project? What's your preference?
+
+---
+
+## Questions for You
+
+1. **HTTP Client Location** - Add to `spire.http` or new project?
+
+2. **Tab IPC** - For multi-process tabs, what IPC mechanism?
+   - Use `ritzlib.ipc` ringbuffers (same as Zeus uses)?
+   - Unix domain sockets?
+   - Harland capabilities?
+
+3. **Ready to scaffold?** - Should I create the initial project structure now?
+   - `ritz.toml` with dependencies
+   - `src/main.ritz` 
+   - `lib/` modules (browser, tab, document, network)
+   - Interface stubs for Iris/Lexis/Sage
+[2026-02-14T23:29:51.300520] [CHAT] user_1: No - there is a literal repository called ritz-lang/http that valet uses.  It has support for http1-3.  Can you take a look for it?  Clone it if you need to.
+[2026-02-14T23:31:26.915587] Claude: I'll look for the `ritz-lang/http` repository. Let me first check if it exists locally, and if not, I'll clone it.The `http` repository isn't in the local filesystem yet. Let me clone it from GitHub:The repository is cloned. Let me explore its structure and understand the HTTP client implementation:Excellent! This is a comprehensive HTTP library with HTTP/1.x, HTTP/2, HTTP/3, and QUIC support. Let me read the README and key source files to understand the client API:Let me also check the h1_request and h1_response files to understand the full HTTP client capabilities:Now let me check the h1_writer to see how to construct HTTP requests (the client side):This is excellent! The `ritz-lang/http` library is comprehensive and ready for use. Let me summarize what I've found and update our architecture understanding:
+
+---
+
+## HTTP Library Summary (`ritz-lang/http`)
+
+The HTTP library is a **mechanism-not-policy** wire protocol library that Tempest will use as its HTTP client. Here's what it provides:
+
+### Completed Features (Phases 1-5 done ✓)
+
+| Protocol | Status | Features |
+|----------|--------|----------|
+| **HTTP/1.0-1.1** | ✓ | Request/response parsing, chunked encoding, keep-alive, serialization |
+| **HTTP/2** | ✓ | Binary framing, HPACK compression, stream multiplexing, flow control |
+| **HTTP/3** | ✓ | QUIC transport, QPACK compression, stream management |
+| **Async I/O** | ✓ | io_uring integration via `async_http.ritz` |
+
+### Key Files for Tempest
+
+| File | Purpose |
+|------|---------|
+| `lib/types.ritz` | Method, Status, Version constants |
+| `lib/h1_request.ritz` | Parse HTTP/1.x requests (for servers, but useful for testing) |
+| `lib/h1_response.ritz` | Parse HTTP/1.x responses (what Tempest needs as a client!) |
+| `lib/h1_writer.ritz` | Serialize HTTP/1.x requests (what Tempest sends) |
+| `lib/async_http.ritz` | io_uring-based async HTTP operations |
+| `lib/h2_*.ritz` | HTTP/2 frame/stream handling |
+| `lib/h3_*.ritz` | HTTP/3 frame/stream handling |
+| `lib/quic_*.ritz` | QUIC transport layer |
+
+### Integration Points for Tempest
+
+1. **HTTP Client (outgoing requests)**:
+   - Use `h1_write_request_line()` + `h1_write_header()` to construct requests
+   - Use `h1_parse_response()` to parse server responses
+   - `AsyncHttpConn` manages connection state with io_uring
+
+2. **Protocol Negotiation**:
+   - Start with HTTP/1.1 over TLS (via cryptosec)
+   - ALPN negotiation for HTTP/2 (`h2`)
+   - UDP + QUIC for HTTP/3 (full implementation available)
+
+3. **Dependencies**:
+   - **cryptosec** - TLS 1.3 (integration TODO in http library)
+   - **squeeze** - Content-Encoding decompression (integration TODO)
+
+---
+
+Now we have a complete picture of all the Tempest dependencies:
+
+| Component | Repository | Purpose | Status |
+|-----------|------------|---------|--------|
+| **Lexis** | ritz-lang/lexis | HTML/CSS parsing | Design session done |
+| **Iris** | ritz-lang/iris | Rendering engine | Design session done |
+| **Sage** | ritz-lang/sage | JavaScript engine | Stub |
+| **Prism** | ritz-lang/prism | Display server | Design session done |
+| **http** | ritz-lang/http | HTTP 1-3 client | ✓ Complete |
+| **cryptosec** | ritz-lang/cryptosec | TLS 1.3 | Available |
+| **squeeze** | ritz-lang/squeeze | Compression | Available |
+
+Would you like me to proceed with creating the Tempest project scaffold (`ritz.toml`, directory structure, interface stubs) now that we have clarity on all the dependencies?
+[2026-02-14T23:34:24.612061] [CHAT] user_1: Yep!  And anything else you'll need from other projects, we can create them as issues.
+[2026-02-14T23:41:26.720774] Claude: Let me start by creating the Tempest project scaffold and identifying what we need from other projects.Now let me create the tab process entry point:Now let me create a simple test file and then compile the issues list:Now let me create an ISSUES.md file documenting what we need from other projects:Let me show you the final project structure:---
+
+# 🌊 Tempest Project Scaffold Complete!
+
+Here's what I've created:
+
+## Project Structure
+
+```
+tempest/
+├── ritz.toml                    # Package config with all dependencies
+├── ISSUES.md                    # Dependencies needed from other projects
+├── src/
+│   ├── main.ritz                # Browser process entry point
+│   └── tab_process.ritz         # Tab renderer process entry point
+├── lib/
+│   ├── browser.ritz             # Browser process orchestration
+│   ├── chrome.ritz              # Native Prism UI widgets
+│   ├── config.ritz              # Browser configuration
+│   ├── document.ritz            # DOM tree types
+│   ├── history.ritz             # Navigation & browsing history
+│   ├── ipc.ritz                 # Browser ↔ Tab IPC messages
+│   ├── iris_bridge.ritz         # Interface to Iris renderer
+│   ├── lexis_bridge.ritz        # Interface to Lexis parser
+│   ├── network.ritz             # HTTP client manager
+│   ├── sage_bridge.ritz         # Interface to Sage JS engine
+│   ├── tab.ritz                 # Tab management
+│   └── tab_renderer.ritz        # Tab process rendering loop
+└── tests/
+    └── test_document.ritz       # DOM tests
+```
+
+## Architecture Summary
+
+```
+┌─────────────────────────────────────────────────────┐
+│           TEMPEST BROWSER PROCESS                    │
+│  ┌──────────┬──────────┬─────────────────────────┐  │
+│  │  Chrome  │   Tab    │      Network            │  │
+│  │ (Prism)  │ Manager  │      Manager            │  │
+│  └──────────┴────┬─────┴─────────────────────────┘  │
+└──────────────────┼──────────────────────────────────┘
+                   │ IPC (ringbuffers)
+        ┌──────────┴──────────┐
+        ▼                     ▼
+┌──────────────┐      ┌──────────────┐
+│ TAB PROCESS  │      │ TAB PROCESS  │
+│   Document   │      │   Document   │
+│ Lexis + Sage │      │ Lexis + Sage │
+│ + Iris       │      │ + Iris       │
+└──────┬───────┘      └──────┬───────┘
+       └──────────┬──────────┘
+                  │ Prism Protocol
+                  ▼
+           ┌───────────┐
+           │   PRISM   │
+           └───────────┘
+```
+
+## Key Issues for Other Projects
+
+### Phase 1 Blockers (Static Pages)
+| Project | Need |
+|---------|------|
+| **prism** | Client connection API, basic widgets |
+| **lexis** | HTML/CSS parsing |
+| **iris** | StyleEvent processing |
+| **http** | DNS resolution, TLS integration |
+| **ritz** | IPC ringbuffers (for multi-process) |
+
+### Phase 2 Blockers (Navigation)
+| Project | Need |
+|---------|------|
+| **iris** | Hit testing |
+| **ritz** | Process spawning (fork/exec) |
+
+### Phase 3 Blockers (JavaScript)
+| Project | Need |
+|---------|------|
+| **sage** | JS context, DOM bindings callback |
+
+The full issue list is in `ISSUES.md`. Want me to create actual GitHub issues for any of these?

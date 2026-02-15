@@ -1,0 +1,198 @@
+# Prism - Window
+#
+# Window state and management.
+
+import types { Point, Size, Rect, WindowId }
+
+# Window state flags
+pub enum WindowState
+    Normal          # Regular window
+    Focused         # Has keyboard focus, may be visually highlighted
+    Maximized       # Fills the screen (minus any shell chrome)
+    Minimized       # Hidden, in taskbar/dock
+    Fullscreen      # Covers entire screen, no chrome
+
+# A window managed by the compositor
+pub struct Window
+    # Identity
+    id: WindowId
+
+    # Geometry
+    x: i32
+    y: i32
+    width: u32
+    height: u32
+
+    # Stacking
+    z_order: i32        # Higher = on top
+
+    # Visual state
+    state: WindowState
+    opacity: f32        # 0.0 = transparent, 1.0 = opaque
+    visible: bool
+
+    # Title (stored separately, this is just metadata)
+    title_len: u32
+
+    # Damage tracking
+    dirty: bool                 # Needs redraw
+    dirty_regions: Vec<Rect>    # Specific regions that need redraw
+
+    # Client info
+    has_buffer: bool            # Client has attached a buffer
+    client_responsive: bool     # Client is responding to events
+
+impl Window
+    pub fn new(id: WindowId, x: i32, y: i32, width: u32, height: u32) -> Window
+        Window {
+            id: id,
+            x: x,
+            y: y,
+            width: width,
+            height: height,
+            z_order: 0,
+            state: WindowState.Normal,
+            opacity: 1.0,
+            visible: true,
+            title_len: 0,
+            dirty: true,  # New windows need initial draw
+            dirty_regions: Vec<Rect>.new(),
+            has_buffer: false,
+            client_responsive: true
+        }
+
+    # --- Geometry ---
+
+    pub fn bounds(self) -> Rect
+        Rect {
+            x: self.x,
+            y: self.y,
+            width: self.width,
+            height: self.height
+        }
+
+    pub fn position(self) -> Point
+        Point { x: self.x, y: self.y }
+
+    pub fn size(self) -> Size
+        Size { width: self.width, height: self.height }
+
+    pub fn set_position(self:&, x: i32, y: i32)
+        self.x = x
+        self.y = y
+
+    pub fn set_size(self:&, width: u32, height: u32)
+        self.width = width
+        self.height = height
+        # Resizing invalidates entire window
+        self.mark_dirty_all()
+
+    pub fn move_by(self:&, dx: i32, dy: i32)
+        self.x += dx
+        self.y += dy
+
+    # --- Stacking ---
+
+    pub fn bring_to_front(self:&, max_z: i32)
+        self.z_order = max_z + 1
+
+    pub fn send_to_back(self:&, min_z: i32)
+        self.z_order = min_z - 1
+
+    # --- State ---
+
+    pub fn set_state(self:&, state: WindowState)
+        self.state = state
+
+    pub fn is_focused(self) -> bool
+        match self.state
+            WindowState.Focused => true
+            _ => false
+
+    pub fn is_visible(self) -> bool
+        self.visible and not self.is_minimized()
+
+    pub fn is_minimized(self) -> bool
+        match self.state
+            WindowState.Minimized => true
+            _ => false
+
+    pub fn is_fullscreen(self) -> bool
+        match self.state
+            WindowState.Fullscreen => true
+            _ => false
+
+    pub fn set_visible(self:&, visible: bool)
+        if self.visible != visible
+            self.visible = visible
+            self.mark_dirty_all()
+
+    pub fn set_opacity(self:&, opacity: f32)
+        let clamped = if opacity < 0.0
+            0.0
+        else if opacity > 1.0
+            1.0
+        else
+            opacity
+
+        if self.opacity != clamped
+            self.opacity = clamped
+            self.mark_dirty_all()
+
+    # --- Damage Tracking ---
+
+    pub fn is_dirty(self) -> bool
+        self.dirty
+
+    pub fn mark_dirty(self:&, region: Rect)
+        # Clip to window bounds
+        let clipped = region.intersection(self.local_bounds())
+        if not clipped.is_empty()
+            self.dirty_regions.push(clipped)
+            self.dirty = true
+
+    pub fn mark_dirty_all(self:&)
+        self.dirty_regions.clear()
+        self.dirty_regions.push(self.local_bounds())
+        self.dirty = true
+
+    pub fn clear_dirty(self:&)
+        self.dirty_regions.clear()
+        self.dirty = false
+
+    pub fn dirty_region_count(self) -> u64
+        self.dirty_regions.len()
+
+    # Get the bounding box of all dirty regions
+    pub fn dirty_bounds(self) -> Rect
+        if self.dirty_regions.len() == 0
+            Rect.zero()
+        else
+            var bounds = self.dirty_regions[0]
+            var i: u64 = 1
+            while i < self.dirty_regions.len()
+                bounds = bounds.union(self.dirty_regions[i])
+                i += 1
+            bounds
+
+    # --- Helpers ---
+
+    # Bounds in local coordinates (0,0 to width,height)
+    fn local_bounds(self) -> Rect
+        Rect { x: 0, y: 0, width: self.width, height: self.height }
+
+    # Convert local point to screen coordinates
+    pub fn local_to_screen(self, p: Point) -> Point
+        Point { x: p.x + self.x, y: p.y + self.y }
+
+    # Convert screen point to local coordinates
+    pub fn screen_to_local(self, p: Point) -> Point
+        Point { x: p.x - self.x, y: p.y - self.y }
+
+    # Check if a screen point is within this window
+    pub fn contains_point(self, p: Point) -> bool
+        self.bounds().contains_point(p)
+
+# Comparison for z-order sorting (higher z = later in draw order)
+pub fn compare_z_order(a: Window, b: Window) -> i32
+    a.z_order - b.z_order

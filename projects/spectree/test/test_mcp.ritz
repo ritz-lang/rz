@@ -1,0 +1,531 @@
+# test/test_mcp.ritz - Tests for MCP server interface
+#
+# Tests for lib/mcp.ritz:
+# - Server creation
+# - Node operations (get, list_children, create, update, move, delete)
+# - Link operations (link_nodes, unlink_nodes, get_links)
+# - Agent operations (claim_ownership, release_ownership)
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.gvec
+
+import lib.types
+import lib.mcp
+
+# ============================================================================
+# Server Creation Tests
+# ============================================================================
+
+[[test]]
+fn test_mcp_server_new() -> i32
+    var server: McpServer = mcp_server_new()
+    assert mcp_node_count(@server) == 0, "new server should have no nodes"
+    0
+
+# ============================================================================
+# Node Creation Tests
+# ============================================================================
+
+[[test]]
+fn test_mcp_create_node() -> i32
+    var server: McpServer = mcp_server_new()
+    var zero: Uuid = uuid_zero()
+
+    var id: Uuid = mcp_create_node(@&server, @zero, NODE_SPEC, null, null)
+
+    assert uuid_eq(@id, @zero) == 0, "created node should have non-zero ID"
+    assert mcp_node_count(@server) == 1, "server should have 1 node"
+    0
+
+[[test]]
+fn test_mcp_create_with_title() -> i32
+    var server: McpServer = mcp_server_new()
+    var zero: Uuid = uuid_zero()
+
+    var title: Vec<u8> = vec_new<u8>()
+    vec_push<u8>(@&title, 'T')
+    vec_push<u8>(@&title, 'e')
+    vec_push<u8>(@&title, 's')
+    vec_push<u8>(@&title, 't')
+
+    var id: Uuid = mcp_create_node(@&server, @zero, NODE_SPEC, @title, null)
+
+    var node: *Node = mcp_get_node(@&server, @id)
+    let node_ptr: i64 = node as i64
+    assert node_ptr != 0, "node should exist"
+    assert vec_len<u8>(@node.title) == 4, "title should have 4 chars"
+    0
+
+[[test]]
+fn test_mcp_create_hierarchy() -> i32
+    var server: McpServer = mcp_server_new()
+    var zero: Uuid = uuid_zero()
+
+    # Create org -> spec -> plan
+    var org_id: Uuid = mcp_create_node(@&server, @zero, NODE_ORG, null, null)
+    var spec_id: Uuid = mcp_create_node(@&server, @org_id, NODE_SPEC, null, null)
+    var plan_id: Uuid = mcp_create_node(@&server, @spec_id, NODE_PLAN, null, null)
+
+    assert mcp_node_count(@server) == 3, "server should have 3 nodes"
+
+    # Check hierarchy
+    var children: [16]Uuid
+    var count: i64 = mcp_list_children(@&server, @org_id, @children[0], 16)
+    assert count == 1, "org should have 1 child"
+    assert uuid_eq(@children[0], @spec_id) == 1, "org's child should be spec"
+    0
+
+# ============================================================================
+# Node Retrieval Tests
+# ============================================================================
+
+[[test]]
+fn test_mcp_get_node() -> i32
+    var server: McpServer = mcp_server_new()
+    var zero: Uuid = uuid_zero()
+
+    var id: Uuid = mcp_create_node(@&server, @zero, NODE_SPEC, null, null)
+    var node: *Node = mcp_get_node(@&server, @id)
+
+    let node_ptr: i64 = node as i64
+    assert node_ptr != 0, "node should exist"
+    assert node.kind == NODE_SPEC, "node should be SPEC"
+    0
+
+[[test]]
+fn test_mcp_get_nonexistent() -> i32
+    var server: McpServer = mcp_server_new()
+    var fake_id: Uuid = uuid_zero()
+    fake_id.high = 12345
+    fake_id.low = 67890
+
+    var node: *Node = mcp_get_node(@&server, @fake_id)
+    let node_ptr: i64 = node as i64
+    assert node_ptr == 0, "nonexistent node should return null"
+    0
+
+[[test]]
+fn test_mcp_list_children() -> i32
+    var server: McpServer = mcp_server_new()
+    var zero: Uuid = uuid_zero()
+
+    var parent_id: Uuid = mcp_create_node(@&server, @zero, NODE_ORG, null, null)
+    var child1: Uuid = mcp_create_node(@&server, @parent_id, NODE_SPEC, null, null)
+    var child2: Uuid = mcp_create_node(@&server, @parent_id, NODE_SPEC, null, null)
+    var child3: Uuid = mcp_create_node(@&server, @parent_id, NODE_PLAN, null, null)
+
+    var children: [16]Uuid
+    var count: i64 = mcp_list_children(@&server, @parent_id, @children[0], 16)
+    assert count == 3, "parent should have 3 children"
+    0
+
+[[test]]
+fn test_mcp_list_children_limited() -> i32
+    var server: McpServer = mcp_server_new()
+    var zero: Uuid = uuid_zero()
+
+    var parent_id: Uuid = mcp_create_node(@&server, @zero, NODE_ORG, null, null)
+    mcp_create_node(@&server, @parent_id, NODE_SPEC, null, null)
+    mcp_create_node(@&server, @parent_id, NODE_SPEC, null, null)
+    mcp_create_node(@&server, @parent_id, NODE_PLAN, null, null)
+
+    var children: [2]Uuid
+    var count: i64 = mcp_list_children(@&server, @parent_id, @children[0], 2)
+    # Returns total count even if limited
+    assert count == 3, "should return total child count"
+    0
+
+# ============================================================================
+# Node Update Tests
+# ============================================================================
+
+[[test]]
+fn test_mcp_update_title() -> i32
+    var server: McpServer = mcp_server_new()
+    var zero: Uuid = uuid_zero()
+
+    var id: Uuid = mcp_create_node(@&server, @zero, NODE_SPEC, null, null)
+
+    var title: Vec<u8> = vec_new<u8>()
+    vec_push<u8>(@&title, 'N')
+    vec_push<u8>(@&title, 'e')
+    vec_push<u8>(@&title, 'w')
+
+    var result: i32 = mcp_update_title(@&server, @id, @title)
+    assert result == MCP_OK, "update should succeed"
+
+    var node: *Node = mcp_get_node(@&server, @id)
+    assert vec_len<u8>(@node.title) == 3, "title should have 3 chars"
+    0
+
+[[test]]
+fn test_mcp_update_content() -> i32
+    var server: McpServer = mcp_server_new()
+    var zero: Uuid = uuid_zero()
+
+    var id: Uuid = mcp_create_node(@&server, @zero, NODE_SPEC, null, null)
+
+    var content: Vec<u8> = vec_new<u8>()
+    vec_push<u8>(@&content, '#')
+    vec_push<u8>(@&content, ' ')
+    vec_push<u8>(@&content, 'H')
+    vec_push<u8>(@&content, 'i')
+
+    var result: i32 = mcp_update_content(@&server, @id, @content)
+    assert result == MCP_OK, "update should succeed"
+
+    var node: *Node = mcp_get_node(@&server, @id)
+    assert vec_len<u8>(@node.content) == 4, "content should have 4 chars"
+    0
+
+[[test]]
+fn test_mcp_update_status() -> i32
+    var server: McpServer = mcp_server_new()
+    var zero: Uuid = uuid_zero()
+
+    var id: Uuid = mcp_create_node(@&server, @zero, NODE_PLAN, null, null)
+
+    var result: i32 = mcp_update_status(@&server, @id, STATUS_IN_PROGRESS)
+    assert result == MCP_OK, "update should succeed"
+
+    var node: *Node = mcp_get_node(@&server, @id)
+    assert node.status == STATUS_IN_PROGRESS, "status should be IN_PROGRESS"
+    0
+
+[[test]]
+fn test_mcp_update_nonexistent() -> i32
+    var server: McpServer = mcp_server_new()
+    var fake_id: Uuid = uuid_zero()
+    fake_id.high = 99999
+
+    var title: Vec<u8> = vec_new<u8>()
+    var result: i32 = mcp_update_title(@&server, @fake_id, @title)
+    assert result == MCP_ERR_NOT_FOUND, "updating nonexistent should fail"
+    0
+
+# ============================================================================
+# Node Move Tests
+# ============================================================================
+
+[[test]]
+fn test_mcp_move_node() -> i32
+    var server: McpServer = mcp_server_new()
+    var zero: Uuid = uuid_zero()
+
+    var parent1: Uuid = mcp_create_node(@&server, @zero, NODE_ORG, null, null)
+    var parent2: Uuid = mcp_create_node(@&server, @zero, NODE_ORG, null, null)
+    var child: Uuid = mcp_create_node(@&server, @parent1, NODE_SPEC, null, null)
+
+    var result: i32 = mcp_move_node(@&server, @child, @parent2)
+    assert result == MCP_OK, "move should succeed"
+
+    var children1: [4]Uuid
+    var children2: [4]Uuid
+    var count1: i64 = mcp_list_children(@&server, @parent1, @children1[0], 4)
+    var count2: i64 = mcp_list_children(@&server, @parent2, @children2[0], 4)
+
+    assert count1 == 0, "parent1 should have no children"
+    assert count2 == 1, "parent2 should have 1 child"
+    0
+
+# ============================================================================
+# Node Delete Tests
+# ============================================================================
+
+[[test]]
+fn test_mcp_delete_node() -> i32
+    var server: McpServer = mcp_server_new()
+    var zero: Uuid = uuid_zero()
+
+    var id: Uuid = mcp_create_node(@&server, @zero, NODE_SPEC, null, null)
+    assert mcp_node_count(@server) == 1, "should have 1 node"
+
+    var result: i32 = mcp_delete_node(@&server, @id)
+    assert result == MCP_OK, "delete should succeed"
+    assert mcp_node_count(@server) == 0, "should have 0 nodes"
+    0
+
+[[test]]
+fn test_mcp_delete_nonexistent() -> i32
+    var server: McpServer = mcp_server_new()
+    var fake_id: Uuid = uuid_zero()
+    fake_id.high = 11111
+
+    var result: i32 = mcp_delete_node(@&server, @fake_id)
+    assert result == MCP_ERR_NOT_FOUND, "deleting nonexistent should fail"
+    0
+
+# ============================================================================
+# Link Tests
+# ============================================================================
+
+[[test]]
+fn test_mcp_link_nodes() -> i32
+    var server: McpServer = mcp_server_new()
+    var zero: Uuid = uuid_zero()
+
+    var spec_id: Uuid = mcp_create_node(@&server, @zero, NODE_SPEC, null, null)
+    var plan_id: Uuid = mcp_create_node(@&server, @zero, NODE_PLAN, null, null)
+
+    var result: i32 = mcp_link_nodes(@&server, @plan_id, @spec_id, LINK_IMPLEMENTS)
+    assert result == MCP_OK, "linking should succeed"
+
+    var links: [4]Link
+    var count: i64 = mcp_get_links(@&server, @plan_id, @links[0], 4)
+    assert count == 1, "plan should have 1 link"
+    assert links[0].kind == LINK_IMPLEMENTS, "link should be IMPLEMENTS"
+    0
+
+[[test]]
+fn test_mcp_unlink_nodes() -> i32
+    var server: McpServer = mcp_server_new()
+    var zero: Uuid = uuid_zero()
+
+    var spec_id: Uuid = mcp_create_node(@&server, @zero, NODE_SPEC, null, null)
+    var plan_id: Uuid = mcp_create_node(@&server, @zero, NODE_PLAN, null, null)
+
+    mcp_link_nodes(@&server, @plan_id, @spec_id, LINK_IMPLEMENTS)
+
+    var result: i32 = mcp_unlink_nodes(@&server, @plan_id, @spec_id)
+    assert result == MCP_OK, "unlinking should succeed"
+
+    var links: [4]Link
+    var count: i64 = mcp_get_links(@&server, @plan_id, @links[0], 4)
+    assert count == 0, "plan should have no links"
+    0
+
+[[test]]
+fn test_mcp_link_invalid() -> i32
+    var server: McpServer = mcp_server_new()
+    var zero: Uuid = uuid_zero()
+
+    var spec_id: Uuid = mcp_create_node(@&server, @zero, NODE_SPEC, null, null)
+    var fake_id: Uuid = uuid_zero()
+    fake_id.high = 77777
+
+    var result: i32 = mcp_link_nodes(@&server, @spec_id, @fake_id, LINK_DEPENDS_ON)
+    assert result == MCP_ERR_INVALID_LINK, "linking to nonexistent should fail"
+    0
+
+# ============================================================================
+# Agent Tests
+# ============================================================================
+
+[[test]]
+fn test_mcp_claim_ownership() -> i32
+    var server: McpServer = mcp_server_new()
+    var zero: Uuid = uuid_zero()
+
+    var plan_id: Uuid = mcp_create_node(@&server, @zero, NODE_PLAN, null, null)
+
+    var agent_name: Vec<u8> = vec_new<u8>()
+    vec_push<u8>(@&agent_name, 'a')
+    vec_push<u8>(@&agent_name, 'd')
+    vec_push<u8>(@&agent_name, 'e')
+    vec_push<u8>(@&agent_name, 'l')
+    vec_push<u8>(@&agent_name, 'e')
+
+    var result: i32 = mcp_claim_ownership(@&server, @plan_id, @agent_name)
+    assert result == MCP_OK, "claiming should succeed"
+
+    var count: i64 = mcp_get_agents_count(@&server, @plan_id)
+    assert count == 1, "plan should have 1 agent"
+    0
+
+[[test]]
+fn test_mcp_claim_nonexistent() -> i32
+    var server: McpServer = mcp_server_new()
+    var fake_id: Uuid = uuid_zero()
+    fake_id.high = 88888
+
+    var agent_name: Vec<u8> = vec_new<u8>()
+    vec_push<u8>(@&agent_name, 'x')
+
+    var result: i32 = mcp_claim_ownership(@&server, @fake_id, @agent_name)
+    assert result == MCP_ERR_NOT_FOUND, "claiming nonexistent should fail"
+    0
+
+[[test]]
+fn test_mcp_release_ownership() -> i32
+    var server: McpServer = mcp_server_new()
+    var zero: Uuid = uuid_zero()
+
+    var plan_id: Uuid = mcp_create_node(@&server, @zero, NODE_PLAN, null, null)
+
+    var agent_name: Vec<u8> = vec_new<u8>()
+    vec_push<u8>(@&agent_name, 'x')
+
+    mcp_claim_ownership(@&server, @plan_id, @agent_name)
+    var result: i32 = mcp_release_ownership(@&server, @plan_id, @agent_name)
+    assert result == MCP_OK, "releasing should succeed"
+    0
+
+[[test]]
+fn test_mcp_get_agent() -> i32
+    var server: McpServer = mcp_server_new()
+    var zero: Uuid = uuid_zero()
+
+    var plan_id: Uuid = mcp_create_node(@&server, @zero, NODE_PLAN, null, null)
+
+    var agent_name: Vec<u8> = vec_new<u8>()
+    vec_push<u8>(@&agent_name, 'a')
+    vec_push<u8>(@&agent_name, '1')
+
+    mcp_claim_ownership(@&server, @plan_id, @agent_name)
+
+    var agent: *AgentRef = mcp_get_agent(@&server, @plan_id, 0)
+    let agent_ptr: i64 = agent as i64
+    assert agent_ptr != 0, "agent should exist"
+    assert agent.role == AGENT_OWNER, "agent should be OWNER"
+    0
+
+# ============================================================================
+# Conversation Tests
+# ============================================================================
+
+[[test]]
+fn test_mcp_create_conversation() -> i32
+    var server: McpServer = mcp_server_new()
+    var zero: Uuid = uuid_zero()
+
+    # Create a node first
+    var node_id: Uuid = mcp_create_node(@&server, @zero, NODE_SPEC, null, null)
+
+    # Create conversation
+    var conv_id: Uuid = mcp_create_conversation(@&server, @node_id)
+    assert uuid_eq(@conv_id, @zero) == 0, "conversation should have non-zero ID"
+    assert mcp_conversation_count(@&server, @node_id) == 1, "node should have 1 conversation"
+    0
+
+[[test]]
+fn test_mcp_create_conversation_invalid_node() -> i32
+    var server: McpServer = mcp_server_new()
+    var fake_id: Uuid = uuid_zero()
+    fake_id.high = 99999
+
+    var conv_id: Uuid = mcp_create_conversation(@&server, @fake_id)
+    var zero: Uuid = uuid_zero()
+    assert uuid_eq(@conv_id, @zero) == 1, "should return zero for invalid node"
+    0
+
+[[test]]
+fn test_mcp_get_conversation() -> i32
+    var server: McpServer = mcp_server_new()
+    var zero: Uuid = uuid_zero()
+
+    var node_id: Uuid = mcp_create_node(@&server, @zero, NODE_SPEC, null, null)
+    var conv_id: Uuid = mcp_create_conversation(@&server, @node_id)
+
+    var conv: *Conversation = mcp_get_conversation(@&server, @conv_id)
+    let conv_ptr: i64 = conv as i64
+    assert conv_ptr != 0, "should find conversation"
+    assert uuid_eq(@conv.node_id, @node_id) == 1, "conversation should belong to correct node"
+    0
+
+[[test]]
+fn test_mcp_append_message() -> i32
+    var server: McpServer = mcp_server_new()
+    var zero: Uuid = uuid_zero()
+
+    var node_id: Uuid = mcp_create_node(@&server, @zero, NODE_SPEC, null, null)
+    var conv_id: Uuid = mcp_create_conversation(@&server, @node_id)
+
+    var content: Vec<u8> = vec_new<u8>()
+    vec_push<u8>(@&content, 'H')
+    vec_push<u8>(@&content, 'i')
+
+    var result: i32 = mcp_append_message(@&server, @conv_id, ROLE_USER, @content)
+    assert result == MCP_OK, "append should succeed"
+    assert mcp_message_count(@&server, @conv_id) == 1, "conversation should have 1 message"
+    0
+
+[[test]]
+fn test_mcp_append_message_invalid_conv() -> i32
+    var server: McpServer = mcp_server_new()
+    var fake_id: Uuid = uuid_zero()
+    fake_id.high = 88888
+
+    var content: Vec<u8> = vec_new<u8>()
+    var result: i32 = mcp_append_message(@&server, @fake_id, ROLE_USER, @content)
+    assert result == MCP_ERR_NOT_FOUND, "append to invalid conv should fail"
+    0
+
+[[test]]
+fn test_mcp_get_message() -> i32
+    var server: McpServer = mcp_server_new()
+    var zero: Uuid = uuid_zero()
+
+    var node_id: Uuid = mcp_create_node(@&server, @zero, NODE_PLAN, null, null)
+    var conv_id: Uuid = mcp_create_conversation(@&server, @node_id)
+
+    var content: Vec<u8> = vec_new<u8>()
+    vec_push<u8>(@&content, 'Q')
+    mcp_append_message(@&server, @conv_id, ROLE_USER, @content)
+
+    var msg: *Message = mcp_get_message(@&server, @conv_id, 0)
+    let msg_ptr: i64 = msg as i64
+    assert msg_ptr != 0, "should find message"
+    assert msg.role == ROLE_USER, "message should have correct role"
+    0
+
+[[test]]
+fn test_mcp_conversation_flow() -> i32
+    var server: McpServer = mcp_server_new()
+    var zero: Uuid = uuid_zero()
+
+    # Create node and conversation
+    var node_id: Uuid = mcp_create_node(@&server, @zero, NODE_SPEC, null, null)
+    var conv_id: Uuid = mcp_create_conversation(@&server, @node_id)
+
+    # Simulate a conversation
+    var q: Vec<u8> = vec_new<u8>()
+    vec_push<u8>(@&q, 'Q')
+
+    var a: Vec<u8> = vec_new<u8>()
+    vec_push<u8>(@&a, 'A')
+
+    mcp_append_message(@&server, @conv_id, ROLE_USER, @q)
+    mcp_append_message(@&server, @conv_id, ROLE_ASSISTANT, @a)
+    mcp_append_message(@&server, @conv_id, ROLE_USER, @q)
+    mcp_append_message(@&server, @conv_id, ROLE_ASSISTANT, @a)
+
+    assert mcp_message_count(@&server, @conv_id) == 4, "conversation should have 4 messages"
+
+    # Verify message order
+    var m0: *Message = mcp_get_message(@&server, @conv_id, 0)
+    var m1: *Message = mcp_get_message(@&server, @conv_id, 1)
+    var m2: *Message = mcp_get_message(@&server, @conv_id, 2)
+    var m3: *Message = mcp_get_message(@&server, @conv_id, 3)
+
+    assert m0.role == ROLE_USER, "m0 should be USER"
+    assert m1.role == ROLE_ASSISTANT, "m1 should be ASSISTANT"
+    assert m2.role == ROLE_USER, "m2 should be USER"
+    assert m3.role == ROLE_ASSISTANT, "m3 should be ASSISTANT"
+    0
+
+[[test]]
+fn test_mcp_delete_conversation() -> i32
+    var server: McpServer = mcp_server_new()
+    var zero: Uuid = uuid_zero()
+
+    var node_id: Uuid = mcp_create_node(@&server, @zero, NODE_SPEC, null, null)
+    var conv_id: Uuid = mcp_create_conversation(@&server, @node_id)
+
+    var result: i32 = mcp_delete_conversation(@&server, @conv_id)
+    assert result == MCP_OK, "delete should succeed"
+    0
+
+[[test]]
+fn test_mcp_total_conversation_count() -> i32
+    var server: McpServer = mcp_server_new()
+    var zero: Uuid = uuid_zero()
+
+    assert mcp_total_conversation_count(@server) == 0, "new server should have 0 conversations"
+
+    var node_id: Uuid = mcp_create_node(@&server, @zero, NODE_SPEC, null, null)
+    mcp_create_conversation(@&server, @node_id)
+    mcp_create_conversation(@&server, @node_id)
+
+    assert mcp_total_conversation_count(@server) == 2, "server should have 2 conversations"
+    0

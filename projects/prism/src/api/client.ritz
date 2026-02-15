@@ -1,0 +1,312 @@
+# Prism - Client API
+#
+# High-level client interface for connecting to Prism.
+# This is what Iris uses to establish a connection and manage windows.
+
+import types { Point, Size, Rect, Color }
+import api.surface { Surface, SurfaceConfig, SurfaceId }
+import api.layer { Layer, LayerConfig, LayerId }
+import api.draw { DrawContext, DrawCommand }
+import api.image { ImageHandle, ImageUpload }
+import protocol.event { WindowEvent, KeyCode, Modifiers, MouseButton }
+
+# Configuration for connecting to Prism
+pub struct ClientConfig
+    # Application identifier
+    app_id: u32
+
+    # Initial window configuration
+    window_title_offset: u32    # Offset in shared mem
+    window_title_len: u32
+    window_width: u32
+    window_height: u32
+
+    # Capabilities requested
+    wants_keyboard: bool
+    wants_mouse: bool
+    wants_touch: bool
+
+    # Is this a desktop widget?
+    is_widget: bool
+
+impl ClientConfig
+    pub fn new(width: u32, height: u32) -> ClientConfig
+        ClientConfig {
+            app_id: 0,
+            window_title_offset: 0,
+            window_title_len: 0,
+            window_width: width,
+            window_height: height,
+            wants_keyboard: true,
+            wants_mouse: true,
+            wants_touch: false,
+            is_widget: false
+        }
+
+    pub fn as_widget(self) -> ClientConfig
+        ClientConfig {
+            app_id: self.app_id,
+            window_title_offset: self.window_title_offset,
+            window_title_len: self.window_title_len,
+            window_width: self.window_width,
+            window_height: self.window_height,
+            wants_keyboard: self.wants_keyboard,
+            wants_mouse: self.wants_mouse,
+            wants_touch: self.wants_touch,
+            is_widget: true
+        }
+
+# Client connection to Prism
+# This is the main interface Iris uses
+pub struct PrismClient
+    # Connection state
+    connected: bool
+    client_id: u64
+
+    # Window info
+    window_width: u32
+    window_height: u32
+
+    # Surfaces and layers
+    surfaces: Vec<Surface>
+    layers: Vec<Layer>
+
+    # Root layer (always exists)
+    root_layer: LayerId
+
+    # Pending commands to send
+    pending_commands: Vec<ClientCommand>
+
+    # Received events
+    pending_events: Vec<WindowEvent>
+
+impl PrismClient
+    # Connect to Prism (placeholder - will use ringbuffer IPC)
+    pub fn connect(config: ClientConfig) -> Result<PrismClient, ClientError>
+        # TODO: Actually connect via ritzlib.ipc
+        Ok(PrismClient {
+            connected: true,
+            client_id: 1,
+            window_width: config.window_width,
+            window_height: config.window_height,
+            surfaces: Vec<Surface>.new(),
+            layers: Vec<Layer>.new(),
+            root_layer: LayerId.new(1),
+            pending_commands: Vec<ClientCommand>.new(),
+            pending_events: Vec<WindowEvent>.new()
+        })
+
+    pub fn disconnect(self:&)
+        self.connected = false
+
+    pub fn is_connected(self) -> bool
+        self.connected
+
+    # --- Surface Management ---
+
+    # Create a new surface for drawing
+    pub fn create_surface(self:&, config: SurfaceConfig) -> SurfaceId
+        let id = SurfaceId.new(self.surfaces.len() as u64 + 1)
+        self.pending_commands.push(ClientCommand.CreateSurface(CreateSurfaceCmd {
+            id: id,
+            config: config
+        }))
+        id
+
+    # Resize a surface
+    pub fn resize_surface(self:&, id: SurfaceId, width: u32, height: u32)
+        self.pending_commands.push(ClientCommand.ResizeSurface(ResizeSurfaceCmd {
+            id: id,
+            width: width,
+            height: height
+        }))
+
+    # Destroy a surface
+    pub fn destroy_surface(self:&, id: SurfaceId)
+        self.pending_commands.push(ClientCommand.DestroySurface(id))
+
+    # --- Layer Management ---
+
+    # Create a new layer
+    pub fn create_layer(self:&, config: LayerConfig) -> LayerId
+        let id = LayerId.new(self.layers.len() as u64 + 2)  # +2 because root is 1
+        self.pending_commands.push(ClientCommand.CreateLayer(CreateLayerCmd {
+            id: id,
+            config: config
+        }))
+        id
+
+    # Destroy a layer
+    pub fn destroy_layer(self:&, id: LayerId)
+        self.pending_commands.push(ClientCommand.DestroyLayer(id))
+
+    # Update layer properties
+    pub fn update_layer(self:&, id: LayerId, update: LayerUpdate)
+        self.pending_commands.push(ClientCommand.UpdateLayer(UpdateLayerCmd {
+            id: id,
+            update: update
+        }))
+
+    # Attach a surface to a layer
+    pub fn attach_surface(self:&, layer: LayerId, surface: SurfaceId)
+        self.pending_commands.push(ClientCommand.AttachSurface(AttachSurfaceCmd {
+            layer: layer,
+            surface: surface
+        }))
+
+    # Set layer parent (for layer tree)
+    pub fn set_layer_parent(self:&, layer: LayerId, parent: LayerId)
+        self.pending_commands.push(ClientCommand.SetLayerParent(SetLayerParentCmd {
+            layer: layer,
+            parent: parent
+        }))
+
+    # --- Drawing ---
+
+    # Begin drawing to a surface
+    pub fn begin_draw(self:&, surface: SurfaceId) -> DrawContext
+        DrawContext {
+            surface_id: surface.raw(),
+            commands: Vec<DrawCommand>.new(),
+            clip_stack: Vec<Rect>.new(),
+            transform_stack: Vec<Transform2D>.new()
+        }
+
+    # Submit drawing commands
+    pub fn submit_draw(self:&, ctx: DrawContext, damage: Vec<Rect>)
+        self.pending_commands.push(ClientCommand.Draw(DrawCmd {
+            surface: SurfaceId.new(ctx.surface_id),
+            commands: ctx.commands,
+            damage: damage
+        }))
+
+    # --- Images ---
+
+    # Upload an image
+    pub fn upload_image(self:&, upload: ImageUpload) -> ImageHandle
+        let id = self.surfaces.len() as u64 + 1000  # Offset to avoid collision
+        self.pending_commands.push(ClientCommand.UploadImage(upload))
+        ImageHandle.new(id, upload.width, upload.height, upload.format)
+
+    # --- Frame Submission ---
+
+    # Submit a frame (call after all drawing is done)
+    pub fn submit_frame(self:&)
+        self.pending_commands.push(ClientCommand.SubmitFrame)
+        # TODO: Send commands via ringbuffer
+
+    # --- Events ---
+
+    # Poll for events (non-blocking)
+    pub fn poll_events(self:&) -> Vec<WindowEvent>
+        # TODO: Read from event ringbuffer
+        let events = self.pending_events
+        self.pending_events = Vec<WindowEvent>.new()
+        events
+
+    # Wait for events (blocking)
+    pub fn wait_events(self:&) -> Vec<WindowEvent>
+        # TODO: Block on event ringbuffer
+        self.poll_events()
+
+    # --- Window Info ---
+
+    pub fn window_size(self) -> Size
+        Size.new(self.window_width, self.window_height)
+
+    pub fn root_layer(self) -> LayerId
+        self.root_layer
+
+# Commands sent from client to Prism
+enum ClientCommand
+    CreateSurface(CreateSurfaceCmd)
+    ResizeSurface(ResizeSurfaceCmd)
+    DestroySurface(SurfaceId)
+    CreateLayer(CreateLayerCmd)
+    DestroyLayer(LayerId)
+    UpdateLayer(UpdateLayerCmd)
+    AttachSurface(AttachSurfaceCmd)
+    SetLayerParent(SetLayerParentCmd)
+    Draw(DrawCmd)
+    UploadImage(ImageUpload)
+    SubmitFrame
+
+struct CreateSurfaceCmd
+    id: SurfaceId
+    config: SurfaceConfig
+
+struct ResizeSurfaceCmd
+    id: SurfaceId
+    width: u32
+    height: u32
+
+struct CreateLayerCmd
+    id: LayerId
+    config: LayerConfig
+
+struct UpdateLayerCmd
+    id: LayerId
+    update: LayerUpdate
+
+struct AttachSurfaceCmd
+    layer: LayerId
+    surface: SurfaceId
+
+struct SetLayerParentCmd
+    layer: LayerId
+    parent: LayerId
+
+struct DrawCmd
+    surface: SurfaceId
+    commands: Vec<DrawCommand>
+    damage: Vec<Rect>
+
+# Layer property updates
+pub struct LayerUpdate
+    position: Option<Point>
+    size: Option<Size>
+    opacity: Option<f32>
+    transform: Option<LayerTransform>
+    scroll_offset: Option<Point>
+    z_index: Option<i32>
+
+impl LayerUpdate
+    pub fn new() -> LayerUpdate
+        LayerUpdate {
+            position: None,
+            size: None,
+            opacity: None,
+            transform: None,
+            scroll_offset: None,
+            z_index: None
+        }
+
+    pub fn position(self, x: i32, y: i32) -> LayerUpdate
+        LayerUpdate {
+            position: Some(Point.new(x, y)),
+            size: self.size,
+            opacity: self.opacity,
+            transform: self.transform,
+            scroll_offset: self.scroll_offset,
+            z_index: self.z_index
+        }
+
+    pub fn opacity(self, opacity: f32) -> LayerUpdate
+        LayerUpdate {
+            position: self.position,
+            size: self.size,
+            opacity: Some(opacity),
+            transform: self.transform,
+            scroll_offset: self.scroll_offset,
+            z_index: self.z_index
+        }
+
+# Connection errors
+pub enum ClientError
+    ConnectionFailed
+    ProtocolError
+    OutOfMemory
+
+# Import for DrawContext (avoiding circular import)
+import api.draw { Transform2D }
+import api.layer { LayerTransform }

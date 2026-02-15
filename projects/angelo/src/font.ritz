@@ -1,0 +1,240 @@
+# Angelo - High-Level Font API
+#
+# User-facing Font type that wraps all the low-level parsing.
+
+import types.FontMetrics
+import types.Glyph
+import types.GlyphMetrics
+import types.GlyphOutline
+import types.Contour
+import types.OutlinePoint
+import types.Tag
+import types.TAG_CMAP
+import types.TAG_LOCA
+import types.TAG_GLYF
+import types.TAG_HMTX
+import types.TAG_HHEA
+import loader.ttf.FontFile
+import loader.ttf.load_font_from_data
+import loader.cmap.CmapTable
+import loader.cmap.parse_cmap
+import loader.loca.LocaTable
+import loader.loca.parse_loca
+import loader.hmtx.HmtxTable
+import loader.hmtx.parse_hmtx
+import loader.glyf.ParsedGlyph
+import loader.glyf.GlyphComponent
+import loader.glyf.parse_glyph
+import loader.glyf.get_glyph_data
+import loader.file.read_file_bytes
+import loader.reader.Reader
+
+# High-level Font type
+# Lazily parses tables as needed for efficient memory use.
+pub struct Font
+    file: FontFile
+    cmap: Option<CmapTable>
+    loca: Option<LocaTable>
+    hmtx: Option<HmtxTable>
+    num_hmetrics: u16
+
+impl Font
+    # Get font metrics
+    pub fn metrics(self) -> FontMetrics
+        self.file.metrics()
+
+    # Get number of glyphs in the font
+    pub fn num_glyphs(self) -> u16
+        self.file.num_glyphs()
+
+    # Look up glyph ID for a Unicode codepoint
+    pub fn glyph_id(self:& Font, codepoint: u32) -> Option<u16>
+        # Ensure cmap is parsed
+        self.ensure_cmap()
+
+        match @self.cmap
+            Some(cmap) => cmap.lookup(codepoint)
+            None => None
+
+    # Get glyph metrics (advance width, left side bearing)
+    pub fn glyph_metrics(self:& Font, glyph_id: u16) -> Option<GlyphMetrics>
+        # Ensure hmtx is parsed
+        self.ensure_hmtx()
+
+        match @self.hmtx
+            Some(hmtx) => hmtx.get_metrics(glyph_id)
+            None => None
+
+    # Get glyph outline
+    pub fn glyph_outline(self:& Font, glyph_id: u16) -> Option<GlyphOutline>
+        # Use depth-limited resolution to handle nested composites
+        self.glyph_outline_with_depth(glyph_id, 0)
+
+    # Internal: Get glyph outline with recursion depth tracking
+    # Max depth prevents infinite recursion on malformed fonts
+    fn glyph_outline_with_depth(self:& Font, glyph_id: u16, depth: u32) -> Option<GlyphOutline>
+        # Prevent infinite recursion (TTF spec allows nested composites)
+        const MAX_DEPTH: u32 = 10
+        if depth > MAX_DEPTH
+            return Some(GlyphOutline.empty())
+
+        # Ensure loca is parsed
+        self.ensure_loca()
+
+        match @self.loca
+            Some(loca) =>
+                let offset = loca.get_offset(glyph_id)?
+                let length = loca.get_length(glyph_id)?
+
+                if length == 0
+                    # Empty glyph (like space)
+                    return Some(GlyphOutline.empty())
+
+                match self.file.get_table(TAG_GLYF)
+                    Some(glyf_data) =>
+                        let glyph_data = get_glyph_data(glyf_data, offset, length)
+                        match parse_glyph(glyph_data)
+                            Ok(Simple(outline)) =>
+                                Some(outline)
+                            Ok(Empty) =>
+                                Some(GlyphOutline.empty())
+                            Ok(Composite(components)) =>
+                                # Resolve composite by fetching and transforming components
+                                Some(self.resolve_composite_glyph(@components, depth))
+                            Err(_) =>
+                                None
+                    None => None
+            None => None
+
+    # Internal: Resolve a composite glyph into a single outline
+    fn resolve_composite_glyph(self:& Font, components: @Vec<GlyphComponent>, depth: u32) -> GlyphOutline
+        var result = GlyphOutline.new()
+        var first = true
+
+        for comp in components
+            # Recursively get the component's outline
+            let outline_opt = self.glyph_outline_with_depth(comp.glyph_id, depth + 1)
+            let outline = match outline_opt
+                Some(o) => o
+                None => continue
+
+            # Transform and add each contour
+            for contour in @outline.contours
+                var new_contour = Contour.new()
+
+                for point in @contour.points
+                    let (new_x, new_y) = comp.transform_point(point.x, point.y)
+                    new_contour.add_point(OutlinePoint.new(new_x, new_y, point.on_curve))
+
+                result.add_contour(new_contour)
+
+            # Update bounding box
+            if first
+                result.x_min = outline.x_min + comp.x_offset
+                result.y_min = outline.y_min + comp.y_offset
+                result.x_max = outline.x_max + comp.x_offset
+                result.y_max = outline.y_max + comp.y_offset
+                first = false
+            else
+                let comp_x_min = outline.x_min + comp.x_offset
+                let comp_y_min = outline.y_min + comp.y_offset
+                let comp_x_max = outline.x_max + comp.x_offset
+                let comp_y_max = outline.y_max + comp.y_offset
+
+                if comp_x_min < result.x_min
+                    result.x_min = comp_x_min
+                if comp_y_min < result.y_min
+                    result.y_min = comp_y_min
+                if comp_x_max > result.x_max
+                    result.x_max = comp_x_max
+                if comp_y_max > result.y_max
+                    result.y_max = comp_y_max
+
+        result
+
+    # Get a complete glyph (outline + metrics)
+    pub fn get_glyph(self:& Font, glyph_id: u16) -> Option<Glyph>
+        let metrics = self.glyph_metrics(glyph_id)?
+        let outline = self.glyph_outline(glyph_id)?
+        Some(Glyph.new(glyph_id, metrics, outline))
+
+    # Get glyph for a Unicode character
+    pub fn get_glyph_for_char(self:& Font, codepoint: u32) -> Option<Glyph>
+        let glyph_id = self.glyph_id(codepoint)?
+        self.get_glyph(glyph_id)
+
+    # Internal: ensure cmap is parsed
+    fn ensure_cmap(self:& Font)
+        if self.cmap.is_some()
+            return
+
+        match self.file.get_table(TAG_CMAP)
+            Some(data) =>
+                match parse_cmap(data)
+                    Ok(cmap) => self.cmap = Some(cmap)
+                    Err(_) => pass
+            None => pass
+
+    # Internal: ensure loca is parsed
+    fn ensure_loca(self:& Font)
+        if self.loca.is_some()
+            return
+
+        match self.file.get_table(TAG_LOCA)
+            Some(data) =>
+                match parse_loca(data, self.file.num_glyphs(), self.file.index_to_loc_format)
+                    Ok(loca) => self.loca = Some(loca)
+                    Err(_) => pass
+            None => pass
+
+    # Internal: ensure hmtx is parsed
+    fn ensure_hmtx(self:& Font)
+        if self.hmtx.is_some()
+            return
+
+        # First get numberOfHMetrics from hhea table
+        if self.num_hmetrics == 0
+            match self.file.get_table(TAG_HHEA)
+                Some(hhea_data) =>
+                    var reader = Reader.new(hhea_data)
+                    # Skip to numberOfHMetrics at offset 34
+                    reader.skip(34)
+                    match reader.read_u16()
+                        Ok(n) => self.num_hmetrics = n
+                        Err(_) => pass
+                None => pass
+
+        if self.num_hmetrics == 0
+            return
+
+        match self.file.get_table(TAG_HMTX)
+            Some(data) =>
+                match parse_hmtx(data, self.file.num_glyphs(), self.num_hmetrics)
+                    Ok(hmtx) => self.hmtx = Some(hmtx)
+                    Err(_) => pass
+            None => pass
+
+# Load a font from a file path
+pub fn load_font(path: StrView) -> Result<Font, StrView>
+    let data = read_file_bytes(path)?
+    let file = load_font_from_data(data)?
+
+    Ok(Font {
+        file: file,
+        cmap: None,
+        loca: None,
+        hmtx: None,
+        num_hmetrics: 0
+    })
+
+# Load a font from raw data
+pub fn load_font_data(data:= Vec<u8>) -> Result<Font, StrView>
+    let file = load_font_from_data(data)?
+
+    Ok(Font {
+        file: file,
+        cmap: None,
+        loca: None,
+        hmtx: None,
+        num_hmetrics: 0
+    })

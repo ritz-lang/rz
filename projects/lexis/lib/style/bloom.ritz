@@ -1,0 +1,111 @@
+# lib/style/bloom.ritz - Bloom Filter for Ancestor Matching
+#
+# A bloom filter used to quickly reject CSS selectors that can't possibly match
+# because required ancestors aren't present. This is a key optimization for
+# selector matching performance.
+#
+# Each element builds an ancestor filter by adding the filter of its parent
+# plus hashes of its own ID, classes, and tag name. When matching a selector
+# like "div.foo .bar", we can quickly check if .foo is in .bar's ancestor
+# filter before walking the tree.
+
+# =============================================================================
+# Bloom Filter Structure
+# =============================================================================
+
+# 256-bit bloom filter (4 x u64)
+pub struct BloomFilter
+    bits: [4]u64
+
+pub fn bloom_filter_new() -> BloomFilter
+    BloomFilter {
+        bits: [0, 0, 0, 0]
+    }
+
+# =============================================================================
+# Hash Function
+# =============================================================================
+
+# Simple FNV-1a hash for strings
+pub fn bloom_hash(s: StrView) -> u32
+    var hash: u32 = 2166136261  # FNV offset basis
+    var i: u64 = 0
+    while i < s.len
+        hash = hash ^ (s.data[i] as u32)
+        hash = hash * 16777619  # FNV prime
+        i = i + 1
+    hash
+
+# =============================================================================
+# Bloom Operations
+# =============================================================================
+
+pub fn bloom_filter_insert(filter:& BloomFilter, hash: u32)
+    # Use multiple hash functions by taking different parts of hash
+    let h1 = hash % 256
+    let h2 = (hash >> 8) % 256
+
+    let idx1 = h1 / 64
+    let bit1 = h1 % 64
+    filter.bits[idx1] = filter.bits[idx1] | (1 << bit1)
+
+    let idx2 = h2 / 64
+    let bit2 = h2 % 64
+    filter.bits[idx2] = filter.bits[idx2] | (1 << bit2)
+
+pub fn bloom_filter_insert_str(filter:& BloomFilter, s: StrView)
+    let hash = bloom_hash(s)
+    bloom_filter_insert(filter, hash)
+
+pub fn bloom_filter_might_contain(filter: BloomFilter, hash: u32) -> i32
+    # Returns 1 if the hash might be in the filter, 0 if definitely not
+    let h1 = hash % 256
+    let h2 = (hash >> 8) % 256
+
+    let idx1 = h1 / 64
+    let bit1 = h1 % 64
+    if (filter.bits[idx1] & (1 << bit1)) == 0
+        return 0
+
+    let idx2 = h2 / 64
+    let bit2 = h2 % 64
+    if (filter.bits[idx2] & (1 << bit2)) == 0
+        return 0
+
+    1
+
+pub fn bloom_filter_might_contain_str(filter: BloomFilter, s: StrView) -> i32
+    let hash = bloom_hash(s)
+    bloom_filter_might_contain(filter, hash)
+
+# =============================================================================
+# Combining Filters
+# =============================================================================
+
+# Combine parent's filter with child's to build child's ancestor filter
+pub fn bloom_filter_union(a:& BloomFilter, b: BloomFilter)
+    a.bits[0] = a.bits[0] | b.bits[0]
+    a.bits[1] = a.bits[1] | b.bits[1]
+    a.bits[2] = a.bits[2] | b.bits[2]
+    a.bits[3] = a.bits[3] | b.bits[3]
+
+pub fn bloom_filter_clone(src: BloomFilter) -> BloomFilter
+    BloomFilter {
+        bits: [src.bits[0], src.bits[1], src.bits[2], src.bits[3]]
+    }
+
+# =============================================================================
+# Debug
+# =============================================================================
+
+pub fn bloom_filter_popcount(filter: BloomFilter) -> u32
+    # Count set bits (useful for debugging filter saturation)
+    var count: u32 = 0
+    var i = 0
+    while i < 4
+        var bits = filter.bits[i]
+        while bits != 0
+            count = count + (bits & 1) as u32
+            bits = bits >> 1
+        i = i + 1
+    count

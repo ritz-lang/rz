@@ -1,0 +1,360 @@
+# lib/style/cascade.ritz - CSS Cascade Algorithm
+#
+# Implements the CSS cascade to determine final property values.
+# Handles specificity, origin, importance, and source order.
+
+import lib.css.selector { Specificity, specificity_compare }
+import lib.css.value { CssValue, CSS_VALUE_KEYWORD, CSS_VALUE_LENGTH, CSS_VALUE_COLOR, CSS_VALUE_NUMBER }
+import lib.css.rule { Declaration, DeclarationBlock, StyleRule }
+import lib.style.selector_map { RuleEntry }
+
+# =============================================================================
+# Cascade Origin
+# =============================================================================
+
+pub const ORIGIN_USER_AGENT: i32 = 0
+pub const ORIGIN_USER: i32 = 1
+pub const ORIGIN_AUTHOR: i32 = 2
+
+# =============================================================================
+# Matched Rule (rule + metadata for sorting)
+# =============================================================================
+
+pub struct MatchedRule
+    declarations: DeclarationBlock
+    specificity: Specificity
+    origin: i32
+    source_order: u32
+    important: i32
+
+pub fn matched_rule_new(entry: RuleEntry, origin: i32) -> MatchedRule
+    MatchedRule {
+        declarations: entry.declarations,
+        specificity: entry.specificity,
+        origin: origin,
+        source_order: entry.source_order,
+        important: 0
+    }
+
+# =============================================================================
+# Cascade Comparator
+# =============================================================================
+
+# Compare two matched rules for cascade order
+# Returns: negative if a comes before b, positive if after, 0 if equal
+pub fn cascade_compare(a: MatchedRule, b: MatchedRule) -> i32
+    # 1. Important declarations from user-agent beat everything
+    # 2. Important declarations from user beat author
+    # 3. Important declarations from author
+    # 4. Normal author declarations
+    # 5. Normal user declarations
+    # 6. Normal user-agent declarations
+
+    # For simplicity, we're implementing:
+    # !important > normal
+    # Author > user > user-agent (for normal)
+    # User-agent > user > author (for !important, reversed)
+
+    # Check importance first
+    if a.important != b.important
+        # !important wins
+        return b.important - a.important
+
+    # For !important, origins are reversed
+    if a.important == 1
+        if a.origin != b.origin
+            return a.origin - b.origin  # Lower origin wins for !important
+    else
+        if a.origin != b.origin
+            return b.origin - a.origin  # Higher origin wins for normal
+
+    # Same importance and origin: compare specificity
+    let spec_cmp = specificity_compare(a.specificity, b.specificity)
+    if spec_cmp != 0
+        return spec_cmp
+
+    # Same specificity: source order (later wins)
+    a.source_order as i32 - b.source_order as i32
+
+# =============================================================================
+# Sort Matched Rules
+# =============================================================================
+
+const MAX_MATCHED_RULES: u32 = 256
+
+pub struct MatchedRuleList
+    rules: [MAX_MATCHED_RULES]MatchedRule
+    count: u32
+
+pub fn matched_rule_list_new() -> MatchedRuleList
+    var list: MatchedRuleList
+    list.count = 0
+    list
+
+pub fn matched_rule_list_add(list:& MatchedRuleList, rule: MatchedRule)
+    if list.count < MAX_MATCHED_RULES
+        list.rules[list.count] = rule
+        list.count = list.count + 1
+
+pub fn matched_rule_list_sort(list:& MatchedRuleList)
+    # Simple insertion sort (good enough for small lists)
+    var i: u32 = 1
+    while i < list.count
+        let current = list.rules[i]
+        var j = i
+        while j > 0 and cascade_compare(list.rules[j - 1], current) > 0
+            list.rules[j] = list.rules[j - 1]
+            j = j - 1
+        list.rules[j] = current
+        i = i + 1
+
+# =============================================================================
+# Property Application
+# =============================================================================
+
+# Apply declarations from matched rules to build final values
+# Returns a map of property -> value (using DeclarationBlock for now)
+
+pub fn cascade_apply(matched: MatchedRuleList) -> DeclarationBlock
+    var result = DeclarationBlock {
+        declarations: [],  # Will be filled
+        count: 0
+    }
+
+    # Sort rules by cascade order
+    var sorted = matched
+    matched_rule_list_sort(sorted)
+
+    # Apply in order (later declarations override earlier)
+    var i: u32 = 0
+    while i < sorted.count
+        let rule = sorted.rules[i]
+
+        # Apply each declaration
+        var d: u32 = 0
+        while d < rule.declarations.count
+            let decl = rule.declarations.declarations[d]
+
+            # Find existing declaration for this property
+            var found = 0
+            var e: u32 = 0
+            while e < result.count
+                # Compare property names
+                if decl_property_eq(result.declarations[e], decl) == 1
+                    # Check if we can override
+                    # (would need to track importance per property)
+                    result.declarations[e] = decl
+                    found = 1
+                    break
+                e = e + 1
+
+            if found == 0 and result.count < 128
+                result.declarations[result.count] = decl
+                result.count = result.count + 1
+
+            d = d + 1
+
+        i = i + 1
+
+    result
+
+fn decl_property_eq(a: Declaration, b: Declaration) -> i32
+    if a.property_len != b.property_len
+        return 0
+    var i: u32 = 0
+    while i < a.property_len
+        if a.property[i] != b.property[i]
+            return 0
+        i = i + 1
+    1
+
+# =============================================================================
+# Inheritance
+# =============================================================================
+
+# Properties that inherit by default
+pub fn property_inherits(property: StrView) -> i32
+    # Text properties
+    if property == "color"
+        return 1
+    if property == "font-family"
+        return 1
+    if property == "font-size"
+        return 1
+    if property == "font-style"
+        return 1
+    if property == "font-weight"
+        return 1
+    if property == "line-height"
+        return 1
+    if property == "text-align"
+        return 1
+    if property == "text-indent"
+        return 1
+    if property == "text-transform"
+        return 1
+    if property == "letter-spacing"
+        return 1
+    if property == "word-spacing"
+        return 1
+    if property == "white-space"
+        return 1
+
+    # List properties
+    if property == "list-style"
+        return 1
+    if property == "list-style-type"
+        return 1
+    if property == "list-style-position"
+        return 1
+    if property == "list-style-image"
+        return 1
+
+    # Other inherited properties
+    if property == "visibility"
+        return 1
+    if property == "cursor"
+        return 1
+    if property == "direction"
+        return 1
+    if property == "quotes"
+        return 1
+
+    0
+
+# Apply inheritance from parent style
+pub fn apply_inheritance(child:& DeclarationBlock, parent: DeclarationBlock)
+    var p: u32 = 0
+    while p < parent.count
+        let parent_decl = parent.declarations[p]
+        let prop = Declaration_property(parent_decl)
+
+        # Check if property inherits
+        if property_inherits(prop) == 1
+            # Check if child already has this property
+            var found = 0
+            var c: u32 = 0
+            while c < child.count
+                if decl_property_eq(child.declarations[c], parent_decl) == 1
+                    found = 1
+                    break
+                c = c + 1
+
+            # If not set on child, inherit from parent
+            if found == 0 and child.count < 128
+                child.declarations[child.count] = parent_decl
+                child.count = child.count + 1
+
+        p = p + 1
+
+fn Declaration_property(decl: Declaration) -> StrView
+    StrView {
+        data: @decl.property[0],
+        len: decl.property_len as u64
+    }
+
+# =============================================================================
+# Initial Values
+# =============================================================================
+
+# Get initial value for a property (per CSS spec)
+pub fn get_initial_value(property: StrView) -> CssValue
+    # Display
+    if property == "display"
+        return css_value_keyword("inline")
+
+    # Position
+    if property == "position"
+        return css_value_keyword("static")
+
+    # Box model
+    if property == "width" or property == "height"
+        return css_value_keyword("auto")
+
+    if property == "margin-top" or property == "margin-right" or property == "margin-bottom" or property == "margin-left" or property == "margin"
+        return css_value_length(0.0, 0)
+
+    if property == "padding-top" or property == "padding-right" or property == "padding-bottom" or property == "padding-left" or property == "padding"
+        return css_value_length(0.0, 0)
+
+    # Text
+    if property == "color"
+        return css_value_keyword("canvastext")  # System color
+
+    if property == "font-size"
+        return css_value_keyword("medium")
+
+    if property == "font-weight"
+        return css_value_keyword("normal")
+
+    if property == "font-style"
+        return css_value_keyword("normal")
+
+    if property == "text-align"
+        return css_value_keyword("start")
+
+    if property == "line-height"
+        return css_value_keyword("normal")
+
+    # Background
+    if property == "background-color"
+        return css_value_keyword("transparent")
+
+    # Visual
+    if property == "opacity"
+        return css_value_number(1.0)
+
+    if property == "visibility"
+        return css_value_keyword("visible")
+
+    if property == "overflow" or property == "overflow-x" or property == "overflow-y"
+        return css_value_keyword("visible")
+
+    # Default: auto or initial
+    css_value_keyword("initial")
+
+fn css_value_keyword(kw: StrView) -> CssValue
+    var v: CssValue
+    v.kind = CSS_VALUE_KEYWORD
+    copy_str(v.string_value[0], v.string_len, kw)
+    v.number = 0.0
+    v.unit = 0
+    v.color_r = 0
+    v.color_g = 0
+    v.color_b = 0
+    v.color_a = 255
+    v.important = 0
+    v
+
+fn css_value_length(num: f64, unit: i32) -> CssValue
+    var v: CssValue
+    v.kind = CSS_VALUE_LENGTH
+    v.string_len = 0
+    v.number = num
+    v.unit = unit
+    v.color_r = 0
+    v.color_g = 0
+    v.color_b = 0
+    v.color_a = 255
+    v.important = 0
+    v
+
+fn css_value_number(num: f64) -> CssValue
+    var v: CssValue
+    v.kind = CSS_VALUE_NUMBER
+    v.string_len = 0
+    v.number = num
+    v.unit = 0
+    v.color_r = 0
+    v.color_g = 0
+    v.color_b = 0
+    v.color_a = 255
+    v.important = 0
+    v
+
+fn copy_str(dst:& u8, len:& u32, src: StrView)
+    var i: u64 = 0
+    while i < src.len and i < 1024
+        dst[i] = src.data[i]
+        i = i + 1
+    @len = i as u32

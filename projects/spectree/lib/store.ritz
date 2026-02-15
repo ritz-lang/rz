@@ -1,0 +1,379 @@
+# lib/store.ritz - In-memory node storage
+#
+# Provides an in-memory store for spectree nodes.
+# This is the initial implementation - can be replaced with
+# persistent storage (via mausoleum) later.
+
+import ritzlib.gvec
+import ritzlib.memory
+
+import lib.types { Node, Link, AgentRef, Uuid, uuid_eq, uuid_zero }
+import lib.uuid { uuid_generate }
+
+# ============================================================================
+# Node Entry
+# ============================================================================
+# Internal storage entry wrapping a node with its relationships.
+
+struct NodeEntry
+    node: Node
+    children: Vec<Uuid>    # Child node IDs
+    links: Vec<Link>       # Outgoing links
+    agents: Vec<AgentRef>  # Assigned agents
+
+fn entry_new(node: Node) -> NodeEntry
+    var e: NodeEntry
+    e.node = node
+    e.children = vec_new<Uuid>()
+    e.links = vec_new<Link>()
+    e.agents = vec_new<AgentRef>()
+    return e
+
+# ============================================================================
+# vec helpers - gvec requires explicit type parameters
+# ============================================================================
+
+fn entries_len(v: @Vec<NodeEntry>) -> i64
+    return vec_len<NodeEntry>(v)
+
+fn entries_get(v: @&Vec<NodeEntry>, idx: i64) -> *NodeEntry
+    return vec_get_ptr<NodeEntry>(v, idx)
+
+fn entries_push(v: @&Vec<NodeEntry>, item: NodeEntry) -> i32
+    return vec_push<NodeEntry>(v, item)
+
+fn entries_remove(v: @&Vec<NodeEntry>, idx: i64)
+    # Shift elements left and decrement length
+    var len: i64 = vec_len<NodeEntry>(v)
+    for i in idx..(len - 1)
+        var next: NodeEntry = vec_get<NodeEntry>(v, i + 1)
+        vec_set<NodeEntry>(v, i, next)
+    v.len = len - 1
+
+fn children_len(v: @Vec<Uuid>) -> i64
+    return vec_len<Uuid>(v)
+
+fn children_get(v: @&Vec<Uuid>, idx: i64) -> *Uuid
+    return vec_get_ptr<Uuid>(v, idx)
+
+fn children_push(v: @&Vec<Uuid>, item: Uuid) -> i32
+    return vec_push<Uuid>(v, item)
+
+fn children_remove(v: @&Vec<Uuid>, idx: i64)
+    var len: i64 = vec_len<Uuid>(v)
+    for i in idx..(len - 1)
+        var next: Uuid = vec_get<Uuid>(v, i + 1)
+        vec_set<Uuid>(v, i, next)
+    v.len = len - 1
+
+fn links_len(v: @Vec<Link>) -> i64
+    return vec_len<Link>(v)
+
+fn links_get(v: @&Vec<Link>, idx: i64) -> *Link
+    return vec_get_ptr<Link>(v, idx)
+
+fn links_push(v: @&Vec<Link>, item: Link) -> i32
+    return vec_push<Link>(v, item)
+
+fn links_remove(v: @&Vec<Link>, idx: i64)
+    var len: i64 = vec_len<Link>(v)
+    for i in idx..(len - 1)
+        var next: Link = vec_get<Link>(v, i + 1)
+        vec_set<Link>(v, i, next)
+    v.len = len - 1
+
+fn agents_len(v: @Vec<AgentRef>) -> i64
+    return vec_len<AgentRef>(v)
+
+fn agents_get(v: @&Vec<AgentRef>, idx: i64) -> *AgentRef
+    return vec_get_ptr<AgentRef>(v, idx)
+
+fn agents_push(v: @&Vec<AgentRef>, item: AgentRef) -> i32
+    return vec_push<AgentRef>(v, item)
+
+# ============================================================================
+# Store
+# ============================================================================
+# In-memory collection of nodes indexed by UUID.
+# Uses a simple linear search for now; can optimize with hash map later.
+
+pub struct Store
+    entries: Vec<NodeEntry>
+
+pub fn store_new() -> Store
+    var s: Store
+    s.entries = vec_new<NodeEntry>()
+    return s
+
+# vec_clone for Vec<u8> - needed for agent_id cloning
+fn vec_clone_u8(src: @Vec<u8>) -> Vec<u8>
+    var dest: Vec<u8> = vec_new<u8>()
+    var len: i64 = vec_len<u8>(src)
+    for i in 0..len
+        var c: u8 = vec_get<u8>(src, i)
+        vec_push<u8>(@&dest, c)
+    return dest
+
+# ============================================================================
+# Store Operations
+# ============================================================================
+
+# Find entry index by UUID, returns -1 if not found
+fn store_find_index(s: @&Store, target_id: @Uuid) -> i32
+    var len: i64 = entries_len(@s.entries)
+    for i in 0..len
+        var entry: *NodeEntry = entries_get(@&s.entries, i)
+        if uuid_eq(@entry.node.uuid, target_id) == 1
+            return i as i32
+    return -1
+
+# Get a node by ID
+pub fn store_get(s: @&Store, target_id: @Uuid) -> *Node
+    var idx: i32 = store_find_index(s, target_id)
+    if idx < 0
+        return 0 as *Node
+    var entry: *NodeEntry = entries_get(@&s.entries, idx as i64)
+    return @entry.node
+
+# Get entry by ID (for internal use)
+fn store_get_entry(s: @&Store, target_id: @Uuid) -> *NodeEntry
+    var idx: i32 = store_find_index(s, target_id)
+    if idx < 0
+        return 0 as *NodeEntry
+    return entries_get(@&s.entries, idx as i64)
+
+# Create a new node and add to store
+pub fn store_create(s: @&Store, kind: i32, parent_id: @Uuid) -> Uuid
+    var node: Node = node_new(kind)
+    node.uuid = uuid_generate()
+    node.parent_id = *parent_id
+
+    # Capture the UUID fields before moving node
+    var uuid_high: u64 = node.uuid.high
+    var uuid_low: u64 = node.uuid.low
+
+    var entry: NodeEntry = entry_new(node)
+    entries_push(@&s.entries, entry)
+
+    # Add to parent's children list
+    var zero: Uuid = uuid_zero()
+    if uuid_eq(parent_id, @zero) == 0
+        var parent_entry: *NodeEntry = store_get_entry(s, parent_id)
+        if parent_entry != 0 as *NodeEntry
+            var child_uuid: Uuid
+            child_uuid.high = uuid_high
+            child_uuid.low = uuid_low
+            children_push(@&parent_entry.children, child_uuid)
+
+    var result: Uuid
+    result.high = uuid_high
+    result.low = uuid_low
+    return result
+
+# Update a node's content
+pub fn store_update_content(s: @&Store, id: @Uuid, content: @Vec<u8>) -> i32
+    var node: *Node = store_get(s, id)
+    if node == 0 as *Node
+        return -1
+
+    # Clear and copy new content
+    vec_clear<u8>(@&node.content)
+    var len: i64 = vec_len<u8>(content)
+    for i in 0..len
+        var c: u8 = vec_get<u8>(content, i)
+        vec_push<u8>(@&node.content, c)
+
+    # Update timestamp
+    node.updated_at = timestamp_now()
+    return 0
+
+# Update a node's title
+pub fn store_update_title(s: @&Store, id: @Uuid, title: @Vec<u8>) -> i32
+    var node: *Node = store_get(s, id)
+    if node == 0 as *Node
+        return -1
+
+    vec_clear<u8>(@&node.title)
+    var len: i64 = vec_len<u8>(title)
+    for i in 0..len
+        var c: u8 = vec_get<u8>(title, i)
+        vec_push<u8>(@&node.title, c)
+
+    node.updated_at = timestamp_now()
+    return 0
+
+# Update a node's status
+pub fn store_update_status(s: @&Store, id: @Uuid, status: i32) -> i32
+    var node: *Node = store_get(s, id)
+    if node == 0 as *Node
+        return -1
+
+    node.status = status
+    node.updated_at = timestamp_now()
+    return 0
+
+# Move a node to a new parent
+pub fn store_move(s: @&Store, id: @Uuid, new_parent_id: @Uuid) -> i32
+    var node: *Node = store_get(s, id)
+    if node == 0 as *Node
+        return -1
+
+    var old_parent_id: Uuid = node.parent_id
+    var zero: Uuid = uuid_zero()
+
+    # Remove from old parent's children
+    if uuid_eq(@old_parent_id, @zero) == 0
+        var old_parent: *NodeEntry = store_get_entry(s, @old_parent_id)
+        if old_parent != 0 as *NodeEntry
+            # Find and remove from children
+            var len: i64 = children_len(@old_parent.children)
+            for i in 0..len
+                var child_id: *Uuid = children_get(@&old_parent.children, i)
+                if uuid_eq(child_id, id) == 1
+                    children_remove(@&old_parent.children, i)
+                    break
+
+    # Add to new parent's children
+    if uuid_eq(new_parent_id, @zero) == 0
+        var new_parent: *NodeEntry = store_get_entry(s, new_parent_id)
+        if new_parent != 0 as *NodeEntry
+            children_push(@&new_parent.children, *id)
+
+    node.parent_id = *new_parent_id
+    node.updated_at = timestamp_now()
+    return 0
+
+# Delete a node (does not delete children)
+pub fn store_delete(s: @&Store, id: @Uuid) -> i32
+    var idx: i32 = store_find_index(s, id)
+    if idx < 0
+        return -1
+
+    var node: *Node = store_get(s, id)
+    var parent_id: Uuid = node.parent_id
+    var zero: Uuid = uuid_zero()
+
+    # Remove from parent's children
+    if uuid_eq(@parent_id, @zero) == 0
+        var parent: *NodeEntry = store_get_entry(s, @parent_id)
+        if parent != 0 as *NodeEntry
+            var len: i64 = children_len(@parent.children)
+            for i in 0..len
+                var child_id: *Uuid = children_get(@&parent.children, i)
+                if uuid_eq(child_id, id) == 1
+                    children_remove(@&parent.children, i)
+                    break
+
+    # Remove from store
+    entries_remove(@&s.entries, idx as i64)
+    return 0
+
+# ============================================================================
+# Link Operations
+# ============================================================================
+
+# Add a link from one node to another
+pub fn store_add_link(s: @&Store, from_id: @Uuid, to_id: @Uuid, kind: i32) -> i32
+    var entry: *NodeEntry = store_get_entry(s, from_id)
+    if entry == 0 as *NodeEntry
+        return -1
+
+    # Verify target exists
+    var target: *Node = store_get(s, to_id)
+    if target == 0 as *Node
+        return -1
+
+    var link: Link
+    link.kind = kind
+    link.target = *to_id
+
+    links_push(@&entry.links, link)
+    return 0
+
+# Remove a link
+pub fn store_remove_link(s: @&Store, from_id: @Uuid, to_id: @Uuid) -> i32
+    var entry: *NodeEntry = store_get_entry(s, from_id)
+    if entry == 0 as *NodeEntry
+        return -1
+
+    var len: i64 = links_len(@entry.links)
+    for i in 0..len
+        var link: *Link = links_get(@&entry.links, i)
+        if uuid_eq(@link.target, to_id) == 1
+            links_remove(@&entry.links, i)
+            return 0
+
+    return -1
+
+# Get links count for a node
+pub fn store_links_count(s: @&Store, id: @Uuid) -> i64
+    var entry: *NodeEntry = store_get_entry(s, id)
+    if entry == 0 as *NodeEntry
+        return 0
+    return links_len(@entry.links)
+
+# Get a specific link by index
+pub fn store_get_link(s: @&Store, id: @Uuid, idx: i64) -> *Link
+    var entry: *NodeEntry = store_get_entry(s, id)
+    if entry == 0 as *NodeEntry
+        return 0 as *Link
+    if idx < 0 || idx >= links_len(@entry.links)
+        return 0 as *Link
+    return links_get(@&entry.links, idx)
+
+# ============================================================================
+# Agent Operations
+# ============================================================================
+
+# Assign an agent to a node
+pub fn store_assign_agent(s: @&Store, node_id: @Uuid, agent_id: @Vec<u8>, role: i32) -> i32
+    var entry: *NodeEntry = store_get_entry(s, node_id)
+    if entry == 0 as *NodeEntry
+        return -1
+
+    var ref: AgentRef
+    ref.agent_id = vec_clone_u8(agent_id)
+    ref.role = role
+
+    agents_push(@&entry.agents, ref)
+    return 0
+
+# Get agents count for a node
+pub fn store_agents_count(s: @&Store, id: @Uuid) -> i64
+    var entry: *NodeEntry = store_get_entry(s, id)
+    if entry == 0 as *NodeEntry
+        return 0
+    return agents_len(@entry.agents)
+
+# Get a specific agent by index
+pub fn store_get_agent(s: @&Store, id: @Uuid, idx: i64) -> *AgentRef
+    var entry: *NodeEntry = store_get_entry(s, id)
+    if entry == 0 as *NodeEntry
+        return 0 as *AgentRef
+    if idx < 0 || idx >= agents_len(@entry.agents)
+        return 0 as *AgentRef
+    return agents_get(@&entry.agents, idx)
+
+# ============================================================================
+# Children Operations
+# ============================================================================
+
+# Get children count for a node
+pub fn store_children_count(s: @&Store, id: @Uuid) -> i64
+    var entry: *NodeEntry = store_get_entry(s, id)
+    if entry == 0 as *NodeEntry
+        return 0
+    return children_len(@entry.children)
+
+# Get a specific child ID by index
+pub fn store_get_child(s: @&Store, id: @Uuid, idx: i64) -> *Uuid
+    var entry: *NodeEntry = store_get_entry(s, id)
+    if entry == 0 as *NodeEntry
+        return 0 as *Uuid
+    if idx < 0 || idx >= children_len(@entry.children)
+        return 0 as *Uuid
+    return children_get(@&entry.children, idx)
+
+# Count nodes in store
+pub fn store_count(s: @Store) -> i64
+    return entries_len(@s.entries)

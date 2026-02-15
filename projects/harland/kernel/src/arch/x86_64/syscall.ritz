@@ -1,0 +1,330 @@
+# Harland Kernel - SYSCALL/SYSRET Implementation
+#
+# x86-64 fast system call mechanism using SYSCALL/SYSRET instructions.
+#
+# SYSCALL entry:
+#   - RCX = return RIP (set by CPU)
+#   - R11 = saved RFLAGS (set by CPU)
+#   - RAX = syscall number
+#   - RDI, RSI, RDX, R10, R8, R9 = arguments 1-6
+#
+# SYSRET return:
+#   - Restores RIP from RCX
+#   - Restores RFLAGS from R11
+#   - Switches to Ring 3
+#
+# MSR Configuration:
+#   - IA32_STAR (0xC0000081): Segment selectors for SYSCALL/SYSRET
+#   - IA32_LSTAR (0xC0000082): Syscall entry point (RIP)
+#   - IA32_SFMASK (0xC0000084): RFLAGS mask (clear IF on entry)
+#   - IA32_EFER (0xC0000080): Enable SCE bit for SYSCALL instruction
+
+# ============================================================================
+# MSR Numbers for SYSCALL/SYSRET
+# ============================================================================
+
+const MSR_EFER: u32 = 0xC0000080       # Extended Feature Enable Register
+const MSR_STAR: u32 = 0xC0000081       # Segment selectors
+const MSR_LSTAR: u32 = 0xC0000082      # Long mode syscall entry
+const MSR_CSTAR: u32 = 0xC0000083      # Compat mode (unused)
+const MSR_SFMASK: u32 = 0xC0000084     # RFLAGS mask
+
+# EFER bits
+const EFER_SCE: u64 = 1                # Syscall Enable
+
+# GDT selectors (must match gdt.ritz)
+const GDT_KERNEL_CODE: u64 = 0x08
+const GDT_KERNEL_DATA: u64 = 0x10
+const GDT_USER_CODE: u64 = 0x1B        # 0x18 | 3 (ring 3)
+const GDT_USER_DATA: u64 = 0x23        # 0x20 | 3 (ring 3)
+
+# ============================================================================
+# Harland Syscall Numbers
+# ============================================================================
+
+# Core I/O
+pub const SYS_READ: u64 = 0
+pub const SYS_WRITE: u64 = 1
+pub const SYS_OPEN: u64 = 2
+pub const SYS_CLOSE: u64 = 3
+
+# Memory
+pub const SYS_MMAP: u64 = 10
+pub const SYS_MUNMAP: u64 = 11
+pub const SYS_MPROTECT: u64 = 12
+
+# Process
+pub const SYS_EXIT: u64 = 20
+pub const SYS_SPAWN: u64 = 21
+pub const SYS_WAIT: u64 = 22
+pub const SYS_GETPID: u64 = 23
+pub const SYS_YIELD: u64 = 24
+
+# IPC
+pub const SYS_IPC_SEND: u64 = 30
+pub const SYS_IPC_RECV: u64 = 31
+pub const SYS_IPC_CALL: u64 = 32
+
+# Capability
+pub const SYS_CAP_GRANT: u64 = 40
+pub const SYS_CAP_REVOKE: u64 = 41
+
+# Debug (temporary - kernel serial output from userspace)
+pub const SYS_DEBUG_PRINT: u64 = 255
+
+# ============================================================================
+# MSR Access (import from cpu module or inline)
+# ============================================================================
+
+fn rdmsr(msr: u32) -> u64
+    var lo: u32 = 0
+    var hi: u32 = 0
+    asm x86_64:
+        movl {msr}, %ecx
+        rdmsr
+        movl %eax, {lo}
+        movl %edx, {hi}
+    return (hi as u64 << 32) | (lo as u64)
+
+fn wrmsr(msr: u32, value: u64) -> i32
+    let lo: u32 = (value & 0xFFFFFFFF) as u32
+    let hi: u32 = (value >> 32) as u32
+    asm x86_64:
+        movl {msr}, %ecx
+        movl {lo}, %eax
+        movl {hi}, %edx
+        wrmsr
+    return 0
+
+# ============================================================================
+# Syscall Frame - pushed/popped by syscall entry/exit
+# ============================================================================
+
+pub struct SyscallFrame
+    # Saved by syscall entry stub
+    rax: u64        # Syscall number / return value
+    rdi: u64        # Arg 1
+    rsi: u64        # Arg 2
+    rdx: u64        # Arg 3
+    r10: u64        # Arg 4 (rcx is clobbered by SYSCALL)
+    r8: u64         # Arg 5
+    r9: u64         # Arg 6
+    # Saved by CPU on SYSCALL
+    rcx: u64        # Return RIP
+    r11: u64        # Saved RFLAGS
+    # User stack (we switch to kernel stack)
+    user_rsp: u64
+
+# ============================================================================
+# Syscall Initialization
+# ============================================================================
+
+# External reference to syscall entry point (defined in assembly)
+extern fn syscall_entry()
+
+pub fn syscall_init() -> i32
+    # 1. Enable SYSCALL/SYSRET in EFER
+    let efer: u64 = rdmsr(MSR_EFER)
+    wrmsr(MSR_EFER, efer | EFER_SCE)
+
+    # 2. Set up STAR MSR
+    # Bits 63:48 = SYSRET CS (user code) and SS (user code + 8)
+    # Bits 47:32 = SYSCALL CS (kernel code) and SS (kernel code + 8)
+    # For SYSRET: CS = STAR[63:48] + 16, SS = STAR[63:48] + 8
+    # So we set STAR[63:48] = GDT_USER_CODE - 16 = 0x1B - 16 = 0x0B...
+    # Actually: SYSRET loads CS from STAR[63:48]+16 and SS from STAR[63:48]+8
+    # We want CS=0x1B (user code), SS=0x23 (user data)
+    # So STAR[63:48] should be 0x1B - 16 = 0x0B? No...
+    #
+    # Correct formula:
+    # For 64-bit SYSRET: CS = STAR[63:48] + 16, SS = STAR[63:48] + 8
+    # We want CS=0x1B=27, so STAR[63:48] = 27 - 16 = 11 = 0x0B?
+    # But 0x0B | 3 = 0x0B, and we need RPL=3...
+    #
+    # Actually the standard layout is:
+    # STAR[47:32] = kernel CS (SYSCALL), kernel SS = STAR[47:32] + 8
+    # STAR[63:48] = user CS base for SYSRET
+    #   - 64-bit: CS = STAR[63:48] + 16, SS = STAR[63:48] + 8
+    #
+    # With GDT layout: null, kcode(0x08), kdata(0x10), ucode(0x18), udata(0x20)
+    # For SYSCALL: we want CS=0x08, SS=0x10 → STAR[47:32] = 0x08
+    # For SYSRET:  we want CS=0x1B, SS=0x23
+    #   CS = base + 16 = 0x1B → base = 0x0B, but RPL comes from instruction
+    #   SS = base + 8 = 0x23 → base = 0x1B... inconsistent!
+    #
+    # Standard trick: reorder GDT so user data comes before user code:
+    # null(0), kcode(0x08), kdata(0x10), udata(0x18), ucode(0x20)
+    # Then SYSRET with STAR[63:48] = 0x13:
+    #   SS = 0x13 + 8 = 0x1B (but we want 0x23...)
+    #
+    # Actually, the RIGHT way with standard GDT order:
+    # STAR[63:48] = 0x18 (user code base without RPL)
+    # SYSRET 64-bit: CS = 0x18 + 16 | 3 = 0x28 | 3 = 0x2B... wrong!
+    #
+    # Let me check Intel docs again...
+    # SYSRET loads: CS.sel = STAR[63:48] + 16, SS.sel = STAR[63:48] + 8
+    # The +16/+8 already include the selector indices.
+    # And SYSRET ORs in CPL 3 for both.
+    #
+    # OK so with our GDT: kcode=0x08, kdata=0x10, udata=0x18(?), ucode=0x20(?)
+    # No wait, let's use what gdt.ritz defines:
+    # GDT_USER_CODE: u16 = 0x1B = 0x18 | 3 (index 3)
+    # GDT_USER_DATA: u16 = 0x23 = 0x20 | 3 (index 4)
+    #
+    # For SYSRET we need: CS = index 3, SS = index 4
+    # SYSRET formula: CS = STAR[63:48] + 16, SS = STAR[63:48] + 8
+    # Raw indices: CS = 0x18, SS = 0x20
+    # We need: 0x18 = base + 16, so base = 0x08
+    #          0x20 = base + 8, so base = 0x18... inconsistent!
+    #
+    # The trick is to swap user data/code in GDT or use different approach.
+    # Many kernels reorder: kcode, kdata, udata32, ucode32, udata64, ucode64
+    # For simplicity, let's use IRET for now, not SYSRET.
+    # We'll still use SYSCALL for fast entry, but IRET for return.
+
+    # Simple approach: just set up for SYSCALL entry
+    # STAR[47:32] = 0x08 (kernel code selector)
+    let star: u64 = (0x08 as u64) << 32
+    wrmsr(MSR_STAR, star)
+
+    # 3. Set LSTAR to syscall entry point
+    let entry_addr: u64 = syscall_entry as u64
+    wrmsr(MSR_LSTAR, entry_addr)
+
+    # 4. Set SFMASK - clear IF (interrupt flag) on syscall entry
+    # This prevents interrupts during the kernel entry sequence
+    let sfmask: u64 = 0x200  # Bit 9 = IF
+    wrmsr(MSR_SFMASK, sfmask)
+
+    return 0
+
+# ============================================================================
+# Syscall Handler (called from assembly stub)
+# ============================================================================
+
+pub fn syscall_handler(frame: *SyscallFrame) -> i64
+    let syscall_num: u64 = (*frame).rax
+    let arg1: u64 = (*frame).rdi
+    let arg2: u64 = (*frame).rsi
+    let arg3: u64 = (*frame).rdx
+    let arg4: u64 = (*frame).r10
+    let arg5: u64 = (*frame).r8
+    let arg6: u64 = (*frame).r9
+
+    # Dispatch based on syscall number
+    if syscall_num == SYS_EXIT
+        return sys_exit(arg1 as i32)
+
+    if syscall_num == SYS_WRITE
+        return sys_write(arg1 as i32, arg2 as *u8, arg3 as i64)
+
+    if syscall_num == SYS_DEBUG_PRINT
+        return sys_debug_print(arg1 as *u8, arg2 as i64)
+
+    if syscall_num == SYS_YIELD
+        return sys_yield()
+
+    if syscall_num == SYS_GETPID
+        return sys_getpid()
+
+    # Unknown syscall
+    return -1
+
+# ============================================================================
+# Syscall Implementations
+# ============================================================================
+
+fn sys_exit(code: i32) -> i64
+    # TODO: Mark process as exited, schedule next process
+    # For now, just print and halt
+    serial_print(c"[syscall] exit(")
+    serial_print_dec(code as u64)
+    serial_print(c")\n")
+
+    # Never returns - halt the CPU
+    asm x86_64:
+        cli
+        hlt
+    return 0
+
+fn sys_write(fd: i32, buf: *u8, len: i64) -> i64
+    # fd 1 = stdout (serial console)
+    # fd 2 = stderr (serial console)
+    if fd == 1 || fd == 2
+        var i: i64 = 0
+        while i < len
+            serial_write_byte(*(buf + i))
+            i = i + 1
+        return len
+
+    # Unknown fd
+    return -1
+
+fn sys_debug_print(buf: *u8, len: i64) -> i64
+    # Direct kernel serial output (debugging)
+    var i: i64 = 0
+    while i < len
+        serial_write_byte(*(buf + i))
+        i = i + 1
+    return len
+
+fn sys_yield() -> i64
+    # TODO: Invoke scheduler
+    return 0
+
+fn sys_getpid() -> i64
+    # TODO: Return current process ID
+    return 1  # Placeholder
+
+# ============================================================================
+# Serial Output (import from main or inline)
+# ============================================================================
+
+const COM1_DATA: u16 = 0x3F8
+const COM1_LSR: u16 = 0x3FD
+const LSR_THRE: u8 = 0x20
+
+fn outb(port: u16, value: u8) -> i32
+    asm x86_64:
+        movw {port}, %dx
+        movb {value}, %al
+        outb %al, %dx
+    return 0
+
+fn inb(port: u16) -> u8
+    var result: u8 = 0
+    asm x86_64:
+        movw {port}, %dx
+        inb %dx, %al
+        movb %al, {result}
+    return result
+
+fn serial_write_byte(c: u8) -> i32
+    while (inb(COM1_LSR) & LSR_THRE) == 0
+        asm x86_64:
+            pause
+    outb(COM1_DATA, c)
+    return 0
+
+fn serial_print(s: *u8) -> i32
+    var p: *u8 = s
+    while *p != 0
+        serial_write_byte(*p)
+        p = p + 1
+    return 0
+
+fn serial_print_dec(value: u64) -> i32
+    if value == 0
+        serial_write_byte(48)
+        return 0
+    var buf: [20]u8
+    var i: i32 = 0
+    var v: u64 = value
+    while v > 0
+        buf[i] = ((v % 10) + 48) as u8
+        v = v / 10
+        i = i + 1
+    while i > 0
+        i = i - 1
+        serial_write_byte(buf[i])
+    return 0

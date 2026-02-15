@@ -1,0 +1,186 @@
+# Directory Entry
+#
+# Structures for directory entries and metadata.
+
+import ritzlib.sys { write }
+import blob_id { BlobId, blob_id_zero, blob_id_eq, blob_id_copy }
+import path { NAME_MAX }
+
+# Entry type constants
+pub const ENTRY_FILE: u8 = 0
+pub const ENTRY_DIRECTORY: u8 = 1
+pub const ENTRY_SYMLINK: u8 = 2
+
+# Type alias
+pub type EntryKind = u8
+
+# File/directory metadata
+pub struct Metadata
+    size: u64           # File size in bytes (0 for directories)
+    created: u64        # Creation time (unix timestamp)
+    modified: u64       # Modification time
+    mode: u32           # Permission bits
+
+# Directory entry
+pub struct DirEntry
+    name: [256]u8       # Name (null-terminated, max 255 chars)
+    name_len: u8        # Length of name
+    kind: EntryKind     # File, directory, or symlink
+    blob_id: BlobId     # Content hash (for files) or dir blob (for dirs)
+    metadata: Metadata  # Size, timestamps, permissions
+
+# Create a new file entry
+pub fn dir_entry_file(name: *u8, name_len: u8, blob_id: BlobId, size: u64) -> DirEntry
+    var entry: DirEntry
+
+    # Copy name
+    var i: i32 = 0
+    while i < name_len as i32 and i < NAME_MAX
+        entry.name[i] = *(name + i)
+        i = i + 1
+    entry.name[i] = 0  # null terminate
+    entry.name_len = name_len
+
+    entry.kind = ENTRY_FILE
+    entry.blob_id = blob_id
+
+    entry.metadata.size = size
+    entry.metadata.created = 0  # TODO: get current time
+    entry.metadata.modified = 0
+    entry.metadata.mode = 420   # 0644
+
+    entry
+
+# Create a new directory entry
+pub fn dir_entry_dir(name: *u8, name_len: u8, blob_id: BlobId) -> DirEntry
+    var entry: DirEntry
+
+    # Copy name
+    var i: i32 = 0
+    while i < name_len as i32 and i < NAME_MAX
+        entry.name[i] = *(name + i)
+        i = i + 1
+    entry.name[i] = 0
+    entry.name_len = name_len
+
+    entry.kind = ENTRY_DIRECTORY
+    entry.blob_id = blob_id
+
+    entry.metadata.size = 0
+    entry.metadata.created = 0
+    entry.metadata.modified = 0
+    entry.metadata.mode = 493   # 0755
+
+    entry
+
+# Check if entry is a file
+pub fn dir_entry_is_file(entry: DirEntry) -> bool
+    entry.kind == ENTRY_FILE
+
+# Check if entry is a directory
+pub fn dir_entry_is_dir(entry: DirEntry) -> bool
+    entry.kind == ENTRY_DIRECTORY
+
+# Get entry name pointer
+pub fn dir_entry_name(entry: DirEntry) -> *u8
+    @entry.name[0]
+
+# Get entry name length
+pub fn dir_entry_name_len(entry: DirEntry) -> u8
+    entry.name_len
+
+# Compare entry name with a string
+pub fn dir_entry_name_eq(entry: DirEntry, name: *u8, len: u8) -> bool
+    if entry.name_len != len
+        return false
+
+    var i: i32 = 0
+    while i < len as i32
+        if entry.name[i] != *(name + i)
+            return false
+        i = i + 1
+
+    true
+
+# Serialized directory (list of entries stored as a blob)
+# Format:
+#   u32: entry count
+#   DirEntry[]: entries
+
+# Calculate serialized size of a directory
+pub fn dir_serialized_size(entry_count: u32) -> u64
+    4 + (entry_count as u64 * 320)  # sizeof(DirEntry) ~ 320 bytes
+
+# Serialize a directory entry to bytes
+pub fn dir_entry_serialize(entry: DirEntry, out: *u8)
+    # Name (256 bytes)
+    var i: i32 = 0
+    while i < 256
+        *(out + i) = entry.name[i]
+        i = i + 1
+
+    # name_len (1 byte)
+    *(out + 256) = entry.name_len
+
+    # kind (1 byte)
+    *(out + 257) = entry.kind
+
+    # blob_id (32 bytes)
+    i = 0
+    while i < 32
+        *(out + 258 + i) = entry.blob_id.hash[i]
+        i = i + 1
+
+    # metadata (24 bytes)
+    # size: u64 at offset 290
+    let size_ptr: *u64 = (out + 290) as *u64
+    *size_ptr = entry.metadata.size
+
+    # created: u64 at offset 298
+    let created_ptr: *u64 = (out + 298) as *u64
+    *created_ptr = entry.metadata.created
+
+    # modified: u64 at offset 306
+    let modified_ptr: *u64 = (out + 306) as *u64
+    *modified_ptr = entry.metadata.modified
+
+    # mode: u32 at offset 314
+    let mode_ptr: *u32 = (out + 314) as *u32
+    *mode_ptr = entry.metadata.mode
+
+# Deserialize a directory entry from bytes
+pub fn dir_entry_deserialize(data: *u8) -> DirEntry
+    var entry: DirEntry
+
+    # Name (256 bytes)
+    var i: i32 = 0
+    while i < 256
+        entry.name[i] = *(data + i)
+        i = i + 1
+
+    # name_len
+    entry.name_len = *(data + 256)
+
+    # kind
+    entry.kind = *(data + 257)
+
+    # blob_id
+    i = 0
+    while i < 32
+        entry.blob_id.hash[i] = *(data + 258 + i)
+        i = i + 1
+
+    # metadata
+    let size_ptr: *u64 = (data + 290) as *u64
+    entry.metadata.size = *size_ptr
+
+    let created_ptr: *u64 = (data + 298) as *u64
+    entry.metadata.created = *created_ptr
+
+    let modified_ptr: *u64 = (data + 306) as *u64
+    entry.metadata.modified = *modified_ptr
+
+    let mode_ptr: *u32 = (data + 314) as *u32
+    entry.metadata.mode = *mode_ptr
+
+    entry
