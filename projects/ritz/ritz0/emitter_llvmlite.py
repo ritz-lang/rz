@@ -754,7 +754,17 @@ class LLVMEmitter:
         return self.builder.call(fn, [string_ptr])
 
     def _emit_global_var(self, var_def: rast.VarDef) -> None:
-        """Emit a module-level mutable variable."""
+        """Emit a module-level mutable variable.
+
+        With separate compilation:
+        - Variables from the current source file get definitions (with initializers)
+        - Variables from other files get external declarations only (no initializer)
+
+        Linkage rules:
+        - pub var: external linkage (visible to linker, can be shared across modules)
+        - var (private): internal linkage (hidden from linker, module-local)
+        - imported var: external linkage (declaration only, defined elsewhere)
+        """
         # Determine the type
         if var_def.type is not None:
             ty = self._ritz_type_to_llvm(var_def.type)
@@ -770,43 +780,62 @@ class LLVMEmitter:
 
         # Create the global variable
         gvar = ir.GlobalVariable(self.module, ty, name=var_def.name)
-        gvar.linkage = "internal"  # Visible within module only
 
-        # Set initializer
-        if var_def.value is not None:
-            if isinstance(var_def.value, rast.IntLit):
-                if isinstance(ty, ir.PointerType):
-                    # Pointer initialized with integer literal (e.g., 0) -> null pointer
-                    gvar.initializer = ir.Constant(ty, None)
-                else:
-                    gvar.initializer = ir.Constant(ty, var_def.value.value)
-            elif isinstance(var_def.value, rast.UnaryOp) and var_def.value.op == '-':
-                # Handle negative integer literals like -1
-                if isinstance(var_def.value.operand, rast.IntLit):
-                    gvar.initializer = ir.Constant(ty, -var_def.value.operand.value)
-                else:
-                    raise ValueError(f"Complex unary op initializer not supported: {var_def.value}")
-            elif isinstance(var_def.value, rast.Cast):
-                # Handle `0 as *i8` style initialization
-                if isinstance(var_def.value.expr, rast.IntLit):
+        # Check if this variable is from the current source file or imported
+        is_from_current_file = self._should_emit_body(var_def)
+
+        if is_from_current_file:
+            # This is a definition - set linkage based on visibility
+            if var_def.is_pub:
+                # pub var: default (external) linkage so other modules can access it
+                # Note: Don't explicitly set "external" because LLVM treats that
+                # as a declaration without initializer. Just leave linkage unset
+                # for a global definition with external visibility.
+                pass  # Default linkage is external for global definitions
+            else:
+                # private var: internal linkage, hidden from linker
+                gvar.linkage = "internal"
+
+            # Set initializer for definitions
+            if var_def.value is not None:
+                if isinstance(var_def.value, rast.IntLit):
                     if isinstance(ty, ir.PointerType):
-                        # Cast to pointer type with zero -> null pointer
+                        # Pointer initialized with integer literal (e.g., 0) -> null pointer
                         gvar.initializer = ir.Constant(ty, None)
                     else:
-                        gvar.initializer = ir.Constant(ty, var_def.value.expr.value)
+                        gvar.initializer = ir.Constant(ty, var_def.value.value)
+                elif isinstance(var_def.value, rast.UnaryOp) and var_def.value.op == '-':
+                    # Handle negative integer literals like -1
+                    if isinstance(var_def.value.operand, rast.IntLit):
+                        gvar.initializer = ir.Constant(ty, -var_def.value.operand.value)
+                    else:
+                        raise ValueError(f"Complex unary op initializer not supported: {var_def.value}")
+                elif isinstance(var_def.value, rast.Cast):
+                    # Handle `0 as *i8` style initialization
+                    if isinstance(var_def.value.expr, rast.IntLit):
+                        if isinstance(ty, ir.PointerType):
+                            # Cast to pointer type with zero -> null pointer
+                            gvar.initializer = ir.Constant(ty, None)
+                        else:
+                            gvar.initializer = ir.Constant(ty, var_def.value.expr.value)
+                    else:
+                        raise ValueError(f"Complex cast initializer not supported: {var_def.value}")
+                elif isinstance(var_def.value, rast.NullLit):
+                    # Handle `null` initialization for pointer types
+                    if isinstance(ty, ir.PointerType):
+                        gvar.initializer = ir.Constant(ty, None)
+                    else:
+                        raise ValueError(f"null can only initialize pointer types, not {ty}")
                 else:
-                    raise ValueError(f"Complex cast initializer not supported: {var_def.value}")
-            elif isinstance(var_def.value, rast.NullLit):
-                # Handle `null` initialization for pointer types
-                if isinstance(ty, ir.PointerType):
-                    gvar.initializer = ir.Constant(ty, None)
-                else:
-                    raise ValueError(f"null can only initialize pointer types, not {ty}")
+                    raise ValueError(f"Unsupported global var initializer: {var_def.value}")
             else:
-                raise ValueError(f"Unsupported global var initializer: {var_def.value}")
+                # Zero initialize
+                gvar.initializer = ir.Constant(ty, None)  # zeroinitializer
         else:
-            # Zero initialize
-            gvar.initializer = ir.Constant(ty, None)  # zeroinitializer
+            # This is an imported variable - external declaration only
+            # No initializer, just a reference to a symbol defined elsewhere
+            gvar.linkage = "external"
+            # No initializer for external declarations
 
         # Store in lookup table
         self.globals[var_def.name] = (gvar, ty)
