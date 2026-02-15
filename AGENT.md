@@ -104,10 +104,10 @@ import valet.http            # From projects/valet/src/
 ### Single Main + Feature Branches
 
 ```
-main                              # Always green, squashed commits
-├── agent/<agent-id>/<description>  # Agent-owned workspaces
-├── shared/<rfc>-<description>      # Multi-agent collaboration
-└── hotfix/<description>            # Urgent fixes
+main                                    # Always green, squashed commits
+├── <project>/<feature>                 # Single-project work
+├── <feature>                           # Cross-project work
+└── hotfix/<description>                # Urgent fixes
 ```
 
 **Key principles:**
@@ -115,21 +115,24 @@ main                              # Always green, squashed commits
 - **Branches are short-lived** — create, work, PR, merge, delete
 - **Squash on merge** — one logical change = one commit on main
 - **Cross-project changes are atomic** — one PR can touch multiple projects
+- **Agents are anonymous** — branches describe the work, not the worker
 
 ### Branch Naming
 
 ```
-agent/agent-042/fix-parser-null     # Agent working on a fix
-agent/agent-073/feat-gzip-stream    # Agent adding a feature
-shared/rfc-107-async-io             # Multi-agent collaboration
-hotfix/critical-typo-fix            # Urgent fix
+squeeze/gzip-streaming              # Feature in squeeze
+ritz/parser-error-recovery          # Feature in ritz compiler
+valet/http2-support                 # Feature in valet
+async-io-overhaul                   # Cross-project feature
+tls-1.3-integration                 # Touches cryptosec, valet, http
+hotfix/critical-parser-null         # Urgent fix
 ```
 
 ### Workflow
 
 ```bash
-# 1. Create your branch from main
-git checkout -b agent/myagent/my-feature main
+# 1. Create your branch from main (name describes the work)
+git checkout -b squeeze/gzip-streaming main
 
 # 2. Work on your changes (can touch multiple projects)
 vim projects/squeeze/src/gzip.ritz
@@ -144,42 +147,42 @@ git add projects/squeeze projects/valet
 git commit -m "squeeze,valet: Add gzip streaming support"
 
 # 5. Push and create PR
-git push -u origin agent/myagent/my-feature
+git push -u origin squeeze/gzip-streaming
 gh pr create --title "Add gzip streaming support"
 
 # 6. PR is squash-merged to main
 # 7. Delete your branch
-git branch -d agent/myagent/my-feature
+git branch -d squeeze/gzip-streaming
 ```
 
 ---
 
 ## Agent Isolation with Worktrees
 
-Each agent works in an isolated git worktree:
+Each agent works in an isolated git worktree. Agents join a "room" (workspace) and work on whatever needs doing:
 
 ```bash
-# Create a worktree for your agent
-git worktree add ~/dev/rz-worktrees/agent-042 -b agent/agent-042/feature main
+# Create a worktree for a room (e.g., "squeeze" room works on squeeze)
+git worktree add ~/dev/rz-worktrees/squeeze -b squeeze/current-work main
 
 # Work in isolation
-cd ~/dev/rz-worktrees/agent-042
+cd ~/dev/rz-worktrees/squeeze
 export RITZ_PATH=$PWD/projects
 
-# Your changes don't affect other agents
-# Other agents' changes don't affect you
+# Your changes don't affect other rooms
+# Other rooms' changes don't affect you
 # Main stays stable
 
-# When done, clean up
-git worktree remove ~/dev/rz-worktrees/agent-042
+# When done with this branch, clean up and start fresh
+git worktree remove ~/dev/rz-worktrees/squeeze
 ```
 
 ### Why Worktrees?
 
-- **Complete isolation** — each agent has their own filesystem view
-- **No file locking** — agents can work on the same files in parallel
+- **Complete isolation** — each room has its own filesystem view
+- **No file locking** — multiple rooms can work on the same files in parallel
 - **Efficient** — git shares objects between worktrees
-- **Stable base** — agents always branch from green main
+- **Stable base** — always branch from green main
 
 ---
 
