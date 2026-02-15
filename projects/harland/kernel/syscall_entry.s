@@ -91,25 +91,34 @@ syscall_entry:
     movq 72(%rsp), %rcx          # rcx = saved RDX (arg3)
     call syscall_handler
 
-    # Return value is in RAX - save it
-    movq %rax, %rbx              # Temporarily save return value
+    # Return value is in RAX - save it to a temporary location
+    # We'll store it where the syscall number was saved (we don't need it anymore)
+    # Stack layout at this point (offset from RSP):
+    #   +0:  r15 (callee-saved)
+    #   +8:  r14
+    #   +16: r13
+    #   +24: r12
+    #   +32: rbp
+    #   +40: rbx
+    #   +48: RAX (syscall number) <- we'll overwrite this with return value
+    #   +56: RDI (arg1)
+    #   ...
+    movq %rax, 48(%rsp)          # Save return value over saved syscall number
 
     # Disable interrupts for exit sequence
     cli
 
-    # Restore callee-saved registers
+    # Restore callee-saved registers (CRITICAL: must restore user's RBX!)
     popq %r15
     popq %r14
     popq %r13
     popq %r12
     popq %rbp
-    # Skip rbx restore - we'll overwrite with return value
+    popq %rbx                    # Restore user's RBX
 
-    # Pop syscall frame but keep the values we need
-    addq $8, %rsp                # Skip saved rbx
-    popq %rax                    # syscall number (discard, use return value)
-    movq %rbx, %rax              # Restore actual return value
-    popq %rdi                    # Restore arg1 (not needed but for symmetry)
+    # Pop syscall frame
+    popq %rax                    # This is now the return value (we saved it here)
+    popq %rdi                    # Restore arg1
     popq %rsi                    # arg2
     popq %rdx                    # arg3
     popq %r10                    # arg4

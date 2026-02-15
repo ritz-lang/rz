@@ -1,0 +1,179 @@
+# Harland IPC - Syscall Handlers
+#
+# Implements the syscall interface for IPC operations.
+# These are called from the main syscall dispatcher.
+
+import serial { prints, println, serial_print_dec, serial_print_hex }
+import ipc.message { Message, MsgHeader }
+import ipc.channel { ChannelEndpoint, ChannelPair, channel_create, channel_send, channel_recv, channel_close, channel_has_messages }
+
+# ============================================================================
+# Syscall Numbers (must match main syscall dispatcher)
+# ============================================================================
+
+pub const SYS_CHANNEL_CREATE: u64 = 100
+pub const SYS_IPC_SEND: u64 = 30
+pub const SYS_IPC_RECV: u64 = 31
+pub const SYS_IPC_CLOSE: u64 = 33
+
+# ============================================================================
+# Endpoint Handle Table (per-process)
+# ============================================================================
+#
+# Maps integer handles to channel endpoints.
+# For now, a simple global table. Will be per-process later.
+
+const MAX_HANDLES: i32 = 64
+
+var endpoint_table: [64]*ChannelEndpoint
+var endpoint_owners: [64]u32
+var handle_count: i32 = 0
+
+pub fn ipc_syscall_init() -> i32
+    var i: i32 = 0
+    while i < MAX_HANDLES
+        endpoint_table[i] = 0 as *ChannelEndpoint
+        endpoint_owners[i] = 0
+        i = i + 1
+    handle_count = 0
+    return 0
+
+fn alloc_handle(endpoint: *ChannelEndpoint, owner_pid: u32) -> i32
+    var i: i32 = 0
+    while i < MAX_HANDLES
+        if endpoint_table[i] == 0 as *ChannelEndpoint
+            endpoint_table[i] = endpoint
+            endpoint_owners[i] = owner_pid
+            handle_count = handle_count + 1
+            return i
+        i = i + 1
+    return -1  # No free handles
+
+fn get_endpoint(handle: i32, pid: u32) -> *ChannelEndpoint
+    if handle < 0 or handle >= MAX_HANDLES
+        return 0 as *ChannelEndpoint
+    if endpoint_owners[handle] != pid
+        return 0 as *ChannelEndpoint
+    return endpoint_table[handle]
+
+fn free_handle(handle: i32) -> i32
+    if handle < 0 or handle >= MAX_HANDLES
+        return -1
+    endpoint_table[handle] = 0 as *ChannelEndpoint
+    endpoint_owners[handle] = 0
+    handle_count = handle_count - 1
+    return 0
+
+# ============================================================================
+# SYS_CHANNEL_CREATE
+# ============================================================================
+#
+# Create a new channel pair.
+# Returns: Two handles packed into i64: (handle_a << 32) | handle_b
+#          Or negative error code.
+
+pub fn sys_channel_create(caller_pid: u32) -> i64
+    # Create channel with both endpoints owned by caller
+    # The caller can transfer one handle to another process later
+    let pair: ChannelPair = channel_create(caller_pid, caller_pid)
+
+    if pair.endpoint_a == 0 as *ChannelEndpoint
+        return -12  # ENOMEM
+
+    # Allocate handles
+    let handle_a: i32 = alloc_handle(pair.endpoint_a, caller_pid)
+    if handle_a < 0
+        channel_close(pair.endpoint_a)
+        channel_close(pair.endpoint_b)
+        return -12  # ENOMEM
+
+    let handle_b: i32 = alloc_handle(pair.endpoint_b, caller_pid)
+    if handle_b < 0
+        free_handle(handle_a)
+        channel_close(pair.endpoint_a)
+        channel_close(pair.endpoint_b)
+        return -12  # ENOMEM
+
+    # Pack both handles into return value
+    let result: i64 = ((handle_a as i64) << 32) | (handle_b as i64 & 0xFFFFFFFF)
+    return result
+
+# ============================================================================
+# SYS_IPC_SEND
+# ============================================================================
+#
+# Send a message on a channel.
+# Args:
+#   handle: Channel endpoint handle
+#   msg_ptr: Pointer to Message structure
+# Returns: 0 on success, negative error code on failure
+
+pub fn sys_ipc_send(caller_pid: u32, handle: i32, msg_ptr: *Message) -> i64
+    let endpoint: *ChannelEndpoint = get_endpoint(handle, caller_pid)
+    if endpoint == 0 as *ChannelEndpoint
+        return -9  # EBADF
+
+    if msg_ptr == 0 as *Message
+        return -22  # EINVAL
+
+    let result: i32 = channel_send(endpoint, msg_ptr, caller_pid)
+    return result as i64
+
+# ============================================================================
+# SYS_IPC_RECV
+# ============================================================================
+#
+# Receive a message from a channel (non-blocking).
+# Args:
+#   handle: Channel endpoint handle
+#   msg_ptr: Pointer to Message buffer to fill
+#   sender_pid_ptr: Pointer to u32 to receive sender PID (may be null)
+# Returns: Payload length on success, negative error code on failure
+#          -EAGAIN (-11) if no messages available
+
+pub fn sys_ipc_recv(caller_pid: u32, handle: i32, msg_ptr: *Message, sender_pid_ptr: *u32) -> i64
+    let endpoint: *ChannelEndpoint = get_endpoint(handle, caller_pid)
+    if endpoint == 0 as *ChannelEndpoint
+        return -9  # EBADF
+
+    if msg_ptr == 0 as *Message
+        return -22  # EINVAL
+
+    let result: i32 = channel_recv(endpoint, msg_ptr, sender_pid_ptr)
+    return result as i64
+
+# ============================================================================
+# SYS_IPC_CLOSE
+# ============================================================================
+#
+# Close a channel endpoint.
+# Args:
+#   handle: Channel endpoint handle
+# Returns: 0 on success, negative error code on failure
+
+pub fn sys_ipc_close(caller_pid: u32, handle: i32) -> i64
+    let endpoint: *ChannelEndpoint = get_endpoint(handle, caller_pid)
+    if endpoint == 0 as *ChannelEndpoint
+        return -9  # EBADF
+
+    let result: i32 = channel_close(endpoint)
+    free_handle(handle)
+    return result as i64
+
+# ============================================================================
+# SYS_IPC_POLL
+# ============================================================================
+#
+# Check if a channel has messages waiting.
+# Args:
+#   handle: Channel endpoint handle
+# Returns: 1 if messages available, 0 if empty, negative on error
+
+pub fn sys_ipc_poll(caller_pid: u32, handle: i32) -> i64
+    let endpoint: *ChannelEndpoint = get_endpoint(handle, caller_pid)
+    if endpoint == 0 as *ChannelEndpoint
+        return -9  # EBADF
+
+    if channel_has_messages(endpoint)
+        return 1
+    return 0

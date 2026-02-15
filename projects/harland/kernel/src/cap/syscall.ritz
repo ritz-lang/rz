@@ -1,0 +1,169 @@
+# Harland Capability System - Syscall Handlers
+#
+# Implements the syscall interface for capability operations.
+
+import serial { prints, println, serial_print_dec }
+import cap.types { CapHandle, CapEntry, CapInfo, CAP_TYPE_NONE, CAP_RIGHT_GRANT, CAP_RIGHT_DERIVE, cap_handle_invalid, cap_handle_is_valid, cap_type_name }
+import cap.table { CapTable, cap_table_get, cap_table_lookup, cap_table_insert, cap_table_remove, cap_table_derive, cap_grant, cap_table_info, cap_has_rights }
+
+# ============================================================================
+# Syscall Numbers
+# ============================================================================
+
+pub const SYS_CAP_GRANT: u64 = 110
+pub const SYS_CAP_REVOKE: u64 = 111
+pub const SYS_CAP_DERIVE: u64 = 112
+pub const SYS_CAP_INFO: u64 = 113
+pub const SYS_CAP_CHECK: u64 = 114
+
+# ============================================================================
+# SYS_CAP_GRANT
+# ============================================================================
+#
+# Grant a capability to another process.
+# Args:
+#   handle: Capability handle to grant (packed as index | gen << 32)
+#   target_pid: Process to grant to
+#   rights: Rights to grant (must be subset of current rights)
+# Returns:
+#   Handle in target process (packed) on success
+#   Negative error code on failure
+
+pub fn sys_cap_grant(caller_pid: u32, handle_packed: u64, target_pid: u32, rights: u32) -> i64
+    # Unpack handle
+    var handle: CapHandle
+    handle.index = (handle_packed & 0xFFFFFFFF) as u32
+    handle.generation = ((handle_packed >> 32) & 0xFFFFFFFF) as u32
+
+    let from_table: *CapTable = cap_table_get(caller_pid)
+    if from_table == 0 as *CapTable
+        return -1  # EPERM - no capability table
+
+    let to_table: *CapTable = cap_table_get(target_pid)
+    if to_table == 0 as *CapTable
+        return -3  # ESRCH - target process not found
+
+    let new_handle: CapHandle = cap_grant(from_table, handle, to_table, rights)
+    # Extract values before validation (which consumes the struct)
+    let idx: u32 = new_handle.index
+    let gen: u32 = new_handle.generation
+    if idx == 0xFFFFFFFF
+        return -1  # EPERM - grant failed (invalid handle)
+
+    # Pack result handle
+    let result: i64 = (idx as i64) | ((gen as i64) << 32)
+    return result
+
+# ============================================================================
+# SYS_CAP_REVOKE
+# ============================================================================
+#
+# Revoke (delete) a capability from caller's table.
+# Args:
+#   handle: Capability handle to revoke (packed)
+# Returns:
+#   0 on success, negative error code on failure
+
+pub fn sys_cap_revoke(caller_pid: u32, handle_packed: u64) -> i64
+    var handle: CapHandle
+    handle.index = (handle_packed & 0xFFFFFFFF) as u32
+    handle.generation = ((handle_packed >> 32) & 0xFFFFFFFF) as u32
+
+    let table: *CapTable = cap_table_get(caller_pid)
+    if table == 0 as *CapTable
+        return -1  # EPERM
+
+    let result: i32 = cap_table_remove(table, handle)
+    return result as i64
+
+# ============================================================================
+# SYS_CAP_DERIVE
+# ============================================================================
+#
+# Create a derived capability with restricted rights.
+# Args:
+#   handle: Source capability handle (packed)
+#   new_rights: Rights for derived capability
+# Returns:
+#   New handle (packed) on success, negative error on failure
+
+pub fn sys_cap_derive(caller_pid: u32, handle_packed: u64, new_rights: u32) -> i64
+    var handle: CapHandle
+    handle.index = (handle_packed & 0xFFFFFFFF) as u32
+    handle.generation = ((handle_packed >> 32) & 0xFFFFFFFF) as u32
+
+    let table: *CapTable = cap_table_get(caller_pid)
+    if table == 0 as *CapTable
+        return -1  # EPERM
+
+    let new_handle: CapHandle = cap_table_derive(table, handle, new_rights)
+    # Extract values before validation (which consumes the struct)
+    let idx: u32 = new_handle.index
+    let gen: u32 = new_handle.generation
+    if idx == 0xFFFFFFFF
+        return -1  # EPERM - derive failed (invalid handle)
+
+    let result: i64 = (idx as i64) | ((gen as i64) << 32)
+    return result
+
+# ============================================================================
+# SYS_CAP_INFO
+# ============================================================================
+#
+# Get information about a capability.
+# Args:
+#   handle: Capability handle (packed)
+#   info_ptr: Pointer to CapInfo struct to fill
+# Returns:
+#   0 on success, negative error on failure
+
+pub fn sys_cap_info(caller_pid: u32, handle_packed: u64, info_ptr: *CapInfo) -> i64
+    if info_ptr == 0 as *CapInfo
+        return -22  # EINVAL
+
+    var handle: CapHandle
+    handle.index = (handle_packed & 0xFFFFFFFF) as u32
+    handle.generation = ((handle_packed >> 32) & 0xFFFFFFFF) as u32
+
+    let table: *CapTable = cap_table_get(caller_pid)
+    if table == 0 as *CapTable
+        return -1  # EPERM
+
+    let result: i32 = cap_table_info(table, handle, info_ptr)
+    return result as i64
+
+# ============================================================================
+# SYS_CAP_CHECK
+# ============================================================================
+#
+# Check if a capability has specific rights.
+# Args:
+#   handle: Capability handle (packed)
+#   required_rights: Rights to check for
+# Returns:
+#   1 if capability has all rights, 0 if not, negative on error
+
+pub fn sys_cap_check(caller_pid: u32, handle_packed: u64, required_rights: u32) -> i64
+    var handle: CapHandle
+    handle.index = (handle_packed & 0xFFFFFFFF) as u32
+    handle.generation = ((handle_packed >> 32) & 0xFFFFFFFF) as u32
+
+    let table: *CapTable = cap_table_get(caller_pid)
+    if table == 0 as *CapTable
+        return -1  # EPERM
+
+    if cap_has_rights(table, handle, required_rights)
+        return 1
+    return 0
+
+# ============================================================================
+# Debug Helpers
+# ============================================================================
+
+pub fn cap_syscall_debug(caller_pid: u32, syscall_num: u64) -> i32
+    prints("[CAP] PID ")
+    serial_print_dec(caller_pid as u64)
+    prints(" syscall ")
+    serial_print_dec(syscall_num)
+    println("")
+    return 0

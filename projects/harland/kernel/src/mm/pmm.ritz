@@ -1,0 +1,332 @@
+# Harland Physical Memory Manager (Bitmap Allocator)
+#
+# Manages physical memory using a bitmap where each bit represents a 4KB page.
+# 1 = free, 0 = used
+#
+# This is the foundation of memory management - VMM and heap depend on it.
+
+import serial { StrView, prints, serial_print_hex, serial_print_dec, println }
+
+# ============================================================================
+# Page Constants (shared with VMM and heap)
+# ============================================================================
+
+pub const PAGE_SIZE: u64 = 4096
+pub const PAGE_SHIFT: u64 = 12
+
+# Maximum memory we support (for now, 256MB - fits in 8KB bitmap)
+# 256MB = 268435456 bytes, 65536 pages
+pub const MAX_MEMORY: u64 = 268435456
+pub const MAX_PAGES: u64 = 65536
+
+# ============================================================================
+# Multiboot2 Information Structures (for memory map parsing)
+# ============================================================================
+
+# Multiboot2 tag types
+pub const MB2_TAG_END: u32 = 0
+pub const MB2_TAG_CMDLINE: u32 = 1
+pub const MB2_TAG_BOOTLOADER_NAME: u32 = 2
+pub const MB2_TAG_MODULE: u32 = 3
+pub const MB2_TAG_BASIC_MEMINFO: u32 = 4
+pub const MB2_TAG_BOOTDEV: u32 = 5
+pub const MB2_TAG_MMAP: u32 = 6
+pub const MB2_TAG_VBE: u32 = 7
+pub const MB2_TAG_FRAMEBUFFER: u32 = 8
+pub const MB2_TAG_ELF_SECTIONS: u32 = 9
+pub const MB2_TAG_APM: u32 = 10
+pub const MB2_TAG_EFI32: u32 = 11
+pub const MB2_TAG_EFI64: u32 = 12
+pub const MB2_TAG_SMBIOS: u32 = 13
+pub const MB2_TAG_ACPI_OLD: u32 = 14
+pub const MB2_TAG_ACPI_NEW: u32 = 15
+pub const MB2_TAG_NETWORK: u32 = 16
+pub const MB2_TAG_EFI_MMAP: u32 = 17
+pub const MB2_TAG_EFI_BS: u32 = 18
+pub const MB2_TAG_EFI32_IH: u32 = 19
+pub const MB2_TAG_EFI64_IH: u32 = 20
+pub const MB2_TAG_LOAD_BASE_ADDR: u32 = 21
+
+# Memory map entry types
+pub const MB2_MEMORY_AVAILABLE: u32 = 1
+pub const MB2_MEMORY_RESERVED: u32 = 2
+pub const MB2_MEMORY_ACPI_RECLAIMABLE: u32 = 3
+pub const MB2_MEMORY_NVS: u32 = 4
+pub const MB2_MEMORY_BADRAM: u32 = 5
+
+# Multiboot2 fixed boot info header
+pub struct Mb2BootInfo
+    total_size: u32
+    reserved: u32
+
+# Generic tag header (all tags start with this)
+pub struct Mb2Tag
+    tag_type: u32
+    size: u32
+
+# Basic memory info tag
+pub struct Mb2BasicMemInfo
+    tag_type: u32
+    size: u32
+    mem_lower: u32
+    mem_upper: u32
+
+# Memory map tag header
+pub struct Mb2MmapTag
+    tag_type: u32
+    size: u32
+    entry_size: u32
+    entry_version: u32
+    # Followed by variable number of Mb2MmapEntry
+
+# Memory map entry (e820-style)
+pub struct Mb2MmapEntry
+    base_addr: u64
+    length: u64
+    entry_type: u32
+    reserved: u32
+
+# ============================================================================
+# Harland Boot Protocol (UEFI bootloader native format)
+# ============================================================================
+
+pub const HARLAND_BOOT_MAGIC: u32 = 0x4841524C   # "HARL"
+pub const HARLAND_BOOT_VERSION: u32 = 1
+
+# Memory types for Harland boot protocol
+pub const HARLAND_MEM_USABLE: u32 = 1
+pub const HARLAND_MEM_RESERVED: u32 = 2
+pub const HARLAND_MEM_ACPI_RECLAIMABLE: u32 = 3
+
+# Harland memory map entry
+[[packed]]
+pub struct HarlandMemEntry
+    base: u64
+    length: u64
+    mem_type: u32
+    reserved: u32
+
+# Harland boot info structure (passed by UEFI bootloader)
+[[packed]]
+pub struct HarlandBootInfo
+    magic: u32                       # 0x4841524C ("HARL")
+    version: u32                     # Boot protocol version
+    memory_map: *HarlandMemEntry     # Simplified memory map
+    memory_map_entries: u32          # Number of entries
+    _pad1: u32
+    framebuffer_addr: u64            # Framebuffer address (0 if none)
+    framebuffer_width: u32
+    framebuffer_height: u32
+    framebuffer_pitch: u32
+    framebuffer_bpp: u8
+    _pad2: [3]u8
+    rsdp_addr: u64                   # ACPI RSDP address
+    kernel_phys: u64                 # Kernel physical address
+    kernel_size: u64                 # Kernel size in bytes
+    pml4_phys: u64                   # Page table physical address
+
+# Boot protocol type detected at runtime
+pub const BOOT_PROTOCOL_UNKNOWN: u32 = 0
+pub const BOOT_PROTOCOL_MULTIBOOT2: u32 = 1
+pub const BOOT_PROTOCOL_HARLAND: u32 = 2
+
+# ============================================================================
+# PMM State
+# ============================================================================
+
+# Bitmap: 1 bit per page, 1 = free, 0 = used
+# 65536 pages / 8 bits per byte = 8192 bytes
+var pmm_bitmap: [8192]u8
+var pmm_total_pages: u64 = 0
+var pmm_free_pages: u64 = 0
+var pmm_initialized: u8 = 0
+
+# ============================================================================
+# Internal Bitmap Operations
+# ============================================================================
+
+# Set a bit (mark page as free)
+fn pmm_set_bit(page: u64) -> i32
+    let byte_idx: u64 = page / 8
+    let bit_idx: u8 = (page % 8) as u8
+    pmm_bitmap[byte_idx as i32] = pmm_bitmap[byte_idx as i32] | (1 << bit_idx)
+    return 0
+
+# Clear a bit (mark page as used)
+fn pmm_clear_bit(page: u64) -> i32
+    let byte_idx: u64 = page / 8
+    let bit_idx: u8 = (page % 8) as u8
+    pmm_bitmap[byte_idx as i32] = pmm_bitmap[byte_idx as i32] & ~(1 << bit_idx)
+    return 0
+
+# Test if a bit is set (page is free)
+fn pmm_test_bit(page: u64) -> bool
+    let byte_idx: u64 = page / 8
+    let bit_idx: u8 = (page % 8) as u8
+    return (pmm_bitmap[byte_idx as i32] & (1 << bit_idx)) != 0
+
+# ============================================================================
+# PMM Initialization
+# ============================================================================
+
+# Initialize the PMM - mark everything as used initially
+pub fn pmm_init() -> i32
+    var i: i32 = 0
+    while i < 8192
+        pmm_bitmap[i] = 0
+        i = i + 1
+    pmm_total_pages = 0
+    pmm_free_pages = 0
+    pmm_initialized = 1
+    return 0
+
+# Mark a range of physical memory as available
+pub fn pmm_mark_region_free(base: u64, length: u64) -> i32
+    let start_page: u64 = (base + PAGE_SIZE - 1) / PAGE_SIZE
+    let end_page: u64 = (base + length) / PAGE_SIZE
+
+    if start_page >= MAX_PAGES
+        return 0
+
+    var page: u64 = start_page
+    while page < end_page
+        if page >= MAX_PAGES
+            break
+        pmm_set_bit(page)
+        pmm_free_pages = pmm_free_pages + 1
+        page = page + 1
+
+    if end_page > pmm_total_pages
+        if end_page > MAX_PAGES
+            pmm_total_pages = MAX_PAGES
+        else
+            pmm_total_pages = end_page
+
+    return 0
+
+# Mark a range of physical memory as used (reserved)
+pub fn pmm_mark_region_used(base: u64, length: u64) -> i32
+    let start_page: u64 = base / PAGE_SIZE
+    let end_page: u64 = (base + length + PAGE_SIZE - 1) / PAGE_SIZE
+
+    var page: u64 = start_page
+    while page < end_page
+        if page >= MAX_PAGES
+            break
+        if pmm_test_bit(page)
+            pmm_clear_bit(page)
+            if pmm_free_pages > 0
+                pmm_free_pages = pmm_free_pages - 1
+        page = page + 1
+
+    return 0
+
+# ============================================================================
+# Page Allocation
+# ============================================================================
+
+# Allocate a single physical page
+# Returns physical address or 0 on failure
+pub fn pmm_alloc_page() -> u64
+    if pmm_initialized == 0
+        return 0
+
+    if pmm_free_pages == 0
+        return 0
+
+    # Linear search for free page
+    var page: u64 = 0
+    while page < pmm_total_pages
+        if pmm_test_bit(page)
+            pmm_clear_bit(page)
+            pmm_free_pages = pmm_free_pages - 1
+            return page * PAGE_SIZE
+        page = page + 1
+
+    return 0
+
+# Free a physical page
+pub fn pmm_free_page(addr: u64) -> i32
+    if pmm_initialized == 0
+        return -1
+
+    let page: u64 = addr / PAGE_SIZE
+    if page >= MAX_PAGES
+        return -1
+
+    if pmm_test_bit(page)
+        return -1
+
+    pmm_set_bit(page)
+    pmm_free_pages = pmm_free_pages + 1
+    return 0
+
+# ============================================================================
+# Statistics
+# ============================================================================
+
+# Get free memory statistics
+pub fn pmm_get_free_pages() -> u64
+    return pmm_free_pages
+
+pub fn pmm_get_total_pages() -> u64
+    return pmm_total_pages
+
+# ============================================================================
+# Boot Protocol Initialization
+# ============================================================================
+
+# Parse Multiboot2 memory map and initialize PMM
+pub fn pmm_init_from_multiboot(mb_info: *Mb2BootInfo) -> i32
+    pmm_init()
+
+    let info_end: u64 = (mb_info as u64) + (*mb_info).total_size as u64
+    var tag_ptr: u64 = (mb_info as u64) + 8
+
+    while tag_ptr < info_end
+        let tag: *Mb2Tag = tag_ptr as *Mb2Tag
+
+        if (*tag).tag_type == MB2_TAG_END
+            break
+
+        if (*tag).tag_type == MB2_TAG_MMAP
+            let mmap_tag: *Mb2MmapTag = tag_ptr as *Mb2MmapTag
+            let entry_size: u32 = (*mmap_tag).entry_size
+            var entry_ptr: u64 = tag_ptr + 16
+            let entries_end: u64 = tag_ptr + (*mmap_tag).size as u64
+
+            while entry_ptr < entries_end
+                let entry: *Mb2MmapEntry = entry_ptr as *Mb2MmapEntry
+
+                if (*entry).entry_type == MB2_MEMORY_AVAILABLE
+                    pmm_mark_region_free((*entry).base_addr, (*entry).length)
+
+                entry_ptr = entry_ptr + entry_size as u64
+
+        tag_ptr = (tag_ptr + (*tag).size as u64 + 7) & ~7
+
+    return 0
+
+# Initialize PMM from Harland boot info (UEFI boot path)
+pub fn pmm_init_from_bootinfo(info: *HarlandBootInfo) -> i32
+    pmm_init()
+
+    let num_entries: u32 = (*info).memory_map_entries
+    let mmap: *HarlandMemEntry = (*info).memory_map
+    var i: u32 = 0
+
+    while i < num_entries
+        let entry: *HarlandMemEntry = (mmap as u64 + (i as u64 * 24)) as *HarlandMemEntry
+
+        if (*entry).mem_type == HARLAND_MEM_USABLE
+            pmm_mark_region_free((*entry).base, (*entry).length)
+
+        i = i + 1
+
+    return 0
+
+# Reserve kernel memory regions (call after pmm_init_from_multiboot or pmm_init_from_bootinfo)
+pub fn pmm_reserve_kernel() -> i32
+    pmm_mark_region_used(0, 0x100000)
+    pmm_mark_region_used(0x100000, 0x100000)
+    return 0

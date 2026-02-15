@@ -1,0 +1,325 @@
+# Harland IPC - Channel Implementation
+#
+# Channels are bidirectional communication endpoints between processes.
+# Each channel has a send queue and receive queue.
+#
+# Design:
+# - Channels are created in pairs (two endpoints)
+# - Each endpoint has its own queue
+# - Sending on endpoint A delivers to endpoint B's queue, and vice versa
+# - Blocking send/receive with optional timeout
+
+import serial { prints, println, serial_print_dec }
+import mm.heap { kalloc, kfree }
+import ipc.message { Message, QueuedMessage, MsgHeader, MSG_MAX_PAYLOAD }
+
+# ============================================================================
+# Channel Constants
+# ============================================================================
+
+# Maximum messages that can be queued per endpoint
+pub const CHANNEL_QUEUE_MAX: u32 = 16
+
+# Maximum number of channels in the system
+const MAX_CHANNELS: i32 = 256
+
+# Channel states
+pub const CHAN_STATE_FREE: u8 = 0
+pub const CHAN_STATE_OPEN: u8 = 1
+pub const CHAN_STATE_CLOSED: u8 = 2
+
+# ============================================================================
+# Channel Endpoint
+# ============================================================================
+#
+# One side of a channel. Messages sent here go to the peer's queue.
+
+pub struct ChannelEndpoint
+    # Queue of messages waiting to be received
+    queue_head: *QueuedMessage
+    queue_tail: *QueuedMessage
+    queue_count: u32
+
+    # Peer endpoint (the other side of this channel)
+    peer: *ChannelEndpoint
+
+    # Owning process
+    owner_pid: u32
+
+    # State
+    state: u8
+    _padding: [3]u8
+
+# ============================================================================
+# Channel (pair of endpoints)
+# ============================================================================
+
+pub struct Channel
+    id: u32
+    endpoint_a: ChannelEndpoint
+    endpoint_b: ChannelEndpoint
+
+# ============================================================================
+# Channel Table
+# ============================================================================
+
+var channels: [256]Channel
+var channel_count: i32 = 0
+var next_channel_id: u32 = 1
+
+# ============================================================================
+# Channel Initialization
+# ============================================================================
+
+pub fn channel_init() -> i32
+    prints("Initializing IPC channels... ")
+
+    var i: i32 = 0
+    while i < MAX_CHANNELS
+        channels[i].id = 0
+        channels[i].endpoint_a.state = CHAN_STATE_FREE
+        channels[i].endpoint_a.queue_head = 0 as *QueuedMessage
+        channels[i].endpoint_a.queue_tail = 0 as *QueuedMessage
+        channels[i].endpoint_a.queue_count = 0
+        channels[i].endpoint_a.peer = 0 as *ChannelEndpoint
+        channels[i].endpoint_a.owner_pid = 0
+
+        channels[i].endpoint_b.state = CHAN_STATE_FREE
+        channels[i].endpoint_b.queue_head = 0 as *QueuedMessage
+        channels[i].endpoint_b.queue_tail = 0 as *QueuedMessage
+        channels[i].endpoint_b.queue_count = 0
+        channels[i].endpoint_b.peer = 0 as *ChannelEndpoint
+        channels[i].endpoint_b.owner_pid = 0
+        i = i + 1
+
+    channel_count = 0
+    next_channel_id = 1
+
+    println("OK")
+    return 0
+
+# ============================================================================
+# Channel Creation
+# ============================================================================
+#
+# Creates a new channel with two endpoints.
+# Returns pointers to both endpoints.
+
+pub struct ChannelPair
+    endpoint_a: *ChannelEndpoint
+    endpoint_b: *ChannelEndpoint
+    channel_id: u32
+
+pub fn channel_create(owner_a_pid: u32, owner_b_pid: u32) -> ChannelPair
+    var result: ChannelPair
+    result.endpoint_a = 0 as *ChannelEndpoint
+    result.endpoint_b = 0 as *ChannelEndpoint
+    result.channel_id = 0
+
+    # Find a free channel slot
+    var i: i32 = 0
+    while i < MAX_CHANNELS
+        if channels[i].endpoint_a.state == CHAN_STATE_FREE
+            # Found a free slot
+            let chan: *Channel = @channels[i]
+
+            (*chan).id = next_channel_id
+            next_channel_id = next_channel_id + 1
+
+            # Initialize endpoint A
+            (*chan).endpoint_a.state = CHAN_STATE_OPEN
+            (*chan).endpoint_a.queue_head = 0 as *QueuedMessage
+            (*chan).endpoint_a.queue_tail = 0 as *QueuedMessage
+            (*chan).endpoint_a.queue_count = 0
+            (*chan).endpoint_a.owner_pid = owner_a_pid
+            (*chan).endpoint_a.peer = @(*chan).endpoint_b
+
+            # Initialize endpoint B
+            (*chan).endpoint_b.state = CHAN_STATE_OPEN
+            (*chan).endpoint_b.queue_head = 0 as *QueuedMessage
+            (*chan).endpoint_b.queue_tail = 0 as *QueuedMessage
+            (*chan).endpoint_b.queue_count = 0
+            (*chan).endpoint_b.owner_pid = owner_b_pid
+            (*chan).endpoint_b.peer = @(*chan).endpoint_a
+
+            channel_count = channel_count + 1
+
+            result.endpoint_a = @(*chan).endpoint_a
+            result.endpoint_b = @(*chan).endpoint_b
+            result.channel_id = (*chan).id
+
+            return result
+        i = i + 1
+
+    # No free slots
+    return result
+
+# ============================================================================
+# Channel Send
+# ============================================================================
+#
+# Send a message through a channel endpoint.
+# The message is queued on the peer's receive queue.
+# Returns 0 on success, negative on error.
+
+pub fn channel_send(endpoint: *ChannelEndpoint, msg: *Message, sender_pid: u32) -> i32
+    if endpoint == 0 as *ChannelEndpoint
+        return -1  # EINVAL
+
+    if (*endpoint).state != CHAN_STATE_OPEN
+        return -2  # EBADF - channel closed
+
+    let peer: *ChannelEndpoint = (*endpoint).peer
+    if peer == 0 as *ChannelEndpoint
+        return -3  # EPIPE - no peer
+
+    if (*peer).state != CHAN_STATE_OPEN
+        return -3  # EPIPE - peer closed
+
+    if (*peer).queue_count >= CHANNEL_QUEUE_MAX
+        return -4  # EAGAIN - queue full
+
+    # Allocate a queue entry
+    let entry: *QueuedMessage = kalloc(4096) as *QueuedMessage
+    if entry == 0 as *QueuedMessage
+        return -5  # ENOMEM
+
+    # Copy the message
+    (*entry).msg.header.msg_type = (*msg).header.msg_type
+    (*entry).msg.header.flags = (*msg).header.flags
+    (*entry).msg.header.seq = (*msg).header.seq
+    (*entry).msg.header.payload_len = (*msg).header.payload_len
+
+    var i: u32 = 0
+    let payload_len: u32 = (*msg).header.payload_len
+    while i < payload_len and i < 4080
+        (*entry).msg.payload[i as i32] = (*msg).payload[i as i32]
+        i = i + 1
+
+    (*entry).sender_pid = sender_pid
+    (*entry).next = 0 as *QueuedMessage
+
+    # Add to peer's queue
+    if (*peer).queue_tail == 0 as *QueuedMessage
+        (*peer).queue_head = entry
+        (*peer).queue_tail = entry
+    else
+        (*(*peer).queue_tail).next = entry
+        (*peer).queue_tail = entry
+
+    (*peer).queue_count = (*peer).queue_count + 1
+
+    return 0
+
+# ============================================================================
+# Channel Receive
+# ============================================================================
+#
+# Receive a message from a channel endpoint.
+# Non-blocking: returns -EAGAIN if no messages available.
+# Returns message size on success, negative on error.
+
+pub fn channel_recv(endpoint: *ChannelEndpoint, msg: *Message, sender_pid: *u32) -> i32
+    if endpoint == 0 as *ChannelEndpoint
+        return -1  # EINVAL
+
+    if (*endpoint).state != CHAN_STATE_OPEN
+        return -2  # EBADF
+
+    if (*endpoint).queue_count == 0
+        return -4  # EAGAIN - no messages
+
+    # Dequeue the first message
+    let entry: *QueuedMessage = (*endpoint).queue_head
+    if entry == 0 as *QueuedMessage
+        return -4  # EAGAIN
+
+    (*endpoint).queue_head = (*entry).next
+    if (*endpoint).queue_head == 0 as *QueuedMessage
+        (*endpoint).queue_tail = 0 as *QueuedMessage
+    (*endpoint).queue_count = (*endpoint).queue_count - 1
+
+    # Copy to output
+    (*msg).header.msg_type = (*entry).msg.header.msg_type
+    (*msg).header.flags = (*entry).msg.header.flags
+    (*msg).header.seq = (*entry).msg.header.seq
+    (*msg).header.payload_len = (*entry).msg.header.payload_len
+
+    var i: u32 = 0
+    let payload_len: u32 = (*entry).msg.header.payload_len
+    while i < payload_len and i < 4080
+        (*msg).payload[i as i32] = (*entry).msg.payload[i as i32]
+        i = i + 1
+
+    if sender_pid != 0 as *u32
+        *sender_pid = (*entry).sender_pid
+
+    # Free the queue entry
+    kfree(entry as *u8)
+
+    return (*msg).header.payload_len as i32
+
+# ============================================================================
+# Channel Close
+# ============================================================================
+#
+# Close a channel endpoint. The peer will get EPIPE on send.
+
+pub fn channel_close(endpoint: *ChannelEndpoint) -> i32
+    if endpoint == 0 as *ChannelEndpoint
+        return -1
+
+    if (*endpoint).state == CHAN_STATE_FREE
+        return -1
+
+    (*endpoint).state = CHAN_STATE_CLOSED
+
+    # Free all queued messages
+    var entry: *QueuedMessage = (*endpoint).queue_head
+    while entry != 0 as *QueuedMessage
+        let next: *QueuedMessage = (*entry).next
+        kfree(entry as *u8)
+        entry = next
+
+    (*endpoint).queue_head = 0 as *QueuedMessage
+    (*endpoint).queue_tail = 0 as *QueuedMessage
+    (*endpoint).queue_count = 0
+
+    # Check if both endpoints are closed, then free the channel
+    let peer: *ChannelEndpoint = (*endpoint).peer
+    if peer != 0 as *ChannelEndpoint and (*peer).state == CHAN_STATE_CLOSED
+        # Both closed, mark as free
+        (*endpoint).state = CHAN_STATE_FREE
+        (*peer).state = CHAN_STATE_FREE
+        channel_count = channel_count - 1
+
+    return 0
+
+# ============================================================================
+# Channel Query
+# ============================================================================
+
+pub fn channel_has_messages(endpoint: *ChannelEndpoint) -> bool
+    if endpoint == 0 as *ChannelEndpoint
+        return false
+    return (*endpoint).queue_count > 0
+
+pub fn channel_get_queue_count(endpoint: *ChannelEndpoint) -> u32
+    if endpoint == 0 as *ChannelEndpoint
+        return 0
+    return (*endpoint).queue_count
+
+pub fn channel_is_open(endpoint: *ChannelEndpoint) -> bool
+    if endpoint == 0 as *ChannelEndpoint
+        return false
+    return (*endpoint).state == CHAN_STATE_OPEN
+
+# ============================================================================
+# Debug
+# ============================================================================
+
+pub fn channel_debug_print() -> i32
+    prints("IPC Channels: ")
+    serial_print_dec(channel_count as u64)
+    println(" active")
+    return 0
