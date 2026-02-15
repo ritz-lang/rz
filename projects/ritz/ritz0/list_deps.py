@@ -48,14 +48,16 @@ if __name__ == "__main__":
     parser.add_argument("source", help="Source file to analyze")
     parser.add_argument("--deps", help="JSON dependency specification")
     parser.add_argument("--project-root", help="Explicit project root for import resolution")
+    parser.add_argument("--sources", help="JSON list of source directories to search for imports")
     args = parser.parse_args()
 
     source_path = args.source
     dependencies = parse_deps_arg(args.deps) if args.deps else None
     project_root = args.project_root
+    source_roots = json.loads(args.sources) if args.sources else None
 
     try:
-        files = collect_all_source_files(source_path, project_root=project_root, dependencies=dependencies)
+        files = collect_all_source_files(source_path, project_root=project_root, dependencies=dependencies, source_roots=source_roots)
         for f in files:
             print(f)
     except Exception as e:
