@@ -5,6 +5,25 @@ set -e
 cd "$(dirname "$0")"
 NEXUS=$(pwd)
 
+# Monorepo layout: projects/nexus, projects/ritz
+RITZ_DIR="../ritz"
+RITZ_BUILD="$RITZ_DIR/build.py"
+
+if [ ! -f "$RITZ_BUILD" ]; then
+    echo "Error: Cannot find $RITZ_BUILD"
+    echo "Are you running from the rz monorepo projects/nexus directory?"
+    exit 1
+fi
+
+# Create symlinks for build.py import resolution (if not present)
+# These are gitignored so they won't be committed
+if [ ! -L "ritz" ]; then
+    ln -sf "$RITZ_DIR" ritz
+fi
+if [ ! -L "ritzlib" ]; then
+    ln -sf "$RITZ_DIR/ritzlib" ritzlib
+fi
+
 # Parse arguments
 BUILD_TYPE="debug"
 while [[ $# -gt 0 ]]; do
@@ -32,9 +51,9 @@ echo "Building Nexus ($BUILD_TYPE mode)..."
 
 # Build using ritz build.py
 if [ "$BUILD_TYPE" == "release" ]; then
-    python3 ritz/build.py build . --release
+    python3 "$RITZ_BUILD" build . --release
 else
-    python3 ritz/build.py build .
+    python3 "$RITZ_BUILD" build .
 fi
 
 echo ""
