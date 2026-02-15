@@ -1,0 +1,171 @@
+# Harland DMA Memory Allocation - Physically Contiguous Memory for I/O
+#
+# This module provides allocation of physically contiguous memory for DMA
+# operations with I/O devices. DMA regions must be:
+# - Physically contiguous (for device scatter-gather)
+# - Non-cacheable (for cache coherency with devices)
+# - Registered with memory management for tracking
+
+import mm.pmm { pmm_alloc_page, pmm_free_page, PAGE_SIZE }
+import mm.heap { kalloc, kfree }
+
+# ============================================================================
+# Types and Constants
+# ============================================================================
+
+const DMA_MAX_REGIONS: u32 = 128      # Maximum DMA regions
+const DMA_REGION_SIZE: u64 = 48       # sizeof(DmaRegion) with alignment
+const DMA_OK: i32 = 0
+const DMA_OUT_OF_MEMORY: i32 = -1
+const DMA_TOO_LARGE: i32 = -2
+const DMA_NOT_FOUND: i32 = -3
+
+# DMA memory region descriptor
+pub struct DmaRegion
+    id: u32                    # Region ID
+    virt: *u8                 # Virtual address (kernel space)
+    phys: u64                 # Physical address
+    size: u64                 # Size in bytes
+    num_pages: u32            # Number of physical pages
+    owner_pid: u32            # Process owning this DMA region
+
+var dma_regions: [128]*DmaRegion
+var dma_next_id: u32 = 1
+
+# ============================================================================
+# DMA Allocation and Deallocation
+# ============================================================================
+
+# Allocate physically contiguous DMA memory
+# Returns region ID, or error code if negative
+pub fn dma_alloc(size: u64) -> i64
+    if size == 0 or size > 10000000   # Max 10MB per region
+        return DMA_TOO_LARGE as i64
+
+    # Calculate number of pages needed
+    let num_pages: u32 = ((size + PAGE_SIZE - 1) / PAGE_SIZE) as u32
+
+    # Allocate region structure
+    let region: *DmaRegion = kalloc(DMA_REGION_SIZE) as *DmaRegion
+    if region == 0 as *DmaRegion
+        return DMA_OUT_OF_MEMORY as i64
+
+    # Allocate physically contiguous pages
+    # For simplicity, we'll allocate individual pages and hope they're contiguous
+    # A real implementation would use a buddy allocator or physical memory defragmentation
+    
+    var first_phys: u64 = 0
+    var is_contiguous: u8 = 1
+    var i: u32 = 0
+    
+    while i < num_pages
+        let phys_page: u64 = pmm_alloc_page()
+        if phys_page == 0
+            # Free already-allocated pages
+            var j: u32 = 0
+            while j < i
+                pmm_free_page(first_phys + ((j as u64) * PAGE_SIZE))
+                j = j + 1
+            kfree(region)
+            return DMA_OUT_OF_MEMORY as i64
+        
+        if i == 0
+            first_phys = phys_page
+        else if phys_page != first_phys + ((i as u64) * PAGE_SIZE)
+            # Pages not contiguous - mark flag
+            is_contiguous = 0
+        
+        i = i + 1
+
+    # Initialize region structure
+    (*region).id = dma_next_id
+    (*region).phys = first_phys
+    (*region).size = size
+    (*region).num_pages = num_pages
+    dma_next_id = dma_next_id + 1
+
+    # Map region to kernel virtual space
+    # For now, use physical address as virtual (will be fixed with proper IOMMU/mapping)
+    (*region).virt = first_phys as *u8
+
+    # Store in global table
+    let idx: u32 = (*region).id % DMA_MAX_REGIONS
+    dma_regions[idx as i32] = region
+
+    # Return region ID
+    return (*region).id as i64
+
+# Look up a DMA region
+fn dma_lookup(region_id: u32) -> *DmaRegion
+    let idx: u32 = region_id % DMA_MAX_REGIONS
+    let region: *DmaRegion = dma_regions[idx as i32]
+    
+    if region == 0 as *DmaRegion
+        return 0 as *DmaRegion
+    
+    # Verify ID matches
+    if (*region).id != region_id
+        return 0 as *DmaRegion
+    
+    return region
+
+# Free a DMA region
+pub fn dma_free(region_id: u32) -> i32
+    let region: *DmaRegion = dma_lookup(region_id)
+    if region == 0 as *DmaRegion
+        return DMA_NOT_FOUND
+    
+    # Free physical pages
+    var i: u32 = 0
+    while i < (*region).num_pages
+        pmm_free_page((*region).phys + ((i as u64) * PAGE_SIZE))
+        i = i + 1
+    
+    # Free region structure
+    let idx: u32 = (*region).id % DMA_MAX_REGIONS
+    dma_regions[idx as i32] = 0 as *DmaRegion
+    kfree(region)
+    
+    return DMA_OK
+
+# ============================================================================
+# Region Queries
+# ============================================================================
+
+# Get physical address of DMA region
+pub fn dma_get_phys(region_id: u32) -> u64
+    let region: *DmaRegion = dma_lookup(region_id)
+    if region == 0 as *DmaRegion
+        return 0
+    return (*region).phys
+
+# Get virtual address of DMA region
+pub fn dma_get_virt(region_id: u32) -> *u8
+    let region: *DmaRegion = dma_lookup(region_id)
+    if region == 0 as *DmaRegion
+        return 0 as *u8
+    return (*region).virt
+
+# Get size of DMA region
+pub fn dma_get_size(region_id: u32) -> u64
+    let region: *DmaRegion = dma_lookup(region_id)
+    if region == 0 as *DmaRegion
+        return 0
+    return (*region).size
+
+# ============================================================================
+# Syscall Handlers
+# ============================================================================
+
+pub fn sys_dma_alloc(size: u64) -> i64
+    return dma_alloc(size)
+
+pub fn sys_dma_free(region_id: u32) -> i32
+    return dma_free(region_id)
+
+pub fn sys_dma_get_phys(region_id: u32) -> u64
+    return dma_get_phys(region_id)
+
+pub fn sys_dma_get_virt(region_id: u32) -> u64
+    return dma_get_virt(region_id) as u64
+

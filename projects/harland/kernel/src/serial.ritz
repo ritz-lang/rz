@@ -1,0 +1,212 @@
+# Harland Serial Port Driver (COM1)
+#
+# Provides serial I/O for kernel logging, debugging, and user input.
+
+import io { outb, inb }
+
+# ============================================================================
+# Serial Port Constants
+# ============================================================================
+
+const COM1: u16 = 0x3F8
+const COM1_DATA: u16 = 0x3F8
+const COM1_IER: u16 = 0x3F9      # Interrupt Enable Register
+const COM1_IIR: u16 = 0x3FA      # Interrupt Identification Register
+const COM1_FCR: u16 = 0x3FA      # FIFO Control Register (write-only)
+const COM1_LCR: u16 = 0x3FB      # Line Control Register
+const COM1_MCR: u16 = 0x3FC      # Modem Control Register
+const COM1_LSR: u16 = 0x3FD      # Line Status Register
+const COM1_MSR: u16 = 0x3FE      # Modem Status Register
+
+# Line Status Register bits
+const LSR_DR: u8 = 0x01          # Data Ready - byte available to read
+const LSR_OE: u8 = 0x02          # Overrun Error
+const LSR_PE: u8 = 0x04          # Parity Error
+const LSR_FE: u8 = 0x08          # Framing Error
+const LSR_BI: u8 = 0x10          # Break Indicator
+const LSR_THRE: u8 = 0x20        # Transmitter Holding Register Empty
+const LSR_TEMT: u8 = 0x40        # Transmitter Empty
+const LSR_ERROR: u8 = 0x80       # Error in FIFO
+
+# Interrupt Enable Register bits
+const IER_RDA: u8 = 0x01         # Received Data Available interrupt
+const IER_THRE: u8 = 0x02        # Transmitter Holding Register Empty
+const IER_LSR: u8 = 0x04         # Line Status Register change
+const IER_MSR: u8 = 0x08         # Modem Status Register change
+
+# ============================================================================
+# Serial Input Buffer
+# ============================================================================
+#
+# Circular buffer for storing incoming serial data.
+# This allows interrupt-driven or polled input without data loss.
+
+const SERIAL_BUF_SIZE: i32 = 256
+
+var serial_input_buf: [256]u8
+var serial_input_head: i32 = 0   # Write position
+var serial_input_tail: i32 = 0   # Read position
+var serial_input_count: i32 = 0  # Bytes in buffer
+
+# ============================================================================
+# StrView - Zero-copy string view
+# ============================================================================
+#
+# This enables using "hello" string literals which produce StrView with
+# compile-time embedded length. No null terminator scanning needed.
+
+pub struct StrView
+    ptr: *u8
+    len: i64
+
+# ============================================================================
+# Serial Port Functions
+# ============================================================================
+
+pub fn serial_init() -> i32
+    outb(COM1_IER, 0x00)      # Disable interrupts
+    outb(COM1_LCR, 0x80)      # Enable DLAB
+    outb(COM1_DATA, 0x01)     # Divisor low (115200 baud)
+    outb(COM1_IER, 0x00)      # Divisor high
+    outb(COM1_LCR, 0x03)      # 8N1
+    outb(COM1_FCR, 0xC7)      # Enable FIFO
+    outb(COM1_MCR, 0x0B)      # Enable IRQs, RTS/DSR
+    return 0
+
+pub fn serial_write_byte(c: u8) -> i32
+    while (inb(COM1_LSR) & LSR_THRE) == 0
+        asm x86_64:
+            pause
+    outb(COM1_DATA, c)
+    return 0
+
+# Legacy: null-terminated C string (use c"..." literals)
+pub fn serial_print(s: *u8) -> i32
+    var p: *u8 = s
+    while *p != 0
+        serial_write_byte(*p)
+        p = p + 1
+    return 0
+
+# Explicit length (syscall-style, no null scanning)
+pub fn serial_write(buf: *u8, len: i64) -> i32
+    var i: i64 = 0
+    while i < len
+        serial_write_byte(*(buf + i))
+        i = i + 1
+    return 0
+
+# StrView wrapper (use "..." literals - compile-time length)
+pub fn prints(s: StrView) -> i32
+    return serial_write(s.ptr, s.len)
+
+pub fn serial_print_hex(value: u64) -> i32
+    let hex_chars: *u8 = c"0123456789ABCDEF"
+    var i: i32 = 15
+    while i >= 0
+        let nibble: u8 = ((value >> (i * 4)) & 0xF) as u8
+        serial_write_byte(*(hex_chars + nibble as i64))
+        i = i - 1
+    return 0
+
+pub fn serial_print_dec(value: u64) -> i32
+    if value == 0
+        serial_write_byte(48)
+        return 0
+    var buf: [20]u8
+    var i: i32 = 0
+    var v: u64 = value
+    while v > 0
+        buf[i] = ((v % 10) + 48) as u8
+        v = v / 10
+        i = i + 1
+    while i > 0
+        i = i - 1
+        serial_write_byte(buf[i])
+    return 0
+
+# ============================================================================
+# Convenience Print Functions
+# ============================================================================
+
+pub fn print_hex_prefix(value: u64) -> i32
+    prints("0x")
+    return serial_print_hex(value)
+
+pub fn println(s: StrView) -> i32
+    prints(s)
+    serial_write_byte(10)  # newline
+    return 0
+
+# ============================================================================
+# Serial Input Functions
+# ============================================================================
+
+# Check if data is available to read
+pub fn serial_data_available() -> bool
+    return (inb(COM1_LSR) & LSR_DR) != 0
+
+# Read a single byte (blocking)
+pub fn serial_read_byte() -> u8
+    while not serial_data_available()
+        asm x86_64:
+            pause
+    return inb(COM1_DATA)
+
+# Read a single byte (non-blocking)
+# Returns the byte read, or -1 if no data available
+pub fn serial_read_byte_nonblock() -> i32
+    if not serial_data_available()
+        return -1
+    return inb(COM1_DATA) as i32
+
+# Poll serial port and buffer any available data
+# Called from interrupt handler or main loop
+pub fn serial_poll() -> i32
+    var bytes_read: i32 = 0
+    while serial_data_available()
+        let c: u8 = inb(COM1_DATA)
+        # Add to buffer if not full
+        if serial_input_count < SERIAL_BUF_SIZE
+            serial_input_buf[serial_input_head] = c
+            serial_input_head = (serial_input_head + 1) % SERIAL_BUF_SIZE
+            serial_input_count = serial_input_count + 1
+            bytes_read = bytes_read + 1
+    return bytes_read
+
+# Check how many bytes are in the input buffer
+pub fn serial_input_available() -> i32
+    return serial_input_count
+
+# Read from the input buffer (non-blocking)
+# Returns the byte, or -1 if buffer is empty
+pub fn serial_buf_read() -> i32
+    if serial_input_count == 0
+        return -1
+    let c: u8 = serial_input_buf[serial_input_tail]
+    serial_input_tail = (serial_input_tail + 1) % SERIAL_BUF_SIZE
+    serial_input_count = serial_input_count - 1
+    return c as i32
+
+# Read multiple bytes from input buffer into user buffer
+# Returns number of bytes actually read
+pub fn serial_buf_read_many(buf: *u8, max_len: i64) -> i64
+    var bytes_read: i64 = 0
+    while bytes_read < max_len and serial_input_count > 0
+        let c: u8 = serial_input_buf[serial_input_tail]
+        serial_input_tail = (serial_input_tail + 1) % SERIAL_BUF_SIZE
+        serial_input_count = serial_input_count - 1
+        *(buf + bytes_read) = c
+        bytes_read = bytes_read + 1
+    return bytes_read
+
+# Enable receive interrupts on COM1
+pub fn serial_enable_rx_interrupt() -> i32
+    # Enable Received Data Available interrupt
+    outb(COM1_IER, IER_RDA)
+    return 0
+
+# Disable receive interrupts on COM1
+pub fn serial_disable_rx_interrupt() -> i32
+    outb(COM1_IER, 0x00)
+    return 0

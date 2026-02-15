@@ -1,0 +1,270 @@
+# Harland Capability System - Capability Table
+#
+# Each process has its own capability table that maps handles to
+# kernel objects with associated rights.
+
+import serial { prints, println, serial_print_dec }
+import mm.heap { kalloc, kfree }
+import cap.types { CapHandle, CapEntry, CapInfo, CAP_TYPE_NONE, cap_entry_init, cap_handle_init, cap_handle_invalid }
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+# Maximum capabilities per process
+pub const CAP_TABLE_SIZE: u32 = 64
+
+# Maximum number of capability tables (one per process)
+const MAX_CAP_TABLES: i32 = 64
+
+# ============================================================================
+# Capability Table
+# ============================================================================
+#
+# A per-process table of capability entries.
+
+pub struct CapTable
+    pid: u32                        # Owning process ID
+    entries: [64]CapEntry           # CAP_TABLE_SIZE entries
+    next_generation: u32            # For handle generation
+    active_count: u32               # Number of active capabilities
+    in_use: bool                    # Whether this table is allocated
+    _padding: [3]u8
+
+# ============================================================================
+# Global Table Registry
+# ============================================================================
+#
+# Maps PIDs to capability tables.
+
+var cap_tables: [64]CapTable
+var cap_tables_count: i32 = 0
+
+# ============================================================================
+# Initialization
+# ============================================================================
+
+pub fn cap_table_init() -> i32
+    prints("Initializing capability tables... ")
+
+    var i: i32 = 0
+    while i < MAX_CAP_TABLES
+        cap_tables[i].pid = 0
+        cap_tables[i].next_generation = 1
+        cap_tables[i].active_count = 0
+        cap_tables[i].in_use = false
+
+        var j: i32 = 0
+        while j < 64
+            cap_tables[i].entries[j] = cap_entry_init()
+            j = j + 1
+
+        i = i + 1
+
+    cap_tables_count = 0
+    println("OK")
+    return 0
+
+# ============================================================================
+# Table Allocation
+# ============================================================================
+
+# Allocate a capability table for a new process
+pub fn cap_table_alloc(pid: u32) -> *CapTable
+    var i: i32 = 0
+    while i < MAX_CAP_TABLES
+        if not cap_tables[i].in_use
+            cap_tables[i].pid = pid
+            cap_tables[i].next_generation = 1
+            cap_tables[i].active_count = 0
+            cap_tables[i].in_use = true
+
+            var j: i32 = 0
+            while j < 64
+                cap_tables[i].entries[j] = cap_entry_init()
+                j = j + 1
+
+            cap_tables_count = cap_tables_count + 1
+            return @cap_tables[i]
+        i = i + 1
+
+    return 0 as *CapTable
+
+# Free a capability table when process exits
+pub fn cap_table_free(table: *CapTable) -> i32
+    if table == 0 as *CapTable
+        return -1
+
+    if not (*table).in_use
+        return -1
+
+    (*table).in_use = false
+    (*table).pid = 0
+    (*table).active_count = 0
+    cap_tables_count = cap_tables_count - 1
+    return 0
+
+# Look up a process's capability table
+pub fn cap_table_get(pid: u32) -> *CapTable
+    var i: i32 = 0
+    while i < MAX_CAP_TABLES
+        if cap_tables[i].in_use and cap_tables[i].pid == pid
+            return @cap_tables[i]
+        i = i + 1
+
+    return 0 as *CapTable
+
+# ============================================================================
+# Capability Operations
+# ============================================================================
+
+# Insert a new capability into the table
+# Returns a handle to the capability, or invalid handle on failure
+pub fn cap_table_insert(table: *CapTable, cap_type: u8, rights: u32, object_id: u64) -> CapHandle
+    if table == 0 as *CapTable
+        return cap_handle_invalid()
+
+    # Find a free slot
+    var i: i32 = 0
+    while i < 64
+        if (*table).entries[i].cap_type == CAP_TYPE_NONE
+            # Found a free slot
+            (*table).entries[i].cap_type = cap_type
+            (*table).entries[i].rights = rights
+            (*table).entries[i].object_id = object_id
+            (*table).entries[i].generation = (*table).next_generation
+            (*table).entries[i].flags = 0
+
+            let gen: u32 = (*table).next_generation
+            (*table).next_generation = (*table).next_generation + 1
+            (*table).active_count = (*table).active_count + 1
+
+            return cap_handle_init(i as u32, gen)
+        i = i + 1
+
+    # No free slots
+    return cap_handle_invalid()
+
+# Look up a capability by handle
+# Returns pointer to entry or null if invalid
+pub fn cap_table_lookup(table: *CapTable, handle: CapHandle) -> *CapEntry
+    if table == 0 as *CapTable
+        return 0 as *CapEntry
+
+    if handle.index >= 64
+        return 0 as *CapEntry
+
+    let entry: *CapEntry = @(*table).entries[handle.index as i32]
+
+    # Check generation to detect stale handles
+    if (*entry).generation != handle.generation
+        return 0 as *CapEntry
+
+    # Check if slot is actually in use
+    if (*entry).cap_type == CAP_TYPE_NONE
+        return 0 as *CapEntry
+
+    return entry
+
+# Remove a capability from the table
+pub fn cap_table_remove(table: *CapTable, handle: CapHandle) -> i32
+    let entry: *CapEntry = cap_table_lookup(table, handle)
+    if entry == 0 as *CapEntry
+        return -1
+
+    (*entry).cap_type = CAP_TYPE_NONE
+    (*entry).rights = 0
+    (*entry).object_id = 0
+    # Keep generation so old handles are detected as stale
+    (*table).active_count = (*table).active_count - 1
+    return 0
+
+# ============================================================================
+# Capability Derivation
+# ============================================================================
+
+# Derive a new capability with reduced rights
+# The new capability refers to the same object but with fewer rights
+pub fn cap_table_derive(table: *CapTable, handle: CapHandle, new_rights: u32) -> CapHandle
+    let entry: *CapEntry = cap_table_lookup(table, handle)
+    if entry == 0 as *CapEntry
+        return cap_handle_invalid()
+
+    # Can only derive with equal or fewer rights
+    let effective_rights: u32 = (*entry).rights & new_rights
+
+    # Check if caller has DERIVE right
+    if ((*entry).rights & 16) == 0  # CAP_RIGHT_DERIVE = 16
+        return cap_handle_invalid()
+
+    # Create new capability with restricted rights
+    return cap_table_insert(table, (*entry).cap_type, effective_rights, (*entry).object_id)
+
+# ============================================================================
+# Capability Grant (between processes)
+# ============================================================================
+
+# Grant a capability to another process
+# The recipient gets a copy with optional rights restriction
+pub fn cap_grant(from_table: *CapTable, handle: CapHandle, to_table: *CapTable, new_rights: u32) -> CapHandle
+    if from_table == 0 as *CapTable or to_table == 0 as *CapTable
+        return cap_handle_invalid()
+
+    let entry: *CapEntry = cap_table_lookup(from_table, handle)
+    if entry == 0 as *CapEntry
+        return cap_handle_invalid()
+
+    # Check if caller has GRANT right
+    if ((*entry).rights & 8) == 0  # CAP_RIGHT_GRANT = 8
+        return cap_handle_invalid()
+
+    # Effective rights are intersection of current and requested
+    let effective_rights: u32 = (*entry).rights & new_rights
+
+    # Insert into recipient's table
+    return cap_table_insert(to_table, (*entry).cap_type, effective_rights, (*entry).object_id)
+
+# ============================================================================
+# Query Operations
+# ============================================================================
+
+# Get info about a capability
+pub fn cap_table_info(table: *CapTable, handle: CapHandle, info: *CapInfo) -> i32
+    let entry: *CapEntry = cap_table_lookup(table, handle)
+    if entry == 0 as *CapEntry
+        return -1
+
+    (*info).cap_type = (*entry).cap_type
+    (*info).rights = (*entry).rights
+    (*info).object_id = (*entry).object_id
+    return 0
+
+# Check if a handle has specific rights
+pub fn cap_has_rights(table: *CapTable, handle: CapHandle, required_rights: u32) -> bool
+    let entry: *CapEntry = cap_table_lookup(table, handle)
+    if entry == 0 as *CapEntry
+        return false
+
+    return ((*entry).rights & required_rights) == required_rights
+
+# ============================================================================
+# Debug
+# ============================================================================
+
+pub fn cap_table_debug_print(table: *CapTable) -> i32
+    if table == 0 as *CapTable
+        println("CapTable: NULL")
+        return -1
+
+    prints("CapTable for PID ")
+    serial_print_dec((*table).pid as u64)
+    prints(": ")
+    serial_print_dec((*table).active_count as u64)
+    println(" active capabilities")
+    return 0
+
+pub fn cap_system_debug_print() -> i32
+    prints("Capability tables: ")
+    serial_print_dec(cap_tables_count as u64)
+    println(" allocated")
+    return 0

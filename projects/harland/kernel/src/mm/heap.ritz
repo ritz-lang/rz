@@ -1,0 +1,278 @@
+# Harland Kernel Heap Allocator (First-Fit Free List)
+#
+# Provides kalloc() and kfree() for dynamic memory allocation.
+# Uses a first-fit free list with block splitting.
+#
+# Depends on PMM for physical pages and VMM for mapping them.
+
+import serial { StrView, prints, serial_print_hex, serial_print_dec, println }
+import mm.pmm { PAGE_SIZE, pmm_alloc_page, pmm_free_page }
+import mm.vmm { PTE_WRITABLE, vmm_map_page }
+
+# ============================================================================
+# Heap Configuration
+# ============================================================================
+
+# The boot.s maps 0-1GB physical to both:
+#   - Identity: 0x0 - 0x40000000
+#   - Higher-half: 0xFFFFFFFF80000000 - 0xFFFFFFFFC0000000
+#
+# These use 2MB huge pages, so we can't use 4KB pages within them.
+# For the heap, we use addresses PAST the pre-mapped 1GB region:
+#   0xFFFFFFFFC0000000 - 0xFFFFFFFFD0000000: Kernel heap (256MB)
+#
+# This region is not pre-mapped, so vmm_map_page creates new 4KB page tables.
+
+pub const KERNEL_VIRT_BASE: u64 = 0xFFFFFFFF80000000
+pub const HEAP_START: u64 = 0xFFFFFFFFC0000000
+pub const HEAP_MAX_SIZE: u64 = 0x10000000  # 256MB
+const HEAP_BLOCK_MAGIC: u64 = 0x4845415042434B21
+
+# Block header (placed before each allocation)
+# next: pointer to next free block (0 if end or allocated)
+# size: size of this block including header (minimum 32 bytes)
+# magic: validation magic number
+# flags: bit 0 = free (1) or allocated (0)
+struct HeapBlock
+    next: u64
+    size: u64
+    magic: u64
+    flags: u64
+
+# ============================================================================
+# Heap State
+# ============================================================================
+
+var heap_start: u64 = 0
+var heap_end: u64 = 0
+var heap_free_list: u64 = 0
+var heap_initialized: u8 = 0
+
+# Minimum block size (header + 8 bytes of data)
+const HEAP_MIN_BLOCK: u64 = 40
+
+# ============================================================================
+# Heap Initialization
+# ============================================================================
+
+# Initialize the heap with an initial size
+pub fn heap_init(initial_pages: u64) -> i32
+    if heap_initialized != 0
+        return -1
+
+    heap_start = HEAP_START
+    heap_end = heap_start
+
+    # Map initial pages
+    var i: u64 = 0
+    while i < initial_pages
+        let phys: u64 = pmm_alloc_page()
+        if phys == 0
+            return -1
+        let virt: u64 = heap_end
+        let result: i32 = vmm_map_page(virt, phys, PTE_WRITABLE)
+        if result != 0
+            pmm_free_page(phys)
+            return -1
+        heap_end = heap_end + PAGE_SIZE
+        i = i + 1
+
+    # Create initial free block
+    let block: *HeapBlock = heap_start as *HeapBlock
+    (*block).next = 0
+    (*block).size = heap_end - heap_start
+    (*block).magic = HEAP_BLOCK_MAGIC
+    (*block).flags = 1
+
+    heap_free_list = heap_start
+    heap_initialized = 1
+
+    return 0
+
+# Expand heap by adding more pages
+fn heap_expand(pages: u64) -> i32
+    var i: u64 = 0
+    while i < pages
+        let phys: u64 = pmm_alloc_page()
+        if phys == 0
+            return -1
+        let virt: u64 = heap_end
+        let result: i32 = vmm_map_page(virt, phys, PTE_WRITABLE)
+        if result != 0
+            pmm_free_page(phys)
+            return -1
+        heap_end = heap_end + PAGE_SIZE
+        i = i + 1
+
+    return 0
+
+# ============================================================================
+# Allocation
+# ============================================================================
+
+# Allocate memory from the heap
+pub fn kalloc(size: u64) -> *u8
+    if heap_initialized == 0
+        return 0 as *u8
+
+    # Calculate actual size needed (header + data, aligned to 8 bytes)
+    let aligned_size: u64 = (size + 7) & 18446744073709551608
+    var total_size: u64 = aligned_size + 32
+
+    if total_size < HEAP_MIN_BLOCK
+        total_size = HEAP_MIN_BLOCK
+
+    # Search free list (first fit)
+    var prev: u64 = 0
+    var curr: u64 = heap_free_list
+
+    while curr != 0
+        let block: *HeapBlock = curr as *HeapBlock
+
+        # Validate block
+        if (*block).magic != HEAP_BLOCK_MAGIC
+            return 0 as *u8
+
+        if ((*block).flags & 1) != 0
+            if (*block).size >= total_size
+                # Found a suitable block
+                let remaining: u64 = (*block).size - total_size
+
+                if remaining >= HEAP_MIN_BLOCK
+                    # Split the block
+                    let new_block_addr: u64 = curr + total_size
+                    let new_block: *HeapBlock = new_block_addr as *HeapBlock
+                    (*new_block).next = (*block).next
+                    (*new_block).size = remaining
+                    (*new_block).magic = HEAP_BLOCK_MAGIC
+                    (*new_block).flags = 1
+
+                    (*block).size = total_size
+                    (*block).next = new_block_addr
+
+                    # Update free list
+                    if prev == 0
+                        heap_free_list = new_block_addr
+                    else
+                        let prev_block: *HeapBlock = prev as *HeapBlock
+                        (*prev_block).next = new_block_addr
+                else
+                    # Use entire block
+                    if prev == 0
+                        heap_free_list = (*block).next
+                    else
+                        let prev_block: *HeapBlock = prev as *HeapBlock
+                        (*prev_block).next = (*block).next
+
+                # Mark as allocated
+                (*block).flags = 0
+                (*block).next = 0
+
+                # Return pointer to data (after header)
+                return (curr + 32) as *u8
+
+        prev = curr
+        curr = (*block).next
+
+    # No suitable block found - expand heap
+    let pages_needed: u64 = (total_size + PAGE_SIZE - 1) / PAGE_SIZE
+    let expand_pages: u64 = pages_needed
+    if expand_pages < 4
+        let four: u64 = 4
+        if four > pages_needed
+            let pages_to_expand: u64 = 4
+            let result: i32 = heap_expand(pages_to_expand)
+            if result != 0
+                return 0 as *u8
+        else
+            let result: i32 = heap_expand(pages_needed)
+            if result != 0
+                return 0 as *u8
+    else
+        let result: i32 = heap_expand(pages_needed)
+        if result != 0
+            return 0 as *u8
+
+    # Create new free block at end
+    let new_start: u64 = heap_end - pages_needed * PAGE_SIZE
+    let new_block: *HeapBlock = new_start as *HeapBlock
+    (*new_block).next = 0
+    (*new_block).size = pages_needed * PAGE_SIZE
+    (*new_block).magic = HEAP_BLOCK_MAGIC
+    (*new_block).flags = 1
+
+    # Add to free list
+    if heap_free_list == 0
+        heap_free_list = new_start
+    else
+        # Find end of free list
+        var curr2: u64 = heap_free_list
+        while curr2 != 0
+            let b: *HeapBlock = curr2 as *HeapBlock
+            if (*b).next == 0
+                (*b).next = new_start
+                break
+            curr2 = (*b).next
+
+    # Try allocation again (recursive)
+    return kalloc(size)
+
+# ============================================================================
+# Deallocation
+# ============================================================================
+
+# Free allocated memory
+pub fn kfree(ptr: *u8) -> i32
+    if ptr == (0 as *u8)
+        return -1
+
+    if heap_initialized == 0
+        return -1
+
+    # Get block header
+    let block_addr: u64 = (ptr as u64) - 32
+    let block: *HeapBlock = block_addr as *HeapBlock
+
+    # Validate
+    if (*block).magic != HEAP_BLOCK_MAGIC
+        return -1
+
+    if ((*block).flags & 1) != 0
+        return -1
+
+    # Mark as free
+    (*block).flags = 1
+
+    # Add to free list (at head for simplicity)
+    (*block).next = heap_free_list
+    heap_free_list = block_addr
+
+    # TODO: Coalesce adjacent free blocks
+
+    return 0
+
+# ============================================================================
+# Statistics
+# ============================================================================
+
+# Get heap statistics
+pub fn heap_get_used() -> u64
+    if heap_initialized == 0
+        return 0
+    return heap_end - heap_start
+
+pub fn heap_get_free() -> u64
+    if heap_initialized == 0
+        return 0
+
+    var total_free: u64 = 0
+    var curr: u64 = heap_free_list
+
+    while curr != 0
+        let block: *HeapBlock = curr as *HeapBlock
+        if (*block).magic == HEAP_BLOCK_MAGIC
+            if ((*block).flags & 1) != 0
+                total_free = total_free + (*block).size - 32
+        curr = (*block).next
+
+    return total_free

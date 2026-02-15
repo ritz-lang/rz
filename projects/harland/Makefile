@@ -51,9 +51,18 @@ BOOT_O = $(BOOT_SRCS:.ritz=.o)
 
 all: kernel
 
-# Build kernel using build.py (recommended)
+# Build kernel using ritz builder (recommended)
+# Note: We build twice - first to get user program, then again with user ELF embedded
 kernel:
-	python3 build.py build kernel
+	@mkdir -p build/user
+	@# First build: compile user programs (and a temporary kernel without user ELF)
+	./ritz/ritz build . 2>&1 | grep -v "Skipping user_elf" || true
+	@# Copy user ELF to expected location for embedding
+	@if [ -f build/debug/portable_getpid ]; then cp build/debug/portable_getpid build/user/portable_getpid.elf 2>/dev/null || true; fi
+	@# Second build: now with user ELF embedded
+	./ritz/ritz build . 2>&1 | grep -v "entry point"
+	@# Copy to expected location for ISO creation
+	@cp build/debug/harland.elf build/harland.elf 2>/dev/null || cp build/release/harland.elf build/harland.elf 2>/dev/null || true
 
 # Build bootable ISO with GRUB
 iso: kernel
@@ -112,21 +121,39 @@ $(OVMF_VARS):
 # Run targets
 # ============================================================================
 
-run: $(IMAGE) $(OVMF_VARS)
+# VirtIO block devices
+INITRAMFS = $(BUILD_DIR)/initramfs.qcow2
+STORAGE = $(BUILD_DIR)/storage.qcow2
+
+$(INITRAMFS):
+	qemu-img create -f qcow2 $@ 64M
+
+$(STORAGE):
+	qemu-img create -f qcow2 $@ 512M
+
+run: $(IMAGE) $(OVMF_VARS) $(INITRAMFS) $(STORAGE)
 	$(QEMU) \
 		-drive if=pflash,format=raw,file=$(OVMF_CODE),readonly=on \
 		-drive if=pflash,format=raw,file=$(OVMF_VARS) \
 		-drive file=$(IMAGE),format=qcow2 \
+		-device virtio-blk-pci,drive=initramfs \
+		-drive file=$(INITRAMFS),format=qcow2,if=none,id=initramfs \
+		-device virtio-blk-pci,drive=storage \
+		-drive file=$(STORAGE),format=qcow2,if=none,id=storage \
 		-m 4G \
 		-smp 4 \
 		-serial mon:stdio \
 		-no-reboot
 
-debug: $(IMAGE) $(OVMF_VARS)
+debug: $(IMAGE) $(OVMF_VARS) $(INITRAMFS) $(STORAGE)
 	$(QEMU) \
 		-drive if=pflash,format=raw,file=$(OVMF_CODE),readonly=on \
 		-drive if=pflash,format=raw,file=$(OVMF_VARS) \
 		-drive file=$(IMAGE),format=qcow2 \
+		-device virtio-blk-pci,drive=initramfs \
+		-drive file=$(INITRAMFS),format=qcow2,if=none,id=initramfs \
+		-device virtio-blk-pci,drive=storage \
+		-drive file=$(STORAGE),format=qcow2,if=none,id=storage \
 		-m 4G \
 		-smp 4 \
 		-serial mon:stdio \

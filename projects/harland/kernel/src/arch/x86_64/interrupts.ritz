@@ -93,7 +93,7 @@ pub fn exception_handler(frame: *InterruptFrame) -> i32
     # For page faults, print CR2 (faulting address)
     if (*frame).vector == 14
         var cr2: u64 = 0
-        var cr2_ptr: *u64 = &cr2
+        var cr2_ptr: *u64 = @cr2
         asm x86_64:
             movq %cr2, %rax
             movq {cr2_ptr}, %rcx
@@ -163,6 +163,9 @@ pub fn exception_handler(frame: *InterruptFrame) -> i32
     serial_print_hex((*frame).r15)
     serial_print(c"\n")
 
+    # Print stack trace
+    print_stack_trace((*frame).rbp, (*frame).rip)
+
     serial_print(c"\n*** KERNEL PANIC ***\n")
     serial_print(c"System halted.\n")
 
@@ -188,6 +191,130 @@ pub fn irq_handler(frame: *InterruptFrame) -> i32
         outb_interrupt(0xA0, 0x20)
     outb_interrupt(0x20, 0x20)
 
+    return 0
+
+# ============================================================================
+# Stack Trace
+# ============================================================================
+
+# Stack frame structure for x86_64 SysV ABI
+# Each frame contains:
+#   [rbp+0]  = previous rbp (saved frame pointer)
+#   [rbp+8]  = return address (rip)
+struct StackFrame
+    prev_rbp: *StackFrame
+    return_addr: u64
+
+# Kernel address space boundaries (higher-half kernel)
+const KERNEL_START: u64 = 0xFFFFFFFF80000000
+const KERNEL_END: u64   = 0xFFFFFFFFFFFFFFFF
+
+# Maximum stack frames to print (prevent infinite loops on corrupted stacks)
+const MAX_STACK_FRAMES: u64 = 20
+
+# Check if an address looks like a valid kernel address
+fn is_kernel_address(addr: u64) -> bool
+    # Kernel is in higher-half, above 0xFFFFFFFF80000000
+    # Also accept low addresses for identity-mapped boot code
+    if addr >= KERNEL_START and addr <= KERNEL_END
+        return true
+    # Identity-mapped kernel during early boot (below 16MB typically)
+    if addr >= 0x100000 and addr < 0x10000000
+        return true
+    return false
+
+# Check if a stack frame pointer looks valid
+fn is_valid_frame_ptr(rbp: u64) -> bool
+    # Must be non-null
+    if rbp == 0
+        return false
+    # Must be 8-byte aligned (stack is always aligned)
+    if (rbp & 7) != 0
+        return false
+    # Must be in a reasonable memory range
+    if is_kernel_address(rbp)
+        return true
+    return false
+
+# Print a stack trace starting from the given RBP and RIP
+fn print_stack_trace(rbp: u64, rip: u64) -> i32
+    serial_print(c"\nStack Trace:\n")
+
+    # First frame: the faulting instruction
+    serial_print(c"  #0  ")
+    serial_print_hex(rip)
+    serial_print(c"  <faulting instruction>\n")
+
+    var frame_ptr: u64 = rbp
+    var frame_num: u64 = 1
+
+    while frame_num < MAX_STACK_FRAMES
+        # Validate frame pointer
+        if not is_valid_frame_ptr(frame_ptr)
+            if frame_num == 1
+                serial_print(c"  (no valid stack frames - RBP invalid or stack corrupted)\n")
+            else
+                serial_print(c"  (end of stack trace)\n")
+            break
+
+        # Read the stack frame
+        let frame: *StackFrame = frame_ptr as *StackFrame
+        let return_addr: u64 = (*frame).return_addr
+        let prev_rbp: u64 = (*frame).prev_rbp as u64
+
+        # Validate return address
+        if not is_kernel_address(return_addr)
+            serial_print(c"  (invalid return address - stack may be corrupted)\n")
+            break
+
+        # Print this frame
+        serial_print(c"  #")
+        serial_print_dec_small(frame_num)
+        serial_print(c"  ")
+        serial_print_hex(return_addr)
+        serial_print(c"\n")
+
+        # Move to previous frame
+        # Check for forward progress (stack grows down, so prev_rbp should be >= frame_ptr)
+        if prev_rbp != 0 and prev_rbp <= frame_ptr
+            serial_print(c"  (stack frame pointer going wrong direction - corrupted?)\n")
+            break
+
+        frame_ptr = prev_rbp
+        frame_num = frame_num + 1
+
+    if frame_num >= MAX_STACK_FRAMES
+        serial_print(c"  ... (max frames reached)\n")
+
+    return 0
+
+# Print a small decimal number (for frame numbers 0-99)
+fn serial_print_dec_small(n: u64) -> i32
+    if n >= 10
+        let tens: u8 = ((n / 10) as u8) + 48  # '0' = 48
+        serial_putchar(tens)
+    let ones: u8 = ((n % 10) as u8) + 48
+    serial_putchar(ones)
+    return 0
+
+# Output a single character to serial
+fn serial_putchar(c: u8) -> i32
+    # Wait for transmit buffer empty
+    var status: u8 = 0
+    var ready: bool = false
+    while not ready
+        asm x86_64:
+            movw $0x3FD, %dx
+            inb %dx, %al
+            movb %al, {status}
+        if (status & 0x20) != 0
+            ready = true
+
+    # Send character
+    asm x86_64:
+        movw $0x3F8, %dx
+        movb {c}, %al
+        outb %al, %dx
     return 0
 
 # ============================================================================
@@ -259,3 +386,38 @@ pub fn disable_interrupts() -> i32
     asm x86_64:
         cli
     return 0
+
+# ============================================================================
+# Test Crash Functions (for debugging exception handler)
+# ============================================================================
+
+# Trigger a page fault by dereferencing a null pointer
+# Creates a call chain to test stack trace
+pub fn test_crash_page_fault() -> i32
+    serial_print(c"\n[TEST] Triggering page fault via null pointer dereference...\n")
+    crash_helper_1()
+    return 0
+
+fn crash_helper_1() -> i32
+    crash_helper_2()
+    return 0
+
+fn crash_helper_2() -> i32
+    crash_helper_3()
+    return 0
+
+fn crash_helper_3() -> i32
+    # Dereference address 0 - guaranteed page fault
+    let ptr: *u64 = 0 as *u64
+    let value: u64 = *ptr  # This will fault
+    return value as i32
+
+# Trigger a divide by zero exception
+pub fn test_crash_divide_by_zero() -> i32
+    serial_print(c"\n[TEST] Triggering divide by zero...\n")
+    var zero: i64 = 0
+    var one: i64 = 1
+    # Volatile-like trick to prevent optimizer from detecting div by zero
+    var zero_ptr: *i64 = @zero
+    var result: i64 = one / (*zero_ptr)
+    return result as i32

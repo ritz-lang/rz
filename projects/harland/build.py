@@ -29,12 +29,15 @@ RITZ_DIR = PROJECT_ROOT / "ritz"
 BUILD_DIR = PROJECT_ROOT / "build"
 KERNEL_DIR = PROJECT_ROOT / "kernel"
 BOOT_DIR = PROJECT_ROOT / "boot"
+USER_DIR = PROJECT_ROOT / "user"
 TOOLS_DIR = PROJECT_ROOT / "tools"
 
 # Output files
 KERNEL_ELF = BUILD_DIR / "harland.elf"
 BOOTLOADER_EFI = BUILD_DIR / "BOOTX64.EFI"
 IMAGE_QCOW2 = BUILD_DIR / "harland.qcow2"
+INITRAMFS_QCOW2 = BUILD_DIR / "initramfs.qcow2"  # Kernel modules, drivers
+STORAGE_QCOW2 = BUILD_DIR / "storage.qcow2"      # General storage
 
 # QEMU/OVMF paths
 OVMF_CODE = Path("/usr/share/OVMF/OVMF_CODE.fd")
@@ -42,10 +45,15 @@ OVMF_VARS_TEMPLATE = Path("/usr/share/OVMF/OVMF_VARS.fd")
 OVMF_VARS = BUILD_DIR / "OVMF_VARS.fd"
 
 
-def run(cmd: list[str], check: bool = True, cwd: Optional[Path] = None) -> subprocess.CompletedProcess:
+def run(cmd: list[str], check: bool = True, cwd: Optional[Path] = None, env: Optional[dict] = None) -> subprocess.CompletedProcess:
     """Run a command and return the result."""
     print(f"  $ {' '.join(str(c) for c in cmd)}")
-    result = subprocess.run(cmd, cwd=cwd, capture_output=False)
+    # Merge with current environment if env is provided
+    run_env = None
+    if env:
+        run_env = os.environ.copy()
+        run_env.update(env)
+    result = subprocess.run(cmd, cwd=cwd, capture_output=False, env=run_env)
     if check and result.returncode != 0:
         sys.exit(result.returncode)
     return result
@@ -103,6 +111,54 @@ def find_ritz_compiler() -> Path:
     sys.exit(1)
 
 
+def find_ritz_sources(src_dir: Path) -> list[Path]:
+    """Find all .ritz source files in a directory tree.
+
+    Returns sources in dependency order: base modules first, then main.
+    Excludes broken/WIP modules.
+    """
+    # Modules to exclude (old/broken/WIP)
+    exclude = {
+        "arch/x86_64/syscall.ritz",   # WIP - needs syntax updates
+        "arch/x86_64/interrupts.ritz", # WIP - needs syntax updates
+        "arch/x86_64/idt.ritz",       # WIP - needs syntax updates
+        "arch/x86_64/apic.ritz",      # WIP - needs syntax updates
+        "arch/x86_64/gdt.ritz",       # WIP - needs syntax updates
+        "process.ritz",               # WIP
+    }
+
+    # Explicit module order (dependencies first)
+    # This ensures io.ritz compiles before serial.ritz which imports it
+    ordered_modules = [
+        "io.ritz",                     # Base: port I/O, CPU control (no deps)
+        "serial.ritz",                 # Depends on: io
+        "drivers/pci.ritz",            # Depends on: io, serial
+        "mm/pmm.ritz",                 # Depends on: serial (Physical Memory Manager)
+        "mm/vmm.ritz",                 # Depends on: serial, mm/pmm (Virtual Memory Manager)
+        "mm/heap.ritz",                # Depends on: serial, mm/pmm, mm/vmm (Kernel Heap)
+        "mm/shm.ritz",                 # Depends on: mm/pmm, mm/heap (Shared Memory)
+        "mm/dma.ritz",                 # Depends on: mm/pmm, mm/heap (DMA Allocation)
+        "ipc/message.ritz",            # IPC message structures (no deps)
+        "ipc/channel.ritz",            # Depends on: serial, mm/heap, ipc/message
+        "ipc/syscall.ritz",            # Depends on: serial, ipc/message, ipc/channel
+        "cap/types.ritz",              # Capability type definitions (no deps)
+        "cap/table.ritz",              # Depends on: serial, mm/heap, cap/types
+        "cap/syscall.ritz",            # Depends on: serial, cap/types, cap/table
+        "drivers/virtio/common.ritz",  # VirtIO common layer
+        "drivers/virtio/blk.ritz",     # VirtIO block device driver
+        # arch/x86_64 modules need syntax updates before enabling
+        "main.ritz",                   # Depends on: all of the above
+    ]
+
+    sources = []
+    for mod in ordered_modules:
+        path = src_dir / mod
+        if path.exists():
+            sources.append(path)
+
+    return sources
+
+
 def build_kernel_native(flat: bool = False):  # True higher-half by default
     """Build the kernel using native Ritz with inline assembly.
 
@@ -114,34 +170,46 @@ def build_kernel_native(flat: bool = False):  # True higher-half by default
     ensure_dirs()
 
     ritz = find_ritz_compiler()
-    main_src = KERNEL_DIR / "src" / "main.ritz"
+    kernel_src = KERNEL_DIR / "src"
+    main_src = kernel_src / "main.ritz"
     boot_asm = KERNEL_DIR / "boot.s"
 
     if not main_src.exists():
         print(f"Error: Kernel main not found at {main_src}")
         return False
 
-    # Step 1: Compile main kernel source to LLVM IR
-    ll_path = BUILD_DIR / "kernel" / "main.ll"
-    ll_path.parent.mkdir(parents=True, exist_ok=True)
+    # Find all .ritz source files
+    ritz_sources = find_ritz_sources(kernel_src)
+    ritz_objects = []
 
-    print(f"  Compiling kernel/src/main.ritz")
-    result = run([
-        str(ritz), "compile", str(main_src),
-        "--no-runtime",  # Don't emit _start, we have our own entry
-        "-o", str(ll_path)
-    ], check=False)
+    # Compile each .ritz file to .ll then .o
+    for src_file in ritz_sources:
+        # Compute relative path for output naming
+        rel_path = src_file.relative_to(kernel_src)
+        ll_path = BUILD_DIR / "kernel" / rel_path.with_suffix(".ll")
+        obj_path = BUILD_DIR / "kernel" / rel_path.with_suffix(".o")
 
-    if result.returncode != 0:
-        print("  Ritz compilation failed")
-        return False
+        # Ensure output directory exists
+        ll_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Step 2: Compile LLVM IR to object file (64-bit)
-    ritz_obj = BUILD_DIR / "kernel" / "main.o"
-    print("  Compiling LLVM IR to 64-bit object")
-    run([LLC, "-filetype=obj", "-mtriple=x86_64-none-elf",
-         "-relocation-model=static", "-code-model=kernel",
-         str(ll_path), "-o", str(ritz_obj)])
+        print(f"  Compiling {rel_path}")
+        result = run([
+            str(ritz), "compile", str(src_file),
+            "--no-runtime",  # Don't emit _start, we have our own entry
+            "-o", str(ll_path)
+        ], check=False, env={"RITZ_PATH": str(kernel_src)})
+
+        if result.returncode != 0:
+            print(f"  Ritz compilation failed for {rel_path}")
+            return False
+
+        # Compile LLVM IR to object file (64-bit)
+        print(f"  Compiling {rel_path.with_suffix('.ll')} to object")
+        run([LLC, "-filetype=obj", "-mtriple=x86_64-none-elf",
+             "-relocation-model=static", "-code-model=kernel",
+             str(ll_path), "-o", str(obj_path)])
+
+        ritz_objects.append(obj_path)
 
     # Step 3: Assemble boot.s
     # The boot.s contains both 32-bit entry (from GRUB) and 64-bit code
@@ -205,6 +273,26 @@ def build_kernel_native(flat: bool = False):  # True higher-half by default
         user_obj = None
         print("  Warning: user_program.s not found")
 
+    # Step 3g: Assemble user_elf.s (embedded ELF binary for ELF loader test)
+    user_elf_asm = KERNEL_DIR / "user_elf.s"
+    user_elf_stub_asm = KERNEL_DIR / "user_elf_stub.s"
+    user_elf_obj = BUILD_DIR / "kernel" / "user_elf.o"
+    if user_elf_asm.exists():
+        # Check if the ELF binary exists first
+        user_elf_bin = BUILD_DIR / "user" / "portable_getpid.elf"
+        if user_elf_bin.exists():
+            print("  Assembling user_elf.s (embedded Ritz ELF binary)")
+            run(["as", "--64", "-o", str(user_elf_obj), str(user_elf_asm)])
+        elif user_elf_stub_asm.exists():
+            # Use stub to provide symbols for linking
+            print("  Assembling user_elf_stub.s (stub for linking)")
+            run(["as", "--64", "-o", str(user_elf_obj), str(user_elf_stub_asm)])
+        else:
+            user_elf_obj = None
+            print("  Skipping user_elf.s (no build/user/portable_getpid.elf)")
+    else:
+        user_elf_obj = None
+
     # Step 4: Link
     print("  Linking kernel...")
     import shutil
@@ -239,7 +327,11 @@ def build_kernel_native(flat: bool = False):  # True higher-half by default
         link_objs.append(str(syscall_obj))
     if user_obj and user_obj.exists():
         link_objs.append(str(user_obj))
-    link_objs.append(str(ritz_obj))
+    if user_elf_obj and user_elf_obj.exists():
+        link_objs.append(str(user_elf_obj))
+    # Add all compiled Ritz objects
+    for obj in ritz_objects:
+        link_objs.append(str(obj))
 
     run([
         linker,
@@ -450,6 +542,111 @@ def create_placeholder_efi(path: Path):
     print(f"  Warning: Placeholder EFI is not functional")
 
 
+def build_userspace():
+    """Build userspace programs."""
+    print("\n=== Building Userspace Programs ===")
+    ensure_dirs()
+    (BUILD_DIR / "user").mkdir(exist_ok=True)
+
+    ritz = find_ritz_compiler()
+
+    # Find all userspace programs (directories under user/)
+    if not USER_DIR.exists():
+        print("  No user/ directory found")
+        return True
+
+    programs = [d for d in USER_DIR.iterdir() if d.is_dir() and (d / "src" / "main.ritz").exists()]
+
+    if not programs:
+        print("  No userspace programs found")
+        return True
+
+    success = True
+    for prog_dir in programs:
+        prog_name = prog_dir.name
+        src_file = prog_dir / "src" / "main.ritz"
+        out_dir = BUILD_DIR / "user" / prog_name
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        ll_path = out_dir / "main.ll"
+        obj_path = out_dir / "main.o"
+        elf_path = BUILD_DIR / "user" / f"{prog_name}.elf"
+
+        print(f"  Building {prog_name}...")
+
+        # Step 1: Compile Ritz to LLVM IR
+        # Userspace programs need --no-runtime (we provide our own syscall wrappers)
+        result = run([
+            str(ritz), "compile", str(src_file),
+            "--no-runtime",
+            "-o", str(ll_path)
+        ], check=False, env={"RITZ_PATH": str(prog_dir / "src")})
+
+        if result.returncode != 0:
+            print(f"    Ritz compilation failed for {prog_name}")
+            success = False
+            continue
+
+        # Step 2: Compile LLVM IR to object file
+        # Use static relocation model for simple userspace programs
+        run([LLC, "-filetype=obj", "-mtriple=x86_64-none-elf",
+             "-relocation-model=static",
+             str(ll_path), "-o", str(obj_path)])
+
+        # Step 3: Link into a position-independent ELF
+        # We use a simple linker script for userspace
+        user_linker_script = USER_DIR / "user.ld"
+        if not user_linker_script.exists():
+            # Create a simple userspace linker script
+            user_linker_script.write_text("""/* Harland userspace linker script */
+ENTRY(main)
+
+SECTIONS {
+    . = 0x400000;  /* Standard userspace base address */
+
+    .text : {
+        *(.text*)
+    }
+
+    .rodata : {
+        *(.rodata*)
+    }
+
+    .data : {
+        *(.data*)
+    }
+
+    .bss : {
+        *(.bss*)
+        *(COMMON)
+    }
+
+    /DISCARD/ : {
+        *(.comment)
+        *(.note*)
+    }
+}
+""")
+
+        import shutil
+        linker = LLD if shutil.which(LLD) else "ld"
+        run([
+            linker,
+            "-T", str(user_linker_script),
+            "-o", str(elf_path),
+            str(obj_path),
+        ], check=False)
+
+        if elf_path.exists():
+            print(f"    Built: {elf_path}")
+            run(["file", str(elf_path)], check=False)
+        else:
+            print(f"    Linking failed for {prog_name}")
+            success = False
+
+    return success
+
+
 def build_image():
     """Build the qcow2 disk image."""
     print("\n=== Building Disk Image ===")
@@ -480,6 +677,9 @@ def cmd_build(args):
     if target == 'kernel' or target == 'all':
         build_kernel()
 
+    if target == 'user' or target == 'all':
+        build_userspace()
+
     if target == 'boot' or target == 'all':
         build_bootloader()
 
@@ -494,6 +694,22 @@ def cmd_run(args):
     if not IMAGE_QCOW2.exists():
         print("Image not found, building...")
         build_image()
+
+    # Create initramfs disk if it doesn't exist (for drivers, modules)
+    if not INITRAMFS_QCOW2.exists():
+        print("Creating initramfs disk (64MB)...")
+        subprocess.run([
+            "qemu-img", "create", "-f", "qcow2",
+            str(INITRAMFS_QCOW2), "64M"
+        ], check=True)
+
+    # Create storage disk if it doesn't exist (general purpose)
+    if not STORAGE_QCOW2.exists():
+        print("Creating storage disk (512MB)...")
+        subprocess.run([
+            "qemu-img", "create", "-f", "qcow2",
+            str(STORAGE_QCOW2), "512M"
+        ], check=True)
 
     # Copy OVMF vars if needed
     if not OVMF_VARS.exists() and OVMF_VARS_TEMPLATE.exists():
@@ -510,6 +726,11 @@ def cmd_run(args):
         "-drive", f"if=pflash,format=raw,file={OVMF_CODE},readonly=on",
         "-drive", f"if=pflash,format=raw,file={OVMF_VARS}",
         "-drive", f"file={IMAGE_QCOW2},format=qcow2",
+        # VirtIO block devices for initramfs and storage
+        "-device", "virtio-blk-pci,drive=initramfs",
+        "-drive", f"file={INITRAMFS_QCOW2},format=qcow2,if=none,id=initramfs",
+        "-device", "virtio-blk-pci,drive=storage",
+        "-drive", f"file={STORAGE_QCOW2},format=qcow2,if=none,id=storage",
         "-m", "4G",
         "-smp", "4",
         "-serial", "mon:stdio",
@@ -560,7 +781,7 @@ def main():
         "target",
         nargs="?",
         default="all",
-        choices=["kernel", "boot", "image", "all"],
+        choices=["kernel", "user", "boot", "image", "all"],
         help="What to build"
     )
     build_parser.set_defaults(func=cmd_build)

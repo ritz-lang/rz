@@ -1,0 +1,251 @@
+# Harland Shell
+#
+# A minimal userspace shell that runs on the Harland kernel.
+# Uses syscalls for I/O (read from stdin, write to stdout).
+
+# ============================================================================
+# Syscall Interface
+# ============================================================================
+#
+# These match the kernel's syscall numbers in main.ritz
+
+const SYS_READ: u64 = 0
+const SYS_WRITE: u64 = 1
+const SYS_EXIT: u64 = 20
+const SYS_YIELD: u64 = 21
+const SYS_GETPID: u64 = 22
+
+# Raw syscall wrappers using inline assembly
+fn syscall0(num: u64) -> i64
+    var result: i64 = 0
+    asm x86_64:
+        movq {num}, %rax
+        syscall
+        movq %rax, {result}
+    return result
+
+fn syscall1(num: u64, arg1: u64) -> i64
+    var result: i64 = 0
+    asm x86_64:
+        movq {num}, %rax
+        movq {arg1}, %rdi
+        syscall
+        movq %rax, {result}
+    return result
+
+fn syscall3(num: u64, arg1: u64, arg2: u64, arg3: u64) -> i64
+    var result: i64 = 0
+    asm x86_64:
+        movq {num}, %rax
+        movq {arg1}, %rdi
+        movq {arg2}, %rsi
+        movq {arg3}, %rdx
+        syscall
+        movq %rax, {result}
+    return result
+
+# ============================================================================
+# I/O Functions
+# ============================================================================
+
+# Write to stdout (fd 1)
+fn write(buf: *u8, len: i64) -> i64
+    return syscall3(SYS_WRITE, 1, buf as u64, len as u64)
+
+# Read from stdin (fd 0)
+fn read(buf: *u8, len: i64) -> i64
+    return syscall3(SYS_READ, 0, buf as u64, len as u64)
+
+# Exit the process
+fn exit(code: i64) -> i64
+    return syscall1(SYS_EXIT, code as u64)
+
+# Yield to other tasks
+fn yield_cpu() -> i64
+    return syscall0(SYS_YIELD)
+
+# ============================================================================
+# String Utilities
+# ============================================================================
+
+fn strlen(s: *u8) -> i64
+    var len: i64 = 0
+    while *(s + len) != 0
+        len = len + 1
+    return len
+
+fn puts(s: *u8) -> i64
+    return write(s, strlen(s))
+
+fn println(s: *u8) -> i64
+    puts(s)
+    let newline: u8 = 10
+    return write(@newline, 1)
+
+# Compare two strings (returns 0 if equal)
+fn strcmp(a: *u8, b: *u8) -> i32
+    var i: i64 = 0
+    while true
+        let ca: u8 = *(a + i)
+        let cb: u8 = *(b + i)
+        if ca != cb
+            return (ca as i32) - (cb as i32)
+        if ca == 0
+            return 0
+        i = i + 1
+    return 0
+
+# Compare first n characters
+fn strncmp(a: *u8, b: *u8, n: i64) -> i32
+    var i: i64 = 0
+    while i < n
+        let ca: u8 = *(a + i)
+        let cb: u8 = *(b + i)
+        if ca != cb
+            return (ca as i32) - (cb as i32)
+        if ca == 0
+            return 0
+        i = i + 1
+    return 0
+
+# ============================================================================
+# Shell Commands
+# ============================================================================
+
+fn cmd_help() -> i32
+    println(c"Available commands:")
+    println(c"  help    - Show this help")
+    println(c"  echo    - Echo arguments")
+    println(c"  pid     - Show process ID")
+    println(c"  exit    - Exit the shell")
+    return 0
+
+fn cmd_pid() -> i32
+    let pid: i64 = syscall0(SYS_GETPID)
+    puts(c"PID: ")
+    # Simple number printing (single digit for now)
+    var digit: u8 = (48 + pid) as u8
+    write(@digit, 1)
+    println(c"")
+    return 0
+
+fn cmd_echo(line: *u8, cmd_len: i64) -> i32
+    # Skip "echo " prefix (5 chars)
+    if cmd_len > 5
+        let args: *u8 = line + 5
+        let args_len: i64 = cmd_len - 5
+        write(args, args_len)
+    println(c"")
+    return 0
+
+# ============================================================================
+# Line Editor
+# ============================================================================
+
+const MAX_LINE: i64 = 256
+
+var line_buffer: [256]u8
+var line_pos: i64 = 0
+
+fn line_clear() -> i32
+    line_pos = 0
+    var i: i64 = 0
+    while i < MAX_LINE
+        line_buffer[i as i32] = 0
+        i = i + 1
+    return 0
+
+fn line_add_char(c: u8) -> i32
+    if line_pos < MAX_LINE - 1
+        line_buffer[line_pos as i32] = c
+        line_pos = line_pos + 1
+    return 0
+
+fn line_backspace() -> i32
+    if line_pos > 0
+        line_pos = line_pos - 1
+        line_buffer[line_pos as i32] = 0
+        # Erase character on terminal: backspace, space, backspace
+        let bs: u8 = 8   # Backspace character
+        let sp: u8 = 32  # Space character
+        write(@bs, 1)
+        write(@sp, 1)
+        write(@bs, 1)
+    return 0
+
+# ============================================================================
+# Shell Main Loop
+# ============================================================================
+
+fn process_line() -> i32
+    # Skip empty lines
+    if line_pos == 0
+        return 0
+
+    # Null-terminate
+    line_buffer[line_pos as i32] = 0
+
+    let line: *u8 = @line_buffer[0]
+
+    # Match commands
+    if strcmp(line, c"help") == 0
+        cmd_help()
+    else if strcmp(line, c"pid") == 0
+        cmd_pid()
+    else if strcmp(line, c"exit") == 0
+        println(c"Goodbye!")
+        exit(0)
+    else if strncmp(line, c"echo ", 5) == 0
+        cmd_echo(line, line_pos)
+    else if strcmp(line, c"echo") == 0
+        println(c"")
+    else
+        puts(c"Unknown command: ")
+        println(line)
+        println(c"Type 'help' for available commands.")
+
+    return 0
+
+pub fn main() -> i32
+    println(c"")
+    println(c"========================================")
+    println(c"  Harland Shell v0.1")
+    println(c"========================================")
+    println(c"Type 'help' for available commands.")
+    println(c"")
+
+    var running: bool = true
+    var read_buf: [1]u8
+
+    while running
+        # Print prompt
+        puts(c"harland> ")
+        line_clear()
+
+        # Read line
+        var reading_line: bool = true
+        while reading_line
+            # Try to read a character
+            let n: i64 = read(@read_buf[0], 1)
+
+            if n > 0
+                let c: u8 = read_buf[0]
+
+                # Enter key (CR or LF)
+                if c == 13 or c == 10
+                    println(c"")
+                    process_line()
+                    reading_line = false
+                # Backspace (0x7F or 0x08)
+                else if c == 127 or c == 8
+                    line_backspace()
+                # Printable character
+                else if c >= 32 and c < 127
+                    line_add_char(c)
+                    # Echo the character
+                    write(@c, 1)
+            else
+                # No input available, yield CPU
+                yield_cpu()
+
+    return 0

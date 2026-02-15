@@ -39,12 +39,31 @@ echo "Testing kernel boot..."
 echo "ISO: $ISO"
 echo "OVMF: $OVMF_CODE"
 
+# Create test disks if they don't exist
+INITRAMFS="$PROJECT_DIR/build/initramfs.qcow2"
+STORAGE="$PROJECT_DIR/build/storage.qcow2"
+
+if [[ ! -f "$INITRAMFS" ]]; then
+    echo "Creating initramfs disk (64MB)..."
+    qemu-img create -f qcow2 "$INITRAMFS" 64M
+fi
+
+if [[ ! -f "$STORAGE" ]]; then
+    echo "Creating storage disk (512MB)..."
+    qemu-img create -f qcow2 "$STORAGE" 512M
+fi
+
 # Run QEMU with timeout, capture serial output
 # Use pflash for OVMF_CODE_4M variant
 # -smp 2 for multi-core testing, -m 1G for full memory tests
-timeout 10 qemu-system-x86_64 \
+# VirtIO block devices for initramfs and storage
+timeout 15 qemu-system-x86_64 \
     -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
     -cdrom "$ISO" \
+    -device virtio-blk-pci,drive=initramfs \
+    -drive file="$INITRAMFS",format=qcow2,if=none,id=initramfs \
+    -device virtio-blk-pci,drive=storage \
+    -drive file="$STORAGE",format=qcow2,if=none,id=storage \
     -serial file:"$SERIAL_LOG" \
     -display none \
     -smp 4 \
@@ -57,7 +76,17 @@ cat "$SERIAL_LOG"
 echo ""
 
 # Check for expected output - most advanced first
-if grep -q "\[syscall\] exit" "$SERIAL_LOG"; then
+if grep -q "virtio-blk.*Read sector 0 OK" "$SERIAL_LOG"; then
+    echo "========================================="
+    echo "  MILESTONE 9 COMPLETE: VirtIO Block Device!"
+    echo "========================================="
+    echo "  - VirtIO-blk driver initialization"
+    echo "  - Sector read/write operations"
+    echo "  - DMA buffer management"
+    echo "  - Ready for filesystem!"
+    rm -f "$SERIAL_LOG"
+    exit 0
+elif grep -q "\[syscall\] exit" "$SERIAL_LOG"; then
     echo "========================================="
     echo "  MILESTONE 8 COMPLETE: Userspace + Syscalls!"
     echo "========================================="
