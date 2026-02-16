@@ -318,30 +318,6 @@ class DependencySpec:
     path: Path          # Path to dependency root (absolute)
     sources: list[str]  # Source directories within dependency (default: ["src"])
 
-
-@dataclass
-class BinaryConfig:
-    """Complete configuration for a binary target.
-
-    Supports both standard hosted builds and freestanding kernel builds.
-    """
-    name: str                    # Binary name
-    src_path: Path               # Main source file
-    additional_sources: list[Path]  # Extra sources (deprecated)
-    freestanding: bool = False   # If True, no runtime, custom linker
-    target: str = ""             # Target triple (e.g., "x86_64-none-elf")
-    linker_script: Path | None = None  # Custom linker script
-    asm_files: list[Path] | None = None  # Assembly files to compile
-    code_model: str = ""         # LLC code model (e.g., "kernel")
-    no_red_zone: bool = False    # Disable red zone (for kernels)
-    bin_sources: list[str] | None = None  # Per-binary source directories
-
-    def __post_init__(self):
-        if self.asm_files is None:
-            self.asm_files = []
-        if self.bin_sources is None:
-            self.bin_sources = []
-
     def resolve_import(self, module_parts: list[str]) -> Path | None:
         """Resolve an import path within this dependency.
 
@@ -368,6 +344,30 @@ class BinaryConfig:
                 return candidate
 
         return None
+
+
+@dataclass
+class BinaryConfig:
+    """Complete configuration for a binary target.
+
+    Supports both standard hosted builds and freestanding kernel builds.
+    """
+    name: str                    # Binary name
+    src_path: Path               # Main source file
+    additional_sources: list[Path]  # Extra sources (deprecated)
+    freestanding: bool = False   # If True, no runtime, custom linker
+    target: str = ""             # Target triple (e.g., "x86_64-none-elf")
+    linker_script: Path | None = None  # Custom linker script
+    asm_files: list[Path] | None = None  # Assembly files to compile
+    code_model: str = ""         # LLC code model (e.g., "kernel")
+    no_red_zone: bool = False    # Disable red zone (for kernels)
+    bin_sources: list[str] | None = None  # Per-binary source directories
+
+    def __post_init__(self):
+        if self.asm_files is None:
+            self.asm_files = []
+        if self.bin_sources is None:
+            self.bin_sources = []
 
 
 def parse_dependencies(config: dict, pkg_dir: Path) -> dict[str, DependencySpec]:
