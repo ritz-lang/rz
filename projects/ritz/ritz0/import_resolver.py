@@ -196,6 +196,9 @@ class ImportResolver:
         For each directory in RITZ_PATH that has a ritz.toml, parse it and
         add the project as a dependency namespace. This allows imports like
         'squeeze.gzip' to resolve correctly when squeeze is in RITZ_PATH.
+
+        Also checks subdirectories of RITZ_PATH entries, so if RITZ_PATH
+        contains '/path/to/projects', we'll find '/path/to/projects/ritzunit'.
         """
         try:
             import tomllib
@@ -205,16 +208,15 @@ class ImportResolver:
             except ImportError:
                 return  # Can't parse TOML, skip auto-detection
 
-        for import_path in self.import_paths:
-            # Skip if already registered as a dependency
-            dep_name = import_path.name
+        def register_project(project_path: Path):
+            """Register a project from its path if it has ritz.toml."""
+            dep_name = project_path.name
             if dep_name in self.dependencies:
-                continue
+                return
 
-            # Check for ritz.toml
-            toml_path = import_path / "ritz.toml"
+            toml_path = project_path / "ritz.toml"
             if not toml_path.exists():
-                continue
+                return
 
             try:
                 with open(toml_path, "rb") as f:
@@ -234,11 +236,23 @@ class ImportResolver:
                 # Register as a dependency
                 self.dependencies[dep_name] = DependencyMapping(
                     name=dep_name,
-                    path=import_path,
+                    path=project_path,
                     sources=sources
                 )
             except Exception:
                 pass  # Skip on any error
+
+        for import_path in self.import_paths:
+            # First try the import_path itself
+            register_project(import_path)
+
+            # Also check subdirectories (for workspace-style RITZ_PATH entries)
+            # This handles the case where RITZ_PATH contains '/path/to/projects'
+            # and we want to find '/path/to/projects/ritzunit', etc.
+            if import_path.is_dir():
+                for subdir in import_path.iterdir():
+                    if subdir.is_dir():
+                        register_project(subdir)
 
     # ============================================================================
     # Export Map Building
