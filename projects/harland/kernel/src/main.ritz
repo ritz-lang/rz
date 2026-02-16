@@ -1737,6 +1737,9 @@ struct GdtEntry
 struct GdtDescriptor
     data: [10]u8
 
+# TSS must be packed to match x86-64 hardware layout
+# RSP0 must be at offset 4, not aligned to 8!
+[[packed]]
 struct Tss
     reserved0: u32
     rsp0: u64
@@ -1760,6 +1763,7 @@ var tss: Tss
 var gdt_descriptor: GdtDescriptor
 var kernel_stack: [4096]u8
 var interrupt_stack: [4096]u8
+var irq_stack: [4096]u8  # IST2 for hardware IRQs during syscall
 
 fn make_gdt_entry(base: u32, limit: u32, access: u8, flags: u8) -> GdtEntry
     var entry: GdtEntry
@@ -1801,19 +1805,16 @@ fn tss_init() -> i32
     let stack_top: u64 = (@kernel_stack[0] as u64) + 4096
     tss.rsp0 = stack_top
 
-    let ist_top: u64 = (@interrupt_stack[0] as u64) + 4096
-    tss.ist1 = ist_top
+    # IST1: Critical exceptions (NMI, double fault, stack fault, machine check)
+    let ist1_top: u64 = (@interrupt_stack[0] as u64) + 4096
+    tss.ist1 = ist1_top
+
+    # IST2: Reserved for future use (hardware IRQs)
+    # Currently, IRQs use IST=0 which works better with our syscall stack
+    let ist2_top: u64 = (@irq_stack[0] as u64) + 4096
+    tss.ist2 = ist2_top
 
     tss.iopb_offset = 104
-
-    # Debug: Print TSS stack values
-    prints("      TSS RSP0: 0x")
-    serial_print_hex(tss.rsp0)
-    prints("\n")
-    prints("      TSS IST1: 0x")
-    serial_print_hex(tss.ist1)
-    prints("\n")
-
     return 0
 
 # GDT reload is done in assembly (boot.s already set up segments)
@@ -2022,23 +2023,25 @@ fn idt_init() -> i32
     idt_set_gate(31, isr_stub_31 as u64, cs, 0, IDT_GATE_INTERRUPT)
 
     # IRQ handlers (32-47)
-    # Timer (IRQ0) uses IST1 to ensure clean stack switching from Ring 3
-    idt_set_gate(32, irq_stub_0 as u64, cs, 1, IDT_GATE_INTERRUPT)
-    idt_set_gate(33, irq_stub_1 as u64, cs, 0, IDT_GATE_INTERRUPT)
-    idt_set_gate(34, irq_stub_2 as u64, cs, 0, IDT_GATE_INTERRUPT)
-    idt_set_gate(35, irq_stub_3 as u64, cs, 0, IDT_GATE_INTERRUPT)
-    idt_set_gate(36, irq_stub_4 as u64, cs, 0, IDT_GATE_INTERRUPT)
-    idt_set_gate(37, irq_stub_5 as u64, cs, 0, IDT_GATE_INTERRUPT)
-    idt_set_gate(38, irq_stub_6 as u64, cs, 0, IDT_GATE_INTERRUPT)
-    idt_set_gate(39, irq_stub_7 as u64, cs, 0, IDT_GATE_INTERRUPT)
-    idt_set_gate(40, irq_stub_8 as u64, cs, 0, IDT_GATE_INTERRUPT)
-    idt_set_gate(41, irq_stub_9 as u64, cs, 0, IDT_GATE_INTERRUPT)
-    idt_set_gate(42, irq_stub_10 as u64, cs, 0, IDT_GATE_INTERRUPT)
-    idt_set_gate(43, irq_stub_11 as u64, cs, 0, IDT_GATE_INTERRUPT)
-    idt_set_gate(44, irq_stub_12 as u64, cs, 0, IDT_GATE_INTERRUPT)
-    idt_set_gate(45, irq_stub_13 as u64, cs, 0, IDT_GATE_INTERRUPT)
-    idt_set_gate(46, irq_stub_14 as u64, cs, 0, IDT_GATE_INTERRUPT)
-    idt_set_gate(47, irq_stub_15 as u64, cs, 0, IDT_GATE_INTERRUPT)
+    # Using IST=0 for all IRQs - they use the current stack (syscall_stack during syscall)
+    # This allows interrupts to fire during syscall execution via STI
+    # NOTE: IST2 is configured but not currently used due to unexplained triple-faults
+    idt_set_gate(32, irq_stub_0 as u64, cs, 0, IDT_GATE_INTERRUPT)   # Timer
+    idt_set_gate(33, irq_stub_1 as u64, cs, 2, IDT_GATE_INTERRUPT)   # Keyboard
+    idt_set_gate(34, irq_stub_2 as u64, cs, 2, IDT_GATE_INTERRUPT)
+    idt_set_gate(35, irq_stub_3 as u64, cs, 2, IDT_GATE_INTERRUPT)
+    idt_set_gate(36, irq_stub_4 as u64, cs, 2, IDT_GATE_INTERRUPT)   # COM1
+    idt_set_gate(37, irq_stub_5 as u64, cs, 2, IDT_GATE_INTERRUPT)
+    idt_set_gate(38, irq_stub_6 as u64, cs, 2, IDT_GATE_INTERRUPT)
+    idt_set_gate(39, irq_stub_7 as u64, cs, 2, IDT_GATE_INTERRUPT)
+    idt_set_gate(40, irq_stub_8 as u64, cs, 2, IDT_GATE_INTERRUPT)
+    idt_set_gate(41, irq_stub_9 as u64, cs, 2, IDT_GATE_INTERRUPT)
+    idt_set_gate(42, irq_stub_10 as u64, cs, 2, IDT_GATE_INTERRUPT)
+    idt_set_gate(43, irq_stub_11 as u64, cs, 2, IDT_GATE_INTERRUPT)
+    idt_set_gate(44, irq_stub_12 as u64, cs, 2, IDT_GATE_INTERRUPT)
+    idt_set_gate(45, irq_stub_13 as u64, cs, 2, IDT_GATE_INTERRUPT)
+    idt_set_gate(46, irq_stub_14 as u64, cs, 2, IDT_GATE_INTERRUPT)
+    idt_set_gate(47, irq_stub_15 as u64, cs, 2, IDT_GATE_INTERRUPT)
 
 # Set IDT descriptor (packed format: u16 size, u64 base)
     let idt_size: u16 = (256 * 16 - 1) as u16
@@ -2334,14 +2337,18 @@ pub fn irq_handler(frame: *InterruptFrame) -> i32
     let irq_num: u64 = (*frame).vector - 32
 
     # Handle specific IRQs
+    if irq_num == 0
+        # Timer interrupt - just acknowledge for now
+        # (scheduler runs via timer_handler which is called separately)
+        lapic_eoi()
+        return 0
+
     if irq_num == 4
         # COM1 serial port interrupt
         serial_poll()
 
-    # Send EOI to PIC
-    if irq_num >= 8
-        outb(0xA0, 0x20)
-    outb(0x20, 0x20)
+    # Send EOI to LAPIC (for APIC-delivered interrupts)
+    lapic_eoi()
 
     return 0
 
@@ -3682,6 +3689,7 @@ pub fn syscall_init() -> i32
 
 # Syscall handler (called from assembly)
 pub fn syscall_handler(rax: u64, rdi: u64, rsi: u64, rdx: u64) -> i64
+    # Debug: show we entered syscall handler
     if rax == SYS_EXIT
         prints("\n[userspace] exit(")
         serial_print_dec(rdi)

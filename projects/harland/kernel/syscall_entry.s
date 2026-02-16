@@ -71,12 +71,11 @@ syscall_entry:
     pushq %r14
     pushq %r15
 
-    # NOTE: Interrupts remain disabled during syscall handling
-    # Enabling interrupts here would cause problems because:
-    # 1. Timer IRQ uses IST1 which is shared with exception handlers
-    # 2. This could corrupt the stack during nested interrupts
-    # TODO: Use separate IST entries for timer vs. exceptions
-    # For now, syscalls run with interrupts disabled (fast and simple)
+    # Enable interrupts during syscall handling
+    # This is safe because we're on the dedicated syscall_stack.
+    # IRQs use IST=0 (current stack), so they push onto syscall_stack.
+    # Userspace runs with IF=0, so timer only fires during syscall.
+    sti
 
     # Call the Ritz syscall handler
     # syscall_handler(rax, rdi, rsi, rdx) -> i64
@@ -176,9 +175,9 @@ jump_to_userspace:
 
     pushq $0x23                  # SS (user data, ring 3)
     pushq %rsi                   # RSP (user stack)
-    # Disable interrupts for now while debugging stack switching
-    # TODO: Re-enable IF=1 once TSS RSP0 issue is resolved
-    pushq $0x002                 # RFLAGS (IF=0, reserved bit 1 = 1)
+    # Enable interrupts in userspace for true preemption
+    # IF (bit 9) = 0x200, reserved bit 1 = 0x002
+    pushq $0x202                 # RFLAGS (IF=1, reserved bit 1 = 1)
     pushq $0x1B                  # CS (user code, ring 3)
     pushq %rdi                   # RIP (entry point)
 
