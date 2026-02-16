@@ -571,10 +571,14 @@ def get_binaries(pkg_dir: Path, config: dict) -> list[BinaryConfig]:
         return []  # Test-only packages have no binaries
 
     # Get package-level sources configuration (RFC #109)
-    # Check both top-level and inside [package] (TOML puts keys in current section)
+    # Check top-level, [package], and [build] sections (TOML puts keys in current section)
     pkg_sources = config.get("sources")
     if pkg_sources is None:
-        pkg_sources = config.get("package", {}).get("sources", ["src"])
+        pkg_sources = config.get("package", {}).get("sources")
+    if pkg_sources is None:
+        pkg_sources = config.get("build", {}).get("sources")
+    if pkg_sources is None:
+        pkg_sources = ["src"]  # Default
     if isinstance(pkg_sources, str):
         pkg_sources = [pkg_sources]
 
@@ -810,6 +814,9 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
             # Pass source roots if any (for import resolution)
             if source_roots:
                 compile_cmd.extend(["--sources", json.dumps(source_roots)])
+            # Pass project root (package directory) for source root resolution
+            if pkg_dir:
+                compile_cmd.extend(["--project-root", str(pkg_dir)])
 
             result = subprocess.run(compile_cmd, capture_output=True, text=True)
             if result.returncode != 0:
@@ -1119,10 +1126,12 @@ def build_package(pkg_dir: Path, config: dict, keep_artifacts: bool = False, use
     dependencies = parse_dependencies(config, pkg_dir)
 
     # Get source roots for import resolution
-    # Check both top-level and inside [package] (TOML puts keys in current section)
+    # Check top-level, [package], and [build] sections
     source_roots = config.get("sources")
     if source_roots is None:
         source_roots = config.get("package", {}).get("sources")
+    if source_roots is None:
+        source_roots = config.get("build", {}).get("sources")
     # Convert single string to list
     if isinstance(source_roots, str):
         source_roots = [source_roots]

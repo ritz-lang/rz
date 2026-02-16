@@ -63,7 +63,7 @@ def _filter_by_target_os(module: rast.Module, target_os: str) -> rast.Module:
 def compile_file(source_path: str, output_path: str, no_runtime: bool = False,
                   check_names: bool = False, check_ownership: bool = False,
                   check_types: bool = False, dependencies: dict = None,
-                  source_roots: list = None,
+                  source_roots: list = None, project_root: str = None,
                   target: str = 'x86_64-unknown-linux-gnu',
                   target_os: str = 'linux') -> bool:
     """Compile a single Ritz source file to LLVM IR.
@@ -80,6 +80,7 @@ def compile_file(source_path: str, output_path: str, no_runtime: bool = False,
         check_types: Check types are compatible before IR emission
         dependencies: RFC #109 dependency mappings for namespace resolution
         source_roots: List of source directories to search for imports
+        project_root: Explicit project root for import resolution (source roots relative to this)
         target: Target triple (default: x86_64-unknown-linux-gnu)
         target_os: Target OS for conditional compilation (default: linux)
     """
@@ -111,7 +112,7 @@ def compile_file(source_path: str, output_path: str, no_runtime: bool = False,
         # Note: use_cache=False because the cache creates stub functions without bodies,
         # which is incompatible with our current merged-module architecture.
         # For separate compilation, the cache would be appropriate.
-        module = resolve_imports(module, source_path, use_cache=False, dependencies=dependencies, source_roots=source_roots)
+        module = resolve_imports(module, source_path, project_root=project_root, use_cache=False, dependencies=dependencies, source_roots=source_roots)
 
         # Filter out items that don't match target_os
         # This must happen after import resolution but before name resolution
@@ -257,6 +258,8 @@ def main():
                         help='JSON dependency specification for RFC #109 namespacing')
     parser.add_argument('--sources',
                         help='JSON list of source directories to search for imports (e.g., ["src", "kernel/src"])')
+    parser.add_argument('--project-root',
+                        help='Explicit project root for import resolution (source roots are relative to this)')
     parser.add_argument('--target', default='x86_64-unknown-linux-gnu',
                         help='Target triple (default: x86_64-unknown-linux-gnu). '
                              'Use x86_64-none-elf for freestanding/kernel builds.')
@@ -356,6 +359,9 @@ def main():
             import json
             source_roots = json.loads(args.sources)
 
+        # Get project root if provided
+        project_root = args.project_root
+
         success = compile_file(args.source[0], args.output,
                                no_runtime=args.no_runtime,
                                check_names=args.check_names,
@@ -363,6 +369,7 @@ def main():
                                check_types=args.check_types,
                                dependencies=dependencies,
                                source_roots=source_roots,
+                               project_root=project_root,
                                target=args.target,
                                target_os=args.target_os)
         sys.exit(0 if success else 1)
