@@ -1283,7 +1283,7 @@ def cmd_list(args):
         if is_test_only:
             print(f"  {rel_path}/  →  {pkg_name} (test-only)")
         elif binaries:
-            bin_names = ", ".join(name for name, _, _ in binaries)
+            bin_names = ", ".join(b.name for b in binaries)
             print(f"  {rel_path}/  →  {pkg_name} ({bin_names})")
         else:
             print(f"  {rel_path}/  →  {pkg_name}")
