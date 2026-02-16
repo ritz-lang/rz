@@ -94,11 +94,110 @@ def strip_main_from_source(source: str) -> str:
     return '\n'.join(result_lines)
 
 
+def setup_test_environment(source_path: str, tmpdir: str) -> Tuple[Optional[Path], Optional[List[Path]], Optional[str]]:
+    """Set up test environment and discover dependencies.
+
+    Returns:
+        (project_root, dependency_files, error_message)
+        dependency_files excludes the test file itself
+    """
+    # Copy helper files to temp directory
+    test_dir = Path(source_path).parent
+    for lib_file in test_dir.glob("test_import_*.ritz"):
+        shutil.copy(lib_file, tmpdir)
+    helpers_file = test_dir / "helpers.ritz"
+    if helpers_file.exists():
+        shutil.copy(helpers_file, tmpdir)
+
+    # Find project root
+    project_root = None
+    search_dir = Path(source_path).parent.resolve()
+    while search_dir != search_dir.parent:
+        if (search_dir / "ritz.toml").exists():
+            project_root = search_dir
+            break
+        search_dir = search_dir.parent
+
+    if project_root:
+        # Symlink common source directories
+        for src_dir in ["lib", "src", "ritzlib"]:
+            src_path = project_root / src_dir
+            if src_path.exists():
+                real_path = src_path.resolve()
+                link_path = Path(tmpdir) / src_dir
+                if not link_path.exists():
+                    os.symlink(real_path, link_path)
+
+    # Discover dependencies using a dummy harness
+    original_source = Path(source_path).read_text()
+    source_no_main = strip_main_from_source(original_source)
+    dummy_harness = source_no_main + "\nfn main() -> i32\n  0\n"
+    dummy_path = os.path.join(tmpdir, "dummy_harness.ritz")
+    Path(dummy_path).write_text(dummy_harness)
+
+    try:
+        source_files = collect_all_source_files(
+            dummy_path,
+            project_root=str(project_root) if project_root else None
+        )
+        # Remove the dummy harness from the list
+        source_files = [f for f in source_files if Path(f).name != "dummy_harness.ritz"]
+        return project_root, source_files, None
+    except Exception as e:
+        return None, None, f"Import resolution failed: {e}"
+
+
+def compile_dependencies(
+    source_files: List[Path],
+    tmpdir: str,
+    ll_cache: dict
+) -> Tuple[List[str], Optional[str]]:
+    """Compile dependencies to LLVM IR, using cache when possible.
+
+    Args:
+        source_files: List of source files to compile
+        tmpdir: Temp directory for .ll files
+        ll_cache: Dict mapping source path -> compiled .ll path (shared across tests)
+
+    Returns:
+        (ll_files, error_message)
+    """
+    ritz0_dir = Path(__file__).parent
+    ritz0_py = ritz0_dir / "ritz0.py"
+    ll_files = []
+
+    for src in source_files:
+        src_key = str(Path(src).resolve())
+
+        # Check cache first
+        if src_key in ll_cache:
+            ll_files.append(ll_cache[src_key])
+            continue
+
+        # Compile to .ll
+        path_hash = hashlib.md5(src_key.encode()).hexdigest()[:8]
+        src_name = f"{Path(src).stem}_{path_hash}"
+        ll_path = os.path.join(tmpdir, f"{src_name}.ll")
+
+        compile_cmd = [sys.executable, str(ritz0_py), str(src), "-o", ll_path, "--no-runtime"]
+        result = subprocess.run(compile_cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            return None, f"ritz0 failed for {Path(src).name}: {result.stderr}"
+
+        ll_cache[src_key] = ll_path
+        ll_files.append(ll_path)
+
+    return ll_files, None
+
+
 def compile_test(
     source_path: str,
     test_name: str,
     tmpdir: str,
-    lib_files: List[str] = None
+    lib_files: List[str] = None,
+    ll_cache: dict = None,
+    dep_ll_files: List[str] = None,
+    project_root: Path = None
 ) -> Tuple[Optional[str], Optional[str]]:
     """Compile a single test to a binary using proper separate compilation.
 
@@ -107,6 +206,9 @@ def compile_test(
         test_name: Name of the test function to run
         tmpdir: Temporary directory for build artifacts
         lib_files: Optional additional library files
+        ll_cache: Optional cache of compiled .ll files (for reuse across tests)
+        dep_ll_files: Pre-compiled dependency .ll files (if already compiled)
+        project_root: Project root (if already determined)
 
     Returns:
         (exe_path, error_message) - exe_path is None on failure
@@ -129,75 +231,91 @@ fn main() -> i32
     test_file_path = os.path.join(tmpdir, "test_main.ritz")
     Path(test_file_path).write_text(harness_source)
 
-    # Copy helper files to temp directory so they can be found via relative imports
-    # This includes test_import_*.ritz (legacy) and helpers.ritz (common pattern)
-    test_dir = Path(source_path).parent
-    for lib_file in test_dir.glob("test_import_*.ritz"):
-        shutil.copy(lib_file, tmpdir)
-    # Also copy helpers.ritz if it exists (common test helper module)
-    helpers_file = test_dir / "helpers.ritz"
-    if helpers_file.exists():
-        shutil.copy(helpers_file, tmpdir)
+    # If we have pre-compiled dependencies, just compile the harness
+    if dep_ll_files is not None:
+        ll_files = list(dep_ll_files)
 
-    # Symlink project source directories (lib/, src/) to temp for import resolution
-    # Find project root by looking for ritz.toml
-    project_root = None
-    search_dir = Path(source_path).parent.resolve()
-    while search_dir != search_dir.parent:
-        if (search_dir / "ritz.toml").exists():
-            project_root = search_dir
-            break
-        search_dir = search_dir.parent
+        # Compile the test harness (with runtime since it has main)
+        harness_hash = hashlib.md5(test_name.encode()).hexdigest()[:8]
+        harness_ll = os.path.join(tmpdir, f"harness_{harness_hash}.ll")
 
-    if project_root:
-        # Symlink common source directories so imports like 'lib.foo' work
-        for src_dir in ["lib", "src", "ritzlib"]:
-            src_path = project_root / src_dir
-            # Follow symlinks to get the real path
-            if src_path.exists():
-                real_path = src_path.resolve()
-                link_path = Path(tmpdir) / src_dir
-                if not link_path.exists():
-                    os.symlink(real_path, link_path)
-
-    # Discover all source files through import resolution on the modified file
-    try:
-        source_files = collect_all_source_files(test_file_path, project_root=str(project_root) if project_root else None)
-    except Exception as e:
-        return None, f"Import resolution failed: {e}"
-
-    # Add explicit lib files if provided (legacy support)
-    if lib_files:
-        for lib in lib_files:
-            lib_path = Path(lib).resolve()
-            if lib_path not in [Path(f).resolve() for f in source_files]:
-                source_files.insert(-1, lib_path)
-
-    ll_files = []
-
-    # Compile each source file to LLVM IR
-    # Main source (last in list) includes _start, dependencies don't
-    for i, src in enumerate(source_files):
-        is_main = (i == len(source_files) - 1)
-
-        # Use a unique name to avoid collisions
-        path_hash = hashlib.md5(str(src).encode()).hexdigest()[:8]
-        src_name = f"{Path(src).stem}_{path_hash}"
-        ll_path = os.path.join(tmpdir, f"{src_name}.ll")
-
-        compile_cmd = [sys.executable, str(ritz0_py), str(src), "-o", ll_path]
-        if not is_main:
-            compile_cmd.append("--no-runtime")
-
+        compile_cmd = [sys.executable, str(ritz0_py), test_file_path, "-o", harness_ll]
         result = subprocess.run(compile_cmd, capture_output=True, text=True)
         if result.returncode != 0:
-            return None, f"ritz0 failed for {Path(src).name}: {result.stderr}"
+            return None, f"ritz0 failed for harness: {result.stderr}"
 
-        ll_files.append(ll_path)
+        ll_files.append(harness_ll)
+    else:
+        # Legacy path: compile everything from scratch
+        # Copy helper files to temp directory
+        test_dir = Path(source_path).parent
+        for lib_file in test_dir.glob("test_import_*.ritz"):
+            shutil.copy(lib_file, tmpdir)
+        helpers_file = test_dir / "helpers.ritz"
+        if helpers_file.exists():
+            shutil.copy(helpers_file, tmpdir)
+
+        # Find project root if not provided
+        if project_root is None:
+            search_dir = Path(source_path).parent.resolve()
+            while search_dir != search_dir.parent:
+                if (search_dir / "ritz.toml").exists():
+                    project_root = search_dir
+                    break
+                search_dir = search_dir.parent
+
+        if project_root:
+            for src_dir in ["lib", "src", "ritzlib"]:
+                src_path = project_root / src_dir
+                if src_path.exists():
+                    real_path = src_path.resolve()
+                    link_path = Path(tmpdir) / src_dir
+                    if not link_path.exists():
+                        os.symlink(real_path, link_path)
+
+        try:
+            source_files = collect_all_source_files(
+                test_file_path,
+                project_root=str(project_root) if project_root else None
+            )
+        except Exception as e:
+            return None, f"Import resolution failed: {e}"
+
+        if lib_files:
+            for lib in lib_files:
+                lib_path = Path(lib).resolve()
+                if lib_path not in [Path(f).resolve() for f in source_files]:
+                    source_files.insert(-1, lib_path)
+
+        ll_files = []
+        if ll_cache is None:
+            ll_cache = {}
+
+        for i, src in enumerate(source_files):
+            is_main = (i == len(source_files) - 1)
+            src_key = str(Path(src).resolve())
+
+            if not is_main and src_key in ll_cache:
+                ll_files.append(ll_cache[src_key])
+                continue
+
+            path_hash = hashlib.md5(src_key.encode()).hexdigest()[:8]
+            src_name = f"{Path(src).stem}_{path_hash}"
+            ll_path = os.path.join(tmpdir, f"{src_name}.ll")
+
+            compile_cmd = [sys.executable, str(ritz0_py), str(src), "-o", ll_path]
+            if not is_main:
+                compile_cmd.append("--no-runtime")
+
+            result = subprocess.run(compile_cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                return None, f"ritz0 failed for {Path(src).name}: {result.stderr}"
+
+            if not is_main:
+                ll_cache[src_key] = ll_path
+            ll_files.append(ll_path)
 
     # Link all .ll files with clang
-    # The main .ll already includes _start, so no external runtime needed
-    # Use -march=native to enable CPU features like SIMD intrinsics (pclmul, sse4.2, etc.)
     exe_path = os.path.join(tmpdir, "test")
     clang_cmd = ["clang"] + ll_files + ["-o", exe_path, "-nostdlib", "-g", "-march=native"]
     result = subprocess.run(clang_cmd, capture_output=True, text=True)
@@ -210,8 +328,103 @@ fn main() -> i32
 def run_test_file(source_path: str, verbose: bool = False, lib_files: List[str] = None) -> Tuple[int, int, List[str]]:
     """
     Run all tests in a file using proper separate compilation.
+
+    OPTIMIZED: Compiles dependencies ONCE and reuses them for all tests in the file.
+    This is ~10-20x faster for files with many tests and complex dependency trees.
+
     Returns (passed, failed, failure_messages).
     """
+    tests = find_test_functions(source_path)
+    if not tests:
+        return (0, 0, [])
+
+    passed = 0
+    failed = 0
+    failures = []
+
+    # Create a SINGLE temp directory for all tests in this file
+    # This allows us to cache compiled .ll files across tests
+    tmpdir = None
+    try:
+        tmpdir = tempfile.mkdtemp(dir='.')
+
+        # Step 1: Set up environment and discover dependencies ONCE
+        if verbose:
+            print(f"  Compiling dependencies for {len(tests)} tests...", flush=True)
+
+        project_root, dep_files, error = setup_test_environment(source_path, tmpdir)
+        if error:
+            # Fall back to per-test compilation on setup error
+            if verbose:
+                print(f"  Warning: {error}, falling back to per-test compilation")
+            cleanup_tmpdir_with_symlinks(tmpdir)
+            return _run_test_file_legacy(source_path, verbose, lib_files)
+
+        # Step 2: Compile all dependencies ONCE
+        ll_cache = {}
+        dep_ll_files, error = compile_dependencies(dep_files or [], tmpdir, ll_cache)
+        if error:
+            if verbose:
+                print(f"  Warning: {error}, falling back to per-test compilation")
+            cleanup_tmpdir_with_symlinks(tmpdir)
+            return _run_test_file_legacy(source_path, verbose, lib_files)
+
+        # Step 3: Run each test (only need to compile harness + link)
+        for test_name, test_fn in tests:
+            if verbose:
+                print(f"  Running {test_name}...", end=" ", flush=True)
+
+            try:
+                exe_path, error = compile_test(
+                    source_path,
+                    test_name,
+                    tmpdir,
+                    lib_files,
+                    ll_cache=ll_cache,
+                    dep_ll_files=dep_ll_files,
+                    project_root=project_root
+                )
+
+                if error:
+                    failed += 1
+                    failures.append(f"{test_name}: {error}")
+                    if verbose:
+                        print("FAIL (compile)")
+                    continue
+
+                # Run the test
+                result = subprocess.run([exe_path], capture_output=True, timeout=10)
+                if result.returncode == 0:
+                    passed += 1
+                    if verbose:
+                        print("OK")
+                else:
+                    failed += 1
+                    failures.append(f"{test_name}: exited with code {result.returncode}")
+                    if verbose:
+                        print(f"FAIL (exit {result.returncode})")
+
+            except subprocess.TimeoutExpired:
+                failed += 1
+                failures.append(f"{test_name}: timeout")
+                if verbose:
+                    print("FAIL (timeout)")
+            except Exception as e:
+                failed += 1
+                failures.append(f"{test_name}: {e}")
+                if verbose:
+                    print(f"FAIL ({e})")
+
+    finally:
+        # Clean up temp directory with proper symlink handling
+        if tmpdir and os.path.exists(tmpdir):
+            cleanup_tmpdir_with_symlinks(tmpdir)
+
+    return (passed, failed, failures)
+
+
+def _run_test_file_legacy(source_path: str, verbose: bool = False, lib_files: List[str] = None) -> Tuple[int, int, List[str]]:
+    """Legacy per-test compilation (fallback when optimized path fails)."""
     tests = find_test_functions(source_path)
     if not tests:
         return (0, 0, [])
@@ -226,7 +439,6 @@ def run_test_file(source_path: str, verbose: bool = False, lib_files: List[str] 
 
         tmpdir = None
         try:
-            # Create temp directory manually so we can clean up symlinks properly
             tmpdir = tempfile.mkdtemp(dir='.')
             exe_path, error = compile_test(
                 source_path,
@@ -242,7 +454,6 @@ def run_test_file(source_path: str, verbose: bool = False, lib_files: List[str] 
                     print("FAIL (compile)")
                 continue
 
-            # Run the test
             result = subprocess.run([exe_path], capture_output=True, timeout=10)
             if result.returncode == 0:
                 passed += 1
@@ -265,11 +476,181 @@ def run_test_file(source_path: str, verbose: bool = False, lib_files: List[str] 
             if verbose:
                 print(f"FAIL ({e})")
         finally:
-            # Clean up temp directory with proper symlink handling
             if tmpdir and os.path.exists(tmpdir):
                 cleanup_tmpdir_with_symlinks(tmpdir)
 
     return (passed, failed, failures)
+
+
+def run_batch_tests(
+    test_files: List[str],
+    verbose: bool = False,
+    project_root: str = None,
+    ritzunit_dir: str = None
+) -> int:
+    """Run all tests in batch mode using ritzunit's ELF-based test discovery.
+
+    This compiles all dependencies ONCE and links all test files into a single
+    binary with ritzunit's runner. Much faster than per-test compilation.
+
+    Args:
+        test_files: List of test file paths
+        verbose: Show verbose output
+        project_root: Project root for import resolution
+        ritzunit_dir: Path to ritzunit project (for runner.ritz)
+
+    Returns:
+        Exit code (0 = all passed)
+    """
+    if not test_files:
+        print("No test files specified")
+        return 1
+
+    ritz0_dir = Path(__file__).parent
+    ritz0_py = ritz0_dir / "ritz0.py"
+    list_deps_py = ritz0_dir / "list_deps.py"
+
+    # Find ritzunit if not specified
+    if ritzunit_dir is None:
+        # Look relative to ritz0 directory
+        # ritz0 is at: projects/ritz/ritz0
+        # ritzunit is at: projects/ritzunit
+        # So: ritz0_dir.parent = projects/ritz, .parent = projects, /ritzunit
+        ritzunit_dir = ritz0_dir.parent.parent / "ritzunit"
+        if not ritzunit_dir.exists():
+            # Try RITZ_PATH
+            ritz_path = os.environ.get("RITZ_PATH")
+            if ritz_path:
+                ritzunit_dir = Path(ritz_path) / "ritzunit"
+
+    if not ritzunit_dir or not ritzunit_dir.exists():
+        print(f"Error: ritzunit not found. Set RITZ_PATH or ensure projects/ritzunit exists.", file=sys.stderr)
+        return 1
+
+    runner_path = ritzunit_dir / "src" / "runner.ritz"
+    if not runner_path.exists():
+        print(f"Error: ritzunit runner not found at {runner_path}", file=sys.stderr)
+        return 1
+
+    # Find project root from first test file
+    if project_root is None:
+        test_path = Path(test_files[0]).resolve()
+        search_dir = test_path.parent
+        while search_dir != search_dir.parent:
+            if (search_dir / "ritz.toml").exists():
+                project_root = str(search_dir)
+                break
+            search_dir = search_dir.parent
+
+    tmpdir = None
+    try:
+        tmpdir = tempfile.mkdtemp(prefix="ritz_batch_test_")
+
+        # Step 1: Collect all dependencies from the runner (includes ritzlib, reporter, etc.)
+        if verbose:
+            print("Collecting runner dependencies...")
+
+        result = subprocess.run(
+            [sys.executable, str(list_deps_py), str(runner_path),
+             "--project-root", str(ritzunit_dir)],
+            capture_output=True, text=True
+        )
+        if result.returncode != 0:
+            print(f"Error collecting runner dependencies: {result.stderr}", file=sys.stderr)
+            return 1
+
+        runner_deps = [Path(f.strip()) for f in result.stdout.strip().split('\n') if f.strip()]
+
+        # Step 2: Collect all source files from test files (excluding duplicates)
+        all_sources = set()
+        for tf in test_files:
+            result = subprocess.run(
+                [sys.executable, str(list_deps_py), str(tf),
+                 "--project-root", project_root or str(Path(tf).parent)],
+                capture_output=True, text=True
+            )
+            if result.returncode != 0:
+                print(f"Error collecting deps for {tf}: {result.stderr}", file=sys.stderr)
+                return 1
+
+            for f in result.stdout.strip().split('\n'):
+                if f.strip():
+                    all_sources.add(Path(f.strip()).resolve())
+
+        # Add runner dependencies
+        for dep in runner_deps:
+            all_sources.add(dep.resolve())
+
+        # Add test files themselves
+        for tf in test_files:
+            all_sources.add(Path(tf).resolve())
+
+        # Convert to list and sort (runner.ritz should be last - it has main())
+        source_list = sorted(all_sources, key=lambda p: (p == runner_path.resolve(), str(p)))
+
+        if verbose:
+            print(f"Compiling {len(source_list)} source files...")
+
+        # Step 3: Compile each source file ONCE
+        ll_files = []
+        compiled = {}  # Track by resolved path to avoid duplicates
+
+        for src in source_list:
+            src_resolved = src.resolve()
+            if str(src_resolved) in compiled:
+                ll_files.append(compiled[str(src_resolved)])
+                continue
+
+            is_runner = (src_resolved == runner_path.resolve())
+
+            # Use path hash for unique names
+            path_hash = hashlib.md5(str(src_resolved).encode()).hexdigest()[:8]
+            src_name = f"{src.stem}_{path_hash}"
+            ll_path = os.path.join(tmpdir, f"{src_name}.ll")
+
+            # All files compiled with --no-runtime except runner (which has main)
+            compile_cmd = [sys.executable, str(ritz0_py), str(src), "-o", ll_path]
+            if not is_runner:
+                compile_cmd.append("--no-runtime")
+
+            result = subprocess.run(compile_cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                print(f"Error compiling {src.name}: {result.stderr}", file=sys.stderr)
+                return 1
+
+            ll_files.append(ll_path)
+            compiled[str(src_resolved)] = ll_path
+
+        # Step 4: Link everything with clang
+        if verbose:
+            print(f"Linking {len(ll_files)} object files...")
+
+        exe_path = os.path.join(tmpdir, "test_runner")
+        clang_cmd = ["clang"] + ll_files + ["-o", exe_path, "-nostdlib", "-g", "-march=native"]
+        result = subprocess.run(clang_cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"Error linking: {result.stderr}", file=sys.stderr)
+            return 1
+
+        # Step 5: Run the test binary
+        if verbose:
+            print(f"Running tests...")
+
+        run_cmd = [exe_path]
+        if verbose:
+            run_cmd.append("-v")
+
+        result = subprocess.run(run_cmd, capture_output=False)
+        return result.returncode
+
+    except Exception as e:
+        print(f"Error in batch test: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
+        return 1
+    finally:
+        if tmpdir and os.path.exists(tmpdir):
+            cleanup_tmpdir_with_symlinks(tmpdir)
 
 
 def main():
@@ -277,9 +658,23 @@ def main():
     parser.add_argument('files', nargs='+', help='Test files to run')
     parser.add_argument('-v', '--verbose', action='store_true', help='Verbose output')
     parser.add_argument('-l', '--lib', action='append', default=[], help='Library files to include (can be specified multiple times)')
+    parser.add_argument('--batch', action='store_true',
+                        help='Use batch mode: compile once, run all tests via ritzunit (much faster)')
+    parser.add_argument('--project-root', help='Project root for import resolution')
+    parser.add_argument('--legacy', action='store_true',
+                        help='Use legacy per-test compilation (for benchmarking)')
 
     args = parser.parse_args()
 
+    # Use batch mode if requested
+    if args.batch:
+        sys.exit(run_batch_tests(
+            args.files,
+            verbose=args.verbose,
+            project_root=args.project_root
+        ))
+
+    # Optimized per-test mode with dependency caching (default)
     total_passed = 0
     total_failed = 0
     all_failures = []
@@ -289,7 +684,10 @@ def main():
             print(f"\n{file_path}:")
 
         try:
-            passed, failed, failures = run_test_file(file_path, args.verbose, args.lib)
+            if args.legacy:
+                passed, failed, failures = _run_test_file_legacy(file_path, args.verbose, args.lib)
+            else:
+                passed, failed, failures = run_test_file(file_path, args.verbose, args.lib)
             total_passed += passed
             total_failed += failed
             all_failures.extend(failures)

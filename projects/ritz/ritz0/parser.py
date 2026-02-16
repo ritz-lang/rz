@@ -80,6 +80,11 @@ class Parser:
         while self._at(TokenType.NEWLINE):
             self._advance()
 
+    def _skip_whitespace_tokens(self) -> None:
+        """Skip newlines, indents, and dedents (for multiline constructs inside brackets)."""
+        while self._at(TokenType.NEWLINE, TokenType.INDENT, TokenType.DEDENT):
+            self._advance()
+
     def _at_double_rbracket(self) -> bool:
         """Check if we're at ]] (either RBRACKET2 token or two RBRACKET tokens)."""
         if self._at(TokenType.RBRACKET2):
@@ -470,16 +475,17 @@ class Parser:
                 self._expect(TokenType.RBRACKET)
                 return rast.SliceType(span, inner)
 
-        # Function type: fn(A, B) -> C
+        # Function type: fn(A, B) -> C or fn(name: A, name2: B) -> C
+        # Named parameters are allowed for documentation purposes
         if self._at(TokenType.FN):
             self._advance()
             self._expect(TokenType.LPAREN)
             params = []
             if not self._at(TokenType.RPAREN):
-                params.append(self.parse_type())
+                params.append(self._parse_fn_type_param())
                 while self._at(TokenType.COMMA):
                     self._advance()
-                    params.append(self.parse_type())
+                    params.append(self._parse_fn_type_param())
             self._expect(TokenType.RPAREN)
             ret = None
             if self._at(TokenType.ARROW):
@@ -519,6 +525,26 @@ class Parser:
         args = self._parse_type_args() if allow_type_args else []
 
         return rast.NamedType(span, name, args)
+
+    def _parse_fn_type_param(self) -> rast.Type:
+        """Parse a parameter in a function type.
+
+        Supports:
+            Type               - just a type
+            name: Type         - named parameter (name is ignored, just for docs)
+        """
+        # Check if this looks like "name: Type" by peeking ahead
+        if self._at(TokenType.IDENT):
+            saved_pos = self.pos
+            self._advance()  # consume potential name
+            if self._at(TokenType.COLON):
+                # It's "name: Type", skip the name and parse the type
+                self._advance()  # consume :
+                return self.parse_type()
+            else:
+                # It's just a type starting with an identifier
+                self.pos = saved_pos
+        return self.parse_type()
 
     # ========================================================================
     # Expressions (Pratt parser)
@@ -972,7 +998,14 @@ class Parser:
         return rast.Match(span, expr, arms)
 
     def parse_match_arm(self) -> rast.MatchArm:
-        """Parse a match arm."""
+        """Parse a match arm.
+
+        Supports both single-line and multiline arms:
+            Ok(x) => x + 1                    # single expression
+            Err(e) =>                         # multiline block
+                log(e)
+                return -1
+        """
         span = self._current().span
         pattern = self.parse_pattern()
 
@@ -982,9 +1015,21 @@ class Parser:
             guard = self.parse_expr()
 
         self._expect(TokenType.FATARROW)
-        body = self.parse_expr()
-        # Skip newline after arm body
-        self._skip_newlines()
+
+        # Check for multiline arm: => followed by newline+indent
+        if self._at(TokenType.NEWLINE):
+            self._advance()
+            if self._at(TokenType.INDENT):
+                # Multiline: parse as block
+                body = self.parse_block()
+            else:
+                # Just newline, then next arm - error
+                raise ParseError("Expected expression or indented block after '=>'", span)
+        else:
+            # Single line: parse expression
+            body = self.parse_expr()
+            # Skip newline after arm body
+            self._skip_newlines()
 
         return rast.MatchArm(span, pattern, guard, body)
 
@@ -1552,17 +1597,21 @@ class Parser:
         type_params, type_param_bounds = self._parse_type_params()
 
         self._expect(TokenType.LPAREN)
+        self._skip_whitespace_tokens()  # Allow newline after (
 
         params = []
         if not self._at(TokenType.RPAREN):
             # First param may be 'self' which can use bare syntax in impl blocks
             params.append(self.parse_param(impl_type=impl_type))
+            self._skip_whitespace_tokens()  # Allow newline after param
             while self._at(TokenType.COMMA):
                 self._advance()
+                self._skip_whitespace_tokens()  # Allow newline after comma
                 if self._at(TokenType.RPAREN):
                     break
                 # Subsequent params don't get impl_type (bare self only valid as first param)
                 params.append(self.parse_param())
+                self._skip_whitespace_tokens()  # Allow newline after param
         self._expect(TokenType.RPAREN)
 
         ret_type = None
@@ -1582,6 +1631,7 @@ class Parser:
         self._expect(TokenType.FN)
         name_tok = self._expect(TokenType.IDENT)
         self._expect(TokenType.LPAREN)
+        self._skip_whitespace_tokens()  # Allow newline after (
 
         params = []
         varargs = False
@@ -1592,8 +1642,10 @@ class Parser:
                 self._advance()
             else:
                 params.append(self.parse_param())
+                self._skip_whitespace_tokens()  # Allow newline after param
                 while self._at(TokenType.COMMA):
                     self._advance()
+                    self._skip_whitespace_tokens()  # Allow newline after comma
                     if self._at(TokenType.RPAREN):
                         break
                     if self._at(TokenType.DOTDOT):
@@ -1601,6 +1653,7 @@ class Parser:
                         self._advance()
                         break
                     params.append(self.parse_param())
+                    self._skip_whitespace_tokens()  # Allow newline after param
         self._expect(TokenType.RPAREN)
 
         ret_type = None
@@ -1611,7 +1664,15 @@ class Parser:
         return rast.ExternFn(span, name_tok.value, params, ret_type, varargs, is_pub=is_pub)
 
     def parse_struct(self, attrs: List[rast.Attr] = None, is_pub: bool = False) -> rast.StructDef:
-        """Parse a struct definition."""
+        """Parse a struct definition.
+
+        Supports:
+            struct Point           # Empty struct (unit struct)
+                x: i32
+                y: i32
+
+            pub struct Empty       # Empty struct with no fields
+        """
         if attrs is None:
             attrs = []
         span = self._current().span
@@ -1622,18 +1683,36 @@ class Parser:
         type_params, type_param_bounds = self._parse_type_params()
 
         self._skip_newlines()
-        self._expect(TokenType.INDENT)
 
+        # Check for empty struct (no indent = no fields)
         fields = []
-        while not self._at(TokenType.DEDENT, TokenType.EOF):
-            field_name = self._expect(TokenType.IDENT)
-            self._expect(TokenType.COLON)
-            field_type = self.parse_type()
-            fields.append((field_name.value, field_type))
-            self._skip_newlines()  # Skip newlines after struct field
-
-        if self._at(TokenType.DEDENT):
+        if self._at(TokenType.INDENT):
             self._advance()
+
+            while not self._at(TokenType.DEDENT, TokenType.EOF):
+                field_name = self._expect(TokenType.IDENT)
+                # Support :& and := for struct fields
+                # :& wraps the type in a RefType (mutable reference)
+                # := is for move semantics (currently just parse normally)
+                wrap_ref = False
+                if self._at(TokenType.COLON_AMP):
+                    self._advance()
+                    wrap_ref = True
+                elif self._at(TokenType.COLON_EQ):
+                    self._advance()
+                    # Move semantics - just parse the type normally for now
+                elif self._at(TokenType.COLON):
+                    self._advance()
+                else:
+                    raise ParseError(f"Expected ':' after field name '{field_name.value}'", field_name.span)
+                field_type = self.parse_type()
+                if wrap_ref:
+                    field_type = rast.RefType(field_type.span, field_type, mutable=True)
+                fields.append((field_name.value, field_type))
+                self._skip_newlines()  # Skip newlines after struct field
+
+            if self._at(TokenType.DEDENT):
+                self._advance()
 
         return rast.StructDef(span, name_tok.value, fields,
                               type_params=type_params, type_param_bounds=type_param_bounds,
@@ -1713,20 +1792,32 @@ class Parser:
             path.append(tok.value)
 
         # Parse optional selective imports: { item1, item2 }
+        # Supports multiline:
+        #   import foo {
+        #       item1,
+        #       item2,
+        #   }
         items = None
         if self._at(TokenType.LBRACE):
             self._advance()
+            self._skip_whitespace_tokens()  # Allow newline after {
             items = []
             if not self._at(TokenType.RBRACE):
                 tok = self._expect_ident_or_keyword("Expected item name")
                 items.append(tok.value)
+                self._skip_whitespace_tokens()  # Allow newline after item
                 while self._at(TokenType.COMMA):
                     self._advance()
+                    self._skip_whitespace_tokens()  # Allow newline after comma
                     if self._at(TokenType.RBRACE):
                         break  # trailing comma
                     tok = self._expect_ident_or_keyword("Expected item name")
                     items.append(tok.value)
+                    self._skip_whitespace_tokens()  # Allow newline after item
             self._expect(TokenType.RBRACE, "Expected '}' after import items")
+            # After multiline imports, skip any DEDENT that was generated
+            # due to continuation indentation
+            self._skip_whitespace_tokens()
 
         # Parse optional alias: as name
         alias = None
@@ -1797,20 +1888,27 @@ class Parser:
         """Parse a method signature in a trait definition (no body).
 
         Example: fn print(self: *Self) -> i32
+
+        Supports bare self syntax:
+            fn method(self)       -> const borrow of Self
+            fn method(self:&)     -> mutable borrow of Self
         """
         span = self._current().span
         self._expect(TokenType.FN)
         name_tok = self._expect(TokenType.IDENT)
         self._expect(TokenType.LPAREN)
 
+        # Create a synthetic Self type for bare self handling
+        self_type = rast.NamedType(span, "Self", [])
+
         params = []
         if not self._at(TokenType.RPAREN):
-            params.append(self.parse_param())
+            params.append(self.parse_param(impl_type=self_type))
             while self._at(TokenType.COMMA):
                 self._advance()
                 if self._at(TokenType.RPAREN):
                     break
-                params.append(self.parse_param())
+                params.append(self.parse_param(impl_type=self_type))
         self._expect(TokenType.RPAREN)
 
         ret_type = None
