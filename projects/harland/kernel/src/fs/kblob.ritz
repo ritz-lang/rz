@@ -1,0 +1,260 @@
+# Kernel Blob Store
+#
+# In-kernel content-addressable storage for boot-time filesystem access.
+# Uses kalloc() for memory allocation (no syscalls).
+#
+# This is a port of Goliath's MemoryBlobStore for kernel use.
+
+import mm.heap { kalloc, kfree }
+import serial { StrView, prints, println }
+
+# Size of a SHA-256 hash in bytes
+pub const BLOB_ID_SIZE: i32 = 32
+
+# Content address - SHA-256 hash
+pub struct KBlobId
+    hash: [32]u8
+
+# Initial capacity for blob store
+const INITIAL_CAPACITY: i32 = 64
+
+# A stored blob entry
+struct KBlobEntry
+    id: KBlobId
+    data: *u8
+    size: u64
+    used: bool
+
+# Kernel blob store
+pub struct KBlobStore
+    entries: *KBlobEntry
+    capacity: i32
+    count: i32
+    total_size: u64
+
+# ============================================================================
+# BlobId Operations
+# ============================================================================
+
+# Create a zero BlobId
+pub fn kblob_id_zero() -> KBlobId
+    var id: KBlobId
+    var i: i32 = 0
+    while i < 32
+        id.hash[i] = 0
+        i = i + 1
+    id
+
+# Compare two BlobIds for equality
+pub fn kblob_id_eq(a: *KBlobId, b: *KBlobId) -> bool
+    var i: i32 = 0
+    while i < 32
+        if (*a).hash[i] != (*b).hash[i]
+            return false
+        i = i + 1
+    true
+
+# Check if a BlobId is zero
+pub fn kblob_id_is_zero(id: *KBlobId) -> bool
+    var i: i32 = 0
+    while i < 32
+        if (*id).hash[i] != 0
+            return false
+        i = i + 1
+    true
+
+# Copy a BlobId
+pub fn kblob_id_copy(src: *KBlobId) -> KBlobId
+    var dst: KBlobId
+    var i: i32 = 0
+    while i < 32
+        dst.hash[i] = (*src).hash[i]
+        i = i + 1
+    dst
+
+# Compute BlobId from data
+# TODO: Use cryptosec.sha256 when available in kernel
+pub fn kblob_id_compute(data: *u8, len: u64) -> KBlobId
+    # Simple hash for now - XOR fold the data into 32 bytes
+    # This is NOT cryptographic, just for testing
+    var id: KBlobId = kblob_id_zero()
+
+    var i: u64 = 0
+    while i < len
+        let idx: i32 = (i % 32) as i32
+        id.hash[idx] = id.hash[idx] ^ *(data + i)
+        i = i + 1
+
+    # Mix in the length to differentiate same-content different-length
+    var len_bytes: u64 = len
+    var j: i32 = 0
+    while j < 8
+        id.hash[j] = id.hash[j] ^ ((len_bytes & 0xFF) as u8)
+        len_bytes = len_bytes >> 8
+        j = j + 1
+
+    id
+
+# ============================================================================
+# Blob Store Operations
+# ============================================================================
+
+# Create a new empty kernel blob store
+pub fn kblob_store_new() -> KBlobStore
+    # Allocate entry array (approximately 56 bytes per entry)
+    let entry_size: u64 = 64  # Aligned size of KBlobEntry
+    let alloc_size: u64 = entry_size * INITIAL_CAPACITY as u64
+
+    let entries: *KBlobEntry = kalloc(alloc_size) as *KBlobEntry
+
+    if entries == 0 as *KBlobEntry
+        prints("kblob: failed to allocate entry array\n" as StrView)
+        return KBlobStore {
+            entries: 0 as *KBlobEntry,
+            capacity: 0,
+            count: 0,
+            total_size: 0
+        }
+
+    # Initialize all entries as unused
+    var i: i32 = 0
+    while i < INITIAL_CAPACITY
+        let entry: *KBlobEntry = entries + i
+        (*entry).used = false
+        i = i + 1
+
+    KBlobStore {
+        entries: entries,
+        capacity: INITIAL_CAPACITY,
+        count: 0,
+        total_size: 0
+    }
+
+# Find an entry by BlobId
+fn store_find(store: *KBlobStore, id: *KBlobId) -> *KBlobEntry
+    var i: i32 = 0
+    while i < (*store).capacity
+        let entry: *KBlobEntry = (*store).entries + i
+        if (*entry).used and kblob_id_eq(@(*entry).id, id)
+            return entry
+        i = i + 1
+    0 as *KBlobEntry
+
+# Check if a blob exists
+pub fn kblob_store_exists(store: *KBlobStore, id: *KBlobId) -> bool
+    let entry: *KBlobEntry = store_find(store, id)
+    entry != 0 as *KBlobEntry
+
+# Get a blob's data (returns null if not found)
+pub fn kblob_store_get(store: *KBlobStore, id: *KBlobId) -> *u8
+    let entry: *KBlobEntry = store_find(store, id)
+    if entry == 0 as *KBlobEntry
+        return 0 as *u8
+    (*entry).data
+
+# Get a blob's size (returns 0 if not found)
+pub fn kblob_store_get_size(store: *KBlobStore, id: *KBlobId) -> u64
+    let entry: *KBlobEntry = store_find(store, id)
+    if entry == 0 as *KBlobEntry
+        return 0
+    (*entry).size
+
+# Store a blob, returns its BlobId
+# If blob already exists, returns existing ID (deduplication)
+pub fn kblob_store_put(store: *KBlobStore, data: *u8, size: u64) -> KBlobId
+    # Compute content hash
+    var id: KBlobId = kblob_id_compute(data, size)
+
+    # Check if already exists (deduplication)
+    if kblob_store_exists(store, @id)
+        return kblob_id_copy(@id)
+
+    # Find a free slot
+    var slot: *KBlobEntry = 0 as *KBlobEntry
+    var i: i32 = 0
+    while i < (*store).capacity
+        let entry: *KBlobEntry = (*store).entries + i
+        if not (*entry).used
+            slot = entry
+            break
+        i = i + 1
+
+    # TODO: Grow array if no free slot
+    if slot == 0 as *KBlobEntry
+        prints("kblob: store full\n" as StrView)
+        return kblob_id_zero()
+
+    # Allocate storage for data copy
+    let data_copy: *u8 = kalloc(size)
+    if data_copy == 0 as *u8
+        prints("kblob: failed to allocate data\n" as StrView)
+        return kblob_id_zero()
+
+    # Copy data
+    var j: u64 = 0
+    while j < size
+        *(data_copy + j) = *(data + j)
+        j = j + 1
+
+    # Store entry
+    (*slot).id = kblob_id_copy(@id)
+    (*slot).data = data_copy
+    (*slot).size = size
+    (*slot).used = true
+
+    (*store).count = (*store).count + 1
+    (*store).total_size = (*store).total_size + size
+
+    kblob_id_copy(@id)
+
+# Delete a blob
+pub fn kblob_store_delete(store: *KBlobStore, id: *KBlobId) -> bool
+    let entry: *KBlobEntry = store_find(store, id)
+    if entry == 0 as *KBlobEntry
+        return false
+
+    # Free data
+    # Note: kfree doesn't require size, but we should track it
+    # For now, we just mark as unused
+    # TODO: Proper kfree with size tracking
+
+    # Mark as unused
+    (*store).total_size = (*store).total_size - (*entry).size
+    (*store).count = (*store).count - 1
+    (*entry).used = false
+
+    true
+
+# Get total number of blobs
+pub fn kblob_store_count(store: *KBlobStore) -> i32
+    (*store).count
+
+# Get total size of all blobs
+pub fn kblob_store_total_size(store: *KBlobStore) -> u64
+    (*store).total_size
+
+# ============================================================================
+# Global Kernel Blob Store
+# ============================================================================
+
+var g_kblob_store: KBlobStore
+var g_kblob_initialized: u8 = 0   # 0 = false, 1 = true
+
+# Initialize the global kernel blob store
+pub fn kblob_init() -> i32
+    if g_kblob_initialized != 0
+        return 0
+
+    g_kblob_store = kblob_store_new()
+    if g_kblob_store.entries == 0 as *KBlobEntry
+        return -1
+
+    g_kblob_initialized = 1
+    prints("kblob: initialized\n" as StrView)
+    0
+
+# Get the global kernel blob store
+pub fn kblob_get_store() -> *KBlobStore
+    if g_kblob_initialized == 0
+        return 0 as *KBlobStore
+    @g_kblob_store

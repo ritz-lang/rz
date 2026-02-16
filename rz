@@ -59,6 +59,75 @@ def get_project_config(project_name):
         return tomllib.load(f)
 
 
+def get_dependency_paths(project_name, seen=None):
+    """Get all dependency paths for a project (including transitive).
+
+    Returns a list of absolute Path objects for all dependencies.
+    """
+    if seen is None:
+        seen = set()
+
+    project_dir = PROJECTS_DIR / project_name
+    if str(project_dir) in seen:
+        return []
+    seen.add(str(project_dir))
+
+    config = get_project_config(project_name)
+    if not config:
+        return []
+
+    deps_config = config.get("dependencies", {})
+    paths = []
+
+    for name, spec in deps_config.items():
+        if isinstance(spec, dict):
+            dep_path = spec.get("path")
+            if dep_path:
+                dep_full_path = (project_dir / dep_path).resolve()
+                if dep_full_path.exists():
+                    paths.append(dep_full_path)
+                    # Get transitive dependencies
+                    dep_name = dep_full_path.name
+                    if (PROJECTS_DIR / dep_name).exists():
+                        paths.extend(get_dependency_paths(dep_name, seen))
+        elif isinstance(spec, str):
+            dep_full_path = (project_dir / spec).resolve()
+            if dep_full_path.exists():
+                paths.append(dep_full_path)
+
+    return paths
+
+
+def compute_ritz_path(project_name, include_ritzunit=False):
+    """Compute RITZ_PATH for a project including all dependencies."""
+    project_dir = PROJECTS_DIR / project_name
+    ritz_dir = PROJECTS_DIR / "ritz"
+
+    # Start with project dir and ritz (for ritzlib)
+    paths = [project_dir, ritz_dir]
+
+    # Add all dependencies
+    dep_paths = get_dependency_paths(project_name)
+    paths.extend(dep_paths)
+
+    # Add ritzunit for tests
+    if include_ritzunit:
+        ritzunit_dir = PROJECTS_DIR / "ritzunit"
+        if ritzunit_dir.exists():
+            paths.append(ritzunit_dir)
+
+    # Deduplicate while preserving order
+    seen = set()
+    unique_paths = []
+    for p in paths:
+        p_str = str(p)
+        if p_str not in seen:
+            seen.add(p_str)
+            unique_paths.append(p)
+
+    return ":".join(str(p) for p in unique_paths)
+
+
 def run_build(project_name, extra_args=None):
     """Run build.py for a specific project."""
     project_dir = PROJECTS_DIR / project_name
@@ -66,10 +135,9 @@ def run_build(project_name, extra_args=None):
         print(f"Error: Project '{project_name}' not found", file=sys.stderr)
         return 1
 
-    # Set up environment - include both ritz (for ritzlib) and project dir (for lib.* imports)
+    # Set up environment with all dependencies in RITZ_PATH
     env = os.environ.copy()
-    ritz_path = f"{project_dir}:{PROJECTS_DIR / 'ritz'}"
-    env["RITZ_PATH"] = ritz_path
+    env["RITZ_PATH"] = compute_ritz_path(project_name)
 
     cmd = [sys.executable, str(RITZ_BUILD), "build", str(project_dir)]
     if extra_args:
@@ -86,10 +154,9 @@ def run_test(project_name, extra_args=None):
         print(f"Error: Project '{project_name}' not found", file=sys.stderr)
         return 1
 
-    # Set up environment - include both ritz (for ritzlib) and project dir (for lib.* imports)
+    # Set up environment with all dependencies in RITZ_PATH (including ritzunit for tests)
     env = os.environ.copy()
-    ritz_path = f"{project_dir}:{PROJECTS_DIR / 'ritz'}"
-    env["RITZ_PATH"] = ritz_path
+    env["RITZ_PATH"] = compute_ritz_path(project_name, include_ritzunit=True)
 
     cmd = [sys.executable, str(RITZ_BUILD), "test", str(project_dir)]
     if extra_args:

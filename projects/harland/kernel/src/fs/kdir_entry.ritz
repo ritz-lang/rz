@@ -1,0 +1,185 @@
+# Kernel Directory Entry
+#
+# Directory entry structures for kernel filesystem.
+
+import serial { StrView }
+import fs.kpath { NAME_MAX, strview_from_ptr }
+import fs.kblob { KBlobId, kblob_id_zero, kblob_id_copy }
+
+# Entry type constants
+pub const ENTRY_FILE: u8 = 0
+pub const ENTRY_DIRECTORY: u8 = 1
+pub const ENTRY_SYMLINK: u8 = 2
+
+# File/directory metadata
+pub struct KMetadata
+    size: u64           # File size in bytes (0 for directories)
+    created: u64        # Creation time (unix timestamp)
+    modified: u64       # Modification time
+    mode: u32           # Permission bits
+
+# Directory entry
+pub struct KDirEntry
+    name: [256]u8       # Name (null-terminated, max 255 chars)
+    name_len: u8        # Length of name
+    kind: u8            # File, directory, or symlink
+    blob_id: KBlobId    # Content hash (for files) or dir blob (for dirs)
+    metadata: KMetadata # Size, timestamps, permissions
+
+# Create a new file entry
+pub fn kdir_entry_file(name: StrView, blob_id: *KBlobId, size: u64) -> KDirEntry
+    var entry: KDirEntry
+
+    # Copy name (truncate if too long)
+    var copy_len: i64 = name.len
+    if copy_len > NAME_MAX
+        copy_len = NAME_MAX
+
+    var i: i64 = 0
+    while i < copy_len
+        entry.name[i] = *(name.ptr + i)
+        i = i + 1
+    entry.name[i] = 0  # null terminate
+    entry.name_len = copy_len as u8
+
+    entry.kind = ENTRY_FILE
+    entry.blob_id = kblob_id_copy(blob_id)
+
+    entry.metadata.size = size
+    entry.metadata.created = 0  # TODO: get current time
+    entry.metadata.modified = 0
+    entry.metadata.mode = 420   # 0644
+
+    entry
+
+# Create a new directory entry
+pub fn kdir_entry_dir(name: StrView, blob_id: *KBlobId) -> KDirEntry
+    var entry: KDirEntry
+
+    # Copy name (truncate if too long)
+    var copy_len: i64 = name.len
+    if copy_len > NAME_MAX
+        copy_len = NAME_MAX
+
+    var i: i64 = 0
+    while i < copy_len
+        entry.name[i] = *(name.ptr + i)
+        i = i + 1
+    entry.name[i] = 0
+    entry.name_len = copy_len as u8
+
+    entry.kind = ENTRY_DIRECTORY
+    entry.blob_id = kblob_id_copy(blob_id)
+
+    entry.metadata.size = 0
+    entry.metadata.created = 0
+    entry.metadata.modified = 0
+    entry.metadata.mode = 493   # 0755
+
+    entry
+
+# Check if entry is a file
+pub fn kdir_entry_is_file(entry: *KDirEntry) -> bool
+    (*entry).kind == ENTRY_FILE
+
+# Check if entry is a directory
+pub fn kdir_entry_is_dir(entry: *KDirEntry) -> bool
+    (*entry).kind == ENTRY_DIRECTORY
+
+# Get entry name as StrView
+pub fn kdir_entry_name(entry: *KDirEntry) -> StrView
+    strview_from_ptr(@(*entry).name[0], (*entry).name_len as i64)
+
+# Compare entry name with a StrView
+pub fn kdir_entry_name_eq(entry: *KDirEntry, name: @StrView) -> bool
+    if (*entry).name_len as i64 != name.len
+        return false
+
+    var i: i64 = 0
+    while i < name.len
+        if (*entry).name[i] != *(name.ptr + i)
+            return false
+        i = i + 1
+
+    true
+
+# Size of a serialized directory entry (approx 320 bytes)
+pub const KDIR_ENTRY_SIZE: i32 = 320
+
+# Calculate serialized size of a directory
+pub fn kdir_serialized_size(entry_count: u32) -> u64
+    4 + (entry_count as u64 * KDIR_ENTRY_SIZE as u64)
+
+# Serialize a directory entry to bytes
+pub fn kdir_entry_serialize(entry: *KDirEntry, out: *u8)
+    # Name (256 bytes)
+    var i: i32 = 0
+    while i < 256
+        *(out + i) = (*entry).name[i]
+        i = i + 1
+
+    # name_len (1 byte)
+    *(out + 256) = (*entry).name_len
+
+    # kind (1 byte)
+    *(out + 257) = (*entry).kind
+
+    # blob_id (32 bytes)
+    i = 0
+    while i < 32
+        *(out + 258 + i) = (*entry).blob_id.hash[i]
+        i = i + 1
+
+    # metadata (24 bytes)
+    # size: u64 at offset 290
+    let size_ptr: *u64 = (out + 290) as *u64
+    *size_ptr = (*entry).metadata.size
+
+    # created: u64 at offset 298
+    let created_ptr: *u64 = (out + 298) as *u64
+    *created_ptr = (*entry).metadata.created
+
+    # modified: u64 at offset 306
+    let modified_ptr: *u64 = (out + 306) as *u64
+    *modified_ptr = (*entry).metadata.modified
+
+    # mode: u32 at offset 314
+    let mode_ptr: *u32 = (out + 314) as *u32
+    *mode_ptr = (*entry).metadata.mode
+
+# Deserialize a directory entry from bytes
+pub fn kdir_entry_deserialize(data: *u8) -> KDirEntry
+    var entry: KDirEntry
+
+    # Name (256 bytes)
+    var i: i32 = 0
+    while i < 256
+        entry.name[i] = *(data + i)
+        i = i + 1
+
+    # name_len
+    entry.name_len = *(data + 256)
+
+    # kind
+    entry.kind = *(data + 257)
+
+    # blob_id
+    i = 0
+    while i < 32
+        entry.blob_id.hash[i] = *(data + 258 + i)
+        i = i + 1
+
+    # metadata
+    let size_ptr: *u64 = (data + 290) as *u64
+    entry.metadata.size = *size_ptr
+
+    let created_ptr: *u64 = (data + 298) as *u64
+    entry.metadata.created = *created_ptr
+
+    let modified_ptr: *u64 = (data + 306) as *u64
+    entry.metadata.modified = *modified_ptr
+
+    let mode_ptr: *u32 = (data + 314) as *u32
+    entry.metadata.mode = *mode_ptr
+
+    entry

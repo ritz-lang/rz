@@ -1,0 +1,325 @@
+# Kernel Namespace - Path to Content Mapping
+#
+# Maps human-readable paths to blob IDs.
+# Uses kalloc for memory instead of sys_mmap.
+
+import mm.heap { kalloc, kfree }
+import serial { StrView, prints, println }
+import fs.kblob { KBlobStore, KBlobId, kblob_store_get, kblob_store_get_size, kblob_store_put, kblob_id_zero, kblob_id_eq, kblob_id_is_zero, kblob_id_copy }
+import fs.kdir_entry { KDirEntry, KDIR_ENTRY_SIZE, kdir_entry_file, kdir_entry_dir, kdir_entry_is_dir, kdir_entry_name_eq, kdir_entry_serialize, kdir_entry_deserialize, kdir_serialized_size }
+import fs.kpath { path_is_absolute, path_is_root, path_parent, path_basename, path_validate, PathIter, path_iter_new, path_iter_next, strview_empty }
+
+# Maximum entries per directory
+const MAX_DIR_ENTRIES: i32 = 256
+
+# Error codes
+pub const KNS_OK: i32 = 0
+pub const KNS_NOT_FOUND: i32 = -2
+pub const KNS_ALREADY_EXISTS: i32 = -17
+pub const KNS_INVALID_PATH: i32 = -22
+pub const KNS_OUT_OF_SPACE: i32 = -28
+pub const KNS_NOT_A_FILE: i32 = -21
+
+# Kernel Namespace - maps paths to content
+pub struct KNamespace
+    store: *KBlobStore
+    root: KBlobId
+
+# Create a new empty namespace
+pub fn knamespace_new(store: *KBlobStore) -> KNamespace
+    # Create empty root directory (just a u32 count of 0)
+    var root_data: [4]u8
+    root_data[0] = 0
+    root_data[1] = 0
+    root_data[2] = 0
+    root_data[3] = 0
+
+    let root_id: KBlobId = kblob_store_put(store, @root_data[0], 4)
+
+    KNamespace {
+        store: store,
+        root: root_id
+    }
+
+# Get the root directory BlobId
+pub fn knamespace_root(ns: *KNamespace) -> KBlobId
+    kblob_id_copy(@(*ns).root)
+
+# Read directory entry count
+fn read_dir_count(ns: *KNamespace, dir_id: *KBlobId) -> i32
+    let data: *u8 = kblob_store_get((*ns).store, dir_id)
+    if data == 0 as *u8
+        return -1
+    let count_ptr: *u32 = data as *u32
+    *count_ptr as i32
+
+# Read directory entry at index
+fn read_dir_entry(ns: *KNamespace, dir_id: *KBlobId, index: i32) -> KDirEntry
+    let data: *u8 = kblob_store_get((*ns).store, dir_id)
+    let entry_offset: i32 = 4 + index * KDIR_ENTRY_SIZE
+    kdir_entry_deserialize(data + entry_offset)
+
+# Find entry in directory by name
+fn find_entry_in_dir(ns: *KNamespace, dir_id: *KBlobId, name: @StrView) -> i32
+    let count: i32 = read_dir_count(ns, dir_id)
+    if count < 0
+        return -1
+
+    var i: i32 = 0
+    while i < count
+        var entry: KDirEntry = read_dir_entry(ns, dir_id, i)
+        if kdir_entry_name_eq(@entry, name)
+            return i
+        i = i + 1
+
+    -1
+
+# Resolve a path to its BlobId
+pub fn knamespace_resolve(ns: *KNamespace, path: @StrView) -> KBlobId
+    if not path_is_absolute(path)
+        return kblob_id_zero()
+
+    if path_is_root(path)
+        return kblob_id_copy(@(*ns).root)
+
+    # Walk the path using iterator
+    var current_dir: KBlobId = kblob_id_copy(@(*ns).root)
+    var iter: PathIter = path_iter_new(path)
+    var component: StrView
+    var last_component: StrView = strview_empty()
+
+    while path_iter_next(@iter, @component)
+        # If we had a previous component, it must have been a directory
+        if last_component.len > 0
+            let entry_idx: i32 = find_entry_in_dir(ns, @current_dir, @last_component)
+            if entry_idx < 0
+                return kblob_id_zero()
+            var entry: KDirEntry = read_dir_entry(ns, @current_dir, entry_idx)
+            if not kdir_entry_is_dir(@entry)
+                return kblob_id_zero()
+            current_dir = kblob_id_copy(@entry.blob_id)
+
+        last_component = component
+
+    # Find the final component
+    if last_component.len == 0
+        return kblob_id_copy(@current_dir)
+
+    let entry_idx: i32 = find_entry_in_dir(ns, @current_dir, @last_component)
+    if entry_idx < 0
+        return kblob_id_zero()
+
+    var entry: KDirEntry = read_dir_entry(ns, @current_dir, entry_idx)
+    kblob_id_copy(@entry.blob_id)
+
+# Check if a path exists
+pub fn knamespace_exists(ns: *KNamespace, path: @StrView) -> bool
+    var id: KBlobId = knamespace_resolve(ns, path)
+    not kblob_id_is_zero(@id)
+
+# Read file content - returns pointer to data and sets size
+pub fn knamespace_read(ns: *KNamespace, path: @StrView, out_size: *u64) -> *u8
+    var id: KBlobId = knamespace_resolve(ns, path)
+    if kblob_id_is_zero(@id)
+        *out_size = 0
+        return 0 as *u8
+
+    let data: *u8 = kblob_store_get((*ns).store, @id)
+    *out_size = kblob_store_get_size((*ns).store, @id)
+    data
+
+# Get file size
+pub fn knamespace_file_size(ns: *KNamespace, path: @StrView) -> u64
+    var id: KBlobId = knamespace_resolve(ns, path)
+    if kblob_id_is_zero(@id)
+        return 0
+    kblob_store_get_size((*ns).store, @id)
+
+# Write/create a file
+# Note: For content-addressed FS, we need to propagate changes up to root
+pub fn knamespace_write(ns: *KNamespace, path: @StrView, data: *u8, size: u64) -> i32
+    if not path_validate(path)
+        return KNS_INVALID_PATH
+
+    if path_is_root(path)
+        return KNS_NOT_A_FILE
+
+    # Get parent and basename
+    let parent_path: StrView = path_parent(path)
+    let base_name: StrView = path_basename(path)
+
+    if base_name.len == 0
+        return KNS_INVALID_PATH
+
+    # Store the file content first
+    var file_id: KBlobId = kblob_store_put((*ns).store, data, size)
+    if kblob_id_is_zero(@file_id)
+        return KNS_OUT_OF_SPACE
+
+    # Now propagate the change up the tree
+    # We need to update each directory from the file's parent up to root
+    return update_path_recursive(ns, path, @file_id, size, 0)
+
+# Recursive helper to update a path and propagate changes to root
+fn update_path_recursive(ns: *KNamespace, path: @StrView, new_blob_id: *KBlobId, size: u64, is_dir: u8) -> i32
+    let parent_path: StrView = path_parent(path)
+    let base_name: StrView = path_basename(path)
+
+    if base_name.len == 0
+        return KNS_INVALID_PATH
+
+    # Check if parent is root (path_parent returns "/" for top-level entries)
+    let parent_is_root: bool = path_is_root(@parent_path) or parent_path.len == 0
+
+    # Find the parent directory's current blob ID
+    var parent_id: KBlobId
+    if parent_is_root
+        # Parent is root
+        parent_id = kblob_id_copy(@(*ns).root)
+    else
+        parent_id = knamespace_resolve(ns, @parent_path)
+        if kblob_id_is_zero(@parent_id)
+            return KNS_NOT_FOUND
+
+    # Create updated parent directory with new entry
+    var new_parent_id: KBlobId = create_updated_dir(ns, @parent_id, @base_name, new_blob_id, size, is_dir)
+    if kblob_id_is_zero(@new_parent_id)
+        return KNS_OUT_OF_SPACE
+
+    # If parent was root, update root and we're done
+    if parent_is_root
+        (*ns).root = new_parent_id
+        return KNS_OK
+
+    # Otherwise, recurse up to update the parent's parent
+    return update_path_recursive(ns, @parent_path, @new_parent_id, 0, 1)
+
+# Create a new directory blob with an added/updated entry
+fn create_updated_dir(ns: *KNamespace, dir_id: *KBlobId, name: @StrView, blob_id: *KBlobId, size: u64, is_dir: u8) -> KBlobId
+    let old_data: *u8 = kblob_store_get((*ns).store, dir_id)
+    if old_data == 0 as *u8
+        return kblob_id_zero()
+
+    let count_ptr: *u32 = old_data as *u32
+    let old_count: i32 = *count_ptr as i32
+
+    let existing_idx: i32 = find_entry_in_dir(ns, dir_id, name)
+
+    var new_count: i32
+    if existing_idx >= 0
+        new_count = old_count
+    else
+        new_count = old_count + 1
+
+    if new_count > MAX_DIR_ENTRIES
+        return kblob_id_zero()
+
+    # Allocate new directory blob
+    let new_size: u64 = kdir_serialized_size(new_count as u32)
+    let new_data: *u8 = kalloc(new_size)
+    if new_data == 0 as *u8
+        return kblob_id_zero()
+
+    let new_count_ptr: *u32 = new_data as *u32
+    *new_count_ptr = new_count as u32
+
+    # Copy existing entries (except the one we're replacing)
+    var write_idx: i32 = 0
+    var i: i32 = 0
+    while i < old_count
+        if i != existing_idx
+            var entry: KDirEntry = read_dir_entry(ns, dir_id, i)
+            kdir_entry_serialize(@entry, new_data + 4 + write_idx * KDIR_ENTRY_SIZE)
+            write_idx = write_idx + 1
+        i = i + 1
+
+    # Add the new/updated entry
+    var name_copy: StrView = StrView { ptr: name.ptr, len: name.len }
+    var new_entry: KDirEntry
+    if is_dir != 0
+        new_entry = kdir_entry_dir(name_copy, blob_id)
+    else
+        new_entry = kdir_entry_file(name_copy, blob_id, size)
+
+    kdir_entry_serialize(@new_entry, new_data + 4 + write_idx * KDIR_ENTRY_SIZE)
+
+    # Store new directory blob
+    let new_dir_id: KBlobId = kblob_store_put((*ns).store, new_data, new_size)
+
+    # Note: should free new_data here but kfree needs updating
+
+    new_dir_id
+
+# Create a directory
+pub fn knamespace_mkdir(ns: *KNamespace, path: @StrView) -> i32
+    if not path_validate(path)
+        return KNS_INVALID_PATH
+
+    if path_is_root(path)
+        return KNS_ALREADY_EXISTS
+
+    if knamespace_exists(ns, path)
+        return KNS_ALREADY_EXISTS
+
+    # Create empty directory blob
+    var empty_dir: [4]u8
+    empty_dir[0] = 0
+    empty_dir[1] = 0
+    empty_dir[2] = 0
+    empty_dir[3] = 0
+
+    var dir_id: KBlobId = kblob_store_put((*ns).store, @empty_dir[0], 4)
+    if kblob_id_is_zero(@dir_id)
+        return KNS_OUT_OF_SPACE
+
+    # Use the recursive update to propagate changes to root
+    return update_path_recursive(ns, path, @dir_id, 0, 1)
+
+# List directory contents
+pub fn knamespace_list(ns: *KNamespace, path: @StrView, entries: *KDirEntry, max_entries: i32) -> i32
+    var dir_id: KBlobId
+
+    if path_is_root(path)
+        dir_id = kblob_id_copy(@(*ns).root)
+    else
+        dir_id = knamespace_resolve(ns, path)
+        if kblob_id_is_zero(@dir_id)
+            return -1
+
+    let count: i32 = read_dir_count(ns, @dir_id)
+    if count < 0
+        return -1
+
+    var copy_count: i32 = count
+    if copy_count > max_entries
+        copy_count = max_entries
+
+    var i: i32 = 0
+    while i < copy_count
+        *(entries + i) = read_dir_entry(ns, @dir_id, i)
+        i = i + 1
+
+    count
+
+# ============================================================================
+# Global Kernel Namespace
+# ============================================================================
+
+var g_knamespace: KNamespace
+var g_knamespace_initialized: u8 = 0
+
+# Initialize the global kernel namespace
+pub fn knamespace_init(store: *KBlobStore) -> i32
+    if g_knamespace_initialized != 0
+        return 0
+
+    g_knamespace = knamespace_new(store)
+    g_knamespace_initialized = 1
+    prints("knamespace: initialized\n" as StrView)
+    0
+
+# Get the global kernel namespace
+pub fn knamespace_get() -> *KNamespace
+    if g_knamespace_initialized == 0
+        return 0 as *KNamespace
+    @g_knamespace

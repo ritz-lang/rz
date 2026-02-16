@@ -908,13 +908,16 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
 def find_llvm_tool(name: str) -> str:
     """Find LLVM tool, trying versioned names."""
     import shutil as shutil_mod
-    # For lld, prefer ld.lld over the generic wrapper
+    # For lld, prefer ld.lld over the generic wrapper, fall back to GNU ld
     if name == "lld":
         if shutil_mod.which("ld.lld"):
             return "ld.lld"
         for ver in ["20", "19", "18", "17", "16", "15"]:
             if shutil_mod.which(f"ld.lld-{ver}"):
                 return f"ld.lld-{ver}"
+        # Fall back to GNU ld if LLD is not available
+        if shutil_mod.which("ld"):
+            return "ld"
     # Try unversioned first
     if shutil_mod.which(name):
         return name
@@ -935,6 +938,7 @@ def compile_freestanding_binary(
     use_cache: bool = True,
     profile: dict = None,
     dependencies: dict[str, DependencySpec] = None,
+    source_roots: list[str] = None,
 ) -> Path:
     """Compile a freestanding binary (kernel, bootloader, etc.).
 
@@ -952,6 +956,7 @@ def compile_freestanding_binary(
         use_cache: Use build cache
         profile: Build profile
         dependencies: RFC #109 dependencies
+        source_roots: List of source directories to search for imports
     """
     import json
     import shutil as shutil_mod
@@ -967,8 +972,14 @@ def compile_freestanding_binary(
     code_model = bin_config.code_model
     no_red_zone = bin_config.no_red_zone
 
-    # Output binary path (ELF for kernels)
-    bin_path = out_dir / f"{name}.elf"
+    # UEFI targets need special handling
+    is_uefi = "uefi" in target.lower()
+
+    # Output binary path (ELF for kernels, EFI for UEFI)
+    if is_uefi:
+        bin_path = out_dir / f"{name.upper()}.EFI"
+    else:
+        bin_path = out_dir / f"{name}.elf"
 
     # Artifact directory
     if keep_artifacts:
@@ -978,7 +989,6 @@ def compile_freestanding_binary(
         artifact_dir = Path(tempfile.mkdtemp())
 
     # Find LLVM tools
-    llc = find_llvm_tool("llc")
     lld = find_llvm_tool("lld")
 
     # Collect object files to link
@@ -995,6 +1005,10 @@ def compile_freestanding_binary(
                 for dep_name, spec in dependencies.items()
             }
             cmd.extend(["--deps", json.dumps(deps_json)])
+        if source_roots:
+            # Resolve source roots to absolute paths relative to pkg_dir
+            abs_source_roots = [str(pkg_dir / sr) for sr in source_roots]
+            cmd.extend(["--sources", json.dumps(abs_source_roots)])
 
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
@@ -1024,6 +1038,10 @@ def compile_freestanding_binary(
                     for dep_name, spec in dependencies.items()
                 }
                 compile_cmd.extend(["--deps", json.dumps(deps_json)])
+            if source_roots:
+                # Resolve source roots to absolute paths relative to pkg_dir
+                abs_source_roots = [str(pkg_dir / sr) for sr in source_roots]
+                compile_cmd.extend(["--sources", json.dumps(abs_source_roots)])
 
             result = subprocess.run(compile_cmd, capture_output=True, text=True)
             if result.returncode != 0:
@@ -1031,22 +1049,36 @@ def compile_freestanding_binary(
                 return None
 
             # Compile LLVM IR to object file with target-specific options
-            llc_cmd = [
-                llc,
-                "-filetype=obj",
-                f"-mtriple={target}",
-                "-relocation-model=static",
-            ]
-            if code_model:
-                llc_cmd.append(f"-code-model={code_model}")
-            if no_red_zone:
-                llc_cmd.append("-mattr=+no-red-zone")
+            # Use clang -c which can compile .ll files directly (more portable than llc)
+            if is_uefi:
+                # UEFI: compile for Windows x64 ABI (produces COFF objects for lld-link)
+                clang_cmd = [
+                    "clang", "-c",
+                    "--target=x86_64-unknown-windows-gnu",  # Windows x64 target for COFF
+                    "-fshort-wchar",      # UEFI uses 16-bit wchar
+                    "-mno-red-zone",      # Required for UEFI
+                    "-fno-stack-protector",
+                    "-ffreestanding",
+                ]
+            else:
+                clang_cmd = [
+                    "clang", "-c",
+                    f"--target={target}",
+                    "-fPIC" if target.endswith("-linux") else "",
+                ]
+                # Filter out empty args
+                clang_cmd = [arg for arg in clang_cmd if arg]
 
-            llc_cmd.extend([str(ll_path), "-o", str(obj_path)])
+                if code_model:
+                    clang_cmd.append(f"-mcmodel={code_model}")
+                if no_red_zone:
+                    clang_cmd.append("-mno-red-zone")
 
-            result = subprocess.run(llc_cmd, capture_output=True, text=True)
+            clang_cmd.extend(["-o", str(obj_path), str(ll_path)])
+
+            result = subprocess.run(clang_cmd, capture_output=True, text=True)
             if result.returncode != 0:
-                print(f"  ✗ llc failed for {src.name}: {result.stderr}", file=sys.stderr)
+                print(f"  ✗ clang failed for {src.name}: {result.stderr}", file=sys.stderr)
                 return None
 
             object_files.append(obj_path)
@@ -1081,28 +1113,104 @@ def compile_freestanding_binary(
                 obj_path = artifact_dir / obj_name
 
                 # Use GNU as for assembly (supports .code32/.code64 directives)
+                # Run from pkg_dir so .incbin relative paths work
                 as_cmd = ["as", "--64", "-o", str(obj_path), str(asm_file)]
-                result = subprocess.run(as_cmd, capture_output=True, text=True)
+                result = subprocess.run(as_cmd, capture_output=True, text=True, cwd=str(pkg_dir))
                 if result.returncode != 0:
                     print(f"  ✗ as failed for {asm_file.name}: {result.stderr}", file=sys.stderr)
                     return None
 
                 object_files.append(obj_path)
 
-        # Step 4: Link with ld.lld
+        # Step 4: Link
         print(f"  ⚡ Linking {len(object_files)} object files...")
-        link_cmd = [lld]
 
-        if linker_script and linker_script.exists():
-            link_cmd.extend(["-T", str(linker_script)])
+        if is_uefi:
+            # UEFI: Use lld-link to directly produce PE/COFF EFI application
+            # This produces a proper PE32+ with optional header that UEFI expects
+            import shutil as shutil_mod
 
-        link_cmd.extend(["-o", str(bin_path)])
-        link_cmd.extend([str(obj) for obj in object_files])
+            # Check for lld-link
+            lld_link = shutil_mod.which("lld-link")
+            if lld_link:
+                # Direct PE/COFF linking with lld-link
+                print(f"  📦 Linking PE/COFF with lld-link...")
+                link_cmd = [
+                    lld_link,
+                    "/subsystem:efi_application",
+                    "/entry:efi_main",
+                    f"/out:{bin_path}",
+                ]
+                link_cmd.extend([str(obj) for obj in object_files])
 
-        result = subprocess.run(link_cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            print(f"  ✗ ld.lld linking failed: {result.stderr}", file=sys.stderr)
-            return None
+                result = subprocess.run(link_cmd, capture_output=True, text=True)
+                if result.returncode != 0:
+                    print(f"  ✗ lld-link failed: {result.stderr}", file=sys.stderr)
+                    return None
+            else:
+                # Fallback: Link as ELF shared object, then convert to PE with objcopy
+                # Note: This produces a minimal PE that may not work with all UEFI firmwares
+                elf_path = artifact_dir / f"{name}.so"
+
+                link_cmd = [
+                    lld,
+                    "-shared",
+                    "-Bsymbolic",
+                    "--no-undefined",
+                    "-o", str(elf_path),
+                ]
+                link_cmd.extend([str(obj) for obj in object_files])
+
+                result = subprocess.run(link_cmd, capture_output=True, text=True)
+                if result.returncode != 0:
+                    print(f"  ✗ Linking failed: {result.stderr}", file=sys.stderr)
+                    return None
+
+                # Convert ELF to PE using objcopy
+                print(f"  📦 Converting to PE/COFF (objcopy fallback)...")
+                objcopy_cmd = [
+                    "objcopy",
+                    "-j", ".text",
+                    "-j", ".rodata",
+                    "-j", ".data",
+                    "-j", ".bss",
+                    "-j", ".rela",
+                    "-O", "pei-x86-64",
+                    str(elf_path),
+                    str(bin_path),
+                ]
+                result = subprocess.run(objcopy_cmd, capture_output=True, text=True)
+                if result.returncode != 0:
+                    print(f"  ✗ objcopy failed: {result.stderr}", file=sys.stderr)
+                    return None
+
+                # Fix PE subsystem field - objcopy doesn't set it correctly for UEFI
+                # The subsystem field is at offset 0x5C in the PE optional header
+                # Value 10 = EFI Application
+                print(f"  🔧 Fixing PE subsystem...")
+                with open(bin_path, 'r+b') as f:
+                    # Read DOS header to find PE header offset
+                    f.seek(0x3C)
+                    pe_offset = int.from_bytes(f.read(4), 'little')
+                    # Subsystem is at PE + 0x5C (in optional header)
+                    subsystem_offset = pe_offset + 0x5C
+                    f.seek(subsystem_offset)
+                    # Write EFI Application subsystem (10)
+                    f.write((10).to_bytes(2, 'little'))
+        else:
+            # Normal freestanding ELF linking
+            link_cmd = [lld]
+
+            if linker_script and linker_script.exists():
+                link_cmd.extend(["-T", str(linker_script)])
+
+            link_cmd.extend(["-o", str(bin_path)])
+            link_cmd.extend([str(obj) for obj in object_files])
+
+            result = subprocess.run(link_cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                print(f"  ✗ ld.lld linking failed: {result.stderr}", file=sys.stderr)
+                return None
 
         return bin_path
 
@@ -1173,6 +1281,7 @@ def build_package(pkg_dir: Path, config: dict, keep_artifacts: bool = False, use
                 use_cache=use_cache,
                 profile=profile,
                 dependencies=dependencies,
+                source_roots=source_roots,
             )
         else:
             # Standard hosted build
@@ -1183,16 +1292,16 @@ def build_package(pkg_dir: Path, config: dict, keep_artifacts: bool = False, use
             else:
                 print(f"  🔨 {bin_config.name} <- {src_rel}", end="")
 
-        bin_path = compile_binary(
-            bin_config.name, bin_config.src_path, out_dir,
-            additional_sources=bin_config.additional_sources,
-            keep_artifacts=keep_artifacts,
-            use_cache=use_cache,
-            profile=profile,
-            dependencies=dependencies,
-            pkg_dir=pkg_dir,
-            source_roots=source_roots
-        )
+            bin_path = compile_binary(
+                bin_config.name, bin_config.src_path, out_dir,
+                additional_sources=bin_config.additional_sources,
+                keep_artifacts=keep_artifacts,
+                use_cache=use_cache,
+                profile=profile,
+                dependencies=dependencies,
+                pkg_dir=pkg_dir,
+                source_roots=source_roots
+            )
         if bin_path:
             try:
                 rel_path = bin_path.relative_to(ROOT)
@@ -1220,10 +1329,11 @@ def run_tests(pkg_dir: Path, config: dict) -> bool:
     # Collect all .ritz test files
     ritz_tests = []
 
-    # Check test/ subdirectory
-    test_dir = pkg_dir / "test"
-    if test_dir.exists():
-        ritz_tests.extend(test_dir.glob("*.ritz"))
+    # Check test/ and tests/ subdirectories
+    for subdir in ["test", "tests"]:
+        test_dir = pkg_dir / subdir
+        if test_dir.exists():
+            ritz_tests.extend(test_dir.glob("*.ritz"))
 
     # For test-only packages, also check package root for test_*.ritz files
     is_test_only = config.get("build", {}).get("test_only", False)

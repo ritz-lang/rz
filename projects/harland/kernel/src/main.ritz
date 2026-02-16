@@ -28,6 +28,11 @@ import cap.types { CapHandle, CapEntry, CapInfo, CAP_TYPE_NONE, CAP_TYPE_MEMORY,
 import cap.table { CapTable, CAP_TABLE_SIZE, cap_table_init, cap_table_alloc, cap_table_free, cap_table_get, cap_table_insert, cap_table_lookup, cap_table_remove, cap_table_derive, cap_grant, cap_table_info, cap_has_rights, cap_system_debug_print }
 import cap.syscall { SYS_CAP_GRANT, SYS_CAP_REVOKE, SYS_CAP_DERIVE, SYS_CAP_INFO, SYS_CAP_CHECK, sys_cap_grant, sys_cap_revoke, sys_cap_derive, sys_cap_info, sys_cap_check }
 import drivers.virtio.blk { VirtioBlkDevice, virtio_blk_init, virtio_blk_read, virtio_blk_write, virtio_blk_get_capacity, virtio_blk_get_device, virtio_blk_test }
+import fs.kblob { KBlobId, kblob_init, kblob_get_store, kblob_store_put, kblob_store_get, kblob_store_exists, kblob_id_eq, kblob_id_is_zero }
+import fs.vfs { vfs_init, fd_table_init }
+import fs.knamespace { knamespace_init, knamespace_get, knamespace_mkdir, knamespace_write, knamespace_read, knamespace_exists, KNS_OK }
+import fs.syscall { fs_syscall_init, sys_open, sys_close, sys_fs_read, sys_fs_write, sys_lseek, is_fs_fd }
+import fs.initramfs { initramfs_load }
 
 # ============================================================================
 # Kernel Ring Buffer (Early Boot Debug)
@@ -1800,6 +1805,15 @@ fn tss_init() -> i32
     tss.ist1 = ist_top
 
     tss.iopb_offset = 104
+
+    # Debug: Print TSS stack values
+    prints("      TSS RSP0: 0x")
+    serial_print_hex(tss.rsp0)
+    prints("\n")
+    prints("      TSS IST1: 0x")
+    serial_print_hex(tss.ist1)
+    prints("\n")
+
     return 0
 
 # GDT reload is done in assembly (boot.s already set up segments)
@@ -1986,9 +2000,9 @@ fn idt_init() -> i32
     idt_set_gate(9, isr_stub_9 as u64, cs, 0, IDT_GATE_INTERRUPT)
     idt_set_gate(10, isr_stub_10 as u64, cs, 0, IDT_GATE_INTERRUPT)
     idt_set_gate(11, isr_stub_11 as u64, cs, 0, IDT_GATE_INTERRUPT)
-    idt_set_gate(12, isr_stub_12 as u64, cs, 0, IDT_GATE_INTERRUPT)
-    idt_set_gate(13, isr_stub_13 as u64, cs, 0, IDT_GATE_INTERRUPT)
-    idt_set_gate(14, isr_stub_14 as u64, cs, 0, IDT_GATE_INTERRUPT)
+    idt_set_gate(12, isr_stub_12 as u64, cs, 1, IDT_GATE_INTERRUPT)  # SS fault - use IST1 for safety
+    idt_set_gate(13, isr_stub_13 as u64, cs, 1, IDT_GATE_INTERRUPT)  # GP fault - use IST1 for safety
+    idt_set_gate(14, isr_stub_14 as u64, cs, 1, IDT_GATE_INTERRUPT)  # Page fault - use IST1 for safety
     idt_set_gate(15, isr_stub_15 as u64, cs, 0, IDT_GATE_INTERRUPT)
     idt_set_gate(16, isr_stub_16 as u64, cs, 0, IDT_GATE_INTERRUPT)
     idt_set_gate(17, isr_stub_17 as u64, cs, 0, IDT_GATE_INTERRUPT)
@@ -2008,7 +2022,8 @@ fn idt_init() -> i32
     idt_set_gate(31, isr_stub_31 as u64, cs, 0, IDT_GATE_INTERRUPT)
 
     # IRQ handlers (32-47)
-    idt_set_gate(32, irq_stub_0 as u64, cs, 0, IDT_GATE_INTERRUPT)
+    # Timer (IRQ0) uses IST1 to ensure clean stack switching from Ring 3
+    idt_set_gate(32, irq_stub_0 as u64, cs, 1, IDT_GATE_INTERRUPT)
     idt_set_gate(33, irq_stub_1 as u64, cs, 0, IDT_GATE_INTERRUPT)
     idt_set_gate(34, irq_stub_2 as u64, cs, 0, IDT_GATE_INTERRUPT)
     idt_set_gate(35, irq_stub_3 as u64, cs, 0, IDT_GATE_INTERRUPT)
@@ -2370,6 +2385,7 @@ const ACPI_SIG_RSDP: u64 = 0x2052545020445352  # "RSD PTR " in little endian
 const ACPI_SIG_RSDT: u32 = 0x54445352  # "RSDT"
 const ACPI_SIG_XSDT: u32 = 0x54445358  # "XSDT"
 const ACPI_SIG_MADT: u32 = 0x43495041  # "APIC"
+const ACPI_SIG_FADT: u32 = 0x50434146  # "FACP" (Fixed ACPI Description Table)
 
 # RSDP (Root System Description Pointer) - ACPI 1.0
 struct AcpiRsdp
@@ -2449,15 +2465,80 @@ struct MadtIntSrcOverride
     gsi: u32
     flags: u16
 
+# FADT (Fixed ACPI Description Table) - Contains PM1a/PM1b control block addresses
+# Note: This is a simplified structure - full FADT is much larger
+struct AcpiFadt
+    header: AcpiTableHeader
+    firmware_ctrl: u32      # Physical address of FACS
+    dsdt: u32               # Physical address of DSDT
+    reserved1: u8
+    preferred_pm_profile: u8
+    sci_int: u16            # SCI interrupt vector
+    smi_cmd: u32            # SMI command port
+    acpi_enable: u8         # Value to write to SMI_CMD to enable ACPI
+    acpi_disable: u8        # Value to write to SMI_CMD to disable ACPI
+    s4bios_req: u8
+    pstate_cnt: u8
+    pm1a_evt_blk: u32       # PM1a Event Block address
+    pm1b_evt_blk: u32       # PM1b Event Block address
+    pm1a_cnt_blk: u32       # PM1a Control Block address (for shutdown)
+    pm1b_cnt_blk: u32       # PM1b Control Block address (for shutdown)
+    pm2_cnt_blk: u32
+    pm_tmr_blk: u32
+    gpe0_blk: u32
+    gpe1_blk: u32
+    pm1_evt_len: u8
+    pm1_cnt_len: u8
+    pm2_cnt_len: u8
+    pm_tmr_len: u8
+    gpe0_blk_len: u8
+    gpe1_blk_len: u8
+    gpe1_base: u8
+    cst_cnt: u8
+    p_lvl2_lat: u16
+    p_lvl3_lat: u16
+    flush_size: u16
+    flush_stride: u16
+    duty_offset: u8
+    duty_width: u8
+    day_alarm: u8
+    mon_alarm: u8
+    century: u8
+    iapc_boot_arch: u16     # IA-PC Boot Architecture Flags (ACPI 2.0+)
+    reserved2: u8
+    flags: u32
+    # ACPI 2.0+ extended fields follow...
+    reset_reg: [12]u8       # Generic Address Structure
+    reset_value: u8
+    arm_boot_arch: u16      # ARM Boot Architecture Flags (ACPI 5.1+)
+    fadt_minor_version: u8
+    x_firmware_ctrl: u64
+    x_dsdt: u64
+    x_pm1a_evt_blk: [12]u8
+    x_pm1b_evt_blk: [12]u8
+    x_pm1a_cnt_blk: [12]u8  # Extended PM1a Control Block
+    x_pm1b_cnt_blk: [12]u8  # Extended PM1b Control Block
+
+# ACPI PM1 control register bits
+const ACPI_SLP_TYP_S5: u16 = 0x1C00  # Sleep type for S5 (shutdown) - varies by system
+const ACPI_SLP_EN: u16 = 0x2000     # Sleep enable bit
+
 # Global ACPI state
 var acpi_rsdp_addr: u64 = 0  # Set from Multiboot2 or BIOS scan
 var acpi_rsdt_addr: u32 = 0
 var acpi_xsdt_addr: u64 = 0
 var acpi_madt_addr: u64 = 0
+var acpi_fadt_addr: u64 = 0
 var local_apic_addr: u64 = 0
 var io_apic_addr: u64 = 0
 var num_cpus: u32 = 0
 var cpu_apic_ids: [16]u8
+
+# ACPI power management state (from FADT)
+var acpi_pm1a_cnt_blk: u32 = 0  # PM1a Control Block I/O port
+var acpi_pm1b_cnt_blk: u32 = 0  # PM1b Control Block I/O port (optional)
+var acpi_slp_typa: u16 = 0      # Sleep type value for S5 (from \_S5 DSDT object)
+var acpi_slp_typb: u16 = 0      # Sleep type value for S5 PM1b (from \_S5 DSDT object)
 
 # Find ACPI RSDP from Multiboot2 tags
 fn acpi_find_from_multiboot(mb_info: *Mb2BootInfo) -> u64
@@ -2577,6 +2658,118 @@ fn acpi_find_madt() -> u64
 
     return 0
 
+# Find FADT in RSDT/XSDT
+fn acpi_find_fadt() -> u64
+    if acpi_xsdt_addr != 0
+        # Use XSDT (64-bit pointers)
+        let xsdt: *AcpiTableHeader = acpi_xsdt_addr as *AcpiTableHeader
+        let num_entries: u32 = ((*xsdt).length - 36) / 8
+        let entries: *u64 = (acpi_xsdt_addr + 36) as *u64
+
+        var i: u32 = 0
+        while i < num_entries
+            let entry_addr: u64 = *(entries + i as i64)
+            # Ensure this table is mapped before reading
+            if vmm_ensure_mapped(entry_addr, 64) != 0
+                i = i + 1
+                continue
+            let table: *AcpiTableHeader = entry_addr as *AcpiTableHeader
+            if (*table).signature == ACPI_SIG_FADT
+                return entry_addr
+            i = i + 1
+    else if acpi_rsdt_addr != 0
+        # Use RSDT (32-bit pointers)
+        let rsdt: *AcpiTableHeader = acpi_rsdt_addr as u64 as *AcpiTableHeader
+        let num_entries: u32 = ((*rsdt).length - 36) / 4
+        let entries: *u32 = (acpi_rsdt_addr as u64 + 36) as *u32
+
+        var i: u32 = 0
+        while i < num_entries
+            let entry_addr: u32 = *(entries + i as i64)
+            # Ensure this table is mapped before reading
+            if vmm_ensure_mapped(entry_addr as u64, 64) != 0
+                i = i + 1
+                continue
+            let table: *AcpiTableHeader = entry_addr as u64 as *AcpiTableHeader
+            if (*table).signature == ACPI_SIG_FADT
+                return entry_addr as u64
+            i = i + 1
+
+    return 0
+
+# Parse FADT to get PM1 control block addresses
+fn acpi_parse_fadt(fadt_addr: u64) -> i32
+    let fadt: *AcpiFadt = fadt_addr as *AcpiFadt
+
+    # Ensure the full FADT is mapped
+    let fadt_length: u64 = (*fadt).header.length as u64
+    if vmm_ensure_mapped(fadt_addr, fadt_length) != 0
+        prints("      ERROR: Failed to map FADT!\n")
+        return -1
+
+    # Get PM1a/PM1b Control Block addresses
+    acpi_pm1a_cnt_blk = (*fadt).pm1a_cnt_blk
+    acpi_pm1b_cnt_blk = (*fadt).pm1b_cnt_blk
+
+    prints("      PM1a Control Block: ")
+    serial_print_hex(acpi_pm1a_cnt_blk as u64)
+    prints("\n")
+
+    if acpi_pm1b_cnt_blk != 0
+        prints("      PM1b Control Block: ")
+        serial_print_hex(acpi_pm1b_cnt_blk as u64)
+        prints("\n")
+
+    # For QEMU, we need to determine SLP_TYP for S5 state
+    # The proper way is to parse DSDT's \_S5 object, but that requires AML parsing
+    # QEMU typically uses SLP_TYP = 0 for S5, but we'll try common values
+    # QEMU default: SLP_TYP_S5 = 0 (bits 10-12 = 0)
+    # Some systems: SLP_TYP_S5 = 5 (bits 10-12 = 5, so 0x1400)
+    # We'll use QEMU's default (SLP_TYP = 0)
+    acpi_slp_typa = 0  # SLP_TYP for PM1a (QEMU default)
+    acpi_slp_typb = 0  # SLP_TYP for PM1b
+
+    return 0
+
+# Perform ACPI S5 (shutdown) power off
+pub fn acpi_poweroff() -> i32
+    if acpi_pm1a_cnt_blk == 0
+        prints("[ACPI] ERROR: PM1a control block not found!\n")
+        return -1
+
+    prints("[ACPI] Initiating S5 shutdown...\n")
+
+    # Disable interrupts before shutdown
+    disable_interrupts()
+
+    # Write SLP_TYP + SLP_EN to PM1a_CNT
+    # SLP_EN is bit 13 (0x2000)
+    # SLP_TYP is bits 10-12
+    let pm1a_value: u16 = (acpi_slp_typa << 10) | ACPI_SLP_EN
+    outw(acpi_pm1a_cnt_blk as u16, pm1a_value)
+
+    # If PM1b exists, write to it too
+    if acpi_pm1b_cnt_blk != 0
+        let pm1b_value: u16 = (acpi_slp_typb << 10) | ACPI_SLP_EN
+        outw(acpi_pm1b_cnt_blk as u16, pm1b_value)
+
+    # If we get here, shutdown didn't work
+    # Try alternative SLP_TYP values (some systems need different values)
+    var slp_typ: u16 = 1
+    while slp_typ < 8
+        let pm1a_value: u16 = (slp_typ << 10) | ACPI_SLP_EN
+        outw(acpi_pm1a_cnt_blk as u16, pm1a_value)
+
+        # Small delay
+        var delay: i32 = 0
+        while delay < 100000
+            delay = delay + 1
+
+        slp_typ = slp_typ + 1
+
+    prints("[ACPI] ERROR: Shutdown failed!\n")
+    return -1
+
 # Parse MADT to find APIC info
 fn acpi_parse_madt(madt_addr: u64) -> i32
     let madt: *MadtHeader = madt_addr as *MadtHeader
@@ -2667,6 +2860,18 @@ fn acpi_init_with_mb(mb_info: *Mb2BootInfo) -> i32
 
     acpi_parse_madt(acpi_madt_addr)
 
+    # Also find FADT for power management (shutdown support)
+    prints("    Searching for FADT...")
+    acpi_fadt_addr = acpi_find_fadt()
+
+    if acpi_fadt_addr == 0
+        prints(" not found (shutdown disabled)\n")
+    else
+        prints(" found at ")
+        serial_print_hex(acpi_fadt_addr)
+        prints("\n")
+        acpi_parse_fadt(acpi_fadt_addr)
+
     return 0
 
 # Initialize ACPI from Harland boot info (UEFI boot path - RSDP already known)
@@ -2696,6 +2901,18 @@ fn acpi_init_from_bootinfo(info: *HarlandBootInfo) -> i32
     prints("\n")
 
     acpi_parse_madt(acpi_madt_addr)
+
+    # Also find FADT for power management (shutdown support)
+    prints("    Searching for FADT...")
+    acpi_fadt_addr = acpi_find_fadt()
+
+    if acpi_fadt_addr == 0
+        prints(" not found (shutdown disabled)\n")
+    else
+        prints(" found at ")
+        serial_print_hex(acpi_fadt_addr)
+        prints("\n")
+        acpi_parse_fadt(acpi_fadt_addr)
 
     return 0
 
@@ -3375,6 +3592,7 @@ const SYS_CLOSE: u64 = 3     # TODO: implement
 const SYS_EXIT: u64 = 20
 const SYS_YIELD: u64 = 21
 const SYS_GETPID: u64 = 22
+const SYS_ACPI_POWEROFF: u64 = 200  # Shutdown the system via ACPI
 const SYS_DEBUG_PRINT: u64 = 255
 
 # rdmsr and wrmsr are imported from io module
@@ -3384,7 +3602,47 @@ pub fn syscall_init() -> i32
     let efer: u64 = rdmsr(MSR_EFER)
     wrmsr(MSR_EFER, efer | EFER_SCE)
 
-    # Set up STAR MSR - kernel CS in bits 47:32
+    # Set up STAR MSR
+    # Bits 47:32 = kernel CS (used on SYSCALL entry)
+    # Bits 63:48 = user segment base (used for SYSRET to compute user CS/SS)
+    #   SYSRET sets CS = STAR[63:48] + 16, SS = STAR[63:48] + 8
+    #   Our user code is selector 0x18+3=0x1B, user data is 0x20+3=0x23
+    #   So we need STAR[63:48] = 0x10 (0x10+16=0x20, but with RPL 3 = 0x23 for data)
+    #   Actually SYSRET adds RPL 3 automatically, so:
+    #     User CS = (STAR[63:48] + 16) | 3 = should give 0x1B
+    #     User SS = (STAR[63:48] + 8) | 3 = should give 0x23
+    #   0x1B = 0x18 | 3 = (0x10 + 8) | 3, so STAR[63:48] should be 0x10? No wait...
+    #   Actually: (STAR[63:48] + 16) | 3 = 0x1B means STAR[63:48] = 0x08
+    #   Because (0x08 + 16) | 3 = (0x08 + 0x10) | 3 = 0x18 | 3 = 0x1B  ✓
+    #   And user SS = (0x08 + 8) | 3 = 0x10 | 3 = 0x13... but we want 0x23!
+    #
+    # Wait, this is wrong. Let me reconsider.
+    # In our GDT: user code = index 3 (selector 0x18), user data = index 4 (selector 0x20)
+    # SYSRET computes:
+    #   CS = (STAR[63:48] + 16) | 3
+    #   SS = (STAR[63:48] + 8) | 3
+    # For CS = 0x1B = 0x18 | 3, we need STAR[63:48] + 16 = 0x18, so STAR[63:48] = 0x08
+    # For SS = 0x23 = 0x20 | 3, we need STAR[63:48] + 8 = 0x20, so STAR[63:48] = 0x18
+    # These are inconsistent! Our GDT layout doesn't match SYSRET's expectations.
+    #
+    # SYSRET expects:
+    #   Index N: 32-bit user code
+    #   Index N+1: user data  (used for SS)
+    #   Index N+2: 64-bit user code (used for CS)
+    #
+    # But our GDT is:
+    #   Index 0: NULL
+    #   Index 1: kernel code (0x08)
+    #   Index 2: kernel data (0x10)
+    #   Index 3: user code (0x18/0x1B)
+    #   Index 4: user data (0x20/0x23)
+    #
+    # We could use SYSRET with STAR[63:48] = 0x10, giving:
+    #   CS = 0x10 + 16 | 3 = 0x20 | 3 = 0x23 (wrong - that's our data segment!)
+    #   SS = 0x10 + 8 | 3 = 0x18 | 3 = 0x1B (wrong - that's our code segment!)
+    #
+    # Our GDT doesn't support SYSRET! We use IRETQ instead (which is fine).
+    # For SYSCALL entry, we only need bits 47:32 (kernel CS).
     let star: u64 = (0x08 as u64) << 32
     wrmsr(MSR_STAR, star)
 
@@ -3396,8 +3654,28 @@ pub fn syscall_init() -> i32
     let sfmask: u64 = 0x200
     wrmsr(MSR_SFMASK, sfmask)
 
-    prints("      LSTAR: ")
-    serial_print_hex(entry_addr)
+    # DEBUG: Read back MSRs to verify they're set correctly
+    let efer_check: u64 = rdmsr(MSR_EFER)
+    let star_check: u64 = rdmsr(MSR_STAR)
+    let lstar_check: u64 = rdmsr(MSR_LSTAR)
+    let sfmask_check: u64 = rdmsr(MSR_SFMASK)
+
+    prints("      EFER:   ")
+    serial_print_hex(efer_check)
+    prints(" (SCE=")
+    if (efer_check & EFER_SCE) != 0
+        prints("1")
+    else
+        prints("0")
+    prints(")\n")
+    prints("      STAR:   ")
+    serial_print_hex(star_check)
+    prints("\n")
+    prints("      LSTAR:  ")
+    serial_print_hex(lstar_check)
+    prints("\n")
+    prints("      SFMASK: ")
+    serial_print_hex(sfmask_check)
     prints("\n")
 
     return 0
@@ -3405,20 +3683,43 @@ pub fn syscall_init() -> i32
 # Syscall handler (called from assembly)
 pub fn syscall_handler(rax: u64, rdi: u64, rsi: u64, rdx: u64) -> i64
     if rax == SYS_EXIT
-        prints("[syscall] exit(")
+        prints("\n[userspace] exit(")
         serial_print_dec(rdi)
         prints(")\n")
         # For now, halt
         halt_loop()
         return 0
 
+    # SYS_OPEN - Open a file
+    if rax == SYS_OPEN
+        # rdi = path pointer
+        # rsi = path length
+        # rdx = flags
+        return sys_open(rdi as *u8, rsi, rdx as i32)
+
+    # SYS_CLOSE - Close a file descriptor
+    if rax == SYS_CLOSE
+        let fd: i32 = rdi as i32
+        # Check if it's a filesystem fd
+        if is_fs_fd(fd)
+            return sys_close(fd)
+        # Otherwise, return success (stdin/stdout/stderr don't close)
+        return 0
+
     if rax == SYS_WRITE or rax == SYS_DEBUG_PRINT
         # Linux/POSIX write convention:
-        #   rdi = fd (ignored for now, always write to serial)
+        #   rdi = fd
         #   rsi = buf
         #   rdx = count
+        let fd: i32 = rdi as i32
         let buf: *u8 = rsi as *u8
         let len: i64 = rdx as i64
+
+        # Check if it's a filesystem fd
+        if is_fs_fd(fd)
+            return sys_fs_write(fd, buf, len as u64)
+
+        # Otherwise, write to serial (fd 1 = stdout, fd 2 = stderr)
         var i: i64 = 0
         while i < len
             serial_write_byte(*(buf + i))
@@ -3427,14 +3728,18 @@ pub fn syscall_handler(rax: u64, rdi: u64, rsi: u64, rdx: u64) -> i64
 
     if rax == SYS_READ
         # Linux/POSIX read convention:
-        #   rdi = fd (0 = stdin, which we map to serial)
+        #   rdi = fd
         #   rsi = buf
         #   rdx = count
-        let fd: u64 = rdi
+        let fd: i32 = rdi as i32
         let buf: *u8 = rsi as *u8
         let count: i64 = rdx as i64
 
-        # Only support stdin (fd 0) for now
+        # Check if it's a filesystem fd
+        if is_fs_fd(fd)
+            return sys_fs_read(fd, buf, count as u64)
+
+        # Only support stdin (fd 0) for serial input
         if fd != 0
             return -1  # EBADF
 
@@ -3482,6 +3787,13 @@ pub fn syscall_handler(rax: u64, rdi: u64, rsi: u64, rdx: u64) -> i64
 
     if rax == SYS_CAP_CHECK
         return sys_cap_check(1, rdi, rsi as u32)
+
+    # ACPI power management syscalls
+    if rax == SYS_ACPI_POWEROFF
+        prints("[syscall] ACPI poweroff requested\n")
+        let result: i32 = acpi_poweroff()
+        # If we get here, poweroff failed
+        return result as i64
 
     # Unknown syscall
     prints("[syscall] unknown: ")
@@ -3993,9 +4305,17 @@ fn test_elf_userspace() -> i32
         pmm_free_page(stack_page)
         return -1
 
-    let stack_top: u64 = stack_vaddr + PAGE_SIZE
+    # Stack top should point INTO the mapped page, not one byte past it!
+    # The stack grows down, so first push will go to (RSP - 8).
+    # We want that to land within the mapped page [stack_vaddr, stack_vaddr + PAGE_SIZE).
+    # So RSP should be at most (stack_vaddr + PAGE_SIZE), and first push lands at
+    # (stack_vaddr + PAGE_SIZE - 8) = 0x7FFFFFFFEFF8 which IS in the page.
+    # BUT: The IRET itself doesn't push anything. The issue is that when we LOAD
+    # RSP = 0x7FFFFFFFF000, that address must be accessible (for some operations).
+    # Let's set it to 0x7FFFFFFFEFF0 (16-byte aligned, well within the page).
+    let stack_top: u64 = stack_vaddr + PAGE_SIZE - 16
 
-    # Flush TLB
+    # Flush TLB for the new mappings
     vmm_flush_tlb_all()
 
     prints("  Jumping to ELF entry at 0x")
@@ -4006,6 +4326,9 @@ fn test_elf_userspace() -> i32
 
     # Jump to userspace
     jump_to_userspace(load_result.entry_point, stack_top)
+
+    # This should never execute
+    prints("  ERROR: Returned from jump_to_userspace!\n")
 
     # Should not return
     return 0
@@ -4525,6 +4848,78 @@ fn test_capability_system() -> i32
     return 0
 
 # ============================================================================
+# Filesystem Quick Test
+# ============================================================================
+
+fn fs_quick_test() -> i32
+    prints("\n  Testing filesystem...\n")
+
+    let ns: *fs.knamespace.KNamespace = knamespace_get()
+    if ns == 0 as *fs.knamespace.KNamespace
+        prints("    FAIL: No namespace\n")
+        return -1
+
+    # Test 1: Create a directory
+    let mkdir_path: StrView = "/test" as StrView
+    let mkdir_result: i32 = knamespace_mkdir(ns, @mkdir_path)
+    if mkdir_result == KNS_OK
+        prints("    [OK] mkdir /test\n")
+    else
+        prints("    [!!] mkdir /test failed\n")
+
+    # Test 2: Create a file
+    var test_data: [12]u8
+    test_data[0] = 72   # H
+    test_data[1] = 101  # e
+    test_data[2] = 108  # l
+    test_data[3] = 108  # l
+    test_data[4] = 111  # o
+    test_data[5] = 32   # (space)
+    test_data[6] = 70   # F
+    test_data[7] = 83   # S
+    test_data[8] = 33   # !
+    test_data[9] = 10   # \n
+    test_data[10] = 0
+
+    let write_path: StrView = "/test/hello.txt" as StrView
+    let write_result: i32 = knamespace_write(ns, @write_path, @test_data[0], 10)
+    if write_result == KNS_OK
+        prints("    [OK] write /test/hello.txt\n")
+    else
+        prints("    [!!] write /test/hello.txt failed\n")
+
+    # Test 3: Check file exists
+    if knamespace_exists(ns, @write_path)
+        prints("    [OK] exists /test/hello.txt\n")
+    else
+        prints("    [!!] exists /test/hello.txt failed\n")
+
+    # Test 4: Read file back
+    var read_size: u64 = 0
+    let read_data: *u8 = knamespace_read(ns, @write_path, @read_size)
+    if read_data != 0 as *u8 and read_size == 10
+        prints("    [OK] read /test/hello.txt (")
+        serial_print_dec(read_size)
+        prints(" bytes)\n")
+        # Verify content
+        var content_ok: u8 = 1
+        var i: u64 = 0
+        while i < read_size
+            if *(read_data + i) != test_data[i]
+                content_ok = 0
+                break
+            i = i + 1
+        if content_ok != 0
+            prints("    [OK] content verified\n")
+        else
+            prints("    [!!] content mismatch\n")
+    else
+        prints("    [!!] read /test/hello.txt failed\n")
+
+    prints("  Filesystem test complete.\n")
+    0
+
+# ============================================================================
 # Kernel Entry Point
 # ============================================================================
 
@@ -4632,6 +5027,38 @@ pub fn kernel_main(boot_info_addr: u64) -> i32
         prints(" KB)\n")
     else
         klog(c"\r  [!!] Kernel heap (init failed)\n")
+
+    # Initialize Kernel Filesystem Layer
+    klog(c"  [..] Kernel blob store")
+    kblob_init()
+    klog(c"\r  [OK] Kernel blob store\n")
+
+    klog(c"  [..] VFS layer")
+    vfs_init()
+    fd_table_init()
+    klog(c"\r  [OK] VFS layer\n")
+
+    # Initialize kernel namespace (Goliath integration)
+    klog(c"  [..] Kernel namespace")
+    let kns_store: *fs.kblob.KBlobStore = kblob_get_store()
+    if kns_store != 0 as *fs.kblob.KBlobStore
+        knamespace_init(kns_store)
+        klog(c"\r  [OK] Kernel namespace\n")
+
+        # Initialize filesystem syscalls
+        klog(c"  [..] Filesystem syscalls")
+        fs_syscall_init()
+        klog(c"\r  [OK] Filesystem syscalls\n")
+
+        # Load initial filesystem
+        klog(c"  [..] Initial filesystem")
+        initramfs_load()
+        klog(c"\r  [OK] Initial filesystem\n")
+
+        # Test filesystem operations
+        fs_quick_test()
+    else
+        klog(c"\r  [!!] Kernel namespace (no store)\n")
 
     # Initialize APIC based on boot protocol
     if boot_protocol == BOOT_PROTOCOL_HARLAND

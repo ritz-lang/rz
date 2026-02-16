@@ -1,0 +1,178 @@
+# Kernel Path Utilities
+#
+# Simple path operations for kernel filesystem.
+# Uses StrView from serial module.
+
+import serial { StrView }
+
+# Constants
+# Note: VFS defines PATH_MAX as u64, we use KPATH_MAX internally for validation
+const KPATH_MAX: i64 = 4096
+pub const NAME_MAX: i64 = 255
+pub const PATH_SEP: u8 = 47  # '/'
+
+# Create a StrView from pointer and length
+pub fn strview_from_ptr(ptr: *u8, len: i64) -> StrView
+    StrView { ptr: ptr, len: len }
+
+# Create an empty StrView
+pub fn strview_empty() -> StrView
+    StrView { ptr: 0 as *u8, len: 0 }
+
+# Slice a StrView (takes const borrow, returns new StrView)
+pub fn strview_slice(s: @StrView, start: i64, end: i64) -> StrView
+    if start >= end or start >= s.len
+        return strview_empty()
+    var actual_end: i64 = end
+    if actual_end > s.len
+        actual_end = s.len
+    StrView { ptr: s.ptr + start, len: actual_end - start }
+
+# Check if a path is absolute (starts with /)
+pub fn path_is_absolute(path: @StrView) -> bool
+    path.len > 0 and *(path.ptr) == PATH_SEP
+
+# Check if a path is the root path
+pub fn path_is_root(path: @StrView) -> bool
+    path.len == 1 and *(path.ptr) == PATH_SEP
+
+# Get the parent path (everything before last component)
+# "/a/b/c" -> "/a/b"
+# "/foo" -> "/"
+# "/" -> empty
+pub fn path_parent(path: @StrView) -> StrView
+    if path.len == 0
+        return strview_empty()
+
+    # Find end of content (skip trailing slashes)
+    var end: i64 = path.len
+    while end > 0 and *(path.ptr + end - 1) == PATH_SEP
+        end = end - 1
+
+    if end == 0
+        return strview_empty()  # Root has no parent
+
+    # Find the last slash before the basename
+    var pos: i64 = end - 1
+    while pos > 0 and *(path.ptr + pos) != PATH_SEP
+        pos = pos - 1
+
+    if pos == 0 and *(path.ptr) == PATH_SEP
+        # Parent is root "/"
+        return strview_slice(path, 0, 1)
+
+    strview_slice(path, 0, pos)
+
+# Get the basename (last component)
+# "/a/b/c" -> "c"
+# "/foo" -> "foo"
+# "/" -> ""
+pub fn path_basename(path: @StrView) -> StrView
+    if path.len == 0
+        return strview_empty()
+
+    # Find end of content (skip trailing slashes)
+    var end: i64 = path.len
+    while end > 0 and *(path.ptr + end - 1) == PATH_SEP
+        end = end - 1
+
+    if end == 0
+        return strview_empty()  # Root has no basename
+
+    # Find start of basename (after last slash)
+    var start: i64 = end - 1
+    while start > 0 and *(path.ptr + start - 1) != PATH_SEP
+        start = start - 1
+
+    strview_slice(path, start, end)
+
+# Validate a path component (no /, no null, not . or ..)
+pub fn path_validate_component(name: @StrView) -> bool
+    if name.len == 0 or name.len > NAME_MAX
+        return false
+
+    # Reject . and ..
+    if name.len == 1 and *(name.ptr) == 46  # '.'
+        return false
+    if name.len == 2 and *(name.ptr) == 46 and *(name.ptr + 1) == 46
+        return false
+
+    # Check for invalid characters
+    var i: i64 = 0
+    while i < name.len
+        let c: u8 = *(name.ptr + i)
+        if c == 0 or c == PATH_SEP
+            return false
+        i = i + 1
+    true
+
+# Validate a full path
+pub fn path_validate(path: @StrView) -> bool
+    if path.len == 0 or path.len > KPATH_MAX
+        return false
+
+    if not path_is_absolute(path)
+        return false
+
+    if path_is_root(path)
+        return true
+
+    # Walk through components using iterator
+    var iter: PathIter = path_iter_new(path)
+    var component: StrView
+    while path_iter_next(@iter, @component)
+        if not path_validate_component(@component)
+            return false
+    true
+
+# Path iterator - get next component
+pub struct PathIter
+    remaining: StrView
+
+pub fn path_iter_new(path: @StrView) -> PathIter
+    # Skip the leading slash for absolute paths
+    var start: i64 = 0
+    if path.len > 0 and *(path.ptr) == PATH_SEP
+        start = 1
+
+    PathIter {
+        remaining: strview_slice(path, start, path.len)
+    }
+
+pub fn path_iter_next(iter: *PathIter, out: *StrView) -> bool
+    # Skip leading slashes
+    while (*iter).remaining.len > 0 and *((*iter).remaining.ptr) == PATH_SEP
+        (*iter).remaining = strview_slice(@(*iter).remaining, 1, (*iter).remaining.len)
+
+    if (*iter).remaining.len == 0
+        return false
+
+    # Find next slash
+    var slash_pos: i64 = -1
+    var i: i64 = 0
+    while i < (*iter).remaining.len
+        if *((*iter).remaining.ptr + i) == PATH_SEP
+            slash_pos = i
+            break
+        i = i + 1
+
+    if slash_pos < 0
+        # Last component
+        *out = (*iter).remaining
+        (*iter).remaining = strview_empty()
+    else
+        *out = strview_slice(@(*iter).remaining, 0, slash_pos)
+        (*iter).remaining = strview_slice(@(*iter).remaining, slash_pos + 1, (*iter).remaining.len)
+
+    true
+
+# Compare two StrViews for equality
+pub fn strview_eq(a: @StrView, b: @StrView) -> bool
+    if a.len != b.len
+        return false
+    var i: i64 = 0
+    while i < a.len
+        if *(a.ptr + i) != *(b.ptr + i)
+            return false
+        i = i + 1
+    true
