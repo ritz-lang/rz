@@ -127,7 +127,16 @@ cat "$SERIAL_LOG"
 echo ""
 
 # Check for expected output - most advanced first (matching BIOS test milestones)
-if grep -q "virtio-blk.*Read sector 0 OK" "$SERIAL_LOG"; then
+if grep -q "\[userspace\] exit" "$SERIAL_LOG"; then
+    echo "========================================="
+    echo "  UEFI: MILESTONE 10 COMPLETE: Userspace Execution!"
+    echo "========================================="
+    echo "  - Ring 0 -> Ring 3 transition"
+    echo "  - ELF loading and execution"
+    echo "  - SYSCALL mechanism working"
+    echo "  - sys_write, sys_getpid, sys_yield, sys_exit"
+    exit 0
+elif grep -q "virtio-blk.*Read sector 0 OK" "$SERIAL_LOG"; then
     echo "========================================="
     echo "  UEFI: MILESTONE 9 COMPLETE: VirtIO Block Device!"
     echo "========================================="
@@ -135,15 +144,6 @@ if grep -q "virtio-blk.*Read sector 0 OK" "$SERIAL_LOG"; then
     echo "  - Sector read/write operations"
     echo "  - DMA buffer management"
     echo "  - Ready for filesystem!"
-    exit 0
-elif grep -q "\[syscall\] exit" "$SERIAL_LOG"; then
-    echo "========================================="
-    echo "  UEFI: MILESTONE 8 COMPLETE: Userspace + Syscalls!"
-    echo "========================================="
-    echo "  - Ring 0 -> Ring 3 transition"
-    echo "  - User program execution"
-    echo "  - SYSCALL/SYSRET mechanism"
-    echo "  - First userspace syscall!"
     exit 0
 elif grep -q "Task.*done" "$SERIAL_LOG"; then
     echo "========================================="
