@@ -1,0 +1,81 @@
+#!/usr/bin/env python3
+"""
+Wrapper script to invoke ritz0 with correct paths for harland build.
+
+This bridges the gap between build.py's expected interface:
+    ritz compile <source.ritz> --no-runtime -o <output.ll>
+
+And ritz0's actual interface:
+    python ritz0.py <source.ritz> --no-runtime -o <output.ll>
+"""
+import sys
+import os
+from pathlib import Path
+
+# Find ritz0 relative to monorepo
+script_dir = Path(__file__).parent.resolve()
+harland_dir = script_dir.parent
+projects_dir = harland_dir.parent
+ritz_dir = projects_dir / "ritz"
+ritz0_dir = ritz_dir / "ritz0"
+
+# Add ritz0 to path for imports
+sys.path.insert(0, str(ritz0_dir))
+
+# Set RITZ_PATH to include both ritzlib and kernel/src
+# The kernel/src path is set via env in build.py, but we need ritzlib too
+ritz_path = os.environ.get("RITZ_PATH", "")
+ritzlib_path = str(ritz_dir / "ritzlib")
+if ritzlib_path not in ritz_path:
+    if ritz_path:
+        os.environ["RITZ_PATH"] = f"{ritz_path}:{ritzlib_path}"
+    else:
+        os.environ["RITZ_PATH"] = ritzlib_path
+
+# Handle subcommands - ritz0 doesn't have them but build.py uses "compile"
+args = sys.argv[1:]
+if args and args[0] == "compile":
+    args = args[1:]  # Remove "compile" subcommand
+elif args and args[0] == "build":
+    # build.py uses ./ritz/ritz build . - this is a Makefile command
+    # We don't support this directly
+    print("Error: 'ritz build' not supported by ritz0 wrapper")
+    print("Use: python3 build.py build")
+    sys.exit(1)
+
+# Convert relative paths to absolute BEFORE changing directory
+# This is crucial because ritz0 needs to be run from its own directory
+# but build.py provides paths relative to harland's directory
+original_cwd = Path.cwd()
+new_args = []
+i = 0
+while i < len(args):
+    arg = args[i]
+    if arg == "-o" and i + 1 < len(args):
+        # Output path - convert to absolute
+        new_args.append(arg)
+        output_path = Path(args[i + 1])
+        if not output_path.is_absolute():
+            output_path = original_cwd / output_path
+        new_args.append(str(output_path))
+        i += 2
+    elif not arg.startswith("-") and (arg.endswith(".ritz") or arg.endswith(".ll")):
+        # Source file - convert to absolute
+        source_path = Path(arg)
+        if not source_path.is_absolute():
+            source_path = original_cwd / source_path
+        new_args.append(str(source_path))
+        i += 1
+    else:
+        new_args.append(arg)
+        i += 1
+
+# Change to ritz0 directory for imports to work
+os.chdir(ritz0_dir)
+
+# Import and run ritz0
+from ritz0 import main
+
+# Replace sys.argv with our processed args
+sys.argv = ["ritz0.py"] + new_args
+sys.exit(main())

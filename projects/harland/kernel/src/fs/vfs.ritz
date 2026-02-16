@@ -1,0 +1,285 @@
+# Virtual Filesystem (VFS) Layer
+#
+# Provides a unified interface for different filesystem backends.
+# Simplified stub for initial kernel integration.
+
+import serial { StrView, prints, println }
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+# Maximum open files per process
+pub const MAX_FDS: i32 = 64
+
+# Maximum filesystem mounts
+const MAX_MOUNTS: i32 = 16
+
+# Maximum path length
+pub const PATH_MAX: u64 = 256
+
+# File open flags
+pub const O_RDONLY: i32 = 0
+pub const O_WRONLY: i32 = 1
+pub const O_RDWR: i32 = 2
+pub const O_CREAT: i32 = 64
+pub const O_TRUNC: i32 = 512
+pub const O_APPEND: i32 = 1024
+
+# Seek origins
+pub const SEEK_SET: i32 = 0
+pub const SEEK_CUR: i32 = 1
+pub const SEEK_END: i32 = 2
+
+# File types
+pub const S_IFREG: u32 = 0x8000   # Regular file
+pub const S_IFDIR: u32 = 0x4000   # Directory
+pub const S_IFCHR: u32 = 0x2000   # Character device
+pub const S_IFBLK: u32 = 0x6000   # Block device
+
+# Error codes
+pub const E_OK: i32 = 0
+pub const E_NOENT: i32 = -2      # No such file or directory
+pub const E_EXIST: i32 = -17     # File exists
+pub const E_NOTDIR: i32 = -20    # Not a directory
+pub const E_ISDIR: i32 = -21     # Is a directory
+pub const E_INVAL: i32 = -22     # Invalid argument
+pub const E_NFILE: i32 = -23     # Too many open files
+pub const E_BADF: i32 = -9       # Bad file descriptor
+pub const E_NOSPC: i32 = -28     # No space left
+pub const E_IO: i32 = -5         # I/O error
+
+# ============================================================================
+# Types
+# ============================================================================
+
+# File stat information
+pub struct Stat
+    mode: u32      # File type and permissions
+    size: u64      # File size in bytes
+    mtime: u64     # Modification time (unix timestamp)
+    blocks: u64    # Number of blocks allocated
+
+# Directory entry (for readdir)
+pub struct Dirent
+    inode: u64           # Inode number
+    name: [256]u8        # File name
+    name_len: u8         # Length of name
+    file_type: u8        # File type (d_type)
+
+# ============================================================================
+# Filesystem Operations (Backend Interface)
+# ============================================================================
+
+# Each filesystem implements these operations
+# For now, just a placeholder struct - actual dispatch will be direct calls
+pub struct FsOps
+    fs_type: u8   # Filesystem type identifier (0 = none, 1 = kblob, etc.)
+
+# ============================================================================
+# File Descriptor
+# ============================================================================
+
+pub struct FileDesc
+    inode: u64       # Filesystem inode
+    offset: u64      # Current file position
+    flags: i32       # Open flags
+    fs_idx: i32      # Which mounted filesystem
+    used: u8         # Is this FD in use? (0 = no, 1 = yes)
+
+# ============================================================================
+# Mount Point
+# ============================================================================
+
+struct MountPoint
+    path: [64]u8     # Mount path
+    path_len: u8     # Path length
+    fs_type: u8      # Filesystem type
+    used: u8         # Is this mount in use? (0 = no, 1 = yes)
+
+# ============================================================================
+# VFS State
+# ============================================================================
+
+var vfs_mounts: [16]MountPoint
+var vfs_mount_count: i32 = 0
+var vfs_initialized: u8 = 0   # 0 = false, 1 = true
+
+# ============================================================================
+# VFS Initialization
+# ============================================================================
+
+pub fn vfs_init() -> i32
+    if vfs_initialized != 0
+        return 0
+
+    var i: i32 = 0
+    while i < MAX_MOUNTS
+        vfs_mounts[i].used = 0
+        i = i + 1
+
+    vfs_mount_count = 0
+    vfs_initialized = 1
+    prints("vfs: initialized\n" as StrView)
+    0
+
+# ============================================================================
+# Mount/Unmount
+# ============================================================================
+
+# Register a filesystem at a mount point
+pub fn vfs_mount(path: *u8, path_len: u64, fs_type: u8) -> i32
+    if vfs_initialized == 0
+        return E_INVAL
+
+    if vfs_mount_count >= MAX_MOUNTS
+        return E_NOSPC
+
+    # Find free slot
+    var slot: i32 = -1
+    var i: i32 = 0
+    while i < MAX_MOUNTS
+        if vfs_mounts[i].used == 0
+            slot = i
+            break
+        i = i + 1
+
+    if slot < 0
+        return E_NOSPC
+
+    # Copy path
+    var j: u64 = 0
+    while j < path_len and j < 63
+        vfs_mounts[slot].path[j as i32] = *(path + j)
+        j = j + 1
+    vfs_mounts[slot].path[j as i32] = 0
+    vfs_mounts[slot].path_len = j as u8
+
+    vfs_mounts[slot].fs_type = fs_type
+    vfs_mounts[slot].used = 1
+    vfs_mount_count = vfs_mount_count + 1
+
+    prints("vfs: mounted filesystem\n" as StrView)
+    0
+
+# Unmount a filesystem
+pub fn vfs_unmount(path: *u8, path_len: u64) -> i32
+    var i: i32 = 0
+    while i < MAX_MOUNTS
+        if vfs_mounts[i].used != 0
+            # Check if path matches
+            var is_match: u8 = 1
+            var j: u64 = 0
+            while j < path_len
+                if vfs_mounts[i].path[j as i32] != *(path + j)
+                    is_match = 0
+                    break
+                j = j + 1
+
+            if is_match != 0 and vfs_mounts[i].path_len as u64 == path_len
+                vfs_mounts[i].used = 0
+                vfs_mount_count = vfs_mount_count - 1
+                return 0
+        i = i + 1
+
+    E_NOENT
+
+# ============================================================================
+# Path Resolution
+# ============================================================================
+
+# Find the filesystem for a path
+fn vfs_find_fs(path: *u8, path_len: u64) -> i32
+    var best_match: i32 = -1
+    var best_len: u8 = 0
+
+    var i: i32 = 0
+    while i < MAX_MOUNTS
+        if vfs_mounts[i].used != 0
+            let mount_len: u8 = vfs_mounts[i].path_len
+            if mount_len as u64 <= path_len
+                # Check if mount path is prefix of path
+                var is_match: u8 = 1
+                var j: u8 = 0
+                while j < mount_len
+                    if vfs_mounts[i].path[j as i32] != *(path + j as u64)
+                        is_match = 0
+                        break
+                    j = j + 1
+
+                if is_match != 0 and mount_len > best_len
+                    best_match = i
+                    best_len = mount_len
+        i = i + 1
+
+    best_match
+
+# ============================================================================
+# File Operations (stubs for now)
+# ============================================================================
+
+# Stat a file
+pub fn vfs_stat(path: *u8, path_len: u64, st: *Stat) -> i32
+    let fs_idx: i32 = vfs_find_fs(path, path_len)
+    if fs_idx < 0
+        return E_NOENT
+    # TODO: implement with filesystem dispatch
+    E_NOENT
+
+# Create a directory
+pub fn vfs_mkdir(path: *u8, path_len: u64) -> i32
+    let fs_idx: i32 = vfs_find_fs(path, path_len)
+    if fs_idx < 0
+        return E_NOENT
+    # TODO: implement with filesystem dispatch
+    E_NOENT
+
+# ============================================================================
+# File Descriptor Table (Per-Process)
+# ============================================================================
+
+# Global fd table for kernel (single process for now)
+var kernel_fds: [64]FileDesc
+var kernel_fds_initialized: u8 = 0
+
+# Initialize the global fd table
+pub fn fd_table_init() -> i32
+    if kernel_fds_initialized != 0
+        return 0
+
+    var i: i32 = 0
+    while i < MAX_FDS
+        kernel_fds[i].used = 0
+        i = i + 1
+
+    kernel_fds_initialized = 1
+    prints("vfs: fd table initialized\n" as StrView)
+    0
+
+# Allocate a file descriptor
+pub fn fd_alloc() -> i32
+    var i: i32 = 0
+    while i < MAX_FDS
+        if kernel_fds[i].used == 0
+            kernel_fds[i].used = 1
+            kernel_fds[i].offset = 0
+            return i
+        i = i + 1
+    E_NFILE
+
+# Free a file descriptor
+pub fn fd_free(fd: i32) -> i32
+    if fd < 0 or fd >= MAX_FDS
+        return E_BADF
+    if kernel_fds[fd].used == 0
+        return E_BADF
+    kernel_fds[fd].used = 0
+    0
+
+# Get a file descriptor
+pub fn fd_get(fd: i32) -> *FileDesc
+    if fd < 0 or fd >= MAX_FDS
+        return 0 as *FileDesc
+    if kernel_fds[fd].used == 0
+        return 0 as *FileDesc
+    @kernel_fds[fd]

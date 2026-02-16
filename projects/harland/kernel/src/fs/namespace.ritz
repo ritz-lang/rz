@@ -1,0 +1,619 @@
+# In-Memory Namespace Tree
+#
+# The namespace is a pure in-memory tree that maps paths to resources.
+# Each node knows its backend type (Goliath, Memory, Device, None).
+#
+# This separation allows:
+# - Ephemeral objects (pipes, sockets) with no disk overhead
+# - Capability-controlled visibility independent of storage
+# - Clean hypervisor-level resource sharing
+
+import mm.heap { kalloc, kfree }
+import serial { StrView, prints, println, serial_print_hex }
+import fs.backend { BACKEND_NONE, BACKEND_GOLIATH, BACKEND_MEMORY, BACKEND_DEVICE, VIS_PUBLIC, VIS_VISIBLE, VIS_HIDDEN, VIS_KERNEL_ONLY, NODE_FILE, NODE_DIRECTORY, NODE_DEVICE, NODE_PIPE, NODE_SOCKET, NODE_SYMLINK, NODE_MOUNT, CAP_READ, CAP_WRITE, CAP_EXECUTE, CAP_DELETE, CAP_CREATE, CAP_ADMIN, BackendHandle, MemoryFile, caps_check, backend_name, visibility_name, node_type_name }
+import fs.kblob { KBlobStore, KBlobId, kblob_store_get, kblob_store_get_size, kblob_store_put, kblob_id_zero, kblob_id_eq, kblob_id_is_zero, kblob_id_copy }
+import fs.kpath { path_is_absolute, path_is_root, path_parent, path_basename, path_validate, PathIter, path_iter_new, path_iter_next, strview_empty, NAME_MAX, strview_from_ptr }
+
+# Maximum name length
+const MAX_NAME: i32 = 255
+
+# Error codes
+pub const NS_OK: i32 = 0
+pub const NS_NOT_FOUND: i32 = -2
+pub const NS_PERMISSION_DENIED: i32 = -13
+pub const NS_ALREADY_EXISTS: i32 = -17
+pub const NS_NOT_A_DIRECTORY: i32 = -20
+pub const NS_NOT_A_FILE: i32 = -21
+pub const NS_INVALID_PATH: i32 = -22
+pub const NS_OUT_OF_MEMORY: i32 = -12
+pub const NS_NOT_EMPTY: i32 = -39
+
+# Namespace node - an entry in the in-memory tree
+pub struct NsNode
+    # Name (filename component, not full path)
+    name: [256]u8
+    name_len: u8
+
+    # Tree structure
+    parent: *NsNode
+    first_child: *NsNode
+    next_sibling: *NsNode
+
+    # Node type and backend
+    node_type: u8       # NODE_FILE, NODE_DIRECTORY, etc.
+    backend: u8         # BACKEND_GOLIATH, BACKEND_MEMORY, etc.
+    visibility: u8      # VIS_PUBLIC, VIS_VISIBLE, etc.
+
+    # Backend-specific handle
+    # For Goliath: blob_id (hash)
+    # For Memory: pointer to MemoryFile
+    # For Device: device_id
+    backend_handle: BackendHandle
+
+    # Size (for files)
+    size: u64
+
+    # Timestamps
+    created: u64
+    modified: u64
+
+    # Access control
+    required_caps: u64   # Capabilities needed to access
+    owner_pid: u32       # Owner process (for cleanup)
+
+    # Flags
+    flags: u32
+
+# Node flags
+pub const NS_FLAG_IMMUTABLE: u32 = 1    # Cannot be modified
+pub const NS_FLAG_APPEND_ONLY: u32 = 2  # Can only append
+pub const NS_FLAG_NO_EXEC: u32 = 4      # Cannot execute
+
+# The namespace itself
+pub struct Namespace
+    root: *NsNode
+    goliath_store: *KBlobStore  # For persistent files
+    node_count: u64
+
+# ============================================================================
+# Node allocation and management
+# ============================================================================
+
+# Allocate a new node
+fn ns_node_alloc() -> *NsNode
+    let node: *NsNode = kalloc(512) as *NsNode  # sizeof(NsNode) ~ 350 bytes
+    if node == 0 as *NsNode
+        return 0 as *NsNode
+
+    # Zero out the structure
+    var i: i32 = 0
+    let bytes: *u8 = node as *u8
+    while i < 512
+        *(bytes + i) = 0
+        i = i + 1
+
+    node
+
+# Free a node
+fn ns_node_free(node: *NsNode)
+    # If memory-backed, free the memory file
+    if (*node).backend == BACKEND_MEMORY
+        let mf: *MemoryFile = (*node).backend_handle.handle as *MemoryFile
+        if mf != 0 as *MemoryFile
+            if (*mf).data != 0 as *u8
+                # kfree((*mf).data)  # TODO: kfree needs size
+                0
+            # kfree(mf as *u8)
+            0
+
+    # Free the node itself
+    # kfree(node as *u8)  # TODO: kfree needs size
+    0
+
+# Set node name
+fn ns_node_set_name(node: *NsNode, name: StrView)
+    var copy_len: i64 = name.len
+    if copy_len > MAX_NAME as i64
+        copy_len = MAX_NAME as i64
+
+    var i: i64 = 0
+    while i < copy_len
+        (*node).name[i] = *(name.ptr + i)
+        i = i + 1
+    (*node).name[i] = 0  # null terminate
+    (*node).name_len = copy_len as u8
+
+# Get node name as StrView
+pub fn ns_node_name(node: *NsNode) -> StrView
+    strview_from_ptr(@(*node).name[0], (*node).name_len as i64)
+
+# Check if node name matches
+fn ns_node_name_eq(node: *NsNode, name: @StrView) -> bool
+    if (*node).name_len as i64 != name.len
+        return false
+
+    var i: i64 = 0
+    while i < name.len
+        if (*node).name[i] != *(name.ptr + i)
+            return false
+        i = i + 1
+    true
+
+# ============================================================================
+# Namespace creation and initialization
+# ============================================================================
+
+# Create a new namespace
+pub fn namespace_new(store: *KBlobStore) -> Namespace
+    var ns: Namespace
+
+    # Allocate root node
+    let root: *NsNode = ns_node_alloc()
+    if root == 0 as *NsNode
+        ns.root = 0 as *NsNode
+        ns.goliath_store = store
+        ns.node_count = 0
+        return ns
+
+    # Initialize root as directory
+    ns_node_set_name(root, "/" as StrView)
+    (*root).node_type = NODE_DIRECTORY
+    (*root).backend = BACKEND_NONE
+    (*root).visibility = VIS_PUBLIC
+    (*root).required_caps = 0  # Everyone can access root
+
+    ns.root = root
+    ns.goliath_store = store
+    ns.node_count = 1
+
+    ns
+
+# ============================================================================
+# Path resolution
+# ============================================================================
+
+# Find child node by name
+fn ns_find_child(parent: *NsNode, name: @StrView) -> *NsNode
+    var child: *NsNode = (*parent).first_child
+    while child != 0 as *NsNode
+        if ns_node_name_eq(child, name)
+            return child
+        child = (*child).next_sibling
+    0 as *NsNode
+
+# Resolve a path to its node (with visibility check)
+pub fn namespace_resolve(ns: *Namespace, path: @StrView, caller_caps: u64) -> *NsNode
+    if not path_is_absolute(path)
+        return 0 as *NsNode
+
+    if path_is_root(path)
+        return (*ns).root
+
+    # Walk the path
+    var current: *NsNode = (*ns).root
+    var iter: PathIter = path_iter_new(path)
+    var component: StrView
+
+    while path_iter_next(@iter, @component)
+        # Current must be a directory
+        if (*current).node_type != NODE_DIRECTORY
+            return 0 as *NsNode
+
+        # Find child
+        let child: *NsNode = ns_find_child(current, @component)
+        if child == 0 as *NsNode
+            return 0 as *NsNode
+
+        # Visibility check
+        if not ns_can_see(child, caller_caps)
+            return 0 as *NsNode  # Pretend it doesn't exist
+
+        current = child
+
+    current
+
+# Resolve path without visibility check (kernel internal use)
+pub fn namespace_resolve_internal(ns: *Namespace, path: @StrView) -> *NsNode
+    namespace_resolve(ns, path, 0xFFFFFFFFFFFFFFFF as u64)  # All caps
+
+# ============================================================================
+# Visibility and access control
+# ============================================================================
+
+# Can the caller see this node?
+pub fn ns_can_see(node: *NsNode, caller_caps: u64) -> bool
+    let vis: u8 = (*node).visibility
+
+    if vis == VIS_PUBLIC
+        return true
+    if vis == VIS_VISIBLE
+        return true  # Can see, but may not access
+    if vis == VIS_HIDDEN
+        return caps_check(caller_caps, (*node).required_caps)
+    if vis == VIS_KERNEL_ONLY
+        return false  # Only kernel internals
+    false
+
+# Can the caller access this node?
+pub fn ns_can_access(node: *NsNode, caller_caps: u64, needed_caps: u64) -> bool
+    # First must be able to see it
+    if not ns_can_see(node, caller_caps)
+        return false
+
+    # Then must have required capabilities
+    let combined: u64 = (*node).required_caps | needed_caps
+    caps_check(caller_caps, combined)
+
+# ============================================================================
+# Directory operations
+# ============================================================================
+
+# Create a directory
+pub fn namespace_mkdir(ns: *Namespace, path: @StrView, visibility: u8, required_caps: u64) -> i32
+    if not path_validate(path)
+        return NS_INVALID_PATH
+
+    if path_is_root(path)
+        return NS_ALREADY_EXISTS
+
+    # Check if already exists
+    let existing: *NsNode = namespace_resolve_internal(ns, path)
+    if existing != 0 as *NsNode
+        return NS_ALREADY_EXISTS
+
+    # Get parent
+    let parent_path: StrView = path_parent(path)
+    let base_name: StrView = path_basename(path)
+
+    var parent: *NsNode
+    if parent_path.len == 0
+        parent = (*ns).root
+    else
+        parent = namespace_resolve_internal(ns, @parent_path)
+        if parent == 0 as *NsNode
+            return NS_NOT_FOUND
+
+    if (*parent).node_type != NODE_DIRECTORY
+        return NS_NOT_A_DIRECTORY
+
+    # Create new directory node
+    let node: *NsNode = ns_node_alloc()
+    if node == 0 as *NsNode
+        return NS_OUT_OF_MEMORY
+
+    ns_node_set_name(node, base_name)
+    (*node).node_type = NODE_DIRECTORY
+    (*node).backend = BACKEND_NONE
+    (*node).visibility = visibility
+    (*node).required_caps = required_caps
+    (*node).parent = parent
+
+    # Link into tree
+    (*node).next_sibling = (*parent).first_child
+    (*parent).first_child = node
+
+    (*ns).node_count = (*ns).node_count + 1
+
+    NS_OK
+
+# ============================================================================
+# File operations with backend support
+# ============================================================================
+
+# Create/write a file (auto-selects backend based on persistence flag)
+pub fn namespace_write_file(ns: *Namespace, path: @StrView, data: *u8, size: u64, persistent: bool) -> i32
+    if not path_validate(path)
+        return NS_INVALID_PATH
+
+    if path_is_root(path)
+        return NS_NOT_A_FILE
+
+    # Get parent
+    let parent_path: StrView = path_parent(path)
+    let base_name: StrView = path_basename(path)
+
+    var parent: *NsNode
+    if parent_path.len == 0
+        parent = (*ns).root
+    else
+        parent = namespace_resolve_internal(ns, @parent_path)
+        if parent == 0 as *NsNode
+            return NS_NOT_FOUND
+
+    if (*parent).node_type != NODE_DIRECTORY
+        return NS_NOT_A_DIRECTORY
+
+    # Check if file already exists
+    var node: *NsNode = ns_find_child(parent, @base_name)
+
+    if node == 0 as *NsNode
+        # Create new node
+        node = ns_node_alloc()
+        if node == 0 as *NsNode
+            return NS_OUT_OF_MEMORY
+
+        ns_node_set_name(node, base_name)
+        (*node).node_type = NODE_FILE
+        (*node).visibility = VIS_PUBLIC
+        (*node).parent = parent
+
+        # Link into tree
+        (*node).next_sibling = (*parent).first_child
+        (*parent).first_child = node
+        (*ns).node_count = (*ns).node_count + 1
+
+    # Store data based on persistence
+    if persistent
+        # Use Goliath backend
+        let blob_id: KBlobId = kblob_store_put((*ns).goliath_store, data, size)
+        if kblob_id_is_zero(@blob_id)
+            return NS_OUT_OF_MEMORY
+
+        (*node).backend = BACKEND_GOLIATH
+        # Store first 8 bytes of hash in handle, next 8 in handle_high
+        var hash_low: u64 = 0
+        var hash_high: u64 = 0
+        var i: i32 = 0
+        while i < 8
+            hash_low = hash_low | ((blob_id.hash[i] as u64) << (i * 8))
+            hash_high = hash_high | ((blob_id.hash[i + 8] as u64) << (i * 8))
+            i = i + 1
+        (*node).backend_handle.handle = hash_low
+        (*node).backend_handle.handle_high = hash_high
+    else
+        # Use memory backend
+        let mf: *MemoryFile = kalloc(64) as *MemoryFile  # sizeof(MemoryFile)
+        if mf == 0 as *MemoryFile
+            return NS_OUT_OF_MEMORY
+
+        let buf: *u8 = kalloc(size)
+        if buf == 0 as *u8
+            return NS_OUT_OF_MEMORY
+
+        # Copy data
+        var i: u64 = 0
+        while i < size
+            *(buf + i) = *(data + i)
+            i = i + 1
+
+        (*mf).data = buf
+        (*mf).capacity = size
+        (*mf).size = size
+        (*mf).readers = 0
+        (*mf).writers = 0
+        (*mf).owner_pid = 0
+
+        (*node).backend = BACKEND_MEMORY
+        (*node).backend_handle.handle = mf as u64
+
+    (*node).size = size
+
+    NS_OK
+
+# Read file content
+pub fn namespace_read_file(ns: *Namespace, path: @StrView, out_size: *u64) -> *u8
+    let node: *NsNode = namespace_resolve_internal(ns, path)
+    if node == 0 as *NsNode
+        *out_size = 0
+        return 0 as *u8
+
+    if (*node).node_type != NODE_FILE
+        *out_size = 0
+        return 0 as *u8
+
+    *out_size = (*node).size
+
+    if (*node).backend == BACKEND_GOLIATH
+        # Read from blob store - reconstruct blob_id from handles
+        var blob_id: KBlobId
+        let hash_low: u64 = (*node).backend_handle.handle
+        let hash_high: u64 = (*node).backend_handle.handle_high
+        var i: i32 = 0
+        while i < 8
+            blob_id.hash[i] = ((hash_low >> (i * 8)) & 0xFF) as u8
+            blob_id.hash[i + 8] = ((hash_high >> (i * 8)) & 0xFF) as u8
+            i = i + 1
+        while i < 16
+            blob_id.hash[i + 8] = 0
+            i = i + 1
+        return kblob_store_get((*ns).goliath_store, @blob_id)
+
+    if (*node).backend == BACKEND_MEMORY
+        let mf: *MemoryFile = (*node).backend_handle.handle as *MemoryFile
+        return (*mf).data
+
+    0 as *u8
+
+# Check if path exists
+pub fn namespace_exists(ns: *Namespace, path: @StrView) -> bool
+    let node: *NsNode = namespace_resolve_internal(ns, path)
+    node != 0 as *NsNode
+
+# Get file size
+pub fn namespace_file_size(ns: *Namespace, path: @StrView) -> u64
+    let node: *NsNode = namespace_resolve_internal(ns, path)
+    if node == 0 as *NsNode
+        return 0
+    (*node).size
+
+# ============================================================================
+# Ephemeral object creation (pipes, sockets)
+# ============================================================================
+
+# Create a pipe
+pub fn namespace_create_pipe(ns: *Namespace, path: @StrView, buffer_size: u64, owner_pid: u32) -> i32
+    if not path_validate(path)
+        return NS_INVALID_PATH
+
+    # Get parent
+    let parent_path: StrView = path_parent(path)
+    let base_name: StrView = path_basename(path)
+
+    var parent: *NsNode
+    if parent_path.len == 0
+        parent = (*ns).root
+    else
+        parent = namespace_resolve_internal(ns, @parent_path)
+        if parent == 0 as *NsNode
+            return NS_NOT_FOUND
+
+    # Create pipe node
+    let node: *NsNode = ns_node_alloc()
+    if node == 0 as *NsNode
+        return NS_OUT_OF_MEMORY
+
+    ns_node_set_name(node, base_name)
+    (*node).node_type = NODE_PIPE
+    (*node).backend = BACKEND_MEMORY
+    (*node).visibility = VIS_PUBLIC
+    (*node).owner_pid = owner_pid
+    (*node).parent = parent
+
+    # Allocate memory file for pipe buffer
+    let mf: *MemoryFile = kalloc(64) as *MemoryFile
+    if mf == 0 as *MemoryFile
+        return NS_OUT_OF_MEMORY
+
+    let buf: *u8 = kalloc(buffer_size)
+    if buf == 0 as *u8
+        return NS_OUT_OF_MEMORY
+
+    (*mf).data = buf
+    (*mf).capacity = buffer_size
+    (*mf).size = 0
+    (*mf).read_pos = 0
+    (*mf).write_pos = 0
+    (*mf).readers = 0
+    (*mf).writers = 0
+    (*mf).owner_pid = owner_pid
+    (*mf).flags = 1  # MEMFILE_PIPE
+
+    (*node).backend_handle.handle = mf as u64
+
+    # Link into tree
+    (*node).next_sibling = (*parent).first_child
+    (*parent).first_child = node
+    (*ns).node_count = (*ns).node_count + 1
+
+    NS_OK
+
+# ============================================================================
+# Device registration
+# ============================================================================
+
+# Register a device node
+pub fn namespace_register_device(ns: *Namespace, path: @StrView, device_id: u64, visibility: u8, required_caps: u64) -> i32
+    if not path_validate(path)
+        return NS_INVALID_PATH
+
+    # Get parent
+    let parent_path: StrView = path_parent(path)
+    let base_name: StrView = path_basename(path)
+
+    var parent: *NsNode
+    if parent_path.len == 0
+        parent = (*ns).root
+    else
+        parent = namespace_resolve_internal(ns, @parent_path)
+        if parent == 0 as *NsNode
+            return NS_NOT_FOUND
+
+    # Create device node
+    let node: *NsNode = ns_node_alloc()
+    if node == 0 as *NsNode
+        return NS_OUT_OF_MEMORY
+
+    ns_node_set_name(node, base_name)
+    (*node).node_type = NODE_DEVICE
+    (*node).backend = BACKEND_DEVICE
+    (*node).visibility = visibility
+    (*node).required_caps = required_caps
+    (*node).backend_handle.handle = device_id
+    (*node).parent = parent
+
+    # Link into tree
+    (*node).next_sibling = (*parent).first_child
+    (*parent).first_child = node
+    (*ns).node_count = (*ns).node_count + 1
+
+    NS_OK
+
+# ============================================================================
+# Directory listing
+# ============================================================================
+
+# List directory (with visibility filtering)
+pub fn namespace_list_dir(ns: *Namespace, path: @StrView, caller_caps: u64, out_nodes: **NsNode, max_nodes: i32) -> i32
+    let dir: *NsNode = namespace_resolve(ns, path, caller_caps)
+    if dir == 0 as *NsNode
+        return -1
+
+    if (*dir).node_type != NODE_DIRECTORY
+        return -1
+
+    var count: i32 = 0
+    var child: *NsNode = (*dir).first_child
+
+    while child != 0 as *NsNode and count < max_nodes
+        # Only include visible nodes
+        if ns_can_see(child, caller_caps)
+            *(out_nodes + count) = child
+            count = count + 1
+        child = (*child).next_sibling
+
+    count
+
+# ============================================================================
+# Cleanup for process exit
+# ============================================================================
+
+# Remove all nodes owned by a process
+pub fn namespace_cleanup_process(ns: *Namespace, pid: u32) -> i32
+    # TODO: Walk tree and remove nodes with owner_pid == pid
+    # For now, this is a stub
+    0
+
+# ============================================================================
+# Global kernel namespace
+# ============================================================================
+
+var g_namespace: Namespace
+var g_namespace_initialized: u8 = 0
+
+# Initialize the global namespace
+pub fn namespace_init(store: *KBlobStore) -> i32
+    if g_namespace_initialized != 0
+        return 0
+
+    g_namespace = namespace_new(store)
+    g_namespace_initialized = 1
+    prints("namespace: initialized (in-memory tree)\n" as StrView)
+    0
+
+# Get the global namespace
+pub fn namespace_get() -> *Namespace
+    if g_namespace_initialized == 0
+        return 0 as *Namespace
+    @g_namespace
+
+# ============================================================================
+# Debug/info
+# ============================================================================
+
+# Print namespace stats
+pub fn namespace_print_stats(ns: *Namespace)
+    prints("namespace: " as StrView)
+    serial_print_hex((*ns).node_count)
+    prints(" nodes\n" as StrView)
+
+# Print a node
+pub fn ns_node_print(node: *NsNode)
+    prints("  " as StrView)
+    prints(ns_node_name(node))
+    prints(" [" as StrView)
+    prints(node_type_name((*node).node_type))
+    prints(", " as StrView)
+    prints(backend_name((*node).backend))
+    prints(", " as StrView)
+    prints(visibility_name((*node).visibility))
+    prints("]\n" as StrView)
