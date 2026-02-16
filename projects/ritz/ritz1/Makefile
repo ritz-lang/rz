@@ -41,8 +41,8 @@ LL_FILES = $(patsubst %,$(BUILD_DIR)/%.ll,$(SOURCES))
 OBJ_FILES = $(patsubst %,$(BUILD_DIR)/%.o,$(SOURCES))
 RITZLIB_OBJ = $(patsubst %,$(BUILD_DIR)/ritzlib_%.o,$(RITZLIB_MODULES))
 
-# Runtime
-RUNTIME = runtime/ritz_crt0.o
+# Runtime - entry point that calls main(argc, argv) and handles exit
+RUNTIME = ../runtime/ritz_start.x86_64.o
 
 # Compiler flags
 LLC_FLAGS = -O2
@@ -68,9 +68,9 @@ $(BUILD_DIR)/%.ll: $(SRC_DIR)/%.ritz | $(BUILD_DIR)
 	@echo "Compiling $< → $@"
 	$(RITZ0) $< --no-runtime -o $@
 
-# main is special - it has main() but _start comes from ritz_crt0.o
+# main is special - it has main() but _start comes from runtime/ritz_start*.o
 $(BUILD_DIR)/main.ll: $(SRC_DIR)/main.ritz | $(BUILD_DIR)
-	@echo "Compiling $< → $@ (with main, crt0 provides _start)"
+	@echo "Compiling $< → $@ (main function, runtime provides _start)"
 	$(RITZ0) $< --no-runtime -o $@
 
 # Compile .ll to .o (use clang directly for LLVM IR)
