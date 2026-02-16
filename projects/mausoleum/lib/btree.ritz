@@ -44,6 +44,7 @@
 import ritzlib.sys
 import ritzlib.str
 import ritzlib.memory
+import ritzlib.option
 
 import lib.m7m_types
 import lib.page
@@ -286,20 +287,21 @@ fn is_leaf(page: *Page) -> i32
 # B-tree Creation/Destruction
 # ============================================================================
 
-pub fn btree_create(pool: *BufferPool) -> *BTree
+pub fn btree_create(pool: *BufferPool) -> Option<*BTree>
     if pool == null
-        return null
+        return None
 
     # Allocate tree structure
     let tree: *BTree = malloc(sizeof(BTree)) as *BTree
     if tree == null
-        return null
+        return None
 
     # Allocate root page (leaf node)
-    let root: *Page = buffer_pool_alloc(pool, PAGE_MAGIC_BTREE)
-    if root == null
+    let root_opt = buffer_pool_alloc(pool, PAGE_MAGIC_BTREE)
+    if option_is_none<*Page>(@root_opt) == 1
         free(tree as *u8)
-        return null
+        return None
+    let root: *Page = option_unwrap_or<*Page>(@root_opt, null)
 
     # Initialize root as leaf
     let root_id: i64 = buffer_pool_page_id(pool, root)
@@ -319,7 +321,7 @@ pub fn btree_create(pool: *BufferPool) -> *BTree
     tree.count = 0
     tree.node_count = 1
 
-    return tree
+    return Some(tree)
 
 pub fn btree_destroy(tree: *BTree)
     if tree == null
@@ -366,9 +368,10 @@ pub fn btree_get(tree: *BTree, key: *u8, key_len: i32, value: *u8, value_len: *i
     var level: i32 = tree.height
 
     while level > 1
-        let page: *Page = buffer_pool_fetch(tree.pool, page_id)
-        if page == null
+        let page_opt = buffer_pool_fetch(tree.pool, page_id)
+        if option_is_none<*Page>(@page_opt) == 1
             return ERR_IO
+        let page: *Page = option_unwrap_or<*Page>(@page_opt, null)
 
         let pos: i32 = find_child_position(page, key, key_len)
         let child_id: i64 = get_child_at(page, pos)
@@ -378,9 +381,10 @@ pub fn btree_get(tree: *BTree, key: *u8, key_len: i32, value: *u8, value_len: *i
         level -= 1
 
     # Now at leaf level
-    let leaf: *Page = buffer_pool_fetch(tree.pool, page_id)
-    if leaf == null
+    let leaf_opt = buffer_pool_fetch(tree.pool, page_id)
+    if option_is_none<*Page>(@leaf_opt) == 1
         return ERR_IO
+    let leaf: *Page = option_unwrap_or<*Page>(@leaf_opt, null)
 
     var found: i32 = 0
     let pos: i32 = find_key_position(leaf, key, key_len, @found)
@@ -512,9 +516,10 @@ fn split_leaf(tree: *BTree, page: *Page, page_id: i64, sep_key: *u8, sep_key_len
     let mid: i32 = header.num_keys / 2
 
     # Allocate new leaf
-    let new_page: *Page = buffer_pool_alloc(tree.pool, PAGE_MAGIC_BTREE)
-    if new_page == null
+    let new_page_opt = buffer_pool_alloc(tree.pool, PAGE_MAGIC_BTREE)
+    if option_is_none<*Page>(@new_page_opt) == 1
         return INVALID_PAGE_ID
+    let new_page: *Page = option_unwrap_or<*Page>(@new_page_opt, null)
 
     let new_page_id: i64 = buffer_pool_page_id(tree.pool, new_page)
     new_page.header.flags = new_page.header.flags | PAGE_FLAG_LEAF
@@ -564,9 +569,10 @@ fn split_internal(tree: *BTree, page: *Page, page_id: i64, sep_key: *u8, sep_key
     let mid: i32 = header.num_keys / 2
 
     # Allocate new internal node
-    let new_page: *Page = buffer_pool_alloc(tree.pool, PAGE_MAGIC_BTREE)
-    if new_page == null
+    let new_page_opt = buffer_pool_alloc(tree.pool, PAGE_MAGIC_BTREE)
+    if option_is_none<*Page>(@new_page_opt) == 1
         return INVALID_PAGE_ID
+    let new_page: *Page = option_unwrap_or<*Page>(@new_page_opt, null)
 
     let new_page_id: i64 = buffer_pool_page_id(tree.pool, new_page)
     # Internal node: no LEAF flag
@@ -621,9 +627,10 @@ fn split_internal(tree: *BTree, page: *Page, page_id: i64, sep_key: *u8, sep_key
 # On split: sep_key and new_child_id are set
 fn btree_insert_recursive(tree: *BTree, page_id: i64, level: i32, key: *u8, key_len: i32, val: *u8, val_len: i32, sep_key: *u8, sep_key_len: *i32, new_child_id: *i64, did_insert: *i32) -> i32
 
-    let page: *Page = buffer_pool_fetch(tree.pool, page_id)
-    if page == null
+    let page_opt = buffer_pool_fetch(tree.pool, page_id)
+    if option_is_none<*Page>(@page_opt) == 1
         return ERR_IO
+    let page: *Page = option_unwrap_or<*Page>(@page_opt, null)
 
     if level == 1
         # Leaf level
@@ -650,12 +657,18 @@ fn btree_insert_recursive(tree: *BTree, page_id: i64, level: i32, key: *u8, key_
             let cmp: i32 = key_compare(key, key_len, sep_key, *sep_key_len)
             if cmp < 0
                 # Insert into original page
-                let orig: *Page = buffer_pool_fetch(tree.pool, page_id)
+                let orig_opt = buffer_pool_fetch(tree.pool, page_id)
+                if option_is_none<*Page>(@orig_opt) == 1
+                    return ERR_IO
+                let orig: *Page = option_unwrap_or<*Page>(@orig_opt, null)
                 *did_insert = leaf_insert_entry(orig, key, key_len, val, val_len)
                 buffer_pool_unpin(tree.pool, page_id, 1)
             else
                 # Insert into new page
-                let new_pg: *Page = buffer_pool_fetch(tree.pool, split_id)
+                let new_pg_opt = buffer_pool_fetch(tree.pool, split_id)
+                if option_is_none<*Page>(@new_pg_opt) == 1
+                    return ERR_IO
+                let new_pg: *Page = option_unwrap_or<*Page>(@new_pg_opt, null)
                 *did_insert = leaf_insert_entry(new_pg, key, key_len, val, val_len)
                 buffer_pool_unpin(tree.pool, split_id, 1)
 
@@ -683,9 +696,10 @@ fn btree_insert_recursive(tree: *BTree, page_id: i64, level: i32, key: *u8, key_
             return ERR_OK
 
         # Child split - need to insert separator into this node
-        let page2: *Page = buffer_pool_fetch(tree.pool, page_id)
-        if page2 == null
+        let page2_opt = buffer_pool_fetch(tree.pool, page_id)
+        if option_is_none<*Page>(@page2_opt) == 1
             return ERR_IO
+        let page2: *Page = option_unwrap_or<*Page>(@page2_opt, null)
 
         let header: *BTreeNodeHeader = get_node_header(page2)
         let entry_size: i32 = internal_entry_size(child_sep_len)
@@ -709,11 +723,17 @@ fn btree_insert_recursive(tree: *BTree, page_id: i64, level: i32, key: *u8, key_
             # Insert the child separator into appropriate node
             let cmp: i32 = key_compare(@child_sep_key[0], child_sep_len, sep_key, *sep_key_len)
             if cmp < 0
-                let orig: *Page = buffer_pool_fetch(tree.pool, page_id)
+                let orig_opt = buffer_pool_fetch(tree.pool, page_id)
+                if option_is_none<*Page>(@orig_opt) == 1
+                    return ERR_IO
+                let orig: *Page = option_unwrap_or<*Page>(@orig_opt, null)
                 internal_insert_entry(orig, @child_sep_key[0], child_sep_len, child_new_id)
                 buffer_pool_unpin(tree.pool, page_id, 1)
             else
-                let new_pg: *Page = buffer_pool_fetch(tree.pool, split_id)
+                let new_pg_opt = buffer_pool_fetch(tree.pool, split_id)
+                if option_is_none<*Page>(@new_pg_opt) == 1
+                    return ERR_IO
+                let new_pg: *Page = option_unwrap_or<*Page>(@new_pg_opt, null)
                 internal_insert_entry(new_pg, @child_sep_key[0], child_sep_len, child_new_id)
                 buffer_pool_unpin(tree.pool, split_id, 1)
 
@@ -749,9 +769,10 @@ pub fn btree_put(tree: *BTree, key: *u8, key_len: i32, value: *u8, value_len: i3
 
     if new_child_id != INVALID_PAGE_ID
         # Root was split - create new root
-        let new_root: *Page = buffer_pool_alloc(tree.pool, PAGE_MAGIC_BTREE)
-        if new_root == null
+        let new_root_opt = buffer_pool_alloc(tree.pool, PAGE_MAGIC_BTREE)
+        if option_is_none<*Page>(@new_root_opt) == 1
             return ERR_NO_MEMORY
+        let new_root: *Page = option_unwrap_or<*Page>(@new_root_opt, null)
 
         let new_root_id: i64 = buffer_pool_page_id(tree.pool, new_root)
         new_root.header.flags = new_root.header.flags | PAGE_FLAG_ROOT
@@ -766,8 +787,9 @@ pub fn btree_put(tree: *BTree, key: *u8, key_len: i32, value: *u8, value_len: i3
         internal_insert_entry(new_root, @sep_key[0], sep_key_len, new_child_id)
 
         # Clear ROOT flag from old root
-        let old_root: *Page = buffer_pool_fetch(tree.pool, tree.root_page_id)
-        if old_root != null
+        let old_root_opt = buffer_pool_fetch(tree.pool, tree.root_page_id)
+        if option_is_none<*Page>(@old_root_opt) == 0
+            let old_root: *Page = option_unwrap_or<*Page>(@old_root_opt, null)
             old_root.header.flags = old_root.header.flags & (~PAGE_FLAG_ROOT)
             buffer_pool_unpin(tree.pool, tree.root_page_id, 1)
 
@@ -794,9 +816,10 @@ pub fn btree_delete(tree: *BTree, key: *u8, key_len: i32) -> i32
     var level: i32 = tree.height
 
     while level > 1
-        let page: *Page = buffer_pool_fetch(tree.pool, page_id)
-        if page == null
+        let page_opt = buffer_pool_fetch(tree.pool, page_id)
+        if option_is_none<*Page>(@page_opt) == 1
             return ERR_IO
+        let page: *Page = option_unwrap_or<*Page>(@page_opt, null)
 
         let pos: i32 = find_child_position(page, key, key_len)
         let child_id: i64 = get_child_at(page, pos)
@@ -806,9 +829,10 @@ pub fn btree_delete(tree: *BTree, key: *u8, key_len: i32) -> i32
         level -= 1
 
     # At leaf
-    let page: *Page = buffer_pool_fetch(tree.pool, page_id)
-    if page == null
+    let page_opt = buffer_pool_fetch(tree.pool, page_id)
+    if option_is_none<*Page>(@page_opt) == 1
         return ERR_IO
+    let page: *Page = option_unwrap_or<*Page>(@page_opt, null)
 
     let header: *BTreeNodeHeader = get_node_header(page)
 
@@ -839,13 +863,13 @@ pub fn btree_delete(tree: *BTree, key: *u8, key_len: i32) -> i32
 # B-tree Iterator (Range Scan)
 # ============================================================================
 
-pub fn btree_scan(tree: *BTree, start_key: *u8, start_len: i32, end_key: *u8, end_len: i32) -> *BTreeIter
+pub fn btree_scan(tree: *BTree, start_key: *u8, start_len: i32, end_key: *u8, end_len: i32) -> Option<*BTreeIter>
     if tree == null
-        return null
+        return None
 
     let iter: *BTreeIter = malloc(sizeof(BTreeIter)) as *BTreeIter
     if iter == null
-        return null
+        return None
 
     iter.tree = tree
     iter.exhausted = 0
@@ -868,10 +892,11 @@ pub fn btree_scan(tree: *BTree, start_key: *u8, start_len: i32, end_key: *u8, en
     var level: i32 = tree.height
 
     while level > 1
-        let page: *Page = buffer_pool_fetch(tree.pool, page_id)
-        if page == null
+        let page_opt = buffer_pool_fetch(tree.pool, page_id)
+        if option_is_none<*Page>(@page_opt) == 1
             free(iter as *u8)
-            return null
+            return None
+        let page: *Page = option_unwrap_or<*Page>(@page_opt, null)
 
         var pos: i32 = 0
         if start_key != null and start_len > 0
@@ -886,12 +911,13 @@ pub fn btree_scan(tree: *BTree, start_key: *u8, start_len: i32, end_key: *u8, en
     iter.page_id = page_id
 
     # Find starting position in leaf
-    let leaf: *Page = buffer_pool_fetch(tree.pool, page_id)
-    if leaf == null
+    let leaf_opt = buffer_pool_fetch(tree.pool, page_id)
+    if option_is_none<*Page>(@leaf_opt) == 1
         if iter.end_key != null
             free(iter.end_key)
         free(iter as *u8)
-        return null
+        return None
+    let leaf: *Page = option_unwrap_or<*Page>(@leaf_opt, null)
 
     var found: i32 = 0
     if start_key != null and start_len > 0
@@ -905,7 +931,7 @@ pub fn btree_scan(tree: *BTree, start_key: *u8, start_len: i32, end_key: *u8, en
 
     buffer_pool_unpin(tree.pool, page_id, 0)
 
-    return iter
+    return Some(iter)
 
 pub fn btree_iter_valid(iter: *BTreeIter) -> i32
     if iter == null
@@ -913,9 +939,10 @@ pub fn btree_iter_valid(iter: *BTreeIter) -> i32
     if iter.exhausted != 0
         return 0
 
-    let page: *Page = buffer_pool_fetch(iter.tree.pool, iter.page_id)
-    if page == null
+    let page_opt = buffer_pool_fetch(iter.tree.pool, iter.page_id)
+    if option_is_none<*Page>(@page_opt) == 1
         return 0
+    let page: *Page = option_unwrap_or<*Page>(@page_opt, null)
 
     let header: *BTreeNodeHeader = get_node_header(page)
     if iter.slot_idx >= header.num_keys
@@ -943,10 +970,11 @@ pub fn btree_iter_next(iter: *BTreeIter)
     if iter == null or iter.exhausted != 0
         return
 
-    let page: *Page = buffer_pool_fetch(iter.tree.pool, iter.page_id)
-    if page == null
+    let page_opt = buffer_pool_fetch(iter.tree.pool, iter.page_id)
+    if option_is_none<*Page>(@page_opt) == 1
         iter.exhausted = 1
         return
+    let page: *Page = option_unwrap_or<*Page>(@page_opt, null)
 
     let header: *BTreeNodeHeader = get_node_header(page)
     iter.slot_idx += 1
@@ -970,10 +998,11 @@ pub fn btree_iter_key(iter: *BTreeIter, key: *u8, key_len: *i32)
         *key_len = 0
         return
 
-    let page: *Page = buffer_pool_fetch(iter.tree.pool, iter.page_id)
-    if page == null
+    let page_opt = buffer_pool_fetch(iter.tree.pool, iter.page_id)
+    if option_is_none<*Page>(@page_opt) == 1
         *key_len = 0
         return
+    let page: *Page = option_unwrap_or<*Page>(@page_opt, null)
 
     var offset: i32 = 0
     var length: i32 = 0
@@ -994,10 +1023,11 @@ pub fn btree_iter_value(iter: *BTreeIter, value: *u8, value_len: *i32)
         *value_len = 0
         return
 
-    let page: *Page = buffer_pool_fetch(iter.tree.pool, iter.page_id)
-    if page == null
+    let page_opt = buffer_pool_fetch(iter.tree.pool, iter.page_id)
+    if option_is_none<*Page>(@page_opt) == 1
         *value_len = 0
         return
+    let page: *Page = option_unwrap_or<*Page>(@page_opt, null)
 
     var offset: i32 = 0
     var length: i32 = 0
