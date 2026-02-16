@@ -136,6 +136,7 @@ pub fn knamespace_file_size(ns: *KNamespace, path: @StrView) -> u64
     kblob_store_get_size((*ns).store, @id)
 
 # Write/create a file
+# Note: For content-addressed FS, we need to propagate changes up to root
 pub fn knamespace_write(ns: *KNamespace, path: @StrView, data: *u8, size: u64) -> i32
     if not path_validate(path)
         return KNS_INVALID_PATH
@@ -150,68 +151,54 @@ pub fn knamespace_write(ns: *KNamespace, path: @StrView, data: *u8, size: u64) -
     if base_name.len == 0
         return KNS_INVALID_PATH
 
-    # Find parent directory
-    var parent_id: KBlobId
-    if parent_path.len == 0
-        parent_id = kblob_id_copy(@(*ns).root)
-    else
-        parent_id = knamespace_resolve(ns, @parent_path)
-        if kblob_id_is_zero(@parent_id)
-            return KNS_NOT_FOUND
-
-    # Store the file content
+    # Store the file content first
     var file_id: KBlobId = kblob_store_put((*ns).store, data, size)
     if kblob_id_is_zero(@file_id)
         return KNS_OUT_OF_SPACE
 
-    # Update parent directory
-    update_dir_entry(ns, @parent_id, @base_name, @file_id, size, 0)
+    # Now propagate the change up the tree
+    # We need to update each directory from the file's parent up to root
+    return update_path_recursive(ns, path, @file_id, size, 0)
 
-# Create a directory
-pub fn knamespace_mkdir(ns: *KNamespace, path: @StrView) -> i32
-    if not path_validate(path)
-        return KNS_INVALID_PATH
-
-    if path_is_root(path)
-        return KNS_ALREADY_EXISTS
-
-    if knamespace_exists(ns, path)
-        return KNS_ALREADY_EXISTS
-
-    # Get parent and basename
+# Recursive helper to update a path and propagate changes to root
+fn update_path_recursive(ns: *KNamespace, path: @StrView, new_blob_id: *KBlobId, size: u64, is_dir: u8) -> i32
     let parent_path: StrView = path_parent(path)
     let base_name: StrView = path_basename(path)
 
     if base_name.len == 0
         return KNS_INVALID_PATH
 
-    # Find parent directory
+    # Check if parent is root (path_parent returns "/" for top-level entries)
+    let parent_is_root: bool = path_is_root(@parent_path) or parent_path.len == 0
+
+    # Find the parent directory's current blob ID
     var parent_id: KBlobId
-    if parent_path.len == 0
+    if parent_is_root
+        # Parent is root
         parent_id = kblob_id_copy(@(*ns).root)
     else
         parent_id = knamespace_resolve(ns, @parent_path)
         if kblob_id_is_zero(@parent_id)
             return KNS_NOT_FOUND
 
-    # Create empty directory blob
-    var empty_dir: [4]u8
-    empty_dir[0] = 0
-    empty_dir[1] = 0
-    empty_dir[2] = 0
-    empty_dir[3] = 0
-
-    var dir_id: KBlobId = kblob_store_put((*ns).store, @empty_dir[0], 4)
-    if kblob_id_is_zero(@dir_id)
+    # Create updated parent directory with new entry
+    var new_parent_id: KBlobId = create_updated_dir(ns, @parent_id, @base_name, new_blob_id, size, is_dir)
+    if kblob_id_is_zero(@new_parent_id)
         return KNS_OUT_OF_SPACE
 
-    update_dir_entry(ns, @parent_id, @base_name, @dir_id, 0, 1)
+    # If parent was root, update root and we're done
+    if parent_is_root
+        (*ns).root = new_parent_id
+        return KNS_OK
 
-# Helper: update a directory with a new or modified entry
-fn update_dir_entry(ns: *KNamespace, dir_id: *KBlobId, name: @StrView, blob_id: *KBlobId, size: u64, is_dir: u8) -> i32
+    # Otherwise, recurse up to update the parent's parent
+    return update_path_recursive(ns, @parent_path, @new_parent_id, 0, 1)
+
+# Create a new directory blob with an added/updated entry
+fn create_updated_dir(ns: *KNamespace, dir_id: *KBlobId, name: @StrView, blob_id: *KBlobId, size: u64, is_dir: u8) -> KBlobId
     let old_data: *u8 = kblob_store_get((*ns).store, dir_id)
     if old_data == 0 as *u8
-        return KNS_NOT_FOUND
+        return kblob_id_zero()
 
     let count_ptr: *u32 = old_data as *u32
     let old_count: i32 = *count_ptr as i32
@@ -225,13 +212,13 @@ fn update_dir_entry(ns: *KNamespace, dir_id: *KBlobId, name: @StrView, blob_id: 
         new_count = old_count + 1
 
     if new_count > MAX_DIR_ENTRIES
-        return KNS_OUT_OF_SPACE
+        return kblob_id_zero()
 
-    # Allocate new directory blob using kalloc
+    # Allocate new directory blob
     let new_size: u64 = kdir_serialized_size(new_count as u32)
     let new_data: *u8 = kalloc(new_size)
     if new_data == 0 as *u8
-        return KNS_OUT_OF_SPACE
+        return kblob_id_zero()
 
     let new_count_ptr: *u32 = new_data as *u32
     *new_count_ptr = new_count as u32
@@ -246,7 +233,7 @@ fn update_dir_entry(ns: *KNamespace, dir_id: *KBlobId, name: @StrView, blob_id: 
             write_idx = write_idx + 1
         i = i + 1
 
-    # Add the new/updated entry - need to copy name to pass to dir_entry functions
+    # Add the new/updated entry
     var name_copy: StrView = StrView { ptr: name.ptr, len: name.len }
     var new_entry: KDirEntry
     if is_dir != 0
@@ -257,20 +244,36 @@ fn update_dir_entry(ns: *KNamespace, dir_id: *KBlobId, name: @StrView, blob_id: 
     kdir_entry_serialize(@new_entry, new_data + 4 + write_idx * KDIR_ENTRY_SIZE)
 
     # Store new directory blob
-    var new_dir_id: KBlobId = kblob_store_put((*ns).store, new_data, new_size)
+    let new_dir_id: KBlobId = kblob_store_put((*ns).store, new_data, new_size)
 
-    # Free temporary buffer
-    # NOTE: kfree doesn't have size parameter in current impl
-    # kfree(new_data, new_size)
+    # Note: should free new_data here but kfree needs updating
 
-    if kblob_id_is_zero(@new_dir_id)
+    new_dir_id
+
+# Create a directory
+pub fn knamespace_mkdir(ns: *KNamespace, path: @StrView) -> i32
+    if not path_validate(path)
+        return KNS_INVALID_PATH
+
+    if path_is_root(path)
+        return KNS_ALREADY_EXISTS
+
+    if knamespace_exists(ns, path)
+        return KNS_ALREADY_EXISTS
+
+    # Create empty directory blob
+    var empty_dir: [4]u8
+    empty_dir[0] = 0
+    empty_dir[1] = 0
+    empty_dir[2] = 0
+    empty_dir[3] = 0
+
+    var dir_id: KBlobId = kblob_store_put((*ns).store, @empty_dir[0], 4)
+    if kblob_id_is_zero(@dir_id)
         return KNS_OUT_OF_SPACE
 
-    # Update root if this was root directory
-    if kblob_id_eq(dir_id, @(*ns).root)
-        (*ns).root = kblob_id_copy(@new_dir_id)
-
-    KNS_OK
+    # Use the recursive update to propagate changes to root
+    return update_path_recursive(ns, path, @dir_id, 0, 1)
 
 # List directory contents
 pub fn knamespace_list(ns: *KNamespace, path: @StrView, entries: *KDirEntry, max_entries: i32) -> i32

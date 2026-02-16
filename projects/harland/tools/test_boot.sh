@@ -1,6 +1,9 @@
 #!/bin/bash
-# Test kernel boot with QEMU
+# Test kernel boot with QEMU (BIOS mode via GRUB)
 # Captures serial output and checks for expected messages
+#
+# This test uses legacy BIOS boot with GRUB multiboot2.
+# For UEFI testing, use: make test-uefi-boot
 
 set -e
 
@@ -10,60 +13,40 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 ISO="$PROJECT_DIR/build/harland.iso"
 SERIAL_LOG="/tmp/harland_serial_$$.log"
 
-# Find OVMF (4M variant is more commonly available)
-OVMF_CODE=""
-for f in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd; do
-    if [[ -f "$f" ]]; then
-        OVMF_CODE="$f"
-        break
-    fi
-done
-
-if [[ -z "$OVMF_CODE" ]]; then
-    OVMF_CODE=$(find /usr -name "OVMF_CODE*.fd" -type f 2>/dev/null | head -1)
-fi
-
-if [[ -z "$OVMF_CODE" || ! -f "$OVMF_CODE" ]]; then
-    echo "Error: OVMF firmware not found"
-    echo "Install: sudo apt install ovmf"
-    exit 1
-fi
-
 if [[ ! -f "$ISO" ]]; then
     echo "Error: ISO not found at $ISO"
     echo "Run: ./tools/mkiso.sh"
     exit 1
 fi
 
-echo "Testing kernel boot..."
+echo "Testing kernel boot (BIOS/GRUB mode)..."
 echo "ISO: $ISO"
-echo "OVMF: $OVMF_CODE"
 
-# Create test disks if they don't exist
+# Create test disks if they don't exist (for VirtIO testing)
 INITRAMFS="$PROJECT_DIR/build/initramfs.qcow2"
 STORAGE="$PROJECT_DIR/build/storage.qcow2"
 
 if [[ ! -f "$INITRAMFS" ]]; then
     echo "Creating initramfs disk (64MB)..."
-    qemu-img create -f qcow2 "$INITRAMFS" 64M
+    qemu-img create -f qcow2 "$INITRAMFS" 64M >/dev/null
 fi
 
 if [[ ! -f "$STORAGE" ]]; then
     echo "Creating storage disk (512MB)..."
-    qemu-img create -f qcow2 "$STORAGE" 512M
+    qemu-img create -f qcow2 "$STORAGE" 512M >/dev/null
 fi
 
-# Run QEMU with timeout, capture serial output
-# Use pflash for OVMF_CODE_4M variant
-# -smp 2 for multi-core testing, -m 1G for full memory tests
-# VirtIO block devices for initramfs and storage
-timeout 15 qemu-system-x86_64 \
-    -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
+# Run QEMU in BIOS mode (no OVMF) with GRUB ISO
+# -smp 4 for multi-core testing, -m 2G for full memory tests
+# VirtIO block and network devices for driver testing
+timeout 20 qemu-system-x86_64 \
     -cdrom "$ISO" \
     -device virtio-blk-pci,drive=initramfs \
     -drive file="$INITRAMFS",format=qcow2,if=none,id=initramfs \
     -device virtio-blk-pci,drive=storage \
     -drive file="$STORAGE",format=qcow2,if=none,id=storage \
+    -device virtio-net-pci,netdev=net0 \
+    -netdev user,id=net0 \
     -serial file:"$SERIAL_LOG" \
     -display none \
     -smp 4 \
