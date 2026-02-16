@@ -1,0 +1,276 @@
+#!/usr/bin/env python3
+"""
+rz - Unified workspace CLI for the Ritz ecosystem
+
+Usage:
+    rz build [PROJECT]     Build a project (or all with --all)
+    rz test [PROJECT]      Run tests for a project (or all with --all)
+    rz run PROJECT         Build and run a project
+    rz list                List all projects in workspace
+    rz clean [PROJECT]     Clean build artifacts
+
+Examples:
+    rz build tome          Build the tome project
+    rz test --all          Run all tests
+    rz run nexus           Build and run nexus
+    rz list                Show all projects
+"""
+
+import argparse
+import os
+import subprocess
+import sys
+import tomllib
+from pathlib import Path
+
+# Workspace root is where this script lives
+WORKSPACE_ROOT = Path(__file__).parent.resolve()
+PROJECTS_DIR = WORKSPACE_ROOT / "projects"
+RITZ_BUILD = WORKSPACE_ROOT / "projects" / "ritz" / "build.py"
+
+
+def load_workspace_config():
+    """Load rz.toml workspace configuration."""
+    config_path = WORKSPACE_ROOT / "rz.toml"
+    if not config_path.exists():
+        print(f"Error: {config_path} not found", file=sys.stderr)
+        sys.exit(1)
+
+    with open(config_path, "rb") as f:
+        return tomllib.load(f)
+
+
+def discover_projects():
+    """Discover all projects in the workspace."""
+    projects = []
+    for item in PROJECTS_DIR.iterdir():
+        if item.is_dir() and (item / "ritz.toml").exists():
+            projects.append(item.name)
+    return sorted(projects)
+
+
+def get_project_config(project_name):
+    """Load a project's ritz.toml configuration."""
+    config_path = PROJECTS_DIR / project_name / "ritz.toml"
+    if not config_path.exists():
+        return None
+
+    with open(config_path, "rb") as f:
+        return tomllib.load(f)
+
+
+def run_build(project_name, extra_args=None):
+    """Run build.py for a specific project."""
+    project_dir = PROJECTS_DIR / project_name
+    if not project_dir.exists():
+        print(f"Error: Project '{project_name}' not found", file=sys.stderr)
+        return 1
+
+    # Set up environment
+    env = os.environ.copy()
+    env["RITZ_PATH"] = str(PROJECTS_DIR / "ritz")
+
+    cmd = [sys.executable, str(RITZ_BUILD), "build", str(project_dir)]
+    if extra_args:
+        cmd.extend(extra_args)
+
+    result = subprocess.run(cmd, env=env, cwd=WORKSPACE_ROOT)
+    return result.returncode
+
+
+def run_test(project_name, extra_args=None):
+    """Run tests for a specific project."""
+    project_dir = PROJECTS_DIR / project_name
+    if not project_dir.exists():
+        print(f"Error: Project '{project_name}' not found", file=sys.stderr)
+        return 1
+
+    # Set up environment
+    env = os.environ.copy()
+    env["RITZ_PATH"] = str(PROJECTS_DIR / "ritz")
+
+    cmd = [sys.executable, str(RITZ_BUILD), "test", str(project_dir)]
+    if extra_args:
+        cmd.extend(extra_args)
+
+    result = subprocess.run(cmd, env=env, cwd=WORKSPACE_ROOT)
+    return result.returncode
+
+
+def cmd_build(args):
+    """Handle 'rz build' command."""
+    if args.all:
+        projects = discover_projects()
+        failed = []
+        for project in projects:
+            print(f"\n{'='*60}")
+            print(f"Building: {project}")
+            print('='*60)
+            if run_build(project) != 0:
+                failed.append(project)
+
+        if failed:
+            print(f"\nFailed projects: {', '.join(failed)}")
+            return 1
+        print(f"\nAll {len(projects)} projects built successfully!")
+        return 0
+
+    if not args.project:
+        print("Error: Specify a project or use --all", file=sys.stderr)
+        return 1
+
+    return run_build(args.project)
+
+
+def cmd_test(args):
+    """Handle 'rz test' command."""
+    if args.all:
+        projects = discover_projects()
+        failed = []
+        for project in projects:
+            config = get_project_config(project)
+            # Skip projects without tests
+            if not config or "test" not in config.get("build", {}):
+                continue
+
+            print(f"\n{'='*60}")
+            print(f"Testing: {project}")
+            print('='*60)
+            if run_test(project) != 0:
+                failed.append(project)
+
+        if failed:
+            print(f"\nFailed tests: {', '.join(failed)}")
+            return 1
+        print("\nAll tests passed!")
+        return 0
+
+    if not args.project:
+        print("Error: Specify a project or use --all", file=sys.stderr)
+        return 1
+
+    return run_test(args.project)
+
+
+def cmd_run(args):
+    """Handle 'rz run' command."""
+    if not args.project:
+        print("Error: Specify a project to run", file=sys.stderr)
+        return 1
+
+    # First build
+    if run_build(args.project) != 0:
+        return 1
+
+    # Then run - look for the binary
+    project_dir = PROJECTS_DIR / args.project
+    build_dir = project_dir / "build"
+
+    # Find the binary (typically named after the project)
+    binary = build_dir / args.project
+    if not binary.exists():
+        # Try debug subdirectory
+        binary = build_dir / "debug" / args.project
+
+    if not binary.exists():
+        print(f"Error: Could not find binary for '{args.project}'", file=sys.stderr)
+        return 1
+
+    env = os.environ.copy()
+    env["RITZ_PATH"] = str(PROJECTS_DIR / "ritz")
+
+    result = subprocess.run([str(binary)] + args.args, env=env)
+    return result.returncode
+
+
+def cmd_list(args):
+    """Handle 'rz list' command."""
+    projects = discover_projects()
+
+    print(f"Workspace: {WORKSPACE_ROOT.name}")
+    print(f"Projects ({len(projects)}):\n")
+
+    for project in projects:
+        config = get_project_config(project)
+        if config and "package" in config:
+            desc = config["package"].get("description", "")
+            name = config["package"].get("name", project)
+            print(f"  {name:20} {desc}")
+        else:
+            print(f"  {project}")
+
+    return 0
+
+
+def cmd_clean(args):
+    """Handle 'rz clean' command."""
+    if args.all:
+        projects = discover_projects()
+    elif args.project:
+        projects = [args.project]
+    else:
+        print("Error: Specify a project or use --all", file=sys.stderr)
+        return 1
+
+    for project in projects:
+        project_dir = PROJECTS_DIR / project
+        build_dir = project_dir / "build"
+        if build_dir.exists():
+            print(f"Cleaning: {project}")
+            import shutil
+            shutil.rmtree(build_dir)
+
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Unified workspace CLI for the Ritz ecosystem",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__
+    )
+
+    subparsers = parser.add_subparsers(dest="command", help="Command to run")
+
+    # build
+    build_parser = subparsers.add_parser("build", help="Build a project")
+    build_parser.add_argument("project", nargs="?", help="Project to build")
+    build_parser.add_argument("--all", action="store_true", help="Build all projects")
+
+    # test
+    test_parser = subparsers.add_parser("test", help="Run tests")
+    test_parser.add_argument("project", nargs="?", help="Project to test")
+    test_parser.add_argument("--all", action="store_true", help="Test all projects")
+
+    # run
+    run_parser = subparsers.add_parser("run", help="Build and run a project")
+    run_parser.add_argument("project", help="Project to run")
+    run_parser.add_argument("args", nargs="*", help="Arguments to pass to the binary")
+
+    # list
+    subparsers.add_parser("list", help="List all projects")
+
+    # clean
+    clean_parser = subparsers.add_parser("clean", help="Clean build artifacts")
+    clean_parser.add_argument("project", nargs="?", help="Project to clean")
+    clean_parser.add_argument("--all", action="store_true", help="Clean all projects")
+
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        return 1
+
+    commands = {
+        "build": cmd_build,
+        "test": cmd_test,
+        "run": cmd_run,
+        "list": cmd_list,
+        "clean": cmd_clean,
+    }
+
+    return commands[args.command](args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
