@@ -8,12 +8,18 @@ Usage:
     rz run PROJECT         Build and run a project
     rz list                List all projects in workspace
     rz clean [PROJECT]     Clean build artifacts
+    rz compare [TIER]      Compare ritz0 vs ritz1 on examples
+
+Compiler Selection:
+    --compiler ritz0       Use Python bootstrap compiler (default)
+    --compiler ritz1       Use self-hosted Ritz compiler
 
 Examples:
-    rz build tome          Build the tome project
-    rz test --all          Run all tests
-    rz run nexus           Build and run nexus
-    rz list                Show all projects
+    rz build tome                Build the tome project
+    rz test --all                Run all tests
+    rz run nexus                 Build and run nexus
+    rz build --compiler ritz1    Build with self-hosted compiler
+    rz compare tier1             Compare compilers on tier1 examples
 """
 
 import argparse
@@ -27,6 +33,10 @@ from pathlib import Path
 WORKSPACE_ROOT = Path(__file__).parent.resolve()
 PROJECTS_DIR = WORKSPACE_ROOT / "projects"
 RITZ_BUILD = WORKSPACE_ROOT / "projects" / "ritz" / "build.py"
+RITZ1_BIN = WORKSPACE_ROOT / "projects" / "ritz" / "ritz1" / "build" / "debug" / "ritz1"
+
+# Global compiler selection (can be overridden per command)
+COMPILER = "ritz0"  # default
 
 
 def load_workspace_config():
@@ -267,6 +277,152 @@ def cmd_clean(args):
     return 0
 
 
+def compile_with_ritz1(source_path, output_path):
+    """Compile a single .ritz file with ritz1."""
+    if not RITZ1_BIN.exists():
+        print(f"Error: ritz1 not found at {RITZ1_BIN}", file=sys.stderr)
+        print("  Run: cd projects/ritz && python3 build.py build ritz1", file=sys.stderr)
+        return False
+
+    env = os.environ.copy()
+    env["RITZ_PATH"] = str(PROJECTS_DIR / "ritz")
+
+    result = subprocess.run(
+        [str(RITZ1_BIN), str(source_path), "-o", str(output_path)],
+        env=env,
+        capture_output=True,
+        text=True
+    )
+    return result.returncode == 0
+
+
+def compile_with_ritz0(source_path, output_path):
+    """Compile a single .ritz file with ritz0."""
+    ritz0_py = PROJECTS_DIR / "ritz" / "ritz0" / "ritz0.py"
+    env = os.environ.copy()
+    env["RITZ_PATH"] = str(PROJECTS_DIR / "ritz")
+
+    result = subprocess.run(
+        [sys.executable, str(ritz0_py), str(source_path), "-o", str(output_path)],
+        env=env,
+        capture_output=True,
+        text=True
+    )
+    return result.returncode == 0
+
+
+def link_llvm_ir(ll_path, binary_path):
+    """Link LLVM IR to a binary.
+
+    Detects whether the IR has a _start function (freestanding) and
+    adjusts linker flags accordingly.
+    """
+    # Check if the IR has _start (freestanding mode)
+    with open(ll_path, 'r') as f:
+        ir_content = f.read()
+
+    has_start = 'define void @_start' in ir_content or 'define void @"_start"' in ir_content
+
+    if has_start:
+        # Freestanding: use -nostdlib to avoid conflicting _start
+        cmd = ["clang", str(ll_path), "-o", str(binary_path), "-nostdlib", "-no-pie"]
+    else:
+        # Normal: let system provide _start
+        cmd = ["clang", str(ll_path), "-o", str(binary_path), "-no-pie"]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    return result.returncode == 0
+
+
+def cmd_compare(args):
+    """Handle 'rz compare' command - compare ritz0 vs ritz1 on examples."""
+    import tempfile
+
+    examples_dir = PROJECTS_DIR / "ritz" / "examples"
+    tier = args.tier or "tier1"
+
+    # Map tier names
+    tier_dirs = {
+        "tier1": "tier1_basics",
+        "tier2": "tier2_stdlib",
+        "tier3": "tier3_coreutils",
+        "tier4": "tier4_applications",
+        "tier5": "tier5_async",
+    }
+
+    if tier not in tier_dirs:
+        print(f"Error: Unknown tier '{tier}'. Available: {', '.join(tier_dirs.keys())}")
+        return 1
+
+    tier_path = examples_dir / tier_dirs[tier]
+    if not tier_path.exists():
+        print(f"Error: Tier directory not found: {tier_path}")
+        return 1
+
+    print(f"Comparing ritz0 vs ritz1 on {tier} examples")
+    print("=" * 70)
+    print(f"{'Example':<25} {'ritz0':<15} {'ritz1':<15} {'Match':<10}")
+    print("-" * 70)
+
+    results = {"ritz0_only": [], "ritz1_only": [], "both": [], "neither": []}
+
+    for example_dir in sorted(tier_path.iterdir()):
+        if not example_dir.is_dir():
+            continue
+
+        src = example_dir / "src" / "main.ritz"
+        if not src.exists():
+            continue
+
+        name = example_dir.name
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+
+            # Try ritz0
+            ll0 = tmpdir / "ritz0.ll"
+            bin0 = tmpdir / "ritz0_bin"
+            r0_compile = compile_with_ritz0(src, ll0)
+            r0_link = link_llvm_ir(ll0, bin0) if r0_compile else False
+            r0_status = "✅ ok" if r0_link else ("⚠️ link" if r0_compile else "❌ fail")
+
+            # Try ritz1
+            ll1 = tmpdir / "ritz1.ll"
+            bin1 = tmpdir / "ritz1_bin"
+            r1_compile = compile_with_ritz1(src, ll1)
+            r1_link = link_llvm_ir(ll1, bin1) if r1_compile else False
+            r1_status = "✅ ok" if r1_link else ("⚠️ link" if r1_compile else "❌ fail")
+
+            # Determine match status
+            if r0_link and r1_link:
+                match = "✅ both"
+                results["both"].append(name)
+            elif r0_link and not r1_link:
+                match = "🔶 r0"
+                results["ritz0_only"].append(name)
+            elif r1_link and not r0_link:
+                match = "🔷 r1"
+                results["ritz1_only"].append(name)
+            else:
+                match = "❌ none"
+                results["neither"].append(name)
+
+            print(f"{name:<25} {r0_status:<15} {r1_status:<15} {match:<10}")
+
+    print("-" * 70)
+    print(f"\nSummary:")
+    print(f"  Both work:     {len(results['both'])} examples")
+    print(f"  ritz0 only:    {len(results['ritz0_only'])} examples")
+    print(f"  ritz1 only:    {len(results['ritz1_only'])} examples")
+    print(f"  Neither work:  {len(results['neither'])} examples")
+
+    total = sum(len(v) for v in results.values())
+    ritz1_pct = (len(results['both']) + len(results['ritz1_only'])) / total * 100 if total > 0 else 0
+    print(f"\n  ritz1 coverage: {ritz1_pct:.1f}%")
+
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Unified workspace CLI for the Ritz ecosystem",
@@ -300,6 +456,11 @@ def main():
     clean_parser.add_argument("project", nargs="?", help="Project to clean")
     clean_parser.add_argument("--all", action="store_true", help="Clean all projects")
 
+    # compare
+    compare_parser = subparsers.add_parser("compare", help="Compare ritz0 vs ritz1 on examples")
+    compare_parser.add_argument("tier", nargs="?", default="tier1",
+                               help="Tier to compare (tier1, tier2, tier3, tier4, tier5)")
+
     args = parser.parse_args()
 
     if not args.command:
@@ -312,6 +473,7 @@ def main():
         "run": cmd_run,
         "list": cmd_list,
         "clean": cmd_clean,
+        "compare": cmd_compare,
     }
 
     return commands[args.command](args)
