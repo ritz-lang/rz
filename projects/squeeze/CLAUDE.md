@@ -8,26 +8,44 @@ Squeeze is a compression library for Ritz, implementing Deflate (RFC 1951), Gzip
 
 ```
 squeeze/
-├── lib/              # Library modules (production code)
-│   ├── crc32.ritz    # CRC-32 checksum
-│   ├── bits.ritz     # Bit stream reader/writer
-│   ├── huffman.ritz  # Huffman coding
-│   ├── inflate.ritz  # Deflate decompression
-│   └── ...           # Future: deflate.ritz, gzip.ritz, zlib.ritz
-├── test/             # Test files (@test functions)
-│   ├── test_crc32.ritz
+├── lib/                    # Library modules (production code)
+│   ├── adler32.ritz        # Adler-32 checksum
+│   ├── adler32_simd.ritz   # SIMD-accelerated Adler-32
+│   ├── bits.ritz           # Bit stream reader/writer
+│   ├── bytes.ritz          # Byte manipulation utilities
+│   ├── crc32.ritz          # CRC-32 checksum
+│   ├── crc32_simd.ritz     # SIMD-accelerated CRC32 (PCLMULQDQ)
+│   ├── deflate.ritz        # Deflate compression (RFC 1951)
+│   ├── deflate_simd.ritz   # SIMD-accelerated deflate
+│   ├── gzip.ritz           # Gzip container format (RFC 1952)
+│   ├── gzip_stream.ritz    # Streaming gzip (GzipReader/GzipWriter)
+│   ├── huffman.ritz        # Huffman coding
+│   ├── inflate.ritz        # Deflate decompression
+│   ├── squeeze.ritz        # Main module (re-exports)
+│   ├── zlib.ritz           # Zlib container format (RFC 1950)
+│   └── zlib_stream.ritz    # Streaming zlib (ZlibReader/ZlibWriter)
+├── test/                   # Test files ([[test]] functions)
+│   ├── test_adler32.ritz
+│   ├── test_adler32_simd.ritz
 │   ├── test_bits.ritz
+│   ├── test_crc32.ritz
+│   ├── test_crc32_simd.ritz
+│   ├── test_crossval.ritz  # Cross-validation against system gzip/zlib
+│   ├── test_deflate.ritz
+│   ├── test_gzip.ritz
+│   ├── test_gzip_stream.ritz
+│   ├── test_hashchain_simd.ritz
 │   ├── test_huffman.ritz
-│   └── test_inflate.ritz
-├── ritz/             # Ritz compiler (submodule)
-├── ritzlib -> ritz/ritzlib  # Symlink to standard library
-├── ritzunit/         # Test framework (submodule)
-├── run_tests.sh      # Build and run tests with ritzunit
-├── build.sh          # Build library (placeholder)
-├── TODO.md           # Development roadmap (phases, tasks)
-├── DONE.md           # Completed work
-├── README.md         # Public documentation
-└── CLAUDE.md         # This file
+│   ├── test_inflate.ritz
+│   ├── test_squeeze.ritz
+│   ├── test_zlib.ritz
+│   └── test_zlib_stream.ritz
+├── ritz.toml               # Build configuration
+├── run_tests.sh            # Build and run tests with ritzunit
+├── TODO.md                 # Development roadmap
+├── DONE.md                 # Completed work
+├── README.md               # Public documentation
+└── CLAUDE.md               # This file
 ```
 
 ## Building and Testing
@@ -54,14 +72,14 @@ Tests run using **ritzunit**, the standard Ritz test framework:
 
 ### Test Discovery
 
-Tests are automatically discovered via ELF symbol table scanning. Any function marked with `@test` that returns `i32` will be found and run:
+Tests are automatically discovered via ELF symbol table scanning. Any function marked with `[[test]]` that returns `i32` will be found and run:
 
 ```ritz
-@test
+[[test]]
 fn test_crc32_empty() -> i32
-    let result: u32 = crc32(c"", 0)
+    let result: u32 = crc32("", 0)
     if result != 0x00000000
-        print(c"FAIL: test_crc32_empty\n")
+        print("FAIL: test_crc32_empty\n")
         return 1
     0
 ```
@@ -87,18 +105,18 @@ import ritzlib.io
 
 import lib.crc32
 
-@test
+[[test]]
 fn test_crc32_empty() -> i32
     # CRC32("") = 0x00000000
-    let result: u32 = crc32("" as *u8, 0)
+    let result: u32 = crc32("", 0)
     if result != 0x00000000
         return 1
     0
 
-@test
+[[test]]
 fn test_crc32_known_vector() -> i32
     # CRC32("123456789") = 0xCBF43926
-    let result: u32 = crc32("123456789" as *u8, 9)
+    let result: u32 = crc32("123456789", 9)
     if result != 0xCBF43926
         return 1
     0
@@ -106,7 +124,7 @@ fn test_crc32_known_vector() -> i32
 
 ### 2. Follow Ritz Style Guide
 
-See `ritz/STYLE.md` for full details. Key points:
+See `projects/larb/docs/STYLE.md` for full details. Key points:
 
 | Item | Convention | Example |
 |------|------------|---------|
@@ -115,6 +133,8 @@ See `ritz/STYLE.md` for full details. Key points:
 | Types/Structs | PascalCase | `BitReader`, `HuffmanTable` |
 | Constants | SCREAMING_SNAKE | `CRC32_POLYNOMIAL`, `MAX_CODE_LENGTH` |
 | Indent | 4 spaces | (no tabs) |
+| Strings | `"string"` | Plain StrView literals |
+| Attributes | `[[test]]` | New attribute syntax |
 
 ### 3. Code Organization Pattern
 
@@ -204,6 +224,17 @@ Initial value: 0xFFFFFFFF
 Final XOR: 0xFFFFFFFF
 
 Table-driven for speed (256-entry lookup table)
+SIMD: PCLMULQDQ folding + Barrett reduction
+```
+
+### Adler-32
+
+```
+s1 = sum of bytes, s2 = sum of s1 values
+Combined: (s2 << 16) | s1
+Modulo: 65521 (largest prime < 2^16)
+
+SIMD: PSADBW for vectorized accumulation
 ```
 
 ### Bit Stream
@@ -223,6 +254,7 @@ Deflate fixed codes:
 - Literals 280-287: 8 bits (11000000 - 11000111)
 
 Maximum code length: 15 bits
+Decode table: 9-bit lookup for fast resolution
 ```
 
 ### Deflate Block Types
@@ -233,67 +265,26 @@ Type 1: Fixed Huffman codes
 Type 2: Dynamic Huffman codes (code length tree + literal/distance trees)
 ```
 
-## Common Patterns
+## Streaming API
 
-### Test Vector Comparison
+The streaming API (`gzip_stream.ritz`, `zlib_stream.ritz`) is designed for:
+- **Large files** - Process data in chunks without loading entire file
+- **HTTP responses** - Valet uses this for chunked transfer compression
+- **Fixed memory** - No dynamic allocation after initialization
 
-```ritz
-# Helper for comparing against hex strings (from cryptosec)
-fn hex_char_to_val(c: u8) -> u8
-    if c >= '0' && c <= '9'
-        return c - '0'
-    if c >= 'a' && c <= 'f'
-        return c - 'a' + 10
-    if c >= 'A' && c <= 'F'
-        return c - 'A' + 10
-    return 0
-
-fn bytes_eq_hex(bytes: *u8, len: i64, hex: *u8) -> i32
-    for i in 0..len
-        let hi: u8 = hex_char_to_val(hex[i * 2])
-        let lo: u8 = hex_char_to_val(hex[i * 2 + 1])
-        let expected: u8 = (hi << 4) | lo
-        if bytes[i] != expected
-            return 0
-    return 1
-```
-
-### Bit Manipulation
+### GzipWriter Example
 
 ```ritz
-# Bit rotation (from sha256)
-fn rotr32(x: u32, n: u32) -> u32
-    return (x >> n) | (x << (32 - n))
+var writer: GzipWriter
+gzip_writer_init(@writer, 6)  # Compression level 6
 
-# Read big-endian u32 from bytes
-fn read_be32(ptr: *u8) -> u32
-    let b0: u32 = ptr[0] as u32
-    let b1: u32 = ptr[1] as u32
-    let b2: u32 = ptr[2] as u32
-    let b3: u32 = ptr[3] as u32
-    return (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+# Write chunks
+var out: [65536]u8
+let n1 = gzip_writer_write(@writer, chunk1, len1, @out[0], 65536)
+let n2 = gzip_writer_write(@writer, chunk2, len2, @out[0], 65536)
 
-# Write little-endian u32 to bytes (for gzip trailer)
-fn write_le32(ptr: *u8, val: u32)
-    ptr[0] = (val & 0xFF) as u8
-    ptr[1] = ((val >> 8) & 0xFF) as u8
-    ptr[2] = ((val >> 16) & 0xFF) as u8
-    ptr[3] = ((val >> 24) & 0xFF) as u8
-```
-
-### Lookup Tables
-
-```ritz
-# Generate CRC32 table (call once at init or use const when supported)
-fn crc32_make_table(table: *u32)
-    for i in 0..256
-        var crc: u32 = i as u32
-        for j in 0..8
-            if (crc & 1) != 0
-                crc = (crc >> 1) ^ CRC32_POLYNOMIAL
-            else
-                crc = crc >> 1
-        table[i] = crc
+# Finish and get trailer
+let final = gzip_writer_finish(@writer, @out[0], 65536)
 ```
 
 ## Debugging Tips
@@ -331,30 +322,31 @@ gdb ./build/test_crc32
 
 ## Phase Progression
 
-See `TODO.md` for detailed tasks. The phases are:
+See `TODO.md` for detailed tasks. Completed phases:
 
-1. **Foundations** - CRC32, Adler32, BitReader/Writer
-2. **Huffman** - Decoding tables, encoding tables, code generation
-3. **Deflate** - Inflate (decompress), then Deflate (compress)
-4. **Containers** - Gzip format, Zlib format
-5. **HTTP** - Accept-Encoding parsing, Valet integration
-6. **Optimization** - SIMD, memory pools, profiling
+1. **Foundations** - CRC32, Adler32, BitReader/Writer ✅
+2. **Huffman** - Decoding tables, encoding tables, code generation ✅
+3. **Deflate** - Inflate (decompress), Deflate (compress), Dynamic Huffman ✅
+4. **Containers** - Gzip format, Zlib format ✅
+5. **Streaming** - GzipReader/Writer, ZlibReader/Writer ✅
+6. **SIMD** - CRC32, Adler-32, hashchain acceleration ✅
 
 ## Related Projects
 
-- **ritz/** - Ritz compiler (submodule)
-- **ritzunit/** - Test framework (submodule)
-- **../valet** - HTTP server that will use squeeze
-- **../cryptosec** - Cryptographic library (similar structure, good reference)
-- **ritz/ritzlib/** - Standard library modules
+- **ritz/** - Ritz compiler (monorepo: `projects/ritz`)
+- **ritzunit/** - Test framework (monorepo: `projects/ritz/ritzunit`)
+- **valet** - HTTP server that uses squeeze (monorepo: `projects/valet`)
+- **cryptosec** - Cryptographic library (similar structure, good reference)
+- **ritzlib** - Standard library modules (monorepo: `projects/ritz/ritzlib`)
 
 ## Notes
 
 - Binaries go in `build/`, not `/tmp` (noexec mount)
 - All code should be valgrind-clean
 - Clear `.ritz-cache` if you see stale constant values
-- Use `c"string"` for C-string literals, `"string"` for String type
+- Use `"string"` for StrView literals (not `c"string"`)
+- Use `[[test]]` attribute syntax (not `@test`)
 
 ---
 
-*Last updated: 2026-02-12*
+*Last updated: 2026-02-16*
