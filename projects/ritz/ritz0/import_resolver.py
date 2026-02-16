@@ -133,7 +133,8 @@ class ImportResolver:
         self,
         project_root: Optional[str] = None,
         use_cache: bool = True,
-        dependencies: Optional[Dict[str, DependencyMapping]] = None
+        dependencies: Optional[Dict[str, DependencyMapping]] = None,
+        source_roots: Optional[List[str]] = None
     ):
         # Track which files have been processed to avoid cycles
         self.processed_files: Set[str] = set()
@@ -176,6 +177,16 @@ class ImportResolver:
         self.import_aliases: Dict[str, Dict[str, str]] = {}
         # RFC #109 Phase 2: Dependency mappings for namespace resolution
         self.dependencies: Dict[str, DependencyMapping] = dependencies or {}
+        # Source roots: directories to search for imports (e.g., ["src", "kernel/src"])
+        # These are searched after relative imports but before project root
+        self.source_roots: List[Path] = []
+        if source_roots:
+            for sr in source_roots:
+                sr_path = Path(sr)
+                if not sr_path.is_absolute() and self.project_root:
+                    sr_path = self.project_root / sr_path
+                if sr_path.exists():
+                    self.source_roots.append(sr_path.resolve())
 
     # ============================================================================
     # Export Map Building
@@ -705,8 +716,9 @@ class ImportResolver:
 
         Resolution order:
         1. Relative to importing file: foo.ritz, foo/bar.ritz
-        2. From project root: ritzlib/sys.ritz
-        3. From RITZ_PATH directories
+        2. From source roots (e.g., ["src", "kernel/src"])
+        3. From project root: ritzlib/sys.ritz
+        4. From RITZ_PATH directories
         """
         base_dir = Path(from_file).parent
 
@@ -733,7 +745,16 @@ class ImportResolver:
         if candidate.exists():
             return str(candidate.resolve())
 
-        # Try 2: From project root
+        # Try 2: From source roots (e.g., ["src", "kernel/src"])
+        for source_root in self.source_roots:
+            candidate = source_root / relative_path
+            if candidate.exists():
+                return str(candidate.resolve())
+            candidate = source_root / flat_name
+            if candidate.exists():
+                return str(candidate.resolve())
+
+        # Try 4: From project root
         if self.project_root:
             candidate = self.project_root / relative_path
             if candidate.exists():
@@ -742,7 +763,7 @@ class ImportResolver:
             if candidate.exists():
                 return str(candidate.resolve())
 
-        # Try 3: From RITZ_PATH directories
+        # Try 5: From RITZ_PATH directories
         for import_path in self.import_paths:
             candidate = import_path / relative_path
             if candidate.exists():
@@ -1258,7 +1279,8 @@ def resolve_imports(
     source_path: str,
     project_root: Optional[str] = None,
     use_cache: bool = True,
-    dependencies: Optional[Dict[str, DependencyMapping]] = None
+    dependencies: Optional[Dict[str, DependencyMapping]] = None,
+    source_roots: Optional[List[str]] = None
 ) -> rast.Module:
     """Convenience function to resolve all imports in a module.
 
@@ -1268,18 +1290,20 @@ def resolve_imports(
         project_root: Optional explicit project root (auto-detected if not provided)
         use_cache: Whether to use .ritz-meta caching (default True)
         dependencies: RFC #109 dependency mappings for namespace resolution
+        source_roots: List of source directories to search for imports
 
     Returns:
         New module with all imported items merged in
     """
-    resolver = ImportResolver(project_root, use_cache=use_cache, dependencies=dependencies)
+    resolver = ImportResolver(project_root, use_cache=use_cache, dependencies=dependencies, source_roots=source_roots)
     return resolver.resolve(module, source_path)
 
 
 def collect_all_source_files(
     source_path: str,
     project_root: Optional[str] = None,
-    dependencies: Optional[Dict[str, DependencyMapping]] = None
+    dependencies: Optional[Dict[str, DependencyMapping]] = None,
+    source_roots: Optional[List[str]] = None
 ) -> List[str]:
     """Collect all source files needed for a module (main + all imports).
 
@@ -1290,6 +1314,7 @@ def collect_all_source_files(
         source_path: Path to the main source file
         project_root: Optional explicit project root (auto-detected if not provided)
         dependencies: RFC #109 dependency mappings for namespace resolution
+        source_roots: List of source directories to search for imports
 
     Returns:
         List of absolute paths to all required source files, in dependency order
@@ -1307,7 +1332,7 @@ def collect_all_source_files(
     # Don't use cache - this is just for discovery, not compilation.
     # Using cache here would write stub metadata that could interfere
     # with later compilation that needs full function bodies.
-    resolver = ImportResolver(project_root, use_cache=False, dependencies=dependencies)
+    resolver = ImportResolver(project_root, use_cache=False, dependencies=dependencies, source_roots=source_roots)
     source_path = str(Path(source_path).resolve())
 
     # Parse main module

@@ -582,7 +582,7 @@ def get_binaries(pkg_dir: Path, config: dict) -> list[tuple[str, Path, list[Path
     return binaries
 
 
-def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources: list[Path] = None, keep_artifacts: bool = False, use_cache: bool = True, profile: dict = None, dependencies: dict[str, DependencySpec] = None, pkg_dir: Path = None) -> Path:
+def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources: list[Path] = None, keep_artifacts: bool = False, use_cache: bool = True, profile: dict = None, dependencies: dict[str, DependencySpec] = None, pkg_dir: Path = None, source_roots: list[str] = None) -> Path:
     """Compile Ritz source file(s) to a binary.
 
     Args:
@@ -595,6 +595,7 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
         profile: Build profile dict with opt_level, debug, lto settings (RFC #109)
         dependencies: RFC #109 dependency specs for namespace resolution
         pkg_dir: Package directory for project root (defaults to ROOT for standalone builds)
+        source_roots: List of source directories to search for imports (e.g., ["src", "kernel/src"])
 
     Uses separate compilation model:
     1. Discover all source files via import resolution
@@ -633,6 +634,8 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
             for name, spec in dependencies.items()
         }
         cmd.extend(["--deps", json.dumps(deps_json)])
+    if source_roots:
+        cmd.extend(["--sources", json.dumps(source_roots)])
 
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
@@ -719,6 +722,9 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
                     for name, spec in dependencies.items()
                 }
                 compile_cmd.extend(["--deps", json.dumps(deps_json)])
+            # Pass source roots if any (for import resolution)
+            if source_roots:
+                compile_cmd.extend(["--sources", json.dumps(source_roots)])
 
             result = subprocess.run(compile_cmd, capture_output=True, text=True)
             if result.returncode != 0:
@@ -818,6 +824,16 @@ def build_package(pkg_dir: Path, config: dict, keep_artifacts: bool = False, use
 
     # Parse dependencies (RFC #109 Phase 2)
     dependencies = parse_dependencies(config, pkg_dir)
+
+    # Get source roots for import resolution
+    # Check both top-level and inside [package] (TOML puts keys in current section)
+    source_roots = config.get("sources")
+    if source_roots is None:
+        source_roots = config.get("package", {}).get("sources")
+    # Convert single string to list
+    if isinstance(source_roots, str):
+        source_roots = [source_roots]
+
     if dependencies:
         print(f"📦 Building {pkg_name} ({profile['name']}) with {len(dependencies)} dependencies...")
     else:
@@ -847,7 +863,8 @@ def build_package(pkg_dir: Path, config: dict, keep_artifacts: bool = False, use
             use_cache=use_cache,
             profile=profile,
             dependencies=dependencies,
-            pkg_dir=pkg_dir
+            pkg_dir=pkg_dir,
+            source_roots=source_roots
         )
         if bin_path:
             try:
