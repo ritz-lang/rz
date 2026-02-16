@@ -28,8 +28,9 @@ import cap.types { CapHandle, CapEntry, CapInfo, CAP_TYPE_NONE, CAP_TYPE_MEMORY,
 import cap.table { CapTable, CAP_TABLE_SIZE, cap_table_init, cap_table_alloc, cap_table_free, cap_table_get, cap_table_insert, cap_table_lookup, cap_table_remove, cap_table_derive, cap_grant, cap_table_info, cap_has_rights, cap_system_debug_print }
 import cap.syscall { SYS_CAP_GRANT, SYS_CAP_REVOKE, SYS_CAP_DERIVE, SYS_CAP_INFO, SYS_CAP_CHECK, sys_cap_grant, sys_cap_revoke, sys_cap_derive, sys_cap_info, sys_cap_check }
 import drivers.virtio.blk { VirtioBlkDevice, virtio_blk_init, virtio_blk_read, virtio_blk_write, virtio_blk_get_capacity, virtio_blk_get_device, virtio_blk_test }
-import fs.kblob { kblob_init, kblob_get_store, kblob_store_put, kblob_store_get, kblob_store_exists, kblob_id_eq }
+import fs.kblob { KBlobId, kblob_init, kblob_get_store, kblob_store_put, kblob_store_get, kblob_store_exists, kblob_id_eq, kblob_id_is_zero }
 import fs.vfs { vfs_init, fd_table_init }
+import fs.knamespace { knamespace_init, knamespace_get, knamespace_mkdir, knamespace_write, knamespace_read, knamespace_exists, KNS_OK }
 
 # ============================================================================
 # Kernel Ring Buffer (Early Boot Debug)
@@ -4527,6 +4528,78 @@ fn test_capability_system() -> i32
     return 0
 
 # ============================================================================
+# Filesystem Quick Test
+# ============================================================================
+
+fn fs_quick_test() -> i32
+    prints("\n  Testing filesystem...\n")
+
+    let ns: *fs.knamespace.KNamespace = knamespace_get()
+    if ns == 0 as *fs.knamespace.KNamespace
+        prints("    FAIL: No namespace\n")
+        return -1
+
+    # Test 1: Create a directory
+    let mkdir_path: StrView = "/test" as StrView
+    let mkdir_result: i32 = knamespace_mkdir(ns, @mkdir_path)
+    if mkdir_result == KNS_OK
+        prints("    [OK] mkdir /test\n")
+    else
+        prints("    [!!] mkdir /test failed\n")
+
+    # Test 2: Create a file
+    var test_data: [12]u8
+    test_data[0] = 72   # H
+    test_data[1] = 101  # e
+    test_data[2] = 108  # l
+    test_data[3] = 108  # l
+    test_data[4] = 111  # o
+    test_data[5] = 32   # (space)
+    test_data[6] = 70   # F
+    test_data[7] = 83   # S
+    test_data[8] = 33   # !
+    test_data[9] = 10   # \n
+    test_data[10] = 0
+
+    let write_path: StrView = "/test/hello.txt" as StrView
+    let write_result: i32 = knamespace_write(ns, @write_path, @test_data[0], 10)
+    if write_result == KNS_OK
+        prints("    [OK] write /test/hello.txt\n")
+    else
+        prints("    [!!] write /test/hello.txt failed\n")
+
+    # Test 3: Check file exists
+    if knamespace_exists(ns, @write_path)
+        prints("    [OK] exists /test/hello.txt\n")
+    else
+        prints("    [!!] exists /test/hello.txt failed\n")
+
+    # Test 4: Read file back
+    var read_size: u64 = 0
+    let read_data: *u8 = knamespace_read(ns, @write_path, @read_size)
+    if read_data != 0 as *u8 and read_size == 10
+        prints("    [OK] read /test/hello.txt (")
+        serial_print_dec(read_size)
+        prints(" bytes)\n")
+        # Verify content
+        var content_ok: u8 = 1
+        var i: u64 = 0
+        while i < read_size
+            if *(read_data + i) != test_data[i]
+                content_ok = 0
+                break
+            i = i + 1
+        if content_ok != 0
+            prints("    [OK] content verified\n")
+        else
+            prints("    [!!] content mismatch\n")
+    else
+        prints("    [!!] read /test/hello.txt failed\n")
+
+    prints("  Filesystem test complete.\n")
+    0
+
+# ============================================================================
 # Kernel Entry Point
 # ============================================================================
 
@@ -4644,6 +4717,18 @@ pub fn kernel_main(boot_info_addr: u64) -> i32
     vfs_init()
     fd_table_init()
     klog(c"\r  [OK] VFS layer\n")
+
+    # Initialize kernel namespace (Goliath integration)
+    klog(c"  [..] Kernel namespace")
+    let kns_store: *fs.kblob.KBlobStore = kblob_get_store()
+    if kns_store != 0 as *fs.kblob.KBlobStore
+        knamespace_init(kns_store)
+        klog(c"\r  [OK] Kernel namespace\n")
+
+        # Quick filesystem test
+        fs_quick_test()
+    else
+        klog(c"\r  [!!] Kernel namespace (no store)\n")
 
     # Initialize APIC based on boot protocol
     if boot_protocol == BOOT_PROTOCOL_HARLAND
