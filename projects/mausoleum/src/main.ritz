@@ -19,6 +19,7 @@
 import ritzlib.sys
 import ritzlib.io
 import ritzlib.str
+import ritzlib.strview
 import ritzlib.memory
 import ritzlib.net
 
@@ -39,8 +40,14 @@ const VERSION: i32 = 1
 const DEFAULT_PORT: i32 = 7777
 const POOL_SIZE: i32 = 1024    # 1024 pages = 4MB buffer pool
 
-fn default_host() -> *u8
-    return c"127.0.0.1"
+# Default host as StrView (idiomatic Ritz)
+fn default_host() -> StrView
+    return "127.0.0.1"
+
+# Helper: compare a C string (from argv) to a StrView literal
+# This is for FFI boundary - argv comes as *u8 from the kernel
+fn arg_eq(arg: *u8, literal: StrView) -> i32
+    return strview_eq_cstr(@literal, arg)
 
 # ============================================================================
 # Argument Parsing
@@ -49,7 +56,7 @@ fn default_host() -> *u8
 struct Args
     command: i32        # 0=help, 1=version, 2=serve, 3=shell
     port: i32
-    host: *u8
+    host: StrView       # Host as StrView (idiomatic Ritz)
 
 const CMD_HELP: i32 = 0
 const CMD_VERSION: i32 = 1
@@ -66,21 +73,22 @@ fn parse_args(argc: i32, argv: **u8, args: *Args)
 
     var cmd: *u8 = *(argv + 1)
 
-    if streq(cmd, c"help") != 0 or streq(cmd, c"--help") != 0 or streq(cmd, c"-h") != 0
+    # Use arg_eq() to compare C strings from argv to string literals
+    if arg_eq(cmd, "help") != 0 or arg_eq(cmd, "--help") != 0 or arg_eq(cmd, "-h") != 0
         args.command = CMD_HELP
         return
 
-    if streq(cmd, c"version") != 0 or streq(cmd, c"--version") != 0 or streq(cmd, c"-v") != 0
+    if arg_eq(cmd, "version") != 0 or arg_eq(cmd, "--version") != 0 or arg_eq(cmd, "-v") != 0
         args.command = CMD_VERSION
         return
 
-    if streq(cmd, c"serve") != 0
+    if arg_eq(cmd, "serve") != 0
         args.command = CMD_SERVE
         # Parse --port
         var i: i32 = 2
         while i < argc
             var arg: *u8 = *(argv + i)
-            if streq(arg, c"--port") != 0 or streq(arg, c"-p") != 0
+            if arg_eq(arg, "--port") != 0 or arg_eq(arg, "-p") != 0
                 if i + 1 < argc
                     args.port = parse_int(*(argv + i + 1))
                     i += 2
@@ -90,21 +98,22 @@ fn parse_args(argc: i32, argv: **u8, args: *Args)
                 i += 1
         return
 
-    if streq(cmd, c"shell") != 0
+    if arg_eq(cmd, "shell") != 0
         args.command = CMD_SHELL
         # Parse --host and --port
         var i: i32 = 2
         while i < argc
             var arg: *u8 = *(argv + i)
-            if streq(arg, c"--port") != 0 or streq(arg, c"-p") != 0
+            if arg_eq(arg, "--port") != 0 or arg_eq(arg, "-p") != 0
                 if i + 1 < argc
                     args.port = parse_int(*(argv + i + 1))
                     i += 2
                 else
                     i += 1
-            else if streq(arg, c"--host") != 0 or streq(arg, c"-h") != 0
+            else if arg_eq(arg, "--host") != 0 or arg_eq(arg, "-h") != 0
                 if i + 1 < argc
-                    args.host = *(argv + i + 1)
+                    # Convert C string from argv to StrView at FFI boundary
+                    args.host = strview_from_cstr(*(argv + i + 1))
                     i += 2
                 else
                     i += 1
@@ -334,10 +343,11 @@ fn handle_encrypted_session(ch: *EncryptedChannel, pool: *BufferPool, collection
 # Shell Command - Interactive Client
 # ============================================================================
 
-fn cmd_shell(host: *u8, port: i32) -> i32
+fn cmd_shell(host: StrView, port: i32) -> i32
     prints("Mausoleum Shell\n")
     prints("Connecting to ")
-    prints_cstr(host)
+    # Print StrView (it's null-terminated since it's a literal or from strview_from_cstr)
+    prints_cstr(host.ptr)
     prints(":")
     print_i32(port)
     prints(" (encrypted)...\n")
@@ -348,8 +358,8 @@ fn cmd_shell(host: *u8, port: i32) -> i32
         prints("Error: Failed to create socket\n")
         return 1
 
-    # Connect to server
-    let result: i32 = socket_connect(@sock, host, port)
+    # Connect to server - socket_connect needs *u8, use .ptr at FFI boundary
+    let result: i32 = socket_connect(@sock, host.ptr, port)
     if result < 0
         prints("Error: Failed to connect to server\n")
         socket_close(@sock)
@@ -407,8 +417,10 @@ fn shell_loop(ch: *EncryptedChannel)
             len -= 1
             line_buf[len] = 0
 
-        # Parse command
-        if streq(@line_buf[0], c"quit") != 0 or streq(@line_buf[0], c"exit") != 0
+        # Parse command - convert line buffer to StrView for comparison
+        let line: StrView = strview_from_ptr(@line_buf[0], len as i64)
+
+        if strview_eq_cstr(@line, "quit") != 0 or strview_eq_cstr(@line, "exit") != 0
             # Send disconnect
             var resp: MessageBuffer
             msgbuf_init(@resp, @msg_buf[0], 512)
@@ -416,7 +428,7 @@ fn shell_loop(ch: *EncryptedChannel)
             channel_send(ch, msgbuf_data(@resp), msgbuf_len(@resp))
             break
 
-        else if streq(@line_buf[0], c"ping") != 0
+        else if strview_eq_cstr(@line, "ping") != 0
             # Send ping
             var req: MessageBuffer
             msgbuf_init(@req, @msg_buf[0], 512)
