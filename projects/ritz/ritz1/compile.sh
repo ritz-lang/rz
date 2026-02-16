@@ -32,7 +32,7 @@ for SRC in $SOURCES; do
     LL_FILE="$BUILD_DIR/${BASENAME}_${HASH}.ll"
 
     echo "  🔧 $SRC -> $LL_FILE"
-    $RITZ0 $SRC -o $LL_FILE
+    $RITZ0 $SRC -o $LL_FILE --no-runtime
 
     LL_FILES="$LL_FILES $LL_FILE"
 done
@@ -41,7 +41,13 @@ echo "  ✅ Generated $(echo $LL_FILES | wc -w) .ll files"
 
 # Link all .ll files with clang
 echo "  🔗 Linking..."
-clang $LL_FILES -o $OUT -nostdlib -g
+RUNTIME=runtime/ritz_start.x86_64.o
+# Build runtime if needed
+if [ ! -f "$RUNTIME" ]; then
+    echo "  📦 Building runtime..."
+    clang -c -o runtime/ritz_start.x86_64.o runtime/ritz_start.x86_64.ll
+fi
+clang $LL_FILES $RUNTIME -o $OUT -nostdlib -g
 
 echo ""
 echo "✨ ritz1 compiler ready: $OUT"
