@@ -406,10 +406,17 @@ def parse_dependencies(config: dict, pkg_dir: Path) -> dict[str, DependencySpec]
                 if dep_toml.exists():
                     with open(dep_toml, "rb") as f:
                         dep_config = tomllib.load(f)
-                    # Check both top-level and inside [package] (TOML quirk)
+                    # Check multiple locations for sources:
+                    # 1. Top-level sources (common case)
+                    # 2. [package].sources (TOML quirk)
+                    # 3. [build].sources (library packages)
                     sources = dep_config.get("sources")
                     if sources is None:
-                        sources = dep_config.get("package", {}).get("sources", ["src"])
+                        sources = dep_config.get("package", {}).get("sources")
+                    if sources is None:
+                        sources = dep_config.get("build", {}).get("sources")
+                    if sources is None:
+                        sources = ["src"]
                 else:
                     sources = ["src"]
 

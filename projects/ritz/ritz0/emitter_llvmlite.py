@@ -904,6 +904,52 @@ class LLVMEmitter:
                 return -expr.operand.value
         raise ValueError(f"Expected integer literal, got {expr}")
 
+    def _emit_const_strview(self, name: str, value: str) -> None:
+        """Emit a module-level constant StrView as a global.
+
+        const MY_STR: StrView = "hello"
+
+        Creates a StrView struct pointing to static string data.
+        StrView is { ptr: *u8, len: u64 }
+        """
+        # First, emit the string data as a global constant
+        str_type = ir.ArrayType(self.i8, len(value) + 1)
+        str_bytes = bytearray(value, 'utf-8') + b'\x00'
+        str_const = ir.Constant(str_type, str_bytes)
+
+        str_gvar = ir.GlobalVariable(self.module, str_type, name=f".str.{name}")
+        str_gvar.global_constant = True
+        str_gvar.initializer = str_const
+        str_gvar.linkage = "internal"
+
+        # Get pointer to start of string
+        zero = ir.Constant(self.i64, 0)
+        # Can't use GEP at module level - use bitcast of the global address
+        str_ptr = str_gvar.bitcast(self.i8.as_pointer())
+
+        # Get the StrView struct type
+        if "StrView" in self.struct_types:
+            strview_type = self.struct_types["StrView"]
+        else:
+            # Create inline literal struct type if StrView not defined
+            strview_type = ir.LiteralStructType([self.i8.as_pointer(), self.i64])
+
+        # Create the StrView constant value
+        # Note: For global initializers, we need to use constant expressions
+        length_const = ir.Constant(self.i64, len(value))
+        strview_const = ir.Constant(strview_type, [str_ptr, length_const])
+
+        # Create global variable for the StrView
+        gvar = ir.GlobalVariable(self.module, strview_type, name=name)
+        gvar.global_constant = True
+        gvar.initializer = strview_const
+        gvar.linkage = "internal"
+
+        # Store in const_strviews for lookup
+        if not hasattr(self, 'const_strviews'):
+            self.const_strviews = {}
+        self.const_strviews[name] = gvar
+
     # Module counter for unique naming
     _module_counter = 0
 
@@ -1223,6 +1269,9 @@ class LLVMEmitter:
                 elif isinstance(item.value, (rast.ArrayLit, rast.ArrayFill)):
                     # Array constants - emit as global constant
                     self._emit_const_array(item.name, item.type, item.value)
+                elif isinstance(item.value, rast.StringLit):
+                    # String constant - emit as global StrView
+                    self._emit_const_strview(item.name, item.value.value)
                 else:
                     raise ValueError(f"Const value must be numeric literal or array literal: {item.value}")
             elif isinstance(item, rast.VarDef):
@@ -3969,6 +4018,12 @@ class LLVMEmitter:
             if name in self.constants:
                 val, ty = self.constants[name]
                 return ir.Constant(ty, val)
+
+            # Check string constants (StrView)
+            if hasattr(self, 'const_strviews') and name in self.const_strviews:
+                gvar = self.const_strviews[name]
+                # Load the StrView struct from the global
+                return self.builder.load(gvar)
 
             # Check locals (var bindings) FIRST - mutable vars shadow let bindings
             # This is critical because the same name may appear as both 'var' and 'let'
