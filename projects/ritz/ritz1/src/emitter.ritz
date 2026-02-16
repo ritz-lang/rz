@@ -63,6 +63,10 @@ struct EmitterState
     emitted_fn_count: i32
     emitted_globals: [512]EmittedName
     emitted_global_count: i32
+    # Track last expression value for if/else phi nodes
+    last_expr_reg: i32
+    # Track current label for phi node predecessors (needed for nested control flow)
+    current_label: i32
 
 # =============================================================================
 # Helpers
@@ -2163,29 +2167,63 @@ fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
             emit_label(s, end_label)
         emit_str(s, "\n")
 
+        # Save current last_expr_reg before entering branches
+        let saved_last: i32 = s.last_expr_reg
+
         emit_label(s, then_label)
         emit_str(s, ":\n")
+        s.current_label = then_label  # Track current block
+        s.last_expr_reg = 0  # Reset before then branch
         var then_stmt: *Stmt = stmt.if_then
         while then_stmt != null
             emit_stmt(s, then_stmt, ret_type)
             then_stmt = then_stmt.next
+        let then_result: i32 = s.last_expr_reg  # Capture then branch result
+        let then_exit_label: i32 = s.current_label  # Capture actual exit block
         emit_str(s, "  br label %")
         emit_label(s, end_label)
         emit_str(s, "\n")
 
+        var else_result: i32 = 0
+        var else_exit_label: i32 = else_label
         if stmt.if_else != null
             emit_label(s, else_label)
             emit_str(s, ":\n")
+            s.current_label = else_label  # Track current block
+            s.last_expr_reg = 0  # Reset before else branch
             var else_stmt: *Stmt = stmt.if_else
             while else_stmt != null
                 emit_stmt(s, else_stmt, ret_type)
                 else_stmt = else_stmt.next
+            else_result = s.last_expr_reg  # Capture else branch result
+            else_exit_label = s.current_label  # Capture actual exit block
             emit_str(s, "  br label %")
             emit_label(s, end_label)
             emit_str(s, "\n")
 
         emit_label(s, end_label)
         emit_str(s, ":\n")
+        s.current_label = end_label  # Update current block
+
+        # If both branches produce values, emit a phi node
+        if stmt.if_else != null and then_result > 0 and else_result > 0
+            let phi_reg: i32 = next_reg(s)
+            emit_str(s, "  ")
+            emit_reg(s, phi_reg)
+            emit_str(s, " = phi i64 [ ")
+            emit_reg(s, then_result)
+            emit_str(s, ", %")
+            emit_label(s, then_exit_label)  # Use actual exit block, not entry
+            emit_str(s, " ], [ ")
+            emit_reg(s, else_result)
+            emit_str(s, ", %")
+            emit_label(s, else_exit_label)  # Use actual exit block
+            emit_str(s, " ]\n")
+            s.last_expr_reg = phi_reg  # Set the merged result
+        else if then_result > 0
+            s.last_expr_reg = then_result
+        else
+            s.last_expr_reg = saved_last  # Restore if no result
 
     else if stmt.kind == STMT_WHILE
         let cond_label: i32 = next_label(s)
@@ -2244,7 +2282,8 @@ fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         # Note: Implicit return only at function body level, not in nested blocks
         # The implicit_return flag would be passed from emit_fn for top-level statements
         # For now, we just emit the expression without implicit return in nested contexts
-        emit_expr(s, stmt.expr)
+        let expr_reg: i32 = emit_expr(s, stmt.expr)
+        s.last_expr_reg = expr_reg  # Track for if/else phi nodes
     else if stmt.kind == STMT_LOCAL_FIELD_ASSIGN
         # local_var.field = value
         # stmt.var_name = variable name
@@ -2587,10 +2626,13 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
             add_local(s, param3.name, param3.name_len, alloca_reg, param3.param_type)
         param3 = param3.next
 
+    s.last_expr_reg = 0  # Reset before processing function body
+    var has_explicit_return: i32 = 0
     var stmt: *Stmt = f.body
     while stmt != null
         # Check if this is the last statement and it's an expression (implicit return)
         if stmt.next == null and stmt.kind == STMT_EXPR
+            has_explicit_return = 1
             # Special handling for struct literal returns
             if stmt.expr.kind == EXPR_STRUCT_LIT and f.return_type == TYPE_STRUCT
                 # Allocate space for the struct, initialize fields, load and return
@@ -2636,11 +2678,37 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
                     emit_reg(s, val)
                     emit_str(s, "\n")
         else
+            # Track if we hit a return statement
+            if stmt.kind == STMT_RETURN
+                has_explicit_return = 1
             emit_stmt(s, stmt, f.return_type)
         stmt = stmt.next
 
-    # For void functions without explicit return, emit ret void
-    if f.return_type == TYPE_VOID
+    # If no explicit return and function has non-void return, use last_expr_reg
+    if has_explicit_return == 0 and f.return_type != TYPE_VOID
+        if s.last_expr_reg > 0
+            if f.return_type == TYPE_I32
+                let trunc: i32 = next_reg(s)
+                emit_str(s, "  ")
+                emit_reg(s, trunc)
+                emit_str(s, " = trunc i64 ")
+                emit_reg(s, s.last_expr_reg)
+                emit_str(s, " to i32\n")
+                emit_str(s, "  ret i32 ")
+                emit_reg(s, trunc)
+                emit_str(s, "\n")
+            else
+                emit_str(s, "  ret ")
+                emit_llvm_type(s, f.return_type)
+                emit_str(s, " ")
+                emit_reg(s, s.last_expr_reg)
+                emit_str(s, "\n")
+        else
+            # No value available, return 0
+            emit_str(s, "  ret ")
+            emit_llvm_type(s, f.return_type)
+            emit_str(s, " 0\n")
+    else if f.return_type == TYPE_VOID and has_explicit_return == 0
         emit_str(s, "  ret void\n")
     emit_str(s, c"}\n\n")
 

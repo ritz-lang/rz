@@ -41,8 +41,9 @@ LL_FILES = $(patsubst %,$(BUILD_DIR)/%.ll,$(SOURCES))
 OBJ_FILES = $(patsubst %,$(BUILD_DIR)/%.o,$(SOURCES))
 RITZLIB_OBJ = $(patsubst %,$(BUILD_DIR)/ritzlib_%.o,$(RITZLIB_MODULES))
 
-# Runtime - entry point that calls main(argc, argv) and handles exit
-RUNTIME = ../runtime/ritz_start.x86_64.o
+# Runtime - entry point that calls main(argc, argv, envp) and handles exit
+# ritz1 needs envp for RITZ_PATH environment variable access
+RUNTIME = ../runtime/ritz_start_envp.x86_64.o
 
 # Compiler flags
 LLC_FLAGS = -O2
