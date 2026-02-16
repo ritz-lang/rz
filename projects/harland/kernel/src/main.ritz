@@ -31,6 +31,7 @@ import drivers.virtio.blk { VirtioBlkDevice, virtio_blk_init, virtio_blk_read, v
 import fs.kblob { KBlobId, kblob_init, kblob_get_store, kblob_store_put, kblob_store_get, kblob_store_exists, kblob_id_eq, kblob_id_is_zero }
 import fs.vfs { vfs_init, fd_table_init }
 import fs.knamespace { knamespace_init, knamespace_get, knamespace_mkdir, knamespace_write, knamespace_read, knamespace_exists, KNS_OK }
+import fs.syscall { fs_syscall_init, sys_open, sys_close, sys_fs_read, sys_fs_write, sys_lseek, is_fs_fd }
 
 # ============================================================================
 # Kernel Ring Buffer (Early Boot Debug)
@@ -3415,13 +3416,36 @@ pub fn syscall_handler(rax: u64, rdi: u64, rsi: u64, rdx: u64) -> i64
         halt_loop()
         return 0
 
+    # SYS_OPEN - Open a file
+    if rax == SYS_OPEN
+        # rdi = path pointer
+        # rsi = path length
+        # rdx = flags
+        return sys_open(rdi as *u8, rsi, rdx as i32)
+
+    # SYS_CLOSE - Close a file descriptor
+    if rax == SYS_CLOSE
+        let fd: i32 = rdi as i32
+        # Check if it's a filesystem fd
+        if is_fs_fd(fd)
+            return sys_close(fd)
+        # Otherwise, return success (stdin/stdout/stderr don't close)
+        return 0
+
     if rax == SYS_WRITE or rax == SYS_DEBUG_PRINT
         # Linux/POSIX write convention:
-        #   rdi = fd (ignored for now, always write to serial)
+        #   rdi = fd
         #   rsi = buf
         #   rdx = count
+        let fd: i32 = rdi as i32
         let buf: *u8 = rsi as *u8
         let len: i64 = rdx as i64
+
+        # Check if it's a filesystem fd
+        if is_fs_fd(fd)
+            return sys_fs_write(fd, buf, len as u64)
+
+        # Otherwise, write to serial (fd 1 = stdout, fd 2 = stderr)
         var i: i64 = 0
         while i < len
             serial_write_byte(*(buf + i))
@@ -3430,14 +3454,18 @@ pub fn syscall_handler(rax: u64, rdi: u64, rsi: u64, rdx: u64) -> i64
 
     if rax == SYS_READ
         # Linux/POSIX read convention:
-        #   rdi = fd (0 = stdin, which we map to serial)
+        #   rdi = fd
         #   rsi = buf
         #   rdx = count
-        let fd: u64 = rdi
+        let fd: i32 = rdi as i32
         let buf: *u8 = rsi as *u8
         let count: i64 = rdx as i64
 
-        # Only support stdin (fd 0) for now
+        # Check if it's a filesystem fd
+        if is_fs_fd(fd)
+            return sys_fs_read(fd, buf, count as u64)
+
+        # Only support stdin (fd 0) for serial input
         if fd != 0
             return -1  # EBADF
 
@@ -4724,6 +4752,11 @@ pub fn kernel_main(boot_info_addr: u64) -> i32
     if kns_store != 0 as *fs.kblob.KBlobStore
         knamespace_init(kns_store)
         klog(c"\r  [OK] Kernel namespace\n")
+
+        # Initialize filesystem syscalls
+        klog(c"  [..] Filesystem syscalls")
+        fs_syscall_init()
+        klog(c"\r  [OK] Filesystem syscalls\n")
 
         # Quick filesystem test
         fs_quick_test()
