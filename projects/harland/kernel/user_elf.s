@@ -18,7 +18,7 @@
 
 .align 16
 user_elf_start:
-    .incbin "build/user/portable_getpid.elf"
+    .incbin "build/debug/portable_getpid.elf"
 user_elf_end:
 
 # Store the size for convenience

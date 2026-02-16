@@ -9,27 +9,25 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HARLAND_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$SCRIPT_DIR"
 
-# Build bootloader if needed
+# Build if needed using workspace rz CLI
 BOOT_EFI="$HARLAND_DIR/build/BOOTX64.EFI"
-if [ ! -f "$BOOT_EFI" ]; then
-    echo "Building bootloader..."
-    cd "$HARLAND_DIR"
-    python3 build.py build boot
-    cd "$SCRIPT_DIR"
-fi
-
-# Build kernel if needed
 KERNEL_ELF="$HARLAND_DIR/build/harland.elf"
-if [ ! -f "$KERNEL_ELF" ]; then
-    echo "Building kernel..."
+RZ_CLI="$HARLAND_DIR/../../rz"
+
+if [ ! -f "$BOOT_EFI" ] || [ ! -f "$KERNEL_ELF" ]; then
+    echo "Building harland..."
+    cd "$HARLAND_DIR/../.."
+    ./rz build harland
     cd "$HARLAND_DIR"
-    python3 build.py build kernel
+    # Copy to expected locations
+    cp build/debug/BOOTX64.EFI build/BOOTX64.EFI 2>/dev/null || true
+    cp build/debug/harland.elf build/harland.elf 2>/dev/null || true
     cd "$SCRIPT_DIR"
 fi
 
 if [ ! -f "$KERNEL_ELF" ]; then
     echo "ERROR: Kernel not found at $KERNEL_ELF"
-    echo "Please build the kernel first: cd .. && python3 build.py build kernel"
+    echo "Please build: cd ../.. && ./rz build harland"
     exit 1
 fi
 

@@ -51,25 +51,21 @@ BOOT_O = $(BOOT_SRCS:.ritz=.o)
 
 all: kernel
 
-# Build kernel using ritz builder (recommended)
-# Note: We build twice - first to get user program, then again with user ELF embedded
+# Build kernel using rz workspace CLI (recommended)
+# The build order in ritz.toml ensures user program builds first, then kernel embeds it
 kernel:
-	@mkdir -p build/user
-	@# First build: compile user programs (and a temporary kernel without user ELF)
-	./ritz/ritz build . 2>&1 | grep -v "Skipping user_elf" || true
-	@# Copy user ELF to expected location for embedding
-	@if [ -f build/debug/portable_getpid ]; then cp build/debug/portable_getpid build/user/portable_getpid.elf 2>/dev/null || true; fi
-	@# Second build: now with user ELF embedded
-	./ritz/ritz build . 2>&1 | grep -v "entry point"
-	@# Copy to expected location for ISO creation
-	@cp build/debug/harland.elf build/harland.elf 2>/dev/null || cp build/release/harland.elf build/harland.elf 2>/dev/null || true
+	@# Build all harland targets (portable_getpid, harland, bootx64)
+	../../rz build harland
+	@# Copy to expected locations for ISO creation and test scripts
+	@cp build/debug/harland.elf build/harland.elf 2>/dev/null || true
+	@cp build/debug/BOOTX64.EFI build/BOOTX64.EFI 2>/dev/null || true
 
 # Build bootable ISO with GRUB
 iso: kernel
 	./tools/mkiso.sh
 
 clean:
-	python3 build.py clean
+	../../rz clean harland
 	rm -f $(KERNEL_LL) $(KERNEL_O) $(BOOT_LL) $(BOOT_O)
 	rm -f $(KERNEL) $(BOOTLOADER) $(IMAGE)
 	rm -f $(OVMF_VARS)
@@ -173,13 +169,11 @@ test-boot: iso
 	./tools/test_boot.sh
 
 # UEFI bootloader test (Ritz UEFI bootloader)
-uefi-boot:
-	@echo "Building UEFI bootloader..."
-	python3 build.py build boot
+uefi-boot: kernel
+	@echo "UEFI bootloader built as part of kernel target"
 
-test-uefi-boot: uefi-boot
+test-uefi-boot: kernel
 	@echo "Testing UEFI bootloader..."
-	python3 build.py build kernel
 	cd boot && ./test.sh
 
 test-unit:
