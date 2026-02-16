@@ -1108,3 +1108,98 @@ Both tests pass with full functionality:
 [2026-02-16T18:43:26.666371] [CHAT] user_1: Nice!  So the next is that bios I get an IP and can read null sectors from the disk.  But I can't do either of that in uefi because I got no disk or nic.
 [2026-02-16T18:44:37.958088] [CHAT] user_1: Also the first 32 bytes dumped via the virtio-blk driver are also 16 0's long.
 [2026-02-16T18:46:21.750886] [CHAT] user_1: I thought we had a true higher half kernel?
+[2026-02-16T18:47:38.358214] Claude: 🎉 **UEFI boot test now passes with VirtIO devices!**
+
+The test shows:
+- ✅ VirtIO Network: MAC 52:54:00:12:34:56, DHCP got 10.0.2.15, ping works!
+- ✅ VirtIO Block: 2 devices found, read sector 0 OK
+- ✅ Userspace: ELF loads and syscalls work
+
+Now let me also fix the VirtIO block hex dump issue the user mentioned - the bytes are being printed as 16 hex digits instead of 2:I see - it's using `serial_print_hex` which prints 16 digits. Let me fix this to use `serial_print_hex8`:Now let me check if serial_print_hex8 is imported in this file:I need to add `serial_print_hex8` to the import:Now let me build and run the test to verify:Now the hex dump shows properly: `00 00 00 00...` instead of 16-digit hex values.
+
+Now let me address the user's question about the **higher-half kernel**. Looking at the serial output, I can see kernel addresses like `0xFFFFFFFF80169BA0` which is in the higher-half. Let me check what the user means:I see - the kernel IS a higher-half kernel. The kernel runs at virtual addresses starting at `0xFFFFFFFF80000000`. Let me check what specifically the user might be asking about. Let me look at the UEFI bootloader to see how the higher-half is set up:I see - the UEFI bootloader sets up:
+- Identity mapping: 0-256MB → 0-256MB 
+- Higher-half: 0xFFFFFFFF80000000 → 0-256MB (same physical memory)
+
+This IS a true higher-half kernel - the kernel code runs at virtual address `0xFFFFFFFF80...` which is mapped to physical addresses starting at 0.
+
+Let me commit the VirtIO block hex fix and respond to the user:Now to address the user's question about the higher-half kernel:
+
+---
+
+## ✅ Both Tests Now Pass with VirtIO
+
+**BIOS test:**
+```
+VirtIO Network: MAC 52:54:00:12:34:56, DHCP 10.0.2.15, ping works!
+VirtIO Block: 2 devices, sector read OK
+Hex dump: 00 00 00 00 00 00 00 00... (proper 2-digit format)
+```
+
+**UEFI test:**
+```
+VirtIO Network: MAC 52:54:00:12:34:56, DHCP 10.0.2.15, ping works!
+VirtIO Block: 2 devices, sector read OK
+```
+
+---
+
+## About the Higher-Half Kernel
+
+**Yes, Harland IS a true higher-half kernel!** Here's how it works:
+
+### Memory Layout
+
+| Virtual Address | Physical Address | Purpose |
+|----------------|------------------|---------|
+| `0x0 - 0x10000000` | Same (identity) | Identity mapping for boot, DMA |
+| `0xFFFFFFFF80000000` | `0x0` | **Kernel code/data (higher-half)** |
+| `0xFFFFFFFFC0000000` | Dynamic | Kernel heap |
+
+### How It Works
+
+1. **Bootloader sets up page tables:**
+   ```
+   PML4[0]   → Identity map: 0-256MB → 0-256MB
+   PML4[511] → Higher-half: 0xFFFFFFFF80000000 → 0-256MB
+   ```
+
+2. **Kernel is linked at higher-half:**
+   ```
+   # From kernel linker script
+   . = 0xFFFFFFFF80100000;   # Kernel starts at this virtual address
+   ```
+
+3. **Kernel code runs at `0xFFFFFFFF8010xxxx`:**
+   ```
+   Kernel entry (virtual):  0xFFFFFFFF80163E10
+   Embedded ELF at:         0xFFFFFFFF80169BA0
+   Kernel heap at:          0xFFFFFFFFC000xxxx
+   ```
+
+4. **Physical memory is still accessible via identity map:**
+   - DMA buffers (VirtIO queues) use physical addresses
+   - Hardware MMIO uses identity-mapped addresses
+
+### Why Both Mappings?
+
+The identity mapping at low addresses is needed for:
+- Early boot (before page tables are fully set up)
+- DMA operations (devices use physical addresses)
+- MMIO access (APIC, PCI BARs)
+
+The higher-half mapping is where the kernel actually runs, keeping the lower 47 bits of address space available for userspace.
+
+### Verification
+
+The kernel tests verify this works:
+```
+Testing Higher-Half Mapping...
+  Read from 0x100000: 00000000E85250D6
+  Read from 0xFFFFFFFF80100000: 00000000E85250D6
+  Higher-half mapping PASSED!
+```
+
+Both addresses read the same value because they map to the same physical memory!
+[2026-02-16T18:51:06.137122] [CHAT] user_1: So I notice that MOST of the numbers actually have leading 0s.  I don't really like that unless it should be explicit.  Can we truncate those leading zeros by default?  Maybe we can have a flag to set (does ritzlang have default values for parameters?  It should...) that can indicate whether to add the amount of zeroes for the type?  Or maybe a separate function.  The default one can render no leading zeroes, the other renders as many leading zeroes as defined by the type, so you can simply control it by doing (i as u64) or (i as u32)...
+[2026-02-16T18:51:37.684382] [CHAT] user_1: Sounds great!
