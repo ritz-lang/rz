@@ -45,12 +45,12 @@ The following identifiers are reserved keywords:
 
 | | | | | |
 |---|---|---|---|---|
-| `as` | `assert` | `break` | `const` | `continue` |
-| `else` | `enum` | `extern` | `false` | `fn` |
-| `for` | `if` | `impl` | `import` | `in` |
-| `let` | `match` | `mut` | `null` | `pub` |
-| `return` | `struct` | `trait` | `true` | `type` |
-| `unsafe` | `var` | `while` | | |
+| `and` | `as` | `assert` | `break` | `const` |
+| `continue` | `else` | `enum` | `extern` | `false` |
+| `fn` | `for` | `if` | `impl` | `import` |
+| `in` | `let` | `match` | `not` | `null` |
+| `or` | `pub` | `return` | `struct` | `trait` |
+| `true` | `type` | `unsafe` | `var` | `while` |
 
 ### 1.4 Primitive Type Keywords
 
@@ -106,8 +106,8 @@ escape_seq  = '\' ( 'n' | 'r' | 't' | '\' | '"' | "'" | '0' | 'x' hex_digit hex_
 | `FAT_ARROW` | `=>` | Match arm |
 | `DOT_DOT` | `..` | Range |
 | `COLON_COLON` | `::` | Path separator |
-| `AND` | `&&` | Logical AND |
-| `OR` | `\|\|` | Logical OR |
+| `AND` | `and` | Logical AND (keyword) |
+| `OR` | `or` | Logical OR (keyword) |
 | `EQ` | `==` | Equality |
 | `NE` | `!=` | Inequality |
 | `LE` | `<=` | Less or equal |
@@ -118,7 +118,7 @@ escape_seq  = '\' ( 'n' | 'r' | 't' | '\' | '"' | "'" | '0' | 'x' hex_digit hex_
 | `MINUS_EQ` | `-=` | Subtract-assign |
 | `STAR_EQ` | `*=` | Multiply-assign |
 | `SLASH_EQ` | `/=` | Divide-assign |
-| `AMP_MUT` | `&mut` | Mutable reference |
+| `AT_AMP` | `@&` | Mutable reference |
 
 #### Single-character Operators
 
@@ -193,18 +193,24 @@ item = [ attrs ] fn_def
 ```ebnf
 attrs = attr { attr }
 
-attr = '@' IDENT [ NEWLINE ]
+attr = '[[' IDENT [ '(' attr_args ')' ] ']]' [ NEWLINE ]
+attr_args = IDENT { ',' IDENT }
 ```
 
 **Examples:**
 ```ritz
-@test
+[[test]]
 fn test_something()
     assert 1 == 1
 
-@inline
+[[inline]]
 fn fast_add(a: i32, b: i32) -> i32
     return a + b
+
+[[derive(Debug, Clone)]]
+struct Point
+    x: i32
+    y: i32
 ```
 
 ### 2.3 Functions
@@ -359,10 +365,9 @@ var buffer: [1024]u8
 ```ebnf
 type = primitive_type
      | type_name
-     | '*' type                    (* pointer *)
-     | '*' 'mut' type              (* mutable pointer *)
-     | '&' type                    (* reference *)
-     | '&mut' type                 (* mutable reference *)
+     | '*' type                    (* raw pointer - FFI/unsafe only *)
+     | '@' type                    (* immutable reference *)
+     | '@&' type                   (* mutable reference *)
      | '[' NUMBER ']' type         (* fixed array *)
      | '[' ']' type                (* slice *)
      | type '|' type               (* union type *)
@@ -380,10 +385,9 @@ primitive_type = 'i8' | 'i16' | 'i32' | 'i64'
 **Type Examples:**
 ```ritz
 i32                     # 32-bit signed integer
-*u8                     # pointer to byte
-*mut Node               # mutable pointer to Node
-&Point                  # reference to Point
-&mut i32                # mutable reference to i32
+*u8                     # raw pointer (FFI/unsafe only)
+@Point                  # immutable reference to Point
+@&i32                   # mutable reference to i32
 [16]u8                  # array of 16 bytes
 []i32                   # slice of i32
 Option<T>               # generic type
@@ -532,8 +536,8 @@ From lowest to highest precedence:
 
 | Level | Operators | Associativity | Description |
 |-------|-----------|---------------|-------------|
-| 1 | `\|\|` | Right | Logical OR |
-| 2 | `&&` | Right | Logical AND |
+| 1 | `or` | Right | Logical OR |
+| 2 | `and` | Right | Logical AND |
 | 3 | `==` `!=` `<` `<=` `>` `>=` | None | Comparison |
 | 4 | `\|` | Right | Bitwise OR |
 | 5 | `..` | None | Range |
@@ -543,7 +547,7 @@ From lowest to highest precedence:
 | 9 | `+` `-` | Right | Additive |
 | 10 | `*` `/` `%` | Right | Multiplicative |
 | 11 | `as` | Left | Type cast |
-| 12 | `-` `!` `~` `*` `&` `&mut` | Prefix | Unary |
+| 12 | `-` `not` `~` `*` `@` `@&` | Prefix | Unary |
 | 13 | `?` | Postfix | Try/propagate |
 | 14 | `()` `[]` `.` | Left | Postfix (call, index, field) |
 
@@ -552,8 +556,8 @@ From lowest to highest precedence:
 ```ebnf
 expr = or_expr
 
-or_expr = and_expr { '||' and_expr }
-and_expr = cmp_expr { '&&' cmp_expr }
+or_expr = and_expr { 'or' and_expr }
+and_expr = cmp_expr { 'and' cmp_expr }
 
 cmp_expr = bit_or_expr [ cmp_op bit_or_expr ]
 cmp_op = '==' | '!=' | '<' | '<=' | '>' | '>='
@@ -570,11 +574,11 @@ mul_expr = cast_expr { ( '*' | '/' | '%' ) cast_expr }
 cast_expr = unary_expr [ 'as' type ]
 
 unary_expr = '-' unary_expr
-           | '!' unary_expr
+           | 'not' unary_expr
            | '~' unary_expr
            | '*' unary_expr
-           | '&' unary_expr
-           | '&mut' unary_expr
+           | '@' unary_expr           (* address-of / immutable ref *)
+           | '@&' unary_expr          (* mutable reference *)
            | try_expr
 
 try_expr = postfix_expr [ '?' ]
@@ -626,8 +630,8 @@ block_expr = '{' stmts [ expr ] '}'
 1 + 2 * 3           # 7 (precedence)
 (1 + 2) * 3         # 9
 
-# Comparisons
-x == y && y > 0
+# Comparisons (using keyword operators)
+x == y and y > 0
 
 # Bitwise
 flags | MASK
@@ -640,10 +644,10 @@ count as i64
 
 # Unary
 -x
-!valid
+not valid
 *ptr
-&value
-&mut array[0]
+@value              # address-of / immutable reference
+@&array[0]          # mutable reference
 
 # Try operator
 file.read()?
@@ -737,10 +741,11 @@ type Result<T, E> = T | E
 
 | Syntax | Meaning | Can be null? | Arithmetic? |
 |--------|---------|--------------|-------------|
-| `&T` | Reference | No | No |
-| `&mut T` | Mutable reference | No | No |
-| `*T` | Pointer | Yes | Yes |
-| `*mut T` | Mutable pointer | Yes | Yes |
+| `@T` | Immutable reference | No | No |
+| `@&T` | Mutable reference | No | No |
+| `*T` | Raw pointer (FFI/unsafe only) | Yes | Yes |
+
+**Note:** Raw pointers (`*T`) are only for FFI and unsafe code. There is no `*mut` distinction - use `@&T` for mutable references in safe code.
 
 ---
 
@@ -754,7 +759,7 @@ item = [ attrs ] fn_def | struct_def | enum_def | const_def
 
 (* === Attributes === *)
 attrs = attr { attr } ;
-attr = '@' IDENT [ NEWLINE ] ;
+attr = '[[' IDENT [ '(' IDENT { ',' IDENT } ')' ] ']]' [ NEWLINE ] ;
 
 (* === Functions === *)
 fn_def = 'fn' IDENT [ generic_params ] '(' [ params ] ')' [ return_type ] block
@@ -792,7 +797,7 @@ global_var = 'var' IDENT ':' type [ '=' expr ] NEWLINE ;
 
 (* === Types === *)
 type = primitive_type | type_name
-     | '*' type | '*' 'mut' type | '&' type | '&mut' type
+     | '*' type | '@' type | '@&' type
      | '[' NUMBER ']' type | '[' ']' type
      | type '|' type | '(' type ')' ;
 type_name = IDENT [ '<' type { ',' type } '>' ] ;
@@ -824,8 +829,8 @@ expr_stmt = expr NEWLINE ;
 
 (* === Expressions === *)
 expr = or_expr ;
-or_expr = and_expr { '||' and_expr } ;
-and_expr = cmp_expr { '&&' cmp_expr } ;
+or_expr = and_expr { 'or' and_expr } ;
+and_expr = cmp_expr { 'and' cmp_expr } ;
 cmp_expr = bit_or_expr [ ( '==' | '!=' | '<' | '<=' | '>' | '>=' ) bit_or_expr ] ;
 bit_or_expr = range_expr { '|' range_expr } ;
 range_expr = bit_xor_expr [ '..' bit_xor_expr ] ;
@@ -835,7 +840,7 @@ shift_expr = add_expr { ( '<<' | '>>' ) add_expr } ;
 add_expr = mul_expr { ( '+' | '-' ) mul_expr } ;
 mul_expr = cast_expr { ( '*' | '/' | '%' ) cast_expr } ;
 cast_expr = unary_expr [ 'as' type ] ;
-unary_expr = ( '-' | '!' | '~' | '*' | '&' | '&mut' ) unary_expr | try_expr ;
+unary_expr = ( '-' | 'not' | '~' | '*' | '@' | '@&' ) unary_expr | try_expr ;
 try_expr = postfix_expr [ '?' ] ;
 postfix_expr = primary_expr { '(' [ expr { ',' expr } ] ')' | '[' expr ']' | '.' IDENT [ generic_args ] | '.' NUMBER } ;
 primary_expr = NUMBER | HEX_NUMBER | BIN_NUMBER | FLOAT | STRING | CSTRING | SPAN_STRING | CHAR
