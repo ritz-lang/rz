@@ -477,7 +477,7 @@ fn is_const(s: *EmitterState, name: *u8, len: i32) -> i32
 fn emit_llvm_type(s: *EmitterState, t: i32)
     if t == TYPE_VOID
         emit_str(s, "void")
-    else if t == TYPE_I32
+    else if t == TYPE_I32 or t == TYPE_U32
         emit_str(s, "i32")
     else if t == TYPE_I64
         emit_str(s, "i64")
@@ -485,6 +485,8 @@ fn emit_llvm_type(s: *EmitterState, t: i32)
         emit_str(s, "i8")
     else if t == TYPE_I8
         emit_str(s, "i8")
+    else if t == TYPE_U16 or t == TYPE_I16
+        emit_str(s, "i16")
     else if t == TYPE_U64
         emit_str(s, "i64")
     else if t == TYPE_BOOL
@@ -2117,15 +2119,9 @@ fn emit_return(s: *EmitterState, stmt: *Stmt, ret_type: i32)
             emit_reg(s, trunc)
             emit_str(s, "\n")
         else if ret_type == TYPE_PTR or ret_type == TYPE_PTR_PTR
-            # Convert i64 to ptr for pointer return types
-            let ptr_val: i32 = next_reg(s)
-            emit_str(s, "  ")
-            emit_reg(s, ptr_val)
-            emit_str(s, " = inttoptr i64 ")
+            # Pointers are represented as i64 internally, return as i64
+            emit_str(s, "  ret i64 ")
             emit_reg(s, val)
-            emit_str(s, " to ptr\n")
-            emit_str(s, "  ret ptr ")
-            emit_reg(s, ptr_val)
             emit_str(s, "\n")
         else
             emit_str(s, "  ret ")
@@ -2558,7 +2554,9 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
     # Check if this is an extern function (no body) - emit declare instead of define
     if f.body == null
         # Skip syscall functions - they're emitted inline at the end
+        # But add them to the extern list so emit_syscall_implementations knows to emit them
         if is_syscall_function(f.name, f.name_len) == 1
+            add_extern(s, f.name, f.name_len)
             return
         emit_str(s, "declare ")
         emit_llvm_type(s, f.return_type)
@@ -2884,7 +2882,8 @@ fn emit_string_constants(s: *EmitterState)
 fn is_local_function(m: *Module, name: *u8, len: i32) -> i32
     var f: *FnDef = m.functions
     while f != null
-        if f.name_len == len
+        # Only consider functions with bodies (not extern declarations)
+        if f.body != null && f.name_len == len
             var j: i32 = 0
             var matched: i32 = 1
             while j < len
@@ -2937,37 +2936,11 @@ fn emit_syscall_implementations(s: *EmitterState)
     emit_str(s, "  ret i64 %ret\n")
     emit_str(s, "\}\n\n")
 
-    # sys_write: write(fd, buf, count)
-    emit_str(s, "define i64 @sys_write(i64 %fd, i64 %buf, i64 %count) \{\n")
-    emit_str(s, "  %ret = call i64 @syscall3(i64 1, i64 %fd, i64 %buf, i64 %count)\n")
-    emit_str(s, "  ret i64 %ret\n")
-    emit_str(s, "\}\n\n")
-
-    # sys_read: read(fd, buf, count)
-    emit_str(s, "define i64 @sys_read(i64 %fd, i64 %buf, i64 %count) \{\n")
-    emit_str(s, "  %ret = call i64 @syscall3(i64 0, i64 %fd, i64 %buf, i64 %count)\n")
-    emit_str(s, "  ret i64 %ret\n")
-    emit_str(s, "\}\n\n")
-
-    # sys_open: open(path, flags, mode) - syscall 2
-    emit_str(s, "define i64 @sys_open(i64 %path, i64 %flags, i64 %mode) \{\n")
-    emit_str(s, "  %ret = call i64 @syscall3(i64 2, i64 %path, i64 %flags, i64 %mode)\n")
-    emit_str(s, "  ret i64 %ret\n")
-    emit_str(s, "\}\n\n")
-
-    # sys_close: close(fd) - syscall 3
-    emit_str(s, "define i64 @sys_close(i64 %fd) \{\n")
-    emit_str(s, "  %ret = call i64 @syscall1(i64 3, i64 %fd)\n")
-    emit_str(s, "  ret i64 %ret\n")
-    emit_str(s, "\}\n\n")
-
-    # sys_exit: exit(code) - syscall 60
-    emit_str(s, "define void @sys_exit(i64 %code) \{\n")
-    emit_str(s, "  call i64 @syscall1(i64 60, i64 %code)\n")
-    emit_str(s, "  unreachable\n")
-    emit_str(s, "\}\n\n")
+    # Note: Higher-level syscall wrappers (sys_write, sys_read, etc.) are
+    # defined in ritzlib/sys.ritz and will be included when that module is imported.
 
 # Check if an external name is a syscall function we implement inline
+# (Only the low-level syscall0-6 functions; higher-level wrappers come from ritzlib/sys.ritz)
 fn is_syscall_function(name: *u8, len: i32) -> i32
     if name_eq(name, len, "syscall0", 8) == 1
         return 1
@@ -2982,16 +2955,6 @@ fn is_syscall_function(name: *u8, len: i32) -> i32
     if name_eq(name, len, "syscall5", 8) == 1
         return 1
     if name_eq(name, len, "syscall6", 8) == 1
-        return 1
-    if name_eq(name, len, "sys_write", 9) == 1
-        return 1
-    if name_eq(name, len, "sys_read", 8) == 1
-        return 1
-    if name_eq(name, len, "sys_open", 8) == 1
-        return 1
-    if name_eq(name, len, "sys_close", 9) == 1
-        return 1
-    if name_eq(name, len, "sys_exit", 8) == 1
         return 1
     0
 
@@ -3021,12 +2984,14 @@ fn emit_extern_declarations(s: *EmitterState)
         emit_str(s, "\n")
 
 fn emit_field_llvm_type(s: *EmitterState, f: *StructField)
-    if f.field_type == TYPE_I32
+    if f.field_type == TYPE_I32 or f.field_type == TYPE_U32
         emit_str(s, "i32")
     else if f.field_type == TYPE_I64
         emit_str(s, "i64")
     else if f.field_type == TYPE_U8 or f.field_type == TYPE_I8
         emit_str(s, "i8")
+    else if f.field_type == TYPE_U16 or f.field_type == TYPE_I16
+        emit_str(s, "i16")
     else if f.field_type == TYPE_BOOL
         emit_str(s, "i1")
     else if f.field_type == TYPE_PTR or f.field_type == TYPE_PTR_PTR
