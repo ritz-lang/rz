@@ -175,10 +175,11 @@ test-boot: iso
 # UEFI bootloader test (Ritz UEFI bootloader)
 uefi-boot:
 	@echo "Building UEFI bootloader..."
-	cd boot && ./build.sh
+	python3 build.py build boot
 
 test-uefi-boot: uefi-boot
 	@echo "Testing UEFI bootloader..."
+	python3 build.py build kernel
 	cd boot && ./test.sh
 
 test-unit:

@@ -10,8 +10,12 @@ HARLAND_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$SCRIPT_DIR"
 
 # Build bootloader if needed
-if [ ! -f build/harland_boot.efi ]; then
-    ./build.sh
+BOOT_EFI="$HARLAND_DIR/build/BOOTX64.EFI"
+if [ ! -f "$BOOT_EFI" ]; then
+    echo "Building bootloader..."
+    cd "$HARLAND_DIR"
+    python3 build.py build boot
+    cd "$SCRIPT_DIR"
 fi
 
 # Build kernel if needed
@@ -50,7 +54,7 @@ fi
 
 echo "=== Testing UEFI Boot (Full System) ==="
 echo "  OVMF:   $OVMF_CODE"
-echo "  EFI:    build/harland_boot.efi"
+echo "  EFI:    $BOOT_EFI"
 echo "  Kernel: $KERNEL_ELF"
 echo ""
 
@@ -61,7 +65,7 @@ trap "rm -rf $TMPDIR" EXIT
 # Create EFI directory structure
 mkdir -p "$TMPDIR/EFI/BOOT"
 mkdir -p "$TMPDIR/harland"
-cp build/harland_boot.efi "$TMPDIR/EFI/BOOT/BOOTX64.EFI"
+cp "$BOOT_EFI" "$TMPDIR/EFI/BOOT/BOOTX64.EFI"
 cp "$KERNEL_ELF" "$TMPDIR/harland/kernel.elf"
 
 # Create startup.nsh to auto-run our EFI app
@@ -76,7 +80,7 @@ mkfs.vfat "$TMPDIR/disk.img" >/dev/null
 mmd -i "$TMPDIR/disk.img" ::/EFI
 mmd -i "$TMPDIR/disk.img" ::/EFI/BOOT
 mmd -i "$TMPDIR/disk.img" ::/harland
-mcopy -i "$TMPDIR/disk.img" build/harland_boot.efi ::/EFI/BOOT/BOOTX64.EFI
+mcopy -i "$TMPDIR/disk.img" "$BOOT_EFI" ::/EFI/BOOT/BOOTX64.EFI
 mcopy -i "$TMPDIR/disk.img" "$KERNEL_ELF" ::/harland/kernel.elf
 mcopy -i "$TMPDIR/disk.img" "$TMPDIR/startup.nsh" ::/startup.nsh
 
