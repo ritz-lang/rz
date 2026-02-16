@@ -50,6 +50,7 @@ pub const CHANNEL_ERR_HANDSHAKE: i32 = -1
 pub const CHANNEL_ERR_DECRYPT: i32 = -2
 pub const CHANNEL_ERR_BUFFER: i32 = -3
 pub const CHANNEL_ERR_IO: i32 = -4
+pub const CHANNEL_ERR_REPLAY: i32 = -5
 
 # ============================================================================
 # Encrypted Channel Structure
@@ -153,6 +154,11 @@ pub fn channel_free(ch: *EncryptedChannel)
     if ch.sock.fd >= 0
         socket_close(@ch.sock)
         ch.sock.fd = -1
+
+    # Poison nonces to prevent accidental reuse (Issue #15)
+    # If channel is ever reused without proper init, nonce checks will fail
+    ch.send_nonce = 0xffffffffffffffff
+    ch.recv_nonce = 0xffffffffffffffff
 
     ch.state = CHANNEL_STATE_ERROR
 
@@ -388,25 +394,33 @@ pub fn channel_recv(ch: *EncryptedChannel, data: *u8, cap: i32) -> i32
             return -5
         received += n as i32
 
-    # Extract nonce
+    # Extract nonce and parse counter value
+    # Nonce format: [4 zeros][8-byte LE counter]
     var nonce: [12]u8
     mem_copy(@nonce[0], ch.recv_buf, 12)
 
-    # Verify nonce matches expected
-    var expected_nonce: [12]u8
-    build_nonce(@expected_nonce[0], ch.recv_nonce)
-    var nonce_ok: i32 = 1
-    var i: i32 = 0
-    while i < 12
-        if nonce[i] != expected_nonce[i]
-            nonce_ok = 0
-        i += 1
+    # Parse nonce counter (bytes 4-11, little-endian)
+    var recv_counter: u64 = nonce[4] as u64
+    recv_counter = recv_counter | ((nonce[5] as u64) << 8)
+    recv_counter = recv_counter | ((nonce[6] as u64) << 16)
+    recv_counter = recv_counter | ((nonce[7] as u64) << 24)
+    recv_counter = recv_counter | ((nonce[8] as u64) << 32)
+    recv_counter = recv_counter | ((nonce[9] as u64) << 40)
+    recv_counter = recv_counter | ((nonce[10] as u64) << 48)
+    recv_counter = recv_counter | ((nonce[11] as u64) << 56)
 
-    if nonce_ok == 0
+    # Verify first 4 bytes are zero (nonce format check)
+    if nonce[0] != 0 or nonce[1] != 0 or nonce[2] != 0 or nonce[3] != 0
         ch.last_error = CHANNEL_ERR_DECRYPT
         return -6
 
-    ch.recv_nonce += 1
+    # Nonce validation: must match expected (strict ordering, Issue #15)
+    # Poisoned channels (recv_nonce = MAX) will always fail this check
+    if recv_counter != ch.recv_nonce
+        ch.last_error = CHANNEL_ERR_REPLAY
+        return -6
+
+    ch.recv_nonce = recv_counter + 1
 
     # Extract ciphertext and tag
     let ct_len: i32 = payload_len - CHANNEL_NONCE_SIZE - CHANNEL_TAG_SIZE
