@@ -1,0 +1,480 @@
+# lib/storage.ritz - Storage Engine
+#
+# The Storage Engine provides durable, crash-safe storage for Mausoleum.
+# It coordinates:
+# - Buffer pool for page caching
+# - WAL for durability
+# - Recovery for crash safety
+#
+# Storage Layout:
+#   <db_path>/
+#     data.m7m     - Main data file (pages)
+#     wal.000000   - WAL segment files
+#     meta.m7m     - Metadata (checkpoint info, config)
+#
+# Usage:
+#   let storage_opt = storage_open("/path/to/db")
+#   if option_is_none<*Storage>(@storage_opt) == 1
+#       print("Failed to open storage\n")
+#       return 1
+#   let storage: *Storage = option_unwrap_or<*Storage>(@storage_opt, null)
+#
+#   # Use the storage...
+#   storage_close(storage)
+
+import ritzlib.sys
+import ritzlib.str
+import ritzlib.strview
+import ritzlib.memory
+import ritzlib.option
+
+import lib.m7m_types
+import lib.page
+import lib.buffer_pool
+import lib.wal
+import lib.recovery
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+const STORAGE_MAGIC: i32 = 0x4D374D53    # "M7MS" - Mausoleum Storage
+const STORAGE_VERSION: i32 = 1
+
+const DATA_FILE_NAME: StrView = "/data.m7m"
+const WAL_FILE_NAME: StrView = "/wal"
+const META_FILE_NAME: StrView = "/meta.m7m"
+
+const DEFAULT_BUFFER_SIZE: i32 = 256    # 256 pages = 1MB cache
+
+# ============================================================================
+# Storage Metadata
+# ============================================================================
+# Stored in meta.m7m file for persistence across restarts
+
+struct StorageMeta
+    magic: i32
+    version: i32
+    checkpoint_lsn: i64     # Last checkpoint LSN
+    next_page_id: i64       # Next page ID to allocate
+    next_txn_id: i64        # Next transaction ID
+    created_at: i64         # Creation timestamp (nanos)
+    last_open: i64          # Last open timestamp (nanos)
+
+# ============================================================================
+# Storage Engine Structure
+# ============================================================================
+
+struct Storage
+    pool: *BufferPool
+    wal_writer: *WalWriter
+    recovery_mgr: *RecoveryManager
+
+    base_path: *u8
+    base_path_len: i32
+
+    meta: StorageMeta
+    meta_fd: i32            # File descriptor for meta file
+
+    current_txn: i64        # Current active transaction ID (0 = none)
+    current_lsn: i64        # Current LSN for the active transaction
+
+    is_open: i32
+
+# ============================================================================
+# Path Building Helpers
+# ============================================================================
+
+fn build_path(base: *u8, base_len: i32, suffix: StrView, buf: *u8) -> i32
+    let blen: i64 = base_len as i64
+    memcpy(buf, base, blen)
+    memcpy(buf + blen, suffix.ptr, suffix.len)
+    *(buf + blen + suffix.len) = 0
+    return (blen + suffix.len) as i32
+
+# ============================================================================
+# Metadata Operations
+# ============================================================================
+
+fn meta_init(meta: *StorageMeta)
+    meta.magic = STORAGE_MAGIC
+    meta.version = STORAGE_VERSION
+    meta.checkpoint_lsn = 0
+    meta.next_page_id = 0
+    meta.next_txn_id = 1
+    let now: Timestamp = timestamp_now()
+    meta.created_at = now.nanos
+    meta.last_open = now.nanos
+
+fn meta_read(fd: i32, meta: *StorageMeta) -> i32
+    let result: i64 = sys_lseek(fd, 0, 0)  # SEEK_SET
+    if result < 0
+        return ERR_IO
+
+    let bytes_read: i64 = sys_read(fd, meta as *u8, sizeof(StorageMeta))
+    if bytes_read != sizeof(StorageMeta)
+        return ERR_CORRUPT
+
+    if meta.magic != STORAGE_MAGIC
+        return ERR_CORRUPT
+
+    if meta.version != STORAGE_VERSION
+        return ERR_VERSION
+
+    return ERR_OK
+
+fn meta_write(fd: i32, meta: *StorageMeta) -> i32
+    let result: i64 = sys_lseek(fd, 0, 0)  # SEEK_SET
+    if result < 0
+        return ERR_IO
+
+    let bytes_written: i64 = sys_write(fd, meta as *u8, sizeof(StorageMeta))
+    if bytes_written != sizeof(StorageMeta)
+        return ERR_IO
+
+    # NOTE: Would call fsync here for durability, but syscall not yet in ritzlib
+    # TODO: Add sys_fsync to ritzlib.sys
+    return ERR_OK
+
+# ============================================================================
+# Storage Creation/Opening
+# ============================================================================
+
+# Open or create a storage directory
+pub fn storage_open(path: *u8) -> Option<*Storage>
+    if path == null
+        return None
+
+    let path_len: i64 = strlen(path)
+    if path_len <= 0 or path_len > 200
+        return None
+
+    # Allocate storage structure
+    let storage: *Storage = malloc(sizeof(Storage)) as *Storage
+    if storage == null
+        return None
+
+    # Copy base path
+    let base_copy: *u8 = malloc(path_len + 1)
+    if base_copy == null
+        free(storage as *u8)
+        return None
+    memcpy(base_copy, path, path_len + 1)
+
+    storage.base_path = base_copy
+    storage.base_path_len = path_len as i32
+    storage.pool = null
+    storage.wal_writer = null
+    storage.recovery_mgr = null
+    storage.meta_fd = -1
+    storage.current_txn = 0
+    storage.current_lsn = 0
+    storage.is_open = 0
+
+    # Try to create directory (may already exist)
+    sys_mkdir(path, 493)  # 0755
+
+    # Build paths
+    var data_path: [256]u8
+    var wal_path: [256]u8
+    var meta_path: [256]u8
+
+    build_path(base_copy, storage.base_path_len, DATA_FILE_NAME, @data_path[0])
+    build_path(base_copy, storage.base_path_len, WAL_FILE_NAME, @wal_path[0])
+    build_path(base_copy, storage.base_path_len, META_FILE_NAME, @meta_path[0])
+
+    # Open or create meta file
+    var is_new: i32 = 0
+    var meta_fd: i32 = sys_open(@meta_path[0], O_RDWR)
+    if meta_fd < 0
+        # Create new meta file
+        meta_fd = sys_open3(@meta_path[0], O_RDWR | O_CREAT, 420)
+        if meta_fd < 0
+            free(base_copy)
+            free(storage as *u8)
+            return None
+        is_new = 1
+
+    storage.meta_fd = meta_fd
+
+    # Read or initialize metadata
+    if is_new != 0
+        meta_init(@storage.meta)
+        let write_result: i32 = meta_write(meta_fd, @storage.meta)
+        if write_result != ERR_OK
+            sys_close(meta_fd)
+            free(base_copy)
+            free(storage as *u8)
+            return None
+    else
+        let read_result: i32 = meta_read(meta_fd, @storage.meta)
+        if read_result != ERR_OK
+            sys_close(meta_fd)
+            free(base_copy)
+            free(storage as *u8)
+            return None
+
+    # Create buffer pool
+    let pool_opt: Option<*BufferPool> = buffer_pool_new(DEFAULT_BUFFER_SIZE)
+    if option_is_none<*BufferPool>(@pool_opt) == 1
+        sys_close(meta_fd)
+        free(base_copy)
+        free(storage as *u8)
+        return None
+    storage.pool = option_unwrap_or<*BufferPool>(@pool_opt, null)
+
+    # Open data file
+    let open_result: i32 = buffer_pool_open(storage.pool, @data_path[0])
+    if open_result != ERR_OK
+        buffer_pool_destroy(storage.pool)
+        sys_close(meta_fd)
+        free(base_copy)
+        free(storage as *u8)
+        return None
+
+    # Create WAL writer
+    storage.wal_writer = wal_writer_new(@wal_path[0])
+    if storage.wal_writer != null
+        wal_writer_open(storage.wal_writer)
+
+    # Create recovery manager
+    storage.recovery_mgr = recovery_mgr_new(storage.pool, @wal_path[0])
+
+    # Perform recovery if needed (only if not a new database)
+    if is_new == 0 and storage.recovery_mgr != null
+        recovery_recover(storage.recovery_mgr)
+
+    # Update last open time
+    let now: Timestamp = timestamp_now()
+    storage.meta.last_open = now.nanos
+    meta_write(meta_fd, @storage.meta)
+
+    storage.is_open = 1
+    return Some(storage)
+
+# Close storage
+pub fn storage_close(storage: *Storage) -> i32
+    if storage == null
+        return ERR_INVALID
+
+    if storage.is_open == 0
+        return ERR_OK
+
+    # Flush all pending data
+    storage_flush(storage)
+
+    # Write final checkpoint
+    storage_checkpoint(storage)
+
+    # Close WAL
+    if storage.wal_writer != null
+        wal_writer_destroy(storage.wal_writer)
+        storage.wal_writer = null
+
+    # Close buffer pool
+    if storage.pool != null
+        buffer_pool_destroy(storage.pool)
+        storage.pool = null
+
+    # Close recovery manager
+    if storage.recovery_mgr != null
+        recovery_mgr_destroy(storage.recovery_mgr)
+        storage.recovery_mgr = null
+
+    # Write final metadata
+    if storage.meta_fd >= 0
+        meta_write(storage.meta_fd, @storage.meta)
+        sys_close(storage.meta_fd)
+        storage.meta_fd = -1
+
+    # Free base path
+    if storage.base_path != null
+        free(storage.base_path)
+        storage.base_path = null
+
+    storage.is_open = 0
+    return ERR_OK
+
+# Destroy storage (calls close if needed)
+pub fn storage_destroy(storage: *Storage)
+    if storage == null
+        return
+
+    if storage.is_open != 0
+        storage_close(storage)
+
+    free(storage as *u8)
+
+# ============================================================================
+# Buffer Pool Access
+# ============================================================================
+
+pub fn storage_pool(storage: *Storage) -> *BufferPool
+    if storage == null
+        return null
+    return storage.pool
+
+pub fn storage_wal(storage: *Storage) -> *WalWriter
+    if storage == null
+        return null
+    return storage.wal_writer
+
+# ============================================================================
+# Transaction Operations
+# ============================================================================
+
+# Begin a new transaction
+pub fn storage_begin_txn(storage: *Storage) -> i64
+    if storage == null or storage.is_open == 0
+        return -1
+
+    if storage.current_txn != 0
+        return -1  # Transaction already active
+
+    let txn_id: i64 = storage.meta.next_txn_id
+    storage.meta.next_txn_id += 1
+    storage.current_txn = txn_id
+
+    # Write BEGIN to WAL
+    if storage.wal_writer != null
+        storage.current_lsn = wal_write_begin(storage.wal_writer, txn_id)
+
+    return txn_id
+
+# Commit the current transaction
+pub fn storage_commit_txn(storage: *Storage) -> i32
+    if storage == null or storage.is_open == 0
+        return ERR_INVALID
+
+    if storage.current_txn == 0
+        return ERR_INVALID  # No active transaction
+
+    # Write COMMIT to WAL
+    if storage.wal_writer != null
+        wal_write_commit(storage.wal_writer, storage.current_txn, storage.current_lsn)
+
+    storage.current_txn = 0
+    storage.current_lsn = 0
+    return ERR_OK
+
+# Abort the current transaction
+pub fn storage_abort_txn(storage: *Storage) -> i32
+    if storage == null or storage.is_open == 0
+        return ERR_INVALID
+
+    if storage.current_txn == 0
+        return ERR_INVALID  # No active transaction
+
+    # Write ABORT to WAL
+    if storage.wal_writer != null
+        wal_write_abort(storage.wal_writer, storage.current_txn, storage.current_lsn)
+
+    storage.current_txn = 0
+    storage.current_lsn = 0
+    return ERR_OK
+
+# ============================================================================
+# Page Operations (with WAL logging)
+# ============================================================================
+
+# Allocate a new page
+pub fn storage_alloc_page(storage: *Storage, page_type: i32) -> Option<*Page>
+    if storage == null or storage.is_open == 0
+        return None
+
+    let page_opt: Option<*Page> = buffer_pool_alloc(storage.pool, page_type)
+    if option_is_none<*Page>(@page_opt) == 1
+        return None
+
+    let page: *Page = option_unwrap_or<*Page>(@page_opt, null)
+
+    # Log full page image to WAL for new pages
+    if storage.wal_writer != null and storage.current_txn != 0
+        let page_id: i64 = buffer_pool_page_id(storage.pool, page)
+        storage.current_lsn = wal_write_page(storage.wal_writer, storage.current_txn, storage.current_lsn, page_id, page)
+
+    # Update next_page_id in metadata
+    let page_id: i64 = buffer_pool_page_id(storage.pool, page)
+    if page_id >= storage.meta.next_page_id
+        storage.meta.next_page_id = page_id + 1
+
+    return Some(page)
+
+# Fetch an existing page
+pub fn storage_fetch_page(storage: *Storage, page_id: i64) -> Option<*Page>
+    if storage == null or storage.is_open == 0
+        return None
+
+    return buffer_pool_fetch(storage.pool, page_id)
+
+# Mark a page as modified and log to WAL
+pub fn storage_mark_dirty(storage: *Storage, page: *Page)
+    if storage == null or page == null or storage.is_open == 0
+        return
+
+    let page_id: i64 = buffer_pool_page_id(storage.pool, page)
+
+    # Log page modification to WAL
+    if storage.wal_writer != null and storage.current_txn != 0
+        storage.current_lsn = wal_write_page(storage.wal_writer, storage.current_txn, storage.current_lsn, page_id, page)
+
+# Unpin a page
+pub fn storage_unpin_page(storage: *Storage, page_id: i64, dirty: i32)
+    if storage == null or storage.is_open == 0
+        return
+
+    buffer_pool_unpin(storage.pool, page_id, dirty)
+
+# ============================================================================
+# Durability Operations
+# ============================================================================
+
+# Flush all dirty pages to disk
+pub fn storage_flush(storage: *Storage) -> i32
+    if storage == null or storage.is_open == 0
+        return ERR_INVALID
+
+    # Flush WAL first (write-ahead)
+    if storage.wal_writer != null
+        wal_writer_flush(storage.wal_writer)
+
+    # Then flush buffer pool
+    return buffer_pool_flush_all(storage.pool)
+
+# Create a checkpoint (flushes everything and updates metadata)
+pub fn storage_checkpoint(storage: *Storage) -> i32
+    if storage == null or storage.is_open == 0
+        return ERR_INVALID
+
+    # Flush all dirty pages
+    let flush_result: i32 = storage_flush(storage)
+    if flush_result != ERR_OK
+        return flush_result
+
+    # Write checkpoint record to WAL
+    if storage.wal_writer != null
+        let lsn: i64 = wal_write_checkpoint(storage.wal_writer)
+        if lsn > 0
+            storage.meta.checkpoint_lsn = lsn
+
+    # Update and persist metadata
+    return meta_write(storage.meta_fd, @storage.meta)
+
+# ============================================================================
+# Statistics
+# ============================================================================
+
+pub fn storage_page_count(storage: *Storage) -> i64
+    if storage == null
+        return 0
+    return storage.meta.next_page_id
+
+pub fn storage_checkpoint_lsn(storage: *Storage) -> i64
+    if storage == null
+        return 0
+    return storage.meta.checkpoint_lsn
+
+pub fn storage_is_open(storage: *Storage) -> i32
+    if storage == null
+        return 0
+    return storage.is_open

@@ -1,0 +1,448 @@
+# test/test_storage.ritz - Tests for Storage Engine
+#
+# Tests for durable storage, transactions, and crash recovery
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+import ritzlib.strview
+import ritzlib.option
+
+import lib.m7m_types
+import lib.page
+import lib.buffer_pool
+import lib.storage
+
+# ============================================================================
+# Test Helpers
+# ============================================================================
+
+fn test_db_path() -> StrView
+    return "/tmp/mausoleum_test_db"
+
+fn cleanup_test_db()
+    # Remove test database directory
+    let path: StrView = test_db_path()
+    var data_path: [256]u8
+    var wal_path: [256]u8
+    var meta_path: [256]u8
+
+    # Build paths
+    let plen: i64 = path.len
+    memcpy(@data_path[0], path.ptr, plen)
+    let data_suffix: StrView = "/data.m7m"
+    memcpy(@data_path[plen], data_suffix.ptr, data_suffix.len)
+    data_path[plen + data_suffix.len] = 0
+
+    memcpy(@wal_path[0], path.ptr, plen)
+    let wal_suffix: StrView = "/wal.wal.000000"
+    memcpy(@wal_path[plen], wal_suffix.ptr, wal_suffix.len)
+    wal_path[plen + wal_suffix.len] = 0
+
+    memcpy(@meta_path[0], path.ptr, plen)
+    let meta_suffix: StrView = "/meta.m7m"
+    memcpy(@meta_path[plen], meta_suffix.ptr, meta_suffix.len)
+    meta_path[plen + meta_suffix.len] = 0
+
+    # Delete files (ignore errors)
+    sys_unlink(@data_path[0])
+    sys_unlink(@wal_path[0])
+    sys_unlink(@meta_path[0])
+    sys_rmdir(path.ptr)
+
+# ============================================================================
+# Storage Creation Tests
+# ============================================================================
+
+[[test]]
+fn test_storage_open_new() -> i32
+    cleanup_test_db()
+
+    let path: StrView = test_db_path()
+    let storage_opt: Option<*Storage> = storage_open(path.ptr)
+    if option_is_none<*Storage>(@storage_opt) == 1
+        return 1
+
+    let storage: *Storage = option_unwrap_or<*Storage>(@storage_opt, null)
+    if storage_is_open(storage) != 1
+        storage_destroy(storage)
+        return 2
+
+    storage_destroy(storage)
+    cleanup_test_db()
+    0
+
+[[test]]
+fn test_storage_open_existing() -> i32
+    cleanup_test_db()
+
+    let path: StrView = test_db_path()
+
+    # Open and close
+    let storage1_opt: Option<*Storage> = storage_open(path.ptr)
+    if option_is_none<*Storage>(@storage1_opt) == 1
+        return 1
+    let storage1: *Storage = option_unwrap_or<*Storage>(@storage1_opt, null)
+    storage_destroy(storage1)
+
+    # Reopen
+    let storage2_opt: Option<*Storage> = storage_open(path.ptr)
+    if option_is_none<*Storage>(@storage2_opt) == 1
+        return 2
+    let storage2: *Storage = option_unwrap_or<*Storage>(@storage2_opt, null)
+
+    if storage_is_open(storage2) != 1
+        storage_destroy(storage2)
+        return 3
+
+    storage_destroy(storage2)
+    cleanup_test_db()
+    0
+
+[[test]]
+fn test_storage_null_path() -> i32
+    let storage_opt: Option<*Storage> = storage_open(null)
+    if option_is_none<*Storage>(@storage_opt) != 1
+        return 1
+    0
+
+# ============================================================================
+# Page Allocation Tests
+# ============================================================================
+
+[[test]]
+fn test_storage_alloc_page() -> i32
+    cleanup_test_db()
+
+    let path: StrView = test_db_path()
+    let storage_opt: Option<*Storage> = storage_open(path.ptr)
+    if option_is_none<*Storage>(@storage_opt) == 1
+        return 1
+    let storage: *Storage = option_unwrap_or<*Storage>(@storage_opt, null)
+
+    # Start transaction
+    let txn: i64 = storage_begin_txn(storage)
+    if txn < 0
+        storage_destroy(storage)
+        return 2
+
+    # Allocate a page
+    let page_opt: Option<*Page> = storage_alloc_page(storage, PAGE_MAGIC_HEAP)
+    if option_is_none<*Page>(@page_opt) == 1
+        storage_destroy(storage)
+        return 3
+    let page: *Page = option_unwrap_or<*Page>(@page_opt, null)
+
+    # Verify page type
+    if page_type(page) != PAGE_MAGIC_HEAP
+        storage_destroy(storage)
+        return 4
+
+    # Commit
+    let result: i32 = storage_commit_txn(storage)
+    if result != ERR_OK
+        storage_destroy(storage)
+        return 5
+
+    storage_destroy(storage)
+    cleanup_test_db()
+    0
+
+[[test]]
+fn test_storage_multiple_pages() -> i32
+    cleanup_test_db()
+
+    let path: StrView = test_db_path()
+    let storage_opt: Option<*Storage> = storage_open(path.ptr)
+    if option_is_none<*Storage>(@storage_opt) == 1
+        return 1
+    let storage: *Storage = option_unwrap_or<*Storage>(@storage_opt, null)
+
+    let txn: i64 = storage_begin_txn(storage)
+
+    # Allocate several pages
+    var page_ids: [8]i64
+    for i in 0..8
+        let page_opt: Option<*Page> = storage_alloc_page(storage, PAGE_MAGIC_BTREE)
+        if option_is_none<*Page>(@page_opt) == 1
+            storage_destroy(storage)
+            return 2
+        let page: *Page = option_unwrap_or<*Page>(@page_opt, null)
+        let pool: *BufferPool = storage_pool(storage)
+        page_ids[i] = buffer_pool_page_id(pool, page)
+
+    storage_commit_txn(storage)
+
+    # Verify page count
+    if storage_page_count(storage) < 8
+        storage_destroy(storage)
+        return 3
+
+    storage_destroy(storage)
+    cleanup_test_db()
+    0
+
+# ============================================================================
+# Transaction Tests
+# ============================================================================
+
+[[test]]
+fn test_storage_begin_commit() -> i32
+    cleanup_test_db()
+
+    let path: StrView = test_db_path()
+    let storage_opt: Option<*Storage> = storage_open(path.ptr)
+    if option_is_none<*Storage>(@storage_opt) == 1
+        return 1
+    let storage: *Storage = option_unwrap_or<*Storage>(@storage_opt, null)
+
+    # Begin transaction
+    let txn: i64 = storage_begin_txn(storage)
+    if txn < 0
+        storage_destroy(storage)
+        return 2
+
+    # Transaction ID should be positive
+    if txn <= 0
+        storage_destroy(storage)
+        return 3
+
+    # Commit
+    let result: i32 = storage_commit_txn(storage)
+    if result != ERR_OK
+        storage_destroy(storage)
+        return 4
+
+    storage_destroy(storage)
+    cleanup_test_db()
+    0
+
+[[test]]
+fn test_storage_begin_abort() -> i32
+    cleanup_test_db()
+
+    let path: StrView = test_db_path()
+    let storage_opt: Option<*Storage> = storage_open(path.ptr)
+    if option_is_none<*Storage>(@storage_opt) == 1
+        return 1
+    let storage: *Storage = option_unwrap_or<*Storage>(@storage_opt, null)
+
+    let txn: i64 = storage_begin_txn(storage)
+    if txn < 0
+        storage_destroy(storage)
+        return 2
+
+    let result: i32 = storage_abort_txn(storage)
+    if result != ERR_OK
+        storage_destroy(storage)
+        return 3
+
+    storage_destroy(storage)
+    cleanup_test_db()
+    0
+
+[[test]]
+fn test_storage_nested_txn_fails() -> i32
+    cleanup_test_db()
+
+    let path: StrView = test_db_path()
+    let storage_opt: Option<*Storage> = storage_open(path.ptr)
+    if option_is_none<*Storage>(@storage_opt) == 1
+        return 1
+    let storage: *Storage = option_unwrap_or<*Storage>(@storage_opt, null)
+
+    let txn1: i64 = storage_begin_txn(storage)
+    if txn1 < 0
+        storage_destroy(storage)
+        return 2
+
+    # Second begin should fail (nested not supported)
+    let txn2: i64 = storage_begin_txn(storage)
+    if txn2 >= 0
+        storage_destroy(storage)
+        return 3
+
+    storage_commit_txn(storage)
+    storage_destroy(storage)
+    cleanup_test_db()
+    0
+
+# ============================================================================
+# Persistence Tests
+# ============================================================================
+
+[[test]]
+fn test_storage_persist_page_data() -> i32
+    cleanup_test_db()
+
+    let path: StrView = test_db_path()
+    var page_id_stored: i64 = -1
+
+    # Phase 1: Create and write data
+    let s1_opt: Option<*Storage> = storage_open(path.ptr)
+    if option_is_none<*Storage>(@s1_opt) == 1
+        return 1
+    let s1: *Storage = option_unwrap_or<*Storage>(@s1_opt, null)
+
+    let txn: i64 = storage_begin_txn(s1)
+
+    let page_opt: Option<*Page> = storage_alloc_page(s1, PAGE_MAGIC_HEAP)
+    if option_is_none<*Page>(@page_opt) == 1
+        storage_destroy(s1)
+        return 2
+    let page: *Page = option_unwrap_or<*Page>(@page_opt, null)
+
+    # Write some data to the page
+    let data: *u8 = page_data(page)
+    data[0] = 0xDE
+    data[1] = 0xAD
+    data[2] = 0xBE
+    data[3] = 0xEF
+
+    let pool: *BufferPool = storage_pool(s1)
+    page_id_stored = buffer_pool_page_id(pool, page)
+
+    storage_mark_dirty(s1, page)
+    storage_unpin_page(s1, page_id_stored, 1)
+
+    storage_commit_txn(s1)
+    storage_checkpoint(s1)
+    storage_destroy(s1)
+
+    # Phase 2: Reopen and verify data
+    let s2_opt: Option<*Storage> = storage_open(path.ptr)
+    if option_is_none<*Storage>(@s2_opt) == 1
+        return 3
+    let s2: *Storage = option_unwrap_or<*Storage>(@s2_opt, null)
+
+    let fetch_opt: Option<*Page> = storage_fetch_page(s2, page_id_stored)
+    if option_is_none<*Page>(@fetch_opt) == 1
+        storage_destroy(s2)
+        return 4
+    let fetched: *Page = option_unwrap_or<*Page>(@fetch_opt, null)
+
+    let fetched_data: *u8 = page_data(fetched)
+    if fetched_data[0] != 0xDE or fetched_data[1] != 0xAD
+        storage_destroy(s2)
+        return 5
+    if fetched_data[2] != 0xBE or fetched_data[3] != 0xEF
+        storage_destroy(s2)
+        return 6
+
+    storage_unpin_page(s2, page_id_stored, 0)
+    storage_destroy(s2)
+    cleanup_test_db()
+    0
+
+[[test]]
+fn test_storage_checkpoint() -> i32
+    cleanup_test_db()
+
+    let path: StrView = test_db_path()
+    let storage_opt: Option<*Storage> = storage_open(path.ptr)
+    if option_is_none<*Storage>(@storage_opt) == 1
+        return 1
+    let storage: *Storage = option_unwrap_or<*Storage>(@storage_opt, null)
+
+    let txn: i64 = storage_begin_txn(storage)
+    let page_opt: Option<*Page> = storage_alloc_page(storage, PAGE_MAGIC_HEAP)
+    if option_is_none<*Page>(@page_opt) == 1
+        storage_destroy(storage)
+        return 2
+    storage_commit_txn(storage)
+
+    # Checkpoint
+    let result: i32 = storage_checkpoint(storage)
+    if result != ERR_OK
+        storage_destroy(storage)
+        return 3
+
+    # Checkpoint LSN should be > 0
+    if storage_checkpoint_lsn(storage) <= 0
+        storage_destroy(storage)
+        return 4
+
+    storage_destroy(storage)
+    cleanup_test_db()
+    0
+
+# ============================================================================
+# Flush Tests
+# ============================================================================
+
+[[test]]
+fn test_storage_flush() -> i32
+    cleanup_test_db()
+
+    let path: StrView = test_db_path()
+    let storage_opt: Option<*Storage> = storage_open(path.ptr)
+    if option_is_none<*Storage>(@storage_opt) == 1
+        return 1
+    let storage: *Storage = option_unwrap_or<*Storage>(@storage_opt, null)
+
+    let txn: i64 = storage_begin_txn(storage)
+
+    # Allocate and modify several pages
+    for i in 0..4
+        let page_opt: Option<*Page> = storage_alloc_page(storage, PAGE_MAGIC_HEAP)
+        if option_is_none<*Page>(@page_opt) == 1
+            storage_destroy(storage)
+            return 2
+        let page: *Page = option_unwrap_or<*Page>(@page_opt, null)
+        let pool: *BufferPool = storage_pool(storage)
+        let pid: i64 = buffer_pool_page_id(pool, page)
+        storage_unpin_page(storage, pid, 1)
+
+    storage_commit_txn(storage)
+
+    # Explicit flush
+    let result: i32 = storage_flush(storage)
+    if result != ERR_OK
+        storage_destroy(storage)
+        return 3
+
+    storage_destroy(storage)
+    cleanup_test_db()
+    0
+
+# ============================================================================
+# Buffer Pool Access Tests
+# ============================================================================
+
+[[test]]
+fn test_storage_pool_access() -> i32
+    cleanup_test_db()
+
+    let path: StrView = test_db_path()
+    let storage_opt: Option<*Storage> = storage_open(path.ptr)
+    if option_is_none<*Storage>(@storage_opt) == 1
+        return 1
+    let storage: *Storage = option_unwrap_or<*Storage>(@storage_opt, null)
+
+    let pool: *BufferPool = storage_pool(storage)
+    if pool == null
+        storage_destroy(storage)
+        return 2
+
+    storage_destroy(storage)
+    cleanup_test_db()
+    0
+
+[[test]]
+fn test_storage_wal_access() -> i32
+    cleanup_test_db()
+
+    let path: StrView = test_db_path()
+    let storage_opt: Option<*Storage> = storage_open(path.ptr)
+    if option_is_none<*Storage>(@storage_opt) == 1
+        return 1
+    let storage: *Storage = option_unwrap_or<*Storage>(@storage_opt, null)
+
+    let wal: *WalWriter = storage_wal(storage)
+    if wal == null
+        storage_destroy(storage)
+        return 2
+
+    storage_destroy(storage)
+    cleanup_test_db()
+    0
