@@ -924,7 +924,9 @@ class ImportResolver:
                 )
                 fn_def.source_file = source_file
                 if fn_sig.name not in self.functions:
-                    self.functions[fn_sig.name] = fn_def
+                    self.functions[fn_sig.name] = [fn_def]
+                else:
+                    self.functions[fn_sig.name].append(fn_def)
 
         # Register structs
         for struct_meta in meta.structs:

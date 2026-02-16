@@ -576,7 +576,21 @@ class LLVMEmitter:
             # Method call return type - look up in method signatures
             return None  # Complex - would need full type resolution
         elif isinstance(expr, rast.Field):
-            # Field access - would need struct type resolution
+            # Field access - resolve struct type and return field type
+            base_type = self._infer_ritz_type(expr.expr)
+            if base_type:
+                # Handle pointer to struct: *S.field -> type of S.field
+                if isinstance(base_type, rast.PtrType):
+                    base_type = base_type.inner
+                elif isinstance(base_type, rast.RefType):
+                    base_type = base_type.inner
+                # Look up field type in struct definition
+                if isinstance(base_type, rast.NamedType):
+                    struct_name = base_type.name
+                    if struct_name in self.struct_fields:
+                        for fname, ftype in self.struct_fields[struct_name]:
+                            if fname == expr.field:
+                                return ftype
             return None
         elif isinstance(expr, rast.Index):
             base_type = self._infer_ritz_type(expr.expr)

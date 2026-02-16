@@ -598,6 +598,9 @@ def get_binaries(pkg_dir: Path, config: dict) -> list[BinaryConfig]:
             # Legacy: path = "src/main.ritz"
             elif "path" in bin_entry:
                 src_path = pkg_dir / bin_entry["path"]
+                # Skip non-.ritz files (e.g., .py or .sh scripts)
+                if not src_path.suffix == ".ritz":
+                    continue
             # Default: src/{name}.ritz
             else:
                 src_path = pkg_dir / "src" / f"{name}.ritz"
@@ -1374,11 +1377,21 @@ def cmd_test(args):
         else:
             # Normal package: build then test
             built = build_package(pkg_dir, config, keep_artifacts=keep_artifacts, use_cache=use_cache, profile_name=profile_name)
-            if built:
-                if not run_tests(pkg_dir, config):
+            # Check if there are any .ritz binaries to build
+            binaries = get_binaries(pkg_dir, config)
+            has_ritz_binaries = len(binaries) > 0
+
+            if has_ritz_binaries:
+                # Package has ritz binaries - build result matters
+                if built:
+                    if not run_tests(pkg_dir, config):
+                        all_passed = False
+                else:
                     all_passed = False
             else:
-                all_passed = False
+                # No ritz binaries (e.g., only scripts) - just run tests
+                if not run_tests(pkg_dir, config):
+                    all_passed = False
 
     if keep_artifacts:
         print(f"\n📁 Debug artifacts kept in build/")

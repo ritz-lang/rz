@@ -1,10 +1,7 @@
 # ritz1/src/regex.ritz - Regex Pattern Parser
 #
 # Parses regex patterns and builds NFAs using Thompson's construction.
-# Supports: literals, character classes, quantifiers, alternation.
-#
-# NOTE: Grouping () is NOT supported in the bootstrap due to mutual recursion
-# requiring forward declarations. Build complex patterns programmatically instead.
+# Supports: literals, character classes, quantifiers, alternation, grouping.
 #
 # Grammar:
 #   regex   = concat ('|' concat)*
@@ -130,9 +127,21 @@ fn regex_parse_class(p: *RegexParser) -> NFAFragment
 
   result
 
-# Parse an atom: char, charclass, or dot (no grouping in bootstrap)
+# Forward declaration workaround: regex_parse_group is defined after regex_parse_alt
+# but ritz0 resolves all function references at the end of compilation, so this works.
+
+# Parse an atom: char, charclass, dot, or grouped expression
 fn regex_parse_atom(p: *RegexParser) -> NFAFragment
   let ch: i32 = regex_peek(p)
+
+  # Grouping: ( expr )
+  if ch == 40    # (
+    regex_advance(p)
+    let inner: NFAFragment = regex_parse_alt(p)
+    # Expect closing paren
+    if regex_peek(p) == 41  # )
+      regex_advance(p)
+    return inner
 
   # Character class
   if ch == 91    # [
@@ -142,6 +151,12 @@ fn regex_parse_atom(p: *RegexParser) -> NFAFragment
   if ch == 46    # .
     regex_advance(p)
     return thompson_any(p.nfa)
+
+  # Stop at closing paren (for nested groups)
+  if ch == 41    # )
+    # Return empty fragment - will be handled by caller
+    let s0: i32 = nfa_add_state(p.nfa, 0, 0)
+    return NFAFragment { start: s0, end: s0 }
 
   # Literal character (possibly escaped)
   let c: i32 = regex_parse_char(p)
@@ -170,8 +185,8 @@ fn regex_parse_concat(p: *RegexParser) -> NFAFragment
 
   while regex_at_end(p) == 0
     let ch: i32 = regex_peek(p)
-    # Stop at alternation or end of input
-    if ch == 124 or ch < 0
+    # Stop at alternation, closing paren, or end of input
+    if ch == 124 or ch == 41 or ch < 0
       return result
     let next: NFAFragment = regex_parse_repeat(p)
     result = thompson_concat(p.nfa, result, next)
