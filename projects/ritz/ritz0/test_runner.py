@@ -14,7 +14,7 @@ import hashlib
 import os
 import shutil
 from pathlib import Path
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional
 
 from lexer import Lexer, LexerError
 from parser import Parser, ParseError
@@ -25,104 +25,6 @@ try:
     import tomllib
 except ImportError:
     import tomli as tomllib  # Python < 3.11
-
-
-def parse_ritz_toml_dependencies(toml_path: Path, pkg_dir: Path) -> Dict[str, DependencyMapping]:
-    """Parse [dependencies] section from ritz.toml config.
-
-    Also adds a self-reference for the current project so tests can import
-    from their own package using the package name (e.g., import cryptosec.u128).
-
-    Args:
-        toml_path: Path to ritz.toml file
-        pkg_dir: Package directory (parent of ritz.toml)
-
-    Returns:
-        Dict mapping dependency name to DependencyMapping
-    """
-    if not toml_path.exists():
-        return {}
-
-    with open(toml_path, "rb") as f:
-        config = tomllib.load(f)
-
-    deps = {}
-
-    # Add self-reference for current project (Issue #48)
-    # This allows tests to import from their own package using the package name
-    # e.g., import cryptosec.u128 when running tests in cryptosec project
-    pkg_name = config.get("package", {}).get("name")
-    if pkg_name:
-        # Determine sources for current project
-        pkg_sources = config.get("sources")
-        if pkg_sources is None:
-            pkg_sources = config.get("package", {}).get("sources")
-        if pkg_sources is None:
-            pkg_sources = config.get("build", {}).get("sources")
-        if pkg_sources is None:
-            # Default: check for common source directories
-            if (pkg_dir / "src").is_dir():
-                pkg_sources = ["src"]
-            elif (pkg_dir / "lib").is_dir():
-                pkg_sources = ["lib"]
-            else:
-                pkg_sources = ["."]
-        if isinstance(pkg_sources, str):
-            pkg_sources = [pkg_sources]
-
-        deps[pkg_name] = DependencyMapping(name=pkg_name, path=pkg_dir.resolve(), sources=pkg_sources)
-    deps_config = config.get("dependencies", {})
-
-    for name, spec in deps_config.items():
-        if isinstance(spec, dict):
-            # Full spec: { path = "...", sources = [...] }
-            dep_path = spec.get("path")
-            if dep_path is None:
-                continue
-
-            # Resolve path relative to package directory
-            dep_path = (pkg_dir / dep_path).resolve()
-            if not dep_path.exists():
-                continue
-
-            # Get sources from dependency's ritz.toml if not specified
-            sources = spec.get("sources")
-            if sources is None:
-                dep_toml = dep_path / "ritz.toml"
-                if dep_toml.exists():
-                    with open(dep_toml, "rb") as f:
-                        dep_config = tomllib.load(f)
-                    # Check multiple locations for sources
-                    sources = dep_config.get("sources")
-                    if sources is None:
-                        sources = dep_config.get("package", {}).get("sources")
-                    if sources is None:
-                        sources = dep_config.get("build", {}).get("sources")
-                    if sources is None:
-                        # Default to ["src"], but also check root if src doesn't exist
-                        if (dep_path / "src").is_dir():
-                            sources = ["src"]
-                        else:
-                            sources = ["."]  # Source files at root level
-                else:
-                    # No ritz.toml - check if src/ exists, otherwise assume root level
-                    if (dep_path / "src").is_dir():
-                        sources = ["src"]
-                    else:
-                        sources = ["."]  # Source files at root level (like ritzlib)
-
-            if isinstance(sources, str):
-                sources = [sources]
-
-            deps[name] = DependencyMapping(name=name, path=dep_path, sources=sources)
-        elif isinstance(spec, str):
-            # Shorthand: just a path
-            dep_path = (pkg_dir / spec).resolve()
-            if not dep_path.exists():
-                continue
-            deps[name] = DependencyMapping(name=name, path=dep_path, sources=["src"])
-
-    return deps
 
 
 def cleanup_tmpdir_with_symlinks(tmpdir: str):
@@ -197,13 +99,75 @@ def strip_main_from_source(source: str) -> str:
     return '\n'.join(result_lines)
 
 
-def setup_test_environment(source_path: str, tmpdir: str) -> Tuple[Optional[Path], Optional[List[Path]], Optional[str], Optional[Dict[str, DependencyMapping]]]:
+def get_sources_from_config(config: dict) -> list:
+    """Extract sources from a ritz.toml config.
+
+    Handles the TOML quirk where sources may be nested under [package]
+    or at top-level or under [build].
+    """
+    sources = config.get("sources")
+    if sources is None:
+        sources = config.get("package", {}).get("sources")
+    if sources is None:
+        sources = config.get("build", {}).get("sources")
+    if sources is None:
+        sources = ["src"]  # default
+    if isinstance(sources, str):
+        sources = [sources]
+    return sources
+
+
+def parse_project_dependencies(project_root: Path) -> dict:
+    """Parse dependencies from project's ritz.toml.
+
+    Returns a dict mapping dependency name to DependencyMapping.
+    """
+    toml_path = project_root / "ritz.toml"
+    if not toml_path.exists():
+        return {}
+
+    with open(toml_path, "rb") as f:
+        config = tomllib.load(f)
+
+    deps_config = config.get("dependencies", {})
+    dependencies = {}
+
+    for name, spec in deps_config.items():
+        if isinstance(spec, dict):
+            dep_path = spec.get("path")
+            if dep_path:
+                dep_full_path = (project_root / dep_path).resolve()
+                if dep_full_path.exists():
+                    # Read the dependency's ritz.toml for sources
+                    dep_toml = dep_full_path / "ritz.toml"
+                    sources = ["src"]  # default
+                    if dep_toml.exists():
+                        with open(dep_toml, "rb") as f:
+                            dep_config = tomllib.load(f)
+                        sources = get_sources_from_config(dep_config)
+                    dependencies[name] = DependencyMapping(
+                        name=name,
+                        path=dep_full_path,
+                        sources=sources
+                    )
+        elif isinstance(spec, str):
+            dep_full_path = (project_root / spec).resolve()
+            if dep_full_path.exists():
+                dependencies[name] = DependencyMapping(
+                    name=name,
+                    path=dep_full_path,
+                    sources=["src"]
+                )
+
+    return dependencies
+
+
+def setup_test_environment(source_path: str, tmpdir: str) -> Tuple[Optional[Path], Optional[List[Path]], Optional[str]]:
     """Set up test environment and discover dependencies.
 
     Returns:
-        (project_root, dependency_files, error_message, dependencies)
+        (project_root, dependency_files, error_message)
         dependency_files excludes the test file itself
-        dependencies is the parsed DependencyMapping dict from ritz.toml
     """
     # Copy helper files to temp directory
     test_dir = Path(source_path).parent
@@ -222,21 +186,60 @@ def setup_test_environment(source_path: str, tmpdir: str) -> Tuple[Optional[Path
             break
         search_dir = search_dir.parent
 
-    # Parse dependencies from ritz.toml (Issue #48)
-    dependencies = {}
+    # Parse dependencies from ritz.toml
+    dependencies = None
+    source_roots = None
     if project_root:
-        toml_path = project_root / "ritz.toml"
-        dependencies = parse_ritz_toml_dependencies(toml_path, project_root)
+        dependencies = parse_project_dependencies(project_root)
 
-    if project_root:
+        # Read source roots from project's ritz.toml
+        toml_path = project_root / "ritz.toml"
+        if toml_path.exists():
+            with open(toml_path, "rb") as f:
+                config = tomllib.load(f)
+            sources = get_sources_from_config(config)
+            source_roots = [str(project_root / s) for s in sources]
+
+        # Add ritzlib to source roots (from ritz project or RITZ_PATH)
+        ritz0_dir = Path(__file__).parent.resolve()
+        ritzlib_path = ritz0_dir.parent / "ritzlib"
+        # DEBUG: print(f"DEBUG: ritz0_dir={ritz0_dir}, ritzlib_path={ritzlib_path}, exists={ritzlib_path.exists()}", file=sys.stderr)
+        if ritzlib_path.exists():
+            if source_roots is None:
+                source_roots = []
+            # Add the parent of ritzlib so imports like 'ritzlib.sys' work
+            source_roots.append(str(ritz0_dir.parent))
+
         # Symlink common source directories
-        for src_dir in ["lib", "src", "ritzlib"]:
+        for src_dir in ["lib", "src"]:
             src_path = project_root / src_dir
             if src_path.exists():
                 real_path = src_path.resolve()
                 link_path = Path(tmpdir) / src_dir
                 if not link_path.exists():
                     os.symlink(real_path, link_path)
+
+        # Symlink ritzlib - try project root first, then RITZ_PATH
+        ritzlib_link = Path(tmpdir) / "ritzlib"
+        if not ritzlib_link.exists():
+            ritzlib_path = project_root / "ritzlib"
+            if ritzlib_path.exists():
+                os.symlink(ritzlib_path.resolve(), ritzlib_link)
+            else:
+                # Try to find ritzlib from RITZ_PATH or parent directories
+                ritz_path_env = os.environ.get("RITZ_PATH", "")
+                for p in ritz_path_env.split(":"):
+                    if p:
+                        ritzlib_candidate = Path(p) / "ritzlib"
+                        if ritzlib_candidate.exists():
+                            os.symlink(ritzlib_candidate.resolve(), ritzlib_link)
+                            break
+                else:
+                    # Fallback: look for ritzlib relative to this file (test_runner.py)
+                    ritz0_dir = Path(__file__).parent
+                    ritzlib_candidate = ritz0_dir.parent / "ritzlib"
+                    if ritzlib_candidate.exists():
+                        os.symlink(ritzlib_candidate.resolve(), ritzlib_link)
 
     # Discover dependencies using a dummy harness
     original_source = Path(source_path).read_text()
@@ -249,21 +252,20 @@ def setup_test_environment(source_path: str, tmpdir: str) -> Tuple[Optional[Path
         source_files = collect_all_source_files(
             dummy_path,
             project_root=str(project_root) if project_root else None,
-            dependencies=dependencies if dependencies else None
+            dependencies=dependencies,
+            source_roots=source_roots
         )
         # Remove the dummy harness from the list
         source_files = [f for f in source_files if Path(f).name != "dummy_harness.ritz"]
-        return project_root, source_files, None, dependencies
+        return project_root, source_files, None
     except Exception as e:
-        return None, None, f"Import resolution failed: {e}", None
+        return None, None, f"Import resolution failed: {e}"
 
 
 def compile_dependencies(
     source_files: List[Path],
     tmpdir: str,
-    ll_cache: dict,
-    dependencies: Dict[str, DependencyMapping] = None,
-    project_root: Path = None
+    ll_cache: dict
 ) -> Tuple[List[str], Optional[str]]:
     """Compile dependencies to LLVM IR, using cache when possible.
 
@@ -271,13 +273,10 @@ def compile_dependencies(
         source_files: List of source files to compile
         tmpdir: Temp directory for .ll files
         ll_cache: Dict mapping source path -> compiled .ll path (shared across tests)
-        dependencies: ritz.toml dependency mappings for import resolution
-        project_root: Project root directory
 
     Returns:
         (ll_files, error_message)
     """
-    import json
     ritz0_dir = Path(__file__).parent
     ritz0_py = ritz0_dir / "ritz0.py"
     ll_files = []
@@ -296,19 +295,6 @@ def compile_dependencies(
         ll_path = os.path.join(tmpdir, f"{src_name}.ll")
 
         compile_cmd = [sys.executable, str(ritz0_py), str(src), "-o", ll_path, "--no-runtime"]
-
-        # Pass dependencies to ritz0 if provided (Issue #48)
-        if dependencies:
-            deps_json = {
-                name: {"path": str(spec.path), "sources": spec.sources}
-                for name, spec in dependencies.items()
-            }
-            compile_cmd.extend(["--deps", json.dumps(deps_json)])
-
-        # Pass project root if provided
-        if project_root:
-            compile_cmd.extend(["--project-root", str(project_root)])
-
         result = subprocess.run(compile_cmd, capture_output=True, text=True)
         if result.returncode != 0:
             return None, f"ritz0 failed for {Path(src).name}: {result.stderr}"
@@ -326,8 +312,7 @@ def compile_test(
     lib_files: List[str] = None,
     ll_cache: dict = None,
     dep_ll_files: List[str] = None,
-    project_root: Path = None,
-    dependencies: Dict[str, DependencyMapping] = None
+    project_root: Path = None
 ) -> Tuple[Optional[str], Optional[str]]:
     """Compile a single test to a binary using proper separate compilation.
 
@@ -339,7 +324,6 @@ def compile_test(
         ll_cache: Optional cache of compiled .ll files (for reuse across tests)
         dep_ll_files: Pre-compiled dependency .ll files (if already compiled)
         project_root: Project root (if already determined)
-        dependencies: ritz.toml dependency mappings for import resolution
 
     Returns:
         (exe_path, error_message) - exe_path is None on failure
@@ -364,7 +348,6 @@ fn main() -> i32
 
     # If we have pre-compiled dependencies, just compile the harness
     if dep_ll_files is not None:
-        import json as json_module
         ll_files = list(dep_ll_files)
 
         # Compile the test harness (with runtime since it has main)
@@ -372,19 +355,6 @@ fn main() -> i32
         harness_ll = os.path.join(tmpdir, f"harness_{harness_hash}.ll")
 
         compile_cmd = [sys.executable, str(ritz0_py), test_file_path, "-o", harness_ll]
-
-        # Pass dependencies to ritz0 for harness compilation (Issue #48)
-        if dependencies:
-            deps_json = {
-                name: {"path": str(spec.path), "sources": spec.sources}
-                for name, spec in dependencies.items()
-            }
-            compile_cmd.extend(["--deps", json_module.dumps(deps_json)])
-
-        # Pass project root for import resolution
-        if project_root:
-            compile_cmd.extend(["--project-root", str(project_root)])
-
         result = subprocess.run(compile_cmd, capture_output=True, text=True)
         if result.returncode != 0:
             return None, f"ritz0 failed for harness: {result.stderr}"
@@ -418,16 +388,10 @@ fn main() -> i32
                     if not link_path.exists():
                         os.symlink(real_path, link_path)
 
-        # Parse dependencies from ritz.toml if not provided
-        if dependencies is None and project_root:
-            toml_path = project_root / "ritz.toml"
-            dependencies = parse_ritz_toml_dependencies(toml_path, project_root)
-
         try:
             source_files = collect_all_source_files(
                 test_file_path,
-                project_root=str(project_root) if project_root else None,
-                dependencies=dependencies if dependencies else None
+                project_root=str(project_root) if project_root else None
             )
         except Exception as e:
             return None, f"Import resolution failed: {e}"
@@ -503,7 +467,7 @@ def run_test_file(source_path: str, verbose: bool = False, lib_files: List[str] 
         if verbose:
             print(f"  Compiling dependencies for {len(tests)} tests...", flush=True)
 
-        project_root, dep_files, error, dependencies = setup_test_environment(source_path, tmpdir)
+        project_root, dep_files, error = setup_test_environment(source_path, tmpdir)
         if error:
             # Fall back to per-test compilation on setup error
             if verbose:
@@ -513,11 +477,7 @@ def run_test_file(source_path: str, verbose: bool = False, lib_files: List[str] 
 
         # Step 2: Compile all dependencies ONCE
         ll_cache = {}
-        dep_ll_files, error = compile_dependencies(
-            dep_files or [], tmpdir, ll_cache,
-            dependencies=dependencies,
-            project_root=project_root
-        )
+        dep_ll_files, error = compile_dependencies(dep_files or [], tmpdir, ll_cache)
         if error:
             if verbose:
                 print(f"  Warning: {error}, falling back to per-test compilation")
@@ -537,8 +497,7 @@ def run_test_file(source_path: str, verbose: bool = False, lib_files: List[str] 
                     lib_files,
                     ll_cache=ll_cache,
                     dep_ll_files=dep_ll_files,
-                    project_root=project_root,
-                    dependencies=dependencies  # Issue #48: Pass dependencies for import resolution
+                    project_root=project_root
                 )
 
                 if error:

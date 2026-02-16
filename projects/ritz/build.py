@@ -1220,10 +1220,11 @@ def run_tests(pkg_dir: Path, config: dict) -> bool:
     # Collect all .ritz test files
     ritz_tests = []
 
-    # Check test/ subdirectory
-    test_dir = pkg_dir / "test"
-    if test_dir.exists():
-        ritz_tests.extend(test_dir.glob("*.ritz"))
+    # Check test/ and tests/ subdirectories
+    for subdir in ["test", "tests"]:
+        test_dir = pkg_dir / subdir
+        if test_dir.exists():
+            ritz_tests.extend(test_dir.glob("*.ritz"))
 
     # For test-only packages, also check package root for test_*.ritz files
     is_test_only = config.get("build", {}).get("test_only", False)
