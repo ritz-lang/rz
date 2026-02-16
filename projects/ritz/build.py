@@ -866,7 +866,8 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
 
         # Link: runtime.o + all .bc/.ll files -> binary
         # Build link command with profile-specific options
-        link_cmd = linker_cmd + [str(runtime_obj)] + [str(f) for f in link_files] + ["-o", str(bin_path), "-nostdlib"]
+        # Use -march=native to enable CPU features like SHA-NI, AVX2, etc.
+        link_cmd = linker_cmd + [str(runtime_obj)] + [str(f) for f in link_files] + ["-o", str(bin_path), "-nostdlib", "-march=native"]
 
         # Add optimization level
         opt_level = profile.get("opt_level", 0)
