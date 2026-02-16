@@ -1,16 +1,237 @@
 # Initramfs Loader
 #
 # Loads an initial filesystem at boot time.
-# For now, this creates a minimal test filesystem.
-# Future: Load from multiboot module or VirtIO disk.
+#
+# Supports two modes:
+# 1. Embedded: Hardcoded files compiled into kernel (fallback)
+# 2. Disk: Load TAR archive from VirtIO block device
+#
+# The TAR archive on the initramfs disk contains:
+#   /bin/init        - First userspace process (ELF)
+#   /etc/hostname    - System hostname
+#   /etc/motd        - Message of the day
+#   ... other files
 
-import serial { StrView, prints, println, serial_print_dec }
+import serial { StrView, prints, println, serial_print_dec, serial_print_hex }
 import fs.kblob { KBlobStore, kblob_get_store, kblob_store_put }
 import fs.knamespace { KNamespace, knamespace_get, knamespace_mkdir, knamespace_write, KNS_OK }
 import fs.kpath { strview_from_ptr }
+import fs.tar { TarEntry, TAR_ENTRY_SIZE, TAR_BLOCK_SIZE, TAR_TYPE_FILE, TAR_TYPE_FILE_ALT, TAR_TYPE_DIRECTORY, tar_parse_header, tar_get_size, tar_data_blocks, tar_print_entry }
+import drivers.virtio.blk { VirtioBlkDevice, virtio_blk_get_device, virtio_blk_read }
+import mm.heap { kalloc, kfree }
 
 # ============================================================================
-# Embedded Initramfs
+# Configuration
+# ============================================================================
+
+# Maximum file size we'll load from TAR (prevent memory exhaustion)
+const MAX_FILE_SIZE: u64 = 4194304   # 4 MB
+
+# Read buffer size (must be multiple of 512)
+const READ_BUFFER_SECTORS: u32 = 7   # 3584 bytes per read
+const READ_BUFFER_SIZE: u64 = 3584   # 7 * 512
+
+# ============================================================================
+# Load from VirtIO Disk
+# ============================================================================
+
+# Load initramfs from the first VirtIO block device
+# The disk contains a raw TAR archive (no partition table)
+pub fn initramfs_load_from_disk() -> i32
+    let dev: *VirtioBlkDevice = virtio_blk_get_device()
+    if dev == 0 as *VirtioBlkDevice
+        prints("[initramfs] No VirtIO block device\n" as StrView)
+        return -1
+
+    let ns: *KNamespace = knamespace_get()
+    if ns == 0 as *KNamespace
+        prints("[initramfs] No namespace\n" as StrView)
+        return -2
+
+    prints("[initramfs] Loading from VirtIO disk...\n" as StrView)
+
+    # Allocate read buffer
+    let read_buf: *u8 = kalloc(READ_BUFFER_SIZE) as *u8
+    if read_buf == 0 as *u8
+        prints("[initramfs] Failed to allocate read buffer\n" as StrView)
+        return -3
+
+    var sector: u64 = 0              # Current sector in archive
+    var entries_loaded: i32 = 0
+    var empty_blocks: i32 = 0        # Count consecutive empty blocks
+
+    # Read loop - process TAR entries
+    while empty_blocks < 2
+        # Read one TAR header block (512 bytes = 1 sector)
+        let result: i32 = virtio_blk_read(dev, sector, 1, read_buf)
+        if result != 0
+            prints("[initramfs] Read error at sector " as StrView)
+            serial_print_dec(sector)
+            prints("\n" as StrView)
+            kfree(read_buf)
+            return -4
+
+        # Parse TAR header
+        var entry: TarEntry
+        let parse_result: i32 = tar_parse_header(read_buf, @entry)
+
+        if parse_result == -1
+            # Empty block (end marker)
+            empty_blocks = empty_blocks + 1
+            sector = sector + 1
+            continue
+        else if parse_result < 0
+            # Invalid header
+            prints("[initramfs] Invalid TAR header at sector " as StrView)
+            serial_print_dec(sector)
+            prints("\n" as StrView)
+            kfree(read_buf)
+            return -5
+
+        # Reset empty block counter
+        empty_blocks = 0
+
+        # Calculate data blocks
+        entry.data_offset = (sector + 1) * 512  # Data starts after header
+        let data_blocks: u64 = tar_data_blocks(entry.size)
+
+        # Debug: print entry
+        prints("  " as StrView)
+        tar_print_entry(@entry)
+
+        # Process entry based on type
+        if entry.entry_type == TAR_TYPE_DIRECTORY
+            # Create directory
+            let path: StrView = strview_from_ptr(@entry.name[0], entry.name_len as i64)
+            process_directory(ns, @path)
+
+        else if entry.entry_type == TAR_TYPE_FILE or entry.entry_type == TAR_TYPE_FILE_ALT
+            # Load file
+            if entry.size <= MAX_FILE_SIZE
+                let load_result: i32 = load_file_from_tar(dev, ns, @entry, sector + 1)
+                if load_result == 0
+                    entries_loaded = entries_loaded + 1
+            else
+                prints("    (skipped: too large)\n" as StrView)
+
+        # Move to next entry
+        sector = sector + 1 + data_blocks
+
+    kfree(read_buf)
+
+    prints("[initramfs] Loaded " as StrView)
+    serial_print_dec(entries_loaded as u64)
+    prints(" files from disk\n" as StrView)
+
+    if entries_loaded > 0
+        return 0
+    else
+        return -6  # No files loaded
+
+# Convert TAR path "./foo/bar" to absolute path "/foo/bar"
+# Returns the path length (or 0 if path is root)
+fn tar_to_absolute_path(tar_path: *StrView, out_buf: *u8, max_len: i64) -> i64
+    var start: i64 = 0
+    var len: i64 = (*tar_path).len
+
+    # Skip leading "./" if present
+    if len >= 2 and *((*tar_path).ptr) == 46 and *((*tar_path).ptr + 1) == 47
+        start = 1  # Keep the leading "/" (skip just the ".")
+        len = len - 1
+
+    # Remove trailing slash if present
+    while len > 0 and *((*tar_path).ptr + start + len - 1) == 47
+        len = len - 1
+
+    # After stripping, "." becomes "" - that's root
+    if len == 0 or (len == 1 and *((*tar_path).ptr + start) == 46)
+        return 0  # Root path
+
+    # Build the path with leading /
+    *out_buf = 47  # '/'
+
+    var i: i64 = 0
+    while i < len and i < max_len - 2
+        *(out_buf + i + 1) = *((*tar_path).ptr + start + i)
+        i = i + 1
+    *(out_buf + i + 1) = 0
+
+    i + 1
+
+# Load a file's data from TAR archive
+fn load_file_from_tar(dev: *VirtioBlkDevice, ns: *KNamespace, entry: *TarEntry, data_sector: u64) -> i32
+    let size: u64 = (*entry).size
+
+    # Convert TAR path to absolute path
+    var abs_path_buf: [256]u8
+    let tar_path: StrView = strview_from_ptr(@(*entry).name[0], (*entry).name_len as i64)
+    let abs_len: i64 = tar_to_absolute_path(@tar_path, @abs_path_buf[0], 256)
+
+    if abs_len == 0
+        return 0  # Skip root entry
+
+    let abs_path: StrView = strview_from_ptr(@abs_path_buf[0], abs_len)
+
+    if size == 0
+        # Empty file
+        let empty: u8 = 0
+        return knamespace_write(ns, @abs_path, @empty as *u8, 0)
+
+    # Allocate buffer for file contents
+    let file_buf: *u8 = kalloc(size) as *u8
+    if file_buf == 0 as *u8
+        prints("    (failed to allocate " as StrView)
+        serial_print_dec(size)
+        prints(" bytes)\n" as StrView)
+        return -1
+
+    # Read file data sector by sector
+    var bytes_read: u64 = 0
+    var current_sector: u64 = data_sector
+
+    while bytes_read < size
+        # Calculate how many sectors to read (max 7 at a time due to DMA buffer)
+        let remaining: u64 = size - bytes_read
+        var sectors_to_read: u32 = 7
+        if remaining < 3584
+            sectors_to_read = ((remaining + 511) / 512) as u32
+            if sectors_to_read == 0
+                sectors_to_read = 1
+
+        # Read sectors
+        let result: i32 = virtio_blk_read(dev, current_sector, sectors_to_read, file_buf + bytes_read as i64)
+        if result != 0
+            prints("    (read error)\n" as StrView)
+            kfree(file_buf)
+            return -2
+
+        bytes_read = bytes_read + (sectors_to_read as u64 * 512)
+        current_sector = current_sector + sectors_to_read as u64
+
+    # Create file in namespace
+    let write_result: i32 = knamespace_write(ns, @abs_path, file_buf, size)
+
+    kfree(file_buf)
+
+    if write_result == KNS_OK
+        return 0
+    else
+        return -3
+
+# Process a directory entry
+# TAR paths are like "./var/log/" - we need to convert to "/var/log"
+fn process_directory(ns: *KNamespace, path: *StrView) -> i32
+    var abs_path_buf: [256]u8
+    let abs_len: i64 = tar_to_absolute_path(path, @abs_path_buf[0], 256)
+
+    if abs_len == 0
+        return 0  # Root directory, nothing to create
+
+    let abs_path: StrView = strview_from_ptr(@abs_path_buf[0], abs_len)
+    knamespace_mkdir(ns, @abs_path)
+
+# ============================================================================
+# Embedded Initramfs (Fallback)
 # ============================================================================
 #
 # For initial testing, we embed a minimal filesystem directly in the kernel.
@@ -20,22 +241,22 @@ import fs.kpath { strview_from_ptr }
 #   /bin/init         - Init script placeholder
 #   /var/log/         - Log directory
 
-# Create the initial filesystem structure
-pub fn initramfs_load() -> i32
+# Create the initial filesystem structure (embedded fallback)
+pub fn initramfs_load_embedded() -> i32
     let ns: *KNamespace = knamespace_get()
     if ns == 0 as *KNamespace
-        prints("initramfs: no namespace\n" as StrView)
+        prints("[initramfs] No namespace\n" as StrView)
         return -1
 
-    prints("initramfs: creating initial filesystem...\n" as StrView)
+    prints("[initramfs] Creating embedded filesystem...\n" as StrView)
 
     # Create directories
-    create_dir(ns, "/etc")
-    create_dir(ns, "/bin")
-    create_dir(ns, "/var")
-    create_dir(ns, "/var/log")
-    create_dir(ns, "/tmp")
-    create_dir(ns, "/home")
+    create_dir(ns, c"/etc")
+    create_dir(ns, c"/bin")
+    create_dir(ns, c"/var")
+    create_dir(ns, c"/var/log")
+    create_dir(ns, c"/tmp")
+    create_dir(ns, c"/home")
 
     # Create /etc/hostname
     var hostname: [16]u8
@@ -47,7 +268,7 @@ pub fn initramfs_load() -> i32
     hostname[5] = 110   # n
     hostname[6] = 100   # d
     hostname[7] = 10    # \n
-    create_file(ns, "/etc/hostname", @hostname[0], 8)
+    create_file(ns, c"/etc/hostname", @hostname[0], 8)
 
     # Create /etc/motd - Message of the Day
     # "Welcome to Harland!\nGoliath filesystem initialized.\n"
@@ -58,7 +279,7 @@ pub fn initramfs_load() -> i32
         motd[i] = *(motd_str.ptr + i)
         i = i + 1
     motd[i] = 0
-    create_file(ns, "/etc/motd", @motd[0], motd_str.len as u64)
+    create_file(ns, c"/etc/motd", @motd[0], motd_str.len as u64)
 
     # Create /bin/init placeholder
     var init_content: [32]u8
@@ -68,7 +289,7 @@ pub fn initramfs_load() -> i32
         init_content[i] = *(init_str.ptr + i)
         i = i + 1
     init_content[i] = 0
-    create_file(ns, "/bin/init", @init_content[0], init_str.len as u64)
+    create_file(ns, c"/bin/init", @init_content[0], init_str.len as u64)
 
     # Create /var/log/boot.log
     var bootlog: [64]u8
@@ -78,10 +299,21 @@ pub fn initramfs_load() -> i32
         bootlog[i] = *(bootlog_str.ptr + i)
         i = i + 1
     bootlog[i] = 0
-    create_file(ns, "/var/log/boot.log", @bootlog[0], bootlog_str.len as u64)
+    create_file(ns, c"/var/log/boot.log", @bootlog[0], bootlog_str.len as u64)
 
-    prints("initramfs: done\n" as StrView)
+    prints("[initramfs] Embedded filesystem ready\n" as StrView)
     0
+
+# Main entry point - tries disk first, falls back to embedded
+pub fn initramfs_load() -> i32
+    # Try to load from VirtIO disk first
+    let disk_result: i32 = initramfs_load_from_disk()
+    if disk_result == 0
+        return 0
+
+    # Fall back to embedded filesystem
+    prints("[initramfs] Disk load failed, using embedded fallback\n" as StrView)
+    initramfs_load_embedded()
 
 # Helper to create a directory
 fn create_dir(ns: *KNamespace, path_str: *u8) -> i32
@@ -126,31 +358,3 @@ fn create_file(ns: *KNamespace, path_str: *u8, data: *u8, size: u64) -> i32
         prints(" bytes)\n" as StrView)
 
     result
-
-# ============================================================================
-# Future: Load from Multiboot Module
-# ============================================================================
-#
-# When the kernel is loaded via GRUB with a module:
-#   multiboot2 /boot/harland.elf
-#   module2 /boot/initramfs.tar
-#
-# We parse the multiboot info to find the module and load it.
-
-# pub fn initramfs_load_from_multiboot(mb_info: *Mb2BootInfo) -> i32
-#     # Find MODULE tag
-#     # Parse tar archive
-#     # Create files/directories in namespace
-#     0
-
-# ============================================================================
-# Future: Load from VirtIO Disk
-# ============================================================================
-#
-# For disk-based boot, we can load a filesystem image from a partition.
-
-# pub fn initramfs_load_from_disk() -> i32
-#     # Read from VirtIO block device
-#     # Parse filesystem format (tar, cpio, etc.)
-#     # Populate namespace
-#     0

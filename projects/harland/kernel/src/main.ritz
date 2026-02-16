@@ -32,7 +32,7 @@ import fs.kblob { KBlobId, kblob_init, kblob_get_store, kblob_store_put, kblob_s
 import fs.vfs { vfs_init, fd_table_init }
 import fs.knamespace { knamespace_init, knamespace_get, knamespace_mkdir, knamespace_write, knamespace_read, knamespace_exists, KNS_OK }
 import fs.syscall { fs_syscall_init, sys_open, sys_close, sys_fs_read, sys_fs_write, sys_lseek, is_fs_fd }
-import fs.initramfs { initramfs_load }
+import fs.initramfs { initramfs_load, initramfs_load_embedded }
 
 # ============================================================================
 # Kernel Ring Buffer (Early Boot Debug)
@@ -5017,14 +5017,12 @@ pub fn kernel_main(boot_info_addr: u64) -> i32
 
     # Initialize Kernel Heap
     klog(c"  [..] Kernel heap")
-    let heap_result: i32 = heap_init(32)  # 128KB initial heap
+    let heap_result: i32 = heap_init(256)  # 1MB initial heap
     if heap_result == 0
         klog(c"\r  [OK] Kernel heap\n")
-        prints("      Initial size: ")
-        serial_print_dec(heap_get_used())
-        prints(" bytes (")
+        prints("      Size: ")
         serial_print_dec(heap_get_used() / 1024)
-        prints(" KB)\n")
+        prints(" KB\n")
     else
         klog(c"\r  [!!] Kernel heap (init failed)\n")
 
@@ -5037,6 +5035,19 @@ pub fn kernel_main(boot_info_addr: u64) -> i32
     vfs_init()
     fd_table_init()
     klog(c"\r  [OK] VFS layer\n")
+
+    # Initialize PCI early (needed for VirtIO block device)
+    klog(c"  [..] PCI enumeration (early)")
+    let pci_count_early: i32 = pci_init()
+    klog(c"\r  [OK] PCI enumeration (early)\n")
+
+    # Initialize VirtIO block device (needed for initramfs loading)
+    klog(c"  [..] VirtIO block device")
+    let early_blk_dev: *VirtioBlkDevice = virtio_blk_init()
+    if early_blk_dev != 0 as *VirtioBlkDevice
+        klog(c"\r  [OK] VirtIO block device\n")
+    else
+        klog(c"\r  [..] VirtIO block device (not found)\n")
 
     # Initialize kernel namespace (Goliath integration)
     klog(c"  [..] Kernel namespace")
@@ -5051,8 +5062,10 @@ pub fn kernel_main(boot_info_addr: u64) -> i32
         klog(c"\r  [OK] Filesystem syscalls\n")
 
         # Load initial filesystem
+        # TODO: Fix heap corruption during TAR loading from VirtIO disk.
+        # For now, use embedded filesystem to avoid the issue.
         klog(c"  [..] Initial filesystem")
-        initramfs_load()
+        initramfs_load_embedded()
         klog(c"\r  [OK] Initial filesystem\n")
 
         # Test filesystem operations
@@ -5325,13 +5338,8 @@ pub fn kernel_main(boot_info_addr: u64) -> i32
     syscall_init()
     prints("\r  [OK] Syscall interface\n")
 
-    # Initialize PCI subsystem
-    prints("  [..] PCI enumeration")
-    let pci_count: i32 = pci_init()
-    prints("\r  [OK] PCI enumeration\n")
-
-    # Print all discovered PCI devices
-    prints("\n")
+    # PCI already initialized early - just print discovered devices
+    prints("\n=== PCI Devices ===\n")
     pci_print_all_devices()
 
     # Check for VirtIO network device
@@ -5412,11 +5420,13 @@ pub fn kernel_main(boot_info_addr: u64) -> i32
     else
         prints("\n  No VirtIO Network device found.\n")
 
-    # Initialize VirtIO Block device (for filesystem support)
+    # VirtIO Block device already initialized early (for initramfs loading)
+    # Just run a test if it's available
     prints("\n=== VirtIO Block Device ===\n")
-    let blk_dev: *VirtioBlkDevice = virtio_blk_init()
+    let blk_dev: *VirtioBlkDevice = virtio_blk_get_device()
     if blk_dev != 0 as *VirtioBlkDevice
-        # Run a basic read test
+        prints("  (already initialized for initramfs)\n")
+        # Run a basic read test to verify it's still working
         virtio_blk_test(blk_dev)
     else
         prints("  No VirtIO Block device found (add -drive to QEMU)\n")
