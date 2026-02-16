@@ -146,6 +146,16 @@ def find_ritz_sources(src_dir: Path) -> list[Path]:
         "cap/syscall.ritz",            # Depends on: serial, cap/types, cap/table
         "drivers/virtio/common.ritz",  # VirtIO common layer
         "drivers/virtio/blk.ritz",     # VirtIO block device driver
+        # Filesystem modules (Goliath + VFS)
+        "fs/kpath.ritz",               # Path handling (no deps)
+        "fs/kdir_entry.ritz",          # Directory entry structure (no deps)
+        "fs/backend.ritz",             # Backend types (no deps)
+        "fs/kblob.ritz",               # Blob storage layer
+        "fs/knamespace.ritz",          # Namespace layer (legacy, blob-backed)
+        "fs/namespace.ritz",           # In-memory namespace tree (new!)
+        "fs/vfs.ritz",                 # VFS layer
+        "fs/syscall.ritz",             # Filesystem syscalls
+        "fs/initramfs.ritz",           # Initramfs loader
         # arch/x86_64 modules need syntax updates before enabling
         "main.ritz",                   # Depends on: all of the above
     ]
