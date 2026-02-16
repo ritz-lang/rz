@@ -1,14 +1,20 @@
 # Tome TODO
 
-## Phase 10: Authentication (In Progress)
+## Phase 10: Authentication (Complete)
 - [x] AUTH command implementation (password-based)
 - [x] Server-side per-connection auth state (integrate with TomeServer)
 - [x] Password authentication (via g_password global)
-- [ ] Requirepass config via CLI flag (--password)
+- [x] Requirepass config via CLI flag (--password)
 - [ ] Pluggable authentication backend interface
 - [ ] JWT authentication with trusted issuer verification
 - [ ] OIDC authentication support
 - [ ] ACL system for command-level permissions
+
+## Phase 10.5: WSL/Compatibility Mode (Complete)
+- [x] Blocking server mode (`-b, --blocking`) for WSL/older kernels
+- [x] Traditional accept/recv/send without io_uring
+- [x] Single-threaded, one client at a time (suitable for dev/testing)
+- [ ] Multi-client blocking mode with fork() or threads
 
 ## Phase 11: Multi-Process Scaling (In Progress)
 - [x] Master process with worker spawning (fork + SO_REUSEPORT)
@@ -19,8 +25,8 @@
 - [ ] Connection draining on worker restart
 
 ## Known Issues
+- [x] io_uring not supported on WSL (workaround: `--blocking` mode)
 - [ ] LLVM 20 crash in SelectionDAGISel when building async_tasks.ll (workaround: use -O1)
-- [ ] io_uring returns -22 (EINVAL) on accept - may be sandbox restriction
 
 ## Phase 12: Shared Memory Store (Optional)
 - [ ] Design lock-free or spinlock-based Store

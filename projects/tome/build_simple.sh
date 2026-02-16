@@ -7,16 +7,18 @@ set -e
 
 cd "$(dirname "$0")"
 
-# Use the flat ecosystem structure
-RITZ_LANG_DIR="${RITZ_PATH:-/home/aaron/dev/ritz-lang}"
+# Monorepo structure: projects/ritz, projects/tome, etc.
+# Find the monorepo root (parent of projects directory)
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+MONOREPO_ROOT="${SCRIPT_DIR}/../.."
+PROJECTS_DIR="${MONOREPO_ROOT}/projects"
 
-# Set RITZ_PATH for import resolution
-# Put the ecosystem ritz FIRST to avoid finding nested submodule
-export RITZ_PATH="$RITZ_LANG_DIR/ritz:."
+# Set RITZ_PATH for import resolution (projects directory for cross-project imports)
+export RITZ_PATH="$PROJECTS_DIR/ritz:$SCRIPT_DIR"
 
-RITZ0="python3 $RITZ_LANG_DIR/ritz/ritz0/ritz0.py"
-LIST_DEPS="python3 $RITZ_LANG_DIR/ritz/ritz0/list_deps.py"
-RUNTIME="$RITZ_LANG_DIR/ritz/runtime/ritz_start.x86_64.o"
+RITZ0="python3 $PROJECTS_DIR/ritz/ritz0/ritz0.py"
+LIST_DEPS="python3 $PROJECTS_DIR/ritz/ritz0/list_deps.py"
+RUNTIME="$PROJECTS_DIR/ritz/runtime/ritz_start.x86_64.o"
 
 # Create build directory
 mkdir -p build
@@ -58,9 +60,6 @@ case "${1:-all}" in
     server)
         compile_binary "bin/tome_server.ritz" "tome-server"
         ;;
-    server-blocking)
-        compile_binary "bin/tome_server_blocking.ritz" "tome-server-blocking"
-        ;;
     cli)
         compile_binary "bin/tome_cli.ritz" "tome-cli"
         ;;
@@ -71,12 +70,11 @@ case "${1:-all}" in
         ;;
     all)
         compile_binary "bin/tome_server.ritz" "tome-server"
-        compile_binary "bin/tome_server_blocking.ritz" "tome-server-blocking"
         compile_binary "bin/tome_cli.ritz" "tome-cli"
         compile_binary "test/run_tests.ritz" "run_tests"
         ;;
     *)
-        echo "Usage: $0 [server|server-blocking|cli|tests|all]"
+        echo "Usage: $0 [server|cli|tests|all]"
         exit 1
         ;;
 esac

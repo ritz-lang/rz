@@ -1,0 +1,191 @@
+# lib/blocking_server.ritz - Blocking TCP server for WSL/compatibility
+#
+# This server uses traditional blocking I/O instead of io_uring.
+# It's slower but works on WSL and older Linux kernels.
+#
+# Architecture:
+#   - Single-threaded, synchronous event loop
+#   - Blocking accept/recv/send calls
+#   - One client at a time (can be extended with fork or threads later)
+#
+# Usage:
+#   var server: BlockingTomeServer
+#   blocking_server_init(@server, 6379)
+#   blocking_server_run(@server)
+
+import ritzlib.memory
+import ritzlib.str
+import ritzlib.string
+import ritzlib.strview
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.async_net
+import lib.tome
+import lib.resp
+import lib.commands
+
+
+# ============================================================================
+# Buffer sizes
+# ============================================================================
+
+const RECV_BUFFER_SIZE: i32 = 4096
+const SEND_BUFFER_SIZE: i32 = 4096
+
+
+# ============================================================================
+# Connection State (same as async server)
+# ============================================================================
+
+pub struct BlockingConnectionState
+    is_authenticated: i32    # 1 if client has successfully AUTH'd
+
+
+fn blk_conn_state_init(state: @BlockingConnectionState)
+    state.is_authenticated = 0
+
+
+# ============================================================================
+# Global Configuration (blocking server specific)
+# ============================================================================
+# Note: For authentication, use blocking_server_set_password() which stores
+# the password in a module-local variable. This keeps blocking_server
+# independent of the async server module.
+
+var g_blk_password: *u8    # Required password (null = no auth required)
+var g_blk_store: Store     # Store for blocking server
+var g_blk_running: i32     # Server running flag
+
+
+# Set server password (call before accepting connections)
+pub fn blocking_server_set_password(password: *u8)
+    g_blk_password = password
+
+
+# ============================================================================
+# Client Handler
+# ============================================================================
+# Handles a single client connection until it closes.
+# Returns 0 on clean close, negative on error.
+
+fn handle_client(client_fd: i32) -> i32
+    var recv_buf: [4096]u8
+    var send_buf: [4096]u8
+    var conn_state: BlockingConnectionState
+    blk_conn_state_init(@conn_state)
+
+    loop
+        # Read command from client (blocking)
+        let n: i64 = sys_read(client_fd, @recv_buf[0], RECV_BUFFER_SIZE as i64)
+        if n <= 0
+            # Connection closed or error
+            return n as i32
+
+        # Parse RESP command
+        var parser: RespParser
+        resp_parser_init(@parser, @recv_buf[0], n)
+
+        let parse_result: i32 = resp_parse(@parser)
+        if parse_result == RESP_ERROR_PARSE
+            # Protocol error - send error and continue
+            let err_msg: StrView = "ERR protocol error"
+            let err_len: i32 = resp_write_error_sv(@send_buf[0], @err_msg)
+            sys_write(client_fd, @send_buf[0], err_len as i64)
+            continue
+
+        if parse_result == RESP_INCOMPLETE
+            # Need more data - for now just return error
+            # TODO: Implement buffering for partial commands
+            let err_msg: StrView = "ERR incomplete command"
+            let err_len: i32 = resp_write_error_sv(@send_buf[0], @err_msg)
+            sys_write(client_fd, @send_buf[0], err_len as i64)
+            continue
+
+        # Execute command with auth context
+        var ctx: CommandContext
+        cmd_ctx_init_auth(@ctx, @g_blk_store, @send_buf[0], SEND_BUFFER_SIZE, g_blk_password, conn_state.is_authenticated)
+        cmd_dispatch(@ctx, @parser.command)
+
+        # Update auth state
+        conn_state.is_authenticated = ctx.is_authenticated
+
+        # Send response (blocking)
+        let sent: i64 = sys_write(client_fd, @send_buf[0], ctx.resp_len as i64)
+        if sent < 0
+            return sent as i32
+
+    return 0
+
+
+# ============================================================================
+# Server
+# ============================================================================
+
+pub struct BlockingTomeServer
+    listen_fd: i32
+    port: i32
+
+
+pub fn blocking_server_init(srv: @BlockingTomeServer, port: i32) -> i32
+    srv.port = port
+
+    # Initialize store
+    g_blk_store = store_new()
+    g_blk_running = 1
+
+    # Create TCP socket
+    let fd: i32 = tcp_socket()
+    if fd < 0
+        return fd
+
+    # Set socket options
+    set_reuseaddr(fd)
+    set_reuseport(fd)
+
+    # Bind
+    let bind_ret: i32 = tcp_bind(fd, 0, port)
+    if bind_ret < 0
+        sys_close(fd)
+        return bind_ret
+
+    # Listen
+    let listen_ret: i32 = tcp_listen(fd, 128)
+    if listen_ret < 0
+        sys_close(fd)
+        return listen_ret
+
+    srv.listen_fd = fd
+    return 0
+
+
+pub fn blocking_server_run(srv: @BlockingTomeServer) -> i32
+    var client_addr: [16]u8   # sockaddr_in is 16 bytes
+    var addrlen: i32 = 16
+
+    while g_blk_running == 1
+        # Accept connection (blocking)
+        let client_fd: i32 = sys_accept(srv.listen_fd, @client_addr[0], @addrlen)
+        if client_fd < 0
+            # Accept error - continue unless fatal
+            if client_fd == -4  # EINTR
+                continue
+            prints("Accept error: ")
+            print_int(client_fd as i64)
+            prints("\n")
+            continue
+
+        # Handle client (blocking - one at a time for now)
+        handle_client(client_fd)
+
+        # Close client connection
+        sys_close(client_fd)
+
+    return 0
+
+
+pub fn blocking_server_stop(srv: @BlockingTomeServer)
+    g_blk_running = 0
+
+
+pub fn blocking_server_destroy(srv: @BlockingTomeServer)
+    sys_close(srv.listen_fd)
