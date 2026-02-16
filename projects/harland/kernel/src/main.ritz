@@ -2385,6 +2385,7 @@ const ACPI_SIG_RSDP: u64 = 0x2052545020445352  # "RSD PTR " in little endian
 const ACPI_SIG_RSDT: u32 = 0x54445352  # "RSDT"
 const ACPI_SIG_XSDT: u32 = 0x54445358  # "XSDT"
 const ACPI_SIG_MADT: u32 = 0x43495041  # "APIC"
+const ACPI_SIG_FADT: u32 = 0x50434146  # "FACP" (Fixed ACPI Description Table)
 
 # RSDP (Root System Description Pointer) - ACPI 1.0
 struct AcpiRsdp
@@ -2464,15 +2465,80 @@ struct MadtIntSrcOverride
     gsi: u32
     flags: u16
 
+# FADT (Fixed ACPI Description Table) - Contains PM1a/PM1b control block addresses
+# Note: This is a simplified structure - full FADT is much larger
+struct AcpiFadt
+    header: AcpiTableHeader
+    firmware_ctrl: u32      # Physical address of FACS
+    dsdt: u32               # Physical address of DSDT
+    reserved1: u8
+    preferred_pm_profile: u8
+    sci_int: u16            # SCI interrupt vector
+    smi_cmd: u32            # SMI command port
+    acpi_enable: u8         # Value to write to SMI_CMD to enable ACPI
+    acpi_disable: u8        # Value to write to SMI_CMD to disable ACPI
+    s4bios_req: u8
+    pstate_cnt: u8
+    pm1a_evt_blk: u32       # PM1a Event Block address
+    pm1b_evt_blk: u32       # PM1b Event Block address
+    pm1a_cnt_blk: u32       # PM1a Control Block address (for shutdown)
+    pm1b_cnt_blk: u32       # PM1b Control Block address (for shutdown)
+    pm2_cnt_blk: u32
+    pm_tmr_blk: u32
+    gpe0_blk: u32
+    gpe1_blk: u32
+    pm1_evt_len: u8
+    pm1_cnt_len: u8
+    pm2_cnt_len: u8
+    pm_tmr_len: u8
+    gpe0_blk_len: u8
+    gpe1_blk_len: u8
+    gpe1_base: u8
+    cst_cnt: u8
+    p_lvl2_lat: u16
+    p_lvl3_lat: u16
+    flush_size: u16
+    flush_stride: u16
+    duty_offset: u8
+    duty_width: u8
+    day_alarm: u8
+    mon_alarm: u8
+    century: u8
+    iapc_boot_arch: u16     # IA-PC Boot Architecture Flags (ACPI 2.0+)
+    reserved2: u8
+    flags: u32
+    # ACPI 2.0+ extended fields follow...
+    reset_reg: [12]u8       # Generic Address Structure
+    reset_value: u8
+    arm_boot_arch: u16      # ARM Boot Architecture Flags (ACPI 5.1+)
+    fadt_minor_version: u8
+    x_firmware_ctrl: u64
+    x_dsdt: u64
+    x_pm1a_evt_blk: [12]u8
+    x_pm1b_evt_blk: [12]u8
+    x_pm1a_cnt_blk: [12]u8  # Extended PM1a Control Block
+    x_pm1b_cnt_blk: [12]u8  # Extended PM1b Control Block
+
+# ACPI PM1 control register bits
+const ACPI_SLP_TYP_S5: u16 = 0x1C00  # Sleep type for S5 (shutdown) - varies by system
+const ACPI_SLP_EN: u16 = 0x2000     # Sleep enable bit
+
 # Global ACPI state
 var acpi_rsdp_addr: u64 = 0  # Set from Multiboot2 or BIOS scan
 var acpi_rsdt_addr: u32 = 0
 var acpi_xsdt_addr: u64 = 0
 var acpi_madt_addr: u64 = 0
+var acpi_fadt_addr: u64 = 0
 var local_apic_addr: u64 = 0
 var io_apic_addr: u64 = 0
 var num_cpus: u32 = 0
 var cpu_apic_ids: [16]u8
+
+# ACPI power management state (from FADT)
+var acpi_pm1a_cnt_blk: u32 = 0  # PM1a Control Block I/O port
+var acpi_pm1b_cnt_blk: u32 = 0  # PM1b Control Block I/O port (optional)
+var acpi_slp_typa: u16 = 0      # Sleep type value for S5 (from \_S5 DSDT object)
+var acpi_slp_typb: u16 = 0      # Sleep type value for S5 PM1b (from \_S5 DSDT object)
 
 # Find ACPI RSDP from Multiboot2 tags
 fn acpi_find_from_multiboot(mb_info: *Mb2BootInfo) -> u64
@@ -2592,6 +2658,118 @@ fn acpi_find_madt() -> u64
 
     return 0
 
+# Find FADT in RSDT/XSDT
+fn acpi_find_fadt() -> u64
+    if acpi_xsdt_addr != 0
+        # Use XSDT (64-bit pointers)
+        let xsdt: *AcpiTableHeader = acpi_xsdt_addr as *AcpiTableHeader
+        let num_entries: u32 = ((*xsdt).length - 36) / 8
+        let entries: *u64 = (acpi_xsdt_addr + 36) as *u64
+
+        var i: u32 = 0
+        while i < num_entries
+            let entry_addr: u64 = *(entries + i as i64)
+            # Ensure this table is mapped before reading
+            if vmm_ensure_mapped(entry_addr, 64) != 0
+                i = i + 1
+                continue
+            let table: *AcpiTableHeader = entry_addr as *AcpiTableHeader
+            if (*table).signature == ACPI_SIG_FADT
+                return entry_addr
+            i = i + 1
+    else if acpi_rsdt_addr != 0
+        # Use RSDT (32-bit pointers)
+        let rsdt: *AcpiTableHeader = acpi_rsdt_addr as u64 as *AcpiTableHeader
+        let num_entries: u32 = ((*rsdt).length - 36) / 4
+        let entries: *u32 = (acpi_rsdt_addr as u64 + 36) as *u32
+
+        var i: u32 = 0
+        while i < num_entries
+            let entry_addr: u32 = *(entries + i as i64)
+            # Ensure this table is mapped before reading
+            if vmm_ensure_mapped(entry_addr as u64, 64) != 0
+                i = i + 1
+                continue
+            let table: *AcpiTableHeader = entry_addr as u64 as *AcpiTableHeader
+            if (*table).signature == ACPI_SIG_FADT
+                return entry_addr as u64
+            i = i + 1
+
+    return 0
+
+# Parse FADT to get PM1 control block addresses
+fn acpi_parse_fadt(fadt_addr: u64) -> i32
+    let fadt: *AcpiFadt = fadt_addr as *AcpiFadt
+
+    # Ensure the full FADT is mapped
+    let fadt_length: u64 = (*fadt).header.length as u64
+    if vmm_ensure_mapped(fadt_addr, fadt_length) != 0
+        prints("      ERROR: Failed to map FADT!\n")
+        return -1
+
+    # Get PM1a/PM1b Control Block addresses
+    acpi_pm1a_cnt_blk = (*fadt).pm1a_cnt_blk
+    acpi_pm1b_cnt_blk = (*fadt).pm1b_cnt_blk
+
+    prints("      PM1a Control Block: ")
+    serial_print_hex(acpi_pm1a_cnt_blk as u64)
+    prints("\n")
+
+    if acpi_pm1b_cnt_blk != 0
+        prints("      PM1b Control Block: ")
+        serial_print_hex(acpi_pm1b_cnt_blk as u64)
+        prints("\n")
+
+    # For QEMU, we need to determine SLP_TYP for S5 state
+    # The proper way is to parse DSDT's \_S5 object, but that requires AML parsing
+    # QEMU typically uses SLP_TYP = 0 for S5, but we'll try common values
+    # QEMU default: SLP_TYP_S5 = 0 (bits 10-12 = 0)
+    # Some systems: SLP_TYP_S5 = 5 (bits 10-12 = 5, so 0x1400)
+    # We'll use QEMU's default (SLP_TYP = 0)
+    acpi_slp_typa = 0  # SLP_TYP for PM1a (QEMU default)
+    acpi_slp_typb = 0  # SLP_TYP for PM1b
+
+    return 0
+
+# Perform ACPI S5 (shutdown) power off
+pub fn acpi_poweroff() -> i32
+    if acpi_pm1a_cnt_blk == 0
+        prints("[ACPI] ERROR: PM1a control block not found!\n")
+        return -1
+
+    prints("[ACPI] Initiating S5 shutdown...\n")
+
+    # Disable interrupts before shutdown
+    disable_interrupts()
+
+    # Write SLP_TYP + SLP_EN to PM1a_CNT
+    # SLP_EN is bit 13 (0x2000)
+    # SLP_TYP is bits 10-12
+    let pm1a_value: u16 = (acpi_slp_typa << 10) | ACPI_SLP_EN
+    outw(acpi_pm1a_cnt_blk as u16, pm1a_value)
+
+    # If PM1b exists, write to it too
+    if acpi_pm1b_cnt_blk != 0
+        let pm1b_value: u16 = (acpi_slp_typb << 10) | ACPI_SLP_EN
+        outw(acpi_pm1b_cnt_blk as u16, pm1b_value)
+
+    # If we get here, shutdown didn't work
+    # Try alternative SLP_TYP values (some systems need different values)
+    var slp_typ: u16 = 1
+    while slp_typ < 8
+        let pm1a_value: u16 = (slp_typ << 10) | ACPI_SLP_EN
+        outw(acpi_pm1a_cnt_blk as u16, pm1a_value)
+
+        # Small delay
+        var delay: i32 = 0
+        while delay < 100000
+            delay = delay + 1
+
+        slp_typ = slp_typ + 1
+
+    prints("[ACPI] ERROR: Shutdown failed!\n")
+    return -1
+
 # Parse MADT to find APIC info
 fn acpi_parse_madt(madt_addr: u64) -> i32
     let madt: *MadtHeader = madt_addr as *MadtHeader
@@ -2682,6 +2860,18 @@ fn acpi_init_with_mb(mb_info: *Mb2BootInfo) -> i32
 
     acpi_parse_madt(acpi_madt_addr)
 
+    # Also find FADT for power management (shutdown support)
+    prints("    Searching for FADT...")
+    acpi_fadt_addr = acpi_find_fadt()
+
+    if acpi_fadt_addr == 0
+        prints(" not found (shutdown disabled)\n")
+    else
+        prints(" found at ")
+        serial_print_hex(acpi_fadt_addr)
+        prints("\n")
+        acpi_parse_fadt(acpi_fadt_addr)
+
     return 0
 
 # Initialize ACPI from Harland boot info (UEFI boot path - RSDP already known)
@@ -2711,6 +2901,18 @@ fn acpi_init_from_bootinfo(info: *HarlandBootInfo) -> i32
     prints("\n")
 
     acpi_parse_madt(acpi_madt_addr)
+
+    # Also find FADT for power management (shutdown support)
+    prints("    Searching for FADT...")
+    acpi_fadt_addr = acpi_find_fadt()
+
+    if acpi_fadt_addr == 0
+        prints(" not found (shutdown disabled)\n")
+    else
+        prints(" found at ")
+        serial_print_hex(acpi_fadt_addr)
+        prints("\n")
+        acpi_parse_fadt(acpi_fadt_addr)
 
     return 0
 
@@ -3390,6 +3592,7 @@ const SYS_CLOSE: u64 = 3     # TODO: implement
 const SYS_EXIT: u64 = 20
 const SYS_YIELD: u64 = 21
 const SYS_GETPID: u64 = 22
+const SYS_ACPI_POWEROFF: u64 = 200  # Shutdown the system via ACPI
 const SYS_DEBUG_PRINT: u64 = 255
 
 # rdmsr and wrmsr are imported from io module
@@ -3584,6 +3787,13 @@ pub fn syscall_handler(rax: u64, rdi: u64, rsi: u64, rdx: u64) -> i64
 
     if rax == SYS_CAP_CHECK
         return sys_cap_check(1, rdi, rsi as u32)
+
+    # ACPI power management syscalls
+    if rax == SYS_ACPI_POWEROFF
+        prints("[syscall] ACPI poweroff requested\n")
+        let result: i32 = acpi_poweroff()
+        # If we get here, poweroff failed
+        return result as i64
 
     # Unknown syscall
     prints("[syscall] unknown: ")

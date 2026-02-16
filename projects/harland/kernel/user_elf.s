@@ -1,10 +1,10 @@
 # Embedded user program ELF binary
 #
-# This file embeds the portable_getpid.elf binary for testing syscalls.
-# portable_getpid.ritz demonstrates:
-# - sys_write(), sys_exit(), sys_yield(), sys_getpid()
-# - Cross-platform syscall abstraction
-# - Harland-specific syscall numbers
+# This file embeds the init.elf binary - the first userspace process.
+# init.ritz:
+# - Runs system tests (sys_write, sys_getpid, sys_yield)
+# - Reports test results
+# - Triggers ACPI poweroff on success
 #
 # The kernel can access the binary via:
 #   extern fn user_elf_start()
@@ -18,7 +18,7 @@
 
 .align 16
 user_elf_start:
-    .incbin "build/debug/portable_getpid.elf"
+    .incbin "build/debug/init.elf"
 user_elf_end:
 
 # Store the size for convenience

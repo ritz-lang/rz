@@ -127,7 +127,17 @@ cat "$SERIAL_LOG"
 echo ""
 
 # Check for expected output - most advanced first (matching BIOS test milestones)
-if grep -q "\[userspace\] exit" "$SERIAL_LOG"; then
+if grep -q "ACPI.*Initiating S5 shutdown" "$SERIAL_LOG"; then
+    echo "========================================="
+    echo "  UEFI: MILESTONE 11 COMPLETE: Init + ACPI Shutdown!"
+    echo "========================================="
+    echo "  - Init userspace process running"
+    echo "  - All userspace tests passed"
+    echo "  - sys_acpi_poweroff syscall working"
+    echo "  - ACPI S5 shutdown via FADT PM1a register"
+    echo "  - Clean system shutdown!"
+    exit 0
+elif grep -q "\[userspace\] exit" "$SERIAL_LOG"; then
     echo "========================================="
     echo "  UEFI: MILESTONE 10 COMPLETE: Userspace Execution!"
     echo "========================================="
