@@ -1,11 +1,14 @@
 # Harland Init Process
 #
-# First userspace process. Runs system tests and triggers ACPI shutdown.
+# First userspace process (PID 1).
+# Iterates through /bin/ and runs all binaries, then triggers ACPI shutdown.
 #
 # Tests performed:
 # - sys_write (console output)
 # - sys_getpid (process identity)
 # - sys_yield (cooperative scheduling)
+# - sys_readdir (directory listing)
+# - sys_spawn (process creation)
 # - sys_acpi_poweroff (system shutdown)
 
 # ============================================================================
@@ -29,6 +32,16 @@ fn syscall1(n: i64, a1: i64) -> i64
         movq %rax, {result}
     return result
 
+fn syscall2(n: i64, a1: i64, a2: i64) -> i64
+    var result: i64 = 0
+    asm x86_64:
+        movq {n}, %rax
+        movq {a1}, %rdi
+        movq {a2}, %rsi
+        syscall
+        movq %rax, {result}
+    return result
+
 fn syscall3(n: i64, a1: i64, a2: i64, a3: i64) -> i64
     var result: i64 = 0
     asm x86_64:
@@ -41,13 +54,16 @@ fn syscall3(n: i64, a1: i64, a2: i64, a3: i64) -> i64
     return result
 
 # ============================================================================
-# Harland syscall numbers
+# Harland syscall numbers (must match kernel)
 # ============================================================================
 
 const SYS_WRITE: i64 = 1
+const SYS_READDIR: i64 = 17
 const SYS_EXIT: i64 = 20
-const SYS_YIELD: i64 = 21
-const SYS_GETPID: i64 = 22
+const SYS_SPAWN: i64 = 21
+const SYS_WAIT: i64 = 22
+const SYS_GETPID: i64 = 23
+const SYS_YIELD: i64 = 24
 const SYS_ACPI_POWEROFF: i64 = 200
 
 # ============================================================================
@@ -69,6 +85,15 @@ fn sys_getpid() -> i32
 fn sys_acpi_poweroff()
     syscall0(SYS_ACPI_POWEROFF)
 
+fn sys_readdir(path: *u8, buf: *u8, buf_size: i64) -> i64
+    return syscall3(SYS_READDIR, path as i64, buf as i64, buf_size)
+
+fn sys_spawn(path: *u8) -> i64
+    return syscall1(SYS_SPAWN, path as i64)
+
+fn sys_wait(pid: i32) -> i64
+    return syscall1(SYS_WAIT, pid as i64)
+
 # ============================================================================
 # String helpers
 # ============================================================================
@@ -89,6 +114,14 @@ fn print_num(n: i32)
     if n >= 10
         print_num(n / 10)
     print_digit(n % 10)
+
+fn strlen(s: *u8) -> i64
+    var len: i64 = 0
+    var p: *u8 = s
+    while *p != 0
+        len = len + 1
+        p = (p as i64 + 1) as *u8
+    return len
 
 # ============================================================================
 # Test functions
@@ -116,6 +149,83 @@ fn test_yield() -> i32
     print_str(c"PASS\n")
     return 0
 
+fn test_readdir() -> i32
+    print_str(c"[init] Testing sys_readdir(/bin)... ")
+    var buf: [1024]u8
+    let result: i64 = sys_readdir(c"/bin", @buf[0], 1024)
+    if result > 0
+        print_str(c"PASS (")
+        print_num(result as i32)
+        print_str(c" bytes)\n")
+        return 0
+    else
+        print_str(c"FAIL\n")
+        return 1
+
+# ============================================================================
+# Run binaries in /bin
+# ============================================================================
+
+fn run_binaries_in_bin() -> i32
+    print_str(c"\n[init] Running binaries in /bin...\n")
+
+    # Get directory listing
+    var dir_buf: [1024]u8
+    let bytes: i64 = sys_readdir(c"/bin", @dir_buf[0], 1024)
+
+    if bytes <= 0
+        print_str(c"[init] No binaries found in /bin\n")
+        return 0
+
+    # Iterate through null-terminated names
+    var pos: i64 = 0
+    var count: i32 = 0
+
+    while pos < bytes
+        let name: *u8 = @dir_buf[pos]
+        let name_len: i64 = strlen(name)
+
+        if name_len > 0
+            # Build full path: /bin/ + name
+            var path: [256]u8
+            path[0] = 47   # /
+            path[1] = 98   # b
+            path[2] = 105  # i
+            path[3] = 110  # n
+            path[4] = 47   # /
+
+            var i: i64 = 0
+            while i < name_len and i < 250
+                path[5 + i] = *(name + i)
+                i = i + 1
+            path[5 + i] = 0
+
+            print_str(c"[init] Running: ")
+            print_str(@path[0])
+            print_str(c"\n")
+
+            # Spawn the binary
+            let pid: i64 = sys_spawn(@path[0])
+            if pid > 0
+                # Wait for it to complete
+                let exit_code: i64 = sys_wait(pid as i32)
+                print_str(c"[init] Process exited with code ")
+                print_num(exit_code as i32)
+                print_str(c"\n")
+            else
+                print_str(c"[init] Failed to spawn\n")
+
+            count = count + 1
+
+        # Move past null terminator
+        pos = pos + name_len + 1
+
+    print_str(c"[init] Ran ")
+    print_num(count)
+    print_str(c" binaries\n")
+
+    return 0
+
 # ============================================================================
 # Main entry point
 # ============================================================================
@@ -131,10 +241,14 @@ pub fn main() -> i32
 
     var failed: i32 = 0
 
-    # Run tests
+    # Run basic tests
     failed = failed + test_write()
     failed = failed + test_getpid()
     failed = failed + test_yield()
+    failed = failed + test_readdir()
+
+    # Run all binaries in /bin
+    run_binaries_in_bin()
 
     print_str(c"\n")
 

@@ -30,7 +30,9 @@ import cap.syscall { SYS_CAP_GRANT, SYS_CAP_REVOKE, SYS_CAP_DERIVE, SYS_CAP_INFO
 import drivers.virtio.blk { VirtioBlkDevice, virtio_blk_init, virtio_blk_read, virtio_blk_write, virtio_blk_get_capacity, virtio_blk_get_device, virtio_blk_test }
 import fs.kblob { KBlobId, kblob_init, kblob_get_store, kblob_store_put, kblob_store_get, kblob_store_exists, kblob_id_eq, kblob_id_is_zero }
 import fs.vfs { vfs_init, fd_table_init }
-import fs.knamespace { knamespace_init, knamespace_get, knamespace_mkdir, knamespace_write, knamespace_read, knamespace_exists, KNS_OK }
+import fs.knamespace { KNamespace, knamespace_init, knamespace_get, knamespace_mkdir, knamespace_write, knamespace_read, knamespace_exists, knamespace_list, KNS_OK }
+import fs.kdir_entry { KDirEntry }
+import fs.kpath { strview_from_ptr }
 import fs.syscall { fs_syscall_init, sys_open, sys_close, sys_fs_read, sys_fs_write, sys_lseek, is_fs_fd }
 import fs.initramfs { initramfs_load, initramfs_load_embedded }
 
@@ -3591,16 +3593,146 @@ const MSR_SFMASK: u32 = 0xC0000084
 const EFER_SCE: u64 = 1
 
 # Harland syscall numbers
-# These match the definitions in ritzlib/sys.ritz
+# Note: Some syscall numbers are imported from cap.syscall and ipc.syscall
+# These are the core syscalls not defined elsewhere:
 const SYS_READ: u64 = 0
 const SYS_WRITE: u64 = 1
-const SYS_OPEN: u64 = 2      # TODO: implement
-const SYS_CLOSE: u64 = 3     # TODO: implement
+const SYS_OPEN: u64 = 2
+const SYS_CLOSE: u64 = 3
+const SYS_READDIR: u64 = 17
 const SYS_EXIT: u64 = 20
-const SYS_YIELD: u64 = 21
-const SYS_GETPID: u64 = 22
-const SYS_ACPI_POWEROFF: u64 = 200  # Shutdown the system via ACPI
+const SYS_SPAWN: u64 = 21
+const SYS_WAIT: u64 = 22
+const SYS_GETPID: u64 = 23
+const SYS_YIELD: u64 = 24
+const SYS_ACPI_POWEROFF: u64 = 200
 const SYS_DEBUG_PRINT: u64 = 255
+
+# ============================================================================
+# New Syscall Implementations
+# ============================================================================
+
+# Helper to get string length
+fn syscall_strlen(s: *u8) -> i64
+    var len: i64 = 0
+    var p: *u8 = s
+    while *p != 0
+        len = len + 1
+        p = p + 1
+    return len
+
+# sys_readdir: List directory contents
+# Returns bytes written to buffer as null-terminated strings
+fn sys_readdir_impl(dir_path: *u8, buf: *u8, buf_size: i64) -> i64
+    prints("[syscall] readdir(")
+    prints_str(dir_path)
+    prints(")\n")
+
+    let ns: *KNamespace = knamespace_get()
+    if ns == 0 as *KNamespace
+        return -1
+
+    # Create StrView from path
+    let path_len: i64 = syscall_strlen(dir_path)
+    let path_view: StrView = strview_from_ptr(dir_path, path_len)
+
+    # Allocate entries array on stack (max 64)
+    var entries: [64]KDirEntry
+    let count: i32 = knamespace_list(ns, @path_view, @entries[0], 64)
+
+    if count < 0
+        prints("[readdir] Failed to list directory\n")
+        return -1
+
+    # Copy names to buffer as null-terminated strings
+    var bytes_written: i64 = 0
+    var i: i32 = 0
+
+    while i < count
+        let entry: *KDirEntry = @entries[i]
+
+        # Find name length
+        var name_len: i32 = (*entry).name_len as i32
+        if name_len == 0
+            # Fallback: count until null
+            while name_len < 255 and (*entry).name[name_len] != 0
+                name_len = name_len + 1
+
+        # Check buffer space
+        if bytes_written + name_len as i64 + 1 > buf_size
+            break
+
+        # Copy name
+        var j: i32 = 0
+        while j < name_len
+            *(buf + bytes_written) = (*entry).name[j]
+            bytes_written = bytes_written + 1
+            j = j + 1
+
+        # Null terminator
+        *(buf + bytes_written) = 0
+        bytes_written = bytes_written + 1
+
+        i = i + 1
+
+    prints("[readdir] Returned ")
+    serial_print_dec(count as u64)
+    prints(" entries (")
+    serial_print_dec(bytes_written as u64)
+    prints(" bytes)\n")
+
+    return bytes_written
+
+# sys_spawn: Load and execute a binary from the filesystem
+# For simplicity, returns a fake PID - actual execution is deferred
+fn sys_spawn_impl(path: *u8) -> i64
+    prints("[syscall] spawn(")
+    prints_str(path)
+    prints(")\n")
+
+    # Look up the file in the namespace
+    let ns: *KNamespace = knamespace_get()
+    if ns == 0 as *KNamespace
+        prints("[spawn] No namespace\n")
+        return -1
+
+    # Read file from namespace
+    let path_len: i64 = syscall_strlen(path)
+    let path_view: StrView = strview_from_ptr(path, path_len)
+    var file_size: u64 = 0
+    let elf_data: *u8 = knamespace_read(ns, @path_view, @file_size)
+
+    if elf_data == 0 as *u8
+        prints("[spawn] File not found: ")
+        prints_str(path)
+        prints("\n")
+        return -1
+
+    prints("[spawn] Found ELF (")
+    serial_print_dec(file_size)
+    prints(" bytes)\n")
+
+    # TODO: Actually load and execute the ELF
+    # For now, just return a fake PID
+    return 2  # Fake PID for spawned process
+
+# sys_wait: Wait for a child process to exit
+# For now, just returns -1 since we don't have real process management
+fn sys_wait_impl(pid: i32) -> i64
+    prints("[syscall] wait(")
+    serial_print_dec(pid as u64)
+    prints(")\n")
+
+    # TODO: Implement real process waiting
+    # For now, return -1 (no child)
+    return -1
+
+# Helper to print null-terminated string
+fn prints_str(s: *u8)
+    var p: *u8 = s
+    while *p != 0
+        serial_write_byte(*p)
+        p = p + 1
 
 # rdmsr and wrmsr are imported from io module
 
@@ -3766,6 +3898,18 @@ pub fn syscall_handler(rax: u64, rdi: u64, rsi: u64, rdx: u64) -> i64
     if rax == SYS_GETPID
         # Return current process ID (1 for now - single process)
         return 1
+
+    if rax == SYS_READDIR
+        # rdi = path pointer, rsi = buffer, rdx = buffer size
+        return sys_readdir_impl(rdi as *u8, rsi as *u8, rdx as i64)
+
+    if rax == SYS_SPAWN
+        # rdi = path pointer
+        return sys_spawn_impl(rdi as *u8)
+
+    if rax == SYS_WAIT
+        # rdi = pid
+        return sys_wait_impl(rdi as i32)
 
     # IPC syscalls
     if rax == SYS_CHANNEL_CREATE
