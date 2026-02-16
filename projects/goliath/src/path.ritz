@@ -1,174 +1,168 @@
 # Path Utilities
 #
-# Path parsing and manipulation for Goliath filesystem.
+# Simple path operations built on StrView. No manual pointer arithmetic -
+# we use ritzlib's string operations.
 
-import ritzlib.sys { write }
-import error { Error, ErrorCode, error_new }
+import ritzlib.strview { StrView, strview_empty, strview_slice, strview_find_byte, strview_eq }
 
-# Maximum path length
-pub const PATH_MAX: i32 = 4096
-
-# Maximum component (single name) length
-pub const NAME_MAX: i32 = 255
-
-# Path separator
+# Constants
+pub const PATH_MAX: i64 = 4096
+pub const NAME_MAX: i64 = 255
 pub const PATH_SEP: u8 = 47  # '/'
 
-# Check if a character is the path separator
-pub fn is_separator(c: u8) -> bool
-    c == PATH_SEP
-
 # Check if a path is absolute (starts with /)
-pub fn path_is_absolute(path: *u8, len: u64) -> bool
-    if len == 0
-        return false
-    *path == PATH_SEP
+pub fn path_is_absolute(path: @StrView) -> bool
+    path.len > 0 and *(path.ptr) == PATH_SEP
 
 # Check if a path is the root path
-pub fn path_is_root(path: *u8, len: u64) -> bool
-    len == 1 and *path == PATH_SEP
+pub fn path_is_root(path: @StrView) -> bool
+    path.len == 1 and *(path.ptr) == PATH_SEP
 
-# Get the length of a null-terminated path
-pub fn path_len(path: *u8) -> u64
-    var len: u64 = 0
-    var p: *u8 = path
-    while *p != 0
-        len = len + 1
-        p = p + 1
-    len
+# Get the parent path (everything before last component)
+# "/a/b/c" -> "/a/b"
+# "/foo" -> "/"
+# "/" -> empty
+pub fn path_parent(path: @StrView) -> StrView
+    if path.len == 0
+        return strview_empty()
 
-# Skip leading slashes
-pub fn path_skip_slashes(path: *u8, len: u64) -> u64
-    var skip: u64 = 0
-    while skip < len and *(path + skip) == PATH_SEP
-        skip = skip + 1
-    skip
-
-# Get the first component of a path
-# Returns: length of first component (0 if none)
-# Sets next_start to the offset where the next component starts
-pub fn path_first_component(path: *u8, len: u64, next_start: *u64) -> u64
-    # Skip leading slashes
-    var start: u64 = path_skip_slashes(path, len)
-
-    if start >= len
-        *next_start = len
-        return 0
-
-    # Find end of component (next slash or end)
-    var end: u64 = start
-    while end < len and *(path + end) != PATH_SEP
-        end = end + 1
-
-    # Set next start (skip trailing slashes)
-    var next: u64 = end
-    while next < len and *(path + next) == PATH_SEP
-        next = next + 1
-    *next_start = next
-
-    end - start
-
-# Get the parent path length
-# For "/a/b/c" returns 4 (length of "/a/b")
-# For "/" returns 0
-# For "/a" returns 1 (length of "/")
-pub fn path_parent_len(path: *u8, len: u64) -> u64
-    if len == 0
-        return 0
-
-    # Find last non-trailing slash
-    var end: u64 = len
-
-    # Skip trailing slashes
-    while end > 0 and *(path + end - 1) == PATH_SEP
+    # Find end of content (skip trailing slashes)
+    var end: i64 = path.len
+    while end > 0 and *(path.ptr + end - 1) == PATH_SEP
         end = end - 1
 
     if end == 0
-        return 0  # Root or all slashes
+        return strview_empty()  # Root has no parent
 
-    # Find previous slash
-    while end > 0 and *(path + end - 1) != PATH_SEP
-        end = end - 1
+    # Find the last slash before the basename
+    var pos: i64 = end - 1
+    while pos > 0 and *(path.ptr + pos) != PATH_SEP
+        pos = pos - 1
 
-    # Skip consecutive slashes
-    while end > 1 and *(path + end - 1) == PATH_SEP
+    if pos == 0 and *(path.ptr) == PATH_SEP
+        # Parent is root "/"
+        return strview_slice(path, 0, 1)
+
+    strview_slice(path, 0, pos)
+
+# Get the basename (last component)
+# "/a/b/c" -> "c"
+# "/foo" -> "foo"
+# "/" -> ""
+pub fn path_basename(path: @StrView) -> StrView
+    if path.len == 0
+        return strview_empty()
+
+    # Find end of content (skip trailing slashes)
+    var end: i64 = path.len
+    while end > 0 and *(path.ptr + end - 1) == PATH_SEP
         end = end - 1
 
     if end == 0
-        return 1  # Parent is root
+        return strview_empty()  # Root has no basename
 
-    end
-
-# Get the basename (last component) start offset
-pub fn path_basename_start(path: *u8, len: u64) -> u64
-    if len == 0
-        return 0
-
-    var end: u64 = len
-
-    # Skip trailing slashes
-    while end > 0 and *(path + end - 1) == PATH_SEP
-        end = end - 1
-
-    if end == 0
-        return 0
-
-    # Find start of basename
-    var start: u64 = end
-    while start > 0 and *(path + start - 1) != PATH_SEP
+    # Find start of basename (after last slash)
+    var start: i64 = end - 1
+    while start > 0 and *(path.ptr + start - 1) != PATH_SEP
         start = start - 1
 
-    start
+    strview_slice(path, start, end)
 
-# Validate a path component (single name, no slashes)
-pub fn path_validate_component(name: *u8, len: u64) -> bool
-    if len == 0 or len > NAME_MAX as u64
+# Validate a path component (no /, no null, not . or ..)
+pub fn path_validate_component(name: @StrView) -> bool
+    if name.len == 0 or name.len > NAME_MAX
         return false
 
-    # Check for . and ..
-    if len == 1 and *name == 46  # '.'
+    # Reject . and ..
+    if name.len == 1 and *(name.ptr) == '.'
         return false
-    if len == 2 and *name == 46 and *(name + 1) == 46  # '..'
+    if name.len == 2 and *(name.ptr) == '.' and *(name.ptr + 1) == '.'
         return false
 
-    # Check for invalid characters (null, slash)
-    var i: u64 = 0
-    while i < len
-        let c: u8 = *(name + i)
+    # Check for invalid characters
+    var i: i64 = 0
+    while i < name.len
+        let c: u8 = *(name.ptr + i)
         if c == 0 or c == PATH_SEP
             return false
         i = i + 1
-
     true
 
 # Validate a full path
-pub fn path_validate(path: *u8, len: u64) -> bool
-    if len == 0 or len > PATH_MAX as u64
+pub fn path_validate(path: @StrView) -> bool
+    if path.len == 0 or path.len > PATH_MAX
         return false
 
-    # Must be absolute
-    if not path_is_absolute(path, len)
+    if not path_is_absolute(path)
         return false
 
-    # Root is valid
-    if path_is_root(path, len)
+    if path_is_root(path)
         return true
 
-    # Validate each component
-    var pos: u64 = 0
-    var next: u64 = 0
+    # Walk through components
+    var remaining: StrView = strview_slice(path, 1, path.len)  # Skip leading /
 
-    while pos < len
-        let comp_len: u64 = path_first_component(path + pos, len - pos, @next)
+    while remaining.len > 0
+        # Skip leading slashes
+        while remaining.len > 0 and *(remaining.ptr) == PATH_SEP
+            remaining = strview_slice(@remaining, 1, remaining.len)
 
-        if comp_len == 0
+        if remaining.len == 0
             break
 
-        if not path_validate_component(path + pos + path_skip_slashes(path + pos, len - pos), comp_len)
+        # Find next slash
+        let slash_pos: i64 = strview_find_byte(@remaining, PATH_SEP)
+        var component: StrView
+
+        if slash_pos < 0
+            # Last component
+            component = strview_slice(@remaining, 0, remaining.len)
+            remaining = strview_empty()
+        else
+            component = strview_slice(@remaining, 0, slash_pos)
+            remaining = strview_slice(@remaining, slash_pos + 1, remaining.len)
+
+        if not path_validate_component(@component)
             return false
 
-        pos = pos + next
-        if next == 0
-            break
+    true
+
+# Path iterator - get next component
+# Usage:
+#   var iter: PathIter = path_iter_new(@path)
+#   var component: StrView
+#   while path_iter_next(@iter, @component)
+#       # use component
+pub struct PathIter
+    remaining: StrView
+
+pub fn path_iter_new(path: @StrView) -> PathIter
+    # Skip the leading slash for absolute paths
+    var start: i64 = 0
+    if path.len > 0 and *(path.ptr) == PATH_SEP
+        start = 1
+
+    PathIter {
+        remaining: strview_slice(path, start, path.len)
+    }
+
+pub fn path_iter_next(iter: *PathIter, out: *StrView) -> bool
+    # Skip leading slashes
+    while (*iter).remaining.len > 0 and *((*iter).remaining.ptr) == PATH_SEP
+        (*iter).remaining = strview_slice(@(*iter).remaining, 1, (*iter).remaining.len)
+
+    if (*iter).remaining.len == 0
+        return false
+
+    # Find next slash
+    let slash_pos: i64 = strview_find_byte(@(*iter).remaining, PATH_SEP)
+
+    if slash_pos < 0
+        # Last component
+        *out = (*iter).remaining
+        (*iter).remaining = strview_empty()
+    else
+        *out = strview_slice(@(*iter).remaining, 0, slash_pos)
+        (*iter).remaining = strview_slice(@(*iter).remaining, slash_pos + 1, (*iter).remaining.len)
 
     true
