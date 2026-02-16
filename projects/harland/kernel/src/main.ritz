@@ -3572,6 +3572,7 @@ extern fn context_switch(old_ctx: *CpuContext, new_ctx: *CpuContext)
 # External assembly functions for syscalls and userspace
 extern fn syscall_entry()
 extern fn jump_to_userspace(entry: u64, stack: u64)
+extern fn jump_to_userspace_with_retval(entry: u64, stack: u64, retval: i64)
 extern fn user_program_start()
 extern fn user_program_end()
 extern fn user_program_minimal()
@@ -3607,6 +3608,33 @@ const SYS_GETPID: u64 = 23
 const SYS_YIELD: u64 = 24
 const SYS_ACPI_POWEROFF: u64 = 200
 const SYS_DEBUG_PRINT: u64 = 255
+
+# ============================================================================
+# Process State for Spawn/Exit
+# ============================================================================
+#
+# When a parent process calls spawn(), we save its execution context here.
+# When the child calls exit(), we restore the parent context and return.
+#
+# This implements simple "blocking spawn" - parent waits for child to exit.
+
+struct ParentContext
+    # User-mode return state (saved from syscall entry)
+    user_rip: u64           # Where parent was when it called spawn
+    user_rsp: u64           # Parent's user stack pointer
+    user_rflags: u64        # Parent's RFLAGS
+    # We don't need to save GPRs - they're on the syscall stack
+
+# Global parent context (single process system for now)
+var g_parent_ctx: ParentContext
+var g_has_parent: u8 = 0           # 1 if we're in a child process
+var g_child_pid: u64 = 1           # Current PID (1 = init)
+var g_child_exit_code: i64 = 0     # Exit code from child
+
+# External functions from syscall_entry.s for accessing user context
+extern fn get_syscall_user_rip() -> u64
+extern fn get_syscall_user_rsp() -> u64
+extern fn get_syscall_user_rflags() -> u64
 
 # ============================================================================
 # New Syscall Implementations
@@ -3684,9 +3712,10 @@ fn sys_readdir_impl(dir_path: *u8, buf: *u8, buf_size: i64) -> i64
     return bytes_written
 
 # sys_spawn: Load and execute a binary from the filesystem
-# For simplicity, returns a fake PID - actual execution is deferred
+# This is a BLOCKING spawn - we save parent state, run child, and when
+# child exits, we restore parent state and return with child's exit code.
 fn sys_spawn_impl(path: *u8) -> i64
-    prints("[syscall] spawn(")
+    prints("[spawn] spawn(")
     prints_str(path)
     prints(")\n")
 
@@ -3708,23 +3737,156 @@ fn sys_spawn_impl(path: *u8) -> i64
         prints("\n")
         return -1
 
-    prints("[spawn] Found ELF (")
+    prints("[spawn] Loading ELF (")
     serial_print_dec(file_size)
-    prints(" bytes)\n")
+    prints(" bytes)...\n")
 
-    # TODO: Actually load and execute the ELF
-    # For now, just return a fake PID
-    return 2  # Fake PID for spawned process
+    # Save parent's execution context
+    # When the child calls sys_exit(), we'll restore this and return here
+    g_parent_ctx.user_rip = get_syscall_user_rip()
+    g_parent_ctx.user_rsp = get_syscall_user_rsp()
+    g_parent_ctx.user_rflags = get_syscall_user_rflags()
+    g_has_parent = 1
+    g_child_pid = 2  # Simple: parent=1, child=2
+
+    prints("[spawn] Saved parent context:\n")
+    prints("  RIP: 0x")
+    serial_print_hex(g_parent_ctx.user_rip)
+    prints("\n  RSP: 0x")
+    serial_print_hex(g_parent_ctx.user_rsp)
+    prints("\n")
+
+    # Load the child ELF
+    # Use a different load base than init to avoid address conflicts
+    # Init loads at ~0x400000, we'll load child at 0x800000 (8MB)
+    let child_load_base: u64 = 0x800000
+    let load_result: ElfLoadResult = elf_load(elf_data, file_size, child_load_base)
+
+    if load_result.error != ELF_OK
+        prints("[spawn] Failed to load ELF, error=")
+        serial_print_dec(load_result.error as u64)
+        prints("\n")
+        g_has_parent = 0  # Cancel spawn
+        return -1
+
+    prints("[spawn] ELF loaded at 0x")
+    serial_print_hex(load_result.load_base)
+    prints(", entry=0x")
+    serial_print_hex(load_result.entry_point)
+    prints("\n")
+
+    # Allocate a separate stack for the child (don't share with parent!)
+    # We'll use a different virtual address range
+    let child_stack_page: u64 = pmm_alloc_page()
+    if child_stack_page == 0
+        prints("[spawn] Failed to allocate child stack\n")
+        g_has_parent = 0
+        return -1
+
+    # Map child stack at a different address than parent
+    # Parent stack is at 0x7FFFFFFFE000, child at 0x7FFFFFFFC000
+    let child_stack_vaddr: u64 = 0x7FFFFFFFC000
+    let map_result: i32 = vmm_map_page(child_stack_vaddr, child_stack_page, PTE_WRITABLE | PTE_USER)
+    if map_result != 0
+        prints("[spawn] Failed to map child stack\n")
+        pmm_free_page(child_stack_page)
+        g_has_parent = 0
+        return -1
+
+    let child_stack_top: u64 = child_stack_vaddr + PAGE_SIZE - 16
+    vmm_flush_tlb_all()
+
+    prints("[spawn] Child stack at 0x")
+    serial_print_hex(child_stack_top)
+    prints("\n")
+    prints("[spawn] Jumping to child...\n\n")
+
+    # Jump to child! This does NOT return.
+    # When child calls sys_exit(), sys_exit_impl will detect g_has_parent
+    # and restore parent context.
+    jump_to_userspace(load_result.entry_point, child_stack_top)
+
+    # Never reached - child will call sys_exit which handles return to parent
+    prints("[spawn] ERROR: jump_to_userspace returned!\n")
+    return -1
+
+# sys_exit: Exit the current process
+# If we're a child (spawned by blocking spawn), restore parent and return
+# with the exit code. Otherwise, halt the system.
+fn sys_exit_impl(code: i32) -> i64
+    prints("\n[exit] exit(")
+    serial_print_dec(code as u64)
+    prints(")")
+
+    if g_has_parent != 0
+        # We're a child! Restore parent context
+        prints(" - returning to parent\n")
+
+        # Save exit code for sys_wait
+        # Keep g_child_pid = 2 so sys_wait knows there was a child
+        g_child_exit_code = code as i64
+        g_has_parent = 0
+        # Don't reset g_child_pid here - sys_wait needs it to know there was a child
+
+        prints("[exit] Restoring parent context...\n")
+        prints("  RIP: 0x")
+        serial_print_hex(g_parent_ctx.user_rip)
+        prints("\n  RSP: 0x")
+        serial_print_hex(g_parent_ctx.user_rsp)
+        prints("\n")
+
+        # We need to return to the parent's spawn() call with the exit code.
+        # The tricky part: spawn() needs to return the child's exit code.
+        # But we're not in the normal syscall return path anymore.
+        #
+        # For blocking spawn, we jump back to parent with RAX=exit_code.
+        # This requires a custom jump that sets RAX before iret.
+        # For now, use the simpler approach: jump to parent, and parent
+        # will call sys_wait() to get the exit code.
+
+        # Actually, for blocking spawn the cleanest is:
+        # Parent's spawn() returns the exit code directly.
+        # So we need to jump back with the exit code in RAX.
+        #
+        # jump_to_userspace clears all registers, so we need a variant.
+        # For now, let's use a workaround: return via normal syscall path
+        # by setting the return context.
+
+        # For blocking spawn, we return to the parent's sys_spawn() call.
+        # The parent expects a positive PID on success.
+        # We return 2 (child PID) on success, or -1 on failure.
+        # The actual exit code is stored in g_child_exit_code for sys_wait().
+        var retval: i64 = 2  # Child PID = 2 on success
+        if code < 0
+            retval = -1  # Error if child exited with negative code
+
+        jump_to_userspace_with_retval(g_parent_ctx.user_rip, g_parent_ctx.user_rsp, retval)
+
+        # Never reached
+        prints("[exit] ERROR: jump returned!\n")
+
+    # No parent - this is init exiting or a system halt
+    prints(" - halting system\n")
+    halt_loop()
+    return 0
 
 # sys_wait: Wait for a child process to exit
-# For now, just returns -1 since we don't have real process management
+# For blocking spawn, the child has already exited by the time spawn returns.
+# This can be used to get the exit code if needed.
 fn sys_wait_impl(pid: i32) -> i64
     prints("[syscall] wait(")
     serial_print_dec(pid as u64)
     prints(")\n")
 
-    # TODO: Implement real process waiting
-    # For now, return -1 (no child)
+    # For blocking spawn, the exit code is already available
+    if g_child_pid == 2
+        let code: i64 = g_child_exit_code
+        # Reset state after collecting exit code
+        g_child_exit_code = 0
+        g_child_pid = 1  # Back to init only
+        return code
+
+    # No child to wait for
     return -1
 
 # Helper to print null-terminated string
@@ -3821,14 +3983,11 @@ pub fn syscall_init() -> i32
 
 # Syscall handler (called from assembly)
 pub fn syscall_handler(rax: u64, rdi: u64, rsi: u64, rdx: u64) -> i64
-    # Debug: show we entered syscall handler
+    # Handle exit specially - it may not return!
     if rax == SYS_EXIT
-        prints("\n[userspace] exit(")
-        serial_print_dec(rdi)
-        prints(")\n")
-        # For now, halt
-        halt_loop()
-        return 0
+        # sys_exit_impl handles both child exit (return to parent) and
+        # init exit (halt system). It may not return!
+        return sys_exit_impl(rdi as i32)
 
     # SYS_OPEN - Open a file
     if rax == SYS_OPEN

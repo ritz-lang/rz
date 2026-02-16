@@ -25,6 +25,53 @@ syscall_stack_top:
 user_rsp_save:
     .quad 0
 
+# ============================================================================
+# Exported User Context (for spawn/exit)
+# ============================================================================
+# These globals are updated on syscall entry and can be read/written by
+# the syscall handler to implement spawn (save parent) and exit (restore parent).
+
+.global syscall_user_rip
+.global syscall_user_rsp
+.global syscall_user_rflags
+
+syscall_user_rip:
+    .quad 0
+syscall_user_rsp:
+    .quad 0
+syscall_user_rflags:
+    .quad 0
+syscall_user_rax:
+    .quad 0
+
+.section .text
+
+# ============================================================================
+# User Context Accessor Functions
+# ============================================================================
+# These functions allow Ritz code to read the saved user context.
+
+.global get_syscall_user_rip
+.type get_syscall_user_rip, @function
+get_syscall_user_rip:
+    movq syscall_user_rip(%rip), %rax
+    ret
+.size get_syscall_user_rip, . - get_syscall_user_rip
+
+.global get_syscall_user_rsp
+.type get_syscall_user_rsp, @function
+get_syscall_user_rsp:
+    movq syscall_user_rsp(%rip), %rax
+    ret
+.size get_syscall_user_rsp, . - get_syscall_user_rsp
+
+.global get_syscall_user_rflags
+.type get_syscall_user_rflags, @function
+get_syscall_user_rflags:
+    movq syscall_user_rflags(%rip), %rax
+    ret
+.size get_syscall_user_rflags, . - get_syscall_user_rflags
+
 .section .text
 
 # ============================================================================
@@ -49,6 +96,19 @@ syscall_entry:
     leaq syscall_stack_top(%rip), %rsp
 
     # Now we have a safe kernel stack
+
+    # Save RAX (syscall number) to global FIRST before using it as scratch
+    # This is critical - we were clobbering it before!
+    movq %rax, syscall_user_rax(%rip)      # Save syscall number
+
+    # Export user context to globals (for spawn/exit to access)
+    movq %rcx, syscall_user_rip(%rip)      # User return RIP
+    movq user_rsp_save(%rip), %rax         # Use RAX as scratch now (already saved)
+    movq %rax, syscall_user_rsp(%rip)      # User RSP
+    movq %r11, syscall_user_rflags(%rip)   # User RFLAGS
+
+    # Restore RAX from saved value before pushing to frame
+    movq syscall_user_rax(%rip), %rax
 
     # Save all registers that the syscall handler might need
     # Build a SyscallFrame on the stack
@@ -202,6 +262,84 @@ jump_to_userspace:
     iretq
 
 .size jump_to_userspace, . - jump_to_userspace
+
+# ============================================================================
+# Set Syscall Return Context
+# ============================================================================
+# void syscall_set_return_context(u64 rip, u64 rsp, u64 rflags)
+#
+# Used by sys_exit to restore parent context when a child process exits.
+# Modifies the saved values on the syscall stack so that when syscall_entry
+# returns, it goes to the specified context instead of the original caller.
+#
+.global syscall_set_return_context
+.type syscall_set_return_context, @function
+syscall_set_return_context:
+    # Arguments:
+    #   RDI = new user RIP
+    #   RSI = new user RSP
+    #   RDX = new user RFLAGS
+    #
+    # Update the global context variables - these will be used
+    # by the next syscall return
+    movq %rdi, syscall_user_rip(%rip)
+    movq %rsi, syscall_user_rsp(%rip)
+    movq %rdx, syscall_user_rflags(%rip)
+    ret
+
+.size syscall_set_return_context, . - syscall_set_return_context
+
+# ============================================================================
+# Jump to Userspace with Return Value
+# ============================================================================
+# void jump_to_userspace_with_retval(u64 entry_point, u64 user_stack, i64 retval)
+#
+# Similar to jump_to_userspace, but sets RAX to retval before jumping.
+# Used by sys_exit to return to parent with the child's exit code.
+#
+.global jump_to_userspace_with_retval
+.type jump_to_userspace_with_retval, @function
+jump_to_userspace_with_retval:
+    # Arguments:
+    #   RDI = entry point (user RIP)
+    #   RSI = user stack pointer
+    #   RDX = return value (to put in RAX)
+
+    # Disable interrupts during transition
+    cli
+
+    # Build IRET frame for Ring 3
+    # Stack layout for IRETQ: RIP, CS, RFLAGS, RSP, SS
+
+    pushq $0x23                  # SS (user data, ring 3)
+    pushq %rsi                   # RSP (user stack)
+    pushq $0x202                 # RFLAGS (IF=1, reserved bit 1 = 1)
+    pushq $0x1B                  # CS (user code, ring 3)
+    pushq %rdi                   # RIP (entry point)
+
+    # Set return value in RAX (this is the key difference!)
+    movq %rdx, %rax
+
+    # Clear other registers (security)
+    xorq %rbx, %rbx
+    xorq %rcx, %rcx
+    xorq %rdx, %rdx
+    xorq %rdi, %rdi
+    xorq %rsi, %rsi
+    xorq %rbp, %rbp
+    xorq %r8, %r8
+    xorq %r9, %r9
+    xorq %r10, %r10
+    xorq %r11, %r11
+    xorq %r12, %r12
+    xorq %r13, %r13
+    xorq %r14, %r14
+    xorq %r15, %r15
+
+    # Jump to userspace!
+    iretq
+
+.size jump_to_userspace_with_retval, . - jump_to_userspace_with_retval
 
 # ============================================================================
 # Userspace Syscall Stub (for testing - would be in user program)
