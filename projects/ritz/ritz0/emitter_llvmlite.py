@@ -3458,8 +3458,13 @@ class LLVMEmitter:
                 constraints.append("r")
 
         # Replace {name} with $N in template
-        # First, escape literal $ for LLVM
-        template_escaped = template.replace('$', '$$')
+        # First, escape literal $ for LLVM inline asm ($ -> $$)
+        # BUT: preserve existing $$ (which means literal $ in AT&T syntax)
+        # Strategy: temporarily replace $$ with a marker, escape $, restore
+        import re
+        # Use regex to escape only single $ (not part of $$)
+        # Negative lookbehind/lookahead: $ not preceded or followed by $
+        template_escaped = re.sub(r'(?<!\$)\$(?!\$)', '$$', template)
 
         # Now replace {name} with temporary markers
         operand_markers = {}
