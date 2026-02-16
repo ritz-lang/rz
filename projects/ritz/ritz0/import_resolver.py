@@ -176,7 +176,9 @@ class ImportResolver:
         # Import aliases: from_file -> {alias -> module_path}
         self.import_aliases: Dict[str, Dict[str, str]] = {}
         # RFC #109 Phase 2: Dependency mappings for namespace resolution
-        self.dependencies: Dict[str, DependencyMapping] = dependencies or {}
+        self.dependencies: Dict[str, DependencyMapping] = dependencies.copy() if dependencies else {}
+        # Auto-detect dependencies from RITZ_PATH entries with ritz.toml
+        self._auto_detect_dependencies_from_ritz_path()
         # Source roots: directories to search for imports (e.g., ["src", "kernel/src"])
         # These are searched after relative imports but before project root
         self.source_roots: List[Path] = []
@@ -187,6 +189,56 @@ class ImportResolver:
                     sr_path = self.project_root / sr_path
                 if sr_path.exists():
                     self.source_roots.append(sr_path.resolve())
+
+    def _auto_detect_dependencies_from_ritz_path(self):
+        """Auto-detect dependencies from RITZ_PATH entries with ritz.toml.
+
+        For each directory in RITZ_PATH that has a ritz.toml, parse it and
+        add the project as a dependency namespace. This allows imports like
+        'squeeze.gzip' to resolve correctly when squeeze is in RITZ_PATH.
+        """
+        try:
+            import tomllib
+        except ImportError:
+            try:
+                import tomli as tomllib
+            except ImportError:
+                return  # Can't parse TOML, skip auto-detection
+
+        for import_path in self.import_paths:
+            # Skip if already registered as a dependency
+            dep_name = import_path.name
+            if dep_name in self.dependencies:
+                continue
+
+            # Check for ritz.toml
+            toml_path = import_path / "ritz.toml"
+            if not toml_path.exists():
+                continue
+
+            try:
+                with open(toml_path, "rb") as f:
+                    config = tomllib.load(f)
+
+                # Extract sources - check multiple locations
+                sources = config.get("sources")
+                if sources is None:
+                    sources = config.get("package", {}).get("sources")
+                if sources is None:
+                    sources = config.get("build", {}).get("sources")
+                if sources is None:
+                    sources = ["src"]  # default
+                if isinstance(sources, str):
+                    sources = [sources]
+
+                # Register as a dependency
+                self.dependencies[dep_name] = DependencyMapping(
+                    name=dep_name,
+                    path=import_path,
+                    sources=sources
+                )
+            except Exception:
+                pass  # Skip on any error
 
     # ============================================================================
     # Export Map Building
