@@ -1043,16 +1043,14 @@ def compile_freestanding_binary(
             # Compile LLVM IR to object file with target-specific options
             # Use clang -c which can compile .ll files directly (more portable than llc)
             if is_uefi:
-                # UEFI: compile for Windows ABI but output as ELF for now
-                # We'll convert to PE later with objcopy
+                # UEFI: compile for Windows x64 ABI (produces COFF objects for lld-link)
                 clang_cmd = [
                     "clang", "-c",
-                    "--target=x86_64-unknown-linux-gnu",  # Compile as ELF, convert later
+                    "--target=x86_64-unknown-windows-gnu",  # Windows x64 target for COFF
                     "-fshort-wchar",      # UEFI uses 16-bit wchar
                     "-mno-red-zone",      # Required for UEFI
                     "-fno-stack-protector",
                     "-ffreestanding",
-                    "-fPIC",              # Position independent for relocation
                 ]
             else:
                 clang_cmd = [
@@ -1120,54 +1118,77 @@ def compile_freestanding_binary(
         print(f"  ⚡ Linking {len(object_files)} object files...")
 
         if is_uefi:
-            # UEFI: Link as ELF shared object, then convert to PE with objcopy
-            elf_path = artifact_dir / f"{name}.so"
+            # UEFI: Use lld-link to directly produce PE/COFF EFI application
+            # This produces a proper PE32+ with optional header that UEFI expects
+            import shutil as shutil_mod
 
-            link_cmd = [
-                lld,
-                "-shared",
-                "-Bsymbolic",
-                "--no-undefined",
-                "-o", str(elf_path),
-            ]
-            link_cmd.extend([str(obj) for obj in object_files])
+            # Check for lld-link
+            lld_link = shutil_mod.which("lld-link")
+            if lld_link:
+                # Direct PE/COFF linking with lld-link
+                print(f"  📦 Linking PE/COFF with lld-link...")
+                link_cmd = [
+                    lld_link,
+                    "/subsystem:efi_application",
+                    "/entry:efi_main",
+                    f"/out:{bin_path}",
+                ]
+                link_cmd.extend([str(obj) for obj in object_files])
 
-            result = subprocess.run(link_cmd, capture_output=True, text=True)
-            if result.returncode != 0:
-                print(f"  ✗ Linking failed: {result.stderr}", file=sys.stderr)
-                return None
+                result = subprocess.run(link_cmd, capture_output=True, text=True)
+                if result.returncode != 0:
+                    print(f"  ✗ lld-link failed: {result.stderr}", file=sys.stderr)
+                    return None
+            else:
+                # Fallback: Link as ELF shared object, then convert to PE with objcopy
+                # Note: This produces a minimal PE that may not work with all UEFI firmwares
+                elf_path = artifact_dir / f"{name}.so"
 
-            # Convert ELF to PE using objcopy
-            print(f"  📦 Converting to PE/COFF...")
-            objcopy_cmd = [
-                "objcopy",
-                "-j", ".text",
-                "-j", ".rodata",
-                "-j", ".data",
-                "-j", ".bss",
-                "-j", ".rela",
-                "-O", "pei-x86-64",
-                str(elf_path),
-                str(bin_path),
-            ]
-            result = subprocess.run(objcopy_cmd, capture_output=True, text=True)
-            if result.returncode != 0:
-                print(f"  ✗ objcopy failed: {result.stderr}", file=sys.stderr)
-                return None
+                link_cmd = [
+                    lld,
+                    "-shared",
+                    "-Bsymbolic",
+                    "--no-undefined",
+                    "-o", str(elf_path),
+                ]
+                link_cmd.extend([str(obj) for obj in object_files])
 
-            # Fix PE subsystem field - objcopy doesn't set it correctly for UEFI
-            # The subsystem field is at offset 0x5C in the PE optional header
-            # Value 10 = EFI Application
-            print(f"  🔧 Fixing PE subsystem...")
-            with open(bin_path, 'r+b') as f:
-                # Read DOS header to find PE header offset
-                f.seek(0x3C)
-                pe_offset = int.from_bytes(f.read(4), 'little')
-                # Subsystem is at PE + 0x5C (in optional header)
-                subsystem_offset = pe_offset + 0x5C
-                f.seek(subsystem_offset)
-                # Write EFI Application subsystem (10)
-                f.write((10).to_bytes(2, 'little'))
+                result = subprocess.run(link_cmd, capture_output=True, text=True)
+                if result.returncode != 0:
+                    print(f"  ✗ Linking failed: {result.stderr}", file=sys.stderr)
+                    return None
+
+                # Convert ELF to PE using objcopy
+                print(f"  📦 Converting to PE/COFF (objcopy fallback)...")
+                objcopy_cmd = [
+                    "objcopy",
+                    "-j", ".text",
+                    "-j", ".rodata",
+                    "-j", ".data",
+                    "-j", ".bss",
+                    "-j", ".rela",
+                    "-O", "pei-x86-64",
+                    str(elf_path),
+                    str(bin_path),
+                ]
+                result = subprocess.run(objcopy_cmd, capture_output=True, text=True)
+                if result.returncode != 0:
+                    print(f"  ✗ objcopy failed: {result.stderr}", file=sys.stderr)
+                    return None
+
+                # Fix PE subsystem field - objcopy doesn't set it correctly for UEFI
+                # The subsystem field is at offset 0x5C in the PE optional header
+                # Value 10 = EFI Application
+                print(f"  🔧 Fixing PE subsystem...")
+                with open(bin_path, 'r+b') as f:
+                    # Read DOS header to find PE header offset
+                    f.seek(0x3C)
+                    pe_offset = int.from_bytes(f.read(4), 'little')
+                    # Subsystem is at PE + 0x5C (in optional header)
+                    subsystem_offset = pe_offset + 0x5C
+                    f.seek(subsystem_offset)
+                    # Write EFI Application subsystem (10)
+                    f.write((10).to_bytes(2, 'little'))
         else:
             # Normal freestanding ELF linking
             link_cmd = [lld]
