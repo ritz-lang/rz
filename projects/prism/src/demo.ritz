@@ -1,0 +1,214 @@
+# Prism Demo - Grey background with white triangle
+#
+# Minimal Harland userspace program that demonstrates graphics rendering.
+# Uses the framebuffer syscalls to draw directly to the display.
+
+import ritzlib.sys { syscall1, syscall2, STDOUT }
+import ritzlib.str { strlen }
+
+# Harland framebuffer syscalls
+const SYS_WRITE: i64 = 1
+const SYS_FB_INFO: i64 = 210
+const SYS_FB_MAP: i64 = 211
+
+# Framebuffer info structure (must match kernel definition)
+struct FbInfo
+    addr: u64       # Physical address
+    width: u32      # Horizontal resolution
+    height: u32     # Vertical resolution
+    pitch: u32      # Bytes per scanline
+    bpp: u8         # Bits per pixel
+    format: u8      # Pixel format (0=RGBX, 1=BGRX)
+    _pad: [2]u8
+
+# Get framebuffer info
+fn sys_fb_info(info: *FbInfo) -> i64
+    syscall1(SYS_FB_INFO, info as i64)
+
+# Map framebuffer into userspace
+fn sys_fb_map() -> i64
+    syscall1(SYS_FB_MAP, 0)
+
+# Print a string to serial console
+fn print_str(s: *u8)
+    let len = strlen(s)
+    syscall2(SYS_WRITE, STDOUT as i64, s as i64, len as i64)
+
+# Pack a color into BGRX format (most common for UEFI)
+fn pack_pixel_bgrx(r: u8, g: u8, b: u8) -> u32
+    (b as u32) | ((g as u32) << 8) | ((r as u32) << 16)
+
+# Set a single pixel
+fn put_pixel(fb: *u32, pitch: u32, x: u32, y: u32, color: u32)
+    let pixels_per_line = pitch / 4
+    let offset = (y as u64) * (pixels_per_line as u64) + (x as u64)
+    *(fb + offset) = color
+
+# Clear screen with a color
+fn clear_screen(fb: *u32, pitch: u32, width: u32, height: u32, color: u32)
+    let pixels_per_line = pitch / 4
+    var y: u32 = 0
+    while y < height
+        var x: u32 = 0
+        let row_offset = (y as u64) * (pixels_per_line as u64)
+        while x < width
+            *(fb + row_offset + (x as u64)) = color
+            x = x + 1
+        y = y + 1
+
+# Fill a triangle using scanline rasterization
+fn fill_triangle(fb: *u32, pitch: u32, width: u32, height: u32, x0: i32, y0: i32, x1: i32, y1: i32, x2: i32, y2: i32, color: u32)
+    # Sort vertices by Y coordinate (v0 top, v2 bottom)
+    var vx0 = x0
+    var vy0 = y0
+    var vx1 = x1
+    var vy1 = y1
+    var vx2 = x2
+    var vy2 = y2
+
+    # Bubble sort by y
+    if vy0 > vy1
+        let tx = vx0
+        let ty = vy0
+        vx0 = vx1
+        vy0 = vy1
+        vx1 = tx
+        vy1 = ty
+
+    if vy1 > vy2
+        let tx = vx1
+        let ty = vy1
+        vx1 = vx2
+        vy1 = vy2
+        vx2 = tx
+        vy2 = ty
+
+    if vy0 > vy1
+        let tx = vx0
+        let ty = vy0
+        vx0 = vx1
+        vy0 = vy1
+        vx1 = tx
+        vy1 = ty
+
+    let total_height = vy2 - vy0
+    if total_height == 0
+        return
+
+    let pixels_per_line = pitch / 4
+
+    var y = vy0
+    while y <= vy2
+        # Skip if outside screen
+        if y < 0
+            y = y + 1
+            continue
+        if y >= height as i32
+            break
+
+        # Determine which segment we're in
+        let second_half = y > vy1 or vy1 == vy0
+        var segment_height: i32 = 0
+        if second_half
+            segment_height = vy2 - vy1
+        else
+            segment_height = vy1 - vy0
+
+        if segment_height == 0
+            y = y + 1
+            continue
+
+        # Calculate alpha (progress through total height)
+        let alpha_num = y - vy0
+        let alpha_denom = total_height
+
+        # Calculate beta (progress through segment)
+        var beta_num: i32 = 0
+        if second_half
+            beta_num = y - vy1
+        else
+            beta_num = y - vy0
+        let beta_denom = segment_height
+
+        # Interpolate X coordinates along edges
+        var ax = vx0 + (vx2 - vx0) * alpha_num / alpha_denom
+        var bx: i32 = 0
+        if second_half
+            bx = vx1 + (vx2 - vx1) * beta_num / beta_denom
+        else
+            bx = vx0 + (vx1 - vx0) * beta_num / beta_denom
+
+        # Ensure ax <= bx
+        if ax > bx
+            let temp = ax
+            ax = bx
+            bx = temp
+
+        # Clip to screen bounds
+        if ax < 0
+            ax = 0
+        if bx >= width as i32
+            bx = (width as i32) - 1
+
+        # Draw horizontal line from ax to bx
+        let row_offset = (y as u64) * (pixels_per_line as u64)
+        var x = ax
+        while x <= bx
+            *(fb + row_offset + (x as u64)) = color
+            x = x + 1
+
+        y = y + 1
+
+pub fn main() -> i32
+    print_str(c"[prism_demo] Starting...\n")
+
+    # Get framebuffer info
+    var info: FbInfo
+    let info_result = sys_fb_info(@info)
+    if info_result != 0
+        print_str(c"[prism_demo] ERROR: No framebuffer available\n")
+        return 1
+
+    print_str(c"[prism_demo] Framebuffer detected\n")
+
+    # Map framebuffer into our address space
+    let fb_addr = sys_fb_map()
+    if fb_addr < 0
+        print_str(c"[prism_demo] ERROR: Failed to map framebuffer\n")
+        return 1
+
+    print_str(c"[prism_demo] Framebuffer mapped\n")
+
+    let fb = fb_addr as *u32
+    let width: u32 = info.width
+    let height: u32 = info.height
+    let pitch: u32 = info.pitch
+
+    # Clear to grey (0x80, 0x80, 0x80)
+    let grey = pack_pixel_bgrx(0x80, 0x80, 0x80)
+    clear_screen(fb, pitch, width, height, grey)
+
+    print_str(c"[prism_demo] Screen cleared to grey\n")
+
+    # Draw a white triangle in the center
+    let white = pack_pixel_bgrx(0xFF, 0xFF, 0xFF)
+
+    # Calculate triangle vertices (centered, pointing up)
+    # Re-read values to avoid move semantics
+    let cx = (info.width / 2) as i32
+    let cy = (info.height / 2) as i32
+    let size: i32 = 150
+
+    let p0_x = cx              # Top vertex
+    let p0_y = cy - size
+    let p1_x = cx - size       # Bottom left
+    let p1_y = cy + size
+    let p2_x = cx + size       # Bottom right
+    let p2_y = cy + size
+
+    fill_triangle(fb, info.pitch, info.width, info.height, p0_x, p0_y, p1_x, p1_y, p2_x, p2_y, white)
+
+    print_str(c"[prism_demo] Triangle drawn\n")
+    print_str(c"[prism_demo] SUCCESS - Grey background with white triangle!\n")
+
+    return 0

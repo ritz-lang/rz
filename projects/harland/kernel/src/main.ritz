@@ -2087,6 +2087,8 @@ const SYS_GETPID: u64 = 23
 const SYS_YIELD: u64 = 24
 const SYS_SPAWN_ARGS: u64 = 25
 const SYS_ACPI_POWEROFF: u64 = 200
+const SYS_FB_INFO: u64 = 210      # Get framebuffer info
+const SYS_FB_MAP: u64 = 211       # Map framebuffer into userspace
 const SYS_DEBUG_PRINT: u64 = 255
 
 # ============================================================================
@@ -2761,6 +2763,116 @@ fn sys_munmap_impl(addr: u64, length: u64) -> i64
 
     return 0
 
+# ============================================================================
+# Framebuffer Syscalls (for Prism compositor)
+# ============================================================================
+#
+# Provides userspace access to the framebuffer for graphics rendering.
+# These syscalls allow Prism to:
+#   1. Query framebuffer dimensions and format
+#   2. Map the framebuffer into userspace memory
+#
+# FbInfo structure (returned by sys_fb_info):
+#   u64 addr       - Physical address of framebuffer
+#   u32 width      - Horizontal resolution
+#   u32 height     - Vertical resolution
+#   u32 pitch      - Bytes per scanline
+#   u8  bpp        - Bits per pixel
+#   u8  format     - Pixel format (0=RGBX, 1=BGRX)
+#   u16 _pad       - Padding
+
+# Framebuffer info structure size: 8 + 4 + 4 + 4 + 1 + 1 + 2 = 24 bytes
+const FBINFO_SIZE: u64 = 24
+
+# Global framebuffer mapping for userspace
+var g_user_fb_mapped: u8 = 0
+var g_user_fb_addr: u64 = 0
+
+# sys_fb_info: Get framebuffer information
+# Args: info_buf pointer to 24-byte FbInfo structure
+# Returns: 0 on success, -1 if no display
+fn sys_fb_info_impl(info_buf: *u8) -> i64
+    if not display_available()
+        return -1
+
+    let fb: *SimpleFramebuffer = display_get_framebuffer()
+    if fb == 0 as *SimpleFramebuffer
+        return -1
+
+    # Write FbInfo structure
+    let buf64: *u64 = info_buf as *u64
+    let buf32: *u32 = (info_buf + 8) as *u32
+    let buf8: *u8 = info_buf + 20
+
+    # addr at offset 0
+    *buf64 = (*fb).base
+
+    # width at offset 8
+    *buf32 = (*fb).width
+
+    # height at offset 12
+    *(buf32 + 1) = (*fb).height
+
+    # pitch at offset 16
+    *(buf32 + 2) = (*fb).pitch
+
+    # bpp at offset 20
+    *buf8 = (*fb).bpp
+
+    # format at offset 21
+    *(buf8 + 1) = (*fb).format
+
+    return 0
+
+# sys_fb_map: Map framebuffer into userspace
+# Returns: Mapped address on success, -1 on error
+fn sys_fb_map_impl() -> i64
+    if not display_available()
+        return -1
+
+    let fb: *SimpleFramebuffer = display_get_framebuffer()
+    if fb == 0 as *SimpleFramebuffer
+        return -1
+
+    # If already mapped, return the existing address
+    if g_user_fb_mapped != 0
+        return g_user_fb_addr as i64
+
+    # Calculate framebuffer size
+    let fb_size: u64 = ((*fb).pitch as u64) * ((*fb).height as u64)
+    let num_pages: u64 = (fb_size + PAGE_SIZE - 1) / PAGE_SIZE
+
+    # Use a fixed address in user space for the framebuffer
+    # This is above the mmap region but below kernel space
+    let user_fb_virt: u64 = 0x00007F0000000000
+
+    # Map each page of the framebuffer
+    var i: u64 = 0
+    while i < num_pages
+        let phys_addr: u64 = (*fb).base + (i * PAGE_SIZE)
+        let virt_addr: u64 = user_fb_virt + (i * PAGE_SIZE)
+
+        # Map with write-through caching and user-accessible
+        let result: i32 = vmm_map_page(virt_addr, phys_addr, PTE_WRITABLE | PTE_USER | PTE_WRITE_THROUGH)
+        if result != 0
+            prints("[fb_map] Failed to map page ")
+            serial_print_dec(i as i64)
+            prints("\n")
+            return -1
+
+        i = i + 1
+
+    g_user_fb_mapped = 1
+    g_user_fb_addr = user_fb_virt
+
+    prints("[fb_map] Mapped ")
+    serial_print_dec(num_pages as i64)
+    prints(" pages to user address 0x")
+    serial_print_hex(user_fb_virt)
+    prints("\n")
+
+    return user_fb_virt as i64
+
 # Helper to print null-terminated string
 fn prints_str(s: *u8)
     var p: *u8 = s
@@ -2999,6 +3111,15 @@ pub fn syscall_handler(rax: u64, rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
         let result: i32 = acpi_poweroff()
         # If we get here, poweroff failed
         return result as i64
+
+    # Framebuffer syscalls for Prism compositor
+    if rax == SYS_FB_INFO
+        # sys_fb_info(info_buf: *FbInfo) -> 0 on success, -1 on no display
+        return sys_fb_info_impl(rdi as *u8)
+
+    if rax == SYS_FB_MAP
+        # sys_fb_map() -> mapped_addr or -1
+        return sys_fb_map_impl()
 
     # Unknown syscall
     prints("[syscall] unknown: ")

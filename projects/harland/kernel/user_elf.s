@@ -191,3 +191,18 @@ mmap_test_elf_end:
 
 mmap_test_elf_size:
     .quad mmap_test_elf_end - mmap_test_elf_start
+
+# ============================================================================
+# prism_demo.elf - Prism graphics demo (grey background with white triangle)
+# ============================================================================
+.global prism_demo_elf_start
+.global prism_demo_elf_end
+.global prism_demo_elf_size
+
+.align 16
+prism_demo_elf_start:
+    .incbin "build/debug/prism_demo.elf"
+prism_demo_elf_end:
+
+prism_demo_elf_size:
+    .quad prism_demo_elf_end - prism_demo_elf_start
