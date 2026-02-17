@@ -6,63 +6,87 @@
 
 The Ritz ecosystem separates the **kernel** from the **distribution**:
 
-- **Harland** — The microkernel. Just the kernel, nothing else.
-- **Indium** — The distribution. Builds the kernel, userspace, and creates bootable images.
+- **Harland** — The microkernel. Just the kernel and UEFI bootloader.
+- **Indium** — The distribution. Builds userspace, creates images, runs QEMU.
 
 This separation allows:
-- Multiple distributions built on Harland
 - Clean testing of kernel vs userspace
 - Proper packaging and image creation
+- Multiple distributions built on Harland (future)
 
-## Current Status
+## Quick Start
 
-**Work in Progress** — Indium is being extracted from the harland project.
+```bash
+# Build everything and create bootable ISO
+make
 
-Currently, harland contains embedded userspace programs (init, hello, true, false, etc.)
-and QEMU run scripts. These will migrate here.
+# Boot in QEMU (BIOS mode via GRUB)
+make run-iso
 
-## Planned Structure
+# Boot in QEMU (UEFI mode)
+make run
+
+# Build with debugging (GDB server on :1234)
+make debug
+```
+
+## Structure
 
 ```
 indium/
-├── build.py              # Main build script
-├── config/               # Distribution configuration
-│   └── default.toml      # Default config
-├── initramfs/            # Initramfs staging
-│   ├── bin/              # Userspace binaries
-│   ├── etc/              # Configuration files
-│   └── ...
-├── image/                # Image creation
-│   └── iso.py            # ISO image builder
-└── run/                  # QEMU run scripts
-    └── qemu.py           # QEMU launcher
+├── ritz.toml             # Userspace program build config
+├── Makefile              # Distribution build orchestration
+├── tools/
+│   ├── mkiso.sh          # ISO image builder
+│   ├── mkimage.py        # qcow2 disk image builder
+│   └── mkboot.sh         # Raw disk image builder
+├── user/                 # Userspace programs
+│   ├── libharland.ritz   # Syscall library
+│   ├── linker_pie.ld     # Position-independent linker
+│   ├── init.ritz         # Init process (PID 1)
+│   ├── hello.ritz        # Hello world
+│   ├── true.ritz         # Exit 0
+│   ├── false.ritz        # Exit 1
+│   ├── echo.ritz         # Echo arguments
+│   ├── wc.ritz           # Word count
+│   └── ...               # Other utilities
+└── config/               # Future: distribution configs
 ```
 
-## Build Process (Planned)
+## Build Targets
 
-```bash
-# Build everything
-./indium build
+| Target | Description |
+|--------|-------------|
+| `make` | Build ISO (default) |
+| `make kernel` | Build Harland kernel |
+| `make userspace` | Build userspace programs |
+| `make iso` | Create bootable ISO with GRUB |
+| `make image` | Create qcow2 disk image (UEFI) |
+| `make run` | Boot in QEMU (UEFI mode) |
+| `make run-iso` | Boot in QEMU (BIOS/GRUB mode) |
+| `make debug` | Boot with GDB server on :1234 |
+| `make clean` | Remove build artifacts |
 
-# This will:
-# 1. Build harland kernel
-# 2. Build userspace (init, rzsh, utilities)
-# 3. Create initramfs TAR archive
-# 4. Create bootable ISO
-# 5. (Optional) Create disk image
+## Userspace Programs
 
-# Run in QEMU
-./indium run
-```
+### Tier 1 - Basic Utilities
+- `hello` - Print "Hello from Harland!"
+- `true` - Exit with status 0
+- `false` - Exit with status 1
+- `exitcode` - Exit with specific code
+- `echo` - Print arguments
+- `wc` - Count words/lines/bytes
+- `seq10` - Print 1-10
+- `cat_motd` - Print message of the day
 
-## Migration Plan
+### System Programs
+- `init` - Init process (PID 1)
+- `ping` - Network connectivity test
 
-1. [x] Create indium project stub
-2. [ ] Move QEMU scripts from harland/boot/ to indium/run/
-3. [ ] Move initramfs creation from kernel to indium
-4. [ ] Remove embedded ELFs from kernel (use disk/TAR instead)
-5. [ ] Create proper build orchestration
-6. [ ] Support multiple configurations (test, release, etc.)
+### Test Programs
+- `args_test` - Test argument passing
+- `minimal_syscall` - Minimal syscall test
+- `portable_getpid` - getpid() test
 
 ## Why "Indium"?
 

@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Harland ISO Creation Script
+# Indium ISO Creation Script
 #
 # Creates a bootable ISO with GRUB2 and the Harland kernel.
 # This allows booting via Multiboot2 protocol.
@@ -13,10 +13,13 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+HARLAND_DIR="$PROJECT_ROOT/../harland"
 BUILD_DIR="$PROJECT_ROOT/build"
-KERNEL_ELF="$BUILD_DIR/harland.elf"
+
+# Kernel is built by harland project
+KERNEL_ELF="$HARLAND_DIR/build/debug/harland.elf"
 ISO_DIR="$BUILD_DIR/isodir"
-ISO_FILE="$BUILD_DIR/harland.iso"
+ISO_FILE="$BUILD_DIR/indium.iso"
 
 # Parse args
 if [ "$1" == "--clean" ]; then
@@ -28,7 +31,7 @@ fi
 # Check kernel exists
 if [ ! -f "$KERNEL_ELF" ]; then
     echo "Error: Kernel not found at $KERNEL_ELF"
-    echo "Run: python3 build.py build kernel"
+    echo "Build the kernel first: make -C ../harland kernel"
     exit 1
 fi
 
@@ -39,9 +42,12 @@ if ! command -v grub-mkrescue &> /dev/null; then
     exit 1
 fi
 
-echo "=== Creating Harland ISO ==="
+echo "=== Creating Indium ISO ==="
 echo "Kernel: $KERNEL_ELF"
 echo ""
+
+# Create build directory
+mkdir -p "$BUILD_DIR"
 
 # Create ISO directory structure
 mkdir -p "$ISO_DIR/boot/grub"
@@ -51,12 +57,12 @@ cp "$KERNEL_ELF" "$ISO_DIR/boot/harland.elf"
 
 # Create GRUB configuration
 cat > "$ISO_DIR/boot/grub/grub.cfg" << 'EOF'
-# Harland GRUB Configuration
+# Indium GRUB Configuration
 
 set timeout=0
 set default=0
 
-menuentry "Harland" {
+menuentry "Indium (Harland Kernel)" {
     multiboot2 /boot/harland.elf
     boot
 }
@@ -64,7 +70,7 @@ EOF
 
 # Create ISO (force both BIOS and UEFI boot modes)
 echo "Building ISO..."
-grub-mkrescue -o "$ISO_FILE" "$ISO_DIR" -- -volid "HARLAND"
+grub-mkrescue -o "$ISO_FILE" "$ISO_DIR" -- -volid "INDIUM"
 
 if [ -f "$ISO_FILE" ]; then
     echo ""
@@ -72,6 +78,8 @@ if [ -f "$ISO_FILE" ]; then
     ls -lh "$ISO_FILE"
     echo ""
     echo "To boot in QEMU:"
+    echo "  make run-iso"
+    echo "  # or:"
     echo "  qemu-system-x86_64 -cdrom $ISO_FILE -serial stdio -m 128M"
 else
     echo "Error: ISO creation failed"
