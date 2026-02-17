@@ -1,9 +1,10 @@
 /* PIE User program linker script for Harland */
 /* Position-Independent Executable - can be loaded at any address */
+/* Entry point is _start (provided by runtime) which calls main() and sys_exit() */
 
 OUTPUT_FORMAT("elf64-x86-64")
 OUTPUT_ARCH(i386:x86-64)
-ENTRY(main)
+ENTRY(_start)
 
 SECTIONS
 {
