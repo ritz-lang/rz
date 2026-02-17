@@ -1,0 +1,313 @@
+# rzsh input handling
+#
+# This module provides escape sequence parsing for arrow keys and special keys.
+# It also provides line editing utilities for cursor movement.
+
+import ritzlib.sys { sys_read, sys_write, STDIN, STDOUT }
+import ritzlib.str { strlen }
+
+# ============================================================================
+# Input key codes
+# ============================================================================
+
+# Special key codes (values > 255 to distinguish from regular chars)
+pub const KEY_NONE: i32 = 0
+pub const KEY_CHAR: i32 = 1        # Regular character (value in low byte)
+pub const KEY_UP: i32 = 256
+pub const KEY_DOWN: i32 = 257
+pub const KEY_RIGHT: i32 = 258
+pub const KEY_LEFT: i32 = 259
+pub const KEY_HOME: i32 = 260
+pub const KEY_END: i32 = 261
+pub const KEY_DELETE: i32 = 262
+pub const KEY_BACKSPACE: i32 = 263
+pub const KEY_ENTER: i32 = 264
+pub const KEY_TAB: i32 = 265
+pub const KEY_CTRL_C: i32 = 266
+pub const KEY_CTRL_D: i32 = 267
+pub const KEY_CTRL_A: i32 = 268
+pub const KEY_CTRL_E: i32 = 269
+pub const KEY_CTRL_K: i32 = 270    # Kill to end of line
+pub const KEY_CTRL_U: i32 = 271    # Kill to start of line
+pub const KEY_CTRL_W: i32 = 272    # Kill previous word
+pub const KEY_CTRL_L: i32 = 273    # Clear screen
+pub const KEY_ESCAPE: i32 = 274    # Bare escape (after timeout)
+pub const KEY_UNKNOWN: i32 = 275
+
+# ============================================================================
+# Escape sequence parser state
+# ============================================================================
+
+# Parser states
+const STATE_NORMAL: i32 = 0
+const STATE_ESCAPE: i32 = 1      # Saw ESC (0x1B)
+const STATE_BRACKET: i32 = 2     # Saw ESC [
+const STATE_EXTENDED: i32 = 3    # Saw ESC [ digit (for sequences like ESC [ 3 ~)
+
+# Parser state (global for simplicity)
+var g_parse_state: i32 = 0
+var g_escape_param: i32 = 0
+
+# Reset parser state
+pub fn input_reset()
+    g_parse_state = STATE_NORMAL
+    g_escape_param = 0
+
+# ============================================================================
+# Parse a single byte into a key code
+# ============================================================================
+# Returns:
+#   KEY_NONE if more bytes needed (escape sequence in progress)
+#   KEY_CHAR + (char << 16) for regular characters
+#   KEY_* for special keys
+
+pub fn input_parse_byte(b: u8) -> i32
+    if g_parse_state == STATE_NORMAL
+        # Regular input mode
+        if b == 27  # ESC
+            g_parse_state = STATE_ESCAPE
+            return KEY_NONE
+
+        if b == 127 or b == 8  # DEL or Backspace
+            return KEY_BACKSPACE
+
+        if b == 13 or b == 10  # CR or LF
+            return KEY_ENTER
+
+        if b == 9  # Tab
+            return KEY_TAB
+
+        if b == 3  # Ctrl+C
+            return KEY_CTRL_C
+
+        if b == 4  # Ctrl+D (EOF)
+            return KEY_CTRL_D
+
+        if b == 1  # Ctrl+A (start of line)
+            return KEY_CTRL_A
+
+        if b == 5  # Ctrl+E (end of line)
+            return KEY_CTRL_E
+
+        if b == 11  # Ctrl+K (kill to end)
+            return KEY_CTRL_K
+
+        if b == 21  # Ctrl+U (kill to start)
+            return KEY_CTRL_U
+
+        if b == 23  # Ctrl+W (kill word)
+            return KEY_CTRL_W
+
+        if b == 12  # Ctrl+L (clear screen)
+            return KEY_CTRL_L
+
+        # Regular printable character
+        if b >= 32 and b < 127
+            return KEY_CHAR | ((b as i32) << 16)
+
+        # Other control characters - return as unknown
+        return KEY_UNKNOWN
+
+    if g_parse_state == STATE_ESCAPE
+        # Saw ESC, waiting for next byte
+        if b == 91  # '[' = 0x5B
+            g_parse_state = STATE_BRACKET
+            return KEY_NONE
+
+        if b == 79  # 'O' = 0x4F (some terminals use ESC O for function keys)
+            g_parse_state = STATE_BRACKET  # Treat same as CSI for now
+            return KEY_NONE
+
+        # ESC followed by something else - reset and treat ESC as escape key
+        g_parse_state = STATE_NORMAL
+        # Return the character that followed ESC as a regular char
+        return KEY_ESCAPE  # The next call will process the current byte
+
+    if g_parse_state == STATE_BRACKET
+        # Saw ESC [, waiting for final byte
+        if b == 65  # 'A'
+            g_parse_state = STATE_NORMAL
+            return KEY_UP
+
+        if b == 66  # 'B'
+            g_parse_state = STATE_NORMAL
+            return KEY_DOWN
+
+        if b == 67  # 'C'
+            g_parse_state = STATE_NORMAL
+            return KEY_RIGHT
+
+        if b == 68  # 'D'
+            g_parse_state = STATE_NORMAL
+            return KEY_LEFT
+
+        if b == 72  # 'H'
+            g_parse_state = STATE_NORMAL
+            return KEY_HOME
+
+        if b == 70  # 'F'
+            g_parse_state = STATE_NORMAL
+            return KEY_END
+
+        # Check for digit (extended sequence like ESC [ 3 ~)
+        if b >= 48 and b <= 57  # '0'-'9'
+            g_escape_param = (b - 48) as i32
+            g_parse_state = STATE_EXTENDED
+            return KEY_NONE
+
+        # Unknown sequence - reset
+        g_parse_state = STATE_NORMAL
+        return KEY_UNKNOWN
+
+    if g_parse_state == STATE_EXTENDED
+        # Saw ESC [ digit, looking for ~ or more digits
+        if b >= 48 and b <= 57  # More digits
+            g_escape_param = g_escape_param * 10 + ((b - 48) as i32)
+            return KEY_NONE
+
+        if b == 126  # '~'
+            g_parse_state = STATE_NORMAL
+            let param: i32 = g_escape_param
+            g_escape_param = 0
+
+            if param == 1  # Home
+                return KEY_HOME
+            if param == 3  # Delete
+                return KEY_DELETE
+            if param == 4  # End
+                return KEY_END
+            if param == 5  # Page Up (ignore for now)
+                return KEY_UNKNOWN
+            if param == 6  # Page Down (ignore for now)
+                return KEY_UNKNOWN
+
+            return KEY_UNKNOWN
+
+        # Unknown extended sequence - reset
+        g_parse_state = STATE_NORMAL
+        g_escape_param = 0
+        return KEY_UNKNOWN
+
+    # Should not reach here
+    g_parse_state = STATE_NORMAL
+    return KEY_UNKNOWN
+
+# ============================================================================
+# Check if parser is in the middle of an escape sequence
+# ============================================================================
+
+pub fn input_in_escape() -> bool
+    return g_parse_state != STATE_NORMAL
+
+# ============================================================================
+# Extract character from KEY_CHAR result
+# ============================================================================
+
+pub fn input_get_char(key: i32) -> u8
+    return ((key >> 16) & 0xFF) as u8
+
+# ============================================================================
+# Cursor movement helpers
+# ============================================================================
+
+# Move cursor left by n positions
+pub fn cursor_left(n: i32)
+    if n <= 0
+        return
+
+    # ESC [ <n> D
+    var buf: [16]u8
+    buf[0] = 27   # ESC
+    buf[1] = 91   # [
+
+    var i: i32 = 2
+    if n >= 100
+        buf[i] = 48 + ((n / 100) as u8)
+        i = i + 1
+    if n >= 10
+        buf[i] = 48 + (((n / 10) % 10) as u8)
+        i = i + 1
+    buf[i] = 48 + ((n % 10) as u8)
+    i = i + 1
+
+    buf[i] = 68   # D
+    i = i + 1
+
+    sys_write(STDOUT, @buf[0], i as i64)
+
+# Move cursor right by n positions
+pub fn cursor_right(n: i32)
+    if n <= 0
+        return
+
+    # ESC [ <n> C
+    var buf: [16]u8
+    buf[0] = 27   # ESC
+    buf[1] = 91   # [
+
+    var i: i32 = 2
+    if n >= 100
+        buf[i] = 48 + ((n / 100) as u8)
+        i = i + 1
+    if n >= 10
+        buf[i] = 48 + (((n / 10) % 10) as u8)
+        i = i + 1
+    buf[i] = 48 + ((n % 10) as u8)
+    i = i + 1
+
+    buf[i] = 67   # C
+    i = i + 1
+
+    sys_write(STDOUT, @buf[0], i as i64)
+
+# Move cursor to column n (1-based)
+pub fn cursor_column(n: i32)
+    if n <= 0
+        n = 1
+
+    # ESC [ <n> G
+    var buf: [16]u8
+    buf[0] = 27   # ESC
+    buf[1] = 91   # [
+
+    var i: i32 = 2
+    if n >= 100
+        buf[i] = 48 + ((n / 100) as u8)
+        i = i + 1
+    if n >= 10
+        buf[i] = 48 + (((n / 10) % 10) as u8)
+        i = i + 1
+    buf[i] = 48 + ((n % 10) as u8)
+    i = i + 1
+
+    buf[i] = 71   # G
+    i = i + 1
+
+    sys_write(STDOUT, @buf[0], i as i64)
+
+# Clear from cursor to end of line
+pub fn clear_to_eol()
+    # ESC [ K (or ESC [ 0 K)
+    var buf: [4]u8
+    buf[0] = 27   # ESC
+    buf[1] = 91   # [
+    buf[2] = 75   # K
+    sys_write(STDOUT, @buf[0], 3)
+
+# Save cursor position
+pub fn cursor_save()
+    # ESC [ s
+    var buf: [3]u8
+    buf[0] = 27
+    buf[1] = 91
+    buf[2] = 115  # s
+    sys_write(STDOUT, @buf[0], 3)
+
+# Restore cursor position
+pub fn cursor_restore()
+    # ESC [ u
+    var buf: [3]u8
+    buf[0] = 27
+    buf[1] = 91
+    buf[2] = 117  # u
+    sys_write(STDOUT, @buf[0], 3)

@@ -12,8 +12,12 @@ import ritzlib.sys {
     # Linux-specific (only used when target_os=linux)
     sys_open, sys_close, sys_getdents64, sys_fork, sys_execve, sys_wait4, sys_exit,
     O_RDONLY, O_DIRECTORY,
+    tcgetattr, tcsetattr, Termios,
+    ECHO, ICANON, ISIG, IEXTEN, ICRNL, IXON,
+    VMIN, VTIME, STDIN,
     # Harland-specific (only used when target_os=harland)
-    sys_readdir, sys_spawn_args, sys_wait, sys_yield
+    sys_readdir, sys_spawn_args, sys_wait, sys_yield,
+    sys_tty_getattr, sys_tty_setattr, TtyAttrs, TTY_ECHO, TTY_ICANON
 }
 
 import ritzlib.str { strlen }
@@ -155,3 +159,83 @@ pub fn os_bin_path_1() -> *u8
 [[target_os = "harland"]]
 pub fn os_bin_path_2() -> *u8
     return c"/bin/"  # Only one path on Harland for now
+
+# ============================================================================
+# Terminal raw mode
+# ============================================================================
+# Raw mode disables canonical input (line buffering) and echo, allowing
+# character-by-character input with escape sequence detection.
+
+# Shared state for raw mode tracking (used by both targets)
+# Note: g_orig_termios storage is platform-specific but we need one buffer
+# that holds Termios (60 bytes) or TtyAttrs (4 bytes) depending on target.
+# We allocate enough for Termios (the larger one).
+var g_termios_storage: [64]u8
+# 0 = not in raw mode, 1 = in raw mode
+var g_raw_mode_active: i32 = 0
+
+# Linux: Save original termios and apply raw mode settings
+[[target_os = "linux"]]
+pub fn os_enable_raw_mode() -> i32
+    if g_raw_mode_active != 0
+        return 0  # Already in raw mode
+
+    # Cast storage to Termios pointer
+    let orig_termios: *Termios = @g_termios_storage[0] as *Termios
+
+    # Get current terminal settings
+    let r1: i32 = tcgetattr(STDIN, orig_termios)
+    if r1 != 0
+        return r1  # Failed (probably not a tty)
+
+    # Create raw mode settings
+    var raw: Termios = *orig_termios
+
+    # Disable canonical mode, echo, signals, extended processing
+    raw.c_lflag = raw.c_lflag & (0xFFFFFFFF ^ (ECHO | ICANON | ISIG | IEXTEN))
+
+    # Disable CR->NL translation and XON/XOFF
+    raw.c_iflag = raw.c_iflag & (0xFFFFFFFF ^ (ICRNL | IXON))
+
+    # Set minimum characters for read to 1, timeout to 0
+    raw.c_cc[VMIN] = 1
+    raw.c_cc[VTIME] = 0
+
+    # Apply raw mode
+    let r2: i32 = tcsetattr(STDIN, @raw)
+    if r2 != 0
+        return r2
+
+    g_raw_mode_active = 1
+    return 0
+
+[[target_os = "linux"]]
+pub fn os_disable_raw_mode() -> i32
+    if g_raw_mode_active == 0
+        return 0  # Not in raw mode
+
+    # Restore original terminal settings
+    let orig_termios: *Termios = @g_termios_storage[0] as *Termios
+    let r: i32 = tcsetattr(STDIN, orig_termios)
+    g_raw_mode_active = 0
+    return r
+
+[[target_os = "linux"]]
+pub fn os_is_raw_mode() -> bool
+    return g_raw_mode_active != 0
+
+# Harland: Terminal is always in "raw" mode from the shell's perspective
+# The kernel provides character-by-character input via serial console
+[[target_os = "harland"]]
+pub fn os_enable_raw_mode() -> i32
+    g_raw_mode_active = 1
+    return 0  # Always succeeds - Harland serial is already raw
+
+[[target_os = "harland"]]
+pub fn os_disable_raw_mode() -> i32
+    g_raw_mode_active = 0
+    return 0
+
+[[target_os = "harland"]]
+pub fn os_is_raw_mode() -> bool
+    return g_raw_mode_active != 0
