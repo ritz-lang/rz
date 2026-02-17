@@ -21,14 +21,14 @@ import ritzlib.async_net
 import ritzlib.async_tasks
 import ritzlib.iovec
 
-import lib.request
-import lib.response
-import lib.router
-import lib.config
-import lib.log
-import lib.static
-import lib.compress
-import lib.tls
+import request
+import response
+import router
+import config
+import log
+import static
+import compress
+import tls
 
 
 # ============================================================================
@@ -170,11 +170,18 @@ pub fn valet_tls(app: *Valet, cert_pem: *u8, cert_pem_len: i64, key_pem: *u8, ke
         prints("Error: Failed to load TLS certificate\n")
         return -1
 
-    # Load private key (Ed25519)
-    let key_ret: i32 = tls_server_config_load_ed25519_key(@app.tls_config, key_pem, key_pem_len)
-    if key_ret < 0
-        prints("Error: Failed to load TLS private key\n")
-        return -2
+    # Try loading private key - first try ECDSA P-256, then Ed25519
+    var key_ret: i32 = tls_server_config_load_ecdsa_p256_key(@app.tls_config, key_pem, key_pem_len)
+    if key_ret == 0
+        prints("Loaded ECDSA P-256 private key\n")
+    else
+        # Fall back to Ed25519
+        key_ret = tls_server_config_load_ed25519_key(@app.tls_config, key_pem, key_pem_len)
+        if key_ret == 0
+            prints("Loaded Ed25519 private key\n")
+        else
+            prints("Error: Failed to load TLS private key (tried ECDSA P-256 and Ed25519)\n")
+            return -2
 
     app.tls_enabled = 1
     return 0
@@ -321,6 +328,39 @@ pub fn ctx_param(idx: i32, buf: *u8, buf_len: i32) -> i32
     return route_match_get_param(c.route_result, idx, buf, buf_len)
 
 
+# Get request body (for POST/PUT requests)
+# Copies up to buf_len bytes of body to buf
+# Returns number of bytes copied, or -1 on error
+pub fn ctx_body(buf: *u8, buf_len: i32) -> i32
+    let c: *HandlerContext = get_g_ctx()
+    if c == null
+        return -1
+
+    # Body starts after headers_end in the raw buffer
+    let body_start: i32 = c.req.headers_end
+    let body_len: i32 = c.req.content_length
+
+    if body_start < 0 or body_len <= 0
+        return 0
+
+    # Calculate actual length to copy
+    var copy_len: i32 = body_len
+    if copy_len > buf_len
+        copy_len = buf_len
+
+    # Check we don't read past end of raw buffer
+    if body_start + copy_len > c.raw_len
+        copy_len = c.raw_len - body_start
+        if copy_len < 0
+            return 0
+
+    # Copy body data
+    for i in 0..copy_len
+        *(buf + i) = *(c.raw_buf + body_start + i)
+
+    return copy_len
+
+
 # Send a plain text response
 pub fn ctx_text(status: i32, body: *u8) -> i32
     let c: *HandlerContext = get_g_ctx()
@@ -358,6 +398,34 @@ pub fn ctx_ok(body: *u8) -> i32
 # Send a 404 Not Found
 pub fn ctx_not_found() -> i32
     return ctx_text(404, c"404 Not Found\n")
+
+
+# Send an HTML response
+pub fn ctx_html(status: i32, body: *u8) -> i32
+    let c: *HandlerContext = get_g_ctx()
+    if c == null
+        return -1
+    let body_len: i32 = strlen(body) as i32
+    response_status(c.res, status)
+    response_header(c.res, c"Content-Type", c"text/html; charset=utf-8")
+    response_content_length(c.res, body_len as i64)
+    response_header(c.res, c"Connection", c"keep-alive")
+    response_end_headers(c.res)
+    response_body(c.res, body, body_len)
+    return 0
+
+
+# Send a redirect response (302 Found)
+pub fn ctx_redirect(location: *u8) -> i32
+    let c: *HandlerContext = get_g_ctx()
+    if c == null
+        return -1
+    response_status(c.res, 302)
+    response_header(c.res, c"Location", location)
+    response_content_length(c.res, 0)
+    response_header(c.res, c"Connection", c"keep-alive")
+    response_end_headers(c.res)
+    return 0
 
 
 # Get a request header by name
@@ -967,21 +1035,23 @@ pub fn valet_handle_connection(task: *Task) -> i32
 # ============================================================================
 
 # TLS connection states
-const TLS_CONN_STATE_HANDSHAKE: i32 = 0
-const TLS_CONN_STATE_RECV: i32 = 1
-const TLS_CONN_STATE_PARSE: i32 = 2
-const TLS_CONN_STATE_SEND: i32 = 3
+# Note: INIT must be 0 since spawn_task initializes handler_state to 0
+const TLS_CONN_STATE_INIT: i32 = 0
+const TLS_CONN_STATE_HANDSHAKE: i32 = 1
+const TLS_CONN_STATE_RECV: i32 = 2
+const TLS_CONN_STATE_PARSE: i32 = 3
+const TLS_CONN_STATE_SEND: i32 = 4
 
 # Global TLS server instance per connection
-# We allocate these on the heap since TlsServer is large (~10KB)
+# We allocate these on the heap since TlsServer is large (~35KB with work buffers)
 # task.user_data points to the TlsTaskData structure
 struct TlsTaskData
     pool: *TaskPool             # Pointer to task pool (for I/O)
-    tls: TlsServer              # TLS connection state
+    tls: TlsServer              # TLS connection state (~35KB)
 
 # Allocate TLS task data
 pub fn tls_task_data_alloc() -> *TlsTaskData
-    let size: i64 = 12000  # Slightly more than sizeof(TlsTaskData)
+    let size: i64 = 40960  # ~40KB for TlsTaskData (TlsServer is ~35KB + work buffers)
     let flags: i32 = 0x02 | 0x20  # MAP_PRIVATE | MAP_ANONYMOUS
     let prot: i32 = 0x01 | 0x02   # PROT_READ | PROT_WRITE
     let ptr: *u8 = sys_mmap(0, size, prot, flags, -1, 0)
@@ -992,7 +1062,7 @@ pub fn tls_task_data_alloc() -> *TlsTaskData
 pub fn tls_task_data_free(data: *TlsTaskData)
     if data != null
         tls_server_free(@data.tls)
-        sys_munmap(data as *u8, 12000)
+        sys_munmap(data as *u8, 40960)
 
 # TLS-specific I/O helpers that use the pool from TlsTaskData
 pub fn tls_task_recv(task: *Task, tls_data: *TlsTaskData) -> i32
@@ -1002,26 +1072,45 @@ pub fn tls_task_send(task: *Task, tls_data: *TlsTaskData, len: i32) -> i32
     return task_submit_send(tls_data.pool, task, len)
 
 pub fn valet_handle_tls_connection(task: *Task) -> i32
+    prints("[TLS] handle_tls_connection called\n")
     let app: *Valet = get_g_app()
-    var tls_data: *TlsTaskData = task.user_data as *TlsTaskData
+    var tls_data: *TlsTaskData = null
 
-    # On first call, allocate TLS state
-    if tls_data == null
+    # On first call (handler_state == 0), allocate TLS state
+    # Note: spawn_task sets handler_state=0 and user_data=pool pointer,
+    # so we can't use user_data==null for first-call detection
+    if task.handler_state == TLS_CONN_STATE_INIT
+        prints("[TLS] Allocating TLS state...\n")
         tls_data = tls_task_data_alloc()
         if tls_data == null
+            prints("[TLS] ERROR: Allocation failed!\n")
             return 1  # Allocation failed
+        prints("[TLS] Setting pool pointer...\n")
         tls_data.pool = get_tls_pool()
+        prints("[TLS] Calling tls_server_init...\n")
         tls_server_init(@tls_data.tls, @app.tls_config)
+        prints("[TLS] tls_server_init done\n")
         task.user_data = tls_data as *u8
         task.handler_state = TLS_CONN_STATE_HANDSHAKE
         task.io_result = 0
+        prints("[TLS] TLS state allocated, starting handshake\n")
+    else
+        tls_data = task.user_data as *TlsTaskData
 
     # State: HANDSHAKE - TLS negotiation
     if task.handler_state == TLS_CONN_STATE_HANDSHAKE
+        prints("[TLS] In HANDSHAKE state, io_result=")
+        print_int(task.io_result as i64)
+        prints(", tls_state=")
+        print_int(tls_server_state(@tls_data.tls) as i64)
+        prints("\n")
+
         # Need to receive data?
         if task.io_result == 0 && tls_server_state(@tls_data.tls) == TLS_SERVER_STATE_INIT
+            prints("[TLS] Submitting recv for ClientHello...\n")
             let ret = tls_task_recv(task, tls_data)
             if ret < 0
+                prints("[TLS] ERROR: recv submit failed\n")
                 tls_task_data_free(tls_data)
                 task.user_data = null
                 return 1
@@ -1029,11 +1118,23 @@ pub fn valet_handle_tls_connection(task: *Task) -> i32
 
         # Feed received data to TLS
         if task.io_result > 0
+            prints("[TLS] Processing ")
+            print_int(task.io_result as i64)
+            prints(" bytes of TLS data\n")
             var out: [8192]u8
             var out_len: i64 = 0
             let result: i32 = tls_server_process(@tls_data.tls, @task.read_buf[0], task.io_result as i64, @out[0], 8192, @out_len)
 
+            prints("[TLS] tls_server_process returned ")
+            print_int(result as i64)
+            prints(", out_len=")
+            print_int(out_len)
+            prints("\n")
+
             if result == TLS_RESULT_ERROR
+                prints("[TLS] ERROR: Handshake error, tls_error=")
+                print_int(tls_server_error(@tls_data.tls) as i64)
+                prints("\n")
                 log_error(c"TLS handshake error")
                 tls_task_data_free(tls_data)
                 task.user_data = null
@@ -1287,26 +1388,25 @@ pub fn valet_run(app: *Valet) -> i32
     router_debug(@app.router)
     prints("\n")
 
-    # Initialize task server
-    var srv: TaskServer
-    var ret_init: i32 = task_server_init(@srv, server_fd)
-    if ret_init < 0
-        prints("Failed to initialize task server\n")
+    # Create task server on the heap (too large for stack - ~4.5MB!)
+    let srv: *TaskServer = task_server_create(server_fd)
+    if srv == null
+        prints("Failed to create task server\n")
         sys_close(server_fd)
         return 1
 
     srv.pool.ring = @srv.ring
 
     # Set up shutdown hook to check global shutdown flag
-    task_server_set_shutdown_hook(@srv, valet_check_shutdown)
+    task_server_set_shutdown_hook(srv, valet_check_shutdown)
 
     # Set idle timeout if configured
     if app.idle_timeout > 0
-        task_server_set_idle_timeout(@srv, app.idle_timeout)
+        task_server_set_idle_timeout(srv, app.idle_timeout)
 
     # Set max connections limit if configured
     if app.max_connections > 0
-        task_server_set_max_connections(@srv, app.max_connections)
+        task_server_set_max_connections(srv, app.max_connections)
 
     # Run event loop - use TLS handler if enabled
     var ret: i32
@@ -1314,16 +1414,16 @@ pub fn valet_run(app: *Valet) -> i32
         # Store pool reference for TLS handler
         set_tls_pool(@srv.pool)
         if app.multishot
-            ret = task_server_run_multishot(@srv, valet_handle_tls_connection)
+            ret = task_server_run_multishot(srv, valet_handle_tls_connection)
         else
-            ret = task_server_run(@srv, valet_handle_tls_connection)
+            ret = task_server_run(srv, valet_handle_tls_connection)
     else
         if app.multishot
-            ret = task_server_run_multishot(@srv, valet_handle_connection)
+            ret = task_server_run_multishot(srv, valet_handle_connection)
         else
-            ret = task_server_run(@srv, valet_handle_connection)
+            ret = task_server_run(srv, valet_handle_connection)
 
     prints("Server shutting down...\n")
-    task_server_destroy(@srv)
+    task_server_free(srv)
     sys_close(server_fd)
     return ret

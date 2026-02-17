@@ -1,0 +1,214 @@
+# spire/repo/mausoleum.ritz
+#
+# Mausoleum database adapter for Spire repositories
+#
+# This module provides the connection between Spire's repository abstraction
+# and the Mausoleum document database. It handles:
+# - Connection management
+# - Document serialization/deserialization
+# - CRUD operations mapped to Mausoleum protocol
+# - Scanning/querying
+#
+# Usage:
+#
+#   # Initialize database connection
+#   var db: Db
+#   db_init(@db, "127.0.0.1", 7777, "my_collection")
+#
+#   # Insert a document
+#   var doc_id: i64 = db_insert(@db, data, len)
+#
+#   # Get a document
+#   var data: *u8 = null
+#   var len: i32 = 0
+#   db_get(@db, doc_id, @data, @len)
+#
+#   # Scan all documents
+#   db_scan(@db, callback, user_data)
+#
+#   # Close connection
+#   db_close(@db)
+
+import ritzlib.sys
+import ritzlib.str
+import ritzlib.memory
+import ritzlib.io
+import ritzlib.strview { StrView, strview_from_ptr }
+
+import mausoleum.client { Client, client_new, client_free }
+import mausoleum.client { client_connect, client_disconnect, client_is_connected }
+import mausoleum.client { client_insert, client_get, client_delete, client_scan }
+import mausoleum.protocol { MSG_SCAN_RESULT }
+import mausoleum.m7m_types { ERR_OK }
+import mausoleum.document { Document, DocumentId, Field }
+import mausoleum.document { doc_init, doc_id_invalid, field_string }
+import mausoleum.document { doc_set_field, doc_get_field, FIELD_STRING }
+import mausoleum.collection { doc_serialize, doc_deserialize }
+
+# Import from same package - use relative import
+# Note: RepoError types are defined in mod.ritz but not used yet in this basic adapter
+
+# ============================================================================
+# Database Connection
+# ============================================================================
+
+pub struct Db
+    client: *Client
+    connected: i32
+    host: [64]u8
+    host_len: i32
+    port: i32
+    collection: [64]u8
+    collection_len: i32
+
+# Initialize a database connection
+pub fn db_init(db: *Db, host: *u8, host_len: i32, port: i32, collection: *u8, collection_len: i32) -> i32
+    db.client = null
+    db.connected = 0
+    db.port = port
+
+    # Copy host
+    if host_len > 63
+        db.host_len = 63
+    else
+        db.host_len = host_len
+    for i in 0..db.host_len
+        db.host[i] = *(host + i)
+    db.host[db.host_len] = 0
+
+    # Copy collection name
+    if collection_len > 63
+        db.collection_len = 63
+    else
+        db.collection_len = collection_len
+    for i in 0..db.collection_len
+        db.collection[i] = *(collection + i)
+    db.collection[db.collection_len] = 0
+
+    return 0
+
+# Connect to the database
+pub fn db_connect(db: *Db) -> i32
+    if db.connected != 0
+        return 0  # Already connected
+
+    db.client = client_new()
+    if db.client == null
+        return -1
+
+    let result: i32 = client_connect(db.client, @db.host[0], db.port, @db.collection[0], db.collection_len)
+    if result < 0
+        client_free(db.client)
+        db.client = null
+        return result
+
+    db.connected = 1
+    return 0
+
+# Close the database connection
+pub fn db_close(db: *Db)
+    if db.client != null
+        if db.connected != 0
+            client_disconnect(db.client)
+        client_free(db.client)
+        db.client = null
+    db.connected = 0
+
+# Check if connected
+pub fn db_is_connected(db: *Db) -> i32
+    return db.connected
+
+# ============================================================================
+# CRUD Operations
+# ============================================================================
+
+# Insert raw document data, returns document ID or < 0 on error
+pub fn db_insert(db: *Db, data: *u8, data_len: i32) -> i64
+    if db.connected == 0
+        return -1
+    return client_insert(db.client, data, data_len)
+
+# Get raw document data by ID
+# Returns 1 if found, 0 if not found, < 0 on error
+pub fn db_get(db: *Db, doc_id: i64, data_out: **u8, len_out: *i32) -> i32
+    if db.connected == 0
+        return -1
+    return client_get(db.client, doc_id, data_out, len_out)
+
+# Delete a document by ID
+# Returns 1 if deleted, 0 if not found, < 0 on error
+pub fn db_delete(db: *Db, doc_id: i64) -> i32
+    if db.connected == 0
+        return -1
+    return client_delete(db.client, doc_id)
+
+# Scan all documents with a callback
+# callback: fn(doc_id: i64, data: *u8, len: i32, user_data: *u8) -> i32
+#   Return 0 to continue, non-zero to stop
+# Returns number of documents scanned, or < 0 on error
+pub fn db_scan(db: *Db, callback: *u8, user_data: *u8) -> i32
+    if db.connected == 0
+        return -1
+    return client_scan(db.client, callback, user_data)
+
+# ============================================================================
+# Document Helpers
+# ============================================================================
+
+# Create a document with string fields and serialize it
+# fields: array of (key, value) pairs where each is (key_ptr, key_len, val_ptr, val_len)
+# Returns serialized size, or < 0 on error
+pub fn db_serialize_doc(buf: *u8, buf_len: i64, fields: *DbField, field_count: i32) -> i64
+    var doc: Document
+    var tmp_id: DocumentId = doc_id_invalid()
+    doc_init(@doc, @tmp_id)
+
+    for i in 0..field_count
+        let f: *DbField = fields + i
+        var field: Field = field_string(f.value, f.value_len as i64)
+        # Create StrView for key
+        let key_sv: StrView = strview_from_ptr(f.key, f.key_len as i64)
+        doc_set_field(@doc, key_sv, @field)
+
+    return doc_serialize(@doc, buf, buf_len)
+
+# Field descriptor for serialization
+pub struct DbField
+    key: *u8
+    key_len: i32
+    value: *u8
+    value_len: i32
+
+# Create a DbField
+pub fn db_field(key: *u8, key_len: i32, value: *u8, value_len: i32) -> DbField
+    var f: DbField
+    f.key = key
+    f.key_len = key_len
+    f.value = value
+    f.value_len = value_len
+    return f
+
+# Extract a string field from serialized document data
+# Returns field length, or < 0 if not found
+pub fn db_extract_field(data: *u8, data_len: i32, field_name: *u8, field_name_len: i32, out_value: *u8, max_len: i32) -> i32
+    var doc: Document
+    let result: i32 = doc_deserialize(data, data_len as i64, @doc)
+    if result != ERR_OK
+        return -1
+
+    # Create StrView for field name
+    let name_sv: StrView = strview_from_ptr(field_name, field_name_len as i64)
+
+    var field: Field
+    if doc_get_field(@doc, name_sv, @field) != ERR_OK
+        return -2
+
+    if field.ftype != FIELD_STRING
+        return -3
+
+    var len: i32 = field.len_val as i32
+    if len > max_len
+        len = max_len
+
+    memcpy(out_value, field.ptr_val, len as i64)
+    return len

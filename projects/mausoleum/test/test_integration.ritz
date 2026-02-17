@@ -1,0 +1,314 @@
+# test/test_integration.ritz - Integration tests for client-server communication
+#
+# These tests require the server to be running with --no-encryption on port 7779.
+# Run in separate terminal:
+#   ./projects/mausoleum/build/debug/mausoleum serve --no-encryption --port 7779
+#
+# Then run tests:
+#   ./projects/mausoleum/build/debug/test_integration
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+import ritzlib.strview
+import ritzlib.memory
+
+import lib.m7m_types
+import lib.protocol
+import lib.client
+import lib.document
+import lib.collection
+
+const TEST_PORT: i32 = 7779
+
+# ============================================================================
+# Test helpers
+# ============================================================================
+
+fn print_test(name: *u8)
+    prints("TEST: ")
+    prints_cstr(name)
+    prints("... ")
+
+fn print_ok()
+    prints("OK\n")
+
+fn print_fail(msg: *u8)
+    prints("FAIL: ")
+    prints_cstr(msg)
+    prints("\n")
+
+fn print_int_test(n: i32)
+    if n == 0
+        print_char(48)
+        return
+    var buf: [16]u8
+    var i: i32 = 0
+    var v: i32 = n
+    if v < 0
+        print_char(45)  # '-'
+        v = -v
+    while v > 0
+        buf[i] = (48 + (v % 10)) as u8
+        v = v / 10
+        i += 1
+    while i > 0
+        i -= 1
+        print_char(buf[i])
+
+# ============================================================================
+# Integration tests
+# ============================================================================
+
+fn test_connect_disconnect() -> i32
+    print_test("connect_disconnect")
+
+    var client: *Client = client_new()
+    if client == null
+        print_fail("client_new returned null")
+        return 1
+
+    let connect_result: i32 = client_connect(client, "127.0.0.1", TEST_PORT, "test", 4)
+    if connect_result < 0
+        print_fail("connect failed")
+        prints("  error code: ")
+        print_int_test(connect_result)
+        prints("\n")
+        client_free(client)
+        return 1
+
+    if client_is_connected(client) == 0
+        print_fail("not marked as connected")
+        client_free(client)
+        return 1
+
+    let disconnect_result: i32 = client_disconnect(client)
+    if disconnect_result < 0
+        print_fail("disconnect failed")
+        client_free(client)
+        return 1
+
+    client_free(client)
+    print_ok()
+    return 0
+
+fn test_ping() -> i32
+    print_test("ping")
+
+    var client: *Client = client_new()
+    if client == null
+        print_fail("client_new returned null")
+        return 1
+
+    let connect_result: i32 = client_connect(client, "127.0.0.1", TEST_PORT, "test", 4)
+    if connect_result < 0
+        print_fail("connect failed")
+        client_free(client)
+        return 1
+
+    let ping_result: i32 = client_ping(client)
+    if ping_result < 0
+        print_fail("ping failed")
+        client_free(client)
+        return 1
+
+    client_disconnect(client)
+    client_free(client)
+    print_ok()
+    return 0
+
+fn test_insert_get() -> i32
+    print_test("insert_get")
+
+    var client: *Client = client_new()
+    if client == null
+        print_fail("client_new returned null")
+        return 1
+
+    let connect_result: i32 = client_connect(client, "127.0.0.1", TEST_PORT, "test", 4)
+    if connect_result < 0
+        print_fail("connect failed")
+        client_free(client)
+        return 1
+
+    # Create a simple document to insert
+    var doc: Document
+    var tmp_id: DocumentId = doc_id_invalid()
+    doc_init(@doc, @tmp_id)
+
+    # Set a field using the proper API
+    var val: Field = field_int(42)
+    doc_set_field(@doc, "value", @val)
+
+    # Serialize document
+    var doc_buf: [2048]u8
+    let doc_size: i64 = doc_serialize(@doc, @doc_buf[0], 2048)
+    if doc_size < 0
+        print_fail("serialize failed")
+        client_free(client)
+        return 1
+
+    # Insert
+    let doc_id: i64 = client_insert(client, @doc_buf[0], doc_size as i32)
+    if doc_id < 0
+        print_fail("insert failed")
+        prints("  error: ")
+        print_int_test(doc_id as i32)
+        prints("\n")
+        client_free(client)
+        return 1
+
+    prints("inserted doc_id=")
+    print_i64(doc_id)
+    prints(" ")
+
+    # Get it back
+    var out_data: *u8 = null
+    var out_len: i32 = 0
+    let get_result: i32 = client_get(client, doc_id, @out_data, @out_len)
+    if get_result < 0
+        print_fail("get failed")
+        client_free(client)
+        return 1
+
+    if out_data == null or out_len == 0
+        print_fail("get returned empty data")
+        client_free(client)
+        return 1
+
+    # Deserialize and verify
+    var retrieved_doc: Document
+    let deser_result: i32 = doc_deserialize(out_data, out_len as i64, @retrieved_doc)
+    if deser_result != ERR_OK
+        print_fail("deserialize failed")
+        client_free(client)
+        return 1
+
+    # Verify the value field using proper API
+    var retrieved_val: Field
+    let field_result: i32 = doc_get_field(@retrieved_doc, "value", @retrieved_val)
+    if field_result == ERR_OK
+        let int_val: i64 = retrieved_val.int_val
+        if int_val != 42
+            print_fail("value mismatch")
+            prints("  expected 42, got ")
+            print_i64(int_val)
+            prints("\n")
+            client_free(client)
+            return 1
+    else
+        print_fail("field 'value' not found")
+        client_free(client)
+        return 1
+
+    client_disconnect(client)
+    client_free(client)
+    print_ok()
+    return 0
+
+fn test_delete() -> i32
+    print_test("delete")
+
+    var client: *Client = client_new()
+    if client == null
+        print_fail("client_new returned null")
+        return 1
+
+    let connect_result: i32 = client_connect(client, "127.0.0.1", TEST_PORT, "test", 4)
+    if connect_result < 0
+        print_fail("connect failed")
+        client_free(client)
+        return 1
+
+    # Create a simple document to insert
+    var doc: Document
+    var tmp_id: DocumentId = doc_id_invalid()
+    doc_init(@doc, @tmp_id)
+
+    var val: Field = field_int(123)
+    doc_set_field(@doc, "delete_me", @val)
+
+    # Serialize document
+    var doc_buf: [2048]u8
+    let doc_size: i64 = doc_serialize(@doc, @doc_buf[0], 2048)
+    if doc_size < 0
+        print_fail("serialize failed")
+        client_free(client)
+        return 1
+
+    # Insert
+    let doc_id: i64 = client_insert(client, @doc_buf[0], doc_size as i32)
+    if doc_id < 0
+        print_fail("insert failed")
+        client_free(client)
+        return 1
+
+    # Delete
+    let delete_result: i32 = client_delete(client, doc_id)
+    if delete_result < 0
+        print_fail("delete failed")
+        client_free(client)
+        return 1
+
+    # Try to get - should return "not found" (0)
+    var out_data: *u8 = null
+    var out_len: i32 = 0
+    let get_result: i32 = client_get(client, doc_id, @out_data, @out_len)
+    # get_result: 1 = found, 0 = not found, <0 = error
+    if get_result != 0
+        print_fail("get did not return 'not found' after delete")
+        prints("  expected 0 (not found), got ")
+        print_int_test(get_result)
+        prints("\n")
+        client_free(client)
+        return 1
+
+    client_disconnect(client)
+    client_free(client)
+    print_ok()
+    return 0
+
+# ============================================================================
+# Main entry point
+# ============================================================================
+
+pub fn main(argc: i32, argv: **u8) -> i32
+    prints("Mausoleum Integration Tests\n")
+    prints("===========================\n")
+    prints("Connecting to server at 127.0.0.1:")
+    print_int_test(TEST_PORT)
+    prints("\n\n")
+
+    var failed: i32 = 0
+    var passed: i32 = 0
+
+    if test_connect_disconnect() == 0
+        passed += 1
+    else
+        failed += 1
+
+    if test_ping() == 0
+        passed += 1
+    else
+        failed += 1
+
+    if test_insert_get() == 0
+        passed += 1
+    else
+        failed += 1
+
+    if test_delete() == 0
+        passed += 1
+    else
+        failed += 1
+
+    prints("\n")
+    prints("Results: ")
+    print_int_test(passed)
+    prints(" passed, ")
+    print_int_test(failed)
+    prints(" failed\n")
+
+    if failed > 0
+        return 1
+    return 0

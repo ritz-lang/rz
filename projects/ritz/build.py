@@ -275,20 +275,16 @@ def get_build_profile(config: dict, profile_name: str | None) -> dict:
             result["lto"] = build["lto"]
 
     # Apply profile-specific overrides
-    if profile_name and "profile" in config:
-        profile = config["profile"].get(profile_name, {})
+    # When profile_name is None, default to "debug" profile
+    effective_profile_name = profile_name or "debug"
+    if "profile" in config:
+        profile = config["profile"].get(effective_profile_name, {})
         if "opt-level" in profile:
             result["opt_level"] = profile["opt-level"]
         if "debug" in profile:
             result["debug"] = profile["debug"]
         if "lto" in profile:
             result["lto"] = profile["lto"]
-
-    # If no profile specified, use debug defaults
-    if profile_name is None:
-        result["name"] = "debug"
-        result["opt_level"] = 0
-        result["debug"] = True
 
     return result
 

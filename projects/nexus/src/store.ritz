@@ -1,0 +1,503 @@
+# src/store.ritz - Wiki page store backed by Mausoleum via Spire
+#
+# Stores wiki pages in the mausoleum database for persistence.
+# Uses Spire's repository layer for database abstraction.
+#
+# Each page is stored as a mausoleum Document with fields:
+#   - slug: String (URL slug)
+#   - content: String (page content)
+#
+# Maintains an in-memory index mapping slug -> document ID.
+
+import ritzlib.sys
+import ritzlib.str
+import ritzlib.memory
+import ritzlib.io
+
+# Use Spire's Mausoleum adapter - this is the proper abstraction layer
+import spire.repo.mausoleum { Db, DbField }
+import spire.repo.mausoleum { db_init, db_connect, db_close, db_is_connected }
+import spire.repo.mausoleum { db_insert, db_get, db_delete, db_scan }
+import spire.repo.mausoleum { db_serialize_doc, db_field, db_extract_field }
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+const STORE_MAX_PAGES: i32 = 100
+const MAX_SLUG_LEN: i32 = 128
+const MAX_CONTENT_LEN: i32 = 8192
+const COLLECTION_NAME_LEN: i32 = 10
+
+# ============================================================================
+# Index Entry - maps slug to document ID
+# ============================================================================
+
+struct IndexEntry
+    used: i32
+    slug: [128]u8
+    slug_len: i32
+    doc_id: i64
+
+# ============================================================================
+# Page Store
+# ============================================================================
+
+struct PageStore
+    db: Db                     # Spire database connection
+    index: [100]IndexEntry     # Slug -> DocId index
+    count: i32
+
+# Global store instance
+var g_store: PageStore
+
+# ============================================================================
+# Initialization
+# ============================================================================
+
+# Global connection info for deferred init
+var g_host: [64]u8
+var g_host_len: i32 = 0
+var g_port: i32 = 7777
+
+# Set mausoleum connection info
+pub fn store_set_connection(host: *u8, host_len: i32, port: i32)
+    if host_len > 63
+        g_host_len = 63
+    else
+        g_host_len = host_len
+
+    for i in 0..g_host_len
+        g_host[i] = *(host + i)
+    g_host[g_host_len] = 0  # Null terminate
+    g_port = port
+
+# Initialize the store and connect to mausoleum via Spire
+pub fn store_init() -> i32
+    g_store.count = 0
+
+    # Initialize index
+    for i in 0..STORE_MAX_PAGES
+        g_store.index[i].used = 0
+        g_store.index[i].slug_len = 0
+        g_store.index[i].doc_id = 0
+
+    # Set default connection if not configured
+    if g_host_len == 0
+        g_host[0] = '1'
+        g_host[1] = '2'
+        g_host[2] = '7'
+        g_host[3] = '.'
+        g_host[4] = '0'
+        g_host[5] = '.'
+        g_host[6] = '0'
+        g_host[7] = '.'
+        g_host[8] = '1'
+        g_host[9] = 0
+        g_host_len = 9
+        g_port = 7777
+
+    # Initialize Spire database connection
+    db_init(@g_store.db, @g_host[0], g_host_len, g_port, c"wiki", 4)
+
+    # Connect to mausoleum via Spire
+    prints("  [STORE] Connecting to mausoleum via Spire at ")
+    prints_cstr(@g_host[0])
+    prints(":")
+    print_int(g_port as i64)
+    prints("...\n")
+
+    let result: i32 = db_connect(@g_store.db)
+    if result < 0
+        prints("  [STORE] Failed to connect to mausoleum (error ")
+        print_int(result as i64)
+        prints(")\n")
+        prints("  [STORE] Falling back to in-memory mode\n")
+        return -2
+
+    prints("  [STORE] Connected to mausoleum via Spire!\n")
+
+    # Rebuild index from existing documents
+    let rebuilt: i32 = rebuild_index_from_mausoleum()
+    if rebuilt > 0
+        prints("  [STORE] Rebuilt index with ")
+        print_int(rebuilt as i64)
+        prints(" pages from mausoleum\n")
+
+    return 0
+
+# Callback for db_scan - rebuilds the index from stored documents
+# Parameters: doc_id, doc_data, doc_len, user_data (unused)
+# Returns 0 to continue scanning
+fn scan_rebuild_callback(doc_id: i64, doc_data: *u8, doc_len: i32, user_data: *u8) -> i32
+    # Decode the page to extract the slug
+    var slug: [128]u8
+    var slug_len: i32 = 0
+    var content: [8192]u8
+    var content_len: i32 = 0
+
+    let decode_result: i32 = decode_page(doc_data, doc_len, @slug[0], @slug_len, @content[0], @content_len)
+    if decode_result < 0
+        return 0  # Skip invalid document, continue scanning
+
+    # Add to index
+    if index_set(@slug[0], slug_len, doc_id) < 0
+        prints("  [STORE] Warning: Index full, some pages may not be indexed\n")
+        return 1  # Stop scanning
+
+    return 0  # Continue scanning
+
+# Rebuild the in-memory index by scanning all documents in mausoleum
+fn rebuild_index_from_mausoleum() -> i32
+    if db_is_connected(@g_store.db) == 0
+        return 0
+
+    prints("  [STORE] Scanning mausoleum for existing documents...\n")
+
+    # Use db_scan with our callback
+    let callback_ptr: *u8 = scan_rebuild_callback as *u8
+    let scanned: i32 = db_scan(@g_store.db, callback_ptr, null)
+
+    if scanned < 0
+        prints("  [STORE] Scan failed with error ")
+        print_int(scanned as i64)
+        prints("\n")
+        return 0
+
+    return scanned
+
+# Close the store connection
+pub fn store_close()
+    db_close(@g_store.db)
+
+# ============================================================================
+# Index management
+# ============================================================================
+
+# Find a slug in the index, returns index or -1
+fn index_find(slug: *u8, slug_len: i32) -> i32
+    for i in 0..STORE_MAX_PAGES
+        if g_store.index[i].used == 1
+            if g_store.index[i].slug_len == slug_len
+                var found: i32 = 1
+                for j in 0..slug_len
+                    if g_store.index[i].slug[j] != *(slug + j)
+                        found = 0
+                        break
+                if found == 1
+                    return i
+    return -1
+
+# Add or update index entry
+fn index_set(slug: *u8, slug_len: i32, doc_id: i64) -> i32
+    # Check if exists
+    var idx: i32 = index_find(slug, slug_len)
+
+    if idx < 0
+        # Find empty slot
+        for i in 0..STORE_MAX_PAGES
+            if g_store.index[i].used == 0
+                idx = i
+                break
+
+        if idx < 0
+            return -1  # Index full
+
+        g_store.count += 1
+
+    # Set entry
+    g_store.index[idx].used = 1
+    g_store.index[idx].slug_len = slug_len
+    g_store.index[idx].doc_id = doc_id
+
+    for i in 0..slug_len
+        g_store.index[idx].slug[i] = *(slug + i)
+
+    return 0
+
+# Remove from index
+fn index_remove(slug: *u8, slug_len: i32) -> i64
+    let idx: i32 = index_find(slug, slug_len)
+    if idx < 0
+        return -1
+
+    let doc_id: i64 = g_store.index[idx].doc_id
+    g_store.index[idx].used = 0
+    g_store.index[idx].slug_len = 0
+    g_store.index[idx].doc_id = 0
+    g_store.count -= 1
+
+    return doc_id
+
+# ============================================================================
+# Document encoding (using Spire's Mausoleum helpers)
+# ============================================================================
+
+# Encode a wiki page using Spire's db_serialize_doc
+# Returns serialized length, or -1 on error
+fn encode_page(buf: *u8, slug: *u8, slug_len: i32, content: *u8, content_len: i32) -> i32
+    var fields: [2]DbField
+    fields[0] = db_field(c"slug", 4, slug, slug_len)
+    fields[1] = db_field(c"content", 7, content, content_len)
+
+    let size: i64 = db_serialize_doc(buf, 8192, @fields[0], 2)
+    if size < 0
+        return -1
+    return size as i32
+
+# Decode a wiki page using Spire's db_extract_field
+# Returns 0 on success, -1 on error
+fn decode_page(buf: *u8, buf_len: i32, slug_out: *u8, slug_len_out: *i32, content_out: *u8, content_len_out: *i32) -> i32
+    # Extract slug field
+    let slug_len: i32 = db_extract_field(buf, buf_len, c"slug", 4, slug_out, MAX_SLUG_LEN)
+    if slug_len < 0
+        *slug_len_out = 0
+    else
+        *slug_len_out = slug_len
+
+    # Extract content field
+    let content_len: i32 = db_extract_field(buf, buf_len, c"content", 7, content_out, MAX_CONTENT_LEN)
+    if content_len < 0
+        *content_len_out = 0
+    else
+        *content_len_out = content_len
+
+    # Return success if we got at least a slug
+    if *slug_len_out > 0
+        return 0
+    return -1
+
+# ============================================================================
+# In-memory fallback (when mausoleum is not available)
+# ============================================================================
+
+struct FallbackPage
+    used: i32
+    slug: [128]u8
+    slug_len: i32
+    content: [8192]u8
+    content_len: i32
+
+var g_fallback: [100]FallbackPage
+var g_fallback_count: i32
+
+fn fallback_init()
+    g_fallback_count = 0
+    for i in 0..STORE_MAX_PAGES
+        g_fallback[i].used = 0
+
+fn fallback_find(slug: *u8, slug_len: i32) -> i32
+    for i in 0..STORE_MAX_PAGES
+        if g_fallback[i].used == 1
+            if g_fallback[i].slug_len == slug_len
+                var found: i32 = 1
+                for j in 0..slug_len
+                    if g_fallback[i].slug[j] != *(slug + j)
+                        found = 0
+                        break
+                if found == 1
+                    return i
+    return -1
+
+fn fallback_get(slug: *u8, slug_len: i32, content_out: *u8, content_len_out: *i32) -> i32
+    let idx: i32 = fallback_find(slug, slug_len)
+    if idx < 0
+        return 0
+
+    let page: *FallbackPage = @g_fallback[idx]
+    *content_len_out = page.content_len
+    for i in 0..page.content_len
+        *(content_out + i) = page.content[i]
+
+    return 1
+
+fn fallback_save(slug: *u8, slug_len: i32, content: *u8, content_len: i32) -> i32
+    if slug_len > MAX_SLUG_LEN or content_len > MAX_CONTENT_LEN
+        return 0
+
+    var idx: i32 = fallback_find(slug, slug_len)
+
+    if idx < 0
+        for i in 0..STORE_MAX_PAGES
+            if g_fallback[i].used == 0
+                idx = i
+                break
+
+        if idx < 0
+            return 0
+
+        g_fallback_count += 1
+
+    let page: *FallbackPage = @g_fallback[idx]
+    page.used = 1
+    page.slug_len = slug_len
+    page.content_len = content_len
+
+    for i in 0..slug_len
+        page.slug[i] = *(slug + i)
+
+    for i in 0..content_len
+        page.content[i] = *(content + i)
+
+    return 1
+
+fn fallback_delete(slug: *u8, slug_len: i32) -> i32
+    let idx: i32 = fallback_find(slug, slug_len)
+    if idx < 0
+        return 0
+
+    g_fallback[idx].used = 0
+    g_fallback_count -= 1
+    return 1
+
+fn fallback_count() -> i32
+    return g_fallback_count
+
+fn fallback_list(buf: *u8, max_len: i32) -> i32
+    var pos: i32 = 0
+    var count: i32 = 0
+
+    for i in 0..STORE_MAX_PAGES
+        if g_fallback[i].used == 1
+            let page: *FallbackPage = @g_fallback[i]
+
+            if pos + page.slug_len + 1 > max_len
+                break
+
+            for j in 0..page.slug_len
+                *(buf + pos) = page.slug[j]
+                pos += 1
+
+            *(buf + pos) = 10
+            pos += 1
+            count += 1
+
+    return count
+
+# ============================================================================
+# Public API
+# ============================================================================
+
+# Get a page by slug
+pub fn store_get(slug: *u8, slug_len: i32, content_out: *u8, content_len_out: *i32) -> i32
+    # Fallback mode
+    if db_is_connected(@g_store.db) == 0
+        return fallback_get(slug, slug_len, content_out, content_len_out)
+
+    # Find in index
+    let idx: i32 = index_find(slug, slug_len)
+    if idx < 0
+        return 0  # Not found
+
+    let doc_id: i64 = g_store.index[idx].doc_id
+
+    # Get from mausoleum via Spire
+    var doc_data: *u8 = null
+    var doc_len: i32 = 0
+    let result: i32 = db_get(@g_store.db, doc_id, @doc_data, @doc_len)
+
+    if result != 1
+        return 0  # Not found or error
+
+    # Decode page
+    var decoded_slug: [128]u8
+    var decoded_slug_len: i32 = 0
+    let decode_result: i32 = decode_page(doc_data, doc_len, @decoded_slug[0], @decoded_slug_len, content_out, content_len_out)
+
+    if decode_result < 0
+        return 0
+
+    return 1
+
+# Save a page (insert or update)
+pub fn store_save(slug: *u8, slug_len: i32, content: *u8, content_len: i32) -> i32
+    # Fallback mode
+    if db_is_connected(@g_store.db) == 0
+        return fallback_save(slug, slug_len, content, content_len)
+
+    if slug_len > MAX_SLUG_LEN or content_len > MAX_CONTENT_LEN
+        return 0
+
+    # Encode page
+    var buf: [8500]u8  # 4 + 128 + 8192
+    let encoded_len: i32 = encode_page(@buf[0], slug, slug_len, content, content_len)
+
+    # Check if page exists
+    let existing_idx: i32 = index_find(slug, slug_len)
+
+    if existing_idx >= 0
+        # Delete old document first
+        let old_doc_id: i64 = g_store.index[existing_idx].doc_id
+        db_delete(@g_store.db, old_doc_id)
+
+    # Insert new document via Spire
+    let doc_id: i64 = db_insert(@g_store.db, @buf[0], encoded_len)
+    if doc_id < 0
+        prints("  [STORE] Insert failed\n")
+        return 0
+
+    # Update index
+    if index_set(slug, slug_len, doc_id) < 0
+        return 0
+
+    return 1
+
+# Delete a page
+pub fn store_delete(slug: *u8, slug_len: i32) -> i32
+    # Fallback mode
+    if db_is_connected(@g_store.db) == 0
+        return fallback_delete(slug, slug_len)
+
+    # Find in index
+    let doc_id: i64 = index_remove(slug, slug_len)
+    if doc_id < 0
+        return 0
+
+    # Delete from mausoleum via Spire
+    let result: i32 = db_delete(@g_store.db, doc_id)
+    return result
+
+# Get count of pages
+pub fn store_count() -> i32
+    if db_is_connected(@g_store.db) == 0
+        return fallback_count()
+    return g_store.count
+
+# List all page slugs
+pub fn store_list(buf: *u8, max_len: i32) -> i32
+    if db_is_connected(@g_store.db) == 0
+        return fallback_list(buf, max_len)
+
+    var pos: i32 = 0
+    var count: i32 = 0
+
+    for i in 0..STORE_MAX_PAGES
+        if g_store.index[i].used == 1
+            let entry: *IndexEntry = @g_store.index[i]
+
+            if pos + entry.slug_len + 1 > max_len
+                break
+
+            for j in 0..entry.slug_len
+                *(buf + pos) = entry.slug[j]
+                pos += 1
+
+            *(buf + pos) = 10
+            pos += 1
+            count += 1
+
+    return count
+
+# Seed with initial pages
+pub fn store_seed()
+    # Only seed if empty
+    # BUG: scan callback receives corrupted data, so count is always 0
+    # TODO: Fix mausoleum client_scan protocol parsing
+    if store_count() > 0
+        return
+
+    prints("  [STORE] Seeding initial pages...\n")
+    store_save(c"welcome", 7, c"# Welcome to Nexus Wiki\n\nThis is your knowledge base powered by Ritz.\n\nThe entire stack - HTTP server, database, and this wiki - is written in Ritz!", 152)
+    store_save(c"getting-started", 15, c"# Getting Started\n\nLearn how to use the Nexus Wiki.\n\n1. Browse pages from the home page\n2. Click 'Edit' to modify a page\n3. Click '+ New Page' to create a page", 166)
+    store_save(c"ritz-language", 13, c"# Ritz Language\n\nRitz is a systems programming language that compiles to LLVM IR.\n\n- No libc dependency\n- Direct Linux syscalls\n- Memory safe (coming soon)", 168)
+    prints("  [STORE] Seeded 3 pages\n")

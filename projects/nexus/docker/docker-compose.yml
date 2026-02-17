@@ -1,84 +1,73 @@
-# Nexus Docker Compose - Ghetto Mode
+# Nexus Wiki - Docker Compose
 #
-# Phase 0: Minimal viable deployment
-# - Mausoleum: Document storage (TCP server)
-# - Tome: In-memory cache (TCP server)
-# - Nexus: Wiki app with embedded HTTP (TODO)
+# Full Ritz stack:
+# - Mausoleum: Document database (port 7777 internal)
+# - Nexus: Wiki app with Valet HTTP (port 8080 external)
 #
 # Usage:
 #   docker compose up -d
 #   docker compose logs -f
 #   docker compose down
-
-version: '3.8'
+#
+# Access: http://10.0.0.191:8080/
 
 services:
   # ============================================================================
   # Document Database - Mausoleum
   # ============================================================================
   mausoleum:
-    build:
-      context: ../../mausoleum
-      dockerfile: ../nexus/docker/Dockerfile.mausoleum
+    image: ubuntu:22.04
     container_name: nexus-mausoleum
-    expose:
-      - "7777"
+    working_dir: /app
+    command: /app/mausoleum serve --port 7777 --data-dir /data --no-encryption
     volumes:
+      - ../../../projects/mausoleum/build/debug/mausoleum:/app/mausoleum:ro
       - nexus-data:/data
-    environment:
-      - M7M_DATA_PATH=/data/nexus.m7m
-      - M7M_PORT=7777
+    ports:
+      - "0.0.0.0:7777:7777"
     healthcheck:
-      test: ["CMD", "nc", "-z", "localhost", "7777"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/7777'"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 2s
     restart: unless-stopped
 
   # ============================================================================
-  # In-Memory Cache - Tome
-  # ============================================================================
-  tome:
-    build:
-      context: ../../tome
-      dockerfile: ../nexus/docker/Dockerfile.tome
-    container_name: nexus-tome
-    expose:
-      - "6379"
-    environment:
-      - TOME_PORT=6379
-      - TOME_MAX_MEMORY=256MB
-      - TOME_EVICTION=allkeys-lru
-    healthcheck:
-      test: ["CMD", "nc", "-z", "localhost", "6379"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
-    restart: unless-stopped
-
-  # ============================================================================
-  # Wiki Application - Nexus
+  # Wiki Application - Nexus (with Valet HTTP server)
   # ============================================================================
   nexus:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile.nexus
+    image: ubuntu:22.04
     container_name: nexus-app
+    working_dir: /app
+    command: /app/nexus
+    volumes:
+      - ../build/debug/nexus:/app/nexus:ro
+      - ../deploy/certs:/certs:ro
     ports:
-      - "8080:8080"
+      - "0.0.0.0:8080:8080"
+      - "0.0.0.0:8443:8443"
+    # Required for io_uring syscalls used by Valet's async server
+    privileged: true
+    # Increase stack size to handle deep crypto call chains
+    ulimits:
+      stack:
+        soft: 16777216  # 16MB
+        hard: 16777216
     environment:
-      - NEXUS_PORT=8080
-      - MAUSOLEUM_HOST=mausoleum
+      # Connect to mausoleum via bridge gateway (172.17.0.1)
+      # TODO: Add DNS resolution to ritzlib.net for proper Docker networking
+      - MAUSOLEUM_HOST=172.17.0.1
       - MAUSOLEUM_PORT=7777
-      - TOME_HOST=tome
-      - TOME_PORT=6379
+      - NEXUS_PORT=8443
+      # TLS config
+      - TLS_CERT=/certs/cert.pem
+      - TLS_KEY=/certs/key.pem
     depends_on:
       mausoleum:
         condition: service_healthy
-      tome:
-        condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/8080'"]
       interval: 10s
       timeout: 5s
       retries: 3

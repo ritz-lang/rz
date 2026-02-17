@@ -723,7 +723,7 @@ pub fn sys_dup2(oldfd: i32, newfd: i32) -> i32
 [[target_os = "linux"]]
 const SIGHUP: i32 = 1       # Hangup
 [[target_os = "linux"]]
-const SIGINT: i32 = 2       # Interrupt (Ctrl+C)
+pub const SIGINT: i32 = 2       # Interrupt (Ctrl+C)
 [[target_os = "linux"]]
 const SIGQUIT: i32 = 3      # Quit (Ctrl+\)
 [[target_os = "linux"]]
@@ -749,7 +749,7 @@ const SIGPIPE: i32 = 13     # Broken pipe
 [[target_os = "linux"]]
 const SIGALRM: i32 = 14     # Alarm clock
 [[target_os = "linux"]]
-const SIGTERM: i32 = 15     # Termination
+pub const SIGTERM: i32 = 15     # Termination
 [[target_os = "linux"]]
 const SIGCHLD: i32 = 17     # Child stopped or terminated
 [[target_os = "linux"]]
@@ -814,6 +814,152 @@ pub fn signal_ignore(signum: i32) -> i32
     return sys_rt_sigaction(signum, @act[0], null, 8)
 
 # ============================================================================
+# Global shutdown flag (for graceful signal handling)
+# ============================================================================
+# Since we can't easily set up a proper signal handler in pure Ritz (it needs
+# a restorer trampoline), we use a different approach:
+# 1. Ignore SIGTERM/SIGINT (prevents process termination)
+# 2. Use a self-pipe or eventfd to wake up blocking calls
+# 3. Or use poll with timeout and check a global flag
+#
+# For simplicity, we provide a global shutdown flag that applications can
+# check periodically, and rely on SIGINT/SIGTERM being ignored so the app
+# can check the flag and exit gracefully.
+
+# Global shutdown flag - set to non-zero to request shutdown
+# Note: This is a mutable global variable
+# Note: No target_os attribute as attributes on module-level variables aren't supported yet
+var g_shutdown_requested: i32 = 0
+
+# Check if shutdown was requested
+[[target_os = "linux"]]
+pub fn shutdown_requested() -> i32
+    return g_shutdown_requested
+
+# Request shutdown (can be called from anywhere)
+[[target_os = "linux"]]
+pub fn request_shutdown()
+    g_shutdown_requested = 1
+
+# Reset shutdown flag (e.g., for testing)
+[[target_os = "linux"]]
+pub fn reset_shutdown()
+    g_shutdown_requested = 0
+
+# ============================================================================
+# Signalfd syscall (Linux-only)
+# ============================================================================
+# signalfd allows receiving signals via a file descriptor, which can be
+# monitored with poll/select/epoll. This is the preferred way to handle
+# signals in event-driven servers.
+
+[[target_os = "linux"]]
+const SYS_SIGNALFD4: i64 = 289
+[[target_os = "linux"]]
+const SYS_RT_SIGPROCMASK: i64 = 14
+
+# Signalfd flags
+[[target_os = "linux"]]
+const SFD_CLOEXEC: i32 = 524288    # 0x80000 - Close on exec
+[[target_os = "linux"]]
+const SFD_NONBLOCK: i32 = 2048     # 0x800 - Non-blocking
+
+# Signal set manipulation (64-bit signal set)
+[[target_os = "linux"]]
+const SIG_BLOCK: i32 = 0
+[[target_os = "linux"]]
+const SIG_UNBLOCK: i32 = 1
+[[target_os = "linux"]]
+const SIG_SETMASK: i32 = 2
+
+# sys_rt_sigprocmask - change the signal mask
+[[target_os = "linux"]]
+pub fn sys_rt_sigprocmask(how: i32, set: *i64, oldset: *i64, sigsetsize: i64) -> i32
+    return syscall4(SYS_RT_SIGPROCMASK, how as i64, set as i64, oldset as i64, sigsetsize) as i32
+
+# sys_signalfd4 - create a file descriptor for accepting signals
+# fd: -1 to create new, or existing signalfd to modify
+# mask: pointer to 64-bit signal mask
+# flags: SFD_CLOEXEC | SFD_NONBLOCK
+# Returns: file descriptor on success, negative errno on error
+[[target_os = "linux"]]
+pub fn sys_signalfd4(fd: i32, mask: *i64, flags: i32) -> i32
+    # Note: sigsetsize is 8 for 64-bit mask
+    return syscall4(SYS_SIGNALFD4, fd as i64, mask as i64, 8, flags as i64) as i32
+
+# Helper: Create a signalfd for SIGTERM and SIGINT
+# This blocks SIGTERM and SIGINT from normal delivery and instead
+# makes them readable via the returned fd.
+# Returns: signalfd on success, negative on error
+[[target_os = "linux"]]
+pub fn signalfd_create_for_shutdown() -> i32
+    # Create signal mask with SIGTERM (15) and SIGINT (2)
+    # Signal bit n is set as (1 << (n-1))
+    var mask: i64 = 0
+    mask = mask | (1 << 14)  # SIGTERM = 15, bit 14
+    mask = mask | (1 << 1)   # SIGINT = 2, bit 1
+
+    # Block these signals from normal delivery
+    let block_result: i32 = sys_rt_sigprocmask(SIG_BLOCK, @mask, null, 8)
+    if block_result < 0
+        return block_result
+
+    # Create signalfd
+    return sys_signalfd4(-1, @mask, SFD_CLOEXEC | SFD_NONBLOCK)
+
+# Signalfd_siginfo structure (128 bytes)
+# We only care about ssi_signo at offset 0
+[[target_os = "linux"]]
+struct SignalfdSiginfo
+    ssi_signo: i32     # Signal number
+    ssi_errno: i32     # Error number
+    ssi_code: i32      # Signal code
+    ssi_pid: i32       # Sending process PID
+    ssi_uid: i32       # Sending process UID
+    ssi_fd: i32        # File descriptor (for SIGIO)
+    ssi_tid: i32       # Thread ID
+    ssi_band: i32      # Band event
+    ssi_overrun: i32   # POSIX timer overrun count
+    ssi_trapno: i32    # Trap number
+    ssi_status: i32    # Exit status or signal
+    ssi_int: i32       # Integer sent by sigqueue
+    ssi_ptr: i64       # Pointer sent by sigqueue
+    ssi_utime: i64     # User CPU time consumed
+    ssi_stime: i64     # System CPU time consumed
+    ssi_addr: i64      # Address that generated signal
+    # Padding to 128 bytes (remaining 40 bytes)
+    __pad: [40]u8
+
+# Helper: Read a signal from signalfd
+# Returns: signal number (SIGTERM=15, SIGINT=2), 0 if nothing, negative on error
+# Note: Uses heap allocation instead of stack to avoid potential stack issues
+[[target_os = "linux"]]
+pub fn signalfd_read(fd: i32) -> i32
+    # Allocate buffer on heap to avoid stack size issues
+    let buf: *u8 = sys_mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)
+    if buf == null or buf as i64 < 0
+        return -1
+
+    let n: i64 = sys_read(fd, buf, 128)
+    var result: i32 = 0
+
+    if n < 0
+        # EAGAIN/EWOULDBLOCK means no signal pending
+        if n == -11
+            result = 0
+        else
+            result = n as i32
+    else if n == 128
+        # ssi_signo is at offset 0, little-endian i32
+        result = *(buf + 0) as i32
+        result = result + ((*(buf + 1) as i32) << 8)
+        result = result + ((*(buf + 2) as i32) << 16)
+        result = result + ((*(buf + 3) as i32) << 24)
+
+    sys_munmap(buf, 4096)
+    return result
+
+# ============================================================================
 # Access mode constants (for sys_access) (Linux-only)
 # ============================================================================
 
@@ -846,6 +992,38 @@ struct Timeval
 pub fn sys_gettimeofday(tv: *Timeval, tz: *u8) -> i32
     return syscall2(SYS_GETTIMEOFDAY, tv as i64, tz as i64) as i32
 
+# ============================================================================
+# Poll syscall (Linux-only)
+# ============================================================================
+
+# pollfd structure for sys_poll
+# Each entry describes one file descriptor to monitor
+[[target_os = "linux"]]
+struct PollFd
+    fd: i32       # File descriptor to monitor
+    events: i16   # Events to monitor (input)
+    revents: i16  # Events that occurred (output)
+
+# Poll event constants
+[[target_os = "linux"]]
+pub const POLLIN: i16 = 1      # Data available for reading
+[[target_os = "linux"]]
+pub const POLLOUT: i16 = 4     # Writing possible
+[[target_os = "linux"]]
+pub const POLLERR: i16 = 8     # Error condition
+[[target_os = "linux"]]
+pub const POLLHUP: i16 = 16    # Hang up
+[[target_os = "linux"]]
+pub const POLLNVAL: i16 = 32   # Invalid request (fd not open)
+
+# sys_poll - wait for events on file descriptors
+# fds: array of PollFd structures
+# nfds: number of file descriptors
+# timeout: timeout in milliseconds (-1 = block indefinitely, 0 = return immediately)
+# Returns: number of fds with events, 0 on timeout, negative errno on error
+[[target_os = "linux"]]
+pub fn sys_poll(fds: *PollFd, nfds: i64, timeout: i32) -> i32
+    return syscall3(SYS_POLL, fds as i64, nfds, timeout as i64) as i32
 
 # ============================================================================
 # Sendfile syscall (Linux-only)
