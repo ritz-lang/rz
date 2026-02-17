@@ -165,13 +165,15 @@ class StructRegistry:
         return layout.alignment
 
 
-# Linux x86_64 syscall numbers
+# Linux x86_64 syscall numbers (used for ritzlib intrinsics)
+# Note: For _start exit, see _emit_start_function which handles OS-specific syscall numbers
 SYSCALL_READ = 0
 SYSCALL_WRITE = 1
 SYSCALL_OPEN = 2
 SYSCALL_CLOSE = 3
 SYSCALL_NANOSLEEP = 35
-SYSCALL_EXIT = 60
+SYSCALL_EXIT_LINUX = 60
+SYSCALL_EXIT_HARLAND = 20
 
 
 class LLVMEmitter:
@@ -183,9 +185,11 @@ class LLVMEmitter:
     """
 
     def __init__(self, source_file: str = "unknown.ritz", source_dir: str = ".",
-                 target: str = 'x86_64-unknown-linux-gnu'):
+                 target: str = 'x86_64-unknown-linux-gnu',
+                 target_os: str = 'linux'):
         # Target triple configuration
         self.target = target
+        self.target_os = target_os
         self.is_freestanding = target.endswith('-none-elf') or '-none-' in target
 
         # LLVM types - integers
@@ -2663,12 +2667,23 @@ class LLVMEmitter:
         return fn
 
     def _emit_start_function(self) -> None:
-        """Emit the _start entry point for Linux x86_64."""
+        """Emit the _start entry point for x86_64.
+
+        The syscall number for exit varies by target OS:
+        - Linux: syscall 60
+        - Harland: syscall 20
+        """
         # We need to emit this as raw IR text since llvmlite doesn't support naked functions
         # This will be appended after the module is stringified
         num_params = len(self.main_fn_def.params)
         main_takes_args = num_params >= 2
         main_takes_envp = num_params >= 3
+
+        # Exit syscall number depends on target OS
+        if self.target_os == 'harland':
+            exit_syscall = 20  # Harland SYS_EXIT
+        else:
+            exit_syscall = 60  # Linux SYS_EXIT (default)
 
         # Create a void function
         start_type = ir.FunctionType(self.void, [])
@@ -2692,34 +2707,34 @@ class LLVMEmitter:
         # For 3-arg main: envp = &argv[argc+1] = argv + (argc+1)*8
         if main_takes_envp:
             # 3-argument main(argc, argv, envp)
-            asm_str = """
+            asm_str = f"""
     movq (%rsp), %rdi
     leaq 8(%rsp), %rsi
     leaq 8(%rsi,%rdi,8), %rdx
     andq $$-16, %rsp
     call main
     movq %rax, %rdi
-    movq $$60, %rax
+    movq $${exit_syscall}, %rax
     syscall
   """
         elif main_takes_args:
             # 2-argument main(argc, argv)
-            asm_str = """
+            asm_str = f"""
     movq (%rsp), %rdi
     leaq 8(%rsp), %rsi
     andq $$-16, %rsp
     call main
     movq %rax, %rdi
-    movq $$60, %rax
+    movq $${exit_syscall}, %rax
     syscall
   """
         else:
             # 0-argument main()
-            asm_str = """
+            asm_str = f"""
     andq $$-16, %rsp
     call main
     movq %rax, %rdi
-    movq $$60, %rax
+    movq $${exit_syscall}, %rax
     syscall
   """
 
@@ -8030,7 +8045,8 @@ def emit(module: rast.Module, no_runtime: bool = False,
 
     # Note: target_os filtering happens earlier in compile_file() before name resolution
 
-    emitter = LLVMEmitter(source_file=source_file, source_dir=source_dir, target=target)
+    emitter = LLVMEmitter(source_file=source_file, source_dir=source_dir, target=target,
+                          target_os=target_os)
     emitter.no_runtime = no_runtime
     emitter.test_mode = test_mode
 
