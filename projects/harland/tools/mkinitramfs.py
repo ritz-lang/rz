@@ -31,7 +31,19 @@ def create_initramfs(bin_dir: Path, output: Path, extra_files: dict = None):
 
         # Create TAR archive (USTAR format, no PAX headers)
         with tarfile.open(tar_path, "w", format=tarfile.USTAR_FORMAT) as tar:
-            # Add /etc directory structure
+            # Helper to add a directory entry
+            def add_dir(name):
+                info = tarfile.TarInfo(name=name)
+                info.type = tarfile.DIRTYPE
+                info.mode = 0o755
+                tar.addfile(info)
+
+            # Add directory structure first (required by Harland kernel)
+            print("  Adding directories...")
+            add_dir("./etc")
+            add_dir("./bin")
+
+            # Add /etc files
             print("  Adding /etc...")
 
             # /etc/hostname
