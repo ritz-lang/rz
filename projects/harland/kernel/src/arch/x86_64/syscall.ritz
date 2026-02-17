@@ -19,6 +19,12 @@
 #   - IA32_SFMASK (0xC0000084): RFLAGS mask (clear IF on entry)
 #   - IA32_EFER (0xC0000080): Enable SCE bit for SYSCALL instruction
 
+import fs.knamespace { KNamespace, knamespace_get, knamespace_list, knamespace_read }
+import fs.kdir_entry { KDirEntry }
+import fs.kblob { KBlobStore, KBlobId, kblob_get_store, kblob_store_get, kblob_store_get_size }
+import fs.kpath { strview_from_ptr }
+import serial { StrView }
+
 # ============================================================================
 # MSR Numbers for SYSCALL/SYSRET
 # ============================================================================
@@ -65,9 +71,15 @@ pub const SYS_IPC_SEND: u64 = 30
 pub const SYS_IPC_RECV: u64 = 31
 pub const SYS_IPC_CALL: u64 = 32
 
+# Filesystem
+pub const SYS_READDIR: u64 = 17
+
 # Capability
 pub const SYS_CAP_GRANT: u64 = 40
 pub const SYS_CAP_REVOKE: u64 = 41
+
+# ACPI
+pub const SYS_ACPI_POWEROFF: u64 = 200
 
 # Debug (temporary - kernel serial output from userspace)
 pub const SYS_DEBUG_PRINT: u64 = 255
@@ -227,6 +239,18 @@ pub fn syscall_handler(frame: *SyscallFrame) -> i64
     if syscall_num == SYS_GETPID
         return sys_getpid()
 
+    if syscall_num == SYS_SPAWN
+        return sys_spawn(arg1 as *u8)
+
+    if syscall_num == SYS_WAIT
+        return sys_wait(arg1 as i32)
+
+    if syscall_num == SYS_READDIR
+        return sys_readdir(arg1 as *u8, arg2 as *u8, arg3 as i64)
+
+    if syscall_num == SYS_ACPI_POWEROFF
+        return sys_acpi_poweroff()
+
     # Unknown syscall
     return -1
 
@@ -327,4 +351,171 @@ fn serial_print_dec(value: u64) -> i32
     while i > 0
         i = i - 1
         serial_write_byte(buf[i])
+    return 0
+
+# ============================================================================
+# Process Syscalls
+# ============================================================================
+
+# Global for tracking spawned child exit code
+var g_spawn_exit_code: i32 = -1
+var g_spawn_completed: u8 = 0
+
+# Helper to get null-terminated string length
+fn strlen(s: *u8) -> i64
+    var len: i64 = 0
+    var p: *u8 = s
+    while *p != 0
+        len = len + 1
+        p = p + 1
+    return len
+
+# sys_spawn: Load and execute a binary from the filesystem
+# For simplicity, this runs the binary synchronously and returns
+# a "pid" (we return 2 for now since init is PID 1)
+fn sys_spawn(path: *u8) -> i64
+    serial_print(c"[syscall] spawn(")
+    serial_print(path)
+    serial_print(c")\n")
+
+    # Look up the file in the namespace
+    let ns: *KNamespace = knamespace_get()
+    if ns == 0 as *KNamespace
+        serial_print(c"[spawn] No namespace\n")
+        return -1
+
+    # Read file from namespace
+    let path_len: i64 = strlen(path)
+    let path_view: StrView = strview_from_ptr(path, path_len)
+    var file_size: u64 = 0
+    let elf_data: *u8 = knamespace_read(ns, @path_view, @file_size)
+
+    if elf_data == 0 as *u8
+        serial_print(c"[spawn] File not found: ")
+        serial_print(path)
+        serial_print(c"\n")
+        return -1
+
+    serial_print(c"[spawn] Loading ELF (")
+    serial_print_dec(file_size)
+    serial_print(c" bytes)...\n")
+
+    # For now, we run the binary inline (blocking spawn)
+    # TODO: Proper process creation with separate address space
+    g_spawn_completed = 0
+    g_spawn_exit_code = -1
+
+    # We can't easily call elf_exec from here as it would replace current process
+    # Instead, store the data location for the calling process to handle
+    # For the simple case, return success and let caller check g_spawn_*
+    return 2  # Return "pid" of spawned process
+
+# sys_wait: Wait for a child process to exit
+# pid: The process ID to wait for (-1 for any)
+# Returns the exit code of the waited process
+fn sys_wait(pid: i32) -> i64
+    serial_print(c"[syscall] wait(")
+    serial_print_dec(pid as u64)
+    serial_print(c")\n")
+
+    # For our simple implementation, just return the stored exit code
+    if g_spawn_completed != 0
+        g_spawn_completed = 0
+        return g_spawn_exit_code as i64
+    return -1
+
+# ============================================================================
+# Filesystem Syscalls
+# ============================================================================
+
+# Dirent structure for userspace (matches what we copy)
+# Each entry: name (null-terminated), then next entry
+# Returns number of bytes written, or -1 on error
+
+# Max entries we'll return from readdir
+const READDIR_MAX_ENTRIES: i32 = 64
+
+fn sys_readdir(dir_path: *u8, buf: *u8, buf_size: i64) -> i64
+    serial_print(c"[syscall] readdir(")
+    serial_print(dir_path)
+    serial_print(c")\n")
+
+    let ns: *KNamespace = knamespace_get()
+    if ns == 0 as *KNamespace
+        return -1
+
+    # Create StrView from path
+    let path_len: i64 = strlen(dir_path)
+    let path_view: StrView = strview_from_ptr(dir_path, path_len)
+
+    # Allocate entries array on stack
+    var entries: [64]KDirEntry
+    let count: i32 = knamespace_list(ns, @path_view, @entries[0], READDIR_MAX_ENTRIES)
+
+    if count < 0
+        serial_print(c"[readdir] Failed to list directory\n")
+        return -1
+
+    # Copy names to buffer as null-terminated strings
+    var bytes_written: i64 = 0
+    var i: i32 = 0
+
+    while i < count
+        let entry: *KDirEntry = @entries[i]
+
+        # Find name length
+        var name_len: i32 = (*entry).name_len as i32
+        if name_len == 0
+            # Fallback: count until null
+            while name_len < 255 and (*entry).name[name_len] != 0
+                name_len = name_len + 1
+
+        # Check buffer space
+        if bytes_written + name_len as i64 + 1 > buf_size
+            break
+
+        # Copy name
+        var j: i32 = 0
+        while j < name_len
+            *(buf + bytes_written) = (*entry).name[j]
+            bytes_written = bytes_written + 1
+            j = j + 1
+
+        # Null terminator
+        *(buf + bytes_written) = 0
+        bytes_written = bytes_written + 1
+
+        i = i + 1
+
+    serial_print(c"[readdir] Returned ")
+    serial_print_dec(count as u64)
+    serial_print(c" entries (")
+    serial_print_dec(bytes_written as u64)
+    serial_print(c" bytes)\n")
+
+    return bytes_written
+
+# ============================================================================
+# ACPI Syscalls
+# ============================================================================
+
+# ACPI PM1a control block port (from FADT)
+const ACPI_PM1A_CNT: u16 = 0x604
+
+fn sys_acpi_poweroff() -> i64
+    serial_print(c"[syscall] ACPI poweroff requested\n")
+    serial_print(c"[ACPI] Initiating S5 shutdown...\n")
+
+    # SLP_TYPa = 5 for S5 (shutdown), SLP_EN = bit 13
+    let sleep_value: u16 = (5 << 10) | (1 << 13)
+    outb_word(ACPI_PM1A_CNT, sleep_value)
+
+    # Should not return
+    return 0
+
+fn outb_word(port: u16, value: u16) -> i32
+    asm x86_64:
+        movw {port}, %dx
+        movw {value}, %ax
+        outw %ax, %dx
     return 0

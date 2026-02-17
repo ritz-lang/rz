@@ -47,9 +47,6 @@ gdt_flush:
 # RSP points to InterruptFrame
 .global isr_common
 isr_common:
-    # Save segment registers (just in case)
-    # Not strictly necessary in 64-bit mode with flat segments
-
     # Call the Ritz exception handler
     # RDI = pointer to InterruptFrame (first argument in System V ABI)
     movq %rsp, %rdi

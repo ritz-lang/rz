@@ -1,94 +1,50 @@
 # Harland Init Process
 #
-# First userspace process. Runs system tests and triggers ACPI shutdown.
+# First userspace process (PID 1).
+# Iterates through /bin/ and runs test binaries, verifying exit codes.
+# Reports pass/fail for each, then triggers ACPI shutdown.
 #
-# Tests performed:
-# - sys_write (console output)
-# - sys_getpid (process identity)
-# - sys_yield (cooperative scheduling)
-# - sys_acpi_poweroff (system shutdown)
+# Test programs and expected exit codes:
+#   - hello:       0  (prints "Hello, Harland!")
+#   - true:        0  (always succeeds)
+#   - false:       1  (always fails)
+#   - exitcode:   42  (tests exit code propagation)
+#   - hello_tier1: 0  (prints "Hello, Ritz!")
+
+import libharland { print_str, print_num, strlen, sys_getpid, sys_yield, sys_readdir, sys_spawn, sys_wait, sys_exit, sys_acpi_poweroff }
 
 # ============================================================================
-# Raw syscall interface
+# Test Registry
 # ============================================================================
 
-fn syscall0(n: i64) -> i64
-    var result: i64 = 0
-    asm x86_64:
-        movq {n}, %rax
-        syscall
-        movq %rax, {result}
-    return result
+# Compare two null-terminated strings
+fn str_eq(a: *u8, b: *u8) -> bool
+    var i: i64 = 0
+    while true
+        let ca: u8 = *(a + i)
+        let cb: u8 = *(b + i)
+        if ca != cb
+            return false
+        if ca == 0
+            return true
+        i = i + 1
+    return false
 
-fn syscall1(n: i64, a1: i64) -> i64
-    var result: i64 = 0
-    asm x86_64:
-        movq {n}, %rax
-        movq {a1}, %rdi
-        syscall
-        movq %rax, {result}
-    return result
-
-fn syscall3(n: i64, a1: i64, a2: i64, a3: i64) -> i64
-    var result: i64 = 0
-    asm x86_64:
-        movq {n}, %rax
-        movq {a1}, %rdi
-        movq {a2}, %rsi
-        movq {a3}, %rdx
-        syscall
-        movq %rax, {result}
-    return result
-
-# ============================================================================
-# Harland syscall numbers
-# ============================================================================
-
-const SYS_WRITE: i64 = 1
-const SYS_EXIT: i64 = 20
-const SYS_YIELD: i64 = 21
-const SYS_GETPID: i64 = 22
-const SYS_ACPI_POWEROFF: i64 = 200
-
-# ============================================================================
-# Syscall wrappers
-# ============================================================================
-
-fn sys_write(fd: i32, buf: *u8, count: i64) -> i64
-    return syscall3(SYS_WRITE, fd as i64, buf as i64, count)
-
-fn sys_exit(code: i32)
-    syscall1(SYS_EXIT, code as i64)
-
-fn sys_yield()
-    syscall0(SYS_YIELD)
-
-fn sys_getpid() -> i32
-    return syscall0(SYS_GETPID) as i32
-
-fn sys_acpi_poweroff()
-    syscall0(SYS_ACPI_POWEROFF)
-
-# ============================================================================
-# String helpers
-# ============================================================================
-
-fn print_str(s: *u8)
-    var len: i64 = 0
-    var p: *u8 = s
-    while *p != 0
-        len = len + 1
-        p = (p as i64 + 1) as *u8
-    sys_write(1, s, len)
-
-fn print_digit(n: i32)
-    var digit: u8 = (n + 0x30) as u8
-    sys_write(1, @digit as *u8, 1)
-
-fn print_num(n: i32)
-    if n >= 10
-        print_num(n / 10)
-    print_digit(n % 10)
+# Get expected exit code for a binary name
+fn get_expected_exit(name: *u8) -> i32
+    # Compare name to known binaries
+    if str_eq(name, c"hello")
+        return 0
+    if str_eq(name, c"true")
+        return 0
+    if str_eq(name, c"false")
+        return 1
+    if str_eq(name, c"exitcode")
+        return 42
+    if str_eq(name, c"hello_tier1")
+        return 0
+    # Unknown binaries: expect 0
+    return 0
 
 # ============================================================================
 # Test functions
@@ -116,6 +72,110 @@ fn test_yield() -> i32
     print_str(c"PASS\n")
     return 0
 
+fn test_readdir() -> i32
+    print_str(c"[init] Testing sys_readdir(/bin)... ")
+    var buf: [1024]u8
+    let result: i64 = sys_readdir(c"/bin", @buf[0], 1024)
+    if result > 0
+        print_str(c"PASS (")
+        print_num(result as i32)
+        print_str(c" bytes)\n")
+        return 0
+    else
+        print_str(c"FAIL\n")
+        return 1
+
+# ============================================================================
+# Run and verify binaries in /bin
+# ============================================================================
+
+fn run_binaries_in_bin() -> i32
+    print_str(c"\n")
+    print_str(c"========================================\n")
+    print_str(c"  Running Tier 1 Test Suite\n")
+    print_str(c"========================================\n")
+
+    # Get directory listing
+    var dir_buf: [1024]u8
+    let bytes: i64 = sys_readdir(c"/bin", @dir_buf[0], 1024)
+
+    if bytes <= 0
+        print_str(c"[init] No binaries found in /bin\n")
+        return 0
+
+    # Iterate through null-terminated names
+    var pos: i64 = 0
+    var passed: i32 = 0
+    var failed: i32 = 0
+
+    while pos < bytes
+        let name: *u8 = @dir_buf[pos]
+        let name_len: i64 = strlen(name)
+
+        if name_len > 0
+            # Skip "init" - that's us!
+            if str_eq(name, c"init")
+                pos = pos + name_len + 1
+                # continue not available, use nested if instead
+            else
+                # Build full path: /bin/ + name
+                var path: [256]u8
+                path[0] = 47   # /
+                path[1] = 98   # b
+                path[2] = 105  # i
+                path[3] = 110  # n
+                path[4] = 47   # /
+
+                var i: i64 = 0
+                while i < name_len and i < 250
+                    path[5 + i] = *(name + i)
+                    i = i + 1
+                path[5 + i] = 0
+
+                # Get expected exit code
+                let expected: i32 = get_expected_exit(name)
+
+                print_str(c"[test] ")
+                print_str(name)
+                print_str(c" ... ")
+
+                # Spawn the binary
+                let pid: i64 = sys_spawn(@path[0])
+                if pid > 0
+                    # Wait for it to complete
+                    let exit_code: i64 = sys_wait(pid as i32)
+                    let actual: i32 = exit_code as i32
+
+                    if actual == expected
+                        print_str(c"PASS (exit=")
+                        print_num(actual)
+                        print_str(c")\n")
+                        passed = passed + 1
+                    else
+                        print_str(c"FAIL (expected ")
+                        print_num(expected)
+                        print_str(c", got ")
+                        print_num(actual)
+                        print_str(c")\n")
+                        failed = failed + 1
+                else
+                    print_str(c"FAIL (spawn error)\n")
+                    failed = failed + 1
+
+        # Move past null terminator
+        pos = pos + name_len + 1
+
+    print_str(c"\n")
+    print_str(c"----------------------------------------\n")
+    print_str(c"  Results: ")
+    print_num(passed)
+    print_str(c" passed, ")
+    print_num(failed)
+    print_str(c" failed\n")
+    print_str(c"----------------------------------------\n")
+
+    return failed
+
 # ============================================================================
 # Main entry point
 # ============================================================================
@@ -126,15 +186,20 @@ pub fn main() -> i32
     print_str(c"  Harland Init Process (PID 1)\n")
     print_str(c"========================================\n")
     print_str(c"\n")
-    print_str(c"Running userspace tests...\n")
+    print_str(c"Running syscall tests...\n")
     print_str(c"\n")
 
     var failed: i32 = 0
 
-    # Run tests
+    # Run basic syscall tests
     failed = failed + test_write()
     failed = failed + test_getpid()
     failed = failed + test_yield()
+    failed = failed + test_readdir()
+
+    # Run all binaries in /bin and verify exit codes
+    let tier1_failed: i32 = run_binaries_in_bin()
+    failed = failed + tier1_failed
 
     print_str(c"\n")
 
