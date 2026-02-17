@@ -89,15 +89,88 @@ SERIAL_LOG="$TMPDIR/serial.log"
 INITRAMFS="$HARLAND_DIR/build/initramfs.qcow2"
 STORAGE="$HARLAND_DIR/build/storage.qcow2"
 
-if [ ! -f "$INITRAMFS" ]; then
-    echo "Creating initramfs disk (64MB)..."
-    qemu-img create -f qcow2 "$INITRAMFS" 64M >/dev/null
-fi
+# User init binary
+INIT_ELF="$HARLAND_DIR/build/debug/init.elf"
 
+# Create storage disk if needed
 if [ ! -f "$STORAGE" ]; then
     echo "Creating storage disk (512MB)..."
     qemu-img create -f qcow2 "$STORAGE" 512M >/dev/null
 fi
+
+# Always rebuild initramfs with latest init.elf
+echo "Creating initramfs TAR archive..."
+
+# Create temporary directory for initramfs contents
+INITRAMFS_TMP=$(mktemp -d)
+mkdir -p "$INITRAMFS_TMP/bin"
+mkdir -p "$INITRAMFS_TMP/etc"
+mkdir -p "$INITRAMFS_TMP/var/log"
+
+# Copy init.elf if it exists
+if [ -f "$INIT_ELF" ]; then
+    cp "$INIT_ELF" "$INITRAMFS_TMP/bin/init"
+    echo "  Added /bin/init ($INIT_ELF)"
+else
+    echo "  WARNING: init.elf not found at $INIT_ELF"
+fi
+
+# Copy tier1 test binaries
+for binary in hello true false exitcode hello_tier1; do
+    ELF="$HARLAND_DIR/build/debug/${binary}.elf"
+    if [ -f "$ELF" ]; then
+        cp "$ELF" "$INITRAMFS_TMP/bin/$binary"
+        echo "  Added /bin/$binary"
+    fi
+done
+
+# Create /etc/hostname
+echo "harland" > "$INITRAMFS_TMP/etc/hostname"
+echo "  Added /etc/hostname"
+
+# Create /etc/motd
+cat > "$INITRAMFS_TMP/etc/motd" << 'MOTD'
+Welcome to Harland!
+Loaded from initramfs TAR archive.
+MOTD
+echo "  Added /etc/motd"
+
+# Create /var/log/boot.log
+echo "Harland kernel booted successfully." > "$INITRAMFS_TMP/var/log/boot.log"
+echo "  Added /var/log/boot.log"
+
+# Create TAR archive (POSIX ustar format)
+# Use --format=ustar for compatibility, --numeric-owner to avoid user lookup
+TAR_FILE="$HARLAND_DIR/build/initramfs.tar"
+(cd "$INITRAMFS_TMP" && tar --format=ustar --numeric-owner -cf "$TAR_FILE" .)
+echo "  Created TAR archive: $(du -h "$TAR_FILE" | cut -f1)"
+
+# Clean up temp directory
+rm -rf "$INITRAMFS_TMP"
+
+# Create a raw disk image with the TAR at the beginning
+# The kernel reads this directly without partition table
+RAW_INITRAMFS="$HARLAND_DIR/build/initramfs.raw"
+
+# Calculate size: TAR + padding to 64MB (or at least 1MB larger than TAR)
+TAR_SIZE=$(stat -c%s "$TAR_FILE")
+DISK_SIZE=$((64 * 1024 * 1024))  # 64 MB
+if [ "$TAR_SIZE" -gt "$((DISK_SIZE - 1024 * 1024))" ]; then
+    DISK_SIZE=$((TAR_SIZE + 1024 * 1024))
+fi
+
+# Create raw disk with TAR at the beginning
+dd if=/dev/zero of="$RAW_INITRAMFS" bs=1M count=$((DISK_SIZE / 1024 / 1024)) 2>/dev/null
+dd if="$TAR_FILE" of="$RAW_INITRAMFS" conv=notrunc 2>/dev/null
+echo "  Created raw disk: $(du -h "$RAW_INITRAMFS" | cut -f1)"
+
+# Convert to QCOW2 for QEMU
+rm -f "$INITRAMFS"
+qemu-img convert -f raw -O qcow2 "$RAW_INITRAMFS" "$INITRAMFS"
+echo "  Converted to QCOW2: $(du -h "$INITRAMFS" | cut -f1)"
+
+# Clean up intermediate files
+rm -f "$TAR_FILE" "$RAW_INITRAMFS"
 
 echo "Starting QEMU..."
 echo ""
@@ -127,7 +200,16 @@ cat "$SERIAL_LOG"
 echo ""
 
 # Check for expected output - most advanced first (matching BIOS test milestones)
-if grep -q "ACPI.*Initiating S5 shutdown" "$SERIAL_LOG"; then
+if grep -q "ALL TESTS PASSED" "$SERIAL_LOG"; then
+    echo "========================================="
+    echo "  UEFI: MILESTONE 12 COMPLETE: Tier 1 Test Suite!"
+    echo "========================================="
+    echo "  - Init userspace process running"
+    echo "  - All Tier 1 programs executed correctly"
+    echo "  - Exit codes verified"
+    echo "  - Full test suite passed!"
+    exit 0
+elif grep -q "ACPI.*Initiating S5 shutdown" "$SERIAL_LOG"; then
     echo "========================================="
     echo "  UEFI: MILESTONE 11 COMPLETE: Init + ACPI Shutdown!"
     echo "========================================="

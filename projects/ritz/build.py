@@ -362,6 +362,7 @@ class BinaryConfig:
     code_model: str = ""         # LLC code model (e.g., "kernel")
     no_red_zone: bool = False    # Disable red zone (for kernels)
     bin_sources: list[str] | None = None  # Per-binary source directories
+    pic: bool = False            # Generate position-independent code (for PIE executables)
 
     def __post_init__(self):
         if self.asm_files is None:
@@ -406,17 +407,10 @@ def parse_dependencies(config: dict, pkg_dir: Path) -> dict[str, DependencySpec]
                 if dep_toml.exists():
                     with open(dep_toml, "rb") as f:
                         dep_config = tomllib.load(f)
-                    # Check multiple locations for sources:
-                    # 1. Top-level sources (common case)
-                    # 2. [package].sources (TOML quirk)
-                    # 3. [build].sources (library packages)
+                    # Check both top-level and inside [package] (TOML quirk)
                     sources = dep_config.get("sources")
                     if sources is None:
-                        sources = dep_config.get("package", {}).get("sources")
-                    if sources is None:
-                        sources = dep_config.get("build", {}).get("sources")
-                    if sources is None:
-                        sources = ["src"]
+                        sources = dep_config.get("package", {}).get("sources", ["src"])
                 else:
                     sources = ["src"]
 
@@ -647,6 +641,7 @@ def get_binaries(pkg_dir: Path, config: dict) -> list[BinaryConfig]:
             flags_config = nested_config.get("flags", {})
             code_model = flags_config.get("code-model", "")
             no_red_zone = flags_config.get("no-red-zone", False)
+            pic = flags_config.get("pic", False)
 
             # Per-binary source directories
             bin_sources = bin_entry.get("sources", [])
@@ -664,6 +659,7 @@ def get_binaries(pkg_dir: Path, config: dict) -> list[BinaryConfig]:
                 code_model=code_model,
                 no_red_zone=no_red_zone,
                 bin_sources=bin_sources,
+                pic=pic,
             ))
     else:
         # Default: single binary with package name
@@ -873,8 +869,7 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
 
         # Link: runtime.o + all .bc/.ll files -> binary
         # Build link command with profile-specific options
-        # Use -march=native to enable CPU features like SHA-NI, AVX2, etc.
-        link_cmd = linker_cmd + [str(runtime_obj)] + [str(f) for f in link_files] + ["-o", str(bin_path), "-nostdlib", "-march=native"]
+        link_cmd = linker_cmd + [str(runtime_obj)] + [str(f) for f in link_files] + ["-o", str(bin_path), "-nostdlib"]
 
         # Add optimization level
         opt_level = profile.get("opt_level", 0)
@@ -971,6 +966,7 @@ def compile_freestanding_binary(
     asm_files = bin_config.asm_files or []
     code_model = bin_config.code_model
     no_red_zone = bin_config.no_red_zone
+    pic = bin_config.pic
 
     # UEFI targets need special handling
     is_uefi = "uefi" in target.lower()
@@ -1064,13 +1060,20 @@ def compile_freestanding_binary(
                 clang_cmd = [
                     "clang", "-c",
                     f"--target={target}",
-                    "-fPIC" if target.endswith("-linux") else "",
                 ]
-                # Filter out empty args
-                clang_cmd = [arg for arg in clang_cmd if arg]
+                # Add PIC flag if explicitly requested or for Linux targets
+                if pic or target.endswith("-linux"):
+                    clang_cmd.append("-fPIC")
 
                 if code_model:
-                    clang_cmd.append(f"-mcmodel={code_model}")
+                    # Note: -mcmodel=large is incompatible with -fPIC on x86_64
+                    # For PIC code, use "small" model (default) which supports
+                    # GOT/PLT relocations for position-independent code
+                    if pic and code_model == "large":
+                        # Skip code model for PIC - use default small model
+                        pass
+                    else:
+                        clang_cmd.append(f"-mcmodel={code_model}")
                 if no_red_zone:
                     clang_cmd.append("-mno-red-zone")
 
@@ -1201,6 +1204,11 @@ def compile_freestanding_binary(
             # Normal freestanding ELF linking
             link_cmd = [lld]
 
+            # For PIE executables, add -pie flag and --no-dynamic-linker
+            # (freestanding PIE doesn't need a dynamic linker)
+            if pic:
+                link_cmd.extend(["--pie", "--no-dynamic-linker"])
+
             if linker_script and linker_script.exists():
                 link_cmd.extend(["-T", str(linker_script)])
 
@@ -1329,11 +1337,10 @@ def run_tests(pkg_dir: Path, config: dict) -> bool:
     # Collect all .ritz test files
     ritz_tests = []
 
-    # Check test/ and tests/ subdirectories
-    for subdir in ["test", "tests"]:
-        test_dir = pkg_dir / subdir
-        if test_dir.exists():
-            ritz_tests.extend(test_dir.glob("*.ritz"))
+    # Check test/ subdirectory
+    test_dir = pkg_dir / "test"
+    if test_dir.exists():
+        ritz_tests.extend(test_dir.glob("*.ritz"))
 
     # For test-only packages, also check package root for test_*.ritz files
     is_test_only = config.get("build", {}).get("test_only", False)

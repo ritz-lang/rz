@@ -2,137 +2,145 @@
 
 > See [MILESTONES.md](MILESTONES.md) for the full roadmap
 
-## Current Focus: Milestone 0 → 1 (Hello World)
+## Current Status: Milestone 12+ Complete
 
-### Milestone 0: Build Infrastructure ✅ COMPLETE
+All core milestones through userspace execution are complete. The kernel successfully:
+- Boots via Multiboot2/GRUB
+- Sets up GDT, IDT, page tables
+- Manages physical/virtual memory
+- Handles interrupts and preemptive multitasking
+- Executes userspace PIE programs in Ring 3
+- Implements syscalls (exit, read, write, spawn, wait, readdir, etc.)
 
-**Goal**: Ritz compiles to x86-64 freestanding binary
+## Next Steps
 
-- [x] Ritz compiler supports `--no-runtime` flag for freestanding code
-- [x] `asm x86_64:` block syntax with `{varname}` interpolation
-- [x] Integer types: `u8-u64`, `i8-i64`
-- [x] build.py compiles kernel/src/main.ritz to ELF64
-- [x] Inline assembly works for port I/O (`outb`, `inb`)
-- [x] Serial driver works with inline assembly
-- [x] Kernel entry point exports properly (`pub fn kernel_main`)
+### High Priority
 
-### Milestone 1: Hello World 🔄 IN PROGRESS
+1. **Fix VirtIO TAR Loading Heap Corruption**
+   - Heap corruption occurs when loading files from VirtIO disk
+   - Currently using embedded initramfs as workaround
+   - Need to investigate block splitting/coalescing in heap allocator
+   - Files: `kernel/src/mm/heap.ritz`, `kernel/src/fs/initramfs.ritz`
 
-**Goal**: Boot in QEMU, print to serial
+2. **Fix Page Fault on Process Exit**
+   - Page fault occurs during address space cleanup after hello_tier1
+   - Tests still pass but cleanup is incomplete
+   - Files: `kernel/src/proc/process.ritz`, `kernel/src/mm/vmm.ritz`
 
-- [x] Kernel serial output (kernel/src/main.ritz)
-  - [x] `outb` / `inb` port I/O via inline assembly
-  - [x] Serial port init (COM1 at 115200 baud)
-  - [x] `serial_print`, `serial_print_hex`, `serial_print_dec`
-- [x] Build infrastructure
-  - [x] Multiboot2 header in boot.s
-  - [x] Flat linker script (kernel at 1MB physical)
-  - [x] tools/qemu-test.sh for automated testing
-  - [x] tools/mkiso.sh for GRUB ISO creation
-- [ ] QEMU boot testing
-  - [ ] Install QEMU: `sudo apt install qemu-system-x86`
-  - [ ] Run: `make test-boot`
-  - [ ] Verify: "Hello from Harland!" appears in serial output
-- [ ] UEFI bootloader (deferred - using Multiboot2/GRUB for now)
-  - [ ] Rewrite boot/stage1.ritz in current Ritz syntax
-  - [ ] qcow2 image creation
+3. **Add More Tier 1 Tests**
+   - Port remaining ritz examples to Harland userspace
+   - Add tests for syscalls: read, write, getpid
+   - Consider adding: cat, echo, basic shell
+
+### Medium Priority
+
+4. **Implement VirtIO Network Driver**
+   - Required for network stack
+   - Files: `kernel/src/drivers/virtio/net.ritz` (create)
+
+5. **Add Signal Handling**
+   - Basic signals: SIGKILL, SIGTERM
+   - Signal delivery to userspace
+
+6. **File Descriptor Table**
+   - Per-process file descriptors
+   - stdin/stdout/stderr mapping
+
+### Low Priority / Future
+
+7. **Self-Hosting**
+   - Run ritz0 compiler on Harland
+   - Requires Python interpreter or native compiler
+
+8. **SMP Support**
+   - Multi-processor boot
+   - Per-CPU data structures
+   - Scheduler improvements
 
 ---
 
-## Upcoming Milestones
+## Completed Milestones
 
 | # | Milestone | Status |
 |---|-----------|--------|
 | 0 | Build Infrastructure | ✅ Complete |
-| 1 | Hello World (Serial) | 🔄 In Progress |
-| 2 | Framebuffer Console | ⏳ Planned |
-| 3 | CPU Setup (GDT/IDT) | ⏳ Planned |
-| 4 | Virtual Memory | ⏳ Planned |
-| 5 | APIC & Interrupts | ⏳ Planned |
-| 6 | Kernel Heap | ⏳ Planned |
-| 7 | Kernel Threads | ⏳ Planned |
-| 8 | User Space | ⏳ Planned |
-| **9** | **Syscall Abstraction** | ⏳ **Critical Path** |
-| 10 | VirtIO Network | ⏳ Planned |
-| 11 | Filesystem | ⏳ Planned |
-| 12 | Self-Hosting | ⏳ Planned |
+| 1 | Hello World (Serial) | ✅ Complete |
+| 2 | Framebuffer Console | ✅ Complete |
+| 3 | CPU Setup (GDT/IDT) | ✅ Complete |
+| 4 | Virtual Memory | ✅ Complete |
+| 5 | APIC & Interrupts | ✅ Complete |
+| 6 | Kernel Heap | ✅ Complete |
+| 7 | Kernel Threads | ✅ Complete |
+| 8 | User Space | ✅ Complete |
+| 9 | Syscall Interface | ✅ Complete |
+| 10 | VirtIO Block | ✅ Complete |
+| 11 | Filesystem (Goliath) | ✅ Complete |
+| 12 | Init + Userspace Apps | ✅ Complete |
+| 12+ | Tier 1 Test Suite | ✅ Complete |
 
 ---
 
-## Critical Architecture Decision: Syscall Abstraction Layer
+## Known Issues
 
-**Goal**: Ritz programs run on Linux, Windows, macOS, ARM, AND Harland
+1. **Import Qualified Names** (ritz-lang/rz#70)
+   - `import module as X` then `X::function()` doesn't work
+   - Workaround: Use `import module { function }` directly
 
-```
-Ritz App → ritz::sys (abstract) → Backend (harland/linux/windows/etc)
-```
+2. **Heap Corruption with VirtIO TAR**
+   - Block magic reads as 0 after splitting
+   - Possibly DMA-related or alignment issue
+   - Workaround: Use embedded initramfs
 
-This needs to be designed NOW, even if Harland-specific syscalls come later.
+3. **Page Fault on Process Exit Cleanup**
+   - Occurs after hello_tier1 execution
+   - Tests pass, but cleanup is incomplete
 
-### ritz::sys API (Draft)
+---
+
+## Architecture Notes
+
+### Userspace Programs
+
+Programs are PIE (Position Independent Executables) loaded at 0x400000.
+They use `libharland.ritz` for syscall wrappers.
 
 ```ritz
-# Platform-agnostic syscall interface
-sys_read(fd: i32, buf: ptr[u8], count: usize) -> isize
-sys_write(fd: i32, buf: ptr[u8], count: usize) -> isize
-sys_open(path: ptr[u8], flags: i32, mode: u32) -> i32
-sys_close(fd: i32) -> i32
-sys_mmap(...) -> ptr[void]
-sys_exit(code: i32) -> !
-# ... etc
+import libharland { sys_exit, sys_write }
+
+pub fn main() -> i32
+    sys_write(1, "Hello!\n", 7)
+    sys_exit(0)
 ```
 
-### Backend Selection
+### Init Test Registry
 
+Init maintains a registry of expected exit codes:
 ```ritz
-@cfg(target_os = "harland")
-import ritz.sys.harland as backend
-
-@cfg(target_os = "linux")
-import ritz.sys.linux as backend
-
-# All backends implement same interface
+# Test registry - maps binary name to expected exit code
+fn get_expected_exit_code(name: StrView) -> i32
+    if strview_eq(name, "true")   -> 0
+    if strview_eq(name, "false")  -> 1
+    if strview_eq(name, "exitcode") -> 42
+    ...
 ```
 
-See MILESTONES.md § Milestone 9 for full design.
+### Build Commands
 
----
-
-## Questions / Decisions Needed
-
-1. **Ritz compiler changes**: Fork ritz repo, or add kernel target to existing?
-   - Leaning: In-place extension, keep one codebase
-
-2. **UEFI bootloader linking**: PE/COFF vs ELF conversion?
-   - Option A: LLVM target `x86_64-unknown-windows` for PE
-   - Option B: Build ELF, `objcopy` to PE
-   - Leaning: Option A (cleaner)
-
-3. **Test framework**: How to run integration tests in QEMU?
-   - Use `isa-debug-exit` device for exit codes
-   - Serial output captured and grep'd for results
-   - Timeout handling for hangs
-
----
-
-## Notes
-
-### QEMU Command Reference
 ```bash
-qemu-system-x86_64 \
-    -drive if=pflash,format=raw,file=/usr/share/OVMF/OVMF_CODE.fd,readonly=on \
-    -drive if=pflash,format=raw,file=OVMF_VARS.fd \
-    -drive file=harland.qcow2,format=qcow2 \
-    -m 4G \
-    -smp 4 \
-    -serial mon:stdio \
-    -no-reboot \
-    -d int,cpu_reset  # Debug: show interrupts and resets
+# Build kernel and userspace
+make -C projects/harland kernel
+
+# Run in QEMU with test harness
+./projects/harland/boot/test.sh
+
+# Run interactively
+./projects/harland/boot/run.sh
 ```
 
-### Key Resources
+---
+
+## Resources
+
 - OSDev Wiki: https://wiki.osdev.org/
-- BOOTBOOT: https://gitlab.com/bztsrc/bootboot
-- OVMF: https://github.com/tianocore/tianocore.github.io/wiki/OVMF
 - Intel SDM Vol 3: System Programming Guide
 - AMD64 ABI: https://refspecs.linuxbase.org/elf/x86_64-abi-0.99.pdf

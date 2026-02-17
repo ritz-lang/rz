@@ -1,0 +1,231 @@
+# TAR Archive Parser
+#
+# Parses USTAR-format tar archives for initramfs loading.
+# TAR is a simple sequential format perfect for read-once archives.
+#
+# TAR Header Format (512 bytes):
+#   0-99:   filename (null-terminated)
+#   100-107: mode (octal ASCII)
+#   108-115: uid (octal ASCII)
+#   116-123: gid (octal ASCII)
+#   124-135: size (octal ASCII)
+#   136-147: mtime (octal ASCII)
+#   148-155: checksum
+#   156:     typeflag ('0'=file, '5'=directory, etc.)
+#   157-256: linkname
+#   257-262: magic "ustar\0" or "ustar "
+#   263-264: version
+#   265-296: uname
+#   297-328: gname
+#   329-336: devmajor
+#   337-344: devminor
+#   345-499: prefix (for long filenames)
+#   500-511: padding
+
+import serial { StrView, prints, println, serial_print_hex, serial_print_dec }
+import fs.knamespace { KNamespace, knamespace_mkdir, knamespace_write, KNS_OK }
+import fs.kpath { strview_from_ptr }
+
+# ============================================================================
+# TAR Constants
+# ============================================================================
+
+const TAR_BLOCK_SIZE: u64 = 512
+const TAR_NAME_SIZE: u64 = 100
+const TAR_MODE_OFFSET: u64 = 100
+const TAR_SIZE_OFFSET: u64 = 124
+const TAR_TYPEFLAG_OFFSET: u64 = 156
+const TAR_MAGIC_OFFSET: u64 = 257
+const TAR_PREFIX_OFFSET: u64 = 345
+const TAR_PREFIX_SIZE: u64 = 155
+
+# Type flags
+const TAR_TYPE_FILE: u8 = 48       # '0' - regular file
+const TAR_TYPE_FILE_ALT: u8 = 0    # NUL - also regular file
+const TAR_TYPE_HARDLINK: u8 = 49   # '1'
+const TAR_TYPE_SYMLINK: u8 = 50    # '2'
+const TAR_TYPE_CHARDEV: u8 = 51    # '3'
+const TAR_TYPE_BLOCKDEV: u8 = 52   # '4'
+const TAR_TYPE_DIRECTORY: u8 = 53  # '5'
+const TAR_TYPE_FIFO: u8 = 54       # '6'
+
+# ============================================================================
+# TAR Header Structure (512 bytes)
+# ============================================================================
+# Note: We don't define a struct because Ritz structs would need exact
+# packing. Instead, we parse directly from the byte buffer.
+
+# ============================================================================
+# Parsing Functions
+# ============================================================================
+
+# Parse an octal ASCII string to u64
+# TAR uses null-terminated or space-terminated octal strings
+pub fn tar_parse_octal(buf: *u8, len: u64) -> u64
+    var result: u64 = 0
+    var i: u64 = 0
+
+    # Skip leading spaces
+    while i < len
+        let c: u8 = *(buf + i as i64)
+        if c != 32  # space
+            break
+        i = i + 1
+
+    # Parse octal digits
+    while i < len
+        let c: u8 = *(buf + i as i64)
+        # Stop at null, space, or non-digit
+        if c == 0 or c == 32
+            break
+        if c < 48 or c > 55   # '0' to '7'
+            break
+        result = result * 8 + (c - 48) as u64
+        i = i + 1
+
+    result
+
+# Check if a TAR block is empty (end-of-archive marker)
+# Two consecutive zero blocks indicate end of archive
+pub fn tar_is_empty_block(block: *u8) -> bool
+    var i: u64 = 0
+    while i < TAR_BLOCK_SIZE
+        if *(block + i as i64) != 0
+            return false
+        i = i + 1
+    true
+
+# Validate USTAR magic
+pub fn tar_is_ustar(block: *u8) -> bool
+    let magic: *u8 = block + TAR_MAGIC_OFFSET as i64
+    # Check for "ustar\0" or "ustar "
+    if *(magic + 0) != 117  # 'u'
+        return false
+    if *(magic + 1) != 115  # 's'
+        return false
+    if *(magic + 2) != 116  # 't'
+        return false
+    if *(magic + 3) != 97   # 'a'
+        return false
+    if *(magic + 4) != 114  # 'r'
+        return false
+    # 5th byte is either '\0' or ' '
+    true
+
+# Get the filename from a TAR header
+# Returns length of filename copied to out_buf
+pub fn tar_get_filename(header: *u8, out_buf: *u8, out_max: u64) -> u64
+    var out_len: u64 = 0
+
+    # Check for prefix (USTAR extended filename)
+    let prefix: *u8 = header + TAR_PREFIX_OFFSET as i64
+    if *prefix != 0
+        # Copy prefix
+        var i: u64 = 0
+        while i < TAR_PREFIX_SIZE and out_len < out_max - 1
+            let c: u8 = *(prefix + i as i64)
+            if c == 0
+                break
+            *(out_buf + out_len as i64) = c
+            out_len = out_len + 1
+            i = i + 1
+        # Add separator
+        if out_len < out_max - 1
+            *(out_buf + out_len as i64) = 47  # '/'
+            out_len = out_len + 1
+
+    # Copy main name
+    let name: *u8 = header
+    var j: u64 = 0
+    while j < TAR_NAME_SIZE and out_len < out_max - 1
+        let c: u8 = *(name + j as i64)
+        if c == 0
+            break
+        *(out_buf + out_len as i64) = c
+        out_len = out_len + 1
+        j = j + 1
+
+    # Null-terminate
+    *(out_buf + out_len as i64) = 0
+    out_len
+
+# Get file size from TAR header
+pub fn tar_get_size(header: *u8) -> u64
+    tar_parse_octal(header + TAR_SIZE_OFFSET as i64, 12)
+
+# Get type flag from TAR header
+pub fn tar_get_type(header: *u8) -> u8
+    *(header + TAR_TYPEFLAG_OFFSET as i64)
+
+# Calculate number of 512-byte blocks needed for a file
+pub fn tar_data_blocks(file_size: u64) -> u64
+    if file_size == 0
+        return 0
+    (file_size + TAR_BLOCK_SIZE - 1) / TAR_BLOCK_SIZE
+
+# ============================================================================
+# TAR Archive Walker
+# ============================================================================
+
+# TAR entry information
+pub struct TarEntry
+    name: [256]u8         # Full pathname
+    name_len: u64         # Length of name
+    size: u64             # File size in bytes
+    entry_type: u8        # TAR type flag
+    _padding: [7]u8       # Alignment padding
+    data_offset: u64      # Offset to data in archive (in bytes)
+
+const TAR_ENTRY_SIZE: u64 = 288  # sizeof(TarEntry)
+
+# Parse a TAR header block into a TarEntry
+# Returns: 0 = success, -1 = empty block (end), -2 = invalid
+pub fn tar_parse_header(header: *u8, entry: *TarEntry) -> i32
+    # Check for end-of-archive (empty block)
+    if tar_is_empty_block(header)
+        return -1
+
+    # Validate USTAR format (optional, some tars don't have it)
+    # if not tar_is_ustar(header)
+    #     return -2
+
+    # Get filename
+    (*entry).name_len = tar_get_filename(header, @(*entry).name[0], 256)
+
+    # Get size
+    (*entry).size = tar_get_size(header)
+
+    # Get type
+    (*entry).entry_type = tar_get_type(header)
+
+    # data_offset is set by the caller (archive walker)
+    (*entry).data_offset = 0
+
+    0
+
+# ============================================================================
+# Debug Functions
+# ============================================================================
+
+pub fn tar_print_entry(entry: *TarEntry)
+    let type_char: u8 = (*entry).entry_type
+    if type_char == TAR_TYPE_DIRECTORY
+        prints("d " as StrView)
+    else if type_char == TAR_TYPE_FILE or type_char == TAR_TYPE_FILE_ALT
+        prints("f " as StrView)
+    else if type_char == TAR_TYPE_SYMLINK
+        prints("l " as StrView)
+    else
+        prints("? " as StrView)
+
+    # Print name
+    let name_view: StrView = strview_from_ptr(@(*entry).name[0], (*entry).name_len as i64)
+    prints(name_view)
+
+    # Print size for files
+    if type_char == TAR_TYPE_FILE or type_char == TAR_TYPE_FILE_ALT
+        prints(" (" as StrView)
+        serial_print_dec((*entry).size)
+        prints(" bytes)" as StrView)
+
+    prints("\n" as StrView)
