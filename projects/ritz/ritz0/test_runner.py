@@ -452,8 +452,7 @@ fn main() -> i32
 
         # Parse dependencies from ritz.toml if not provided
         if dependencies is None and project_root:
-            toml_path = project_root / "ritz.toml"
-            dependencies = parse_ritz_toml_dependencies(toml_path, project_root)
+            dependencies = parse_project_dependencies(project_root)
 
         try:
             source_files = collect_all_source_files(
