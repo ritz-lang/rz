@@ -24,7 +24,6 @@ entry:
     shlq $$3, %rax
     leaq 8(%rsp,%rax), %rdx
     andq $$-16, %rsp
-    subq $$8, %rsp
     call main
     movq %rax, %rdi
     movq $$60, %rax

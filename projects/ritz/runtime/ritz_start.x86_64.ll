@@ -18,7 +18,6 @@ entry:
     movq (%rsp), %rdi
     leaq 8(%rsp), %rsi
     andq $$-16, %rsp
-    subq $$8, %rsp
     call main
     movq %rax, %rdi
     movq $$60, %rax
