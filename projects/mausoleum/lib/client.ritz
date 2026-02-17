@@ -409,6 +409,71 @@ pub fn client_delete(client: *Client, doc_id: i64) -> i32
     return 1
 
 # ============================================================================
+# Scan operations
+# ============================================================================
+
+# Scan all documents in the collection
+# callback: fn(doc_id: i64, data: *u8, len: i32, user_data: *u8) -> i32
+#   Return 0 to continue, non-zero to stop
+# Returns number of documents scanned, or < 0 on error
+pub fn client_scan(client: *Client, callback: *u8, user_data: *u8) -> i32
+    if client == null or client.connected == 0
+        return -1
+
+    let req_id: i32 = client.next_request_id
+    client.next_request_id += 1
+    build_scan(client.send_buf, req_id, 0)  # 0 = get all documents
+
+    if send_message(client) < 0
+        client.connected = 0
+        client.last_error = PROTO_ERR_DISCONNECTED
+        return -2
+
+    var count: i32 = 0
+    var done: i32 = 0
+
+    while done == 0
+        var reader: MessageReader
+        if recv_message(client, @reader) < 0
+            client.connected = 0
+            client.last_error = PROTO_ERR_DISCONNECTED
+            return -3
+
+        let msg_type: i32 = msgreader_msg_type(@reader)
+
+        if msg_type == MSG_ERROR
+            client.last_error = msgreader_read_i32(@reader)
+            return -4
+
+        if msg_type == MSG_SCAN_END
+            done = 1
+        else if msg_type == MSG_SCAN_RESULT
+            # Read document count in this batch
+            let batch_count: i32 = msgreader_read_i32(@reader)
+
+            for i in 0..batch_count
+                let doc_id: i64 = msgreader_read_i64(@reader)
+                var doc_len: i32 = 0
+                var doc_data: *u8 = msgreader_read_bytes(@reader, @doc_len)
+
+                # Call the callback
+                let cb: fn(i64, *u8, i32, *u8) -> i32 = callback as fn(i64, *u8, i32, *u8) -> i32
+                let result: i32 = cb(doc_id, doc_data, doc_len, user_data)
+
+                count += 1
+
+                if result != 0
+                    # Callback requested stop
+                    done = 1
+                    break
+        else
+            client.last_error = PROTO_ERR_PROTOCOL
+            return -5
+
+    client.last_error = PROTO_OK
+    return count
+
+# ============================================================================
 # Transaction operations
 # ============================================================================
 
