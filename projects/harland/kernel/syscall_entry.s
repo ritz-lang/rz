@@ -342,6 +342,65 @@ jump_to_userspace_with_retval:
 .size jump_to_userspace_with_retval, . - jump_to_userspace_with_retval
 
 # ============================================================================
+# Jump to Userspace with Arguments (argc/argv)
+# ============================================================================
+# void jump_to_userspace_with_args(u64 entry_point, u64 user_stack, i64 argc, u64 argv)
+#
+# Jumps to userspace with argc in RDI and argv in RSI.
+# This follows the SysV AMD64 ABI for passing arguments to main().
+#
+.global jump_to_userspace_with_args
+.type jump_to_userspace_with_args, @function
+jump_to_userspace_with_args:
+    # Arguments:
+    #   RDI = entry point (user RIP)
+    #   RSI = user stack pointer
+    #   RDX = argc
+    #   RCX = argv pointer
+
+    # Disable interrupts during transition
+    cli
+
+    # Save argc and argv before we clobber RDX/RCX
+    movq %rdx, %r8              # Save argc in R8
+    movq %rcx, %r9              # Save argv in R9
+
+    # Build IRET frame for Ring 3
+    # Stack layout for IRETQ: RIP, CS, RFLAGS, RSP, SS
+
+    pushq $0x23                  # SS (user data, ring 3)
+    pushq %rsi                   # RSP (user stack)
+    pushq $0x202                 # RFLAGS (IF=1, reserved bit 1 = 1)
+    pushq $0x1B                  # CS (user code, ring 3)
+    pushq %rdi                   # RIP (entry point)
+
+    # Set up main() arguments per SysV AMD64 ABI:
+    #   RDI = argc (first argument)
+    #   RSI = argv (second argument)
+    movq %r8, %rdi              # argc
+    movq %r9, %rsi              # argv
+
+    # Clear other registers (security)
+    xorq %rax, %rax
+    xorq %rbx, %rbx
+    xorq %rcx, %rcx
+    xorq %rdx, %rdx
+    xorq %rbp, %rbp
+    xorq %r8, %r8
+    xorq %r9, %r9
+    xorq %r10, %r10
+    xorq %r11, %r11
+    xorq %r12, %r12
+    xorq %r13, %r13
+    xorq %r14, %r14
+    xorq %r15, %r15
+
+    # Jump to userspace!
+    iretq
+
+.size jump_to_userspace_with_args, . - jump_to_userspace_with_args
+
+# ============================================================================
 # Userspace Syscall Stub (for testing - would be in user program)
 # ============================================================================
 # This is what userspace programs call to make syscalls.

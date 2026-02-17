@@ -1,0 +1,223 @@
+# rzsh - Ritz Shell (Linux version)
+#
+# Linux-specific implementation of rzsh.
+
+import common {
+    puts, println, putchar, print_num, is_whitespace,
+    g_line_buffer, g_line_pos, line_clear, line_add_char, line_backspace,
+    g_argv, parse_args,
+    cmd_help, cmd_exit, cmd_pid, cmd_echo, cmd_clear, print_prompt,
+    MAX_LINE, MAX_ARGS, MAX_PATH,
+    STDIN, STDOUT, STDERR
+}
+
+import ritzlib.sys {
+    sys_read, sys_write, sys_exit,
+    sys_open, sys_close, sys_getdents64, sys_fork, sys_execve, sys_wait4,
+    O_RDONLY, O_DIRECTORY,
+    STDIN, STDOUT, STDERR
+}
+
+import ritzlib.str { strlen, strcmp }
+
+# ============================================================================
+# ls command (Linux)
+# ============================================================================
+
+fn cmd_ls(argc: i32) -> i32
+    var path: *u8 = c"."
+    if argc > 1
+        path = g_argv[1]
+
+    let fd: i32 = sys_open(path, O_RDONLY | O_DIRECTORY)
+    if fd < 0
+        puts(c"ls: cannot access '")
+        puts(path)
+        println(c"'")
+        return 1
+
+    var buf: [4096]u8
+    while true
+        let n: i64 = sys_getdents64(fd, @buf[0], 4096)
+        if n <= 0
+            break
+
+        var pos: i64 = 0
+        while pos < n
+            let entry: *u8 = @buf[0] + pos
+            let reclen_lo: u8 = *(entry + 16)
+            let reclen_hi: u8 = *(entry + 17)
+            let reclen: i64 = (reclen_lo as i64) | ((reclen_hi as i64) << 8)
+            let name: *u8 = entry + 19
+
+            # Skip . and ..
+            if *name != 46 or (*(name + 1) != 0 and *(name + 1) != 46)
+                puts(c"  ")
+                println(name)
+
+            pos = pos + reclen
+
+    sys_close(fd)
+    return 0
+
+# ============================================================================
+# External Command Execution (Linux)
+# ============================================================================
+
+fn exec_external(argc: i32) -> i32
+    let cmd: *u8 = g_argv[0]
+
+    var path_buf: [256]u8
+    var path: *u8 = cmd
+
+    if *cmd != 47  # Not starting with '/'
+        # Try /usr/bin/ first
+        path_buf[0] = 47   # '/'
+        path_buf[1] = 117  # 'u'
+        path_buf[2] = 115  # 's'
+        path_buf[3] = 114  # 'r'
+        path_buf[4] = 47   # '/'
+        path_buf[5] = 98   # 'b'
+        path_buf[6] = 105  # 'i'
+        path_buf[7] = 110  # 'n'
+        path_buf[8] = 47   # '/'
+        var i: i64 = 0
+        while *(cmd + i) != 0 and i < MAX_PATH - 10
+            path_buf[(9 + i) as i32] = *(cmd + i)
+            i = i + 1
+        path_buf[(9 + i) as i32] = 0
+        path = @path_buf[0]
+
+    let pid: i32 = sys_fork()
+
+    if pid < 0
+        println(c"rzsh: fork failed")
+        return 1
+
+    if pid == 0
+        # Child process
+        g_argv[argc] = null
+
+        var envp: [1]*u8
+        envp[0] = null
+
+        sys_execve(path, @g_argv[0], @envp[0])
+
+        # If execve returns, it failed - try /bin/ instead
+        path_buf[0] = 47   # '/'
+        path_buf[1] = 98   # 'b'
+        path_buf[2] = 105  # 'i'
+        path_buf[3] = 110  # 'n'
+        path_buf[4] = 47   # '/'
+        var i: i64 = 0
+        while *(cmd + i) != 0 and i < MAX_PATH - 6
+            path_buf[(5 + i) as i32] = *(cmd + i)
+            i = i + 1
+        path_buf[(5 + i) as i32] = 0
+
+        sys_execve(@path_buf[0], @g_argv[0], @envp[0])
+
+        # Still failed
+        puts(c"rzsh: command not found: ")
+        println(cmd)
+        sys_exit(127)
+
+    # Parent process - wait for child
+    var status: i32 = 0
+    sys_wait4(pid, @status, 0, null)
+
+    return (status >> 8) & 255
+
+# ============================================================================
+# Wait for input (Linux)
+# ============================================================================
+
+fn wait_for_input() -> i32
+    # On Linux, blocking read handles waiting
+    return 0
+
+# ============================================================================
+# Command Dispatch
+# ============================================================================
+
+fn process_line() -> i32
+    if g_line_pos == 0
+        return 0
+
+    g_line_buffer[g_line_pos as i32] = 0
+
+    let argc: i32 = parse_args(@g_line_buffer[0])
+    if argc == 0
+        return 0
+
+    let cmd: *u8 = g_argv[0]
+
+    if strcmp(cmd, c"help") == 0
+        return cmd_help()
+
+    if strcmp(cmd, c"exit") == 0
+        return cmd_exit(argc)
+
+    if strcmp(cmd, c"pid") == 0
+        return cmd_pid()
+
+    if strcmp(cmd, c"echo") == 0
+        return cmd_echo(argc)
+
+    if strcmp(cmd, c"ls") == 0
+        return cmd_ls(argc)
+
+    if strcmp(cmd, c"clear") == 0
+        return cmd_clear()
+
+    return exec_external(argc)
+
+# ============================================================================
+# Main
+# ============================================================================
+
+pub fn main() -> i32
+    println(c"")
+    println(c"===========================================")
+    println(c"  rzsh - Ritz Shell v0.1 (linux)")
+    println(c"  Type 'help' for available commands")
+    println(c"===========================================")
+    println(c"")
+
+    var read_buf: [1]u8
+    var running: bool = true
+
+    while running
+        print_prompt()
+        line_clear()
+
+        var reading: bool = true
+        while reading
+            let n: i64 = sys_read(STDIN, @read_buf[0], 1)
+
+            if n > 0
+                let c: u8 = read_buf[0]
+
+                if c == 13 or c == 10
+                    println(c"")
+                    process_line()
+                    reading = false
+                else if c == 127 or c == 8
+                    line_backspace()
+                else if c == 3
+                    println(c"^C")
+                    line_clear()
+                    reading = false
+                else if c == 4
+                    if g_line_pos == 0
+                        println(c"")
+                        running = false
+                        reading = false
+                else if c >= 32 and c < 127
+                    line_add_char(c)
+                    putchar(c)
+            else
+                wait_for_input()
+
+    println(c"Goodbye!")
+    return 0
