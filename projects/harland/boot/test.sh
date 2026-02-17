@@ -11,10 +11,14 @@ set -e
 
 # Parse arguments
 GUI_MODE=false
+INTERACTIVE=false
 for arg in "$@"; do
     case $arg in
         --gui)
             GUI_MODE=true
+            ;;
+        --interactive)
+            INTERACTIVE=true
             ;;
     esac
 done
@@ -243,25 +247,37 @@ else
     echo "  Display: headless"
 fi
 
+# Interactive mode disables timeout
+if [ "$INTERACTIVE" = true ]; then
+    TIMEOUT_SECS=0
+    echo "  Mode: interactive (no timeout, Ctrl+C to quit)"
+fi
+
 # Run QEMU with UEFI (longer timeout for full boot)
 # NOTE: Using 256M because UEFI bootloader only identity maps first 256MB.
 # With more RAM, UEFI may allocate kernel buffers above 256MB which aren't mapped.
 # TODO: Fix bootloader to dynamically map memory where kernel is loaded.
 # VirtIO block and network devices for driver testing (matching BIOS test)
-timeout $TIMEOUT_SECS qemu-system-x86_64 \
-    -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
-    -drive format=raw,file="$TMPDIR/disk.img" \
+QEMU_CMD="qemu-system-x86_64 \
+    -drive if=pflash,format=raw,readonly=on,file=$OVMF_CODE \
+    -drive format=raw,file=$TMPDIR/disk.img \
     -device virtio-blk-pci,drive=initramfs \
-    -drive file="$INITRAMFS",format=qcow2,if=none,id=initramfs \
+    -drive file=$INITRAMFS,format=qcow2,if=none,id=initramfs \
     -device virtio-blk-pci,drive=storage \
-    -drive file="$STORAGE",format=qcow2,if=none,id=storage \
+    -drive file=$STORAGE,format=qcow2,if=none,id=storage \
     -device virtio-net-pci,netdev=net0 \
     -netdev user,id=net0 \
-    -serial file:"$SERIAL_LOG" \
+    -serial file:$SERIAL_LOG \
     $DISPLAY_OPT \
     -smp 4 \
     -m 256M \
-    -no-reboot 2>&1 || true
+    -no-reboot"
+
+if [ "$TIMEOUT_SECS" -gt 0 ]; then
+    timeout $TIMEOUT_SECS $QEMU_CMD 2>&1 || true
+else
+    $QEMU_CMD 2>&1 || true
+fi
 
 echo "=== Serial Output ==="
 cat "$SERIAL_LOG"
