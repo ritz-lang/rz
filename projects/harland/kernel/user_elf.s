@@ -131,3 +131,33 @@ cat_motd_elf_end:
 
 cat_motd_elf_size:
     .quad cat_motd_elf_end - cat_motd_elf_start
+
+# ============================================================================
+# echo.elf - Tier 1: prints command-line arguments
+# ============================================================================
+.global echo_elf_start
+.global echo_elf_end
+.global echo_elf_size
+
+.align 16
+echo_elf_start:
+    .incbin "build/debug/echo.elf"
+echo_elf_end:
+
+echo_elf_size:
+    .quad echo_elf_end - echo_elf_start
+
+# ============================================================================
+# wc.elf - Tier 1: counts lines/words/chars in a file
+# ============================================================================
+.global wc_elf_start
+.global wc_elf_end
+.global wc_elf_size
+
+.align 16
+wc_elf_start:
+    .incbin "build/debug/wc.elf"
+wc_elf_end:
+
+wc_elf_size:
+    .quad wc_elf_end - wc_elf_start

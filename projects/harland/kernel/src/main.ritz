@@ -4120,10 +4120,6 @@ fn sys_exit_impl(code: i32) -> i64
 # For blocking spawn, the child has already exited by the time spawn returns.
 # This can be used to get the exit code if needed.
 fn sys_wait_impl(pid: i32) -> i64
-    prints("[syscall] wait(")
-    serial_print_dec(pid as u64)
-    prints(")\n")
-
     # For blocking spawn, the exit code is already available
     if g_child_pid == 2
         let code: i64 = g_child_exit_code
@@ -4236,11 +4232,19 @@ pub fn syscall_handler(rax: u64, rdi: u64, rsi: u64, rdx: u64) -> i64
         return sys_exit_impl(rdi as i32)
 
     # SYS_OPEN - Open a file
+    # WORKAROUND: knamespace_resolve returns a 32-byte struct which triggers
+    # a compiler bug that corrupts kernel globals. Save/restore the affected
+    # globals around the call. TODO: Fix the Ritz compiler's large struct return.
     if rax == SYS_OPEN
         # rdi = path pointer
         # rsi = path length
         # rdx = flags
-        return sys_open(rdi as *u8, rsi, rdx as i32)
+        let saved_child_pid: u64 = g_child_pid
+        let saved_has_parent: u8 = g_has_parent
+        let result: i64 = sys_open(rdi as *u8, rsi, rdx as i32)
+        g_child_pid = saved_child_pid
+        g_has_parent = saved_has_parent
+        return result
 
     # SYS_CLOSE - Close a file descriptor
     if rax == SYS_CLOSE
@@ -4647,6 +4651,7 @@ pub fn elf_load(elf_data: *u8, elf_size: u64, load_base: u64) -> ElfLoadResult
                 # Check if we already allocated this page for a previous segment
                 var page_phys: u64 = 0
                 var need_map: bool = true
+                var need_upgrade: bool = false
 
                 # Check if WE already mapped this page (with USER bit)
                 # For the ELF loader, we track pages we've allocated by checking
@@ -4661,6 +4666,11 @@ pub fn elf_load(elf_data: *u8, elf_size: u64, load_base: u64) -> ElfLoadResult
                     # We already allocated and mapped this page for a previous segment
                     page_phys = existing_phys
                     need_map = false
+                    # Check if we need to upgrade permissions (e.g., R -> RW)
+                    # Multiple segments can share a page with different permissions;
+                    # we need to use the most permissive combination
+                    if (pte_flags & PTE_WRITABLE) != 0
+                        need_upgrade = true
                 else
                     # Need to allocate a new physical page
                     page_phys = pmm_alloc_page()
@@ -4712,6 +4722,16 @@ pub fn elf_load(elf_data: *u8, elf_size: u64, load_base: u64) -> ElfLoadResult
                         serial_print_hex(page_vaddr)
                         prints("!\n")
                         pmm_free_page(page_phys)
+                        result.error = ELF_ERR_MAP_FAILED
+                        return result
+                else if need_upgrade
+                    # Page was already mapped but we need to upgrade permissions
+                    # (e.g., a read-only segment followed by a writable segment sharing the same page)
+                    let map_result: i32 = vmm_map_page(page_vaddr, page_phys, pte_flags)
+                    if map_result != 0
+                        prints("[elf] Failed to upgrade page permissions at 0x")
+                        serial_print_hex(page_vaddr)
+                        prints("!\n")
                         result.error = ELF_ERR_MAP_FAILED
                         return result
 
