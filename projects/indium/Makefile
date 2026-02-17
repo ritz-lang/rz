@@ -27,7 +27,7 @@ STORAGE = $(BUILD_DIR)/storage.qcow2
 # Phony targets
 # ============================================================================
 
-.PHONY: all clean kernel userspace iso run run-iso run-uefi debug test help
+.PHONY: all clean kernel userspace iso run run-iso run-uefi debug test test-uefi test-uefi-gui help
 
 all: iso
 
@@ -169,6 +169,10 @@ test: kernel
 test-uefi: kernel
 	$(MAKE) -C $(HARLAND_DIR) test-uefi-boot
 
+# Test UEFI boot with GUI display (shows framebuffer)
+test-uefi-gui: kernel
+	$(MAKE) -C $(HARLAND_DIR) test-uefi-gui
+
 # ============================================================================
 # Clean
 # ============================================================================
@@ -199,7 +203,8 @@ help:
 	@echo ""
 	@echo "Test Targets:"
 	@echo "  test        - Run kernel boot test (BIOS)"
-	@echo "  test-uefi   - Run kernel boot test (UEFI)"
+	@echo "  test-uefi   - Run kernel boot test (UEFI, headless)"
+	@echo "  test-uefi-gui - Test UEFI with display (see framebuffer)"
 	@echo ""
 	@echo "Other:"
 	@echo "  clean       - Remove build artifacts"

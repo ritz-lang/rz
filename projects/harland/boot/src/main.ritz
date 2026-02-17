@@ -613,33 +613,59 @@ var pml4_addr: u64 = 0
 var pdpt_identity_addr: u64 = 0
 var pdpt_highhalf_addr: u64 = 0
 var pd_addr: u64 = 0
+var pd_extra_addr: u64 = 0     # For 1-2GB range
+var pd_extra2_addr: u64 = 0    # For 2-3GB range
+var pd_extra3_addr: u64 = 0    # For 3-4GB range
+var detected_memory_mb: u64 = 0  # Total usable memory in MB
 
 fn allocate_page_tables() -> i32
     prints("  Allocating page tables...\n")
+    # We need:
+    # - 1 page for PML4
+    # - 1 page for PDPT (identity, covers 0-512GB)
+    # - 1 page for PDPT (higher-half)
+    # - Up to 4 pages for PDs (each covers 1GB with 2MB pages)
+    # Total: 7 pages for up to 4GB mapping
     var addr: u64 = 0
-    var status: u64 = efi_allocate_pages(ALLOCATE_ANY_PAGES, EFI_LOADER_DATA, 4, @addr)
+    var status: u64 = efi_allocate_pages(ALLOCATE_ANY_PAGES, EFI_LOADER_DATA, 7, @addr)
     if status != EFI_SUCCESS
         prints("    ERROR: Failed to allocate page tables\n")
         return -1
     pml4_addr = addr
     pdpt_identity_addr = addr + 0x1000
     pdpt_highhalf_addr = addr + 0x2000
-    pd_addr = addr + 0x3000
+    pd_addr = addr + 0x3000         # 0-1GB
+    pd_extra_addr = addr + 0x4000   # 1-2GB
+    pd_extra2_addr = addr + 0x5000  # 2-3GB
+    pd_extra3_addr = addr + 0x6000  # 3-4GB
     prints("    PML4 at ")
     serial_print_hex(pml4_addr)
     prints("\n")
+    # Zero all 7 pages
     var p: *u64 = pml4_addr as *u64
     var i: i32 = 0
-    while i < 2048
+    while i < 3584  # 7 pages * 512 entries
         *p = 0
         p = p + 1
         i = i + 1
     return 0
 
 fn setup_page_tables() -> i32
-    prints("  Setting up page tables...\n")
+    prints("  Setting up page tables based on detected memory...\n")
     let flags: u64 = PTE_PRESENT | PTE_WRITABLE
     let huge_flags: u64 = PTE_PRESENT | PTE_WRITABLE | PTE_HUGE
+
+    # Determine how much memory to map based on detected usable memory
+    # We cap at 4GB since we're using 32-bit addressing limits in some places
+    var memory_to_map_mb: u64 = detected_memory_mb
+    if memory_to_map_mb > 4096
+        memory_to_map_mb = 4096
+    if memory_to_map_mb < 256
+        memory_to_map_mb = 256  # Minimum 256MB
+
+    prints("    Will map ")
+    serial_print_dec(memory_to_map_mb)
+    prints(" MB of memory\n")
 
     # PML4[0] -> pdpt_identity (for identity mapping)
     let pml4: *u64 = pml4_addr as *u64
@@ -649,37 +675,109 @@ fn setup_page_tables() -> i32
     let pml4_511: *u64 = (pml4_addr + 511 * 8) as *u64
     *pml4_511 = pdpt_highhalf_addr | flags
 
-    # PDPT[0] for identity -> PD (covers 0-1GB)
-    let pdpt_id: *u64 = pdpt_identity_addr as *u64
-    *pdpt_id = pd_addr | flags
+    # Set up identity PDPT entries for each GB we need to map
+    # PDPT[0] -> pd_addr (0-1GB)
+    let pdpt_id_0: *u64 = pdpt_identity_addr as *u64
+    *pdpt_id_0 = pd_addr | flags
 
-    # PDPT[510] for higher-half -> same PD (0xFFFFFFFF80000000 maps to physical 0)
+    # PDPT[1] -> pd_extra_addr (1-2GB) if needed
+    if memory_to_map_mb > 1024
+        let pdpt_id_1: *u64 = (pdpt_identity_addr + 8) as *u64
+        *pdpt_id_1 = pd_extra_addr | flags
+
+    # PDPT[2] -> pd_extra2_addr (2-3GB) if needed
+    if memory_to_map_mb > 2048
+        let pdpt_id_2: *u64 = (pdpt_identity_addr + 16) as *u64
+        *pdpt_id_2 = pd_extra2_addr | flags
+
+    # PDPT[3] -> pd_extra3_addr (3-4GB) if needed
+    if memory_to_map_mb > 3072
+        let pdpt_id_3: *u64 = (pdpt_identity_addr + 24) as *u64
+        *pdpt_id_3 = pd_extra3_addr | flags
+
+    # Higher-half mapping: PDPT[510] -> pd_addr
+    # The kernel at 0xFFFFFFFF80000000 only needs the first 1GB (where kernel lives)
     let pdpt_hh_510: *u64 = (pdpt_highhalf_addr + 510 * 8) as *u64
     *pdpt_hh_510 = pd_addr | flags
 
-    # Fill PD with 2MB huge pages
-    # Only map what we need:
-    # - First 16MB: kernel code at 0x100000
-    # - Up to 256MB: bootloader data and boot_info structure
-    # 256MB = 128 × 2MB pages
-    let num_pages: i32 = 128  # 256MB (was 512 for 1GB)
+    # Fill first PD (0-1GB) with 2MB huge pages
     var pd: *u64 = pd_addr as *u64
     var phys: u64 = 0
+    var pages_in_first_gb: i32 = 512  # Full 1GB
+    if memory_to_map_mb < 1024
+        pages_in_first_gb = (memory_to_map_mb / 2) as i32  # MB / 2MB per page
     var j: i32 = 0
-    while j < num_pages
+    while j < pages_in_first_gb
         *pd = phys | huge_flags
         pd = pd + 1
         phys = phys + 0x200000
         j = j + 1
-
-    # Zero remaining PD entries (important for security)
+    # Zero remaining entries in first PD
     while j < 512
         *pd = 0
         pd = pd + 1
         j = j + 1
 
-    prints("    Identity map: 0-256MB -> 0-256MB\n")
-    prints("    Higher-half:  0xFFFFFFFF80000000 -> 0-256MB\n")
+    # Fill second PD (1-2GB) if needed
+    if memory_to_map_mb > 1024
+        pd = pd_extra_addr as *u64
+        phys = 0x40000000  # 1GB
+        var pages_in_second_gb: i32 = 512
+        if memory_to_map_mb < 2048
+            pages_in_second_gb = ((memory_to_map_mb - 1024) / 2) as i32
+        j = 0
+        while j < pages_in_second_gb
+            *pd = phys | huge_flags
+            pd = pd + 1
+            phys = phys + 0x200000
+            j = j + 1
+        while j < 512
+            *pd = 0
+            pd = pd + 1
+            j = j + 1
+
+    # Fill third PD (2-3GB) if needed
+    if memory_to_map_mb > 2048
+        pd = pd_extra2_addr as *u64
+        phys = 0x80000000  # 2GB
+        var pages_in_third_gb: i32 = 512
+        if memory_to_map_mb < 3072
+            pages_in_third_gb = ((memory_to_map_mb - 2048) / 2) as i32
+        j = 0
+        while j < pages_in_third_gb
+            *pd = phys | huge_flags
+            pd = pd + 1
+            phys = phys + 0x200000
+            j = j + 1
+        while j < 512
+            *pd = 0
+            pd = pd + 1
+            j = j + 1
+
+    # Fill fourth PD (3-4GB) if needed
+    if memory_to_map_mb > 3072
+        pd = pd_extra3_addr as *u64
+        phys = 0xC0000000  # 3GB
+        var pages_in_fourth_gb: i32 = 512
+        if memory_to_map_mb < 4096
+            pages_in_fourth_gb = ((memory_to_map_mb - 3072) / 2) as i32
+        j = 0
+        while j < pages_in_fourth_gb
+            *pd = phys | huge_flags
+            pd = pd + 1
+            phys = phys + 0x200000
+            j = j + 1
+        while j < 512
+            *pd = 0
+            pd = pd + 1
+            j = j + 1
+
+    prints("    Identity map: 0-")
+    serial_print_dec(memory_to_map_mb)
+    prints("MB -> 0-")
+    serial_print_dec(memory_to_map_mb)
+    prints("MB\n")
+    prints("    Higher-half:  0xFFFFFFFF80000000 -> 0-1GB\n")
     return 0
 
 fn load_page_tables() -> i32
@@ -717,15 +815,27 @@ fn get_memory_map() -> i32
     serial_print_dec(memory_map_desc_size)
     prints(" bytes\n")
     var usable_pages: u64 = 0
+    var highest_usable_addr: u64 = 0
     var i: u64 = 0
     while i < num_entries
         let desc: *EfiMemoryDescriptor = (@memory_map_buffer[0] + i * memory_map_desc_size) as *EfiMemoryDescriptor
         if desc.mem_type == EFI_CONVENTIONAL_MEMORY
             usable_pages = usable_pages + desc.number_of_pages
+            # Track highest address to know how much to map
+            let region_end: u64 = desc.physical_start + (desc.number_of_pages * 4096)
+            if region_end > highest_usable_addr
+                highest_usable_addr = region_end
         i = i + 1
     let usable_mb: u64 = (usable_pages * 4096) / (1024 * 1024)
+    # Round up to nearest 256MB for simpler page table setup
+    detected_memory_mb = ((highest_usable_addr + 0x0FFFFFFF) / 0x10000000) * 256
     prints("    Usable memory: ")
     serial_print_dec(usable_mb)
+    prints(" MB\n")
+    prints("    Highest address: ")
+    serial_print_hex(highest_usable_addr)
+    prints(" -> mapping ")
+    serial_print_dec(detected_memory_mb)
     prints(" MB\n")
     return 0
 

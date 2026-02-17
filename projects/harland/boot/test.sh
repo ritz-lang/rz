@@ -2,8 +2,22 @@
 # Test the Harland UEFI bootloader with QEMU + OVMF
 #
 # This boots the full system: UEFI bootloader loads kernel.elf from filesystem.
+#
+# Usage:
+#   ./test.sh         # Headless mode (for CI/automated testing)
+#   ./test.sh --gui   # With display window (to see framebuffer graphics)
 
 set -e
+
+# Parse arguments
+GUI_MODE=false
+for arg in "$@"; do
+    case $arg in
+        --gui)
+            GUI_MODE=true
+            ;;
+    esac
+done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HARLAND_DIR="$(dirname "$SCRIPT_DIR")"
@@ -96,8 +110,9 @@ SERIAL_LOG="$TMPDIR/serial.log"
 INITRAMFS="$HARLAND_DIR/build/initramfs.qcow2"
 STORAGE="$HARLAND_DIR/build/storage.qcow2"
 
-# User init binary
-INIT_ELF="$HARLAND_DIR/build/debug/init.elf"
+# Indium and Prism directories
+INDIUM_DIR="$HARLAND_DIR/../indium"
+PRISM_DIR="$HARLAND_DIR/../prism"
 
 # Create storage disk if needed
 if [ ! -f "$STORAGE" ]; then
@@ -105,7 +120,30 @@ if [ ! -f "$STORAGE" ]; then
     qemu-img create -f qcow2 "$STORAGE" 512M >/dev/null
 fi
 
-# Always rebuild initramfs with latest init.elf
+# Build the Ritz runtime (required for harland userspace binaries)
+echo "Building ritz runtime..."
+make -C "$HARLAND_DIR/../ritz/runtime" >/dev/null 2>&1 || {
+    echo "  Building runtime..."
+    make -C "$HARLAND_DIR/../ritz/runtime"
+}
+
+# Build indium userspace (init, hello, true, false, etc.)
+echo "Building indium userspace..."
+cd "$HARLAND_DIR/../.."
+./rz build indium 2>&1 | grep -v "^  Compiling\|^  Assembling\|^  ⚡" || true
+cd "$SCRIPT_DIR"
+
+# Build prism (includes prism_demo)
+echo "Building prism..."
+cd "$HARLAND_DIR/../.."
+./rz build prism 2>&1 | grep -v "^  Compiling\|^  Assembling\|^  ⚡" || true
+
+# Build rzsh (Ritz shell)
+echo "Building rzsh..."
+./rz build rzsh 2>&1 | grep -v "^  Compiling\|^  Assembling\|^  ⚡" || true
+cd "$SCRIPT_DIR"
+
+# Always rebuild initramfs with all binaries
 echo "Creating initramfs TAR archive..."
 
 # Create temporary directory for initramfs contents
@@ -114,22 +152,28 @@ mkdir -p "$INITRAMFS_TMP/bin"
 mkdir -p "$INITRAMFS_TMP/etc"
 mkdir -p "$INITRAMFS_TMP/var/log"
 
-# Copy init.elf if it exists
-if [ -f "$INIT_ELF" ]; then
-    cp "$INIT_ELF" "$INITRAMFS_TMP/bin/init"
-    echo "  Added /bin/init ($INIT_ELF)"
-else
-    echo "  WARNING: init.elf not found at $INIT_ELF"
-fi
-
-# Copy tier1 test binaries
-for binary in hello true false exitcode hello_tier1; do
-    ELF="$HARLAND_DIR/build/debug/${binary}.elf"
-    if [ -f "$ELF" ]; then
-        cp "$ELF" "$INITRAMFS_TMP/bin/$binary"
-        echo "  Added /bin/$binary"
+# Copy all indium binaries
+echo "  Copying indium binaries..."
+for elf in "$INDIUM_DIR/build/debug"/*.elf; do
+    if [ -f "$elf" ]; then
+        name=$(basename "$elf" .elf)
+        cp "$elf" "$INITRAMFS_TMP/bin/$name"
+        echo "    /bin/$name"
     fi
 done
+
+# Copy prism_demo
+if [ -f "$PRISM_DIR/build/debug/prism_demo.elf" ]; then
+    cp "$PRISM_DIR/build/debug/prism_demo.elf" "$INITRAMFS_TMP/bin/prism_demo"
+    echo "    /bin/prism_demo"
+fi
+
+# Copy rzsh
+RZSH_DIR="$HARLAND_DIR/../rzsh"
+if [ -f "$RZSH_DIR/build/debug/rzsh.elf" ]; then
+    cp "$RZSH_DIR/build/debug/rzsh.elf" "$INITRAMFS_TMP/bin/rzsh"
+    echo "    /bin/rzsh"
+fi
 
 # Create /etc/hostname
 echo "harland" > "$INITRAMFS_TMP/etc/hostname"
@@ -182,12 +226,23 @@ rm -f "$TAR_FILE" "$RAW_INITRAMFS"
 echo "Starting QEMU..."
 echo ""
 
+# Set display mode based on --gui flag
+if [ "$GUI_MODE" = true ]; then
+    DISPLAY_OPT="-display gtk"
+    TIMEOUT_SECS=120  # Longer timeout for interactive use
+    echo "  Display: GUI mode (gtk)"
+else
+    DISPLAY_OPT="-display none"
+    TIMEOUT_SECS=30
+    echo "  Display: headless"
+fi
+
 # Run QEMU with UEFI (longer timeout for full boot)
 # NOTE: Using 256M because UEFI bootloader only identity maps first 256MB.
 # With more RAM, UEFI may allocate kernel buffers above 256MB which aren't mapped.
 # TODO: Fix bootloader to dynamically map memory where kernel is loaded.
 # VirtIO block and network devices for driver testing (matching BIOS test)
-timeout 30 qemu-system-x86_64 \
+timeout $TIMEOUT_SECS qemu-system-x86_64 \
     -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
     -drive format=raw,file="$TMPDIR/disk.img" \
     -device virtio-blk-pci,drive=initramfs \
@@ -197,7 +252,7 @@ timeout 30 qemu-system-x86_64 \
     -device virtio-net-pci,netdev=net0 \
     -netdev user,id=net0 \
     -serial file:"$SERIAL_LOG" \
-    -display none \
+    $DISPLAY_OPT \
     -smp 4 \
     -m 256M \
     -no-reboot 2>&1 || true

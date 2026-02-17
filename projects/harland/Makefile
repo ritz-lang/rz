@@ -21,7 +21,7 @@ ISO = $(BUILD_DIR)/harland.iso
 # Phony targets
 # ============================================================================
 
-.PHONY: all clean test test-boot test-uefi-boot kernel iso help
+.PHONY: all clean test test-boot test-uefi-boot test-uefi-gui kernel iso help
 
 all: kernel
 
@@ -60,10 +60,15 @@ test-boot: iso
 	@echo "=== Testing Kernel Boot (GRUB) ==="
 	./tools/test_boot.sh
 
-# UEFI bootloader test
+# UEFI bootloader test (headless)
 test-uefi-boot: kernel
 	@echo "=== Testing UEFI Bootloader ==="
 	cd boot && ./test.sh
+
+# UEFI bootloader test with GUI display (shows framebuffer)
+test-uefi-gui: kernel
+	@echo "=== Testing UEFI Bootloader (GUI) ==="
+	cd boot && ./test.sh --gui
 
 # ============================================================================
 # Clean
@@ -88,7 +93,8 @@ help:
 	@echo "  iso          - Create test ISO with GRUB"
 	@echo "  test         - Run kernel boot test"
 	@echo "  test-boot    - Run kernel boot test (GRUB/BIOS)"
-	@echo "  test-uefi-boot - Test UEFI bootloader"
+	@echo "  test-uefi-boot - Test UEFI bootloader (headless)"
+	@echo "  test-uefi-gui  - Test UEFI bootloader with display"
 	@echo "  clean        - Remove build artifacts"
 	@echo "  help         - Show this help"
 	@echo ""
