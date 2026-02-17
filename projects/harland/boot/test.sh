@@ -2,8 +2,22 @@
 # Test the Harland UEFI bootloader with QEMU + OVMF
 #
 # This boots the full system: UEFI bootloader loads kernel.elf from filesystem.
+#
+# Usage:
+#   ./test.sh         # Headless mode (for CI/automated testing)
+#   ./test.sh --gui   # With display window (to see framebuffer graphics)
 
 set -e
+
+# Parse arguments
+GUI_MODE=false
+for arg in "$@"; do
+    case $arg in
+        --gui)
+            GUI_MODE=true
+            ;;
+    esac
+done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HARLAND_DIR="$(dirname "$SCRIPT_DIR")"
@@ -212,12 +226,23 @@ rm -f "$TAR_FILE" "$RAW_INITRAMFS"
 echo "Starting QEMU..."
 echo ""
 
+# Set display mode based on --gui flag
+if [ "$GUI_MODE" = true ]; then
+    DISPLAY_OPT="-display gtk"
+    TIMEOUT_SECS=120  # Longer timeout for interactive use
+    echo "  Display: GUI mode (gtk)"
+else
+    DISPLAY_OPT="-display none"
+    TIMEOUT_SECS=30
+    echo "  Display: headless"
+fi
+
 # Run QEMU with UEFI (longer timeout for full boot)
 # NOTE: Using 256M because UEFI bootloader only identity maps first 256MB.
 # With more RAM, UEFI may allocate kernel buffers above 256MB which aren't mapped.
 # TODO: Fix bootloader to dynamically map memory where kernel is loaded.
 # VirtIO block and network devices for driver testing (matching BIOS test)
-timeout 30 qemu-system-x86_64 \
+timeout $TIMEOUT_SECS qemu-system-x86_64 \
     -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
     -drive format=raw,file="$TMPDIR/disk.img" \
     -device virtio-blk-pci,drive=initramfs \
@@ -227,7 +252,7 @@ timeout 30 qemu-system-x86_64 \
     -device virtio-net-pci,netdev=net0 \
     -netdev user,id=net0 \
     -serial file:"$SERIAL_LOG" \
-    -display none \
+    $DISPLAY_OPT \
     -smp 4 \
     -m 256M \
     -no-reboot 2>&1 || true
