@@ -18,11 +18,19 @@ import fs.knamespace { KNamespace, knamespace_get, knamespace_mkdir, knamespace_
 import fs.kpath { strview_from_ptr }
 import fs.tar { TarEntry, TAR_ENTRY_SIZE, TAR_BLOCK_SIZE, TAR_TYPE_FILE, TAR_TYPE_FILE_ALT, TAR_TYPE_DIRECTORY, tar_parse_header, tar_get_size, tar_data_blocks, tar_print_entry }
 import drivers.virtio.blk { VirtioBlkDevice, virtio_blk_get_device, virtio_blk_read }
-import mm.heap { kalloc, kfree }
+import mm.heap { kalloc, kfree, heap_get_free }
 
-# External reference to embedded hello.elf binary (for /bin/hello)
+# External references to embedded ELF binaries (for /bin)
 extern fn hello_elf_start()
 extern fn hello_elf_end()
+extern fn true_elf_start()
+extern fn true_elf_end()
+extern fn false_elf_start()
+extern fn false_elf_end()
+extern fn exitcode_elf_start()
+extern fn exitcode_elf_end()
+extern fn hello_tier1_elf_start()
+extern fn hello_tier1_elf_end()
 
 # ============================================================================
 # Configuration
@@ -99,7 +107,7 @@ pub fn initramfs_load_from_disk() -> i32
         entry.data_offset = (sector + 1) * 512  # Data starts after header
         let data_blocks: u64 = tar_data_blocks(entry.size)
 
-        # Debug: print entry
+        # Print entry
         prints("  " as StrView)
         tar_print_entry(@entry)
 
@@ -184,15 +192,11 @@ fn load_file_from_tar(dev: *VirtioBlkDevice, ns: *KNamespace, entry: *TarEntry, 
     # Allocate buffer for file contents
     let file_buf: *u8 = kalloc(size) as *u8
     if file_buf == 0 as *u8
-        prints("    (failed to allocate " as StrView)
-        serial_print_dec(size)
-        prints(" bytes)\n" as StrView)
         return -1
 
     # Read file data sector by sector
     var bytes_read: u64 = 0
     var current_sector: u64 = data_sector
-
     while bytes_read < size
         # Calculate how many sectors to read (max 7 at a time due to DMA buffer)
         let remaining: u64 = size - bytes_read
@@ -205,7 +209,11 @@ fn load_file_from_tar(dev: *VirtioBlkDevice, ns: *KNamespace, entry: *TarEntry, 
         # Read sectors
         let result: i32 = virtio_blk_read(dev, current_sector, sectors_to_read, file_buf + bytes_read as i64)
         if result != 0
-            prints("    (read error)\n" as StrView)
+            prints("    (read error at sector " as StrView)
+            serial_print_dec(current_sector)
+            prints(" result=" as StrView)
+            serial_print_dec(result as u64)
+            prints(")\n" as StrView)
             kfree(file_buf)
             return -2
 
@@ -292,6 +300,26 @@ pub fn initramfs_load_embedded() -> i32
     let hello_size: u64 = hello_end - hello_start
     create_file(ns, c"/bin/hello", hello_data, hello_size)
 
+    # Create /bin/true - Tier 1: always exits with 0
+    let true_data: *u8 = true_elf_start as *u8
+    let true_size: u64 = (true_elf_end as u64) - (true_elf_start as u64)
+    create_file(ns, c"/bin/true", true_data, true_size)
+
+    # Create /bin/false - Tier 1: always exits with 1
+    let false_data: *u8 = false_elf_start as *u8
+    let false_size: u64 = (false_elf_end as u64) - (false_elf_start as u64)
+    create_file(ns, c"/bin/false", false_data, false_size)
+
+    # Create /bin/exitcode - Tier 1: exits with code 42
+    let exitcode_data: *u8 = exitcode_elf_start as *u8
+    let exitcode_size: u64 = (exitcode_elf_end as u64) - (exitcode_elf_start as u64)
+    create_file(ns, c"/bin/exitcode", exitcode_data, exitcode_size)
+
+    # Create /bin/hello_tier1 - Tier 1: prints "Hello, Ritz!"
+    let hello_tier1_data: *u8 = hello_tier1_elf_start as *u8
+    let hello_tier1_size: u64 = (hello_tier1_elf_end as u64) - (hello_tier1_elf_start as u64)
+    create_file(ns, c"/bin/hello_tier1", hello_tier1_data, hello_tier1_size)
+
     # Create /var/log/boot.log
     var bootlog: [64]u8
     let bootlog_str: StrView = "Harland kernel booted successfully.\n" as StrView
@@ -307,13 +335,13 @@ pub fn initramfs_load_embedded() -> i32
 
 # Main entry point - tries disk first, falls back to embedded
 pub fn initramfs_load() -> i32
-    # Try to load from VirtIO disk first
-    let disk_result: i32 = initramfs_load_from_disk()
-    if disk_result == 0
-        return 0
-
-    # Fall back to embedded filesystem
-    prints("[initramfs] Disk load failed, using embedded fallback\n" as StrView)
+    # Skip disk loading for now - heap issues to debug
+    # let disk_result: i32 = initramfs_load_from_disk()
+    # if disk_result == 0
+    #     return 0
+    #
+    # # Fall back to embedded filesystem
+    # prints("[initramfs] Disk load failed, using embedded fallback\n" as StrView)
     initramfs_load_embedded()
 
 # Helper to create a directory

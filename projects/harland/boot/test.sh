@@ -115,6 +115,15 @@ else
     echo "  WARNING: init.elf not found at $INIT_ELF"
 fi
 
+# Copy tier1 test binaries
+for binary in hello true false exitcode hello_tier1; do
+    ELF="$HARLAND_DIR/build/debug/${binary}.elf"
+    if [ -f "$ELF" ]; then
+        cp "$ELF" "$INITRAMFS_TMP/bin/$binary"
+        echo "  Added /bin/$binary"
+    fi
+done
+
 # Create /etc/hostname
 echo "harland" > "$INITRAMFS_TMP/etc/hostname"
 echo "  Added /etc/hostname"
@@ -191,7 +200,16 @@ cat "$SERIAL_LOG"
 echo ""
 
 # Check for expected output - most advanced first (matching BIOS test milestones)
-if grep -q "ACPI.*Initiating S5 shutdown" "$SERIAL_LOG"; then
+if grep -q "ALL TESTS PASSED" "$SERIAL_LOG"; then
+    echo "========================================="
+    echo "  UEFI: MILESTONE 12 COMPLETE: Tier 1 Test Suite!"
+    echo "========================================="
+    echo "  - Init userspace process running"
+    echo "  - All Tier 1 programs executed correctly"
+    echo "  - Exit codes verified"
+    echo "  - Full test suite passed!"
+    exit 0
+elif grep -q "ACPI.*Initiating S5 shutdown" "$SERIAL_LOG"; then
     echo "========================================="
     echo "  UEFI: MILESTONE 11 COMPLETE: Init + ACPI Shutdown!"
     echo "========================================="
