@@ -362,6 +362,7 @@ class BinaryConfig:
     code_model: str = ""         # LLC code model (e.g., "kernel")
     no_red_zone: bool = False    # Disable red zone (for kernels)
     bin_sources: list[str] | None = None  # Per-binary source directories
+    pic: bool = False            # Generate position-independent code (for PIE executables)
 
     def __post_init__(self):
         if self.asm_files is None:
@@ -640,6 +641,7 @@ def get_binaries(pkg_dir: Path, config: dict) -> list[BinaryConfig]:
             flags_config = nested_config.get("flags", {})
             code_model = flags_config.get("code-model", "")
             no_red_zone = flags_config.get("no-red-zone", False)
+            pic = flags_config.get("pic", False)
 
             # Per-binary source directories
             bin_sources = bin_entry.get("sources", [])
@@ -657,6 +659,7 @@ def get_binaries(pkg_dir: Path, config: dict) -> list[BinaryConfig]:
                 code_model=code_model,
                 no_red_zone=no_red_zone,
                 bin_sources=bin_sources,
+                pic=pic,
             ))
     else:
         # Default: single binary with package name
@@ -963,6 +966,7 @@ def compile_freestanding_binary(
     asm_files = bin_config.asm_files or []
     code_model = bin_config.code_model
     no_red_zone = bin_config.no_red_zone
+    pic = bin_config.pic
 
     # UEFI targets need special handling
     is_uefi = "uefi" in target.lower()
@@ -1056,13 +1060,20 @@ def compile_freestanding_binary(
                 clang_cmd = [
                     "clang", "-c",
                     f"--target={target}",
-                    "-fPIC" if target.endswith("-linux") else "",
                 ]
-                # Filter out empty args
-                clang_cmd = [arg for arg in clang_cmd if arg]
+                # Add PIC flag if explicitly requested or for Linux targets
+                if pic or target.endswith("-linux"):
+                    clang_cmd.append("-fPIC")
 
                 if code_model:
-                    clang_cmd.append(f"-mcmodel={code_model}")
+                    # Note: -mcmodel=large is incompatible with -fPIC on x86_64
+                    # For PIC code, use "small" model (default) which supports
+                    # GOT/PLT relocations for position-independent code
+                    if pic and code_model == "large":
+                        # Skip code model for PIC - use default small model
+                        pass
+                    else:
+                        clang_cmd.append(f"-mcmodel={code_model}")
                 if no_red_zone:
                     clang_cmd.append("-mno-red-zone")
 
@@ -1192,6 +1203,11 @@ def compile_freestanding_binary(
         else:
             # Normal freestanding ELF linking
             link_cmd = [lld]
+
+            # For PIE executables, add -pie flag and --no-dynamic-linker
+            # (freestanding PIE doesn't need a dynamic linker)
+            if pic:
+                link_cmd.extend(["--pie", "--no-dynamic-linker"])
 
             if linker_script and linker_script.exists():
                 link_cmd.extend(["-T", str(linker_script)])

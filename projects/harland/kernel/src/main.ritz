@@ -16,7 +16,7 @@ import io { outb, inb, outw, inw, outl, inl, halt, halt_loop, enable_interrupts,
 import serial { StrView, serial_init, serial_write_byte, serial_print, serial_write, prints, serial_print_hex, serial_print_dec, print_hex_prefix, println, serial_data_available, serial_read_byte, serial_read_byte_nonblock, serial_poll, serial_input_available, serial_buf_read, serial_buf_read_many, serial_enable_rx_interrupt, serial_disable_rx_interrupt }
 import drivers.pci { PciDevice, PCI_CLASS_NETWORK, PCI_CLASS_STORAGE, PCI_CLASS_BRIDGE, PCI_CLASS_DISPLAY, PCI_VENDOR_REDHAT, VIRTIO_DEVICE_NET, PCI_CMD_BUS_MASTER, PCI_CMD_MEMORY_SPACE, PCI_CMD_IO_SPACE, pci_init, pci_find_device, pci_find_by_class, pci_find_virtio, pci_enable_bus_master, pci_enable_memory, pci_enable_io, pci_get_device_count, pci_get_device, pci_read_config16, pci_read_config32, pci_write_config16, pci_print_all_devices, pci_print_device }
 import mm.pmm { PAGE_SIZE, PAGE_SHIFT, MAX_MEMORY, MAX_PAGES, MB2_TAG_END, MB2_TAG_CMDLINE, MB2_TAG_BOOTLOADER_NAME, MB2_TAG_MODULE, MB2_TAG_BASIC_MEMINFO, MB2_TAG_BOOTDEV, MB2_TAG_MMAP, MB2_TAG_VBE, MB2_TAG_FRAMEBUFFER, MB2_TAG_ELF_SECTIONS, MB2_TAG_APM, MB2_TAG_EFI32, MB2_TAG_EFI64, MB2_TAG_SMBIOS, MB2_TAG_ACPI_OLD, MB2_TAG_ACPI_NEW, MB2_TAG_NETWORK, MB2_TAG_EFI_MMAP, MB2_TAG_EFI_BS, MB2_TAG_EFI32_IH, MB2_TAG_EFI64_IH, MB2_TAG_LOAD_BASE_ADDR, MB2_MEMORY_AVAILABLE, MB2_MEMORY_RESERVED, MB2_MEMORY_ACPI_RECLAIMABLE, MB2_MEMORY_NVS, MB2_MEMORY_BADRAM, Mb2BootInfo, Mb2Tag, Mb2BasicMemInfo, Mb2MmapTag, Mb2MmapEntry, HARLAND_BOOT_MAGIC, HARLAND_BOOT_VERSION, HARLAND_MEM_USABLE, HARLAND_MEM_RESERVED, HARLAND_MEM_ACPI_RECLAIMABLE, HarlandMemEntry, HarlandBootInfo, BOOT_PROTOCOL_UNKNOWN, BOOT_PROTOCOL_MULTIBOOT2, BOOT_PROTOCOL_HARLAND, pmm_init, pmm_mark_region_free, pmm_mark_region_used, pmm_alloc_page, pmm_free_page, pmm_get_free_pages, pmm_get_total_pages, pmm_init_from_multiboot, pmm_init_from_bootinfo, pmm_reserve_kernel }
-import mm.vmm { PTE_PRESENT, PTE_WRITABLE, PTE_USER, PTE_WRITE_THROUGH, PTE_CACHE_DISABLE, PTE_ACCESSED, PTE_DIRTY, PTE_HUGE, PTE_GLOBAL, PTE_NO_EXECUTE, PTE_ADDR_MASK, vmm_init, vmm_flush_tlb, vmm_flush_tlb_all, vmm_debug_page_tables, vmm_map_page, vmm_unmap_page, vmm_virt_to_phys, vmm_is_accessible, vmm_ensure_mapped }
+import mm.vmm { PTE_PRESENT, PTE_WRITABLE, PTE_USER, PTE_WRITE_THROUGH, PTE_CACHE_DISABLE, PTE_ACCESSED, PTE_DIRTY, PTE_HUGE, PTE_GLOBAL, PTE_NO_EXECUTE, PTE_ADDR_MASK, vmm_init, vmm_flush_tlb, vmm_flush_tlb_all, vmm_debug_page_tables, vmm_map_page, vmm_unmap_page, vmm_virt_to_phys, vmm_is_accessible, vmm_ensure_mapped, vmm_create_user_pml4, vmm_switch_pml4, vmm_get_current_pml4, vmm_map_page_in, vmm_free_pml4 }
 import mm.heap { KERNEL_VIRT_BASE, HEAP_START, HEAP_MAX_SIZE, heap_init, kalloc, kfree, heap_get_used, heap_get_free }
 # mm.shm and mm.dma are WIP - commented out until imports are fixed
 # import mm.shm { ShmRegion, ShmMapping, shm_create, ... }
@@ -3623,12 +3623,14 @@ struct ParentContext
     user_rip: u64           # Where parent was when it called spawn
     user_rsp: u64           # Parent's user stack pointer
     user_rflags: u64        # Parent's RFLAGS
+    user_pml4: u64          # Parent's page table (CR3)
     # We don't need to save GPRs - they're on the syscall stack
 
 # Global parent context (single process system for now)
 var g_parent_ctx: ParentContext
 var g_has_parent: u8 = 0           # 1 if we're in a child process
 var g_child_pid: u64 = 1           # Current PID (1 = init)
+var g_child_pml4: u64 = 0          # Child's page table (for cleanup)
 var g_child_exit_code: i64 = 0     # Exit code from child
 
 # External functions from syscall_entry.s for accessing user context
@@ -3714,6 +3716,10 @@ fn sys_readdir_impl(dir_path: *u8, buf: *u8, buf_size: i64) -> i64
 # sys_spawn: Load and execute a binary from the filesystem
 # This is a BLOCKING spawn - we save parent state, run child, and when
 # child exits, we restore parent state and return with child's exit code.
+#
+# ISOLATION: Each child process gets its own page table (CR3), providing
+# full memory isolation from the parent. The child cannot read or write
+# the parent's user-space memory.
 fn sys_spawn_impl(path: *u8) -> i64
     prints("[spawn] spawn(")
     prints_str(path)
@@ -3725,7 +3731,7 @@ fn sys_spawn_impl(path: *u8) -> i64
         prints("[spawn] No namespace\n")
         return -1
 
-    # Read file from namespace
+    # Read file from namespace (using kernel's page table)
     let path_len: i64 = syscall_strlen(path)
     let path_view: StrView = strview_from_ptr(path, path_len)
     var file_size: u64 = 0
@@ -3746,6 +3752,7 @@ fn sys_spawn_impl(path: *u8) -> i64
     g_parent_ctx.user_rip = get_syscall_user_rip()
     g_parent_ctx.user_rsp = get_syscall_user_rsp()
     g_parent_ctx.user_rflags = get_syscall_user_rflags()
+    g_parent_ctx.user_pml4 = vmm_get_current_pml4()  # Save parent's page table
     g_has_parent = 1
     g_child_pid = 2  # Simple: parent=1, child=2
 
@@ -3754,19 +3761,42 @@ fn sys_spawn_impl(path: *u8) -> i64
     serial_print_hex(g_parent_ctx.user_rip)
     prints("\n  RSP: 0x")
     serial_print_hex(g_parent_ctx.user_rsp)
+    prints("\n  PML4: 0x")
+    serial_print_hex(g_parent_ctx.user_pml4)
     prints("\n")
 
-    # Load the child ELF
-    # Use a different load base than init to avoid address conflicts
-    # Init loads at ~0x400000, we'll load child at 0x800000 (8MB)
-    let child_load_base: u64 = 0x800000
+    # Create an isolated address space for the child
+    # This copies kernel mappings but starts with empty user space
+    let child_pml4: u64 = vmm_create_user_pml4()
+    if child_pml4 == 0
+        prints("[spawn] Failed to create child page table\n")
+        g_has_parent = 0
+        return -1
+
+    g_child_pml4 = child_pml4  # Save for cleanup on exit
+    prints("[spawn] Created child PML4 at 0x")
+    serial_print_hex(child_pml4)
+    prints("\n")
+
+    # Switch to child's address space for ELF loading
+    # This way, elf_load will map pages directly into the child's page table
+    vmm_switch_pml4(child_pml4)
+
+    # Load the child ELF into the child's address space
+    # For PIE executables, we can load at any address in userspace.
+    # With isolated address spaces, we can use the same base as init!
+    let child_load_base: u64 = 0x100000000  # 4GB - same as init, no conflict due to isolation
     let load_result: ElfLoadResult = elf_load(elf_data, file_size, child_load_base)
 
     if load_result.error != ELF_OK
         prints("[spawn] Failed to load ELF, error=")
         serial_print_dec(load_result.error as u64)
         prints("\n")
-        g_has_parent = 0  # Cancel spawn
+        # Switch back to parent before cleanup
+        vmm_switch_pml4(g_parent_ctx.user_pml4)
+        vmm_free_pml4(child_pml4)
+        g_has_parent = 0
+        g_child_pml4 = 0
         return -1
 
     prints("[spawn] ELF loaded at 0x")
@@ -3775,35 +3805,39 @@ fn sys_spawn_impl(path: *u8) -> i64
     serial_print_hex(load_result.entry_point)
     prints("\n")
 
-    # Allocate a separate stack for the child (don't share with parent!)
-    # We'll use a different virtual address range
+    # Allocate child stack in the child's address space
     let child_stack_page: u64 = pmm_alloc_page()
     if child_stack_page == 0
         prints("[spawn] Failed to allocate child stack\n")
+        vmm_switch_pml4(g_parent_ctx.user_pml4)
+        vmm_free_pml4(child_pml4)
         g_has_parent = 0
+        g_child_pml4 = 0
         return -1
 
-    # Map child stack at a different address than parent
-    # Parent stack is at 0x7FFFFFFFE000, child at 0x7FFFFFFFC000
-    let child_stack_vaddr: u64 = 0x7FFFFFFFC000
+    # Map stack at standard location (no conflict with parent - separate address space!)
+    let child_stack_vaddr: u64 = 0x7FFFFFFFE000  # Same as init's stack
     let map_result: i32 = vmm_map_page(child_stack_vaddr, child_stack_page, PTE_WRITABLE | PTE_USER)
     if map_result != 0
         prints("[spawn] Failed to map child stack\n")
         pmm_free_page(child_stack_page)
+        vmm_switch_pml4(g_parent_ctx.user_pml4)
+        vmm_free_pml4(child_pml4)
         g_has_parent = 0
+        g_child_pml4 = 0
         return -1
 
     let child_stack_top: u64 = child_stack_vaddr + PAGE_SIZE - 16
-    vmm_flush_tlb_all()
 
     prints("[spawn] Child stack at 0x")
     serial_print_hex(child_stack_top)
-    prints("\n")
+    prints(" (isolated address space)\n")
     prints("[spawn] Jumping to child...\n\n")
 
     # Jump to child! This does NOT return.
+    # We're already in the child's address space (CR3 was switched above).
     # When child calls sys_exit(), sys_exit_impl will detect g_has_parent
-    # and restore parent context.
+    # and restore parent context including switching back to parent's CR3.
     jump_to_userspace(load_result.entry_point, child_stack_top)
 
     # Never reached - child will call sys_exit which handles return to parent
@@ -3833,24 +3867,23 @@ fn sys_exit_impl(code: i32) -> i64
         serial_print_hex(g_parent_ctx.user_rip)
         prints("\n  RSP: 0x")
         serial_print_hex(g_parent_ctx.user_rsp)
+        prints("\n  PML4: 0x")
+        serial_print_hex(g_parent_ctx.user_pml4)
         prints("\n")
 
-        # We need to return to the parent's spawn() call with the exit code.
-        # The tricky part: spawn() needs to return the child's exit code.
-        # But we're not in the normal syscall return path anymore.
-        #
-        # For blocking spawn, we jump back to parent with RAX=exit_code.
-        # This requires a custom jump that sets RAX before iret.
-        # For now, use the simpler approach: jump to parent, and parent
-        # will call sys_wait() to get the exit code.
+        # IMPORTANT: Switch back to parent's address space BEFORE jumping!
+        # The parent's user code and stack are only accessible in the parent's
+        # page table. If we jump while still in the child's CR3, we'll page fault.
+        prints("[exit] Switching to parent address space...\n")
+        vmm_switch_pml4(g_parent_ctx.user_pml4)
 
-        # Actually, for blocking spawn the cleanest is:
-        # Parent's spawn() returns the exit code directly.
-        # So we need to jump back with the exit code in RAX.
-        #
-        # jump_to_userspace clears all registers, so we need a variant.
-        # For now, let's use a workaround: return via normal syscall path
-        # by setting the return context.
+        # Free the child's page table and all its user-space pages
+        if g_child_pml4 != 0
+            prints("[exit] Freeing child page table at 0x")
+            serial_print_hex(g_child_pml4)
+            prints("\n")
+            vmm_free_pml4(g_child_pml4)
+            g_child_pml4 = 0
 
         # For blocking spawn, we return to the parent's sys_spawn() call.
         # The parent expects a positive PID on success.
