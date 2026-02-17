@@ -26,7 +26,9 @@ import ritzlib.net
 import lib.m7m_types
 import lib.page
 import lib.buffer_pool
+import lib.storage
 import lib.collection
+import lib.document
 import lib.server
 import lib.client
 import lib.protocol
@@ -57,6 +59,8 @@ struct Args
     command: i32        # 0=help, 1=version, 2=serve, 3=shell
     port: i32
     host: StrView       # Host as StrView (idiomatic Ritz)
+    data_dir: *u8       # Data directory for persistence (null = in-memory)
+    no_encryption: i32  # 1 = disable encryption (for development)
 
 const CMD_HELP: i32 = 0
 const CMD_VERSION: i32 = 1
@@ -67,6 +71,8 @@ fn parse_args(argc: i32, argv: **u8, args: *Args)
     args.command = CMD_HELP
     args.port = DEFAULT_PORT
     args.host = default_host()
+    args.data_dir = null
+    args.no_encryption = 0
 
     if argc < 2
         return
@@ -84,7 +90,7 @@ fn parse_args(argc: i32, argv: **u8, args: *Args)
 
     if arg_eq(cmd, "serve") != 0
         args.command = CMD_SERVE
-        # Parse --port
+        # Parse --port and --data-dir
         var i: i32 = 2
         while i < argc
             var arg: *u8 = *(argv + i)
@@ -94,6 +100,15 @@ fn parse_args(argc: i32, argv: **u8, args: *Args)
                     i += 2
                 else
                     i += 1
+            else if arg_eq(arg, "--data-dir") != 0 or arg_eq(arg, "-d") != 0
+                if i + 1 < argc
+                    args.data_dir = *(argv + i + 1)
+                    i += 2
+                else
+                    i += 1
+            else if arg_eq(arg, "--no-encryption") != 0
+                args.no_encryption = 1
+                i += 1
             else
                 i += 1
         return
@@ -147,17 +162,25 @@ fn print_help()
     prints("Mausoleum - An encrypted document database\n")
     prints("\n")
     prints("Usage:\n")
-    prints("  mausoleum serve [--port PORT]           Start the encrypted server (default: 7777)\n")
+    prints("  mausoleum serve [OPTIONS]               Start the server\n")
     prints("  mausoleum shell [--host H] [--port P]   Connect to server with interactive shell\n")
     prints("  mausoleum version                       Print version information\n")
     prints("  mausoleum help                          Print this help\n")
     prints("\n")
+    prints("Server options:\n")
+    prints("  --port, -p PORT                         Listen port (default: 7777)\n")
+    prints("  --data-dir, -d PATH                     Data directory for persistence\n")
+    prints("                                          (default: in-memory)\n")
+    prints("  --no-encryption                         Disable encryption (development only!)\n")
+    prints("\n")
     prints("Security:\n")
-    prints("  All connections use X25519 key exchange and ChaCha20-Poly1305 encryption.\n")
-    prints("  Perfect forward secrecy via ephemeral keys per connection.\n")
+    prints("  By default, connections use X25519 key exchange + ChaCha20-Poly1305.\n")
+    prints("  Use --no-encryption only for local development/testing.\n")
     prints("\n")
     prints("Examples:\n")
     prints("  mausoleum serve --port 8888             Start server on port 8888\n")
+    prints("  mausoleum serve --data-dir /var/m7m     Start with persistent storage\n")
+    prints("  mausoleum serve --no-encryption         Start without encryption (dev mode)\n")
     prints("  mausoleum shell --host 192.168.1.5      Connect to remote server\n")
     prints("\n")
 
@@ -186,29 +209,84 @@ fn print_i32(n: i32)
         print_char(buf[i])
 
 # ============================================================================
+# Collection Metadata Persistence Helper
+# ============================================================================
+
+# Save collection metadata to storage for persistence across restarts
+fn save_collection_metadata(storage: *Storage, col: *Collection)
+    if storage == null or col == null
+        return
+    storage_set_root_page_id(storage, collection_root_page_id(col))
+    storage_set_next_sequence(storage, collection_next_sequence(col))
+    storage_set_doc_count(storage, collection_doc_count(col))
+
+# ============================================================================
 # Serve Command - Encrypted Database Server
 # ============================================================================
 
-fn cmd_serve(port: i32) -> i32
+fn cmd_serve(port: i32, data_dir: *u8, no_encryption: i32) -> i32
     prints("Starting Mausoleum server...\n")
     prints("  Port: ")
     print_i32(port)
     prints("\n")
-    prints("  Encryption: X25519 + ChaCha20-Poly1305\n")
+    if data_dir != null
+        prints("  Data: ")
+        prints_cstr(data_dir)
+        prints("\n")
+    else
+        prints("  Data: in-memory (no persistence)\n")
+    if no_encryption != 0
+        prints("  Encryption: DISABLED (development mode)\n")
+    else
+        prints("  Encryption: X25519 + ChaCha20-Poly1305\n")
     prints("\n")
 
-    # Create buffer pool (in-memory for now)
-    var pool: *BufferPool = buffer_pool_new(POOL_SIZE)
-    if pool == null
-        prints("Error: Failed to allocate buffer pool\n")
-        return 1
+    # Create buffer pool - either persistent or in-memory
+    var pool: *BufferPool = null
+    var storage: *Storage = null
 
-    # Create collection
+    if data_dir != null
+        # Persistent mode - use storage engine
+        storage = storage_open(data_dir)
+        if storage == null
+            prints("Error: Failed to open storage at ")
+            prints_cstr(data_dir)
+            prints("\n")
+            return 1
+        pool = storage_pool(storage)
+        prints("Opened persistent storage.\n")
+    else
+        # In-memory mode
+        pool = buffer_pool_new(POOL_SIZE)
+        if pool == null
+            prints("Error: Failed to allocate buffer pool\n")
+            return 1
+
+    # Create or load collection
     var collection: Collection
-    let col_result: i32 = collection_init(@collection, pool, 1)
+    var col_result: i32 = ERR_OK
+
+    if storage != null and storage_has_collection(storage) != 0
+        # Load existing collection from storage
+        let root_id: i64 = storage_root_page_id(storage)
+        let next_seq: i32 = storage_next_sequence(storage)
+        let count: i64 = storage_doc_count(storage)
+        prints("Loading existing collection (root_page_id=")
+        print_i64(root_id)
+        prints(", docs=")
+        print_i64(count)
+        prints(")...\n")
+        col_result = collection_load(@collection, pool, 1, root_id, next_seq, count)
+    else
+        # Create new collection
+        col_result = collection_init(@collection, pool, 1)
+
     if col_result < 0
-        prints("Error: Failed to create collection\n")
-        buffer_pool_destroy(pool)
+        prints("Error: Failed to create/load collection\n")
+        if storage != null
+            storage_destroy(storage)
+        else
+            buffer_pool_destroy(pool)
         return 1
 
     # Create TCP socket
@@ -216,7 +294,10 @@ fn cmd_serve(port: i32) -> i32
     if sock.fd < 0
         prints("Error: Failed to create socket\n")
         collection_destroy(@collection)
-        buffer_pool_destroy(pool)
+        if storage != null
+            storage_destroy(storage)
+        else
+            buffer_pool_destroy(pool)
         return 1
 
     socket_set_reuseaddr(@sock)
@@ -229,7 +310,10 @@ fn cmd_serve(port: i32) -> i32
         prints("\n")
         socket_close(@sock)
         collection_destroy(@collection)
-        buffer_pool_destroy(pool)
+        if storage != null
+            storage_destroy(storage)
+        else
+            buffer_pool_destroy(pool)
         return 1
 
     # Start listening
@@ -238,72 +322,137 @@ fn cmd_serve(port: i32) -> i32
         prints("Error: Failed to listen on socket\n")
         socket_close(@sock)
         collection_destroy(@collection)
-        buffer_pool_destroy(pool)
+        if storage != null
+            storage_destroy(storage)
+        else
+            buffer_pool_destroy(pool)
         return 1
 
     prints("Server listening on 0.0.0.0:")
     print_i32(port)
     prints("\n")
     prints("Press Ctrl+C to stop.\n")
+    prints("Note: Data is flushed after each write operation.\n")
     prints("\n")
 
-    # Accept loop with encrypted channels
-    serve_loop(sock.fd, pool, @collection)
+    # Accept loop - encrypted or plain depending on mode
+    if no_encryption != 0
+        serve_loop_plain(sock.fd, pool, storage, @collection)
+    else
+        serve_loop(sock.fd, pool, storage, @collection)
 
     # Cleanup
     socket_close(@sock)
     collection_destroy(@collection)
-    buffer_pool_destroy(pool)
+    if storage != null
+        # Flush and close persistent storage
+        storage_checkpoint(storage)
+        storage_destroy(storage)
+    else
+        buffer_pool_destroy(pool)
 
     prints("Server stopped.\n")
     return 0
 
 # Server main loop - handles encrypted connections
-fn serve_loop(listen_fd: i32, pool: *BufferPool, collection: *Collection)
+fn serve_loop(listen_fd: i32, pool: *BufferPool, storage: *Storage, collection: *Collection)
+    # Create signalfd for SIGTERM/SIGINT
+    let signal_fd: i32 = signalfd_create_for_shutdown()
+    if signal_fd < 0
+        prints("Warning: Failed to create signalfd, shutdown may not be graceful\n")
+
+    # Set up poll fds: [0] = listen socket, [1] = signal fd
+    var poll_fds: [2]PollFd
+
+    poll_fds[0].fd = listen_fd
+    poll_fds[0].events = POLLIN
+    poll_fds[0].revents = 0
+
+    poll_fds[1].fd = signal_fd
+    poll_fds[1].events = POLLIN
+    poll_fds[1].revents = 0
+
+    let num_fds: i64 = 2
+    if signal_fd < 0
+        poll_fds[1].fd = -1
+
     loop
-        # Accept new connection
-        var client_sock: Socket
-        client_sock.fd = -1
+        # Poll with 1 second timeout
+        let poll_result: i32 = sys_poll(@poll_fds[0], num_fds, 1000)
 
-        # Use blocking accept for simplicity in this demo
-        # (Production would use epoll)
-        var client_fd: i32 = sys_accept(listen_fd, null, null) as i32
-        if client_fd < 0
+        if poll_result < 0
             continue
 
-        client_sock.fd = client_fd
-        client_sock.family = AF_INET
-        client_sock.socktype = SOCK_STREAM
-
-        prints("New connection, performing encrypted handshake...\n")
-
-        # Initialize encrypted channel
-        var channel: EncryptedChannel
-        if channel_init_server(@channel, client_sock) < 0
-            prints("  Error: Channel init failed\n")
-            sys_close(client_fd)
+        if poll_result == 0
+            if shutdown_requested() != 0
+                prints("Shutdown requested (flag).\n")
+                break
             continue
 
-        # Perform handshake
-        if channel_handshake_server(@channel) < 0
-            prints("  Error: Handshake failed\n")
+        # Check for signal
+        if signal_fd >= 0 and (poll_fds[1].revents & POLLIN) != 0
+            let sig: i32 = signalfd_read(signal_fd)
+            if sig == SIGTERM or sig == SIGINT
+                prints("Received shutdown signal, stopping server...\n")
+                break
+
+        # Check for new connection
+        if (poll_fds[0].revents & POLLIN) != 0
+            var client_sock: Socket
+            client_sock.fd = -1
+
+            var client_fd: i32 = sys_accept(listen_fd, null, null) as i32
+            if client_fd < 0
+                poll_fds[0].revents = 0
+                poll_fds[1].revents = 0
+                continue
+
+            client_sock.fd = client_fd
+            client_sock.family = AF_INET
+            client_sock.socktype = SOCK_STREAM
+
+            prints("New connection, performing encrypted handshake...\n")
+
+            # Initialize encrypted channel
+            var channel: EncryptedChannel
+            if channel_init_server(@channel, client_sock) < 0
+                prints("  Error: Channel init failed\n")
+                sys_close(client_fd)
+                poll_fds[0].revents = 0
+                poll_fds[1].revents = 0
+                continue
+
+            # Perform handshake
+            if channel_handshake_server(@channel) < 0
+                prints("  Error: Handshake failed\n")
+                channel_free(@channel)
+                sys_close(client_fd)
+                poll_fds[0].revents = 0
+                poll_fds[1].revents = 0
+                continue
+
+            prints("  Encrypted session established.\n")
+
+            # Handle commands
+            handle_encrypted_session(@channel, pool, storage, collection)
+
+            # Cleanup
             channel_free(@channel)
             sys_close(client_fd)
-            continue
+            prints("Connection closed.\n")
 
-        prints("  Encrypted session established.\n")
+        # Reset revents for next poll
+        poll_fds[0].revents = 0
+        poll_fds[1].revents = 0
 
-        # Handle commands
-        handle_encrypted_session(@channel, pool, collection)
-
-        # Cleanup
-        channel_free(@channel)
-        sys_close(client_fd)
-        prints("Connection closed.\n")
+    # Cleanup signalfd
+    if signal_fd >= 0
+        sys_close(signal_fd)
 
 # Handle a single encrypted session
-fn handle_encrypted_session(ch: *EncryptedChannel, pool: *BufferPool, collection: *Collection)
-    var buf: [4096]u8
+fn handle_encrypted_session(ch: *EncryptedChannel, pool: *BufferPool, storage: *Storage, collection: *Collection)
+    var buf: [8192]u8
+    var active_txn: i64 = -1  # Track active transaction (-1 = none)
 
     loop
         # Receive encrypted message
@@ -322,22 +471,470 @@ fn handle_encrypted_session(ch: *EncryptedChannel, pool: *BufferPool, collection
 
         # Handle message
         var resp: MessageBuffer
-        msgbuf_init(@resp, @buf[0] + 2048, 2048)
+        msgbuf_init(@resp, @buf[0] + 4096, 4096)
 
         if msg_type == MSG_PING
             build_pong(@resp, request_id)
+
         else if msg_type == MSG_DISCONNECT
+            # Abort any active transaction
+            if active_txn >= 0 and storage != null
+                storage_abort_txn(storage)
             build_disconnected(@resp, request_id)
             let resp_len: i32 = msgbuf_len(@resp)
             channel_send(ch, msgbuf_data(@resp), resp_len)
             break
+
+        else if msg_type == MSG_INSERT
+            handle_insert(@reader, @resp, request_id, collection)
+            # Flush to disk and update metadata after insert
+            if storage != null
+                save_collection_metadata(storage, collection)
+                storage_flush(storage)
+
+        else if msg_type == MSG_GET
+            handle_get(@reader, @resp, request_id, collection)
+
+        else if msg_type == MSG_UPDATE
+            handle_update(@reader, @resp, request_id, collection)
+            # Flush to disk and update metadata after update
+            if storage != null
+                save_collection_metadata(storage, collection)
+                storage_flush(storage)
+
+        else if msg_type == MSG_DELETE
+            handle_delete(@reader, @resp, request_id, collection)
+            # Flush to disk and update metadata after delete
+            if storage != null
+                save_collection_metadata(storage, collection)
+                storage_flush(storage)
+
+        else if msg_type == MSG_TXN_BEGIN
+            if storage != null
+                active_txn = storage_begin_txn(storage)
+                if active_txn >= 0
+                    build_txn_begun(@resp, request_id, active_txn)
+                else
+                    build_error(@resp, request_id, PROTO_ERR_INTERNAL, "Failed to begin transaction")
+            else
+                # In-memory mode - no real transactions
+                active_txn = 1
+                build_txn_begun(@resp, request_id, active_txn)
+
+        else if msg_type == MSG_TXN_COMMIT
+            if active_txn >= 0 and storage != null
+                let commit_result: i32 = storage_commit_txn(storage)
+                if commit_result == ERR_OK
+                    build_txn_committed(@resp, request_id)
+                else
+                    build_error(@resp, request_id, PROTO_ERR_INTERNAL, "Failed to commit")
+            else
+                build_txn_committed(@resp, request_id)
+            active_txn = -1
+
+        else if msg_type == MSG_TXN_ABORT
+            if active_txn >= 0 and storage != null
+                storage_abort_txn(storage)
+            build_txn_aborted(@resp, request_id)
+            active_txn = -1
+
         else
-            build_pong(@resp, request_id)  # Default response
+            build_error(@resp, request_id, PROTO_ERR_INVALID_MSG_TYPE, "Unknown message type")
 
         # Send encrypted response
         let resp_len: i32 = msgbuf_len(@resp)
         if resp_len > 0
             channel_send(ch, msgbuf_data(@resp), resp_len)
+
+# ============================================================================
+# Message Handlers
+# ============================================================================
+
+# Handle INSERT message
+# Payload: [doc_data_len: i32][doc_data: bytes]
+fn handle_insert(reader: *MessageReader, resp: *MessageBuffer, request_id: i32, collection: *Collection)
+    # Read document data
+    var doc_len: i32 = 0
+    let doc_data: *u8 = msgreader_read_bytes(reader, @doc_len)
+    if doc_data == null or doc_len <= 0
+        build_error(resp, request_id, PROTO_ERR_INVALID_DOCUMENT, "Missing document data")
+        return
+
+    # Deserialize document (doc_deserialize populates all fields)
+    var doc: Document
+    let deser_result: i32 = doc_deserialize(doc_data, doc_len as i64, @doc)
+    if deser_result != ERR_OK
+        build_error(resp, request_id, PROTO_ERR_INVALID_DOCUMENT, "Failed to deserialize document")
+        return
+
+    # Insert into collection
+    var out_id: DocumentId
+    let insert_result: i32 = collection_insert(collection, @doc, @out_id)
+    if insert_result != ERR_OK
+        build_error(resp, request_id, PROTO_ERR_INTERNAL, "Failed to insert document")
+        return
+
+    prints("  INSERT doc_id=")
+    print_i64(out_id.value)
+    prints("\n")
+
+    build_insert_ok(resp, request_id, out_id.value)
+
+# Handle GET message
+# Payload: [doc_id: i64]
+fn handle_get(reader: *MessageReader, resp: *MessageBuffer, request_id: i32, collection: *Collection)
+    # Read document ID
+    let doc_id_val: i64 = msgreader_read_i64(reader)
+    if doc_id_val < 0
+        build_error(resp, request_id, PROTO_ERR_INVALID_DOCUMENT, "Invalid document ID")
+        return
+
+    var doc_id: DocumentId
+    doc_id.value = doc_id_val
+
+    # Get from collection (collection_get populates the document)
+    var doc: Document
+    let get_result: i32 = collection_get(collection, @doc_id, @doc)
+    if get_result == ERR_NOT_FOUND
+        build_error(resp, request_id, PROTO_ERR_NOT_FOUND, "Document not found")
+        return
+    if get_result != ERR_OK
+        build_error(resp, request_id, PROTO_ERR_INTERNAL, "Failed to get document")
+        return
+
+    # Serialize document for response
+    var doc_buf: [2048]u8
+    let doc_size: i64 = doc_serialize(@doc, @doc_buf[0], 2048)
+    if doc_size < 0
+        build_error(resp, request_id, PROTO_ERR_INTERNAL, "Failed to serialize document")
+        return
+
+    prints("  GET doc_id=")
+    print_i64(doc_id_val)
+    prints(" size=")
+    print_i64(doc_size)
+    prints("\n")
+
+    build_get_ok(resp, request_id, @doc_buf[0], doc_size as i32)
+
+# Handle UPDATE message
+# Payload: [doc_data_len: i32][doc_data: bytes]
+fn handle_update(reader: *MessageReader, resp: *MessageBuffer, request_id: i32, collection: *Collection)
+    # Read document data
+    var doc_len: i32 = 0
+    let doc_data: *u8 = msgreader_read_bytes(reader, @doc_len)
+    if doc_data == null or doc_len <= 0
+        build_error(resp, request_id, PROTO_ERR_INVALID_DOCUMENT, "Missing document data")
+        return
+
+    # Deserialize document (doc_deserialize populates all fields)
+    var doc: Document
+    let deser_result: i32 = doc_deserialize(doc_data, doc_len as i64, @doc)
+    if deser_result != ERR_OK
+        build_error(resp, request_id, PROTO_ERR_INVALID_DOCUMENT, "Failed to deserialize document")
+        return
+
+    # Update in collection
+    let update_result: i32 = collection_update(collection, @doc)
+    if update_result == ERR_NOT_FOUND
+        build_error(resp, request_id, PROTO_ERR_NOT_FOUND, "Document not found")
+        return
+    if update_result != ERR_OK
+        build_error(resp, request_id, PROTO_ERR_INTERNAL, "Failed to update document")
+        return
+
+    prints("  UPDATE doc_id=")
+    print_i64(doc.id.value)
+    prints("\n")
+
+    build_update_ok(resp, request_id)
+
+# Handle DELETE message
+# Payload: [doc_id: i64]
+fn handle_delete(reader: *MessageReader, resp: *MessageBuffer, request_id: i32, collection: *Collection)
+    # Read document ID
+    let doc_id_val: i64 = msgreader_read_i64(reader)
+    if doc_id_val < 0
+        build_error(resp, request_id, PROTO_ERR_INVALID_DOCUMENT, "Invalid document ID")
+        return
+
+    var doc_id: DocumentId
+    doc_id.value = doc_id_val
+
+    # Delete from collection
+    let delete_result: i32 = collection_delete(collection, @doc_id)
+    if delete_result == ERR_NOT_FOUND
+        build_error(resp, request_id, PROTO_ERR_NOT_FOUND, "Document not found")
+        return
+    if delete_result != ERR_OK
+        build_error(resp, request_id, PROTO_ERR_INTERNAL, "Failed to delete document")
+        return
+
+    prints("  DELETE doc_id=")
+    print_i64(doc_id_val)
+    prints("\n")
+
+    build_delete_ok(resp, request_id)
+
+# Handle SCAN message - returns all documents in the collection
+# Payload: [max_results: i32] (0 = all)
+# Response is sent directly to fd, resp buffer is not used (since we may have many docs)
+fn handle_scan(reader: *MessageReader, resp: *MessageBuffer, request_id: i32, collection: *Collection, fd: i32)
+    # Read max_results (0 = all)
+    let max_results: i32 = msgreader_read_i32(reader)
+
+    prints("  SCAN max_results=")
+    print_i32(max_results)
+    prints("\n")
+
+    # Create iterator to scan all documents
+    let iter: *CollectionIter = collection_scan(collection)
+    if iter == null
+        build_error(resp, request_id, PROTO_ERR_INTERNAL, "Failed to create scan iterator")
+        return
+
+    # Count documents first (needed for response header)
+    var doc_count: i32 = 0
+    var max_count: i32 = max_results
+    if max_count == 0
+        max_count = 10000  # Reasonable limit
+
+    # Build response in a larger buffer
+    var scan_buf: [65536]u8  # 64KB for scan results
+    var scan_resp: MessageBuffer
+    msgbuf_init(@scan_resp, @scan_buf[0], 65536)
+
+    # Start SCAN_RESULT message
+    msgbuf_start(@scan_resp, MSG_SCAN_RESULT, request_id)
+
+    # Reserve space for doc_count and has_more (we'll fill in later)
+    let count_offset: i32 = msgbuf_len(@scan_resp)
+    msgbuf_write_i32(@scan_resp, 0)  # Placeholder for doc_count
+    msgbuf_write_i32(@scan_resp, 0)  # Placeholder for has_more
+
+    # Iterate and serialize documents
+    while collection_iter_valid(iter) != 0 and doc_count < max_count
+        var doc: Document
+        let get_result: i32 = collection_iter_get(iter, @doc)
+        if get_result == ERR_OK
+            # Serialize document
+            var doc_buf: [2048]u8
+            let doc_size: i64 = doc_serialize(@doc, @doc_buf[0], 2048)
+            if doc_size > 0
+                # Write doc_id + doc_len + doc_data
+                msgbuf_write_i64(@scan_resp, doc.id.value)
+                msgbuf_write_i32(@scan_resp, doc_size as i32)
+                msgbuf_write_bytes(@scan_resp, @doc_buf[0], doc_size as i32)
+                doc_count += 1
+
+        collection_iter_next(iter)
+
+    # Check if there are more
+    let has_more: i32 = collection_iter_valid(iter)
+
+    collection_iter_destroy(iter)
+
+    # Go back and fill in the count and has_more (big-endian)
+    var data: *u8 = msgbuf_data(@scan_resp)
+    var ptr: *u8 = data + count_offset
+    # Write doc_count as big-endian i32
+    *(ptr + 0) = ((doc_count >> 24) & 0xFF) as u8
+    *(ptr + 1) = ((doc_count >> 16) & 0xFF) as u8
+    *(ptr + 2) = ((doc_count >> 8) & 0xFF) as u8
+    *(ptr + 3) = (doc_count & 0xFF) as u8
+    # Write has_more as big-endian i32
+    *(ptr + 4) = ((has_more >> 24) & 0xFF) as u8
+    *(ptr + 5) = ((has_more >> 16) & 0xFF) as u8
+    *(ptr + 6) = ((has_more >> 8) & 0xFF) as u8
+    *(ptr + 7) = (has_more & 0xFF) as u8
+
+    # Finish and send
+    msgbuf_finish(@scan_resp)
+
+    prints("  SCAN returned ")
+    print_i32(doc_count)
+    prints(" documents\n")
+
+    let scan_len: i32 = msgbuf_len(@scan_resp)
+    sys_write(fd, msgbuf_data(@scan_resp), scan_len as i64)
+
+# ============================================================================
+# Plain (Unencrypted) Server Loop - Development Mode
+# ============================================================================
+
+# Server main loop - handles plain TCP connections (no encryption)
+fn serve_loop_plain(listen_fd: i32, pool: *BufferPool, storage: *Storage, collection: *Collection)
+    # Create signalfd for SIGTERM/SIGINT for graceful shutdown
+    let signal_fd: i32 = signalfd_create_for_shutdown()
+    if signal_fd < 0
+        prints("Warning: Failed to create signalfd, shutdown may not be graceful\n")
+
+    # Set up poll fds: [0] = listen socket, [1] = signal fd
+    var poll_fds: [2]PollFd
+
+    poll_fds[0].fd = listen_fd
+    poll_fds[0].events = POLLIN
+    poll_fds[0].revents = 0
+
+    poll_fds[1].fd = signal_fd
+    poll_fds[1].events = POLLIN
+    poll_fds[1].revents = 0
+
+    let num_fds: i64 = 2
+    if signal_fd < 0
+        # Skip signalfd if it failed to create
+        poll_fds[1].fd = -1
+
+    loop
+        # Poll with 1 second timeout
+        let poll_result: i32 = sys_poll(@poll_fds[0], num_fds, 1000)
+
+        if poll_result < 0
+            # Error - check if it's EINTR
+            continue
+
+        if poll_result == 0
+            # Timeout - check shutdown flag
+            if shutdown_requested() != 0
+                prints("Shutdown requested (flag).\n")
+                break
+            continue
+
+        # Check for signal
+        if signal_fd >= 0 and (poll_fds[1].revents & POLLIN) != 0
+            let sig: i32 = signalfd_read(signal_fd)
+            if sig == SIGTERM or sig == SIGINT
+                prints("Received shutdown signal, stopping server...\n")
+                break
+
+        # Check for new connection
+        if (poll_fds[0].revents & POLLIN) != 0
+            var client_fd: i32 = sys_accept(listen_fd, null, null) as i32
+            if client_fd < 0
+                continue
+
+            prints("New connection (plain TCP).\n")
+
+            # Handle session using plain TCP
+            handle_plain_session(client_fd, pool, storage, collection)
+
+            # Cleanup
+            sys_close(client_fd)
+            prints("Connection closed.\n")
+
+        # Reset revents for next poll
+        poll_fds[0].revents = 0
+        poll_fds[1].revents = 0
+
+    # Cleanup signalfd
+    if signal_fd >= 0
+        sys_close(signal_fd)
+
+# Handle a single plain (unencrypted) session
+fn handle_plain_session(fd: i32, pool: *BufferPool, storage: *Storage, collection: *Collection)
+    var buf: [8192]u8
+    var active_txn: i64 = -1  # Track active transaction (-1 = none)
+
+    loop
+        # Receive message (plain TCP read)
+        let n: i64 = sys_read(fd, @buf[0], 4096)
+        if n <= 0
+            break
+
+        # Parse and handle M7SP message
+        var reader: MessageReader
+        let result: i32 = msgreader_init(@reader, @buf[0], n as i32)
+        if result != PROTO_OK
+            continue
+
+        let msg_type: i32 = msgreader_msg_type(@reader)
+        let request_id: i32 = msgreader_request_id(@reader)
+
+        # Handle message
+        var resp: MessageBuffer
+        msgbuf_init(@resp, @buf[0] + 4096, 4096)
+
+        if msg_type == MSG_CONNECT
+            # Client sends MSG_CONNECT first (normally this triggers handshake)
+            # In plain mode, we just acknowledge with session_id = 1
+            prints("  CONNECT received, sending OK\n")
+            build_connected(@resp, request_id, 1)
+
+        else if msg_type == MSG_PING
+            build_pong(@resp, request_id)
+
+        else if msg_type == MSG_DISCONNECT
+            # Abort any active transaction
+            if active_txn >= 0 and storage != null
+                storage_abort_txn(storage)
+            build_disconnected(@resp, request_id)
+            let resp_len: i32 = msgbuf_len(@resp)
+            sys_write(fd, msgbuf_data(@resp), resp_len as i64)
+            break
+
+        else if msg_type == MSG_INSERT
+            handle_insert(@reader, @resp, request_id, collection)
+            # Flush to disk and update metadata after insert
+            if storage != null
+                save_collection_metadata(storage, collection)
+                storage_flush(storage)
+
+        else if msg_type == MSG_GET
+            handle_get(@reader, @resp, request_id, collection)
+
+        else if msg_type == MSG_UPDATE
+            handle_update(@reader, @resp, request_id, collection)
+            # Flush to disk and update metadata after update
+            if storage != null
+                save_collection_metadata(storage, collection)
+                storage_flush(storage)
+
+        else if msg_type == MSG_DELETE
+            handle_delete(@reader, @resp, request_id, collection)
+            # Flush to disk and update metadata after delete
+            if storage != null
+                save_collection_metadata(storage, collection)
+                storage_flush(storage)
+
+        else if msg_type == MSG_TXN_BEGIN
+            if storage != null
+                active_txn = storage_begin_txn(storage)
+                if active_txn >= 0
+                    build_txn_begun(@resp, request_id, active_txn)
+                else
+                    build_error(@resp, request_id, PROTO_ERR_INTERNAL, "Failed to begin transaction")
+            else
+                # In-memory mode - no real transactions
+                active_txn = 1
+                build_txn_begun(@resp, request_id, active_txn)
+
+        else if msg_type == MSG_TXN_COMMIT
+            if active_txn >= 0 and storage != null
+                let commit_result: i32 = storage_commit_txn(storage)
+                if commit_result == ERR_OK
+                    build_txn_committed(@resp, request_id)
+                else
+                    build_error(@resp, request_id, PROTO_ERR_INTERNAL, "Failed to commit")
+            else
+                build_txn_committed(@resp, request_id)
+            active_txn = -1
+
+        else if msg_type == MSG_TXN_ABORT
+            if active_txn >= 0 and storage != null
+                storage_abort_txn(storage)
+            build_txn_aborted(@resp, request_id)
+            active_txn = -1
+
+        else if msg_type == MSG_SCAN
+            handle_scan(@reader, @resp, request_id, collection, fd)
+
+        else
+            build_error(@resp, request_id, PROTO_ERR_INVALID_MSG_TYPE, "Unknown message type")
+
+        # Send plain response
+        let resp_len: i32 = msgbuf_len(@resp)
+        if resp_len > 0
+            sys_write(fd, msgbuf_data(@resp), resp_len as i64)
 
 # ============================================================================
 # Shell Command - Interactive Client
@@ -476,7 +1073,7 @@ pub fn main(argc: i32, argv: **u8) -> i32
         return 0
 
     if args.command == CMD_SERVE
-        return cmd_serve(args.port)
+        return cmd_serve(args.port, args.data_dir, args.no_encryption)
 
     if args.command == CMD_SHELL
         return cmd_shell(args.host, args.port)

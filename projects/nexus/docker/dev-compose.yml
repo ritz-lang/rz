@@ -1,35 +1,74 @@
 # Nexus Development Compose
 #
-# Development setup with real Nexus binary!
+# Development setup with real Nexus + Mausoleum binaries!
 #
 # Usage:
-#   # Build nexus first
-#   ./build.sh --debug
+#   # Build both first
+#   ./rz build nexus && ./rz build mausoleum
 #
 #   # Then run with docker compose
-#   cd docker
+#   cd projects/nexus/docker
 #   docker compose -f dev-compose.yml up -d
+#
+#   # Seed initial wiki pages (first time only):
+#   docker compose -f dev-compose.yml run --rm wiki-seed --seed
+#
+#   # Access the wiki:
 #   curl http://localhost:8080/
-#   curl http://localhost:8080/health
+#   curl http://localhost:8080/wiki/welcome
+#
+# Data persistence:
+#   Wiki data is stored in a Docker volume (mausoleum-data)
+#   To wipe data: docker volume rm docker_mausoleum-data
 
 services:
   # ============================================================================
-  # Mock Mausoleum - Redis standing in for document storage
+  # Mausoleum - Document Database (real binary!)
   # ============================================================================
-  mausoleum-mock:
-    image: redis:7-alpine
-    container_name: nexus-mausoleum-mock
-    command: redis-server --port 7777
-    expose:
-      - "7777"
+  mausoleum:
+    image: ubuntu:22.04
+    container_name: nexus-mausoleum
+    volumes:
+      - ../../mausoleum/build/debug/mausoleum:/app/mausoleum:ro
+      - mausoleum-data:/data
+    command: ["/app/mausoleum", "serve", "--port", "7777", "--data-dir", "/data", "--no-encryption"]
+    ports:
+      - "7777:7777"
+    # Graceful shutdown with SIGTERM (fixed in GitHub #72)
+    stop_grace_period: 10s
+    # Unencrypted mode for development - Nexus uses plain TCP client
     healthcheck:
-      test: ["CMD", "redis-cli", "-p", "7777", "ping"]
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/7777' || exit 1"]
       interval: 5s
       timeout: 3s
-      retries: 3
+      retries: 5
+      start_period: 2s
 
   # ============================================================================
-  # Mock Tome - Redis for caching
+  # Wiki Seed - Seeds initial wiki pages into Mausoleum
+  # ============================================================================
+  wiki-seed:
+    image: ubuntu:22.04
+    container_name: nexus-wiki-seed
+    volumes:
+      - ../../mausoleum/build/debug/wiki-seed:/app/wiki-seed:ro
+    # Note: wiki-seed doesn't support DNS names yet, so we resolve the IP first
+    command:
+      - bash
+      - -c
+      - |
+        sleep 2
+        IP=$$(getent hosts mausoleum | awk '{print $$1}')
+        echo "Resolved mausoleum to: $$IP"
+        /app/wiki-seed --host "$$IP" --port 7777 --seed
+    depends_on:
+      mausoleum:
+        condition: service_healthy
+    profiles:
+      - seed  # Only run with: docker compose --profile seed up
+
+  # ============================================================================
+  # Mock Tome - Redis for caching (until tome is ready)
   # ============================================================================
   tome-mock:
     image: redis:7-alpine
@@ -54,14 +93,16 @@ services:
     volumes:
       - ../build/debug/nexus:/app/nexus:ro
     command: ["/app/nexus"]
+    # io_uring requires privileged mode or specific seccomp settings
+    privileged: true
+    environment:
+      - MAUSOLEUM_HOST=mausoleum
+      - MAUSOLEUM_PORT=7777
     depends_on:
-      mausoleum-mock:
-        condition: service_healthy
-      tome-mock:
-        condition: service_healthy
-    # healthcheck disabled for dev - ubuntu:22.04 minimal doesn't have curl
-    # healthcheck:
-    #   test: ["CMD-SHELL", "curl -sf http://localhost:8080/health || exit 1"]
-    #   interval: 5s
-    #   timeout: 3s
-    #   retries: 3
+      - mausoleum
+      - tome-mock
+
+# Named volumes for data persistence
+volumes:
+  mausoleum-data:
+    driver: local

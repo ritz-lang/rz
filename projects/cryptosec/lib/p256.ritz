@@ -1420,6 +1420,7 @@ pub struct EcdsaSignature
 # 8. Loop: T = HMAC_K(V), if T in [1, n-1], return T, else K = HMAC_K(V || 0x00), V = HMAC_K(V)
 
 fn rfc6979_generate_k(k: *Scalar256, priv_key: *Scalar256, hash: *u8)
+    prints("[RFC6979] enter\n")
     # Initialize V = 0x01...01 (32 bytes)
     var v: [32]u8
     var i: i32 = 0
@@ -1434,9 +1435,13 @@ fn rfc6979_generate_k(k: *Scalar256, priv_key: *Scalar256, hash: *u8)
         key[i] = 0x00
         i += 1
 
+    prints("[RFC6979] init done\n")
+
     # Convert private key to bytes
     var x_bytes: [32]u8
     scalar256_to_bytes(priv_key, @x_bytes[0])
+
+    prints("[RFC6979] key converted\n")
 
     # Build message: V || 0x00 || x || h1
     var msg1: [97]u8  # 32 + 1 + 32 + 32
@@ -1454,11 +1459,17 @@ fn rfc6979_generate_k(k: *Scalar256, priv_key: *Scalar256, hash: *u8)
         msg1[65 + i] = hash[i]
         i += 1
 
+    prints("[RFC6979] msg1 built, calling hmac1\n")
+
     # K = HMAC_K(V || 0x00 || x || h1)
     hmac_sha256(@key[0], 32, @msg1[0], 97, @key[0])
 
+    prints("[RFC6979] hmac1 done, calling hmac2\n")
+
     # V = HMAC_K(V)
     hmac_sha256(@key[0], 32, @v[0], 32, @v[0])
+
+    prints("[RFC6979] hmac2 done\n")
 
     # Build message: V || 0x01 || x || h1
     i = 0
@@ -1467,11 +1478,17 @@ fn rfc6979_generate_k(k: *Scalar256, priv_key: *Scalar256, hash: *u8)
         i += 1
     msg1[32] = 0x01
 
+    prints("[RFC6979] calling hmac3\n")
+
     # K = HMAC_K(V || 0x01 || x || h1)
     hmac_sha256(@key[0], 32, @msg1[0], 97, @key[0])
 
+    prints("[RFC6979] calling hmac4\n")
+
     # V = HMAC_K(V)
     hmac_sha256(@key[0], 32, @v[0], 32, @v[0])
+
+    prints("[RFC6979] generate k loop\n")
 
     # Generate k
     var n: Scalar256
@@ -1479,14 +1496,20 @@ fn rfc6979_generate_k(k: *Scalar256, priv_key: *Scalar256, hash: *u8)
 
     var tries: i32 = 0
     while tries < 100  # Safety limit
+        prints("[RFC6979] loop iter\n")
         # V = HMAC_K(V)
         hmac_sha256(@key[0], 32, @v[0], 32, @v[0])
+        prints("[RFC6979] hmac done\n")
 
         # T = V as scalar
+        prints("[RFC6979] from_bytes\n")
         scalar256_from_bytes(k, @v[0])
+        prints("[RFC6979] from_bytes done\n")
 
         # Check if k is valid: 1 <= k < n
-        if scalar256_is_zero(k) == 0 && scalar256_cmp(k, @n) < 0
+        prints("[RFC6979] checking k\n")
+        if scalar256_is_zero(k) == 0 and scalar256_cmp(k, @n) < 0
+            prints("[RFC6979] found valid k\n")
             return
 
         # Invalid k, update K and V
@@ -1520,8 +1543,10 @@ fn rfc6979_generate_k(k: *Scalar256, priv_key: *Scalar256, hash: *u8)
 # Returns: 1 on success, 0 on failure
 
 pub fn ecdsa_p256_sign(sig: *EcdsaSignature, hash: *u8, priv_key: *Scalar256) -> i32
+    prints("[ECDSA] enter\n")
     var n: Scalar256
     get_p256_order(@n)
+    prints("[ECDSA] got order\n")
 
     # Convert hash to scalar z (may need truncation for larger hashes)
     var z: Scalar256
@@ -1529,15 +1554,20 @@ pub fn ecdsa_p256_sign(sig: *EcdsaSignature, hash: *u8, priv_key: *Scalar256) ->
     # Reduce z mod n if necessary
     if scalar256_cmp(@z, @n) >= 0
         scalar256_sub(@z, @z, @n)
+    prints("[ECDSA] z converted\n")
 
     # Generate deterministic k using RFC 6979
     var k: Scalar256
+    prints("[ECDSA] rfc6979...\n")
     rfc6979_generate_k(@k, priv_key, hash)
+    prints("[ECDSA] rfc6979 done\n")
 
     if scalar256_is_zero(@k) == 1
+        prints("[ECDSA] k is zero!\n")
         return 0  # Failed to generate valid k
 
     # Compute R = k * G
+    prints("[ECDSA] scalar_mult...\n")
     var k_bytes: [32]u8
     scalar256_to_bytes(@k, @k_bytes[0])
 
@@ -1545,15 +1575,20 @@ pub fn ecdsa_p256_sign(sig: *EcdsaSignature, hash: *u8, priv_key: *Scalar256) ->
     var G: P256Point
     p256_point_generator(@G)
     p256_scalar_mult(@R, @k_bytes[0], 32, @G)
+    prints("[ECDSA] scalar_mult done\n")
 
     if p256_point_is_identity(@R) == 1
+        prints("[ECDSA] R is identity!\n")
         return 0
 
     # Convert R to affine coordinates
+    prints("[ECDSA] to_affine...\n")
     var rx: FeP256
     var ry: FeP256
     if p256_point_to_affine(@R, @rx, @ry) == 0
+        prints("[ECDSA] affine failed!\n")
         return 0
+    prints("[ECDSA] affine done\n")
 
     # r = rx mod n
     var rx_bytes: [32]u8
@@ -1562,28 +1597,41 @@ pub fn ecdsa_p256_sign(sig: *EcdsaSignature, hash: *u8, priv_key: *Scalar256) ->
     scalar256_reduce(@sig.r)
 
     if scalar256_is_zero(@sig.r) == 1
+        prints("[ECDSA] r is zero!\n")
         return 0
 
     # s = k^(-1) * (z + r * d) mod n
+    prints("[ECDSA] computing s...\n")
     var k_inv: Scalar256
+    prints("[ECDSA] scalar256_inv...\n")
     scalar256_inv(@k_inv, @k)
+    prints("[ECDSA] scalar256_inv done\n")
 
     var rd: Scalar256
+    prints("[ECDSA] mul rd...\n")
     scalar256_mul(@rd, @sig.r, priv_key)
+    prints("[ECDSA] mul rd done\n")
 
     var z_rd: Scalar256
+    prints("[ECDSA] add z_rd...\n")
     scalar256_add(@z_rd, @z, @rd)
+    prints("[ECDSA] add z_rd done\n")
 
+    prints("[ECDSA] final mul...\n")
     scalar256_mul(@sig.s, @k_inv, @z_rd)
+    prints("[ECDSA] final mul done\n")
 
     if scalar256_is_zero(@sig.s) == 1
+        prints("[ECDSA] s is zero!\n")
         return 0
 
     # Zero sensitive data
+    prints("[ECDSA] cleanup...\n")
     mem_zero(@k_bytes[0], 32)
     scalar256_zero(@k)
     scalar256_zero(@k_inv)
 
+    prints("[ECDSA] success!\n")
     return 1
 
 # ============================================================================
@@ -1698,3 +1746,70 @@ pub fn ecdsa_sig_to_bytes(sig: *EcdsaSignature, out: *u8)
 pub fn ecdsa_sig_from_bytes(sig: *EcdsaSignature, data: *u8)
     scalar256_from_bytes(@sig.r, @data[0])
     scalar256_from_bytes(@sig.s, @data[32])
+
+# Encode ECDSA signature in DER format
+# DER: SEQUENCE { INTEGER r, INTEGER s }
+# Returns the number of bytes written (max 72)
+pub fn ecdsa_signature_to_der(sig: *EcdsaSignature, out: *u8) -> i64
+    var r_bytes: [32]u8
+    var s_bytes: [32]u8
+    scalar256_to_bytes(@sig.r, @r_bytes[0])
+    scalar256_to_bytes(@sig.s, @s_bytes[0])
+
+    # Encode r as INTEGER
+    var r_der: [35]u8
+    let r_len: i64 = encode_der_integer(@r_bytes[0], 32, @r_der[0])
+
+    # Encode s as INTEGER
+    var s_der: [35]u8
+    let s_len: i64 = encode_der_integer(@s_bytes[0], 32, @s_der[0])
+
+    # Build SEQUENCE
+    let seq_len: i64 = r_len + s_len
+    var pos: i64 = 0
+
+    out[pos] = 0x30  # SEQUENCE tag
+    pos = pos + 1
+    out[pos] = seq_len as u8  # Length (always < 128)
+    pos = pos + 1
+
+    # Copy r
+    mem_copy(out + pos, @r_der[0], r_len as u64)
+    pos = pos + r_len
+
+    # Copy s
+    mem_copy(out + pos, @s_der[0], s_len as u64)
+    pos = pos + s_len
+
+    return pos
+
+# Encode a big-endian integer as DER INTEGER
+# Adds leading 0x00 if high bit is set (to keep positive)
+# Returns bytes written
+fn encode_der_integer(data: *u8, data_len: i64, out: *u8) -> i64
+    # Skip leading zeros
+    var start: i64 = 0
+    while start < data_len - 1 and data[start] == 0
+        start = start + 1
+
+    # Check if we need to add a leading 0x00 (high bit set = negative in DER)
+    var need_pad: i32 = 0
+    if data[start] & 0x80 != 0
+        need_pad = 1
+
+    let int_len: i64 = (data_len - start) + need_pad
+
+    var pos: i64 = 0
+    out[pos] = 0x02  # INTEGER tag
+    pos = pos + 1
+    out[pos] = int_len as u8
+    pos = pos + 1
+
+    if need_pad == 1
+        out[pos] = 0x00
+        pos = pos + 1
+
+    mem_copy(out + pos, data + start, (data_len - start) as u64)
+    pos = pos + (data_len - start)
+
+    return pos

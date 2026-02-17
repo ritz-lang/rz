@@ -1,84 +1,575 @@
-# src/main.ritz - Nexus HTTP server
+# src/main.ritz - Nexus Wiki Application (Zeus Worker)
 #
-# Minimal HTTP server for the Ritz Knowledge Base.
-# Serves /health endpoint for Docker health checks.
+# A wiki built on the Ritz stack as a Zeus worker process:
+# - zeus: Zero-copy IPC with Valet HTTP server
+# - mausoleum: Document database
+# - tome: Caching (TODO)
+#
+# This binary is spawned by Zeus daemon and communicates via shared memory.
+#
+# Usage (spawned by zeus):
+#   nexus <shm_size> <worker_id>
+#
+# Environment:
+#   - fd 3 is the shared memory file descriptor
+#
+# Routes:
+#   GET /           - Home page (list of pages)
+#   GET /health     - Health check
+#   GET /wiki/:slug - View a wiki page
+#   GET /wiki/:slug/edit - Edit form
+#   POST /wiki/:slug - Save changes
+#   GET /wiki/new   - Create new page form
+#   POST /wiki      - Create new page
 
-import ritzlib.sys { sys_read, sys_write, sys_close }
-import ritzlib.async_net { tcp_socket, set_reuseaddr, tcp_bind, tcp_listen, tcp_accept }
-import ritzlib.strview { StrView }
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+
+import zeus.worker { WorkerContext }
+import zeus.worker { worker_init, worker_destroy }
+import zeus.worker { worker_set_running, worker_set_busy }
+import zeus.worker { worker_poll_request, worker_ack_request }
+import zeus.worker { worker_begin_response, worker_commit_response }
+import zeus.worker { worker_get_request_path, worker_get_request_body }
+import zeus.worker { worker_alloc_response_data, worker_ptr_to_offset }
+import zeus.ring { RequestSlot, ResponseSlot }
+import zeus.ring { HTTP_METHOD_GET, HTTP_METHOD_POST }
+import zeus.ring { response_slot_set_status, response_slot_set_flags }
+import zeus.ring { response_slot_set_body, response_slot_set_headers }
+import zeus.ring { RESP_FLAG_COMPLETE }
+
+import src.store
 
 
-# Write a StrView to a file descriptor
-fn fd_write(fd: i32, s: StrView)
-    sys_write(fd, s.ptr, s.len)
+# ============================================================================
+# Constants
+# ============================================================================
+
+const SHM_FD: i32 = 3  # Zeus always passes shm fd as fd 3
 
 
-fn main() -> i32
-    print("Nexus - The Ritz Knowledge Base\n")
-    print("Starting HTTP server on port 8080...\n")
+# ============================================================================
+# Print Helpers (using ritzlib)
+# ============================================================================
 
-    # Create socket
-    let sock = tcp_socket()
-    if sock < 0
-        print("Failed to create socket\n")
+# Using ritzlib.io: prints, print_int are already imported
+
+
+# ============================================================================
+# HTML Templates
+# ============================================================================
+
+fn write_cstr(buf: *u8, pos: i32, src: *u8) -> i32
+    var p: i32 = pos
+    var i: i32 = 0
+    while *(src + i) != 0
+        *(buf + p) = *(src + i)
+        p += 1
+        i += 1
+    return p
+
+
+fn write_bytes(buf: *u8, pos: i32, src: *u8, len: i32) -> i32
+    var p: i32 = pos
+    for i in 0..len
+        *(buf + p) = *(src + i)
+        p += 1
+    return p
+
+
+fn cstr_len(s: *u8) -> i32
+    var len: i32 = 0
+    while *(s + len) != 0
+        len += 1
+    return len
+
+
+fn write_html_head(buf: *u8, pos: i32, title: *u8) -> i32
+    var p: i32 = pos
+    p = write_cstr(buf, p, c"<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>")
+    p = write_cstr(buf, p, title)
+    p = write_cstr(buf, p, c"</title><style>")
+    p = write_cstr(buf, p, c"body{font-family:system-ui,sans-serif;max-width:800px;margin:2rem auto;padding:0 1rem;line-height:1.6}")
+    p = write_cstr(buf, p, c"h1{color:#333}a{color:#0066cc}")
+    p = write_cstr(buf, p, c".pages{list-style:none;padding:0}")
+    p = write_cstr(buf, p, c".pages li{margin:.5rem 0;padding:.5rem;background:#f5f5f5;border-radius:4px}")
+    p = write_cstr(buf, p, c".content{background:#f9f9f9;padding:1rem;border-radius:4px;margin:1rem 0;white-space:pre-wrap}")
+    p = write_cstr(buf, p, c"textarea{width:100%;height:300px;font-family:monospace;padding:.5rem}")
+    p = write_cstr(buf, p, c"input[type=text]{width:100%;padding:.5rem;margin:.5rem 0}")
+    p = write_cstr(buf, p, c"button{background:#0066cc;color:white;border:none;padding:.5rem 1rem;cursor:pointer;border-radius:4px}")
+    p = write_cstr(buf, p, c"button:hover{background:#0055aa}")
+    p = write_cstr(buf, p, c".nav{margin-bottom:1rem}")
+    p = write_cstr(buf, p, c".actions{margin-top:1rem}")
+    p = write_cstr(buf, p, c".success{background:#d4edda;padding:1rem;border-radius:4px;margin:1rem 0}")
+    p = write_cstr(buf, p, c"</style></head><body>")
+    return p
+
+
+fn write_html_footer(buf: *u8, pos: i32) -> i32
+    var p: i32 = pos
+    p = write_cstr(buf, p, c"<hr><small>Powered by <a href=\"https://ritz-lang.org\">Ritz</a> | ")
+    p = write_cstr(buf, p, c"<a href=\"/\">Home</a></small></body></html>")
+    return p
+
+
+fn write_escaped(buf: *u8, pos: i32, src: *u8, len: i32) -> i32
+    var p: i32 = pos
+    for i in 0..len
+        let c: u8 = *(src + i)
+        if c == 60
+            p = write_cstr(buf, p, c"&lt;")
+        else if c == 62
+            p = write_cstr(buf, p, c"&gt;")
+        else if c == 38
+            p = write_cstr(buf, p, c"&amp;")
+        else if c == 34
+            p = write_cstr(buf, p, c"&quot;")
+        else if c == 39
+            p = write_cstr(buf, p, c"&#39;")
+        else
+            *(buf + p) = c
+            p += 1
+    return p
+
+
+# ============================================================================
+# Form Parsing
+# ============================================================================
+
+fn url_decode(buf: *u8, len: i32) -> i32
+    var read: i32 = 0
+    var write: i32 = 0
+
+    while read < len
+        let c: u8 = *(buf + read)
+        if c == 43
+            *(buf + write) = 32
+            read += 1
+            write += 1
+        else if c == 37 and read + 2 < len
+            let h1: u8 = *(buf + read + 1)
+            let h2: u8 = *(buf + read + 2)
+            var val: u8 = 0
+
+            if h1 >= 48 and h1 <= 57
+                val = (h1 - 48) << 4
+            else if h1 >= 65 and h1 <= 70
+                val = (h1 - 55) << 4
+            else if h1 >= 97 and h1 <= 102
+                val = (h1 - 87) << 4
+
+            if h2 >= 48 and h2 <= 57
+                val = val | (h2 - 48)
+            else if h2 >= 65 and h2 <= 70
+                val = val | (h2 - 55)
+            else if h2 >= 97 and h2 <= 102
+                val = val | (h2 - 87)
+
+            *(buf + write) = val
+            read += 3
+            write += 1
+        else
+            *(buf + write) = c
+            read += 1
+            write += 1
+
+    return write
+
+
+fn parse_form_field(body: *u8, body_len: i32, field: *u8, value_out: *u8, max_len: i32) -> i32
+    let field_len: i32 = cstr_len(field)
+
+    var pos: i32 = 0
+    while pos < body_len
+        var found: i32 = 1
+        if pos + field_len + 1 > body_len
+            found = 0
+        else
+            for i in 0..field_len
+                if *(body + pos + i) != *(field + i)
+                    found = 0
+                    break
+            if found == 1 and *(body + pos + field_len) != 61
+                found = 0
+
+        if found == 1
+            var start: i32 = pos + field_len + 1
+            var end: i32 = start
+
+            while end < body_len and *(body + end) != 38
+                end += 1
+
+            var value_len: i32 = end - start
+            if value_len > max_len
+                value_len = max_len
+
+            for i in 0..value_len
+                *(value_out + i) = *(body + start + i)
+
+            return url_decode(value_out, value_len)
+
+        while pos < body_len and *(body + pos) != 38
+            pos += 1
+        pos += 1
+
+    return -1
+
+
+# ============================================================================
+# Routing Helpers
+# ============================================================================
+
+# Check if path starts with prefix
+fn path_starts_with(path: *u8, path_len: i32, prefix: *u8) -> i32
+    let prefix_len: i32 = cstr_len(prefix)
+    if path_len < prefix_len
+        return 0
+    for i in 0..prefix_len
+        if *(path + i) != *(prefix + i)
+            return 0
+    return 1
+
+
+# Extract parameter from path: /wiki/:slug -> slug
+fn extract_slug(path: *u8, path_len: i32, slug_out: *u8, max_len: i32) -> i32
+    # Skip "/wiki/"
+    if path_len < 7
+        return -1
+    if path_starts_with(path, path_len, c"/wiki/") == 0
+        return -1
+
+    var start: i32 = 6
+    var end: i32 = start
+
+    # Find end of slug (next '/' or end of path)
+    while end < path_len and *(path + end) != 47
+        end += 1
+
+    var len: i32 = end - start
+    if len > max_len
+        len = max_len
+    if len == 0
+        return -1
+
+    for i in 0..len
+        *(slug_out + i) = *(path + start + i)
+
+    return len
+
+
+# ============================================================================
+# Response Building
+# ============================================================================
+
+# Build HTTP response headers
+fn build_headers(buf: *u8, status: i32, content_type: *u8, content_len: i32) -> i32
+    var p: i32 = 0
+
+    # Status line
+    p = write_cstr(buf, p, c"HTTP/1.1 ")
+    if status == 200
+        p = write_cstr(buf, p, c"200 OK")
+    else if status == 301
+        p = write_cstr(buf, p, c"301 Moved Permanently")
+    else if status == 302
+        p = write_cstr(buf, p, c"302 Found")
+    else if status == 400
+        p = write_cstr(buf, p, c"400 Bad Request")
+    else if status == 404
+        p = write_cstr(buf, p, c"404 Not Found")
+    else if status == 500
+        p = write_cstr(buf, p, c"500 Internal Server Error")
+    else
+        p = write_cstr(buf, p, c"200 OK")
+
+    p = write_cstr(buf, p, c"\r\nContent-Type: ")
+    p = write_cstr(buf, p, content_type)
+    p = write_cstr(buf, p, c"\r\nContent-Length: ")
+
+    # Write content length as string
+    var len_buf: [12]u8
+    var len_i: i32 = 0
+    var len_v: i32 = content_len
+    if len_v == 0
+        len_buf[0] = 48
+        len_i = 1
+    else
+        var tmp: [12]u8
+        var tmp_i: i32 = 0
+        while len_v > 0
+            tmp[tmp_i] = (0x30 + (len_v % 10)) as u8
+            len_v = len_v / 10
+            tmp_i += 1
+        while tmp_i > 0
+            tmp_i -= 1
+            len_buf[len_i] = tmp[tmp_i]
+            len_i += 1
+
+    p = write_bytes(buf, p, @len_buf[0], len_i)
+    p = write_cstr(buf, p, c"\r\nConnection: keep-alive\r\n\r\n")
+
+    return p
+
+
+fn build_redirect_headers(buf: *u8, location: *u8) -> i32
+    var p: i32 = 0
+    p = write_cstr(buf, p, c"HTTP/1.1 302 Found\r\nLocation: ")
+    p = write_cstr(buf, p, location)
+    p = write_cstr(buf, p, c"\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n")
+    return p
+
+
+# ============================================================================
+# Handlers
+# ============================================================================
+
+fn handle_index(ctx: *WorkerContext, req: *RequestSlot, resp: *ResponseSlot) -> i32
+    var body: [8192]u8
+    var p: i32 = 0
+
+    p = write_html_head(@body[0], p, c"Nexus Wiki")
+    p = write_cstr(@body[0], p, c"<h1>Nexus Wiki</h1>")
+    p = write_cstr(@body[0], p, c"<p>The Ritz Knowledge Base</p>")
+    p = write_cstr(@body[0], p, c"<nav class=\"nav\"><a href=\"/wiki/new\">+ New Page</a></nav>")
+    p = write_cstr(@body[0], p, c"<h2>Pages</h2>")
+    p = write_cstr(@body[0], p, c"<ul class=\"pages\">")
+
+    var slugs: [2048]u8
+    let count: i32 = store_list(@slugs[0], 2048)
+
+    if count == 0
+        p = write_cstr(@body[0], p, c"<li><em>No pages yet. <a href=\"/wiki/new\">Create one!</a></em></li>")
+    else
+        var pos: i32 = 0
+        var start: i32 = 0
+        while pos < 2048 and slugs[pos] != 0
+            if slugs[pos] == 10
+                if pos > start
+                    p = write_cstr(@body[0], p, c"<li><a href=\"/wiki/")
+                    p = write_bytes(@body[0], p, @slugs[start], pos - start)
+                    p = write_cstr(@body[0], p, c"\">")
+                    p = write_bytes(@body[0], p, @slugs[start], pos - start)
+                    p = write_cstr(@body[0], p, c"</a></li>")
+                start = pos + 1
+            pos += 1
+
+    p = write_cstr(@body[0], p, c"</ul>")
+    p = write_html_footer(@body[0], p)
+
+    var headers: [256]u8
+    let headers_len: i32 = build_headers(@headers[0], 200, c"text/html; charset=utf-8", p)
+
+    let arena_headers: *u8 = worker_alloc_response_data(ctx, headers_len as i64)
+    let arena_body: *u8 = worker_alloc_response_data(ctx, p as i64)
+
+    for i in 0..headers_len
+        *(arena_headers + i) = headers[i]
+    for i in 0..p
+        *(arena_body + i) = body[i]
+
+    response_slot_set_status(resp, 200)
+    response_slot_set_headers(resp, worker_ptr_to_offset(ctx, arena_headers) as u32, headers_len as u16)
+    response_slot_set_body(resp, worker_ptr_to_offset(ctx, arena_body) as u32, p as u32)
+    response_slot_set_flags(resp, RESP_FLAG_COMPLETE)
+
+    return 0
+
+
+fn handle_health(ctx: *WorkerContext, req: *RequestSlot, resp: *ResponseSlot) -> i32
+    let body_text: *u8 = c"OK"
+    let body_len: i32 = 2
+
+    var headers: [256]u8
+    let headers_len: i32 = build_headers(@headers[0], 200, c"text/plain", body_len)
+
+    let arena_headers: *u8 = worker_alloc_response_data(ctx, headers_len as i64)
+    let arena_body: *u8 = worker_alloc_response_data(ctx, body_len as i64)
+
+    for i in 0..headers_len
+        *(arena_headers + i) = headers[i]
+    for i in 0..body_len
+        *(arena_body + i) = *(body_text + i)
+
+    response_slot_set_status(resp, 200)
+    response_slot_set_headers(resp, worker_ptr_to_offset(ctx, arena_headers) as u32, headers_len as u16)
+    response_slot_set_body(resp, worker_ptr_to_offset(ctx, arena_body) as u32, body_len as u32)
+    response_slot_set_flags(resp, RESP_FLAG_COMPLETE)
+
+    return 0
+
+
+fn handle_not_found(ctx: *WorkerContext, req: *RequestSlot, resp: *ResponseSlot) -> i32
+    let body_text: *u8 = c"404 Not Found"
+    let body_len: i32 = 13
+
+    var headers: [256]u8
+    let headers_len: i32 = build_headers(@headers[0], 404, c"text/plain", body_len)
+
+    let arena_headers: *u8 = worker_alloc_response_data(ctx, headers_len as i64)
+    let arena_body: *u8 = worker_alloc_response_data(ctx, body_len as i64)
+
+    for i in 0..headers_len
+        *(arena_headers + i) = headers[i]
+    for i in 0..body_len
+        *(arena_body + i) = *(body_text + i)
+
+    response_slot_set_status(resp, 404)
+    response_slot_set_headers(resp, worker_ptr_to_offset(ctx, arena_headers) as u32, headers_len as u16)
+    response_slot_set_body(resp, worker_ptr_to_offset(ctx, arena_body) as u32, body_len as u32)
+    response_slot_set_flags(resp, RESP_FLAG_COMPLETE)
+
+    return 0
+
+
+fn handle_wiki_new(ctx: *WorkerContext, req: *RequestSlot, resp: *ResponseSlot) -> i32
+    var body: [4096]u8
+    var p: i32 = 0
+
+    p = write_html_head(@body[0], p, c"New Page - Nexus Wiki")
+    p = write_cstr(@body[0], p, c"<nav class=\"nav\"><a href=\"/\">&larr; Home</a></nav>")
+    p = write_cstr(@body[0], p, c"<h1>New Page</h1>")
+    p = write_cstr(@body[0], p, c"<form method=\"POST\" action=\"/wiki\">")
+    p = write_cstr(@body[0], p, c"<p><label>Slug (URL-friendly name):</label></p>")
+    p = write_cstr(@body[0], p, c"<input type=\"text\" name=\"slug\" placeholder=\"my-page-name\" required pattern=\"[a-z0-9-]+\">")
+    p = write_cstr(@body[0], p, c"<p><label>Content:</label></p>")
+    p = write_cstr(@body[0], p, c"<textarea name=\"content\" placeholder=\"Enter your page content here...\"></textarea>")
+    p = write_cstr(@body[0], p, c"<p><button type=\"submit\">Create Page</button></p>")
+    p = write_cstr(@body[0], p, c"</form>")
+    p = write_html_footer(@body[0], p)
+
+    var headers: [256]u8
+    let headers_len: i32 = build_headers(@headers[0], 200, c"text/html; charset=utf-8", p)
+
+    let arena_headers: *u8 = worker_alloc_response_data(ctx, headers_len as i64)
+    let arena_body: *u8 = worker_alloc_response_data(ctx, p as i64)
+
+    for i in 0..headers_len
+        *(arena_headers + i) = headers[i]
+    for i in 0..p
+        *(arena_body + i) = body[i]
+
+    response_slot_set_status(resp, 200)
+    response_slot_set_headers(resp, worker_ptr_to_offset(ctx, arena_headers) as u32, headers_len as u16)
+    response_slot_set_body(resp, worker_ptr_to_offset(ctx, arena_body) as u32, p as u32)
+    response_slot_set_flags(resp, RESP_FLAG_COMPLETE)
+
+    return 0
+
+
+# ============================================================================
+# Router
+# ============================================================================
+
+fn route_request(ctx: *WorkerContext, req: *RequestSlot, resp: *ResponseSlot) -> i32
+    let path: *u8 = worker_get_request_path(ctx, req)
+    let path_len: i32 = req.path_len as i32
+    let method: u8 = req.method
+
+    # GET /
+    if method == HTTP_METHOD_GET and path_len == 1 and *path == 47
+        return handle_index(ctx, req, resp)
+
+    # GET /health
+    if method == HTTP_METHOD_GET and path_starts_with(path, path_len, c"/health") != 0
+        return handle_health(ctx, req, resp)
+
+    # GET /wiki/new
+    if method == HTTP_METHOD_GET and path_starts_with(path, path_len, c"/wiki/new") != 0
+        return handle_wiki_new(ctx, req, resp)
+
+    # TODO: Add more handlers as needed
+
+    return handle_not_found(ctx, req, resp)
+
+
+# ============================================================================
+# Argument Parsing
+# ============================================================================
+
+fn parse_i64(s: *u8) -> i64
+    var result: i64 = 0
+    var i: i32 = 0
+    while *(s + i) != 0
+        let c: u8 = *(s + i)
+        if c >= 48 and c <= 57
+            result = result * 10 + (c - 48) as i64
+        else
+            break
+        i += 1
+    return result
+
+
+fn parse_i32(s: *u8) -> i32
+    return parse_i64(s) as i32
+
+
+# ============================================================================
+# Main - Zeus Worker Entry Point
+# ============================================================================
+
+pub fn main(argc: i32, argv: **u8) -> i32
+    prints_cstr(c"Nexus Wiki Worker starting...\n")
+
+    # Expect: nexus <shm_size> <worker_id>
+    if argc < 3
+        prints_cstr(c"Usage: nexus <shm_size> <worker_id>\n")
+        prints_cstr(c"  (This binary is spawned by Zeus daemon)\n")
         return 1
 
-    # Set SO_REUSEADDR
-    set_reuseaddr(sock)
+    let shm_size: i64 = parse_i64(*(argv + 1))
+    let worker_id: i32 = parse_i32(*(argv + 2))
 
-    # Bind to 0.0.0.0:8080
-    let bind_result = tcp_bind(sock, 0, 8080)
-    if bind_result < 0
-        print("Failed to bind\n")
-        sys_close(sock)
+    prints_cstr(c"  Worker ID: ")
+    print_int(worker_id as i64)
+    prints_cstr(c"\n  SHM Size: ")
+    print_int(shm_size)
+    prints_cstr(c" bytes\n")
+
+    # Initialize store (connects to mausoleum)
+    store_init()
+    store_seed()
+    prints_cstr(c"  Store initialized with ")
+    print_int(store_count() as i64)
+    prints_cstr(c" pages\n")
+
+    # Initialize zeus worker context
+    var ctx: WorkerContext
+    let init_result: i32 = worker_init(@ctx, SHM_FD, shm_size)
+    if init_result != 0
+        prints_cstr(c"Failed to initialize worker context\n")
         return 1
 
-    # Listen
-    let listen_result = tcp_listen(sock, 128)
-    if listen_result < 0
-        print("Failed to listen\n")
-        sys_close(sock)
-        return 1
+    prints_cstr(c"  Worker attached to shared memory\n")
+    prints_cstr(c"  Ready to process requests\n\n")
 
-    print("Listening on http://0.0.0.0:8080\n")
+    worker_set_running(@ctx)
 
-    # Accept loop
-    loop
-        let client = tcp_accept(sock)
-        if client < 0
-            continue
+    # Main request loop
+    var running: i32 = 1
+    while running != 0
+        let req: *RequestSlot = worker_poll_request(@ctx)
 
-        # Read request
-        var buf: [4096]u8
-        let n = sys_read(client, @buf[0], 4096)
-        if n > 0
-            # Simple routing based on first few bytes
-            # GET / HTTP/1.1
-            # GET /health HTTP/1.1
-            if n >= 5 and buf[0] == 'G' as u8 and buf[1] == 'E' as u8 and buf[2] == 'T' as u8
-                if buf[4] == '/' as u8 and buf[5] == ' ' as u8
-                    # Root path
-                    send_index(client)
-                else if buf[4] == '/' as u8 and buf[5] == 'h' as u8 and buf[6] == 'e' as u8
-                    # /health
-                    send_health(client)
-                else
-                    send_not_found(client)
-            else
-                send_not_found(client)
+        if req != null
+            worker_set_busy(@ctx)
 
-        sys_close(client)
+            # Route and handle request
+            let resp: *ResponseSlot = worker_begin_response(@ctx, req.id)
+            if resp != null
+                route_request(@ctx, req, resp)
+                worker_commit_response(@ctx)
 
-    0
+            worker_ack_request(@ctx)
+            worker_set_running(@ctx)
+        else
+            # No request - sleep briefly
+            var ts: [2]i64
+            ts[0] = 0       # seconds
+            ts[1] = 1000000 # nanoseconds (1ms)
+            sys_nanosleep(@ts[0], null)
 
+    worker_destroy(@ctx)
+    store_close()
+    prints_cstr(c"Worker shutting down\n")
 
-fn send_health(fd: i32)
-    fd_write(fd, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK")
-
-
-fn send_not_found(fd: i32)
-    fd_write(fd, "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found")
-
-
-fn send_index(fd: i32)
-    fd_write(fd, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 180\r\nConnection: close\r\n\r\n<!DOCTYPE html><html><head><title>Nexus</title></head><body><h1>Nexus</h1><p>The Ritz Knowledge Base</p><p>Status: Running</p><ul><li>/health - Health check</li></ul></body></html>")
+    return 0
