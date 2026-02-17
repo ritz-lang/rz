@@ -10,7 +10,7 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
 DEPLOY_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 TERRAFORM_DIR="$DEPLOY_DIR/terraform"
 SYSTEMD_DIR="$DEPLOY_DIR/systemd"
@@ -113,9 +113,11 @@ provision() {
     if [[ -f "$PROJECT_ROOT/projects/mausoleum/build/release/mausoleum" ]]; then
         MAUSOLEUM_BIN="$PROJECT_ROOT/projects/mausoleum/build/release/mausoleum"
         NEXUS_BIN="$PROJECT_ROOT/projects/nexus/build/release/nexus"
+        ZEUS_BIN="$PROJECT_ROOT/projects/zeus/build/release/zeus"
     else
         MAUSOLEUM_BIN="$PROJECT_ROOT/projects/mausoleum/build/debug/mausoleum"
         NEXUS_BIN="$PROJECT_ROOT/projects/nexus/build/debug/nexus"
+        ZEUS_BIN="$PROJECT_ROOT/projects/zeus/build/debug/zeus"
     fi
 
     SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
@@ -140,6 +142,7 @@ provision() {
     log "Copying binaries..."
     $SCP "$MAUSOLEUM_BIN" ubuntu@"$IP":/opt/ritz/bin/mausoleum
     $SCP "$NEXUS_BIN" ubuntu@"$IP":/opt/ritz/bin/nexus
+    $SCP "$ZEUS_BIN" ubuntu@"$IP":/opt/ritz/bin/zeus
     $SSH "chmod +x /opt/ritz/bin/*"
 
     # Copy systemd services
