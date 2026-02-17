@@ -1,9 +1,12 @@
 # BlobStore - Content Storage Backend
 #
-# BlobStore is the trait for storing and retrieving content blobs.
-# Implementations: MemoryBlobStore (G1), DiskBlobStore (G2)
+# BlobStore provides a polymorphic interface for blob storage.
+# Implementations: MemoryBlobStore (in-memory), VirtIOBlobStore (persistent)
+#
+# Uses vtable pattern since traits aren't fully implemented yet.
 
 import ritzlib.sys { sys_mmap, sys_munmap, PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANONYMOUS }
+import ritzlib.span { Span, span_from_ptr, span_empty }
 import blob_id { BlobId, blob_id_eq, blob_id_zero, blob_id_is_zero, blob_id_compute, blob_id_copy }
 import error { Error, ErrorCode, error_new }
 
@@ -13,6 +16,66 @@ pub const BLOB_MAX_SIZE: u64 = 1073741824
 # Initial capacity for memory store
 const INITIAL_CAPACITY: i32 = 64
 
+# ============================================================================
+# BlobStore Interface (vtable pattern)
+# ============================================================================
+
+# Function pointer types for BlobStore operations
+# Note: self is *u8 to allow different implementations
+
+# BlobStoreOps - vtable of operations
+pub struct BlobStoreOps
+    exists_fn: fn(*u8, *BlobId) -> bool
+    get_fn: fn(*u8, *BlobId) -> Span<u8>
+    get_size_fn: fn(*u8, *BlobId) -> u64
+    put_fn: fn(*u8, *u8, u64) -> BlobId
+    delete_fn: fn(*u8, *BlobId) -> bool
+    count_fn: fn(*u8) -> i32
+    total_size_fn: fn(*u8) -> u64
+    free_fn: fn(*u8) -> i32
+
+# BlobStore - polymorphic wrapper
+pub struct BlobStore
+    data: *u8           # Pointer to concrete implementation
+    ops: *BlobStoreOps  # Vtable pointer
+
+# Polymorphic interface functions
+pub fn store_exists(store: *BlobStore, id: *BlobId) -> bool
+    let fn_ptr: fn(*u8, *BlobId) -> bool = (*(*store).ops).exists_fn
+    fn_ptr((*store).data, id)
+
+pub fn store_get(store: *BlobStore, id: *BlobId) -> Span<u8>
+    let fn_ptr: fn(*u8, *BlobId) -> Span<u8> = (*(*store).ops).get_fn
+    fn_ptr((*store).data, id)
+
+pub fn store_get_size(store: *BlobStore, id: *BlobId) -> u64
+    let fn_ptr: fn(*u8, *BlobId) -> u64 = (*(*store).ops).get_size_fn
+    fn_ptr((*store).data, id)
+
+pub fn store_put(store: *BlobStore, data: *u8, size: u64) -> BlobId
+    let fn_ptr: fn(*u8, *u8, u64) -> BlobId = (*(*store).ops).put_fn
+    fn_ptr((*store).data, data, size)
+
+pub fn store_delete(store: *BlobStore, id: *BlobId) -> bool
+    let fn_ptr: fn(*u8, *BlobId) -> bool = (*(*store).ops).delete_fn
+    fn_ptr((*store).data, id)
+
+pub fn store_count(store: *BlobStore) -> i32
+    let fn_ptr: fn(*u8) -> i32 = (*(*store).ops).count_fn
+    fn_ptr((*store).data)
+
+pub fn store_total_size(store: *BlobStore) -> u64
+    let fn_ptr: fn(*u8) -> u64 = (*(*store).ops).total_size_fn
+    fn_ptr((*store).data)
+
+pub fn store_free(store: *BlobStore) -> i32
+    let fn_ptr: fn(*u8) -> i32 = (*(*store).ops).free_fn
+    fn_ptr((*store).data)
+
+# ============================================================================
+# MemoryBlobStore Implementation
+# ============================================================================
+
 # A stored blob entry
 struct BlobEntry
     id: BlobId
@@ -21,13 +84,25 @@ struct BlobEntry
     used: bool
 
 # In-memory blob store
-# Uses a simple linear array for now
-# TODO: Replace with HashMap when available in ritzlib
 pub struct MemoryBlobStore
     entries: *BlobEntry
     capacity: i32
     count: i32
     total_size: u64
+
+# MemoryBlobStore vtable (static, allocated once)
+var memory_store_ops: BlobStoreOps
+
+# Initialize the memory store vtable (call once at startup)
+pub fn memory_store_init_ops()
+    memory_store_ops.exists_fn = memory_store_exists_impl
+    memory_store_ops.get_fn = memory_store_get_impl
+    memory_store_ops.get_size_fn = memory_store_get_size_impl
+    memory_store_ops.put_fn = memory_store_put_impl
+    memory_store_ops.delete_fn = memory_store_delete_impl
+    memory_store_ops.count_fn = memory_store_count_impl
+    memory_store_ops.total_size_fn = memory_store_total_size_impl
+    memory_store_ops.free_fn = memory_store_free_impl
 
 # Create a new empty memory blob store
 pub fn memory_store_new() -> MemoryBlobStore
@@ -54,6 +129,13 @@ pub fn memory_store_new() -> MemoryBlobStore
         total_size: 0
     }
 
+# Create a polymorphic BlobStore from a MemoryBlobStore
+pub fn memory_store_as_store(store: *MemoryBlobStore) -> BlobStore
+    BlobStore {
+        data: store as *u8,
+        ops: @memory_store_ops
+    }
+
 # Find an entry by BlobId
 fn store_find(store: *MemoryBlobStore, id: *BlobId) -> *BlobEntry
     var i: i32 = 0
@@ -64,35 +146,35 @@ fn store_find(store: *MemoryBlobStore, id: *BlobId) -> *BlobEntry
         i = i + 1
     0 as *BlobEntry
 
-# Check if a blob exists
-pub fn memory_store_exists(store: *MemoryBlobStore, id: *BlobId) -> bool
+# Implementation functions (take *u8 for vtable compatibility)
+
+fn memory_store_exists_impl(self: *u8, id: *BlobId) -> bool
+    let store: *MemoryBlobStore = self as *MemoryBlobStore
     let entry: *BlobEntry = store_find(store, id)
     entry != 0 as *BlobEntry
 
-# Get a blob's data
-# Returns null if not found
-pub fn memory_store_get(store: *MemoryBlobStore, id: *BlobId) -> *u8
+fn memory_store_get_impl(self: *u8, id: *BlobId) -> Span<u8>
+    let store: *MemoryBlobStore = self as *MemoryBlobStore
     let entry: *BlobEntry = store_find(store, id)
     if entry == 0 as *BlobEntry
-        return 0 as *u8
-    (*entry).data
+        return span_empty<u8>()
+    span_from_ptr<u8>((*entry).data, (*entry).size as i64)
 
-# Get a blob's size
-# Returns 0 if not found
-pub fn memory_store_get_size(store: *MemoryBlobStore, id: *BlobId) -> u64
+fn memory_store_get_size_impl(self: *u8, id: *BlobId) -> u64
+    let store: *MemoryBlobStore = self as *MemoryBlobStore
     let entry: *BlobEntry = store_find(store, id)
     if entry == 0 as *BlobEntry
         return 0
     (*entry).size
 
-# Store a blob, returns its BlobId
-# If blob already exists, returns existing ID (deduplication)
-pub fn memory_store_put(store: *MemoryBlobStore, data: *u8, size: u64) -> BlobId
+fn memory_store_put_impl(self: *u8, data: *u8, size: u64) -> BlobId
+    let store: *MemoryBlobStore = self as *MemoryBlobStore
+
     # Compute content hash
     var id: BlobId = blob_id_compute(data, size)
 
     # Check if already exists (deduplication)
-    if memory_store_exists(store, @id)
+    if memory_store_exists_impl(self, @id)
         return blob_id_copy(@id)
 
     # Find a free slot
@@ -132,8 +214,8 @@ pub fn memory_store_put(store: *MemoryBlobStore, data: *u8, size: u64) -> BlobId
 
     blob_id_copy(@id)
 
-# Delete a blob
-pub fn memory_store_delete(store: *MemoryBlobStore, id: *BlobId) -> bool
+fn memory_store_delete_impl(self: *u8, id: *BlobId) -> bool
+    let store: *MemoryBlobStore = self as *MemoryBlobStore
     let entry: *BlobEntry = store_find(store, id)
     if entry == 0 as *BlobEntry
         return false
@@ -148,16 +230,17 @@ pub fn memory_store_delete(store: *MemoryBlobStore, id: *BlobId) -> bool
 
     true
 
-# Get total number of blobs
-pub fn memory_store_count(store: *MemoryBlobStore) -> i32
+fn memory_store_count_impl(self: *u8) -> i32
+    let store: *MemoryBlobStore = self as *MemoryBlobStore
     (*store).count
 
-# Get total size of all blobs
-pub fn memory_store_total_size(store: *MemoryBlobStore) -> u64
+fn memory_store_total_size_impl(self: *u8) -> u64
+    let store: *MemoryBlobStore = self as *MemoryBlobStore
     (*store).total_size
 
-# Free the blob store
-pub fn memory_store_free(store: *MemoryBlobStore)
+fn memory_store_free_impl(self: *u8) -> i32
+    let store: *MemoryBlobStore = self as *MemoryBlobStore
+
     # Free all blob data
     var i: i32 = 0
     while i < (*store).capacity
@@ -174,3 +257,41 @@ pub fn memory_store_free(store: *MemoryBlobStore)
     (*store).capacity = 0
     (*store).count = 0
     (*store).total_size = 0
+    0
+
+# ============================================================================
+# Legacy API (for backwards compatibility)
+# ============================================================================
+
+# Check if a blob exists
+pub fn memory_store_exists(store: *MemoryBlobStore, id: *BlobId) -> bool
+    memory_store_exists_impl(store as *u8, id)
+
+# Get a blob's data (returns raw pointer for legacy compatibility)
+pub fn memory_store_get(store: *MemoryBlobStore, id: *BlobId) -> *u8
+    let span: Span<u8> = memory_store_get_impl(store as *u8, id)
+    span.ptr
+
+# Get a blob's size
+pub fn memory_store_get_size(store: *MemoryBlobStore, id: *BlobId) -> u64
+    memory_store_get_size_impl(store as *u8, id)
+
+# Store a blob, returns its BlobId
+pub fn memory_store_put(store: *MemoryBlobStore, data: *u8, size: u64) -> BlobId
+    memory_store_put_impl(store as *u8, data, size)
+
+# Delete a blob
+pub fn memory_store_delete(store: *MemoryBlobStore, id: *BlobId) -> bool
+    memory_store_delete_impl(store as *u8, id)
+
+# Get total number of blobs
+pub fn memory_store_count(store: *MemoryBlobStore) -> i32
+    memory_store_count_impl(store as *u8)
+
+# Get total size of all blobs
+pub fn memory_store_total_size(store: *MemoryBlobStore) -> u64
+    memory_store_total_size_impl(store as *u8)
+
+# Free the blob store
+pub fn memory_store_free(store: *MemoryBlobStore) -> i32
+    memory_store_free_impl(store as *u8)

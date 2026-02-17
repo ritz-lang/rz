@@ -1,0 +1,391 @@
+# VirtIOBlobStore - Persistent Blob Storage via VirtIO Block Device
+#
+# Implements the BlobStore interface using Harland's VirtIO block driver
+# for persistent storage. Blobs survive kernel reboots.
+#
+# Disk Layout:
+# ┌──────────────────────────────────────────────────────────────┐
+# │ Superblock (LBA 0, 512 bytes)                                │
+# │   magic: u64 = 0x474F4C49415448   # "GOLIATH"                │
+# │   version: u32 = 1                                           │
+# │   block_size: u32 = 512                                      │
+# │   total_blocks: u64                                          │
+# │   free_blocks: u64                                           │
+# │   blob_count: u32                                            │
+# │   index_lba: u64                  # Where blob index starts  │
+# │   data_lba: u64                   # Where data region starts │
+# ├──────────────────────────────────────────────────────────────┤
+# │ Blob Index (LBA 1 to index_end)                              │
+# │   Array of IndexEntry: { blob_id, lba, size, used }          │
+# ├──────────────────────────────────────────────────────────────┤
+# │ Free Block Bitmap (after index)                              │
+# │   1 bit per block (0 = free, 1 = used)                       │
+# ├──────────────────────────────────────────────────────────────┤
+# │ Data Region (rest of disk)                                   │
+# │   Blobs stored contiguously, 512-byte aligned                │
+# └──────────────────────────────────────────────────────────────┘
+
+import ritzlib.sys { sys_mmap, sys_munmap, PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANONYMOUS }
+import ritzlib.span { Span, span_from_ptr, span_empty }
+import blob_id { BlobId, blob_id_eq, blob_id_zero, blob_id_is_zero, blob_id_compute, blob_id_copy }
+import blob_store { BlobStore, BlobStoreOps }
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+# Magic number: "GOLIATH\0" as u64 little-endian
+pub const GOLIATH_MAGIC: u64 = 0x0048544149494C4F  # "OLIATH\0\0" - adjust as needed
+pub const GOLIATH_VERSION: u32 = 1
+pub const SECTOR_SIZE: u32 = 512
+
+# Maximum blobs supported (fits in ~128KB of index)
+pub const MAX_BLOBS: i32 = 2048
+
+# ============================================================================
+# On-Disk Structures
+# ============================================================================
+
+# Superblock - stored at LBA 0
+pub struct Superblock
+    magic: u64              # Must be GOLIATH_MAGIC
+    version: u32            # Format version
+    block_size: u32         # Always 512 for now
+    total_sectors: u64      # Total sectors on disk
+    free_sectors: u64       # Free sectors remaining
+    blob_count: u32         # Number of stored blobs
+    _padding1: u32
+    index_lba: u64          # LBA where index starts
+    data_lba: u64           # LBA where data region starts
+    # Pad to 512 bytes
+    _reserved: [456]u8
+
+# Index entry - 64 bytes each (8 entries per sector)
+pub struct IndexEntry
+    id: BlobId              # 32 bytes - content hash
+    lba: u64                # Starting sector of blob data
+    size: u64               # Size in bytes
+    sectors: u32            # Number of sectors used
+    used: u8                # 1 if entry is in use, 0 if free
+    _padding: [3]u8
+    _reserved: [8]u8        # Pad to 64 bytes
+
+# ============================================================================
+# VirtIOBlobStore Structure
+# ============================================================================
+
+# Note: This store is designed to work with Harland's VirtIO block driver.
+# For now, we define the interface - actual VirtIO calls will be added
+# when integrated into Harland.
+
+pub struct VirtIOBlobStore
+    # Device handle (opaque pointer to VirtioBlkDevice)
+    device: *u8
+
+    # Cached superblock (loaded at init)
+    superblock: Superblock
+
+    # In-memory index cache
+    index: *IndexEntry
+    index_capacity: i32
+
+    # Read/write function pointers (set by Harland)
+    read_fn: fn(*u8, u64, u32, *u8) -> i32   # (dev, sector, count, buf) -> result
+    write_fn: fn(*u8, u64, u32, *u8) -> i32  # (dev, sector, count, buf) -> result
+
+    # Statistics
+    count: i32
+    total_size: u64
+
+# ============================================================================
+# VirtIOBlobStore vtable
+# ============================================================================
+
+var virtio_store_ops: BlobStoreOps
+
+pub fn virtio_store_init_ops()
+    virtio_store_ops.exists_fn = virtio_store_exists_impl
+    virtio_store_ops.get_fn = virtio_store_get_impl
+    virtio_store_ops.get_size_fn = virtio_store_get_size_impl
+    virtio_store_ops.put_fn = virtio_store_put_impl
+    virtio_store_ops.delete_fn = virtio_store_delete_impl
+    virtio_store_ops.count_fn = virtio_store_count_impl
+    virtio_store_ops.total_size_fn = virtio_store_total_size_impl
+    virtio_store_ops.free_fn = virtio_store_free_impl
+
+# ============================================================================
+# Constructor
+# ============================================================================
+
+# Create a new VirtIOBlobStore
+# device: pointer to VirtioBlkDevice from Harland
+# read_fn: function to read sectors
+# write_fn: function to write sectors
+# Returns: initialized store, or store with device=0 on failure
+pub fn virtio_store_new(
+    device: *u8,
+    read_fn: fn(*u8, u64, u32, *u8) -> i32,
+    write_fn: fn(*u8, u64, u32, *u8) -> i32
+) -> VirtIOBlobStore
+    var store: VirtIOBlobStore
+
+    store.device = device
+    store.read_fn = read_fn
+    store.write_fn = write_fn
+    store.count = 0
+    store.total_size = 0
+
+    # Allocate index cache
+    let index_size: i64 = (64 * MAX_BLOBS) as i64  # 64 bytes per entry
+    let prot: i32 = PROT_READ + PROT_WRITE
+    let flags: i32 = MAP_PRIVATE + MAP_ANONYMOUS
+    store.index = sys_mmap(0, index_size, prot, flags, -1, 0) as *IndexEntry
+    store.index_capacity = MAX_BLOBS
+
+    # Initialize all index entries as unused
+    var i: i32 = 0
+    while i < MAX_BLOBS
+        let entry: *IndexEntry = store.index + i
+        (*entry).used = 0
+        i = i + 1
+
+    # Try to read existing superblock
+    var sector_buf: [512]u8
+    let result: i32 = read_fn(device, 0, 1, @sector_buf[0])
+
+    if result == 0
+        # Check magic number
+        let sb: *Superblock = @sector_buf[0] as *Superblock
+        if (*sb).magic == GOLIATH_MAGIC and (*sb).version == GOLIATH_VERSION
+            # Valid filesystem - load it
+            store.superblock = *sb
+            # TODO: Load index from disk
+            # For now, scan would happen here
+        else
+            # No valid filesystem - format it
+            virtio_store_format(@store)
+    else
+        # Read failed - mark device as invalid
+        store.device = 0 as *u8
+
+    store
+
+# Format the disk with a new Goliath filesystem
+fn virtio_store_format(store: *VirtIOBlobStore) -> i32
+    # Initialize superblock
+    (*store).superblock.magic = GOLIATH_MAGIC
+    (*store).superblock.version = GOLIATH_VERSION
+    (*store).superblock.block_size = SECTOR_SIZE
+    # TODO: Get actual capacity from device
+    (*store).superblock.total_sectors = 1024 * 1024  # 512MB default
+    (*store).superblock.free_sectors = (*store).superblock.total_sectors - 256  # Reserve for index
+    (*store).superblock.blob_count = 0
+    (*store).superblock.index_lba = 1  # Index starts at sector 1
+    (*store).superblock.data_lba = 256  # Data starts at sector 256
+
+    # Write superblock to disk
+    let write_fn: fn(*u8, u64, u32, *u8) -> i32 = (*store).write_fn
+    let result: i32 = write_fn((*store).device, 0, 1, @(*store).superblock as *u8)
+
+    if result != 0
+        return -1
+
+    # Clear index region
+    var zero_sector: [512]u8
+    var i: i32 = 0
+    while i < 512
+        zero_sector[i] = 0
+        i = i + 1
+
+    # Write zeroes to index region (sectors 1-255)
+    var lba: u64 = 1
+    while lba < 256
+        let r: i32 = write_fn((*store).device, lba, 1, @zero_sector[0])
+        if r != 0
+            return -2
+        lba = lba + 1
+
+    0
+
+# Create polymorphic BlobStore from VirtIOBlobStore
+pub fn virtio_store_as_store(store: *VirtIOBlobStore) -> BlobStore
+    BlobStore {
+        data: store as *u8,
+        ops: @virtio_store_ops
+    }
+
+# ============================================================================
+# Implementation Functions
+# ============================================================================
+
+fn virtio_store_find(store: *VirtIOBlobStore, id: *BlobId) -> *IndexEntry
+    var i: i32 = 0
+    while i < (*store).index_capacity
+        let entry: *IndexEntry = (*store).index + i
+        if (*entry).used == 1 and blob_id_eq(@(*entry).id, id)
+            return entry
+        i = i + 1
+    0 as *IndexEntry
+
+fn virtio_store_exists_impl(self: *u8, id: *BlobId) -> bool
+    let store: *VirtIOBlobStore = self as *VirtIOBlobStore
+    let entry: *IndexEntry = virtio_store_find(store, id)
+    entry != 0 as *IndexEntry
+
+fn virtio_store_get_impl(self: *u8, id: *BlobId) -> Span<u8>
+    let store: *VirtIOBlobStore = self as *VirtIOBlobStore
+    let entry: *IndexEntry = virtio_store_find(store, id)
+
+    if entry == 0 as *IndexEntry
+        return span_empty<u8>()
+
+    # Allocate buffer for blob data
+    let size: u64 = (*entry).size
+    let prot: i32 = PROT_READ + PROT_WRITE
+    let flags: i32 = MAP_PRIVATE + MAP_ANONYMOUS
+    let buf: *u8 = sys_mmap(0, size as i64, prot, flags, -1, 0)
+
+    # Read sectors from disk
+    let read_fn: fn(*u8, u64, u32, *u8) -> i32 = (*store).read_fn
+    let sectors: u32 = (*entry).sectors
+    let result: i32 = read_fn((*store).device, (*entry).lba, sectors, buf)
+
+    if result != 0
+        sys_munmap(buf, size as i64)
+        return span_empty<u8>()
+
+    span_from_ptr<u8>(buf, size as i64)
+
+fn virtio_store_get_size_impl(self: *u8, id: *BlobId) -> u64
+    let store: *VirtIOBlobStore = self as *VirtIOBlobStore
+    let entry: *IndexEntry = virtio_store_find(store, id)
+    if entry == 0 as *IndexEntry
+        return 0
+    (*entry).size
+
+fn virtio_store_put_impl(self: *u8, data: *u8, size: u64) -> BlobId
+    let store: *VirtIOBlobStore = self as *VirtIOBlobStore
+
+    # Compute content hash
+    var id: BlobId = blob_id_compute(data, size)
+
+    # Check if already exists (deduplication)
+    if virtio_store_exists_impl(self, @id)
+        return blob_id_copy(@id)
+
+    # Find free index slot
+    var slot: *IndexEntry = 0 as *IndexEntry
+    var i: i32 = 0
+    while i < (*store).index_capacity
+        let entry: *IndexEntry = (*store).index + i
+        if (*entry).used == 0
+            slot = entry
+            break
+        i = i + 1
+
+    if slot == 0 as *IndexEntry
+        # No free slots
+        return blob_id_zero()
+
+    # Calculate sectors needed
+    let sectors: u32 = ((size + 511) / 512) as u32
+
+    # Find free space in data region
+    # TODO: Proper free block management
+    # For now, simple append-only allocation
+    let data_lba: u64 = (*store).superblock.data_lba + (*store).total_size / 512
+
+    # Write data to disk
+    # Need to write full sectors, pad if necessary
+    let write_fn: fn(*u8, u64, u32, *u8) -> i32 = (*store).write_fn
+
+    # If data isn't sector-aligned, we need a temp buffer
+    if size % 512 != 0
+        # Allocate padded buffer
+        let padded_size: u64 = (sectors as u64) * 512
+        let prot: i32 = PROT_READ + PROT_WRITE
+        let flags: i32 = MAP_PRIVATE + MAP_ANONYMOUS
+        let buf: *u8 = sys_mmap(0, padded_size as i64, prot, flags, -1, 0)
+
+        # Copy data
+        var j: u64 = 0
+        while j < size
+            *(buf + j) = *(data + j)
+            j = j + 1
+
+        # Zero padding
+        while j < padded_size
+            *(buf + j) = 0
+            j = j + 1
+
+        # Write
+        let result: i32 = write_fn((*store).device, data_lba, sectors, buf)
+        sys_munmap(buf, padded_size as i64)
+
+        if result != 0
+            return blob_id_zero()
+    else
+        # Data is already aligned
+        let result: i32 = write_fn((*store).device, data_lba, sectors, data)
+        if result != 0
+            return blob_id_zero()
+
+    # Update index entry
+    (*slot).id = blob_id_copy(@id)
+    (*slot).lba = data_lba
+    (*slot).size = size
+    (*slot).sectors = sectors
+    (*slot).used = 1
+
+    # Update stats
+    (*store).count = (*store).count + 1
+    (*store).total_size = (*store).total_size + (sectors as u64) * 512
+    (*store).superblock.blob_count = (*store).count as u32
+    (*store).superblock.free_sectors = (*store).superblock.free_sectors - sectors as u64
+
+    # TODO: Write updated index entry and superblock to disk
+
+    blob_id_copy(@id)
+
+fn virtio_store_delete_impl(self: *u8, id: *BlobId) -> bool
+    let store: *VirtIOBlobStore = self as *VirtIOBlobStore
+    let entry: *IndexEntry = virtio_store_find(store, id)
+
+    if entry == 0 as *IndexEntry
+        return false
+
+    # Mark as unused (tombstone - space not reclaimed until compaction)
+    let sectors: u64 = (*entry).sectors as u64
+    (*entry).used = 0
+
+    # Update stats
+    (*store).count = (*store).count - 1
+    (*store).superblock.blob_count = (*store).count as u32
+    (*store).superblock.free_sectors = (*store).superblock.free_sectors + sectors
+
+    # TODO: Write updated index to disk
+
+    true
+
+fn virtio_store_count_impl(self: *u8) -> i32
+    let store: *VirtIOBlobStore = self as *VirtIOBlobStore
+    (*store).count
+
+fn virtio_store_total_size_impl(self: *u8) -> u64
+    let store: *VirtIOBlobStore = self as *VirtIOBlobStore
+    (*store).total_size
+
+fn virtio_store_free_impl(self: *u8) -> i32
+    let store: *VirtIOBlobStore = self as *VirtIOBlobStore
+
+    # Write final superblock to disk
+    let write_fn: fn(*u8, u64, u32, *u8) -> i32 = (*store).write_fn
+    write_fn((*store).device, 0, 1, @(*store).superblock as *u8)
+
+    # Free index cache
+    let index_size: i64 = (64 * MAX_BLOBS) as i64
+    sys_munmap((*store).index as *u8, index_size)
+
+    (*store).device = 0 as *u8
+    (*store).index = 0 as *IndexEntry
+    0
