@@ -1,0 +1,268 @@
+# net/ip.ritz - Internet Protocol version 4 (Layer 3)
+#
+# Handles IPv4 packet construction, parsing, and network configuration.
+
+import serial { prints, serial_print_dec }
+import net.types { IP_PROTO_ICMP, IP_PROTO_UDP, IP_PROTO_TCP, IP_HEADER_SIZE, IP_DEFAULT_TTL }
+import net.arp { arp_set_our_ip }
+
+# ============================================================================
+# IPv4 Header Structure
+# ============================================================================
+
+pub struct IpHeader
+    version_ihl: u8     # Version (4 bits) + IHL (4 bits)
+    tos: u8             # Type of service
+    total_len: u16      # Total length (big-endian)
+    id: u16             # Identification
+    flags_frag: u16     # Flags + Fragment offset
+    ttl: u8             # Time to live
+    protocol: u8        # Protocol (ICMP=1, UDP=17, TCP=6)
+    checksum: u16       # Header checksum
+    src_ip: [4]u8
+    dst_ip: [4]u8
+
+# ============================================================================
+# Network Configuration
+# ============================================================================
+
+var ip_our_addr: [4]u8
+var ip_gateway: [4]u8
+var ip_netmask: [4]u8
+var ip_dns: [4]u8
+var ip_configured: u8 = 0
+var ip_packet_id: u16 = 1
+
+# ============================================================================
+# Initialization
+# ============================================================================
+
+pub fn ip_init()
+    var i: i32 = 0
+    while i < 4
+        ip_our_addr[i] = 0
+        ip_gateway[i] = 0
+        ip_netmask[i] = 0
+        ip_dns[i] = 0
+        i = i + 1
+    ip_configured = 0
+    ip_packet_id = 1
+
+# ============================================================================
+# Configuration
+# ============================================================================
+
+pub fn ip_set_config(ip: *u8, gateway: *u8, netmask: *u8)
+    var i: i32 = 0
+    while i < 4
+        ip_our_addr[i] = *(ip + i as i64)
+        ip_gateway[i] = *(gateway + i as i64)
+        ip_netmask[i] = *(netmask + i as i64)
+        i = i + 1
+    ip_configured = 1
+
+    # Tell ARP layer our IP so it can respond to requests
+    arp_set_our_ip(@ip_our_addr[0])
+
+pub fn ip_set_dns(dns: *u8)
+    var i: i32 = 0
+    while i < 4
+        ip_dns[i] = *(dns + i as i64)
+        i = i + 1
+
+pub fn ip_is_configured() -> bool
+    return ip_configured == 1
+
+pub fn ip_get_our_addr() -> *u8
+    return @ip_our_addr[0]
+
+pub fn ip_get_gateway() -> *u8
+    return @ip_gateway[0]
+
+pub fn ip_get_netmask() -> *u8
+    return @ip_netmask[0]
+
+pub fn ip_get_dns() -> *u8
+    return @ip_dns[0]
+
+# ============================================================================
+# Checksum Calculation
+# ============================================================================
+
+# Calculate IP/ICMP/UDP checksum (one's complement sum)
+pub fn ip_checksum(buf: *u8, len: u32) -> u16
+    var sum: u32 = 0
+    var i: u32 = 0
+
+    # Sum 16-bit words
+    while i < len
+        if i + 1 < len
+            let word: u32 = ((*(buf + i as i64) as u32) << 8) | (*(buf + i as i64 + 1) as u32)
+            sum = sum + word
+        else
+            sum = sum + ((*(buf + i as i64) as u32) << 8)
+        i = i + 2
+
+    # Fold 32-bit sum to 16 bits
+    while (sum >> 16) != 0
+        sum = (sum & 0xFFFF) + (sum >> 16)
+
+    return (sum ^ 0xFFFF) as u16
+
+# ============================================================================
+# Packet Construction
+# ============================================================================
+
+# Build IP header in buffer
+# Returns header size (always IP_HEADER_SIZE = 20)
+pub fn ip_build_header(buf: *u8, dst_ip: *u8, protocol: u8, payload_len: u32) -> u32
+    let total_len: u16 = (IP_HEADER_SIZE + payload_len) as u16
+
+    # Version=4, IHL=5 (20 bytes, no options)
+    *(buf + 0) = 0x45
+
+    # TOS (default)
+    *(buf + 1) = 0
+
+    # Total length (big-endian)
+    *(buf + 2) = ((total_len >> 8) & 0xFF) as u8
+    *(buf + 3) = (total_len & 0xFF) as u8
+
+    # Identification
+    *(buf + 4) = ((ip_packet_id >> 8) & 0xFF) as u8
+    *(buf + 5) = (ip_packet_id & 0xFF) as u8
+    ip_packet_id = ip_packet_id + 1
+
+    # Flags + Fragment offset (Don't fragment, no offset)
+    *(buf + 6) = 0x40
+    *(buf + 7) = 0
+
+    # TTL
+    *(buf + 8) = IP_DEFAULT_TTL
+
+    # Protocol
+    *(buf + 9) = protocol
+
+    # Checksum (will fill in after we set addresses)
+    *(buf + 10) = 0
+    *(buf + 11) = 0
+
+    # Source IP (our address)
+    var i: i32 = 0
+    while i < 4
+        *(buf + 12 + i as i64) = ip_our_addr[i]
+        i = i + 1
+
+    # Destination IP
+    i = 0
+    while i < 4
+        *(buf + 16 + i as i64) = *(dst_ip + i as i64)
+        i = i + 1
+
+    # Calculate and set checksum
+    let cksum: u16 = ip_checksum(buf, IP_HEADER_SIZE)
+    *(buf + 10) = ((cksum >> 8) & 0xFF) as u8
+    *(buf + 11) = (cksum & 0xFF) as u8
+
+    return IP_HEADER_SIZE
+
+# ============================================================================
+# Packet Parsing
+# ============================================================================
+
+# Parse IP header from buffer
+pub fn ip_parse_header(buf: *u8, header: *IpHeader)
+    (*header).version_ihl = *(buf + 0)
+    (*header).tos = *(buf + 1)
+    (*header).total_len = ((*(buf + 2) as u16) << 8) | (*(buf + 3) as u16)
+    (*header).id = ((*(buf + 4) as u16) << 8) | (*(buf + 5) as u16)
+    (*header).flags_frag = ((*(buf + 6) as u16) << 8) | (*(buf + 7) as u16)
+    (*header).ttl = *(buf + 8)
+    (*header).protocol = *(buf + 9)
+    (*header).checksum = ((*(buf + 10) as u16) << 8) | (*(buf + 11) as u16)
+
+    var i: i32 = 0
+    while i < 4
+        (*header).src_ip[i] = *(buf + 12 + i as i64)
+        (*header).dst_ip[i] = *(buf + 16 + i as i64)
+        i = i + 1
+
+# Get IP header length in bytes (from IHL field)
+pub fn ip_get_header_len(buf: *u8) -> u32
+    let ihl: u8 = *buf & 0x0F
+    return (ihl as u32) * 4
+
+# Get IP version (should be 4)
+pub fn ip_get_version(buf: *u8) -> u8
+    return (*buf >> 4) & 0x0F
+
+# Get protocol field
+pub fn ip_get_protocol(buf: *u8) -> u8
+    return *(buf + 9)
+
+# Get source IP pointer
+pub fn ip_get_src(buf: *u8) -> *u8
+    return buf + 12
+
+# Get destination IP pointer
+pub fn ip_get_dst(buf: *u8) -> *u8
+    return buf + 16
+
+# Get payload pointer (data after IP header)
+pub fn ip_get_payload(buf: *u8) -> *u8
+    let hdr_len: u32 = ip_get_header_len(buf)
+    return buf + hdr_len as i64
+
+# Get payload length
+pub fn ip_get_payload_len(buf: *u8) -> u32
+    let total_len: u16 = ((*(buf + 2) as u16) << 8) | (*(buf + 3) as u16)
+    let hdr_len: u32 = ip_get_header_len(buf)
+    if (total_len as u32) <= hdr_len
+        return 0
+    return (total_len as u32) - hdr_len
+
+# ============================================================================
+# Routing
+# ============================================================================
+
+# Check if destination is on local network
+pub fn ip_is_local(dst_ip: *u8) -> bool
+    var i: i32 = 0
+    while i < 4
+        let our_masked: u8 = ip_our_addr[i] & ip_netmask[i]
+        let dst_masked: u8 = *(dst_ip + i as i64) & ip_netmask[i]
+        if our_masked != dst_masked
+            return false
+        i = i + 1
+    return true
+
+# Get next hop IP (direct if local, gateway if not)
+pub fn ip_get_next_hop(dst_ip: *u8) -> *u8
+    if ip_is_local(dst_ip)
+        return dst_ip
+    return @ip_gateway[0]
+
+# ============================================================================
+# Debug
+# ============================================================================
+
+pub fn ip_print_addr(ip: *u8)
+    serial_print_dec(*(ip + 0) as u64)
+    prints(".")
+    serial_print_dec(*(ip + 1) as u64)
+    prints(".")
+    serial_print_dec(*(ip + 2) as u64)
+    prints(".")
+    serial_print_dec(*(ip + 3) as u64)
+
+pub fn ip_print_config()
+    prints("[ip] Configuration:\n")
+    prints("  IP:      ")
+    ip_print_addr(@ip_our_addr[0])
+    prints("\n  Gateway: ")
+    ip_print_addr(@ip_gateway[0])
+    prints("\n  Netmask: ")
+    ip_print_addr(@ip_netmask[0])
+    prints("\n  DNS:     ")
+    ip_print_addr(@ip_dns[0])
+    prints("\n")
