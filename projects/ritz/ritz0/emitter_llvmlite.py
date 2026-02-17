@@ -2755,6 +2755,12 @@ class LLVMEmitter:
 
         Signature: void *memset(void *dest, int c, size_t n)
         """
+        # Check if memset already exists (e.g., from ritzlib.str import)
+        # If so, skip emitting our version - the user-provided one will work
+        for gv in self.module.global_values:
+            if gv.name == "memset":
+                return  # memset already defined, don't emit duplicate
+
         # void* memset(void* dest, int c, size_t n)
         memset_ty = ir.FunctionType(
             self.i8.as_pointer(),
