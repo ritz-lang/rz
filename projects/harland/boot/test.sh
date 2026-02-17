@@ -106,6 +106,13 @@ if [ ! -f "$STORAGE" ]; then
     qemu-img create -f qcow2 "$STORAGE" 512M >/dev/null
 fi
 
+# Build the Ritz runtime (required for harland userspace binaries)
+echo "Building ritz runtime..."
+make -C "$HARLAND_DIR/../ritz/runtime" >/dev/null 2>&1 || {
+    echo "  Building runtime..."
+    make -C "$HARLAND_DIR/../ritz/runtime"
+}
+
 # Build indium userspace (init, hello, true, false, etc.)
 echo "Building indium userspace..."
 cd "$HARLAND_DIR/../.."
