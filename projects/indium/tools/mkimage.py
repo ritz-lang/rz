@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
-Harland qcow2 Image Builder
+Indium qcow2 Image Builder
 
 Creates a bootable UEFI disk image with:
 - GPT partition table
 - EFI System Partition (FAT32) with bootloader
-- Harland boot partition with kernel and initrd
+- Boot partition with kernel and initrd
 
 Usage:
-    python3 mkimage.py --kernel harland.elf --bootloader boot/BOOTX64.EFI --output harland.qcow2
+    python3 mkimage.py --kernel ../harland/build/debug/harland.elf \
+                       --bootloader ../harland/build/debug/BOOTX64.EFI \
+                       --output build/indium.qcow2
 
 Requirements:
     - qemu-img
@@ -48,6 +50,11 @@ def create_image(
         print(f"Error: initrd not found: {initrd_path}")
         sys.exit(1)
 
+    # Ensure output directory exists
+    output_dir = os.path.dirname(output_path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
     # Create empty qcow2 image
     run(["qemu-img", "create", "-f", "qcow2", output_path, f"{size_mb}M"])
 
@@ -64,7 +71,7 @@ part-add /dev/sda p 2048 {efi_end_sector}
 part-add /dev/sda p {boot_start_sector} -1
 part-set-gpt-type /dev/sda 1 C12A7328-F81F-11D2-BA4B-00A0C93EC93B
 part-set-name /dev/sda 1 "EFI System"
-part-set-name /dev/sda 2 "Harland Boot"
+part-set-name /dev/sda 2 "Indium Boot"
 mkfs fat /dev/sda1
 mkfs ext4 /dev/sda2
 mount /dev/sda1 /
@@ -104,18 +111,12 @@ upload {kernel_path} /harland.elf
     print(f"\nImage created: {output_path}")
     print(f"  Size: {os.path.getsize(output_path) / 1024 / 1024:.1f} MB")
     print("\nTo boot:")
-    print(f"  make run")
-    print("  # or:")
-    print(f"  qemu-system-x86_64 \\")
-    print(f"    -drive if=pflash,format=raw,file=/usr/share/OVMF/OVMF_CODE.fd,readonly=on \\")
-    print(f"    -drive if=pflash,format=raw,file=OVMF_VARS.fd \\")
-    print(f"    -drive file={output_path},format=qcow2 \\")
-    print(f"    -m 4G -serial mon:stdio")
+    print("  make run")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Create a bootable Harland qcow2 image"
+        description="Create a bootable Indium qcow2 image"
     )
     parser.add_argument(
         "--kernel", "-k",
@@ -133,8 +134,8 @@ def main():
     )
     parser.add_argument(
         "--output", "-o",
-        default="harland.qcow2",
-        help="Output image path (default: harland.qcow2)"
+        default="build/indium.qcow2",
+        help="Output image path (default: build/indium.qcow2)"
     )
     parser.add_argument(
         "--size", "-s",

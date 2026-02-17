@@ -1,24 +1,32 @@
 #!/bin/bash
 #
-# Create a minimal bootable disk image using GRUB
-# This creates a raw disk image with GRUB and our kernel
+# Create a minimal bootable raw disk image using GRUB
+# This creates a raw disk image with GRUB and the kernel
 #
+# NOTE: Requires sudo for loop device operations
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+HARLAND_DIR="$PROJECT_ROOT/../harland"
 BUILD_DIR="$PROJECT_ROOT/build"
-KERNEL_ELF="$BUILD_DIR/harland.elf"
-DISK_IMG="$BUILD_DIR/harland.img"
+
+# Kernel is built by harland project
+KERNEL_ELF="$HARLAND_DIR/build/debug/harland.elf"
+DISK_IMG="$BUILD_DIR/indium.img"
 
 # Check kernel exists
 if [ ! -f "$KERNEL_ELF" ]; then
     echo "Error: Kernel not found at $KERNEL_ELF"
+    echo "Build the kernel first: make -C ../harland kernel"
     exit 1
 fi
 
-echo "=== Creating Bootable Disk Image ==="
+# Create build directory
+mkdir -p "$BUILD_DIR"
+
+echo "=== Creating Bootable Raw Disk Image ==="
 
 # Create a 32MB disk image
 dd if=/dev/zero of="$DISK_IMG" bs=1M count=32 2>/dev/null
@@ -55,7 +63,7 @@ sudo tee "$MOUNT_DIR/boot/grub/grub.cfg" > /dev/null << 'EOF'
 set timeout=0
 set default=0
 
-menuentry "Harland" {
+menuentry "Indium (Harland Kernel)" {
     multiboot2 /boot/harland.elf
     boot
 }

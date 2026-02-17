@@ -39,9 +39,26 @@ IMAGE_QCOW2 = BUILD_DIR / "harland.qcow2"
 INITRAMFS_QCOW2 = BUILD_DIR / "initramfs.qcow2"  # Kernel modules, drivers
 STORAGE_QCOW2 = BUILD_DIR / "storage.qcow2"      # General storage
 
-# QEMU/OVMF paths
-OVMF_CODE = Path("/usr/share/OVMF/OVMF_CODE.fd")
-OVMF_VARS_TEMPLATE = Path("/usr/share/OVMF/OVMF_VARS.fd")
+# QEMU/OVMF paths - try multiple locations
+def find_ovmf():
+    """Find OVMF firmware files."""
+    candidates = [
+        ("/usr/share/OVMF/OVMF_CODE.fd", "/usr/share/OVMF/OVMF_VARS.fd"),
+        ("/usr/share/edk2/OVMF_CODE_4M.fd", "/usr/share/edk2/OVMF_VARS_4M.fd"),
+        ("/usr/share/edk2-ovmf/x64/OVMF_CODE.fd", "/usr/share/edk2-ovmf/x64/OVMF_VARS.fd"),
+        ("/usr/share/qemu/OVMF.fd", None),  # Single-file OVMF
+    ]
+    for entry in candidates:
+        code = entry[0]
+        vars = entry[1] if len(entry) > 1 else None
+        if Path(code).exists():
+            return Path(code), Path(vars) if vars else None
+    return None, None
+
+OVMF_CODE, OVMF_VARS_TEMPLATE = find_ovmf()
+if OVMF_CODE is None:
+    OVMF_CODE = Path("/usr/share/OVMF/OVMF_CODE.fd")  # Fallback for error message
+    OVMF_VARS_TEMPLATE = None
 OVMF_VARS = BUILD_DIR / "OVMF_VARS.fd"
 
 
@@ -146,6 +163,16 @@ def find_ritz_sources(src_dir: Path) -> list[Path]:
         "cap/syscall.ritz",            # Depends on: serial, cap/types, cap/table
         "drivers/virtio/common.ritz",  # VirtIO common layer
         "drivers/virtio/blk.ritz",     # VirtIO block device driver
+        "drivers/virtio/net.ritz",     # VirtIO network device driver
+        # Network stack
+        "net/types.ritz",              # Network types and constants
+        "net/eth.ritz",                # Ethernet frame handling
+        "net/arp.ritz",                # ARP protocol
+        "net/ip.ritz",                 # IPv4 protocol
+        "net/icmp.ritz",               # ICMP (ping)
+        "net/udp.ritz",                # UDP protocol
+        "net/dhcp.ritz",               # DHCP client
+        "net/stack.ritz",              # Network stack orchestration
         # Filesystem modules (Goliath + VFS)
         "fs/kpath.ritz",               # Path handling (no deps)
         "fs/kdir_entry.ritz",          # Directory entry structure (no deps)
@@ -155,6 +182,7 @@ def find_ritz_sources(src_dir: Path) -> list[Path]:
         "fs/namespace.ritz",           # In-memory namespace tree (new!)
         "fs/vfs.ritz",                 # VFS layer
         "fs/syscall.ritz",             # Filesystem syscalls
+        "fs/tar.ritz",                 # TAR archive parser
         "fs/initramfs.ritz",           # Initramfs loader
         # arch/x86_64 modules need syntax updates before enabling
         "main.ritz",                   # Depends on: all of the above
@@ -204,7 +232,7 @@ def build_kernel_native(flat: bool = False):  # True higher-half by default
 
         print(f"  Compiling {rel_path}")
         result = run([
-            str(ritz), "compile", str(src_file),
+            str(ritz), str(src_file),
             "--no-runtime",  # Don't emit _start, we have our own entry
             "-o", str(ll_path)
         ], check=False, env={"RITZ_PATH": str(kernel_src)})
@@ -283,15 +311,16 @@ def build_kernel_native(flat: bool = False):  # True higher-half by default
         user_obj = None
         print("  Warning: user_program.s not found")
 
-    # Step 3g: Assemble user_elf.s (embedded ELF binary for ELF loader test)
+    # Step 3g: Assemble user_elf.s (embedded ELF binaries for initramfs)
     user_elf_asm = KERNEL_DIR / "user_elf.s"
     user_elf_stub_asm = KERNEL_DIR / "user_elf_stub.s"
     user_elf_obj = BUILD_DIR / "kernel" / "user_elf.o"
     if user_elf_asm.exists():
-        # Check if the ELF binary exists first
-        user_elf_bin = BUILD_DIR / "user" / "portable_getpid.elf"
+        # Check if at least one user ELF binary exists
+        # user_elf.s references binaries in build/debug/
+        user_elf_bin = BUILD_DIR / "debug" / "init.elf"
         if user_elf_bin.exists():
-            print("  Assembling user_elf.s (embedded Ritz ELF binary)")
+            print("  Assembling user_elf.s (embedded Ritz ELF binaries)")
             run(["as", "--64", "-o", str(user_elf_obj), str(user_elf_asm)])
         elif user_elf_stub_asm.exists():
             # Use stub to provide symbols for linking
@@ -299,7 +328,7 @@ def build_kernel_native(flat: bool = False):  # True higher-half by default
             run(["as", "--64", "-o", str(user_elf_obj), str(user_elf_stub_asm)])
         else:
             user_elf_obj = None
-            print("  Skipping user_elf.s (no build/user/portable_getpid.elf)")
+            print("  Skipping user_elf.s (no build/debug/*.elf)")
     else:
         user_elf_obj = None
 
@@ -380,7 +409,7 @@ def build_kernel_stub():
 
     print(f"  Compiling stub/main.ritz")
     result = run([
-        str(ritz), "compile", str(ritz_src),
+        str(ritz), str(ritz_src),
         "--no-runtime",
         "-o", str(ll_path)
     ], check=False)
@@ -470,8 +499,9 @@ def build_bootloader():
 
         print(f"  Compiling {rel_path}")
         result = run([
-            str(ritz), "build", str(src),
-            "--emit-llvm",
+            str(ritz), str(src),
+            "--no-runtime",  # UEFI has its own entry point
+            "--target", "x86_64-unknown-windows",  # UEFI uses PE/COFF
             "-o", str(ll_path)
         ], check=False)
 
@@ -490,10 +520,11 @@ def build_bootloader():
 
     # Link for UEFI
     print("  Linking bootloader...")
+    llc = find_llvm_tool("llc")
     obj_files = []
     for ll in ll_files:
         obj = ll.with_suffix(".o")
-        run(["llc", "-filetype=obj", "-mtriple=x86_64-unknown-windows", str(ll), "-o", str(obj)])
+        run([llc, "-filetype=obj", "-mtriple=x86_64-unknown-windows", str(ll), "-o", str(obj)])
         obj_files.append(obj)
 
     run([
@@ -587,7 +618,7 @@ def build_userspace():
         # Step 1: Compile Ritz to LLVM IR
         # Userspace programs need --no-runtime (we provide our own syscall wrappers)
         result = run([
-            str(ritz), "compile", str(src_file),
+            str(ritz), str(src_file),
             "--no-runtime",
             "-o", str(ll_path)
         ], check=False, env={"RITZ_PATH": str(prog_dir / "src")})
@@ -722,7 +753,7 @@ def cmd_run(args):
         ], check=True)
 
     # Copy OVMF vars if needed
-    if not OVMF_VARS.exists() and OVMF_VARS_TEMPLATE.exists():
+    if OVMF_VARS_TEMPLATE and not OVMF_VARS.exists() and OVMF_VARS_TEMPLATE.exists():
         import shutil
         shutil.copy(OVMF_VARS_TEMPLATE, OVMF_VARS)
 
@@ -734,7 +765,13 @@ def cmd_run(args):
     qemu_args = [
         "qemu-system-x86_64",
         "-drive", f"if=pflash,format=raw,file={OVMF_CODE},readonly=on",
-        "-drive", f"if=pflash,format=raw,file={OVMF_VARS}",
+    ]
+
+    # Add VARS drive if available (for persistent NVRAM)
+    if OVMF_VARS_TEMPLATE and OVMF_VARS.exists():
+        qemu_args.extend(["-drive", f"if=pflash,format=raw,file={OVMF_VARS}"])
+
+    qemu_args.extend([
         "-drive", f"file={IMAGE_QCOW2},format=qcow2",
         # VirtIO block devices for initramfs and storage
         "-device", "virtio-blk-pci,drive=initramfs",
@@ -745,7 +782,7 @@ def cmd_run(args):
         "-smp", "4",
         "-serial", "mon:stdio",
         "-no-reboot",
-    ]
+    ])
 
     if args.debug:
         qemu_args.extend(["-d", "int,cpu_reset", "-S", "-s"])

@@ -206,6 +206,51 @@ var acpi20_guid: EfiGuid
 # ACPI 1.0 RSDP GUID: {EB9D2D30-2D88-11D3-9A16-0090273FC14D}
 var acpi10_guid: EfiGuid
 
+# ============================================================================
+# UEFI Graphics Output Protocol (GOP)
+# ============================================================================
+
+# EFI_GRAPHICS_OUTPUT_PROTOCOL GUID: {9042A9DE-23DC-4A38-96FB-7ADED080516A}
+var gop_guid: EfiGuid
+
+# Pixel format constants
+const EFI_PIXEL_RGBX_8BIT: u32 = 0     # RedGreenBlueReserved 8bit per color
+const EFI_PIXEL_BGRX_8BIT: u32 = 1     # BlueGreenRedReserved 8bit per color
+const EFI_PIXEL_BITMASK: u32 = 2       # Use PixelInformation bitmask
+const EFI_PIXEL_BLT_ONLY: u32 = 3      # No direct framebuffer access
+
+[[packed]]
+struct EfiPixelBitmask
+    red_mask: u32
+    green_mask: u32
+    blue_mask: u32
+    reserved_mask: u32
+
+[[packed]]
+struct EfiGopModeInfo
+    version: u32
+    horizontal_resolution: u32
+    vertical_resolution: u32
+    pixel_format: u32                    # EFI_PIXEL_* constants
+    pixel_info: EfiPixelBitmask          # Only valid if pixel_format == 2
+    pixels_per_scan_line: u32            # May differ from horizontal_resolution!
+
+[[packed]]
+struct EfiGopMode
+    max_mode: u32
+    mode_number: u32                     # Current mode index
+    info: *EfiGopModeInfo
+    info_size: u64
+    frame_buffer_base: u64               # Physical address of framebuffer!
+    frame_buffer_size: u64
+
+[[packed]]
+struct EfiGraphicsOutputProtocol
+    query_mode: *u8                      # QueryMode function pointer
+    set_mode: *u8                        # SetMode function pointer
+    blt: *u8                             # Blt (Block Transfer) function pointer
+    mode: *EfiGopMode                    # Current mode information
+
 # EFI_SIMPLE_FILE_SYSTEM_PROTOCOL
 [[packed]]
 struct EfiSimpleFileSystem
@@ -335,9 +380,10 @@ struct BootInfo
     framebuffer_addr: u64            # Framebuffer address (0 if none)
     framebuffer_width: u32
     framebuffer_height: u32
-    framebuffer_pitch: u32
-    framebuffer_bpp: u8
-    _pad2: [3]u8
+    framebuffer_pitch: u32           # Bytes per scanline
+    framebuffer_bpp: u8              # Bits per pixel (32)
+    framebuffer_format: u8           # 0=RGBX, 1=BGRX, 2=other
+    _pad2: [2]u8
     rsdp_addr: u64                   # ACPI RSDP address
     kernel_phys: u64                 # Kernel physical address
     kernel_size: u64                 # Kernel size in bytes
@@ -567,33 +613,59 @@ var pml4_addr: u64 = 0
 var pdpt_identity_addr: u64 = 0
 var pdpt_highhalf_addr: u64 = 0
 var pd_addr: u64 = 0
+var pd_extra_addr: u64 = 0     # For 1-2GB range
+var pd_extra2_addr: u64 = 0    # For 2-3GB range
+var pd_extra3_addr: u64 = 0    # For 3-4GB range
+var detected_memory_mb: u64 = 0  # Total usable memory in MB
 
 fn allocate_page_tables() -> i32
     prints("  Allocating page tables...\n")
+    # We need:
+    # - 1 page for PML4
+    # - 1 page for PDPT (identity, covers 0-512GB)
+    # - 1 page for PDPT (higher-half)
+    # - Up to 4 pages for PDs (each covers 1GB with 2MB pages)
+    # Total: 7 pages for up to 4GB mapping
     var addr: u64 = 0
-    var status: u64 = efi_allocate_pages(ALLOCATE_ANY_PAGES, EFI_LOADER_DATA, 4, @addr)
+    var status: u64 = efi_allocate_pages(ALLOCATE_ANY_PAGES, EFI_LOADER_DATA, 7, @addr)
     if status != EFI_SUCCESS
         prints("    ERROR: Failed to allocate page tables\n")
         return -1
     pml4_addr = addr
     pdpt_identity_addr = addr + 0x1000
     pdpt_highhalf_addr = addr + 0x2000
-    pd_addr = addr + 0x3000
+    pd_addr = addr + 0x3000         # 0-1GB
+    pd_extra_addr = addr + 0x4000   # 1-2GB
+    pd_extra2_addr = addr + 0x5000  # 2-3GB
+    pd_extra3_addr = addr + 0x6000  # 3-4GB
     prints("    PML4 at ")
     serial_print_hex(pml4_addr)
     prints("\n")
+    # Zero all 7 pages
     var p: *u64 = pml4_addr as *u64
     var i: i32 = 0
-    while i < 2048
+    while i < 3584  # 7 pages * 512 entries
         *p = 0
         p = p + 1
         i = i + 1
     return 0
 
 fn setup_page_tables() -> i32
-    prints("  Setting up page tables...\n")
+    prints("  Setting up page tables based on detected memory...\n")
     let flags: u64 = PTE_PRESENT | PTE_WRITABLE
     let huge_flags: u64 = PTE_PRESENT | PTE_WRITABLE | PTE_HUGE
+
+    # Determine how much memory to map based on detected usable memory
+    # We cap at 4GB since we're using 32-bit addressing limits in some places
+    var memory_to_map_mb: u64 = detected_memory_mb
+    if memory_to_map_mb > 4096
+        memory_to_map_mb = 4096
+    if memory_to_map_mb < 256
+        memory_to_map_mb = 256  # Minimum 256MB
+
+    prints("    Will map ")
+    serial_print_dec(memory_to_map_mb)
+    prints(" MB of memory\n")
 
     # PML4[0] -> pdpt_identity (for identity mapping)
     let pml4: *u64 = pml4_addr as *u64
@@ -603,37 +675,109 @@ fn setup_page_tables() -> i32
     let pml4_511: *u64 = (pml4_addr + 511 * 8) as *u64
     *pml4_511 = pdpt_highhalf_addr | flags
 
-    # PDPT[0] for identity -> PD (covers 0-1GB)
-    let pdpt_id: *u64 = pdpt_identity_addr as *u64
-    *pdpt_id = pd_addr | flags
+    # Set up identity PDPT entries for each GB we need to map
+    # PDPT[0] -> pd_addr (0-1GB)
+    let pdpt_id_0: *u64 = pdpt_identity_addr as *u64
+    *pdpt_id_0 = pd_addr | flags
 
-    # PDPT[510] for higher-half -> same PD (0xFFFFFFFF80000000 maps to physical 0)
+    # PDPT[1] -> pd_extra_addr (1-2GB) if needed
+    if memory_to_map_mb > 1024
+        let pdpt_id_1: *u64 = (pdpt_identity_addr + 8) as *u64
+        *pdpt_id_1 = pd_extra_addr | flags
+
+    # PDPT[2] -> pd_extra2_addr (2-3GB) if needed
+    if memory_to_map_mb > 2048
+        let pdpt_id_2: *u64 = (pdpt_identity_addr + 16) as *u64
+        *pdpt_id_2 = pd_extra2_addr | flags
+
+    # PDPT[3] -> pd_extra3_addr (3-4GB) if needed
+    if memory_to_map_mb > 3072
+        let pdpt_id_3: *u64 = (pdpt_identity_addr + 24) as *u64
+        *pdpt_id_3 = pd_extra3_addr | flags
+
+    # Higher-half mapping: PDPT[510] -> pd_addr
+    # The kernel at 0xFFFFFFFF80000000 only needs the first 1GB (where kernel lives)
     let pdpt_hh_510: *u64 = (pdpt_highhalf_addr + 510 * 8) as *u64
     *pdpt_hh_510 = pd_addr | flags
 
-    # Fill PD with 2MB huge pages
-    # Only map what we need:
-    # - First 16MB: kernel code at 0x100000
-    # - Up to 256MB: bootloader data and boot_info structure
-    # 256MB = 128 × 2MB pages
-    let num_pages: i32 = 128  # 256MB (was 512 for 1GB)
+    # Fill first PD (0-1GB) with 2MB huge pages
     var pd: *u64 = pd_addr as *u64
     var phys: u64 = 0
+    var pages_in_first_gb: i32 = 512  # Full 1GB
+    if memory_to_map_mb < 1024
+        pages_in_first_gb = (memory_to_map_mb / 2) as i32  # MB / 2MB per page
     var j: i32 = 0
-    while j < num_pages
+    while j < pages_in_first_gb
         *pd = phys | huge_flags
         pd = pd + 1
         phys = phys + 0x200000
         j = j + 1
-
-    # Zero remaining PD entries (important for security)
+    # Zero remaining entries in first PD
     while j < 512
         *pd = 0
         pd = pd + 1
         j = j + 1
 
-    prints("    Identity map: 0-256MB -> 0-256MB\n")
-    prints("    Higher-half:  0xFFFFFFFF80000000 -> 0-256MB\n")
+    # Fill second PD (1-2GB) if needed
+    if memory_to_map_mb > 1024
+        pd = pd_extra_addr as *u64
+        phys = 0x40000000  # 1GB
+        var pages_in_second_gb: i32 = 512
+        if memory_to_map_mb < 2048
+            pages_in_second_gb = ((memory_to_map_mb - 1024) / 2) as i32
+        j = 0
+        while j < pages_in_second_gb
+            *pd = phys | huge_flags
+            pd = pd + 1
+            phys = phys + 0x200000
+            j = j + 1
+        while j < 512
+            *pd = 0
+            pd = pd + 1
+            j = j + 1
+
+    # Fill third PD (2-3GB) if needed
+    if memory_to_map_mb > 2048
+        pd = pd_extra2_addr as *u64
+        phys = 0x80000000  # 2GB
+        var pages_in_third_gb: i32 = 512
+        if memory_to_map_mb < 3072
+            pages_in_third_gb = ((memory_to_map_mb - 2048) / 2) as i32
+        j = 0
+        while j < pages_in_third_gb
+            *pd = phys | huge_flags
+            pd = pd + 1
+            phys = phys + 0x200000
+            j = j + 1
+        while j < 512
+            *pd = 0
+            pd = pd + 1
+            j = j + 1
+
+    # Fill fourth PD (3-4GB) if needed
+    if memory_to_map_mb > 3072
+        pd = pd_extra3_addr as *u64
+        phys = 0xC0000000  # 3GB
+        var pages_in_fourth_gb: i32 = 512
+        if memory_to_map_mb < 4096
+            pages_in_fourth_gb = ((memory_to_map_mb - 3072) / 2) as i32
+        j = 0
+        while j < pages_in_fourth_gb
+            *pd = phys | huge_flags
+            pd = pd + 1
+            phys = phys + 0x200000
+            j = j + 1
+        while j < 512
+            *pd = 0
+            pd = pd + 1
+            j = j + 1
+
+    prints("    Identity map: 0-")
+    serial_print_dec(memory_to_map_mb)
+    prints("MB -> 0-")
+    serial_print_dec(memory_to_map_mb)
+    prints("MB\n")
+    prints("    Higher-half:  0xFFFFFFFF80000000 -> 0-1GB\n")
     return 0
 
 fn load_page_tables() -> i32
@@ -671,15 +815,27 @@ fn get_memory_map() -> i32
     serial_print_dec(memory_map_desc_size)
     prints(" bytes\n")
     var usable_pages: u64 = 0
+    var highest_usable_addr: u64 = 0
     var i: u64 = 0
     while i < num_entries
         let desc: *EfiMemoryDescriptor = (@memory_map_buffer[0] + i * memory_map_desc_size) as *EfiMemoryDescriptor
         if desc.mem_type == EFI_CONVENTIONAL_MEMORY
             usable_pages = usable_pages + desc.number_of_pages
+            # Track highest address to know how much to map
+            let region_end: u64 = desc.physical_start + (desc.number_of_pages * 4096)
+            if region_end > highest_usable_addr
+                highest_usable_addr = region_end
         i = i + 1
     let usable_mb: u64 = (usable_pages * 4096) / (1024 * 1024)
+    # Round up to nearest 256MB for simpler page table setup
+    detected_memory_mb = ((highest_usable_addr + 0x0FFFFFFF) / 0x10000000) * 256
     prints("    Usable memory: ")
     serial_print_dec(usable_mb)
+    prints(" MB\n")
+    prints("    Highest address: ")
+    serial_print_hex(highest_usable_addr)
+    prints(" -> mapping ")
+    serial_print_dec(detected_memory_mb)
     prints(" MB\n")
     return 0
 
@@ -742,6 +898,19 @@ fn init_guids() -> i32
     acpi10_guid.data4[5] = 0x3F
     acpi10_guid.data4[6] = 0xC1
     acpi10_guid.data4[7] = 0x4D
+
+    # Graphics Output Protocol GUID: {9042A9DE-23DC-4A38-96FB-7ADED080516A}
+    gop_guid.data1 = 0x9042A9DE
+    gop_guid.data2 = 0x23DC
+    gop_guid.data3 = 0x4A38
+    gop_guid.data4[0] = 0x96
+    gop_guid.data4[1] = 0xFB
+    gop_guid.data4[2] = 0x7A
+    gop_guid.data4[3] = 0xDE
+    gop_guid.data4[4] = 0xD0
+    gop_guid.data4[5] = 0x80
+    gop_guid.data4[6] = 0x51
+    gop_guid.data4[7] = 0x6A
 
     return 0
 
@@ -819,6 +988,110 @@ fn find_rsdp_from_uefi() -> i32
     return -1
 
 # ============================================================================
+# Graphics Initialization (UEFI GOP)
+# ============================================================================
+
+# Global framebuffer info (populated by init_graphics)
+var fb_addr: u64 = 0
+var fb_width: u32 = 0
+var fb_height: u32 = 0
+var fb_pitch: u32 = 0
+var fb_bpp: u8 = 0
+var fb_format: u32 = 0
+
+fn init_graphics() -> i32
+    prints("  Initializing graphics (UEFI GOP)...\n")
+
+    # Locate GOP protocol
+    var gop_ptr: u64 = 0
+    let status: u64 = efi_locate_protocol(@gop_guid, 0, @gop_ptr)
+    if status != EFI_SUCCESS
+        prints("    WARNING: No GOP found (headless mode)\n")
+        return -1
+
+    let gop: *EfiGraphicsOutputProtocol = gop_ptr as *EfiGraphicsOutputProtocol
+    let mode: *EfiGopMode = (*gop).mode
+    let info: *EfiGopModeInfo = (*mode).info
+
+    prints("    GOP found at: ")
+    serial_print_hex(gop_ptr)
+    prints("\n")
+
+    # Print current mode info
+    prints("    Current mode: ")
+    serial_print_dec((*mode).mode_number as u64)
+    prints(" of ")
+    serial_print_dec((*mode).max_mode as u64)
+    prints("\n")
+
+    prints("    Resolution: ")
+    serial_print_dec((*info).horizontal_resolution as u64)
+    prints("x")
+    serial_print_dec((*info).vertical_resolution as u64)
+    prints("\n")
+
+    prints("    Pixels per scanline: ")
+    serial_print_dec((*info).pixels_per_scan_line as u64)
+    prints("\n")
+
+    prints("    Pixel format: ")
+    if (*info).pixel_format == EFI_PIXEL_RGBX_8BIT
+        prints("RGBX\n")
+    else if (*info).pixel_format == EFI_PIXEL_BGRX_8BIT
+        prints("BGRX\n")
+    else if (*info).pixel_format == EFI_PIXEL_BITMASK
+        prints("Bitmask\n")
+    else if (*info).pixel_format == EFI_PIXEL_BLT_ONLY
+        prints("BLT-only (no direct framebuffer!)\n")
+        return -1
+    else
+        prints("Unknown\n")
+
+    prints("    Framebuffer: ")
+    serial_print_hex((*mode).frame_buffer_base)
+    prints(" (")
+    serial_print_dec((*mode).frame_buffer_size / 1024)
+    prints(" KB)\n")
+
+    # Store framebuffer info for BootInfo
+    fb_addr = (*mode).frame_buffer_base
+    fb_width = (*info).horizontal_resolution
+    fb_height = (*info).vertical_resolution
+    fb_pitch = (*info).pixels_per_scan_line * 4  # Assuming 32bpp
+    fb_bpp = 32
+    fb_format = (*info).pixel_format
+
+    # Quick visual test: fill framebuffer with a color
+    # This happens before ExitBootServices, so we can access it directly
+    prints("    Drawing test pattern...\n")
+    let fb: *u32 = fb_addr as *u32
+    var y: u32 = 0
+    while y < fb_height
+        var x: u32 = 0
+        while x < fb_width
+            # Simple gradient: blue in top-left, red in bottom-right
+            let r: u32 = (x * 255) / fb_width
+            let b: u32 = (y * 255) / fb_height
+            let g: u32 = 128
+            var pixel: u32 = 0
+
+            # Pack pixel based on format
+            if fb_format == EFI_PIXEL_RGBX_8BIT
+                # RGBX: R in low byte
+                pixel = r | (g << 8) | (b << 16)
+            else
+                # BGRX: B in low byte (default for most UEFI)
+                pixel = b | (g << 8) | (r << 16)
+
+            let offset: u64 = (y as u64) * ((*info).pixels_per_scan_line as u64) + (x as u64)
+            *(fb + offset) = pixel
+            x = x + 1
+        y = y + 1
+
+    prints("    Graphics initialized!\n")
+    return 0
+
+# ============================================================================
 # BootInfo Population
 # ============================================================================
 
@@ -881,12 +1154,22 @@ fn build_boot_info() -> i32
     # Set page table info
     boot_info.pml4_phys = pml4_addr
 
-    # No framebuffer for now
-    boot_info.framebuffer_addr = 0
-    boot_info.framebuffer_width = 0
-    boot_info.framebuffer_height = 0
-    boot_info.framebuffer_pitch = 0
-    boot_info.framebuffer_bpp = 0
+    # Set framebuffer info (populated by init_graphics)
+    boot_info.framebuffer_addr = fb_addr
+    boot_info.framebuffer_width = fb_width
+    boot_info.framebuffer_height = fb_height
+    boot_info.framebuffer_pitch = fb_pitch
+    boot_info.framebuffer_bpp = fb_bpp
+    boot_info.framebuffer_format = fb_format as u8
+
+    if fb_addr != 0
+        prints("    Framebuffer: ")
+        serial_print_dec(fb_width as u64)
+        prints("x")
+        serial_print_dec(fb_height as u64)
+        prints(" @ ")
+        serial_print_hex(fb_addr)
+        prints("\n")
 
     prints("    BootInfo ready at: ")
     serial_print_hex(@boot_info as u64)
@@ -1337,6 +1620,10 @@ pub fn efi_main(image_handle: u64, system_table: *EfiSystemTable) -> u64
 
     # Find ACPI RSDP from UEFI configuration table (must happen before ExitBootServices)
     find_rsdp_from_uefi()
+
+    # Initialize graphics (must happen before ExitBootServices)
+    # This is optional - system will work in headless mode without GOP
+    init_graphics()
 
     # Load kernel from filesystem (must happen before ExitBootServices)
     if load_kernel_from_fs() != 0

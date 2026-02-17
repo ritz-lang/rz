@@ -1,46 +1,21 @@
 # Initramfs Loader
 #
-# Loads an initial filesystem at boot time.
+# Loads the initial filesystem from a TAR archive on the VirtIO block device.
+# This is required for boot - if the initramfs cannot be loaded, the kernel panics.
 #
-# Supports two modes:
-# 1. Embedded: Hardcoded files compiled into kernel (fallback)
-# 2. Disk: Load TAR archive from VirtIO block device
-#
-# The TAR archive on the initramfs disk contains:
+# The TAR archive contains:
 #   /bin/init        - First userspace process (ELF)
 #   /etc/hostname    - System hostname
 #   /etc/motd        - Message of the day
 #   ... other files
 
-import serial { StrView, prints, println, serial_print_dec, serial_print_hex }
-import fs.kblob { KBlobStore, kblob_get_store, kblob_store_put }
-import fs.knamespace { KNamespace, knamespace_get, knamespace_mkdir, knamespace_write, KNS_OK }
+import serial { StrView, prints, serial_print_dec }
+import io { halt_loop }
+import fs.knamespace { KNamespace, knamespace_get, knamespace_mkdir, knamespace_write, KNS_OK, KNS_NOT_FOUND, KNS_OUT_OF_SPACE }
 import fs.kpath { strview_from_ptr }
-import fs.tar { TarEntry, TAR_ENTRY_SIZE, TAR_BLOCK_SIZE, TAR_TYPE_FILE, TAR_TYPE_FILE_ALT, TAR_TYPE_DIRECTORY, tar_parse_header, tar_get_size, tar_data_blocks, tar_print_entry }
+import fs.tar { TarEntry, TAR_ENTRY_SIZE, TAR_BLOCK_SIZE, TAR_TYPE_FILE, TAR_TYPE_FILE_ALT, TAR_TYPE_DIRECTORY, tar_parse_header, tar_data_blocks }
 import drivers.virtio.blk { VirtioBlkDevice, virtio_blk_get_device, virtio_blk_read }
-import mm.heap { kalloc, kfree, heap_get_free }
-
-# External references to embedded ELF binaries (for /bin)
-extern fn hello_elf_start()
-extern fn hello_elf_end()
-extern fn true_elf_start()
-extern fn true_elf_end()
-extern fn false_elf_start()
-extern fn false_elf_end()
-extern fn exitcode_elf_start()
-extern fn exitcode_elf_end()
-extern fn hello_tier1_elf_start()
-extern fn hello_tier1_elf_end()
-extern fn seq10_elf_start()
-extern fn seq10_elf_end()
-extern fn cat_motd_elf_start()
-extern fn cat_motd_elf_end()
-extern fn echo_elf_start()
-extern fn echo_elf_end()
-extern fn wc_elf_start()
-extern fn wc_elf_end()
-extern fn rzsh_elf_start()
-extern fn rzsh_elf_end()
+import mm.heap { kalloc, kfree }
 
 # ============================================================================
 # Configuration
@@ -54,12 +29,30 @@ const READ_BUFFER_SECTORS: u32 = 7   # 3584 bytes per read
 const READ_BUFFER_SIZE: u64 = 3584   # 7 * 512
 
 # ============================================================================
+# Public API
+# ============================================================================
+
+# Load the initramfs from VirtIO disk.
+# Panics if the initramfs cannot be loaded - this is a fatal boot error.
+pub fn initramfs_load() -> i32
+    let result: i32 = initramfs_load_from_disk()
+    if result != 0
+        prints("\n*** KERNEL PANIC: Failed to load initramfs ***\n" as StrView)
+        prints("    Error code: " as StrView)
+        serial_print_dec(result as u64)
+        prints("\n" as StrView)
+        prints("    Cannot continue without root filesystem.\n" as StrView)
+        prints("    Ensure VirtIO disk with TAR initramfs is attached.\n\n" as StrView)
+        halt_loop()
+    result
+
+# ============================================================================
 # Load from VirtIO Disk
 # ============================================================================
 
 # Load initramfs from the first VirtIO block device
 # The disk contains a raw TAR archive (no partition table)
-pub fn initramfs_load_from_disk() -> i32
+fn initramfs_load_from_disk() -> i32
     let dev: *VirtioBlkDevice = virtio_blk_get_device()
     if dev == 0 as *VirtioBlkDevice
         prints("[initramfs] No VirtIO block device\n" as StrView)
@@ -144,6 +137,10 @@ pub fn initramfs_load_from_disk() -> i32
     else
         return -6  # No files loaded
 
+# ============================================================================
+# Internal Helpers
+# ============================================================================
+
 # Convert TAR path "./foo/bar" to absolute path "/foo/bar"
 # Returns the path length (or 0 if path is root)
 fn tar_to_absolute_path(tar_path: *StrView, out_buf: *u8, max_len: i64) -> i64
@@ -193,10 +190,18 @@ fn load_file_from_tar(dev: *VirtioBlkDevice, ns: *KNamespace, entry: *TarEntry, 
         let empty: u8 = 0
         return knamespace_write(ns, @abs_path, @empty as *u8, 0)
 
-    # Allocate buffer for file contents
-    let file_buf: *u8 = kalloc(size) as *u8
+    # Allocate buffer for file contents - round up to sector boundary
+    # because virtio_blk_read copies whole sectors (512 bytes)
+    var alloc_size: u64 = ((size + 511) / 512) * 512
+    if alloc_size == 0
+        alloc_size = 512
+
+    let file_buf: *u8 = kalloc(alloc_size) as *u8
     if file_buf == 0 as *u8
-        return -1
+        prints("[initramfs] kalloc failed for size=" as StrView)
+        serial_print_dec(alloc_size)
+        prints("\n" as StrView)
+        return KNS_OUT_OF_SPACE
 
     # Read file data sector by sector
     var bytes_read: u64 = 0
@@ -213,26 +218,29 @@ fn load_file_from_tar(dev: *VirtioBlkDevice, ns: *KNamespace, entry: *TarEntry, 
         # Read sectors
         let result: i32 = virtio_blk_read(dev, current_sector, sectors_to_read, file_buf + bytes_read as i64)
         if result != 0
-            prints("    (read error at sector " as StrView)
+            prints("[initramfs] VirtIO read error at sector " as StrView)
             serial_print_dec(current_sector)
             prints(" result=" as StrView)
             serial_print_dec(result as u64)
-            prints(")\n" as StrView)
+            prints("\n" as StrView)
             kfree(file_buf)
-            return -2
+            return KNS_NOT_FOUND  # I/O failure
 
         bytes_read = bytes_read + (sectors_to_read as u64 * 512)
         current_sector = current_sector + sectors_to_read as u64
 
     # Create file in namespace
     let write_result: i32 = knamespace_write(ns, @abs_path, file_buf, size)
-
     kfree(file_buf)
 
-    if write_result == KNS_OK
-        return 0
-    else
-        return -3
+    if write_result != KNS_OK
+        prints("[initramfs] knamespace_write failed for " as StrView)
+        prints(abs_path)
+        prints(" error=" as StrView)
+        serial_print_dec(write_result as u64)
+        prints("\n" as StrView)
+
+    write_result
 
 # Process a directory entry
 # TAR paths are like "./var/log/" - we need to convert to "/var/log"
@@ -245,154 +253,3 @@ fn process_directory(ns: *KNamespace, path: *StrView) -> i32
 
     let abs_path: StrView = strview_from_ptr(@abs_path_buf[0], abs_len)
     knamespace_mkdir(ns, @abs_path)
-
-# ============================================================================
-# Embedded Initramfs (Fallback)
-# ============================================================================
-#
-# For initial testing, we embed a minimal filesystem directly in the kernel.
-# This includes:
-#   /etc/hostname     - System hostname
-#   /etc/motd         - Message of the day
-#   /bin/init         - Init script placeholder
-#   /var/log/         - Log directory
-
-# Create the initial filesystem structure (embedded fallback)
-pub fn initramfs_load_embedded() -> i32
-    let ns: *KNamespace = knamespace_get()
-    if ns == 0 as *KNamespace
-        prints("[initramfs] No namespace\n" as StrView)
-        return -1
-
-    prints("[initramfs] Creating embedded filesystem...\n" as StrView)
-
-    # Create directories
-    create_dir(ns, c"/etc")
-    create_dir(ns, c"/bin")
-    create_dir(ns, c"/var")
-    create_dir(ns, c"/var/log")
-    create_dir(ns, c"/tmp")
-    create_dir(ns, c"/home")
-
-    # Create /etc/hostname
-    var hostname: [16]u8
-    hostname[0] = 104   # h
-    hostname[1] = 97    # a
-    hostname[2] = 114   # r
-    hostname[3] = 108   # l
-    hostname[4] = 97    # a
-    hostname[5] = 110   # n
-    hostname[6] = 100   # d
-    hostname[7] = 10    # \n
-    create_file(ns, c"/etc/hostname", @hostname[0], 8)
-
-    # Create /etc/motd - Message of the Day
-    # "Welcome to Harland!\nGoliath filesystem initialized.\n"
-    var motd: [64]u8
-    let motd_str: StrView = "Welcome to Harland!\nGoliath filesystem initialized.\n" as StrView
-    var i: i64 = 0
-    while i < motd_str.len and i < 63
-        motd[i] = *(motd_str.ptr + i)
-        i = i + 1
-    motd[i] = 0
-    create_file(ns, c"/etc/motd", @motd[0], motd_str.len as u64)
-
-    # Create /bin/hello - embed the actual hello.elf binary
-    let hello_data: *u8 = hello_elf_start as *u8
-    let hello_end: u64 = hello_elf_end as u64
-    let hello_start: u64 = hello_elf_start as u64
-    let hello_size: u64 = hello_end - hello_start
-    create_file(ns, c"/bin/hello", hello_data, hello_size)
-
-    # Create /bin/true - Tier 1: always exits with 0
-    let true_data: *u8 = true_elf_start as *u8
-    let true_size: u64 = (true_elf_end as u64) - (true_elf_start as u64)
-    create_file(ns, c"/bin/true", true_data, true_size)
-
-    # Create /bin/false - Tier 1: always exits with 1
-    let false_data: *u8 = false_elf_start as *u8
-    let false_size: u64 = (false_elf_end as u64) - (false_elf_start as u64)
-    create_file(ns, c"/bin/false", false_data, false_size)
-
-    # Create /bin/exitcode - Tier 1: exits with code 42
-    let exitcode_data: *u8 = exitcode_elf_start as *u8
-    let exitcode_size: u64 = (exitcode_elf_end as u64) - (exitcode_elf_start as u64)
-    create_file(ns, c"/bin/exitcode", exitcode_data, exitcode_size)
-
-    # Create /bin/hello_tier1 - Tier 1: prints "Hello, Ritz!"
-    let hello_tier1_data: *u8 = hello_tier1_elf_start as *u8
-    let hello_tier1_size: u64 = (hello_tier1_elf_end as u64) - (hello_tier1_elf_start as u64)
-    create_file(ns, c"/bin/hello_tier1", hello_tier1_data, hello_tier1_size)
-
-    # Create /bin/seq10 - Tier 1: prints numbers 1-10
-    let seq10_data: *u8 = seq10_elf_start as *u8
-    let seq10_size: u64 = (seq10_elf_end as u64) - (seq10_elf_start as u64)
-    create_file(ns, c"/bin/seq10", seq10_data, seq10_size)
-
-    # Create /bin/cat_motd - Tier 1: reads and prints /etc/motd
-    let cat_motd_data: *u8 = cat_motd_elf_start as *u8
-    let cat_motd_size: u64 = (cat_motd_elf_end as u64) - (cat_motd_elf_start as u64)
-    create_file(ns, c"/bin/cat_motd", cat_motd_data, cat_motd_size)
-
-    # Create /bin/echo - Tier 1: prints command-line arguments
-    let echo_data: *u8 = echo_elf_start as *u8
-    let echo_size: u64 = (echo_elf_end as u64) - (echo_elf_start as u64)
-    create_file(ns, c"/bin/echo", echo_data, echo_size)
-
-    # Create /bin/wc - Tier 1: counts lines/words/chars
-    let wc_data: *u8 = wc_elf_start as *u8
-    let wc_size: u64 = (wc_elf_end as u64) - (wc_elf_start as u64)
-    create_file(ns, c"/bin/wc", wc_data, wc_size)
-
-    # Create /bin/rzsh - Ritz Shell (interactive shell)
-    let rzsh_data: *u8 = rzsh_elf_start as *u8
-    let rzsh_size: u64 = (rzsh_elf_end as u64) - (rzsh_elf_start as u64)
-    create_file(ns, c"/bin/rzsh", rzsh_data, rzsh_size)
-
-    # Create /var/log/boot.log
-    var bootlog: [64]u8
-    let bootlog_str: StrView = "Harland kernel booted successfully.\n" as StrView
-    i = 0
-    while i < bootlog_str.len and i < 63
-        bootlog[i] = *(bootlog_str.ptr + i)
-        i = i + 1
-    bootlog[i] = 0
-    create_file(ns, c"/var/log/boot.log", @bootlog[0], bootlog_str.len as u64)
-
-    prints("[initramfs] Embedded filesystem ready\n" as StrView)
-    0
-
-# Main entry point - tries disk first, falls back to embedded
-pub fn initramfs_load() -> i32
-    # Skip disk loading for now - heap issues to debug
-    # let disk_result: i32 = initramfs_load_from_disk()
-    # if disk_result == 0
-    #     return 0
-    #
-    # # Fall back to embedded filesystem
-    # prints("[initramfs] Disk load failed, using embedded fallback\n" as StrView)
-    initramfs_load_embedded()
-
-# Helper to create a directory
-fn create_dir(ns: *KNamespace, path_str: *u8) -> i32
-    # Calculate length
-    var len: i64 = 0
-    var p: *u8 = path_str
-    while *p != 0
-        len = len + 1
-        p = p + 1
-
-    let path: StrView = strview_from_ptr(path_str, len)
-    knamespace_mkdir(ns, @path)
-
-# Helper to create a file
-fn create_file(ns: *KNamespace, path_str: *u8, data: *u8, size: u64) -> i32
-    # Calculate length of path
-    var len: i64 = 0
-    var p: *u8 = path_str
-    while *p != 0
-        len = len + 1
-        p = p + 1
-
-    let path: StrView = strview_from_ptr(path_str, len)
-    knamespace_write(ns, @path, data, size)
