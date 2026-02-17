@@ -22,6 +22,7 @@ Named after Indium, a soft malleable metal - the distribution that wraps around 
 - Bootable ISO image builder (GRUB/BIOS mode)
 - UEFI disk image builder (qcow2 format)
 - QEMU launch targets for both UEFI and BIOS boot
+- GPU framebuffer support with prism_demo
 
 ## Installation
 
@@ -37,6 +38,9 @@ make run-iso
 
 # Boot in QEMU (UEFI mode)
 make run
+
+# Boot with GUI display (shows framebuffer)
+make test-uefi-gui
 
 # Build with GDB debug server
 make debug
@@ -54,6 +58,7 @@ make iso          # Create bootable ISO with GRUB
 make image        # Create qcow2 disk image (UEFI)
 make run          # Boot in QEMU (UEFI)
 make run-iso      # Boot in QEMU (BIOS/GRUB)
+make test-uefi-gui # Boot with display (shows graphics)
 make debug        # Boot with GDB server on :1234
 make clean        # Remove build artifacts
 ```
@@ -75,6 +80,7 @@ make clean        # Remove build artifacts
 | `ping` | Network connectivity test |
 | `args_test` | Test argument passing |
 | `mmap_test` | Test mmap syscall |
+| `prism_demo` | GPU framebuffer graphics demo |
 
 ## Dependencies
 
@@ -82,7 +88,7 @@ make clean        # Remove build artifacts
 
 ## Status
 
-**Active development** - Init, basic utilities (hello, true, false, echo, wc, seq10), and rzsh shell all run on Harland. UEFI and BIOS bootable images are buildable. mmap and args passing work. Multi-process support and more utilities are in progress.
+**Active development** - Init, basic utilities (hello, true, false, echo, wc, seq10), and rzsh shell all run on Harland. UEFI and BIOS bootable images are buildable. mmap and args passing work. GPU framebuffer support with prism_demo. Multi-process support and more utilities are in progress.
 
 ## License
 

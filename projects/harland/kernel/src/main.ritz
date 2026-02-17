@@ -17,7 +17,7 @@ import serial { StrView, serial_init, serial_write_byte, serial_print, serial_wr
 import drivers.pci { PciDevice, PCI_CLASS_NETWORK, PCI_CLASS_STORAGE, PCI_CLASS_BRIDGE, PCI_CLASS_DISPLAY, PCI_VENDOR_REDHAT, VIRTIO_DEVICE_NET, PCI_CMD_BUS_MASTER, PCI_CMD_MEMORY_SPACE, PCI_CMD_IO_SPACE, pci_init, pci_find_device, pci_find_by_class, pci_find_virtio, pci_enable_bus_master, pci_enable_memory, pci_enable_io, pci_get_device_count, pci_get_device, pci_read_config16, pci_read_config32, pci_write_config16, pci_print_all_devices, pci_print_device }
 import mm.pmm { PAGE_SIZE, PAGE_SHIFT, MAX_MEMORY, MAX_PAGES, MB2_TAG_END, MB2_TAG_CMDLINE, MB2_TAG_BOOTLOADER_NAME, MB2_TAG_MODULE, MB2_TAG_BASIC_MEMINFO, MB2_TAG_BOOTDEV, MB2_TAG_MMAP, MB2_TAG_VBE, MB2_TAG_FRAMEBUFFER, MB2_TAG_ELF_SECTIONS, MB2_TAG_APM, MB2_TAG_EFI32, MB2_TAG_EFI64, MB2_TAG_SMBIOS, MB2_TAG_ACPI_OLD, MB2_TAG_ACPI_NEW, MB2_TAG_NETWORK, MB2_TAG_EFI_MMAP, MB2_TAG_EFI_BS, MB2_TAG_EFI32_IH, MB2_TAG_EFI64_IH, MB2_TAG_LOAD_BASE_ADDR, MB2_MEMORY_AVAILABLE, MB2_MEMORY_RESERVED, MB2_MEMORY_ACPI_RECLAIMABLE, MB2_MEMORY_NVS, MB2_MEMORY_BADRAM, Mb2BootInfo, Mb2Tag, Mb2BasicMemInfo, Mb2MmapTag, Mb2MmapEntry, HARLAND_BOOT_MAGIC, HARLAND_BOOT_VERSION, HARLAND_MEM_USABLE, HARLAND_MEM_RESERVED, HARLAND_MEM_ACPI_RECLAIMABLE, HarlandMemEntry, HarlandBootInfo, BOOT_PROTOCOL_UNKNOWN, BOOT_PROTOCOL_MULTIBOOT2, BOOT_PROTOCOL_HARLAND, pmm_init, pmm_mark_region_free, pmm_mark_region_used, pmm_alloc_page, pmm_free_page, pmm_get_free_pages, pmm_get_total_pages, pmm_init_from_multiboot, pmm_init_from_bootinfo, pmm_reserve_kernel }
 import mm.vmm { PTE_PRESENT, PTE_WRITABLE, PTE_USER, PTE_WRITE_THROUGH, PTE_CACHE_DISABLE, PTE_ACCESSED, PTE_DIRTY, PTE_HUGE, PTE_GLOBAL, PTE_NO_EXECUTE, PTE_ADDR_MASK, vmm_init, vmm_flush_tlb, vmm_flush_tlb_all, vmm_debug_page_tables, vmm_map_page, vmm_unmap_page, vmm_virt_to_phys, vmm_is_accessible, vmm_ensure_mapped, vmm_create_user_pml4, vmm_switch_pml4, vmm_get_current_pml4, vmm_map_page_in, vmm_free_pml4, vmm_read_pml4_entry, vmm_reserve_page_tables }
-import mm.heap { KERNEL_VIRT_BASE, HEAP_START, HEAP_MAX_SIZE, heap_init, kalloc, kfree, heap_get_used, heap_get_free }
+import mm.heap { KERNEL_VIRT_BASE, HEAP_START, HEAP_MAX_SIZE, heap_init, kalloc, kfree, heap_get_used, heap_get_free, heap_check }
 # mm.shm and mm.dma are WIP - commented out until imports are fixed
 # import mm.shm { ShmRegion, ShmMapping, shm_create, ... }
 # import mm.dma { DmaRegion, dma_alloc, dma_free, ... }
@@ -34,7 +34,7 @@ import fs.knamespace { KNamespace, knamespace_init, knamespace_get, knamespace_m
 import fs.kdir_entry { KDirEntry }
 import fs.kpath { strview_from_ptr }
 import fs.syscall { fs_syscall_init, sys_open, sys_close, sys_fs_read, sys_fs_write, sys_lseek, is_fs_fd }
-import fs.initramfs { initramfs_load, initramfs_load_embedded }
+import fs.initramfs { initramfs_load }
 
 # Network stack imports
 import drivers.virtio.net { virtio_net_init, virtio_net_send, virtio_net_poll, virtio_net_is_ready, virtio_net_get_mac, VirtioNetDevice, virtio_net_get_device }
@@ -45,7 +45,8 @@ import net.arp { arp_print_cache }
 
 # Display driver imports
 import drivers.display.mod { SimpleFramebuffer, display_init, display_get_framebuffer, display_available, PIXEL_FORMAT_RGBX, PIXEL_FORMAT_BGRX }
-import drivers.display.framebuffer { fb_clear, fb_fill_rect, fb_fill_rect_rgb, fb_clear_rgb } origin/harland-gpu
+import drivers.display.framebuffer { fb_clear, fb_fill_rect, fb_fill_rect_rgb, fb_clear_rgb }
+
 # ============================================================================
 # Kernel Ring Buffer (Early Boot Debug)
 # ============================================================================
@@ -2053,10 +2054,8 @@ extern fn user_program_start()
 extern fn user_program_end()
 extern fn user_program_minimal()
 
-# Embedded Ritz ELF binary (from user/hello.ritz)
-# These symbols are defined in kernel/user_elf.s
-extern fn user_elf_start()
-extern fn user_elf_end()
+# Note: Embedded ELF binaries removed. User binaries are now loaded
+# from the TAR initramfs disk by initramfs_load_from_disk().
 
 # ============================================================================
 # Syscall Interface
@@ -2086,6 +2085,8 @@ const SYS_GETPID: u64 = 23
 const SYS_YIELD: u64 = 24
 const SYS_SPAWN_ARGS: u64 = 25
 const SYS_ACPI_POWEROFF: u64 = 200
+const SYS_FB_INFO: u64 = 210      # Get framebuffer info
+const SYS_FB_MAP: u64 = 211       # Map framebuffer into userspace
 const SYS_DEBUG_PRINT: u64 = 255
 
 # ============================================================================
@@ -2760,6 +2761,116 @@ fn sys_munmap_impl(addr: u64, length: u64) -> i64
 
     return 0
 
+# ============================================================================
+# Framebuffer Syscalls (for Prism compositor)
+# ============================================================================
+#
+# Provides userspace access to the framebuffer for graphics rendering.
+# These syscalls allow Prism to:
+#   1. Query framebuffer dimensions and format
+#   2. Map the framebuffer into userspace memory
+#
+# FbInfo structure (returned by sys_fb_info):
+#   u64 addr       - Physical address of framebuffer
+#   u32 width      - Horizontal resolution
+#   u32 height     - Vertical resolution
+#   u32 pitch      - Bytes per scanline
+#   u8  bpp        - Bits per pixel
+#   u8  format     - Pixel format (0=RGBX, 1=BGRX)
+#   u16 _pad       - Padding
+
+# Framebuffer info structure size: 8 + 4 + 4 + 4 + 1 + 1 + 2 = 24 bytes
+const FBINFO_SIZE: u64 = 24
+
+# Global framebuffer mapping for userspace
+var g_user_fb_mapped: u8 = 0
+var g_user_fb_addr: u64 = 0
+
+# sys_fb_info: Get framebuffer information
+# Args: info_buf pointer to 24-byte FbInfo structure
+# Returns: 0 on success, -1 if no display
+fn sys_fb_info_impl(info_buf: *u8) -> i64
+    if not display_available()
+        return -1
+
+    let fb: *SimpleFramebuffer = display_get_framebuffer()
+    if fb == 0 as *SimpleFramebuffer
+        return -1
+
+    # Write FbInfo structure
+    let buf64: *u64 = info_buf as *u64
+    let buf32: *u32 = (info_buf + 8) as *u32
+    let buf8: *u8 = info_buf + 20
+
+    # addr at offset 0
+    *buf64 = (*fb).base
+
+    # width at offset 8
+    *buf32 = (*fb).width
+
+    # height at offset 12
+    *(buf32 + 1) = (*fb).height
+
+    # pitch at offset 16
+    *(buf32 + 2) = (*fb).pitch
+
+    # bpp at offset 20
+    *buf8 = (*fb).bpp
+
+    # format at offset 21
+    *(buf8 + 1) = (*fb).format
+
+    return 0
+
+# sys_fb_map: Map framebuffer into userspace
+# Returns: Mapped address on success, -1 on error
+fn sys_fb_map_impl() -> i64
+    if not display_available()
+        return -1
+
+    let fb: *SimpleFramebuffer = display_get_framebuffer()
+    if fb == 0 as *SimpleFramebuffer
+        return -1
+
+    # If already mapped, return the existing address
+    if g_user_fb_mapped != 0
+        return g_user_fb_addr as i64
+
+    # Calculate framebuffer size
+    let fb_size: u64 = ((*fb).pitch as u64) * ((*fb).height as u64)
+    let num_pages: u64 = (fb_size + PAGE_SIZE - 1) / PAGE_SIZE
+
+    # Use a fixed address in user space for the framebuffer
+    # This is above the mmap region but below kernel space
+    let user_fb_virt: u64 = 0x00007F0000000000
+
+    # Map each page of the framebuffer
+    var i: u64 = 0
+    while i < num_pages
+        let phys_addr: u64 = (*fb).base + (i * PAGE_SIZE)
+        let virt_addr: u64 = user_fb_virt + (i * PAGE_SIZE)
+
+        # Map with write-through caching and user-accessible
+        let result: i32 = vmm_map_page(virt_addr, phys_addr, PTE_WRITABLE | PTE_USER | PTE_WRITE_THROUGH)
+        if result != 0
+            prints("[fb_map] Failed to map page ")
+            serial_print_dec(i as i64)
+            prints("\n")
+            return -1
+
+        i = i + 1
+
+    g_user_fb_mapped = 1
+    g_user_fb_addr = user_fb_virt
+
+    prints("[fb_map] Mapped ")
+    serial_print_dec(num_pages as i64)
+    prints(" pages to user address 0x")
+    serial_print_hex(user_fb_virt)
+    prints("\n")
+
+    return user_fb_virt as i64
+
 # Helper to print null-terminated string
 fn prints_str(s: *u8)
     var p: *u8 = s
@@ -2998,6 +3109,15 @@ pub fn syscall_handler(rax: u64, rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
         let result: i32 = acpi_poweroff()
         # If we get here, poweroff failed
         return result as i64
+
+    # Framebuffer syscalls for Prism compositor
+    if rax == SYS_FB_INFO
+        # sys_fb_info(info_buf: *FbInfo) -> 0 on success, -1 on no display
+        return sys_fb_info_impl(rdi as *u8)
+
+    if rax == SYS_FB_MAP
+        # sys_fb_map() -> mapped_addr or -1
+        return sys_fb_map_impl()
 
     # Unknown syscall
     prints("[syscall] unknown: ")
@@ -3405,86 +3525,70 @@ fn test_elf_loader() -> i32
     prints("=== ELF Loader Test Complete ===\n\n")
     return 0
 
-# Test loading and running the embedded Ritz ELF binary
-fn test_elf_userspace() -> i32
-    prints("\n=== Testing ELF Userspace ===\n")
+# Note: test_elf_userspace() was removed - it relied on embedded ELF binaries.
+# User binaries are now loaded from the TAR initramfs filesystem.
 
-    # Get the embedded ELF binary
-    let elf_data: *u8 = user_elf_start as *u8
-    let elf_end: u64 = user_elf_end as u64
-    let elf_size: u64 = elf_end - (elf_data as u64)
+# Run /bin/init from the filesystem as PID 1
+# This is the actual init process that runs tests and triggers shutdown.
+fn run_init() -> i32
+    prints("[init] Loading /bin/init from filesystem...\n")
 
-    prints("  Embedded ELF: ")
-    serial_print_dec(elf_size)
-    prints(" bytes at 0x")
-    serial_print_hex(elf_data as u64)
-    prints("\n")
-
-    # Validate it's a real ELF
-    let ehdr: *Elf64Ehdr = elf_data as *Elf64Ehdr
-    let validate: i32 = elf_validate_header(ehdr)
-    if validate != ELF_OK
-        prints("  Invalid ELF header!\n")
+    # Get filesystem namespace
+    let ns: *KNamespace = knamespace_get()
+    if ns == 0 as *KNamespace
+        prints("[init] No namespace!\n")
         return -1
 
-    prints("  Valid ELF64 header\n")
-    prints("  Entry point: 0x")
-    serial_print_hex((*ehdr).e_entry)
-    prints("\n")
+    # Read /bin/init
+    let path: StrView = "/bin/init" as StrView
+    var file_size: u64 = 0
+    let elf_data: *u8 = knamespace_read(ns, @path, @file_size)
 
-    # Load the ELF
-    # For static executables (ET_EXEC), use load_base=0 to use the embedded addresses
-    # For PIE executables (ET_DYN), the loader adds load_base to each address
-    var load_base: u64 = 0
-    if (*ehdr).e_type == ET_DYN
-        load_base = 0x100000000  # 4GB for PIE
-    let load_result: ElfLoadResult = elf_load(elf_data, elf_size, load_base)
+    if elf_data == 0 as *u8
+        prints("[init] /bin/init not found in filesystem\n")
+        return -1
+
+    prints("[init] Found /bin/init, size=")
+    serial_print_dec(file_size)
+    prints(" bytes\n")
+
+    # Load the ELF at a userspace address
+    let load_base: u64 = 0x100000000  # 4GB
+    let load_result: ElfLoadResult = elf_load(elf_data, file_size, load_base)
+
     if load_result.error != ELF_OK
-        prints("  ELF load failed!\n")
+        prints("[init] ELF load failed, error=")
+        serial_print_dec(load_result.error as u64)
+        prints("\n")
         return -1
 
-    # Allocate user stack
-    let stack_page: u64 = pmm_alloc_page()
-    if stack_page == 0
-        prints("  Failed to allocate stack!\n")
+    prints("[init] Loaded at entry=0x")
+    serial_print_hex(load_result.entry_point)
+    prints("\n")
+
+    # Allocate 64KB user stack (16 pages)
+    let user_stack_top: u64 = alloc_user_stack()
+    if user_stack_top == 0
+        prints("[init] Failed to allocate user stack!\n")
         return -1
 
-    let stack_vaddr: u64 = 0x7FFFFFFFE000
-    let stack_map: i32 = vmm_map_page(stack_vaddr, stack_page, PTE_WRITABLE | PTE_USER)
-    if stack_map != 0
-        prints("  Failed to map stack!\n")
-        pmm_free_page(stack_page)
-        return -1
-
-    # Stack top should point INTO the mapped page, not one byte past it!
-    # The stack grows down, so first push will go to (RSP - 8).
-    # We want that to land within the mapped page [stack_vaddr, stack_vaddr + PAGE_SIZE).
-    # So RSP should be at most (stack_vaddr + PAGE_SIZE), and first push lands at
-    # (stack_vaddr + PAGE_SIZE - 8) = 0x7FFFFFFFEFF8 which IS in the page.
-    # BUT: The IRET itself doesn't push anything. The issue is that when we LOAD
-    # RSP = 0x7FFFFFFFF000, that address must be accessible (for some operations).
-    # Let's set it to 0x7FFFFFFFEFF0 (16-byte aligned, well within the page).
-    let stack_top: u64 = stack_vaddr + PAGE_SIZE - 16
-
-    # Flush TLB for the new mappings
+    # Flush TLB for new mappings
     vmm_flush_tlb_all()
 
-    prints("  Jumping to ELF entry at 0x")
-    serial_print_hex(load_result.entry_point)
-    prints(", stack=0x")
-    serial_print_hex(stack_top)
-    prints("\n")
+    prints("[init] Starting init process...\n\n")
 
-    # Jump to userspace
-    jump_to_userspace(load_result.entry_point, stack_top)
+    # Set up as init process (PID 1)
+    g_has_parent = 0
+    g_child_pid = 1
 
-    # This should never execute
-    prints("  ERROR: Returned from jump_to_userspace!\n")
+    # Jump to userspace - this will not return until init exits
+    jump_to_userspace(load_result.entry_point, user_stack_top)
 
-    # Should not return
+    # Should not reach here - init should call ACPI poweroff
+    prints("[init] Init returned unexpectedly\n")
     return 0
 
-# Test userspace execution
+# Test userspace execution with raw assembly (minimal test)
 fn test_userspace() -> i32
     # Use the minimal user program for initial test (just calls exit)
     let user_start: u64 = user_program_minimal as u64
@@ -4200,16 +4304,22 @@ pub fn kernel_main(boot_info_addr: u64) -> i32
     klog(c"  [..] Kernel blob store")
     kblob_init()
     klog(c"\r  [OK] Kernel blob store\n")
+    if heap_check() != 0
+        klog(c"    [HEAP CORRUPT after kblob_init]\n")
 
     klog(c"  [..] VFS layer")
     vfs_init()
     fd_table_init()
     klog(c"\r  [OK] VFS layer\n")
+    if heap_check() != 0
+        klog(c"    [HEAP CORRUPT after vfs_init]\n")
 
     # Initialize PCI early (needed for VirtIO block device)
     klog(c"  [..] PCI enumeration (early)")
     let pci_count_early: i32 = pci_init()
     klog(c"\r  [OK] PCI enumeration (early)\n")
+    if heap_check() != 0
+        klog(c"    [HEAP CORRUPT after pci_init]\n")
 
     # Initialize VirtIO block device (needed for initramfs loading)
     klog(c"  [..] VirtIO block device")
@@ -4218,6 +4328,8 @@ pub fn kernel_main(boot_info_addr: u64) -> i32
         klog(c"\r  [OK] VirtIO block device\n")
     else
         klog(c"\r  [..] VirtIO block device (not found)\n")
+    if heap_check() != 0
+        klog(c"    [HEAP CORRUPT after virtio_blk_init]\n")
 
     # Initialize kernel namespace (Goliath integration)
     klog(c"  [..] Kernel namespace")
@@ -4225,6 +4337,8 @@ pub fn kernel_main(boot_info_addr: u64) -> i32
     if kns_store != 0 as *fs.kblob.KBlobStore
         knamespace_init(kns_store)
         klog(c"\r  [OK] Kernel namespace\n")
+        if heap_check() != 0
+            klog(c"    [HEAP CORRUPT after knamespace_init]\n")
 
         # Initialize filesystem syscalls
         klog(c"  [..] Filesystem syscalls")
@@ -4570,20 +4684,11 @@ pub fn kernel_main(boot_info_addr: u64) -> i32
     # Test ELF loader (validates structures and parsing)
     test_elf_loader()
 
-    # Test userspace execution
-    # First try loading the embedded Ritz ELF binary
-    # If that's not available, fall back to raw assembly test
-    prints("\nTesting Userspace...\n")
-
-    let elf_data: *u8 = user_elf_start as *u8
-    let elf_end: u64 = user_elf_end as u64
-    let elf_size: u64 = elf_end - (elf_data as u64)
-
-    if elf_size > 0
-        prints("  Using embedded Ritz ELF binary\n")
-        test_elf_userspace()
-    else
-        prints("  Using raw assembly test\n")
+    # Run /bin/init as PID 1 - this runs tests and shuts down
+    # This will not return if init runs correctly
+    let init_result: i32 = run_init()
+    if init_result != 0
+        prints("[kernel] Failed to run init, falling back to assembly test\n")
         test_userspace()
 
     # Test scheduler with some tasks
