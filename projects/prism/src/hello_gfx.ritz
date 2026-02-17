@@ -1,0 +1,249 @@
+# Graphical Hello World for Harland
+#
+# Minimal userspace program that demonstrates bitmap text rendering
+# on the framebuffer. Uses a simple 8x8 bitmap font for ASCII.
+
+import ritzlib.sys { syscall1, syscall2, STDOUT }
+import ritzlib.str { strlen }
+
+# Harland framebuffer syscalls
+const SYS_WRITE: i64 = 1
+const SYS_FB_INFO: i64 = 210
+const SYS_FB_MAP: i64 = 211
+
+# Framebuffer info structure (must match kernel definition)
+struct FbInfo
+    addr: u64       # Physical address
+    width: u32      # Horizontal resolution
+    height: u32     # Vertical resolution
+    pitch: u32      # Bytes per scanline
+    bpp: u8         # Bits per pixel
+    format: u8      # Pixel format (0=RGBX, 1=BGRX)
+    _pad: [2]u8
+
+# Get framebuffer info
+fn sys_fb_info(info: *FbInfo) -> i64
+    syscall1(SYS_FB_INFO, info as i64)
+
+# Map framebuffer into userspace
+fn sys_fb_map() -> i64
+    syscall1(SYS_FB_MAP, 0)
+
+# Print to serial console
+fn print_str(s: *u8)
+    let len = strlen(s)
+    syscall2(SYS_WRITE, STDOUT as i64, s as i64, len as i64)
+
+# Pack RGB into BGRX format (common for UEFI)
+fn pack_bgrx(r: u8, g: u8, b: u8) -> u32
+    (b as u32) | ((g as u32) << 8) | ((r as u32) << 16)
+
+# Set a single pixel (bounds-checked)
+fn put_pixel(fb: *u32, pitch: u32, width: u32, height: u32, x: u32, y: u32, color: u32)
+    if x >= width or y >= height
+        return
+    let pixels_per_line = pitch / 4
+    let offset = (y as u64) * (pixels_per_line as u64) + (x as u64)
+    *(fb + offset) = color
+
+# Clear screen with a color
+fn clear_screen(fb: *u32, pitch: u32, width: u32, height: u32, color: u32)
+    let pixels_per_line = pitch / 4
+    var y: u32 = 0
+    while y < height
+        let row_offset = (y as u64) * (pixels_per_line as u64)
+        var x: u32 = 0
+        while x < width
+            *(fb + row_offset + (x as u64)) = color
+            x = x + 1
+        y = y + 1
+
+# =============================================================================
+# 8x8 Bitmap Font
+# =============================================================================
+
+# Get the bit pattern for a character's row
+# Returns 8 bits where MSB = leftmost pixel
+fn font_row(c: u8, row: u32) -> u8
+    # H (72) = [0x66, 0x66, 0x66, 0x7E, 0x66, 0x66, 0x66, 0x00]
+    if c == 72
+        if row == 0 or row == 1 or row == 2 or row == 4 or row == 5 or row == 6
+            return 0x66
+        if row == 3
+            return 0x7E
+        return 0x00
+
+    # e (101) = [0x00, 0x00, 0x3C, 0x66, 0x7E, 0x60, 0x3C, 0x00]
+    if c == 101
+        if row == 0 or row == 1 or row == 7
+            return 0x00
+        if row == 2 or row == 6
+            return 0x3C
+        if row == 3
+            return 0x66
+        if row == 4
+            return 0x7E
+        return 0x60
+
+    # l (108) = [0x38, 0x18, 0x18, 0x18, 0x18, 0x18, 0x3C, 0x00]
+    if c == 108
+        if row == 0
+            return 0x38
+        if row == 1 or row == 2 or row == 3 or row == 4 or row == 5
+            return 0x18
+        if row == 6
+            return 0x3C
+        return 0x00
+
+    # o (111) = [0x00, 0x00, 0x3C, 0x66, 0x66, 0x66, 0x3C, 0x00]
+    if c == 111
+        if row == 0 or row == 1 or row == 7
+            return 0x00
+        if row == 2 or row == 6
+            return 0x3C
+        return 0x66
+
+    # comma (44) = [0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x18, 0x30]
+    if c == 44
+        if row == 5 or row == 6
+            return 0x18
+        if row == 7
+            return 0x30
+        return 0x00
+
+    # space (32) = all zeros
+    if c == 32
+        return 0x00
+
+    # a (97) = [0x00, 0x00, 0x3C, 0x06, 0x3E, 0x66, 0x3E, 0x00]
+    if c == 97
+        if row == 0 or row == 1 or row == 7
+            return 0x00
+        if row == 2
+            return 0x3C
+        if row == 3
+            return 0x06
+        if row == 4 or row == 6
+            return 0x3E
+        return 0x66
+
+    # r (114) = [0x00, 0x00, 0x6C, 0x76, 0x60, 0x60, 0x60, 0x00]
+    if c == 114
+        if row == 0 or row == 1 or row == 7
+            return 0x00
+        if row == 2
+            return 0x6C
+        if row == 3
+            return 0x76
+        return 0x60
+
+    # n (110) = [0x00, 0x00, 0x7C, 0x66, 0x66, 0x66, 0x66, 0x00]
+    if c == 110
+        if row == 0 or row == 1 or row == 7
+            return 0x00
+        if row == 2
+            return 0x7C
+        return 0x66
+
+    # d (100) = [0x06, 0x06, 0x3E, 0x66, 0x66, 0x66, 0x3E, 0x00]
+    if c == 100
+        if row == 0 or row == 1
+            return 0x06
+        if row == 2 or row == 6
+            return 0x3E
+        if row == 7
+            return 0x00
+        return 0x66
+
+    # ! (33) = [0x18, 0x18, 0x18, 0x18, 0x18, 0x00, 0x18, 0x00]
+    if c == 33
+        if row == 5 or row == 7
+            return 0x00
+        return 0x18
+
+    # Default: empty glyph
+    0x00
+
+# Draw a single character at (x, y) with scaling
+fn draw_char(fb: *u32, pitch: u32, width: u32, height: u32, x: u32, y: u32, c: u8, color: u32, scale: u32)
+    var row: u32 = 0
+    while row < 8
+        let row_bits = font_row(c, row)
+        var col: u32 = 0
+        while col < 8
+            # Check if pixel is set (MSB first)
+            let mask: u8 = (0x80 >> col) as u8
+            if (row_bits and mask) != 0
+                # Draw scaled pixel block
+                var sy: u32 = 0
+                while sy < scale
+                    var sx: u32 = 0
+                    while sx < scale
+                        let px = x + col * scale + sx
+                        let py = y + row * scale + sy
+                        put_pixel(fb, pitch, width, height, px, py, color)
+                        sx = sx + 1
+                    sy = sy + 1
+            col = col + 1
+        row = row + 1
+
+# Draw a null-terminated string at (x, y)
+fn draw_string(fb: *u32, pitch: u32, width: u32, height: u32, x: u32, y: u32, text: *u8, color: u32, scale: u32)
+    var cur_x = x
+    var i: usize = 0
+    while *(text + i) != 0
+        let c = *(text + i)
+        draw_char(fb, pitch, width, height, cur_x, y, c, color, scale)
+        cur_x = cur_x + 8 * scale + scale  # 8px char + 1px spacing
+        i = i + 1
+
+# =============================================================================
+# Main
+# =============================================================================
+
+pub fn main() -> i32
+    print_str(c"[hello_gfx] Starting...\n")
+
+    # Get framebuffer info
+    var info: FbInfo
+    let info_result = sys_fb_info(@info)
+    if info_result != 0
+        print_str(c"[hello_gfx] ERROR: No framebuffer available\n")
+        return 1
+
+    print_str(c"[hello_gfx] Framebuffer detected\n")
+
+    # Map framebuffer into our address space
+    let fb_addr = sys_fb_map()
+    if fb_addr < 0
+        print_str(c"[hello_gfx] ERROR: Failed to map framebuffer\n")
+        return 1
+
+    print_str(c"[hello_gfx] Framebuffer mapped\n")
+
+    let fb = fb_addr as *u32
+
+    # Clear to Catppuccin Mocha base (dark blue #1E1E2E)
+    let bg = pack_bgrx(0x1E, 0x1E, 0x2E)
+    clear_screen(fb, info.pitch, info.width, info.height, bg)
+
+    print_str(c"[hello_gfx] Screen cleared\n")
+
+    # Calculate centered text position
+    # "Hello, Harland!" is 15 chars, each (8*scale + scale) pixels wide
+    let scale: u32 = 4
+    let char_width = 8 * scale + scale
+    let text_width = 15 * char_width
+    let text_height = 8 * scale
+
+    let text_x = (info.width - text_width) / 2
+    let text_y = (info.height - text_height) / 2
+
+    # Draw text in white
+    let white = pack_bgrx(0xFF, 0xFF, 0xFF)
+    draw_string(fb, info.pitch, info.width, info.height, text_x, text_y, c"Hello, Harland!", white, scale)
+
+    print_str(c"[hello_gfx] Text drawn\n")
+    print_str(c"[hello_gfx] SUCCESS - Hello, Harland! displayed!\n")
+
+    0
