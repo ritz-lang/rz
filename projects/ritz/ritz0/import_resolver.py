@@ -471,9 +471,9 @@ class ImportResolver:
             new_body = self._transform_block(stmt.body, aliases)
             return replace(stmt, cond=new_cond, body=new_body)
         elif isinstance(stmt, rast.ForStmt):
-            new_iter = self._transform_expr(stmt.iter_expr, aliases)
+            new_iter = self._transform_expr(stmt.iter, aliases)
             new_body = self._transform_block(stmt.body, aliases)
-            return replace(stmt, iter_expr=new_iter, body=new_body)
+            return replace(stmt, iter=new_iter, body=new_body)
         return stmt
 
     def _transform_expr(self, expr: rast.Expr, aliases: Dict[str, str]) -> rast.Expr:
