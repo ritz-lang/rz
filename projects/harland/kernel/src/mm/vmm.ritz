@@ -6,7 +6,7 @@
 # Depends on PMM for page table allocation.
 
 import serial { StrView, prints, serial_print_hex, serial_print_dec, println }
-import mm.pmm { PAGE_SIZE, pmm_alloc_page, pmm_free_page }
+import mm.pmm { PAGE_SIZE, pmm_alloc_page, pmm_free_page, pmm_mark_region_used }
 
 # ============================================================================
 # Page Table Entry Flags (x86-64)
@@ -85,6 +85,11 @@ fn vmm_set_entry(table_phys: u64, index: u64, value: u64) -> i32
     let entry_ptr: *u64 = (table_phys + index * 8) as *u64
     *entry_ptr = value
     return 0
+
+# Read a PML4 entry (public for debugging)
+pub fn vmm_read_pml4_entry(pml4_phys: u64, index: u64) -> u64
+    let entry_ptr: *u64 = (pml4_phys + index * 8) as *u64
+    return *entry_ptr
 
 # ============================================================================
 # Address Decomposition
@@ -570,13 +575,22 @@ pub fn vmm_create_user_pml4() -> u64
             vmm_set_entry(new_pdpt, i, 0)
             i = i + 1
 
-        # Copy only PDPT[0] from kernel - this is the 0-1GB identity mapping
-        # (1GB huge page or PD for 2MB pages)
+        # Copy PDPT entries from kernel that the kernel needs:
+        # - PDPT[0]: 0-1GB identity mapping (physical memory)
+        # - PDPT[3]: 3-4GB range (contains LAPIC at 0xFEE00000 and I/O APIC at 0xFEC00000)
+        # These mappings are kernel-only (no USER bit) so userspace can't access them
+        # but the kernel can still use them when handling syscalls/interrupts.
         let kernel_pdpt: u64 = kernel_pml4_0 & PTE_ADDR_MASK
+
+        # Copy PDPT[0] - identity mapping for 0-1GB physical
         let pdpt_0: u64 = vmm_get_entry(kernel_pdpt, 0)
         if (pdpt_0 & PTE_PRESENT) != 0
-            # Copy without USER bit - kernel only
             vmm_set_entry(new_pdpt, 0, pdpt_0 & ~PTE_USER)
+
+        # Copy PDPT[3] - 3-4GB range (LAPIC, I/O APIC, other MMIO)
+        let pdpt_3: u64 = vmm_get_entry(kernel_pdpt, 3)
+        if (pdpt_3 & PTE_PRESENT) != 0
+            vmm_set_entry(new_pdpt, 3, pdpt_3 & ~PTE_USER)
 
         # Set PML4[0] to point to our new PDPT (without USER bit)
         vmm_set_entry(new_pml4, 0, new_pdpt | PTE_PRESENT | PTE_WRITABLE)
@@ -613,6 +627,42 @@ pub fn vmm_switch_pml4(pml4_phys: u64) -> i32
 pub fn vmm_get_current_pml4() -> u64
     return vmm_pml4_phys
 
+# Reserve all page table pages in the PMM so they won't be reallocated.
+# This walks the entire PML4 and marks all PDPT, PD, and PT pages as used.
+# Call this after heap_init since the heap creates new page table entries.
+pub fn vmm_reserve_page_tables() -> i32
+    # Reserve the PML4 itself
+    pmm_mark_region_used(vmm_pml4_phys, PAGE_SIZE)
+
+    # Walk all present PML4 entries
+    var pml4i: u64 = 0
+    while pml4i < 512
+        let pml4_entry: u64 = vmm_get_entry(vmm_pml4_phys, pml4i)
+        if (pml4_entry & PTE_PRESENT) != 0
+            let pdpt_phys: u64 = pml4_entry & PTE_ADDR_MASK
+            pmm_mark_region_used(pdpt_phys, PAGE_SIZE)
+
+            # Walk present PDPT entries
+            var pdpti: u64 = 0
+            while pdpti < 512
+                let pdpt_entry: u64 = vmm_get_entry(pdpt_phys, pdpti)
+                if (pdpt_entry & PTE_PRESENT) != 0 and (pdpt_entry & PTE_HUGE) == 0
+                    let pd_phys: u64 = pdpt_entry & PTE_ADDR_MASK
+                    pmm_mark_region_used(pd_phys, PAGE_SIZE)
+
+                    # Walk present PD entries
+                    var pdi: u64 = 0
+                    while pdi < 512
+                        let pd_entry: u64 = vmm_get_entry(pd_phys, pdi)
+                        if (pd_entry & PTE_PRESENT) != 0 and (pd_entry & PTE_HUGE) == 0
+                            let pt_phys: u64 = pd_entry & PTE_ADDR_MASK
+                            pmm_mark_region_used(pt_phys, PAGE_SIZE)
+                        pdi = pdi + 1
+                pdpti = pdpti + 1
+        pml4i = pml4i + 1
+
+    return 0
+
 # Map a page in a specific page table (not necessarily the active one)
 # This is used to set up a process's address space before switching to it
 pub fn vmm_map_page_in(pml4: u64, vaddr: u64, paddr: u64, flags: u64) -> i32
@@ -632,6 +682,10 @@ pub fn vmm_map_page_in(pml4: u64, vaddr: u64, paddr: u64, flags: u64) -> i32
 
 # Free all user-space pages in a page table (for process cleanup)
 # Does NOT free the kernel mappings or the PML4 itself
+#
+# IMPORTANT: vmm_create_user_pml4 copies kernel PDPT entries [0] and [3] into
+# the child's PML4[0] PDPT. These point to SHARED kernel page tables that must
+# NOT be freed! We only free entries that were allocated for the child process.
 pub fn vmm_free_user_pages(pml4: u64) -> i32
     # User space is in the lower half (PML4 indices 0-255)
     # Walk each level and free pages
@@ -647,6 +701,13 @@ pub fn vmm_free_user_pages(pml4: u64) -> i32
 
         var pdpt_idx: u64 = 0
         while pdpt_idx < 512
+            # CRITICAL: Skip PDPT[0] and PDPT[3] in PML4[0] - these are copies of
+            # kernel entries that point to SHARED page tables (identity mapping and
+            # APIC/MMIO regions). We must NOT free these!
+            if pml4_idx == 0 and (pdpt_idx == 0 or pdpt_idx == 3)
+                pdpt_idx = pdpt_idx + 1
+                continue
+
             let pdpt_entry: u64 = vmm_get_entry(pdpt_phys, pdpt_idx)
             if (pdpt_entry & PTE_PRESENT) == 0
                 pdpt_idx = pdpt_idx + 1
@@ -690,7 +751,7 @@ pub fn vmm_free_user_pages(pml4: u64) -> i32
             pmm_free_page(pd_phys)
             pdpt_idx = pdpt_idx + 1
 
-        # Free the PDPT itself
+        # Free the PDPT itself (this was allocated by vmm_create_user_pml4)
         pmm_free_page(pdpt_phys)
         pml4_idx = pml4_idx + 1
 
