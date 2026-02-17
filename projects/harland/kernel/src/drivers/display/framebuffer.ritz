@@ -1,0 +1,277 @@
+# Simple Framebuffer Driver
+#
+# Linear framebuffer driver for UEFI GOP and VESA VBE.
+# Provides basic pixel operations for kernel console output.
+#
+# The framebuffer is memory-mapped and can be accessed directly.
+# For production use, consider double-buffering to avoid tearing.
+
+import serial { prints, serial_print_hex, serial_print_dec }
+import mm.heap { kalloc, kfree }
+import mm.vmm { vmm_map_page, PTE_WRITABLE, PTE_WRITE_THROUGH }
+import mm.pmm { PAGE_SIZE }
+
+# Framebuffer pixel formats
+pub const FB_FORMAT_RGBX: u8 = 0     # Red-Green-Blue-Reserved (UEFI type 0)
+pub const FB_FORMAT_BGRX: u8 = 1     # Blue-Green-Red-Reserved (UEFI type 1, most common)
+pub const FB_FORMAT_OTHER: u8 = 2    # Custom bitmask
+
+# Size of SimpleFramebuffer structure for allocation
+const SIMPLE_FRAMEBUFFER_SIZE: u64 = 48
+
+# Simple framebuffer state
+pub struct SimpleFramebuffer
+    base: u64           # Physical address (also virtual in identity-mapped kernel)
+    width: u32          # Horizontal resolution
+    height: u32         # Vertical resolution
+    pitch: u32          # Bytes per scanline (may be > width * bytes_per_pixel)
+    bpp: u8             # Bits per pixel (usually 32)
+    format: u8          # Pixel format (FB_FORMAT_*)
+    _pad: [2]u8
+
+# Pack a color into the correct pixel format
+fn pack_pixel(fb: *SimpleFramebuffer, r: u8, g: u8, b: u8) -> u32
+    if (*fb).format == FB_FORMAT_RGBX
+        # RGBX: R in low byte
+        return (r as u32) | ((g as u32) << 8) | ((b as u32) << 16)
+    else
+        # BGRX (default): B in low byte
+        return (b as u32) | ((g as u32) << 8) | ((r as u32) << 16)
+
+# Unpack a pixel to RGB components (via out parameters)
+fn unpack_pixel(fb: *SimpleFramebuffer, pixel: u32, r_out: *u8, g_out: *u8, b_out: *u8)
+    if (*fb).format == FB_FORMAT_RGBX
+        *r_out = (pixel & 0xFF) as u8
+        *g_out = ((pixel >> 8) & 0xFF) as u8
+        *b_out = ((pixel >> 16) & 0xFF) as u8
+    else
+        *b_out = (pixel & 0xFF) as u8
+        *g_out = ((pixel >> 8) & 0xFF) as u8
+        *r_out = ((pixel >> 16) & 0xFF) as u8
+
+# Initialize framebuffer from boot info
+pub fn fb_init(addr: u64, width: u32, height: u32, pitch: u32, bpp: u8, format: u8) -> *SimpleFramebuffer
+    if addr == 0
+        return 0 as *SimpleFramebuffer
+
+    # Calculate framebuffer size and map it into kernel address space
+    let fb_size: u64 = (pitch as u64) * (height as u64)
+    let num_pages: u64 = (fb_size + PAGE_SIZE - 1) / PAGE_SIZE
+
+    # Map framebuffer pages (identity map the physical address)
+    # Use write-through caching for framebuffer (PTE_WRITE_THROUGH)
+    var page: u64 = 0
+    while page < num_pages
+        let page_addr: u64 = addr + (page * PAGE_SIZE)
+        let result: i32 = vmm_map_page(page_addr, page_addr, PTE_WRITABLE | PTE_WRITE_THROUGH)
+        if result != 0
+            prints("[fb] Failed to map framebuffer page at ")
+            serial_print_hex(page_addr)
+            prints("\n")
+            return 0 as *SimpleFramebuffer
+        page = page + 1
+
+    # Allocate framebuffer state
+    let fb: *SimpleFramebuffer = kalloc(SIMPLE_FRAMEBUFFER_SIZE) as *SimpleFramebuffer
+    if fb == 0 as *SimpleFramebuffer
+        prints("[fb] Failed to allocate framebuffer state\n")
+        return 0 as *SimpleFramebuffer
+
+    (*fb).base = addr
+    (*fb).width = width
+    (*fb).height = height
+    (*fb).pitch = pitch
+    (*fb).bpp = bpp
+    (*fb).format = format
+
+    prints("[fb] Framebuffer initialized: ")
+    serial_print_dec(width as u64)
+    prints("x")
+    serial_print_dec(height as u64)
+    prints(" @ ")
+    serial_print_hex(addr)
+    prints(" (")
+    if format == FB_FORMAT_RGBX
+        prints("RGBX")
+    else if format == FB_FORMAT_BGRX
+        prints("BGRX")
+    else
+        prints("custom")
+    prints(", ")
+    serial_print_dec(num_pages)
+    prints(" pages mapped)\n")
+
+    return fb
+
+# Get framebuffer dimensions
+pub fn fb_get_info(fb: *SimpleFramebuffer, width: *u32, height: *u32, pitch: *u32)
+    *width = (*fb).width
+    *height = (*fb).height
+    *pitch = (*fb).pitch
+
+# Clear entire framebuffer with a color
+pub fn fb_clear(fb: *SimpleFramebuffer, color: u32)
+    let pixels: *u32 = (*fb).base as *u32
+    let pixels_per_line: u32 = (*fb).pitch / 4
+    let total: u64 = (pixels_per_line as u64) * ((*fb).height as u64)
+
+    var i: u64 = 0
+    while i < total
+        *(pixels + i) = color
+        i = i + 1
+
+# Clear framebuffer with RGB color
+pub fn fb_clear_rgb(fb: *SimpleFramebuffer, r: u8, g: u8, b: u8)
+    let color: u32 = pack_pixel(fb, r, g, b)
+    fb_clear(fb, color)
+
+# Set a single pixel
+pub fn fb_put_pixel(fb: *SimpleFramebuffer, x: u32, y: u32, color: u32)
+    if x >= (*fb).width or y >= (*fb).height
+        return
+
+    let pixels_per_line: u32 = (*fb).pitch / 4
+    let offset: u64 = (y as u64) * (pixels_per_line as u64) + (x as u64)
+    let pixels: *u32 = (*fb).base as *u32
+    *(pixels + offset) = color
+
+# Set a pixel with RGB values
+pub fn fb_put_pixel_rgb(fb: *SimpleFramebuffer, x: u32, y: u32, r: u8, g: u8, b: u8)
+    let color: u32 = pack_pixel(fb, r, g, b)
+    fb_put_pixel(fb, x, y, color)
+
+# Fill a rectangle
+pub fn fb_fill_rect(fb: *SimpleFramebuffer, x: u32, y: u32, w: u32, h: u32, color: u32)
+    let pixels: *u32 = (*fb).base as *u32
+    let pixels_per_line: u32 = (*fb).pitch / 4
+
+    # Clip to screen bounds
+    var x1: u32 = x
+    var y1: u32 = y
+    var x2: u32 = x + w
+    var y2: u32 = y + h
+
+    if x1 >= (*fb).width
+        return
+    if y1 >= (*fb).height
+        return
+    if x2 > (*fb).width
+        x2 = (*fb).width
+    if y2 > (*fb).height
+        y2 = (*fb).height
+
+    var row: u32 = y1
+    while row < y2
+        var col: u32 = x1
+        let row_offset: u64 = (row as u64) * (pixels_per_line as u64)
+        while col < x2
+            *(pixels + row_offset + (col as u64)) = color
+            col = col + 1
+        row = row + 1
+
+# Fill rectangle with RGB color
+pub fn fb_fill_rect_rgb(fb: *SimpleFramebuffer, x: u32, y: u32, w: u32, h: u32, r: u8, g: u8, b: u8)
+    let color: u32 = pack_pixel(fb, r, g, b)
+    fb_fill_rect(fb, x, y, w, h, color)
+
+# Draw a horizontal line
+pub fn fb_hline(fb: *SimpleFramebuffer, x: u32, y: u32, w: u32, color: u32)
+    fb_fill_rect(fb, x, y, w, 1, color)
+
+# Draw a vertical line
+pub fn fb_vline(fb: *SimpleFramebuffer, x: u32, y: u32, h: u32, color: u32)
+    fb_fill_rect(fb, x, y, 1, h, color)
+
+# Draw an outlined rectangle
+pub fn fb_stroke_rect(fb: *SimpleFramebuffer, x: u32, y: u32, w: u32, h: u32, color: u32)
+    fb_hline(fb, x, y, w, color)              # Top
+    fb_hline(fb, x, y + h - 1, w, color)      # Bottom
+    fb_vline(fb, x, y, h, color)              # Left
+    fb_vline(fb, x + w - 1, y, h, color)      # Right
+
+# Get raw pixel value at position
+pub fn fb_get_pixel(fb: *SimpleFramebuffer, x: u32, y: u32) -> u32
+    if x >= (*fb).width or y >= (*fb).height
+        return 0
+
+    let pixels_per_line: u32 = (*fb).pitch / 4
+    let offset: u64 = (y as u64) * (pixels_per_line as u64) + (x as u64)
+    let pixels: *u32 = (*fb).base as *u32
+    return *(pixels + offset)
+
+# Scroll framebuffer up by 'lines' pixels
+pub fn fb_scroll_up(fb: *SimpleFramebuffer, lines: u32)
+    if lines >= (*fb).height
+        fb_clear(fb, 0)
+        return
+
+    let pixels: *u32 = (*fb).base as *u32
+    let pixels_per_line: u32 = (*fb).pitch / 4
+    let line_bytes: u32 = (*fb).pitch
+
+    # Copy lines up
+    var dst_row: u32 = 0
+    var src_row: u32 = lines
+    while src_row < (*fb).height
+        let dst_offset: u64 = (dst_row as u64) * (pixels_per_line as u64)
+        let src_offset: u64 = (src_row as u64) * (pixels_per_line as u64)
+
+        var col: u32 = 0
+        while col < pixels_per_line
+            *(pixels + dst_offset + (col as u64)) = *(pixels + src_offset + (col as u64))
+            col = col + 1
+
+        dst_row = dst_row + 1
+        src_row = src_row + 1
+
+    # Clear the newly exposed lines at bottom
+    var clear_row: u32 = (*fb).height - lines
+    while clear_row < (*fb).height
+        let row_offset: u64 = (clear_row as u64) * (pixels_per_line as u64)
+        var col: u32 = 0
+        while col < pixels_per_line
+            *(pixels + row_offset + (col as u64)) = 0
+            col = col + 1
+        clear_row = clear_row + 1
+
+# Copy a region within the framebuffer
+pub fn fb_copy_rect(fb: *SimpleFramebuffer, src_x: u32, src_y: u32, dst_x: u32, dst_y: u32, w: u32, h: u32)
+    let pixels: *u32 = (*fb).base as *u32
+    let pixels_per_line: u32 = (*fb).pitch / 4
+
+    # Determine copy direction to handle overlapping regions
+    var y_start: i32 = 0
+    var y_end: i32 = h as i32
+    var y_step: i32 = 1
+
+    if dst_y > src_y
+        # Copy from bottom to top
+        y_start = (h as i32) - 1
+        y_end = -1
+        y_step = -1
+
+    var y: i32 = y_start
+    while y != y_end
+        let row: u32 = y as u32
+        let src_row_offset: u64 = ((src_y + row) as u64) * (pixels_per_line as u64)
+        let dst_row_offset: u64 = ((dst_y + row) as u64) * (pixels_per_line as u64)
+
+        if dst_x <= src_x
+            # Copy left to right
+            var col: u32 = 0
+            while col < w
+                *(pixels + dst_row_offset + (dst_x + col) as u64) = *(pixels + src_row_offset + (src_x + col) as u64)
+                col = col + 1
+        else
+            # Copy right to left
+            var col: i32 = (w as i32) - 1
+            while col >= 0
+                *(pixels + dst_row_offset + (dst_x + (col as u32)) as u64) = *(pixels + src_row_offset + (src_x + (col as u32)) as u64)
+                col = col - 1
+
+        y = y + y_step
+
+# Free framebuffer resources
+pub fn fb_destroy(fb: *SimpleFramebuffer)
+    if fb != 0 as *SimpleFramebuffer
+        kfree(fb)
