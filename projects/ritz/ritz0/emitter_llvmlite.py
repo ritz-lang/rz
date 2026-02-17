@@ -4088,10 +4088,44 @@ class LLVMEmitter:
         elif isinstance(expr, rast.BinOp):
             op = expr.op
 
-            # Handle short-circuit operators BEFORE evaluating right operand
+            # Handle and/or operators
+            # For boolean types (i1): use short-circuit evaluation
+            # For integer types: use bitwise operations
             if op in ('&&', 'and'):
+                # Check if this is a boolean context (both sides are comparisons or bool)
+                if self._is_boolean_expr(expr.left) and self._is_boolean_expr(expr.right):
+                    return self._emit_short_circuit_and(expr)
+                # Otherwise, evaluate both and use bitwise and
+                left = self._emit_expr(expr.left)
+                right = self._emit_expr(expr.right)
+                # If both are integers, use bitwise AND
+                if isinstance(left.type, ir.IntType) and isinstance(right.type, ir.IntType):
+                    # Ensure same width
+                    if left.type.width != right.type.width:
+                        if left.type.width < right.type.width:
+                            left = self.builder.zext(left, right.type)
+                        else:
+                            right = self.builder.zext(right, left.type)
+                    return self.builder.and_(left, right)
+                # Fall back to short-circuit for other types
                 return self._emit_short_circuit_and(expr)
             elif op in ('||', 'or'):
+                # Check if this is a boolean context
+                if self._is_boolean_expr(expr.left) and self._is_boolean_expr(expr.right):
+                    return self._emit_short_circuit_or(expr)
+                # Otherwise, evaluate both and use bitwise or
+                left = self._emit_expr(expr.left)
+                right = self._emit_expr(expr.right)
+                # If both are integers, use bitwise OR
+                if isinstance(left.type, ir.IntType) and isinstance(right.type, ir.IntType):
+                    # Ensure same width
+                    if left.type.width != right.type.width:
+                        if left.type.width < right.type.width:
+                            left = self.builder.zext(left, right.type)
+                        else:
+                            right = self.builder.zext(right, left.type)
+                    return self.builder.or_(left, right)
+                # Fall back to short-circuit for other types
                 return self._emit_short_circuit_or(expr)
 
             left = self._emit_expr(expr.left)
@@ -7071,6 +7105,42 @@ class LLVMEmitter:
         """Check if a Ritz type is unsigned."""
         if isinstance(ty, rast.NamedType):
             return ty.name in ('u8', 'u16', 'u32', 'u64')
+        return False
+
+    def _is_boolean_expr(self, expr: rast.Expr) -> bool:
+        """Check if an expression is a boolean (comparison, logical, etc).
+
+        Used to determine whether 'and'/'or' should use short-circuit
+        evaluation (for booleans) or bitwise operations (for integers).
+        """
+        # Comparison operators always produce bool
+        if isinstance(expr, rast.BinOp):
+            if expr.op in ('==', '!=', '<', '<=', '>', '>='):
+                return True
+            # Nested and/or with boolean operands
+            if expr.op in ('&&', '||', 'and', 'or'):
+                return self._is_boolean_expr(expr.left) and self._is_boolean_expr(expr.right)
+
+        # Unary not on boolean
+        if isinstance(expr, rast.UnaryOp) and expr.op == 'not':
+            return True
+
+        # Bool literals
+        if isinstance(expr, rast.BoolLit):
+            return True
+
+        # Identifier with bool type
+        if isinstance(expr, rast.Ident):
+            if expr.name in self.ritz_types:
+                ritz_type = self.ritz_types[expr.name]
+                if isinstance(ritz_type, rast.NamedType) and ritz_type.name == 'bool':
+                    return True
+
+        # Method calls that return bool (e.g., is_some(), is_none())
+        if isinstance(expr, rast.MethodCall):
+            if expr.method in ('is_some', 'is_none', 'is_ok', 'is_err'):
+                return True
+
         return False
 
     def _infer_unsigned_expr(self, expr: rast.Expr) -> bool:
