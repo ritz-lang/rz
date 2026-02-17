@@ -138,13 +138,20 @@ syscall_entry:
     sti
 
     # Call the Ritz syscall handler
-    # syscall_handler(rax, rdi, rsi, rdx) -> i64
+    # syscall_handler(rax, rdi, rsi, rdx, r10) -> i64
     #
     # Our saved frame on the stack (after callee-saved):
-    #   +0:  RAX (syscall number)
-    #   +8:  RDI (arg1)
-    #   +16: RSI (arg2)
-    #   +24: RDX (arg3)
+    #   +0:  r15 (callee-saved)
+    #   +8:  r14
+    #   +16: r13
+    #   +24: r12
+    #   +32: rbp
+    #   +40: rbx
+    #   +48: RAX (syscall number)
+    #   +56: RDI (arg1)
+    #   +64: RSI (arg2)
+    #   +72: RDX (arg3)
+    #   +80: R10 (arg4)
     #   ... etc
     #
     # Load arguments from saved frame
@@ -152,6 +159,7 @@ syscall_entry:
     movq 56(%rsp), %rsi          # rsi = saved RDI (arg1)
     movq 64(%rsp), %rdx          # rdx = saved RSI (arg2)
     movq 72(%rsp), %rcx          # rcx = saved RDX (arg3)
+    movq 80(%rsp), %r8           # r8 = saved R10 (arg4)
     call syscall_handler
 
     # Return value is in RAX - save it to a temporary location

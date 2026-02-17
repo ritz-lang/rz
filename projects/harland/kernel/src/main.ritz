@@ -2076,6 +2076,8 @@ const SYS_READ: u64 = 0
 const SYS_WRITE: u64 = 1
 const SYS_OPEN: u64 = 2
 const SYS_CLOSE: u64 = 3
+const SYS_MMAP: u64 = 9       # Map memory pages
+const SYS_MUNMAP: u64 = 11    # Unmap memory pages
 const SYS_READDIR: u64 = 17
 const SYS_EXIT: u64 = 20
 const SYS_SPAWN: u64 = 21
@@ -2085,6 +2087,49 @@ const SYS_YIELD: u64 = 24
 const SYS_SPAWN_ARGS: u64 = 25
 const SYS_ACPI_POWEROFF: u64 = 200
 const SYS_DEBUG_PRINT: u64 = 255
+
+# ============================================================================
+# Memory Mapping (mmap/munmap)
+# ============================================================================
+#
+# Harland uses a simplified mmap interface:
+#   sys_mmap(addr_hint, length, prot, flags) -> mapped_addr or -1
+#   sys_munmap(addr, length) -> 0 or -1
+#
+# We only support anonymous mappings (no file-backed mmap yet).
+# The kernel allocates physical pages and maps them into the process.
+
+# Protection flags (simplified - we always allow read)
+const PROT_READ: u64 = 1
+const PROT_WRITE: u64 = 2
+const PROT_EXEC: u64 = 4
+
+# Mapping flags
+const MAP_PRIVATE: u64 = 0x02     # Private mapping (copy-on-write if file-backed)
+const MAP_ANONYMOUS: u64 = 0x20   # No file backing
+const MAP_FIXED: u64 = 0x10       # Map at exact address (hint is required)
+
+# User address space limits
+const USER_MMAP_START: u64 = 0x10000000      # 256MB - start of mmap region
+const USER_MMAP_END: u64 = 0x7FFFFFF00000    # Just below stack
+
+# User stack configuration
+# Stack grows DOWN from the top of the stack region.
+# We map 16 pages (64KB) from USER_STACK_BASE to USER_STACK_TOP.
+# The stack pointer starts at USER_STACK_TOP + PAGE_SIZE (one byte past the top page).
+#
+# Memory layout:
+#   USER_STACK_BASE   = 0x7FFFFFFEF000  (page 0, lowest address)
+#   ...
+#   USER_STACK_TOP    = 0x7FFFFFFFE000  (page 15, highest mapped page)
+#   Stack grows DOWN from USER_STACK_TOP + PAGE_SIZE - 16
+const USER_STACK_PAGES: u64 = 16
+const USER_STACK_SIZE: u64 = 65536  # 16 * 4096 = 64KB
+const USER_STACK_TOP: u64 = 0x7FFFFFFFE000   # Highest mapped page of user stack
+const USER_STACK_BASE: u64 = 0x7FFFFFFEF000  # Lowest page of stack (TOP - 15*PAGE_SIZE)
+
+# Simple mmap allocator state - tracks next free address for hint=0 case
+var g_next_mmap_addr: u64 = 0x10000000  # USER_MMAP_START
 
 # ============================================================================
 # Process State for Spawn/Exit
@@ -2179,6 +2224,67 @@ fn sys_readdir_impl(dir_path: *u8, buf: *u8, buf_size: i64) -> i64
 
     return bytes_written
 
+# ============================================================================
+# User Stack Allocation Helper
+# ============================================================================
+#
+# Allocates and maps a multi-page user stack. The stack grows DOWN from
+# USER_STACK_TOP. We allocate USER_STACK_PAGES physical pages and map them
+# contiguously.
+#
+# Returns: Stack pointer (top of usable stack), or 0 on failure
+fn alloc_user_stack() -> u64
+    # Allocate and map USER_STACK_PAGES pages starting from USER_STACK_BASE
+    var i: u64 = 0
+    while i < USER_STACK_PAGES
+        let phys_page: u64 = pmm_alloc_page()
+        if phys_page == 0
+            # Allocation failed - unmap what we've done so far
+            var j: u64 = 0
+            while j < i
+                let vaddr: u64 = USER_STACK_BASE + (j * PAGE_SIZE)
+                let paddr: u64 = vmm_virt_to_phys(vaddr)
+                vmm_unmap_page(vaddr)
+                if paddr != 0
+                    pmm_free_page(paddr)
+                j = j + 1
+            return 0
+
+        # Map page at USER_STACK_BASE + (i * PAGE_SIZE)
+        let vaddr: u64 = USER_STACK_BASE + (i * PAGE_SIZE)
+        let map_result: i32 = vmm_map_page(vaddr, phys_page, PTE_WRITABLE | PTE_USER)
+        if map_result != 0
+            # Map failed - free this page and unmap previous pages
+            pmm_free_page(phys_page)
+            var j: u64 = 0
+            while j < i
+                let prev_vaddr: u64 = USER_STACK_BASE + (j * PAGE_SIZE)
+                let paddr: u64 = vmm_virt_to_phys(prev_vaddr)
+                vmm_unmap_page(prev_vaddr)
+                if paddr != 0
+                    pmm_free_page(paddr)
+                j = j + 1
+            return 0
+
+        i = i + 1
+
+    # Stack pointer points to top of mapped region (stack grows DOWN)
+    # USER_STACK_TOP + PAGE_SIZE is the first unmapped address
+    # So stack_ptr = USER_STACK_TOP + PAGE_SIZE - 16 (aligned, with some headroom)
+    let stack_ptr: u64 = USER_STACK_TOP + PAGE_SIZE - 16
+    return stack_ptr
+
+# Free a user stack allocated by alloc_user_stack
+fn free_user_stack()
+    var i: u64 = 0
+    while i < USER_STACK_PAGES
+        let vaddr: u64 = USER_STACK_BASE + (i * PAGE_SIZE)
+        let paddr: u64 = vmm_virt_to_phys(vaddr)
+        vmm_unmap_page(vaddr)
+        if paddr != 0
+            pmm_free_page(paddr)
+        i = i + 1
+
 # sys_spawn: Load and execute a binary from the filesystem
 # This is a BLOCKING spawn - we save parent state, run child, and when
 # child exits, we restore parent state and return with child's exit code.
@@ -2245,27 +2351,14 @@ fn sys_spawn_impl(path: *u8) -> i64
         g_child_pml4 = 0
         return -1
 
-    # Allocate child stack in the child's address space
-    let child_stack_page: u64 = pmm_alloc_page()
-    if child_stack_page == 0
+    # Allocate 64KB user stack (16 pages)
+    let child_stack_top: u64 = alloc_user_stack()
+    if child_stack_top == 0
         vmm_switch_pml4(g_parent_ctx.user_pml4)
         vmm_free_pml4(child_pml4)
         g_has_parent = 0
         g_child_pml4 = 0
         return -1
-
-    # Map stack at standard location (no conflict with parent - separate address space!)
-    let child_stack_vaddr: u64 = 0x7FFFFFFFE000  # Same as init's stack
-    let map_result: i32 = vmm_map_page(child_stack_vaddr, child_stack_page, PTE_WRITABLE | PTE_USER)
-    if map_result != 0
-        pmm_free_page(child_stack_page)
-        vmm_switch_pml4(g_parent_ctx.user_pml4)
-        vmm_free_pml4(child_pml4)
-        g_has_parent = 0
-        g_child_pml4 = 0
-        return -1
-
-    let child_stack_top: u64 = child_stack_vaddr + PAGE_SIZE - 16
 
     # Jump to child! This does NOT return.
     # We're already in the child's address space (CR3 was switched above).
@@ -2388,21 +2481,10 @@ fn sys_spawn_args_impl(path: *u8, argv: **u8, argc: i32) -> i64
         g_child_pml4 = 0
         return -1
 
-    # Allocate child stack
-    let child_stack_page: u64 = pmm_alloc_page()
-    if child_stack_page == 0
+    # Allocate 64KB user stack (16 pages)
+    let alloc_stack_top: u64 = alloc_user_stack()
+    if alloc_stack_top == 0
         prints("[spawn_args] Failed to allocate child stack\n")
-        vmm_switch_pml4(g_parent_ctx.user_pml4)
-        vmm_free_pml4(child_pml4)
-        g_has_parent = 0
-        g_child_pml4 = 0
-        return -1
-
-    let child_stack_vaddr: u64 = 0x7FFFFFFFE000
-    let map_result: i32 = vmm_map_page(child_stack_vaddr, child_stack_page, PTE_WRITABLE | PTE_USER)
-    if map_result != 0
-        prints("[spawn_args] Failed to map child stack\n")
-        pmm_free_page(child_stack_page)
         vmm_switch_pml4(g_parent_ctx.user_pml4)
         vmm_free_pml4(child_pml4)
         g_has_parent = 0
@@ -2418,8 +2500,8 @@ fn sys_spawn_args_impl(path: *u8, argv: **u8, argc: i32) -> i64
     #   5. argv[0] pointer
     #   6. (16-byte aligned) <- RSP points here
 
-    let stack_base: u64 = child_stack_vaddr
-    var stack_ptr: u64 = stack_base + PAGE_SIZE
+    # Stack top is USER_STACK_TOP + PAGE_SIZE (first unmapped address)
+    var stack_ptr: u64 = USER_STACK_TOP + PAGE_SIZE
 
     # Copy string data to top of stack (working down)
     stack_ptr = stack_ptr - (total_string_bytes as u64)
@@ -2531,6 +2613,153 @@ fn sys_wait_impl(pid: i32) -> i64
     # No child to wait for
     return -1
 
+# ============================================================================
+# sys_mmap: Map anonymous memory pages
+# ============================================================================
+#
+# Arguments:
+#   addr_hint: Suggested address (0 = kernel chooses)
+#   length: Number of bytes to map (will be rounded up to page size)
+#   prot: Protection flags (PROT_READ | PROT_WRITE | PROT_EXEC)
+#   flags: Mapping flags (MAP_ANONYMOUS | MAP_PRIVATE)
+#
+# Returns:
+#   Address of mapped region, or -1 on error
+#
+# Note: We only support anonymous private mappings for now.
+fn sys_mmap_impl(addr_hint: u64, length: u64, prot: u64, flags: u64) -> i64
+    # Validate flags - we only support anonymous private mappings
+    if (flags & MAP_ANONYMOUS) == 0
+        prints("[mmap] ERROR: only anonymous mappings supported\n")
+        return -1
+
+    if length == 0
+        prints("[mmap] ERROR: length cannot be zero\n")
+        return -1
+
+    # Round length up to page size
+    let num_pages: u64 = (length + PAGE_SIZE - 1) / PAGE_SIZE
+
+    # Determine the mapping address
+    var map_addr: u64 = 0
+    if (flags & MAP_FIXED) != 0
+        # Must map at the exact address
+        if addr_hint == 0 or (addr_hint & 0xFFF) != 0
+            prints("[mmap] ERROR: MAP_FIXED requires page-aligned address\n")
+            return -1
+        map_addr = addr_hint
+    else if addr_hint != 0 and (addr_hint & 0xFFF) == 0
+        # Try the hint address if it's page-aligned
+        map_addr = addr_hint
+    else
+        # Kernel chooses - use simple bump allocator
+        map_addr = g_next_mmap_addr
+        g_next_mmap_addr = g_next_mmap_addr + (num_pages * PAGE_SIZE)
+
+    # Validate address is in user mmap region
+    if map_addr < USER_MMAP_START or map_addr >= USER_MMAP_END
+        prints("[mmap] ERROR: address outside user mmap region\n")
+        return -1
+
+    if (map_addr + num_pages * PAGE_SIZE) > USER_MMAP_END
+        prints("[mmap] ERROR: mapping would exceed mmap region\n")
+        return -1
+
+    # Compute page table flags from protection
+    var pte_flags: u64 = PTE_PRESENT | PTE_USER
+    if (prot & PROT_WRITE) != 0
+        pte_flags = pte_flags | PTE_WRITABLE
+    if (prot & PROT_EXEC) == 0
+        pte_flags = pte_flags | PTE_NO_EXECUTE
+
+    # Allocate and map each page
+    var i: u64 = 0
+    while i < num_pages
+        let page_phys: u64 = pmm_alloc_page()
+        if page_phys == 0
+            prints("[mmap] ERROR: out of physical memory\n")
+            # TODO: Unmap already-mapped pages
+            return -1
+
+        let page_virt: u64 = map_addr + (i * PAGE_SIZE)
+        let result: i32 = vmm_map_page(page_virt, page_phys, pte_flags)
+        if result != 0
+            prints("[mmap] ERROR: failed to map page at 0x")
+            serial_print_hex(page_virt)
+            prints("\n")
+            pmm_free_page(page_phys)
+            # TODO: Unmap already-mapped pages
+            return -1
+
+        # Zero the page for security
+        var p: u64 = 0
+        while p < PAGE_SIZE
+            *((page_virt + p) as *u8) = 0
+            p = p + 1
+
+        i = i + 1
+
+    # Debug output
+    prints("[mmap] Mapped ")
+    serial_print_dec(num_pages as i64)
+    prints(" pages at 0x")
+    serial_print_hex(map_addr)
+    prints("\n")
+
+    return map_addr as i64
+
+# ============================================================================
+# sys_munmap: Unmap memory pages
+# ============================================================================
+#
+# Arguments:
+#   addr: Address of region to unmap (must be page-aligned)
+#   length: Number of bytes to unmap (will be rounded up to page size)
+#
+# Returns:
+#   0 on success, -1 on error
+fn sys_munmap_impl(addr: u64, length: u64) -> i64
+    # Validate address alignment
+    if (addr & 0xFFF) != 0
+        prints("[munmap] ERROR: address not page-aligned\n")
+        return -1
+
+    if length == 0
+        return 0  # Nothing to do
+
+    # Validate address is in user mmap region
+    if addr < USER_MMAP_START or addr >= USER_MMAP_END
+        prints("[munmap] ERROR: address outside user mmap region\n")
+        return -1
+
+    # Round length up to page size
+    let num_pages: u64 = (length + PAGE_SIZE - 1) / PAGE_SIZE
+
+    # Unmap each page
+    var i: u64 = 0
+    while i < num_pages
+        let page_virt: u64 = addr + (i * PAGE_SIZE)
+
+        # Get physical address before unmapping
+        let page_phys: u64 = vmm_virt_to_phys(page_virt)
+
+        # Unmap the page
+        let result: i32 = vmm_unmap_page(page_virt)
+        if result == 0 and page_phys != 0
+            # Free the physical page
+            pmm_free_page(page_phys)
+
+        i = i + 1
+
+    # Debug output
+    prints("[munmap] Unmapped ")
+    serial_print_dec(num_pages as i64)
+    prints(" pages at 0x")
+    serial_print_hex(addr)
+    prints("\n")
+
+    return 0
+
 # Helper to print null-terminated string
 fn prints_str(s: *u8)
     var p: *u8 = s
@@ -2624,7 +2853,8 @@ pub fn syscall_init() -> i32
     return 0
 
 # Syscall handler (called from assembly)
-pub fn syscall_handler(rax: u64, rdi: u64, rsi: u64, rdx: u64) -> i64
+# Arguments: rax=syscall#, rdi=arg1, rsi=arg2, rdx=arg3, r10=arg4
+pub fn syscall_handler(rax: u64, rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
     # Handle exit specially - it may not return!
     if rax == SYS_EXIT
         # sys_exit_impl handles both child exit (return to parent) and
@@ -2752,6 +2982,15 @@ pub fn syscall_handler(rax: u64, rdi: u64, rsi: u64, rdx: u64) -> i64
 
     if rax == SYS_CAP_CHECK
         return sys_cap_check(1, rdi, rsi as u32)
+
+    # Memory management syscalls
+    if rax == SYS_MMAP
+        # mmap(addr, length, prot, flags)
+        return sys_mmap_impl(rdi, rsi, rdx, r10)
+
+    if rax == SYS_MUNMAP
+        # munmap(addr, length)
+        return sys_munmap_impl(rdi, rsi)
 
     # ACPI power management syscalls
     if rax == SYS_ACPI_POWEROFF
@@ -3110,20 +3349,11 @@ pub fn elf_exec(elf_data: *u8, elf_size: u64) -> i32
         prints("\n")
         return load_result.error
 
-    # Allocate user stack
-    let stack_page: u64 = pmm_alloc_page()
-    if stack_page == 0
+    # Allocate 64KB user stack (16 pages)
+    let stack_top: u64 = alloc_user_stack()
+    if stack_top == 0
         prints("[elf] Failed to allocate user stack!\n")
         return ELF_ERR_ALLOC_FAILED
-
-    let stack_vaddr: u64 = 0x7FFFFFFFE000
-    let map_result: i32 = vmm_map_page(stack_vaddr, stack_page, PTE_WRITABLE | PTE_USER)
-    if map_result != 0
-        prints("[elf] Failed to map user stack!\n")
-        pmm_free_page(stack_page)
-        return ELF_ERR_MAP_FAILED
-
-    let stack_top: u64 = stack_vaddr + PAGE_SIZE
 
     # Flush TLB
     vmm_flush_tlb_all()
@@ -3260,28 +3490,17 @@ fn test_userspace() -> i32
     let user_start: u64 = user_program_minimal as u64
     let user_size: u64 = 16  # Just a few instructions
 
-    # Allocate a user stack (4KB)
-    let user_stack_page: u64 = pmm_alloc_page()
-    if user_stack_page == 0
+    # Allocate 64KB user stack (16 pages)
+    let user_stack_top: u64 = alloc_user_stack()
+    if user_stack_top == 0
         prints("  Failed to allocate user stack!\n")
         return -1
-
-    # Map the stack at a user-accessible address
-    let user_stack_vaddr: u64 = 0x7FFFFFFFE000  # High canonical user address
-    let map_result: i32 = vmm_map_page(user_stack_vaddr, user_stack_page, PTE_WRITABLE | PTE_USER)
-    if map_result != 0
-        prints("  Failed to map user stack!\n")
-        pmm_free_page(user_stack_page)
-        return -1
-
-    let user_stack_top: u64 = user_stack_vaddr + 4096
 
     # Allocate and copy user code to a new page
     let user_code_page: u64 = pmm_alloc_page()
     if user_code_page == 0
         prints("  Failed to allocate user code page!\n")
-        vmm_unmap_page(user_stack_vaddr)
-        pmm_free_page(user_stack_page)
+        free_user_stack()
         return -1
 
     # Copy user program to new page
@@ -3297,8 +3516,7 @@ fn test_userspace() -> i32
     let code_map_result: i32 = vmm_map_page(user_code_vaddr, user_code_page, PTE_USER)
     if code_map_result != 0
         prints("  Failed to map user code!\n")
-        vmm_unmap_page(user_stack_vaddr)
-        pmm_free_page(user_stack_page)
+        free_user_stack()
         pmm_free_page(user_code_page)
         return -1
 
@@ -3318,8 +3536,7 @@ fn test_userspace() -> i32
 
     # Cleanup (shouldn't happen)
     vmm_unmap_page(user_code_vaddr)
-    vmm_unmap_page(user_stack_vaddr)
-    pmm_free_page(user_stack_page)
+    free_user_stack()
     pmm_free_page(user_code_page)
 
     return 0

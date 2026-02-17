@@ -1,9 +1,10 @@
 /* User program linker script for Harland */
 /* Links at 4GB virtual address, above kernel's identity-mapped region */
+/* Entry point is _start (provided by runtime) which calls main() and sys_exit() */
 
 OUTPUT_FORMAT("elf64-x86-64")
 OUTPUT_ARCH(i386:x86-64)
-ENTRY(main)
+ENTRY(_start)
 
 SECTIONS
 {
