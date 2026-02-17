@@ -161,3 +161,18 @@ wc_elf_end:
 
 wc_elf_size:
     .quad wc_elf_end - wc_elf_start
+
+# ============================================================================
+# rzsh.elf - Ritz Shell (interactive shell for harland)
+# ============================================================================
+.global rzsh_elf_start
+.global rzsh_elf_end
+.global rzsh_elf_size
+
+.align 16
+rzsh_elf_start:
+    .incbin "build/debug/rzsh.elf"
+rzsh_elf_end:
+
+rzsh_elf_size:
+    .quad rzsh_elf_end - rzsh_elf_start
