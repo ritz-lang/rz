@@ -167,6 +167,14 @@ for elf in "$INDIUM_DIR/build/debug"/*.elf; do
     fi
 done
 
+# For interactive mode, replace init with init_interactive
+if [ "$INTERACTIVE" = true ]; then
+    if [ -f "$INITRAMFS_TMP/bin/init_interactive" ]; then
+        echo "  Using init_interactive for interactive mode"
+        cp "$INITRAMFS_TMP/bin/init_interactive" "$INITRAMFS_TMP/bin/init"
+    fi
+fi
+
 # Copy prism binaries
 if [ -f "$PRISM_DIR/build/debug/prism_demo.elf" ]; then
     cp "$PRISM_DIR/build/debug/prism_demo.elf" "$INITRAMFS_TMP/bin/prism_demo"
