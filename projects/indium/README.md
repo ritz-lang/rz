@@ -1,93 +1,89 @@
 # Indium
 
-**Indium** is the distribution built on the Harland microkernel.
+Distribution built on the Harland microkernel - userspace programs, init system, and bootable image tooling.
 
-## Architecture
+**Part of the [Ritz Ecosystem](../larb/docs/ECOSYSTEM.md)**
 
-The Ritz ecosystem separates the **kernel** from the **distribution**:
+## Overview
 
-- **Harland** — The microkernel. Just the kernel and UEFI bootloader.
-- **Indium** — The distribution. Builds userspace, creates images, runs QEMU.
+Indium is the distribution layer that builds on top of the Harland microkernel. While Harland provides only the kernel and UEFI bootloader, Indium provides everything needed for a bootable, usable system: an init process, basic Unix utilities, shell, and the tooling to build bootable ISO and disk images.
 
-This separation allows:
-- Clean testing of kernel vs userspace
-- Proper packaging and image creation
-- Multiple distributions built on Harland (future)
+This separation keeps the kernel repository clean and focused, allowing multiple distributions to potentially build on Harland in the future. Indium programs use `libharland` - a Ritz library that wraps Harland's syscall ABI into a portable interface. All userspace binaries are position-independent executables (PIE) compiled as freestanding Ritz programs that link the Harland runtime.
 
-## Quick Start
+Named after Indium, a soft malleable metal - the distribution that wraps around the hard kernel.
+
+## Features
+
+- Init process (PID 1) for system initialization
+- Basic Unix utilities written in Ritz for Harland
+- rzsh shell (cross-platform, runs on both Harland and Linux)
+- libharland syscall wrapper library
+- Position-independent executable (PIE) userspace binaries
+- Bootable ISO image builder (GRUB/BIOS mode)
+- UEFI disk image builder (qcow2 format)
+- QEMU launch targets for both UEFI and BIOS boot
+
+## Installation
 
 ```bash
+# Prerequisites: qemu-system-x86, grub-efi, mtools
+cd projects/indium
+
 # Build everything and create bootable ISO
 make
 
-# Boot in QEMU (BIOS mode via GRUB)
+# Boot in QEMU (BIOS/GRUB mode)
 make run-iso
 
 # Boot in QEMU (UEFI mode)
 make run
 
-# Build with debugging (GDB server on :1234)
+# Build with GDB debug server
 make debug
+# Then: gdb -ex "target remote :1234" ../harland/build/harland.elf
 ```
 
-## Structure
+## Usage
 
+```bash
+# Available make targets
+make              # Build ISO (default)
+make kernel       # Build Harland kernel only
+make userspace    # Build all userspace programs
+make iso          # Create bootable ISO with GRUB
+make image        # Create qcow2 disk image (UEFI)
+make run          # Boot in QEMU (UEFI)
+make run-iso      # Boot in QEMU (BIOS/GRUB)
+make debug        # Boot with GDB server on :1234
+make clean        # Remove build artifacts
 ```
-indium/
-├── ritz.toml             # Userspace program build config
-├── Makefile              # Distribution build orchestration
-├── tools/
-│   ├── mkiso.sh          # ISO image builder
-│   ├── mkimage.py        # qcow2 disk image builder
-│   └── mkboot.sh         # Raw disk image builder
-├── user/                 # Userspace programs
-│   ├── libharland.ritz   # Syscall library
-│   ├── linker_pie.ld     # Position-independent linker
-│   ├── init.ritz         # Init process (PID 1)
-│   ├── hello.ritz        # Hello world
-│   ├── true.ritz         # Exit 0
-│   ├── false.ritz        # Exit 1
-│   ├── echo.ritz         # Echo arguments
-│   ├── wc.ritz           # Word count
-│   └── ...               # Other utilities
-└── config/               # Future: distribution configs
-```
-
-## Build Targets
-
-| Target | Description |
-|--------|-------------|
-| `make` | Build ISO (default) |
-| `make kernel` | Build Harland kernel |
-| `make userspace` | Build userspace programs |
-| `make iso` | Create bootable ISO with GRUB |
-| `make image` | Create qcow2 disk image (UEFI) |
-| `make run` | Boot in QEMU (UEFI mode) |
-| `make run-iso` | Boot in QEMU (BIOS/GRUB mode) |
-| `make debug` | Boot with GDB server on :1234 |
-| `make clean` | Remove build artifacts |
 
 ## Userspace Programs
 
-### Tier 1 - Basic Utilities
-- `hello` - Print "Hello from Harland!"
-- `true` - Exit with status 0
-- `false` - Exit with status 1
-- `exitcode` - Exit with specific code
-- `echo` - Print arguments
-- `wc` - Count words/lines/bytes
-- `seq10` - Print 1-10
-- `cat_motd` - Print message of the day
+| Program | Description |
+|---------|-------------|
+| `init` | Init process - PID 1, starts the system |
+| `rzsh` | Interactive shell |
+| `hello` | Print "Hello from Harland!" |
+| `true` | Exit with status 0 |
+| `false` | Exit with status 1 |
+| `exitcode` | Exit with a specific code |
+| `echo` | Print command-line arguments |
+| `wc` | Count words, lines, and bytes |
+| `seq10` | Print numbers 1 through 10 |
+| `cat_motd` | Display the message of the day |
+| `ping` | Network connectivity test |
+| `args_test` | Test argument passing |
+| `mmap_test` | Test mmap syscall |
 
-### System Programs
-- `init` - Init process (PID 1)
-- `ping` - Network connectivity test
+## Dependencies
 
-### Test Programs
-- `args_test` - Test argument passing
-- `minimal_syscall` - Minimal syscall test
-- `portable_getpid` - getpid() test
+- `harland` - Microkernel (kernel must be built first)
 
-## Why "Indium"?
+## Status
 
-Indium is a soft, malleable metal. Like the distribution that wraps around the hard kernel.
+**Active development** - Init, basic utilities (hello, true, false, echo, wc, seq10), and rzsh shell all run on Harland. UEFI and BIOS bootable images are buildable. mmap and args passing work. Multi-process support and more utilities are in progress.
+
+## License
+
+MIT License - see LICENSE file

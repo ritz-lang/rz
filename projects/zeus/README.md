@@ -1,137 +1,80 @@
 # Zeus
 
-Zero-copy process runner for Ritz applications. Shared memory ring buffer IPC between Valet and isolated worker processes.
+Zero-copy process runner for Ritz - shared memory ring buffer IPC between Valet and isolated worker processes.
+
+**Part of the [Ritz Ecosystem](../larb/docs/ECOSYSTEM.md)**
 
 ## Overview
 
-Zeus provides secure process isolation for Ritz web applications. Instead of running user code in the same process as Valet, Zeus spawns isolated worker processes that communicate via shared memory ring buffers - achieving zero-copy data transfer for maximum performance.
+Zeus provides secure process isolation for Ritz web applications. Rather than running application code in the same process as the HTTP server, Zeus spawns isolated worker processes that communicate with Valet via shared memory ring buffers. Request and response data never leaves shared memory - only pointers and offsets cross the process boundary, achieving zero-copy data transfer.
+
+This architecture means a crashing worker process cannot take down the HTTP server. Zeus handles worker restarts, load balancing across multiple workers, and resource limits. It is the process management and IPC layer that sits between Valet (HTTP) and Spire (application framework) in the full Ritz stack.
 
 Named as a hat tip to the OG homies.
 
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────┐
-│                   Valet (Policy)                    │
-│            routing, TLS, load balancing             │
-└───────────────────────┬─────────────────────────────┘
-                        │
-            ┌───────────▼───────────┐
-            │    Shared Memory      │
-            │  ┌─────────────────┐  │
-            │  │  Request Ring   │  │  Valet → Worker
-            │  └─────────────────┘  │
-            │  ┌─────────────────┐  │
-            │  │  Response Ring  │  │  Worker → Valet
-            │  └─────────────────┘  │
-            │  ┌─────────────────┐  │
-            │  │   Data Arena    │  │  Bodies, headers
-            │  └─────────────────┘  │
-            └───────────────────────┘
-                        │
-┌───────────────────────▼─────────────────────────────┐
-│                  Zeus Worker                        │
-│           Your Ritz app (isolated)                  │
-└─────────────────────────────────────────────────────┘
-```
-
 ## Features
 
-### Zero-Copy IPC
-- Shared memory ring buffers (SPSC)
-- Request/response data stays in place
-- Only pointers/offsets cross the boundary
-- No serialization overhead
+- Zero-copy IPC using shared memory SPSC ring buffers
+- Worker process isolation - crashes don't affect Valet
+- Automatic worker restarts on failure
+- Multiple workers with round-robin or least-connections load balancing
+- Request/response correlation via 64-bit IDs
+- Data arena for body and header storage (bump allocator)
+- Futex-based signaling with spin-then-block strategy
+- No serialization overhead - data stays in shared memory
+- Resource limits per worker process
 
-### Process Isolation
-- Worker crashes don't take down Valet
-- Security boundary between server and app code
-- Resource limits per worker
-- Graceful worker restarts
+## Installation
 
-### Multi-Worker Scaling
-- N workers with dedicated ring pairs
-- Round-robin or least-connections load balancing
-- Work stealing (optional)
-- Hot reload support
+```bash
+# As a dependency in ritz.toml:
+# [dependencies]
+# zeus = { path = "../zeus" }
 
-## Memory Layout
-
+# Build from source
+export RITZ_PATH=/path/to/ritz
+./ritz build .
 ```
-Shared Memory Region (configurable, e.g., 64MB)
-┌─────────────────────────────────────────────────────┐
-│  Control Block (4KB)                                │
-│    req_write_idx, req_read_idx                      │
-│    resp_write_idx, resp_read_idx                    │
-│    flags, worker_pid, ...                           │
-├─────────────────────────────────────────────────────┤
-│  Request Ring (N slots)                             │
-├─────────────────────────────────────────────────────┤
-│  Response Ring (N slots)                            │
-├─────────────────────────────────────────────────────┤
-│  Data Arena                                         │
-│    Request bodies, response bodies, headers         │
-│    Bump allocator, freed on request completion      │
-└─────────────────────────────────────────────────────┘
-```
-
-## Slot Structures
-
-```ritz
-struct RequestSlot {
-    id: u64,              // Request correlation ID
-    method: u8,           // HTTP method enum
-    path_offset: u32,     // Offset into data arena
-    path_len: u16,
-    headers_offset: u32,
-    headers_len: u16,
-    body_offset: u32,
-    body_len: u32,
-    flags: u8,            // Streaming, keep-alive, etc.
-}
-
-struct ResponseSlot {
-    id: u64,              // Correlates to request
-    status: u16,          // HTTP status code
-    headers_offset: u32,
-    headers_len: u16,
-    body_offset: u32,
-    body_len: u32,
-    flags: u8,            // Chunked, complete, error
-}
-```
-
-## Signaling
-
-| Platform | Wake Mechanism |
-|----------|----------------|
-| Linux | `futex` on control word |
-| macOS | `dispatch_semaphore` / `pthread_cond` |
-| Windows | `WaitOnAddress` / named semaphore |
-
-Strategy: Spin briefly, then block. Most requests complete fast enough that spinning wins.
 
 ## Usage
 
 ```ritz
-use zeus::{Worker, Config}
+import zeus { Worker }
 
-// In your Ritz app
-pub fn main() {
-    let worker = Worker::connect()?
-
-    worker.serve(|req| {
-        Response::new()
+# In your Ritz application worker process
+fn main() -> i32
+    let worker = Worker.connect()
+    worker.serve(fn(req: *Request) -> Response
+        Response.new()
             .status(200)
-            .body("Hello from Zeus!")
-    })
-}
+            .body("Hello from Zeus!\n")
+    )
+    0
 ```
+
+## Memory Layout
+
+```
+Shared Memory Region (configurable, default 64MB)
++---------------------------+
+|  Control Block (4KB)      |  Indices, flags, worker PID
++---------------------------+
+|  Request Ring (N slots)   |  Valet -> Worker
++---------------------------+
+|  Response Ring (N slots)  |  Worker -> Valet
++---------------------------+
+|  Data Arena               |  Request/response bodies and headers
++---------------------------+
+```
+
+## Dependencies
+
+- `ritzunit` - Test framework
 
 ## Status
 
-**Early Development** - Ring buffer primitives and protocol design in progress.
+**Alpha** - Ring buffer design and shared memory protocol are defined. Core IPC primitives and worker lifecycle management are being implemented. The full integration with Valet and Spire is in progress.
 
 ## License
 
-MIT
+MIT License - see LICENSE file

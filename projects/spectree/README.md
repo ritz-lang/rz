@@ -1,153 +1,97 @@
 # Spectree
 
-Hierarchical specification and planning tree for AI-assisted software development. Built in Ritz, served over Zeus/Valet.
+Hierarchical specification and planning tree for AI-assisted software development.
+
+**Part of the [Ritz Ecosystem](../larb/docs/ECOSYSTEM.md)**
 
 ## Overview
 
-Spectree manages a tree of well-defined specifications and plans. It provides the organizational structure for complex projects where AI agents (like Adele) can collaborate on planning, own segments of work, and propose changes to specs.
+Spectree manages a tree of well-defined specifications and plans for complex software projects. It provides the organizational structure for AI agents (such as Adele) to collaborate on planning, own segments of work, propose changes to specifications, and track progress across a project hierarchy.
 
-## Concepts
+The tree has three node types: Org nodes provide root organizational context, Spec nodes declare what IS or SHOULD BE (declarative truth), and Plan nodes describe what TO DO (imperative work items). Nodes can be linked to each other (a Plan implements a Spec, a Spec depends on another Spec), and each node has an attached conversation history for agent collaboration.
 
-### Node Types
+Spectree is served as an MCP (Model Context Protocol) server, enabling any MCP-compatible AI client to interact with the spec tree. It is built using Mausoleum for persistent storage and deployed via the Zeus/Valet stack.
 
-| Type | Purpose | Contains |
-|------|---------|----------|
-| **Org** | Root node | Top-level organizational context |
-| **Spec** | Declarative truth | What IS or SHOULD BE |
-| **Plan** | Imperative work | What TO DO |
+## Features
 
-### Tree Structure
+- Three node types: Org (root), Spec (declarative), Plan (imperative)
+- Tree structure with parent/child relationships
+- Graph links between nodes (Implements, DependsOn, RelatedTo)
+- Agent ownership - assign responsibility to specific agents
+- Conversation history attached to each node
+- Status tracking (Draft, InProgress, Review, Complete, Archived)
+- MCP server interface for AI client integration
+- Node splitting and merging as scope evolves
+- Built on Mausoleum for full version history
 
-```
-Org: "Ritz Language"
-├── Spec: "Language Design"
-│   ├── Spec: "Type System"
-│   │   ├── Spec: "Borrowing Semantics"
-│   │   └── Spec: "Generic Constraints"
-│   └── Spec: "Async Model"
-│       └── Plan: "Implement Async/Await"  ← agent owns this
-├── Spec: "Standard Library"
-│   └── Spec: "HTTP Module"
-│       └── Plan: "Port from Valet"
-└── Plan: "Q1 2025 Roadmap"
-    ├── Plan: "Phase 1: Core Compiler"
-    └── Plan: "Phase 2: Stdlib"
-```
+## Installation
 
-### Links
+```bash
+# Build from source
+export RITZ_PATH=/path/to/ritz
+./ritz build .
 
-Plans reference the specs they implement or modify. Specs can reference other specs they depend on.
-
-## Agent Integration
-
-Spectree is designed for AI agent collaboration:
-
-### Conversation History
-Each node has an attached conversation history - like a "room" in Adele's UI.
-
-```
-┌─────────────────────────────────────────────┐
-│  Node: "Borrowing Semantics Spec"           │
-├─────────────────────────────────────────────┤
-│  Status: Draft                              │
-│  Agents: @adele-1 (owner), @adele-2 (review)│
-├─────────────────────────────────────────────┤
-│  [Conversation History]                     │
-│  [Proposed Changes]                         │
-│  [Child Nodes]                              │
-└─────────────────────────────────────────────┘
+# Run the Spectree MCP server
+./build/debug/spectree serve --port 9090
 ```
 
-### Agent Capabilities
-
-- **Own** a node (responsible for completion)
-- **Collaborate** on planning phases (turn-by-turn chat)
-- **Propose** spec changes or plan adjustments
-- **Split/merge** nodes as scope clarifies
-- **Complete** segments and update status
-
-## Architecture
-
-Spectree is:
-- **Separate** from Adele's UI (clean separation of concerns)
-- **Hookable** by Adele's ecosystem (MCP server interface)
-- **Built in Ritz** (dogfooding the language)
-- **Served over Zeus/Valet** (dogfooding the stack)
-
-```
-┌─────────────────────────────────────────────┐
-│              Adele UI                       │
-│         (or any MCP client)                 │
-└───────────────────┬─────────────────────────┘
-                    │ MCP Protocol
-┌───────────────────▼─────────────────────────┐
-│              Spectree                       │
-│         (Ritz application)                  │
-└───────────────────┬─────────────────────────┘
-                    │ Zeus Protocol
-┌───────────────────▼─────────────────────────┐
-│           Valet + Zeus                      │
-│         (HTTP server layer)                 │
-└─────────────────────────────────────────────┘
-```
-
-## Data Model
+## Usage
 
 ```ritz
-enum NodeKind {
-    Org,
-    Spec,
-    Plan,
-}
+import spectree { Tree, Node, NodeKind }
 
-struct Node {
-    id: Uuid,
-    kind: NodeKind,
-    title: String,
-    content: Markdown,
-    status: Status,
-    parent: Option<NodeId>,
-    children: Vec<NodeId>,
-    links: Vec<Link>,
-    agents: Vec<AgentRef>,
-    history: ConversationId,
-    created_at: Timestamp,
-    updated_at: Timestamp,
-}
+# Create a spec hierarchy
+let tree = Tree.open("project.m7m")
 
-enum Status {
-    Draft,
-    InProgress,
-    Review,
-    Complete,
-    Archived,
-}
+let org = tree.create(NodeKind.Org, "Ritz Language", null)
+let spec = tree.create(NodeKind.Spec, "Type System", org.id)
+let plan = tree.create(NodeKind.Plan, "Implement Generics", spec.id)
 
-struct Link {
-    kind: LinkKind,  // Implements, DependsOn, RelatedTo
-    target: NodeId,
-}
+# Link plan to the spec it implements
+tree.link(plan.id, spec.id, LinkKind.Implements)
+
+# Claim ownership (agent responsibility)
+tree.claim(plan.id, "adele-agent-1")
+
+# Query the tree
+let all_plans = tree.descendants(org.id).filter_kind(NodeKind.Plan)
+let drafts = tree.query().kind(NodeKind.Spec).status(Status.Draft).exec()
 ```
 
-## API (MCP Server)
-
 ```
+# MCP API (for AI clients)
 spectree.get_node(id)
 spectree.list_children(id)
 spectree.create_node(parent, kind, title, content)
 spectree.update_node(id, changes)
-spectree.move_node(id, new_parent)
-spectree.link_nodes(from, to, kind)
 spectree.claim_ownership(node_id, agent_id)
 spectree.propose_change(node_id, proposal)
-spectree.get_conversation(node_id)
 spectree.append_message(node_id, message)
 ```
 
+## Tree Structure Example
+
+```
+Org: "Ritz Language"
+  Spec: "Language Design"
+    Spec: "Type System"
+      Plan: "Implement Generics"   <- agent owns this
+    Spec: "Async Model"
+  Spec: "Standard Library"
+    Plan: "Port HTTP Module"
+  Plan: "Q1 2026 Roadmap"
+    Plan: "Phase 1: Core Compiler"
+    Plan: "Phase 2: Stdlib"
+```
+
+## Dependencies
+
+- `ritzlib` - Standard library
+
 ## Status
 
-**Design Phase** - Data model and MCP interface being defined.
+**Alpha** - Data model, node types, and MCP interface are designed. Core tree operations and persistence via Mausoleum are being implemented. Agent collaboration features and MCP server are planned once the data layer stabilizes.
 
 ## License
 
-MIT
+MIT License - see LICENSE file

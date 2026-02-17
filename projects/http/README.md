@@ -1,84 +1,85 @@
 # http
 
-HTTP protocol implementation for Ritz - the mechanism layer for HTTP/1.0, HTTP/1.1, HTTP/2, and HTTP/3.
+HTTP protocol implementation for Ritz - wire protocol, parsing, and framing for HTTP/1.x, HTTP/2, and HTTP/3.
+
+**Part of the [Ritz Ecosystem](../larb/docs/ECOSYSTEM.md)**
 
 ## Overview
 
-`http` is the wire protocol library that handles parsing, framing, and codec operations for all HTTP versions. It provides the low-level mechanism bits while leaving policy decisions to higher-level libraries like [Valet](https://github.com/ritz-lang/valet).
+The `http` library provides the mechanism layer for HTTP: parsing request and response messages, encoding/decoding headers, managing connection framing, and implementing the protocol state machines for HTTP/1.1, HTTP/2, and HTTP/3. It deliberately handles only the wire protocol, leaving policy decisions (routing, middleware, server configuration) to higher-level libraries like Valet.
 
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────┐
-│                  http (this crate)                  │
-├─────────────────────────────────────────────────────┤
-│     h1 codec    │    h2 codec    │    h3 codec     │
-├─────────────────┼────────────────┼─────────────────┤
-│       TCP       │      TCP       │      QUIC       │
-├─────────────────┴────────────────┴─────────────────┤
-│              cryptosec  │  squeeze                 │
-└────────────────────────────────────────────────────┘
-```
+HTTP/2 support includes the full binary framing layer with stream multiplexing, HPACK header compression, and flow control. HTTP/3 implements QUIC transport from scratch alongside QPACK header compression and 0-RTT session resumption. The library uses cryptosec for TLS 1.3 and squeeze for content compression.
 
 ## Features
 
-### HTTP/1.0 & HTTP/1.1
-- Request/response parsing
+- HTTP/1.0 and HTTP/1.1 request/response parsing
 - Chunked transfer encoding
 - Keep-alive connection management
-- Pipelining support
+- HTTP pipelining support
+- HTTP/2 binary framing and stream multiplexing
+- HPACK header compression (HTTP/2)
+- HTTP/2 flow control and server push
+- HTTP/3 over QUIC transport
+- QPACK header compression (HTTP/3)
+- QUIC connection migration and 0-RTT resumption
+- TLS 1.3 integration via cryptosec
+- Content-Encoding via squeeze
 
-### HTTP/2
-- Binary framing layer
-- Stream multiplexing
-- HPACK header compression
-- Flow control
-- Server push
-- Priority handling
+## Installation
 
-### HTTP/3
-- QUIC transport (implemented from scratch)
-- QPACK header compression
-- Connection migration
-- 0-RTT resumption
-- Per-stream flow control
+```bash
+# As a dependency in ritz.toml:
+# [dependencies]
+# http = { path = "../http" }
 
-## Dependencies
-
-- [`cryptosec`](https://github.com/ritz-lang/cryptosec) - TLS 1.3 and cryptographic primitives
-- [`squeeze`](https://github.com/ritz-lang/squeeze) - Compression algorithms
-
-## Design Philosophy
-
-This library is **mechanism, not policy**:
-
-| Layer | Library | Role |
-|-------|---------|------|
-| Mechanism | `http` | Wire protocol, parsing, framing |
-| Policy | `Valet` | Routing, middleware, server config |
-| Runtime | `Zeus` | Process isolation, zero-copy IPC |
+# Build from source
+export RITZ_PATH=/path/to/ritz
+./ritz build .
+```
 
 ## Usage
 
 ```ritz
-use http::{Request, Response, Version}
-use http::h1::parse_request
-use http::h2::Frame
+import lib.h1 { parse_request, RequestParser }
+import lib.h2 { Frame, FrameType }
 
-// Parse HTTP/1.1 request
-let req = parse_request(buffer)?
+# Parse HTTP/1.1 request from buffer
+let parser = RequestParser.new(buffer, buffer_len)
+let req = parser.parse()
 
-// Build response
-let resp = Response::new()
+# Build HTTP/1.1 response
+let resp = Response.new()
     .status(200)
     .header("Content-Type", "text/plain")
     .body("Hello, world!")
+let bytes = resp.encode()
 ```
+
+```ritz
+import lib.h2 { Connection, StreamId }
+
+# HTTP/2 connection
+let conn = Connection.new(socket, Role.Server)
+conn.send_settings()
+
+# Handle incoming frames
+let frame = conn.read_frame()
+match frame.frame_type
+    FrameType.Headers => handle_headers(frame)
+    FrameType.Data    => handle_data(frame)
+    FrameType.GoAway  => close_connection()
+```
+
+## Dependencies
+
+- `ritzlib` - Standard library
+- `cryptosec` - TLS 1.3 support
+- `squeeze` - Content-Encoding compression
 
 ## Status
 
-**Early Development** - Core types and H1 codec in progress.
+**Alpha** - Core type definitions, HTTP/1.1 parser, and basic response building are in progress. HTTP/2 framing, HTTP/3/QUIC, and full TLS integration are planned in subsequent phases.
 
 ## License
 
-MIT
+MIT License - see LICENSE file
