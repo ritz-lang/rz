@@ -176,3 +176,18 @@ rzsh_elf_end:
 
 rzsh_elf_size:
     .quad rzsh_elf_end - rzsh_elf_start
+
+# ============================================================================
+# mmap_test.elf - Tests sys_mmap/sys_munmap syscalls
+# ============================================================================
+.global mmap_test_elf_start
+.global mmap_test_elf_end
+.global mmap_test_elf_size
+
+.align 16
+mmap_test_elf_start:
+    .incbin "build/debug/mmap_test.elf"
+mmap_test_elf_end:
+
+mmap_test_elf_size:
+    .quad mmap_test_elf_end - mmap_test_elf_start
