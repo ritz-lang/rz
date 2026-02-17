@@ -206,6 +206,51 @@ var acpi20_guid: EfiGuid
 # ACPI 1.0 RSDP GUID: {EB9D2D30-2D88-11D3-9A16-0090273FC14D}
 var acpi10_guid: EfiGuid
 
+# ============================================================================
+# UEFI Graphics Output Protocol (GOP)
+# ============================================================================
+
+# EFI_GRAPHICS_OUTPUT_PROTOCOL GUID: {9042A9DE-23DC-4A38-96FB-7ADED080516A}
+var gop_guid: EfiGuid
+
+# Pixel format constants
+const EFI_PIXEL_RGBX_8BIT: u32 = 0     # RedGreenBlueReserved 8bit per color
+const EFI_PIXEL_BGRX_8BIT: u32 = 1     # BlueGreenRedReserved 8bit per color
+const EFI_PIXEL_BITMASK: u32 = 2       # Use PixelInformation bitmask
+const EFI_PIXEL_BLT_ONLY: u32 = 3      # No direct framebuffer access
+
+[[packed]]
+struct EfiPixelBitmask
+    red_mask: u32
+    green_mask: u32
+    blue_mask: u32
+    reserved_mask: u32
+
+[[packed]]
+struct EfiGopModeInfo
+    version: u32
+    horizontal_resolution: u32
+    vertical_resolution: u32
+    pixel_format: u32                    # EFI_PIXEL_* constants
+    pixel_info: EfiPixelBitmask          # Only valid if pixel_format == 2
+    pixels_per_scan_line: u32            # May differ from horizontal_resolution!
+
+[[packed]]
+struct EfiGopMode
+    max_mode: u32
+    mode_number: u32                     # Current mode index
+    info: *EfiGopModeInfo
+    info_size: u64
+    frame_buffer_base: u64               # Physical address of framebuffer!
+    frame_buffer_size: u64
+
+[[packed]]
+struct EfiGraphicsOutputProtocol
+    query_mode: *u8                      # QueryMode function pointer
+    set_mode: *u8                        # SetMode function pointer
+    blt: *u8                             # Blt (Block Transfer) function pointer
+    mode: *EfiGopMode                    # Current mode information
+
 # EFI_SIMPLE_FILE_SYSTEM_PROTOCOL
 [[packed]]
 struct EfiSimpleFileSystem
@@ -335,9 +380,10 @@ struct BootInfo
     framebuffer_addr: u64            # Framebuffer address (0 if none)
     framebuffer_width: u32
     framebuffer_height: u32
-    framebuffer_pitch: u32
-    framebuffer_bpp: u8
-    _pad2: [3]u8
+    framebuffer_pitch: u32           # Bytes per scanline
+    framebuffer_bpp: u8              # Bits per pixel (32)
+    framebuffer_format: u8           # 0=RGBX, 1=BGRX, 2=other
+    _pad2: [2]u8
     rsdp_addr: u64                   # ACPI RSDP address
     kernel_phys: u64                 # Kernel physical address
     kernel_size: u64                 # Kernel size in bytes
@@ -743,6 +789,19 @@ fn init_guids() -> i32
     acpi10_guid.data4[6] = 0xC1
     acpi10_guid.data4[7] = 0x4D
 
+    # Graphics Output Protocol GUID: {9042A9DE-23DC-4A38-96FB-7ADED080516A}
+    gop_guid.data1 = 0x9042A9DE
+    gop_guid.data2 = 0x23DC
+    gop_guid.data3 = 0x4A38
+    gop_guid.data4[0] = 0x96
+    gop_guid.data4[1] = 0xFB
+    gop_guid.data4[2] = 0x7A
+    gop_guid.data4[3] = 0xDE
+    gop_guid.data4[4] = 0xD0
+    gop_guid.data4[5] = 0x80
+    gop_guid.data4[6] = 0x51
+    gop_guid.data4[7] = 0x6A
+
     return 0
 
 # Handle protocol wrapper
@@ -819,6 +878,110 @@ fn find_rsdp_from_uefi() -> i32
     return -1
 
 # ============================================================================
+# Graphics Initialization (UEFI GOP)
+# ============================================================================
+
+# Global framebuffer info (populated by init_graphics)
+var fb_addr: u64 = 0
+var fb_width: u32 = 0
+var fb_height: u32 = 0
+var fb_pitch: u32 = 0
+var fb_bpp: u8 = 0
+var fb_format: u32 = 0
+
+fn init_graphics() -> i32
+    prints("  Initializing graphics (UEFI GOP)...\n")
+
+    # Locate GOP protocol
+    var gop_ptr: u64 = 0
+    let status: u64 = efi_locate_protocol(@gop_guid, 0, @gop_ptr)
+    if status != EFI_SUCCESS
+        prints("    WARNING: No GOP found (headless mode)\n")
+        return -1
+
+    let gop: *EfiGraphicsOutputProtocol = gop_ptr as *EfiGraphicsOutputProtocol
+    let mode: *EfiGopMode = (*gop).mode
+    let info: *EfiGopModeInfo = (*mode).info
+
+    prints("    GOP found at: ")
+    serial_print_hex(gop_ptr)
+    prints("\n")
+
+    # Print current mode info
+    prints("    Current mode: ")
+    serial_print_dec((*mode).mode_number as u64)
+    prints(" of ")
+    serial_print_dec((*mode).max_mode as u64)
+    prints("\n")
+
+    prints("    Resolution: ")
+    serial_print_dec((*info).horizontal_resolution as u64)
+    prints("x")
+    serial_print_dec((*info).vertical_resolution as u64)
+    prints("\n")
+
+    prints("    Pixels per scanline: ")
+    serial_print_dec((*info).pixels_per_scan_line as u64)
+    prints("\n")
+
+    prints("    Pixel format: ")
+    if (*info).pixel_format == EFI_PIXEL_RGBX_8BIT
+        prints("RGBX\n")
+    else if (*info).pixel_format == EFI_PIXEL_BGRX_8BIT
+        prints("BGRX\n")
+    else if (*info).pixel_format == EFI_PIXEL_BITMASK
+        prints("Bitmask\n")
+    else if (*info).pixel_format == EFI_PIXEL_BLT_ONLY
+        prints("BLT-only (no direct framebuffer!)\n")
+        return -1
+    else
+        prints("Unknown\n")
+
+    prints("    Framebuffer: ")
+    serial_print_hex((*mode).frame_buffer_base)
+    prints(" (")
+    serial_print_dec((*mode).frame_buffer_size / 1024)
+    prints(" KB)\n")
+
+    # Store framebuffer info for BootInfo
+    fb_addr = (*mode).frame_buffer_base
+    fb_width = (*info).horizontal_resolution
+    fb_height = (*info).vertical_resolution
+    fb_pitch = (*info).pixels_per_scan_line * 4  # Assuming 32bpp
+    fb_bpp = 32
+    fb_format = (*info).pixel_format
+
+    # Quick visual test: fill framebuffer with a color
+    # This happens before ExitBootServices, so we can access it directly
+    prints("    Drawing test pattern...\n")
+    let fb: *u32 = fb_addr as *u32
+    var y: u32 = 0
+    while y < fb_height
+        var x: u32 = 0
+        while x < fb_width
+            # Simple gradient: blue in top-left, red in bottom-right
+            let r: u32 = (x * 255) / fb_width
+            let b: u32 = (y * 255) / fb_height
+            let g: u32 = 128
+            var pixel: u32 = 0
+
+            # Pack pixel based on format
+            if fb_format == EFI_PIXEL_RGBX_8BIT
+                # RGBX: R in low byte
+                pixel = r | (g << 8) | (b << 16)
+            else
+                # BGRX: B in low byte (default for most UEFI)
+                pixel = b | (g << 8) | (r << 16)
+
+            let offset: u64 = (y as u64) * ((*info).pixels_per_scan_line as u64) + (x as u64)
+            *(fb + offset) = pixel
+            x = x + 1
+        y = y + 1
+
+    prints("    Graphics initialized!\n")
+    return 0
+
+# ============================================================================
 # BootInfo Population
 # ============================================================================
 
@@ -881,12 +1044,22 @@ fn build_boot_info() -> i32
     # Set page table info
     boot_info.pml4_phys = pml4_addr
 
-    # No framebuffer for now
-    boot_info.framebuffer_addr = 0
-    boot_info.framebuffer_width = 0
-    boot_info.framebuffer_height = 0
-    boot_info.framebuffer_pitch = 0
-    boot_info.framebuffer_bpp = 0
+    # Set framebuffer info (populated by init_graphics)
+    boot_info.framebuffer_addr = fb_addr
+    boot_info.framebuffer_width = fb_width
+    boot_info.framebuffer_height = fb_height
+    boot_info.framebuffer_pitch = fb_pitch
+    boot_info.framebuffer_bpp = fb_bpp
+    boot_info.framebuffer_format = fb_format as u8
+
+    if fb_addr != 0
+        prints("    Framebuffer: ")
+        serial_print_dec(fb_width as u64)
+        prints("x")
+        serial_print_dec(fb_height as u64)
+        prints(" @ ")
+        serial_print_hex(fb_addr)
+        prints("\n")
 
     prints("    BootInfo ready at: ")
     serial_print_hex(@boot_info as u64)
@@ -1337,6 +1510,10 @@ pub fn efi_main(image_handle: u64, system_table: *EfiSystemTable) -> u64
 
     # Find ACPI RSDP from UEFI configuration table (must happen before ExitBootServices)
     find_rsdp_from_uefi()
+
+    # Initialize graphics (must happen before ExitBootServices)
+    # This is optional - system will work in headless mode without GOP
+    init_graphics()
 
     # Load kernel from filesystem (must happen before ExitBootServices)
     if load_kernel_from_fs() != 0
