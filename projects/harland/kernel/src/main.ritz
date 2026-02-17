@@ -3654,10 +3654,6 @@ fn syscall_strlen(s: *u8) -> i64
 # sys_readdir: List directory contents
 # Returns bytes written to buffer as null-terminated strings
 fn sys_readdir_impl(dir_path: *u8, buf: *u8, buf_size: i64) -> i64
-    prints("[syscall] readdir(")
-    prints_str(dir_path)
-    prints(")\n")
-
     let ns: *KNamespace = knamespace_get()
     if ns == 0 as *KNamespace
         return -1
@@ -3671,7 +3667,6 @@ fn sys_readdir_impl(dir_path: *u8, buf: *u8, buf_size: i64) -> i64
     let count: i32 = knamespace_list(ns, @path_view, @entries[0], 64)
 
     if count < 0
-        prints("[readdir] Failed to list directory\n")
         return -1
 
     # Copy names to buffer as null-terminated strings
@@ -3705,12 +3700,6 @@ fn sys_readdir_impl(dir_path: *u8, buf: *u8, buf_size: i64) -> i64
 
         i = i + 1
 
-    prints("[readdir] Returned ")
-    serial_print_dec(count as u64)
-    prints(" entries (")
-    serial_print_dec(bytes_written as u64)
-    prints(" bytes)\n")
-
     return bytes_written
 
 # sys_spawn: Load and execute a binary from the filesystem
@@ -3721,14 +3710,9 @@ fn sys_readdir_impl(dir_path: *u8, buf: *u8, buf_size: i64) -> i64
 # full memory isolation from the parent. The child cannot read or write
 # the parent's user-space memory.
 fn sys_spawn_impl(path: *u8) -> i64
-    prints("[spawn] spawn(")
-    prints_str(path)
-    prints(")\n")
-
     # Look up the file in the namespace
     let ns: *KNamespace = knamespace_get()
     if ns == 0 as *KNamespace
-        prints("[spawn] No namespace\n")
         return -1
 
     # Read file from namespace (using kernel's page table)
@@ -3738,14 +3722,7 @@ fn sys_spawn_impl(path: *u8) -> i64
     let elf_data: *u8 = knamespace_read(ns, @path_view, @file_size)
 
     if elf_data == 0 as *u8
-        prints("[spawn] File not found: ")
-        prints_str(path)
-        prints("\n")
         return -1
-
-    prints("[spawn] Loading ELF (")
-    serial_print_dec(file_size)
-    prints(" bytes)...\n")
 
     # Save parent's execution context
     # When the child calls sys_exit(), we'll restore this and return here
@@ -3756,35 +3733,14 @@ fn sys_spawn_impl(path: *u8) -> i64
     g_has_parent = 1
     g_child_pid = 2  # Simple: parent=1, child=2
 
-    prints("[spawn] Saved parent context:\n")
-    prints("  RIP: 0x")
-    serial_print_hex(g_parent_ctx.user_rip)
-    prints("\n  RSP: 0x")
-    serial_print_hex(g_parent_ctx.user_rsp)
-    prints("\n  PML4: 0x")
-    serial_print_hex(g_parent_ctx.user_pml4)
-    prints("\n")
-
     # Create an isolated address space for the child
     # This copies kernel mappings but starts with empty user space
     let child_pml4: u64 = vmm_create_user_pml4()
     if child_pml4 == 0
-        prints("[spawn] Failed to create child page table\n")
         g_has_parent = 0
         return -1
 
     g_child_pml4 = child_pml4  # Save for cleanup on exit
-    prints("[spawn] Created child PML4 at 0x")
-    serial_print_hex(child_pml4)
-    prints("\n")
-
-    # Debug: Print parent PML4[511] before switch
-    prints("[spawn] Parent PML4[511] = 0x")
-    serial_print_hex(vmm_read_pml4_entry(g_parent_ctx.user_pml4, 511))
-    prints("\n")
-    prints("[spawn] Child  PML4[511] = 0x")
-    serial_print_hex(vmm_read_pml4_entry(child_pml4, 511))
-    prints("\n")
 
     # Switch to child's address space for ELF loading
     # This way, elf_load will map pages directly into the child's page table
@@ -3797,9 +3753,6 @@ fn sys_spawn_impl(path: *u8) -> i64
     let load_result: ElfLoadResult = elf_load(elf_data, file_size, child_load_base)
 
     if load_result.error != ELF_OK
-        prints("[spawn] Failed to load ELF, error=")
-        serial_print_dec(load_result.error as u64)
-        prints("\n")
         # Switch back to parent before cleanup
         vmm_switch_pml4(g_parent_ctx.user_pml4)
         vmm_free_pml4(child_pml4)
@@ -3807,16 +3760,9 @@ fn sys_spawn_impl(path: *u8) -> i64
         g_child_pml4 = 0
         return -1
 
-    prints("[spawn] ELF loaded at 0x")
-    serial_print_hex(load_result.load_base)
-    prints(", entry=0x")
-    serial_print_hex(load_result.entry_point)
-    prints("\n")
-
     # Allocate child stack in the child's address space
     let child_stack_page: u64 = pmm_alloc_page()
     if child_stack_page == 0
-        prints("[spawn] Failed to allocate child stack\n")
         vmm_switch_pml4(g_parent_ctx.user_pml4)
         vmm_free_pml4(child_pml4)
         g_has_parent = 0
@@ -3827,7 +3773,6 @@ fn sys_spawn_impl(path: *u8) -> i64
     let child_stack_vaddr: u64 = 0x7FFFFFFFE000  # Same as init's stack
     let map_result: i32 = vmm_map_page(child_stack_vaddr, child_stack_page, PTE_WRITABLE | PTE_USER)
     if map_result != 0
-        prints("[spawn] Failed to map child stack\n")
         pmm_free_page(child_stack_page)
         vmm_switch_pml4(g_parent_ctx.user_pml4)
         vmm_free_pml4(child_pml4)
@@ -3837,11 +3782,6 @@ fn sys_spawn_impl(path: *u8) -> i64
 
     let child_stack_top: u64 = child_stack_vaddr + PAGE_SIZE - 16
 
-    prints("[spawn] Child stack at 0x")
-    serial_print_hex(child_stack_top)
-    prints(" (isolated address space)\n")
-    prints("[spawn] Jumping to child...\n\n")
-
     # Jump to child! This does NOT return.
     # We're already in the child's address space (CR3 was switched above).
     # When child calls sys_exit(), sys_exit_impl will detect g_has_parent
@@ -3849,47 +3789,25 @@ fn sys_spawn_impl(path: *u8) -> i64
     jump_to_userspace(load_result.entry_point, child_stack_top)
 
     # Never reached - child will call sys_exit which handles return to parent
-    prints("[spawn] ERROR: jump_to_userspace returned!\n")
     return -1
 
 # sys_exit: Exit the current process
 # If we're a child (spawned by blocking spawn), restore parent and return
 # with the exit code. Otherwise, halt the system.
 fn sys_exit_impl(code: i32) -> i64
-    prints("\n[exit] exit(")
-    serial_print_dec(code as u64)
-    prints(")")
-
     if g_has_parent != 0
         # We're a child! Restore parent context
-        prints(" - returning to parent\n")
-
         # Save exit code for sys_wait
-        # Keep g_child_pid = 2 so sys_wait knows there was a child
         g_child_exit_code = code as i64
         g_has_parent = 0
-        # Don't reset g_child_pid here - sys_wait needs it to know there was a child
-
-        prints("[exit] Restoring parent context...\n")
-        prints("  RIP: 0x")
-        serial_print_hex(g_parent_ctx.user_rip)
-        prints("\n  RSP: 0x")
-        serial_print_hex(g_parent_ctx.user_rsp)
-        prints("\n  PML4: 0x")
-        serial_print_hex(g_parent_ctx.user_pml4)
-        prints("\n")
 
         # IMPORTANT: Switch back to parent's address space BEFORE jumping!
         # The parent's user code and stack are only accessible in the parent's
         # page table. If we jump while still in the child's CR3, we'll page fault.
-        prints("[exit] Switching to parent address space...\n")
         vmm_switch_pml4(g_parent_ctx.user_pml4)
 
         # Free the child's page table and all its user-space pages
         if g_child_pml4 != 0
-            prints("[exit] Freeing child page table at 0x")
-            serial_print_hex(g_child_pml4)
-            prints("\n")
             vmm_free_pml4(g_child_pml4)
             g_child_pml4 = 0
 
@@ -3904,7 +3822,6 @@ fn sys_exit_impl(code: i32) -> i64
         jump_to_userspace_with_retval(g_parent_ctx.user_rip, g_parent_ctx.user_rsp, retval)
 
         # Never reached
-        prints("[exit] ERROR: jump returned!\n")
 
     # No parent - this is init exiting or a system halt
     prints(" - halting system\n")
@@ -3915,10 +3832,6 @@ fn sys_exit_impl(code: i32) -> i64
 # For blocking spawn, the child has already exited by the time spawn returns.
 # This can be used to get the exit code if needed.
 fn sys_wait_impl(pid: i32) -> i64
-    prints("[syscall] wait(")
-    serial_print_dec(pid as u64)
-    prints(")\n")
-
     # For blocking spawn, the exit code is already available
     if g_child_pid == 2
         let code: i64 = g_child_exit_code
@@ -4273,45 +4186,32 @@ const ELF_ERR_MAP_FAILED: i32 = -8
 fn elf_validate_header(ehdr: *Elf64Ehdr) -> i32
     # Check magic number
     if (*ehdr).e_ident[EI_MAG0] != ELF_MAGIC_0
-        prints("[elf] Invalid magic byte 0\n")
         return ELF_ERR_INVALID_MAGIC
     if (*ehdr).e_ident[EI_MAG1] != ELF_MAGIC_1
-        prints("[elf] Invalid magic byte 1\n")
         return ELF_ERR_INVALID_MAGIC
     if (*ehdr).e_ident[EI_MAG2] != ELF_MAGIC_2
-        prints("[elf] Invalid magic byte 2\n")
         return ELF_ERR_INVALID_MAGIC
     if (*ehdr).e_ident[EI_MAG3] != ELF_MAGIC_3
-        prints("[elf] Invalid magic byte 3\n")
         return ELF_ERR_INVALID_MAGIC
 
     # Check 64-bit class
     if (*ehdr).e_ident[EI_CLASS] != ELFCLASS64
-        prints("[elf] Not a 64-bit ELF\n")
         return ELF_ERR_NOT_64BIT
 
     # Check little-endian encoding
     if (*ehdr).e_ident[EI_DATA] != ELFDATA2LSB
-        prints("[elf] Not little-endian\n")
         return ELF_ERR_NOT_LITTLE_ENDIAN
 
     # Check executable type (accept both ET_EXEC and ET_DYN for PIE)
     if (*ehdr).e_type != ET_EXEC and (*ehdr).e_type != ET_DYN
-        prints("[elf] Not an executable (type=")
-        serial_print_dec((*ehdr).e_type as u64)
-        prints(")\n")
         return ELF_ERR_NOT_EXECUTABLE
 
     # Check x86-64 architecture
     if (*ehdr).e_machine != EM_X86_64
-        prints("[elf] Wrong architecture (machine=")
-        serial_print_dec((*ehdr).e_machine as u64)
-        prints(")\n")
         return ELF_ERR_WRONG_MACHINE
 
     # Check program headers exist
     if (*ehdr).e_phnum == 0
-        prints("[elf] No program headers\n")
         return ELF_ERR_NO_SEGMENTS
 
     return ELF_OK
@@ -4344,10 +4244,6 @@ pub fn elf_load(elf_data: *u8, elf_size: u64, load_base: u64) -> ElfLoadResult
     result.load_base = load_base
     result.error = ELF_OK
 
-    prints("[elf] Loading ELF binary (")
-    serial_print_dec(elf_size)
-    prints(" bytes)\n")
-
     # Parse ELF header
     let ehdr: *Elf64Ehdr = elf_data as *Elf64Ehdr
 
@@ -4356,16 +4252,6 @@ pub fn elf_load(elf_data: *u8, elf_size: u64, load_base: u64) -> ElfLoadResult
     if validate_result != ELF_OK
         result.error = validate_result
         return result
-
-    prints("[elf] Valid ELF64 header\n")
-    prints("      Entry point: 0x")
-    serial_print_hex((*ehdr).e_entry)
-    prints("\n")
-    prints("      Program headers: ")
-    serial_print_dec((*ehdr).e_phnum as u64)
-    prints(" at offset 0x")
-    serial_print_hex((*ehdr).e_phoff)
-    prints("\n")
 
     # Calculate adjusted entry point
     # For PIE executables (ET_DYN), add load_base offset
@@ -4384,23 +4270,6 @@ pub fn elf_load(elf_data: *u8, elf_size: u64, load_base: u64) -> ElfLoadResult
 
         # Only process PT_LOAD segments
         if (*phdr).p_type == PT_LOAD
-            prints("      LOAD segment ")
-            serial_print_dec(phdr_idx as u64)
-            prints(": vaddr=0x")
-            serial_print_hex((*phdr).p_vaddr)
-            prints(" filesz=")
-            serial_print_dec((*phdr).p_filesz)
-            prints(" memsz=")
-            serial_print_dec((*phdr).p_memsz)
-            prints(" flags=")
-            if ((*phdr).p_flags & PF_R) != 0
-                prints("R")
-            if ((*phdr).p_flags & PF_W) != 0
-                prints("W")
-            if ((*phdr).p_flags & PF_X) != 0
-                prints("X")
-            prints("\n")
-
             # Calculate virtual address (apply load_base for PIE)
             var seg_vaddr: u64 = (*phdr).p_vaddr
             if (*ehdr).e_type == ET_DYN and load_base != 0
@@ -4411,12 +4280,6 @@ pub fn elf_load(elf_data: *u8, elf_size: u64, load_base: u64) -> ElfLoadResult
             let seg_end: u64 = seg_vaddr + (*phdr).p_memsz
             let seg_end_page: u64 = (seg_end + 0xFFF) & 0xFFFFFFFFFFFFF000  # Page-align up
             let num_pages: u64 = (seg_end_page - seg_start_page) / PAGE_SIZE
-
-            prints("        Allocating ")
-            serial_print_dec(num_pages)
-            prints(" pages at 0x")
-            serial_print_hex(seg_start_page)
-            prints("\n")
 
             # Get page table flags for this segment
             let pte_flags: u64 = elf_flags_to_pte((*phdr).p_flags)
@@ -4515,10 +4378,6 @@ pub fn elf_load(elf_data: *u8, elf_size: u64, load_base: u64) -> ElfLoadResult
     # Flush TLB for the new mappings
     vmm_flush_tlb_all()
 
-    prints("[elf] Load complete, entry=0x")
-    serial_print_hex(result.entry_point)
-    prints("\n")
-
     return result
 
 # Load an ELF and execute it in userspace
@@ -4552,12 +4411,6 @@ pub fn elf_exec(elf_data: *u8, elf_size: u64) -> i32
 
     # Flush TLB
     vmm_flush_tlb_all()
-
-    prints("[elf] Jumping to userspace at 0x")
-    serial_print_hex(load_result.entry_point)
-    prints(", stack=0x")
-    serial_print_hex(stack_top)
-    prints("\n")
 
     # Jump to userspace
     jump_to_userspace(load_result.entry_point, stack_top)
