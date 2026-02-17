@@ -1,71 +1,88 @@
 # Cryptosec
 
-A cryptographic & security library for [Ritz](../langdev), targeting TLS 1.3 for the [Valet](../valet) webserver.
+Cryptographic primitives and security library for Ritz - pure Ritz implementation targeting TLS 1.3.
 
-## Goals
+**Part of the [Ritz Ecosystem](../larb/docs/ECOSYSTEM.md)**
 
-- **TLS 1.3 support** for Valet HTTP server
-- **Pure Ritz implementation** - no C dependencies
-- **Constant-time operations** - side-channel resistant
-- **SIMD acceleration** - AVX2/AES-NI where beneficial
-- **Test-driven development** - comprehensive test coverage
+## Overview
 
-## Supported Algorithms
+Cryptosec provides the cryptographic foundation for the Ritz ecosystem. It implements hashing, symmetric encryption, asymmetric cryptography, and the full TLS 1.3 handshake in pure Ritz with no C dependencies. The primary integration target is the Valet HTTP server, which uses cryptosec for HTTPS support.
 
-### Hash Functions
-- SHA-256, SHA-384, SHA-512
+All implementations aim for constant-time execution to resist timing side-channel attacks. The library uses the `getrandom` syscall for cryptographically secure random number generation. SIMD acceleration via AES-NI and AVX2 is planned for hot paths.
+
+Cryptosec is also used by Goliath (content-addressable filesystem) for SHA-256 content hashing.
+
+## Features
+
+- SHA-256, SHA-384, SHA-512 hash functions
 - HMAC-SHA256, HMAC-SHA384
-- HKDF (RFC 5869)
-
-### Symmetric Ciphers
-- AES-128-GCM, AES-256-GCM (AEAD)
+- HKDF key derivation (RFC 5869)
+- AES-128-GCM and AES-256-GCM (AEAD)
 - ChaCha20-Poly1305 (AEAD)
-
-### Asymmetric Cryptography
-- X25519 (key exchange)
-- Ed25519 (signatures)
-- P-256/ECDSA (optional, for compatibility)
-
-### TLS 1.3
-- Full handshake support
+- X25519 key exchange (Diffie-Hellman)
+- Ed25519 digital signatures
+- P-256/ECDSA (for TLS compatibility)
+- Full TLS 1.3 handshake support
 - Certificate validation
-- Integration with io_uring async I/O
+- Constant-time implementations (side-channel resistant)
+- No C dependencies - pure Ritz
 
-## Requirements
-
-- Linux (uses getrandom syscall)
-- Ritz compiler (sibling `langdev` directory)
-- x86-64 CPU (AVX2 for accelerated paths)
-
-## Building
+## Installation
 
 ```bash
-export RITZ_PATH=/path/to/langdev
-./build.sh
+# As a dependency in ritz.toml:
+# [dependencies]
+# cryptosec = { path = "../cryptosec" }
+
+# Build from source
+export RITZ_PATH=/path/to/ritz
+./ritz build .
 ```
 
-## Testing
+## Usage
 
-```bash
-ritz test
+```ritz
+import lib.sha256
+
+# SHA-256 hash
+var digest: [32]u8
+sha256(data, data_len, @digest[0])
+
+# HMAC-SHA256
+var mac: [32]u8
+hmac_sha256(key, key_len, message, msg_len, @mac[0])
 ```
 
-## Project Structure
+```ritz
+import lib.aes_gcm
 
+# AES-256-GCM encryption
+var ciphertext: [MAX_LEN]u8
+var tag: [16]u8
+aes256_gcm_encrypt(key, nonce, plaintext, pt_len, @ciphertext[0], @tag[0])
+
+# AES-256-GCM decryption (authenticated)
+let ok: i32 = aes256_gcm_decrypt(key, nonce, ciphertext, ct_len, tag, @plaintext[0])
 ```
-cryptosec/
-├── lib/          # Library modules
-├── test/         # Test files
-├── fixtures/     # Test vectors
-└── src/          # Example programs
+
+```ritz
+import lib.x25519
+
+# X25519 key exchange
+var public_key: [32]u8
+var shared_secret: [32]u8
+x25519_keygen(private_key, @public_key[0])
+x25519_shared(private_key, peer_public, @shared_secret[0])
 ```
+
+## Dependencies
+
+- `ritzlib` - Standard library (uses `getrandom` syscall for entropy)
 
 ## Status
 
-**Current Phase:** 1 - Foundations
-
-See [TODO.md](TODO.md) for detailed progress.
+**Active development** - SHA-256, HMAC, and foundational primitives are implemented. AES-GCM, ChaCha20-Poly1305, X25519, and TLS 1.3 handshake are in progress as part of Valet HTTPS integration.
 
 ## License
 
-TBD
+MIT License - see LICENSE file

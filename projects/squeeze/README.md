@@ -1,97 +1,48 @@
 # Squeeze
 
-A high-performance compression library for [Ritz](./ritz), targeting HTTP compression for the [Valet](../valet) webserver.
+High-performance compression library for Ritz - gzip, deflate, and zlib implemented in pure Ritz.
 
-## Goals
+**Part of the [Ritz Ecosystem](../larb/docs/ECOSYSTEM.md)**
 
-- **Deflate/Gzip support** for HTTP Content-Encoding
-- **Pure Ritz implementation** - no C dependencies
-- **Streaming API** - process data in chunks for large files
-- **RFC compliant** - full conformance with RFC 1950/1951/1952
-- **Zero-copy where possible** - minimize allocations in hot paths
-- **SIMD acceleration** - AVX2/AVX-512 for bulk operations (future)
+## Overview
 
-## Supported Formats
+Squeeze provides RFC-compliant compression and decompression for the Ritz ecosystem. It implements the Deflate algorithm (RFC 1951) with LZ77 match finding and Huffman coding, wrapped in the Gzip (RFC 1952) and Zlib (RFC 1950) container formats.
 
-### Compression Algorithms
-- Deflate (RFC 1951) - core compression
-- LZ77 with hash chains for match finding
-- Huffman coding (fixed and dynamic)
+The primary use case is HTTP Content-Encoding compression in the Valet web server, where squeeze handles `gzip` and `deflate` transfer encodings. The streaming API allows processing data incrementally without buffering entire payloads in memory.
 
-### Container Formats
-- Gzip (RFC 1952) - standard `.gz` format with CRC32
-- Zlib (RFC 1950) - wrapper with Adler-32 checksum
+Squeeze is a pure Ritz implementation with no C dependencies, targeting both correctness (full RFC conformance) and performance (zero-copy streaming, future SIMD acceleration).
 
-### HTTP Integration
-- Content-Encoding: gzip, deflate
-- Accept-Encoding header parsing
-- Quality value (q=) handling
+## Features
 
-## Requirements
+- Deflate compression and decompression (RFC 1951)
+- Gzip container format with CRC-32 checksums (RFC 1952)
+- Zlib container format with Adler-32 checksums (RFC 1950)
+- Streaming API for incremental processing of large data
+- Multiple compression levels (0=store, 1=fast, 6=balanced, 9=best)
+- LZ77 with hash chain match finding
+- Fixed and dynamic Huffman coding
+- HTTP Content-Encoding integration (Accept-Encoding parsing)
+- No external dependencies - pure Ritz
 
-- Linux (uses Linux syscalls directly)
-- Ritz compiler (sibling `ritz/` directory or `langdev`)
-- x86-64 CPU (AVX2 for accelerated paths, future)
-
-## Building
+## Installation
 
 ```bash
-export RITZ_PATH=/path/to/langdev
-./build.sh
+# As a dependency in ritz.toml:
+# [dependencies]
+# squeeze = { path = "../squeeze" }
+
+# Build from source
+export RITZ_PATH=/path/to/ritz
+./ritz build .
 ```
 
-## Testing
-
-```bash
-ritz test
-```
-
-## Project Structure
-
-```
-squeeze/
-├── lib/              # Library modules
-│   ├── crc32.ritz    # CRC-32 checksum (ISO 3309)
-│   ├── adler32.ritz  # Adler-32 checksum
-│   ├── bits.ritz     # Bit stream reader/writer
-│   ├── huffman.ritz  # Huffman coding tables
-│   ├── inflate.ritz  # Deflate decompression
-│   ├── deflate.ritz  # Deflate compression
-│   ├── gzip.ritz     # Gzip container format
-│   └── zlib.ritz     # Zlib container format
-├── test/             # Test files
-├── fixtures/         # Test vectors (gzip files, corpus)
-├── src/              # Example programs
-│   └── main.ritz     # Demo/CLI entry point
-├── build.sh
-├── TODO.md           # Development roadmap
-├── DONE.md           # Completed work
-└── README.md
-```
-
-## API Overview
-
-### CRC-32 (for Gzip)
-
-```ritz
-import lib.crc32
-
-# One-shot
-var checksum: u32 = crc32(data, len)
-
-# Streaming
-var state: u32 = crc32_init()
-state = crc32_update(state, chunk1, len1)
-state = crc32_update(state, chunk2, len2)
-let final: u32 = crc32_final(state)
-```
-
-### Gzip Compression
+## Usage
 
 ```ritz
 import lib.gzip
+import lib.crc32
 
-# One-shot compression
+# One-shot gzip compression
 var out_len: i64 = 0
 let compressed: *u8 = gzip_compress(data, len, &out_len)
 
@@ -99,78 +50,37 @@ let compressed: *u8 = gzip_compress(data, len, &out_len)
 var inflater: Inflater
 gzip_init(&inflater, compressed, compressed_len)
 while gzip_read(&inflater, buf, buf_size) > 0
-    # process decompressed data
+    # process decompressed chunk
 ```
-
-### Deflate (Low-Level)
 
 ```ritz
 import lib.deflate
 
-# Compression with level
+# Compression with explicit level
 var deflater: Deflater
 deflate_init(&deflater, DEFLATE_LEVEL_6)  # balanced
 deflate(&deflater, input, input_len, output, &output_len)
 deflate_finish(&deflater)
-
-# Decompression
-var inflater: Inflater
-inflate_init(&inflater)
-inflate(&inflater, compressed, comp_len, output, &out_len)
 ```
-
-## Compression Levels
-
-| Level | Strategy | Hash Chain Depth | Use Case |
-|-------|----------|------------------|----------|
-| 0 | Store only | N/A | No compression, just wrap |
-| 1 | Fast | 4 | Speed priority |
-| 6 | Default | 32 | Balanced speed/ratio |
-| 9 | Best | 4096 | Maximum compression |
-
-## Valet Integration
-
-Squeeze will be integrated with Valet as a submodule for HTTP compression:
-
-```bash
-cd /path/to/valet
-git submodule add git@github.com:ritz-lang/squeeze.git squeeze
-```
-
-### Compression Middleware
 
 ```ritz
-import squeeze.gzip
-import valet.middleware
+import lib.crc32
 
-# Automatic response compression
-fn compression_middleware(req: *Request, res: *Response) -> i32
-    let encoding: *u8 = accept_encoding_select(req)
-    if encoding != null
-        res.body = gzip_compress(res.body, res.body_len, &res.body_len)
-        response_header(res, "Content-Encoding", "gzip")
-    return MW_CONTINUE
+# Incremental CRC-32 checksum
+var state: u32 = crc32_init()
+state = crc32_update(state, chunk1, len1)
+state = crc32_update(state, chunk2, len2)
+let checksum: u32 = crc32_final(state)
 ```
 
-**If additional functionality is needed:**
-1. **File an issue**: https://github.com/ritz-lang/squeeze/issues
-2. **Submit a PR**: Make changes in `./squeeze/` and submit to ritz-lang/squeeze
+## Dependencies
+
+- `ritzlib` - Standard library
 
 ## Status
 
-**Current Phase:** 1 - Foundations (CRC32, Bit Streams)
-
-See [TODO.md](TODO.md) for detailed progress.
-
-## References
-
-- [RFC 1951 - DEFLATE](https://tools.ietf.org/html/rfc1951)
-- [RFC 1952 - GZIP](https://tools.ietf.org/html/rfc1952)
-- [RFC 1950 - ZLIB](https://tools.ietf.org/html/rfc1950)
-- [An Explanation of the Deflate Algorithm](https://zlib.net/feldspar.html)
-- [zlib source](https://github.com/madler/zlib)
-- [zlib-ng (optimized)](https://github.com/zlib-ng/zlib-ng)
+**Active development** - CRC-32, Adler-32, bit stream I/O, and Huffman tables are implemented. Deflate compression/decompression and Gzip/Zlib container support are in progress as part of Valet HTTP integration.
 
 ## License
 
-TBD
+MIT License - see LICENSE file

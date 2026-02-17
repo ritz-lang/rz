@@ -1,212 +1,102 @@
 # Spire
 
-*MVRSPT Web Framework for Ritz*
+MVRSPT web application framework for Ritz - Django/Rails-style productivity built on Zeus and Valet.
 
-Spire is a web application framework built on the MVRSPT (Model-View-Repository-Service-Presenter-Tests) architecture pattern. It runs on Zeus and provides Django/Rails-like productivity with Ritz's performance and safety.
+**Part of the [Ritz Ecosystem](../larb/docs/ECOSYSTEM.md)**
 
-## Architecture
+## Overview
 
+Spire is the web application framework layer of the Ritz ecosystem. It implements the MVRSPT (Model-View-Repository-Service-Presenter-Tests) architecture pattern, which solves the "fat model" problem of traditional MVC by introducing explicit Repository and Service layers.
+
+Spire runs on Zeus (process isolation) which runs on Valet (HTTP server), providing a complete application framework from HTTP parsing to database persistence. It integrates with Mausoleum for persistent document storage and Tome for in-memory caching. The framework is designed for test-driven development, with mocking support at every layer.
+
+The primary reference implementation built on Spire is Nexus, the Ritz knowledge base wiki.
+
+## Features
+
+- MVRSPT architecture with clean separation of concerns
+- Repository pattern abstracts data access (swap Mausoleum for mock in tests)
+- Service layer for business logic - fully testable without a database
+- Presenter layer handles HTTP request/response routing
+- Template engine integration for HTML rendering
+- JSON API support
+- Mock repositories for unit testing without database
+- Route declaration via attributes
+- Built-in test utilities for all layers
+
+## Installation
+
+```bash
+# As a dependency in ritz.toml:
+# [dependencies]
+# spire = { path = "../spire" }
+
+# Build from source
+export RITZ_PATH=/path/to/ritz
+./ritz build .
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                           SPIRE                                      │
-│                    MVRSPT Web Framework                              │
-├─────────────────────────────────────────────────────────────────────┤
-│  ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────┐│
-│  │  Model  │ │  View   │ │  Repo   │ │ Service │ │Presenter│ │Tests││
-│  │  Data   │ │Templates│ │  Data   │ │Business │ │ Routes  │ │ TDD ││
-│  │ Structs │ │  HTML   │ │ Access  │ │  Logic  │ │ Control │ │     ││
-│  └─────────┘ └─────────┘ └─────────┘ └─────────┘ └─────────┘ └─────┘│
-├─────────────────────────────────────────────────────────────────────┤
-│                              ZEUS                                    │
-│                    (App Server / Process Manager)                    │
-├─────────────────────────────────────────────────────────────────────┤
-│                             VALET                                    │
-│                    (HTTP Server / Reverse Proxy)                     │
-└─────────────────────────────────────────────────────────────────────┘
-```
 
-## The Six Layers (MVRSPT)
-
-| Layer | Directory | Responsibility |
-|-------|-----------|----------------|
-| **M** - Model | `models/` | Pure data structs, no behavior |
-| **V** - View | `views/` | Templates, HTML/JSON rendering |
-| **R** - Repository | `repos/` | Data access abstraction (Mausoleum/Tome) |
-| **S** - Service | `services/` | Business logic, workflows, rules |
-| **P** - Presenter | `presenters/` | HTTP handlers, request/response |
-| **T** - Tests | `tests/` | Unit + integration, mocks at every layer |
-
-## Why MVRSPT?
-
-Traditional MVC suffers from "fat model" syndrome where models accumulate business logic, data access, and validation. MVRSPT solves this by:
-
-1. **Repository Layer** - Abstracts data access. Services don't know if data comes from Mausoleum, Tome, or a mock.
-2. **Service Layer** - Contains all business logic. Testable without database.
-3. **Clear Boundaries** - Each layer has one job. Easy to test, easy to maintain.
-
-## Quick Example
+## Usage
 
 ```ritz
-// models/task.ritz — Pure data
+# models/task.ritz - Pure data structures
 struct Task
     id: Uuid
     title: String
     completed: bool
     user_id: Uuid
+```
 
-// repos/task_repo.ritz — Data access
-struct TaskRepository
-    db: @Mausoleum
-
-impl TaskRepository
-    fn find_by_user(self: @TaskRepository, user_id: Uuid) -> Vec<Task>
-        self.db.query()
-            .kind("task")
-            .where("user_id", user_id)
-            .exec()
-
-    fn create(self:& TaskRepository, task: Task) -> Result<Task, Error>
-        self.db.insert(task)
-
-// services/task_service.ritz — Business logic
+```ritz
+# services/task_service.ritz - Business logic
 struct TaskService
     repo: TaskRepository
 
 impl TaskService
-    fn create_task(self:& TaskService, user: User, title: StrView) -> Result<Task, Error>
-        // Business rule: title must be meaningful
-        if title.len() < 3
+    fn create_task(self: *TaskService, user: User, title: *u8) -> Result<Task, Error>
+        if strlen(title) < 3
             return Err(ValidationError("Title too short"))
-
-        // Business rule: max 100 pending tasks
-        let pending = self.repo.count_pending(user.id)
-        if pending >= 100
-            return Err(LimitError("Too many pending tasks"))
-
-        let task = Task {
-            id: Uuid.new_v4(),
-            title: String.from(title),
-            completed: false,
-            user_id: user.id,
-        }
-
+        let task = Task { id: uuid_new(), title: title, completed: false, user_id: user.id }
         self.repo.create(task)
+```
 
-// presenters/task_presenter.ritz — HTTP handlers
+```ritz
+# presenters/task_presenter.ritz - HTTP handlers
 struct TaskPresenter
     service: TaskService
 
 impl TaskPresenter
     [[route("POST", "/tasks")]]
-    fn create(self:& TaskPresenter, req: Request) -> Response
-        let form = req.parse_json::<CreateTaskForm>()?
-
+    fn create(self: *TaskPresenter, req: *Request) -> Response
+        let form = req.parse_json()
         match self.service.create_task(req.user, form.title)
-            Ok(task) => Response.json(task, status: 201)
-            Err(ValidationError(msg)) => Response.bad_request(msg)
-            Err(LimitError(msg)) => Response.conflict(msg)
-
-// tests/task_service_test.ritz — Unit tests with mocks
-[[test]]
-fn test_title_validation()
-    let mock_repo = MockTaskRepository.new()
-    let service = TaskService { repo: mock_repo }
-
-    let result = service.create_task(mock_user(), "ab")
-
-    assert(result.is_err())
-    assert(result.unwrap_err().message.contains("too short"))
+            Ok(task) => Response.json(task, 201)
+            Err(e) => Response.bad_request(e.message)
 ```
-
-## The Repository Trait
-
-All repositories implement a common interface, enabling easy mocking:
 
 ```ritz
-trait Repository<T>
-    fn find(self: @Self, id: Uuid) -> Option<T>
-    fn find_all(self: @Self, query: Query) -> Vec<T>
-    fn create(self:& Self, item: T) -> Result<T, Error>
-    fn update(self:& Self, item: T) -> Result<T, Error>
-    fn delete(self:& Self, id: Uuid) -> Result<(), Error>
-
-// Production: uses Mausoleum
-struct MausoleumRepo<T> implements Repository<T>
-    db: @Mausoleum
-
-// Testing: in-memory mock
-struct MockRepo<T> implements Repository<T>
-    items: HashMap<Uuid, T>
-    should_fail: bool
+# tests/task_service_test.ritz - Unit tests with mocks
+@test
+fn test_title_too_short() -> i32
+    let repo = MockTaskRepository.new()
+    let service = TaskService { repo: repo }
+    let result = service.create_task(mock_user(), "ab")
+    if result.is_ok()
+        return 1  # FAIL - should have rejected short title
+    return 0
 ```
-
-## Project Structure
-
-```
-myapp/
-├── models/
-│   ├── user.ritz
-│   └── task.ritz
-├── views/
-│   ├── layouts/
-│   │   └── base.html
-│   └── tasks/
-│       ├── index.html
-│       └── show.html
-├── repos/
-│   ├── user_repo.ritz
-│   └── task_repo.ritz
-├── services/
-│   ├── user_service.ritz
-│   └── task_service.ritz
-├── presenters/
-│   ├── user_presenter.ritz
-│   └── task_presenter.ritz
-├── tests/
-│   ├── repos/
-│   ├── services/
-│   └── presenters/
-├── config/
-│   └── routes.ritz
-└── main.ritz
-```
-
-## Full Stack Integration
-
-```
-                    THE RITZ STACK
-
-    ┌──────────────────────────────────────────┐
-    │            YOUR APPLICATION              │
-    ├──────────────────────────────────────────┤
-    │               SPIRE                      │  ← You are here
-    │   Model │ View │ Repo │ Service │ Present│
-    ├──────────────────────────────────────────┤
-    │               ZEUS                       │  ← App Server
-    ├──────────────────────────────────────────┤
-    │               VALET                      │  ← HTTP Server
-    ├──────────────────────────────────────────┤
-    │       MAUSOLEUM  │   TOME               │  ← Storage
-    │      (Persist)   │  (Cache)              │
-    ├──────────────────────────────────────────┤
-    │        CRYPTOSEC │ SQUEEZE              │  ← Security/Compression
-    ├──────────────────────────────────────────┤
-    │            RITZ + RITZUNIT              │  ← Language + Testing
-    └──────────────────────────────────────────┘
-```
-
-## Status
-
-**Design Phase** — Architecture and patterns being defined.
 
 ## Dependencies
 
-- `ritz` - Core compiler
-- `ritzunit` - Testing framework
-- `zeus` - App server (runtime)
-- `mausoleum` - Persistent storage (optional)
+- `ritzlib` - Standard library
+- `http` - HTTP protocol types (via ritz.toml)
+- `mausoleum` - Document storage (optional, for production repositories)
 - `tome` - In-memory cache (optional)
+
+## Status
+
+**Alpha** - Architecture and patterns are designed. Core routing, request/response handling, and repository traits are being implemented with TDD. Full Mausoleum and Tome integration is planned once those libraries stabilize.
 
 ## License
 
-MIT
+MIT License - see LICENSE file
