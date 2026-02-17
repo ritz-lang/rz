@@ -364,6 +364,8 @@ class BinaryConfig:
     no_red_zone: bool = False    # Disable red zone (for kernels)
     bin_sources: list[str] | None = None  # Per-binary source directories
     pic: bool = False            # Generate position-independent code (for PIE executables)
+    link_runtime: bool = False   # Link with Ritz runtime (_start that calls main and sys_exit)
+    main_args: int = 0           # Number of args main() takes (0, 2, or 3) for runtime selection
 
     def __post_init__(self):
         if self.asm_files is None:
@@ -645,6 +647,12 @@ def get_binaries(pkg_dir: Path, config: dict) -> list[BinaryConfig]:
             no_red_zone = flags_config.get("no-red-zone", False)
             pic = flags_config.get("pic", False)
 
+            # Parse runtime linking options
+            # link_runtime: bool - link with Ritz runtime (_start)
+            # main_args: int - number of args main() takes (0, 2, or 3)
+            link_runtime = bin_entry.get("link_runtime", False)
+            main_args = bin_entry.get("main_args", 0)
+
             # Per-binary source directories
             bin_sources = bin_entry.get("sources", [])
             if isinstance(bin_sources, str):
@@ -663,6 +671,8 @@ def get_binaries(pkg_dir: Path, config: dict) -> list[BinaryConfig]:
                 no_red_zone=no_red_zone,
                 bin_sources=bin_sources,
                 pic=pic,
+                link_runtime=link_runtime,
+                main_args=main_args,
             ))
     else:
         # Default: single binary with package name
@@ -1131,6 +1141,34 @@ def compile_freestanding_binary(
                     return None
 
                 object_files.append(obj_path)
+
+        # Step 3.5: Add runtime object file if requested
+        # The runtime provides _start which calls main() and then sys_exit()
+        if bin_config.link_runtime and not is_uefi:
+            # Determine the runtime variant based on main_args and target_os
+            main_args = bin_config.main_args
+            if main_args == 3:
+                runtime_variant = "ritz_start_envp"
+            elif main_args == 2:
+                runtime_variant = "ritz_start"
+            else:
+                runtime_variant = "ritz_start_noargs"
+
+            # Choose OS-specific runtime
+            if target_os == "harland":
+                runtime_suffix = ".harland.x86_64.o"
+            else:
+                runtime_suffix = ".x86_64.o"
+
+            runtime_name = f"{runtime_variant}{runtime_suffix}"
+            runtime_path = RITZ0_DIR.parent / "runtime" / runtime_name
+
+            if runtime_path.exists():
+                object_files.insert(0, runtime_path)  # Runtime should be first
+                print(f"  📦 Linking with runtime: {runtime_name}")
+            else:
+                print(f"  ⚠ Runtime not found: {runtime_path}", file=sys.stderr)
+                print(f"    Run 'make' in projects/ritz/runtime/ to build", file=sys.stderr)
 
         # Step 4: Link
         print(f"  ⚡ Linking {len(object_files)} object files...")

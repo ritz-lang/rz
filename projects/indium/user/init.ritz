@@ -1,0 +1,195 @@
+# Harland Init Process
+#
+# First userspace process (PID 1).
+# Runs explicit test cases and reports pass/fail, then triggers ACPI shutdown.
+#
+# This is a test harness - when the kernel is decoupled from the distribution,
+# this will move to the test suite rather than being the actual init process.
+# Runtime _start calls main() and then sys_exit(return_value).
+
+import libharland { print_str, print_num, strlen, sys_getpid, sys_yield, sys_spawn, sys_spawn_args, sys_wait, sys_acpi_poweroff }
+
+# ============================================================================
+# Test Infrastructure
+# ============================================================================
+
+var g_passed: i32 = 0
+var g_failed: i32 = 0
+
+# Run a test binary and check its exit code
+fn run_test(path: *u8, name: *u8, expected: i32) -> i32
+    print_str(c"[test] ")
+    print_str(name)
+    print_str(c" ... ")
+
+    let pid: i64 = sys_spawn(path)
+    if pid <= 0
+        print_str(c"FAIL (spawn error)\n")
+        g_failed = g_failed + 1
+        return 1
+
+    let exit_code: i64 = sys_wait(pid as i32)
+    let actual: i32 = exit_code as i32
+
+    if actual == expected
+        print_str(c"PASS (exit=")
+        print_num(actual)
+        print_str(c")\n")
+        g_passed = g_passed + 1
+        return 0
+    else
+        print_str(c"FAIL (expected ")
+        print_num(expected)
+        print_str(c", got ")
+        print_num(actual)
+        print_str(c")\n")
+        g_failed = g_failed + 1
+        return 1
+
+# Run a test binary with arguments
+fn run_test_args(path: *u8, name: *u8, argv: **u8, argc: i32, expected: i32) -> i32
+    print_str(c"[test] ")
+    print_str(name)
+    print_str(c" ... ")
+
+    let pid: i64 = sys_spawn_args(path, argv, argc)
+    if pid <= 0
+        print_str(c"FAIL (spawn error)\n")
+        g_failed = g_failed + 1
+        return 1
+
+    let exit_code: i64 = sys_wait(pid as i32)
+    let actual: i32 = exit_code as i32
+
+    if actual == expected
+        print_str(c"PASS (exit=")
+        print_num(actual)
+        print_str(c")\n")
+        g_passed = g_passed + 1
+        return 0
+    else
+        print_str(c"FAIL (expected ")
+        print_num(expected)
+        print_str(c", got ")
+        print_num(actual)
+        print_str(c")\n")
+        g_failed = g_failed + 1
+        return 1
+
+# ============================================================================
+# Syscall Tests
+# ============================================================================
+
+fn test_getpid() -> i32
+    print_str(c"[init] Testing sys_getpid()... ")
+    let pid: i32 = sys_getpid()
+    if pid == 1
+        print_str(c"PASS (pid=1)\n")
+        return 0
+    else
+        print_str(c"FAIL (expected 1, got ")
+        print_num(pid)
+        print_str(c")\n")
+        return 1
+
+fn test_write() -> i32
+    print_str(c"[init] Testing sys_write()... PASS\n")
+    return 0
+
+fn test_yield() -> i32
+    print_str(c"[init] Testing sys_yield()... ")
+    sys_yield()
+    print_str(c"PASS\n")
+    return 0
+
+# ============================================================================
+# Tier 1 Test Suite
+# ============================================================================
+#
+# These are explicit test cases. Each test specifies:
+#   - Binary path
+#   - Test name (for display)
+#   - Expected exit code
+#
+# To add a new test, just add another run_test() call.
+
+fn run_tier1_tests() -> i32
+    print_str(c"\n")
+    print_str(c"========================================\n")
+    print_str(c"  Running Tier 1 Test Suite\n")
+    print_str(c"========================================\n")
+
+    # Reset counters
+    g_passed = 0
+    g_failed = 0
+
+    # Basic tests - no arguments needed
+    run_test(c"/bin/hello",       c"hello",       0)
+    run_test(c"/bin/true",        c"true",        0)
+    run_test(c"/bin/false",       c"false",       1)
+    run_test(c"/bin/exitcode",    c"exitcode",   42)
+    run_test(c"/bin/hello_tier1", c"hello_tier1", 0)
+    run_test(c"/bin/seq10",       c"seq10",       0)
+    run_test(c"/bin/cat_motd",    c"cat_motd",    0)
+
+    # Test rzsh --help (non-interactive)
+    var rzsh_argv: [2]*u8
+    rzsh_argv[0] = c"rzsh"
+    rzsh_argv[1] = c"--help"
+    run_test_args(c"/bin/rzsh", c"rzsh --help", @rzsh_argv[0], 2, 0)
+
+    # Print summary
+    print_str(c"\n")
+    print_str(c"----------------------------------------\n")
+    print_str(c"  Results: ")
+    print_num(g_passed)
+    print_str(c" passed, ")
+    print_num(g_failed)
+    print_str(c" failed\n")
+    print_str(c"----------------------------------------\n")
+
+    return g_failed
+
+# ============================================================================
+# Main entry point
+# ============================================================================
+
+pub fn main() -> i32
+    print_str(c"\n")
+    print_str(c"========================================\n")
+    print_str(c"  Harland Init Process (PID 1)\n")
+    print_str(c"========================================\n")
+    print_str(c"\n")
+    print_str(c"Running syscall tests...\n")
+    print_str(c"\n")
+
+    var failed: i32 = 0
+
+    # Run basic syscall tests
+    failed = failed + test_write()
+    failed = failed + test_getpid()
+    failed = failed + test_yield()
+
+    # Run tier 1 test suite
+    let tier1_failed: i32 = run_tier1_tests()
+    failed = failed + tier1_failed
+
+    print_str(c"\n")
+
+    if failed == 0
+        print_str(c"========================================\n")
+        print_str(c"  ALL TESTS PASSED\n")
+        print_str(c"========================================\n")
+        print_str(c"\n")
+        print_str(c"[init] Triggering ACPI poweroff...\n")
+        sys_acpi_poweroff()
+        # If poweroff fails, just return 0 (runtime will call sys_exit)
+        print_str(c"[init] ACPI poweroff failed\n")
+        return 0
+    else
+        print_str(c"========================================\n")
+        print_str(c"  TESTS FAILED: ")
+        print_num(failed)
+        print_str(c"\n")
+        print_str(c"========================================\n")
+        return 1
