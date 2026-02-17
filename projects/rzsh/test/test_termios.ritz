@@ -1,0 +1,204 @@
+# Test file for terminal I/O support
+#
+# Tests termios structures and syscalls for raw mode terminal support.
+# These tests run on Linux only since that's where we develop/test.
+
+import ritzlib.sys {
+    sys_write, sys_ioctl, tcgetattr, tcsetattr, get_winsize,
+    Termios, Winsize,
+    TCGETS, TCSETS, TIOCGWINSZ,
+    ECHO, ICANON, ISIG, IEXTEN, ICRNL, IXON,
+    VMIN, VTIME,
+    STDIN, STDOUT
+}
+import ritzlib.str { strlen }
+
+fn puts(s: *u8) -> i64
+    return sys_write(STDOUT, s, strlen(s))
+
+fn println(s: *u8) -> i64
+    puts(s)
+    var nl: u8 = 10
+    return sys_write(STDOUT, @nl, 1)
+
+fn print_num(n: i32)
+    if n >= 10
+        print_num(n / 10)
+    var digit: u8 = ((n % 10) + 48) as u8
+    sys_write(STDOUT, @digit, 1)
+
+fn print_u32(n: u32)
+    print_num(n as i32)
+
+# ============================================================================
+# Test: Termios structure size
+# ============================================================================
+
+[[test]]
+fn test_termios_get() -> i32
+    println(c"Testing tcgetattr...")
+
+    var termios: Termios
+
+    # Get current terminal attributes
+    let result: i32 = tcgetattr(STDIN, @termios)
+
+    puts(c"  tcgetattr returned: ")
+    print_num(result)
+    println(c"")
+
+    if result != 0
+        # ENOTTY (-25) is expected when running without a terminal
+        # (e.g., in CI, piped, or under test harness)
+        println(c"  SKIP: stdin is not a tty (expected in CI)")
+        return 0  # Skip, not fail
+
+    # Print some values to verify structure is being read correctly
+    puts(c"  c_lflag: ")
+    print_u32(termios.c_lflag)
+    println(c"")
+
+    puts(c"  c_iflag: ")
+    print_u32(termios.c_iflag)
+    println(c"")
+
+    puts(c"  c_oflag: ")
+    print_u32(termios.c_oflag)
+    println(c"")
+
+    puts(c"  c_cflag: ")
+    print_u32(termios.c_cflag)
+    println(c"")
+
+    # Verify ECHO is set (should be for normal terminal)
+    # Note: When run via test harness, ECHO may not be set
+    puts(c"  ECHO flag: ")
+    if (termios.c_lflag & ECHO) != 0
+        println(c"set")
+    else
+        println(c"not set")
+
+    puts(c"  ICANON flag: ")
+    if (termios.c_lflag & ICANON) != 0
+        println(c"set")
+    else
+        println(c"not set")
+
+    println(c"  PASS: tcgetattr succeeded")
+    return 0
+
+# ============================================================================
+# Test: Get window size
+# ============================================================================
+
+[[test]]
+fn test_winsize() -> i32
+    println(c"Testing get_winsize...")
+
+    var ws: Winsize
+
+    let result: i32 = get_winsize(STDOUT, @ws)
+
+    puts(c"  get_winsize returned: ")
+    print_num(result)
+    println(c"")
+
+    # Note: This may fail if stdout is not a tty (e.g., piped output)
+    if result != 0
+        println(c"  INFO: get_winsize failed (stdout may not be a tty)")
+        # Don't fail the test - this is expected when running under a test harness
+        return 0
+
+    puts(c"  Rows: ")
+    print_num(ws.ws_row as i32)
+    println(c"")
+
+    puts(c"  Cols: ")
+    print_num(ws.ws_col as i32)
+    println(c"")
+
+    println(c"  PASS: get_winsize succeeded")
+    return 0
+
+# ============================================================================
+# Test: Raw mode enable/disable
+# ============================================================================
+
+[[test]]
+fn test_raw_mode_roundtrip() -> i32
+    println(c"Testing raw mode roundtrip...")
+
+    # Get original termios
+    var orig: Termios
+    let r1: i32 = tcgetattr(STDIN, @orig)
+    if r1 != 0
+        # ENOTTY (-25) is expected when running without a terminal
+        println(c"  SKIP: stdin is not a tty (expected in CI)")
+        return 0  # Skip, not fail
+
+    let orig_lflag: u32 = orig.c_lflag
+    puts(c"  Original c_lflag: ")
+    print_u32(orig_lflag)
+    println(c"")
+
+    # Modify to raw mode - work on orig directly since we already saved orig_lflag
+    # We'll restore from a fresh tcgetattr call
+
+    # Disable canonical mode, echo, signals, extended processing
+    orig.c_lflag = orig.c_lflag & (0xFFFFFFFF ^ (ECHO | ICANON | ISIG | IEXTEN))
+
+    # Disable CR->NL translation and XON/XOFF
+    orig.c_iflag = orig.c_iflag & (0xFFFFFFFF ^ (ICRNL | IXON))
+
+    # Set minimum characters for read to 1, timeout to 0
+    orig.c_cc[VMIN] = 1
+    orig.c_cc[VTIME] = 0
+
+    puts(c"  Modified c_lflag: ")
+    print_u32(orig.c_lflag)
+    println(c"")
+
+    # Apply raw mode
+    let r2: i32 = tcsetattr(STDIN, @orig)
+    if r2 != 0
+        println(c"  FAIL: tcsetattr (raw) failed")
+        return 1
+
+    println(c"  Raw mode applied")
+
+    # Get fresh copy of terminal state and restore original lflag
+    # (We can't easily copy structs, so we modify in place)
+    var restore: Termios
+    let r2b: i32 = tcgetattr(STDIN, @restore)
+    if r2b != 0
+        println(c"  FAIL: tcgetattr for restore failed")
+        return 1
+
+    # Restore original flags
+    restore.c_lflag = orig_lflag
+    restore.c_iflag = restore.c_iflag | ICRNL | IXON
+
+    let r3: i32 = tcsetattr(STDIN, @restore)
+    if r3 != 0
+        println(c"  FAIL: tcsetattr (restore) failed")
+        return 1
+
+    println(c"  Original mode restored")
+
+    # Verify restoration
+    var verify: Termios
+    let r4: i32 = tcgetattr(STDIN, @verify)
+    if r4 != 0
+        println(c"  FAIL: Verification tcgetattr failed")
+        return 1
+
+    if verify.c_lflag != orig_lflag
+        puts(c"  FAIL: c_lflag not restored. Expected: ")
+        print_u32(orig_lflag)
+        puts(c", got: ")
+        print_u32(verify.c_lflag)
+        println(c"")
+        return 1
+
+    println(c"  PASS: Raw mode roundtrip succeeded")
+    return 0
