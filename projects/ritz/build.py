@@ -357,6 +357,7 @@ class BinaryConfig:
     additional_sources: list[Path]  # Extra sources (deprecated)
     freestanding: bool = False   # If True, no runtime, custom linker
     target: str = ""             # Target triple (e.g., "x86_64-none-elf")
+    target_os: str = ""          # Target OS for conditional compilation (e.g., "harland", "linux")
     linker_script: Path | None = None  # Custom linker script
     asm_files: list[Path] | None = None  # Assembly files to compile
     code_model: str = ""         # LLC code model (e.g., "kernel")
@@ -622,6 +623,7 @@ def get_binaries(pkg_dir: Path, config: dict) -> list[BinaryConfig]:
             # Parse freestanding build options
             freestanding = bin_entry.get("freestanding", False)
             target = bin_entry.get("target", "")
+            target_os = bin_entry.get("target_os", "")
 
             # Parse [bin.NAME.linker] section
             # TOML puts [bin.harland.linker] as bin_entry["harland"]["linker"]
@@ -654,6 +656,7 @@ def get_binaries(pkg_dir: Path, config: dict) -> list[BinaryConfig]:
                 additional_sources=additional_sources,
                 freestanding=freestanding,
                 target=target,
+                target_os=target_os,
                 linker_script=linker_script,
                 asm_files=asm_files,
                 code_model=code_model,
@@ -962,6 +965,7 @@ def compile_freestanding_binary(
     name = bin_config.name
     src_path = bin_config.src_path
     target = bin_config.target or "x86_64-none-elf"
+    target_os = bin_config.target_os or ""  # For conditional compilation (e.g., "harland")
     linker_script = bin_config.linker_script
     asm_files = bin_config.asm_files or []
     code_model = bin_config.code_model
@@ -1028,6 +1032,9 @@ def compile_freestanding_binary(
                 "-o", str(ll_path),
                 "--no-runtime"
             ]
+            # Pass target OS for [[target_os = "..."]] conditional compilation
+            if target_os:
+                compile_cmd.extend(["--target-os", target_os])
             if dependencies:
                 deps_json = {
                     dep_name: {"path": str(spec.path), "sources": spec.sources}

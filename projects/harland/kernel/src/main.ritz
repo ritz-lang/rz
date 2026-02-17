@@ -3573,6 +3573,7 @@ extern fn context_switch(old_ctx: *CpuContext, new_ctx: *CpuContext)
 extern fn syscall_entry()
 extern fn jump_to_userspace(entry: u64, stack: u64)
 extern fn jump_to_userspace_with_retval(entry: u64, stack: u64, retval: i64)
+extern fn jump_to_userspace_with_args(entry: u64, stack: u64, argc: i64, argv: u64)
 extern fn user_program_start()
 extern fn user_program_end()
 extern fn user_program_minimal()
@@ -3606,6 +3607,7 @@ const SYS_SPAWN: u64 = 21
 const SYS_WAIT: u64 = 22
 const SYS_GETPID: u64 = 23
 const SYS_YIELD: u64 = 24
+const SYS_SPAWN_ARGS: u64 = 25
 const SYS_ACPI_POWEROFF: u64 = 200
 const SYS_DEBUG_PRINT: u64 = 255
 
@@ -3850,6 +3852,209 @@ fn sys_spawn_impl(path: *u8) -> i64
 
     # Never reached - child will call sys_exit which handles return to parent
     prints("[spawn] ERROR: jump_to_userspace returned!\n")
+    return -1
+
+# sys_spawn_args: Load and execute a binary with command-line arguments
+# Similar to sys_spawn_impl but passes argc/argv to the child process.
+#
+# Arguments:
+#   path: Path to the executable
+#   argv: Array of null-terminated argument strings (in parent's address space)
+#   argc: Number of arguments
+#
+# The child's main() receives: fn main(argc: i32, argv: **u8) -> i32
+fn sys_spawn_args_impl(path: *u8, argv: **u8, argc: i32) -> i64
+    prints("[spawn_args] spawn_args(")
+    prints_str(path)
+    prints(", argc=")
+    serial_print_dec(argc as u64)
+    prints(")\n")
+
+    # Look up the file in the namespace
+    let ns: *KNamespace = knamespace_get()
+    if ns == 0 as *KNamespace
+        prints("[spawn_args] No namespace\n")
+        return -1
+
+    # Read file from namespace (using kernel's page table)
+    let path_len: i64 = syscall_strlen(path)
+    let path_view: StrView = strview_from_ptr(path, path_len)
+    var file_size: u64 = 0
+    let elf_data: *u8 = knamespace_read(ns, @path_view, @file_size)
+
+    if elf_data == 0 as *u8
+        prints("[spawn_args] File not found: ")
+        prints_str(path)
+        prints("\n")
+        return -1
+
+    prints("[spawn_args] Loading ELF (")
+    serial_print_dec(file_size)
+    prints(" bytes)...\n")
+
+    # Save parent's execution context
+    g_parent_ctx.user_rip = get_syscall_user_rip()
+    g_parent_ctx.user_rsp = get_syscall_user_rsp()
+    g_parent_ctx.user_rflags = get_syscall_user_rflags()
+    g_parent_ctx.user_pml4 = vmm_get_current_pml4()
+    g_has_parent = 1
+    g_child_pid = 2
+
+    # Create an isolated address space for the child
+    let child_pml4: u64 = vmm_create_user_pml4()
+    if child_pml4 == 0
+        prints("[spawn_args] Failed to create child page table\n")
+        g_has_parent = 0
+        return -1
+
+    g_child_pml4 = child_pml4
+
+    # Copy argv strings from parent's address space before switching
+    # We need to measure total space needed and copy while we can still read parent memory
+    var total_string_bytes: i64 = 0
+    var i: i32 = 0
+    while i < argc
+        let arg: *u8 = *(argv + i)
+        total_string_bytes = total_string_bytes + syscall_strlen(arg) + 1  # +1 for null
+        i = i + 1
+
+    # Allocate temporary kernel buffer to hold copies of argv strings
+    # For simplicity, use a static buffer (max 4KB of arguments)
+    var argv_copy: [4096]u8
+    var argv_offsets: [64]i64  # Store offset of each arg in argv_copy
+
+    if total_string_bytes > 4096
+        prints("[spawn_args] argv too large\n")
+        vmm_free_pml4(child_pml4)
+        g_has_parent = 0
+        g_child_pml4 = 0
+        return -1
+
+    if argc > 64
+        prints("[spawn_args] too many arguments\n")
+        vmm_free_pml4(child_pml4)
+        g_has_parent = 0
+        g_child_pml4 = 0
+        return -1
+
+    # Copy all strings into argv_copy
+    var copy_pos: i64 = 0
+    i = 0
+    while i < argc
+        argv_offsets[i] = copy_pos
+        let arg: *u8 = *(argv + i)
+        var j: i64 = 0
+        while *(arg + j) != 0
+            argv_copy[(copy_pos + j) as i32] = *(arg + j)
+            j = j + 1
+        argv_copy[(copy_pos + j) as i32] = 0  # Null terminate
+        copy_pos = copy_pos + j + 1
+        i = i + 1
+
+    # Switch to child's address space
+    vmm_switch_pml4(child_pml4)
+
+    # Load the child ELF
+    let child_load_base: u64 = 0x100000000
+    let load_result: ElfLoadResult = elf_load(elf_data, file_size, child_load_base)
+
+    if load_result.error != ELF_OK
+        prints("[spawn_args] Failed to load ELF\n")
+        vmm_switch_pml4(g_parent_ctx.user_pml4)
+        vmm_free_pml4(child_pml4)
+        g_has_parent = 0
+        g_child_pml4 = 0
+        return -1
+
+    # Allocate child stack
+    let child_stack_page: u64 = pmm_alloc_page()
+    if child_stack_page == 0
+        prints("[spawn_args] Failed to allocate child stack\n")
+        vmm_switch_pml4(g_parent_ctx.user_pml4)
+        vmm_free_pml4(child_pml4)
+        g_has_parent = 0
+        g_child_pml4 = 0
+        return -1
+
+    let child_stack_vaddr: u64 = 0x7FFFFFFFE000
+    let map_result: i32 = vmm_map_page(child_stack_vaddr, child_stack_page, PTE_WRITABLE | PTE_USER)
+    if map_result != 0
+        prints("[spawn_args] Failed to map child stack\n")
+        pmm_free_page(child_stack_page)
+        vmm_switch_pml4(g_parent_ctx.user_pml4)
+        vmm_free_pml4(child_pml4)
+        g_has_parent = 0
+        g_child_pml4 = 0
+        return -1
+
+    # Set up the stack with argv data
+    # Layout from top of stack going down:
+    #   1. String data (argv[0] content, argv[1] content, ...)
+    #   2. argv[argc] = NULL
+    #   3. argv[argc-1] pointer
+    #   4. ...
+    #   5. argv[0] pointer
+    #   6. (16-byte aligned) <- RSP points here
+
+    let stack_base: u64 = child_stack_vaddr
+    var stack_ptr: u64 = stack_base + PAGE_SIZE
+
+    # Copy string data to top of stack (working down)
+    stack_ptr = stack_ptr - (total_string_bytes as u64)
+    stack_ptr = stack_ptr & 0xFFFFFFFFFFFFFFF0  # Align to 16 bytes
+    let strings_base: u64 = stack_ptr
+
+    # Copy argv strings to child stack
+    i = 0
+    var child_argv_ptrs: [64]u64
+    var dst_offset: i64 = 0
+    while i < argc
+        child_argv_ptrs[i] = strings_base + (dst_offset as u64)
+        let src_offset: i64 = argv_offsets[i]
+        var j: i64 = 0
+        while argv_copy[(src_offset + j) as i32] != 0
+            *((strings_base + dst_offset as u64 + j as u64) as *u8) = argv_copy[(src_offset + j) as i32]
+            j = j + 1
+        *((strings_base + dst_offset as u64 + j as u64) as *u8) = 0
+        dst_offset = dst_offset + j + 1
+        i = i + 1
+
+    # Push argv array (including NULL terminator)
+    let argv_array_size: u64 = ((argc + 1) as u64) * 8  # pointers + NULL
+    stack_ptr = stack_ptr - argv_array_size
+    stack_ptr = stack_ptr & 0xFFFFFFFFFFFFFFF0  # Align
+    let child_argv: u64 = stack_ptr
+
+    # Write argv pointers
+    i = 0
+    while i < argc
+        *((child_argv + (i as u64) * 8) as *u64) = child_argv_ptrs[i]
+        i = i + 1
+    # NULL terminator
+    *((child_argv + (argc as u64) * 8) as *u64) = 0
+
+    # Final stack alignment for SysV ABI (RSP must be 16-byte aligned before call)
+    stack_ptr = stack_ptr & 0xFFFFFFFFFFFFFFF0
+
+    prints("[spawn_args] Child argv at 0x")
+    serial_print_hex(child_argv)
+    prints(", stack=0x")
+    serial_print_hex(stack_ptr)
+    prints("\n")
+
+    # Debug: print first arg
+    if argc > 0
+        prints("[spawn_args] argv[0] = ")
+        prints_str(child_argv_ptrs[0] as *u8)
+        prints("\n")
+
+    prints("[spawn_args] Jumping to child with args...\n\n")
+
+    # Jump to child with argc/argv!
+    jump_to_userspace_with_args(load_result.entry_point, stack_ptr, argc as i64, child_argv)
+
+    # Never reached
+    prints("[spawn_args] ERROR: jump returned!\n")
     return -1
 
 # sys_exit: Exit the current process
@@ -4106,6 +4311,10 @@ pub fn syscall_handler(rax: u64, rdi: u64, rsi: u64, rdx: u64) -> i64
     if rax == SYS_SPAWN
         # rdi = path pointer
         return sys_spawn_impl(rdi as *u8)
+
+    if rax == SYS_SPAWN_ARGS
+        # rdi = path pointer, rsi = argv, rdx = argc
+        return sys_spawn_args_impl(rdi as *u8, rsi as **u8, rdx as i32)
 
     if rax == SYS_WAIT
         # rdi = pid
