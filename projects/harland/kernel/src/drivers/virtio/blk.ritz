@@ -6,7 +6,7 @@
 # Reference: https://docs.oasis-open.org/virtio/virtio/v1.1/cs01/virtio-v1.1-cs01.html#x1-2500006
 
 import serial { prints, println, serial_print_hex, serial_print_hex8, serial_print_dec }
-import drivers.pci { PciDevice, pci_find_virtio, VIRTIO_DEVICE_BLOCK }
+import drivers.pci { PciDevice, pci_find_virtio, pci_find_virtio_nth, VIRTIO_DEVICE_BLOCK }
 import drivers.virtio.common { VirtioDevice, Virtqueue, VringDesc, vio_init_device, vio_device_ready, vio_get_features, vio_set_features, vio_setup_queue, vio_read_config64, vq_alloc_desc, vq_free_desc, vq_get_desc, vq_submit, vq_notify, vq_has_used, vq_get_used, VRING_DESC_F_NEXT, VRING_DESC_F_WRITE }
 import mm.heap { kalloc, kfree }
 import mm.vmm { vmm_virt_to_phys }
@@ -79,24 +79,33 @@ const VIRTIO_BLK_CFG_GEOMETRY: u16 = 16     # Disk geometry (if feature set)
 const VIRTIO_BLK_CFG_BLK_SIZE: u16 = 20     # 32-bit block size
 
 # ============================================================================
-# Global Block Device
+# Global Block Devices
 # ============================================================================
 
+# Support up to 4 block devices
+const MAX_BLK_DEVICES: i32 = 4
+var blk_devices: [4]*VirtioBlkDevice
+var blk_device_count: i32 = 0
+
+# Legacy single-device pointer (for backwards compatibility)
 var blk_device: *VirtioBlkDevice = 0 as *VirtioBlkDevice
 
-# DMA buffer for block I/O
-# Layout: [header 16 bytes][status 1 byte][padding to 32][data up to 4064 bytes]
-# Total: one 4KB page
-var dma_buffer_phys: u64 = 0   # Physical address of DMA buffer
-var dma_buffer_virt: *u8 = 0 as *u8  # Virtual address (identity mapped)
+# Per-device DMA buffers
+# Each device needs its own DMA buffer for concurrent I/O
+var dma_buffer_phys: [4]u64
+var dma_buffer_virt: [4]*u8
 
 # ============================================================================
 # Device Initialization
 # ============================================================================
 
-pub fn virtio_blk_init() -> *VirtioBlkDevice
-    # Find VirtIO block device
-    let pci_dev: *PciDevice = pci_find_virtio(VIRTIO_DEVICE_BLOCK)
+# Initialize the Nth VirtIO block device (0-indexed)
+pub fn virtio_blk_init_nth(n: i32) -> *VirtioBlkDevice
+    if n >= MAX_BLK_DEVICES
+        return 0 as *VirtioBlkDevice
+
+    # Find the Nth VirtIO block device
+    let pci_dev: *PciDevice = pci_find_virtio_nth(VIRTIO_DEVICE_BLOCK, n)
     if pci_dev == 0 as *PciDevice
         return 0 as *VirtioBlkDevice
 
@@ -133,18 +142,18 @@ pub fn virtio_blk_init() -> *VirtioBlkDevice
         kfree(dev)
         return 0 as *VirtioBlkDevice
 
-    # Allocate DMA buffer (one physical page, identity mapped)
-    dma_buffer_phys = pmm_alloc_page()
-    if dma_buffer_phys == 0
+    # Allocate DMA buffer for this device (one physical page, identity mapped)
+    dma_buffer_phys[n] = pmm_alloc_page()
+    if dma_buffer_phys[n] == 0
         println("[virtio-blk] Failed to allocate DMA buffer")
         kfree(dev)
         return 0 as *VirtioBlkDevice
-    dma_buffer_virt = dma_buffer_phys as *u8
+    dma_buffer_virt[n] = dma_buffer_phys[n] as *u8
 
     # Zero the DMA buffer
     var i: u64 = 0
     while i < PAGE_SIZE
-        *(dma_buffer_virt + i as i64) = 0
+        *(dma_buffer_virt[n] + i as i64) = 0
         i = i + 1
 
     # Mark device as ready
@@ -153,13 +162,48 @@ pub fn virtio_blk_init() -> *VirtioBlkDevice
         kfree(dev)
         return 0 as *VirtioBlkDevice
 
-    blk_device = dev
-    println("[virtio-blk] Initialization complete")
+    # Store in array
+    blk_devices[n] = dev
+    blk_device_count = blk_device_count + 1
+
+    prints("[virtio-blk] Device " as StrView)
+    serial_print_dec(n as u64)
+    prints(" initialized (" as StrView)
+    serial_print_dec((*dev).capacity / 2048)
+    prints(" MB)\n" as StrView)
     return dev
+
+# Initialize the first VirtIO block device (backwards compatible)
+pub fn virtio_blk_init() -> *VirtioBlkDevice
+    let dev: *VirtioBlkDevice = virtio_blk_init_nth(0)
+    if dev != 0 as *VirtioBlkDevice
+        blk_device = dev
+        # For backwards compatibility, also set up legacy DMA pointers
+        # (using device 0's DMA buffer)
+    return dev
+
+# Get the Nth block device
+pub fn virtio_blk_get_device_nth(n: i32) -> *VirtioBlkDevice
+    if n < 0 or n >= MAX_BLK_DEVICES
+        return 0 as *VirtioBlkDevice
+    return blk_devices[n]
+
+# Get the total number of initialized block devices
+pub fn virtio_blk_get_device_count() -> i32
+    return blk_device_count
 
 # ============================================================================
 # Block Read/Write Operations
 # ============================================================================
+
+# Find the device index for a given device pointer
+fn get_device_index(dev: *VirtioBlkDevice) -> i32
+    var i: i32 = 0
+    while i < MAX_BLK_DEVICES
+        if blk_devices[i] == dev
+            return i
+        i = i + 1
+    return 0  # Fall back to device 0
 
 # Read sectors from the block device
 # sector: starting sector number
@@ -170,7 +214,11 @@ pub fn virtio_blk_read(dev: *VirtioBlkDevice, sector: u64, count: u32, buf: *u8)
     if dev == 0 as *VirtioBlkDevice
         return -1
 
-    if dma_buffer_phys == 0
+    let dev_idx: i32 = get_device_index(dev)
+    let dev_dma_phys: u64 = dma_buffer_phys[dev_idx]
+    let dev_dma_virt: *u8 = dma_buffer_virt[dev_idx]
+
+    if dev_dma_phys == 0
         println("[virtio-blk] No DMA buffer")
         return -1
 
@@ -178,18 +226,18 @@ pub fn virtio_blk_read(dev: *VirtioBlkDevice, sector: u64, count: u32, buf: *u8)
     # [0-15]   : VirtioBlkReqHdr (16 bytes)
     # [16]     : status byte
     # [32-4095]: data (up to 4064 bytes = 7 sectors + some)
-    let header_phys: u64 = dma_buffer_phys
-    let status_phys: u64 = dma_buffer_phys + 16
-    let data_phys: u64 = dma_buffer_phys + 32
+    let header_phys: u64 = dev_dma_phys
+    let status_phys: u64 = dev_dma_phys + 16
+    let data_phys: u64 = dev_dma_phys + 32
 
     # Set up request header in DMA buffer
-    let header: *VirtioBlkReqHdr = dma_buffer_virt as *VirtioBlkReqHdr
+    let header: *VirtioBlkReqHdr = dev_dma_virt as *VirtioBlkReqHdr
     (*header).req_type = VIRTIO_BLK_T_IN
     (*header).reserved = 0
     (*header).sector = sector
 
     # Initialize status to invalid
-    *(dma_buffer_virt + 16 as i64) = 0xFF
+    *(dev_dma_virt + 16 as i64) = 0xFF
 
     let vq: *Virtqueue = (*dev).request_queue
 
@@ -253,7 +301,7 @@ pub fn virtio_blk_read(dev: *VirtioBlkDevice, sector: u64, count: u32, buf: *u8)
     vq_free_desc(vq, desc0 as u16)
 
     # Check status
-    let status: u8 = *(dma_buffer_virt + 16 as i64)
+    let status: u8 = *(dev_dma_virt + 16 as i64)
     if status != VIRTIO_BLK_S_OK
         prints("[virtio-blk] Read error: ")
         serial_print_dec(status as u64)
@@ -261,7 +309,7 @@ pub fn virtio_blk_read(dev: *VirtioBlkDevice, sector: u64, count: u32, buf: *u8)
         return -5
 
     # Copy data from DMA buffer to user buffer
-    let data_virt: *u8 = (dma_buffer_virt + 32 as i64)
+    let data_virt: *u8 = (dev_dma_virt + 32 as i64)
     let bytes_to_copy: u32 = count * 512
     var j: u32 = 0
     while j < bytes_to_copy
@@ -279,7 +327,11 @@ pub fn virtio_blk_write(dev: *VirtioBlkDevice, sector: u64, count: u32, buf: *u8
     if dev == 0 as *VirtioBlkDevice
         return -1
 
-    if dma_buffer_phys == 0
+    let dev_idx: i32 = get_device_index(dev)
+    let dev_dma_phys: u64 = dma_buffer_phys[dev_idx]
+    let dev_dma_virt: *u8 = dma_buffer_virt[dev_idx]
+
+    if dev_dma_phys == 0
         println("[virtio-blk] No DMA buffer")
         return -1
 
@@ -287,12 +339,12 @@ pub fn virtio_blk_write(dev: *VirtioBlkDevice, sector: u64, count: u32, buf: *u8
     # [0-15]   : VirtioBlkReqHdr (16 bytes)
     # [16]     : status byte
     # [32-4095]: data (up to 4064 bytes = 7 sectors + some)
-    let header_phys: u64 = dma_buffer_phys
-    let status_phys: u64 = dma_buffer_phys + 16
-    let data_phys: u64 = dma_buffer_phys + 32
+    let header_phys: u64 = dev_dma_phys
+    let status_phys: u64 = dev_dma_phys + 16
+    let data_phys: u64 = dev_dma_phys + 32
 
     # Copy data from user buffer to DMA buffer
-    let data_virt: *u8 = (dma_buffer_virt + 32 as i64)
+    let data_virt: *u8 = (dev_dma_virt + 32 as i64)
     let bytes_to_copy: u32 = count * 512
     var j: u32 = 0
     while j < bytes_to_copy
@@ -300,13 +352,13 @@ pub fn virtio_blk_write(dev: *VirtioBlkDevice, sector: u64, count: u32, buf: *u8
         j = j + 1
 
     # Set up request header in DMA buffer
-    let header: *VirtioBlkReqHdr = dma_buffer_virt as *VirtioBlkReqHdr
+    let header: *VirtioBlkReqHdr = dev_dma_virt as *VirtioBlkReqHdr
     (*header).req_type = VIRTIO_BLK_T_OUT
     (*header).reserved = 0
     (*header).sector = sector
 
     # Initialize status to invalid
-    *(dma_buffer_virt + 16 as i64) = 0xFF
+    *(dev_dma_virt + 16 as i64) = 0xFF
 
     let vq: *Virtqueue = (*dev).request_queue
 
@@ -370,7 +422,7 @@ pub fn virtio_blk_write(dev: *VirtioBlkDevice, sector: u64, count: u32, buf: *u8
     vq_free_desc(vq, desc0 as u16)
 
     # Check status
-    let status: u8 = *(dma_buffer_virt + 16 as i64)
+    let status: u8 = *(dev_dma_virt + 16 as i64)
     if status != VIRTIO_BLK_S_OK
         prints("[virtio-blk] Write error: ")
         serial_print_dec(status as u64)

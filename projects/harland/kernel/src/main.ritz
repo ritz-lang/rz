@@ -27,7 +27,7 @@ import ipc.syscall { SYS_CHANNEL_CREATE, SYS_IPC_SEND, SYS_IPC_RECV, SYS_IPC_CLO
 import cap.types { CapHandle, CapEntry, CapInfo, CAP_TYPE_NONE, CAP_TYPE_MEMORY, CAP_TYPE_CHANNEL, CAP_TYPE_IRQ, CAP_RIGHT_READ, CAP_RIGHT_WRITE, CAP_RIGHT_GRANT, CAP_RIGHT_DERIVE, cap_handle_init, cap_handle_invalid, cap_handle_is_valid }
 import cap.table { CapTable, CAP_TABLE_SIZE, cap_table_init, cap_table_alloc, cap_table_free, cap_table_get, cap_table_insert, cap_table_lookup, cap_table_remove, cap_table_derive, cap_grant, cap_table_info, cap_has_rights, cap_system_debug_print }
 import cap.syscall { SYS_CAP_GRANT, SYS_CAP_REVOKE, SYS_CAP_DERIVE, SYS_CAP_INFO, SYS_CAP_CHECK, sys_cap_grant, sys_cap_revoke, sys_cap_derive, sys_cap_info, sys_cap_check }
-import drivers.virtio.blk { VirtioBlkDevice, virtio_blk_init, virtio_blk_read, virtio_blk_write, virtio_blk_get_capacity, virtio_blk_get_device, virtio_blk_test }
+import drivers.virtio.blk { VirtioBlkDevice, virtio_blk_init, virtio_blk_init_nth, virtio_blk_read, virtio_blk_write, virtio_blk_get_capacity, virtio_blk_get_device, virtio_blk_get_device_nth, virtio_blk_get_device_count, virtio_blk_test }
 import fs.kblob { KBlobId, kblob_init, kblob_get_store, kblob_store_put, kblob_store_get, kblob_store_exists, kblob_id_eq, kblob_id_is_zero }
 import fs.vfs { vfs_init, fd_table_init }
 import fs.knamespace { KNamespace, knamespace_init, knamespace_get, knamespace_mkdir, knamespace_write, knamespace_read, knamespace_exists, knamespace_list, KNS_OK }
@@ -35,6 +35,8 @@ import fs.kdir_entry { KDirEntry }
 import fs.kpath { strview_from_ptr }
 import fs.syscall { fs_syscall_init, sys_open, sys_close, sys_fs_read, sys_fs_write, sys_lseek, is_fs_fd }
 import fs.initramfs { initramfs_load }
+import fs.persist { PersistBlobStore, persist_init, persist_format, persist_exists, persist_get_size, persist_read, persist_put, persist_sync, persist_count, persist_global_init, persist_get_store }
+import fs.sync { fs_sync_init, fs_sync_all, fs_sync_stats, fs_sync_is_enabled }
 
 # Network stack imports
 import drivers.virtio.net { virtio_net_init, virtio_net_send, virtio_net_poll, virtio_net_is_ready, virtio_net_get_mac, VirtioNetDevice, virtio_net_get_device }
@@ -4353,6 +4355,33 @@ pub fn kernel_main(boot_info_addr: u64) -> i32
 
         # Test filesystem operations
         fs_quick_test()
+
+        # Initialize second block device (persistent storage)
+        klog(c"  [..] Persistent storage")
+        let storage_dev: *VirtioBlkDevice = virtio_blk_init_nth(1)
+        if storage_dev != 0 as *VirtioBlkDevice
+            # Initialize persistent blob store
+            let persist_result: i32 = persist_global_init()
+            if persist_result == 0
+                let pstore: *PersistBlobStore = persist_get_store()
+                if pstore != 0 as *PersistBlobStore
+                    klog(c"\r  [OK] Persistent storage (")
+                    serial_print_dec(persist_count(pstore) as u64)
+                    klog(c" blobs)\n")
+
+                    # Initialize filesystem sync layer
+                    klog(c"  [..] Filesystem sync")
+                    let sync_result: i32 = fs_sync_init()
+                    if sync_result == 0
+                        klog(c"\r  [OK] Filesystem sync\n")
+                    else
+                        klog(c"\r  [!!] Filesystem sync (failed)\n")
+                else
+                    klog(c"\r  [!!] Persistent storage (init failed)\n")
+            else
+                klog(c"\r  [!!] Persistent storage (persist_init failed)\n")
+        else
+            klog(c"\r  [..] Persistent storage (not found)\n")
     else
         klog(c"\r  [!!] Kernel namespace (no store)\n")
 
