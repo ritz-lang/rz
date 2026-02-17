@@ -22,10 +22,10 @@ All core milestones through userspace execution are complete. The kernel success
    - Need to investigate block splitting/coalescing in heap allocator
    - Files: `kernel/src/mm/heap.ritz`, `kernel/src/fs/initramfs.ritz`
 
-2. **Fix Page Fault on Process Exit**
-   - Page fault occurs during address space cleanup after hello_tier1
-   - Tests still pass but cleanup is incomplete
-   - Files: `kernel/src/proc/process.ritz`, `kernel/src/mm/vmm.ritz`
+2. ~~**Fix Page Fault on Process Exit**~~ ✅ FIXED
+   - Fixed in PR #73 - vmm_free_user_pages was freeing shared kernel page tables
+   - Child process cleanup now works correctly
+   - All 5 Tier 1 tests pass reliably
 
 3. **Add More Tier 1 Tests**
    - Port remaining ritz examples to Harland userspace
@@ -91,9 +91,9 @@ All core milestones through userspace execution are complete. The kernel success
    - Possibly DMA-related or alignment issue
    - Workaround: Use embedded initramfs
 
-3. **Page Fault on Process Exit Cleanup**
-   - Occurs after hello_tier1 execution
-   - Tests pass, but cleanup is incomplete
+3. ~~**Page Fault on Process Exit Cleanup**~~ ✅ FIXED (PR #73)
+   - Was freeing shared kernel page tables in vmm_free_user_pages
+   - Fixed by skipping PDPT[0] and PDPT[3] which are kernel copies
 
 ---
 

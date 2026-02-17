@@ -1,0 +1,267 @@
+# net/arp.ritz - Address Resolution Protocol
+#
+# Maps IPv4 addresses to Ethernet MAC addresses.
+#
+# ARP packet format (for Ethernet/IPv4):
+# +----------+----------+---------+---------+-----+
+# | HW Type  | Proto    | HW Len  | P Len   | Op  |
+# +----------+----------+---------+---------+-----+
+# | Sender MAC (6) | Sender IP (4)                 |
+# +----------------+-------------------------------+
+# | Target MAC (6) | Target IP (4)                 |
+# +----------------+-------------------------------+
+
+import serial { prints, serial_print_dec }
+import net.types { ARP_OP_REQUEST, ARP_OP_REPLY, ARP_PACKET_SIZE, ARP_HW_ETHERNET, ARP_PROTO_IPV4, ETHERTYPE_ARP, ip_eq, mac_copy, ip_copy }
+import net.eth { eth_build_frame }
+import drivers.virtio.net { virtio_net_send, virtio_net_get_mac }
+
+# ============================================================================
+# ARP Cache
+# ============================================================================
+
+const ARP_CACHE_SIZE: i32 = 16
+
+pub struct ArpEntry
+    ip: [4]u8
+    mac: [6]u8
+    valid: u8
+
+var arp_cache: [16]ArpEntry
+
+# Our IP address (set by IP layer, used for ARP responses)
+# This is a forward declaration - will be linked from net/ip.ritz
+var arp_our_ip: [4]u8
+var arp_ip_configured: u8 = 0
+
+# ============================================================================
+# Initialization
+# ============================================================================
+
+pub fn arp_init()
+    var i: i32 = 0
+    while i < ARP_CACHE_SIZE
+        arp_cache[i].valid = 0
+        i = i + 1
+
+# Set our IP address (called by IP layer when configured)
+pub fn arp_set_our_ip(ip: *u8)
+    var i: i32 = 0
+    while i < 4
+        arp_our_ip[i] = *(ip + i as i64)
+        i = i + 1
+    arp_ip_configured = 1
+
+# ============================================================================
+# Cache Operations
+# ============================================================================
+
+# Look up MAC address for an IP
+# Returns 0 if found (copies MAC to mac_out), -1 if not found
+pub fn arp_cache_lookup(ip: *u8, mac_out: *u8) -> i32
+    var i: i32 = 0
+    while i < ARP_CACHE_SIZE
+        if arp_cache[i].valid == 1
+            if arp_cache[i].ip[0] == *(ip + 0) and arp_cache[i].ip[1] == *(ip + 1) and arp_cache[i].ip[2] == *(ip + 2) and arp_cache[i].ip[3] == *(ip + 3)
+                # Found it
+                var j: i32 = 0
+                while j < 6
+                    *(mac_out + j as i64) = arp_cache[i].mac[j]
+                    j = j + 1
+                return 0
+        i = i + 1
+    return -1  # Not found
+
+# Add an entry to the ARP cache
+pub fn arp_cache_add(ip: *u8, mac: *u8)
+    # First check if entry already exists (update it)
+    var i: i32 = 0
+    while i < ARP_CACHE_SIZE
+        if arp_cache[i].valid == 1
+            if arp_cache[i].ip[0] == *(ip + 0) and arp_cache[i].ip[1] == *(ip + 1) and arp_cache[i].ip[2] == *(ip + 2) and arp_cache[i].ip[3] == *(ip + 3)
+                # Update existing entry
+                var j: i32 = 0
+                while j < 6
+                    arp_cache[i].mac[j] = *(mac + j as i64)
+                    j = j + 1
+                return
+        i = i + 1
+
+    # Find empty slot
+    i = 0
+    var slot: i32 = 0
+    while i < ARP_CACHE_SIZE
+        if arp_cache[i].valid == 0
+            slot = i
+            break
+        i = i + 1
+
+    # Add entry
+    var j: i32 = 0
+    while j < 4
+        arp_cache[slot].ip[j] = *(ip + j as i64)
+        j = j + 1
+    j = 0
+    while j < 6
+        arp_cache[slot].mac[j] = *(mac + j as i64)
+        j = j + 1
+    arp_cache[slot].valid = 1
+
+# Clear the ARP cache
+pub fn arp_cache_clear()
+    var i: i32 = 0
+    while i < ARP_CACHE_SIZE
+        arp_cache[i].valid = 0
+        i = i + 1
+
+# ============================================================================
+# Packet Construction
+# ============================================================================
+
+# Build an ARP packet
+# Returns packet size (ARP_PACKET_SIZE = 28)
+fn arp_build_packet(buf: *u8, operation: u16, target_ip: *u8, target_mac: *u8) -> u32
+    var our_mac: [6]u8
+    virtio_net_get_mac(@our_mac[0])
+
+    # HW Type = Ethernet (big-endian)
+    *(buf + 0) = 0
+    *(buf + 1) = 1
+
+    # Proto Type = IPv4 (big-endian)
+    *(buf + 2) = 0x08
+    *(buf + 3) = 0x00
+
+    # HW Len = 6, Proto Len = 4
+    *(buf + 4) = 6
+    *(buf + 5) = 4
+
+    # Operation
+    *(buf + 6) = ((operation >> 8) & 0xFF) as u8
+    *(buf + 7) = (operation & 0xFF) as u8
+
+    # Sender MAC
+    var i: i32 = 0
+    while i < 6
+        *(buf + 8 + i as i64) = our_mac[i]
+        i = i + 1
+
+    # Sender IP (our IP)
+    *(buf + 14) = arp_our_ip[0]
+    *(buf + 15) = arp_our_ip[1]
+    *(buf + 16) = arp_our_ip[2]
+    *(buf + 17) = arp_our_ip[3]
+
+    # Target MAC
+    i = 0
+    while i < 6
+        *(buf + 18 + i as i64) = *(target_mac + i as i64)
+        i = i + 1
+
+    # Target IP
+    i = 0
+    while i < 4
+        *(buf + 24 + i as i64) = *(target_ip + i as i64)
+        i = i + 1
+
+    return ARP_PACKET_SIZE
+
+# ============================================================================
+# Send ARP Request
+# ============================================================================
+
+pub fn arp_send_request(target_ip: *u8) -> i32
+    var frame: [64]u8
+    var arp_payload: [28]u8
+    var broadcast_mac: [6]u8
+
+    # Broadcast MAC = FF:FF:FF:FF:FF:FF
+    var i: i32 = 0
+    while i < 6
+        broadcast_mac[i] = 0xFF
+        i = i + 1
+
+    # Zero target MAC for request
+    var zero_mac: [6]u8
+    i = 0
+    while i < 6
+        zero_mac[i] = 0
+        i = i + 1
+
+    # Build ARP packet
+    let arp_len: u32 = arp_build_packet(@arp_payload[0], ARP_OP_REQUEST, target_ip, @zero_mac[0])
+
+    # Build Ethernet frame
+    let frame_len: u32 = eth_build_frame(@frame[0], @broadcast_mac[0], ETHERTYPE_ARP, @arp_payload[0], arp_len)
+
+    # Send via NIC
+    return virtio_net_send(@frame[0], frame_len)
+
+# ============================================================================
+# Handle Received ARP Packet
+# ============================================================================
+
+pub fn arp_handle_packet(arp_buf: *u8, len: u32)
+    if len < ARP_PACKET_SIZE
+        return
+
+    # Parse operation
+    let op: u16 = ((*(arp_buf + 6) as u16) << 8) | (*(arp_buf + 7) as u16)
+
+    # Get sender info
+    let sender_mac: *u8 = arp_buf + 8
+    let sender_ip: *u8 = arp_buf + 14
+    let target_ip: *u8 = arp_buf + 24
+
+    # Add sender to cache (we learn from all ARP packets)
+    arp_cache_add(sender_ip, sender_mac)
+
+    if op == ARP_OP_REQUEST
+        # Check if they're asking for us
+        if arp_ip_configured == 1
+            if *(target_ip + 0) == arp_our_ip[0] and *(target_ip + 1) == arp_our_ip[1] and *(target_ip + 2) == arp_our_ip[2] and *(target_ip + 3) == arp_our_ip[3]
+                # Send reply
+                var frame: [64]u8
+                var arp_reply: [28]u8
+                let reply_len: u32 = arp_build_packet(@arp_reply[0], ARP_OP_REPLY, sender_ip, sender_mac)
+                let frame_len: u32 = eth_build_frame(@frame[0], sender_mac, ETHERTYPE_ARP, @arp_reply[0], reply_len)
+                virtio_net_send(@frame[0], frame_len)
+
+                prints("[arp] Sent reply to ")
+                arp_print_ip(sender_ip)
+                prints("\n")
+
+    else if op == ARP_OP_REPLY
+        prints("[arp] Got reply from ")
+        arp_print_ip(sender_ip)
+        prints("\n")
+
+# ============================================================================
+# Debug / Utility
+# ============================================================================
+
+fn arp_print_ip(ip: *u8)
+    serial_print_dec(*(ip + 0) as u64)
+    prints(".")
+    serial_print_dec(*(ip + 1) as u64)
+    prints(".")
+    serial_print_dec(*(ip + 2) as u64)
+    prints(".")
+    serial_print_dec(*(ip + 3) as u64)
+
+pub fn arp_print_cache()
+    prints("[arp] Cache:\n")
+    var i: i32 = 0
+    while i < ARP_CACHE_SIZE
+        if arp_cache[i].valid == 1
+            prints("  ")
+            arp_print_ip(@arp_cache[i].ip[0])
+            prints(" -> ")
+            var j: i32 = 0
+            while j < 6
+                if j > 0
+                    prints(":")
+                serial_print_dec(arp_cache[i].mac[j] as u64)
+                j = j + 1
+            prints("\n")
+        i = i + 1

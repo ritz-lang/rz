@@ -1,0 +1,181 @@
+# net/stack.ritz - Network Stack
+#
+# Main network stack initialization, packet polling, and dispatch.
+# This is the central coordination point for all network layers.
+
+import serial { prints, serial_print_dec }
+import net.types { ETHERTYPE_ARP, ETHERTYPE_IPV4, IP_PROTO_ICMP, IP_PROTO_UDP, IP_PROTO_TCP, IP_HEADER_SIZE, ETH_HEADER_SIZE, DHCP_SERVER_PORT, DHCP_CLIENT_PORT, UDP_HEADER_SIZE }
+import net.eth { eth_parse_header, EthHeader }
+import net.arp { arp_init, arp_handle_packet }
+import net.ip { ip_init, ip_is_configured, ip_print_config, ip_get_header_len, ip_get_protocol }
+import net.icmp { icmp_handle_packet }
+import net.udp { udp_get_src_port, udp_get_dst_port }
+import net.dhcp { dhcp_discover, dhcp_handle_packet, dhcp_is_configured }
+import drivers.virtio.net { virtio_net_init, virtio_net_poll, virtio_net_is_ready }
+
+# ============================================================================
+# Network Stack State
+# ============================================================================
+
+var net_rx_buf: [2048]u8
+var net_initialized: u8 = 0
+
+# ============================================================================
+# Initialization
+# ============================================================================
+
+pub fn net_stack_init() -> i32
+    prints("[net] Initializing network stack...\n")
+
+    # Initialize protocol layers
+    arp_init()
+    ip_init()
+
+    # Initialize VirtIO-net driver
+    let result: i32 = virtio_net_init()
+    if result < 0
+        prints("[net] VirtIO-net init failed!\n")
+        return result
+
+    net_initialized = 1
+    prints("[net] Network stack initialized\n")
+
+    return 0
+
+# ============================================================================
+# DHCP Configuration
+# ============================================================================
+
+pub fn net_configure_dhcp() -> i32
+    if net_initialized == 0
+        prints("[net] Stack not initialized!\n")
+        return -1
+
+    prints("[net] Starting DHCP configuration...\n")
+    return dhcp_discover()
+
+# ============================================================================
+# Packet Reception & Dispatch
+# ============================================================================
+
+pub fn net_poll() -> i32
+    if net_initialized == 0
+        return 0
+
+    let len: i32 = virtio_net_poll(@net_rx_buf[0], 2048)
+    if len <= 0
+        return 0
+
+    # Parse Ethernet header
+    if len < ETH_HEADER_SIZE as i32
+        return 0
+
+    var eth_hdr: EthHeader
+    eth_parse_header(@net_rx_buf[0], @eth_hdr)
+
+    let payload: *u8 = @net_rx_buf[0] + ETH_HEADER_SIZE as i64
+    let payload_len: u32 = (len as u32) - ETH_HEADER_SIZE
+
+    # Dispatch by ethertype
+    if eth_hdr.ethertype == ETHERTYPE_ARP
+        arp_handle_packet(payload, payload_len)
+        return 1
+
+    else if eth_hdr.ethertype == ETHERTYPE_IPV4
+        return handle_ipv4_packet(payload, payload_len)
+
+    return 0
+
+# ============================================================================
+# IPv4 Packet Handling
+# ============================================================================
+
+fn handle_ipv4_packet(ip_data: *u8, ip_len: u32) -> i32
+    if ip_len < IP_HEADER_SIZE
+        return 0
+
+    # Check IP version
+    let ip_version: u8 = (*(ip_data + 0) >> 4) & 0x0F
+    if ip_version != 4
+        return 0
+
+    let ip_hdr_len: u32 = ip_get_header_len(ip_data)
+    if ip_hdr_len < IP_HEADER_SIZE or ip_hdr_len > ip_len
+        return 0
+
+    let protocol: u8 = ip_get_protocol(ip_data)
+    let src_ip: *u8 = ip_data + 12
+    let ip_payload: *u8 = ip_data + ip_hdr_len as i64
+    let ip_payload_len: u32 = ip_len - ip_hdr_len
+
+    if protocol == IP_PROTO_ICMP
+        icmp_handle_packet(ip_payload, ip_payload_len, src_ip)
+        return 1
+
+    else if protocol == IP_PROTO_UDP
+        return handle_udp_packet(ip_payload, ip_payload_len, src_ip)
+
+    else if protocol == IP_PROTO_TCP
+        # TODO: TCP handling
+        return 0
+
+    return 0
+
+# ============================================================================
+# UDP Packet Handling
+# ============================================================================
+
+fn handle_udp_packet(udp_data: *u8, udp_len: u32, src_ip: *u8) -> i32
+    if udp_len < UDP_HEADER_SIZE
+        return 0
+
+    let src_port: u16 = udp_get_src_port(udp_data)
+    let dst_port: u16 = udp_get_dst_port(udp_data)
+
+    # DHCP response
+    if src_port == DHCP_SERVER_PORT and dst_port == DHCP_CLIENT_PORT
+        let dhcp_data: *u8 = udp_data + UDP_HEADER_SIZE as i64
+        let dhcp_len: u32 = udp_len - UDP_HEADER_SIZE
+        dhcp_handle_packet(dhcp_data, dhcp_len)
+        return 1
+
+    # TODO: Add more UDP handlers (DNS, user sockets, etc.)
+
+    return 0
+
+# ============================================================================
+# Status Queries
+# ============================================================================
+
+pub fn net_is_ready() -> bool
+    return net_initialized == 1 and virtio_net_is_ready() == 1
+
+pub fn net_is_configured() -> bool
+    return ip_is_configured()
+
+# ============================================================================
+# Debug
+# ============================================================================
+
+pub fn net_print_status()
+    prints("[net] Status:\n")
+    prints("  Initialized: ")
+    if net_initialized == 1
+        prints("yes\n")
+    else
+        prints("no\n")
+
+    prints("  VirtIO-net:  ")
+    if virtio_net_is_ready() == 1
+        prints("ready\n")
+    else
+        prints("not ready\n")
+
+    prints("  DHCP:        ")
+    if dhcp_is_configured()
+        prints("configured\n")
+    else
+        prints("pending\n")
+
+    if ip_is_configured()
+        ip_print_config()

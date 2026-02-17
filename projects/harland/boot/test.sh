@@ -10,19 +10,26 @@ HARLAND_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$SCRIPT_DIR"
 
 # Build if needed using workspace rz CLI
+# Use debug/ path directly - always copy fresh build to avoid stale cache
 BOOT_EFI="$HARLAND_DIR/build/BOOTX64.EFI"
 KERNEL_ELF="$HARLAND_DIR/build/harland.elf"
+DEBUG_EFI="$HARLAND_DIR/build/debug/BOOTX64.EFI"
+DEBUG_ELF="$HARLAND_DIR/build/debug/harland.elf"
 RZ_CLI="$HARLAND_DIR/../../rz"
 
-if [ ! -f "$BOOT_EFI" ] || [ ! -f "$KERNEL_ELF" ]; then
+if [ ! -f "$DEBUG_ELF" ]; then
     echo "Building harland..."
     cd "$HARLAND_DIR/../.."
     ./rz build harland
-    cd "$HARLAND_DIR"
-    # Copy to expected locations
-    cp build/debug/BOOTX64.EFI build/BOOTX64.EFI 2>/dev/null || true
-    cp build/debug/harland.elf build/harland.elf 2>/dev/null || true
     cd "$SCRIPT_DIR"
+fi
+
+# Always copy from debug/ to avoid stale cached builds
+if [ -f "$DEBUG_EFI" ]; then
+    cp "$DEBUG_EFI" "$BOOT_EFI"
+fi
+if [ -f "$DEBUG_ELF" ]; then
+    cp "$DEBUG_ELF" "$KERNEL_ELF"
 fi
 
 if [ ! -f "$KERNEL_ELF" ]; then
@@ -180,7 +187,7 @@ echo ""
 # With more RAM, UEFI may allocate kernel buffers above 256MB which aren't mapped.
 # TODO: Fix bootloader to dynamically map memory where kernel is loaded.
 # VirtIO block and network devices for driver testing (matching BIOS test)
-timeout 20 qemu-system-x86_64 \
+timeout 30 qemu-system-x86_64 \
     -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
     -drive format=raw,file="$TMPDIR/disk.img" \
     -device virtio-blk-pci,drive=initramfs \
