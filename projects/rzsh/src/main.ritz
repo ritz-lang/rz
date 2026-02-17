@@ -1,6 +1,10 @@
-# rzsh - Ritz Shell (Harland version)
+# rzsh - Ritz Shell
 #
-# Harland-specific implementation of rzsh.
+# A simple interactive shell that runs on both Linux and Harland.
+# OS-specific details are abstracted in the 'os' module using
+# [[target_os]] conditional compilation.
+#
+# Runtime _start calls main() and then sys_exit(return_value).
 
 import common {
     puts, println, putchar, print_num, is_whitespace,
@@ -11,25 +15,37 @@ import common {
     STDIN, STDOUT, STDERR
 }
 
-import ritzlib.sys {
-    sys_read, sys_write, sys_exit,
-    sys_yield, sys_spawn_args, sys_wait, sys_readdir,
-    STDIN, STDOUT, STDERR
+import os {
+    os_readdir, os_spawn_and_wait, os_yield,
+    os_default_ls_path, os_bin_path_1, os_bin_path_2
 }
 
+import ritzlib.sys { sys_read, sys_write }
 import ritzlib.str { strlen, strcmp }
 
 # ============================================================================
-# ls command (Harland)
+# Version string (selected at compile time)
+# ============================================================================
+
+[[target_os = "linux"]]
+fn version_string() -> *u8
+    return c"rzsh - Ritz Shell v0.1 (linux)"
+
+[[target_os = "harland"]]
+fn version_string() -> *u8
+    return c"rzsh - Ritz Shell v0.1 (harland)"
+
+# ============================================================================
+# ls command
 # ============================================================================
 
 fn cmd_ls(argc: i32) -> i32
-    var path: *u8 = c"/"
+    var path: *u8 = os_default_ls_path()
     if argc > 1
         path = g_argv[1]
 
     var buf: [4096]u8
-    let n: i64 = sys_readdir(path, @buf[0], 4096)
+    let n: i64 = os_readdir(path, @buf[0], 4096)
 
     if n < 0
         puts(c"ls: cannot access '")
@@ -49,7 +65,7 @@ fn cmd_ls(argc: i32) -> i32
     return 0
 
 # ============================================================================
-# External Command Execution (Harland)
+# External Command Execution
 # ============================================================================
 
 fn exec_external(argc: i32) -> i32
@@ -59,40 +75,62 @@ fn exec_external(argc: i32) -> i32
     var path: *u8 = cmd
 
     if *cmd != 47  # Not starting with '/'
-        path_buf[0] = 47  # '/'
-        path_buf[1] = 98  # 'b'
-        path_buf[2] = 105 # 'i'
-        path_buf[3] = 110 # 'n'
-        path_buf[4] = 47  # '/'
+        # Build full path: prefix + cmd
+        let prefix: *u8 = os_bin_path_1()
+        var prefix_len: i64 = strlen(prefix)
         var i: i64 = 0
-        while *(cmd + i) != 0 and i < MAX_PATH - 6
-            path_buf[(5 + i) as i32] = *(cmd + i)
+
+        # Copy prefix
+        while i < prefix_len
+            path_buf[i as i32] = *(prefix + i)
             i = i + 1
-        path_buf[(5 + i) as i32] = 0
+
+        # Copy command
+        var j: i64 = 0
+        while *(cmd + j) != 0 and (i + j) < MAX_PATH - 1
+            path_buf[(i + j) as i32] = *(cmd + j)
+            j = j + 1
+        path_buf[(i + j) as i32] = 0
         path = @path_buf[0]
 
     let orig_argv0: *u8 = g_argv[0]
     g_argv[0] = path
 
-    let pid: i64 = sys_spawn_args(path, @g_argv[0], argc)
+    let result: i32 = os_spawn_and_wait(path, @g_argv[0], argc)
 
     g_argv[0] = orig_argv0
 
-    if pid < 0
-        puts(c"rzsh: command not found: ")
-        println(cmd)
-        return 127
+    if result < 0
+        # Try second path
+        let prefix2: *u8 = os_bin_path_2()
+        var prefix_len: i64 = strlen(prefix2)
+        var i: i64 = 0
 
-    let status: i64 = sys_wait(pid as i32)
-    return status as i32
+        # Copy prefix
+        while i < prefix_len
+            path_buf[i as i32] = *(prefix2 + i)
+            i = i + 1
 
-# ============================================================================
-# Wait for input (Harland)
-# ============================================================================
+        # Copy command
+        var j: i64 = 0
+        while *(cmd + j) != 0 and (i + j) < MAX_PATH - 1
+            path_buf[(i + j) as i32] = *(cmd + j)
+            j = j + 1
+        path_buf[(i + j) as i32] = 0
+        path = @path_buf[0]
 
-fn wait_for_input() -> i32
-    sys_yield()
-    return 0
+        g_argv[0] = path
+        let result2: i32 = os_spawn_and_wait(path, @g_argv[0], argc)
+        g_argv[0] = orig_argv0
+
+        if result2 < 0
+            puts(c"rzsh: command not found: ")
+            println(cmd)
+            return 127
+
+        return result2
+
+    return result
 
 # ============================================================================
 # Command Dispatch
@@ -131,13 +169,40 @@ fn process_line() -> i32
     return exec_external(argc)
 
 # ============================================================================
+# Help message
+# ============================================================================
+
+fn print_help()
+    println(version_string())
+    println(c"")
+    println(c"Usage: rzsh [options]")
+    println(c"")
+    println(c"Options:")
+    println(c"  --help    Show this help message and exit")
+    println(c"")
+    println(c"Built-in commands:")
+    println(c"  help      Show available commands")
+    println(c"  exit [N]  Exit the shell with code N (default 0)")
+    println(c"  pid       Show current process ID")
+    println(c"  echo ...  Print arguments")
+    println(c"  ls [DIR]  List directory contents")
+    println(c"  clear     Clear the screen")
+
+# ============================================================================
 # Main
 # ============================================================================
 
-pub fn main() -> i32
+pub fn main(argc: i32, argv: **u8) -> i32
+    # Check for --help flag (for non-interactive testing)
+    if argc > 1
+        let arg: *u8 = *(argv + 1)
+        if strcmp(arg, c"--help") == 0
+            print_help()
+            return 0
+
     println(c"")
     println(c"===========================================")
-    println(c"  rzsh - Ritz Shell v0.1 (harland)")
+    println(version_string())
     println(c"  Type 'help' for available commands")
     println(c"===========================================")
     println(c"")
@@ -175,8 +240,7 @@ pub fn main() -> i32
                     line_add_char(c)
                     putchar(c)
             else
-                wait_for_input()
+                os_yield()
 
     println(c"Goodbye!")
-    sys_exit(0)
-    return 0  # Never reached
+    return 0
