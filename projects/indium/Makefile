@@ -7,6 +7,7 @@
 
 # Paths
 HARLAND_DIR = ../harland
+RZSH_DIR = ../rzsh
 BUILD_DIR = build
 KERNEL_ELF = $(HARLAND_DIR)/build/debug/harland.elf
 BOOTLOADER = $(HARLAND_DIR)/build/debug/BOOTX64.EFI
@@ -27,7 +28,7 @@ STORAGE = $(BUILD_DIR)/storage.qcow2
 # Phony targets
 # ============================================================================
 
-.PHONY: all clean kernel userspace iso run run-iso run-uefi debug test test-uefi test-uefi-gui help
+.PHONY: all clean kernel userspace rzsh iso run run-iso run-uefi debug test test-uefi test-uefi-gui help
 
 all: iso
 
@@ -46,6 +47,13 @@ userspace:
 	../../rz build indium
 	@mkdir -p $(BUILD_DIR)/debug
 	@cp build/debug/*.elf $(BUILD_DIR)/debug/ 2>/dev/null || true
+
+# Build rzsh (Ritz Shell)
+rzsh:
+	@echo "=== Building rzsh ==="
+	../../rz build rzsh
+	@mkdir -p $(BUILD_DIR)/debug
+	@cp $(RZSH_DIR)/build/debug/rzsh.elf $(BUILD_DIR)/debug/ 2>/dev/null || true
 
 # Build bootable ISO with kernel and userspace
 iso: kernel

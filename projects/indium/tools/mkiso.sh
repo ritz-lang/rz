@@ -3,7 +3,7 @@
 # Indium ISO Creation Script
 #
 # Creates a bootable ISO with GRUB2 and the Harland kernel.
-# This allows booting via Multiboot2 protocol.
+# Also builds userspace programs and creates the initramfs.
 #
 # Usage:
 #   ./tools/mkiso.sh              # Create ISO
@@ -14,16 +14,19 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 HARLAND_DIR="$PROJECT_ROOT/../harland"
+RZSH_DIR="$PROJECT_ROOT/../rzsh"
 BUILD_DIR="$PROJECT_ROOT/build"
+RZ_CLI="$PROJECT_ROOT/../../rz"
 
 # Kernel is built by harland project
 KERNEL_ELF="$HARLAND_DIR/build/debug/harland.elf"
 ISO_DIR="$BUILD_DIR/isodir"
 ISO_FILE="$BUILD_DIR/indium.iso"
+INITRAMFS="$BUILD_DIR/initramfs.qcow2"
 
 # Parse args
 if [ "$1" == "--clean" ]; then
-    rm -rf "$ISO_DIR" "$ISO_FILE"
+    rm -rf "$ISO_DIR" "$ISO_FILE" "$INITRAMFS"
     echo "Cleaned ISO build files"
     exit 0
 fi
@@ -47,7 +50,39 @@ echo "Kernel: $KERNEL_ELF"
 echo ""
 
 # Create build directory
-mkdir -p "$BUILD_DIR"
+mkdir -p "$BUILD_DIR/debug"
+
+# ============================================================================
+# Build userspace programs
+# ============================================================================
+
+echo "=== Building Indium Userspace ==="
+"$RZ_CLI" build indium
+cp "$PROJECT_ROOT/build/debug/"*.elf "$BUILD_DIR/debug/" 2>/dev/null || true
+
+echo ""
+echo "=== Building rzsh ==="
+"$RZ_CLI" build rzsh
+cp "$RZSH_DIR/build/debug/rzsh.elf" "$BUILD_DIR/debug/" 2>/dev/null || true
+
+# List what we're including
+echo ""
+echo "=== Userspace binaries ==="
+ls -la "$BUILD_DIR/debug/"*.elf 2>/dev/null || echo "(none found)"
+echo ""
+
+# ============================================================================
+# Create initramfs
+# ============================================================================
+
+echo "=== Creating initramfs ==="
+python3 "$HARLAND_DIR/tools/mkinitramfs.py" \
+    --bin-dir "$BUILD_DIR/debug" \
+    --output "$INITRAMFS"
+
+# ============================================================================
+# Create ISO
+# ============================================================================
 
 # Create ISO directory structure
 mkdir -p "$ISO_DIR/boot/grub"
@@ -69,18 +104,24 @@ menuentry "Indium (Harland Kernel)" {
 EOF
 
 # Create ISO (force both BIOS and UEFI boot modes)
-echo "Building ISO..."
+echo ""
+echo "=== Building ISO ==="
 grub-mkrescue -o "$ISO_FILE" "$ISO_DIR" -- -volid "INDIUM"
 
 if [ -f "$ISO_FILE" ]; then
     echo ""
-    echo "ISO created: $ISO_FILE"
+    echo "=========================================="
+    echo "  Indium build complete!"
+    echo "=========================================="
+    echo ""
+    echo "ISO:       $ISO_FILE"
     ls -lh "$ISO_FILE"
+    echo ""
+    echo "Initramfs: $INITRAMFS"
+    ls -lh "$INITRAMFS"
     echo ""
     echo "To boot in QEMU:"
     echo "  make run-iso"
-    echo "  # or:"
-    echo "  qemu-system-x86_64 -cdrom $ISO_FILE -serial stdio -m 128M"
 else
     echo "Error: ISO creation failed"
     exit 1
