@@ -51,6 +51,7 @@ struct EmitterState
     locals: [256]LocalVar
     local_count: i32
     break_label: i32
+    continue_label: i32
     module: *Module
     strings: [256]StringLit
     string_count: i32
@@ -2227,7 +2228,9 @@ fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         let end_label: i32 = next_label(s)
 
         let old_break: i32 = s.break_label
+        let old_continue: i32 = s.continue_label
         s.break_label = end_label
+        s.continue_label = cond_label
 
         emit_str(s, "  br label %")
         emit_label(s, cond_label)
@@ -2264,11 +2267,139 @@ fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         emit_str(s, ":\n")
 
         s.break_label = old_break
+        s.continue_label = old_continue
+
+    else if stmt.kind == STMT_FOR
+        # For-loop: for i in start..end { body }
+        # Desugar to:
+        #   %i = alloca i64
+        #   store i64 %start, ptr %i
+        #   br label %for.cond
+        # for.cond:
+        #   %i.val = load i64, ptr %i
+        #   %cmp = icmp slt i64 %i.val, %end
+        #   br i1 %cmp, label %for.body, label %for.end
+        # for.body:
+        #   ... body ...
+        #   %i.next = add i64 %i.val, 1
+        #   store i64 %i.next, ptr %i
+        #   br label %for.cond
+        # for.end:
+
+        let cond_label: i32 = next_label(s)
+        let body_label: i32 = next_label(s)
+        let incr_label: i32 = next_label(s)
+        let end_label: i32 = next_label(s)
+
+        let old_break: i32 = s.break_label
+        let old_continue: i32 = s.continue_label
+        s.break_label = end_label
+        s.continue_label = incr_label
+
+        # Allocate loop variable
+        let var_reg: i32 = next_reg(s)
+        emit_str(s, "  ")
+        emit_reg(s, var_reg)
+        emit_str(s, " = alloca i64\n")
+
+        # Register the loop variable
+        add_local(s, stmt.for_var, stmt.for_var_len, var_reg, TYPE_I64)
+
+        # Emit start expression and store it
+        let start_reg: i32 = emit_expr(s, stmt.for_start)
+        emit_str(s, "  store i64 ")
+        emit_reg(s, start_reg)
+        emit_str(s, ", ptr ")
+        emit_reg(s, var_reg)
+        emit_str(s, "\n")
+
+        # Branch to condition check
+        emit_str(s, "  br label %")
+        emit_label(s, cond_label)
+        emit_str(s, "\n")
+
+        # Condition block
+        emit_label(s, cond_label)
+        emit_str(s, ":\n")
+        let load_reg: i32 = next_reg(s)
+        emit_str(s, "  ")
+        emit_reg(s, load_reg)
+        emit_str(s, " = load i64, ptr ")
+        emit_reg(s, var_reg)
+        emit_str(s, "\n")
+
+        let end_reg: i32 = emit_expr(s, stmt.for_end)
+        let cmp_reg: i32 = next_reg(s)
+        emit_str(s, "  ")
+        emit_reg(s, cmp_reg)
+        emit_str(s, " = icmp slt i64 ")
+        emit_reg(s, load_reg)
+        emit_str(s, ", ")
+        emit_reg(s, end_reg)
+        emit_str(s, "\n")
+        emit_str(s, "  br i1 ")
+        emit_reg(s, cmp_reg)
+        emit_str(s, ", label %")
+        emit_label(s, body_label)
+        emit_str(s, ", label %")
+        emit_label(s, end_label)
+        emit_str(s, "\n")
+
+        # Body block
+        emit_label(s, body_label)
+        emit_str(s, ":\n")
+        var body_stmt: *Stmt = stmt.for_body
+        while body_stmt != null
+            emit_stmt(s, body_stmt, ret_type)
+            body_stmt = body_stmt.next
+        emit_str(s, "  br label %")
+        emit_label(s, incr_label)
+        emit_str(s, "\n")
+
+        # Increment block
+        emit_label(s, incr_label)
+        emit_str(s, ":\n")
+        let load2_reg: i32 = next_reg(s)
+        emit_str(s, "  ")
+        emit_reg(s, load2_reg)
+        emit_str(s, " = load i64, ptr ")
+        emit_reg(s, var_reg)
+        emit_str(s, "\n")
+        let incr_reg: i32 = next_reg(s)
+        emit_str(s, "  ")
+        emit_reg(s, incr_reg)
+        emit_str(s, " = add i64 ")
+        emit_reg(s, load2_reg)
+        emit_str(s, ", 1\n")
+        emit_str(s, "  store i64 ")
+        emit_reg(s, incr_reg)
+        emit_str(s, ", ptr ")
+        emit_reg(s, var_reg)
+        emit_str(s, "\n")
+        emit_str(s, "  br label %")
+        emit_label(s, cond_label)
+        emit_str(s, "\n")
+
+        # End block
+        emit_label(s, end_label)
+        emit_str(s, ":\n")
+
+        s.break_label = old_break
+        s.continue_label = old_continue
 
     else if stmt.kind == STMT_BREAK
         if s.break_label >= 0
             emit_str(s, "  br label %")
             emit_label(s, s.break_label)
+            emit_str(s, "\n")
+            let dead_label: i32 = next_label(s)
+            emit_label(s, dead_label)
+            emit_str(s, ":\n")
+
+    else if stmt.kind == STMT_CONTINUE
+        if s.continue_label >= 0
+            emit_str(s, "  br label %")
+            emit_label(s, s.continue_label)
             emit_str(s, "\n")
             let dead_label: i32 = next_label(s)
             emit_label(s, dead_label)
@@ -2578,9 +2709,10 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
     s.label_counter = 0
     s.local_count = 0
     s.break_label = -1
+    s.continue_label = -1
 
     emit_str(s, "define ")
-    emit_llvm_type(s, f.return_type)
+    emit_llvm_type_struct(s, f.return_type, f.return_type_name, f.return_type_name_len)
     emit_str(s, " @")
     emit_name(s, f.name, f.name_len)
     emit_str(s, "(")
@@ -2597,7 +2729,9 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
         emit_str(s, ".arg")
         param2 = param2.next
 
-    emit_str(s, c") {\n")
+    # alignstack(16) ensures proper 16-byte stack alignment for SIMD instructions
+    # that clang's optimizer may introduce even when we don't use SIMD explicitly
+    emit_str(s, c") alignstack(16) {\n")
     emit_str(s, "entry:\n")
 
     var param3: *Param = f.params
@@ -2729,6 +2863,7 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
     s.label_counter = 0
     s.local_count = 0
     s.break_label = -1
+    s.continue_label = -1
 
     emit_str(s, "define ")
     emit_llvm_type(s, method.return_type)
@@ -2751,7 +2886,9 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
         emit_str(s, ".arg")
         param = param.next
 
-    emit_str(s, c") {\n")
+    # alignstack(16) ensures proper 16-byte stack alignment for SIMD instructions
+    # that clang's optimizer may introduce even when we don't use SIMD explicitly
+    emit_str(s, c") alignstack(16) {\n")
     emit_str(s, "entry:\n")
 
     var param2: *Param = method.params
@@ -3280,6 +3417,7 @@ fn emit_module(m: *Module, out: *Vec<u8>) -> i32
     s.label_counter = 0
     s.local_count = 0
     s.break_label = -1
+    s.continue_label = -1
     s.module = m
     s.string_count = 0
     s.extern_count = 0

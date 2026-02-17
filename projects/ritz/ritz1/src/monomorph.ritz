@@ -386,21 +386,24 @@ fn clone_and_specialize_function(m: *Module, template: *FnDef, suffix: *u8, suff
     # Handle return type struct name substitution
     if specialized.return_type == TYPE_STRUCT
         if specialized.return_type_name != null
-            # Check if it matches the type param
+            # Check if it matches the type param exactly (e.g., "T" -> "u8")
             if specialized.return_type_name_len == type_param_len
                 if memcmp(specialized.return_type_name, type_param_name, type_param_len as i64) == 0
                     # Substitute with concrete type
                     specialized.return_type = subst_type
                     specialized.return_type_name = subst_type_name
                     specialized.return_type_name_len = subst_type_len
-            # Check if it's a generic struct like Vec<T>
+            # Otherwise it might be a generic struct like "Vec$T" -> "Vec$u8"
             else
-                specialized.return_type_name = mangle_struct_name(specialized.return_type_name, specialized.return_type_name_len, suffix, suffix_len)
-                specialized.return_type_name_len = specialized.return_type_name_len + suffix_len
+                var new_name: *u8 = null
+                var new_len: i32 = 0
+                substitute_type_param_in_name(specialized.return_type_name, specialized.return_type_name_len, type_param_name, type_param_len, suffix, suffix_len, @new_name, @new_len)
+                specialized.return_type_name = new_name
+                specialized.return_type_name_len = new_len
 
     return specialized
 
-fn clone_params(params: *Param, type_param: *u8, type_param_len: i32, subst_type: i32, subst_name: *u8, subst_len: i32) -> *Param
+fn clone_params_with_suffix(params: *Param, type_param: *u8, type_param_len: i32, subst_type: i32, subst_name: *u8, subst_len: i32, suffix: *u8, suffix_len: i32) -> *Param
     if params == null
         return null
 
@@ -410,8 +413,9 @@ fn clone_params(params: *Param, type_param: *u8, type_param_len: i32, subst_type
     cloned.param_type = substitute_type(params.param_type, type_param, type_param_len, subst_type, subst_name, subst_len)
     cloned.param_type_name = params.param_type_name
     cloned.param_type_name_len = params.param_type_name_len
+    cloned.param_pointee_type = params.param_pointee_type
 
-    # Handle struct type name substitution
+    # Handle struct type name substitution for TYPE_STRUCT
     if cloned.param_type == TYPE_STRUCT
         if cloned.param_type_name != null and cloned.param_type_name_len == type_param_len
             if memcmp(cloned.param_type_name, type_param, type_param_len as i64) == 0
@@ -419,9 +423,20 @@ fn clone_params(params: *Param, type_param: *u8, type_param_len: i32, subst_type
                 cloned.param_type_name = subst_name
                 cloned.param_type_name_len = subst_len
 
-    cloned.param_pointee_type = params.param_pointee_type
-    cloned.next = clone_params(params.next, type_param, type_param_len, subst_type, subst_name, subst_len)
+    # Handle pointer-to-struct type name substitution (e.g., *Vec<T> -> *Vec$u8)
+    if cloned.param_type == TYPE_PTR and cloned.param_type_name != null
+        var new_name: *u8 = null
+        var new_len: i32 = 0
+        substitute_type_param_in_name(cloned.param_type_name, cloned.param_type_name_len, type_param, type_param_len, suffix, suffix_len, @new_name, @new_len)
+        cloned.param_type_name = new_name
+        cloned.param_type_name_len = new_len
+
+    cloned.next = clone_params_with_suffix(params.next, type_param, type_param_len, subst_type, subst_name, subst_len, suffix, suffix_len)
     return cloned
+
+fn clone_params(params: *Param, type_param: *u8, type_param_len: i32, subst_type: i32, subst_name: *u8, subst_len: i32) -> *Param
+    # Legacy wrapper - doesn't handle pointer-to-struct substitution
+    return clone_params_with_suffix(params, type_param, type_param_len, subst_type, subst_name, subst_len, null, 0)
 
 fn substitute_type(ty: i32, type_param: *u8, type_param_len: i32, subst_type: i32, subst_name: *u8, subst_len: i32) -> i32
     # For simple types, no substitution needed
@@ -441,6 +456,47 @@ fn mangle_struct_name(name: *u8, name_len: i32, suffix: *u8, suffix_len: i32) ->
         *(mangled + name_len + j) = *(suffix + j)
     *(mangled + mangled_len) = 0
     return mangled
+
+# Substitute type parameter in a mangled name like "Vec$T" -> "Vec$u8"
+# Input: name = "Vec$T", type_param = "T", new_suffix = "$u8"
+# Output: "Vec$u8"
+fn substitute_type_param_in_name(name: *u8, name_len: i32, type_param: *u8, type_param_len: i32, new_suffix: *u8, new_suffix_len: i32, out_name: **u8, out_len: *i32)
+    # Check if name ends with "$T" where T is the type param
+    # Expected pattern: "Base$T" where Base is some prefix
+    let expected_suffix_len: i32 = type_param_len + 1  # "$" + type_param
+    if name_len > expected_suffix_len
+        let suffix_start: i32 = name_len - expected_suffix_len
+        # Check for '$' separator
+        if *(name + suffix_start) == 36  # '$'
+            # Check if rest matches type param
+            var matches: i32 = 1
+            for i in 0..type_param_len
+                if *(name + suffix_start + 1 + i) != *(type_param + i)
+                    matches = 0
+                    break
+            if matches != 0
+                # Replace "$T" with new_suffix
+                let base_len: i32 = suffix_start  # "Vec" part
+                let new_len: i32 = base_len + new_suffix_len
+                let result: *u8 = malloc(new_len as i64 + 1) as *u8
+                # Copy base part
+                for j in 0..base_len
+                    *(result + j) = *(name + j)
+                # Copy new suffix
+                for k in 0..new_suffix_len
+                    *(result + base_len + k) = *(new_suffix + k)
+                *(result + new_len) = 0
+                *out_name = result
+                *out_len = new_len
+                return
+
+    # No substitution needed - just copy the name
+    let copy: *u8 = malloc(name_len as i64 + 1) as *u8
+    for i in 0..name_len
+        *(copy + i) = *(name + i)
+    *(copy + name_len) = 0
+    *out_name = copy
+    *out_len = name_len
 
 fn clone_body(body: *Stmt, type_param: *u8, type_param_len: i32, subst_type: i32, subst_name: *u8, subst_len: i32, suffix: *u8, suffix_len: i32) -> *Stmt
     if body == null
@@ -559,6 +615,22 @@ fn clone_expr(e: *Expr, type_param: *u8, type_param_len: i32, subst_type: i32, s
     else if k == EXPR_CAST
         cloned.operand = clone_expr(e.operand, type_param, type_param_len, subst_type, subst_name, subst_len, suffix, suffix_len)
         cloned.op = e.op  # cast_type stored in op
+    else if k == EXPR_STRUCT_LIT
+        # Struct literal: TypeName { field: value, ... }
+        # e.ident_ptr/ident_len = struct type name
+        # For generic struct literals, name is already mangled like "Vec$T"
+        # We need to replace the "$T" with the new suffix "$u8"
+        if e.ident_ptr != null
+            var new_name_ptr: *u8 = null
+            var new_name_len: i32 = 0
+            substitute_type_param_in_name(e.ident_ptr, e.ident_len, type_param, type_param_len, suffix, suffix_len, @new_name_ptr, @new_name_len)
+            cloned.ident_ptr = new_name_ptr
+            cloned.ident_len = new_name_len
+        else
+            cloned.ident_ptr = e.ident_ptr
+            cloned.ident_len = e.ident_len
+        # Clone field initializers (stored in args)
+        cloned.args = clone_field_inits(e.args as *FieldInit, type_param, type_param_len, subst_type, subst_name, subst_len, suffix, suffix_len) as *Expr
 
     return cloned
 
@@ -568,6 +640,18 @@ fn clone_expr_list(list: *Expr, type_param: *u8, type_param_len: i32, subst_type
 
     let cloned: *Expr = clone_expr(list, type_param, type_param_len, subst_type, subst_name, subst_len, suffix, suffix_len)
     cloned.next = clone_expr_list(list.next, type_param, type_param_len, subst_type, subst_name, subst_len, suffix, suffix_len)
+    return cloned
+
+fn clone_field_inits(fi: *FieldInit, type_param: *u8, type_param_len: i32, subst_type: i32, subst_name: *u8, subst_len: i32, suffix: *u8, suffix_len: i32) -> *FieldInit
+    if fi == null
+        return null
+
+    let cloned: *FieldInit = malloc(40) as *FieldInit  # Approx size of FieldInit
+    cloned.name = fi.name
+    cloned.name_len = fi.name_len
+    # Clone the value expression (handles nested generic calls/literals)
+    cloned.value = clone_expr(fi.value, type_param, type_param_len, subst_type, subst_name, subst_len, suffix, suffix_len)
+    cloned.next = clone_field_inits(fi.next, type_param, type_param_len, subst_type, subst_name, subst_len, suffix, suffix_len)
     return cloned
 
 fn check_and_substitute_suffix(old_suffix: *u8, old_suffix_len: i32, type_param: *u8, type_param_len: i32, new_suffix: *u8, new_suffix_len: i32, out_len: *i32) -> *u8
@@ -667,6 +751,117 @@ fn clone_struct_fields(fields: *StructField, type_param: *u8, type_param_len: i3
     return cloned
 
 # ============================================================================
+# Impl Block Method Specialization
+# ============================================================================
+# Find impl block for a generic type and specialize its methods
+
+fn find_generic_impl(m: *Module, type_name: *u8, type_name_len: i32) -> *ImplBlock
+    # Look for impl block with matching type_name prefix (before $)
+    # e.g., for type_name="Vec", find impl with type_name="Vec$T"
+    var ib: *ImplBlock = m.impls
+    while ib != null
+        if ib.type_params != null  # Is a generic impl
+            # Find $ in impl block type name
+            var dollar_pos: i32 = -1
+            for i in 0..ib.type_name_len
+                if *(ib.type_name + i) == 36  # '$'
+                    dollar_pos = i
+                    break
+            if dollar_pos > 0
+                # Compare the prefix before $ with our type name
+                if dollar_pos == type_name_len
+                    if memcmp(ib.type_name, type_name, type_name_len as i64) == 0
+                        return ib
+        ib = ib.next
+    return null
+
+fn specialize_impl_methods(m: *Module, type_name: *u8, type_name_len: i32, suffix: *u8, suffix_len: i32)
+    # Find the generic impl block for this type
+    let ib: *ImplBlock = find_generic_impl(m, type_name, type_name_len)
+    if ib == null
+        return  # No generic impl block for this type
+
+    # Get type parameter from impl block
+    var type_param_name: *u8 = null
+    var type_param_len: i32 = 0
+    if ib.type_params != null
+        type_param_name = ib.type_params.name
+        type_param_len = ib.type_params.name_len
+
+    # Get substitution type from suffix
+    var subst_type_name: *u8 = null
+    var subst_type_len: i32 = 0
+    get_type_name_from_suffix(suffix, suffix_len, @subst_type_name, @subst_type_len)
+    let subst_type: i32 = parse_type_from_suffix(suffix, suffix_len)
+
+    # For each method in the impl block, create a specialized version
+    var method: *FnDef = ib.methods
+    while method != null
+        let specialized: *FnDef = specialize_impl_method(m, method, type_name, type_name_len, suffix, suffix_len, type_param_name, type_param_len, subst_type, subst_type_name, subst_type_len)
+        if specialized != null
+            # Add to module's function list
+            if m.functions == null
+                m.functions = specialized
+            else
+                var f: *FnDef = m.functions
+                while f.next != null
+                    f = f.next
+                f.next = specialized
+        method = method.next
+
+fn specialize_impl_method(m: *Module, method: *FnDef, type_name: *u8, type_name_len: i32, suffix: *u8, suffix_len: i32, type_param: *u8, type_param_len: i32, subst_type: i32, subst_name: *u8, subst_len: i32) -> *FnDef
+    # Build mangled method name: TypeName$suffix_methodName
+    # e.g., Vec$u8_get_len
+    let mangled_type_len: i32 = type_name_len + suffix_len
+    let mangled_name_len: i32 = mangled_type_len + 1 + method.name_len  # Type$suffix_method
+    let mangled_name: *u8 = malloc(mangled_name_len as i64 + 1) as *u8
+
+    var pos: i32 = 0
+    # Copy type name
+    for i in 0..type_name_len
+        *(mangled_name + pos) = *(type_name + i)
+        pos = pos + 1
+    # Copy suffix (e.g., "$u8")
+    for j in 0..suffix_len
+        *(mangled_name + pos) = *(suffix + j)
+        pos = pos + 1
+    # Add underscore separator
+    *(mangled_name + pos) = 95  # '_'
+    pos = pos + 1
+    # Copy method name
+    for k in 0..method.name_len
+        *(mangled_name + pos) = *(method.name + k)
+        pos = pos + 1
+    *(mangled_name + pos) = 0  # Null terminate
+
+    # Clone the function with specialized name and body
+    let specialized: *FnDef = malloc(120) as *FnDef  # Size of FnDef
+    specialized.name = mangled_name
+    specialized.name_len = mangled_name_len
+    specialized.line = method.line
+
+    # Specialize return type
+    specialized.return_type = substitute_type(method.return_type, type_param, type_param_len, subst_type, subst_name, subst_len)
+    if method.return_type == TYPE_STRUCT and method.return_type_name != null
+        # Substitute type name if needed
+        substitute_type_param_in_name(method.return_type_name, method.return_type_name_len, type_param, type_param_len, suffix, suffix_len, @specialized.return_type_name, @specialized.return_type_name_len)
+    else
+        specialized.return_type_name = method.return_type_name
+        specialized.return_type_name_len = method.return_type_name_len
+
+    # Clone and specialize parameters (with suffix for pointer-to-struct substitution)
+    specialized.params = clone_params_with_suffix(method.params, type_param, type_param_len, subst_type, subst_name, subst_len, suffix, suffix_len)
+
+    # Clone and specialize body
+    specialized.body = clone_body(method.body, type_param, type_param_len, subst_type, subst_name, subst_len, suffix, suffix_len)
+
+    # Clear type params (not generic anymore)
+    specialized.type_params = null
+    specialized.next = null
+
+    return specialized
+
+# ============================================================================
 # Main Monomorphization Entry Point
 # ============================================================================
 
@@ -693,6 +888,9 @@ fn monomorphize_module(m: *Module)
             if specialized != null
                 specialized.next = m.structs
                 m.structs = specialized
+
+            # Also specialize impl block methods for this struct
+            specialize_impl_methods(m, name, name_len, suffix, suffix_len)
 
     # Generate specialized functions
     for i in 0..g_inst_count
