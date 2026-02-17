@@ -4296,6 +4296,19 @@ class LLVMEmitter:
                     zero = ir.Constant(self.i32, 0)
                     ptr = self.builder.gep(alloca, [zero, index])
                     return self.builder.load(ptr)
+            elif name in self.params:
+                # let binding - array value is SSA (not alloca)
+                # Need to extract element using extractvalue
+                val, ty = self.params[name]
+                if isinstance(ty, ir.ArrayType):
+                    # For fixed-size arrays from let bindings, we need to
+                    # store temporarily to extract by dynamic index
+                    # (extractvalue requires constant index)
+                    alloca = self._alloca_in_entry_block(ty, f"{name}.tmp")
+                    self.builder.store(val, alloca)
+                    zero = ir.Constant(self.i32, 0)
+                    ptr = self.builder.gep(alloca, [zero, index])
+                    return self.builder.load(ptr)
             elif name in self.const_arrays:
                 # Const array - use two-level GEP [0, index] on the global
                 gvar, ty = self.const_arrays[name]
