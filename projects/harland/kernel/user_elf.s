@@ -101,3 +101,78 @@ hello_tier1_elf_end:
 
 hello_tier1_elf_size:
     .quad hello_tier1_elf_end - hello_tier1_elf_start
+
+# ============================================================================
+# seq10.elf - Tier 1: prints numbers 1-10
+# ============================================================================
+.global seq10_elf_start
+.global seq10_elf_end
+.global seq10_elf_size
+
+.align 16
+seq10_elf_start:
+    .incbin "build/debug/seq10.elf"
+seq10_elf_end:
+
+seq10_elf_size:
+    .quad seq10_elf_end - seq10_elf_start
+
+# ============================================================================
+# cat_motd.elf - Tier 1: reads and prints /etc/motd
+# ============================================================================
+.global cat_motd_elf_start
+.global cat_motd_elf_end
+.global cat_motd_elf_size
+
+.align 16
+cat_motd_elf_start:
+    .incbin "build/debug/cat_motd.elf"
+cat_motd_elf_end:
+
+cat_motd_elf_size:
+    .quad cat_motd_elf_end - cat_motd_elf_start
+
+# ============================================================================
+# echo.elf - Tier 1: prints command-line arguments
+# ============================================================================
+.global echo_elf_start
+.global echo_elf_end
+.global echo_elf_size
+
+.align 16
+echo_elf_start:
+    .incbin "build/debug/echo.elf"
+echo_elf_end:
+
+echo_elf_size:
+    .quad echo_elf_end - echo_elf_start
+
+# ============================================================================
+# wc.elf - Tier 1: counts lines/words/chars in a file
+# ============================================================================
+.global wc_elf_start
+.global wc_elf_end
+.global wc_elf_size
+
+.align 16
+wc_elf_start:
+    .incbin "build/debug/wc.elf"
+wc_elf_end:
+
+wc_elf_size:
+    .quad wc_elf_end - wc_elf_start
+
+# ============================================================================
+# rzsh.elf - Ritz Shell (interactive shell for harland)
+# ============================================================================
+.global rzsh_elf_start
+.global rzsh_elf_end
+.global rzsh_elf_size
+
+.align 16
+rzsh_elf_start:
+    .incbin "build/debug/rzsh.elf"
+rzsh_elf_end:
+
+rzsh_elf_size:
+    .quad rzsh_elf_end - rzsh_elf_start

@@ -1,0 +1,385 @@
+# net/dhcp.ritz - Dynamic Host Configuration Protocol Client
+#
+# DHCP client for obtaining IP address configuration from a DHCP server.
+# Supports DISCOVER/OFFER/REQUEST/ACK flow.
+
+import serial { prints, serial_print_dec }
+import net.types { DHCP_SERVER_PORT, DHCP_CLIENT_PORT, DHCP_OP_REQUEST, DHCP_OP_REPLY, DHCP_DISCOVER, DHCP_OFFER, DHCP_REQUEST, DHCP_ACK, DHCP_MAGIC, DHCP_HEADER_SIZE, IP_PROTO_UDP, UDP_HEADER_SIZE, ETHERTYPE_IPV4 }
+import net.ip { ip_build_header, ip_set_config, ip_set_dns }
+import net.udp { udp_build_header }
+import net.eth { eth_build_frame, eth_get_broadcast_mac }
+import drivers.virtio.net { virtio_net_send, virtio_net_get_mac }
+
+# ============================================================================
+# DHCP Client State
+# ============================================================================
+
+var dhcp_xid: u32 = 0x12345678
+var dhcp_state: u8 = 0  # 0=idle, 1=discover sent, 2=request sent, 3=configured
+
+# Offered configuration (saved to send REQUEST for)
+var dhcp_offered_ip: [4]u8
+var dhcp_offered_server: [4]u8
+var dhcp_offered_gateway: [4]u8
+var dhcp_offered_netmask: [4]u8
+var dhcp_offered_dns: [4]u8
+
+# ============================================================================
+# DHCP Discover
+# ============================================================================
+
+pub fn dhcp_discover() -> i32
+    var frame: [576]u8
+    var ip_buf: [320]u8
+    var udp_buf: [300]u8
+    var dhcp_buf: [280]u8
+
+    # Zero DHCP buffer
+    var i: u32 = 0
+    while i < 280
+        dhcp_buf[i as i32] = 0
+        i = i + 1
+
+    # DHCP header
+    dhcp_buf[0] = DHCP_OP_REQUEST  # op
+    dhcp_buf[1] = 1                # htype = Ethernet
+    dhcp_buf[2] = 6                # hlen = 6 bytes MAC
+    dhcp_buf[3] = 0                # hops
+
+    # Transaction ID
+    dhcp_xid = dhcp_xid + 1
+    dhcp_buf[4] = ((dhcp_xid >> 24) & 0xFF) as u8
+    dhcp_buf[5] = ((dhcp_xid >> 16) & 0xFF) as u8
+    dhcp_buf[6] = ((dhcp_xid >> 8) & 0xFF) as u8
+    dhcp_buf[7] = (dhcp_xid & 0xFF) as u8
+
+    # secs, flags (broadcast)
+    dhcp_buf[8] = 0
+    dhcp_buf[9] = 0
+    dhcp_buf[10] = 0x80  # Broadcast flag
+    dhcp_buf[11] = 0
+
+    # ciaddr, yiaddr, siaddr, giaddr all zero (bytes 12-27)
+
+    # Client MAC at offset 28
+    virtio_net_get_mac(@dhcp_buf[28])
+
+    # DHCP Magic cookie at offset 236
+    dhcp_buf[236] = 0x63
+    dhcp_buf[237] = 0x82
+    dhcp_buf[238] = 0x53
+    dhcp_buf[239] = 0x63
+
+    # DHCP Options starting at 240
+    # Option 53: DHCP Message Type = Discover
+    dhcp_buf[240] = 53
+    dhcp_buf[241] = 1
+    dhcp_buf[242] = DHCP_DISCOVER
+
+    # Option 55: Parameter Request List
+    dhcp_buf[243] = 55
+    dhcp_buf[244] = 4
+    dhcp_buf[245] = 1    # Subnet mask
+    dhcp_buf[246] = 3    # Router
+    dhcp_buf[247] = 6    # DNS
+    dhcp_buf[248] = 15   # Domain name
+
+    # End option
+    dhcp_buf[249] = 255
+
+    let dhcp_len: u32 = 250
+
+    # Build UDP header
+    let udp_hdr_len: u32 = udp_build_header(@udp_buf[0], DHCP_CLIENT_PORT, DHCP_SERVER_PORT, dhcp_len)
+
+    # Copy DHCP after UDP header
+    i = 0
+    while i < dhcp_len
+        udp_buf[udp_hdr_len as i32 + i as i32] = dhcp_buf[i as i32]
+        i = i + 1
+
+    let udp_total: u32 = udp_hdr_len + dhcp_len
+
+    # Build IP header (broadcast destination 255.255.255.255)
+    var broadcast_ip: [4]u8
+    broadcast_ip[0] = 255
+    broadcast_ip[1] = 255
+    broadcast_ip[2] = 255
+    broadcast_ip[3] = 255
+
+    let ip_len: u32 = ip_build_header(@ip_buf[0], @broadcast_ip[0], IP_PROTO_UDP, udp_total)
+
+    # Copy UDP after IP header
+    i = 0
+    while i < udp_total
+        ip_buf[ip_len as i32 + i as i32] = udp_buf[i as i32]
+        i = i + 1
+
+    # Build Ethernet frame (broadcast)
+    let broadcast_mac: *u8 = eth_get_broadcast_mac()
+    let frame_len: u32 = eth_build_frame(@frame[0], broadcast_mac, ETHERTYPE_IPV4, @ip_buf[0], ip_len + udp_total)
+
+    dhcp_state = 1
+    prints("[dhcp] Sending DISCOVER\n")
+
+    return virtio_net_send(@frame[0], frame_len)
+
+# ============================================================================
+# DHCP Request
+# ============================================================================
+
+fn dhcp_send_request() -> i32
+    var frame: [576]u8
+    var ip_buf: [320]u8
+    var udp_buf: [300]u8
+    var dhcp_buf: [280]u8
+
+    # Zero DHCP buffer
+    var i: u32 = 0
+    while i < 280
+        dhcp_buf[i as i32] = 0
+        i = i + 1
+
+    # DHCP header
+    dhcp_buf[0] = DHCP_OP_REQUEST
+    dhcp_buf[1] = 1
+    dhcp_buf[2] = 6
+    dhcp_buf[3] = 0
+
+    # Same transaction ID
+    dhcp_buf[4] = ((dhcp_xid >> 24) & 0xFF) as u8
+    dhcp_buf[5] = ((dhcp_xid >> 16) & 0xFF) as u8
+    dhcp_buf[6] = ((dhcp_xid >> 8) & 0xFF) as u8
+    dhcp_buf[7] = (dhcp_xid & 0xFF) as u8
+
+    # Broadcast flag
+    dhcp_buf[10] = 0x80
+
+    # Client MAC at offset 28
+    virtio_net_get_mac(@dhcp_buf[28])
+
+    # DHCP Magic cookie
+    dhcp_buf[236] = 0x63
+    dhcp_buf[237] = 0x82
+    dhcp_buf[238] = 0x53
+    dhcp_buf[239] = 0x63
+
+    # Option 53: DHCP Message Type = Request
+    dhcp_buf[240] = 53
+    dhcp_buf[241] = 1
+    dhcp_buf[242] = DHCP_REQUEST
+
+    # Option 50: Requested IP Address
+    dhcp_buf[243] = 50
+    dhcp_buf[244] = 4
+    dhcp_buf[245] = dhcp_offered_ip[0]
+    dhcp_buf[246] = dhcp_offered_ip[1]
+    dhcp_buf[247] = dhcp_offered_ip[2]
+    dhcp_buf[248] = dhcp_offered_ip[3]
+
+    # Option 54: Server Identifier
+    dhcp_buf[249] = 54
+    dhcp_buf[250] = 4
+    dhcp_buf[251] = dhcp_offered_server[0]
+    dhcp_buf[252] = dhcp_offered_server[1]
+    dhcp_buf[253] = dhcp_offered_server[2]
+    dhcp_buf[254] = dhcp_offered_server[3]
+
+    # End option
+    dhcp_buf[255] = 255
+
+    let dhcp_len: u32 = 256
+
+    # Build UDP header
+    let udp_hdr_len: u32 = udp_build_header(@udp_buf[0], DHCP_CLIENT_PORT, DHCP_SERVER_PORT, dhcp_len)
+
+    # Copy DHCP after UDP header
+    i = 0
+    while i < dhcp_len
+        udp_buf[udp_hdr_len as i32 + i as i32] = dhcp_buf[i as i32]
+        i = i + 1
+
+    let udp_total: u32 = udp_hdr_len + dhcp_len
+
+    # Broadcast
+    var broadcast_ip: [4]u8
+    broadcast_ip[0] = 255
+    broadcast_ip[1] = 255
+    broadcast_ip[2] = 255
+    broadcast_ip[3] = 255
+
+    let ip_len: u32 = ip_build_header(@ip_buf[0], @broadcast_ip[0], IP_PROTO_UDP, udp_total)
+
+    i = 0
+    while i < udp_total
+        ip_buf[ip_len as i32 + i as i32] = udp_buf[i as i32]
+        i = i + 1
+
+    let broadcast_mac: *u8 = eth_get_broadcast_mac()
+    let frame_len: u32 = eth_build_frame(@frame[0], broadcast_mac, ETHERTYPE_IPV4, @ip_buf[0], ip_len + udp_total)
+
+    dhcp_state = 2
+    prints("[dhcp] Sending REQUEST\n")
+
+    return virtio_net_send(@frame[0], frame_len)
+
+# ============================================================================
+# Handle DHCP Response
+# ============================================================================
+
+pub fn dhcp_handle_packet(dhcp_data: *u8, dhcp_len: u32)
+    if dhcp_len < DHCP_HEADER_SIZE
+        return
+
+    # Check magic cookie at offset 236
+    if dhcp_len < 240
+        return
+
+    let b0: u32 = (*(dhcp_data + 236) as u32) << 24
+    let b1: u32 = (*(dhcp_data + 237) as u32) << 16
+    let b2: u32 = (*(dhcp_data + 238) as u32) << 8
+    let b3: u32 = *(dhcp_data + 239) as u32
+    let magic: u32 = b0 | b1 | b2 | b3
+    if magic != DHCP_MAGIC
+        return
+
+    # Check transaction ID
+    let x0: u32 = (*(dhcp_data + 4) as u32) << 24
+    let x1: u32 = (*(dhcp_data + 5) as u32) << 16
+    let x2: u32 = (*(dhcp_data + 6) as u32) << 8
+    let x3: u32 = *(dhcp_data + 7) as u32
+    let xid: u32 = x0 | x1 | x2 | x3
+    if xid != dhcp_xid
+        return
+
+    # Get offered IP (yiaddr at offset 16)
+    let offered_ip: *u8 = dhcp_data + 16
+
+    # Parse options to find message type and other info
+    var msg_type: u8 = 0
+    var i: u32 = 240
+    while i < dhcp_len
+        let opt: u8 = *(dhcp_data + i as i64)
+        if opt == 255
+            break  # End option
+        if opt == 0
+            i = i + 1  # Padding
+            continue
+
+        let opt_len: u8 = *(dhcp_data + i as i64 + 1)
+        let opt_data: *u8 = dhcp_data + i as i64 + 2
+
+        if opt == 53 and opt_len >= 1
+            # DHCP Message Type
+            msg_type = *opt_data
+
+        else if opt == 1 and opt_len >= 4
+            # Subnet Mask
+            var j: i32 = 0
+            while j < 4
+                dhcp_offered_netmask[j] = *(opt_data + j as i64)
+                j = j + 1
+
+        else if opt == 3 and opt_len >= 4
+            # Router
+            var j: i32 = 0
+            while j < 4
+                dhcp_offered_gateway[j] = *(opt_data + j as i64)
+                j = j + 1
+
+        else if opt == 6 and opt_len >= 4
+            # DNS Server
+            var j: i32 = 0
+            while j < 4
+                dhcp_offered_dns[j] = *(opt_data + j as i64)
+                j = j + 1
+
+        else if opt == 54 and opt_len >= 4
+            # Server Identifier
+            var j: i32 = 0
+            while j < 4
+                dhcp_offered_server[j] = *(opt_data + j as i64)
+                j = j + 1
+
+        i = i + 2 + opt_len as u32
+
+    if msg_type == DHCP_OFFER and dhcp_state == 1
+        # Save offered IP
+        var j: i32 = 0
+        while j < 4
+            dhcp_offered_ip[j] = *(offered_ip + j as i64)
+            j = j + 1
+
+        prints("[dhcp] OFFER: ")
+        dhcp_print_ip(@dhcp_offered_ip[0])
+        prints("\n")
+
+        # Send REQUEST
+        dhcp_send_request()
+
+    else if msg_type == DHCP_ACK and dhcp_state == 2
+        # Configure the IP stack
+        prints("[dhcp] ACK: ")
+        dhcp_print_ip(@dhcp_offered_ip[0])
+        prints("\n")
+
+        # Set default netmask if not provided
+        if dhcp_offered_netmask[0] == 0 and dhcp_offered_netmask[1] == 0
+            dhcp_offered_netmask[0] = 255
+            dhcp_offered_netmask[1] = 255
+            dhcp_offered_netmask[2] = 255
+            dhcp_offered_netmask[3] = 0
+
+        # Set default gateway if not provided (QEMU SLIRP default)
+        if dhcp_offered_gateway[0] == 0 and dhcp_offered_gateway[1] == 0
+            dhcp_offered_gateway[0] = 10
+            dhcp_offered_gateway[1] = 0
+            dhcp_offered_gateway[2] = 2
+            dhcp_offered_gateway[3] = 2
+
+        # Configure IP layer
+        ip_set_config(@dhcp_offered_ip[0], @dhcp_offered_gateway[0], @dhcp_offered_netmask[0])
+
+        if dhcp_offered_dns[0] != 0 or dhcp_offered_dns[1] != 0
+            ip_set_dns(@dhcp_offered_dns[0])
+
+        dhcp_state = 3
+        prints("[dhcp] Configured!\n")
+
+# ============================================================================
+# State Query
+# ============================================================================
+
+pub fn dhcp_is_configured() -> bool
+    return dhcp_state == 3
+
+pub fn dhcp_get_state() -> u8
+    return dhcp_state
+
+pub fn dhcp_reset()
+    dhcp_state = 0
+
+# ============================================================================
+# Debug
+# ============================================================================
+
+fn dhcp_print_ip(ip: *u8)
+    serial_print_dec(*(ip + 0) as u64)
+    prints(".")
+    serial_print_dec(*(ip + 1) as u64)
+    prints(".")
+    serial_print_dec(*(ip + 2) as u64)
+    prints(".")
+    serial_print_dec(*(ip + 3) as u64)
+
+pub fn dhcp_print_config()
+    prints("[dhcp] Configuration:\n")
+    prints("  IP:      ")
+    dhcp_print_ip(@dhcp_offered_ip[0])
+    prints("\n  Gateway: ")
+    dhcp_print_ip(@dhcp_offered_gateway[0])
+    prints("\n  Netmask: ")
+    dhcp_print_ip(@dhcp_offered_netmask[0])
+    prints("\n  DNS:     ")
+    dhcp_print_ip(@dhcp_offered_dns[0])
+    prints("\n")
