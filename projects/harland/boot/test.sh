@@ -106,19 +106,20 @@ mcopy -i "$TMPDIR/disk.img" "$TMPDIR/startup.nsh" ::/startup.nsh
 # Serial output file
 SERIAL_LOG="$TMPDIR/serial.log"
 
-# Create VirtIO test disks (matching BIOS test)
+# Create VirtIO test disks
+# Tests use separate disk images that get reformatted each run
+# This keeps `make run` disks pristine for interactive use
 INITRAMFS="$HARLAND_DIR/build/initramfs.qcow2"
-STORAGE="$HARLAND_DIR/build/storage.qcow2"
+STORAGE="$HARLAND_DIR/build/storage-test.qcow2"
 
 # Indium and Prism directories
 INDIUM_DIR="$HARLAND_DIR/../indium"
 PRISM_DIR="$HARLAND_DIR/../prism"
 
-# Create storage disk if needed
-if [ ! -f "$STORAGE" ]; then
-    echo "Creating storage disk (512MB)..."
-    qemu-img create -f qcow2 "$STORAGE" 512M >/dev/null
-fi
+# Always recreate test storage disk (fresh for each test run)
+echo "Creating test storage disk (512MB)..."
+rm -f "$STORAGE"
+qemu-img create -f qcow2 "$STORAGE" 512M >/dev/null
 
 # Build the Ritz runtime (required for harland userspace binaries)
 echo "Building ritz runtime..."
