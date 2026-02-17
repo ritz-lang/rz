@@ -101,3 +101,33 @@ hello_tier1_elf_end:
 
 hello_tier1_elf_size:
     .quad hello_tier1_elf_end - hello_tier1_elf_start
+
+# ============================================================================
+# seq10.elf - Tier 1: prints numbers 1-10
+# ============================================================================
+.global seq10_elf_start
+.global seq10_elf_end
+.global seq10_elf_size
+
+.align 16
+seq10_elf_start:
+    .incbin "build/debug/seq10.elf"
+seq10_elf_end:
+
+seq10_elf_size:
+    .quad seq10_elf_end - seq10_elf_start
+
+# ============================================================================
+# cat_motd.elf - Tier 1: reads and prints /etc/motd
+# ============================================================================
+.global cat_motd_elf_start
+.global cat_motd_elf_end
+.global cat_motd_elf_size
+
+.align 16
+cat_motd_elf_start:
+    .incbin "build/debug/cat_motd.elf"
+cat_motd_elf_end:
+
+cat_motd_elf_size:
+    .quad cat_motd_elf_end - cat_motd_elf_start
