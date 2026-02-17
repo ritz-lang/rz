@@ -163,10 +163,15 @@ for elf in "$INDIUM_DIR/build/debug"/*.elf; do
     fi
 done
 
-# Copy prism_demo
+# Copy prism binaries
 if [ -f "$PRISM_DIR/build/debug/prism_demo.elf" ]; then
     cp "$PRISM_DIR/build/debug/prism_demo.elf" "$INITRAMFS_TMP/bin/prism_demo"
     echo "    /bin/prism_demo"
+fi
+
+if [ -f "$PRISM_DIR/build/debug/hello_gfx.elf" ]; then
+    cp "$PRISM_DIR/build/debug/hello_gfx.elf" "$INITRAMFS_TMP/bin/hello_gfx"
+    echo "    /bin/hello_gfx"
 fi
 
 # Copy rzsh
