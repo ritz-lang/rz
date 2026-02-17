@@ -1,0 +1,171 @@
+# net/udp.ritz - User Datagram Protocol (Layer 4)
+#
+# Simple connectionless datagram protocol.
+# Used by DHCP, DNS, and other protocols.
+
+import serial { prints, serial_print_dec }
+import net.types { UDP_HEADER_SIZE, IP_PROTO_UDP, ETHERTYPE_IPV4 }
+import net.ip { ip_checksum, ip_build_header, ip_get_next_hop, ip_get_our_addr }
+import net.arp { arp_cache_lookup, arp_send_request }
+import net.eth { eth_build_frame, eth_get_broadcast_mac }
+import drivers.virtio.net { virtio_net_send }
+
+# ============================================================================
+# UDP Header Structure
+# ============================================================================
+
+pub struct UdpHeader
+    src_port: u16
+    dst_port: u16
+    length: u16
+    checksum: u16
+
+# ============================================================================
+# Build UDP Header
+# ============================================================================
+
+# Build UDP header in buffer
+# Returns header size (always UDP_HEADER_SIZE = 8)
+pub fn udp_build_header(buf: *u8, src_port: u16, dst_port: u16, payload_len: u32) -> u32
+    let total_len: u16 = (UDP_HEADER_SIZE + payload_len) as u16
+
+    # Source port (big-endian)
+    *(buf + 0) = ((src_port >> 8) & 0xFF) as u8
+    *(buf + 1) = (src_port & 0xFF) as u8
+
+    # Destination port (big-endian)
+    *(buf + 2) = ((dst_port >> 8) & 0xFF) as u8
+    *(buf + 3) = (dst_port & 0xFF) as u8
+
+    # Length (big-endian)
+    *(buf + 4) = ((total_len >> 8) & 0xFF) as u8
+    *(buf + 5) = (total_len & 0xFF) as u8
+
+    # Checksum (optional for UDP over IPv4, set to 0)
+    *(buf + 6) = 0
+    *(buf + 7) = 0
+
+    return UDP_HEADER_SIZE
+
+# ============================================================================
+# Parse UDP Header
+# ============================================================================
+
+pub fn udp_parse_header(buf: *u8, header: *UdpHeader)
+    (*header).src_port = ((*(buf + 0) as u16) << 8) | (*(buf + 1) as u16)
+    (*header).dst_port = ((*(buf + 2) as u16) << 8) | (*(buf + 3) as u16)
+    (*header).length = ((*(buf + 4) as u16) << 8) | (*(buf + 5) as u16)
+    (*header).checksum = ((*(buf + 6) as u16) << 8) | (*(buf + 7) as u16)
+
+# ============================================================================
+# Send UDP Packet
+# ============================================================================
+
+# Send a UDP packet to dst_ip:dst_port from src_port
+# Returns 0 on success, -1 if ARP needed
+pub fn udp_send(dst_ip: *u8, dst_port: u16, src_port: u16, payload: *u8, payload_len: u32) -> i32
+    var frame: [576]u8
+    var packet: [512]u8
+
+    # Build IP header (space for UDP + payload)
+    let udp_total: u32 = UDP_HEADER_SIZE + payload_len
+    let ip_len: u32 = ip_build_header(@packet[0], dst_ip, IP_PROTO_UDP, udp_total)
+
+    # Build UDP header after IP
+    let udp_start: i64 = ip_len as i64
+    udp_build_header(@packet[0] + udp_start, src_port, dst_port, payload_len)
+
+    # Copy payload after UDP header
+    var i: i32 = 0
+    while i < payload_len as i32
+        *(@packet[0] + udp_start + UDP_HEADER_SIZE as i64 + i as i64) = *(payload + i as i64)
+        i = i + 1
+
+    let total_len: u32 = ip_len + udp_total
+
+    # Get next hop IP
+    let next_hop: *u8 = ip_get_next_hop(dst_ip)
+
+    # Look up MAC address
+    var dst_mac: [6]u8
+    if arp_cache_lookup(next_hop, @dst_mac[0]) < 0
+        # Need to ARP
+        arp_send_request(next_hop)
+        return -1
+
+    # Build Ethernet frame
+    let frame_len: u32 = eth_build_frame(@frame[0], @dst_mac[0], ETHERTYPE_IPV4, @packet[0], total_len)
+
+    return virtio_net_send(@frame[0], frame_len)
+
+# ============================================================================
+# Send UDP Broadcast
+# ============================================================================
+
+# Send a UDP broadcast packet (e.g., for DHCP)
+# Uses broadcast MAC and broadcast IP
+pub fn udp_send_broadcast(dst_port: u16, src_port: u16, payload: *u8, payload_len: u32) -> i32
+    var frame: [576]u8
+    var packet: [512]u8
+
+    # Broadcast IP: 255.255.255.255
+    var bcast_ip: [4]u8
+    bcast_ip[0] = 255
+    bcast_ip[1] = 255
+    bcast_ip[2] = 255
+    bcast_ip[3] = 255
+
+    # Build IP header
+    let udp_total: u32 = UDP_HEADER_SIZE + payload_len
+    let ip_len: u32 = ip_build_header(@packet[0], @bcast_ip[0], IP_PROTO_UDP, udp_total)
+
+    # Build UDP header after IP
+    let udp_start: i64 = ip_len as i64
+    udp_build_header(@packet[0] + udp_start, src_port, dst_port, payload_len)
+
+    # Copy payload after UDP header
+    var i: i32 = 0
+    while i < payload_len as i32
+        *(@packet[0] + udp_start + UDP_HEADER_SIZE as i64 + i as i64) = *(payload + i as i64)
+        i = i + 1
+
+    let total_len: u32 = ip_len + udp_total
+
+    # Build Ethernet frame with broadcast MAC
+    let bcast_mac: *u8 = eth_get_broadcast_mac()
+    let frame_len: u32 = eth_build_frame(@frame[0], bcast_mac, ETHERTYPE_IPV4, @packet[0], total_len)
+
+    return virtio_net_send(@frame[0], frame_len)
+
+# ============================================================================
+# Get UDP Payload
+# ============================================================================
+
+pub fn udp_get_payload(buf: *u8) -> *u8
+    return buf + UDP_HEADER_SIZE as i64
+
+pub fn udp_get_payload_len(buf: *u8) -> u32
+    let length: u16 = ((*(buf + 4) as u16) << 8) | (*(buf + 5) as u16)
+    if (length as u32) <= UDP_HEADER_SIZE
+        return 0
+    return (length as u32) - UDP_HEADER_SIZE
+
+pub fn udp_get_src_port(buf: *u8) -> u16
+    return ((*(buf + 0) as u16) << 8) | (*(buf + 1) as u16)
+
+pub fn udp_get_dst_port(buf: *u8) -> u16
+    return ((*(buf + 2) as u16) << 8) | (*(buf + 3) as u16)
+
+# ============================================================================
+# Debug
+# ============================================================================
+
+pub fn udp_print_header(buf: *u8)
+    prints("[udp] src_port=")
+    serial_print_dec(udp_get_src_port(buf) as u64)
+    prints(" dst_port=")
+    serial_print_dec(udp_get_dst_port(buf) as u64)
+    prints(" len=")
+    let length: u16 = ((*(buf + 4) as u16) << 8) | (*(buf + 5) as u16)
+    serial_print_dec(length as u64)
+    prints("\n")

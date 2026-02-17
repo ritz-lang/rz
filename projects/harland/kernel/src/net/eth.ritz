@@ -1,0 +1,139 @@
+# net/eth.ritz - Ethernet Layer (L2)
+#
+# Handles Ethernet frame construction and parsing.
+#
+# Ethernet frame structure:
+# +--------------+-------------+------+------------------+-----+
+# | Dest MAC (6) | Src MAC (6) | Type | Payload (46-1500)| FCS |
+# +--------------+-------------+------+------------------+-----+
+#
+# FCS (Frame Check Sequence) is handled by hardware.
+
+import net.types { ETHERTYPE_IPV4, ETHERTYPE_ARP, ETH_HEADER_SIZE, memcpy }
+import drivers.virtio.net { virtio_net_get_mac }
+
+# ============================================================================
+# Ethernet Header Structure
+# ============================================================================
+
+pub struct EthHeader
+    dst_mac: [6]u8
+    src_mac: [6]u8
+    ethertype: u16   # Network byte order (big-endian)
+
+# ============================================================================
+# Frame Construction
+# ============================================================================
+
+# Build an Ethernet frame in the provided buffer
+# Uses our NIC's MAC as source address
+# Returns total frame size including header
+pub fn eth_build_frame(buf: *u8, dst_mac: *u8, ethertype: u16, payload: *u8, payload_len: u32) -> u32
+    # Copy destination MAC
+    var i: u32 = 0
+    while i < 6
+        *(buf + i as i64) = *(dst_mac + i as i64)
+        i = i + 1
+
+    # Copy source MAC (our MAC)
+    virtio_net_get_mac(buf + 6)
+
+    # Set EtherType (big-endian/network byte order)
+    *(buf + 12) = ((ethertype >> 8) & 0xFF) as u8
+    *(buf + 13) = (ethertype & 0xFF) as u8
+
+    # Copy payload
+    i = 0
+    while i < payload_len
+        *(buf + 14 + i as i64) = *(payload + i as i64)
+        i = i + 1
+
+    return ETH_HEADER_SIZE + payload_len
+
+# Build an Ethernet frame with explicit source MAC
+pub fn eth_build_frame_src(buf: *u8, dst_mac: *u8, src_mac: *u8, ethertype: u16, payload: *u8, payload_len: u32) -> u32
+    # Copy destination MAC
+    var i: u32 = 0
+    while i < 6
+        *(buf + i as i64) = *(dst_mac + i as i64)
+        i = i + 1
+
+    # Copy source MAC
+    while i < 12
+        *(buf + i as i64) = *(src_mac + (i - 6) as i64)
+        i = i + 1
+
+    # Set EtherType (big-endian/network byte order)
+    *(buf + 12) = ((ethertype >> 8) & 0xFF) as u8
+    *(buf + 13) = (ethertype & 0xFF) as u8
+
+    # Copy payload
+    i = 0
+    while i < payload_len
+        *(buf + 14 + i as i64) = *(payload + i as i64)
+        i = i + 1
+
+    return ETH_HEADER_SIZE + payload_len
+
+# ============================================================================
+# Frame Parsing
+# ============================================================================
+
+# Parse Ethernet header from buffer
+pub fn eth_parse_header(buf: *u8, header: *EthHeader)
+    var i: u32 = 0
+    while i < 6
+        (*header).dst_mac[i as i32] = *(buf + i as i64)
+        (*header).src_mac[i as i32] = *(buf + 6 + i as i64)
+        i = i + 1
+
+    # Read ethertype (big-endian to host)
+    let et_high: u16 = *(buf + 12) as u16
+    let et_low: u16 = *(buf + 13) as u16
+    (*header).ethertype = (et_high << 8) | et_low
+
+# Get payload pointer (data after Ethernet header)
+pub fn eth_get_payload(buf: *u8) -> *u8
+    return buf + ETH_HEADER_SIZE as i64
+
+# Get payload length from total frame length
+pub fn eth_get_payload_len(frame_len: u32) -> u32
+    if frame_len <= ETH_HEADER_SIZE
+        return 0
+    return frame_len - ETH_HEADER_SIZE
+
+# ============================================================================
+# MAC Address Utilities
+# ============================================================================
+
+# Broadcast MAC address (FF:FF:FF:FF:FF:FF)
+var broadcast_mac: [6]u8
+
+pub fn eth_get_broadcast_mac() -> *u8
+    broadcast_mac[0] = 0xFF
+    broadcast_mac[1] = 0xFF
+    broadcast_mac[2] = 0xFF
+    broadcast_mac[3] = 0xFF
+    broadcast_mac[4] = 0xFF
+    broadcast_mac[5] = 0xFF
+    return @broadcast_mac[0]
+
+# Check if MAC is broadcast
+pub fn eth_is_broadcast(mac: *u8) -> bool
+    var i: i32 = 0
+    while i < 6
+        if *(mac + i as i64) != 0xFF
+            return false
+        i = i + 1
+    return true
+
+# Check if MAC is multicast (first bit of first byte is 1)
+pub fn eth_is_multicast(mac: *u8) -> bool
+    return (*mac & 0x01) != 0
+
+# Zero a MAC address
+pub fn eth_zero_mac(mac: *u8)
+    var i: i32 = 0
+    while i < 6
+        *(mac + i as i64) = 0
+        i = i + 1
