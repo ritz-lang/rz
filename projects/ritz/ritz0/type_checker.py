@@ -400,6 +400,11 @@ class TypeChecker:
             elem_type = self._infer_type(expr.value)
             return rast.ArrayType(expr.span, expr.count, elem_type)
 
+        elif isinstance(expr, rast.TupleLit):
+            # Infer tuple type from element types
+            element_types = [self._infer_type(elem) for elem in expr.elements]
+            return rast.TupleType(expr.span, element_types)
+
         elif isinstance(expr, rast.Cast):
             # Just check the source expression is valid
             self._infer_type(expr.expr)
@@ -676,6 +681,19 @@ class TypeChecker:
         while isinstance(inner_type, (rast.PtrType, rast.RefType)):
             inner_type = inner_type.inner
 
+        # Handle tuple field access: tuple.0, tuple.1, etc.
+        if isinstance(inner_type, rast.TupleType):
+            if expr.field.isdigit():
+                index = int(expr.field)
+                if index < len(inner_type.elements):
+                    return inner_type.elements[index]
+                else:
+                    self._error(f"tuple index {index} out of bounds for tuple with {len(inner_type.elements)} elements", expr.span)
+                    return rast.NamedType(expr.span, 'unknown', [])
+            else:
+                self._error(f"tuple fields must be numeric indices, got '{expr.field}'", expr.span)
+                return rast.NamedType(expr.span, 'unknown', [])
+
         if not isinstance(inner_type, rast.NamedType):
             self._error(f"cannot access field on {self._type_str(base_type)}", expr.span)
             return rast.NamedType(expr.span, 'unknown', [])
@@ -951,6 +969,13 @@ class TypeChecker:
         if isinstance(actual, rast.ArrayType) and isinstance(expected, rast.ArrayType):
             return self._types_compatible(actual.inner, expected.inner)
 
+        # Tuple types
+        if isinstance(actual, rast.TupleType) and isinstance(expected, rast.TupleType):
+            if len(actual.elements) != len(expected.elements):
+                return False
+            return all(self._types_compatible(a, e)
+                       for a, e in zip(actual.elements, expected.elements))
+
         # Function pointer types
         if isinstance(actual, rast.FnType) and isinstance(expected, rast.FnType):
             if len(actual.params) != len(expected.params):
@@ -1044,6 +1069,9 @@ class TypeChecker:
         elif isinstance(ty, rast.FnType):
             params = ', '.join(self._type_str(p) for p in ty.params)
             return f"fn({params}) -> {self._type_str(ty.ret)}"
+        elif isinstance(ty, rast.TupleType):
+            elem_strs = ', '.join(self._type_str(e) for e in ty.elements)
+            return f"({elem_strs})"
         return str(ty)
 
     def _error(self, message: str, span: Optional[rast.Span]):

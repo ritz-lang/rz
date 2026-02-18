@@ -475,6 +475,33 @@ class Parser:
                 self._expect(TokenType.RBRACKET)
                 return rast.SliceType(span, inner)
 
+        # Tuple type: (T1, T2, ...) or (T,) or ()
+        # Distinguished from grouped types by comma presence
+        if self._at(TokenType.LPAREN):
+            self._advance()
+            # Empty tuple: ()
+            if self._at(TokenType.RPAREN):
+                self._advance()
+                return rast.TupleType(span, [])
+            # Parse first type
+            first_type = self.parse_type()
+            # Check for comma (tuple) vs no comma (error - grouped types not allowed in type position)
+            if self._at(TokenType.COMMA):
+                types = [first_type]
+                while self._at(TokenType.COMMA):
+                    self._advance()
+                    if self._at(TokenType.RPAREN):
+                        break  # Trailing comma allowed
+                    types.append(self.parse_type())
+                self._expect(TokenType.RPAREN)
+                return rast.TupleType(span, types)
+            else:
+                # Single element without comma - treat as single-element tuple
+                # (T) is just parenthesized for grouping, (T,) is a single-element tuple
+                self._expect(TokenType.RPAREN)
+                # Just a parenthesized type - return the inner type directly
+                return first_type
+
         # Function type: fn(A, B) -> C or fn(name: A, name2: B) -> C
         # Named parameters are allowed for documentation purposes
         if self._at(TokenType.FN):
@@ -741,24 +768,30 @@ class Parser:
                         expr = rast.Index(expr.span, expr, first)
 
             elif self._at(TokenType.DOT):
-                # Field access or method call
+                # Field access, tuple field access, or method call
                 self._advance()
-                field_tok = self._expect(TokenType.IDENT)
-                if self._at(TokenType.LPAREN):
-                    # Method call
-                    self._advance()
-                    args = []
-                    if not self._at(TokenType.RPAREN):
-                        args.append(self.parse_expr())
-                        while self._at(TokenType.COMMA):
-                            self._advance()
-                            if self._at(TokenType.RPAREN):
-                                break
-                            args.append(self.parse_expr())
-                    self._expect(TokenType.RPAREN)
-                    expr = rast.MethodCall(expr.span, expr, field_tok.value, args)
+                # Check for tuple field access: expr.0, expr.1, etc.
+                if self._at(TokenType.INT):
+                    field_tok = self._advance()
+                    field_name = str(field_tok.value)
+                    expr = rast.Field(expr.span, expr, field_name)
                 else:
-                    expr = rast.Field(expr.span, expr, field_tok.value)
+                    field_tok = self._expect(TokenType.IDENT)
+                    if self._at(TokenType.LPAREN):
+                        # Method call
+                        self._advance()
+                        args = []
+                        if not self._at(TokenType.RPAREN):
+                            args.append(self.parse_expr())
+                            while self._at(TokenType.COMMA):
+                                self._advance()
+                                if self._at(TokenType.RPAREN):
+                                    break
+                                args.append(self.parse_expr())
+                        self._expect(TokenType.RPAREN)
+                        expr = rast.MethodCall(expr.span, expr, field_tok.value, args)
+                    else:
+                        expr = rast.Field(expr.span, expr, field_tok.value)
 
             elif self._at(TokenType.QUESTION):
                 # Try operator
@@ -901,12 +934,33 @@ class Parser:
             else:
                 return rast.Ident(span, name)
 
-        # Parenthesized expression
+        # Parenthesized expression or tuple literal
         if self._at(TokenType.LPAREN):
             self._advance()
-            expr = self.parse_expr()
-            self._expect(TokenType.RPAREN)
-            return expr
+
+            # Empty tuple: ()
+            if self._at(TokenType.RPAREN):
+                self._advance()
+                return rast.TupleLit(span, [])
+
+            # Parse first expression
+            first_expr = self.parse_expr()
+
+            # Check for comma (tuple) vs no comma (grouped expression)
+            if self._at(TokenType.COMMA):
+                # It's a tuple literal: (expr1, expr2, ...) or (expr,)
+                elements = [first_expr]
+                while self._at(TokenType.COMMA):
+                    self._advance()
+                    if self._at(TokenType.RPAREN):
+                        break  # Trailing comma allowed
+                    elements.append(self.parse_expr())
+                self._expect(TokenType.RPAREN)
+                return rast.TupleLit(span, elements)
+            else:
+                # Single grouped expression: (expr)
+                self._expect(TokenType.RPAREN)
+                return first_expr
 
         # If expression
         if self._at(TokenType.IF):

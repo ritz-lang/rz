@@ -365,6 +365,25 @@ class LLVMEmitter:
             total_size = elem_size * ty.count
             return (total_size, total_size)
 
+        elif isinstance(ty, rast.TupleType):
+            # Tuple: calculate size with proper alignment padding
+            if not ty.elements:
+                # Empty tuple: 0 bytes, 1-byte alignment (unit type)
+                return (0, 1)
+            total_size = 0
+            max_align = 1
+            for elem_ty in ty.elements:
+                elem_size, elem_align = self._ritz_type_size_and_align(elem_ty)
+                # Align element within the tuple
+                if total_size % elem_align != 0:
+                    total_size += elem_align - (total_size % elem_align)
+                total_size += elem_size
+                max_align = max(max_align, elem_align)
+            # Align total size to max alignment (struct padding)
+            if total_size % max_align != 0:
+                total_size += max_align - (total_size % max_align)
+            return (total_size, max_align)
+
         else:
             # Default fallback
             return (8, 8)
@@ -459,6 +478,14 @@ class LLVMEmitter:
                 return self.dyn_types[ty.trait_name]
             # If vtable not yet created, create a placeholder fat pointer
             return ir.LiteralStructType([self.i8_ptr, self.i8_ptr])
+        elif isinstance(ty, rast.TupleType):
+            # Tuple type: (T1, T2, ...) -> { T1, T2, ... }
+            # Maps to LLVM literal struct type
+            if not ty.elements:
+                # Empty tuple (unit type): empty struct
+                return ir.LiteralStructType([])
+            element_types = [self._ritz_type_to_llvm(elem) for elem in ty.elements]
+            return ir.LiteralStructType(element_types)
         else:
             raise ValueError(f"Unknown type: {ty}")
 
@@ -4283,6 +4310,9 @@ class LLVMEmitter:
         elif isinstance(expr, rast.ArrayFill):
             return self._emit_array_fill(expr)
 
+        elif isinstance(expr, rast.TupleLit):
+            return self._emit_tuple_lit(expr)
+
         elif isinstance(expr, rast.Field):
             return self._emit_field_access(expr)
 
@@ -4691,6 +4721,29 @@ class LLVMEmitter:
 
         # Load and return the filled array
         return self.builder.load(arr_alloca)
+
+    def _emit_tuple_lit(self, expr: rast.TupleLit) -> ir.Value:
+        """Emit a tuple literal: (a, b, c).
+
+        Tuples are anonymous struct types in LLVM: { T1, T2, ... }
+        """
+        if not expr.elements:
+            # Empty tuple (unit type): return empty struct
+            return ir.Constant(ir.LiteralStructType([]), ir.Undefined)
+
+        # Emit all elements
+        values = [self._emit_expr(e) for e in expr.elements]
+
+        # Create struct type from element types
+        elem_types = [val.type for val in values]
+        struct_type = ir.LiteralStructType(elem_types)
+
+        # Build struct aggregate using insertvalue
+        result = ir.Constant(struct_type, ir.Undefined)
+        for i, val in enumerate(values):
+            result = self.builder.insert_value(result, val, i)
+
+        return result
 
     def _emit_array_fill_to_alloca(self, expr: rast.ArrayFill, alloca: ir.AllocaInstr,
                                     target_type: ir.Type) -> None:
@@ -5643,12 +5696,35 @@ class LLVMEmitter:
     def _emit_field_access(self, expr: rast.Field) -> ir.Value:
         """Emit field access: struct_val.field or struct_ptr->field.
 
-        Supports implicit deref for Box<T> types:
+        Supports:
+        - Tuple field access: tuple.0, tuple.1, etc. (numeric indices)
+        - Implicit deref for Box<T> types:
           If b: Box<Point>, then b.x is equivalent to (*b.ptr).x
 
         For local variables, uses GEP directly on the alloca to avoid loading
         the entire struct into a register (which can crash LLVM for large structs).
         """
+        # Check for tuple field access (numeric field names)
+        if expr.field.isdigit():
+            index = int(expr.field)
+            struct_val = self._emit_expr(expr.expr)
+
+            # Handle tuple values (LiteralStructType)
+            if isinstance(struct_val.type, ir.LiteralStructType):
+                return self.builder.extract_value(struct_val, index)
+            # Handle pointer to tuple
+            elif isinstance(struct_val.type, ir.PointerType):
+                pointee = struct_val.type.pointee
+                if isinstance(pointee, ir.LiteralStructType):
+                    # GEP to the field, then load
+                    field_ptr = self.builder.gep(struct_val,
+                        [ir.Constant(self.i32, 0), ir.Constant(self.i32, index)])
+                    return self.builder.load(field_ptr)
+            # Fallback: try extractvalue on any struct-like type
+            if isinstance(struct_val.type, ir.BaseStructType):
+                return self.builder.extract_value(struct_val, index)
+            raise ValueError(f"Cannot access tuple field {index} on type: {struct_val.type}")
+
         # Optimization: if the inner expression is a local variable, use GEP directly
         # instead of loading the entire struct then extracting a field.
         local_alloca = self._get_local_alloca(expr.expr)

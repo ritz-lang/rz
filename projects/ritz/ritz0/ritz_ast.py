@@ -177,6 +177,21 @@ class VectorType(Type):
     inner: Type  # Element type (e.g., i32)
 
 
+@dataclass
+class TupleType(Type):
+    """A tuple type: (T1, T2, ...).
+
+    Anonymous heterogeneous product type with numeric indexing.
+    Elements accessed by index: tuple.0, tuple.1, etc.
+
+    Examples:
+        (i32, f64)  -> TupleType([i32, f64])
+        (i32,)      -> TupleType([i32])  # single element (trailing comma)
+        ()          -> TupleType([])     # unit type
+    """
+    elements: List[Type]
+
+
 # ============================================================================
 # Expressions
 # ============================================================================
@@ -398,6 +413,20 @@ class ArrayFill(Expr):
     """
     value: Expr
     count: int
+
+
+@dataclass
+class TupleLit(Expr):
+    """A tuple literal: (expr1, expr2, ...).
+
+    Anonymous heterogeneous product value. Elements evaluated left-to-right.
+
+    Examples:
+        (1, 2.0)    -> TupleLit([IntLit(1), FloatLit(2.0)])
+        (x,)        -> TupleLit([Ident("x")])  # single element (trailing comma)
+        ()          -> TupleLit([])            # unit value
+    """
+    elements: List[Expr]
 
 
 @dataclass
