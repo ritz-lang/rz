@@ -6956,10 +6956,16 @@ class LLVMEmitter:
         # Determine receiver type first by peeking at the expression
         # For identifiers, we can look up the type directly
         type_name = None
+        is_static_call = False  # True if Type.method() with no receiver instance
         if isinstance(expr.expr, rast.Ident):
             name = expr.expr.name
+            # Check if this is a static method call (receiver is a type name, not a variable)
+            # e.g., ShapedGlyph.simple(...) where ShapedGlyph is a type, not a variable
+            if name in self.struct_types and name not in self.locals and name not in self.params:
+                type_name = name
+                is_static_call = True
             # First check ritz_types for the original Ritz type (preserves signedness)
-            if name in self.ritz_types:
+            elif name in self.ritz_types:
                 ritz_type = self.ritz_types[name]
                 if isinstance(ritz_type, rast.NamedType):
                     type_name = ritz_type.name
@@ -7011,6 +7017,31 @@ class LLVMEmitter:
             raise ValueError(f"Method function '{mangled_name}' not found")
 
         fn, fn_def = self.functions[mangled_name]
+
+        # Check if this is a static method (no self parameter)
+        # Static methods are called as Type.method() with no receiver instance
+        has_self_param = len(fn_def.params) > 0 and fn_def.params[0].name == 'self'
+
+        # For static calls (Type.method()), verify there's no self parameter
+        if is_static_call and has_self_param:
+            raise ValueError(f"Static method call Type.method() but method '{expr.method}' expects 'self' parameter")
+
+        # Handle static method call - no receiver needed
+        if is_static_call or not has_self_param:
+            # Static method - just emit the arguments, no receiver
+            all_args = []
+            for arg in expr.args:
+                all_args.append(self._emit_expr(arg))
+
+            # Convert argument types as needed
+            converted_args = []
+            for i, arg in enumerate(all_args):
+                expected_type = fn.function_type.args[i]
+                converted = self._convert_type(arg, expected_type)
+                converted_args.append(converted)
+
+            return self.builder.call(fn, converted_args)
+
         first_param_type = fn.function_type.args[0]
 
         # Determine whether to pass by value or by pointer (auto-borrow)
