@@ -1,0 +1,496 @@
+# VirtIO Input Device Driver
+#
+# Implements a driver for VirtIO input devices (keyboard, mouse, tablet).
+# Uses Linux evdev event format over VirtIO transport.
+#
+# References:
+# - https://docs.oasis-open.org/virtio/virtio/v1.1/virtio-v1.1.html#x1-3850008
+# - https://www.kernel.org/doc/html/latest/input/event-codes.html
+
+import serial { prints, println, serial_print_hex, serial_print_hex8, serial_print_dec }
+import drivers.pci { PciDevice, pci_find_virtio, pci_find_virtio_nth, pci_enable_bus_master, pci_enable_io, VIRTIO_DEVICE_INPUT }
+import drivers.virtio.common { VirtioDevice, Virtqueue, VringDesc, vio_init_device, vio_device_ready, vio_get_features, vio_set_features, vio_features_ok, vio_setup_queue, vq_alloc_desc, vq_free_desc, vq_get_desc, vq_submit, vq_notify, vq_has_used, vq_get_used, vq_get_used_len, VRING_DESC_F_WRITE }
+import mm.heap { kalloc, kfree }
+import mm.vmm { vmm_virt_to_phys }
+import mm.pmm { pmm_alloc_page, PAGE_SIZE }
+
+# ============================================================================
+# VirtIO Input Config Select Values
+# ============================================================================
+
+const VIRTIO_INPUT_CFG_UNSET: u8 = 0x00
+const VIRTIO_INPUT_CFG_ID_NAME: u8 = 0x01
+const VIRTIO_INPUT_CFG_ID_SERIAL: u8 = 0x02
+const VIRTIO_INPUT_CFG_ID_DEVIDS: u8 = 0x03
+const VIRTIO_INPUT_CFG_PROP_BITS: u8 = 0x10
+const VIRTIO_INPUT_CFG_EV_BITS: u8 = 0x11
+const VIRTIO_INPUT_CFG_ABS_INFO: u8 = 0x12
+
+# ============================================================================
+# Linux Input Event Types
+# ============================================================================
+
+pub const EV_SYN: u16 = 0x00    # Synchronization events
+pub const EV_KEY: u16 = 0x01    # Key/button events
+pub const EV_REL: u16 = 0x02    # Relative axis (mouse movement)
+pub const EV_ABS: u16 = 0x03    # Absolute axis (touchscreen, tablet)
+
+# Synchronization codes
+pub const SYN_REPORT: u16 = 0   # End of event packet
+
+# ============================================================================
+# Key Codes (Linux input-event-codes.h subset)
+# ============================================================================
+
+pub const KEY_ESC: u16 = 1
+pub const KEY_1: u16 = 2
+pub const KEY_2: u16 = 3
+pub const KEY_3: u16 = 4
+pub const KEY_4: u16 = 5
+pub const KEY_5: u16 = 6
+pub const KEY_6: u16 = 7
+pub const KEY_7: u16 = 8
+pub const KEY_8: u16 = 9
+pub const KEY_9: u16 = 10
+pub const KEY_0: u16 = 11
+pub const KEY_MINUS: u16 = 12
+pub const KEY_EQUAL: u16 = 13
+pub const KEY_BACKSPACE: u16 = 14
+pub const KEY_TAB: u16 = 15
+pub const KEY_Q: u16 = 16
+pub const KEY_W: u16 = 17
+pub const KEY_E: u16 = 18
+pub const KEY_R: u16 = 19
+pub const KEY_T: u16 = 20
+pub const KEY_Y: u16 = 21
+pub const KEY_U: u16 = 22
+pub const KEY_I: u16 = 23
+pub const KEY_O: u16 = 24
+pub const KEY_P: u16 = 25
+pub const KEY_LEFTBRACE: u16 = 26
+pub const KEY_RIGHTBRACE: u16 = 27
+pub const KEY_ENTER: u16 = 28
+pub const KEY_LEFTCTRL: u16 = 29
+pub const KEY_A: u16 = 30
+pub const KEY_S: u16 = 31
+pub const KEY_D: u16 = 32
+pub const KEY_F: u16 = 33
+pub const KEY_G: u16 = 34
+pub const KEY_H: u16 = 35
+pub const KEY_J: u16 = 36
+pub const KEY_K: u16 = 37
+pub const KEY_L: u16 = 38
+pub const KEY_SEMICOLON: u16 = 39
+pub const KEY_APOSTROPHE: u16 = 40
+pub const KEY_GRAVE: u16 = 41
+pub const KEY_LEFTSHIFT: u16 = 42
+pub const KEY_BACKSLASH: u16 = 43
+pub const KEY_Z: u16 = 44
+pub const KEY_X: u16 = 45
+pub const KEY_C: u16 = 46
+pub const KEY_V: u16 = 47
+pub const KEY_B: u16 = 48
+pub const KEY_N: u16 = 49
+pub const KEY_M: u16 = 50
+pub const KEY_COMMA: u16 = 51
+pub const KEY_DOT: u16 = 52
+pub const KEY_SLASH: u16 = 53
+pub const KEY_RIGHTSHIFT: u16 = 54
+pub const KEY_KPASTERISK: u16 = 55
+pub const KEY_LEFTALT: u16 = 56
+pub const KEY_SPACE: u16 = 57
+pub const KEY_CAPSLOCK: u16 = 58
+pub const KEY_F1: u16 = 59
+pub const KEY_F2: u16 = 60
+pub const KEY_F3: u16 = 61
+pub const KEY_F4: u16 = 62
+pub const KEY_F5: u16 = 63
+pub const KEY_F6: u16 = 64
+pub const KEY_F7: u16 = 65
+pub const KEY_F8: u16 = 66
+pub const KEY_F9: u16 = 67
+pub const KEY_F10: u16 = 68
+pub const KEY_F11: u16 = 87
+pub const KEY_F12: u16 = 88
+
+# Arrow keys
+pub const KEY_UP: u16 = 103
+pub const KEY_LEFT: u16 = 105
+pub const KEY_RIGHT: u16 = 106
+pub const KEY_DOWN: u16 = 108
+
+# More modifier keys
+pub const KEY_RIGHTCTRL: u16 = 97
+pub const KEY_RIGHTALT: u16 = 100
+pub const KEY_HOME: u16 = 102
+pub const KEY_END: u16 = 107
+pub const KEY_PAGEUP: u16 = 104
+pub const KEY_PAGEDOWN: u16 = 109
+pub const KEY_INSERT: u16 = 110
+pub const KEY_DELETE: u16 = 111
+pub const KEY_LEFTMETA: u16 = 125
+pub const KEY_RIGHTMETA: u16 = 126
+
+# ============================================================================
+# Relative Axis Codes (for mouse)
+# ============================================================================
+
+pub const REL_X: u16 = 0x00
+pub const REL_Y: u16 = 0x01
+pub const REL_WHEEL: u16 = 0x08
+
+# ============================================================================
+# Mouse Button Codes
+# ============================================================================
+
+pub const BTN_LEFT: u16 = 0x110
+pub const BTN_RIGHT: u16 = 0x111
+pub const BTN_MIDDLE: u16 = 0x112
+
+# ============================================================================
+# VirtIO Input Event Structure (8 bytes)
+# ============================================================================
+
+pub struct VirtioInputEvent
+    event_type: u16     # EV_KEY, EV_REL, etc.
+    code: u16           # Key code or axis
+    value: i32          # 0=release, 1=press, 2=repeat, or axis value
+
+const VIRTIO_INPUT_EVENT_SIZE: u64 = 8
+
+# ============================================================================
+# Input Event Ring Buffer (for userspace)
+# ============================================================================
+
+const INPUT_RING_SIZE: i32 = 256
+
+struct InputRing
+    events: [256]VirtioInputEvent
+    head: i32       # Next slot to write
+    tail: i32       # Next slot to read
+    count: i32      # Number of events in buffer
+
+var g_input_ring: InputRing
+
+# ============================================================================
+# VirtIO Input Device Structure
+# ============================================================================
+
+pub struct VirtioInputDevice
+    virtio_dev: *VirtioDevice   # Underlying VirtIO device
+    event_queue: *Virtqueue     # Event virtqueue (queue 0)
+    status_queue: *Virtqueue    # Status virtqueue (queue 1)
+    event_buffers: *u8          # Pre-allocated event buffers
+    event_buffer_phys: u64      # Physical address of buffers
+    device_type: u8             # 0=unknown, 1=keyboard, 2=mouse, 3=tablet
+    _padding: [7]u8
+
+const VIRTIO_INPUT_DEVICE_SIZE: u64 = 48
+const NUM_EVENT_BUFFERS: i32 = 64
+
+# ============================================================================
+# Global Input Device
+# ============================================================================
+
+var input_device: *VirtioInputDevice = 0 as *VirtioInputDevice
+
+# ============================================================================
+# Ring Buffer Operations
+# ============================================================================
+
+fn ring_init()
+    g_input_ring.head = 0
+    g_input_ring.tail = 0
+    g_input_ring.count = 0
+
+fn ring_push(event: *VirtioInputEvent) -> bool
+    if g_input_ring.count >= INPUT_RING_SIZE
+        return false  # Buffer full
+
+    g_input_ring.events[g_input_ring.head] = *event
+    g_input_ring.head = (g_input_ring.head + 1) % INPUT_RING_SIZE
+    g_input_ring.count = g_input_ring.count + 1
+    return true
+
+pub fn ring_pop(event: *VirtioInputEvent) -> bool
+    if g_input_ring.count == 0
+        return false  # Buffer empty
+
+    *event = g_input_ring.events[g_input_ring.tail]
+    g_input_ring.tail = (g_input_ring.tail + 1) % INPUT_RING_SIZE
+    g_input_ring.count = g_input_ring.count - 1
+    return true
+
+pub fn ring_count() -> i32
+    return g_input_ring.count
+
+# ============================================================================
+# Device Initialization
+# ============================================================================
+
+pub fn virtio_input_init() -> i32
+    prints("[virtio-input] Initializing...\n")
+
+    # Initialize ring buffer
+    ring_init()
+
+    # Find VirtIO Input device
+    let pci_dev: *PciDevice = pci_find_virtio(VIRTIO_DEVICE_INPUT)
+    if pci_dev == 0 as *PciDevice
+        prints("[virtio-input] No device found\n")
+        return -1
+
+    prints("[virtio-input] Found device at PCI ")
+    serial_print_hex8((*pci_dev).bus)
+    prints(":")
+    serial_print_hex8((*pci_dev).device)
+    prints(".")
+    serial_print_hex8((*pci_dev).function)
+    prints("\n")
+
+    # Enable bus mastering and I/O space
+    pci_enable_bus_master(pci_dev)
+    pci_enable_io(pci_dev)
+
+    # Get I/O base address
+    let io_base: u16 = ((*pci_dev).bar[0] & 0xFFFC) as u16
+    prints("[virtio-input] I/O base: 0x")
+    serial_print_hex(io_base as u64)
+    prints("\n")
+
+    # Initialize VirtIO device
+    let virtio_dev: *VirtioDevice = vio_init_device(pci_dev)
+    if virtio_dev == 0 as *VirtioDevice
+        prints("[virtio-input] Failed to init VirtIO device\n")
+        return -1
+
+    # Allocate input device structure
+    input_device = kalloc(VIRTIO_INPUT_DEVICE_SIZE) as *VirtioInputDevice
+    if input_device == 0 as *VirtioInputDevice
+        prints("[virtio-input] Failed to allocate device struct\n")
+        return -1
+
+    (*input_device).virtio_dev = virtio_dev
+    (*input_device).device_type = 0
+
+    # Get device features (we don't need any special features for input)
+    let features: u32 = vio_get_features(virtio_dev)
+    vio_set_features(virtio_dev, 0)
+
+    # Complete feature negotiation (required for modern transport)
+    if vio_features_ok(virtio_dev) != 0
+        prints("[virtio-input] Feature negotiation failed\n")
+        kfree(input_device)
+        input_device = 0 as *VirtioInputDevice
+        return -1
+
+    # Setup event queue (queue 0) - receives events from device
+    let event_queue: *Virtqueue = vio_setup_queue(virtio_dev, 0)
+    if event_queue == 0 as *Virtqueue
+        prints("[virtio-input] Failed to setup event queue\n")
+        kfree(input_device)
+        input_device = 0 as *VirtioInputDevice
+        return -1
+
+    (*input_device).event_queue = event_queue
+
+    # Setup status queue (queue 1) - for LED status etc.
+    let status_queue: *Virtqueue = vio_setup_queue(virtio_dev, 1)
+    (*input_device).status_queue = status_queue
+
+    # Allocate event buffers for receiving events
+    let buf_size: u64 = (NUM_EVENT_BUFFERS as u64) * VIRTIO_INPUT_EVENT_SIZE
+    let buf_pages: u64 = (buf_size + PAGE_SIZE - 1) / PAGE_SIZE
+    let buf_phys: u64 = pmm_alloc_page()
+    if buf_phys == 0
+        prints("[virtio-input] Failed to allocate event buffers\n")
+        kfree(input_device)
+        input_device = 0 as *VirtioInputDevice
+        return -1
+
+    (*input_device).event_buffers = buf_phys as *u8
+    (*input_device).event_buffer_phys = buf_phys
+
+    # Pre-populate event queue with empty buffers
+    var i: i32 = 0
+    while i < NUM_EVENT_BUFFERS
+        let buf_offset: u64 = (i as u64) * VIRTIO_INPUT_EVENT_SIZE
+        let desc_idx: i32 = vq_alloc_desc(event_queue)
+        if desc_idx < 0
+            break
+
+        let desc: *VringDesc = vq_get_desc(event_queue, desc_idx as u16)
+        (*desc).addr = buf_phys + buf_offset
+        (*desc).len = VIRTIO_INPUT_EVENT_SIZE as u32
+        (*desc).flags = VRING_DESC_F_WRITE  # Device writes to this buffer
+        (*desc).next = 0
+
+        vq_submit(event_queue, desc_idx as u16)
+        i = i + 1
+
+    # Notify device that buffers are available
+    vq_notify(event_queue)
+
+    # Mark device as ready
+    vio_device_ready(virtio_dev)
+
+    prints("[virtio-input] Initialized with ")
+    serial_print_dec(i)
+    prints(" event buffers\n")
+
+    return 0
+
+# ============================================================================
+# Poll for Input Events
+# ============================================================================
+
+pub fn virtio_input_poll() -> i32
+    if input_device == 0 as *VirtioInputDevice
+        return 0
+
+    let vq: *Virtqueue = (*input_device).event_queue
+    var events_processed: i32 = 0
+
+    # Process all used buffers
+    while vq_has_used(vq)
+        let desc_idx: i32 = vq_get_used(vq)
+        if desc_idx < 0
+            break
+
+        let len: u32 = vq_get_used_len(vq)
+
+        # Get the event from the buffer
+        let buf_offset: u64 = (desc_idx as u64) * VIRTIO_INPUT_EVENT_SIZE
+        let event_ptr: *VirtioInputEvent = ((*input_device).event_buffer_phys + buf_offset) as *VirtioInputEvent
+
+        # Push to ring buffer (skip SYN_REPORT events)
+        if (*event_ptr).event_type != EV_SYN
+            ring_push(event_ptr)
+            events_processed = events_processed + 1
+
+        # Re-submit the buffer
+        let desc: *VringDesc = vq_get_desc(vq, desc_idx as u16)
+        (*desc).addr = (*input_device).event_buffer_phys + buf_offset
+        (*desc).len = VIRTIO_INPUT_EVENT_SIZE as u32
+        (*desc).flags = VRING_DESC_F_WRITE
+        (*desc).next = 0
+
+        vq_submit(vq, desc_idx as u16)
+
+    # Notify device if we re-submitted any buffers
+    if events_processed > 0
+        vq_notify(vq)
+
+    return events_processed
+
+# ============================================================================
+# Get Next Input Event (for syscall)
+# ============================================================================
+
+pub fn virtio_input_get_event(event: *VirtioInputEvent) -> bool
+    # First poll for new events
+    virtio_input_poll()
+
+    # Then try to get from ring buffer
+    return ring_pop(event)
+
+# ============================================================================
+# Check if Input Device is Available
+# ============================================================================
+
+pub fn virtio_input_available() -> bool
+    return input_device != 0 as *VirtioInputDevice
+
+# ============================================================================
+# Convert Key Code to ASCII (basic mapping)
+# ============================================================================
+
+pub fn keycode_to_ascii(code: u16, shift: bool) -> u8
+    # Number row
+    if code >= KEY_1 and code <= KEY_9
+        if shift
+            # Shift symbols: !@#$%^&*(
+            let symbols: [9]u8 = [33, 64, 35, 36, 37, 94, 38, 42, 40]
+            return symbols[(code - KEY_1) as i32]
+        return (48 + (code - KEY_1 + 1)) as u8  # '1' to '9'
+
+    if code == KEY_0
+        if shift
+            return 41  # ')'
+        return 48  # '0'
+
+    # Letters (QWERTY layout)
+    let qwerty_map: [26]u16 = [
+        KEY_Q, KEY_W, KEY_E, KEY_R, KEY_T, KEY_Y, KEY_U, KEY_I, KEY_O, KEY_P,
+        KEY_A, KEY_S, KEY_D, KEY_F, KEY_G, KEY_H, KEY_J, KEY_K, KEY_L,
+        KEY_Z, KEY_X, KEY_C, KEY_V, KEY_B, KEY_N, KEY_M
+    ]
+
+    var i: i32 = 0
+    while i < 26
+        if qwerty_map[i] == code
+            var base: u8 = 97  # 'a'
+            if shift
+                base = 65  # 'A'
+            return base + (i as u8)
+        i = i + 1
+
+    # Special keys
+    if code == KEY_SPACE
+        return 32
+    if code == KEY_ENTER
+        return 10  # '\n'
+    if code == KEY_TAB
+        return 9
+    if code == KEY_BACKSPACE
+        return 8
+    if code == KEY_ESC
+        return 27
+
+    # Punctuation - return shift or normal variant
+    if code == KEY_MINUS
+        if shift
+            return 95  # '_'
+        return 45  # '-'
+    if code == KEY_EQUAL
+        if shift
+            return 43  # '+'
+        return 61  # '='
+    if code == KEY_LEFTBRACE
+        if shift
+            return 123  # '{'
+        return 91  # '['
+    if code == KEY_RIGHTBRACE
+        if shift
+            return 125  # '}'
+        return 93  # ']'
+    if code == KEY_SEMICOLON
+        if shift
+            return 58  # ':'
+        return 59  # ';'
+    if code == KEY_APOSTROPHE
+        if shift
+            return 34  # '"'
+        return 39  # '\''
+    if code == KEY_GRAVE
+        if shift
+            return 126  # '~'
+        return 96  # '`'
+    if code == KEY_BACKSLASH
+        if shift
+            return 124  # '|'
+        return 92  # '\'
+    if code == KEY_COMMA
+        if shift
+            return 60  # '<'
+        return 44  # ','
+    if code == KEY_DOT
+        if shift
+            return 62  # '>'
+        return 46  # '.'
+    if code == KEY_SLASH
+        if shift
+            return 63  # '?'
+        return 47  # '/'
+
+    return 0  # Unknown

@@ -1,0 +1,109 @@
+# cat - Concatenate and display files
+#
+# Usage: cat [file...]
+#
+# Reads files sequentially and writes them to stdout.
+# If no files specified, reads from stdin.
+
+import ritzlib.sys {
+    sys_read, sys_write, sys_exit,
+    STDIN, STDOUT, STDERR
+}
+
+import ritzlib.str { strlen }
+
+# File open syscall (Harland-specific)
+# Kernel expects: path, path_len, flags
+const SYS_OPEN: i64 = 2
+const SYS_CLOSE: i64 = 3
+
+const O_RDONLY: i32 = 0
+
+extern fn syscall1(n: i64, a1: i64) -> i64
+extern fn syscall3(n: i64, a1: i64, a2: i64, a3: i64) -> i64
+
+fn sys_open(path: *u8, flags: i32) -> i32
+    let path_len: i64 = strlen(path)
+    return syscall3(SYS_OPEN, path as i64, path_len, flags as i64) as i32
+
+fn sys_close(fd: i32) -> i32
+    return syscall1(SYS_CLOSE, fd as i64) as i32
+
+# Print error message
+fn print_error(msg: *u8)
+    sys_write(STDERR, msg, strlen(msg))
+
+fn print_error_path(prefix: *u8, path: *u8, suffix: *u8)
+    print_error(prefix)
+    sys_write(STDERR, path, strlen(path))
+    print_error(suffix)
+
+# Cat a single file to stdout
+fn cat_file(path: *u8) -> i32
+    let fd: i32 = sys_open(path, O_RDONLY)
+    if fd < 0
+        print_error_path(c"cat: ", path, c": No such file or directory\n")
+        return 1
+
+    var buf: [4096]u8
+    var status: i32 = 0
+
+    var reading: bool = true
+    while reading
+        let n: i64 = sys_read(fd, @buf[0], 4096)
+        if n > 0
+            sys_write(STDOUT, @buf[0], n)
+        else if n == 0
+            reading = false
+        else
+            print_error_path(c"cat: ", path, c": read error\n")
+            status = 1
+            reading = false
+
+    sys_close(fd)
+    return status
+
+# Cat stdin to stdout
+fn cat_stdin() -> i32
+    var buf: [4096]u8
+
+    var reading: bool = true
+    while reading
+        let n: i64 = sys_read(STDIN, @buf[0], 4096)
+        if n > 0
+            sys_write(STDOUT, @buf[0], n)
+        else if n == 0
+            reading = false
+        else
+            print_error(c"cat: stdin: read error\n")
+            return 1
+
+    return 0
+
+# Main entry point
+# argc: argument count
+# argv: argument vector
+pub fn main(argc: i32, argv: **u8) -> i32
+    # If no files specified, read from stdin
+    if argc <= 1
+        return cat_stdin()
+
+    var status: i32 = 0
+    var i: i32 = 1
+
+    while i < argc
+        let path: *u8 = *(argv + i as i64)
+
+        # "-" means stdin
+        if *path == 45 and *(path + 1) == 0
+            let result: i32 = cat_stdin()
+            if result != 0
+                status = result
+        else
+            let result: i32 = cat_file(path)
+            if result != 0
+                status = result
+
+        i = i + 1
+
+    return status

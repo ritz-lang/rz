@@ -2,8 +2,11 @@
 #
 # Main network stack initialization, packet polling, and dispatch.
 # This is the central coordination point for all network layers.
+#
+# Uses the netdev abstraction layer to support multiple network backends
+# (VirtIO-net, ENA, etc) without protocol-level changes.
 
-import serial { prints, serial_print_dec }
+import serial { prints, serial_print_dec, serial_print }
 import net.types { ETHERTYPE_ARP, ETHERTYPE_IPV4, IP_PROTO_ICMP, IP_PROTO_UDP, IP_PROTO_TCP, IP_HEADER_SIZE, ETH_HEADER_SIZE, DHCP_SERVER_PORT, DHCP_CLIENT_PORT, UDP_HEADER_SIZE }
 import net.eth { eth_parse_header, EthHeader }
 import net.arp { arp_init, arp_handle_packet }
@@ -11,7 +14,7 @@ import net.ip { ip_init, ip_is_configured, ip_print_config, ip_get_header_len, i
 import net.icmp { icmp_handle_packet }
 import net.udp { udp_get_src_port, udp_get_dst_port }
 import net.dhcp { dhcp_discover, dhcp_handle_packet, dhcp_is_configured }
-import drivers.virtio.net { virtio_net_init, virtio_net_poll, virtio_net_is_ready }
+import drivers.netdev { NetDevice, netdev_init, netdev_get_default, netdev_poll, netdev_send, netdev_count, netdev_is_running, netdev_print_mac, netdev_type_name, netdev_get_mac }
 
 # ============================================================================
 # Network Stack State
@@ -19,6 +22,7 @@ import drivers.virtio.net { virtio_net_init, virtio_net_poll, virtio_net_is_read
 
 var net_rx_buf: [2048]u8
 var net_initialized: u8 = 0
+var net_device: *NetDevice = 0 as *NetDevice
 
 # ============================================================================
 # Initialization
@@ -31,11 +35,17 @@ pub fn net_stack_init() -> i32
     arp_init()
     ip_init()
 
-    # Initialize VirtIO-net driver
-    let result: i32 = virtio_net_init()
-    if result < 0
-        prints("[net] VirtIO-net init failed!\n")
-        return result
+    # Probe for network devices via netdev abstraction
+    let dev_count: i32 = netdev_init()
+    if dev_count <= 0
+        prints("[net] No network devices found!\n")
+        return -1
+
+    # Get the default network device
+    net_device = netdev_get_default()
+    if net_device == 0 as *NetDevice
+        prints("[net] Failed to get default network device!\n")
+        return -2
 
     net_initialized = 1
     prints("[net] Network stack initialized\n")
@@ -62,7 +72,8 @@ pub fn net_poll() -> i32
     if net_initialized == 0
         return 0
 
-    let len: i32 = virtio_net_poll(@net_rx_buf[0], 2048)
+    # Poll via netdev abstraction
+    let len: i32 = netdev_poll(net_device, @net_rx_buf[0], 2048)
     if len <= 0
         return 0
 
@@ -148,10 +159,25 @@ fn handle_udp_packet(udp_data: *u8, udp_len: u32, src_ip: *u8) -> i32
 # ============================================================================
 
 pub fn net_is_ready() -> bool
-    return net_initialized == 1 and virtio_net_is_ready() == 1
+    return net_initialized == 1 and net_device != 0 as *NetDevice and netdev_is_running(net_device)
 
 pub fn net_is_configured() -> bool
     return ip_is_configured()
+
+# Get the active network device
+pub fn net_get_device() -> *NetDevice
+    net_device
+
+# Get the MAC address of the active network device
+pub fn net_get_mac(mac_out: *u8)
+    netdev_get_mac(net_device, mac_out)
+    return
+
+# Send a packet through the active network device
+pub fn net_send(data: *u8, len: u32) -> i32
+    if net_device == 0 as *NetDevice
+        return -1
+    netdev_send(net_device, data, len)
 
 # ============================================================================
 # Debug
@@ -165,11 +191,20 @@ pub fn net_print_status()
     else
         prints("no\n")
 
-    prints("  VirtIO-net:  ")
-    if virtio_net_is_ready() == 1
-        prints("ready\n")
+    prints("  Device:      ")
+    if net_device != 0 as *NetDevice
+        serial_print(netdev_type_name(net_device))
+        prints(" (")
+        netdev_print_mac(net_device)
+        prints(")\n")
     else
-        prints("not ready\n")
+        prints("none\n")
+
+    prints("  Running:     ")
+    if net_device != 0 as *NetDevice and netdev_is_running(net_device)
+        prints("yes\n")
+    else
+        prints("no\n")
 
     prints("  DHCP:        ")
     if dhcp_is_configured()

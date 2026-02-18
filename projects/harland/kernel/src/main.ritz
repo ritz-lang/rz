@@ -49,6 +49,9 @@ import net.arp { arp_print_cache }
 import drivers.display.mod { SimpleFramebuffer, display_init, display_get_framebuffer, display_available, PIXEL_FORMAT_RGBX, PIXEL_FORMAT_BGRX }
 import drivers.display.framebuffer { fb_clear, fb_fill_rect, fb_fill_rect_rgb, fb_clear_rgb }
 
+# Input driver imports
+import drivers.virtio.input { VirtioInputEvent, virtio_input_init, virtio_input_poll, virtio_input_get_event, virtio_input_available, ring_count, EV_KEY, EV_REL, EV_ABS }
+
 # ============================================================================
 # Kernel Ring Buffer (Early Boot Debug)
 # ============================================================================
@@ -2086,6 +2089,10 @@ const SYS_WAIT: u64 = 22
 const SYS_GETPID: u64 = 23
 const SYS_YIELD: u64 = 24
 const SYS_SPAWN_ARGS: u64 = 25
+const SYS_GETCWD: u64 = 26
+const SYS_CHDIR: u64 = 27
+const SYS_INPUT_POLL: u64 = 30      # Poll for input events
+const SYS_INPUT_READ: u64 = 31      # Read next input event
 const SYS_ACPI_POWEROFF: u64 = 200
 const SYS_FB_INFO: u64 = 210      # Get framebuffer info
 const SYS_FB_MAP: u64 = 211       # Map framebuffer into userspace
@@ -2764,6 +2771,128 @@ fn sys_munmap_impl(addr: u64, length: u64) -> i64
     return 0
 
 # ============================================================================
+# Working Directory Syscalls
+# ============================================================================
+#
+# Per-process current working directory support.
+# CWD is stored as a simple path string (max 255 bytes).
+# These syscalls allow userspace to:
+#   1. Get the current working directory (getcwd)
+#   2. Change the current working directory (chdir)
+
+# Global CWD storage (single process for now)
+var g_cwd: [256]u8
+var g_cwd_len: u16 = 1
+
+# Initialize CWD to root
+fn init_cwd()
+    g_cwd[0] = 47  # '/'
+    g_cwd[1] = 0   # null terminator
+    g_cwd_len = 1
+
+# sys_getcwd_impl: Get current working directory
+# Args: buf = buffer to write path to, size = buffer size
+# Returns: length of path on success, -1 if buffer too small
+fn sys_getcwd_impl(buf: *u8, size: u64) -> i64
+    # Check buffer size (need room for null terminator)
+    if size < (g_cwd_len as u64 + 1)
+        return -1
+
+    # Copy CWD to user buffer
+    var i: u16 = 0
+    while i < g_cwd_len
+        *(buf + i as i64) = g_cwd[i]
+        i = i + 1
+    *(buf + g_cwd_len as i64) = 0  # Null terminate
+
+    return g_cwd_len as i64
+
+# sys_chdir_impl: Change current working directory
+# Args: path = path to new directory (null-terminated)
+# Returns: 0 on success, -1 on error
+fn sys_chdir_impl(path: *u8) -> i64
+    # Get path length
+    var path_len: i64 = 0
+    while *(path + path_len) != 0 and path_len < 255
+        path_len = path_len + 1
+
+    if path_len == 0 or path_len >= 255
+        return -1
+
+    # Verify the path exists in the namespace
+    let ns: *KNamespace = knamespace_get()
+    if ns == 0 as *KNamespace
+        return -1
+
+    let path_view: StrView = strview_from_ptr(path, path_len)
+
+    # Check if path exists (by trying to list it as a directory)
+    var entries: [1]KDirEntry
+    let count: i32 = knamespace_list(ns, @path_view, @entries[0], 1)
+
+    # knamespace_list returns -1 if path not found, >= 0 otherwise
+    if count < 0
+        return -1
+
+    # Path exists, update CWD
+    var i: i64 = 0
+    while i < path_len
+        g_cwd[i] = *(path + i)
+        i = i + 1
+    g_cwd[path_len] = 0
+    g_cwd_len = path_len as u16
+
+    return 0
+
+# ============================================================================
+# Input Device Syscalls
+# ============================================================================
+#
+# Provides userspace access to keyboard, mouse, and other input devices.
+# Uses VirtIO input device (virtio-keyboard, virtio-mouse).
+#
+# Event structure (8 bytes):
+#   u16 event_type - EV_KEY, EV_REL, EV_ABS, etc.
+#   u16 code       - Key code or axis code
+#   i32 value      - Press/release (0/1) or axis value
+
+# sys_input_poll: Poll for pending input events
+# Returns: number of events pending in the queue
+fn sys_input_poll_impl() -> i64
+    if not virtio_input_available()
+        return 0
+
+    # Poll the device for new events
+    virtio_input_poll()
+
+    # Return count of pending events
+    return ring_count() as i64
+
+# sys_input_read: Read next input event
+# Args: event_ptr = pointer to 8-byte VirtioInputEvent structure
+# Returns: 0 if event read successfully, -1 if no events pending
+fn sys_input_read_impl(event_ptr: *VirtioInputEvent) -> i64
+    if not virtio_input_available()
+        return -1
+
+    if event_ptr == 0 as *VirtioInputEvent
+        return -1
+
+    # Poll for new events first
+    virtio_input_poll()
+
+    # Try to read an event from the ring buffer
+    var event: VirtioInputEvent
+    if virtio_input_get_event(@event)
+        # Copy to userspace
+        (*event_ptr).event_type = event.event_type
+        (*event_ptr).code = event.code
+        (*event_ptr).value = event.value
+        return 0
+
+    return -1
+
+# ============================================================================
 # Framebuffer Syscalls (for Prism compositor)
 # ============================================================================
 #
@@ -3104,6 +3233,24 @@ pub fn syscall_handler(rax: u64, rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
     if rax == SYS_MUNMAP
         # munmap(addr, length)
         return sys_munmap_impl(rdi, rsi)
+
+    # Working directory syscalls
+    if rax == SYS_GETCWD
+        # getcwd(buf, size) -> length or -1
+        return sys_getcwd_impl(rdi as *u8, rsi)
+
+    if rax == SYS_CHDIR
+        # chdir(path) -> 0 or -1
+        return sys_chdir_impl(rdi as *u8)
+
+    # Input device syscalls
+    if rax == SYS_INPUT_POLL
+        # input_poll() -> number of events pending
+        return sys_input_poll_impl()
+
+    if rax == SYS_INPUT_READ
+        # input_read(event_ptr) -> 0 if event read, -1 if no events
+        return sys_input_read_impl(rdi as *VirtioInputEvent)
 
     # ACPI power management syscalls
     if rax == SYS_ACPI_POWEROFF
@@ -4323,6 +4470,14 @@ pub fn kernel_main(boot_info_addr: u64) -> i32
     if heap_check() != 0
         klog(c"    [HEAP CORRUPT after pci_init]\n")
 
+    # Initialize VirtIO Input device (keyboard/mouse) - after PCI enumeration
+    klog(c"  [..] VirtIO input device")
+    let input_result: i32 = virtio_input_init()
+    if input_result == 0
+        klog(c"\r  [OK] VirtIO input device\n")
+    else
+        klog(c"\r  [..] VirtIO input device (not found)\n")
+
     # Initialize VirtIO block device (needed for initramfs loading)
     klog(c"  [..] VirtIO block device")
     let early_blk_dev: *VirtioBlkDevice = virtio_blk_init()
@@ -4352,6 +4507,9 @@ pub fn kernel_main(boot_info_addr: u64) -> i32
         klog(c"  [..] Initial filesystem")
         initramfs_load()
         klog(c"\r  [OK] Initial filesystem\n")
+
+        # Initialize working directory to root
+        init_cwd()
 
         # Test filesystem operations
         fs_quick_test()

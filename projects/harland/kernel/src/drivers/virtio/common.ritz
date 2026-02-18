@@ -9,7 +9,8 @@ import io { inb, outb, inw, outw, inl, outl }
 import serial { prints, println, serial_print_hex, serial_print_dec }
 import mm.pmm { pmm_alloc_page, pmm_free_page, PAGE_SIZE }
 import mm.heap { kalloc, kfree }
-import drivers.pci { PciDevice, pci_enable_bus_master, pci_enable_memory, pci_enable_io }
+import mm.vmm { vmm_map_page, vmm_virt_to_phys, PTE_PRESENT, PTE_WRITABLE, PTE_CACHE_DISABLE }
+import drivers.pci { PciDevice, pci_enable_bus_master, pci_enable_memory, pci_enable_io, pci_find_capability_nth, pci_read_config8, pci_read_config16, pci_read_config32, PCI_CAP_VENDOR }
 
 # ============================================================================
 # VirtIO Device Status Bits
@@ -35,6 +36,44 @@ const VIRTIO_PCI_QUEUE_NOTIFY: u16 = 16    # W: Queue notify (16-bit)
 const VIRTIO_PCI_STATUS: u16 = 18          # R/W: Device status (8-bit)
 const VIRTIO_PCI_ISR: u16 = 19             # R: ISR status (8-bit)
 const VIRTIO_PCI_CONFIG: u16 = 20          # Device-specific config starts here
+
+# ============================================================================
+# VirtIO PCI Capability Types (Modern MMIO transport)
+# ============================================================================
+
+const VIRTIO_PCI_CAP_COMMON_CFG: u8 = 1    # Common configuration
+const VIRTIO_PCI_CAP_NOTIFY_CFG: u8 = 2    # Notifications
+const VIRTIO_PCI_CAP_ISR_CFG: u8 = 3       # ISR status
+const VIRTIO_PCI_CAP_DEVICE_CFG: u8 = 4    # Device-specific configuration
+const VIRTIO_PCI_CAP_PCI_CFG: u8 = 5       # PCI configuration access
+
+# VirtIO PCI capability structure offsets
+const VIRTIO_PCI_CAP_TYPE: u8 = 3          # Capability type
+const VIRTIO_PCI_CAP_BAR: u8 = 4           # BAR number
+const VIRTIO_PCI_CAP_OFFSET: u8 = 8        # Offset within BAR (32-bit)
+const VIRTIO_PCI_CAP_LENGTH: u8 = 12       # Length of structure (32-bit)
+const VIRTIO_PCI_CAP_NOTIFY_MULT: u8 = 16  # Notify multiplier (for NOTIFY_CFG only)
+
+# ============================================================================
+# VirtIO Modern Common Config Register Offsets (MMIO)
+# ============================================================================
+
+const VIRTIO_MMIO_DEVICE_FEATURES_SEL: u32 = 0x00  # W: Select features word
+const VIRTIO_MMIO_DEVICE_FEATURES: u32 = 0x04      # R: Device features
+const VIRTIO_MMIO_DRIVER_FEATURES_SEL: u32 = 0x08  # W: Select features word
+const VIRTIO_MMIO_DRIVER_FEATURES: u32 = 0x0C      # W: Driver features
+const VIRTIO_MMIO_QUEUE_SEL: u32 = 0x16            # W: Queue select (16-bit)
+const VIRTIO_MMIO_QUEUE_SIZE: u32 = 0x18           # R/W: Queue size (16-bit)
+const VIRTIO_MMIO_QUEUE_MSIX_VEC: u32 = 0x1A       # R/W: MSI-X vector
+const VIRTIO_MMIO_QUEUE_ENABLE: u32 = 0x1C         # R/W: Queue enable
+const VIRTIO_MMIO_QUEUE_NOTIFY_OFF: u32 = 0x1E     # R: Notify offset
+const VIRTIO_MMIO_QUEUE_DESC_LO: u32 = 0x20        # W: Desc table addr (low)
+const VIRTIO_MMIO_QUEUE_DESC_HI: u32 = 0x24        # W: Desc table addr (high)
+const VIRTIO_MMIO_QUEUE_AVAIL_LO: u32 = 0x28       # W: Avail ring addr (low)
+const VIRTIO_MMIO_QUEUE_AVAIL_HI: u32 = 0x2C       # W: Avail ring addr (high)
+const VIRTIO_MMIO_QUEUE_USED_LO: u32 = 0x30        # W: Used ring addr (low)
+const VIRTIO_MMIO_QUEUE_USED_HI: u32 = 0x34        # W: Used ring addr (high)
+const VIRTIO_MMIO_DEVICE_STATUS: u32 = 0x14        # R/W: Device status (8-bit)
 
 # ============================================================================
 # Virtqueue Descriptor Flags
@@ -98,8 +137,22 @@ pub struct Virtqueue
     # Tracking for processing completions
     last_used_idx: u16      # Last used index we processed
 
-    # I/O base for this device
+    # I/O base for this device (legacy)
     io_base: u16
+
+    # MMIO transport info
+    transport: u8           # VIO_TRANSPORT_LEGACY or VIO_TRANSPORT_MMIO
+    _padding: u8
+    mmio_notify: u64        # Notification MMIO base
+    notify_multiplier: u32  # Notify offset multiplier
+    notify_offset: u16      # Queue-specific notify offset
+
+# ============================================================================
+# VirtIO Transport Type
+# ============================================================================
+
+pub const VIO_TRANSPORT_LEGACY: u8 = 0    # Legacy port I/O transport
+pub const VIO_TRANSPORT_MMIO: u8 = 1      # Modern MMIO transport
 
 # ============================================================================
 # VirtIO Device Structure
@@ -107,11 +160,18 @@ pub struct Virtqueue
 
 pub struct VirtioDevice
     pci_dev: *PciDevice     # PCI device handle
-    io_base: u16            # I/O port base address
+    io_base: u16            # I/O port base address (legacy transport)
     num_queues: u16         # Number of virtqueues
     queues: [16]*Virtqueue  # Up to 16 queues per device
     status: u8              # Current device status
-    _padding: [3]u8
+    transport: u8           # VIO_TRANSPORT_LEGACY or VIO_TRANSPORT_MMIO
+    _padding: [2]u8
+    # Modern MMIO transport addresses (from PCI capabilities)
+    mmio_common: u64        # Common config MMIO base
+    mmio_notify: u64        # Notification MMIO base
+    mmio_isr: u64           # ISR status MMIO base
+    mmio_device: u64        # Device-specific MMIO base
+    notify_multiplier: u32  # Notify offset multiplier
 
 # ============================================================================
 # Size Constants
@@ -122,7 +182,7 @@ const VRING_DESC_SIZE: u64 = 16           # sizeof(VringDesc)
 const VRING_AVAIL_SIZE: u64 = 520         # 4 + 256*2 + padding
 const VRING_USED_ELEM_SIZE: u64 = 8       # sizeof(VringUsedElem)
 const VRING_USED_SIZE: u64 = 2060         # 4 + 256*8 + padding
-const VIRTIO_DEVICE_SIZE: u64 = 160       # sizeof(VirtioDevice)
+const VIRTIO_DEVICE_SIZE: u64 = 200       # sizeof(VirtioDevice)
 
 # ============================================================================
 # Ring Size Calculation
@@ -143,7 +203,7 @@ fn vring_size(num: u16) -> u64
     return first_aligned + used_size
 
 # ============================================================================
-# Device I/O Helpers
+# Device I/O Helpers (Legacy port I/O)
 # ============================================================================
 
 fn vio_read8(dev: *VirtioDevice, offset: u16) -> u8
@@ -165,15 +225,49 @@ fn vio_write32(dev: *VirtioDevice, offset: u16, value: u32)
     outl((*dev).io_base + offset, value)
 
 # ============================================================================
+# MMIO Helpers (Modern transport)
+# ============================================================================
+
+fn mmio_read8(addr: u64) -> u8
+    let ptr: *u8 = addr as *u8
+    return *ptr
+
+fn mmio_write8(addr: u64, value: u8)
+    let ptr: *u8 = addr as *u8
+    *ptr = value
+
+fn mmio_read16(addr: u64) -> u16
+    let ptr: *u16 = addr as *u16
+    return *ptr
+
+fn mmio_write16(addr: u64, value: u16)
+    let ptr: *u16 = addr as *u16
+    *ptr = value
+
+fn mmio_read32(addr: u64) -> u32
+    let ptr: *u32 = addr as *u32
+    return *ptr
+
+fn mmio_write32(addr: u64, value: u32)
+    let ptr: *u32 = addr as *u32
+    *ptr = value
+
+# ============================================================================
 # Device Status Management
 # ============================================================================
 
 pub fn vio_set_status(dev: *VirtioDevice, status: u8)
     (*dev).status = status
-    vio_write8(dev, VIRTIO_PCI_STATUS, status)
+    if (*dev).transport == VIO_TRANSPORT_MMIO
+        mmio_write8((*dev).mmio_common + VIRTIO_MMIO_DEVICE_STATUS as u64, status)
+    else
+        vio_write8(dev, VIRTIO_PCI_STATUS, status)
 
 pub fn vio_get_status(dev: *VirtioDevice) -> u8
-    return vio_read8(dev, VIRTIO_PCI_STATUS)
+    if (*dev).transport == VIO_TRANSPORT_MMIO
+        return mmio_read8((*dev).mmio_common + VIRTIO_MMIO_DEVICE_STATUS as u64)
+    else
+        return vio_read8(dev, VIRTIO_PCI_STATUS)
 
 pub fn vio_reset(dev: *VirtioDevice)
     vio_set_status(dev, 0)
@@ -181,32 +275,67 @@ pub fn vio_reset(dev: *VirtioDevice)
 
 pub fn vio_add_status(dev: *VirtioDevice, status: u8)
     (*dev).status = (*dev).status | status
-    vio_write8(dev, VIRTIO_PCI_STATUS, (*dev).status)
+    vio_set_status(dev, (*dev).status)
 
 # ============================================================================
 # Feature Negotiation
 # ============================================================================
 
 pub fn vio_get_features(dev: *VirtioDevice) -> u32
-    return vio_read32(dev, VIRTIO_PCI_HOST_FEATURES)
+    if (*dev).transport == VIO_TRANSPORT_MMIO
+        mmio_write32((*dev).mmio_common + VIRTIO_MMIO_DEVICE_FEATURES_SEL as u64, 0)
+        return mmio_read32((*dev).mmio_common + VIRTIO_MMIO_DEVICE_FEATURES as u64)
+    else
+        return vio_read32(dev, VIRTIO_PCI_HOST_FEATURES)
 
 pub fn vio_set_features(dev: *VirtioDevice, features: u32)
-    vio_write32(dev, VIRTIO_PCI_GUEST_FEATURES, features)
+    if (*dev).transport == VIO_TRANSPORT_MMIO
+        mmio_write32((*dev).mmio_common + VIRTIO_MMIO_DRIVER_FEATURES_SEL as u64, 0)
+        mmio_write32((*dev).mmio_common + VIRTIO_MMIO_DRIVER_FEATURES as u64, features)
+    else
+        vio_write32(dev, VIRTIO_PCI_GUEST_FEATURES, features)
+
+# Complete feature negotiation (call after vio_set_features for modern transport)
+# Returns 0 on success, -1 on failure
+pub fn vio_features_ok(dev: *VirtioDevice) -> i32
+    if (*dev).transport == VIO_TRANSPORT_MMIO
+        # Modern transport requires FEATURES_OK
+        vio_add_status(dev, VIRTIO_STATUS_FEATURES_OK)
+
+        # Verify device accepted features
+        let status: u8 = vio_get_status(dev)
+        if (status & VIRTIO_STATUS_FEATURES_OK) == 0
+            prints("[virtio] Device did not accept features!\n")
+            return -1
+        prints("[virtio] Features OK\n")
+    # Legacy transport doesn't need this step
+    return 0
 
 # ============================================================================
 # Queue Setup
 # ============================================================================
 
 pub fn vio_get_queue_size(dev: *VirtioDevice, queue_idx: u16) -> u16
-    vio_write16(dev, VIRTIO_PCI_QUEUE_SEL, queue_idx)
-    return vio_read16(dev, VIRTIO_PCI_QUEUE_SIZE)
+    if (*dev).transport == VIO_TRANSPORT_MMIO
+        mmio_write16((*dev).mmio_common + VIRTIO_MMIO_QUEUE_SEL as u64, queue_idx)
+        return mmio_read16((*dev).mmio_common + VIRTIO_MMIO_QUEUE_SIZE as u64)
+    else
+        vio_write16(dev, VIRTIO_PCI_QUEUE_SEL, queue_idx)
+        return vio_read16(dev, VIRTIO_PCI_QUEUE_SIZE)
 
 pub fn vio_setup_queue(dev: *VirtioDevice, queue_idx: u16) -> *Virtqueue
     # Select the queue
-    vio_write16(dev, VIRTIO_PCI_QUEUE_SEL, queue_idx)
+    if (*dev).transport == VIO_TRANSPORT_MMIO
+        mmio_write16((*dev).mmio_common + VIRTIO_MMIO_QUEUE_SEL as u64, queue_idx)
+    else
+        vio_write16(dev, VIRTIO_PCI_QUEUE_SEL, queue_idx)
 
     # Get queue size
-    let num: u16 = vio_read16(dev, VIRTIO_PCI_QUEUE_SIZE)
+    var num: u16 = 0
+    if (*dev).transport == VIO_TRANSPORT_MMIO
+        num = mmio_read16((*dev).mmio_common + VIRTIO_MMIO_QUEUE_SIZE as u64)
+    else
+        num = vio_read16(dev, VIRTIO_PCI_QUEUE_SIZE)
     if num == 0
         return 0 as *Virtqueue
 
@@ -221,6 +350,10 @@ pub fn vio_setup_queue(dev: *VirtioDevice, queue_idx: u16) -> *Virtqueue
     (*vq).io_base = (*dev).io_base
     (*vq).free_count = num
     (*vq).last_used_idx = 0
+    (*vq).transport = (*dev).transport
+    (*vq).mmio_notify = (*dev).mmio_notify
+    (*vq).notify_multiplier = (*dev).notify_multiplier
+    (*vq).notify_offset = 0  # Will be set below for MMIO
 
     # Calculate memory needed and allocate
     let ring_size: u64 = vring_size(num)
@@ -274,9 +407,31 @@ pub fn vio_setup_queue(dev: *VirtioDevice, queue_idx: u16) -> *Virtqueue
         (*desc).next = j + 1
         j = j + 1
 
-    # Tell device where the queue is (PFN = page frame number)
-    let pfn: u32 = (ring_phys / PAGE_SIZE) as u32
-    vio_write32(dev, VIRTIO_PCI_QUEUE_PFN, pfn)
+    # Tell device where the queue is
+    if (*dev).transport == VIO_TRANSPORT_MMIO
+        # Read queue-specific notify offset
+        let notify_off: u16 = mmio_read16((*dev).mmio_common + VIRTIO_MMIO_QUEUE_NOTIFY_OFF as u64)
+        (*vq).notify_offset = notify_off
+
+        # Modern: set descriptor, avail, used addresses separately
+        let desc_phys: u64 = ring_phys
+        let avail_phys: u64 = ring_phys + (num as u64) * VRING_DESC_SIZE
+        let used_offset: u64 = ((num as u64) * VRING_DESC_SIZE + 4 + (num as u64) * 2 + PAGE_SIZE - 1) & (0xFFFFFFFFFFFFFFFF ^ (PAGE_SIZE - 1))
+        let used_phys: u64 = ring_phys + used_offset
+
+        mmio_write32((*dev).mmio_common + VIRTIO_MMIO_QUEUE_DESC_LO as u64, (desc_phys & 0xFFFFFFFF) as u32)
+        mmio_write32((*dev).mmio_common + VIRTIO_MMIO_QUEUE_DESC_HI as u64, (desc_phys >> 32) as u32)
+        mmio_write32((*dev).mmio_common + VIRTIO_MMIO_QUEUE_AVAIL_LO as u64, (avail_phys & 0xFFFFFFFF) as u32)
+        mmio_write32((*dev).mmio_common + VIRTIO_MMIO_QUEUE_AVAIL_HI as u64, (avail_phys >> 32) as u32)
+        mmio_write32((*dev).mmio_common + VIRTIO_MMIO_QUEUE_USED_LO as u64, (used_phys & 0xFFFFFFFF) as u32)
+        mmio_write32((*dev).mmio_common + VIRTIO_MMIO_QUEUE_USED_HI as u64, (used_phys >> 32) as u32)
+
+        # Enable the queue
+        mmio_write16((*dev).mmio_common + VIRTIO_MMIO_QUEUE_ENABLE as u64, 1)
+    else
+        # Legacy: set PFN (page frame number)
+        let pfn: u32 = (ring_phys / PAGE_SIZE) as u32
+        vio_write32(dev, VIRTIO_PCI_QUEUE_PFN, pfn)
 
     return vq
 
@@ -328,7 +483,14 @@ pub fn vq_submit(vq: *Virtqueue, head_idx: u16)
 
 # Notify device that there are buffers available
 pub fn vq_notify(vq: *Virtqueue)
-    outw((*vq).io_base + VIRTIO_PCI_QUEUE_NOTIFY, (*vq).queue_index)
+    if (*vq).transport == VIO_TRANSPORT_MMIO
+        # Modern: write queue index to notify address
+        # notify_addr = mmio_notify + notify_offset * notify_multiplier
+        let notify_addr: u64 = (*vq).mmio_notify + (((*vq).notify_offset as u32) * (*vq).notify_multiplier) as u64
+        mmio_write16(notify_addr, (*vq).queue_index)
+    else
+        # Legacy: write to I/O port
+        outw((*vq).io_base + VIRTIO_PCI_QUEUE_NOTIFY, (*vq).queue_index)
 
 # Check if there are used buffers to process
 pub fn vq_has_used(vq: *Virtqueue) -> bool
@@ -371,18 +533,44 @@ pub fn vio_init_device(pci_dev: *PciDevice) -> *VirtioDevice
     (*dev).pci_dev = pci_dev
     (*dev).status = 0
     (*dev).num_queues = 0
+    (*dev).mmio_common = 0
+    (*dev).mmio_notify = 0
+    (*dev).mmio_isr = 0
+    (*dev).mmio_device = 0
+    (*dev).notify_multiplier = 0
 
-    # Get I/O base from BAR0
-    if (*pci_dev).bar_is_io[0] == 0
-        println("[virtio] BAR0 is not I/O space")
+    # Try legacy I/O transport first (BAR0 as I/O space)
+    if (*pci_dev).bar_is_io[0] != 0
+        (*dev).transport = VIO_TRANSPORT_LEGACY
+        (*dev).io_base = (*pci_dev).bar[0] as u16
+
+        # Enable PCI bus mastering and I/O space
+        pci_enable_bus_master(pci_dev)
+        pci_enable_io(pci_dev)
+
+        # Reset the device
+        vio_reset(dev)
+
+        # Acknowledge we found the device
+        vio_add_status(dev, VIRTIO_STATUS_ACKNOWLEDGE)
+
+        # Acknowledge we know how to drive it
+        vio_add_status(dev, VIRTIO_STATUS_DRIVER)
+
+        return dev
+
+    # Enable PCI bus mastering and memory space BEFORE accessing MMIO
+    pci_enable_bus_master(pci_dev)
+    pci_enable_memory(pci_dev)
+
+    # Try modern MMIO transport via PCI capabilities
+    let common_result: i32 = vio_find_mmio_caps(dev, pci_dev)
+    if common_result != 0
+        println("[virtio] BAR0 is not I/O space and no MMIO caps found")
         kfree(dev)
         return 0 as *VirtioDevice
 
-    (*dev).io_base = (*pci_dev).bar[0] as u16
-
-    # Enable PCI bus mastering and I/O space
-    pci_enable_bus_master(pci_dev)
-    pci_enable_io(pci_dev)
+    (*dev).transport = VIO_TRANSPORT_MMIO
 
     # Reset the device
     vio_reset(dev)
@@ -394,6 +582,63 @@ pub fn vio_init_device(pci_dev: *PciDevice) -> *VirtioDevice
     vio_add_status(dev, VIRTIO_STATUS_DRIVER)
 
     return dev
+
+# Find VirtIO MMIO capabilities and map them
+# NOTE: Modern VirtIO MMIO mapping currently has issues with vmm_map_page
+# The MMIO regions are found but the page table mapping doesn't work correctly.
+# This needs further investigation - see github issue for tracking.
+fn vio_find_mmio_caps(dev: *VirtioDevice, pci_dev: *PciDevice) -> i32
+    # Look for vendor capabilities (VirtIO uses PCI_CAP_VENDOR = 0x09)
+    var cap_idx: i32 = 0
+    var found_common: bool = false
+    var found_notify: bool = false
+
+    while cap_idx < 16
+        let cap_ptr: u8 = pci_find_capability_nth(pci_dev, PCI_CAP_VENDOR, cap_idx)
+        if cap_ptr == 0
+            break
+
+        # Read the VirtIO capability type (offset 3 in vendor cap)
+        let cap_type: u8 = pci_read_config8((*pci_dev).bus, (*pci_dev).device, (*pci_dev).function, cap_ptr + VIRTIO_PCI_CAP_TYPE)
+        let bar: u8 = pci_read_config8((*pci_dev).bus, (*pci_dev).device, (*pci_dev).function, cap_ptr + VIRTIO_PCI_CAP_BAR)
+        let offset: u32 = pci_read_config32((*pci_dev).bus, (*pci_dev).device, (*pci_dev).function, cap_ptr + VIRTIO_PCI_CAP_OFFSET)
+        let length: u32 = pci_read_config32((*pci_dev).bus, (*pci_dev).device, (*pci_dev).function, cap_ptr + VIRTIO_PCI_CAP_LENGTH)
+
+        # Get the BAR base address
+        let bar_base: u64 = (*pci_dev).bar[bar as i32]
+
+        # Map the MMIO region to a known virtual address
+        # We use the kernel high memory region starting at 0xFFFFFFFF90000000
+        var virt_base: u64 = 0xFFFFFFFF90000000 + ((bar as u64) * 0x1000000)
+        virt_base = virt_base + (offset as u64)
+
+        # Map the physical page
+        let phys_page: u64 = (bar_base + (offset as u64)) & 0xFFFFFFFFFFFFF000
+        let virt_page: u64 = virt_base & 0xFFFFFFFFFFFFF000
+        let page_offset: u64 = (bar_base + (offset as u64)) & 0xFFF
+        let map_result: i32 = vmm_map_page(virt_page, phys_page, PTE_PRESENT | PTE_WRITABLE | PTE_CACHE_DISABLE)
+
+        # Store the virtual address with page offset
+        let mapped_addr: u64 = virt_page + page_offset
+
+        if cap_type == VIRTIO_PCI_CAP_COMMON_CFG
+            (*dev).mmio_common = mapped_addr
+            found_common = true
+        else if cap_type == VIRTIO_PCI_CAP_NOTIFY_CFG
+            (*dev).mmio_notify = mapped_addr
+            # Read notify multiplier
+            (*dev).notify_multiplier = pci_read_config32((*pci_dev).bus, (*pci_dev).device, (*pci_dev).function, cap_ptr + VIRTIO_PCI_CAP_NOTIFY_MULT)
+            found_notify = true
+        else if cap_type == VIRTIO_PCI_CAP_ISR_CFG
+            (*dev).mmio_isr = mapped_addr
+        else if cap_type == VIRTIO_PCI_CAP_DEVICE_CFG
+            (*dev).mmio_device = mapped_addr
+
+        cap_idx = cap_idx + 1
+
+    if found_common and found_notify
+        return 0
+    return -1
 
 # Finalize device initialization (call after feature negotiation and queue setup)
 pub fn vio_device_ready(dev: *VirtioDevice) -> i32
@@ -409,15 +654,30 @@ pub fn vio_device_ready(dev: *VirtioDevice) -> i32
 # ============================================================================
 
 pub fn vio_read_config8(dev: *VirtioDevice, offset: u16) -> u8
-    return inb((*dev).io_base + VIRTIO_PCI_CONFIG + offset)
+    if (*dev).transport == VIO_TRANSPORT_MMIO
+        return mmio_read8((*dev).mmio_device + (offset as u64))
+    else
+        return inb((*dev).io_base + VIRTIO_PCI_CONFIG + offset)
 
 pub fn vio_read_config16(dev: *VirtioDevice, offset: u16) -> u16
-    return inw((*dev).io_base + VIRTIO_PCI_CONFIG + offset)
+    if (*dev).transport == VIO_TRANSPORT_MMIO
+        return mmio_read16((*dev).mmio_device + (offset as u64))
+    else
+        return inw((*dev).io_base + VIRTIO_PCI_CONFIG + offset)
 
 pub fn vio_read_config32(dev: *VirtioDevice, offset: u16) -> u32
-    return inl((*dev).io_base + VIRTIO_PCI_CONFIG + offset)
+    if (*dev).transport == VIO_TRANSPORT_MMIO
+        return mmio_read32((*dev).mmio_device + (offset as u64))
+    else
+        return inl((*dev).io_base + VIRTIO_PCI_CONFIG + offset)
 
 pub fn vio_read_config64(dev: *VirtioDevice, offset: u16) -> u64
-    let low: u32 = inl((*dev).io_base + VIRTIO_PCI_CONFIG + offset)
-    let high: u32 = inl((*dev).io_base + VIRTIO_PCI_CONFIG + offset + 4)
+    var low: u32 = 0
+    var high: u32 = 0
+    if (*dev).transport == VIO_TRANSPORT_MMIO
+        low = mmio_read32((*dev).mmio_device + (offset as u64))
+        high = mmio_read32((*dev).mmio_device + (offset as u64) + 4)
+    else
+        low = inl((*dev).io_base + VIRTIO_PCI_CONFIG + offset)
+        high = inl((*dev).io_base + VIRTIO_PCI_CONFIG + offset + 4)
     return ((high as u64) << 32) | (low as u64)

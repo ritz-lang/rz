@@ -1,0 +1,257 @@
+# Network Device Abstraction Layer
+#
+# Provides a unified interface for network devices regardless of the
+# underlying driver (VirtIO-net, ENA, etc).
+#
+# This abstraction allows higher-level code (network stack, sockets)
+# to work with any network device without knowing the specifics.
+#
+# Usage:
+#   netdev_init()                    # Probe for network devices
+#   let dev = netdev_get_default()   # Get default device (first found)
+#   netdev_send(dev, data, len)      # Send packet
+#   netdev_poll(dev, buf, max_len)   # Receive packet
+
+import serial { prints, println, serial_print_dec, serial_print_hex8, serial_write_byte }
+import drivers.virtio.net { VirtioNetDevice, virtio_net_init, virtio_net_send, virtio_net_poll, virtio_net_is_ready, virtio_net_get_mac, virtio_net_get_device }
+import drivers.ena.device { EnaDevice, ena_init, ena_send, ena_poll, ena_is_ready, ena_get_mac, ena_get_device }
+
+# ============================================================================
+# Network Device Types
+# ============================================================================
+
+# Network device type enumeration
+pub const NETDEV_TYPE_NONE: u8 = 0
+pub const NETDEV_TYPE_VIRTIO: u8 = 1
+pub const NETDEV_TYPE_ENA: u8 = 2
+
+# Network device structure
+# This is a thin wrapper that knows which driver to call
+pub struct NetDevice
+    dev_type: u8              # NETDEV_TYPE_*
+    _padding1: [3]u8
+    device_idx: i32           # Device index within driver (for multi-device support)
+    handle: u64               # Opaque handle to underlying device
+    mac: [6]u8                # MAC address
+    _padding2: [2]u8
+    flags: u32                # Device flags
+    mtu: u32                  # Maximum transmission unit
+
+pub const NETDEV_SIZE: u64 = 32
+
+# Device flags
+pub const NETDEV_FLAG_UP: u32 = 1       # Device is up
+pub const NETDEV_FLAG_RUNNING: u32 = 2  # Device is running
+pub const NETDEV_FLAG_PROMISC: u32 = 4  # Promiscuous mode
+
+# ============================================================================
+# Global State
+# ============================================================================
+
+const MAX_NET_DEVICES: i32 = 8
+
+var net_devices: [8]NetDevice
+var net_device_count: i32 = 0
+var default_device_idx: i32 = -1  # First available device
+
+# ============================================================================
+# Initialization
+# ============================================================================
+
+# Probe for network devices
+# Tries VirtIO-net first, then ENA
+# Returns number of devices found
+pub fn netdev_init() -> i32
+    net_device_count = 0
+    default_device_idx = -1
+
+    # Try VirtIO-net first (QEMU environment)
+    let virtio_result: i32 = virtio_net_init()
+    if virtio_result == 0
+        let vdev: *VirtioNetDevice = virtio_net_get_device()
+        if vdev != 0 as *VirtioNetDevice
+            let idx: i32 = net_device_count
+            net_devices[idx].dev_type = NETDEV_TYPE_VIRTIO
+            net_devices[idx].device_idx = 0
+            net_devices[idx].handle = vdev as u64
+            net_devices[idx].flags = NETDEV_FLAG_UP | NETDEV_FLAG_RUNNING
+            net_devices[idx].mtu = 1500
+
+            # Copy MAC address
+            virtio_net_get_mac(@net_devices[idx].mac[0])
+
+            net_device_count = net_device_count + 1
+            if default_device_idx < 0
+                default_device_idx = idx
+
+            prints("[netdev] Registered VirtIO-net device, MAC: ")
+            netdev_print_mac(@net_devices[idx])
+            prints("\n")
+
+    # Try ENA (EC2 environment)
+    let ena_result: i32 = ena_init()
+    if ena_result == 0
+        let edev: *EnaDevice = ena_get_device()
+        if edev != 0 as *EnaDevice
+            let idx: i32 = net_device_count
+            net_devices[idx].dev_type = NETDEV_TYPE_ENA
+            net_devices[idx].device_idx = 0
+            net_devices[idx].handle = edev as u64
+            net_devices[idx].flags = NETDEV_FLAG_UP | NETDEV_FLAG_RUNNING
+            net_devices[idx].mtu = 1500
+
+            # Copy MAC address
+            ena_get_mac(@net_devices[idx].mac[0])
+
+            net_device_count = net_device_count + 1
+            if default_device_idx < 0
+                default_device_idx = idx
+
+            prints("[netdev] Registered ENA device, MAC: ")
+            netdev_print_mac(@net_devices[idx])
+            prints("\n")
+
+    prints("[netdev] Found ")
+    serial_print_dec(net_device_count as u64)
+    prints(" network device(s)\n")
+
+    net_device_count
+
+# ============================================================================
+# Device Access
+# ============================================================================
+
+# Get the default network device (first available)
+pub fn netdev_get_default() -> *NetDevice
+    if default_device_idx < 0
+        return 0 as *NetDevice
+    @net_devices[default_device_idx]
+
+# Get network device by index
+pub fn netdev_get(idx: i32) -> *NetDevice
+    if idx < 0 or idx >= net_device_count
+        return 0 as *NetDevice
+    @net_devices[idx]
+
+# Get number of network devices
+pub fn netdev_count() -> i32
+    net_device_count
+
+# ============================================================================
+# Network I/O Operations
+# ============================================================================
+
+# Send packet through a network device
+# data: Packet data (Ethernet frame)
+# len: Length of packet
+# Returns: 0 on success, negative on error
+pub fn netdev_send(dev: *NetDevice, data: *u8, len: u32) -> i32
+    if dev == 0 as *NetDevice
+        return -1
+
+    if (*dev).dev_type == NETDEV_TYPE_VIRTIO
+        return virtio_net_send(data, len)
+
+    else if (*dev).dev_type == NETDEV_TYPE_ENA
+        return ena_send(data, len)
+
+    -3  # Unknown device type
+
+# Poll for received packets
+# buf: Buffer to receive into
+# max_len: Maximum bytes to read
+# Returns: Number of bytes received, 0 if no packet, negative on error
+pub fn netdev_poll(dev: *NetDevice, buf: *u8, max_len: u32) -> i32
+    if dev == 0 as *NetDevice
+        return -1
+
+    if (*dev).dev_type == NETDEV_TYPE_VIRTIO
+        return virtio_net_poll(buf, max_len)
+
+    else if (*dev).dev_type == NETDEV_TYPE_ENA
+        return ena_poll(buf, max_len)
+
+    -3  # Unknown device type
+
+# ============================================================================
+# Device Properties
+# ============================================================================
+
+# Get MAC address
+pub fn netdev_get_mac(dev: *NetDevice, mac_out: *u8)
+    if dev == 0 as *NetDevice
+        var i: i32 = 0
+        while i < 6
+            *(mac_out + i as i64) = 0
+            i = i + 1
+        return
+
+    var i: i32 = 0
+    while i < 6
+        *(mac_out + i as i64) = (*dev).mac[i]
+        i = i + 1
+
+# Get device MTU
+pub fn netdev_get_mtu(dev: *NetDevice) -> u32
+    if dev == 0 as *NetDevice
+        return 0
+    (*dev).mtu
+
+# Check if device is up
+pub fn netdev_is_up(dev: *NetDevice) -> bool
+    if dev == 0 as *NetDevice
+        return false
+    ((*dev).flags & NETDEV_FLAG_UP) != 0
+
+# Check if device is running
+pub fn netdev_is_running(dev: *NetDevice) -> bool
+    if dev == 0 as *NetDevice
+        return false
+    ((*dev).flags & NETDEV_FLAG_RUNNING) != 0
+
+# Get device type
+pub fn netdev_type(dev: *NetDevice) -> u8
+    if dev == 0 as *NetDevice
+        return NETDEV_TYPE_NONE
+    (*dev).dev_type
+
+# Get device type as string
+pub fn netdev_type_name(dev: *NetDevice) -> *u8
+    if dev == 0 as *NetDevice
+        return c"none"
+    if (*dev).dev_type == NETDEV_TYPE_VIRTIO
+        return c"virtio-net"
+    if (*dev).dev_type == NETDEV_TYPE_ENA
+        return c"ena"
+    c"unknown"
+
+# ============================================================================
+# Utility Functions
+# ============================================================================
+
+# Print MAC address
+pub fn netdev_print_mac(dev: *NetDevice)
+    if dev == 0 as *NetDevice
+        prints("00:00:00:00:00:00")
+        return
+
+    let hex_chars: *u8 = c"0123456789ABCDEF"
+    var i: i32 = 0
+    while i < 6
+        if i > 0
+            prints(":")
+        let byte: u8 = (*dev).mac[i]
+        let hi: u8 = (byte >> 4) & 0x0F
+        let lo: u8 = byte & 0x0F
+        serial_write_byte(*(hex_chars + hi as i64))
+        serial_write_byte(*(hex_chars + lo as i64))
+        i = i + 1
+
+# Check if any network device is ready
+pub fn netdev_any_ready() -> bool
+    var i: i32 = 0
+    while i < net_device_count
+        if netdev_is_running(@net_devices[i])
+            return true
+        i = i + 1
+    false
