@@ -50,7 +50,7 @@ export RITZ_PATH=$PWD/projects
 |---------|-------------|
 | **valet** | Async HTTP server — io_uring backend, TLS termination, static files, reverse proxy |
 | **zeus** | Process runner — zero-copy IPC, worker pool management, graceful restarts |
-| **spire** | Web framework — MVRSPT pattern (Model-View-Repo-Service-Presenter-Template), routing, middleware |
+| **spire** | Web framework — MVRSPT pattern (Model-View-Repo-Service-Presenter-Test), test-driven routing and middleware |
 
 ### Data & Storage
 
