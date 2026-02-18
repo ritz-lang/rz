@@ -73,7 +73,7 @@ export RITZ_PATH=$PWD/projects
 
 | Project | Description |
 |---------|-------------|
-| **tempest** | Web browser — multi-process architecture, sandboxing, tab management |
+| **tempest** | Web browser — multi-process architecture, built on lexis/sage/iris/angelo, the ultimate Ritz stress test |
 | **lexis** | HTML/CSS parser — HTML5-compliant tokenizer and tree builder, CSS selectors |
 | **sage** | JavaScript engine — bytecode compiler, garbage collector, ES6+ support |
 
@@ -81,10 +81,10 @@ export RITZ_PATH=$PWD/projects
 
 | Project | Description |
 |---------|-------------|
-| **nexus** | Knowledge base — wiki with tree-structured documents, full-text search |
-| **spectree** | Spec tree — hierarchical planning and specification management |
+| **nexus** | Official Ritz wiki — built on the full stack (mausoleum → tome → spire → zeus → valet), serves as living documentation |
+| **spectree** | Specification tree — hierarchical specs and actions that drive each other, planning tool |
 | **indium** | Harland distribution — packaging, installation, system images |
-| **rzsh** | Ritz shell — command-line interface with history, line editing, job control |
+| **rzsh** | Ritz shell — terminal shell with raw mode input, line editing, history, runs on Linux and Harland |
 
 ## Architecture
 
