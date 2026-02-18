@@ -48,6 +48,10 @@ build_binaries() {
     log "Building nexus..."
     python3 projects/ritz/build.py build projects/nexus --release --no-cache 2>&1 | tail -5
 
+    # Build valet
+    log "Building valet..."
+    python3 projects/ritz/build.py build projects/valet --release --no-cache 2>&1 | tail -5
+
     # Verify binaries exist
     if [[ ! -f "projects/mausoleum/build/release/mausoleum" ]]; then
         # Fall back to debug build
@@ -55,10 +59,12 @@ build_binaries() {
         MAUSOLEUM_BIN="projects/mausoleum/build/debug/mausoleum"
         ZEUS_BIN="projects/zeus/build/debug/zeus"
         NEXUS_BIN="projects/nexus/build/debug/nexus"
+        VALET_BIN="projects/valet/build/debug/valet"
     else
         MAUSOLEUM_BIN="projects/mausoleum/build/release/mausoleum"
         ZEUS_BIN="projects/zeus/build/release/zeus"
         NEXUS_BIN="projects/nexus/build/release/nexus"
+        VALET_BIN="projects/valet/build/release/valet"
     fi
 
     if [[ ! -f "$PROJECT_ROOT/$MAUSOLEUM_BIN" ]]; then
@@ -70,9 +76,12 @@ build_binaries() {
     if [[ ! -f "$PROJECT_ROOT/$NEXUS_BIN" ]]; then
         error "Nexus binary not found at $NEXUS_BIN"
     fi
+    if [[ ! -f "$PROJECT_ROOT/$VALET_BIN" ]]; then
+        error "Valet binary not found at $VALET_BIN"
+    fi
 
     log "Binaries ready:"
-    ls -lh "$PROJECT_ROOT/$MAUSOLEUM_BIN" "$PROJECT_ROOT/$ZEUS_BIN" "$PROJECT_ROOT/$NEXUS_BIN"
+    ls -lh "$PROJECT_ROOT/$MAUSOLEUM_BIN" "$PROJECT_ROOT/$ZEUS_BIN" "$PROJECT_ROOT/$NEXUS_BIN" "$PROJECT_ROOT/$VALET_BIN"
 }
 
 # Run terraform
@@ -123,10 +132,12 @@ provision() {
         MAUSOLEUM_BIN="$PROJECT_ROOT/projects/mausoleum/build/release/mausoleum"
         NEXUS_BIN="$PROJECT_ROOT/projects/nexus/build/release/nexus"
         ZEUS_BIN="$PROJECT_ROOT/projects/zeus/build/release/zeus"
+        VALET_BIN="$PROJECT_ROOT/projects/valet/build/release/valet"
     else
         MAUSOLEUM_BIN="$PROJECT_ROOT/projects/mausoleum/build/debug/mausoleum"
         NEXUS_BIN="$PROJECT_ROOT/projects/nexus/build/debug/nexus"
         ZEUS_BIN="$PROJECT_ROOT/projects/zeus/build/debug/zeus"
+        VALET_BIN="$PROJECT_ROOT/projects/valet/build/debug/valet"
     fi
 
     SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
@@ -152,14 +163,17 @@ provision() {
     $SCP "$MAUSOLEUM_BIN" ubuntu@"$IP":/opt/ritz/bin/mausoleum
     $SCP "$NEXUS_BIN" ubuntu@"$IP":/opt/ritz/bin/nexus
     $SCP "$ZEUS_BIN" ubuntu@"$IP":/opt/ritz/bin/zeus
+    $SCP "$VALET_BIN" ubuntu@"$IP":/opt/ritz/bin/valet
     $SSH "chmod +x /opt/ritz/bin/*"
 
     # Copy systemd services
     log "Installing systemd services..."
     $SCP "$SYSTEMD_DIR/mausoleum.service" ubuntu@"$IP":/tmp/
     $SCP "$SYSTEMD_DIR/zeus.service" ubuntu@"$IP":/tmp/
+    $SCP "$SYSTEMD_DIR/valet.service" ubuntu@"$IP":/tmp/
     $SSH "sudo mv /tmp/mausoleum.service /etc/systemd/system/"
     $SSH "sudo mv /tmp/zeus.service /etc/systemd/system/"
+    $SSH "sudo mv /tmp/valet.service /etc/systemd/system/"
 
     # Fix permissions for mausoleum data dir
     log "Setting up permissions..."
@@ -169,30 +183,33 @@ provision() {
     # Reload systemd and start services
     log "Starting services..."
     $SSH "sudo systemctl daemon-reload"
-    $SSH "sudo systemctl enable mausoleum zeus"
+    $SSH "sudo systemctl enable mausoleum zeus valet"
     $SSH "sudo systemctl start mausoleum"
     sleep 2
     $SSH "sudo systemctl start zeus"
+    sleep 2
+    $SSH "sudo systemctl start valet"
 
     # Verify services
     log "Verifying services..."
     sleep 3
     $SSH "sudo systemctl status mausoleum --no-pager" || true
     $SSH "sudo systemctl status zeus --no-pager" || true
+    $SSH "sudo systemctl status valet --no-pager" || true
 
     # Check if Zeus workers are running
     log "Checking Zeus workers..."
     $SSH "pgrep -a nexus" || true
+    $SSH "pgrep -a valet" || true
 
     echo ""
     log "Deployment complete!"
     echo ""
+    echo "  URL:       http://$IP/"
     echo "  SSH:       ssh ubuntu@$IP"
+    echo "  Valet:     ssh ubuntu@$IP 'sudo journalctl -u valet -f'"
     echo "  Zeus logs: ssh ubuntu@$IP 'sudo journalctl -u zeus -f'"
     echo "  M7M logs:  ssh ubuntu@$IP 'sudo journalctl -u mausoleum -f'"
-    echo ""
-    echo "  NOTE: HTTP frontend (Valet→Zeus integration) not yet implemented."
-    echo "        Zeus workers are running but need Valet to dispatch HTTP requests."
     echo ""
 }
 
