@@ -719,6 +719,15 @@ class Monomorphizer:
                 inner_name = key[7:]
                 inner = rast.NamedType(None, inner_name, [])
                 result.append(rast.PtrType(None, inner, True))
+            # Handle reference types
+            elif key.startswith("ref_"):
+                inner_name = key[4:]
+                inner = rast.NamedType(None, inner_name, [])
+                result.append(rast.RefType(None, inner, False))
+            elif key.startswith("refmut_"):
+                inner_name = key[7:]
+                inner = rast.NamedType(None, inner_name, [])
+                result.append(rast.RefType(None, inner, True))
             else:
                 result.append(rast.NamedType(None, key, []))
         return result
