@@ -2846,7 +2846,16 @@ class LLVMEmitter:
                 # Set expected type for closure inference if return type is a function type
                 if self.current_fn_def and isinstance(self.current_fn_def.ret_type, rast.FnType):
                     self.closure_expected_type = self.current_fn_def.ret_type
-                val = self._emit_expr(stmt.value)
+
+                # Check if this is an enum variant constructor that needs type context
+                # This handles return None, return Some(x), etc. for generic enum types
+                if (self._is_enum_variant_call(stmt.value) and
+                    self.current_fn_def and
+                    isinstance(self.current_fn_def.ret_type, rast.NamedType)):
+                    # Use function return type to construct the correct variant
+                    val = self._emit_enum_variant_with_type(stmt.value, self.current_fn_def.ret_type.name)
+                else:
+                    val = self._emit_expr(stmt.value)
                 self.closure_expected_type = None  # Clear context
                 val = self._convert_type(val, ret_type)
                 # Emit drops for all scopes before return (excluding moved variable)
