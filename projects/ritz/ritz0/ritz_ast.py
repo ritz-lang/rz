@@ -482,6 +482,44 @@ class HeapExpr(Expr):
 
 
 @dataclass
+class ContinueExpr(Expr):
+    """Continue as an expression (for use in match arms).
+
+    Has the never type (!) since it diverges.
+    """
+    pass
+
+
+@dataclass
+class BreakExpr(Expr):
+    """Break as an expression (for use in match arms).
+
+    Has the never type (!) since it diverges.
+    """
+    pass
+
+
+@dataclass
+class ReturnExpr(Expr):
+    """Return as an expression (for use in match arms).
+
+    Has the never type (!) since it diverges.
+    """
+    value: Optional[Expr] = None
+
+
+@dataclass
+class AssignExpr(Expr):
+    """Assignment as an expression (for use in match arms).
+
+    Evaluates to the assigned value. Used for side-effect assignments:
+        Some(x) => self.field = x
+    """
+    target: Expr
+    value: Expr
+
+
+@dataclass
 class ClosureParam:
     """A closure parameter: name with optional type."""
     name: str
@@ -576,6 +614,13 @@ class LetStmt(Stmt):
     name: str
     type: Optional[Type]
     value: Optional[Expr]
+
+
+@dataclass
+class LetTupleStmt(Stmt):
+    """Tuple destructuring: let (a, b, c) = expr."""
+    names: List[str]
+    value: Expr
 
 
 @dataclass

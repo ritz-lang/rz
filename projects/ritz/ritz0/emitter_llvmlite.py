@@ -2971,6 +2971,24 @@ class LLVMEmitter:
                     self.ritz_types[stmt.name] = inferred_ritz_type
             return None
 
+        elif isinstance(stmt, rast.LetTupleStmt):
+            # Tuple destructuring: let (a, b, c) = expr
+            # Emit the tuple expression
+            tuple_val = self._emit_expr(stmt.value)
+
+            # Extract each element and bind to the corresponding name
+            if not isinstance(tuple_val.type, ir.LiteralStructType):
+                raise ValueError(f"Cannot destructure non-tuple type: {tuple_val.type}")
+
+            if len(stmt.names) != len(tuple_val.type.elements):
+                raise ValueError(f"Tuple destructuring mismatch: expected {len(tuple_val.type.elements)} "
+                               f"elements, got {len(stmt.names)} names")
+
+            for i, name in enumerate(stmt.names):
+                elem_val = self.builder.extract_value(tuple_val, i)
+                self.params[name] = (elem_val, elem_val.type)
+            return None
+
         elif isinstance(stmt, rast.AssignStmt):
             val = self._emit_expr(stmt.value)
             if isinstance(stmt.target, rast.Ident):
@@ -4343,6 +4361,21 @@ class LLVMEmitter:
         elif isinstance(expr, rast.HeapExpr):
             return self._emit_heap_expr(expr)
 
+        elif isinstance(expr, rast.ContinueExpr):
+            return self._emit_continue_expr(expr)
+
+        elif isinstance(expr, rast.BreakExpr):
+            return self._emit_break_expr(expr)
+
+        elif isinstance(expr, rast.ReturnExpr):
+            return self._emit_return_expr(expr)
+
+        elif isinstance(expr, rast.Block):
+            return self._emit_block_expr(expr)
+
+        elif isinstance(expr, rast.AssignExpr):
+            return self._emit_assign_expr(expr)
+
         else:
             raise NotImplementedError(f"Expression: {type(expr)}")
 
@@ -5296,6 +5329,101 @@ class LLVMEmitter:
         #        *p = 100        // modify value
         #        free(p as *u8)  // manual cleanup
         return typed_ptr
+
+    def _emit_continue_expr(self, expr: rast.ContinueExpr) -> ir.Value:
+        """Emit continue as an expression (for use in match arms).
+
+        Branches to the loop continue target and returns an undefined value
+        (since we're diverging, the value is never used).
+        """
+        if not self.loop_stack:
+            raise RuntimeError("continue expression outside of loop")
+        continue_block, _ = self.loop_stack[-1]
+        self.builder.branch(continue_block)
+        # Return an undefined value - this is never used since we branched
+        return ir.Undefined
+
+    def _emit_break_expr(self, expr: rast.BreakExpr) -> ir.Value:
+        """Emit break as an expression (for use in match arms).
+
+        Branches to the loop break target and returns an undefined value
+        (since we're diverging, the value is never used).
+        """
+        if not self.loop_stack:
+            raise RuntimeError("break expression outside of loop")
+        _, break_block = self.loop_stack[-1]
+        self.builder.branch(break_block)
+        # Return an undefined value - this is never used since we branched
+        return ir.Undefined
+
+    def _emit_return_expr(self, expr: rast.ReturnExpr) -> ir.Value:
+        """Emit return as an expression (for use in match arms).
+
+        Emits the return instruction and returns an undefined value
+        (since we're diverging, the value is never used).
+        """
+        ret_type = self.current_fn.function_type.return_type
+        if expr.value is not None:
+            ret_val = self._emit_expr(expr.value)
+            ret_val = self._convert_type(ret_val, ret_type)
+            self.builder.ret(ret_val)
+        else:
+            if ret_type == self.void:
+                self.builder.ret_void()
+            else:
+                self.builder.ret(ir.Constant(ret_type, 0))
+        # Return an undefined value - this is never used since we returned
+        return ir.Undefined
+
+    def _emit_block_expr(self, block: rast.Block) -> ir.Value:
+        """Emit a block expression: { stmts; expr }.
+
+        Evaluates all statements and returns the value of the final expression.
+        Used for multiline match arms and other block contexts.
+        """
+        # Emit all statements
+        for stmt in block.stmts:
+            self._emit_stmt(stmt)
+
+        # Emit and return the final expression
+        if block.expr is not None:
+            return self._emit_expr(block.expr)
+        else:
+            # Void block - return undefined
+            return ir.Undefined
+
+    def _emit_assign_expr(self, expr: rast.AssignExpr) -> ir.Value:
+        """Emit an assignment expression: target = value.
+
+        Used for side-effect assignments in match arms:
+            Some(x) => self.field = x
+
+        Returns the assigned value.
+        """
+        val = self._emit_expr(expr.value)
+
+        # Handle different target types (similar to AssignStmt handling)
+        if isinstance(expr.target, rast.Ident):
+            name = expr.target.name
+            if name in self.locals:
+                alloca, ty = self.locals[name]
+                val = self._convert_type(val, ty)
+                self.builder.store(val, alloca)
+            elif name in self.globals:
+                gvar, ty = self.globals[name]
+                val = self._convert_type(val, ty)
+                self.builder.store(val, gvar)
+            else:
+                raise ValueError(f"Unknown variable: {name}")
+
+        else:
+            # For field access, index, dereference - use _emit_lvalue_addr
+            ptr = self._emit_lvalue_addr(expr.target)
+            target_ty = ptr.type.pointee
+            val = self._convert_type(val, target_ty)
+            self.builder.store(val, ptr)
+
+        return val
 
     def _emit_closure(self, closure: rast.Closure) -> ir.Value:
         """Emit a closure expression: |params| body.
@@ -7174,6 +7302,18 @@ class LLVMEmitter:
                     self._emit_array_convert_loop(src_alloca, arr_alloca, val.type, target_type)
 
                 return self.builder.load(arr_alloca)
+
+        # Struct/tuple conversion: {T1, T2, ...} to {U1, U2, ...}
+        # Both LiteralStructType (tuples) and IdentifiedStructType (named structs)
+        if isinstance(val.type, ir.LiteralStructType) and isinstance(target_type, ir.LiteralStructType):
+            if len(val.type.elements) == len(target_type.elements):
+                # Convert element by element
+                result = ir.Constant(target_type, ir.Undefined)
+                for i in range(len(val.type.elements)):
+                    elem = self.builder.extract_value(val, i)
+                    converted_elem = self._convert_type(elem, target_type.elements[i])
+                    result = self.builder.insert_value(result, converted_elem, i)
+                return result
 
         return val
 
