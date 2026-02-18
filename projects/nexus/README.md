@@ -12,6 +12,65 @@ Wiki pages are stored in Mausoleum as versioned documents with Git-like history,
 
 Nexus is the dogfooding platform for the Ritz ecosystem - every component is built and tested through real-world wiki usage.
 
+## Architecture
+
+The Ritz application stack is a complete, self-hosted ecosystem written entirely in Ritz with direct Linux syscalls (no libc). Each component serves a specific role:
+
+| Component   | Role                                         |
+|-------------|----------------------------------------------|
+| **Valet**   | HTTP server with io_uring, TLS termination   |
+| **Zeus**    | App server, worker process management        |
+| **Spire**   | Web framework (MVRSPT pattern)               |
+| **Tome**    | In-memory key-value cache                    |
+| **Mausoleum** | Document database with versioning          |
+
+### Request Flow
+
+```
+HTTP Request
+    │
+    ▼
+┌─────────┐
+│  Valet  │  ← HTTP parsing, TLS, io_uring
+└────┬────┘
+     │ ring buffer
+     ▼
+┌─────────┐
+│  Zeus   │  ← Worker dispatch, process isolation
+└────┬────┘
+     │
+     ▼
+┌─────────┐
+│  Spire  │  ← Routing, controllers, views
+└────┬────┘
+     │
+     ▼
+┌─────────┐     ┌─────────┐
+│  Tome   │ ←→  │Mausoleum│
+└─────────┘     └─────────┘
+   cache          storage
+```
+
+### Deployment Model
+
+- **Valet** binds to port 80/443, handles TLS termination and HTTP parsing
+- **Zeus** spawns worker processes with shared memory ring buffers
+- **Spire** workers (Nexus) receive requests via ring buffer, return responses
+- **Mausoleum** runs as a separate daemon for persistent storage
+- **Tome** provides in-process caching (future: separate daemon mode)
+
+All components communicate via Unix sockets and shared memory - no TCP overhead within the stack.
+
+### The Vision
+
+Nexus demonstrates the full Ritz stack today on Linux. The ultimate goal:
+
+1. **Harland** - Microkernel written in Ritz
+2. **Indium** - Linux-compatible distro running on Harland
+3. **Nexus on Indium** - Wiki running Ritz all the way down to the kernel
+
+No C. No libc. Just Ritz.
+
 ## Features
 
 - Hierarchical wiki pages with parent/child tree structure
@@ -92,7 +151,33 @@ fn main() -> i32
 
 ## Status
 
-**Design phase** - Architecture, content structure, and data model are defined. Core wiki functionality (page CRUD, versioning, Markdown rendering) is being implemented using TDD once the underlying Spire, Mausoleum, and Tome libraries stabilize.
+**Deployed** - Nexus is running in production on AWS EC2 with systemd service management. The core stack (Valet → Zeus → Spire workers, with Mausoleum storage) is operational. Currently implementing:
+
+- [ ] Ring buffer request dispatch (Valet → Zeus workers)
+- [ ] Wiki page CRUD operations
+- [ ] Markdown rendering with Ritz syntax highlighting
+- [ ] Tome caching integration
+- [ ] Full-text search
+
+### Production Deployment
+
+```bash
+# Deploy to EC2 (requires AWS credentials and terraform)
+cd projects/nexus/deploy/scripts
+./deploy.sh
+
+# Just rebuild and provision (skip terraform)
+./deploy.sh build
+./deploy.sh provision
+
+# SSH into the server
+./deploy.sh ssh
+```
+
+Services managed via systemd:
+- `mausoleum.service` - Document storage daemon
+- `zeus.service` - App server with Nexus workers
+- `valet.service` - HTTP frontend
 
 ## License
 
