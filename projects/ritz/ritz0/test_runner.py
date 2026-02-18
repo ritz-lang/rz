@@ -499,7 +499,7 @@ fn main() -> i32
 
     # Link all .ll files with clang
     exe_path = os.path.join(tmpdir, "test")
-    clang_cmd = ["clang"] + ll_files + ["-o", exe_path, "-nostdlib", "-g", "-march=native"]
+    clang_cmd = ["clang"] + ll_files + ["-o", exe_path, "-nostdlib", "-no-pie", "-g", "-march=native"]
     result = subprocess.run(clang_cmd, capture_output=True, text=True)
     if result.returncode != 0:
         return None, f"clang failed: {result.stderr}"
@@ -813,7 +813,7 @@ def run_batch_tests(
             print(f"Linking {len(ll_files)} object files...")
 
         exe_path = os.path.join(tmpdir, "test_runner")
-        clang_cmd = ["clang"] + ll_files + ["-o", exe_path, "-nostdlib", "-g", "-march=native"]
+        clang_cmd = ["clang"] + ll_files + ["-o", exe_path, "-nostdlib", "-no-pie", "-g", "-march=native"]
         result = subprocess.run(clang_cmd, capture_output=True, text=True)
         if result.returncode != 0:
             print(f"Error linking: {result.stderr}", file=sys.stderr)

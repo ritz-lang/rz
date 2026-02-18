@@ -3509,8 +3509,19 @@ class LLVMEmitter:
                 constraints.append("r")
 
         # Replace {name} with $N in template
-        # First, escape literal $ for LLVM
-        template_escaped = template.replace('$', '$$')
+        # In Ritz inline asm, $$ means "literal $" (AT&T immediate syntax)
+        # In LLVM IR inline asm, $$ also means "literal $"
+        # So we preserve $$ pairs and escape lone $ to $$
+        # This way: Ritz "$$42" -> LLVM IR "$$42" -> assembly "$42" (immediate 42)
+        #           Ritz "$0" -> LLVM IR "$$0" -> different from operand reference
+        import re as re_module
+        # First, temporarily replace $$ pairs with a marker to protect them
+        marker = '\x01DOUBLE_DOLLAR\x01'
+        template_escaped = template.replace('$$', marker)
+        # Escape remaining single $ to $$
+        template_escaped = template_escaped.replace('$', '$$')
+        # Restore $$ pairs
+        template_escaped = template_escaped.replace(marker, '$$')
 
         # Now replace {name} with temporary markers
         operand_markers = {}
