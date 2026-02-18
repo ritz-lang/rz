@@ -40,52 +40,41 @@ impl FontEntry
             style: style
         }
 
-    pub fn path(self) -> @String
+    pub fn path(self: @FontEntry) -> @String
         @self.path
 
-    pub fn family(self) -> @String
+    pub fn family(self: @FontEntry) -> @String
         @self.family
 
-    pub fn style(self) -> @String
+    pub fn style(self: @FontEntry) -> @String
         @self.style
 
 # Font registry - indexes discovered fonts
+# Uses linear search since HashMap<K,V> isn't available yet (see issue #97)
 pub struct FontRegistry
     fonts: Vec<FontEntry>
-    by_family: Map<String, Vec<usize>>  # family name -> indices
 
 impl FontRegistry
     pub fn new() -> FontRegistry
         FontRegistry {
-            fonts: Vec.new(),
-            by_family: Map.new()
+            fonts: Vec.new()
         }
 
     # Add a font entry
-    pub fn add(self:&, entry:= FontEntry)
-        let idx = self.fonts.len()
-        let family = entry.family.clone()
+    pub fn add(self:& FontRegistry, entry:= FontEntry)
         self.fonts.push(entry)
 
-        # Index by family
-        match self.by_family.get(@&family)
-            Some(indices) => indices.push(idx)
-            None =>
-                var indices = Vec.new()
-                indices.push(idx)
-                self.by_family.insert(family, indices)
-
     # Get number of fonts
-    pub fn len(self) -> usize
+    pub fn len(self: @FontRegistry) -> usize
         self.fonts.len()
 
     # Get all fonts
-    pub fn fonts(self) -> @Vec<FontEntry>
+    pub fn fonts(self: @FontRegistry) -> @Vec<FontEntry>
         @self.fonts
 
     # Find fonts by family name (case-insensitive)
-    pub fn find_by_family(self, name: StrView) -> Vec<@FontEntry>
-        var results = Vec.new()
+    pub fn find_by_family(self: @FontRegistry, name: StrView) -> Vec<@FontEntry>
+        var results: Vec<@FontEntry> = Vec.new()
         let lower_name = name.to_lowercase()
 
         for entry in @self.fonts
@@ -95,7 +84,7 @@ impl FontRegistry
         results
 
     # Find first font matching family name
-    pub fn find_first(self, name: StrView) -> Option<@FontEntry>
+    pub fn find_first(self: @FontRegistry, name: StrView) -> Option<@FontEntry>
         let matches = self.find_by_family(name)
         if matches.len() > 0
             Some(matches[0])
@@ -103,13 +92,14 @@ impl FontRegistry
             None
 
     # Find a font with specific family and style
-    pub fn find_exact(self, family: StrView, style: StrView) -> Option<@FontEntry>
+    pub fn find_exact(self: @FontRegistry, family: StrView, style: StrView) -> Option<@FontEntry>
         let lower_family = family.to_lowercase()
         let lower_style = style.to_lowercase()
 
         for entry in @self.fonts
-            if entry.family.to_lowercase() == lower_family and
-               entry.style.to_lowercase() == lower_style
+            let entry_fam = entry.family.to_lowercase()
+            let entry_sty = entry.style.to_lowercase()
+            if entry_fam == lower_family and entry_sty == lower_style
                 return Some(entry)
 
         None
@@ -171,8 +161,11 @@ pub fn extract_font_info(path: StrView) -> Option<FontEntry>
 fn parse_font_filename(path: StrView) -> FontFilenameInfo
     # Get basename
     var name = path
-    if let Some(idx) = path.rfind("/")
-        name = path.slice(idx + 1, path.len())
+    let slash_opt = path.rfind("/")
+    match slash_opt
+        Some(idx) =>
+            name = path.slice(idx + 1, path.len())
+        None => pass
 
     # Remove extension
     for ext in FONT_EXTENSIONS
@@ -181,18 +174,20 @@ fn parse_font_filename(path: StrView) -> FontFilenameInfo
             break
 
     # Split on hyphen for style
-    if let Some(idx) = name.rfind("-")
-        let family = name.slice(0, idx)
-        let style = name.slice(idx + 1, name.len())
-        FontFilenameInfo {
-            family: expand_camel_case(family),
-            style: String.from(style)
-        }
-    else
-        FontFilenameInfo {
-            family: expand_camel_case(name),
-            style: String.from("Regular")
-        }
+    let hyphen_opt = name.rfind("-")
+    match hyphen_opt
+        Some(idx) =>
+            let family = name.slice(0, idx)
+            let style = name.slice(idx + 1, name.len())
+            FontFilenameInfo {
+                family: expand_camel_case(family),
+                style: String.from(style)
+            }
+        None =>
+            FontFilenameInfo {
+                family: expand_camel_case(name),
+                style: String.from("Regular")
+            }
 
 # Expand CamelCase to "Camel Case"
 fn expand_camel_case(s: StrView) -> String
@@ -208,22 +203,26 @@ fn expand_camel_case(s: StrView) -> String
 
     result
 
-# Well-known font family aliases
-const FONT_ALIASES: [(StrView, StrView); 6] = [
-    ("sans-serif", "DejaVu Sans"),
-    ("serif", "DejaVu Serif"),
-    ("monospace", "DejaVu Sans Mono"),
-    ("sans", "DejaVu Sans"),
-    ("mono", "DejaVu Sans Mono"),
-    ("system-ui", "DejaVu Sans")
+# Well-known font alias entry
+struct FontAlias
+    alias: StrView
+    target: StrView
+
+const FONT_ALIASES: [6]FontAlias = [
+    FontAlias { alias: "sans-serif", target: "DejaVu Sans" },
+    FontAlias { alias: "serif", target: "DejaVu Serif" },
+    FontAlias { alias: "monospace", target: "DejaVu Sans Mono" },
+    FontAlias { alias: "sans", target: "DejaVu Sans" },
+    FontAlias { alias: "mono", target: "DejaVu Sans Mono" },
+    FontAlias { alias: "system-ui", target: "DejaVu Sans" }
 ]
 
 # Resolve a font family name (handles aliases)
 pub fn resolve_family_name(name: StrView) -> String
     let lower = name.to_lowercase()
-    for (alias, target) in FONT_ALIASES
-        if lower == alias
-            return String.from(target)
+    for fa in FONT_ALIASES
+        if lower == fa.alias
+            return String.from(fa.target)
     String.from(name)
 
 # Tests
@@ -276,7 +275,8 @@ fn test_registry_find() -> i32
     assert matches.len() == 2
 
     match registry.find_exact("DejaVu Sans", "Bold")
-        Some(entry) => assert entry.style() == "Bold"
+        Some(entry) =>
+            assert entry.style() == "Bold"
         None => return 1  # fail
 
     0
