@@ -277,7 +277,7 @@ resource "null_resource" "burn_image" {
       "echo 'Waiting for EBS volumes to appear...'",
       "while [ ! -e /dev/nvme1n1 ]; do sleep 1; done",
       "while [ ! -e /dev/nvme2n1 ]; do sleep 1; done",
-      "echo 'EBS volumes ready at /dev/nvme1n1 and /dev/nvme2n1'"
+      "echo 'EBS volumes ready'"
     ]
   }
 
@@ -293,12 +293,31 @@ resource "null_resource" "burn_image" {
   }
 
   # Burn both images to EBS volumes
+  # Use /dev/disk/by-id/ symlinks which contain the volume ID
   provisioner "remote-exec" {
     inline = [
-      "echo 'Burning boot image to EBS volume (nvme1n1)...'",
-      "sudo dd if=/tmp/harland-boot.img of=/dev/nvme1n1 bs=4M status=progress",
-      "echo 'Burning initramfs to EBS volume (nvme2n1)...'",
-      "sudo dd if=/tmp/initramfs.tar of=/dev/nvme2n1 bs=4M status=progress",
+      "echo 'Identifying EBS volumes...'",
+      "ls -la /dev/disk/by-id/ | grep -E 'nvme.*vol'",
+      "# Get volume IDs (with dashes removed since by-id uses no dashes)",
+      "BOOT_VOL_ID=$(echo '${aws_ebs_volume.harland.id}' | tr -d '-')",
+      "INITRAMFS_VOL_ID=$(echo '${aws_ebs_volume.initramfs.id}' | tr -d '-')",
+      "echo \"  Looking for boot volume: $BOOT_VOL_ID\"",
+      "echo \"  Looking for initramfs volume: $INITRAMFS_VOL_ID\"",
+      "# Find the devices by their volume IDs in /dev/disk/by-id/",
+      "BOOT_DEV=$(ls -la /dev/disk/by-id/ | grep $BOOT_VOL_ID | head -1 | awk '{print $NF}' | xargs -I{} realpath /dev/disk/by-id/{})",
+      "INITRAMFS_DEV=$(ls -la /dev/disk/by-id/ | grep $INITRAMFS_VOL_ID | head -1 | awk '{print $NF}' | xargs -I{} realpath /dev/disk/by-id/{})",
+      "echo \"  Boot device: $BOOT_DEV\"",
+      "echo \"  Initramfs device: $INITRAMFS_DEV\"",
+      "if [ -z \"$BOOT_DEV\" ] || [ -z \"$INITRAMFS_DEV\" ]; then",
+      "  echo 'ERROR: Could not identify EBS volumes!'",
+      "  echo 'Available devices:'",
+      "  ls -la /dev/disk/by-id/ | grep nvme",
+      "  exit 1",
+      "fi",
+      "echo \"Burning boot image to $BOOT_DEV...\"",
+      "sudo dd if=/tmp/harland-boot.img of=$BOOT_DEV bs=4M status=progress",
+      "echo \"Burning initramfs to $INITRAMFS_DEV...\"",
+      "sudo dd if=/tmp/initramfs.tar of=$INITRAMFS_DEV bs=4M status=progress",
       "sudo sync",
       "rm /tmp/harland-boot.img /tmp/initramfs.tar",
       "echo 'Both images burned successfully!'"

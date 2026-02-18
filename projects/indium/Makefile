@@ -84,47 +84,52 @@ $(UEFI_DISK): kernel
 # Create EC2-compatible UEFI boot disk with GPT partition table
 # EC2 requires a proper GPT with EFI System Partition for UEFI boot
 # Layout:
-#   Partition 1: ESP (EFI System Partition) - FAT32, ~32MB - kernel + bootloader
-#   Partition 2: Data - Raw TAR initramfs - ~30MB
+#   Partition 1: ESP (EFI System Partition) - FAT32, ~62MB - kernel + bootloader
+#
+# NOTE: The initramfs is on a separate EBS volume (/dev/xvdb).
+# We keep the boot disk simple with just the ESP to maximize compatibility.
+#
+# IMPORTANT: We use mtools to create the FAT32 filesystem, avoiding loop device
+# issues. This matches how working UEFI boot disks are typically created.
 EC2_DISK = $(BUILD_DIR)/ec2-boot.img
+EC2_ESP = $(BUILD_DIR)/ec2-esp.img
 
 ec2-disk: $(EC2_DISK)
 
-$(EC2_DISK): kernel $(BUILD_DIR)/initramfs.tar
-	@echo "=== Creating EC2 Boot Disk (GPT + ESP + Data) ==="
+# First, create a standalone FAT32 filesystem using mtools (no loop device)
+$(EC2_ESP): kernel
+	@echo "=== Creating ESP FAT32 Image ==="
 	@mkdir -p $(BUILD_DIR)
-	@# Create 128MB disk image (ESP + initramfs partition)
-	dd if=/dev/zero of=$@ bs=1M count=128 2>/dev/null
-	@# Create GPT partition table with:
-	@#   Partition 1: ESP at 1MB (sector 2048), 32MB
-	@#   Partition 2: Linux data at 34MB, rest of disk
-	@# Sector calculations: 1MB = 2048 sectors, 32MB = 65536 sectors
+	@# Create 62MB FAT32 image (will fit in the partition)
+	dd if=/dev/zero of=$@ bs=1M count=62 2>/dev/null
+	mkfs.vfat -F 32 -n HARLAND $@ >/dev/null
+	@# Create directory structure
+	mmd -i $@ ::/EFI
+	mmd -i $@ ::/EFI/BOOT
+	mmd -i $@ ::/harland
+	@# Copy files
+	mcopy -i $@ $(BOOTLOADER) ::/EFI/BOOT/BOOTX64.EFI
+	mcopy -i $@ $(KERNEL_ELF) ::/harland/kernel.elf
+	@# Create startup script
+	@echo '@echo -off' > $(BUILD_DIR)/startup.nsh
+	@echo 'FS0:\EFI\BOOT\BOOTX64.EFI' >> $(BUILD_DIR)/startup.nsh
+	mcopy -i $@ $(BUILD_DIR)/startup.nsh ::/startup.nsh
+	@echo "Created: $@ (FAT32 filesystem)"
+
+# Then, wrap it in a GPT disk image
+$(EC2_DISK): $(EC2_ESP)
+	@echo "=== Creating EC2 Boot Disk (GPT + ESP) ==="
+	@# Create 64MB disk image with GPT header/footer space
+	dd if=/dev/zero of=$@ bs=1M count=64 2>/dev/null
+	@# Create GPT partition table with single ESP partition
+	@# ESP at 1MB (sector 2048), size 62MB (126976 sectors)
 	sgdisk --clear \
-	       --new=1:2048:67583 --typecode=1:EF00 --change-name=1:ESP \
-	       --new=2:69632:0 --typecode=2:8300 --change-name=2:initramfs \
+	       --new=1:2048:129023 --typecode=1:EF00 --change-name=1:ESP \
 	       $@
-	@# Format and populate ESP (partition 1)
+	@# Copy the FAT32 filesystem to the ESP partition
 	@# ESP offset: 2048 * 512 = 1048576 (1MB)
-	@# ESP size: 65536 * 512 = 33554432 (~32MB)
-	@LOOP_ESP=$$(sudo losetup --find --show --offset 1048576 --sizelimit 33554432 $@) && \
-	sudo mkfs.vfat -F 32 $$LOOP_ESP && \
-	mkdir -p $(BUILD_DIR)/mnt && \
-	sudo mount $$LOOP_ESP $(BUILD_DIR)/mnt && \
-	sudo mkdir -p $(BUILD_DIR)/mnt/EFI/BOOT && \
-	sudo mkdir -p $(BUILD_DIR)/mnt/harland && \
-	sudo cp $(BOOTLOADER) $(BUILD_DIR)/mnt/EFI/BOOT/BOOTX64.EFI && \
-	sudo cp $(KERNEL_ELF) $(BUILD_DIR)/mnt/harland/kernel.elf && \
-	echo '@echo -off' > $(BUILD_DIR)/startup.nsh && \
-	echo 'FS0:\EFI\BOOT\BOOTX64.EFI' >> $(BUILD_DIR)/startup.nsh && \
-	sudo cp $(BUILD_DIR)/startup.nsh $(BUILD_DIR)/mnt/startup.nsh && \
-	sudo umount $(BUILD_DIR)/mnt && \
-	sudo losetup -d $$LOOP_ESP && \
-	rmdir $(BUILD_DIR)/mnt
-	@# Write initramfs TAR to partition 2 (raw, no filesystem)
-	@# Partition 2 offset: 69632 * 512 = 35651584 (~34MB)
-	@echo "Writing initramfs to partition 2..."
-	dd if=$(BUILD_DIR)/initramfs.tar of=$@ bs=512 seek=69632 conv=notrunc 2>/dev/null
-	@echo "Created: $@ (GPT + ESP + initramfs, ready for EC2)"
+	dd if=$(EC2_ESP) of=$@ bs=512 seek=2048 conv=notrunc 2>/dev/null
+	@echo "Created: $@ (GPT + ESP, ready for EC2)"
 
 # ============================================================================
 # Run targets
