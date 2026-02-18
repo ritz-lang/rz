@@ -5918,6 +5918,24 @@ class LLVMEmitter:
                         return self.builder.load(field_ptr)
                 raise ValueError(f"Cannot access field on double pointer: {pointee_type}")
             else:
+                # LLVM type doesn't tell us the struct type - try Ritz type info
+                ritz_type = self._infer_ritz_type(expr.expr)
+                if ritz_type:
+                    # Handle RefType: @T where T is a struct
+                    inner_type = ritz_type
+                    if isinstance(inner_type, rast.RefType):
+                        inner_type = inner_type.inner
+                    if isinstance(inner_type, rast.PtrType):
+                        inner_type = inner_type.inner
+                    if isinstance(inner_type, rast.NamedType):
+                        struct_name = inner_type.name
+                        if struct_name in self.structs:
+                            # We know it's a pointer to this struct type - bitcast and access
+                            llvm_struct_type = self.structs[struct_name]
+                            typed_ptr = self.builder.bitcast(struct_val, ir.PointerType(llvm_struct_type))
+                            idx = self._get_struct_field_index(struct_name, expr.field)
+                            field_ptr = self.builder.gep(typed_ptr, [ir.Constant(self.i32, 0), ir.Constant(self.i32, idx)])
+                            return self.builder.load(field_ptr)
                 raise ValueError(f"Cannot access field on non-struct pointer: {pointee_type}")
         elif isinstance(struct_val.type, ir.BaseStructType):
             # Value of struct type: extract the field
@@ -7703,6 +7721,8 @@ class LLVMEmitter:
                     if isinstance(field_pattern, rast.IdentPattern):
                         # Store in params so it can be used in the arm body
                         self.params[field_pattern.name] = (field_val, llvm_field_type)
+                        # Also store the Ritz type for field access on reference types
+                        self.ritz_types[field_pattern.name] = field_type
                     # Wildcard patterns just discard the value
 
                     offset += self._type_size_bytes(llvm_field_type)
@@ -7723,6 +7743,8 @@ class LLVMEmitter:
                 for field_pattern in pattern.fields:
                     if isinstance(field_pattern, rast.IdentPattern):
                         del self.params[field_pattern.name]
+                        if field_pattern.name in self.ritz_types:
+                            del self.ritz_types[field_pattern.name]
 
         # Position at merge block
         self.builder.position_at_end(merge_block)

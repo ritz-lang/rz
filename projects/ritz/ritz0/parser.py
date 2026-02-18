@@ -175,10 +175,11 @@ class Parser:
         type_args = []
         if self._at(TokenType.LT):
             # Lookahead: check if this looks like type args or a comparison
-            # Type args: <T>, <*u8>, <&T>, <[T]>, <fn()>
+            # Type args: <T>, <*u8>, <&T>, <[T]>, <fn()>, <@T>, <@&T>
             # Comparison: < 0, < x + y, etc.
             if not self._peek_at(1, TokenType.IDENT, TokenType.STAR, TokenType.AMP,
-                                  TokenType.LBRACKET, TokenType.FN, TokenType.GT):
+                                  TokenType.LBRACKET, TokenType.FN, TokenType.GT,
+                                  TokenType.AT, TokenType.AT_AMP, TokenType.LPAREN):
                 return type_args  # Not type args, leave < for expression parser
 
             self._advance()  # consume <
