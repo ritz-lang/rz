@@ -166,6 +166,7 @@ fn main(argc: i32, argv: **u8) -> i32
     args_option(@parser, 'p', c"port", c"PORT", c"Listen port (overrides config)", c"0")
     args_option(@parser, 'w', c"workers", c"N", c"Number of worker processes (overrides config)", c"0")
     args_flag(@parser, 'm', c"multishot", c"Use multishot accept (kernel 5.19+)")
+    args_option(@parser, 'z', c"zeus-socket", c"PATH", c"Zeus daemon socket for worker dispatch", c"")
 
     if args_parse(@parser, argc, argv) != 0
         return 1
@@ -197,6 +198,7 @@ fn main(argc: i32, argv: **u8) -> i32
     let cli_port: i64 = args_get_int(@parser, 'p')
     let cli_workers: i64 = args_get_int(@parser, 'w')
     let cli_multishot: i32 = args_get_flag(@parser, 'm')
+    let cli_zeus_socket: *u8 = args_get_str(@parser, 'z')
 
     if cli_port > 0
         cfg.port = cli_port as i32
@@ -204,6 +206,14 @@ fn main(argc: i32, argv: **u8) -> i32
         cfg.workers = cli_workers as i32
     if cli_multishot != 0
         cfg.multishot = 1
+    if cli_zeus_socket != null and *cli_zeus_socket != 0
+        cfg.zeus_enabled = 1
+        # Copy zeus socket path to config
+        var i: i32 = 0
+        while *(cli_zeus_socket + i) != 0 and i < 255
+            cfg.zeus_socket[i] = *(cli_zeus_socket + i)
+            i = i + 1
+        cfg.zeus_socket[i] = 0
 
     # Validate
     if cfg.port <= 0 || cfg.port > 65535
@@ -247,16 +257,21 @@ fn main(argc: i32, argv: **u8) -> i32
             eprints("valet: failed to load TLS certificates\n")
             return 1
 
-    # Register middleware
-    valet_use_named(@app, c"logging", logging_middleware)
+    # In Zeus mode, we don't register routes - workers handle them
+    if cfg.zeus_enabled == 0
+        # Register middleware
+        valet_use_named(@app, c"logging", logging_middleware)
 
-    # Register routes
-    valet_get(@app, c"/", handle_index)
-    valet_get(@app, c"/hello", handle_hello)
-    valet_get(@app, c"/json", handle_json)
-    valet_get(@app, c"/users/:id", handle_user)
-    valet_get(@app, c"/echo/:msg", handle_echo)
-    valet_get(@app, c"/api/**", handle_api_catchall)  # Catch-all for /api/*
+        # Register routes
+        valet_get(@app, c"/", handle_index)
+        valet_get(@app, c"/hello", handle_hello)
+        valet_get(@app, c"/json", handle_json)
+        valet_get(@app, c"/users/:id", handle_user)
+        valet_get(@app, c"/echo/:msg", handle_echo)
+        valet_get(@app, c"/api/**", handle_api_catchall)  # Catch-all for /api/*
 
-    # Run the server
-    return valet_run(@app)
+    # Run the server in appropriate mode
+    if cfg.zeus_enabled != 0
+        return valet_run_zeus(@app, @cfg.zeus_socket[0])
+    else
+        return valet_run(@app)
