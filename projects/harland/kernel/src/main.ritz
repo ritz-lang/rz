@@ -1932,19 +1932,13 @@ const TIMER_INITIAL_COUNT: u32 = 10000000   # ~10ms at typical frequencies
 
 # Spinlock acquire
 fn sched_lock() -> i32
-    # Simple spinlock using atomic CAS
-    # Load the lock address and use RIP-relative addressing
-    while true
-        var result: u32 = 0
-        var one: u32 = 1
-        # Try to atomically swap: set lock to 1 and get old value
-        asm x86_64:
-            lea scheduler_lock(%rip), %rsi
-            movl {one}, %eax
-            xchgl %eax, (%rsi)
-            movl %eax, {result}
-        if result == 0
-            return 0  # Got the lock (was unlocked)
+    # Simple spinlock using load/store (not atomic, but OK for single-threaded kernel init)
+    # TODO: Fix inline asm for proper atomic spinlock on EC2
+    while scheduler_lock != 0
+        # Spin
+        let x: u32 = 0
+
+    scheduler_lock = 1
     return 0
 
 # Spinlock release
@@ -3173,7 +3167,10 @@ pub fn syscall_handler(rax: u64, rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
 
     if rax == SYS_YIELD
         # Yield to scheduler
-        yield_task()
+        # NOTE: For now, yield is a no-op because init isn't registered as a task
+        # with the scheduler. Full multitasking requires creating a Task struct for
+        # init before jumping to userspace.
+        # yield_task()  # Disabled until proper task management
         return 0
 
     if rax == SYS_GETPID
@@ -3984,6 +3981,14 @@ pub fn scheduler_init() -> i32
         cpu_sched[i].idle_task = 0
         i = i + 1
 
+    # Explicitly zero scheduler globals (BSS may not be zeroed on UEFI boot)
+    scheduler_lock = 0
+    task_count = 0
+    ready_head = 0
+    ready_tail = 0
+    ready_count = 0
+    scheduler_initialized = 0
+
     # Create idle task for BSP
     create_idle_task(0)
 
@@ -3992,10 +3997,6 @@ pub fn scheduler_init() -> i32
     while i < num_cpus as i32
         create_idle_task(i)
         i = i + 1
-
-    prints("      Created ")
-    serial_print_dec(num_cpus as u64)
-    prints(" idle tasks\n")
 
     # Configure APIC timer on BSP
     apic_timer_init(0)
