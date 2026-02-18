@@ -148,8 +148,9 @@ provision() {
     log "Waiting for cloud-init to complete..."
     $SSH "cloud-init status --wait" || true
 
-    # Stop existing services
+    # Stop existing services (reverse order of start)
     log "Stopping existing services..."
+    $SSH "sudo systemctl stop valet 2>/dev/null || true"
     $SSH "sudo systemctl stop zeus 2>/dev/null || true"
     $SSH "sudo systemctl stop mausoleum 2>/dev/null || true"
 

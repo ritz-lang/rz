@@ -32,6 +32,9 @@ import tls
 
 # Zeus client for daemon integration
 import zeus.zeus_client
+import zeus.ring
+import zeus.arena
+import zeus.control
 
 
 # ============================================================================
@@ -1592,16 +1595,245 @@ pub fn valet_run_zeus(app: *Valet, zeus_socket: *u8) -> i32
     return ret
 
 
+# Zeus dispatch states (reuse some from standard handler)
+const ZEUS_STATE_RECV: i32 = 0
+const ZEUS_STATE_PARSE: i32 = 1
+const ZEUS_STATE_DISPATCH: i32 = 2
+const ZEUS_STATE_WAIT: i32 = 3
+const ZEUS_STATE_SEND: i32 = 4
+
 # Handle a connection in Zeus mode (dispatch to workers via ring buffers)
 # This is similar to valet_handle_connection but uses Zeus ring buffers
 fn valet_handle_zeus_connection(task: *Task) -> i32
-    # For now, fall back to standard handling
-    # TODO: Implement proper Zeus dispatch
-    return valet_handle_connection(task)
+    let client: *ZeusClient = get_zeus_client()
+    if client == null
+        # No Zeus client - fall back to standard handling
+        return valet_handle_connection(task)
+
+    # State: RECV - read request data
+    if task.handler_state == ZEUS_STATE_RECV
+        if task.io_result == 0
+            let ret = task_recv(task)
+            if ret < 0
+                return 1
+            return -1
+
+        if task.io_result <= 0
+            return 0
+
+        task.read_len = task.io_result
+
+        # Check request size limit
+        let app: *Valet = get_g_app()
+        if app.max_request_size > 0 and task.read_len > app.max_request_size
+            log_warn(c"Request too large, closing connection")
+            return valet_send_413(task)
+
+        task.handler_state = ZEUS_STATE_PARSE
+
+    # State: PARSE - parse request and dispatch to worker
+    if task.handler_state == ZEUS_STATE_PARSE
+        var req: Request
+        request_init(@req)
+
+        let parsed = request_parse(@req, @task.read_buf[0], task.read_len)
+        if parsed < 0
+            return 0
+
+        task.request_count += 1
+
+        # Select a worker (round-robin)
+        let worker_idx: i32 = zeus_client_select_worker(client)
+        if worker_idx < 0
+            # No workers available - send 503
+            log_warn(c"No Zeus workers available")
+            return valet_send_503(task)
+
+        # Get worker handle and its arena
+        let handle: *WorkerHandle = zeus_client_get_worker(client, worker_idx)
+        if handle == null
+            return valet_send_503(task)
+
+        # Get arena for this worker
+        var arena: DataArena
+        worker_handle_get_arena(handle, @arena)
+
+        # Calculate total data size needed
+        let path_size: i64 = ((req.path_len as i64) + 7) & (0 - 8)
+        let body_size: i64 = ((req.content_length as i64) + 7) & (0 - 8)
+
+        # Reset arena for this request (simple approach - one request per arena at a time)
+        data_arena_reset(@arena)
+
+        # Allocate and copy path
+        let path_ptr: *u8 = data_arena_alloc(@arena, req.path_len as i64)
+        if path_ptr == null
+            return valet_send_503(task)
+
+        for i in 0..req.path_len
+            *(path_ptr + i) = *(req.path_ptr + i)
+
+        let path_offset: i64 = data_arena_ptr_to_offset(@arena, path_ptr)
+
+        # Allocate and copy body (if any)
+        var body_offset: i64 = 0
+        var body_len: i32 = 0
+        if req.content_length > 0 and req.headers_end + req.content_length <= task.read_len
+            let body_ptr: *u8 = data_arena_alloc(@arena, req.content_length as i64)
+            if body_ptr != null
+                let body_start: *u8 = @task.read_buf[0] + req.headers_end
+                for i in 0..req.content_length
+                    *(body_ptr + i) = *(body_start + i)
+                body_offset = data_arena_ptr_to_offset(@arena, body_ptr)
+                body_len = req.content_length
+
+        # Build request slot
+        var slot: RequestSlot
+        request_slot_init(@slot)
+        slot.id = zeus_client_next_request_id(client)
+        slot.method = valet_method_to_zeus(req.method_ptr, req.method_len)
+        slot.flags = REQ_FLAG_COMPLETE
+        slot.path_offset = path_offset as u32
+        slot.path_len = req.path_len as u16
+        slot.body_offset = body_offset as u32
+        slot.body_len = body_len as u32
+
+        # Store request ID in task for later matching
+        task.user_data = slot.id as *u8
+
+        # Submit request to worker
+        let submit_result: i32 = zeus_client_submit_request(client, worker_idx, @slot)
+        if submit_result < 0
+            if submit_result == -2
+                # Ring full - send 503
+                log_warn(c"Zeus worker ring full")
+            return valet_send_503(task)
+
+        task.handler_state = ZEUS_STATE_WAIT
+        # Fall through to WAIT state
+
+    # State: WAIT - poll for response from worker
+    if task.handler_state == ZEUS_STATE_WAIT
+        let expected_id: u64 = task.user_data as u64
+
+        var resp: ResponseSlot
+        var resp_worker_idx: i32 = -1
+        let poll_result: i32 = zeus_client_poll_response(client, @resp, @resp_worker_idx)
+
+        if poll_result < 0
+            # No response yet - yield and retry
+            # Use a short timeout to avoid busy spinning
+            var ts: [2]i64
+            ts[0] = 0        # seconds
+            ts[1] = 100000   # nanoseconds (100µs)
+            sys_nanosleep(@ts[0], null)
+            return -1  # Re-enter handler
+
+        # Got a response - verify it matches our request
+        if resp.id != expected_id
+            # Unexpected response ID - this shouldn't happen in single-request mode
+            log_warn(c"Zeus response ID mismatch")
+
+        # Get the worker's arena to read response data
+        let handle: *WorkerHandle = zeus_client_get_worker(client, resp_worker_idx)
+        if handle == null
+            return valet_send_503(task)
+
+        var arena: DataArena
+        worker_handle_get_arena(handle, @arena)
+
+        # Copy response data to task's write buffer
+        var write_pos: i32 = 0
+
+        # Copy headers from arena
+        if resp.headers_len > 0
+            let headers_ptr: *u8 = data_arena_offset_to_ptr(@arena, resp.headers_offset as i64)
+            for i in 0..(resp.headers_len as i32)
+                if write_pos < 8192
+                    task.write_buf[write_pos] = *(headers_ptr + i)
+                    write_pos += 1
+
+        # Copy body from arena
+        if resp.body_len > 0
+            let body_ptr: *u8 = data_arena_offset_to_ptr(@arena, resp.body_offset as i64)
+            for i in 0..(resp.body_len as i32)
+                if write_pos < 8192
+                    task.write_buf[write_pos] = *(body_ptr + i)
+                    write_pos += 1
+
+        task.write_len = write_pos
+        task.write_pos = 0
+        task.handler_state = ZEUS_STATE_SEND
+
+        let ret = valet_task_send(task, write_pos)
+        if ret < 0
+            return 1
+        return -1
+
+    # State: SEND - wait for send completion
+    if task.handler_state == ZEUS_STATE_SEND
+        if task.io_result < 0
+            return 1
+
+        # Check keep-alive limit from app config
+        let app: *Valet = get_g_app()
+        if task.request_count < app.keepalive_requests
+            let ret = task_reset_for_recv(task)
+            if ret < 0
+                tcp_shutdown(task.fd, SHUT_WR)
+                return 0
+            return -1
+
+        tcp_shutdown(task.fd, SHUT_WR)
+        return 0
+
+    return 0
+
+
+# Convert HTTP method string to Zeus method code
+fn valet_method_to_zeus(method: *u8, len: i32) -> u8
+    if len == 3
+        if *method == 'G' and *(method + 1) == 'E' and *(method + 2) == 'T'
+            return HTTP_METHOD_GET
+        if *method == 'P' and *(method + 1) == 'U' and *(method + 2) == 'T'
+            return HTTP_METHOD_PUT
+    if len == 4
+        if *method == 'P' and *(method + 1) == 'O' and *(method + 2) == 'S' and *(method + 3) == 'T'
+            return HTTP_METHOD_POST
+        if *method == 'H' and *(method + 1) == 'E' and *(method + 2) == 'A' and *(method + 3) == 'D'
+            return HTTP_METHOD_HEAD
+    if len == 5
+        if *method == 'P' and *(method + 1) == 'A' and *(method + 2) == 'T' and *(method + 3) == 'C' and *(method + 4) == 'H'
+            return HTTP_METHOD_PATCH
+    if len == 6
+        if *method == 'D' and *(method + 1) == 'E' and *(method + 2) == 'L' and *(method + 3) == 'E' and *(method + 4) == 'T' and *(method + 5) == 'E'
+            return HTTP_METHOD_DELETE
+    if len == 7
+        if *method == 'O' and *(method + 1) == 'P' and *(method + 2) == 'T' and *(method + 3) == 'I' and *(method + 4) == 'O' and *(method + 5) == 'N' and *(method + 6) == 'S'
+            return HTTP_METHOD_OPTIONS
+    return 0  # Unknown method
+
+
+# Send 503 Service Unavailable
+fn valet_send_503(task: *Task) -> i32
+    let response: *u8 = c"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 23\r\nConnection: close\r\n\r\nService Unavailable\r\n"
+    var i: i32 = 0
+    while *(response + i) != 0 and i < 8192
+        task.write_buf[i] = *(response + i)
+        i += 1
+
+    task.write_len = i
+    task.write_pos = 0
+    task.handler_state = ZEUS_STATE_SEND
+
+    let ret = valet_task_send(task, i)
+    if ret < 0
+        return 1
+    return -1
 
 
 # Handle a TLS connection in Zeus mode
 fn valet_handle_zeus_tls_connection(task: *Task) -> i32
-    # For now, fall back to standard handling
-    # TODO: Implement proper Zeus dispatch
+    # TODO: Implement TLS + Zeus dispatch
+    # For now, fall back to standard TLS handling
     return valet_handle_tls_connection(task)

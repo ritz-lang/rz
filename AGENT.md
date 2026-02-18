@@ -384,6 +384,41 @@ ritzlib,squeeze,valet: 🤖 <description>
 
 ---
 
+## Critical Safety Rules
+
+### NEVER Use pkill or killall
+
+**⚠️ NEVER use `pkill`, `killall`, or pattern-based process killing.**
+
+```bash
+# ❌ DANGEROUS - Will kill other Claude Code rooms!
+pkill valet
+pkill -f "valet"
+killall zeus
+
+# ✅ SAFE - Use PID-based cleanup
+kill $PID
+kill $(cat /tmp/myprocess.pid)
+```
+
+**Why this matters:**
+- `pkill -f "valet"` matches ANY process with "valet" in the command line
+- This includes `adele agent --room valet` (your colleague's room!)
+- You will kill other agents and lose their work
+- Use PID files or direct PID tracking instead
+
+**In tests and scripts:**
+```bash
+# Start process and save PID
+./build/valet &
+VALET_PID=$!
+
+# Later, clean up by PID
+kill $VALET_PID 2>/dev/null || true
+```
+
+---
+
 ## Remember
 
 1. **No Concessions** — Fix the language, don't work around it
@@ -391,6 +426,7 @@ ritzlib,squeeze,valet: 🤖 <description>
 3. **Atomic Changes** — Cross-project changes in one commit
 4. **Test First** — TDD is not optional
 5. **Main is Green** — Always branch from stable main
+6. **NEVER pkill** — Use PIDs, not pattern matching
 
 ---
 
