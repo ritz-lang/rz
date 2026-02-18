@@ -1014,10 +1014,32 @@ class Parser:
         raise ParseError(f"Expected expression, got {tok.type.name}", span)
 
     def parse_if(self) -> rast.If:
-        """Parse an if expression."""
+        """Parse an if expression.
+
+        Supports both block-style and ternary style:
+            if cond                           # block style
+                body
+            else
+                other
+
+            if cond then a else b             # ternary style (single line)
+        """
         span = self._current().span
         self._expect(TokenType.IF)
         cond = self.parse_expr()
+
+        # Check for ternary style: if cond then a else b
+        if self._at(TokenType.THEN):
+            self._advance()
+            then_expr = self.parse_expr()
+            self._expect(TokenType.ELSE)
+            else_expr = self.parse_expr()
+            # Wrap expressions in blocks for consistency
+            then_block = rast.Block(then_expr.span, [], then_expr)
+            else_block = rast.Block(else_expr.span, [], else_expr)
+            return rast.If(span, cond, then_block, else_block)
+
+        # Block style
         then_block = self.parse_block()
 
         else_block = None
@@ -1072,7 +1094,7 @@ class Parser:
 
         # Check for multiline arm: => followed by newline+indent
         if self._at(TokenType.NEWLINE):
-            self._advance()
+            self._skip_newlines()  # Skip all newlines (handles comments producing extra NEWLINEs)
             if self._at(TokenType.INDENT):
                 # Multiline: parse as block
                 body = self.parse_block()
@@ -1080,12 +1102,54 @@ class Parser:
                 # Just newline, then next arm - error
                 raise ParseError("Expected expression or indented block after '=>'", span)
         else:
-            # Single line: parse expression
-            body = self.parse_expr()
+            # Single line: parse expression or control flow statement
+            body = self.parse_match_arm_body()
             # Skip newline after arm body
             self._skip_newlines()
 
         return rast.MatchArm(span, pattern, guard, body)
+
+    def parse_match_arm_body(self) -> rast.Expr:
+        """Parse a single-line match arm body.
+
+        Supports regular expressions plus control flow and assignments:
+            Some(x) => x + 1
+            None => continue
+            None => break
+            None => return -1
+            Some(x) => self.field = x   (assignment as side-effect)
+        """
+        span = self._current().span
+
+        # continue as expression
+        if self._at(TokenType.CONTINUE):
+            self._advance()
+            return rast.ContinueExpr(span)
+
+        # break as expression
+        if self._at(TokenType.BREAK):
+            self._advance()
+            return rast.BreakExpr(span)
+
+        # return as expression
+        if self._at(TokenType.RETURN):
+            self._advance()
+            # Check if there's a value (not at newline/EOF)
+            if not self._at(TokenType.NEWLINE, TokenType.EOF, TokenType.DEDENT):
+                value = self.parse_expr()
+                return rast.ReturnExpr(span, value)
+            return rast.ReturnExpr(span, None)
+
+        # Parse expression - but check for assignment after
+        expr = self.parse_expr()
+
+        # Check for assignment (convert to AssignExpr for match arm context)
+        if self._at(TokenType.EQ):
+            self._advance()
+            value = self.parse_expr()
+            return rast.AssignExpr(span, expr, value)
+
+        return expr
 
     def parse_pattern(self) -> rast.Pattern:
         """Parse a pattern."""
@@ -1345,10 +1409,34 @@ class Parser:
 
         return rast.ExprStmt(span, expr)
 
-    def parse_let(self) -> rast.LetStmt:
-        """Parse a let binding."""
+    def parse_let(self) -> rast.Stmt:
+        """Parse a let binding.
+
+        Supports both regular bindings and tuple destructuring:
+            let x = expr
+            let x: T = expr
+            let (a, b, c) = expr
+        """
         span = self._current().span
         self._expect(TokenType.LET)
+
+        # Check for tuple destructuring: let (a, b, ...) = expr
+        if self._at(TokenType.LPAREN):
+            self._advance()
+            names = []
+            while not self._at(TokenType.RPAREN):
+                name_tok = self._expect(TokenType.IDENT)
+                names.append(name_tok.value)
+                if self._at(TokenType.COMMA):
+                    self._advance()
+                else:
+                    break
+            self._expect(TokenType.RPAREN)
+            self._expect(TokenType.EQ)
+            value = self.parse_expr()
+            return rast.LetTupleStmt(span, names, value)
+
+        # Regular binding
         name_tok = self._expect(TokenType.IDENT)
 
         type_ann = None

@@ -56,6 +56,7 @@ class TokenType(Enum):
     NULL = auto()
     HEAP = auto()
     PUB = auto()
+    THEN = auto()          # then (for ternary: if cond then a else b)
 
     # Logical operators as keywords (pythonic style)
     AND = auto()           # and
@@ -172,6 +173,7 @@ KEYWORDS = {
     'null': TokenType.NULL,
     'heap': TokenType.HEAP,
     'pub': TokenType.PUB,
+    'then': TokenType.THEN,
     'for': TokenType.FOR,
     'asm': TokenType.ASM,
     'and': TokenType.AND,
