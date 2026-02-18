@@ -231,6 +231,34 @@ class MoveChecker:
                     return self.fn_return_types[fn_name]
             # Unknown function or no return type
             return rast.NamedType(expr.span, 'unknown', [])
+        elif isinstance(expr, rast.TryOp):
+            # TryOp (?) unwraps Result<T, E> to T or Option<T> to T
+            # Infer the inner type from the expression's Result/Option
+            inner = self._infer_expr_type(expr.expr)
+            if isinstance(inner, rast.NamedType) and inner.name in ('Result', 'Option'):
+                # The ok/some type is the first type argument
+                if inner.type_args:
+                    return inner.type_args[0]
+            # Fallback: return unknown (could be any type)
+            return rast.NamedType(expr.span, 'unknown', [])
+        elif isinstance(expr, rast.MethodCall):
+            # Method calls - try to find the return type
+            # For now, check if method name suggests a primitive return type
+            method = expr.method
+            # Common methods that return Copy types
+            if method in ('len', 'cap', 'count', 'size', 'is_empty', 'is_some', 'is_none',
+                          'is_ok', 'is_err', 'contains', 'unwrap_or'):
+                # These typically return usize, i64, or bool - all Copy
+                return rast.NamedType(expr.span, 'i64', [])
+            # read_* methods return Result<primitive>
+            if method.startswith('read_'):
+                type_suffix = method[5:]  # e.g., "u16", "u32", "i8", etc.
+                if type_suffix in self.COPY_TYPES:
+                    return rast.NamedType(expr.span, 'Result', [
+                        rast.NamedType(expr.span, type_suffix, [])
+                    ])
+            # Fallback to unknown
+            return rast.NamedType(expr.span, 'unknown', [])
         # Default to unknown
         return rast.NamedType(expr.span, 'unknown', [])
 

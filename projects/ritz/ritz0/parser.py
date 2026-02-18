@@ -720,14 +720,26 @@ class Parser:
                 # Function call - check if the expr has type_args attached
                 type_args = getattr(expr, '_type_args', [])
                 self._advance()
+                # Skip any newlines/indentation after opening paren (multiline calls)
+                while self._at(TokenType.NEWLINE, TokenType.INDENT, TokenType.DEDENT):
+                    self._advance()
                 args = []
                 if not self._at(TokenType.RPAREN):
                     args.append(self.parse_expr())
+                    # Skip any newlines after argument
+                    while self._at(TokenType.NEWLINE, TokenType.INDENT, TokenType.DEDENT):
+                        self._advance()
                     while self._at(TokenType.COMMA):
                         self._advance()
+                        # Skip any newlines after comma
+                        while self._at(TokenType.NEWLINE, TokenType.INDENT, TokenType.DEDENT):
+                            self._advance()
                         if self._at(TokenType.RPAREN):
                             break  # trailing comma
                         args.append(self.parse_expr())
+                        # Skip any newlines after argument
+                        while self._at(TokenType.NEWLINE, TokenType.INDENT, TokenType.DEDENT):
+                            self._advance()
                 self._expect(TokenType.RPAREN)
                 expr = rast.Call(expr.span, expr, args, type_args=type_args)
 
@@ -781,14 +793,26 @@ class Parser:
                     if self._at(TokenType.LPAREN):
                         # Method call
                         self._advance()
+                        # Skip any newlines/indentation after opening paren (multiline calls)
+                        while self._at(TokenType.NEWLINE, TokenType.INDENT, TokenType.DEDENT):
+                            self._advance()
                         args = []
                         if not self._at(TokenType.RPAREN):
                             args.append(self.parse_expr())
+                            # Skip any newlines after argument
+                            while self._at(TokenType.NEWLINE, TokenType.INDENT, TokenType.DEDENT):
+                                self._advance()
                             while self._at(TokenType.COMMA):
                                 self._advance()
+                                # Skip any newlines after comma
+                                while self._at(TokenType.NEWLINE, TokenType.INDENT, TokenType.DEDENT):
+                                    self._advance()
                                 if self._at(TokenType.RPAREN):
                                     break
                                 args.append(self.parse_expr())
+                                # Skip any newlines after argument
+                                while self._at(TokenType.NEWLINE, TokenType.INDENT, TokenType.DEDENT):
+                                    self._advance()
                         self._expect(TokenType.RPAREN)
                         expr = rast.MethodCall(expr.span, expr, field_tok.value, args)
                     else:
