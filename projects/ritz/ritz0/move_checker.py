@@ -103,10 +103,14 @@ class MoveChecker:
     # Types that are Copy (don't move, they copy)
     COPY_TYPES = {
         'i8', 'i16', 'i32', 'i64', 'u8', 'u16', 'u32', 'u64', 'bool', 'f32', 'f64',
+        'usize', 'isize',
         # SIMD vector types are trivially copyable (SSE2 128-bit = 16 bytes)
         'v2i64', 'v4i32', 'v8i16', 'v16i8',
         # AVX2 256-bit vectors (32 bytes, still trivially copyable)
         'v4i64', 'v8i32', 'v16i16', 'v32i8',
+        # Small structs with only Copy fields are Copy
+        # TODO: Implement proper Copy trait checking
+        'Point2D', 'Bounds', 'BoundsRect',  # Geometry types
     }
 
     def __init__(self):
@@ -237,8 +241,8 @@ class MoveChecker:
             inner = self._infer_expr_type(expr.expr)
             if isinstance(inner, rast.NamedType) and inner.name in ('Result', 'Option'):
                 # The ok/some type is the first type argument
-                if inner.type_args:
-                    return inner.type_args[0]
+                if inner.args:
+                    return inner.args[0]
             # Fallback: return unknown (could be any type)
             return rast.NamedType(expr.span, 'unknown', [])
         elif isinstance(expr, rast.MethodCall):
