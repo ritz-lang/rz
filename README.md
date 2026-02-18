@@ -1,8 +1,12 @@
 # Ritz 🎭
 
-**Ritz** is a systems programming language that compiles to LLVM IR with no libc dependency — direct Linux syscalls only.
+**Ritz** is a systems programming language and ecosystem for building software from the ground up.
 
-This monorepo (`rz`) contains the complete Ritz ecosystem: compiler, standard library, OS, web stack, and applications.
+The language compiles to LLVM IR and runs on multiple platforms:
+- **Linux** — direct syscalls, no libc dependency
+- **Harland** — our own microkernel OS, also written in Ritz
+
+This monorepo (`rz`) contains everything: the compiler, standard library, an operating system, a web stack, a browser engine, and real-world applications — all serving as reference implementations that demonstrate idiomatic Ritz.
 
 ## Quick Start
 
@@ -112,6 +116,12 @@ export RITZ_PATH=$PWD/projects
 - [Style Guide](projects/larb/docs/STYLE.md)
 - [Ecosystem Overview](projects/larb/docs/ECOSYSTEM.md)
 - [Standard Library Reference](projects/larb/docs/STDLIB_REFERENCE.md)
+
+## Philosophy
+
+Ritz follows a "no concessions" doctrine: if the language can't express something cleanly, we fix the language rather than work around it. Every project in this repo is both a useful tool and a test case for the language itself.
+
+The ecosystem is designed to be self-hosting: Ritz compiles itself, runs on its own OS, serves its own web applications, and renders its own fonts.
 
 ## License
 
