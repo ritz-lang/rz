@@ -1,0 +1,1319 @@
+# ENA Network Device Driver
+#
+# Driver for Amazon Elastic Network Adapter (ENA).
+# Used in AWS EC2 instances for network connectivity.
+#
+# Reference: https://github.com/amzn/amzn-drivers
+
+import serial { prints, serial_print_hex, serial_print_dec, serial_write_byte }
+import drivers.pci { PciDevice, pci_find_ena, pci_enable_bus_master, pci_enable_memory }
+import drivers.ena.regs {
+    ENA_REGS_VERSION_OFF, ENA_REGS_VERSION_MAJOR_MASK, ENA_REGS_VERSION_MAJOR_SHIFT,
+    ENA_REGS_VERSION_MINOR_MASK, ENA_REGS_CONTROLLER_VERSION_OFF,
+    ENA_REGS_CTRL_VER_MAJOR_MASK, ENA_REGS_CTRL_VER_MAJOR_SHIFT,
+    ENA_REGS_CTRL_VER_MINOR_MASK, ENA_REGS_CTRL_VER_MINOR_SHIFT,
+    ENA_REGS_CTRL_VER_SUBMINOR_MASK, ENA_REGS_DEV_CTL_OFF, ENA_REGS_DEV_CTL_DEV_RESET_MASK,
+    ENA_REGS_DEV_CTL_RESET_REASON_SHIFT, ENA_REGS_DEV_STS_OFF, ENA_REGS_DEV_STS_READY_MASK,
+    ENA_REGS_DEV_STS_RESET_FINISHED_MASK, ENA_REGS_DEV_STS_FATAL_ERROR_MASK,
+    ENA_REGS_DEV_STS_RESET_IN_PROGRESS_MASK,
+    ENA_REGS_CAPS_OFF, ENA_REGS_CAPS_RESET_TIMEOUT_MASK, ENA_REGS_CAPS_RESET_TIMEOUT_SHIFT,
+    ENA_REGS_AQ_BASE_LO_OFF, ENA_REGS_AQ_BASE_HI_OFF, ENA_REGS_AQ_CAPS_OFF,
+    ENA_REGS_AQ_CAPS_ENTRY_SIZE_SHIFT, ENA_REGS_ACQ_BASE_LO_OFF, ENA_REGS_ACQ_BASE_HI_OFF,
+    ENA_REGS_ACQ_CAPS_OFF, ENA_REGS_ACQ_CAPS_ENTRY_SIZE_SHIFT, ENA_REGS_AQ_DB_OFF,
+    ENA_REGS_ACQ_TAIL_OFF, ENA_REGS_RESET_NORMAL,
+    ENA_REGS_AENQ_BASE_LO_OFF, ENA_REGS_AENQ_BASE_HI_OFF, ENA_REGS_AENQ_CAPS_OFF,
+    ENA_REGS_AENQ_CAPS_ENTRY_SIZE_SHIFT
+}
+import drivers.ena.admin {
+    EnaAdminAqEntry, EnaAdminAcqEntry, EnaAdminGetFeatureCmd, EnaAdminCreateCqCmd,
+    EnaAdminCreateCqResp, EnaAdminCreateSqCmd, EnaAdminCreateSqResp,
+    EnaAdminDeviceAttrFeature, EnaAdminMaxQueuesFeature, EnaAdminAenqEntry,
+    EnaAdminSetFeatureCmd, EnaAdminAenqFeature,
+    ENA_ADMIN_AQ_ENTRY_SIZE, ENA_ADMIN_ACQ_ENTRY_SIZE, ENA_ADMIN_ACQ_FLAG_PHASE,
+    ENA_ADMIN_AENQ_ENTRY_SIZE,
+    ENA_ADMIN_GET_FEATURE, ENA_ADMIN_SET_FEATURE, ENA_ADMIN_CREATE_CQ, ENA_ADMIN_CREATE_SQ,
+    ENA_ADMIN_DEVICE_ATTRIBUTES, ENA_ADMIN_MAX_QUEUES_NUM, ENA_ADMIN_AENQ_CONFIG, ENA_ADMIN_SUCCESS,
+    ENA_ADMIN_PLACEMENT_POLICY_HOST, ENA_ADMIN_COMPLETION_POLICY_DESC,
+    ENA_ADMIN_SQ_IDENTITY_DIRECTION_SHIFT, ENA_ADMIN_SQ_CAPS2_COMPLETION_SHIFT,
+    ENA_ADMIN_SQ_CAPS3_CONTIGUOUS_MASK,
+    ENA_ADMIN_AENQ_LINK_CHANGE, ENA_ADMIN_AENQ_FATAL_ERROR, ENA_ADMIN_AENQ_WARNING,
+    ENA_ADMIN_AENQ_NOTIFICATION, ENA_ADMIN_AENQ_KEEP_ALIVE
+}
+import drivers.ena.io {
+    EnaTxDesc, EnaRxDesc, EnaRxCdescBase,
+    ENA_TX_DESC_SIZE, ENA_RX_DESC_SIZE, ENA_RX_CDESC_BASE_SIZE,
+    ena_tx_build_len_ctrl, ena_tx_build_meta_ctrl_simple, ena_rx_build_ctrl,
+    ena_rx_cdesc_phase_matches, ena_rx_cdesc_get_length, ena_rx_cdesc_get_req_id
+}
+import mm.pmm { pmm_alloc_page, pmm_free_page, PAGE_SIZE }
+import mm.vmm { vmm_virt_to_phys, vmm_map_page, PTE_WRITABLE }
+
+# ============================================================================
+# Configuration Constants
+# ============================================================================
+
+const ENA_MAX_QUEUES: u32 = 4
+const ENA_ADMIN_QUEUE_DEPTH: u32 = 32
+const ENA_ADMIN_CQ_DEPTH: u32 = 32
+const ENA_AENQ_DEPTH: u32 = 32
+const ENA_IO_QUEUE_DEPTH: u32 = 256  # ENA minimum is 256 (ENA_MIN_RING_SIZE)
+const ENA_RX_BUFFER_SIZE: u32 = 2048
+const ENA_TX_BUFFER_SIZE: u32 = 2048
+const ENA_RX_BUFFER_COUNT: u32 = 8   # Reduced for initial testing
+const ENA_TX_BUFFER_COUNT: u32 = 8   # Reduced for initial testing
+
+const ENA_ADMIN_TIMEOUT_US: u32 = 3000000   # 3 seconds
+const ENA_RESET_TIMEOUT_MS: u32 = 1000
+
+# Local constants to avoid module access issues
+const SQ_DIR_TX: u8 = 1
+const SQ_DIR_RX: u8 = 2
+
+# ============================================================================
+# Admin Queue State
+# ============================================================================
+
+struct EnaAdminQueue
+    sq_entries: *EnaAdminAqEntry    # Submission queue entries
+    cq_entries: *EnaAdminAcqEntry   # Completion queue entries
+    sq_phys: u64                          # SQ physical address
+    cq_phys: u64                          # CQ physical address
+    sq_depth: u16
+    cq_depth: u16
+    sq_head: u16                          # Next entry to submit
+    sq_tail: u16                          # Last submitted
+    cq_head: u16                          # Next completion to process
+    sq_phase: u8                          # Current SQ phase bit
+    cq_phase: u8                          # Expected CQ phase bit
+    cmd_id: u16                           # Rolling command ID
+
+# ============================================================================
+# AENQ State (Async Event Notification Queue)
+# ============================================================================
+
+struct EnaAenq
+    entries: *EnaAdminAenqEntry    # AENQ entries
+    phys: u64                            # Physical address
+    depth: u16
+    head: u16                            # Next entry to process
+    phase: u8                            # Expected phase bit
+
+# ============================================================================
+# I/O Queue State
+# ============================================================================
+
+struct EnaIoSq
+    entries: *EnaTxDesc        # For TX: EnaTxDesc, For RX: EnaRxDesc
+    phys: u64                     # Physical address
+    depth: u16
+    head: u16                     # Next to submit
+    tail: u16                     # Last submitted
+    phase: u8
+    doorbell_offset: u32          # Doorbell offset from BAR
+
+struct EnaIoCq
+    entries: *EnaRxCdescBase   # Completion entries
+    phys: u64
+    depth: u16
+    head: u16                     # Next to process
+    phase: u8                     # Expected phase
+    hw_index: u16                 # Hardware-assigned CQ index
+    unmask_offset: u32            # Interrupt unmask register offset
+
+# ============================================================================
+# ENA Device State
+# ============================================================================
+
+pub struct EnaDevice
+    pci_dev: *PciDevice
+    bar0: u64                     # MMIO base address (from BAR0)
+    bar0_size: u64
+    admin_queue: EnaAdminQueue
+    aenq: EnaAenq                 # Async Event Notification Queue
+    tx_sq: EnaIoSq
+    tx_cq: EnaIoCq
+    rx_sq: EnaIoSq
+    rx_cq: EnaIoCq
+    mac: [6]u8
+    mtu: u16
+    max_tx_queues: u16
+    max_rx_queues: u16
+    max_sq_depth: u16
+    max_cq_depth: u16
+    initialized: u8
+
+# Global device instance
+var ena_dev: EnaDevice
+
+# Pre-allocated RX/TX buffers (reduced for initial testing)
+var ena_rx_buffers: [16384]u8     # 8 * 2048 = 16KB
+var ena_tx_buffers: [16384]u8     # 8 * 2048 = 16KB
+
+# RX buffer tracking
+var ena_rx_req_to_buf: [256]u16   # req_id -> buffer index
+
+# ============================================================================
+# Address Calculation Helpers
+# ============================================================================
+
+fn ena_admin_sq_entry_addr(aq: *EnaAdminQueue, idx: u16) -> u64
+    let base: u64 = (*aq).sq_entries as u64
+    let offset: u64 = (idx as u64) * (ENA_ADMIN_AQ_ENTRY_SIZE as u64)
+    base + offset
+
+fn ena_admin_cq_entry_addr(aq: *EnaAdminQueue, idx: u16) -> u64
+    let base: u64 = (*aq).cq_entries as u64
+    let offset: u64 = (idx as u64) * (ENA_ADMIN_ACQ_ENTRY_SIZE as u64)
+    base + offset
+
+fn ena_io_sq_entry_addr(sq: *EnaIoSq, idx: u16, entry_size: u32) -> u64
+    let base: u64 = (*sq).entries as u64
+    let offset: u64 = (idx as u64) * (entry_size as u64)
+    base + offset
+
+fn ena_io_cq_entry_addr(cq: *EnaIoCq, idx: u16, entry_size: u32) -> u64
+    let base: u64 = (*cq).entries as u64
+    let offset: u64 = (idx as u64) * (entry_size as u64)
+    base + offset
+
+fn ena_get_prev_cq_head(aq: *EnaAdminQueue) -> u16
+    if (*aq).cq_head == 0
+        return (ENA_ADMIN_CQ_DEPTH - 1) as u16
+    (*aq).cq_head - 1
+
+fn ena_get_phys_or_virt(phys: u64, virt: u64) -> u64
+    if phys != 0
+        return phys
+    virt
+
+# ============================================================================
+# MMIO Register Access
+# ============================================================================
+
+fn ena_read32(dev: *EnaDevice, offset: u32) -> u32
+    let addr: *u32 = ((*dev).bar0 + offset as u64) as *u32
+    *addr
+
+fn ena_write32(dev: *EnaDevice, offset: u32, value: u32)
+    let addr: *u32 = ((*dev).bar0 + offset as u64) as *u32
+    *addr = value
+    # Memory fence to ensure write is visible
+    asm x86_64:
+        mfence
+
+# ============================================================================
+# Device Reset and Status
+# ============================================================================
+
+# Read capabilities register to get reset timeout
+fn ena_get_reset_timeout(dev: *EnaDevice) -> u32
+    let caps: u32 = ena_read32(dev, ENA_REGS_CAPS_OFF)
+    # Timeout is in 100ms units, bits 5:1
+    let timeout_100ms: u32 = (caps & ENA_REGS_CAPS_RESET_TIMEOUT_MASK) >> ENA_REGS_CAPS_RESET_TIMEOUT_SHIFT
+    if timeout_100ms == 0
+        return 10  # Default 1 second (10 * 100ms)
+    return timeout_100ms
+
+# Wait for reset state to match expected value
+fn ena_wait_for_reset_state(dev: *EnaDevice, expected_state: u32, timeout_100ms: u32) -> i32
+    # Convert 100ms units to iterations (roughly 100k loops per 100ms)
+    var max_iterations: u64 = (timeout_100ms as u64) * 100000
+    if max_iterations < 1000000
+        max_iterations = 1000000  # Minimum ~1 second
+
+    var iterations: u64 = 0
+    while iterations < max_iterations
+        let status: u32 = ena_read32(dev, ENA_REGS_DEV_STS_OFF)
+        let reset_in_progress: u32 = status & ENA_REGS_DEV_STS_RESET_IN_PROGRESS_MASK
+
+        if reset_in_progress == expected_state
+            return 0
+
+        # Simple delay loop with some volatility to prevent optimization
+        var delay: u32 = 0
+        while delay < 100
+            asm x86_64:
+                pause
+            delay = delay + 1
+
+        iterations = iterations + 1
+
+    return -1  # Timeout
+
+fn ena_device_reset(dev: *EnaDevice, reason: u8) -> i32
+    prints("[ena] Resetting device (reason ")
+    serial_print_dec(reason as u64)
+    prints(")...\n")
+
+    # Get reset timeout from capabilities register
+    let timeout_100ms: u32 = ena_get_reset_timeout(dev)
+    prints("[ena] Reset timeout: ")
+    serial_print_dec(timeout_100ms as u64)
+    prints(" x 100ms\n")
+
+    # Check current device status
+    let initial_status: u32 = ena_read32(dev, ENA_REGS_DEV_STS_OFF)
+    prints("[ena] Initial status: 0x")
+    serial_print_hex(initial_status as u64)
+    prints("\n")
+
+    # Phase 1: Trigger reset by setting reset bit with reason
+    var ctl: u32 = ENA_REGS_DEV_CTL_DEV_RESET_MASK
+    ctl = ctl | ((reason as u32) << ENA_REGS_DEV_CTL_RESET_REASON_SHIFT)
+    ena_write32(dev, ENA_REGS_DEV_CTL_OFF, ctl)
+
+    # Wait for reset-in-progress to become active
+    prints("[ena] Waiting for reset to start...\n")
+    var result: i32 = ena_wait_for_reset_state(dev, ENA_REGS_DEV_STS_RESET_IN_PROGRESS_MASK, timeout_100ms)
+    if result != 0
+        # Some devices may not set reset-in-progress, try alternative approach
+        prints("[ena] Reset-in-progress not seen, trying alternative...\n")
+        # Read status again
+        let status2: u32 = ena_read32(dev, ENA_REGS_DEV_STS_OFF)
+        prints("[ena] Status after trigger: 0x")
+        serial_print_hex(status2 as u64)
+        prints("\n")
+
+    # Phase 2: Clear reset bit to allow device to complete reset
+    ena_write32(dev, ENA_REGS_DEV_CTL_OFF, 0)
+
+    # Wait for reset-in-progress to clear
+    prints("[ena] Waiting for reset to complete...\n")
+    result = ena_wait_for_reset_state(dev, 0, timeout_100ms)
+    if result != 0
+        let final_status: u32 = ena_read32(dev, ENA_REGS_DEV_STS_OFF)
+        prints("[ena] ERROR: Reset timeout, final status: 0x")
+        serial_print_hex(final_status as u64)
+        prints("\n")
+
+        # Check for fatal error
+        if (final_status & ENA_REGS_DEV_STS_FATAL_ERROR_MASK) != 0
+            prints("[ena] ERROR: Device has fatal error!\n")
+
+        return -1
+
+    prints("[ena] Reset complete\n")
+    return 0
+
+fn ena_wait_for_ready(dev: *EnaDevice) -> i32
+    var timeout: u32 = 0
+    while timeout < 10000
+        let status: u32 = ena_read32(dev, ENA_REGS_DEV_STS_OFF)
+        if (status & ENA_REGS_DEV_STS_READY_MASK) != 0
+            return 0
+        # Check for fatal error
+        if (status & ENA_REGS_DEV_STS_FATAL_ERROR_MASK) != 0
+            prints("[ena] ERROR: Device fatal error\n")
+            return -1
+        # Simple delay
+        var i: u32 = 0
+        while i < 10000
+            i = i + 1
+        timeout = timeout + 1
+
+    prints("[ena] ERROR: Device not ready (timeout)\n")
+    return -1
+
+# ============================================================================
+# Admin Queue Operations
+# ============================================================================
+
+fn ena_admin_queue_init(dev: *EnaDevice) -> i32
+    prints("[ena] Initializing admin queue...\n")
+
+    let aq: *EnaAdminQueue = @(*dev).admin_queue
+
+    # Allocate admin SQ memory (must be contiguous)
+    let sq_size: u64 = (ENA_ADMIN_QUEUE_DEPTH * ENA_ADMIN_AQ_ENTRY_SIZE) as u64
+    let sq_page: u64 = pmm_alloc_page()
+    if sq_page == 0
+        prints("[ena] ERROR: Failed to allocate admin SQ\n")
+        return -1
+
+    (*aq).sq_entries = sq_page as *EnaAdminAqEntry
+    (*aq).sq_phys = vmm_virt_to_phys(sq_page)
+    if (*aq).sq_phys == 0
+        (*aq).sq_phys = sq_page  # Identity mapped
+
+    # Allocate admin CQ memory
+    let cq_size: u64 = (ENA_ADMIN_CQ_DEPTH * ENA_ADMIN_ACQ_ENTRY_SIZE) as u64
+    let cq_page: u64 = pmm_alloc_page()
+    if cq_page == 0
+        prints("[ena] ERROR: Failed to allocate admin CQ\n")
+        return -1
+
+    (*aq).cq_entries = cq_page as *EnaAdminAcqEntry
+    (*aq).cq_phys = vmm_virt_to_phys(cq_page)
+    if (*aq).cq_phys == 0
+        (*aq).cq_phys = cq_page
+
+    # Zero out the queues
+    var i: u64 = 0
+    while i < PAGE_SIZE
+        *((sq_page + i) as *u8) = 0
+        *((cq_page + i) as *u8) = 0
+        i = i + 1
+
+    # Initialize queue state
+    (*aq).sq_depth = ENA_ADMIN_QUEUE_DEPTH as u16
+    (*aq).cq_depth = ENA_ADMIN_CQ_DEPTH as u16
+    (*aq).sq_head = 0
+    (*aq).sq_tail = 0
+    (*aq).cq_head = 0
+    (*aq).sq_phase = 1
+    (*aq).cq_phase = 1
+    (*aq).cmd_id = 0
+
+    # Write admin SQ base address
+    ena_write32(dev, ENA_REGS_AQ_BASE_LO_OFF, ((*aq).sq_phys & 0xFFFFFFFF) as u32)
+    ena_write32(dev, ENA_REGS_AQ_BASE_HI_OFF, (((*aq).sq_phys >> 32) & 0xFFFFFFFF) as u32)
+
+    # Write admin SQ caps (depth in lower 16 bits, entry size in upper 16 bits)
+    var aq_caps: u32 = ENA_ADMIN_QUEUE_DEPTH as u32
+    aq_caps = aq_caps | ((ENA_ADMIN_AQ_ENTRY_SIZE as u32) << ENA_REGS_AQ_CAPS_ENTRY_SIZE_SHIFT)
+    ena_write32(dev, ENA_REGS_AQ_CAPS_OFF, aq_caps)
+
+    # Write admin CQ base address
+    ena_write32(dev, ENA_REGS_ACQ_BASE_LO_OFF, ((*aq).cq_phys & 0xFFFFFFFF) as u32)
+    ena_write32(dev, ENA_REGS_ACQ_BASE_HI_OFF, (((*aq).cq_phys >> 32) & 0xFFFFFFFF) as u32)
+
+    # Write admin CQ caps (same format: depth | entry_size << 16)
+    var acq_caps: u32 = ENA_ADMIN_CQ_DEPTH as u32
+    acq_caps = acq_caps | ((ENA_ADMIN_ACQ_ENTRY_SIZE as u32) << ENA_REGS_ACQ_CAPS_ENTRY_SIZE_SHIFT)
+    ena_write32(dev, ENA_REGS_ACQ_CAPS_OFF, acq_caps)
+
+    prints("[ena] Admin queue initialized\n")
+    prints("[ena]   SQ: phys=0x")
+    serial_print_hex((*aq).sq_phys)
+    prints(" depth=")
+    serial_print_dec(ENA_ADMIN_QUEUE_DEPTH as u64)
+    prints(" entry_size=")
+    serial_print_dec(ENA_ADMIN_AQ_ENTRY_SIZE as u64)
+    prints("\n")
+    prints("[ena]   CQ: phys=0x")
+    serial_print_hex((*aq).cq_phys)
+    prints(" depth=")
+    serial_print_dec(ENA_ADMIN_CQ_DEPTH as u64)
+    prints(" entry_size=")
+    serial_print_dec(ENA_ADMIN_ACQ_ENTRY_SIZE as u64)
+    prints("\n")
+    prints("[ena]   AQ_CAPS=0x")
+    serial_print_hex(aq_caps as u64)
+    prints(" ACQ_CAPS=0x")
+    serial_print_hex(acq_caps as u64)
+    prints("\n")
+
+    # Initialize AENQ (Async Event Notification Queue)
+    let aenq_result: i32 = ena_aenq_init(dev)
+    if aenq_result != 0
+        prints("[ena] Warning: AENQ init failed, continuing anyway\n")
+
+    return 0
+
+fn ena_aenq_init(dev: *EnaDevice) -> i32
+    prints("[ena] Initializing AENQ...\n")
+
+    let aenq: *EnaAenq = @(*dev).aenq
+
+    # Allocate AENQ memory
+    let aenq_size: u64 = (ENA_AENQ_DEPTH * ENA_ADMIN_AENQ_ENTRY_SIZE) as u64
+    let aenq_page: u64 = pmm_alloc_page()
+    if aenq_page == 0
+        prints("[ena] ERROR: Failed to allocate AENQ\n")
+        return -1
+
+    (*aenq).entries = aenq_page as *EnaAdminAenqEntry
+    (*aenq).phys = vmm_virt_to_phys(aenq_page)
+    if (*aenq).phys == 0
+        (*aenq).phys = aenq_page  # Identity mapped
+
+    # Zero out the queue
+    var i: u64 = 0
+    while i < PAGE_SIZE
+        *((aenq_page + i) as *u8) = 0
+        i = i + 1
+
+    # Initialize AENQ state
+    (*aenq).depth = ENA_AENQ_DEPTH as u16
+    (*aenq).head = 0
+    (*aenq).phase = 1
+
+    # Write AENQ base address to registers
+    ena_write32(dev, ENA_REGS_AENQ_BASE_LO_OFF, ((*aenq).phys & 0xFFFFFFFF) as u32)
+    ena_write32(dev, ENA_REGS_AENQ_BASE_HI_OFF, (((*aenq).phys >> 32) & 0xFFFFFFFF) as u32)
+
+    # Write AENQ caps (depth in lower 16 bits, entry size in upper 16 bits)
+    var aenq_caps: u32 = ENA_AENQ_DEPTH as u32
+    aenq_caps = aenq_caps | ((ENA_ADMIN_AENQ_ENTRY_SIZE as u32) << ENA_REGS_AENQ_CAPS_ENTRY_SIZE_SHIFT)
+    ena_write32(dev, ENA_REGS_AENQ_CAPS_OFF, aenq_caps)
+
+    prints("[ena]   AENQ: phys=0x")
+    serial_print_hex((*aenq).phys)
+    prints(" depth=")
+    serial_print_dec(ENA_AENQ_DEPTH as u64)
+    prints(" caps=0x")
+    serial_print_hex(aenq_caps as u64)
+    prints("\n")
+
+    return 0
+
+fn ena_admin_submit_cmd(dev: *EnaDevice, cmd: *EnaAdminAqEntry) -> u16
+    let aq: *EnaAdminQueue = @(*dev).admin_queue
+
+    # Get command ID and increment (12-bit wrap)
+    let cmd_id: u16 = (*aq).cmd_id
+    (*aq).cmd_id = ((*aq).cmd_id + 1) & 0x0FFF
+
+    # Set command ID and phase bit in the command
+    # The phase bit goes in flags[0]
+    (*cmd).common_desc.command_id = cmd_id
+    (*cmd).common_desc.flags = (*aq).sq_phase
+
+    # Get the tail position (where we write next)
+    let tail_masked: u16 = (*aq).sq_tail
+    let entry_addr: u64 = ena_admin_sq_entry_addr(aq, tail_masked)
+    let dst: *EnaAdminAqEntry = entry_addr as *EnaAdminAqEntry
+
+    # Copy command to submission queue at tail position
+    var i: u32 = 0
+    while i < ENA_ADMIN_AQ_ENTRY_SIZE
+        *((dst as u64 + i as u64) as *u8) = *((cmd as u64 + i as u64) as *u8)
+        i = i + 1
+
+    # Advance tail and flip phase if we wrap
+    (*aq).sq_tail = (*aq).sq_tail + 1
+    if (*aq).sq_tail as u32 >= ENA_ADMIN_QUEUE_DEPTH
+        (*aq).sq_tail = 0
+        (*aq).sq_phase = (*aq).sq_phase ^ 1
+
+    # Memory barrier before doorbell
+    asm x86_64:
+        mfence
+
+    # Ring doorbell with the NEW tail value (after increment)
+    # This tells the device "there's a new command up to this tail"
+    ena_write32(dev, ENA_REGS_AQ_DB_OFF, (*aq).sq_tail as u32)
+
+    # Debug output
+    prints("[ena] Submitted cmd: id=")
+    serial_print_dec(cmd_id as u64)
+    prints(" opcode=")
+    serial_print_dec((*cmd).common_desc.opcode as u64)
+    prints(" tail=")
+    serial_print_dec((*aq).sq_tail as u64)
+    prints(" phase=")
+    serial_print_dec(((*aq).sq_phase ^ 1) as u64)  # Previous phase (what we wrote)
+    prints("\n")
+
+    cmd_id
+
+fn ena_admin_wait_completion(dev: *EnaDevice, cmd_id: u16) -> i32
+    let aq: *EnaAdminQueue = @(*dev).admin_queue
+
+    var timeout: u32 = 0
+    while timeout < 100000
+        # Read memory barrier before checking completion
+        asm x86_64:
+            lfence
+
+        let entry_addr: u64 = ena_admin_cq_entry_addr(aq, (*aq).cq_head)
+        let cqe: *EnaAdminAcqEntry = entry_addr as *EnaAdminAcqEntry
+
+        # Check phase bit - device sets this to indicate valid completion
+        let cqe_phase: u8 = (*cqe).common_desc.flags & ENA_ADMIN_ACQ_FLAG_PHASE
+        if cqe_phase == (*aq).cq_phase
+            # Read barrier to ensure we read the rest after phase check
+            asm x86_64:
+                lfence
+
+            # Verify command ID matches (lower 12 bits)
+            let resp_cmd_id: u16 = (*cqe).common_desc.command_id & 0x0FFF
+            if resp_cmd_id == cmd_id
+                let status: u8 = (*cqe).common_desc.status
+
+                # Always advance CQ head after processing, even on error
+                (*aq).cq_head = (*aq).cq_head + 1
+                if (*aq).cq_head as u32 >= ENA_ADMIN_CQ_DEPTH
+                    (*aq).cq_head = 0
+                    (*aq).cq_phase = (*aq).cq_phase ^ 1
+
+                # Update ACQ tail to tell device we consumed this entry
+                ena_write32(dev, ENA_REGS_ACQ_TAIL_OFF, (*aq).cq_head as u32)
+
+                if status == ENA_ADMIN_SUCCESS
+                    return 0
+                else
+                    prints("[ena] Admin command failed, status: ")
+                    serial_print_dec(status as u64)
+                    prints(" extended_status: 0x")
+                    serial_print_hex((*cqe).common_desc.extended_status as u64)
+                    prints(" (cmd_id=")
+                    serial_print_dec(cmd_id as u64)
+                    prints(")\n")
+                    return -(status as i32)
+
+        # Pause to avoid hammering the bus
+        asm x86_64:
+            pause
+        timeout = timeout + 1
+
+    prints("[ena] Admin command timeout (cmd_id=")
+    serial_print_dec(cmd_id as u64)
+    prints(", cq_head=")
+    serial_print_dec((*aq).cq_head as u64)
+    prints(", cq_phase=")
+    serial_print_dec((*aq).cq_phase as u64)
+    prints(")\n")
+
+    # Debug: dump the CQ entry we're looking at
+    let entry_addr: u64 = ena_admin_cq_entry_addr(aq, (*aq).cq_head)
+    let cqe: *EnaAdminAcqEntry = entry_addr as *EnaAdminAcqEntry
+    prints("[ena] CQ entry: flags=0x")
+    serial_print_hex((*cqe).common_desc.flags as u64)
+    prints(" cmd_id=")
+    serial_print_dec((*cqe).common_desc.command_id as u64)
+    prints(" status=")
+    serial_print_dec((*cqe).common_desc.status as u64)
+    prints("\n")
+
+    return -1
+
+# ============================================================================
+# Feature Queries
+# ============================================================================
+
+fn ena_get_device_attributes(dev: *EnaDevice) -> i32
+    prints("[ena] Getting device attributes...\n")
+
+    var cmd: EnaAdminGetFeatureCmd
+    var i: u32 = 0
+    while i < 64
+        *((@cmd as u64 + i as u64) as *u8) = 0
+        i = i + 1
+
+    cmd.common_desc.opcode = ENA_ADMIN_GET_FEATURE
+    cmd.feature_id = ENA_ADMIN_DEVICE_ATTRIBUTES
+
+    let cmd_id: u16 = ena_admin_submit_cmd(dev, @cmd as *EnaAdminAqEntry)
+    let result: i32 = ena_admin_wait_completion(dev, cmd_id)
+
+    if result != 0
+        prints("[ena] Failed to get device attributes\n")
+        return result
+
+    # Parse response from CQ
+    let aq: *EnaAdminQueue = @(*dev).admin_queue
+    let prev_head: u16 = ena_get_prev_cq_head(aq)
+    let entry_addr: u64 = ena_admin_cq_entry_addr(aq, prev_head)
+    let resp: *EnaAdminDeviceAttrFeature = entry_addr as *EnaAdminDeviceAttrFeature
+
+    # Copy MAC address
+    var j: i32 = 0
+    while j < 6
+        (*dev).mac[j] = (*resp).mac_addr[j]
+        j = j + 1
+
+    (*dev).mtu = (*resp).max_mtu as u16
+
+    prints("[ena] Device attributes:\n")
+    prints("[ena]   MAC: ")
+    ena_print_mac(dev)
+    prints("\n")
+    prints("[ena]   Max MTU: ")
+    serial_print_dec((*dev).mtu as u64)
+    prints("\n")
+
+    return 0
+
+fn ena_get_max_queues(dev: *EnaDevice) -> i32
+    prints("[ena] Getting max queues info...\n")
+
+    var cmd: EnaAdminGetFeatureCmd
+    var i: u32 = 0
+    while i < 64
+        *((@cmd as u64 + i as u64) as *u8) = 0
+        i = i + 1
+
+    cmd.common_desc.opcode = ENA_ADMIN_GET_FEATURE
+    cmd.feature_id = ENA_ADMIN_MAX_QUEUES_NUM
+
+    let cmd_id: u16 = ena_admin_submit_cmd(dev, @cmd as *EnaAdminAqEntry)
+    let result: i32 = ena_admin_wait_completion(dev, cmd_id)
+
+    if result != 0
+        prints("[ena] Failed to get max queues (may not be supported)\n")
+        # Set defaults
+        (*dev).max_tx_queues = 1
+        (*dev).max_rx_queues = 1
+        (*dev).max_sq_depth = ENA_IO_QUEUE_DEPTH as u16
+        (*dev).max_cq_depth = ENA_IO_QUEUE_DEPTH as u16
+        return 0
+
+    # Parse response
+    let aq: *EnaAdminQueue = @(*dev).admin_queue
+    let prev_head: u16 = ena_get_prev_cq_head(aq)
+    let entry_addr: u64 = ena_admin_cq_entry_addr(aq, prev_head)
+    let resp: *EnaAdminMaxQueuesFeature = entry_addr as *EnaAdminMaxQueuesFeature
+
+    (*dev).max_tx_queues = ((*resp).max_sq_num / 2) as u16  # Half for TX
+    (*dev).max_rx_queues = ((*resp).max_sq_num / 2) as u16  # Half for RX
+    (*dev).max_sq_depth = (*resp).max_sq_depth as u16
+    (*dev).max_cq_depth = (*resp).max_cq_depth as u16
+
+    if (*dev).max_tx_queues == 0
+        (*dev).max_tx_queues = 1
+    if (*dev).max_rx_queues == 0
+        (*dev).max_rx_queues = 1
+
+    prints("[ena] Queue limits:\n")
+    prints("[ena]   Max TX queues: ")
+    serial_print_dec((*dev).max_tx_queues as u64)
+    prints("\n")
+    prints("[ena]   Max RX queues: ")
+    serial_print_dec((*dev).max_rx_queues as u64)
+    prints("\n")
+    prints("[ena]   Max SQ depth: ")
+    serial_print_dec((*dev).max_sq_depth as u64)
+    prints("\n")
+
+    return 0
+
+# ============================================================================
+# AENQ Configuration
+# ============================================================================
+
+fn ena_set_aenq_config(dev: *EnaDevice) -> i32
+    prints("[ena] Setting AENQ config...\n")
+
+    # First, get the supported groups
+    var get_cmd: EnaAdminGetFeatureCmd
+    var i: u32 = 0
+    while i < 64
+        *((@get_cmd as u64 + i as u64) as *u8) = 0
+        i = i + 1
+
+    get_cmd.common_desc.opcode = ENA_ADMIN_GET_FEATURE
+    get_cmd.feature_id = ENA_ADMIN_AENQ_CONFIG
+
+    var cmd_id: u16 = ena_admin_submit_cmd(dev, @get_cmd as *EnaAdminAqEntry)
+    var result: i32 = ena_admin_wait_completion(dev, cmd_id)
+
+    if result != 0
+        prints("[ena] Failed to get AENQ config\n")
+        return result
+
+    # Parse response
+    let aq: *EnaAdminQueue = @(*dev).admin_queue
+    var prev_head: u16 = ena_get_prev_cq_head(aq)
+    var entry_addr: u64 = ena_admin_cq_entry_addr(aq, prev_head)
+    let resp: *EnaAdminAenqFeature = entry_addr as *EnaAdminAenqFeature
+
+    let supported: u32 = (*resp).supported_groups
+    prints("[ena]   Supported AENQ groups: 0x")
+    serial_print_hex(supported as u64)
+    prints("\n")
+
+    # Request to enable: link change, fatal error, warning, notification, keep-alive
+    var requested: u32 = (1 << ENA_ADMIN_AENQ_LINK_CHANGE as u32)
+    requested = requested | (1 << ENA_ADMIN_AENQ_FATAL_ERROR as u32)
+    requested = requested | (1 << ENA_ADMIN_AENQ_WARNING as u32)
+    requested = requested | (1 << ENA_ADMIN_AENQ_NOTIFICATION as u32)
+    requested = requested | (1 << ENA_ADMIN_AENQ_KEEP_ALIVE as u32)
+
+    # Mask with what device supports
+    let enabled: u32 = requested & supported
+
+    prints("[ena]   Enabling AENQ groups: 0x")
+    serial_print_hex(enabled as u64)
+    prints("\n")
+
+    # Now set the feature
+    var set_cmd: EnaAdminSetFeatureCmd
+    i = 0
+    while i < 64
+        *((@set_cmd as u64 + i as u64) as *u8) = 0
+        i = i + 1
+
+    set_cmd.common_desc.opcode = ENA_ADMIN_SET_FEATURE
+    set_cmd.feature_id = ENA_ADMIN_AENQ_CONFIG
+    set_cmd.aenq_enabled_groups = enabled
+
+    cmd_id = ena_admin_submit_cmd(dev, @set_cmd as *EnaAdminAqEntry)
+    result = ena_admin_wait_completion(dev, cmd_id)
+
+    if result != 0
+        prints("[ena] Failed to set AENQ config\n")
+        return result
+
+    prints("[ena] AENQ config set successfully\n")
+    return 0
+
+# ============================================================================
+# I/O Queue Setup
+# ============================================================================
+
+fn ena_create_cq(dev: *EnaDevice, qid: u16, depth: u16, direction: u8, cq_out: *EnaIoCq) -> i32
+    prints("[ena] Creating CQ ")
+    serial_print_dec(qid as u64)
+    if direction == SQ_DIR_TX
+        prints(" (TX)...\n")
+    else
+        prints(" (RX)...\n")
+
+    # Entry size depends on direction:
+    # TX CQ uses 8-byte entries (EnaTxCdescExt: 2 words)
+    # RX CQ uses 16-byte entries (EnaRxCdescBase: 4 words)
+    var entry_size_words: u8 = 4  # RX default: 16 bytes = 4 words
+    var entry_size_bytes: u64 = 16
+    if direction == SQ_DIR_TX
+        entry_size_words = 2  # TX: 8 bytes = 2 words
+        entry_size_bytes = 8
+
+    # Allocate CQ memory
+    let cq_size: u64 = (depth as u64) * entry_size_bytes
+    let pages_needed: u64 = (cq_size + PAGE_SIZE - 1) / PAGE_SIZE
+    let cq_page: u64 = pmm_alloc_page()
+    if cq_page == 0
+        prints("[ena] ERROR: Failed to allocate CQ memory\n")
+        return -1
+
+    (*cq_out).entries = cq_page as *EnaRxCdescBase
+    (*cq_out).phys = vmm_virt_to_phys(cq_page)
+    if (*cq_out).phys == 0
+        (*cq_out).phys = cq_page
+    (*cq_out).depth = depth
+    (*cq_out).head = 0
+    (*cq_out).phase = 1
+
+    # Zero out CQ
+    var i: u64 = 0
+    while i < PAGE_SIZE
+        *((cq_page + i) as *u8) = 0
+        i = i + 1
+
+    # Build admin command
+    var cmd: EnaAdminCreateCqCmd
+    i = 0
+    while i < 64
+        *((@cmd as u64 + i) as *u8) = 0
+        i = i + 1
+
+    cmd.common_desc.opcode = ENA_ADMIN_CREATE_CQ
+    # The C driver always sets interrupt mode enabled (bit 5), even when polling
+    cmd.cq_caps_1 = 0x20  # Interrupt mode enabled mask
+    cmd.cq_caps_2 = entry_size_words  # Entry size in words (TX=2, RX=4)
+    cmd.cq_depth = depth
+    cmd.msix_vector = 0
+    cmd.cq_ba_lo = ((*cq_out).phys & 0xFFFFFFFF) as u32
+    cmd.cq_ba_hi = (((*cq_out).phys >> 32) & 0xFFFF) as u16
+    cmd.cq_ba_reserved = 0
+
+    prints("[ena] CQ caps1=0x")
+    serial_print_hex(cmd.cq_caps_1 as u64)
+    prints(" caps2=")
+    serial_print_dec(entry_size_words as u64)
+    prints(" words (")
+    serial_print_dec(entry_size_bytes)
+    prints(" bytes)\n")
+
+    let cmd_id: u16 = ena_admin_submit_cmd(dev, @cmd as *EnaAdminAqEntry)
+    let result: i32 = ena_admin_wait_completion(dev, cmd_id)
+
+    if result != 0
+        prints("[ena] Failed to create CQ\n")
+        return result
+
+    # Get response with HW index and interrupt unmask offset
+    let aq: *EnaAdminQueue = @(*dev).admin_queue
+    let prev_head: u16 = ena_get_prev_cq_head(aq)
+    let entry_addr: u64 = ena_admin_cq_entry_addr(aq, prev_head)
+    let resp: *EnaAdminCreateCqResp = entry_addr as *EnaAdminCreateCqResp
+
+    (*cq_out).hw_index = (*resp).cq_idx
+    (*cq_out).unmask_offset = (*resp).cq_interrupt_unmask_offset
+
+    prints("[ena] CQ ")
+    serial_print_dec(qid as u64)
+    prints(" created, hw_idx=")
+    serial_print_dec((*cq_out).hw_index as u64)
+    prints("\n")
+
+    return 0
+
+fn ena_create_sq(dev: *EnaDevice, qid: u16, cq_idx: u16, direction: u8, depth: u16, sq_out: *EnaIoSq) -> i32
+    prints("[ena] Creating SQ ")
+    serial_print_dec(qid as u64)
+    if direction == SQ_DIR_TX
+        prints(" (TX)...\n")
+    else
+        prints(" (RX)...\n")
+
+    # Allocate SQ memory
+    var entry_size: u64 = ENA_RX_DESC_SIZE as u64
+    if direction == SQ_DIR_TX
+        entry_size = ENA_TX_DESC_SIZE as u64
+    let sq_size: u64 = (depth as u64) * entry_size
+    let sq_page: u64 = pmm_alloc_page()
+    if sq_page == 0
+        prints("[ena] ERROR: Failed to allocate SQ memory\n")
+        return -1
+
+    (*sq_out).entries = sq_page as *EnaTxDesc
+    (*sq_out).phys = vmm_virt_to_phys(sq_page)
+    if (*sq_out).phys == 0
+        (*sq_out).phys = sq_page
+    (*sq_out).depth = depth
+    (*sq_out).head = 0
+    (*sq_out).tail = 0
+    (*sq_out).phase = 1
+
+    # Zero out SQ
+    var i: u64 = 0
+    while i < PAGE_SIZE
+        *((sq_page + i) as *u8) = 0
+        i = i + 1
+
+    # Build admin command
+    var cmd: EnaAdminCreateSqCmd
+    i = 0
+    while i < 64
+        *((@cmd as u64 + i) as *u8) = 0
+        i = i + 1
+
+    cmd.common_desc.opcode = ENA_ADMIN_CREATE_SQ
+    cmd.sq_identity = direction << ENA_ADMIN_SQ_IDENTITY_DIRECTION_SHIFT
+    var caps2: u8 = ENA_ADMIN_PLACEMENT_POLICY_HOST
+    caps2 = caps2 | (ENA_ADMIN_COMPLETION_POLICY_DESC << ENA_ADMIN_SQ_CAPS2_COMPLETION_SHIFT)
+    cmd.sq_caps_2 = caps2
+    cmd.sq_caps_3 = ENA_ADMIN_SQ_CAPS3_CONTIGUOUS_MASK  # Contiguous memory
+    cmd.cq_idx = cq_idx
+    cmd.sq_depth = depth
+    cmd.sq_ba_lo = ((*sq_out).phys & 0xFFFFFFFF) as u32
+    cmd.sq_ba_hi = (((*sq_out).phys >> 32) & 0xFFFF) as u16
+    cmd.sq_ba_reserved = 0
+
+    # Debug: print what we're sending
+    prints("[ena] SQ cmd: identity=0x")
+    serial_print_hex(cmd.sq_identity as u64)
+    prints(" caps2=0x")
+    serial_print_hex(cmd.sq_caps_2 as u64)
+    prints(" caps3=0x")
+    serial_print_hex(cmd.sq_caps_3 as u64)
+    prints(" cq_idx=")
+    serial_print_dec(cmd.cq_idx as u64)
+    prints(" depth=")
+    serial_print_dec(cmd.sq_depth as u64)
+    prints("\n")
+    prints("[ena] SQ ba: lo=0x")
+    serial_print_hex(cmd.sq_ba_lo as u64)
+    prints(" hi=0x")
+    serial_print_hex(cmd.sq_ba_hi as u64)
+    prints("\n")
+
+    # Dump raw bytes of command (first 36 bytes which is the data portion)
+    prints("[ena] SQ raw: ")
+    ena_dump_bytes(@cmd as *u8, 36)
+
+    let cmd_id: u16 = ena_admin_submit_cmd(dev, @cmd as *EnaAdminAqEntry)
+    let result: i32 = ena_admin_wait_completion(dev, cmd_id)
+
+    if result != 0
+        prints("[ena] Failed to create SQ\n")
+        return result
+
+    # Get doorbell offset from response
+    let aq: *EnaAdminQueue = @(*dev).admin_queue
+    let prev_head: u16 = ena_get_prev_cq_head(aq)
+    let entry_addr: u64 = ena_admin_cq_entry_addr(aq, prev_head)
+    let resp: *EnaAdminCreateSqResp = entry_addr as *EnaAdminCreateSqResp
+
+    (*sq_out).doorbell_offset = (*resp).sq_doorbell_offset
+
+    prints("[ena] SQ ")
+    serial_print_dec(qid as u64)
+    prints(" created, idx=")
+    serial_print_dec((*resp).sq_idx as u64)
+    prints(", doorbell=0x")
+    serial_print_hex((*sq_out).doorbell_offset as u64)
+    prints("\n")
+
+    return 0
+
+fn ena_setup_io_queues(dev: *EnaDevice) -> i32
+    prints("[ena] Setting up I/O queues...\n")
+
+    # Create TX CQ (queue 0)
+    var result: i32 = ena_create_cq(dev, 0, ENA_IO_QUEUE_DEPTH as u16, SQ_DIR_TX, @(*dev).tx_cq)
+    if result != 0
+        return result
+
+    # Create TX SQ - use the hardware CQ index, not our queue ID
+    let tx_cq_hw_idx: u16 = (*dev).tx_cq.hw_index
+    let tx_depth: u16 = ENA_IO_QUEUE_DEPTH as u16
+    prints("[ena] Creating TX SQ with cq_idx=")
+    serial_print_dec(tx_cq_hw_idx as u64)
+    prints("\n")
+    result = ena_create_sq(dev, 0, tx_cq_hw_idx, SQ_DIR_TX, tx_depth, @(*dev).tx_sq)
+    if result != 0
+        return result
+
+    # Create RX CQ (queue 1)
+    result = ena_create_cq(dev, 1, ENA_IO_QUEUE_DEPTH as u16, SQ_DIR_RX, @(*dev).rx_cq)
+    if result != 0
+        return result
+
+    # Create RX SQ - use the hardware CQ index
+    let rx_cq_hw_idx: u16 = (*dev).rx_cq.hw_index
+    let rx_depth: u16 = ENA_IO_QUEUE_DEPTH as u16
+    prints("[ena] Creating RX SQ with cq_idx=")
+    serial_print_dec(rx_cq_hw_idx as u64)
+    prints("\n")
+    result = ena_create_sq(dev, 1, rx_cq_hw_idx, SQ_DIR_RX, rx_depth, @(*dev).rx_sq)
+    if result != 0
+        return result
+
+    prints("[ena] I/O queues ready\n")
+    return 0
+
+# ============================================================================
+# RX Buffer Population
+# ============================================================================
+
+fn ena_populate_rx_buffers(dev: *EnaDevice) -> i32
+    prints("[ena] Populating RX buffers...\n")
+
+    let rx_sq: *EnaIoSq = @(*dev).rx_sq
+    var buf_idx: u32 = 0
+
+    while buf_idx < ENA_RX_BUFFER_COUNT
+        let buf_addr: u64 = (@ena_rx_buffers[0] as u64) + (buf_idx as u64 * ENA_RX_BUFFER_SIZE as u64)
+        let buf_phys: u64 = vmm_virt_to_phys(buf_addr)
+        let phys: u64 = ena_get_phys_or_virt(buf_phys, buf_addr)
+
+        # Get RX descriptor
+        let desc_addr: u64 = ena_io_sq_entry_addr(rx_sq, (*rx_sq).head, ENA_RX_DESC_SIZE)
+        let desc: *EnaRxDesc = desc_addr as *EnaRxDesc
+
+        # Fill descriptor
+        (*desc).length = ENA_RX_BUFFER_SIZE as u16
+        (*desc).reserved2 = 0
+        (*desc).ctrl = ena_rx_build_ctrl((*rx_sq).phase, 1, 1, 1)
+        (*desc).req_id = buf_idx as u16
+        (*desc).reserved6 = 0
+        (*desc).buff_addr_lo = (phys & 0xFFFFFFFF) as u32
+        (*desc).buff_addr_hi = ((phys >> 32) & 0xFFFF) as u16
+        (*desc).reserved16_w3 = 0
+
+        # Track buffer mapping
+        ena_rx_req_to_buf[buf_idx] = buf_idx as u16
+
+        # Advance head
+        (*rx_sq).head = (*rx_sq).head + 1
+        if (*rx_sq).head >= (*rx_sq).depth
+            (*rx_sq).head = 0
+            (*rx_sq).phase = (*rx_sq).phase ^ 1
+
+        buf_idx = buf_idx + 1
+
+    # Ring doorbell
+    asm x86_64:
+        mfence
+    ena_write32(dev, (*rx_sq).doorbell_offset, (*rx_sq).head as u32)
+
+    prints("[ena] Populated ")
+    serial_print_dec(buf_idx as u64)
+    prints(" RX buffers\n")
+
+    return 0
+
+# ============================================================================
+# Public API
+# ============================================================================
+
+pub fn ena_init() -> i32
+    prints("\n[ena] Initializing ENA driver...\n")
+
+    # Find ENA device
+    let pci_dev: *PciDevice = pci_find_ena()
+    if pci_dev == (0 as *PciDevice)
+        prints("[ena] No ENA device found\n")
+        return -1
+
+    prints("[ena] Found ENA device at ")
+    serial_print_dec((*pci_dev).bus as u64)
+    prints(":")
+    serial_print_dec((*pci_dev).device as u64)
+    prints(".")
+    serial_print_dec((*pci_dev).function as u64)
+    prints("\n")
+
+    # Enable PCI bus mastering and memory space
+    pci_enable_bus_master(pci_dev)
+    pci_enable_memory(pci_dev)
+
+    # Get BAR0 (memory-mapped registers)
+    if (*pci_dev).bar_is_io[0] != 0
+        prints("[ena] ERROR: BAR0 is I/O space, expected memory\n")
+        return -1
+
+    ena_dev.pci_dev = pci_dev
+    ena_dev.bar0 = (*pci_dev).bar[0]
+    ena_dev.bar0_size = (*pci_dev).bar_size[0]
+    ena_dev.initialized = 0
+
+    prints("[ena] BAR0: 0x")
+    serial_print_hex(ena_dev.bar0)
+    prints(" size=")
+    serial_print_dec(ena_dev.bar0_size)
+    prints("\n")
+
+    # Map the ENA MMIO region (BAR0) into virtual memory
+    # Identity map the BAR0 pages so we can access the registers
+    let bar0_page: u64 = ena_dev.bar0 & 0xFFFFFFFFFFFFF000  # Page-align
+    var num_pages: u64 = (ena_dev.bar0_size + PAGE_SIZE - 1) / PAGE_SIZE
+    if num_pages < 4
+        num_pages = 4  # Minimum 4 pages (16KB) for ENA registers
+
+    prints("[ena] Mapping ")
+    serial_print_dec(num_pages)
+    prints(" pages for BAR0 MMIO\n")
+
+    var page_idx: u64 = 0
+    while page_idx < num_pages
+        let addr: u64 = bar0_page + (page_idx * PAGE_SIZE)
+        let map_result: i32 = vmm_map_page(addr, addr, PTE_WRITABLE)
+        if map_result != 0
+            prints("[ena] Failed to map BAR0 page at 0x")
+            serial_print_hex(addr)
+            prints("\n")
+            return -1
+        page_idx = page_idx + 1
+    prints("[ena] BAR0 MMIO region mapped\n")
+
+    # Read version registers
+    let version: u32 = ena_read32(@ena_dev, ENA_REGS_VERSION_OFF)
+    let ctrl_version: u32 = ena_read32(@ena_dev, ENA_REGS_CONTROLLER_VERSION_OFF)
+    prints("[ena] Device version: ")
+    serial_print_dec(((version & ENA_REGS_VERSION_MAJOR_MASK) >> ENA_REGS_VERSION_MAJOR_SHIFT) as u64)
+    prints(".")
+    serial_print_dec((version & ENA_REGS_VERSION_MINOR_MASK) as u64)
+    prints("\n")
+    prints("[ena] Controller version: ")
+    serial_print_dec(((ctrl_version & ENA_REGS_CTRL_VER_MAJOR_MASK) >> ENA_REGS_CTRL_VER_MAJOR_SHIFT) as u64)
+    prints(".")
+    serial_print_dec(((ctrl_version & ENA_REGS_CTRL_VER_MINOR_MASK) >> ENA_REGS_CTRL_VER_MINOR_SHIFT) as u64)
+    prints(".")
+    serial_print_dec((ctrl_version & ENA_REGS_CTRL_VER_SUBMINOR_MASK) as u64)
+    prints("\n")
+
+    # Reset device
+    var result: i32 = ena_device_reset(@ena_dev, ENA_REGS_RESET_NORMAL)
+    if result != 0
+        return result
+
+    # Wait for device ready
+    result = ena_wait_for_ready(@ena_dev)
+    if result != 0
+        return result
+
+    # Initialize admin queue
+    result = ena_admin_queue_init(@ena_dev)
+    if result != 0
+        return result
+
+    # Get device attributes (includes MAC)
+    result = ena_get_device_attributes(@ena_dev)
+    if result != 0
+        prints("[ena] Warning: Could not get device attributes\n")
+        # Set default MAC
+        ena_dev.mac[0] = 0x02
+        ena_dev.mac[1] = 0x00
+        ena_dev.mac[2] = 0x00
+        ena_dev.mac[3] = 0x00
+        ena_dev.mac[4] = 0x00
+        ena_dev.mac[5] = 0x01
+        ena_dev.mtu = 1500
+
+    # Get max queue info
+    result = ena_get_max_queues(@ena_dev)
+    if result != 0
+        return result
+
+    # Configure AENQ (async event notification)
+    result = ena_set_aenq_config(@ena_dev)
+    if result != 0
+        prints("[ena] Warning: AENQ config failed, continuing anyway\n")
+
+    # Setup I/O queues
+    result = ena_setup_io_queues(@ena_dev)
+    if result != 0
+        return result
+
+    # Populate RX buffers
+    result = ena_populate_rx_buffers(@ena_dev)
+    if result != 0
+        return result
+
+    ena_dev.initialized = 1
+    prints("[ena] Initialization complete!\n")
+
+    return 0
+
+pub fn ena_send(data: *u8, len: u32) -> i32
+    if ena_dev.initialized == 0
+        return -1
+
+    if len > 1514 or len == 0
+        return -1
+
+    let tx_sq: *EnaIoSq = @ena_dev.tx_sq
+
+    # Get buffer for this packet (simple: use head index)
+    let buf_idx: u32 = tx_sq.head as u32
+    let buf_addr: u64 = (@ena_tx_buffers[0] as u64) + (buf_idx as u64 * ENA_TX_BUFFER_SIZE as u64)
+
+    # Copy packet to buffer
+    var i: u32 = 0
+    while i < len
+        *((buf_addr + i as u64) as *u8) = *(data + i as i64)
+        i = i + 1
+
+    # Get physical address
+    let buf_phys: u64 = vmm_virt_to_phys(buf_addr)
+    let phys: u64 = ena_get_phys_or_virt(buf_phys, buf_addr)
+
+    # Build TX descriptor
+    let desc_addr: u64 = ena_io_sq_entry_addr(tx_sq, (*tx_sq).head, ENA_TX_DESC_SIZE)
+    let desc: *EnaTxDesc = desc_addr as *EnaTxDesc
+
+    let req_id: u16 = (*tx_sq).head
+    (*desc).len_ctrl = ena_tx_build_len_ctrl(len as u16, req_id, (*tx_sq).phase, 1, 1, 1)
+    (*desc).meta_ctrl = ena_tx_build_meta_ctrl_simple(req_id)
+    (*desc).buff_addr_lo = (phys & 0xFFFFFFFF) as u32
+    (*desc).buff_addr_hi_hdr_sz = ((phys >> 32) & 0xFFFF) as u32
+
+    # Advance head
+    (*tx_sq).head = (*tx_sq).head + 1
+    if (*tx_sq).head >= (*tx_sq).depth
+        (*tx_sq).head = 0
+        (*tx_sq).phase = (*tx_sq).phase ^ 1
+
+    # Ring doorbell
+    asm x86_64:
+        mfence
+    ena_write32(@ena_dev, (*tx_sq).doorbell_offset, (*tx_sq).head as u32)
+
+    return 0
+
+pub fn ena_poll(buf: *u8, max_len: u32) -> i32
+    if ena_dev.initialized == 0
+        return -1
+
+    let rx_cq: *EnaIoCq = @ena_dev.rx_cq
+    let rx_sq: *EnaIoSq = @ena_dev.rx_sq
+
+    # Check for completion
+    let cqe_addr: u64 = ena_io_cq_entry_addr(rx_cq, (*rx_cq).head, ENA_RX_CDESC_BASE_SIZE)
+    let cqe: *EnaRxCdescBase = cqe_addr as *EnaRxCdescBase
+
+    if not ena_rx_cdesc_phase_matches(cqe, (*rx_cq).phase)
+        return 0  # No packet
+
+    let pkt_len: u16 = ena_rx_cdesc_get_length(cqe)
+    let req_id: u16 = ena_rx_cdesc_get_req_id(cqe)
+
+    if pkt_len == 0
+        # Advance CQ and return
+        (*rx_cq).head = (*rx_cq).head + 1
+        if (*rx_cq).head >= (*rx_cq).depth
+            (*rx_cq).head = 0
+            (*rx_cq).phase = (*rx_cq).phase ^ 1
+        return 0
+
+    # Get buffer from req_id
+    let buf_idx: u16 = ena_rx_req_to_buf[req_id]
+    let src_addr: u64 = (@ena_rx_buffers[0] as u64) + (buf_idx as u64 * ENA_RX_BUFFER_SIZE as u64)
+
+    # Copy packet to output buffer
+    var copy_len: u32 = pkt_len as u32
+    if copy_len > max_len
+        copy_len = max_len
+
+    var i: u32 = 0
+    while i < copy_len
+        *(buf + i as i64) = *((src_addr + i as u64) as *u8)
+        i = i + 1
+
+    # Advance CQ head
+    (*rx_cq).head = (*rx_cq).head + 1
+    if (*rx_cq).head >= (*rx_cq).depth
+        (*rx_cq).head = 0
+        (*rx_cq).phase = (*rx_cq).phase ^ 1
+
+    # Re-submit the buffer to RX SQ
+    let rx_buf_phys: u64 = vmm_virt_to_phys(src_addr)
+    let phys: u64 = ena_get_phys_or_virt(rx_buf_phys, src_addr)
+
+    let desc_addr: u64 = ena_io_sq_entry_addr(rx_sq, (*rx_sq).head, ENA_RX_DESC_SIZE)
+    let desc: *EnaRxDesc = desc_addr as *EnaRxDesc
+
+    (*desc).length = ENA_RX_BUFFER_SIZE as u16
+    (*desc).reserved2 = 0
+    (*desc).ctrl = ena_rx_build_ctrl((*rx_sq).phase, 1, 1, 1)
+    (*desc).req_id = req_id
+    (*desc).reserved6 = 0
+    (*desc).buff_addr_lo = (phys & 0xFFFFFFFF) as u32
+    (*desc).buff_addr_hi = ((phys >> 32) & 0xFFFF) as u16
+    (*desc).reserved16_w3 = 0
+
+    (*rx_sq).head = (*rx_sq).head + 1
+    if (*rx_sq).head >= (*rx_sq).depth
+        (*rx_sq).head = 0
+        (*rx_sq).phase = (*rx_sq).phase ^ 1
+
+    # Ring RX doorbell
+    asm x86_64:
+        mfence
+    ena_write32(@ena_dev, (*rx_sq).doorbell_offset, (*rx_sq).head as u32)
+
+    return copy_len as i32
+
+pub fn ena_is_ready() -> u8
+    return ena_dev.initialized
+
+pub fn ena_get_mac(mac_out: *u8)
+    var i: i32 = 0
+    while i < 6
+        *(mac_out + i as i64) = ena_dev.mac[i]
+        i = i + 1
+
+pub fn ena_get_device() -> *EnaDevice
+    return @ena_dev
+
+fn ena_print_mac(dev: *EnaDevice)
+    let hex_chars: *u8 = c"0123456789ABCDEF"
+    var i: i32 = 0
+    while i < 6
+        if i > 0
+            prints(":")
+        let byte: u8 = (*dev).mac[i]
+        let hi: u8 = (byte >> 4) & 0x0F
+        let lo: u8 = byte & 0x0F
+        serial_write_byte(*(hex_chars + hi as i64))
+        serial_write_byte(*(hex_chars + lo as i64))
+        i = i + 1
+
+# Debug: dump first N bytes of a struct as hex
+fn ena_dump_bytes(ptr: *u8, count: i32)
+    let hex_chars: *u8 = c"0123456789ABCDEF"
+    var i: i32 = 0
+    while i < count
+        let byte: u8 = *(ptr + i as i64)
+        let hi: u8 = (byte >> 4) & 0x0F
+        let lo: u8 = byte & 0x0F
+        serial_write_byte(*(hex_chars + hi as i64))
+        serial_write_byte(*(hex_chars + lo as i64))
+        if (i + 1) % 4 == 0
+            prints(" ")
+        i = i + 1
+    prints("\n")
