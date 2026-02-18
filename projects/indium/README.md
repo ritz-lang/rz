@@ -23,6 +23,7 @@ Named after Indium, a soft malleable metal - the distribution that wraps around 
 - UEFI disk image builder (qcow2 format)
 - QEMU launch targets for both UEFI and BIOS boot
 - GPU framebuffer support with prism_demo
+- **AWS EC2 deployment** via Terraform
 
 ## Installation
 
@@ -55,13 +56,140 @@ make              # Build ISO (default)
 make kernel       # Build Harland kernel only
 make userspace    # Build all userspace programs
 make iso          # Create bootable ISO with GRUB
-make image        # Create qcow2 disk image (UEFI)
+make ec2-disk     # Create EC2-compatible GPT disk image
 make run          # Boot in QEMU (UEFI)
 make run-iso      # Boot in QEMU (BIOS/GRUB)
 make test-uefi-gui # Boot with display (shows graphics)
 make debug        # Boot with GDB server on :1234
 make clean        # Remove build artifacts
 ```
+
+## AWS EC2 Deployment
+
+Indium can run on real AWS EC2 hardware using UEFI boot. The deployment uses Terraform to automate the entire process.
+
+### Architecture
+
+The deployment works using a **builder pattern**:
+
+1. **Builder Instance** - Ubuntu t3.micro that burns the disk image to EBS
+2. **EBS Volume** - 1GB volume that holds the Harland OS
+3. **Snapshot + AMI** - EBS snapshot registered as UEFI-bootable AMI
+4. **Harland Instance** - t3.micro running Harland from the custom AMI
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                       Terraform Deployment Flow                          │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  ┌──────────┐     ┌─────────────┐     ┌──────────────┐                  │
+│  │  Local   │ SCP │   Ubuntu    │ dd  │     EBS      │                  │
+│  │ GPT Disk ├────▶│   Builder   ├────▶│    Volume    │                  │
+│  │  Image   │     │  Instance   │     │   (1 GB)     │                  │
+│  └──────────┘     └─────────────┘     └──────┬───────┘                  │
+│       │                                       │                          │
+│       │  make ec2-disk                        │ snapshot                 │
+│       │                                       ▼                          │
+│  ┌──────────┐                         ┌──────────────┐                  │
+│  │  Harland │◀───────────────────────│    UEFI      │                  │
+│  │ Instance │     boot from AMI       │     AMI      │                  │
+│  │ (t3.micro)│                        │ (ena_support)│                  │
+│  └──────────┘                         └──────────────┘                  │
+│       │                                                                  │
+│       │ serial output                                                    │
+│       ▼                                                                  │
+│  aws ec2 get-console-output                                             │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Prerequisites
+
+```bash
+# Install AWS CLI and Terraform
+brew install awscli terraform    # macOS
+sudo apt install awscli terraform  # Ubuntu
+
+# Configure AWS credentials
+aws configure
+
+# Create S3 bucket for Terraform state (one-time)
+aws s3 mb s3://ritz-harland-terraform-state --region us-west-2
+```
+
+### Deployment
+
+```bash
+# Build the EC2-compatible disk image
+cd projects/indium
+make ec2-disk
+
+# Initialize Terraform (first time only)
+cd deploy/terraform
+terraform init
+
+# Deploy to AWS
+terraform apply
+
+# View serial console output (boot log)
+terraform output -raw get_console_output | sh
+
+# Or manually:
+aws ec2 get-console-output --instance-id $(terraform output -raw harland_instance_id) --region us-west-2 --output text
+```
+
+### Disk Image Format
+
+The EC2 disk image (`build/ec2-boot.img`) uses:
+- **GPT partition table** (required for UEFI boot)
+- **EFI System Partition (ESP)** - FAT32, type code `EF00`
+- **Partition layout:**
+  - Sectors 2048-131038 (~63MB ESP)
+  - Contains `/EFI/BOOT/BOOTX64.EFI` (bootloader)
+  - Contains `/harland/kernel.elf` (kernel)
+
+### Hardware Support (Nitro Instances)
+
+EC2 Nitro instances (t3, c5, m5, etc.) use:
+- **NVMe for storage** - Amazon EBS appears as `/dev/nvme*`
+- **ENA for networking** - Elastic Network Adapter (VF device)
+- **UEFI firmware** - Required for custom OS boot
+
+Current driver status:
+- ✅ **NVMe** - Working, reads/writes to EBS volumes
+- 🔄 **ENA** - In progress, reset sequence being debugged
+- ✅ **Serial Console** - Working via `aws ec2 get-console-output`
+
+### Terraform Resources
+
+| Resource | Purpose |
+|----------|---------|
+| `aws_instance.builder` | Ubuntu instance for burning images |
+| `aws_ebs_volume.harland` | Target volume for OS image |
+| `aws_ebs_snapshot.harland` | Snapshot for AMI creation |
+| `aws_ami.harland` | UEFI-bootable AMI with ENA support |
+| `aws_instance.harland` | Running Harland OS instance |
+
+### Outputs
+
+```bash
+# Get all outputs
+terraform output
+
+# Specific outputs
+terraform output harland_instance_id   # Instance ID
+terraform output harland_ami_id        # AMI ID
+terraform output get_console_output    # Command to view boot log
+```
+
+### Destroying Resources
+
+```bash
+cd deploy/terraform
+terraform destroy
+```
+
+This will terminate instances, delete snapshots, deregister the AMI, and clean up all resources.
 
 ## Userspace Programs
 
