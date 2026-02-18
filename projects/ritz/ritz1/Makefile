@@ -33,7 +33,7 @@ SOURCES = \
 
 # ritzlib modules needed by ritz1
 RITZLIB_DIR = ../ritzlib
-RITZLIB_MODULES = sys io str string hash memory gvec drop
+RITZLIB_MODULES = sys io str string hash memory gvec drop env
 
 # Build artifacts
 BUILD_DIR = build
