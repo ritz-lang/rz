@@ -38,32 +38,41 @@ build_binaries() {
 
     # Build mausoleum
     log "Building mausoleum..."
-    ./rz build mausoleum --release 2>&1 | tail -5
+    python3 projects/ritz/build.py build projects/mausoleum --release --no-cache 2>&1 | tail -5
+
+    # Build zeus
+    log "Building zeus..."
+    python3 projects/ritz/build.py build projects/zeus --release --no-cache 2>&1 | tail -5
 
     # Build nexus
     log "Building nexus..."
-    ./rz build nexus --release 2>&1 | tail -5
+    python3 projects/ritz/build.py build projects/nexus --release --no-cache 2>&1 | tail -5
 
     # Verify binaries exist
     if [[ ! -f "projects/mausoleum/build/release/mausoleum" ]]; then
         # Fall back to debug build
         warn "Release build not found, using debug build"
         MAUSOLEUM_BIN="projects/mausoleum/build/debug/mausoleum"
+        ZEUS_BIN="projects/zeus/build/debug/zeus"
         NEXUS_BIN="projects/nexus/build/debug/nexus"
     else
         MAUSOLEUM_BIN="projects/mausoleum/build/release/mausoleum"
+        ZEUS_BIN="projects/zeus/build/release/zeus"
         NEXUS_BIN="projects/nexus/build/release/nexus"
     fi
 
     if [[ ! -f "$PROJECT_ROOT/$MAUSOLEUM_BIN" ]]; then
         error "Mausoleum binary not found at $MAUSOLEUM_BIN"
     fi
+    if [[ ! -f "$PROJECT_ROOT/$ZEUS_BIN" ]]; then
+        error "Zeus binary not found at $ZEUS_BIN"
+    fi
     if [[ ! -f "$PROJECT_ROOT/$NEXUS_BIN" ]]; then
         error "Nexus binary not found at $NEXUS_BIN"
     fi
 
     log "Binaries ready:"
-    ls -lh "$PROJECT_ROOT/$MAUSOLEUM_BIN" "$PROJECT_ROOT/$NEXUS_BIN"
+    ls -lh "$PROJECT_ROOT/$MAUSOLEUM_BIN" "$PROJECT_ROOT/$ZEUS_BIN" "$PROJECT_ROOT/$NEXUS_BIN"
 }
 
 # Run terraform
@@ -130,7 +139,7 @@ provision() {
 
     # Stop existing services
     log "Stopping existing services..."
-    $SSH "sudo systemctl stop nexus 2>/dev/null || true"
+    $SSH "sudo systemctl stop zeus 2>/dev/null || true"
     $SSH "sudo systemctl stop mausoleum 2>/dev/null || true"
 
     # Create directories
@@ -148,9 +157,9 @@ provision() {
     # Copy systemd services
     log "Installing systemd services..."
     $SCP "$SYSTEMD_DIR/mausoleum.service" ubuntu@"$IP":/tmp/
-    $SCP "$SYSTEMD_DIR/nexus.service" ubuntu@"$IP":/tmp/
+    $SCP "$SYSTEMD_DIR/zeus.service" ubuntu@"$IP":/tmp/
     $SSH "sudo mv /tmp/mausoleum.service /etc/systemd/system/"
-    $SSH "sudo mv /tmp/nexus.service /etc/systemd/system/"
+    $SSH "sudo mv /tmp/zeus.service /etc/systemd/system/"
 
     # Fix permissions for mausoleum data dir
     log "Setting up permissions..."
@@ -160,31 +169,30 @@ provision() {
     # Reload systemd and start services
     log "Starting services..."
     $SSH "sudo systemctl daemon-reload"
-    $SSH "sudo systemctl enable mausoleum nexus"
+    $SSH "sudo systemctl enable mausoleum zeus"
     $SSH "sudo systemctl start mausoleum"
     sleep 2
-    $SSH "sudo systemctl start nexus"
+    $SSH "sudo systemctl start zeus"
 
     # Verify services
     log "Verifying services..."
     sleep 3
     $SSH "sudo systemctl status mausoleum --no-pager" || true
-    $SSH "sudo systemctl status nexus --no-pager" || true
+    $SSH "sudo systemctl status zeus --no-pager" || true
 
-    # Test health endpoint
-    log "Testing health endpoint..."
-    if curl -s --connect-timeout 5 "http://$IP/" | head -1 | grep -q "DOCTYPE"; then
-        log "Wiki is responding!"
-    else
-        warn "Wiki might not be ready yet. Check logs with: ssh ubuntu@$IP 'sudo journalctl -u nexus -f'"
-    fi
+    # Check if Zeus workers are running
+    log "Checking Zeus workers..."
+    $SSH "pgrep -a nexus" || true
 
     echo ""
     log "Deployment complete!"
     echo ""
-    echo "  Wiki URL:  http://$IP/"
     echo "  SSH:       ssh ubuntu@$IP"
-    echo "  Logs:      ssh ubuntu@$IP 'sudo journalctl -u nexus -f'"
+    echo "  Zeus logs: ssh ubuntu@$IP 'sudo journalctl -u zeus -f'"
+    echo "  M7M logs:  ssh ubuntu@$IP 'sudo journalctl -u mausoleum -f'"
+    echo ""
+    echo "  NOTE: HTTP frontend (Valet→Zeus integration) not yet implemented."
+    echo "        Zeus workers are running but need Valet to dispatch HTTP requests."
     echo ""
 }
 
