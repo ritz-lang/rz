@@ -10,6 +10,15 @@ import raster.fill { Bitmap, scanline_fill_simple, scanline_fill_antialiased }
 # Tolerance for bezier flattening (in font units)
 const FLATTEN_TOLERANCE: f32 = 0.5
 
+# Expanded point with on_curve flag (replaces tuple)
+struct ExpandedPoint
+    p: Point2D
+    on_curve: bool
+
+impl ExpandedPoint
+    fn new(p: Point2D, on_curve: bool) -> ExpandedPoint
+        ExpandedPoint { p: p, on_curve: on_curve }
+
 # Convert a contour to edges
 fn contour_to_edges(contour: Contour, scale: f32, edge_table:& EdgeTable)
     let n = contour.len()
@@ -22,7 +31,7 @@ fn contour_to_edges(contour: Contour, scale: f32, edge_table:& EdgeTable)
     # Two consecutive off-curve points have an implied on-curve between them
 
     # First, expand the contour to handle implied points
-    var points = Vec.new()
+    var points = vec_new<ExpandedPoint>()
 
     for i in 0..n
         let curr = contour.points[i]
@@ -30,13 +39,13 @@ fn contour_to_edges(contour: Contour, scale: f32, edge_table:& EdgeTable)
         let next = contour.points[next_idx]
 
         let p = Point2D.from_i16(curr.x, curr.y).scale(scale)
-        points.push((p, curr.on_curve))
+        points.push(ExpandedPoint.new(p, curr.on_curve))
 
         # If both current and next are off-curve, add implied on-curve
         if not curr.on_curve and not next.on_curve
             let next_p = Point2D.from_i16(next.x, next.y).scale(scale)
             let implied = p.midpoint(next_p)
-            points.push((implied, true))
+            points.push(ExpandedPoint.new(implied, true))
 
     # Now process the expanded points
     let expanded_n = points.len()
@@ -46,42 +55,42 @@ fn contour_to_edges(contour: Contour, scale: f32, edge_table:& EdgeTable)
     # Find first on-curve point to start
     var start_idx = 0usize
     for i in 0..expanded_n
-        let (_, on_curve) = points[i]
-        if on_curve
+        let ep = points[i]
+        if ep.on_curve
             start_idx = i
             break
 
     # Walk through points, emitting edges
-    var curr_on_curve = points[start_idx].0
+    var curr_on_curve = points[start_idx].p
     var i = 1usize
 
     while i <= expanded_n
         let idx = (start_idx + i) % expanded_n
-        let (p, on_curve) = points[idx]
+        let ep = points[idx]
 
-        if on_curve
+        if ep.on_curve
             # Line segment from curr_on_curve to p
-            edge_table.add_line(curr_on_curve, p)
-            curr_on_curve = p
+            edge_table.add_line(curr_on_curve, ep.p)
+            curr_on_curve = ep.p
         else
             # This is a control point - look for next on-curve
             let next_idx = (start_idx + i + 1) % expanded_n
-            let (next_p, next_on_curve) = points[next_idx]
+            let next_ep = points[next_idx]
 
-            if next_on_curve
-                # Quadratic bezier: curr_on_curve -> p (control) -> next_p
-                let flattened = flatten_quad_bezier(@curr_on_curve, @p, @next_p, FLATTEN_TOLERANCE)
+            if next_ep.on_curve
+                # Quadratic bezier: curr_on_curve -> ep.p (control) -> next_ep.p
+                let flattened = flatten_quad_bezier(@curr_on_curve, @ep.p, @next_ep.p, FLATTEN_TOLERANCE)
 
                 # Add edges for flattened segments
                 for j in 0..flattened.len() - 1
                     edge_table.add_line(flattened[j], flattened[j + 1])
 
-                curr_on_curve = next_p
+                curr_on_curve = next_ep.p
                 i = i + 1  # Skip the next point since we used it
             else
                 # Next is also off-curve, implied point between
-                let implied = p.midpoint(next_p)
-                let flattened = flatten_quad_bezier(@curr_on_curve, @p, @implied, FLATTEN_TOLERANCE)
+                let implied = ep.p.midpoint(next_ep.p)
+                let flattened = flatten_quad_bezier(@curr_on_curve, @ep.p, @implied, FLATTEN_TOLERANCE)
 
                 for j in 0..flattened.len() - 1
                     edge_table.add_line(flattened[j], flattened[j + 1])
@@ -237,8 +246,8 @@ fn test_rasterize_with_antialiasing() -> i32
     outline.y_max = 100
     outline.add_contour(contour)
 
-    let result_no_aa = rasterize_outline(outline, 100, 20, false)
-    let result_aa = rasterize_outline(outline, 100, 20, true)
+    let result_no_aa = rasterize_outline(@outline, 100, 20, false)
+    let result_aa = rasterize_outline(@outline, 100, 20, true)
 
     # Both should produce output
     assert result_no_aa.width > 0
