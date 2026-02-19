@@ -4557,11 +4557,22 @@ class LLVMEmitter:
 
         # Get element type
         if isinstance(base.type, ir.PointerType):
-            elem_type = base.type.pointee
-            # GEP to get pointer to element
-            ptr = self.builder.gep(base, [index])
-            # Load the element
-            return self.builder.load(ptr)
+            pointee = base.type.pointee
+            if isinstance(pointee, ir.ArrayType):
+                # Pointer to array - need two-level GEP [0, index]
+                zero = ir.Constant(self.i32, 0)
+                # Ensure index is i32 for GEP consistency
+                if isinstance(index.type, ir.IntType) and index.type.width != 32:
+                    if index.type.width < 32:
+                        index = self.builder.sext(index, self.i32)
+                    else:
+                        index = self.builder.trunc(index, self.i32)
+                ptr = self.builder.gep(base, [zero, index])
+                return self.builder.load(ptr)
+            else:
+                # Pointer to element - single-level GEP [index]
+                ptr = self.builder.gep(base, [index])
+                return self.builder.load(ptr)
         else:
             raise ValueError(f"Cannot index type: {base.type}")
 
