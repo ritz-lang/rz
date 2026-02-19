@@ -47,7 +47,7 @@ pub struct SubpixelGlyph
 impl SubpixelGlyph
     pub fn new(width: u32, height: u32) -> SubpixelGlyph
         let size = width * height * 3  # 3 bytes per pixel
-        var rgb_data = Vec.with_capacity(size as usize)
+        var rgb_data = vec_with_cap<u8>(size as usize)
         for i in 0..size
             rgb_data.push(0)
         SubpixelGlyph {
@@ -73,9 +73,14 @@ impl SubpixelGlyph
 
 # FreeType-style subpixel filter coefficients
 # These reduce color fringing by spreading coverage across neighbors
-const FILTER_LIGHT: [5]u8 = [0, 85, 86, 85, 0]     # Very light filtering
-const FILTER_DEFAULT: [5]u8 = [8, 77, 86, 77, 8]   # Balanced filter
-const FILTER_LEGACY: [5]u8 = [16, 64, 96, 64, 16]  # Stronger filtering
+fn get_filter_light() -> [5]u8
+    [0, 85, 86, 85, 0]     # Very light filtering
+
+fn get_filter_default() -> [5]u8
+    [8, 77, 86, 77, 8]   # Balanced filter
+
+fn get_filter_legacy() -> [5]u8
+    [16, 64, 96, 64, 16]  # Stronger filtering
 
 # Rasterize a glyph with subpixel antialiasing
 pub fn rasterize_subpixel(
@@ -87,11 +92,11 @@ pub fn rasterize_subpixel(
     match order
         None =>
             # Fall back to grayscale
-            rasterize_subpixel_grayscale(@outline, units_per_em, size_px)
+            rasterize_subpixel_grayscale(outline, units_per_em, size_px)
         RGB =>
-            rasterize_subpixel_rgb(@outline, units_per_em, size_px, false)
+            rasterize_subpixel_rgb(outline, units_per_em, size_px, false)
         BGR =>
-            rasterize_subpixel_rgb(@outline, units_per_em, size_px, true)
+            rasterize_subpixel_rgb(outline, units_per_em, size_px, true)
 
 # Grayscale fallback - just convert to RGB
 fn rasterize_subpixel_grayscale(
@@ -109,7 +114,8 @@ fn rasterize_subpixel_grayscale(
     # Convert grayscale to RGB
     for y in 0..gray.height
         for x in 0..gray.width
-            let alpha = gray.bitmap[(y * gray.width + x) as usize]
+            let idx = (y * gray.width + x) as usize
+            let alpha = gray.get_pixel_alpha(x, y)
             result.set_pixel(x, y, alpha, alpha, alpha)
 
     result
@@ -126,13 +132,14 @@ fn rasterize_subpixel_rgb(
 
     # Scale at 3x horizontal resolution
     let scale = size_px as f32 / units_per_em as f32
-    let scale_x = scale * 3.0  # 3x for subpixels
+    let scale_x = scale * (3 as f32)  # 3x for subpixels
     let scale_y = scale
 
     # Convert outline to edges at 3x horizontal scale
     var edge_table = EdgeTable.new()
 
-    for contour in @outline.contours
+    for i in 0..outline.contours.len()
+        let contour = outline.contours[i]
         contour_to_edges_scaled(contour, scale_x, scale_y, @&edge_table)
 
     edge_table.sort()
@@ -166,7 +173,7 @@ fn rasterize_subpixel_rgb(
     var result = SubpixelGlyph.new(final_width, height)
 
     # Scale bearing back
-    result.bearing_x = (bounds.x_min / 3.0).floor() as i32
+    result.bearing_x = (bounds.x_min / (3 as f32)).floor() as i32
     result.bearing_y = bounds.y_max.ceil() as i32
 
     # Apply filter and downsample
@@ -189,13 +196,37 @@ fn rasterize_subpixel_rgb(
 # Sample with 5-tap filter for smoother transitions
 fn filter_sample(bitmap: @Bitmap, x: u32, y: u32, width: u32) -> u8
     # 5-tap filter centered on x
+    # Filter weights: [8, 77, 86, 77, 8] sum to 256
     var sum: u32 = 0
 
-    for i in 0..5
-        let filter_x = x as i32 + i as i32 - 2
-        if filter_x >= 0 and filter_x < width as i32
-            let sample = bitmap.get(filter_x as u32, y)
-            sum = sum + sample as u32 * FILTER_DEFAULT[i] as u32
+    # Tap -2
+    let fx0 = x as i32 - 2
+    if fx0 >= 0 and fx0 < width as i32
+        let sample = bitmap.get(fx0 as u32, y)
+        sum = sum + sample as u32 * 8u32
+
+    # Tap -1
+    let fx1 = x as i32 - 1
+    if fx1 >= 0 and fx1 < width as i32
+        let sample = bitmap.get(fx1 as u32, y)
+        sum = sum + sample as u32 * 77u32
+
+    # Tap 0 (center)
+    if x < width
+        let sample = bitmap.get(x, y)
+        sum = sum + sample as u32 * 86u32
+
+    # Tap +1
+    let fx3 = x + 1
+    if fx3 < width
+        let sample = bitmap.get(fx3, y)
+        sum = sum + sample as u32 * 77u32
+
+    # Tap +2
+    let fx4 = x + 2
+    if fx4 < width
+        let sample = bitmap.get(fx4, y)
+        sum = sum + sample as u32 * 8u32
 
     # Filter weights sum to 256, so divide by 256
     (sum / 256) as u8
@@ -212,7 +243,7 @@ fn contour_to_edges_scaled(contour: Contour, scale_x: f32, scale_y: f32, edge_ta
         return
 
     # Build expanded point list
-    var points: Vec<ContourPoint> = Vec.new()
+    var points: Vec<ContourPoint> = vec_new<ContourPoint>()
 
     for i in 0..n
         let curr = contour.points[i]
@@ -243,7 +274,7 @@ fn contour_to_edges_scaled(contour: Contour, scale_x: f32, scale_y: f32, edge_ta
     var curr_on_curve = points[start_idx].p
     var i: usize = 1
 
-    let tolerance = 0.5 * scale_x  # Adjust tolerance for scale
+    let tolerance = (1 as f32) / (2 as f32) * scale_x  # Adjust tolerance for scale
 
     while i <= expanded_n
         let idx = (start_idx + i) % expanded_n
@@ -295,9 +326,8 @@ fn test_subpixel_pixel_access() -> i32
 [[test]]
 fn test_filter_coefficients_sum() -> i32
     # Filter weights should sum to 256 for proper normalization
-    var sum: u32 = 0
-    for i in 0..5
-        sum = sum + FILTER_DEFAULT[i] as u32
+    # Default filter: [8, 77, 86, 77, 8]
+    let sum: u32 = 8 + 77 + 86 + 77 + 8
     assert sum == 256
     0
 
