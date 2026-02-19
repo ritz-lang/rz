@@ -39,7 +39,9 @@ fi
 # Run QEMU in BIOS mode (no OVMF) with GRUB ISO
 # -smp 4 for multi-core testing, -m 2G for full memory tests
 # VirtIO block, network, and input devices for driver testing
-timeout 20 qemu-system-x86_64 \
+# -cpu Haswell-v1 enables BMI1/BMI2 instructions (bextr, etc.)
+timeout 45 qemu-system-x86_64 \
+    -cpu Haswell-v1 \
     -cdrom "$ISO" \
     -device virtio-blk-pci,drive=initramfs \
     -drive file="$INITRAMFS",format=qcow2,if=none,id=initramfs \

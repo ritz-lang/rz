@@ -1,0 +1,312 @@
+# Harland User Pointer Validation
+#
+# This module provides functions to validate that user-supplied pointers
+# are safe to access from the kernel. This is critical for preventing
+# privilege escalation attacks where malicious userspace passes kernel
+# addresses to syscalls.
+#
+# x86-64 canonical address space:
+#   User space:   0x0000_0000_0000_0000 - 0x0000_7FFF_FFFF_FFFF
+#   Kernel space: 0xFFFF_8000_0000_0000 - 0xFFFF_FFFF_FFFF_FFFF
+#   Non-canonical (invalid): everything else
+#
+# Security requirements:
+#   1. Pointer must be in user address space (canonical lower half)
+#   2. Entire range [ptr, ptr+len) must be in user space
+#   3. Range must not wrap around (overflow check)
+#   4. If writable access required, pages must be writable
+
+import mm.vmm { vmm_pml4_phys, PTE_PRESENT, PTE_WRITABLE, PTE_USER, PTE_HUGE, PTE_ADDR_MASK }
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+# Highest valid user-space address (end of canonical lower half)
+# 0x0000_7FFF_FFFF_FFFF = 140737488355327
+pub const USER_SPACE_END: u64 = 140737488355327
+
+# Error codes for pointer validation
+pub const UPTR_OK: i32 = 0
+pub const UPTR_ERR_NULL: i32 = -14         # EFAULT - NULL pointer
+pub const UPTR_ERR_KERNEL: i32 = -14       # EFAULT - Pointer in kernel space
+pub const UPTR_ERR_OVERFLOW: i32 = -14     # EFAULT - Range overflows
+pub const UPTR_ERR_NOT_MAPPED: i32 = -14   # EFAULT - Page not mapped
+pub const UPTR_ERR_NOT_USER: i32 = -14     # EFAULT - Page not user-accessible
+pub const UPTR_ERR_NOT_WRITABLE: i32 = -14 # EFAULT - Page not writable
+
+# EFAULT error code (standard POSIX)
+pub const EFAULT: i64 = -14
+
+# Page size
+const PAGE_SIZE: u64 = 4096
+const PAGE_MASK: u64 = 0xFFFFFFFFFFFFF000
+
+# ============================================================================
+# Page Table Index Helpers (inlined from vmm.ritz)
+# ============================================================================
+
+fn pml4_index(vaddr: u64) -> u64
+    return (vaddr >> 39) & 511
+
+fn pdpt_index(vaddr: u64) -> u64
+    return (vaddr >> 30) & 511
+
+fn pd_index(vaddr: u64) -> u64
+    return (vaddr >> 21) & 511
+
+fn pt_index(vaddr: u64) -> u64
+    return (vaddr >> 12) & 511
+
+# ============================================================================
+# Basic Validation
+# ============================================================================
+
+# Check if a single address is in user space (canonical lower half)
+# Does NOT check if the address is actually mapped!
+pub fn uptr_in_user_space(addr: u64) -> bool
+    # User space is 0 to USER_SPACE_END
+    # Note: addr == 0 (NULL) is technically in user space but should be
+    # rejected separately for null pointer checks
+    return addr <= USER_SPACE_END
+
+# Check if an address range is entirely in user space
+# Returns true if [addr, addr+len) is valid user space
+# Returns false if:
+#   - addr + len overflows
+#   - any part of range is outside user space
+pub fn uptr_range_in_user_space(addr: u64, len: u64) -> bool
+    # Check for overflow
+    let end: u64 = addr + len
+    if end < addr
+        return false
+
+    # Empty range is valid
+    if len == 0
+        return true
+
+    # Check both start and end are in user space
+    # Note: end is exclusive, so we check end - 1
+    if not uptr_in_user_space(addr)
+        return false
+    if end > 0 and not uptr_in_user_space(end - 1)
+        return false
+
+    return true
+
+# ============================================================================
+# Page Table Validation
+# ============================================================================
+
+# Check if a page is mapped with user access permissions
+# pml4: Physical address of the process's PML4 table
+# vaddr: Virtual address to check
+# need_write: If true, also check that page is writable
+#
+# Returns UPTR_OK if valid, or error code
+fn uptr_check_page_access(pml4: u64, vaddr: u64, need_write: bool) -> i32
+    let pml4i: u64 = pml4_index(vaddr)
+    let pdpti: u64 = pdpt_index(vaddr)
+    let pdi: u64 = pd_index(vaddr)
+    let pti: u64 = pt_index(vaddr)
+
+    # Check PML4 entry
+    let pml4_ptr: *u64 = (pml4 + pml4i * 8) as *u64
+    let pml4_entry: u64 = *pml4_ptr
+
+    if (pml4_entry & PTE_PRESENT) == 0
+        return UPTR_ERR_NOT_MAPPED
+    if (pml4_entry & PTE_USER) == 0
+        return UPTR_ERR_NOT_USER
+
+    # Check PDPT entry
+    let pdpt_phys: u64 = pml4_entry & PTE_ADDR_MASK
+    let pdpt_ptr: *u64 = (pdpt_phys + pdpti * 8) as *u64
+    let pdpt_entry: u64 = *pdpt_ptr
+
+    if (pdpt_entry & PTE_PRESENT) == 0
+        return UPTR_ERR_NOT_MAPPED
+    if (pdpt_entry & PTE_USER) == 0
+        return UPTR_ERR_NOT_USER
+
+    # 1GB huge page?
+    if (pdpt_entry & PTE_HUGE) != 0
+        if need_write and (pdpt_entry & PTE_WRITABLE) == 0
+            return UPTR_ERR_NOT_WRITABLE
+        return UPTR_OK
+
+    # Check PD entry
+    let pd_phys: u64 = pdpt_entry & PTE_ADDR_MASK
+    let pd_ptr: *u64 = (pd_phys + pdi * 8) as *u64
+    let pd_entry: u64 = *pd_ptr
+
+    if (pd_entry & PTE_PRESENT) == 0
+        return UPTR_ERR_NOT_MAPPED
+    if (pd_entry & PTE_USER) == 0
+        return UPTR_ERR_NOT_USER
+
+    # 2MB huge page?
+    if (pd_entry & PTE_HUGE) != 0
+        if need_write and (pd_entry & PTE_WRITABLE) == 0
+            return UPTR_ERR_NOT_WRITABLE
+        return UPTR_OK
+
+    # Check PT entry
+    let pt_phys: u64 = pd_entry & PTE_ADDR_MASK
+    let pt_ptr: *u64 = (pt_phys + pti * 8) as *u64
+    let pt_entry: u64 = *pt_ptr
+
+    if (pt_entry & PTE_PRESENT) == 0
+        return UPTR_ERR_NOT_MAPPED
+    if (pt_entry & PTE_USER) == 0
+        return UPTR_ERR_NOT_USER
+    if need_write and (pt_entry & PTE_WRITABLE) == 0
+        return UPTR_ERR_NOT_WRITABLE
+
+    return UPTR_OK
+
+# ============================================================================
+# Main Validation Functions
+# ============================================================================
+
+# Validate a user pointer for read access
+# ptr: User-space pointer
+# len: Length of buffer in bytes
+#
+# Returns UPTR_OK (0) if valid, or negative error code
+#
+# This is the primary function to call before reading from a user buffer.
+# It checks:
+#   1. Pointer is not NULL (if len > 0)
+#   2. Range is entirely in user space
+#   3. All pages in range are mapped with USER bit set
+#
+# NOTE: This uses the current page table (vmm_pml4_phys). If you need to
+# validate against a different process's page table, use uptr_validate_read_in().
+pub fn uptr_validate_read(ptr: *u8, len: u64) -> i32
+    let addr: u64 = ptr as u64
+
+    # Zero-length is always valid
+    if len == 0
+        return UPTR_OK
+
+    # NULL pointer with non-zero length is invalid
+    if addr == 0
+        return UPTR_ERR_NULL
+
+    # Check range is in user space
+    if not uptr_range_in_user_space(addr, len)
+        return UPTR_ERR_KERNEL
+
+    # Check each page in the range is mapped with user access
+    let page_size: u64 = 4096
+    var check_addr: u64 = addr & 0xFFFFFFFFFFFFF000  # Page-align start
+    let end_addr: u64 = addr + len
+
+    while check_addr < end_addr
+        let result: i32 = uptr_check_page_access(vmm_pml4_phys, check_addr, false)
+        if result != UPTR_OK
+            return result
+        check_addr = check_addr + page_size
+
+    return UPTR_OK
+
+# Validate a user pointer for write access
+# Same as uptr_validate_read, but also checks pages are writable
+pub fn uptr_validate_write(ptr: *u8, len: u64) -> i32
+    let addr: u64 = ptr as u64
+
+    # Zero-length is always valid
+    if len == 0
+        return UPTR_OK
+
+    # NULL pointer with non-zero length is invalid
+    if addr == 0
+        return UPTR_ERR_NULL
+
+    # Check range is in user space
+    if not uptr_range_in_user_space(addr, len)
+        return UPTR_ERR_KERNEL
+
+    # Check each page in the range is mapped with user+write access
+    let page_size: u64 = 4096
+    var check_addr: u64 = addr & 0xFFFFFFFFFFFFF000  # Page-align start
+    let end_addr: u64 = addr + len
+
+    while check_addr < end_addr
+        let result: i32 = uptr_check_page_access(vmm_pml4_phys, check_addr, true)
+        if result != UPTR_OK
+            return result
+        check_addr = check_addr + page_size
+
+    return UPTR_OK
+
+# Validate a null-terminated string from user space
+# Returns the string length (not including null terminator) if valid,
+# or negative error code if invalid.
+#
+# max_len: Maximum length to scan (prevents DoS from missing null terminator)
+pub fn uptr_validate_string(ptr: *u8, max_len: u64) -> i64
+    let addr: u64 = ptr as u64
+
+    # NULL pointer is invalid
+    if addr == 0
+        return UPTR_ERR_NULL as i64
+
+    # Check string doesn't start outside user space
+    if not uptr_in_user_space(addr)
+        return UPTR_ERR_KERNEL as i64
+
+    # Scan for null terminator, validating pages as we go
+    var current_page: u64 = addr & 0xFFFFFFFFFFFFF000
+    var validated_page: u64 = 0  # Last page we validated
+    var len: u64 = 0
+
+    while len < max_len
+        let current_addr: u64 = addr + len
+
+        # Check we're still in user space
+        if not uptr_in_user_space(current_addr)
+            return UPTR_ERR_KERNEL as i64
+
+        # Validate page if we crossed to a new one
+        let page: u64 = current_addr & 0xFFFFFFFFFFFFF000
+        if page != validated_page
+            let result: i32 = uptr_check_page_access(vmm_pml4_phys, page, false)
+            if result != UPTR_OK
+                return result as i64
+            validated_page = page
+
+        # Check for null terminator
+        if *(ptr + len) == 0
+            return len as i64
+
+        len = len + 1
+
+    # String too long - no null terminator found within max_len
+    return UPTR_ERR_OVERFLOW as i64
+
+# ============================================================================
+# Convenience Macros / Helper Functions
+# ============================================================================
+
+# Quick check: is this a valid user pointer (non-null, in user space)?
+# Does NOT validate page mappings - use uptr_validate_* for full validation
+pub fn uptr_is_valid(ptr: *u8) -> bool
+    let addr: u64 = ptr as u64
+    return addr != 0 and uptr_in_user_space(addr)
+
+# Validate pointer and return EFAULT if invalid (for use in syscalls)
+# Returns 0 if valid, EFAULT (-14) if invalid
+pub fn uptr_check_read(ptr: *u8, len: u64) -> i64
+    let result: i32 = uptr_validate_read(ptr, len)
+    if result != UPTR_OK
+        return EFAULT
+    return 0
+
+# Validate writable pointer and return EFAULT if invalid
+pub fn uptr_check_write(ptr: *u8, len: u64) -> i64
+    let result: i32 = uptr_validate_write(ptr, len)
+    if result != UPTR_OK
+        return EFAULT
+    return 0

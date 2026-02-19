@@ -18,6 +18,7 @@ import drivers.pci { PciDevice, PCI_CLASS_NETWORK, PCI_CLASS_STORAGE, PCI_CLASS_
 import mm.pmm { PAGE_SIZE, PAGE_SHIFT, MAX_MEMORY, MAX_PAGES, MB2_TAG_END, MB2_TAG_CMDLINE, MB2_TAG_BOOTLOADER_NAME, MB2_TAG_MODULE, MB2_TAG_BASIC_MEMINFO, MB2_TAG_BOOTDEV, MB2_TAG_MMAP, MB2_TAG_VBE, MB2_TAG_FRAMEBUFFER, MB2_TAG_ELF_SECTIONS, MB2_TAG_APM, MB2_TAG_EFI32, MB2_TAG_EFI64, MB2_TAG_SMBIOS, MB2_TAG_ACPI_OLD, MB2_TAG_ACPI_NEW, MB2_TAG_NETWORK, MB2_TAG_EFI_MMAP, MB2_TAG_EFI_BS, MB2_TAG_EFI32_IH, MB2_TAG_EFI64_IH, MB2_TAG_LOAD_BASE_ADDR, MB2_MEMORY_AVAILABLE, MB2_MEMORY_RESERVED, MB2_MEMORY_ACPI_RECLAIMABLE, MB2_MEMORY_NVS, MB2_MEMORY_BADRAM, Mb2BootInfo, Mb2Tag, Mb2BasicMemInfo, Mb2MmapTag, Mb2MmapEntry, HARLAND_BOOT_MAGIC, HARLAND_BOOT_VERSION, HARLAND_MEM_USABLE, HARLAND_MEM_RESERVED, HARLAND_MEM_ACPI_RECLAIMABLE, HarlandMemEntry, HarlandBootInfo, BOOT_PROTOCOL_UNKNOWN, BOOT_PROTOCOL_MULTIBOOT2, BOOT_PROTOCOL_HARLAND, pmm_init, pmm_mark_region_free, pmm_mark_region_used, pmm_alloc_page, pmm_free_page, pmm_get_free_pages, pmm_get_total_pages, pmm_init_from_multiboot, pmm_init_from_bootinfo, pmm_reserve_kernel }
 import mm.vmm { PTE_PRESENT, PTE_WRITABLE, PTE_USER, PTE_WRITE_THROUGH, PTE_CACHE_DISABLE, PTE_ACCESSED, PTE_DIRTY, PTE_HUGE, PTE_GLOBAL, PTE_NO_EXECUTE, PTE_ADDR_MASK, vmm_init, vmm_flush_tlb, vmm_flush_tlb_all, vmm_debug_page_tables, vmm_map_page, vmm_unmap_page, vmm_virt_to_phys, vmm_is_accessible, vmm_ensure_mapped, vmm_create_user_pml4, vmm_switch_pml4, vmm_get_current_pml4, vmm_map_page_in, vmm_free_pml4, vmm_read_pml4_entry, vmm_reserve_page_tables }
 import mm.heap { KERNEL_VIRT_BASE, HEAP_START, HEAP_MAX_SIZE, heap_init, kalloc, kfree, heap_get_used, heap_get_free, heap_check }
+import mm.uptr { EFAULT, USER_SPACE_END, uptr_validate_read, uptr_validate_write, uptr_validate_string, uptr_check_read, uptr_check_write, UPTR_OK }
 # mm.shm and mm.dma are WIP - commented out until imports are fixed
 # import mm.shm { ShmRegion, ShmMapping, shm_create, ... }
 # import mm.dma { DmaRegion, dma_alloc, dma_free, ... }
@@ -3113,6 +3114,11 @@ pub fn syscall_handler(rax: u64, rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
         # rdi = path pointer
         # rsi = path length
         # rdx = flags
+        # SECURITY: Validate path buffer
+        if rsi > 0
+            let path_result: i64 = uptr_check_read(rdi as *u8, rsi as u64)
+            if path_result != 0
+                return EFAULT
         let saved_child_pid: u64 = g_child_pid
         let saved_has_parent: u8 = g_has_parent
         let result: i64 = sys_open(rdi as *u8, rsi, rdx as i32)
@@ -3137,6 +3143,12 @@ pub fn syscall_handler(rax: u64, rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
         let fd: i32 = rdi as i32
         let buf: *u8 = rsi as *u8
         let len: i64 = rdx as i64
+
+        # SECURITY: Validate user buffer is readable
+        if len > 0
+            let uptr_result: i64 = uptr_check_read(buf, len as u64)
+            if uptr_result != 0
+                return EFAULT
 
         # Check if it's a filesystem fd
         if is_fs_fd(fd)
@@ -3165,6 +3177,12 @@ pub fn syscall_handler(rax: u64, rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
         let buf: *u8 = rsi as *u8
         let count: i64 = rdx as i64
 
+        # SECURITY: Validate user buffer is writable
+        if count > 0
+            let uptr_result: i64 = uptr_check_write(buf, count as u64)
+            if uptr_result != 0
+                return EFAULT
+
         # Check if it's a filesystem fd
         if is_fs_fd(fd)
             return sys_fs_read(fd, buf, count as u64)
@@ -3191,14 +3209,47 @@ pub fn syscall_handler(rax: u64, rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
 
     if rax == SYS_READDIR
         # rdi = path pointer, rsi = buffer, rdx = buffer size
+        # SECURITY: Validate path string and output buffer
+        let path_result: i64 = uptr_validate_string(rdi as *u8, 4096)
+        if path_result < 0
+            return EFAULT
+        if rdx > 0
+            let buf_result: i64 = uptr_check_write(rsi as *u8, rdx as u64)
+            if buf_result != 0
+                return EFAULT
         return sys_readdir_impl(rdi as *u8, rsi as *u8, rdx as i64)
 
     if rax == SYS_SPAWN
         # rdi = path pointer
+        # SECURITY: Validate path string
+        let path_result: i64 = uptr_validate_string(rdi as *u8, 4096)
+        if path_result < 0
+            return EFAULT
         return sys_spawn_impl(rdi as *u8)
 
     if rax == SYS_SPAWN_ARGS
         # rdi = path pointer, rsi = argv, rdx = argc
+        # SECURITY: Validate path string
+        let path_result: i64 = uptr_validate_string(rdi as *u8, 4096)
+        if path_result < 0
+            return EFAULT
+        # SECURITY: Validate argv array (each pointer + the strings they point to)
+        let argc: i32 = rdx as i32
+        if argc > 0
+            # Validate the argv array itself
+            let argv_size: u64 = (argc as u64) * 8  # sizeof(*u8) = 8 on x86-64
+            let argv_result: i64 = uptr_check_read(rsi as *u8, argv_size)
+            if argv_result != 0
+                return EFAULT
+            # Validate each string in argv
+            var i: i32 = 0
+            let argv: **u8 = rsi as **u8
+            while i < argc
+                let arg: *u8 = *(argv + i)
+                let arg_result: i64 = uptr_validate_string(arg, 4096)
+                if arg_result < 0
+                    return EFAULT
+                i = i + 1
         return sys_spawn_args_impl(rdi as *u8, rsi as **u8, rdx as i32)
 
     if rax == SYS_WAIT
@@ -3210,9 +3261,22 @@ pub fn syscall_handler(rax: u64, rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
         return sys_channel_create(1)  # PID 1 for now
 
     if rax == SYS_IPC_SEND
+        # SECURITY: Validate Message struct (4096 bytes) is readable
+        let msg_result: i64 = uptr_check_read(rsi as *u8, 4096)
+        if msg_result != 0
+            return EFAULT
         return sys_ipc_send(1, rdi as i32, rsi as *Message)
 
     if rax == SYS_IPC_RECV
+        # SECURITY: Validate Message struct (4096 bytes) is writable
+        let msg_result: i64 = uptr_check_write(rsi as *u8, 4096)
+        if msg_result != 0
+            return EFAULT
+        # Validate sender_pid output pointer (4 bytes for u32)
+        if rdx != 0
+            let sender_result: i64 = uptr_check_write(rdx as *u8, 4)
+            if sender_result != 0
+                return EFAULT
         return sys_ipc_recv(1, rdi as i32, rsi as *Message, rdx as *u32)
 
     if rax == SYS_IPC_CLOSE
@@ -3229,6 +3293,10 @@ pub fn syscall_handler(rax: u64, rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
         return sys_cap_derive(1, rdi, rsi as u32)
 
     if rax == SYS_CAP_INFO
+        # SECURITY: Validate CapInfo output struct (16 bytes) is writable
+        let info_result: i64 = uptr_check_write(rsi as *u8, 16)
+        if info_result != 0
+            return EFAULT
         return sys_cap_info(1, rdi, rsi as *CapInfo)
 
     if rax == SYS_CAP_CHECK
@@ -3246,10 +3314,19 @@ pub fn syscall_handler(rax: u64, rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
     # Working directory syscalls
     if rax == SYS_GETCWD
         # getcwd(buf, size) -> length or -1
+        # SECURITY: Validate output buffer is writable
+        if rsi > 0
+            let buf_result: i64 = uptr_check_write(rdi as *u8, rsi as u64)
+            if buf_result != 0
+                return EFAULT
         return sys_getcwd_impl(rdi as *u8, rsi)
 
     if rax == SYS_CHDIR
         # chdir(path) -> 0 or -1
+        # SECURITY: Validate path string
+        let path_result: i64 = uptr_validate_string(rdi as *u8, 4096)
+        if path_result < 0
+            return EFAULT
         return sys_chdir_impl(rdi as *u8)
 
     # Input device syscalls
@@ -3259,6 +3336,10 @@ pub fn syscall_handler(rax: u64, rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
 
     if rax == SYS_INPUT_READ
         # input_read(event_ptr) -> 0 if event read, -1 if no events
+        # SECURITY: Validate VirtioInputEvent output struct (8 bytes) is writable
+        let event_result: i64 = uptr_check_write(rdi as *u8, 8)
+        if event_result != 0
+            return EFAULT
         return sys_input_read_impl(rdi as *VirtioInputEvent)
 
     # ACPI power management syscalls
@@ -3271,6 +3352,10 @@ pub fn syscall_handler(rax: u64, rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
     # Framebuffer syscalls for Prism compositor
     if rax == SYS_FB_INFO
         # sys_fb_info(info_buf: *FbInfo) -> 0 on success, -1 on no display
+        # SECURITY: Validate FbInfo output struct (24 bytes) is writable
+        let info_result: i64 = uptr_check_write(rdi as *u8, 24)
+        if info_result != 0
+            return EFAULT
         return sys_fb_info_impl(rdi as *u8)
 
     if rax == SYS_FB_MAP
