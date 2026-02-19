@@ -47,6 +47,9 @@ class VarInfo:
     move_span: Optional[rast.Span] = None
     # Active borrows (borrow location -> is_mutable)
     borrows: List[Tuple[rast.Span, bool]] = field(default_factory=list)
+    # Borrow semantics for parameters (CONST/MUTABLE/MOVE)
+    # If set, this parameter is a borrow and is effectively Copy
+    borrow: Optional[rast.Borrow] = None
 
 
 @dataclass
@@ -63,9 +66,9 @@ class Scope:
             return self.parent.lookup(name)
         return None
 
-    def define(self, name: str, ritz_type: rast.Type, span: Optional[rast.Span] = None):
+    def define(self, name: str, ritz_type: rast.Type, span: Optional[rast.Span] = None, borrow: Optional[rast.Borrow] = None):
         """Define a new variable in this scope."""
-        self.vars[name] = VarInfo(name, ritz_type, VarState.OWNED, span)
+        self.vars[name] = VarInfo(name, ritz_type, VarState.OWNED, span, borrow=borrow)
 
     def save_states(self) -> Dict[str, Tuple[VarState, Optional[rast.Span]]]:
         """Save variable states (for control flow analysis)."""
@@ -312,8 +315,10 @@ class MoveChecker:
         self._push_scope()
 
         # Parameters are owned at function start
+        # For borrow semantics tracking, we need to store the borrow kind
+        # along with the type so _is_copy_type can know if it's a reference
         for param in fn.params:
-            self.scope.define(param.name, param.type, param.span)
+            self.scope.define(param.name, param.type, param.span, borrow=param.borrow)
 
         # Check function body (which is a Block)
         self._check_block(fn.body)
@@ -432,7 +437,10 @@ class MoveChecker:
                     return
 
                 # If this is a move context and type is not Copy, mark as moved
-                if is_move_context and not self._is_copy_type(var_info.ritz_type):
+                # Borrow parameters (CONST or MUTABLE) are effectively Copy since
+                # they're references that can be passed multiple times
+                is_borrow_param = var_info.borrow in (rast.Borrow.CONST, rast.Borrow.MUTABLE)
+                if is_move_context and not is_borrow_param and not self._is_copy_type(var_info.ritz_type):
                     var_info.state = VarState.MOVED
                     var_info.move_span = expr.span
 

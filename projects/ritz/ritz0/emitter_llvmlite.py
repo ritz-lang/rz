@@ -7046,6 +7046,7 @@ class LLVMEmitter:
             return bitops_result
 
         method_key = (type_name, expr.method)
+        used_ufcs_fallback = False  # Track if we used UFCS fallback
         if method_key in self.method_lookup:
             mangled_name = self.method_lookup[method_key]
         else:
@@ -7056,6 +7057,7 @@ class LLVMEmitter:
             mangled_name = self._find_method_fallback(type_name, expr.method)
             if mangled_name is None:
                 raise ValueError(f"No method '{expr.method}' found for type '{type_name}'")
+            used_ufcs_fallback = True  # UFCS fallback functions take receiver as first param
 
         if mangled_name not in self.functions:
             raise ValueError(f"Method function '{mangled_name}' not found")
@@ -7064,7 +7066,8 @@ class LLVMEmitter:
 
         # Check if this is a static method (no self parameter)
         # Static methods are called as Type.method() with no receiver instance
-        has_self_param = len(fn_def.params) > 0 and fn_def.params[0].name == 'self'
+        # For UFCS fallback functions, treat first parameter as receiver even if not named 'self'
+        has_self_param = len(fn_def.params) > 0 and (fn_def.params[0].name == 'self' or used_ufcs_fallback)
 
         # For static calls (Type.method()), verify there's no self parameter
         if is_static_call and has_self_param:
