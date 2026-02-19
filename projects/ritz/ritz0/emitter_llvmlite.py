@@ -7773,6 +7773,15 @@ class LLVMEmitter:
 
         target_type = self._ritz_type_to_llvm(expr.target)
 
+        # Handle StrView -> *u8 cast (common RERITZ pattern: "str" as *u8)
+        # StrView is {ptr, len}, we extract the ptr field
+        src_ritz_type = self._infer_ritz_type(expr.expr)
+        if (src_ritz_type and isinstance(src_ritz_type, rast.NamedType)
+            and src_ritz_type.name == 'StrView'
+            and isinstance(target_type, ir.PointerType)
+            and target_type.pointee == self.i8):
+            return self.builder.extract_value(val, 0, name='strview.ptr')
+
         # Check if source OR target is unsigned for proper extension
         # When casting to unsigned (e.g., i32 as u64), use zext to avoid sign pollution
         # When casting from unsigned (e.g., u8 as u64), also use zext

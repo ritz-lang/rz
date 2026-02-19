@@ -1,0 +1,347 @@
+# rz-cli - Ritz Workspace CLI
+#
+# Usage:
+#     rz build [PROJECT]     Build a project (or all with --all)
+#     rz test [PROJECT]      Run tests for a project (or all with --all)
+#     rz run PROJECT         Build and run a project
+#     rz list                List all projects in workspace
+#     rz clean [PROJECT]     Clean build artifacts
+#     rz compare [TIER]      Compare ritz0 vs ritz1 on examples
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+import ritzlib.env
+import ritzlib.fs
+import ritzlib.process
+import ritzlib.gvec
+
+# ============================================================================
+# Command Enum
+# ============================================================================
+
+const CMD_NONE: i32 = 0
+const CMD_BUILD: i32 = 1
+const CMD_TEST: i32 = 2
+const CMD_RUN: i32 = 3
+const CMD_LIST: i32 = 4
+const CMD_CLEAN: i32 = 5
+const CMD_COMPARE: i32 = 6
+const CMD_HELP: i32 = 7
+const CMD_VERSION: i32 = 8
+
+# ============================================================================
+# Argument Parsing
+# ============================================================================
+
+struct Args
+    command: i32
+    project: *u8
+    all_projects: i32
+    release_mode: i32
+    tier: *u8
+    envp: **u8
+
+fn parse_args(argc: i32, argv: **u8, envp: **u8) -> Args
+    var args: Args
+    args.command = CMD_HELP
+    args.project = null
+    args.all_projects = 0
+    args.release_mode = 0
+    args.tier = null
+    args.envp = envp
+
+    if argc < 2
+        return args
+
+    # Parse command
+    let cmd: *u8 = argv[1]
+
+    if strcmp(cmd, c"build") == 0
+        args.command = CMD_BUILD
+    else if strcmp(cmd, c"test") == 0
+        args.command = CMD_TEST
+    else if strcmp(cmd, c"run") == 0
+        args.command = CMD_RUN
+    else if strcmp(cmd, c"list") == 0
+        args.command = CMD_LIST
+    else if strcmp(cmd, c"clean") == 0
+        args.command = CMD_CLEAN
+    else if strcmp(cmd, c"compare") == 0
+        args.command = CMD_COMPARE
+    else if strcmp(cmd, c"--help") == 0 or strcmp(cmd, c"-h") == 0
+        args.command = CMD_HELP
+    else if strcmp(cmd, c"--version") == 0 or strcmp(cmd, c"-V") == 0
+        args.command = CMD_VERSION
+    else
+        # Unknown command
+        eprints_cstr("Error: Unknown command '")
+        eprints_cstr(cmd)
+        eprints_cstr("'\n")
+        args.command = CMD_HELP
+
+    # Parse remaining arguments
+    var i: i32 = 2
+    while i < argc
+        let arg: *u8 = argv[i]
+
+        if strcmp(arg, c"--all") == 0
+            args.all_projects = 1
+        else if strcmp(arg, c"--release") == 0
+            args.release_mode = 1
+        else if *(arg + 0) != 45  # Not starting with '-'
+            if args.project == null
+                args.project = arg
+            else if args.tier == null
+                args.tier = arg
+
+        i += 1
+
+    args
+
+# ============================================================================
+# Commands
+# ============================================================================
+
+fn print_help()
+    prints_cstr("rz - Unified workspace CLI for the Ritz ecosystem\n")
+    prints_cstr("\n")
+    prints_cstr("Usage:\n")
+    prints_cstr("    rz build [PROJECT]     Build a project (or all with --all)\n")
+    prints_cstr("    rz test [PROJECT]      Run tests for a project (or all with --all)\n")
+    prints_cstr("    rz run PROJECT         Build and run a project\n")
+    prints_cstr("    rz list                List all projects in workspace\n")
+    prints_cstr("    rz clean [PROJECT]     Clean build artifacts\n")
+    prints_cstr("    rz compare [TIER]      Compare ritz0 vs ritz1 on examples\n")
+    prints_cstr("\n")
+    prints_cstr("Options:\n")
+    prints_cstr("    --all                  Apply to all projects\n")
+    prints_cstr("    --release              Build with release profile\n")
+    prints_cstr("    --help, -h             Show this help message\n")
+    prints_cstr("    --version, -V          Show version information\n")
+
+fn print_version()
+    prints_cstr("rz 0.1.0 (ritz1 bootstrap)\n")
+
+fn cmd_list() -> i32
+    # List all projects in the projects/ directory
+    var dir: DirIter = dir_open(c"projects")
+
+    if dir_valid(@dir) == 0
+        eprints_cstr("Error: Could not open projects directory\n")
+        return 1
+
+    prints_cstr("Workspace: rz\n")
+    prints_cstr("Projects:\n\n")
+
+    var count: i32 = 0
+    while dir_next(@dir)
+        let name: *u8 = dir_entry_name(@dir)
+
+        # Skip . and ..
+        if strcmp(name, c".") == 0 or strcmp(name, c"..") == 0
+            continue
+
+        # Skip if not a directory
+        if dir_entry_is_dir(@dir) == 0
+            continue
+
+        # Check if ritz.toml exists in this subdirectory
+        var path_buf: [256]u8
+        path_join(c"projects", name, @path_buf[0])
+
+        var toml_buf: [256]u8
+        path_join(@path_buf[0], c"ritz.toml", @toml_buf[0])
+
+        if path_exists(@toml_buf[0])
+            prints_cstr("  ")
+            prints_cstr(name)
+            prints_cstr("\n")
+            count += 1
+
+    dir_close(@dir)
+
+    prints_cstr("\n")
+    print_int(count as i64)
+    prints_cstr(" projects found\n")
+    0
+
+fn cmd_build(args: Args) -> i32
+    if args.project == null and args.all_projects == 0
+        eprints_cstr("Error: Specify a project or use --all\n")
+        return 1
+
+    if args.all_projects == 1
+        # Build all projects
+        var dir: DirIter = dir_open(c"projects")
+        if dir_valid(@dir) == 0
+            eprints_cstr("Error: Could not open projects directory\n")
+            return 1
+
+        var failed_count: i32 = 0
+        var success_count: i32 = 0
+
+        while dir_next(@dir)
+            let name: *u8 = dir_entry_name(@dir)
+
+            # Skip . and ..
+            if strcmp(name, c".") == 0 or strcmp(name, c"..") == 0
+                continue
+
+            # Skip if not a directory
+            if dir_entry_is_dir(@dir) == 0
+                continue
+
+            # Check if ritz.toml exists
+            var path_buf: [256]u8
+            path_join(c"projects", name, @path_buf[0])
+
+            var toml_buf: [256]u8
+            path_join(@path_buf[0], c"ritz.toml", @toml_buf[0])
+
+            if path_exists(@toml_buf[0])
+                if build_project(name, args.release_mode, args.envp) != 0
+                    failed_count += 1
+                else
+                    success_count += 1
+
+        dir_close(@dir)
+
+        print_int(success_count as i64)
+        prints_cstr(" projects built successfully")
+        if failed_count > 0
+            prints_cstr(", ")
+            print_int(failed_count as i64)
+            prints_cstr(" failed")
+        prints_cstr("\n")
+
+        if failed_count > 0
+            return 1
+        return 0
+
+    # Build single project
+    return build_project(args.project, args.release_mode, args.envp)
+
+fn build_project(name: *u8, release: i32, envp: **u8) -> i32
+    prints_cstr("Building: ")
+    prints_cstr(name)
+    prints_cstr("\n")
+
+    # Use python3 to run the rz script
+    # python3 ./rz build <project> [--release]
+    var argv: [6]*u8
+    argv[0] = c"python3"
+    argv[1] = c"./rz"
+    argv[2] = c"build"
+    argv[3] = name
+    if release != 0
+        argv[4] = c"--release"
+        argv[5] = null
+    else
+        argv[4] = null
+
+    var proc: Process = spawn_full(c"python3", @argv[0], envp)
+    if process_valid(@proc) == 0
+        eprints_cstr("Error: Could not spawn build process\n")
+        return 1
+
+    # Read and print stdout
+    var stdout: Vec<u8> = process_read_stdout_all(@proc)
+    if vec_len<u8>(@stdout) > 0
+        let data: *u8 = vec_as_ptr<u8>(@stdout)
+        sys_write(STDOUT, data, vec_len<u8>(@stdout))
+    vec_drop<u8>(@stdout)
+
+    # Also read stderr
+    var stderr: Vec<u8> = process_read_stderr_all(@proc)
+    if vec_len<u8>(@stderr) > 0
+        let err_data: *u8 = vec_as_ptr<u8>(@stderr)
+        sys_write(STDERR, err_data, vec_len<u8>(@stderr))
+    vec_drop<u8>(@stderr)
+
+    # Wait for completion
+    let result: ProcessResult = process_wait(@proc)
+    process_close_pipes(@proc)
+
+    if result_success(@result) != 0
+        return 0
+    return 1
+
+fn cmd_test(args: Args) -> i32
+    if args.project == null and args.all_projects == 0
+        eprints_cstr("Error: Specify a project or use --all\n")
+        return 1
+
+    if args.all_projects == 1
+        prints_cstr("Testing all projects...\n")
+    else
+        prints_cstr("Testing project: ")
+        prints_cstr(args.project)
+        prints_cstr("\n")
+
+    0
+
+fn cmd_run(args: Args) -> i32
+    if args.project == null
+        eprints_cstr("Error: Specify a project to run\n")
+        return 1
+
+    prints_cstr("Running project: ")
+    prints_cstr(args.project)
+    prints_cstr("\n")
+    # TODO: Build then exec the binary
+    0
+
+fn cmd_clean(args: Args) -> i32
+    if args.project == null and args.all_projects == 0
+        eprints_cstr("Error: Specify a project or use --all\n")
+        return 1
+
+    if args.all_projects == 1
+        prints_cstr("Cleaning all projects...\n")
+    else
+        prints_cstr("Cleaning project: ")
+        prints_cstr(args.project)
+        prints_cstr("\n")
+
+    0
+
+fn cmd_compare(args: Args) -> i32
+    var tier: *u8 = c"tier1"
+    if args.tier != null
+        tier = args.tier
+
+    prints_cstr("Comparing ritz0 vs ritz1 on ")
+    prints_cstr(tier)
+    prints_cstr(" examples...\n")
+    # TODO: Implement comparison
+    0
+
+# ============================================================================
+# Main
+# ============================================================================
+
+fn main(argc: i32, argv: **u8, envp: **u8) -> i32
+    let args: Args = parse_args(argc, argv, envp)
+
+    if args.command == CMD_HELP
+        print_help()
+        return 0
+    if args.command == CMD_VERSION
+        print_version()
+        return 0
+    if args.command == CMD_LIST
+        return cmd_list()
+    if args.command == CMD_BUILD
+        return cmd_build(args)
+    if args.command == CMD_TEST
+        return cmd_test(args)
+    if args.command == CMD_RUN
+        return cmd_run(args)
+    if args.command == CMD_CLEAN
+        return cmd_clean(args)
+    if args.command == CMD_COMPARE
+        return cmd_compare(args)
+
+    eprints_cstr("Error: Unknown command\n")
+    1

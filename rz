@@ -110,8 +110,8 @@ def run_build(project_name, extra_args=None):
     dep_paths = collect_dependency_paths(project_name)
     # Always include ritz for ritzlib
     dep_paths.append(PROJECTS_DIR / "ritz")
-    # Build colon-separated RITZ_PATH
-    ritz_path = ":".join(str(p) for p in dep_paths)
+    # Build colon-separated RITZ_PATH using absolute paths
+    ritz_path = ":".join(str(p.resolve()) for p in dep_paths)
 
     env = os.environ.copy()
     env["RITZ_PATH"] = ritz_path
@@ -135,8 +135,8 @@ def run_test(project_name, extra_args=None):
     dep_paths = collect_dependency_paths(project_name)
     # Always include ritz for ritzlib
     dep_paths.append(PROJECTS_DIR / "ritz")
-    # Build colon-separated RITZ_PATH
-    ritz_path = ":".join(str(p) for p in dep_paths)
+    # Build colon-separated RITZ_PATH using absolute paths
+    ritz_path = ":".join(str(p.resolve()) for p in dep_paths)
 
     env = os.environ.copy()
     env["RITZ_PATH"] = ritz_path
@@ -334,6 +334,41 @@ def link_llvm_ir(ll_path, binary_path):
     return result.returncode == 0
 
 
+def build_example_with_build_py(example_rel_path, compiler="ritz0"):
+    """Build an example using build.py (full multi-file support).
+
+    Returns True if build succeeded, False otherwise.
+    """
+    env = os.environ.copy()
+    env["RITZ_PATH"] = str(PROJECTS_DIR / "ritz")
+
+    # Use build.py to do proper multi-file build
+    # example_rel_path is like "examples/tier1_basics/01_hello"
+    build_py = PROJECTS_DIR / "ritz" / "build.py"
+
+    # Clean first to ensure fresh build
+    result = subprocess.run(
+        [sys.executable, str(build_py), "clean", example_rel_path],
+        env=env,
+        capture_output=True,
+        text=True,
+        cwd=PROJECTS_DIR / "ritz"
+    )
+
+    # Build with specified compiler
+    cmd = [sys.executable, str(build_py), "build", example_rel_path]
+    # TODO: Add compiler selection flag to build.py when needed
+
+    result = subprocess.run(
+        cmd,
+        env=env,
+        capture_output=True,
+        text=True,
+        cwd=PROJECTS_DIR / "ritz"
+    )
+    return result.returncode == 0
+
+
 def cmd_compare(args):
     """Handle 'rz compare' command - compare ritz0 vs ritz1 on examples."""
     import tempfile
@@ -366,6 +401,11 @@ def cmd_compare(args):
 
     results = {"ritz0_only": [], "ritz1_only": [], "both": [], "neither": []}
 
+    # Determine whether to use simple (single-file) or full (multi-file) builds
+    # tier1 has no external dependencies, can use simple build
+    # tier2+ have ritzlib dependencies, need full build
+    use_full_build = tier in ("tier2", "tier3", "tier4", "tier5")
+
     for example_dir in sorted(tier_path.iterdir()):
         if not example_dir.is_dir():
             continue
@@ -376,38 +416,53 @@ def cmd_compare(args):
 
         name = example_dir.name
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmpdir = Path(tmpdir)
+        if use_full_build:
+            # Use build.py for multi-file builds
+            example_rel = f"examples/{tier_dirs[tier]}/{name}"
 
-            # Try ritz0
-            ll0 = tmpdir / "ritz0.ll"
-            bin0 = tmpdir / "ritz0_bin"
-            r0_compile = compile_with_ritz0(src, ll0)
-            r0_link = link_llvm_ir(ll0, bin0) if r0_compile else False
-            r0_status = "✅ ok" if r0_link else ("⚠️ link" if r0_compile else "❌ fail")
+            # Build with ritz0 (default)
+            r0_ok = build_example_with_build_py(example_rel, "ritz0")
+            r0_status = "✅ ok" if r0_ok else "❌ fail"
 
-            # Try ritz1
-            ll1 = tmpdir / "ritz1.ll"
-            bin1 = tmpdir / "ritz1_bin"
-            r1_compile = compile_with_ritz1(src, ll1)
-            r1_link = link_llvm_ir(ll1, bin1) if r1_compile else False
-            r1_status = "✅ ok" if r1_link else ("⚠️ link" if r1_compile else "❌ fail")
+            # For now, ritz1 isn't supported in build.py, so skip
+            # TODO: Add ritz1 support to build.py
+            r1_ok = False
+            r1_status = "❌ skip"
 
-            # Determine match status
-            if r0_link and r1_link:
-                match = "✅ both"
-                results["both"].append(name)
-            elif r0_link and not r1_link:
-                match = "🔶 r0"
-                results["ritz0_only"].append(name)
-            elif r1_link and not r0_link:
-                match = "🔷 r1"
-                results["ritz1_only"].append(name)
-            else:
-                match = "❌ none"
-                results["neither"].append(name)
+        else:
+            # Simple single-file build (tier1)
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmpdir = Path(tmpdir)
 
-            print(f"{name:<25} {r0_status:<15} {r1_status:<15} {match:<10}")
+                # Try ritz0
+                ll0 = tmpdir / "ritz0.ll"
+                bin0 = tmpdir / "ritz0_bin"
+                r0_compile = compile_with_ritz0(src, ll0)
+                r0_ok = link_llvm_ir(ll0, bin0) if r0_compile else False
+                r0_status = "✅ ok" if r0_ok else ("⚠️ link" if r0_compile else "❌ fail")
+
+                # Try ritz1
+                ll1 = tmpdir / "ritz1.ll"
+                bin1 = tmpdir / "ritz1_bin"
+                r1_compile = compile_with_ritz1(src, ll1)
+                r1_ok = link_llvm_ir(ll1, bin1) if r1_compile else False
+                r1_status = "✅ ok" if r1_ok else ("⚠️ link" if r1_compile else "❌ fail")
+
+        # Determine match status
+        if r0_ok and r1_ok:
+            match = "✅ both"
+            results["both"].append(name)
+        elif r0_ok and not r1_ok:
+            match = "🔶 r0"
+            results["ritz0_only"].append(name)
+        elif r1_ok and not r0_ok:
+            match = "🔷 r1"
+            results["ritz1_only"].append(name)
+        else:
+            match = "❌ none"
+            results["neither"].append(name)
+
+        print(f"{name:<25} {r0_status:<15} {r1_status:<15} {match:<10}")
 
     print("-" * 70)
     print(f"\nSummary:")

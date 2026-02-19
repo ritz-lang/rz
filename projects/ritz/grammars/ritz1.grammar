@@ -70,6 +70,8 @@ MINUS_EQ    = "-="
 STAR_EQ     = "*="
 SLASH_EQ    = "/="
 DOTDOT      = ".."
+LBRACKET2   = "[["
+# Note: ]] is parsed as two RBRACKET tokens, not RBRACKET2, matching ritz0 behavior
 
 # Single-character operators
 PLUS        = "+"
@@ -128,20 +130,35 @@ module_init -> *Module
     : { module_new(p) }
     ;
 
+# Attributes: [[name = "value"]] or [[name]]
+# For bootstrap, we parse and skip them (conditional compilation handled later)
+attrs -> i32
+    : attr attrs { 0 }
+    | { 0 }
+    ;
+
+attr -> i32
+    : LBRACKET2 IDENT RBRACKET RBRACKET NEWLINE { 0 }
+    | LBRACKET2 IDENT ASSIGN STRING RBRACKET RBRACKET NEWLINE { 0 }
+    ;
+
 item
-    : fn_def { module_add_fn(p.module, $1) }
-    | extern_fn_def { module_add_fn(p.module, $1) }
-    | struct_def { module_add_struct(p.module, $1) }
-    | const_def { module_add_const(p.module, $1) }
-    | global_var_def { module_add_global_var(p.module, $1) }
+    : attrs fn_def { module_add_fn(p.module, $2) }
+    | attrs extern_fn_def { module_add_fn(p.module, $2) }
+    | attrs struct_def { module_add_struct(p.module, $2) }
+    | attrs const_def { module_add_const(p.module, $2) }
+    | attrs global_var_def { module_add_global_var(p.module, $2) }
     | import_stmt { module_add_import(p.module, $1) }
     | impl_block { module_add_impl(p.module, $1) }
     ;
 
 # Function definition (with optional generic params)
+# Supports both "fn name" and "pub fn name"
 fn_def -> *FnDef
     : FN IDENT generic_params? LPAREN params? RPAREN return_type? block
       { generic_fn_def_new(p, $2.start, $2.len, $3, $5, $7, $8, $1.line, $1.col) }
+    | PUB FN IDENT generic_params? LPAREN params? RPAREN return_type? block
+      { generic_fn_def_new(p, $3.start, $3.len, $4, $6, $8, $9, $1.line, $1.col) }
     ;
 
 # Extern function declaration (no body)
@@ -167,6 +184,8 @@ return_type -> i32
 struct_def -> *StructDef
     : STRUCT IDENT generic_params? NEWLINE INDENT struct_fields DEDENT
       { generic_struct_def_new(p, $2.start, $2.len, $3, $6, $1.line, $1.col) }
+    | PUB STRUCT IDENT generic_params? NEWLINE INDENT struct_fields DEDENT
+      { generic_struct_def_new(p, $3.start, $3.len, $4, $7, $1.line, $1.col) }
     ;
 
 struct_fields -> *StructField
@@ -183,6 +202,8 @@ struct_field -> *StructField
 const_def -> *ConstEntry
     : CONST IDENT COLON type_spec ASSIGN expr NEWLINE
       { const_new(p, $2.start, $2.len, $4, $6, $1.line, $1.col) }
+    | PUB CONST IDENT COLON type_spec ASSIGN expr NEWLINE
+      { const_new(p, $3.start, $3.len, $5, $7, $1.line, $1.col) }
     ;
 
 # Import statement
@@ -264,17 +285,23 @@ control_stmt -> *Stmt
     ;
 
 let_stmt -> *Stmt
-    : LET IDENT COLON type_spec ASSIGN expr NEWLINE
+    : LET IDENT COLON var_type ASSIGN expr NEWLINE
       { stmt_var_decl(p, $2.start, $2.len, $4, $6, $1.line, $1.col) }
     | LET IDENT ASSIGN expr NEWLINE
       { stmt_var_decl(p, $2.start, $2.len, 0, $4, $1.line, $1.col) }
     ;
 
 var_stmt -> *Stmt
-    : VAR IDENT COLON type_spec ASSIGN expr NEWLINE
+    : VAR IDENT COLON var_type ASSIGN expr NEWLINE
       { stmt_var_decl(p, $2.start, $2.len, $4, $6, $1.line, $1.col) }
     | VAR IDENT COLON type_spec NEWLINE
       { stmt_var_decl(p, $2.start, $2.len, $4, 0 as *Expr, $1.line, $1.col) }
+    ;
+
+# Variable type - like type_spec but captures the type name for struct types
+# This prevents the type name from being clobbered when parsing the initializer expression
+var_type -> i32
+    : type_spec { capture_var_type(p, $1) }
     ;
 
 return_stmt -> *Stmt
@@ -508,6 +535,7 @@ primary_expr -> *Expr
     | STRING { expr_string(p, $1) }
     | CHAR { expr_char(p, $1) }
     | NIL { expr_nil(p, $1.line, $1.col) }
+    | NULL { expr_nil(p, $1.line, $1.col) }
     | IDENT LT type_spec GT struct_lit { generic_struct_lit(p, $1, $3, $5) }
     | IDENT struct_lit? { ident_or_struct(p, $1, $2) }
     | LPAREN expr RPAREN { $2 }

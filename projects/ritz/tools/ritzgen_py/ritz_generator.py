@@ -101,6 +101,7 @@ HAND_WRITTEN_TOKEN_IDS = {
     # Punctuation
     'DOT': 120, 'COMMA': 121, 'COLON': 122, 'SEMICOLON': 123,
     'HASH': 124, 'DBLBRACKET_L': 125, 'DBLBRACKET_R': 126,
+    'LBRACKET2': 125, 'RBRACKET2': 126,  # Aliases for double bracket
     # Literals
     'IDENT': 130, 'NUMBER': 131, 'STRING': 132, 'CSTRING': 133,
     'SSTRING': 134, 'CHAR': 135,

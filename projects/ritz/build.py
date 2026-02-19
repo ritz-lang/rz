@@ -738,7 +738,8 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
     if source_roots:
         cmd.extend(["--sources", json.dumps(source_roots)])
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    # Pass environment including RITZ_PATH for import resolution
+    result = subprocess.run(cmd, capture_output=True, text=True, env=os.environ)
     if result.returncode != 0:
         print(f"  ✗ import resolution failed: {result.stderr}", file=sys.stderr)
         return None
