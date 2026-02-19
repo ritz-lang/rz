@@ -40,8 +40,8 @@ import fs.persist { PersistBlobStore, persist_init, persist_format, persist_exis
 import fs.sync { fs_sync_init, fs_sync_all, fs_sync_stats, fs_sync_is_enabled }
 
 # Network stack imports (uses netdev abstraction internally)
-import net.stack { net_stack_init, net_poll, net_configure_dhcp, net_is_ready, net_is_configured, net_print_status }
-import net.ip { ip_is_configured, ip_get_our_addr, ip_get_gateway, ip_print_config }
+import net.stack { net_stack_init, net_poll, net_configure_dhcp, net_is_ready, net_is_configured, net_print_status, net_get_mac }
+import net.ip { ip_is_configured, ip_get_our_addr, ip_get_gateway, ip_get_netmask, ip_print_config }
 import net.icmp { icmp_ping }
 import net.arp { arp_print_cache }
 
@@ -2087,6 +2087,8 @@ const SYS_GETCWD: u64 = 26
 const SYS_CHDIR: u64 = 27
 const SYS_INPUT_POLL: u64 = 30      # Poll for input events
 const SYS_INPUT_READ: u64 = 31      # Read next input event
+const SYS_NET_INFO: u64 = 50        # Get network configuration info
+const SYS_NET_PING: u64 = 51        # Send ICMP ping
 const SYS_ACPI_POWEROFF: u64 = 200
 const SYS_FB_INFO: u64 = 210      # Get framebuffer info
 const SYS_FB_MAP: u64 = 211       # Map framebuffer into userspace
@@ -3110,6 +3112,91 @@ fn sys_input_read_impl(event_ptr: *VirtioInputEvent) -> i64
     return -1
 
 # ============================================================================
+# Network Syscalls
+# ============================================================================
+#
+# Provides userspace access to network configuration and basic operations.
+# These syscalls allow userspace programs to:
+#   1. Query network configuration (IP, gateway, netmask, MAC)
+#   2. Send ICMP ping requests
+#
+# NetInfo structure (returned by sys_net_info):
+#   u8[4]  ip_addr    - Our IP address
+#   u8[4]  gateway    - Gateway IP address
+#   u8[4]  netmask    - Network mask
+#   u8[6]  mac_addr   - Our MAC address
+#   u8     configured - 1 if DHCP configured, 0 otherwise
+#   u8     _pad       - Padding for alignment
+# Total: 4 + 4 + 4 + 6 + 1 + 1 = 20 bytes
+
+const NETINFO_SIZE: u64 = 20
+
+# sys_net_info: Get network configuration
+# Args: info_buf pointer to 20-byte NetInfo structure
+# Returns: 0 on success, -1 if network not configured
+fn sys_net_info_impl(info_buf: *u8) -> i64
+    if info_buf == 0 as *u8
+        return -1
+
+    if not net_is_configured()
+        return -1
+
+    # Get IP configuration (ip_get_netmask imported at module level)
+    let our_ip: *u8 = ip_get_our_addr()
+    let gateway: *u8 = ip_get_gateway()
+    let netmask: *u8 = ip_get_netmask()
+
+    # Copy IP address (bytes 0-3)
+    var i: i32 = 0
+    while i < 4
+        *(info_buf + i as i64) = *(our_ip + i as i64)
+        i = i + 1
+
+    # Copy gateway (bytes 4-7)
+    i = 0
+    while i < 4
+        *(info_buf + 4 + i as i64) = *(gateway + i as i64)
+        i = i + 1
+
+    # Copy netmask (bytes 8-11)
+    i = 0
+    while i < 4
+        *(info_buf + 8 + i as i64) = *(netmask + i as i64)
+        i = i + 1
+
+    # Copy MAC address (bytes 12-17) (net_get_mac imported at module level)
+    net_get_mac(info_buf + 12)
+
+    # Set configured flag (byte 18)
+    *(info_buf + 18) = 1
+
+    # Padding (byte 19)
+    *(info_buf + 19) = 0
+
+    return 0
+
+# sys_net_ping: Send ICMP echo request
+# Args: dst_ip_buf pointer to 4-byte IP address
+# Returns: 0 on success, -1 on error
+fn sys_net_ping_impl(dst_ip_buf: *u8) -> i64
+    if dst_ip_buf == 0 as *u8
+        return -1
+
+    if not net_is_configured()
+        return -2  # Network not configured
+
+    # Send ping - icmp_ping handles ARP if needed
+    let result: i32 = icmp_ping(dst_ip_buf)
+
+    # Poll network a few times to wait for reply
+    var polls: i32 = 0
+    while polls < 100
+        net_poll()
+        polls = polls + 1
+
+    return result as i64
+
+# ============================================================================
 # Framebuffer Syscalls (for Prism compositor)
 # ============================================================================
 #
@@ -3515,6 +3602,15 @@ pub fn syscall_handler(rax: u64, rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
     if rax == SYS_INPUT_READ
         # input_read(event_ptr) -> 0 if event read, -1 if no events
         return sys_input_read_impl(rdi as *VirtioInputEvent)
+
+    # Network syscalls
+    if rax == SYS_NET_INFO
+        # net_info(info_buf) -> 0 on success, -1 if not configured
+        return sys_net_info_impl(rdi as *u8)
+
+    if rax == SYS_NET_PING
+        # net_ping(dst_ip_buf) -> 0 on success, -1 on error
+        return sys_net_ping_impl(rdi as *u8)
 
     # ACPI power management syscalls
     if rax == SYS_ACPI_POWEROFF
