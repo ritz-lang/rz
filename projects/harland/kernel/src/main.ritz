@@ -60,6 +60,32 @@ import drivers.acpi.tables {
 }
 
 # ============================================================================
+# BSS Section Clearing
+# ============================================================================
+#
+# The ELF loader in the bootloader should zero the BSS segment (memory beyond
+# file size), but some systems or configurations may not do this correctly.
+# We explicitly zero BSS at kernel entry to ensure all static variables start
+# with known values.
+
+# Linker-provided BSS boundaries (defined as labels, not variables)
+# We use assembly to get their addresses since they're symbols, not variables
+extern fn __bss_start()
+extern fn __bss_end()
+
+# Clear BSS section - MUST be called before using any BSS variables
+fn clear_bss() -> i32
+    # Get BSS boundaries from linker symbols
+    let bss_start: u64 = __bss_start as u64
+    let bss_end: u64 = __bss_end as u64
+
+    var p: *u8 = bss_start as *u8
+    while (p as u64) < bss_end
+        *p = 0
+        p = (p as u64 + 1) as *u8
+    return 0
+
+# ============================================================================
 # Kernel Ring Buffer (Early Boot Debug)
 # ============================================================================
 #
@@ -2660,8 +2686,8 @@ pub fn syscall_handler(rax: u64, rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
         return bytes_read
 
     if rax == SYS_YIELD
-        # Yield to scheduler
-        yield_task()
+        # Yield CPU - currently a no-op (TODO: implement proper user-level yield)
+        # The kernel task scheduler is for kernel threads, not user processes
         return 0
 
     if rax == SYS_GETPID
@@ -3525,6 +3551,9 @@ fn apic_timer_init(cpu_idx: i32) -> i32
 pub fn scheduler_init() -> i32
     prints("  [..] Scheduler\n")
 
+    # Explicitly initialize scheduler_lock (BSS may not be zeroed correctly)
+    scheduler_lock = 0
+
     # Initialize task array
     var i: i32 = 0
     while i < MAX_TASKS
@@ -3553,8 +3582,10 @@ pub fn scheduler_init() -> i32
     serial_print_dec(num_cpus as u64)
     prints(" idle tasks\n")
 
-    # Configure APIC timer on BSP
-    apic_timer_init(0)
+    # NOTE: APIC timer is disabled for now because it conflicts with userspace execution
+    # The scheduler is designed for kernel threads, not user processes
+    # TODO: Implement proper process/thread distinction before enabling preemptive scheduling
+    # apic_timer_init(0)
 
     scheduler_initialized = 1
     prints("\r  [OK] Scheduler\n")
@@ -3871,11 +3902,17 @@ fn fs_quick_test() -> i32
 # ============================================================================
 
 pub fn kernel_main(boot_info_addr: u64) -> i32
+    # Clear BSS section (bootloader may not have done this correctly)
+    clear_bss()
+
     # Initialize serial for early debug output
     serial_init()
 
     # Clear ring buffer for fresh boot log
     ring_clear()
+
+    # Explicitly mark scheduler as not initialized (BSS might not be zeroed)
+    scheduler_initialized = 0
 
     # Banner (use klog to capture in ring buffer)
     klog(c"\n")

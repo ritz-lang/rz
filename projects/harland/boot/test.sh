@@ -266,7 +266,10 @@ fi
 # With more RAM, UEFI may allocate kernel buffers above 256MB which aren't mapped.
 # TODO: Fix bootloader to dynamically map memory where kernel is loaded.
 # VirtIO block, network, and input devices for driver testing (matching BIOS test)
+# NOTE: Using Haswell CPU because LLVM may generate BMI1 instructions (like bextr)
+# that the default qemu64 CPU doesn't support.
 QEMU_CMD="qemu-system-x86_64 \
+    -cpu Haswell \
     -drive if=pflash,format=raw,readonly=on,file=$OVMF_CODE \
     -drive format=raw,file=$TMPDIR/disk.img \
     -device virtio-blk-pci,drive=initramfs \
