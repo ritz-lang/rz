@@ -2716,6 +2716,20 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
                         return
 
         # Deref assignment: *(expr) = value
+        # Determine the type of the value being stored
+        var value_type: i32 = TYPE_I64
+        var struct_name: *u8 = null
+        var struct_name_len: i32 = 0
+
+        # Check if value is an identifier - look up its type
+        if stmt.assign_value.kind == EXPR_IDENT
+            let local: *LocalVar = find_local_struct_name(s, stmt.assign_value.ident_ptr, stmt.assign_value.ident_len)
+            if local != null
+                value_type = local.var_type
+                if local.var_type == TYPE_STRUCT
+                    struct_name = local.type_name
+                    struct_name_len = local.type_name_len
+
         let val: i32 = emit_expr(s, stmt.assign_value)
         let addr: i32 = emit_expr(s, target_expr)
         # Convert i64 address to ptr
@@ -2725,18 +2739,63 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
         emit_str(s, " = inttoptr i64 ")
         emit_reg(s, addr)
         emit_str(s, " to ptr\n")
-        # Truncate value to i8 and store (assuming byte store for now)
-        let trunc: i32 = next_reg(s)
-        emit_str(s, "  ")
-        emit_reg(s, trunc)
-        emit_str(s, " = trunc i64 ")
-        emit_reg(s, val)
-        emit_str(s, " to i8\n")
-        emit_str(s, "  store i8 ")
-        emit_reg(s, trunc)
-        emit_str(s, ", ptr ")
-        emit_reg(s, ptr)
-        emit_str(s, "\n")
+
+        # Store based on value type
+        if value_type == TYPE_STRUCT and struct_name_len > 0
+            # Struct store - emit: store %StructName %val, ptr %ptr
+            emit_str(s, "  store %")
+            emit_name(s, struct_name, struct_name_len)
+            emit_str(s, " ")
+            emit_reg(s, val)
+            emit_str(s, ", ptr ")
+            emit_reg(s, ptr)
+            emit_str(s, "\n")
+        else if value_type == TYPE_I32 or value_type == TYPE_U32
+            # i32 store
+            let trunc: i32 = next_reg(s)
+            emit_str(s, "  ")
+            emit_reg(s, trunc)
+            emit_str(s, " = trunc i64 ")
+            emit_reg(s, val)
+            emit_str(s, " to i32\n")
+            emit_str(s, "  store i32 ")
+            emit_reg(s, trunc)
+            emit_str(s, ", ptr ")
+            emit_reg(s, ptr)
+            emit_str(s, "\n")
+        else if value_type == TYPE_U8 or value_type == TYPE_I8
+            # Byte store
+            let trunc: i32 = next_reg(s)
+            emit_str(s, "  ")
+            emit_reg(s, trunc)
+            emit_str(s, " = trunc i64 ")
+            emit_reg(s, val)
+            emit_str(s, " to i8\n")
+            emit_str(s, "  store i8 ")
+            emit_reg(s, trunc)
+            emit_str(s, ", ptr ")
+            emit_reg(s, ptr)
+            emit_str(s, "\n")
+        else if value_type == TYPE_PTR or value_type == TYPE_PTR_PTR
+            # Pointer store
+            let ptr_val: i32 = next_reg(s)
+            emit_str(s, "  ")
+            emit_reg(s, ptr_val)
+            emit_str(s, " = inttoptr i64 ")
+            emit_reg(s, val)
+            emit_str(s, " to ptr\n")
+            emit_str(s, "  store ptr ")
+            emit_reg(s, ptr_val)
+            emit_str(s, ", ptr ")
+            emit_reg(s, ptr)
+            emit_str(s, "\n")
+        else
+            # Default: store i64 (for i64, u64, and unknown types)
+            emit_str(s, "  store i64 ")
+            emit_reg(s, val)
+            emit_str(s, ", ptr ")
+            emit_reg(s, ptr)
+            emit_str(s, "\n")
         return
 
     let loc: i32 = find_local(s, stmt.assign_target, stmt.assign_target_len)
@@ -3033,6 +3092,42 @@ fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
             body_stmt = body_stmt.next
         emit_str(s, "  br label %")
         emit_label(s, cond_label)
+        emit_str(s, "\n")
+
+        emit_label(s, end_label)
+        emit_str(s, ":\n")
+
+        s.break_label = old_break
+        s.continue_label = old_continue
+
+    else if stmt.kind == STMT_LOOP
+        # Infinite loop: loop { body }
+        # Generates:
+        #   br label %loop.body
+        # loop.body:
+        #   ... body ...
+        #   br label %loop.body
+        # loop.end:
+        let body_label: i32 = next_label(s)
+        let end_label: i32 = next_label(s)
+
+        let old_break: i32 = s.break_label
+        let old_continue: i32 = s.continue_label
+        s.break_label = end_label
+        s.continue_label = body_label
+
+        emit_str(s, "  br label %")
+        emit_label(s, body_label)
+        emit_str(s, "\n")
+
+        emit_label(s, body_label)
+        emit_str(s, ":\n")
+        var body_stmt: *Stmt = stmt.while_body
+        while body_stmt != null
+            emit_stmt(s, body_stmt, ret_type)
+            body_stmt = body_stmt.next
+        emit_str(s, "  br label %")
+        emit_label(s, body_label)
         emit_str(s, "\n")
 
         emit_label(s, end_label)
