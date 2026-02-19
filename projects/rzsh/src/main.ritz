@@ -15,13 +15,18 @@ import common {
     g_argv, parse_args,
     cmd_help, cmd_exit, cmd_pid, cmd_echo, cmd_clear, print_prompt,
     MAX_LINE, MAX_ARGS, MAX_PATH,
-    STDIN, STDOUT, STDERR
+    STDIN, STDOUT, STDERR,
+    # Pipeline parsing
+    has_pipe, parse_pipeline, g_pipe_count, get_pipe_argv, get_pipe_argc, get_pipe_cmd
 }
 
 import os {
     os_readdir, os_spawn_and_wait, os_yield,
     os_default_ls_path, os_bin_path_1, os_bin_path_2,
-    os_enable_raw_mode, os_disable_raw_mode, os_is_raw_mode
+    os_enable_raw_mode, os_disable_raw_mode, os_is_raw_mode,
+    # Pipeline execution
+    os_create_pipe, os_close_pipe, os_spawn_with_io,
+    pipe_read_fd, pipe_write_fd
 }
 
 import input {
@@ -86,6 +91,34 @@ fn cmd_ls(argc: i32) -> i32
 # ============================================================================
 # External Command Execution
 # ============================================================================
+
+# Build full path to command
+# Returns true if found in path_buf, false if should use cmd directly
+var g_path_buf: [256]u8
+
+fn build_cmd_path(cmd: *u8) -> *u8
+    # If already absolute, use as-is
+    if *cmd == 47  # '/'
+        return cmd
+
+    # Try first path
+    let prefix: *u8 = os_bin_path_1()
+    var prefix_len: i64 = strlen(prefix)
+    var i: i64 = 0
+
+    # Copy prefix
+    while i < prefix_len
+        g_path_buf[i as i32] = *(prefix + i)
+        i = i + 1
+
+    # Copy command
+    var j: i64 = 0
+    while *(cmd + j) != 0 and (i + j) < MAX_PATH - 1
+        g_path_buf[(i + j) as i32] = *(cmd + j)
+        j = j + 1
+    g_path_buf[(i + j) as i32] = 0
+
+    return @g_path_buf[0]
 
 fn exec_external(argc: i32) -> i32
     let cmd: *u8 = g_argv[0]
@@ -152,6 +185,110 @@ fn exec_external(argc: i32) -> i32
     return result
 
 # ============================================================================
+# Pipeline Execution
+# ============================================================================
+
+# Per-stage path buffer (separate from g_path_buf to avoid conflicts)
+var g_stage_path: [256]u8
+
+fn build_stage_path(cmd: *u8) -> *u8
+    # If already absolute, use as-is
+    if *cmd == 47  # '/'
+        return cmd
+
+    # Build path with /bin/ prefix
+    let prefix: *u8 = os_bin_path_1()
+    var prefix_len: i64 = strlen(prefix)
+    var i: i64 = 0
+
+    while i < prefix_len
+        g_stage_path[i as i32] = *(prefix + i)
+        i = i + 1
+
+    var j: i64 = 0
+    while *(cmd + j) != 0 and (i + j) < 254
+        g_stage_path[(i + j) as i32] = *(cmd + j)
+        j = j + 1
+    g_stage_path[(i + j) as i32] = 0
+
+    return @g_stage_path[0]
+
+# Execute a pipeline of 2 commands
+# For now, only supports 2-stage pipelines (cmd1 | cmd2)
+fn exec_pipeline() -> i32
+    if g_pipe_count < 2
+        return -1
+
+    # Debug
+    puts(c"[pipe] Executing pipeline with ")
+    print_num(g_pipe_count)
+    println(c" stages")
+
+    # Create a pipe between the two commands
+    let pipe_result: i64 = os_create_pipe()
+    if pipe_result < 0
+        println(c"[pipe] Failed to create pipe")
+        return -1
+
+    let read_fd: i32 = pipe_read_fd(pipe_result)
+    let write_fd: i32 = pipe_write_fd(pipe_result)
+
+    puts(c"[pipe] Created pipe: read_fd=")
+    print_num(read_fd)
+    puts(c", write_fd=")
+    print_num(write_fd)
+    println(c"")
+
+    # Stage 0: Run first command with stdout redirected to pipe write end
+    let cmd0: *u8 = get_pipe_cmd(0)
+    let argv0: **u8 = get_pipe_argv(0)
+    let argc0: i32 = get_pipe_argc(0)
+    let path0: *u8 = build_stage_path(cmd0)
+
+    puts(c"[pipe] Stage 0: ")
+    puts(path0)
+    puts(c" (stdout -> pipe write)")
+    println(c"")
+
+    # Set argv[0] to full path
+    *argv0 = path0
+
+    # Spawn first command with stdout redirected to pipe write end
+    # stdin = 0 (serial), stdout = write_fd (pipe)
+    let result0: i32 = os_spawn_with_io(path0, argv0, argc0, 0, write_fd)
+
+    puts(c"[pipe] Stage 0 exit code: ")
+    print_num(result0)
+    println(c"")
+
+    # Stage 1: Run second command with stdin redirected to pipe read end
+    let cmd1: *u8 = get_pipe_cmd(1)
+    let argv1: **u8 = get_pipe_argv(1)
+    let argc1: i32 = get_pipe_argc(1)
+    let path1: *u8 = build_stage_path(cmd1)
+
+    puts(c"[pipe] Stage 1: ")
+    puts(path1)
+    puts(c" (stdin <- pipe read)")
+    println(c"")
+
+    # Set argv[0] to full path
+    *argv1 = path1
+
+    # Spawn second command with stdin redirected to pipe read end
+    # stdin = read_fd (pipe), stdout = 0 (serial)
+    let result1: i32 = os_spawn_with_io(path1, argv1, argc1, read_fd, 0)
+
+    puts(c"[pipe] Stage 1 exit code: ")
+    print_num(result1)
+    println(c"")
+
+    # Close pipe ends (kernel will clean up when both are closed)
+    # TODO: Implement proper close
+
+    return result1
+
+# ============================================================================
 # Command Dispatch
 # ============================================================================
 
@@ -160,6 +297,13 @@ fn process_line() -> i32
         return 0
 
     g_line_buffer[g_line_pos as i32] = 0
+
+    # Check for pipeline
+    if has_pipe(@g_line_buffer[0])
+        let num_stages: i32 = parse_pipeline(@g_line_buffer[0])
+        if num_stages >= 2
+            return exec_pipeline()
+        # Fall through if parsing failed
 
     let argc: i32 = parse_args(@g_line_buffer[0])
     if argc == 0

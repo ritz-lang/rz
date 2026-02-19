@@ -251,7 +251,12 @@ if [ "$GUI_MODE" = true ]; then
     echo "  Display: GUI mode (gtk)"
 else
     DISPLAY_OPT="-display none"
-    TIMEOUT_SECS=30
+    # TCG mode is much slower than KVM - need longer timeout
+    if [ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+        TIMEOUT_SECS=60
+    else
+        TIMEOUT_SECS=120  # Longer timeout for TCG emulation
+    fi
     echo "  Display: headless"
 fi
 
@@ -266,7 +271,16 @@ fi
 # With more RAM, UEFI may allocate kernel buffers above 256MB which aren't mapped.
 # TODO: Fix bootloader to dynamically map memory where kernel is loaded.
 # VirtIO block, network, and input devices for driver testing (matching BIOS test)
+# Use -cpu host with KVM for native CPU features, or fall back to Haswell
+if [ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+    CPU_OPT="-enable-kvm -cpu host"
+else
+    # Haswell supports BMI1/BMI2 which -march=native may generate (bextr, etc.)
+    CPU_OPT="-cpu Haswell"
+fi
+
 QEMU_CMD="qemu-system-x86_64 \
+    $CPU_OPT \
     -drive if=pflash,format=raw,readonly=on,file=$OVMF_CODE \
     -drive format=raw,file=$TMPDIR/disk.img \
     -device virtio-blk-pci,drive=initramfs \

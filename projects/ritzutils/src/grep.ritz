@@ -1,0 +1,194 @@
+# grep - Search for patterns in files
+#
+# Usage: grep PATTERN [file...]
+#
+# Searches for PATTERN in files and prints matching lines.
+# If no files specified, reads from stdin.
+# Simple substring matching (not full regex).
+
+import ritzlib.sys {
+    sys_read, sys_write, sys_exit,
+    STDIN, STDOUT, STDERR
+}
+
+import ritzlib.str { strlen }
+
+# File open syscall (Harland-specific)
+const SYS_OPEN: i64 = 2
+const SYS_CLOSE: i64 = 3
+
+const O_RDONLY: i32 = 0
+
+extern fn syscall1(n: i64, a1: i64) -> i64
+extern fn syscall3(n: i64, a1: i64, a2: i64, a3: i64) -> i64
+
+fn sys_open(path: *u8, flags: i32) -> i32
+    let path_len: i64 = strlen(path)
+    return syscall3(SYS_OPEN, path as i64, path_len, flags as i64) as i32
+
+fn sys_close(fd: i32) -> i32
+    return syscall1(SYS_CLOSE, fd as i64) as i32
+
+# Print error message
+fn print_error(msg: *u8)
+    sys_write(STDERR, msg, strlen(msg))
+
+fn print_error_path(prefix: *u8, path: *u8, suffix: *u8)
+    print_error(prefix)
+    sys_write(STDERR, path, strlen(path))
+    print_error(suffix)
+
+# Check if haystack contains needle (simple substring search)
+fn contains(haystack: *u8, haystack_len: i64, needle: *u8, needle_len: i64) -> bool
+    if needle_len == 0
+        return true
+    if needle_len > haystack_len
+        return false
+
+    var i: i64 = 0
+    let limit: i64 = haystack_len - needle_len + 1
+
+    while i < limit
+        var found: bool = true
+        var j: i64 = 0
+
+        while j < needle_len and found
+            if *(haystack + i + j) != *(needle + j)
+                found = false
+            j = j + 1
+
+        if found
+            return true
+        i = i + 1
+
+    return false
+
+# Global state for line buffering
+var g_line_buf: [8192]u8
+var g_line_len: i64 = 0
+
+# Process a chunk of input, extracting and checking lines
+# Returns number of matches found
+fn process_chunk(buf: *u8, len: i64, pattern: *u8, pattern_len: i64) -> i32
+    var matches: i32 = 0
+    var i: i64 = 0
+
+    while i < len
+        let c: u8 = *(buf + i)
+
+        if c == 10  # newline
+            # Check if this line matches
+            if contains(@g_line_buf[0], g_line_len, pattern, pattern_len)
+                # Print the matching line
+                sys_write(STDOUT, @g_line_buf[0], g_line_len)
+                sys_write(STDOUT, c"\n", 1)
+                matches = matches + 1
+            # Reset line buffer
+            g_line_len = 0
+        else
+            # Add character to line buffer (with overflow protection)
+            if g_line_len < 8191
+                g_line_buf[g_line_len] = c
+                g_line_len = g_line_len + 1
+
+        i = i + 1
+
+    return matches
+
+# Grep a file descriptor
+fn grep_fd(fd: i32, pattern: *u8) -> i32
+    let pattern_len: i64 = strlen(pattern)
+    var buf: [4096]u8
+    var total_matches: i32 = 0
+
+    # Reset line buffer for this file
+    g_line_len = 0
+
+    var reading: bool = true
+    while reading
+        let n: i64 = sys_read(fd, @buf[0], 4096)
+        if n > 0
+            total_matches = total_matches + process_chunk(@buf[0], n, pattern, pattern_len)
+        else if n == 0
+            # End of file - check if there's a final line without newline
+            if g_line_len > 0
+                if contains(@g_line_buf[0], g_line_len, pattern, pattern_len)
+                    sys_write(STDOUT, @g_line_buf[0], g_line_len)
+                    sys_write(STDOUT, c"\n", 1)
+                    total_matches = total_matches + 1
+            reading = false
+        else
+            return -1  # Read error
+
+    return total_matches
+
+# Grep a single file
+fn grep_file(path: *u8, pattern: *u8) -> i32
+    let fd: i32 = sys_open(path, O_RDONLY)
+    if fd < 0
+        print_error_path(c"grep: ", path, c": No such file or directory\n")
+        return -1
+
+    let matches: i32 = grep_fd(fd, pattern)
+    sys_close(fd)
+
+    if matches < 0
+        print_error_path(c"grep: ", path, c": read error\n")
+        return -1
+
+    return matches
+
+# Grep stdin
+fn grep_stdin(pattern: *u8) -> i32
+    let matches: i32 = grep_fd(STDIN, pattern)
+    if matches < 0
+        print_error(c"grep: stdin: read error\n")
+        return -1
+    return matches
+
+# Main entry point
+pub fn main(argc: i32, argv: **u8) -> i32
+    # Need at least a pattern
+    if argc < 2
+        print_error(c"Usage: grep PATTERN [file...]\n")
+        return 2  # Exit code 2 = usage error
+
+    let pattern: *u8 = *(argv + 1)
+    var total_matches: i32 = 0
+    var had_error: bool = false
+
+    # If no files specified, read from stdin
+    if argc == 2
+        let matches: i32 = grep_stdin(pattern)
+        if matches < 0
+            had_error = true
+        else
+            total_matches = total_matches + matches
+    else
+        # Process each file
+        var i: i32 = 2
+        while i < argc
+            let path: *u8 = *(argv + i as i64)
+
+            # "-" means stdin
+            if *path == 45 and *(path + 1) == 0
+                let matches: i32 = grep_stdin(pattern)
+                if matches < 0
+                    had_error = true
+                else
+                    total_matches = total_matches + matches
+            else
+                let matches: i32 = grep_file(path, pattern)
+                if matches < 0
+                    had_error = true
+                else
+                    total_matches = total_matches + matches
+
+            i = i + 1
+
+    # Exit codes: 0 = match found, 1 = no match, 2 = error
+    if had_error
+        return 2
+    if total_matches > 0
+        return 0
+    return 1

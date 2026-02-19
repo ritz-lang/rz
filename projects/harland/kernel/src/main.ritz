@@ -2092,6 +2092,229 @@ const SYS_FB_INFO: u64 = 210      # Get framebuffer info
 const SYS_FB_MAP: u64 = 211       # Map framebuffer into userspace
 const SYS_DEBUG_PRINT: u64 = 255
 
+# Pipe syscalls
+const SYS_PIPE: u64 = 40          # Create a pipe (returns read_fd in rdi, write_fd in rsi)
+const SYS_DUP2: u64 = 41          # Duplicate file descriptor
+const SYS_SPAWN_EX: u64 = 42      # Spawn with I/O redirection
+
+# ============================================================================
+# Pipe Infrastructure
+# ============================================================================
+#
+# Pipes are kernel-managed ring buffers that connect processes.
+# Each pipe has a read end and write end. When the write end is closed
+# and the buffer is empty, reads return 0 (EOF).
+#
+# Pipe file descriptors start at 100 to distinguish from filesystem fds.
+
+const MAX_PIPES: i32 = 4          # Reduced for now to minimize BSS usage
+const PIPE_BUF_SIZE: u64 = 1024   # 1KB buffer per pipe
+const PIPE_FD_BASE: i32 = 100     # Pipe fds start at 100
+
+struct Pipe
+    buffer: [1024]u8        # Ring buffer (1KB to reduce BSS)
+    read_pos: u64           # Read position
+    write_pos: u64          # Write position
+    data_count: u64         # Bytes in buffer
+    read_open: u8           # Read end is open (1 = open, 0 = closed)
+    write_open: u8          # Write end is open (1 = open, 0 = closed)
+    in_use: u8              # Pipe slot is allocated (1 = yes, 0 = no)
+    _pad: [5]u8             # Padding to align to 8 bytes
+
+var g_pipes: [4]Pipe
+var g_pipe_count: i32 = 0
+
+# Initialize pipe system
+fn pipe_init()
+    var i: i32 = 0
+    while i < MAX_PIPES
+        g_pipes[i].read_pos = 0
+        g_pipes[i].write_pos = 0
+        g_pipes[i].data_count = 0
+        g_pipes[i].read_open = 0
+        g_pipes[i].write_open = 0
+        g_pipes[i].in_use = 0
+        i = i + 1
+
+# Allocate a new pipe, returns pipe index (0-3) or -1 on failure
+fn pipe_alloc() -> i32
+    var i: i32 = 0
+    while i < MAX_PIPES
+        if g_pipes[i].in_use == 0
+            g_pipes[i].read_pos = 0
+            g_pipes[i].write_pos = 0
+            g_pipes[i].data_count = 0
+            g_pipes[i].read_open = 1
+            g_pipes[i].write_open = 1
+            g_pipes[i].in_use = 1
+            g_pipe_count = g_pipe_count + 1
+            return i
+        i = i + 1
+    return -1
+
+# Check if fd is a pipe fd (100-163 for read, 200-263 for write)
+fn is_pipe_fd(fd: i32) -> bool
+    return (fd >= 100 and fd < 164) or (fd >= 200 and fd < 264)
+
+# Get pipe index from fd (100-131 = pipe 0-31 read, 200-231 = pipe 0-31 write)
+fn pipe_fd_to_index(fd: i32) -> i32
+    if fd >= 200
+        return fd - 200
+    return fd - 100
+
+# Check if fd is read end (100-163) or write end (200-263)
+fn is_pipe_read_fd(fd: i32) -> bool
+    return fd >= 100 and fd < 164
+
+fn is_pipe_write_fd(fd: i32) -> bool
+    return fd >= 200 and fd < 264
+
+# Read from pipe (blocking until data available or write end closed)
+fn pipe_read(pipe_idx: i32, buf: *u8, count: u64) -> i64
+    if pipe_idx < 0 or pipe_idx >= MAX_PIPES
+        return -1
+    let pipe: *Pipe = @g_pipes[pipe_idx]
+
+    if (*pipe).in_use == 0 or (*pipe).read_open == 0
+        return -1  # EBADF
+
+    # If no data and write end closed, return EOF
+    if (*pipe).data_count == 0 and (*pipe).write_open == 0
+        return 0
+
+    # Wait for data (simple spin for now - later use blocking)
+    var waited: i32 = 0
+    while (*pipe).data_count == 0 and (*pipe).write_open != 0
+        # Yield to let writer run
+        # For now, busy wait (TODO: proper blocking)
+        waited = waited + 1
+        if waited > 1000000
+            # Timeout - return 0 bytes for now
+            return 0
+
+    # Read available data
+    var bytes_to_read: u64 = count
+    if bytes_to_read > (*pipe).data_count
+        bytes_to_read = (*pipe).data_count
+
+    var i: u64 = 0
+    while i < bytes_to_read
+        let pos: u64 = (*pipe).read_pos % PIPE_BUF_SIZE
+        *(buf + i) = (*pipe).buffer[pos as i32]
+        (*pipe).read_pos = (*pipe).read_pos + 1
+        i = i + 1
+
+    (*pipe).data_count = (*pipe).data_count - bytes_to_read
+    return bytes_to_read as i64
+
+# Write to pipe
+fn pipe_write(pipe_idx: i32, buf: *u8, count: u64) -> i64
+    if pipe_idx < 0 or pipe_idx >= MAX_PIPES
+        return -1
+    let pipe: *Pipe = @g_pipes[pipe_idx]
+
+    if (*pipe).in_use == 0 or (*pipe).write_open == 0
+        return -1  # EBADF
+
+    # If read end closed, return error (EPIPE)
+    if (*pipe).read_open == 0
+        return -1
+
+    # Write data (may block if buffer full - spin for now)
+    var bytes_written: u64 = 0
+    while bytes_written < count
+        # Wait for space
+        var waited: i32 = 0
+        while (*pipe).data_count >= PIPE_BUF_SIZE
+            waited = waited + 1
+            if waited > 1000000
+                # Timeout - return what we've written
+                return bytes_written as i64
+
+        let pos: u64 = (*pipe).write_pos % PIPE_BUF_SIZE
+        (*pipe).buffer[pos as i32] = *(buf + bytes_written)
+        (*pipe).write_pos = (*pipe).write_pos + 1
+        (*pipe).data_count = (*pipe).data_count + 1
+        bytes_written = bytes_written + 1
+
+    return bytes_written as i64
+
+# Close pipe end
+fn pipe_close(fd: i32) -> i32
+    let pipe_idx: i32 = pipe_fd_to_index(fd)
+    if pipe_idx < 0 or pipe_idx >= MAX_PIPES
+        return -1
+    let pipe: *Pipe = @g_pipes[pipe_idx]
+
+    if (*pipe).in_use == 0
+        return -1
+
+    if is_pipe_read_fd(fd)
+        (*pipe).read_open = 0
+    else
+        (*pipe).write_open = 0
+
+    # If both ends closed, free the pipe
+    if (*pipe).read_open == 0 and (*pipe).write_open == 0
+        (*pipe).in_use = 0
+        g_pipe_count = g_pipe_count - 1
+
+    return 0
+
+# sys_pipe: Create a pipe and return two fds
+# Returns: read_fd in lower 32 bits, write_fd in upper 32 bits
+fn sys_pipe_impl() -> i64
+    let pipe_idx: i32 = pipe_alloc()
+    if pipe_idx < 0
+        return -1
+
+    # read_fd = 100 + pipe_idx, write_fd = 200 + pipe_idx
+    let read_fd: i64 = (PIPE_FD_BASE + pipe_idx) as i64
+    let write_fd: i64 = (200 + pipe_idx) as i64
+
+    # Return both fds packed: (write_fd << 32) | read_fd
+    return (write_fd << 32) | read_fd
+
+# ============================================================================
+# Per-Process I/O Redirection
+# ============================================================================
+#
+# For shell pipelines, we track stdin/stdout redirections per process.
+# When a process is spawned with redirected I/O, these are set and used
+# by sys_read/sys_write for fd 0/1/2.
+#
+# 0 = use default (serial for stdin/stdout)
+# >0 = pipe fd to use
+
+var g_child_stdin_fd: i32 = 0       # If set, child reads stdin from this pipe
+var g_child_stdout_fd: i32 = 0      # If set, child writes stdout to this pipe
+var g_child_stderr_fd: i32 = 0      # If set, child writes stderr to this pipe
+
+# Set I/O redirection for next spawned child
+fn set_child_io(stdin_fd: i32, stdout_fd: i32, stderr_fd: i32)
+    g_child_stdin_fd = stdin_fd
+    g_child_stdout_fd = stdout_fd
+    g_child_stderr_fd = stderr_fd
+
+# Clear I/O redirection
+fn clear_child_io()
+    g_child_stdin_fd = 0
+    g_child_stdout_fd = 0
+    g_child_stderr_fd = 0
+
+# Check if current process has redirected stdin/stdout
+fn has_redirected_stdin() -> bool
+    return g_child_stdin_fd != 0
+
+fn has_redirected_stdout() -> bool
+    return g_child_stdout_fd != 0
+
+fn get_redirected_stdin() -> i32
+    return g_child_stdin_fd
+
+fn get_redirected_stdout() -> i32
+    return g_child_stdout_fd
+
 # ============================================================================
 # Memory Mapping (mmap/munmap)
 # ============================================================================
@@ -3115,6 +3338,9 @@ pub fn syscall_handler(rax: u64, rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
     # SYS_CLOSE - Close a file descriptor
     if rax == SYS_CLOSE
         let fd: i32 = rdi as i32
+        # Check if it's a pipe fd
+        if is_pipe_fd(fd)
+            return pipe_close(fd) as i64
         # Check if it's a filesystem fd
         if is_fs_fd(fd)
             return sys_close(fd)
@@ -3130,9 +3356,21 @@ pub fn syscall_handler(rax: u64, rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
         let buf: *u8 = rsi as *u8
         let len: i64 = rdx as i64
 
+        # Check if it's a pipe write fd
+        if is_pipe_write_fd(fd)
+            let pipe_idx: i32 = pipe_fd_to_index(fd)
+            return pipe_write(pipe_idx, buf, len as u64)
+
         # Check if it's a filesystem fd
         if is_fs_fd(fd)
             return sys_fs_write(fd, buf, len as u64)
+
+        # Check for redirected stdout (fd 1) in child process
+        if fd == 1 and g_has_parent == 1 and has_redirected_stdout()
+            let redirect_fd: i32 = get_redirected_stdout()
+            if is_pipe_write_fd(redirect_fd)
+                let pipe_idx: i32 = pipe_fd_to_index(redirect_fd)
+                return pipe_write(pipe_idx, buf, len as u64)
 
         # Otherwise, write to serial (fd 1 = stdout, fd 2 = stderr)
         var i: i64 = 0
@@ -3150,9 +3388,21 @@ pub fn syscall_handler(rax: u64, rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
         let buf: *u8 = rsi as *u8
         let count: i64 = rdx as i64
 
+        # Check if it's a pipe read fd
+        if is_pipe_read_fd(fd)
+            let pipe_idx: i32 = pipe_fd_to_index(fd)
+            return pipe_read(pipe_idx, buf, count as u64)
+
         # Check if it's a filesystem fd
         if is_fs_fd(fd)
             return sys_fs_read(fd, buf, count as u64)
+
+        # Check for redirected stdin (fd 0) in child process
+        if fd == 0 and g_has_parent == 1 and has_redirected_stdin()
+            let redirect_fd: i32 = get_redirected_stdin()
+            if is_pipe_read_fd(redirect_fd)
+                let pipe_idx: i32 = pipe_fd_to_index(redirect_fd)
+                return pipe_read(pipe_idx, buf, count as u64)
 
         # Only support stdin (fd 0) for serial input
         if fd != 0
@@ -3188,6 +3438,18 @@ pub fn syscall_handler(rax: u64, rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
     if rax == SYS_SPAWN_ARGS
         # rdi = path pointer, rsi = argv, rdx = argc
         return sys_spawn_args_impl(rdi as *u8, rsi as **u8, rdx as i32)
+
+    if rax == SYS_SPAWN_EX
+        # Spawn with I/O redirection
+        # rdi = path pointer, rsi = argv, rdx = argc, r10 = stdin_fd | (stdout_fd << 16)
+        let stdin_fd: i32 = (r10 & 0xFFFF) as i32
+        let stdout_fd: i32 = ((r10 >> 16) & 0xFFFF) as i32
+        # Set I/O redirection before spawn
+        set_child_io(stdin_fd, stdout_fd, 0)
+        let result: i64 = sys_spawn_args_impl(rdi as *u8, rsi as **u8, rdx as i32)
+        # Clear redirection after spawn returns (child exited)
+        clear_child_io()
+        return result
 
     if rax == SYS_WAIT
         # rdi = pid
@@ -3239,6 +3501,11 @@ pub fn syscall_handler(rax: u64, rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
     if rax == SYS_CHDIR
         # chdir(path) -> 0 or -1
         return sys_chdir_impl(rdi as *u8)
+
+    # Pipe syscalls
+    if rax == SYS_PIPE
+        # pipe() -> (read_fd | (write_fd << 32)) or -1
+        return sys_pipe_impl()
 
     # Input device syscalls
     if rax == SYS_INPUT_POLL
@@ -4472,12 +4739,15 @@ pub fn kernel_main(boot_info_addr: u64) -> i32
         klog(c"    [HEAP CORRUPT after pci_init]\n")
 
     # Initialize VirtIO Input device (keyboard/mouse) - after PCI enumeration
-    klog(c"  [..] VirtIO input device")
-    let input_result: i32 = virtio_input_init()
-    if input_result == 0
-        klog(c"\r  [OK] VirtIO input device\n")
-    else
-        klog(c"\r  [..] VirtIO input device (not found)\n")
+    # DISABLED: VirtIO input uses modern MMIO transport which requires vmm_map_page fixes
+    # The MMIO mapping doesn't work correctly - vmm_map_page succeeds but reads return wrong values
+    # TODO: Fix vmm_map_page for address range 0xFFFFFFFF90000000+, then re-enable
+    klog(c"  [..] VirtIO input device (disabled - MMIO WIP)\n")
+    # let input_result: i32 = virtio_input_init()
+    # if input_result == 0
+    #     klog(c"\r  [OK] VirtIO input device\n")
+    # else
+    #     klog(c"\r  [..] VirtIO input device (not found)\n")
 
     # Initialize block device abstraction layer
     # This probes for VirtIO (QEMU) and NVMe (EC2/bare metal) block devices
@@ -4574,6 +4844,11 @@ pub fn kernel_main(boot_info_addr: u64) -> i32
     channel_init()
     ipc_syscall_init()
     klog(c"\r  [OK] IPC channels\n")
+
+    # Initialize pipes for shell pipelines
+    klog(c"  [..] Pipe subsystem")
+    pipe_init()
+    klog(c"\r  [OK] Pipe subsystem\n")
 
     # Initialize capability subsystem
     klog(c"  [..] Capability tables")

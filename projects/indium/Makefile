@@ -14,8 +14,9 @@ BOOTLOADER = $(HARLAND_DIR)/build/debug/BOOTX64.EFI
 ISO_FILE = $(BUILD_DIR)/indium.iso
 UEFI_DISK = $(BUILD_DIR)/uefi-boot.img
 
-# QEMU
-QEMU = qemu-system-x86_64
+# QEMU - use KVM with host CPU if available, else Skylake (supports AVX2, SHA-NI for -march=native)
+QEMU_CPU := $(shell [ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ] && echo "-enable-kvm -cpu host" || echo "-cpu Skylake-Client")
+QEMU = qemu-system-x86_64 $(QEMU_CPU)
 
 # Find OVMF firmware
 OVMF_CODE := $(shell for p in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/x64/OVMF_CODE.4m.fd; do [ -f "$$p" ] && echo "$$p" && break; done)
