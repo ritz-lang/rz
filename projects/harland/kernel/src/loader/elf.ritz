@@ -1,0 +1,420 @@
+# Harland Kernel - ELF Loader
+#
+# Parses and loads ELF64 executables for user processes.
+# Supports:
+#   - ELF64 format (x86-64)
+#   - PT_LOAD segments (code, data, bss)
+#   - Position-independent executables (PIE) or static
+#
+# ELF Header Format (64-bit):
+#   0x00: e_ident[16]     - Magic number and other info
+#   0x10: e_type          - Object file type (u16)
+#   0x12: e_machine       - Architecture (u16)
+#   0x14: e_version       - Object file version (u32)
+#   0x18: e_entry         - Entry point virtual address (u64)
+#   0x20: e_phoff         - Program header table file offset (u64)
+#   0x28: e_shoff         - Section header table file offset (u64)
+#   0x30: e_flags         - Processor-specific flags (u32)
+#   0x34: e_ehsize        - ELF header size in bytes (u16)
+#   0x36: e_phentsize     - Program header table entry size (u16)
+#   0x38: e_phnum         - Program header table entry count (u16)
+#   0x3A: e_shentsize     - Section header table entry size (u16)
+#   0x3C: e_shnum         - Section header table entry count (u16)
+#   0x3E: e_shstrndx      - Section header string table index (u16)
+
+import serial { prints, serial_print_hex, serial_print_dec }
+import mm.pmm { pmm_alloc_page, pmm_free_page, PAGE_SIZE }
+import mm.vmm { vmm_map_page, vmm_virt_to_phys, vmm_flush_tlb_all, PTE_USER, PTE_WRITABLE }
+
+# External functions from main.ritz
+extern fn alloc_user_stack() -> u64
+extern fn jump_to_userspace(entry: u64, stack: u64)
+
+# ============================================================================
+# ELF Constants
+# ============================================================================
+
+# ELF magic bytes: 0x7F 'E' 'L' 'F'
+const ELF_MAGIC_0: u8 = 0x7F
+const ELF_MAGIC_1: u8 = 0x45  # 'E'
+const ELF_MAGIC_2: u8 = 0x4C  # 'L'
+const ELF_MAGIC_3: u8 = 0x46  # 'F'
+
+# e_ident indices
+const EI_MAG0: i32 = 0
+const EI_MAG1: i32 = 1
+const EI_MAG2: i32 = 2
+const EI_MAG3: i32 = 3
+const EI_CLASS: i32 = 4     # 1=32-bit, 2=64-bit
+const EI_DATA: i32 = 5      # 1=little-endian, 2=big-endian
+const EI_VERSION: i32 = 6
+const EI_OSABI: i32 = 7
+const EI_ABIVERSION: i32 = 8
+
+# ELF class values
+const ELFCLASS64: u8 = 2
+
+# ELF data encoding
+const ELFDATA2LSB: u8 = 1  # Little-endian
+
+# e_type values
+pub const ET_EXEC: u16 = 2   # Executable file
+pub const ET_DYN: u16 = 3    # Shared object file (PIE)
+
+# e_machine values
+const EM_X86_64: u16 = 62
+
+# Program header types
+const PT_NULL: u32 = 0
+const PT_LOAD: u32 = 1    # Loadable segment
+const PT_DYNAMIC: u32 = 2
+const PT_INTERP: u32 = 3
+const PT_NOTE: u32 = 4
+const PT_PHDR: u32 = 6
+const PT_GNU_STACK: u32 = 0x6474E551
+const PT_GNU_RELRO: u32 = 0x6474E552
+
+# Program header flags
+const PF_X: u32 = 1       # Execute
+const PF_W: u32 = 2       # Write
+const PF_R: u32 = 4       # Read
+
+# ============================================================================
+# ELF Structures
+# ============================================================================
+
+# ELF64 Header structure (64 bytes)
+pub struct Elf64Ehdr
+    e_ident: [16]u8       # Magic number and other info
+    e_type: u16           # Object file type
+    e_machine: u16        # Architecture
+    e_version: u32        # Object file version
+    e_entry: u64          # Entry point virtual address
+    e_phoff: u64          # Program header table file offset
+    e_shoff: u64          # Section header table file offset
+    e_flags: u32          # Processor-specific flags
+    e_ehsize: u16         # ELF header size in bytes
+    e_phentsize: u16      # Program header table entry size
+    e_phnum: u16          # Program header table entry count
+    e_shentsize: u16      # Section header table entry size
+    e_shnum: u16          # Section header table entry count
+    e_shstrndx: u16       # Section header string table index
+
+# ELF64 Program Header structure (56 bytes)
+pub struct Elf64Phdr
+    p_type: u32           # Segment type
+    p_flags: u32          # Segment flags
+    p_offset: u64         # Segment file offset
+    p_vaddr: u64          # Segment virtual address
+    p_paddr: u64          # Segment physical address
+    p_filesz: u64         # Segment size in file
+    p_memsz: u64          # Segment size in memory
+    p_align: u64          # Segment alignment
+
+# ELF loader result
+pub struct ElfLoadResult
+    entry_point: u64      # Entry point address
+    load_base: u64        # Base address where ELF was loaded
+    error: i32            # 0 = success, <0 = error code
+
+# ============================================================================
+# ELF Error Codes
+# ============================================================================
+
+pub const ELF_OK: i32 = 0
+pub const ELF_ERR_INVALID_MAGIC: i32 = -1
+pub const ELF_ERR_NOT_64BIT: i32 = -2
+pub const ELF_ERR_NOT_LITTLE_ENDIAN: i32 = -3
+pub const ELF_ERR_NOT_EXECUTABLE: i32 = -4
+pub const ELF_ERR_WRONG_MACHINE: i32 = -5
+pub const ELF_ERR_NO_SEGMENTS: i32 = -6
+pub const ELF_ERR_ALLOC_FAILED: i32 = -7
+pub const ELF_ERR_MAP_FAILED: i32 = -8
+
+# ============================================================================
+# ELF Functions
+# ============================================================================
+
+# Validate ELF header
+pub fn elf_validate_header(ehdr: *Elf64Ehdr) -> i32
+    # Check magic number
+    if (*ehdr).e_ident[EI_MAG0] != ELF_MAGIC_0
+        return ELF_ERR_INVALID_MAGIC
+    if (*ehdr).e_ident[EI_MAG1] != ELF_MAGIC_1
+        return ELF_ERR_INVALID_MAGIC
+    if (*ehdr).e_ident[EI_MAG2] != ELF_MAGIC_2
+        return ELF_ERR_INVALID_MAGIC
+    if (*ehdr).e_ident[EI_MAG3] != ELF_MAGIC_3
+        return ELF_ERR_INVALID_MAGIC
+
+    # Check 64-bit class
+    if (*ehdr).e_ident[EI_CLASS] != ELFCLASS64
+        return ELF_ERR_NOT_64BIT
+
+    # Check little-endian encoding
+    if (*ehdr).e_ident[EI_DATA] != ELFDATA2LSB
+        return ELF_ERR_NOT_LITTLE_ENDIAN
+
+    # Check executable type (accept both ET_EXEC and ET_DYN for PIE)
+    if (*ehdr).e_type != ET_EXEC and (*ehdr).e_type != ET_DYN
+        return ELF_ERR_NOT_EXECUTABLE
+
+    # Check x86-64 architecture
+    if (*ehdr).e_machine != EM_X86_64
+        return ELF_ERR_WRONG_MACHINE
+
+    # Check program headers exist
+    if (*ehdr).e_phnum == 0
+        return ELF_ERR_NO_SEGMENTS
+
+    return ELF_OK
+
+# Convert ELF flags to page table flags
+fn elf_flags_to_pte(p_flags: u32) -> u64
+    var pte_flags: u64 = PTE_USER  # Always user accessible
+
+    # Writable
+    if (p_flags & PF_W) != 0
+        pte_flags = pte_flags | PTE_WRITABLE
+
+    # Note: x86-64 doesn't have page-level execute disable by default
+    # NX bit requires checking EFER.NXE - for now, all pages are executable
+
+    return pte_flags
+
+# Load an ELF executable from memory
+#
+# Parameters:
+#   elf_data: Pointer to ELF file in memory
+#   elf_size: Size of ELF file in bytes
+#   load_base: Virtual address base for loading (0 to use ELF's addresses)
+#
+# Returns:
+#   ElfLoadResult with entry point and error code
+pub fn elf_load(elf_data: *u8, elf_size: u64, load_base: u64) -> ElfLoadResult
+    var result: ElfLoadResult
+    result.entry_point = 0
+    result.load_base = load_base
+    result.error = ELF_OK
+
+    # Parse ELF header
+    let ehdr: *Elf64Ehdr = elf_data as *Elf64Ehdr
+
+    # Validate header
+    let validate_result: i32 = elf_validate_header(ehdr)
+    if validate_result != ELF_OK
+        result.error = validate_result
+        return result
+
+    # Calculate adjusted entry point
+    # For PIE executables (ET_DYN), add load_base offset
+    # For static executables (ET_EXEC), use as-is
+    if (*ehdr).e_type == ET_DYN and load_base != 0
+        result.entry_point = (*ehdr).e_entry + load_base
+    else
+        result.entry_point = (*ehdr).e_entry
+
+    # Process program headers
+    let phdr_base: *u8 = elf_data + (*ehdr).e_phoff as i64
+    var phdr_idx: u16 = 0
+
+    while phdr_idx < (*ehdr).e_phnum
+        let phdr: *Elf64Phdr = (phdr_base + (phdr_idx as i64 * (*ehdr).e_phentsize as i64)) as *Elf64Phdr
+
+        # Only process PT_LOAD segments
+        if (*phdr).p_type == PT_LOAD
+            # Calculate virtual address (apply load_base for PIE)
+            var seg_vaddr: u64 = (*phdr).p_vaddr
+            if (*ehdr).e_type == ET_DYN and load_base != 0
+                seg_vaddr = seg_vaddr + load_base
+
+            # Calculate number of pages needed
+            let seg_start_page: u64 = seg_vaddr & 0xFFFFFFFFFFFFF000  # Page-align down
+            let seg_end: u64 = seg_vaddr + (*phdr).p_memsz
+            let seg_end_page: u64 = (seg_end + 0xFFF) & 0xFFFFFFFFFFFFF000  # Page-align up
+            let num_pages: u64 = (seg_end_page - seg_start_page) / PAGE_SIZE
+
+            # Get page table flags for this segment
+            let pte_flags: u64 = elf_flags_to_pte((*phdr).p_flags)
+
+            # Allocate, map, and copy data for this segment
+            # We need to copy data through the physical addresses (identity-mapped)
+            # since the virtual addresses may be outside the identity-mapped region
+            let src: *u8 = elf_data + (*phdr).p_offset as i64
+            var bytes_copied: u64 = 0
+            var page_offset: u64 = 0
+
+            while page_offset < num_pages * PAGE_SIZE
+                let page_vaddr: u64 = seg_start_page + page_offset
+
+                # For user ELF segments, we always need to allocate NEW physical
+                # pages and map them with USER permissions. The identity mapping
+                # of low memory is kernel-only and would cause page faults.
+                #
+                # Check if we already allocated this page for a previous segment
+                var page_phys: u64 = 0
+                var need_map: bool = true
+                var need_upgrade: bool = false
+
+                # Check if WE already mapped this page (with USER bit)
+                # For the ELF loader, we track pages we've allocated by checking
+                # if the physical address differs from the virtual address.
+                # Identity mapping has phys == virt, our allocations have phys > 32MB
+                # (where PMM allocates from available RAM)
+                let existing_phys: u64 = vmm_virt_to_phys(page_vaddr)
+                # If physical != virtual, we already mapped it (not identity mapped)
+                # Also check it's a reasonable physical address (our allocations
+                # come from PMM which allocates from free RAM, typically above kernel)
+                if existing_phys != page_vaddr and existing_phys >= 0x200000
+                    # We already allocated and mapped this page for a previous segment
+                    page_phys = existing_phys
+                    need_map = false
+                    # Check if we need to upgrade permissions (e.g., R -> RW)
+                    # Multiple segments can share a page with different permissions;
+                    # we need to use the most permissive combination
+                    if (pte_flags & PTE_WRITABLE) != 0
+                        need_upgrade = true
+                else
+                    # Need to allocate a new physical page
+                    page_phys = pmm_alloc_page()
+                    if page_phys == 0
+                        prints("[elf] Failed to allocate page!\n")
+                        result.error = ELF_ERR_ALLOC_FAILED
+                        return result
+
+                    # Zero the new page (through physical/identity-mapped address)
+                    var zero_ptr: *u8 = page_phys as *u8
+                    var zero_i: u64 = 0
+                    while zero_i < PAGE_SIZE
+                        *(zero_ptr + zero_i as i64) = 0
+                        zero_i = zero_i + 1
+
+                # Copy data to this page (through physical address)
+                var copy_ptr: *u8 = page_phys as *u8
+
+                # Calculate where in the page this segment's data should go
+                let page_base: u64 = page_vaddr
+                let seg_start_in_page: u64 = 0
+                if seg_vaddr > page_base
+                    # Segment starts partway into this page
+                    let offset: u64 = seg_vaddr - page_base
+                    if offset < PAGE_SIZE
+                        # Copy starting at offset
+                        var copy_i: u64 = 0
+                        while copy_i < (*phdr).p_filesz and (offset + copy_i) < PAGE_SIZE
+                            *(copy_ptr + (offset + copy_i) as i64) = *(src + copy_i as i64)
+                            copy_i = copy_i + 1
+                        bytes_copied = copy_i
+                else
+                    # Segment started before or at this page
+                    # Calculate how many bytes we've already copied
+                    let already_copied: u64 = page_vaddr - seg_vaddr
+                    if already_copied < (*phdr).p_filesz
+                        var copy_i: u64 = 0
+                        let remaining: u64 = (*phdr).p_filesz - already_copied
+                        while copy_i < remaining and copy_i < PAGE_SIZE
+                            *(copy_ptr + copy_i as i64) = *(src + (already_copied + copy_i) as i64)
+                            copy_i = copy_i + 1
+                        bytes_copied = already_copied + copy_i
+
+                # Map the page if needed
+                if need_map
+                    let map_result: i32 = vmm_map_page(page_vaddr, page_phys, pte_flags)
+                    if map_result != 0
+                        prints("[elf] Failed to map page at 0x")
+                        serial_print_hex(page_vaddr)
+                        prints("!\n")
+                        pmm_free_page(page_phys)
+                        result.error = ELF_ERR_MAP_FAILED
+                        return result
+                else if need_upgrade
+                    # Page was already mapped but we need to upgrade permissions
+                    # (e.g., a read-only segment followed by a writable segment sharing the same page)
+                    let map_result: i32 = vmm_map_page(page_vaddr, page_phys, pte_flags)
+                    if map_result != 0
+                        prints("[elf] Failed to upgrade page permissions at 0x")
+                        serial_print_hex(page_vaddr)
+                        prints("!\n")
+                        result.error = ELF_ERR_MAP_FAILED
+                        return result
+
+                page_offset = page_offset + PAGE_SIZE
+
+            # The rest (from p_filesz to p_memsz) is already zeroed
+
+        phdr_idx = phdr_idx + 1
+
+    # Flush TLB for the new mappings
+    vmm_flush_tlb_all()
+
+    return result
+
+# Load an ELF and execute it in userspace
+pub fn elf_exec(elf_data: *u8, elf_size: u64) -> i32
+    # Default load base for PIE executables
+    # Using a user-space address that's easy to debug
+    let default_load_base: u64 = 0x400000
+
+    # Load the ELF
+    let load_result: ElfLoadResult = elf_load(elf_data, elf_size, default_load_base)
+    if load_result.error != ELF_OK
+        prints("[elf] Load failed with error ")
+        serial_print_dec((0 - load_result.error) as u64)
+        prints("\n")
+        return load_result.error
+
+    # Allocate 64KB user stack (16 pages)
+    let stack_top: u64 = alloc_user_stack()
+    if stack_top == 0
+        prints("[elf] Failed to allocate user stack!\n")
+        return ELF_ERR_ALLOC_FAILED
+
+    # Flush TLB
+    vmm_flush_tlb_all()
+
+    # Jump to userspace
+    jump_to_userspace(load_result.entry_point, stack_top)
+
+    # Should not return
+    return 0
+
+# Test ELF loader with validation
+pub fn test_elf_loader() -> i32
+    prints("\n=== Testing ELF Loader ===\n")
+
+    # Show we have the ELF structures defined
+    prints("  Elf64Ehdr size: 64 bytes\n")
+    prints("  Elf64Phdr size: 56 bytes\n")
+
+    # Create a minimal ELF header for testing validation
+    var test_ehdr: Elf64Ehdr
+    test_ehdr.e_ident[0] = ELF_MAGIC_0
+    test_ehdr.e_ident[1] = ELF_MAGIC_1
+    test_ehdr.e_ident[2] = ELF_MAGIC_2
+    test_ehdr.e_ident[3] = ELF_MAGIC_3
+    test_ehdr.e_ident[4] = ELFCLASS64
+    test_ehdr.e_ident[5] = ELFDATA2LSB
+    test_ehdr.e_type = ET_EXEC
+    test_ehdr.e_machine = EM_X86_64
+    test_ehdr.e_phnum = 1
+
+    let validate_result: i32 = elf_validate_header(@test_ehdr)
+    prints("  Validation test: ")
+    if validate_result == ELF_OK
+        prints("PASSED\n")
+    else
+        prints("FAILED (error=")
+        serial_print_dec((0 - validate_result) as u64)
+        prints(")\n")
+
+    # Test invalid magic
+    test_ehdr.e_ident[0] = 0x00
+    let invalid_result: i32 = elf_validate_header(@test_ehdr)
+    prints("  Invalid magic test: ")
+    if invalid_result == ELF_ERR_INVALID_MAGIC
+        prints("PASSED (correctly rejected)\n")
+    else
+        prints("FAILED\n")
+
+    prints("=== ELF Loader Test Complete ===\n\n")
+    return 0

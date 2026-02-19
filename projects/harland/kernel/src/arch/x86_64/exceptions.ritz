@@ -1,0 +1,312 @@
+# Harland Kernel - Exception and IRQ Handlers
+#
+# Handles CPU exceptions (divide error, page fault, etc.) and hardware IRQs.
+# These handlers are called from isr_stubs.s assembly code.
+
+import io { halt_loop }
+import serial { StrView, prints, serial_print, serial_print_hex, serial_print_dec, serial_poll, serial_drain_output }
+import mm.vmm { vmm_debug_page_tables }
+
+# External functions from main.ritz
+extern fn ring_dump() -> i32
+extern fn lapic_eoi() -> i32
+
+# ============================================================================
+# Interrupt Frame Structure
+# ============================================================================
+#
+# Pushed by CPU and ISR stubs when an interrupt occurs.
+# Layout matches isr_stubs.s push order.
+
+pub struct InterruptFrame
+    r15: u64
+    r14: u64
+    r13: u64
+    r12: u64
+    r11: u64
+    r10: u64
+    r9: u64
+    r8: u64
+    rbp: u64
+    rdi: u64
+    rsi: u64
+    rdx: u64
+    rcx: u64
+    rbx: u64
+    rax: u64
+    vector: u64
+    error_code: u64
+    rip: u64
+    cs: u64
+    rflags: u64
+    rsp: u64
+    ss: u64
+
+# ============================================================================
+# Stack Trace Support
+# ============================================================================
+
+# Stack frame structure for x86_64 SysV ABI
+# Each frame contains:
+#   [rbp+0]  = previous rbp (saved frame pointer)
+#   [rbp+8]  = return address (rip)
+struct StackFrame
+    prev_rbp: *StackFrame
+    return_addr: u64
+
+# Maximum stack frames to print (prevent infinite loops on corrupted stacks)
+const MAX_STACK_FRAMES: u64 = 16
+
+# Check if an address looks like a valid kernel code address
+fn is_valid_code_address(addr: u64) -> bool
+    # Kernel code is in higher-half, 0xFFFFFFFF80100000 - 0xFFFFFFFF80200000 typically
+    if addr >= 0xFFFFFFFF80100000 and addr < 0xFFFFFFFF80400000
+        return true
+    # Identity-mapped kernel during early boot (around 1MB)
+    if addr >= 0x100000 and addr < 0x400000
+        return true
+    return false
+
+# Check if a stack frame pointer looks valid
+fn is_valid_frame_ptr(rbp: u64) -> bool
+    # Must be non-null
+    if rbp == 0
+        return false
+    # Must be 8-byte aligned
+    if (rbp & 7) != 0
+        return false
+    # Check for reasonable kernel stack range
+    # Kernel stacks are either in identity-mapped region or higher-half
+    if rbp >= 0xFFFFFFFF80000000
+        return true
+    if rbp >= 0x100000 and rbp < 0x10000000
+        return true
+    return false
+
+# Print a stack trace starting from the given RBP and RIP
+pub fn print_stack_trace(rbp: u64, rip: u64) -> i32
+    prints("\nStack Trace:\n")
+
+    # First frame: the faulting instruction
+    prints("  #0  ")
+    serial_print_hex(rip)
+    prints("  <faulting instruction>\n")
+
+    var frame_ptr: u64 = rbp
+    var frame_num: u64 = 1
+
+    while frame_num < MAX_STACK_FRAMES
+        # Validate frame pointer
+        if not is_valid_frame_ptr(frame_ptr)
+            if frame_num == 1
+                prints("  (no valid stack frames - frame pointer invalid)\n")
+            else
+                prints("  (end of stack)\n")
+            break
+
+        # Read the stack frame
+        let frame: *StackFrame = frame_ptr as *StackFrame
+        let return_addr: u64 = (*frame).return_addr
+        let prev_rbp: u64 = (*frame).prev_rbp as u64
+
+        # Validate return address
+        if not is_valid_code_address(return_addr)
+            prints("  (invalid return address - end of trace)\n")
+            break
+
+        # Print this frame
+        prints("  #")
+        serial_print_dec(frame_num)
+        prints("  ")
+        serial_print_hex(return_addr)
+        prints("\n")
+
+        # Check for progress (stack grows down, so prev_rbp should be >= frame_ptr)
+        if prev_rbp != 0 and prev_rbp <= frame_ptr
+            prints("  (stack corruption detected - frame pointer going wrong direction)\n")
+            break
+
+        frame_ptr = prev_rbp
+        frame_num = frame_num + 1
+
+    if frame_num >= MAX_STACK_FRAMES
+        prints("  ... (max frames reached)\n")
+
+    return 0
+
+# ============================================================================
+# Exception Names
+# ============================================================================
+
+pub fn exception_name(vector: u8) -> *u8
+    if vector == 0
+        return c"Divide Error"
+    if vector == 1
+        return c"Debug"
+    if vector == 2
+        return c"NMI"
+    if vector == 3
+        return c"Breakpoint"
+    if vector == 4
+        return c"Overflow"
+    if vector == 5
+        return c"Bound Range"
+    if vector == 6
+        return c"Invalid Opcode"
+    if vector == 7
+        return c"Device Not Available"
+    if vector == 8
+        return c"Double Fault"
+    if vector == 10
+        return c"Invalid TSS"
+    if vector == 11
+        return c"Segment Not Present"
+    if vector == 12
+        return c"Stack Fault"
+    if vector == 13
+        return c"General Protection"
+    if vector == 14
+        return c"Page Fault"
+    if vector == 16
+        return c"x87 FP Exception"
+    if vector == 17
+        return c"Alignment Check"
+    if vector == 18
+        return c"Machine Check"
+    if vector == 19
+        return c"SIMD FP Exception"
+    if vector == 20
+        return c"Virtualization"
+    if vector == 21
+        return c"Control Protection"
+    return c"Unknown"
+
+# ============================================================================
+# Exception Handler
+# ============================================================================
+#
+# Called from isr_stubs.s when a CPU exception occurs (vectors 0-31).
+# Prints diagnostic information and halts the system.
+
+pub fn exception_handler(frame: *InterruptFrame) -> i32
+    prints("\n!!! EXCEPTION !!!\n")
+    prints("Vector: ")
+    serial_print_hex((*frame).vector)
+    prints(" (")
+    serial_print(exception_name((*frame).vector as u8))
+    prints(")\n")
+
+    prints("Error Code: ")
+    serial_print_hex((*frame).error_code)
+    prints("\n")
+
+    prints("RIP: ")
+    serial_print_hex((*frame).rip)
+    prints("\n")
+
+    prints("CS: ")
+    serial_print_hex((*frame).cs)
+    prints("  SS: ")
+    serial_print_hex((*frame).ss)
+    prints("\n")
+
+    prints("RFLAGS: ")
+    serial_print_hex((*frame).rflags)
+    prints("\n")
+
+    prints("RSP: ")
+    serial_print_hex((*frame).rsp)
+    prints("\n")
+
+    # For page faults, print CR2 and decode error code
+    if (*frame).vector == 14
+        var cr2: u64 = 0
+        var cr2_ptr: *u64 = @cr2
+        asm x86_64:
+            movq %cr2, %rax
+            movq {cr2_ptr}, %rcx
+            movq %rax, (%rcx)
+        prints("CR2: ")
+        serial_print_hex(cr2)
+        prints(" (fault address)\n")
+
+        # Decode error code
+        prints("Error Code Bits:\n")
+        if ((*frame).error_code & 1) != 0
+            prints("  [P] Page present\n")
+        else
+            prints("  [P] Page not present\n")
+        if ((*frame).error_code & 2) != 0
+            prints("  [W] Write operation\n")
+        else
+            prints("  [W] Read operation\n")
+        if ((*frame).error_code & 4) != 0
+            prints("  [U] User mode\n")
+        else
+            prints("  [U] Kernel mode\n")
+        if ((*frame).error_code & 8) != 0
+            prints("  [R] Reserved bit violation\n")
+        if ((*frame).error_code & 16) != 0
+            prints("  [I] Instruction fetch\n")
+
+        # Walk page tables to show the issue
+        prints("\nPage Table Walk:\n")
+        vmm_debug_page_tables(cr2)
+
+    prints("\nRegisters:\n")
+    prints("  RAX=")
+    serial_print_hex((*frame).rax)
+    prints(" RBX=")
+    serial_print_hex((*frame).rbx)
+    prints("\n")
+    prints("  RCX=")
+    serial_print_hex((*frame).rcx)
+    prints(" RDX=")
+    serial_print_hex((*frame).rdx)
+    prints("\n")
+    prints("  RSI=")
+    serial_print_hex((*frame).rsi)
+    prints(" RDI=")
+    serial_print_hex((*frame).rdi)
+    prints("\n")
+    prints("  RBP=")
+    serial_print_hex((*frame).rbp)
+    prints("\n")
+
+    # Print stack trace
+    print_stack_trace((*frame).rbp, (*frame).rip)
+
+    # Dump ring buffer (shows recent kernel activity before crash)
+    ring_dump()
+
+    prints("\n*** KERNEL PANIC ***\n")
+    prints("System halted.\n")
+    halt_loop()
+    return 0
+
+# ============================================================================
+# IRQ Handler
+# ============================================================================
+#
+# Called from isr_stubs.s when a hardware interrupt occurs (vectors 32+).
+
+pub fn irq_handler(frame: *InterruptFrame) -> i32
+    let irq_num: u64 = (*frame).vector - 32
+
+    # Handle specific IRQs
+    if irq_num == 0
+        # Timer interrupt - just acknowledge for now
+        # (scheduler runs via timer_handler which is called separately)
+        lapic_eoi()
+        return 0
+
+    if irq_num == 4
+        # COM1 serial port interrupt
+        # Handle both RX (incoming data) and TX (buffer drain) interrupts
+        serial_poll()          # Read any available input
+        serial_drain_output()  # Send any pending output
+
+    # Send EOI to LAPIC (for APIC-delivered interrupts)
+    lapic_eoi()
+
+    return 0

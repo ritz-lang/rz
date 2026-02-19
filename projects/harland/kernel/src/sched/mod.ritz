@@ -1,0 +1,454 @@
+# Harland Kernel - Scheduler Module
+#
+# Kernel-level cooperative multitasking scheduler.
+# Manages kernel tasks (threads) with per-CPU scheduling state.
+#
+# Features:
+#   - Task Control Blocks (TCB) with saved CPU context
+#   - Per-CPU scheduler state with idle tasks
+#   - Simple FIFO ready queue
+#   - Cooperative scheduling via yield_task()
+#   - APIC timer support for preemptive scheduling (currently disabled)
+#
+# Note: This scheduler is for kernel tasks only.
+# User processes use a different mechanism (see process.ritz, spawn syscalls).
+
+import serial { prints, serial_print_dec }
+import mm.pmm { PAGE_SIZE, pmm_alloc_page, pmm_free_page }
+import mm.vmm { PTE_WRITABLE, vmm_map_page }
+import drivers.acpi.tables { num_cpus, cpu_apic_ids }
+
+# External LAPIC functions from main.ritz
+extern fn lapic_id() -> u32
+extern fn lapic_eoi() -> i32
+extern fn lapic_write(reg: u32, value: u32) -> i32
+
+# External context switch assembly
+extern fn context_switch(old_ctx: *CpuContext, new_ctx: *CpuContext)
+
+# Get AP stack top from main.ritz (returns stack base + size)
+extern fn get_ap_stack_top(cpu_idx: i32) -> u64
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+# Task states
+pub const TASK_STATE_DEAD: u8 = 0
+pub const TASK_STATE_READY: u8 = 1
+pub const TASK_STATE_RUNNING: u8 = 2
+pub const TASK_STATE_BLOCKED: u8 = 3
+
+# Maximum tasks and CPUs
+pub const MAX_TASKS: i32 = 64
+pub const MAX_CPUS: i32 = 16
+
+# NOTE: APIC timer constants removed - timer init is disabled
+# When re-enabling preemptive scheduling, import LAPIC constants from main
+
+# ============================================================================
+# Data Structures
+# ============================================================================
+
+# CPU context - all registers saved on context switch
+# Must match the layout in context_switch assembly
+pub struct CpuContext
+    # Callee-saved registers (System V AMD64 ABI)
+    rbx: u64
+    rbp: u64
+    r12: u64
+    r13: u64
+    r14: u64
+    r15: u64
+    rsp: u64        # Stack pointer
+    rip: u64        # Return address (set to task entry point initially)
+    rflags: u64     # Flags register
+
+# Task Control Block (TCB)
+pub struct Task
+    id: u32
+    state: u8
+    cpu_id: u8          # Which CPU is running this (if RUNNING)
+    priority: u8
+    pad: u8
+    context: CpuContext
+    stack_base: u64     # Base of kernel stack
+    stack_size: u64     # Stack size
+    name: [16]u8        # Task name for debugging
+
+# Per-CPU scheduler state
+pub struct CpuSched
+    cpu_id: u8
+    pad: [7]u8
+    current_task: u32   # Index of currently running task (or 0xFFFFFFFF if idle)
+    idle_task: u32      # Index of this CPU's idle task
+
+# ============================================================================
+# Global Scheduler State
+# ============================================================================
+
+pub var tasks: [64]Task                 # All tasks
+pub var task_count: u32 = 0             # Number of tasks created
+var next_task_id: u32 = 1               # Next task ID to assign
+
+pub var cpu_sched: [16]CpuSched         # Per-CPU scheduler state
+var ready_queue: [64]u32                # Ready task indices (simple FIFO)
+var ready_head: u32 = 0
+var ready_tail: u32 = 0
+var ready_count: u32 = 0
+
+pub var scheduler_initialized: u8 = 0
+pub var scheduler_lock: u32 = 0         # Simple spinlock
+
+# ============================================================================
+# Spinlock Functions
+# ============================================================================
+
+# Spinlock acquire
+pub fn sched_lock() -> i32
+    # Simple spinlock using atomic CAS
+    while true
+        var result: u32 = 0
+        var one: u32 = 1
+        # Try to atomically swap: set lock to 1 and get old value
+        asm x86_64:
+            lea scheduler_lock(%rip), %rsi
+            movl {one}, %eax
+            xchgl %eax, (%rsi)
+            movl %eax, {result}
+        if result == 0
+            return 0  # Got the lock (was unlocked)
+    return 0
+
+# Spinlock release
+pub fn sched_unlock() -> i32
+    scheduler_lock = 0
+    return 0
+
+# ============================================================================
+# Ready Queue Functions
+# ============================================================================
+
+# Add task to ready queue
+fn ready_queue_push(task_idx: u32) -> i32
+    if ready_count >= 64
+        return -1
+    ready_queue[ready_tail as i32] = task_idx
+    ready_tail = (ready_tail + 1) % 64
+    ready_count = ready_count + 1
+    return 0
+
+# Remove task from ready queue
+fn ready_queue_pop() -> u32
+    if ready_count == 0
+        return 0xFFFFFFFF  # No tasks
+    let task_idx: u32 = ready_queue[ready_head as i32]
+    ready_head = (ready_head + 1) % 64
+    ready_count = ready_count - 1
+    return task_idx
+
+# ============================================================================
+# Task Context Functions
+# ============================================================================
+
+# Initialize a task's context for first run
+fn task_init_context(task: *Task, entry: u64, stack_top: u64) -> i32
+    (*task).context.rbx = 0
+    (*task).context.rbp = stack_top
+    (*task).context.r12 = 0
+    (*task).context.r13 = 0
+    (*task).context.r14 = 0
+    (*task).context.r15 = 0
+    (*task).context.rsp = stack_top - 8  # Room for return address
+    (*task).context.rip = entry
+    (*task).context.rflags = 0x202       # IF=1, reserved bit 1
+
+    # Push the return address onto the stack
+    let ret_ptr: *u64 = (stack_top - 8) as *u64
+    *ret_ptr = entry
+
+    return 0
+
+# ============================================================================
+# Task Creation
+# ============================================================================
+
+# Create a new kernel task
+pub fn task_create(name: *u8, entry: u64) -> i32
+    sched_lock()
+
+    if task_count >= MAX_TASKS as u32
+        sched_unlock()
+        return -1
+
+    let task_idx: u32 = task_count
+    task_count = task_count + 1
+
+    let task: *Task = @tasks[task_idx as i32]
+
+    # Initialize task
+    (*task).id = next_task_id
+    next_task_id = next_task_id + 1
+    (*task).state = TASK_STATE_READY
+    (*task).cpu_id = 0
+    (*task).priority = 128  # Default priority
+
+    # Copy name
+    var i: i32 = 0
+    var src: *u8 = name
+    while i < 15 and *src != 0
+        (*task).name[i] = *src
+        src = src + 1
+        i = i + 1
+    (*task).name[i] = 0
+
+    # Allocate stack (4KB)
+    let stack_pages: u64 = 1
+    let stack_phys: u64 = pmm_alloc_page()
+    if stack_phys == 0
+        sched_unlock()
+        return -1
+
+    # Map stack (use a high virtual address range for task stacks)
+    let stack_virt: u64 = 0x200000000 + (task_idx as u64) * 0x2000
+    let map_result: i32 = vmm_map_page(stack_virt, stack_phys, PTE_WRITABLE)
+    if map_result != 0
+        pmm_free_page(stack_phys)
+        sched_unlock()
+        return -1
+
+    (*task).stack_base = stack_virt
+    (*task).stack_size = PAGE_SIZE
+
+    let stack_top: u64 = stack_virt + PAGE_SIZE
+
+    # Initialize context
+    task_init_context(task, entry, stack_top)
+
+    # Add to ready queue
+    ready_queue_push(task_idx)
+
+    sched_unlock()
+
+    return (*task).id as i32
+
+# ============================================================================
+# Per-CPU State
+# ============================================================================
+
+# Get the current CPU's scheduler state
+pub fn get_cpu_sched() -> *CpuSched
+    let cpu_id: u32 = lapic_id()
+    # Find the CPU in our list by APIC ID
+    var i: i32 = 0
+    while i < num_cpus as i32
+        if cpu_apic_ids[i] == cpu_id as u8
+            return @cpu_sched[i]
+        i = i + 1
+    # Fallback to CPU 0 if not found
+    return @cpu_sched[0]
+
+# ============================================================================
+# Scheduling
+# ============================================================================
+
+# Schedule next task (called from timer interrupt or yield)
+pub fn schedule() -> i32
+    if scheduler_initialized == 0
+        return 0
+
+    sched_lock()
+
+    let cpu: *CpuSched = get_cpu_sched()
+    let old_task_idx: u32 = (*cpu).current_task
+
+    # If we have a current task, save it and put it back on ready queue
+    if old_task_idx != 0xFFFFFFFF
+        let old_task: *Task = @tasks[old_task_idx as i32]
+        if (*old_task).state == TASK_STATE_RUNNING
+            (*old_task).state = TASK_STATE_READY
+            ready_queue_push(old_task_idx)
+
+    # Get next task from ready queue
+    let new_task_idx: u32 = ready_queue_pop()
+
+    if new_task_idx == 0xFFFFFFFF
+        # No tasks ready - run idle task
+        (*cpu).current_task = (*cpu).idle_task
+        let idle: *Task = @tasks[(*cpu).idle_task as i32]
+        (*idle).state = TASK_STATE_RUNNING
+
+        sched_unlock()
+
+        # If switching from a real task to idle, do context switch
+        if old_task_idx != 0xFFFFFFFF and old_task_idx != (*cpu).idle_task
+            let old_ctx: *CpuContext = @(tasks[old_task_idx as i32].context)
+            let new_ctx: *CpuContext = @((*idle).context)
+            context_switch(old_ctx, new_ctx)
+
+        return 0
+
+    # Switch to new task
+    let new_task: *Task = @tasks[new_task_idx as i32]
+    (*new_task).state = TASK_STATE_RUNNING
+    (*new_task).cpu_id = (*cpu).cpu_id
+    (*cpu).current_task = new_task_idx
+
+    sched_unlock()
+
+    # Perform context switch if task actually changed
+    if old_task_idx != new_task_idx
+        if old_task_idx == 0xFFFFFFFF
+            # First switch - no old context to save, just restore new
+            let new_ctx: *CpuContext = @((*new_task).context)
+            # Jump to new task (special case - no old context)
+            asm x86_64:
+                movq {new_ctx}, %rdi
+                movq 48(%rdi), %rsp        # Restore RSP
+                movq 64(%rdi), %rax        # Get RFLAGS
+                pushq %rax
+                popfq                       # Restore RFLAGS
+                movq 0(%rdi), %rbx
+                movq 8(%rdi), %rbp
+                movq 16(%rdi), %r12
+                movq 24(%rdi), %r13
+                movq 32(%rdi), %r14
+                movq 40(%rdi), %r15
+                movq 56(%rdi), %rax        # Get RIP
+                jmpq *%rax                  # Jump to task
+        else
+            let old_ctx: *CpuContext = @(tasks[old_task_idx as i32].context)
+            let new_ctx: *CpuContext = @((*new_task).context)
+            context_switch(old_ctx, new_ctx)
+
+    return 0
+
+# Yield current task
+pub fn yield_task() -> i32
+    schedule()
+    return 0
+
+# ============================================================================
+# Idle Task
+# ============================================================================
+
+# Idle task function (one per CPU)
+fn idle_task_func() -> i32
+    while true
+        asm x86_64:
+            sti
+            hlt
+    return 0
+
+# Create idle task for a CPU
+fn create_idle_task(cpu_idx: i32) -> i32
+    sched_lock()
+
+    let task_idx: u32 = task_count
+    task_count = task_count + 1
+
+    let task: *Task = @tasks[task_idx as i32]
+
+    (*task).id = 0  # Idle tasks have ID 0
+    (*task).state = TASK_STATE_READY
+    (*task).cpu_id = cpu_idx as u8
+    (*task).priority = 0  # Lowest priority
+
+    # Name: "idle-N"
+    (*task).name[0] = 105  # 'i'
+    (*task).name[1] = 100  # 'd'
+    (*task).name[2] = 108  # 'l'
+    (*task).name[3] = 101  # 'e'
+    (*task).name[4] = 45   # '-'
+    (*task).name[5] = (48 + cpu_idx) as u8  # '0' + cpu_idx
+    (*task).name[6] = 0
+
+    # Allocate stack based on CPU
+    var stack_top: u64 = 0
+    if cpu_idx == 0
+        # Allocate a page for BSP idle task stack
+        let stack_phys: u64 = pmm_alloc_page()
+        (*task).stack_base = stack_phys
+        (*task).stack_size = PAGE_SIZE
+        stack_top = stack_phys + PAGE_SIZE
+    else
+        # For APs, use their bootstrap stacks (get via helper function)
+        stack_top = get_ap_stack_top(cpu_idx)
+        (*task).stack_base = stack_top - 4096
+        (*task).stack_size = 4096
+
+    task_init_context(task, idle_task_func as u64, stack_top)
+
+    cpu_sched[cpu_idx].idle_task = task_idx
+    cpu_sched[cpu_idx].cpu_id = cpu_idx as u8
+    cpu_sched[cpu_idx].current_task = 0xFFFFFFFF
+
+    sched_unlock()
+
+    return task_idx as i32
+
+# ============================================================================
+# Timer Interrupt Handler
+# ============================================================================
+
+# Timer interrupt handler (vector 32)
+pub fn timer_handler() -> i32
+    # Acknowledge interrupt
+    lapic_eoi()
+
+    # Trigger scheduler
+    schedule()
+
+    return 0
+
+# NOTE: apic_timer_init removed - preemptive scheduling is disabled
+# TODO: Re-implement when process/thread distinction is implemented
+
+# ============================================================================
+# Scheduler Initialization
+# ============================================================================
+
+# Initialize scheduler
+pub fn scheduler_init() -> i32
+    prints("  [..] Scheduler\n")
+
+    # Explicitly initialize scheduler_lock (BSS may not be zeroed correctly)
+    scheduler_lock = 0
+
+    # Initialize task array
+    var i: i32 = 0
+    while i < MAX_TASKS
+        tasks[i].id = 0
+        tasks[i].state = TASK_STATE_DEAD
+        i = i + 1
+
+    # Initialize CPU scheduler state
+    i = 0
+    while i < MAX_CPUS
+        cpu_sched[i].cpu_id = i as u8
+        cpu_sched[i].current_task = 0xFFFFFFFF
+        cpu_sched[i].idle_task = 0
+        i = i + 1
+
+    # Create idle task for BSP
+    create_idle_task(0)
+
+    # Create idle tasks for APs
+    i = 1
+    while i < num_cpus as i32
+        create_idle_task(i)
+        i = i + 1
+
+    prints("      Created ")
+    serial_print_dec(num_cpus as u64)
+    prints(" idle tasks\n")
+
+    # NOTE: APIC timer is disabled for now because it conflicts with userspace execution
+    # The scheduler is designed for kernel threads, not user processes
+    # TODO: Implement proper process/thread distinction before enabling preemptive scheduling
+    # apic_timer_init(0)
+
+    scheduler_initialized = 1
+    prints("\r  [OK] Scheduler\n")
+
+    return 0
