@@ -259,6 +259,11 @@ pub fn tls_server_config_load_ecdsa_p256_key(cfg: *TlsServerConfig, pem_data: *u
     mem_copy(@cfg.ecdsa_p256_private[0], @der_buf[pos], 32)
     cfg.key_type = TLS_KEY_TYPE_ECDSA_P256
 
+    # Debug: print first 4 bytes of private key (expect: 72 9b 41 70 = 0x729b4170)
+    prints("Loaded ECDSA P-256 private key, first bytes: 0x")
+    print_hex((cfg.ecdsa_p256_private[0] as i64) << 24 | (cfg.ecdsa_p256_private[1] as i64) << 16 | (cfg.ecdsa_p256_private[2] as i64) << 8 | (cfg.ecdsa_p256_private[3] as i64))
+    prints("\n")
+
     return 0
 
 # ============================================================================
@@ -737,12 +742,29 @@ pub fn serialize_certificate_verify(server: *TlsServer, out: *u8, cap: i64) -> i
     prints("[SER_CV] transcript_hash...\n")
     var th: [32]u8
     transcript_hash(@server.transcript, @th[0])
-    prints("[SER_CV] transcript_hash done\n")
+    prints("[SER_CV] transcript_hash done, first bytes: 0x")
+    print_hex((th[0] as i64) << 24 | (th[1] as i64) << 16 | (th[2] as i64) << 8 | (th[3] as i64))
+    prints("\n")
 
     # Build context for signing (64 spaces + context string + 0x00 + transcript hash)
     prints("[SER_CV] build_cv_context...\n")
     var cv_content: [130]u8  # 64 + 33 + 1 + 32 = 130
     build_cv_context(@th[0], @cv_content[0])
+    # Debug: verify cv_content structure
+    prints("[SER_CV] cv_content bytes 0-7: ")
+    var cv_i: i32 = 0
+    while cv_i < 8
+        print_hex(cv_content[cv_i] as i64)
+        prints(" ")
+        cv_i += 1
+    prints("\n")
+    prints("[SER_CV] cv_content bytes 64-71: ")
+    cv_i = 64
+    while cv_i < 72
+        print_hex(cv_content[cv_i] as i64)
+        prints(" ")
+        cv_i += 1
+    prints("\n")
     prints("[SER_CV] build_cv_context done\n")
 
     # Build CertificateVerify message
@@ -776,13 +798,19 @@ pub fn serialize_certificate_verify(server: *TlsServer, out: *u8, cap: i64) -> i
         sha256_init(@server.sha_ctx)
         sha256_update(@server.sha_ctx, @cv_content[0], 130)
         sha256_final(@server.sha_ctx, @hash[0])
-        prints("[SER_CV] sha256 done\n")
+        prints("[SER_CV] sha256 done, content_hash first bytes: 0x")
+        print_hex((hash[0] as i64) << 24 | (hash[1] as i64) << 16 | (hash[2] as i64) << 8 | (hash[3] as i64))
+        prints("\n")
 
         # Sign with ECDSA P-256
         prints("[SER_CV] preparing sig\n")
         var sig: EcdsaSignature
         var priv_scalar: Scalar256
         scalar256_from_bytes(@priv_scalar, @cfg.ecdsa_p256_private[0])
+        # Debug: print priv_scalar first limb
+        prints("[SER_CV] priv_scalar.limbs[3] (MSB): 0x")
+        print_hex64(priv_scalar.limbs[3])
+        prints("\n")
         prints("[SER_CV] calling ecdsa_p256_sign\n")
 
         if ecdsa_p256_sign(@sig, @hash[0], @priv_scalar) == 0
@@ -799,6 +827,13 @@ pub fn serialize_certificate_verify(server: *TlsServer, out: *u8, cap: i64) -> i
         # ECDSA signature is SEQUENCE { INTEGER r, INTEGER s }
         var der_sig: [72]u8
         let der_len: i64 = ecdsa_signature_to_der(@sig, @der_sig[0])
+        prints("[SER_CV] DER signature (hex): ")
+        var sig_i: i32 = 0
+        while sig_i < der_len as i32
+            print_hex(der_sig[sig_i] as i64)
+            prints(" ")
+            sig_i += 1
+        prints("\n")
 
         # Signature length (2 bytes)
         out[pos] = ((der_len >> 8) & 0xff) as u8
@@ -1137,21 +1172,17 @@ pub fn build_server_flight(server: *TlsServer, out: *u8, out_cap: i64, out_len: 
         return TLS_RESULT_ERROR
 
     let encrypted_len: i64 = encrypt_result as i64
-    prints("[BUILD_SF] wrapping\n")
+    prints("[BUILD_SF] copying encrypted record\n")
 
-    # Wrap in TLS record
-    if pos + 5 + encrypted_len > out_cap
+    # tls13_record_encrypt already returns a complete TLS record with header
+    # Just copy it directly - no need to wrap again!
+    if pos + encrypted_len > out_cap
         server.last_error = TLS_ERR_BUFFER_TOO_SMALL
         server.state = TLS_SERVER_STATE_ERROR
         return TLS_RESULT_ERROR
 
-    out[pos] = 23  # Application Data (encrypted)
-    out[pos + 1] = 0x03
-    out[pos + 2] = 0x03
-    out[pos + 3] = ((encrypted_len >> 8) & 0xff) as u8
-    out[pos + 4] = (encrypted_len & 0xff) as u8
-    mem_copy(out + pos + 5, @server.encrypted[0], encrypted_len )
-    pos = pos + 5 + encrypted_len
+    mem_copy(out + pos, @server.encrypted[0], encrypted_len)
+    pos = pos + encrypted_len
 
     # Update transcript with Finished
     transcript_update(@server.transcript, @fin_buf[0], fin_len)
@@ -1179,9 +1210,9 @@ pub fn process_client_finished(server: *TlsServer, out: *u8, out_cap: i64, out_l
         prints("[PROC_CF] need more input\n")
         return TLS_RESULT_NEED_INPUT
 
-    # Parse TLS record header
-    let content_type: u8 = server.recv_buf[0]
-    let record_len: i64 = ((server.recv_buf[3] as i64) << 8) | (server.recv_buf[4] as i64)
+    # Parse TLS record header (var for mutability - may update after skipping CCS)
+    var content_type: u8 = server.recv_buf[0]
+    var record_len: i64 = ((server.recv_buf[3] as i64) << 8) | (server.recv_buf[4] as i64)
 
     prints("[PROC_CF] content_type=")
     print_int(content_type as i64)
@@ -1194,11 +1225,26 @@ pub fn process_client_finished(server: *TlsServer, out: *u8, out_cap: i64, out_l
         return TLS_RESULT_NEED_INPUT
 
     # In TLS 1.3, the client may send a ChangeCipherSpec (content_type 20) for
-    # middlebox compatibility - just skip it
+    # middlebox compatibility - just skip it and continue processing if more data
     if content_type == 20
         prints("[PROC_CF] skipping ChangeCipherSpec\n")
         shift_recv_buf(server, 5 + record_len)
-        return TLS_RESULT_NEED_INPUT
+        # Continue processing if there's more data in buffer
+        if server.recv_len >= 5
+            prints("[PROC_CF] more data after CCS, continuing...\n")
+            # Re-read header for next record
+            content_type = server.recv_buf[0]
+            record_len = ((server.recv_buf[3] as i64) << 8) | (server.recv_buf[4] as i64)
+            prints("[PROC_CF] next content_type=")
+            print_int(content_type as i64)
+            prints(" record_len=")
+            print_int(record_len)
+            prints("\n")
+            if server.recv_len < 5 + record_len
+                prints("[PROC_CF] need more data for next record\n")
+                return TLS_RESULT_NEED_INPUT
+        else
+            return TLS_RESULT_NEED_INPUT
 
     # Expect Application Data (encrypted)
     if content_type != 23
@@ -1208,10 +1254,10 @@ pub fn process_client_finished(server: *TlsServer, out: *u8, out_cap: i64, out_l
         return TLS_RESULT_ERROR
 
     prints("[PROC_CF] decrypting...\n")
-    # Decrypt record
+    # Decrypt record - pass full record including header
     var plaintext: [256]u8
     var inner_type: u8 = 0
-    let decrypt_result: i32 = tls_record_state_client_decrypt(@server.read_state, @server.recv_buf[5], record_len as i32, @plaintext[0], 256, @inner_type)
+    let decrypt_result: i32 = tls_record_state_client_decrypt(@server.read_state, @server.recv_buf[0], (5 + record_len) as i32, @plaintext[0], 256, @inner_type)
 
     prints("[PROC_CF] decrypt_result=")
     print_int(decrypt_result as i64)
@@ -1268,17 +1314,19 @@ pub fn process_client_finished(server: *TlsServer, out: *u8, out_cap: i64, out_l
 
     prints("[PROC_CF] Finished verified OK\n")
 
-    # Update transcript with client Finished
-    transcript_update(@server.transcript, @plaintext[0], decrypt_result as i64)
-
-    # Derive application keys
-    prints("[PROC_CF] deriving application keys\n")
-    var final_transcript: [32]u8
-    transcript_hash(@server.transcript, @final_transcript[0])
-    tls13_key_schedule_derive_application(@server.key_schedule, @final_transcript[0])
+    # Derive application keys BEFORE updating transcript with client Finished
+    # RFC 8446 Section 7.1: application traffic secrets use transcript CH...SF (Server Finished)
+    # expected_transcript already contains hash of CH...SF (used to verify client Finished)
+    # Derive application keys BEFORE updating transcript with client Finished
+    # RFC 8446 Section 7.1: application traffic secrets use transcript CH...SF (Server Finished)
+    # expected_transcript already contains hash of CH...SF (used to verify client Finished)
+    tls13_key_schedule_derive_application(@server.key_schedule, @expected_transcript[0])
     tls13_key_schedule_derive_application_keys(@server.key_schedule, 16, 12)
 
-    # Reset record states for application data
+    # Update transcript with client Finished (after deriving app keys)
+    transcript_update(@server.transcript, @plaintext[0], decrypt_result as i64)
+
+    # Set up record states for application data
     tls_record_state_set_keys(@server.read_state, @server.key_schedule.client_write_key[0], @server.key_schedule.client_write_iv[0], @server.key_schedule.server_write_key[0], @server.key_schedule.server_write_iv[0], 16)
     server.read_state.client_seq = 0
     server.read_state.server_seq = 0
@@ -1292,7 +1340,6 @@ pub fn process_client_finished(server: *TlsServer, out: *u8, out_cap: i64, out_l
 
     server.handshake_complete = 1
     server.state = TLS_SERVER_STATE_CONNECTED
-    prints("[PROC_CF] handshake complete!\n")
 
     return TLS_RESULT_COMPLETE
 
@@ -1306,53 +1353,80 @@ pub fn tls_server_write(server: *TlsServer, data: *u8, data_len: i64, out: *u8, 
     if server.state != TLS_SERVER_STATE_CONNECTED
         return -1
 
-    var encrypted: [16500]u8
-    let result: i32 = tls_record_state_server_encrypt(@server.write_state, data, data_len as i32, 23, @encrypted[0], 16500)
+    # tls_record_state_server_encrypt returns the complete TLS record (header + ciphertext + tag)
+    let result: i32 = tls_record_state_server_encrypt(@server.write_state, data, data_len as i32, 23, out, out_cap as i32)
 
     if result < 0
         return -1
 
-    let encrypted_len: i64 = result as i64
-
-    if out_cap < 5 + encrypted_len
-        return -1
-
-    out[0] = 23  # Application Data
-    out[1] = 0x03
-    out[2] = 0x03
-    out[3] = ((encrypted_len >> 8) & 0xff) as u8
-    out[4] = (encrypted_len & 0xff) as u8
-    mem_copy(out + 5, @encrypted[0], encrypted_len )
-
-    return 5 + encrypted_len
+    return result as i64
 
 # Decrypt received application data
 # Returns bytes written to out, or negative on error
 pub fn tls_server_read(server: *TlsServer, data: *u8, data_len: i64, out: *u8, out_cap: i64) -> i64
+    prints("[TLS_READ] enter data_len=")
+    print_int(data_len)
+    prints(" state=")
+    print_int(server.state as i64)
+    prints(" client_seq=")
+    print_int(server.read_state.client_seq as i64)
+    prints("\n")
+
     if server.state != TLS_SERVER_STATE_CONNECTED
+        prints("[TLS_READ] NOT connected, failing\n")
         return -1
 
     if data_len < 5
+        prints("[TLS_READ] data_len < 5, need more\n")
         return 0
 
     let content_type: u8 = data[0]
     let record_len: i64 = ((data[3] as i64) << 8) | (data[4] as i64)
 
+    prints("[TLS_READ] content_type=")
+    print_int(content_type as i64)
+    prints(" record_len=")
+    print_int(record_len)
+    prints("\n")
+
     if data_len < 5 + record_len
+        prints("[TLS_READ] incomplete record, need more\n")
         return 0
 
     if content_type != 23
+        prints("[TLS_READ] not app_data, failing\n")
         return -1
 
     var plaintext: [16500]u8
     var inner_type: u8 = 0
 
-    let result: i32 = tls_record_state_client_decrypt(@server.read_state, data + 5, record_len as i32, @plaintext[0], 16500, @inner_type)
+    # Pass full record including header (tls13_record_decrypt expects it)
+    prints("[TLS_READ] read_state.client_key first 4: 0x")
+    print_hex(server.read_state.client_key[0] as i64)
+    prints(" 0x")
+    print_hex(server.read_state.client_key[1] as i64)
+    prints(" 0x")
+    print_hex(server.read_state.client_key[2] as i64)
+    prints(" 0x")
+    print_hex(server.read_state.client_key[3] as i64)
+    prints(" key_len=")
+    print_int(server.read_state.key_len as i64)
+    prints("\n")
+
+    let result: i32 = tls_record_state_client_decrypt(@server.read_state, data, (5 + record_len) as i32, @plaintext[0], 16500, @inner_type)
+
+    prints("[TLS_READ] decrypt result=")
+    print_int(result as i64)
+    prints(" inner_type=")
+    print_int(inner_type as i64)
+    prints("\n")
 
     if result < 0
+        prints("[TLS_READ] decrypt failed\n")
         return -1
 
     if inner_type != 23
+        prints("[TLS_READ] inner_type not app_data\n")
         return -1
 
     let plaintext_len: i64 = result as i64
@@ -1423,3 +1497,94 @@ pub fn tls_server_error(server: *TlsServer) -> i32
 # Check if handshake is complete
 pub fn tls_server_is_connected(server: *TlsServer) -> i32
     return server.handshake_complete
+
+# Check if there's buffered data from handshake that needs processing
+pub fn tls_server_buffered_len(server: *TlsServer) -> i64
+    return server.recv_len
+
+# Read application data from internal buffer
+# Returns bytes written to out, 0 if need more data, or negative on error
+pub fn tls_server_read_buffered(server: *TlsServer, out: *u8, out_cap: i64) -> i64
+    prints("[TLS_READ_BUF] enter recv_len=")
+    print_int(server.recv_len)
+    prints(" state=")
+    print_int(server.state as i64)
+    prints(" client_seq=")
+    print_int(server.read_state.client_seq as i64)
+    prints(" key_len=")
+    print_int(server.read_state.key_len as i64)
+    prints("\n")
+
+    # Print first 5 bytes of recv_buf (record header)
+    prints("[TLS_READ_BUF] recv_buf[0:5]: 0x")
+    print_hex(server.recv_buf[0] as i64)
+    prints(" 0x")
+    print_hex(server.recv_buf[1] as i64)
+    prints(" 0x")
+    print_hex(server.recv_buf[2] as i64)
+    prints(" 0x")
+    print_hex(server.recv_buf[3] as i64)
+    prints(" 0x")
+    print_hex(server.recv_buf[4] as i64)
+    prints("\n")
+
+    if server.state != TLS_SERVER_STATE_CONNECTED
+        prints("[TLS_READ_BUF] NOT connected, failing\n")
+        return -1
+
+    if server.recv_len < 5
+        prints("[TLS_READ_BUF] recv_len < 5, need more\n")
+        return 0
+
+    let content_type: u8 = server.recv_buf[0]
+    let record_len: i64 = ((server.recv_buf[3] as i64) << 8) | (server.recv_buf[4] as i64)
+
+    prints("[TLS_READ_BUF] content_type=")
+    print_int(content_type as i64)
+    prints(" record_len=")
+    print_int(record_len)
+    prints("\n")
+
+    if server.recv_len < 5 + record_len
+        prints("[TLS_READ_BUF] incomplete record, need more\n")
+        return 0
+
+    if content_type != 23
+        prints("[TLS_READ_BUF] not app_data, failing\n")
+        return -1
+
+    var plaintext: [16500]u8
+    var inner_type: u8 = 0
+
+    let result: i32 = tls_record_state_client_decrypt(@server.read_state, @server.recv_buf[0], (5 + record_len) as i32, @plaintext[0], 16500, @inner_type)
+
+    prints("[TLS_READ_BUF] decrypt result=")
+    print_int(result as i64)
+    prints(" inner_type=")
+    print_int(inner_type as i64)
+    prints("\n")
+
+    if result < 0
+        prints("[TLS_READ_BUF] decrypt failed\n")
+        return -1
+
+    if inner_type != 23
+        prints("[TLS_READ_BUF] inner_type not app_data\n")
+        return -1
+
+    let plaintext_len: i64 = result as i64
+
+    if plaintext_len > out_cap
+        prints("[TLS_READ_BUF] output too large for buffer\n")
+        return -1
+
+    mem_copy(out, @plaintext[0], plaintext_len)
+
+    # Consume the record from internal buffer
+    shift_recv_buf(server, 5 + record_len)
+
+    prints("[TLS_READ_BUF] success, plaintext_len=")
+    print_int(plaintext_len)
+    prints("\n")
+
+    return plaintext_len
