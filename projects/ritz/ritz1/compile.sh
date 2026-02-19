@@ -41,11 +41,12 @@ echo "  ✅ Generated $(echo $LL_FILES | wc -w) .ll files"
 
 # Link all .ll files with clang
 echo "  🔗 Linking..."
-RUNTIME=runtime/ritz_start.x86_64.o
+# Use envp variant since main() uses 3 arguments (argc, argv, envp)
+RUNTIME=runtime/ritz_start_envp.x86_64.o
 # Build runtime if needed
 if [ ! -f "$RUNTIME" ]; then
     echo "  📦 Building runtime..."
-    clang -c -o runtime/ritz_start.x86_64.o runtime/ritz_start.x86_64.ll
+    clang -c -o runtime/ritz_start_envp.x86_64.o runtime/ritz_start_envp.x86_64.ll
 fi
 clang $LL_FILES $RUNTIME -o $OUT -nostdlib -g
 

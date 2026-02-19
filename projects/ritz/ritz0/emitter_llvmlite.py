@@ -1353,19 +1353,51 @@ class LLVMEmitter:
         # Generate IR string
         ir_str = str(self.module)
 
-        # Post-process IR to add alignstack(16) attribute to SIMD functions
-        # This ensures proper 16-byte stack alignment for SIMD operations
-        # (e.g., movaps instruction requires 16-byte aligned memory addresses)
-        if self.simd_functions:
-            ir_str = self._add_simd_alignstack(ir_str)
+        # Post-process IR to add alignstack(16) to ALL functions.
+        # This ensures proper 16-byte stack alignment even when clang's -O2
+        # introduces SIMD instructions (movaps requires 16-byte aligned memory).
+        # The x86-64 ABI requires 16-byte stack alignment at function entry,
+        # and alignstack(16) forces LLVM to maintain this guarantee.
+        ir_str = self._add_alignstack_to_all_functions(ir_str)
 
         # Add header comment
         lines = ir_str.split('\n')
         lines.insert(0, '; Ritz compiled module')
         return '\n'.join(lines)
 
+    def _add_alignstack_to_all_functions(self, ir_str: str) -> str:
+        """Add alignstack(16) attribute to ALL function definitions.
+
+        Clang's -O2 optimizer can introduce SIMD instructions (movaps, etc.)
+        in ANY function, not just those that explicitly use SIMD types.
+        These SIMD instructions require 16-byte aligned stack addresses.
+
+        The x86-64 ABI guarantees 16-byte stack alignment at function entry.
+        Adding alignstack(16) ensures LLVM maintains this alignment when
+        it generates prologue/epilogue code.
+
+        This fixes SIGSEGV crashes when SIMD instructions access misaligned stack.
+        """
+        import re
+
+        # Match function definitions at start of line: define ... @"name"(...) !dbg
+        # The pattern must:
+        # 1. Start at line beginning with 'define'
+        # 2. Have @"funcname"(...) format
+        # 3. Not already have alignstack
+        # We use negative lookbehind to skip if alignstack already present
+        # Pattern: start of line, define, type, @"name"(...), optional space, !dbg or {
+        pattern = r'^(define [^\n]+@"[^"]+"\([^)]*\))(?! alignstack)(\s*)(!dbg|\{)'
+        replacement = r'\1 alignstack(16)\2\3'
+        ir_str = re.sub(pattern, replacement, ir_str, flags=re.MULTILINE)
+
+        return ir_str
+
     def _add_simd_alignstack(self, ir_str: str) -> str:
         """Add alignstack(16) attribute to functions that use SIMD.
+
+        NOTE: This is now superseded by _add_alignstack_to_all_functions,
+        but kept for reference and potential future selective use.
 
         SIMD operations (SSE2/AVX) often require 16-byte aligned memory.
         When LLVM's register allocator spills SIMD registers to the stack,
@@ -3518,19 +3550,11 @@ class LLVMEmitter:
                 constraints.append("r")
 
         # Replace {name} with $N in template
-        # In Ritz inline asm, $$ means "literal $" (AT&T immediate syntax)
-        # In LLVM IR inline asm, $$ also means "literal $"
-        # So we preserve $$ pairs and escape lone $ to $$
-        # This way: Ritz "$$42" -> LLVM IR "$$42" -> assembly "$42" (immediate 42)
-        #           Ritz "$0" -> LLVM IR "$$0" -> different from operand reference
-        import re as re_module
-        # First, temporarily replace $$ pairs with a marker to protect them
-        marker = '\x01DOUBLE_DOLLAR\x01'
-        template_escaped = template.replace('$$', marker)
-        # Escape remaining single $ to $$
-        template_escaped = template_escaped.replace('$', '$$')
-        # Restore $$ pairs
-        template_escaped = template_escaped.replace(marker, '$$')
+        # First, escape literal $ for LLVM inline asm ($ -> $$)
+        # BUT: preserve existing $$ (which means literal $ in AT&T syntax)
+        # Use regex to escape only single $ (not part of $$)
+        import re
+        template_escaped = re.sub(r'(?<!\$)\$(?!\$)', '$$', template)
 
         # Now replace {name} with temporary markers
         operand_markers = {}
@@ -8082,6 +8106,15 @@ class LLVMEmitter:
             return self._emit_cast_from_union(val, src_union_name, expr.target)
 
         target_type = self._ritz_type_to_llvm(expr.target)
+
+        # Handle StrView -> *u8 cast (common RERITZ pattern: "str" as *u8)
+        # StrView is {ptr, len}, we extract the ptr field
+        src_ritz_type = self._infer_ritz_type(expr.expr)
+        if (src_ritz_type and isinstance(src_ritz_type, rast.NamedType)
+            and src_ritz_type.name == 'StrView'
+            and isinstance(target_type, ir.PointerType)
+            and target_type.pointee == self.i8):
+            return self.builder.extract_value(val, 0, name='strview.ptr')
 
         # Check if source OR target is unsigned for proper extension
         # When casting to unsigned (e.g., i32 as u64), use zext to avoid sign pollution
