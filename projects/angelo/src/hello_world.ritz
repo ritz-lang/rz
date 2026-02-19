@@ -1,0 +1,193 @@
+# Angelo - Hello World Test
+#
+# Simple test that renders text to a raw bitmap file.
+# Output is in PGM format which can be viewed with:
+#   convert output.pgm output.png && display output.png
+# Or:
+#   feh output.pgm
+
+import ritzlib.sys { sys_open, sys_write, sys_close, O_WRONLY, O_CREAT, O_TRUNC }
+import ritzlib.strview { strview_as_ptr }
+import ritzlib.gvec { vec_as_ptr }
+import font { Font, load_font }
+import types { RasterizedGlyph, GlyphOutline }
+import raster.render { rasterize_outline }
+
+# Write bytes to file
+fn write_file(path: StrView, data: @Vec<u8>) -> Result<i32, StrView>
+    # O_WRONLY | O_CREAT | O_TRUNC with mode 0644
+    let flags = O_WRONLY | O_CREAT | O_TRUNC
+    let mode: i32 = 420  # 0644 octal
+
+    let cstr = strview_as_ptr(@path)
+    let fd = sys_open(cstr, flags)
+    if fd < 0
+        return Err("failed to open file for writing")
+
+    let written = sys_write(fd, vec_as_ptr(data), data.len() as i64)
+    sys_close(fd)
+
+    if written < 0
+        return Err("failed to write to file")
+
+    Ok(written as i32)
+
+# Write a PGM (grayscale) image file
+# Format: "P5\nWIDTH HEIGHT\n255\n<raw bytes>"
+fn write_pgm(path: StrView, width: u32, height: u32, data: @Vec<u8>) -> Result<i32, StrView>
+    var output = vec_new<u8>()
+
+    # Header: "P5\n"
+    output.push(80 as u8)   # 'P'
+    output.push(53 as u8)   # '5'
+    output.push(10 as u8)   # '\n'
+
+    # Width
+    write_number_to_vec(@&output, width)
+    output.push(32 as u8)   # ' '
+
+    # Height
+    write_number_to_vec(@&output, height)
+    output.push(10 as u8)   # '\n'
+
+    # Max value: "255\n"
+    output.push(50 as u8)   # '2'
+    output.push(53 as u8)   # '5'
+    output.push(53 as u8)   # '5'
+    output.push(10 as u8)   # '\n'
+
+    # Raw pixel data
+    for i in 0..data.len()
+        output.push(data[i])
+
+    write_file(path, @output)
+
+# Write a number as ASCII digits to a vector
+fn write_number_to_vec(out:& Vec<u8>, n: u32)
+    if n == 0
+        out.push(48 as u8)  # '0'
+        return
+
+    # Build digits in reverse
+    var digits = vec_new<u8>()
+    var val = n
+    while val > 0
+        let digit = (val % 10) as u8
+        digits.push(48 as u8 + digit)  # '0' + digit
+        val = val / 10
+
+    # Output in correct order (reverse)
+    var i = digits.len()
+    while i > 0
+        i = i - 1
+        out.push(digits[i])
+
+# Render a single glyph to a bitmap
+fn render_glyph_to_bitmap(font:& Font, codepoint: u32, size_px: u32) -> Option<RasterizedGlyph>
+    # Look up glyph ID
+    let glyph_id_opt = font.glyph_id(codepoint)
+    let glyph_id = match glyph_id_opt
+        Some(id) => id
+        None => return None
+
+    # Get outline
+    let outline_opt = font.glyph_outline(glyph_id)
+    let outline = match outline_opt
+        Some(o) => o
+        None => return None
+
+    # Get metrics for units_per_em
+    let metrics = font.metrics()
+
+    # Rasterize
+    let glyph = rasterize_outline(outline, metrics.units_per_em, size_px, true)
+
+    Some(glyph)
+
+# Create a canvas (bitmap buffer)
+struct Canvas
+    data: Vec<u8>
+    width: u32
+    height: u32
+
+impl Canvas
+    fn new(width: u32, height: u32) -> Canvas
+        var data = vec_with_cap<u8>((width * height) as usize)
+        for i in 0..(width * height)
+            data.push(0 as u8)  # Black background
+        Canvas { data: data, width: width, height: height }
+
+    fn set_pixel(self:& Canvas, x: u32, y: u32, value: u8)
+        if x < self.width and y < self.height
+            let idx = (y * self.width + x) as usize
+            self.data[idx] = value
+
+    # Blit a glyph at position (x, y) - y is baseline
+    fn blit_glyph(self:& Canvas, glyph: @RasterizedGlyph, x: i32, y: i32)
+        # Calculate top-left corner in canvas coordinates
+        let glyph_x = x + glyph.bearing_x
+        let glyph_y = y - glyph.bearing_y
+
+        for gy in 0..glyph.height
+            for gx in 0..glyph.width
+                let canvas_x = glyph_x + gx as i32
+                let canvas_y = glyph_y + gy as i32
+
+                if canvas_x >= 0 and canvas_x < self.width as i32 and canvas_y >= 0 and canvas_y < self.height as i32
+                    let alpha = glyph.get_pixel_alpha(gx, gy)
+                    if alpha > 0
+                        self.set_pixel(canvas_x as u32, canvas_y as u32, alpha)
+
+# Main entry point
+pub fn main() -> i32
+    # Load font
+    let font_result = load_font("aadhunik.ttf")
+    var font = match font_result
+        Ok(f) => f
+        Err(msg) =>
+            # Try with projects path
+            let font_result2 = load_font("projects/angelo/aadhunik.ttf")
+            match font_result2
+                Ok(f2) => f2
+                Err(_) =>
+                    print("Failed to load font\n")
+                    return 1
+
+    print("Font loaded successfully!\n")
+
+    # Create canvas
+    let canvas_width: u32 = 200
+    let canvas_height: u32 = 80
+    var canvas = Canvas.new(canvas_width, canvas_height)
+
+    # Render "Hello" at 32px
+    let size_px: u32 = 32
+    let baseline: i32 = 60  # Y position of baseline
+    var cursor_x: i32 = 10  # X position
+
+    # Characters to render: H e l l o
+    let chars: [5]u32 = [72, 101, 108, 108, 111]  # 'H', 'e', 'l', 'l', 'o'
+
+    for i in 0..5
+        let codepoint = chars[i]
+        let glyph_opt = render_glyph_to_bitmap(@&font, codepoint, size_px)
+
+        match glyph_opt
+            Some(glyph) =>
+                canvas.blit_glyph(@glyph, cursor_x, baseline)
+                cursor_x = cursor_x + glyph.advance as i32
+            None =>
+                print("Failed to render glyph\n")
+
+    # Write output
+    let result = write_pgm("hello.pgm", canvas_width, canvas_height, @canvas.data)
+    match result
+        Ok(_) =>
+            print("Wrote hello.pgm\n")
+            print("View with: convert hello.pgm hello.png && display hello.png\n")
+            0
+        Err(msg) =>
+            print("Failed to write output: ")
+            print(msg)
+            print("\n")
+            1
