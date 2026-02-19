@@ -49,6 +49,22 @@ var serial_input_tail: i32 = 0   # Read position
 var serial_input_count: i32 = 0  # Bytes in buffer
 
 # ============================================================================
+# Serial Output Buffer
+# ============================================================================
+#
+# Circular buffer for outgoing serial data.
+# Enables interrupt-driven TX without blocking the CPU.
+# When userspace calls sys_write, data goes into this buffer.
+# COM1 THRE interrupt drains the buffer to hardware.
+
+const SERIAL_OUT_BUF_SIZE: i32 = 4096
+
+var serial_output_buf: [4096]u8
+var serial_output_head: i32 = 0   # Write position (producer)
+var serial_output_tail: i32 = 0   # Read position (consumer/IRQ)
+var serial_output_count: i32 = 0  # Bytes in buffer
+
+# ============================================================================
 # StrView - Zero-copy string view
 # ============================================================================
 #
@@ -270,4 +286,128 @@ pub fn serial_enable_rx_interrupt() -> i32
 # Disable receive interrupts on COM1
 pub fn serial_disable_rx_interrupt() -> i32
     outb(COM1_IER, 0x00)
+    return 0
+
+# ============================================================================
+# Serial Output Buffer Functions (Interrupt-driven TX)
+# ============================================================================
+
+# Current IER state (tracks which interrupts are enabled)
+var serial_ier_state: u8 = 0
+
+# Update IER register with current state
+fn serial_update_ier() -> i32
+    outb(COM1_IER, serial_ier_state)
+    return 0
+
+# Enable TX interrupt (THRE - Transmitter Holding Register Empty)
+pub fn serial_enable_tx_interrupt() -> i32
+    serial_ier_state = serial_ier_state | IER_THRE
+    serial_update_ier()
+    return 0
+
+# Disable TX interrupt
+pub fn serial_disable_tx_interrupt() -> i32
+    serial_ier_state = serial_ier_state & (0xFF ^ IER_THRE)
+    serial_update_ier()
+    return 0
+
+# Enable RX interrupt (wrapper that updates state tracking)
+pub fn serial_enable_rx() -> i32
+    serial_ier_state = serial_ier_state | IER_RDA
+    serial_update_ier()
+    return 0
+
+# Check if output buffer has space
+pub fn serial_output_space() -> i32
+    return SERIAL_OUT_BUF_SIZE - serial_output_count
+
+# Check if output buffer has data
+pub fn serial_output_pending() -> i32
+    return serial_output_count
+
+# Write bytes to the output buffer (non-blocking)
+# Returns number of bytes actually written (may be less than len if buffer full)
+pub fn serial_buffer_write(buf: *u8, len: i64) -> i64
+    var bytes_written: i64 = 0
+
+    while bytes_written < len
+        # Check if buffer is full
+        if serial_output_count >= SERIAL_OUT_BUF_SIZE
+            # Buffer full - enable TX interrupt and return what we wrote
+            if serial_output_count > 0
+                serial_enable_tx_interrupt()
+            return bytes_written
+
+        # Add byte to buffer
+        serial_output_buf[serial_output_head] = *(buf + bytes_written)
+        serial_output_head = (serial_output_head + 1) % SERIAL_OUT_BUF_SIZE
+        serial_output_count = serial_output_count + 1
+        bytes_written = bytes_written + 1
+
+    # Enable TX interrupt to start draining
+    if serial_output_count > 0
+        serial_enable_tx_interrupt()
+
+    return bytes_written
+
+# Write a single byte to output buffer
+pub fn serial_buffer_write_byte(c: u8) -> i32
+    if serial_output_count >= SERIAL_OUT_BUF_SIZE
+        # Buffer full
+        return 0
+
+    serial_output_buf[serial_output_head] = c
+    serial_output_head = (serial_output_head + 1) % SERIAL_OUT_BUF_SIZE
+    serial_output_count = serial_output_count + 1
+
+    # Enable TX interrupt
+    serial_enable_tx_interrupt()
+    return 1
+
+# Drain output buffer to hardware (called from IRQ handler)
+# Sends bytes while hardware is ready (THRE set)
+# Returns number of bytes sent
+pub fn serial_drain_output() -> i32
+    var bytes_sent: i32 = 0
+
+    # While buffer has data and hardware is ready
+    while serial_output_count > 0 and (inb(COM1_LSR) & LSR_THRE) != 0
+        # Get byte from buffer
+        let c: u8 = serial_output_buf[serial_output_tail]
+        serial_output_tail = (serial_output_tail + 1) % SERIAL_OUT_BUF_SIZE
+        serial_output_count = serial_output_count - 1
+
+        # Send to hardware
+        outb(COM1_DATA, c)
+        bytes_sent = bytes_sent + 1
+
+    # If buffer is empty, disable TX interrupt
+    if serial_output_count == 0
+        serial_disable_tx_interrupt()
+
+    return bytes_sent
+
+# Blocking write - waits until all bytes are written
+# Used for kernel logging where we need to ensure output
+pub fn serial_write_blocking(buf: *u8, len: i64) -> i64
+    var total_written: i64 = 0
+
+    while total_written < len
+        let written: i64 = serial_buffer_write(buf + total_written, len - total_written)
+        total_written = total_written + written
+
+        if total_written < len
+            # Buffer was full, drain some to hardware directly
+            serial_drain_output()
+
+    return total_written
+
+# Flush output buffer - blocks until all pending data is sent
+pub fn serial_flush() -> i32
+    while serial_output_count > 0
+        serial_drain_output()
+        # Small pause to let hardware catch up
+        asm x86_64:
+            pause
     return 0
