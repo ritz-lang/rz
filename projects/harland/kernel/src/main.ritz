@@ -242,28 +242,6 @@ var harland_boot_info: *HarlandBootInfo = 0 as *HarlandBootInfo
 # Exception handlers are in arch/x86_64/exceptions.ritz
 # Imported above: InterruptFrame, exception_handler, irq_handler, exception_name, print_stack_trace
 
-# Test crash functions - for debugging exception handler
-# Uncomment the call in kernel_main to test
-fn test_crash_page_fault() -> i32
-    prints("\n[TEST] Triggering page fault via null pointer dereference...\n")
-    crash_helper_1()
-    return 0
-
-fn crash_helper_1() -> i32
-    crash_helper_2()
-    return 0
-
-fn crash_helper_2() -> i32
-    crash_helper_3()
-    return 0
-
-fn crash_helper_3() -> i32
-    # Dereference unmapped address (guaranteed page fault)
-    # Using 0xDEAD0000 which should be unmapped in kernel address space
-    let ptr: *u64 = 0xDEAD0000 as *u64
-    let value: u64 = *ptr  # This will fault
-    return value as i32
-
 # ============================================================================
 # PIC (Programmable Interrupt Controller) - Remap to vectors 32-47
 # ============================================================================
@@ -766,9 +744,6 @@ extern fn syscall_entry()
 extern fn jump_to_userspace(entry: u64, stack: u64)
 extern fn jump_to_userspace_with_retval(entry: u64, stack: u64, retval: i64)
 extern fn jump_to_userspace_with_args(entry: u64, stack: u64, argc: i64, argv: u64)
-extern fn user_program_start()
-extern fn user_program_end()
-extern fn user_program_minimal()
 
 # Note: Embedded ELF binaries removed. User binaries are now loaded
 # from the TAR initramfs disk by initramfs_load_from_disk().
@@ -2132,299 +2107,6 @@ fn run_init() -> i32
     prints("[init] Init returned unexpectedly\n")
     return 0
 
-# Test userspace execution with raw assembly (minimal test)
-fn test_userspace() -> i32
-    # Use the minimal user program for initial test (just calls exit)
-    let user_start: u64 = user_program_minimal as u64
-    let user_size: u64 = 16  # Just a few instructions
-
-    # Allocate 64KB user stack (16 pages)
-    let user_stack_top: u64 = alloc_user_stack()
-    if user_stack_top == 0
-        prints("  Failed to allocate user stack!\n")
-        return -1
-
-    # Allocate and copy user code to a new page
-    let user_code_page: u64 = pmm_alloc_page()
-    if user_code_page == 0
-        prints("  Failed to allocate user code page!\n")
-        free_user_stack()
-        return -1
-
-    # Copy user program to new page
-    var src: *u8 = user_start as *u8
-    var dst: *u8 = user_code_page as *u8
-    var i: i64 = 0
-    while i < user_size as i64
-        *(dst + i) = *(src + i)
-        i = i + 1
-
-    # Map code at user-accessible address (beyond identity region)
-    let user_code_vaddr: u64 = 0x100000000  # 4GB
-    let code_map_result: i32 = vmm_map_page(user_code_vaddr, user_code_page, PTE_USER)
-    if code_map_result != 0
-        prints("  Failed to map user code!\n")
-        free_user_stack()
-        pmm_free_page(user_code_page)
-        return -1
-
-    let user_entry: u64 = user_code_vaddr
-
-    # Flush TLB for new mappings
-    vmm_flush_tlb_all()
-
-    prints("  Jumping to userspace (Ring 3)...\n")
-
-    # This will transition to Ring 3 and execute the user program
-    # When the user program calls exit(0), syscall_handler will halt
-    jump_to_userspace(user_entry, user_stack_top)
-
-    # We should NOT reach here - exit() halts the system
-    prints("  Returned from userspace unexpectedly!\n")
-
-    # Cleanup (shouldn't happen)
-    vmm_unmap_page(user_code_vaddr)
-    free_user_stack()
-    pmm_free_page(user_code_page)
-
-    return 0
-
-# ============================================================================
-# Capability System Test
-# ============================================================================
-#
-# Tests the capability table operations.
-
-fn test_capability_system() -> i32
-    # Allocate a capability table for PID 1 (kernel)
-    let table: *CapTable = cap_table_alloc(1)
-    if table == 0 as *CapTable
-        prints("  FAILED: Could not allocate capability table\n")
-        return -1
-
-    prints("  [1] Allocated capability table for PID 1\n")
-
-    # Insert a memory capability
-    let mem_handle: CapHandle = cap_table_insert(table, CAP_TYPE_MEMORY, CAP_RIGHT_READ | CAP_RIGHT_WRITE | CAP_RIGHT_GRANT, 0x100000)
-    let mem_idx: u32 = mem_handle.index
-    let mem_gen: u32 = mem_handle.generation
-
-    if mem_idx == 0xFFFFFFFF
-        prints("  FAILED: Could not insert memory capability\n")
-        return -1
-
-    prints("  [2] Inserted memory capability: handle=")
-    serial_print_dec(mem_idx as u64)
-    prints(", gen=")
-    serial_print_dec(mem_gen as u64)
-    prints("\n")
-
-    # Insert a channel capability
-    let chan_handle: CapHandle = cap_table_insert(table, CAP_TYPE_CHANNEL, CAP_RIGHT_SEND | CAP_RIGHT_RECV | CAP_RIGHT_DERIVE, 1)
-    let chan_idx: u32 = chan_handle.index
-    let chan_gen: u32 = chan_handle.generation
-
-    if chan_idx == 0xFFFFFFFF
-        prints("  FAILED: Could not insert channel capability\n")
-        return -1
-
-    prints("  [3] Inserted channel capability: handle=")
-    serial_print_dec(chan_idx as u64)
-    prints(", gen=")
-    serial_print_dec(chan_gen as u64)
-    prints("\n")
-
-    # Look up the memory capability
-    var lookup_handle: CapHandle
-    lookup_handle.index = mem_idx
-    lookup_handle.generation = mem_gen
-
-    let entry: *CapEntry = cap_table_lookup(table, lookup_handle)
-    if entry == 0 as *CapEntry
-        prints("  FAILED: Could not look up memory capability\n")
-        return -1
-
-    prints("  [4] Looked up memory cap: type=")
-    serial_print_dec((*entry).cap_type as u64)
-    prints(", rights=")
-    serial_print_hex((*entry).rights as u64)
-    prints(", object_id=")
-    serial_print_hex((*entry).object_id)
-    prints("\n")
-
-    # Check rights
-    var check_handle: CapHandle
-    check_handle.index = mem_idx
-    check_handle.generation = mem_gen
-
-    let has_rw: bool = cap_has_rights(table, check_handle, CAP_RIGHT_READ | CAP_RIGHT_WRITE)
-
-    var check_handle2: CapHandle
-    check_handle2.index = mem_idx
-    check_handle2.generation = mem_gen
-
-    let has_exec: bool = cap_has_rights(table, check_handle2, CAP_RIGHT_EXECUTE)
-
-    prints("  [5] Rights check: has READ|WRITE=")
-    if has_rw
-        prints("yes")
-    else
-        prints("no")
-    prints(", has EXECUTE=")
-    if has_exec
-        prints("yes")
-    else
-        prints("no")
-    prints("\n")
-
-    if not has_rw or has_exec
-        prints("  FAILED: Rights check incorrect\n")
-        return -1
-
-    # Derive a read-only capability from the memory cap
-    var derive_handle: CapHandle
-    derive_handle.index = mem_idx
-    derive_handle.generation = mem_gen
-
-    # Need to add DERIVE right first - the mem_handle has GRANT but not DERIVE
-    # So let's test with a capability that has DERIVE right
-    let derive_cap: CapHandle = cap_table_insert(table, CAP_TYPE_MEMORY, CAP_RIGHT_READ | CAP_RIGHT_WRITE | CAP_RIGHT_DERIVE, 0x200000)
-    let derive_cap_idx: u32 = derive_cap.index
-    let derive_cap_gen: u32 = derive_cap.generation
-
-    var derive_src: CapHandle
-    derive_src.index = derive_cap_idx
-    derive_src.generation = derive_cap_gen
-
-    let derived: CapHandle = cap_table_derive(table, derive_src, CAP_RIGHT_READ)
-    let derived_idx: u32 = derived.index
-    let derived_gen: u32 = derived.generation
-
-    if derived_idx == 0xFFFFFFFF
-        prints("  [6] Derive test skipped (DERIVE right required)\n")
-    else
-        prints("  [6] Derived read-only capability: handle=")
-        serial_print_dec(derived_idx as u64)
-        prints(", gen=")
-        serial_print_dec(derived_gen as u64)
-        prints("\n")
-
-        # Verify derived cap has only READ
-        var derived_lookup: CapHandle
-        derived_lookup.index = derived_idx
-        derived_lookup.generation = derived_gen
-
-        let derived_entry: *CapEntry = cap_table_lookup(table, derived_lookup)
-        if derived_entry != 0 as *CapEntry
-            prints("  [7] Derived cap rights=")
-            serial_print_hex((*derived_entry).rights as u64)
-            prints(" (should be 0x1 = READ only)\n")
-
-    # Remove a capability
-    var remove_handle: CapHandle
-    remove_handle.index = chan_idx
-    remove_handle.generation = chan_gen
-
-    let remove_result: i32 = cap_table_remove(table, remove_handle)
-    if remove_result != 0
-        prints("  FAILED: Could not remove capability\n")
-        return -1
-
-    prints("  [8] Removed channel capability\n")
-
-    # Verify it's gone
-    var stale_handle: CapHandle
-    stale_handle.index = chan_idx
-    stale_handle.generation = chan_gen
-
-    let stale_entry: *CapEntry = cap_table_lookup(table, stale_handle)
-    if stale_entry != 0 as *CapEntry
-        prints("  FAILED: Removed capability still exists\n")
-        return -1
-
-    prints("  [9] Verified capability was removed\n")
-
-    # Free the table
-    cap_table_free(table)
-    prints("  [10] Freed capability table\n")
-
-    cap_system_debug_print()
-
-    prints("  Capability test PASSED!\n")
-    return 0
-
-# ============================================================================
-# Filesystem Quick Test
-# ============================================================================
-
-fn fs_quick_test() -> i32
-    prints("\n  Testing filesystem...\n")
-
-    let ns: *fs.knamespace.KNamespace = knamespace_get()
-    if ns == 0 as *fs.knamespace.KNamespace
-        prints("    FAIL: No namespace\n")
-        return -1
-
-    # Test 1: Create a directory
-    let mkdir_path: StrView = "/test" as StrView
-    let mkdir_result: i32 = knamespace_mkdir(ns, @mkdir_path)
-    if mkdir_result == KNS_OK
-        prints("    [OK] mkdir /test\n")
-    else
-        prints("    [!!] mkdir /test failed\n")
-
-    # Test 2: Create a file
-    var test_data: [12]u8
-    test_data[0] = 72   # H
-    test_data[1] = 101  # e
-    test_data[2] = 108  # l
-    test_data[3] = 108  # l
-    test_data[4] = 111  # o
-    test_data[5] = 32   # (space)
-    test_data[6] = 70   # F
-    test_data[7] = 83   # S
-    test_data[8] = 33   # !
-    test_data[9] = 10   # \n
-    test_data[10] = 0
-
-    let write_path: StrView = "/test/hello.txt" as StrView
-    let write_result: i32 = knamespace_write(ns, @write_path, @test_data[0], 10)
-    if write_result == KNS_OK
-        prints("    [OK] write /test/hello.txt\n")
-    else
-        prints("    [!!] write /test/hello.txt failed\n")
-
-    # Test 3: Check file exists
-    if knamespace_exists(ns, @write_path)
-        prints("    [OK] exists /test/hello.txt\n")
-    else
-        prints("    [!!] exists /test/hello.txt failed\n")
-
-    # Test 4: Read file back
-    var read_size: u64 = 0
-    let read_data: *u8 = knamespace_read(ns, @write_path, @read_size)
-    if read_data != 0 as *u8 and read_size == 10
-        prints("    [OK] read /test/hello.txt (")
-        serial_print_dec(read_size)
-        prints(" bytes)\n")
-        # Verify content
-        var content_ok: u8 = 1
-        var i: u64 = 0
-        while i < read_size
-            if *(read_data + i) != test_data[i]
-                content_ok = 0
-                break
-            i = i + 1
-        if content_ok != 0
-            prints("    [OK] content verified\n")
-        else
-            prints("    [!!] content mismatch\n")
-    else
-        prints("    [!!] read /test/hello.txt failed\n")
-
-    prints("  Filesystem test complete.\n")
-    0
-
 # ============================================================================
 # Kernel Entry Point
 # ============================================================================
@@ -2631,9 +2313,6 @@ pub fn kernel_main(boot_info_addr: u64) -> i32
 
         # Initialize working directory to root
         init_cwd()
-
-        # Test filesystem operations
-        fs_quick_test()
 
         # Initialize second block device (persistent storage)
         klog(c"  [..] Persistent storage")
@@ -2916,14 +2595,7 @@ pub fn kernel_main(boot_info_addr: u64) -> i32
         # Note: channel_debug_print causes page fault - skipped for now
         # channel_debug_print()
 
-    # Test capability system
-    prints("\nTesting Capability System...\n")
-    test_capability_system()
-
     prints("\nKernel initialized successfully.\n")
-
-    # Uncomment to test exception handler with stack trace:
-    # test_crash_page_fault()
 
     # Initialize syscall interface
     prints("\n  [..] Syscall interface")
@@ -2997,8 +2669,7 @@ pub fn kernel_main(boot_info_addr: u64) -> i32
     # This will not return if init runs correctly
     let init_result: i32 = run_init()
     if init_result != 0
-        prints("[kernel] Failed to run init, falling back to assembly test\n")
-        test_userspace()
+        prints("[kernel] Failed to run init!\n")
 
     # If init fails, halt
     halt_loop()
