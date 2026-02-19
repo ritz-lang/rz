@@ -1,0 +1,215 @@
+# NVMe Queue Management
+#
+# Implements NVMe submission and completion queue operations.
+# NVMe queues are ring buffers with head/tail pointers:
+#   - Submission Queue (SQ): Host writes commands, controller reads
+#   - Completion Queue (CQ): Controller writes completions, host reads
+#
+# The doorbell registers notify the controller of queue updates:
+#   - SQ Tail Doorbell: Written by host after adding commands
+#   - CQ Head Doorbell: Written by host after processing completions
+
+import mm.pmm { pmm_alloc_page, PAGE_SIZE }
+import mm.heap { kalloc, kfree }
+import drivers.nvme.types { NvmeCommand, NvmeCompletion, NVME_COMMAND_SIZE, NVME_COMPLETION_SIZE, NVME_CQE_STATUS_PHASE }
+
+# ============================================================================
+# Queue Structures
+# ============================================================================
+
+# NVMe Submission Queue
+pub struct NvmeSubmissionQueue
+    entries: *NvmeCommand     # Submission queue entries (virtual addr)
+    phys_addr: u64            # Physical address of queue
+    size: u16                 # Number of entries
+    tail: u16                 # Tail index (where host writes next)
+    head: u16                 # Head index (updated from CQ)
+    qid: u16                  # Queue ID (0 = admin, 1+ = I/O)
+    doorbell_offset: u64      # Doorbell register offset from BAR0
+    cq_id: u16                # Associated Completion Queue ID
+    _padding: [6]u8
+
+# NVMe Completion Queue
+pub struct NvmeCompletionQueue
+    entries: *NvmeCompletion  # Completion queue entries (virtual addr)
+    phys_addr: u64            # Physical address of queue
+    size: u16                 # Number of entries
+    head: u16                 # Head index (where host reads next)
+    phase: u8                 # Expected phase bit (toggles on wrap)
+    _padding1: u8
+    qid: u16                  # Queue ID
+    doorbell_offset: u64      # Doorbell register offset from BAR0
+    _padding2: [8]u8
+
+# Size constants
+pub const SQ_STRUCT_SIZE: u64 = 48
+pub const CQ_STRUCT_SIZE: u64 = 48
+
+# ============================================================================
+# Queue Allocation
+# ============================================================================
+
+# Calculate pages needed for a queue
+fn queue_pages(entries: u16, entry_size: u64) -> u64
+    let total_size: u64 = (entries as u64) * entry_size
+    return (total_size + PAGE_SIZE - 1) / PAGE_SIZE
+
+# Allocate contiguous pages for queue memory
+# For simplicity, we limit queues to fit in a single page (4KB)
+# This supports up to 64 SQ entries (64*64=4096) or 256 CQ entries (256*16=4096)
+fn alloc_queue_pages(pages: u64) -> u64
+    # For now, only support single-page queues
+    # Multi-page queues would need scatter-gather or contiguous allocation
+    if pages > 1
+        return 0
+    return pmm_alloc_page()
+
+# Allocate a submission queue
+# qid: Queue ID (0 = admin, 1+ = I/O)
+# entries: Number of queue entries (must be power of 2, max 64 for single page)
+# doorbell_stride: Doorbell stride from CAP.DSTRD (in bytes = 4 << DSTRD)
+# cq_id: Associated completion queue ID
+pub fn nvme_alloc_sq(qid: u16, entries: u16, doorbell_stride: u32, cq_id: u16) -> *NvmeSubmissionQueue
+    let sq: *NvmeSubmissionQueue = kalloc(SQ_STRUCT_SIZE) as *NvmeSubmissionQueue
+    if sq == 0 as *NvmeSubmissionQueue
+        return 0 as *NvmeSubmissionQueue
+
+    # Calculate queue memory size and allocate
+    let pages: u64 = queue_pages(entries, NVME_COMMAND_SIZE)
+    let phys: u64 = alloc_queue_pages(pages)
+    if phys == 0
+        kfree(sq)
+        return 0 as *NvmeSubmissionQueue
+
+    # Initialize queue structure
+    (*sq).entries = phys as *NvmeCommand  # Identity mapping
+    (*sq).phys_addr = phys
+    (*sq).size = entries
+    (*sq).tail = 0
+    (*sq).head = 0
+    (*sq).qid = qid
+    (*sq).cq_id = cq_id
+
+    # Calculate doorbell offset: base + (2 * qid * stride) for SQ tail
+    # Doorbell base is 0x1000
+    (*sq).doorbell_offset = 0x1000 + ((2 * (qid as u64)) * (doorbell_stride as u64))
+
+    # Zero the queue memory
+    var i: u64 = 0
+    let total_bytes: u64 = pages * PAGE_SIZE
+    while i < total_bytes
+        *(((*sq).entries as u64 + i) as *u8) = 0
+        i = i + 1
+
+    return sq
+
+# Allocate a completion queue
+# qid: Queue ID (0 = admin, 1+ = I/O)
+# entries: Number of queue entries (max 256 for single page)
+# doorbell_stride: Doorbell stride from CAP.DSTRD (in bytes)
+pub fn nvme_alloc_cq(qid: u16, entries: u16, doorbell_stride: u32) -> *NvmeCompletionQueue
+    let cq: *NvmeCompletionQueue = kalloc(CQ_STRUCT_SIZE) as *NvmeCompletionQueue
+    if cq == 0 as *NvmeCompletionQueue
+        return 0 as *NvmeCompletionQueue
+
+    # Calculate queue memory size and allocate
+    let pages: u64 = queue_pages(entries, NVME_COMPLETION_SIZE)
+    let phys: u64 = alloc_queue_pages(pages)
+    if phys == 0
+        kfree(cq)
+        return 0 as *NvmeCompletionQueue
+
+    # Initialize queue structure
+    (*cq).entries = phys as *NvmeCompletion  # Identity mapping
+    (*cq).phys_addr = phys
+    (*cq).size = entries
+    (*cq).head = 0
+    (*cq).phase = 1  # Initial phase is 1
+    (*cq).qid = qid
+
+    # Calculate doorbell offset: base + (2 * qid + 1) * stride for CQ head
+    (*cq).doorbell_offset = 0x1000 + (((2 * (qid as u64)) + 1) * (doorbell_stride as u64))
+
+    # Zero the queue memory (important: phase bit starts at 0, we expect 1)
+    var i: u64 = 0
+    let total_bytes: u64 = pages * PAGE_SIZE
+    while i < total_bytes
+        *(((*cq).entries as u64 + i) as *u8) = 0
+        i = i + 1
+
+    return cq
+
+# ============================================================================
+# Submission Queue Operations
+# ============================================================================
+
+# Get pointer to next submission queue entry
+# Returns null if queue is full
+pub fn sq_get_next_entry(sq: *NvmeSubmissionQueue) -> *NvmeCommand
+    # Check if queue is full: (tail + 1) % size == head
+    let next_tail: u16 = ((*sq).tail + 1) % (*sq).size
+    if next_tail == (*sq).head
+        return 0 as *NvmeCommand
+
+    # Return pointer to current tail entry
+    let entry_addr: u64 = (*sq).entries as u64 + (((*sq).tail as u64) * NVME_COMMAND_SIZE)
+    return entry_addr as *NvmeCommand
+
+# Commit the submission queue entry (increment tail)
+# Call this after filling in the command
+pub fn sq_commit(sq: *NvmeSubmissionQueue)
+    (*sq).tail = ((*sq).tail + 1) % (*sq).size
+
+# Update submission queue head from completion queue response
+pub fn sq_update_head(sq: *NvmeSubmissionQueue, new_head: u16)
+    (*sq).head = new_head
+
+# Get number of pending commands in queue
+pub fn sq_pending_count(sq: *NvmeSubmissionQueue) -> u16
+    if (*sq).tail >= (*sq).head
+        return (*sq).tail - (*sq).head
+    else
+        return (*sq).size - (*sq).head + (*sq).tail
+
+# ============================================================================
+# Completion Queue Operations
+# ============================================================================
+
+# Check if there's a completion entry ready
+# Returns true if the next entry has the expected phase bit
+pub fn cq_has_completion(cq: *NvmeCompletionQueue) -> bool
+    let entry_addr: u64 = (*cq).entries as u64 + (((*cq).head as u64) * NVME_COMPLETION_SIZE)
+    let entry: *NvmeCompletion = entry_addr as *NvmeCompletion
+    let status: u16 = (*entry).status
+
+    # Check phase bit matches expected
+    let phase_bit: u8 = (status & NVME_CQE_STATUS_PHASE) as u8
+    return phase_bit == (*cq).phase
+
+# Get the next completion entry
+# Returns null if no completion ready
+pub fn cq_get_completion(cq: *NvmeCompletionQueue) -> *NvmeCompletion
+    if not cq_has_completion(cq)
+        return 0 as *NvmeCompletion
+
+    let entry_addr: u64 = (*cq).entries as u64 + (((*cq).head as u64) * NVME_COMPLETION_SIZE)
+    return entry_addr as *NvmeCompletion
+
+# Advance completion queue head after processing an entry
+pub fn cq_advance_head(cq: *NvmeCompletionQueue)
+    (*cq).head = (*cq).head + 1
+    if (*cq).head >= (*cq).size
+        (*cq).head = 0
+        # Toggle phase bit on wrap
+        (*cq).phase = (*cq).phase ^ 1
+
+# Get status code from completion entry
+# Returns 0 on success, non-zero on error
+pub fn cq_get_status_code(cqe: *NvmeCompletion) -> u8
+    # Status code is bits 1-8 of status field
+    return (((*cqe).status >> 1) & 0xFF) as u8
+
+# Get status code type from completion entry
+pub fn cq_get_status_type(cqe: *NvmeCompletion) -> u8
+    # Status code type is bits 9-11 of status field
+    return (((*cqe).status >> 9) & 0x07) as u8

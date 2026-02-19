@@ -1,0 +1,340 @@
+# NVMe Block Device I/O Operations
+#
+# Implements block read/write operations for NVMe devices.
+# This is the high-level API used by filesystems and initramfs.
+#
+# NVMe I/O uses Physical Region Pages (PRPs) for DMA transfers.
+# For simplicity, we support single-page transfers (up to 4KB).
+# Multi-page transfers would require PRP lists.
+
+import serial { prints, println, serial_print_hex, serial_print_hex8, serial_print_dec }
+import mm.pmm { pmm_alloc_page, PAGE_SIZE }
+import mm.heap { kalloc, kfree }
+import drivers.nvme.types { NvmeCommand, NvmeCompletion, NVME_CMD_READ, NVME_CMD_WRITE, NVME_CMD_FLUSH }
+import drivers.nvme.queue { NvmeSubmissionQueue, NvmeCompletionQueue, sq_get_next_entry, sq_commit, sq_update_head, cq_has_completion, cq_get_completion, cq_advance_head, cq_get_status_code }
+import drivers.nvme.controller { NvmeController, NvmeNamespace, nvme_get_controller, nvme_get_namespace, nvme_get_block_size }
+
+# ============================================================================
+# DMA Buffer Management
+# ============================================================================
+
+# DMA buffer for I/O operations (one page, identity mapped)
+var io_dma_buffer: u64 = 0
+
+fn ensure_dma_buffer() -> bool
+    if io_dma_buffer == 0
+        io_dma_buffer = pmm_alloc_page()
+        if io_dma_buffer == 0
+            println("[nvme-blk] Failed to allocate DMA buffer")
+            return false
+    return true
+
+# ============================================================================
+# MMIO Access
+# ============================================================================
+
+fn blk_mmio_write32(base: u64, offset: u64, value: u32)
+    *((base + offset) as *u32) = value
+
+# ============================================================================
+# I/O Command Helpers
+# ============================================================================
+
+# Ring the I/O submission queue doorbell
+fn ring_io_sq_doorbell(ctrl: *NvmeController, sq: *NvmeSubmissionQueue)
+    blk_mmio_write32((*ctrl).bar0, (*sq).doorbell_offset, (*sq).tail as u32)
+
+# Ring the I/O completion queue doorbell
+fn ring_io_cq_doorbell(ctrl: *NvmeController, cq: *NvmeCompletionQueue)
+    blk_mmio_write32((*ctrl).bar0, (*cq).doorbell_offset, (*cq).head as u32)
+
+# Get next command ID
+fn blk_get_next_cmd_id(ctrl: *NvmeController) -> u16
+    let id: u16 = (*ctrl).next_cmd_id
+    (*ctrl).next_cmd_id = (*ctrl).next_cmd_id + 1
+    return id
+
+# Zero out a command structure
+fn blk_zero_command(cmd: *NvmeCommand)
+    var i: i32 = 0
+    while i < 64
+        *((cmd as u64 + i as u64) as *u8) = 0
+        i = i + 1
+
+# Submit I/O command and wait for completion
+# Returns 0 on success, negative on error
+fn submit_io_cmd(ctrl: *NvmeController, cmd: *NvmeCommand) -> i32
+    let sq: *NvmeSubmissionQueue = (*ctrl).io_sq
+    let cq: *NvmeCompletionQueue = (*ctrl).io_cq
+
+    if sq == 0 as *NvmeSubmissionQueue or cq == 0 as *NvmeCompletionQueue
+        println("[nvme-blk] I/O queues not initialized")
+        return -1
+
+    # Get next submission entry
+    let entry: *NvmeCommand = sq_get_next_entry(sq)
+    if entry == 0 as *NvmeCommand
+        println("[nvme-blk] I/O queue full")
+        return -2
+
+    # Copy command to queue entry
+    var i: i32 = 0
+    while i < 64
+        *((entry as u64 + i as u64) as *u8) = *((cmd as u64 + i as u64) as *u8)
+        i = i + 1
+
+    # Commit and ring doorbell
+    sq_commit(sq)
+    ring_io_sq_doorbell(ctrl, sq)
+
+    # Poll for completion
+    var timeout: u32 = 10000000
+    while not cq_has_completion(cq)
+        timeout = timeout - 1
+        if timeout == 0
+            println("[nvme-blk] I/O command timeout")
+            return -3
+
+    # Process completion
+    let cqe: *NvmeCompletion = cq_get_completion(cq)
+    let status: u8 = cq_get_status_code(cqe)
+
+    # Update SQ head from completion
+    sq_update_head(sq, (*cqe).sq_head)
+
+    # Advance CQ head and ring doorbell
+    cq_advance_head(cq)
+    ring_io_cq_doorbell(ctrl, cq)
+
+    if status != 0
+        prints("[nvme-blk] I/O command failed, status=")
+        serial_print_hex8(status)
+        println("")
+        return status as i32
+
+    return 0
+
+# ============================================================================
+# Public Block I/O API
+# ============================================================================
+
+# Read blocks from NVMe device
+# lba: Starting logical block address
+# count: Number of blocks to read (max: PAGE_SIZE / block_size for single transfer)
+# buf: Buffer to read data into
+# Returns: 0 on success, negative on error
+pub fn nvme_read(lba: u64, count: u32, buf: *u8) -> i32
+    let ctrl: *NvmeController = nvme_get_controller()
+    if ctrl == 0 as *NvmeController
+        println("[nvme-blk] No controller")
+        return -1
+
+    let ns: *NvmeNamespace = nvme_get_namespace()
+    if ns == 0 as *NvmeNamespace
+        println("[nvme-blk] No namespace")
+        return -1
+
+    if not ensure_dma_buffer()
+        return -2
+
+    let block_size: u32 = (*ns).block_size
+    let transfer_size: u32 = count * block_size
+
+    # Check transfer fits in one page
+    if transfer_size > PAGE_SIZE as u32
+        println("[nvme-blk] Transfer too large (max 4KB)")
+        return -3
+
+    # Build NVM Read command (opcode 0x02)
+    # CDW10-11: Starting LBA (64-bit)
+    # CDW12: Number of Logical Blocks (0-based, bits 0-15)
+    var cmd: NvmeCommand
+    blk_zero_command(@cmd)
+    cmd.opcode = NVME_CMD_READ
+    cmd.command_id = blk_get_next_cmd_id(ctrl)
+    cmd.nsid = (*ns).nsid
+    cmd.prp1 = io_dma_buffer
+    cmd.prp2 = 0  # Only used for transfers > 4KB
+    cmd.cdw10 = (lba & 0xFFFFFFFF) as u32
+    cmd.cdw11 = ((lba >> 32) & 0xFFFFFFFF) as u32
+    cmd.cdw12 = (count - 1) as u32  # Number of blocks minus 1
+
+    # Submit command
+    let result: i32 = submit_io_cmd(ctrl, @cmd)
+    if result != 0
+        return result
+
+    # Copy data from DMA buffer to user buffer
+    var i: u32 = 0
+    while i < transfer_size
+        *(buf + i as i64) = *((io_dma_buffer + i as u64) as *u8)
+        i = i + 1
+
+    return 0
+
+# Write blocks to NVMe device
+# lba: Starting logical block address
+# count: Number of blocks to write
+# buf: Buffer containing data to write
+# Returns: 0 on success, negative on error
+pub fn nvme_write(lba: u64, count: u32, buf: *u8) -> i32
+    let ctrl: *NvmeController = nvme_get_controller()
+    if ctrl == 0 as *NvmeController
+        println("[nvme-blk] No controller")
+        return -1
+
+    let ns: *NvmeNamespace = nvme_get_namespace()
+    if ns == 0 as *NvmeNamespace
+        println("[nvme-blk] No namespace")
+        return -1
+
+    if not ensure_dma_buffer()
+        return -2
+
+    let block_size: u32 = (*ns).block_size
+    let transfer_size: u32 = count * block_size
+
+    # Check transfer fits in one page
+    if transfer_size > PAGE_SIZE as u32
+        println("[nvme-blk] Transfer too large (max 4KB)")
+        return -3
+
+    # Copy data from user buffer to DMA buffer
+    var i: u32 = 0
+    while i < transfer_size
+        *((io_dma_buffer + i as u64) as *u8) = *(buf + i as i64)
+        i = i + 1
+
+    # Build NVM Write command (opcode 0x01)
+    var cmd: NvmeCommand
+    blk_zero_command(@cmd)
+    cmd.opcode = NVME_CMD_WRITE
+    cmd.command_id = blk_get_next_cmd_id(ctrl)
+    cmd.nsid = (*ns).nsid
+    cmd.prp1 = io_dma_buffer
+    cmd.prp2 = 0
+    cmd.cdw10 = (lba & 0xFFFFFFFF) as u32
+    cmd.cdw11 = ((lba >> 32) & 0xFFFFFFFF) as u32
+    cmd.cdw12 = (count - 1) as u32
+
+    # Submit command
+    return submit_io_cmd(ctrl, @cmd)
+
+# Flush all pending writes to device
+# Returns: 0 on success, negative on error
+pub fn nvme_flush() -> i32
+    let ctrl: *NvmeController = nvme_get_controller()
+    if ctrl == 0 as *NvmeController
+        return -1
+
+    let ns: *NvmeNamespace = nvme_get_namespace()
+    if ns == 0 as *NvmeNamespace
+        return -1
+
+    var cmd: NvmeCommand
+    blk_zero_command(@cmd)
+    cmd.opcode = NVME_CMD_FLUSH
+    cmd.command_id = blk_get_next_cmd_id(ctrl)
+    cmd.nsid = (*ns).nsid
+
+    return submit_io_cmd(ctrl, @cmd)
+
+# ============================================================================
+# Sector-Based API (512-byte sectors for compatibility with VirtIO)
+# ============================================================================
+
+# Read sectors (512 bytes each) from NVMe device
+# This provides compatibility with the VirtIO block interface
+# sector: Starting sector number (512-byte based)
+# count: Number of 512-byte sectors to read
+# buf: Buffer to read into
+# Returns: 0 on success, negative on error
+pub fn nvme_read_sectors(sector: u64, count: u32, buf: *u8) -> i32
+    let ns: *NvmeNamespace = nvme_get_namespace()
+    if ns == 0 as *NvmeNamespace
+        return -1
+
+    let block_size: u32 = (*ns).block_size
+
+    if block_size == 512
+        # Direct mapping: sector = LBA
+        return nvme_read(sector, count, buf)
+    else
+        # Block size > 512: need to convert
+        # This handles 4K native drives
+        let blocks_per_sector: u32 = block_size / 512
+        let start_lba: u64 = sector / blocks_per_sector as u64
+        let block_count: u32 = (count + blocks_per_sector - 1) / blocks_per_sector
+
+        # For now, require aligned access for simplicity
+        if (sector % blocks_per_sector as u64) != 0
+            println("[nvme-blk] Unaligned sector access not supported for 4K drives")
+            return -10
+
+        return nvme_read(start_lba, block_count, buf)
+
+# Write sectors (512 bytes each) to NVMe device
+pub fn nvme_write_sectors(sector: u64, count: u32, buf: *u8) -> i32
+    let ns: *NvmeNamespace = nvme_get_namespace()
+    if ns == 0 as *NvmeNamespace
+        return -1
+
+    let block_size: u32 = (*ns).block_size
+
+    if block_size == 512
+        return nvme_write(sector, count, buf)
+    else
+        let blocks_per_sector: u32 = block_size / 512
+        let start_lba: u64 = sector / blocks_per_sector as u64
+        let block_count: u32 = (count + blocks_per_sector - 1) / blocks_per_sector
+
+        if (sector % blocks_per_sector as u64) != 0
+            println("[nvme-blk] Unaligned sector access not supported for 4K drives")
+            return -10
+
+        return nvme_write(start_lba, block_count, buf)
+
+# ============================================================================
+# Test Function
+# ============================================================================
+
+pub fn nvme_blk_test() -> i32
+    let ctrl: *NvmeController = nvme_get_controller()
+    if ctrl == 0 as *NvmeController
+        println("[nvme-blk] No controller for test")
+        return -1
+
+    let ns: *NvmeNamespace = nvme_get_namespace()
+    if ns == 0 as *NvmeNamespace
+        println("[nvme-blk] No namespace for test")
+        return -1
+
+    println("[nvme-blk] Running read test...")
+
+    # Allocate a buffer for one block
+    var buf: [512]u8
+    var i: i32 = 0
+    while i < 512
+        buf[i] = 0
+        i = i + 1
+
+    # Read sector 0
+    let result: i32 = nvme_read_sectors(0, 1, @buf[0])
+    if result != 0
+        prints("[nvme-blk] Read test failed: ")
+        serial_print_dec((0 - result) as u64)
+        println("")
+        return result
+
+    println("[nvme-blk] Read sector 0 OK")
+
+    # Print first 32 bytes
+    prints("[nvme-blk] First 32 bytes: ")
+    i = 0
+    while i < 32
+        serial_print_hex8(buf[i])
+        prints(" ")
+        i = i + 1
+    println("")
+
+    return 0

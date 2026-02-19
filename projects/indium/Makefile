@@ -28,7 +28,7 @@ STORAGE = $(BUILD_DIR)/storage.qcow2
 # Phony targets
 # ============================================================================
 
-.PHONY: all clean kernel userspace rzsh iso run run-iso run-uefi debug test test-uefi test-uefi-gui help
+.PHONY: all clean kernel userspace rzsh iso run run-iso run-uefi debug test test-uefi test-uefi-gui ec2-disk help
 
 all: iso
 
@@ -81,14 +81,74 @@ $(UEFI_DISK): kernel
 	mcopy -i $@ $(BUILD_DIR)/startup.nsh ::/startup.nsh
 	@echo "Created: $@"
 
+# Create EC2-compatible UEFI boot disk with GPT partition table
+# EC2 requires a proper GPT with EFI System Partition for UEFI boot
+# Layout:
+#   Partition 1: ESP (EFI System Partition) - FAT32, ~62MB - kernel + bootloader
+#
+# NOTE: The initramfs is on a separate EBS volume (/dev/xvdb).
+# We keep the boot disk simple with just the ESP to maximize compatibility.
+#
+# IMPORTANT: We use mtools to create the FAT32 filesystem, avoiding loop device
+# issues. This matches how working UEFI boot disks are typically created.
+EC2_DISK = $(BUILD_DIR)/ec2-boot.img
+EC2_ESP = $(BUILD_DIR)/ec2-esp.img
+
+ec2-disk: $(EC2_DISK)
+
+# First, create a standalone FAT32 filesystem using mtools (no loop device)
+$(EC2_ESP): kernel
+	@echo "=== Creating ESP FAT32 Image ==="
+	@mkdir -p $(BUILD_DIR)
+	@# Create 62MB FAT32 image (will fit in the partition)
+	dd if=/dev/zero of=$@ bs=1M count=62 2>/dev/null
+	mkfs.vfat -F 32 -n HARLAND $@ >/dev/null
+	@# Create directory structure
+	mmd -i $@ ::/EFI
+	mmd -i $@ ::/EFI/BOOT
+	mmd -i $@ ::/harland
+	@# Copy files
+	mcopy -i $@ $(BOOTLOADER) ::/EFI/BOOT/BOOTX64.EFI
+	mcopy -i $@ $(KERNEL_ELF) ::/harland/kernel.elf
+	@# Create startup script
+	@echo '@echo -off' > $(BUILD_DIR)/startup.nsh
+	@echo 'FS0:\EFI\BOOT\BOOTX64.EFI' >> $(BUILD_DIR)/startup.nsh
+	mcopy -i $@ $(BUILD_DIR)/startup.nsh ::/startup.nsh
+	@echo "Created: $@ (FAT32 filesystem)"
+
+# Then, wrap it in a GPT disk image
+$(EC2_DISK): $(EC2_ESP)
+	@echo "=== Creating EC2 Boot Disk (GPT + ESP) ==="
+	@# Create 64MB disk image with GPT header/footer space
+	dd if=/dev/zero of=$@ bs=1M count=64 2>/dev/null
+	@# Create GPT partition table with single ESP partition
+	@# ESP at 1MB (sector 2048), size 62MB (126976 sectors)
+	sgdisk --clear \
+	       --new=1:2048:129023 --typecode=1:EF00 --change-name=1:ESP \
+	       $@
+	@# Copy the FAT32 filesystem to the ESP partition
+	@# ESP offset: 2048 * 512 = 1048576 (1MB)
+	dd if=$(EC2_ESP) of=$@ bs=512 seek=2048 conv=notrunc 2>/dev/null
+	@echo "Created: $@ (GPT + ESP, ready for EC2)"
+
 # ============================================================================
 # Run targets
 # ============================================================================
 
-# Create test disks
-$(INITRAMFS):
+# Build userspace programs and create initramfs TAR
+$(BUILD_DIR)/initramfs.tar: userspace rzsh
+	@echo "=== Creating Initramfs TAR ==="
 	@mkdir -p $(BUILD_DIR)
-	qemu-img create -f qcow2 $@ 64M
+	python3 $(HARLAND_DIR)/tools/mkinitramfs.py \
+		--bin-dir $(BUILD_DIR)/debug \
+		--output $(BUILD_DIR)/initramfs.tar
+
+# Create QCOW2 initramfs disk for QEMU
+$(INITRAMFS): $(BUILD_DIR)/initramfs.tar
+	@echo "=== Creating Initramfs QCOW2 ==="
+	python3 $(HARLAND_DIR)/tools/mkinitramfs.py \
+		--bin-dir $(BUILD_DIR)/debug \
+		--output $(INITRAMFS)
 
 $(STORAGE):
 	@mkdir -p $(BUILD_DIR)
@@ -205,6 +265,7 @@ help:
 	@echo "  kernel      - Build Harland kernel"
 	@echo "  userspace   - Build userspace programs"
 	@echo "  iso         - Create bootable ISO with GRUB"
+	@echo "  ec2-disk    - Create EC2-compatible UEFI disk (GPT + ESP)"
 	@echo ""
 	@echo "Run Targets:"
 	@echo "  run         - Boot in QEMU (BIOS/GRUB mode, default)"

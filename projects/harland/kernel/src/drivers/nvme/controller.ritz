@@ -1,0 +1,566 @@
+# NVMe Controller Driver
+#
+# Implements NVMe controller initialization and management.
+# This is the main entry point for NVMe device operations.
+#
+# Initialization sequence:
+# 1. Disable controller (CC.EN = 0)
+# 2. Wait for CSTS.RDY = 0
+# 3. Configure admin queues (AQA, ASQ, ACQ)
+# 4. Set controller configuration (CC)
+# 5. Enable controller (CC.EN = 1)
+# 6. Wait for CSTS.RDY = 1
+# 7. Identify controller and namespaces
+# 8. Create I/O queues
+
+import serial { prints, println, serial_print_hex, serial_print_hex8, serial_print_hex16, serial_print_hex32, serial_print_dec, StrView }
+import mm.pmm { pmm_alloc_page, PAGE_SIZE }
+import mm.heap { kalloc, kfree }
+import mm.vmm { vmm_map_page, PTE_WRITABLE }
+import drivers.pci { PciDevice, pci_enable_bus_master, pci_enable_memory, pci_find_by_class, pci_get_device, pci_get_device_count, PCI_CLASS_STORAGE }
+import drivers.nvme.types { NVME_REG_CAP, NVME_REG_VS, NVME_REG_CC, NVME_REG_CSTS, NVME_REG_AQA, NVME_REG_ASQ, NVME_REG_ACQ, CC_EN, CC_CSS_NVM, CC_IOSQES_64B, CC_IOCQES_16B, CSTS_RDY, CSTS_CFS, CAP_MQES_MASK, CAP_TO_SHIFT, CAP_TO_MASK, CAP_DSTRD_SHIFT, CAP_DSTRD_MASK, AQA_ASQS_SHIFT, AQA_ACQS_SHIFT, NvmeCommand, NvmeCompletion, NvmeIdentifyCtrl, NvmeIdentifyNs, NVME_ADMIN_IDENTIFY, NVME_ADMIN_CREATE_CQ, NVME_ADMIN_CREATE_SQ, NVME_IDENTIFY_CNS_CTRL, NVME_IDENTIFY_CNS_NS, NVME_IDENTIFY_SIZE, LBAF_LBADS_SHIFT, LBAF_LBADS_MASK }
+import drivers.nvme.queue { NvmeSubmissionQueue, NvmeCompletionQueue, nvme_alloc_sq, nvme_alloc_cq, sq_get_next_entry, sq_commit, sq_update_head, cq_has_completion, cq_get_completion, cq_advance_head, cq_get_status_code }
+
+# ============================================================================
+# NVMe Controller Structure
+# ============================================================================
+
+pub struct NvmeController
+    pci_dev: *PciDevice           # PCI device handle
+    bar0: u64                     # BAR0 memory-mapped base address
+    cap: u64                      # Cached capabilities register
+    doorbell_stride: u32          # Doorbell stride in bytes
+    max_queue_entries: u16        # Maximum queue entries supported
+    timeout: u32                  # Timeout in 500ms units
+    _padding: u16
+
+    # Admin queues
+    admin_sq: *NvmeSubmissionQueue
+    admin_cq: *NvmeCompletionQueue
+
+    # I/O queues (one pair for now)
+    io_sq: *NvmeSubmissionQueue
+    io_cq: *NvmeCompletionQueue
+
+    # Controller info from Identify
+    serial: [20]u8
+    model: [40]u8
+    num_namespaces: u32
+    mdts: u8                      # Maximum data transfer size (2^n pages)
+    _padding2: [3]u8
+
+    # Command ID counter
+    next_cmd_id: u16
+    _padding3: [6]u8
+
+# Namespace structure
+pub struct NvmeNamespace
+    nsid: u32                     # Namespace ID
+    block_count: u64              # Total blocks
+    block_size: u32               # Block size in bytes
+    _padding: u32
+
+# Size constants
+pub const NVME_CTRL_SIZE: u64 = 192
+pub const NVME_NS_SIZE: u64 = 24
+
+# Queue size for admin and I/O queues
+const ADMIN_QUEUE_SIZE: u16 = 32
+const IO_QUEUE_SIZE: u16 = 64
+
+# Global controller state (support one controller for now)
+var nvme_ctrl: *NvmeController = 0 as *NvmeController
+var nvme_ns: NvmeNamespace
+
+# ============================================================================
+# Memory-Mapped Register Access
+# ============================================================================
+
+fn nvme_mmio_read32(base: u64, offset: u64) -> u32
+    return *((base + offset) as *u32)
+
+fn nvme_mmio_write32(base: u64, offset: u64, value: u32)
+    *((base + offset) as *u32) = value
+
+fn nvme_mmio_read64(base: u64, offset: u64) -> u64
+    # Read as two 32-bit values for compatibility
+    let low: u32 = *((base + offset) as *u32)
+    let high: u32 = *((base + offset + 4) as *u32)
+    return ((high as u64) << 32) | (low as u64)
+
+fn nvme_mmio_write64(base: u64, offset: u64, value: u64)
+    *((base + offset) as *u32) = (value & 0xFFFFFFFF) as u32
+    *((base + offset + 4) as *u32) = ((value >> 32) & 0xFFFFFFFF) as u32
+
+# ============================================================================
+# Doorbell Operations
+# ============================================================================
+
+fn ring_sq_doorbell(ctrl: *NvmeController, sq: *NvmeSubmissionQueue)
+    nvme_mmio_write32((*ctrl).bar0, (*sq).doorbell_offset, (*sq).tail as u32)
+
+fn ring_cq_doorbell(ctrl: *NvmeController, cq: *NvmeCompletionQueue)
+    nvme_mmio_write32((*ctrl).bar0, (*cq).doorbell_offset, (*cq).head as u32)
+
+# ============================================================================
+# Command Submission
+# ============================================================================
+
+# Allocate a command ID
+fn alloc_cmd_id(ctrl: *NvmeController) -> u16
+    let id: u16 = (*ctrl).next_cmd_id
+    (*ctrl).next_cmd_id = (*ctrl).next_cmd_id + 1
+    return id
+
+# Submit a command to the admin queue and wait for completion
+# Returns 0 on success, negative on error
+fn submit_admin_cmd(ctrl: *NvmeController, cmd: *NvmeCommand) -> i32
+    let sq: *NvmeSubmissionQueue = (*ctrl).admin_sq
+    let cq: *NvmeCompletionQueue = (*ctrl).admin_cq
+
+    # Get next submission entry
+    let entry: *NvmeCommand = sq_get_next_entry(sq)
+    if entry == 0 as *NvmeCommand
+        println("[nvme] Admin queue full")
+        return -1
+
+    # Copy command to queue entry
+    var i: i32 = 0
+    while i < 64
+        *((entry as u64 + i as u64) as *u8) = *((cmd as u64 + i as u64) as *u8)
+        i = i + 1
+
+    # Commit and ring doorbell
+    sq_commit(sq)
+    ring_sq_doorbell(ctrl, sq)
+
+    # Poll for completion
+    var timeout: u32 = 10000000
+    while not cq_has_completion(cq)
+        timeout = timeout - 1
+        if timeout == 0
+            println("[nvme] Admin command timeout")
+            return -2
+
+    # Process completion
+    let cqe: *NvmeCompletion = cq_get_completion(cq)
+    let status: u8 = cq_get_status_code(cqe)
+
+    # Update SQ head from completion
+    sq_update_head(sq, (*cqe).sq_head)
+
+    # Advance CQ head and ring doorbell
+    cq_advance_head(cq)
+    ring_cq_doorbell(ctrl, cq)
+
+    if status != 0
+        prints("[nvme] Admin command failed, status=")
+        serial_print_hex8(status)
+        println("")
+        return status as i32
+
+    return 0
+
+# ============================================================================
+# Controller Initialization
+# ============================================================================
+
+# Disable the controller and wait for ready bit to clear
+fn nvme_disable(ctrl: *NvmeController) -> i32
+    let cc: u32 = nvme_mmio_read32((*ctrl).bar0, NVME_REG_CC)
+    nvme_mmio_write32((*ctrl).bar0, NVME_REG_CC, cc & (0xFFFFFFFF ^ CC_EN))
+
+    # Wait for CSTS.RDY = 0
+    var timeout: u32 = (*ctrl).timeout * 500000  # Approximate timeout
+    while (nvme_mmio_read32((*ctrl).bar0, NVME_REG_CSTS) & CSTS_RDY) != 0
+        timeout = timeout - 1
+        if timeout == 0
+            println("[nvme] Timeout waiting for disable")
+            return -1
+    return 0
+
+# Enable the controller and wait for ready bit
+fn nvme_enable(ctrl: *NvmeController) -> i32
+    let cc: u32 = nvme_mmio_read32((*ctrl).bar0, NVME_REG_CC)
+    nvme_mmio_write32((*ctrl).bar0, NVME_REG_CC, cc | CC_EN)
+
+    # Wait for CSTS.RDY = 1
+    var timeout: u32 = (*ctrl).timeout * 500000
+    while (nvme_mmio_read32((*ctrl).bar0, NVME_REG_CSTS) & CSTS_RDY) == 0
+        timeout = timeout - 1
+        if timeout == 0
+            println("[nvme] Timeout waiting for enable")
+            return -1
+
+    # Check for fatal error
+    if (nvme_mmio_read32((*ctrl).bar0, NVME_REG_CSTS) & CSTS_CFS) != 0
+        println("[nvme] Controller fatal status")
+        return -2
+
+    return 0
+
+# Initialize the first NVMe controller
+pub fn nvme_init() -> *NvmeController
+    return nvme_init_nth(0)
+
+# Initialize the Nth NVMe controller (0-indexed)
+pub fn nvme_init_nth(n: i32) -> *NvmeController
+    # Find Nth NVMe device
+    let pci_dev: *PciDevice = find_nvme_device_nth(n)
+    if pci_dev == 0 as *PciDevice
+        return 0 as *NvmeController
+
+    prints("[nvme] Found NVMe controller at PCI ")
+    serial_print_hex8((*pci_dev).bus)
+    prints(":")
+    serial_print_hex8((*pci_dev).device)
+    prints(".")
+    serial_print_hex8((*pci_dev).function)
+    println("")
+
+    # Enable PCI bus master and memory space
+    pci_enable_bus_master(pci_dev)
+    pci_enable_memory(pci_dev)
+
+    # Get BAR0 (memory-mapped registers)
+    let bar0: u64 = (*pci_dev).bar[0]
+    if bar0 == 0
+        println("[nvme] BAR0 not configured")
+        return 0 as *NvmeController
+
+    prints("[nvme] BAR0 at ")
+    serial_print_hex(bar0)
+    println("")
+
+    # Map the NVMe MMIO region (BAR0) into virtual memory
+    # BAR0 typically spans several pages, map enough for all registers
+    # NVMe spec requires at least 4KB for registers
+    let bar0_page: u64 = bar0 & 0xFFFFFFFFFFFFF000  # Page-align
+    var i: u64 = 0
+    # Map 8 pages (32KB) to cover all NVMe registers
+    while i < 8
+        let addr: u64 = bar0_page + (i * PAGE_SIZE)
+        let result: i32 = vmm_map_page(addr, addr, PTE_WRITABLE)
+        if result != 0
+            prints("[nvme] Failed to map BAR0 page ")
+            serial_print_hex(addr)
+            println("")
+            return 0 as *NvmeController
+        i = i + 1
+    println("[nvme] BAR0 MMIO region mapped")
+
+    # Allocate controller structure
+    let ctrl: *NvmeController = kalloc(NVME_CTRL_SIZE) as *NvmeController
+    if ctrl == 0 as *NvmeController
+        println("[nvme] Failed to allocate controller")
+        return 0 as *NvmeController
+
+    (*ctrl).pci_dev = pci_dev
+    (*ctrl).bar0 = bar0
+    (*ctrl).next_cmd_id = 0
+
+    # Read capabilities
+    (*ctrl).cap = nvme_mmio_read64(bar0, NVME_REG_CAP)
+    (*ctrl).max_queue_entries = (((*ctrl).cap & CAP_MQES_MASK) + 1) as u16
+    (*ctrl).timeout = ((((*ctrl).cap >> CAP_TO_SHIFT) & CAP_TO_MASK) as u32) + 1
+    (*ctrl).doorbell_stride = 4 << ((((*ctrl).cap >> CAP_DSTRD_SHIFT) & CAP_DSTRD_MASK) as u32)
+
+    prints("[nvme] Max queue entries: ")
+    serial_print_dec((*ctrl).max_queue_entries as u64)
+    prints(", doorbell stride: ")
+    serial_print_dec((*ctrl).doorbell_stride as u64)
+    println("")
+
+    # Read version
+    let vs: u32 = nvme_mmio_read32(bar0, NVME_REG_VS)
+    prints("[nvme] Version: ")
+    serial_print_dec(((vs >> 16) & 0xFFFF) as u64)
+    prints(".")
+    serial_print_dec(((vs >> 8) & 0xFF) as u64)
+    println("")
+
+    # Disable controller
+    if nvme_disable(ctrl) != 0
+        kfree(ctrl)
+        return 0 as *NvmeController
+
+    # Allocate admin queues
+    (*ctrl).admin_cq = nvme_alloc_cq(0, ADMIN_QUEUE_SIZE, (*ctrl).doorbell_stride)
+    if (*ctrl).admin_cq == 0 as *NvmeCompletionQueue
+        println("[nvme] Failed to allocate admin CQ")
+        kfree(ctrl)
+        return 0 as *NvmeController
+
+    (*ctrl).admin_sq = nvme_alloc_sq(0, ADMIN_QUEUE_SIZE, (*ctrl).doorbell_stride, 0)
+    if (*ctrl).admin_sq == 0 as *NvmeSubmissionQueue
+        println("[nvme] Failed to allocate admin SQ")
+        kfree(ctrl)
+        return 0 as *NvmeController
+
+    # Configure admin queue attributes
+    let aqa: u32 = ((ADMIN_QUEUE_SIZE - 1) as u32) | (((ADMIN_QUEUE_SIZE - 1) as u32) << 16)
+    nvme_mmio_write32(bar0, NVME_REG_AQA, aqa)
+
+    # Set admin queue base addresses
+    nvme_mmio_write64(bar0, NVME_REG_ASQ, (*(*ctrl).admin_sq).phys_addr)
+    nvme_mmio_write64(bar0, NVME_REG_ACQ, (*(*ctrl).admin_cq).phys_addr)
+
+    # Configure controller
+    # MPS = 0 (4KB pages), CSS = 0 (NVM command set)
+    # IOSQES = 6 (64 bytes), IOCQES = 4 (16 bytes)
+    let cc: u32 = CC_CSS_NVM | CC_IOSQES_64B | CC_IOCQES_16B
+    nvme_mmio_write32(bar0, NVME_REG_CC, cc)
+
+    # Enable controller
+    if nvme_enable(ctrl) != 0
+        kfree(ctrl)
+        return 0 as *NvmeController
+
+    println("[nvme] Controller enabled")
+
+    # Identify controller
+    if identify_controller(ctrl) != 0
+        kfree(ctrl)
+        return 0 as *NvmeController
+
+    # Create I/O queues
+    if create_io_queues(ctrl) != 0
+        kfree(ctrl)
+        return 0 as *NvmeController
+
+    # Identify namespace 1
+    # Note: Amazon EBS reports NN=0 but namespace 1 exists and works
+    # This is a known quirk - we always try namespace 1 regardless
+    if identify_namespace(ctrl, 1) != 0
+        # Only warn if controller reports namespaces but we failed
+        if (*ctrl).num_namespaces > 0
+            println("[nvme] Warning: Failed to identify namespace 1")
+        else
+            println("[nvme] NN=0 quirk: trying namespace 1 anyway failed")
+
+    # Store global controller
+    nvme_ctrl = ctrl
+
+    return ctrl
+
+# Find NVMe PCI device (first one)
+fn find_nvme_device() -> *PciDevice
+    return find_nvme_device_nth(0)
+
+# Find the Nth NVMe PCI device (0-indexed)
+fn find_nvme_device_nth(n: i32) -> *PciDevice
+    var found: i32 = 0
+    var i: i32 = 0
+    let count: i32 = pci_get_device_count()
+    while i < count
+        let dev: *PciDevice = pci_get_device(i)
+        if dev != 0 as *PciDevice
+            # NVMe: Class 01h (Storage), Subclass 08h (NVM), Prog-IF 02h (NVMe)
+            if (*dev).class_code == 0x01 and (*dev).subclass == 0x08 and (*dev).prog_if == 0x02
+                if found == n
+                    return dev
+                found = found + 1
+        i = i + 1
+    return 0 as *PciDevice
+
+# Count the number of NVMe devices
+pub fn nvme_count_devices() -> i32
+    var count: i32 = 0
+    var i: i32 = 0
+    let total: i32 = pci_get_device_count()
+    while i < total
+        let dev: *PciDevice = pci_get_device(i)
+        if dev != 0 as *PciDevice
+            if (*dev).class_code == 0x01 and (*dev).subclass == 0x08 and (*dev).prog_if == 0x02
+                count = count + 1
+        i = i + 1
+    return count
+
+# ============================================================================
+# Identify Commands
+# ============================================================================
+
+fn identify_controller(ctrl: *NvmeController) -> i32
+    # Allocate buffer for identify data
+    let identify_buf: u64 = pmm_alloc_page()
+    if identify_buf == 0
+        println("[nvme] Failed to allocate identify buffer")
+        return -1
+
+    # Build identify command
+    var cmd: NvmeCommand
+    zero_command(@cmd)
+    cmd.opcode = NVME_ADMIN_IDENTIFY
+    cmd.command_id = alloc_cmd_id(ctrl)
+    cmd.nsid = 0
+    cmd.prp1 = identify_buf
+    cmd.cdw10 = NVME_IDENTIFY_CNS_CTRL as u32
+
+    # Submit and wait
+    let result: i32 = submit_admin_cmd(ctrl, @cmd)
+    if result != 0
+        return result
+
+    # Parse identify data
+    let id: *NvmeIdentifyCtrl = identify_buf as *NvmeIdentifyCtrl
+
+    # Copy serial and model (for debug)
+    var i: i32 = 0
+    while i < 20
+        (*ctrl).serial[i] = (*id).sn[i]
+        i = i + 1
+    i = 0
+    while i < 40
+        (*ctrl).model[i] = (*id).mn[i]
+        i = i + 1
+
+    (*ctrl).num_namespaces = (*id).nn
+    (*ctrl).mdts = (*id).mdts
+
+    prints("[nvme] Model: ")
+    print_trimmed(@(*ctrl).model[0], 40)
+    println("")
+    prints("[nvme] Serial: ")
+    print_trimmed(@(*ctrl).serial[0], 20)
+    println("")
+    prints("[nvme] Namespaces: ")
+    serial_print_dec((*ctrl).num_namespaces as u64)
+    println("")
+
+    return 0
+
+fn identify_namespace(ctrl: *NvmeController, nsid: u32) -> i32
+    let identify_buf: u64 = pmm_alloc_page()
+    if identify_buf == 0
+        return -1
+
+    var cmd: NvmeCommand
+    zero_command(@cmd)
+    cmd.opcode = NVME_ADMIN_IDENTIFY
+    cmd.command_id = alloc_cmd_id(ctrl)
+    cmd.nsid = nsid
+    cmd.prp1 = identify_buf
+    cmd.cdw10 = NVME_IDENTIFY_CNS_NS as u32
+
+    let result: i32 = submit_admin_cmd(ctrl, @cmd)
+    if result != 0
+        return result
+
+    let ns: *NvmeIdentifyNs = identify_buf as *NvmeIdentifyNs
+
+    # Get LBA format
+    let flbas: u8 = (*ns).flbas & 0x0F
+    let lbaf: u32 = (*ns).lbaf[flbas as i32]
+    let lba_shift: u8 = ((lbaf >> LBAF_LBADS_SHIFT) & LBAF_LBADS_MASK) as u8
+
+    nvme_ns.nsid = nsid
+    nvme_ns.block_count = (*ns).nsze
+    nvme_ns.block_size = 1 << (lba_shift as u32)
+
+    prints("[nvme] Namespace ")
+    serial_print_dec(nsid as u64)
+    prints(": ")
+    serial_print_dec(nvme_ns.block_count)
+    prints(" blocks of ")
+    serial_print_dec(nvme_ns.block_size as u64)
+    prints(" bytes (")
+    serial_print_dec((nvme_ns.block_count * nvme_ns.block_size as u64) / (1024 * 1024))
+    prints(" MB)\n")
+
+    return 0
+
+# ============================================================================
+# I/O Queue Creation
+# ============================================================================
+
+fn create_io_queues(ctrl: *NvmeController) -> i32
+    # Respect controller's maximum queue size
+    # Amazon EBS reports MQES=32, so we must not exceed that
+    var io_queue_size: u16 = IO_QUEUE_SIZE
+    if io_queue_size > (*ctrl).max_queue_entries
+        io_queue_size = (*ctrl).max_queue_entries
+
+    prints("[nvme] Creating I/O queues with ")
+    serial_print_dec(io_queue_size as u64)
+    prints(" entries\n")
+
+    # Create I/O completion queue (must be created before submission queue)
+    (*ctrl).io_cq = nvme_alloc_cq(1, io_queue_size, (*ctrl).doorbell_stride)
+    if (*ctrl).io_cq == 0 as *NvmeCompletionQueue
+        println("[nvme] Failed to allocate I/O CQ")
+        return -1
+
+    # Send Create I/O Completion Queue command
+    var cmd: NvmeCommand
+    zero_command(@cmd)
+    cmd.opcode = NVME_ADMIN_CREATE_CQ
+    cmd.command_id = alloc_cmd_id(ctrl)
+    cmd.prp1 = (*(*ctrl).io_cq).phys_addr
+    cmd.cdw10 = ((io_queue_size - 1) as u32) << 16 | 1  # QID=1, QSIZE
+    cmd.cdw11 = 1  # Physically contiguous, interrupts enabled
+
+    if submit_admin_cmd(ctrl, @cmd) != 0
+        println("[nvme] Create I/O CQ failed")
+        return -2
+
+    # Create I/O submission queue
+    (*ctrl).io_sq = nvme_alloc_sq(1, io_queue_size, (*ctrl).doorbell_stride, 1)
+    if (*ctrl).io_sq == 0 as *NvmeSubmissionQueue
+        println("[nvme] Failed to allocate I/O SQ")
+        return -3
+
+    # Send Create I/O Submission Queue command
+    zero_command(@cmd)
+    cmd.opcode = NVME_ADMIN_CREATE_SQ
+    cmd.command_id = alloc_cmd_id(ctrl)
+    cmd.prp1 = (*(*ctrl).io_sq).phys_addr
+    cmd.cdw10 = ((io_queue_size - 1) as u32) << 16 | 1  # QID=1, QSIZE
+    cmd.cdw11 = (1 << 16) | 1  # CQID=1, Physically contiguous
+
+    if submit_admin_cmd(ctrl, @cmd) != 0
+        println("[nvme] Create I/O SQ failed")
+        return -4
+
+    println("[nvme] I/O queues created")
+    return 0
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+fn zero_command(cmd: *NvmeCommand)
+    var i: i32 = 0
+    while i < 64
+        *((cmd as u64 + i as u64) as *u8) = 0
+        i = i + 1
+
+fn print_trimmed(buf: *u8, max_len: i32)
+    # Print string, trimming trailing spaces
+    var end: i32 = max_len - 1
+    while end >= 0 and (*(buf + end as i64) == 0x20 or *(buf + end as i64) == 0)
+        end = end - 1
+
+    var i: i32 = 0
+    while i <= end
+        let c: u8 = *(buf + i as i64)
+        if c >= 0x20 and c < 0x7F
+            prints(StrView { ptr: buf + i as i64, len: 1 })
+        i = i + 1
+
+# ============================================================================
+# Public API
+# ============================================================================
+
+pub fn nvme_get_controller() -> *NvmeController
+    return nvme_ctrl
+
+pub fn nvme_get_namespace() -> *NvmeNamespace
+    if nvme_ctrl == 0 as *NvmeController
+        return 0 as *NvmeNamespace
+    return @nvme_ns
+
+pub fn nvme_get_block_count() -> u64
+    return nvme_ns.block_count
+
+pub fn nvme_get_block_size() -> u32
+    return nvme_ns.block_size

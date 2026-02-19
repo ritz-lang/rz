@@ -1,7 +1,10 @@
 # Initramfs Loader
 #
-# Loads the initial filesystem from a TAR archive on the VirtIO block device.
+# Loads the initial filesystem from a TAR archive on a block device.
 # This is required for boot - if the initramfs cannot be loaded, the kernel panics.
+#
+# Uses the block device abstraction layer to support both VirtIO (QEMU)
+# and NVMe (EC2/bare metal) block devices.
 #
 # The TAR archive contains:
 #   /bin/init        - First userspace process (ELF)
@@ -14,7 +17,7 @@ import io { halt_loop }
 import fs.knamespace { KNamespace, knamespace_get, knamespace_mkdir, knamespace_write, KNS_OK, KNS_NOT_FOUND, KNS_OUT_OF_SPACE }
 import fs.kpath { strview_from_ptr }
 import fs.tar { TarEntry, TAR_ENTRY_SIZE, TAR_BLOCK_SIZE, TAR_TYPE_FILE, TAR_TYPE_FILE_ALT, TAR_TYPE_DIRECTORY, tar_parse_header, tar_data_blocks }
-import drivers.virtio.blk { VirtioBlkDevice, virtio_blk_get_device, virtio_blk_read }
+import drivers.blkdev { BlockDevice, blkdev_get_root, blkdev_read, blkdev_type_name }
 import mm.heap { kalloc, kfree }
 
 # ============================================================================
@@ -32,7 +35,7 @@ const READ_BUFFER_SIZE: u64 = 3584   # 7 * 512
 # Public API
 # ============================================================================
 
-# Load the initramfs from VirtIO disk.
+# Load the initramfs from block device.
 # Panics if the initramfs cannot be loaded - this is a fatal boot error.
 pub fn initramfs_load() -> i32
     let result: i32 = initramfs_load_from_disk()
@@ -42,20 +45,20 @@ pub fn initramfs_load() -> i32
         serial_print_dec(result as u64)
         prints("\n" as StrView)
         prints("    Cannot continue without root filesystem.\n" as StrView)
-        prints("    Ensure VirtIO disk with TAR initramfs is attached.\n\n" as StrView)
+        prints("    Ensure block device with TAR initramfs is attached.\n\n" as StrView)
         halt_loop()
     result
 
 # ============================================================================
-# Load from VirtIO Disk
+# Load from Block Device
 # ============================================================================
 
-# Load initramfs from the first VirtIO block device
+# Load initramfs from the root block device
 # The disk contains a raw TAR archive (no partition table)
 fn initramfs_load_from_disk() -> i32
-    let dev: *VirtioBlkDevice = virtio_blk_get_device()
-    if dev == 0 as *VirtioBlkDevice
-        prints("[initramfs] No VirtIO block device\n" as StrView)
+    let dev: *BlockDevice = blkdev_get_root()
+    if dev == 0 as *BlockDevice
+        prints("[initramfs] No block device available\n" as StrView)
         return -1
 
     let ns: *KNamespace = knamespace_get()
@@ -63,7 +66,16 @@ fn initramfs_load_from_disk() -> i32
         prints("[initramfs] No namespace\n" as StrView)
         return -2
 
-    prints("[initramfs] Loading from VirtIO disk...\n" as StrView)
+    prints("[initramfs] Loading from " as StrView)
+    # Print device type
+    let type_name: *u8 = blkdev_type_name(dev)
+    var i: i64 = 0
+    while *(type_name + i) != 0
+        let c: u8 = *(type_name + i)
+        if c >= 0x20 and c < 0x7F
+            prints(StrView { ptr: type_name + i, len: 1 })
+        i = i + 1
+    prints(" disk...\n" as StrView)
 
     # Allocate read buffer
     let read_buf: *u8 = kalloc(READ_BUFFER_SIZE) as *u8
@@ -78,7 +90,7 @@ fn initramfs_load_from_disk() -> i32
     # Read loop - process TAR entries
     while empty_blocks < 2
         # Read one TAR header block (512 bytes = 1 sector)
-        let result: i32 = virtio_blk_read(dev, sector, 1, read_buf)
+        let result: i32 = blkdev_read(dev, sector, 1, read_buf)
         if result != 0
             prints("[initramfs] Read error at sector " as StrView)
             serial_print_dec(sector)
@@ -172,7 +184,7 @@ fn tar_to_absolute_path(tar_path: *StrView, out_buf: *u8, max_len: i64) -> i64
     i + 1
 
 # Load a file's data from TAR archive
-fn load_file_from_tar(dev: *VirtioBlkDevice, ns: *KNamespace, entry: *TarEntry, data_sector: u64) -> i32
+fn load_file_from_tar(dev: *BlockDevice, ns: *KNamespace, entry: *TarEntry, data_sector: u64) -> i32
     let size: u64 = (*entry).size
 
     # Convert TAR path to absolute path
@@ -191,7 +203,7 @@ fn load_file_from_tar(dev: *VirtioBlkDevice, ns: *KNamespace, entry: *TarEntry, 
         return knamespace_write(ns, @abs_path, @empty as *u8, 0)
 
     # Allocate buffer for file contents - round up to sector boundary
-    # because virtio_blk_read copies whole sectors (512 bytes)
+    # because blkdev_read copies whole sectors (512 bytes)
     var alloc_size: u64 = ((size + 511) / 512) * 512
     if alloc_size == 0
         alloc_size = 512
@@ -215,10 +227,10 @@ fn load_file_from_tar(dev: *VirtioBlkDevice, ns: *KNamespace, entry: *TarEntry, 
             if sectors_to_read == 0
                 sectors_to_read = 1
 
-        # Read sectors
-        let result: i32 = virtio_blk_read(dev, current_sector, sectors_to_read, file_buf + bytes_read as i64)
+        # Read sectors via block device abstraction
+        let result: i32 = blkdev_read(dev, current_sector, sectors_to_read, file_buf + bytes_read as i64)
         if result != 0
-            prints("[initramfs] VirtIO read error at sector " as StrView)
+            prints("[initramfs] Block read error at sector " as StrView)
             serial_print_dec(current_sector)
             prints(" result=" as StrView)
             serial_print_dec(result as u64)
