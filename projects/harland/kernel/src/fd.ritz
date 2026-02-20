@@ -1,0 +1,203 @@
+# File Descriptor Table
+#
+# Provides fd allocation/free/get/dup over an explicit table.
+# Harland currently uses a bootstrap table during early boot and can
+# switch to per-process tables once process state is initialized.
+
+pub const MAX_FDS: i32 = 64
+
+pub const FD_KIND_NONE: u8 = 0
+pub const FD_KIND_FILE: u8 = 1
+pub const FD_KIND_DIRECTORY: u8 = 2
+pub const FD_KIND_SOCKET: u8 = 3
+pub const FD_KIND_PIPE: u8 = 4
+pub const FD_KIND_STDIO: u8 = 5
+
+const FD_ERR_BADF: i32 = -9
+const FD_ERR_NFILE: i32 = -23
+
+pub struct FileDescriptor
+    kind: u8
+    flags: u32
+    position: u64
+    path_hash: u64
+    target_fd: i32
+    used: u8
+
+pub struct FdTable
+    fds: [64]FileDescriptor
+    ref_counts: [64]i32
+    initialized: u8
+
+var bootstrap_fds: FdTable
+
+fn fd_slot(table: *FdTable, fd: i32) -> *FileDescriptor
+    return @(*table).fds[fd]
+
+fn fd_ref_slot(table: *FdTable, fd: i32) -> *i32
+    return @(*table).ref_counts[fd]
+
+fn fd_slot_clear(slot: *FileDescriptor)
+    (*slot).used = 0
+    (*slot).kind = FD_KIND_NONE
+    (*slot).flags = 0
+    (*slot).position = 0
+    (*slot).path_hash = 0
+    (*slot).target_fd = -1
+
+pub fn fd_bootstrap_table() -> *FdTable
+    return @bootstrap_fds
+
+pub fn fd_table_init(table: *FdTable) -> i32
+    if table == 0 as *FdTable
+        return FD_ERR_BADF
+
+    var i: i32 = 0
+    while i < MAX_FDS
+        let slot: *FileDescriptor = fd_slot(table, i)
+        fd_slot_clear(slot)
+        *fd_ref_slot(table, i) = 0
+        i = i + 1
+
+    # Reserve stdin/stdout/stderr.
+    let stdin_slot: *FileDescriptor = fd_slot(table, 0)
+    let stdout_slot: *FileDescriptor = fd_slot(table, 1)
+    let stderr_slot: *FileDescriptor = fd_slot(table, 2)
+    (*stdin_slot).kind = FD_KIND_STDIO
+    (*stdout_slot).kind = FD_KIND_STDIO
+    (*stderr_slot).kind = FD_KIND_STDIO
+    (*stdin_slot).used = 1
+    (*stdout_slot).used = 1
+    (*stderr_slot).used = 1
+    (*stdin_slot).target_fd = 0
+    (*stdout_slot).target_fd = 1
+    (*stderr_slot).target_fd = 2
+    *fd_ref_slot(table, 0) = 1
+    *fd_ref_slot(table, 1) = 1
+    *fd_ref_slot(table, 2) = 1
+    (*table).initialized = 1
+    return 0
+
+pub fn fd_alloc(table: *FdTable) -> i32
+    if table == 0 as *FdTable
+        return FD_ERR_BADF
+    if (*table).initialized == 0
+        fd_table_init(table)
+
+    var i: i32 = 3
+    while i < MAX_FDS
+        let slot: *FileDescriptor = fd_slot(table, i)
+        if (*slot).used == 0
+            (*slot).used = 1
+            (*slot).kind = FD_KIND_FILE
+            (*slot).flags = 0
+            (*slot).position = 0
+            (*slot).path_hash = 0
+            (*slot).target_fd = i
+            *fd_ref_slot(table, i) = 1
+            return i
+        i = i + 1
+
+    return FD_ERR_NFILE
+
+pub fn fd_free(table: *FdTable, fd: i32) -> i32
+    if table == 0 as *FdTable
+        return FD_ERR_BADF
+    if fd < 3 or fd >= MAX_FDS
+        return FD_ERR_BADF
+    let slot: *FileDescriptor = fd_slot(table, fd)
+    if (*slot).used == 0
+        return FD_ERR_BADF
+
+    let owner_fd: i32 = (*slot).target_fd
+    if owner_fd < 0 or owner_fd >= MAX_FDS
+        return FD_ERR_BADF
+    let owner_slot: *FileDescriptor = fd_slot(table, owner_fd)
+    if (*owner_slot).used == 0
+        return FD_ERR_BADF
+
+    let owner_ref: *i32 = fd_ref_slot(table, owner_fd)
+    *owner_ref = *owner_ref - 1
+    # Closing a duplicate handle.
+    if owner_fd != fd
+        fd_slot_clear(slot)
+
+        if *owner_ref <= 0
+            fd_slot_clear(owner_slot)
+            *owner_ref = 0
+        return 0
+
+    # Closing the canonical owner handle.
+    if *owner_ref > 0
+        var new_owner: i32 = -1
+        var i: i32 = 3
+        while i < MAX_FDS
+            let cand: *FileDescriptor = fd_slot(table, i)
+            if i != fd and (*cand).used != 0 and (*cand).target_fd == owner_fd
+                new_owner = i
+                break
+            i = i + 1
+
+        if new_owner < 0
+            return FD_ERR_BADF
+
+        let new_owner_slot: *FileDescriptor = fd_slot(table, new_owner)
+        (*new_owner_slot).kind = (*owner_slot).kind
+        (*new_owner_slot).flags = (*owner_slot).flags
+        (*new_owner_slot).position = (*owner_slot).position
+        (*new_owner_slot).path_hash = (*owner_slot).path_hash
+        (*new_owner_slot).target_fd = new_owner
+
+        let new_ref_count: i32 = *owner_ref
+        *fd_ref_slot(table, new_owner) = new_ref_count
+        *owner_ref = 0
+
+        var j: i32 = 3
+        while j < MAX_FDS
+            let alias: *FileDescriptor = fd_slot(table, j)
+            if (*alias).used != 0 and (*alias).target_fd == owner_fd
+                (*alias).target_fd = new_owner
+            j = j + 1
+
+        fd_slot_clear(slot)
+        return 0
+
+    fd_slot_clear(slot)
+    *owner_ref = 0
+    return 0
+
+pub fn fd_get(table: *FdTable, fd: i32) -> *FileDescriptor
+    if table == 0 as *FdTable
+        return 0 as *FileDescriptor
+    if fd < 0 or fd >= MAX_FDS
+        return 0 as *FileDescriptor
+    let slot: *FileDescriptor = fd_slot(table, fd)
+    let owner_fd: i32 = (*slot).target_fd
+    if owner_fd < 0 or owner_fd >= MAX_FDS
+        return 0 as *FileDescriptor
+    let owner_slot: *FileDescriptor = fd_slot(table, owner_fd)
+    if (*owner_slot).used == 0
+        return 0 as *FileDescriptor
+    return owner_slot
+
+pub fn fd_dup(table: *FdTable, old_fd: i32) -> i32
+    let old_desc: *FileDescriptor = fd_get(table, old_fd)
+    if old_desc == 0 as *FileDescriptor
+        return FD_ERR_BADF
+
+    let new_fd: i32 = fd_alloc(table)
+    if new_fd < 0
+        return new_fd
+
+    let old_slot: *FileDescriptor = fd_slot(table, old_fd)
+    let new_slot: *FileDescriptor = fd_slot(table, new_fd)
+    let owner_fd: i32 = (*old_slot).target_fd
+    (*new_slot).kind = (*old_desc).kind
+    (*new_slot).flags = (*old_desc).flags
+    (*new_slot).position = (*old_desc).position
+    (*new_slot).path_hash = (*old_desc).path_hash
+    (*new_slot).target_fd = owner_fd
+    (*new_slot).used = 1
+    *fd_ref_slot(table, owner_fd) = *fd_ref_slot(table, owner_fd) + 1
+    *fd_ref_slot(table, new_fd) = 0
+    return new_fd

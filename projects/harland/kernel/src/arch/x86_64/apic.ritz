@@ -1,0 +1,368 @@
+# Harland Microkernel - APIC (Advanced Programmable Interrupt Controller)
+#
+# Local APIC, I/O APIC, PIC remap/disable, and AP bootstrap flow.
+
+import io { outb, inb }
+import serial { prints, serial_print_dec, serial_print_hex }
+import mm.vmm { vmm_pml4_phys, vmm_map_page, PTE_WRITABLE, PTE_CACHE_DISABLE }
+import mm.pmm { Mb2BootInfo, HarlandBootInfo }
+import drivers.acpi.tables { acpi_init_with_mb, acpi_init_from_bootinfo, local_apic_addr, io_apic_addr, num_cpus, cpu_apic_ids }
+
+# ============================================================================
+# PIC (Programmable Interrupt Controller) - Remap to vectors 32-47
+# ============================================================================
+
+pub fn pic_remap() -> i32
+    # Save masks
+    let mask1: u8 = inb(0x21)
+    let mask2: u8 = inb(0xA1)
+
+    # Start initialization sequence
+    outb(0x20, 0x11)  # ICW1: init + ICW4 needed
+    outb(0xA0, 0x11)
+
+    # ICW2: Vector offsets
+    outb(0x21, 0x20)  # PIC1 starts at vector 32
+    outb(0xA1, 0x28)  # PIC2 starts at vector 40
+
+    # ICW3: Cascade configuration
+    outb(0x21, 0x04)  # PIC1: slave on IRQ2
+    outb(0xA1, 0x02)  # PIC2: cascade identity
+
+    # ICW4: 8086 mode
+    outb(0x21, 0x01)
+    outb(0xA1, 0x01)
+
+    # Restore masks (mask all for now)
+    outb(0x21, 0xFF)
+    outb(0xA1, 0xFF)
+
+    return 0
+
+# ============================================================================
+# Local APIC
+# ============================================================================
+
+const LAPIC_ID: u64 = 0x020          # APIC ID
+const LAPIC_VERSION: u64 = 0x030     # Version
+const LAPIC_TPR: u64 = 0x080         # Task Priority Register
+const LAPIC_EOI: u64 = 0x0B0         # End of Interrupt
+const LAPIC_SVR: u64 = 0x0F0         # Spurious Interrupt Vector
+const LAPIC_ESR: u64 = 0x280         # Error Status
+const LAPIC_ICR_LO: u64 = 0x300      # Interrupt Command (low 32 bits)
+const LAPIC_ICR_HI: u64 = 0x310      # Interrupt Command (high 32 bits)
+const LAPIC_TIMER: u64 = 0x320       # Timer LVT
+const LAPIC_THERMAL: u64 = 0x330     # Thermal LVT
+const LAPIC_PERFCNT: u64 = 0x340     # Performance Counter LVT
+const LAPIC_LINT0: u64 = 0x350       # LINT0 LVT
+const LAPIC_LINT1: u64 = 0x360       # LINT1 LVT
+const LAPIC_ERROR: u64 = 0x370       # Error LVT
+
+const LAPIC_SVR_ENABLE: u32 = 0x100  # Bit 8: Enable APIC
+const LAPIC_SPURIOUS_VEC: u32 = 0xFF # Spurious vector (255)
+
+fn lapic_read(offset: u64) -> u32
+    let addr: *u32 = (local_apic_addr + offset) as *u32
+    return *addr
+
+pub fn lapic_write(offset: u64, value: u32) -> i32
+    let addr: *u32 = (local_apic_addr + offset) as *u32
+    *addr = value
+    return 0
+
+pub fn lapic_id() -> u32
+    return lapic_read(LAPIC_ID) >> 24
+
+pub fn lapic_eoi() -> i32
+    lapic_write(LAPIC_EOI, 0)
+    return 0
+
+fn lapic_init() -> i32
+    lapic_write(LAPIC_SVR, LAPIC_SVR_ENABLE | LAPIC_SPURIOUS_VEC)
+    lapic_write(LAPIC_TPR, 0)
+    lapic_write(LAPIC_ESR, 0)
+    lapic_write(LAPIC_ESR, 0)
+    lapic_write(LAPIC_EOI, 0)
+    lapic_write(LAPIC_TIMER, 0x10000)  # Masked
+    lapic_write(LAPIC_THERMAL, 0x10000)
+    lapic_write(LAPIC_PERFCNT, 0x10000)
+    lapic_write(LAPIC_LINT0, 0x08700)   # ExtINT, unmasked
+    lapic_write(LAPIC_LINT1, 0x00400)   # NMI
+    lapic_write(LAPIC_ERROR, 0x10000)
+    lapic_write(LAPIC_ESR, 0)
+
+    prints("      LAPIC ID: ")
+    serial_print_dec(lapic_id() as u64)
+    prints(", Version: ")
+    serial_print_hex(lapic_read(LAPIC_VERSION) as u64)
+    prints("\n")
+
+    return 0
+
+# ============================================================================
+# I/O APIC
+# ============================================================================
+
+const IOAPIC_WINDOW: u64 = 0x10
+const IOAPIC_VER: u8 = 0x01
+const IOAPIC_REDTBL: u8 = 0x10
+
+fn ioapic_read(reg: u8) -> u32
+    let regsel: *u32 = io_apic_addr as *u32
+    let window: *u32 = (io_apic_addr + IOAPIC_WINDOW) as *u32
+    *regsel = reg as u32
+    return *window
+
+fn ioapic_write(reg: u8, value: u32) -> i32
+    let regsel: *u32 = io_apic_addr as *u32
+    let window: *u32 = (io_apic_addr + IOAPIC_WINDOW) as *u32
+    *regsel = reg as u32
+    *window = value
+    return 0
+
+fn ioapic_set_irq(irq: u8, vector: u8, dest_apic: u8, masked: bool) -> i32
+    let reg_lo: u8 = IOAPIC_REDTBL + irq * 2
+    let reg_hi: u8 = IOAPIC_REDTBL + irq * 2 + 1
+    ioapic_write(reg_hi, (dest_apic as u32) << 24)
+
+    var value: u32 = vector as u32
+    if masked
+        value = value | 0x10000
+    ioapic_write(reg_lo, value)
+    return 0
+
+fn ioapic_init() -> i32
+    if io_apic_addr == 0
+        prints("      No I/O APIC!\n")
+        return -1
+
+    let version: u32 = ioapic_read(IOAPIC_VER)
+    let max_irqs: u32 = ((version >> 16) & 0xFF) + 1
+
+    prints("      I/O APIC version: ")
+    serial_print_hex((version & 0xFF) as u64)
+    prints(", max IRQs: ")
+    serial_print_dec(max_irqs as u64)
+    prints("\n")
+
+    var i: u8 = 0
+    while i < max_irqs as u8
+        ioapic_set_irq(i, 32 + i, 0, true)
+        i = i + 1
+
+    ioapic_set_irq(1, 33, 0, false)
+    ioapic_set_irq(4, 36, 0, false)
+    return 0
+
+fn pic_disable() -> i32
+    outb(0xA1, 0xFF)
+    outb(0x21, 0xFF)
+    return 0
+
+# ============================================================================
+# AP (Application Processor) Bootstrap
+# ============================================================================
+
+var ap_started: [16]u8
+var ap_stacks: [16][4096]u8
+var ap_count: u32 = 0
+var bsp_apic_id: u8 = 0
+
+pub fn get_ap_stack_top(cpu_idx: i32) -> u64
+    return (@ap_stacks[(cpu_idx - 1) as i32][0] as u64) + 4096
+
+const AP_TRAMPOLINE_ADDR: u64 = 0x8000
+
+extern fn ap_trampoline_start() -> i32
+extern fn ap_trampoline_end() -> i32
+
+const IPI_DELIVERY_INIT: u8 = 5
+const IPI_DELIVERY_SIPI: u8 = 6
+
+fn lapic_send_ipi(dest_apic: u8, vector: u8, delivery_mode: u8) -> i32
+    while (lapic_read(LAPIC_ICR_LO) & 0x1000) != 0
+        asm x86_64:
+            pause
+
+    lapic_write(LAPIC_ICR_HI, (dest_apic as u32) << 24)
+    let icr_lo: u32 = (vector as u32) | ((delivery_mode as u32) << 8)
+    lapic_write(LAPIC_ICR_LO, icr_lo)
+    return 0
+
+fn delay_us(us: u32) -> i32
+    var i: u32 = 0
+    while i < us * 100
+        asm x86_64:
+            pause
+        i = i + 1
+    return 0
+
+pub fn ap_entry() -> i32
+    let my_apic_id: u32 = lapic_id()
+    lapic_write(LAPIC_SVR, LAPIC_SVR_ENABLE | LAPIC_SPURIOUS_VEC)
+    lapic_write(LAPIC_TPR, 0)
+
+    prints("    AP ")
+    serial_print_dec(my_apic_id as u64)
+    prints(" started!\n")
+
+    ap_started[my_apic_id as i32] = 1
+    ap_count = ap_count + 1
+
+    while true
+        asm x86_64:
+            hlt
+
+    return 0
+
+fn ap_setup_trampoline(ap_index: u32) -> i32
+    let tramp_start: u64 = ap_trampoline_start as u64
+    let tramp_end: u64 = ap_trampoline_end as u64
+    let tramp_size: u64 = tramp_end - tramp_start
+
+    var src: *u8 = tramp_start as *u8
+    var dst: *u8 = AP_TRAMPOLINE_ADDR as *u8
+    var i: u64 = 0
+    while i < tramp_size
+        *(dst + i as i64) = *(src + i as i64)
+        i = i + 1
+
+    let pml4_ptr: *u32 = 0x8FF0 as *u32
+    *pml4_ptr = vmm_pml4_phys as u32
+
+    let stack_ptr: *u64 = 0x8FF8 as *u64
+    let stack_top: u64 = (@ap_stacks[ap_index as i32][0] as u64) + 4096
+    *stack_ptr = stack_top
+
+    let entry_ptr: *u64 = 0x9000 as *u64
+    *entry_ptr = ap_entry as u64
+    return 0
+
+fn ap_boot_one(apic_id: u8, ap_index: u32) -> i32
+    prints("    Booting AP ")
+    serial_print_dec(apic_id as u64)
+    prints("...")
+
+    ap_setup_trampoline(ap_index)
+    lapic_send_ipi(apic_id, 0, IPI_DELIVERY_INIT)
+    delay_us(10000)
+
+    lapic_write(LAPIC_ICR_HI, (apic_id as u32) << 24)
+    lapic_write(LAPIC_ICR_LO, 0x8500)
+    delay_us(200)
+
+    let sipi_vector: u8 = (AP_TRAMPOLINE_ADDR / 4096) as u8
+    lapic_send_ipi(apic_id, sipi_vector, IPI_DELIVERY_SIPI)
+    delay_us(200)
+    lapic_send_ipi(apic_id, sipi_vector, IPI_DELIVERY_SIPI)
+    delay_us(200)
+
+    var timeout: u32 = 1000
+    while ap_started[apic_id as i32] == 0 and timeout > 0
+        delay_us(1000)
+        timeout = timeout - 1
+
+    if ap_started[apic_id as i32] != 0
+        prints(" OK\n")
+        return 0
+    prints(" TIMEOUT\n")
+    return -1
+
+pub fn ap_boot_all() -> i32
+    bsp_apic_id = lapic_id() as u8
+
+    prints("  [..] Boot APs\n")
+    prints("    BSP APIC ID: ")
+    serial_print_dec(bsp_apic_id as u64)
+    prints("\n")
+
+    var i: i32 = 0
+    while i < 16
+        ap_started[i] = 0
+        i = i + 1
+
+    var ap_index: u32 = 0
+    i = 0
+    while i < num_cpus as i32
+        let apic_id: u8 = cpu_apic_ids[i]
+        if apic_id != bsp_apic_id
+            ap_boot_one(apic_id, ap_index)
+            ap_index = ap_index + 1
+        i = i + 1
+
+    prints("  [OK] Boot APs (")
+    serial_print_dec(ap_count as u64)
+    prints(" APs started)\n")
+    return 0
+
+pub fn apic_init_with_mb(mb_info: *Mb2BootInfo) -> i32
+    prints("  [..] ACPI/APIC\n")
+
+    let acpi_result: i32 = acpi_init_with_mb(mb_info)
+    if acpi_result != 0
+        prints("\r  [!!] ACPI/APIC (ACPI not found)\n")
+        return -1
+
+    prints("    Mapping APIC regions...")
+    if local_apic_addr != 0
+        let lapic_result: i32 = vmm_map_page(local_apic_addr, local_apic_addr, PTE_WRITABLE | PTE_CACHE_DISABLE)
+        if lapic_result != 0
+            prints(" LAPIC map failed!\n")
+            return -1
+    if io_apic_addr != 0
+        let ioapic_result: i32 = vmm_map_page(io_apic_addr, io_apic_addr, PTE_WRITABLE | PTE_CACHE_DISABLE)
+        if ioapic_result != 0
+            prints(" IOAPIC map failed!\n")
+            return -1
+    prints(" done\n")
+
+    prints("    Initializing Local APIC...")
+    lapic_init()
+    prints(" done\n")
+
+    prints("    Initializing I/O APIC...")
+    ioapic_init()
+    prints(" done\n")
+
+    prints("    Disabling legacy PIC...")
+    pic_disable()
+    prints(" done\n")
+
+    prints("\r  [OK] ACPI/APIC\n")
+    return 0
+
+pub fn apic_init_from_bootinfo(info: *HarlandBootInfo) -> i32
+    prints("  [..] ACPI/APIC\n")
+
+    let acpi_result: i32 = acpi_init_from_bootinfo(info)
+    if acpi_result != 0
+        prints("\r  [!!] ACPI/APIC (ACPI not found)\n")
+        return -1
+
+    prints("    Mapping APIC regions...")
+    if local_apic_addr != 0
+        let lapic_result: i32 = vmm_map_page(local_apic_addr, local_apic_addr, PTE_WRITABLE | PTE_CACHE_DISABLE)
+        if lapic_result != 0
+            prints(" LAPIC map failed!\n")
+            return -1
+    if io_apic_addr != 0
+        let ioapic_result: i32 = vmm_map_page(io_apic_addr, io_apic_addr, PTE_WRITABLE | PTE_CACHE_DISABLE)
+        if ioapic_result != 0
+            prints(" IOAPIC map failed!\n")
+            return -1
+    prints(" done\n")
+
+    prints("    Initializing Local APIC...")
+    lapic_init()
+    prints(" done\n")
+
+    prints("    Initializing I/O APIC...")
+    ioapic_init()
+    prints(" done\n")
+
+    prints("    Disabling legacy PIC...")
+    pic_disable()
+    prints(" done\n")
+
+    prints("\r  [OK] ACPI/APIC\n")
+    return 0

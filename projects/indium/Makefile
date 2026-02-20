@@ -69,18 +69,19 @@ $(UEFI_DISK): kernel
 	@mkdir -p $(BUILD_DIR)
 	@# Create 64MB FAT disk image
 	dd if=/dev/zero of=$@ bs=1M count=64 2>/dev/null
-	mkfs.vfat $@ >/dev/null
+	@# -I allows filesystem creation on a regular file, not just block devices.
+	mkfs.vfat -F 32 -I $@ >/dev/null
 	@# Create EFI directory structure
-	mmd -i $@ ::/EFI
-	mmd -i $@ ::/EFI/BOOT
-	mmd -i $@ ::/harland
+	MTOOLS_SKIP_CHECK=1 mmd -i $@ ::/EFI
+	MTOOLS_SKIP_CHECK=1 mmd -i $@ ::/EFI/BOOT
+	MTOOLS_SKIP_CHECK=1 mmd -i $@ ::/harland
 	@# Copy bootloader and kernel
-	mcopy -i $@ $(BOOTLOADER) ::/EFI/BOOT/BOOTX64.EFI
-	mcopy -i $@ $(KERNEL_ELF) ::/harland/kernel.elf
+	MTOOLS_SKIP_CHECK=1 mcopy -i $@ $(BOOTLOADER) ::/EFI/BOOT/BOOTX64.EFI
+	MTOOLS_SKIP_CHECK=1 mcopy -i $@ $(KERNEL_ELF) ::/harland/kernel.elf
 	@# Create startup script
 	@echo '@echo -off' > $(BUILD_DIR)/startup.nsh
 	@echo 'FS0:\EFI\BOOT\BOOTX64.EFI' >> $(BUILD_DIR)/startup.nsh
-	mcopy -i $@ $(BUILD_DIR)/startup.nsh ::/startup.nsh
+	MTOOLS_SKIP_CHECK=1 mcopy -i $@ $(BUILD_DIR)/startup.nsh ::/startup.nsh
 	@echo "Created: $@"
 
 # Create EC2-compatible UEFI boot disk with GPT partition table
