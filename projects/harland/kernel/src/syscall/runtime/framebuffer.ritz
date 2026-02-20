@@ -1,0 +1,72 @@
+# Harland Syscall Runtime - Framebuffer
+
+import serial { prints, serial_print_hex, serial_print_dec }
+import mm.pmm { PAGE_SIZE }
+import mm.vmm { PTE_WRITABLE, PTE_USER, PTE_WRITE_THROUGH, vmm_map_page }
+import drivers.display.mod { SimpleFramebuffer, display_available, display_get_framebuffer }
+
+const FBINFO_SIZE: u64 = 24
+
+var g_user_fb_mapped: u8 = 0
+var g_user_fb_addr: u64 = 0
+
+pub fn runtime_fb_info(info_buf: *u8) -> i64
+    if not display_available()
+        return -1
+
+    let fb: *SimpleFramebuffer = display_get_framebuffer()
+    if fb == 0 as *SimpleFramebuffer
+        return -1
+
+    let buf64: *u64 = info_buf as *u64
+    let buf32: *u32 = (info_buf + 8) as *u32
+    let buf8: *u8 = info_buf + 20
+
+    *buf64 = (*fb).base
+    *buf32 = (*fb).width
+    *(buf32 + 1) = (*fb).height
+    *(buf32 + 2) = (*fb).pitch
+    *buf8 = (*fb).bpp
+    *(buf8 + 1) = (*fb).format
+
+    return 0
+
+pub fn runtime_fb_map() -> i64
+    if not display_available()
+        return -1
+
+    let fb: *SimpleFramebuffer = display_get_framebuffer()
+    if fb == 0 as *SimpleFramebuffer
+        return -1
+
+    if g_user_fb_mapped != 0
+        return g_user_fb_addr as i64
+
+    let fb_size: u64 = ((*fb).pitch as u64) * ((*fb).height as u64)
+    let num_pages: u64 = (fb_size + PAGE_SIZE - 1) / PAGE_SIZE
+    let user_fb_virt: u64 = 0x00007F0000000000
+
+    var i: u64 = 0
+    while i < num_pages
+        let phys_addr: u64 = (*fb).base + (i * PAGE_SIZE)
+        let virt_addr: u64 = user_fb_virt + (i * PAGE_SIZE)
+
+        let result: i32 = vmm_map_page(virt_addr, phys_addr, PTE_WRITABLE | PTE_USER | PTE_WRITE_THROUGH)
+        if result != 0
+            prints("[fb_map] Failed to map page ")
+            serial_print_dec(i as i64)
+            prints("\n")
+            return -1
+
+        i = i + 1
+
+    g_user_fb_mapped = 1
+    g_user_fb_addr = user_fb_virt
+
+    prints("[fb_map] Mapped ")
+    serial_print_dec(num_pages as i64)
+    prints(" pages to user address 0x")
+    serial_print_hex(user_fb_virt)
+    prints("\n")
+
+    return user_fb_virt as i64
