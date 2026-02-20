@@ -40,7 +40,7 @@ import fs.initramfs { initramfs_load }
 import fs.persist { PersistBlobStore, persist_init, persist_format, persist_exists, persist_get_size, persist_read, persist_put, persist_sync, persist_count, persist_global_init, persist_get_store }
 import fs.sync { fs_sync_init, fs_sync_all, fs_sync_stats, fs_sync_is_enabled }
 import syscall.dispatch { syscall_handler }
-import syscall.runtime { alloc_user_stack, init_cwd, syscall_init, syscall_runtime_set_init_process }
+import syscall.runtime { init_cwd, syscall_init, syscall_runtime_set_init_process, sys_exec_init_impl }
 
 # Network stack imports
 import drivers.virtio.net { virtio_net_init, virtio_net_send, virtio_net_poll, virtio_net_is_ready, virtio_net_get_mac, VirtioNetDevice, virtio_net_get_device }
@@ -130,6 +130,12 @@ var ring_wrapped: u8 = 0    # Has buffer wrapped around?
 
 # Write a single byte to the ring buffer
 fn ring_write_byte(c: u8) -> i32
+    # Defensive clamp: if some subsystem corrupts ring_head, avoid OOB write
+    # and keep logging alive instead of panicking in the logger itself.
+    if ring_head >= RING_BUFFER_SIZE
+        ring_head = 0
+        ring_wrapped = 1
+
     ring_buffer[ring_head as i32] = c
     ring_head = ring_head + 1
     if ring_head >= RING_BUFFER_SIZE
@@ -285,38 +291,14 @@ fn run_init() -> i32
     serial_print_dec(file_size)
     prints(" bytes\n")
 
-    # Load the ELF at a userspace address
-    let load_base: u64 = 0x100000000  # 4GB
-    let load_result: ElfLoadResult = elf_load(elf_data, file_size, load_base)
-
-    if load_result.error != ELF_OK
-        prints("[init] ELF load failed, error=")
-        serial_print_dec(load_result.error as u64)
-        prints("\n")
-        return -1
-
-    prints("[init] Loaded at entry=0x")
-    serial_print_hex(load_result.entry_point)
-    prints("\n")
-
-    # Allocate 64KB user stack (16 pages)
-    let user_stack_top: u64 = alloc_user_stack()
-    if user_stack_top == 0
-        prints("[init] Failed to allocate user stack!\n")
-        return -1
-
-    # Flush TLB for new mappings
-    vmm_flush_tlb_all()
-
     prints("[init] Starting init process...\n\n")
 
-    # Set up as init process (PID 1)
-    syscall_runtime_set_init_process()
+    # Use syscall runtime exec path (fresh userspace address space).
+    let exec_result: i64 = sys_exec_init_impl(c"/bin/init")
+    if exec_result != 0
+        prints("[init] Failed to execute /bin/init\n")
+        return -1
 
-    # Jump to userspace - this will not return until init exits
-    jump_to_userspace(load_result.entry_point, user_stack_top)
-
-    # Should not reach here - init should call ACPI poweroff
     prints("[init] Init returned unexpectedly\n")
     return 0
 
@@ -526,6 +508,17 @@ pub fn kernel_main(boot_info_addr: u64) -> i32
 
         # Initialize working directory to root
         init_cwd()
+
+        # Initialize syscall interface before launching userspace.
+        klog(c"  [..] Syscall interface")
+        syscall_init()
+        klog(c"\r  [OK] Syscall interface\n")
+
+        # Launch init as soon as filesystem + syscalls are ready. This keeps
+        # boot-to-shell path independent from optional diagnostic subsystems.
+        let early_init_result: i32 = run_init()
+        if early_init_result != 0
+            prints("[kernel] Early init launch failed, continuing diagnostics...\n")
 
         # Initialize second block device (persistent storage)
         klog(c"  [..] Persistent storage")
@@ -810,11 +803,6 @@ pub fn kernel_main(boot_info_addr: u64) -> i32
 
     prints("\nKernel initialized successfully.\n")
 
-    # Initialize syscall interface
-    prints("\n  [..] Syscall interface")
-    syscall_init()
-    prints("\r  [OK] Syscall interface\n")
-
     # PCI already initialized early - just print discovered devices
     prints("\n=== PCI Devices ===\n")
     pci_print_all_devices()
@@ -878,11 +866,10 @@ pub fn kernel_main(boot_info_addr: u64) -> i32
     # Test ELF loader (validates structures and parsing)
     test_elf_loader()
 
-    # Run /bin/init as PID 1 - this runs tests and shuts down
-    # This will not return if init runs correctly
+    # Run /bin/init as PID 1 - retry at end if early launch failed
     let init_result: i32 = run_init()
     if init_result != 0
-        prints("[kernel] Failed to run init!\n")
+        prints("[kernel] Failed to run init (late retry)!\n")
 
     # If init fails, halt
     halt_loop()
