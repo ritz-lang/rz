@@ -217,7 +217,7 @@ fn process(d: Data) -> i32
         assert len(errors) == 0
 
     def test_param_move_then_use(self):
-        """Moving a param then using it should error."""
+        """Const-borrow param can be reused after call."""
         errors = check("""
 struct Data
     x: i32
@@ -229,7 +229,24 @@ fn process(d: Data) -> i32
     consume(d)
     return d.x
 """)
-        # d is moved to consume, then d.x accessed - error
+        # In RERITZ, `d: Data` is a const borrow parameter.
+        # Passing it to another const-borrow parameter does not move ownership.
+        assert len(errors) == 0
+
+    def test_param_explicit_move_then_use(self):
+        """Explicit move param then use should error."""
+        errors = check("""
+struct Data
+    x: i32
+
+fn consume(d:= Data) -> i32
+    return d.x
+
+fn process(d:= Data) -> i32
+    consume(d)
+    return d.x
+""")
+        # d is explicitly moved to consume, then d.x accessed - error
         assert len(errors) == 1
         assert "use of moved value" in str(errors[0])
 
