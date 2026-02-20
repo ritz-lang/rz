@@ -1,0 +1,226 @@
+# Harland Syscall Dispatcher
+#
+# Dispatches syscall numbers to subsystem handlers.
+
+import serial { prints, serial_print_dec, serial_buffer_write, serial_drain_output, serial_poll, serial_buf_read_many }
+import mm.uptr { EFAULT, uptr_check_read, uptr_check_write, uptr_validate_string }
+import fs.syscall { sys_close, sys_fs_read, sys_fs_write, is_fs_fd }
+import ipc.message { Message }
+import ipc.syscall { sys_channel_create, sys_ipc_send, sys_ipc_recv, sys_ipc_close }
+import cap.types { CapInfo }
+import cap.syscall { sys_cap_grant, sys_cap_revoke, sys_cap_derive, sys_cap_info, sys_cap_check }
+import drivers.acpi.tables { acpi_poweroff }
+import drivers.virtio.input { VirtioInputEvent }
+import syscall.numbers {
+    SYS_READ, SYS_WRITE, SYS_OPEN, SYS_CLOSE, SYS_MMAP, SYS_MUNMAP, SYS_READDIR,
+    SYS_EXIT, SYS_SPAWN, SYS_WAIT, SYS_GETPID, SYS_YIELD, SYS_SPAWN_ARGS, SYS_GETCWD, SYS_CHDIR,
+    SYS_IPC_SEND, SYS_IPC_RECV, SYS_IPC_CLOSE, SYS_CHANNEL_CREATE,
+    SYS_CAP_GRANT, SYS_CAP_REVOKE, SYS_CAP_DERIVE, SYS_CAP_INFO, SYS_CAP_CHECK,
+    SYS_INPUT_POLL, SYS_INPUT_READ, SYS_ACPI_POWEROFF, SYS_FB_INFO, SYS_FB_MAP, SYS_DEBUG_PRINT
+}
+
+extern fn current_pid() -> u32
+extern fn syscall_open_safe(path_ptr: *u8, path_len: u64, flags: i32) -> i64
+extern fn sys_readdir_impl(dir_path: *u8, buf: *u8, buf_size: i64) -> i64
+extern fn sys_spawn_impl(path: *u8) -> i64
+extern fn sys_spawn_args_impl(path: *u8, argv: **u8, argc: i32) -> i64
+extern fn sys_wait_impl(pid: i32) -> i64
+extern fn sys_exit_impl(code: i32) -> i64
+extern fn sys_mmap_impl(addr_hint: u64, length: u64, prot: u64, flags: u64) -> i64
+extern fn sys_munmap_impl(addr: u64, length: u64) -> i64
+extern fn sys_getcwd_impl(buf: *u8, size: u64) -> i64
+extern fn sys_chdir_impl(path: *u8) -> i64
+extern fn sys_input_poll_impl() -> i64
+extern fn sys_input_read_impl(event_ptr: *VirtioInputEvent) -> i64
+extern fn sys_fb_info_impl(info_buf: *u8) -> i64
+extern fn sys_fb_map_impl() -> i64
+
+pub fn syscall_handler(rax: u64, rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    if rax == SYS_EXIT
+        return sys_exit_impl(rdi as i32)
+
+    if rax == SYS_OPEN
+        if rsi > 0
+            let path_result: i64 = uptr_check_read(rdi as *u8, rsi as u64)
+            if path_result != 0
+                return EFAULT
+        return syscall_open_safe(rdi as *u8, rsi, rdx as i32)
+
+    if rax == SYS_CLOSE
+        let fd: i32 = rdi as i32
+        if is_fs_fd(fd)
+            return sys_close(fd)
+        return 0
+
+    if rax == SYS_WRITE or rax == SYS_DEBUG_PRINT
+        let fd: i32 = rdi as i32
+        let buf: *u8 = rsi as *u8
+        let len: i64 = rdx as i64
+
+        if len > 0
+            let uptr_result: i64 = uptr_check_read(buf, len as u64)
+            if uptr_result != 0
+                return EFAULT
+
+        if is_fs_fd(fd)
+            return sys_fs_write(fd, buf, len as u64)
+
+        var total_written: i64 = 0
+        while total_written < len
+            let written: i64 = serial_buffer_write(buf + total_written, len - total_written)
+            total_written = total_written + written
+            if total_written < len
+                serial_drain_output()
+
+        return total_written
+
+    if rax == SYS_READ
+        let fd: i32 = rdi as i32
+        let buf: *u8 = rsi as *u8
+        let count: i64 = rdx as i64
+
+        if count > 0
+            let uptr_result: i64 = uptr_check_write(buf, count as u64)
+            if uptr_result != 0
+                return EFAULT
+
+        if is_fs_fd(fd)
+            return sys_fs_read(fd, buf, count as u64)
+
+        if fd != 0
+            return -1
+
+        serial_poll()
+        return serial_buf_read_many(buf, count)
+
+    if rax == SYS_YIELD
+        return 0
+
+    if rax == SYS_GETPID
+        return current_pid() as i64
+
+    if rax == SYS_READDIR
+        let path_result: i64 = uptr_validate_string(rdi as *u8, 4096)
+        if path_result < 0
+            return EFAULT
+        if rdx > 0
+            let buf_result: i64 = uptr_check_write(rsi as *u8, rdx as u64)
+            if buf_result != 0
+                return EFAULT
+        return sys_readdir_impl(rdi as *u8, rsi as *u8, rdx as i64)
+
+    if rax == SYS_SPAWN
+        let path_result: i64 = uptr_validate_string(rdi as *u8, 4096)
+        if path_result < 0
+            return EFAULT
+        return sys_spawn_impl(rdi as *u8)
+
+    if rax == SYS_SPAWN_ARGS
+        let path_result: i64 = uptr_validate_string(rdi as *u8, 4096)
+        if path_result < 0
+            return EFAULT
+        let argc: i32 = rdx as i32
+        if argc > 0
+            let argv_size: u64 = (argc as u64) * 8
+            let argv_result: i64 = uptr_check_read(rsi as *u8, argv_size)
+            if argv_result != 0
+                return EFAULT
+            var i: i32 = 0
+            let argv: **u8 = rsi as **u8
+            while i < argc
+                let arg: *u8 = *(argv + i)
+                let arg_result: i64 = uptr_validate_string(arg, 4096)
+                if arg_result < 0
+                    return EFAULT
+                i = i + 1
+        return sys_spawn_args_impl(rdi as *u8, rsi as **u8, rdx as i32)
+
+    if rax == SYS_WAIT
+        return sys_wait_impl(rdi as i32)
+
+    if rax == SYS_CHANNEL_CREATE
+        return sys_channel_create(current_pid())
+
+    if rax == SYS_IPC_SEND
+        let msg_result: i64 = uptr_check_read(rsi as *u8, 4096)
+        if msg_result != 0
+            return EFAULT
+        return sys_ipc_send(current_pid(), rdi as i32, rsi as *Message)
+
+    if rax == SYS_IPC_RECV
+        let msg_result: i64 = uptr_check_write(rsi as *u8, 4096)
+        if msg_result != 0
+            return EFAULT
+        if rdx != 0
+            let sender_result: i64 = uptr_check_write(rdx as *u8, 4)
+            if sender_result != 0
+                return EFAULT
+        return sys_ipc_recv(current_pid(), rdi as i32, rsi as *Message, rdx as *u32)
+
+    if rax == SYS_IPC_CLOSE
+        return sys_ipc_close(current_pid(), rdi as i32)
+
+    if rax == SYS_CAP_GRANT
+        return sys_cap_grant(current_pid(), rdi, rsi as u32, rdx as u32)
+
+    if rax == SYS_CAP_REVOKE
+        return sys_cap_revoke(current_pid(), rdi)
+
+    if rax == SYS_CAP_DERIVE
+        return sys_cap_derive(current_pid(), rdi, rsi as u32)
+
+    if rax == SYS_CAP_INFO
+        let info_result: i64 = uptr_check_write(rsi as *u8, 16)
+        if info_result != 0
+            return EFAULT
+        return sys_cap_info(current_pid(), rdi, rsi as *CapInfo)
+
+    if rax == SYS_CAP_CHECK
+        return sys_cap_check(current_pid(), rdi, rsi as u32)
+
+    if rax == SYS_MMAP
+        return sys_mmap_impl(rdi, rsi, rdx, r10)
+
+    if rax == SYS_MUNMAP
+        return sys_munmap_impl(rdi, rsi)
+
+    if rax == SYS_GETCWD
+        if rsi > 0
+            let buf_result: i64 = uptr_check_write(rdi as *u8, rsi as u64)
+            if buf_result != 0
+                return EFAULT
+        return sys_getcwd_impl(rdi as *u8, rsi)
+
+    if rax == SYS_CHDIR
+        let path_result: i64 = uptr_validate_string(rdi as *u8, 4096)
+        if path_result < 0
+            return EFAULT
+        return sys_chdir_impl(rdi as *u8)
+
+    if rax == SYS_INPUT_POLL
+        return sys_input_poll_impl()
+
+    if rax == SYS_INPUT_READ
+        let event_result: i64 = uptr_check_write(rdi as *u8, 8)
+        if event_result != 0
+            return EFAULT
+        return sys_input_read_impl(rdi as *VirtioInputEvent)
+
+    if rax == SYS_ACPI_POWEROFF
+        prints("[syscall] ACPI poweroff requested\n")
+        let result: i32 = acpi_poweroff()
+        return result as i64
+
+    if rax == SYS_FB_INFO
+        let info_result: i64 = uptr_check_write(rdi as *u8, 24)
+        if info_result != 0
+            return EFAULT
+        return sys_fb_info_impl(rdi as *u8)
+
+    if rax == SYS_FB_MAP
+        return sys_fb_map_impl()
+
+    prints("[syscall] unknown: ")
+    serial_print_dec(rax)
+    prints("\n")
+    return -1

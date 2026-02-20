@@ -39,6 +39,7 @@ import fs.syscall { fs_syscall_init, sys_open, sys_close, sys_fs_read, sys_fs_wr
 import fs.initramfs { initramfs_load }
 import fs.persist { PersistBlobStore, persist_init, persist_format, persist_exists, persist_get_size, persist_read, persist_put, persist_sync, persist_count, persist_global_init, persist_get_store }
 import fs.sync { fs_sync_init, fs_sync_all, fs_sync_stats, fs_sync_is_enabled }
+import syscall.dispatch { syscall_handler }
 
 # Network stack imports
 import drivers.virtio.net { virtio_net_init, virtio_net_send, virtio_net_poll, virtio_net_is_ready, virtio_net_get_mac, VirtioNetDevice, virtio_net_get_device }
@@ -358,8 +359,18 @@ extern fn get_syscall_user_rflags() -> u64
 
 # Get current process ID (for syscalls that need caller PID)
 # This returns the actual running process PID, not hardcoded 1
-fn current_pid() -> u32
+pub fn current_pid() -> u32
     return g_child_pid as u32
+
+# SYS_OPEN wrapper that preserves process globals around sys_open().
+# Keeps the compiler workaround localized and reusable by dispatcher module.
+pub fn syscall_open_safe(path_ptr: *u8, path_len: u64, flags: i32) -> i64
+    let saved_child_pid: u64 = g_child_pid
+    let saved_has_parent: u8 = g_has_parent
+    let result: i64 = sys_open(path_ptr, path_len, flags)
+    g_child_pid = saved_child_pid
+    g_has_parent = saved_has_parent
+    return result
 
 # ============================================================================
 # New Syscall Implementations
@@ -376,7 +387,7 @@ fn syscall_strlen(s: *u8) -> i64
 
 # sys_readdir: List directory contents
 # Returns bytes written to buffer as null-terminated strings
-fn sys_readdir_impl(dir_path: *u8, buf: *u8, buf_size: i64) -> i64
+pub fn sys_readdir_impl(dir_path: *u8, buf: *u8, buf_size: i64) -> i64
     let ns: *KNamespace = knamespace_get()
     if ns == 0 as *KNamespace
         return -1
@@ -493,7 +504,7 @@ fn free_user_stack()
 # ISOLATION: Each child process gets its own page table (CR3), providing
 # full memory isolation from the parent. The child cannot read or write
 # the parent's user-space memory.
-fn sys_spawn_impl(path: *u8) -> i64
+pub fn sys_spawn_impl(path: *u8) -> i64
     # Look up the file in the namespace
     let ns: *KNamespace = knamespace_get()
     if ns == 0 as *KNamespace
@@ -579,7 +590,7 @@ fn sys_spawn_impl(path: *u8) -> i64
 #   argc: Number of arguments
 #
 # The child's main() receives: fn main(argc: i32, argv: **u8) -> i32
-fn sys_spawn_args_impl(path: *u8, argv: **u8, argc: i32) -> i64
+pub fn sys_spawn_args_impl(path: *u8, argv: **u8, argc: i32) -> i64
     prints("[spawn_args] spawn_args(")
     prints_str(path)
     prints(", argc=")
@@ -765,7 +776,7 @@ fn sys_spawn_args_impl(path: *u8, argv: **u8, argc: i32) -> i64
 # sys_exit: Exit the current process
 # If we're a child (spawned by blocking spawn), restore parent and return
 # with the exit code. Otherwise, halt the system.
-fn sys_exit_impl(code: i32) -> i64
+pub fn sys_exit_impl(code: i32) -> i64
     if g_has_parent != 0
         # We're a child! Restore parent context
         # Save exit code for sys_wait
@@ -802,7 +813,7 @@ fn sys_exit_impl(code: i32) -> i64
 # sys_wait: Wait for a child process to exit
 # For blocking spawn, the child has already exited by the time spawn returns.
 # This can be used to get the exit code if needed.
-fn sys_wait_impl(pid: i32) -> i64
+pub fn sys_wait_impl(pid: i32) -> i64
     # For blocking spawn, the exit code is already available
     if g_child_pid == 2
         let code: i64 = g_child_exit_code
@@ -828,7 +839,7 @@ fn sys_wait_impl(pid: i32) -> i64
 #   Address of mapped region, or -1 on error
 #
 # Note: We only support anonymous private mappings for now.
-fn sys_mmap_impl(addr_hint: u64, length: u64, prot: u64, flags: u64) -> i64
+pub fn sys_mmap_impl(addr_hint: u64, length: u64, prot: u64, flags: u64) -> i64
     # Validate flags - we only support anonymous private mappings
     if (flags & MAP_ANONYMOUS) == 0
         prints("[mmap] ERROR: only anonymous mappings supported\n")
@@ -919,7 +930,7 @@ fn sys_mmap_impl(addr_hint: u64, length: u64, prot: u64, flags: u64) -> i64
 #
 # Returns:
 #   0 on success, -1 on error
-fn sys_munmap_impl(addr: u64, length: u64) -> i64
+pub fn sys_munmap_impl(addr: u64, length: u64) -> i64
     # Validate address alignment
     if (addr & 0xFFF) != 0
         prints("[munmap] ERROR: address not page-aligned\n")
@@ -984,7 +995,7 @@ fn init_cwd()
 # sys_getcwd_impl: Get current working directory
 # Args: buf = buffer to write path to, size = buffer size
 # Returns: length of path on success, -1 if buffer too small
-fn sys_getcwd_impl(buf: *u8, size: u64) -> i64
+pub fn sys_getcwd_impl(buf: *u8, size: u64) -> i64
     # Check buffer size (need room for null terminator)
     if size < (g_cwd_len as u64 + 1)
         return -1
@@ -1001,7 +1012,7 @@ fn sys_getcwd_impl(buf: *u8, size: u64) -> i64
 # sys_chdir_impl: Change current working directory
 # Args: path = path to new directory (null-terminated)
 # Returns: 0 on success, -1 on error
-fn sys_chdir_impl(path: *u8) -> i64
+pub fn sys_chdir_impl(path: *u8) -> i64
     # Get path length
     var path_len: i64 = 0
     while *(path + path_len) != 0 and path_len < 255
@@ -1049,7 +1060,7 @@ fn sys_chdir_impl(path: *u8) -> i64
 
 # sys_input_poll: Poll for pending input events
 # Returns: number of events pending in the queue
-fn sys_input_poll_impl() -> i64
+pub fn sys_input_poll_impl() -> i64
     if not virtio_input_available()
         return 0
 
@@ -1062,7 +1073,7 @@ fn sys_input_poll_impl() -> i64
 # sys_input_read: Read next input event
 # Args: event_ptr = pointer to 8-byte VirtioInputEvent structure
 # Returns: 0 if event read successfully, -1 if no events pending
-fn sys_input_read_impl(event_ptr: *VirtioInputEvent) -> i64
+pub fn sys_input_read_impl(event_ptr: *VirtioInputEvent) -> i64
     if not virtio_input_available()
         return -1
 
@@ -1111,7 +1122,7 @@ var g_user_fb_addr: u64 = 0
 # sys_fb_info: Get framebuffer information
 # Args: info_buf pointer to 24-byte FbInfo structure
 # Returns: 0 on success, -1 if no display
-fn sys_fb_info_impl(info_buf: *u8) -> i64
+pub fn sys_fb_info_impl(info_buf: *u8) -> i64
     if not display_available()
         return -1
 
@@ -1146,7 +1157,7 @@ fn sys_fb_info_impl(info_buf: *u8) -> i64
 
 # sys_fb_map: Map framebuffer into userspace
 # Returns: Mapped address on success, -1 on error
-fn sys_fb_map_impl() -> i64
+pub fn sys_fb_map_impl() -> i64
     if not display_available()
         return -1
 
@@ -1284,278 +1295,6 @@ pub fn syscall_init() -> i32
     prints("\n")
 
     return 0
-
-# Syscall handler (called from assembly)
-# Arguments: rax=syscall#, rdi=arg1, rsi=arg2, rdx=arg3, r10=arg4
-pub fn syscall_handler(rax: u64, rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
-    # Handle exit specially - it may not return!
-    if rax == SYS_EXIT
-        # sys_exit_impl handles both child exit (return to parent) and
-        # init exit (halt system). It may not return!
-        return sys_exit_impl(rdi as i32)
-
-    # SYS_OPEN - Open a file
-    # WORKAROUND: knamespace_resolve returns a 32-byte struct which triggers
-    # a compiler bug that corrupts kernel globals. Save/restore the affected
-    # globals around the call. TODO: Fix the Ritz compiler's large struct return.
-    if rax == SYS_OPEN
-        # rdi = path pointer
-        # rsi = path length
-        # rdx = flags
-        # SECURITY: Validate path buffer
-        if rsi > 0
-            let path_result: i64 = uptr_check_read(rdi as *u8, rsi as u64)
-            if path_result != 0
-                return EFAULT
-        let saved_child_pid: u64 = g_child_pid
-        let saved_has_parent: u8 = g_has_parent
-        let result: i64 = sys_open(rdi as *u8, rsi, rdx as i32)
-        g_child_pid = saved_child_pid
-        g_has_parent = saved_has_parent
-        return result
-
-    # SYS_CLOSE - Close a file descriptor
-    if rax == SYS_CLOSE
-        let fd: i32 = rdi as i32
-        # Check if it's a filesystem fd
-        if is_fs_fd(fd)
-            return sys_close(fd)
-        # Otherwise, return success (stdin/stdout/stderr don't close)
-        return 0
-
-    if rax == SYS_WRITE or rax == SYS_DEBUG_PRINT
-        # Linux/POSIX write convention:
-        #   rdi = fd
-        #   rsi = buf
-        #   rdx = count
-        let fd: i32 = rdi as i32
-        let buf: *u8 = rsi as *u8
-        let len: i64 = rdx as i64
-
-        # SECURITY: Validate user buffer is readable
-        if len > 0
-            let uptr_result: i64 = uptr_check_read(buf, len as u64)
-            if uptr_result != 0
-                return EFAULT
-
-        # Check if it's a filesystem fd
-        if is_fs_fd(fd)
-            return sys_fs_write(fd, buf, len as u64)
-
-        # Otherwise, write to serial (fd 1 = stdout, fd 2 = stderr)
-        # Use interrupt-driven buffered output
-        var total_written: i64 = 0
-        while total_written < len
-            let written: i64 = serial_buffer_write(buf + total_written, len - total_written)
-            total_written = total_written + written
-
-            if total_written < len
-                # Buffer was full - drain some to hardware
-                # This ensures we don't block indefinitely
-                serial_drain_output()
-
-        return total_written
-
-    if rax == SYS_READ
-        # Linux/POSIX read convention:
-        #   rdi = fd
-        #   rsi = buf
-        #   rdx = count
-        let fd: i32 = rdi as i32
-        let buf: *u8 = rsi as *u8
-        let count: i64 = rdx as i64
-
-        # SECURITY: Validate user buffer is writable
-        if count > 0
-            let uptr_result: i64 = uptr_check_write(buf, count as u64)
-            if uptr_result != 0
-                return EFAULT
-
-        # Check if it's a filesystem fd
-        if is_fs_fd(fd)
-            return sys_fs_read(fd, buf, count as u64)
-
-        # Only support stdin (fd 0) for serial input
-        if fd != 0
-            return -1  # EBADF
-
-        # First, poll for any new data
-        serial_poll()
-
-        # Read from the serial input buffer
-        let bytes_read: i64 = serial_buf_read_many(buf, count)
-        return bytes_read
-
-    if rax == SYS_YIELD
-        # Yield CPU - currently a no-op (TODO: implement proper user-level yield)
-        # The kernel task scheduler is for kernel threads, not user processes
-        return 0
-
-    if rax == SYS_GETPID
-        # Return current process ID
-        # g_child_pid tracks the current running process (1=init, 2+=children)
-        return g_child_pid as i64
-
-    if rax == SYS_READDIR
-        # rdi = path pointer, rsi = buffer, rdx = buffer size
-        # SECURITY: Validate path string and output buffer
-        let path_result: i64 = uptr_validate_string(rdi as *u8, 4096)
-        if path_result < 0
-            return EFAULT
-        if rdx > 0
-            let buf_result: i64 = uptr_check_write(rsi as *u8, rdx as u64)
-            if buf_result != 0
-                return EFAULT
-        return sys_readdir_impl(rdi as *u8, rsi as *u8, rdx as i64)
-
-    if rax == SYS_SPAWN
-        # rdi = path pointer
-        # SECURITY: Validate path string
-        let path_result: i64 = uptr_validate_string(rdi as *u8, 4096)
-        if path_result < 0
-            return EFAULT
-        return sys_spawn_impl(rdi as *u8)
-
-    if rax == SYS_SPAWN_ARGS
-        # rdi = path pointer, rsi = argv, rdx = argc
-        # SECURITY: Validate path string
-        let path_result: i64 = uptr_validate_string(rdi as *u8, 4096)
-        if path_result < 0
-            return EFAULT
-        # SECURITY: Validate argv array (each pointer + the strings they point to)
-        let argc: i32 = rdx as i32
-        if argc > 0
-            # Validate the argv array itself
-            let argv_size: u64 = (argc as u64) * 8  # sizeof(*u8) = 8 on x86-64
-            let argv_result: i64 = uptr_check_read(rsi as *u8, argv_size)
-            if argv_result != 0
-                return EFAULT
-            # Validate each string in argv
-            var i: i32 = 0
-            let argv: **u8 = rsi as **u8
-            while i < argc
-                let arg: *u8 = *(argv + i)
-                let arg_result: i64 = uptr_validate_string(arg, 4096)
-                if arg_result < 0
-                    return EFAULT
-                i = i + 1
-        return sys_spawn_args_impl(rdi as *u8, rsi as **u8, rdx as i32)
-
-    if rax == SYS_WAIT
-        # rdi = pid
-        return sys_wait_impl(rdi as i32)
-
-    # IPC syscalls - use current_pid() instead of hardcoded 1
-    if rax == SYS_CHANNEL_CREATE
-        return sys_channel_create(current_pid())
-
-    if rax == SYS_IPC_SEND
-        # SECURITY: Validate Message struct (4096 bytes) is readable
-        let msg_result: i64 = uptr_check_read(rsi as *u8, 4096)
-        if msg_result != 0
-            return EFAULT
-        return sys_ipc_send(current_pid(), rdi as i32, rsi as *Message)
-
-    if rax == SYS_IPC_RECV
-        # SECURITY: Validate Message struct (4096 bytes) is writable
-        let msg_result: i64 = uptr_check_write(rsi as *u8, 4096)
-        if msg_result != 0
-            return EFAULT
-        # Validate sender_pid output pointer (4 bytes for u32)
-        if rdx != 0
-            let sender_result: i64 = uptr_check_write(rdx as *u8, 4)
-            if sender_result != 0
-                return EFAULT
-        return sys_ipc_recv(current_pid(), rdi as i32, rsi as *Message, rdx as *u32)
-
-    if rax == SYS_IPC_CLOSE
-        return sys_ipc_close(current_pid(), rdi as i32)
-
-    # Capability syscalls - use current_pid() instead of hardcoded 1
-    if rax == SYS_CAP_GRANT
-        return sys_cap_grant(current_pid(), rdi, rsi as u32, rdx as u32)
-
-    if rax == SYS_CAP_REVOKE
-        return sys_cap_revoke(current_pid(), rdi)
-
-    if rax == SYS_CAP_DERIVE
-        return sys_cap_derive(current_pid(), rdi, rsi as u32)
-
-    if rax == SYS_CAP_INFO
-        # SECURITY: Validate CapInfo output struct (16 bytes) is writable
-        let info_result: i64 = uptr_check_write(rsi as *u8, 16)
-        if info_result != 0
-            return EFAULT
-        return sys_cap_info(current_pid(), rdi, rsi as *CapInfo)
-
-    if rax == SYS_CAP_CHECK
-        return sys_cap_check(current_pid(), rdi, rsi as u32)
-
-    # Memory management syscalls
-    if rax == SYS_MMAP
-        # mmap(addr, length, prot, flags)
-        return sys_mmap_impl(rdi, rsi, rdx, r10)
-
-    if rax == SYS_MUNMAP
-        # munmap(addr, length)
-        return sys_munmap_impl(rdi, rsi)
-
-    # Working directory syscalls
-    if rax == SYS_GETCWD
-        # getcwd(buf, size) -> length or -1
-        # SECURITY: Validate output buffer is writable
-        if rsi > 0
-            let buf_result: i64 = uptr_check_write(rdi as *u8, rsi as u64)
-            if buf_result != 0
-                return EFAULT
-        return sys_getcwd_impl(rdi as *u8, rsi)
-
-    if rax == SYS_CHDIR
-        # chdir(path) -> 0 or -1
-        # SECURITY: Validate path string
-        let path_result: i64 = uptr_validate_string(rdi as *u8, 4096)
-        if path_result < 0
-            return EFAULT
-        return sys_chdir_impl(rdi as *u8)
-
-    # Input device syscalls
-    if rax == SYS_INPUT_POLL
-        # input_poll() -> number of events pending
-        return sys_input_poll_impl()
-
-    if rax == SYS_INPUT_READ
-        # input_read(event_ptr) -> 0 if event read, -1 if no events
-        # SECURITY: Validate VirtioInputEvent output struct (8 bytes) is writable
-        let event_result: i64 = uptr_check_write(rdi as *u8, 8)
-        if event_result != 0
-            return EFAULT
-        return sys_input_read_impl(rdi as *VirtioInputEvent)
-
-    # ACPI power management syscalls
-    if rax == SYS_ACPI_POWEROFF
-        prints("[syscall] ACPI poweroff requested\n")
-        let result: i32 = acpi_poweroff()
-        # If we get here, poweroff failed
-        return result as i64
-
-    # Framebuffer syscalls for Prism compositor
-    if rax == SYS_FB_INFO
-        # sys_fb_info(info_buf: *FbInfo) -> 0 on success, -1 on no display
-        # SECURITY: Validate FbInfo output struct (24 bytes) is writable
-        let info_result: i64 = uptr_check_write(rdi as *u8, 24)
-        if info_result != 0
-            return EFAULT
-        return sys_fb_info_impl(rdi as *u8)
-
-    if rax == SYS_FB_MAP
-        # sys_fb_map() -> mapped_addr or -1
-        return sys_fb_map_impl()
-
-    # Unknown syscall
-    prints("[syscall] unknown: ")
-    serial_print_dec(rax)
-    prints("\n")
-    return -1
 
 # Run /bin/init from the filesystem as PID 1
 # This is the actual init process that runs tests and triggers shutdown.
