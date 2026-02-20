@@ -1043,10 +1043,12 @@ pub fn valet_handle_connection(task: *Task) -> i32
 # TLS connection states
 # Note: INIT must be 0 since spawn_task initializes handler_state to 0
 const TLS_CONN_STATE_INIT: i32 = 0
-const TLS_CONN_STATE_HANDSHAKE: i32 = 1
+const TLS_CONN_STATE_HANDSHAKE: i32 = 1      # Waiting for recv during handshake
+const TLS_CONN_STATE_HANDSHAKE_SEND: i32 = 5 # Waiting for send during handshake
 const TLS_CONN_STATE_RECV: i32 = 2
 const TLS_CONN_STATE_PARSE: i32 = 3
 const TLS_CONN_STATE_SEND: i32 = 4
+const TLS_CONN_STATE_RECV_BUFFERED: i32 = 6  # Process buffered data after handshake
 
 # Global TLS server instance per connection
 # We allocate these on the heap since TlsServer is large (~35KB with work buffers)
@@ -1078,7 +1080,11 @@ pub fn tls_task_send(task: *Task, tls_data: *TlsTaskData, len: i32) -> i32
     return task_submit_send(tls_data.pool, task, len)
 
 pub fn valet_handle_tls_connection(task: *Task) -> i32
-    prints("[TLS] handle_tls_connection called\n")
+    prints("[TLS] handle_tls_connection called, handler_state=")
+    print_int(task.handler_state as i64)
+    prints(", io_result=")
+    print_int(task.io_result as i64)
+    prints("\n")
     let app: *Valet = get_g_app()
     var tls_data: *TlsTaskData = null
 
@@ -1153,6 +1159,8 @@ pub fn valet_handle_tls_connection(task: *Task) -> i32
                     task.write_buf[i] = out[i]
                     i = i + 1
                 task.write_len = out_len as i32
+                # Switch to HANDSHAKE_SEND state to handle send completion properly
+                task.handler_state = TLS_CONN_STATE_HANDSHAKE_SEND
                 let ret = tls_task_send(task, tls_data, out_len as i32)
                 if ret < 0
                     tls_task_data_free(tls_data)
@@ -1170,17 +1178,48 @@ pub fn valet_handle_tls_connection(task: *Task) -> i32
                 return -1
 
             if result == TLS_RESULT_COMPLETE
-                task.handler_state = TLS_CONN_STATE_RECV
-                task.io_result = 0
-                let ret = tls_task_recv(task, tls_data)
-                if ret < 0
-                    tls_task_data_free(tls_data)
-                    task.user_data = null
-                    return 1
-                return -1
+                # Handshake complete! Check if there's buffered application data
+                let buffered: i64 = tls_server_buffered_len(@tls_data.tls)
+                prints("[TLS] Handshake complete, buffered=")
+                print_int(buffered)
+                prints("\n")
 
-        # After send completes, check if handshake needs more
-        if task.io_result >= 0 && tls_server_state(@tls_data.tls) == TLS_SERVER_STATE_FINISHED_SENT
+                if buffered >= 5
+                    # Process buffered data immediately
+                    prints("[TLS] Processing buffered application data...\n")
+                    task.handler_state = TLS_CONN_STATE_RECV_BUFFERED
+                    task.io_result = buffered as i32
+                    # Re-enter handler to process buffered data
+                else
+                    # Need to recv more data
+                    task.handler_state = TLS_CONN_STATE_RECV
+                    task.io_result = 0
+                    let ret = tls_task_recv(task, tls_data)
+                    if ret < 0
+                        tls_task_data_free(tls_data)
+                        task.user_data = null
+                        return 1
+                    return -1
+
+    # State: HANDSHAKE_SEND - waiting for send to complete during handshake
+    if task.handler_state == TLS_CONN_STATE_HANDSHAKE_SEND
+        prints("[TLS] In HANDSHAKE_SEND state, io_result=")
+        print_int(task.io_result as i64)
+        prints(", tls_state=")
+        print_int(tls_server_state(@tls_data.tls) as i64)
+        prints("\n")
+
+        # Send failed?
+        if task.io_result < 0
+            prints("[TLS] ERROR: Send failed\n")
+            tls_task_data_free(tls_data)
+            task.user_data = null
+            return 1
+
+        # Send completed - now we need to receive client's Finished message
+        if tls_server_state(@tls_data.tls) == TLS_SERVER_STATE_FINISHED_SENT
+            prints("[TLS] Send complete, waiting for client Finished\n")
+            task.handler_state = TLS_CONN_STATE_HANDSHAKE
             task.io_result = 0
             let ret = tls_task_recv(task, tls_data)
             if ret < 0
@@ -1188,6 +1227,112 @@ pub fn valet_handle_tls_connection(task: *Task) -> i32
                 task.user_data = null
                 return 1
             return -1
+
+        # Otherwise, unexpected state
+        prints("[TLS] ERROR: Unexpected tls_state after send\n")
+        tls_task_data_free(tls_data)
+        task.user_data = null
+        return 1
+
+    # State: RECV_BUFFERED - process application data from internal TLS buffer
+    if task.handler_state == TLS_CONN_STATE_RECV_BUFFERED
+        prints("[TLS] In RECV_BUFFERED state\n")
+
+        # Decrypt application data from internal buffer
+        var plaintext: [8192]u8
+        let plaintext_len: i64 = tls_server_read_buffered(@tls_data.tls, @plaintext[0], 8192)
+
+        if plaintext_len == 0
+            # Need more data, switch to normal RECV
+            prints("[TLS] RECV_BUFFERED: need more data, switching to RECV\n")
+            task.handler_state = TLS_CONN_STATE_RECV
+            task.io_result = 0
+            let ret = tls_task_recv(task, tls_data)
+            if ret < 0
+                tls_task_data_free(tls_data)
+                task.user_data = null
+                return 1
+            return -1
+
+        if plaintext_len < 0
+            log_warn(c"TLS decrypt from buffer failed")
+            tls_task_data_free(tls_data)
+            task.user_data = null
+            return 1
+
+        prints("[TLS] RECV_BUFFERED: got ")
+        print_int(plaintext_len)
+        prints(" bytes of plaintext\n")
+
+        # Parse HTTP request from decrypted data (same as RECV state)
+        var req: Request
+        request_init(@req)
+
+        let parsed = request_parse(@req, @plaintext[0], plaintext_len as i32)
+        if parsed < 0
+            tls_task_data_free(tls_data)
+            task.user_data = null
+            return 0
+
+        task.request_count += 1
+
+        # Build response
+        var http_res: [4096]u8
+        var res: Response
+        response_init(@res, @http_res[0], 4096)
+
+        # Set up handler context
+        var handler_ctx: HandlerContext
+        handler_ctx.req = @req
+        handler_ctx.res = @res
+        handler_ctx.route_result = null
+        handler_ctx.path = req.path_ptr
+        handler_ctx.path_len = req.path_len
+        handler_ctx.raw_buf = @plaintext[0]
+        handler_ctx.raw_len = plaintext_len as i32
+        set_g_ctx(@handler_ctx)
+
+        # Run middleware
+        let mw_result: i32 = router_run_middleware(@app.router, req.path_ptr, req.path_len)
+        if mw_result != MW_CONTINUE
+            set_g_ctx(null)
+        else
+            # Try to match route
+            var route_result: RouteMatch
+            let matched: i32 = router_match(@app.router, req.method_ptr, req.path_ptr, req.path_len, @route_result)
+
+            if matched == 1
+                handler_ctx.route_result = @route_result
+                let h: fn(*u8, i32) -> i32 = route_result.handler
+                let status: i32 = h(req.path_ptr, req.path_len)
+                set_g_ctx(null)
+                if status != 0 && res.len == 0
+                    response_status(@res, 500)
+                    response_header(@res, c"Content-Type", c"text/plain")
+                    let body = c"Internal Server Error\n"
+                    response_content_length(@res, 22)
+                    response_end_headers(@res)
+                    response_body(@res, body, 22)
+            else
+                set_g_ctx(null)
+                response_not_found(@res)
+
+        # Encrypt and send response
+        let encrypted_len: i64 = tls_server_write(@tls_data.tls, @http_res[0], res.len as i64, @task.write_buf[0], 8192)
+        if encrypted_len <= 0
+            log_error(c"TLS encrypt failed")
+            tls_task_data_free(tls_data)
+            task.user_data = null
+            return 1
+
+        task.write_len = encrypted_len as i32
+        task.handler_state = TLS_CONN_STATE_SEND
+        let ret = tls_task_send(task, tls_data, encrypted_len as i32)
+        if ret < 0
+            tls_task_data_free(tls_data)
+            task.user_data = null
+            return 1
+        return -1
 
     # State: RECV - receive encrypted application data
     if task.handler_state == TLS_CONN_STATE_RECV
@@ -1339,7 +1484,10 @@ pub fn set_tls_pool(pool: *TaskPool)
 # Shutdown hook - checks global shutdown flag
 # Returns non-zero to trigger server shutdown
 pub fn valet_check_shutdown() -> i32
-    return config_should_shutdown()
+    let flag: i32 = config_should_shutdown()
+    if flag != 0
+        log_info(c"[SHUTDOWN] shutdown flag is set!")
+    return flag
 
 
 # ============================================================================
@@ -1624,8 +1772,17 @@ fn valet_send_static_text(task: *Task, text: *u8, text_len: i32) -> i32
 # Handle a connection in Zeus mode (dispatch to workers via ring buffers)
 # This is similar to valet_handle_connection but uses Zeus ring buffers
 fn valet_handle_zeus_connection(task: *Task) -> i32
+    log_info(c"[ZEUS] handle_zeus_connection: entry")
+    let client: *ZeusClient = get_zeus_client()
+    if client == null
+        # No Zeus client - fall back to standard handling
+        log_info(c"[ZEUS] No client, falling back to standard")
+        return valet_handle_connection(task)
+
+    log_info(c"[ZEUS] handler_state check")
     # State: RECV - read request first
     if task.handler_state == ZEUS_STATE_RECV
+        log_info(c"[ZEUS] STATE_RECV")
         if task.io_result == 0
             let ret = task_recv(task)
             if ret < 0
@@ -1638,11 +1795,212 @@ fn valet_handle_zeus_connection(task: *Task) -> i32
         task.read_len = task.io_result
         task.handler_state = ZEUS_STATE_PARSE
 
-    # For now, just send a static response to test the connection flow
-    # TODO: Implement proper Zeus IPC dispatch
+    # State: PARSE - parse request and dispatch to worker
     if task.handler_state == ZEUS_STATE_PARSE
-        let msg: *u8 = c"Hello from Valet (Zeus mode - WIP)\n"
-        return valet_send_static_text(task, msg, 36)
+        log_info(c"[ZEUS] STATE_PARSE")
+        var req: Request
+        request_init(@req)
+
+        log_info(c"[ZEUS] calling request_parse")
+        let parsed = request_parse(@req, @task.read_buf[0], task.read_len)
+        if parsed < 0
+            log_warn(c"[ZEUS] request_parse failed")
+            return 0
+
+        task.request_count += 1
+
+        log_info(c"[ZEUS] selecting worker")
+        # Select a worker (round-robin)
+        let worker_idx: i32 = zeus_client_select_worker(client)
+        if worker_idx < 0
+            log_warn(c"No Zeus workers available")
+            return valet_send_503(task)
+
+        log_info(c"[ZEUS] getting worker handle")
+        # Get worker handle
+        let handle: *WorkerHandle = zeus_client_get_worker(client, worker_idx)
+        if handle == null
+            log_warn(c"Worker handle is null")
+            return valet_send_503(task)
+
+        log_info(c"[ZEUS] getting worker arena")
+        # Get arena for this worker
+        var arena: DataArena
+        worker_handle_get_arena(handle, @arena)
+
+        # Check if arena is valid
+        if arena.base == null
+            log_warn(c"Worker arena base is null")
+            return valet_send_503(task)
+
+        log_info(c"[ZEUS] resetting arena")
+        # Reset arena for this request
+        data_arena_reset(@arena)
+
+        log_info(c"[ZEUS] allocating path in arena")
+        # Allocate and copy path
+        let path_ptr: *u8 = data_arena_alloc(@arena, req.path_len as i64)
+        if path_ptr == null
+            log_warn(c"Failed to allocate path in arena")
+            return valet_send_503(task)
+
+        log_info(c"[ZEUS] copying path bytes")
+        # Copy path bytes
+        var i: i32 = 0
+        while i < req.path_len
+            *(path_ptr + i) = *(req.path_ptr + i)
+            i += 1
+
+        let path_offset: i64 = data_arena_ptr_to_offset(@arena, path_ptr)
+
+        log_info(c"[ZEUS] handling body")
+        # Allocate and copy body (if any)
+        var body_offset: i64 = 0
+        var body_len: i32 = 0
+        if req.content_length > 0 and req.headers_end + req.content_length <= task.read_len
+            let body_ptr: *u8 = data_arena_alloc(@arena, req.content_length as i64)
+            if body_ptr != null
+                let body_start: *u8 = @task.read_buf[0] + req.headers_end
+                var j: i32 = 0
+                while j < req.content_length
+                    *(body_ptr + j) = *(body_start + j)
+                    j += 1
+                body_offset = data_arena_ptr_to_offset(@arena, body_ptr)
+                body_len = req.content_length
+
+        log_info(c"[ZEUS] building request slot")
+        # Build request slot
+        var slot: RequestSlot
+        request_slot_init(@slot)
+        slot.id = zeus_client_next_request_id(client)
+        slot.method = valet_method_to_zeus(req.method_ptr, req.method_len)
+        slot.flags = REQ_FLAG_COMPLETE
+        slot.path_offset = path_offset as u32
+        slot.path_len = req.path_len as u16
+        slot.body_offset = body_offset as u32
+        slot.body_len = body_len as u32
+
+        # NOTE: Don't store request ID in task.user_data - that's used by the async system!
+        # We poll for any response, not a specific request ID.
+
+        log_info(c"[ZEUS] submitting request to worker")
+        # Submit request to worker
+        let submit_result: i32 = zeus_client_submit_request(client, worker_idx, @slot)
+        if submit_result < 0
+            log_warn(c"Zeus submit failed")
+            return valet_send_503(task)
+
+        log_info(c"[ZEUS] submit succeeded, going to WAIT state")
+        task.handler_state = ZEUS_STATE_WAIT
+        # Fall through to WAIT state
+
+    # State: WAIT - poll for response from worker
+    if task.handler_state == ZEUS_STATE_WAIT
+        log_info(c"[ZEUS] STATE_WAIT - polling for response")
+        # Note: We poll for any response from any worker. In a full implementation,
+        # we would track request IDs to match responses to tasks.
+
+        var resp: ResponseSlot
+        var resp_worker_idx: i32 = -1
+
+        # Busy-wait for response (temporary workaround for event loop issue)
+        var poll_result: i32 = -1
+        var attempts: i32 = 0
+        while poll_result < 0 and attempts < 1000
+            poll_result = zeus_client_poll_response(client, @resp, @resp_worker_idx)
+            if poll_result < 0
+                # Sleep 1ms and retry
+                var ts: [2]i64
+                ts[0] = 0        # seconds
+                ts[1] = 1000000  # 1ms
+                sys_nanosleep(@ts[0], null)
+                attempts = attempts + 1
+
+        if poll_result < 0
+            log_warn(c"[ZEUS] No response after 1000ms, giving up")
+            return 0  # Close connection
+
+        log_info(c"[ZEUS] got response, copying to write buffer")
+        # Got a response - get the worker's arena to read response data
+        let handle: *WorkerHandle = zeus_client_get_worker(client, resp_worker_idx)
+        if handle == null
+            log_warn(c"Response worker handle is null")
+            return valet_send_503(task)
+
+        var arena: DataArena
+        worker_handle_get_arena(handle, @arena)
+
+        if arena.base == null
+            log_warn(c"Response arena base is null")
+            return valet_send_503(task)
+
+        # Debug: log response slot values
+        "[ZEUS] resp: status={resp.status} hdrs_off={resp.headers_offset} hdrs_len={resp.headers_len} body_off={resp.body_offset} body_len={resp.body_len}\n"
+
+        # Debug: show arena base and first 8 bytes
+        let arena_base_int: i64 = arena.base as i64
+        "[ZEUS] arena.base={arena_base_int} arena.size={arena.size}\n"
+        let b0: i32 = *(arena.base + 0) as i32
+        let b1: i32 = *(arena.base + 1) as i32
+        let b2: i32 = *(arena.base + 2) as i32
+        let b3: i32 = *(arena.base + 3) as i32
+        let b4: i32 = *(arena.base + 4) as i32
+        let b5: i32 = *(arena.base + 5) as i32
+        let b6: i32 = *(arena.base + 6) as i32
+        let b7: i32 = *(arena.base + 7) as i32
+        "[ZEUS] arena[0..7]: {b0} {b1} {b2} {b3} {b4} {b5} {b6} {b7}\n"
+
+        # Validate response lengths
+        if resp.headers_len > 8000 or resp.body_len > 1000000
+            log_warn(c"Response lengths look invalid, skipping")
+            return valet_send_503(task)
+
+        # Copy response data to task's write buffer
+        var write_pos: i32 = 0
+
+        log_info(c"[ZEUS] copying headers")
+        # Copy headers from arena
+        if resp.headers_len > 0
+            let headers_ptr: *u8 = data_arena_offset_to_ptr(@arena, resp.headers_offset as i64)
+            var h: i32 = 0
+            while h < (resp.headers_len as i32)
+                if write_pos < 8192
+                    task.write_buf[write_pos] = *(headers_ptr + h)
+                    write_pos += 1
+                h += 1
+
+        log_info(c"[ZEUS] copying body")
+        # Copy body from arena
+        if resp.body_len > 0
+            let body_ptr: *u8 = data_arena_offset_to_ptr(@arena, resp.body_offset as i64)
+            var b: i32 = 0
+            while b < (resp.body_len as i32)
+                if write_pos < 8192
+                    task.write_buf[write_pos] = *(body_ptr + b)
+                    write_pos += 1
+                b += 1
+
+        # Send response using async io_uring
+        task.write_len = write_pos
+        task.write_pos = 0
+        task.handler_state = ZEUS_STATE_SEND
+        let send_ret = task_send(task, write_pos)
+        if send_ret < 0
+            "[ZEUS] task_send failed, returning 0\n"
+            return 0
+        "[ZEUS] task_send submitted, returning -1\n"
+        return -1  # Wait for send to complete
+
+    # State: SEND - wait for send to complete
+    if task.handler_state == ZEUS_STATE_SEND
+        if task.io_result < 0
+            log_warn(c"[ZEUS] Send failed")
+            return 0
+        log_info(c"[ZEUS] Send complete, closing connection")
+        return 0  # Connection complete
+
+    "[ZEUS] unexpected state, returning 0\n"
+    return 0
 
 fn valet_handle_zeus_connection_disabled(task: *Task) -> i32
     let client: *ZeusClient = get_zeus_client()
@@ -1738,8 +2096,7 @@ fn valet_handle_zeus_connection_disabled(task: *Task) -> i32
         slot.body_offset = body_offset as u32
         slot.body_len = body_len as u32
 
-        # Store request ID in task for later matching
-        task.user_data = slot.id as *u8
+        # NOTE: Don't clobber task.user_data - it's used by async system!
 
         # Submit request to worker
         let submit_result: i32 = zeus_client_submit_request(client, worker_idx, @slot)

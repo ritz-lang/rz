@@ -30,6 +30,7 @@ import zeus.arena
 pub struct WorkerContext
     region: ShmRegion         # Attached shared memory region
     current_req_idx: i64      # Index of request being processed
+    arena: DataArena          # Arena view with persistent offset tracking
 
 # ============================================================================
 # Initialization
@@ -45,6 +46,9 @@ pub fn worker_init(ctx: *WorkerContext, fd: i32, size: i64) -> i32
         return result
 
     ctx.current_req_idx = -1
+
+    # Initialize arena view (this sets up base/size and offset=0)
+    shm_get_arena(@ctx.region, @ctx.arena)
 
     # Set our PID in the control block
     let cb: *ControlBlock = shm_get_control_block(@ctx.region)
@@ -125,12 +129,16 @@ pub fn worker_ack_request(ctx: *WorkerContext)
 
 # Begin writing a response for the given request ID
 # Returns pointer to response slot, or null if ring is full
+# Resets the arena for fresh allocations
 pub fn worker_begin_response(ctx: *WorkerContext, request_id: u64) -> *ResponseSlot
     let cb: *ControlBlock = shm_get_control_block(@ctx.region)
 
     # Check if response ring is full
     if control_block_resp_full(cb) != 0
         return null
+
+    # Reset arena for fresh allocations for this response
+    data_arena_reset(@ctx.arena)
 
     # Get the response ring
     let resp_ring: *ResponseSlot = shm_get_response_ring(@ctx.region)
@@ -174,13 +182,10 @@ pub fn worker_get_request_headers(ctx: *WorkerContext, req: *RequestSlot) -> *u8
     return data_arena_offset_to_ptr(@arena, req.headers_offset as i64)
 
 # Allocate space in arena for response data
+# Uses the persistent arena in the context so offset is tracked
 pub fn worker_alloc_response_data(ctx: *WorkerContext, size: i64) -> *u8
-    var arena: DataArena
-    shm_get_arena(@ctx.region, @arena)
-    return data_arena_alloc(@arena, size)
+    return data_arena_alloc(@ctx.arena, size)
 
 # Get offset for a pointer (for setting in response slots)
 pub fn worker_ptr_to_offset(ctx: *WorkerContext, ptr: *u8) -> i64
-    var arena: DataArena
-    shm_get_arena(@ctx.region, @arena)
-    return data_arena_ptr_to_offset(@arena, ptr)
+    return data_arena_ptr_to_offset(@ctx.arena, ptr)

@@ -6,6 +6,7 @@
 #   ./deploy.sh provision    # Just provision (skip terraform)
 #   ./deploy.sh build        # Just build binaries
 #   ./deploy.sh ssh          # SSH into the server
+#   ./deploy.sh certbot      # Setup Let's Encrypt certificates
 
 set -e
 
@@ -14,6 +15,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
 DEPLOY_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 TERRAFORM_DIR="$DEPLOY_DIR/terraform"
 SYSTEMD_DIR="$DEPLOY_DIR/systemd"
+CONFIG_DIR="$DEPLOY_DIR/config"
 
 # Colors
 RED='\033[0;31m'
@@ -118,6 +120,51 @@ run_terraform() {
     error "SSH not ready after 150 seconds"
 }
 
+# Setup Let's Encrypt certificates
+setup_certbot() {
+    IP=$(get_ip)
+    if [[ -z "$IP" ]]; then
+        error "No IP found. Run terraform first."
+    fi
+
+    log "Setting up Let's Encrypt certificates on $IP..."
+
+    SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+    SSH="ssh $SSH_OPTS ubuntu@$IP"
+
+    # Install certbot
+    log "Installing certbot..."
+    $SSH "sudo apt-get update && sudo apt-get install -y certbot"
+
+    # Stop valet to free up port 80/443
+    log "Stopping Valet for certificate issuance..."
+    $SSH "sudo systemctl stop valet 2>/dev/null || true"
+
+    # Get certificate (standalone mode)
+    log "Requesting certificate for ritz-lang.org..."
+    $SSH "sudo certbot certonly --standalone -d ritz-lang.org -d www.ritz-lang.org --non-interactive --agree-tos --email admin@ritz-lang.org"
+
+    # Create symlinks for Valet
+    log "Creating certificate symlinks..."
+    $SSH "sudo mkdir -p /etc/ritz/certs"
+    $SSH "sudo ln -sf /etc/letsencrypt/live/ritz-lang.org/fullchain.pem /etc/ritz/certs/fullchain.pem"
+    $SSH "sudo ln -sf /etc/letsencrypt/live/ritz-lang.org/privkey.pem /etc/ritz/certs/privkey.pem"
+    $SSH "sudo chmod 755 /etc/letsencrypt/live /etc/letsencrypt/archive"
+
+    # Restart valet
+    log "Restarting Valet with TLS..."
+    $SSH "sudo systemctl start valet"
+
+    # Setup auto-renewal cron job
+    log "Setting up certificate renewal..."
+    $SSH "echo '0 3 * * * root certbot renew --quiet --deploy-hook \"systemctl restart valet\"' | sudo tee /etc/cron.d/certbot-renew"
+
+    log "Certificate setup complete!"
+    echo ""
+    echo "  HTTPS URL: https://ritz-lang.org/"
+    echo ""
+}
+
 # Provision the server
 provision() {
     IP=$(get_ip)
@@ -156,7 +203,7 @@ provision() {
 
     # Create directories
     log "Creating directories..."
-    $SSH "sudo mkdir -p /opt/ritz/bin /var/lib/mausoleum /var/log/ritz"
+    $SSH "sudo mkdir -p /opt/ritz/bin /var/lib/mausoleum /var/log/ritz /etc/ritz/certs"
     $SSH "sudo chown -R ubuntu:ubuntu /opt/ritz"
 
     # Copy binaries
@@ -166,6 +213,11 @@ provision() {
     $SCP "$ZEUS_BIN" ubuntu@"$IP":/opt/ritz/bin/zeus
     $SCP "$VALET_BIN" ubuntu@"$IP":/opt/ritz/bin/valet
     $SSH "chmod +x /opt/ritz/bin/*"
+
+    # Copy configuration files
+    log "Installing configuration..."
+    $SCP "$CONFIG_DIR/valet.json" ubuntu@"$IP":/tmp/valet.json
+    $SSH "sudo mv /tmp/valet.json /etc/ritz/valet.json"
 
     # Copy systemd services
     log "Installing systemd services..."
@@ -189,7 +241,16 @@ provision() {
     sleep 2
     $SSH "sudo systemctl start zeus"
     sleep 2
-    $SSH "sudo systemctl start valet"
+
+    # Check if TLS certs exist before starting Valet
+    if $SSH "test -f /etc/ritz/certs/fullchain.pem"; then
+        log "TLS certificates found, starting Valet with HTTPS..."
+        $SSH "sudo systemctl start valet"
+    else
+        warn "No TLS certificates found. Run './deploy.sh certbot' to set up Let's Encrypt."
+        warn "Starting Valet anyway (will fail if config requires TLS)..."
+        $SSH "sudo systemctl start valet" || true
+    fi
 
     # Verify services
     log "Verifying services..."
@@ -206,7 +267,13 @@ provision() {
     echo ""
     log "Deployment complete!"
     echo ""
-    echo "  URL:       http://$IP/"
+    if $SSH "test -f /etc/ritz/certs/fullchain.pem" 2>/dev/null; then
+        echo "  HTTPS URL: https://ritz-lang.org/"
+    else
+        echo "  HTTP URL:  http://$IP/"
+        echo ""
+        echo "  To enable HTTPS, run: ./deploy.sh certbot"
+    fi
     echo "  SSH:       ssh ubuntu@$IP"
     echo "  Valet:     ssh ubuntu@$IP 'sudo journalctl -u valet -f'"
     echo "  Zeus logs: ssh ubuntu@$IP 'sudo journalctl -u zeus -f'"
@@ -236,6 +303,9 @@ case "${1:-}" in
         ;;
     terraform)
         run_terraform
+        ;;
+    certbot)
+        setup_certbot
         ;;
     *)
         # Full deploy
