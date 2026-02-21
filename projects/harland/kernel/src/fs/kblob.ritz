@@ -17,8 +17,7 @@ pub struct KBlobId
     hash: [32]u8
 
 # Initial capacity for blob store.
-# Initramfs loading performs many directory rewrite snapshots, so we need
-# significantly more than just the number of final files.
+# Initramfs loading creates many directory snapshots; keep ample headroom.
 const INITIAL_CAPACITY: i32 = 4096
 
 # A stored blob entry
@@ -128,6 +127,41 @@ fn store_find(store: *KBlobStore, id: *KBlobId) -> *KBlobEntry
         i = i + 1
     0 as *KBlobEntry
 
+# Grow the store when all slots are used.
+fn store_grow(store: *KBlobStore) -> i32
+    let old_capacity: i32 = (*store).capacity
+    var new_capacity: i32 = old_capacity * 2
+    if new_capacity < 1
+        new_capacity = INITIAL_CAPACITY
+
+    let entry_size: u64 = 64
+    let new_alloc_size: u64 = entry_size * new_capacity as u64
+    let new_entries: *KBlobEntry = kalloc(new_alloc_size) as *KBlobEntry
+    if new_entries == 0 as *KBlobEntry
+        return -1
+
+    var i: i32 = 0
+    while i < new_capacity
+        let new_entry: *KBlobEntry = new_entries + i
+        (*new_entry).used = false
+        i = i + 1
+
+    i = 0
+    while i < old_capacity
+        let src: *KBlobEntry = (*store).entries + i
+        let dst: *KBlobEntry = new_entries + i
+        if (*src).used
+            (*dst).id = kblob_id_copy(@(*src).id)
+            (*dst).data = (*src).data
+            (*dst).size = (*src).size
+            (*dst).used = true
+        i = i + 1
+
+    kfree((*store).entries as *u8)
+    (*store).entries = new_entries
+    (*store).capacity = new_capacity
+    return 0
+
 # Check if a blob exists
 pub fn kblob_store_exists(store: *KBlobStore, id: *KBlobId) -> bool
     let entry: *KBlobEntry = store_find(store, id)
@@ -167,10 +201,22 @@ pub fn kblob_store_put(store: *KBlobStore, data: *u8, size: u64) -> KBlobId
             break
         i = i + 1
 
-    # TODO: Grow array if no free slot
     if slot == 0 as *KBlobEntry
-        prints("kblob: store full\n" as StrView)
-        return kblob_id_zero()
+        if store_grow(store) != 0
+            prints("kblob: store grow failed\n" as StrView)
+            return kblob_id_zero()
+
+        # Retry slot search after successful growth.
+        i = 0
+        while i < (*store).capacity
+            let entry: *KBlobEntry = (*store).entries + i
+            if not (*entry).used
+                slot = entry
+                break
+            i = i + 1
+        if slot == 0 as *KBlobEntry
+            prints("kblob: no slot after grow\n" as StrView)
+            return kblob_id_zero()
 
     # Allocate storage for data copy
     let data_copy: *u8 = kalloc(size)
