@@ -3,9 +3,9 @@
 import io { halt_loop }
 import serial { StrView, prints, serial_print_hex, serial_print_dec, serial_write_byte }
 import drivers.acpi.tables { acpi_poweroff }
+import fd { FdTable, fd_table_init }
 import mm.pmm { PAGE_SIZE }
 import mm.vmm { vmm_create_user_pml4, vmm_switch_pml4, vmm_get_current_pml4, vmm_free_pml4, vmm_read_pml4_entry }
-import fs.syscall { sys_open }
 import fs.knamespace { KNamespace, knamespace_get, knamespace_read, knamespace_list }
 import fs.kdir_entry { KDirEntry }
 import fs.kpath { strview_from_ptr }
@@ -43,6 +43,35 @@ var g_child_pid: u64 = 1
 var g_child_pml4: u64 = 0
 var g_child_exit_code: i64 = 0
 
+const RUNTIME_MAX_FD_TABLES: i32 = 8
+
+struct RuntimeFdTableSlot
+    pid: u64
+    used: u8
+    table: FdTable
+
+var g_fd_table_slots: [8]RuntimeFdTableSlot
+
+fn runtime_process_fd_slot_for_pid(pid: u64) -> *RuntimeFdTableSlot
+    var i: i32 = 0
+    while i < RUNTIME_MAX_FD_TABLES
+        let slot: *RuntimeFdTableSlot = @g_fd_table_slots[i]
+        if (*slot).used != 0 and (*slot).pid == pid
+            return slot
+        i = i + 1
+
+    i = 0
+    while i < RUNTIME_MAX_FD_TABLES
+        let slot: *RuntimeFdTableSlot = @g_fd_table_slots[i]
+        if (*slot).used == 0
+            (*slot).pid = pid
+            (*slot).used = 1
+            fd_table_init(@(*slot).table)
+            return slot
+        i = i + 1
+
+    return 0 as *RuntimeFdTableSlot
+
 fn runtime_process_strlen(s: *u8) -> i64
     var len: i64 = 0
     var p: *u8 = s
@@ -65,14 +94,13 @@ pub fn runtime_process_set_init_process()
     g_child_pid = 1
     g_child_pml4 = 0
     g_child_exit_code = 0
+    runtime_process_fd_slot_for_pid(1)
 
-pub fn runtime_process_open_safe(path_ptr: *u8, path_len: u64, flags: i32) -> i64
-    let saved_child_pid: u64 = g_child_pid
-    let saved_has_parent: u8 = g_has_parent
-    let result: i64 = sys_open(path_ptr, path_len, flags)
-    g_child_pid = saved_child_pid
-    g_has_parent = saved_has_parent
-    return result
+pub fn runtime_process_current_fd_table() -> *FdTable
+    let slot: *RuntimeFdTableSlot = runtime_process_fd_slot_for_pid(g_child_pid)
+    if slot == 0 as *RuntimeFdTableSlot
+        return 0 as *FdTable
+    return @(*slot).table
 
 pub fn runtime_process_readdir(dir_path: *u8, buf: *u8, buf_size: i64) -> i64
     let ns: *KNamespace = knamespace_get()
