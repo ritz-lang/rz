@@ -371,6 +371,14 @@ pub fn kernel_main(boot_info_addr: u64) -> i32
     if boot_protocol == BOOT_PROTOCOL_HARLAND
         pmm_init_from_bootinfo(harland_boot_info)
         pmm_reserve_kernel()
+        # UEFI bootloader may place kernel/boot structures outside legacy 1-2MB.
+        # Reserve those concrete regions before any PMM allocations occur.
+        pmm_mark_region_used((*harland_boot_info).kernel_phys, (*harland_boot_info).kernel_size)
+        pmm_mark_region_used((*harland_boot_info).pml4_phys, PAGE_SIZE)
+        pmm_mark_region_used(boot_info_addr, 4096)
+        let mmap_entries: u64 = (*harland_boot_info).memory_map_entries as u64
+        if mmap_entries > 0 and (*harland_boot_info).memory_map != 0 as *HarlandMemEntry
+            pmm_mark_region_used((*harland_boot_info).memory_map as u64, mmap_entries * 24)
         klog(c"\r  [OK] Physical memory\n")
     else if boot_protocol == BOOT_PROTOCOL_MULTIBOOT2
         let mb_info: *Mb2BootInfo = boot_info_addr as *Mb2BootInfo
@@ -404,6 +412,10 @@ pub fn kernel_main(boot_info_addr: u64) -> i32
     serial_print_hex(vmm_pml4_phys)
     prints("\n")
 
+    # Reserve current page tables before heap allocations; reserve again after
+    # heap growth so newly created tables are also protected from PMM reuse.
+    vmm_reserve_page_tables()
+
     # Initialize Kernel Heap
     klog(c"  [..] Kernel heap")
     let heap_result: i32 = heap_init(16384)  # 64MB heap (content-addressed FS needs space for version history)
@@ -415,8 +427,8 @@ pub fn kernel_main(boot_info_addr: u64) -> i32
     else
         klog(c"\r  [!!] Kernel heap (init failed)\n")
 
-    # Reserve all page table pages in PMM so they won't be reallocated
-    # Must be after heap_init since heap creates new page table entries
+    # Reserve all page table pages in PMM so they won't be reallocated.
+    # Re-run after heap_init since heap mapping creates additional PT pages.
     vmm_reserve_page_tables()
 
     # Initialize Display subsystem (if framebuffer available)

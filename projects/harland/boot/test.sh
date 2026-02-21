@@ -297,7 +297,10 @@ cat "$SERIAL_LOG"
 echo ""
 
 # Check for expected output - most advanced first (matching BIOS test milestones)
-if grep -q "ALL TESTS PASSED" "$SERIAL_LOG"; then
+if grep -q "\*\*\* KERNEL PANIC \*\*\*" "$SERIAL_LOG" || grep -q "!!! EXCEPTION !!!" "$SERIAL_LOG"; then
+    echo "FAIL: Kernel panic/exception detected"
+    exit 1
+elif grep -q "ALL TESTS PASSED" "$SERIAL_LOG"; then
     echo "========================================="
     echo "  UEFI: MILESTONE 12 COMPLETE: Tier 1 Test Suite!"
     echo "========================================="
