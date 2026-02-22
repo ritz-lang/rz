@@ -67,21 +67,10 @@ iso: kernel
 $(UEFI_DISK): kernel
 	@echo "=== Creating UEFI Boot Disk ==="
 	@mkdir -p $(BUILD_DIR)
-	@# Create 64MB FAT disk image
-	dd if=/dev/zero of=$@ bs=1M count=64 2>/dev/null
-	mkfs.vfat $@ >/dev/null
-	@# Create EFI directory structure
-	mmd -i $@ ::/EFI
-	mmd -i $@ ::/EFI/BOOT
-	mmd -i $@ ::/harland
 	@# Copy bootloader and kernel
-	mcopy -i $@ $(BOOTLOADER) ::/EFI/BOOT/BOOTX64.EFI
-	mcopy -i $@ $(KERNEL_ELF) ::/harland/kernel.elf
-	@# Create startup script
 	@echo '@echo -off' > $(BUILD_DIR)/startup.nsh
 	@echo 'FS0:\EFI\BOOT\BOOTX64.EFI' >> $(BUILD_DIR)/startup.nsh
-	mcopy -i $@ $(BUILD_DIR)/startup.nsh ::/startup.nsh
-	@echo "Created: $@"
+	python3 ./tools/mkuefi.py $@ $(BOOTLOADER) $(KERNEL_ELF) $(BUILD_DIR)/startup.nsh
 
 # Create EC2-compatible UEFI boot disk with GPT partition table
 # EC2 requires a proper GPT with EFI System Partition for UEFI boot

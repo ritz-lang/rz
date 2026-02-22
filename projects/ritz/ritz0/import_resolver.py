@@ -175,6 +175,8 @@ class ImportResolver:
         self.module_exports: Dict[str, ModuleExports] = {}
         # Import aliases: from_file -> {alias -> module_path}
         self.import_aliases: Dict[str, Dict[str, str]] = {}
+        # Qualified name rewrites: from_file -> {alias -> {name -> rewritten_name}}
+        self.qualified_rewrites: Dict[str, Dict[str, Dict[str, str]]] = {}
         # RFC #109 Phase 2: Dependency mappings for namespace resolution
         self.dependencies: Dict[str, DependencyMapping] = dependencies.copy() if dependencies else {}
         # Auto-detect dependencies from RITZ_PATH entries with ritz.toml
@@ -360,6 +362,76 @@ class ImportResolver:
             self.import_aliases[from_file] = {}
         self.import_aliases[from_file][alias] = module_path
 
+    def _mangle_qualified_name(self, alias: str, name: str) -> str:
+        """Create a collision-free symbol name for qualified alias imports."""
+        return f"__imp_{alias}_{name}"
+
+    def _find_export_item(self, entry: ExportEntry):
+        """Find a registered AST item matching an export entry."""
+        if entry.kind == "fn":
+            for fn in self.functions.get(entry.name, []):
+                if getattr(fn, 'source_file', None) == entry.module_path:
+                    return fn
+        elif entry.kind == "extern_fn":
+            ex = self.extern_fns.get(entry.name)
+            if ex and getattr(ex, 'source_file', None) == entry.module_path:
+                return ex
+        elif entry.kind == "const":
+            for const in self.constants.get(entry.name, []):
+                if getattr(const, 'source_file', None) == entry.module_path:
+                    return const
+        elif entry.kind == "var":
+            var = self.variables.get(entry.name)
+            if var and getattr(var, 'source_file', None) == entry.module_path:
+                return var
+        return None
+
+    def _register_alias_rewrites(self, imp: rast.Import, module_path: str, from_file: str):
+        """Register qualified-name rewrite mappings for an import alias."""
+        if not imp.alias:
+            return
+
+        exports = self.module_exports.get(module_path)
+        if exports is None:
+            return
+
+        selected = self._validate_selective_import(imp, exports)
+        if from_file not in self.qualified_rewrites:
+            self.qualified_rewrites[from_file] = {}
+        if imp.alias not in self.qualified_rewrites[from_file]:
+            self.qualified_rewrites[from_file][imp.alias] = {}
+
+        alias_map = self.qualified_rewrites[from_file][imp.alias]
+        for export_name, entry in selected.items():
+            rewritten = export_name
+            if entry.kind in ("fn", "extern_fn", "const", "var"):
+                rewritten = self._mangle_qualified_name(imp.alias, export_name)
+                export_item = self._find_export_item(entry)
+                if export_item is not None and rewritten != export_name:
+                    cloned = replace(export_item, name=rewritten)
+                    self._register_item(cloned, entry.module_path)
+            alias_map[export_name] = rewritten
+
+    def _build_export_map_from_metadata(self, cached_meta, module_path: str) -> ModuleExports:
+        """Build a module export map from cached metadata."""
+        exports = ModuleExports()
+
+        for fn in cached_meta.functions:
+            kind = "extern_fn" if fn.is_extern else "fn"
+            exports.add_export(ExportEntry(fn.name, kind, module_path, True))
+        for s in cached_meta.structs:
+            exports.add_export(ExportEntry(s.name, "struct", module_path, True))
+        for e in cached_meta.enums:
+            exports.add_export(ExportEntry(e.name, "enum", module_path, True))
+        for c in cached_meta.constants:
+            exports.add_export(ExportEntry(c.name, "const", module_path, True))
+        for t in cached_meta.type_aliases:
+            exports.add_export(ExportEntry(t.name, "type_alias", module_path, True))
+        for tr in cached_meta.traits:
+            exports.add_export(ExportEntry(tr.name, "trait", module_path, True))
+
+        return exports
+
     def resolve_qualified_name(
         self,
         qualifier: str,
@@ -399,7 +471,7 @@ class ImportResolver:
         Issue #99: Qualified import name resolution not implemented
         """
         source_path = str(Path(source_path).resolve())
-        aliases = self.import_aliases.get(source_path, {})
+        aliases = self.qualified_rewrites.get(source_path, {})
 
         if not aliases:
             # No aliases registered for this file - no transformation needed
@@ -412,7 +484,7 @@ class ImportResolver:
 
         return rast.Module(module.span, transformed_items)
 
-    def _transform_item(self, item: rast.Item, aliases: Dict[str, str]) -> rast.Item:
+    def _transform_item(self, item: rast.Item, aliases: Dict[str, Dict[str, str]]) -> rast.Item:
         """Transform QualifiedIdent nodes in an item."""
         # Helper to preserve source_file attribute through replace()
         def copy_source_file(old_item: rast.Item, new_item: rast.Item) -> rast.Item:
@@ -450,13 +522,13 @@ class ImportResolver:
         # Other items don't contain expressions that need transformation
         return item
 
-    def _transform_block(self, block: rast.Block, aliases: Dict[str, str]) -> rast.Block:
+    def _transform_block(self, block: rast.Block, aliases: Dict[str, Dict[str, str]]) -> rast.Block:
         """Transform expressions in a block."""
         new_stmts = [self._transform_stmt(stmt, aliases) for stmt in block.stmts]
         new_expr = self._transform_expr(block.expr, aliases) if block.expr else None
         return replace(block, stmts=new_stmts, expr=new_expr)
 
-    def _transform_stmt(self, stmt: rast.Stmt, aliases: Dict[str, str]) -> rast.Stmt:
+    def _transform_stmt(self, stmt: rast.Stmt, aliases: Dict[str, Dict[str, str]]) -> rast.Stmt:
         """Transform expressions in a statement."""
         if isinstance(stmt, rast.LetStmt):
             if stmt.value:
@@ -490,21 +562,26 @@ class ImportResolver:
             return replace(stmt, iter=new_iter, body=new_body)
         return stmt
 
-    def _transform_expr(self, expr: rast.Expr, aliases: Dict[str, str]) -> rast.Expr:
+    def _transform_expr(self, expr: rast.Expr, aliases: Dict[str, Dict[str, str]]) -> rast.Expr:
         """Transform QualifiedIdent and recursively transform sub-expressions."""
         if expr is None:
             return None
 
         # KEY TRANSFORMATION: QualifiedIdent -> Ident
         if isinstance(expr, rast.QualifiedIdent):
-            if expr.qualifier in aliases:
-                # Transform sys::write -> write
-                return rast.Ident(expr.span, expr.name)
-            else:
-                raise RitzImportError(
+            alias_map = aliases.get(expr.qualifier)
+            if alias_map is None:
+                raise ImportError(
                     f"Unknown import alias: '{expr.qualifier}' in '{expr.qualifier}::{expr.name}'",
                     expr.span
                 )
+            rewritten = alias_map.get(expr.name)
+            if rewritten is None:
+                raise ImportError(
+                    f"'{expr.name}' is not exported by aliased module '{expr.qualifier}'",
+                    expr.span
+                )
+            return rast.Ident(expr.span, rewritten)
 
         # Recursively transform sub-expressions using replace()
         if isinstance(expr, rast.BinOp):
@@ -698,13 +775,13 @@ class ImportResolver:
         if import_path is None:
             raise ImportError(f"Cannot find module: {'.'.join(imp.path)}")
 
-        # Register import alias if present (Issue #99: qualified import support)
-        # e.g., import ritzlib.sys as sys -> register 'sys' alias for from_file
+        # Register import alias if present
         if imp.alias:
             self._register_import_alias(imp.alias, import_path, from_file)
 
         # Skip if already processed
         if import_path in self.processed_files:
+            self._register_alias_rewrites(imp, import_path, from_file)
             return
 
         # Check for cycles
@@ -729,10 +806,12 @@ class ImportResolver:
                     if not has_generics:
                         # Use cached metadata - convert to AST items without reparsing
                         self._register_items_from_metadata(cached_meta, import_path)
+                        self.module_exports[import_path] = self._build_export_map_from_metadata(cached_meta, import_path)
                         # Recursively process cached imports
                         for nested_import_path in cached_meta.imports:
                             nested_imp = rast.Import(rast.Span("<cached>", 0, 0, 0), nested_import_path.split('.'))
                             self._process_import(nested_imp, import_path)
+                        self._register_alias_rewrites(imp, import_path, from_file)
                         return
 
             # Cache miss or disabled - read and parse the imported file
@@ -741,6 +820,7 @@ class ImportResolver:
             tokens = lexer.tokenize()
             parser = Parser(tokens)
             imported_module = parser.parse_module()
+            self.module_exports[import_path] = self._build_export_map(imported_module, import_path)
 
             # Process imports in the imported module
             for item in imported_module.items:
@@ -754,6 +834,8 @@ class ImportResolver:
                 meta = extract_metadata(imported_module, import_path)
                 self.generated_metadata[import_path] = meta
                 self.metadata_cache.put(meta)
+
+            self._register_alias_rewrites(imp, import_path, from_file)
 
         finally:
             self.processing_stack.pop()

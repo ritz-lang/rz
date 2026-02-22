@@ -342,7 +342,14 @@ fn idle_task_func() -> i32
 
 # Create idle task for a CPU
 fn create_idle_task(cpu_idx: i32) -> i32
+    if cpu_idx < 0 or cpu_idx >= MAX_CPUS
+        return -1
+
     sched_lock()
+
+    if task_count >= MAX_TASKS as u32
+        sched_unlock()
+        return -1
 
     let task_idx: u32 = task_count
     task_count = task_count + 1
@@ -368,6 +375,9 @@ fn create_idle_task(cpu_idx: i32) -> i32
     if cpu_idx == 0
         # Allocate a page for BSP idle task stack
         let stack_phys: u64 = pmm_alloc_page()
+        if stack_phys == 0
+            sched_unlock()
+            return -1
         (*task).stack_base = stack_phys
         (*task).stack_size = PAGE_SIZE
         stack_top = stack_phys + PAGE_SIZE
@@ -430,17 +440,29 @@ pub fn scheduler_init() -> i32
         cpu_sched[i].idle_task = 0
         i = i + 1
 
+    # Sanitize CPU count from firmware before using it for array indexing.
+    var cpu_total: i32 = num_cpus as i32
+    if cpu_total < 1
+        cpu_total = 1
+    if cpu_total > MAX_CPUS
+        cpu_total = MAX_CPUS
+
     # Create idle task for BSP
-    create_idle_task(0)
+    let bsp_idle_result: i32 = create_idle_task(0)
+    if bsp_idle_result < 0
+        prints("\r  [!!] Scheduler (failed to create BSP idle task)\n")
+        return -1
 
     # Create idle tasks for APs
     i = 1
-    while i < num_cpus as i32
-        create_idle_task(i)
+    while i < cpu_total
+        let ap_idle_result: i32 = create_idle_task(i)
+        if ap_idle_result < 0
+            break
         i = i + 1
 
     prints("      Created ")
-    serial_print_dec(num_cpus as u64)
+    serial_print_dec(i as u64)
     prints(" idle tasks\n")
 
     # NOTE: APIC timer is disabled for now because it conflicts with userspace execution
