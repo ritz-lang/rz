@@ -29,6 +29,7 @@ import ritz_ast as rast
 from lexer import Lexer
 from parser import Parser
 from metadata import MetadataCache, extract_metadata, ModuleMetadata
+from emitter.fn_cache import read_sig_file, source_file_hash, check_source_hash
 
 
 class ImportError(Exception):
@@ -717,6 +718,36 @@ class ImportResolver:
         self.processed_files.add(import_path)
 
         try:
+            # --- Incremental compilation: .ritz.sig-based import caching ---
+            # Before re-parsing, check if a .ritz.sig exists for this module
+            # with a matching source hash. If so, use cached metadata instead
+            # of re-lexing/re-parsing. This eliminates re-parsing all 34+
+            # ritzlib modules on every compilation.
+            sig_data = read_sig_file(import_path)
+            if sig_data is not None:
+                try:
+                    import_source = Path(import_path).read_text()
+                    current_hash = source_file_hash(import_source)
+                    cached_hash = sig_data.get('source_hash')
+                    if current_hash == cached_hash:
+                        # Source unchanged — try metadata cache or parse once
+                        # The sig file confirms the source hasn't changed,
+                        # so we can trust in-memory metadata cache if available
+                        if self.use_cache and self.metadata_cache:
+                            cached_meta = self.metadata_cache.get(import_path)
+                            if cached_meta is not None:
+                                has_generics = any(fn.is_generic for fn in cached_meta.functions)
+                                has_generics = has_generics or any(s.is_generic for s in cached_meta.structs)
+                                has_generics = has_generics or any(len(i.type_params) > 0 for i in cached_meta.impls)
+                                if not has_generics:
+                                    self._register_items_from_metadata(cached_meta, import_path)
+                                    for nested_import_path in cached_meta.imports:
+                                        nested_imp = rast.Import(rast.Span("<cached>", 0, 0, 0), nested_import_path.split('.'))
+                                        self._process_import(nested_imp, import_path)
+                                    return
+                except OSError:
+                    pass  # Fall through to full parse
+
             # Try to use cached metadata first (faster incremental compilation)
             if self.use_cache and self.metadata_cache:
                 cached_meta = self.metadata_cache.get(import_path)

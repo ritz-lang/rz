@@ -2461,6 +2461,9 @@ class LLVMEmitter:
         bodies for items from the current source file. Items from other
         files are declared but not defined (external linkage).
 
+        Per-fn IR cache: if _cached_fn_names contains this function name,
+        skip body emission — cached IR will be spliced in post-processing.
+
         Args:
             item: The AST item to check
 
@@ -2474,6 +2477,10 @@ class LLVMEmitter:
         # If item has no source_file set, it's from the main file
         item_source = getattr(item, 'source_file', None)
         if item_source is None:
+            # Check per-fn IR cache: skip if cached IR available
+            fn_name = getattr(item, 'name', None)
+            if fn_name and hasattr(self, '_cached_fn_names') and fn_name in self._cached_fn_names:
+                return False
             return True
 
         # Emit body only if item is from the current source file
@@ -8441,12 +8448,76 @@ def filter_by_target_os(module: rast.Module, target_os: str) -> rast.Module:
     return rast.Module(module.span, filtered_items)
 
 
+def _extract_fn_ir_blocks(ir_str: str) -> Dict[str, str]:
+    """Extract per-function 'define' blocks from LLVM IR text.
+
+    Parses the IR string to find each function definition and extracts
+    the complete block (from 'define' to the closing '}').
+
+    Args:
+        ir_str: Complete LLVM IR text
+
+    Returns:
+        Dict mapping function names to their complete define blocks
+    """
+    import re
+    fn_blocks = {}
+    # Match: define <ret> @"<name>"(<params>) ... {
+    # Function names may be quoted or unquoted
+    pattern = re.compile(r'^(define\s+[^@]+@"?([^"(]+)"?\([^)]*\)[^{]*\{)', re.MULTILINE)
+
+    for match in pattern.finditer(ir_str):
+        fn_name = match.group(2)
+        start = match.start()
+
+        # Find the matching closing brace (accounting for nested braces in blocks)
+        depth = 0
+        pos = match.end() - 1  # Position of the opening '{'
+        for i in range(pos, len(ir_str)):
+            if ir_str[i] == '{':
+                depth += 1
+            elif ir_str[i] == '}':
+                depth -= 1
+                if depth == 0:
+                    fn_blocks[fn_name] = ir_str[start:i + 1]
+                    break
+
+    return fn_blocks
+
+
+def _splice_cached_ir(ir_str: str, cached_fns: Dict[str, str]) -> str:
+    """Replace 'declare' lines with cached 'define' blocks for cached functions.
+
+    Args:
+        ir_str: LLVM IR text (with some functions as 'declare')
+        cached_fns: Dict mapping fn names to their cached 'define' blocks
+
+    Returns:
+        IR text with cached functions spliced in
+    """
+    import re
+
+    for fn_name, cached_block in cached_fns.items():
+        # Match the declare line for this function
+        # declare <ret> @"<name>"(<params>)
+        escaped_name = re.escape(fn_name)
+        # Try both quoted and unquoted forms
+        pattern = rf'^declare\s+[^@]+@"?{escaped_name}"?\([^)]*\)\s*$'
+        match = re.search(pattern, ir_str, re.MULTILINE)
+        if match:
+            # Replace declare with the cached define block
+            ir_str = ir_str[:match.start()] + cached_block + ir_str[match.end():]
+
+    return ir_str
+
+
 def emit(module: rast.Module, no_runtime: bool = False,
          source_file: str = "unknown.ritz", source_dir: str = ".",
          main_source_path: Optional[str] = None,
          test_mode: bool = False,
          target: str = 'x86_64-unknown-linux-gnu',
-         target_os: str = 'linux') -> str:
+         target_os: str = 'linux',
+         fn_cache_data: Optional[Dict] = None) -> Union[str, Tuple[str, Dict[str, str]]]:
     """Convenience function to emit a module to LLVM IR.
 
     Args:
@@ -8460,9 +8531,15 @@ def emit(module: rast.Module, no_runtime: bool = False,
         target: Target triple (default: x86_64-unknown-linux-gnu)
                 Use x86_64-none-elf for freestanding/kernel builds.
         target_os: Target OS for conditional compilation (default: linux)
+        fn_cache_data: Per-function cache data from .ritz.sig (optional).
+                       When provided, enables per-fn IR reuse. Functions with
+                       matching token hashes will use cached IR instead of
+                       re-emitting.
 
     Returns:
-        LLVM IR text
+        If fn_cache_data is provided: (ir_str, emitted_fn_ir) tuple
+            where emitted_fn_ir is {fn_name: ir_block} for cache storage
+        Otherwise: ir_str only (backward compatible)
     """
     # Monomorphize generics before emission
     from monomorph import monomorphize
@@ -8475,6 +8552,22 @@ def emit(module: rast.Module, no_runtime: bool = False,
     emitter.no_runtime = no_runtime
     emitter.test_mode = test_mode
 
+    # Configure per-fn cache: tells emitter which functions to skip
+    cached_fn_ir = {}
+    if fn_cache_data is not None:
+        cache_hits = fn_cache_data.get('cache_hits', {})
+        sig_data = fn_cache_data.get('sig_data', {})
+        cached_fns = sig_data.get('functions', {}) if sig_data else {}
+        for fn_name in cache_hits:
+            entry = cached_fns.get(fn_name, {})
+            ir_text = entry.get('ir', '')
+            if ir_text:
+                cached_fn_ir[fn_name] = ir_text
+        # Tell emitter which functions to skip body emission for
+        emitter._cached_fn_names = set(cached_fn_ir.keys())
+    else:
+        emitter._cached_fn_names = set()
+
     # Always use separate compilation - pass source path to control body emission
     if main_source_path:
         ir_str = emitter.emit_module(module, source_file=main_source_path)
@@ -8485,6 +8578,15 @@ def emit(module: rast.Module, no_runtime: bool = False,
     if not no_runtime:
         ir_str = ir_str.replace('define void @"_start"()', 'define void @_start() naked')
         ir_str = ir_str.replace('@"_start"', '@_start')
+
+    # Splice cached function IR back in (replace declare -> define)
+    if cached_fn_ir:
+        ir_str = _splice_cached_ir(ir_str, cached_fn_ir)
+
+    if fn_cache_data is not None:
+        # Extract per-function IR blocks for cache storage
+        emitted_fn_ir = _extract_fn_ir_blocks(ir_str)
+        return ir_str, emitted_fn_ir
 
     return ir_str
 

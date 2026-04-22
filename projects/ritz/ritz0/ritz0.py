@@ -29,6 +29,11 @@ from name_resolver import resolve_names, NameError as RitzNameError
 from move_checker import MoveChecker, OwnershipError
 from type_checker import TypeChecker, TypeError as RitzTypeError
 from const_eval import evaluate_array_sizes, ConstEvalError
+from emitter.fn_cache import (
+    source_file_hash, build_hash_map, build_sig_hash_map,
+    read_sig_file, write_sig_file, check_cache, check_source_hash,
+    build_sig_data, detect_sig_changes, invalidate_dependents,
+)
 import ritz_ast as rast
 
 
@@ -90,6 +95,17 @@ def compile_file(source_path: str, output_path: str, no_runtime: bool = False,
 
         # Get absolute path for source file tracking
         source_abs_path = str(Path(source_path).resolve())
+
+        # --- Incremental compilation: source-file-level hash check ---
+        # If the .ll output exists, is newer than the source, and the
+        # source hash matches the cached hash in .ritz.sig, skip everything.
+        output_file = Path(output_path)
+        if output_file.exists():
+            source_mtime = Path(source_path).stat().st_mtime
+            output_mtime = output_file.stat().st_mtime
+            if output_mtime >= source_mtime and check_source_hash(source, source_abs_path):
+                print(f"Skipped {source_path} (unchanged)")
+                return True
 
         # Extract directory and filename for debug info
         source_path_obj = Path(source_path)
@@ -153,18 +169,76 @@ def compile_file(source_path: str, output_path: str, no_runtime: bool = False,
                     print(f"Ownership error: {err}", file=sys.stderr)
                 return False
 
+        # --- Incremental compilation: per-fn IR reuse ---
+        # Build hash map and check against cached data before emission
+        fn_cache_data = None
+        try:
+            fn_hashes = build_hash_map(source, source_abs_path)
+            sig_hashes = build_sig_hash_map(source, source_abs_path)
+            old_sig_data = read_sig_file(source_abs_path)
+
+            # Detect signature changes and invalidate dependent modules
+            changed_sigs = detect_sig_changes(source_abs_path, sig_hashes)
+            if changed_sigs:
+                project_root = str(Path(source_path).resolve().parent)
+                for parent in Path(source_path).resolve().parents:
+                    if (parent / '.git').exists() or (parent / 'ritzlib').is_dir():
+                        project_root = str(parent)
+                        break
+                invalidate_dependents(source_abs_path, changed_sigs, project_root)
+
+            # Check which functions have cached IR
+            hits, misses = check_cache(fn_hashes, old_sig_data)
+            fn_cache_data = {
+                'cache_hits': hits,
+                'cache_misses': misses,
+                'sig_data': old_sig_data,
+            }
+        except Exception:
+            fn_hashes = {}
+            sig_hashes = {}
+            old_sig_data = None
+
         # Emit IR
         # Always use separate compilation: each source file → one .ll file
         # Functions from current file: define (full body)
         # Functions from imports: declare (external reference)
         # --no-runtime only controls whether to emit _start entry point
-        ir = emit_llvmlite(module, no_runtime=no_runtime,
+        emit_result = emit_llvmlite(module, no_runtime=no_runtime,
                            source_file=source_file, source_dir=source_dir,
                            main_source_path=source_abs_path,
-                           target=target, target_os=target_os)
+                           target=target, target_os=target_os,
+                           fn_cache_data=fn_cache_data)
+
+        if fn_cache_data is not None and isinstance(emit_result, tuple):
+            ir, emitted_fn_ir = emit_result
+        else:
+            ir = emit_result
+            emitted_fn_ir = {}
 
         # Write output
         Path(output_path).write_text(ir)
+
+        # --- Write .ritz.sig cache with emitted function IR ---
+        try:
+            # Extract import paths from the module for the sig file
+            import_paths = []
+            for item in module.items:
+                if isinstance(item, rast.Import):
+                    import_paths.append('.'.join(item.path))
+
+            sig_data = build_sig_data(
+                source=source,
+                fn_hashes=fn_hashes,
+                sig_hashes=sig_hashes,
+                fn_ir=emitted_fn_ir,
+                imports=import_paths,
+                old_sig_data=old_sig_data,
+            )
+            write_sig_file(source_abs_path, sig_data)
+        except Exception as e:
+            # Cache write failure is non-fatal
+            print(f"Warning: cache write failed: {e}", file=sys.stderr)
 
         print(f"Compiled {source_path} -> {output_path}")
         return True
