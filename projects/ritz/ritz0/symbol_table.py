@@ -180,7 +180,7 @@ class SymbolTable:
                 return f"@&{self._type_to_str(type_node.inner)}"
             return f"@{self._type_to_str(type_node.inner)}"
         if isinstance(type_node, rast.ArrayType):
-            return f"[{type_node.size}]{self._type_to_str(type_node.element_type)}"
+            return f"[{type_node.size}]{self._type_to_str(type_node.inner)}"
         # Fallback
         return str(type(type_node).__name__)
 

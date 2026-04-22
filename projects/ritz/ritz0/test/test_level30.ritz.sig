@@ -1,0 +1,18 @@
+{
+  "source_hash": "26efcc5008ca58dd",
+  "functions": {
+    "test_wrapper_i32_describe": {
+      "hash": "a6826b76499394f2",
+      "ir": "define internal i32 @\"test_wrapper_i32_describe\"() !dbg !19\n{\nentry:\n  %\"w.addr\" = alloca %\"struct.ritz_module_1.Wrapper$i32\", !dbg !36\n  %\".2\" = trunc i64 100 to i32 , !dbg !36\n  %\".3\" = trunc i64 0 to i32 , !dbg !36\n  %\".4\" = insertvalue %\"struct.ritz_module_1.Wrapper$i32\" undef, i32 %\".2\", 0 , !dbg !36\n  %\".5\" = insertvalue %\"struct.ritz_module_1.Wrapper$i32\" %\".4\", i32 %\".3\", 1 , !dbg !36\n  store %\"struct.ritz_module_1.Wrapper$i32\" %\".5\", %\"struct.ritz_module_1.Wrapper$i32\"* %\"w.addr\", !dbg !36\n  call void @\"llvm.dbg.declare\"(metadata %\"struct.ritz_module_1.Wrapper$i32\"* %\"w.addr\", metadata !38, metadata !7), !dbg !39\n  %\".8\" = call i32 @\"Wrapper$i32_describe\"(%\"struct.ritz_module_1.Wrapper$i32\"* %\"w.addr\"), !dbg !40\n  %\".9\" = sext i32 %\".8\" to i64 , !dbg !41\n  %\".10\" = icmp eq i64 %\".9\", 42 , !dbg !41\n  br i1 %\".10\", label %\"assert.pass\", label %\"assert.fail\", !dbg !41\nassert.pass:\n  %\".14\" = trunc i64 0 to i32 , !dbg !42\n  ret i32 %\".14\", !dbg !42\nassert.fail:\n  %\".12\" = call i64 asm sideeffect \"syscall\", \"={rax},{rax},{rdi},~{rcx},~{r11},~{memory}\"(i64 60, i64 1), !dbg !41\n  unreachable\n}"
+    },
+    "test_wrapper_i64_describe": {
+      "hash": "817d139b5206a52e",
+      "ir": "define internal i32 @\"test_wrapper_i64_describe\"() !dbg !20\n{\nentry:\n  %\"w.addr\" = alloca %\"struct.ritz_module_1.Wrapper$i64\", !dbg !43\n  %\".2\" = trunc i64 0 to i32 , !dbg !43\n  %\".3\" = insertvalue %\"struct.ritz_module_1.Wrapper$i64\" undef, i64 999, 0 , !dbg !43\n  %\".4\" = insertvalue %\"struct.ritz_module_1.Wrapper$i64\" %\".3\", i32 %\".2\", 1 , !dbg !43\n  store %\"struct.ritz_module_1.Wrapper$i64\" %\".4\", %\"struct.ritz_module_1.Wrapper$i64\"* %\"w.addr\", !dbg !43\n  call void @\"llvm.dbg.declare\"(metadata %\"struct.ritz_module_1.Wrapper$i64\"* %\"w.addr\", metadata !45, metadata !7), !dbg !46\n  %\".7\" = call i32 @\"Wrapper$i64_describe\"(%\"struct.ritz_module_1.Wrapper$i64\"* %\"w.addr\"), !dbg !47\n  %\".8\" = sext i32 %\".7\" to i64 , !dbg !48\n  %\".9\" = icmp eq i64 %\".8\", 42 , !dbg !48\n  br i1 %\".9\", label %\"assert.pass\", label %\"assert.fail\", !dbg !48\nassert.pass:\n  %\".13\" = trunc i64 0 to i32 , !dbg !49\n  ret i32 %\".13\", !dbg !49\nassert.fail:\n  %\".11\" = call i64 asm sideeffect \"syscall\", \"={rax},{rax},{rdi},~{rcx},~{r11},~{memory}\"(i64 60, i64 1), !dbg !48\n  unreachable\n}"
+    },
+    "main": {
+      "hash": "ab988a5a07148ba7",
+      "ir": "define i32 @\"main\"() !dbg !21\n{\nentry:\n  %\".2\" = getelementptr [36 x i8], [36 x i8]* @\".str.0\", i64 0, i64 0 , !dbg !50\n  %\".3\" = insertvalue %\"struct.ritz_module_1.StrView\" undef, i8* %\".2\", 0 , !dbg !50\n  %\".4\" = insertvalue %\"struct.ritz_module_1.StrView\" %\".3\", i64 35, 1 , !dbg !50\n  %\".5\" = call i32 @\"prints\"(%\"struct.ritz_module_1.StrView\" %\".4\"), !dbg !50\n  %\".6\" = call i32 @\"test_wrapper_i32_describe\"(), !dbg !51\n  %\".7\" = call i32 @\"test_wrapper_i64_describe\"(), !dbg !52\n  %\".8\" = getelementptr [32 x i8], [32 x i8]* @\".str.1\", i64 0, i64 0 , !dbg !53\n  %\".9\" = insertvalue %\"struct.ritz_module_1.StrView\" undef, i8* %\".8\", 0 , !dbg !53\n  %\".10\" = insertvalue %\"struct.ritz_module_1.StrView\" %\".9\", i64 31, 1 , !dbg !53\n  %\".11\" = call i32 @\"prints\"(%\"struct.ritz_module_1.StrView\" %\".10\"), !dbg !53\n  %\".12\" = trunc i64 0 to i32 , !dbg !54\n  ret i32 %\".12\", !dbg !54\n}"
+    }
+  },
+  "imports": []
+}
