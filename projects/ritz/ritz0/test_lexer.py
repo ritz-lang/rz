@@ -609,5 +609,54 @@ class TestReritzAsmKeyword:
         ]
 
 
+class TestStringBraceLiterals:
+    """Tests for literal braces in regular strings (not interpolation)."""
+
+    def test_lone_open_brace_string(self):
+        """String containing just '{' should be a literal string, not interpolation."""
+        result = token_values('"{"')
+        assert result == [
+            (TokenType.STRING, "{"),
+            (TokenType.EOF, None),
+        ]
+
+    def test_open_brace_at_end_of_string(self):
+        """String ending with '{' should be literal, not interpolation."""
+        result = token_values('"hello{"')
+        assert result == [
+            (TokenType.STRING, "hello{"),
+            (TokenType.EOF, None),
+        ]
+
+    def test_unmatched_brace_in_string(self):
+        """String with { but no matching } should treat { as literal."""
+        result = token_values('"a { b"')
+        assert result == [
+            (TokenType.STRING, "a { b"),
+            (TokenType.EOF, None),
+        ]
+
+    def test_valid_interpolation_still_works(self):
+        """Strings with matched {expr} should still produce INTERP_STRING."""
+        result = token_values('"hello {name}!"')
+        assert result[0] == (TokenType.INTERP_STRING, (["hello ", "!"], ["name"]))
+
+    def test_escaped_brace_still_works(self):
+        r"""Escaped \{ should still produce literal brace."""
+        result = token_values(r'"\{"')
+        assert result == [
+            (TokenType.STRING, "{"),
+            (TokenType.EOF, None),
+        ]
+
+    def test_double_brace_still_works(self):
+        """{{ should still produce literal brace."""
+        result = token_values('"{{hello}}"')
+        assert result == [
+            (TokenType.STRING, "{hello}"),
+            (TokenType.EOF, None),
+        ]
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

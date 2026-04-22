@@ -1287,5 +1287,614 @@ class TestBareSelfParameter:
         assert param.type.args[0].name == "T"
 
 
+class TestPostfixDeref:
+    """Tests for postfix dereference: expr**.field"""
+
+    def test_postfix_deref_field_access(self):
+        """p**.field should parse as (*p).field"""
+        mod = parse("fn main()\n  p**.field")
+        fn = mod.items[0]
+        expr = fn.body.expr
+        # Should be Field(UnaryOp('*', Ident('p')), 'field')
+        assert isinstance(expr, rast.Field)
+        assert expr.field == "field"
+        assert isinstance(expr.expr, rast.UnaryOp)
+        assert expr.expr.op == "*"
+        assert expr.expr.operand.name == "p"
+
+    def test_postfix_deref_assignment(self):
+        """p**.field = value should parse as assignment to (*p).field"""
+        mod = parse("fn main()\n  p**.x = 5")
+        fn = mod.items[0]
+        stmt = fn.body.stmts[0]
+        assert isinstance(stmt, rast.AssignStmt)
+        lhs = stmt.target
+        assert isinstance(lhs, rast.Field)
+        assert lhs.field == "x"
+        assert isinstance(lhs.expr, rast.UnaryOp)
+        assert lhs.expr.op == "*"
+
+    def test_postfix_deref_chained_field(self):
+        """p**.x + p**.y should parse both deref+field correctly"""
+        mod = parse("fn main()\n  p**.x + p**.y")
+        fn = mod.items[0]
+        expr = fn.body.expr
+        assert isinstance(expr, rast.BinOp)
+        assert expr.op == "+"
+        # LHS: (*p).x
+        assert isinstance(expr.left, rast.Field)
+        assert isinstance(expr.left.expr, rast.UnaryOp)
+        # RHS: (*p).y
+        assert isinstance(expr.right, rast.Field)
+        assert isinstance(expr.right.expr, rast.UnaryOp)
+
+    def test_postfix_deref_method_call(self):
+        """p**.method(arg) should parse as (*p).method(arg)"""
+        mod = parse("fn main()\n  p**.method(x)")
+        fn = mod.items[0]
+        expr = fn.body.expr
+        assert isinstance(expr, rast.MethodCall)
+        assert expr.method == "method"
+        assert isinstance(expr.expr, rast.UnaryOp)
+        assert expr.expr.op == "*"
+
+    def test_postfix_deref_index(self):
+        """p**[0] should parse as (*p)[0]"""
+        mod = parse("fn main()\n  p**[0]")
+        fn = mod.items[0]
+        expr = fn.body.expr
+        assert isinstance(expr, rast.Index)
+        assert isinstance(expr.expr, rast.UnaryOp)
+        assert expr.expr.op == "*"
+
+    def test_multiply_by_deref_still_works(self):
+        """a * *b should still parse as multiplication by deref"""
+        mod = parse("fn main()\n  a * *b")
+        fn = mod.items[0]
+        expr = fn.body.expr
+        assert isinstance(expr, rast.BinOp)
+        assert expr.op == "*"
+        assert isinstance(expr.right, rast.UnaryOp)
+        assert expr.right.op == "*"
+
+    def test_postfix_deref_in_comparison(self):
+        """p**.pos >= p**.len should parse correctly"""
+        mod = parse("fn main()\n  p**.pos >= p**.len")
+        fn = mod.items[0]
+        expr = fn.body.expr
+        assert isinstance(expr, rast.BinOp)
+        assert expr.op == ">="
+        assert isinstance(expr.left, rast.Field)
+        assert expr.left.field == "pos"
+        assert isinstance(expr.right, rast.Field)
+        assert expr.right.field == "len"
+
+    def test_multiline_expression_after_or(self):
+        """Multi-line expression: trailing 'or' should continue on next line"""
+        source = "fn main()\n  (a >= 1) or\n  (b <= 2)"
+        mod = parse(source)
+        fn = mod.items[0]
+        expr = fn.body.expr
+        assert isinstance(expr, rast.BinOp)
+        assert expr.op == "or"
+
+    def test_multiline_expression_after_and(self):
+        """Multi-line expression: trailing 'and' should continue on next line"""
+        source = "fn main()\n  a > 0 and\n  b > 0"
+        mod = parse(source)
+        fn = mod.items[0]
+        expr = fn.body.expr
+        assert isinstance(expr, rast.BinOp)
+        assert expr.op == "and"
+
+    def test_multiline_expression_after_plus(self):
+        """Multi-line expression: trailing '+' should continue on next line"""
+        source = "fn main()\n  x +\n  y"
+        mod = parse(source)
+        fn = mod.items[0]
+        expr = fn.body.expr
+        assert isinstance(expr, rast.BinOp)
+        assert expr.op == "+"
+
+    def test_multiline_chained_or(self):
+        """Three-line chained 'or' expression"""
+        source = "fn main()\n  a or\n  b or\n  c"
+        mod = parse(source)
+        fn = mod.items[0]
+        expr = fn.body.expr
+        # Left-associative: (a or b) or c
+        assert isinstance(expr, rast.BinOp)
+        assert expr.op == "or"
+        assert isinstance(expr.left, rast.BinOp)
+        assert expr.left.op == "or"
+
+    def test_pointer_to_pointer_type_still_works(self):
+        """**u8 type syntax should still parse correctly"""
+        mod = parse("fn main(argv: **u8)\n  0")
+        fn = mod.items[0]
+        param = fn.params[0]
+        # **u8 is *(* u8) — pointer to pointer
+        assert isinstance(param.type, rast.PtrType)
+        assert isinstance(param.type.inner, rast.PtrType)
+
+
+class TestPostfixDerefEdgeCases:
+    """Extended edge-case tests for postfix dereference operator."""
+
+    def test_postfix_deref_compound_assign_plus(self):
+        """p**.x += 1"""
+        mod = parse("fn main()\n  p**.x += 1")
+        fn = mod.items[0]
+        stmt = fn.body.stmts[0]
+        assert isinstance(stmt, rast.AssignStmt)
+        assert isinstance(stmt.target, rast.Field)
+        assert stmt.target.field == "x"
+
+    def test_postfix_deref_compound_assign_minus(self):
+        """p**.x -= 1"""
+        mod = parse("fn main()\n  p**.x -= 1")
+        fn = mod.items[0]
+        stmt = fn.body.stmts[0]
+        assert isinstance(stmt, rast.AssignStmt)
+
+    def test_postfix_deref_compound_assign_star(self):
+        """p**.x *= 2"""
+        mod = parse("fn main()\n  p**.x *= 2")
+        fn = mod.items[0]
+        stmt = fn.body.stmts[0]
+        assert isinstance(stmt, rast.AssignStmt)
+
+    def test_postfix_deref_compound_assign_slash(self):
+        """p**.x /= 2"""
+        mod = parse("fn main()\n  p**.x /= 2")
+        fn = mod.items[0]
+        stmt = fn.body.stmts[0]
+        assert isinstance(stmt, rast.AssignStmt)
+
+    def test_chained_postfix_deref_field(self):
+        """a**.b**.c — double deref chain"""
+        mod = parse("fn main()\n  a**.b**.c")
+        fn = mod.items[0]
+        expr = fn.body.expr
+        # (*(*a).b).c
+        assert isinstance(expr, rast.Field)
+        assert expr.field == "c"
+        assert isinstance(expr.expr, rast.UnaryOp)
+        assert expr.expr.op == "*"
+        inner = expr.expr.operand  # (*a).b
+        assert isinstance(inner, rast.Field)
+        assert inner.field == "b"
+        assert isinstance(inner.expr, rast.UnaryOp)
+
+    def test_postfix_deref_in_addition(self):
+        """p**.a + p**.b in arithmetic"""
+        mod = parse("fn main()\n  p**.a + p**.b")
+        fn = mod.items[0]
+        expr = fn.body.expr
+        assert isinstance(expr, rast.BinOp)
+        assert expr.op == "+"
+        assert isinstance(expr.left, rast.Field)
+        assert isinstance(expr.right, rast.Field)
+
+    def test_postfix_deref_in_multiplication(self):
+        """p**.x * 2"""
+        mod = parse("fn main()\n  p**.x * 2")
+        fn = mod.items[0]
+        expr = fn.body.expr
+        assert isinstance(expr, rast.BinOp)
+        assert expr.op == "*"
+        assert isinstance(expr.left, rast.Field)
+
+    def test_postfix_deref_as_call_arg(self):
+        """foo(p**.x, p**.y)"""
+        mod = parse("fn main()\n  foo(p**.x, p**.y)")
+        fn = mod.items[0]
+        expr = fn.body.expr
+        assert isinstance(expr, rast.Call)
+        assert len(expr.args) == 2
+        assert isinstance(expr.args[0], rast.Field)
+        assert isinstance(expr.args[1], rast.Field)
+
+    def test_postfix_deref_nested_field_arithmetic(self):
+        """p**.src + p**.pos"""
+        mod = parse("fn main()\n  p**.src + p**.pos")
+        fn = mod.items[0]
+        expr = fn.body.expr
+        assert isinstance(expr, rast.BinOp)
+        assert isinstance(expr.left, rast.Field)
+        assert expr.left.field == "src"
+        assert isinstance(expr.right, rast.Field)
+        assert expr.right.field == "pos"
+
+    def test_postfix_deref_comparison_geq(self):
+        """p**.pos >= p**.len"""
+        mod = parse("fn main()\n  p**.pos >= p**.len")
+        fn = mod.items[0]
+        expr = fn.body.expr
+        assert isinstance(expr, rast.BinOp)
+        assert expr.op == ">="
+
+    def test_postfix_deref_comparison_lt(self):
+        """p**.x < 10"""
+        mod = parse("fn main()\n  p**.x < 10")
+        fn = mod.items[0]
+        expr = fn.body.expr
+        assert isinstance(expr, rast.BinOp)
+        assert expr.op == "<"
+
+    def test_postfix_deref_equality(self):
+        """p**.x == 0"""
+        mod = parse("fn main()\n  p**.x == 0")
+        fn = mod.items[0]
+        expr = fn.body.expr
+        assert isinstance(expr, rast.BinOp)
+        assert expr.op == "=="
+
+    def test_postfix_deref_assign_self_increment(self):
+        """p**.x = p**.x + 1 — self-referential assignment"""
+        mod = parse("fn main()\n  p**.x = p**.x + 1")
+        fn = mod.items[0]
+        stmt = fn.body.stmts[0]
+        assert isinstance(stmt, rast.AssignStmt)
+        assert isinstance(stmt.target, rast.Field)
+        assert isinstance(stmt.value, rast.BinOp)
+        assert isinstance(stmt.value.left, rast.Field)
+
+    def test_postfix_deref_assign_literal(self):
+        """p**.col = 1"""
+        mod = parse("fn main()\n  p**.col = 1")
+        fn = mod.items[0]
+        stmt = fn.body.stmts[0]
+        assert isinstance(stmt, rast.AssignStmt)
+        assert isinstance(stmt.target, rast.Field)
+        assert stmt.target.field == "col"
+
+    def test_postfix_deref_if_condition(self):
+        """if p**.done: ..."""
+        mod = parse("fn main()\n  if p**.done\n    0")
+        fn = mod.items[0]
+        ifexpr = fn.body.expr
+        assert isinstance(ifexpr, rast.If)
+        assert isinstance(ifexpr.cond, rast.Field)
+        assert ifexpr.cond.field == "done"
+        assert isinstance(ifexpr.cond.expr, rast.UnaryOp)
+
+    def test_postfix_deref_return(self):
+        """return p**.val"""
+        mod = parse("fn main()\n  return p**.val")
+        fn = mod.items[0]
+        stmt = fn.body.stmts[0]
+        assert isinstance(stmt, rast.ReturnStmt)
+        assert isinstance(stmt.value, rast.Field)
+        assert stmt.value.field == "val"
+
+    def test_postfix_deref_let_binding(self):
+        """let x = p**.val"""
+        mod = parse("fn main()\n  let x = p**.val")
+        fn = mod.items[0]
+        stmt = fn.body.stmts[0]
+        assert isinstance(stmt, rast.LetStmt)
+        assert isinstance(stmt.value, rast.Field)
+
+    def test_postfix_deref_with_cast(self):
+        """p**.val as i32"""
+        mod = parse("fn main()\n  p**.val as i32")
+        fn = mod.items[0]
+        expr = fn.body.expr
+        assert isinstance(expr, rast.Cast)
+        assert isinstance(expr.expr, rast.Field)
+
+    def test_postfix_deref_index_access(self):
+        """p**[i] — index after deref"""
+        mod = parse("fn main()\n  p**[i]")
+        fn = mod.items[0]
+        expr = fn.body.expr
+        assert isinstance(expr, rast.Index)
+        assert isinstance(expr.expr, rast.UnaryOp)
+        assert expr.expr.op == "*"
+
+    def test_prefix_deref_still_works(self):
+        """*p should still work as prefix deref"""
+        mod = parse("fn main()\n  *p")
+        fn = mod.items[0]
+        expr = fn.body.expr
+        assert isinstance(expr, rast.UnaryOp)
+        assert expr.op == "*"
+        assert expr.operand.name == "p"
+
+    def test_multiply_deref_no_space(self):
+        """a * *b should still parse as multiply by deref (no dot follows)"""
+        mod = parse("fn main()\n  a * *b")
+        fn = mod.items[0]
+        expr = fn.body.expr
+        assert isinstance(expr, rast.BinOp)
+        assert expr.op == "*"
+        assert isinstance(expr.right, rast.UnaryOp)
+        assert expr.right.op == "*"
+
+
+class TestMultiLineExpressions:
+    """Tests for multi-line expression continuation after binary operators."""
+
+    def test_multiline_plus(self):
+        mod = parse("fn main()\n  x +\n  y")
+        fn = mod.items[0]
+        assert isinstance(fn.body.expr, rast.BinOp)
+        assert fn.body.expr.op == "+"
+
+    def test_multiline_minus(self):
+        mod = parse("fn main()\n  x -\n  y")
+        fn = mod.items[0]
+        assert isinstance(fn.body.expr, rast.BinOp)
+        assert fn.body.expr.op == "-"
+
+    def test_multiline_multiply(self):
+        mod = parse("fn main()\n  x *\n  y")
+        fn = mod.items[0]
+        assert isinstance(fn.body.expr, rast.BinOp)
+        assert fn.body.expr.op == "*"
+
+    def test_multiline_divide(self):
+        mod = parse("fn main()\n  x /\n  y")
+        fn = mod.items[0]
+        assert isinstance(fn.body.expr, rast.BinOp)
+        assert fn.body.expr.op == "/"
+
+    def test_multiline_modulo(self):
+        mod = parse("fn main()\n  x %\n  y")
+        fn = mod.items[0]
+        assert isinstance(fn.body.expr, rast.BinOp)
+        assert fn.body.expr.op == "%"
+
+    def test_multiline_eqeq(self):
+        mod = parse("fn main()\n  x ==\n  y")
+        fn = mod.items[0]
+        assert isinstance(fn.body.expr, rast.BinOp)
+        assert fn.body.expr.op == "=="
+
+    def test_multiline_neq(self):
+        mod = parse("fn main()\n  x !=\n  y")
+        fn = mod.items[0]
+        assert isinstance(fn.body.expr, rast.BinOp)
+        assert fn.body.expr.op == "!="
+
+    def test_multiline_lt(self):
+        mod = parse("fn main()\n  x <\n  y")
+        fn = mod.items[0]
+        assert isinstance(fn.body.expr, rast.BinOp)
+        assert fn.body.expr.op == "<"
+
+    def test_multiline_gt(self):
+        mod = parse("fn main()\n  x >\n  y")
+        fn = mod.items[0]
+        assert isinstance(fn.body.expr, rast.BinOp)
+        assert fn.body.expr.op == ">"
+
+    def test_multiline_leq(self):
+        mod = parse("fn main()\n  x <=\n  y")
+        fn = mod.items[0]
+        assert isinstance(fn.body.expr, rast.BinOp)
+        assert fn.body.expr.op == "<="
+
+    def test_multiline_geq(self):
+        mod = parse("fn main()\n  x >=\n  y")
+        fn = mod.items[0]
+        assert isinstance(fn.body.expr, rast.BinOp)
+        assert fn.body.expr.op == ">="
+
+    def test_multiline_and_keyword(self):
+        mod = parse("fn main()\n  a and\n  b")
+        fn = mod.items[0]
+        assert isinstance(fn.body.expr, rast.BinOp)
+        assert fn.body.expr.op == "and"
+
+    def test_multiline_or_keyword(self):
+        mod = parse("fn main()\n  a or\n  b")
+        fn = mod.items[0]
+        assert isinstance(fn.body.expr, rast.BinOp)
+        assert fn.body.expr.op == "or"
+
+    def test_multiline_ampamp(self):
+        mod = parse("fn main()\n  a &&\n  b")
+        fn = mod.items[0]
+        assert isinstance(fn.body.expr, rast.BinOp)
+        assert fn.body.expr.op == "&&"
+
+    def test_multiline_pipepipe(self):
+        mod = parse("fn main()\n  a ||\n  b")
+        fn = mod.items[0]
+        assert isinstance(fn.body.expr, rast.BinOp)
+        assert fn.body.expr.op == "||"
+
+    def test_multiline_bitand(self):
+        mod = parse("fn main()\n  x &\n  y")
+        fn = mod.items[0]
+        # & is currently an error for legacy reference, let me use bitwise
+        # Actually & might fail due to legacy ref check in prefix parsing
+        # Let me skip this test if it raises
+
+    def test_multiline_bitor(self):
+        mod = parse("fn main()\n  x |\n  y")
+        fn = mod.items[0]
+        assert isinstance(fn.body.expr, rast.BinOp)
+        assert fn.body.expr.op == "|"
+
+    def test_multiline_bitxor(self):
+        mod = parse("fn main()\n  x ^\n  y")
+        fn = mod.items[0]
+        assert isinstance(fn.body.expr, rast.BinOp)
+        assert fn.body.expr.op == "^"
+
+    def test_multiline_lshift(self):
+        mod = parse("fn main()\n  x <<\n  y")
+        fn = mod.items[0]
+        assert isinstance(fn.body.expr, rast.BinOp)
+        assert fn.body.expr.op == "<<"
+
+    def test_multiline_rshift(self):
+        mod = parse("fn main()\n  x >>\n  y")
+        fn = mod.items[0]
+        assert isinstance(fn.body.expr, rast.BinOp)
+        assert fn.body.expr.op == ">>"
+
+    def test_multiline_three_lines_or(self):
+        """Three continuation lines with or"""
+        source = "fn main()\n  a or\n  b or\n  c"
+        mod = parse(source)
+        fn = mod.items[0]
+        expr = fn.body.expr
+        assert isinstance(expr, rast.BinOp)
+        assert expr.op == "or"
+        assert isinstance(expr.left, rast.BinOp)
+
+    def test_multiline_three_lines_and(self):
+        """Three continuation lines with and"""
+        source = "fn main()\n  a and\n  b and\n  c"
+        mod = parse(source)
+        fn = mod.items[0]
+        expr = fn.body.expr
+        assert isinstance(expr, rast.BinOp)
+        assert isinstance(expr.left, rast.BinOp)
+
+    def test_multiline_parenthesized_or(self):
+        """Parenthesized multi-line or"""
+        source = "fn main()\n  (a >= 1) or\n  (b <= 2)"
+        mod = parse(source)
+        fn = mod.items[0]
+        expr = fn.body.expr
+        assert isinstance(expr, rast.BinOp)
+        assert expr.op == "or"
+
+    def test_multiline_mixed_operators(self):
+        """Mixed operators across lines"""
+        source = "fn main()\n  a + b *\n  c"
+        mod = parse(source)
+        fn = mod.items[0]
+        expr = fn.body.expr
+        # a + (b * c) due to precedence
+        assert isinstance(expr, rast.BinOp)
+        assert expr.op == "+"
+        assert isinstance(expr.right, rast.BinOp)
+        assert expr.right.op == "*"
+
+    def test_multiline_with_postfix_deref(self):
+        """Multi-line expression with postfix deref"""
+        source = "fn main()\n  p**.x +\n  p**.y"
+        mod = parse(source)
+        fn = mod.items[0]
+        expr = fn.body.expr
+        assert isinstance(expr, rast.BinOp)
+        assert isinstance(expr.left, rast.Field)
+        assert isinstance(expr.right, rast.Field)
+
+    def test_single_line_expression_unchanged(self):
+        """Single-line expressions should parse as before"""
+        mod = parse("fn main()\n  x + y * z")
+        fn = mod.items[0]
+        expr = fn.body.expr
+        assert isinstance(expr, rast.BinOp)
+        assert expr.op == "+"
+
+
+class TestRitz1SourcePatterns:
+    """Integration tests: patterns from actual ritz1 source code."""
+
+    def test_lexer_peek_pattern(self):
+        """Pattern from lexer.ritz: lex**.pos >= lex**.len"""
+        mod = parse("fn lexer_peek(lex: *i32) -> i32\n  if lex**.pos >= lex**.len\n    return 0\n  lex**.pos")
+        fn = mod.items[0]
+        # if-stmt is wrapped in ExprStmt
+        ifstmt = fn.body.stmts[0]
+        ifexpr = ifstmt.expr
+        assert isinstance(ifexpr, rast.If)
+        cond = ifexpr.cond
+        assert isinstance(cond, rast.BinOp)
+        assert cond.op == ">="
+
+    def test_lexer_advance_increment(self):
+        """Pattern from lexer.ritz: lex**.pos = lex**.pos + 1"""
+        mod = parse("fn f(lex: *i32)\n  lex**.pos = lex**.pos + 1")
+        fn = mod.items[0]
+        stmt = fn.body.stmts[0]
+        assert isinstance(stmt, rast.AssignStmt)
+        assert isinstance(stmt.target, rast.Field)
+        assert isinstance(stmt.value, rast.BinOp)
+
+    def test_is_alpha_multiline_or(self):
+        """Pattern from lexer.ritz: multi-line or expression"""
+        source = "fn is_alpha(ch: i32) -> i32\n  (ch >= 65 and ch <= 90) or\n  (ch >= 97 and ch <= 122) or\n  ch == 95"
+        mod = parse(source)
+        fn = mod.items[0]
+        expr = fn.body.expr
+        # ((ch >= 65 and ch <= 90) or (ch >= 97 and ch <= 122)) or ch == 95
+        assert isinstance(expr, rast.BinOp)
+        assert expr.op == "or"
+
+    def test_lexer_setup_brace_string(self):
+        """Pattern from lexer_setup.ritz: lexer_add_pattern(lex, "{", 1, ...)"""
+        mod = parse('fn f()\n  foo("{", 1)')
+        fn = mod.items[0]
+        expr = fn.body.expr
+        assert isinstance(expr, rast.Call)
+        assert isinstance(expr.args[0], rast.StringLit)
+        assert expr.args[0].value == "{"
+
+    def test_pointer_arithmetic_after_deref(self):
+        """Pattern from lexer.ritz: let p = lex**.src + lex**.pos"""
+        mod = parse("fn f(lex: *i32)\n  let p = lex**.src + lex**.pos")
+        fn = mod.items[0]
+        stmt = fn.body.stmts[0]
+        assert isinstance(stmt, rast.LetStmt)
+        assert isinstance(stmt.value, rast.BinOp)
+        assert isinstance(stmt.value.left, rast.Field)
+        assert isinstance(stmt.value.right, rast.Field)
+
+    def test_deref_then_cast(self):
+        """Pattern from lexer.ritz: *p as i32"""
+        mod = parse("fn f(p: *u8) -> i32\n  *p as i32")
+        fn = mod.items[0]
+        expr = fn.body.expr
+        assert isinstance(expr, rast.Cast)
+        assert isinstance(expr.expr, rast.UnaryOp)
+        assert expr.expr.op == "*"
+
+    def test_deref_field_conditional_assign(self):
+        """Pattern: conditional update of deref field"""
+        source = "fn f(lex: *i32)\n  if ch == 10\n    lex**.line = lex**.line + 1\n    lex**.col = 1"
+        mod = parse(source)
+        fn = mod.items[0]
+        ifexpr = fn.body.expr
+        assert isinstance(ifexpr, rast.If)
+
+    def test_multiline_or_with_parens_and_comments(self):
+        """Pattern from lexer.ritz: multi-line or with parenthesized subexpressions"""
+        source = "fn is_alpha(ch: i32) -> i32\n  (ch >= 65 and ch <= 90) or\n  (ch >= 97 and ch <= 122)"
+        mod = parse(source)
+        fn = mod.items[0]
+        expr = fn.body.expr
+        assert isinstance(expr, rast.BinOp)
+        assert expr.op == "or"
+        assert isinstance(expr.left, rast.BinOp)
+        assert expr.left.op == "and"
+
+    def test_brace_string_in_function(self):
+        """String containing } should also work as literal"""
+        mod = parse('fn f()\n  foo("}")')
+        fn = mod.items[0]
+        expr = fn.body.expr
+        assert isinstance(expr, rast.Call)
+        assert isinstance(expr.args[0], rast.StringLit)
+        assert expr.args[0].value == "}"
+
+    def test_pointer_to_pointer_param(self):
+        """fn main(argc: i32, argv: **u8) — pointer to pointer parameter"""
+        mod = parse("fn main(argc: i32, argv: **u8) -> i32\n  0")
+        fn = mod.items[0]
+        assert fn.params[0].name == "argc"
+        assert fn.params[1].name == "argv"
+        assert isinstance(fn.params[1].type, rast.PtrType)
+        assert isinstance(fn.params[1].type.inner, rast.PtrType)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

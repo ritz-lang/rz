@@ -632,6 +632,10 @@ class Parser:
 
             op_tok = self._advance()
 
+            # Skip newlines after binary operator for multi-line expressions
+            # e.g., `(a >= 1) or\n  (b <= 2)` continues on the next line
+            self._skip_newlines()
+
             if op_tok.type == TokenType.AS:
                 # Cast expression: expr as Type
                 # Don't allow type args to avoid ambiguity: `x as i64 < y`
@@ -817,6 +821,21 @@ class Parser:
                         expr = rast.MethodCall(expr.span, expr, field_tok.value, args)
                     else:
                         expr = rast.Field(expr.span, expr, field_tok.value)
+
+            elif self._at(TokenType.STAR) and self._peek(1).type == TokenType.STAR:
+                # Postfix dereference: expr** (followed by . or [ or ()
+                # Disambiguate from multiplication + prefix deref (a * *b):
+                # expr** is postfix deref only when followed by DOT, LBRACKET,
+                # LPAREN, or another ** (chained deref). Otherwise it's
+                # multiplication and prefix deref handled by parse_expr.
+                peek2_type = self._peek(2).type
+                if peek2_type in (TokenType.DOT, TokenType.LBRACKET, TokenType.LPAREN,
+                                  TokenType.STAR):
+                    self._advance()  # consume first *
+                    self._advance()  # consume second *
+                    expr = rast.UnaryOp(expr.span, '*', expr)
+                else:
+                    break
 
             elif self._at(TokenType.QUESTION):
                 # Try operator
