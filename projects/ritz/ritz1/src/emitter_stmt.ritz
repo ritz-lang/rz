@@ -646,6 +646,298 @@ fn emit_return(s: *EmitterState, stmt: *Stmt, ret_type: i32)
     else
         emit_str(s, "  ret void\n")
 
+# Decode a mangled Vec<T> struct name (e.g. "Vec$u8") into its element TYPE_*
+# constant. Only int element types are recognised — unknown/struct elements
+# fall back to TYPE_I64 so the loop alloca + load still produce valid IR.
+fn vec_elem_type_from_suffix(name: *u8, name_len: i32) -> i32
+    if name_len == 6
+        # "Vec$u8" / "Vec$i8"
+        if *(name + 4) == 117 and *(name + 5) == 56   # 'u8'
+            return TYPE_U8
+        if *(name + 4) == 105 and *(name + 5) == 56   # 'i8'
+            return TYPE_I8
+    else if name_len == 7
+        # "Vec$i32"/"u32"/"i64"/"u64"/"i16"/"u16"
+        if *(name + 4) == 105 and *(name + 5) == 51 and *(name + 6) == 50
+            return TYPE_I32
+        if *(name + 4) == 117 and *(name + 5) == 51 and *(name + 6) == 50
+            return TYPE_U32
+        if *(name + 4) == 105 and *(name + 5) == 54 and *(name + 6) == 52
+            return TYPE_I64
+        if *(name + 4) == 117 and *(name + 5) == 54 and *(name + 6) == 52
+            return TYPE_U64
+        if *(name + 4) == 105 and *(name + 5) == 49 and *(name + 6) == 54
+            return TYPE_I16
+        if *(name + 4) == 117 and *(name + 5) == 49 and *(name + 6) == 54
+            return TYPE_U16
+    TYPE_I64
+
+# Check if a struct type name begins with "Vec$" (i.e. Vec<T> monomorph).
+fn is_vec_struct_name(name: *u8, name_len: i32) -> i32
+    if name == null
+        return 0
+    if name_len < 5
+        return 0
+    if *(name + 0) != 86    # 'V'
+        return 0
+    if *(name + 1) != 101   # 'e'
+        return 0
+    if *(name + 2) != 99    # 'c'
+        return 0
+    if *(name + 3) != 36    # '$'
+        return 0
+    1
+
+# Lower `for x in iter { body }` (no `..`) — the iterable form.
+# Supports two shapes ritz1 can express today:
+#   • local `var x: [N]T` / `[N]T` stored in a slot (TYPE_ARRAY)
+#   • `@v` where `v` has TYPE_STRUCT name = "Vec$T" (borrow of Vec<T>)
+# Unknown shapes lower to an empty iteration so the enclosing function still
+# emits valid IR; the body is still code-generated (with the loop var bound
+# to elem-type i64) so that name lookups inside the body succeed.
+fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: i32)
+    var iter_kind: i32 = 0         # 0=unsupported, 1=local array, 2=vec-ref
+    var elem_type: i32 = TYPE_I64
+    var arr_size: i32 = 0
+    var data_reg: i32 = 0
+    var type_name: *u8 = null
+    var type_name_len: i32 = 0
+
+    let iter: *Expr = stmt.for_start
+    if iter != null
+        if iter.kind == EXPR_IDENT
+            let loc: *LocalVar = find_local_struct_name(s, iter.ident_ptr, iter.ident_len)
+            if loc != null
+                if loc.var_type == TYPE_ARRAY
+                    iter_kind = 1
+                    elem_type = loc.array_elem_type
+                    arr_size = loc.array_size
+                    data_reg = loc.reg
+        else if iter.kind == EXPR_UNARY
+            if iter.op == OP_ADDR or iter.op == OP_ADDR_MUT
+                if iter.operand != null
+                    if iter.operand.kind == EXPR_IDENT
+                        let loc: *LocalVar = find_local_struct_name(s, iter.operand.ident_ptr, iter.operand.ident_len)
+                        if loc != null
+                            if loc.var_type == TYPE_STRUCT
+                                if is_vec_struct_name(loc.type_name, loc.type_name_len) == 1
+                                    iter_kind = 2
+                                    elem_type = vec_elem_type_from_suffix(loc.type_name, loc.type_name_len)
+                                    type_name = loc.type_name
+                                    type_name_len = loc.type_name_len
+                                    data_reg = loc.reg
+
+    # Index storage (i64 counter).
+    let idx_reg: i32 = next_reg(s)
+    emit_str(s, "  ")
+    emit_reg(s, idx_reg)
+    emit_str(s, " = alloca i64\n")
+    emit_str(s, "  store i64 0, ptr ")
+    emit_reg(s, idx_reg)
+    emit_str(s, "\n")
+
+    # Loop variable — typed to elem_type so body reads get the right width.
+    let var_reg: i32 = next_reg(s)
+    emit_str(s, "  ")
+    emit_reg(s, var_reg)
+    emit_str(s, " = alloca ")
+    emit_llvm_type(s, elem_type)
+    emit_str(s, "\n")
+
+    add_local(s, stmt.for_var, stmt.for_var_len, var_reg, elem_type)
+
+    let cond_label: i32 = next_label(s)
+    let body_label: i32 = next_label(s)
+    let incr_label: i32 = next_label(s)
+    let end_label: i32 = next_label(s)
+
+    let old_break: i32 = s.break_label
+    let old_continue: i32 = s.continue_label
+    s.break_label = end_label
+    s.continue_label = incr_label
+
+    emit_str(s, "  br label %")
+    emit_label(s, cond_label)
+    emit_str(s, "\n")
+
+    # cond: idx < len
+    emit_label(s, cond_label)
+    emit_str(s, ":\n")
+    let idx_val: i32 = next_reg(s)
+    emit_str(s, "  ")
+    emit_reg(s, idx_val)
+    emit_str(s, " = load i64, ptr ")
+    emit_reg(s, idx_reg)
+    emit_str(s, "\n")
+
+    var len_val: i32 = 0
+    if iter_kind == 1
+        len_val = next_reg(s)
+        emit_str(s, "  ")
+        emit_reg(s, len_val)
+        emit_str(s, " = add i64 0, ")
+        emit_int(s, arr_size as i64)
+        emit_str(s, "\n")
+    else if iter_kind == 2
+        let len_ptr: i32 = next_reg(s)
+        emit_str(s, "  ")
+        emit_reg(s, len_ptr)
+        emit_str(s, " = getelementptr %")
+        emit_name(s, type_name, type_name_len)
+        emit_str(s, ", ptr ")
+        emit_reg(s, data_reg)
+        emit_str(s, ", i32 0, i32 1\n")
+        len_val = next_reg(s)
+        emit_str(s, "  ")
+        emit_reg(s, len_val)
+        emit_str(s, " = load i64, ptr ")
+        emit_reg(s, len_ptr)
+        emit_str(s, "\n")
+    else
+        # Unsupported iter — always-false loop keeps IR valid.
+        len_val = next_reg(s)
+        emit_str(s, "  ")
+        emit_reg(s, len_val)
+        emit_str(s, " = add i64 0, 0  ; unsupported for-iterable\n")
+
+    let cmp_reg: i32 = next_reg(s)
+    emit_str(s, "  ")
+    emit_reg(s, cmp_reg)
+    emit_str(s, " = icmp ult i64 ")
+    emit_reg(s, idx_val)
+    emit_str(s, ", ")
+    emit_reg(s, len_val)
+    emit_str(s, "\n")
+    emit_str(s, "  br i1 ")
+    emit_reg(s, cmp_reg)
+    emit_str(s, ", label %")
+    emit_label(s, body_label)
+    emit_str(s, ", label %")
+    emit_label(s, end_label)
+    emit_str(s, "\n")
+
+    # body: load current element, store into loop var, then recurse body.
+    emit_label(s, body_label)
+    emit_str(s, ":\n")
+
+    let idx_val2: i32 = next_reg(s)
+    emit_str(s, "  ")
+    emit_reg(s, idx_val2)
+    emit_str(s, " = load i64, ptr ")
+    emit_reg(s, idx_reg)
+    emit_str(s, "\n")
+
+    if iter_kind == 1
+        let elem_ptr: i32 = next_reg(s)
+        emit_str(s, "  ")
+        emit_reg(s, elem_ptr)
+        emit_str(s, " = getelementptr [")
+        emit_int(s, arr_size as i64)
+        emit_str(s, " x ")
+        emit_llvm_type(s, elem_type)
+        emit_str(s, "], ptr ")
+        emit_reg(s, data_reg)
+        emit_str(s, ", i64 0, i64 ")
+        emit_reg(s, idx_val2)
+        emit_str(s, "\n")
+        let elem_val: i32 = next_reg(s)
+        emit_str(s, "  ")
+        emit_reg(s, elem_val)
+        emit_str(s, " = load ")
+        emit_llvm_type(s, elem_type)
+        emit_str(s, ", ptr ")
+        emit_reg(s, elem_ptr)
+        emit_str(s, "\n")
+        emit_str(s, "  store ")
+        emit_llvm_type(s, elem_type)
+        emit_str(s, " ")
+        emit_reg(s, elem_val)
+        emit_str(s, ", ptr ")
+        emit_reg(s, var_reg)
+        emit_str(s, "\n")
+    else if iter_kind == 2
+        # Vec.data at field 0, Vec.len at field 1 — already used above.
+        let data_ptr_ptr: i32 = next_reg(s)
+        emit_str(s, "  ")
+        emit_reg(s, data_ptr_ptr)
+        emit_str(s, " = getelementptr %")
+        emit_name(s, type_name, type_name_len)
+        emit_str(s, ", ptr ")
+        emit_reg(s, data_reg)
+        emit_str(s, ", i32 0, i32 0\n")
+        let data_ptr: i32 = next_reg(s)
+        emit_str(s, "  ")
+        emit_reg(s, data_ptr)
+        emit_str(s, " = load ptr, ptr ")
+        emit_reg(s, data_ptr_ptr)
+        emit_str(s, "\n")
+        let elem_ptr: i32 = next_reg(s)
+        emit_str(s, "  ")
+        emit_reg(s, elem_ptr)
+        emit_str(s, " = getelementptr ")
+        emit_llvm_type(s, elem_type)
+        emit_str(s, ", ptr ")
+        emit_reg(s, data_ptr)
+        emit_str(s, ", i64 ")
+        emit_reg(s, idx_val2)
+        emit_str(s, "\n")
+        let elem_val: i32 = next_reg(s)
+        emit_str(s, "  ")
+        emit_reg(s, elem_val)
+        emit_str(s, " = load ")
+        emit_llvm_type(s, elem_type)
+        emit_str(s, ", ptr ")
+        emit_reg(s, elem_ptr)
+        emit_str(s, "\n")
+        emit_str(s, "  store ")
+        emit_llvm_type(s, elem_type)
+        emit_str(s, " ")
+        emit_reg(s, elem_val)
+        emit_str(s, ", ptr ")
+        emit_reg(s, var_reg)
+        emit_str(s, "\n")
+
+    # Body statements.
+    var body_stmt: *Stmt = stmt.for_body
+    while body_stmt != null
+        emit_stmt(s, body_stmt, ret_type)
+        body_stmt = body_stmt.next
+
+    emit_str(s, "  br label %")
+    emit_label(s, incr_label)
+    emit_str(s, "\n")
+
+    # incr: idx = idx + 1
+    emit_label(s, incr_label)
+    emit_str(s, ":\n")
+    let load2_reg: i32 = next_reg(s)
+    emit_str(s, "  ")
+    emit_reg(s, load2_reg)
+    emit_str(s, " = load i64, ptr ")
+    emit_reg(s, idx_reg)
+    emit_str(s, "\n")
+    let incr_val: i32 = next_reg(s)
+    emit_str(s, "  ")
+    emit_reg(s, incr_val)
+    emit_str(s, " = add i64 ")
+    emit_reg(s, load2_reg)
+    emit_str(s, ", 1\n")
+    emit_str(s, "  store i64 ")
+    emit_reg(s, incr_val)
+    emit_str(s, ", ptr ")
+    emit_reg(s, idx_reg)
+    emit_str(s, "\n")
+    emit_str(s, "  br label %")
+    emit_label(s, cond_label)
+    emit_str(s, "\n")
+
+    # end
+    emit_label(s, end_label)
+    emit_str(s, ":\n")
+
+    s.break_label = old_break
+    s.continue_label = old_continue
+
 fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
     if stmt.kind == STMT_VAR_DECL
         emit_var_decl(s, stmt)
@@ -819,7 +1111,14 @@ fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         s.continue_label = old_continue
 
     else if stmt.kind == STMT_FOR
-        # For-loop: for i in start..end { body }
+        # For-loop. Two shapes:
+        #   for i in start..end   — range; for_end != null
+        #   for x in iterable     — array/Vec-ref; for_end == null
+        if stmt.for_end == null
+            emit_for_iterable(s, stmt, ret_type)
+            return
+
+        # For-loop (range): for i in start..end { body }
         # Desugar to:
         #   %i = alloca i64
         #   store i64 %start, ptr %i
