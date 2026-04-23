@@ -571,6 +571,116 @@ fn find_base_expr(e: *Expr) -> *Expr
         return find_base_expr(e.left)
     return e
 
+# Compute size in bytes of a named struct with proper C-style alignment.
+# Each field is aligned to its natural alignment; final size rounded up to struct alignment.
+fn get_struct_size_by_name(s: *EmitterState, name: *u8, name_len: i32) -> i64
+    if name == null or name_len == 0
+        return 8
+    let st: *StructDef = find_struct(s, name, name_len)
+    if st == null
+        return 8
+    var offset: i64 = 0
+    var max_align: i64 = 1
+    var f: *StructField = st.fields
+    while f != null
+        var fsize: i64 = 8
+        var falign: i64 = 8
+        if f.field_type == TYPE_U8 or f.field_type == TYPE_I8
+            fsize = 1
+            falign = 1
+        else if f.field_type == TYPE_U16 or f.field_type == TYPE_I16
+            fsize = 2
+            falign = 2
+        else if f.field_type == TYPE_U32 or f.field_type == TYPE_I32
+            fsize = 4
+            falign = 4
+        else if f.field_type == TYPE_ARRAY
+            # Array: size = elem_size * count, align = elem_align
+            var esize: i64 = 8
+            var ealign: i64 = 8
+            if f.array_elem_type == TYPE_U8 or f.array_elem_type == TYPE_I8
+                esize = 1
+                ealign = 1
+            else if f.array_elem_type == TYPE_U16 or f.array_elem_type == TYPE_I16
+                esize = 2
+                ealign = 2
+            else if f.array_elem_type == TYPE_U32 or f.array_elem_type == TYPE_I32
+                esize = 4
+                ealign = 4
+            else if f.array_elem_type == TYPE_STRUCT and f.array_elem_type_name_len > 0
+                esize = get_struct_size_by_name(s, f.array_elem_type_name, f.array_elem_type_name_len)
+                ealign = 8  # struct alignment (simplified to 8)
+            fsize = esize * (f.array_size as i64)
+            falign = ealign
+        else if f.field_type == TYPE_STRUCT and f.field_type_name_len > 0
+            fsize = get_struct_size_by_name(s, f.field_type_name, f.field_type_name_len)
+            falign = 8  # struct alignment (simplified to 8)
+        # else: pointer/i64/ref — size 8, align 8 (default)
+
+        # Align offset up to falign
+        let rem: i64 = offset % falign
+        if rem != 0
+            offset = offset + (falign - rem)
+        offset = offset + fsize
+        if falign > max_align
+            max_align = falign
+        f = f.next
+
+    # Round final size up to struct alignment
+    if max_align > 1
+        let rem2: i64 = offset % max_align
+        if rem2 != 0
+            offset = offset + (max_align - rem2)
+    return offset
+
+# Compute size of pointed-to element for pointer arithmetic on a pointer expression.
+# Handles identifiers (looks up LocalVar.pointee_type + type_name) and member accesses
+# (looks up struct field's pointee info). Returns 1 if unknown.
+fn get_ptr_elem_size(s: *EmitterState, e: *Expr) -> i64
+    if e.kind == EXPR_IDENT
+        let loc: *LocalVar = find_local_struct_name(s, e.ident_ptr, e.ident_len)
+        if loc == null
+            return 1
+        # For TYPE_PTR_PTR the element is a pointer (8 bytes)
+        if loc.var_type == TYPE_PTR_PTR
+            return 8
+        if loc.var_type == TYPE_PTR or loc.var_type == TYPE_REF or loc.var_type == TYPE_MUT_REF
+            # Pointee is a struct — use struct size
+            if loc.pointee_type == TYPE_STRUCT and loc.type_name_len > 0
+                return get_struct_size_by_name(s, loc.type_name, loc.type_name_len)
+            if loc.pointee_type == TYPE_U16 or loc.pointee_type == TYPE_I16
+                return 2
+            if loc.pointee_type == TYPE_U32 or loc.pointee_type == TYPE_I32
+                return 4
+            if loc.pointee_type == TYPE_U64 or loc.pointee_type == TYPE_I64
+                return 8
+            return 1  # Default *u8/*i8
+        return 1
+    if e.kind == EXPR_MEMBER
+        if e.left.kind == EXPR_IDENT
+            let loc2: *LocalVar = find_local_struct_name(s, e.left.ident_ptr, e.left.ident_len)
+            if loc2 != null and loc2.type_name_len > 0
+                let st: *StructDef = find_struct(s, loc2.type_name, loc2.type_name_len)
+                if st != null
+                    let field_idx: i32 = find_field_index(st, e.ident_ptr, e.ident_len)
+                    if field_idx >= 0
+                        let field: *StructField = get_field_type(st, field_idx)
+                        if field.field_type == TYPE_PTR_PTR
+                            return 8
+                        if field.field_type == TYPE_PTR or field.field_type == TYPE_REF or field.field_type == TYPE_MUT_REF
+                            # Field is pointer-to-something — field_type_name holds the pointee struct name
+                            if field.field_type_name_len > 0
+                                return get_struct_size_by_name(s, field.field_type_name, field.field_type_name_len)
+                            if field.array_elem_type == TYPE_U16 or field.array_elem_type == TYPE_I16
+                                return 2
+                            if field.array_elem_type == TYPE_U32 or field.array_elem_type == TYPE_I32
+                                return 4
+                            if field.array_elem_type == TYPE_U64 or field.array_elem_type == TYPE_I64
+                                return 8
+                            return 1
+        return 1
+    return 1
+
 # Helper: get pointee type for a struct member that is a pointer
 # e.g., for span.ptr (where ptr is *u8), returns TYPE_U8
 fn get_member_pointee_type(s: *EmitterState, e: *Expr) -> i32
@@ -1078,20 +1188,29 @@ fn emit_expr(s: *EmitterState, e: *Expr) -> i32
 
     else if e.kind == EXPR_BINARY
         # Check if this is pointer arithmetic (ptr + int or ptr - int)
-        # If left operand is a pointer type, scale the right operand
+        # If left operand is a pointer type, scale the right operand by pointee size.
+        # Handles both simple identifier (p + i) and member access (s.ptr + i).
         var is_ptr_arith: i32 = 0
         var ptr_elem_size: i64 = 1
         if e.op == OP_ADD or e.op == OP_SUB
             if e.left.kind == EXPR_IDENT
                 let left_type: i32 = find_local_type(s, e.left.ident_ptr, e.left.ident_len)
-                if left_type == TYPE_PTR_PTR
-                    # Pointer-to-pointer: scale by 8 (pointer size)
+                if left_type == TYPE_PTR or left_type == TYPE_PTR_PTR or left_type == TYPE_REF or left_type == TYPE_MUT_REF
                     is_ptr_arith = 1
-                    ptr_elem_size = 8
-                else if left_type == TYPE_PTR
-                    # Pointer-to-byte: scale by 1
-                    is_ptr_arith = 1
-                    ptr_elem_size = 1
+                    ptr_elem_size = get_ptr_elem_size(s, e.left)
+            else if e.left.kind == EXPR_MEMBER
+                # Member field access — check if field is a pointer type
+                if e.left.left.kind == EXPR_IDENT
+                    let base_loc: *LocalVar = find_local_struct_name(s, e.left.left.ident_ptr, e.left.left.ident_len)
+                    if base_loc != null and base_loc.type_name_len > 0
+                        let base_st: *StructDef = find_struct(s, base_loc.type_name, base_loc.type_name_len)
+                        if base_st != null
+                            let fi: i32 = find_field_index(base_st, e.left.ident_ptr, e.left.ident_len)
+                            if fi >= 0
+                                let fld: *StructField = get_field_type(base_st, fi)
+                                if fld.field_type == TYPE_PTR or fld.field_type == TYPE_PTR_PTR or fld.field_type == TYPE_REF or fld.field_type == TYPE_MUT_REF
+                                    is_ptr_arith = 1
+                                    ptr_elem_size = get_ptr_elem_size(s, e.left)
 
         let left_reg: i32 = emit_expr(s, e.left)
         let right_reg: i32 = emit_expr(s, e.right)
@@ -1589,24 +1708,8 @@ fn emit_expr(s: *EmitterState, e: *Expr) -> i32
                     else if memcmp(e.args.ident_ptr, "i64", 3) == 0
                         type_size = 8
                 else
-                    # Check if it's a struct
-                    let st: *StructDef = find_struct(s, e.args.ident_ptr, e.args.ident_len)
-                    if st != null
-                        # Calculate struct size (simplified: sum of fields)
-                        # TODO: Proper alignment
-                        var size: i64 = 0
-                        var f: *StructField = st.fields
-                        while f != null
-                            if f.field_type == TYPE_U8 or f.field_type == TYPE_I8
-                                size = size + 1
-                            else if f.field_type == TYPE_U16 or f.field_type == TYPE_I16
-                                size = size + 2
-                            else if f.field_type == TYPE_U32 or f.field_type == TYPE_I32
-                                size = size + 4
-                            else
-                                size = size + 8  # Pointer, i64, etc.
-                            f = f.next
-                        type_size = size
+                    # Check if it's a struct — use proper C-style aligned size
+                    type_size = get_struct_size_by_name(s, e.args.ident_ptr, e.args.ident_len)
             let result: i32 = next_reg(s)
             emit_str(s, "  ")
             emit_reg(s, result)
@@ -1833,8 +1936,11 @@ fn emit_expr(s: *EmitterState, e: *Expr) -> i32
                 emit_str(s, " = call i16 @")
             else if ret_type == TYPE_I8 or ret_type == TYPE_U8
                 emit_str(s, " = call i8 @")
-            else if ret_type == TYPE_PTR or ret_type == TYPE_REF or ret_type == TYPE_MUT_REF
+            else if ret_type == TYPE_MUT_REF
                 emit_str(s, " = call ptr @")
+            else if ret_type == TYPE_PTR or ret_type == TYPE_REF
+                # Match definition's return type (emit_llvm_type emits i64 for TYPE_PTR/TYPE_REF)
+                emit_str(s, " = call i64 @")
             else
                 emit_str(s, " = call i64 @")
         emit_name(s, @full_name[0], full_len)
@@ -1910,7 +2016,8 @@ fn emit_expr(s: *EmitterState, e: *Expr) -> i32
             emit_reg(s, call_result)
             emit_str(s, " to i64\n")
             return ext
-        else if ret_type == TYPE_PTR or ret_type == TYPE_REF or ret_type == TYPE_MUT_REF
+        else if ret_type == TYPE_MUT_REF
+            # TYPE_MUT_REF call returns ptr — convert to i64 for consistent value representation
             let pti: i32 = next_reg(s)
             emit_str(s, "  ")
             emit_reg(s, pti)
@@ -1918,6 +2025,7 @@ fn emit_expr(s: *EmitterState, e: *Expr) -> i32
             emit_reg(s, call_result)
             emit_str(s, " to i64\n")
             return pti
+        # TYPE_PTR/TYPE_REF calls now return i64 directly — no conversion needed
         return call_result
 
     else if e.kind == EXPR_INDEX
@@ -2440,14 +2548,19 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
         emit_str(s, "[")
         emit_int(s, stmt.var_array_size as i64)
         emit_str(s, " x ")
-        if stmt.var_array_elem_type == TYPE_I32
+        if stmt.var_array_elem_type == TYPE_I32 or stmt.var_array_elem_type == TYPE_U32
             emit_str(s, "i32")
-        else if stmt.var_array_elem_type == TYPE_I64
+        else if stmt.var_array_elem_type == TYPE_I64 or stmt.var_array_elem_type == TYPE_U64
             emit_str(s, "i64")
         else if stmt.var_array_elem_type == TYPE_U8 or stmt.var_array_elem_type == TYPE_I8
             emit_str(s, "i8")
+        else if stmt.var_array_elem_type == TYPE_U16 or stmt.var_array_elem_type == TYPE_I16
+            emit_str(s, "i16")
         else if stmt.var_array_elem_type == TYPE_PTR or stmt.var_array_elem_type == TYPE_PTR_PTR
             emit_str(s, "ptr")
+        else if stmt.var_array_elem_type == TYPE_STRUCT and stmt.var_type_name_len > 0
+            emit_str(s, "%")
+            emit_name(s, stmt.var_type_name, stmt.var_type_name_len)
         else
             emit_str(s, "i64")
         emit_str(s, "]")
