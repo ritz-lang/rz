@@ -391,10 +391,11 @@ class LLVMEmitter:
     def _ritz_type_to_llvm(self, ty: rast.Type) -> ir.Type:
         """Convert a Ritz type to an LLVM type."""
         if isinstance(ty, rast.NamedType):
-            # If this is a generic instantiation (e.g., Span<u8>), resolve to
-            # its specialized LLVM type — otherwise we would fall through to
-            # the opaque `i8` placeholder and downstream field access would
-            # fail.
+            # If this is a generic instantiation (e.g., Span<u8>, Vec<u8>,
+            # Option<i32>, Result<Vec<u8>, StrView>), resolve to the already
+            # registered specialization rather than falling through to the
+            # opaque `i8` placeholder, which would break downstream field
+            # access.
             if ty.args:
                 specialized_name = self._get_specialized_type_name(ty)
                 if specialized_name in self.union_types:
@@ -409,6 +410,11 @@ class LLVMEmitter:
                 synthesized_struct = self._ensure_builtin_generic_struct_specialization(ty)
                 if synthesized_struct and synthesized_struct in self.struct_types:
                     return self.struct_types[synthesized_struct]
+                # Synthesize built-in generic enums (Result<T,E>, Option<T>)
+                # on demand when monomorphization missed them.
+                synthesized = self._ensure_builtin_generic_specialization(ty)
+                if synthesized and synthesized in self.enum_types:
+                    return self.enum_types[synthesized][0]
             mapping = {
                 'i8': self.i8,
                 'i16': self.i16,
@@ -451,6 +457,17 @@ class LLVMEmitter:
             # Check for struct types
             if ty.name in self.struct_types:
                 return self.struct_types[ty.name]
+            # Legacy mangling fallback: monomorphizer sometimes uses '_' as a
+            # separator for the first generic arg (e.g. Vec_u8) while the
+            # struct registry uses '$' (Vec$u8). Try the dollar-form variant.
+            if '_' in ty.name and '$' not in ty.name:
+                legacy_name = ty.name.replace('_', '$', 1)
+                if legacy_name in self.union_types:
+                    return self.union_types[legacy_name][0]
+                if legacy_name in self.enum_types:
+                    return self.enum_types[legacy_name][0]
+                if legacy_name in self.struct_types:
+                    return self.struct_types[legacy_name]
             # Treat unknown types as opaque struct types (i8 placeholder)
             # This allows forward references and unknown struct types
             return self.i8
@@ -530,6 +547,54 @@ class LLVMEmitter:
             ('ptr', rast.PtrType(ty.span, ty.args[0], mutable=False)),
             ('len', rast.NamedType(ty.span, 'i64', [])),
         ]
+        return specialized_name
+
+    def _ensure_builtin_generic_specialization(self, ty: rast.NamedType) -> Optional[str]:
+        """Synthesize Result/Option specializations on demand when monomorphization missed them."""
+        if not ty.args:
+            return None
+
+        specialized_name = self._get_specialized_type_name(ty)
+        if specialized_name in self.enum_types:
+            return specialized_name
+        if ty.name == 'Result' and len(ty.args) == 2:
+            variants = [
+                rast.Variant(ty.span, 'Ok', [ty.args[0]]),
+                rast.Variant(ty.span, 'Err', [ty.args[1]]),
+            ]
+        elif ty.name == 'Option' and len(ty.args) == 1:
+            variants = [
+                rast.Variant(ty.span, 'Some', [ty.args[0]]),
+                rast.Variant(ty.span, 'None', []),
+            ]
+        else:
+            return None
+
+        enum_type = self.module.context.get_identified_type(specialized_name)
+        self.enum_types[specialized_name] = (enum_type, variants)
+        for variant in variants:
+            self.variant_to_enum[variant.name] = specialized_name
+
+        max_size = 0
+        max_align = 1
+        for variant in variants:
+            if variant.fields:
+                field_llvm_ty = self._ritz_type_to_llvm(variant.fields[0])
+                size = self._type_size_bytes(field_llvm_ty)
+                align = self._type_size_bytes(field_llvm_ty)
+                max_size = max(max_size, size)
+                max_align = max(max_align, align)
+
+        if max_size > 0:
+            tag_size = 1
+            padding_needed = (max_align - (tag_size % max_align)) % max_align
+            if padding_needed > 0:
+                enum_type.set_body(self.i8, ir.ArrayType(self.i8, padding_needed), ir.ArrayType(self.i8, max_size))
+            else:
+                enum_type.set_body(self.i8, ir.ArrayType(self.i8, max_size))
+        else:
+            enum_type.set_body(self.i8)
+
         return specialized_name
 
     def _type_size_bytes(self, ty: ir.Type) -> int:
@@ -1910,9 +1975,25 @@ class LLVMEmitter:
             for i, (field_type, arg) in enumerate(zip(variant.fields, args)):
                 arg_val = self._emit_expr(arg)
                 llvm_field_type = self._ritz_type_to_llvm(field_type)
+                # Generic placeholder fields (e.g., T/E in unspecialized Result/Option)
+                # lower to i8; use the argument's concrete LLVM type instead so the
+                # payload (e.g. Vec<u8>) is preserved.
+                if (
+                    isinstance(field_type, rast.NamedType)
+                    and not field_type.args
+                    and len(field_type.name) == 1
+                    and field_type.name.isupper()
+                    and llvm_field_type == self.i8
+                    and arg_val.type != self.i8
+                ):
+                    llvm_field_type = arg_val.type
 
                 # Convert arg to field type (e.g., i64 literal -> i32)
                 arg_val = self._convert_type(arg_val, llvm_field_type)
+                # If conversion could not realize an unresolved generic i8 placeholder,
+                # keep the concrete argument type to preserve payload fidelity.
+                if arg_val.type != llvm_field_type and llvm_field_type == self.i8:
+                    llvm_field_type = arg_val.type
 
                 # Cast data buffer to pointer to field type
                 field_ptr = self.builder.bitcast(
@@ -1952,6 +2033,34 @@ class LLVMEmitter:
             # Fallback to regular expression emission
             return self._emit_expr(expr)
 
+    def _resolve_enum_type_name(self, ty: Optional['rast.Type'], llvm_hint: Optional[ir.Type] = None) -> Optional[str]:
+        """Resolve a Ritz type annotation to a concrete enum type name when possible.
+
+        Used when we need to disambiguate which monomorphized enum (e.g.
+        Result_Vec_u8_StrView vs Result_i32_StrView) is meant for a variant
+        constructor based on the surrounding context (function return type,
+        let binding annotation, etc.).
+        """
+        if llvm_hint is not None:
+            for enum_name, (enum_ty, _) in self.enum_types.items():
+                if enum_ty == llvm_hint:
+                    return enum_name
+        if not isinstance(ty, rast.NamedType):
+            return None
+        if ty.args:
+            specialized_name = self._get_specialized_type_name(ty)
+            if specialized_name in self.enum_types:
+                return specialized_name
+        if ty.name in self.enum_types:
+            return ty.name
+        return None
+
+    def _emit_expr_with_expected_enum(self, expr: rast.Expr, expected_enum_name: Optional[str]) -> ir.Value:
+        """Emit expression, forcing enum variant constructors to a specific enum type."""
+        if expected_enum_name and self._is_enum_variant_call(expr):
+            return self._emit_enum_variant_with_type(expr, expected_enum_name)
+        return self._emit_expr(expr)
+
     def _emit_enum_variant_constructor_for_type(self, variant_name: str, args: List[rast.Expr], enum_name: str) -> ir.Value:
         """Emit code to construct an enum variant for a specific enum type.
 
@@ -1983,9 +2092,25 @@ class LLVMEmitter:
             for i, (field_type, arg) in enumerate(zip(variant.fields, args)):
                 arg_val = self._emit_expr(arg)
                 llvm_field_type = self._ritz_type_to_llvm(field_type)
+                # Generic placeholder fields (e.g., T/E in unspecialized Result/Option)
+                # lower to i8; use the argument's concrete LLVM type instead so the
+                # payload (e.g. Vec<u8>) is preserved.
+                if (
+                    isinstance(field_type, rast.NamedType)
+                    and not field_type.args
+                    and len(field_type.name) == 1
+                    and field_type.name.isupper()
+                    and llvm_field_type == self.i8
+                    and arg_val.type != self.i8
+                ):
+                    llvm_field_type = arg_val.type
 
                 # Convert arg to field type (e.g., i64 literal -> i32)
                 arg_val = self._convert_type(arg_val, llvm_field_type)
+                # If conversion could not realize an unresolved generic i8 placeholder,
+                # keep the concrete argument type to preserve payload fidelity.
+                if arg_val.type != llvm_field_type and llvm_field_type == self.i8:
+                    llvm_field_type = arg_val.type
 
                 # Cast data buffer to pointer to field type
                 field_ptr = self.builder.bitcast(
@@ -2365,10 +2490,29 @@ class LLVMEmitter:
             if type_name.startswith(prefix):
                 # Extract type parameter suffix (e.g., "u8" from "Vec$u8")
                 type_param = type_name[len(prefix):]
-                # Try: vec_len$u8, vec_swap$u8, etc.
-                candidate = f"{fn_prefix}{method_name}${type_param}"
-                if candidate in self.functions:
-                    return candidate
+                base = f"{fn_prefix}{method_name}"
+
+                # Preferred exact forms.
+                exact_candidates = [
+                    f"{base}${type_param}",
+                    base,
+                ]
+                for candidate in exact_candidates:
+                    if candidate in self.functions:
+                        return candidate
+
+                # Namespaced/mangled fallback forms (strict suffix match only).
+                for name in self.functions:
+                    if name.endswith(f"{base}${type_param}"):
+                        return name
+                # Generic template fallback (e.g., vec_push$T) if specialization missing.
+                for generic_param in ("T", "U", "V", "K", "E"):
+                    generic_candidate = f"{base}${generic_param}"
+                    if generic_candidate in self.functions:
+                        return generic_candidate
+                for name in self.functions:
+                    if any(name.endswith(f"{base}${gp}") for gp in ("T", "U", "V", "K", "E")):
+                        return name
 
         # Non-generic types: String, GrowBuf, Buffer, etc.
         non_generic_mappings = {
@@ -2383,6 +2527,12 @@ class LLVMEmitter:
             candidate = f"{fn_prefix}{method_name}"
             if candidate in self.functions:
                 return candidate
+            for name in self.functions:
+                if name.endswith(candidate):
+                    return name
+            for name in self.functions:
+                if candidate in name:
+                    return name
 
         return None
 
@@ -2854,7 +3004,12 @@ class LLVMEmitter:
                 # Set expected type for closure inference if return type is a function type
                 if isinstance(fn_def.ret_type, rast.FnType):
                     self.closure_expected_type = fn_def.ret_type
-                last_val = self._emit_expr(fn_def.body.expr)
+                # If the trailing expression is a bare enum variant constructor
+                # (e.g. `Ok(data)`), resolve which monomorphized enum the
+                # function's return type refers to, so we use the right
+                # specialization instead of an arbitrary one from variant_to_enum.
+                expected_enum_name = self._resolve_enum_type_name(fn_def.ret_type, ret_type)
+                last_val = self._emit_expr_with_expected_enum(fn_def.body.expr, expected_enum_name)
                 self.closure_expected_type = None  # Clear context
                 last_val = self._convert_type(last_val, ret_type)
                 # Emit drops before returning (excluding moved variable)
@@ -6741,8 +6896,16 @@ class LLVMEmitter:
                         # Argument is already a pointer type - just emit it
                         val = self._emit_expr(arg)
                     else:
-                        # Reference parameter: emit address of the argument
-                        val = self._emit_lvalue_addr(arg)
+                        # Reference parameter: emit address of the argument.
+                        # If the argument is an rvalue (e.g. a method call result),
+                        # spill it to a stack slot so we can take its address.
+                        try:
+                            val = self._emit_lvalue_addr(arg)
+                        except ValueError:
+                            tmp_val = self._emit_expr(arg)
+                            tmp = self._alloca_in_entry_block(tmp_val.type, "arg.tmp")
+                            self.builder.store(tmp_val, tmp)
+                            val = tmp
                 else:
                     # Moved/value parameter: emit value normally
                     val = self._emit_expr(arg)
@@ -7442,6 +7605,52 @@ class LLVMEmitter:
         # Not a SIMD builtin
         return None
 
+    def _try_emit_enum_predicate_method(
+        self,
+        expr: rast.MethodCall,
+        type_name: str,
+    ) -> Optional[ir.Value]:
+        """Emit Option/Result predicate methods directly via tag comparison.
+
+        This bypasses the need for a registered ritzlib helper specialization
+        (e.g. result_is_ok$i32_StrView) which the monomorphizer may not have
+        instantiated when the receiver's type was inferred only from a call
+        return rather than an explicit annotation.
+        """
+        if expr.args:
+            return None
+        if expr.method not in ('is_some', 'is_none', 'is_ok', 'is_err'):
+            return None
+        if type_name not in self.enum_types:
+            return None
+
+        target_variant = {
+            'is_some': 'Some',
+            'is_none': 'None',
+            'is_ok': 'Ok',
+            'is_err': 'Err',
+        }[expr.method]
+
+        enum_type, variants = self.enum_types[type_name]
+        tag_idx = None
+        for i, variant in enumerate(variants):
+            if variant.name == target_variant:
+                tag_idx = i
+                break
+        if tag_idx is None:
+            return None
+
+        receiver = self._emit_expr(expr.expr)
+        if isinstance(receiver.type, ir.PointerType) and receiver.type.pointee == enum_type:
+            receiver = self.builder.load(receiver)
+        receiver = self._convert_type(receiver, enum_type)
+
+        enum_alloca = self.builder.alloca(enum_type, name="enum.pred")
+        self.builder.store(receiver, enum_alloca)
+        tag_ptr = self.builder.gep(enum_alloca, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)])
+        tag_val = self.builder.load(tag_ptr)
+        return self.builder.icmp_unsigned('==', tag_val, ir.Constant(self.i8, tag_idx))
+
     def _try_emit_bitops_intrinsic(self, expr: rast.MethodCall, type_name: str) -> ir.Value:
         """Try to emit a BitOps intrinsic for primitive integer types.
 
@@ -7631,6 +7840,15 @@ class LLVMEmitter:
         if float_result is not None:
             return float_result
 
+        # Built-in enum predicate methods (is_some/is_none/is_ok/is_err) for
+        # Option/Result. Emit a direct tag comparison rather than relying on
+        # ritzlib helper specializations, which the monomorphizer can't always
+        # see (e.g. when the receiver's type is inferred from a function call
+        # without an explicit annotation).
+        enum_predicate = self._try_emit_enum_predicate_method(expr, type_name)
+        if enum_predicate is not None:
+            return enum_predicate
+
         method_key = (type_name, expr.method)
         used_ufcs_fallback = False  # Track if we used UFCS fallback
         if method_key in self.method_lookup:
@@ -7719,6 +7937,17 @@ class LLVMEmitter:
         else:
             # Emit as normal expression
             receiver_val = self._emit_expr(expr.expr)
+            # If the method expects a pointer receiver but we just computed
+            # an rvalue (e.g. `Point { x: 2.0 }.scale(3.0)`), spill to a stack
+            # slot so we can pass its address (auto-borrow rvalue).
+            if (
+                isinstance(first_param_type, ir.PointerType)
+                and not isinstance(receiver_val.type, ir.PointerType)
+                and receiver_val.type == first_param_type.pointee
+            ):
+                tmp = self._alloca_in_entry_block(receiver_val.type, "recv.tmp")
+                self.builder.store(receiver_val, tmp)
+                receiver_val = tmp
 
         # Build arguments: receiver first, then explicit args
         # Auto-borrow addressable args when the method expects a pointer param.
@@ -7969,6 +8198,17 @@ class LLVMEmitter:
                 return self.builder.sext(val, target_type)
             elif val.type.width > target_type.width:
                 return self.builder.trunc(val, target_type)
+
+        # Float-width conversions: f32 <-> f64.
+        # Float literals are emitted as f64 so this is needed when storing into
+        # f32 fields/params (e.g. struct lit `Point { x: 2.0 as f32 }`).
+        if isinstance(val.type, (ir.FloatType, ir.DoubleType)) and isinstance(
+            target_type, (ir.FloatType, ir.DoubleType)
+        ):
+            if isinstance(val.type, ir.DoubleType) and isinstance(target_type, ir.FloatType):
+                return self.builder.fptrunc(val, target_type)
+            if isinstance(val.type, ir.FloatType) and isinstance(target_type, ir.DoubleType):
+                return self.builder.fpext(val, target_type)
 
         # Pointer to integer
         if isinstance(val.type, ir.PointerType) and isinstance(target_type, ir.IntType):
