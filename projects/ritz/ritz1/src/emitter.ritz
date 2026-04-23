@@ -614,6 +614,190 @@ fn emit_global_vars(s: *EmitterState)
     emit_str(s, "\n")
 
 # =============================================================================
+# Const Arrays of Struct Literals (ritz0 parity — B1 wave-1)
+# =============================================================================
+# Lowers declarations like:
+#
+#   const PAIRS: [2]Pair = [
+#       Pair { a: "x", b: "y" },
+#       Pair { a: "m", b: "n" }
+#   ]
+#
+# to an immutable LLVM global constant:
+#
+#   @.const.PAIRS.0.a = private constant [2 x i8] c"x\00"
+#   @.const.PAIRS.0.b = private constant [2 x i8] c"y\00"
+#   @.const.PAIRS.1.a = private constant [2 x i8] c"m\00"
+#   @.const.PAIRS.1.b = private constant [2 x i8] c"n\00"
+#   @PAIRS = internal constant [2 x %Pair] [ ... ]
+#
+# Only handles the shape needed by the current regression test: arrays whose
+# element type is a named struct, whose StructLit elements have
+# int / bool / char / StringLit-typed fields. Non-StrView struct-typed
+# fields inside the struct literal are not supported yet (would require
+# nested recursion); integer consts still take the old fast path via
+# find_const and do not need an LLVM global.
+
+# Find a FieldInit in a struct literal's FieldInit list by field name.
+# Note: parse_struct_lit returns the *FieldInit linked list directly,
+# and EXPR_STRUCT_LIT stores the list head in `e.args` (see ident_or_struct).
+# We iterate the list directly — there is no boxed StructLit struct.
+fn find_field_init(fields: *FieldInit, name: *u8, len: i32) -> *FieldInit
+    var fi: *FieldInit = fields
+    while fi != null
+        if fi.name_len == len
+            var j: i32 = 0
+            var matched: i32 = 1
+            while j < len
+                if *(fi.name + j) != *(name + j)
+                    matched = 0
+                    break
+                j += 1
+            if matched == 1
+                return fi
+        fi = fi.next
+    return null
+
+# Emit a backing `@.const.NAME.ELEM.FIELD` string global for StrView fields
+# inside a const struct-array element.
+fn emit_const_array_string(s: *EmitterState, c: *ConstEntry, elem_idx: i32, fi: *FieldInit)
+    emit_str(s, "@.const.")
+    emit_name(s, c.name, c.name_len)
+    emit_str(s, ".")
+    emit_int(s, elem_idx as i64)
+    emit_str(s, ".")
+    emit_name(s, fi.name, fi.name_len)
+    emit_str(s, " = private constant [")
+    let strlen: i32 = fi.value.string_len
+    emit_int(s, (strlen + 1) as i64)
+    emit_str(s, " x i8] c\"")
+    for j in 0..strlen
+        emit_string_byte(s, *(fi.value.string_ptr + j))
+    emit_str(s, "\\00\"\n")
+
+# Emit one struct-literal element inside the top-level array constant.
+# Walks the struct definition in field order (canonical) and emits each
+# field's value using `emit_const_field_value`.
+fn emit_const_struct_literal(s: *EmitterState, c: *ConstEntry, elem_idx: i32, st: *StructDef, elem: *Expr)
+    emit_str(s, "%")
+    emit_name(s, c.array_elem_type_name, c.array_elem_type_name_len)
+    emit_str(s, " { ")
+    let fields: *FieldInit = elem.args as *FieldInit
+    var field: *StructField = st.fields
+    var first: i32 = 1
+    while field != null
+        if first == 0
+            emit_str(s, ", ")
+        first = 0
+        let fi: *FieldInit = find_field_init(fields, field.name, field.name_len)
+        emit_const_field_value(s, c, elem_idx, field, fi)
+        field = field.next
+    emit_str(s, " }")
+
+# Emit one field's value as an LLVM typed-constant operand.
+# StrView-shaped struct field + StringLit value → %StrView { ptr @str, i64 len }.
+# Scalar (i8/i16/i32/i64) → `<type> <int>` using FieldInit value's int_val.
+# For anything we don't recognise, fall back to zeroinitializer so the
+# overall global still assembles — matches ritz0's "best-effort lowering"
+# behaviour on mixed-shape const arrays.
+fn emit_const_field_value(s: *EmitterState, c: *ConstEntry, elem_idx: i32, field: *StructField, fi: *FieldInit)
+    if fi == null
+        # Missing field init — shouldn't happen for well-formed source.
+        emit_field_llvm_type(s, field)
+        emit_str(s, " zeroinitializer")
+        return
+    let v: *Expr = fi.value
+    if field.field_type == TYPE_STRUCT and v != null and v.kind == EXPR_STRING_LIT
+        # Treat target struct as StrView-shaped: { ptr, i64 len }.
+        emit_str(s, "%")
+        emit_name(s, field.field_type_name, field.field_type_name_len)
+        emit_str(s, " { ptr @.const.")
+        emit_name(s, c.name, c.name_len)
+        emit_str(s, ".")
+        emit_int(s, elem_idx as i64)
+        emit_str(s, ".")
+        emit_name(s, fi.name, fi.name_len)
+        emit_str(s, ", i64 ")
+        emit_int(s, v.string_len as i64)
+        emit_str(s, " }")
+        return
+    # Scalar / integer path — emit typed integer literal.
+    emit_llvm_type(s, field.field_type)
+    emit_str(s, " ")
+    if v != null
+        emit_int(s, v.int_val)
+    else
+        emit_int(s, 0)
+
+# Emit a single ConstEntry as an LLVM global constant (if applicable).
+fn emit_const_array_entry(s: *EmitterState, c: *ConstEntry)
+    # Only handle const arrays of struct elements. Integer consts are
+    # inlined via find_const at use sites; no global needed.
+    if c.const_type != TYPE_ARRAY
+        return
+    if c.array_elem_type != TYPE_STRUCT
+        return
+    if c.value_expr == null
+        return
+    if c.value_expr.kind != EXPR_ARRAY_LIT
+        return
+    # Dedup across imports (same const may be reached from multiple paths)
+    if was_global_emitted(s, c.name, c.name_len) == 1
+        return
+    mark_global_emitted(s, c.name, c.name_len)
+    # Need the struct def to emit fields in canonical order.
+    let st: *StructDef = find_struct(s, c.array_elem_type_name, c.array_elem_type_name_len)
+    if st == null
+        return
+
+    # Pass 1: emit the backing string globals referenced by StrView fields.
+    var elem: *Expr = c.value_expr.args
+    var elem_idx: i32 = 0
+    while elem != null
+        if elem.kind == EXPR_STRUCT_LIT
+            var fi: *FieldInit = elem.args as *FieldInit
+            while fi != null
+                if fi.value != null and fi.value.kind == EXPR_STRING_LIT
+                    emit_const_array_string(s, c, elem_idx, fi)
+                fi = fi.next
+        elem_idx = elem_idx + 1
+        elem = elem.next
+
+    # Pass 2: emit the top-level [N x %Struct] constant.
+    emit_str(s, "@")
+    emit_name(s, c.name, c.name_len)
+    emit_str(s, " = internal constant [")
+    emit_int(s, c.array_size as i64)
+    emit_str(s, " x %")
+    emit_name(s, c.array_elem_type_name, c.array_elem_type_name_len)
+    emit_str(s, "] [")
+
+    elem = c.value_expr.args
+    elem_idx = 0
+    while elem != null
+        if elem_idx > 0
+            emit_str(s, ", ")
+        if elem.kind == EXPR_STRUCT_LIT
+            emit_const_struct_literal(s, c, elem_idx, st, elem)
+        else
+            # Unexpected non-struct element in a struct-array; emit zero.
+            emit_str(s, "%")
+            emit_name(s, c.array_elem_type_name, c.array_elem_type_name_len)
+            emit_str(s, " zeroinitializer")
+        elem_idx = elem_idx + 1
+        elem = elem.next
+
+    emit_str(s, "]\n")
+
+# Walk module constants and emit LLVM globals for const arrays of structs.
+fn emit_const_arrays(s: *EmitterState)
+    var c: *ConstEntry = s.module.constants
+    while c != null
+        emit_const_array_entry(s, c)
+        c = c.next
+    emit_str(s, "\n")
+
+# =============================================================================
 # Builtin Struct Types (from ritzlib)
 # =============================================================================
 # Hardcoded struct layouts for commonly used ritzlib types.
@@ -950,6 +1134,11 @@ fn emit_module(m: *Module, out: *Vec<u8>) -> i32
 
     # Emit global variable declarations
     emit_global_vars(@s)
+
+    # Emit const arrays of struct literals as LLVM globals (B1 parity).
+    # Integer consts remain inlined via find_const; only complex shapes
+    # (array-of-struct) need a real global.
+    emit_const_arrays(@s)
 
     # First pass: emit all functions (to collect externs)
     # Deduplicate: same function may appear multiple times from imports
