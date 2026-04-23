@@ -22,6 +22,32 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
     # and callers reading i64 see garbage in the upper half.
     var var_type: i32 = stmt.var_type
 
+    # Infer struct type for `var IDENT = expr` (no annotation).
+    # The parser defaults missing annotations to TYPE_I64, which is
+    # fine for numeric initializers but breaks when the initializer
+    # returns a struct (e.g. `var v = vec_new<i32>()` → `%Vec$i32`).
+    # When we see a plain TYPE_I64 with no type-name but a call-style
+    # initializer whose resolved function returns a struct, narrow
+    # var_type to the struct so the alloca/store widths match.
+    if var_type == TYPE_I64 and stmt.var_type_name_len == 0 and stmt.var_init != null
+        if stmt.var_init.kind == EXPR_CALL
+            var full_name: [256]u8
+            var full_len: i32 = 0
+            for i in 0..stmt.var_init.func_name_len
+                full_name[full_len] = *(stmt.var_init.func_name + i)
+                full_len += 1
+            if stmt.var_init.call_type_suffix_len > 0
+                for i in 0..stmt.var_init.call_type_suffix_len
+                    full_name[full_len] = *(stmt.var_init.call_type_suffix + i)
+                    full_len += 1
+            let fn_def: *FnDef = find_fn(s, @full_name[0], full_len)
+            if fn_def != null and fn_def.return_type == TYPE_STRUCT
+                if fn_def.return_type_name != null and fn_def.return_type_name_len > 0
+                    var_type = TYPE_STRUCT
+                    stmt.var_type = TYPE_STRUCT
+                    stmt.var_type_name = fn_def.return_type_name
+                    stmt.var_type_name_len = fn_def.return_type_name_len
+
     let alloca_reg: i32 = next_reg(s)
     emit_str(s, "  ")
     emit_reg(s, alloca_reg)
