@@ -2729,6 +2729,19 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
                 if local.var_type == TYPE_STRUCT
                     struct_name = local.type_name
                     struct_name_len = local.type_name_len
+        # Check if value is a function call - look up the function's return type
+        else if stmt.assign_value.kind == EXPR_CALL
+            let fn_def: *FnDef = find_fn(s, stmt.assign_value.func_name, stmt.assign_value.func_name_len)
+            if fn_def != null
+                if fn_def.return_type == TYPE_STRUCT
+                    value_type = TYPE_STRUCT
+                    struct_name = fn_def.return_type_name
+                    struct_name_len = fn_def.return_type_name_len
+        # Check if value is a struct literal
+        else if stmt.assign_value.kind == EXPR_STRUCT_LIT
+            value_type = TYPE_STRUCT
+            struct_name = stmt.assign_value.ident_ptr
+            struct_name_len = stmt.assign_value.ident_len
 
         let val: i32 = emit_expr(s, stmt.assign_value)
         let addr: i32 = emit_expr(s, target_expr)
@@ -2801,6 +2814,30 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
     let loc: i32 = find_local(s, stmt.assign_target, stmt.assign_target_len)
     if loc >= 0
         let var_type: i32 = find_local_type(s, stmt.assign_target, stmt.assign_target_len)
+        # Special handling for struct-typed assignments
+        if var_type == TYPE_STRUCT
+            # For struct literal assignment, use alloca + field init
+            if stmt.assign_value.kind == EXPR_STRUCT_LIT
+                emit_struct_lit_to_alloca(s, stmt.assign_value, loc)
+                return
+            # For function call or other expression returning struct
+            let val: i32 = emit_expr(s, stmt.assign_value)
+            let local: *LocalVar = find_local_struct_name(s, stmt.assign_target, stmt.assign_target_len)
+            if local != null
+                emit_str(s, "  store %")
+                emit_name(s, local.type_name, local.type_name_len)
+                emit_str(s, " ")
+                emit_reg(s, val)
+                emit_str(s, ", ptr ")
+                emit_reg(s, loc)
+                emit_str(s, "\n")
+            else
+                emit_str(s, "  store i64 ")
+                emit_reg(s, val)
+                emit_str(s, ", ptr ")
+                emit_reg(s, loc)
+                emit_str(s, "\n")
+            return
         let val: i32 = emit_expr(s, stmt.assign_value)
         if var_type == TYPE_I32 or var_type == TYPE_U32
             let trunc: i32 = next_reg(s)
@@ -2876,6 +2913,29 @@ fn emit_return(s: *EmitterState, stmt: *Stmt, ret_type: i32)
     if stmt.return_value != null
         # Special handling for struct returns - need to load entire struct
         if ret_type == TYPE_STRUCT
+            # Check if return value is a struct literal (e.g., return NFAFragment { start: s0, end: s0 })
+            if stmt.return_value.kind == EXPR_STRUCT_LIT
+                let alloca_reg: i32 = next_reg(s)
+                emit_str(s, "  ")
+                emit_reg(s, alloca_reg)
+                emit_str(s, " = alloca %")
+                emit_name(s, stmt.return_value.ident_ptr, stmt.return_value.ident_len)
+                emit_str(s, "\n")
+                emit_struct_lit_to_alloca(s, stmt.return_value, alloca_reg)
+                let result: i32 = next_reg(s)
+                emit_str(s, "  ")
+                emit_reg(s, result)
+                emit_str(s, " = load %")
+                emit_name(s, stmt.return_value.ident_ptr, stmt.return_value.ident_len)
+                emit_str(s, ", ptr ")
+                emit_reg(s, alloca_reg)
+                emit_str(s, "\n")
+                emit_str(s, "  ret %")
+                emit_name(s, stmt.return_value.ident_ptr, stmt.return_value.ident_len)
+                emit_str(s, " ")
+                emit_reg(s, result)
+                emit_str(s, "\n")
+                return
             # Check if return value is a local variable
             if stmt.return_value.kind == EXPR_IDENT
                 let loc: i32 = find_local(s, stmt.return_value.ident_ptr, stmt.return_value.ident_len)
@@ -3799,6 +3859,40 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
                 emit_str(s, " ")
                 emit_reg(s, val)
                 emit_str(s, "\n")
+            else if f.return_type == TYPE_STRUCT
+                # Struct return — handle ident (load from alloca) or call result
+                if stmt.expr.kind == EXPR_IDENT
+                    let local: *LocalVar = find_local_struct_name(s, stmt.expr.ident_ptr, stmt.expr.ident_len)
+                    if local != null
+                        let loc: i32 = find_local(s, stmt.expr.ident_ptr, stmt.expr.ident_len)
+                        let val: i32 = next_reg(s)
+                        emit_str(s, "  ")
+                        emit_reg(s, val)
+                        emit_str(s, " = load %")
+                        emit_name(s, local.type_name, local.type_name_len)
+                        emit_str(s, ", ptr ")
+                        emit_reg(s, loc)
+                        emit_str(s, "\n")
+                        emit_str(s, "  ret %")
+                        emit_name(s, local.type_name, local.type_name_len)
+                        emit_str(s, " ")
+                        emit_reg(s, val)
+                        emit_str(s, "\n")
+                    else
+                        let val: i32 = emit_expr(s, stmt.expr)
+                        emit_str(s, "  ret %")
+                        emit_name(s, s.ret_type_name, s.ret_type_name_len)
+                        emit_str(s, " ")
+                        emit_reg(s, val)
+                        emit_str(s, "\n")
+                else
+                    # Function call or other expression returning struct
+                    let val: i32 = emit_expr(s, stmt.expr)
+                    emit_str(s, "  ret %")
+                    emit_name(s, s.ret_type_name, s.ret_type_name_len)
+                    emit_str(s, " ")
+                    emit_reg(s, val)
+                    emit_str(s, "\n")
             else
                 let val: i32 = emit_expr(s, stmt.expr)
                 if f.return_type == TYPE_I32

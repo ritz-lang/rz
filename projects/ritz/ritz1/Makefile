@@ -112,9 +112,8 @@ $(BUILD_DIR)/%_sh.ll: $(SRC_DIR)/%.ritz $(RITZ1) | $(BUILD_DIR)
 	$(RITZ1) $< -o $@
 
 $(BUILD_DIR)/%_sh.o: $(BUILD_DIR)/%_sh.ll
-	@echo "Assembling $< → $@"
-	llc $(LLC_FLAGS) $< -o $(BUILD_DIR)/$*_sh.s
-	clang -c $(BUILD_DIR)/$*_sh.s -o $@
+	@echo "Compiling $< → $@"
+	clang -c -O2 $< -o $@
 
 $(RITZ1_SELFHOSTED): $(SELFHOSTED_OBJ) $(RUNTIME)
 	@echo "=== Linking self-hosted ritz1 ==="
