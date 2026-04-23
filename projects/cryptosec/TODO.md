@@ -22,7 +22,7 @@ A cryptographic & security library for Ritz, targeting TLS 1.3 for the Valet web
 - [x] `ct_is_zero_u64` - Constant-time zero check
 - [x] `mem_is_zero(ptr, len)` - Constant-time all-zeros check
 - [x] Tests for all memory utilities (20 tests)
-- [ ] `SecureBuffer<N>` - Stack buffer that zeros on drop
+- [x] `SecureBuffer` - Stack buffer with explicit zeroing API (`secure_buffer_clear`)
 
 ### 1.2 Fixed-Width Integer Operations
 - [x] `u128` emulation via `struct U128 { lo: u64, hi: u64 }`
