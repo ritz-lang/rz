@@ -115,9 +115,12 @@ $(BUILD_DIR)/%_sh.o: $(BUILD_DIR)/%_sh.ll
 	@echo "Compiling $< → $@"
 	clang -c -O2 $< -o $@
 
-$(RITZ1_SELFHOSTED): $(SELFHOSTED_OBJ) $(RUNTIME)
+$(RITZ1_SELFHOSTED): $(SELFHOSTED_OBJ) $(RITZLIB_OBJ) $(RUNTIME)
 	@echo "=== Linking self-hosted ritz1 ==="
-	ld $(LD_FLAGS) -o $@ $(RUNTIME) $(SELFHOSTED_OBJ)
+	# Link ritzlib_*.o FIRST so its strong symbols (T) win over the
+	# ritz1-compiled weak_odr (W) duplicates in $(SELFHOSTED_OBJ).
+	# Without this, buggy ritz1-emitted malloc/realloc/etc. are used.
+	ld $(LD_FLAGS) -o $@ $(RUNTIME) $(RITZLIB_OBJ) $(SELFHOSTED_OBJ)
 	@echo "✓ Self-hosted binary created: $(RITZ1_SELFHOSTED)"
 	@ls -lh $@
 
