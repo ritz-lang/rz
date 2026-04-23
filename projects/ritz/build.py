@@ -1412,6 +1412,30 @@ def build_package(pkg_dir: Path, config: dict, keep_artifacts: bool = False, use
                     rel_path = bin_path
             print(f"\n  ✓ {rel_path}")
             built.append(bin_path)
+
+            # RFC convention: maintain a symlink at pkg_dir/<name> pointing at
+            # the profile binary. Integration tests in test/*.ritz commonly
+            # fork/exec `./<name>` (e.g. tier1/01_hello/test uses c"./hello"),
+            # which means the binary has to live at pkg_dir/<name> when tests
+            # run with cwd=pkg_dir. Symlink avoids copying (bin_path may be
+            # large) and always reflects the most recent build profile.
+            convenience_link = pkg_dir / bin_config.name
+            try:
+                if convenience_link.is_symlink() or convenience_link.exists():
+                    # Replace stale target (old committed binary OR previous
+                    # build's symlink pointing at a different profile)
+                    convenience_link.unlink()
+                # Use relative target so the symlink survives directory moves
+                try:
+                    rel_target = bin_path.relative_to(pkg_dir)
+                except ValueError:
+                    rel_target = bin_path
+                convenience_link.symlink_to(rel_target)
+            except OSError as e:
+                # Non-fatal: a broken convenience symlink just means tests that
+                # exec `./<name>` will fail — the build itself is still good.
+                print(f"  ⚠ Could not create convenience symlink {convenience_link}: {e}",
+                      file=sys.stderr)
         else:
             print(f"\n  ✗ Failed to build {bin_config.name}")
 
@@ -1442,9 +1466,17 @@ def run_tests(pkg_dir: Path, config: dict) -> bool:
     if ritz_tests:
         tests_found = True
         print(f"  🧪 Running {len(ritz_tests)} .ritz test file(s)...")
+        # ritz0 --test compiles a test-harness binary and then EXECUTES it. The
+        # execution CWD matters for integration tests that `fork/exec ./binary`
+        # (see tier1/01_hello's test_hello_output). We run from pkg_dir so those
+        # relative paths work; imports still resolve via RITZ_PATH (env-based,
+        # not CWD-based — see ritz0/import_resolver.py).
+        test_env = os.environ.copy()
+        test_env["RITZ_PATH"] = str(ROOT)  # needed for ritzlib.* resolution
         result = subprocess.run(
             [sys.executable, str(RITZ0), "--test"] + [str(t) for t in ritz_tests],
-            cwd=ROOT,  # Run from project root so imports work
+            cwd=pkg_dir,
+            env=test_env,
             capture_output=True, text=True,
             timeout=300  # 5 minute timeout per test suite
         )
