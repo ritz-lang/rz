@@ -3931,11 +3931,16 @@ class LLVMEmitter:
                 body
                 x = x + 1
         """
-        # For now, only support Range expressions
-        if not isinstance(stmt.iter, rast.Range):
-            raise NotImplementedError(f"for loop only supports range expressions, got {type(stmt.iter)}")
+        # Normalize parser edge-cases (e.g. `for i in 0..n - 1` parses as
+        # BinOp('-', Range(0..n), 1); `for i in 0..n as usize` parses as
+        # BinOp('as', Range(0..n), usize)).
+        iter_expr = self._normalize_for_iter_expr(stmt.iter)
 
-        range_expr = stmt.iter
+        # Support both range loops and iterable loops (arrays/Vec-like values).
+        if not isinstance(iter_expr, rast.Range):
+            return self._emit_for_iterable(stmt)
+
+        range_expr = iter_expr
         if range_expr.start is None or range_expr.end is None:
             raise NotImplementedError("for loop requires both start and end in range")
 
@@ -4040,6 +4045,207 @@ class LLVMEmitter:
         self.loop_stack.pop()
 
         # End block
+        self.builder.position_at_end(end_block)
+        return None
+
+    def _normalize_for_iter_expr(self, expr: rast.Expr) -> rast.Expr:
+        """Normalize parser edge-cases so range loops still lower as ranges.
+
+        Handles:
+        - `for i in 0..n as usize` parsed as BinOp('as', Range(...), usize)
+        - `for i in 0..n - 1`      parsed as BinOp('-', Range(0..n), 1)
+        - `for i in (0..n) as ty`  parsed as Cast(Range(...), ty)
+        """
+        if isinstance(expr, rast.Range):
+            return expr
+
+        if isinstance(expr, rast.BinOp):
+            # Unwrap trailing casts over a range.
+            if expr.op == 'as' and isinstance(expr.left, rast.Range):
+                return expr.left
+            if expr.op == 'as':
+                normalized_left = self._normalize_for_iter_expr(expr.left)
+                if isinstance(normalized_left, rast.Range):
+                    return normalized_left
+
+            # `for i in 0..n - 1` -> Range(0, BinOp('-', n, 1))
+            if isinstance(expr.left, rast.Range):
+                left_range = expr.left
+                adjusted_end = rast.BinOp(expr.span, expr.op, left_range.end, expr.right)
+                return rast.Range(left_range.span, left_range.start, adjusted_end, left_range.inclusive)
+
+        if isinstance(expr, rast.Cast):
+            normalized_inner = self._normalize_for_iter_expr(expr.expr)
+            if isinstance(normalized_inner, rast.Range):
+                return normalized_inner
+
+        return expr
+
+    def _emit_for_iterable(self, stmt: rast.ForStmt) -> None:
+        """Emit `for x in iterable` loops for arrays and Vec-like values.
+
+        Desugars `for x in iterable` to indexed iteration:
+            var idx: i64 = 0
+            while idx < len(iterable):
+                let x = iterable[idx]
+                body
+                idx = idx + 1
+        """
+        iter_kind = None
+        elem_ty = None
+        arr_ptr = None
+        arr_len = None
+        vec_ptr = None
+        vec_get_fn = None
+
+        # Special-case bare identifiers that don't materialize through
+        # `_emit_expr` (const arrays, global arrays, locals storing arrays).
+        iter_val = None
+        if isinstance(stmt.iter, rast.Ident):
+            name = stmt.iter.name
+            if name in self.const_arrays:
+                gvar, ty = self.const_arrays[name]
+                if isinstance(ty, ir.ArrayType):
+                    iter_kind = "array_ptr"
+                    elem_ty = ty.element
+                    arr_ptr = gvar
+                    arr_len = ty.count
+            elif name in self.globals:
+                gvar, ty = self.globals[name]
+                if isinstance(ty, ir.ArrayType):
+                    iter_kind = "array_ptr"
+                    elem_ty = ty.element
+                    arr_ptr = gvar
+                    arr_len = ty.count
+            elif name in self.locals:
+                alloca, ty = self.locals[name]
+                if isinstance(ty, ir.ArrayType):
+                    iter_kind = "array_ptr"
+                    elem_ty = ty.element
+                    arr_ptr = alloca
+                    arr_len = ty.count
+
+        if iter_kind is None:
+            iter_val = self._emit_expr(stmt.iter)
+
+            if isinstance(iter_val.type, ir.ArrayType):
+                iter_kind = "array"
+                elem_ty = iter_val.type.element
+                arr_ptr = self._alloca_in_entry_block(iter_val.type, "for.arr")
+                self.builder.store(iter_val, arr_ptr)
+                arr_len = iter_val.type.count
+            elif isinstance(iter_val.type, ir.PointerType) and isinstance(iter_val.type.pointee, ir.ArrayType):
+                iter_kind = "array_ptr"
+                elem_ty = iter_val.type.pointee.element
+                arr_ptr = iter_val
+                arr_len = iter_val.type.pointee.count
+            else:
+                vec_candidate_ptr = None
+                if isinstance(iter_val.type, ir.PointerType) and isinstance(iter_val.type.pointee, ir.BaseStructType):
+                    vec_candidate_ptr = iter_val
+                elif isinstance(iter_val.type, ir.BaseStructType):
+                    temp_vec = self._alloca_in_entry_block(iter_val.type, "for.vec")
+                    self.builder.store(iter_val, temp_vec)
+                    vec_candidate_ptr = temp_vec
+
+                if vec_candidate_ptr is not None:
+                    src_elems = vec_candidate_ptr.type.pointee.elements
+                    if (
+                        len(src_elems) >= 2
+                        and isinstance(src_elems[0], ir.PointerType)
+                        and isinstance(src_elems[1], ir.IntType)
+                    ):
+                        iter_kind = "vec_like"
+                        vec_ptr = vec_candidate_ptr
+                        elem_ty = src_elems[0].pointee
+                        struct_name = self._get_struct_name_from_type(vec_ptr.type.pointee)
+                        if struct_name and struct_name.startswith("Vec$"):
+                            elem_suffix = struct_name[4:]
+                            get_name = f"vec_get${elem_suffix}"
+                            if get_name in self.functions:
+                                vec_get_fn = self.functions[get_name][0]
+
+        if iter_kind is None or elem_ty is None:
+            iter_ty_repr = iter_val.type if iter_val is not None else type(stmt.iter).__name__
+            raise NotImplementedError(f"for loop iterable not supported: {stmt.iter} (llvm={iter_ty_repr})")
+
+        idx_var = self._alloca_in_entry_block(self.i64, f"{stmt.var}.idx")
+        self.builder.store(ir.Constant(self.i64, 0), idx_var)
+
+        cond_block = self.current_fn.append_basic_block("for.iter.cond")
+        body_block = self.current_fn.append_basic_block("for.iter.body")
+        incr_block = self.current_fn.append_basic_block("for.iter.incr")
+        end_block = self.current_fn.append_basic_block("for.iter.end")
+
+        self.loop_stack.append((incr_block, end_block))
+        self.builder.branch(cond_block)
+
+        prev_param = self.params.get(stmt.var)
+        prev_ritz = self.ritz_types.get(stmt.var) if stmt.var in self.ritz_types else None
+
+        self.builder.position_at_end(cond_block)
+        idx_val = self.builder.load(idx_var)
+        if iter_kind in ("array", "array_ptr"):
+            len_val = ir.Constant(self.i64, arr_len)
+        else:
+            len_ptr = self.builder.gep(vec_ptr, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)])
+            len_raw = self.builder.load(len_ptr)
+            len_val = len_raw if len_raw.type == self.i64 else self._convert_type(len_raw, self.i64)
+        cond = self.builder.icmp_unsigned('<', idx_val, len_val)
+        self.builder.cbranch(cond, body_block, end_block)
+
+        self.builder.position_at_end(body_block)
+        saved_returned = self.has_returned
+        self.has_returned = False
+
+        idx_val = self.builder.load(idx_var)
+        if iter_kind in ("array", "array_ptr"):
+            elem_ptr = self.builder.gep(arr_ptr, [ir.Constant(self.i32, 0), idx_val])
+            elem_val = self.builder.load(elem_ptr)
+        else:
+            if vec_get_fn is not None:
+                get_index_ty = vec_get_fn.function_type.args[1]
+                get_idx = idx_val if idx_val.type == get_index_ty else self._convert_type(idx_val, get_index_ty)
+                elem_val = self.builder.call(vec_get_fn, [vec_ptr, get_idx])
+            else:
+                data_ptr_ptr = self.builder.gep(vec_ptr, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)])
+                data_ptr = self.builder.load(data_ptr_ptr)
+                elem_ptr = self.builder.gep(data_ptr, [idx_val])
+                elem_val = self.builder.load(elem_ptr)
+
+        self.params[stmt.var] = (elem_val, elem_val.type)
+        for s in stmt.body.stmts:
+            result = self._emit_stmt(s)
+            if result is True:
+                break
+
+        if not self.builder.block.is_terminated and stmt.body.expr:
+            if isinstance(stmt.body.expr, rast.If):
+                self._emit_if(stmt.body.expr)
+            else:
+                self._emit_expr(stmt.body.expr)
+
+        if not self.builder.block.is_terminated:
+            self.builder.branch(incr_block)
+
+        self.has_returned = saved_returned
+
+        self.builder.position_at_end(incr_block)
+        idx_val = self.builder.load(idx_var)
+        next_idx = self.builder.add(idx_val, ir.Constant(self.i64, 1))
+        self.builder.store(next_idx, idx_var)
+        self.builder.branch(cond_block)
+
+        self.loop_stack.pop()
+        if prev_param is None:
+            self.params.pop(stmt.var, None)
+        else:
+            self.params[stmt.var] = prev_param
+        if prev_ritz is None:
+            self.ritz_types.pop(stmt.var, None)
+        else:
+            self.ritz_types[stmt.var] = prev_ritz
+
         self.builder.position_at_end(end_block)
         return None
 
