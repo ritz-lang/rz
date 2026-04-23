@@ -21,28 +21,11 @@ import emitter_core
 # Helper to emit GEP for local variable member access
 fn emit_member_gep_local(s: *EmitterState, e: *Expr, result: *MemberPtrResult, loc: *LocalVar, st: *StructDef, field_idx: i32, field: *StructField)
     var base_ptr: i32 = loc.reg
-    # For ptr/ref types (stored as i64), load and convert to ptr
-    if loc.var_type == TYPE_PTR or loc.var_type == TYPE_REF
-        let loaded: i32 = next_reg(s)
-        emit_str(s, "  ")
-        emit_reg(s, loaded)
-        emit_str(s, " = load i64, ptr ")
-        emit_reg(s, loc.reg)
-        emit_str(s, "\n")
-        base_ptr = next_reg(s)
-        emit_str(s, "  ")
-        emit_reg(s, base_ptr)
-        emit_str(s, " = inttoptr i64 ")
-        emit_reg(s, loaded)
-        emit_str(s, " to ptr\n")
-    else if loc.var_type == TYPE_MUT_REF
-        # TYPE_MUT_REF is stored as ptr, load directly
-        base_ptr = next_reg(s)
-        emit_str(s, "  ")
-        emit_reg(s, base_ptr)
-        emit_str(s, " = load ptr, ptr ")
-        emit_reg(s, loc.reg)
-        emit_str(s, "\n")
+    # For ptr/ref types — load the pointer natively (task #73 migration).
+    # Old pattern was `load i64` + `inttoptr` round-trip; opaque pointers
+    # let us just `load ptr` from the same slot.
+    if loc.var_type == TYPE_PTR or loc.var_type == TYPE_REF or loc.var_type == TYPE_MUT_REF
+        base_ptr = emit_load_ptr(s, loc.reg)
     # GEP to get pointer to field
     let field_ptr: i32 = next_reg(s)
     emit_str(s, "  ")
@@ -165,20 +148,8 @@ fn emit_member_ptr(s: *EmitterState, e: *Expr, result: *MemberPtrResult)
                             let field_idx: i32 = find_field_index(st, e.ident_ptr, e.ident_len)
                             if field_idx >= 0
                                 let field: *StructField = get_field_type(st, field_idx)
-                                emit_str(s, "  ; DEBUG: OP_DEREF path, load i64 for TYPE_PTR\n")
-                                # Load the i64 value and convert to ptr
-                                let loaded: i32 = next_reg(s)
-                                emit_str(s, "  ")
-                                emit_reg(s, loaded)
-                                emit_str(s, " = load i64, ptr ")
-                                emit_reg(s, loc.reg)
-                                emit_str(s, "\n")
-                                let base_ptr: i32 = next_reg(s)
-                                emit_str(s, "  ")
-                                emit_reg(s, base_ptr)
-                                emit_str(s, " = inttoptr i64 ")
-                                emit_reg(s, loaded)
-                                emit_str(s, " to ptr\n")
+                                # OP_DEREF path: native ptr load (task #73 migration)
+                                let base_ptr: i32 = emit_load_ptr(s, loc.reg)
                                 emit_member_gep_from_ptr(s, result, base_ptr, st, field_idx, field)
                                 return
 
@@ -760,18 +731,7 @@ fn emit_expr(s: *EmitterState, e: *Expr) -> i32
                                         let field: *StructField = get_field_type(st, field_idx)
                                         if field.field_type == TYPE_ARRAY
                                             # Load the pointer from the local, GEP to array field, index into it
-                                            let loaded_i64: i32 = next_reg(s)
-                                            emit_str(s, "  ")
-                                            emit_reg(s, loaded_i64)
-                                            emit_str(s, " = load i64, ptr ")
-                                            emit_reg(s, local.reg)
-                                            emit_str(s, "\n")
-                                            let loaded_ptr: i32 = next_reg(s)
-                                            emit_str(s, "  ")
-                                            emit_reg(s, loaded_ptr)
-                                            emit_str(s, " = inttoptr i64 ")
-                                            emit_reg(s, loaded_i64)
-                                            emit_str(s, " to ptr\n")
+                                            let loaded_ptr: i32 = emit_load_ptr(s, local.reg)
                                             # GEP to array field, then to element
                                             let idx: i32 = emit_expr(s, e.operand.right)
                                             let elem_ptr: i32 = next_reg(s)
@@ -835,19 +795,8 @@ fn emit_expr(s: *EmitterState, e: *Expr) -> i32
                                         emit_str(s, " to i64\n")
                                         return result
                                     else
-                                        # Ptr/ref - load the i64 value first, convert to ptr, then GEP
-                                        let loaded_i64: i32 = next_reg(s)
-                                        emit_str(s, "  ")
-                                        emit_reg(s, loaded_i64)
-                                        emit_str(s, " = load i64, ptr ")
-                                        emit_reg(s, local.reg)
-                                        emit_str(s, "\n")
-                                        let loaded_ptr: i32 = next_reg(s)
-                                        emit_str(s, "  ")
-                                        emit_reg(s, loaded_ptr)
-                                        emit_str(s, " = inttoptr i64 ")
-                                        emit_reg(s, loaded_i64)
-                                        emit_str(s, " to ptr\n")
+                                        # Ptr/ref - native ptr load (task #73 migration)
+                                        let loaded_ptr: i32 = emit_load_ptr(s, local.reg)
                                         let field_ptr: i32 = next_reg(s)
                                         emit_str(s, "  ")
                                         emit_reg(s, field_ptr)
