@@ -28,6 +28,9 @@ SOURCES = \
 	ast_helpers \
 	parser_gen \
 	monomorph \
+	emitter_core \
+	emitter_expr \
+	emitter_stmt \
 	emitter \
 	main
 

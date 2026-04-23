@@ -1,0 +1,846 @@
+# ritz1/src/emitter_core.ritz - Emitter State & Helpers
+#
+# Types, state, lookup helpers, type emission, member-access GEP.
+# Split from emitter.ritz to keep individual files under ~1500 lines.
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+import ritzlib.gvec
+import ritzlib.memory
+
+import ast
+import tokens_gen
+
+# =============================================================================
+# Emitter State
+# =============================================================================
+
+const MAX_LOCALS: i32 = 256
+const MAX_STRINGS: i32 = 4096  # Self-hosting: merged modules have >256 string literals
+const MAX_EXTERNS: i32 = 2048  # Self-hosting needs many externs (hundreds of functions per module)
+const MAX_EMITTED_NAMES: i32 = 512  # Track emitted structs/functions to avoid duplicates
+
+# Track emitted names for deduplication (imports can duplicate structs/functions)
+struct EmittedName
+    name: *u8
+    name_len: i32
+
+struct LocalVar
+    name: *u8
+    name_len: i32
+    reg: i32
+    var_type: i32
+    type_name: *u8       # Struct name when var_type == TYPE_STRUCT
+    type_name_len: i32
+    pointee_type: i32    # Element type for pointers (e.g., TYPE_U8 for *u8)
+    array_size: i32      # Array size when var_type == TYPE_ARRAY
+    array_elem_type: i32 # Element type when var_type == TYPE_ARRAY
+
+struct StringLit
+    data: *u8
+    len: i32
+
+struct ExternFunc
+    name: *u8
+    name_len: i32
+
+struct EmitterState
+    out: *Vec<u8>
+    reg_counter: i32
+    label_counter: i32
+    locals: [256]LocalVar
+    local_count: i32
+    break_label: i32
+    continue_label: i32
+    module: *Module
+    strings: [4096]StringLit
+    string_count: i32
+    externs: [2048]ExternFunc  # Self-hosting needs many externs (hundreds of functions per module)
+    extern_count: i32
+    # Deduplication tracking for imports
+    emitted_structs: [512]EmittedName
+    emitted_struct_count: i32
+    emitted_fns: [512]EmittedName
+    emitted_fn_count: i32
+    emitted_globals: [512]EmittedName
+    emitted_global_count: i32
+    # Track last expression value for if/else phi nodes
+    last_expr_reg: i32
+    # Track current label for phi node predecessors (needed for nested control flow)
+    current_label: i32
+    # Current function's return type name (for struct returns)
+    ret_type_name: *u8
+    ret_type_name_len: i32
+
+# =============================================================================
+# Helpers
+# =============================================================================
+
+fn emit_str(s: *EmitterState, text: *u8)
+    var i: i32 = 0
+    while *(text + i) != 0
+        i += 1
+    vec_push_bytes<u8>(s.out, text, i as i64)
+
+fn emit_name(s: *EmitterState, name: *u8, len: i32)
+    vec_push_bytes<u8>(s.out, name, len as i64)
+
+fn emit_int(s: *EmitterState, n: i64)
+    if n < 0
+        vec_push<u8>(s.out, 45)
+        emit_int(s, 0 - n)
+        return
+    if n == 0
+        vec_push<u8>(s.out, 48)
+        return
+    var buf: [20]u8
+    var idx: i32 = 0
+    var val: i64 = n
+    while val > 0
+        buf[idx] = (48 + (val % 10)) as u8
+        val = val / 10
+        idx += 1
+    while idx > 0
+        idx -= 1
+        vec_push<u8>(s.out, buf[idx])
+
+fn emit_reg(s: *EmitterState, reg: i32)
+    emit_str(s, "%.")
+    emit_int(s, reg as i64)
+
+fn next_reg(s: *EmitterState) -> i32
+    let r: i32 = s.reg_counter
+    s.reg_counter = s.reg_counter + 1
+    r
+
+fn next_label(s: *EmitterState) -> i32
+    let l: i32 = s.label_counter
+    s.label_counter = s.label_counter + 1
+    l
+
+fn emit_label(s: *EmitterState, label: i32)
+    emit_str(s, "L")
+    emit_int(s, label as i64)
+
+fn find_local(s: *EmitterState, name: *u8, len: i32) -> i32
+    # Search from end to find innermost scope's variable
+    var i: i32 = s.local_count - 1
+    while i >= 0
+        let loc: *LocalVar = @s.locals[i]
+        if loc.name_len == len
+            var j: i32 = 0
+            var matched: i32 = 1
+            while j < len
+                if *(loc.name + j) != *(name + j)
+                    matched = 0
+                    break
+                j += 1
+            if matched == 1
+                return loc.reg
+        i -= 1
+    -1
+
+fn find_local_type(s: *EmitterState, name: *u8, len: i32) -> i32
+    # Search from end to find innermost scope's variable
+    var i: i32 = s.local_count - 1
+    while i >= 0
+        let loc: *LocalVar = @s.locals[i]
+        if loc.name_len == len
+            var j: i32 = 0
+            var matched: i32 = 1
+            while j < len
+                if *(loc.name + j) != *(name + j)
+                    matched = 0
+                    break
+                j += 1
+            if matched == 1
+                return loc.var_type
+        i -= 1
+    TYPE_I64
+
+fn find_local_pointee_type(s: *EmitterState, name: *u8, len: i32) -> i32
+    # Search from end to find the pointee type for a pointer variable
+    var i: i32 = s.local_count - 1
+    while i >= 0
+        let loc: *LocalVar = @s.locals[i]
+        if loc.name_len == len
+            var j: i32 = 0
+            var matched: i32 = 1
+            while j < len
+                if *(loc.name + j) != *(name + j)
+                    matched = 0
+                    break
+                j += 1
+            if matched == 1
+                return loc.pointee_type
+        i -= 1
+    TYPE_I64  # Default to i64
+
+# Find the struct type name for a local variable
+fn find_local_struct_name(s: *EmitterState, name: *u8, len: i32) -> *LocalVar
+    var i: i32 = s.local_count - 1
+    while i >= 0
+        let loc: *LocalVar = @s.locals[i]
+        if loc.name_len == len
+            var j: i32 = 0
+            var matched: i32 = 1
+            while j < len
+                if *(loc.name + j) != *(name + j)
+                    matched = 0
+                    break
+                j += 1
+            if matched == 1
+                return loc
+        i -= 1
+    null
+
+fn add_local(s: *EmitterState, name: *u8, len: i32, reg: i32, var_type: i32)
+    add_local_full(s, name, len, reg, var_type, null, 0, TYPE_I64, 0, 0)
+
+fn add_local_ptr(s: *EmitterState, name: *u8, len: i32, reg: i32, var_type: i32, pointee: i32)
+    add_local_full(s, name, len, reg, var_type, null, 0, pointee, 0, 0)
+
+fn add_local_struct(s: *EmitterState, name: *u8, len: i32, reg: i32, var_type: i32, type_name: *u8, type_name_len: i32)
+    add_local_full(s, name, len, reg, var_type, type_name, type_name_len, TYPE_I64, 0, 0)
+
+fn add_local_array(s: *EmitterState, name: *u8, len: i32, reg: i32, arr_size: i32, elem_type: i32)
+    add_local_full(s, name, len, reg, TYPE_ARRAY, null, 0, TYPE_I64, arr_size, elem_type)
+
+fn add_local_full(s: *EmitterState, name: *u8, len: i32, reg: i32, var_type: i32, type_name: *u8, type_name_len: i32, pointee: i32, arr_size: i32, arr_elem: i32)
+    if s.local_count < MAX_LOCALS
+        let loc: *LocalVar = @s.locals[s.local_count]
+        loc.name = name
+        loc.name_len = len
+        loc.reg = reg
+        loc.var_type = var_type
+        loc.type_name = type_name
+        loc.type_name_len = type_name_len
+        loc.pointee_type = pointee
+        loc.array_size = arr_size
+        loc.array_elem_type = arr_elem
+        s.local_count = s.local_count + 1
+
+# Find a global variable by name - returns the GlobalVarDef or null
+fn find_global(s: *EmitterState, name: *u8, len: i32) -> *GlobalVarDef
+    var g: *GlobalVarDef = s.module.globals
+    while g != null
+        if g.name_len == len
+            var j: i32 = 0
+            var matched: i32 = 1
+            while j < len
+                if *(g.name + j) != *(name + j)
+                    matched = 0
+                    break
+                j += 1
+            if matched == 1
+                return g
+        g = g.next
+    null
+
+# Find a function definition by name - returns the FnDef or null
+fn find_fn(s: *EmitterState, name: *u8, len: i32) -> *FnDef
+    var fn_def: *FnDef = s.module.functions
+    while fn_def != null
+        if fn_def.name_len == len
+            var j: i32 = 0
+            var matched: i32 = 1
+            while j < len
+                if *(fn_def.name + j) != *(name + j)
+                    matched = 0
+                    break
+                j += 1
+            if matched == 1
+                return fn_def
+        fn_def = fn_def.next
+    null
+
+# Find a struct definition by name
+fn find_struct(s: *EmitterState, name: *u8, len: i32) -> *StructDef
+    var st: *StructDef = s.module.structs
+    while st != null
+        if st.name_len == len
+            var j: i32 = 0
+            var matched: i32 = 1
+            while j < len
+                if *(st.name + j) != *(name + j)
+                    matched = 0
+                    break
+                j += 1
+            if matched == 1
+                return st
+        st = st.next
+    null
+
+# Find field index in a struct (returns -1 if not found)
+fn find_field_index(st: *StructDef, field: *u8, field_len: i32) -> i32
+    var idx: i32 = 0
+    var f: *StructField = st.fields
+    while f != null
+        if f.name_len == field_len
+            var j: i32 = 0
+            var matched: i32 = 1
+            while j < field_len
+                if *(f.name + j) != *(field + j)
+                    matched = 0
+                    break
+                j += 1
+            if matched == 1
+                return idx
+        idx += 1
+        f = f.next
+    -1
+
+# Get field type from struct definition
+fn get_field_type(st: *StructDef, field_idx: i32) -> *StructField
+    var idx: i32 = 0
+    var f: *StructField = st.fields
+    while f != null
+        if idx == field_idx
+            return f
+        idx += 1
+        f = f.next
+    null
+
+# Result struct for emit_member_ptr - returns pointer register and field info
+struct MemberPtrResult
+    reg: i32              # Register holding pointer to field
+    field: *StructField   # Field info (type, name, etc.)
+    success: i32          # 1 if successful, 0 if error
+
+fn add_extern(s: *EmitterState, name: *u8, len: i32)
+    # Check if already registered
+    var i: i32 = 0
+    while i < s.extern_count
+        let ex: *ExternFunc = @s.externs[i]
+        if ex.name_len == len
+            var j: i32 = 0
+            var matched: i32 = 1
+            while j < len
+                if *(ex.name + j) != *(name + j)
+                    matched = 0
+                    break
+                j += 1
+            if matched == 1
+                return  # Already registered
+        i += 1
+    # Add new external - copy the name since caller might use a stack buffer
+    if s.extern_count < MAX_EXTERNS
+        let ex: *ExternFunc = @s.externs[s.extern_count]
+        # Allocate memory for the name copy
+        let name_copy: *u8 = malloc(len as i64 + 1) as *u8
+        if name_copy != null
+            for k in 0..len
+                *(name_copy + k) = *(name + k)
+            *(name_copy + len) = 0  # Null terminate
+            ex.name = name_copy
+            ex.name_len = len
+            s.extern_count = s.extern_count + 1
+
+# Add extern for method call: TypeName_methodName
+# Allocates memory for the mangled name
+fn add_method_extern(s: *EmitterState, type_name: *u8, type_len: i32, method_name: *u8, method_len: i32)
+    # Calculate total length: TypeName_methodName
+    let total_len: i32 = type_len + 1 + method_len
+
+    # Allocate memory for the name (use malloc)
+    let name: *u8 = malloc(total_len as i64 + 1) as *u8
+    if name == null
+        return
+
+    # Copy type name
+    for i in 0..type_len
+        *(name + i) = *(type_name + i)
+
+    # Add underscore
+    *(name + type_len) = 95  # '_'
+
+    # Copy method name
+    for i in 0..method_len
+        *(name + type_len + 1 + i) = *(method_name + i)
+
+    # Null terminate
+    *(name + total_len) = 0
+
+    # Add to externs
+    add_extern(s, name, total_len)
+
+# Helper to check if name matches a string
+fn name_eq(name: *u8, len: i32, target: *u8, target_len: i32) -> i32
+    if len != target_len
+        return 0
+    for i in 0..len
+        if *(name + i) != *(target + i)
+            return 0
+    1
+
+# =============================================================================
+# Deduplication Helpers - Track emitted structs/functions to avoid duplicates
+# =============================================================================
+
+# Check if a struct has already been emitted
+fn was_struct_emitted(s: *EmitterState, name: *u8, len: i32) -> i32
+    for i in 0..s.emitted_struct_count
+        let e: *EmittedName = @s.emitted_structs[i]
+        if e.name_len == len
+            var j: i32 = 0
+            var matched: i32 = 1
+            while j < len
+                if *(e.name + j) != *(name + j)
+                    matched = 0
+                    break
+                j += 1
+            if matched == 1
+                return 1
+    0
+
+# Mark a struct as emitted
+fn mark_struct_emitted(s: *EmitterState, name: *u8, len: i32)
+    if s.emitted_struct_count < MAX_EMITTED_NAMES
+        let e: *EmittedName = @s.emitted_structs[s.emitted_struct_count]
+        e.name = name
+        e.name_len = len
+        s.emitted_struct_count = s.emitted_struct_count + 1
+
+# Check if a function has already been emitted
+fn was_fn_emitted(s: *EmitterState, name: *u8, len: i32) -> i32
+    for i in 0..s.emitted_fn_count
+        let e: *EmittedName = @s.emitted_fns[i]
+        if e.name_len == len
+            var j: i32 = 0
+            var matched: i32 = 1
+            while j < len
+                if *(e.name + j) != *(name + j)
+                    matched = 0
+                    break
+                j += 1
+            if matched == 1
+                return 1
+    0
+
+# Mark a function as emitted
+fn mark_fn_emitted(s: *EmitterState, name: *u8, len: i32)
+    if s.emitted_fn_count < MAX_EMITTED_NAMES
+        let e: *EmittedName = @s.emitted_fns[s.emitted_fn_count]
+        e.name = name
+        e.name_len = len
+        s.emitted_fn_count = s.emitted_fn_count + 1
+
+# Check if a global has already been emitted
+fn was_global_emitted(s: *EmitterState, name: *u8, len: i32) -> i32
+    for i in 0..s.emitted_global_count
+        let e: *EmittedName = @s.emitted_globals[i]
+        if e.name_len == len
+            var j: i32 = 0
+            var matched: i32 = 1
+            while j < len
+                if *(e.name + j) != *(name + j)
+                    matched = 0
+                    break
+                j += 1
+            if matched == 1
+                return 1
+    0
+
+# Mark a global as emitted
+fn mark_global_emitted(s: *EmitterState, name: *u8, len: i32)
+    if s.emitted_global_count < MAX_EMITTED_NAMES
+        let e: *EmittedName = @s.emitted_globals[s.emitted_global_count]
+        e.name = name
+        e.name_len = len
+        s.emitted_global_count = s.emitted_global_count + 1
+
+# Check for well-known constants from ritzlib.sys
+fn find_builtin_const(name: *u8, len: i32) -> i64
+    # STDIN, STDOUT, STDERR
+    if name_eq(name, len, "STDIN", 5) == 1
+        return 0
+    if name_eq(name, len, "STDOUT", 6) == 1
+        return 1
+    if name_eq(name, len, "STDERR", 6) == 1
+        return 2
+    # O_RDONLY, O_WRONLY, O_RDWR
+    if name_eq(name, len, "O_RDONLY", 8) == 1
+        return 0
+    if name_eq(name, len, "O_WRONLY", 8) == 1
+        return 1
+    if name_eq(name, len, "O_RDWR", 6) == 1
+        return 2
+    # Return a sentinel that means "not found"
+    return -9999
+
+fn is_builtin_const(name: *u8, len: i32) -> i32
+    if find_builtin_const(name, len) != -9999
+        return 1
+    0
+
+fn find_const(s: *EmitterState, name: *u8, len: i32) -> i64
+    # First check module constants
+    var c: *ConstEntry = s.module.constants
+    while c != null
+        if c.name_len == len
+            var j: i32 = 0
+            var matched: i32 = 1
+            while j < len
+                if *(c.name + j) != *(name + j)
+                    matched = 0
+                    break
+                j = j + 1
+            if matched == 1
+                return c.value
+        c = c.next
+    # Then check builtin constants
+    let builtin: i64 = find_builtin_const(name, len)
+    if builtin != -9999
+        return builtin
+    0
+
+fn is_const(s: *EmitterState, name: *u8, len: i32) -> i32
+    # Check module constants first
+    var c: *ConstEntry = s.module.constants
+    while c != null
+        if c.name_len == len
+            var j: i32 = 0
+            var matched: i32 = 1
+            while j < len
+                if *(c.name + j) != *(name + j)
+                    matched = 0
+                    break
+                j = j + 1
+            if matched == 1
+                return 1
+        c = c.next
+    # Check builtin constants
+    is_builtin_const(name, len)
+
+fn emit_llvm_type(s: *EmitterState, t: i32)
+    if t == TYPE_VOID
+        emit_str(s, "void")
+    else if t == TYPE_I32 or t == TYPE_U32
+        emit_str(s, "i32")
+    else if t == TYPE_I64
+        emit_str(s, "i64")
+    else if t == TYPE_U8
+        emit_str(s, "i8")
+    else if t == TYPE_I8
+        emit_str(s, "i8")
+    else if t == TYPE_U16 or t == TYPE_I16
+        emit_str(s, "i16")
+    else if t == TYPE_U64
+        emit_str(s, "i64")
+    else if t == TYPE_BOOL
+        emit_str(s, "i1")
+    else if t == TYPE_PTR
+        emit_str(s, "i64")  # Pointers passed as i64
+    else if t == TYPE_PTR_PTR
+        emit_str(s, "i64")  # Double pointers also i64
+    else if t == TYPE_REF
+        emit_str(s, "i64")  # References are i64 at LLVM level
+    else if t == TYPE_MUT_REF
+        emit_str(s, "ptr")  # Mutable references are pointers at LLVM level
+    else
+        emit_str(s, "i64")
+
+# Emit LLVM type with struct name support
+fn emit_llvm_type_struct(s: *EmitterState, t: i32, name: *u8, name_len: i32)
+    if t == TYPE_STRUCT
+        emit_str(s, "%")
+        emit_name(s, name, name_len)
+    else
+        emit_llvm_type(s, t)
+
+fn add_string(s: *EmitterState, data: *u8, len: i32) -> i32
+    if s.string_count < MAX_STRINGS
+        let idx: i32 = s.string_count
+        s.strings[idx].data = data
+        s.strings[idx].len = len
+        s.string_count = s.string_count + 1
+        return idx
+    # Overflow — report error loudly so it's visible instead of silently aliasing @.str.0
+    eprints_cstr(c"[FATAL] add_string: MAX_STRINGS exceeded — bump MAX_STRINGS\n")
+    sys_exit(1)
+    0
+
+# =============================================================================
+# Type Inference - Determine expression type without emitting code
+# =============================================================================
+
+# Helper: find the leftmost/base expression in a chain of binary ops
+# e.g., for (a.ptr + pos + i), returns a.ptr
+fn find_base_expr(e: *Expr) -> *Expr
+    if e.kind == EXPR_BINARY
+        return find_base_expr(e.left)
+    return e
+
+# Compute size in bytes of a named struct with proper C-style alignment.
+# Each field is aligned to its natural alignment; final size rounded up to struct alignment.
+fn get_struct_size_by_name(s: *EmitterState, name: *u8, name_len: i32) -> i64
+    if name == null or name_len == 0
+        return 8
+    let st: *StructDef = find_struct(s, name, name_len)
+    if st == null
+        return 8
+    var offset: i64 = 0
+    var max_align: i64 = 1
+    var f: *StructField = st.fields
+    while f != null
+        var fsize: i64 = 8
+        var falign: i64 = 8
+        if f.field_type == TYPE_U8 or f.field_type == TYPE_I8
+            fsize = 1
+            falign = 1
+        else if f.field_type == TYPE_U16 or f.field_type == TYPE_I16
+            fsize = 2
+            falign = 2
+        else if f.field_type == TYPE_U32 or f.field_type == TYPE_I32
+            fsize = 4
+            falign = 4
+        else if f.field_type == TYPE_ARRAY
+            # Array: size = elem_size * count, align = elem_align
+            var esize: i64 = 8
+            var ealign: i64 = 8
+            if f.array_elem_type == TYPE_U8 or f.array_elem_type == TYPE_I8
+                esize = 1
+                ealign = 1
+            else if f.array_elem_type == TYPE_U16 or f.array_elem_type == TYPE_I16
+                esize = 2
+                ealign = 2
+            else if f.array_elem_type == TYPE_U32 or f.array_elem_type == TYPE_I32
+                esize = 4
+                ealign = 4
+            else if f.array_elem_type == TYPE_STRUCT and f.array_elem_type_name_len > 0
+                esize = get_struct_size_by_name(s, f.array_elem_type_name, f.array_elem_type_name_len)
+                ealign = 8  # struct alignment (simplified to 8)
+            fsize = esize * (f.array_size as i64)
+            falign = ealign
+        else if f.field_type == TYPE_STRUCT and f.field_type_name_len > 0
+            fsize = get_struct_size_by_name(s, f.field_type_name, f.field_type_name_len)
+            falign = 8  # struct alignment (simplified to 8)
+        # else: pointer/i64/ref — size 8, align 8 (default)
+
+        # Align offset up to falign
+        let rem: i64 = offset % falign
+        if rem != 0
+            offset = offset + (falign - rem)
+        offset = offset + fsize
+        if falign > max_align
+            max_align = falign
+        f = f.next
+
+    # Round final size up to struct alignment
+    if max_align > 1
+        let rem2: i64 = offset % max_align
+        if rem2 != 0
+            offset = offset + (max_align - rem2)
+    return offset
+
+# Compute size of pointed-to element for pointer arithmetic on a pointer expression.
+# Handles identifiers (looks up LocalVar.pointee_type + type_name) and member accesses
+# (looks up struct field's pointee info). Returns 1 if unknown.
+fn get_ptr_elem_size(s: *EmitterState, e: *Expr) -> i64
+    if e.kind == EXPR_IDENT
+        let loc: *LocalVar = find_local_struct_name(s, e.ident_ptr, e.ident_len)
+        if loc == null
+            return 1
+        # For TYPE_PTR_PTR the element is a pointer (8 bytes)
+        if loc.var_type == TYPE_PTR_PTR
+            return 8
+        if loc.var_type == TYPE_PTR or loc.var_type == TYPE_REF or loc.var_type == TYPE_MUT_REF
+            # Pointee is a struct — use struct size
+            if loc.pointee_type == TYPE_STRUCT and loc.type_name_len > 0
+                return get_struct_size_by_name(s, loc.type_name, loc.type_name_len)
+            if loc.pointee_type == TYPE_U16 or loc.pointee_type == TYPE_I16
+                return 2
+            if loc.pointee_type == TYPE_U32 or loc.pointee_type == TYPE_I32
+                return 4
+            if loc.pointee_type == TYPE_U64 or loc.pointee_type == TYPE_I64
+                return 8
+            return 1  # Default *u8/*i8
+        return 1
+    if e.kind == EXPR_MEMBER
+        if e.left.kind == EXPR_IDENT
+            let loc2: *LocalVar = find_local_struct_name(s, e.left.ident_ptr, e.left.ident_len)
+            if loc2 != null and loc2.type_name_len > 0
+                let st: *StructDef = find_struct(s, loc2.type_name, loc2.type_name_len)
+                if st != null
+                    let field_idx: i32 = find_field_index(st, e.ident_ptr, e.ident_len)
+                    if field_idx >= 0
+                        let field: *StructField = get_field_type(st, field_idx)
+                        if field.field_type == TYPE_PTR_PTR
+                            return 8
+                        if field.field_type == TYPE_PTR or field.field_type == TYPE_REF or field.field_type == TYPE_MUT_REF
+                            # Field is pointer-to-something — field_type_name holds the pointee struct name
+                            if field.field_type_name_len > 0
+                                return get_struct_size_by_name(s, field.field_type_name, field.field_type_name_len)
+                            if field.array_elem_type == TYPE_U16 or field.array_elem_type == TYPE_I16
+                                return 2
+                            if field.array_elem_type == TYPE_U32 or field.array_elem_type == TYPE_I32
+                                return 4
+                            if field.array_elem_type == TYPE_U64 or field.array_elem_type == TYPE_I64
+                                return 8
+                            return 1
+        return 1
+    return 1
+
+# Helper: get pointee type for a struct member that is a pointer
+# e.g., for span.ptr (where ptr is *u8), returns TYPE_U8
+fn get_member_pointee_type(s: *EmitterState, e: *Expr) -> i32
+    if e.kind != EXPR_MEMBER
+        return TYPE_I64
+    if e.left.kind == EXPR_IDENT
+        let local: *LocalVar = find_local_struct_name(s, e.left.ident_ptr, e.left.ident_len)
+        if local != null and local.type_name_len > 0
+            let st: *StructDef = find_struct(s, local.type_name, local.type_name_len)
+            if st != null
+                let field_idx: i32 = find_field_index(st, e.ident_ptr, e.ident_len)
+                if field_idx >= 0
+                    let field: *StructField = get_field_type(st, field_idx)
+                    # Return the pointee type based on field's pointer kind
+                    if field.field_type == TYPE_PTR
+                        # Check array_elem_type as that's where pointee type is stored
+                        if field.array_elem_type == TYPE_U8 or field.array_elem_type == TYPE_I8
+                            return field.array_elem_type
+                        # For *u8 in Span<u8>, the pointee is u8
+                        # TODO: Parser should set array_elem_type for pointer fields
+                        # For now, if it's TYPE_PTR with no array_elem_type, assume u8
+                        return TYPE_U8
+    return TYPE_I64
+
+fn get_expr_type(s: *EmitterState, e: *Expr) -> i32
+    # Returns the Ritz type of an expression
+    if e.kind == EXPR_INT_LIT
+        return TYPE_I64
+    else if e.kind == EXPR_CHAR_LIT
+        return TYPE_U8   # Character literals are u8
+    else if e.kind == EXPR_STRING_LIT
+        return TYPE_PTR  # String literals are *u8
+    else if e.kind == EXPR_NIL_LIT
+        return TYPE_PTR  # nil is a null pointer
+    else if e.kind == EXPR_IDENT
+        let var_type: i32 = find_local_type(s, e.ident_ptr, e.ident_len)
+        return var_type
+    else if e.kind == EXPR_INDEX
+        # Indexing: result type depends on base type
+        if e.left.kind == EXPR_IDENT
+            let base_type: i32 = find_local_type(s, e.left.ident_ptr, e.left.ident_len)
+            if base_type == TYPE_PTR_PTR
+                return TYPE_PTR  # **u8 indexed gives *u8
+            else if base_type == TYPE_PTR
+                return TYPE_U8   # *u8 indexed gives u8
+        return TYPE_I64  # Default
+    else if e.kind == EXPR_UNARY
+        if e.op == OP_ADDR
+            return TYPE_PTR  # Address-of gives pointer
+        else if e.op == OP_ADDR_MUT
+            return TYPE_MUT_REF  # Mutable address-of gives mutable reference
+        else if e.op == OP_DEREF
+            let inner_type: i32 = get_expr_type(s, e.operand)
+            if inner_type == TYPE_PTR_PTR
+                return TYPE_PTR  # Deref **T gives *T
+            else if inner_type == TYPE_PTR
+                # Deref *T gives T - look up what T is
+                # If operand is an identifier, look up its pointee type
+                if e.operand.kind == EXPR_IDENT
+                    return find_local_pointee_type(s, e.operand.ident_ptr, e.operand.ident_len)
+                # If operand is ptr+offset, find base expression and get its pointee type
+                else if e.operand.kind == EXPR_BINARY
+                    let base: *Expr = find_base_expr(e.operand)
+                    if base.kind == EXPR_IDENT
+                        return find_local_pointee_type(s, base.ident_ptr, base.ident_len)
+                    else if base.kind == EXPR_MEMBER
+                        # Member+offset dereference (e.g., *(span.ptr + i))
+                        return get_member_pointee_type(s, base)
+                return TYPE_I64  # Default for unknown pointer dereference
+            else
+                return TYPE_I64  # Deref *T gives value
+        return get_expr_type(s, e.operand)
+    else if e.kind == EXPR_BINARY
+        return get_expr_type(s, e.left)  # Binary ops preserve left type (simplified)
+    else if e.kind == EXPR_MEMBER
+        # Look up the field type in the struct
+        if e.left.kind == EXPR_IDENT
+            let local: *LocalVar = find_local_struct_name(s, e.left.ident_ptr, e.left.ident_len)
+            if local != null and local.type_name_len > 0
+                let st: *StructDef = find_struct(s, local.type_name, local.type_name_len)
+                if st != null
+                    let field_idx: i32 = find_field_index(st, e.ident_ptr, e.ident_len)
+                    if field_idx >= 0
+                        let field: *StructField = get_field_type(st, field_idx)
+                        return field.field_type
+        return TYPE_I64  # Default for unknown member access
+    else if e.kind == EXPR_CALL
+        # Look up function return type
+        # Build full function name with type suffix if generic
+        var full_name: [256]u8
+        var full_len: i32 = 0
+
+        # Copy function name
+        for i in 0..e.func_name_len
+            full_name[full_len] = *(e.func_name + i)
+            full_len += 1
+
+        # Add type suffix if present (e.g., "$u8" for vec_new<u8>())
+        if e.call_type_suffix_len > 0
+            for i in 0..e.call_type_suffix_len
+                full_name[full_len] = *(e.call_type_suffix + i)
+                full_len += 1
+
+        # Look up the function
+        let fn_def: *FnDef = find_fn(s, @full_name[0], full_len)
+        if fn_def != null
+            return fn_def.return_type
+
+        return TYPE_I64  # Default for unknown functions
+    TYPE_I64  # Default fallback (including EXPR_CAST - would need AST change to track type)
+
+# Get the struct type name for a dereference expression that returns TYPE_STRUCT
+# Returns the field info if found, null otherwise
+# NOTE: Disabled due to parser bug where primitive pointer types have stale type_name values
+fn get_deref_struct_type(s: *EmitterState, e: *Expr) -> *StructField
+    # For now, always return null until parser properly tracks pointee types
+    # TODO: Enable this once parser is fixed
+    null
+
+# =============================================================================
+# Field type emission (used by emit_expr member access and module-level struct emission)
+# =============================================================================
+
+fn emit_field_llvm_type(s: *EmitterState, f: *StructField)
+    if f.field_type == TYPE_I32 or f.field_type == TYPE_U32
+        emit_str(s, "i32")
+    else if f.field_type == TYPE_I64
+        emit_str(s, "i64")
+    else if f.field_type == TYPE_U8 or f.field_type == TYPE_I8
+        emit_str(s, "i8")
+    else if f.field_type == TYPE_U16 or f.field_type == TYPE_I16
+        emit_str(s, "i16")
+    else if f.field_type == TYPE_BOOL
+        emit_str(s, "i1")
+    else if f.field_type == TYPE_PTR or f.field_type == TYPE_PTR_PTR
+        emit_str(s, "ptr")
+    else if f.field_type == TYPE_STRUCT
+        # Emit nested struct type reference: %StructName
+        emit_str(s, "%")
+        emit_name(s, f.field_type_name, f.field_type_name_len)
+    else if f.field_type == TYPE_ARRAY
+        # Emit array type: [N x elem_type]
+        emit_str(s, "[")
+        emit_int(s, f.array_size as i64)
+        emit_str(s, " x ")
+        if f.array_elem_type == TYPE_I32
+            emit_str(s, "i32")
+        else if f.array_elem_type == TYPE_I64
+            emit_str(s, "i64")
+        else if f.array_elem_type == TYPE_U8 or f.array_elem_type == TYPE_I8
+            emit_str(s, "i8")
+        else if f.array_elem_type == TYPE_PTR or f.array_elem_type == TYPE_PTR_PTR
+            emit_str(s, "ptr")
+        else if f.array_elem_type == TYPE_STRUCT
+            # Emit struct type reference: %StructName
+            emit_str(s, "%")
+            emit_name(s, f.array_elem_type_name, f.array_elem_type_name_len)
+        else
+            emit_str(s, "i64")
+        emit_str(s, "]")
+    else
+        emit_str(s, "i64")

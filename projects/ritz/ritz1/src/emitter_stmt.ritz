@@ -1,0 +1,1369 @@
+# ritz1/src/emitter_stmt.ritz - Statement Emission
+#
+# emit_var_decl / emit_assign / emit_return / emit_stmt.
+# Split from emitter.ritz.
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+import ritzlib.gvec
+import ritzlib.memory
+
+import ast
+import tokens_gen
+import emitter_core
+import emitter_expr
+
+fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
+    # Use the user's explicit type annotation. The parser defaults
+    # missing annotations to TYPE_I64, so any TYPE_I32 we see here
+    # came from an explicit `: i32` and must NOT be overridden —
+    # otherwise `var best_type: i32 = -1` stores i32 into an i64 slot,
+    # and callers reading i64 see garbage in the upper half.
+    var var_type: i32 = stmt.var_type
+
+    let alloca_reg: i32 = next_reg(s)
+    emit_str(s, "  ")
+    emit_reg(s, alloca_reg)
+    emit_str(s, " = alloca ")
+    if var_type == TYPE_ARRAY
+        # Emit array type: [N x elem_type]
+        emit_str(s, "[")
+        emit_int(s, stmt.var_array_size as i64)
+        emit_str(s, " x ")
+        if stmt.var_array_elem_type == TYPE_I32 or stmt.var_array_elem_type == TYPE_U32
+            emit_str(s, "i32")
+        else if stmt.var_array_elem_type == TYPE_I64 or stmt.var_array_elem_type == TYPE_U64
+            emit_str(s, "i64")
+        else if stmt.var_array_elem_type == TYPE_U8 or stmt.var_array_elem_type == TYPE_I8
+            emit_str(s, "i8")
+        else if stmt.var_array_elem_type == TYPE_U16 or stmt.var_array_elem_type == TYPE_I16
+            emit_str(s, "i16")
+        else if stmt.var_array_elem_type == TYPE_PTR or stmt.var_array_elem_type == TYPE_PTR_PTR
+            emit_str(s, "ptr")
+        else if stmt.var_array_elem_type == TYPE_STRUCT and stmt.var_type_name_len > 0
+            emit_str(s, "%")
+            emit_name(s, stmt.var_type_name, stmt.var_type_name_len)
+        else
+            emit_str(s, "i64")
+        emit_str(s, "]")
+    else
+        emit_llvm_type_struct(s, var_type, stmt.var_type_name, stmt.var_type_name_len)
+    emit_str(s, "\n")
+
+    # Track local variable type info for member access
+    # For pointer-to-struct (*StructName), use add_local_struct to track struct name
+    # References are treated as pointers at the LLVM level
+    if var_type == TYPE_PTR and stmt.var_type_name_len > 0
+        # Pointer to struct - track with struct name for ptr.field access
+        add_local_struct(s, stmt.var_name, stmt.var_name_len, alloca_reg, var_type, stmt.var_type_name, stmt.var_type_name_len)
+    else if var_type == TYPE_PTR or var_type == TYPE_PTR_PTR or var_type == TYPE_REF or var_type == TYPE_MUT_REF
+        add_local_ptr(s, stmt.var_name, stmt.var_name_len, alloca_reg, var_type, stmt.var_pointee_type)
+    else if var_type == TYPE_STRUCT
+        add_local_struct(s, stmt.var_name, stmt.var_name_len, alloca_reg, var_type, stmt.var_type_name, stmt.var_type_name_len)
+    else if var_type == TYPE_ARRAY
+        add_local_array(s, stmt.var_name, stmt.var_name_len, alloca_reg, stmt.var_array_size, stmt.var_array_elem_type)
+    else
+        add_local(s, stmt.var_name, stmt.var_name_len, alloca_reg, var_type)
+
+    if stmt.var_init != null
+        # Check for struct literal initializer
+        if stmt.var_init.kind == EXPR_STRUCT_LIT
+            # Struct literal: emit field-by-field initialization
+            # e.ident_ptr/ident_len = struct type name
+            # e.args = pointer to FieldInit list (recast)
+            let e: *Expr = stmt.var_init
+            let st: *StructDef = find_struct(s, e.ident_ptr, e.ident_len)
+            if st != null
+                # Iterate through field initializers
+                var fi: *FieldInit = e.args as *FieldInit
+                while fi != null
+                    # Find field index in struct
+                    let field_idx: i32 = find_field_index(st, fi.name, fi.name_len)
+                    if field_idx >= 0
+                        let field: *StructField = get_field_type(st, field_idx)
+                        # Emit value expression
+                        let val_reg: i32 = emit_expr(s, fi.value)
+                        # GEP to get field pointer
+                        let field_ptr: i32 = next_reg(s)
+                        emit_str(s, "  ")
+                        emit_reg(s, field_ptr)
+                        emit_str(s, " = getelementptr %")
+                        emit_name(s, st.name, st.name_len)
+                        emit_str(s, ", ptr ")
+                        emit_reg(s, alloca_reg)
+                        emit_str(s, ", i32 0, i32 ")
+                        emit_int(s, field_idx as i64)
+                        emit_str(s, "\n")
+                        # Store value based on field type
+                        if field.field_type == TYPE_I64
+                            emit_str(s, "  store i64 ")
+                            emit_reg(s, val_reg)
+                            emit_str(s, ", ptr ")
+                            emit_reg(s, field_ptr)
+                            emit_str(s, "\n")
+                        else if field.field_type == TYPE_I32
+                            let trunc: i32 = next_reg(s)
+                            emit_str(s, "  ")
+                            emit_reg(s, trunc)
+                            emit_str(s, " = trunc i64 ")
+                            emit_reg(s, val_reg)
+                            emit_str(s, " to i32\n")
+                            emit_str(s, "  store i32 ")
+                            emit_reg(s, trunc)
+                            emit_str(s, ", ptr ")
+                            emit_reg(s, field_ptr)
+                            emit_str(s, "\n")
+                        else if field.field_type == TYPE_PTR or field.field_type == TYPE_PTR_PTR
+                            let ptr_val: i32 = next_reg(s)
+                            emit_str(s, "  ")
+                            emit_reg(s, ptr_val)
+                            emit_str(s, " = inttoptr i64 ")
+                            emit_reg(s, val_reg)
+                            emit_str(s, " to ptr\n")
+                            emit_str(s, "  store ptr ")
+                            emit_reg(s, ptr_val)
+                            emit_str(s, ", ptr ")
+                            emit_reg(s, field_ptr)
+                            emit_str(s, "\n")
+                        else
+                            # Default: store as i64
+                            emit_str(s, "  store i64 ")
+                            emit_reg(s, val_reg)
+                            emit_str(s, ", ptr ")
+                            emit_reg(s, field_ptr)
+                            emit_str(s, "\n")
+                    fi = fi.next
+            return  # Done with struct literal init
+
+        let init_reg: i32 = emit_expr(s, stmt.var_init)
+        if var_type == TYPE_I32 or var_type == TYPE_U32
+            let trunc: i32 = next_reg(s)
+            emit_str(s, "  ")
+            emit_reg(s, trunc)
+            emit_str(s, " = trunc i64 ")
+            emit_reg(s, init_reg)
+            emit_str(s, " to i32\n")
+            emit_str(s, "  store i32 ")
+            emit_reg(s, trunc)
+            emit_str(s, ", ptr ")
+            emit_reg(s, alloca_reg)
+            emit_str(s, "\n")
+        else if var_type == TYPE_U8 or var_type == TYPE_I8
+            # Truncate i64 to i8 for byte types
+            let trunc: i32 = next_reg(s)
+            emit_str(s, "  ")
+            emit_reg(s, trunc)
+            emit_str(s, " = trunc i64 ")
+            emit_reg(s, init_reg)
+            emit_str(s, " to i8\n")
+            emit_str(s, "  store i8 ")
+            emit_reg(s, trunc)
+            emit_str(s, ", ptr ")
+            emit_reg(s, alloca_reg)
+            emit_str(s, "\n")
+        else if var_type == TYPE_PTR or var_type == TYPE_PTR_PTR or var_type == TYPE_REF or var_type == TYPE_MUT_REF
+            # Store i64 directly (pointers are stored as i64)
+            emit_str(s, "  store i64 ")
+            emit_reg(s, init_reg)
+            emit_str(s, ", ptr ")
+            emit_reg(s, alloca_reg)
+            emit_str(s, "\n")
+        else if var_type == TYPE_STRUCT
+            # Store struct directly
+            emit_str(s, "  store %")
+            emit_name(s, stmt.var_type_name, stmt.var_type_name_len)
+            emit_str(s, " ")
+            emit_reg(s, init_reg)
+            emit_str(s, ", ptr ")
+            emit_reg(s, alloca_reg)
+            emit_str(s, "\n")
+        else
+            emit_str(s, "  store ")
+            emit_llvm_type(s, var_type)
+            emit_str(s, " ")
+            emit_reg(s, init_reg)
+            emit_str(s, ", ptr ")
+            emit_reg(s, alloca_reg)
+            emit_str(s, "\n")
+
+fn emit_assign(s: *EmitterState, stmt: *Stmt)
+    # Check for expression assignment: expr = value
+    # When assign_target_len == 0, the target is in if_cond as an expression
+    if stmt.assign_target_len == 0
+        let target_expr: *Expr = stmt.if_cond as *Expr
+
+        # Check if target is a member expression (struct field assignment)
+        if target_expr.kind == EXPR_MEMBER
+            var member_result: MemberPtrResult
+            emit_member_ptr(s, target_expr, @member_result)
+            if member_result.success == 1
+                let val: i32 = emit_expr(s, stmt.assign_value)
+                let field: *StructField = member_result.field
+                # Store value based on field type
+                if field.field_type == TYPE_I32
+                    let trunc: i32 = next_reg(s)
+                    emit_str(s, "  ")
+                    emit_reg(s, trunc)
+                    emit_str(s, " = trunc i64 ")
+                    emit_reg(s, val)
+                    emit_str(s, " to i32\n")
+                    emit_str(s, "  store i32 ")
+                    emit_reg(s, trunc)
+                    emit_str(s, ", ptr ")
+                    emit_reg(s, member_result.reg)
+                    emit_str(s, "\n")
+                else if field.field_type == TYPE_PTR or field.field_type == TYPE_PTR_PTR
+                    let ptr_val: i32 = next_reg(s)
+                    emit_str(s, "  ")
+                    emit_reg(s, ptr_val)
+                    emit_str(s, " = inttoptr i64 ")
+                    emit_reg(s, val)
+                    emit_str(s, " to ptr\n")
+                    emit_str(s, "  store ptr ")
+                    emit_reg(s, ptr_val)
+                    emit_str(s, ", ptr ")
+                    emit_reg(s, member_result.reg)
+                    emit_str(s, "\n")
+                else
+                    # Default: store i64
+                    emit_str(s, "  store i64 ")
+                    emit_reg(s, val)
+                    emit_str(s, ", ptr ")
+                    emit_reg(s, member_result.reg)
+                    emit_str(s, "\n")
+                return
+            # Fall through to emit error if member access failed
+            emit_str(s, "  ; ERROR: unhandled EXPR_MEMBER in assignment\n")
+            return
+
+        # Check for array field element assignment: s.field[idx] = value
+        if target_expr.kind == EXPR_INDEX
+            if target_expr.left.kind == EXPR_MEMBER
+                var member_result: MemberPtrResult
+                emit_member_ptr(s, target_expr.left, @member_result)
+                if member_result.success == 1
+                    let field: *StructField = member_result.field
+                    if field.field_type == TYPE_ARRAY
+                        # Array field in struct - GEP to element, then store
+                        let idx: i32 = emit_expr(s, target_expr.right)
+                        let val: i32 = emit_expr(s, stmt.assign_value)
+                        let elem_ptr: i32 = next_reg(s)
+                        emit_str(s, "  ")
+                        emit_reg(s, elem_ptr)
+                        emit_str(s, " = getelementptr [")
+                        emit_int(s, field.array_size as i64)
+                        emit_str(s, " x ")
+                        if field.array_elem_type == TYPE_I32
+                            emit_str(s, "i32")
+                        else if field.array_elem_type == TYPE_I64
+                            emit_str(s, "i64")
+                        else if field.array_elem_type == TYPE_U8 or field.array_elem_type == TYPE_I8
+                            emit_str(s, "i8")
+                        else if field.array_elem_type == TYPE_PTR or field.array_elem_type == TYPE_PTR_PTR
+                            emit_str(s, "ptr")
+                        else
+                            emit_str(s, "i64")
+                        emit_str(s, "], ptr ")
+                        emit_reg(s, member_result.reg)
+                        emit_str(s, ", i64 0, i64 ")
+                        emit_reg(s, idx)
+                        emit_str(s, "\n")
+                        # Store element
+                        if field.array_elem_type == TYPE_I32
+                            let trunc: i32 = next_reg(s)
+                            emit_str(s, "  ")
+                            emit_reg(s, trunc)
+                            emit_str(s, " = trunc i64 ")
+                            emit_reg(s, val)
+                            emit_str(s, " to i32\n")
+                            emit_str(s, "  store i32 ")
+                            emit_reg(s, trunc)
+                            emit_str(s, ", ptr ")
+                            emit_reg(s, elem_ptr)
+                            emit_str(s, "\n")
+                        else if field.array_elem_type == TYPE_U8 or field.array_elem_type == TYPE_I8
+                            let trunc: i32 = next_reg(s)
+                            emit_str(s, "  ")
+                            emit_reg(s, trunc)
+                            emit_str(s, " = trunc i64 ")
+                            emit_reg(s, val)
+                            emit_str(s, " to i8\n")
+                            emit_str(s, "  store i8 ")
+                            emit_reg(s, trunc)
+                            emit_str(s, ", ptr ")
+                            emit_reg(s, elem_ptr)
+                            emit_str(s, "\n")
+                        else if field.array_elem_type == TYPE_PTR or field.array_elem_type == TYPE_PTR_PTR
+                            let ptr_val: i32 = next_reg(s)
+                            emit_str(s, "  ")
+                            emit_reg(s, ptr_val)
+                            emit_str(s, " = inttoptr i64 ")
+                            emit_reg(s, val)
+                            emit_str(s, " to ptr\n")
+                            emit_str(s, "  store ptr ")
+                            emit_reg(s, ptr_val)
+                            emit_str(s, ", ptr ")
+                            emit_reg(s, elem_ptr)
+                            emit_str(s, "\n")
+                        else
+                            emit_str(s, "  store i64 ")
+                            emit_reg(s, val)
+                            emit_str(s, ", ptr ")
+                            emit_reg(s, elem_ptr)
+                            emit_str(s, "\n")
+                        return
+
+        # Deref assignment: *(expr) = value
+        # Determine the store type. For `*ptr = value` we want the POINTEE
+        # type of `ptr` (the destination slot's type), not the value's type.
+        # Otherwise storing an i64 RHS into an i32 slot writes 4 extra bytes.
+        var value_type: i32 = TYPE_I64
+        var struct_name: *u8 = null
+        var struct_name_len: i32 = 0
+
+        # Prefer the destination's pointee type when available
+        if target_expr.kind == EXPR_UNARY and target_expr.op == OP_DEREF
+            if target_expr.operand.kind == EXPR_IDENT
+                let dst_loc: *LocalVar = find_local_struct_name(s, target_expr.operand.ident_ptr, target_expr.operand.ident_len)
+                if dst_loc != null and dst_loc.pointee_type != TYPE_I64
+                    value_type = dst_loc.pointee_type
+                    if dst_loc.pointee_type == TYPE_STRUCT
+                        struct_name = dst_loc.type_name
+                        struct_name_len = dst_loc.type_name_len
+
+        # Fall back to value's type if destination pointee was unknown (TYPE_I64 default)
+        if value_type == TYPE_I64
+            # Check if value is an identifier - look up its type
+            if stmt.assign_value.kind == EXPR_IDENT
+                let local: *LocalVar = find_local_struct_name(s, stmt.assign_value.ident_ptr, stmt.assign_value.ident_len)
+                if local != null
+                    value_type = local.var_type
+                    if local.var_type == TYPE_STRUCT
+                        struct_name = local.type_name
+                        struct_name_len = local.type_name_len
+            # Check if value is a function call - look up the function's return type
+            else if stmt.assign_value.kind == EXPR_CALL
+                let fn_def: *FnDef = find_fn(s, stmt.assign_value.func_name, stmt.assign_value.func_name_len)
+                if fn_def != null
+                    if fn_def.return_type == TYPE_STRUCT
+                        value_type = TYPE_STRUCT
+                        struct_name = fn_def.return_type_name
+                        struct_name_len = fn_def.return_type_name_len
+            # Check if value is a struct literal
+            else if stmt.assign_value.kind == EXPR_STRUCT_LIT
+                value_type = TYPE_STRUCT
+                struct_name = stmt.assign_value.ident_ptr
+                struct_name_len = stmt.assign_value.ident_len
+
+        let val: i32 = emit_expr(s, stmt.assign_value)
+        # For `*ptr = value`, the store address IS the pointer — NOT the
+        # dereferenced value. emit_expr on the full deref expr would load
+        # through the pointer and produce the pointee's value, which we'd
+        # then incorrectly treat as an address (double-indirection bug).
+        # If target is EXPR_UNARY with OP_DEREF, emit just the operand (the pointer).
+        var addr: i32 = 0
+        if target_expr.kind == EXPR_UNARY and target_expr.op == OP_DEREF
+            addr = emit_expr(s, target_expr.operand)
+        else
+            addr = emit_expr(s, target_expr)
+        # Convert i64 address to ptr
+        let ptr: i32 = next_reg(s)
+        emit_str(s, "  ")
+        emit_reg(s, ptr)
+        emit_str(s, " = inttoptr i64 ")
+        emit_reg(s, addr)
+        emit_str(s, " to ptr\n")
+
+        # Store based on value type
+        if value_type == TYPE_STRUCT and struct_name_len > 0
+            # Struct store - emit: store %StructName %val, ptr %ptr
+            emit_str(s, "  store %")
+            emit_name(s, struct_name, struct_name_len)
+            emit_str(s, " ")
+            emit_reg(s, val)
+            emit_str(s, ", ptr ")
+            emit_reg(s, ptr)
+            emit_str(s, "\n")
+        else if value_type == TYPE_I32 or value_type == TYPE_U32
+            # i32 store
+            let trunc: i32 = next_reg(s)
+            emit_str(s, "  ")
+            emit_reg(s, trunc)
+            emit_str(s, " = trunc i64 ")
+            emit_reg(s, val)
+            emit_str(s, " to i32\n")
+            emit_str(s, "  store i32 ")
+            emit_reg(s, trunc)
+            emit_str(s, ", ptr ")
+            emit_reg(s, ptr)
+            emit_str(s, "\n")
+        else if value_type == TYPE_U8 or value_type == TYPE_I8
+            # Byte store
+            let trunc: i32 = next_reg(s)
+            emit_str(s, "  ")
+            emit_reg(s, trunc)
+            emit_str(s, " = trunc i64 ")
+            emit_reg(s, val)
+            emit_str(s, " to i8\n")
+            emit_str(s, "  store i8 ")
+            emit_reg(s, trunc)
+            emit_str(s, ", ptr ")
+            emit_reg(s, ptr)
+            emit_str(s, "\n")
+        else if value_type == TYPE_PTR or value_type == TYPE_PTR_PTR
+            # Pointer store
+            let ptr_val: i32 = next_reg(s)
+            emit_str(s, "  ")
+            emit_reg(s, ptr_val)
+            emit_str(s, " = inttoptr i64 ")
+            emit_reg(s, val)
+            emit_str(s, " to ptr\n")
+            emit_str(s, "  store ptr ")
+            emit_reg(s, ptr_val)
+            emit_str(s, ", ptr ")
+            emit_reg(s, ptr)
+            emit_str(s, "\n")
+        else
+            # Default: store i64 (for i64, u64, and unknown types)
+            emit_str(s, "  store i64 ")
+            emit_reg(s, val)
+            emit_str(s, ", ptr ")
+            emit_reg(s, ptr)
+            emit_str(s, "\n")
+        return
+
+    let loc: i32 = find_local(s, stmt.assign_target, stmt.assign_target_len)
+    if loc >= 0
+        let var_type: i32 = find_local_type(s, stmt.assign_target, stmt.assign_target_len)
+        # Special handling for struct-typed assignments
+        if var_type == TYPE_STRUCT
+            # For struct literal assignment, use alloca + field init
+            if stmt.assign_value.kind == EXPR_STRUCT_LIT
+                emit_struct_lit_to_alloca(s, stmt.assign_value, loc)
+                return
+            # For function call or other expression returning struct
+            let val: i32 = emit_expr(s, stmt.assign_value)
+            let local: *LocalVar = find_local_struct_name(s, stmt.assign_target, stmt.assign_target_len)
+            if local != null
+                emit_str(s, "  store %")
+                emit_name(s, local.type_name, local.type_name_len)
+                emit_str(s, " ")
+                emit_reg(s, val)
+                emit_str(s, ", ptr ")
+                emit_reg(s, loc)
+                emit_str(s, "\n")
+            else
+                emit_str(s, "  store i64 ")
+                emit_reg(s, val)
+                emit_str(s, ", ptr ")
+                emit_reg(s, loc)
+                emit_str(s, "\n")
+            return
+        let val: i32 = emit_expr(s, stmt.assign_value)
+        if var_type == TYPE_I32 or var_type == TYPE_U32
+            let trunc: i32 = next_reg(s)
+            emit_str(s, "  ")
+            emit_reg(s, trunc)
+            emit_str(s, " = trunc i64 ")
+            emit_reg(s, val)
+            emit_str(s, " to i32\n")
+            emit_str(s, "  store i32 ")
+            emit_reg(s, trunc)
+            emit_str(s, ", ptr ")
+            emit_reg(s, loc)
+            emit_str(s, "\n")
+        else if var_type == TYPE_PTR or var_type == TYPE_PTR_PTR or var_type == TYPE_REF or var_type == TYPE_MUT_REF
+            # Store i64 directly (pointers are stored as i64)
+            emit_str(s, "  store i64 ")
+            emit_reg(s, val)
+            emit_str(s, ", ptr ")
+            emit_reg(s, loc)
+            emit_str(s, "\n")
+        else if var_type == TYPE_U8 or var_type == TYPE_I8
+            # Truncate i64 to i8 for byte types
+            let trunc: i32 = next_reg(s)
+            emit_str(s, "  ")
+            emit_reg(s, trunc)
+            emit_str(s, " = trunc i64 ")
+            emit_reg(s, val)
+            emit_str(s, " to i8\n")
+            emit_str(s, "  store i8 ")
+            emit_reg(s, trunc)
+            emit_str(s, ", ptr ")
+            emit_reg(s, loc)
+            emit_str(s, "\n")
+        else
+            emit_str(s, "  store ")
+            emit_llvm_type(s, var_type)
+            emit_str(s, " ")
+            emit_reg(s, val)
+            emit_str(s, ", ptr ")
+            emit_reg(s, loc)
+            emit_str(s, "\n")
+    else
+        # Check for global variable
+        let glob: *GlobalVarDef = find_global(s, stmt.assign_target, stmt.assign_target_len)
+        if glob != null
+            let val: i32 = emit_expr(s, stmt.assign_value)
+            if glob.var_type == TYPE_I32 or glob.var_type == TYPE_U32
+                let trunc: i32 = next_reg(s)
+                emit_str(s, "  ")
+                emit_reg(s, trunc)
+                emit_str(s, " = trunc i64 ")
+                emit_reg(s, val)
+                emit_str(s, " to i32\n")
+                emit_str(s, "  store i32 ")
+                emit_reg(s, trunc)
+                emit_str(s, ", ptr @")
+                emit_name(s, glob.name, glob.name_len)
+                emit_str(s, "\n")
+            else
+                emit_str(s, "  store ")
+                emit_llvm_type(s, glob.var_type)
+                emit_str(s, " ")
+                emit_reg(s, val)
+                emit_str(s, ", ptr @")
+                emit_name(s, glob.name, glob.name_len)
+                emit_str(s, "\n")
+        else
+            emit_str(s, "  ; ERROR: unknown variable '")
+            emit_name(s, stmt.assign_target, stmt.assign_target_len)
+            emit_str(s, "'\n")
+
+fn emit_return(s: *EmitterState, stmt: *Stmt, ret_type: i32)
+    if stmt.return_value != null
+        # Special handling for struct returns - need to load entire struct
+        if ret_type == TYPE_STRUCT
+            # Check if return value is a struct literal (e.g., return NFAFragment { start: s0, end: s0 })
+            if stmt.return_value.kind == EXPR_STRUCT_LIT
+                let alloca_reg: i32 = next_reg(s)
+                emit_str(s, "  ")
+                emit_reg(s, alloca_reg)
+                emit_str(s, " = alloca %")
+                emit_name(s, stmt.return_value.ident_ptr, stmt.return_value.ident_len)
+                emit_str(s, "\n")
+                emit_struct_lit_to_alloca(s, stmt.return_value, alloca_reg)
+                let result: i32 = next_reg(s)
+                emit_str(s, "  ")
+                emit_reg(s, result)
+                emit_str(s, " = load %")
+                emit_name(s, stmt.return_value.ident_ptr, stmt.return_value.ident_len)
+                emit_str(s, ", ptr ")
+                emit_reg(s, alloca_reg)
+                emit_str(s, "\n")
+                emit_str(s, "  ret %")
+                emit_name(s, stmt.return_value.ident_ptr, stmt.return_value.ident_len)
+                emit_str(s, " ")
+                emit_reg(s, result)
+                emit_str(s, "\n")
+                return
+            # Check if return value is a local variable
+            if stmt.return_value.kind == EXPR_IDENT
+                let loc: i32 = find_local(s, stmt.return_value.ident_ptr, stmt.return_value.ident_len)
+                if loc >= 0
+                    # Load the entire struct from the local
+                    let result: i32 = next_reg(s)
+                    emit_str(s, "  ")
+                    emit_reg(s, result)
+                    emit_str(s, " = load %")
+                    emit_name(s, s.ret_type_name, s.ret_type_name_len)
+                    emit_str(s, ", ptr ")
+                    emit_reg(s, loc)
+                    emit_str(s, "\n")
+                    emit_str(s, "  ret %")
+                    emit_name(s, s.ret_type_name, s.ret_type_name_len)
+                    emit_str(s, " ")
+                    emit_reg(s, result)
+                    emit_str(s, "\n")
+                    return
+            # Check if return value is a dereference (e.g., *ptr or *(ptr + offset))
+            if stmt.return_value.kind == EXPR_UNARY and stmt.return_value.op == OP_DEREF
+                # Calculate the pointer address, then load the struct from it
+                let addr: i32 = emit_expr(s, stmt.return_value.operand)
+                let ptr: i32 = next_reg(s)
+                emit_str(s, "  ")
+                emit_reg(s, ptr)
+                emit_str(s, " = inttoptr i64 ")
+                emit_reg(s, addr)
+                emit_str(s, " to ptr\n")
+                let result: i32 = next_reg(s)
+                emit_str(s, "  ")
+                emit_reg(s, result)
+                emit_str(s, " = load %")
+                emit_name(s, s.ret_type_name, s.ret_type_name_len)
+                emit_str(s, ", ptr ")
+                emit_reg(s, ptr)
+                emit_str(s, "\n")
+                emit_str(s, "  ret %")
+                emit_name(s, s.ret_type_name, s.ret_type_name_len)
+                emit_str(s, " ")
+                emit_reg(s, result)
+                emit_str(s, "\n")
+                return
+            # For other expressions, emit normally and return
+            let val: i32 = emit_expr(s, stmt.return_value)
+            emit_str(s, "  ret %")
+            emit_name(s, s.ret_type_name, s.ret_type_name_len)
+            emit_str(s, " ")
+            emit_reg(s, val)
+            emit_str(s, "\n")
+            return
+
+        let val: i32 = emit_expr(s, stmt.return_value)
+        if ret_type == TYPE_I32
+            let trunc: i32 = next_reg(s)
+            emit_str(s, "  ")
+            emit_reg(s, trunc)
+            emit_str(s, " = trunc i64 ")
+            emit_reg(s, val)
+            emit_str(s, " to i32\n")
+            emit_str(s, "  ret i32 ")
+            emit_reg(s, trunc)
+            emit_str(s, "\n")
+        else if ret_type == TYPE_U8 or ret_type == TYPE_I8
+            # Truncate i64 to i8 for byte return types
+            let trunc: i32 = next_reg(s)
+            emit_str(s, "  ")
+            emit_reg(s, trunc)
+            emit_str(s, " = trunc i64 ")
+            emit_reg(s, val)
+            emit_str(s, " to i8\n")
+            emit_str(s, "  ret i8 ")
+            emit_reg(s, trunc)
+            emit_str(s, "\n")
+        else if ret_type == TYPE_PTR or ret_type == TYPE_PTR_PTR
+            # Pointers are represented as i64 internally, return as i64
+            emit_str(s, "  ret i64 ")
+            emit_reg(s, val)
+            emit_str(s, "\n")
+        else
+            emit_str(s, "  ret ")
+            emit_llvm_type(s, ret_type)
+            emit_str(s, " ")
+            emit_reg(s, val)
+            emit_str(s, "\n")
+    else
+        emit_str(s, "  ret void\n")
+
+fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
+    if stmt.kind == STMT_VAR_DECL
+        emit_var_decl(s, stmt)
+    else if stmt.kind == STMT_ASSIGN
+        emit_assign(s, stmt)
+    else if stmt.kind == STMT_RETURN
+        emit_return(s, stmt, ret_type)
+    else if stmt.kind == STMT_IF
+        let cond: i32 = emit_expr(s, stmt.if_cond)
+        let cond_i1: i32 = next_reg(s)
+        emit_str(s, "  ")
+        emit_reg(s, cond_i1)
+        emit_str(s, " = icmp ne i64 ")
+        emit_reg(s, cond)
+        emit_str(s, ", 0\n")
+
+        let then_label: i32 = next_label(s)
+        let else_label: i32 = next_label(s)
+        let end_label: i32 = next_label(s)
+
+        emit_str(s, "  br i1 ")
+        emit_reg(s, cond_i1)
+        emit_str(s, ", label %")
+        emit_label(s, then_label)
+        emit_str(s, ", label %")
+        if stmt.if_else != null
+            emit_label(s, else_label)
+        else
+            emit_label(s, end_label)
+        emit_str(s, "\n")
+
+        # Save current last_expr_reg before entering branches
+        let saved_last: i32 = s.last_expr_reg
+
+        emit_label(s, then_label)
+        emit_str(s, ":\n")
+        s.current_label = then_label  # Track current block
+        s.last_expr_reg = 0  # Reset before then branch
+        var then_stmt: *Stmt = stmt.if_then
+        while then_stmt != null
+            emit_stmt(s, then_stmt, ret_type)
+            then_stmt = then_stmt.next
+        let then_result: i32 = s.last_expr_reg  # Capture then branch result
+        let then_exit_label: i32 = s.current_label  # Capture actual exit block
+        emit_str(s, "  br label %")
+        emit_label(s, end_label)
+        emit_str(s, "\n")
+
+        var else_result: i32 = 0
+        var else_exit_label: i32 = else_label
+        if stmt.if_else != null
+            emit_label(s, else_label)
+            emit_str(s, ":\n")
+            s.current_label = else_label  # Track current block
+            s.last_expr_reg = 0  # Reset before else branch
+            var else_stmt: *Stmt = stmt.if_else
+            while else_stmt != null
+                emit_stmt(s, else_stmt, ret_type)
+                else_stmt = else_stmt.next
+            else_result = s.last_expr_reg  # Capture else branch result
+            else_exit_label = s.current_label  # Capture actual exit block
+            emit_str(s, "  br label %")
+            emit_label(s, end_label)
+            emit_str(s, "\n")
+
+        emit_label(s, end_label)
+        emit_str(s, ":\n")
+        s.current_label = end_label  # Update current block
+
+        # If both branches produce values, emit a phi node
+        if stmt.if_else != null and then_result > 0 and else_result > 0
+            let phi_reg: i32 = next_reg(s)
+            emit_str(s, "  ")
+            emit_reg(s, phi_reg)
+            emit_str(s, " = phi i64 [ ")
+            emit_reg(s, then_result)
+            emit_str(s, ", %")
+            emit_label(s, then_exit_label)  # Use actual exit block, not entry
+            emit_str(s, " ], [ ")
+            emit_reg(s, else_result)
+            emit_str(s, ", %")
+            emit_label(s, else_exit_label)  # Use actual exit block
+            emit_str(s, " ]\n")
+            s.last_expr_reg = phi_reg  # Set the merged result
+        else if then_result > 0
+            s.last_expr_reg = then_result
+        else
+            s.last_expr_reg = saved_last  # Restore if no result
+
+    else if stmt.kind == STMT_WHILE
+        let cond_label: i32 = next_label(s)
+        let body_label: i32 = next_label(s)
+        let end_label: i32 = next_label(s)
+
+        let old_break: i32 = s.break_label
+        let old_continue: i32 = s.continue_label
+        s.break_label = end_label
+        s.continue_label = cond_label
+
+        emit_str(s, "  br label %")
+        emit_label(s, cond_label)
+        emit_str(s, "\n")
+
+        emit_label(s, cond_label)
+        emit_str(s, ":\n")
+        let cond: i32 = emit_expr(s, stmt.while_cond)
+        let cond_i1: i32 = next_reg(s)
+        emit_str(s, "  ")
+        emit_reg(s, cond_i1)
+        emit_str(s, " = icmp ne i64 ")
+        emit_reg(s, cond)
+        emit_str(s, ", 0\n")
+        emit_str(s, "  br i1 ")
+        emit_reg(s, cond_i1)
+        emit_str(s, ", label %")
+        emit_label(s, body_label)
+        emit_str(s, ", label %")
+        emit_label(s, end_label)
+        emit_str(s, "\n")
+
+        emit_label(s, body_label)
+        emit_str(s, ":\n")
+        var body_stmt: *Stmt = stmt.while_body
+        while body_stmt != null
+            emit_stmt(s, body_stmt, ret_type)
+            body_stmt = body_stmt.next
+        emit_str(s, "  br label %")
+        emit_label(s, cond_label)
+        emit_str(s, "\n")
+
+        emit_label(s, end_label)
+        emit_str(s, ":\n")
+
+        s.break_label = old_break
+        s.continue_label = old_continue
+
+    else if stmt.kind == STMT_LOOP
+        # Infinite loop: loop { body }
+        # Generates:
+        #   br label %loop.body
+        # loop.body:
+        #   ... body ...
+        #   br label %loop.body
+        # loop.end:
+        let body_label: i32 = next_label(s)
+        let end_label: i32 = next_label(s)
+
+        let old_break: i32 = s.break_label
+        let old_continue: i32 = s.continue_label
+        s.break_label = end_label
+        s.continue_label = body_label
+
+        emit_str(s, "  br label %")
+        emit_label(s, body_label)
+        emit_str(s, "\n")
+
+        emit_label(s, body_label)
+        emit_str(s, ":\n")
+        var body_stmt: *Stmt = stmt.while_body
+        while body_stmt != null
+            emit_stmt(s, body_stmt, ret_type)
+            body_stmt = body_stmt.next
+        emit_str(s, "  br label %")
+        emit_label(s, body_label)
+        emit_str(s, "\n")
+
+        emit_label(s, end_label)
+        emit_str(s, ":\n")
+
+        s.break_label = old_break
+        s.continue_label = old_continue
+
+    else if stmt.kind == STMT_FOR
+        # For-loop: for i in start..end { body }
+        # Desugar to:
+        #   %i = alloca i64
+        #   store i64 %start, ptr %i
+        #   br label %for.cond
+        # for.cond:
+        #   %i.val = load i64, ptr %i
+        #   %cmp = icmp slt i64 %i.val, %end
+        #   br i1 %cmp, label %for.body, label %for.end
+        # for.body:
+        #   ... body ...
+        #   %i.next = add i64 %i.val, 1
+        #   store i64 %i.next, ptr %i
+        #   br label %for.cond
+        # for.end:
+
+        let cond_label: i32 = next_label(s)
+        let body_label: i32 = next_label(s)
+        let incr_label: i32 = next_label(s)
+        let end_label: i32 = next_label(s)
+
+        let old_break: i32 = s.break_label
+        let old_continue: i32 = s.continue_label
+        s.break_label = end_label
+        s.continue_label = incr_label
+
+        # Allocate loop variable
+        let var_reg: i32 = next_reg(s)
+        emit_str(s, "  ")
+        emit_reg(s, var_reg)
+        emit_str(s, " = alloca i64\n")
+
+        # Register the loop variable
+        add_local(s, stmt.for_var, stmt.for_var_len, var_reg, TYPE_I64)
+
+        # Emit start expression and store it
+        let start_reg: i32 = emit_expr(s, stmt.for_start)
+        emit_str(s, "  store i64 ")
+        emit_reg(s, start_reg)
+        emit_str(s, ", ptr ")
+        emit_reg(s, var_reg)
+        emit_str(s, "\n")
+
+        # Branch to condition check
+        emit_str(s, "  br label %")
+        emit_label(s, cond_label)
+        emit_str(s, "\n")
+
+        # Condition block
+        emit_label(s, cond_label)
+        emit_str(s, ":\n")
+        let load_reg: i32 = next_reg(s)
+        emit_str(s, "  ")
+        emit_reg(s, load_reg)
+        emit_str(s, " = load i64, ptr ")
+        emit_reg(s, var_reg)
+        emit_str(s, "\n")
+
+        let end_reg: i32 = emit_expr(s, stmt.for_end)
+        let cmp_reg: i32 = next_reg(s)
+        emit_str(s, "  ")
+        emit_reg(s, cmp_reg)
+        emit_str(s, " = icmp slt i64 ")
+        emit_reg(s, load_reg)
+        emit_str(s, ", ")
+        emit_reg(s, end_reg)
+        emit_str(s, "\n")
+        emit_str(s, "  br i1 ")
+        emit_reg(s, cmp_reg)
+        emit_str(s, ", label %")
+        emit_label(s, body_label)
+        emit_str(s, ", label %")
+        emit_label(s, end_label)
+        emit_str(s, "\n")
+
+        # Body block
+        emit_label(s, body_label)
+        emit_str(s, ":\n")
+        var body_stmt: *Stmt = stmt.for_body
+        while body_stmt != null
+            emit_stmt(s, body_stmt, ret_type)
+            body_stmt = body_stmt.next
+        emit_str(s, "  br label %")
+        emit_label(s, incr_label)
+        emit_str(s, "\n")
+
+        # Increment block
+        emit_label(s, incr_label)
+        emit_str(s, ":\n")
+        let load2_reg: i32 = next_reg(s)
+        emit_str(s, "  ")
+        emit_reg(s, load2_reg)
+        emit_str(s, " = load i64, ptr ")
+        emit_reg(s, var_reg)
+        emit_str(s, "\n")
+        let incr_reg: i32 = next_reg(s)
+        emit_str(s, "  ")
+        emit_reg(s, incr_reg)
+        emit_str(s, " = add i64 ")
+        emit_reg(s, load2_reg)
+        emit_str(s, ", 1\n")
+        emit_str(s, "  store i64 ")
+        emit_reg(s, incr_reg)
+        emit_str(s, ", ptr ")
+        emit_reg(s, var_reg)
+        emit_str(s, "\n")
+        emit_str(s, "  br label %")
+        emit_label(s, cond_label)
+        emit_str(s, "\n")
+
+        # End block
+        emit_label(s, end_label)
+        emit_str(s, ":\n")
+
+        s.break_label = old_break
+        s.continue_label = old_continue
+
+    else if stmt.kind == STMT_BREAK
+        if s.break_label >= 0
+            emit_str(s, "  br label %")
+            emit_label(s, s.break_label)
+            emit_str(s, "\n")
+            let dead_label: i32 = next_label(s)
+            emit_label(s, dead_label)
+            emit_str(s, ":\n")
+
+    else if stmt.kind == STMT_CONTINUE
+        if s.continue_label >= 0
+            emit_str(s, "  br label %")
+            emit_label(s, s.continue_label)
+            emit_str(s, "\n")
+            let dead_label: i32 = next_label(s)
+            emit_label(s, dead_label)
+            emit_str(s, ":\n")
+
+    else if stmt.kind == STMT_EXPR
+        # Note: Implicit return only at function body level, not in nested blocks
+        # The implicit_return flag would be passed from emit_fn for top-level statements
+        # For now, we just emit the expression without implicit return in nested contexts
+        if stmt.expr == null
+            eprints_cstr("ERROR: STMT_EXPR with null expr field!\n")
+        else
+            let expr_reg: i32 = emit_expr(s, stmt.expr)
+            s.last_expr_reg = expr_reg  # Track for if/else phi nodes
+    else if stmt.kind == STMT_LOCAL_FIELD_ASSIGN
+        # local_var.field = value
+        # stmt.var_name = variable name
+        # stmt.assign_target = field name
+        # stmt.assign_value = value expression
+        let loc: *LocalVar = find_local_struct_name(s, stmt.var_name, stmt.var_name_len)
+        if loc != null
+            let st: *StructDef = find_struct(s, loc.type_name, loc.type_name_len)
+            if st != null
+                let field_idx: i32 = find_field_index(st, stmt.assign_target, stmt.assign_target_len)
+                if field_idx >= 0
+                    let field: *StructField = get_field_type(st, field_idx)
+                    # Get the base pointer - differs for TYPE_PTR/TYPE_REF/TYPE_MUT_REF vs TYPE_STRUCT
+                    var base_ptr_reg: i32 = loc.reg
+                    if loc.var_type == TYPE_PTR or loc.var_type == TYPE_REF or loc.var_type == TYPE_MUT_REF
+                        # Load the pointer value, then convert to ptr
+                        let loaded: i32 = next_reg(s)
+                        emit_str(s, "  ")
+                        emit_reg(s, loaded)
+                        emit_str(s, " = load i64, ptr ")
+                        emit_reg(s, loc.reg)
+                        emit_str(s, "\n")
+                        base_ptr_reg = next_reg(s)
+                        emit_str(s, "  ")
+                        emit_reg(s, base_ptr_reg)
+                        emit_str(s, " = inttoptr i64 ")
+                        emit_reg(s, loaded)
+                        emit_str(s, " to ptr\n")
+                    # Get pointer to the field using GEP
+                    let field_ptr: i32 = next_reg(s)
+                    emit_str(s, "  ")
+                    emit_reg(s, field_ptr)
+                    emit_str(s, " = getelementptr %")
+                    emit_name(s, st.name, st.name_len)
+                    emit_str(s, ", ptr ")
+                    emit_reg(s, base_ptr_reg)
+                    emit_str(s, ", i32 0, i32 ")
+                    emit_int(s, field_idx as i64)
+                    emit_str(s, "\n")
+                    # Emit the value
+                    let val_reg: i32 = emit_expr(s, stmt.assign_value)
+                    # Store the value based on field type
+                    if field.field_type == TYPE_I32
+                        let trunc: i32 = next_reg(s)
+                        emit_str(s, "  ")
+                        emit_reg(s, trunc)
+                        emit_str(s, " = trunc i64 ")
+                        emit_reg(s, val_reg)
+                        emit_str(s, " to i32\n")
+                        emit_str(s, "  store i32 ")
+                        emit_reg(s, trunc)
+                        emit_str(s, ", ptr ")
+                        emit_reg(s, field_ptr)
+                        emit_str(s, "\n")
+                    else if field.field_type == TYPE_PTR or field.field_type == TYPE_PTR_PTR
+                        let ptr_val: i32 = next_reg(s)
+                        emit_str(s, "  ")
+                        emit_reg(s, ptr_val)
+                        emit_str(s, " = inttoptr i64 ")
+                        emit_reg(s, val_reg)
+                        emit_str(s, " to ptr\n")
+                        emit_str(s, "  store ptr ")
+                        emit_reg(s, ptr_val)
+                        emit_str(s, ", ptr ")
+                        emit_reg(s, field_ptr)
+                        emit_str(s, "\n")
+                    else if field.field_type == TYPE_STRUCT and field.field_type_name_len > 0
+                        # Struct field - store as struct type
+                        emit_str(s, "  store %")
+                        emit_name(s, field.field_type_name, field.field_type_name_len)
+                        emit_str(s, " ")
+                        emit_reg(s, val_reg)
+                        emit_str(s, ", ptr ")
+                        emit_reg(s, field_ptr)
+                        emit_str(s, "\n")
+                    else
+                        emit_str(s, "  store i64 ")
+                        emit_reg(s, val_reg)
+                        emit_str(s, ", ptr ")
+                        emit_reg(s, field_ptr)
+                        emit_str(s, "\n")
+    else if stmt.kind == STMT_LOCAL_FIELD_INDEX_ASSIGN
+        # local_var.field[index] = value
+        # stmt.var_name = variable name
+        # stmt.assign_target = field name
+        # stmt.while_cond = index expression (reused)
+        # stmt.assign_value = value expression
+        let loc: *LocalVar = find_local_struct_name(s, stmt.var_name, stmt.var_name_len)
+        if loc != null
+            let st: *StructDef = find_struct(s, loc.type_name, loc.type_name_len)
+            if st != null
+                let field_idx: i32 = find_field_index(st, stmt.assign_target, stmt.assign_target_len)
+                if field_idx >= 0
+                    let field: *StructField = get_field_type(st, field_idx)
+                    # Get the base pointer - differs for TYPE_PTR/TYPE_REF/TYPE_MUT_REF vs TYPE_STRUCT
+                    var base_ptr_reg: i32 = loc.reg
+                    if loc.var_type == TYPE_PTR or loc.var_type == TYPE_REF or loc.var_type == TYPE_MUT_REF
+                        # Load the pointer value, then convert to ptr
+                        let loaded: i32 = next_reg(s)
+                        emit_str(s, "  ")
+                        emit_reg(s, loaded)
+                        emit_str(s, " = load i64, ptr ")
+                        emit_reg(s, loc.reg)
+                        emit_str(s, "\n")
+                        base_ptr_reg = next_reg(s)
+                        emit_str(s, "  ")
+                        emit_reg(s, base_ptr_reg)
+                        emit_str(s, " = inttoptr i64 ")
+                        emit_reg(s, loaded)
+                        emit_str(s, " to ptr\n")
+                    # First GEP to get the field (array within struct)
+                    let field_ptr: i32 = next_reg(s)
+                    emit_str(s, "  ")
+                    emit_reg(s, field_ptr)
+                    emit_str(s, " = getelementptr %")
+                    emit_name(s, st.name, st.name_len)
+                    emit_str(s, ", ptr ")
+                    emit_reg(s, base_ptr_reg)
+                    emit_str(s, ", i32 0, i32 ")
+                    emit_int(s, field_idx as i64)
+                    emit_str(s, "\n")
+                    # Emit index expression
+                    let idx_reg: i32 = emit_expr(s, stmt.while_cond)
+                    # Emit value expression
+                    let val_reg: i32 = emit_expr(s, stmt.assign_value)
+                    # Second GEP to get array element
+                    let elem_ptr: i32 = next_reg(s)
+                    emit_str(s, "  ")
+                    emit_reg(s, elem_ptr)
+                    emit_str(s, " = getelementptr [")
+                    emit_int(s, field.array_size as i64)
+                    emit_str(s, " x ")
+                    if field.array_elem_type == TYPE_I32
+                        emit_str(s, "i32")
+                    else if field.array_elem_type == TYPE_I64
+                        emit_str(s, "i64")
+                    else if field.array_elem_type == TYPE_U8 or field.array_elem_type == TYPE_I8
+                        emit_str(s, "i8")
+                    else if field.array_elem_type == TYPE_PTR or field.array_elem_type == TYPE_PTR_PTR
+                        emit_str(s, "ptr")
+                    else
+                        emit_str(s, "i64")
+                    emit_str(s, "], ptr ")
+                    emit_reg(s, field_ptr)
+                    emit_str(s, ", i64 0, i64 ")
+                    emit_reg(s, idx_reg)
+                    emit_str(s, "\n")
+                    # Store value - handle type conversion
+                    if field.array_elem_type == TYPE_U8 or field.array_elem_type == TYPE_I8
+                        let trunc: i32 = next_reg(s)
+                        emit_str(s, "  ")
+                        emit_reg(s, trunc)
+                        emit_str(s, " = trunc i64 ")
+                        emit_reg(s, val_reg)
+                        emit_str(s, " to i8\n")
+                        emit_str(s, "  store i8 ")
+                        emit_reg(s, trunc)
+                        emit_str(s, ", ptr ")
+                        emit_reg(s, elem_ptr)
+                        emit_str(s, "\n")
+                    else if field.array_elem_type == TYPE_I32
+                        let trunc: i32 = next_reg(s)
+                        emit_str(s, "  ")
+                        emit_reg(s, trunc)
+                        emit_str(s, " = trunc i64 ")
+                        emit_reg(s, val_reg)
+                        emit_str(s, " to i32\n")
+                        emit_str(s, "  store i32 ")
+                        emit_reg(s, trunc)
+                        emit_str(s, ", ptr ")
+                        emit_reg(s, elem_ptr)
+                        emit_str(s, "\n")
+                    else if field.array_elem_type == TYPE_PTR or field.array_elem_type == TYPE_PTR_PTR
+                        let ptr_val: i32 = next_reg(s)
+                        emit_str(s, "  ")
+                        emit_reg(s, ptr_val)
+                        emit_str(s, " = inttoptr i64 ")
+                        emit_reg(s, val_reg)
+                        emit_str(s, " to ptr\n")
+                        emit_str(s, "  store ptr ")
+                        emit_reg(s, ptr_val)
+                        emit_str(s, ", ptr ")
+                        emit_reg(s, elem_ptr)
+                        emit_str(s, "\n")
+                    else
+                        emit_str(s, "  store i64 ")
+                        emit_reg(s, val_reg)
+                        emit_str(s, ", ptr ")
+                        emit_reg(s, elem_ptr)
+                        emit_str(s, "\n")
+    else if stmt.kind == STMT_INDEX_ASSIGN
+        # name[index] = value (array or pointer index assignment)
+        # stmt.assign_target = base variable name (as *u8)
+        # stmt.assign_target_len = name length
+        # stmt.while_cond = index expression (reused field)
+        # stmt.assign_value = value expression
+        let base_reg: i32 = find_local(s, stmt.assign_target, stmt.assign_target_len)
+        let base_type: i32 = find_local_type(s, stmt.assign_target, stmt.assign_target_len)
+        let local: *LocalVar = find_local_struct_name(s, stmt.assign_target, stmt.assign_target_len)
+        if base_reg >= 0
+            if base_type == TYPE_ARRAY and local != null
+                # Array local - use GEP [0, index] to get element
+                let idx_reg: i32 = emit_expr(s, stmt.while_cond)
+                let val_reg: i32 = emit_expr(s, stmt.assign_value)
+                let elem_ptr: i32 = next_reg(s)
+                emit_str(s, "  ")
+                emit_reg(s, elem_ptr)
+                emit_str(s, " = getelementptr [")
+                emit_int(s, local.array_size as i64)
+                emit_str(s, " x ")
+                if local.array_elem_type == TYPE_I32
+                    emit_str(s, "i32")
+                else if local.array_elem_type == TYPE_I64
+                    emit_str(s, "i64")
+                else if local.array_elem_type == TYPE_U8 or local.array_elem_type == TYPE_I8
+                    emit_str(s, "i8")
+                else if local.array_elem_type == TYPE_PTR or local.array_elem_type == TYPE_PTR_PTR
+                    emit_str(s, "ptr")
+                else
+                    emit_str(s, "i64")
+                emit_str(s, "], ptr ")
+                emit_reg(s, base_reg)
+                emit_str(s, ", i64 0, i64 ")
+                emit_reg(s, idx_reg)
+                emit_str(s, "\n")
+                # Store value - truncate to element type if needed
+                if local.array_elem_type == TYPE_U8 or local.array_elem_type == TYPE_I8
+                    let trunc: i32 = next_reg(s)
+                    emit_str(s, "  ")
+                    emit_reg(s, trunc)
+                    emit_str(s, " = trunc i64 ")
+                    emit_reg(s, val_reg)
+                    emit_str(s, " to i8\n")
+                    emit_str(s, "  store i8 ")
+                    emit_reg(s, trunc)
+                    emit_str(s, ", ptr ")
+                    emit_reg(s, elem_ptr)
+                    emit_str(s, "\n")
+                else if local.array_elem_type == TYPE_I32
+                    let trunc: i32 = next_reg(s)
+                    emit_str(s, "  ")
+                    emit_reg(s, trunc)
+                    emit_str(s, " = trunc i64 ")
+                    emit_reg(s, val_reg)
+                    emit_str(s, " to i32\n")
+                    emit_str(s, "  store i32 ")
+                    emit_reg(s, trunc)
+                    emit_str(s, ", ptr ")
+                    emit_reg(s, elem_ptr)
+                    emit_str(s, "\n")
+                else if local.array_elem_type == TYPE_PTR or local.array_elem_type == TYPE_PTR_PTR
+                    let ptr_val: i32 = next_reg(s)
+                    emit_str(s, "  ")
+                    emit_reg(s, ptr_val)
+                    emit_str(s, " = inttoptr i64 ")
+                    emit_reg(s, val_reg)
+                    emit_str(s, " to ptr\n")
+                    emit_str(s, "  store ptr ")
+                    emit_reg(s, ptr_val)
+                    emit_str(s, ", ptr ")
+                    emit_reg(s, elem_ptr)
+                    emit_str(s, "\n")
+                else
+                    emit_str(s, "  store i64 ")
+                    emit_reg(s, val_reg)
+                    emit_str(s, ", ptr ")
+                    emit_reg(s, elem_ptr)
+                    emit_str(s, "\n")
+            else
+                # Pointer type - load the i64 value and convert to ptr
+                let loaded_i64: i32 = next_reg(s)
+                emit_str(s, "  ")
+                emit_reg(s, loaded_i64)
+                emit_str(s, " = load i64, ptr ")
+                emit_reg(s, base_reg)
+                emit_str(s, "\n")
+                let base_ptr: i32 = next_reg(s)
+                emit_str(s, "  ")
+                emit_reg(s, base_ptr)
+                emit_str(s, " = inttoptr i64 ")
+                emit_reg(s, loaded_i64)
+                emit_str(s, " to ptr\n")
+                # Emit index expression (stored in while_cond)
+                let idx_reg: i32 = emit_expr(s, stmt.while_cond)
+                # Emit value expression
+                let val_reg: i32 = emit_expr(s, stmt.assign_value)
+                # GEP to get element pointer
+                let elem_ptr: i32 = next_reg(s)
+                emit_str(s, "  ")
+                emit_reg(s, elem_ptr)
+                # Determine element type from base type
+                if base_type == TYPE_PTR_PTR
+                    # *(*i64) - pointer to pointers, element is ptr
+                    emit_str(s, " = getelementptr ptr, ptr ")
+                    emit_reg(s, base_ptr)
+                    emit_str(s, ", i64 ")
+                    emit_reg(s, idx_reg)
+                    emit_str(s, "\n")
+                    # Convert value to ptr and store
+                    let ptr_val: i32 = next_reg(s)
+                    emit_str(s, "  ")
+                    emit_reg(s, ptr_val)
+                    emit_str(s, " = inttoptr i64 ")
+                    emit_reg(s, val_reg)
+                    emit_str(s, " to ptr\n")
+                    emit_str(s, "  store ptr ")
+                    emit_reg(s, ptr_val)
+                    emit_str(s, ", ptr ")
+                    emit_reg(s, elem_ptr)
+                    emit_str(s, "\n")
+                else
+                    # *T - pointer to values, element is the pointed-to type
+                    # For *i64, element type is i64
+                    emit_str(s, " = getelementptr i64, ptr ")
+                    emit_reg(s, base_ptr)
+                    emit_str(s, ", i64 ")
+                    emit_reg(s, idx_reg)
+                    emit_str(s, "\n")
+                    # Store value
+                    emit_str(s, "  store i64 ")
+                    emit_reg(s, val_reg)
+                    emit_str(s, ", ptr ")
+                    emit_reg(s, elem_ptr)
+                    emit_str(s, "\n")
+    else if stmt.kind == STMT_MEMBER_ASSIGN
+        # ptr_expr.field = value
+        # stmt.if_cond = ptr expression (the thing being dereferenced)
+        # stmt.assign_target = field name
+        # stmt.assign_target_len = field name length
+        # stmt.assign_value = value expression
+        # First, emit the pointer expression
+        let ptr_reg: i32 = emit_expr(s, stmt.if_cond)
+        # Convert i64 to ptr
+        let ptr: i32 = next_reg(s)
+        emit_str(s, "  ")
+        emit_reg(s, ptr)
+        emit_str(s, " = inttoptr i64 ")
+        emit_reg(s, ptr_reg)
+        emit_str(s, " to ptr\n")
+        # Need to determine the struct type from the pointer expression
+        # For now, try to infer from the identifier if it's a simple identifier
+        if stmt.if_cond.kind == EXPR_IDENT
+            let loc: *LocalVar = find_local_struct_name(s, stmt.if_cond.ident_ptr, stmt.if_cond.ident_len)
+            if loc != null
+                if loc.var_type == TYPE_PTR
+                    # Look up the pointed-to struct type
+                    let st: *StructDef = find_struct(s, loc.type_name, loc.type_name_len)
+                    if st != null
+                        let field_idx: i32 = find_field_index(st, stmt.assign_target, stmt.assign_target_len)
+                        if field_idx >= 0
+                            let field: *StructField = get_field_type(st, field_idx)
+                            # GEP to the field
+                            let field_ptr: i32 = next_reg(s)
+                            emit_str(s, "  ")
+                            emit_reg(s, field_ptr)
+                            emit_str(s, " = getelementptr %")
+                            emit_name(s, st.name, st.name_len)
+                            emit_str(s, ", ptr ")
+                            emit_reg(s, ptr)
+                            emit_str(s, ", i32 0, i32 ")
+                            emit_int(s, field_idx as i64)
+                            emit_str(s, "\n")
+                            # Emit the value
+                            let val_reg: i32 = emit_expr(s, stmt.assign_value)
+                            # Store the value based on field type
+                            if field.field_type == TYPE_I32
+                                let trunc: i32 = next_reg(s)
+                                emit_str(s, "  ")
+                                emit_reg(s, trunc)
+                                emit_str(s, " = trunc i64 ")
+                                emit_reg(s, val_reg)
+                                emit_str(s, " to i32\n")
+                                emit_str(s, "  store i32 ")
+                                emit_reg(s, trunc)
+                                emit_str(s, ", ptr ")
+                                emit_reg(s, field_ptr)
+                                emit_str(s, "\n")
+                            else if field.field_type == TYPE_PTR or field.field_type == TYPE_PTR_PTR
+                                let ptr_val: i32 = next_reg(s)
+                                emit_str(s, "  ")
+                                emit_reg(s, ptr_val)
+                                emit_str(s, " = inttoptr i64 ")
+                                emit_reg(s, val_reg)
+                                emit_str(s, " to ptr\n")
+                                emit_str(s, "  store ptr ")
+                                emit_reg(s, ptr_val)
+                                emit_str(s, ", ptr ")
+                                emit_reg(s, field_ptr)
+                                emit_str(s, "\n")
+                            else
+                                emit_str(s, "  store i64 ")
+                                emit_reg(s, val_reg)
+                                emit_str(s, ", ptr ")
+                                emit_reg(s, field_ptr)
+                                emit_str(s, "\n")
+    else
+        emit_str(s, "  ; TODO: statement kind ")
+        emit_int(s, stmt.kind as i64)
+        emit_str(s, "\n")
+
+# =============================================================================
+# Function Emission
+# =============================================================================
+
