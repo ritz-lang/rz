@@ -436,6 +436,71 @@ fn lexer_next(lex: *Lexer) -> Token
       lex.col = lex.col + best_len
       continue
 
+    # Check for c"..." and s"..." string prefixes
+    # If the NFA matched a 1-char identifier 'c' or 's' and next char is '"',
+    # scan it as a c-string or s-string literal
+    if best_type == TOK_IDENT and best_len == 1 and lex.pos + 1 < lex.len and *(lex.src + lex.pos + 1) == 34
+        let prefix_ch: i32 = *(lex.src + lex.pos)
+        if prefix_ch == 99 or prefix_ch == 115
+            let start: i32 = lex.pos
+            let line: i32 = lex.line
+            let col: i32 = lex.col
+            lex.pos = lex.pos + 2  # skip prefix + opening quote
+            lex.col = lex.col + 2
+            let str_start: i32 = lex.string_pos
+            var found_close: i32 = 0
+            while lex.pos < lex.len
+                let str_ch: i32 = lexer_peek_at(lex, 0)
+                if str_ch == 34  # closing quote
+                    found_close = 1
+                    lex.pos = lex.pos + 1
+                    lex.col = lex.col + 1
+                    break
+                if str_ch == 10  # newline - unterminated
+                    break
+                if str_ch == 92  # backslash escape
+                    lex.pos = lex.pos + 1
+                    lex.col = lex.col + 1
+                    if lex.pos < lex.len
+                        let esc_ch: i32 = lexer_peek_at(lex, 0)
+                        var cooked: i8 = esc_ch as i8
+                        if esc_ch == 110
+                            cooked = 10
+                        else if esc_ch == 116
+                            cooked = 9
+                        else if esc_ch == 114
+                            cooked = 13
+                        else if esc_ch == 92
+                            cooked = 92
+                        else if esc_ch == 34
+                            cooked = 34
+                        else if esc_ch == 48
+                            cooked = 0
+                        if lex.string_pos < MAX_STRING_LEN
+                            lex.string_buf[lex.string_pos] = cooked
+                            lex.string_pos = lex.string_pos + 1
+                        lex.pos = lex.pos + 1
+                        lex.col = lex.col + 1
+                else
+                    if lex.string_pos < MAX_STRING_LEN
+                        lex.string_buf[lex.string_pos] = str_ch as i8
+                        lex.string_pos = lex.string_pos + 1
+                    lex.pos = lex.pos + 1
+                    lex.col = lex.col + 1
+            if found_close == 1
+                let len: i32 = lex.pos - start
+                # Use TOK_CSTRING for c prefix, TOK_STRING for s prefix (treated same for now)
+                var result_tok_kind: i32 = TOK_STRING
+                if prefix_ch == 99
+                    result_tok_kind = TOK_CSTRING
+                else
+                    result_tok_kind = TOK_SSTRING
+                var tok: Token = token_new(result_tok_kind, start, len, line, col)
+                tok.start = lex.src + start
+                tok.string_val = (@lex.string_buf[str_start]) as *u8
+                tok.string_len = lex.string_pos - str_start
+                return tok
+
     # Create and return the token
     let start: i32 = lex.pos
     let line: i32 = lex.line
