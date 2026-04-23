@@ -16,7 +16,7 @@ import tokens_gen
 # =============================================================================
 
 const MAX_LOCALS: i32 = 256
-const MAX_STRINGS: i32 = 256
+const MAX_STRINGS: i32 = 4096  # Self-hosting: merged modules have >256 string literals
 const MAX_EXTERNS: i32 = 2048  # Self-hosting needs many externs (hundreds of functions per module)
 const MAX_EMITTED_NAMES: i32 = 512  # Track emitted structs/functions to avoid duplicates
 
@@ -53,7 +53,7 @@ struct EmitterState
     break_label: i32
     continue_label: i32
     module: *Module
-    strings: [256]StringLit
+    strings: [4096]StringLit
     string_count: i32
     externs: [2048]ExternFunc  # Self-hosting needs many externs (hundreds of functions per module)
     extern_count: i32
@@ -555,6 +555,9 @@ fn add_string(s: *EmitterState, data: *u8, len: i32) -> i32
         s.strings[idx].len = len
         s.string_count = s.string_count + 1
         return idx
+    # Overflow — report error loudly so it's visible instead of silently aliasing @.str.0
+    eprints_cstr(c"[FATAL] add_string: MAX_STRINGS exceeded — bump MAX_STRINGS\n")
+    sys_exit(1)
     0
 
 # =============================================================================
@@ -3778,7 +3781,7 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
     s.ret_type_name = f.return_type_name
     s.ret_type_name_len = f.return_type_name_len
 
-    # Use linkonce_odr linkage for all function definitions so the linker
+    # Use weak_odr linkage for all function definitions so the linker
     # can merge duplicates that occur when the same function is emitted
     # in multiple modules (from transitively-resolved imports).
     # This mirrors how C++ handles template instantiations.
@@ -3790,7 +3793,7 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
     if is_main == 1
         emit_str(s, "define ")
     else
-        emit_str(s, "define linkonce_odr ")
+        emit_str(s, "define weak_odr ")
     emit_llvm_type_struct(s, f.return_type, f.return_type_name, f.return_type_name_len)
     emit_str(s, " @")
     emit_name(s, f.name, f.name_len)
@@ -3978,8 +3981,8 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
     s.break_label = -1
     s.continue_label = -1
 
-    # linkonce_odr: same as fn emission — linker merges duplicates across modules
-    emit_str(s, "define linkonce_odr ")
+    # weak_odr: same as fn emission — linker merges duplicates across modules
+    emit_str(s, "define weak_odr ")
     emit_llvm_type(s, method.return_type)
     emit_str(s, " @")
     # Emit mangled name: Type_method
@@ -4149,41 +4152,41 @@ fn is_local_function(m: *Module, name: *u8, len: i32) -> i32
 
 # Emit inline syscall implementations for commonly used syscall functions
 fn emit_syscall_implementations(s: *EmitterState)
-    emit_str(s, "; Inline syscall implementations (linkonce_odr — linker merges duplicates across modules)\n")
+    emit_str(s, "; Inline syscall implementations (weak_odr — linker merges duplicates across modules)\n")
 
-    # syscall0-6: low-level syscall wrappers with linkonce_odr linkage
+    # syscall0-6: low-level syscall wrappers with weak_odr linkage
     # so multiple modules can emit them and the linker deduplicates.
-    emit_str(s, "define linkonce_odr i64 @syscall0(i64 %n) \{\n")
+    emit_str(s, "define weak_odr i64 @syscall0(i64 %n) \{\n")
     emit_str(s, "  %ret = call i64 asm sideeffect \"syscall\", \"=\{rax\},\{rax\},~\{rcx\},~\{r11\},~\{memory\}\"(i64 %n)\n")
     emit_str(s, "  ret i64 %ret\n")
     emit_str(s, "\}\n\n")
 
-    emit_str(s, "define linkonce_odr i64 @syscall1(i64 %n, i64 %a1) \{\n")
+    emit_str(s, "define weak_odr i64 @syscall1(i64 %n, i64 %a1) \{\n")
     emit_str(s, "  %ret = call i64 asm sideeffect \"syscall\", \"=\{rax\},\{rax\},\{rdi\},~\{rcx\},~\{r11\},~\{memory\}\"(i64 %n, i64 %a1)\n")
     emit_str(s, "  ret i64 %ret\n")
     emit_str(s, "\}\n\n")
 
-    emit_str(s, "define linkonce_odr i64 @syscall2(i64 %n, i64 %a1, i64 %a2) \{\n")
+    emit_str(s, "define weak_odr i64 @syscall2(i64 %n, i64 %a1, i64 %a2) \{\n")
     emit_str(s, "  %ret = call i64 asm sideeffect \"syscall\", \"=\{rax\},\{rax\},\{rdi\},\{rsi\},~\{rcx\},~\{r11\},~\{memory\}\"(i64 %n, i64 %a1, i64 %a2)\n")
     emit_str(s, "  ret i64 %ret\n")
     emit_str(s, "\}\n\n")
 
-    emit_str(s, "define linkonce_odr i64 @syscall3(i64 %n, i64 %a1, i64 %a2, i64 %a3) \{\n")
+    emit_str(s, "define weak_odr i64 @syscall3(i64 %n, i64 %a1, i64 %a2, i64 %a3) \{\n")
     emit_str(s, "  %ret = call i64 asm sideeffect \"syscall\", \"=\{rax\},\{rax\},\{rdi\},\{rsi\},\{rdx\},~\{rcx\},~\{r11\},~\{memory\}\"(i64 %n, i64 %a1, i64 %a2, i64 %a3)\n")
     emit_str(s, "  ret i64 %ret\n")
     emit_str(s, "\}\n\n")
 
-    emit_str(s, "define linkonce_odr i64 @syscall4(i64 %n, i64 %a1, i64 %a2, i64 %a3, i64 %a4) \{\n")
+    emit_str(s, "define weak_odr i64 @syscall4(i64 %n, i64 %a1, i64 %a2, i64 %a3, i64 %a4) \{\n")
     emit_str(s, "  %ret = call i64 asm sideeffect \"syscall\", \"=\{rax\},\{rax\},\{rdi\},\{rsi\},\{rdx\},\{r10\},~\{rcx\},~\{r11\},~\{memory\}\"(i64 %n, i64 %a1, i64 %a2, i64 %a3, i64 %a4)\n")
     emit_str(s, "  ret i64 %ret\n")
     emit_str(s, "\}\n\n")
 
-    emit_str(s, "define linkonce_odr i64 @syscall5(i64 %n, i64 %a1, i64 %a2, i64 %a3, i64 %a4, i64 %a5) \{\n")
+    emit_str(s, "define weak_odr i64 @syscall5(i64 %n, i64 %a1, i64 %a2, i64 %a3, i64 %a4, i64 %a5) \{\n")
     emit_str(s, "  %ret = call i64 asm sideeffect \"syscall\", \"=\{rax\},\{rax\},\{rdi\},\{rsi\},\{rdx\},\{r10\},\{r8\},~\{rcx\},~\{r11\},~\{memory\}\"(i64 %n, i64 %a1, i64 %a2, i64 %a3, i64 %a4, i64 %a5)\n")
     emit_str(s, "  ret i64 %ret\n")
     emit_str(s, "\}\n\n")
 
-    emit_str(s, "define linkonce_odr i64 @syscall6(i64 %n, i64 %a1, i64 %a2, i64 %a3, i64 %a4, i64 %a5, i64 %a6) \{\n")
+    emit_str(s, "define weak_odr i64 @syscall6(i64 %n, i64 %a1, i64 %a2, i64 %a3, i64 %a4, i64 %a5, i64 %a6) \{\n")
     emit_str(s, "  %ret = call i64 asm sideeffect \"syscall\", \"=\{rax\},\{rax\},\{rdi\},\{rsi\},\{rdx\},\{r10\},\{r8\},\{r9\},~\{rcx\},~\{r11\},~\{memory\}\"(i64 %n, i64 %a1, i64 %a2, i64 %a3, i64 %a4, i64 %a5, i64 %a6)\n")
     emit_str(s, "  ret i64 %ret\n")
     emit_str(s, "\}\n\n")
@@ -4363,8 +4366,8 @@ fn emit_global_vars(s: *EmitterState)
         mark_global_emitted(s, g.name, g.name_len)
         emit_str(s, "@")
         emit_name(s, g.name, g.name_len)
-        # linkonce_odr: merge duplicates across modules (same as functions)
-        emit_str(s, " = linkonce_odr global ")
+        # weak_odr: merge duplicates across modules (same as functions)
+        emit_str(s, " = weak_odr global ")
         # Emit the type
         if g.var_type == TYPE_STRUCT
             emit_str(s, "%")
