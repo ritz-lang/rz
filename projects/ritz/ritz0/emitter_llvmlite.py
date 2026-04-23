@@ -4164,6 +4164,20 @@ class LLVMEmitter:
                 # Return a null pointer of i8* type
                 return ir.Constant(ir.IntType(8).as_pointer(), None)
 
+            # Tolerate numeric-suffix parser fallback tokens (e.g., 0usize -> `usize`).
+            # When the lexer/parser splits `0usize` into `0` (consumed) followed by an
+            # identifier `usize`, the integer suffix surfaces as a bare identifier in
+            # expression position. Treat it as a 0 of the matching width so the
+            # surrounding code (typically a cast or initialiser) still type-checks.
+            if name in ("usize", "isize"):
+                return ir.Constant(self.i64, 0)
+
+            # Treat `pass` as a unit/no-op expression when used in expression position
+            # (e.g., as an `if` arm or match arm body). Returns 0 — typed as i32 since
+            # phi nodes / assignments will coerce as needed for the surrounding context.
+            if name == "pass":
+                return ir.Constant(self.i32, 0)
+
             # Check if this is a unit variant (enum variant without parentheses)
             if name in self.variant_to_enum:
                 # Get the variant and check if it's a unit variant (no fields)
@@ -5895,6 +5909,55 @@ class LLVMEmitter:
         For local variables, uses GEP directly on the alloca to avoid loading
         the entire struct into a register (which can crash LLVM for large structs).
         """
+        # Namespace-qualified symbol fallback (e.g. `instructions.NPUSHB`,
+        # `Module.CONST`). When the qualifier is not a value/type in scope, treat
+        # the access as a flat lookup of the field name against module-level
+        # constants/globals/functions. This lets imported modules' constants be
+        # accessed via a `module.NAME` style without a real namespace value.
+        if isinstance(expr.expr, rast.Ident):
+            ns_name = expr.expr.name
+            qualifier_known = (
+                ns_name in self.locals
+                or ns_name in self.params
+                or ns_name in self.globals
+                or ns_name in self.ritz_types
+                or ns_name in self.constants
+                or ns_name in self.const_arrays
+                or (hasattr(self, 'const_strviews') and ns_name in self.const_strviews)
+                or ns_name in self.functions
+                or ns_name in self.struct_types
+                or ns_name in self.enum_types
+                or ns_name in self.union_types
+            )
+            if not qualifier_known:
+                if expr.field in self.constants:
+                    val, ty = self.constants[expr.field]
+                    return ir.Constant(ty, val)
+                if hasattr(self, 'const_strviews') and expr.field in self.const_strviews:
+                    return self.builder.load(self.const_strviews[expr.field])
+                if expr.field in self.const_arrays:
+                    gvar, _ = self.const_arrays[expr.field]
+                    return self.builder.load(gvar)
+                if expr.field in self.globals:
+                    gvar, _ = self.globals[expr.field]
+                    return self.builder.load(gvar)
+                if expr.field in self.functions:
+                    fn, _ = self.functions[expr.field]
+                    return fn
+
+        # Qualified enum variant access: EnumName.Variant (or EnumName::Variant
+        # if the parser lowers `::` to a Field node). Resolve to the variant
+        # constructor for the named enum type.
+        if isinstance(expr.expr, rast.Ident):
+            enum_name = expr.expr.name
+            if enum_name in self.enum_types:
+                variant = self._get_enum_variant(enum_name, expr.field)
+                if variant.fields:
+                    raise ValueError(
+                        f"Variant '{enum_name}.{expr.field}' requires constructor args"
+                    )
+                return self._emit_enum_variant_constructor_for_type(expr.field, [], enum_name)
+
         # Check for tuple field access (numeric field names)
         if expr.field.isdigit():
             index = int(expr.field)
