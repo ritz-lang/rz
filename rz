@@ -9,6 +9,9 @@ Usage:
     rz list                List all projects in workspace
     rz clean [PROJECT]     Clean build artifacts
     rz compare [TIER]      Compare ritz0 vs ritz1 on examples
+    rz ci plan             Compute impacted-project build plan as JSON
+    rz ci run              Build/test/package from plan or git refs
+    rz ci generate         Emit GitHub / GitLab / CircleCI config
 
 Compiler Selection:
     --compiler ritz0       Use Python bootstrap compiler (default)
@@ -23,11 +26,15 @@ Examples:
 """
 
 import argparse
+import json
 import os
+import shutil
 import subprocess
 import sys
 import tomllib
+from datetime import datetime, timezone
 from pathlib import Path
+from string import Formatter
 
 # Workspace root is where this script lives
 WORKSPACE_ROOT = Path(__file__).parent.resolve()
@@ -567,6 +574,628 @@ def cmd_compare(args):
     return 0
 
 
+
+# =============================================================================
+# CI subcommands — impact analysis, build/test/package pipeline, config gen
+# Ported from origin/holy-fuck-wip (Apr 2026) as Commit C of the branch review.
+# Non-CI commands (build/test/run/list/clean/compare) are untouched above.
+# =============================================================================
+
+def get_project_dependencies(project_name):
+    """Get local workspace project dependencies from [dependencies]."""
+    config = get_project_config(project_name)
+    if not config:
+        return []
+
+    deps = []
+    for _dep_name, dep_spec in config.get("dependencies", {}).items():
+        if not isinstance(dep_spec, dict) or "path" not in dep_spec:
+            continue
+        dep_path = Path(dep_spec["path"])
+        if not dep_path.is_absolute():
+            dep_path = (PROJECTS_DIR / project_name / dep_path).resolve()
+        if dep_path.parent == PROJECTS_DIR and (dep_path / "ritz.toml").exists():
+            dep_name = dep_path.name
+            # Ignore accidental self-dependencies to keep graph valid.
+            if dep_name != project_name:
+                deps.append(dep_name)
+    return sorted(set(deps))
+
+
+
+
+def build_dependency_graph(projects):
+    """Build dependency and reverse-dependency graphs for workspace projects."""
+    deps = {p: get_project_dependencies(p) for p in projects}
+    reverse = {p: set() for p in projects}
+    for project, project_deps in deps.items():
+        for dep in project_deps:
+            if dep in reverse:
+                reverse[dep].add(project)
+    return deps, reverse
+
+
+
+
+def topo_sort_subset(projects_subset, deps_graph):
+    """Topologically sort a subset of projects by dependency order."""
+    visiting = set()
+    visited = set()
+    order = []
+    cycle_nodes = set()
+
+    def visit(node):
+        if node in visited:
+            return
+        if node in visiting:
+            # Break cycles conservatively and continue with a stable order.
+            cycle_nodes.add(node)
+            return
+        visiting.add(node)
+        for dep in deps_graph.get(node, []):
+            if dep in projects_subset:
+                visit(dep)
+        visiting.remove(node)
+        visited.add(node)
+        order.append(node)
+
+    for project in sorted(projects_subset):
+        visit(project)
+    if cycle_nodes:
+        cycle_list = ", ".join(sorted(cycle_nodes))
+        print(f"Warning: dependency cycle detected (continuing): {cycle_list}", file=sys.stderr)
+    return order
+
+
+
+
+def get_changed_files(base_ref=None, head_ref=None):
+    """Get changed files from git diff."""
+    cmd = ["git", "-C", str(WORKSPACE_ROOT), "diff", "--name-only"]
+    if base_ref and head_ref:
+        cmd.append(f"{base_ref}..{head_ref}")
+    elif base_ref:
+        cmd.append(base_ref)
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"Error: failed to get changed files: {result.stderr}", file=sys.stderr)
+        return None
+
+    files = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    return files
+
+
+
+
+def compute_impacted_projects(changed_files, projects, deps_graph, reverse_graph):
+    """Compute directly affected and transitive impacted projects."""
+    global_triggers = [
+        "rz",
+        "rz.toml",
+        "projects/ritz/build.py",
+        "projects/ritz/cache.py",
+        "projects/ritz/ritz0/",
+        "projects/ritz/runtime/",
+    ]
+    if any(any(path == trig or path.startswith(trig) for trig in global_triggers) for path in changed_files):
+        impacted = set(projects)
+        return impacted, set(projects)
+
+    directly_changed = set()
+    for path in changed_files:
+        parts = Path(path).parts
+        if len(parts) >= 2 and parts[0] == "projects":
+            candidate = parts[1]
+            if candidate in projects:
+                directly_changed.add(candidate)
+
+    impacted = set(directly_changed)
+    queue = list(directly_changed)
+    while queue:
+        cur = queue.pop(0)
+        for dependent in reverse_graph.get(cur, set()):
+            if dependent not in impacted:
+                impacted.add(dependent)
+                queue.append(dependent)
+
+    # If a project depends on changed deps but itself unchanged, it is included.
+    # Do not auto-include dependencies, as build.py resolves cross-project source deps.
+    return impacted, directly_changed
+
+
+
+
+def has_tests(project_name):
+    """Best-effort check whether a project declares tests."""
+    config = get_project_config(project_name) or {}
+    if "test" in config:
+        return True
+    if "build" in config and isinstance(config["build"], dict):
+        if "test" in config["build"] or config["build"].get("test_only", False):
+            return True
+    return False
+
+
+
+
+def package_project_artifacts(project_name, release=False):
+    """Package successful build artifacts for CI consumption."""
+    profile = "release" if release else "debug"
+    src_dir = PROJECTS_DIR / project_name / "build" / profile
+    if not src_dir.exists():
+        return None
+
+    dst_root = WORKSPACE_ROOT / "dist" / "ci" / project_name / profile
+    dst_root.mkdir(parents=True, exist_ok=True)
+
+    copied = []
+    for item in sorted(src_dir.iterdir()):
+        dst = dst_root / item.name
+        if item.is_dir():
+            shutil.copytree(item, dst, dirs_exist_ok=True)
+            copied.append(str(dst.relative_to(WORKSPACE_ROOT)))
+        else:
+            shutil.copy2(item, dst)
+            copied.append(str(dst.relative_to(WORKSPACE_ROOT)))
+
+    manifest = {
+        "project": project_name,
+        "profile": profile,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "artifacts": copied,
+    }
+    manifest_path = dst_root / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2))
+    return str(manifest_path.relative_to(WORKSPACE_ROOT))
+
+
+
+
+def _expand_template(value, context):
+    """Expand {placeholders} in a string using context."""
+    if not isinstance(value, str):
+        return value
+
+    fields = [fname for _, fname, _, _ in Formatter().parse(value) if fname]
+    if not fields:
+        return value
+
+    missing = [f for f in fields if f not in context]
+    if missing:
+        raise ValueError(f"Unknown placeholder(s): {', '.join(missing)}")
+
+    return value.format(**context)
+
+
+
+
+def _resolve_path(raw_path, project_dir, context):
+    expanded = _expand_template(raw_path, context)
+    path = Path(expanded)
+    if not path.is_absolute():
+        path = project_dir / path
+    return path
+
+
+
+
+def run_pipeline(project_name, pipeline_name, release=False):
+    """Run a declarative pipeline from [rz.pipeline.<name>] in ritz.toml."""
+    config = get_project_config(project_name)
+    if not config:
+        print(f"Error: Project '{project_name}' not found", file=sys.stderr)
+        return 1
+
+    rz_cfg = config.get("rz", {})
+    pipelines = rz_cfg.get("pipeline", {})
+    pipeline = pipelines.get(pipeline_name)
+    if not pipeline:
+        available = ", ".join(sorted(pipelines.keys())) if pipelines else "(none)"
+        print(
+            f"Error: Pipeline '{pipeline_name}' not found in {project_name}/ritz.toml. "
+            f"Available: {available}",
+            file=sys.stderr,
+        )
+        return 1
+
+    steps = pipeline.get("steps", [])
+    if not isinstance(steps, list) or not steps:
+        print(f"Error: Pipeline '{pipeline_name}' has no steps", file=sys.stderr)
+        return 1
+
+    project_dir = PROJECTS_DIR / project_name
+    context = {
+        "workspace_root": str(WORKSPACE_ROOT),
+        "projects_dir": str(PROJECTS_DIR),
+        "project": project_name,
+        "project_dir": str(project_dir),
+    }
+
+    print(f"Running pipeline '{pipeline_name}' for project '{project_name}'", flush=True)
+    print("=" * 70, flush=True)
+
+    for idx, step in enumerate(steps, 1):
+        if not isinstance(step, dict):
+            print(f"Error: Step {idx} must be a table/object", file=sys.stderr)
+            return 1
+        step_type = step.get("type")
+        step_name = step.get("name", f"step-{idx}")
+        print(f"[{idx}/{len(steps)}] {step_name} ({step_type})", flush=True)
+
+        if step_type == "build":
+            target_project = step.get("project")
+            if not target_project:
+                print(f"Error: Step {idx} missing 'project' for build step", file=sys.stderr)
+                return 1
+            extra_args = ["--release"] if (release or step.get("release", False)) else []
+            rc = run_build(target_project, extra_args)
+            if rc != 0:
+                return rc
+
+        elif step_type == "require_tool":
+            tool = step.get("tool")
+            if not tool:
+                print(f"Error: Step {idx} missing 'tool' for require_tool", file=sys.stderr)
+                return 1
+            if shutil.which(tool) is None:
+                hint = step.get("hint")
+                print(f"Error: required tool not found: {tool}", file=sys.stderr)
+                if hint:
+                    print(hint, file=sys.stderr)
+                return 1
+
+        elif step_type == "ensure_dir":
+            raw_path = step.get("path")
+            if not raw_path:
+                print(f"Error: Step {idx} missing 'path' for ensure_dir", file=sys.stderr)
+                return 1
+            dst = _resolve_path(raw_path, project_dir, context)
+            dst.mkdir(parents=True, exist_ok=True)
+
+        elif step_type == "copy_glob":
+            src_glob = step.get("from")
+            dst_raw = step.get("to")
+            allow_missing = step.get("allow_missing", False)
+            if not src_glob or not dst_raw:
+                print(f"Error: Step {idx} missing 'from' or 'to' for copy_glob", file=sys.stderr)
+                return 1
+            src_glob_expanded = _expand_template(src_glob, context)
+            src_pattern = Path(src_glob_expanded)
+            if not src_pattern.is_absolute():
+                src_pattern = project_dir / src_pattern
+            dst_dir = _resolve_path(dst_raw, project_dir, context)
+            dst_dir.mkdir(parents=True, exist_ok=True)
+            matches = sorted(src_pattern.parent.glob(src_pattern.name))
+            if not matches and not allow_missing:
+                print(f"Error: no files matched glob: {src_pattern}", file=sys.stderr)
+                return 1
+            for src_file in matches:
+                shutil.copy2(src_file, dst_dir / src_file.name)
+
+        elif step_type == "write_file":
+            raw_path = step.get("path")
+            content = step.get("content")
+            if not raw_path or content is None:
+                print(f"Error: Step {idx} missing 'path' or 'content' for write_file", file=sys.stderr)
+                return 1
+            dst = _resolve_path(raw_path, project_dir, context)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_text(_expand_template(content, context))
+
+        elif step_type == "run":
+            cmd = step.get("cmd")
+            if not cmd:
+                print(f"Error: Step {idx} missing 'cmd' for run step", file=sys.stderr)
+                return 1
+            cwd_raw = step.get("cwd", "{project_dir}")
+            cwd = Path(_expand_template(cwd_raw, context))
+            if not cwd.is_absolute():
+                cwd = project_dir / cwd
+
+            env = os.environ.copy()
+            env["RITZ_PATH"] = ":".join(
+                [
+                    str((PROJECTS_DIR / "ritz").resolve()),
+                    str((PROJECTS_DIR / project_name).resolve()),
+                ]
+            )
+
+            if isinstance(cmd, str):
+                cmd_expanded = _expand_template(cmd, context)
+                result = subprocess.run(cmd_expanded, shell=True, cwd=cwd, env=env)
+            elif isinstance(cmd, list):
+                cmd_expanded = [_expand_template(str(c), context) for c in cmd]
+                result = subprocess.run(cmd_expanded, cwd=cwd, env=env)
+            else:
+                print(f"Error: Step {idx} 'cmd' must be string or list", file=sys.stderr)
+                return 1
+
+            if result.returncode != 0:
+                return result.returncode
+
+        else:
+            print(f"Error: Step {idx} has unknown type '{step_type}'", file=sys.stderr)
+            return 1
+
+    print("=" * 70, flush=True)
+    print(f"Pipeline '{pipeline_name}' completed successfully.", flush=True)
+    return 0
+
+
+
+
+def cmd_ci_plan(args):
+    """Generate CI impact/build plan as JSON."""
+    projects = discover_projects()
+    deps_graph, reverse_graph = build_dependency_graph(projects)
+
+    changed_files = get_changed_files(args.base, args.head)
+    if changed_files is None:
+        return 1
+
+    impacted, directly_changed = compute_impacted_projects(
+        changed_files, projects, deps_graph, reverse_graph
+    )
+
+    try:
+        build_order = topo_sort_subset(impacted, deps_graph) if impacted else []
+    except RuntimeError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    plan = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "base": args.base,
+        "head": args.head,
+        "changed_files": changed_files,
+        "directly_changed_projects": sorted(directly_changed),
+        "impacted_projects": sorted(impacted),
+        "build_order": build_order,
+        "test_projects": [p for p in build_order if has_tests(p)],
+        "package_projects": build_order,
+    }
+
+    output = json.dumps(plan, indent=2)
+    if args.output:
+        out_path = Path(args.output)
+        if not out_path.is_absolute():
+            out_path = WORKSPACE_ROOT / out_path
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(output)
+        print(f"Wrote CI plan to {out_path.relative_to(WORKSPACE_ROOT)}")
+    else:
+        print(output)
+    return 0
+
+
+
+
+def cmd_ci_run(args):
+    """Execute CI plan: build impacted projects, test, and package artifacts."""
+    if args.plan:
+        plan_path = Path(args.plan)
+        if not plan_path.is_absolute():
+            plan_path = WORKSPACE_ROOT / plan_path
+        if not plan_path.exists():
+            print(f"Error: plan file not found: {plan_path}", file=sys.stderr)
+            return 1
+        plan = json.loads(plan_path.read_text())
+    else:
+        projects = discover_projects()
+        deps_graph, reverse_graph = build_dependency_graph(projects)
+        changed_files = get_changed_files(args.base, args.head)
+        if changed_files is None:
+            return 1
+        impacted, _direct = compute_impacted_projects(changed_files, projects, deps_graph, reverse_graph)
+        build_order = topo_sort_subset(impacted, deps_graph) if impacted else []
+        plan = {
+            "changed_files": changed_files,
+            "build_order": build_order,
+            "test_projects": [p for p in build_order if has_tests(p)],
+            "package_projects": build_order,
+        }
+
+    build_order = plan.get("build_order", [])
+    if not build_order:
+        print("No impacted projects detected. Nothing to build.")
+        results = {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "release": getattr(args, "release", False),
+            "built": [],
+            "tested": [],
+            "packaged": [],
+            "failed": [],
+        }
+        if args.results:
+            results_path = Path(args.results)
+            if not results_path.is_absolute():
+                results_path = WORKSPACE_ROOT / results_path
+        else:
+            results_path = WORKSPACE_ROOT / "dist" / "ci" / "results.json"
+        results_path.parent.mkdir(parents=True, exist_ok=True)
+        results_path.write_text(json.dumps(results, indent=2))
+        print(f"Wrote CI results: {results_path.relative_to(WORKSPACE_ROOT)}")
+        return 0
+
+    release = getattr(args, "release", False)
+    results = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "release": release,
+        "built": [],
+        "tested": [],
+        "packaged": [],
+        "failed": [],
+    }
+
+    for project in build_order:
+        print(f"\n[CI] build {project}")
+        rc = run_build(project, ["--release"] if release else [])
+        if rc != 0:
+            results["failed"].append({"project": project, "phase": "build", "code": rc})
+            break
+        results["built"].append(project)
+
+        if has_tests(project):
+            print(f"[CI] test {project}")
+            trc = run_test(project)
+            if trc != 0:
+                results["failed"].append({"project": project, "phase": "test", "code": trc})
+                break
+            results["tested"].append(project)
+
+        manifest = package_project_artifacts(project, release=release)
+        if manifest:
+            results["packaged"].append({"project": project, "manifest": manifest})
+
+    if args.results:
+        results_path = Path(args.results)
+        if not results_path.is_absolute():
+            results_path = WORKSPACE_ROOT / results_path
+    else:
+        results_path = WORKSPACE_ROOT / "dist" / "ci" / "results.json"
+    results_path.parent.mkdir(parents=True, exist_ok=True)
+    results_path.write_text(json.dumps(results, indent=2))
+    print(f"\nWrote CI results: {results_path.relative_to(WORKSPACE_ROOT)}")
+
+    return 1 if results["failed"] else 0
+
+
+
+
+def _github_ci_template():
+    return """name: rz-ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Plan
+        run: |
+          BASE="${{ github.event.pull_request.base.sha || github.event.before }}"
+          HEAD="${{ github.sha }}"
+          ./rz ci plan --base "$BASE" --head "$HEAD" --output dist/ci/plan.json
+      - name: Build/Test/Package
+        run: ./rz ci run --plan dist/ci/plan.json --results dist/ci/results.json
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: rz-ci-artifacts
+          path: dist/ci
+"""
+
+
+
+
+def _gitlab_ci_template():
+    return """stages:
+  - ci
+
+rz_ci:
+  image: python:3.11
+  stage: ci
+  before_script:
+    - apt-get update && apt-get install -y git clang make
+    - git fetch origin main
+  script:
+    - BASE="${CI_MERGE_REQUEST_DIFF_BASE_SHA:-$CI_COMMIT_BEFORE_SHA}"
+    - HEAD="${CI_COMMIT_SHA}"
+    - ./rz ci plan --base "$BASE" --head "$HEAD" --output dist/ci/plan.json
+    - ./rz ci run --plan dist/ci/plan.json --results dist/ci/results.json
+  artifacts:
+    when: always
+    paths:
+      - dist/ci
+"""
+
+
+
+
+def _circleci_template():
+    return """version: 2.1
+
+jobs:
+  ci:
+    docker:
+      - image: cimg/python:3.11
+    steps:
+      - checkout
+      - run:
+          name: Install deps
+          command: sudo apt-get update && sudo apt-get install -y git clang make
+      - run:
+          name: Fetch main
+          command: git fetch origin main
+      - run:
+          name: Plan
+          command: |
+            BASE=$(git merge-base origin/main HEAD)
+            HEAD=$CIRCLE_SHA1
+            ./rz ci plan --base "$BASE" --head "$HEAD" --output dist/ci/plan.json
+      - run:
+          name: Build/Test/Package
+          command: ./rz ci run --plan dist/ci/plan.json --results dist/ci/results.json
+      - store_artifacts:
+          path: dist/ci
+
+workflows:
+  rz_ci:
+    jobs:
+      - ci
+"""
+
+
+
+
+def cmd_ci_generate(args):
+    """Generate provider CI config that delegates impact logic to rz ci."""
+    provider_map = {
+        "github": (".github/workflows/rz-ci.yml", _github_ci_template),
+        "gitlab": (".gitlab-ci.yml", _gitlab_ci_template),
+        "circleci": (".circleci/config.yml", _circleci_template),
+    }
+    output_path, render = provider_map[args.provider]
+    if args.output:
+        out = Path(args.output)
+        if not out.is_absolute():
+            out = WORKSPACE_ROOT / out
+    else:
+        out = WORKSPACE_ROOT / output_path
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(render())
+    print(f"Generated {args.provider} CI config at {out.relative_to(WORKSPACE_ROOT)}")
+    return 0
+
+
+
+
+def cmd_ci(args):
+    """Dispatch 'rz ci' subcommands."""
+    if args.ci_command == "plan":
+        return cmd_ci_plan(args)
+    if args.ci_command == "run":
+        return cmd_ci_run(args)
+    if args.ci_command == "generate":
+        return cmd_ci_generate(args)
+    print("Error: missing ci subcommand (plan|run|generate)", file=sys.stderr)
+    return 1
+
+
+
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Unified workspace CLI for the Ritz ecosystem",
@@ -607,6 +1236,26 @@ def main():
     compare_parser.add_argument("--skip-tests", action="store_true",
                                help="Only run builds, skip test execution (faster)")
 
+    # ci (new subcommand tree — ported from holy-fuck-wip; see cmd_ci* funcs above)
+    ci_parser = subparsers.add_parser("ci", help="CI planning/execution/generation")
+    ci_sub = ci_parser.add_subparsers(dest="ci_command")
+
+    ci_plan = ci_sub.add_parser("plan", help="Generate impacted-project plan JSON")
+    ci_plan.add_argument("--base", help="Base git ref/sha for diff")
+    ci_plan.add_argument("--head", help="Head git ref/sha for diff")
+    ci_plan.add_argument("--output", help="Write plan JSON to file")
+
+    ci_run = ci_sub.add_parser("run", help="Run build/test/package from plan or refs")
+    ci_run.add_argument("--plan", help="Path to plan.json (optional)")
+    ci_run.add_argument("--base", help="Base git ref/sha when no --plan is provided")
+    ci_run.add_argument("--head", help="Head git ref/sha when no --plan is provided")
+    ci_run.add_argument("--release", action="store_true", help="Use release profile")
+    ci_run.add_argument("--results", help="Write execution results JSON to file")
+
+    ci_gen = ci_sub.add_parser("generate", help="Generate provider CI config")
+    ci_gen.add_argument("--provider", required=True, choices=["github", "gitlab", "circleci"])
+    ci_gen.add_argument("--output", help="Output file path (defaults to provider convention)")
+
     args = parser.parse_args()
 
     if not args.command:
@@ -620,6 +1269,7 @@ def main():
         "list": cmd_list,
         "clean": cmd_clean,
         "compare": cmd_compare,
+        "ci": cmd_ci,
     }
 
     return commands[args.command](args)
