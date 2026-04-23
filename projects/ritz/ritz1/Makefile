@@ -29,6 +29,9 @@ SOURCES = \
 	parser_gen \
 	monomorph \
 	emitter_core \
+	emitter_expr_arith \
+	emitter_expr_access \
+	emitter_expr_call \
 	emitter_expr \
 	emitter_stmt \
 	emitter \

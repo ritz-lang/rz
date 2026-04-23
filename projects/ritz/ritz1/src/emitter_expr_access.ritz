@@ -1,0 +1,404 @@
+# Auto-extracted from emitter_expr.ritz — IDENT + INDEX + MEMBER codegen.
+
+import ast
+import emitter_core
+import emitter_expr
+
+
+fn emit_expr_ident(s: *EmitterState, e: *Expr) -> i32
+    if is_const(s, e.ident_ptr, e.ident_len) == 1
+        let val: i64 = find_const(s, e.ident_ptr, e.ident_len)
+        let result: i32 = next_reg(s)
+        emit_str(s, "  ")
+        emit_reg(s, result)
+        emit_str(s, " = add i64 0, ")
+        emit_int(s, val)
+        emit_str(s, "\n")
+        return result
+
+    let loc: i32 = find_local(s, e.ident_ptr, e.ident_len)
+    if loc >= 0
+        let local_var: *LocalVar = find_local_struct_name(s, e.ident_ptr, e.ident_len)
+        let var_type: i32 = local_var.var_type
+        let result: i32 = next_reg(s)
+        emit_str(s, "  ")
+        emit_reg(s, result)
+        emit_str(s, " = load ")
+        emit_llvm_type_struct(s, var_type, local_var.type_name, local_var.type_name_len)
+        emit_str(s, ", ptr ")
+        emit_reg(s, loc)
+        emit_str(s, "\n")
+
+        if var_type == TYPE_I32
+            let ext: i32 = next_reg(s)
+            emit_str(s, "  ")
+            emit_reg(s, ext)
+            emit_str(s, " = sext i32 ")
+            emit_reg(s, result)
+            emit_str(s, " to i64\n")
+            return ext
+        else if var_type == TYPE_U32
+            let ext: i32 = next_reg(s)
+            emit_str(s, "  ")
+            emit_reg(s, ext)
+            emit_str(s, " = zext i32 ")
+            emit_reg(s, result)
+            emit_str(s, " to i64\n")
+            return ext
+        else if var_type == TYPE_U8 or var_type == TYPE_I8
+            let ext: i32 = next_reg(s)
+            emit_str(s, "  ")
+            emit_reg(s, ext)
+            emit_str(s, " = zext i8 ")
+            emit_reg(s, result)
+            emit_str(s, " to i64\n")
+            return ext
+        else if var_type == TYPE_PTR or var_type == TYPE_PTR_PTR or var_type == TYPE_REF or var_type == TYPE_MUT_REF
+            # Pointers are already stored/loaded as i64, no conversion needed
+            return result
+        return result
+
+    # Check for global variable
+    let glob: *GlobalVarDef = find_global(s, e.ident_ptr, e.ident_len)
+    if glob != null
+        # Load from global variable
+        let result: i32 = next_reg(s)
+        emit_str(s, "  ")
+        emit_reg(s, result)
+        emit_str(s, " = load ")
+        emit_llvm_type(s, glob.var_type)
+        emit_str(s, ", ptr @")
+        emit_name(s, glob.name, glob.name_len)
+        emit_str(s, "\n")
+        # Extend to i64 if needed
+        if glob.var_type == TYPE_I32
+            let ext: i32 = next_reg(s)
+            emit_str(s, "  ")
+            emit_reg(s, ext)
+            emit_str(s, " = sext i32 ")
+            emit_reg(s, result)
+            emit_str(s, " to i64\n")
+            return ext
+        else if glob.var_type == TYPE_U32
+            let ext: i32 = next_reg(s)
+            emit_str(s, "  ")
+            emit_reg(s, ext)
+            emit_str(s, " = zext i32 ")
+            emit_reg(s, result)
+            emit_str(s, " to i64\n")
+            return ext
+        return result
+
+    emit_str(s, "  ; ERROR: unknown identifier '")
+    emit_name(s, e.ident_ptr, e.ident_len)
+    emit_str(s, "'\n")
+    let zero: i32 = next_reg(s)
+    emit_str(s, "  ")
+    emit_reg(s, zero)
+    emit_str(s, " = add i64 0, 0\n")
+    return zero
+
+fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
+    # Check if base is an array, pointer-to-pointer (e.g., argv: **u8), or pointer
+    var base_type: i32 = TYPE_PTR
+    var local: *LocalVar = null
+    if e.left.kind == EXPR_IDENT
+        base_type = find_local_type(s, e.left.ident_ptr, e.left.ident_len)
+        local = find_local_struct_name(s, e.left.ident_ptr, e.left.ident_len)
+
+    if base_type == TYPE_ARRAY and local != null
+        # Array local - use GEP [0, index] to get element, then load
+        let idx: i32 = emit_expr(s, e.right)
+        let elem_ptr: i32 = next_reg(s)
+        emit_str(s, "  ")
+        emit_reg(s, elem_ptr)
+        emit_str(s, " = getelementptr [")
+        emit_int(s, local.array_size as i64)
+        emit_str(s, " x ")
+        if local.array_elem_type == TYPE_I32
+            emit_str(s, "i32")
+        else if local.array_elem_type == TYPE_I64
+            emit_str(s, "i64")
+        else if local.array_elem_type == TYPE_U8 or local.array_elem_type == TYPE_I8
+            emit_str(s, "i8")
+        else if local.array_elem_type == TYPE_PTR or local.array_elem_type == TYPE_PTR_PTR
+            emit_str(s, "ptr")
+        else
+            emit_str(s, "i64")
+        emit_str(s, "], ptr ")
+        emit_reg(s, local.reg)
+        emit_str(s, ", i64 0, i64 ")
+        emit_reg(s, idx)
+        emit_str(s, "\n")
+        # Load element
+        let result: i32 = next_reg(s)
+        emit_str(s, "  ")
+        emit_reg(s, result)
+        emit_str(s, " = load ")
+        if local.array_elem_type == TYPE_I32
+            emit_str(s, "i32")
+        else if local.array_elem_type == TYPE_I64
+            emit_str(s, "i64")
+        else if local.array_elem_type == TYPE_U8 or local.array_elem_type == TYPE_I8
+            emit_str(s, "i8")
+        else if local.array_elem_type == TYPE_PTR or local.array_elem_type == TYPE_PTR_PTR
+            emit_str(s, "ptr")
+        else
+            emit_str(s, "i64")
+        emit_str(s, ", ptr ")
+        emit_reg(s, elem_ptr)
+        emit_str(s, "\n")
+        # Extend to i64 if needed
+        if local.array_elem_type == TYPE_U8
+            let ext: i32 = next_reg(s)
+            emit_str(s, "  ")
+            emit_reg(s, ext)
+            emit_str(s, " = zext i8 ")
+            emit_reg(s, result)
+            emit_str(s, " to i64\n")
+            return ext
+        else if local.array_elem_type == TYPE_I8
+            let ext: i32 = next_reg(s)
+            emit_str(s, "  ")
+            emit_reg(s, ext)
+            emit_str(s, " = sext i8 ")
+            emit_reg(s, result)
+            emit_str(s, " to i64\n")
+            return ext
+        else if local.array_elem_type == TYPE_I32
+            let ext: i32 = next_reg(s)
+            emit_str(s, "  ")
+            emit_reg(s, ext)
+            emit_str(s, " = sext i32 ")
+            emit_reg(s, result)
+            emit_str(s, " to i64\n")
+            return ext
+        else if local.array_elem_type == TYPE_PTR or local.array_elem_type == TYPE_PTR_PTR
+            let pti: i32 = next_reg(s)
+            emit_str(s, "  ")
+            emit_reg(s, pti)
+            emit_str(s, " = ptrtoint ptr ")
+            emit_reg(s, result)
+            emit_str(s, " to i64\n")
+            return pti
+        return result
+
+    # Check for struct member array access: s.field[idx] where field is an array
+    if e.left.kind == EXPR_MEMBER
+        var member_result: MemberPtrResult
+        emit_member_ptr(s, e.left, @member_result)
+        if member_result.success == 1
+            let field: *StructField = member_result.field
+            if field.field_type == TYPE_ARRAY
+                # Array field in struct - GEP directly into it
+                let idx: i32 = emit_expr(s, e.right)
+                let elem_ptr: i32 = next_reg(s)
+                emit_str(s, "  ")
+                emit_reg(s, elem_ptr)
+                emit_str(s, " = getelementptr [")
+                emit_int(s, field.array_size as i64)
+                emit_str(s, " x ")
+                if field.array_elem_type == TYPE_I32
+                    emit_str(s, "i32")
+                else if field.array_elem_type == TYPE_I64
+                    emit_str(s, "i64")
+                else if field.array_elem_type == TYPE_U8 or field.array_elem_type == TYPE_I8
+                    emit_str(s, "i8")
+                else if field.array_elem_type == TYPE_PTR or field.array_elem_type == TYPE_PTR_PTR
+                    emit_str(s, "ptr")
+                else
+                    emit_str(s, "i64")
+                emit_str(s, "], ptr ")
+                emit_reg(s, member_result.reg)
+                emit_str(s, ", i64 0, i64 ")
+                emit_reg(s, idx)
+                emit_str(s, "\n")
+                # Load element
+                let result: i32 = next_reg(s)
+                emit_str(s, "  ")
+                emit_reg(s, result)
+                emit_str(s, " = load ")
+                if field.array_elem_type == TYPE_I32
+                    emit_str(s, "i32")
+                else if field.array_elem_type == TYPE_I64
+                    emit_str(s, "i64")
+                else if field.array_elem_type == TYPE_U8 or field.array_elem_type == TYPE_I8
+                    emit_str(s, "i8")
+                else if field.array_elem_type == TYPE_PTR or field.array_elem_type == TYPE_PTR_PTR
+                    emit_str(s, "ptr")
+                else
+                    emit_str(s, "i64")
+                emit_str(s, ", ptr ")
+                emit_reg(s, elem_ptr)
+                emit_str(s, "\n")
+                # Extend to i64 if needed
+                if field.array_elem_type == TYPE_U8
+                    let ext: i32 = next_reg(s)
+                    emit_str(s, "  ")
+                    emit_reg(s, ext)
+                    emit_str(s, " = zext i8 ")
+                    emit_reg(s, result)
+                    emit_str(s, " to i64\n")
+                    return ext
+                else if field.array_elem_type == TYPE_I8
+                    let ext: i32 = next_reg(s)
+                    emit_str(s, "  ")
+                    emit_reg(s, ext)
+                    emit_str(s, " = sext i8 ")
+                    emit_reg(s, result)
+                    emit_str(s, " to i64\n")
+                    return ext
+                else if field.array_elem_type == TYPE_I32
+                    let ext: i32 = next_reg(s)
+                    emit_str(s, "  ")
+                    emit_reg(s, ext)
+                    emit_str(s, " = sext i32 ")
+                    emit_reg(s, result)
+                    emit_str(s, " to i64\n")
+                    return ext
+                else if field.array_elem_type == TYPE_PTR or field.array_elem_type == TYPE_PTR_PTR
+                    let pti: i32 = next_reg(s)
+                    emit_str(s, "  ")
+                    emit_reg(s, pti)
+                    emit_str(s, " = ptrtoint ptr ")
+                    emit_reg(s, result)
+                    emit_str(s, " to i64\n")
+                    return pti
+                return result
+
+    let base: i32 = emit_expr(s, e.left)
+    let idx: i32 = emit_expr(s, e.right)
+
+    if base_type == TYPE_PTR_PTR
+        # Pointer-to-pointer: index by pointer size, load pointer
+        # First convert base i64 back to ptr
+        let base_ptr: i32 = next_reg(s)
+        emit_str(s, "  ")
+        emit_reg(s, base_ptr)
+        emit_str(s, " = inttoptr i64 ")
+        emit_reg(s, base)
+        emit_str(s, " to ptr\n")
+
+        let ptr: i32 = next_reg(s)
+        emit_str(s, "  ")
+        emit_reg(s, ptr)
+        emit_str(s, " = getelementptr ptr, ptr ")
+        emit_reg(s, base_ptr)
+        emit_str(s, ", i64 ")
+        emit_reg(s, idx)
+        emit_str(s, "\n")
+
+        let result: i32 = next_reg(s)
+        emit_str(s, "  ")
+        emit_reg(s, result)
+        emit_str(s, " = load ptr, ptr ")
+        emit_reg(s, ptr)
+        emit_str(s, "\n")
+
+        # Convert ptr to i64 for our uniform value representation
+        let pti: i32 = next_reg(s)
+        emit_str(s, "  ")
+        emit_reg(s, pti)
+        emit_str(s, " = ptrtoint ptr ")
+        emit_reg(s, result)
+        emit_str(s, " to i64\n")
+        return pti
+    else
+        # Pointer-to-byte: index by 1, load byte
+        # First convert i64 value back to ptr
+        let base_ptr: i32 = next_reg(s)
+        emit_str(s, "  ")
+        emit_reg(s, base_ptr)
+        emit_str(s, " = inttoptr i64 ")
+        emit_reg(s, base)
+        emit_str(s, " to ptr\n")
+
+        let ptr: i32 = next_reg(s)
+        emit_str(s, "  ")
+        emit_reg(s, ptr)
+        emit_str(s, " = getelementptr i8, ptr ")
+        emit_reg(s, base_ptr)
+        emit_str(s, ", i64 ")
+        emit_reg(s, idx)
+        emit_str(s, "\n")
+
+        let result: i32 = next_reg(s)
+        emit_str(s, "  ")
+        emit_reg(s, result)
+        emit_str(s, " = load i8, ptr ")
+        emit_reg(s, ptr)
+        emit_str(s, "\n")
+
+        let ext: i32 = next_reg(s)
+        emit_str(s, "  ")
+        emit_reg(s, ext)
+        emit_str(s, " = zext i8 ")
+        emit_reg(s, result)
+        emit_str(s, " to i64\n")
+        return ext
+
+fn emit_expr_member(s: *EmitterState, e: *Expr) -> i32
+    # expr.field - member access on struct
+    # Use emit_member_ptr helper for both direct and nested access
+    var member_result: MemberPtrResult
+    emit_member_ptr(s, e, @member_result)
+    if member_result.success == 1
+        let field: *StructField = member_result.field
+        let field_ptr: i32 = member_result.reg
+        # Load the field value
+        let val_reg: i32 = next_reg(s)
+        emit_str(s, "  ")
+        emit_reg(s, val_reg)
+        emit_str(s, " = load ")
+        emit_field_llvm_type(s, field)
+        emit_str(s, ", ptr ")
+        emit_reg(s, field_ptr)
+        emit_str(s, "\n")
+        # Convert to i64 if needed
+        if field.field_type == TYPE_I32
+            let ext: i32 = next_reg(s)
+            emit_str(s, "  ")
+            emit_reg(s, ext)
+            emit_str(s, " = sext i32 ")
+            emit_reg(s, val_reg)
+            emit_str(s, " to i64\n")
+            return ext
+        else if field.field_type == TYPE_U32
+            let ext: i32 = next_reg(s)
+            emit_str(s, "  ")
+            emit_reg(s, ext)
+            emit_str(s, " = zext i32 ")
+            emit_reg(s, val_reg)
+            emit_str(s, " to i64\n")
+            return ext
+        else if field.field_type == TYPE_I8
+            let ext: i32 = next_reg(s)
+            emit_str(s, "  ")
+            emit_reg(s, ext)
+            emit_str(s, " = sext i8 ")
+            emit_reg(s, val_reg)
+            emit_str(s, " to i64\n")
+            return ext
+        else if field.field_type == TYPE_U8
+            let ext: i32 = next_reg(s)
+            emit_str(s, "  ")
+            emit_reg(s, ext)
+            emit_str(s, " = zext i8 ")
+            emit_reg(s, val_reg)
+            emit_str(s, " to i64\n")
+            return ext
+        else if field.field_type == TYPE_PTR or field.field_type == TYPE_PTR_PTR
+            let pti: i32 = next_reg(s)
+            emit_str(s, "  ")
+            emit_reg(s, pti)
+            emit_str(s, " = ptrtoint ptr ")
+            emit_reg(s, val_reg)
+            emit_str(s, " to i64\n")
+            return pti
+        else
+            return val_reg
+    emit_str(s, "  ; ERROR: unhandled EXPR_MEMBER\n")
+
+    # Unhandled path — return 0
+    return 0
+
