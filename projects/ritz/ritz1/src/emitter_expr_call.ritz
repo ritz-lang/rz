@@ -630,6 +630,82 @@ fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
                     converted_regs[j] = cast
                 else
                     converted_regs[j] = arg_regs[j]
+            else if param_ptr.param_type == TYPE_STRUCT and param_ptr.param_type_name_len > 4 and *(param_ptr.param_type_name + 0) == 'S' and *(param_ptr.param_type_name + 1) == 'p' and *(param_ptr.param_type_name + 2) == 'a' and *(param_ptr.param_type_name + 3) == 'n' and *(param_ptr.param_type_name + 4) == '$'
+                # Port of ritz0 bedc85b: `@vec` -> Span<T> coercion at call site.
+                # When the parameter is `Span<T>` and the argument is `@v` where
+                # v is a Vec<T> local, materialize a Span struct from
+                # { v.data, v.len } so the callee receives a proper slice view.
+                var span_arg_expr: *Expr = e.args
+                var sak: i32 = 0
+                while sak < j and span_arg_expr != null
+                    span_arg_expr = span_arg_expr.next
+                    sak = sak + 1
+                var coerced: i32 = 0
+                if span_arg_expr != null and span_arg_expr.kind == EXPR_UNARY
+                    if span_arg_expr.op == OP_ADDR and span_arg_expr.operand.kind == EXPR_IDENT
+                        let src_loc: *LocalVar = find_local_struct_name(s, span_arg_expr.operand.ident_ptr, span_arg_expr.operand.ident_len)
+                        if src_loc != null and src_loc.type_name_len > 4
+                            if *(src_loc.type_name + 0) == 'V' and *(src_loc.type_name + 1) == 'e' and *(src_loc.type_name + 2) == 'c' and *(src_loc.type_name + 3) == '$'
+                                # Convert the i64 arg (ptrtoint of alloca) back to ptr
+                                let span_vec_ptr: i32 = next_reg(s)
+                                emit_str(s, "  ")
+                                emit_reg(s, span_vec_ptr)
+                                emit_str(s, " = inttoptr i64 ")
+                                emit_reg(s, arg_regs[j])
+                                emit_str(s, " to ptr\n")
+                                # GEP to data field (offset 0)
+                                let sp_data_pp: i32 = next_reg(s)
+                                emit_str(s, "  ")
+                                emit_reg(s, sp_data_pp)
+                                emit_str(s, " = getelementptr %")
+                                emit_name(s, src_loc.type_name, src_loc.type_name_len)
+                                emit_str(s, ", ptr ")
+                                emit_reg(s, span_vec_ptr)
+                                emit_str(s, ", i32 0, i32 0\n")
+                                let sp_data: i32 = next_reg(s)
+                                emit_str(s, "  ")
+                                emit_reg(s, sp_data)
+                                emit_str(s, " = load ptr, ptr ")
+                                emit_reg(s, sp_data_pp)
+                                emit_str(s, "\n")
+                                # GEP to len field (offset 1)
+                                let sp_len_p: i32 = next_reg(s)
+                                emit_str(s, "  ")
+                                emit_reg(s, sp_len_p)
+                                emit_str(s, " = getelementptr %")
+                                emit_name(s, src_loc.type_name, src_loc.type_name_len)
+                                emit_str(s, ", ptr ")
+                                emit_reg(s, span_vec_ptr)
+                                emit_str(s, ", i32 0, i32 1\n")
+                                let sp_len: i32 = next_reg(s)
+                                emit_str(s, "  ")
+                                emit_reg(s, sp_len)
+                                emit_str(s, " = load i64, ptr ")
+                                emit_reg(s, sp_len_p)
+                                emit_str(s, "\n")
+                                # Build Span { data, len }
+                                let sp1: i32 = next_reg(s)
+                                emit_str(s, "  ")
+                                emit_reg(s, sp1)
+                                emit_str(s, " = insertvalue %")
+                                emit_name(s, param_ptr.param_type_name, param_ptr.param_type_name_len)
+                                emit_str(s, " undef, ptr ")
+                                emit_reg(s, sp_data)
+                                emit_str(s, ", 0\n")
+                                let sp2: i32 = next_reg(s)
+                                emit_str(s, "  ")
+                                emit_reg(s, sp2)
+                                emit_str(s, " = insertvalue %")
+                                emit_name(s, param_ptr.param_type_name, param_ptr.param_type_name_len)
+                                emit_str(s, " ")
+                                emit_reg(s, sp1)
+                                emit_str(s, ", i64 ")
+                                emit_reg(s, sp_len)
+                                emit_str(s, ", 1\n")
+                                converted_regs[j] = sp2
+                                coerced = 1
+                if coerced == 0
+                    converted_regs[j] = arg_regs[j]
             else if param_ptr.param_type == TYPE_STRUCT and param_ptr.param_type_name_len == 7
                 # Check if this is StrView (7 chars)
                 var is_strview: i32 = 0

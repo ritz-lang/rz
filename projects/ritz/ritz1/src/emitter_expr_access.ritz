@@ -265,6 +265,278 @@ fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
                     emit_str(s, " to i64\n")
                     return pti
                 return result
+            # Port of ritz0 bedc85b: Vec<T> field indexing — s.vec_field[i]
+            # The field is a Vec$T struct: { *T data, i64 len, i64 cap }.
+            # We already have a ptr to the Vec struct in member_result.reg; load
+            # the data ptr (field 0), GEP by idx, load the element, extend to i64.
+            else if field.field_type == TYPE_STRUCT and field.field_type_name_len > 4
+                if *(field.field_type_name + 0) == 'V' and *(field.field_type_name + 1) == 'e' and *(field.field_type_name + 2) == 'c' and *(field.field_type_name + 3) == '$'
+                    let idx_v: i32 = emit_expr(s, e.right)
+                    # GEP to data field of Vec struct
+                    let data_ptr_ptr: i32 = next_reg(s)
+                    emit_str(s, "  ")
+                    emit_reg(s, data_ptr_ptr)
+                    emit_str(s, " = getelementptr %")
+                    emit_name(s, field.field_type_name, field.field_type_name_len)
+                    emit_str(s, ", ptr ")
+                    emit_reg(s, member_result.reg)
+                    emit_str(s, ", i32 0, i32 0\n")
+                    # Load data pointer
+                    let data_ptr: i32 = next_reg(s)
+                    emit_str(s, "  ")
+                    emit_reg(s, data_ptr)
+                    emit_str(s, " = load ptr, ptr ")
+                    emit_reg(s, data_ptr_ptr)
+                    emit_str(s, "\n")
+                    # Determine element type from suffix after "Vec$"
+                    let elem_name: *u8 = field.field_type_name + 4
+                    let elem_len: i32 = field.field_type_name_len - 4
+                    # Match common suffixes: i32, i64, u8, i8, u16, i16, u32
+                    var elem_ty_str: *u8 = c"i64"
+                    var elem_kind: i32 = TYPE_I64
+                    if elem_len == 2 and *(elem_name + 0) == 'u' and *(elem_name + 1) == '8'
+                        elem_ty_str = c"i8"
+                        elem_kind = TYPE_U8
+                    else if elem_len == 2 and *(elem_name + 0) == 'i' and *(elem_name + 1) == '8'
+                        elem_ty_str = c"i8"
+                        elem_kind = TYPE_I8
+                    else if elem_len == 3 and *(elem_name + 0) == 'i' and *(elem_name + 1) == '3' and *(elem_name + 2) == '2'
+                        elem_ty_str = c"i32"
+                        elem_kind = TYPE_I32
+                    else if elem_len == 3 and *(elem_name + 0) == 'u' and *(elem_name + 1) == '3' and *(elem_name + 2) == '2'
+                        elem_ty_str = c"i32"
+                        elem_kind = TYPE_U32
+                    else if elem_len == 3 and *(elem_name + 0) == 'i' and *(elem_name + 1) == '6' and *(elem_name + 2) == '4'
+                        elem_ty_str = c"i64"
+                        elem_kind = TYPE_I64
+                    else if elem_len == 3 and *(elem_name + 0) == 'u' and *(elem_name + 1) == '6' and *(elem_name + 2) == '4'
+                        elem_ty_str = c"i64"
+                        elem_kind = TYPE_I64
+                    else if elem_len == 3 and *(elem_name + 0) == 'i' and *(elem_name + 1) == '1' and *(elem_name + 2) == '6'
+                        elem_ty_str = c"i16"
+                        elem_kind = TYPE_I16
+                    else if elem_len == 3 and *(elem_name + 0) == 'u' and *(elem_name + 1) == '1' and *(elem_name + 2) == '6'
+                        elem_ty_str = c"i16"
+                        elem_kind = TYPE_U16
+                    # GEP by index
+                    let elem_ptr: i32 = next_reg(s)
+                    emit_str(s, "  ")
+                    emit_reg(s, elem_ptr)
+                    emit_str(s, " = getelementptr ")
+                    emit_str(s, elem_ty_str)
+                    emit_str(s, ", ptr ")
+                    emit_reg(s, data_ptr)
+                    emit_str(s, ", i64 ")
+                    emit_reg(s, idx_v)
+                    emit_str(s, "\n")
+                    # Load the element
+                    let val_reg: i32 = next_reg(s)
+                    emit_str(s, "  ")
+                    emit_reg(s, val_reg)
+                    emit_str(s, " = load ")
+                    emit_str(s, elem_ty_str)
+                    emit_str(s, ", ptr ")
+                    emit_reg(s, elem_ptr)
+                    emit_str(s, "\n")
+                    # Extend to i64 for uniform value representation
+                    if elem_kind == TYPE_I32
+                        let ext: i32 = next_reg(s)
+                        emit_str(s, "  ")
+                        emit_reg(s, ext)
+                        emit_str(s, " = sext i32 ")
+                        emit_reg(s, val_reg)
+                        emit_str(s, " to i64\n")
+                        return ext
+                    else if elem_kind == TYPE_U32
+                        let ext: i32 = next_reg(s)
+                        emit_str(s, "  ")
+                        emit_reg(s, ext)
+                        emit_str(s, " = zext i32 ")
+                        emit_reg(s, val_reg)
+                        emit_str(s, " to i64\n")
+                        return ext
+                    else if elem_kind == TYPE_I16
+                        let ext: i32 = next_reg(s)
+                        emit_str(s, "  ")
+                        emit_reg(s, ext)
+                        emit_str(s, " = sext i16 ")
+                        emit_reg(s, val_reg)
+                        emit_str(s, " to i64\n")
+                        return ext
+                    else if elem_kind == TYPE_U16
+                        let ext: i32 = next_reg(s)
+                        emit_str(s, "  ")
+                        emit_reg(s, ext)
+                        emit_str(s, " = zext i16 ")
+                        emit_reg(s, val_reg)
+                        emit_str(s, " to i64\n")
+                        return ext
+                    else if elem_kind == TYPE_I8
+                        let ext: i32 = next_reg(s)
+                        emit_str(s, "  ")
+                        emit_reg(s, ext)
+                        emit_str(s, " = sext i8 ")
+                        emit_reg(s, val_reg)
+                        emit_str(s, " to i64\n")
+                        return ext
+                    else if elem_kind == TYPE_U8
+                        let ext: i32 = next_reg(s)
+                        emit_str(s, "  ")
+                        emit_reg(s, ext)
+                        emit_str(s, " = zext i8 ")
+                        emit_reg(s, val_reg)
+                        emit_str(s, " to i64\n")
+                        return ext
+                    return val_reg
+
+    # Port of ritz0 bedc85b: Vec<T> indexing on call receiver — mk()[i].
+    # When the index base is a call returning Vec<T>, spill the returned
+    # struct to a stack slot, then GEP to the data pointer + index.
+    if e.left.kind == EXPR_CALL
+        # Look up the callee's return type
+        var cfn_name: [256]u8
+        var cfn_len: i32 = 0
+        for ii in 0..e.left.func_name_len
+            cfn_name[cfn_len] = *(e.left.func_name + ii)
+            cfn_len += 1
+        if e.left.call_type_suffix_len > 0
+            for ii in 0..e.left.call_type_suffix_len
+                cfn_name[cfn_len] = *(e.left.call_type_suffix + ii)
+                cfn_len += 1
+        let cfn: *FnDef = find_fn(s, @cfn_name[0], cfn_len)
+        if cfn != null and cfn.return_type == TYPE_STRUCT and cfn.return_type_name_len > 4
+            if *(cfn.return_type_name + 0) == 'V' and *(cfn.return_type_name + 1) == 'e' and *(cfn.return_type_name + 2) == 'c' and *(cfn.return_type_name + 3) == '$'
+                # Evaluate the call (returns a struct value register)
+                let call_val: i32 = emit_expr(s, e.left)
+                let idx_v: i32 = emit_expr(s, e.right)
+                # Allocate a stack slot for the returned Vec and store
+                let slot: i32 = next_reg(s)
+                emit_str(s, "  ")
+                emit_reg(s, slot)
+                emit_str(s, " = alloca %")
+                emit_name(s, cfn.return_type_name, cfn.return_type_name_len)
+                emit_str(s, "\n")
+                emit_str(s, "  store %")
+                emit_name(s, cfn.return_type_name, cfn.return_type_name_len)
+                emit_str(s, " ")
+                emit_reg(s, call_val)
+                emit_str(s, ", ptr ")
+                emit_reg(s, slot)
+                emit_str(s, "\n")
+                # GEP to data field
+                let data_ptr_ptr: i32 = next_reg(s)
+                emit_str(s, "  ")
+                emit_reg(s, data_ptr_ptr)
+                emit_str(s, " = getelementptr %")
+                emit_name(s, cfn.return_type_name, cfn.return_type_name_len)
+                emit_str(s, ", ptr ")
+                emit_reg(s, slot)
+                emit_str(s, ", i32 0, i32 0\n")
+                let data_ptr: i32 = next_reg(s)
+                emit_str(s, "  ")
+                emit_reg(s, data_ptr)
+                emit_str(s, " = load ptr, ptr ")
+                emit_reg(s, data_ptr_ptr)
+                emit_str(s, "\n")
+                # Decode elem type suffix after "Vec$"
+                let elem_name2: *u8 = cfn.return_type_name + 4
+                let elem_len2: i32 = cfn.return_type_name_len - 4
+                var elem_ty_s2: *u8 = c"i64"
+                var elem_kind2: i32 = TYPE_I64
+                if elem_len2 == 2 and *(elem_name2 + 0) == 'u' and *(elem_name2 + 1) == '8'
+                    elem_ty_s2 = c"i8"
+                    elem_kind2 = TYPE_U8
+                else if elem_len2 == 2 and *(elem_name2 + 0) == 'i' and *(elem_name2 + 1) == '8'
+                    elem_ty_s2 = c"i8"
+                    elem_kind2 = TYPE_I8
+                else if elem_len2 == 3 and *(elem_name2 + 0) == 'i' and *(elem_name2 + 1) == '3' and *(elem_name2 + 2) == '2'
+                    elem_ty_s2 = c"i32"
+                    elem_kind2 = TYPE_I32
+                else if elem_len2 == 3 and *(elem_name2 + 0) == 'u' and *(elem_name2 + 1) == '3' and *(elem_name2 + 2) == '2'
+                    elem_ty_s2 = c"i32"
+                    elem_kind2 = TYPE_U32
+                else if elem_len2 == 3 and *(elem_name2 + 0) == 'i' and *(elem_name2 + 1) == '6' and *(elem_name2 + 2) == '4'
+                    elem_ty_s2 = c"i64"
+                    elem_kind2 = TYPE_I64
+                else if elem_len2 == 3 and *(elem_name2 + 0) == 'u' and *(elem_name2 + 1) == '6' and *(elem_name2 + 2) == '4'
+                    elem_ty_s2 = c"i64"
+                    elem_kind2 = TYPE_I64
+                else if elem_len2 == 3 and *(elem_name2 + 0) == 'i' and *(elem_name2 + 1) == '1' and *(elem_name2 + 2) == '6'
+                    elem_ty_s2 = c"i16"
+                    elem_kind2 = TYPE_I16
+                else if elem_len2 == 3 and *(elem_name2 + 0) == 'u' and *(elem_name2 + 1) == '1' and *(elem_name2 + 2) == '6'
+                    elem_ty_s2 = c"i16"
+                    elem_kind2 = TYPE_U16
+                # GEP by index
+                let elem_ptr2: i32 = next_reg(s)
+                emit_str(s, "  ")
+                emit_reg(s, elem_ptr2)
+                emit_str(s, " = getelementptr ")
+                emit_str(s, elem_ty_s2)
+                emit_str(s, ", ptr ")
+                emit_reg(s, data_ptr)
+                emit_str(s, ", i64 ")
+                emit_reg(s, idx_v)
+                emit_str(s, "\n")
+                # Load
+                let val2: i32 = next_reg(s)
+                emit_str(s, "  ")
+                emit_reg(s, val2)
+                emit_str(s, " = load ")
+                emit_str(s, elem_ty_s2)
+                emit_str(s, ", ptr ")
+                emit_reg(s, elem_ptr2)
+                emit_str(s, "\n")
+                # Extend to i64
+                if elem_kind2 == TYPE_I32
+                    let ext: i32 = next_reg(s)
+                    emit_str(s, "  ")
+                    emit_reg(s, ext)
+                    emit_str(s, " = sext i32 ")
+                    emit_reg(s, val2)
+                    emit_str(s, " to i64\n")
+                    return ext
+                else if elem_kind2 == TYPE_U32
+                    let ext: i32 = next_reg(s)
+                    emit_str(s, "  ")
+                    emit_reg(s, ext)
+                    emit_str(s, " = zext i32 ")
+                    emit_reg(s, val2)
+                    emit_str(s, " to i64\n")
+                    return ext
+                else if elem_kind2 == TYPE_I16
+                    let ext: i32 = next_reg(s)
+                    emit_str(s, "  ")
+                    emit_reg(s, ext)
+                    emit_str(s, " = sext i16 ")
+                    emit_reg(s, val2)
+                    emit_str(s, " to i64\n")
+                    return ext
+                else if elem_kind2 == TYPE_U16
+                    let ext: i32 = next_reg(s)
+                    emit_str(s, "  ")
+                    emit_reg(s, ext)
+                    emit_str(s, " = zext i16 ")
+                    emit_reg(s, val2)
+                    emit_str(s, " to i64\n")
+                    return ext
+                else if elem_kind2 == TYPE_I8
+                    let ext: i32 = next_reg(s)
+                    emit_str(s, "  ")
+                    emit_reg(s, ext)
+                    emit_str(s, " = sext i8 ")
+                    emit_reg(s, val2)
+                    emit_str(s, " to i64\n")
+                    return ext
+                else if elem_kind2 == TYPE_U8
+                    let ext: i32 = next_reg(s)
+                    emit_str(s, "  ")
+                    emit_reg(s, ext)
+                    emit_str(s, " = zext i8 ")
+                    emit_reg(s, val2)
+                    emit_str(s, " to i64\n")
+                    return ext
+                return val2
 
     let base: i32 = emit_expr(s, e.left)
     let idx: i32 = emit_expr(s, e.right)
