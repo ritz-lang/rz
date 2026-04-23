@@ -1227,6 +1227,47 @@ fn emit_expr(s: *EmitterState, e: *Expr) -> i32
             emit_int(s, ptr_elem_size)
             emit_str(s, "\n")
 
+        # For pointer arithmetic, emit as `getelementptr i8` to preserve LLVM
+        # pointer provenance (prevents -O2 mis-optimization of inttoptr-derived
+        # stores). Result is ptrtoint'd back to i64 for the unified value model.
+        if is_ptr_arith == 1
+            # Convert left i64 → ptr
+            let left_as_ptr: i32 = next_reg(s)
+            emit_str(s, "  ")
+            emit_reg(s, left_as_ptr)
+            emit_str(s, " = inttoptr i64 ")
+            emit_reg(s, left_reg)
+            emit_str(s, " to ptr\n")
+
+            # For SUB, negate the scaled offset
+            var offset_reg: i32 = scaled_right
+            if e.op == OP_SUB
+                offset_reg = next_reg(s)
+                emit_str(s, "  ")
+                emit_reg(s, offset_reg)
+                emit_str(s, " = sub i64 0, ")
+                emit_reg(s, scaled_right)
+                emit_str(s, "\n")
+
+            # getelementptr i8, ptr %left, i64 %offset — preserves provenance
+            let gep_reg: i32 = next_reg(s)
+            emit_str(s, "  ")
+            emit_reg(s, gep_reg)
+            emit_str(s, " = getelementptr i8, ptr ")
+            emit_reg(s, left_as_ptr)
+            emit_str(s, ", i64 ")
+            emit_reg(s, offset_reg)
+            emit_str(s, "\n")
+
+            # ptrtoint back to i64 (unified value model)
+            let ptr_result: i32 = next_reg(s)
+            emit_str(s, "  ")
+            emit_reg(s, ptr_result)
+            emit_str(s, " = ptrtoint ptr ")
+            emit_reg(s, gep_reg)
+            emit_str(s, " to i64\n")
+            return ptr_result
+
         let result: i32 = next_reg(s)
 
         emit_str(s, "  ")
@@ -1337,6 +1378,44 @@ fn emit_expr(s: *EmitterState, e: *Expr) -> i32
                 emit_reg(s, result)
                 emit_str(s, " = zext i8 ")
                 emit_reg(s, byte_val)
+                emit_str(s, " to i64\n")
+                return result
+            else if deref_type == TYPE_U16 or deref_type == TYPE_I16
+                # Load i16 and sign/zero-extend to i64
+                let val16: i32 = next_reg(s)
+                emit_str(s, "  ")
+                emit_reg(s, val16)
+                emit_str(s, " = load i16, ptr ")
+                emit_reg(s, ptr)
+                emit_str(s, "\n")
+                let result: i32 = next_reg(s)
+                emit_str(s, "  ")
+                emit_reg(s, result)
+                if deref_type == TYPE_I16
+                    emit_str(s, " = sext i16 ")
+                else
+                    emit_str(s, " = zext i16 ")
+                emit_reg(s, val16)
+                emit_str(s, " to i64\n")
+                return result
+            else if deref_type == TYPE_I32 or deref_type == TYPE_U32
+                # Load i32 and sign/zero-extend to i64 (unified value model)
+                # Critical: reading i64 from a 4-byte slot reads 4 bytes of
+                # adjacent stack/heap = garbage upper half.
+                let val32: i32 = next_reg(s)
+                emit_str(s, "  ")
+                emit_reg(s, val32)
+                emit_str(s, " = load i32, ptr ")
+                emit_reg(s, ptr)
+                emit_str(s, "\n")
+                let result: i32 = next_reg(s)
+                emit_str(s, "  ")
+                emit_reg(s, result)
+                if deref_type == TYPE_I32
+                    emit_str(s, " = sext i32 ")
+                else
+                    emit_str(s, " = zext i32 ")
+                emit_reg(s, val32)
                 emit_str(s, " to i64\n")
                 return result
             else if deref_type == TYPE_STRUCT
@@ -2528,16 +2607,12 @@ fn emit_struct_lit_to_alloca(s: *EmitterState, e: *Expr, alloca_reg: i32) -> i32
 # =============================================================================
 
 fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
-    # Determine the actual type (infer if needed)
+    # Use the user's explicit type annotation. The parser defaults
+    # missing annotations to TYPE_I64, so any TYPE_I32 we see here
+    # came from an explicit `: i32` and must NOT be overridden —
+    # otherwise `var best_type: i32 = -1` stores i32 into an i64 slot,
+    # and callers reading i64 see garbage in the upper half.
     var var_type: i32 = stmt.var_type
-
-    # For let statements without explicit type annotation (parser defaults to TYPE_I32),
-    # infer the type from the initializer expression
-    if var_type == TYPE_I32 and stmt.var_init != null
-        let inferred: i32 = get_expr_type(s, stmt.var_init)
-        # Only override if we inferred a non-default type
-        if inferred == TYPE_PTR or inferred == TYPE_PTR_PTR or inferred == TYPE_I64
-            var_type = inferred
 
     let alloca_reg: i32 = next_reg(s)
     emit_str(s, "  ")
@@ -2832,35 +2907,58 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
                         return
 
         # Deref assignment: *(expr) = value
-        # Determine the type of the value being stored
+        # Determine the store type. For `*ptr = value` we want the POINTEE
+        # type of `ptr` (the destination slot's type), not the value's type.
+        # Otherwise storing an i64 RHS into an i32 slot writes 4 extra bytes.
         var value_type: i32 = TYPE_I64
         var struct_name: *u8 = null
         var struct_name_len: i32 = 0
 
-        # Check if value is an identifier - look up its type
-        if stmt.assign_value.kind == EXPR_IDENT
-            let local: *LocalVar = find_local_struct_name(s, stmt.assign_value.ident_ptr, stmt.assign_value.ident_len)
-            if local != null
-                value_type = local.var_type
-                if local.var_type == TYPE_STRUCT
-                    struct_name = local.type_name
-                    struct_name_len = local.type_name_len
-        # Check if value is a function call - look up the function's return type
-        else if stmt.assign_value.kind == EXPR_CALL
-            let fn_def: *FnDef = find_fn(s, stmt.assign_value.func_name, stmt.assign_value.func_name_len)
-            if fn_def != null
-                if fn_def.return_type == TYPE_STRUCT
-                    value_type = TYPE_STRUCT
-                    struct_name = fn_def.return_type_name
-                    struct_name_len = fn_def.return_type_name_len
-        # Check if value is a struct literal
-        else if stmt.assign_value.kind == EXPR_STRUCT_LIT
-            value_type = TYPE_STRUCT
-            struct_name = stmt.assign_value.ident_ptr
-            struct_name_len = stmt.assign_value.ident_len
+        # Prefer the destination's pointee type when available
+        if target_expr.kind == EXPR_UNARY and target_expr.op == OP_DEREF
+            if target_expr.operand.kind == EXPR_IDENT
+                let dst_loc: *LocalVar = find_local_struct_name(s, target_expr.operand.ident_ptr, target_expr.operand.ident_len)
+                if dst_loc != null and dst_loc.pointee_type != TYPE_I64
+                    value_type = dst_loc.pointee_type
+                    if dst_loc.pointee_type == TYPE_STRUCT
+                        struct_name = dst_loc.type_name
+                        struct_name_len = dst_loc.type_name_len
+
+        # Fall back to value's type if destination pointee was unknown (TYPE_I64 default)
+        if value_type == TYPE_I64
+            # Check if value is an identifier - look up its type
+            if stmt.assign_value.kind == EXPR_IDENT
+                let local: *LocalVar = find_local_struct_name(s, stmt.assign_value.ident_ptr, stmt.assign_value.ident_len)
+                if local != null
+                    value_type = local.var_type
+                    if local.var_type == TYPE_STRUCT
+                        struct_name = local.type_name
+                        struct_name_len = local.type_name_len
+            # Check if value is a function call - look up the function's return type
+            else if stmt.assign_value.kind == EXPR_CALL
+                let fn_def: *FnDef = find_fn(s, stmt.assign_value.func_name, stmt.assign_value.func_name_len)
+                if fn_def != null
+                    if fn_def.return_type == TYPE_STRUCT
+                        value_type = TYPE_STRUCT
+                        struct_name = fn_def.return_type_name
+                        struct_name_len = fn_def.return_type_name_len
+            # Check if value is a struct literal
+            else if stmt.assign_value.kind == EXPR_STRUCT_LIT
+                value_type = TYPE_STRUCT
+                struct_name = stmt.assign_value.ident_ptr
+                struct_name_len = stmt.assign_value.ident_len
 
         let val: i32 = emit_expr(s, stmt.assign_value)
-        let addr: i32 = emit_expr(s, target_expr)
+        # For `*ptr = value`, the store address IS the pointer — NOT the
+        # dereferenced value. emit_expr on the full deref expr would load
+        # through the pointer and produce the pointee's value, which we'd
+        # then incorrectly treat as an address (double-indirection bug).
+        # If target is EXPR_UNARY with OP_DEREF, emit just the operand (the pointer).
+        var addr: i32 = 0
+        if target_expr.kind == EXPR_UNARY and target_expr.op == OP_DEREF
+            addr = emit_expr(s, target_expr.operand)
+        else
+            addr = emit_expr(s, target_expr)
         # Convert i64 address to ptr
         let ptr: i32 = next_reg(s)
         emit_str(s, "  ")
