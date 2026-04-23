@@ -396,7 +396,9 @@ fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
         # Get the first argument - should be a string literal
         var arg: *Expr = e.args
         if arg != null
-            if arg.kind == EXPR_STRING_LIT
+            # Accept bare "...", c"..." and s"..." here — all three carry
+            # ptr+len on the AST node; print() only needs those.
+            if arg.kind == EXPR_STRING_LIT or arg.kind == EXPR_CSTRING_LIT or arg.kind == EXPR_SSTRING_LIT
                 # For string literal, we know the length at compile time
                 let str_idx: i32 = add_string(s, arg.string_ptr, arg.string_len)
                 let gep_reg: i32 = next_reg(s)
@@ -643,10 +645,42 @@ fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
                     while k < j and arg_expr != null
                         arg_expr = arg_expr.next
                         k = k + 1
-                    if arg_expr != null and arg_expr.kind == EXPR_STRING_LIT
-                        # String literal being passed to StrView param
-                        # arg_regs[j] is already the pointer (as i64)
-                        # We need to construct: %StrView { ptr, len }
+                    if arg_expr != null and arg_expr.kind == EXPR_SSTRING_LIT
+                        # s"..." already produced a %Span$u8 aggregate in
+                        # arg_regs[j]. Span<u8> and StrView are layout-
+                        # compatible but nominally distinct in LLVM IR, so
+                        # rebuild the aggregate under the StrView name rather
+                        # than try to bitcast.
+                        let p: i32 = next_reg(s)
+                        emit_str(s, "  ")
+                        emit_reg(s, p)
+                        emit_str(s, " = extractvalue %Span$u8 ")
+                        emit_reg(s, arg_regs[j])
+                        emit_str(s, ", 0\n")
+                        let l: i32 = next_reg(s)
+                        emit_str(s, "  ")
+                        emit_reg(s, l)
+                        emit_str(s, " = extractvalue %Span$u8 ")
+                        emit_reg(s, arg_regs[j])
+                        emit_str(s, ", 1\n")
+                        let sv1: i32 = next_reg(s)
+                        emit_str(s, "  ")
+                        emit_reg(s, sv1)
+                        emit_str(s, " = insertvalue %StrView undef, ptr ")
+                        emit_reg(s, p)
+                        emit_str(s, ", 0\n")
+                        let sv2: i32 = next_reg(s)
+                        emit_str(s, "  ")
+                        emit_reg(s, sv2)
+                        emit_str(s, " = insertvalue %StrView ")
+                        emit_reg(s, sv1)
+                        emit_str(s, ", i64 ")
+                        emit_reg(s, l)
+                        emit_str(s, ", 1\n")
+                        converted_regs[j] = sv2
+                    else if arg_expr != null and (arg_expr.kind == EXPR_STRING_LIT or arg_expr.kind == EXPR_CSTRING_LIT)
+                        # "..." / c"..." literal being passed to StrView param
+                        # arg_regs[j] is the pointer (as i64) - build %StrView { ptr, len }
                         let inttoptr_reg: i32 = next_reg(s)
                         emit_str(s, "  ")
                         emit_reg(s, inttoptr_reg)
