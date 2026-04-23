@@ -379,8 +379,78 @@ fn try_emit_ufcs_method(s: *EmitterState, e: *Expr, type_name: *u8, type_name_le
         return pti
     return call_result
 
+# Tag-encoded variant constructor support (ritz-task-87).
+# Convention: "carrier" variants (Some/Ok) encode as (1 << 48) | payload.
+# "Null" variants (None, Err(x)) encode as (0 << 48) | payload (i.e., just payload).
+# See emitter_match.ritz for the consumer side.
+#
+# Returns 1 if this call name matches a known variant, 0 otherwise.
+fn is_variant_carrier(name: *u8, name_len: i32) -> i32
+    if name_len == 4
+        # "Some"
+        if *name == 83 and *(name + 1) == 111 and *(name + 2) == 109 and *(name + 3) == 101
+            return 1
+    if name_len == 2
+        # "Ok"
+        if *name == 79 and *(name + 1) == 107
+            return 1
+    return 0
+
+fn is_variant_null(name: *u8, name_len: i32) -> i32
+    if name_len == 4
+        # "None"
+        if *name == 78 and *(name + 1) == 111 and *(name + 2) == 110 and *(name + 3) == 101
+            return 1
+    if name_len == 3
+        # "Err"
+        if *name == 69 and *(name + 1) == 114 and *(name + 2) == 114
+            return 1
+    return 0
 
 fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
+    # Variant constructor: Some(x) / Ok(x) / Err(x) -> tag-encoded i64.
+    # Handled before the generic call path so the resulting value has the
+    # right bit pattern for match's tag check (see emitter_match.ritz).
+    if is_variant_carrier(e.func_name, e.func_name_len) == 1
+        # Some/Ok — pack: (1 << 48) | (payload & 0xFFFFFFFFFFFF)
+        if e.args == null
+            # Unreachable in valid code, but emit 0 for safety
+            let z: i32 = next_reg(s)
+            emit_str(s, "  ")
+            emit_reg(s, z)
+            emit_str(s, " = add i64 0, 0  ; carrier variant with no args\n")
+            return z
+        let payload_reg: i32 = emit_expr(s, e.args)
+        let masked: i32 = next_reg(s)
+        emit_str(s, "  ")
+        emit_reg(s, masked)
+        emit_str(s, " = and i64 ")
+        emit_reg(s, payload_reg)
+        emit_str(s, ", 281474976710655  ; payload mask (2^48 - 1)\n")
+        let tagged: i32 = next_reg(s)
+        emit_str(s, "  ")
+        emit_reg(s, tagged)
+        emit_str(s, " = or i64 ")
+        emit_reg(s, masked)
+        emit_str(s, ", 281474976710656  ; tag = 1 (carrier variant)\n")
+        return tagged
+    if is_variant_null(e.func_name, e.func_name_len) == 1
+        # Err(x) — pack: (0 << 48) | (payload & 0xFFFFFFFFFFFF) = payload alone.
+        # (None takes no args and is handled in emit_expr_ident.)
+        if e.args == null
+            let z: i32 = next_reg(s)
+            emit_str(s, "  ")
+            emit_reg(s, z)
+            emit_str(s, " = add i64 0, 0  ; null variant, no args\n")
+            return z
+        let payload_reg: i32 = emit_expr(s, e.args)
+        let masked: i32 = next_reg(s)
+        emit_str(s, "  ")
+        emit_reg(s, masked)
+        emit_str(s, " = and i64 ")
+        emit_reg(s, payload_reg)
+        emit_str(s, ", 281474976710655  ; payload mask, tag=0\n")
+        return masked
     # Check if this is the print() built-in
     var is_print: i32 = 0
     if e.func_name_len == 5

@@ -33,6 +33,7 @@ SOURCES = \
 	emitter_expr_access \
 	emitter_expr_call \
 	emitter_expr \
+	emitter_match \
 	emitter_stmt \
 	emitter \
 	main

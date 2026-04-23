@@ -357,6 +357,21 @@ fn parse_item(p: *Parser) -> i32
     if p.pos > start_pos
         return 1
 
+    # Try next alternative
+    p.pos = start_pos
+    p.error = 0
+
+    # Alternative 8: enum declaration (consume-and-skip, ritz-task-87)
+    # Currently ritz1's AST has no enum node, so this just validates syntax
+    # and moves on. Variant constructors are resolved at call sites.
+    var enum_result: i32
+
+    enum_result = parse_enum_def(p)
+    if p.error != 0
+        p.pos = start_pos
+    if p.pos > start_pos
+        return 1
+
     if p.error == 0
         return 0
     return 0
@@ -1272,6 +1287,16 @@ fn parse_type_spec(p: *Parser) -> i32
         result_a14_3 = parse_type_spec(p)
         if p.error != 0
             p.pos = start_pos
+    # Tolerate multi-arg generics (e.g. Result<T, E>) by consuming any
+    # extra `, T2, T3...` after the first type arg. Only the first arg
+    # is used for name mangling — extras are ignored (ritz-task-87 skip).
+    if p.error == 0
+        while p_peek(p) == TOK_COMMA
+            p_advance(p)  # consume `,`
+            let _extra: i32 = parse_type_spec(p)
+            if p.error != 0
+                p.pos = start_pos
+                break
     if p.error == 0
         result_a14_4 = p_current_token(p)
         if p_expect(p, TOK_GT) == 0
@@ -1633,6 +1658,19 @@ fn parse_control_stmt(p: *Parser) -> *Stmt
     if p.error == 0
         return result_a5_1
 
+    # Try next alternative
+    p.pos = start_pos
+    p.error = 0
+
+    # Alternative 6: match stmt (added for ritz-task-87)
+    var result_a6_1: *Stmt
+
+    result_a6_1 = parse_match_stmt(p)
+    if p.error != 0
+        p.pos = start_pos
+    if p.error == 0
+        return result_a6_1
+
     if p.error == 0
         return null
     return null
@@ -1677,10 +1715,18 @@ fn parse_let_stmt(p: *Parser) -> *Stmt
         if p.error != 0
             p.pos = start_pos
     if p.error == 0
+        # NEWLINE is optional when the RHS was a block-expression (match), since
+        # match_expr already consumed its trailing DEDENT instead of NEWLINE
+        # (ritz-task-87).
         result_a1_7 = p_current_token(p)
-        if p_expect(p, TOK_NEWLINE) == 0
-            p.error = 1
-            p.pos = start_pos
+        if result_a1_6 != null and result_a1_6.kind == EXPR_MATCH
+            # Tolerate missing NEWLINE after match expression.
+            if p_peek(p) == TOK_NEWLINE
+                p_advance(p)
+        else
+            if p_expect(p, TOK_NEWLINE) == 0
+                p.error = 1
+                p.pos = start_pos
     if p.error == 0
         return stmt_var_decl(p, result_a1_2.start, result_a1_2.len, result_a1_4, result_a1_6, result_a1_1.line, result_a1_1.col)
 
@@ -1714,10 +1760,15 @@ fn parse_let_stmt(p: *Parser) -> *Stmt
         if p.error != 0
             p.pos = start_pos
     if p.error == 0
+        # Same optional-NEWLINE treatment for match-expression RHS.
         result_a2_5 = p_current_token(p)
-        if p_expect(p, TOK_NEWLINE) == 0
-            p.error = 1
-            p.pos = start_pos
+        if result_a2_4 != null and result_a2_4.kind == EXPR_MATCH
+            if p_peek(p) == TOK_NEWLINE
+                p_advance(p)
+        else
+            if p_expect(p, TOK_NEWLINE) == 0
+                p.error = 1
+                p.pos = start_pos
     if p.error == 0
         return stmt_var_decl(p, result_a2_2.start, result_a2_2.len, 0, result_a2_4, result_a2_1.line, result_a2_1.col)
 
@@ -4011,6 +4062,55 @@ fn parse_args(p: *Parser) -> *Expr
 fn parse_primary_expr(p: *Parser) -> *Expr
     let start_pos: i32 = p.pos
 
+    # Alternative -1 (ritz-task-87): bool literals true/false.
+    # ritz1's existing parser had no rule for TOK_TRUE / TOK_FALSE, so any
+    # `let b: bool = true` or `pick(true)` silently dropped the enclosing fn.
+    # Map them to i64 1 / 0 — the surrounding type system treats bools
+    # uniformly as i64 at the expression level.
+    if p_peek(p) == TOK_TRUE
+        let tt: Token = p_current_token(p)
+        p_advance(p)
+        return expr_int(p, 1, tt.line, tt.col)
+    if p_peek(p) == TOK_FALSE
+        let ft: Token = p_current_token(p)
+        p_advance(p)
+        return expr_int(p, 0, ft.line, ft.col)
+
+    # Alternative 0 (ritz-task-87): match as expression
+    # Allows `let x = match scrut \n INDENT arms DEDENT`.
+    # We reuse the stmt_match helper's structure via expr_match which stores
+    # scrutinee in `left` and arm list in `args`. Only try this when the
+    # next token is `match` to avoid stealing the start_pos from other alts.
+    # After DEDENT we proactively inject a synthetic "stmt end" by NOT
+    # consuming the outer NEWLINE (there isn't one) — the caller's
+    # NEWLINE-expect should be skipped when it sees a block-expression;
+    # we handle that on the parse_let side via `p.block_expr_tail` style flag.
+    # Simpler approach: consume DEDENT only if the *following* token is
+    # clearly the start of the next statement; otherwise leave DEDENT for
+    # the outer block parser to consume.
+    if p_peek(p) == TOK_MATCH
+        var m_tok: Token
+        var m_scrut: *Expr
+        var m_arms: *MatchArm
+        m_tok = p_current_token(p)
+        p_advance(p)  # consume `match`
+        m_scrut = parse_expr(p)
+        if p.error == 0
+            if p_expect(p, TOK_NEWLINE) == 0
+                p.error = 1
+        if p.error == 0
+            if p_expect(p, TOK_INDENT) == 0
+                p.error = 1
+        if p.error == 0
+            m_arms = parse_match_arms(p)
+        if p.error == 0
+            if p_expect(p, TOK_DEDENT) == 0
+                p.error = 1
+        if p.error == 0
+            return expr_match(p, m_scrut, m_arms, m_tok.line, m_tok.col)
+        p.pos = start_pos
+        p.error = 0
+
     # Alternative 1
     var result_a1_1: Token
 
@@ -4517,4 +4617,275 @@ fn parse_impl_methods(p: *Parser) -> *FnDef
     if p.error == 0
         return null
     return null
+
+# =============================================================================
+# Match parsing (added for ritz-task-87)
+# =============================================================================
+#
+# Grammar:
+#   match_stmt : MATCH expr NEWLINE INDENT match_arms DEDENT
+#   match_arms : match_arm+
+#   match_arm  : pattern FAT_ARROW arm_body NEWLINE
+#   pattern    : NUMBER
+#              | '_'         (wildcard)
+#              | IDENT       (binding / unit variant)
+#              | IDENT '(' inner ')'  (variant with payload)
+#   inner      : '_' | IDENT
+#   arm_body   : expr | PASS
+#
+# Design notes:
+#   - Pattern kinds + data are flattened into MatchArm (see ast.ritz).
+#   - `pass` is handled as a no-op arm body (emitter produces default i64 0).
+#   - Only what the 2 test_issue_match_*.ritz + 1 custom test need — no
+#     nested patterns, no guards, no range patterns.
+
+fn parse_match_stmt(p: *Parser) -> *Stmt
+    let start_pos: i32 = p.pos
+
+    var tok_match: Token
+    var scrutinee: *Expr
+    var arms: *MatchArm
+
+    tok_match = p_current_token(p)
+    if p_expect(p, TOK_MATCH) == 0
+        p.error = 1
+        p.pos = start_pos
+        return null
+    if p.error == 0
+        scrutinee = parse_expr(p)
+        if p.error != 0
+            p.pos = start_pos
+            return null
+    if p.error == 0
+        if p_expect(p, TOK_NEWLINE) == 0
+            p.error = 1
+            p.pos = start_pos
+            return null
+    if p.error == 0
+        if p_expect(p, TOK_INDENT) == 0
+            p.error = 1
+            p.pos = start_pos
+            return null
+    if p.error == 0
+        arms = parse_match_arms(p)
+        if p.error != 0
+            p.pos = start_pos
+            return null
+    if p.error == 0
+        if p_expect(p, TOK_DEDENT) == 0
+            p.error = 1
+            p.pos = start_pos
+            return null
+    if p.error == 0
+        return stmt_match(p, scrutinee, arms, tok_match.line, tok_match.col)
+    return null
+
+# match_arms: one or more arms
+# Iterative implementation — recursive version destroyed `first` when the
+# second arm failed because the recursive call's start_pos rewind undid it.
+fn parse_match_arms(p: *Parser) -> *MatchArm
+    var first: *MatchArm = parse_match_arm(p)
+    if p.error != 0
+        return null
+    var curr: *MatchArm = first
+    while 1 == 1
+        let save: i32 = p.pos
+        let saved_err: i32 = p.error
+        let next_arm: *MatchArm = parse_match_arm(p)
+        if p.error != 0
+            # No more arms — rewind exactly to after the last good arm
+            p.pos = save
+            p.error = saved_err
+            break
+        curr.next = next_arm
+        curr = next_arm
+    return first
+
+# match_arm: pattern FAT_ARROW arm_body NEWLINE
+fn parse_match_arm(p: *Parser) -> *MatchArm
+    let start_pos: i32 = p.pos
+    var arm: *MatchArm
+
+    # Parse pattern. We allocate the arm upfront and fill pattern fields.
+    arm = parse_pattern(p)
+    if p.error != 0
+        p.pos = start_pos
+        p.error = 1
+        return null
+    if arm == null
+        p.pos = start_pos
+        p.error = 1
+        return null
+
+    # Expect FAT_ARROW
+    if p_expect(p, TOK_FAT_ARROW) == 0
+        p.error = 1
+        p.pos = start_pos
+        return null
+
+    # arm_body: either `pass` (as an IDENT) or expression
+    # `pass` is not its own keyword in ritz1's lexer — it surfaces as TOK_IDENT.
+    let body_tok: Token = p_current_token(p)
+    var is_pass: i32 = 0
+    if body_tok.kind == TOK_IDENT and body_tok.len == 4
+        # Check for "pass" literal: 'p'=112, 'a'=97, 's'=115, 's'=115
+        if *body_tok.start == 112 and *(body_tok.start + 1) == 97
+            if *(body_tok.start + 2) == 115 and *(body_tok.start + 3) == 115
+                is_pass = 1
+    if is_pass == 1
+        p_advance(p)  # consume `pass`
+        match_arm_set_body(arm, null, 1)
+    else
+        let body: *Expr = parse_expr(p)
+        if p.error != 0
+            p.pos = start_pos
+            return null
+        match_arm_set_body(arm, body, 0)
+
+    # Consume trailing newline
+    if p_expect(p, TOK_NEWLINE) == 0
+        p.error = 1
+        p.pos = start_pos
+        return null
+    return arm
+
+# pattern: NUMBER | '_' | IDENT | IDENT '(' inner ')'
+# Returns a MatchArm with the pattern fields filled (body unset).
+fn parse_pattern(p: *Parser) -> *MatchArm
+    let tok: Token = p_current_token(p)
+
+    # Integer literal pattern
+    if tok.kind == TOK_NUMBER
+        p_advance(p)
+        return match_arm_int(p, parse_int(tok.start, tok.len))
+
+    # Negative integer literal pattern: `-NUMBER`
+    if tok.kind == TOK_MINUS
+        p_advance(p)
+        let num: Token = p_current_token(p)
+        if num.kind == TOK_NUMBER
+            p_advance(p)
+            return match_arm_int(p, 0 - parse_int(num.start, num.len))
+        p.error = 1
+        return null
+
+    # Identifier-based patterns (wildcard `_`, binding, variant)
+    if tok.kind == TOK_IDENT
+        p_advance(p)
+        # Check for wildcard: single-char ident '_'
+        if tok.len == 1 and *tok.start == 95  # '_'
+            return match_arm_wildcard(p)
+        # Check for variant: IDENT LPAREN inner RPAREN
+        if p_peek(p) == TOK_LPAREN
+            p_advance(p)  # consume `(`
+            let inner_tok: Token = p_current_token(p)
+            var inner_kind: i32 = 0
+            var inner_name: *u8 = null
+            var inner_len: i32 = 0
+            if inner_tok.kind == TOK_IDENT
+                p_advance(p)
+                if inner_tok.len == 1 and *inner_tok.start == 95  # '_'
+                    inner_kind = PAT_WILDCARD
+                else
+                    inner_kind = PAT_IDENT
+                    inner_name = inner_tok.start
+                    inner_len = inner_tok.len
+            else
+                p.error = 1
+                return null
+            if p_expect(p, TOK_RPAREN) == 0
+                p.error = 1
+                return null
+            return match_arm_variant(p, tok.start, tok.len, inner_kind, inner_name, inner_len)
+        # Plain ident pattern — binding or unit variant (None, etc.)
+        return match_arm_ident(p, tok.start, tok.len)
+
+    p.error = 1
+    return null
+
+# =============================================================================
+# Enum declaration parsing (minimal skip)
+# =============================================================================
+#
+# ritz1 doesn't yet model enums in its AST — but ritzlib/result.ritz and
+# ritzlib/option.ritz use `enum Name<T> ... variants`. Without at least a
+# consume-and-skip parser here, parse_item bails at the first `enum` token
+# and the rest of the module silently drops. We consume the syntax but
+# discard the payload; variant constructors are handled as opaque calls
+# (or special-cased by the emitter for Some/Ok/None/Err).
+#
+# Grammar consumed:
+#   [ 'pub' ] enum IDENT [ '<' ... '>' ]
+#       INDENT (IDENT [ '(' ... ')' ] NEWLINE)+ DEDENT
+
+fn parse_enum_def(p: *Parser) -> i32
+    let start_pos: i32 = p.pos
+
+    # Optional `pub` prefix
+    if p_peek(p) == TOK_PUB
+        p_advance(p)
+
+    if p_expect(p, TOK_ENUM) == 0
+        p.error = 1
+        p.pos = start_pos
+        return 0
+    if p_expect(p, TOK_IDENT) == 0
+        p.error = 1
+        p.pos = start_pos
+        return 0
+    # Optional <T, ...>
+    if p_peek(p) == TOK_LT
+        p_advance(p)
+        # Consume until matching '>'
+        var depth: i32 = 1
+        while depth > 0
+            let k: i32 = p_peek(p)
+            if k == TOK_LT
+                depth = depth + 1
+            else if k == TOK_GT
+                depth = depth - 1
+            else if k == TOK_EOF
+                p.error = 1
+                p.pos = start_pos
+                return 0
+            p_advance(p)
+    if p_expect(p, TOK_NEWLINE) == 0
+        p.error = 1
+        p.pos = start_pos
+        return 0
+    if p_expect(p, TOK_INDENT) == 0
+        p.error = 1
+        p.pos = start_pos
+        return 0
+    # Consume variant lines until DEDENT
+    while p_peek(p) != TOK_DEDENT and p_peek(p) != TOK_EOF
+        # Variant name
+        if p_peek(p) != TOK_IDENT
+            # Skip unexpected token gracefully
+            p_advance(p)
+        else
+            p_advance(p)
+            # Optional (type, ...)
+            if p_peek(p) == TOK_LPAREN
+                var depth2: i32 = 1
+                p_advance(p)
+                while depth2 > 0
+                    let k: i32 = p_peek(p)
+                    if k == TOK_LPAREN
+                        depth2 = depth2 + 1
+                    else if k == TOK_RPAREN
+                        depth2 = depth2 - 1
+                    else if k == TOK_EOF
+                        p.error = 1
+                        p.pos = start_pos
+                        return 0
+                    p_advance(p)
+            # Consume trailing newline (optional — tolerate missing)
+            if p_peek(p) == TOK_NEWLINE
+                p_advance(p)
+    if p_expect(p, TOK_DEDENT) == 0
+        p.error = 1
+        p.pos = start_pos
+        return 0
+    return 1
 
