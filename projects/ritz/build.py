@@ -33,6 +33,7 @@ from cache import BuildCache
 
 ROOT = Path(__file__).parent
 RITZ0 = ROOT / "ritz0" / "ritz0.py"
+RITZ1_BIN = ROOT / "ritz1" / "build" / "ritz1"   # self-hosted compiler binary
 RUNTIME_DIR = ROOT / "runtime"
 
 # Architecture-specific runtime files
@@ -683,7 +684,7 @@ def get_binaries(pkg_dir: Path, config: dict) -> list[BinaryConfig]:
     return binaries
 
 
-def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources: list[Path] = None, keep_artifacts: bool = False, use_cache: bool = True, profile: dict = None, dependencies: dict[str, DependencySpec] = None, pkg_dir: Path = None, source_roots: list[str] = None) -> Path:
+def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources: list[Path] = None, keep_artifacts: bool = False, use_cache: bool = True, profile: dict = None, dependencies: dict[str, DependencySpec] = None, pkg_dir: Path = None, source_roots: list[str] = None, compiler: str = "ritz0") -> Path:
     """Compile Ritz source file(s) to a binary.
 
     Args:
@@ -713,6 +714,15 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
     if profile is None:
         profile = {"name": "debug", "opt_level": 0, "debug": True, "lto": False}
     bin_path = out_dir / name
+
+    # The build cache is keyed by source file hash only — it doesn't know which
+    # compiler produced the cached .ll/.bc. Using ritz1 with a cache warmed by
+    # ritz0 (or vice versa) would silently return the wrong artifact, so we
+    # disable the cache whenever compiler != "ritz0". This is Phase I; a future
+    # change could namespace the cache by compiler.
+    if compiler != "ritz0":
+        use_cache = False
+
     cache = get_build_cache()
 
     # Check for llvm-as (needed for .ll → .bc conversion)
@@ -815,25 +825,48 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
                         continue
 
             # All sources compiled without runtime - _start comes from external .o
-            compile_cmd = [sys.executable, str(RITZ0), str(src), "-o", str(ll_path), "--no-runtime"]
+            if compiler == "ritz1":
+                # ritz1's CLI is minimal: <input> -o <output> [-I <ritz_path>]. It
+                # doesn't understand --no-runtime, --deps, --sources, or
+                # --project-root. Its default emitter is non-freestanding (no
+                # _start embedded), so the "--no-runtime" semantics come for free.
+                # Import resolution: ritz1 tries source_dir first, then RITZ_PATH.
+                # We point `-I` at the ritz ROOT so ritzlib/* imports resolve,
+                # and also ensure RITZ_PATH is set to the same root for
+                # `ritzlib.X` qualified imports (ritz1 strips the "ritzlib"
+                # prefix when RITZ_PATH-resolving those).
+                if not RITZ1_BIN.exists():
+                    print(f"  ✗ ritz1 binary not found at {RITZ1_BIN}", file=sys.stderr)
+                    print(f"    Run: cd {RITZ1_BIN.parent.parent} && make ritz1", file=sys.stderr)
+                    return None
+                i_root = str(ROOT)
+                compile_cmd = [str(RITZ1_BIN), str(src), "-o", str(ll_path), "-I", i_root]
+            else:
+                compile_cmd = [sys.executable, str(RITZ0), str(src), "-o", str(ll_path), "--no-runtime"]
 
-            # Pass dependencies if any (RFC #109 Phase 2)
-            if dependencies:
-                deps_json = {
-                    name: {"path": str(spec.path), "sources": spec.sources}
-                    for name, spec in dependencies.items()
-                }
-                compile_cmd.extend(["--deps", json.dumps(deps_json)])
-            # Pass source roots if any (for import resolution)
-            if source_roots:
-                compile_cmd.extend(["--sources", json.dumps(source_roots)])
-            # Pass project root (package directory) for source root resolution
-            if pkg_dir:
-                compile_cmd.extend(["--project-root", str(pkg_dir)])
+                # Pass dependencies if any (RFC #109 Phase 2)
+                if dependencies:
+                    deps_json = {
+                        name: {"path": str(spec.path), "sources": spec.sources}
+                        for name, spec in dependencies.items()
+                    }
+                    compile_cmd.extend(["--deps", json.dumps(deps_json)])
+                # Pass source roots if any (for import resolution)
+                if source_roots:
+                    compile_cmd.extend(["--sources", json.dumps(source_roots)])
+                # Pass project root (package directory) for source root resolution
+                if pkg_dir:
+                    compile_cmd.extend(["--project-root", str(pkg_dir)])
 
-            result = subprocess.run(compile_cmd, capture_output=True, text=True)
+            # ritz1 needs RITZ_PATH to resolve qualified `ritzlib.*` imports.
+            # Inject it into the subprocess env unconditionally (overriding any
+            # stale value the caller may have — our ROOT is canonical).
+            env = os.environ.copy()
+            if compiler == "ritz1":
+                env["RITZ_PATH"] = str(ROOT)
+            result = subprocess.run(compile_cmd, capture_output=True, text=True, env=env)
             if result.returncode != 0:
-                print(f"  ✗ ritz0 failed for {src.name}: {result.stderr}", file=sys.stderr)
+                print(f"  ✗ {compiler} failed for {src.name}: {result.stderr}", file=sys.stderr)
                 return None
 
             # Update .ll cache
@@ -1280,7 +1313,7 @@ def compile_freestanding_binary(
             shutil.rmtree(artifact_dir, ignore_errors=True)
 
 
-def build_package(pkg_dir: Path, config: dict, keep_artifacts: bool = False, use_cache: bool = True, profile_name: str = None) -> list[Path]:
+def build_package(pkg_dir: Path, config: dict, keep_artifacts: bool = False, use_cache: bool = True, profile_name: str = None, compiler: str = "ritz0") -> list[Path]:
     """Build all binaries in a package.
 
     Args:
@@ -1289,6 +1322,11 @@ def build_package(pkg_dir: Path, config: dict, keep_artifacts: bool = False, use
         keep_artifacts: Keep intermediate .ll files for debugging
         use_cache: Use build cache to skip unchanged files
         profile_name: Build profile ("debug", "release", or None for default)
+        compiler:    "ritz0" (Python bootstrap, default) or "ritz1" (self-hosted).
+                     When "ritz1", each source is compiled via the ritz1 binary
+                     instead of ritz0.py. ritz1 has a minimal CLI so we skip the
+                     --deps/--sources/--project-root plumbing and rely on -I
+                     plus the standard RITZ_PATH for import resolution.
     """
     pkg_name = config["package"]["name"]
     profile = get_build_profile(config, profile_name)
@@ -1359,7 +1397,8 @@ def build_package(pkg_dir: Path, config: dict, keep_artifacts: bool = False, use
                 profile=profile,
                 dependencies=dependencies,
                 pkg_dir=pkg_dir,
-                source_roots=source_roots
+                source_roots=source_roots,
+                compiler=compiler,
             )
         if bin_path:
             try:
@@ -1482,6 +1521,7 @@ def cmd_build(args):
     keep_artifacts = getattr(args, 'debug', False)
     use_cache = not getattr(args, 'no_cache', False)
     profile_name = "release" if getattr(args, 'release', False) else None
+    compiler = getattr(args, 'compiler', 'ritz0')
 
     if args.all:
         # Build all packages under current directory
@@ -1509,7 +1549,7 @@ def cmd_build(args):
 
     success = True
     for pkg_dir, config in targets:
-        built = build_package(pkg_dir, config, keep_artifacts=keep_artifacts, use_cache=use_cache, profile_name=profile_name)
+        built = build_package(pkg_dir, config, keep_artifacts=keep_artifacts, use_cache=use_cache, profile_name=profile_name, compiler=compiler)
         if not built:
             success = False
 
@@ -1524,6 +1564,7 @@ def cmd_test(args):
     keep_artifacts = getattr(args, 'debug', False)
     use_cache = not getattr(args, 'no_cache', False)
     profile_name = "release" if getattr(args, 'release', False) else None
+    compiler = getattr(args, 'compiler', 'ritz0')
 
     if args.all:
         # Test all packages under current directory
@@ -1561,7 +1602,7 @@ def cmd_test(args):
                 all_passed = False
         else:
             # Normal package: build then test
-            built = build_package(pkg_dir, config, keep_artifacts=keep_artifacts, use_cache=use_cache, profile_name=profile_name)
+            built = build_package(pkg_dir, config, keep_artifacts=keep_artifacts, use_cache=use_cache, profile_name=profile_name, compiler=compiler)
             # Check if there are any .ritz binaries to build
             binaries = get_binaries(pkg_dir, config)
             has_ritz_binaries = len(binaries) > 0
@@ -1893,6 +1934,8 @@ def main():
                               help="Keep intermediate files (.ll, .o) in build/ for debugging")
     build_parser.add_argument("--no-cache", action="store_true",
                               help="Disable build cache (always rebuild)")
+    build_parser.add_argument("--compiler", choices=["ritz0", "ritz1"], default="ritz0",
+                              help="Which compiler to use (default: ritz0). ritz1 is the self-hosted compiler.")
 
     # test
     test_parser = subparsers.add_parser("test", help="Build and test packages")
@@ -1904,6 +1947,8 @@ def main():
                              help="Keep intermediate files (.ll, .o) in build/ for debugging")
     test_parser.add_argument("--no-cache", action="store_true",
                              help="Disable build cache (always rebuild)")
+    test_parser.add_argument("--compiler", choices=["ritz0", "ritz1"], default="ritz0",
+                             help="Which compiler to use (default: ritz0). ritz1 is the self-hosted compiler.")
 
     # run
     run_parser = subparsers.add_parser("run", help="Compile and run a single .ritz file")

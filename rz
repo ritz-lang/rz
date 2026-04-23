@@ -33,7 +33,7 @@ from pathlib import Path
 WORKSPACE_ROOT = Path(__file__).parent.resolve()
 PROJECTS_DIR = WORKSPACE_ROOT / "projects"
 RITZ_BUILD = WORKSPACE_ROOT / "projects" / "ritz" / "build.py"
-RITZ1_BIN = WORKSPACE_ROOT / "projects" / "ritz" / "ritz1" / "build" / "debug" / "ritz1"
+RITZ1_BIN = WORKSPACE_ROOT / "projects" / "ritz" / "ritz1" / "build" / "ritz1"
 
 # Global compiler selection (can be overridden per command)
 COMPILER = "ritz0"  # default
@@ -278,17 +278,24 @@ def cmd_clean(args):
 
 
 def compile_with_ritz1(source_path, output_path):
-    """Compile a single .ritz file with ritz1."""
+    """Compile a single .ritz file with ritz1.
+
+    ritz1's CLI is minimal: `<input> -o <output> [-I <ritz_path>]`. It has no
+    `--no-runtime` flag — its emitter is non-freestanding by default, so the
+    resulting IR does NOT embed _start and must be linked against a runtime
+    object (see link_ritz_ir → runtime_obj_for).
+    """
     if not RITZ1_BIN.exists():
         print(f"Error: ritz1 not found at {RITZ1_BIN}", file=sys.stderr)
-        print("  Run: cd projects/ritz && python3 build.py build ritz1", file=sys.stderr)
+        print("  Run: cd projects/ritz/ritz1 && make ritz1", file=sys.stderr)
         return False
 
     env = os.environ.copy()
     env["RITZ_PATH"] = str(PROJECTS_DIR / "ritz")
 
     result = subprocess.run(
-        [str(RITZ1_BIN), str(source_path), "-o", str(output_path)],
+        [str(RITZ1_BIN), str(source_path), "-o", str(output_path),
+         "-I", str(PROJECTS_DIR / "ritz")],
         env=env,
         capture_output=True,
         text=True
@@ -297,13 +304,18 @@ def compile_with_ritz1(source_path, output_path):
 
 
 def compile_with_ritz0(source_path, output_path):
-    """Compile a single .ritz file with ritz0."""
+    """Compile a single .ritz file with ritz0, emitting runtime-free IR.
+
+    Passes `--no-runtime` so ritz0 does NOT emit _start in the IR — _start
+    is provided by linking against the appropriate runtime object in
+    link_ritz_ir (matches what projects/ritz/build.py does).
+    """
     ritz0_py = PROJECTS_DIR / "ritz" / "ritz0" / "ritz0.py"
     env = os.environ.copy()
     env["RITZ_PATH"] = str(PROJECTS_DIR / "ritz")
 
     result = subprocess.run(
-        [sys.executable, str(ritz0_py), str(source_path), "-o", str(output_path)],
+        [sys.executable, str(ritz0_py), str(source_path), "-o", str(output_path), "--no-runtime"],
         env=env,
         capture_output=True,
         text=True
@@ -311,72 +323,151 @@ def compile_with_ritz0(source_path, output_path):
     return result.returncode == 0
 
 
-def link_llvm_ir(ll_path, binary_path):
+def detect_main_params(source_path):
+    """Count the parameters of `fn main(...)` in the source file.
+
+    Returns 0, 2, or 3 — which runtime variant to link against.
+    Mirrors projects/ritz/build.py:detect_main_signature but simpler.
+    """
+    try:
+        with open(source_path) as f:
+            text = f.read()
+    except Exception:
+        return 0
+    import re
+    # Match: fn main(...)  — capture everything between parens
+    m = re.search(r"\bfn\s+main\s*\(([^)]*)\)", text)
+    if not m:
+        return 0
+    args_str = m.group(1).strip()
+    if not args_str:
+        return 0
+    # Count comma-separated params
+    return len([p for p in args_str.split(",") if p.strip()])
+
+
+def runtime_obj_for(source_path):
+    """Pick the right ritz_start object file based on main's arity."""
+    import platform
+    arch = platform.machine()
+    runtime_dir = PROJECTS_DIR / "ritz" / "runtime"
+    params = detect_main_params(source_path)
+    if params == 0:
+        return runtime_dir / f"ritz_start_noargs.{arch}.o"
+    elif params == 3:
+        return runtime_dir / f"ritz_start_envp.{arch}.o"
+    else:  # 2-arg (argc, argv)
+        return runtime_dir / f"ritz_start.{arch}.o"
+
+
+def link_llvm_ir(ll_path, binary_path, source_path=None):
     """Link LLVM IR to a binary.
 
-    Detects whether the IR has a _start function (freestanding) and
-    adjusts linker flags accordingly.
+    Uses the same runtime-object linking strategy as projects/ritz/build.py:
+      * Compile with `--no-runtime` → IR has no _start
+      * Link with the appropriate ritz_start runtime .o (provides _start +
+        the minimal syscall wrappers programs rely on)
+      * `-nostdlib` keeps us off libc's _start / crt1.o
+      * Falls back to the old "let system provide _start" path for bitcode
+        that happens to define _start itself (freestanding experiments)
+
+    `source_path` is used to pick the runtime variant (main arity).
     """
-    # Check if the IR has _start (freestanding mode)
+    # Check if the IR has _start (legacy freestanding mode — pre --no-runtime)
     with open(ll_path, 'r') as f:
         ir_content = f.read()
 
     has_start = 'define void @_start' in ir_content or 'define void @"_start"' in ir_content
 
     if has_start:
-        # Freestanding: use -nostdlib to avoid conflicting _start
+        # Freestanding: IR already provides _start, use -nostdlib
         cmd = ["clang", str(ll_path), "-o", str(binary_path), "-nostdlib", "-no-pie"]
     else:
-        # Normal: let system provide _start
-        cmd = ["clang", str(ll_path), "-o", str(binary_path), "-no-pie"]
+        # Non-freestanding: link the runtime .o which provides _start + syscalls
+        runtime_obj = runtime_obj_for(source_path) if source_path else None
+        if runtime_obj and runtime_obj.exists():
+            cmd = ["clang", str(ll_path), str(runtime_obj), "-o", str(binary_path),
+                   "-nostdlib", "-no-pie"]
+        else:
+            # Last resort: let clang/libc provide _start (will fail if IR calls syscalls)
+            cmd = ["clang", str(ll_path), "-o", str(binary_path), "-no-pie"]
 
     result = subprocess.run(cmd, capture_output=True, text=True)
     return result.returncode == 0
 
 
 def build_example_with_build_py(example_rel_path, compiler="ritz0"):
-    """Build an example using build.py (full multi-file support).
+    """Build an example using projects/ritz/build.py (full multi-file support).
 
     Returns True if build succeeded, False otherwise.
+
+    Both compilers now route through build.py — single-file probe modes are
+    retired because they couldn't resolve ritzlib imports / generic
+    monomorphization, producing misleading "ritz1 only" green cells.
     """
     env = os.environ.copy()
     env["RITZ_PATH"] = str(PROJECTS_DIR / "ritz")
 
-    # Use build.py to do proper multi-file build
-    # example_rel_path is like "examples/tier1_basics/01_hello"
     build_py = PROJECTS_DIR / "ritz" / "build.py"
 
-    # Clean first to ensure fresh build
-    result = subprocess.run(
+    # Clean first to ensure fresh build (avoid cross-compiler cache pollution)
+    subprocess.run(
         [sys.executable, str(build_py), "clean", example_rel_path],
-        env=env,
-        capture_output=True,
-        text=True,
-        cwd=PROJECTS_DIR / "ritz"
+        env=env, capture_output=True, text=True,
+        cwd=PROJECTS_DIR / "ritz",
     )
 
-    # Build with specified compiler
-    cmd = [sys.executable, str(build_py), "build", example_rel_path]
-    # TODO: Add compiler selection flag to build.py when needed
-
+    # Build with the selected compiler (build.py gained --compiler ritz1 in Phase I)
+    cmd = [sys.executable, str(build_py), "build", example_rel_path,
+           "--compiler", compiler]
     result = subprocess.run(
-        cmd,
-        env=env,
-        capture_output=True,
-        text=True,
-        cwd=PROJECTS_DIR / "ritz"
+        cmd, env=env, capture_output=True, text=True,
+        cwd=PROJECTS_DIR / "ritz",
     )
     return result.returncode == 0
 
 
-def cmd_compare(args):
-    """Handle 'rz compare' command - compare ritz0 vs ritz1 on examples."""
-    import tempfile
+def test_example_with_build_py(example_rel_path, compiler="ritz0"):
+    """Run an example's `[[test]]` suite (if any), re-building with `compiler`.
 
+    Returns:
+        "ok"   — tests exist and all passed
+        "fail" — tests exist and at least one failed
+        "none" — no tests defined (no test/ dir, no test.sh)
+    """
+    env = os.environ.copy()
+    env["RITZ_PATH"] = str(PROJECTS_DIR / "ritz")
+
+    example_dir = PROJECTS_DIR / "ritz" / example_rel_path
+    has_test_dir = (example_dir / "test").is_dir()
+    has_test_sh = (example_dir / "test.sh").is_file()
+    if not has_test_dir and not has_test_sh:
+        return "none"
+
+    build_py = PROJECTS_DIR / "ritz" / "build.py"
+    # `build.py test` builds the binary first (needed for integration tests)
+    # then runs ritz0 --test on test/*.ritz and bash ./test.sh.
+    cmd = [sys.executable, str(build_py), "test", example_rel_path,
+           "--compiler", compiler]
+    result = subprocess.run(
+        cmd, env=env, capture_output=True, text=True,
+        cwd=PROJECTS_DIR / "ritz",
+    )
+    return "ok" if result.returncode == 0 else "fail"
+
+
+def cmd_compare(args):
+    """Handle 'rz compare' command — ritz0 vs ritz1 build + test dashboard.
+
+    Shows four columns per example:
+        build-r0   build-r1   tests-r0   tests-r1
+    Every cell routes through projects/ritz/build.py so the measurement
+    matches how the user actually builds/tests. ritz1 is now a first-class
+    --compiler in build.py (Phase I) so both columns have teeth.
+    """
     examples_dir = PROJECTS_DIR / "ritz" / "examples"
     tier = args.tier or "tier1"
 
-    # Map tier names
     tier_dirs = {
         "tier1": "tier1_basics",
         "tier2": "tier2_stdlib",
@@ -394,87 +485,85 @@ def cmd_compare(args):
         print(f"Error: Tier directory not found: {tier_path}")
         return 1
 
-    print(f"Comparing ritz0 vs ritz1 on {tier} examples")
-    print("=" * 70)
-    print(f"{'Example':<25} {'ritz0':<15} {'ritz1':<15} {'Match':<10}")
-    print("-" * 70)
+    skip_tests = getattr(args, "skip_tests", False)
 
-    results = {"ritz0_only": [], "ritz1_only": [], "both": [], "neither": []}
+    print(f"Comparing ritz0 vs ritz1 on {tier} examples (builds + tests)")
+    print("=" * 84)
+    header_fmt = "{:<22} {:<10} {:<10} {:<10} {:<10} {:<10}"
+    row_fmt    = "{:<22} {:<10} {:<10} {:<10} {:<10} {:<10}"
+    print(header_fmt.format("Example", "build-r0", "build-r1", "test-r0", "test-r1", "match"))
+    print("-" * 84)
 
-    # Determine whether to use simple (single-file) or full (multi-file) builds
-    # tier1 has no external dependencies, can use simple build
-    # tier2+ have ritzlib dependencies, need full build
-    use_full_build = tier in ("tier2", "tier3", "tier4", "tier5")
+    totals = {
+        "b0": 0, "b1": 0, "t0_ok": 0, "t0_fail": 0, "t1_ok": 0, "t1_fail": 0,
+        "both_build": 0, "both_test_pass": 0, "count": 0,
+    }
 
     for example_dir in sorted(tier_path.iterdir()):
         if not example_dir.is_dir():
             continue
-
-        src = example_dir / "src" / "main.ritz"
-        if not src.exists():
+        if not (example_dir / "src" / "main.ritz").exists():
             continue
 
         name = example_dir.name
+        example_rel = f"examples/{tier_dirs[tier]}/{name}"
+        totals["count"] += 1
 
-        if use_full_build:
-            # Use build.py for multi-file builds
-            example_rel = f"examples/{tier_dirs[tier]}/{name}"
+        # Builds
+        b0 = build_example_with_build_py(example_rel, "ritz0")
+        b1 = build_example_with_build_py(example_rel, "ritz1")
+        if b0: totals["b0"] += 1
+        if b1: totals["b1"] += 1
+        if b0 and b1: totals["both_build"] += 1
 
-            # Build with ritz0 (default)
-            r0_ok = build_example_with_build_py(example_rel, "ritz0")
-            r0_status = "✅ ok" if r0_ok else "❌ fail"
+        b0_str = "✅" if b0 else "❌"
+        b1_str = "✅" if b1 else "❌"
 
-            # For now, ritz1 isn't supported in build.py, so skip
-            # TODO: Add ritz1 support to build.py
-            r1_ok = False
-            r1_status = "❌ skip"
-
+        # Tests (only if the build worked — there's nothing to test otherwise)
+        if skip_tests:
+            t0_str, t1_str = "—", "—"
         else:
-            # Simple single-file build (tier1)
-            with tempfile.TemporaryDirectory() as tmpdir:
-                tmpdir = Path(tmpdir)
+            if b0:
+                t0 = test_example_with_build_py(example_rel, "ritz0")
+                t0_str = {"ok": "✅", "fail": "❌", "none": "—"}[t0]
+                if t0 == "ok":   totals["t0_ok"]   += 1
+                if t0 == "fail": totals["t0_fail"] += 1
+            else:
+                t0_str = "·"  # build failed → test not attempted
 
-                # Try ritz0
-                ll0 = tmpdir / "ritz0.ll"
-                bin0 = tmpdir / "ritz0_bin"
-                r0_compile = compile_with_ritz0(src, ll0)
-                r0_ok = link_llvm_ir(ll0, bin0) if r0_compile else False
-                r0_status = "✅ ok" if r0_ok else ("⚠️ link" if r0_compile else "❌ fail")
+            if b1:
+                t1 = test_example_with_build_py(example_rel, "ritz1")
+                t1_str = {"ok": "✅", "fail": "❌", "none": "—"}[t1]
+                if t1 == "ok":   totals["t1_ok"]   += 1
+                if t1 == "fail": totals["t1_fail"] += 1
+            else:
+                t1_str = "·"
 
-                # Try ritz1
-                ll1 = tmpdir / "ritz1.ll"
-                bin1 = tmpdir / "ritz1_bin"
-                r1_compile = compile_with_ritz1(src, ll1)
-                r1_ok = link_llvm_ir(ll1, bin1) if r1_compile else False
-                r1_status = "✅ ok" if r1_ok else ("⚠️ link" if r1_compile else "❌ fail")
-
-        # Determine match status
-        if r0_ok and r1_ok:
-            match = "✅ both"
-            results["both"].append(name)
-        elif r0_ok and not r1_ok:
+        # Cross-compiler match verdict
+        if b0 and b1:
+            if not skip_tests and t0_str == "✅" and t1_str == "✅":
+                totals["both_test_pass"] += 1
+                match = "✅ both"
+            else:
+                match = "🟡 build"
+        elif b0:
             match = "🔶 r0"
-            results["ritz0_only"].append(name)
-        elif r1_ok and not r0_ok:
+        elif b1:
             match = "🔷 r1"
-            results["ritz1_only"].append(name)
         else:
             match = "❌ none"
-            results["neither"].append(name)
 
-        print(f"{name:<25} {r0_status:<15} {r1_status:<15} {match:<10}")
+        print(row_fmt.format(name, b0_str, b1_str, t0_str, t1_str, match))
 
-    print("-" * 70)
-    print(f"\nSummary:")
-    print(f"  Both work:     {len(results['both'])} examples")
-    print(f"  ritz0 only:    {len(results['ritz0_only'])} examples")
-    print(f"  ritz1 only:    {len(results['ritz1_only'])} examples")
-    print(f"  Neither work:  {len(results['neither'])} examples")
-
-    total = sum(len(v) for v in results.values())
-    ritz1_pct = (len(results['both']) + len(results['ritz1_only'])) / total * 100 if total > 0 else 0
-    print(f"\n  ritz1 coverage: {ritz1_pct:.1f}%")
-
+    print("-" * 84)
+    n = totals["count"]
+    print(f"\nBuilds:  ritz0 {totals['b0']}/{n}    ritz1 {totals['b1']}/{n}    both {totals['both_build']}/{n}")
+    if not skip_tests:
+        print(f"Tests:   r0-pass {totals['t0_ok']}  r0-fail {totals['t0_fail']}    r1-pass {totals['t1_ok']}  r1-fail {totals['t1_fail']}")
+        print(f"Green (build+test on both): {totals['both_test_pass']}/{n}")
+    if n:
+        r1_pct = totals["b1"] / n * 100
+        print(f"\nritz1 build coverage: {r1_pct:.1f}%")
     return 0
 
 
@@ -515,6 +604,8 @@ def main():
     compare_parser = subparsers.add_parser("compare", help="Compare ritz0 vs ritz1 on examples")
     compare_parser.add_argument("tier", nargs="?", default="tier1",
                                help="Tier to compare (tier1, tier2, tier3, tier4, tier5)")
+    compare_parser.add_argument("--skip-tests", action="store_true",
+                               help="Only run builds, skip test execution (faster)")
 
     args = parser.parse_args()
 
