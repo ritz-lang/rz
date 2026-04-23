@@ -2728,7 +2728,7 @@ class LLVMEmitter:
             else:
                 # Emit drops before implicit return
                 self._emit_drop_for_all_scopes()
-                self.builder.ret(ir.Constant(ret_type, 0))
+                self.builder.ret(self._zero_constant(ret_type))
 
         return fn
 
@@ -2906,7 +2906,7 @@ class LLVMEmitter:
                 if ret_type == self.void:
                     self.builder.ret_void()
                 else:
-                    self.builder.ret(ir.Constant(ret_type, 0))
+                    self.builder.ret(self._zero_constant(ret_type))
             self.has_returned = True
             return True
 
@@ -5433,7 +5433,7 @@ class LLVMEmitter:
             if ret_type == self.void:
                 self.builder.ret_void()
             else:
-                self.builder.ret(ir.Constant(ret_type, 0))
+                self.builder.ret(self._zero_constant(ret_type))
         # Return an undefined value - this is never used since we returned
         return ir.Undefined
 
@@ -5856,11 +5856,12 @@ class LLVMEmitter:
 
             field_values[idx] = field_val
 
-        # Check that all fields are provided
+        # Zero-initialize any fields not provided in the struct literal
         for i, val in enumerate(field_values):
             if val is None:
-                field_name, _ = field_defs[i]
-                raise ValueError(f"Field {field_name} not provided in struct literal")
+                _, field_type = field_defs[i]
+                llvm_type = self._ritz_type_to_llvm(field_type)
+                field_values[i] = self._zero_constant(llvm_type)
 
         # Build struct using insert_value
         # Start with undef then insert each field
@@ -7348,6 +7349,18 @@ class LLVMEmitter:
             return self.builder.ptrtoint(val, self.i64)
         else:
             raise ValueError(f"Cannot convert {val.type} to i64")
+
+    def _zero_constant(self, llvm_type: ir.Type) -> ir.Constant:
+        """Create a zero/null constant for any LLVM type."""
+        if isinstance(llvm_type, ir.IntType):
+            return ir.Constant(llvm_type, 0)
+        elif isinstance(llvm_type, ir.PointerType):
+            return ir.Constant(llvm_type, None)
+        elif isinstance(llvm_type, (ir.FloatType, ir.DoubleType)):
+            return ir.Constant(llvm_type, 0.0)
+        else:
+            # Structs, arrays, etc. - use zeroinitializer
+            return ir.Constant(llvm_type, None)
 
     def _convert_type(self, val: ir.Value, target_type: ir.Type) -> ir.Value:
         """Convert a value to the target type if needed."""
