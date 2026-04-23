@@ -893,22 +893,46 @@ class LLVMEmitter:
 
         Creates an immutable global array that can be indexed.
         """
+        is_strview_array = (
+            isinstance(ritz_type, rast.ArrayType)
+            and isinstance(ritz_type.inner, rast.NamedType)
+            and ritz_type.inner.name == "StrView"
+        )
         # Get the LLVM array type
         llvm_type = self._ritz_type_to_llvm(ritz_type)
-        if not isinstance(llvm_type, ir.ArrayType):
-            raise ValueError(f"Const array '{name}' must have array type, got {llvm_type}")
-
-        elem_type = llvm_type.element
+        if is_strview_array:
+            # StrView may not be fully resolved yet when constants are emitted.
+            # Rebuild the array type explicitly as [N x StrView].
+            if "StrView" in self.struct_types:
+                strview_ty = self.struct_types["StrView"]
+            else:
+                strview_ty = ir.LiteralStructType([self.i8.as_pointer(), self.i64])
+            count = ritz_type.size if isinstance(ritz_type.size, int) else 0
+            llvm_type = ir.ArrayType(strview_ty, count)
+            elem_type = strview_ty
+        else:
+            if not isinstance(llvm_type, ir.ArrayType):
+                raise ValueError(f"Const array '{name}' must have array type, got {llvm_type}")
+            elem_type = llvm_type.element
 
         # Extract element values
         if isinstance(value, rast.ArrayLit):
             elements = []
             for elem in value.elements:
-                elem_val = self._extract_int_from_expr(elem)
-                elements.append(ir.Constant(elem_type, elem_val))
+                if isinstance(elem, rast.StringLit) and is_strview_array:
+                    elements.append(self._make_const_strview_value(elem.value, f"{name}.arr", elem_type))
+                elif isinstance(elem, rast.StructLit):
+                    elements.append(self._make_const_struct_value(elem, elem_type, f"{name}.arr"))
+                else:
+                    elem_val = self._extract_int_from_expr(elem)
+                    elements.append(ir.Constant(elem_type, elem_val))
         elif isinstance(value, rast.ArrayFill):
-            fill_val = self._extract_int_from_expr(value.value)
-            elements = [ir.Constant(elem_type, fill_val)] * value.count
+            if isinstance(value.value, rast.StringLit) and is_strview_array:
+                fill = self._make_const_strview_value(value.value.value, f"{name}.fill", elem_type)
+                elements = [fill] * value.count
+            else:
+                fill_val = self._extract_int_from_expr(value.value)
+                elements = [ir.Constant(elem_type, fill_val)] * value.count
         else:
             raise ValueError(f"Const array '{name}' must be array literal or fill")
 
@@ -925,6 +949,74 @@ class LLVMEmitter:
         # because they need to be addressed for indexing
         self.const_arrays[name] = (gvar, llvm_type)
         self.ritz_types[name] = ritz_type
+
+    def _const_value_from_expr(self, expr: rast.Expr, target_type: ir.Type, name_hint: str) -> ir.Constant:
+        """Build a compile-time constant value for globals/const arrays."""
+        if isinstance(expr, rast.IntLit):
+            return ir.Constant(target_type, expr.value)
+        if isinstance(expr, rast.UnaryOp) and expr.op == '-' and isinstance(expr.operand, rast.IntLit):
+            return ir.Constant(target_type, -expr.operand.value)
+        if isinstance(expr, rast.BoolLit):
+            return ir.Constant(target_type, 1 if expr.value else 0)
+        if isinstance(expr, rast.StringLit) and self._is_strview_llvm_type(target_type):
+            return self._make_const_strview_value(expr.value, name_hint, target_type)
+        if isinstance(expr, rast.StructLit):
+            return self._make_const_struct_value(expr, target_type, name_hint)
+        raise ValueError(f"Unsupported const expression for target {target_type}: {expr}")
+
+    def _make_const_struct_value(self, expr: rast.StructLit, target_type: ir.Type, name_hint: str) -> ir.Constant:
+        """Create an LLVM constant for a struct literal used in const contexts."""
+        if expr.name not in self.struct_fields:
+            raise ValueError(f"Unknown struct in const literal: {expr.name}")
+
+        field_exprs = {fname: fexpr for fname, fexpr in expr.fields}
+        field_types = self.struct_fields[expr.name]
+        field_constants = []
+        for field_name, field_ritz_type in field_types:
+            if field_name not in field_exprs:
+                raise ValueError(f"Missing field '{field_name}' in const struct literal {expr.name}")
+            field_llvm_type = self._ritz_type_to_llvm(field_ritz_type)
+            field_expr = field_exprs[field_name]
+            field_const = self._const_value_from_expr(field_expr, field_llvm_type, f"{name_hint}.{field_name}")
+            field_constants.append(field_const)
+
+        return ir.Constant(target_type, field_constants)
+
+    def _is_strview_llvm_type(self, ty: ir.Type) -> bool:
+        """Heuristic check for StrView-like LLVM struct: { *i8, i64 }."""
+        if not isinstance(ty, ir.BaseStructType):
+            return False
+        elements = ty.elements
+        if len(elements) != 2:
+            return False
+        ptr_ty, len_ty = elements
+        return (
+            isinstance(ptr_ty, ir.PointerType)
+            and ptr_ty.pointee == self.i8
+            and len_ty == self.i64
+        )
+
+    def _make_const_strview_value(self, value: str, name_hint: str, target_type: Optional[ir.Type] = None) -> ir.Constant:
+        """Create a constant StrView value and backing static string global."""
+        str_type = ir.ArrayType(self.i8, len(value) + 1)
+        str_bytes = bytearray(value, 'utf-8') + b'\x00'
+        str_const = ir.Constant(str_type, str_bytes)
+        gname = f".str.{name_hint}.{self.string_counter}"
+        self.string_counter += 1
+        str_gvar = ir.GlobalVariable(self.module, str_type, name=gname)
+        str_gvar.global_constant = True
+        str_gvar.initializer = str_const
+        str_gvar.linkage = "internal"
+
+        str_ptr = str_gvar.bitcast(self.i8.as_pointer())
+        if target_type is not None:
+            strview_ty = target_type
+        elif "StrView" in self.struct_types:
+            strview_ty = self.struct_types["StrView"]
+        else:
+            strview_ty = ir.LiteralStructType([self.i8.as_pointer(), self.i64])
+        length_const = ir.Constant(self.i64, len(value))
+        return ir.Constant(strview_ty, [str_ptr, length_const])
 
     def _extract_int_from_expr(self, expr: rast.Expr) -> int:
         """Extract an integer value from a constant expression."""
