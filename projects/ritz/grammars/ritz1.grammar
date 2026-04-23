@@ -63,15 +63,11 @@ EQ          = "=="
 NE          = "!="
 LE          = "<="
 GE          = ">="
-SHL         = "<<"
-SHR         = ">>"
 PLUS_EQ     = "+="
 MINUS_EQ    = "-="
 STAR_EQ     = "*="
 SLASH_EQ    = "/="
 DOTDOT      = ".."
-LBRACKET2   = "[["
-# Note: ]] is parsed as two RBRACKET tokens, not RBRACKET2, matching ritz0 behavior
 
 # Single-character operators
 PLUS        = "+"
@@ -130,35 +126,20 @@ module_init -> *Module
     : { module_new(p) }
     ;
 
-# Attributes: [[name = "value"]] or [[name]]
-# For bootstrap, we parse and skip them (conditional compilation handled later)
-attrs -> i32
-    : attr attrs { 0 }
-    | { 0 }
-    ;
-
-attr -> i32
-    : LBRACKET2 IDENT RBRACKET RBRACKET NEWLINE { 0 }
-    | LBRACKET2 IDENT ASSIGN STRING RBRACKET RBRACKET NEWLINE { 0 }
-    ;
-
 item
-    : attrs fn_def { module_add_fn(p.module, $2) }
-    | attrs extern_fn_def { module_add_fn(p.module, $2) }
-    | attrs struct_def { module_add_struct(p.module, $2) }
-    | attrs const_def { module_add_const(p.module, $2) }
-    | attrs global_var_def { module_add_global_var(p.module, $2) }
+    : fn_def { module_add_fn(p.module, $1) }
+    | extern_fn_def { module_add_fn(p.module, $1) }
+    | struct_def { module_add_struct(p.module, $1) }
+    | const_def { module_add_const(p.module, $1) }
+    | global_var_def { module_add_global_var(p.module, $1) }
     | import_stmt { module_add_import(p.module, $1) }
     | impl_block { module_add_impl(p.module, $1) }
     ;
 
 # Function definition (with optional generic params)
-# Supports both "fn name" and "pub fn name"
 fn_def -> *FnDef
     : FN IDENT generic_params? LPAREN params? RPAREN return_type? block
       { generic_fn_def_new(p, $2.start, $2.len, $3, $5, $7, $8, $1.line, $1.col) }
-    | PUB FN IDENT generic_params? LPAREN params? RPAREN return_type? block
-      { generic_fn_def_new(p, $3.start, $3.len, $4, $6, $8, $9, $1.line, $1.col) }
     ;
 
 # Extern function declaration (no body)
@@ -184,8 +165,6 @@ return_type -> i32
 struct_def -> *StructDef
     : STRUCT IDENT generic_params? NEWLINE INDENT struct_fields DEDENT
       { generic_struct_def_new(p, $2.start, $2.len, $3, $6, $1.line, $1.col) }
-    | PUB STRUCT IDENT generic_params? NEWLINE INDENT struct_fields DEDENT
-      { generic_struct_def_new(p, $3.start, $3.len, $4, $7, $1.line, $1.col) }
     ;
 
 struct_fields -> *StructField
@@ -202,8 +181,6 @@ struct_field -> *StructField
 const_def -> *ConstEntry
     : CONST IDENT COLON type_spec ASSIGN expr NEWLINE
       { const_new(p, $2.start, $2.len, $4, $6, $1.line, $1.col) }
-    | PUB CONST IDENT COLON type_spec ASSIGN expr NEWLINE
-      { const_new(p, $3.start, $3.len, $5, $7, $1.line, $1.col) }
     ;
 
 # Import statement
@@ -276,32 +253,25 @@ stmt -> *Stmt
     | expr_stmt
     ;
 
-# Control flow statements (while, for, break, continue)
+# Control flow statements (while, break, continue)
 control_stmt -> *Stmt
     : while_stmt
-    | for_stmt
     | break_stmt
     | continue_stmt
     ;
 
 let_stmt -> *Stmt
-    : LET IDENT COLON var_type ASSIGN expr NEWLINE
+    : LET IDENT COLON type_spec ASSIGN expr NEWLINE
       { stmt_var_decl(p, $2.start, $2.len, $4, $6, $1.line, $1.col) }
     | LET IDENT ASSIGN expr NEWLINE
       { stmt_var_decl(p, $2.start, $2.len, 0, $4, $1.line, $1.col) }
     ;
 
 var_stmt -> *Stmt
-    : VAR IDENT COLON var_type ASSIGN expr NEWLINE
+    : VAR IDENT COLON type_spec ASSIGN expr NEWLINE
       { stmt_var_decl(p, $2.start, $2.len, $4, $6, $1.line, $1.col) }
     | VAR IDENT COLON type_spec NEWLINE
       { stmt_var_decl(p, $2.start, $2.len, $4, 0 as *Expr, $1.line, $1.col) }
-    ;
-
-# Variable type - like type_spec but captures the type name for struct types
-# This prevents the type name from being clobbered when parsing the initializer expression
-var_type -> i32
-    : type_spec { capture_var_type(p, $1) }
     ;
 
 return_stmt -> *Stmt
@@ -322,11 +292,6 @@ while_stmt -> *Stmt
     : WHILE expr block { stmt_while(p, $2, $3, $1.line, $1.col) }
     ;
 
-for_stmt -> *Stmt
-    : FOR IDENT IN expr DOTDOT expr block
-      { stmt_for(p, $2.start, $2.len, $4, $6, $7, $1.line, $1.col) }
-    ;
-
 break_stmt -> *Stmt
     : BREAK NEWLINE { stmt_break(p, $1.line, $1.col) }
     ;
@@ -338,45 +303,20 @@ continue_stmt -> *Stmt
 assign_stmt -> *Stmt
     : IDENT ASSIGN expr NEWLINE
       { stmt_assign_name(p, $1.start, $1.len, $3, $1.line, $1.col) }
-    | IDENT compound_op expr NEWLINE
-      { stmt_compound_assign(p, $1.start, $1.len, $2, $3, $1.line, $1.col) }
     | IDENT LBRACKET expr RBRACKET ASSIGN expr NEWLINE
       { stmt_assign_index(p, $1.start, $1.len, $3, $6, $1.line, $1.col) }
-    | IDENT LBRACKET expr RBRACKET compound_op expr NEWLINE
-      { stmt_compound_assign_index(p, $1.start, $1.len, $3, $5, $6, $1.line, $1.col) }
     | STAR expr ASSIGN expr NEWLINE
       { stmt_assign_deref(p, $2, $4, $1.line, $1.col) }
-    | STAR expr compound_op expr NEWLINE
-      { stmt_compound_assign_deref(p, $2, $3, $4, $1.line, $1.col) }
     | LPAREN STAR expr RPAREN DOT IDENT ASSIGN expr NEWLINE
       { stmt_assign_member(p, $3, $6.start, $6.len, $8, $1.line, $1.col) }
-    | LPAREN STAR expr RPAREN DOT IDENT compound_op expr NEWLINE
-      { stmt_compound_assign_member(p, $3, $6.start, $6.len, $7, $8, $1.line, $1.col) }
     | LPAREN STAR expr RPAREN DOT IDENT LBRACKET expr RBRACKET ASSIGN expr NEWLINE
       { stmt_assign_member_index(p, $3, $6.start, $6.len, $8, $11, $1.line, $1.col) }
-    | LPAREN STAR expr RPAREN DOT IDENT LBRACKET expr RBRACKET compound_op expr NEWLINE
-      { stmt_compound_assign_member_index(p, $3, $6.start, $6.len, $8, $10, $11, $1.line, $1.col) }
     | IDENT DOT IDENT LBRACKET expr RBRACKET ASSIGN expr NEWLINE
       { stmt_assign_local_field_index(p, $1.start, $1.len, $3.start, $3.len, $5, $8, $1.line, $1.col) }
-    | IDENT DOT IDENT LBRACKET expr RBRACKET compound_op expr NEWLINE
-      { stmt_compound_assign_local_field_index(p, $1.start, $1.len, $3.start, $3.len, $5, $7, $8, $1.line, $1.col) }
     | IDENT DOT IDENT ASSIGN expr NEWLINE
       { stmt_assign_local_field(p, $1.start, $1.len, $3.start, $3.len, $5, $1.line, $1.col) }
-    | IDENT DOT IDENT compound_op expr NEWLINE
-      { stmt_compound_assign_local_field(p, $1.start, $1.len, $3.start, $3.len, $4, $5, $1.line, $1.col) }
     | postfix_expr ASSIGN expr NEWLINE
       { stmt_assign_expr(p, $1, $3, $1.span.line, $1.span.col) }
-    | postfix_expr compound_op expr NEWLINE
-      { stmt_compound_assign_expr(p, $1, $2, $3, $1.span.line, $1.span.col) }
-    ;
-
-# Compound assignment operators: +=, -=, *=, /=
-# Returns the operation type (OP_ADD, OP_SUB, etc.)
-compound_op -> i32
-    : PLUS_EQ { OP_ADD }
-    | MINUS_EQ { OP_SUB }
-    | STAR_EQ { OP_MUL }
-    | SLASH_EQ { OP_DIV }
     ;
 
 expr_stmt -> *Stmt
@@ -438,27 +378,16 @@ bit_and_tail -> *BinaryOp
     ;
 
 cmp_expr -> *Expr
-    : shift_expr cmp_tail { apply_binary_opt_p(p, $1, $2) }
+    : add_expr cmp_tail { apply_binary_opt_p(p, $1, $2) }
     ;
 
 cmp_tail -> *BinaryOp
-    : EQ shift_expr { binary_op_new(p, OP_EQ, $2, 0 as *BinaryOp) }
-    | NE shift_expr { binary_op_new(p, OP_NE, $2, 0 as *BinaryOp) }
-    | LT shift_expr { binary_op_new(p, OP_LT, $2, 0 as *BinaryOp) }
-    | LE shift_expr { binary_op_new(p, OP_LE, $2, 0 as *BinaryOp) }
-    | GT shift_expr { binary_op_new(p, OP_GT, $2, 0 as *BinaryOp) }
-    | GE shift_expr { binary_op_new(p, OP_GE, $2, 0 as *BinaryOp) }
-    | { 0 as *BinaryOp }
-    ;
-
-# Shift expressions (higher precedence than comparison, lower than addition)
-shift_expr -> *Expr
-    : add_expr shift_tail { apply_binary_opt_p(p, $1, $2) }
-    ;
-
-shift_tail -> *BinaryOp
-    : SHL add_expr shift_tail { binary_op_new(p, OP_SHL, $2, $3) }
-    | SHR add_expr shift_tail { binary_op_new(p, OP_SHR, $2, $3) }
+    : EQ add_expr { binary_op_new(p, OP_EQ, $2, 0 as *BinaryOp) }
+    | NE add_expr { binary_op_new(p, OP_NE, $2, 0 as *BinaryOp) }
+    | LT add_expr { binary_op_new(p, OP_LT, $2, 0 as *BinaryOp) }
+    | LE add_expr { binary_op_new(p, OP_LE, $2, 0 as *BinaryOp) }
+    | GT add_expr { binary_op_new(p, OP_GT, $2, 0 as *BinaryOp) }
+    | GE add_expr { binary_op_new(p, OP_GE, $2, 0 as *BinaryOp) }
     | { 0 as *BinaryOp }
     ;
 
@@ -495,17 +424,17 @@ cast_tail -> *CastTail
     ;
 
 unary_expr -> *Expr
-    : MINUS unary_expr { expr_unary(p, OP_NEG, $2, $1.line, $1.col) }
-    | NOT unary_expr { expr_unary(p, OP_NOT, $2, $1.line, $1.col) }
-    | TILDE unary_expr { expr_unary(p, OP_BIT_NOT, $2, $1.line, $1.col) }
-    | STAR unary_expr { expr_unary(p, OP_DEREF, $2, $1.line, $1.col) }
+    : MINUS unary_expr { expr_unary(p, UOP_NEG, $2, $1.line, $1.col) }
+    | NOT unary_expr { expr_unary(p, UOP_NOT, $2, $1.line, $1.col) }
+    | TILDE unary_expr { expr_unary(p, UOP_BIT_NOT, $2, $1.line, $1.col) }
+    | STAR unary_expr { expr_unary(p, UOP_DEREF, $2, $1.line, $1.col) }
     | addr_expr { $1 }
     ;
 
 # Address-of binds tighter than cast, so @ts as *i64 is (@ts) as *i64
 addr_expr -> *Expr
-    : AT AMP addr_expr { expr_unary(p, OP_ADDR_MUT, $3, $1.line, $1.col) }
-    | AT addr_expr { expr_unary(p, OP_ADDR, $2, $1.line, $1.col) }
+    : AT AMP addr_expr { expr_unary(p, UOP_ADDR_MUT, $3, $1.line, $1.col) }
+    | AT addr_expr { expr_unary(p, UOP_ADDR, $2, $1.line, $1.col) }
     | postfix_expr { $1 }
     ;
 
@@ -535,7 +464,6 @@ primary_expr -> *Expr
     | STRING { expr_string(p, $1) }
     | CHAR { expr_char(p, $1) }
     | NIL { expr_nil(p, $1.line, $1.col) }
-    | NULL { expr_nil(p, $1.line, $1.col) }
     | IDENT LT type_spec GT struct_lit { generic_struct_lit(p, $1, $3, $5) }
     | IDENT struct_lit? { ident_or_struct(p, $1, $2) }
     | LPAREN expr RPAREN { $2 }

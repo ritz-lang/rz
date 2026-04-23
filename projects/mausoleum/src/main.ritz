@@ -23,16 +23,16 @@ import ritzlib.strview
 import ritzlib.memory
 import ritzlib.net
 
-import mausoleum.m7m_types
-import mausoleum.page
-import mausoleum.buffer_pool
-import mausoleum.storage
-import mausoleum.collection
-import mausoleum.document
-import mausoleum.server
-import mausoleum.client
-import mausoleum.protocol
-import mausoleum.encrypted_channel
+import lib.m7m_types
+import lib.page
+import lib.buffer_pool
+import lib.storage
+import lib.collection
+import lib.document
+import lib.server
+import lib.client
+import lib.protocol
+import lib.encrypted_channel
 
 # ============================================================================
 # Constants
@@ -247,29 +247,39 @@ fn cmd_serve(port: i32, data_dir: *u8, no_encryption: i32) -> i32
 
     if data_dir != null
         # Persistent mode - use storage engine
-        let storage_opt = storage_open(data_dir)
-        if option_is_none<*Storage>(@storage_opt) == 1
+        storage = storage_open(data_dir)
+        if storage == null
             prints("Error: Failed to open storage at ")
             prints_cstr(data_dir)
             prints("\n")
             return 1
-        storage = option_unwrap_or<*Storage>(@storage_opt, null)
         pool = storage_pool(storage)
         prints("Opened persistent storage.\n")
     else
         # In-memory mode
-        let pool_opt = buffer_pool_new(POOL_SIZE)
-        if option_is_none<*BufferPool>(@pool_opt) == 1
+        pool = buffer_pool_new(POOL_SIZE)
+        if pool == null
             prints("Error: Failed to allocate buffer pool\n")
             return 1
-        pool = option_unwrap_or<*BufferPool>(@pool_opt, null)
 
     # Create or load collection
     var collection: Collection
     var col_result: i32 = ERR_OK
 
-    # TODO: Implement collection persistence - for now always create new
-    col_result = collection_init(@collection, pool, 1)
+    if storage != null and storage_has_collection(storage) != 0
+        # Load existing collection from storage
+        let root_id: i64 = storage_root_page_id(storage)
+        let next_seq: i32 = storage_next_sequence(storage)
+        let count: i64 = storage_doc_count(storage)
+        prints("Loading existing collection (root_page_id=")
+        print_i64(root_id)
+        prints(", docs=")
+        print_i64(count)
+        prints(")...\n")
+        col_result = collection_load(@collection, pool, 1, root_id, next_seq, count)
+    else
+        # Create new collection
+        col_result = collection_init(@collection, pool, 1)
 
     if col_result < 0
         prints("Error: Failed to create/load collection\n")
@@ -667,31 +677,86 @@ fn handle_delete(reader: *MessageReader, resp: *MessageBuffer, request_id: i32, 
     build_delete_ok(resp, request_id)
 
 # Handle SCAN message - returns all documents in the collection
-# TODO: Implement collection scan iteration
-# For now, returns empty result and immediately sends SCAN_END
+# Payload: [max_results: i32] (0 = all)
+# Response is sent directly to fd, resp buffer is not used (since we may have many docs)
 fn handle_scan(reader: *MessageReader, resp: *MessageBuffer, request_id: i32, collection: *Collection, fd: i32)
     # Read max_results (0 = all)
     let max_results: i32 = msgreader_read_i32(reader)
 
     prints("  SCAN max_results=")
     print_i32(max_results)
-    prints(" (not implemented - returning empty)\n")
+    prints("\n")
 
-    # Build SCAN_RESULT with 0 documents
-    var scan_buf: [256]u8
+    # Create iterator to scan all documents
+    let iter: *CollectionIter = collection_scan(collection)
+    if iter == null
+        build_error(resp, request_id, PROTO_ERR_INTERNAL, "Failed to create scan iterator")
+        return
+
+    # Count documents first (needed for response header)
+    var doc_count: i32 = 0
+    var max_count: i32 = max_results
+    if max_count == 0
+        max_count = 10000  # Reasonable limit
+
+    # Build response in a larger buffer
+    var scan_buf: [65536]u8  # 64KB for scan results
     var scan_resp: MessageBuffer
-    msgbuf_init(@scan_resp, @scan_buf[0], 256)
+    msgbuf_init(@scan_resp, @scan_buf[0], 65536)
 
+    # Start SCAN_RESULT message
     msgbuf_start(@scan_resp, MSG_SCAN_RESULT, request_id)
-    msgbuf_write_i32(@scan_resp, 0)  # doc_count = 0
-    msgbuf_write_i32(@scan_resp, 0)  # has_more = 0
+
+    # Reserve space for doc_count and has_more (we'll fill in later)
+    let count_offset: i32 = msgbuf_len(@scan_resp)
+    msgbuf_write_i32(@scan_resp, 0)  # Placeholder for doc_count
+    msgbuf_write_i32(@scan_resp, 0)  # Placeholder for has_more
+
+    # Iterate and serialize documents
+    while collection_iter_valid(iter) != 0 and doc_count < max_count
+        var doc: Document
+        let get_result: i32 = collection_iter_get(iter, @doc)
+        if get_result == ERR_OK
+            # Serialize document
+            var doc_buf: [2048]u8
+            let doc_size: i64 = doc_serialize(@doc, @doc_buf[0], 2048)
+            if doc_size > 0
+                # Write doc_id + doc_len + doc_data
+                msgbuf_write_i64(@scan_resp, doc.id.value)
+                msgbuf_write_i32(@scan_resp, doc_size as i32)
+                msgbuf_write_bytes(@scan_resp, @doc_buf[0], doc_size as i32)
+                doc_count += 1
+
+        collection_iter_next(iter)
+
+    # Check if there are more
+    let has_more: i32 = collection_iter_valid(iter)
+
+    collection_iter_destroy(iter)
+
+    # Go back and fill in the count and has_more (big-endian)
+    var data: *u8 = msgbuf_data(@scan_resp)
+    var ptr: *u8 = data + count_offset
+    # Write doc_count as big-endian i32
+    *(ptr + 0) = ((doc_count >> 24) & 0xFF) as u8
+    *(ptr + 1) = ((doc_count >> 16) & 0xFF) as u8
+    *(ptr + 2) = ((doc_count >> 8) & 0xFF) as u8
+    *(ptr + 3) = (doc_count & 0xFF) as u8
+    # Write has_more as big-endian i32
+    *(ptr + 4) = ((has_more >> 24) & 0xFF) as u8
+    *(ptr + 5) = ((has_more >> 16) & 0xFF) as u8
+    *(ptr + 6) = ((has_more >> 8) & 0xFF) as u8
+    *(ptr + 7) = (has_more & 0xFF) as u8
+
+    # Finish and send
     msgbuf_finish(@scan_resp)
+
+    prints("  SCAN returned ")
+    print_i32(doc_count)
+    prints(" documents\n")
 
     let scan_len: i32 = msgbuf_len(@scan_resp)
     sys_write(fd, msgbuf_data(@scan_resp), scan_len as i64)
-
-    # Send SCAN_END
-    build_scan_end(resp, request_id)
 
 # ============================================================================
 # Plain (Unencrypted) Server Loop - Development Mode

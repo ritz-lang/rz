@@ -738,8 +738,7 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
     if source_roots:
         cmd.extend(["--sources", json.dumps(source_roots)])
 
-    # Pass environment including RITZ_PATH for import resolution
-    result = subprocess.run(cmd, capture_output=True, text=True, env=os.environ)
+    result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         print(f"  ✗ import resolution failed: {result.stderr}", file=sys.stderr)
         return None
@@ -861,9 +860,6 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
         # Use -g to preserve DWARF debug info, -nostdlib for bare-metal
         # Debug: print number of files to link
         print(f"  ⚡ Linking {len(link_files)} object files...")
-        if os.environ.get("RITZ_DEBUG"):
-            for lf in link_files:
-                print(f"    - {lf}")
         # Try clang first, fall back to gcc
         linker_cmd = None
         linker_name = None
@@ -882,8 +878,7 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
 
         # Link: runtime.o + all .bc/.ll files -> binary
         # Build link command with profile-specific options
-        # -march=native enables CPU-specific features (SHA-NI, AES-NI, etc.) for code generation
-        link_cmd = linker_cmd + [str(runtime_obj)] + [str(f) for f in link_files] + ["-o", str(bin_path), "-nostdlib", "-march=native"]
+        link_cmd = linker_cmd + [str(runtime_obj)] + [str(f) for f in link_files] + ["-o", str(bin_path), "-nostdlib"]
 
         # Add optimization level
         opt_level = profile.get("opt_level", 0)
@@ -900,7 +895,6 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
         # Debug: print link command
         if os.environ.get("RITZ_DEBUG"):
             print(f"  [DEBUG] Link cmd: {' '.join(link_cmd[:5])}... ({len(link_files)} files)")
-            print(f"  [DEBUG] Full command: {' '.join(link_cmd)}")
 
         result = subprocess.run(link_cmd, capture_output=True, text=True)
         if result.returncode != 0:
@@ -910,10 +904,7 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
         return bin_path
     finally:
         # Clean up temp directory if not keeping artifacts
-        # Disable cleanup temporarily for debugging
-        if os.environ.get("RITZ_KEEP_TEMP"):
-            print(f"  [DEBUG] Keeping temp dir: {artifact_dir}")
-        elif not keep_artifacts and artifact_dir.exists():
+        if not keep_artifacts and artifact_dir.exists():
             import shutil
             shutil.rmtree(artifact_dir, ignore_errors=True)
 
@@ -1082,7 +1073,6 @@ def compile_freestanding_binary(
                 clang_cmd = [
                     "clang", "-c",
                     f"--target={target}",
-                    "-march=native",  # Enable CPU-specific features (SHA-NI, AES-NI, etc.)
                 ]
                 # Add PIC flag if explicitly requested or for Linux targets
                 if pic or target.endswith("-linux"):

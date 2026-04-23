@@ -265,7 +265,7 @@ fi
 # NOTE: Using 256M because UEFI bootloader only identity maps first 256MB.
 # With more RAM, UEFI may allocate kernel buffers above 256MB which aren't mapped.
 # TODO: Fix bootloader to dynamically map memory where kernel is loaded.
-# VirtIO block, network, and input devices for driver testing (matching BIOS test)
+# VirtIO block and network devices for driver testing (matching BIOS test)
 QEMU_CMD="qemu-system-x86_64 \
     -drive if=pflash,format=raw,readonly=on,file=$OVMF_CODE \
     -drive format=raw,file=$TMPDIR/disk.img \
@@ -275,8 +275,6 @@ QEMU_CMD="qemu-system-x86_64 \
     -drive file=$STORAGE,format=qcow2,if=none,id=storage \
     -device virtio-net-pci,netdev=net0 \
     -netdev user,id=net0 \
-    -device virtio-keyboard-pci \
-    -device virtio-mouse-pci \
     -serial file:$SERIAL_LOG \
     $DISPLAY_OPT \
     -smp 4 \

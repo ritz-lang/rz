@@ -42,7 +42,6 @@ def create_initramfs(bin_dir: Path, output: Path, extra_files: dict = None):
             print("  Adding directories...")
             add_dir("./etc")
             add_dir("./bin")
-            add_dir("./tmp")
 
             # Add /etc files
             print("  Adding /etc...")

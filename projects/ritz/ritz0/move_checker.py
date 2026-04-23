@@ -47,6 +47,9 @@ class VarInfo:
     move_span: Optional[rast.Span] = None
     # Active borrows (borrow location -> is_mutable)
     borrows: List[Tuple[rast.Span, bool]] = field(default_factory=list)
+    # Borrow semantics for parameters (CONST/MUTABLE/MOVE)
+    # If set, this parameter is a borrow and is effectively Copy
+    borrow: Optional[rast.Borrow] = None
 
 
 @dataclass
@@ -63,9 +66,9 @@ class Scope:
             return self.parent.lookup(name)
         return None
 
-    def define(self, name: str, ritz_type: rast.Type, span: Optional[rast.Span] = None):
+    def define(self, name: str, ritz_type: rast.Type, span: Optional[rast.Span] = None, borrow: Optional[rast.Borrow] = None):
         """Define a new variable in this scope."""
-        self.vars[name] = VarInfo(name, ritz_type, VarState.OWNED, span)
+        self.vars[name] = VarInfo(name, ritz_type, VarState.OWNED, span, borrow=borrow)
 
     def save_states(self) -> Dict[str, Tuple[VarState, Optional[rast.Span]]]:
         """Save variable states (for control flow analysis)."""
@@ -103,10 +106,14 @@ class MoveChecker:
     # Types that are Copy (don't move, they copy)
     COPY_TYPES = {
         'i8', 'i16', 'i32', 'i64', 'u8', 'u16', 'u32', 'u64', 'bool', 'f32', 'f64',
+        'usize', 'isize',
         # SIMD vector types are trivially copyable (SSE2 128-bit = 16 bytes)
         'v2i64', 'v4i32', 'v8i16', 'v16i8',
         # AVX2 256-bit vectors (32 bytes, still trivially copyable)
         'v4i64', 'v8i32', 'v16i16', 'v32i8',
+        # Small structs with only Copy fields are Copy
+        # TODO: Implement proper Copy trait checking
+        'Point2D', 'Bounds', 'BoundsRect',  # Geometry types
     }
 
     def __init__(self):
@@ -231,6 +238,34 @@ class MoveChecker:
                     return self.fn_return_types[fn_name]
             # Unknown function or no return type
             return rast.NamedType(expr.span, 'unknown', [])
+        elif isinstance(expr, rast.TryOp):
+            # TryOp (?) unwraps Result<T, E> to T or Option<T> to T
+            # Infer the inner type from the expression's Result/Option
+            inner = self._infer_expr_type(expr.expr)
+            if isinstance(inner, rast.NamedType) and inner.name in ('Result', 'Option'):
+                # The ok/some type is the first type argument
+                if inner.args:
+                    return inner.args[0]
+            # Fallback: return unknown (could be any type)
+            return rast.NamedType(expr.span, 'unknown', [])
+        elif isinstance(expr, rast.MethodCall):
+            # Method calls - try to find the return type
+            # For now, check if method name suggests a primitive return type
+            method = expr.method
+            # Common methods that return Copy types
+            if method in ('len', 'cap', 'count', 'size', 'is_empty', 'is_some', 'is_none',
+                          'is_ok', 'is_err', 'contains', 'unwrap_or'):
+                # These typically return usize, i64, or bool - all Copy
+                return rast.NamedType(expr.span, 'i64', [])
+            # read_* methods return Result<primitive>
+            if method.startswith('read_'):
+                type_suffix = method[5:]  # e.g., "u16", "u32", "i8", etc.
+                if type_suffix in self.COPY_TYPES:
+                    return rast.NamedType(expr.span, 'Result', [
+                        rast.NamedType(expr.span, type_suffix, [])
+                    ])
+            # Fallback to unknown
+            return rast.NamedType(expr.span, 'unknown', [])
         # Default to unknown
         return rast.NamedType(expr.span, 'unknown', [])
 
@@ -280,8 +315,10 @@ class MoveChecker:
         self._push_scope()
 
         # Parameters are owned at function start
+        # For borrow semantics tracking, we need to store the borrow kind
+        # along with the type so _is_copy_type can know if it's a reference
         for param in fn.params:
-            self.scope.define(param.name, param.type, param.span)
+            self.scope.define(param.name, param.type, param.span, borrow=param.borrow)
 
         # Check function body (which is a Block)
         self._check_block(fn.body)
@@ -400,7 +437,10 @@ class MoveChecker:
                     return
 
                 # If this is a move context and type is not Copy, mark as moved
-                if is_move_context and not self._is_copy_type(var_info.ritz_type):
+                # Borrow parameters (CONST or MUTABLE) are effectively Copy since
+                # they're references that can be passed multiple times
+                is_borrow_param = var_info.borrow in (rast.Borrow.CONST, rast.Borrow.MUTABLE)
+                if is_move_context and not is_borrow_param and not self._is_copy_type(var_info.ritz_type):
                     var_info.state = VarState.MOVED
                     var_info.move_span = expr.span
 

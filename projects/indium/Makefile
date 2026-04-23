@@ -107,8 +107,6 @@ run-iso: iso $(INITRAMFS) $(STORAGE)
 		-drive file=$(STORAGE),format=qcow2,if=none,id=storage \
 		-device virtio-net-pci,netdev=net0 \
 		-netdev user,id=net0 \
-		-device virtio-keyboard-pci \
-		-device virtio-mouse-pci \
 		-m 4G \
 		-smp 4 \
 		-serial mon:stdio \
@@ -126,8 +124,6 @@ run-uefi: $(UEFI_DISK) $(INITRAMFS) $(STORAGE)
 		-drive file=$(STORAGE),format=qcow2,if=none,id=storage \
 		-device virtio-net-pci,netdev=net0 \
 		-netdev user,id=net0 \
-		-device virtio-keyboard-pci \
-		-device virtio-mouse-pci \
 		-m 256M \
 		-smp 4 \
 		-serial mon:stdio \

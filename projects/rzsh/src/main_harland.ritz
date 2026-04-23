@@ -19,112 +19,6 @@ import ritzlib.sys {
 
 import ritzlib.str { strlen, strcmp }
 
-# File operations (Harland syscalls)
-const SYS_OPEN: i64 = 2
-const SYS_CLOSE: i64 = 3
-
-const O_RDONLY: i32 = 0
-const O_WRONLY: i32 = 1
-const O_RDWR: i32 = 2
-const O_CREAT: i32 = 64
-const O_TRUNC: i32 = 512
-const O_APPEND: i32 = 1024
-
-extern fn syscall1(n: i64, a1: i64) -> i64
-extern fn syscall3(n: i64, a1: i64, a2: i64, a3: i64) -> i64
-
-fn sys_open(path: *u8, flags: i32) -> i32
-    let path_len: i64 = strlen(path)
-    return syscall3(SYS_OPEN, path as i64, path_len, flags as i64) as i32
-
-fn sys_close(fd: i32) -> i32
-    return syscall1(SYS_CLOSE, fd as i64) as i32
-
-# Redirection state
-var g_redirect_out: bool = false
-var g_redirect_append: bool = false
-var g_redirect_file: [256]u8
-var g_saved_stdout: i32 = -1
-
-# ============================================================================
-# Redirection Helpers
-# ============================================================================
-
-# Parse redirection from command line
-# Looks for > or >> and extracts filename
-# Returns the new argc (excluding redirection args)
-fn parse_redirection(argc: i32) -> i32
-    g_redirect_out = false
-    g_redirect_append = false
-
-    var i: i32 = 0
-    while i < argc
-        let arg: *u8 = g_argv[i]
-
-        # Check for >> (append)
-        if *arg == 62 and *(arg + 1) == 62
-            g_redirect_out = true
-            g_redirect_append = true
-            # Next arg should be the filename
-            if i + 1 < argc
-                let file: *u8 = g_argv[i + 1]
-                var j: i64 = 0
-                while *(file + j) != 0 and j < 255
-                    g_redirect_file[j] = *(file + j)
-                    j = j + 1
-                g_redirect_file[j] = 0
-            return i  # Return argc up to the redirect
-
-        # Check for > (truncate)
-        if *arg == 62 and *(arg + 1) == 0
-            g_redirect_out = true
-            g_redirect_append = false
-            # Next arg should be the filename
-            if i + 1 < argc
-                let file: *u8 = g_argv[i + 1]
-                var j: i64 = 0
-                while *(file + j) != 0 and j < 255
-                    g_redirect_file[j] = *(file + j)
-                    j = j + 1
-                g_redirect_file[j] = 0
-            return i  # Return argc up to the redirect
-
-        i = i + 1
-
-    return argc  # No redirection found
-
-# Open redirect file and return fd (or -1 on error)
-fn open_redirect_file() -> i32
-    var flags: i32 = O_WRONLY | O_CREAT
-    if g_redirect_append
-        flags = flags | O_APPEND
-    else
-        flags = flags | O_TRUNC
-
-    return sys_open(@g_redirect_file[0], flags)
-
-# Write to file descriptor
-fn fd_puts(fd: i32, s: *u8) -> i64
-    return sys_write(fd, s, strlen(s))
-
-fn fd_println(fd: i32, s: *u8) -> i64
-    fd_puts(fd, s)
-    var newline: u8 = 10
-    return sys_write(fd, @newline, 1)
-
-# Echo command that can redirect to a file
-fn cmd_echo_redirect(argc: i32, fd: i32) -> i32
-    var i: i32 = 1
-    while i < argc
-        if i > 1
-            var space: u8 = 32
-            sys_write(fd, @space, 1)
-        fd_puts(fd, g_argv[i])
-        i = i + 1
-    var newline: u8 = 10
-    sys_write(fd, @newline, 1)
-    return 0
-
 # ============================================================================
 # ls command (Harland)
 # ============================================================================
@@ -210,49 +104,31 @@ fn process_line() -> i32
 
     g_line_buffer[g_line_pos as i32] = 0
 
-    let raw_argc: i32 = parse_args(@g_line_buffer[0])
-    if raw_argc == 0
+    let argc: i32 = parse_args(@g_line_buffer[0])
+    if argc == 0
         return 0
 
-    # Parse redirection (>, >>)
-    let argc: i32 = parse_redirection(raw_argc)
-
-    # Open redirect file if needed
-    var redirect_fd: i32 = -1
-    if g_redirect_out
-        redirect_fd = open_redirect_file()
-        if redirect_fd < 0
-            puts(c"rzsh: cannot open file: ")
-            println(@g_redirect_file[0])
-            return 1
-
     let cmd: *u8 = g_argv[0]
-    var result: i32 = 0
 
     if strcmp(cmd, c"help") == 0
-        result = cmd_help()
-    else if strcmp(cmd, c"exit") == 0
-        result = cmd_exit(argc)
-    else if strcmp(cmd, c"pid") == 0
-        result = cmd_pid()
-    else if strcmp(cmd, c"echo") == 0
-        # Use redirect-aware echo if redirecting
-        if redirect_fd >= 0
-            result = cmd_echo_redirect(argc, redirect_fd)
-        else
-            result = cmd_echo(argc)
-    else if strcmp(cmd, c"ls") == 0
-        result = cmd_ls(argc)
-    else if strcmp(cmd, c"clear") == 0
-        result = cmd_clear()
-    else
-        result = exec_external(argc)
+        return cmd_help()
 
-    # Close redirect file
-    if redirect_fd >= 0
-        sys_close(redirect_fd)
+    if strcmp(cmd, c"exit") == 0
+        return cmd_exit(argc)
 
-    return result
+    if strcmp(cmd, c"pid") == 0
+        return cmd_pid()
+
+    if strcmp(cmd, c"echo") == 0
+        return cmd_echo(argc)
+
+    if strcmp(cmd, c"ls") == 0
+        return cmd_ls(argc)
+
+    if strcmp(cmd, c"clear") == 0
+        return cmd_clear()
+
+    return exec_external(argc)
 
 # ============================================================================
 # Main

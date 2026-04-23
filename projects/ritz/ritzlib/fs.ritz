@@ -387,7 +387,7 @@ pub fn file_size_string(path: *String) -> Result<i64, i32>
 # Read entire file contents into a String.
 # Returns error code (0 = success, negative = error).
 # TODO: Migrate to Result<String, i32> now that struct-in-enum works.
-pub fn read_file_string(path: *String, out: *String) -> i32
+pub fn read_file_string(path: *String, out: @&String) -> i32
     let cstr: *u8 = string_as_ptr(path)
     let fd: i32 = sys_open(cstr, O_RDONLY)
     if fd < 0
@@ -400,7 +400,7 @@ pub fn read_file_string(path: *String, out: *String) -> i32
         return -FS_ERR_IO
 
     # Ensure capacity
-    string_clear(out)
+    string_clear(@out)
 
     # Read in chunks
     var buf: [4096]u8
@@ -412,7 +412,7 @@ pub fn read_file_string(path: *String, out: *String) -> i32
         if n == 0
             break
         for i in 0..n
-            string_push(out, buf[i])
+            string_push(@out, buf[i])
 
     sys_close(fd)
     return 0
@@ -517,97 +517,3 @@ pub fn copy_file_string(src: *String, dest: *String, mode: i32) -> Result<i64, i
     sys_close(src_fd)
     sys_close(dest_fd)
     return Ok(total)
-
-# ============================================================================
-# Directory Iteration
-# ============================================================================
-# High-level directory iteration API using getdents64.
-#
-# Usage:
-#     var dir: DirIter = dir_open("/path/to/dir")
-#     while dir_next(@dir)
-#         let name: *u8 = dir_entry_name(@dir)
-#         # process entry...
-#     dir_close(@dir)
-
-const DIR_BUF_SIZE: i64 = 4096
-
-pub struct DirIter
-    fd: i32              # Directory file descriptor
-    buf: [4096]u8        # Buffer for getdents64
-    buf_pos: i64         # Current position in buffer
-    buf_len: i64         # Bytes read into buffer
-    entry: *u8           # Current entry pointer
-
-# Open a directory for iteration.
-# Returns a DirIter - check with dir_valid() before using.
-pub fn dir_open(path: *u8) -> DirIter
-    var dir: DirIter
-    dir.fd = sys_open(path, O_RDONLY + O_DIRECTORY)
-    dir.buf_pos = 0
-    dir.buf_len = 0
-    dir.entry = null
-    dir
-
-# Open a directory for iteration (String version).
-pub fn dir_open_string(path: *String) -> DirIter
-    let cstr: *u8 = string_as_ptr(path)
-    dir_open(cstr)
-
-# Check if directory was opened successfully.
-pub fn dir_valid(dir: *DirIter) -> i32
-    (dir.fd >= 0) as i32
-
-# Advance to next directory entry.
-# Returns 1 if an entry is available, 0 if done.
-pub fn dir_next(dir: *DirIter) -> i32
-    # Need more data?
-    if dir.buf_pos >= dir.buf_len
-        # Read next batch of entries
-        dir.buf_len = sys_getdents64(dir.fd, @dir.buf[0], DIR_BUF_SIZE)
-        dir.buf_pos = 0
-
-        if dir.buf_len <= 0
-            dir.entry = null
-            return 0
-
-    # Point to current entry
-    dir.entry = @dir.buf[0] + dir.buf_pos
-
-    # Advance position for next call
-    let reclen: i32 = dirent_get_reclen(dir.entry)
-    dir.buf_pos = dir.buf_pos + reclen as i64
-
-    1
-
-# Get name of current entry.
-# Only valid after dir_next() returns 1.
-pub fn dir_entry_name(dir: *DirIter) -> *u8
-    if dir.entry == null
-        return null
-    dirent_get_name(dir.entry)
-
-# Get type of current entry.
-# Returns DT_REG, DT_DIR, etc. from sys.ritz
-pub fn dir_entry_type(dir: *DirIter) -> u8
-    if dir.entry == null
-        return 0
-    dirent_get_type(dir.entry)
-
-# Check if current entry is a directory.
-pub fn dir_entry_is_dir(dir: *DirIter) -> i32
-    (dir_entry_type(dir) == DT_DIR) as i32
-
-# Check if current entry is a regular file.
-pub fn dir_entry_is_file(dir: *DirIter) -> i32
-    (dir_entry_type(dir) == DT_REG) as i32
-
-# Check if current entry is a symlink.
-pub fn dir_entry_is_link(dir: *DirIter) -> i32
-    (dir_entry_type(dir) == DT_LNK) as i32
-
-# Close the directory iterator.
-pub fn dir_close(dir: *DirIter)
-    if dir.fd >= 0
-        sys_close(dir.fd)
-        dir.fd = -1

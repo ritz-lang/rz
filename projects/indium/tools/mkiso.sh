@@ -65,18 +65,6 @@ echo "=== Building rzsh ==="
 "$RZ_CLI" build rzsh
 cp "$RZSH_DIR/build/debug/rzsh.elf" "$BUILD_DIR/debug/" 2>/dev/null || true
 
-echo ""
-echo "=== Building ritzutils ==="
-RITZUTILS_DIR="$PROJECT_ROOT/../ritzutils"
-"$RZ_CLI" build ritzutils
-cp "$RITZUTILS_DIR/build/debug/"*.elf "$BUILD_DIR/debug/" 2>/dev/null || true
-
-echo ""
-echo "=== Building prism ==="
-PRISM_DIR="$PROJECT_ROOT/../prism"
-"$RZ_CLI" build prism
-cp "$PRISM_DIR/build/debug/"*.elf "$BUILD_DIR/debug/" 2>/dev/null || true
-
 # List what we're including
 echo ""
 echo "=== Userspace binaries ==="

@@ -51,7 +51,6 @@ struct EmitterState
     locals: [256]LocalVar
     local_count: i32
     break_label: i32
-    continue_label: i32
     module: *Module
     strings: [256]StringLit
     string_count: i32
@@ -64,13 +63,6 @@ struct EmitterState
     emitted_fn_count: i32
     emitted_globals: [512]EmittedName
     emitted_global_count: i32
-    # Track last expression value for if/else phi nodes
-    last_expr_reg: i32
-    # Track current label for phi node predecessors (needed for nested control flow)
-    current_label: i32
-    # Current function's return type name (for struct returns)
-    ret_type_name: *u8
-    ret_type_name_len: i32
 
 # =============================================================================
 # Helpers
@@ -219,40 +211,6 @@ fn add_local_full(s: *EmitterState, name: *u8, len: i32, reg: i32, var_type: i32
         loc.array_size = arr_size
         loc.array_elem_type = arr_elem
         s.local_count = s.local_count + 1
-
-# Find a global variable by name - returns the GlobalVarDef or null
-fn find_global(s: *EmitterState, name: *u8, len: i32) -> *GlobalVarDef
-    var g: *GlobalVarDef = s.module.globals
-    while g != null
-        if g.name_len == len
-            var j: i32 = 0
-            var matched: i32 = 1
-            while j < len
-                if *(g.name + j) != *(name + j)
-                    matched = 0
-                    break
-                j += 1
-            if matched == 1
-                return g
-        g = g.next
-    null
-
-# Find a function definition by name - returns the FnDef or null
-fn find_fn(s: *EmitterState, name: *u8, len: i32) -> *FnDef
-    var fn_def: *FnDef = s.module.functions
-    while fn_def != null
-        if fn_def.name_len == len
-            var j: i32 = 0
-            var matched: i32 = 1
-            while j < len
-                if *(fn_def.name + j) != *(name + j)
-                    matched = 0
-                    break
-                j += 1
-            if matched == 1
-                return fn_def
-        fn_def = fn_def.next
-    null
 
 # Find a struct definition by name
 fn find_struct(s: *EmitterState, name: *u8, len: i32) -> *StructDef
@@ -515,7 +473,7 @@ fn is_const(s: *EmitterState, name: *u8, len: i32) -> i32
 fn emit_llvm_type(s: *EmitterState, t: i32)
     if t == TYPE_VOID
         emit_str(s, "void")
-    else if t == TYPE_I32 or t == TYPE_U32
+    else if t == TYPE_I32
         emit_str(s, "i32")
     else if t == TYPE_I64
         emit_str(s, "i64")
@@ -523,18 +481,16 @@ fn emit_llvm_type(s: *EmitterState, t: i32)
         emit_str(s, "i8")
     else if t == TYPE_I8
         emit_str(s, "i8")
-    else if t == TYPE_U16 or t == TYPE_I16
-        emit_str(s, "i16")
     else if t == TYPE_U64
         emit_str(s, "i64")
     else if t == TYPE_BOOL
         emit_str(s, "i1")
     else if t == TYPE_PTR
-        emit_str(s, "i64")  # Pointers passed as i64
+        emit_str(s, "i64")  # Pointers passed as i64 to match call site
     else if t == TYPE_PTR_PTR
-        emit_str(s, "i64")  # Double pointers also i64
+        emit_str(s, "i64")  # Pointers passed as i64 to match call site
     else if t == TYPE_REF
-        emit_str(s, "i64")  # References are i64 at LLVM level
+        emit_str(s, "i64")  # References are pointers at LLVM level
     else if t == TYPE_MUT_REF
         emit_str(s, "ptr")  # Mutable references are pointers at LLVM level
     else
@@ -561,37 +517,6 @@ fn add_string(s: *EmitterState, data: *u8, len: i32) -> i32
 # Type Inference - Determine expression type without emitting code
 # =============================================================================
 
-# Helper: find the leftmost/base expression in a chain of binary ops
-# e.g., for (a.ptr + pos + i), returns a.ptr
-fn find_base_expr(e: *Expr) -> *Expr
-    if e.kind == EXPR_BINARY
-        return find_base_expr(e.left)
-    return e
-
-# Helper: get pointee type for a struct member that is a pointer
-# e.g., for span.ptr (where ptr is *u8), returns TYPE_U8
-fn get_member_pointee_type(s: *EmitterState, e: *Expr) -> i32
-    if e.kind != EXPR_MEMBER
-        return TYPE_I64
-    if e.left.kind == EXPR_IDENT
-        let local: *LocalVar = find_local_struct_name(s, e.left.ident_ptr, e.left.ident_len)
-        if local != null and local.type_name_len > 0
-            let st: *StructDef = find_struct(s, local.type_name, local.type_name_len)
-            if st != null
-                let field_idx: i32 = find_field_index(st, e.ident_ptr, e.ident_len)
-                if field_idx >= 0
-                    let field: *StructField = get_field_type(st, field_idx)
-                    # Return the pointee type based on field's pointer kind
-                    if field.field_type == TYPE_PTR
-                        # Check array_elem_type as that's where pointee type is stored
-                        if field.array_elem_type == TYPE_U8 or field.array_elem_type == TYPE_I8
-                            return field.array_elem_type
-                        # For *u8 in Span<u8>, the pointee is u8
-                        # TODO: Parser should set array_elem_type for pointer fields
-                        # For now, if it's TYPE_PTR with no array_elem_type, assume u8
-                        return TYPE_U8
-    return TYPE_I64
-
 fn get_expr_type(s: *EmitterState, e: *Expr) -> i32
     # Returns the Ritz type of an expression
     if e.kind == EXPR_INT_LIT
@@ -600,8 +525,6 @@ fn get_expr_type(s: *EmitterState, e: *Expr) -> i32
         return TYPE_U8   # Character literals are u8
     else if e.kind == EXPR_STRING_LIT
         return TYPE_PTR  # String literals are *u8
-    else if e.kind == EXPR_NIL_LIT
-        return TYPE_PTR  # nil is a null pointer
     else if e.kind == EXPR_IDENT
         let var_type: i32 = find_local_type(s, e.ident_ptr, e.ident_len)
         return var_type
@@ -617,8 +540,6 @@ fn get_expr_type(s: *EmitterState, e: *Expr) -> i32
     else if e.kind == EXPR_UNARY
         if e.op == OP_ADDR
             return TYPE_PTR  # Address-of gives pointer
-        else if e.op == OP_ADDR_MUT
-            return TYPE_MUT_REF  # Mutable address-of gives mutable reference
         else if e.op == OP_DEREF
             let inner_type: i32 = get_expr_type(s, e.operand)
             if inner_type == TYPE_PTR_PTR
@@ -628,64 +549,19 @@ fn get_expr_type(s: *EmitterState, e: *Expr) -> i32
                 # If operand is an identifier, look up its pointee type
                 if e.operand.kind == EXPR_IDENT
                     return find_local_pointee_type(s, e.operand.ident_ptr, e.operand.ident_len)
-                # If operand is ptr+offset, find base expression and get its pointee type
+                # If operand is ptr+offset (s+i), look up base variable's pointee type
                 else if e.operand.kind == EXPR_BINARY
-                    let base: *Expr = find_base_expr(e.operand)
-                    if base.kind == EXPR_IDENT
-                        return find_local_pointee_type(s, base.ident_ptr, base.ident_len)
-                    else if base.kind == EXPR_MEMBER
-                        # Member+offset dereference (e.g., *(span.ptr + i))
-                        return get_member_pointee_type(s, base)
+                    if e.operand.left.kind == EXPR_IDENT
+                        return find_local_pointee_type(s, e.operand.left.ident_ptr, e.operand.left.ident_len)
                 return TYPE_I64  # Default for unknown pointer dereference
             else
                 return TYPE_I64  # Deref *T gives value
         return get_expr_type(s, e.operand)
     else if e.kind == EXPR_BINARY
         return get_expr_type(s, e.left)  # Binary ops preserve left type (simplified)
-    else if e.kind == EXPR_MEMBER
-        # Look up the field type in the struct
-        if e.left.kind == EXPR_IDENT
-            let local: *LocalVar = find_local_struct_name(s, e.left.ident_ptr, e.left.ident_len)
-            if local != null and local.type_name_len > 0
-                let st: *StructDef = find_struct(s, local.type_name, local.type_name_len)
-                if st != null
-                    let field_idx: i32 = find_field_index(st, e.ident_ptr, e.ident_len)
-                    if field_idx >= 0
-                        let field: *StructField = get_field_type(st, field_idx)
-                        return field.field_type
-        return TYPE_I64  # Default for unknown member access
     else if e.kind == EXPR_CALL
-        # Look up function return type
-        # Build full function name with type suffix if generic
-        var full_name: [256]u8
-        var full_len: i32 = 0
-
-        # Copy function name
-        for i in 0..e.func_name_len
-            full_name[full_len] = *(e.func_name + i)
-            full_len += 1
-
-        # Add type suffix if present (e.g., "$u8" for vec_new<u8>())
-        if e.call_type_suffix_len > 0
-            for i in 0..e.call_type_suffix_len
-                full_name[full_len] = *(e.call_type_suffix + i)
-                full_len += 1
-
-        # Look up the function
-        let fn_def: *FnDef = find_fn(s, @full_name[0], full_len)
-        if fn_def != null
-            return fn_def.return_type
-
-        return TYPE_I64  # Default for unknown functions
+        return TYPE_I64  # Function calls default to i64 (TODO: look up return type)
     TYPE_I64  # Default fallback (including EXPR_CAST - would need AST change to track type)
-
-# Get the struct type name for a dereference expression that returns TYPE_STRUCT
-# Returns the field info if found, null otherwise
-# NOTE: Disabled due to parser bug where primitive pointer types have stale type_name values
-fn get_deref_struct_type(s: *EmitterState, e: *Expr) -> *StructField
-    # For now, always return null until parser properly tracks pointee types
-    # TODO: Enable this once parser is fixed
-    null
 
 # =============================================================================
 # Member pointer helper - emits GEP to get pointer to field
@@ -696,8 +572,8 @@ fn get_deref_struct_type(s: *EmitterState, e: *Expr) -> *StructField
 # Helper to emit GEP for local variable member access
 fn emit_member_gep_local(s: *EmitterState, e: *Expr, result: *MemberPtrResult, loc: *LocalVar, st: *StructDef, field_idx: i32, field: *StructField)
     var base_ptr: i32 = loc.reg
-    # For ptr/ref types (stored as i64), load and convert to ptr
-    if loc.var_type == TYPE_PTR or loc.var_type == TYPE_REF
+    # For ptr/ref types, load the i64 and convert to ptr
+    if loc.var_type == TYPE_PTR or loc.var_type == TYPE_REF or loc.var_type == TYPE_MUT_REF
         let loaded: i32 = next_reg(s)
         emit_str(s, "  ")
         emit_reg(s, loaded)
@@ -710,14 +586,6 @@ fn emit_member_gep_local(s: *EmitterState, e: *Expr, result: *MemberPtrResult, l
         emit_str(s, " = inttoptr i64 ")
         emit_reg(s, loaded)
         emit_str(s, " to ptr\n")
-    else if loc.var_type == TYPE_MUT_REF
-        # TYPE_MUT_REF is stored as ptr, load directly
-        base_ptr = next_reg(s)
-        emit_str(s, "  ")
-        emit_reg(s, base_ptr)
-        emit_str(s, " = load ptr, ptr ")
-        emit_reg(s, loc.reg)
-        emit_str(s, "\n")
     # GEP to get pointer to field
     let field_ptr: i32 = next_reg(s)
     emit_str(s, "  ")
@@ -807,23 +675,6 @@ fn emit_member_ptr(s: *EmitterState, e: *Expr, result: *MemberPtrResult)
                         let field: *StructField = get_field_type(st, field_idx)
                         emit_member_gep_from_ptr(s, result, inner_result.reg, st, field_idx, field)
                         return
-            # Handle pointer-to-struct field: load the pointer, then GEP into the pointed-to struct
-            else if inner_field.field_type == TYPE_PTR and inner_field.field_type_name_len > 0
-                # Load the pointer value from the field
-                let loaded: i32 = next_reg(s)
-                emit_str(s, "  ")
-                emit_reg(s, loaded)
-                emit_str(s, " = load ptr, ptr ")
-                emit_reg(s, inner_result.reg)
-                emit_str(s, "\n")
-                # Now GEP into the pointed-to struct
-                let st: *StructDef = find_struct(s, inner_field.field_type_name, inner_field.field_type_name_len)
-                if st != null
-                    let field_idx: i32 = find_field_index(st, e.ident_ptr, e.ident_len)
-                    if field_idx >= 0
-                        let field: *StructField = get_field_type(st, field_idx)
-                        emit_member_gep_from_ptr(s, result, loaded, st, field_idx, field)
-                        return
 
     # Dereference case: ptr.field - e.left is EXPR_UNARY with OP_DEREF
     else if e.left.kind == EXPR_UNARY
@@ -840,7 +691,6 @@ fn emit_member_ptr(s: *EmitterState, e: *Expr, result: *MemberPtrResult)
                             let field_idx: i32 = find_field_index(st, e.ident_ptr, e.ident_len)
                             if field_idx >= 0
                                 let field: *StructField = get_field_type(st, field_idx)
-                                emit_str(s, "  ; DEBUG: OP_DEREF path, load i64 for TYPE_PTR\n")
                                 # Load the i64 value and convert to ptr
                                 let loaded: i32 = next_reg(s)
                                 emit_str(s, "  ")
@@ -857,110 +707,11 @@ fn emit_member_ptr(s: *EmitterState, e: *Expr, result: *MemberPtrResult)
                                 emit_member_gep_from_ptr(s, result, base_ptr, st, field_idx, field)
                                 return
 
-    # Pointer arithmetic case: (ptr + offset).field - e.left is EXPR_BINARY
-    else if e.left.kind == EXPR_BINARY
-        # For pointer arithmetic like (p.tokens + p.pos).kind
-        # Need to trace back to find the original pointer type
-        # Could be: (member + n), (ident + n), or ((expr + n) + m)
-        var base_expr: *Expr = e.left.left
-        # Walk through cascaded binary ops to find the base
-        while base_expr.kind == EXPR_BINARY
-            base_expr = base_expr.left
-
-        if base_expr.kind == EXPR_MEMBER
-            # The MEMBER access gives us a pointer field - get the type from the field
-            var inner_result: MemberPtrResult
-            emit_member_ptr(s, base_expr, @inner_result)
-            if inner_result.success == 1
-                let inner_field: *StructField = inner_result.field
-                # If the field is a pointer to a struct, we can use it
-                if inner_field.field_type == TYPE_PTR and inner_field.field_type_name_len > 0
-                    let st: *StructDef = find_struct(s, inner_field.field_type_name, inner_field.field_type_name_len)
-                    if st != null
-                        let field_idx: i32 = find_field_index(st, e.ident_ptr, e.ident_len)
-                        if field_idx >= 0
-                            let field: *StructField = get_field_type(st, field_idx)
-                            # Evaluate the full binary expression to get the pointer
-                            let ptr_val: i32 = emit_expr(s, e.left)
-                            let base_ptr: i32 = next_reg(s)
-                            emit_str(s, "  ")
-                            emit_reg(s, base_ptr)
-                            emit_str(s, " = inttoptr i64 ")
-                            emit_reg(s, ptr_val)
-                            emit_str(s, " to ptr\n")
-                            emit_member_gep_from_ptr(s, result, base_ptr, st, field_idx, field)
-                            return
-        else if base_expr.kind == EXPR_IDENT
-            # Direct identifier pointer arithmetic: (ptr_var + offset).field
-            let loc: *LocalVar = find_local_struct_name(s, base_expr.ident_ptr, base_expr.ident_len)
-            if loc != null
-                if loc.var_type == TYPE_PTR and loc.type_name_len > 0
-                    let st: *StructDef = find_struct(s, loc.type_name, loc.type_name_len)
-                    if st != null
-                        let field_idx: i32 = find_field_index(st, e.ident_ptr, e.ident_len)
-                        if field_idx >= 0
-                            let field: *StructField = get_field_type(st, field_idx)
-                            # Evaluate the full binary expression to get the pointer
-                            let ptr_val: i32 = emit_expr(s, e.left)
-                            let base_ptr: i32 = next_reg(s)
-                            emit_str(s, "  ")
-                            emit_reg(s, base_ptr)
-                            emit_str(s, " = inttoptr i64 ")
-                            emit_reg(s, ptr_val)
-                            emit_str(s, " to ptr\n")
-                            emit_member_gep_from_ptr(s, result, base_ptr, st, field_idx, field)
-                            return
-
-    # Array element case: struct_array[idx].field
-    # e.left is EXPR_INDEX, representing struct_array[idx]
-    else if e.left.kind == EXPR_INDEX
-        # e.left.left is the array expression (could be var.field for struct array field)
-        # e.left.right is the index expression
-        # First, we need to get the array element as a pointer
-        # If left.left is EXPR_MEMBER, it's something like parser.pos_defs[idx]
-        if e.left.left.kind == EXPR_MEMBER
-            # Get pointer to the array field
-            var inner_result: MemberPtrResult
-            emit_member_ptr(s, e.left.left, @inner_result)
-            if inner_result.success == 1
-                let inner_field: *StructField = inner_result.field
-                # The field should be an array type with struct elements
-                # For arrays, the element type name is in array_elem_type_name, not field_type_name
-                if inner_field.field_type == TYPE_ARRAY and inner_field.array_elem_type_name_len > 0
-                    # Find the element struct type
-                    let elem_st: *StructDef = find_struct(s, inner_field.array_elem_type_name, inner_field.array_elem_type_name_len)
-                    if elem_st != null
-                        let field_idx: i32 = find_field_index(elem_st, e.ident_ptr, e.ident_len)
-                        if field_idx >= 0
-                            let field: *StructField = get_field_type(elem_st, field_idx)
-                            # Emit index expression
-                            let idx_reg: i32 = emit_expr(s, e.left.right)
-                            # GEP into the array to get the element
-                            let elem_ptr: i32 = next_reg(s)
-                            emit_str(s, "  ")
-                            emit_reg(s, elem_ptr)
-                            emit_str(s, " = getelementptr [")
-                            emit_int(s, inner_field.array_size as i64)
-                            emit_str(s, " x %")
-                            emit_name(s, elem_st.name, elem_st.name_len)
-                            emit_str(s, "], ptr ")
-                            emit_reg(s, inner_result.reg)
-                            emit_str(s, ", i64 0, i64 ")
-                            emit_reg(s, idx_reg)
-                            emit_str(s, "\n")
-                            # Now GEP into the element struct to get the field
-                            emit_member_gep_from_ptr(s, result, elem_ptr, elem_st, field_idx, field)
-                            return
-
 # =============================================================================
 # Expression Emission - Single function to avoid mutual recursion
 # =============================================================================
 
 fn emit_expr(s: *EmitterState, e: *Expr) -> i32
-    # Safety check for null expression
-    if e == null
-        eprints_cstr("ERROR: emit_expr called with null expression!\n")
-        return 0
     if e.kind == EXPR_INT_LIT
         let result: i32 = next_reg(s)
         emit_str(s, "  ")
@@ -993,13 +744,12 @@ fn emit_expr(s: *EmitterState, e: *Expr) -> i32
 
         let loc: i32 = find_local(s, e.ident_ptr, e.ident_len)
         if loc >= 0
-            let local_var: *LocalVar = find_local_struct_name(s, e.ident_ptr, e.ident_len)
-            let var_type: i32 = local_var.var_type
+            let var_type: i32 = find_local_type(s, e.ident_ptr, e.ident_len)
             let result: i32 = next_reg(s)
             emit_str(s, "  ")
             emit_reg(s, result)
             emit_str(s, " = load ")
-            emit_llvm_type_struct(s, var_type, local_var.type_name, local_var.type_name_len)
+            emit_llvm_type(s, var_type)
             emit_str(s, ", ptr ")
             emit_reg(s, loc)
             emit_str(s, "\n")
@@ -1009,14 +759,6 @@ fn emit_expr(s: *EmitterState, e: *Expr) -> i32
                 emit_str(s, "  ")
                 emit_reg(s, ext)
                 emit_str(s, " = sext i32 ")
-                emit_reg(s, result)
-                emit_str(s, " to i64\n")
-                return ext
-            else if var_type == TYPE_U32
-                let ext: i32 = next_reg(s)
-                emit_str(s, "  ")
-                emit_reg(s, ext)
-                emit_str(s, " = zext i32 ")
                 emit_reg(s, result)
                 emit_str(s, " to i64\n")
                 return ext
@@ -1031,37 +773,6 @@ fn emit_expr(s: *EmitterState, e: *Expr) -> i32
             else if var_type == TYPE_PTR or var_type == TYPE_PTR_PTR or var_type == TYPE_REF or var_type == TYPE_MUT_REF
                 # Pointers are already stored/loaded as i64, no conversion needed
                 return result
-            return result
-
-        # Check for global variable
-        let glob: *GlobalVarDef = find_global(s, e.ident_ptr, e.ident_len)
-        if glob != null
-            # Load from global variable
-            let result: i32 = next_reg(s)
-            emit_str(s, "  ")
-            emit_reg(s, result)
-            emit_str(s, " = load ")
-            emit_llvm_type(s, glob.var_type)
-            emit_str(s, ", ptr @")
-            emit_name(s, glob.name, glob.name_len)
-            emit_str(s, "\n")
-            # Extend to i64 if needed
-            if glob.var_type == TYPE_I32
-                let ext: i32 = next_reg(s)
-                emit_str(s, "  ")
-                emit_reg(s, ext)
-                emit_str(s, " = sext i32 ")
-                emit_reg(s, result)
-                emit_str(s, " to i64\n")
-                return ext
-            else if glob.var_type == TYPE_U32
-                let ext: i32 = next_reg(s)
-                emit_str(s, "  ")
-                emit_reg(s, ext)
-                emit_str(s, " = zext i32 ")
-                emit_reg(s, result)
-                emit_str(s, " to i64\n")
-                return ext
             return result
 
         emit_str(s, "  ; ERROR: unknown identifier '")
@@ -1143,10 +854,6 @@ fn emit_expr(s: *EmitterState, e: *Expr) -> i32
             emit_str(s, "or i64 ")
         else if e.op == OP_BIT_XOR
             emit_str(s, "xor i64 ")
-        else if e.op == OP_SHL
-            emit_str(s, "shl i64 ")
-        else if e.op == OP_SHR
-            emit_str(s, "lshr i64 ")  # Logical shift right (unsigned)
         else
             emit_str(s, "add i64 ")
 
@@ -1217,28 +924,6 @@ fn emit_expr(s: *EmitterState, e: *Expr) -> i32
                 emit_reg(s, byte_val)
                 emit_str(s, " to i64\n")
                 return result
-            else if deref_type == TYPE_STRUCT
-                # Load struct type - need to find the actual struct name
-                let field: *StructField = get_deref_struct_type(s, e)
-                if field != null and field.field_type_name_len > 0
-                    let result: i32 = next_reg(s)
-                    emit_str(s, "  ")
-                    emit_reg(s, result)
-                    emit_str(s, " = load %")
-                    emit_name(s, field.field_type_name, field.field_type_name_len)
-                    emit_str(s, ", ptr ")
-                    emit_reg(s, ptr)
-                    emit_str(s, "\n")
-                    return result
-                else
-                    # Fallback to i64 if we can't determine struct name
-                    let result: i32 = next_reg(s)
-                    emit_str(s, "  ")
-                    emit_reg(s, result)
-                    emit_str(s, " = load i64, ptr ")
-                    emit_reg(s, ptr)
-                    emit_str(s, "\n")
-                    return result
             else
                 # Default: load i64
                 let result: i32 = next_reg(s)
@@ -1334,52 +1019,6 @@ fn emit_expr(s: *EmitterState, e: *Expr) -> i32
                                             emit_reg(s, elem_ptr)
                                             emit_str(s, " to i64\n")
                                             return result
-                        # Handle @ptr_to_struct.array_field[i] - address of element in array field via pointer
-                        let local: *LocalVar = find_local_struct_name(s, e.operand.left.left.ident_ptr, e.operand.left.left.ident_len)
-                        if local != null
-                            if local.var_type == TYPE_PTR and local.type_name_len > 0
-                                # It's a pointer to a struct with a known type name
-                                let st: *StructDef = find_struct(s, local.type_name, local.type_name_len)
-                                if st != null
-                                    let field_idx: i32 = find_field_index(st, e.operand.left.ident_ptr, e.operand.left.ident_len)
-                                    if field_idx >= 0
-                                        let field: *StructField = get_field_type(st, field_idx)
-                                        if field.field_type == TYPE_ARRAY
-                                            # Load the pointer from the local, GEP to array field, index into it
-                                            let loaded_i64: i32 = next_reg(s)
-                                            emit_str(s, "  ")
-                                            emit_reg(s, loaded_i64)
-                                            emit_str(s, " = load i64, ptr ")
-                                            emit_reg(s, local.reg)
-                                            emit_str(s, "\n")
-                                            let loaded_ptr: i32 = next_reg(s)
-                                            emit_str(s, "  ")
-                                            emit_reg(s, loaded_ptr)
-                                            emit_str(s, " = inttoptr i64 ")
-                                            emit_reg(s, loaded_i64)
-                                            emit_str(s, " to ptr\n")
-                                            # GEP to array field, then to element
-                                            let idx: i32 = emit_expr(s, e.operand.right)
-                                            let elem_ptr: i32 = next_reg(s)
-                                            emit_str(s, "  ")
-                                            emit_reg(s, elem_ptr)
-                                            emit_str(s, " = getelementptr %")
-                                            emit_name(s, st.name, st.name_len)
-                                            emit_str(s, ", ptr ")
-                                            emit_reg(s, loaded_ptr)
-                                            emit_str(s, ", i32 0, i32 ")
-                                            emit_int(s, field_idx as i64)
-                                            emit_str(s, ", i64 ")
-                                            emit_reg(s, idx)
-                                            emit_str(s, "\n")
-                                            # Convert to i64
-                                            let result: i32 = next_reg(s)
-                                            emit_str(s, "  ")
-                                            emit_reg(s, result)
-                                            emit_str(s, " = ptrtoint ptr ")
-                                            emit_reg(s, elem_ptr)
-                                            emit_str(s, " to i64\n")
-                                            return result
             else if e.operand.kind == EXPR_MEMBER
                 # Handle @local_struct.field - address of a field in a local struct
                 if e.operand.left.kind == EXPR_IDENT
@@ -1453,15 +1092,6 @@ fn emit_expr(s: *EmitterState, e: *Expr) -> i32
                                         emit_str(s, " to i64\n")
                                         return result
             emit_str(s, "  ; ERROR: cannot take address\n")
-            return 0
-        else if e.op == OP_ADDR_MUT
-            # @&expr - mutable address-of, returns ptr type (not i64)
-            if e.operand.kind == EXPR_IDENT
-                let loc: i32 = find_local(s, e.operand.ident_ptr, e.operand.ident_len)
-                if loc >= 0
-                    # loc is already a ptr (alloca result), return it directly
-                    return loc
-            emit_str(s, "  ; ERROR: cannot take mutable address\n")
             return 0
         else if e.op == OP_BIT_NOT
             let operand: i32 = emit_expr(s, e.operand)
@@ -1556,62 +1186,6 @@ fn emit_expr(s: *EmitterState, e: *Expr) -> i32
                                                                         if *(e.func_name + 15) == 97 # a
                                                                             is_alloca = 1
 
-        # Check if this is sizeof
-        var is_sizeof: i32 = 0
-        if e.func_name_len == 6
-            if memcmp(e.func_name, "sizeof", 6) == 0
-                is_sizeof = 1
-
-        if is_sizeof == 1
-            # sizeof(Type) -> compile-time constant
-            var type_size: i64 = 8  # Default to 8 (pointer size)
-            if e.args != null and e.args.kind == EXPR_IDENT
-                # Look up the type and return its size
-                if e.args.ident_len == 2
-                    if memcmp(e.args.ident_ptr, "u8", 2) == 0
-                        type_size = 1
-                    else if memcmp(e.args.ident_ptr, "i8", 2) == 0
-                        type_size = 1
-                else if e.args.ident_len == 3
-                    if memcmp(e.args.ident_ptr, "u16", 3) == 0
-                        type_size = 2
-                    else if memcmp(e.args.ident_ptr, "i16", 3) == 0
-                        type_size = 2
-                    else if memcmp(e.args.ident_ptr, "u32", 3) == 0
-                        type_size = 4
-                    else if memcmp(e.args.ident_ptr, "i32", 3) == 0
-                        type_size = 4
-                    else if memcmp(e.args.ident_ptr, "u64", 3) == 0
-                        type_size = 8
-                    else if memcmp(e.args.ident_ptr, "i64", 3) == 0
-                        type_size = 8
-                else
-                    # Check if it's a struct
-                    let st: *StructDef = find_struct(s, e.args.ident_ptr, e.args.ident_len)
-                    if st != null
-                        # Calculate struct size (simplified: sum of fields)
-                        # TODO: Proper alignment
-                        var size: i64 = 0
-                        var f: *StructField = st.fields
-                        while f != null
-                            if f.field_type == TYPE_U8 or f.field_type == TYPE_I8
-                                size = size + 1
-                            else if f.field_type == TYPE_U16 or f.field_type == TYPE_I16
-                                size = size + 2
-                            else if f.field_type == TYPE_U32 or f.field_type == TYPE_I32
-                                size = size + 4
-                            else
-                                size = size + 8  # Pointer, i64, etc.
-                            f = f.next
-                        type_size = size
-            let result: i32 = next_reg(s)
-            emit_str(s, "  ")
-            emit_reg(s, result)
-            emit_str(s, " = add i64 0, ")
-            emit_int(s, type_size)
-            emit_str(s, "\n")
-            return result
-
         if is_alloca == 1
             # __builtin_alloca(size) -> alloca i8, i64 size
             var arg: *Expr = e.args
@@ -1668,254 +1242,21 @@ fn emit_expr(s: *EmitterState, e: *Expr) -> i32
                 arg_count += 1
             arg2 = arg2.next
 
-        # Look up function to determine return type
-        let fn_def: *FnDef = find_fn(s, @full_name[0], full_len)
-        var ret_type: i32 = TYPE_I64  # Default for unknown functions
-        var ret_struct_name: *u8 = null
-        var ret_struct_name_len: i32 = 0
-        if fn_def != null
-            ret_type = fn_def.return_type
-            if fn_def.return_type == TYPE_STRUCT
-                ret_struct_name = fn_def.return_type_name
-                ret_struct_name_len = fn_def.return_type_name_len
-
-        # Convert argument values to match parameter types BEFORE emitting call
-        var converted_regs: [16]i32
-        var param_types: [16]i32
-        var param_ptr: *Param = null
-        if fn_def != null
-            param_ptr = fn_def.params
-        for j in 0..arg_count
-            if param_ptr != null
-                param_types[j] = param_ptr.param_type
-                # Truncate i64 values to smaller types if needed
-                if param_ptr.param_type == TYPE_U8 or param_ptr.param_type == TYPE_I8
-                    let trunc: i32 = next_reg(s)
-                    emit_str(s, "  ")
-                    emit_reg(s, trunc)
-                    emit_str(s, " = trunc i64 ")
-                    emit_reg(s, arg_regs[j])
-                    emit_str(s, " to i8\n")
-                    converted_regs[j] = trunc
-                else if param_ptr.param_type == TYPE_I32 or param_ptr.param_type == TYPE_U32
-                    let trunc: i32 = next_reg(s)
-                    emit_str(s, "  ")
-                    emit_reg(s, trunc)
-                    emit_str(s, " = trunc i64 ")
-                    emit_reg(s, arg_regs[j])
-                    emit_str(s, " to i32\n")
-                    converted_regs[j] = trunc
-                else if param_ptr.param_type == TYPE_I16 or param_ptr.param_type == TYPE_U16
-                    let trunc: i32 = next_reg(s)
-                    emit_str(s, "  ")
-                    emit_reg(s, trunc)
-                    emit_str(s, " = trunc i64 ")
-                    emit_reg(s, arg_regs[j])
-                    emit_str(s, " to i16\n")
-                    converted_regs[j] = trunc
-                else if param_ptr.param_type == TYPE_MUT_REF
-                    # TYPE_MUT_REF params expect ptr
-                    # If arg is a TYPE_MUT_REF ident, it's already ptr (from load ptr)
-                    # If arg is OP_ADDR (@v), it's i64 (from ptrtoint), needs inttoptr
-                    var arg_expr: *Expr = e.args
-                    var k: i32 = 0
-                    while k < j and arg_expr != null
-                        arg_expr = arg_expr.next
-                        k = k + 1
-                    var need_convert: i32 = 1  # Default: need conversion
-                    if arg_expr != null
-                        let arg_type: i32 = get_expr_type(s, arg_expr)
-                        if arg_type == TYPE_MUT_REF
-                            # Already ptr from loading a TYPE_MUT_REF variable
-                            need_convert = 0
-                    if need_convert == 1
-                        let cast: i32 = next_reg(s)
-                        emit_str(s, "  ")
-                        emit_reg(s, cast)
-                        emit_str(s, " = inttoptr i64 ")
-                        emit_reg(s, arg_regs[j])
-                        emit_str(s, " to ptr\n")
-                        converted_regs[j] = cast
-                    else
-                        converted_regs[j] = arg_regs[j]
-                else if param_ptr.param_type == TYPE_STRUCT and param_ptr.param_type_name_len == 7
-                    # Check if this is StrView (7 chars)
-                    var is_strview: i32 = 0
-                    if *(param_ptr.param_type_name + 0) == 'S' and *(param_ptr.param_type_name + 1) == 't'
-                        if *(param_ptr.param_type_name + 2) == 'r' and *(param_ptr.param_type_name + 3) == 'V'
-                            if *(param_ptr.param_type_name + 4) == 'i' and *(param_ptr.param_type_name + 5) == 'e'
-                                if *(param_ptr.param_type_name + 6) == 'w'
-                                    is_strview = 1
-                    if is_strview == 1
-                        # Get the argument expression to check if it's a string literal
-                        var arg_expr: *Expr = e.args
-                        var k: i32 = 0
-                        while k < j and arg_expr != null
-                            arg_expr = arg_expr.next
-                            k = k + 1
-                        if arg_expr != null and arg_expr.kind == EXPR_STRING_LIT
-                            # String literal being passed to StrView param
-                            # arg_regs[j] is already the pointer (as i64)
-                            # We need to construct: %StrView { ptr, len }
-                            let inttoptr_reg: i32 = next_reg(s)
-                            emit_str(s, "  ")
-                            emit_reg(s, inttoptr_reg)
-                            emit_str(s, " = inttoptr i64 ")
-                            emit_reg(s, arg_regs[j])
-                            emit_str(s, " to ptr\n")
-                            let sv1: i32 = next_reg(s)
-                            emit_str(s, "  ")
-                            emit_reg(s, sv1)
-                            emit_str(s, " = insertvalue %StrView undef, ptr ")
-                            emit_reg(s, inttoptr_reg)
-                            emit_str(s, ", 0\n")
-                            let sv2: i32 = next_reg(s)
-                            emit_str(s, "  ")
-                            emit_reg(s, sv2)
-                            emit_str(s, " = insertvalue %StrView ")
-                            emit_reg(s, sv1)
-                            emit_str(s, ", i64 ")
-                            emit_int(s, arg_expr.string_len as i64)
-                            emit_str(s, ", 1\n")
-                            converted_regs[j] = sv2
-                        else
-                            converted_regs[j] = arg_regs[j]
-                    else
-                        converted_regs[j] = arg_regs[j]
-                else
-                    converted_regs[j] = arg_regs[j]
-                param_ptr = param_ptr.next
-            else
-                # fn_def is null - external function, assume i64 for all args
-                # But if argument is TYPE_MUT_REF, it's loaded as ptr, needs ptrtoint
-                param_types[j] = TYPE_I64
-                var arg_expr: *Expr = e.args
-                var k: i32 = 0
-                while k < j and arg_expr != null
-                    arg_expr = arg_expr.next
-                    k = k + 1
-                var need_convert: i32 = 0
-                if arg_expr != null
-                    let arg_type: i32 = get_expr_type(s, arg_expr)
-                    if arg_type == TYPE_MUT_REF
-                        # Value is ptr, need to convert to i64
-                        need_convert = 1
-                if need_convert == 1
-                    let pti: i32 = next_reg(s)
-                    emit_str(s, "  ")
-                    emit_reg(s, pti)
-                    emit_str(s, " = ptrtoint ptr ")
-                    emit_reg(s, arg_regs[j])
-                    emit_str(s, " to i64\n")
-                    converted_regs[j] = pti
-                else
-                    converted_regs[j] = arg_regs[j]
-
-        # Now emit the call with converted registers
-        var call_result: i32 = 0
-        if ret_type == TYPE_VOID
-            # void call - no result register assignment
-            emit_str(s, "  call void @")
-        else
-            call_result = next_reg(s)
-            emit_str(s, "  ")
-            emit_reg(s, call_result)
-            if ret_type == TYPE_STRUCT and ret_struct_name_len > 0
-                emit_str(s, " = call %")
-                emit_name(s, ret_struct_name, ret_struct_name_len)
-                emit_str(s, " @")
-            else if ret_type == TYPE_I32 or ret_type == TYPE_U32
-                emit_str(s, " = call i32 @")
-            else if ret_type == TYPE_I16 or ret_type == TYPE_U16
-                emit_str(s, " = call i16 @")
-            else if ret_type == TYPE_I8 or ret_type == TYPE_U8
-                emit_str(s, " = call i8 @")
-            else if ret_type == TYPE_PTR or ret_type == TYPE_REF or ret_type == TYPE_MUT_REF
-                emit_str(s, " = call ptr @")
-            else
-                emit_str(s, " = call i64 @")
+        let result: i32 = next_reg(s)
+        emit_str(s, "  ")
+        emit_reg(s, result)
+        emit_str(s, " = call i64 @")
         emit_name(s, @full_name[0], full_len)
         emit_str(s, "(")
 
         for j in 0..arg_count
             if j > 0
                 emit_str(s, ", ")
-            if fn_def != null
-                # Reset param_ptr to walk params again
-                var p: *Param = fn_def.params
-                var k: i32 = 0
-                while k < j and p != null
-                    p = p.next
-                    k = k + 1
-                if p != null
-                    emit_llvm_type_struct(s, p.param_type, p.param_type_name, p.param_type_name_len)
-                else
-                    emit_str(s, "i64")
-            else
-                emit_str(s, "i64")
-            emit_str(s, " ")
-            emit_reg(s, converted_regs[j])
+            emit_str(s, "i64 ")
+            emit_reg(s, arg_regs[j])
 
         emit_str(s, ")\n")
-
-        # Extend smaller return types to i64 for consistent value representation
-        if ret_type == TYPE_I32
-            let ext: i32 = next_reg(s)
-            emit_str(s, "  ")
-            emit_reg(s, ext)
-            emit_str(s, " = sext i32 ")
-            emit_reg(s, call_result)
-            emit_str(s, " to i64\n")
-            return ext
-        else if ret_type == TYPE_U32
-            let ext: i32 = next_reg(s)
-            emit_str(s, "  ")
-            emit_reg(s, ext)
-            emit_str(s, " = zext i32 ")
-            emit_reg(s, call_result)
-            emit_str(s, " to i64\n")
-            return ext
-        else if ret_type == TYPE_I16
-            let ext: i32 = next_reg(s)
-            emit_str(s, "  ")
-            emit_reg(s, ext)
-            emit_str(s, " = sext i16 ")
-            emit_reg(s, call_result)
-            emit_str(s, " to i64\n")
-            return ext
-        else if ret_type == TYPE_U16
-            let ext: i32 = next_reg(s)
-            emit_str(s, "  ")
-            emit_reg(s, ext)
-            emit_str(s, " = zext i16 ")
-            emit_reg(s, call_result)
-            emit_str(s, " to i64\n")
-            return ext
-        else if ret_type == TYPE_I8
-            let ext: i32 = next_reg(s)
-            emit_str(s, "  ")
-            emit_reg(s, ext)
-            emit_str(s, " = sext i8 ")
-            emit_reg(s, call_result)
-            emit_str(s, " to i64\n")
-            return ext
-        else if ret_type == TYPE_U8
-            let ext: i32 = next_reg(s)
-            emit_str(s, "  ")
-            emit_reg(s, ext)
-            emit_str(s, " = zext i8 ")
-            emit_reg(s, call_result)
-            emit_str(s, " to i64\n")
-            return ext
-        else if ret_type == TYPE_PTR or ret_type == TYPE_REF or ret_type == TYPE_MUT_REF
-            let pti: i32 = next_reg(s)
-            emit_str(s, "  ")
-            emit_reg(s, pti)
-            emit_str(s, " = ptrtoint ptr ")
-            emit_reg(s, call_result)
-            emit_str(s, " to i64\n")
-            return pti
-        return call_result
+        return result
 
     else if e.kind == EXPR_INDEX
         # Check if base is an array, pointer-to-pointer (e.g., argv: **u8), or pointer
@@ -2160,14 +1501,6 @@ fn emit_expr(s: *EmitterState, e: *Expr) -> i32
         # Parser stores operand in e.left field
         return emit_expr(s, e.left)
 
-    else if e.kind == EXPR_NIL_LIT
-        # nil literal - emit as null pointer (0)
-        let zero: i32 = next_reg(s)
-        emit_str(s, "  ")
-        emit_reg(s, zero)
-        emit_str(s, " = add i64 0, 0  ; nil\n")
-        return zero
-
     else if e.kind == EXPR_STRING_LIT
         let str_idx: i32 = add_string(s, e.string_ptr, e.string_len)
         let gep_reg: i32 = next_reg(s)
@@ -2222,30 +1555,6 @@ fn emit_expr(s: *EmitterState, e: *Expr) -> i32
                 emit_str(s, "  ")
                 emit_reg(s, ext)
                 emit_str(s, " = sext i32 ")
-                emit_reg(s, val_reg)
-                emit_str(s, " to i64\n")
-                return ext
-            else if field.field_type == TYPE_U32
-                let ext: i32 = next_reg(s)
-                emit_str(s, "  ")
-                emit_reg(s, ext)
-                emit_str(s, " = zext i32 ")
-                emit_reg(s, val_reg)
-                emit_str(s, " to i64\n")
-                return ext
-            else if field.field_type == TYPE_I8
-                let ext: i32 = next_reg(s)
-                emit_str(s, "  ")
-                emit_reg(s, ext)
-                emit_str(s, " = sext i8 ")
-                emit_reg(s, val_reg)
-                emit_str(s, " to i64\n")
-                return ext
-            else if field.field_type == TYPE_U8
-                let ext: i32 = next_reg(s)
-                emit_str(s, "  ")
-                emit_reg(s, ext)
-                emit_str(s, " = zext i8 ")
                 emit_reg(s, val_reg)
                 emit_str(s, " to i64\n")
                 return ext
@@ -2538,7 +1847,7 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
             return  # Done with struct literal init
 
         let init_reg: i32 = emit_expr(s, stmt.var_init)
-        if var_type == TYPE_I32 or var_type == TYPE_U32
+        if var_type == TYPE_I32
             let trunc: i32 = next_reg(s)
             emit_str(s, "  ")
             emit_reg(s, trunc)
@@ -2566,15 +1875,6 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
         else if var_type == TYPE_PTR or var_type == TYPE_PTR_PTR or var_type == TYPE_REF or var_type == TYPE_MUT_REF
             # Store i64 directly (pointers are stored as i64)
             emit_str(s, "  store i64 ")
-            emit_reg(s, init_reg)
-            emit_str(s, ", ptr ")
-            emit_reg(s, alloca_reg)
-            emit_str(s, "\n")
-        else if var_type == TYPE_STRUCT
-            # Store struct directly
-            emit_str(s, "  store %")
-            emit_name(s, stmt.var_type_name, stmt.var_type_name_len)
-            emit_str(s, " ")
             emit_reg(s, init_reg)
             emit_str(s, ", ptr ")
             emit_reg(s, alloca_reg)
@@ -2716,20 +2016,6 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
                         return
 
         # Deref assignment: *(expr) = value
-        # Determine the type of the value being stored
-        var value_type: i32 = TYPE_I64
-        var struct_name: *u8 = null
-        var struct_name_len: i32 = 0
-
-        # Check if value is an identifier - look up its type
-        if stmt.assign_value.kind == EXPR_IDENT
-            let local: *LocalVar = find_local_struct_name(s, stmt.assign_value.ident_ptr, stmt.assign_value.ident_len)
-            if local != null
-                value_type = local.var_type
-                if local.var_type == TYPE_STRUCT
-                    struct_name = local.type_name
-                    struct_name_len = local.type_name_len
-
         let val: i32 = emit_expr(s, stmt.assign_value)
         let addr: i32 = emit_expr(s, target_expr)
         # Convert i64 address to ptr
@@ -2739,70 +2025,25 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
         emit_str(s, " = inttoptr i64 ")
         emit_reg(s, addr)
         emit_str(s, " to ptr\n")
-
-        # Store based on value type
-        if value_type == TYPE_STRUCT and struct_name_len > 0
-            # Struct store - emit: store %StructName %val, ptr %ptr
-            emit_str(s, "  store %")
-            emit_name(s, struct_name, struct_name_len)
-            emit_str(s, " ")
-            emit_reg(s, val)
-            emit_str(s, ", ptr ")
-            emit_reg(s, ptr)
-            emit_str(s, "\n")
-        else if value_type == TYPE_I32 or value_type == TYPE_U32
-            # i32 store
-            let trunc: i32 = next_reg(s)
-            emit_str(s, "  ")
-            emit_reg(s, trunc)
-            emit_str(s, " = trunc i64 ")
-            emit_reg(s, val)
-            emit_str(s, " to i32\n")
-            emit_str(s, "  store i32 ")
-            emit_reg(s, trunc)
-            emit_str(s, ", ptr ")
-            emit_reg(s, ptr)
-            emit_str(s, "\n")
-        else if value_type == TYPE_U8 or value_type == TYPE_I8
-            # Byte store
-            let trunc: i32 = next_reg(s)
-            emit_str(s, "  ")
-            emit_reg(s, trunc)
-            emit_str(s, " = trunc i64 ")
-            emit_reg(s, val)
-            emit_str(s, " to i8\n")
-            emit_str(s, "  store i8 ")
-            emit_reg(s, trunc)
-            emit_str(s, ", ptr ")
-            emit_reg(s, ptr)
-            emit_str(s, "\n")
-        else if value_type == TYPE_PTR or value_type == TYPE_PTR_PTR
-            # Pointer store
-            let ptr_val: i32 = next_reg(s)
-            emit_str(s, "  ")
-            emit_reg(s, ptr_val)
-            emit_str(s, " = inttoptr i64 ")
-            emit_reg(s, val)
-            emit_str(s, " to ptr\n")
-            emit_str(s, "  store ptr ")
-            emit_reg(s, ptr_val)
-            emit_str(s, ", ptr ")
-            emit_reg(s, ptr)
-            emit_str(s, "\n")
-        else
-            # Default: store i64 (for i64, u64, and unknown types)
-            emit_str(s, "  store i64 ")
-            emit_reg(s, val)
-            emit_str(s, ", ptr ")
-            emit_reg(s, ptr)
-            emit_str(s, "\n")
+        # Truncate value to i8 and store (assuming byte store for now)
+        let trunc: i32 = next_reg(s)
+        emit_str(s, "  ")
+        emit_reg(s, trunc)
+        emit_str(s, " = trunc i64 ")
+        emit_reg(s, val)
+        emit_str(s, " to i8\n")
+        emit_str(s, "  store i8 ")
+        emit_reg(s, trunc)
+        emit_str(s, ", ptr ")
+        emit_reg(s, ptr)
+        emit_str(s, "\n")
         return
 
     let loc: i32 = find_local(s, stmt.assign_target, stmt.assign_target_len)
     if loc >= 0
         let var_type: i32 = find_local_type(s, stmt.assign_target, stmt.assign_target_len)
         let val: i32 = emit_expr(s, stmt.assign_value)
-        if var_type == TYPE_I32 or var_type == TYPE_U32
+        if var_type == TYPE_I32
             let trunc: i32 = next_reg(s)
             emit_str(s, "  ")
             emit_reg(s, trunc)
@@ -2843,91 +2084,12 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
             emit_reg(s, loc)
             emit_str(s, "\n")
     else
-        # Check for global variable
-        let glob: *GlobalVarDef = find_global(s, stmt.assign_target, stmt.assign_target_len)
-        if glob != null
-            let val: i32 = emit_expr(s, stmt.assign_value)
-            if glob.var_type == TYPE_I32 or glob.var_type == TYPE_U32
-                let trunc: i32 = next_reg(s)
-                emit_str(s, "  ")
-                emit_reg(s, trunc)
-                emit_str(s, " = trunc i64 ")
-                emit_reg(s, val)
-                emit_str(s, " to i32\n")
-                emit_str(s, "  store i32 ")
-                emit_reg(s, trunc)
-                emit_str(s, ", ptr @")
-                emit_name(s, glob.name, glob.name_len)
-                emit_str(s, "\n")
-            else
-                emit_str(s, "  store ")
-                emit_llvm_type(s, glob.var_type)
-                emit_str(s, " ")
-                emit_reg(s, val)
-                emit_str(s, ", ptr @")
-                emit_name(s, glob.name, glob.name_len)
-                emit_str(s, "\n")
-        else
-            emit_str(s, "  ; ERROR: unknown variable '")
-            emit_name(s, stmt.assign_target, stmt.assign_target_len)
-            emit_str(s, "'\n")
+        emit_str(s, "  ; ERROR: unknown variable '")
+        emit_name(s, stmt.assign_target, stmt.assign_target_len)
+        emit_str(s, "'\n")
 
 fn emit_return(s: *EmitterState, stmt: *Stmt, ret_type: i32)
     if stmt.return_value != null
-        # Special handling for struct returns - need to load entire struct
-        if ret_type == TYPE_STRUCT
-            # Check if return value is a local variable
-            if stmt.return_value.kind == EXPR_IDENT
-                let loc: i32 = find_local(s, stmt.return_value.ident_ptr, stmt.return_value.ident_len)
-                if loc >= 0
-                    # Load the entire struct from the local
-                    let result: i32 = next_reg(s)
-                    emit_str(s, "  ")
-                    emit_reg(s, result)
-                    emit_str(s, " = load %")
-                    emit_name(s, s.ret_type_name, s.ret_type_name_len)
-                    emit_str(s, ", ptr ")
-                    emit_reg(s, loc)
-                    emit_str(s, "\n")
-                    emit_str(s, "  ret %")
-                    emit_name(s, s.ret_type_name, s.ret_type_name_len)
-                    emit_str(s, " ")
-                    emit_reg(s, result)
-                    emit_str(s, "\n")
-                    return
-            # Check if return value is a dereference (e.g., *ptr or *(ptr + offset))
-            if stmt.return_value.kind == EXPR_UNARY and stmt.return_value.op == OP_DEREF
-                # Calculate the pointer address, then load the struct from it
-                let addr: i32 = emit_expr(s, stmt.return_value.operand)
-                let ptr: i32 = next_reg(s)
-                emit_str(s, "  ")
-                emit_reg(s, ptr)
-                emit_str(s, " = inttoptr i64 ")
-                emit_reg(s, addr)
-                emit_str(s, " to ptr\n")
-                let result: i32 = next_reg(s)
-                emit_str(s, "  ")
-                emit_reg(s, result)
-                emit_str(s, " = load %")
-                emit_name(s, s.ret_type_name, s.ret_type_name_len)
-                emit_str(s, ", ptr ")
-                emit_reg(s, ptr)
-                emit_str(s, "\n")
-                emit_str(s, "  ret %")
-                emit_name(s, s.ret_type_name, s.ret_type_name_len)
-                emit_str(s, " ")
-                emit_reg(s, result)
-                emit_str(s, "\n")
-                return
-            # For other expressions, emit normally and return
-            let val: i32 = emit_expr(s, stmt.return_value)
-            emit_str(s, "  ret %")
-            emit_name(s, s.ret_type_name, s.ret_type_name_len)
-            emit_str(s, " ")
-            emit_reg(s, val)
-            emit_str(s, "\n")
-            return
-
         let val: i32 = emit_expr(s, stmt.return_value)
         if ret_type == TYPE_I32
             let trunc: i32 = next_reg(s)
@@ -2951,9 +2113,15 @@ fn emit_return(s: *EmitterState, stmt: *Stmt, ret_type: i32)
             emit_reg(s, trunc)
             emit_str(s, "\n")
         else if ret_type == TYPE_PTR or ret_type == TYPE_PTR_PTR
-            # Pointers are represented as i64 internally, return as i64
-            emit_str(s, "  ret i64 ")
+            # Convert i64 to ptr for pointer return types
+            let ptr_val: i32 = next_reg(s)
+            emit_str(s, "  ")
+            emit_reg(s, ptr_val)
+            emit_str(s, " = inttoptr i64 ")
             emit_reg(s, val)
+            emit_str(s, " to ptr\n")
+            emit_str(s, "  ret ptr ")
+            emit_reg(s, ptr_val)
             emit_str(s, "\n")
         else
             emit_str(s, "  ret ")
@@ -2995,63 +2163,29 @@ fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
             emit_label(s, end_label)
         emit_str(s, "\n")
 
-        # Save current last_expr_reg before entering branches
-        let saved_last: i32 = s.last_expr_reg
-
         emit_label(s, then_label)
         emit_str(s, ":\n")
-        s.current_label = then_label  # Track current block
-        s.last_expr_reg = 0  # Reset before then branch
         var then_stmt: *Stmt = stmt.if_then
         while then_stmt != null
             emit_stmt(s, then_stmt, ret_type)
             then_stmt = then_stmt.next
-        let then_result: i32 = s.last_expr_reg  # Capture then branch result
-        let then_exit_label: i32 = s.current_label  # Capture actual exit block
         emit_str(s, "  br label %")
         emit_label(s, end_label)
         emit_str(s, "\n")
 
-        var else_result: i32 = 0
-        var else_exit_label: i32 = else_label
         if stmt.if_else != null
             emit_label(s, else_label)
             emit_str(s, ":\n")
-            s.current_label = else_label  # Track current block
-            s.last_expr_reg = 0  # Reset before else branch
             var else_stmt: *Stmt = stmt.if_else
             while else_stmt != null
                 emit_stmt(s, else_stmt, ret_type)
                 else_stmt = else_stmt.next
-            else_result = s.last_expr_reg  # Capture else branch result
-            else_exit_label = s.current_label  # Capture actual exit block
             emit_str(s, "  br label %")
             emit_label(s, end_label)
             emit_str(s, "\n")
 
         emit_label(s, end_label)
         emit_str(s, ":\n")
-        s.current_label = end_label  # Update current block
-
-        # If both branches produce values, emit a phi node
-        if stmt.if_else != null and then_result > 0 and else_result > 0
-            let phi_reg: i32 = next_reg(s)
-            emit_str(s, "  ")
-            emit_reg(s, phi_reg)
-            emit_str(s, " = phi i64 [ ")
-            emit_reg(s, then_result)
-            emit_str(s, ", %")
-            emit_label(s, then_exit_label)  # Use actual exit block, not entry
-            emit_str(s, " ], [ ")
-            emit_reg(s, else_result)
-            emit_str(s, ", %")
-            emit_label(s, else_exit_label)  # Use actual exit block
-            emit_str(s, " ]\n")
-            s.last_expr_reg = phi_reg  # Set the merged result
-        else if then_result > 0
-            s.last_expr_reg = then_result
-        else
-            s.last_expr_reg = saved_last  # Restore if no result
 
     else if stmt.kind == STMT_WHILE
         let cond_label: i32 = next_label(s)
@@ -3059,9 +2193,7 @@ fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         let end_label: i32 = next_label(s)
 
         let old_break: i32 = s.break_label
-        let old_continue: i32 = s.continue_label
         s.break_label = end_label
-        s.continue_label = cond_label
 
         emit_str(s, "  br label %")
         emit_label(s, cond_label)
@@ -3098,161 +2230,6 @@ fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         emit_str(s, ":\n")
 
         s.break_label = old_break
-        s.continue_label = old_continue
-
-    else if stmt.kind == STMT_LOOP
-        # Infinite loop: loop { body }
-        # Generates:
-        #   br label %loop.body
-        # loop.body:
-        #   ... body ...
-        #   br label %loop.body
-        # loop.end:
-        let body_label: i32 = next_label(s)
-        let end_label: i32 = next_label(s)
-
-        let old_break: i32 = s.break_label
-        let old_continue: i32 = s.continue_label
-        s.break_label = end_label
-        s.continue_label = body_label
-
-        emit_str(s, "  br label %")
-        emit_label(s, body_label)
-        emit_str(s, "\n")
-
-        emit_label(s, body_label)
-        emit_str(s, ":\n")
-        var body_stmt: *Stmt = stmt.while_body
-        while body_stmt != null
-            emit_stmt(s, body_stmt, ret_type)
-            body_stmt = body_stmt.next
-        emit_str(s, "  br label %")
-        emit_label(s, body_label)
-        emit_str(s, "\n")
-
-        emit_label(s, end_label)
-        emit_str(s, ":\n")
-
-        s.break_label = old_break
-        s.continue_label = old_continue
-
-    else if stmt.kind == STMT_FOR
-        # For-loop: for i in start..end { body }
-        # Desugar to:
-        #   %i = alloca i64
-        #   store i64 %start, ptr %i
-        #   br label %for.cond
-        # for.cond:
-        #   %i.val = load i64, ptr %i
-        #   %cmp = icmp slt i64 %i.val, %end
-        #   br i1 %cmp, label %for.body, label %for.end
-        # for.body:
-        #   ... body ...
-        #   %i.next = add i64 %i.val, 1
-        #   store i64 %i.next, ptr %i
-        #   br label %for.cond
-        # for.end:
-
-        let cond_label: i32 = next_label(s)
-        let body_label: i32 = next_label(s)
-        let incr_label: i32 = next_label(s)
-        let end_label: i32 = next_label(s)
-
-        let old_break: i32 = s.break_label
-        let old_continue: i32 = s.continue_label
-        s.break_label = end_label
-        s.continue_label = incr_label
-
-        # Allocate loop variable
-        let var_reg: i32 = next_reg(s)
-        emit_str(s, "  ")
-        emit_reg(s, var_reg)
-        emit_str(s, " = alloca i64\n")
-
-        # Register the loop variable
-        add_local(s, stmt.for_var, stmt.for_var_len, var_reg, TYPE_I64)
-
-        # Emit start expression and store it
-        let start_reg: i32 = emit_expr(s, stmt.for_start)
-        emit_str(s, "  store i64 ")
-        emit_reg(s, start_reg)
-        emit_str(s, ", ptr ")
-        emit_reg(s, var_reg)
-        emit_str(s, "\n")
-
-        # Branch to condition check
-        emit_str(s, "  br label %")
-        emit_label(s, cond_label)
-        emit_str(s, "\n")
-
-        # Condition block
-        emit_label(s, cond_label)
-        emit_str(s, ":\n")
-        let load_reg: i32 = next_reg(s)
-        emit_str(s, "  ")
-        emit_reg(s, load_reg)
-        emit_str(s, " = load i64, ptr ")
-        emit_reg(s, var_reg)
-        emit_str(s, "\n")
-
-        let end_reg: i32 = emit_expr(s, stmt.for_end)
-        let cmp_reg: i32 = next_reg(s)
-        emit_str(s, "  ")
-        emit_reg(s, cmp_reg)
-        emit_str(s, " = icmp slt i64 ")
-        emit_reg(s, load_reg)
-        emit_str(s, ", ")
-        emit_reg(s, end_reg)
-        emit_str(s, "\n")
-        emit_str(s, "  br i1 ")
-        emit_reg(s, cmp_reg)
-        emit_str(s, ", label %")
-        emit_label(s, body_label)
-        emit_str(s, ", label %")
-        emit_label(s, end_label)
-        emit_str(s, "\n")
-
-        # Body block
-        emit_label(s, body_label)
-        emit_str(s, ":\n")
-        var body_stmt: *Stmt = stmt.for_body
-        while body_stmt != null
-            emit_stmt(s, body_stmt, ret_type)
-            body_stmt = body_stmt.next
-        emit_str(s, "  br label %")
-        emit_label(s, incr_label)
-        emit_str(s, "\n")
-
-        # Increment block
-        emit_label(s, incr_label)
-        emit_str(s, ":\n")
-        let load2_reg: i32 = next_reg(s)
-        emit_str(s, "  ")
-        emit_reg(s, load2_reg)
-        emit_str(s, " = load i64, ptr ")
-        emit_reg(s, var_reg)
-        emit_str(s, "\n")
-        let incr_reg: i32 = next_reg(s)
-        emit_str(s, "  ")
-        emit_reg(s, incr_reg)
-        emit_str(s, " = add i64 ")
-        emit_reg(s, load2_reg)
-        emit_str(s, ", 1\n")
-        emit_str(s, "  store i64 ")
-        emit_reg(s, incr_reg)
-        emit_str(s, ", ptr ")
-        emit_reg(s, var_reg)
-        emit_str(s, "\n")
-        emit_str(s, "  br label %")
-        emit_label(s, cond_label)
-        emit_str(s, "\n")
-
-        # End block
-        emit_label(s, end_label)
-        emit_str(s, ":\n")
-
-        s.break_label = old_break
-        s.continue_label = old_continue
 
     else if stmt.kind == STMT_BREAK
         if s.break_label >= 0
@@ -3263,24 +2240,11 @@ fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
             emit_label(s, dead_label)
             emit_str(s, ":\n")
 
-    else if stmt.kind == STMT_CONTINUE
-        if s.continue_label >= 0
-            emit_str(s, "  br label %")
-            emit_label(s, s.continue_label)
-            emit_str(s, "\n")
-            let dead_label: i32 = next_label(s)
-            emit_label(s, dead_label)
-            emit_str(s, ":\n")
-
     else if stmt.kind == STMT_EXPR
         # Note: Implicit return only at function body level, not in nested blocks
         # The implicit_return flag would be passed from emit_fn for top-level statements
         # For now, we just emit the expression without implicit return in nested contexts
-        if stmt.expr == null
-            eprints_cstr("ERROR: STMT_EXPR with null expr field!\n")
-        else
-            let expr_reg: i32 = emit_expr(s, stmt.expr)
-            s.last_expr_reg = expr_reg  # Track for if/else phi nodes
+        emit_expr(s, stmt.expr)
     else if stmt.kind == STMT_LOCAL_FIELD_ASSIGN
         # local_var.field = value
         # stmt.var_name = variable name
@@ -3293,22 +2257,6 @@ fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                 let field_idx: i32 = find_field_index(st, stmt.assign_target, stmt.assign_target_len)
                 if field_idx >= 0
                     let field: *StructField = get_field_type(st, field_idx)
-                    # Get the base pointer - differs for TYPE_PTR/TYPE_REF/TYPE_MUT_REF vs TYPE_STRUCT
-                    var base_ptr_reg: i32 = loc.reg
-                    if loc.var_type == TYPE_PTR or loc.var_type == TYPE_REF or loc.var_type == TYPE_MUT_REF
-                        # Load the pointer value, then convert to ptr
-                        let loaded: i32 = next_reg(s)
-                        emit_str(s, "  ")
-                        emit_reg(s, loaded)
-                        emit_str(s, " = load i64, ptr ")
-                        emit_reg(s, loc.reg)
-                        emit_str(s, "\n")
-                        base_ptr_reg = next_reg(s)
-                        emit_str(s, "  ")
-                        emit_reg(s, base_ptr_reg)
-                        emit_str(s, " = inttoptr i64 ")
-                        emit_reg(s, loaded)
-                        emit_str(s, " to ptr\n")
                     # Get pointer to the field using GEP
                     let field_ptr: i32 = next_reg(s)
                     emit_str(s, "  ")
@@ -3316,7 +2264,7 @@ fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                     emit_str(s, " = getelementptr %")
                     emit_name(s, st.name, st.name_len)
                     emit_str(s, ", ptr ")
-                    emit_reg(s, base_ptr_reg)
+                    emit_reg(s, loc.reg)
                     emit_str(s, ", i32 0, i32 ")
                     emit_int(s, field_idx as i64)
                     emit_str(s, "\n")
@@ -3347,129 +2295,11 @@ fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                         emit_str(s, ", ptr ")
                         emit_reg(s, field_ptr)
                         emit_str(s, "\n")
-                    else if field.field_type == TYPE_STRUCT and field.field_type_name_len > 0
-                        # Struct field - store as struct type
-                        emit_str(s, "  store %")
-                        emit_name(s, field.field_type_name, field.field_type_name_len)
-                        emit_str(s, " ")
-                        emit_reg(s, val_reg)
-                        emit_str(s, ", ptr ")
-                        emit_reg(s, field_ptr)
-                        emit_str(s, "\n")
                     else
                         emit_str(s, "  store i64 ")
                         emit_reg(s, val_reg)
                         emit_str(s, ", ptr ")
                         emit_reg(s, field_ptr)
-                        emit_str(s, "\n")
-    else if stmt.kind == STMT_LOCAL_FIELD_INDEX_ASSIGN
-        # local_var.field[index] = value
-        # stmt.var_name = variable name
-        # stmt.assign_target = field name
-        # stmt.while_cond = index expression (reused)
-        # stmt.assign_value = value expression
-        let loc: *LocalVar = find_local_struct_name(s, stmt.var_name, stmt.var_name_len)
-        if loc != null
-            let st: *StructDef = find_struct(s, loc.type_name, loc.type_name_len)
-            if st != null
-                let field_idx: i32 = find_field_index(st, stmt.assign_target, stmt.assign_target_len)
-                if field_idx >= 0
-                    let field: *StructField = get_field_type(st, field_idx)
-                    # Get the base pointer - differs for TYPE_PTR/TYPE_REF/TYPE_MUT_REF vs TYPE_STRUCT
-                    var base_ptr_reg: i32 = loc.reg
-                    if loc.var_type == TYPE_PTR or loc.var_type == TYPE_REF or loc.var_type == TYPE_MUT_REF
-                        # Load the pointer value, then convert to ptr
-                        let loaded: i32 = next_reg(s)
-                        emit_str(s, "  ")
-                        emit_reg(s, loaded)
-                        emit_str(s, " = load i64, ptr ")
-                        emit_reg(s, loc.reg)
-                        emit_str(s, "\n")
-                        base_ptr_reg = next_reg(s)
-                        emit_str(s, "  ")
-                        emit_reg(s, base_ptr_reg)
-                        emit_str(s, " = inttoptr i64 ")
-                        emit_reg(s, loaded)
-                        emit_str(s, " to ptr\n")
-                    # First GEP to get the field (array within struct)
-                    let field_ptr: i32 = next_reg(s)
-                    emit_str(s, "  ")
-                    emit_reg(s, field_ptr)
-                    emit_str(s, " = getelementptr %")
-                    emit_name(s, st.name, st.name_len)
-                    emit_str(s, ", ptr ")
-                    emit_reg(s, base_ptr_reg)
-                    emit_str(s, ", i32 0, i32 ")
-                    emit_int(s, field_idx as i64)
-                    emit_str(s, "\n")
-                    # Emit index expression
-                    let idx_reg: i32 = emit_expr(s, stmt.while_cond)
-                    # Emit value expression
-                    let val_reg: i32 = emit_expr(s, stmt.assign_value)
-                    # Second GEP to get array element
-                    let elem_ptr: i32 = next_reg(s)
-                    emit_str(s, "  ")
-                    emit_reg(s, elem_ptr)
-                    emit_str(s, " = getelementptr [")
-                    emit_int(s, field.array_size as i64)
-                    emit_str(s, " x ")
-                    if field.array_elem_type == TYPE_I32
-                        emit_str(s, "i32")
-                    else if field.array_elem_type == TYPE_I64
-                        emit_str(s, "i64")
-                    else if field.array_elem_type == TYPE_U8 or field.array_elem_type == TYPE_I8
-                        emit_str(s, "i8")
-                    else if field.array_elem_type == TYPE_PTR or field.array_elem_type == TYPE_PTR_PTR
-                        emit_str(s, "ptr")
-                    else
-                        emit_str(s, "i64")
-                    emit_str(s, "], ptr ")
-                    emit_reg(s, field_ptr)
-                    emit_str(s, ", i64 0, i64 ")
-                    emit_reg(s, idx_reg)
-                    emit_str(s, "\n")
-                    # Store value - handle type conversion
-                    if field.array_elem_type == TYPE_U8 or field.array_elem_type == TYPE_I8
-                        let trunc: i32 = next_reg(s)
-                        emit_str(s, "  ")
-                        emit_reg(s, trunc)
-                        emit_str(s, " = trunc i64 ")
-                        emit_reg(s, val_reg)
-                        emit_str(s, " to i8\n")
-                        emit_str(s, "  store i8 ")
-                        emit_reg(s, trunc)
-                        emit_str(s, ", ptr ")
-                        emit_reg(s, elem_ptr)
-                        emit_str(s, "\n")
-                    else if field.array_elem_type == TYPE_I32
-                        let trunc: i32 = next_reg(s)
-                        emit_str(s, "  ")
-                        emit_reg(s, trunc)
-                        emit_str(s, " = trunc i64 ")
-                        emit_reg(s, val_reg)
-                        emit_str(s, " to i32\n")
-                        emit_str(s, "  store i32 ")
-                        emit_reg(s, trunc)
-                        emit_str(s, ", ptr ")
-                        emit_reg(s, elem_ptr)
-                        emit_str(s, "\n")
-                    else if field.array_elem_type == TYPE_PTR or field.array_elem_type == TYPE_PTR_PTR
-                        let ptr_val: i32 = next_reg(s)
-                        emit_str(s, "  ")
-                        emit_reg(s, ptr_val)
-                        emit_str(s, " = inttoptr i64 ")
-                        emit_reg(s, val_reg)
-                        emit_str(s, " to ptr\n")
-                        emit_str(s, "  store ptr ")
-                        emit_reg(s, ptr_val)
-                        emit_str(s, ", ptr ")
-                        emit_reg(s, elem_ptr)
-                        emit_str(s, "\n")
-                    else
-                        emit_str(s, "  store i64 ")
-                        emit_reg(s, val_reg)
-                        emit_str(s, ", ptr ")
-                        emit_reg(s, elem_ptr)
                         emit_str(s, "\n")
     else if stmt.kind == STMT_INDEX_ASSIGN
         # name[index] = value (array or pointer index assignment)
@@ -3688,11 +2518,6 @@ fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
 fn emit_fn(s: *EmitterState, f: *FnDef)
     # Check if this is an extern function (no body) - emit declare instead of define
     if f.body == null
-        # Skip syscall functions - they're emitted inline at the end
-        # But add them to the extern list so emit_syscall_implementations knows to emit them
-        if is_syscall_function(f.name, f.name_len) == 1
-            add_extern(s, f.name, f.name_len)
-            return
         emit_str(s, "declare ")
         emit_llvm_type(s, f.return_type)
         emit_str(s, " @")
@@ -3704,7 +2529,7 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
             if first == 0
                 emit_str(s, ", ")
             first = 0
-            emit_llvm_type_struct(s, param.param_type, param.param_type_name, param.param_type_name_len)
+            emit_llvm_type(s, param.param_type)
             param = param.next
         emit_str(s, ")\n\n")
         return
@@ -3713,13 +2538,9 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
     s.label_counter = 0
     s.local_count = 0
     s.break_label = -1
-    s.continue_label = -1
-    # Store return type name for struct returns
-    s.ret_type_name = f.return_type_name
-    s.ret_type_name_len = f.return_type_name_len
 
     emit_str(s, "define ")
-    emit_llvm_type_struct(s, f.return_type, f.return_type_name, f.return_type_name_len)
+    emit_llvm_type(s, f.return_type)
     emit_str(s, " @")
     emit_name(s, f.name, f.name_len)
     emit_str(s, "(")
@@ -3730,15 +2551,13 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
         if first2 == 0
             emit_str(s, ", ")
         first2 = 0
-        emit_llvm_type_struct(s, param2.param_type, param2.param_type_name, param2.param_type_name_len)
+        emit_llvm_type(s, param2.param_type)
         emit_str(s, " %")
         emit_name(s, param2.name, param2.name_len)
         emit_str(s, ".arg")
         param2 = param2.next
 
-    # alignstack(16) ensures proper 16-byte stack alignment for SIMD instructions
-    # that clang's optimizer may introduce even when we don't use SIMD explicitly
-    emit_str(s, c") alignstack(16) {\n")
+    emit_str(s, c") {\n")
     emit_str(s, "entry:\n")
 
     var param3: *Param = f.params
@@ -3747,10 +2566,10 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
         emit_str(s, "  ")
         emit_reg(s, alloca_reg)
         emit_str(s, " = alloca ")
-        emit_llvm_type_struct(s, param3.param_type, param3.param_type_name, param3.param_type_name_len)
+        emit_llvm_type(s, param3.param_type)
         emit_str(s, "\n")
         emit_str(s, "  store ")
-        emit_llvm_type_struct(s, param3.param_type, param3.param_type_name, param3.param_type_name_len)
+        emit_llvm_type(s, param3.param_type)
         emit_str(s, " %")
         emit_name(s, param3.name, param3.name_len)
         emit_str(s, ".arg, ptr ")
@@ -3768,13 +2587,10 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
             add_local(s, param3.name, param3.name_len, alloca_reg, param3.param_type)
         param3 = param3.next
 
-    s.last_expr_reg = 0  # Reset before processing function body
-    var has_explicit_return: i32 = 0
     var stmt: *Stmt = f.body
     while stmt != null
         # Check if this is the last statement and it's an expression (implicit return)
         if stmt.next == null and stmt.kind == STMT_EXPR
-            has_explicit_return = 1
             # Special handling for struct literal returns
             if stmt.expr.kind == EXPR_STRUCT_LIT and f.return_type == TYPE_STRUCT
                 # Allocate space for the struct, initialize fields, load and return
@@ -3820,37 +2636,11 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
                     emit_reg(s, val)
                     emit_str(s, "\n")
         else
-            # Track if we hit a return statement
-            if stmt.kind == STMT_RETURN
-                has_explicit_return = 1
             emit_stmt(s, stmt, f.return_type)
         stmt = stmt.next
 
-    # If no explicit return and function has non-void return, use last_expr_reg
-    if has_explicit_return == 0 and f.return_type != TYPE_VOID
-        if s.last_expr_reg > 0
-            if f.return_type == TYPE_I32
-                let trunc: i32 = next_reg(s)
-                emit_str(s, "  ")
-                emit_reg(s, trunc)
-                emit_str(s, " = trunc i64 ")
-                emit_reg(s, s.last_expr_reg)
-                emit_str(s, " to i32\n")
-                emit_str(s, "  ret i32 ")
-                emit_reg(s, trunc)
-                emit_str(s, "\n")
-            else
-                emit_str(s, "  ret ")
-                emit_llvm_type(s, f.return_type)
-                emit_str(s, " ")
-                emit_reg(s, s.last_expr_reg)
-                emit_str(s, "\n")
-        else
-            # No value available, return 0
-            emit_str(s, "  ret ")
-            emit_llvm_type(s, f.return_type)
-            emit_str(s, " 0\n")
-    else if f.return_type == TYPE_VOID and has_explicit_return == 0
+    # For void functions without explicit return, emit ret void
+    if f.return_type == TYPE_VOID
         emit_str(s, "  ret void\n")
     emit_str(s, c"}\n\n")
 
@@ -3870,7 +2660,6 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
     s.label_counter = 0
     s.local_count = 0
     s.break_label = -1
-    s.continue_label = -1
 
     emit_str(s, "define ")
     emit_llvm_type(s, method.return_type)
@@ -3893,9 +2682,7 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
         emit_str(s, ".arg")
         param = param.next
 
-    # alignstack(16) ensures proper 16-byte stack alignment for SIMD instructions
-    # that clang's optimizer may introduce even when we don't use SIMD explicitly
-    emit_str(s, c") alignstack(16) {\n")
+    emit_str(s, c") {\n")
     emit_str(s, "entry:\n")
 
     var param2: *Param = method.params
@@ -4026,8 +2813,7 @@ fn emit_string_constants(s: *EmitterState)
 fn is_local_function(m: *Module, name: *u8, len: i32) -> i32
     var f: *FnDef = m.functions
     while f != null
-        # Only consider functions with bodies (not extern declarations)
-        if f.body != null && f.name_len == len
+        if f.name_len == len
             var j: i32 = 0
             var matched: i32 = 1
             while j < len
@@ -4040,102 +2826,24 @@ fn is_local_function(m: *Module, name: *u8, len: i32) -> i32
         f = f.next
     0
 
-# Emit inline syscall implementations for commonly used syscall functions
-fn emit_syscall_implementations(s: *EmitterState)
-    emit_str(s, "; Inline syscall implementations\n")
-
-    # syscall0-6: low-level syscall wrappers
-    emit_str(s, "define i64 @syscall0(i64 %n) \{\n")
-    emit_str(s, "  %ret = call i64 asm sideeffect \"syscall\", \"=\{rax\},\{rax\},~\{rcx\},~\{r11\},~\{memory\}\"(i64 %n)\n")
-    emit_str(s, "  ret i64 %ret\n")
-    emit_str(s, "\}\n\n")
-
-    emit_str(s, "define i64 @syscall1(i64 %n, i64 %a1) \{\n")
-    emit_str(s, "  %ret = call i64 asm sideeffect \"syscall\", \"=\{rax\},\{rax\},\{rdi\},~\{rcx\},~\{r11\},~\{memory\}\"(i64 %n, i64 %a1)\n")
-    emit_str(s, "  ret i64 %ret\n")
-    emit_str(s, "\}\n\n")
-
-    emit_str(s, "define i64 @syscall2(i64 %n, i64 %a1, i64 %a2) \{\n")
-    emit_str(s, "  %ret = call i64 asm sideeffect \"syscall\", \"=\{rax\},\{rax\},\{rdi\},\{rsi\},~\{rcx\},~\{r11\},~\{memory\}\"(i64 %n, i64 %a1, i64 %a2)\n")
-    emit_str(s, "  ret i64 %ret\n")
-    emit_str(s, "\}\n\n")
-
-    emit_str(s, "define i64 @syscall3(i64 %n, i64 %a1, i64 %a2, i64 %a3) \{\n")
-    emit_str(s, "  %ret = call i64 asm sideeffect \"syscall\", \"=\{rax\},\{rax\},\{rdi\},\{rsi\},\{rdx\},~\{rcx\},~\{r11\},~\{memory\}\"(i64 %n, i64 %a1, i64 %a2, i64 %a3)\n")
-    emit_str(s, "  ret i64 %ret\n")
-    emit_str(s, "\}\n\n")
-
-    emit_str(s, "define i64 @syscall4(i64 %n, i64 %a1, i64 %a2, i64 %a3, i64 %a4) \{\n")
-    emit_str(s, "  %ret = call i64 asm sideeffect \"syscall\", \"=\{rax\},\{rax\},\{rdi\},\{rsi\},\{rdx\},\{r10\},~\{rcx\},~\{r11\},~\{memory\}\"(i64 %n, i64 %a1, i64 %a2, i64 %a3, i64 %a4)\n")
-    emit_str(s, "  ret i64 %ret\n")
-    emit_str(s, "\}\n\n")
-
-    emit_str(s, "define i64 @syscall5(i64 %n, i64 %a1, i64 %a2, i64 %a3, i64 %a4, i64 %a5) \{\n")
-    emit_str(s, "  %ret = call i64 asm sideeffect \"syscall\", \"=\{rax\},\{rax\},\{rdi\},\{rsi\},\{rdx\},\{r10\},\{r8\},~\{rcx\},~\{r11\},~\{memory\}\"(i64 %n, i64 %a1, i64 %a2, i64 %a3, i64 %a4, i64 %a5)\n")
-    emit_str(s, "  ret i64 %ret\n")
-    emit_str(s, "\}\n\n")
-
-    emit_str(s, "define i64 @syscall6(i64 %n, i64 %a1, i64 %a2, i64 %a3, i64 %a4, i64 %a5, i64 %a6) \{\n")
-    emit_str(s, "  %ret = call i64 asm sideeffect \"syscall\", \"=\{rax\},\{rax\},\{rdi\},\{rsi\},\{rdx\},\{r10\},\{r8\},\{r9\},~\{rcx\},~\{r11\},~\{memory\}\"(i64 %n, i64 %a1, i64 %a2, i64 %a3, i64 %a4, i64 %a5, i64 %a6)\n")
-    emit_str(s, "  ret i64 %ret\n")
-    emit_str(s, "\}\n\n")
-
-    # Note: Higher-level syscall wrappers (sys_write, sys_read, etc.) are
-    # defined in ritzlib/sys.ritz and will be included when that module is imported.
-
-# Check if an external name is a syscall function we implement inline
-# (Only the low-level syscall0-6 functions; higher-level wrappers come from ritzlib/sys.ritz)
-fn is_syscall_function(name: *u8, len: i32) -> i32
-    if name_eq(name, len, "syscall0", 8) == 1
-        return 1
-    if name_eq(name, len, "syscall1", 8) == 1
-        return 1
-    if name_eq(name, len, "syscall2", 8) == 1
-        return 1
-    if name_eq(name, len, "syscall3", 8) == 1
-        return 1
-    if name_eq(name, len, "syscall4", 8) == 1
-        return 1
-    if name_eq(name, len, "syscall5", 8) == 1
-        return 1
-    if name_eq(name, len, "syscall6", 8) == 1
-        return 1
-    0
-
 fn emit_extern_declarations(s: *EmitterState)
-    # Check if we need syscall implementations
-    var need_syscalls: i32 = 0
     for i in 0..s.extern_count
         let ex: *ExternFunc = @s.externs[i]
+        # Skip if this is a function defined in this module
         if is_local_function(s.module, ex.name, ex.name_len) == 0
-            if is_syscall_function(ex.name, ex.name_len) == 1
-                need_syscalls = 1
-
-    # Emit syscall implementations if needed
-    if need_syscalls == 1
-        emit_syscall_implementations(s)
-
-    # Emit remaining external declarations (non-syscall functions)
-    for i in 0..s.extern_count
-        let ex: *ExternFunc = @s.externs[i]
-        # Skip if this is a function defined in this module or a syscall we implement
-        if is_local_function(s.module, ex.name, ex.name_len) == 0
-            if is_syscall_function(ex.name, ex.name_len) == 0
-                emit_str(s, "declare i64 @")
-                emit_name(s, ex.name, ex.name_len)
-                emit_str(s, "(...)\n")
+            emit_str(s, "declare i64 @")
+            emit_name(s, ex.name, ex.name_len)
+            emit_str(s, "(...)\n")
     if s.extern_count > 0
         emit_str(s, "\n")
 
 fn emit_field_llvm_type(s: *EmitterState, f: *StructField)
-    if f.field_type == TYPE_I32 or f.field_type == TYPE_U32
+    if f.field_type == TYPE_I32
         emit_str(s, "i32")
     else if f.field_type == TYPE_I64
         emit_str(s, "i64")
     else if f.field_type == TYPE_U8 or f.field_type == TYPE_I8
         emit_str(s, "i8")
-    else if f.field_type == TYPE_U16 or f.field_type == TYPE_I16
-        emit_str(s, "i16")
     else if f.field_type == TYPE_BOOL
         emit_str(s, "i1")
     else if f.field_type == TYPE_PTR or f.field_type == TYPE_PTR_PTR
@@ -4195,6 +2903,15 @@ fn is_builtin_struct(name: *u8, len: i32) -> i32
         return 1
     0
 
+# Find a global variable by name
+fn find_global(s: *EmitterState, name: *u8, len: i32) -> *GlobalVarDef
+    var g: *GlobalVarDef = s.module.globals
+    while g != null
+        if name_eq(g.name, g.name_len, name, len) == 1
+            return g
+        g = g.next
+    return null
+
 fn emit_struct_types(s: *EmitterState)
     var st: *StructDef = s.module.structs
     while st != null
@@ -4243,9 +2960,9 @@ fn emit_global_vars(s: *EmitterState)
         if g.var_type == TYPE_STRUCT
             emit_str(s, "%")
             emit_name(s, g.type_name, g.type_name_len)
-        else if g.var_type == TYPE_I32 or g.var_type == TYPE_U32
+        else if g.var_type == TYPE_I32
             emit_str(s, "i32")
-        else if g.var_type == TYPE_I64 or g.var_type == TYPE_U64
+        else if g.var_type == TYPE_I64
             emit_str(s, "i64")
         else if g.var_type == TYPE_PTR
             emit_str(s, "ptr")
@@ -4292,18 +3009,6 @@ fn emit_builtin_struct_types(s: *EmitterState)
     # String wraps Vec<u8> internally - same layout
     emit_str(s, c"%String = type { ptr, i64, i64 }\n")
 
-    # NFA-related types (used by lexer/parser)
-    # NFAFragment = { i64, i64 } - start, end
-    emit_str(s, c"%NFAFragment = type { i64, i64 }\n")
-    # TokenPattern = { i64, i64, %NFAFragment } - token_type, priority, frag
-    emit_str(s, c"%TokenPattern = type { i64, i64, %NFAFragment }\n")
-    # NFAState = { i64, i64, i64 } - id, is_accept, token_type
-    emit_str(s, c"%NFAState = type { i64, i64, i64 }\n")
-    # Transition = { i64, i64, i64, i64, i64 } - kind, char_lo, char_hi, from_state, to_state
-    emit_str(s, c"%Transition = type { i64, i64, i64, i64, i64 }\n")
-    # NFA = { ptr, i64, ptr, i64, i64 } - states, state_count, transitions, trans_count, start_state
-    emit_str(s, c"%NFA = type { ptr, i64, ptr, i64, i64 }\n")
-
     emit_str(s, "\n")
 
     # Mark all builtin types as emitted so emit_struct_types won't re-emit them
@@ -4321,17 +3026,8 @@ fn emit_builtin_struct_types(s: *EmitterState)
     mark_struct_emitted(s, "String", 6)
     # Also mark generic base names (not instantiations) to prevent emission
     # These are template types that shouldn't be emitted without type parameters
-    # Note: Vec<T> and Span<T> in ritzlib have type_params set, so they'll be skipped
-    # via the `st.type_params != null` check. We mark Vec here to prevent any
-    # accidental emission of a non-generic Vec. We do NOT mark Span because
-    # ast.ritz has a non-generic Span struct that needs to be emitted.
     mark_struct_emitted(s, "Vec", 3)
-    # NFA-related types
-    mark_struct_emitted(s, "NFAFragment", 11)
-    mark_struct_emitted(s, "TokenPattern", 12)
-    mark_struct_emitted(s, "NFAState", 8)
-    mark_struct_emitted(s, "Transition", 10)
-    mark_struct_emitted(s, "NFA", 3)
+    mark_struct_emitted(s, "Span", 4)
 
 # =============================================================================
 # Builtin Struct AST Registration
@@ -4369,21 +3065,6 @@ fn make_array_field(name: *u8, len: i32, ty: i32, arr_size: i32, elem_ty: i32) -
     f.next = null
     f
 
-fn make_array_struct_field(name: *u8, len: i32, ty: i32, arr_size: i32, elem_ty: i32, elem_name: *u8, elem_name_len: i32) -> *StructField
-    # StructField is 64 bytes (with alignment)
-    let f: *StructField = malloc(64) as *StructField
-    f.name = name
-    f.name_len = len
-    f.field_type = ty
-    f.field_type_name = null
-    f.field_type_name_len = 0
-    f.array_size = arr_size
-    f.array_elem_type = elem_ty
-    f.array_elem_type_name = elem_name
-    f.array_elem_type_name_len = elem_name_len
-    f.next = null
-    f
-
 fn make_struct(name: *u8, len: i32, fields: *StructField) -> *StructDef
     # StructDef: name(8) + name_len(4) + pad(4) + fields(8) + next(8) + type_params(8) = 40 bytes
     let s: *StructDef = malloc(40) as *StructDef
@@ -4418,9 +3099,9 @@ fn register_builtin_structs(m: *Module)
     # Fields: program_name, description, options[32], option_count, pos_defs[8], pos_def_count, positionals[256], positional_count, error_msg
     var ap_f1: *StructField = make_field("program_name", 12, TYPE_PTR)
     var ap_f2: *StructField = make_field("description", 11, TYPE_PTR)
-    var ap_f3: *StructField = make_array_struct_field("options", 7, TYPE_ARRAY, 32, TYPE_STRUCT, "OptDef", 6)
+    var ap_f3: *StructField = make_array_field("options", 7, TYPE_ARRAY, 32, TYPE_STRUCT)
     var ap_f4: *StructField = make_field("option_count", 12, TYPE_I32)
-    var ap_f5: *StructField = make_array_struct_field("pos_defs", 8, TYPE_ARRAY, 8, TYPE_STRUCT, "PosDef", 6)
+    var ap_f5: *StructField = make_array_field("pos_defs", 8, TYPE_ARRAY, 8, TYPE_STRUCT)
     var ap_f6: *StructField = make_field("pos_def_count", 13, TYPE_I32)
     var ap_f7: *StructField = make_array_field("positionals", 11, TYPE_ARRAY, 256, TYPE_PTR)
     var ap_f8: *StructField = make_field("positional_count", 16, TYPE_I32)
@@ -4435,66 +3116,10 @@ fn register_builtin_structs(m: *Module)
     ap_f8.next = ap_f9
     var arg_parser: *StructDef = make_struct("ArgParser", 9, ap_f1)
 
-    # NFAFragment = { i64 start, i64 end }
-    var nfafrag_fields: *StructField = make_field("start", 5, TYPE_I64)
-    nfafrag_fields = link_fields_2(nfafrag_fields, make_field("end", 3, TYPE_I64))
-    var nfafrag: *StructDef = make_struct("NFAFragment", 11, nfafrag_fields)
-
-    # TokenPattern = { i64 token_type, i64 priority, NFAFragment frag }
-    var tokpat_f1: *StructField = make_field("token_type", 10, TYPE_I64)
-    var tokpat_f2: *StructField = make_field("priority", 8, TYPE_I64)
-    var tokpat_f3: *StructField = make_field("frag", 4, TYPE_STRUCT)
-    tokpat_f3.field_type_name = c"NFAFragment"
-    tokpat_f3.field_type_name_len = 11
-    tokpat_f1.next = tokpat_f2
-    tokpat_f2.next = tokpat_f3
-    var tokpat: *StructDef = make_struct("TokenPattern", 12, tokpat_f1)
-
-    # NFAState = { i64 id, i64 is_accept, i64 token_type }
-    var nfastate_f1: *StructField = make_field("id", 2, TYPE_I64)
-    var nfastate_f2: *StructField = make_field("is_accept", 9, TYPE_I64)
-    var nfastate_f3: *StructField = make_field("token_type", 10, TYPE_I64)
-    nfastate_f1.next = nfastate_f2
-    nfastate_f2.next = nfastate_f3
-    var nfastate: *StructDef = make_struct("NFAState", 8, nfastate_f1)
-
-    # Transition = { i64 kind, i64 char_lo, i64 char_hi, i64 from_state, i64 to_state }
-    var trans_f1: *StructField = make_field("kind", 4, TYPE_I64)
-    var trans_f2: *StructField = make_field("char_lo", 7, TYPE_I64)
-    var trans_f3: *StructField = make_field("char_hi", 7, TYPE_I64)
-    var trans_f4: *StructField = make_field("from_state", 10, TYPE_I64)
-    var trans_f5: *StructField = make_field("to_state", 8, TYPE_I64)
-    trans_f1.next = trans_f2
-    trans_f2.next = trans_f3
-    trans_f3.next = trans_f4
-    trans_f4.next = trans_f5
-    var transition: *StructDef = make_struct("Transition", 10, trans_f1)
-
-    # NFA = { *NFAState states, i64 state_count, *Transition transitions, i64 trans_count, i64 start_state }
-    var nfa_f1: *StructField = make_field("states", 6, TYPE_PTR)
-    nfa_f1.field_type_name = c"NFAState"
-    nfa_f1.field_type_name_len = 8
-    var nfa_f2: *StructField = make_field("state_count", 11, TYPE_I64)
-    var nfa_f3: *StructField = make_field("transitions", 11, TYPE_PTR)
-    nfa_f3.field_type_name = c"Transition"
-    nfa_f3.field_type_name_len = 10
-    var nfa_f4: *StructField = make_field("trans_count", 11, TYPE_I64)
-    var nfa_f5: *StructField = make_field("start_state", 11, TYPE_I64)
-    nfa_f1.next = nfa_f2
-    nfa_f2.next = nfa_f3
-    nfa_f3.next = nfa_f4
-    nfa_f4.next = nfa_f5
-    var nfa: *StructDef = make_struct("NFA", 3, nfa_f1)
-
     # Link the builtin structs and prepend to module's struct list
     vec_u8.next = span_u8
     span_u8.next = arg_parser
-    arg_parser.next = nfafrag
-    nfafrag.next = tokpat
-    tokpat.next = nfastate
-    nfastate.next = transition
-    transition.next = nfa
-    nfa.next = m.structs
+    arg_parser.next = m.structs
     m.structs = vec_u8
 
 fn emit_module(m: *Module, out: *Vec<u8>) -> i32
@@ -4507,7 +3132,6 @@ fn emit_module(m: *Module, out: *Vec<u8>) -> i32
     s.label_counter = 0
     s.local_count = 0
     s.break_label = -1
-    s.continue_label = -1
     s.module = m
     s.string_count = 0
     s.extern_count = 0

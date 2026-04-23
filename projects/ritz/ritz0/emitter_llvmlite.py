@@ -391,6 +391,21 @@ class LLVMEmitter:
     def _ritz_type_to_llvm(self, ty: rast.Type) -> ir.Type:
         """Convert a Ritz type to an LLVM type."""
         if isinstance(ty, rast.NamedType):
+            if ty.args:
+                specialized_name = self._get_specialized_type_name(ty)
+                if specialized_name in self.union_types:
+                    return self.union_types[specialized_name][0]
+                if specialized_name in self.enum_types:
+                    return self.enum_types[specialized_name][0]
+                if specialized_name in self.struct_types:
+                    return self.struct_types[specialized_name]
+                synthesized = self._ensure_builtin_generic_specialization(ty)
+                if synthesized and synthesized in self.enum_types:
+                    return self.enum_types[synthesized][0]
+                synthesized_struct = self._ensure_builtin_generic_struct_specialization(ty)
+                if synthesized_struct and synthesized_struct in self.struct_types:
+                    return self.struct_types[synthesized_struct]
+
             mapping = {
                 'i8': self.i8,
                 'i16': self.i16,
@@ -406,6 +421,17 @@ class LLVMEmitter:
             }
             if ty.name in mapping:
                 return mapping[ty.name]
+            if ty.name == 'StrView':
+                if 'StrView' in self.struct_types:
+                    return self.struct_types['StrView']
+                strview_ty = self.module.context.get_identified_type('StrView')
+                strview_ty.set_body(self.i8.as_pointer(), self.i64)
+                self.struct_types['StrView'] = strview_ty
+                self.struct_fields['StrView'] = [
+                    ('ptr', rast.PtrType(ty.span, rast.NamedType(ty.span, 'u8', []), mutable=False)),
+                    ('len', rast.NamedType(ty.span, 'i64', [])),
+                ]
+                return strview_ty
             # SIMD vector type aliases (SSE2 128-bit vectors)
             simd_types = {
                 'v2i64': ir.VectorType(self.i64, 2),  # <2 x i64>
@@ -433,6 +459,15 @@ class LLVMEmitter:
             # Check for struct types
             if ty.name in self.struct_types:
                 return self.struct_types[ty.name]
+            # Legacy mangling fallback: Vec_u8 -> Vec$u8
+            if '_' in ty.name and '$' not in ty.name:
+                legacy_name = ty.name.replace('_', '$', 1)
+                if legacy_name in self.union_types:
+                    return self.union_types[legacy_name][0]
+                if legacy_name in self.enum_types:
+                    return self.enum_types[legacy_name][0]
+                if legacy_name in self.struct_types:
+                    return self.struct_types[legacy_name]
             # Treat unknown types as opaque struct types (i8 placeholder)
             # This allows forward references and unknown struct types
             return self.i8
@@ -487,7 +522,75 @@ class LLVMEmitter:
             element_types = [self._ritz_type_to_llvm(elem) for elem in ty.elements]
             return ir.LiteralStructType(element_types)
         else:
-            raise ValueError(f"Unknown type: {ty}")
+            return self.i8
+
+    def _ensure_builtin_generic_specialization(self, ty: rast.NamedType) -> Optional[str]:
+        """Synthesize Result/Option specializations on demand when monomorphization missed them."""
+        if not ty.args:
+            return None
+
+        specialized_name = self._get_specialized_type_name(ty)
+        if specialized_name in self.enum_types:
+            return specialized_name
+        if ty.name == 'Result' and len(ty.args) == 2:
+            variants = [
+                rast.Variant(ty.span, 'Ok', [ty.args[0]]),
+                rast.Variant(ty.span, 'Err', [ty.args[1]]),
+            ]
+        elif ty.name == 'Option' and len(ty.args) == 1:
+            variants = [
+                rast.Variant(ty.span, 'Some', [ty.args[0]]),
+                rast.Variant(ty.span, 'None', []),
+            ]
+        else:
+            return None
+
+        enum_type = self.module.context.get_identified_type(specialized_name)
+        self.enum_types[specialized_name] = (enum_type, variants)
+        for variant in variants:
+            self.variant_to_enum[variant.name] = specialized_name
+
+        max_size = 0
+        max_align = 1
+        for variant in variants:
+            if variant.fields:
+                field_llvm_ty = self._ritz_type_to_llvm(variant.fields[0])
+                size = self._type_size_bytes(field_llvm_ty)
+                align = self._type_size_bytes(field_llvm_ty)
+                max_size = max(max_size, size)
+                max_align = max(max_align, align)
+
+        if max_size > 0:
+            tag_size = 1
+            padding_needed = (max_align - (tag_size % max_align)) % max_align
+            if padding_needed > 0:
+                enum_type.set_body(self.i8, ir.ArrayType(self.i8, padding_needed), ir.ArrayType(self.i8, max_size))
+            else:
+                enum_type.set_body(self.i8, ir.ArrayType(self.i8, max_size))
+        else:
+            enum_type.set_body(self.i8)
+
+        return specialized_name
+
+    def _ensure_builtin_generic_struct_specialization(self, ty: rast.NamedType) -> Optional[str]:
+        """Synthesize lightweight generic structs used by built-ins (Span<T>)."""
+        if not ty.args:
+            return None
+        specialized_name = self._get_specialized_type_name(ty)
+        if specialized_name in self.struct_types:
+            return specialized_name
+        if ty.name != 'Span' or len(ty.args) != 1:
+            return None
+
+        elem_ty = self._ritz_type_to_llvm(ty.args[0])
+        span_ty = self.module.context.get_identified_type(specialized_name)
+        span_ty.set_body(ir.PointerType(elem_ty), self.i64)
+        self.struct_types[specialized_name] = span_ty
+        self.struct_fields[specialized_name] = [
+            ('ptr', rast.PtrType(ty.span, ty.args[0], mutable=False)),
+            ('len', rast.NamedType(ty.span, 'i64', [])),
+        ]
+        return specialized_name
 
     def _type_size_bytes(self, ty: ir.Type) -> int:
         """Get the size of an LLVM type in bytes."""
@@ -593,20 +696,38 @@ class LLVMEmitter:
             return inner_type
         elif isinstance(expr, rast.Call):
             # Look up function return type from self.functions
+            fn_name = None
             if isinstance(expr.func, rast.Ident):
                 fn_name = expr.func.name
+            elif isinstance(expr.func, str):
+                fn_name = expr.func
+            if fn_name:
                 if fn_name in self.functions:
                     _, fn_def = self.functions[fn_name]
                     return fn_def.ret_type
-                # Check for generic instantiation
+                # Check for generic instantiation / mangled variants
                 for name, (_, fn_def) in self.functions.items():
                     if name.startswith(fn_name + '$'):
                         return fn_def.ret_type
             return None
         elif isinstance(expr, rast.MethodCall):
+            # Built-in StrView -> Span<u8> conversion.
+            if expr.method == 'as_bytes':
+                base_type = self._infer_ritz_type(expr.expr)
+                if isinstance(base_type, rast.NamedType) and base_type.name == 'StrView':
+                    return rast.NamedType(expr.span, 'Span', [rast.NamedType(expr.span, 'u8', [])])
             # Method call return type - look up in method signatures
             return None  # Complex - would need full type resolution
         elif isinstance(expr, rast.Field):
+            # Qualified enum variant: EnumName.Variant
+            if isinstance(expr.expr, rast.Ident):
+                enum_name = expr.expr.name
+                if enum_name in self.enum_types:
+                    try:
+                        self._get_enum_variant(enum_name, expr.field)
+                        return rast.NamedType(expr.span, enum_name, [])
+                    except ValueError:
+                        pass
             # Field access - resolve struct type and return field type
             base_type = self._infer_ritz_type(expr.expr)
             if base_type:
@@ -893,22 +1014,46 @@ class LLVMEmitter:
 
         Creates an immutable global array that can be indexed.
         """
+        is_strview_array = (
+            isinstance(ritz_type, rast.ArrayType)
+            and isinstance(ritz_type.inner, rast.NamedType)
+            and ritz_type.inner.name == "StrView"
+        )
         # Get the LLVM array type
         llvm_type = self._ritz_type_to_llvm(ritz_type)
-        if not isinstance(llvm_type, ir.ArrayType):
-            raise ValueError(f"Const array '{name}' must have array type, got {llvm_type}")
-
-        elem_type = llvm_type.element
+        if is_strview_array:
+            # StrView may not be fully resolved yet when constants are emitted.
+            # Rebuild the array type explicitly as [N x StrView].
+            if "StrView" in self.struct_types:
+                strview_ty = self.struct_types["StrView"]
+            else:
+                strview_ty = ir.LiteralStructType([self.i8.as_pointer(), self.i64])
+            count = ritz_type.size if isinstance(ritz_type.size, int) else 0
+            llvm_type = ir.ArrayType(strview_ty, count)
+            elem_type = strview_ty
+        else:
+            if not isinstance(llvm_type, ir.ArrayType):
+                raise ValueError(f"Const array '{name}' must have array type, got {llvm_type}")
+            elem_type = llvm_type.element
 
         # Extract element values
         if isinstance(value, rast.ArrayLit):
             elements = []
             for elem in value.elements:
-                elem_val = self._extract_int_from_expr(elem)
-                elements.append(ir.Constant(elem_type, elem_val))
+                if isinstance(elem, rast.StringLit) and is_strview_array:
+                    elements.append(self._make_const_strview_value(elem.value, f"{name}.arr", elem_type))
+                elif isinstance(elem, rast.StructLit):
+                    elements.append(self._make_const_struct_value(elem, elem_type, f"{name}.arr"))
+                else:
+                    elem_val = self._extract_int_from_expr(elem)
+                    elements.append(ir.Constant(elem_type, elem_val))
         elif isinstance(value, rast.ArrayFill):
-            fill_val = self._extract_int_from_expr(value.value)
-            elements = [ir.Constant(elem_type, fill_val)] * value.count
+            if isinstance(value.value, rast.StringLit) and is_strview_array:
+                fill = self._make_const_strview_value(value.value.value, f"{name}.fill", elem_type)
+                elements = [fill] * value.count
+            else:
+                fill_val = self._extract_int_from_expr(value.value)
+                elements = [ir.Constant(elem_type, fill_val)] * value.count
         else:
             raise ValueError(f"Const array '{name}' must be array literal or fill")
 
@@ -925,6 +1070,74 @@ class LLVMEmitter:
         # because they need to be addressed for indexing
         self.const_arrays[name] = (gvar, llvm_type)
         self.ritz_types[name] = ritz_type
+
+    def _const_value_from_expr(self, expr: rast.Expr, target_type: ir.Type, name_hint: str) -> ir.Constant:
+        """Build a compile-time constant value for globals/const arrays."""
+        if isinstance(expr, rast.IntLit):
+            return ir.Constant(target_type, expr.value)
+        if isinstance(expr, rast.UnaryOp) and expr.op == '-' and isinstance(expr.operand, rast.IntLit):
+            return ir.Constant(target_type, -expr.operand.value)
+        if isinstance(expr, rast.BoolLit):
+            return ir.Constant(target_type, 1 if expr.value else 0)
+        if isinstance(expr, rast.StringLit) and self._is_strview_llvm_type(target_type):
+            return self._make_const_strview_value(expr.value, name_hint, target_type)
+        if isinstance(expr, rast.StructLit):
+            return self._make_const_struct_value(expr, target_type, name_hint)
+        raise ValueError(f"Unsupported const expression for target {target_type}: {expr}")
+
+    def _make_const_struct_value(self, expr: rast.StructLit, target_type: ir.Type, name_hint: str) -> ir.Constant:
+        """Create an LLVM constant for a struct literal used in const contexts."""
+        if expr.name not in self.struct_fields:
+            raise ValueError(f"Unknown struct in const literal: {expr.name}")
+
+        field_exprs = {fname: fexpr for fname, fexpr in expr.fields}
+        field_types = self.struct_fields[expr.name]
+        field_constants = []
+        for field_name, field_ritz_type in field_types:
+            if field_name not in field_exprs:
+                raise ValueError(f"Missing field '{field_name}' in const struct literal {expr.name}")
+            field_llvm_type = self._ritz_type_to_llvm(field_ritz_type)
+            field_expr = field_exprs[field_name]
+            field_const = self._const_value_from_expr(field_expr, field_llvm_type, f"{name_hint}.{field_name}")
+            field_constants.append(field_const)
+
+        return ir.Constant(target_type, field_constants)
+
+    def _is_strview_llvm_type(self, ty: ir.Type) -> bool:
+        """Heuristic check for StrView-like LLVM struct: { *i8, i64 }."""
+        if not isinstance(ty, ir.BaseStructType):
+            return False
+        elements = ty.elements
+        if len(elements) != 2:
+            return False
+        ptr_ty, len_ty = elements
+        return (
+            isinstance(ptr_ty, ir.PointerType)
+            and ptr_ty.pointee == self.i8
+            and len_ty == self.i64
+        )
+
+    def _make_const_strview_value(self, value: str, name_hint: str, target_type: Optional[ir.Type] = None) -> ir.Constant:
+        """Create a constant StrView value and backing static string global."""
+        str_type = ir.ArrayType(self.i8, len(value) + 1)
+        str_bytes = bytearray(value, 'utf-8') + b'\x00'
+        str_const = ir.Constant(str_type, str_bytes)
+        gname = f".str.{name_hint}.{self.string_counter}"
+        self.string_counter += 1
+        str_gvar = ir.GlobalVariable(self.module, str_type, name=gname)
+        str_gvar.global_constant = True
+        str_gvar.initializer = str_const
+        str_gvar.linkage = "internal"
+
+        str_ptr = str_gvar.bitcast(self.i8.as_pointer())
+        if target_type is not None:
+            strview_ty = target_type
+        elif "StrView" in self.struct_types:
+            strview_ty = self.struct_types["StrView"]
+        else:
+            strview_ty = ir.LiteralStructType([self.i8.as_pointer(), self.i64])
+        length_const = ir.Constant(self.i64, len(value))
+        return ir.Constant(strview_ty, [str_ptr, length_const])
 
     def _extract_int_from_expr(self, expr: rast.Expr) -> int:
         """Extract an integer value from a constant expression."""
@@ -1353,51 +1566,19 @@ class LLVMEmitter:
         # Generate IR string
         ir_str = str(self.module)
 
-        # Post-process IR to add alignstack(16) to ALL functions.
-        # This ensures proper 16-byte stack alignment even when clang's -O2
-        # introduces SIMD instructions (movaps requires 16-byte aligned memory).
-        # The x86-64 ABI requires 16-byte stack alignment at function entry,
-        # and alignstack(16) forces LLVM to maintain this guarantee.
-        ir_str = self._add_alignstack_to_all_functions(ir_str)
+        # Post-process IR to add alignstack(16) attribute to SIMD functions
+        # This ensures proper 16-byte stack alignment for SIMD operations
+        # (e.g., movaps instruction requires 16-byte aligned memory addresses)
+        if self.simd_functions:
+            ir_str = self._add_simd_alignstack(ir_str)
 
         # Add header comment
         lines = ir_str.split('\n')
         lines.insert(0, '; Ritz compiled module')
         return '\n'.join(lines)
 
-    def _add_alignstack_to_all_functions(self, ir_str: str) -> str:
-        """Add alignstack(16) attribute to ALL function definitions.
-
-        Clang's -O2 optimizer can introduce SIMD instructions (movaps, etc.)
-        in ANY function, not just those that explicitly use SIMD types.
-        These SIMD instructions require 16-byte aligned stack addresses.
-
-        The x86-64 ABI guarantees 16-byte stack alignment at function entry.
-        Adding alignstack(16) ensures LLVM maintains this alignment when
-        it generates prologue/epilogue code.
-
-        This fixes SIGSEGV crashes when SIMD instructions access misaligned stack.
-        """
-        import re
-
-        # Match function definitions at start of line: define ... @"name"(...) !dbg
-        # The pattern must:
-        # 1. Start at line beginning with 'define'
-        # 2. Have @"funcname"(...) format
-        # 3. Not already have alignstack
-        # We use negative lookbehind to skip if alignstack already present
-        # Pattern: start of line, define, type, @"name"(...), optional space, !dbg or {
-        pattern = r'^(define [^\n]+@"[^"]+"\([^)]*\))(?! alignstack)(\s*)(!dbg|\{)'
-        replacement = r'\1 alignstack(16)\2\3'
-        ir_str = re.sub(pattern, replacement, ir_str, flags=re.MULTILINE)
-
-        return ir_str
-
     def _add_simd_alignstack(self, ir_str: str) -> str:
         """Add alignstack(16) attribute to functions that use SIMD.
-
-        NOTE: This is now superseded by _add_alignstack_to_all_functions,
-        but kept for reference and potential future selective use.
 
         SIMD operations (SSE2/AVX) often require 16-byte aligned memory.
         When LLVM's register allocator spills SIMD registers to the stack,
@@ -1696,6 +1877,15 @@ class LLVMEmitter:
 
         enum_type, variants = self.enum_types[enum_name]
 
+        # Prefer actual emitted LLVM struct layout when available.
+        elems = getattr(enum_type, 'elements', None)
+        if elems is not None:
+            if len(elems) >= 3:
+                return 2
+            if len(elems) >= 2:
+                return 1
+            raise ValueError(f"Enum {enum_name} has no data buffer")
+
         # Calculate max alignment of all variant payloads
         max_align = 1
         has_data = False
@@ -1775,9 +1965,24 @@ class LLVMEmitter:
             for i, (field_type, arg) in enumerate(zip(variant.fields, args)):
                 arg_val = self._emit_expr(arg)
                 llvm_field_type = self._ritz_type_to_llvm(field_type)
+                # Generic placeholder fields (e.g., T/E in unspecialized Result/Option)
+                # lower to i8; use the argument's concrete LLVM type instead.
+                if (
+                    isinstance(field_type, rast.NamedType)
+                    and not field_type.args
+                    and len(field_type.name) == 1
+                    and field_type.name.isupper()
+                    and llvm_field_type == self.i8
+                    and arg_val.type != self.i8
+                ):
+                    llvm_field_type = arg_val.type
 
                 # Convert arg to field type (e.g., i64 literal -> i32)
                 arg_val = self._convert_type(arg_val, llvm_field_type)
+                # If conversion could not realize an unresolved generic i8 placeholder,
+                # keep the concrete argument type to preserve payload fidelity.
+                if arg_val.type != llvm_field_type and llvm_field_type == self.i8:
+                    llvm_field_type = arg_val.type
 
                 # Cast data buffer to pointer to field type
                 field_ptr = self.builder.bitcast(
@@ -1817,6 +2022,31 @@ class LLVMEmitter:
             # Fallback to regular expression emission
             return self._emit_expr(expr)
 
+    def _resolve_enum_type_name(self, ty: Optional[rast.Type], llvm_hint: Optional[ir.Type] = None) -> Optional[str]:
+        """Resolve a Ritz type annotation to a concrete enum type name when possible."""
+        if llvm_hint is not None:
+            for enum_name, (enum_ty, _) in self.enum_types.items():
+                if enum_ty == llvm_hint:
+                    return enum_name
+        if not isinstance(ty, rast.NamedType):
+            return None
+        if ty.args:
+            specialized_name = self._get_specialized_type_name(ty)
+            if specialized_name in self.enum_types:
+                return specialized_name
+            synthesized = self._ensure_builtin_generic_specialization(ty)
+            if synthesized and synthesized in self.enum_types:
+                return synthesized
+        if ty.name in self.enum_types:
+            return ty.name
+        return None
+
+    def _emit_expr_with_expected_enum(self, expr: rast.Expr, expected_enum_name: Optional[str]) -> ir.Value:
+        """Emit expression, forcing enum variant constructors to a specific enum type."""
+        if expected_enum_name and self._is_enum_variant_call(expr):
+            return self._emit_enum_variant_with_type(expr, expected_enum_name)
+        return self._emit_expr(expr)
+
     def _emit_enum_variant_constructor_for_type(self, variant_name: str, args: List[rast.Expr], enum_name: str) -> ir.Value:
         """Emit code to construct an enum variant for a specific enum type.
 
@@ -1848,9 +2078,24 @@ class LLVMEmitter:
             for i, (field_type, arg) in enumerate(zip(variant.fields, args)):
                 arg_val = self._emit_expr(arg)
                 llvm_field_type = self._ritz_type_to_llvm(field_type)
+                # Generic placeholder fields (e.g., T/E in unspecialized Result/Option)
+                # lower to i8; use the argument's concrete LLVM type instead.
+                if (
+                    isinstance(field_type, rast.NamedType)
+                    and not field_type.args
+                    and len(field_type.name) == 1
+                    and field_type.name.isupper()
+                    and llvm_field_type == self.i8
+                    and arg_val.type != self.i8
+                ):
+                    llvm_field_type = arg_val.type
 
                 # Convert arg to field type (e.g., i64 literal -> i32)
                 arg_val = self._convert_type(arg_val, llvm_field_type)
+                # If conversion could not realize an unresolved generic i8 placeholder,
+                # keep the concrete argument type to preserve payload fidelity.
+                if arg_val.type != llvm_field_type and llvm_field_type == self.i8:
+                    llvm_field_type = arg_val.type
 
                 # Cast data buffer to pointer to field type
                 field_ptr = self.builder.bitcast(
@@ -2230,10 +2475,29 @@ class LLVMEmitter:
             if type_name.startswith(prefix):
                 # Extract type parameter suffix (e.g., "u8" from "Vec$u8")
                 type_param = type_name[len(prefix):]
-                # Try: vec_len$u8, vec_swap$u8, etc.
-                candidate = f"{fn_prefix}{method_name}${type_param}"
-                if candidate in self.functions:
-                    return candidate
+                base = f"{fn_prefix}{method_name}"
+
+                # Preferred exact forms.
+                exact_candidates = [
+                    f"{base}${type_param}",
+                    base,
+                ]
+                for candidate in exact_candidates:
+                    if candidate in self.functions:
+                        return candidate
+
+                # Namespaced/mangled fallback forms (strict suffix match only).
+                for name in self.functions:
+                    if name.endswith(f"{base}${type_param}"):
+                        return name
+                # Generic template fallback (e.g., vec_push$T) if specialization missing.
+                for generic_param in ("T", "U", "V", "K", "E"):
+                    generic_candidate = f"{base}${generic_param}"
+                    if generic_candidate in self.functions:
+                        return generic_candidate
+                for name in self.functions:
+                    if any(name.endswith(f"{base}${gp}") for gp in ("T", "U", "V", "K", "E")):
+                        return name
 
         # Non-generic types: String, GrowBuf, Buffer, etc.
         non_generic_mappings = {
@@ -2248,6 +2512,12 @@ class LLVMEmitter:
             candidate = f"{fn_prefix}{method_name}"
             if candidate in self.functions:
                 return candidate
+            for name in self.functions:
+                if name.endswith(candidate):
+                    return name
+            for name in self.functions:
+                if candidate in name:
+                    return name
 
         return None
 
@@ -2658,7 +2928,7 @@ class LLVMEmitter:
 
             # Check if parameter is a reference type or mutable borrow
             is_mutable_borrow = hasattr(param, 'borrow') and param.borrow == rast.Borrow.MUTABLE
-            is_ref_type = isinstance(param.type, rast.RefType)
+            is_ref_type = isinstance(param.type, (rast.RefType, rast.PtrType))
 
             if is_mutable_borrow:
                 # :& borrow: arg is *T where T is param.type
@@ -2712,7 +2982,8 @@ class LLVMEmitter:
                 # Set expected type for closure inference if return type is a function type
                 if isinstance(fn_def.ret_type, rast.FnType):
                     self.closure_expected_type = fn_def.ret_type
-                last_val = self._emit_expr(fn_def.body.expr)
+                expected_enum_name = self._resolve_enum_type_name(fn_def.ret_type, ret_type)
+                last_val = self._emit_expr_with_expected_enum(fn_def.body.expr, expected_enum_name)
                 self.closure_expected_type = None  # Clear context
                 last_val = self._convert_type(last_val, ret_type)
                 # Emit drops before returning (excluding moved variable)
@@ -2878,16 +3149,11 @@ class LLVMEmitter:
                 # Set expected type for closure inference if return type is a function type
                 if self.current_fn_def and isinstance(self.current_fn_def.ret_type, rast.FnType):
                     self.closure_expected_type = self.current_fn_def.ret_type
-
-                # Check if this is an enum variant constructor that needs type context
-                # This handles return None, return Some(x), etc. for generic enum types
-                if (self._is_enum_variant_call(stmt.value) and
-                    self.current_fn_def and
-                    isinstance(self.current_fn_def.ret_type, rast.NamedType)):
-                    # Use function return type to construct the correct variant
-                    val = self._emit_enum_variant_with_type(stmt.value, self.current_fn_def.ret_type.name)
-                else:
-                    val = self._emit_expr(stmt.value)
+                expected_enum_name = self._resolve_enum_type_name(
+                    self.current_fn_def.ret_type if self.current_fn_def else None,
+                    ret_type
+                )
+                val = self._emit_expr_with_expected_enum(stmt.value, expected_enum_name)
                 self.closure_expected_type = None  # Clear context
                 val = self._convert_type(val, ret_type)
                 # Emit drops for all scopes before return (excluding moved variable)
@@ -2950,9 +3216,13 @@ class LLVMEmitter:
                 elif isinstance(stmt.value, rast.ArrayFill) and stmt.value.count > 64:
                     self._emit_array_fill_to_alloca(stmt.value, alloca, ty)
                 # Check if this is an enum variant constructor that needs type context
-                elif self._is_enum_variant_call(stmt.value) and stmt.type and isinstance(stmt.type, rast.NamedType):
-                    # Use declared enum type to construct the correct variant
-                    val = self._emit_enum_variant_with_type(stmt.value, stmt.type.name)
+                elif self._is_enum_variant_call(stmt.value) and stmt.type:
+                    enum_name = self._resolve_enum_type_name(stmt.type, ty)
+                    if enum_name:
+                        # Use declared enum type (including specializations) to construct the variant.
+                        val = self._emit_enum_variant_with_type(stmt.value, enum_name)
+                    else:
+                        val = self._emit_expr(stmt.value)
                     val = self._convert_type(val, ty)
                     self.builder.store(val, alloca)
                 else:
@@ -2961,7 +3231,8 @@ class LLVMEmitter:
                         if stmt.type.name in ('v8i32', 'v4i64', 'v16i16', 'v32i8',
                                               'v4i32', 'v2i64', 'v8i16', 'v16i8'):
                             self.simd_expected_type = stmt.type
-                    val = self._emit_expr(stmt.value)
+                    expected_enum_name = self._resolve_enum_type_name(stmt.type, ty) if stmt.type else None
+                    val = self._emit_expr_with_expected_enum(stmt.value, expected_enum_name)
                     self.simd_expected_type = None  # Clear SIMD context
                     val = self._convert_type(val, ty)
                     self.builder.store(val, alloca)
@@ -2993,7 +3264,11 @@ class LLVMEmitter:
                     if stmt.type.name in ('v8i32', 'v4i64', 'v16i16', 'v32i8',
                                           'v4i32', 'v2i64', 'v8i16', 'v16i8'):
                         self.simd_expected_type = stmt.type
-                val = self._emit_expr(stmt.value)
+                expected_enum_name = (
+                    self._resolve_enum_type_name(stmt.type, self._ritz_type_to_llvm(stmt.type))
+                    if stmt.type else None
+                )
+                val = self._emit_expr_with_expected_enum(stmt.value, expected_enum_name)
                 self.closure_expected_type = None  # Clear context
                 self.simd_expected_type = None  # Clear SIMD context
             if stmt.type:
@@ -3018,11 +3293,12 @@ class LLVMEmitter:
             tuple_val = self._emit_expr(stmt.value)
 
             # Extract each element and bind to the corresponding name
-            if not isinstance(tuple_val.type, ir.LiteralStructType):
+            if not isinstance(tuple_val.type, ir.BaseStructType):
                 raise ValueError(f"Cannot destructure non-tuple type: {tuple_val.type}")
 
-            if len(stmt.names) != len(tuple_val.type.elements):
-                raise ValueError(f"Tuple destructuring mismatch: expected {len(tuple_val.type.elements)} "
+            elements = tuple_val.type.elements
+            if len(stmt.names) != len(elements):
+                raise ValueError(f"Tuple destructuring mismatch: expected {len(elements)} "
                                f"elements, got {len(stmt.names)} names")
 
             for i, name in enumerate(stmt.names):
@@ -3183,7 +3459,10 @@ class LLVMEmitter:
                     else:
                         raise ValueError(f"Cannot determine struct type for field assignment")
                 else:
-                    raise ValueError(f"Invalid type for field assignment: {struct_val.type}")
+                    raise ValueError(
+                        f"Invalid type for field assignment: {struct_val.type} "
+                        f"at {stmt.span} target={stmt.target!r}"
+                    )
             else:
                 raise NotImplementedError(f"Assignment to: {type(stmt.target)}")
             return None
@@ -3550,11 +3829,8 @@ class LLVMEmitter:
                 constraints.append("r")
 
         # Replace {name} with $N in template
-        # First, escape literal $ for LLVM inline asm ($ -> $$)
-        # BUT: preserve existing $$ (which means literal $ in AT&T syntax)
-        # Use regex to escape only single $ (not part of $$)
-        import re
-        template_escaped = re.sub(r'(?<!\$)\$(?!\$)', '$$', template)
+        # First, escape literal $ for LLVM
+        template_escaped = template.replace('$', '$$')
 
         # Now replace {name} with temporary markers
         operand_markers = {}
@@ -3924,11 +4200,13 @@ class LLVMEmitter:
                 body
                 x = x + 1
         """
-        # For now, only support Range expressions
-        if not isinstance(stmt.iter, rast.Range):
-            raise NotImplementedError(f"for loop only supports range expressions, got {type(stmt.iter)}")
+        iter_expr = self._normalize_for_iter_expr(stmt.iter)
 
-        range_expr = stmt.iter
+        # Support both range loops and iterable loops (arrays/Vec-like values).
+        if not isinstance(iter_expr, rast.Range):
+            return self._emit_for_iterable(stmt)
+
+        range_expr = iter_expr
         if range_expr.start is None or range_expr.end is None:
             raise NotImplementedError("for loop requires both start and end in range")
 
@@ -4036,6 +4314,164 @@ class LLVMEmitter:
         self.builder.position_at_end(end_block)
         return None
 
+    def _normalize_for_iter_expr(self, expr: rast.Expr) -> rast.Expr:
+        """Normalize parser edge-cases so range loops still lower as ranges."""
+        if isinstance(expr, rast.Range):
+            return expr
+
+        # `for i in 0..n as usize` can parse as BinOp('as', Range(...), usize).
+        if isinstance(expr, rast.BinOp):
+            # Unwrap trailing casts over a range.
+            if expr.op == 'as' and isinstance(expr.left, rast.Range):
+                return expr.left
+            if expr.op == 'as':
+                normalized_left = self._normalize_for_iter_expr(expr.left)
+                if isinstance(normalized_left, rast.Range):
+                    return normalized_left
+
+            # `for i in 0..n - 1` may parse as BinOp('-', Range(0..n), 1).
+            if isinstance(expr.left, rast.Range):
+                left_range = expr.left
+                adjusted_end = rast.BinOp(expr.span, expr.op, left_range.end, expr.right)
+                return rast.Range(left_range.span, left_range.start, adjusted_end, left_range.inclusive)
+
+        if isinstance(expr, rast.Cast):
+            normalized_inner = self._normalize_for_iter_expr(expr.expr)
+            if isinstance(normalized_inner, rast.Range):
+                return normalized_inner
+
+        return expr
+
+    def _emit_for_iterable(self, stmt: rast.ForStmt) -> None:
+        """Emit `for x in iterable` loops for arrays and Vec-like values."""
+        iter_val = self._emit_expr(stmt.iter)
+
+        iter_kind = None
+        elem_ty = None
+        arr_ptr = None
+        vec_ptr = None
+        vec_get_fn = None
+
+        if isinstance(iter_val.type, ir.ArrayType):
+            iter_kind = "array"
+            elem_ty = iter_val.type.element
+            arr_ptr = self._alloca_in_entry_block(iter_val.type, "for.arr")
+            self.builder.store(iter_val, arr_ptr)
+            arr_len = iter_val.type.count
+        elif isinstance(iter_val.type, ir.PointerType) and isinstance(iter_val.type.pointee, ir.ArrayType):
+            iter_kind = "array_ptr"
+            elem_ty = iter_val.type.pointee.element
+            arr_ptr = iter_val
+            arr_len = iter_val.type.pointee.count
+        else:
+            vec_candidate_ptr = None
+            if isinstance(iter_val.type, ir.PointerType) and isinstance(iter_val.type.pointee, ir.BaseStructType):
+                vec_candidate_ptr = iter_val
+            elif isinstance(iter_val.type, ir.BaseStructType):
+                temp_vec = self._alloca_in_entry_block(iter_val.type, "for.vec")
+                self.builder.store(iter_val, temp_vec)
+                vec_candidate_ptr = temp_vec
+
+            if vec_candidate_ptr is not None:
+                src_elems = vec_candidate_ptr.type.pointee.elements
+                if (
+                    len(src_elems) >= 2
+                    and isinstance(src_elems[0], ir.PointerType)
+                    and isinstance(src_elems[1], ir.IntType)
+                ):
+                    iter_kind = "vec_like"
+                    vec_ptr = vec_candidate_ptr
+                    elem_ty = src_elems[0].pointee
+                    struct_name = self._get_struct_name_from_type(vec_ptr.type.pointee)
+                    if struct_name and struct_name.startswith("Vec$"):
+                        elem_suffix = struct_name[4:]
+                        get_name = f"vec_get${elem_suffix}"
+                        if get_name in self.functions:
+                            vec_get_fn = self.functions[get_name][0]
+
+        if iter_kind is None or elem_ty is None:
+            raise NotImplementedError(f"for loop iterable not supported: {stmt.iter} (llvm={iter_val.type})")
+
+        idx_var = self._alloca_in_entry_block(self.i64, f"{stmt.var}.idx")
+        self.builder.store(ir.Constant(self.i64, 0), idx_var)
+
+        cond_block = self.current_fn.append_basic_block("for.iter.cond")
+        body_block = self.current_fn.append_basic_block("for.iter.body")
+        incr_block = self.current_fn.append_basic_block("for.iter.incr")
+        end_block = self.current_fn.append_basic_block("for.iter.end")
+
+        self.loop_stack.append((incr_block, end_block))
+        self.builder.branch(cond_block)
+
+        prev_param = self.params.get(stmt.var)
+        prev_ritz = self.ritz_types.get(stmt.var) if stmt.var in self.ritz_types else None
+
+        self.builder.position_at_end(cond_block)
+        idx_val = self.builder.load(idx_var)
+        if iter_kind in ("array", "array_ptr"):
+            len_val = ir.Constant(self.i64, arr_len)
+        else:
+            len_ptr = self.builder.gep(vec_ptr, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)])
+            len_raw = self.builder.load(len_ptr)
+            len_val = len_raw if len_raw.type == self.i64 else self._convert_type(len_raw, self.i64)
+        cond = self.builder.icmp_unsigned('<', idx_val, len_val)
+        self.builder.cbranch(cond, body_block, end_block)
+
+        self.builder.position_at_end(body_block)
+        saved_returned = self.has_returned
+        self.has_returned = False
+
+        idx_val = self.builder.load(idx_var)
+        if iter_kind in ("array", "array_ptr"):
+            elem_ptr = self.builder.gep(arr_ptr, [ir.Constant(self.i32, 0), idx_val])
+            elem_val = self.builder.load(elem_ptr)
+        else:
+            if vec_get_fn is not None:
+                get_index_ty = vec_get_fn.function_type.args[1]
+                get_idx = idx_val if idx_val.type == get_index_ty else self._convert_type(idx_val, get_index_ty)
+                elem_val = self.builder.call(vec_get_fn, [vec_ptr, get_idx])
+            else:
+                data_ptr_ptr = self.builder.gep(vec_ptr, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)])
+                data_ptr = self.builder.load(data_ptr_ptr)
+                elem_ptr = self.builder.gep(data_ptr, [idx_val])
+                elem_val = self.builder.load(elem_ptr)
+
+        self.params[stmt.var] = (elem_val, elem_val.type)
+        for s in stmt.body.stmts:
+            result = self._emit_stmt(s)
+            if result is True:
+                break
+
+        if not self.builder.block.is_terminated and stmt.body.expr:
+            if isinstance(stmt.body.expr, rast.If):
+                self._emit_if(stmt.body.expr)
+            else:
+                self._emit_expr(stmt.body.expr)
+
+        if not self.builder.block.is_terminated:
+            self.builder.branch(incr_block)
+
+        self.has_returned = saved_returned
+
+        self.builder.position_at_end(incr_block)
+        idx_val = self.builder.load(idx_var)
+        next_idx = self.builder.add(idx_val, ir.Constant(self.i64, 1))
+        self.builder.store(next_idx, idx_var)
+        self.builder.branch(cond_block)
+
+        self.loop_stack.pop()
+        if prev_param is None:
+            self.params.pop(stmt.var, None)
+        else:
+            self.params[stmt.var] = prev_param
+        if prev_ritz is None:
+            self.ritz_types.pop(stmt.var, None)
+        else:
+            self.ritz_types[stmt.var] = prev_ritz
+
+        self.builder.position_at_end(end_block)
+        return None
+
     def _is_signed_type(self, ty) -> bool:
         """Check if an LLVM integer type should be treated as signed."""
         # i8, i16, i32, i64 are signed by convention in Ritz
@@ -4134,6 +4570,10 @@ class LLVMEmitter:
                 gvar = self.const_strviews[name]
                 # Load the StrView struct from the global
                 return self.builder.load(gvar)
+            # Check constant arrays
+            if name in self.const_arrays:
+                gvar, _ = self.const_arrays[name]
+                return self.builder.load(gvar)
 
             # Check locals (var bindings) FIRST - mutable vars shadow let bindings
             # This is critical because the same name may appear as both 'var' and 'let'
@@ -4156,6 +4596,12 @@ class LLVMEmitter:
             if name == "nil":
                 # Return a null pointer of i8* type
                 return ir.Constant(ir.IntType(8).as_pointer(), None)
+            # Tolerate numeric-suffix parser fallback tokens (e.g., 0usize -> `usize`).
+            if name in ("usize", "isize"):
+                return ir.Constant(self.i64, 0)
+            # Treat pass as a unit/no-op expression when it appears in expression position.
+            if name == "pass":
+                return ir.Constant(self.i32, 0)
 
             # Check if this is a unit variant (enum variant without parentheses)
             if name in self.variant_to_enum:
@@ -4176,6 +4622,16 @@ class LLVMEmitter:
 
         elif isinstance(expr, rast.BinOp):
             op = expr.op
+
+            # Parser fallback: some `x as T` forms arrive as BinOp('as', x, T).
+            if op == 'as':
+                if isinstance(expr.right, rast.NamedType):
+                    target_ty = expr.right
+                elif isinstance(expr.right, rast.Ident):
+                    target_ty = rast.NamedType(expr.right.span, expr.right.name, [])
+                else:
+                    raise ValueError(f"Invalid cast target in 'as' expression: {type(expr.right)}")
+                return self._emit_cast(rast.Cast(expr.span, expr.left, target_ty))
 
             # Handle and/or operators
             # For boolean types (i1): use short-circuit evaluation
@@ -4425,6 +4881,22 @@ class LLVMEmitter:
 
     def _emit_index(self, expr: rast.Index) -> ir.Value:
         """Emit an indexing operation: base[index]."""
+        if isinstance(expr.index, rast.Range):
+            slice_end = expr.index.end
+            if expr.index.inclusive and slice_end is not None:
+                slice_end = rast.BinOp(
+                    span=slice_end.span,
+                    op='+',
+                    left=slice_end,
+                    right=rast.IntLit(span=slice_end.span, value=1)
+                )
+            return self._emit_slice(rast.SliceExpr(
+                span=expr.span,
+                expr=expr.expr,
+                start=expr.index.start,
+                end=slice_end
+            ))
+
         index = self._emit_expr(expr.index)
 
         # Special handling for identifiers that are arrays
@@ -4513,16 +4985,18 @@ class LLVMEmitter:
 
                         # Build vec_get call: vec_get$T(&v, i)
                         fn_name = f"vec_get${elem_type_name}"
-                        if fn_name not in self.functions:
-                            raise ValueError(f"Vec indexing requires {fn_name} to be defined")
-
-                        fn, _ = self.functions[fn_name]
-                        # Get pointer to vec
                         vec_ptr = self._emit_lvalue_addr(expr.expr)
-                        # Ensure index is i64
                         if index.type != self.i64:
                             index = self.builder.sext(index, self.i64)
-                        return self.builder.call(fn, [vec_ptr, index])
+                        if fn_name in self.functions:
+                            fn, _ = self.functions[fn_name]
+                            return self.builder.call(fn, [vec_ptr, index])
+                        # Fallback: index Vec storage directly via data pointer.
+                        data_field_idx = self._get_struct_field_index(type_name, 'data')
+                        data_ptr_ptr = self.builder.gep(vec_ptr, [ir.Constant(self.i32, 0), ir.Constant(self.i32, data_field_idx)])
+                        data_ptr = self.builder.load(data_ptr_ptr)
+                        elem_ptr = self.builder.gep(data_ptr, [index])
+                        return self.builder.load(elem_ptr)
 
                     # Handle String indexing: s[i] -> string_get(&s, i)
                     elif type_name == 'String':
@@ -4552,16 +5026,100 @@ class LLVMEmitter:
                             index = self.builder.sext(index, self.i64)
                         return self.builder.call(fn, [map_ptr, index])
 
+        # Vec<T> indexing sugar for non-identifier receivers (e.g., self.entries[i]).
+        inferred_base_type = self._infer_ritz_type(expr.expr)
+        if isinstance(inferred_base_type, rast.NamedType):
+            inferred_name = inferred_base_type.name
+            if inferred_name.startswith('Vec$') or inferred_name == 'Vec':
+                if inferred_name.startswith('Vec$'):
+                    elem_type_name = inferred_name[4:]
+                elif inferred_base_type.args:
+                    elem_type_name = self._type_to_name_suffix(inferred_base_type.args[0])
+                else:
+                    elem_type_name = None
+                if elem_type_name:
+                    fn_name = f"vec_get${elem_type_name}"
+                    try:
+                        vec_ptr = self._emit_lvalue_addr(expr.expr)
+                    except ValueError:
+                        vec_val = self._emit_expr(expr.expr)
+                        vec_tmp = self._alloca_in_entry_block(vec_val.type, "vec.tmp")
+                        self.builder.store(vec_val, vec_tmp)
+                        vec_ptr = vec_tmp
+                    if index.type != self.i64:
+                        if isinstance(index.type, ir.IntType) and index.type.width < 64:
+                            index = self.builder.sext(index, self.i64)
+                        elif isinstance(index.type, ir.IntType) and index.type.width > 64:
+                            index = self.builder.trunc(index, self.i64)
+                    if fn_name in self.functions:
+                        return self.builder.call(self.functions[fn_name][0], [vec_ptr, index])
+                    data_field_idx = self._get_struct_field_index(inferred_name, 'data')
+                    data_ptr_ptr = self.builder.gep(vec_ptr, [ir.Constant(self.i32, 0), ir.Constant(self.i32, data_field_idx)])
+                    data_ptr = self.builder.load(data_ptr_ptr)
+                    elem_ptr = self.builder.gep(data_ptr, [index])
+                    return self.builder.load(elem_ptr)
+
+        # Span<T> indexing sugar: s[i] -> *(s.ptr + i)
+        span_ritz_type = self._infer_ritz_type(expr.expr)
+        if isinstance(span_ritz_type, rast.NamedType):
+            is_span = span_ritz_type.name == 'Span' or span_ritz_type.name.startswith('Span$')
+            if is_span:
+                span_val = self._emit_expr(expr.expr)
+                if isinstance(span_val.type, ir.PointerType):
+                    span_val = self.builder.load(span_val)
+                span_ptr = self.builder.extract_value(span_val, 0)
+                if index.type != self.i64:
+                    if isinstance(index.type, ir.IntType) and index.type.width < 64:
+                        index = self.builder.sext(index, self.i64)
+                    elif isinstance(index.type, ir.IntType) and index.type.width > 64:
+                        index = self.builder.trunc(index, self.i64)
+                elem_ptr = self.builder.gep(span_ptr, [index])
+                return self.builder.load(elem_ptr)
+
         # General case
         base = self._emit_expr(expr.expr)
 
+        # Shape-based Span indexing fallback: { *T, i64 }[i].
+        if isinstance(base.type, ir.BaseStructType):
+            elems = base.type.elements
+            if len(elems) == 2 and isinstance(elems[0], ir.PointerType) and isinstance(elems[1], ir.IntType):
+                span_ptr = self.builder.extract_value(base, 0)
+                if index.type != self.i64:
+                    if isinstance(index.type, ir.IntType) and index.type.width < 64:
+                        index = self.builder.sext(index, self.i64)
+                    elif isinstance(index.type, ir.IntType) and index.type.width > 64:
+                        index = self.builder.trunc(index, self.i64)
+                elem_ptr = self.builder.gep(span_ptr, [index])
+                return self.builder.load(elem_ptr)
+            # Shape-based Vec indexing fallback: { *T, len, ... }[i].
+            if len(elems) >= 3 and isinstance(elems[0], ir.PointerType) and isinstance(elems[1], ir.IntType):
+                data_ptr = self.builder.extract_value(base, 0)
+                if index.type != self.i64:
+                    if isinstance(index.type, ir.IntType) and index.type.width < 64:
+                        index = self.builder.sext(index, self.i64)
+                    elif isinstance(index.type, ir.IntType) and index.type.width > 64:
+                        index = self.builder.trunc(index, self.i64)
+                elem_ptr = self.builder.gep(data_ptr, [index])
+                return self.builder.load(elem_ptr)
+
         # Get element type
         if isinstance(base.type, ir.PointerType):
-            elem_type = base.type.pointee
-            # GEP to get pointer to element
-            ptr = self.builder.gep(base, [index])
-            # Load the element
-            return self.builder.load(ptr)
+            pointee = base.type.pointee
+            if isinstance(pointee, ir.ArrayType):
+                # Pointer to array - need two-level GEP [0, index]
+                zero = ir.Constant(self.i32, 0)
+                # Ensure index is i32 for GEP consistency
+                if isinstance(index.type, ir.IntType) and index.type.width != 32:
+                    if index.type.width < 32:
+                        index = self.builder.sext(index, self.i32)
+                    else:
+                        index = self.builder.trunc(index, self.i32)
+                ptr = self.builder.gep(base, [zero, index])
+                return self.builder.load(ptr)
+            else:
+                # Pointer to element - single-level GEP [index]
+                ptr = self.builder.gep(base, [index])
+                return self.builder.load(ptr)
         else:
             raise ValueError(f"Cannot index type: {base.type}")
 
@@ -4592,9 +5150,43 @@ class LLVMEmitter:
                     # Handle Vec<T> slicing
                     if type_name.startswith('Vec$') or type_name == 'Vec':
                         return self._emit_vec_slice(expr, type_name, base_ritz_type)
+                    # Handle Span<T> slicing.
+                    if type_name.startswith('Span$') or type_name == 'Span':
+                        return self._emit_span_slice(expr)
 
         raise ValueError(f"Slice operation not supported for this type. "
                          f"Only String and Vec types support slicing.")
+
+    def _emit_span_slice(self, expr: rast.SliceExpr) -> ir.Value:
+        """Emit span slice: s[a:b] -> Span<T> { ptr + a, b - a }."""
+        span_val = self._emit_expr(expr.expr)
+        if isinstance(span_val.type, ir.PointerType):
+            span_val = self.builder.load(span_val)
+        span_type = span_val.type
+        base_ptr = self.builder.extract_value(span_val, 0)
+        base_len = self.builder.extract_value(span_val, 1)
+        if base_len.type != self.i64:
+            base_len = self._convert_type(base_len, self.i64)
+
+        if expr.start is not None:
+            start = self._emit_expr(expr.start)
+            if start.type != self.i64:
+                start = self._convert_type(start, self.i64)
+        else:
+            start = ir.Constant(self.i64, 0)
+
+        if expr.end is not None:
+            end = self._emit_expr(expr.end)
+            if end.type != self.i64:
+                end = self._convert_type(end, self.i64)
+        else:
+            end = base_len
+
+        new_ptr = self.builder.gep(base_ptr, [start])
+        new_len = self.builder.sub(end, start)
+        out = self.builder.insert_value(ir.Constant(span_type, ir.Undefined), new_ptr, 0)
+        out = self.builder.insert_value(out, new_len, 1)
+        return out
 
     def _emit_string_slice(self, expr: rast.SliceExpr) -> ir.Value:
         """Emit string slice: s[1:5] → string_slice(&s, 1, 5)."""
@@ -5408,7 +6000,11 @@ class LLVMEmitter:
         """
         ret_type = self.current_fn.function_type.return_type
         if expr.value is not None:
-            ret_val = self._emit_expr(expr.value)
+            expected_enum_name = self._resolve_enum_type_name(
+                self.current_fn_def.ret_type if self.current_fn_def else None,
+                ret_type
+            )
+            ret_val = self._emit_expr_with_expected_enum(expr.value, expected_enum_name)
             ret_val = self._convert_type(ret_val, ret_type)
             self.builder.ret(ret_val)
         else:
@@ -5876,6 +6472,50 @@ class LLVMEmitter:
         For local variables, uses GEP directly on the alloca to avoid loading
         the entire struct into a register (which can crash LLVM for large structs).
         """
+        # Namespace-qualified symbol fallback (e.g., instructions.NPUSHB).
+        # If the qualifier is not a value in scope, resolve by field symbol.
+        if isinstance(expr.expr, rast.Ident):
+            ns_name = expr.expr.name
+            qualifier_known = (
+                ns_name in self.locals
+                or ns_name in self.params
+                or ns_name in self.globals
+                or ns_name in self.ritz_types
+                or ns_name in self.constants
+                or ns_name in self.const_arrays
+                or (hasattr(self, 'const_strviews') and ns_name in self.const_strviews)
+                or ns_name in self.functions
+                or ns_name in self.struct_types
+                or ns_name in self.enum_types
+                or ns_name in self.union_types
+            )
+            if not qualifier_known:
+                if expr.field in self.constants:
+                    val, ty = self.constants[expr.field]
+                    return ir.Constant(ty, val)
+                if hasattr(self, 'const_strviews') and expr.field in self.const_strviews:
+                    return self.builder.load(self.const_strviews[expr.field])
+                if expr.field in self.const_arrays:
+                    gvar, _ = self.const_arrays[expr.field]
+                    return self.builder.load(gvar)
+                if expr.field in self.globals:
+                    gvar, _ = self.globals[expr.field]
+                    return self.builder.load(gvar)
+                if expr.field in self.functions:
+                    fn, _ = self.functions[expr.field]
+                    return fn
+
+        # Qualified enum variant access: EnumName.Variant
+        if isinstance(expr.expr, rast.Ident):
+            enum_name = expr.expr.name
+            if enum_name in self.enum_types:
+                variant = self._get_enum_variant(enum_name, expr.field)
+                if variant.fields:
+                    raise ValueError(
+                        f"Variant '{enum_name}.{expr.field}' requires constructor args"
+                    )
+                return self._emit_enum_variant_constructor_for_type(expr.field, [], enum_name)
+
         # Check for tuple field access (numeric field names)
         if expr.field.isdigit():
             index = int(expr.field)
@@ -5973,9 +6613,9 @@ class LLVMEmitter:
                         inner_type = inner_type.inner
                     if isinstance(inner_type, rast.NamedType):
                         struct_name = inner_type.name
-                        if struct_name in self.structs:
+                        if struct_name in self.struct_types:
                             # We know it's a pointer to this struct type - bitcast and access
-                            llvm_struct_type = self.structs[struct_name]
+                            llvm_struct_type = self.struct_types[struct_name]
                             typed_ptr = self.builder.bitcast(struct_val, ir.PointerType(llvm_struct_type))
                             idx = self._get_struct_field_index(struct_name, expr.field)
                             field_ptr = self.builder.gep(typed_ptr, [ir.Constant(self.i32, 0), ir.Constant(self.i32, idx)])
@@ -6134,12 +6774,27 @@ class LLVMEmitter:
             return self._emit_generic_syscall(fname, call.args)
 
         # Look up user-defined function
-        if fname in self.functions:
-            fn, fn_def = self.functions[fname]
+        resolved_name = None
+        if hasattr(call, 'type_args') and call.type_args:
+            suffix = "_".join(self._type_to_name_suffix(t) for t in call.type_args)
+            candidate = f"{fname}${suffix}"
+            if candidate in self.functions:
+                resolved_name = candidate
+        if resolved_name is None and fname in self.functions:
+            resolved_name = fname
+        if resolved_name is None:
+            prefix = f"{fname}$"
+            for candidate in self.functions:
+                if candidate.startswith(prefix):
+                    resolved_name = candidate
+                    break
+
+        if resolved_name is not None:
+            fn, fn_def = self.functions[resolved_name]
 
             # Check argument count BEFORE processing
             if len(call.args) != len(fn.function_type.args):
-                raise ValueError(f"Function '{fname}' called with {len(call.args)} args but defined with {len(fn.function_type.args)} params")
+                raise ValueError(f"Function '{resolved_name}' called with {len(call.args)} args but defined with {len(fn.function_type.args)} params")
 
             # Emit arguments with type conversion and String -> *u8 coercion
             # Also handle RERITZ Borrow semantics - borrowed params need addresses
@@ -6167,10 +6822,24 @@ class LLVMEmitter:
                         val = self._emit_expr(arg)
                     else:
                         # Reference parameter: emit address of the argument
-                        val = self._emit_lvalue_addr(arg)
+                        try:
+                            val = self._emit_lvalue_addr(arg)
+                        except ValueError:
+                            tmp_val = self._emit_expr(arg)
+                            tmp = self._alloca_in_entry_block(tmp_val.type, "arg.tmp")
+                            self.builder.store(tmp_val, tmp)
+                            val = tmp
                 else:
                     # Moved/value parameter: emit value normally
-                    val = self._emit_expr(arg)
+                    if isinstance(expected_type, ir.PointerType) and not (arg_is_ref or arg_is_ptr or arg_is_addr_of):
+                        # Pointer parameter without explicit borrow syntax:
+                        # auto-borrow addressable arguments, otherwise pass value as-is.
+                        try:
+                            val = self._emit_lvalue_addr(arg)
+                        except ValueError:
+                            val = self._emit_expr(arg)
+                    else:
+                        val = self._emit_expr(arg)
 
                     # Check for String -> *u8 implicit coercion (Issue #89)
                     arg_ritz_type = self._infer_ritz_type(arg)
@@ -6190,7 +6859,12 @@ class LLVMEmitter:
                         val = self._convert_type(val, expected_type)
                 args.append(val)
 
-            return self.builder.call(fn, args)
+            try:
+                return self.builder.call(fn, args)
+            except TypeError as e:
+                expected = [str(t) for t in fn.function_type.args]
+                got = [str(a.type) for a in args]
+                raise TypeError(f"{e} (call {resolved_name}; expected={expected}; got={got})")
 
         # Look up extern function
         if fname in self.extern_fns:
@@ -6970,6 +7644,198 @@ class LLVMEmitter:
 
         return None
 
+    def _try_emit_float_intrinsic(self, expr: rast.MethodCall, receiver: Optional[ir.Value] = None) -> Optional[ir.Value]:
+        """Try to emit float methods via LLVM intrinsics.
+
+        Supports expression receivers like `(x + y).ceil()`.
+        """
+        method = expr.method
+        if method not in ('ceil', 'floor', 'round', 'abs'):
+            return None
+        if len(expr.args) != 0:
+            raise ValueError(f"{method}() takes no arguments")
+
+        recv = receiver if receiver is not None else self._emit_expr(expr.expr)
+        if not isinstance(recv.type, (ir.FloatType, ir.DoubleType)):
+            return None
+
+        intrinsic_name = {
+            'ceil': 'llvm.ceil',
+            'floor': 'llvm.floor',
+            'round': 'llvm.round',
+            'abs': 'llvm.fabs',
+        }[method]
+        fn_type = ir.FunctionType(recv.type, [recv.type])
+        intrinsic = self.module.declare_intrinsic(intrinsic_name, [recv.type], fnty=fn_type)
+        return self.builder.call(intrinsic, [recv])
+
+    def _try_emit_enum_predicate_method(
+        self,
+        expr: rast.MethodCall,
+        type_name: str,
+        receiver_probe: Optional[ir.Value] = None,
+    ) -> Optional[ir.Value]:
+        """Emit Option/Result predicate methods directly when helper fns are absent."""
+        if expr.args:
+            return None
+        if expr.method not in ('is_some', 'is_none', 'is_ok', 'is_err'):
+            return None
+        if type_name not in self.enum_types:
+            return None
+
+        target_variant = {
+            'is_some': 'Some',
+            'is_none': 'None',
+            'is_ok': 'Ok',
+            'is_err': 'Err',
+        }[expr.method]
+
+        enum_type, variants = self.enum_types[type_name]
+        tag_idx = None
+        for i, variant in enumerate(variants):
+            if variant.name == target_variant:
+                tag_idx = i
+                break
+        if tag_idx is None:
+            return None
+
+        receiver = receiver_probe if receiver_probe is not None else self._emit_expr(expr.expr)
+        if isinstance(receiver.type, ir.PointerType) and receiver.type.pointee == enum_type:
+            receiver = self.builder.load(receiver)
+        receiver = self._convert_type(receiver, enum_type)
+
+        enum_alloca = self.builder.alloca(enum_type, name="enum.pred")
+        self.builder.store(receiver, enum_alloca)
+        tag_ptr = self.builder.gep(enum_alloca, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)])
+        tag_val = self.builder.load(tag_ptr)
+        return self.builder.icmp_unsigned('==', tag_val, ir.Constant(self.i8, tag_idx))
+
+    def _try_emit_strview_builtin(self, expr: rast.MethodCall, type_name: str, receiver_probe: Optional[ir.Value] = None) -> Optional[ir.Value]:
+        """Emit built-in StrView methods not provided via ritzlib UFCS wrappers."""
+        if type_name != 'StrView':
+            return None
+        if expr.method != 'as_bytes':
+            return None
+        if expr.args:
+            raise ValueError("as_bytes() takes no arguments")
+
+        recv = receiver_probe if receiver_probe is not None else self._emit_expr(expr.expr)
+        if isinstance(recv.type, ir.PointerType) and isinstance(recv.type.pointee, ir.BaseStructType):
+            struct_name = self._get_struct_name_from_type(recv.type.pointee)
+            if struct_name == 'StrView':
+                recv = self.builder.load(recv)
+
+        ptr = self.builder.extract_value(recv, 0)
+        length = self.builder.extract_value(recv, 1)
+
+        if 'Span$u8' in self.struct_types:
+            span_ty = self.struct_types['Span$u8']
+        else:
+            span_ty = ir.LiteralStructType([self.i8.as_pointer(), self.i64])
+        span = self.builder.insert_value(ir.Constant(span_ty, ir.Undefined), ptr, 0)
+        span = self.builder.insert_value(span, length, 1)
+        return span
+
+    def _try_emit_len_builtin(self, expr: rast.MethodCall, type_name: str, receiver_probe: Optional[ir.Value] = None) -> Optional[ir.Value]:
+        """Emit direct .len() for common container/view structs."""
+        if expr.method != 'len' or expr.args:
+            return None
+        if not (type_name.startswith('Vec$') or type_name.startswith('Span$') or type_name == 'StrView'):
+            return None
+
+        recv = receiver_probe if receiver_probe is not None else self._emit_expr(expr.expr)
+
+        # Pointer receiver: load named field directly when we know the struct.
+        if isinstance(recv.type, ir.PointerType) and isinstance(recv.type.pointee, ir.BaseStructType):
+            struct_name = self._get_struct_name_from_type(recv.type.pointee)
+            if struct_name and self._struct_has_field(struct_name, 'len'):
+                idx = self._get_struct_field_index(struct_name, 'len')
+                field_ptr = self.builder.gep(recv, [ir.Constant(self.i32, 0), ir.Constant(self.i32, idx)])
+                return self.builder.load(field_ptr)
+            recv = self.builder.load(recv)
+
+        # Value receiver: extract named field when possible.
+        if isinstance(recv.type, ir.BaseStructType):
+            struct_name = self._get_struct_name_from_type(recv.type)
+            if struct_name and self._struct_has_field(struct_name, 'len'):
+                idx = self._get_struct_field_index(struct_name, 'len')
+                return self.builder.extract_value(recv, idx)
+
+        # Fallback for literal layouts used by lightweight views.
+        if isinstance(recv.type, ir.LiteralStructType) and len(recv.type.elements) >= 2:
+            return self.builder.extract_value(recv, 1)
+
+        return None
+
+    def _try_emit_enum_unwrap_method(self, expr: rast.MethodCall, type_name: str, receiver_probe: Optional[ir.Value] = None) -> Optional[ir.Value]:
+        """Emit Option/Result unwrap-style methods directly."""
+        if expr.method not in ('unwrap', 'unwrap_or'):
+            return None
+        if type_name not in self.enum_types:
+            return None
+        if not (type_name.startswith('Result$') or type_name.startswith('Option$')):
+            return None
+        if expr.method == 'unwrap' and expr.args:
+            return None
+        if expr.method == 'unwrap_or' and len(expr.args) != 1:
+            return None
+
+        enum_type, variants = self.enum_types[type_name]
+        target_variant = 'Ok' if type_name.startswith('Result$') else 'Some'
+        target_variant_def = next((v for v in variants if v.name == target_variant), None)
+        if target_variant_def is None or not target_variant_def.fields:
+            return None
+
+        payload_type = target_variant_def.fields[0]
+        llvm_payload_type = self._ritz_type_to_llvm(payload_type)
+        target_tag = self._get_enum_variant_tag(type_name, target_variant)
+
+        recv = receiver_probe if receiver_probe is not None else self._emit_expr(expr.expr)
+        if isinstance(recv.type, ir.PointerType) and recv.type.pointee == enum_type:
+            recv = self.builder.load(recv)
+        recv = self._convert_type(recv, enum_type)
+
+        enum_alloca = self.builder.alloca(enum_type, name="unwrap.enum")
+        self.builder.store(recv, enum_alloca)
+
+        tag_ptr = self.builder.gep(enum_alloca, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)])
+        tag_val = self.builder.load(tag_ptr)
+        is_target = self.builder.icmp_unsigned('==', tag_val, ir.Constant(self.i8, target_tag))
+
+        ok_block = self.current_fn.append_basic_block("unwrap.ok")
+        bad_block = self.current_fn.append_basic_block("unwrap.bad")
+        merge_block = self.current_fn.append_basic_block("unwrap.merge")
+        self.builder.cbranch(is_target, ok_block, bad_block)
+
+        self.builder.position_at_end(ok_block)
+        data_index = self._get_enum_data_index(type_name)
+        data_ptr = self.builder.gep(enum_alloca, [ir.Constant(self.i32, 0), ir.Constant(self.i32, data_index)])
+        payload_ptr = self.builder.bitcast(data_ptr, ir.PointerType(llvm_payload_type))
+        payload_val = self.builder.load(payload_ptr)
+        self.builder.branch(merge_block)
+        ok_exit = self.builder.block
+
+        bad_val = None
+        bad_exit = None
+        self.builder.position_at_end(bad_block)
+        if expr.method == 'unwrap_or':
+            bad_val = self._emit_expr(expr.args[0])
+            bad_val = self._convert_type(bad_val, llvm_payload_type)
+            self.builder.branch(merge_block)
+            bad_exit = self.builder.block
+        else:
+            trap_ty = ir.FunctionType(self.void, [])
+            trap = self.module.declare_intrinsic('llvm.trap', [], fnty=trap_ty)
+            self.builder.call(trap, [])
+            self.builder.unreachable()
+
+        self.builder.position_at_end(merge_block)
+        phi = self.builder.phi(llvm_payload_type, name="unwrap.val")
+        phi.add_incoming(payload_val, ok_exit)
+        if bad_exit is not None:
+            phi.add_incoming(bad_val, bad_exit)
+        return phi
+
     def _emit_method_call(self, expr: rast.MethodCall) -> ir.Value:
         """Emit a method call: receiver.method(args...).
 
@@ -6993,6 +7859,12 @@ class LLVMEmitter:
             if isinstance(receiver_type.inner, rast.DynType):
                 return self._emit_dyn_method_call(expr, receiver_type.inner)
 
+        # Static enum variant constructor syntax: EnumName.Variant(...)
+        if isinstance(expr.expr, rast.Ident):
+            enum_name = expr.expr.name
+            if enum_name in self.enum_types:
+                return self._emit_enum_variant_constructor_for_type(expr.method, expr.args, enum_name)
+
         # First, check if the receiver is an lvalue (identifier, field, index)
         # If so, get its address for auto-borrowing when method expects *Self
         receiver_is_lvalue = isinstance(expr.expr, (rast.Ident, rast.Field, rast.Index))
@@ -7000,13 +7872,22 @@ class LLVMEmitter:
         # Determine receiver type first by peeking at the expression
         # For identifiers, we can look up the type directly
         type_name = None
+        is_static_call = False  # True if Type.method() with no receiver instance
         if isinstance(expr.expr, rast.Ident):
             name = expr.expr.name
+            # Check if this is a static method call (receiver is a type name, not a variable)
+            # e.g., ShapedGlyph.simple(...) where ShapedGlyph is a type, not a variable
+            if name in self.struct_types and name not in self.locals and name not in self.params:
+                type_name = name
+                is_static_call = True
             # First check ritz_types for the original Ritz type (preserves signedness)
-            if name in self.ritz_types:
+            elif name in self.ritz_types:
                 ritz_type = self.ritz_types[name]
                 if isinstance(ritz_type, rast.NamedType):
-                    type_name = ritz_type.name
+                    if ritz_type.args:
+                        type_name = self._get_specialized_type_name(ritz_type)
+                    else:
+                        type_name = ritz_type.name
             # Fall back to LLVM type inspection for struct types
             if type_name is None:
                 if name in self.locals:
@@ -7017,10 +7898,11 @@ class LLVMEmitter:
                     type_name = self._get_struct_name_from_type(ty)
 
         # Look up the mangled function name (need type_name first)
+        receiver_probe = None
         if type_name is None:
             # Fall back to emitting the expression and checking its type
-            receiver_val = self._emit_expr(expr.expr)
-            receiver_type = receiver_val.type
+            receiver_probe = self._emit_expr(expr.expr)
+            receiver_type = receiver_probe.type
             if isinstance(receiver_type, ir.PointerType):
                 type_name = self._get_struct_name_from_type(receiver_type.pointee)
             else:
@@ -7030,6 +7912,28 @@ class LLVMEmitter:
                     bits = receiver_type.width
                     # Default to unsigned for BitOps (both signed/unsigned work the same)
                     type_name = f'u{bits}'
+                # Float primitive methods on expression receivers
+                if type_name is None and self._is_float_type(receiver_type):
+                    float_result = self._try_emit_float_intrinsic(expr, receiver_probe)
+                    if float_result is not None:
+                        return float_result
+
+        if type_name is None:
+            inferred = self._infer_ritz_type(expr.expr)
+            if isinstance(inferred, rast.NamedType):
+                if inferred.args:
+                    type_name = self._get_specialized_type_name(inferred)
+                    if type_name not in self.enum_types:
+                        self._ensure_builtin_generic_specialization(inferred)
+                else:
+                    type_name = inferred.name
+
+        if type_name is None and receiver_probe is not None:
+            probe_ty = receiver_probe.type.pointee if isinstance(receiver_probe.type, ir.PointerType) else receiver_probe.type
+            for enum_name, (enum_ty, _) in self.enum_types.items():
+                if enum_ty == probe_ty:
+                    type_name = enum_name
+                    break
 
         if type_name is None:
             raise ValueError(f"Cannot call method '{expr.method}' on unknown type")
@@ -7039,7 +7943,33 @@ class LLVMEmitter:
         if bitops_result is not None:
             return bitops_result
 
+        # Float intrinsic methods when receiver type was inferred from symbols.
+        float_result = self._try_emit_float_intrinsic(expr)
+        if float_result is not None:
+            return float_result
+
+        # Built-in enum predicates for Option/Result.
+        enum_predicate = self._try_emit_enum_predicate_method(expr, type_name, receiver_probe)
+        if enum_predicate is not None:
+            return enum_predicate
+
+        # Built-in StrView helpers.
+        strview_builtin = self._try_emit_strview_builtin(expr, type_name, receiver_probe)
+        if strview_builtin is not None:
+            return strview_builtin
+
+        # Built-in .len() for Vec/Span/StrView layouts.
+        len_builtin = self._try_emit_len_builtin(expr, type_name, receiver_probe)
+        if len_builtin is not None:
+            return len_builtin
+
+        # Built-in unwrap for Option/Result.
+        unwrap_builtin = self._try_emit_enum_unwrap_method(expr, type_name, receiver_probe)
+        if unwrap_builtin is not None:
+            return unwrap_builtin
+
         method_key = (type_name, expr.method)
+        used_ufcs_fallback = False  # Track if we used UFCS fallback
         if method_key in self.method_lookup:
             mangled_name = self.method_lookup[method_key]
         else:
@@ -7050,11 +7980,43 @@ class LLVMEmitter:
             mangled_name = self._find_method_fallback(type_name, expr.method)
             if mangled_name is None:
                 raise ValueError(f"No method '{expr.method}' found for type '{type_name}'")
+            used_ufcs_fallback = True  # UFCS fallback functions take receiver as first param
 
         if mangled_name not in self.functions:
             raise ValueError(f"Method function '{mangled_name}' not found")
 
         fn, fn_def = self.functions[mangled_name]
+
+        # Check if this is a static method (no self parameter)
+        # Static methods are called as Type.method() with no receiver instance
+        # For UFCS fallback functions, treat first parameter as receiver even if not named 'self'
+        has_self_param = len(fn_def.params) > 0 and (fn_def.params[0].name == 'self' or used_ufcs_fallback)
+
+        # For static calls (Type.method()), verify there's no self parameter
+        if is_static_call and has_self_param:
+            raise ValueError(f"Static method call Type.method() but method '{expr.method}' expects 'self' parameter")
+
+        # Handle static method call - no receiver needed
+        if is_static_call or not has_self_param:
+            # Static method - just emit the arguments, no receiver
+            all_args = []
+            for arg in expr.args:
+                all_args.append(self._emit_expr(arg))
+
+            # Convert argument types as needed
+            converted_args = []
+            for i, arg in enumerate(all_args):
+                expected_type = fn.function_type.args[i]
+                converted = self._convert_type(arg, expected_type)
+                converted_args.append(converted)
+
+            try:
+                return self.builder.call(fn, converted_args)
+            except TypeError as e:
+                expected = [str(t) for t in fn.function_type.args]
+                got = [str(a.type) for a in converted_args]
+                raise TypeError(f"{e} (static method call {mangled_name}; expected={expected}; got={got})")
+
         first_param_type = fn.function_type.args[0]
 
         # Determine whether to pass by value or by pointer (auto-borrow)
@@ -7099,11 +8061,27 @@ class LLVMEmitter:
         else:
             # Emit as normal expression
             receiver_val = self._emit_expr(expr.expr)
+            # Auto-borrow temporaries when method expects a pointer receiver.
+            if isinstance(first_param_type, ir.PointerType) and not isinstance(receiver_val.type, ir.PointerType):
+                tmp = self.builder.alloca(receiver_val.type, name="recv.tmp")
+                self.builder.store(receiver_val, tmp)
+                receiver_val = tmp
 
         # Build arguments: receiver first, then explicit args
         all_args = [receiver_val]
-        for arg in expr.args:
-            all_args.append(self._emit_expr(arg))
+        for j, arg in enumerate(expr.args, start=1):
+            expected_type = fn.function_type.args[j]
+            arg_ritz_type = self._infer_ritz_type(arg)
+            arg_is_ref = isinstance(arg_ritz_type, rast.RefType) if arg_ritz_type else False
+            arg_is_ptr = isinstance(arg_ritz_type, rast.PtrType) if arg_ritz_type else False
+            arg_is_addr_of = isinstance(arg, rast.UnaryOp) and arg.op in ('&', '@', '@&', '&mut')
+            if isinstance(expected_type, ir.PointerType) and not (arg_is_ref or arg_is_ptr or arg_is_addr_of):
+                try:
+                    all_args.append(self._emit_lvalue_addr(arg))
+                except ValueError:
+                    all_args.append(self._emit_expr(arg))
+            else:
+                all_args.append(self._emit_expr(arg))
 
         # Convert argument types as needed
         converted_args = []
@@ -7112,7 +8090,12 @@ class LLVMEmitter:
             converted = self._convert_type(arg, expected_type)
             converted_args.append(converted)
 
-        return self.builder.call(fn, converted_args)
+        try:
+            return self.builder.call(fn, converted_args)
+        except TypeError as e:
+            expected = [str(t) for t in fn.function_type.args]
+            got = [str(a.type) for a in converted_args]
+            raise TypeError(f"{e} (method call {mangled_name}; expected={expected}; got={got})")
 
     def _emit_dyn_method_call(self, expr: rast.MethodCall, dyn_type: rast.DynType) -> ir.Value:
         """Emit a method call on a dyn Trait using dynamic dispatch.
@@ -7302,6 +8285,20 @@ class LLVMEmitter:
         if val.type == target_type:
             return val
 
+        # Floating-point conversions
+        if isinstance(val.type, ir.FloatType) and isinstance(target_type, ir.DoubleType):
+            return self.builder.fpext(val, target_type)
+        if isinstance(val.type, ir.DoubleType) and isinstance(target_type, ir.FloatType):
+            return self.builder.fptrunc(val, target_type)
+
+        # Integer <-> floating-point conversions
+        if isinstance(val.type, ir.IntType) and isinstance(target_type, (ir.FloatType, ir.DoubleType)):
+            # We don't retain full signedness provenance here; use signed conversion by default.
+            return self.builder.sitofp(val, target_type)
+        if isinstance(val.type, (ir.FloatType, ir.DoubleType)) and isinstance(target_type, ir.IntType):
+            # Explicit cast/argument conversion from float to int.
+            return self.builder.fptosi(val, target_type)
+
         # Integer conversions
         if isinstance(val.type, ir.IntType) and isinstance(target_type, ir.IntType):
             if val.type.width < target_type.width:
@@ -7323,6 +8320,12 @@ class LLVMEmitter:
         # Pointer to pointer (bitcast)
         if isinstance(val.type, ir.PointerType) and isinstance(target_type, ir.PointerType):
             return self.builder.bitcast(val, target_type)
+
+        # Auto-deref when a value is expected and we have a pointer to that value.
+        # This helps method/function argument conversion in mixed value/ref call sites.
+        if isinstance(val.type, ir.PointerType) and not isinstance(target_type, ir.PointerType):
+            if val.type.pointee == target_type:
+                return self.builder.load(val)
 
         # Array type conversion: [N x T1] to [N x T2]
         if isinstance(val.type, ir.ArrayType) and isinstance(target_type, ir.ArrayType):
@@ -7376,6 +8379,60 @@ class LLVMEmitter:
                     converted_elem = self._convert_type(elem, target_type.elements[i])
                     result = self.builder.insert_value(result, converted_elem, i)
                 return result
+
+        # Scalar-to-newtype conversion: i32 -> struct { i32 }.
+        if isinstance(target_type, ir.BaseStructType):
+            elems = target_type.elements
+            if len(elems) == 1 and isinstance(elems[0], ir.IntType) and isinstance(val.type, ir.IntType):
+                inner = self._convert_type(val, elems[0])
+                wrapped = self.builder.insert_value(ir.Constant(target_type, ir.Undefined), inner, 0)
+                return wrapped
+
+        # Pointer-to-array -> Span-like struct conversion.
+        # Supports passing string/byte array pointers to Span<T> parameters.
+        if isinstance(target_type, ir.BaseStructType):
+            elems = target_type.elements
+            if len(elems) == 2 and isinstance(elems[0], ir.PointerType) and elems[1] == self.i64:
+                target_elem_ty = elems[0].pointee
+                if isinstance(val.type, ir.ArrayType) and val.type.element == target_elem_ty:
+                    # Array value -> Span by taking a temporary stack address.
+                    temp_arr = self._alloca_in_entry_block(val.type, "span.arr")
+                    self.builder.store(val, temp_arr)
+                    zero = ir.Constant(self.i32, 0)
+                    ptr = self.builder.gep(temp_arr, [zero, zero])
+                    length = ir.Constant(self.i64, val.type.count)
+                    span = self.builder.insert_value(ir.Constant(target_type, ir.Undefined), ptr, 0)
+                    span = self.builder.insert_value(span, length, 1)
+                    return span
+                if isinstance(val.type, ir.PointerType) and isinstance(val.type.pointee, ir.ArrayType):
+                    arr_ty = val.type.pointee
+                    if arr_ty.element == target_elem_ty:
+                        zero = ir.Constant(self.i32, 0)
+                        ptr = self.builder.gep(val, [zero, zero])
+                        length = ir.Constant(self.i64, arr_ty.count)
+                        span = self.builder.insert_value(ir.Constant(target_type, ir.Undefined), ptr, 0)
+                        span = self.builder.insert_value(span, length, 1)
+                        return span
+                # Pointer-to-Vec-like struct -> Span conversion.
+                # Accepts { *T data, i64 len, ... } and projects to { *T, i64 }.
+                if isinstance(val.type, ir.PointerType) and isinstance(val.type.pointee, ir.BaseStructType):
+                    src_elems = val.type.pointee.elements
+                    if (
+                        len(src_elems) >= 2
+                        and isinstance(src_elems[0], ir.PointerType)
+                        and src_elems[0].pointee == target_elem_ty
+                        and isinstance(src_elems[1], ir.IntType)
+                    ):
+                        zero = ir.Constant(self.i32, 0)
+                        data_ptr_ptr = self.builder.gep(val, [zero, ir.Constant(self.i32, 0)])
+                        len_ptr = self.builder.gep(val, [zero, ir.Constant(self.i32, 1)])
+                        data_ptr = self.builder.load(data_ptr_ptr)
+                        length = self.builder.load(len_ptr)
+                        if length.type != self.i64:
+                            length = self._convert_type(length, self.i64)
+                        span = self.builder.insert_value(ir.Constant(target_type, ir.Undefined), data_ptr, 0)
+                        span = self.builder.insert_value(span, length, 1)
+                        return span
 
         return val
 
@@ -7567,6 +8624,10 @@ class LLVMEmitter:
         enum_name = self._get_enum_name_from_expr(expr.expr)
         if enum_name and enum_name in self.enum_types:
             return self._emit_enum_match(expr, match_val, enum_name)
+        # Fallback: resolve enum directly from emitted LLVM type.
+        for candidate_name, (enum_ty, _) in self.enum_types.items():
+            if enum_ty == match_val.type:
+                return self._emit_enum_match(expr, match_val, candidate_name)
 
         # Check if matching on an integer type
         if isinstance(match_val.type, ir.IntType):
@@ -7798,11 +8859,22 @@ class LLVMEmitter:
             # Filter out terminated blocks (those that returned)
             incoming = [(val, block) for val, block in zip(arm_values, arm_exit_blocks) if block is not None]
             if incoming:
-                # All values should have the same type (or be convertible)
-                # For now assume they're all the same type
-                phi = self.builder.phi(incoming[0][0].type)
+                typed_incoming = [(val, block) for val, block in incoming if hasattr(val, 'type')]
+                if not typed_incoming:
+                    return ir.Constant(self.i32, 0)
+                phi_type = typed_incoming[0][0].type
+                phi = self.builder.phi(phi_type)
                 for val, block in incoming:
-                    phi.add_incoming(val, block)
+                    if hasattr(val, 'type'):
+                        if val.type == phi_type:
+                            incoming_val = val
+                        elif isinstance(val, ir.Constant) and isinstance(phi_type, ir.IntType) and isinstance(val.type, ir.IntType):
+                            incoming_val = ir.Constant(phi_type, val.constant)
+                        else:
+                            incoming_val = ir.Constant(phi_type, ir.Undefined)
+                        phi.add_incoming(incoming_val, block)
+                    else:
+                        phi.add_incoming(ir.Constant(phi_type, ir.Undefined), block)
                 return phi
 
         # Return a dummy value if no arms produce values
@@ -7944,13 +9016,29 @@ class LLVMEmitter:
         # Get the enum name from the expression type
         enum_name = self._get_enum_name_from_expr(expr.expr)
         if not enum_name:
-            raise ValueError(f"Try operator requires a Result type, got expression: {type(expr.expr)}")
+            # Fallback: infer from the emitted LLVM type.
+            for candidate_name, (candidate_ty, _) in self.enum_types.items():
+                if candidate_ty == result_val.type:
+                    enum_name = candidate_name
+                    break
+        if not enum_name:
+            inferred = self._infer_ritz_type(expr.expr)
+            raise ValueError(
+                "Try operator requires a Result type, "
+                f"got expression: {type(expr.expr)} llvm={result_val.type} inferred={inferred}"
+            )
 
         if not enum_name.startswith("Result$"):
             raise ValueError(f"Try operator requires a Result type, got: {enum_name}")
 
         # Get the Result type info
         enum_type, variants = self.enum_types[enum_name]
+        inferred_result_type = self._infer_ritz_type(expr.expr)
+        inferred_ok_type = None
+        inferred_err_type = None
+        if isinstance(inferred_result_type, rast.NamedType) and len(inferred_result_type.args) >= 2:
+            inferred_ok_type = inferred_result_type.args[0]
+            inferred_err_type = inferred_result_type.args[1]
 
         # Store result to memory so we can extract tag and data
         result_alloca = self.builder.alloca(enum_type, name="try.result")
@@ -7982,7 +9070,7 @@ class LLVMEmitter:
         if not err_variant or not err_variant.fields:
             raise ValueError(f"Result type {enum_name} has no Err variant with payload")
 
-        err_field_type = err_variant.fields[0]
+        err_field_type = inferred_err_type if inferred_err_type is not None else err_variant.fields[0]
         llvm_err_type = self._ritz_type_to_llvm(err_field_type)
 
         # Get pointer to data buffer (index depends on alignment padding)
@@ -7999,6 +9087,8 @@ class LLVMEmitter:
             if ret_ritz_type.args:
                 # Generic instantiation like Result<i32, i32>
                 fn_ret_type_name = self._get_specialized_type_name(ret_ritz_type)
+                if fn_ret_type_name not in self.enum_types:
+                    self._ensure_builtin_generic_specialization(ret_ritz_type)
             else:
                 # Simple named type (already monomorphized)
                 fn_ret_type_name = ret_ritz_type.name
@@ -8036,7 +9126,7 @@ class LLVMEmitter:
         if not ok_variant or not ok_variant.fields:
             raise ValueError(f"Result type {enum_name} has no Ok variant with payload")
 
-        ok_field_type = ok_variant.fields[0]
+        ok_field_type = inferred_ok_type if inferred_ok_type is not None else ok_variant.fields[0]
         llvm_ok_type = self._ritz_type_to_llvm(ok_field_type)
 
         # Extract the Ok payload (reuse data_index from earlier)
@@ -8068,7 +9158,10 @@ class LLVMEmitter:
         """Convert a type to a name suffix for monomorphization."""
         if isinstance(ty, rast.NamedType):
             if ty.args:
-                return self._get_specialized_type_name(ty)
+                # Nested generic suffixes use '_' in current monomorphized names:
+                # Result<Vec<u8>, E> -> Result$Vec_u8_E
+                arg_suffixes = '_'.join(self._type_to_name_suffix(arg) for arg in ty.args)
+                return f"{ty.name}_{arg_suffixes}"
             return ty.name
         elif isinstance(ty, rast.PtrType):
             return "ptr_" + self._type_to_name_suffix(ty.inner)
@@ -8106,15 +9199,6 @@ class LLVMEmitter:
             return self._emit_cast_from_union(val, src_union_name, expr.target)
 
         target_type = self._ritz_type_to_llvm(expr.target)
-
-        # Handle StrView -> *u8 cast (common RERITZ pattern: "str" as *u8)
-        # StrView is {ptr, len}, we extract the ptr field
-        src_ritz_type = self._infer_ritz_type(expr.expr)
-        if (src_ritz_type and isinstance(src_ritz_type, rast.NamedType)
-            and src_ritz_type.name == 'StrView'
-            and isinstance(target_type, ir.PointerType)
-            and target_type.pointee == self.i8):
-            return self.builder.extract_value(val, 0, name='strview.ptr')
 
         # Check if source OR target is unsigned for proper extension
         # When casting to unsigned (e.g., i32 as u64), use zext to avoid sign pollution
@@ -8166,6 +9250,30 @@ class LLVMEmitter:
 
     def _get_enum_name_from_expr(self, expr: rast.Expr) -> Optional[str]:
         """Get the enum type name if the expression has an enum type."""
+        # Fast path: infer Ritz type and map it to a known enum name.
+        inferred = self._infer_ritz_type(expr)
+        if isinstance(inferred, rast.NamedType):
+            if inferred.args:
+                specialized_name = self._get_specialized_type_name(inferred)
+                if specialized_name in self.enum_types:
+                    return specialized_name
+                synthesized = self._ensure_builtin_generic_specialization(inferred)
+                if synthesized and synthesized in self.enum_types:
+                    return synthesized
+            if inferred.name in self.enum_types:
+                return inferred.name
+        elif isinstance(inferred, (rast.RefType, rast.PtrType)) and isinstance(inferred.inner, rast.NamedType):
+            inner = inferred.inner
+            if inner.args:
+                specialized_name = self._get_specialized_type_name(inner)
+                if specialized_name in self.enum_types:
+                    return specialized_name
+                synthesized = self._ensure_builtin_generic_specialization(inner)
+                if synthesized and synthesized in self.enum_types:
+                    return synthesized
+            if inner.name in self.enum_types:
+                return inner.name
+
         if isinstance(expr, rast.Ident):
             name = expr.name
             # Check locals (var bindings)
@@ -8214,20 +9322,27 @@ class LLVMEmitter:
                 fn_name = expr.func.name
             elif isinstance(expr.func, str):
                 fn_name = expr.func
-            if fn_name and fn_name in self.functions:
-                _, fn_def = self.functions[fn_name]
-                if fn_def and fn_def.ret_type:
-                    ret_type = fn_def.ret_type
-                    if isinstance(ret_type, rast.NamedType):
-                        if ret_type.args:
-                            # Generic instantiation like Result<i32, i32>
-                            specialized_name = self._get_specialized_type_name(ret_type)
-                            if specialized_name in self.enum_types:
-                                return specialized_name
-                        else:
-                            # Simple named type (possibly already monomorphized)
-                            if ret_type.name in self.enum_types:
-                                return ret_type.name
+            if fn_name:
+                fn_candidates = []
+                if fn_name in self.functions:
+                    fn_candidates.append(fn_name)
+                for declared_name in self.functions:
+                    if declared_name.startswith(fn_name + "$"):
+                        fn_candidates.append(declared_name)
+                for candidate in fn_candidates:
+                    _, fn_def = self.functions[candidate]
+                    if fn_def and fn_def.ret_type:
+                        ret_type = fn_def.ret_type
+                        if isinstance(ret_type, rast.NamedType):
+                            if ret_type.args:
+                                # Generic instantiation like Result<i32, i32>
+                                specialized_name = self._get_specialized_type_name(ret_type)
+                                if specialized_name in self.enum_types:
+                                    return specialized_name
+                            else:
+                                # Simple named type (possibly already monomorphized)
+                                if ret_type.name in self.enum_types:
+                                    return ret_type.name
         return None
 
     def _emit_cast_to_union(self, expr: rast.Cast) -> ir.Value:

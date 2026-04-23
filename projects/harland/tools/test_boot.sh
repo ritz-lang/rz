@@ -38,7 +38,7 @@ fi
 
 # Run QEMU in BIOS mode (no OVMF) with GRUB ISO
 # -smp 4 for multi-core testing, -m 2G for full memory tests
-# VirtIO block, network, and input devices for driver testing
+# VirtIO block and network devices for driver testing
 timeout 20 qemu-system-x86_64 \
     -cdrom "$ISO" \
     -device virtio-blk-pci,drive=initramfs \
@@ -47,8 +47,6 @@ timeout 20 qemu-system-x86_64 \
     -drive file="$STORAGE",format=qcow2,if=none,id=storage \
     -device virtio-net-pci,netdev=net0 \
     -netdev user,id=net0 \
-    -device virtio-keyboard-pci \
-    -device virtio-mouse-pci \
     -serial file:"$SERIAL_LOG" \
     -display none \
     -smp 4 \

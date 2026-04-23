@@ -2,23 +2,23 @@
 #
 # Converts glyph outlines to bitmaps.
 
-import types { GlyphOutline }
-import types { Contour }
-import types { OutlinePoint }
-import types { RasterizedGlyph }
-import types { FontMetrics }
-import raster.bezier.Point2D
-import raster.bezier.QuadBezier
-import raster.bezier.flatten_quad_bezier
-import raster.bezier.implied_on_curve
-import raster.edge.Edge
-import raster.edge.EdgeTable
-import raster.fill.Bitmap
-import raster.fill.scanline_fill_simple
-import raster.fill.scanline_fill_antialiased
+import types { GlyphOutline, Contour, OutlinePoint, RasterizedGlyph, FontMetrics }
+import raster.bezier { Point2D, QuadBezier, flatten_quad_bezier, implied_on_curve }
+import raster.edge { Edge, EdgeTable }
+import raster.fill { Bitmap, scanline_fill_simple, scanline_fill_antialiased }
+import ritzlib.gvec
 
 # Tolerance for bezier flattening (in font units)
 const FLATTEN_TOLERANCE: f32 = 0.5
+
+# Expanded point with on_curve flag (replaces tuple)
+struct ExpandedPoint
+    p: Point2D
+    on_curve: bool
+
+impl ExpandedPoint
+    fn new(p: Point2D, on_curve: bool) -> ExpandedPoint
+        ExpandedPoint { p: p, on_curve: on_curve }
 
 # Convert a contour to edges
 fn contour_to_edges(contour: Contour, scale: f32, edge_table:& EdgeTable)
@@ -32,21 +32,21 @@ fn contour_to_edges(contour: Contour, scale: f32, edge_table:& EdgeTable)
     # Two consecutive off-curve points have an implied on-curve between them
 
     # First, expand the contour to handle implied points
-    var points = Vec.new()
+    var points = vec_new<ExpandedPoint>()
 
     for i in 0..n
-        let curr = contour.points[i]
+        let curr = vec_get<OutlinePoint>(@contour.points, i as i64)
         let next_idx = (i + 1) % n
-        let next = contour.points[next_idx]
+        let next = vec_get<OutlinePoint>(@contour.points, next_idx as i64)
 
         let p = Point2D.from_i16(curr.x, curr.y).scale(scale)
-        points.push((p, curr.on_curve))
+        points.push(ExpandedPoint.new(p, curr.on_curve))
 
         # If both current and next are off-curve, add implied on-curve
         if not curr.on_curve and not next.on_curve
             let next_p = Point2D.from_i16(next.x, next.y).scale(scale)
             let implied = p.midpoint(next_p)
-            points.push((implied, true))
+            points.push(ExpandedPoint.new(implied, true))
 
     # Now process the expanded points
     let expanded_n = points.len()
@@ -56,45 +56,57 @@ fn contour_to_edges(contour: Contour, scale: f32, edge_table:& EdgeTable)
     # Find first on-curve point to start
     var start_idx = 0usize
     for i in 0..expanded_n
-        let (_, on_curve) = points[i]
-        if on_curve
+        let ep = vec_get<ExpandedPoint>(@points, i as i64)
+        if ep.on_curve
             start_idx = i
             break
 
     # Walk through points, emitting edges
-    var curr_on_curve = points[start_idx].0
+    let start_ep = vec_get<ExpandedPoint>(@points, start_idx as i64)
+    var curr_on_curve = start_ep.p
     var i = 1usize
 
     while i <= expanded_n
         let idx = (start_idx + i) % expanded_n
-        let (p, on_curve) = points[idx]
+        let ep = vec_get<ExpandedPoint>(@points, idx as i64)
 
-        if on_curve
+        if ep.on_curve
             # Line segment from curr_on_curve to p
-            edge_table.add_line(curr_on_curve, p)
-            curr_on_curve = p
+            edge_table.add_line(@curr_on_curve, @ep.p)
+            curr_on_curve = ep.p
         else
             # This is a control point - look for next on-curve
             let next_idx = (start_idx + i + 1) % expanded_n
-            let (next_p, next_on_curve) = points[next_idx]
+            let next_ep = vec_get<ExpandedPoint>(@points, next_idx as i64)
 
-            if next_on_curve
-                # Quadratic bezier: curr_on_curve -> p (control) -> next_p
-                let flattened = flatten_quad_bezier(curr_on_curve, p, next_p, FLATTEN_TOLERANCE)
+            if next_ep.on_curve
+                # Quadratic bezier: curr_on_curve -> ep.p (control) -> next_ep.p
+                let flattened = flatten_quad_bezier(@curr_on_curve, @ep.p, @next_ep.p, FLATTEN_TOLERANCE)
 
                 # Add edges for flattened segments
                 for j in 0..flattened.len() - 1
-                    edge_table.add_line(flattened[j], flattened[j + 1])
+                    let p0 = vec_get<Point2D>(@flattened, j as i64)
+                    let p1 = vec_get<Point2D>(@flattened, (j + 1) as i64)
+                    edge_table.add_line(
+                        @p0,
+                        @p1
+                    )
 
-                curr_on_curve = next_p
+                curr_on_curve = next_ep.p
                 i = i + 1  # Skip the next point since we used it
             else
                 # Next is also off-curve, implied point between
-                let implied = p.midpoint(next_p)
-                let flattened = flatten_quad_bezier(curr_on_curve, p, implied, FLATTEN_TOLERANCE)
+                let next_p = Point2D.new(next_ep.p.x, next_ep.p.y)
+                let implied = ep.p.midpoint(next_p)
+                let flattened = flatten_quad_bezier(@curr_on_curve, @ep.p, @implied, FLATTEN_TOLERANCE)
 
                 for j in 0..flattened.len() - 1
-                    edge_table.add_line(flattened[j], flattened[j + 1])
+                    let p0 = vec_get<Point2D>(@flattened, j as i64)
+                    let p1 = vec_get<Point2D>(@flattened, (j + 1) as i64)
+                    edge_table.add_line(
+                        @p0,
+                        @p1
+                    )
 
                 curr_on_curve = implied
 
@@ -112,7 +124,7 @@ fn outline_to_edges(outline: GlyphOutline, scale: f32) -> EdgeTable
 
 # Rasterize a glyph outline at a given pixel size
 # Returns a bitmap with alpha values (0-255)
-pub fn rasterize_outline(outline: GlyphOutline, units_per_em: u16, size_px: u32, antialias: bool) -> RasterizedGlyph
+pub fn rasterize_outline(outline: @GlyphOutline, units_per_em: u16, size_px: u32, antialias: bool) -> RasterizedGlyph
     if outline.is_empty()
         # Return empty glyph (e.g., space character)
         return RasterizedGlyph.new(0, 0)
@@ -121,13 +133,17 @@ pub fn rasterize_outline(outline: GlyphOutline, units_per_em: u16, size_px: u32,
     let scale = size_px as f32 / units_per_em as f32
 
     # Convert outline to edges
-    let edge_table = outline_to_edges(outline, scale)
+    let edge_table = outline_to_edges(*outline, scale)
 
     if edge_table.is_empty()
         return RasterizedGlyph.new(0, 0)
 
     # Get bounding box
-    let (x_min, y_min, x_max, y_max) = edge_table.bounds()
+    let bounds = edge_table.bounds()
+    let x_min = bounds.x_min
+    let y_min = bounds.y_min
+    let x_max = bounds.x_max
+    let y_max = bounds.y_max
 
     # Add padding for antialiasing
     let padding = 1u32
@@ -221,7 +237,7 @@ fn test_rasterize_simple_square() -> i32
     # Check that some pixels are filled
     var filled = 0
     for i in 0..result.bitmap.len()
-        if result.bitmap[i] > 0
+        if vec_get<u8>(@result.bitmap, i as i64) > 0
             filled = filled + 1
 
     assert filled > 0
@@ -243,8 +259,8 @@ fn test_rasterize_with_antialiasing() -> i32
     outline.y_max = 100
     outline.add_contour(contour)
 
-    let result_no_aa = rasterize_outline(outline, 100, 20, false)
-    let result_aa = rasterize_outline(outline, 100, 20, true)
+    let result_no_aa = rasterize_outline(@outline, 100, 20, false)
+    let result_aa = rasterize_outline(@outline, 100, 20, true)
 
     # Both should produce output
     assert result_no_aa.width > 0
@@ -255,12 +271,12 @@ fn test_rasterize_with_antialiasing() -> i32
     var partial_count_aa = 0
 
     for i in 0..result_no_aa.bitmap.len()
-        let v = result_no_aa.bitmap[i]
+        let v = vec_get<u8>(@result_no_aa.bitmap, i as i64)
         if v > 0 and v < 255
             partial_count_no_aa = partial_count_no_aa + 1
 
     for i in 0..result_aa.bitmap.len()
-        let v = result_aa.bitmap[i]
+        let v = vec_get<u8>(@result_aa.bitmap, i as i64)
         if v > 0 and v < 255
             partial_count_aa = partial_count_aa + 1
 

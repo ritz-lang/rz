@@ -8,21 +8,31 @@
 # By rendering at 3x resolution and assigning to color channels,
 # we effectively get 3x horizontal resolution.
 
-import types { GlyphOutline }
-import types { RasterizedGlyph }
-import types { Contour }
-import types { OutlinePoint }
-import raster.bezier.Point2D
-import raster.bezier.flatten_quad_bezier
-import raster.edge.EdgeTable
-import raster.fill.Bitmap
-import raster.fill.scanline_fill_antialiased
+import types { GlyphOutline, RasterizedGlyph, Contour, OutlinePoint }
+import raster.bezier { Point2D, flatten_quad_bezier }
+import raster.edge { EdgeTable }
+import raster.fill { Bitmap, scanline_fill_antialiased }
+import raster.render { rasterize_outline }
+import ritzlib.gvec
+
+# RGB pixel value
+pub struct RGB
+    r: u8
+    g: u8
+    b: u8
+
+impl RGB
+    pub fn new(r: u8, g: u8, b: u8) -> RGB
+        RGB { r: r, g: g, b: b }
+
+    pub fn zero() -> RGB
+        RGB { r: 0, g: 0, b: 0 }
 
 # Subpixel order for different LCD panel types
 pub enum SubpixelOrder
     RGB     # Most common: Red-Green-Blue left to right
     BGR     # Blue-Green-Red
-    None    # No subpixel rendering (grayscale)
+    Gray    # No subpixel rendering (grayscale)
 
 # Rasterized glyph with RGB data
 pub struct SubpixelGlyph
@@ -38,7 +48,7 @@ pub struct SubpixelGlyph
 impl SubpixelGlyph
     pub fn new(width: u32, height: u32) -> SubpixelGlyph
         let size = width * height * 3  # 3 bytes per pixel
-        var rgb_data = Vec.with_capacity(size as usize)
+        var rgb_data = vec_with_cap<u8>(size as usize)
         for i in 0..size
             rgb_data.push(0)
         SubpixelGlyph {
@@ -51,48 +61,54 @@ impl SubpixelGlyph
         }
 
     # Get pixel color at (x, y)
-    # Returns (R, G, B)
-    pub fn get_pixel(self, x: u32, y: u32) -> (u8, u8, u8)
+    pub fn get_pixel(self: @SubpixelGlyph, x: u32, y: u32) -> RGB
         let idx = ((y * self.width + x) * 3) as usize
-        (self.rgb_data[idx], self.rgb_data[idx + 1], self.rgb_data[idx + 2])
+        RGB {
+            r: vec_get<u8>(@self.rgb_data, idx as i64),
+            g: vec_get<u8>(@self.rgb_data, (idx + 1) as i64),
+            b: vec_get<u8>(@self.rgb_data, (idx + 2) as i64)
+        }
 
     # Set pixel color at (x, y)
-    pub fn set_pixel(self:&, x: u32, y: u32, r: u8, g: u8, b: u8)
+    pub fn set_pixel(self:& SubpixelGlyph, x: u32, y: u32, r: u8, g: u8, b: u8)
         let idx = ((y * self.width + x) * 3) as usize
-        self.rgb_data[idx] = r
-        self.rgb_data[idx + 1] = g
-        self.rgb_data[idx + 2] = b
+        vec_set<u8>(@self.rgb_data, idx as i64, r)
+        vec_set<u8>(@self.rgb_data, (idx + 1) as i64, g)
+        vec_set<u8>(@self.rgb_data, (idx + 2) as i64, b)
 
 # FreeType-style subpixel filter coefficients
 # These reduce color fringing by spreading coverage across neighbors
-const FILTER_LIGHT: [5]u8 = [0, 85, 86, 85, 0]     # Very light filtering
-const FILTER_DEFAULT: [5]u8 = [8, 77, 86, 77, 8]   # Balanced filter
-const FILTER_LEGACY: [5]u8 = [16, 64, 96, 64, 16]  # Stronger filtering
+fn get_filter_light() -> [5]u8
+    [0, 85, 86, 85, 0]     # Very light filtering
+
+fn get_filter_default() -> [5]u8
+    [8, 77, 86, 77, 8]   # Balanced filter
+
+fn get_filter_legacy() -> [5]u8
+    [16, 64, 96, 64, 16]  # Stronger filtering
 
 # Rasterize a glyph with subpixel antialiasing
 pub fn rasterize_subpixel(
-    outline: GlyphOutline,
+    outline: @GlyphOutline,
     units_per_em: u16,
     size_px: u32,
     order: SubpixelOrder
 ) -> SubpixelGlyph
     match order
-        SubpixelOrder.None =>
+        Gray =>
             # Fall back to grayscale
             rasterize_subpixel_grayscale(outline, units_per_em, size_px)
-        SubpixelOrder.RGB =>
+        RGB =>
             rasterize_subpixel_rgb(outline, units_per_em, size_px, false)
-        SubpixelOrder.BGR =>
+        BGR =>
             rasterize_subpixel_rgb(outline, units_per_em, size_px, true)
 
 # Grayscale fallback - just convert to RGB
 fn rasterize_subpixel_grayscale(
-    outline: GlyphOutline,
+    outline: @GlyphOutline,
     units_per_em: u16,
     size_px: u32
 ) -> SubpixelGlyph
-    import raster.render.rasterize_outline
-
     let gray = rasterize_outline(outline, units_per_em, size_px, true)
 
     var result = SubpixelGlyph.new(gray.width, gray.height)
@@ -103,14 +119,15 @@ fn rasterize_subpixel_grayscale(
     # Convert grayscale to RGB
     for y in 0..gray.height
         for x in 0..gray.width
-            let alpha = gray.bitmap[(y * gray.width + x) as usize]
+            let idx = (y * gray.width + x) as usize
+            let alpha = gray.get_pixel_alpha(x, y)
             result.set_pixel(x, y, alpha, alpha, alpha)
 
     result
 
 # Rasterize with horizontal subpixel antialiasing
 fn rasterize_subpixel_rgb(
-    outline: GlyphOutline,
+    outline: @GlyphOutline,
     units_per_em: u16,
     size_px: u32,
     bgr: bool
@@ -120,13 +137,14 @@ fn rasterize_subpixel_rgb(
 
     # Scale at 3x horizontal resolution
     let scale = size_px as f32 / units_per_em as f32
-    let scale_x = scale * 3.0  # 3x for subpixels
+    let scale_x = scale * (3 as f32)  # 3x for subpixels
     let scale_y = scale
 
     # Convert outline to edges at 3x horizontal scale
     var edge_table = EdgeTable.new()
 
-    for contour in @outline.contours
+    for i in 0..vec_len<Contour>(@outline.contours) as usize
+        let contour = vec_get<Contour>(@outline.contours, i as i64)
         contour_to_edges_scaled(contour, scale_x, scale_y, @&edge_table)
 
     edge_table.sort()
@@ -135,21 +153,23 @@ fn rasterize_subpixel_rgb(
         return SubpixelGlyph.new(0, 0)
 
     # Get bounding box
-    let (x_min, y_min, x_max, y_max) = edge_table.bounds()
+    let bounds = edge_table.bounds()
 
     # Calculate dimensions
-    let padding = 3u32  # Extra pixels for filtering
-    let width_3x = (x_max - x_min).ceil() as u32 + padding * 2
-    let height = (y_max - y_min).ceil() as u32 + padding * 2
+    let padding: u32 = 3  # Extra pixels for filtering
+    let width_3x = (bounds.x_max - bounds.x_min).ceil() as u32 + padding * 2
+    let height = (bounds.y_max - bounds.y_min).ceil() as u32 + padding * 2
 
     # Sanity check
-    if width_3x > 4096 or height > 1024
+    if width_3x > 4096
+        return SubpixelGlyph.new(0, 0)
+    if height > 1024
         return SubpixelGlyph.new(0, 0)
 
     # Render at 3x resolution
     var bitmap_3x = Bitmap.new(width_3x, height)
-    let x_offset = x_min - padding as f32
-    let y_offset = y_min - padding as f32
+    let x_offset = bounds.x_min - padding as f32
+    let y_offset = bounds.y_min - padding as f32
 
     scanline_fill_antialiased(@&edge_table, @&bitmap_3x, y_offset, x_offset)
 
@@ -158,8 +178,8 @@ fn rasterize_subpixel_rgb(
     var result = SubpixelGlyph.new(final_width, height)
 
     # Scale bearing back
-    result.bearing_x = (x_min / 3.0).floor() as i32
-    result.bearing_y = y_max.ceil() as i32
+    result.bearing_x = (bounds.x_min / (3 as f32)).floor() as i32
+    result.bearing_y = bounds.y_max.ceil() as i32
 
     # Apply filter and downsample
     for y in 0..height
@@ -167,9 +187,9 @@ fn rasterize_subpixel_rgb(
             let x3 = x * 3
 
             # Sample 3 subpixels with filtering
-            let r = filter_sample(@&bitmap_3x, x3, y, width_3x)
-            let g = filter_sample(@&bitmap_3x, x3 + 1, y, width_3x)
-            let b = filter_sample(@&bitmap_3x, x3 + 2, y, width_3x)
+            let r = filter_sample(@bitmap_3x, x3, y, width_3x)
+            let g = filter_sample(@bitmap_3x, x3 + 1, y, width_3x)
+            let b = filter_sample(@bitmap_3x, x3 + 2, y, width_3x)
 
             if bgr
                 result.set_pixel(x, y, b, g, r)
@@ -181,16 +201,45 @@ fn rasterize_subpixel_rgb(
 # Sample with 5-tap filter for smoother transitions
 fn filter_sample(bitmap: @Bitmap, x: u32, y: u32, width: u32) -> u8
     # 5-tap filter centered on x
+    # Filter weights: [8, 77, 86, 77, 8] sum to 256
     var sum: u32 = 0
 
-    for i in 0..5
-        let filter_x = x as i32 + i as i32 - 2
-        if filter_x >= 0 and filter_x < width as i32
-            let sample = bitmap.get(filter_x as u32, y)
-            sum = sum + sample as u32 * FILTER_DEFAULT[i] as u32
+    # Tap -2
+    let fx0 = x as i32 - 2
+    if fx0 >= 0 and fx0 < width as i32
+        let sample = bitmap.get(fx0 as u32, y)
+        sum = sum + sample as u32 * (8 as u32)
+
+    # Tap -1
+    let fx1 = x as i32 - 1
+    if fx1 >= 0 and fx1 < width as i32
+        let sample = bitmap.get(fx1 as u32, y)
+        sum = sum + sample as u32 * (77 as u32)
+
+    # Tap 0 (center)
+    if x < width
+        let sample = bitmap.get(x, y)
+        sum = sum + sample as u32 * (86 as u32)
+
+    # Tap +1
+    let fx3 = x + 1
+    if fx3 < width
+        let sample = bitmap.get(fx3, y)
+        sum = sum + sample as u32 * (77 as u32)
+
+    # Tap +2
+    let fx4 = x + 2
+    if fx4 < width
+        let sample = bitmap.get(fx4, y)
+        sum = sum + sample as u32 * (8 as u32)
 
     # Filter weights sum to 256, so divide by 256
     (sum / 256) as u8
+
+# Point with on_curve flag for contour processing
+struct ContourPoint
+    p: Point2D
+    on_curve: bool
 
 # Convert contour to edges with separate X/Y scaling
 fn contour_to_edges_scaled(contour: Contour, scale_x: f32, scale_y: f32, edge_table:& EdgeTable)
@@ -199,62 +248,66 @@ fn contour_to_edges_scaled(contour: Contour, scale_x: f32, scale_y: f32, edge_ta
         return
 
     # Build expanded point list
-    var points = Vec.new()
+    var points: Vec<ContourPoint> = vec_new<ContourPoint>()
 
     for i in 0..n
-        let curr = contour.points[i]
+        let curr = vec_get<OutlinePoint>(@contour.points, i as i64)
         let next_idx = (i + 1) % n
-        let next = contour.points[next_idx]
+        let next = vec_get<OutlinePoint>(@contour.points, next_idx as i64)
 
         let p = Point2D.new(curr.x as f32 * scale_x, curr.y as f32 * scale_y)
-        points.push((p, curr.on_curve))
+        points.push(ContourPoint { p: p, on_curve: curr.on_curve })
 
         # If both current and next are off-curve, add implied on-curve
         if not curr.on_curve and not next.on_curve
             let next_p = Point2D.new(next.x as f32 * scale_x, next.y as f32 * scale_y)
             let implied = p.midpoint(next_p)
-            points.push((implied, true))
+            points.push(ContourPoint { p: implied, on_curve: true })
 
-    let expanded_n = points.len()
+    let expanded_n = vec_len<ContourPoint>(@points) as usize
     if expanded_n < 2
         return
 
     # Find first on-curve point
-    var start_idx = 0usize
+    var start_idx: usize = 0
     for i in 0..expanded_n
-        let (_, on_curve) = points[i]
-        if on_curve
+        if vec_get<ContourPoint>(@points, i as i64).on_curve
             start_idx = i
             break
 
     # Walk through points, emitting edges
-    var curr_on_curve = points[start_idx].0
-    var i = 1usize
+    var curr_on_curve = vec_get<ContourPoint>(@points, start_idx as i64).p
+    var i: usize = 1
 
-    let tolerance = 0.5f32 * scale_x  # Adjust tolerance for scale
+    let tolerance = (1 as f32) / (2 as f32) * scale_x  # Adjust tolerance for scale
 
     while i <= expanded_n
         let idx = (start_idx + i) % expanded_n
-        let (p, on_curve) = points[idx]
+        let pt = vec_get<ContourPoint>(@points, idx as i64)
 
-        if on_curve
-            edge_table.add_line(curr_on_curve, p)
-            curr_on_curve = p
+        if pt.on_curve
+            edge_table.add_line(@curr_on_curve, @pt.p)
+            curr_on_curve = pt.p
         else
             let next_idx = (start_idx + i + 1) % expanded_n
-            let (next_p, next_on_curve) = points[next_idx]
+            let next_pt = vec_get<ContourPoint>(@points, next_idx as i64)
 
-            if next_on_curve
-                let flattened = flatten_quad_bezier(curr_on_curve, p, next_p, tolerance)
+            if next_pt.on_curve
+                let flattened = flatten_quad_bezier(@curr_on_curve, @pt.p, @next_pt.p, tolerance)
                 for j in 0..flattened.len() - 1
-                    edge_table.add_line(flattened[j], flattened[j + 1])
-                curr_on_curve = next_p
+                    let p0 = vec_get<Point2D>(@flattened, j as i64)
+                    let p1 = vec_get<Point2D>(@flattened, (j + 1) as i64)
+                    edge_table.add_line(@p0, @p1)
+                curr_on_curve = next_pt.p
                 i = i + 1
             else
-                let implied = p.midpoint(next_p)
-                let flattened = flatten_quad_bezier(curr_on_curve, p, implied, tolerance)
+                let next_p = Point2D.new(next_pt.p.x, next_pt.p.y)
+                let implied = pt.p.midpoint(next_p)
+                let flattened = flatten_quad_bezier(@curr_on_curve, @pt.p, @implied, tolerance)
                 for j in 0..flattened.len() - 1
-                    edge_table.add_line(flattened[j], flattened[j + 1])
+                    let p0 = vec_get<Point2D>(@flattened, j as i64)
+                    let p1 = vec_get<Point2D>(@flattened, (j + 1) as i64)
+                    edge_table.add_line(@p0, @p1)
                 curr_on_curve = implied
 
         i = i + 1
@@ -266,7 +319,7 @@ fn test_subpixel_glyph_creation() -> i32
     let glyph = SubpixelGlyph.new(10, 10)
     assert glyph.width == 10
     assert glyph.height == 10
-    assert glyph.rgb_data.len() == 300  # 10 * 10 * 3
+    assert vec_len<u8>(@glyph.rgb_data) == 300  # 10 * 10 * 3
     0
 
 [[test]]
@@ -274,18 +327,17 @@ fn test_subpixel_pixel_access() -> i32
     var glyph = SubpixelGlyph.new(5, 5)
     glyph.set_pixel(2, 3, 255, 128, 64)
 
-    let (r, g, b) = glyph.get_pixel(2, 3)
-    assert r == 255
-    assert g == 128
-    assert b == 64
+    let rgb = glyph.get_pixel(2, 3)
+    assert rgb.r == 255
+    assert rgb.g == 128
+    assert rgb.b == 64
     0
 
 [[test]]
 fn test_filter_coefficients_sum() -> i32
     # Filter weights should sum to 256 for proper normalization
-    var sum: u32 = 0
-    for i in 0..5
-        sum = sum + FILTER_DEFAULT[i] as u32
+    # Default filter: [8, 77, 86, 77, 8]
+    let sum: u32 = 8 + 77 + 86 + 77 + 8
     assert sum == 256
     0
 
@@ -305,7 +357,7 @@ fn test_subpixel_grayscale_fallback() -> i32
     outline.y_max = 100
     outline.add_contour(contour)
 
-    let result = rasterize_subpixel(outline, 100, 10, SubpixelOrder.None)
+    let result = rasterize_subpixel(outline, 100, 10, SubpixelOrder.Gray)
 
     # Should produce valid output
     assert result.width > 0
@@ -314,8 +366,8 @@ fn test_subpixel_grayscale_fallback() -> i32
     # Grayscale means R = G = B for all pixels
     for y in 0..result.height
         for x in 0..result.width
-            let (r, g, b) = result.get_pixel(x, y)
-            assert r == g and g == b
+            let rgb = result.get_pixel(x, y)
+            assert rgb.r == rgb.g and rgb.g == rgb.b
 
     0
 
@@ -345,8 +397,14 @@ fn test_subpixel_rgb_rendering() -> i32
     var has_color = false
     for y in 0..result.height
         for x in 0..result.width
-            let (r, g, b) = result.get_pixel(x, y)
-            if r > 0 or g > 0 or b > 0
+            let rgb = result.get_pixel(x, y)
+            if rgb.r > 0
+                has_color = true
+                break
+            if rgb.g > 0
+                has_color = true
+                break
+            if rgb.b > 0
                 has_color = true
                 break
 

@@ -89,7 +89,7 @@ HAND_WRITTEN_TOKEN_IDS = {
     # Operators
     'PLUS': 70, 'MINUS': 71, 'STAR': 72, 'SLASH': 73, 'PERCENT': 74,
     'AMP': 75, 'PIPE': 76, 'CARET': 77, 'TILDE': 78, 'AT': 79,
-    'BANG': 80, 'QUESTION': 81, 'SHL': 82, 'SHR': 83,
+    'BANG': 80, 'QUESTION': 81,
     # Comparison
     'EQ': 85, 'NE': 86, 'LT': 87, 'GT': 88, 'LE': 89, 'GE': 90,
     # Assignment/arrows
@@ -101,7 +101,6 @@ HAND_WRITTEN_TOKEN_IDS = {
     # Punctuation
     'DOT': 120, 'COMMA': 121, 'COLON': 122, 'SEMICOLON': 123,
     'HASH': 124, 'DBLBRACKET_L': 125, 'DBLBRACKET_R': 126,
-    'LBRACKET2': 125, 'RBRACKET2': 126,  # Aliases for double bracket
     # Literals
     'IDENT': 130, 'NUMBER': 131, 'STRING': 132, 'CSTRING': 133,
     'SSTRING': 134, 'CHAR': 135,
@@ -239,7 +238,7 @@ class RitzGenerator:
         self._emit('# Import dependencies')
         self._emit('import ast')
         self._emit('import ast_helpers')
-        self._emit('import tokens_gen')
+        self._emit('import tokens')
         self._emit('')
 
         # Parser helper functions
@@ -326,7 +325,7 @@ class RitzGenerator:
         # Imports
         self._emit('# Import dependencies')
         self._emit('import ast')
-        self._emit('import tokens_gen')
+        self._emit('import tokens')
         self._emit('')
 
         # Generate parser_init and helpers
@@ -760,7 +759,7 @@ class RitzGenerator:
         self._emit('#')
         self._emit('# This is auto-generated code. Do not edit.')
         self._emit('')
-        self._emit('import tokens_gen')
+        self._emit('import tokens')
         self._emit('import nfa')
         self._emit('import lexer_nfa')
         self._emit('')
@@ -790,11 +789,11 @@ class RitzGenerator:
             if tok.is_literal and tok.pattern:
                 pattern = tok.pattern
                 pat_len = len(pattern)
-                # Escape { and } to avoid ritz string interpolation
+                # Use c"..." for { and } to avoid ritz string issues
                 if pattern == '{':
-                    self._emit(f'    lexer_add_pattern(lex, "\\{{", {pat_len}, TOK_{tok.name}, 1)')
+                    self._emit(f'    lexer_add_pattern(lex, c"{{", {pat_len}, TOK_{tok.name}, 1)')
                 elif pattern == '}':
-                    self._emit(f'    lexer_add_pattern(lex, "\\}}", {pat_len}, TOK_{tok.name}, 1)')
+                    self._emit(f'    lexer_add_pattern(lex, c"}}", {pat_len}, TOK_{tok.name}, 1)')
                 else:
                     self._emit(f'    lexer_add_pattern(lex, "{pattern}", {pat_len}, TOK_{tok.name}, 1)')
             elif not tok.is_literal and tok.pattern:
