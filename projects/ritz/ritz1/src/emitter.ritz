@@ -17,7 +17,7 @@ import tokens_gen
 
 const MAX_LOCALS: i32 = 256
 const MAX_STRINGS: i32 = 256
-const MAX_EXTERNS: i32 = 256  # Increased from 64 to support more ritzlib modules
+const MAX_EXTERNS: i32 = 2048  # Self-hosting needs many externs (hundreds of functions per module)
 const MAX_EMITTED_NAMES: i32 = 512  # Track emitted structs/functions to avoid duplicates
 
 # Track emitted names for deduplication (imports can duplicate structs/functions)
@@ -55,7 +55,7 @@ struct EmitterState
     module: *Module
     strings: [256]StringLit
     string_count: i32
-    externs: [256]ExternFunc  # Increased from 64 to support more ritzlib modules
+    externs: [2048]ExternFunc  # Self-hosting needs many externs (hundreds of functions per module)
     extern_count: i32
     # Deduplication tracking for imports
     emitted_structs: [512]EmittedName
@@ -3778,7 +3778,19 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
     s.ret_type_name = f.return_type_name
     s.ret_type_name_len = f.return_type_name_len
 
-    emit_str(s, "define ")
+    # Use linkonce_odr linkage for all function definitions so the linker
+    # can merge duplicates that occur when the same function is emitted
+    # in multiple modules (from transitively-resolved imports).
+    # This mirrors how C++ handles template instantiations.
+    # Exception: `main` must have external linkage so the runtime's _start can find it.
+    var is_main: i32 = 0
+    if f.name_len == 4
+        if *(f.name + 0) == 109 and *(f.name + 1) == 97 and *(f.name + 2) == 105 and *(f.name + 3) == 110
+            is_main = 1
+    if is_main == 1
+        emit_str(s, "define ")
+    else
+        emit_str(s, "define linkonce_odr ")
     emit_llvm_type_struct(s, f.return_type, f.return_type_name, f.return_type_name_len)
     emit_str(s, " @")
     emit_name(s, f.name, f.name_len)
@@ -3966,7 +3978,8 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
     s.break_label = -1
     s.continue_label = -1
 
-    emit_str(s, "define ")
+    # linkonce_odr: same as fn emission — linker merges duplicates across modules
+    emit_str(s, "define linkonce_odr ")
     emit_llvm_type(s, method.return_type)
     emit_str(s, " @")
     # Emit mangled name: Type_method
@@ -4121,7 +4134,7 @@ fn is_local_function(m: *Module, name: *u8, len: i32) -> i32
     var f: *FnDef = m.functions
     while f != null
         # Only consider functions with bodies (not extern declarations)
-        if f.body != null && f.name_len == len
+        if f.body != null and f.name_len == len
             var j: i32 = 0
             var matched: i32 = 1
             while j < len
@@ -4136,40 +4149,41 @@ fn is_local_function(m: *Module, name: *u8, len: i32) -> i32
 
 # Emit inline syscall implementations for commonly used syscall functions
 fn emit_syscall_implementations(s: *EmitterState)
-    emit_str(s, "; Inline syscall implementations\n")
+    emit_str(s, "; Inline syscall implementations (linkonce_odr — linker merges duplicates across modules)\n")
 
-    # syscall0-6: low-level syscall wrappers
-    emit_str(s, "define i64 @syscall0(i64 %n) \{\n")
+    # syscall0-6: low-level syscall wrappers with linkonce_odr linkage
+    # so multiple modules can emit them and the linker deduplicates.
+    emit_str(s, "define linkonce_odr i64 @syscall0(i64 %n) \{\n")
     emit_str(s, "  %ret = call i64 asm sideeffect \"syscall\", \"=\{rax\},\{rax\},~\{rcx\},~\{r11\},~\{memory\}\"(i64 %n)\n")
     emit_str(s, "  ret i64 %ret\n")
     emit_str(s, "\}\n\n")
 
-    emit_str(s, "define i64 @syscall1(i64 %n, i64 %a1) \{\n")
+    emit_str(s, "define linkonce_odr i64 @syscall1(i64 %n, i64 %a1) \{\n")
     emit_str(s, "  %ret = call i64 asm sideeffect \"syscall\", \"=\{rax\},\{rax\},\{rdi\},~\{rcx\},~\{r11\},~\{memory\}\"(i64 %n, i64 %a1)\n")
     emit_str(s, "  ret i64 %ret\n")
     emit_str(s, "\}\n\n")
 
-    emit_str(s, "define i64 @syscall2(i64 %n, i64 %a1, i64 %a2) \{\n")
+    emit_str(s, "define linkonce_odr i64 @syscall2(i64 %n, i64 %a1, i64 %a2) \{\n")
     emit_str(s, "  %ret = call i64 asm sideeffect \"syscall\", \"=\{rax\},\{rax\},\{rdi\},\{rsi\},~\{rcx\},~\{r11\},~\{memory\}\"(i64 %n, i64 %a1, i64 %a2)\n")
     emit_str(s, "  ret i64 %ret\n")
     emit_str(s, "\}\n\n")
 
-    emit_str(s, "define i64 @syscall3(i64 %n, i64 %a1, i64 %a2, i64 %a3) \{\n")
+    emit_str(s, "define linkonce_odr i64 @syscall3(i64 %n, i64 %a1, i64 %a2, i64 %a3) \{\n")
     emit_str(s, "  %ret = call i64 asm sideeffect \"syscall\", \"=\{rax\},\{rax\},\{rdi\},\{rsi\},\{rdx\},~\{rcx\},~\{r11\},~\{memory\}\"(i64 %n, i64 %a1, i64 %a2, i64 %a3)\n")
     emit_str(s, "  ret i64 %ret\n")
     emit_str(s, "\}\n\n")
 
-    emit_str(s, "define i64 @syscall4(i64 %n, i64 %a1, i64 %a2, i64 %a3, i64 %a4) \{\n")
+    emit_str(s, "define linkonce_odr i64 @syscall4(i64 %n, i64 %a1, i64 %a2, i64 %a3, i64 %a4) \{\n")
     emit_str(s, "  %ret = call i64 asm sideeffect \"syscall\", \"=\{rax\},\{rax\},\{rdi\},\{rsi\},\{rdx\},\{r10\},~\{rcx\},~\{r11\},~\{memory\}\"(i64 %n, i64 %a1, i64 %a2, i64 %a3, i64 %a4)\n")
     emit_str(s, "  ret i64 %ret\n")
     emit_str(s, "\}\n\n")
 
-    emit_str(s, "define i64 @syscall5(i64 %n, i64 %a1, i64 %a2, i64 %a3, i64 %a4, i64 %a5) \{\n")
+    emit_str(s, "define linkonce_odr i64 @syscall5(i64 %n, i64 %a1, i64 %a2, i64 %a3, i64 %a4, i64 %a5) \{\n")
     emit_str(s, "  %ret = call i64 asm sideeffect \"syscall\", \"=\{rax\},\{rax\},\{rdi\},\{rsi\},\{rdx\},\{r10\},\{r8\},~\{rcx\},~\{r11\},~\{memory\}\"(i64 %n, i64 %a1, i64 %a2, i64 %a3, i64 %a4, i64 %a5)\n")
     emit_str(s, "  ret i64 %ret\n")
     emit_str(s, "\}\n\n")
 
-    emit_str(s, "define i64 @syscall6(i64 %n, i64 %a1, i64 %a2, i64 %a3, i64 %a4, i64 %a5, i64 %a6) \{\n")
+    emit_str(s, "define linkonce_odr i64 @syscall6(i64 %n, i64 %a1, i64 %a2, i64 %a3, i64 %a4, i64 %a5, i64 %a6) \{\n")
     emit_str(s, "  %ret = call i64 asm sideeffect \"syscall\", \"=\{rax\},\{rax\},\{rdi\},\{rsi\},\{rdx\},\{r10\},\{r8\},\{r9\},~\{rcx\},~\{r11\},~\{memory\}\"(i64 %n, i64 %a1, i64 %a2, i64 %a3, i64 %a4, i64 %a5, i64 %a6)\n")
     emit_str(s, "  ret i64 %ret\n")
     emit_str(s, "\}\n\n")
@@ -4197,16 +4211,24 @@ fn is_syscall_function(name: *u8, len: i32) -> i32
     0
 
 fn emit_extern_declarations(s: *EmitterState)
-    # Always emit syscall implementations — ritz1 can't emit ritzlib.sys's inline asm bodies,
-    # so we provide our own implementations. This is safe even if no syscalls are used (dead code).
-    emit_syscall_implementations(s)
-
-    # Emit remaining external declarations (non-syscall functions)
+    # Check ALL externs for syscalls — even "local" ones (imported from ritzlib.sys),
+    # because ritz1 can't emit their inline asm bodies. We provide our own implementations.
+    var need_syscalls: i32 = 0
     for i in 0..s.extern_count
         let ex: *ExternFunc = @s.externs[i]
-        # Skip if this is a function defined in this module or a syscall we implement
+        if is_syscall_function(ex.name, ex.name_len) == 1
+            need_syscalls = 1
+    if need_syscalls == 1
+        emit_syscall_implementations(s)
+
+    # Emit remaining external declarations (non-syscall, non-local functions)
+    for i in 0..s.extern_count
+        let ex: *ExternFunc = @s.externs[i]
+        # Skip syscalls (already emitted inline above)
+        if is_syscall_function(ex.name, ex.name_len) == 1
+            continue
+        # Skip if this function is defined in this module
         if is_local_function(s.module, ex.name, ex.name_len) == 0
-            if is_syscall_function(ex.name, ex.name_len) == 0
                 # Look up the function's return type from its definition
                 let fn_def: *FnDef = find_fn(s, ex.name, ex.name_len)
                 if fn_def != null and fn_def.return_type == TYPE_STRUCT
@@ -4341,7 +4363,8 @@ fn emit_global_vars(s: *EmitterState)
         mark_global_emitted(s, g.name, g.name_len)
         emit_str(s, "@")
         emit_name(s, g.name, g.name_len)
-        emit_str(s, " = global ")
+        # linkonce_odr: merge duplicates across modules (same as functions)
+        emit_str(s, " = linkonce_odr global ")
         # Emit the type
         if g.var_type == TYPE_STRUCT
             emit_str(s, "%")
@@ -4652,6 +4675,18 @@ fn emit_module(m: *Module, out: *Vec<u8>) -> i32
             skipped_generic = skipped_generic + 1
             f = f.next
             continue
+        # Skip syscall functions — ritz1 can't emit their asm bodies,
+        # we emit our own inline implementations at the end.
+        # Also skip functions with unsafe/asm blocks that ritz1 can't emit.
+        if f.name_len == 8 and f.name != null
+            let c0: i32 = *(f.name + 0)
+            let c1: i32 = *(f.name + 1)
+            if c0 == 115 and c1 == 121  # "sy" prefix
+                let c2: i32 = *(f.name + 2)
+                let c3: i32 = *(f.name + 3)
+                if c2 == 115 and c3 == 99  # "sc" continuation
+                    f = f.next
+                    continue
         # Skip already-emitted functions (deduplication for imports)
         if was_fn_emitted(@s, f.name, f.name_len) == 1
             skipped_dup = skipped_dup + 1
@@ -4661,6 +4696,14 @@ fn emit_module(m: *Module, out: *Vec<u8>) -> i32
         emit_fn(@s, f)
         emitted_count = emitted_count + 1
         f = f.next
+
+    # Register syscall functions as externs — ritz1 can't emit their inline asm bodies,
+    # so they need to be handled by emit_extern_declarations (which provides our own inline implementations)
+    var sys_fn: *FnDef = m.functions
+    while sys_fn != null
+        if is_syscall_function(sys_fn.name, sys_fn.name_len) == 1
+            add_extern(@s, sys_fn.name, sys_fn.name_len)
+        sys_fn = sys_fn.next
 
     # Emit impl block methods with mangled names (Type_method)
     var ib: *ImplBlock = m.impls
@@ -4674,7 +4717,8 @@ fn emit_module(m: *Module, out: *Vec<u8>) -> i32
     emit_str(@s, "\n")
     emit_string_constants(@s)
 
-    # Emit extern declarations after collecting them from function bodies
+    # Emit extern declarations after collecting them from function bodies.
+    # This will also emit syscall implementations if any syscalls are used.
     emit_extern_declarations(@s)
 
     # Note: _start is provided by runtime/ritz_crt0.o which properly sets up argc/argv
