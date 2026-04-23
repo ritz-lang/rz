@@ -391,6 +391,24 @@ class LLVMEmitter:
     def _ritz_type_to_llvm(self, ty: rast.Type) -> ir.Type:
         """Convert a Ritz type to an LLVM type."""
         if isinstance(ty, rast.NamedType):
+            # If this is a generic instantiation (e.g., Span<u8>), resolve to
+            # its specialized LLVM type — otherwise we would fall through to
+            # the opaque `i8` placeholder and downstream field access would
+            # fail.
+            if ty.args:
+                specialized_name = self._get_specialized_type_name(ty)
+                if specialized_name in self.union_types:
+                    return self.union_types[specialized_name][0]
+                if specialized_name in self.enum_types:
+                    return self.enum_types[specialized_name][0]
+                if specialized_name in self.struct_types:
+                    return self.struct_types[specialized_name]
+                # Synthesize built-in generic structs (Span<T>) on demand so
+                # that parameters typed `Span<u8>` resolve to a real struct
+                # even when monomorphization hasn't materialized them.
+                synthesized_struct = self._ensure_builtin_generic_struct_specialization(ty)
+                if synthesized_struct and synthesized_struct in self.struct_types:
+                    return self.struct_types[synthesized_struct]
             mapping = {
                 'i8': self.i8,
                 'i16': self.i16,
@@ -488,6 +506,31 @@ class LLVMEmitter:
             return ir.LiteralStructType(element_types)
         else:
             raise ValueError(f"Unknown type: {ty}")
+
+    def _ensure_builtin_generic_struct_specialization(self, ty: rast.NamedType) -> Optional[str]:
+        """Synthesize lightweight generic structs used by built-ins (Span<T>).
+
+        When a function parameter is typed `Span<T>` and no explicit
+        monomorphization produced the struct, we materialize it here so that
+        field access and indexing have a concrete LLVM struct to work with.
+        """
+        if not ty.args:
+            return None
+        specialized_name = self._get_specialized_type_name(ty)
+        if specialized_name in self.struct_types:
+            return specialized_name
+        if ty.name != 'Span' or len(ty.args) != 1:
+            return None
+
+        elem_ty = self._ritz_type_to_llvm(ty.args[0])
+        span_ty = self.module.context.get_identified_type(specialized_name)
+        span_ty.set_body(ir.PointerType(elem_ty), self.i64)
+        self.struct_types[specialized_name] = span_ty
+        self.struct_fields[specialized_name] = [
+            ('ptr', rast.PtrType(ty.span, ty.args[0], mutable=False)),
+            ('len', rast.NamedType(ty.span, 'i64', [])),
+        ]
+        return specialized_name
 
     def _type_size_bytes(self, ty: ir.Type) -> int:
         """Get the size of an LLVM type in bytes."""
@@ -3117,11 +3160,15 @@ class LLVMEmitter:
             tuple_val = self._emit_expr(stmt.value)
 
             # Extract each element and bind to the corresponding name
-            if not isinstance(tuple_val.type, ir.LiteralStructType):
+            # Accept both LiteralStructType (tuples) and IdentifiedStructType
+            # (named structs) — positional destructure of a struct maps names to
+            # fields in declaration order.
+            if not isinstance(tuple_val.type, ir.BaseStructType):
                 raise ValueError(f"Cannot destructure non-tuple type: {tuple_val.type}")
 
-            if len(stmt.names) != len(tuple_val.type.elements):
-                raise ValueError(f"Tuple destructuring mismatch: expected {len(tuple_val.type.elements)} "
+            elements = tuple_val.type.elements
+            if len(stmt.names) != len(elements):
+                raise ValueError(f"Tuple destructuring mismatch: expected {len(elements)} "
                                f"elements, got {len(stmt.names)} names")
 
             for i, name in enumerate(stmt.names):
@@ -4744,6 +4791,23 @@ class LLVMEmitter:
 
     def _emit_index(self, expr: rast.Index) -> ir.Value:
         """Emit an indexing operation: base[index]."""
+        # Range index: `a[start..end]` lowers to a slice operation.
+        if isinstance(expr.index, rast.Range):
+            slice_end = expr.index.end
+            if expr.index.inclusive and slice_end is not None:
+                slice_end = rast.BinOp(
+                    span=slice_end.span,
+                    op='+',
+                    left=slice_end,
+                    right=rast.IntLit(span=slice_end.span, value=1),
+                )
+            return self._emit_slice(rast.SliceExpr(
+                span=expr.span,
+                expr=expr.expr,
+                start=expr.index.start,
+                end=slice_end,
+            ))
+
         index = self._emit_expr(expr.index)
 
         # Special handling for identifiers that are arrays
@@ -4871,8 +4935,94 @@ class LLVMEmitter:
                             index = self.builder.sext(index, self.i64)
                         return self.builder.call(fn, [map_ptr, index])
 
+        # Vec<T> indexing sugar for non-identifier receivers, e.g.
+        # `s.entries[i]` or `mk()[i]`. We infer the base Ritz type and, if it
+        # is `Vec<T>`, dispatch to `vec_get$T` when available or fall back to
+        # indexing the backing data pointer directly.
+        inferred_base_type = self._infer_ritz_type(expr.expr)
+        if isinstance(inferred_base_type, rast.NamedType):
+            inferred_name = inferred_base_type.name
+            if inferred_name.startswith('Vec$') or inferred_name == 'Vec':
+                if inferred_name.startswith('Vec$'):
+                    elem_type_name = inferred_name[4:]
+                elif inferred_base_type.args:
+                    elem_type_name = self._type_to_name_suffix(inferred_base_type.args[0])
+                else:
+                    elem_type_name = None
+                if elem_type_name:
+                    fn_name = f"vec_get${elem_type_name}"
+                    try:
+                        vec_ptr = self._emit_lvalue_addr(expr.expr)
+                    except ValueError:
+                        vec_val = self._emit_expr(expr.expr)
+                        vec_tmp = self._alloca_in_entry_block(vec_val.type, "vec.tmp")
+                        self.builder.store(vec_val, vec_tmp)
+                        vec_ptr = vec_tmp
+                    if index.type != self.i64:
+                        if isinstance(index.type, ir.IntType) and index.type.width < 64:
+                            index = self.builder.sext(index, self.i64)
+                        elif isinstance(index.type, ir.IntType) and index.type.width > 64:
+                            index = self.builder.trunc(index, self.i64)
+                    if fn_name in self.functions:
+                        return self.builder.call(self.functions[fn_name][0], [vec_ptr, index])
+                    # Fallback: index the `data` field (backing storage) directly.
+                    data_field_idx = self._get_struct_field_index(inferred_name, 'data')
+                    data_ptr_ptr = self.builder.gep(
+                        vec_ptr,
+                        [ir.Constant(self.i32, 0), ir.Constant(self.i32, data_field_idx)],
+                    )
+                    data_ptr = self.builder.load(data_ptr_ptr)
+                    elem_ptr = self.builder.gep(data_ptr, [index])
+                    return self.builder.load(elem_ptr)
+
+        # Span<T> indexing sugar: s[i] -> *(s.ptr + i).
+        if isinstance(inferred_base_type, rast.NamedType):
+            is_span = (
+                inferred_base_type.name == 'Span'
+                or inferred_base_type.name.startswith('Span$')
+            )
+            if is_span:
+                span_val = self._emit_expr(expr.expr)
+                if isinstance(span_val.type, ir.PointerType):
+                    span_val = self.builder.load(span_val)
+                span_ptr = self.builder.extract_value(span_val, 0)
+                if index.type != self.i64:
+                    if isinstance(index.type, ir.IntType) and index.type.width < 64:
+                        index = self.builder.sext(index, self.i64)
+                    elif isinstance(index.type, ir.IntType) and index.type.width > 64:
+                        index = self.builder.trunc(index, self.i64)
+                elem_ptr = self.builder.gep(span_ptr, [index])
+                return self.builder.load(elem_ptr)
+
         # General case
         base = self._emit_expr(expr.expr)
+
+        # Shape-based Span indexing fallback: `{ *T, i64 }[i]`.
+        if isinstance(base.type, ir.BaseStructType):
+            elems = base.type.elements
+            if (len(elems) == 2
+                    and isinstance(elems[0], ir.PointerType)
+                    and isinstance(elems[1], ir.IntType)):
+                span_ptr = self.builder.extract_value(base, 0)
+                if index.type != self.i64:
+                    if isinstance(index.type, ir.IntType) and index.type.width < 64:
+                        index = self.builder.sext(index, self.i64)
+                    elif isinstance(index.type, ir.IntType) and index.type.width > 64:
+                        index = self.builder.trunc(index, self.i64)
+                elem_ptr = self.builder.gep(span_ptr, [index])
+                return self.builder.load(elem_ptr)
+            # Shape-based Vec indexing fallback: `{ *T, i64, ... }[i]`.
+            if (len(elems) >= 3
+                    and isinstance(elems[0], ir.PointerType)
+                    and isinstance(elems[1], ir.IntType)):
+                data_ptr = self.builder.extract_value(base, 0)
+                if index.type != self.i64:
+                    if isinstance(index.type, ir.IntType) and index.type.width < 64:
+                        index = self.builder.sext(index, self.i64)
+                    elif isinstance(index.type, ir.IntType) and index.type.width > 64:
+                        index = self.builder.trunc(index, self.i64)
+                elem_ptr = self.builder.gep(data_ptr, [index])
+                return self.builder.load(elem_ptr)
 
         # Get element type
         if isinstance(base.type, ir.PointerType):
@@ -4923,8 +5073,53 @@ class LLVMEmitter:
                     if type_name.startswith('Vec$') or type_name == 'Vec':
                         return self._emit_vec_slice(expr, type_name, base_ritz_type)
 
+                    # Handle Span<T> slicing: s[a..b] returns a sub-span.
+                    if type_name.startswith('Span$') or type_name == 'Span':
+                        return self._emit_span_slice(expr)
+
+        # Non-identifier receivers (e.g., parameters, call results) — if the
+        # inferred Ritz type is a Span, dispatch to span slicing directly.
+        inferred = self._infer_ritz_type(expr.expr)
+        if isinstance(inferred, rast.NamedType):
+            if inferred.name == 'Span' or inferred.name.startswith('Span$'):
+                return self._emit_span_slice(expr)
+
         raise ValueError(f"Slice operation not supported for this type. "
                          f"Only String and Vec types support slicing.")
+
+    def _emit_span_slice(self, expr: rast.SliceExpr) -> ir.Value:
+        """Emit span slice: `s[a..b]` -> `Span<T> { ptr + a, b - a }`.
+
+        Zero-copy sub-view over an existing Span.
+        """
+        span_val = self._emit_expr(expr.expr)
+        if isinstance(span_val.type, ir.PointerType):
+            span_val = self.builder.load(span_val)
+        span_type = span_val.type
+        base_ptr = self.builder.extract_value(span_val, 0)
+        base_len = self.builder.extract_value(span_val, 1)
+        if base_len.type != self.i64:
+            base_len = self._convert_type(base_len, self.i64)
+
+        if expr.start is not None:
+            start = self._emit_expr(expr.start)
+            if start.type != self.i64:
+                start = self._convert_type(start, self.i64)
+        else:
+            start = ir.Constant(self.i64, 0)
+
+        if expr.end is not None:
+            end = self._emit_expr(expr.end)
+            if end.type != self.i64:
+                end = self._convert_type(end, self.i64)
+        else:
+            end = base_len
+
+        new_ptr = self.builder.gep(base_ptr, [start])
+        new_len = self.builder.sub(end, start)
+        out = self.builder.insert_value(ir.Constant(span_type, ir.Undefined), new_ptr, 0)
+        out = self.builder.insert_value(out, new_len, 1)
+        return out
 
     def _emit_string_slice(self, expr: rast.SliceExpr) -> ir.Value:
         """Emit string slice: s[1:5] → string_slice(&s, 1, 5)."""
@@ -7854,6 +8049,57 @@ class LLVMEmitter:
                 inner = self._convert_type(val, elems[0])
                 wrapped = self.builder.insert_value(ir.Constant(target_type, ir.Undefined), inner, 0)
                 return wrapped
+
+        # Span-shape conversions: target is `{ *T, i64 }` and source is an
+        # array value, a pointer-to-array, or a pointer-to-Vec-like struct.
+        # These support auto-borrow coercion at call sites, e.g.:
+        #   - `[N]u8`      -> Span<u8>  (materialize to stack, take ptr+len)
+        #   - `*[N]u8`     -> Span<u8>  (decay to pointer, embed length)
+        #   - `*Vec<u8>`   -> Span<u8>  (project data/len fields)
+        if isinstance(target_type, ir.BaseStructType):
+            elems = target_type.elements
+            if (len(elems) == 2
+                    and isinstance(elems[0], ir.PointerType)
+                    and elems[1] == self.i64):
+                target_elem_ty = elems[0].pointee
+                # Array value -> Span: store to a temp, then take ptr+len.
+                if isinstance(val.type, ir.ArrayType) and val.type.element == target_elem_ty:
+                    temp_arr = self._alloca_in_entry_block(val.type, "span.arr")
+                    self.builder.store(val, temp_arr)
+                    zero = ir.Constant(self.i32, 0)
+                    ptr = self.builder.gep(temp_arr, [zero, zero])
+                    length = ir.Constant(self.i64, val.type.count)
+                    span = self.builder.insert_value(ir.Constant(target_type, ir.Undefined), ptr, 0)
+                    span = self.builder.insert_value(span, length, 1)
+                    return span
+                # Pointer to array -> Span.
+                if isinstance(val.type, ir.PointerType) and isinstance(val.type.pointee, ir.ArrayType):
+                    arr_ty = val.type.pointee
+                    if arr_ty.element == target_elem_ty:
+                        zero = ir.Constant(self.i32, 0)
+                        ptr = self.builder.gep(val, [zero, zero])
+                        length = ir.Constant(self.i64, arr_ty.count)
+                        span = self.builder.insert_value(ir.Constant(target_type, ir.Undefined), ptr, 0)
+                        span = self.builder.insert_value(span, length, 1)
+                        return span
+                # Pointer to Vec-like struct { *T, i64, ... } -> Span projection.
+                if isinstance(val.type, ir.PointerType) and isinstance(val.type.pointee, ir.BaseStructType):
+                    src_elems = val.type.pointee.elements
+                    if (src_elems is not None
+                            and len(src_elems) >= 2
+                            and isinstance(src_elems[0], ir.PointerType)
+                            and src_elems[0].pointee == target_elem_ty
+                            and isinstance(src_elems[1], ir.IntType)):
+                        zero = ir.Constant(self.i32, 0)
+                        data_ptr_ptr = self.builder.gep(val, [zero, ir.Constant(self.i32, 0)])
+                        len_ptr = self.builder.gep(val, [zero, ir.Constant(self.i32, 1)])
+                        data_ptr = self.builder.load(data_ptr_ptr)
+                        length = self.builder.load(len_ptr)
+                        if length.type != self.i64:
+                            length = self._convert_type(length, self.i64)
+                        span = self.builder.insert_value(ir.Constant(target_type, ir.Undefined), data_ptr, 0)
+                        span = self.builder.insert_value(span, length, 1)
+                        return span
 
         return val
 
