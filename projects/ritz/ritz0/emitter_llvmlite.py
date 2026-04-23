@@ -7311,10 +7311,11 @@ class LLVMEmitter:
                     type_name = self._get_struct_name_from_type(ty)
 
         # Look up the mangled function name (need type_name first)
+        receiver_probe = None
         if type_name is None:
             # Fall back to emitting the expression and checking its type
-            receiver_val = self._emit_expr(expr.expr)
-            receiver_type = receiver_val.type
+            receiver_probe = self._emit_expr(expr.expr)
+            receiver_type = receiver_probe.type
             if isinstance(receiver_type, ir.PointerType):
                 type_name = self._get_struct_name_from_type(receiver_type.pointee)
             else:
@@ -7324,6 +7325,11 @@ class LLVMEmitter:
                     bits = receiver_type.width
                     # Default to unsigned for BitOps (both signed/unsigned work the same)
                     type_name = f'u{bits}'
+                # Float primitive methods on expression receivers (ceil/floor/round/abs)
+                if type_name is None and self._is_float_type(receiver_type):
+                    float_result = self._try_emit_float_intrinsic(expr, receiver_probe)
+                    if float_result is not None:
+                        return float_result
 
         if type_name is None:
             raise ValueError(f"Cannot call method '{expr.method}' on unknown type")
@@ -7332,6 +7338,11 @@ class LLVMEmitter:
         bitops_result = self._try_emit_bitops_intrinsic(expr, type_name)
         if bitops_result is not None:
             return bitops_result
+
+        # Float intrinsic methods when receiver type was inferred from symbols.
+        float_result = self._try_emit_float_intrinsic(expr, receiver_probe)
+        if float_result is not None:
+            return float_result
 
         method_key = (type_name, expr.method)
         used_ufcs_fallback = False  # Track if we used UFCS fallback
@@ -7423,9 +7434,22 @@ class LLVMEmitter:
             receiver_val = self._emit_expr(expr.expr)
 
         # Build arguments: receiver first, then explicit args
+        # Auto-borrow addressable args when the method expects a pointer param.
         all_args = [receiver_val]
-        for arg in expr.args:
-            all_args.append(self._emit_expr(arg))
+        for j, arg in enumerate(expr.args, start=1):
+            expected_type = fn.function_type.args[j] if j < len(fn.function_type.args) else None
+            arg_ritz_type = self._infer_ritz_type(arg)
+            arg_is_ref = isinstance(arg_ritz_type, rast.RefType) if arg_ritz_type else False
+            arg_is_ptr = isinstance(arg_ritz_type, rast.PtrType) if arg_ritz_type else False
+            arg_is_addr_of = isinstance(arg, rast.UnaryOp) and arg.op in ('&', '@', '@&', '&mut')
+            if (expected_type is not None and isinstance(expected_type, ir.PointerType)
+                    and not (arg_is_ref or arg_is_ptr or arg_is_addr_of)):
+                try:
+                    all_args.append(self._emit_lvalue_addr(arg))
+                except ValueError:
+                    all_args.append(self._emit_expr(arg))
+            else:
+                all_args.append(self._emit_expr(arg))
 
         # Convert argument types as needed
         converted_args = []
@@ -7636,6 +7660,19 @@ class LLVMEmitter:
         if val.type == target_type:
             return val
 
+        # Floating-point conversions (float <-> double)
+        if isinstance(val.type, ir.FloatType) and isinstance(target_type, ir.DoubleType):
+            return self.builder.fpext(val, target_type)
+        if isinstance(val.type, ir.DoubleType) and isinstance(target_type, ir.FloatType):
+            return self.builder.fptrunc(val, target_type)
+
+        # Integer <-> floating-point conversions
+        # Full signedness provenance is not tracked here; default to signed.
+        if isinstance(val.type, ir.IntType) and isinstance(target_type, (ir.FloatType, ir.DoubleType)):
+            return self.builder.sitofp(val, target_type)
+        if isinstance(val.type, (ir.FloatType, ir.DoubleType)) and isinstance(target_type, ir.IntType):
+            return self.builder.fptosi(val, target_type)
+
         # Integer conversions
         if isinstance(val.type, ir.IntType) and isinstance(target_type, ir.IntType):
             if val.type.width < target_type.width:
@@ -7657,6 +7694,12 @@ class LLVMEmitter:
         # Pointer to pointer (bitcast)
         if isinstance(val.type, ir.PointerType) and isinstance(target_type, ir.PointerType):
             return self.builder.bitcast(val, target_type)
+
+        # Auto-deref when a value type is expected and we have a pointer to that value.
+        # Helps at call sites that pass `@x` where `T` is expected.
+        if isinstance(val.type, ir.PointerType) and not isinstance(target_type, ir.PointerType):
+            if val.type.pointee == target_type:
+                return self.builder.load(val)
 
         # Array type conversion: [N x T1] to [N x T2]
         if isinstance(val.type, ir.ArrayType) and isinstance(target_type, ir.ArrayType):
@@ -7710,6 +7753,15 @@ class LLVMEmitter:
                     converted_elem = self._convert_type(elem, target_type.elements[i])
                     result = self.builder.insert_value(result, converted_elem, i)
                 return result
+
+        # Scalar-to-newtype wrap: i32 -> struct { i32 }.
+        # Allows passing raw integers into single-field struct params (newtype wrappers).
+        if isinstance(target_type, ir.BaseStructType):
+            elems = target_type.elements
+            if len(elems) == 1 and isinstance(elems[0], ir.IntType) and isinstance(val.type, ir.IntType):
+                inner = self._convert_type(val, elems[0])
+                wrapped = self.builder.insert_value(ir.Constant(target_type, ir.Undefined), inner, 0)
+                return wrapped
 
         return val
 
@@ -7836,6 +7888,33 @@ class LLVMEmitter:
     def _is_float_type(self, llvm_ty: ir.Type) -> bool:
         """Check if an LLVM type is a floating-point type."""
         return isinstance(llvm_ty, (ir.FloatType, ir.DoubleType))
+
+    def _try_emit_float_intrinsic(self, expr: rast.MethodCall, receiver: Optional[ir.Value] = None) -> Optional[ir.Value]:
+        """Try to emit float methods via LLVM intrinsics.
+
+        Supports expression receivers like `(x + y).ceil()`.
+        Returns None when the method isn't a recognised float intrinsic
+        or the receiver isn't a float/double value.
+        """
+        method = expr.method
+        if method not in ('ceil', 'floor', 'round', 'abs'):
+            return None
+        if len(expr.args) != 0:
+            raise ValueError(f"{method}() takes no arguments")
+
+        recv = receiver if receiver is not None else self._emit_expr(expr.expr)
+        if not isinstance(recv.type, (ir.FloatType, ir.DoubleType)):
+            return None
+
+        intrinsic_name = {
+            'ceil': 'llvm.ceil',
+            'floor': 'llvm.floor',
+            'round': 'llvm.round',
+            'abs': 'llvm.fabs',
+        }[method]
+        fn_type = ir.FunctionType(recv.type, [recv.type])
+        intrinsic = self.module.declare_intrinsic(intrinsic_name, [recv.type], fnty=fn_type)
+        return self.builder.call(intrinsic, [recv])
 
     def _infer_float_expr(self, expr: rast.Expr) -> bool:
         """Check if an expression produces a floating-point type.
