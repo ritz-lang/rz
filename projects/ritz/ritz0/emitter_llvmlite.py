@@ -712,7 +712,15 @@ class LLVMEmitter:
                         return fn_def.ret_type
             return None
         elif isinstance(expr, rast.MethodCall):
-            # Method call return type - look up in method signatures
+            # Method call return type - look up in method signatures.
+            # Handle a few well-known builtins so let bindings get usable types.
+            if expr.method == 'as_bytes':
+                recv_type = self._infer_ritz_type(expr.expr)
+                if isinstance(recv_type, rast.NamedType) and recv_type.name == 'StrView':
+                    return rast.NamedType(
+                        expr.span, 'Span',
+                        [rast.NamedType(expr.span, 'u8', [])],
+                    )
             return None  # Complex - would need full type resolution
         elif isinstance(expr, rast.Field):
             # Field access - resolve struct type and return field type
@@ -5043,9 +5051,9 @@ class LLVMEmitter:
                             elem_type_name = type_name[4:]  # Strip "Vec$"
                         else:
                             # Try to get from type args
-                            if base_ritz_type.type_args:
-                                elem_ty = base_ritz_type.type_args[0]
-                                elem_type_name = self._type_to_mangled_name(elem_ty)
+                            if base_ritz_type.args:
+                                elem_ty = base_ritz_type.args[0]
+                                elem_type_name = self._type_to_name_suffix(elem_ty)
                             else:
                                 raise ValueError("Vec type without element type")
 
@@ -5153,6 +5161,8 @@ class LLVMEmitter:
         base = self._emit_expr(expr.expr)
 
         # Shape-based Span indexing fallback: `{ *T, i64 }[i]`.
+        # Catches Span values whose Ritz type wasn't registered (e.g. result of
+        # s.as_bytes() bound to a `let`).
         if isinstance(base.type, ir.BaseStructType):
             elems = base.type.elements
             if (len(elems) == 2
@@ -6703,9 +6713,9 @@ class LLVMEmitter:
                         inner_type = inner_type.inner
                     if isinstance(inner_type, rast.NamedType):
                         struct_name = inner_type.name
-                        if struct_name in self.structs:
+                        if struct_name in self.struct_types:
                             # We know it's a pointer to this struct type - bitcast and access
-                            llvm_struct_type = self.structs[struct_name]
+                            llvm_struct_type = self.struct_types[struct_name]
                             typed_ptr = self.builder.bitcast(struct_val, ir.PointerType(llvm_struct_type))
                             idx = self._get_struct_field_index(struct_name, expr.field)
                             field_ptr = self.builder.gep(typed_ptr, [ir.Constant(self.i32, 0), ir.Constant(self.i32, idx)])
@@ -7605,52 +7615,6 @@ class LLVMEmitter:
         # Not a SIMD builtin
         return None
 
-    def _try_emit_enum_predicate_method(
-        self,
-        expr: rast.MethodCall,
-        type_name: str,
-    ) -> Optional[ir.Value]:
-        """Emit Option/Result predicate methods directly via tag comparison.
-
-        This bypasses the need for a registered ritzlib helper specialization
-        (e.g. result_is_ok$i32_StrView) which the monomorphizer may not have
-        instantiated when the receiver's type was inferred only from a call
-        return rather than an explicit annotation.
-        """
-        if expr.args:
-            return None
-        if expr.method not in ('is_some', 'is_none', 'is_ok', 'is_err'):
-            return None
-        if type_name not in self.enum_types:
-            return None
-
-        target_variant = {
-            'is_some': 'Some',
-            'is_none': 'None',
-            'is_ok': 'Ok',
-            'is_err': 'Err',
-        }[expr.method]
-
-        enum_type, variants = self.enum_types[type_name]
-        tag_idx = None
-        for i, variant in enumerate(variants):
-            if variant.name == target_variant:
-                tag_idx = i
-                break
-        if tag_idx is None:
-            return None
-
-        receiver = self._emit_expr(expr.expr)
-        if isinstance(receiver.type, ir.PointerType) and receiver.type.pointee == enum_type:
-            receiver = self.builder.load(receiver)
-        receiver = self._convert_type(receiver, enum_type)
-
-        enum_alloca = self.builder.alloca(enum_type, name="enum.pred")
-        self.builder.store(receiver, enum_alloca)
-        tag_ptr = self.builder.gep(enum_alloca, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)])
-        tag_val = self.builder.load(tag_ptr)
-        return self.builder.icmp_unsigned('==', tag_val, ir.Constant(self.i8, tag_idx))
-
     def _try_emit_bitops_intrinsic(self, expr: rast.MethodCall, type_name: str) -> ir.Value:
         """Try to emit a BitOps intrinsic for primitive integer types.
 
@@ -7754,6 +7718,195 @@ class LLVMEmitter:
 
         return None
 
+    # =========================================================================
+    # Builtin method dispatchers (Option/Result/StrView/Span/Vec)
+    # Run before the regular impl-table lookup so missing UFCS wrappers don't
+    # block obvious intrinsic patterns. Mirrors the dispatch chain from the
+    # holy-fuck-wip branch.
+    # =========================================================================
+
+    def _try_emit_enum_predicate_method(
+        self,
+        expr: rast.MethodCall,
+        type_name: str,
+        receiver_probe: Optional[ir.Value] = None,
+    ) -> Optional[ir.Value]:
+        """Emit Option/Result predicate methods (is_some/is_none/is_ok/is_err)."""
+        if expr.args:
+            return None
+        if expr.method not in ('is_some', 'is_none', 'is_ok', 'is_err'):
+            return None
+        if type_name not in self.enum_types:
+            return None
+
+        target_variant = {
+            'is_some': 'Some',
+            'is_none': 'None',
+            'is_ok': 'Ok',
+            'is_err': 'Err',
+        }[expr.method]
+
+        enum_type, variants = self.enum_types[type_name]
+        tag_idx = None
+        for i, variant in enumerate(variants):
+            if variant.name == target_variant:
+                tag_idx = i
+                break
+        if tag_idx is None:
+            return None
+
+        receiver = receiver_probe if receiver_probe is not None else self._emit_expr(expr.expr)
+        if isinstance(receiver.type, ir.PointerType) and receiver.type.pointee == enum_type:
+            receiver = self.builder.load(receiver)
+        receiver = self._convert_type(receiver, enum_type)
+
+        enum_alloca = self.builder.alloca(enum_type, name="enum.pred")
+        self.builder.store(receiver, enum_alloca)
+        tag_ptr = self.builder.gep(enum_alloca, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)])
+        tag_val = self.builder.load(tag_ptr)
+        return self.builder.icmp_unsigned('==', tag_val, ir.Constant(self.i8, tag_idx))
+
+    def _try_emit_strview_builtin(
+        self,
+        expr: rast.MethodCall,
+        type_name: str,
+        receiver_probe: Optional[ir.Value] = None,
+    ) -> Optional[ir.Value]:
+        """Emit built-in StrView methods (as_bytes -> Span<u8>)."""
+        if type_name != 'StrView':
+            return None
+        if expr.method != 'as_bytes':
+            return None
+        if expr.args:
+            raise ValueError("as_bytes() takes no arguments")
+
+        recv = receiver_probe if receiver_probe is not None else self._emit_expr(expr.expr)
+        if isinstance(recv.type, ir.PointerType) and isinstance(recv.type.pointee, ir.BaseStructType):
+            struct_name = self._get_struct_name_from_type(recv.type.pointee)
+            if struct_name == 'StrView':
+                recv = self.builder.load(recv)
+
+        ptr = self.builder.extract_value(recv, 0)
+        length = self.builder.extract_value(recv, 1)
+
+        if 'Span$u8' in self.struct_types:
+            span_ty = self.struct_types['Span$u8']
+        else:
+            span_ty = ir.LiteralStructType([self.i8.as_pointer(), self.i64])
+        span = self.builder.insert_value(ir.Constant(span_ty, ir.Undefined), ptr, 0)
+        span = self.builder.insert_value(span, length, 1)
+        return span
+
+    def _try_emit_len_builtin(
+        self,
+        expr: rast.MethodCall,
+        type_name: str,
+        receiver_probe: Optional[ir.Value] = None,
+    ) -> Optional[ir.Value]:
+        """Emit direct .len() for Vec/Span/StrView when no UFCS wrapper is found."""
+        if expr.method != 'len' or expr.args:
+            return None
+        if not (type_name.startswith('Vec$') or type_name.startswith('Span$') or type_name == 'StrView'):
+            return None
+
+        recv = receiver_probe if receiver_probe is not None else self._emit_expr(expr.expr)
+
+        # Pointer receiver: load named field directly when we know the struct
+        if isinstance(recv.type, ir.PointerType) and isinstance(recv.type.pointee, ir.BaseStructType):
+            struct_name = self._get_struct_name_from_type(recv.type.pointee)
+            if struct_name and self._struct_has_field(struct_name, 'len'):
+                idx = self._get_struct_field_index(struct_name, 'len')
+                field_ptr = self.builder.gep(recv, [ir.Constant(self.i32, 0), ir.Constant(self.i32, idx)])
+                return self.builder.load(field_ptr)
+            recv = self.builder.load(recv)
+
+        # Value receiver: extract named field when possible
+        if isinstance(recv.type, ir.BaseStructType):
+            struct_name = self._get_struct_name_from_type(recv.type)
+            if struct_name and self._struct_has_field(struct_name, 'len'):
+                idx = self._get_struct_field_index(struct_name, 'len')
+                return self.builder.extract_value(recv, idx)
+
+        # Fallback for literal layouts used by lightweight views
+        if isinstance(recv.type, ir.LiteralStructType) and len(recv.type.elements) >= 2:
+            return self.builder.extract_value(recv, 1)
+
+        return None
+
+    def _try_emit_enum_unwrap_method(
+        self,
+        expr: rast.MethodCall,
+        type_name: str,
+        receiver_probe: Optional[ir.Value] = None,
+    ) -> Optional[ir.Value]:
+        """Emit Option/Result unwrap()/unwrap_or() directly without ritzlib helpers."""
+        if expr.method not in ('unwrap', 'unwrap_or'):
+            return None
+        if type_name not in self.enum_types:
+            return None
+        if not (type_name.startswith('Result$') or type_name.startswith('Option$')):
+            return None
+        if expr.method == 'unwrap' and expr.args:
+            return None
+        if expr.method == 'unwrap_or' and len(expr.args) != 1:
+            return None
+
+        enum_type, variants = self.enum_types[type_name]
+        target_variant = 'Ok' if type_name.startswith('Result$') else 'Some'
+        target_variant_def = next((v for v in variants if v.name == target_variant), None)
+        if target_variant_def is None or not target_variant_def.fields:
+            return None
+
+        payload_type = target_variant_def.fields[0]
+        llvm_payload_type = self._ritz_type_to_llvm(payload_type)
+        target_tag = self._get_enum_variant_tag(type_name, target_variant)
+
+        recv = receiver_probe if receiver_probe is not None else self._emit_expr(expr.expr)
+        if isinstance(recv.type, ir.PointerType) and recv.type.pointee == enum_type:
+            recv = self.builder.load(recv)
+        recv = self._convert_type(recv, enum_type)
+
+        enum_alloca = self.builder.alloca(enum_type, name="unwrap.enum")
+        self.builder.store(recv, enum_alloca)
+
+        tag_ptr = self.builder.gep(enum_alloca, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)])
+        tag_val = self.builder.load(tag_ptr)
+        is_target = self.builder.icmp_unsigned('==', tag_val, ir.Constant(self.i8, target_tag))
+
+        ok_block = self.current_fn.append_basic_block("unwrap.ok")
+        bad_block = self.current_fn.append_basic_block("unwrap.bad")
+        merge_block = self.current_fn.append_basic_block("unwrap.merge")
+        self.builder.cbranch(is_target, ok_block, bad_block)
+
+        self.builder.position_at_end(ok_block)
+        data_index = self._get_enum_data_index(type_name)
+        data_ptr = self.builder.gep(enum_alloca, [ir.Constant(self.i32, 0), ir.Constant(self.i32, data_index)])
+        payload_ptr = self.builder.bitcast(data_ptr, ir.PointerType(llvm_payload_type))
+        payload_val = self.builder.load(payload_ptr)
+        self.builder.branch(merge_block)
+        ok_exit = self.builder.block
+
+        bad_val = None
+        bad_exit = None
+        self.builder.position_at_end(bad_block)
+        if expr.method == 'unwrap_or':
+            bad_val = self._emit_expr(expr.args[0])
+            bad_val = self._convert_type(bad_val, llvm_payload_type)
+            self.builder.branch(merge_block)
+            bad_exit = self.builder.block
+        else:
+            trap_ty = ir.FunctionType(self.void, [])
+            trap = self.module.declare_intrinsic('llvm.trap', [], fnty=trap_ty)
+            self.builder.call(trap, [])
+            self.builder.unreachable()
+
+        self.builder.position_at_end(merge_block)
+        phi = self.builder.phi(llvm_payload_type, name="unwrap.val")
+        phi.add_incoming(payload_val, ok_exit)
+        if bad_exit is not None:
+            phi.add_incoming(bad_val, bad_exit)
+        return phi
+
     def _emit_method_call(self, expr: rast.MethodCall) -> ir.Value:
         """Emit a method call: receiver.method(args...).
 
@@ -7796,7 +7949,10 @@ class LLVMEmitter:
             elif name in self.ritz_types:
                 ritz_type = self.ritz_types[name]
                 if isinstance(ritz_type, rast.NamedType):
-                    type_name = ritz_type.name
+                    if ritz_type.args:
+                        type_name = self._get_specialized_type_name(ritz_type)
+                    else:
+                        type_name = ritz_type.name
             # Fall back to LLVM type inspection for struct types
             if type_name is None:
                 if name in self.locals:
@@ -7814,6 +7970,12 @@ class LLVMEmitter:
             receiver_type = receiver_probe.type
             if isinstance(receiver_type, ir.PointerType):
                 type_name = self._get_struct_name_from_type(receiver_type.pointee)
+                if type_name is None:
+                    # Pointer-to-enum receiver (e.g. *Result<T,E>)
+                    for enum_name, (enum_ty, _) in self.enum_types.items():
+                        if receiver_type.pointee == enum_ty:
+                            type_name = enum_name
+                            break
             else:
                 type_name = self._get_struct_name_from_type(receiver_type)
                 # Also check for primitive integer types (for BitOps support)
@@ -7826,6 +7988,27 @@ class LLVMEmitter:
                     float_result = self._try_emit_float_intrinsic(expr, receiver_probe)
                     if float_result is not None:
                         return float_result
+                if type_name is None:
+                    # Value-of-enum receiver (e.g. result of fn returning Result/Option)
+                    for enum_name, (enum_ty, _) in self.enum_types.items():
+                        if receiver_type == enum_ty:
+                            type_name = enum_name
+                            break
+
+        # Final fallback: resolve the receiver's Ritz type via inference
+        # (handles call/field receivers whose return-type carries generic args)
+        if type_name is None:
+            enum_name = self._get_enum_name_from_expr(expr.expr)
+            if enum_name:
+                type_name = enum_name
+
+        if type_name is None:
+            inferred = self._infer_ritz_type(expr.expr)
+            if isinstance(inferred, rast.NamedType):
+                if inferred.args:
+                    type_name = self._get_specialized_type_name(inferred)
+                else:
+                    type_name = inferred.name
 
         if type_name is None:
             raise ValueError(f"Cannot call method '{expr.method}' on unknown type")
@@ -7845,9 +8028,25 @@ class LLVMEmitter:
         # ritzlib helper specializations, which the monomorphizer can't always
         # see (e.g. when the receiver's type is inferred from a function call
         # without an explicit annotation).
-        enum_predicate = self._try_emit_enum_predicate_method(expr, type_name)
+        enum_predicate = self._try_emit_enum_predicate_method(expr, type_name, receiver_probe)
         if enum_predicate is not None:
             return enum_predicate
+
+        # Built-in StrView helpers (.as_bytes)
+        strview_builtin = self._try_emit_strview_builtin(expr, type_name, receiver_probe)
+        if strview_builtin is not None:
+            return strview_builtin
+
+        # Built-in .len() for Vec/Span/StrView when no impl is in scope
+        len_builtin = self._try_emit_len_builtin(expr, type_name, receiver_probe)
+        if len_builtin is not None:
+            return len_builtin
+
+        # Built-in unwrap for Option/Result (.unwrap/.unwrap_or)
+        unwrap_builtin = self._try_emit_enum_unwrap_method(expr, type_name, receiver_probe)
+        if unwrap_builtin is not None:
+            return unwrap_builtin
+
 
         method_key = (type_name, expr.method)
         used_ufcs_fallback = False  # Track if we used UFCS fallback

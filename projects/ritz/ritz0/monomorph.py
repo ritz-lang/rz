@@ -340,6 +340,15 @@ class Monomorphizer:
                 self._visit_type(stmt.type)
                 # Track variable type
                 self.var_types[stmt.name] = stmt.type
+            elif stmt.value is not None:
+                # No explicit type — try to infer from the rhs so that subsequent
+                # method calls (`v.push(...)`) can register UFCS instantiations.
+                inferred = self._infer_value_type(stmt.value)
+                if inferred is not None:
+                    self.var_types[stmt.name] = inferred
+                    # Treat the inferred type like a real annotation so that
+                    # generic struct/enum payloads get registered for monomorph.
+                    self._visit_type(inferred)
             if stmt.value:
                 self._visit_expr(stmt.value)
         elif isinstance(stmt, rast.VarStmt):
@@ -347,6 +356,11 @@ class Monomorphizer:
                 self._visit_type(stmt.type)
                 # Track variable type
                 self.var_types[stmt.name] = stmt.type
+            elif stmt.value is not None:
+                inferred = self._infer_value_type(stmt.value)
+                if inferred is not None:
+                    self.var_types[stmt.name] = inferred
+                    self._visit_type(inferred)
             if stmt.value:
                 self._visit_expr(stmt.value)
         elif isinstance(stmt, rast.ExprStmt):
@@ -397,6 +411,8 @@ class Monomorphizer:
         elif isinstance(expr, rast.Index):
             self._visit_expr(expr.expr)
             self._visit_expr(expr.index)
+            # Register vec_get<T> for Vec<T> indexing sugar.
+            self._register_index_instantiation(expr)
         elif isinstance(expr, rast.Field):
             self._visit_expr(expr.expr)
         elif isinstance(expr, rast.MethodCall):
@@ -470,6 +486,50 @@ class Monomorphizer:
                     if key not in self.function_instantiations:
                         mangled = mangle_generic_name(fn_name, type_args)
                         self.function_instantiations[key] = mangled
+
+    def _register_index_instantiation(self, expr: rast.Index) -> None:
+        """Register vec_get<T> instantiation for Vec<T> indexing sugar.
+
+        `v[i]` on a Vec<T> desugars to `vec_get<T>(&v, i)` in the emitter — so
+        the monomorphizer needs to specialize vec_get<T> alongside the call.
+        """
+        if not isinstance(expr.expr, rast.Ident):
+            return
+
+        var_name = expr.expr.name
+        if var_name not in self.var_types:
+            return
+
+        var_type = self.var_types[var_name]
+        if not isinstance(var_type, rast.NamedType):
+            return
+
+        if var_type.name == 'Vec' and var_type.args:
+            type_args = var_type.args
+            if 'vec_get' in self.generic_functions:
+                key = ('vec_get', self._type_args_to_key(type_args))
+                if key not in self.function_instantiations:
+                    mangled = mangle_generic_name('vec_get', type_args)
+                    self.function_instantiations[key] = mangled
+
+    def _infer_value_type(self, expr: rast.Expr) -> Optional[rast.Type]:
+        """Infer the Ritz type of an expression for var/let bindings without
+        an explicit type annotation. Limited to patterns that gate UFCS
+        method-instantiation registration (e.g. `var v = vec_new<u16>()`).
+        """
+        # Direct call to a generic function with explicit type args:
+        #   vec_new<u16>() -> Vec<u16>
+        if isinstance(expr, rast.Call) and isinstance(expr.func, rast.Ident):
+            fn_name = expr.func.name
+            fn_def = self.generic_functions.get(fn_name)
+            if (fn_def and fn_def.ret_type and expr.type_args
+                    and len(fn_def.type_params) == len(expr.type_args)):
+                mapping = {
+                    tp: ta for tp, ta in zip(fn_def.type_params, expr.type_args)
+                }
+                subst = TypeSubstitution(mapping=mapping)
+                return subst.apply(fn_def.ret_type)
+        return None
 
     def _register_method_instantiation(self, expr: rast.MethodCall) -> None:
         """Register UFCS function instantiation for method calls on generic types.
