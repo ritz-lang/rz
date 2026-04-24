@@ -64,6 +64,53 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
                 stmt.var_type = TYPE_STRUCT
                 stmt.var_type_name = c"Span$u8"
                 stmt.var_type_name_len = 7
+            else
+                # task-112: non-intrinsic impl-method calls. Resolve the
+                # receiver's struct type, then walk the impl table for a
+                # matching Type.method whose return is TYPE_STRUCT and
+                # narrow var_type. Without this, `let x = a.clone_self()`
+                # allocates i64 and loses the %Struct layout the call
+                # actually produces — downstream field access and arg
+                # coercion then bind to the wrong slot type.
+                var recv_tn: *u8 = null
+                var recv_tn_len: i32 = 0
+                let rcv: *Expr = stmt.var_init.left
+                if rcv != null
+                    if rcv.kind == EXPR_IDENT
+                        let loc: *LocalVar = find_local_struct_name(s, rcv.ident_ptr, rcv.ident_len)
+                        if loc != null
+                            recv_tn = loc.type_name
+                            recv_tn_len = loc.type_name_len
+                    else if rcv.kind == EXPR_CALL
+                        var fname: [256]u8
+                        var flen: i32 = 0
+                        for i in 0..rcv.func_name_len
+                            fname[flen] = *(rcv.func_name + i)
+                            flen += 1
+                        if rcv.call_type_suffix_len > 0
+                            for i in 0..rcv.call_type_suffix_len
+                                fname[flen] = *(rcv.call_type_suffix + i)
+                                flen += 1
+                        let fdr: *FnDef = find_fn(s, @fname[0], flen)
+                        if fdr != null and fdr.return_type == TYPE_STRUCT
+                            recv_tn = fdr.return_type_name
+                            recv_tn_len = fdr.return_type_name_len
+                if recv_tn != null and recv_tn_len > 0
+                    var ib: *ImplBlock = s.module.impls
+                    while ib != null
+                        if name_eq(ib.type_name, ib.type_name_len, recv_tn, recv_tn_len) == 1
+                            var m: *FnDef = ib.methods
+                            while m != null
+                                if name_eq(m.name, m.name_len, stmt.var_init.ident_ptr, stmt.var_init.ident_len) == 1
+                                    if m.return_type == TYPE_STRUCT and m.return_type_name_len > 0
+                                        var_type = TYPE_STRUCT
+                                        stmt.var_type = TYPE_STRUCT
+                                        stmt.var_type_name = m.return_type_name
+                                        stmt.var_type_name_len = m.return_type_name_len
+                                    break
+                                m = m.next
+                            break
+                        ib = ib.next
         # task-101: bare "..." literal lowers to a %Span$u8 aggregate
         # (see emit_expr EXPR_STRING_LIT). Without widening, `let s = "ABC"`
         # hits the same store-i64-of-%Span$u8 mismatch that as_bytes does.
