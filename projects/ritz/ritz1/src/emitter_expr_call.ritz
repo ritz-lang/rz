@@ -292,6 +292,51 @@ fn try_emit_ufcs_method(s: *EmitterState, e: *Expr, type_name: *u8, type_name_le
                     emit_reg(s, arg_regs[j])
                     emit_str(s, c" to i1\n")
                     converted_regs[j] = bool_trunc
+            else if param_ptr.param_type == TYPE_STRUCT and param_ptr.param_type_name_len > 0
+                # Scalar→struct newtype boxing: when the formal is a single-
+                # field (or narrow aggregate) struct but the arg is an
+                # integer-typed scalar expression (literal, arithmetic, const),
+                # materialize a proper struct value so the call signature
+                # matches.  Gate on a narrow scalar type — pointers and other
+                # structs pass through so a 2-field struct like Span<T> isn't
+                # corrupted by an 8-byte opaque-ptr reinterpret.
+                var arg_expr: *Expr = e.args
+                var k: i32 = 0
+                while k < j and arg_expr != null
+                    arg_expr = arg_expr.next
+                    k = k + 1
+                var is_scalar_int: i32 = 0
+                if arg_expr != null
+                    let at: i32 = get_expr_type(s, arg_expr)
+                    if at == TYPE_I8 or at == TYPE_U8 or at == TYPE_I16 or at == TYPE_U16 or at == TYPE_I32 or at == TYPE_U32 or at == TYPE_I64 or at == TYPE_U64
+                        is_scalar_int = 1
+                if is_scalar_int == 0
+                    converted_regs[j] = arg_regs[j]
+                else
+                    # alloca %T; store i64 arg into it (opaque-ptr reinterpret);
+                    # load %T — this works for newtypes whose single field fits
+                    # in 8 bytes.  LLVM accepts a typed-load from differently-
+                    # typed alloca with opaque pointers.
+                    let box_slot: i32 = next_reg(s)
+                    emit_str(s, c"  ")
+                    emit_reg(s, box_slot)
+                    emit_str(s, c" = alloca %")
+                    emit_name(s, param_ptr.param_type_name, param_ptr.param_type_name_len)
+                    emit_str(s, c"  ; newtype arg box\n")
+                    emit_str(s, c"  store i64 ")
+                    emit_reg(s, arg_regs[j])
+                    emit_str(s, c", ptr ")
+                    emit_reg(s, box_slot)
+                    emit_str(s, c"\n")
+                    let boxed: i32 = next_reg(s)
+                    emit_str(s, c"  ")
+                    emit_reg(s, boxed)
+                    emit_str(s, c" = load %")
+                    emit_name(s, param_ptr.param_type_name, param_ptr.param_type_name_len)
+                    emit_str(s, c", ptr ")
+                    emit_reg(s, box_slot)
+                    emit_str(s, c"\n")
+                    converted_regs[j] = boxed
             else
                 converted_regs[j] = arg_regs[j]
             param_ptr = param_ptr.next
@@ -1610,6 +1655,42 @@ fn emit_expr_method(s: *EmitterState, e: *Expr) -> i32
                         emit_reg(s, mloc.reg)
                         emit_str(s, c" to i64\n")
                         conv_regs[j] = pti_m
+            else if mp.param_type == TYPE_STRUCT and mp.param_type_name_len > 0
+                # Scalar→struct newtype boxing (mirrors the plain-call path).
+                # Gate on a narrow scalar type — pointers and other structs
+                # pass through so 2-field structs like Span<T> aren't
+                # corrupted by the 8-byte opaque-ptr reinterpret.
+                var mae2: *Expr = e.args
+                var mk2: i32 = 0
+                while mk2 < j and mae2 != null
+                    mae2 = mae2.next
+                    mk2 = mk2 + 1
+                var is_scalar_int2: i32 = 0
+                if mae2 != null
+                    let at2: i32 = get_expr_type(s, mae2)
+                    if at2 == TYPE_I8 or at2 == TYPE_U8 or at2 == TYPE_I16 or at2 == TYPE_U16 or at2 == TYPE_I32 or at2 == TYPE_U32 or at2 == TYPE_I64 or at2 == TYPE_U64
+                        is_scalar_int2 = 1
+                if is_scalar_int2 == 1
+                    let box_slot2: i32 = next_reg(s)
+                    emit_str(s, c"  ")
+                    emit_reg(s, box_slot2)
+                    emit_str(s, c" = alloca %")
+                    emit_name(s, mp.param_type_name, mp.param_type_name_len)
+                    emit_str(s, c"  ; newtype arg box\n")
+                    emit_str(s, c"  store i64 ")
+                    emit_reg(s, arg_regs[j])
+                    emit_str(s, c", ptr ")
+                    emit_reg(s, box_slot2)
+                    emit_str(s, c"\n")
+                    let boxed2: i32 = next_reg(s)
+                    emit_str(s, c"  ")
+                    emit_reg(s, boxed2)
+                    emit_str(s, c" = load %")
+                    emit_name(s, mp.param_type_name, mp.param_type_name_len)
+                    emit_str(s, c", ptr ")
+                    emit_reg(s, box_slot2)
+                    emit_str(s, c"\n")
+                    conv_regs[j] = boxed2
             mp = mp.next
 
     var rtype: i32 = TYPE_I64
