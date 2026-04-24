@@ -3,14 +3,17 @@
 # The ritz1 compiler: compiles Ritz source to LLVM IR.
 # Uses the generated parser (parser_gen.ritz) and emitter (emitter.ritz).
 #
-# Usage: ritz1 input.ritz -o output.ll
+# Usage: ritz1 input.ritz -o output.ll [-I ritz_path]
+#        ritz1 -- input.ritz               # end-of-flags; writes /tmp default
 #
 # Pipeline:
 #   1. Read source file
 #   2. Tokenize with NFA lexer
 #   3. Parse to AST using generated parser
-#   4. Emit LLVM IR
-#   5. Write to output file
+#   4. Resolve imports (recursively merge modules)
+#   5. Monomorphize generics
+#   6. Emit LLVM IR
+#   7. Write to output file
 
 import ritzlib.sys
 import ritzlib.io
@@ -18,6 +21,8 @@ import ritzlib.str
 import ritzlib.gvec
 import ritzlib.memory
 import ritzlib.env
+import ritzlib.string
+import ritzlib.strview
 
 # Lexer and parser infrastructure
 import tokens_gen
@@ -31,586 +36,481 @@ import monomorph
 import emitter
 
 # =============================================================================
+# Error Reporting Helpers
+# =============================================================================
+
+# Print "prefix<path>suffix\n" as a single error line.
+fn err2(prefix: StrView, path: *u8) -> i32
+    var s: String = string_from_strview(@prefix)
+    string_push_str(@s, path)
+    eprintln_string(@s)
+    string_drop(@s)
+    -1
+
+# Print "prefix<path>middle<extra>\n" as a single error line.
+fn err3(prefix: StrView, path: *u8, extra: *u8) -> i32
+    var s: String = string_from_strview(@prefix)
+    string_push_str(@s, path)
+    string_push_str(@s, extra)
+    eprintln_string(@s)
+    string_drop(@s)
+    -1
+
+# =============================================================================
 # File I/O Helpers
 # =============================================================================
 
 fn read_file(path: *u8) -> Vec<u8>
-  var buf: Vec<u8> = vec_new<u8>()
-  let fd: i32 = sys_open(path, O_RDONLY)
-  if fd < 0
-    eprints_cstr(c"Error: Cannot open file: ")
-    eprints_cstr(path)
-    eprints_cstr(c"\n")
-    return buf
+    var buf: Vec<u8> = vec_new<u8>()
+    let fd: i32 = sys_open(path, O_RDONLY)
+    if fd < 0
+        err2("Error: Cannot open file: ", path)
+        return buf
 
-  # Read in chunks
-  var chunk: [4096]u8
-  let chunk_ptr: *u8 = @chunk[0]
-  var n: i64 = 1
-  while n > 0
-    n = sys_read(fd, chunk_ptr, 4096)
-    if n > 0
-      for i in 0..n
-        vec_push<u8>(@buf, chunk[i])
+    # Read in chunks
+    var chunk: [4096]u8
+    let chunk_ptr: *u8 = @chunk[0]
+    var n: i64 = 1
+    while n > 0
+        n = sys_read(fd, chunk_ptr, 4096)
+        if n > 0
+            for i in 0..n
+                vec_push<u8>(@buf, chunk[i])
 
-  sys_close(fd)
-  # Add null terminator
-  vec_push<u8>(@buf, 0)
-  buf
+    sys_close(fd)
+    # Add null terminator
+    vec_push<u8>(@buf, 0)
+    buf
 
 fn write_file(path: *u8, data: *u8, len: i64) -> i32
-  let fd: i32 = sys_open3(path, O_WRONLY + O_CREAT + O_TRUNC, 420)
-  if fd < 0
-    eprints_cstr(c"Error: Cannot create output file: ")
-    eprints_cstr(path)
-    eprints_cstr(c"\n")
-    return -1
-  sys_write(fd, data, len)
-  sys_close(fd)
-  0
+    let fd: i32 = sys_open3(path, O_WRONLY + O_CREAT + O_TRUNC, 420)
+    if fd < 0
+        return err2("Error: Cannot create output file: ", path)
+    sys_write(fd, data, len)
+    sys_close(fd)
+    0
 
 # =============================================================================
 # Tokenizer
 # =============================================================================
 
 fn tokenize(src: *u8, src_len: i64, tokens: *Vec<Token>) -> i32
-  # Allocate storage for lexer NFA structures
-  var nfa_storage: NFA
-  var patterns_storage: [128]TokenPattern
-  var states_storage: [4096]NFAState
-  var trans_storage: [8192]Transition
+    # Allocate storage for lexer NFA structures
+    var nfa_storage: NFA
+    var patterns_storage: [128]TokenPattern
+    var states_storage: [4096]NFAState
+    var trans_storage: [8192]Transition
 
-  # Initialize lexer with NFA patterns
-  var lex: Lexer
-  setup_lexer(@lex, @nfa_storage, @patterns_storage[0], @states_storage[0], @trans_storage[0])
-  lexer_reset(@lex, src, src_len)
+    # Initialize lexer with NFA patterns
+    var lex: Lexer
+    setup_lexer(@lex, @nfa_storage, @patterns_storage[0], @states_storage[0], @trans_storage[0])
+    lexer_reset(@lex, src, src_len)
 
-  var errors: i32 = 0
-  while 1 == 1
-    var tok: Token = lexer_next(@lex)
-    let kind: i32 = tok.kind
-    let line: i32 = tok.line
-    let col: i32 = tok.col
-    # For STRING-like tokens, copy string_val to heap (lexer buffer is on stack)
-    # Must include TOK_CSTRING — same buffer ownership issue.
-    # (AGAST #98: TOK_SSTRING removed.)
-    let needs_copy: i32 = (kind == TOK_STRING or kind == TOK_CSTRING) as i32
-    if needs_copy == 1 and tok.string_val != null and tok.string_len > 0
-      let heap_str: *u8 = malloc(tok.string_len as i64) as *u8
-      for i in 0..tok.string_len
-        *(heap_str + i) = *(tok.string_val + i)
-      tok.string_val = heap_str
-    # Always push the token first (moves tok)
-    vec_push<Token>(tokens, tok)
-    # Then check conditions on kind (not tok)
-    if kind == TOK_EOF
-      break
-    if kind == TOK_ERROR
-      eprints_cstr(c"Lexer error at line ")
-      eprint_int(line as i64)
-      eprints_cstr(c", column ")
-      eprint_int(col as i64)
-      eprints_cstr(c"\n")
-      errors = errors + 1
+    var errors: i32 = 0
+    while 1 == 1
+        var tok: Token = lexer_next(@lex)
+        let kind: i32 = tok.kind
+        let line: i32 = tok.line
+        let col: i32 = tok.col
+        # For STRING-like tokens, copy string_val to heap (lexer buffer is on stack)
+        let needs_copy: i32 = (kind == TOK_STRING or kind == TOK_CSTRING) as i32
+        if needs_copy == 1 and tok.string_val != null and tok.string_len > 0
+            let heap_str: *u8 = malloc(tok.string_len as i64)
+            for i in 0..tok.string_len
+                *(heap_str + i) = *(tok.string_val + i)
+            tok.string_val = heap_str
+        # Always push the token first (moves tok)
+        vec_push<Token>(tokens, tok)
+        # Then check conditions on kind (not tok)
+        if kind == TOK_EOF
+            break
+        if kind == TOK_ERROR
+            var msg: String = string_from("Lexer error at line ")
+            string_push_i64(@msg, line as i64)
+            string_push_strview(@msg, ", column ")
+            string_push_i64(@msg, col as i64)
+            eprintln_string(@msg)
+            string_drop(@msg)
+            errors = errors + 1
 
-  errors
+    errors
 
 # =============================================================================
 # Parser
 # =============================================================================
 
 fn parse_tokens(tokens: *Vec<Token>) -> *Module
-  var p: Parser
-  # Allocate arena for AST nodes (4MB should be plenty for even large files)
-  let arena: *u8 = malloc(4194304) as *u8
-  if arena == null
-    eprints_cstr(c"Error: Failed to allocate parser arena\n")
-    return null
-  parser_init(@p, tokens.data, tokens.len as i32, arena)
+    var p: Parser
+    # Allocate arena for AST nodes (4MB should be plenty for even large files)
+    let arena: *u8 = malloc(4194304)
+    if arena == null
+        eprintln("Error: Failed to allocate parser arena")
+        return null
+    parser_init(@p, tokens.data, tokens.len as i32, arena)
 
-  let m: *Module = parse_module(@p)
+    let m: *Module = parse_module(@p)
 
-  if p.error != 0
-    eprints_cstr(c"Parse error at pos ")
-    eprint_int(p.pos as i64)
-    eprints_cstr(c"\n")
-    return null
+    if p.error != 0
+        var msg: String = string_from("Parse error at pos ")
+        string_push_i64(@msg, p.pos as i64)
+        eprintln_string(@msg)
+        string_drop(@msg)
+        return null
 
-  m
+    m
 
 # =============================================================================
 # Import Resolution - Inline imported code into the module
 # =============================================================================
 
-# Track processed imports to avoid circular dependencies
-const MAX_PROCESSED_IMPORTS: i32 = 128
+# Track processed import paths and the source buffers the AST nodes
+# point into. Both are plain Vec<String> / Vec<*u8> — no parallel arrays,
+# no MAX_* ceilings, no hand-rolled linear search primitives.
+var g_processed: Vec<String>
+var g_processed_init: i32 = 0
+var g_source_buffers: Vec<*u8>
+var g_source_init: i32 = 0
 
-# Store paths and lengths in separate parallel pointer-based arrays
-var g_import_paths: *u8 = null      # Packed storage of pointers (8 bytes each)
-var g_import_lens: *i32 = null     # Packed storage of lengths
-var g_processed_import_count: i32 = 0
-
-# Track source buffers to keep them alive (AST points into them)
-var g_source_buffers: **u8 = null
-var g_source_buffer_count: i32 = 0
-const MAX_SOURCE_BUFFERS: i32 = 128
-
-fn init_import_tracker()
-    # Allocate storage for 128 pointers (8 bytes each) = 1024 bytes
-    g_import_paths = malloc(1024) as *u8
-    # Allocate storage for 128 i32s (4 bytes each) = 512 bytes
-    g_import_lens = malloc(512) as *i32
-    # Allocate storage for source buffer pointers
-    g_source_buffers = malloc(1024) as **u8
+fn import_tracker_init()
+    if g_processed_init == 0
+        g_processed = vec_new<String>()
+        g_source_buffers = vec_new<*u8>()
+        g_processed_init = 1
+        g_source_init = 1
 
 fn keep_source_alive(src_ptr: *u8)
-    # Store the source buffer pointer so it won't be deallocated
-    if g_source_buffer_count < MAX_SOURCE_BUFFERS
-        *(g_source_buffers + g_source_buffer_count) = src_ptr
-        g_source_buffer_count = g_source_buffer_count + 1
+    vec_push<*u8>(@g_source_buffers, src_ptr)
 
-fn was_import_processed(path: *u8, len: i32) -> i32
-    for i in 0..g_processed_import_count
-        # Access as pointer arrays
-        let stored_path: *u8 = *((g_import_paths as **u8) + i)
-        let stored_len: i32 = *(g_import_lens + i)
-        if stored_len == len
-            var j: i32 = 0
-            var matched: i32 = 1
-            while j < len
-                if *(stored_path + j) != *(path + j)
-                    matched = 0
-                    break
-                j += 1
-            if matched == 1
-                return 1
+fn was_import_processed(path: @String) -> i32
+    let n: i64 = vec_len<String>(@g_processed)
+    for i in 0..n
+        let entry_ptr: *String = vec_get_ptr<String>(@g_processed, i)
+        if string_eq(entry_ptr, path) == 1
+            return 1
     0
 
-fn mark_import_processed(path: *u8, len: i32)
-    if g_processed_import_count < MAX_PROCESSED_IMPORTS
-        # Store path pointer
-        *((g_import_paths as **u8) + g_processed_import_count) = path
-        # Store length
-        *(g_import_lens + g_processed_import_count) = len
-        g_processed_import_count = g_processed_import_count + 1
+fn mark_import_processed(path: String)
+    vec_push<String>(@g_processed, path)
 
-# Get directory from a file path (returns length of directory part including trailing /)
-fn get_dir_len(path: *u8) -> i32
-    var len: i32 = 0
-    var last_slash: i32 = -1
+# Return the directory portion (up to and including the trailing '/'), or
+# an empty StrView if path has no directory component.
+fn path_dir(path: *u8) -> StrView
+    var len: i64 = 0
+    var last_slash: i64 = -1
     while *(path + len) != 0
-        if *(path + len) == 47  # '/'
+        if *(path + len) == '/'
             last_slash = len
         len += 1
+    var sv: StrView
+    sv.ptr = path
     if last_slash >= 0
-        return last_slash + 1  # Include the trailing /
-    0
+        sv.len = last_slash + 1
+    else
+        sv.len = 0
+    sv
 
-# Build import path from import segments
-# Returns a null-terminated path string (caller must free)
-fn build_import_path(dir: *u8, dir_len: i32, imp: *ImportPath, ritz_path: *u8) -> *u8
-    # Calculate total length
-    # Format: dir + "/" + segment1/segment2/...segmentN.ritz
-    # `get_dir_len` returns length INCLUDING a trailing '/', so if dir
-    # already ends in '/' we skip our own separator — otherwise each
-    # recursive import accumulates an extra slash and the dedup tracker
-    # (which keys on raw path) treats `src/ast.ritz`, `src//ast.ritz`,
-    # `src///ast.ritz`, ... as distinct files → infinite reprocessing.
-    var needs_sep: i32 = 1
-    if dir_len > 0
-        if *(dir + dir_len - 1) == 47  # '/'
-            needs_sep = 0
-    var total_len: i32 = dir_len + needs_sep
+# Build "dir/seg1/seg2/....ritz" from a dir view and import segment list.
+# Caller owns the returned String.
+fn build_import_path(dir: StrView, imp: *ImportPath) -> String
+    var out: String = string_from_strview(@dir)
+    # Ensure separator between dir and segments (only if dir doesn't end with '/').
+    if string_len(@out) > 0
+        if string_char_at(@out, string_len(@out) - 1) != '/'
+            string_push(@out, '/')
     var seg: *ImportPath = imp
     while seg != null
-        total_len = total_len + seg.segment_len
+        string_push_bytes(@out, seg.segment, seg.segment_len as i64)
         if seg.next != null
-            total_len = total_len + 1  # For '/'
-        else
-            total_len = total_len + 5  # For ".ritz"
+            string_push(@out, '/')
         seg = seg.next
+    string_push_strview(@out, ".ritz")
+    out
 
-    # Allocate buffer
-    let buf: *u8 = malloc(total_len as i64 + 1) as *u8
-    if buf == null
-        return null
+# Does the first segment of this import path equal "ritzlib"?
+fn import_is_ritzlib(imp: *ImportPath) -> i32
+    if imp == null
+        return 0
+    var seg_view: StrView
+    seg_view.ptr = imp.segment
+    seg_view.len = imp.segment_len as i64
+    strview_eq_cstr(@seg_view, c"ritzlib")
 
-    # Copy directory
-    var pos: i32 = 0
-    for i in 0..dir_len
-        *(buf + pos) = *(dir + i)
-        pos = pos + 1
-
-    # Add separator between dir and segments (only if dir doesn't already end with '/')
-    if needs_sep == 1
-        *(buf + pos) = 47  # '/'
-        pos = pos + 1
-
-    # Copy segments
-    seg = imp
-    while seg != null
-        for i in 0..seg.segment_len
-            *(buf + pos) = *(seg.segment + i)
-            pos = pos + 1
-        if seg.next != null
-            *(buf + pos) = 47  # '/'
-            pos = pos + 1
-        else
-            # Add .ritz extension
-            *(buf + pos) = 46   # '.'
-            *(buf + pos + 1) = 114  # 'r'
-            *(buf + pos + 2) = 105  # 'i'
-            *(buf + pos + 3) = 116  # 't'
-            *(buf + pos + 4) = 122  # 'z'
-            pos = pos + 5
-        seg = seg.next
-
-    *(buf + pos) = 0  # Null terminate
-    buf
-
-# Try to open an import file, checking multiple paths
-# Returns: path to file if found, 0 if not found
-# Sets found_via_ritz_path to 1 if found via RITZ_PATH, 0 otherwise
-fn try_open_import(imp: *ImportPath, source_dir: *u8, source_dir_len: i32, ritz_path: *u8, ritz_path_len: i32, found_via_ritz_path: *i32) -> *u8
+# Try to open an import file, checking source-dir first, then RITZ_PATH.
+# Returns a fresh String with the resolved path, or empty String if not found.
+# Sets *found_via_ritz_path to 1 when RITZ_PATH was used.
+fn try_open_import(imp: *ImportPath, source_dir: StrView, ritz_path: StrView, found_via_ritz_path: *i32) -> String
     *found_via_ritz_path = 0
 
-    # Check if this is a qualified import starting with "ritzlib"
-    # If so, skip source_dir and use RITZ_PATH without the "ritzlib" prefix
-    var is_ritzlib: i32 = 0
-    var skip_first: i32 = 0
-    if imp != null and imp.segment_len == 7
-        # Check if segment is "ritzlib" (r=114, i=105, t=116, z=122, l=108, i=105, b=98)
-        let c0: i32 = *(imp.segment + 0)
-        let c1: i32 = *(imp.segment + 1)
-        let c2: i32 = *(imp.segment + 2)
-        let c3: i32 = *(imp.segment + 3)
-        let c4: i32 = *(imp.segment + 4)
-        let c5: i32 = *(imp.segment + 5)
-        let c6: i32 = *(imp.segment + 6)
-        if c0 == 114 and c1 == 105 and c2 == 116 and c3 == 122 and c4 == 108 and c5 == 105 and c6 == 98
-            is_ritzlib = 1
-            skip_first = 1
+    # ritzlib imports skip source-dir and resolve only via RITZ_PATH.
+    let is_ritzlib: i32 = import_is_ritzlib(imp)
 
-    # First try relative to source file (unless it's a ritzlib import)
+    # First try relative to source file (unless this is a ritzlib import).
     if is_ritzlib == 0
-        var path: *u8 = build_import_path(source_dir, source_dir_len, imp, ritz_path)
-        if path != null
-            eprints_cstr(c"  Trying: ")
-            eprints_cstr(path)
-            eprints_cstr(c"\n")
-            let fd: i32 = sys_open(path, O_RDONLY)
-            if fd >= 0
-                sys_close(fd)
-                return path
-            free(path as *i8)
+        var candidate: String = build_import_path(source_dir, imp)
+        let fd: i32 = sys_open(string_as_ptr(@candidate), O_RDONLY)
+        if fd >= 0
+            sys_close(fd)
+            return candidate
+        string_drop(@candidate)
 
-    # Then try RITZ_PATH if set
-    if ritz_path_len > 0
-        # Build path including full import path (e.g., ritzlib/sys.ritz)
-        var path: *u8 = build_import_path(ritz_path, ritz_path_len, imp, ritz_path)
+    # Then try RITZ_PATH if set.
+    if ritz_path.len > 0
+        var candidate: String = build_import_path(ritz_path, imp)
+        let fd: i32 = sys_open(string_as_ptr(@candidate), O_RDONLY)
+        if fd >= 0
+            sys_close(fd)
+            *found_via_ritz_path = 1
+            return candidate
+        string_drop(@candidate)
 
-        if path != null
-            eprints_cstr(c"  Trying: ")
-            eprints_cstr(path)
-            eprints_cstr(c"\n")
-            let fd: i32 = sys_open(path, O_RDONLY)
-            if fd >= 0
-                sys_close(fd)
-                *found_via_ritz_path = 1
-                return path
-            free(path as *i8)
+    string_new()
 
-    null
+# Append the human-readable dotted import path ("foo.bar.baz") to a String.
+fn append_import_display(s: *String, imp: *ImportPath)
+    var seg: *ImportPath = imp
+    while seg != null
+        string_push_bytes(s, seg.segment, seg.segment_len as i64)
+        if seg.next != null
+            string_push(s, '.')
+        seg = seg.next
 
-# Resolve imports recursively, merging into the main module
-fn resolve_imports(m: *Module, source_dir: *u8, source_dir_len: i32, ritz_path: *u8, ritz_path_len: i32) -> i32
+# Merge imported_module's declarations into main module m.
+# Each list is preserved by walking to its tail and prepending the main list.
+fn merge_module_into(m: *Module, other: *Module)
+    if other.structs != null
+        var last: *StructDef = other.structs
+        while last.next != null
+            last = last.next
+        last.next = m.structs
+        m.structs = other.structs
+    if other.functions != null
+        var last: *FnDef = other.functions
+        while last.next != null
+            last = last.next
+        last.next = m.functions
+        m.functions = other.functions
+    if other.constants != null
+        var last: *ConstEntry = other.constants
+        while last.next != null
+            last = last.next
+        last.next = m.constants
+        m.constants = other.constants
+    if other.globals != null
+        var last: *GlobalVarDef = other.globals
+        while last.next != null
+            last = last.next
+        last.next = m.globals
+        m.globals = other.globals
+    if other.impls != null
+        var last: *ImplBlock = other.impls
+        while last.next != null
+            last = last.next
+        last.next = m.impls
+        m.impls = other.impls
+
+# Read / tokenize / parse a single file. Returns a parsed Module, or null
+# on any failure (already reported to stderr). Steals src.data to keep
+# AST-pointed-into buffer alive via keep_source_alive().
+fn load_and_parse(path: @String) -> *Module
+    let path_ptr: *u8 = string_as_ptr(path)
+    var src: Vec<u8> = read_file(path_ptr)
+    if src.len == 0
+        return null
+
+    var tokens: Vec<Token> = vec_with_cap<Token>(24000)
+    let lex_err: i32 = tokenize(src.data, src.len - 1, @tokens)
+    if lex_err > 0
+        err2("Lexer errors in: ", path_ptr)
+        return null
+
+    let mod: *Module = parse_tokens(@tokens)
+    if mod == null
+        err2("Parse error in: ", path_ptr)
+        return null
+
+    # Keep source buffer alive: AST nodes point into it.
+    keep_source_alive(src.data)
+    src.data = null  # Prevent Vec Drop from freeing.
+
+    mod
+
+# Resolve imports recursively, merging into the main module.
+fn resolve_imports(m: *Module, source_dir: StrView, ritz_path: StrView) -> i32
     var imp: *ImportDecl = m.imports
     while imp != null
-        # Debug: print what we're trying to import
-        eprints_cstr(c"[IMPORT] ")
-        var seg: *ImportPath = imp.path
-        while seg != null
-            for k in 0..seg.segment_len
-                eprint_char(*(seg.segment + k))
-            if seg.next != null
-                eprint_char(46)  # '.'
-            seg = seg.next
-        eprints_cstr(c"\n")
-
-        # Find the import file
+        # Find the import file.
         var found_via_ritz_path: i32 = 0
-        let path: *u8 = try_open_import(imp.path, source_dir, source_dir_len, ritz_path, ritz_path_len, @found_via_ritz_path)
-        if path == null
-            eprints_cstr(c"Error: Could not read import file: ")
-            # Print import path for debugging
-            var seg: *ImportPath = imp.path
-            while seg != null
-                for k in 0..seg.segment_len
-                    eprint_char(*(seg.segment + k))
-                if seg.next != null
-                    eprint_char(47)  # '/'
-                seg = seg.next
-            eprints_cstr(c".ritz\n")
+        var path: String = try_open_import(imp.path, source_dir, ritz_path, @found_via_ritz_path)
+        if string_is_empty(@path) == 1
+            var msg: String = string_from("Error: Could not read import: ")
+            append_import_display(@msg, imp.path)
+            string_push_strview(@msg, ".ritz")
+            eprintln_string(@msg)
+            string_drop(@msg)
+            string_drop(@path)
             return -1
 
-        # Check if already processed (cycle detection)
-        var path_len: i32 = 0
-        while *(path + path_len) != 0
-            path_len += 1
-
-        if was_import_processed(path, path_len) == 1
-            eprints_cstr(c"  (already processed, skipping)\n")
-            free(path as *i8)
+        # Cycle detection.
+        if was_import_processed(@path) == 1
+            string_drop(@path)
             imp = imp.next
             continue
+        mark_import_processed(string_clone(@path))
 
-        eprints_cstr(c"  Processing: ")
-        eprints_cstr(path)
-        eprints_cstr(c"\n")
-        mark_import_processed(path, path_len)
-
-        # Read, tokenize, parse the import
-        var import_src: Vec<u8> = read_file(path)
-        if import_src.len == 0
-            free(path as *i8)
-            return -1
-
-        # IMPORTANT: Token is 48 bytes but ritz0's sizeof returns 8 (6x undercount)
-        # So vec_with_cap<Token>(N) only allocates space for ~N/6 tokens
-        # Large files like ritzlib/string.ritz (631 lines, ~6000 tokens) need 36000+
-        var import_tokens: Vec<Token> = vec_with_cap<Token>(150000)
-        let lex_err: i32 = tokenize(import_src.data, import_src.len - 1, @import_tokens)
-        if lex_err > 0
-            eprints_cstr(c"Lexer errors in import: ")
-            eprints_cstr(path)
-            eprints_cstr(c"\n")
-            free(path as *i8)
-            return -1
-
-        let import_module: *Module = parse_tokens(@import_tokens)
+        let import_module: *Module = load_and_parse(@path)
         if import_module == null
-            eprints_cstr(c"Parse error in import: ")
-            eprints_cstr(path)
-            eprints_cstr(c"\n")
-            free(path as *i8)
+            string_drop(@path)
             return -1
 
-        # DEBUG: Count functions AFTER parse but BEFORE recursive import resolution
-        var pre_fn_count: i32 = 0
-        var pre_fn: *FnDef = import_module.functions
-        while pre_fn != null
-            pre_fn_count += 1
-            pre_fn = pre_fn.next
-        eprints_cstr(c"  [PARSED] Functions: ")
-        eprint_int(pre_fn_count as i64)
-        eprints_cstr(c"\n")
-
-        # Keep source buffer alive - AST node names point into it
-        # CRITICAL: We must "steal" the data pointer from the Vec to prevent
-        # the Vec's Drop impl from freeing it when import_src goes out of scope.
-        # The AST nodes hold pointers into this buffer, so we need it to persist.
-        keep_source_alive(import_src.data)
-        import_src.data = null  # Prevent Drop from freeing
-
-        # Recursively resolve imports in the imported module
-        # If file was found via RITZ_PATH, use empty source_dir so child imports
-        # also resolve relative to RITZ_PATH (not the file's directory)
-        var import_dir_len: i32 = 0
+        # Child imports: relative to this file's directory if local, else
+        # still RITZ_PATH (empty source_dir re-forces RITZ_PATH fallback).
+        var child_dir: StrView
         if found_via_ritz_path == 0
-            import_dir_len = get_dir_len(path)
-        let res: i32 = resolve_imports(import_module, path, import_dir_len, ritz_path, ritz_path_len)
+            child_dir = path_dir(string_as_ptr(@path))
+        else
+            child_dir.ptr = null
+            child_dir.len = 0
+        let res: i32 = resolve_imports(import_module, child_dir, ritz_path)
         if res < 0
-            free(path as *i8)
+            string_drop(@path)
             return -1
 
-        # DEBUG: Count functions in imported module before merge
-        var imp_fn_count: i32 = 0
-        var imp_generic_count: i32 = 0
-        var imp_fn: *FnDef = import_module.functions
-        while imp_fn != null
-            imp_fn_count += 1
-            if imp_fn.type_params != null
-                imp_generic_count += 1
-            imp_fn = imp_fn.next
-        eprints_cstr(c"  [MERGE] Functions: ")
-        eprint_int(imp_fn_count as i64)
-        eprints_cstr(c", Generic: ")
-        eprint_int(imp_generic_count as i64)
-        eprints_cstr(c"\n")
+        merge_module_into(m, import_module)
 
-        # Merge imported module into main module
-        # Merge structs (prepend to list)
-        if import_module.structs != null
-            var last_struct: *StructDef = import_module.structs
-            while last_struct.next != null
-                last_struct = last_struct.next
-            last_struct.next = m.structs
-            m.structs = import_module.structs
-
-        # Merge functions (prepend to list)
-        if import_module.functions != null
-            var last_fn: *FnDef = import_module.functions
-            while last_fn.next != null
-                last_fn = last_fn.next
-            last_fn.next = m.functions
-            m.functions = import_module.functions
-
-        # Merge constants (prepend to list)
-        if import_module.constants != null
-            var last_const: *ConstEntry = import_module.constants
-            while last_const.next != null
-                last_const = last_const.next
-            last_const.next = m.constants
-            m.constants = import_module.constants
-
-        # Merge global variables (prepend to list)
-        if import_module.globals != null
-            var last_global: *GlobalVarDef = import_module.globals
-            while last_global.next != null
-                last_global = last_global.next
-            last_global.next = m.globals
-            m.globals = import_module.globals
-
-        # Merge impl blocks (prepend to list)
-        if import_module.impls != null
-            var last_impl: *ImplBlock = import_module.impls
-            while last_impl.next != null
-                last_impl = last_impl.next
-            last_impl.next = m.impls
-            m.impls = import_module.impls
-
-        # DON'T free path - it's stored in import tracker for dedup checks
-        # (minor memory leak, but compiler only runs once)
+        # Don't drop path — it's owned by g_processed now (we cloned above).
+        string_drop(@path)
         imp = imp.next
 
     0
+
+# =============================================================================
+# Argument parsing
+# =============================================================================
+
+struct CliArgs
+    input_path: *u8
+    output_path: *u8
+    ritz_path: StrView    # .len == 0 if none was supplied
+    dash_dash: i32
+
+fn parse_cli(argc: i32, argv: **u8, envp: **u8) -> CliArgs
+    var args: CliArgs
+    args.input_path = null
+    args.output_path = null
+    args.ritz_path.ptr = null
+    args.ritz_path.len = 0
+    args.dash_dash = 0
+
+    if argc < 2
+        return args
+
+    let first: StrView = strview_from_cstr(argv[1])
+
+    # Support `ritz1 -- <input.ritz>` form used by test harnesses.
+    if strview_eq_cstr(@first, c"--") == 1
+        args.dash_dash = 1
+        if argc < 3
+            return args
+        args.input_path = argv[2]
+        args.output_path = c"/tmp/ritz1_dashdash_out.ll"
+        return args
+
+    if argc < 4
+        return args
+
+    args.input_path = argv[1]
+    let flag: StrView = strview_from_cstr(argv[2])
+    if strview_eq_cstr(@flag, c"-o") == 0
+        eprintln("Error: Expected -o flag")
+        args.input_path = null
+        return args
+    args.output_path = argv[3]
+
+    # Optional -I <path>
+    if argc >= 6
+        let dash_i: StrView = strview_from_cstr(argv[4])
+        if strview_eq_cstr(@dash_i, c"-I") == 1
+            args.ritz_path = strview_from_cstr(argv[5])
+
+    # Fall back to RITZ_PATH environment variable if -I not provided.
+    if args.ritz_path.len == 0
+        let env_path: *u8 = getenv(envp, c"RITZ_PATH")
+        if env_path != null
+            args.ritz_path = strview_from_cstr(env_path)
+
+    args
+
+# Ensure a RITZ_PATH view ends with '/'. May allocate if it doesn't; caller
+# doesn't need to free (we leak the small buffer — compiler runs once).
+fn normalize_ritz_path(rp: StrView) -> StrView
+    if rp.len == 0
+        return rp
+    if *(rp.ptr + rp.len - 1) == '/'
+        return rp
+    let buf: *u8 = malloc(rp.len + 2)
+    for k in 0..rp.len
+        *(buf + k) = *(rp.ptr + k)
+    *(buf + rp.len) = '/'
+    *(buf + rp.len + 1) = 0
+    var out: StrView
+    out.ptr = buf
+    out.len = rp.len + 1
+    out
+
+fn print_usage()
+    eprintln("Usage: ritz1 <input.ritz> -o <output.ll> [-I <ritz_path>]")
+    eprintln("       ritz1 -- <input.ritz>")
 
 # =============================================================================
 # Main Entry Point
 # =============================================================================
 
 fn main(argc: i32, argv: **u8, envp: **u8) -> i32
-  # Support `ritz1 -- <input.ritz>` form used by test harnesses: `--` just
-  # marks end-of-flags, and a default output path is used so callers can
-  # check the compile-success exit code without needing a temp file.
-  var dash_dash: i32 = 0
-  if argc >= 2
-    let first: *u8 = argv[1]
-    if *(first + 0) == 45 and *(first + 1) == 45 and *(first + 2) == 0
-      dash_dash = 1
+    let args: CliArgs = parse_cli(argc, argv, envp)
+    if args.input_path == null
+        print_usage()
+        return 1
 
-  var input_path: *u8 = null
-  var output_path: *u8 = null
+    # Read source file
+    var src: Vec<u8> = read_file(args.input_path)
+    if src.len == 0
+        return 1
 
-  if dash_dash == 1
-    if argc < 3
-      eprints_cstr(c"Usage: ritz1 -- <input.ritz>\n")
-      return 1
-    input_path = argv[2]
-    output_path = c"/tmp/ritz1_dashdash_out.ll"
-  else
-    if argc < 4
-      eprints_cstr(c"Usage: ritz1 <input.ritz> -o <output.ll> [-I <ritz_path>]\n")
-      return 1
+    # Tokenize. Typical compiler input files produce under 20K tokens;
+    # bigger files realloc organically.
+    var tokens: Vec<Token> = vec_with_cap<Token>(24000)
+    let lex_errors: i32 = tokenize(src.data, src.len - 1, @tokens)
+    if lex_errors > 0
+        var msg: String = string_from("Lexer errors: ")
+        string_push_i64(@msg, lex_errors as i64)
+        eprintln_string(@msg)
+        string_drop(@msg)
+        return 1
 
-    input_path = argv[1]
-    let flag: *u8 = argv[2]
-    output_path = argv[3]
+    # Parse
+    let m: *Module = parse_tokens(@tokens)
+    if m == null
+        return 1
 
-    # Check for -o flag
-    if *(flag + 0) != 45 or *(flag + 1) != 111  # -o
-      eprints_cstr(c"Error: Expected -o flag\n")
-      return 1
+    # Get source directory for relative imports
+    let source_dir: StrView = path_dir(args.input_path)
+    let ritz_path: StrView = normalize_ritz_path(args.ritz_path)
 
-  # Read source file
-  var src: Vec<u8> = read_file(input_path)
-  if src.len == 0
-    return 1
+    # Resolve imports recursively
+    import_tracker_init()
+    if resolve_imports(m, source_dir, ritz_path) < 0
+        eprintln("Error: Import resolution failed")
+        return 1
 
-  # Tokenize - pre-allocate enough capacity to avoid realloc bug
-  # (ritz0 has a bug where sizeof(T) returns 8 instead of the actual struct size)
-  # Token is ~48 bytes, but sizeof returns 8 (6x undercount)
-  # To get space for ~1000 tokens, we need to request 6000 capacity
-  # Token is 48 bytes but sizeof returns 8 (6x undercount)
-  # For 5000-line files like emitter.ritz (~12K tokens), need 12000*6 = 72000
-  var tokens: Vec<Token> = vec_with_cap<Token>(150000)
-  let lex_errors: i32 = tokenize(src.data, src.len - 1, @tokens)
-  if lex_errors > 0
-    eprints_cstr(c"Lexer errors: ")
-    eprint_int(lex_errors as i64)
-    eprints_cstr(c"\n")
-    return 1
+    # Monomorphize: generate specialized versions of generic functions
+    monomorphize_module(m)
 
-  # Parse
-  let m: *Module = parse_tokens(@tokens)
-  if m == null
-    return 1
+    # Emit IR
+    var ir: Vec<u8> = vec_with_cap<u8>(131072)  # 128KB seed; realloc as needed
+    emit_module(m, @ir)
 
-  # DEBUG: Count functions in MAIN module after parse
-  var main_fn_count: i32 = 0
-  var main_fn: *FnDef = m.functions
-  while main_fn != null
-      main_fn_count += 1
-      main_fn = main_fn.next
-  eprints_cstr(c"[MAIN] Parsed functions: ")
-  eprint_int(main_fn_count as i64)
-  eprints_cstr(c"\n")
+    # Write output
+    if write_file(args.output_path, ir.data, ir.len as i64) < 0
+        return 1
 
-  # DISABLED: Keep main source buffer alive - see comment below
-  # Note: src.data is a Vec that stays in scope until function returns,
-  # so AST pointers into it remain valid during emit. No need to call
-  # keep_source_alive here - it would corrupt the allocator.
-
-  # Get source directory for relative imports
-  let source_dir_len: i32 = get_dir_len(input_path)
-
-  # Parse RITZ_PATH from command line -I flag or RITZ_PATH environment variable
-  var ritz_path: *u8 = null
-  var ritz_path_len: i32 = 0
-
-  # First check -I <path> argument
-  if argc >= 6
-    let dash_i: *u8 = argv[4]
-    if *(dash_i + 0) == 45 and *(dash_i + 1) == 73  # "-I"
-      ritz_path = argv[5]
-      while *(ritz_path + ritz_path_len) != 0
-        ritz_path_len += 1
-
-  # Fall back to RITZ_PATH environment variable if -I not provided
-  if ritz_path == null
-    let env_path: *u8 = getenv(envp, c"RITZ_PATH")
-    if env_path != null
-      ritz_path = env_path
-      while *(ritz_path + ritz_path_len) != 0
-        ritz_path_len += 1
-
-  # Ensure path ends with / if we have one
-  if ritz_path_len > 0 and *(ritz_path + ritz_path_len - 1) != 47
-    let new_ritz_path: *u8 = malloc(ritz_path_len as i64 + 2) as *u8
-    for k in 0..ritz_path_len
-      *(new_ritz_path + k) = *(ritz_path + k)
-    *(new_ritz_path + ritz_path_len) = 47  # '/'
-    *(new_ritz_path + ritz_path_len + 1) = 0
-    ritz_path = new_ritz_path
-    ritz_path_len = ritz_path_len + 1
-
-  # Initialize import tracker and resolve imports recursively
-  init_import_tracker()
-  let resolve_result: i32 = resolve_imports(m, input_path, source_dir_len, ritz_path, ritz_path_len)
-  if resolve_result < 0
-    eprints_cstr(c"Error: Import resolution failed\n")
-    return 1
-
-  # Monomorphize: generate specialized versions of generic functions
-  monomorphize_module(m)
-
-  # Emit IR - pre-allocate buffer to avoid realloc issues
-  # Typical IR output is 10-100KB for medium programs
-  var ir: Vec<u8> = vec_with_cap<u8>(131072)  # 128KB
-  emit_module(m, @ir)
-
-  # Write output
-  if write_file(output_path, ir.data, ir.len as i64) < 0
-    return 1
-
-  0
+    0
