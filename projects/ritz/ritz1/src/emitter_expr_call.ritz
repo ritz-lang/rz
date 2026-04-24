@@ -312,6 +312,33 @@ fn try_emit_ufcs_method(s: *EmitterState, e: *Expr, type_name: *u8, type_name_le
                         is_scalar_int = 1
                 if is_scalar_int == 0
                     converted_regs[j] = arg_regs[j]
+                else if name_eq(param_ptr.param_type_name, param_ptr.param_type_name_len, c"u16", 3) == 1 or name_eq(param_ptr.param_type_name, param_ptr.param_type_name_len, c"i16", 3) == 1
+                    # Post-monomorph primitive (vec_push_u16_method parity):
+                    # the param was a generic `T` substituted with u16/i16 but
+                    # left TYPE_STRUCT in the AST.  Just truncate the i64 arg.
+                    let t16: i32 = next_reg(s)
+                    emit_str(s, c"  ")
+                    emit_reg(s, t16)
+                    emit_str(s, c" = trunc i64 ")
+                    emit_reg(s, arg_regs[j])
+                    emit_str(s, c" to i16\n")
+                    converted_regs[j] = t16
+                else if name_eq(param_ptr.param_type_name, param_ptr.param_type_name_len, c"u8", 2) == 1 or name_eq(param_ptr.param_type_name, param_ptr.param_type_name_len, c"i8", 2) == 1
+                    let t8: i32 = next_reg(s)
+                    emit_str(s, c"  ")
+                    emit_reg(s, t8)
+                    emit_str(s, c" = trunc i64 ")
+                    emit_reg(s, arg_regs[j])
+                    emit_str(s, c" to i8\n")
+                    converted_regs[j] = t8
+                else if name_eq(param_ptr.param_type_name, param_ptr.param_type_name_len, c"u32", 3) == 1 or name_eq(param_ptr.param_type_name, param_ptr.param_type_name_len, c"i32", 3) == 1
+                    let t32: i32 = next_reg(s)
+                    emit_str(s, c"  ")
+                    emit_reg(s, t32)
+                    emit_str(s, c" = trunc i64 ")
+                    emit_reg(s, arg_regs[j])
+                    emit_str(s, c" to i32\n")
+                    converted_regs[j] = t32
                 else
                     # alloca %T; store i64 arg into it (opaque-ptr reinterpret);
                     # load %T — this works for newtypes whose single field fits
@@ -879,6 +906,38 @@ fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
                 emit_reg(s, arg_regs[j])
                 emit_str(s, c" to i16\n")
                 converted_regs[j] = trunc
+            else if param_ptr.param_type == TYPE_STRUCT and param_ptr.param_type_name_len > 0 and is_primitive_type_name(param_ptr.param_type_name, param_ptr.param_type_name_len) == 1
+                # Post-monomorph primitive param (vec_push_u16_method parity):
+                # `T` substituted with u16/i32/etc. but left TYPE_STRUCT in AST.
+                # emit_llvm_type_struct maps the name back for signatures;
+                # match by truncating i64 arg down to primitive width.
+                if name_eq(param_ptr.param_type_name, param_ptr.param_type_name_len, c"u8", 2) == 1 or name_eq(param_ptr.param_type_name, param_ptr.param_type_name_len, c"i8", 2) == 1
+                    let tp8: i32 = next_reg(s)
+                    emit_str(s, c"  ")
+                    emit_reg(s, tp8)
+                    emit_str(s, c" = trunc i64 ")
+                    emit_reg(s, arg_regs[j])
+                    emit_str(s, c" to i8\n")
+                    converted_regs[j] = tp8
+                else if name_eq(param_ptr.param_type_name, param_ptr.param_type_name_len, c"u16", 3) == 1 or name_eq(param_ptr.param_type_name, param_ptr.param_type_name_len, c"i16", 3) == 1
+                    let tp16: i32 = next_reg(s)
+                    emit_str(s, c"  ")
+                    emit_reg(s, tp16)
+                    emit_str(s, c" = trunc i64 ")
+                    emit_reg(s, arg_regs[j])
+                    emit_str(s, c" to i16\n")
+                    converted_regs[j] = tp16
+                else if name_eq(param_ptr.param_type_name, param_ptr.param_type_name_len, c"u32", 3) == 1 or name_eq(param_ptr.param_type_name, param_ptr.param_type_name_len, c"i32", 3) == 1
+                    let tp32: i32 = next_reg(s)
+                    emit_str(s, c"  ")
+                    emit_reg(s, tp32)
+                    emit_str(s, c" = trunc i64 ")
+                    emit_reg(s, arg_regs[j])
+                    emit_str(s, c" to i32\n")
+                    converted_regs[j] = tp32
+                else
+                    # bool/usize/isize/u64/i64/f32/f64: passthrough.
+                    converted_regs[j] = arg_regs[j]
             else if param_ptr.param_type == TYPE_MUT_REF
                 # TYPE_MUT_REF params expect ptr
                 # If arg is a TYPE_MUT_REF ident, it's already ptr (from load ptr)
@@ -1331,6 +1390,62 @@ fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
         emit_reg(s, call_result)
         emit_str(s, c" to i64\n")
         return ext
+    else if ret_type == TYPE_STRUCT and ret_struct_name_len > 0 and is_primitive_type_name(ret_struct_name, ret_struct_name_len) == 1
+        # Post-monomorph primitive return (vec_push_u16_method parity):
+        # generic `T` substituted with u16/i32/etc. leaves TYPE_STRUCT in
+        # the AST.  emit_llvm_type_struct emitted the LLVM primitive type
+        # for the `call` opcode; now extend to i64 so the caller's
+        # expression-level representation stays uniform.
+        if name_eq(ret_struct_name, ret_struct_name_len, c"u8", 2) == 1
+            let e8: i32 = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, e8)
+            emit_str(s, c" = zext i8 ")
+            emit_reg(s, call_result)
+            emit_str(s, c" to i64\n")
+            return e8
+        else if name_eq(ret_struct_name, ret_struct_name_len, c"i8", 2) == 1
+            let e8s: i32 = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, e8s)
+            emit_str(s, c" = sext i8 ")
+            emit_reg(s, call_result)
+            emit_str(s, c" to i64\n")
+            return e8s
+        else if name_eq(ret_struct_name, ret_struct_name_len, c"u16", 3) == 1
+            let e16: i32 = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, e16)
+            emit_str(s, c" = zext i16 ")
+            emit_reg(s, call_result)
+            emit_str(s, c" to i64\n")
+            return e16
+        else if name_eq(ret_struct_name, ret_struct_name_len, c"i16", 3) == 1
+            let e16s: i32 = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, e16s)
+            emit_str(s, c" = sext i16 ")
+            emit_reg(s, call_result)
+            emit_str(s, c" to i64\n")
+            return e16s
+        else if name_eq(ret_struct_name, ret_struct_name_len, c"u32", 3) == 1
+            let e32: i32 = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, e32)
+            emit_str(s, c" = zext i32 ")
+            emit_reg(s, call_result)
+            emit_str(s, c" to i64\n")
+            return e32
+        else if name_eq(ret_struct_name, ret_struct_name_len, c"i32", 3) == 1
+            let e32s: i32 = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, e32s)
+            emit_str(s, c" = sext i32 ")
+            emit_reg(s, call_result)
+            emit_str(s, c" to i64\n")
+            return e32s
+        # bool/usize/isize/u64/i64/f32/f64: no extension.
+        return call_result
     else if ret_type == TYPE_MUT_REF
         # TYPE_MUT_REF call returns ptr — convert to i64 for consistent value representation
         let pti: i32 = next_reg(s)
