@@ -297,28 +297,39 @@ fn try_emit_enum_is_ok(s: *EmitterState, e: *Expr) -> i32
     if want_carrier < 0
         return 0 - 1
 
-    # Load i64 value from receiver slot. Pointer-typed locals (*T, @T) store
-    # a pointer, so dereference first.
+    # Post-task-133 layout: Result$/Option$ is `{ i8 tag, [N x i8] payload }`.
+    # Receiver slot holds that struct.  Pointer-typed locals (*T, @T) store a
+    # pointer to the struct; load it through first to reach the aggregate.
     var ptr_reg: i32 = loc.reg
     if loc.var_type == TYPE_PTR or loc.var_type == TYPE_REF or loc.var_type == TYPE_MUT_REF
         ptr_reg = emit_load_ptr(s, loc.reg)
-    let v: i32 = next_reg(s)
+
+    # GEP to tag (field 0) and load the i8 directly.  Ok/Some = 0; Err/None = 1.
+    let tag_ptr: i32 = next_reg(s)
     emit_str(s, c"  ")
-    emit_reg(s, v)
-    emit_str(s, c" = load i64, ptr ")
+    emit_reg(s, tag_ptr)
+    emit_str(s, c" = getelementptr %")
+    emit_name(s, loc.type_name, loc.type_name_len)
+    emit_str(s, c", ptr ")
     emit_reg(s, ptr_reg)
+    emit_str(s, c", i32 0, i32 0\n")
+    let tag: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, tag)
+    emit_str(s, c" = load i8, ptr ")
+    emit_reg(s, tag_ptr)
     emit_str(s, c"\n")
 
-    # Compare against the tag bit (1 << 48). uge => carrier; ult => null.
+    # Carrier (Ok/Some) iff tag == 0; null (Err/None) iff tag != 0.
     let cmp: i32 = next_reg(s)
     emit_str(s, c"  ")
     emit_reg(s, cmp)
     if want_carrier == 1
-        emit_str(s, c" = icmp uge i64 ")
+        emit_str(s, c" = icmp eq i8 ")
     else
-        emit_str(s, c" = icmp ult i64 ")
-    emit_reg(s, v)
-    emit_str(s, c", 281474976710656  ; is_ok/is_err tag check\n")
+        emit_str(s, c" = icmp ne i8 ")
+    emit_reg(s, tag)
+    emit_str(s, c", 0  ; is_ok/is_err tag check\n")
     let wide: i32 = next_reg(s)
     emit_str(s, c"  ")
     emit_reg(s, wide)
@@ -332,29 +343,66 @@ fn try_emit_enum_is_ok(s: *EmitterState, e: *Expr) -> i32
 # =============================================================================
 
 # Lower `expr?`:
-#   * On Some/Ok: extract 48-bit payload, continue with that value.
-#   * On None/Err: early-return the raw i64 back to the caller.
+#   * On Some/Ok: extract payload from the carrier struct, continue with it.
+#   * On None/Err: early-return the whole struct back to the caller.
 #
-# Ritz1 packs tagged enums (Result$/Option$) into a single i64:
-#   tag==1 payload  → Some(x) / Ok(x) : (1 << 48) | (x & 0xFFFFFFFFFFFF)
-#   tag==0 payload  → None / Err(x)   : (x & 0xFFFFFFFFFFFF)
-# (See is_variant_carrier + try_emit_enum_unwrap in emitter_expr_call.ritz.)
-# Because the enclosing function's return type is also Result$/Option$ with
-# the same error payload, the Err/None encoding is identical — we can
-# `ret i64 %value` directly without a rebuild step. When AGAST #133
-# swaps the representation to `{ i8 tag, <payload> }`, this function
-# needs the corresponding extractvalue/insertvalue update.
+# Post-task-133 layout: Result$/Option$ is `{ i8 tag, [N x i8] payload }` with
+# tag 0 = Ok/Some (carrier) and tag 1 = Err/None.  The enclosing function's
+# return type must also be Result$/Option$ with a matching error variant —
+# the briefing for `?` already ensures that.  Because the Err/None encoding
+# is byte-identical we can return the struct verbatim without a rebuild.
 fn emit_expr_try(s: *EmitterState, e: *Expr) -> i32
-    # Evaluate the inner Result/Option.
+    # Evaluate the inner Result/Option (yields a struct SSA register).
     let value: i32 = emit_expr(s, e.left)
 
-    # Tag check: value >= (1 << 48) means Some/Ok (carrier variant).
+    # Resolve the carrier's LLVM struct type name.  Prefer the inner
+    # expression's declared type; fall back to the enclosing fn's return
+    # type when the inner is opaque (same type by definition of `?`).
+    var enum_name: *u8 = null
+    var enum_name_len: i32 = 0
+    let have_inner: i32 = resolve_scrutinee_enum(s, e.left, @enum_name, @enum_name_len)
+    if have_inner == 0
+        enum_name = s.ret_type_name
+        enum_name_len = s.ret_type_name_len
+
+    # Spill the struct so we can GEP for tag + payload.
+    let slot: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, slot)
+    emit_str(s, c" = alloca %")
+    emit_name(s, enum_name, enum_name_len)
+    emit_str(s, c"  ; try: spill scrutinee\n")
+    emit_str(s, c"  store %")
+    emit_name(s, enum_name, enum_name_len)
+    emit_str(s, c" ")
+    emit_reg(s, value)
+    emit_str(s, c", ptr ")
+    emit_reg(s, slot)
+    emit_str(s, c"\n")
+
+    # Load tag byte at field 0.
+    let tag_ptr: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, tag_ptr)
+    emit_str(s, c" = getelementptr %")
+    emit_name(s, enum_name, enum_name_len)
+    emit_str(s, c", ptr ")
+    emit_reg(s, slot)
+    emit_str(s, c", i32 0, i32 0\n")
+    let tag: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, tag)
+    emit_str(s, c" = load i8, ptr ")
+    emit_reg(s, tag_ptr)
+    emit_str(s, c"\n")
+
+    # Ok/Some (tag == 0) → fall through to the Ok branch; else early-return.
     let tag_ok: i32 = next_reg(s)
     emit_str(s, c"  ")
     emit_reg(s, tag_ok)
-    emit_str(s, c" = icmp uge i64 ")
-    emit_reg(s, value)
-    emit_str(s, c", 281474976710656  ; try: tag == carrier\n")
+    emit_str(s, c" = icmp eq i8 ")
+    emit_reg(s, tag)
+    emit_str(s, c", 0  ; try: tag == carrier\n")
 
     let ok_label: i32 = next_label(s)
     let err_label: i32 = next_label(s)
@@ -367,26 +415,49 @@ fn emit_expr_try(s: *EmitterState, e: *Expr) -> i32
     emit_label(s, err_label)
     emit_str(s, c"\n")
 
-    # None/Err branch: propagate via early return. The enclosing function
-    # must also return Result$/Option$ with a matching error type, so the
-    # i64 representation of Err(e) / None is preserved verbatim.
+    # Err/None branch: early-return the carrier as the enclosing fn's
+    # return type.  When inner (e.g. Result$Vec_u8_StrView) and outer
+    # (Result$i32_StrView) differ only in the Ok payload type, the stored
+    # bytes are layout-compatible — { i8 tag, [32 x i8] payload } is
+    # shared — so a plain "load outer, ptr %slot" reinterprets the Err
+    # without a rebuild.  Opaque pointers allow this access.
     emit_label(s, err_label)
     emit_str(s, c":\n")
-    emit_str(s, c"  ret i64 ")
-    emit_reg(s, value)
+    let ret_reg: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, ret_reg)
+    emit_str(s, c" = load %")
+    emit_name(s, s.ret_type_name, s.ret_type_name_len)
+    emit_str(s, c", ptr ")
+    emit_reg(s, slot)
+    emit_str(s, c"\n")
+    emit_str(s, c"  ret %")
+    emit_name(s, s.ret_type_name, s.ret_type_name_len)
+    emit_str(s, c" ")
+    emit_reg(s, ret_reg)
     emit_str(s, c"\n")
 
-    # Ok/Some branch: unmask payload and continue with it. Callers see the
-    # payload register as the value of the `?` expression.
+    # Ok/Some branch: load the payload scalar from field 1.  Scalar payloads
+    # are stored as i64 by emit_variant_struct, so a matching i64 load hands
+    # the caller back an i64 register — ritz1's downstream arithmetic /
+    # call paths already operate at that width.
     emit_label(s, ok_label)
     emit_str(s, c":\n")
     s.current_label = ok_label
+    let pay_ptr: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, pay_ptr)
+    emit_str(s, c" = getelementptr %")
+    emit_name(s, enum_name, enum_name_len)
+    emit_str(s, c", ptr ")
+    emit_reg(s, slot)
+    emit_str(s, c", i32 0, i32 1\n")
     let payload: i32 = next_reg(s)
     emit_str(s, c"  ")
     emit_reg(s, payload)
-    emit_str(s, c" = and i64 ")
-    emit_reg(s, value)
-    emit_str(s, c", 281474976710655  ; try: unwrap payload\n")
+    emit_str(s, c" = load i64, ptr ")
+    emit_reg(s, pay_ptr)
+    emit_str(s, c"  ; try: unwrap payload\n")
     return payload
 
 # =============================================================================
