@@ -98,6 +98,15 @@ CALL_SIG: dict[str, dict[int, str]] = {
     # (the whole point of this audit!).  Mark as `c` because it is what
     # the self-hosted compiler, selfhosted tests, and runtime all use.
     "print":       {0: "c"},
+
+    # Heap-String constructors -- take StrView, so literal stays bare
+    # under terminal state (A) (bare -> StrView).
+    "string_from":        {0: "s"},
+    "string_from_strview": {0: "s"},
+
+    # StrView constructors -- take StrView, stay bare.
+    "strview_from":        {0: "s"},
+    "strview_eq":          {0: "s", 1: "s"},
 }
 
 
@@ -224,9 +233,12 @@ def _prefix_from_type_ann(line: str, col: int) -> Optional[str]:
     return None
 
 
-def _prefix_from_call(line: str, col: int) -> Optional[str]:
-    """If the literal is an argument to a known stdlib function, return the
-    prefix that the callee expects at that arg position."""
+def _prefix_from_call(
+    line: str, col: int, file_sig: Optional[dict[str, dict[int, str]]] = None
+) -> Optional[str]:
+    """If the literal is an argument to a known stdlib function (or a
+    file-local function whose signature was harvested into *file_sig*),
+    return the prefix that the callee expects at that arg position."""
     head = line[:col - 1]
     # Match the nearest `ident(` or `ident( arg , arg ,` preceding col.
     # A cheap approach: find all `name(` openings and pick the last one
@@ -261,7 +273,14 @@ def _prefix_from_call(line: str, col: int) -> Optional[str]:
             call_name = nm
             call_open = op
             break
-    if not call_name or call_name not in CALL_SIG:
+    # Look up in stdlib CALL_SIG first, then fall back to the file-local
+    # signatures harvested from the current file.
+    sig_map: Optional[dict[int, str]] = None
+    if call_name in CALL_SIG:
+        sig_map = CALL_SIG[call_name]
+    elif file_sig is not None and call_name in file_sig:
+        sig_map = file_sig[call_name]
+    if sig_map is None:
         return None
 
     # Count commas at depth 1 between call_open+1 and col-1 -> arg index
@@ -296,25 +315,58 @@ def _prefix_from_call(line: str, col: int) -> Optional[str]:
             elif c == "," and depth == 0:
                 arg_idx += 1
         j += 1
-    return CALL_SIG[call_name].get(arg_idx)
+    return sig_map.get(arg_idx)
 
 
-def _prefix_from_context(line: str, col: int) -> str:
-    """Best-effort guess at the correct prefix."""
+def _prefix_from_context(line: str, col: int, file_sig: Optional[dict] = None) -> str:
+    """Best-effort guess at the correct prefix.
+
+    *file_sig* is an optional per-file mapping ``{fn_name: {argpos: prefix}}``
+    harvested from `fn foo(arg: TYPE, ...)` declarations in the current
+    file; it supplements `CALL_SIG` so we can match user-defined helpers
+    in the same file (e.g. `fn first_byte_len(s: StrView)` -> literal
+    passed at arg 0 stays bare).
+    """
     # Line-local comments are already stripped by the scanner.
+
+    # 0) Attribute contexts: `[[name = "..."]]`, `[[cfg(name = "...")]]`,
+    # etc.  The ritz parser only accepts `TokenType.STRING` for the rhs of
+    # attribute equalities, so the literal MUST stay bare.  Tag as `s`
+    # (stays bare under terminal state (A)).
+    stripped = line.lstrip()
+    if stripped.startswith("[["):
+        return "s"
 
     # 1) Typed binding wins if present.
     p = _prefix_from_type_ann(line, col)
     if p:
         return p
 
-    # 2) Stdlib call signature.
-    p = _prefix_from_call(line, col)
+    # 2) Stdlib + file-local call signatures.
+    p = _prefix_from_call(line, col, file_sig=file_sig)
     if p:
         return p
 
-    # 3) Fallbacks based on common idioms.
-    stripped = line.lstrip()
+    # 3) Struct literal field detection -- if the literal is directly
+    # after a `field:` in a struct-literal context (e.g.
+    # `Pair { a: "x", b: "y" }`), the field's declared type could be
+    # StrView or *u8 -- we cannot tell without cross-file analysis.
+    # Flag as `?` rather than risk a wrong `c`-rewrite.
+    head = line[:col - 1]
+    # The literal is immediately preceded by `FIELD:\s*` and we're
+    # inside a `{ ... }` block (struct literal or const init).
+    m = re.search(r"([A-Za-z_][A-Za-z0-9_]*)\s*:\s*$", head)
+    if m and "{" in head[:m.start()]:
+        return "?"
+
+    # 3b) Array / collection literal element -- the line is just
+    # whitespace + `"..."` + optional `,` / `]` trailing.  We cannot
+    # tell the element type without multi-line analysis, so flag `?`.
+    tail = line[col - 1:]
+    if head.strip() == "" and re.match(r'^"(?:[^"\\]|\\.)*"\s*[,\]]?\s*$', tail):
+        return "?"
+
+    # 4) Fallbacks based on common idioms.
     if stripped.startswith("assert ") and "," in stripped:
         # `assert cond, "msg"` -- msg goes to panic, which takes *u8
         return "c"
@@ -323,6 +375,49 @@ def _prefix_from_context(line: str, col: int) -> str:
         # probably want cstr.  Not always true; flag it explicitly.
         return "?"
     return "c"
+
+
+# Regex to harvest file-local function signatures.  Matches
+#   fn NAME(a: TYPE, b: TYPE, ...)
+# with TYPE in the same whitelist as RE_LET_TYPED.  Multiline because
+# parameter lists can wrap.
+RE_FN_SIG = re.compile(
+    r"""^\s*(?:pub\s+)?fn\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*
+        (?:<[^>]*>)?\s*
+        \(\s*(?P<params>[^)]*)\)
+    """,
+    re.VERBOSE | re.MULTILINE,
+)
+
+
+def _harvest_file_sig(text: str) -> dict[str, dict[int, str]]:
+    """Scan *text* for top-level `fn NAME(a: TYPE, b: TYPE)` declarations
+    and build a mapping compatible with CALL_SIG."""
+    sig: dict[str, dict[int, str]] = {}
+    for m in RE_FN_SIG.finditer(text):
+        name = m.group("name")
+        params = m.group("params").strip()
+        if not params:
+            continue
+        # Split on commas at top level (no generics nesting here; keep simple).
+        arg_map: dict[int, str] = {}
+        parts = [p.strip() for p in params.split(",") if p.strip()]
+        for idx, p in enumerate(parts):
+            # Each part is `NAME: TYPE` (optionally with leading @& or &).
+            ptm = re.match(r"[A-Za-z_][A-Za-z0-9_]*\s*:\s*(?P<ty>.+)$", p)
+            if not ptm:
+                continue
+            ty = _normalize_ty(ptm.group("ty"))
+            prefix = TYPE_TO_PREFIX.get(ty)
+            if prefix:
+                arg_map[idx] = prefix
+        if arg_map:
+            # If a fn is declared multiple times (e.g. with cfg gates), union
+            # the maps -- first-seen wins on conflict.
+            existing = sig.setdefault(name, {})
+            for k, v in arg_map.items():
+                existing.setdefault(k, v)
+    return sig
 
 
 # --------------------------------------------------------------------------
@@ -403,12 +498,17 @@ def main() -> int:
         proj = _project_of(rel)
         dkey = _directory_of(rel)
 
+        # Harvest per-file function signatures so we can correctly infer
+        # prefixes for literals passed to user-defined helpers in the same
+        # file.
+        file_sig = _harvest_file_sig(text)
+
         for lineno, raw in enumerate(text.splitlines(), start=1):
             for col, prefixed, lit in _scan_line(raw):
                 if prefixed:
                     continue  # skip c"..." / s"..."
                 total += 1
-                prefix = _prefix_from_context(raw, col)
+                prefix = _prefix_from_context(raw, col, file_sig=file_sig)
                 per_project[proj] += 1
                 per_directory[dkey] += 1
                 per_prefix[prefix] += 1

@@ -186,6 +186,51 @@ mostly `return "..."` sites and macro-like contexts where the callee's
 expected type cannot be inferred locally. A human picks one and commits
 per-file.
 
+### String bucket — resolution (CS8, AGAST #97)
+
+**Canonical heap-String constructor: `string_from(sv: StrView) -> String`**
+(declared in `projects/ritz/ritzlib/string.ritz:154`).
+
+Under terminal state (A), bare `"..."` produces a `StrView`.  Therefore
+the idiomatic way to obtain an owned heap-allocated `String` from a
+string literal is:
+
+```ritz
+var s: String = string_from("hello")
+```
+
+All 10 residual `string`-bucket rows already used this idiom correctly
+before #97; they were emitted to the residual CSV so the tool could
+re-confirm the choice by hand (nothing to rewrite).
+
+Related constructors on the same type:
+
+| Need                                  | Call                                      |
+| ------------------------------------- | ----------------------------------------- |
+| Empty `String`                        | `string_new()`                            |
+| `String` with pre-allocated capacity  | `string_with_cap(cap: i64)`               |
+| From literal / `StrView`              | `string_from("...")`                      |
+| From C-string (`*u8`)                 | `string_from_cstr(cstr)`  *(deprecated)*  |
+| From explicit `(*u8, len)` pair       | `string_from_bytes(ptr, len)`             |
+
+`string_from_cstr` is deprecated; prefer `string_from()` with a
+`StrView`.  For interop with a raw `*u8` pointer, first convert via
+`strview_from_cstr(cstr)` and then `string_from(...)`.
+
+### ? bucket — resolution (CS8, AGAST #97)
+
+All 52 residual `?`-bucket rows flowed into `*u8` sinks (error-message
+formatters, operator-name lookup tables, HTTP content-type arguments,
+`as *u8` casts).  They were all rewritten `"..." → c"..."` by hand.
+Remaining buckets in the audit CSV are:
+
+| Bucket    | Action        | Status                                   |
+| --------- | ------------- | ---------------------------------------- |
+| `c`       | insert `c`    | applied by scripted rewriter (Wave 3)    |
+| `s`       | stay bare     | no-op under terminal state (A)           |
+| `string`  | constructor   | `string_from("...")` (see above)         |
+| `?`       | per-site call | resolved, see commit history #97         |
+
 ### Phase 5 — flip the type checker
 
 Only once phases 2–4 are done do we change the compilers:
