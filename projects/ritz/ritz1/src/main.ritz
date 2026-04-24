@@ -163,23 +163,23 @@ fn parse_tokens(tokens: *Vec<Token>) -> *Module
 # Import Resolution - Inline imported code into the module
 # =============================================================================
 
-# Track processed import paths and the source buffers the AST nodes
-# point into. Both are plain Vec<String> / Vec<*u8> — no parallel arrays,
-# no MAX_* ceilings, no hand-rolled linear search primitives.
+# Track processed import paths.  Vec<String> globals zero-initialise
+# correctly (vec_new's null/0/0 shape matches LLVM zeroinitializer), so
+# no explicit init pass is needed — vec_push grows on demand.
 var g_processed: Vec<String>
-var g_processed_init: i32 = 0
-var g_source_buffers: Vec<*u8>
-var g_source_init: i32 = 0
 
-fn import_tracker_init()
-    if g_processed_init == 0
-        g_processed = vec_new<String>()
-        g_source_buffers = vec_new<*u8>()
-        g_processed_init = 1
-        g_source_init = 1
-
+# Source buffers backing AST string slices.  We "leak" each by stealing
+# its `data` pointer from the local Vec<u8> in load_and_parse; the OS
+# reclaims at process exit.  The compiler runs once, so a per-import
+# malloc-leak is acceptable and saves us a Vec<*u8> global (which would
+# need ritz1 mangling support for pointer-typed type args).
 fn keep_source_alive(src_ptr: *u8)
-    vec_push<*u8>(@g_source_buffers, src_ptr)
+    # Intentionally a no-op — `src_ptr` is the malloced backing buffer,
+    # leaked-by-design until compiler exit.  Keeping the function (with
+    # a dummy use of src_ptr to satisfy the parser) so call sites stay
+    # readable and we have a single place to wire a real keep-alive when
+    # ritz1 ever gains pointer-typed generic type-arg mangling.
+    let _: *u8 = src_ptr
 
 fn was_import_processed(path: @String) -> i32
     let n: i64 = vec_len<String>(@g_processed)
@@ -497,7 +497,6 @@ fn main(argc: i32, argv: **u8, envp: **u8) -> i32
     let ritz_path: StrView = normalize_ritz_path(args.ritz_path)
 
     # Resolve imports recursively
-    import_tracker_init()
     if resolve_imports(m, source_dir, ritz_path) < 0
         eprintln("Error: Import resolution failed")
         return 1
