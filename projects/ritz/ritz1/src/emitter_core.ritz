@@ -72,6 +72,14 @@ struct EmitterState
     # Current function's return type name (for struct returns)
     ret_type_name: *u8
     ret_type_name_len: i32
+    # Tagged-enum context for variant constructors (ritz-task-133).
+    # When non-null, `Some(x)` / `Ok(x)` / `None` / `Err(x)` allocas use this
+    # struct name instead of falling back to `ret_type_name`.  Set by
+    # emit_var_decl / emit_return for explicit `let r: Result<_,_> = Ok(x)`
+    # bindings.  Null means "use ret_type_name" (covers tail-expression
+    # returns inside a Result-returning fn).
+    ctx_enum_name: *u8
+    ctx_enum_name_len: i32
 
 # =============================================================================
 # Helpers
@@ -541,12 +549,12 @@ fn emit_llvm_type(s: *EmitterState, t: i32)
     else
         emit_str(s, c"i64")
 
-# Returns 1 if the type name refers to a tag-encoded enum (Result$T /
-# Option$T) that lowers to i64 in ritz1's IR. These are treated as TYPE_STRUCT
-# in the AST but the actual LLVM-level representation is a packed i64 (48 bits
-# payload + 16 bits tag), built by variant constructors in emit_expr_call.
-# Without this check, signatures declare `%Result$i32` (opaque) while the
-# values are i64, and clang rejects `ret %Result$i32 %i64reg`. (task-99 #3)
+# Returns 1 if the type name refers to a tagged-enum instantiation
+# (`Result$...` or `Option$...`).  After ritz-task-133 these are lowered to a
+# real LLVM struct `{ i8, [N x i8] }` (matching ritz0 byte-for-byte) rather
+# than the old packed-i64 representation.  Callers that emit payload load /
+# store paths still key off this predicate to decide between "scalar slot"
+# and "tagged-enum aggregate slot" code shapes.
 fn is_tagged_enum_type(name: *u8, name_len: i32) -> i32
     if name_len >= 7
         # "Result$" = 82 101 115 117 108 116 36
@@ -569,14 +577,20 @@ fn is_tagged_enum_type(name: *u8, name_len: i32) -> i32
                                     return 1
     return 0
 
-# Emit LLVM type with struct name support
+# Payload-byte count reserved inside a tagged-enum struct (ritz0 parity uses
+# the actual payload size per-instantiation; ritz1 currently uses a conservative
+# upper bound because the enum's variant list is discarded by the parser —
+# ritz-task-133).  24 bytes covers `Vec<T>` (ptr+len+cap=24), `StrView` (16),
+# and every scalar payload.  Bump when a wider payload type lands.
+const TAGGED_ENUM_PAYLOAD_BYTES: i32 = 32
+
+# Emit LLVM type with struct name support.  Tagged-enum types emit as the
+# named struct so variant constructors / match / return paths share the same
+# declared layout.
 fn emit_llvm_type_struct(s: *EmitterState, t: i32, name: *u8, name_len: i32)
     if t == TYPE_STRUCT
-        if is_tagged_enum_type(name, name_len) == 1
-            emit_str(s, c"i64")
-        else
-            emit_str(s, c"%")
-            emit_name(s, name, name_len)
+        emit_str(s, c"%")
+        emit_name(s, name, name_len)
     else
         emit_llvm_type(s, t)
 

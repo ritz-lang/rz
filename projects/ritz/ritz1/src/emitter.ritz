@@ -232,6 +232,15 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
                 emit_str(s, c"  ret i32 ")
                 emit_reg(s, trunc)
                 emit_str(s, c"\n")
+            else if f.return_type == TYPE_STRUCT
+                # tagged-enum or named-struct return: use the named type
+                # (ritz-task-133).  Without this the tail-expression phi
+                # carries `%Result$...` but the ret claims `i64`.
+                emit_str(s, c"  ret ")
+                emit_llvm_type_struct(s, TYPE_STRUCT, f.return_type_name, f.return_type_name_len)
+                emit_str(s, c" ")
+                emit_reg(s, s.last_expr_reg)
+                emit_str(s, c"\n")
             else
                 emit_str(s, c"  ret ")
                 emit_llvm_type(s, f.return_type)
@@ -240,9 +249,14 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
                 emit_str(s, c"\n")
         else
             # No value available, return 0
-            emit_str(s, c"  ret ")
-            emit_llvm_type(s, f.return_type)
-            emit_str(s, c" 0\n")
+            if f.return_type == TYPE_STRUCT
+                emit_str(s, c"  ret ")
+                emit_llvm_type_struct(s, TYPE_STRUCT, f.return_type_name, f.return_type_name_len)
+                emit_str(s, c" zeroinitializer\n")
+            else
+                emit_str(s, c"  ret ")
+                emit_llvm_type(s, f.return_type)
+                emit_str(s, c" 0\n")
     else if f.return_type == TYPE_VOID and has_explicit_return == 0
         emit_str(s, c"  ret void\n")
     emit_str(s, c"}\n\n")
@@ -665,6 +679,94 @@ fn emit_struct_types(s: *EmitterState)
         emit_str(s, c"}\n")
         st = st.next
     emit_str(s, c"\n")
+
+# Emit one `%Result$... = type { i8, [N x i8] }` decl (dedup via
+# emitted_structs) for the tagged-enum name at (name, len).  No-op when
+# name doesn't look like Result$/Option$, which lets callers funnel every
+# type name they see through here unconditionally.  ritz-task-133.
+fn emit_tagged_enum_decl_once(s: *EmitterState, name: *u8, len: i32)
+    if name == null or len == 0
+        return
+    if is_tagged_enum_type(name, len) == 0
+        return
+    # Skip template-shaped names like `Option$T` / `Result$E` — these are
+    # the raw generic placeholders that leak in from function signatures
+    # declared against an unspecialized type parameter.  Concrete
+    # instantiations (Option$i32, Option$Vec_u8) are what we want to emit.
+    # Also skip empty suffix (`Option$`) which happens for u-types whose
+    # mangling table doesn't know the suffix letter — those still work
+    # because they share a single struct layout, but we only want one
+    # emission regardless.  A "template" suffix is a single ASCII upper
+    # letter A..Z immediately after `$`; any multi-char or lowercase
+    # suffix (i32/u8/Vec_u8/...) is concrete.
+    let suffix_start: i32 = 7
+    if len - suffix_start == 1
+        let ch: i32 = *(name + suffix_start) as i32
+        if ch >= 65 and ch <= 90
+            return
+    if was_struct_emitted(s, name, len) == 1
+        return
+    mark_struct_emitted(s, name, len)
+    emit_str(s, c"%")
+    emit_name(s, name, len)
+    emit_str(s, c" = type { i8, [")
+    emit_int(s, TAGGED_ENUM_PAYLOAD_BYTES as i64)
+    emit_str(s, c" x i8] }\n")
+
+# Walk every fn / param / var-decl type name in the module and emit a
+# tagged-enum struct decl for each unique Result$/Option$ instantiation.
+# Must run AFTER emit_struct_types so user-declared types get dibs on the
+# emitted-names table; before any IR that references `%Result$...`.
+fn emit_tagged_enum_types(s: *EmitterState)
+    var f: *FnDef = s.module.functions
+    while f != null
+        if f.return_type == TYPE_STRUCT
+            emit_tagged_enum_decl_once(s, f.return_type_name, f.return_type_name_len)
+        var p: *Param = f.params
+        while p != null
+            if p.param_type == TYPE_STRUCT
+                emit_tagged_enum_decl_once(s, p.param_type_name, p.param_type_name_len)
+            p = p.next
+        # Walk body for let-bindings with explicit enum types
+        emit_tagged_enum_scan_stmts(s, f.body)
+        f = f.next
+
+    # Impl-block methods carry the same shape (generic dispatch is lowered
+    # to FnDefs elsewhere — this is defensive).
+    var ib: *ImplBlock = s.module.impls
+    while ib != null
+        var meth: *FnDef = ib.methods
+        while meth != null
+            if meth.return_type == TYPE_STRUCT
+                emit_tagged_enum_decl_once(s, meth.return_type_name, meth.return_type_name_len)
+            var mp: *Param = meth.params
+            while mp != null
+                if mp.param_type == TYPE_STRUCT
+                    emit_tagged_enum_decl_once(s, mp.param_type_name, mp.param_type_name_len)
+                mp = mp.next
+            emit_tagged_enum_scan_stmts(s, meth.body)
+            meth = meth.next
+        ib = ib.next
+
+    emit_str(s, c"\n")
+
+fn emit_tagged_enum_scan_stmts(s: *EmitterState, body: *Stmt)
+    var st: *Stmt = body
+    while st != null
+        if st.kind == STMT_VAR_DECL
+            if st.var_type == TYPE_STRUCT
+                emit_tagged_enum_decl_once(s, st.var_type_name, st.var_type_name_len)
+        else if st.kind == STMT_IF
+            emit_tagged_enum_scan_stmts(s, st.if_then)
+            if st.if_else != null
+                emit_tagged_enum_scan_stmts(s, st.if_else)
+        else if st.kind == STMT_WHILE
+            emit_tagged_enum_scan_stmts(s, st.while_body)
+        else if st.kind == STMT_FOR
+            emit_tagged_enum_scan_stmts(s, st.for_body)
+        else if st.kind == STMT_LOOP
+            emit_tagged_enum_scan_stmts(s, st.while_body)
+        st = st.next
 
 # Emit global variable declarations
 fn emit_global_vars(s: *EmitterState)
@@ -1204,6 +1306,8 @@ fn emit_module(m: *Module, out: *Vec<u8>) -> i32
     s.emitted_struct_count = 0
     s.emitted_fn_count = 0
     s.emitted_global_count = 0
+    s.ctx_enum_name = null
+    s.ctx_enum_name_len = 0
 
     emit_str(@s, c"; ModuleID = 'ritz1_output'\n")
     emit_str(@s, c"target triple = \"x86_64-unknown-linux-gnu\"\n\n")
@@ -1213,6 +1317,12 @@ fn emit_module(m: *Module, out: *Vec<u8>) -> i32
 
     # Emit struct type definitions from source
     emit_struct_types(@s)
+
+    # Emit tagged-enum struct type decls for every Result$/Option$
+    # instantiation referenced in the module.  ritz-task-133 replaces the
+    # old i64-pack fast-path with a real `{ i8, [N x i8] }` struct so the
+    # IR matches ritz0.
+    emit_tagged_enum_types(@s)
 
     # Emit global variable declarations
     emit_global_vars(@s)

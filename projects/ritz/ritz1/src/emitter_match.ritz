@@ -64,73 +64,107 @@ fn variant_is_tag_one(name: *u8, len: i32) -> i32
             return 1
     return 0
 
-# Emit a check for the scrutinee being of a given variant.
-# For tag-1 (Some/Ok): emit `icmp uge i64 %scrut, (1 << 48)`.
-# For tag-0 (None/Err): emit `icmp ult i64 %scrut, (1 << 48)`.
-# Returns the i1 register with the result.
-fn emit_variant_tag_check(s: *EmitterState, scrut_reg: i32, tag_one: i32) -> i32
-    let tag_mask: i64 = 281474976710656  # 1 << 48
+# Emit a check for the scrutinee being of a given variant against the
+# struct layout `{ i8 tag, [N x i8] payload }` (ritz-task-133 parity with
+# ritz0).  `slot_reg` is a pointer to the scrutinee struct (the match
+# prelude spills the scrutinee value into an alloca once).  `enum_name`
+# is the `%Result$.../Option$...` type name used to GEP.  `tag_one == 1`
+# checks for the carrier variant (Ok / Some); 0 checks for the null
+# variant (Err / None).  ritz0 tag convention: Ok=0 Err=1 Some=0 None=1,
+# so carrier <=> tag==0.
+fn emit_variant_tag_check(s: *EmitterState, slot_reg: i32, enum_name: *u8, enum_name_len: i32, tag_one: i32) -> i32
+    let tag_ptr: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, tag_ptr)
+    emit_str(s, c" = getelementptr %")
+    emit_name(s, enum_name, enum_name_len)
+    emit_str(s, c", ptr ")
+    emit_reg(s, slot_reg)
+    emit_str(s, c", i32 0, i32 0\n")
     let tag_reg: i32 = next_reg(s)
     emit_str(s, c"  ")
     emit_reg(s, tag_reg)
-    emit_str(s, c" = icmp uge i64 ")
-    emit_reg(s, scrut_reg)
-    emit_str(s, c", ")
-    emit_int(s, tag_mask)
+    emit_str(s, c" = load i8, ptr ")
+    emit_reg(s, tag_ptr)
     emit_str(s, c"\n")
-    if tag_one == 1
-        return tag_reg
-    # Invert: tag_one was 0 means we want to match when scrut < tag_mask
-    let inv_reg: i32 = next_reg(s)
+    let cmp_reg: i32 = next_reg(s)
     emit_str(s, c"  ")
-    emit_reg(s, inv_reg)
-    emit_str(s, c" = xor i1 ")
+    emit_reg(s, cmp_reg)
+    if tag_one == 1
+        # carrier (Ok/Some) → tag == 0
+        emit_str(s, c" = icmp eq i8 ")
+    else
+        # null (Err/None) → tag != 0
+        emit_str(s, c" = icmp ne i8 ")
     emit_reg(s, tag_reg)
-    emit_str(s, c", true\n")
-    return inv_reg
+    emit_str(s, c", 0\n")
+    return cmp_reg
 
-# Extract the variant payload (low 48 bits of scrutinee).
-# Returns a register holding the payload as i64.
-fn emit_variant_payload(s: *EmitterState, scrut_reg: i32) -> i32
-    let payload_mask: i64 = 281474976710655  # (1 << 48) - 1
+# Extract the variant payload as an i64 (the common scalar case).  Payload
+# sits at field 1 (the `[N x i8]` buffer).  Callers widen to i64 because
+# ritz1's downstream arithmetic / call paths operate on i64 registers.
+fn emit_variant_payload(s: *EmitterState, slot_reg: i32, enum_name: *u8, enum_name_len: i32) -> i32
+    let pay_ptr: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, pay_ptr)
+    emit_str(s, c" = getelementptr %")
+    emit_name(s, enum_name, enum_name_len)
+    emit_str(s, c", ptr ")
+    emit_reg(s, slot_reg)
+    emit_str(s, c", i32 0, i32 1\n")
     let r: i32 = next_reg(s)
     emit_str(s, c"  ")
     emit_reg(s, r)
-    emit_str(s, c" = and i64 ")
-    emit_reg(s, scrut_reg)
-    emit_str(s, c", ")
-    emit_int(s, payload_mask)
+    emit_str(s, c" = load i64, ptr ")
+    emit_reg(s, pay_ptr)
     emit_str(s, c"\n")
     return r
 
+# Scalar-scrutinee fallback (non-enum `match x on int`).
+fn emit_variant_tag_check_i64(s: *EmitterState, scrut_reg: i32, tag_one: i32) -> i32
+    # Legacy packed-i64 path retained only for non-enum match.  In practice
+    # ritz1 code only uses `match` on Result/Option + integers; this branch
+    # covers the latter.  Returns a conservative always-false for "variant"
+    # patterns against a scalar scrutinee.
+    let r: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, r)
+    emit_str(s, c" = icmp eq i64 ")
+    emit_reg(s, scrut_reg)
+    emit_str(s, c", 0\n")
+    if tag_one == 1
+        return r
+    let inv: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, inv)
+    emit_str(s, c" = xor i1 ")
+    emit_reg(s, r)
+    emit_str(s, c", true\n")
+    return inv
+
 # Emit match body, returning (result_reg, exit_label) via MatchResult slot.
-# `arm_index` selects which slot in result to fill.
-# For PAT_VARIANT arms with PAT_IDENT inner (e.g. `Ok(v) => v` or
-# `Some(n) => n`), the inner name is bound to the extracted payload
-# for the duration of the arm body, then popped via local_count
-# rollback. (task-99 #105)
-fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, result: *MatchResult, arm_index: i32, end_label: i32)
+# For PAT_VARIANT arms with PAT_IDENT inner (e.g. `Ok(v) => v`), the inner
+# name is bound to the extracted payload for the duration of the arm body,
+# then popped via local_count rollback. (task-99 #105)
+fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_slot: i32, enum_name: *u8, enum_name_len: i32, result: *MatchResult, arm_index: i32, end_label: i32)
     # Save local_count so arm-scoped bindings get popped after the body.
-    # (Lightweight scope — no push/pop API exists in emitter_core.)
     let saved_local_count: i32 = s.local_count
 
-    # Bind variant payload to inner pattern name if the arm is
-    # `Constructor(binding)`. The payload is the low 48 bits of
-    # scrut_reg (matches the encoding in emitter_expr_call's Ok/Some
-    # constructor).
+    # Bind variant payload to inner pattern name on `Constructor(binding)`.
     if arm.pattern_kind == PAT_VARIANT
         if arm.pattern_inner_kind == PAT_IDENT
             if arm.pattern_inner_name_len > 0
-                # Skip wildcard-styled names ("_"). pattern_inner_kind
-                # == PAT_IDENT excludes PAT_WILDCARD already, but we
-                # still guard against a pattern_inner_name == "_"
-                # binding ritz0 accepts.
                 var is_wildcard: i32 = 0
                 if arm.pattern_inner_name_len == 1
                     if *arm.pattern_inner_name == 95   # '_'
                         is_wildcard = 1
                 if is_wildcard == 0
-                    let payload_reg: i32 = emit_variant_payload(s, scrut_reg)
+                    var payload_reg: i32 = 0
+                    if scrut_slot != 0 and enum_name != null and enum_name_len > 0
+                        payload_reg = emit_variant_payload(s, scrut_slot, enum_name, enum_name_len)
+                    else
+                        # Non-enum scrutinee (shouldn't reach here in practice).
+                        payload_reg = scrut_reg
                     let alloca_reg: i32 = next_reg(s)
                     emit_str(s, c"  ")
                     emit_reg(s, alloca_reg)
@@ -144,7 +178,6 @@ fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, result:
 
     var body_reg: i32 = 0
     if arm.is_pass == 1
-        # `pass` arm: emit zero as default value
         body_reg = next_reg(s)
         emit_str(s, c"  ")
         emit_reg(s, body_reg)
@@ -157,33 +190,29 @@ fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, result:
         emit_reg(s, body_reg)
         emit_str(s, c" = add i64 0, 0  ; match arm: null body\n")
 
-    # Pop arm-scoped locals so later arms and the end-block don't see them.
     s.local_count = saved_local_count
 
-    # Capture actual exit label (the body might have branched internally).
     let exit_label: i32 = s.current_label
-    # Record in result array
     if arm_index < MAX_MATCH_ARMS
         result.values[arm_index] = body_reg
         result.labels[arm_index] = exit_label
         if arm_index + 1 > result.count
             result.count = arm_index + 1
 
-    # Branch to match end
     emit_str(s, c"  br label %")
     emit_label(s, end_label)
     emit_str(s, c"\n")
 
-# Emit one arm's condition + body. On success, sets result.values/labels[arm_index].
-# After emission, current_label is set to the "next-arm" label so the next
-# arm's condition can be emitted directly.
-fn emit_match_arm(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, result: *MatchResult, arm_index: i32, end_label: i32)
+# Emit one arm's condition + body.  `scrut_slot` is an alloca holding the
+# scrutinee struct (when enum_name is non-null), or 0 for scalar scrutinees.
+fn emit_match_arm(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_slot: i32, enum_name: *u8, enum_name_len: i32, result: *MatchResult, arm_index: i32, end_label: i32)
     let body_label: i32 = next_label(s)
     let next_label_id: i32 = next_label(s)
 
-    # Emit test based on pattern kind
     var cond_reg: i32 = 0
     var always_true: i32 = 0
+    let is_enum_match: i32 = (enum_name != null) and (enum_name_len > 0)
+
     if arm.pattern_kind == PAT_INT_LIT
         cond_reg = next_reg(s)
         emit_str(s, c"  ")
@@ -196,25 +225,27 @@ fn emit_match_arm(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, result: *Mat
     else if arm.pattern_kind == PAT_WILDCARD
         always_true = 1
     else if arm.pattern_kind == PAT_IDENT
-        # Ident pattern — could be unit variant (None/Err) or a binding.
-        # Heuristic: if the name is a known tag-0 variant (None), emit tag
-        # check; otherwise treat as an ident binding (always match).
-        # "None" = 4 chars: N=78 o=111 n=110 e=101
+        # Ident pattern — unit variant (None/Err) or a binding.
         if arm.pattern_name_len == 4
             if *arm.pattern_name == 78 and *(arm.pattern_name + 1) == 111
                 if *(arm.pattern_name + 2) == 110 and *(arm.pattern_name + 3) == 101
-                    # "None": tag == 0
-                    cond_reg = emit_variant_tag_check(s, scrut_reg, 0)
+                    # "None": null variant → tag != 0
+                    if is_enum_match == 1
+                        cond_reg = emit_variant_tag_check(s, scrut_slot, enum_name, enum_name_len, 0)
+                    else
+                        cond_reg = emit_variant_tag_check_i64(s, scrut_reg, 0)
         if cond_reg == 0
             always_true = 1
     else if arm.pattern_kind == PAT_VARIANT
         let tag_one: i32 = variant_is_tag_one(arm.pattern_name, arm.pattern_name_len)
-        cond_reg = emit_variant_tag_check(s, scrut_reg, tag_one)
+        if is_enum_match == 1
+            cond_reg = emit_variant_tag_check(s, scrut_slot, enum_name, enum_name_len, tag_one)
+        else
+            cond_reg = emit_variant_tag_check_i64(s, scrut_reg, tag_one)
     else
         always_true = 1
 
     if always_true == 1
-        # Unconditional branch to body. Skip condition emission.
         emit_str(s, c"  br label %")
         emit_label(s, body_label)
         emit_str(s, c"\n")
@@ -227,32 +258,89 @@ fn emit_match_arm(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, result: *Mat
         emit_label(s, next_label_id)
         emit_str(s, c"\n")
 
-    # Body block
     emit_label(s, body_label)
     emit_str(s, c":\n")
     s.current_label = body_label
-    emit_match_arm_body(s, arm, scrut_reg, result, arm_index, end_label)
+    emit_match_arm_body(s, arm, scrut_reg, scrut_slot, enum_name, enum_name_len, result, arm_index, end_label)
 
-    # Next arm block (fall-through when condition failed)
     emit_label(s, next_label_id)
     emit_str(s, c":\n")
     s.current_label = next_label_id
 
+# Resolve the scrutinee's enum struct type name by peeking at the AST:
+#   * EXPR_IDENT   -> local's recorded struct type
+#   * EXPR_CALL    -> callee's return struct type (by name)
+#   * EXPR_UNARY*  -> unwrap deref (match *res) and recurse
+# Returns 1 with (out_name, out_len) filled, 0 otherwise.
+fn resolve_scrutinee_enum(s: *EmitterState, scr: *Expr, out_name: **u8, out_len: *i32) -> i32
+    if scr.kind == EXPR_IDENT
+        let loc: *LocalVar = find_local_struct_name(s, scr.ident_ptr, scr.ident_len)
+        if loc != null
+            if loc.type_name_len > 0
+                if is_tagged_enum_type(loc.type_name, loc.type_name_len) == 1
+                    *out_name = loc.type_name
+                    *out_len = loc.type_name_len
+                    return 1
+    else if scr.kind == EXPR_CALL
+        var full_name: [256]u8
+        var full_len: i32 = 0
+        for i in 0..scr.func_name_len
+            full_name[full_len] = *(scr.func_name + i)
+            full_len = full_len + 1
+        if scr.call_type_suffix_len > 0
+            for i in 0..scr.call_type_suffix_len
+                full_name[full_len] = *(scr.call_type_suffix + i)
+                full_len = full_len + 1
+        let fd: *FnDef = find_fn(s, @full_name[0], full_len)
+        if fd != null
+            if fd.return_type == TYPE_STRUCT
+                if fd.return_type_name_len > 0
+                    if is_tagged_enum_type(fd.return_type_name, fd.return_type_name_len) == 1
+                        *out_name = fd.return_type_name
+                        *out_len = fd.return_type_name_len
+                        return 1
+    else if scr.kind == EXPR_UNARY
+        if scr.op == OP_DEREF
+            return resolve_scrutinee_enum(s, scr.operand, out_name, out_len)
+    *out_name = null
+    *out_len = 0
+    return 0
+
 # Main entry: emit a match construct. Returns the phi register holding
 # the match's result value (or 0 if no arms contribute).
 fn emit_match(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm) -> i32
-    # Evaluate scrutinee once
+    # Detect whether the scrutinee is a tagged-enum struct; if so, spill
+    # it into an alloca once so every arm can GEP the same pointer.
+    var enum_name: *u8 = null
+    var enum_name_len: i32 = 0
+    let is_enum: i32 = resolve_scrutinee_enum(s, scrutinee, @enum_name, @enum_name_len)
+
+    # Evaluate scrutinee
     let scrut_reg: i32 = emit_expr(s, scrutinee)
+    var scrut_slot: i32 = 0
+    if is_enum == 1
+        scrut_slot = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, scrut_slot)
+        emit_str(s, c" = alloca %")
+        emit_name(s, enum_name, enum_name_len)
+        emit_str(s, c"  ; match scrut spill\n")
+        emit_str(s, c"  store %")
+        emit_name(s, enum_name, enum_name_len)
+        emit_str(s, c" ")
+        emit_reg(s, scrut_reg)
+        emit_str(s, c", ptr ")
+        emit_reg(s, scrut_slot)
+        emit_str(s, c"\n")
 
     let end_label: i32 = next_label(s)
     var result: MatchResult
     result.count = 0
 
-    # Walk arms in order
     var arm: *MatchArm = arms
     var idx: i32 = 0
     while arm != null
-        emit_match_arm(s, arm, scrut_reg, @result, idx, end_label)
+        emit_match_arm(s, arm, scrut_reg, scrut_slot, enum_name, enum_name_len, @result, idx, end_label)
         arm = arm.next
         idx = idx + 1
 

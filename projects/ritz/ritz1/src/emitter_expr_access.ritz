@@ -13,18 +13,67 @@ fn is_ident_none(name: *u8, len: i32) -> i32
     return 0
 
 fn emit_expr_ident(s: *EmitterState, e: *Expr) -> i32
-    # Unit-variant None → tag-0 with zero payload = i64 0.
-    # (ritz-task-87 tag-encoding; see emitter_match.ritz for consumer.)
+    # Unit-variant None → `%Option$... = { i8 1, [N x i8] zero }` aggregate
+    # (ritz-task-133: matches ritz0 tag convention Some=0, None=1).
     if is_ident_none(e.ident_ptr, e.ident_len) == 1
         # Only treat as None if not shadowed by local/global/const.
         if is_const(s, e.ident_ptr, e.ident_len) == 0
             if find_local(s, e.ident_ptr, e.ident_len) < 0
                 if find_global(s, e.ident_ptr, e.ident_len) == null
-                    let z: i32 = next_reg(s)
+                    # Resolve enum context (fn return type or var decl).
+                    var enum_name: *u8 = null
+                    var enum_name_len: i32 = 0
+                    if s.ctx_enum_name != null
+                        if s.ctx_enum_name_len > 0
+                            if is_tagged_enum_type(s.ctx_enum_name, s.ctx_enum_name_len) == 1
+                                enum_name = s.ctx_enum_name
+                                enum_name_len = s.ctx_enum_name_len
+                    if enum_name == null
+                        if s.ret_type_name != null
+                            if s.ret_type_name_len > 0
+                                if is_tagged_enum_type(s.ret_type_name, s.ret_type_name_len) == 1
+                                    enum_name = s.ret_type_name
+                                    enum_name_len = s.ret_type_name_len
+                    if enum_name == null
+                        # No context — fall through to legacy i64 zero (old
+                        # behaviour; rare but keeps IR well-formed).
+                        let z: i32 = next_reg(s)
+                        emit_str(s, c"  ")
+                        emit_reg(s, z)
+                        emit_str(s, c" = add i64 0, 0  ; None (no enum ctx)\n")
+                        return z
+                    # alloca + zero-init + store tag=1 + load.
+                    let slot: i32 = next_reg(s)
                     emit_str(s, c"  ")
-                    emit_reg(s, z)
-                    emit_str(s, c" = add i64 0, 0  ; None unit variant (tag=0)\n")
-                    return z
+                    emit_reg(s, slot)
+                    emit_str(s, c" = alloca %")
+                    emit_name(s, enum_name, enum_name_len)
+                    emit_str(s, c"  ; None\n")
+                    emit_str(s, c"  store %")
+                    emit_name(s, enum_name, enum_name_len)
+                    emit_str(s, c" zeroinitializer, ptr ")
+                    emit_reg(s, slot)
+                    emit_str(s, c"\n")
+                    let tptr: i32 = next_reg(s)
+                    emit_str(s, c"  ")
+                    emit_reg(s, tptr)
+                    emit_str(s, c" = getelementptr %")
+                    emit_name(s, enum_name, enum_name_len)
+                    emit_str(s, c", ptr ")
+                    emit_reg(s, slot)
+                    emit_str(s, c", i32 0, i32 0\n")
+                    emit_str(s, c"  store i8 1, ptr ")
+                    emit_reg(s, tptr)
+                    emit_str(s, c"\n")
+                    let result: i32 = next_reg(s)
+                    emit_str(s, c"  ")
+                    emit_reg(s, result)
+                    emit_str(s, c" = load %")
+                    emit_name(s, enum_name, enum_name_len)
+                    emit_str(s, c", ptr ")
+                    emit_reg(s, slot)
+                    emit_str(s, c"\n")
+                    return result
 
     if is_const(s, e.ident_ptr, e.ident_len) == 1
         let val: i64 = find_const(s, e.ident_ptr, e.ident_len)

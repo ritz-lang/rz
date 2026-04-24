@@ -258,7 +258,19 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
                     fi = fi.next
             return  # Done with struct literal init
 
+        # ritz-task-133: thread enum ctx so `let r: Result<_,_> = Ok(x)` in
+        # a non-Result-returning fn still builds the right struct.  Save /
+        # restore around the init expression so nested decls don't leak.
+        let _saved_ctx: *u8 = s.ctx_enum_name
+        let _saved_ctx_len: i32 = s.ctx_enum_name_len
+        if var_type == TYPE_STRUCT
+            if stmt.var_type_name_len > 0
+                if is_tagged_enum_type(stmt.var_type_name, stmt.var_type_name_len) == 1
+                    s.ctx_enum_name = stmt.var_type_name
+                    s.ctx_enum_name_len = stmt.var_type_name_len
         let init_reg: i32 = emit_expr(s, stmt.var_init)
+        s.ctx_enum_name = _saved_ctx
+        s.ctx_enum_name_len = _saved_ctx_len
         if var_type == TYPE_I32 or var_type == TYPE_U32
             let trunc: i32 = next_reg(s)
             emit_str(s, c"  ")
@@ -1141,21 +1153,35 @@ fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         emit_str(s, c":\n")
         s.current_label = end_label  # Update current block
 
-        # If both branches produce values, emit a phi node
+        # If both branches produce values, emit a phi node.  When the
+        # enclosing fn returns a tagged-enum struct, both branches hand us
+        # `%Result$.../Option$...` struct values — the phi must match that
+        # type or LLVM rejects the IR. (ritz-task-133)
         if stmt.if_else != null and then_result > 0 and else_result > 0
             let phi_reg: i32 = next_reg(s)
             emit_str(s, c"  ")
             emit_reg(s, phi_reg)
-            emit_str(s, c" = phi i64 [ ")
+            emit_str(s, c" = phi ")
+            if ret_type == TYPE_STRUCT
+                if s.ret_type_name_len > 0
+                    if is_tagged_enum_type(s.ret_type_name, s.ret_type_name_len) == 1
+                        emit_llvm_type_struct(s, TYPE_STRUCT, s.ret_type_name, s.ret_type_name_len)
+                    else
+                        emit_str(s, c"i64")
+                else
+                    emit_str(s, c"i64")
+            else
+                emit_str(s, c"i64")
+            emit_str(s, c" [ ")
             emit_reg(s, then_result)
             emit_str(s, c", %")
-            emit_label(s, then_exit_label)  # Use actual exit block, not entry
+            emit_label(s, then_exit_label)
             emit_str(s, c" ], [ ")
             emit_reg(s, else_result)
             emit_str(s, c", %")
-            emit_label(s, else_exit_label)  # Use actual exit block
+            emit_label(s, else_exit_label)
             emit_str(s, c" ]\n")
-            s.last_expr_reg = phi_reg  # Set the merged result
+            s.last_expr_reg = phi_reg
         else if then_result > 0
             s.last_expr_reg = then_result
         else
