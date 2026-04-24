@@ -203,6 +203,125 @@ fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
             return pti
         return result
 
+    # task-101: Span$T indexing on a struct local — `let b = s.as_bytes(); b[0]`
+    # or `let b = "ABC"; b[0]`. Without this, emit_expr(e.left) loads the whole
+    # %Span$u8 aggregate and the ptr-to-byte fallback's
+    # `inttoptr i64 %base to ptr` fails because %base is a struct, not i64.
+    # Mirrors the Vec$T struct-field path below, but for a whole-struct local.
+    # NOTE: lane-bleed from ritz-task-101 into ritz-task-110's emitter_expr_access
+    # lane — necessary because the emit_var_decl Span$u8 alloca fix in -101
+    # depends on this to keep `bytes[0]` compiling.
+    if e.left.kind == EXPR_IDENT and local != null and local.var_type == TYPE_STRUCT and local.type_name_len >= 5
+        if *(local.type_name + 0) == 'S' and *(local.type_name + 1) == 'p' and *(local.type_name + 2) == 'a' and *(local.type_name + 3) == 'n' and *(local.type_name + 4) == '$'
+            let idx_s: i32 = emit_expr(s, e.right)
+            # GEP to data ptr field (index 0 of Span struct)
+            let data_ptr_ptr: i32 = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, data_ptr_ptr)
+            emit_str(s, c" = getelementptr %")
+            emit_name(s, local.type_name, local.type_name_len)
+            emit_str(s, c", ptr ")
+            emit_reg(s, local.reg)
+            emit_str(s, c", i32 0, i32 0\n")
+            let data_ptr: i32 = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, data_ptr)
+            emit_str(s, c" = load ptr, ptr ")
+            emit_reg(s, data_ptr_ptr)
+            emit_str(s, c"\n")
+            # Decode element type from suffix after "Span$"
+            let elem_name_s: *u8 = local.type_name + 5
+            let elem_len_s: i32 = local.type_name_len - 5
+            var elem_ty_s3: *u8 = c"i64"
+            var elem_kind_s: i32 = TYPE_I64
+            if elem_len_s == 2 and *(elem_name_s + 0) == 'u' and *(elem_name_s + 1) == '8'
+                elem_ty_s3 = c"i8"
+                elem_kind_s = TYPE_U8
+            else if elem_len_s == 2 and *(elem_name_s + 0) == 'i' and *(elem_name_s + 1) == '8'
+                elem_ty_s3 = c"i8"
+                elem_kind_s = TYPE_I8
+            else if elem_len_s == 3 and *(elem_name_s + 0) == 'i' and *(elem_name_s + 1) == '3' and *(elem_name_s + 2) == '2'
+                elem_ty_s3 = c"i32"
+                elem_kind_s = TYPE_I32
+            else if elem_len_s == 3 and *(elem_name_s + 0) == 'u' and *(elem_name_s + 1) == '3' and *(elem_name_s + 2) == '2'
+                elem_ty_s3 = c"i32"
+                elem_kind_s = TYPE_U32
+            else if elem_len_s == 3 and *(elem_name_s + 0) == 'i' and *(elem_name_s + 1) == '1' and *(elem_name_s + 2) == '6'
+                elem_ty_s3 = c"i16"
+                elem_kind_s = TYPE_I16
+            else if elem_len_s == 3 and *(elem_name_s + 0) == 'u' and *(elem_name_s + 1) == '1' and *(elem_name_s + 2) == '6'
+                elem_ty_s3 = c"i16"
+                elem_kind_s = TYPE_U16
+            # GEP by index
+            let elem_ptr_s: i32 = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, elem_ptr_s)
+            emit_str(s, c" = getelementptr ")
+            emit_str(s, elem_ty_s3)
+            emit_str(s, c", ptr ")
+            emit_reg(s, data_ptr)
+            emit_str(s, c", i64 ")
+            emit_reg(s, idx_s)
+            emit_str(s, c"\n")
+            let val_s: i32 = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, val_s)
+            emit_str(s, c" = load ")
+            emit_str(s, elem_ty_s3)
+            emit_str(s, c", ptr ")
+            emit_reg(s, elem_ptr_s)
+            emit_str(s, c"\n")
+            # Zero/sign-extend to i64 for uniform value representation
+            if elem_kind_s == TYPE_U8
+                let ext: i32 = next_reg(s)
+                emit_str(s, c"  ")
+                emit_reg(s, ext)
+                emit_str(s, c" = zext i8 ")
+                emit_reg(s, val_s)
+                emit_str(s, c" to i64\n")
+                return ext
+            else if elem_kind_s == TYPE_I8
+                let ext: i32 = next_reg(s)
+                emit_str(s, c"  ")
+                emit_reg(s, ext)
+                emit_str(s, c" = sext i8 ")
+                emit_reg(s, val_s)
+                emit_str(s, c" to i64\n")
+                return ext
+            else if elem_kind_s == TYPE_I32
+                let ext: i32 = next_reg(s)
+                emit_str(s, c"  ")
+                emit_reg(s, ext)
+                emit_str(s, c" = sext i32 ")
+                emit_reg(s, val_s)
+                emit_str(s, c" to i64\n")
+                return ext
+            else if elem_kind_s == TYPE_U32
+                let ext: i32 = next_reg(s)
+                emit_str(s, c"  ")
+                emit_reg(s, ext)
+                emit_str(s, c" = zext i32 ")
+                emit_reg(s, val_s)
+                emit_str(s, c" to i64\n")
+                return ext
+            else if elem_kind_s == TYPE_I16
+                let ext: i32 = next_reg(s)
+                emit_str(s, c"  ")
+                emit_reg(s, ext)
+                emit_str(s, c" = sext i16 ")
+                emit_reg(s, val_s)
+                emit_str(s, c" to i64\n")
+                return ext
+            else if elem_kind_s == TYPE_U16
+                let ext: i32 = next_reg(s)
+                emit_str(s, c"  ")
+                emit_reg(s, ext)
+                emit_str(s, c" = zext i16 ")
+                emit_reg(s, val_s)
+                emit_str(s, c" to i64\n")
+                return ext
+            return val_s
+
     # Check for struct member array access: s.field[idx] where field is an array
     if e.left.kind == EXPR_MEMBER
         var member_result: MemberPtrResult

@@ -48,6 +48,30 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
                     stmt.var_type = TYPE_STRUCT
                     stmt.var_type_name = fn_def.return_type_name
                     stmt.var_type_name_len = fn_def.return_type_name_len
+        # task-101: builtin method return-type table. Method calls like
+        # `s.as_bytes()` hit compiler intrinsics (try_emit_strview_as_bytes),
+        # NOT a real fn_def, so the EXPR_CALL branch above can't find them
+        # via find_fn. Without narrowing here, the alloca defaults to i64 →
+        # `store i64 %span, ptr %slot` with %span typed %Span$u8 =>
+        # LLVM type-mismatch. Hardcode known builtin return types so the
+        # slot is sized/typed correctly and the local is registered as a
+        # struct so later `.len()` / method dispatch can resolve the
+        # receiver type.
+        else if stmt.var_init.kind == EXPR_METHOD
+            # StrView.as_bytes() -> %Span$u8
+            if name_eq(stmt.var_init.ident_ptr, stmt.var_init.ident_len, c"as_bytes", 8) == 1
+                var_type = TYPE_STRUCT
+                stmt.var_type = TYPE_STRUCT
+                stmt.var_type_name = c"Span$u8"
+                stmt.var_type_name_len = 7
+        # task-101: bare "..." literal lowers to a %Span$u8 aggregate
+        # (see emit_expr EXPR_STRING_LIT). Without widening, `let s = "ABC"`
+        # hits the same store-i64-of-%Span$u8 mismatch that as_bytes does.
+        else if stmt.var_init.kind == EXPR_STRING_LIT
+            var_type = TYPE_STRUCT
+            stmt.var_type = TYPE_STRUCT
+            stmt.var_type_name = c"Span$u8"
+            stmt.var_type_name_len = 7
         # task-103: same widening for `let w = Wrap { ... }`. Without this,
         # var_type stays TYPE_I64 → alloca i64 (8 bytes) instead of %Wrap,
         # AND w isn't registered with add_local_struct, so later
