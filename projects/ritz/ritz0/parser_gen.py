@@ -107,7 +107,8 @@ class TokenType(IntEnum):
     STRING = 92
     CHAR = 93
     CSTRING = 94
-    SPAN_STRING = 95
+    # SPAN_STRING (slot 95) was removed in AGAST #98 — retained as a hole so
+    # the surrounding enum values stay stable.
     WHITESPACE = 96
     COMMENT = 97
 
@@ -207,7 +208,7 @@ TOKEN_NAMES = {
     TokenType.STRING: "STRING",
     TokenType.CHAR: "CHAR",
     TokenType.CSTRING: "CSTRING",
-    TokenType.SPAN_STRING: "SPAN_STRING",
+    # SPAN_STRING removed in AGAST #98.
     TokenType.WHITESPACE: "WHITESPACE",
     TokenType.COMMENT: "COMMENT",
 }
@@ -530,8 +531,8 @@ class Lexer:
             kind = TokenType.CHAR
         elif prefix == "c":
             kind = TokenType.CSTRING
-        elif prefix == "s":
-            kind = TokenType.SPAN_STRING
+        # Note: s"..." (SPAN_STRING) was removed in AGAST #98 — bare strings
+        # produce StrView which is layout-compatible with Span<u8>.
         else:
             kind = TokenType.STRING
         return Token(kind, value, self.line, start_col, start, self.pos)
@@ -2914,15 +2915,8 @@ class Parser:
         # Try next alternative
         self.pos = start_pos
 
-        # Alternative 8
-        try:
-            result_1 = self._expect(TokenType.SPAN_STRING)
-            return result_1
-        except ParseError:
-            self.pos = start_pos
-
-        # Try next alternative
-        self.pos = start_pos
+        # Alternative 8 (SPAN_STRING) removed in AGAST #98 — bare STRING
+        # handles the same case via StrView.
 
         # Alternative 11
         try:

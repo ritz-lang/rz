@@ -104,9 +104,8 @@ def build_cstring_lit(token: Token) -> ast.CStringLit:
     return ast.CStringLit(span=token.span, value=token.value)
 
 
-def build_span_string_lit(token: Token) -> ast.SpanStringLit:
-    """Build a span string literal s"..."."""
-    return ast.SpanStringLit(span=token.span, value=token.value)
+# Note: build_span_string_lit (s"...") was removed in AGAST #98 — bare
+# "..." now produces StrView which is layout-compatible with Span<u8>.
 
 
 def build_char_lit(token: Token) -> ast.CharLit:

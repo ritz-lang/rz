@@ -899,9 +899,8 @@ class ASTConverter:
             # C-string literal: c"hello" -> *u8 (null-terminated)
             return ast.CStringLit(span=span, value=token.value)
 
-        if token.kind == TokenType.SPAN_STRING:
-            # Span string literal: s"hello" -> Span<u8> { ptr, len }
-            return ast.SpanStringLit(span=span, value=token.value)
+        # Note: SPAN_STRING (s"...") was removed in AGAST #98 — bare "..."
+        # now produces StrView which is layout-compatible.
 
         if token.kind == TokenType.CHAR:
             value = token.value

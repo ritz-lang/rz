@@ -132,50 +132,25 @@ class TestCStrings:
         assert (TokenType.CSTRING, "test") in tokens
 
 
-class TestSpanStrings:
-    """Tests for Span string literals: s"..." -> Span<u8> { ptr, len }"""
+class TestSpanStringsRemoved:
+    """AGAST #98: s"..." prefix removed — a leading 's' followed by a quoted
+    string is now lexed as an ident + bare string (bare strings produce
+    StrView which is layout-compatible with the old Span<u8> semantics)."""
 
-    def test_span_string_basic(self):
+    def test_s_prefix_no_longer_produces_span_string(self):
+        # `s"hello"` lexes as IDENT('s') followed by STRING('hello').
         assert token_values('s"hello"') == [
-            (TokenType.SPAN_STRING, "hello"),
-            (TokenType.EOF, None),
-        ]
-
-    def test_span_string_empty(self):
-        assert token_values('s""') == [
-            (TokenType.SPAN_STRING, ""),
-            (TokenType.EOF, None),
-        ]
-
-    def test_span_string_escapes(self):
-        assert token_values(r's"a\nb\tc"') == [
-            (TokenType.SPAN_STRING, "a\nb\tc"),
-            (TokenType.EOF, None),
-        ]
-
-    def test_span_string_literal_braces(self):
-        """Braces in span strings are literal, not interpolation."""
-        assert token_values('s"hello {world}"') == [
-            (TokenType.SPAN_STRING, "hello {world}"),
-            (TokenType.EOF, None),
-        ]
-
-    def test_span_string_unterminated(self):
-        with pytest.raises(LexerError):
-            tokenize('s"hello')
-
-    def test_span_string_not_ident(self):
-        """s followed by non-quote is an identifier."""
-        assert token_values('s "hello"') == [
             (TokenType.IDENT, "s"),
             (TokenType.STRING, "hello"),
             (TokenType.EOF, None),
         ]
 
-    def test_span_string_in_expression(self):
-        """Span string in typical usage context."""
-        tokens = token_values('let s: Span<u8> = s"test"')
-        assert (TokenType.SPAN_STRING, "test") in tokens
+    def test_s_followed_by_space_and_string_still_tokenises(self):
+        assert token_values('s "hello"') == [
+            (TokenType.IDENT, "s"),
+            (TokenType.STRING, "hello"),
+            (TokenType.EOF, None),
+        ]
 
 
 class TestOperators:

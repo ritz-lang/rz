@@ -16,7 +16,8 @@ class TokenType(Enum):
     STRING = auto()
     INTERP_STRING = auto()  # Interpolated string: "Hello, {name}!"
     CSTRING = auto()        # C-string literal: c"hello" -> *u8 (null-terminated)
-    SPAN_STRING = auto()    # Span string literal: s"hello" -> Span<u8> { ptr, len }
+    # Note: SPAN_STRING (s"...") was removed in AGAST #98 — bare "..." now
+    # produces StrView which is layout-compatible.
     CHAR = auto()
     REGEX = auto()
 

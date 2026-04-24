@@ -678,9 +678,8 @@ class LLVMEmitter:
             return rast.NamedType(expr.span, 'StrView', [])
         elif isinstance(expr, rast.CStringLit):
             return rast.PtrType(expr.span, rast.NamedType(expr.span, 'u8', []), mutable=False)
-        elif isinstance(expr, rast.SpanStringLit):
-            # s"hello" -> Span<u8>
-            return rast.NamedType(expr.span, 'Span', [rast.NamedType(expr.span, 'u8', [])])
+        # Note: SpanStringLit (s"...") was removed in AGAST #98 — bare
+        # StringLit now produces StrView (see above).
         elif isinstance(expr, rast.NullLit):
             return rast.NamedType(expr.span, 'null', [])
         elif isinstance(expr, rast.Ident):
@@ -807,35 +806,9 @@ class LLVMEmitter:
         # Call string_from_bytes(cstr_ptr, length)
         return self.builder.call(fn, [cstr_ptr, length])
 
-    def _emit_span_string_literal(self, expr: rast.SpanStringLit) -> ir.Value:
-        """Emit a Span<u8> from a span string literal.
-
-        Converts s"hello" -> Span<u8> { ptr: @.str.0, len: 5 }
-        Zero allocation - static data with compile-time known length.
-        """
-        # Get the string constant pointer
-        gvar = self._get_string_constant(expr.value)
-        zero = ir.Constant(self.i64, 0)
-        ptr = self.builder.gep(gvar, [zero, zero])
-
-        # Compile-time length
-        length = ir.Constant(self.i64, len(expr.value))
-
-        # Get the Span<u8> struct type (monomorphized as Span$u8)
-        # Span<u8> is: { ptr: *u8, len: i64 }
-        span_type_name = "Span$u8"
-        if span_type_name in self.struct_types:
-            span_type = self.struct_types[span_type_name]
-        else:
-            # Create inline literal struct type if Span$u8 not defined
-            # This allows span strings to work without importing ritzlib.span
-            span_type = ir.LiteralStructType([self.i8.as_pointer(), self.i64])
-
-        # Build the Span struct value
-        span = self.builder.insert_value(ir.Constant(span_type, ir.Undefined), ptr, 0)
-        span = self.builder.insert_value(span, length, 1)
-
-        return span
+    # Note: _emit_span_string_literal (s"...") was removed in AGAST #98 —
+    # bare StringLit now emits a StrView (same { ptr, len } shape) via
+    # _emit_strview_string_literal below.
 
     def _emit_strview_string_literal(self, expr: rast.StringLit) -> ir.Value:
         """Emit a StrView from a string literal (RERITZ mode).
@@ -4617,9 +4590,8 @@ class LLVMEmitter:
             zero = ir.Constant(self.i64, 0)
             return self.builder.gep(gvar, [zero, zero])
 
-        elif isinstance(expr, rast.SpanStringLit):
-            # Span string literal: s"hello" -> Span<u8> { ptr, len }
-            return self._emit_span_string_literal(expr)
+        # Note: SpanStringLit (s"...") was removed in AGAST #98 — bare
+        # StringLit (above) emits a StrView of the same shape.
 
         elif isinstance(expr, rast.InterpString):
             # Interpolated strings are currently only supported as expression statements
@@ -5907,7 +5879,7 @@ class LLVMEmitter:
 
         # Literals don't have free variables
         elif isinstance(expr, (rast.IntLit, rast.FloatLit, rast.StringLit,
-                               rast.CStringLit, rast.SpanStringLit, rast.CharLit,
+                               rast.CStringLit, rast.CharLit,
                                rast.BoolLit, rast.NullLit)):
             pass
 

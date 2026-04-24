@@ -876,10 +876,8 @@ class Parser:
             self._advance()
             return rast.CStringLit(span, tok.value)
 
-        # Span string literal: s"..."
-        if self._at(TokenType.SPAN_STRING):
-            self._advance()
-            return rast.SpanStringLit(span, tok.value)
+        # Note: s"..." (SPAN_STRING) was removed in AGAST #98 — bare "..."
+        # now produces StrView which is layout-compatible.
 
         # Interpolated string literal
         if self._at(TokenType.INTERP_STRING):

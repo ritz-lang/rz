@@ -337,54 +337,6 @@ class Lexer:
 
         return Token(TokenType.CSTRING, ''.join(chars), start_span)
 
-    def _lex_span_string(self) -> Token:
-        """Lex a span string literal: s"...".
-
-        Span strings produce Span<u8> { ptr: *u8, len: i64 } with compile-time length.
-        They do NOT support interpolation.
-        """
-        start_span = self._span()
-        self._advance()  # consume 's'
-        self._advance()  # consume opening '"'
-        chars = []
-
-        while True:
-            ch = self._peek()
-            if ch == '\0' or ch == '\n':
-                raise LexerError("Unterminated span string literal", start_span)
-            if ch == '"':
-                self._advance()
-                break
-            if ch == '\\':
-                self._advance()
-                escape = self._peek()
-                if escape == 'n':
-                    chars.append('\n')
-                elif escape == 't':
-                    chars.append('\t')
-                elif escape == 'r':
-                    chars.append('\r')
-                elif escape == '\\':
-                    chars.append('\\')
-                elif escape == '"':
-                    chars.append('"')
-                elif escape == "'":
-                    chars.append("'")
-                elif escape == '0':
-                    chars.append('\0')
-                else:
-                    raise LexerError(f"Unknown escape sequence '\\{escape}'", self._span())
-                self._advance()
-            elif ch == '{':
-                # No interpolation in span strings - just literal braces
-                chars.append(ch)
-                self._advance()
-            else:
-                chars.append(ch)
-                self._advance()
-
-        return Token(TokenType.SPAN_STRING, ''.join(chars), start_span)
-
     def _lex_number(self) -> Token:
         """Lex a number literal (int or float)."""
         start_span = self._span()
@@ -654,11 +606,8 @@ class Lexer:
             self.last_token_type = tok.type
             return tok
 
-        # Span string literal: s"..."
-        if ch == 's' and self._peek(1) == '"':
-            tok = self._lex_span_string()
-            self.last_token_type = tok.type
-            return tok
+        # Note: s"..." (Span string) was removed in AGAST #98 — bare "..."
+        # now produces StrView which is layout-compatible.
 
         # Identifier or keyword
         if ch.isalpha() or ch == '_':

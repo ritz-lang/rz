@@ -1,7 +1,7 @@
 """
 Literal and constructor emission mixin for the LLVM emitter.
 
-Contains: _get_string_constant, _emit_string_from_literal, _emit_span_string_literal,
+Contains: _get_string_constant, _emit_string_from_literal,
           _emit_strview_string_literal, _coerce_string_to_u8_ptr,
           _emit_array_lit, _emit_array_fill, _emit_array_fill_to_alloca,
           _emit_memset, _emit_fill_loop, _emit_array_convert_loop,
@@ -59,35 +59,9 @@ class LiteralEmitterMixin:
         return self.builder.call(fn, [cstr_ptr, length])
 
 
-    def _emit_span_string_literal(self, expr: rast.SpanStringLit) -> ir.Value:
-        """Emit a Span<u8> from a span string literal.
-
-        Converts s"hello" -> Span<u8> { ptr: @.str.0, len: 5 }
-        Zero allocation - static data with compile-time known length.
-        """
-        # Get the string constant pointer
-        gvar = self._get_string_constant(expr.value)
-        zero = ir.Constant(self.i64, 0)
-        ptr = self.builder.gep(gvar, [zero, zero])
-
-        # Compile-time length
-        length = ir.Constant(self.i64, len(expr.value))
-
-        # Get the Span<u8> struct type (monomorphized as Span$u8)
-        # Span<u8> is: { ptr: *u8, len: i64 }
-        span_type_name = "Span$u8"
-        if span_type_name in self.struct_types:
-            span_type = self.struct_types[span_type_name]
-        else:
-            # Create inline literal struct type if Span$u8 not defined
-            # This allows span strings to work without importing ritzlib.span
-            span_type = ir.LiteralStructType([self.i8.as_pointer(), self.i64])
-
-        # Build the Span struct value
-        span = self.builder.insert_value(ir.Constant(span_type, ir.Undefined), ptr, 0)
-        span = self.builder.insert_value(span, length, 1)
-
-        return span
+    # Note: _emit_span_string_literal (s"...") was removed in AGAST #98 —
+    # bare StringLit now emits a StrView via _emit_strview_string_literal
+    # below, which has the same { ptr, len } shape.
 
 
     def _emit_strview_string_literal(self, expr: rast.StringLit) -> ir.Value:

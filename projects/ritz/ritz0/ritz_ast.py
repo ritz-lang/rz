@@ -230,14 +230,8 @@ class CStringLit(Expr):
     value: str
 
 
-@dataclass
-class SpanStringLit(Expr):
-    """Span string literal: s"hello".
-
-    Produces Span<u8> type { ptr: *u8, len: i64 } with compile-time length.
-    Does not support interpolation. Zero allocation (static data).
-    """
-    value: str
+# Note: SpanStringLit (s"...") was removed in AGAST #98 — bare StringLit now
+# produces StrView which is layout-compatible with the old Span<u8> semantics.
 
 
 @dataclass

@@ -447,33 +447,25 @@ fn main() -> i32
         assert len(errors) == 0
 
 
-class TestSpanStringLiterals:
-    """Test span string literal type checking: s"..." -> Span<u8>"""
+# AGAST #98: s"..." was removed. Bare "..." now produces StrView (which has
+# the same { ptr, len } shape as Span<u8>) so the old TestSpanStringLiterals
+# class is obsolete. Coverage for bare-string → StrView typing lives in
+# test_sstring.ritz (the surviving file name is a historical artefact) and
+# the unit tests below.
 
-    def test_span_string_produces_span_u8(self):
-        """s"..." should produce Span<u8> type."""
-        # Note: This currently requires Span<u8> to be defined or builtin.
-        # For now we just test that the syntax parses and type checks.
+
+class TestStrViewLiteralType:
+    """Bare "..." should infer as StrView under AGAST #98."""
+
+    def test_bare_string_infers_strview(self):
+        """A bare literal assigned to an implicit `let` gets StrView."""
         errors = check("""
-struct Span<T>
-    ptr: *T
+struct StrView
+    ptr: *u8
     len: i64
 
 fn main() -> i32
-    let s: Span<u8> = s"hello"
-    return 0
-""")
-        assert len(errors) == 0
-
-    def test_span_string_empty(self):
-        """Empty span string should also work."""
-        errors = check("""
-struct Span<T>
-    ptr: *T
-    len: i64
-
-fn main() -> i32
-    let s: Span<u8> = s""
+    let s: StrView = "hello"
     return 0
 """)
         assert len(errors) == 0

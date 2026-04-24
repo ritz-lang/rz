@@ -37,9 +37,8 @@ class ExprEmitterMixin:
             zero = ir.Constant(self.i64, 0)
             return self.builder.gep(gvar, [zero, zero])
 
-        elif isinstance(expr, rast.SpanStringLit):
-            # Span string literal: s"hello" -> Span<u8> { ptr, len }
-            return self._emit_span_string_literal(expr)
+        # Note: SpanStringLit (s"...") was removed in AGAST #98 — bare
+        # StringLit now emits a StrView aggregate of the same shape.
 
         elif isinstance(expr, rast.InterpString):
             # Interpolated strings are currently only supported as expression statements
@@ -745,7 +744,7 @@ class ExprEmitterMixin:
 
         # Literals don't have free variables
         elif isinstance(expr, (rast.IntLit, rast.FloatLit, rast.StringLit,
-                               rast.CStringLit, rast.SpanStringLit, rast.CharLit,
+                               rast.CStringLit, rast.CharLit,
                                rast.BoolLit, rast.NullLit)):
             pass
 

@@ -189,15 +189,14 @@ class MoveChecker:
         elif isinstance(expr, rast.CharLit):
             return rast.NamedType(expr.span, 'u8', [])
         elif isinstance(expr, rast.StringLit):
-            # String literals produce String type (Issue #89 Phase 3)
-            # String is NOT Copy - needs ownership tracking
-            return rast.NamedType(expr.span, 'String', [])
+            # Bare string literals produce StrView (AGAST #98).
+            # StrView is Copy (ptr + len view, no ownership).
+            return rast.NamedType(expr.span, 'StrView', [])
         elif isinstance(expr, rast.CStringLit):
             # C-string literals: c"hello" -> *u8 (Copy)
             return rast.PtrType(expr.span, rast.NamedType(expr.span, 'u8', []), mutable=False)
-        elif isinstance(expr, rast.SpanStringLit):
-            # Span string literals: s"hello" -> Span<u8> (Copy - it's just ptr + len)
-            return rast.NamedType(expr.span, 'Span', [rast.NamedType(expr.span, 'u8', [])])
+        # Note: SpanStringLit (s"...") was removed in AGAST #98 — bare
+        # StringLit now produces StrView of the same { ptr, len } shape.
         elif isinstance(expr, rast.NullLit):
             # Null is a special pointer type (Copy)
             return rast.PtrType(expr.span, rast.NamedType(expr.span, 'void', []), mutable=False)
@@ -577,7 +576,7 @@ class MoveChecker:
 
         # Literals don't have ownership concerns
         elif isinstance(expr, (rast.IntLit, rast.FloatLit, rast.StringLit,
-                               rast.CStringLit, rast.SpanStringLit, rast.BoolLit, rast.CharLit)):
+                               rast.CStringLit, rast.BoolLit, rast.CharLit)):
             pass
 
     def _check_borrow(self, expr: rast.Expr, mutable: bool, span: rast.Span):

@@ -340,10 +340,8 @@ class TypeChecker:
             # C-string literals: c"hello" -> *u8 (null-terminated)
             return rast.PtrType(expr.span, rast.NamedType(expr.span, 'u8', []), mutable=False)
 
-        elif isinstance(expr, rast.SpanStringLit):
-            # Span string literals: s"hello" -> Span<u8> { ptr, len }
-            # Generic type Span with u8 type argument
-            return rast.NamedType(expr.span, 'Span', [rast.NamedType(expr.span, 'u8', [])])
+        # Note: SpanStringLit (s"...") was removed in AGAST #98 — bare
+        # StringLit now produces StrView which is layout-compatible.
 
         elif isinstance(expr, rast.NullLit):
             # Null is a special pointer type compatible with any pointer
