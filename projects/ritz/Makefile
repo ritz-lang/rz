@@ -13,7 +13,7 @@
 #   make build-<name>  - Build a specific package
 #   make test-<name>   - Build and test a specific package
 
-.PHONY: all test unit ritz ritz1 build clean list help valgrind regression regression-quick
+.PHONY: all test unit ritz ritz1 build clean list help valgrind regression regression-quick check-no-s-strings
 
 PYTHON ?= python3
 VALGRIND ?= valgrind --error-exitcode=1 --leak-check=full -q
@@ -26,8 +26,18 @@ export RITZ_PATH := $(ROOT)
 all: test
 
 # Run everything
-test: unit ritz ritz1 examples
+# AGAST #98: check-no-s-strings runs first so any resurrected s"..." literal
+# fails CI before we burn compile cycles on it.
+test: check-no-s-strings unit ritz ritz1 examples
 	@echo "✓ All tests passed!"
+
+# AGAST #98 guard: ensure no s"..." span-string literals leak back in.
+# The prefix was removed after bare "..." was flipped to StrView (same
+# { ptr, len } shape), so any new s"..." is either dead syntax or a
+# regression. docs/archive/ is excluded (frozen snapshots).
+check-no-s-strings:
+	@echo "=== Checking no s\"...\" literals remain ==="
+	@$(PYTHON) tools/check_no_s_strings.py .
 
 # Python unit tests for ritz0 compiler
 unit:
@@ -108,6 +118,7 @@ help:
 	@echo "  make valgrind - Run valgrind memory checks on Tier 1 examples"
 	@echo "  make regression       - Full regression suite (all 4 tiers)"
 	@echo "  make regression-quick - Quick regression (skip bootstrap)"
+	@echo "  make check-no-s-strings - Guard that no s\"...\" literals leak back in"
 	@echo ""
 	@echo "Individual packages:"
 	@echo "  make build-<name>  - Build a specific package"
