@@ -48,6 +48,19 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
                     stmt.var_type = TYPE_STRUCT
                     stmt.var_type_name = fn_def.return_type_name
                     stmt.var_type_name_len = fn_def.return_type_name_len
+        # task-103: same widening for `let w = Wrap { ... }`. Without this,
+        # var_type stays TYPE_I64 → alloca i64 (8 bytes) instead of %Wrap,
+        # AND w isn't registered with add_local_struct, so later
+        # `w.field` lookups via find_local_struct_name miss → emit_member_ptr
+        # fails → "; ERROR: unhandled EXPR_MEMBER".
+        else if stmt.var_init.kind == EXPR_STRUCT_LIT
+            if stmt.var_init.ident_ptr != null and stmt.var_init.ident_len > 0
+                let lit_st: *StructDef = find_struct(s, stmt.var_init.ident_ptr, stmt.var_init.ident_len)
+                if lit_st != null
+                    var_type = TYPE_STRUCT
+                    stmt.var_type = TYPE_STRUCT
+                    stmt.var_type_name = stmt.var_init.ident_ptr
+                    stmt.var_type_name_len = stmt.var_init.ident_len
 
     let alloca_reg: i32 = next_reg(s)
     emit_str(s, c"  ")
@@ -150,6 +163,17 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
                             emit_str(s, c" to ptr\n")
                             emit_str(s, c"  store ptr ")
                             emit_reg(s, ptr_val)
+                            emit_str(s, c", ptr ")
+                            emit_reg(s, field_ptr)
+                            emit_str(s, c"\n")
+                        else if field.field_type == TYPE_STRUCT and field.field_type_name_len > 0
+                            # task-103: struct-by-value field (e.g. `Vec$T` in `Wrap`).
+                            # val_reg is the loaded aggregate (`%Vec$T`), not an i64.
+                            # Emit `store %TypeName %val, ptr %field_ptr`.
+                            emit_str(s, c"  store %")
+                            emit_name(s, field.field_type_name, field.field_type_name_len)
+                            emit_str(s, c" ")
+                            emit_reg(s, val_reg)
                             emit_str(s, c", ptr ")
                             emit_reg(s, field_ptr)
                             emit_str(s, c"\n")
