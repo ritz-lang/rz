@@ -726,6 +726,30 @@ fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
                     converted_regs[j] = cast
                 else
                     converted_regs[j] = arg_regs[j]
+            else if param_ptr.param_type == TYPE_REF and param_ptr.param_type_name_len > 0
+                # AGAST #113 — auto-borrow: @Struct param + Struct-valued ident
+                # actual. Callsite emits `i64` for TYPE_REF, but emit_expr of a
+                # struct ident loaded `%Struct`. Take the local slot's address
+                # as i64 instead (the load is left orphaned — harmless).
+                var ref_arg: *Expr = e.args
+                var rk: i32 = 0
+                while rk < j and ref_arg != null
+                    ref_arg = ref_arg.next
+                    rk = rk + 1
+                var ref_done: i32 = 0
+                if ref_arg != null and ref_arg.kind == EXPR_IDENT
+                    let ref_loc: *LocalVar = find_local_struct_name(s, ref_arg.ident_ptr, ref_arg.ident_len)
+                    if ref_loc != null and ref_loc.var_type == TYPE_STRUCT
+                        let pti_r: i32 = next_reg(s)
+                        emit_str(s, c"  ")
+                        emit_reg(s, pti_r)
+                        emit_str(s, c" = ptrtoint ptr ")
+                        emit_reg(s, ref_loc.reg)
+                        emit_str(s, c" to i64\n")
+                        converted_regs[j] = pti_r
+                        ref_done = 1
+                if ref_done == 0
+                    converted_regs[j] = arg_regs[j]
             else if param_ptr.param_type == TYPE_BOOL
                 # Callee expects i1. Bool-typed arg exprs (direct ident load)
                 # are already i1; other arg exprs (literal true/false, which
@@ -1339,38 +1363,141 @@ fn emit_expr_method(s: *EmitterState, e: *Expr) -> i32
         return ufcs
 
     # Fallback: Build mangled function name: Type_method
-    # Emit: call i64 @Type_method(ptr %receiver, args...)
+    # Emit: call <rt> @Type_method(ptr %receiver, args...)
+    #
+    # AGAST #113 — walk the impl blocks to find the method's FnDef so we can
+    # coerce struct-ref args (auto-borrow) and narrow non-i64 return values.
+    # Without the FnDef, fall back to the pre-#113 `call i64 @...(i64 ...)`.
+    var mfn: *FnDef = null
+    var ib_it: *ImplBlock = s.module.impls
+    while ib_it != null and mfn == null
+        if ib_it.type_name_len == type_name_len
+            var ib_match: i32 = 1
+            for i in 0..type_name_len
+                if *(ib_it.type_name + i) != *(type_name + i)
+                    ib_match = 0
+            if ib_match == 1
+                var mm: *FnDef = ib_it.methods
+                while mm != null and mfn == null
+                    if mm.name_len == e.ident_len
+                        var name_match: i32 = 1
+                        for i in 0..e.ident_len
+                            if *(mm.name + i) != *(e.ident_ptr + i)
+                                name_match = 0
+                        if name_match == 1
+                            mfn = mm
+                    mm = mm.next
+        ib_it = ib_it.next
 
     # First, evaluate all arguments and collect their registers
     var arg_regs: [16]i32
+    var conv_regs: [16]i32
     var arg_count: i32 = 0
     var arg: *Expr = e.args
     while arg != null
         arg_regs[arg_count] = emit_expr(s, arg)
+        conv_regs[arg_count] = arg_regs[arg_count]
         arg_count = arg_count + 1
         arg = arg.next
 
-    # Now emit the call instruction
+    # Arg coerce — walk params (skip self) and auto-borrow struct-ref args.
+    var mp: *Param = null
+    if mfn != null
+        mp = mfn.params
+        if mp != null
+            mp = mp.next
+    for j in 0..arg_count
+        if mp != null
+            if mp.param_type == TYPE_REF and mp.param_type_name_len > 0
+                var mae: *Expr = e.args
+                var mk: i32 = 0
+                while mk < j and mae != null
+                    mae = mae.next
+                    mk = mk + 1
+                if mae != null and mae.kind == EXPR_IDENT
+                    let mloc: *LocalVar = find_local_struct_name(s, mae.ident_ptr, mae.ident_len)
+                    if mloc != null and mloc.var_type == TYPE_STRUCT
+                        let pti_m: i32 = next_reg(s)
+                        emit_str(s, c"  ")
+                        emit_reg(s, pti_m)
+                        emit_str(s, c" = ptrtoint ptr ")
+                        emit_reg(s, mloc.reg)
+                        emit_str(s, c" to i64\n")
+                        conv_regs[j] = pti_m
+            mp = mp.next
+
+    var rtype: i32 = TYPE_I64
+    if mfn != null
+        rtype = mfn.return_type
+
+    # Emit the call with the correct return type keyword.
     let result: i32 = next_reg(s)
     emit_str(s, c"  ")
     emit_reg(s, result)
-    emit_str(s, c" = call i64 @")
+    if rtype == TYPE_BOOL
+        emit_str(s, c" = call i1 @")
+    else if rtype == TYPE_I32 or rtype == TYPE_U32
+        emit_str(s, c" = call i32 @")
+    else if rtype == TYPE_I16 or rtype == TYPE_U16
+        emit_str(s, c" = call i16 @")
+    else if rtype == TYPE_I8 or rtype == TYPE_U8
+        emit_str(s, c" = call i8 @")
+    else
+        emit_str(s, c" = call i64 @")
     emit_name(s, type_name, type_name_len)
     emit_str(s, c"_")
     emit_name(s, e.ident_ptr, e.ident_len)
     emit_str(s, c"(ptr ")
     emit_reg(s, receiver_reg)
 
-    # Emit the collected argument registers
-    var i: i32 = 0
-    while i < arg_count
-        emit_str(s, c", i64 ")
-        emit_reg(s, arg_regs[i])
-        i = i + 1
+    # Emit args with formal types (or i64 fallback when fn_def missing).
+    var mp2: *Param = null
+    if mfn != null
+        mp2 = mfn.params
+        if mp2 != null
+            mp2 = mp2.next
+    for j in 0..arg_count
+        emit_str(s, c", ")
+        if mp2 != null
+            emit_llvm_type_struct(s, mp2.param_type, mp2.param_type_name, mp2.param_type_name_len)
+            mp2 = mp2.next
+        else
+            emit_str(s, c"i64")
+        emit_str(s, c" ")
+        emit_reg(s, conv_regs[j])
     emit_str(s, c")\n")
 
-    # Add method to extern declarations (uses malloc for stable name storage)
-    add_method_extern(s, type_name, type_name_len, e.ident_ptr, e.ident_len)
+    # Add method to extern declarations (uses malloc for stable name storage).
+    # When mfn is non-null the method is defined in this module, so emitting
+    # an extern `declare i64 @...` would conflict with the `define <rt> @...`
+    # local body — skip it.
+    if mfn == null
+        add_method_extern(s, type_name, type_name_len, e.ident_ptr, e.ident_len)
+
+    # Return narrow — extend smaller returns back to i64 so consumers see i64.
+    var nw_op: *u8 = null
+    if rtype == TYPE_BOOL
+        nw_op = c" = zext i1 "
+    else if rtype == TYPE_I32
+        nw_op = c" = sext i32 "
+    else if rtype == TYPE_U32
+        nw_op = c" = zext i32 "
+    else if rtype == TYPE_I16
+        nw_op = c" = sext i16 "
+    else if rtype == TYPE_U16
+        nw_op = c" = zext i16 "
+    else if rtype == TYPE_I8
+        nw_op = c" = sext i8 "
+    else if rtype == TYPE_U8
+        nw_op = c" = zext i8 "
+    if nw_op != null
+        let ext: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, ext)
+        emit_str(s, nw_op)
+        emit_reg(s, result)
+        emit_str(s, c" to i64\n")
+        return ext
 
     return result
 
