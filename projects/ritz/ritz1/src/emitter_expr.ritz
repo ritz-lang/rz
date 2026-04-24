@@ -255,6 +255,141 @@ fn emit_member_ptr(s: *EmitterState, e: *Expr, result: *MemberPtrResult)
 
 
 # =============================================================================
+# Tagged-enum is_ok / is_err / is_some / is_none inline (AGAST #134 companion)
+# =============================================================================
+
+# Inline `.is_ok()` / `.is_err()` / `.is_some()` / `.is_none()` for Result$/
+# Option$ receivers. Ritzlib's `result_is_ok<T,E>` is generic and isn't
+# monomorphized in isolation, so without inlining the method resolves to an
+# undefined extern. This mirrors try_emit_enum_unwrap's packed-i64 contract.
+# Returns i64 register on success, -1 to fall through to emit_expr_method.
+fn try_emit_enum_is_ok(s: *EmitterState, e: *Expr) -> i32
+    # Receiver must be an ident bound to a Result$/Option$ local.
+    if e.left == null
+        return 0 - 1
+    if e.left.kind != EXPR_IDENT
+        return 0 - 1
+    let loc: *LocalVar = find_local_struct_name(s, e.left.ident_ptr, e.left.ident_len)
+    if loc == null
+        return 0 - 1
+    if is_tagged_enum_type(loc.type_name, loc.type_name_len) == 0
+        return 0 - 1
+
+    # Identify which predicate — only 0-arg forms apply.
+    if e.args != null
+        return 0 - 1
+    var want_carrier: i32 = 0 - 1   # 1 = is_ok/is_some, 0 = is_err/is_none
+    if e.ident_len == 5
+        # "is_ok" = 105 115 95 111 107
+        if *(e.ident_ptr + 0) == 105 and *(e.ident_ptr + 1) == 115 and *(e.ident_ptr + 2) == 95 and *(e.ident_ptr + 3) == 111 and *(e.ident_ptr + 4) == 107
+            want_carrier = 1
+    if e.ident_len == 6
+        # "is_err" / "is_err" = 105 115 95 101 114 114
+        if *(e.ident_ptr + 0) == 105 and *(e.ident_ptr + 1) == 115 and *(e.ident_ptr + 2) == 95 and *(e.ident_ptr + 3) == 101 and *(e.ident_ptr + 4) == 114 and *(e.ident_ptr + 5) == 114
+            want_carrier = 0
+    if e.ident_len == 7
+        # "is_some" = 105 115 95 115 111 109 101
+        if *(e.ident_ptr + 0) == 105 and *(e.ident_ptr + 1) == 115 and *(e.ident_ptr + 2) == 95 and *(e.ident_ptr + 3) == 115 and *(e.ident_ptr + 4) == 111 and *(e.ident_ptr + 5) == 109 and *(e.ident_ptr + 6) == 101
+            want_carrier = 1
+        # "is_none" = 105 115 95 110 111 110 101
+        if *(e.ident_ptr + 0) == 105 and *(e.ident_ptr + 1) == 115 and *(e.ident_ptr + 2) == 95 and *(e.ident_ptr + 3) == 110 and *(e.ident_ptr + 4) == 111 and *(e.ident_ptr + 5) == 110 and *(e.ident_ptr + 6) == 101
+            want_carrier = 0
+    if want_carrier < 0
+        return 0 - 1
+
+    # Load i64 value from receiver slot. Pointer-typed locals (*T, @T) store
+    # a pointer, so dereference first.
+    var ptr_reg: i32 = loc.reg
+    if loc.var_type == TYPE_PTR or loc.var_type == TYPE_REF or loc.var_type == TYPE_MUT_REF
+        ptr_reg = emit_load_ptr(s, loc.reg)
+    let v: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, v)
+    emit_str(s, c" = load i64, ptr ")
+    emit_reg(s, ptr_reg)
+    emit_str(s, c"\n")
+
+    # Compare against the tag bit (1 << 48). uge => carrier; ult => null.
+    let cmp: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, cmp)
+    if want_carrier == 1
+        emit_str(s, c" = icmp uge i64 ")
+    else
+        emit_str(s, c" = icmp ult i64 ")
+    emit_reg(s, v)
+    emit_str(s, c", 281474976710656  ; is_ok/is_err tag check\n")
+    let wide: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, wide)
+    emit_str(s, c" = zext i1 ")
+    emit_reg(s, cmp)
+    emit_str(s, c" to i64\n")
+    return wide
+
+# =============================================================================
+# Try operator (AGAST #134)
+# =============================================================================
+
+# Lower `expr?`:
+#   * On Some/Ok: extract 48-bit payload, continue with that value.
+#   * On None/Err: early-return the raw i64 back to the caller.
+#
+# Ritz1 packs tagged enums (Result$/Option$) into a single i64:
+#   tag==1 payload  → Some(x) / Ok(x) : (1 << 48) | (x & 0xFFFFFFFFFFFF)
+#   tag==0 payload  → None / Err(x)   : (x & 0xFFFFFFFFFFFF)
+# (See is_variant_carrier + try_emit_enum_unwrap in emitter_expr_call.ritz.)
+# Because the enclosing function's return type is also Result$/Option$ with
+# the same error payload, the Err/None encoding is identical — we can
+# `ret i64 %value` directly without a rebuild step. When AGAST #133
+# swaps the representation to `{ i8 tag, <payload> }`, this function
+# needs the corresponding extractvalue/insertvalue update.
+fn emit_expr_try(s: *EmitterState, e: *Expr) -> i32
+    # Evaluate the inner Result/Option.
+    let value: i32 = emit_expr(s, e.left)
+
+    # Tag check: value >= (1 << 48) means Some/Ok (carrier variant).
+    let tag_ok: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, tag_ok)
+    emit_str(s, c" = icmp uge i64 ")
+    emit_reg(s, value)
+    emit_str(s, c", 281474976710656  ; try: tag == carrier\n")
+
+    let ok_label: i32 = next_label(s)
+    let err_label: i32 = next_label(s)
+
+    emit_str(s, c"  br i1 ")
+    emit_reg(s, tag_ok)
+    emit_str(s, c", label %")
+    emit_label(s, ok_label)
+    emit_str(s, c", label %")
+    emit_label(s, err_label)
+    emit_str(s, c"\n")
+
+    # None/Err branch: propagate via early return. The enclosing function
+    # must also return Result$/Option$ with a matching error type, so the
+    # i64 representation of Err(e) / None is preserved verbatim.
+    emit_label(s, err_label)
+    emit_str(s, c":\n")
+    emit_str(s, c"  ret i64 ")
+    emit_reg(s, value)
+    emit_str(s, c"\n")
+
+    # Ok/Some branch: unmask payload and continue with it. Callers see the
+    # payload register as the value of the `?` expression.
+    emit_label(s, ok_label)
+    emit_str(s, c":\n")
+    s.current_label = ok_label
+    let payload: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, payload)
+    emit_str(s, c" = and i64 ")
+    emit_reg(s, value)
+    emit_str(s, c", 281474976710655  ; try: unwrap payload\n")
+    return payload
+
+# =============================================================================
 # Expression Emission - Single function to avoid mutual recursion
 # =============================================================================
 
@@ -373,11 +508,21 @@ fn emit_expr(s: *EmitterState, e: *Expr) -> i32
     else if e.kind == EXPR_MEMBER
         return emit_expr_member(s, e)
     else if e.kind == EXPR_METHOD
+        # Inline predicate intrinsics for Result$/Option$ (AGAST #134): the
+        # ritzlib `result_is_ok<T,E>` / `option_is_some<T>` generics aren't
+        # monomorphized in isolation, so method dispatch would resolve to an
+        # undefined extern. Fall through to emit_expr_method for anything
+        # that isn't a tagged-enum predicate.
+        let pred_reg: i32 = try_emit_enum_is_ok(s, e)
+        if pred_reg >= 0
+            return pred_reg
         return emit_expr_method(s, e)
     else if e.kind == EXPR_MATCH
         # Match expression — scrutinee in `left`, arms in `args` (recast).
         let arms: *MatchArm = e.args as *MatchArm
         return emit_match(s, e.left, arms)
+    else if e.kind == EXPR_TRY
+        return emit_expr_try(s, e)
 
     else if e.kind == EXPR_ARRAY_LIT
         # Array literal: [e1, e2, ...] — materialize an `alloca [N x i64]`
