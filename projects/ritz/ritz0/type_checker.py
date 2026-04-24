@@ -330,9 +330,11 @@ class TypeChecker:
             return rast.NamedType(expr.span, 'u8', [])
 
         elif isinstance(expr, rast.StringLit):
-            # String literals produce String type (Issue #89 Phase 3)
-            # Use c"..." for *u8 (C-string) literals
-            return rast.NamedType(expr.span, 'String', [])
+            # Bare string literals produce StrView (AGAST #98, Wave 3).
+            # `"hello"` is a zero-copy view { ptr, len }. Use `c"..."` for
+            # null-terminated *u8, and call a `String` constructor explicitly
+            # for a heap-owned String.
+            return rast.NamedType(expr.span, 'StrView', [])
 
         elif isinstance(expr, rast.CStringLit):
             # C-string literals: c"hello" -> *u8 (null-terminated)
