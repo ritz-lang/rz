@@ -63,6 +63,23 @@ fn p_current_token(p: *Parser) -> Token
         return eof
     return *(p.tokens + p.pos)
 
+# AGAST #107: return the digit-only length of an integer-literal token,
+# trimming the optional `[uUiI](8|16|32|64|size)` typed suffix absorbed by
+# the lexer. Scans left-to-right and stops at the first u/U/i/I that
+# appears after at least one leading digit-or-prefix char. Hex/binary
+# prefixes (`0x`, `0b`) are preserved because 'x'/'b'/'X'/'B' are not
+# treated as suffix markers here.
+fn int_lit_len(start: *u8, len: i32) -> i32
+    var si: i32 = 0
+    while si < len
+        let sc: i32 = *(start + si) as i32
+        # 'u'=117 'U'=85 'i'=105 'I'=73 — suffix only after at least one
+        # preceding digit/prefix char (si > 0).
+        if si > 0 and (sc == 117 or sc == 85 or sc == 105 or sc == 73)
+            return si
+        si = si + 1
+    return len
+
 fn parse_module(p: *Parser) -> *Module
     let start_pos: i32 = p.pos
 
@@ -4184,7 +4201,9 @@ fn parse_primary_expr(p: *Parser) -> *Expr
         p.error = 1
         p.pos = start_pos
     if p.error == 0
-        return expr_int(p, parse_int(result_a1_1.start, result_a1_1.len), result_a1_1.line, result_a1_1.col)
+        # AGAST #107: trim optional typed integer-literal suffix before
+        # parse_int so `0u8` / `123u16` / `0usize` produce the correct value.
+        return expr_int(p, parse_int(result_a1_1.start, int_lit_len(result_a1_1.start, result_a1_1.len)), result_a1_1.line, result_a1_1.col)
 
     # Try next alternative
     p.pos = start_pos
@@ -4811,7 +4830,8 @@ fn parse_pattern(p: *Parser) -> *MatchArm
     # Integer literal pattern
     if tok.kind == TOK_NUMBER
         p_advance(p)
-        return match_arm_int(p, parse_int(tok.start, tok.len))
+        # AGAST #107: strip typed-suffix before parsing digit value.
+        return match_arm_int(p, parse_int(tok.start, int_lit_len(tok.start, tok.len)))
 
     # Negative integer literal pattern: `-NUMBER`
     if tok.kind == TOK_MINUS
@@ -4819,7 +4839,7 @@ fn parse_pattern(p: *Parser) -> *MatchArm
         let num: Token = p_current_token(p)
         if num.kind == TOK_NUMBER
             p_advance(p)
-            return match_arm_int(p, 0 - parse_int(num.start, num.len))
+            return match_arm_int(p, 0 - parse_int(num.start, int_lit_len(num.start, num.len)))
         p.error = 1
         return null
 

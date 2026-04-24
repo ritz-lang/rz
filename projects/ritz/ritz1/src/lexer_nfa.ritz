@@ -442,6 +442,59 @@ fn lexer_next(lex: *Lexer) -> Token
       lex.col = lex.col + best_len
       continue
 
+    # AGAST #107: typed integer-literal suffix.
+    # Absorb optional `[uUiI](8|16|32|64|size)` after a TOK_NUMBER so that
+    # `0u8`, `123u16`, `0usize`, `0x10i32` lex as one number token. The
+    # suffix is only consumed when not followed by another alnum/underscore
+    # char (so `5usize_max` stays split as `5` + ident).
+    # parse_int() (ast_helpers) still sees the suffix chars, so the parse
+    # site uses int_lit_len() to trim the suffix before parsing digits.
+    if best_type == TOK_NUMBER
+      let sfx_pos: i64 = lex.pos + best_len
+      if sfx_pos < lex.len
+        let s0: i32 = *(lex.src + sfx_pos) & 255
+        # 'u'=117, 'U'=85, 'i'=105, 'I'=73
+        if s0 == 117 or s0 == 85 or s0 == 105 or s0 == 73
+          var ext: i32 = 0
+          # "size" (4 chars after prefix)
+          if sfx_pos + 4 < lex.len
+            let c1: i32 = *(lex.src + sfx_pos + 1) & 255
+            let c2: i32 = *(lex.src + sfx_pos + 2) & 255
+            let c3: i32 = *(lex.src + sfx_pos + 3) & 255
+            let c4: i32 = *(lex.src + sfx_pos + 4) & 255
+            # 's'=115, 'i'=105, 'z'=122, 'e'=101
+            if c1 == 115 and c2 == 105 and c3 == 122 and c4 == 101
+              ext = 5
+          # "16" | "32" | "64" (2 chars after prefix)
+          if ext == 0 and sfx_pos + 2 < lex.len
+            let c1: i32 = *(lex.src + sfx_pos + 1) & 255
+            let c2: i32 = *(lex.src + sfx_pos + 2) & 255
+            # '1'=49 '6'=54 | '3'=51 '2'=50 | '6'=54 '4'=52
+            if c1 == 49 and c2 == 54
+              ext = 3
+            else if c1 == 51 and c2 == 50
+              ext = 3
+            else if c1 == 54 and c2 == 52
+              ext = 3
+          # "8" (1 char after prefix)
+          if ext == 0 and sfx_pos + 1 < lex.len
+            let c1: i32 = *(lex.src + sfx_pos + 1) & 255
+            if c1 == 56  # '8'
+              ext = 2
+          # Edge case: suffix at very end of buffer. sfx_pos+1 == lex.len
+          # means the prefix char itself is the last byte — not a suffix.
+          if ext > 0
+            let after: i64 = sfx_pos + ext
+            var ok: i32 = 1
+            if after < lex.len
+              let ac: i32 = *(lex.src + after) & 255
+              # a-z, A-Z, 0-9, or '_' → suffix is actually part of a
+              # longer identifier like `usize_max`; don't consume.
+              if (ac >= 97 and ac <= 122) or (ac >= 65 and ac <= 90) or (ac >= 48 and ac <= 57) or ac == 95
+                ok = 0
+            if ok == 1
+              best_len = best_len + ext
+
     # Check for c"..." string prefix.
     # If the NFA matched a 1-char identifier 'c' and next char is '"',
     # scan it as a c-string literal.
