@@ -372,6 +372,38 @@ fn parse_item(p: *Parser) -> i32
     if p.pos > start_pos
         return 1
 
+    # Recovery path (task-99 cluster #1): no alternative matched. Before
+    # this existed, a partially-parsed impl/fn whose inner parse failed
+    # would return 0 here, parse_module would stop, and every subsequent
+    # top-level item was silently dropped ("Parsed functions: 0" on a
+    # 20-line file). Now: when we're not at EOF, skip forward to the next
+    # plausible top-level keyword and report progress so parse_module
+    # keeps going. Converts silent drops into partial parses.
+    if p.pos < p.token_count
+        # Skip the current (unmatched) token and scan forward.
+        p.pos = p.pos + 1
+        while p.pos < p.token_count
+            let t: Token = p_current_token(p)
+            if t.kind == TOK_FN
+                break
+            if t.kind == TOK_PUB
+                break
+            if t.kind == TOK_IMPL
+                break
+            if t.kind == TOK_STRUCT
+                break
+            if t.kind == TOK_CONST
+                break
+            if t.kind == TOK_IMPORT
+                break
+            if t.kind == TOK_EXTERN
+                break
+            if t.kind == TOK_ENUM
+                break
+            p.pos = p.pos + 1
+        p.error = 0
+        return 1
+
     if p.error == 0
         return 0
     return 0
@@ -583,7 +615,31 @@ fn parse_params(p: *Parser) -> *Param
 fn parse_param(p: *Parser) -> *Param
     let start_pos: i32 = p.pos
 
-    # Alternative 1
+    # Alternative 1: bare `self` receiver (task-99 cluster #1).
+    # `fn foo(self)` in an impl block. The actual impl type is resolved
+    # by emit_impl_method via the enclosing ImplBlock's type_name — we
+    # just create a Param named "self" here. TYPE_STRUCT matches the
+    # by-value receiver convention; the emitter special-cases the
+    # "self" name to emit `ptr` at the LLVM level (UFCS callers pass
+    # the receiver as ptr).
+    var result_self: Token
+    result_self = p_current_token(p)
+    if p_expect(p, TOK_SELF) == 0
+        p.error = 1
+        p.pos = start_pos
+    if p.error == 0
+        # Clear the "last type name" carried from a prior parse_type_spec —
+        # we don't have one here. param_new reads it for TYPE_STRUCT
+        # params; emit_impl_method will fill in the real type later.
+        p.last_type_name = null
+        p.last_type_name_len = 0
+        return param_new(p, result_self.start, result_self.len, TYPE_STRUCT, result_self.line, result_self.col)
+
+    # Try next alternative
+    p.pos = start_pos
+    p.error = 0
+
+    # Alternative 2: IDENT COLON type (the original).
     var result_1: Token
     var result_2: Token
     var result_3: i32
@@ -4075,6 +4131,15 @@ fn parse_primary_expr(p: *Parser) -> *Expr
         let ft: Token = p_current_token(p)
         p_advance(p)
         return expr_int(p, 0, ft.line, ft.col)
+
+    # `self` as expression (task-99 cluster #1). The lexer tokenizes `self`
+    # as TOK_SELF; treat it as an ordinary ident so the impl-method body's
+    # `self.n` / `self.foo()` / bare `self` all resolve against the local
+    # registered by emit_impl_method.
+    if p_peek(p) == TOK_SELF
+        let st: Token = p_current_token(p)
+        p_advance(p)
+        return expr_ident(p, st.start, st.len, st.line, st.col)
 
     # Alternative 0 (ritz-task-87): match as expression
     # Allows `let x = match scrut \n INDENT arms DEDENT`.

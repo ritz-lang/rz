@@ -268,6 +268,30 @@ fn try_emit_ufcs_method(s: *EmitterState, e: *Expr, type_name: *u8, type_name_le
                 emit_reg(s, arg_regs[j])
                 emit_str(s, c" to ptr\n")
                 converted_regs[j] = cast
+            else if param_ptr.param_type == TYPE_BOOL
+                # Callee expects i1. Bool-typed arg exprs (direct ident load)
+                # are already i1; other arg exprs (literal true/false, which
+                # emit `add i64 0, 1`, or comparisons, which zext back to i64)
+                # are i64 and need trunc. (task-99 #100)
+                var arg_expr: *Expr = e.args
+                var k: i32 = 0
+                while k < j and arg_expr != null
+                    arg_expr = arg_expr.next
+                    k = k + 1
+                var already_i1: i32 = 0
+                if arg_expr != null
+                    if get_expr_type(s, arg_expr) == TYPE_BOOL
+                        already_i1 = 1
+                if already_i1 == 1
+                    converted_regs[j] = arg_regs[j]
+                else
+                    let bool_trunc: i32 = next_reg(s)
+                    emit_str(s, c"  ")
+                    emit_reg(s, bool_trunc)
+                    emit_str(s, c" = trunc i64 ")
+                    emit_reg(s, arg_regs[j])
+                    emit_str(s, c" to i1\n")
+                    converted_regs[j] = bool_trunc
             else
                 converted_regs[j] = arg_regs[j]
             param_ptr = param_ptr.next
@@ -284,8 +308,10 @@ fn try_emit_ufcs_method(s: *EmitterState, e: *Expr, type_name: *u8, type_name_le
         emit_str(s, c"  ")
         emit_reg(s, call_result)
         if ret_type == TYPE_STRUCT and fn_def.return_type_name_len > 0
-            emit_str(s, c" = call %")
-            emit_name(s, fn_def.return_type_name, fn_def.return_type_name_len)
+            # emit_llvm_type_struct routes tagged-enum Result$/Option$ to i64
+            # (task-99 cluster #3).
+            emit_str(s, c" = call ")
+            emit_llvm_type_struct(s, TYPE_STRUCT, fn_def.return_type_name, fn_def.return_type_name_len)
             emit_str(s, c" @")
         else if ret_type == TYPE_I32 or ret_type == TYPE_U32
             emit_str(s, c" = call i32 @")
@@ -700,6 +726,30 @@ fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
                     converted_regs[j] = cast
                 else
                     converted_regs[j] = arg_regs[j]
+            else if param_ptr.param_type == TYPE_BOOL
+                # Callee expects i1. Bool-typed arg exprs (direct ident load)
+                # are already i1; other arg exprs (literal true/false, which
+                # emit `add i64 0, 1`, or comparisons, which zext back to i64)
+                # are i64 and need trunc. (task-99 #100)
+                var bool_arg_expr: *Expr = e.args
+                var bk: i32 = 0
+                while bk < j and bool_arg_expr != null
+                    bool_arg_expr = bool_arg_expr.next
+                    bk = bk + 1
+                var bool_already_i1: i32 = 0
+                if bool_arg_expr != null
+                    if get_expr_type(s, bool_arg_expr) == TYPE_BOOL
+                        bool_already_i1 = 1
+                if bool_already_i1 == 1
+                    converted_regs[j] = arg_regs[j]
+                else
+                    let bool_trunc: i32 = next_reg(s)
+                    emit_str(s, c"  ")
+                    emit_reg(s, bool_trunc)
+                    emit_str(s, c" = trunc i64 ")
+                    emit_reg(s, arg_regs[j])
+                    emit_str(s, c" to i1\n")
+                    converted_regs[j] = bool_trunc
             else if param_ptr.param_type == TYPE_STRUCT and param_ptr.param_type_name_len > 4 and *(param_ptr.param_type_name + 0) == 'S' and *(param_ptr.param_type_name + 1) == 'p' and *(param_ptr.param_type_name + 2) == 'a' and *(param_ptr.param_type_name + 3) == 'n' and *(param_ptr.param_type_name + 4) == '$'
                 # Port of ritz0 bedc85b: `@vec` -> Span<T> coercion at call site.
                 # When the parameter is `Span<T>` and the argument is `@v` where
@@ -891,8 +941,10 @@ fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
         emit_str(s, c"  ")
         emit_reg(s, call_result)
         if ret_type == TYPE_STRUCT and ret_struct_name_len > 0
-            emit_str(s, c" = call %")
-            emit_name(s, ret_struct_name, ret_struct_name_len)
+            # emit_llvm_type_struct routes tagged-enum Result$/Option$ to i64
+            # (task-99 cluster #3).
+            emit_str(s, c" = call ")
+            emit_llvm_type_struct(s, TYPE_STRUCT, ret_struct_name, ret_struct_name_len)
             emit_str(s, c" @")
         else if ret_type == TYPE_I32 or ret_type == TYPE_U32
             emit_str(s, c" = call i32 @")

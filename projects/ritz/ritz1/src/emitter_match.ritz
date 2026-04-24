@@ -105,20 +105,42 @@ fn emit_variant_payload(s: *EmitterState, scrut_reg: i32) -> i32
 
 # Emit match body, returning (result_reg, exit_label) via MatchResult slot.
 # `arm_index` selects which slot in result to fill.
-fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, result: *MatchResult, arm_index: i32, end_label: i32)
-    # Bind payload / scrutinee for pattern that introduces a name.
-    # For arm->pattern_kind:
-    #   PAT_IDENT (unit variant or binding): if pattern_name != "_" we could
-    #     bind scrutinee to it, but the ritzlib tests never actually use the
-    #     bound name inside the arm body, so we skip binding to keep emission
-    #     simple.
-    #   PAT_VARIANT with PAT_IDENT inner: bind inner_name to payload.
-    # NB: binding requires the scrutinee register to be accessible. The
-    # caller saves it in result.values[MAX_MATCH_ARMS-1] by convention —
-    # but to avoid the extra plumbing, we just emit the body without local
-    # binding for now. Arm bodies in the tests use literal return values.
-    # (The custom test exercises the variant path but doesn't rely on
-    # payload binding correctness either.)
+# For PAT_VARIANT arms with PAT_IDENT inner (e.g. `Ok(v) => v` or
+# `Some(n) => n`), the inner name is bound to the extracted payload
+# for the duration of the arm body, then popped via local_count
+# rollback. (task-99 #105)
+fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, result: *MatchResult, arm_index: i32, end_label: i32)
+    # Save local_count so arm-scoped bindings get popped after the body.
+    # (Lightweight scope — no push/pop API exists in emitter_core.)
+    let saved_local_count: i32 = s.local_count
+
+    # Bind variant payload to inner pattern name if the arm is
+    # `Constructor(binding)`. The payload is the low 48 bits of
+    # scrut_reg (matches the encoding in emitter_expr_call's Ok/Some
+    # constructor).
+    if arm.pattern_kind == PAT_VARIANT
+        if arm.pattern_inner_kind == PAT_IDENT
+            if arm.pattern_inner_name_len > 0
+                # Skip wildcard-styled names ("_"). pattern_inner_kind
+                # == PAT_IDENT excludes PAT_WILDCARD already, but we
+                # still guard against a pattern_inner_name == "_"
+                # binding ritz0 accepts.
+                var is_wildcard: i32 = 0
+                if arm.pattern_inner_name_len == 1
+                    if *arm.pattern_inner_name == 95   # '_'
+                        is_wildcard = 1
+                if is_wildcard == 0
+                    let payload_reg: i32 = emit_variant_payload(s, scrut_reg)
+                    let alloca_reg: i32 = next_reg(s)
+                    emit_str(s, c"  ")
+                    emit_reg(s, alloca_reg)
+                    emit_str(s, c" = alloca i64  ; match payload bind\n")
+                    emit_str(s, c"  store i64 ")
+                    emit_reg(s, payload_reg)
+                    emit_str(s, c", ptr ")
+                    emit_reg(s, alloca_reg)
+                    emit_str(s, c"\n")
+                    add_local(s, arm.pattern_inner_name, arm.pattern_inner_name_len, alloca_reg, TYPE_I64)
 
     var body_reg: i32 = 0
     if arm.is_pass == 1
@@ -134,6 +156,9 @@ fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, result: *MatchResult, a
         emit_str(s, c"  ")
         emit_reg(s, body_reg)
         emit_str(s, c" = add i64 0, 0  ; match arm: null body\n")
+
+    # Pop arm-scoped locals so later arms and the end-block don't see them.
+    s.local_count = saved_local_count
 
     # Capture actual exit label (the body might have branched internally).
     let exit_label: i32 = s.current_label
@@ -206,7 +231,7 @@ fn emit_match_arm(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, result: *Mat
     emit_label(s, body_label)
     emit_str(s, c":\n")
     s.current_label = body_label
-    emit_match_arm_body(s, arm, result, arm_index, end_label)
+    emit_match_arm_body(s, arm, scrut_reg, result, arm_index, end_label)
 
     # Next arm block (fall-through when condition failed)
     emit_label(s, next_label_id)

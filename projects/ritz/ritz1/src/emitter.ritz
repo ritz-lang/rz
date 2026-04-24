@@ -145,7 +145,9 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
                 emit_reg(s, val)
                 emit_str(s, c"\n")
             else if f.return_type == TYPE_STRUCT
-                # Struct return — handle ident (load from alloca) or call result
+                # Struct return — handle ident (load from alloca) or call result.
+                # Use emit_llvm_type_struct so tagged-enum types (Result$/Option$)
+                # auto-route to `i64` instead of `%<name>` (task-99 cluster #3).
                 if stmt.expr.kind == EXPR_IDENT
                     let local: *LocalVar = find_local_struct_name(s, stmt.expr.ident_ptr, stmt.expr.ident_len)
                     if local != null
@@ -153,28 +155,28 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
                         let val: i32 = next_reg(s)
                         emit_str(s, c"  ")
                         emit_reg(s, val)
-                        emit_str(s, c" = load %")
-                        emit_name(s, local.type_name, local.type_name_len)
+                        emit_str(s, c" = load ")
+                        emit_llvm_type_struct(s, TYPE_STRUCT, local.type_name, local.type_name_len)
                         emit_str(s, c", ptr ")
                         emit_reg(s, loc)
                         emit_str(s, c"\n")
-                        emit_str(s, c"  ret %")
-                        emit_name(s, local.type_name, local.type_name_len)
+                        emit_str(s, c"  ret ")
+                        emit_llvm_type_struct(s, TYPE_STRUCT, local.type_name, local.type_name_len)
                         emit_str(s, c" ")
                         emit_reg(s, val)
                         emit_str(s, c"\n")
                     else
                         let val: i32 = emit_expr(s, stmt.expr)
-                        emit_str(s, c"  ret %")
-                        emit_name(s, s.ret_type_name, s.ret_type_name_len)
+                        emit_str(s, c"  ret ")
+                        emit_llvm_type_struct(s, TYPE_STRUCT, s.ret_type_name, s.ret_type_name_len)
                         emit_str(s, c" ")
                         emit_reg(s, val)
                         emit_str(s, c"\n")
                 else
                     # Function call or other expression returning struct
                     let val: i32 = emit_expr(s, stmt.expr)
-                    emit_str(s, c"  ret %")
-                    emit_name(s, s.ret_type_name, s.ret_type_name_len)
+                    emit_str(s, c"  ret ")
+                    emit_llvm_type_struct(s, TYPE_STRUCT, s.ret_type_name, s.ret_type_name_len)
                     emit_str(s, c" ")
                     emit_reg(s, val)
                     emit_str(s, c"\n")
@@ -189,6 +191,18 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
                     emit_str(s, c" to i32\n")
                     emit_str(s, c"  ret i32 ")
                     emit_reg(s, trunc)
+                    emit_str(s, c"\n")
+                else if f.return_type == TYPE_BOOL
+                    # Comparisons zext to i64; trunc back for bool returns.
+                    # (task-99 cluster #1)
+                    let btrunc: i32 = next_reg(s)
+                    emit_str(s, c"  ")
+                    emit_reg(s, btrunc)
+                    emit_str(s, c" = trunc i64 ")
+                    emit_reg(s, val)
+                    emit_str(s, c" to i1\n")
+                    emit_str(s, c"  ret i1 ")
+                    emit_reg(s, btrunc)
                     emit_str(s, c"\n")
                 else if f.return_type == 0
                     emit_str(s, c"  ret void\n")
@@ -267,7 +281,17 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
         if first == 0
             emit_str(s, c", ")
         first = 0
-        emit_llvm_type(s, param.param_type)
+        # Bare `self` receiver (task-99 cluster #1): UFCS callers pass
+        # the receiver as `ptr <reg>` so the signature must declare it
+        # as `ptr`, not as the impl's struct type.
+        var is_self: i32 = 0
+        if param.name_len == 4
+            if *param.name == 115 and *(param.name + 1) == 101 and *(param.name + 2) == 108 and *(param.name + 3) == 102
+                is_self = 1
+        if is_self == 1
+            emit_str(s, c"ptr")
+        else
+            emit_llvm_type(s, param.param_type)
         emit_str(s, c" %")
         emit_name(s, param.name, param.name_len)
         emit_str(s, c".arg")
@@ -280,21 +304,35 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
 
     var param2: *Param = method.params
     while param2 != null
+        var p2_is_self: i32 = 0
+        if param2.name_len == 4
+            if *param2.name == 115 and *(param2.name + 1) == 101 and *(param2.name + 2) == 108 and *(param2.name + 3) == 102
+                p2_is_self = 1
         let alloca_reg: i32 = next_reg(s)
         emit_str(s, c"  ")
         emit_reg(s, alloca_reg)
         emit_str(s, c" = alloca ")
-        emit_llvm_type(s, param2.param_type)
+        if p2_is_self == 1
+            emit_str(s, c"ptr")
+        else
+            emit_llvm_type(s, param2.param_type)
         emit_str(s, c"\n")
         emit_str(s, c"  store ")
-        emit_llvm_type(s, param2.param_type)
+        if p2_is_self == 1
+            emit_str(s, c"ptr")
+        else
+            emit_llvm_type(s, param2.param_type)
         emit_str(s, c" %")
         emit_name(s, param2.name, param2.name_len)
         emit_str(s, c".arg, ptr ")
         emit_reg(s, alloca_reg)
         emit_str(s, c"\n")
         # Track parameter type including struct name for method calls
-        if param2.param_type == TYPE_PTR or param2.param_type == TYPE_PTR_PTR or param2.param_type == TYPE_REF or param2.param_type == TYPE_MUT_REF
+        if p2_is_self == 1
+            # Register `self` as a pointer-to-struct local so `self.field`
+            # member access resolves via the impl type. (task-99 cluster #1)
+            add_local_full(s, param2.name, param2.name_len, alloca_reg, TYPE_PTR, ib.type_name, ib.type_name_len, TYPE_STRUCT, 0, 0)
+        else if param2.param_type == TYPE_PTR or param2.param_type == TYPE_PTR_PTR or param2.param_type == TYPE_REF or param2.param_type == TYPE_MUT_REF
             add_local_full(s, param2.name, param2.name_len, alloca_reg, param2.param_type, param2.param_type_name, param2.param_type_name_len, param2.param_pointee_type, 0, 0)
         else if param2.param_type == TYPE_STRUCT
             add_local_struct(s, param2.name, param2.name_len, alloca_reg, param2.param_type, param2.param_type_name, param2.param_type_name_len)
@@ -341,6 +379,18 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
                     emit_str(s, c" to i32\n")
                     emit_str(s, c"  ret i32 ")
                     emit_reg(s, trunc)
+                    emit_str(s, c"\n")
+                else if method.return_type == TYPE_BOOL
+                    # Comparisons zext to i64 in emit_binary; trunc back to
+                    # i1 for bool-returning methods. (task-99 cluster #1)
+                    let btrunc: i32 = next_reg(s)
+                    emit_str(s, c"  ")
+                    emit_reg(s, btrunc)
+                    emit_str(s, c" = trunc i64 ")
+                    emit_reg(s, val)
+                    emit_str(s, c" to i1\n")
+                    emit_str(s, c"  ret i1 ")
+                    emit_reg(s, btrunc)
                     emit_str(s, c"\n")
                 else if method.return_type == 0
                     emit_str(s, c"  ret void\n")
