@@ -258,6 +258,89 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
                     fi = fi.next
             return  # Done with struct literal init
 
+        # Array-literal init for typed [N]T slots (ritz0 parity —
+        # test_issue_span_slice_range and friends).  The generic fallthrough
+        # below emits the literal into a shadow `[N x i64]` alloca and then
+        # stores a single `i64 %ptrtoint` into the declared array slot,
+        # which is wrong when the slot's element type isn't i64 (most cases).
+        # Instead, iterate the literal's elements, evaluate each, and store
+        # it into slot[i] at the declared element type — mirrors ritz0's
+        # direct-element-store behaviour.
+        if var_type == TYPE_ARRAY and stmt.var_init.kind == EXPR_ARRAY_LIT
+            let elem_ty: i32 = stmt.var_array_elem_type
+            let arr_size: i32 = stmt.var_array_size
+            var elem_llvm: *u8 = c"i64"
+            if elem_ty == TYPE_I32 or elem_ty == TYPE_U32
+                elem_llvm = c"i32"
+            else if elem_ty == TYPE_U8 or elem_ty == TYPE_I8
+                elem_llvm = c"i8"
+            else if elem_ty == TYPE_U16 or elem_ty == TYPE_I16
+                elem_llvm = c"i16"
+            else if elem_ty == TYPE_PTR or elem_ty == TYPE_PTR_PTR
+                elem_llvm = c"ptr"
+            var idx: i32 = 0
+            var it: *Expr = stmt.var_init.args
+            while it != null and idx < arr_size
+                let val_reg: i32 = emit_expr(s, it)
+                let elem_ptr: i32 = next_reg(s)
+                emit_str(s, c"  ")
+                emit_reg(s, elem_ptr)
+                emit_str(s, c" = getelementptr [")
+                emit_int(s, arr_size as i64)
+                emit_str(s, c" x ")
+                emit_str(s, elem_llvm)
+                emit_str(s, c"], ptr ")
+                emit_reg(s, alloca_reg)
+                emit_str(s, c", i64 0, i64 ")
+                emit_int(s, idx as i64)
+                emit_str(s, c"\n")
+                # Truncate the i64 expression value down to the element type.
+                if elem_ty == TYPE_U8 or elem_ty == TYPE_I8
+                    let t8: i32 = next_reg(s)
+                    emit_str(s, c"  ")
+                    emit_reg(s, t8)
+                    emit_str(s, c" = trunc i64 ")
+                    emit_reg(s, val_reg)
+                    emit_str(s, c" to i8\n")
+                    emit_str(s, c"  store i8 ")
+                    emit_reg(s, t8)
+                else if elem_ty == TYPE_U16 or elem_ty == TYPE_I16
+                    let t16: i32 = next_reg(s)
+                    emit_str(s, c"  ")
+                    emit_reg(s, t16)
+                    emit_str(s, c" = trunc i64 ")
+                    emit_reg(s, val_reg)
+                    emit_str(s, c" to i16\n")
+                    emit_str(s, c"  store i16 ")
+                    emit_reg(s, t16)
+                else if elem_ty == TYPE_I32 or elem_ty == TYPE_U32
+                    let t32: i32 = next_reg(s)
+                    emit_str(s, c"  ")
+                    emit_reg(s, t32)
+                    emit_str(s, c" = trunc i64 ")
+                    emit_reg(s, val_reg)
+                    emit_str(s, c" to i32\n")
+                    emit_str(s, c"  store i32 ")
+                    emit_reg(s, t32)
+                else if elem_ty == TYPE_PTR or elem_ty == TYPE_PTR_PTR
+                    let tp: i32 = next_reg(s)
+                    emit_str(s, c"  ")
+                    emit_reg(s, tp)
+                    emit_str(s, c" = inttoptr i64 ")
+                    emit_reg(s, val_reg)
+                    emit_str(s, c" to ptr\n")
+                    emit_str(s, c"  store ptr ")
+                    emit_reg(s, tp)
+                else
+                    emit_str(s, c"  store i64 ")
+                    emit_reg(s, val_reg)
+                emit_str(s, c", ptr ")
+                emit_reg(s, elem_ptr)
+                emit_str(s, c"\n")
+                idx = idx + 1
+                it = it.next
+            return
+
         # ritz-task-133: thread enum ctx so `let r: Result<_,_> = Ok(x)` in
         # a non-Result-returning fn still builds the right struct.  Save /
         # restore around the init expression so nested decls don't leak.
