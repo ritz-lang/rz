@@ -232,6 +232,21 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
                 emit_str(s, c"  ret i32 ")
                 emit_reg(s, trunc)
                 emit_str(s, c"\n")
+            else if f.return_type == TYPE_BOOL
+                # Match arms / binops carry their result as i64 even when the
+                # function signature is bool; trunc back to i1 at the implicit
+                # return (mirrors the explicit-return path at line ~195).
+                # Without this, `fn f() -> bool \n    match ... => true` emits
+                # `ret i1 %i64reg` which clang rejects.
+                let btrunc: i32 = next_reg(s)
+                emit_str(s, c"  ")
+                emit_reg(s, btrunc)
+                emit_str(s, c" = trunc i64 ")
+                emit_reg(s, s.last_expr_reg)
+                emit_str(s, c" to i1\n")
+                emit_str(s, c"  ret i1 ")
+                emit_reg(s, btrunc)
+                emit_str(s, c"\n")
             else if f.return_type == TYPE_STRUCT
                 # tagged-enum or named-struct return: use the named type
                 # (ritz-task-133).  Without this the tail-expression phi
@@ -770,6 +785,87 @@ fn emit_tagged_enum_scan_stmts(s: *EmitterState, body: *Stmt)
         else if st.kind == STMT_LOOP
             emit_tagged_enum_scan_stmts(s, st.while_body)
         st = st.next
+
+# Unit-variant enum fallback (ritz0 parity — test_issue_qualified_enum_variant).
+#
+# ritz1's parser currently swallows `enum Name ... variants` declarations
+# without persisting them to the AST (see parser_gen.ritz parse_enum_def).
+# But the type name can still be referenced by function signatures
+# (`fn f(s: Shade) -> bool`) and emitted as `%Shade` in IR.  Without a
+# matching type declaration, LLVM rejects the IR with "Cannot allocate
+# unsized type".  We plug the gap by walking every struct-typed reference
+# in the module, and emitting `%Name = type { i8 }` for any name that
+# nothing else has claimed — matching the single-tag layout ritz0 uses
+# for C-style enums.  User structs and Result$/Option$ tagged enums are
+# already marked in `emitted_structs` by prior passes, so we skip those.
+fn emit_enum_fallback_decl(s: *EmitterState, name: *u8, len: i32)
+    if name == null or len == 0
+        return
+    if is_tagged_enum_type(name, len) == 1
+        return
+    if was_struct_emitted(s, name, len) == 1
+        return
+    mark_struct_emitted(s, name, len)
+    emit_str(s, c"%")
+    emit_name(s, name, len)
+    emit_str(s, c" = type { i8 }\n")
+
+fn emit_enum_fallback_scan_stmts(s: *EmitterState, body: *Stmt)
+    var st: *Stmt = body
+    while st != null
+        if st.kind == STMT_VAR_DECL
+            if st.var_type == TYPE_STRUCT
+                emit_enum_fallback_decl(s, st.var_type_name, st.var_type_name_len)
+        else if st.kind == STMT_IF
+            emit_enum_fallback_scan_stmts(s, st.if_then)
+            if st.if_else != null
+                emit_enum_fallback_scan_stmts(s, st.if_else)
+        else if st.kind == STMT_WHILE
+            emit_enum_fallback_scan_stmts(s, st.while_body)
+        else if st.kind == STMT_FOR
+            emit_enum_fallback_scan_stmts(s, st.for_body)
+        else if st.kind == STMT_LOOP
+            emit_enum_fallback_scan_stmts(s, st.while_body)
+        st = st.next
+
+fn emit_enum_fallback_types(s: *EmitterState)
+    # Function signatures.
+    var f: *FnDef = s.module.functions
+    while f != null
+        if f.return_type == TYPE_STRUCT
+            emit_enum_fallback_decl(s, f.return_type_name, f.return_type_name_len)
+        var p: *Param = f.params
+        while p != null
+            if p.param_type == TYPE_STRUCT
+                emit_enum_fallback_decl(s, p.param_type_name, p.param_type_name_len)
+            p = p.next
+        emit_enum_fallback_scan_stmts(s, f.body)
+        f = f.next
+
+    # Impl methods.
+    var ib: *ImplBlock = s.module.impls
+    while ib != null
+        var meth: *FnDef = ib.methods
+        while meth != null
+            if meth.return_type == TYPE_STRUCT
+                emit_enum_fallback_decl(s, meth.return_type_name, meth.return_type_name_len)
+            var mp: *Param = meth.params
+            while mp != null
+                if mp.param_type == TYPE_STRUCT
+                    emit_enum_fallback_decl(s, mp.param_type_name, mp.param_type_name_len)
+                mp = mp.next
+            emit_enum_fallback_scan_stmts(s, meth.body)
+            meth = meth.next
+        ib = ib.next
+
+    # Global variable types.
+    var g: *GlobalVarDef = s.module.globals
+    while g != null
+        if g.var_type == TYPE_STRUCT
+            emit_enum_fallback_decl(s, g.type_name, g.type_name_len)
+        g = g.next
+
+    emit_str(s, c"\n")
 
 # Emit global variable declarations
 fn emit_global_vars(s: *EmitterState)
@@ -1326,6 +1422,14 @@ fn emit_module(m: *Module, out: *Vec<u8>) -> i32
     # old i64-pack fast-path with a real `{ i8, [N x i8] }` struct so the
     # IR matches ritz0.
     emit_tagged_enum_types(@s)
+
+    # Emit fallback `%Name = type { i8 }` decls for any remaining
+    # referenced struct-typed name the parser skipped (C-style unit
+    # enums — parse_enum_def currently consumes without persisting to
+    # the AST).  Must run AFTER emit_struct_types + emit_tagged_enum_types
+    # so real structs and Result$/Option$ instantiations keep priority
+    # in the emitted_structs dedup table.
+    emit_enum_fallback_types(@s)
 
     # Emit global variable declarations
     emit_global_vars(@s)
