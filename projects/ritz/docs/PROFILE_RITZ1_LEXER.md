@@ -176,3 +176,69 @@ The fix is well-scoped and the payoff is large:
 **Recommendation**: schedule as the next focused session. It pays for itself
 across every future iteration. Defer until then — don't bolt it onto an
 unrelated change.
+
+---
+
+## Attempted implementation, 2026-04-25 — blocked on a sibling bug
+
+Built and tested the per-state index in nfa.ritz + lexer_nfa.ritz +
+generator change to `setup_lexer` signature.  The optimisation itself works
+exactly as expected:
+
+| Metric | Before | After (measured) |
+|---|---|---|
+| ritz1 self-compile of `emitter.ritz` | 12.4 s | **0.336 s** |
+| `make matrix` (ritz1-only) | ~30 s | **11 s** |
+
+**~37× speedup on ritz1, validated end-to-end.**
+
+But selfhost (`ritz1_selfhosted`) failed: when ritz1 self-compiles the new
+nfa.ritz, the resulting binary's `lexer_match_from` emits `load i8` from a
+pointer that should be `load i64` — the local-pointer-deref counterpart of
+the `d30466f` fix (which only handled global pointers).
+
+The relevant LL fragment for the new code:
+
+```llvm
+; ritz1 sees `let off: i64 = *(nfa.state_trans_offset + state_i64)`
+%.105 = mul i64 %.104, 8       ; ✓ correct stride for *i64
+%.106 = inttoptr i64 %.103 to ptr
+%.107 = getelementptr i8, ptr %.106, i64 %.105
+%.108 = ptrtoint ptr %.107 to i64
+%.109 = inttoptr i64 %.108 to ptr
+%.110 = load i8, ptr %.109     ; ✗ should be `load i64`
+```
+
+ritz1's pointer arithmetic correctly uses stride 8, but the subsequent
+load width defaults to i8.  The pointee type is lost across the
+`inttoptr/ptrtoint` round-trip.  Same shape of bug as `d30466f` (where
+globals' pointee type was tracked in `GlobalVarDef.pointee_type`); the
+local-binding equivalent (`LocalVar.pointee_type`?) doesn't exist yet.
+
+I tried widening the index arrays to `*i64` (since i64 stores work — the
+write side hits a different codegen path that does honour the type). That
+fixed the writes during finalize, but reads in `lexer_match_from` still
+got `load i8` because the read path is what's broken.
+
+**Reverted the Tier 1 attempt.**  The optimisation is correct; ritz1's
+codegen for typed-local-pointer reads is the actual blocker.
+
+### Prerequisite for landing Tier 1
+
+Extend ritz1's emitter to track pointee type for local pointer bindings:
+
+1. Add `pointee_type: i32` to `LocalVar` (mirror of `GlobalVarDef.pointee_type`)
+2. In `find_local_type` / equivalent, propagate pointee_type for `*T` locals
+3. In `emit_expr_arith` and `emit_expr` (OP_DEREF), when reading
+   `*(local_ptr + i)`, look up the local's pointee_type and emit the
+   correct load width
+4. Apply the same to OP_DEREF on a struct-field access whose field type
+   is `*T`
+
+Estimated effort: ~80-120 LoC across ast.ritz / ast_helpers.ritz /
+emitter_core.ritz / emitter_expr_arith.ritz.  Sibling of `d30466f` —
+should be tractable in one focused session.
+
+After that lands, re-applying Tier 1 NFA optimisation is a ~30-line cherry
+pick: the previous attempt branched on `regen-check + matrix-full` and is
+recoverable from `git reflog`.  Validation gate is `make matrix-full`.
