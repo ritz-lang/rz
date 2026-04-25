@@ -33,6 +33,7 @@ import ritzlib.gvec
 import ritzlib.memory
 
 import ast
+import ast_helpers
 import tokens_gen
 import emitter_core
 import emitter_expr
@@ -72,6 +73,35 @@ fn variant_is_tag_one(name: *u8, len: i32) -> i32
 # checks for the carrier variant (Ok / Some); 0 checks for the null
 # variant (Err / None).  ritz0 tag convention: Ok=0 Err=1 Some=0 None=1,
 # so carrier <=> tag==0.
+# User-enum variant check: load the tag byte and compare against an
+# arbitrary i8 tag value (instead of the tagged-enum 0/1 binary check).
+# Used when the scrutinee's enum is a parser-tracked user enum (Shade,
+# etc.) and the match arm names a specific variant by index.
+fn emit_variant_tag_check_eq(s: *EmitterState, slot_reg: i32, enum_name: *u8, enum_name_len: i32, tag_value: i32) -> i32
+    let tag_ptr: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, tag_ptr)
+    emit_str(s, c" = getelementptr %")
+    emit_name(s, enum_name, enum_name_len)
+    emit_str(s, c", ptr ")
+    emit_reg(s, slot_reg)
+    emit_str(s, c", i32 0, i32 0\n")
+    let tag_reg: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, tag_reg)
+    emit_str(s, c" = load i8, ptr ")
+    emit_reg(s, tag_ptr)
+    emit_str(s, c"\n")
+    let cmp_reg: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, cmp_reg)
+    emit_str(s, c" = icmp eq i8 ")
+    emit_reg(s, tag_reg)
+    emit_str(s, c", ")
+    emit_int(s, tag_value as i64)
+    emit_str(s, c"\n")
+    return cmp_reg
+
 fn emit_variant_tag_check(s: *EmitterState, slot_reg: i32, enum_name: *u8, enum_name_len: i32, tag_one: i32) -> i32
     let tag_ptr: i32 = next_reg(s)
     emit_str(s, c"  ")
@@ -225,8 +255,15 @@ fn emit_match_arm(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_slot: 
     else if arm.pattern_kind == PAT_WILDCARD
         always_true = 1
     else if arm.pattern_kind == PAT_IDENT
-        # Ident pattern — unit variant (None/Err) or a binding.
-        if arm.pattern_name_len == 4
+        # Ident pattern — unit variant (None/Err/Light/Dark) or a binding.
+        # First try the user-enum tracker so user-declared variants resolve
+        # to their proper tag index; fall back to None/Err special-casing
+        # for tagged enums; otherwise treat as a binding (always_true).
+        if is_enum_match == 1 and is_enum_type(enum_name, enum_name_len) == 1
+            let user_idx: i32 = enum_variant_index(enum_name, enum_name_len, arm.pattern_name, arm.pattern_name_len)
+            if user_idx >= 0
+                cond_reg = emit_variant_tag_check_eq(s, scrut_slot, enum_name, enum_name_len, user_idx)
+        if cond_reg == 0 and arm.pattern_name_len == 4
             if *arm.pattern_name == 78 and *(arm.pattern_name + 1) == 111
                 if *(arm.pattern_name + 2) == 110 and *(arm.pattern_name + 3) == 101
                     # "None": null variant → tag != 0
@@ -237,11 +274,21 @@ fn emit_match_arm(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_slot: 
         if cond_reg == 0
             always_true = 1
     else if arm.pattern_kind == PAT_VARIANT
-        let tag_one: i32 = variant_is_tag_one(arm.pattern_name, arm.pattern_name_len)
-        if is_enum_match == 1
-            cond_reg = emit_variant_tag_check(s, scrut_slot, enum_name, enum_name_len, tag_one)
+        # User-declared enum: look up the variant's tag index from the
+        # parser's enum tracker (Shade.Light=0, Shade.Dark=1).  Falls back
+        # to the binary Some/Ok-vs-None/Err mapping for tagged enums.
+        if is_enum_match == 1 and is_enum_type(enum_name, enum_name_len) == 1
+            let user_idx: i32 = enum_variant_index(enum_name, enum_name_len, arm.pattern_name, arm.pattern_name_len)
+            if user_idx >= 0
+                cond_reg = emit_variant_tag_check_eq(s, scrut_slot, enum_name, enum_name_len, user_idx)
+            else
+                always_true = 1
         else
-            cond_reg = emit_variant_tag_check_i64(s, scrut_reg, tag_one)
+            let tag_one: i32 = variant_is_tag_one(arm.pattern_name, arm.pattern_name_len)
+            if is_enum_match == 1
+                cond_reg = emit_variant_tag_check(s, scrut_slot, enum_name, enum_name_len, tag_one)
+            else
+                cond_reg = emit_variant_tag_check_i64(s, scrut_reg, tag_one)
     else
         always_true = 1
 
@@ -281,6 +328,13 @@ fn resolve_scrutinee_enum(s: *EmitterState, scr: *Expr, out_name: **u8, out_len:
                     *out_name = loc.type_name
                     *out_len = loc.type_name_len
                     return 1
+                # Also recognize user-declared enums (Shade, etc.) via the
+                # parser's per-enum tracker.  Their layout is `{ i8 tag }`
+                # (no payload) so match logic uses the same tag-byte GEP.
+                if is_enum_type(loc.type_name, loc.type_name_len) == 1
+                    *out_name = loc.type_name
+                    *out_len = loc.type_name_len
+                    return 1
     else if scr.kind == EXPR_CALL
         var full_name: [256]u8
         var full_len: i32 = 0
@@ -296,6 +350,10 @@ fn resolve_scrutinee_enum(s: *EmitterState, scr: *Expr, out_name: **u8, out_len:
             if fd.return_type == TYPE_STRUCT
                 if fd.return_type_name_len > 0
                     if is_tagged_enum_type(fd.return_type_name, fd.return_type_name_len) == 1
+                        *out_name = fd.return_type_name
+                        *out_len = fd.return_type_name_len
+                        return 1
+                    if is_enum_type(fd.return_type_name, fd.return_type_name_len) == 1
                         *out_name = fd.return_type_name
                         *out_len = fd.return_type_name_len
                         return 1

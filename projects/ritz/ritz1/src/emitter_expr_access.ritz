@@ -1,6 +1,7 @@
 # Auto-extracted from emitter_expr.ritz — IDENT + INDEX + MEMBER codegen.
 
 import ast
+import ast_helpers
 import emitter_core
 import emitter_expr
 
@@ -1055,6 +1056,55 @@ fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
 
 fn emit_expr_member(s: *EmitterState, e: *Expr) -> i32
     # expr.field - member access on struct.
+    #
+    # Qualified enum variant: `Shade.Light` / `Result.Ok`.  When the LHS
+    # ident is a known enum type and the RHS is one of its variants,
+    # materialize a %Shade-typed value: alloca + store i8 <tag> + load %Shade.
+    # The result register is a struct-typed SSA value usable as a call arg
+    # or var-decl initializer; downstream var-decl narrowing handles the
+    # alloca-width / store-type so `let a = Shade.Light` packs correctly.
+    if e.left.kind == EXPR_IDENT
+        if is_enum_type(e.left.ident_ptr, e.left.ident_len) == 1
+            let variant_idx: i32 = enum_variant_index(e.left.ident_ptr, e.left.ident_len, e.ident_ptr, e.ident_len)
+            if variant_idx >= 0
+                # alloca %EnumType
+                let slot: i32 = next_reg(s)
+                emit_str(s, c"  ")
+                emit_reg(s, slot)
+                emit_str(s, c" = alloca %")
+                emit_name(s, e.left.ident_ptr, e.left.ident_len)
+                emit_str(s, c"  ; enum variant ctor\n")
+                # Zero-init so any padding is deterministic
+                emit_str(s, c"  store %")
+                emit_name(s, e.left.ident_ptr, e.left.ident_len)
+                emit_str(s, c" zeroinitializer, ptr ")
+                emit_reg(s, slot)
+                emit_str(s, c"\n")
+                # Get pointer to tag byte (field 0 of the {i8} fallback layout)
+                let tag_ptr: i32 = next_reg(s)
+                emit_str(s, c"  ")
+                emit_reg(s, tag_ptr)
+                emit_str(s, c" = getelementptr %")
+                emit_name(s, e.left.ident_ptr, e.left.ident_len)
+                emit_str(s, c", ptr ")
+                emit_reg(s, slot)
+                emit_str(s, c", i32 0, i32 0\n")
+                # Store the variant tag
+                emit_str(s, c"  store i8 ")
+                emit_int(s, variant_idx as i64)
+                emit_str(s, c", ptr ")
+                emit_reg(s, tag_ptr)
+                emit_str(s, c"\n")
+                # Load the struct value
+                let val: i32 = next_reg(s)
+                emit_str(s, c"  ")
+                emit_reg(s, val)
+                emit_str(s, c" = load %")
+                emit_name(s, e.left.ident_ptr, e.left.ident_len)
+                emit_str(s, c", ptr ")
+                emit_reg(s, slot)
+                emit_str(s, c"\n")
+                return val
     #
     # Namespace-const fallback (ritz0 parity — test_issue_namespace_const_field).
     # `module_name.CONST_NAME` where `module_name` isn't a local/global/const

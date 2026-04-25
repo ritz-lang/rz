@@ -10,6 +10,7 @@ import ritzlib.gvec
 import ritzlib.memory
 
 import ast
+import ast_helpers
 import tokens_gen
 import emitter_core
 import emitter_expr
@@ -163,6 +164,19 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
                     stmt.var_type = TYPE_STRUCT
                     stmt.var_type_name = stmt.var_init.ident_ptr
                     stmt.var_type_name_len = stmt.var_init.ident_len
+        # Qualified enum variant: `let a = Shade.Light`.  EXPR_MEMBER on an
+        # enum type produces a %Shade-typed register (alloca/store/load
+        # pattern in emit_expr_member); the var-decl slot must therefore be
+        # %Shade so the store width matches.  Without this narrowing, the
+        # alloca defaulted to i64 → "store %Shade %.X, ptr <i64-slot>" was
+        # rejected by clang.
+        else if stmt.var_init.kind == EXPR_MEMBER
+            if stmt.var_init.left != null and stmt.var_init.left.kind == EXPR_IDENT
+                if is_enum_type(stmt.var_init.left.ident_ptr, stmt.var_init.left.ident_len) == 1
+                    var_type = TYPE_STRUCT
+                    stmt.var_type = TYPE_STRUCT
+                    stmt.var_type_name = stmt.var_init.left.ident_ptr
+                    stmt.var_type_name_len = stmt.var_init.left.ident_len
         # try-expression: `let data = read_bytes()?`. The try-emit hands back
         # the unwrapped Ok payload, which is a struct (e.g., %Vec$u8) when
         # the Result's Ok variant carries a struct.  Narrow var_type to that
@@ -1394,7 +1408,14 @@ fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         let a_cond: i32 = emit_expr(s, stmt.if_cond)
         let a_cond_type: i32 = get_expr_type(s, stmt.if_cond)
         var a_cond_i1: i32 = a_cond
-        if a_cond_type != TYPE_BOOL
+        # Only direct EXPR_IDENT loads of bool-typed locals leave i1 in the
+        # register; bool-returning calls/binops zext to i64 even though
+        # get_expr_type reports TYPE_BOOL.  Coerce i64→i1 for everything
+        # except a bare bool ident.
+        var a_already_i1: i32 = 0
+        if a_cond_type == TYPE_BOOL and stmt.if_cond.kind == EXPR_IDENT
+            a_already_i1 = 1
+        if a_already_i1 == 0
             a_cond_i1 = next_reg(s)
             emit_str(s, c"  ")
             emit_reg(s, a_cond_i1)

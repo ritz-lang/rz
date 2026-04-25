@@ -5,6 +5,8 @@
 
 # Import AST types only - no ritzlib dependencies for standalone compilation
 import ast
+import ritzlib.memory
+import ritzlib.io
 
 # =============================================================================
 # Parser allocation (bump allocator using parser's arena)
@@ -1951,4 +1953,147 @@ pub fn stmt_for_iter(p: *Parser, name: *u8, name_len: i32, iter: *Expr, body: *S
 # unit-tag fallback layout.  This action just signals "syntactically
 # valid, nothing to add to module".
 pub fn enum_def_skip(p: *Parser) -> i32
+    return 0
+
+# ============================================================================
+# Enum variant tracker (for qualified enum-variant lookup at codegen)
+# ============================================================================
+# When the parser sees `enum Shade ... Light ... Dark`, ritz1 doesn't build
+# a real enum AST node — but downstream code references like `Shade.Light`
+# still need to resolve to the variant's tag value (0 for Light, 1 for Dark).
+#
+# Track each enum's variants in parallel arrays:
+#   g_enum_names      → enum type names (e.g., "Shade")
+#   g_enum_variant_starts → index into g_enum_variant_names where this enum's
+#                           variants begin
+#   g_enum_variant_count  → how many variants this enum has
+#   g_enum_variant_names → flattened list of variant names across all enums
+#
+# Lookup: enum_variant_index(enum_name, variant_name) returns index or -1.
+
+const MAX_ENUMS: i32 = 32
+const MAX_ENUM_VARIANTS: i32 = 256
+
+var g_enum_names: **u8 = null
+var g_enum_name_lens: *i32 = null
+var g_enum_variant_starts: *i32 = null
+var g_enum_variant_counts: *i32 = null
+var g_enum_count: i32 = 0
+
+var g_enum_variant_names: **u8 = null
+var g_enum_variant_name_lens: *i32 = null
+var g_enum_variant_total: i32 = 0
+
+var g_enum_initialized: i32 = 0
+
+fn init_enum_tracker()
+    if g_enum_initialized == 1
+        return
+    g_enum_names = malloc(MAX_ENUMS * 8) as **u8
+    g_enum_name_lens = malloc(MAX_ENUMS * 4) as *i32
+    g_enum_variant_starts = malloc(MAX_ENUMS * 4) as *i32
+    g_enum_variant_counts = malloc(MAX_ENUMS * 4) as *i32
+    g_enum_variant_names = malloc(MAX_ENUM_VARIANTS * 8) as **u8
+    g_enum_variant_name_lens = malloc(MAX_ENUM_VARIANTS * 4) as *i32
+    g_enum_initialized = 1
+    g_enum_count = 0
+    g_enum_variant_total = 0
+
+# Called from grammar rule enum_def_header: starts a new enum-tracking entry.
+pub fn enum_def_start(p: *Parser, name: *u8, len: i32) -> i32
+    init_enum_tracker()
+    if g_enum_count >= MAX_ENUMS
+        return 0
+    *(g_enum_names + g_enum_count) = name
+    *(g_enum_name_lens + g_enum_count) = len
+    *(g_enum_variant_starts + g_enum_count) = g_enum_variant_total
+    *(g_enum_variant_counts + g_enum_count) = 0
+    g_enum_count = g_enum_count + 1
+    return 0
+
+# Called from grammar rule enum_variant: appends to the most recent enum's
+# variant list.
+pub fn enum_variant_record(p: *Parser, name: *u8, len: i32) -> i32
+    init_enum_tracker()
+    if g_enum_count == 0
+        return 0
+    if g_enum_variant_total >= MAX_ENUM_VARIANTS
+        return 0
+    *(g_enum_variant_names + g_enum_variant_total) = name
+    *(g_enum_variant_name_lens + g_enum_variant_total) = len
+    g_enum_variant_total = g_enum_variant_total + 1
+    # Read-modify-write through an intermediate `let` to avoid a self-host
+    # codegen quirk where the compound `*(p + i) = *(p + i) + 1` form
+    # produces an off-by-one count under ritz1-self-compiled binaries.
+    let idx: i32 = g_enum_count - 1
+    let old_count: i32 = *(g_enum_variant_counts + idx)
+    *(g_enum_variant_counts + idx) = old_count + 1
+    return 0
+
+# Lookup: returns the variant's tag index (0-based) within an enum, or -1
+# when either the enum or the variant is unknown.
+# Same compound-deref workaround as is_enum_type: load each byte through
+# an explicit `let` binding so the i8 comparison codegen is correct under
+# self-hosting.
+pub fn enum_variant_index(enum_name: *u8, enum_name_len: i32, var_name: *u8, var_name_len: i32) -> i32
+    if g_enum_initialized == 0
+        return 0 - 1
+    var ei: i32 = 0
+    while ei < g_enum_count
+        if *(g_enum_name_lens + ei) == enum_name_len
+            var match_e: i32 = 1
+            let stored_e: *u8 = *(g_enum_names + ei)
+            for k in 0..enum_name_len
+                let sb: u8 = *(stored_e + k)
+                let qb: u8 = *(enum_name + k)
+                if sb != qb
+                    match_e = 0
+            if match_e == 1
+                # Pointer-then-deref via local `let` bindings — same self-host
+                # codegen workaround as is_enum_type's name comparison.
+                let starts_ptr: *i32 = g_enum_variant_starts
+                let counts_ptr: *i32 = g_enum_variant_counts
+                let start: i32 = *(starts_ptr + ei)
+                let count: i32 = *(counts_ptr + ei)
+                for vi in 0..count
+                    let vidx: i32 = start + vi
+                    let vlens_ptr: *i32 = g_enum_variant_name_lens
+                    let stored_len: i32 = *(vlens_ptr + vidx)
+                    if stored_len == var_name_len
+                        var match_v: i32 = 1
+                        let vnames_ptr: **u8 = g_enum_variant_names
+                        let stored_v: *u8 = *(vnames_ptr + vidx)
+                        for k in 0..var_name_len
+                            let svb: u8 = *(stored_v + k)
+                            let qvb: u8 = *(var_name + k)
+                            if svb != qvb
+                                match_v = 0
+                        if match_v == 1
+                            return vi
+                return 0 - 1
+        ei = ei + 1
+    return 0 - 1
+
+# Returns 1 if name is a known enum type, 0 otherwise.
+# NOTE: the byte comparison uses explicit `let` bindings for the loaded
+# bytes — when ritz1 self-compiles itself, the inlined compound deref
+# `*(*(g_enum_names + ei) + k) != *(name + k)` was producing buggy code
+# (false negative on equal strings).  Using the let-binding form forces
+# distinct loads with proper i8 type that compare correctly.
+pub fn is_enum_type(name: *u8, len: i32) -> i32
+    if g_enum_initialized == 0
+        return 0
+    var ei: i32 = 0
+    while ei < g_enum_count
+        if *(g_enum_name_lens + ei) == len
+            var match_e: i32 = 1
+            let stored: *u8 = *(g_enum_names + ei)
+            for k in 0..len
+                let stored_byte: u8 = *(stored + k)
+                let query_byte: u8 = *(name + k)
+                if stored_byte != query_byte
+                    match_e = 0
+            if match_e == 1
+                return 1
+        ei = ei + 1
     return 0
