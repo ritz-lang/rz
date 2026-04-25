@@ -48,6 +48,12 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
                     stmt.var_type = TYPE_STRUCT
                     stmt.var_type_name = fn_def.return_type_name
                     stmt.var_type_name_len = fn_def.return_type_name_len
+            # Float-returning fn → narrow to TYPE_F32/F64 so the alloca
+            # and downstream loads/stores are the right width (was
+            # defaulting to i64 → `store i64 <float>` rejected by clang).
+            else if fn_def != null and (fn_def.return_type == TYPE_F32 or fn_def.return_type == TYPE_F64)
+                var_type = fn_def.return_type
+                stmt.var_type = fn_def.return_type
         # task-101: builtin method return-type table. Method calls like
         # `s.as_bytes()` hit compiler intrinsics (try_emit_strview_as_bytes),
         # NOT a real fn_def, so the EXPR_CALL branch above can't find them
@@ -393,6 +399,31 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
             emit_str(s, c"  store ")
             emit_llvm_type_struct(s, TYPE_STRUCT, stmt.var_type_name, stmt.var_type_name_len)
             emit_str(s, c" ")
+            emit_reg(s, init_reg)
+            emit_str(s, c", ptr ")
+            emit_reg(s, alloca_reg)
+            emit_str(s, c"\n")
+        else if var_type == TYPE_F32
+            # Float literal lowers as `fadd double 0.0, <lit>` (i.e. f64);
+            # narrow to f32 via fptrunc when the binding is f32-typed.
+            # The init reg is `double` — same alloca slot is `float`.
+            var stored_reg: i32 = init_reg
+            let init_ty: i32 = get_expr_type(s, stmt.var_init)
+            if init_ty == TYPE_F64
+                stored_reg = next_reg(s)
+                emit_str(s, c"  ")
+                emit_reg(s, stored_reg)
+                emit_str(s, c" = fptrunc double ")
+                emit_reg(s, init_reg)
+                emit_str(s, c" to float\n")
+            emit_str(s, c"  store float ")
+            emit_reg(s, stored_reg)
+            emit_str(s, c", ptr ")
+            emit_reg(s, alloca_reg)
+            emit_str(s, c"\n")
+        else if var_type == TYPE_F64
+            # f64 binding — float lit already at double, nothing to widen.
+            emit_str(s, c"  store double ")
             emit_reg(s, init_reg)
             emit_str(s, c", ptr ")
             emit_reg(s, alloca_reg)
