@@ -226,6 +226,84 @@ fn emit_expr_binary(s: *EmitterState, e: *Expr) -> i32
         emit_str(s, c" to i64\n")
         return ptr_result
 
+    # Float arithmetic / comparison dispatch.  When either operand is a
+    # float, route through fadd/fsub/fmul/fdiv/fcmp instead of i64 ops.
+    # The float result stays as `float`/`double` (no widening to i64) so
+    # the surrounding emit-llvm-type knows what shape to write.  ritz0 uses
+    # the same pattern via NamedType("f32")/("f64") string-name dispatch.
+    let lty: i32 = get_expr_type(s, e.left)
+    let rty: i32 = get_expr_type(s, e.right)
+    var lname: *u8 = null
+    var lname_len: i32 = 0
+    var rname: *u8 = null
+    var rname_len: i32 = 0
+    if e.left.kind == EXPR_IDENT
+        let llv: *LocalVar = find_local_struct_name(s, e.left.ident_ptr, e.left.ident_len)
+        if llv != null
+            lname = llv.type_name
+            lname_len = llv.type_name_len
+    if e.right.kind == EXPR_IDENT
+        let rlv: *LocalVar = find_local_struct_name(s, e.right.ident_ptr, e.right.ident_len)
+        if rlv != null
+            rname = rlv.type_name
+            rname_len = rlv.type_name_len
+    let lf: i32 = is_float_type(lty, lname, lname_len)
+    let rf: i32 = is_float_type(rty, rname, rname_len)
+    if lf == 1 or rf == 1
+        # Pick the wider type: f64 wins over f32.  EXPR_FLOAT_LIT defaults
+        # to double; if the other side is f32, narrow the literal via
+        # fptrunc.  For mixed lit+f32, keep the result at f32 width.
+        let result_f: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, result_f)
+        emit_str(s, c" = ")
+        # Choose width: f32 if BOTH sides are f32 (or one is f32 and other a
+        # narrowable lit); f64 otherwise.  For now we treat f32 vs f64 the
+        # same and emit at the tighter type when known.
+        var fty: *u8 = c"double"
+        if lty == TYPE_F32 and (rty == TYPE_F32 or e.right.kind == EXPR_FLOAT_LIT)
+            fty = c"float"
+        else if rty == TYPE_F32 and (lty == TYPE_F32 or e.left.kind == EXPR_FLOAT_LIT)
+            fty = c"float"
+        if e.op == OP_ADD
+            emit_str(s, c"fadd ")
+        else if e.op == OP_SUB
+            emit_str(s, c"fsub ")
+        else if e.op == OP_MUL
+            emit_str(s, c"fmul ")
+        else if e.op == OP_DIV
+            emit_str(s, c"fdiv ")
+        else if e.op == OP_EQ
+            emit_str(s, c"fcmp oeq ")
+        else if e.op == OP_NE
+            emit_str(s, c"fcmp one ")
+        else if e.op == OP_LT
+            emit_str(s, c"fcmp olt ")
+        else if e.op == OP_GT
+            emit_str(s, c"fcmp ogt ")
+        else if e.op == OP_LE
+            emit_str(s, c"fcmp ole ")
+        else if e.op == OP_GE
+            emit_str(s, c"fcmp oge ")
+        else
+            emit_str(s, c"fadd ")
+        emit_str(s, fty)
+        emit_str(s, c" ")
+        emit_reg(s, left_reg)
+        emit_str(s, c", ")
+        emit_reg(s, scaled_right)
+        emit_str(s, c"\n")
+        # Comparison ops produce i1 — zext to i64 for unified value model.
+        if e.op == OP_EQ or e.op == OP_NE or e.op == OP_LT or e.op == OP_GT or e.op == OP_LE or e.op == OP_GE
+            let ext: i32 = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, ext)
+            emit_str(s, c" = zext i1 ")
+            emit_reg(s, result_f)
+            emit_str(s, c" to i64\n")
+            return ext
+        return result_f
+
     let result: i32 = next_reg(s)
 
     emit_str(s, c"  ")

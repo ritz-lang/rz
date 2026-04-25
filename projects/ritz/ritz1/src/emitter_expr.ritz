@@ -513,8 +513,82 @@ fn emit_expr(s: *EmitterState, e: *Expr) -> i32
     else if e.kind == EXPR_INDEX
         return emit_expr_index(s, e)
     else if e.kind == EXPR_CAST
-        # Parser stores operand in e.left field
-        return emit_expr(s, e.left)
+        # `expr as <type>` — `e.op` holds the target type kind.
+        # Float ↔ int needs explicit instructions (sitofp / fptosi /
+        # fptrunc / fpext); same-class casts pass through as i64 wraps
+        # (the unified value model already keeps narrow ints in i64).
+        let cast_src: i32 = emit_expr(s, e.left)
+        let target_ty: i32 = e.op
+        var src_name: *u8 = null
+        var src_name_len: i32 = 0
+        if e.left.kind == EXPR_IDENT
+            let lv2: *LocalVar = find_local_struct_name(s, e.left.ident_ptr, e.left.ident_len)
+            if lv2 != null
+                src_name = lv2.type_name
+                src_name_len = lv2.type_name_len
+        let src_ty: i32 = get_expr_type(s, e.left)
+        let src_is_float: i32 = is_float_type(src_ty, src_name, src_name_len)
+        let dst_is_float: i32 = is_float_type(target_ty, null, 0)
+        if src_is_float == 1 and dst_is_float == 0
+            # Float → int: fptosi
+            let r: i32 = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, r)
+            emit_str(s, c" = fptosi ")
+            if src_ty == TYPE_F32
+                emit_str(s, c"float")
+            else
+                emit_str(s, c"double")
+            emit_str(s, c" ")
+            emit_reg(s, cast_src)
+            emit_str(s, c" to ")
+            emit_llvm_type(s, target_ty)
+            emit_str(s, c"\n")
+            # Sign-extend narrow int back to i64 for unified value model
+            if target_ty == TYPE_I32 or target_ty == TYPE_U32
+                let ext: i32 = next_reg(s)
+                emit_str(s, c"  ")
+                emit_reg(s, ext)
+                if target_ty == TYPE_I32
+                    emit_str(s, c" = sext i32 ")
+                else
+                    emit_str(s, c" = zext i32 ")
+                emit_reg(s, r)
+                emit_str(s, c" to i64\n")
+                return ext
+            return r
+        if src_is_float == 0 and dst_is_float == 1
+            # Int → float: sitofp.  Source is i64 in unified model.
+            let r: i32 = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, r)
+            emit_str(s, c" = sitofp i64 ")
+            emit_reg(s, cast_src)
+            emit_str(s, c" to ")
+            emit_llvm_type(s, target_ty)
+            emit_str(s, c"\n")
+            return r
+        if src_is_float == 1 and dst_is_float == 1
+            # f32 ↔ f64
+            if src_ty == TYPE_F64 and target_ty == TYPE_F32
+                let r: i32 = next_reg(s)
+                emit_str(s, c"  ")
+                emit_reg(s, r)
+                emit_str(s, c" = fptrunc double ")
+                emit_reg(s, cast_src)
+                emit_str(s, c" to float\n")
+                return r
+            if src_ty == TYPE_F32 and target_ty == TYPE_F64
+                let r: i32 = next_reg(s)
+                emit_str(s, c"  ")
+                emit_reg(s, r)
+                emit_str(s, c" = fpext float ")
+                emit_reg(s, cast_src)
+                emit_str(s, c" to double\n")
+                return r
+            return cast_src
+        # int → int: pass through (uniform i64 representation)
+        return cast_src
 
     else if e.kind == EXPR_NIL_LIT
         # nil literal - emit as null pointer (0)
