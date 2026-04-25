@@ -153,6 +153,93 @@ fn find_generic_struct(m: *Module, name: *u8, name_len: i32) -> *StructDef
     return null
 
 # ============================================================================
+# Local-var Type Tracking (per fn body, for UFCS-driven instantiation)
+# ============================================================================
+# When we see `var v = vec_new<u16>()` at the AST level, monomorph normally
+# only records `vec_new$u16` (the explicit generic call).  But the later
+# `v.push(...)` call is an EXPR_METHOD whose mangled fn name (`vec_push$u16`)
+# is computed at emit time — without a hook here, we never collect that
+# instantiation, the linker can't find `vec_push$u16`, and the UFCS dispatch
+# in emitter_expr_call.ritz falls back to the broken `Vec$u16_push` mangling.
+#
+# Solution: walk fn bodies tracking which local vars hold Vec<T> / Span<T>
+# (inferred from the initializer), then on every EXPR_METHOD with an IDENT
+# receiver, register the corresponding `vec_<method>$<T>` / `span_<method>$<T>`
+# instantiation when a matching generic template exists.
+
+const MAX_LOCAL_VARS: i32 = 64
+
+var g_lv_names: **u8 = null
+var g_lv_name_lens: *i32 = null
+var g_lv_prefix_kind: *i32 = null      # 1 = Vec, 2 = Span
+var g_lv_suffixes: **u8 = null         # The "$T" portion (with leading $)
+var g_lv_suffix_lens: *i32 = null
+var g_lv_count: i32 = 0
+var g_lv_initialized: i32 = 0
+
+fn init_local_var_tracker()
+    if g_lv_initialized == 1
+        return
+    g_lv_names = malloc(MAX_LOCAL_VARS * 8) as **u8
+    g_lv_name_lens = malloc(MAX_LOCAL_VARS * 4) as *i32
+    g_lv_prefix_kind = malloc(MAX_LOCAL_VARS * 4) as *i32
+    g_lv_suffixes = malloc(MAX_LOCAL_VARS * 8) as **u8
+    g_lv_suffix_lens = malloc(MAX_LOCAL_VARS * 4) as *i32
+    g_lv_initialized = 1
+    g_lv_count = 0
+
+fn reset_local_var_tracker()
+    g_lv_count = 0
+
+fn add_local_var(name: *u8, name_len: i32, prefix_kind: i32, suffix: *u8, suffix_len: i32)
+    if g_lv_count >= MAX_LOCAL_VARS
+        return
+    *(g_lv_names + g_lv_count) = name
+    *(g_lv_name_lens + g_lv_count) = name_len
+    *(g_lv_prefix_kind + g_lv_count) = prefix_kind
+    *(g_lv_suffixes + g_lv_count) = suffix
+    *(g_lv_suffix_lens + g_lv_count) = suffix_len
+    g_lv_count = g_lv_count + 1
+
+fn find_local_var_idx(name: *u8, name_len: i32) -> i32
+    for i in 0..g_lv_count
+        if *(g_lv_name_lens + i) == name_len
+            if memcmp(*(g_lv_names + i), name, name_len as i64) == 0
+                return i
+    return -1
+
+# If `type_name` is a Vec$T or Span$T mangled name, return the prefix kind
+# (1 = Vec, 2 = Span) and write the inner suffix (with leading $) to out.
+# Returns 0 if no match.
+fn classify_collection_type(type_name: *u8, type_name_len: i32, out_suffix: **u8, out_suffix_len: *i32) -> i32
+    if type_name == null or type_name_len < 5
+        return 0
+    # "Vec$..." → kind 1, suffix starts at index 3
+    if *(type_name + 0) == 86 and *(type_name + 1) == 101 and *(type_name + 2) == 99 and *(type_name + 3) == 36
+        *out_suffix = type_name + 3
+        *out_suffix_len = type_name_len - 3
+        return 1
+    # "Span$..." → kind 2, suffix starts at index 4 (need 6+ bytes)
+    if type_name_len >= 6
+        if *(type_name + 0) == 83 and *(type_name + 1) == 112 and *(type_name + 2) == 97 and *(type_name + 3) == 110 and *(type_name + 4) == 36
+            *out_suffix = type_name + 4
+            *out_suffix_len = type_name_len - 4
+            return 2
+    return 0
+
+# Walk module functions looking for any (generic or specialized) fn matching
+# the given name.  Used during collection to resolve a var-decl initializer
+# call's return type so we can infer the local var's struct type.
+fn find_fn_in_module(m: *Module, name: *u8, name_len: i32) -> *FnDef
+    var f: *FnDef = m.functions
+    while f != null
+        if f.name_len == name_len
+            if memcmp(f.name, name, name_len as i64) == 0
+                return f
+        f = f.next
+    return null
+
+# ============================================================================
 # Instantiation Collection
 # ============================================================================
 # Walk the AST to find all generic function and struct instantiations
@@ -200,6 +287,18 @@ fn collect_instantiations_from_module(m: *Module)
                 if p.param_type == TYPE_STRUCT and p.param_type_name != null
                     add_struct_from_mangled_name(m, p.param_type_name, p.param_type_name_len)
                 p = p.next
+            # Reset local-var tracker per fn body, then seed from fn params so
+            # `fn foo(v: Vec<T>)` lets `v.push(...)` resolve UFCS-style.
+            reset_local_var_tracker()
+            var pp: *Param = f.params
+            while pp != null
+                if pp.param_type == TYPE_STRUCT and pp.param_type_name != null
+                    var psuf: *u8 = null
+                    var psuf_len: i32 = 0
+                    let pkind: i32 = classify_collection_type(pp.param_type_name, pp.param_type_name_len, @psuf, @psuf_len)
+                    if pkind > 0
+                        add_local_var(pp.name, pp.name_len, pkind, psuf, psuf_len)
+                pp = pp.next
             # Walk function body
             collect_from_fn_body(m, f.body)
         f = f.next
@@ -209,6 +308,16 @@ fn collect_instantiations_from_module(m: *Module)
     while ib != null
         var method: *FnDef = ib.methods
         while method != null
+            reset_local_var_tracker()
+            var ipp: *Param = method.params
+            while ipp != null
+                if ipp.param_type == TYPE_STRUCT and ipp.param_type_name != null
+                    var ipsuf: *u8 = null
+                    var ipsuf_len: i32 = 0
+                    let ipkind: i32 = classify_collection_type(ipp.param_type_name, ipp.param_type_name_len, @ipsuf, @ipsuf_len)
+                    if ipkind > 0
+                        add_local_var(ipp.name, ipp.name_len, ipkind, ipsuf, ipsuf_len)
+                ipp = ipp.next
             collect_from_fn_body(m, method.body)
             method = method.next
         ib = ib.next
@@ -238,6 +347,36 @@ fn collect_from_stmt(m: *Module, s: *Stmt)
         # Check if variable type is a generic struct
         if s.var_type == TYPE_STRUCT and s.var_type_name != null
             add_struct_from_mangled_name(m, s.var_type_name, s.var_type_name_len)
+        # Record local-var → Vec/Span suffix mapping for UFCS-driven generic
+        # instantiation.  Two paths:
+        #   1. Explicit annotation: `var v: Vec<u16>` — var_type_name="Vec$u16"
+        #   2. Inferred from EXPR_CALL initializer: `var v = vec_new<u16>()`
+        #      — look up the called fn's return type (which for a generic
+        #      template is "Vec$T"; substitute T with the call's type suffix).
+        var lv_kind: i32 = 0
+        var lv_suf: *u8 = null
+        var lv_suf_len: i32 = 0
+        if s.var_type == TYPE_STRUCT and s.var_type_name != null
+            lv_kind = classify_collection_type(s.var_type_name, s.var_type_name_len, @lv_suf, @lv_suf_len)
+        if lv_kind == 0 and s.var_init != null
+            if s.var_init.kind == EXPR_CALL
+                if s.var_init.call_type_suffix_len > 0
+                    let init_fn: *FnDef = find_fn_in_module(m, s.var_init.func_name, s.var_init.func_name_len)
+                    if init_fn != null
+                        if init_fn.return_type == TYPE_STRUCT and init_fn.return_type_name != null
+                            # Template return type names look like "Vec$T".
+                            # The classifier wants the concrete suffix though,
+                            # so for generic templates we use the call's own
+                            # type suffix instead of the template's "$T".
+                            var rt_suf: *u8 = null
+                            var rt_suf_len: i32 = 0
+                            let rt_kind: i32 = classify_collection_type(init_fn.return_type_name, init_fn.return_type_name_len, @rt_suf, @rt_suf_len)
+                            if rt_kind > 0
+                                lv_kind = rt_kind
+                                lv_suf = s.var_init.call_type_suffix
+                                lv_suf_len = s.var_init.call_type_suffix_len
+        if lv_kind > 0 and lv_suf != null and lv_suf_len > 0
+            add_local_var(s.var_name, s.var_name_len, lv_kind, lv_suf, lv_suf_len)
         if s.var_init != null
             collect_from_expr(m, s.var_init)
     else if k == STMT_ASSIGN
@@ -317,6 +456,50 @@ fn collect_from_expr(m: *Module, e: *Expr)
     else if k == EXPR_MEMBER
         collect_from_expr(m, e.left)  # base
     else if k == EXPR_METHOD
+        # UFCS instantiation: `v.push(...)` where v: Vec<T> implies
+        # `vec_push<T>` needs to be specialized.  Look up the receiver
+        # ident in the local-var tracker; when it's a Vec or Span,
+        # mangle to `vec_<method>$T` / `span_<method>$T` and register
+        # the instantiation so the specialization loop emits a real
+        # function body.  Without this, the linker fails on the missing
+        # `vec_<method>$T` symbol (the emitter's UFCS dispatch falls
+        # back to the broken `Vec$T_<method>` mangling).
+        if e.left != null and e.left.kind == EXPR_IDENT
+            let lv_idx: i32 = find_local_var_idx(e.left.ident_ptr, e.left.ident_len)
+            if lv_idx >= 0
+                let lv_kind: i32 = *(g_lv_prefix_kind + lv_idx)
+                let lv_suf: *u8 = *(g_lv_suffixes + lv_idx)
+                let lv_suf_len: i32 = *(g_lv_suffix_lens + lv_idx)
+                # Pick the fn-name prefix for the kind
+                var prefix_buf: [16]u8
+                var prefix_len: i32 = 0
+                if lv_kind == 1
+                    # "vec_"
+                    prefix_buf[0] = 'v'
+                    prefix_buf[1] = 'e'
+                    prefix_buf[2] = 'c'
+                    prefix_buf[3] = '_'
+                    prefix_len = 4
+                else if lv_kind == 2
+                    # "span_"
+                    prefix_buf[0] = 's'
+                    prefix_buf[1] = 'p'
+                    prefix_buf[2] = 'a'
+                    prefix_buf[3] = 'n'
+                    prefix_buf[4] = '_'
+                    prefix_len = 5
+                if prefix_len > 0
+                    # Build "<prefix><method>" for the fn name
+                    let mangled_len: i32 = prefix_len + e.ident_len
+                    let mangled: *u8 = malloc(mangled_len as i64 + 1) as *u8
+                    for i in 0..prefix_len
+                        *(mangled + i) = prefix_buf[i]
+                    for i in 0..e.ident_len
+                        *(mangled + prefix_len + i) = *(e.ident_ptr + i)
+                    *(mangled + mangled_len) = 0
+                    # Only register if a generic template by this name exists
+                    if find_generic_function(m, mangled, mangled_len) != null
+                        add_instantiation(mangled, mangled_len, lv_suf, lv_suf_len)
         collect_from_expr(m, e.left)  # receiver
         var arg: *Expr = e.args
         while arg != null
@@ -1027,6 +1210,7 @@ fn specialize_impl_method(m: *Module, method: *FnDef, type_name: *u8, type_name_
 
 fn monomorphize_module(m: *Module)
     init_instantiation_tracker()
+    init_local_var_tracker()
 
     # DEBUG: Count functions and check for generics
     var fn_count: i32 = 0
