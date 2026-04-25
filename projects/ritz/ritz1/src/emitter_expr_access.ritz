@@ -401,6 +401,121 @@ fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
     # NOTE: lane-bleed from ritz-task-101 into ritz-task-110's emitter_expr_access
     # lane — necessary because the emit_var_decl Span$u8 alloca fix in -101
     # depends on this to keep `bytes[0]` compiling.
+    # Vec$T local indexing — `v[i]` where v: Vec<T>.  Mirrors the
+    # Span$T branch below; emit_member_ptr's Vec-field path handles the
+    # `s.vec_field[i]` shape but not bare-local `v[i]`.  Without this,
+    # vec_push_u16_method's `v[0] == 3` lowers to `inttoptr i64 %vec_struct`
+    # which clang rejects (struct → ptr not allowed).
+    if e.left.kind == EXPR_IDENT and local != null and local.var_type == TYPE_STRUCT and local.type_name_len > 4
+        if *(local.type_name + 0) == 'V' and *(local.type_name + 1) == 'e' and *(local.type_name + 2) == 'c' and *(local.type_name + 3) == '$'
+            let idx_v: i32 = emit_expr(s, e.right)
+            # GEP to data ptr field (index 0 of Vec struct)
+            let v_data_ptr_ptr: i32 = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, v_data_ptr_ptr)
+            emit_str(s, c" = getelementptr %")
+            emit_name(s, local.type_name, local.type_name_len)
+            emit_str(s, c", ptr ")
+            emit_reg(s, local.reg)
+            emit_str(s, c", i32 0, i32 0\n")
+            let v_data_ptr: i32 = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, v_data_ptr)
+            emit_str(s, c" = load ptr, ptr ")
+            emit_reg(s, v_data_ptr_ptr)
+            emit_str(s, c"\n")
+            # Decode element type from suffix after "Vec$".
+            let v_en: *u8 = local.type_name + 4
+            let v_el: i32 = local.type_name_len - 4
+            var v_ty: *u8 = c"i64"
+            var v_kind: i32 = TYPE_I64
+            if v_el == 2 and *(v_en + 0) == 'u' and *(v_en + 1) == '8'
+                v_ty = c"i8"
+                v_kind = TYPE_U8
+            else if v_el == 2 and *(v_en + 0) == 'i' and *(v_en + 1) == '8'
+                v_ty = c"i8"
+                v_kind = TYPE_I8
+            else if v_el == 3 and *(v_en + 0) == 'u' and *(v_en + 1) == '1' and *(v_en + 2) == '6'
+                v_ty = c"i16"
+                v_kind = TYPE_U16
+            else if v_el == 3 and *(v_en + 0) == 'i' and *(v_en + 1) == '1' and *(v_en + 2) == '6'
+                v_ty = c"i16"
+                v_kind = TYPE_I16
+            else if v_el == 3 and *(v_en + 0) == 'u' and *(v_en + 1) == '3' and *(v_en + 2) == '2'
+                v_ty = c"i32"
+                v_kind = TYPE_U32
+            else if v_el == 3 and *(v_en + 0) == 'i' and *(v_en + 1) == '3' and *(v_en + 2) == '2'
+                v_ty = c"i32"
+                v_kind = TYPE_I32
+            let v_ep: i32 = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, v_ep)
+            emit_str(s, c" = getelementptr ")
+            emit_str(s, v_ty)
+            emit_str(s, c", ptr ")
+            emit_reg(s, v_data_ptr)
+            emit_str(s, c", i64 ")
+            emit_reg(s, idx_v)
+            emit_str(s, c"\n")
+            let v_val: i32 = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, v_val)
+            emit_str(s, c" = load ")
+            emit_str(s, v_ty)
+            emit_str(s, c", ptr ")
+            emit_reg(s, v_ep)
+            emit_str(s, c"\n")
+            # Extend to i64 for uniform value representation.
+            if v_kind == TYPE_U8
+                let ext: i32 = next_reg(s)
+                emit_str(s, c"  ")
+                emit_reg(s, ext)
+                emit_str(s, c" = zext i8 ")
+                emit_reg(s, v_val)
+                emit_str(s, c" to i64\n")
+                return ext
+            else if v_kind == TYPE_I8
+                let ext: i32 = next_reg(s)
+                emit_str(s, c"  ")
+                emit_reg(s, ext)
+                emit_str(s, c" = sext i8 ")
+                emit_reg(s, v_val)
+                emit_str(s, c" to i64\n")
+                return ext
+            else if v_kind == TYPE_U16
+                let ext: i32 = next_reg(s)
+                emit_str(s, c"  ")
+                emit_reg(s, ext)
+                emit_str(s, c" = zext i16 ")
+                emit_reg(s, v_val)
+                emit_str(s, c" to i64\n")
+                return ext
+            else if v_kind == TYPE_I16
+                let ext: i32 = next_reg(s)
+                emit_str(s, c"  ")
+                emit_reg(s, ext)
+                emit_str(s, c" = sext i16 ")
+                emit_reg(s, v_val)
+                emit_str(s, c" to i64\n")
+                return ext
+            else if v_kind == TYPE_U32
+                let ext: i32 = next_reg(s)
+                emit_str(s, c"  ")
+                emit_reg(s, ext)
+                emit_str(s, c" = zext i32 ")
+                emit_reg(s, v_val)
+                emit_str(s, c" to i64\n")
+                return ext
+            else if v_kind == TYPE_I32
+                let ext: i32 = next_reg(s)
+                emit_str(s, c"  ")
+                emit_reg(s, ext)
+                emit_str(s, c" = sext i32 ")
+                emit_reg(s, v_val)
+                emit_str(s, c" to i64\n")
+                return ext
+            return v_val
+
     if e.left.kind == EXPR_IDENT and local != null and local.var_type == TYPE_STRUCT and local.type_name_len >= 5
         if *(local.type_name + 0) == 'S' and *(local.type_name + 1) == 'p' and *(local.type_name + 2) == 'a' and *(local.type_name + 3) == 'n' and *(local.type_name + 4) == '$'
             let idx_s: i32 = emit_expr(s, e.right)
