@@ -337,7 +337,10 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
 
     # weak_odr: same as fn emission — linker merges duplicates across modules
     emit_str(s, c"define weak_odr ")
-    emit_llvm_type(s, method.return_type)
+    # emit_llvm_type_struct so struct-typed returns get the proper %Type
+    # rather than the i64 fallback.  Was emitting `i64 @Vec2_new(...)`
+    # when method returned %Vec2, blocking call-site type alignment.
+    emit_llvm_type_struct(s, method.return_type, method.return_type_name, method.return_type_name_len)
     emit_str(s, c" @")
     # Emit mangled name: Type_method
     emit_name(s, ib.type_name, ib.type_name_len)
@@ -487,6 +490,33 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
                     emit_str(s, c"\n")
                 else if method.return_type == 0
                     emit_str(s, c"  ret void\n")
+                else if method.return_type == TYPE_STRUCT and method.return_type_name_len > 0
+                    # Struct-returning impl method.  Tail expression
+                    # already produced an i64 register (unified value
+                    # model — `self` etc. lives as ptr-as-i64).  Inttoptr
+                    # to a real ptr, load the struct, return by value.
+                    # Without this, `ret %S i64-reg` mismatches the new
+                    # struct-typed signature emitted at the top of
+                    # emit_impl_method.
+                    let pp: i32 = next_reg(s)
+                    emit_str(s, c"  ")
+                    emit_reg(s, pp)
+                    emit_str(s, c" = inttoptr i64 ")
+                    emit_reg(s, val)
+                    emit_str(s, c" to ptr\n")
+                    let sv: i32 = next_reg(s)
+                    emit_str(s, c"  ")
+                    emit_reg(s, sv)
+                    emit_str(s, c" = load %")
+                    emit_name(s, method.return_type_name, method.return_type_name_len)
+                    emit_str(s, c", ptr ")
+                    emit_reg(s, pp)
+                    emit_str(s, c"\n")
+                    emit_str(s, c"  ret %")
+                    emit_name(s, method.return_type_name, method.return_type_name_len)
+                    emit_str(s, c" ")
+                    emit_reg(s, sv)
+                    emit_str(s, c"\n")
                 else
                     emit_str(s, c"  ret ")
                     emit_llvm_type(s, method.return_type)
