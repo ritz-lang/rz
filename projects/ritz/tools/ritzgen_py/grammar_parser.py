@@ -57,6 +57,12 @@ class Grammar:
     tokens: List[TokenDef] = field(default_factory=list)
     rules: List[GrammarRule] = field(default_factory=list)
     token_map: Dict[str, TokenDef] = field(default_factory=dict)
+    # Per-rule recovery directives.  Maps rule name -> list of token names.
+    # When all alternatives of the rule fail and we're not at EOF, the
+    # generated code skips forward to the next token whose kind is in this
+    # list, clears the error, and reports progress (return 1).  Used to
+    # convert "silent drop on unknown top-level item" into "skip & continue".
+    recovery: Dict[str, List[str]] = field(default_factory=dict)
 
 
 class GrammarParser:
@@ -100,6 +106,10 @@ class GrammarParser:
                 continue
             elif self._match('%skip'):
                 in_skip_section = True
+                continue
+            elif self._match('%recovery'):
+                in_skip_section = False
+                self._parse_recovery_section(grammar)
                 continue
             elif self._match('%grammar'):
                 # Parse grammar rules
@@ -194,6 +204,53 @@ class GrammarParser:
             return TokenDef(name, pattern, is_literal=False, is_skip=is_skip)
 
         return None
+
+    def _parse_recovery_section(self, grammar: Grammar):
+        """Parse %recovery declarations.
+
+        Format:
+            %recovery
+            <rule_name> = <TOKEN1> <TOKEN2> ... ;
+
+        Each line declares the recovery token-set for one rule: when
+        all alternatives of <rule_name> fail to match, the generator
+        will emit a skip-forward loop that advances p.pos past the
+        unmatched token until p_peek returns one of the listed tokens
+        (or EOF).  After the skip, p.error is cleared and the rule
+        returns 1 to signal progress so the enclosing star/plus loop
+        keeps going instead of silently dropping subsequent items.
+        """
+        while self.pos < len(self.text):
+            self._skip_whitespace_and_comments()
+            if self.pos >= len(self.text):
+                return
+            # Stop at next section marker.
+            if self.text[self.pos] == '%':
+                return
+            # Rule name (lowercase ident).
+            name_match = re.match(r'([a-z_][a-z0-9_]*)', self.text[self.pos:])
+            if not name_match:
+                return
+            name = name_match.group(1)
+            self.pos += len(name)
+            self._skip_whitespace_and_comments()
+            if not self._match('='):
+                return
+            self._skip_whitespace_and_comments()
+            # Collect tokens until ';' or newline-followed-by-non-token.
+            tokens: List[str] = []
+            while self.pos < len(self.text):
+                self._skip_whitespace_and_comments()
+                if self.pos >= len(self.text):
+                    break
+                if self._match(';'):
+                    break
+                tok_match = re.match(r'([A-Z_][A-Z0-9_]*)', self.text[self.pos:])
+                if not tok_match:
+                    break
+                tokens.append(tok_match.group(1))
+                self.pos += len(tok_match.group(1))
+            grammar.recovery[name] = tokens
 
     def _parse_grammar_rules(self, grammar: Grammar):
         """Parse grammar rules after %grammar."""

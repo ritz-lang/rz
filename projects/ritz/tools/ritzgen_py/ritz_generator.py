@@ -484,6 +484,28 @@ class RitzGenerator:
             self._emit(f'    # Alternative {alt_idx + 1}')
             self._generate_alternative(rule, alt, alt_idx, default_ret)
 
+        # Recovery directive: when all alternatives failed and we're not
+        # at EOF, skip forward to the next "anchor" token from the rule's
+        # recovery set, clear the error, and return.  For i32-returning
+        # rules (typical: `item`) we return 1 to signal "progress made"
+        # so the enclosing star/plus loop in the caller continues.
+        # For other return types we return the default (null / 0).
+        recovery_tokens = self.grammar.recovery.get(rule.name)
+        if recovery_tokens:
+            recovery_ret = '1' if rt == 'i32' else default_ret
+            self._emit('')
+            self._emit('    # Recovery: skip to next anchor token, report progress.')
+            self._emit('    if p.pos < p.token_count')
+            self._emit('        p.pos = p.pos + 1')
+            self._emit('        while p.pos < p.token_count')
+            self._emit('            let t: Token = p_current_token(p)')
+            for tok in recovery_tokens:
+                self._emit(f'            if t.kind == TOK_{tok}')
+                self._emit('                break')
+            self._emit('            p.pos = p.pos + 1')
+            self._emit('        p.error = 0')
+            self._emit(f'        return {recovery_ret}')
+
         # Final return
         self._emit('')
         self._emit(f'    if p.error == 0')

@@ -84,6 +84,60 @@ pub fn check_target_os_filter(p: *Parser, ident_start: *u8, ident_len: i32, str_
         return
     p.skip_item = 1
 
+# Grammar-action wrapper around check_target_os_filter.  The grammar's
+# `attr` rule returns i32; this lets the action stay a single function
+# call (no multi-statement-action support needed in ritzgen).
+pub fn attr_target_os(p: *Parser, ident_start: *u8, ident_len: i32, str_val: *u8, str_len: i32) -> i32
+    check_target_os_filter(p, ident_start, ident_len, str_val, str_len)
+    return 0
+
+# =============================================================================
+# Item dispatchers — honour p.skip_item set by attrs (5F.3c)
+# =============================================================================
+#
+# Conditional-compilation flow:
+#   1. parse_attrs walks the [[ ... ]] attribute list.  For
+#      `[[target_os = "<not linux>"]]`, attr_target_os sets p.skip_item = 1.
+#   2. The matching `attrs <item>` alternative in parse_item then calls
+#      one of these dispatchers, which:
+#        - skip the module_add_* call when p.skip_item == 1
+#        - reset p.skip_item to 0
+#        - return 1 to signal "alternative matched" to the multi-alt
+#          generator template (which only emits `return 1` on void rules;
+#          we want explicit-return semantics here for the skip case).
+#
+# Without these, the grammar action would need to be multi-statement
+# (`if not skipped: add_to_module; reset; return 1`), which ritzgen
+# doesn't yet support — so we hide the conditional inside a helper.
+pub fn item_dispatch_fn(p: *Parser, fn_def: *FnDef) -> i32
+    if p.skip_item == 0
+        module_add_fn(p.module, fn_def)
+    p.skip_item = 0
+    return 1
+
+pub fn item_dispatch_struct(p: *Parser, st: *StructDef) -> i32
+    if p.skip_item == 0
+        module_add_struct(p.module, st)
+    p.skip_item = 0
+    return 1
+
+pub fn item_dispatch_const(p: *Parser, c: *ConstEntry) -> i32
+    if p.skip_item == 0
+        module_add_const(p.module, c)
+    p.skip_item = 0
+    return 1
+
+pub fn item_dispatch_global(p: *Parser, g: *GlobalVarDef) -> i32
+    if p.skip_item == 0
+        module_add_global_var(p.module, g)
+    p.skip_item = 0
+    return 1
+
+pub fn item_dispatch_enum(p: *Parser) -> i32
+    # enum has no AST node yet; just reset skip flag and report progress.
+    p.skip_item = 0
+    return 1
+
 pub fn module_add_struct(m: *Module, s: *StructDef)
     if m.structs == null
         m.structs = s
@@ -1573,36 +1627,46 @@ pub fn parse_int(start: *u8, len: i32) -> i64
             return parse_hex(start + 2, len - 2)
         if prefix == 98 or prefix == 66   # 'b' or 'B'
             return parse_binary(start + 2, len - 2)
-    # Decimal parsing
+    # Decimal parsing.  Stops on the first non-digit so typed-int literal
+    # suffixes (`42i32`, `100u16`, etc.) are naturally ignored — caller
+    # used to have to pre-trim via int_lit_len; that's no longer required.
     var val: i64 = 0
     for i in 0..len
         let ch: i32 = *(start + i) as i32
-        if ch >= 48 and ch <= 57  # '0'-'9'
-            val = val * 10 + (ch - 48) as i64
+        if ch < 48 or ch > 57  # not '0'-'9'
+            return val
+        val = val * 10 + (ch - 48) as i64
     return val
 
 pub fn parse_hex(start: *u8, len: i32) -> i64
+    # Stops on the first non-hex-digit so a `42u8` style suffix on a hex
+    # literal (`0xFFi32`) doesn't leak into the value.
     var val: i64 = 0
     for i in 0..len
         let ch: i32 = *(start + i) as i32
-        var digit: i64 = 0
+        var digit: i64 = -1
         if ch >= 48 and ch <= 57       # '0'-'9'
             digit = (ch - 48) as i64
         else if ch >= 65 and ch <= 70  # 'A'-'F'
             digit = (ch - 55) as i64
         else if ch >= 97 and ch <= 102 # 'a'-'f'
             digit = (ch - 87) as i64
+        if digit < 0
+            return val
         val = val * 16 + digit
     return val
 
 pub fn parse_binary(start: *u8, len: i32) -> i64
+    # Stops on the first non-bit-digit (typed-int suffix tolerance).
     var val: i64 = 0
     for i in 0..len
         let ch: i32 = *(start + i) as i32
-        if ch == 49  # '1'
+        if ch == 49        # '1'
             val = val * 2 + 1
-        else         # '0'
+        else if ch == 48   # '0'
             val = val * 2
+        else
+            return val
     return val
 
 # =============================================================================
