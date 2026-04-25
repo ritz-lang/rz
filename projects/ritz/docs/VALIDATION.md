@@ -67,6 +67,13 @@ These are not suggestions:
    your change can't possibly affect `ritz1`'s own compiled output (for
    example, you're only adding a grammar rule that ritz1's source doesn't use),
    skip it.
+5. **Never hand-edit `ritz1/src/parser_gen.ritz`.** The grammar (in
+   `grammars/ritz1.grammar`) is the source of truth. Edit the grammar, then
+   regenerate via `tools/ritzgen_py/ritz_generator.py grammars/ritz1.grammar
+   --monolithic --output-dir <tmp>` and copy the output. `make matrix` and
+   `make matrix-full` run `make regen-check` automatically and refuse to run
+   the matrix if drift is detected — but you can also run `make regen-check`
+   directly any time to verify.
 
 ---
 

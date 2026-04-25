@@ -13,7 +13,7 @@
 #   make build-<name>  - Build a specific package
 #   make test-<name>   - Build and test a specific package
 
-.PHONY: all test unit ritz ritz1 build clean list help valgrind regression regression-quick check-no-s-strings matrix matrix-full matrix-quick
+.PHONY: all test unit ritz ritz1 build clean list help valgrind regression regression-quick check-no-s-strings matrix matrix-full matrix-quick regen-check
 
 PYTHON ?= python3
 VALGRIND ?= valgrind --error-exitcode=1 --leak-check=full -q
@@ -105,15 +105,38 @@ valgrind: build
 #
 # DO NOT add a `clean` step here. Make's dep tracking is correct; if it
 # isn't, that's a Makefile bug. See docs/VALIDATION.md "Hard rules".
-matrix-quick: | _matrix_ritz1_built
+matrix-quick: regen-check | _matrix_ritz1_built
 	@$(PYTHON) tools/run_regression_matrix.py --compiler ritz1
 
 matrix: matrix-quick
 
-matrix-full: | _matrix_ritz1_built
+matrix-full: regen-check | _matrix_ritz1_built
 	@echo "=== Full matrix (ritz0 + ritz1 + ritz1_selfhosted) ==="
 	@echo "    This will incrementally rebuild ritz1_selfhosted (~3 min if ritz1 source changed)."
 	@$(PYTHON) tools/run_regression_matrix.py --rebuild
+
+# Guard against the cardinal sin: hand-editing parser_gen.ritz instead of
+# regenerating from grammars/ritz1.grammar.  Runs the generator into a tmp
+# dir and diffs against the committed parser_gen.ritz.  If they differ, the
+# committed file has drifted from the grammar — fix the grammar, regen, or
+# both.
+#
+# See docs/VALIDATION.md "Hard rules" — the grammar is the source of truth.
+regen-check:
+	@TMPDIR=$$(mktemp -d) && \
+	  $(PYTHON) tools/ritzgen_py/ritz_generator.py grammars/ritz1.grammar \
+	    --monolithic --output-dir $$TMPDIR >/dev/null 2>&1 && \
+	  if ! diff -q $$TMPDIR/parser.ritz ritz1/src/parser_gen.ritz >/dev/null 2>&1; then \
+	    echo "❌ regen-check FAILED — parser_gen.ritz has drifted from grammars/ritz1.grammar." ; \
+	    echo "   Either:" ; \
+	    echo "     (a) edit grammars/ritz1.grammar and regenerate," ; \
+	    echo "     (b) revert hand-edits to ritz1/src/parser_gen.ritz." ; \
+	    echo "   First few diff lines:" ; \
+	    diff $$TMPDIR/parser.ritz ritz1/src/parser_gen.ritz | head -10 ; \
+	    rm -rf $$TMPDIR ; \
+	    exit 1 ; \
+	  fi ; \
+	  rm -rf $$TMPDIR
 
 # Internal: ensure ritz1 binary is up-to-date before running the matrix.
 .PHONY: _matrix_ritz1_built
@@ -144,6 +167,7 @@ help:
 	@echo "  make valgrind - Run valgrind memory checks on Tier 1 examples"
 	@echo "  make matrix       - Pre-commit gate: incremental ritz1 + ritz1-only matrix (~30-60s)"
 	@echo "  make matrix-full  - Pre-push gate: incremental ritz1 + selfhost + full matrix (~4-5min)"
+	@echo "  make regen-check  - Verify parser_gen.ritz matches a fresh regen from the grammar"
 	@echo "  make regression       - Full regression suite (all 4 tiers)"
 	@echo "  make regression-quick - Quick regression (skip bootstrap)"
 	@echo "  make check-no-s-strings - Guard that no s\"...\" literals leak back in"
