@@ -1166,6 +1166,98 @@ fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: i32)
 fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
     if stmt.kind == STMT_VAR_DECL
         emit_var_decl(s, stmt)
+    else if stmt.kind == STMT_TUPLE_DECL
+        # `let (x, y) = expr` — destructure 2-field struct value.  Resolve
+        # the struct type from the init expr, extract fields 0 and 1, and
+        # bind two locals (sign/zero-extended to i64 for uniform storage).
+        let init_reg: i32 = emit_expr(s, stmt.var_init)
+        let init_type: i32 = get_expr_type(s, stmt.var_init)
+        var struct_name: *u8 = null
+        var struct_name_len: i32 = 0
+        # Pull the type name from the call/expr's return-type metadata.
+        if stmt.var_init.kind == EXPR_CALL
+            let cn: *u8 = stmt.var_init.func_name
+            let cn_len: i32 = stmt.var_init.func_name_len
+            let fn_def: *FnDef = find_fn(s, cn, cn_len)
+            if fn_def != null and fn_def.return_type_name_len > 0
+                struct_name = fn_def.return_type_name as *u8
+                struct_name_len = fn_def.return_type_name_len
+        # Fall back: if init is a struct ident, use its type name.
+        if struct_name_len == 0
+            if stmt.var_init.kind == EXPR_IDENT
+                let lv: *LocalVar = find_local_struct_name(s, stmt.var_init.ident_ptr, stmt.var_init.ident_len)
+                if lv != null
+                    struct_name = lv.type_name
+                    struct_name_len = lv.type_name_len
+        if struct_name_len > 0
+            let st: *StructDef = find_struct(s, struct_name, struct_name_len)
+            # Slot 1 — first field
+            let slot1: i32 = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, slot1)
+            emit_str(s, c" = alloca i64\n")
+            let f1_val: i32 = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, f1_val)
+            emit_str(s, c" = extractvalue %")
+            emit_name(s, struct_name, struct_name_len)
+            emit_str(s, c" ")
+            emit_reg(s, init_reg)
+            emit_str(s, c", 0\n")
+            # Widen field 0 to i64 (i32 sext / i8 sext / i64 passthrough).
+            var f1_ext: i32 = f1_val
+            if st != null
+                let fld0: *StructField = get_field_type(st, 0)
+                if fld0 != null
+                    if fld0.field_type == TYPE_I32 or fld0.field_type == TYPE_U32
+                        f1_ext = next_reg(s)
+                        emit_str(s, c"  ")
+                        emit_reg(s, f1_ext)
+                        if fld0.field_type == TYPE_I32
+                            emit_str(s, c" = sext i32 ")
+                        else
+                            emit_str(s, c" = zext i32 ")
+                        emit_reg(s, f1_val)
+                        emit_str(s, c" to i64\n")
+            emit_str(s, c"  store i64 ")
+            emit_reg(s, f1_ext)
+            emit_str(s, c", ptr ")
+            emit_reg(s, slot1)
+            emit_str(s, c"\n")
+            add_local(s, stmt.var_name, stmt.var_name_len, slot1, TYPE_I64)
+            # Slot 2 — second field
+            let slot2: i32 = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, slot2)
+            emit_str(s, c" = alloca i64\n")
+            let f2_val: i32 = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, f2_val)
+            emit_str(s, c" = extractvalue %")
+            emit_name(s, struct_name, struct_name_len)
+            emit_str(s, c" ")
+            emit_reg(s, init_reg)
+            emit_str(s, c", 1\n")
+            var f2_ext: i32 = f2_val
+            if st != null
+                let fld1: *StructField = get_field_type(st, 1)
+                if fld1 != null
+                    if fld1.field_type == TYPE_I32 or fld1.field_type == TYPE_U32
+                        f2_ext = next_reg(s)
+                        emit_str(s, c"  ")
+                        emit_reg(s, f2_ext)
+                        if fld1.field_type == TYPE_I32
+                            emit_str(s, c" = sext i32 ")
+                        else
+                            emit_str(s, c" = zext i32 ")
+                        emit_reg(s, f2_val)
+                        emit_str(s, c" to i64\n")
+            emit_str(s, c"  store i64 ")
+            emit_reg(s, f2_ext)
+            emit_str(s, c", ptr ")
+            emit_reg(s, slot2)
+            emit_str(s, c"\n")
+            add_local(s, stmt.assign_target, stmt.assign_target_len, slot2, TYPE_I64)
     else if stmt.kind == STMT_ASSIGN
         emit_assign(s, stmt)
     else if stmt.kind == STMT_RETURN
