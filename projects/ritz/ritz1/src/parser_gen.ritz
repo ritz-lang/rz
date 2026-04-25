@@ -31,8 +31,11 @@ fn parser_init(p: *Parser, tokens: *Token, count: i32, arena_ptr: *u8)
     p.last_call_type_suffix = null
     p.last_call_type_suffix_len = 0
     p.last_ref_inner_type = 0
-    # Conditional-compilation skip flag. MUST be zeroed — if left garbage
-    # we'd drop every parsed item and produce an empty module.
+    # Conditional-compilation skip flag. MUST be zeroed — if left
+    # garbage we drop every parsed item and produce an empty module.
+    # Symptom: with RITZ_PATH set (different heap layout), the first
+    # parsed fn lands on a non-zero skip_item and silently disappears,
+    # leaving callers with extern declarations only at link time.
     p.skip_item = 0
 
 fn p_peek(p: *Parser) -> i32
@@ -62,23 +65,6 @@ fn p_current_token(p: *Parser) -> Token
         eof.col = 0
         return eof
     return *(p.tokens + p.pos)
-
-# AGAST #107: return the digit-only length of an integer-literal token,
-# trimming the optional `[uUiI](8|16|32|64|size)` typed suffix absorbed by
-# the lexer. Scans left-to-right and stops at the first u/U/i/I that
-# appears after at least one leading digit-or-prefix char. Hex/binary
-# prefixes (`0x`, `0b`) are preserved because 'x'/'b'/'X'/'B' are not
-# treated as suffix markers here.
-fn int_lit_len(start: *u8, len: i32) -> i32
-    var si: i32 = 0
-    while si < len
-        let sc: i32 = *(start + si) as i32
-        # 'u'=117 'U'=85 'i'=105 'I'=73 — suffix only after at least one
-        # preceding digit/prefix char (si > 0).
-        if si > 0 and (sc == 117 or sc == 85 or sc == 105 or sc == 73)
-            return si
-        si = si + 1
-    return len
 
 fn parse_module(p: *Parser) -> *Module
     let start_pos: i32 = p.pos
@@ -223,11 +209,7 @@ fn parse_attr(p: *Parser) -> i32
             p.error = 1
             p.pos = start_pos
     if p.error == 0
-        # Hook: let ast_helpers inspect `[[ident = "string"]]` for
-        # target_os filtering. result_a2_2 is the ident token,
-        # result_a2_4 is the string-literal token.
-        check_target_os_filter(p, result_a2_2.start, result_a2_2.len, result_a2_4.string_val, result_a2_4.string_len)
-        return 0
+        return attr_target_os(p, result_a2_2.start, result_a2_2.len, result_a2_4.string_val, result_a2_4.string_len)
 
     if p.error == 0
         return 0
@@ -235,9 +217,6 @@ fn parse_attr(p: *Parser) -> i32
 
 fn parse_item(p: *Parser) -> i32
     let start_pos: i32 = p.pos
-    # Reset target_os skip flag at start of each item — parse_attrs may
-    # set it during attribute parsing below.
-    p.skip_item = 0
 
     # Alternative 1
     var result_a1_1: i32
@@ -251,15 +230,11 @@ fn parse_item(p: *Parser) -> i32
         if p.error != 0
             p.pos = start_pos
     if p.error == 0
-        if p.skip_item == 0
-            module_add_fn(p.module, result_a1_2)
-    if p.pos > start_pos
-        return 1
+        return item_dispatch_fn(p, result_a1_2)
 
     # Try next alternative
     p.pos = start_pos
     p.error = 0
-    p.skip_item = 0
 
     # Alternative 2
     var result_a2_1: i32
@@ -273,15 +248,11 @@ fn parse_item(p: *Parser) -> i32
         if p.error != 0
             p.pos = start_pos
     if p.error == 0
-        if p.skip_item == 0
-            module_add_fn(p.module, result_a2_2)
-    if p.pos > start_pos
-        return 1
+        return item_dispatch_fn(p, result_a2_2)
 
     # Try next alternative
     p.pos = start_pos
     p.error = 0
-    p.skip_item = 0
 
     # Alternative 3
     var result_a3_1: i32
@@ -295,15 +266,11 @@ fn parse_item(p: *Parser) -> i32
         if p.error != 0
             p.pos = start_pos
     if p.error == 0
-        if p.skip_item == 0
-            module_add_struct(p.module, result_a3_2)
-    if p.pos > start_pos
-        return 1
+        return item_dispatch_struct(p, result_a3_2)
 
     # Try next alternative
     p.pos = start_pos
     p.error = 0
-    p.skip_item = 0
 
     # Alternative 4
     var result_a4_1: i32
@@ -317,15 +284,11 @@ fn parse_item(p: *Parser) -> i32
         if p.error != 0
             p.pos = start_pos
     if p.error == 0
-        if p.skip_item == 0
-            module_add_const(p.module, result_a4_2)
-    if p.pos > start_pos
-        return 1
+        return item_dispatch_const(p, result_a4_2)
 
     # Try next alternative
     p.pos = start_pos
     p.error = 0
-    p.skip_item = 0
 
     # Alternative 5
     var result_a5_1: i32
@@ -339,38 +302,38 @@ fn parse_item(p: *Parser) -> i32
         if p.error != 0
             p.pos = start_pos
     if p.error == 0
-        if p.skip_item == 0
-            module_add_global_var(p.module, result_a5_2)
-    if p.pos > start_pos
-        return 1
+        return item_dispatch_global(p, result_a5_2)
 
     # Try next alternative
     p.pos = start_pos
     p.error = 0
 
     # Alternative 6
-    var result_a6_1: *ImportDecl
+    var result_a6_1: i32
+    var result_a6_2: i32
 
-    result_a6_1 = parse_import_stmt(p)
+    result_a6_1 = parse_attrs(p)
     if p.error != 0
         p.pos = start_pos
     if p.error == 0
-        module_add_import(p.module, result_a6_1)
-    if p.pos > start_pos
-        return 1
+        result_a6_2 = parse_enum_def(p)
+        if p.error != 0
+            p.pos = start_pos
+    if p.error == 0
+        return item_dispatch_enum(p)
 
     # Try next alternative
     p.pos = start_pos
     p.error = 0
 
     # Alternative 7
-    var result_a7_1: *ImplBlock
+    var result_a7_1: *ImportDecl
 
-    result_a7_1 = parse_impl_block(p)
+    result_a7_1 = parse_import_stmt(p)
     if p.error != 0
         p.pos = start_pos
     if p.error == 0
-        module_add_impl(p.module, result_a7_1)
+        module_add_import(p.module, result_a7_1)
     if p.pos > start_pos
         return 1
 
@@ -378,26 +341,19 @@ fn parse_item(p: *Parser) -> i32
     p.pos = start_pos
     p.error = 0
 
-    # Alternative 8: enum declaration (consume-and-skip, ritz-task-87)
-    # Currently ritz1's AST has no enum node, so this just validates syntax
-    # and moves on. Variant constructors are resolved at call sites.
-    var enum_result: i32
+    # Alternative 8
+    var result_a8_1: *ImplBlock
 
-    enum_result = parse_enum_def(p)
+    result_a8_1 = parse_impl_block(p)
     if p.error != 0
         p.pos = start_pos
+    if p.error == 0
+        module_add_impl(p.module, result_a8_1)
     if p.pos > start_pos
         return 1
 
-    # Recovery path (task-99 cluster #1): no alternative matched. Before
-    # this existed, a partially-parsed impl/fn whose inner parse failed
-    # would return 0 here, parse_module would stop, and every subsequent
-    # top-level item was silently dropped ("Parsed functions: 0" on a
-    # 20-line file). Now: when we're not at EOF, skip forward to the next
-    # plausible top-level keyword and report progress so parse_module
-    # keeps going. Converts silent drops into partial parses.
+    # Recovery: skip to next anchor token, report progress.
     if p.pos < p.token_count
-        # Skip the current (unmatched) token and scan forward.
         p.pos = p.pos + 1
         while p.pos < p.token_count
             let t: Token = p_current_token(p)
@@ -420,6 +376,205 @@ fn parse_item(p: *Parser) -> i32
             p.pos = p.pos + 1
         p.error = 0
         return 1
+
+    if p.error == 0
+        return 0
+    return 0
+
+fn parse_enum_def(p: *Parser) -> i32
+    let start_pos: i32 = p.pos
+
+    # Alternative 1
+    var result_a1_1: Token
+    var result_a1_2: Token
+    var result_a1_3: *TypeParam
+    var result_a1_4: Token
+    var result_a1_5: Token
+    var result_a1_6: i32
+    var result_a1_7: Token
+
+    result_a1_1 = p_current_token(p)
+    if p_expect(p, TOK_ENUM) == 0
+        p.error = 1
+        p.pos = start_pos
+    if p.error == 0
+        result_a1_2 = p_current_token(p)
+        if p_expect(p, TOK_IDENT) == 0
+            p.error = 1
+            p.pos = start_pos
+    result_a1_3 = null
+    if p.error == 0
+        result_a1_3 = parse_generic_params(p)  # optional
+        p.error = 0
+    if p.error == 0
+        result_a1_4 = p_current_token(p)
+        if p_expect(p, TOK_NEWLINE) == 0
+            p.error = 1
+            p.pos = start_pos
+    if p.error == 0
+        result_a1_5 = p_current_token(p)
+        if p_expect(p, TOK_INDENT) == 0
+            p.error = 1
+            p.pos = start_pos
+    if p.error == 0
+        result_a1_6 = parse_enum_variants(p)
+        if p.error != 0
+            p.pos = start_pos
+    if p.error == 0
+        result_a1_7 = p_current_token(p)
+        if p_expect(p, TOK_DEDENT) == 0
+            p.error = 1
+            p.pos = start_pos
+    if p.error == 0
+        return enum_def_skip(p)
+
+    # Try next alternative
+    p.pos = start_pos
+    p.error = 0
+
+    # Alternative 2
+    var result_a2_1: Token
+    var result_a2_2: Token
+    var result_a2_3: Token
+    var result_a2_4: *TypeParam
+    var result_a2_5: Token
+    var result_a2_6: Token
+    var result_a2_7: i32
+    var result_a2_8: Token
+
+    result_a2_1 = p_current_token(p)
+    if p_expect(p, TOK_PUB) == 0
+        p.error = 1
+        p.pos = start_pos
+    if p.error == 0
+        result_a2_2 = p_current_token(p)
+        if p_expect(p, TOK_ENUM) == 0
+            p.error = 1
+            p.pos = start_pos
+    if p.error == 0
+        result_a2_3 = p_current_token(p)
+        if p_expect(p, TOK_IDENT) == 0
+            p.error = 1
+            p.pos = start_pos
+    result_a2_4 = null
+    if p.error == 0
+        result_a2_4 = parse_generic_params(p)  # optional
+        p.error = 0
+    if p.error == 0
+        result_a2_5 = p_current_token(p)
+        if p_expect(p, TOK_NEWLINE) == 0
+            p.error = 1
+            p.pos = start_pos
+    if p.error == 0
+        result_a2_6 = p_current_token(p)
+        if p_expect(p, TOK_INDENT) == 0
+            p.error = 1
+            p.pos = start_pos
+    if p.error == 0
+        result_a2_7 = parse_enum_variants(p)
+        if p.error != 0
+            p.pos = start_pos
+    if p.error == 0
+        result_a2_8 = p_current_token(p)
+        if p_expect(p, TOK_DEDENT) == 0
+            p.error = 1
+            p.pos = start_pos
+    if p.error == 0
+        return enum_def_skip(p)
+
+    if p.error == 0
+        return 0
+    return 0
+
+fn parse_enum_variants(p: *Parser) -> i32
+    let start_pos: i32 = p.pos
+
+    # Alternative 1
+    var result_a1_1: i32
+    var result_a1_2: i32
+
+    result_a1_1 = parse_enum_variant(p)
+    if p.error != 0
+        p.pos = start_pos
+    if p.error == 0
+        result_a1_2 = parse_enum_variants(p)
+        if p.error != 0
+            p.pos = start_pos
+    if p.error == 0
+        return 0
+
+    # Try next alternative
+    p.pos = start_pos
+    p.error = 0
+
+    # Alternative 2
+    var result_a2_1: i32
+
+    result_a2_1 = parse_enum_variant(p)
+    if p.error != 0
+        p.pos = start_pos
+    if p.error == 0
+        return 0
+
+    if p.error == 0
+        return 0
+    return 0
+
+fn parse_enum_variant(p: *Parser) -> i32
+    let start_pos: i32 = p.pos
+
+    # Alternative 1
+    var result_a1_1: Token
+    var result_a1_2: Token
+
+    result_a1_1 = p_current_token(p)
+    if p_expect(p, TOK_IDENT) == 0
+        p.error = 1
+        p.pos = start_pos
+    if p.error == 0
+        result_a1_2 = p_current_token(p)
+        if p_expect(p, TOK_NEWLINE) == 0
+            p.error = 1
+            p.pos = start_pos
+    if p.error == 0
+        return 0
+
+    # Try next alternative
+    p.pos = start_pos
+    p.error = 0
+
+    # Alternative 2
+    var result_a2_1: Token
+    var result_a2_2: Token
+    var result_a2_3: i32
+    var result_a2_4: Token
+    var result_a2_5: Token
+
+    result_a2_1 = p_current_token(p)
+    if p_expect(p, TOK_IDENT) == 0
+        p.error = 1
+        p.pos = start_pos
+    if p.error == 0
+        result_a2_2 = p_current_token(p)
+        if p_expect(p, TOK_LPAREN) == 0
+            p.error = 1
+            p.pos = start_pos
+    if p.error == 0
+        result_a2_3 = parse_type_spec(p)
+        if p.error != 0
+            p.pos = start_pos
+    if p.error == 0
+        result_a2_4 = p_current_token(p)
+        if p_expect(p, TOK_RPAREN) == 0
+            p.error = 1
+            p.pos = start_pos
+    if p.error == 0
+        result_a2_5 = p_current_token(p)
+        if p_expect(p, TOK_NEWLINE) == 0
+            p.error = 1
+            p.pos = start_pos
+    if p.error == 0
+        return 0
 
     if p.error == 0
         return 0
@@ -632,31 +787,7 @@ fn parse_params(p: *Parser) -> *Param
 fn parse_param(p: *Parser) -> *Param
     let start_pos: i32 = p.pos
 
-    # Alternative 1: bare `self` receiver (task-99 cluster #1).
-    # `fn foo(self)` in an impl block. The actual impl type is resolved
-    # by emit_impl_method via the enclosing ImplBlock's type_name — we
-    # just create a Param named "self" here. TYPE_STRUCT matches the
-    # by-value receiver convention; the emitter special-cases the
-    # "self" name to emit `ptr` at the LLVM level (UFCS callers pass
-    # the receiver as ptr).
-    var result_self: Token
-    result_self = p_current_token(p)
-    if p_expect(p, TOK_SELF) == 0
-        p.error = 1
-        p.pos = start_pos
-    if p.error == 0
-        # Clear the "last type name" carried from a prior parse_type_spec —
-        # we don't have one here. param_new reads it for TYPE_STRUCT
-        # params; emit_impl_method will fill in the real type later.
-        p.last_type_name = null
-        p.last_type_name_len = 0
-        return param_new(p, result_self.start, result_self.len, TYPE_STRUCT, result_self.line, result_self.col)
-
-    # Try next alternative
-    p.pos = start_pos
-    p.error = 0
-
-    # Alternative 2: IDENT COLON type (the original).
+    # Alternative 1
     var result_1: Token
     var result_2: Token
     var result_3: i32
@@ -1360,16 +1491,6 @@ fn parse_type_spec(p: *Parser) -> i32
         result_a14_3 = parse_type_spec(p)
         if p.error != 0
             p.pos = start_pos
-    # Tolerate multi-arg generics (e.g. Result<T, E>) by consuming any
-    # extra `, T2, T3...` after the first type arg. Only the first arg
-    # is used for name mangling — extras are ignored (ritz-task-87 skip).
-    if p.error == 0
-        while p_peek(p) == TOK_COMMA
-            p_advance(p)  # consume `,`
-            let _extra: i32 = parse_type_spec(p)
-            if p.error != 0
-                p.pos = start_pos
-                break
     if p.error == 0
         result_a14_4 = p_current_token(p)
         if p_expect(p, TOK_GT) == 0
@@ -1417,7 +1538,7 @@ fn parse_type_name(p: *Parser) -> Token
     var result_a2_1: Token
 
     result_a2_1 = p_current_token(p)
-    if p_expect(p, TOK_I32) == 0
+    if p_expect(p, TOK_I16) == 0
         p.error = 1
         p.pos = start_pos
     if p.error == 0
@@ -1431,7 +1552,7 @@ fn parse_type_name(p: *Parser) -> Token
     var result_a3_1: Token
 
     result_a3_1 = p_current_token(p)
-    if p_expect(p, TOK_I64) == 0
+    if p_expect(p, TOK_I32) == 0
         p.error = 1
         p.pos = start_pos
     if p.error == 0
@@ -1445,7 +1566,7 @@ fn parse_type_name(p: *Parser) -> Token
     var result_a4_1: Token
 
     result_a4_1 = p_current_token(p)
-    if p_expect(p, TOK_U8) == 0
+    if p_expect(p, TOK_I64) == 0
         p.error = 1
         p.pos = start_pos
     if p.error == 0
@@ -1459,7 +1580,7 @@ fn parse_type_name(p: *Parser) -> Token
     var result_a5_1: Token
 
     result_a5_1 = p_current_token(p)
-    if p_expect(p, TOK_U64) == 0
+    if p_expect(p, TOK_U8) == 0
         p.error = 1
         p.pos = start_pos
     if p.error == 0
@@ -1473,7 +1594,7 @@ fn parse_type_name(p: *Parser) -> Token
     var result_a6_1: Token
 
     result_a6_1 = p_current_token(p)
-    if p_expect(p, TOK_BOOL) == 0
+    if p_expect(p, TOK_U16) == 0
         p.error = 1
         p.pos = start_pos
     if p.error == 0
@@ -1483,30 +1604,25 @@ fn parse_type_name(p: *Parser) -> Token
     p.pos = start_pos
     p.error = 0
 
-    # AGAST #111: missing alternatives for TOK_I16/TOK_U16/TOK_U32.
-    # Without these, `vec_new<u16>()` silently fails — u8/i32/u64 work because
-    # their tokens are in the list above. Adding as new alternatives (copy of
-    # the TOK_I8/TOK_I32/... pattern) fixes `<u16>`, `<i16>`, `<u32>` in
-    # generic call type args.
-    # Alternative 7 (TOK_I16)
-    var result_a7b_1: Token
+    # Alternative 7
+    var result_a7_1: Token
 
-    result_a7b_1 = p_current_token(p)
-    if p_expect(p, TOK_I16) == 0
+    result_a7_1 = p_current_token(p)
+    if p_expect(p, TOK_U32) == 0
         p.error = 1
         p.pos = start_pos
     if p.error == 0
-        return result_a7b_1
+        return result_a7_1
 
     # Try next alternative
     p.pos = start_pos
     p.error = 0
 
-    # Alternative 8 (TOK_U16)
+    # Alternative 8
     var result_a8_1: Token
 
     result_a8_1 = p_current_token(p)
-    if p_expect(p, TOK_U16) == 0
+    if p_expect(p, TOK_U64) == 0
         p.error = 1
         p.pos = start_pos
     if p.error == 0
@@ -1516,11 +1632,11 @@ fn parse_type_name(p: *Parser) -> Token
     p.pos = start_pos
     p.error = 0
 
-    # Alternative 9 (TOK_U32)
+    # Alternative 9
     var result_a9_1: Token
 
     result_a9_1 = p_current_token(p)
-    if p_expect(p, TOK_U32) == 0
+    if p_expect(p, TOK_BOOL) == 0
         p.error = 1
         p.pos = start_pos
     if p.error == 0
@@ -1530,7 +1646,7 @@ fn parse_type_name(p: *Parser) -> Token
     p.pos = start_pos
     p.error = 0
 
-    # Alternative 10 (TOK_IDENT)
+    # Alternative 10
     var result_a10_1: Token
 
     result_a10_1 = p_current_token(p)
@@ -1678,7 +1794,7 @@ fn parse_stmt(p: *Parser) -> *Stmt
     # Alternative 5
     var result_a5_1: *Stmt
 
-    result_a5_1 = parse_control_stmt(p)
+    result_a5_1 = parse_match_stmt(p)
     if p.error != 0
         p.pos = start_pos
     if p.error == 0
@@ -1691,7 +1807,7 @@ fn parse_stmt(p: *Parser) -> *Stmt
     # Alternative 6
     var result_a6_1: *Stmt
 
-    result_a6_1 = parse_assign_stmt(p)
+    result_a6_1 = parse_control_stmt(p)
     if p.error != 0
         p.pos = start_pos
     if p.error == 0
@@ -1704,11 +1820,24 @@ fn parse_stmt(p: *Parser) -> *Stmt
     # Alternative 7
     var result_a7_1: *Stmt
 
-    result_a7_1 = parse_expr_stmt(p)
+    result_a7_1 = parse_assign_stmt(p)
     if p.error != 0
         p.pos = start_pos
     if p.error == 0
         return result_a7_1
+
+    # Try next alternative
+    p.pos = start_pos
+    p.error = 0
+
+    # Alternative 8
+    var result_a8_1: *Stmt
+
+    result_a8_1 = parse_expr_stmt(p)
+    if p.error != 0
+        p.pos = start_pos
+    if p.error == 0
+        return result_a8_1
 
     if p.error == 0
         return null
@@ -1778,19 +1907,6 @@ fn parse_control_stmt(p: *Parser) -> *Stmt
     if p.error == 0
         return result_a5_1
 
-    # Try next alternative
-    p.pos = start_pos
-    p.error = 0
-
-    # Alternative 6: match stmt (added for ritz-task-87)
-    var result_a6_1: *Stmt
-
-    result_a6_1 = parse_match_stmt(p)
-    if p.error != 0
-        p.pos = start_pos
-    if p.error == 0
-        return result_a6_1
-
     if p.error == 0
         return null
     return null
@@ -1835,18 +1951,10 @@ fn parse_let_stmt(p: *Parser) -> *Stmt
         if p.error != 0
             p.pos = start_pos
     if p.error == 0
-        # NEWLINE is optional when the RHS was a block-expression (match), since
-        # match_expr already consumed its trailing DEDENT instead of NEWLINE
-        # (ritz-task-87).
         result_a1_7 = p_current_token(p)
-        if result_a1_6 != null and result_a1_6.kind == EXPR_MATCH
-            # Tolerate missing NEWLINE after match expression.
-            if p_peek(p) == TOK_NEWLINE
-                p_advance(p)
-        else
-            if p_expect(p, TOK_NEWLINE) == 0
-                p.error = 1
-                p.pos = start_pos
+        if p_expect(p, TOK_NEWLINE) == 0
+            p.error = 1
+            p.pos = start_pos
     if p.error == 0
         return stmt_var_decl(p, result_a1_2.start, result_a1_2.len, result_a1_4, result_a1_6, result_a1_1.line, result_a1_1.col)
 
@@ -1880,15 +1988,10 @@ fn parse_let_stmt(p: *Parser) -> *Stmt
         if p.error != 0
             p.pos = start_pos
     if p.error == 0
-        # Same optional-NEWLINE treatment for match-expression RHS.
         result_a2_5 = p_current_token(p)
-        if result_a2_4 != null and result_a2_4.kind == EXPR_MATCH
-            if p_peek(p) == TOK_NEWLINE
-                p_advance(p)
-        else
-            if p_expect(p, TOK_NEWLINE) == 0
-                p.error = 1
-                p.pos = start_pos
+        if p_expect(p, TOK_NEWLINE) == 0
+            p.error = 1
+            p.pos = start_pos
     if p.error == 0
         return stmt_var_decl(p, result_a2_2.start, result_a2_2.len, 0, result_a2_4, result_a2_1.line, result_a2_1.col)
 
@@ -1984,7 +2087,7 @@ fn parse_var_stmt(p: *Parser) -> *Stmt
     p.pos = start_pos
     p.error = 0
 
-    # Alternative 3: var IDENT = expr NEWLINE (type inferred)
+    # Alternative 3
     var result_a3_1: Token
     var result_a3_2: Token
     var result_a3_3: Token
@@ -2163,40 +2266,84 @@ fn parse_while_stmt(p: *Parser) -> *Stmt
 fn parse_for_stmt(p: *Parser) -> *Stmt
     let start_pos: i32 = p.pos
 
-    # Two shapes:
-    #   for IDENT in expr .. expr block   (range)
-    #   for IDENT in expr block           (iterable; for_end = null)
-    var result_1: Token
-    var result_2: Token
-    var result_3: Token
-    var result_4: *Expr
-    var result_6: *Expr
-    var result_7: *Stmt
+    # Alternative 1
+    var result_a1_1: Token
+    var result_a1_2: Token
+    var result_a1_3: Token
+    var result_a1_4: *Expr
+    var result_a1_5: Token
+    var result_a1_6: *Expr
+    var result_a1_7: *Stmt
 
-    result_6 = null
-
-    result_1 = p_current_token(p)
+    result_a1_1 = p_current_token(p)
     if p_expect(p, TOK_FOR) == 0
         p.error = 1
+        p.pos = start_pos
     if p.error == 0
-        result_2 = p_current_token(p)
+        result_a1_2 = p_current_token(p)
         if p_expect(p, TOK_IDENT) == 0
             p.error = 1
+            p.pos = start_pos
     if p.error == 0
-        result_3 = p_current_token(p)
+        result_a1_3 = p_current_token(p)
         if p_expect(p, TOK_IN) == 0
             p.error = 1
+            p.pos = start_pos
     if p.error == 0
-        result_4 = parse_expr(p)
-    # Optional `.. endExpr` — absent means iterable form (for_end stays null).
+        result_a1_4 = parse_expr(p)
+        if p.error != 0
+            p.pos = start_pos
     if p.error == 0
-        if p_peek(p) == TOK_DOTDOT
-            p_advance(p)
-            result_6 = parse_expr(p)
+        result_a1_5 = p_current_token(p)
+        if p_expect(p, TOK_DOTDOT) == 0
+            p.error = 1
+            p.pos = start_pos
     if p.error == 0
-        result_7 = parse_block(p)
+        result_a1_6 = parse_expr(p)
+        if p.error != 0
+            p.pos = start_pos
     if p.error == 0
-        return stmt_for(p, result_2.start, result_2.len, result_4, result_6, result_7, result_1.line, result_1.col)
+        result_a1_7 = parse_block(p)
+        if p.error != 0
+            p.pos = start_pos
+    if p.error == 0
+        return stmt_for(p, result_a1_2.start, result_a1_2.len, result_a1_4, result_a1_6, result_a1_7, result_a1_1.line, result_a1_1.col)
+
+    # Try next alternative
+    p.pos = start_pos
+    p.error = 0
+
+    # Alternative 2
+    var result_a2_1: Token
+    var result_a2_2: Token
+    var result_a2_3: Token
+    var result_a2_4: *Expr
+    var result_a2_5: *Stmt
+
+    result_a2_1 = p_current_token(p)
+    if p_expect(p, TOK_FOR) == 0
+        p.error = 1
+        p.pos = start_pos
+    if p.error == 0
+        result_a2_2 = p_current_token(p)
+        if p_expect(p, TOK_IDENT) == 0
+            p.error = 1
+            p.pos = start_pos
+    if p.error == 0
+        result_a2_3 = p_current_token(p)
+        if p_expect(p, TOK_IN) == 0
+            p.error = 1
+            p.pos = start_pos
+    if p.error == 0
+        result_a2_4 = parse_expr(p)
+        if p.error != 0
+            p.pos = start_pos
+    if p.error == 0
+        result_a2_5 = parse_block(p)
+        if p.error != 0
+            p.pos = start_pos
+    if p.error == 0
+        return stmt_for_iter(p, result_a2_2.start, result_a2_2.len, result_a2_4, result_a2_5, result_a2_1.line, result_a2_1.col)
 
     if p.error == 0
         return null
@@ -2216,6 +2363,197 @@ fn parse_loop_stmt(p: *Parser) -> *Stmt
         result_2 = parse_block(p)
     if p.error == 0
         return stmt_loop(p, result_2, result_1.line, result_1.col)
+
+    if p.error == 0
+        return null
+    return null
+
+fn parse_match_stmt(p: *Parser) -> *Stmt
+    let start_pos: i32 = p.pos
+
+    # Alternative 1
+    var result_1: Token
+    var result_2: *Expr
+    var result_3: Token
+    var result_4: Token
+    var result_5: *MatchArm
+    var result_6: Token
+
+    result_1 = p_current_token(p)
+    if p_expect(p, TOK_MATCH) == 0
+        p.error = 1
+    if p.error == 0
+        result_2 = parse_expr(p)
+    if p.error == 0
+        result_3 = p_current_token(p)
+        if p_expect(p, TOK_NEWLINE) == 0
+            p.error = 1
+    if p.error == 0
+        result_4 = p_current_token(p)
+        if p_expect(p, TOK_INDENT) == 0
+            p.error = 1
+    if p.error == 0
+        result_5 = parse_match_arms(p)
+    if p.error == 0
+        result_6 = p_current_token(p)
+        if p_expect(p, TOK_DEDENT) == 0
+            p.error = 1
+    if p.error == 0
+        return stmt_match(p, result_2, result_5, result_1.line, result_1.col)
+
+    if p.error == 0
+        return null
+    return null
+
+fn parse_match_arms(p: *Parser) -> *MatchArm
+    let start_pos: i32 = p.pos
+
+    # Alternative 1
+    var result_a1_1: *MatchArm
+    var result_a1_2: *MatchArm
+
+    result_a1_1 = parse_match_arm(p)
+    if p.error != 0
+        p.pos = start_pos
+    if p.error == 0
+        result_a1_2 = parse_match_arms(p)
+        if p.error != 0
+            p.pos = start_pos
+    if p.error == 0
+        return match_arm_link(result_a1_1, result_a1_2)
+
+    # Try next alternative
+    p.pos = start_pos
+    p.error = 0
+
+    # Alternative 2
+    var result_a2_1: *MatchArm
+
+    result_a2_1 = parse_match_arm(p)
+    if p.error != 0
+        p.pos = start_pos
+    if p.error == 0
+        return result_a2_1
+
+    if p.error == 0
+        return null
+    return null
+
+fn parse_match_arm(p: *Parser) -> *MatchArm
+    let start_pos: i32 = p.pos
+
+    # Alternative 1
+    var result_1: *MatchArm
+    var result_2: Token
+    var result_3: *Expr
+    var result_4: Token
+
+    result_1 = parse_pattern(p)
+    if p.error == 0
+        result_2 = p_current_token(p)
+        if p_expect(p, TOK_FAT_ARROW) == 0
+            p.error = 1
+    if p.error == 0
+        result_3 = parse_arm_body(p)
+    if p.error == 0
+        result_4 = p_current_token(p)
+        if p_expect(p, TOK_NEWLINE) == 0
+            p.error = 1
+    if p.error == 0
+        return match_arm_set_body_or_pass(result_1, result_3)
+
+    if p.error == 0
+        return null
+    return null
+
+fn parse_pattern(p: *Parser) -> *MatchArm
+    let start_pos: i32 = p.pos
+
+    # Alternative 1
+    var result_a1_1: Token
+
+    result_a1_1 = p_current_token(p)
+    if p_expect(p, TOK_NUMBER) == 0
+        p.error = 1
+        p.pos = start_pos
+    if p.error == 0
+        return pattern_lit_int(p, result_a1_1.start, result_a1_1.len)
+
+    # Try next alternative
+    p.pos = start_pos
+    p.error = 0
+
+    # Alternative 2
+    var result_a2_1: Token
+    var result_a2_2: Token
+    var result_a2_3: Token
+    var result_a2_4: Token
+
+    result_a2_1 = p_current_token(p)
+    if p_expect(p, TOK_IDENT) == 0
+        p.error = 1
+        p.pos = start_pos
+    if p.error == 0
+        result_a2_2 = p_current_token(p)
+        if p_expect(p, TOK_LPAREN) == 0
+            p.error = 1
+            p.pos = start_pos
+    if p.error == 0
+        result_a2_3 = p_current_token(p)
+        if p_expect(p, TOK_IDENT) == 0
+            p.error = 1
+            p.pos = start_pos
+    if p.error == 0
+        result_a2_4 = p_current_token(p)
+        if p_expect(p, TOK_RPAREN) == 0
+            p.error = 1
+            p.pos = start_pos
+    if p.error == 0
+        return pattern_variant_inner(p, result_a2_1.start, result_a2_1.len, result_a2_3.start, result_a2_3.len)
+
+    # Try next alternative
+    p.pos = start_pos
+    p.error = 0
+
+    # Alternative 3
+    var result_a3_1: Token
+
+    result_a3_1 = p_current_token(p)
+    if p_expect(p, TOK_IDENT) == 0
+        p.error = 1
+        p.pos = start_pos
+    if p.error == 0
+        return pattern_ident_or_wildcard(p, result_a3_1.start, result_a3_1.len)
+
+    if p.error == 0
+        return null
+    return null
+
+fn parse_arm_body(p: *Parser) -> *Expr
+    let start_pos: i32 = p.pos
+
+    # Alternative 1
+    var result_a1_1: Token
+
+    result_a1_1 = p_current_token(p)
+    if p_expect(p, TOK_PASS) == 0
+        p.error = 1
+        p.pos = start_pos
+    if p.error == 0
+        return null
+
+    # Try next alternative
+    p.pos = start_pos
+    p.error = 0
+
+    # Alternative 2
+    var result_a2_1: *Expr
+
+    result_a2_1 = parse_expr(p)
+    if p.error != 0
+        p.pos = start_pos
+    if p.error == 0
+        return result_a2_1
 
     if p.error == 0
         return null
@@ -4095,14 +4433,11 @@ fn parse_postfix_op(p: *Parser) -> *PostfixOp
     p.error = 0
 
     # Alternative 3
-    # Index: `[ expr ]` OR range-index: `[ expr .. expr ]`
-    # Range-index builds an EXPR_RANGE node (kind=14, left=lo, right=hi) and
-    # wraps it in a POSTFIX_INDEX so emit_expr_index can lower it to a slice.
     var result_a3_1: Token
     var result_a3_2: *Expr
     var result_a3_3: Token
-    var result_a3_hi: *Expr
-    var is_range: i32 = 0
+    var result_a3_4: *Expr
+    var result_a3_5: Token
 
     result_a3_1 = p_current_token(p)
     if p_expect(p, TOK_LBRACKET) == 0
@@ -4112,32 +4447,22 @@ fn parse_postfix_op(p: *Parser) -> *PostfixOp
         result_a3_2 = parse_expr(p)
         if p.error != 0
             p.pos = start_pos
-    # Range-index: `.. expr` between `[` and `]`
-    if p.error == 0
-        if p_peek(p) == TOK_DOTDOT
-            p_advance(p)
-            result_a3_hi = parse_expr(p)
-            if p.error != 0
-                p.pos = start_pos
-            else
-                is_range = 1
     if p.error == 0
         result_a3_3 = p_current_token(p)
+        if p_expect(p, TOK_DOTDOT) == 0
+            p.error = 1
+            p.pos = start_pos
+    if p.error == 0
+        result_a3_4 = parse_expr(p)
+        if p.error != 0
+            p.pos = start_pos
+    if p.error == 0
+        result_a3_5 = p_current_token(p)
         if p_expect(p, TOK_RBRACKET) == 0
             p.error = 1
             p.pos = start_pos
     if p.error == 0
-        if is_range == 1
-            # Build EXPR_RANGE { left: lo, right: hi } inline — keeps the AST
-            # helper surface unchanged (ast_helpers.ritz isn't in this lane).
-            let r: *Expr = parser_alloc(p, 128) as *Expr
-            r.kind = EXPR_RANGE
-            r.span = result_a3_2.span
-            r.left = result_a3_2
-            r.right = result_a3_hi
-            r.next = null
-            return postfix_index(p, r)
-        return postfix_index(p, result_a3_2)
+        return postfix_range_index(p, result_a3_2, result_a3_4)
 
     # Try next alternative
     p.pos = start_pos
@@ -4145,39 +4470,58 @@ fn parse_postfix_op(p: *Parser) -> *PostfixOp
 
     # Alternative 4
     var result_a4_1: Token
-    var result_a4_2: Token
+    var result_a4_2: *Expr
+    var result_a4_3: Token
 
     result_a4_1 = p_current_token(p)
-    if p_expect(p, TOK_DOT) == 0
+    if p_expect(p, TOK_LBRACKET) == 0
         p.error = 1
         p.pos = start_pos
     if p.error == 0
-        result_a4_2 = p_current_token(p)
-        if p_expect(p, TOK_IDENT) == 0
+        result_a4_2 = parse_expr(p)
+        if p.error != 0
+            p.pos = start_pos
+    if p.error == 0
+        result_a4_3 = p_current_token(p)
+        if p_expect(p, TOK_RBRACKET) == 0
             p.error = 1
             p.pos = start_pos
     if p.error == 0
-        return postfix_member(p, result_a4_2.start, result_a4_2.len)
+        return postfix_index(p, result_a4_2)
 
     # Try next alternative
     p.pos = start_pos
     p.error = 0
 
-    # Alternative 5 (AGAST #134): try operator `?`.
-    # Emits a POSTFIX_TRY op which apply_postfix_p wraps in an EXPR_TRY
-    # node around the running postfix result. Kept inline (no new
-    # ast_helpers surface) since it's a one-field op — mirrors the
-    # EXPR_RANGE inline-alloc pattern in Alternative 3.
+    # Alternative 5
     var result_a5_1: Token
+    var result_a5_2: Token
+
     result_a5_1 = p_current_token(p)
+    if p_expect(p, TOK_DOT) == 0
+        p.error = 1
+        p.pos = start_pos
+    if p.error == 0
+        result_a5_2 = p_current_token(p)
+        if p_expect(p, TOK_IDENT) == 0
+            p.error = 1
+            p.pos = start_pos
+    if p.error == 0
+        return postfix_member(p, result_a5_2.start, result_a5_2.len)
+
+    # Try next alternative
+    p.pos = start_pos
+    p.error = 0
+
+    # Alternative 6
+    var result_a6_1: Token
+
+    result_a6_1 = p_current_token(p)
     if p_expect(p, TOK_QUESTION) == 0
         p.error = 1
         p.pos = start_pos
     if p.error == 0
-        let op: *PostfixOp = parser_alloc(p, 64) as *PostfixOp
-        op.kind = POSTFIX_TRY
-        op.next = null
-        return op
+        return postfix_try_new(p)
 
     if p.error == 0
         return null
@@ -4226,64 +4570,6 @@ fn parse_args(p: *Parser) -> *Expr
 fn parse_primary_expr(p: *Parser) -> *Expr
     let start_pos: i32 = p.pos
 
-    # Alternative -1 (ritz-task-87): bool literals true/false.
-    # ritz1's existing parser had no rule for TOK_TRUE / TOK_FALSE, so any
-    # `let b: bool = true` or `pick(true)` silently dropped the enclosing fn.
-    # Map them to i64 1 / 0 — the surrounding type system treats bools
-    # uniformly as i64 at the expression level.
-    if p_peek(p) == TOK_TRUE
-        let tt: Token = p_current_token(p)
-        p_advance(p)
-        return expr_int(p, 1, tt.line, tt.col)
-    if p_peek(p) == TOK_FALSE
-        let ft: Token = p_current_token(p)
-        p_advance(p)
-        return expr_int(p, 0, ft.line, ft.col)
-
-    # `self` as expression (task-99 cluster #1). The lexer tokenizes `self`
-    # as TOK_SELF; treat it as an ordinary ident so the impl-method body's
-    # `self.n` / `self.foo()` / bare `self` all resolve against the local
-    # registered by emit_impl_method.
-    if p_peek(p) == TOK_SELF
-        let st: Token = p_current_token(p)
-        p_advance(p)
-        return expr_ident(p, st.start, st.len, st.line, st.col)
-
-    # Alternative 0 (ritz-task-87): match as expression
-    # Allows `let x = match scrut \n INDENT arms DEDENT`.
-    # We reuse the stmt_match helper's structure via expr_match which stores
-    # scrutinee in `left` and arm list in `args`. Only try this when the
-    # next token is `match` to avoid stealing the start_pos from other alts.
-    # After DEDENT we proactively inject a synthetic "stmt end" by NOT
-    # consuming the outer NEWLINE (there isn't one) — the caller's
-    # NEWLINE-expect should be skipped when it sees a block-expression;
-    # we handle that on the parse_let side via `p.block_expr_tail` style flag.
-    # Simpler approach: consume DEDENT only if the *following* token is
-    # clearly the start of the next statement; otherwise leave DEDENT for
-    # the outer block parser to consume.
-    if p_peek(p) == TOK_MATCH
-        var m_tok: Token
-        var m_scrut: *Expr
-        var m_arms: *MatchArm
-        m_tok = p_current_token(p)
-        p_advance(p)  # consume `match`
-        m_scrut = parse_expr(p)
-        if p.error == 0
-            if p_expect(p, TOK_NEWLINE) == 0
-                p.error = 1
-        if p.error == 0
-            if p_expect(p, TOK_INDENT) == 0
-                p.error = 1
-        if p.error == 0
-            m_arms = parse_match_arms(p)
-        if p.error == 0
-            if p_expect(p, TOK_DEDENT) == 0
-                p.error = 1
-        if p.error == 0
-            return expr_match(p, m_scrut, m_arms, m_tok.line, m_tok.col)
-        p.pos = start_pos
-        p.error = 0
-
     # Alternative 1
     var result_a1_1: Token
 
@@ -4292,54 +4578,35 @@ fn parse_primary_expr(p: *Parser) -> *Expr
         p.error = 1
         p.pos = start_pos
     if p.error == 0
-        # AGAST #107: trim optional typed integer-literal suffix before
-        # parse_int so `0u8` / `123u16` / `0usize` produce the correct value.
-        return expr_int(p, parse_int(result_a1_1.start, int_lit_len(result_a1_1.start, result_a1_1.len)), result_a1_1.line, result_a1_1.col)
+        return expr_int(p, parse_int(result_a1_1.start, result_a1_1.len), result_a1_1.line, result_a1_1.col)
 
     # Try next alternative
     p.pos = start_pos
     p.error = 0
 
-    # Alternative 2: regular string "..."
+    # Alternative 2
     var result_a2_1: Token
 
     result_a2_1 = p_current_token(p)
-    if p_expect(p, TOK_STRING) == 0
+    if p_expect(p, TOK_TRUE) == 0
         p.error = 1
         p.pos = start_pos
     if p.error == 0
-        return expr_string(p, result_a2_1)
+        return expr_int(p, 1, result_a2_1.line, result_a2_1.col)
 
     # Try next alternative
     p.pos = start_pos
     p.error = 0
-
-    # Alternative 2b: c-string c"..."
-    var result_a2b_1: Token
-
-    result_a2b_1 = p_current_token(p)
-    if p_expect(p, TOK_CSTRING) == 0
-        p.error = 1
-        p.pos = start_pos
-    if p.error == 0
-        return expr_string(p, result_a2b_1)
-
-    # Try next alternative
-    p.pos = start_pos
-    p.error = 0
-
-    # Alternative 2c (s-string s"...") was removed in AGAST #98 — bare "..."
-    # handles the same case via StrView.
 
     # Alternative 3
     var result_a3_1: Token
 
     result_a3_1 = p_current_token(p)
-    if p_expect(p, TOK_CHAR) == 0
+    if p_expect(p, TOK_FALSE) == 0
         p.error = 1
         p.pos = start_pos
     if p.error == 0
-        return expr_char(p, result_a3_1)
+        return expr_int(p, 0, result_a3_1.line, result_a3_1.col)
 
     # Try next alternative
     p.pos = start_pos
@@ -4349,11 +4616,11 @@ fn parse_primary_expr(p: *Parser) -> *Expr
     var result_a4_1: Token
 
     result_a4_1 = p_current_token(p)
-    if p_expect(p, TOK_NIL) == 0
+    if p_expect(p, TOK_STRING) == 0
         p.error = 1
         p.pos = start_pos
     if p.error == 0
-        return expr_nil(p, result_a4_1.line, result_a4_1.col)
+        return expr_string(p, result_a4_1)
 
     # Try next alternative
     p.pos = start_pos
@@ -4363,11 +4630,11 @@ fn parse_primary_expr(p: *Parser) -> *Expr
     var result_a5_1: Token
 
     result_a5_1 = p_current_token(p)
-    if p_expect(p, TOK_NULL) == 0
+    if p_expect(p, TOK_CSTRING) == 0
         p.error = 1
         p.pos = start_pos
     if p.error == 0
-        return expr_nil(p, result_a5_1.line, result_a5_1.col)
+        return expr_string(p, result_a5_1)
 
     # Try next alternative
     p.pos = start_pos
@@ -4375,35 +4642,13 @@ fn parse_primary_expr(p: *Parser) -> *Expr
 
     # Alternative 6
     var result_a6_1: Token
-    var result_a6_2: Token
-    var result_a6_3: i32
-    var result_a6_4: Token
-    var result_a6_5: *StructLit
 
     result_a6_1 = p_current_token(p)
-    if p_expect(p, TOK_IDENT) == 0
+    if p_expect(p, TOK_CHAR) == 0
         p.error = 1
         p.pos = start_pos
     if p.error == 0
-        result_a6_2 = p_current_token(p)
-        if p_expect(p, TOK_LT) == 0
-            p.error = 1
-            p.pos = start_pos
-    if p.error == 0
-        result_a6_3 = parse_type_spec(p)
-        if p.error != 0
-            p.pos = start_pos
-    if p.error == 0
-        result_a6_4 = p_current_token(p)
-        if p_expect(p, TOK_GT) == 0
-            p.error = 1
-            p.pos = start_pos
-    if p.error == 0
-        result_a6_5 = parse_struct_lit(p)
-        if p.error != 0
-            p.pos = start_pos
-    if p.error == 0
-        return generic_struct_lit(p, result_a6_1, result_a6_3, result_a6_5)
+        return expr_char(p, result_a6_1)
 
     # Try next alternative
     p.pos = start_pos
@@ -4411,18 +4656,13 @@ fn parse_primary_expr(p: *Parser) -> *Expr
 
     # Alternative 7
     var result_a7_1: Token
-    var result_a7_2: *StructLit
 
     result_a7_1 = p_current_token(p)
-    if p_expect(p, TOK_IDENT) == 0
+    if p_expect(p, TOK_NIL) == 0
         p.error = 1
         p.pos = start_pos
-    result_a7_2 = null
     if p.error == 0
-        result_a7_2 = parse_struct_lit(p)  # optional
-        p.error = 0
-    if p.error == 0
-        return ident_or_struct(p, result_a7_1, result_a7_2)
+        return expr_nil(p, result_a7_1.line, result_a7_1.col)
 
     # Try next alternative
     p.pos = start_pos
@@ -4430,51 +4670,121 @@ fn parse_primary_expr(p: *Parser) -> *Expr
 
     # Alternative 8
     var result_a8_1: Token
-    var result_a8_2: *Expr
-    var result_a8_3: Token
 
     result_a8_1 = p_current_token(p)
-    if p_expect(p, TOK_LPAREN) == 0
+    if p_expect(p, TOK_NULL) == 0
         p.error = 1
         p.pos = start_pos
     if p.error == 0
-        result_a8_2 = parse_expr(p)
-        if p.error != 0
-            p.pos = start_pos
-    if p.error == 0
-        result_a8_3 = p_current_token(p)
-        if p_expect(p, TOK_RPAREN) == 0
-            p.error = 1
-            p.pos = start_pos
-    if p.error == 0
-        return result_a8_2
+        return expr_nil(p, result_a8_1.line, result_a8_1.col)
 
     # Try next alternative
     p.pos = start_pos
     p.error = 0
 
-    # Alternative 9: array literal `[e1, e2, ...]`
-    # Stored as EXPR_ARRAY_LIT with elements as a linked list in `args`.
-    # Element parsing reuses `parse_args` (comma-separated expression list).
+    # Alternative 9
     var result_a9_1: Token
-    var result_a9_2: *Expr
-    var result_a9_3: Token
 
     result_a9_1 = p_current_token(p)
-    if p_expect(p, TOK_LBRACKET) == 0
+    if p_expect(p, TOK_SELF) == 0
         p.error = 1
         p.pos = start_pos
     if p.error == 0
-        result_a9_2 = parse_args(p)
-        if p.error != 0
-            p.pos = start_pos
+        return expr_ident(p, result_a9_1.start, result_a9_1.len, result_a9_1.line, result_a9_1.col)
+
+    # Try next alternative
+    p.pos = start_pos
+    p.error = 0
+
+    # Alternative 10
+    var result_a10_1: Token
+
+    result_a10_1 = p_current_token(p)
+    if p_expect(p, TOK_PASS) == 0
+        p.error = 1
+        p.pos = start_pos
     if p.error == 0
-        result_a9_3 = p_current_token(p)
-        if p_expect(p, TOK_RBRACKET) == 0
+        return expr_int(p, 0, result_a10_1.line, result_a10_1.col)
+
+    # Try next alternative
+    p.pos = start_pos
+    p.error = 0
+
+    # Alternative 11
+    var result_a11_1: Token
+    var result_a11_2: Token
+    var result_a11_3: i32
+    var result_a11_4: Token
+    var result_a11_5: *StructLit
+
+    result_a11_1 = p_current_token(p)
+    if p_expect(p, TOK_IDENT) == 0
+        p.error = 1
+        p.pos = start_pos
+    if p.error == 0
+        result_a11_2 = p_current_token(p)
+        if p_expect(p, TOK_LT) == 0
             p.error = 1
             p.pos = start_pos
     if p.error == 0
-        return expr_array(p, result_a9_2, result_a9_1.line, result_a9_1.col)
+        result_a11_3 = parse_type_spec(p)
+        if p.error != 0
+            p.pos = start_pos
+    if p.error == 0
+        result_a11_4 = p_current_token(p)
+        if p_expect(p, TOK_GT) == 0
+            p.error = 1
+            p.pos = start_pos
+    if p.error == 0
+        result_a11_5 = parse_struct_lit(p)
+        if p.error != 0
+            p.pos = start_pos
+    if p.error == 0
+        return generic_struct_lit(p, result_a11_1, result_a11_3, result_a11_5)
+
+    # Try next alternative
+    p.pos = start_pos
+    p.error = 0
+
+    # Alternative 12
+    var result_a12_1: Token
+    var result_a12_2: *StructLit
+
+    result_a12_1 = p_current_token(p)
+    if p_expect(p, TOK_IDENT) == 0
+        p.error = 1
+        p.pos = start_pos
+    result_a12_2 = null
+    if p.error == 0
+        result_a12_2 = parse_struct_lit(p)  # optional
+        p.error = 0
+    if p.error == 0
+        return ident_or_struct(p, result_a12_1, result_a12_2)
+
+    # Try next alternative
+    p.pos = start_pos
+    p.error = 0
+
+    # Alternative 13
+    var result_a13_1: Token
+    var result_a13_2: *Expr
+    var result_a13_3: Token
+
+    result_a13_1 = p_current_token(p)
+    if p_expect(p, TOK_LPAREN) == 0
+        p.error = 1
+        p.pos = start_pos
+    if p.error == 0
+        result_a13_2 = parse_expr(p)
+        if p.error != 0
+            p.pos = start_pos
+    if p.error == 0
+        result_a13_3 = p_current_token(p)
+        if p_expect(p, TOK_RPAREN) == 0
+            p.error = 1
+            p.pos = start_pos
+    if p.error == 0
+        return result_a13_2
 
     if p.error == 0
         return null
@@ -4781,276 +5091,4 @@ fn parse_impl_methods(p: *Parser) -> *FnDef
     if p.error == 0
         return null
     return null
-
-# =============================================================================
-# Match parsing (added for ritz-task-87)
-# =============================================================================
-#
-# Grammar:
-#   match_stmt : MATCH expr NEWLINE INDENT match_arms DEDENT
-#   match_arms : match_arm+
-#   match_arm  : pattern FAT_ARROW arm_body NEWLINE
-#   pattern    : NUMBER
-#              | '_'         (wildcard)
-#              | IDENT       (binding / unit variant)
-#              | IDENT '(' inner ')'  (variant with payload)
-#   inner      : '_' | IDENT
-#   arm_body   : expr | PASS
-#
-# Design notes:
-#   - Pattern kinds + data are flattened into MatchArm (see ast.ritz).
-#   - `pass` is handled as a no-op arm body (emitter produces default i64 0).
-#   - Only what the 2 test_issue_match_*.ritz + 1 custom test need — no
-#     nested patterns, no guards, no range patterns.
-
-fn parse_match_stmt(p: *Parser) -> *Stmt
-    let start_pos: i32 = p.pos
-
-    var tok_match: Token
-    var scrutinee: *Expr
-    var arms: *MatchArm
-
-    tok_match = p_current_token(p)
-    if p_expect(p, TOK_MATCH) == 0
-        p.error = 1
-        p.pos = start_pos
-        return null
-    if p.error == 0
-        scrutinee = parse_expr(p)
-        if p.error != 0
-            p.pos = start_pos
-            return null
-    if p.error == 0
-        if p_expect(p, TOK_NEWLINE) == 0
-            p.error = 1
-            p.pos = start_pos
-            return null
-    if p.error == 0
-        if p_expect(p, TOK_INDENT) == 0
-            p.error = 1
-            p.pos = start_pos
-            return null
-    if p.error == 0
-        arms = parse_match_arms(p)
-        if p.error != 0
-            p.pos = start_pos
-            return null
-    if p.error == 0
-        if p_expect(p, TOK_DEDENT) == 0
-            p.error = 1
-            p.pos = start_pos
-            return null
-    if p.error == 0
-        return stmt_match(p, scrutinee, arms, tok_match.line, tok_match.col)
-    return null
-
-# match_arms: one or more arms
-# Iterative implementation — recursive version destroyed `first` when the
-# second arm failed because the recursive call's start_pos rewind undid it.
-fn parse_match_arms(p: *Parser) -> *MatchArm
-    var first: *MatchArm = parse_match_arm(p)
-    if p.error != 0
-        return null
-    var curr: *MatchArm = first
-    while 1 == 1
-        let save: i32 = p.pos
-        let saved_err: i32 = p.error
-        let next_arm: *MatchArm = parse_match_arm(p)
-        if p.error != 0
-            # No more arms — rewind exactly to after the last good arm
-            p.pos = save
-            p.error = saved_err
-            break
-        curr.next = next_arm
-        curr = next_arm
-    return first
-
-# match_arm: pattern FAT_ARROW arm_body NEWLINE
-fn parse_match_arm(p: *Parser) -> *MatchArm
-    let start_pos: i32 = p.pos
-    var arm: *MatchArm
-
-    # Parse pattern. We allocate the arm upfront and fill pattern fields.
-    arm = parse_pattern(p)
-    if p.error != 0
-        p.pos = start_pos
-        p.error = 1
-        return null
-    if arm == null
-        p.pos = start_pos
-        p.error = 1
-        return null
-
-    # Expect FAT_ARROW
-    if p_expect(p, TOK_FAT_ARROW) == 0
-        p.error = 1
-        p.pos = start_pos
-        return null
-
-    # arm_body: either `pass` (as an IDENT) or expression
-    # `pass` is not its own keyword in ritz1's lexer — it surfaces as TOK_IDENT.
-    let body_tok: Token = p_current_token(p)
-    var is_pass: i32 = 0
-    if body_tok.kind == TOK_IDENT and body_tok.len == 4
-        # Check for "pass" literal: 'p'=112, 'a'=97, 's'=115, 's'=115
-        if *body_tok.start == 112 and *(body_tok.start + 1) == 97
-            if *(body_tok.start + 2) == 115 and *(body_tok.start + 3) == 115
-                is_pass = 1
-    if is_pass == 1
-        p_advance(p)  # consume `pass`
-        match_arm_set_body(arm, null, 1)
-    else
-        let body: *Expr = parse_expr(p)
-        if p.error != 0
-            p.pos = start_pos
-            return null
-        match_arm_set_body(arm, body, 0)
-
-    # Consume trailing newline
-    if p_expect(p, TOK_NEWLINE) == 0
-        p.error = 1
-        p.pos = start_pos
-        return null
-    return arm
-
-# pattern: NUMBER | '_' | IDENT | IDENT '(' inner ')'
-# Returns a MatchArm with the pattern fields filled (body unset).
-fn parse_pattern(p: *Parser) -> *MatchArm
-    let tok: Token = p_current_token(p)
-
-    # Integer literal pattern
-    if tok.kind == TOK_NUMBER
-        p_advance(p)
-        # AGAST #107: strip typed-suffix before parsing digit value.
-        return match_arm_int(p, parse_int(tok.start, int_lit_len(tok.start, tok.len)))
-
-    # Negative integer literal pattern: `-NUMBER`
-    if tok.kind == TOK_MINUS
-        p_advance(p)
-        let num: Token = p_current_token(p)
-        if num.kind == TOK_NUMBER
-            p_advance(p)
-            return match_arm_int(p, 0 - parse_int(num.start, int_lit_len(num.start, num.len)))
-        p.error = 1
-        return null
-
-    # Identifier-based patterns (wildcard `_`, binding, variant)
-    if tok.kind == TOK_IDENT
-        p_advance(p)
-        # Check for wildcard: single-char ident '_'
-        if tok.len == 1 and *tok.start == 95  # '_'
-            return match_arm_wildcard(p)
-        # Check for variant: IDENT LPAREN inner RPAREN
-        if p_peek(p) == TOK_LPAREN
-            p_advance(p)  # consume `(`
-            let inner_tok: Token = p_current_token(p)
-            var inner_kind: i32 = 0
-            var inner_name: *u8 = null
-            var inner_len: i32 = 0
-            if inner_tok.kind == TOK_IDENT
-                p_advance(p)
-                if inner_tok.len == 1 and *inner_tok.start == 95  # '_'
-                    inner_kind = PAT_WILDCARD
-                else
-                    inner_kind = PAT_IDENT
-                    inner_name = inner_tok.start
-                    inner_len = inner_tok.len
-            else
-                p.error = 1
-                return null
-            if p_expect(p, TOK_RPAREN) == 0
-                p.error = 1
-                return null
-            return match_arm_variant(p, tok.start, tok.len, inner_kind, inner_name, inner_len)
-        # Plain ident pattern — binding or unit variant (None, etc.)
-        return match_arm_ident(p, tok.start, tok.len)
-
-    p.error = 1
-    return null
-
-# =============================================================================
-# Enum declaration parsing (minimal skip)
-# =============================================================================
-#
-# ritz1 doesn't yet model enums in its AST — but ritzlib/result.ritz and
-# ritzlib/option.ritz use `enum Name<T> ... variants`. Without at least a
-# consume-and-skip parser here, parse_item bails at the first `enum` token
-# and the rest of the module silently drops. We consume the syntax but
-# discard the payload; variant constructors are handled as opaque calls
-# (or special-cased by the emitter for Some/Ok/None/Err).
-#
-# Grammar consumed:
-#   [ 'pub' ] enum IDENT [ '<' ... '>' ]
-#       INDENT (IDENT [ '(' ... ')' ] NEWLINE)+ DEDENT
-
-fn parse_enum_def(p: *Parser) -> i32
-    let start_pos: i32 = p.pos
-
-    # Optional `pub` prefix
-    if p_peek(p) == TOK_PUB
-        p_advance(p)
-
-    if p_expect(p, TOK_ENUM) == 0
-        p.error = 1
-        p.pos = start_pos
-        return 0
-    if p_expect(p, TOK_IDENT) == 0
-        p.error = 1
-        p.pos = start_pos
-        return 0
-    # Optional <T, ...>
-    if p_peek(p) == TOK_LT
-        p_advance(p)
-        # Consume until matching '>'
-        var depth: i32 = 1
-        while depth > 0
-            let k: i32 = p_peek(p)
-            if k == TOK_LT
-                depth = depth + 1
-            else if k == TOK_GT
-                depth = depth - 1
-            else if k == TOK_EOF
-                p.error = 1
-                p.pos = start_pos
-                return 0
-            p_advance(p)
-    if p_expect(p, TOK_NEWLINE) == 0
-        p.error = 1
-        p.pos = start_pos
-        return 0
-    if p_expect(p, TOK_INDENT) == 0
-        p.error = 1
-        p.pos = start_pos
-        return 0
-    # Consume variant lines until DEDENT
-    while p_peek(p) != TOK_DEDENT and p_peek(p) != TOK_EOF
-        # Variant name
-        if p_peek(p) != TOK_IDENT
-            # Skip unexpected token gracefully
-            p_advance(p)
-        else
-            p_advance(p)
-            # Optional (type, ...)
-            if p_peek(p) == TOK_LPAREN
-                var depth2: i32 = 1
-                p_advance(p)
-                while depth2 > 0
-                    let k: i32 = p_peek(p)
-                    if k == TOK_LPAREN
-                        depth2 = depth2 + 1
-                    else if k == TOK_RPAREN
-                        depth2 = depth2 - 1
-                    else if k == TOK_EOF
-                        p.error = 1
-                        p.pos = start_pos
-                        return 0
-                    p_advance(p)
-            # Consume trailing newline (optional — tolerate missing)
-            if p_peek(p) == TOK_NEWLINE
-                p_advance(p)
-    if p_expect(p, TOK_DEDENT) == 0
-        p.error = 1
-        p.pos = start_pos
-        return 0
-    return 1
 

@@ -81,7 +81,7 @@ HAND_WRITTEN_TOKEN_IDS = {
     'IMPL': 26, 'FOR': 27, 'TRAIT': 28, 'ENUM': 29, 'MATCH': 30,
     'DEFER': 31, 'LOOP': 32, 'UNSAFE': 33, 'IN': 34,
     'AND': 35, 'OR': 36, 'NOT': 37, 'TRUE': 38, 'FALSE': 39,
-    'NULL': 40, 'SELF': 41, 'MUT': 42,
+    'NULL': 40, 'SELF': 41, 'MUT': 42, 'PASS': 43,
     # Type keywords
     'I8': 50, 'I16': 51, 'I32': 52, 'I64': 53,
     'U8': 54, 'U16': 55, 'U32': 56, 'U64': 57,
@@ -382,6 +382,12 @@ class RitzGenerator:
         self._emit('    p.last_call_type_suffix = null')
         self._emit('    p.last_call_type_suffix_len = 0')
         self._emit('    p.last_ref_inner_type = 0')
+        self._emit('    # Conditional-compilation skip flag. MUST be zeroed — if left')
+        self._emit('    # garbage we drop every parsed item and produce an empty module.')
+        self._emit('    # Symptom: with RITZ_PATH set (different heap layout), the first')
+        self._emit('    # parsed fn lands on a non-zero skip_item and silently disappears,')
+        self._emit('    # leaving callers with extern declarations only at link time.')
+        self._emit('    p.skip_item = 0')
 
     def _generate_parser_helpers(self):
         self._emit('fn p_peek(p: *Parser) -> i32')
@@ -810,38 +816,33 @@ class RitzGenerator:
                 continue
 
             if tok.is_literal and tok.pattern:
-                pattern = tok.pattern
-                pat_len = len(pattern)
-                # Escape { and } to avoid ritz string interpolation
-                if pattern == '{':
-                    self._emit(f'    lexer_add_pattern(lex, "\\{{", {pat_len}, TOK_{tok.name}, 1)')
-                elif pattern == '}':
-                    self._emit(f'    lexer_add_pattern(lex, "\\}}", {pat_len}, TOK_{tok.name}, 1)')
-                else:
-                    self._emit(f'    lexer_add_pattern(lex, "{pattern}", {pat_len}, TOK_{tok.name}, 1)')
+                # Bare "..." literals lower to StrView in ritz1 — the pair
+                # of `*u8 + i32 len` parameters is collapsed to a single
+                # StrView at the lexer_add_pattern boundary.
+                pattern = tok.pattern.replace('\\', '\\\\').replace('"', '\\"')
+                self._emit(f'    lexer_add_pattern(lex, "{pattern}", TOK_{tok.name}, 1)')
             elif not tok.is_literal and tok.pattern:
-                # Regex pattern — len is runtime length (raw pattern),
-                # escaped is the Ritz source representation
+                # Regex pattern — same StrView treatment as literal patterns.
                 raw_pat = tok.pattern
                 escaped = raw_pat.replace('\\', '\\\\').replace('"', '\\"')
-                self._emit(f'    lexer_add_pattern(lex, "{escaped}", {len(raw_pat)}, TOK_{tok.name}, 0)')
+                self._emit(f'    lexer_add_pattern(lex, "{escaped}", TOK_{tok.name}, 0)')
 
         # Add whitespace and comment patterns
         wt = self.grammar.token_map.get('WHITESPACE')
         if wt:
             raw_pat = wt.pattern
             escaped = raw_pat.replace('\\', '\\\\').replace('"', '\\"')
-            self._emit(f'    lexer_add_pattern(lex, "{escaped}", {len(raw_pat)}, TOK_WHITESPACE, 0)')
+            self._emit(f'    lexer_add_pattern(lex, "{escaped}", TOK_WHITESPACE, 0)')
 
         ct = self.grammar.token_map.get('COMMENT')
         if ct:
             raw_pat = ct.pattern
             escaped = raw_pat.replace('\\', '\\\\').replace('"', '\\"')
-            self._emit(f'    lexer_add_pattern(lex, "{escaped}", {len(raw_pat)}, TOK_COMMENT, 0)')
+            self._emit(f'    lexer_add_pattern(lex, "{escaped}", TOK_COMMENT, 0)')
 
         self._emit('')
         self._emit('    # Add whitespace as skip token')
-        self._emit('    lexer_add_pattern(lex, " ", 1, TOK_SKIP, 1)')
+        self._emit('    lexer_add_pattern(lex, " ", TOK_SKIP, 1)')
         self._emit('')
         self._emit('    # Finalize lexer')
         self._emit('    lexer_finalize(lex)')
