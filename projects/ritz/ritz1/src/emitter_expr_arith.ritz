@@ -9,6 +9,142 @@ import emitter_expr
 
 
 fn emit_expr_binary(s: *EmitterState, e: *Expr) -> i32
+    # Short-circuit logical AND / OR.  Without this, ritz1 emits
+    #   %r = and i64 %left, %right
+    # which evaluates BOTH operands eagerly — `a and *p == 'x'` always
+    # dereferences `p` even when `a` is false.  ritz0 implements proper
+    # short-circuit via control flow + phi.  The selfhost-emit-strview
+    # SEGV (Wave 5E) was a downstream consequence: a code path inside
+    # emit_expr_call had `param_type == TYPE_STRUCT and *(param_type_name + 0)
+    # == 'S' and ...` — when the param was a non-struct, the deref of a
+    # null name fired anyway.  See ritz0 _emit_short_circuit_and (~3942).
+    if e.op == OP_AND
+        # Synthetic anchor block — gives us a known predecessor label for
+        # the phi.  s.current_label may be stale at the function entry
+        # block (which is named `entry`, not a number), so we can't rely
+        # on it being a valid number.  LLVM optimizes the trivial branch
+        # away.
+        let sa_anchor: i32 = next_label(s)
+        emit_str(s, c"  br label %")
+        emit_label(s, sa_anchor)
+        emit_str(s, c"\n")
+        emit_label(s, sa_anchor)
+        emit_str(s, c":\n")
+        s.current_label = sa_anchor
+        let sa_left_val: i32 = emit_expr(s, e.left)
+        let sa_left_bool: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, sa_left_bool)
+        emit_str(s, c" = icmp ne i64 ")
+        emit_reg(s, sa_left_val)
+        emit_str(s, c", 0\n")
+        let sa_entry_label: i32 = s.current_label
+        let sa_right_label: i32 = next_label(s)
+        let sa_end_label: i32 = next_label(s)
+        emit_str(s, c"  br i1 ")
+        emit_reg(s, sa_left_bool)
+        emit_str(s, c", label %")
+        emit_label(s, sa_right_label)
+        emit_str(s, c", label %")
+        emit_label(s, sa_end_label)
+        emit_str(s, c"\n")
+        # Right branch — only entered when left was truthy
+        emit_label(s, sa_right_label)
+        emit_str(s, c":\n")
+        s.current_label = sa_right_label
+        let sa_right_val: i32 = emit_expr(s, e.right)
+        let sa_right_bool: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, sa_right_bool)
+        emit_str(s, c" = icmp ne i64 ")
+        emit_reg(s, sa_right_val)
+        emit_str(s, c", 0\n")
+        let sa_right_ext: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, sa_right_ext)
+        emit_str(s, c" = zext i1 ")
+        emit_reg(s, sa_right_bool)
+        emit_str(s, c" to i64\n")
+        let sa_right_exit: i32 = s.current_label
+        emit_str(s, c"  br label %")
+        emit_label(s, sa_end_label)
+        emit_str(s, c"\n")
+        # End — phi merges short-circuit (false) and full-eval branches.
+        emit_label(s, sa_end_label)
+        emit_str(s, c":\n")
+        s.current_label = sa_end_label
+        let sa_phi: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, sa_phi)
+        emit_str(s, c" = phi i64 [ 0, %")
+        emit_label(s, sa_entry_label)
+        emit_str(s, c" ], [ ")
+        emit_reg(s, sa_right_ext)
+        emit_str(s, c", %")
+        emit_label(s, sa_right_exit)
+        emit_str(s, c" ]\n")
+        return sa_phi
+    if e.op == OP_OR
+        let so_anchor: i32 = next_label(s)
+        emit_str(s, c"  br label %")
+        emit_label(s, so_anchor)
+        emit_str(s, c"\n")
+        emit_label(s, so_anchor)
+        emit_str(s, c":\n")
+        s.current_label = so_anchor
+        let so_left_val: i32 = emit_expr(s, e.left)
+        let so_left_bool: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, so_left_bool)
+        emit_str(s, c" = icmp ne i64 ")
+        emit_reg(s, so_left_val)
+        emit_str(s, c", 0\n")
+        let so_entry_label: i32 = s.current_label
+        let so_right_label: i32 = next_label(s)
+        let so_end_label: i32 = next_label(s)
+        # Inverted: if left truthy, skip right (result already true).
+        emit_str(s, c"  br i1 ")
+        emit_reg(s, so_left_bool)
+        emit_str(s, c", label %")
+        emit_label(s, so_end_label)
+        emit_str(s, c", label %")
+        emit_label(s, so_right_label)
+        emit_str(s, c"\n")
+        emit_label(s, so_right_label)
+        emit_str(s, c":\n")
+        s.current_label = so_right_label
+        let so_right_val: i32 = emit_expr(s, e.right)
+        let so_right_bool: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, so_right_bool)
+        emit_str(s, c" = icmp ne i64 ")
+        emit_reg(s, so_right_val)
+        emit_str(s, c", 0\n")
+        let so_right_ext: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, so_right_ext)
+        emit_str(s, c" = zext i1 ")
+        emit_reg(s, so_right_bool)
+        emit_str(s, c" to i64\n")
+        let so_right_exit: i32 = s.current_label
+        emit_str(s, c"  br label %")
+        emit_label(s, so_end_label)
+        emit_str(s, c"\n")
+        emit_label(s, so_end_label)
+        emit_str(s, c":\n")
+        s.current_label = so_end_label
+        let so_phi: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, so_phi)
+        emit_str(s, c" = phi i64 [ 1, %")
+        emit_label(s, so_entry_label)
+        emit_str(s, c" ], [ ")
+        emit_reg(s, so_right_ext)
+        emit_str(s, c", %")
+        emit_label(s, so_right_exit)
+        emit_str(s, c" ]\n")
+        return so_phi
+
     # Check if this is pointer arithmetic (ptr + int or ptr - int)
     # If left operand is a pointer type, scale the right operand by pointee size.
     # Handles both simple identifier (p + i) and member access (s.ptr + i).
