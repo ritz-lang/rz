@@ -1170,6 +1170,45 @@ fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         emit_assign(s, stmt)
     else if stmt.kind == STMT_RETURN
         emit_return(s, stmt, ret_type)
+    else if stmt.kind == STMT_ASSERT
+        # Runtime check: `assert <cond>` exits 1 if cond is falsy.  Same
+        # i1 / i64 coercion as STMT_IF.  On failure path we emit an inline
+        # syscall(60, 1) (Linux _exit) followed by `unreachable` so LLVM
+        # knows the fail block has no successor; the success path falls
+        # through to the next statement via the named ok-label.
+        let a_cond: i32 = emit_expr(s, stmt.if_cond)
+        let a_cond_type: i32 = get_expr_type(s, stmt.if_cond)
+        var a_cond_i1: i32 = a_cond
+        if a_cond_type != TYPE_BOOL
+            a_cond_i1 = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, a_cond_i1)
+            emit_str(s, c" = icmp ne i64 ")
+            emit_reg(s, a_cond)
+            emit_str(s, c", 0\n")
+        let a_ok: i32 = next_label(s)
+        let a_fail: i32 = next_label(s)
+        emit_str(s, c"  br i1 ")
+        emit_reg(s, a_cond_i1)
+        emit_str(s, c", label %")
+        emit_label(s, a_ok)
+        emit_str(s, c", label %")
+        emit_label(s, a_fail)
+        emit_str(s, c"\n")
+        # Fail path — inline syscall(60, 1).  Constraint string mirrors
+        # `_exit(1)`: rax=60 selects exit, rdi=1 is the status.  The
+        # `~{rcx},~{r11},~{memory}` clobbers match what other syscall
+        # sites in the emitter use.
+        emit_label(s, a_fail)
+        emit_str(s, c":\n")
+        emit_str(s, c"  call i64 asm sideeffect \"syscall\", ")
+        emit_str(s, c"\"=&{rax},{rax},{rdi},~{rcx},~{r11},~{memory}\"")
+        emit_str(s, c"(i64 60, i64 1)\n")
+        emit_str(s, c"  unreachable\n")
+        # OK path — labelled and dropped to the next statement.
+        emit_label(s, a_ok)
+        emit_str(s, c":\n")
+        s.current_label = a_ok
     else if stmt.kind == STMT_IF
         let cond: i32 = emit_expr(s, stmt.if_cond)
         # If the condition is already i1 (TYPE_BOOL identifier/load), use it

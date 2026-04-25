@@ -1261,7 +1261,40 @@ fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
                 else
                     converted_regs[j] = arg_regs[j]
             else
-                converted_regs[j] = arg_regs[j]
+                # Final fallback for TYPE_STRUCT params not matched by any
+                # specialised branch (StrView/Span/primitive).  ptr_value_
+                # coercion regression: `sum_point(@p)` where p: PointI and
+                # the callee takes PointI by value.  emit_expr(@p) emitted
+                # i64 (ptrtoint of the alloca); we need %PointI value.  If
+                # the arg is OP_ADDR/OP_ADDR_MUT and the param is a
+                # struct, inttoptr+load to materialise the value.
+                var fb_arg: *Expr = e.args
+                var fk: i32 = 0
+                while fk < j and fb_arg != null
+                    fb_arg = fb_arg.next
+                    fk = fk + 1
+                var fb_done: i32 = 0
+                if param_ptr.param_type == TYPE_STRUCT and param_ptr.param_type_name_len > 0
+                    if fb_arg != null and fb_arg.kind == EXPR_UNARY
+                        if fb_arg.op == OP_ADDR or fb_arg.op == OP_ADDR_MUT
+                            let fb_pp: i32 = next_reg(s)
+                            emit_str(s, c"  ")
+                            emit_reg(s, fb_pp)
+                            emit_str(s, c" = inttoptr i64 ")
+                            emit_reg(s, arg_regs[j])
+                            emit_str(s, c" to ptr\n")
+                            let fb_v: i32 = next_reg(s)
+                            emit_str(s, c"  ")
+                            emit_reg(s, fb_v)
+                            emit_str(s, c" = load %")
+                            emit_name(s, param_ptr.param_type_name, param_ptr.param_type_name_len)
+                            emit_str(s, c", ptr ")
+                            emit_reg(s, fb_pp)
+                            emit_str(s, c"\n")
+                            converted_regs[j] = fb_v
+                            fb_done = 1
+                if fb_done == 0
+                    converted_regs[j] = arg_regs[j]
             param_ptr = param_ptr.next
         else
             # fn_def is null - external function, assume i64 for all args

@@ -81,7 +81,7 @@ HAND_WRITTEN_TOKEN_IDS = {
     'IMPL': 26, 'FOR': 27, 'TRAIT': 28, 'ENUM': 29, 'MATCH': 30,
     'DEFER': 31, 'LOOP': 32, 'UNSAFE': 33, 'IN': 34,
     'AND': 35, 'OR': 36, 'NOT': 37, 'TRUE': 38, 'FALSE': 39,
-    'NULL': 40, 'SELF': 41, 'MUT': 42, 'PASS': 43,
+    'NULL': 40, 'SELF': 41, 'MUT': 42, 'PASS': 43, 'ASSERT': 44,
     # Type keywords
     'I8': 50, 'I16': 51, 'I32': 52, 'I64': 53,
     'U8': 54, 'U16': 55, 'U32': 56, 'U64': 57,
