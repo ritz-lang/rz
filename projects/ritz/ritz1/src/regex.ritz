@@ -64,6 +64,15 @@ fn regex_parse_char(p: *RegexParser) -> i32
 
 # Parse a character class [...]
 # Returns an NFAFragment matching the class
+#
+# Negation `[^abc...]` is supported for arbitrary multi-char exclusion sets:
+# we collect all excluded chars into a fixed-size array (up to 16, enough
+# for the patterns this lexer cares about — STRING/CSTRING use [^"\\],
+# COMMENT uses [^\n]), insertion-sort them ascending, then emit an
+# alternation of complement ranges between the gaps.  Previously only the
+# FIRST excluded char was honoured — `[^"\\]` reduced to `[^"]`, letting
+# `\` slip through and confuse string/cstring lexing on inputs containing
+# multiple backslashes.
 fn regex_parse_class(p: *RegexParser) -> NFAFragment
   # Skip opening [
   regex_advance(p)
@@ -78,21 +87,22 @@ fn regex_parse_class(p: *RegexParser) -> NFAFragment
   # For negated classes, we'll need to track what to exclude
   var result: NFAFragment = NFAFragment { start: -1, end: -1 }
   var first: i32 = 1
-  var excluded_char: i32 = 0  # For negation, track the excluded char
+  # Excluded chars for negation (sorted ascending after the loop).
+  var excl: [16]i32
+  var excl_n: i32 = 0
 
   while regex_at_end(p) == 0 and regex_peek(p) != 93
     let ch: i32 = regex_parse_char(p)
 
-    # If negated, just track the first excluded char (for single-char negation)
-    if negated == 1 and first == 1
-      excluded_char = ch
-
     # Check for range
     var frag: NFAFragment = NFAFragment { start: 0, end: 0 }
+    var range_lo: i32 = ch
+    var range_hi: i32 = ch
     if regex_peek(p) == 45  # -
       regex_advance(p)
       if regex_peek(p) != 93
         let hi: i32 = regex_parse_char(p)
+        range_hi = hi
         frag = thompson_range(p.nfa, ch, hi)
       else
         # Trailing dash, treat as literal
@@ -101,6 +111,17 @@ fn regex_parse_class(p: *RegexParser) -> NFAFragment
         frag = thompson_alt(p.nfa, frag, dash)
     else
       frag = thompson_char(p.nfa, ch)
+
+    # If negated, append every byte in [range_lo..range_hi] to the
+    # excluded set (cap at the array size; more than 16 distinct chars
+    # is exotic enough to not matter for lexer-grade patterns).
+    if negated == 1
+      var k: i32 = range_lo
+      while k <= range_hi
+        if excl_n < 16
+          excl[excl_n] = k
+          excl_n = excl_n + 1
+        k = k + 1
 
     # Only build normal result if not negated
     if negated == 0
@@ -116,14 +137,42 @@ fn regex_parse_class(p: *RegexParser) -> NFAFragment
   if regex_peek(p) == 93
     regex_advance(p)
 
-  # Handle negation: for [^x], create complement (everything except x)
-  # For simplicity, support only single-char negation for bootstrap
+  # Handle negation: for [^abc...], create complement.
   if negated == 1
-    # For [^x], match everything except x
-    # Create: [\x00-\x{x-1}] | [\x{x+1}-\xFF]
-    var before: NFAFragment = thompson_range(p.nfa, 0, excluded_char - 1)
-    var after: NFAFragment = thompson_range(p.nfa, excluded_char + 1, 255)
-    result = thompson_alt(p.nfa, before, after)
+    # Insertion sort the excluded set in ascending order so we can walk
+    # the gaps in one pass.
+    var i: i32 = 1
+    while i < excl_n
+      let cur: i32 = excl[i]
+      var j: i32 = i - 1
+      while j >= 0 and excl[j] > cur
+        excl[j + 1] = excl[j]
+        j = j - 1
+      excl[j + 1] = cur
+      i = i + 1
+    # Walk gaps: [0..excl[0]-1], [excl[0]+1..excl[1]-1], ..., [excl[n-1]+1..255].
+    var lo: i32 = 0
+    var alt_first: i32 = 1
+    var ix: i32 = 0
+    while ix < excl_n
+      let hi: i32 = excl[ix] - 1
+      if hi >= lo
+        let seg: NFAFragment = thompson_range(p.nfa, lo, hi)
+        if alt_first == 1
+          result = seg
+          alt_first = 0
+        else
+          result = thompson_alt(p.nfa, result, seg)
+      lo = excl[ix] + 1
+      ix = ix + 1
+    # Final tail [lo..255].
+    if lo <= 255
+      let tail: NFAFragment = thompson_range(p.nfa, lo, 255)
+      if alt_first == 1
+        result = tail
+        alt_first = 0
+      else
+        result = thompson_alt(p.nfa, result, tail)
 
   result
 

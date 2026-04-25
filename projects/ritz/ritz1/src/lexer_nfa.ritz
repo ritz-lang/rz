@@ -585,6 +585,49 @@ fn lexer_next(lex: *Lexer) -> Token
     var tok: Token = token_new(best_type, start, best_len, line, col)
     # Set the start pointer to point into the source buffer
     tok.start = lex.src + start
+
+    # CSTRING / STRING cooking after NFA match.  The NFA only knows the
+    # raw byte span; tokens have a separate `string_val/string_len` slot
+    # for the cooked (escape-processed) content, which expr_string reads.
+    # Without this pass the cooked slot stays null and `c"hello"` lowers
+    # to an empty string at emit time.  The special-case CSTRING-via-
+    # IDENT-prefix path above is the legacy workaround for when the NFA
+    # negation bug masked CSTRING matches; with the negation fixed,
+    # CSTRING wins the longest match and we cook here.
+    if best_type == TOK_CSTRING or best_type == TOK_STRING
+      var prefix: i32 = 1  # default: `"`
+      if best_type == TOK_CSTRING
+        prefix = 2  # `c"`
+      var i: i32 = prefix
+      let str_start: i32 = lex.string_pos
+      while i < best_len - 1  # stop before closing quote
+        let raw: i32 = (*(lex.src + start + i)) & 255
+        if raw == 92 and i + 1 < best_len - 1  # backslash escape
+          let esc: i32 = (*(lex.src + start + i + 1)) & 255
+          var cooked: i8 = esc as i8
+          if esc == 110       # \n
+            cooked = 10
+          else if esc == 116  # \t
+            cooked = 9
+          else if esc == 114  # \r
+            cooked = 13
+          else if esc == 92   # \\
+            cooked = 92
+          else if esc == 34   # \"
+            cooked = 34
+          else if esc == 48   # \0
+            cooked = 0
+          if lex.string_pos < MAX_STRING_LEN
+            lex.string_buf[lex.string_pos] = cooked
+            lex.string_pos = lex.string_pos + 1
+          i = i + 2
+        else
+          if lex.string_pos < MAX_STRING_LEN
+            lex.string_buf[lex.string_pos] = raw as i8
+            lex.string_pos = lex.string_pos + 1
+          i = i + 1
+      tok.string_val = (@lex.string_buf[str_start]) as *u8
+      tok.string_len = lex.string_pos - str_start
     return tok
 
   # End of input - emit any remaining DEDENTs
