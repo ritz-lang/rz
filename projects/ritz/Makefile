@@ -13,7 +13,7 @@
 #   make build-<name>  - Build a specific package
 #   make test-<name>   - Build and test a specific package
 
-.PHONY: all test unit ritz ritz1 build clean list help valgrind regression regression-quick check-no-s-strings
+.PHONY: all test unit ritz ritz1 build clean list help valgrind regression regression-quick check-no-s-strings matrix matrix-full matrix-quick
 
 PYTHON ?= python3
 VALGRIND ?= valgrind --error-exitcode=1 --leak-check=full -q
@@ -95,6 +95,31 @@ valgrind: build
 	@$(VALGRIND) examples/10_sleep/sleep 0.001
 	@echo "✓ All valgrind checks passed!"
 
+# Validation matrix: 33-test regression × {ritz0, ritz1, ritz1_selfhosted}.
+# See docs/VALIDATION.md for the full validation workflow.
+#
+# Three escalating thoroughness levels:
+#   matrix-quick — incremental ritz1 build + ritz1-only matrix       (~30-60s)
+#   matrix       — alias for matrix-quick (the common pre-commit gate)
+#   matrix-full  — incremental ritz1 + selfhost build + full matrix  (~4-5min)
+#
+# DO NOT add a `clean` step here. Make's dep tracking is correct; if it
+# isn't, that's a Makefile bug. See docs/VALIDATION.md "Hard rules".
+matrix-quick: | _matrix_ritz1_built
+	@$(PYTHON) tools/run_regression_matrix.py --compiler ritz1
+
+matrix: matrix-quick
+
+matrix-full: | _matrix_ritz1_built
+	@echo "=== Full matrix (ritz0 + ritz1 + ritz1_selfhosted) ==="
+	@echo "    This will incrementally rebuild ritz1_selfhosted (~3 min if ritz1 source changed)."
+	@$(PYTHON) tools/run_regression_matrix.py --rebuild
+
+# Internal: ensure ritz1 binary is up-to-date before running the matrix.
+.PHONY: _matrix_ritz1_built
+_matrix_ritz1_built:
+	@$(MAKE) -C ritz1 ritz1 >/dev/null 2>&1 || $(MAKE) -C ritz1 ritz1
+
 # Regression test suite (all tiers)
 regression:
 	@./scripts/regression.sh
@@ -117,9 +142,13 @@ help:
 	@echo "  make list     - List all packages"
 	@echo "  make clean    - Remove build artifacts"
 	@echo "  make valgrind - Run valgrind memory checks on Tier 1 examples"
+	@echo "  make matrix       - Pre-commit gate: incremental ritz1 + ritz1-only matrix (~30-60s)"
+	@echo "  make matrix-full  - Pre-push gate: incremental ritz1 + selfhost + full matrix (~4-5min)"
 	@echo "  make regression       - Full regression suite (all 4 tiers)"
 	@echo "  make regression-quick - Quick regression (skip bootstrap)"
 	@echo "  make check-no-s-strings - Guard that no s\"...\" literals leak back in"
+	@echo ""
+	@echo "  See docs/VALIDATION.md for the full validation workflow."
 	@echo ""
 	@echo "Individual packages:"
 	@echo "  make build-<name>  - Build a specific package"

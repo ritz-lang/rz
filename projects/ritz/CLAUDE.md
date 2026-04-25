@@ -2,12 +2,13 @@
 
 Systems programming language compiling to LLVM IR. No libc - direct Linux syscalls.
 
-## Status (February 2026)
+## Status (April 2026)
 
 | Component | Status |
 |-----------|--------|
-| **ritz0** (Python bootstrap) | ✅ 324 tests passing |
-| **ritz1** (self-hosted) | 🔄 Blocked on generics monomorphization |
+| **ritz0** (Python bootstrap) | ✅ 33/33 regression matrix |
+| **ritz1** (self-hosted, ritz0-built) | ✅ 33/33 regression matrix |
+| **ritz1_selfhosted** (ritz1 self-compiling) | ✅ 33/33 regression matrix |
 | **ritzlib** | 34 modules |
 | **examples** | 75+ programs |
 
@@ -17,12 +18,20 @@ Systems programming language compiling to LLVM IR. No libc - direct Linux syscal
 # Build an example
 python3 build.py build 21_ls
 
-# Run tests
-make test
+# Pre-commit validation (incremental ritz1, 30-60s)
+make matrix
 
-# Run regression suite
-make regression
+# Pre-push validation (full bootstrap + matrix, ~5min)
+make matrix-full
+
+# All tests, all examples (slow)
+make test
 ```
+
+**Read `docs/VALIDATION.md` before running clean rebuilds.** The hard rule is:
+never `make clean` to "make sure it works" — Make's incremental rebuild is
+correct; if it isn't, that's a Makefile bug to fix, not paper over. A previous
+session burned 100 minutes on redundant full bootstraps.
 
 ## Directory Structure
 
@@ -71,5 +80,6 @@ fn test_add() -> i32
 - `docs/LANGUAGE.md` - Full language reference
 - `docs/EXAMPLES.md` - Example program guide
 - `docs/TESTING.md` - Test system documentation
+- `docs/VALIDATION.md` - **Validation workflow & build cadence** (read this!)
 - `STYLE.md` - Code style guide
 - `TODO.md` / `DONE.md` - Work tracking
