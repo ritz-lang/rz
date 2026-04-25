@@ -1704,3 +1704,73 @@ pub fn expr_match(p: *Parser, scrutinee: *Expr, arms: *MatchArm, line: i32, col:
     e.args = arms as *Expr  # Reinterpret arm list as Expr* slot
     e.next = null
     return e
+
+# =============================================================================
+# Wave 5F.2 — wrappers called from the canonical grammar (ritz1.grammar)
+# =============================================================================
+# These wrap the lower-level helpers above with the names / shapes the
+# grammar productions reference.  Kept thin so generator output stays a
+# direct translation of the grammar.
+
+# pattern : NUMBER  →  PAT_INT_LIT.  Token text comes raw from the lexer; we
+# parse it into an i64 here so the action stays a single function call.
+pub fn pattern_lit_int(p: *Parser, start: *u8, len: i32) -> *MatchArm
+    return match_arm_int(p, parse_int(start, len))
+
+# pattern : IDENT  →  PAT_WILDCARD if `_`, else PAT_IDENT.
+pub fn pattern_ident_or_wildcard(p: *Parser, name: *u8, name_len: i32) -> *MatchArm
+    if name_len == 1
+        if *name == 95  # '_'
+            return match_arm_wildcard(p)
+    return match_arm_ident(p, name, name_len)
+
+# pattern : IDENT '(' IDENT ')'  →  PAT_VARIANT with inner = wildcard or bind.
+# Inner ident `_` becomes a wildcard payload; any other ident is a binding.
+pub fn pattern_variant_inner(p: *Parser, name: *u8, name_len: i32, inner: *u8, inner_len: i32) -> *MatchArm
+    if inner_len == 1
+        if *inner == 95  # '_'
+            return match_arm_variant(p, name, name_len, PAT_WILDCARD, null, 0)
+    return match_arm_variant(p, name, name_len, PAT_IDENT, inner, inner_len)
+
+# match_arm action: arm_body returns null for `pass` keyword, expr otherwise.
+# Mark is_pass=1 when null; otherwise store the body expr.  Returns arm.
+pub fn match_arm_set_body_or_pass(arm: *MatchArm, body: *Expr) -> *MatchArm
+    if body == null
+        match_arm_set_body(arm, null as *Expr, 1)
+    else
+        match_arm_set_body(arm, body, 0)
+    return arm
+
+# postfix_op : '?'  →  POSTFIX_TRY.  apply_postfix_p wraps the running
+# postfix result in an EXPR_TRY node when it sees this op (AGAST #134).
+pub fn postfix_try_new(p: *Parser) -> *PostfixOp
+    let op: *PostfixOp = parser_alloc(p, 64) as *PostfixOp
+    op.kind = POSTFIX_TRY
+    op.next = null
+    return op
+
+# postfix_op : '[' expr '..' expr ']'  →  POSTFIX_INDEX wrapping an
+# EXPR_RANGE { lo, hi }.  emit_expr_index lowers the range to a slice
+# (AGAST #110).
+pub fn postfix_range_index(p: *Parser, lo: *Expr, hi: *Expr) -> *PostfixOp
+    let r: *Expr = parser_alloc(p, 128) as *Expr
+    r.kind = EXPR_RANGE
+    r.span = lo.span
+    r.left = lo
+    r.right = hi
+    r.next = null
+    return postfix_index(p, r)
+
+# for_stmt : FOR IDENT IN expr block  →  STMT_FOR with iter expression
+# stored in for_end (start = null sentinel).  emit_for handles the
+# Vec/Span/Range iteration shapes (ritz-task-84 — for-iterables).
+pub fn stmt_for_iter(p: *Parser, name: *u8, name_len: i32, iter: *Expr, body: *Stmt, line: i32, col: i32) -> *Stmt
+    return stmt_for(p, name, name_len, null as *Expr, iter, body, line, col)
+
+# enum_def : ENUM ... { skip-and-return-zero }
+# ritz1's AST has no enum node yet — variant constructors resolve via
+# call-site special-casing in the emitter (Some/Ok/None/Err) plus the
+# unit-tag fallback layout.  This action just signals "syntactically
+# valid, nothing to add to module".
+pub fn enum_def_skip(p: *Parser) -> i32
+    return 0
