@@ -921,12 +921,16 @@ fn is_vec_struct_name(name: *u8, name_len: i32) -> i32
 # emits valid IR; the body is still code-generated (with the loop var bound
 # to elem-type i64) so that name lookups inside the body succeed.
 fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: i32)
-    var iter_kind: i32 = 0         # 0=unsupported, 1=local array, 2=vec-ref
+    var iter_kind: i32 = 0         # 0=unsupported, 1=local array, 2=vec-ref, 3=const array
     var elem_type: i32 = TYPE_I64
     var arr_size: i32 = 0
     var data_reg: i32 = 0
     var type_name: *u8 = null
     var type_name_len: i32 = 0
+    # Const-array iter (kind=3): use global symbol `@<const_name>` as the
+    # base pointer instead of an SSA reg.
+    var const_name: *u8 = null
+    var const_name_len: i32 = 0
 
     let iter: *Expr = stmt.for_start
     if iter != null
@@ -938,6 +942,18 @@ fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                     elem_type = loc.array_elem_type
                     arr_size = loc.array_size
                     data_reg = loc.reg
+            else
+                # Iter is not a local — try a module const array
+                # (`const VALUES: [3]i32 = [2,3,5]`).  emit_const_array_entry
+                # emits `@VALUES = internal constant [3 x i32] [...]`; we GEP
+                # off the global symbol below.
+                let centry: *ConstEntry = find_const_entry(s, iter.ident_ptr, iter.ident_len)
+                if centry != null and centry.const_type == TYPE_ARRAY
+                    iter_kind = 3
+                    elem_type = centry.array_elem_type
+                    arr_size = centry.array_size
+                    const_name = centry.name as *u8
+                    const_name_len = centry.name_len
         else if iter.kind == EXPR_UNARY
             if iter.op == OP_ADDR or iter.op == OP_ADDR_MUT
                 if iter.operand != null
@@ -996,7 +1012,7 @@ fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: i32)
     emit_str(s, c"\n")
 
     var len_val: i32 = 0
-    if iter_kind == 1
+    if iter_kind == 1 or iter_kind == 3
         len_val = next_reg(s)
         emit_str(s, c"  ")
         emit_reg(s, len_val)
@@ -1052,7 +1068,7 @@ fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: i32)
     emit_reg(s, idx_reg)
     emit_str(s, c"\n")
 
-    if iter_kind == 1
+    if iter_kind == 1 or iter_kind == 3
         let elem_ptr: i32 = next_reg(s)
         emit_str(s, c"  ")
         emit_reg(s, elem_ptr)
@@ -1061,7 +1077,13 @@ fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         emit_str(s, c" x ")
         emit_llvm_type(s, elem_type)
         emit_str(s, c"], ptr ")
-        emit_reg(s, data_reg)
+        # Local arrays use the alloca SSA reg; const arrays use the
+        # global symbol emitted by emit_const_array_entry.
+        if iter_kind == 3
+            emit_str(s, c"@")
+            emit_name(s, const_name, const_name_len)
+        else
+            emit_reg(s, data_reg)
         emit_str(s, c", i64 0, i64 ")
         emit_reg(s, idx_val2)
         emit_str(s, c"\n")
