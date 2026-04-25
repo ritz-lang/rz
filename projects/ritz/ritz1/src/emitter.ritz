@@ -334,13 +334,27 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
     s.local_count = 0
     s.break_label = -1
     s.continue_label = -1
+    # Propagate this method's return-type name into emitter state so
+    # STMT_RETURN handling (in emitter_stmt.ritz) emits the correct
+    # `ret %T` rather than leaking the previous fn's `s.ret_type_name`.
+    # Without this, `fn slice(self: @StrView, ...) -> StrView` ended up
+    # emitting `ret %Token` because the Token-returning emit_fn ran
+    # earlier and last set s.ret_type_name.
+    s.ret_type_name = method.return_type_name
+    s.ret_type_name_len = method.return_type_name_len
 
     # weak_odr: same as fn emission — linker merges duplicates across modules
     emit_str(s, c"define weak_odr ")
-    # emit_llvm_type_struct so struct-typed returns get the proper %Type
-    # rather than the i64 fallback.  Was emitting `i64 @Vec2_new(...)`
-    # when method returned %Vec2, blocking call-site type alignment.
-    emit_llvm_type_struct(s, method.return_type, method.return_type_name, method.return_type_name_len)
+    # For struct-returning impl methods (where `method.return_type_name`
+    # is set), emit `%Type` so call sites that walk the impl table can
+    # match the signature.  Other return types route through
+    # emit_llvm_type which preserves the legacy i64 default for
+    # TYPE_STRUCT-without-name (impl methods whose return slot lost the
+    # name during parse — strview_slice etc. land here).
+    if method.return_type == TYPE_STRUCT and method.return_type_name != null and method.return_type_name_len > 0
+        emit_llvm_type_struct(s, method.return_type, method.return_type_name, method.return_type_name_len)
+    else
+        emit_llvm_type(s, method.return_type)
     emit_str(s, c" @")
     # Emit mangled name: Type_method
     emit_name(s, ib.type_name, ib.type_name_len)
@@ -490,33 +504,44 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
                     emit_str(s, c"\n")
                 else if method.return_type == 0
                     emit_str(s, c"  ret void\n")
-                else if method.return_type == TYPE_STRUCT and method.return_type_name_len > 0
-                    # Struct-returning impl method.  Tail expression
-                    # already produced an i64 register (unified value
-                    # model — `self` etc. lives as ptr-as-i64).  Inttoptr
-                    # to a real ptr, load the struct, return by value.
-                    # Without this, `ret %S i64-reg` mismatches the new
-                    # struct-typed signature emitted at the top of
-                    # emit_impl_method.
-                    let pp: i32 = next_reg(s)
-                    emit_str(s, c"  ")
-                    emit_reg(s, pp)
-                    emit_str(s, c" = inttoptr i64 ")
-                    emit_reg(s, val)
-                    emit_str(s, c" to ptr\n")
-                    let sv: i32 = next_reg(s)
-                    emit_str(s, c"  ")
-                    emit_reg(s, sv)
-                    emit_str(s, c" = load %")
-                    emit_name(s, method.return_type_name, method.return_type_name_len)
-                    emit_str(s, c", ptr ")
-                    emit_reg(s, pp)
-                    emit_str(s, c"\n")
-                    emit_str(s, c"  ret %")
-                    emit_name(s, method.return_type_name, method.return_type_name_len)
-                    emit_str(s, c" ")
-                    emit_reg(s, sv)
-                    emit_str(s, c"\n")
+                else if method.return_type == TYPE_STRUCT and method.return_type_name != null and method.return_type_name_len > 0
+                    # Struct-returning impl method.  Function header
+                    # emits `define %T @T_method(...)` so the body must
+                    # `ret %T <val>`.  Two shapes:
+                    #
+                    #  * EXPR_IDENT (`return self`): emit_expr loaded
+                    #    the local as i64 (ptr-as-int).  Need
+                    #    inttoptr+load to materialise a typed struct.
+                    #
+                    #  * EXPR_CALL (`return strview_slice(...)`): the
+                    #    call already produced a `%T` register, so
+                    #    just `ret %T <val>` directly.
+                    if stmt.expr.kind == EXPR_IDENT
+                        let pp: i32 = next_reg(s)
+                        emit_str(s, c"  ")
+                        emit_reg(s, pp)
+                        emit_str(s, c" = inttoptr i64 ")
+                        emit_reg(s, val)
+                        emit_str(s, c" to ptr\n")
+                        let sv: i32 = next_reg(s)
+                        emit_str(s, c"  ")
+                        emit_reg(s, sv)
+                        emit_str(s, c" = load %")
+                        emit_name(s, method.return_type_name, method.return_type_name_len)
+                        emit_str(s, c", ptr ")
+                        emit_reg(s, pp)
+                        emit_str(s, c"\n")
+                        emit_str(s, c"  ret %")
+                        emit_name(s, method.return_type_name, method.return_type_name_len)
+                        emit_str(s, c" ")
+                        emit_reg(s, sv)
+                        emit_str(s, c"\n")
+                    else
+                        emit_str(s, c"  ret %")
+                        emit_name(s, method.return_type_name, method.return_type_name_len)
+                        emit_str(s, c" ")
+                        emit_reg(s, val)
+                        emit_str(s, c"\n")
                 else
                     emit_str(s, c"  ret ")
                     emit_llvm_type(s, method.return_type)
