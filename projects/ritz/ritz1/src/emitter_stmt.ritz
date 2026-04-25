@@ -163,6 +163,51 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
                     stmt.var_type = TYPE_STRUCT
                     stmt.var_type_name = stmt.var_init.ident_ptr
                     stmt.var_type_name_len = stmt.var_init.ident_len
+        # try-expression: `let data = read_bytes()?`. The try-emit hands back
+        # the unwrapped Ok payload, which is a struct (e.g., %Vec$u8) when
+        # the Result's Ok variant carries a struct.  Narrow var_type to that
+        # struct so the alloca matches the load width — without this, the
+        # slot is i64-sized and the call's struct arg coerces from a
+        # truncated 8-byte register.
+        else if stmt.var_init.kind == EXPR_TRY
+            var inner_call: *Expr = stmt.var_init.left
+            if inner_call != null
+                # Resolve inner Result/Option's payload type.  For inner
+                # EXPR_CALL: lookup fn return-type-name.  For inner
+                # EXPR_METHOD: not yet handled (different code path).
+                var carrier_name: *u8 = null
+                var carrier_name_len: i32 = 0
+                if inner_call.kind == EXPR_CALL
+                    var fname: [256]u8
+                    var flen: i32 = 0
+                    for i in 0..inner_call.func_name_len
+                        fname[flen] = *(inner_call.func_name + i)
+                        flen += 1
+                    if inner_call.call_type_suffix_len > 0
+                        for i in 0..inner_call.call_type_suffix_len
+                            fname[flen] = *(inner_call.call_type_suffix + i)
+                            flen += 1
+                    let fdr: *FnDef = find_fn(s, @fname[0], flen)
+                    if fdr != null and fdr.return_type == TYPE_STRUCT
+                        carrier_name = fdr.return_type_name
+                        carrier_name_len = fdr.return_type_name_len
+                if carrier_name != null and carrier_name_len > 0
+                    # Extract Ok payload type: substring after first '$'.
+                    var dpos: i32 = 0
+                    while dpos < carrier_name_len
+                        if *(carrier_name + dpos) == 36  # '$'
+                            dpos = dpos
+                            break
+                        dpos = dpos + 1
+                    if dpos < carrier_name_len - 1
+                        let pay: *u8 = carrier_name + dpos + 1
+                        let pay_len: i32 = carrier_name_len - dpos - 1
+                        let pay_st: *StructDef = find_struct(s, pay, pay_len)
+                        if pay_st != null
+                            var_type = TYPE_STRUCT
+                            stmt.var_type = TYPE_STRUCT
+                            stmt.var_type_name = pay
+                            stmt.var_type_name_len = pay_len
 
     let alloca_reg: i32 = next_reg(s)
     emit_str(s, c"  ")

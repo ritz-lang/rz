@@ -437,10 +437,13 @@ fn emit_expr_try(s: *EmitterState, e: *Expr) -> i32
     emit_reg(s, ret_reg)
     emit_str(s, c"\n")
 
-    # Ok/Some branch: load the payload scalar from field 1.  Scalar payloads
-    # are stored as i64 by emit_variant_struct, so a matching i64 load hands
-    # the caller back an i64 register — ritz1's downstream arithmetic /
-    # call paths already operate at that width.
+    # Ok/Some branch: load the payload from field 1.  For scalar payloads,
+    # emit_variant_struct stores them as i64 so an i64 load is fine.  For
+    # struct payloads (e.g., Result<Vec<u8>, E>'s Ok holds a 24-byte
+    # %Vec$u8), an i64 load truncates to 8 bytes — corrupting the value.
+    # Detect Result$<Struct> / Option$<Struct> by parsing the suffix after
+    # the first '$' in enum_name and checking whether find_struct resolves
+    # it to a known StructDef.  When yes, load that struct type directly.
     emit_label(s, ok_label)
     emit_str(s, c":\n")
     s.current_label = ok_label
@@ -452,12 +455,38 @@ fn emit_expr_try(s: *EmitterState, e: *Expr) -> i32
     emit_str(s, c", ptr ")
     emit_reg(s, slot)
     emit_str(s, c", i32 0, i32 1\n")
+
+    # Extract the Ok-payload type name: substring of enum_name after the
+    # first '$' (e.g., "Result$Vec$u8" → "Vec$u8", "Option$i32" → "i32").
+    var pay_name: *u8 = null
+    var pay_name_len: i32 = 0
+    var pay_struct: *StructDef = null
+    var di: i32 = 0
+    while di < enum_name_len
+        if *(enum_name + di) == 36  # '$'
+            pay_name = enum_name + di + 1
+            pay_name_len = enum_name_len - di - 1
+            di = enum_name_len
+        else
+            di = di + 1
+    if pay_name != null and pay_name_len > 0
+        pay_struct = find_struct(s, pay_name, pay_name_len)
+
     let payload: i32 = next_reg(s)
     emit_str(s, c"  ")
     emit_reg(s, payload)
-    emit_str(s, c" = load i64, ptr ")
-    emit_reg(s, pay_ptr)
-    emit_str(s, c"  ; try: unwrap payload\n")
+    if pay_struct != null
+        # Struct payload — load the actual type so the 24-byte (or larger)
+        # value is preserved for the caller's let-decl / arg coercion.
+        emit_str(s, c" = load %")
+        emit_name(s, pay_name, pay_name_len)
+        emit_str(s, c", ptr ")
+        emit_reg(s, pay_ptr)
+        emit_str(s, c"  ; try: unwrap struct payload\n")
+    else
+        emit_str(s, c" = load i64, ptr ")
+        emit_reg(s, pay_ptr)
+        emit_str(s, c"  ; try: unwrap payload\n")
     return payload
 
 # =============================================================================
