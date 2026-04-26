@@ -1,0 +1,163 @@
+# Tests for 22_mkdir - create directories
+#
+# Integration tests fork+exec ./mkdir against a sandbox under /tmp/.
+# See 11_grep/test/test_grep.ritz for the canonical helper pattern.
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+fn buf_eq(a: *u8, b: *u8, len: i64) -> i32
+    var i: i64 = 0
+    while i < len
+        if *(a + i) != *(b + i)
+            return 0
+        i += 1
+    return 1
+
+# Build /tmp/ritz_mkdir_<pid>_<suffix> in dst (caller-allocated), returns length.
+fn make_sandbox_path(dst: *u8, suffix: *u8) -> i64
+    let prefix: *u8 = c"/tmp/ritz_mkdir_"
+    var i: i64 = 0
+    while *(prefix + i) != 0
+        *(dst + i) = *(prefix + i)
+        i += 1
+    # Append pid in decimal
+    var n: i32 = sys_getpid()
+    var d_buf: [16]u8
+    var d_len: i32 = 0
+    if n == 0
+        d_buf[0] = '0'
+        d_len = 1
+    else
+        while n > 0
+            d_buf[d_len] = ((n % 10) + 48) as u8
+            n = n / 10
+            d_len += 1
+    var j: i32 = 0
+    while j < d_len
+        *(dst + i) = d_buf[d_len - 1 - j]
+        i += 1
+        j += 1
+    *(dst + i) = '_' as u8
+    i += 1
+    var k: i64 = 0
+    while *(suffix + k) != 0
+        *(dst + i) = *(suffix + k)
+        i += 1
+        k += 1
+    *(dst + i) = 0
+    return i
+
+fn mkdir_exec(argv: **u8, out_buf: *u8, out_len: *i64) -> i32
+    var stdout_pipe: [2]i32
+    if sys_pipe(@stdout_pipe[0]) < 0
+        return -1
+
+    let pid: i32 = sys_fork()
+    if pid < 0
+        sys_close(stdout_pipe[0])
+        sys_close(stdout_pipe[1])
+        return -2
+
+    if pid == 0
+        sys_dup2(stdout_pipe[1], 1)
+        sys_dup2(stdout_pipe[1], 2)  # capture stderr too
+        sys_close(stdout_pipe[0])
+        sys_close(stdout_pipe[1])
+        sys_execve(c"./mkdir", argv, null)
+        sys_exit(127)
+
+    sys_close(stdout_pipe[1])
+
+    var total: i64 = 0
+    while total < 1024
+        let r: i64 = sys_read(stdout_pipe[0], out_buf + total, 1024 - total)
+        if r <= 0
+            break
+        total += r
+    sys_close(stdout_pipe[0])
+    *out_len = total
+
+    var status: i32 = 0
+    sys_wait4(pid, @status, 0, null)
+    return (status >> 8) & 0xFF
+
+# ============================================================================
+# Integration tests
+# ============================================================================
+
+[[test]]
+fn test_mkdir_creates_directory() -> i32
+    var path: [128]u8
+    make_sandbox_path(@path[0], c"one")
+    sys_rmdir(@path[0])  # best-effort prior cleanup
+
+    var argv: [3]*u8
+    argv[0] = c"./mkdir"
+    argv[1] = @path[0]
+    argv[2] = null
+
+    var out: [1024]u8
+    var n: i64 = 0
+    let exit_code: i32 = mkdir_exec(@argv[0], @out[0], @n)
+
+    # Verify dir exists by stat
+    var st: Stat
+    let stat_rc: i32 = sys_stat2(@path[0], @st)
+    sys_rmdir(@path[0])  # cleanup before assert
+
+    assert exit_code == 0, c"mkdir <new> should exit 0"
+    assert stat_rc == 0, c"directory should exist after mkdir"
+    0
+
+[[test]]
+fn test_mkdir_existing_dir_errors() -> i32
+    var path: [128]u8
+    make_sandbox_path(@path[0], c"exists")
+    sys_rmdir(@path[0])
+
+    # Create it first.
+    if sys_mkdir(@path[0], 493) < 0
+        assert 0 == 1, c"setup: could not create existing dir"
+
+    # Second mkdir should fail.
+    var argv: [3]*u8
+    argv[0] = c"./mkdir"
+    argv[1] = @path[0]
+    argv[2] = null
+
+    var out: [1024]u8
+    var n: i64 = 0
+    let exit_code: i32 = mkdir_exec(@argv[0], @out[0], @n)
+    sys_rmdir(@path[0])
+
+    assert exit_code != 0, c"mkdir of existing dir should fail without -p"
+    0
+
+[[test]]
+fn test_mkdir_creates_sibling() -> i32
+    var path: [128]u8
+    make_sandbox_path(@path[0], c"two")
+    sys_rmdir(@path[0])
+
+    var argv: [3]*u8
+    argv[0] = c"./mkdir"
+    argv[1] = @path[0]
+    argv[2] = null
+
+    var out: [1024]u8
+    var n: i64 = 0
+    let exit_code: i32 = mkdir_exec(@argv[0], @out[0], @n)
+
+    var st: Stat
+    let stat_rc: i32 = sys_stat2(@path[0], @st)
+    sys_rmdir(@path[0])
+
+    assert exit_code == 0, c"mkdir sibling should exit 0"
+    assert stat_rc == 0, c"sibling directory should exist"
+    0

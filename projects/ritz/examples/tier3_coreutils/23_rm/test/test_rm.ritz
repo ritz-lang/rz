@@ -1,0 +1,171 @@
+# Tests for 23_rm - remove files
+#
+# Integration tests fork+exec ./rm against a sandbox under /tmp/.
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+
+fn buf_eq(a: *u8, b: *u8, len: i64) -> i32
+    var i: i64 = 0
+    while i < len
+        if *(a + i) != *(b + i)
+            return 0
+        i += 1
+    return 1
+
+fn make_sandbox_path(dst: *u8, suffix: *u8) -> i64
+    let prefix: *u8 = c"/tmp/ritz_rm_"
+    var i: i64 = 0
+    while *(prefix + i) != 0
+        *(dst + i) = *(prefix + i)
+        i += 1
+    var n: i32 = sys_getpid()
+    var d_buf: [16]u8
+    var d_len: i32 = 0
+    if n == 0
+        d_buf[0] = '0'
+        d_len = 1
+    else
+        while n > 0
+            d_buf[d_len] = ((n % 10) + 48) as u8
+            n = n / 10
+            d_len += 1
+    var j: i32 = 0
+    while j < d_len
+        *(dst + i) = d_buf[d_len - 1 - j]
+        i += 1
+        j += 1
+    *(dst + i) = '_' as u8
+    i += 1
+    var k: i64 = 0
+    while *(suffix + k) != 0
+        *(dst + i) = *(suffix + k)
+        i += 1
+        k += 1
+    *(dst + i) = 0
+    return i
+
+# Create an empty file at path.  Returns 0 on success.
+fn touch_file(path: *u8) -> i32
+    let fd: i32 = sys_open3(path, O_WRONLY + O_CREAT + O_TRUNC, 384)  # 0o600
+    if fd < 0
+        return -1
+    sys_close(fd)
+    return 0
+
+fn rm_exec(argv: **u8, out_buf: *u8, out_len: *i64) -> i32
+    var stdout_pipe: [2]i32
+    if sys_pipe(@stdout_pipe[0]) < 0
+        return -1
+    let pid: i32 = sys_fork()
+    if pid < 0
+        sys_close(stdout_pipe[0])
+        sys_close(stdout_pipe[1])
+        return -2
+    if pid == 0
+        sys_dup2(stdout_pipe[1], 1)
+        sys_dup2(stdout_pipe[1], 2)
+        sys_close(stdout_pipe[0])
+        sys_close(stdout_pipe[1])
+        sys_execve(c"./rm", argv, null)
+        sys_exit(127)
+    sys_close(stdout_pipe[1])
+    var total: i64 = 0
+    while total < 1024
+        let r: i64 = sys_read(stdout_pipe[0], out_buf + total, 1024 - total)
+        if r <= 0
+            break
+        total += r
+    sys_close(stdout_pipe[0])
+    *out_len = total
+    var status: i32 = 0
+    sys_wait4(pid, @status, 0, null)
+    return (status >> 8) & 0xFF
+
+[[test]]
+fn test_rm_removes_existing_file() -> i32
+    var path: [128]u8
+    make_sandbox_path(@path[0], c"a")
+    sys_unlink(@path[0])
+    if touch_file(@path[0]) < 0
+        assert 0 == 1, c"setup: could not create file"
+
+    var argv: [3]*u8
+    argv[0] = c"./rm"
+    argv[1] = @path[0]
+    argv[2] = null
+
+    var out: [1024]u8
+    var n: i64 = 0
+    let exit_code: i32 = rm_exec(@argv[0], @out[0], @n)
+
+    var st: Stat
+    let stat_rc: i32 = sys_stat2(@path[0], @st)
+    if stat_rc == 0
+        sys_unlink(@path[0])  # cleanup if rm failed
+
+    assert exit_code == 0, c"rm <existing> should exit 0"
+    assert stat_rc != 0, c"file should not exist after rm"
+    0
+
+[[test]]
+fn test_rm_removes_multiple() -> i32
+    var path1: [128]u8
+    var path2: [128]u8
+    var path3: [128]u8
+    make_sandbox_path(@path1[0], c"x")
+    make_sandbox_path(@path2[0], c"y")
+    make_sandbox_path(@path3[0], c"z")
+    sys_unlink(@path1[0])
+    sys_unlink(@path2[0])
+    sys_unlink(@path3[0])
+    if touch_file(@path1[0]) < 0
+        assert 0 == 1, c"setup: x"
+    if touch_file(@path2[0]) < 0
+        assert 0 == 1, c"setup: y"
+    if touch_file(@path3[0]) < 0
+        assert 0 == 1, c"setup: z"
+
+    var argv: [5]*u8
+    argv[0] = c"./rm"
+    argv[1] = @path1[0]
+    argv[2] = @path2[0]
+    argv[3] = @path3[0]
+    argv[4] = null
+
+    var out: [1024]u8
+    var n: i64 = 0
+    let exit_code: i32 = rm_exec(@argv[0], @out[0], @n)
+
+    var st: Stat
+    let stat1: i32 = sys_stat2(@path1[0], @st)
+    let stat2: i32 = sys_stat2(@path2[0], @st)
+    let stat3: i32 = sys_stat2(@path3[0], @st)
+    sys_unlink(@path1[0])
+    sys_unlink(@path2[0])
+    sys_unlink(@path3[0])
+
+    assert exit_code == 0, c"rm of 3 files should exit 0"
+    assert stat1 != 0, c"x should be gone"
+    assert stat2 != 0, c"y should be gone"
+    assert stat3 != 0, c"z should be gone"
+    0
+
+[[test]]
+fn test_rm_nonexistent_errors() -> i32
+    var path: [128]u8
+    make_sandbox_path(@path[0], c"never")
+    sys_unlink(@path[0])  # ensure absent
+
+    var argv: [3]*u8
+    argv[0] = c"./rm"
+    argv[1] = @path[0]
+    argv[2] = null
+
+    var out: [1024]u8
+    var n: i64 = 0
+    let exit_code: i32 = rm_exec(@argv[0], @out[0], @n)
+
+    assert exit_code != 0, c"rm of nonexistent file should fail (no -f)"
+    0

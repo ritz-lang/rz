@@ -1,0 +1,165 @@
+# Tests for 28_chmod - change file mode
+#
+# Integration tests fork+exec ./chmod against a sandbox under /tmp/.
+# We verify the mode by calling sys_stat2 directly and masking with 0o777.
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+
+fn buf_eq(a: *u8, b: *u8, len: i64) -> i32
+    var i: i64 = 0
+    while i < len
+        if *(a + i) != *(b + i)
+            return 0
+        i += 1
+    return 1
+
+fn make_sandbox_path(dst: *u8, suffix: *u8) -> i64
+    let prefix: *u8 = c"/tmp/ritz_chmod_"
+    var i: i64 = 0
+    while *(prefix + i) != 0
+        *(dst + i) = *(prefix + i)
+        i += 1
+    var n: i32 = sys_getpid()
+    var d_buf: [16]u8
+    var d_len: i32 = 0
+    if n == 0
+        d_buf[0] = '0'
+        d_len = 1
+    else
+        while n > 0
+            d_buf[d_len] = ((n % 10) + 48) as u8
+            n = n / 10
+            d_len += 1
+    var j: i32 = 0
+    while j < d_len
+        *(dst + i) = d_buf[d_len - 1 - j]
+        i += 1
+        j += 1
+    *(dst + i) = '_' as u8
+    i += 1
+    var k: i64 = 0
+    while *(suffix + k) != 0
+        *(dst + i) = *(suffix + k)
+        i += 1
+        k += 1
+    *(dst + i) = 0
+    return i
+
+fn write_file(path: *u8, content: *u8, len: i64) -> i32
+    let fd: i32 = sys_open3(path, O_WRONLY + O_CREAT + O_TRUNC, 384)
+    if fd < 0
+        return -1
+    if len > 0
+        sys_write(fd, content, len)
+    sys_close(fd)
+    return 0
+
+fn chmod_exec(argv: **u8, out_buf: *u8, out_len: *i64) -> i32
+    var stdout_pipe: [2]i32
+    if sys_pipe(@stdout_pipe[0]) < 0
+        return -1
+    let pid: i32 = sys_fork()
+    if pid < 0
+        sys_close(stdout_pipe[0])
+        sys_close(stdout_pipe[1])
+        return -2
+    if pid == 0
+        sys_dup2(stdout_pipe[1], 1)
+        sys_dup2(stdout_pipe[1], 2)
+        sys_close(stdout_pipe[0])
+        sys_close(stdout_pipe[1])
+        sys_execve(c"./chmod", argv, null)
+        sys_exit(127)
+    sys_close(stdout_pipe[1])
+    var total: i64 = 0
+    while total < 1024
+        let r: i64 = sys_read(stdout_pipe[0], out_buf + total, 1024 - total)
+        if r <= 0
+            break
+        total += r
+    sys_close(stdout_pipe[0])
+    *out_len = total
+    var status: i32 = 0
+    sys_wait4(pid, @status, 0, null)
+    return (status >> 8) & 0xFF
+
+# Read the file's permission bits (0o777 mask) via stat.
+fn read_perms(path: *u8) -> i32
+    var st: Stat
+    if sys_stat2(path, @st) != 0
+        return -1
+    return st.st_mode & 0x1FF  # 0o777
+
+[[test]]
+fn test_chmod_755() -> i32
+    var path: [128]u8
+    make_sandbox_path(@path[0], c"f755")
+    sys_unlink(@path[0])
+    if write_file(@path[0], c"", 0) < 0
+        assert 0 == 1, c"setup: file"
+
+    var argv: [4]*u8
+    argv[0] = c"./chmod"
+    argv[1] = c"755"
+    argv[2] = @path[0]
+    argv[3] = null
+
+    var out: [1024]u8
+    var n: i64 = 0
+    let exit_code: i32 = chmod_exec(@argv[0], @out[0], @n)
+    let perms: i32 = read_perms(@path[0])
+    sys_unlink(@path[0])
+
+    assert exit_code == 0, c"chmod 755 should exit 0"
+    assert perms == 0x1ED, c"perms should be 0o755 (0x1ED)"  # 0o755 = 493 = 0x1ED
+    0
+
+[[test]]
+fn test_chmod_600() -> i32
+    var path: [128]u8
+    make_sandbox_path(@path[0], c"f600")
+    sys_unlink(@path[0])
+    if write_file(@path[0], c"", 0) < 0
+        assert 0 == 1, c"setup: file"
+
+    var argv: [4]*u8
+    argv[0] = c"./chmod"
+    argv[1] = c"600"
+    argv[2] = @path[0]
+    argv[3] = null
+
+    var out: [1024]u8
+    var n: i64 = 0
+    let exit_code: i32 = chmod_exec(@argv[0], @out[0], @n)
+    let perms: i32 = read_perms(@path[0])
+    sys_unlink(@path[0])
+
+    assert exit_code == 0, c"chmod 600 should exit 0"
+    assert perms == 0x180, c"perms should be 0o600 (0x180)"  # 0o600 = 384 = 0x180
+    0
+
+[[test]]
+fn test_chmod_644() -> i32
+    var path: [128]u8
+    make_sandbox_path(@path[0], c"f644")
+    sys_unlink(@path[0])
+    if write_file(@path[0], c"", 0) < 0
+        assert 0 == 1, c"setup: file"
+
+    var argv: [4]*u8
+    argv[0] = c"./chmod"
+    argv[1] = c"644"
+    argv[2] = @path[0]
+    argv[3] = null
+
+    var out: [1024]u8
+    var n: i64 = 0
+    let exit_code: i32 = chmod_exec(@argv[0], @out[0], @n)
+    let perms: i32 = read_perms(@path[0])
+    sys_unlink(@path[0])
+
+    assert exit_code == 0, c"chmod 644 should exit 0"
+    assert perms == 0x1A4, c"perms should be 0o644 (0x1A4)"  # 0o644 = 420 = 0x1A4
+    0

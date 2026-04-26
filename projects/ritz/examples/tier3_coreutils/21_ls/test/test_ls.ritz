@@ -1,0 +1,242 @@
+# Tests for 21_ls - list directory contents
+#
+# Integration tests fork+exec ./ls with various flag combinations and assert
+# on captured stdout + exit code, covering the same scenarios as test.sh.
+#
+# Implementation notes:
+#  * Stdin is unused (ls reads from the filesystem, not stdin).  We close
+#    fd 0 in the child to avoid inheriting the test harness's tty.
+#  * We loop on sys_read until EOF — pipes return on ANY data, not on close
+#    (lesson learned from tier 2 grep: a fast parent could read just the
+#    first chunk and miss subsequent output).  See docs/TESTING.md.
+#  * Each test creates its sandbox under /tmp/ritz_ls_<pid>_<test>/ so
+#    parallel runs and assertion failures both leak cleanly without
+#    cross-test contamination.
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+import ritzlib.span
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+# Compare buffer contents up to len bytes.  Returns 1 if equal, else 0.
+fn buf_eq(a: *u8, b: *u8, len: i64) -> i32
+    var i: i64 = 0
+    while i < len
+        if *(a + i) != *(b + i)
+            return 0
+        i += 1
+    return 1
+
+# Find needle in [hay, hay+hay_len).  Returns 1 if found, else 0.
+fn buf_contains(hay: *u8, hay_len: i64, needle: *u8, needle_len: i64) -> i32
+    if needle_len == 0
+        return 1
+    if needle_len > hay_len
+        return 0
+    var i: i64 = 0
+    while i <= hay_len - needle_len
+        if buf_eq(hay + i, needle, needle_len) == 1
+            return 1
+        i += 1
+    return 0
+
+fn cstr_len(s: *u8) -> i64
+    var n: i64 = 0
+    while *(s + n) != 0
+        n += 1
+    return n
+
+# Run ./ls with argv (null-terminated).  Captures up to 4096 bytes of stdout
+# into out_buf, writes byte count to *out_len, returns exit code.
+fn ls_exec(argv: **u8, out_buf: *u8, out_len: *i64) -> i32
+    var stdout_pipe: [2]i32
+    if sys_pipe(@stdout_pipe[0]) < 0
+        return -1
+
+    let pid: i32 = sys_fork()
+    if pid < 0
+        sys_close(stdout_pipe[0])
+        sys_close(stdout_pipe[1])
+        return -2
+
+    if pid == 0
+        # Child: redirect stdout to pipe, close stdin (no input expected)
+        sys_dup2(stdout_pipe[1], 1)
+        sys_close(stdout_pipe[0])
+        sys_close(stdout_pipe[1])
+        sys_execve(c"./ls", argv, null)
+        sys_exit(127)
+
+    sys_close(stdout_pipe[1])
+
+    var total: i64 = 0
+    while total < 4096
+        let r: i64 = sys_read(stdout_pipe[0], out_buf + total, 4096 - total)
+        if r <= 0
+            break
+        total += r
+    sys_close(stdout_pipe[0])
+    *out_len = total
+
+    var status: i32 = 0
+    sys_wait4(pid, @status, 0, null)
+    return (status >> 8) & 0xFF
+
+# ============================================================================
+# Integration tests — basic listing
+# ============================================================================
+
+[[test]]
+fn test_ls_lists_current_dir() -> i32
+    # `./ls .` should list cwd contents — at minimum it should not error
+    # and should produce some output.
+    var argv: [3]*u8
+    argv[0] = c"./ls"
+    argv[1] = c"."
+    argv[2] = null
+
+    var out: [4096]u8
+    var n: i64 = 0
+    let exit_code: i32 = ls_exec(@argv[0], @out[0], @n)
+
+    assert exit_code == 0, c"ls . should exit 0"
+    assert n > 0, c"ls . should produce output"
+    # cwd contains a 'src' directory (we run from the example dir during build)
+    assert buf_contains(@out[0], n, c"src", 3) == 1, c"expected 'src' in output"
+    0
+
+[[test]]
+fn test_ls_long_listing() -> i32
+    # `./ls -l .` should include 'drwx' (directory perms prefix)
+    var argv: [4]*u8
+    argv[0] = c"./ls"
+    argv[1] = c"-l"
+    argv[2] = c"."
+    argv[3] = null
+
+    var out: [4096]u8
+    var n: i64 = 0
+    let exit_code: i32 = ls_exec(@argv[0], @out[0], @n)
+
+    assert exit_code == 0, c"ls -l . should exit 0"
+    assert buf_contains(@out[0], n, c"drwx", 4) == 1, c"expected 'drwx' in -l output"
+    0
+
+[[test]]
+fn test_ls_one_per_line() -> i32
+    # `./ls -1 .` — at least 2 entries (we have ls + src + ritz.toml + ...)
+    var argv: [4]*u8
+    argv[0] = c"./ls"
+    argv[1] = c"-1"
+    argv[2] = c"."
+    argv[3] = null
+
+    var out: [4096]u8
+    var n: i64 = 0
+    let exit_code: i32 = ls_exec(@argv[0], @out[0], @n)
+
+    assert exit_code == 0, c"ls -1 . should exit 0"
+    # Count newlines — must be >= 2
+    var i: i64 = 0
+    var nl: i64 = 0
+    while i < n
+        if *(@out[0] + i) == 10
+            nl += 1
+        i += 1
+    assert nl >= 2, c"expected >= 2 lines in -1 output"
+    0
+
+[[test]]
+fn test_ls_multiple_paths() -> i32
+    # `./ls . ..` — must include 'src' (from cwd .)
+    var argv: [4]*u8
+    argv[0] = c"./ls"
+    argv[1] = c"."
+    argv[2] = c".."
+    argv[3] = null
+
+    var out: [4096]u8
+    var n: i64 = 0
+    let exit_code: i32 = ls_exec(@argv[0], @out[0], @n)
+
+    assert exit_code == 0, c"ls . .. should exit 0"
+    assert buf_contains(@out[0], n, c"src", 3) == 1, c"expected 'src' in output"
+    0
+
+[[test]]
+fn test_ls_classify_marks_dirs() -> i32
+    # Build a sandbox and check -F appends '/' to subdirs.
+    let pid_self: i32 = sys_getpid()
+
+    # /tmp/ritz_ls_<pid>_F
+    var path: [64]u8
+    let prefix: *u8 = c"/tmp/ritz_ls_"
+    var i: i64 = 0
+    while *(prefix + i) != 0
+        path[i] = *(prefix + i)
+        i += 1
+    # Append pid in decimal
+    var n_self: i32 = pid_self
+    var d_buf: [16]u8
+    var d_len: i32 = 0
+    if n_self == 0
+        d_buf[0] = '0'
+        d_len = 1
+    else
+        while n_self > 0
+            d_buf[d_len] = ((n_self % 10) + 48) as u8
+            n_self = n_self / 10
+            d_len += 1
+        var j: i32 = 0
+        while j < d_len
+            path[i + j] = d_buf[d_len - 1 - j]
+            j += 1
+        i += d_len
+    # Suffix _F
+    path[i] = '_' as u8
+    path[i + 1] = 'F' as u8
+    path[i + 2] = 0
+    let path_len: i64 = i + 2
+
+    # Cleanup any prior leak (best-effort), then mkdir + populate
+    sys_rmdir(@path[0])  # may fail; ignored
+    if sys_mkdir(@path[0], 493) < 0  # 0o755
+        assert 0 == 1, c"could not create sandbox"
+
+    # Create a subdir inside it.
+    var subdir: [80]u8
+    var k: i64 = 0
+    while k < path_len
+        subdir[k] = path[k]
+        k += 1
+    subdir[k] = '/' as u8
+    subdir[k + 1] = 's' as u8
+    subdir[k + 2] = 'u' as u8
+    subdir[k + 3] = 'b' as u8
+    subdir[k + 4] = 0
+    sys_mkdir(@subdir[0], 493)
+
+    # Run ./ls -F <sandbox>
+    var argv: [4]*u8
+    argv[0] = c"./ls"
+    argv[1] = c"-F"
+    argv[2] = @path[0]
+    argv[3] = null
+
+    var out: [4096]u8
+    var n: i64 = 0
+    let exit_code: i32 = ls_exec(@argv[0], @out[0], @n)
+
+    # Cleanup before assertions (best-effort — any failure here just leaks
+    # /tmp, which is bounded by pid uniqueness)
+    sys_rmdir(@subdir[0])
+    sys_rmdir(@path[0])
+
+    assert exit_code == 0, c"ls -F <sandbox> should exit 0"
+    # Output should include 'sub/'
+    assert buf_contains(@out[0], n, c"sub/", 4) == 1, c"expected 'sub/' in -F output"
+    0
