@@ -571,7 +571,10 @@ pub fn client_scan(client: *Client, callback: *u8, user_data: *u8) -> i32
             return -4
 
         if msg_type == MSG_SCAN_END
-            # Scan completed
+            # Scan completed — server always sends this as the final
+            # message of a scan, even after a SCAN_RESULT with has_more=0.
+            # We MUST drain it from the stream or it'll show up as the
+            # response to the next request.
             done = 1
         else if msg_type == MSG_SCAN_RESULT
             # Process batch of documents
@@ -580,6 +583,7 @@ pub fn client_scan(client: *Client, callback: *u8, user_data: *u8) -> i32
             let doc_count: i32 = msgreader_read_i32(@reader)
             let has_more: i32 = msgreader_read_i32(@reader)
 
+            var user_stopped: i32 = 0
             for i in 0..doc_count
                 let doc_id: i64 = msgreader_read_i64(@reader)
                 var data_len: i32 = 0
@@ -591,13 +595,16 @@ pub fn client_scan(client: *Client, callback: *u8, user_data: *u8) -> i32
                 count = count + 1
 
                 if result != 0
-                    # User requested stop
-                    done = 1
+                    # User requested stop — but we still have to drain
+                    # SCAN_END from the stream below before returning.
+                    user_stopped = 1
                     break
 
-            # If user stopped or no more, we're done
-            if has_more == 0
-                done = 1
+            # Don't terminate the loop on has_more=0 alone.  The server
+            # always emits a trailing SCAN_END, and short-circuiting here
+            # leaves it in the socket's recv buffer where it gets mis-
+            # parsed as the response to the *next* request.  Keep
+            # looping until we see SCAN_END explicitly.
         else
             client.last_error = PROTO_ERR_PROTOCOL
             return -5
