@@ -1374,10 +1374,14 @@ class Parser:
             self._advance()
             condition = self.parse_expr()
             message = None
-            # Optional message: assert x, "error message"
+            # Optional message: `assert x, "error message"`.  Accept either
+            # bare-string ("...") or c-string (c"...") form — both lex with
+            # the same payload, and the message is just text the emitter
+            # bakes into a global cstr at compile time.  Older code uses
+            # c"..."; idiomatic ritz prefers "..." (StrView).
             if self._at(TokenType.COMMA):
                 self._advance()
-                if self._at(TokenType.STRING):
+                if self._at(TokenType.STRING) or self._at(TokenType.CSTRING):
                     message = self._advance().value
             return rast.AssertStmt(span, condition, message)
 

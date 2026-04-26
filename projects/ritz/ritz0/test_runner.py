@@ -587,7 +587,14 @@ def run_test_file(source_path: str, verbose: bool = False, lib_files: List[str] 
                         print("OK")
                 else:
                     failed += 1
-                    failures.append(f"{test_name}: exited with code {result.returncode}")
+                    # Surface the assert diagnostic (written to stderr by
+                    # _emit_assert) in the failure message — without this
+                    # you only see "exit 1" with no clue what failed.
+                    msg = f"{test_name}: exited with code {result.returncode}"
+                    err = result.stderr.decode("utf-8", errors="replace").strip()
+                    if err:
+                        msg += f"\n      {err.replace(chr(10), chr(10) + '      ')}"
+                    failures.append(msg)
                     if verbose:
                         print(f"FAIL (exit {result.returncode})")
 
@@ -648,7 +655,11 @@ def _run_test_file_legacy(source_path: str, verbose: bool = False, lib_files: Li
                     print("OK")
             else:
                 failed += 1
-                failures.append(f"{test_name}: exited with code {result.returncode}")
+                msg = f"{test_name}: exited with code {result.returncode}"
+                err = result.stderr.decode("utf-8", errors="replace").strip()
+                if err:
+                    msg += f"\n      {err.replace(chr(10), chr(10) + '      ')}"
+                failures.append(msg)
                 if verbose:
                     print(f"FAIL (exit {result.returncode})")
 

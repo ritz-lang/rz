@@ -4533,11 +4533,37 @@ class LLVMEmitter:
         return True  # Default to signed comparisons for now
 
     def _emit_assert(self, stmt: rast.AssertStmt) -> None:
-        """Emit an assert statement (only valid in test functions)."""
+        """Emit an assert statement (only valid in test functions).
+
+        On failure, writes a diagnostic line to stderr then exits with code 1:
+
+            assertion failed at <file>:<line>: <message>\n
+
+        If no message was supplied, just '<file>:<line>: assertion failed\n'.
+        Both the file:line prefix and message body are baked into a single
+        global cstr at compile time so failure-emit code is just one write
+        syscall + one exit syscall.
+        """
         # Enforce assert only in @test functions
         if not self.in_test_fn:
             fn_name = self.current_fn_def.name if self.current_fn_def else "unknown"
             raise ValueError(f"assert is only allowed in @test functions, not in '{fn_name}'")
+
+        # Build the diagnostic string at compile time.  Source location lets
+        # a hard-exit assert tell you which test failed (the test runner only
+        # sees the exit code; without this prefix you'd be guessing).
+        loc = ""
+        if stmt.span is not None:
+            # Strip directory noise — the basename is enough context.
+            file_part = stmt.span.file or "?"
+            if "/" in file_part:
+                file_part = file_part.rsplit("/", 1)[-1]
+            loc = f"{file_part}:{stmt.span.line}: "
+        if stmt.message:
+            diag = f"{loc}assertion failed: {stmt.message}\n"
+        else:
+            diag = f"{loc}assertion failed\n"
+        diag_bytes = diag.encode("utf-8")
 
         # Emit the condition
         cond = self._emit_expr(stmt.condition)
@@ -4553,8 +4579,20 @@ class LLVMEmitter:
         # Branch based on condition
         self.builder.cbranch(cond, pass_block, fail_block)
 
-        # Fail block: exit(1) via syscall
+        # Fail block: write(2, diag, len) then exit(1)
         self.builder.position_at_end(fail_block)
+
+        # Stage the diagnostic string as a global cstr (sans the trailing NUL,
+        # since write takes an explicit length).
+        diag_gvar = self._get_string_constant(diag)
+        zero = ir.Constant(self.i64, 0)
+        diag_ptr = self.builder.gep(diag_gvar, [zero, zero])
+        self._emit_write_syscall(
+            ir.Constant(self.i64, 2),                  # fd 2 = stderr
+            diag_ptr,
+            ir.Constant(self.i64, len(diag_bytes)),
+        )
+
         # syscall 60 = exit on x86_64
         exit_code = ir.Constant(self.i64, 1)
         asm_str = "syscall"
