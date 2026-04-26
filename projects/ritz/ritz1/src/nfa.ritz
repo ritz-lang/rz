@@ -34,20 +34,34 @@ struct Transition
   to_state: i64
 
 # NOTE: Using i64 for all non-pointer fields to ensure 8-byte alignment for ritz1 self-hosting
+#
+# Tier 1 NFA optimization (state-indexed transition table):
+# nfa_finalize() builds a per-state lookup so lexer_match_from no longer
+# scans all transitions for each step (was 98.79% of compile time).
+#
+#   state_trans_offset[s] = where state s's indices begin in trans_indices
+#   state_trans_count [s] = how many transitions leave state s
+#   trans_indices    [k] = original transitions[] index, grouped by from_state
 struct NFA
   states: *NFAState
   state_count: i64
   transitions: *Transition
   trans_count: i64
   start_state: i64
+  state_trans_offset: *i64
+  state_trans_count: *i64
+  trans_indices: *i64
 
 # Initialize an NFA with pre-allocated storage
-fn nfa_init(nfa: *NFA, states: *NFAState, trans: *Transition) -> i32
+fn nfa_init(nfa: *NFA, states: *NFAState, trans: *Transition, sto: *i64, stc: *i64, ti: *i64) -> i32
   nfa.states = states
   nfa.state_count = 0
   nfa.transitions = trans
   nfa.trans_count = 0
   nfa.start_state = 0
+  nfa.state_trans_offset = sto
+  nfa.state_trans_count = stc
+  nfa.trans_indices = ti
   0
 
 # Add a new state, returns state ID
@@ -127,6 +141,72 @@ fn trans_matches(trans: *Transition, ch: i32) -> i32
   0
 
 # =============================================================================
+# NFA Finalize — build per-state transition index
+# =============================================================================
+# Call once after all transitions are added.  Builds:
+#   state_trans_offset[s] = first index into trans_indices for state s
+#   state_trans_count [s] = number of transitions leaving state s
+#   trans_indices    [k] = original index into nfa.transitions, grouped by from_state
+#
+# After this, lexer_match_from / lexer_check_accept / nfa_accepts_from
+# can iterate only state s's outgoing transitions instead of scanning
+# all nfa.trans_count transitions per recursive step.
+fn nfa_finalize(nfa: *NFA) -> i32
+  let count_arr: *i64 = nfa.state_trans_count
+  let offset_arr: *i64 = nfa.state_trans_offset
+  let indices_arr: *i64 = nfa.trans_indices
+  let nstates: i64 = nfa.state_count
+  let ntrans: i64 = nfa.trans_count
+
+  # Phase 1: zero the count array
+  var i: i64 = 0
+  while i < nstates
+    *(count_arr + i) = 0
+    i = i + 1
+
+  # Phase 2: count transitions per from_state
+  var t: i64 = 0
+  while t < ntrans
+    let trans_ptr: *Transition = nfa.transitions + t
+    let from: i64 = trans_ptr.from_state
+    let cur: i64 = *(count_arr + from)
+    *(count_arr + from) = cur + 1
+    t = t + 1
+
+  # Phase 3: prefix-sum into offset array
+  var off: i64 = 0
+  var s: i64 = 0
+  while s < nstates
+    *(offset_arr + s) = off
+    off = off + *(count_arr + s)
+    s = s + 1
+
+  # Phase 4: reset count array (will use as write cursor in phase 5)
+  var k: i64 = 0
+  while k < nstates
+    *(count_arr + k) = 0
+    k = k + 1
+
+  # Phase 5: bin transition indices by from_state.
+  # NOTE: `indices_arr + base_off + cur_count` would left-associate as
+  # `(indices_arr + base_off) + cur_count` — and ritz1 only applies
+  # pointer-arith stride scaling when the LHS of `+` is EXPR_IDENT or
+  # EXPR_MEMBER, not EXPR_BINARY.  Without the explicit parens, the
+  # second `+` would skip the *8 stride and corrupt every read.
+  # (Same workaround used in lexer_nfa.ritz Tier 1 readers.)
+  var t2: i64 = 0
+  while t2 < ntrans
+    let tp2: *Transition = nfa.transitions + t2
+    let from2: i64 = tp2.from_state
+    let base_off: i64 = *(offset_arr + from2)
+    let cur_count: i64 = *(count_arr + from2)
+    *(indices_arr + (base_off + cur_count)) = t2
+    *(count_arr + from2) = cur_count + 1
+    t2 = t2 + 1
+
+  0
+
+# =============================================================================
 # NFA Simulation
 # =============================================================================
 
@@ -134,37 +214,47 @@ fn trans_matches(trans: *Transition, ch: i32) -> i32
 # Returns 1 if accepts, 0 otherwise
 fn nfa_accepts_from(nfa: *NFA, state: i32, src: *u8, pos: i32, len: i32) -> i32
   let state_ptr: *NFAState = nfa.states + state
+  let state_i64: i64 = state as i64
+  let off: i64 = *(nfa.state_trans_offset + state_i64)
+  let cnt: i64 = *(nfa.state_trans_count + state_i64)
 
   # Check if at end of input
   if pos >= len
     if state_ptr.is_accept == 1
       return 1
     # Try epsilon transitions
-    let state_i64: i64 = state as i64
-    for i in 0..nfa.trans_count
+    var k: i64 = 0
+    while k < cnt
+      let i: i64 = *(nfa.trans_indices + (off + k))
       let trans_ptr: *Transition = nfa.transitions + i
-      if trans_ptr.from_state == state_i64 and trans_ptr.kind == TR_EPSILON
+      if trans_ptr.kind == TR_EPSILON
         if nfa_accepts_from(nfa, trans_ptr.to_state as i32, src, pos, len) == 1
           return 1
+      k = k + 1
     return 0
 
   # Get current character (unsigned byte)
   let ch: i32 = (*(src + pos)) & 255
-  let state_i64_2: i64 = state as i64
 
   # Try epsilon transitions first
-  for i in 0..nfa.trans_count
-    let trans_ptr: *Transition = nfa.transitions + i
-    if trans_ptr.from_state == state_i64_2 and trans_ptr.kind == TR_EPSILON
-      if nfa_accepts_from(nfa, trans_ptr.to_state as i32, src, pos, len) == 1
+  var k1: i64 = 0
+  while k1 < cnt
+    let i1: i64 = *(nfa.trans_indices + (off + k1))
+    let trans_ptr1: *Transition = nfa.transitions + i1
+    if trans_ptr1.kind == TR_EPSILON
+      if nfa_accepts_from(nfa, trans_ptr1.to_state as i32, src, pos, len) == 1
         return 1
+    k1 = k1 + 1
 
   # Try character transitions
-  for i in 0..nfa.trans_count
-    let trans_ptr: *Transition = nfa.transitions + i
-    if trans_ptr.from_state == state_i64_2 and trans_matches(trans_ptr, ch) == 1
-      if nfa_accepts_from(nfa, trans_ptr.to_state as i32, src, pos + 1, len) == 1
+  var k2: i64 = 0
+  while k2 < cnt
+    let i2: i64 = *(nfa.trans_indices + (off + k2))
+    let trans_ptr2: *Transition = nfa.transitions + i2
+    if trans_matches(trans_ptr2, ch) == 1
+      if nfa_accepts_from(nfa, trans_ptr2.to_state as i32, src, pos + 1, len) == 1
         return 1
+    k2 = k2 + 1
 
   0
 

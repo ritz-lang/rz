@@ -136,9 +136,12 @@ fn lexer_add_pattern(lex: *Lexer, pattern: StrView, token_type: i32, is_literal:
   lex.pattern_count = idx + 1
   (idx) as i32
 
-# Finalize the lexer - no-op now that patterns connect on add
+# Finalize the lexer - build per-state transition index (Tier 1 NFA opt)
 fn lexer_finalize(lex: *Lexer) -> i32
-  # Patterns are already connected to start state during lexer_add_pattern
+  # Patterns are already connected to start state during lexer_add_pattern.
+  # Now build the state-indexed transition table so simulation can iterate
+  # only this state's outgoing transitions (was 98.79% of compile time).
+  nfa_finalize(lex.nfa)
   0
 
 # =============================================================================
@@ -158,14 +161,19 @@ fn lexer_check_accept(lex: *Lexer, state: i32) -> i32
   if state_ptr.is_accept == 1
     return state_ptr.token_type
 
-  # Check epsilon transitions
+  # Check epsilon transitions (Tier 1: state-indexed lookup)
   let state_i64: i64 = state as i64
-  for i in 0..nfa.trans_count
+  let off: i64 = *(nfa.state_trans_offset + state_i64)
+  let cnt: i64 = *(nfa.state_trans_count + state_i64)
+  var k: i64 = 0
+  while k < cnt
+    let i: i64 = *(nfa.trans_indices + (off + k))
     let trans_ptr: *Transition = nfa.transitions + i
-    if trans_ptr.from_state == state_i64 and trans_ptr.kind == TR_EPSILON
+    if trans_ptr.kind == TR_EPSILON
       let result: i32 = lexer_check_accept(lex, trans_ptr.to_state as i32)
       if result >= 0
         return result
+    k = k + 1
 
   return -1
 
@@ -189,11 +197,17 @@ fn lexer_match_from(lex: *Lexer, state: i32, pos: i64, best_type: *i32, best_len
       (*best_priority) = 0  # Just reset, not used anymore
 
   # Try epsilon transitions first (without consuming input)
+  # Tier 1: state-indexed lookup — only iterate this state's outgoing trans
   let state_i64: i64 = state as i64
-  for i in 0..nfa.trans_count
-    let trans_ptr: *Transition = nfa.transitions + i
-    if trans_ptr.from_state == state_i64 and trans_ptr.kind == TR_EPSILON
-      lexer_match_from(lex, trans_ptr.to_state as i32, pos, best_type, best_len, best_priority)
+  let off: i64 = *(nfa.state_trans_offset + state_i64)
+  let cnt: i64 = *(nfa.state_trans_count + state_i64)
+  var ke: i64 = 0
+  while ke < cnt
+    let ie: i64 = *(nfa.trans_indices + (off + ke))
+    let trans_pe: *Transition = nfa.transitions + ie
+    if trans_pe.kind == TR_EPSILON
+      lexer_match_from(lex, trans_pe.to_state as i32, pos, best_type, best_len, best_priority)
+    ke = ke + 1
 
   # If at end of input, we're done with character transitions
   if pos >= lex.len
@@ -203,10 +217,13 @@ fn lexer_match_from(lex: *Lexer, state: i32, pos: i64, best_type: *i32, best_len
   let ch: i32 = (*(lex.src + pos)) & 255
 
   # Try character transitions
-  for i in 0..nfa.trans_count
-    let trans_ptr: *Transition = nfa.transitions + i
-    if trans_ptr.from_state == state_i64 and trans_matches(trans_ptr, ch) == 1
-      lexer_match_from(lex, trans_ptr.to_state as i32, pos + 1, best_type, best_len, best_priority)
+  var kc: i64 = 0
+  while kc < cnt
+    let ic: i64 = *(nfa.trans_indices + (off + kc))
+    let trans_pc: *Transition = nfa.transitions + ic
+    if trans_matches(trans_pc, ch) == 1
+      lexer_match_from(lex, trans_pc.to_state as i32, pos + 1, best_type, best_len, best_priority)
+    kc = kc + 1
 
   0
 

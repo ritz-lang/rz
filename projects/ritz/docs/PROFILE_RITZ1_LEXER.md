@@ -179,6 +179,42 @@ unrelated change.
 
 ---
 
+## Implementation landed, 2026-04-26 — actual measured wins
+
+| Metric | Before | After (measured) |
+|---|---|---|
+| ritz1 self-compile of `emitter.ritz` | 12.4 s | **0.34 s** (37×) |
+| `make matrix` (ritz1-only) | 23 s | **11.1 s** (2×) |
+| `make bootstrap` (selfhost rebuild) | 3 m 6 s | **1 m 17 s** (2.4×) |
+| `make matrix-full` total | ~5 min | **~1 m 40 s** (3×) |
+
+The Tier 1 work landed in two commits — the optimization itself plus
+three latent ritz1 codegen bugs surfaced by selfhosting it:
+
+1. **NFA per-state index** — `state_trans_offset[s] = first index`,
+   `state_trans_count[s] = count`, `trans_indices[k] = original index`.
+   Built once by `nfa_finalize` (counting sort), then `lexer_match_from`
+   iterates only `cnt` entries instead of all `nfa.trans_count`.
+
+2. **Three latent ritz1 codegen bugs** found and fixed by wiring up the
+   selfhost path:
+   - Hardcoded `%NFA = type { ptr, i64, ptr, i64, i64 }` string in
+     `emit_builtin_struct_types` — needed three more `ptr` fields for
+     the index arrays.  Caused `getelementptr ... i32 5` against a
+     5-field type — clang error.
+   - `get_member_pointee_type` defaulted to TYPE_U8 for any struct
+     pointer field whose `array_elem_type` wasn't u8/i8.  So
+     `*(struct.ptr_field + i)` for a `*i64` field emitted `load i8`,
+     reading garbage offsets.  Fixed to handle u16/i16/u32/i32/u64/i64.
+   - Pointer arithmetic doesn't compose: `(p + off) + k` skips stride
+     scaling on the second `+` because ritz1's `is_ptr_arith` check only
+     looks at EXPR_IDENT/EXPR_MEMBER, not EXPR_BINARY.  Worked around in
+     source by parenthesising as `p + (off + k)` so the stride applies
+     to the outer add.  (The deeper fix — making `is_ptr_arith` also
+     fire when `get_expr_type(left) == TYPE_PTR` — is a future cleanup.)
+
+### Original attempted-and-blocked notes (preserved for context)
+
 ## Attempted implementation, 2026-04-25 — blocked on a sibling bug
 
 Built and tested the per-state index in nfa.ritz + lexer_nfa.ritz +
