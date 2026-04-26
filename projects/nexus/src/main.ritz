@@ -422,6 +422,100 @@ fn handle_not_found(ctx: *WorkerContext, req: *RequestSlot, resp: *ResponseSlot)
     return 0
 
 
+# GET /wiki/:slug - View a wiki page
+#
+# Looks up the page in the store (mausoleum or fallback), renders the markdown
+# content inside the standard Nexus chrome.  404s with a styled page if the
+# slug is missing.  This is the handler that finally closes the
+# valet → zeus → nexus → mausoleum loop end-to-end (mausoleum integration via
+# store.ritz; falls back to seeded in-memory pages if mausoleum isn't reachable).
+fn handle_wiki_view(ctx: *WorkerContext, req: *RequestSlot, resp: *ResponseSlot) -> i32
+    let path: *u8 = worker_get_request_path(ctx, req)
+    let path_len: i32 = req.path_len as i32
+
+    var slug: [128]u8
+    let slug_len: i32 = extract_slug(path, path_len, @slug[0], 128)
+
+    if slug_len <= 0
+        return handle_not_found(ctx, req, resp)
+
+    # Look up content in the store
+    var content: [8192]u8
+    var content_len: i32 = 0
+    let found: i32 = store_get(@slug[0], slug_len, @content[0], @content_len)
+
+    if found == 0
+        # Render styled 404 with offer to create
+        var nf_body: [4096]u8
+        var np: i32 = 0
+
+        np = write_html_head(@nf_body[0], np, c"Not Found - Nexus Wiki")
+        np = write_cstr(@nf_body[0], np, c"<nav class=\"nav\"><a href=\"/\">&larr; Home</a></nav>")
+        np = write_cstr(@nf_body[0], np, c"<h1>Page Not Found</h1>")
+        np = write_cstr(@nf_body[0], np, c"<p>No page exists with the slug <code>")
+        np = write_escaped(@nf_body[0], np, @slug[0], slug_len)
+        np = write_cstr(@nf_body[0], np, c"</code>.</p>")
+        np = write_cstr(@nf_body[0], np, c"<p><a href=\"/wiki/new\">Create a new page &rarr;</a></p>")
+        np = write_html_footer(@nf_body[0], np)
+
+        var nf_headers: [256]u8
+        let nf_headers_len: i32 = build_headers(@nf_headers[0], 404, c"text/html; charset=utf-8", np)
+
+        let nf_arena_h: *u8 = worker_alloc_response_data(ctx, nf_headers_len as i64)
+        let nf_arena_b: *u8 = worker_alloc_response_data(ctx, np as i64)
+
+        for i in 0..nf_headers_len
+            *(nf_arena_h + i) = nf_headers[i]
+        for i in 0..np
+            *(nf_arena_b + i) = nf_body[i]
+
+        response_slot_set_status(resp, 404)
+        response_slot_set_headers(resp, worker_ptr_to_offset(ctx, nf_arena_h) as u32, nf_headers_len as u16)
+        response_slot_set_body(resp, worker_ptr_to_offset(ctx, nf_arena_b) as u32, np as u32)
+        response_slot_set_flags(resp, RESP_FLAG_COMPLETE)
+        return 0
+
+    # Render the page
+    var body: [16384]u8
+    var p: i32 = 0
+
+    p = write_html_head(@body[0], p, c"Nexus Wiki")
+    p = write_cstr(@body[0], p, c"<nav class=\"nav\"><a href=\"/\">&larr; Home</a></nav>")
+    p = write_cstr(@body[0], p, c"<h1>")
+    p = write_escaped(@body[0], p, @slug[0], slug_len)
+    p = write_cstr(@body[0], p, c"</h1>")
+    p = write_cstr(@body[0], p, c"<div class=\"content\">")
+    # Render content as escaped pre-formatted text.  Markdown rendering is a
+    # follow-up — for now `white-space: pre-wrap` (set in head) preserves
+    # line breaks, and write_escaped neutralises any HTML in the source.
+    p = write_escaped(@body[0], p, @content[0], content_len)
+    p = write_cstr(@body[0], p, c"</div>")
+    p = write_cstr(@body[0], p, c"<div class=\"actions\">")
+    p = write_cstr(@body[0], p, c"<a href=\"/wiki/")
+    p = write_bytes(@body[0], p, @slug[0], slug_len)
+    p = write_cstr(@body[0], p, c"/edit\">Edit this page</a>")
+    p = write_cstr(@body[0], p, c"</div>")
+    p = write_html_footer(@body[0], p)
+
+    var headers: [256]u8
+    let headers_len: i32 = build_headers(@headers[0], 200, c"text/html; charset=utf-8", p)
+
+    let arena_headers: *u8 = worker_alloc_response_data(ctx, headers_len as i64)
+    let arena_body: *u8 = worker_alloc_response_data(ctx, p as i64)
+
+    for i in 0..headers_len
+        *(arena_headers + i) = headers[i]
+    for i in 0..p
+        *(arena_body + i) = body[i]
+
+    response_slot_set_status(resp, 200)
+    response_slot_set_headers(resp, worker_ptr_to_offset(ctx, arena_headers) as u32, headers_len as u16)
+    response_slot_set_body(resp, worker_ptr_to_offset(ctx, arena_body) as u32, p as u32)
+    response_slot_set_flags(resp, RESP_FLAG_COMPLETE)
+
+    return 0
+
+
 fn handle_wiki_new(ctx: *WorkerContext, req: *RequestSlot, resp: *ResponseSlot) -> i32
     var body: [4096]u8
     var p: i32 = 0
@@ -474,11 +568,13 @@ fn route_request(ctx: *WorkerContext, req: *RequestSlot, resp: *ResponseSlot) ->
     if method == HTTP_METHOD_GET and path_starts_with(path, path_len, c"/health") != 0
         return handle_health(ctx, req, resp)
 
-    # GET /wiki/new
+    # GET /wiki/new — must come before /wiki/:slug so "new" isn't treated as a slug
     if method == HTTP_METHOD_GET and path_starts_with(path, path_len, c"/wiki/new") != 0
         return handle_wiki_new(ctx, req, resp)
 
-    # TODO: Add more handlers as needed
+    # GET /wiki/:slug — view a wiki page (mausoleum-backed via store_get)
+    if method == HTTP_METHOD_GET and path_starts_with(path, path_len, c"/wiki/") != 0
+        return handle_wiki_view(ctx, req, resp)
 
     return handle_not_found(ctx, req, resp)
 
