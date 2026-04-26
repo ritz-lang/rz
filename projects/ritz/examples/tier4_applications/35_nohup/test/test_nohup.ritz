@@ -1,0 +1,156 @@
+# Tests for 35_nohup - run command immune to hangups
+#
+# Integration tests fork+exec ./nohup with various command/argument
+# combinations.  Verifies output passthrough, exit-code propagation,
+# and the standard error codes (125 for missing op, 127 for not found).
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+
+fn buf_eq(a: *u8, b: *u8, len: i64) -> i32
+    var i: i64 = 0
+    while i < len
+        if *(a + i) != *(b + i)
+            return 0
+        i += 1
+    return 1
+
+fn buf_contains(hay: *u8, hay_len: i64, needle: *u8, needle_len: i64) -> i32
+    if needle_len == 0
+        return 1
+    if needle_len > hay_len
+        return 0
+    var i: i64 = 0
+    while i <= hay_len - needle_len
+        if buf_eq(hay + i, needle, needle_len) == 1
+            return 1
+        i += 1
+    return 0
+
+fn nohup_exec(argv: **u8, envp: **u8, out_buf: *u8, out_len: *i64) -> i32
+    var stdout_pipe: [2]i32
+    if sys_pipe(@stdout_pipe[0]) < 0
+        return -1
+    let pid: i32 = sys_fork()
+    if pid < 0
+        sys_close(stdout_pipe[0])
+        sys_close(stdout_pipe[1])
+        return -2
+    if pid == 0
+        sys_dup2(stdout_pipe[1], 1)
+        sys_dup2(stdout_pipe[1], 2)
+        sys_close(stdout_pipe[0])
+        sys_close(stdout_pipe[1])
+        sys_execve(c"./nohup", argv, envp)
+        sys_exit(127)
+    sys_close(stdout_pipe[1])
+    var total: i64 = 0
+    while total < 4096
+        let r: i64 = sys_read(stdout_pipe[0], out_buf + total, 4096 - total)
+        if r <= 0
+            break
+        total += r
+    sys_close(stdout_pipe[0])
+    *out_len = total
+    var status: i32 = 0
+    sys_wait4(pid, @status, 0, null)
+    return (status >> 8) & 0xFF
+
+[[test]]
+fn test_nohup_basic_execution() -> i32
+    # `./nohup /bin/echo hello` — should print "hello" and exit 0
+    var argv: [4]*u8
+    argv[0] = c"./nohup"
+    argv[1] = c"/bin/echo"
+    argv[2] = c"hello"
+    argv[3] = null
+
+    # Pass minimal envp; nohup itself uses fewer env vars but needs a valid
+    # pointer to avoid crashes.
+    var envp: [2]*u8
+    envp[0] = c"PATH=/bin:/usr/bin"
+    envp[1] = null
+
+    var out: [1024]u8
+    var n: i64 = 0
+    let exit_code: i32 = nohup_exec(@argv[0], @envp[0], @out[0], @n)
+
+    assert exit_code == 0, c"nohup echo should exit 0"
+    assert buf_contains(@out[0], n, c"hello", 5) == 1, c"missing 'hello' in output"
+    0
+
+[[test]]
+fn test_nohup_exit_zero_passthrough() -> i32
+    # `./nohup /bin/true` — should exit 0
+    var argv: [3]*u8
+    argv[0] = c"./nohup"
+    argv[1] = c"/bin/true"
+    argv[2] = null
+
+    var envp: [2]*u8
+    envp[0] = c"PATH=/bin:/usr/bin"
+    envp[1] = null
+
+    var out: [1024]u8
+    var n: i64 = 0
+    let exit_code: i32 = nohup_exec(@argv[0], @envp[0], @out[0], @n)
+
+    assert exit_code == 0, c"nohup /bin/true should exit 0"
+    0
+
+[[test]]
+fn test_nohup_exit_nonzero_passthrough() -> i32
+    # `./nohup /bin/false` — should exit 1
+    var argv: [3]*u8
+    argv[0] = c"./nohup"
+    argv[1] = c"/bin/false"
+    argv[2] = null
+
+    var envp: [2]*u8
+    envp[0] = c"PATH=/bin:/usr/bin"
+    envp[1] = null
+
+    var out: [1024]u8
+    var n: i64 = 0
+    let exit_code: i32 = nohup_exec(@argv[0], @envp[0], @out[0], @n)
+
+    assert exit_code == 1, c"nohup /bin/false should exit 1"
+    0
+
+[[test]]
+fn test_nohup_missing_command() -> i32
+    # `./nohup` (no args) — should exit 125
+    var argv: [2]*u8
+    argv[0] = c"./nohup"
+    argv[1] = null
+
+    var envp: [2]*u8
+    envp[0] = c"PATH=/bin:/usr/bin"
+    envp[1] = null
+
+    var out: [1024]u8
+    var n: i64 = 0
+    let exit_code: i32 = nohup_exec(@argv[0], @envp[0], @out[0], @n)
+
+    assert exit_code == 125, c"nohup (no args) should exit 125"
+    0
+
+[[test]]
+fn test_nohup_command_not_found() -> i32
+    # `./nohup /nonexistent` — should exit 127
+    var argv: [3]*u8
+    argv[0] = c"./nohup"
+    argv[1] = c"/nonexistent_xyzzy"
+    argv[2] = null
+
+    var envp: [2]*u8
+    envp[0] = c"PATH=/bin:/usr/bin"
+    envp[1] = null
+
+    var out: [1024]u8
+    var n: i64 = 0
+    let exit_code: i32 = nohup_exec(@argv[0], @envp[0], @out[0], @n)
+
+    assert exit_code == 127, c"nohup <missing> should exit 127"
+    0

@@ -21,7 +21,7 @@ python3 build.py build 21_ls
 # Pre-commit validation (incremental ritz1, 30-60s)
 make matrix
 
-# Pre-push validation (full bootstrap + matrix, ~5min)
+# Pre-push validation (full bootstrap + matrix, ~1m 40s)
 make matrix-full
 
 # All tests, all examples (slow)
@@ -63,11 +63,14 @@ fn main() -> i32
 
 **Testing:**
 ```ritz
-@test
+[[test]]
 fn test_add() -> i32
     assert 2 + 3 == 5
     0
 ```
+
+See `docs/TESTING.md` for the canonical fork+exec integration-test template
+and the four harness gotchas (read-until-EOF, temp-file stdin, etc.).
 
 ## Principles
 
@@ -83,3 +86,5 @@ fn test_add() -> i32
 - `docs/VALIDATION.md` - **Validation workflow & build cadence** (read this!)
 - `STYLE.md` - Code style guide
 - `TODO.md` / `DONE.md` - Work tracking
+- `docs/XARGS_WATCH_BLOCKER.md` - Pre-existing StrView/i8* type-mismatch
+  blocking 37_xargs and 40_watch builds. Fix sketch included.

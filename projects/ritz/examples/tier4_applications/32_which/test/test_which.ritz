@@ -1,0 +1,116 @@
+# Tests for 32_which - find executables in PATH
+#
+# Integration tests fork+exec ./which with controlled PATH via envp.
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+
+fn buf_eq(a: *u8, b: *u8, len: i64) -> i32
+    var i: i64 = 0
+    while i < len
+        if *(a + i) != *(b + i)
+            return 0
+        i += 1
+    return 1
+
+fn buf_contains(hay: *u8, hay_len: i64, needle: *u8, needle_len: i64) -> i32
+    if needle_len == 0
+        return 1
+    if needle_len > hay_len
+        return 0
+    var i: i64 = 0
+    while i <= hay_len - needle_len
+        if buf_eq(hay + i, needle, needle_len) == 1
+            return 1
+        i += 1
+    return 0
+
+fn which_exec(argv: **u8, envp: **u8, out_buf: *u8, out_len: *i64) -> i32
+    var stdout_pipe: [2]i32
+    if sys_pipe(@stdout_pipe[0]) < 0
+        return -1
+    let pid: i32 = sys_fork()
+    if pid < 0
+        sys_close(stdout_pipe[0])
+        sys_close(stdout_pipe[1])
+        return -2
+    if pid == 0
+        sys_dup2(stdout_pipe[1], 1)
+        sys_dup2(stdout_pipe[1], 2)
+        sys_close(stdout_pipe[0])
+        sys_close(stdout_pipe[1])
+        sys_execve(c"./which", argv, envp)
+        sys_exit(127)
+    sys_close(stdout_pipe[1])
+    var total: i64 = 0
+    while total < 1024
+        let r: i64 = sys_read(stdout_pipe[0], out_buf + total, 1024 - total)
+        if r <= 0
+            break
+        total += r
+    sys_close(stdout_pipe[0])
+    *out_len = total
+    var status: i32 = 0
+    sys_wait4(pid, @status, 0, null)
+    return (status >> 8) & 0xFF
+
+[[test]]
+fn test_which_finds_in_usr_bin() -> i32
+    # /usr/bin/true is on virtually every Linux system; use a custom PATH
+    # that points only to /usr/bin so the test is reproducible.
+    var argv: [3]*u8
+    argv[0] = c"./which"
+    argv[1] = c"true"
+    argv[2] = null
+
+    var envp: [2]*u8
+    envp[0] = c"PATH=/usr/bin:/bin"
+    envp[1] = null
+
+    var out: [1024]u8
+    var n: i64 = 0
+    let exit_code: i32 = which_exec(@argv[0], @envp[0], @out[0], @n)
+
+    assert exit_code == 0, c"which true should exit 0"
+    # Output should be either /usr/bin/true or /bin/true
+    let found_usr: i32 = buf_contains(@out[0], n, c"/usr/bin/true", 13)
+    let found_bin: i32 = buf_contains(@out[0], n, c"/bin/true", 9)
+    assert found_usr == 1 || found_bin == 1, c"expected path to true"
+    0
+
+[[test]]
+fn test_which_not_found() -> i32
+    var argv: [3]*u8
+    argv[0] = c"./which"
+    argv[1] = c"nonexistent_xyz_definitely_not_there"
+    argv[2] = null
+
+    var envp: [2]*u8
+    envp[0] = c"PATH=/usr/bin:/bin"
+    envp[1] = null
+
+    var out: [1024]u8
+    var n: i64 = 0
+    let exit_code: i32 = which_exec(@argv[0], @envp[0], @out[0], @n)
+
+    assert exit_code != 0, c"which nonexistent should exit non-zero"
+    0
+
+[[test]]
+fn test_which_empty_path_fails() -> i32
+    var argv: [3]*u8
+    argv[0] = c"./which"
+    argv[1] = c"true"
+    argv[2] = null
+
+    var envp: [2]*u8
+    envp[0] = c"PATH=/no_such_directory_xyzzy"
+    envp[1] = null
+
+    var out: [1024]u8
+    var n: i64 = 0
+    let exit_code: i32 = which_exec(@argv[0], @envp[0], @out[0], @n)
+
+    assert exit_code != 0, c"empty PATH should fail to find"
+    0

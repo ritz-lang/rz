@@ -1,0 +1,136 @@
+# Tests for 33_printenv - print env variable values
+#
+# Integration tests fork+exec ./printenv with a controlled envp.
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+
+fn buf_eq(a: *u8, b: *u8, len: i64) -> i32
+    var i: i64 = 0
+    while i < len
+        if *(a + i) != *(b + i)
+            return 0
+        i += 1
+    return 1
+
+fn buf_contains(hay: *u8, hay_len: i64, needle: *u8, needle_len: i64) -> i32
+    if needle_len == 0
+        return 1
+    if needle_len > hay_len
+        return 0
+    var i: i64 = 0
+    while i <= hay_len - needle_len
+        if buf_eq(hay + i, needle, needle_len) == 1
+            return 1
+        i += 1
+    return 0
+
+fn printenv_exec(argv: **u8, envp: **u8, out_buf: *u8, out_len: *i64) -> i32
+    var stdout_pipe: [2]i32
+    if sys_pipe(@stdout_pipe[0]) < 0
+        return -1
+    let pid: i32 = sys_fork()
+    if pid < 0
+        sys_close(stdout_pipe[0])
+        sys_close(stdout_pipe[1])
+        return -2
+    if pid == 0
+        sys_dup2(stdout_pipe[1], 1)
+        sys_dup2(stdout_pipe[1], 2)
+        sys_close(stdout_pipe[0])
+        sys_close(stdout_pipe[1])
+        sys_execve(c"./printenv", argv, envp)
+        sys_exit(127)
+    sys_close(stdout_pipe[1])
+    var total: i64 = 0
+    while total < 4096
+        let r: i64 = sys_read(stdout_pipe[0], out_buf + total, 4096 - total)
+        if r <= 0
+            break
+        total += r
+    sys_close(stdout_pipe[0])
+    *out_len = total
+    var status: i32 = 0
+    sys_wait4(pid, @status, 0, null)
+    return (status >> 8) & 0xFF
+
+[[test]]
+fn test_printenv_single_var() -> i32
+    var argv: [3]*u8
+    argv[0] = c"./printenv"
+    argv[1] = c"HOME"
+    argv[2] = null
+
+    var envp: [3]*u8
+    envp[0] = c"HOME=/test_home"
+    envp[1] = c"USER=tester"
+    envp[2] = null
+
+    var out: [1024]u8
+    var n: i64 = 0
+    let exit_code: i32 = printenv_exec(@argv[0], @envp[0], @out[0], @n)
+
+    assert exit_code == 0, c"printenv HOME should exit 0"
+    assert n == 11, c"expected 11 bytes (/test_home\\n)"
+    assert buf_eq(@out[0], c"/test_home\n", 11) == 1, c"output mismatch"
+    0
+
+[[test]]
+fn test_printenv_multiple_vars() -> i32
+    var argv: [4]*u8
+    argv[0] = c"./printenv"
+    argv[1] = c"HOME"
+    argv[2] = c"USER"
+    argv[3] = null
+
+    var envp: [3]*u8
+    envp[0] = c"HOME=/h"
+    envp[1] = c"USER=u"
+    envp[2] = null
+
+    var out: [1024]u8
+    var n: i64 = 0
+    let exit_code: i32 = printenv_exec(@argv[0], @envp[0], @out[0], @n)
+
+    assert exit_code == 0, c"printenv HOME USER should exit 0"
+    assert buf_eq(@out[0], c"/h\nu\n", 5) == 1, c"output mismatch"
+    0
+
+[[test]]
+fn test_printenv_missing_var() -> i32
+    var argv: [3]*u8
+    argv[0] = c"./printenv"
+    argv[1] = c"NONEXISTENT_XYZ"
+    argv[2] = null
+
+    var envp: [2]*u8
+    envp[0] = c"PATH=/usr/bin"
+    envp[1] = null
+
+    var out: [1024]u8
+    var n: i64 = 0
+    let exit_code: i32 = printenv_exec(@argv[0], @envp[0], @out[0], @n)
+
+    assert exit_code != 0, c"missing var should exit non-zero"
+    0
+
+[[test]]
+fn test_printenv_no_args_prints_all() -> i32
+    var argv: [2]*u8
+    argv[0] = c"./printenv"
+    argv[1] = null
+
+    var envp: [3]*u8
+    envp[0] = c"X=1"
+    envp[1] = c"Y=2"
+    envp[2] = null
+
+    var out: [1024]u8
+    var n: i64 = 0
+    let exit_code: i32 = printenv_exec(@argv[0], @envp[0], @out[0], @n)
+
+    assert exit_code == 0, c"printenv (no args) should exit 0"
+    assert buf_contains(@out[0], n, c"X=1", 3) == 1, c"missing X=1"
+    assert buf_contains(@out[0], n, c"Y=2", 3) == 1, c"missing Y=2"
+    0
