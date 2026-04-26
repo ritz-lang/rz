@@ -50,6 +50,24 @@ const SYS_ACCEPT4: i64 = 288
 const SYS_EPOLL_CREATE1: i64 = 291
 const SYS_EPOLL_CTL: i64 = 233
 const SYS_EPOLL_WAIT: i64 = 232
+const SYS_FCNTL: i64 = 72
+
+# fcntl operations
+const F_GETFL: i32 = 3
+const F_SETFL: i32 = 4
+const O_NONBLOCK_FLAG: i32 = 2048   # 0x800
+
+# Socket option for retrieving pending error after non-blocking connect
+const SO_ERROR: i32 = 4
+
+# Receive- and send-timeout socket options (struct timeval values).  Used
+# to bound recv() and send() syscalls so a hung peer can't lock a client
+# forever during the protocol-level handshake.
+const SO_RCVTIMEO: i32 = 20
+const SO_SNDTIMEO: i32 = 21
+
+# Errno values relevant to non-blocking connect timeouts
+const E_INPROGRESS: i32 = 115
 
 # ============================================================================
 # Socket constants
@@ -284,6 +302,29 @@ pub fn socket_set_reuseport(sock: *Socket) -> i32
 pub fn socket_set_nodelay(sock: *Socket) -> i32
     return socket_set_opt_int(sock, IPPROTO_TCP, TCP_NODELAY, 1)
 
+
+# Set both SO_RCVTIMEO and SO_SNDTIMEO on a socket so subsequent recv/send
+# calls fail with -EAGAIN after the timeout instead of blocking forever.
+#
+# Implements the timeval-based form expected by Linux:
+#   struct timeval {
+#       i64 tv_sec;
+#       i64 tv_usec;
+#   };
+#
+# Returns 0 on success, negative on the first failing setsockopt.  Pass 0
+# for `timeout_ms` to clear timeouts (sets both fields to zero — kernel
+# treats that as "no timeout").
+pub fn socket_set_io_timeout(sock: *Socket, timeout_ms: i32) -> i32
+    var tv: [2]i64
+    tv[0] = (timeout_ms / 1000) as i64
+    tv[1] = ((timeout_ms % 1000) * 1000) as i64
+
+    let r1: i32 = sys_setsockopt(sock.fd, SOL_SOCKET, SO_RCVTIMEO, @tv[0] as *u8, 16)
+    if r1 < 0
+        return r1
+    return sys_setsockopt(sock.fd, SOL_SOCKET, SO_SNDTIMEO, @tv[0] as *u8, 16)
+
 # Bind socket to address and port
 pub fn socket_bind(sock: *Socket, addr_str: *u8, port: i32) -> i32
     var addr: SockAddrIn
@@ -333,6 +374,99 @@ pub fn socket_connect(sock: *Socket, addr_str: *u8, port: i32) -> i32
     memset(@addr.zero[0], 0, 8)
 
     return sys_connect(sock.fd, @addr as *u8, 16)
+
+
+# fcntl wrapper for setting/clearing socket flags.  Used by the timeout
+# variant of connect to flip O_NONBLOCK on and off around the connect call.
+fn sys_fcntl_set(fd: i32, flags: i32) -> i32
+    return __syscall3(SYS_FCNTL, fd as i64, F_SETFL as i64, flags as i64) as i32
+
+fn sys_fcntl_get(fd: i32) -> i32
+    return __syscall3(SYS_FCNTL, fd as i64, F_GETFL as i64, 0) as i32
+
+
+# Connect to a server with a wall-clock timeout in milliseconds.
+#
+# Standard "non-blocking connect" recipe (POSIX):
+#   1. Snapshot the socket's current flags, OR in O_NONBLOCK.
+#   2. Issue connect().  Either succeeds immediately (rare on TCP) or
+#      returns -EINPROGRESS, which means the SYN is in flight.
+#   3. poll(POLLOUT) with the timeout.  Writable = connect resolved.
+#   4. getsockopt(SO_ERROR) — 0 means success, anything else is the
+#      pending errno (ECONNREFUSED, ETIMEDOUT, etc.).
+#   5. Restore the original blocking flags.
+#
+# Returns:
+#    0 on success (connection established).
+#   -1 on syscall errors (socket level, fcntl, etc.).
+#   -2 on connect timeout — kernel didn't resolve within `timeout_ms`.
+#   -3 on connect refused / unreachable / other connect-time errno.
+#
+# This is the standard fix for the "if a half-broken peer is on the port,
+# regular socket_connect() blocks for the kernel's TCP retry timeout
+# (~75s)" failure mode that bit nexus during the G-wedge testing.
+pub fn socket_connect_timeout(sock: *Socket, addr_str: *u8, port: i32, timeout_ms: i32) -> i32
+    var addr: SockAddrIn
+    addr.family = AF_INET as i16
+    addr.port = htons(port)
+    addr.addr = parse_ipv4(addr_str)
+    memset(@addr.zero[0], 0, 8)
+
+    # 1. Save current flags and switch to non-blocking
+    let orig_flags: i32 = sys_fcntl_get(sock.fd)
+    if orig_flags < 0
+        return -1
+
+    if sys_fcntl_set(sock.fd, orig_flags | O_NONBLOCK_FLAG) < 0
+        return -1
+
+    # 2. Issue connect.  Expected to return -EINPROGRESS (-115) for TCP.
+    let rc: i32 = sys_connect(sock.fd, @addr as *u8, 16)
+
+    if rc == 0
+        # Connect resolved synchronously (loopback fast path); restore
+        # blocking and return success.
+        sys_fcntl_set(sock.fd, orig_flags)
+        return 0
+
+    # Anything else negative that isn't EINPROGRESS is a hard failure.
+    # Linux returns -EINPROGRESS as -115.
+    if rc != (0 - E_INPROGRESS)
+        sys_fcntl_set(sock.fd, orig_flags)
+        return -3
+
+    # 3. Wait for the socket to become writable, with timeout.
+    var pfd: PollFd
+    pfd.fd = sock.fd
+    pfd.events = POLLOUT
+    pfd.revents = 0
+
+    let poll_rc: i32 = sys_poll(@pfd, 1, timeout_ms)
+
+    # Restore blocking mode regardless of outcome.  We're either going to
+    # use the socket synchronously after this (caller expects blocking
+    # I/O) or close it on error.
+    sys_fcntl_set(sock.fd, orig_flags)
+
+    if poll_rc == 0
+        return -2  # timeout
+
+    if poll_rc < 0
+        return -1  # poll syscall error
+
+    if (pfd.revents & POLLERR) != 0
+        return -3  # connect failed (RST, refused, unreachable)
+
+    # 4. Verify connect actually succeeded via SO_ERROR.
+    var so_error: i32 = 0
+    var optlen: i32 = 4
+    let err_rc: i32 = sys_getsockopt(sock.fd, SOL_SOCKET, SO_ERROR, @so_error as *u8, @optlen)
+    if err_rc < 0
+        return -1
+    if so_error != 0
+        return -3  # actual errno of the failed connect
+
+    return 0
 
 # Send data
 pub fn socket_send(sock: *Socket, buf: *u8, len: i64) -> i64

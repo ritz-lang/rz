@@ -99,7 +99,13 @@ pub fn client_free(client: *Client)
 # Connection management
 # ============================================================================
 
-# Connect to a server
+# Default connect timeout in milliseconds.  Anything larger than this is
+# almost certainly a network problem and the caller would rather fail fast
+# than block.  Tuned for "nexus startup probes mausoleum at 127.0.0.1" —
+# that should resolve in a few ms; if it doesn't, mausoleum is broken.
+const DEFAULT_CONNECT_TIMEOUT_MS: i32 = 5000
+
+# Connect to a server (with a 5-second connect timeout)
 pub fn client_connect(client: *Client, host: *u8, port: i32, collection: *u8, collection_len: i32) -> i32
     if client == null
         return -1
@@ -115,13 +121,24 @@ pub fn client_connect(client: *Client, host: *u8, port: i32, collection: *u8, co
     # Set TCP_NODELAY
     socket_set_nodelay(@client.sock)
 
-    # Connect to server
-    let result: i32 = socket_connect(@client.sock, host, port)
+    # Connect to server with a bounded timeout.  Falls into one of:
+    #   0 = success
+    #  -2 = timeout
+    #  -3 = ECONNREFUSED / unreachable / RST
+    #  -1 = syscall error
+    let result: i32 = socket_connect_timeout(@client.sock, host, port, DEFAULT_CONNECT_TIMEOUT_MS)
     if result < 0
         socket_close(@client.sock)
         client.sock.fd = -1
         client.last_error = PROTO_ERR_DISCONNECTED
         return -4
+
+    # The connect itself succeeded but a misbehaving peer (e.g. a process
+    # that accepts but never responds) would still cause the *protocol*
+    # handshake below to block forever in recv_message.  Bound recv/send
+    # via SO_RCVTIMEO / SO_SNDTIMEO too so the whole client_connect call
+    # is wall-clock-bounded.
+    socket_set_io_timeout(@client.sock, DEFAULT_CONNECT_TIMEOUT_MS)
 
     # Send CONNECT message
     let req_id: i32 = client.next_request_id
@@ -162,6 +179,10 @@ pub fn client_connect(client: *Client, host: *u8, port: i32, collection: *u8, co
     client.session_id = msgreader_read_i64(@reader)
     client.connected = 1
     client.last_error = PROTO_OK
+    # Handshake done — clear the recv/send timeouts so subsequent
+    # operations (which may legitimately be long-running, e.g. big
+    # scans) aren't constrained to the connect timeout.
+    socket_set_io_timeout(@client.sock, 0)
     return 0
 
 # Disconnect from server
