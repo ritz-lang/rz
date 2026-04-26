@@ -1,169 +1,41 @@
-# Tests for 20_xxd - hex dump
-# Asserts structural properties (offset/hex/ASCII columns) rather than
-# byte-perfect equality, matching test.sh's looser approach since whitespace
-# can vary between xxd implementations.
+# Tests for 20_xxd — hex dump.
+import ritzlib.testlib
 
-import ritzlib.sys
-import ritzlib.io
-import ritzlib.str
-
-fn buf_eq(a: *u8, b: *u8, len: i64) -> i32
-    var i: i64 = 0
-    while i < len
-        if *(a + i) != *(b + i)
-            return 0
-        i += 1
-    return 1
-
-# Substring search: returns 1 if needle (len needle_len) appears in haystack (len hay_len).
-fn buf_contains(hay: *u8, hay_len: i64, needle: *u8, needle_len: i64) -> i32
-    if needle_len == 0
-        return 1
-    if needle_len > hay_len
-        return 0
-    var i: i64 = 0
-    let last: i64 = hay_len - needle_len
-    while i <= last
-        if buf_eq(hay + i, needle, needle_len) == 1
-            return 1
-        i += 1
-    return 0
-
-# Run ./xxd with given argv and stdin content; return exit code.
-# Captures the first 1024 bytes of stdout into out_buf and writes the
-# byte count to *out_len.  argv must be null-terminated.
-#
-# Implementation note: stdin is delivered via a temp file (not a pipe).
-# An earlier pipe-based approach was flaky (~20% failure rate) — even
-# pre-buffering before fork didn't fully fix it under ritz0 --test's
-# in-process test harness.  Temp files are race-free: write all data,
-# close, then fork+dup2 the read fd into the child's stdin.  The child
-# sees a regular file with full contents and EOF at end.
-fn xxd_exec(stdin_content: *u8, stdin_len: i64, out_buf: *u8, out_len: *i64) -> i32
-    # Build a unique temp path with the parent's pid as suffix.
-    var path_buf: [64]u8
-    let path_prefix: *u8 = c"/tmp/ritz_xxd_stdin_"
-    var i: i64 = 0
-    while *(path_prefix + i) != 0
-        path_buf[i] = *(path_prefix + i)
-        i += 1
-    # Append pid in decimal
-    let pid_self: i32 = sys_getpid()
-    var n_self: i32 = pid_self
-    var d_buf: [16]u8
-    var d_len: i32 = 0
-    if n_self == 0
-        d_buf[0] = '0'
-        d_len = 1
-    else
-        while n_self > 0
-            d_buf[d_len] = ((n_self % 10) + 48) as u8
-            n_self = n_self / 10
-            d_len += 1
-        # Reverse digits into path_buf
-        var j: i32 = 0
-        while j < d_len
-            path_buf[i + j] = d_buf[d_len - 1 - j]
-            j += 1
-        i += d_len
-    path_buf[i] = 0
-
-    # Write stdin content to temp file.
-    let fd_w: i32 = sys_open3(@path_buf[0], O_WRONLY + O_CREAT + O_TRUNC, 384)  # 0o600
-    if fd_w < 0
-        return -1
-    if stdin_len > 0
-        sys_write(fd_w, stdin_content, stdin_len)
-    sys_close(fd_w)
-
-    # Open temp file for reading (will become child's stdin).
-    let fd_r: i32 = sys_open(@path_buf[0], O_RDONLY)
-    if fd_r < 0
-        sys_unlink(@path_buf[0])
-        return -2
-
-    # Pipe for capturing stdout.
-    var stdout_pipe: [2]i32
-    if sys_pipe(@stdout_pipe[0]) < 0
-        sys_close(fd_r)
-        sys_unlink(@path_buf[0])
-        return -3
-
-    let pid: i32 = sys_fork()
-    if pid < 0
-        sys_close(fd_r)
-        sys_close(stdout_pipe[0])
-        sys_close(stdout_pipe[1])
-        sys_unlink(@path_buf[0])
-        return -4
-
-    if pid == 0
-        sys_dup2(fd_r, 0)
-        sys_dup2(stdout_pipe[1], 1)
-        sys_close(fd_r)
-        sys_close(stdout_pipe[0])
-        sys_close(stdout_pipe[1])
-        var argv: [2]*u8
-        argv[0] = c"./xxd"
-        argv[1] = null
-        sys_execve(c"./xxd", @argv[0], null)
-        sys_exit(127)
-
-    sys_close(fd_r)
-    sys_close(stdout_pipe[1])
-
-    # Loop on sys_read until EOF — pipes return as soon as ANY data is
-    # available, not when the writer is done.  Without the loop a fast
-    # parent read returns the first chunk only and we lose the rest of
-    # the child's output (was the source of the test_grep_basic_match
-    # flake — read returned 5 bytes of "apple\napricot\n" because grep
-    # wrote the second match between two reads).
-    var total: i64 = 0
-    while total < 1024
-        let r: i64 = sys_read(stdout_pipe[0], out_buf + total, 1024 - total)
-        if r <= 0
-            break
-        total += r
-    sys_close(stdout_pipe[0])
-    *out_len = total
-
-    var status: i32 = 0
-    sys_wait4(pid, @status, 0, null)
-    sys_unlink(@path_buf[0])
-    # WEXITSTATUS — high byte of status (POSIX spec)
-    return (status >> 8) & 0xFF
+fn xxd_run(stdin_content: *u8, stdin_len: i64, out_buf: *u8, out_len: *i64) -> i32
+    var argv: [2]*u8
+    argv[0] = c"./xxd"
+    argv[1] = null
+    return exec_capture(c"./xxd", @argv[0], null, stdin_content, stdin_len, out_buf, 1024, out_len)
 
 [[test]]
 fn test_xxd_hi_dump() -> i32
-    # `printf 'hi\n' | ./xxd` — 3 bytes (0x68 0x69 0x0a)
-    # Asserts presence of hex bytes "6869" and "0a" + ASCII "hi" + offset prefix.
+    # 'hi\n' is 3 bytes (0x68 0x69 0x0a).  Assert hex digits + ASCII + offset.
     var out: [1024]u8
     var n: i64 = 0
-    let exit_code: i32 = xxd_exec(c"hi\n", 3, @out[0], @n)
-    assert exit_code == 0, c"exit code should be 0"
-    assert n > 0, c"expected output"
-    assert buf_contains(@out[0], n, c"6869", 4) == 1, c"missing 6869 hex"
-    assert buf_contains(@out[0], n, c"0a", 2) == 1, c"missing 0a hex"
-    assert buf_contains(@out[0], n, c"hi", 2) == 1, c"missing 'hi' ASCII"
-    assert buf_contains(@out[0], n, c"00000000", 8) == 1, c"missing offset prefix"
+    let exit_code: i32 = xxd_run(c"hi\n", 3, @out[0], @n)
+    assert exit_code == 0, "exit code should be 0"
+    assert n > 0, "expected output"
+    assert buf_contains(@out[0], n, c"6869", 4) == 1, "missing 6869 hex"
+    assert buf_contains(@out[0], n, c"0a", 2) == 1, "missing 0a hex"
+    assert buf_contains(@out[0], n, c"hi", 2) == 1, "missing 'hi' ASCII"
+    assert buf_contains(@out[0], n, c"00000000", 8) == 1, "missing offset prefix"
     0
 
 [[test]]
 fn test_xxd_empty_input() -> i32
     var out: [1024]u8
     var n: i64 = 0
-    let exit_code: i32 = xxd_exec(c"", 0, @out[0], @n)
-    assert exit_code == 0, c"exit code should be 0"
-    assert n == 0, c"empty in → empty out"
+    let exit_code: i32 = xxd_run(c"", 0, @out[0], @n)
+    assert exit_code == 0, "exit code should be 0"
+    assert n == 0, "empty in → empty out"
     0
 
 [[test]]
 fn test_xxd_single_char() -> i32
-    # 'A' = 0x41 — assert hex 41 and ASCII 'A' present
     var out: [1024]u8
     var n: i64 = 0
-    let exit_code: i32 = xxd_exec(c"A", 1, @out[0], @n)
-    assert exit_code == 0, c"exit code should be 0"
-    assert n > 0, c"expected output"
-    assert buf_contains(@out[0], n, c"41", 2) == 1, c"missing 41 hex"
+    let exit_code: i32 = xxd_run(c"A", 1, @out[0], @n)
+    assert exit_code == 0, "exit code should be 0"
+    assert n > 0, "expected output"
+    assert buf_contains(@out[0], n, c"41", 2) == 1, "missing 41 hex"
     0

@@ -1,112 +1,17 @@
-# Tests for 25_mv - rename/move files
-#
-# Integration tests fork+exec ./mv against a sandbox under /tmp/.
-
+# Tests for 25_mv — rename/move files.
 import ritzlib.sys
-import ritzlib.io
-import ritzlib.str
-
-fn buf_eq(a: *u8, b: *u8, len: i64) -> i32
-    var i: i64 = 0
-    while i < len
-        if *(a + i) != *(b + i)
-            return 0
-        i += 1
-    return 1
-
-fn make_sandbox_path(dst: *u8, suffix: *u8) -> i64
-    let prefix: *u8 = c"/tmp/ritz_mv_"
-    var i: i64 = 0
-    while *(prefix + i) != 0
-        *(dst + i) = *(prefix + i)
-        i += 1
-    var n: i32 = sys_getpid()
-    var d_buf: [16]u8
-    var d_len: i32 = 0
-    if n == 0
-        d_buf[0] = '0'
-        d_len = 1
-    else
-        while n > 0
-            d_buf[d_len] = ((n % 10) + 48) as u8
-            n = n / 10
-            d_len += 1
-    var j: i32 = 0
-    while j < d_len
-        *(dst + i) = d_buf[d_len - 1 - j]
-        i += 1
-        j += 1
-    *(dst + i) = '_' as u8
-    i += 1
-    var k: i64 = 0
-    while *(suffix + k) != 0
-        *(dst + i) = *(suffix + k)
-        i += 1
-        k += 1
-    *(dst + i) = 0
-    return i
-
-fn write_file(path: *u8, content: *u8, len: i64) -> i32
-    let fd: i32 = sys_open3(path, O_WRONLY + O_CREAT + O_TRUNC, 384)
-    if fd < 0
-        return -1
-    if len > 0
-        sys_write(fd, content, len)
-    sys_close(fd)
-    return 0
-
-fn read_file(path: *u8, buf: *u8, max: i64) -> i64
-    let fd: i32 = sys_open(path, O_RDONLY)
-    if fd < 0
-        return -1
-    var total: i64 = 0
-    while total < max
-        let r: i64 = sys_read(fd, buf + total, max - total)
-        if r <= 0
-            break
-        total += r
-    sys_close(fd)
-    return total
-
-fn mv_exec(argv: **u8, out_buf: *u8, out_len: *i64) -> i32
-    var stdout_pipe: [2]i32
-    if sys_pipe(@stdout_pipe[0]) < 0
-        return -1
-    let pid: i32 = sys_fork()
-    if pid < 0
-        sys_close(stdout_pipe[0])
-        sys_close(stdout_pipe[1])
-        return -2
-    if pid == 0
-        sys_dup2(stdout_pipe[1], 1)
-        sys_dup2(stdout_pipe[1], 2)
-        sys_close(stdout_pipe[0])
-        sys_close(stdout_pipe[1])
-        sys_execve(c"./mv", argv, null)
-        sys_exit(127)
-    sys_close(stdout_pipe[1])
-    var total: i64 = 0
-    while total < 1024
-        let r: i64 = sys_read(stdout_pipe[0], out_buf + total, 1024 - total)
-        if r <= 0
-            break
-        total += r
-    sys_close(stdout_pipe[0])
-    *out_len = total
-    var status: i32 = 0
-    sys_wait4(pid, @status, 0, null)
-    return (status >> 8) & 0xFF
+import ritzlib.testlib
 
 [[test]]
 fn test_mv_renames_within_dir() -> i32
     var a: [128]u8
     var b: [128]u8
-    make_sandbox_path(@a[0], c"a")
-    make_sandbox_path(@b[0], c"b")
+    make_sandbox_path(@a[0], c"mv", c"a")
+    make_sandbox_path(@b[0], c"mv", c"b")
     sys_unlink(@a[0])
     sys_unlink(@b[0])
     if write_file(@a[0], c"payload\n", 8) < 0
-        assert 0 == 1, c"setup: a"
+        assert 0 == 1, "setup: a"
 
     var argv: [4]*u8
     argv[0] = c"./mv"
@@ -116,7 +21,7 @@ fn test_mv_renames_within_dir() -> i32
 
     var out: [1024]u8
     var n: i64 = 0
-    let exit_code: i32 = mv_exec(@argv[0], @out[0], @n)
+    let exit_code: i32 = exec_capture(c"./mv", @argv[0], null, null, 0, @out[0], 1024, @n)
 
     var st: Stat
     let stat_a: i32 = sys_stat2(@a[0], @st)
@@ -125,39 +30,38 @@ fn test_mv_renames_within_dir() -> i32
     sys_unlink(@a[0])
     sys_unlink(@b[0])
 
-    assert exit_code == 0, c"mv a b should exit 0"
-    assert stat_a != 0, c"a should be gone"
-    assert rd == 8, c"b should have 8 bytes"
-    assert buf_eq(@rd_buf[0], c"payload\n", 8) == 1, c"payload mismatch"
+    assert exit_code == 0, "mv a b should exit 0"
+    assert stat_a != 0, "a should be gone"
+    assert rd == 8, "b should have 8 bytes"
+    assert buf_eq(@rd_buf[0], c"payload\n", 8) == 1, "payload mismatch"
     0
 
 [[test]]
 fn test_mv_between_subdirs() -> i32
     var d1: [128]u8
     var d2: [128]u8
-    make_sandbox_path(@d1[0], c"d1")
-    make_sandbox_path(@d2[0], c"d2")
+    let d1len: i64 = make_sandbox_path(@d1[0], c"mv", c"d1")
+    let d2len: i64 = make_sandbox_path(@d2[0], c"mv", c"d2")
     sys_rmdir(@d1[0])
     sys_rmdir(@d2[0])
     if sys_mkdir(@d1[0], 493) < 0
-        assert 0 == 1, c"setup: d1"
+        assert 0 == 1, "setup: d1"
     if sys_mkdir(@d2[0], 493) < 0
         sys_rmdir(@d1[0])
-        assert 0 == 1, c"setup: d2"
+        assert 0 == 1, "setup: d2"
 
-    # Build paths d1/file and d2/file
     var src: [192]u8
     var dst: [192]u8
     var i: i64 = 0
-    while *(@d1[0] + i) != 0
-        src[i] = *(@d1[0] + i)
+    while i < d1len
+        src[i] = d1[i]
         i += 1
     src[i] = '/' as u8
     src[i + 1] = 'f' as u8
     src[i + 2] = 0
     i = 0
-    while *(@d2[0] + i) != 0
-        dst[i] = *(@d2[0] + i)
+    while i < d2len
+        dst[i] = d2[i]
         i += 1
     dst[i] = '/' as u8
     dst[i + 1] = 'f' as u8
@@ -166,7 +70,7 @@ fn test_mv_between_subdirs() -> i32
     if write_file(@src[0], c"x", 1) < 0
         sys_rmdir(@d1[0])
         sys_rmdir(@d2[0])
-        assert 0 == 1, c"setup: src file"
+        assert 0 == 1, "setup: src file"
 
     var argv: [4]*u8
     argv[0] = c"./mv"
@@ -176,7 +80,7 @@ fn test_mv_between_subdirs() -> i32
 
     var out: [1024]u8
     var n: i64 = 0
-    let exit_code: i32 = mv_exec(@argv[0], @out[0], @n)
+    let exit_code: i32 = exec_capture(c"./mv", @argv[0], null, null, 0, @out[0], 1024, @n)
 
     var st: Stat
     let stat_src: i32 = sys_stat2(@src[0], @st)
@@ -186,17 +90,17 @@ fn test_mv_between_subdirs() -> i32
     sys_rmdir(@d1[0])
     sys_rmdir(@d2[0])
 
-    assert exit_code == 0, c"mv across dirs should exit 0"
-    assert stat_src != 0, c"src should be gone"
-    assert stat_dst == 0, c"dst should exist"
+    assert exit_code == 0, "mv across dirs should exit 0"
+    assert stat_src != 0, "src should be gone"
+    assert stat_dst == 0, "dst should exist"
     0
 
 [[test]]
 fn test_mv_missing_source_errors() -> i32
     var src: [128]u8
     var dst: [128]u8
-    make_sandbox_path(@src[0], c"never")
-    make_sandbox_path(@dst[0], c"target")
+    make_sandbox_path(@src[0], c"mv", c"never")
+    make_sandbox_path(@dst[0], c"mv", c"target")
     sys_unlink(@src[0])
     sys_unlink(@dst[0])
 
@@ -208,8 +112,8 @@ fn test_mv_missing_source_errors() -> i32
 
     var out: [1024]u8
     var n: i64 = 0
-    let exit_code: i32 = mv_exec(@argv[0], @out[0], @n)
-    sys_unlink(@dst[0])  # in case mv created it
+    let exit_code: i32 = exec_capture(c"./mv", @argv[0], null, null, 0, @out[0], 1024, @n)
+    sys_unlink(@dst[0])
 
-    assert exit_code != 0, c"mv of missing source should fail"
+    assert exit_code != 0, "mv of missing source should fail"
     0

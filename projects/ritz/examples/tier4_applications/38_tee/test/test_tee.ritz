@@ -1,138 +1,15 @@
-# Tests for 38_tee - read from stdin, write to stdout and files
+# Tests for 38_tee — read from stdin, write to stdout and files.
 #
-# Integration tests fork+exec ./tee with piped stdin via temp file
-# (race-free per docs/TESTING.md), capture stdout, verify file outputs.
+# Helpers (exec_capture, make_sandbox_path, read_file, buf_eq) live in
+# ritzlib.testlib; see docs/TESTING.md.
 
 import ritzlib.sys
-import ritzlib.io
-import ritzlib.str
-
-fn buf_eq(a: *u8, b: *u8, len: i64) -> i32
-    var i: i64 = 0
-    while i < len
-        if *(a + i) != *(b + i)
-            return 0
-        i += 1
-    return 1
-
-fn buf_contains(hay: *u8, hay_len: i64, needle: *u8, needle_len: i64) -> i32
-    if needle_len == 0
-        return 1
-    if needle_len > hay_len
-        return 0
-    var i: i64 = 0
-    while i <= hay_len - needle_len
-        if buf_eq(hay + i, needle, needle_len) == 1
-            return 1
-        i += 1
-    return 0
-
-fn make_sandbox_path(dst: *u8, suffix: *u8) -> i64
-    let prefix: *u8 = c"/tmp/ritz_tee_"
-    var i: i64 = 0
-    while *(prefix + i) != 0
-        *(dst + i) = *(prefix + i)
-        i += 1
-    var n: i32 = sys_getpid()
-    var d_buf: [16]u8
-    var d_len: i32 = 0
-    if n == 0
-        d_buf[0] = '0'
-        d_len = 1
-    else
-        while n > 0
-            d_buf[d_len] = ((n % 10) + 48) as u8
-            n = n / 10
-            d_len += 1
-    var j: i32 = 0
-    while j < d_len
-        *(dst + i) = d_buf[d_len - 1 - j]
-        i += 1
-        j += 1
-    *(dst + i) = '_' as u8
-    i += 1
-    var k: i64 = 0
-    while *(suffix + k) != 0
-        *(dst + i) = *(suffix + k)
-        i += 1
-        k += 1
-    *(dst + i) = 0
-    return i
-
-fn read_file(path: *u8, buf: *u8, max: i64) -> i64
-    let fd: i32 = sys_open(path, O_RDONLY)
-    if fd < 0
-        return -1
-    var total: i64 = 0
-    while total < max
-        let r: i64 = sys_read(fd, buf + total, max - total)
-        if r <= 0
-            break
-        total += r
-    sys_close(fd)
-    return total
-
-# Run ./tee with given argv and stdin content via temp-file (race-free).
-fn tee_exec(argv: **u8, stdin_content: *u8, stdin_len: i64, out_buf: *u8, out_len: *i64) -> i32
-    var stdin_path: [128]u8
-    make_sandbox_path(@stdin_path[0], c"stdin")
-
-    let fd_w: i32 = sys_open3(@stdin_path[0], O_WRONLY + O_CREAT + O_TRUNC, 384)
-    if fd_w < 0
-        return -1
-    if stdin_len > 0
-        sys_write(fd_w, stdin_content, stdin_len)
-    sys_close(fd_w)
-
-    let fd_r: i32 = sys_open(@stdin_path[0], O_RDONLY)
-    if fd_r < 0
-        sys_unlink(@stdin_path[0])
-        return -2
-
-    var stdout_pipe: [2]i32
-    if sys_pipe(@stdout_pipe[0]) < 0
-        sys_close(fd_r)
-        sys_unlink(@stdin_path[0])
-        return -3
-
-    let pid: i32 = sys_fork()
-    if pid < 0
-        sys_close(fd_r)
-        sys_close(stdout_pipe[0])
-        sys_close(stdout_pipe[1])
-        sys_unlink(@stdin_path[0])
-        return -4
-
-    if pid == 0
-        sys_dup2(fd_r, 0)
-        sys_dup2(stdout_pipe[1], 1)
-        sys_dup2(stdout_pipe[1], 2)
-        sys_close(fd_r)
-        sys_close(stdout_pipe[0])
-        sys_close(stdout_pipe[1])
-        sys_execve(c"./tee", argv, null)
-        sys_exit(127)
-
-    sys_close(fd_r)
-    sys_close(stdout_pipe[1])
-    var total: i64 = 0
-    while total < 1024
-        let r: i64 = sys_read(stdout_pipe[0], out_buf + total, 1024 - total)
-        if r <= 0
-            break
-        total += r
-    sys_close(stdout_pipe[0])
-    *out_len = total
-
-    var status: i32 = 0
-    sys_wait4(pid, @status, 0, null)
-    sys_unlink(@stdin_path[0])
-    return (status >> 8) & 0xFF
+import ritzlib.testlib
 
 [[test]]
 fn test_tee_single_file() -> i32
     var path: [128]u8
-    make_sandbox_path(@path[0], c"single")
+    make_sandbox_path(@path[0], c"tee", c"single")
     sys_unlink(@path[0])
 
     var argv: [3]*u8
@@ -142,25 +19,25 @@ fn test_tee_single_file() -> i32
 
     var out: [1024]u8
     var n: i64 = 0
-    let exit_code: i32 = tee_exec(@argv[0], c"hello", 5, @out[0], @n)
+    let exit_code: i32 = exec_capture(c"./tee", @argv[0], null, c"hello", 5, @out[0], 1024, @n)
 
     var rd_buf: [64]u8
     let rd: i64 = read_file(@path[0], @rd_buf[0], 64)
     sys_unlink(@path[0])
 
-    assert exit_code == 0, c"tee single should exit 0"
-    assert n == 5, c"stdout should be 5 bytes"
-    assert buf_eq(@out[0], c"hello", 5) == 1, c"stdout mismatch"
-    assert rd == 5, c"file should be 5 bytes"
-    assert buf_eq(@rd_buf[0], c"hello", 5) == 1, c"file content mismatch"
+    assert exit_code == 0, "tee single should exit 0"
+    assert n == 5, "stdout should be 5 bytes"
+    assert buf_eq(@out[0], c"hello", 5) == 1, "stdout mismatch"
+    assert rd == 5, "file should be 5 bytes"
+    assert buf_eq(@rd_buf[0], c"hello", 5) == 1, "file content mismatch"
     0
 
 [[test]]
 fn test_tee_multiple_files() -> i32
     var p1: [128]u8
     var p2: [128]u8
-    make_sandbox_path(@p1[0], c"a")
-    make_sandbox_path(@p2[0], c"b")
+    make_sandbox_path(@p1[0], c"tee", c"a")
+    make_sandbox_path(@p2[0], c"tee", c"b")
     sys_unlink(@p1[0])
     sys_unlink(@p2[0])
 
@@ -172,7 +49,7 @@ fn test_tee_multiple_files() -> i32
 
     var out: [1024]u8
     var n: i64 = 0
-    let exit_code: i32 = tee_exec(@argv[0], c"world", 5, @out[0], @n)
+    let exit_code: i32 = exec_capture(c"./tee", @argv[0], null, c"world", 5, @out[0], 1024, @n)
 
     var b1: [64]u8
     var b2: [64]u8
@@ -181,85 +58,80 @@ fn test_tee_multiple_files() -> i32
     sys_unlink(@p1[0])
     sys_unlink(@p2[0])
 
-    assert exit_code == 0, c"tee multi should exit 0"
-    assert n == 5, c"stdout 5 bytes"
-    assert r1 == 5, c"file 1 should have 5 bytes"
-    assert buf_eq(@b1[0], c"world", 5) == 1, c"file 1 content mismatch"
-    assert r2 == 5, c"file 2 should have 5 bytes"
-    assert buf_eq(@b2[0], c"world", 5) == 1, c"file 2 content mismatch"
+    assert exit_code == 0, "tee multi should exit 0"
+    assert n == 5, "stdout 5 bytes"
+    assert r1 == 5, "file 1 should have 5 bytes"
+    assert buf_eq(@b1[0], c"world", 5) == 1, "file 1 content mismatch"
+    assert r2 == 5, "file 2 should have 5 bytes"
+    assert buf_eq(@b2[0], c"world", 5) == 1, "file 2 content mismatch"
     0
 
 [[test]]
 fn test_tee_overwrite_default() -> i32
     var path: [128]u8
-    make_sandbox_path(@path[0], c"ow")
+    make_sandbox_path(@path[0], c"tee", c"ow")
     sys_unlink(@path[0])
 
-    # First write "first"
     var argv1: [3]*u8
     argv1[0] = c"./tee"
     argv1[1] = @path[0]
     argv1[2] = null
     var out: [1024]u8
     var n: i64 = 0
-    tee_exec(@argv1[0], c"first", 5, @out[0], @n)
+    exec_capture(c"./tee", @argv1[0], null, c"first", 5, @out[0], 1024, @n)
 
-    # Now overwrite with "second"
-    let exit_code: i32 = tee_exec(@argv1[0], c"second", 6, @out[0], @n)
+    let exit_code: i32 = exec_capture(c"./tee", @argv1[0], null, c"second", 6, @out[0], 1024, @n)
 
     var rd_buf: [64]u8
     let rd: i64 = read_file(@path[0], @rd_buf[0], 64)
     sys_unlink(@path[0])
 
-    assert exit_code == 0, c"second tee should exit 0"
-    assert rd == 6, c"file should be 6 bytes after overwrite"
-    assert buf_eq(@rd_buf[0], c"second", 6) == 1, c"file should contain 'second'"
+    assert exit_code == 0, "second tee should exit 0"
+    assert rd == 6, "file should be 6 bytes after overwrite"
+    assert buf_eq(@rd_buf[0], c"second", 6) == 1, "file should contain 'second'"
     0
 
 [[test]]
 fn test_tee_append_flag() -> i32
     var path: [128]u8
-    make_sandbox_path(@path[0], c"ap")
+    make_sandbox_path(@path[0], c"tee", c"ap")
     sys_unlink(@path[0])
 
-    # First write "line1\n"
     var argv1: [3]*u8
     argv1[0] = c"./tee"
     argv1[1] = @path[0]
     argv1[2] = null
     var out: [1024]u8
     var n: i64 = 0
-    tee_exec(@argv1[0], c"line1\n", 6, @out[0], @n)
+    exec_capture(c"./tee", @argv1[0], null, c"line1\n", 6, @out[0], 1024, @n)
 
-    # Now append "line2\n"
     var argv2: [4]*u8
     argv2[0] = c"./tee"
     argv2[1] = c"-a"
     argv2[2] = @path[0]
     argv2[3] = null
-    let exit_code: i32 = tee_exec(@argv2[0], c"line2\n", 6, @out[0], @n)
+    let exit_code: i32 = exec_capture(c"./tee", @argv2[0], null, c"line2\n", 6, @out[0], 1024, @n)
 
     var rd_buf: [64]u8
     let rd: i64 = read_file(@path[0], @rd_buf[0], 64)
     sys_unlink(@path[0])
 
-    assert exit_code == 0, c"tee -a should exit 0"
-    assert rd == 12, c"file should have 12 bytes after append"
-    assert buf_eq(@rd_buf[0], c"line1\nline2\n", 12) == 1, c"appended content mismatch"
+    assert exit_code == 0, "tee -a should exit 0"
+    assert rd == 12, "file should have 12 bytes after append"
+    assert buf_eq(@rd_buf[0], c"line1\nline2\n", 12) == 1, "appended content mismatch"
     0
 
 [[test]]
 fn test_tee_no_files_passthrough() -> i32
-    # `./tee` with no args should pass stdin to stdout unchanged
     var argv: [2]*u8
     argv[0] = c"./tee"
     argv[1] = null
 
     var out: [1024]u8
     var n: i64 = 0
-    let exit_code: i32 = tee_exec(@argv[0], c"passthrough", 11, @out[0], @n)
+    let exit_code: i32 = exec_capture(c"./tee", @argv[0], null, c"passthrough", 11, @out[0], 1024, @n)
 
-    assert exit_code == 0, c"tee should exit 0"
-    assert n == 11, c"stdout should be 11 bytes"
-    assert buf_eq(@out[0], c"passthrough", 11) == 1, c"passthrough mismatch"
+    assert exit_code == 0, "tee should exit 0"
+    assert n == 11, "stdout should be 11 bytes"
+    assert buf_eq(@out[0], c"passthrough", 11) == 1, "passthrough mismatch"
     0

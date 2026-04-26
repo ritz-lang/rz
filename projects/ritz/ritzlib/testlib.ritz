@@ -1,0 +1,249 @@
+# testlib — helpers for [[test]] integration tests.
+#
+# Centralises the boilerplate that was previously copy-pasted across every
+# tier 2-4 test_*.ritz file:
+#
+#   * buf_eq / buf_contains / cstr_len  — buffer/cstring primitives
+#   * make_sandbox_path                  — pid-suffixed /tmp paths
+#   * write_file / read_file             — byte-level file I/O
+#   * exec_capture                       — fork+exec a binary with optional
+#                                          stdin (delivered race-free via a
+#                                          temp file) and capture stdout
+#
+# Lessons baked in here:
+#
+#   * Read-until-EOF: `sys_read` returns on ANY data, not just on close.  A
+#     fast parent reading a single chunk would silently truncate the child's
+#     output, surfacing as bizarre length-mismatch flakes.  Every read path
+#     loops until EOF.
+#   * Temp-file stdin > pipe stdin: even with pre-fork buffering, pipe-fed
+#     stdin had ~5% flake under ritz0 --test's harness on contended boxes.
+#     Temp file is race-free; the child sees a regular file with full
+#     contents and a clean EOF.
+#
+# All paths use null-terminated cstr (*u8); test code is at the syscall
+# boundary so cstr is the natural shape.  Returns and counts are i64.
+
+import ritzlib.sys
+
+# ============================================================================
+# Buffer primitives
+# ============================================================================
+
+# Compare two byte buffers up to len bytes.  Returns 1 if equal, else 0.
+pub fn buf_eq(a: *u8, b: *u8, len: i64) -> i32
+    var i: i64 = 0
+    while i < len
+        if *(a + i) != *(b + i)
+            return 0
+        i += 1
+    return 1
+
+# Find needle (needle_len bytes) anywhere in [hay, hay+hay_len).
+# Empty needle always matches (mirrors strstr/grep semantics).
+# Returns 1 if found, else 0.
+pub fn buf_contains(hay: *u8, hay_len: i64, needle: *u8, needle_len: i64) -> i32
+    if needle_len == 0
+        return 1
+    if needle_len > hay_len
+        return 0
+    var i: i64 = 0
+    while i <= hay_len - needle_len
+        if buf_eq(hay + i, needle, needle_len) == 1
+            return 1
+        i += 1
+    return 0
+
+# Length of a null-terminated cstring (excluding the terminator).
+pub fn cstr_len(s: *u8) -> i64
+    var n: i64 = 0
+    while *(s + n) != 0
+        n += 1
+    return n
+
+# ============================================================================
+# Sandbox paths
+# ============================================================================
+
+# Build "/tmp/ritz_<prefix>_<pid>_<suffix>" into the caller-supplied dst.
+# Returns the length written (excluding the trailing NUL).
+#
+# Pid uniqueness keeps parallel test workers from colliding; the suffix
+# disambiguates within a single test (e.g. "src", "dst", "subdir").  The
+# caller is responsible for ensuring dst is large enough — for the tiers
+# 3-4 use case, [128]u8 has comfortable headroom (prefix ≤ 12 chars,
+# 10-digit max-i32 pid, suffix ≤ 32 chars → ~55 chars max).
+pub fn make_sandbox_path(dst: *u8, prefix: *u8, suffix: *u8) -> i64
+    # "/tmp/ritz_"
+    let head: *u8 = c"/tmp/ritz_"
+    var i: i64 = 0
+    while *(head + i) != 0
+        *(dst + i) = *(head + i)
+        i += 1
+    # prefix
+    var k: i64 = 0
+    while *(prefix + k) != 0
+        *(dst + i) = *(prefix + k)
+        i += 1
+        k += 1
+    *(dst + i) = '_' as u8
+    i += 1
+    # pid in decimal — i32 max is 10 digits
+    var n: i32 = sys_getpid()
+    var d_buf: [16]u8
+    var d_len: i32 = 0
+    if n == 0
+        d_buf[0] = '0'
+        d_len = 1
+    else
+        while n > 0
+            d_buf[d_len] = ((n % 10) + 48) as u8
+            n = n / 10
+            d_len += 1
+    var j: i32 = 0
+    while j < d_len
+        *(dst + i) = d_buf[d_len - 1 - j]
+        i += 1
+        j += 1
+    *(dst + i) = '_' as u8
+    i += 1
+    # suffix
+    var s: i64 = 0
+    while *(suffix + s) != 0
+        *(dst + i) = *(suffix + s)
+        i += 1
+        s += 1
+    *(dst + i) = 0
+    return i
+
+# ============================================================================
+# File I/O
+# ============================================================================
+
+# Write content (len bytes) to path, creating/truncating with 0o600 perms.
+# Returns 0 on success, -1 if open fails.
+pub fn write_file(path: *u8, content: *u8, len: i64) -> i32
+    let fd: i32 = sys_open3(path, O_WRONLY + O_CREAT + O_TRUNC, 384)
+    if fd < 0
+        return -1
+    if len > 0
+        sys_write(fd, content, len)
+    sys_close(fd)
+    return 0
+
+# Read up to max bytes from path into buf.  Loops on sys_read until EOF —
+# critical because sys_read returns as soon as ANY data is available, not
+# when the writer is done.  Returns bytes read, or -1 if open fails.
+pub fn read_file(path: *u8, buf: *u8, max: i64) -> i64
+    let fd: i32 = sys_open(path, O_RDONLY)
+    if fd < 0
+        return -1
+    var total: i64 = 0
+    while total < max
+        let r: i64 = sys_read(fd, buf + total, max - total)
+        if r <= 0
+            break
+        total += r
+    sys_close(fd)
+    return total
+
+# ============================================================================
+# Process exec / capture
+# ============================================================================
+
+# fork + exec `bin` with the given argv (null-terminated) and envp (or
+# null for empty env), capture up to out_max bytes of merged stdout/stderr
+# into out_buf, write byte count to *out_len, and return the child's exit
+# code.  Negative return is a setup failure (pipe/fork/exec).
+#
+# stdin handling:
+#   * stdin_data == null: child inherits parent's stdin (typically /dev/null
+#     or the test harness's stdin).
+#   * stdin_data != null: stdin_data[..stdin_len] is written to a unique
+#     temp file under /tmp/ritz_stdin_<pid>_<bin>, opened RDONLY, and dup'd
+#     into the child's fd 0.  Race-free.  Temp file is unlinked after wait.
+#
+# bin must be a path that exec can resolve (absolute, or relative to cwd
+# like "./grep").  argv[0] should typically match bin.
+pub fn exec_capture(
+    bin: *u8,
+    argv: **u8,
+    envp: **u8,
+    stdin_data: *u8,
+    stdin_len: i64,
+    out_buf: *u8,
+    out_max: i64,
+    out_len: *i64,
+) -> i32
+    # Stage stdin via temp file if requested.  We use a fixed "in" suffix
+    # (pid keeps it unique across parallel test workers); each test runs
+    # its exec_capture calls serially so a single in-flight temp file per
+    # process is sufficient.  Don't try to encode `bin` here — bin paths
+    # can contain '/' (e.g. "./tee"), which would make the sandbox path
+    # nonsensical.
+    var stdin_path: [128]u8
+    var fd_r: i32 = -1
+    if stdin_data != null
+        make_sandbox_path(@stdin_path[0], c"stdin", c"in")
+        let fd_w: i32 = sys_open3(@stdin_path[0], O_WRONLY + O_CREAT + O_TRUNC, 384)
+        if fd_w < 0
+            return -1
+        if stdin_len > 0
+            sys_write(fd_w, stdin_data, stdin_len)
+        sys_close(fd_w)
+        fd_r = sys_open(@stdin_path[0], O_RDONLY)
+        if fd_r < 0
+            sys_unlink(@stdin_path[0])
+            return -2
+
+    # Pipe for capturing the child's stdout (and stderr — we dup2 both
+    # onto the write end so error messages from the binary surface in the
+    # captured output, useful for negative-path tests).
+    var stdout_pipe: [2]i32
+    if sys_pipe(@stdout_pipe[0]) < 0
+        if fd_r >= 0
+            sys_close(fd_r)
+            sys_unlink(@stdin_path[0])
+        return -3
+
+    let pid: i32 = sys_fork()
+    if pid < 0
+        sys_close(stdout_pipe[0])
+        sys_close(stdout_pipe[1])
+        if fd_r >= 0
+            sys_close(fd_r)
+            sys_unlink(@stdin_path[0])
+        return -4
+
+    if pid == 0
+        # Child: rewire fds and exec.
+        if fd_r >= 0
+            sys_dup2(fd_r, 0)
+            sys_close(fd_r)
+        sys_dup2(stdout_pipe[1], 1)
+        sys_dup2(stdout_pipe[1], 2)
+        sys_close(stdout_pipe[0])
+        sys_close(stdout_pipe[1])
+        sys_execve(bin, argv, envp)
+        sys_exit(127)
+
+    # Parent: close write end + child-side stdin fd, then drain output.
+    sys_close(stdout_pipe[1])
+    if fd_r >= 0
+        sys_close(fd_r)
+
+    var total: i64 = 0
+    while total < out_max
+        let r: i64 = sys_read(stdout_pipe[0], out_buf + total, out_max - total)
+        if r <= 0
+            break
+        total += r
+    sys_close(stdout_pipe[0])
+    *out_len = total
+
+    var status: i32 = 0
+    sys_wait4(pid, @status, 0, null)
+    if stdin_data != null
+        sys_unlink(@stdin_path[0])
+    # POSIX wait status: high byte is exit code.
+    return (status >> 8) & 0xFF
