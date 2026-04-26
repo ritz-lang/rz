@@ -1,7 +1,39 @@
-# Tier 5 backfill triage (2026-04-26)
+# Tier 5 backfill triage (2026-04-26 — UPDATED)
 
 **Inventory**: 36 packages under `examples/tier5_async/`, 9 already tested
 (66_for_loops through 74_autodrop), **27 missing**.
+
+## Update after first backfill pass
+
+The original triage identified 22/27 as "tractable with existing testlib
+template" — that turned out to be optimistic.  Most packages had
+**pre-existing build failures** that masked the test-writing scope.
+
+After mass-migrating legacy `&x` → `@x` across 29 src files in tier 5,
+**9 newly built cleanly**.  Tests written and passing for all 9
+(commit `<TBD>`).
+
+| Built + tested now | Failure mode masking the rest |
+|---|---|
+| 41_calc (10 tests) | StrView/i8* if-emit (6 pkgs: 42-46, 48) |
+| 56_async_runtime (1) | async Future/i64 mismatch (3 pkgs: 53, 54, 55) |
+| 57_fn_ptr (1) | uring API drift (1 pkg: 52_uring) |
+| 58_closures (1) | reserved keyword "HEAP" (1 pkg: 47_lisp) |
+| 61_true_async (1) | StrView/i8* (1 pkg: 49_ritzgen) |
+| 62_async_compiler (1) | StrView/i8* (1 pkg: 59_async_net) |
+| 63_executor (1) | server / no exit (3 pkgs: 50_http, 51_loadtest, 60_echo_server) |
+| 64_async_io (1) | unstructured (1 pkg: 51_iovec) |
+| 65_async_main (1) | doc-only (1 pkg: 75_async_reference) |
+
+**Cumulative tier 5 coverage: 9 (previously) + 9 (this pass) = 18/36.**
+
+The remaining 18 packages need:
+- **6 with StrView/i8* fix** (same blocker as xargs/watch — `docs/XARGS_WATCH_BLOCKER.md`)
+  → 42_json, 43_toml, 44_csv, 45_regex, 46_markdown, 48_ritzfmt, 49_ritzgen, 59_async_net
+- **3 with async runtime fix** — 53_async, 54_async_fs, 55_async_state_machine
+- **1 with uring API alignment** — 52_uring
+- **1 with parser fix** — 47_lisp (`HEAP` is now a reserved keyword?)
+- **5 special cases** (servers / fragments / docs) — out of scope for `[[test]]`
 
 **Result**: 22 of those 27 are tractable with the existing
 `ritzlib.testlib` template; 5 are special cases worth deferring or
