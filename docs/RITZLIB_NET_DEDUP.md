@@ -1,5 +1,10 @@
 # `ritzlib.net` and `ritzlib.async_net` duplicate `sys_*` syscall wrappers
 
+> **STATUS: RESOLVED** in the wedge that landed shortly after this doc
+> was written.  `ritzlib/async_net.ritz` now imports the duplicated
+> wrappers from `ritzlib.net` instead of declaring its own.  Kept here
+> as historical context for the fix.
+
 ## Summary
 
 `ritz/ritzlib/net.ritz` and `ritz/ritzlib/async_net.ritz` both declare the
