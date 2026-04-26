@@ -24,6 +24,54 @@ import lib.config
 import lib.log
 import lib.router
 import lib.json_builder
+import lib.response {
+    response_status,
+    response_header,
+    response_content_length,
+    response_end_headers,
+    response_body
+}
+
+# Zeus reverse-proxy support (--zeus-socket).  When valet is told to talk
+# to a zeus daemon, it acts as a thin nginx-shaped front-end: receive HTTP,
+# dispatch to a worker via the shared-memory ring, copy the response back.
+import zeus.zeus_client {
+    ZeusClient,
+    ZeusClientConfig,
+    zeus_client_config_default,
+    zeus_client_init,
+    zeus_client_destroy,
+    zeus_client_connect,
+    zeus_client_handshake,
+    zeus_client_recv_worker,
+    zeus_client_get_worker,
+    zeus_client_select_worker,
+    zeus_client_next_request_id,
+    zeus_client_submit_request,
+    zeus_client_poll_response,
+    worker_handle_get_arena,
+    WorkerHandle
+}
+import zeus.ring {
+    RequestSlot,
+    ResponseSlot,
+    request_slot_init,
+    response_slot_init,
+    HTTP_METHOD_GET,
+    HTTP_METHOD_POST,
+    HTTP_METHOD_PUT,
+    HTTP_METHOD_DELETE,
+    HTTP_METHOD_HEAD,
+    HTTP_METHOD_OPTIONS,
+    HTTP_METHOD_PATCH,
+    REQ_FLAG_COMPLETE
+}
+import zeus.arena {
+    DataArena,
+    data_arena_alloc,
+    data_arena_ptr_to_offset,
+    data_arena_offset_to_ptr
+}
 
 
 # ============================================================================
@@ -153,6 +201,182 @@ fn handle_api_catchall(path: *u8, path_len: i32) -> i32
 
 
 # ============================================================================
+# Zeus reverse-proxy mode
+# ============================================================================
+#
+# When --zeus-socket is given, valet stops being a stand-alone HTTP server
+# and becomes the front-end of a `valet → zeus → app` pipeline:
+#
+#   browser ─HTTP/1.1─► valet ─shm-ring─► zeus worker (e.g. nexus)
+#                          ▲                  │
+#                          └────── shm ───────┘
+#
+# Today the dispatch is synchronous (busy-poll the response ring with a
+# small sleep).  This holds up the connection while the worker runs.  It's
+# enough to prove the architecture and run a real wiki end-to-end; an
+# async dispatch using the existing futex slots is a follow-up.
+
+# Module-level handles for the proxy.  Stored as i64 so we can guard with
+# `== 0` ("not configured") without dragging null pointer initialisers
+# into globals (Ritz doesn't allow null *T in `var`).
+var g_zeus_client_ptr: i64 = 0
+var g_zeus_attached: i32 = 0
+
+
+fn get_zeus_client() -> *ZeusClient
+    return g_zeus_client_ptr as *ZeusClient
+
+
+# Map an HTTP method string from the request line to zeus's HTTP_METHOD_*
+# code.  Returns 0 (unknown) if the method isn't one we proxy.
+fn http_method_code(method_ptr: *u8, method_len: i32) -> u8
+    if method_len == 3 and *method_ptr == 'G' and *(method_ptr + 1) == 'E' and *(method_ptr + 2) == 'T'
+        return HTTP_METHOD_GET
+    if method_len == 4 and *method_ptr == 'P' and *(method_ptr + 1) == 'O' and *(method_ptr + 2) == 'S' and *(method_ptr + 3) == 'T'
+        return HTTP_METHOD_POST
+    if method_len == 3 and *method_ptr == 'P' and *(method_ptr + 1) == 'U' and *(method_ptr + 2) == 'T'
+        return HTTP_METHOD_PUT
+    if method_len == 6 and *method_ptr == 'D' and *(method_ptr + 1) == 'E' and *(method_ptr + 2) == 'L' and *(method_ptr + 3) == 'E' and *(method_ptr + 4) == 'T' and *(method_ptr + 5) == 'E'
+        return HTTP_METHOD_DELETE
+    if method_len == 4 and *method_ptr == 'H' and *(method_ptr + 1) == 'E' and *(method_ptr + 2) == 'A' and *(method_ptr + 3) == 'D'
+        return HTTP_METHOD_HEAD
+    if method_len == 7 and *method_ptr == 'O' and *(method_ptr + 1) == 'P' and *(method_ptr + 2) == 'T' and *(method_ptr + 3) == 'I' and *(method_ptr + 4) == 'O' and *(method_ptr + 5) == 'N' and *(method_ptr + 6) == 'S'
+        return HTTP_METHOD_OPTIONS
+    if method_len == 5 and *method_ptr == 'P' and *(method_ptr + 1) == 'A' and *(method_ptr + 2) == 'T' and *(method_ptr + 3) == 'C' and *(method_ptr + 4) == 'H'
+        return HTTP_METHOD_PATCH
+    return 0
+
+
+# Sleep `ms` milliseconds — used to throttle the response-ring poll loop.
+fn proxy_sleep_ms(ms: i64)
+    var ts: [2]i64
+    ts[0] = ms / 1000
+    ts[1] = (ms % 1000) * 1000000
+    sys_nanosleep(@ts[0], null)
+
+
+# Proxy a single request through the zeus shm ring.
+#
+# Catch-all handler registered for every method when --zeus-socket is set.
+# Builds a RequestSlot, allocates the path bytes (and body bytes for POST/
+# PUT/PATCH) in the worker's data arena, submits, and busy-polls the
+# response ring for up to 5 seconds.  Forwards status + Content-Length +
+# body bytes back to the HTTP client.
+#
+# Limitations (acknowledged, follow-ups tracked):
+#   * Synchronous dispatch — the connection stalls while the worker runs.
+#   * Content-Type is forwarded as text/html (workers like nexus produce a
+#     full HTTP response in their headers blob, but we don't parse it back
+#     yet).  This is enough for nexus today; mausoleum/static will need
+#     proper header forwarding.
+#   * No streaming, no chunked, no trailers.
+fn handle_zeus_proxy(path: *u8, path_len: i32) -> i32
+    let c: *HandlerContext = ctx()
+    if c == null
+        return -1
+
+    let client: *ZeusClient = get_zeus_client()
+    if client == null
+        return ctx_text(503, c"zeus client not configured\n")
+
+    # Pick a worker
+    let worker_idx: i32 = zeus_client_select_worker(client)
+    if worker_idx < 0
+        return ctx_text(503, c"no zeus worker available\n")
+
+    let handle: *WorkerHandle = zeus_client_get_worker(client, worker_idx)
+    if handle == null
+        return ctx_text(503, c"zeus worker handle null\n")
+
+    var arena: DataArena
+    worker_handle_get_arena(handle, @arena)
+    if arena.base == null
+        return ctx_text(503, c"zeus arena unavailable\n")
+
+    # Allocate + copy path bytes
+    let path_dst: *u8 = data_arena_alloc(@arena, path_len as i64)
+    if path_dst == null
+        return ctx_text(503, c"zeus arena: out of space for path\n")
+    for i in 0..path_len
+        *(path_dst + i) = *(path + i)
+    let path_offset: i64 = data_arena_ptr_to_offset(@arena, path_dst)
+
+    # Allocate + copy body bytes for write methods.  ctx_body returns 0 if
+    # there's nothing to forward.
+    var body_offset: i64 = 0
+    var body_len: i32 = 0
+    var body_buf: [16384]u8
+    let copied: i32 = ctx_body(@body_buf[0], 16384)
+    if copied > 0
+        let body_dst: *u8 = data_arena_alloc(@arena, copied as i64)
+        if body_dst == null
+            return ctx_text(503, c"zeus arena: out of space for body\n")
+        for i in 0..copied
+            *(body_dst + i) = body_buf[i]
+        body_offset = data_arena_ptr_to_offset(@arena, body_dst)
+        body_len = copied
+
+    # Build + submit RequestSlot
+    var req: RequestSlot
+    request_slot_init(@req)
+    req.id = zeus_client_next_request_id(client)
+    req.method = http_method_code(c.req.method_ptr, c.req.method_len)
+    if req.method == 0
+        return ctx_text(405, c"unsupported method\n")
+    req.flags = REQ_FLAG_COMPLETE
+    req.path_offset = path_offset as u32
+    req.path_len = path_len as u16
+    req.body_offset = body_offset as u32
+    req.body_len = body_len as u32
+
+    let submit_rc: i32 = zeus_client_submit_request(client, worker_idx, @req)
+    if submit_rc != 0
+        return ctx_text(503, c"zeus submit failed\n")
+
+    # Poll up to ~5s for the response.  500 attempts × 10ms.
+    var resp: ResponseSlot
+    response_slot_init(@resp)
+    var got_widx: i32 = -1
+    var attempts: i32 = 0
+    var poll_rc: i32 = -1
+    while attempts < 500
+        poll_rc = zeus_client_poll_response(client, @resp, @got_widx)
+        if poll_rc == 0
+            break
+        proxy_sleep_ms(10)
+        attempts += 1
+
+    if poll_rc != 0
+        return ctx_text(504, c"zeus worker timeout\n")
+
+    # Re-derive arena and resolve body offset → pointer.
+    var arena2: DataArena
+    worker_handle_get_arena(handle, @arena2)
+    let body_ptr: *u8 = data_arena_offset_to_ptr(@arena2, resp.body_offset as i64)
+
+    # Forward to the HTTP client.  Status from worker, Content-Length from
+    # worker, Content-Type fixed at text/html for now.  See limitations.
+    response_status(c.res, resp.status as i32)
+    response_header(c.res, c"Content-Type", c"text/html; charset=utf-8")
+    response_content_length(c.res, resp.body_len as i64)
+    response_header(c.res, c"Connection", c"keep-alive")
+    response_end_headers(c.res)
+    response_body(c.res, body_ptr, resp.body_len as i32)
+    return 0
+
+
+# Register the proxy handler under every method as a catch-all.
+fn register_zeus_proxy(app: *Valet)
+    valet_get(app, c"/**", handle_zeus_proxy)
+    valet_post(app, c"/**", handle_zeus_proxy)
+    valet_put(app, c"/**", handle_zeus_proxy)
+    valet_add_route(app, c"DELETE", c"/**", handle_zeus_proxy)
+    valet_add_route(app, c"HEAD", c"/**", handle_zeus_proxy)
+    valet_add_route(app, c"OPTIONS", c"/**", handle_zeus_proxy)
+    valet_add_route(app, c"PATCH", c"/**", handle_zeus_proxy)
+
+
+# ============================================================================
 # Main
 # ============================================================================
 
@@ -166,6 +390,7 @@ fn main(argc: i32, argv: **u8) -> i32
     args_option(@parser, 'p', c"port", c"PORT", c"Listen port (overrides config)", c"0")
     args_option(@parser, 'w', c"workers", c"N", c"Number of worker processes (overrides config)", c"0")
     args_flag(@parser, 'm', c"multishot", c"Use multishot accept (kernel 5.19+)")
+    args_option(@parser, 'z', c"zeus-socket", c"PATH", c"Reverse-proxy mode: dispatch all requests to a zeus daemon at PATH", c"")
 
     if args_parse(@parser, argc, argv) != 0
         return 1
@@ -250,13 +475,71 @@ fn main(argc: i32, argv: **u8) -> i32
     # Register middleware
     valet_use_named(@app, c"logging", logging_middleware)
 
-    # Register routes
-    valet_get(@app, c"/", handle_index)
-    valet_get(@app, c"/hello", handle_hello)
-    valet_get(@app, c"/json", handle_json)
-    valet_get(@app, c"/users/:id", handle_user)
-    valet_get(@app, c"/echo/:msg", handle_echo)
-    valet_get(@app, c"/api/**", handle_api_catchall)  # Catch-all for /api/*
+    # Reverse-proxy mode: --zeus-socket <path>.  When set, valet stops
+    # serving its built-in routes and instead forwards every request to a
+    # zeus daemon over the shm ring.  See handle_zeus_proxy above.
+    let zeus_sock: *u8 = args_get_str(@parser, 'z')
+    if zeus_sock != null and *zeus_sock != 0
+        prints("Zeus reverse-proxy mode enabled\n")
+        prints("  zeus socket: ")
+        prints_cstr(zeus_sock)
+        prints("\n")
+
+        # Allocate the client on the heap so its address survives across
+        # handler invocations (handlers reach it via g_zeus_client_ptr).
+        let zc_size: i64 = 4096
+        let zc_mem: *u8 = sys_mmap(0, zc_size, PROT_READ + PROT_WRITE, MAP_PRIVATE + MAP_ANONYMOUS, -1, 0)
+        if zc_mem == (-1) as *u8
+            eprints("valet: failed to allocate zeus client\n")
+            return 1
+        let client: *ZeusClient = zc_mem as *ZeusClient
+
+        var zcfg: ZeusClientConfig
+        zeus_client_config_default(@zcfg)
+
+        let zinit: i32 = zeus_client_init(client, @zcfg)
+        if zinit != 0
+            eprints("valet: zeus_client_init failed\n")
+            return 1
+
+        let zconn: i32 = zeus_client_connect(client, zeus_sock)
+        if zconn != 0
+            eprints("valet: zeus_client_connect failed\n")
+            return 1
+
+        let zhs: i32 = zeus_client_handshake(client)
+        if zhs < 0
+            eprints("valet: zeus handshake failed\n")
+            return 1
+
+        prints("  reported workers: ")
+        print_int(zhs as i64)
+        prints("\n")
+
+        var attached: i32 = 0
+        while attached < zhs
+            let widx: i32 = zeus_client_recv_worker(client)
+            if widx < 0
+                eprints("valet: failed to receive worker info\n")
+                return 1
+            attached += 1
+
+        prints("  attached workers: ")
+        print_int(attached as i64)
+        prints("\n")
+
+        g_zeus_client_ptr = client as i64
+        g_zeus_attached = attached
+
+        register_zeus_proxy(@app)
+    else
+        # Stand-alone mode: register the built-in routes
+        valet_get(@app, c"/", handle_index)
+        valet_get(@app, c"/hello", handle_hello)
+        valet_get(@app, c"/json", handle_json)
+        valet_get(@app, c"/users/:id", handle_user)
+        valet_get(@app, c"/echo/:msg", handle_echo)
+        valet_get(@app, c"/api/**", handle_api_catchall)  # Catch-all for /api/*
 
     # Run the server
     return valet_run(@app)
