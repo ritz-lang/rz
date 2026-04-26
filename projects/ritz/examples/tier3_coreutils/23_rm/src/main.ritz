@@ -8,19 +8,12 @@
 #   -f        ignore nonexistent files, never prompt
 #   -d        remove empty directories
 #   -v        verbose: print each file as it's removed
-#
-# Examples:
-#   rm file.txt           # remove file
-#   rm -rf dir/           # remove directory recursively
-#   rm -v a b c           # remove with verbose output
-
-# ============================================================================
-# Standard library imports
-# ============================================================================
 
 import ritzlib.sys
 import ritzlib.io
 import ritzlib.str
+import ritzlib.strview
+import ritzlib.string
 import ritzlib.fs
 import ritzlib.args
 
@@ -35,6 +28,30 @@ struct RmOptions
     verbose: i32     # -v
 
 # ============================================================================
+# Diagnostic helpers — see 24_cp for the rationale.
+#
+# Bare-string ("...") arguments are StrViews (length-tagged, no NUL,
+# zero-copy).  *u8 is reserved for runtime path data from argv/syscalls.
+# Each helper returns 1 (rm's error exit code) so call sites can `return
+# rm_err2(...)` directly.
+# ============================================================================
+
+fn rm_err2(prefix: StrView, path: *u8, suffix: StrView) -> i32
+    var s: String = string_from_strview(@prefix)
+    string_push_str(@s, path)
+    string_push_strview(@s, suffix)
+    eprintln_string(@s)
+    string_drop(@s)
+    return 1
+
+fn rm_print2(prefix: StrView, path: *u8, suffix: StrView)
+    var s: String = string_from_strview(@prefix)
+    string_push_str(@s, path)
+    string_push_strview(@s, suffix)
+    println_string(@s)
+    string_drop(@s)
+
+# ============================================================================
 # Removal functions
 # ============================================================================
 
@@ -42,32 +59,24 @@ fn remove_file(path: *u8, opts: *RmOptions) -> i32
     let result: i32 = sys_unlink(path)
     if result != 0
         if opts.force == 0
-            eprints_cstr(c"rm: cannot remove '")
-            eprints_cstr(path)
-            eprints_cstr(c"'\n")
+            rm_err2("rm: cannot remove '", path, "'")
         return result
 
     if opts.verbose != 0
-        prints_cstr(c"removed '")
-        prints_cstr(path)
-        prints_cstr(c"'\n")
+        rm_print2("removed '", path, "'")
 
     return 0
 
 fn remove_dir_recursive(path: *u8, opts: *RmOptions) -> i32
-    # Open directory
     let fd: i32 = sys_open(path, O_DIRECTORY)
     if fd < 0
         if opts.force == 0
-            eprints_cstr(c"rm: cannot open directory '")
-            eprints_cstr(path)
-            eprints_cstr(c"'\n")
+            rm_err2("rm: cannot open directory '", path, "'")
         return 1
 
     var result: i32 = 0
     var buf: [8192]u8
 
-    # Read and remove all entries
     loop
         let nread: i64 = sys_getdents64(fd, @buf[0], 8192)
         if nread <= 0
@@ -81,18 +90,14 @@ fn remove_dir_recursive(path: *u8, opts: *RmOptions) -> i32
 
             # Skip . and ..
             if streq(name, c".") == 0 and streq(name, c"..") == 0
-                # Build full path
                 var child_path: [4096]u8
                 path_join(path, name, @child_path[0])
 
-                # Check if directory
                 if is_directory(@child_path[0]) != 0
-                    # Recurse
                     let r: i32 = remove_dir_recursive(@child_path[0], opts)
                     if r != 0
                         result = 1
                 else
-                    # Remove file
                     let r: i32 = remove_file(@child_path[0], opts)
                     if r != 0
                         result = 1
@@ -105,15 +110,11 @@ fn remove_dir_recursive(path: *u8, opts: *RmOptions) -> i32
     let r: i32 = sys_rmdir(path)
     if r != 0
         if opts.force == 0
-            eprints_cstr(c"rm: cannot remove directory '")
-            eprints_cstr(path)
-            eprints_cstr(c"'\n")
+            rm_err2("rm: cannot remove directory '", path, "'")
         return 1
 
     if opts.verbose != 0
-        prints_cstr(c"removed directory '")
-        prints_cstr(path)
-        prints_cstr(c"'\n")
+        rm_print2("removed directory '", path, "'")
 
     return result
 
@@ -121,10 +122,7 @@ fn remove_path(path: *u8, opts: *RmOptions) -> i32
     # Check if path exists
     if path_exists(path) == 0
         if opts.force == 0
-            eprints_cstr(c"rm: cannot remove '")
-            eprints_cstr(path)
-            eprints_cstr(c"': No such file or directory\n")
-            return 1
+            return rm_err2("rm: cannot remove '", path, "': No such file or directory")
         return 0  # -f ignores nonexistent
 
     # Check if it's a directory
@@ -135,20 +133,12 @@ fn remove_path(path: *u8, opts: *RmOptions) -> i32
             # Try to remove empty directory
             let r: i32 = sys_rmdir(path)
             if r != 0
-                eprints_cstr(c"rm: cannot remove '")
-                eprints_cstr(path)
-                eprints_cstr(c"': Is a directory\n")
-                return 1
+                return rm_err2("rm: cannot remove '", path, "': Is a directory")
             if opts.verbose != 0
-                prints_cstr(c"removed directory '")
-                prints_cstr(path)
-                prints_cstr(c"'\n")
+                rm_print2("removed directory '", path, "'")
             return 0
         else
-            eprints_cstr(c"rm: cannot remove '")
-            eprints_cstr(path)
-            eprints_cstr(c"': Is a directory\n")
-            return 1
+            return rm_err2("rm: cannot remove '", path, "': Is a directory")
 
     return remove_file(path, opts)
 
@@ -157,32 +147,26 @@ fn remove_path(path: *u8, opts: *RmOptions) -> i32
 # ============================================================================
 
 fn main(argc: i32, argv: **u8) -> i32
-    # Initialize argument parser
     var parser: ArgParser
     args_init(@parser, c"rm", c"Remove files or directories")
 
-    # Define flags
     args_flag(@parser, 'r', c"recursive", c"Remove directories and their contents recursively")
     args_flag(@parser, 'R', null, c"Remove directories and their contents recursively")
     args_flag(@parser, 'f', c"force", c"Ignore nonexistent files, never prompt")
     args_flag(@parser, 'd', c"dir", c"Remove empty directories")
     args_flag(@parser, 'v', c"verbose", c"Print each file as it's removed")
 
-    # Define positional arguments
     args_positional(@parser, c"FILE", c"Files or directories to remove", 1, -1)
 
-    # Parse arguments
     if args_parse(@parser, argc, argv) != 0
         return 1
 
-    # Set options from parsed flags
     var opts: RmOptions
     opts.recursive = args_get_flag(@parser, 'r') | args_get_flag(@parser, 'R')
     opts.force = args_get_flag(@parser, 'f')
     opts.dir = args_get_flag(@parser, 'd')
     opts.verbose = args_get_flag(@parser, 'v')
 
-    # Process each file
     var result: i32 = 0
     for i in 0..parser.positional_count
         let path: *u8 = args_get_positional(@parser, i)
