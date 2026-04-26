@@ -119,29 +119,64 @@ fn handle_echo(path: *u8, path_len: i32) -> i32
     return ctx_ok(@msg_buf[0])
 
 
-# GET /docs/:slug - Dynamic doc lookup (currently a stub; will be backed by mausoleum)
+# GET /docs/:slug - Dynamic wiki content from disk
+#
+# Reads `wiki/<slug>.md` and returns its contents as text/html.  Slugs are
+# sanitised: only [a-zA-Z0-9_-] is accepted to prevent path traversal.
+#
+# Mausoleum integration is the long-term plan; tracked in
+# docs/RITZLIB_NET_DEDUP.md.  Today this is enough to prove the dynamic
+# routing + I/O pipeline.
 fn handle_docs(path: *u8, path_len: i32) -> i32
-    var slug_buf: [256]u8
-    let slug_len: i32 = ctx_param(0, @slug_buf[0], 255)
-    if slug_len < 0
+    var slug_buf: [128]u8
+    let slug_len: i32 = ctx_param(0, @slug_buf[0], 127)
+    if slug_len <= 0
         return ctx_text(400, c"Missing slug\n")
 
-    # Build "you asked for: <slug>\n"
-    var response_buf: [512]u8
-    var pos: i32 = 0
-    let prefix = c"you asked for: "
-    let prefix_len: i32 = 15
-    for i in 0..prefix_len
-        response_buf[pos] = *(prefix + i)
-        pos += 1
+    # Sanitise slug — only [a-zA-Z0-9_-] allowed to block ../../etc/passwd
     for i in 0..slug_len
-        response_buf[pos] = slug_buf[i]
-        pos += 1
-    response_buf[pos] = '\n'
-    pos += 1
-    response_buf[pos] = 0
+        let c: u8 = slug_buf[i]
+        let is_lower: i32 = if c >= 'a' and c <= 'z' then 1 else 0
+        let is_upper: i32 = if c >= 'A' and c <= 'Z' then 1 else 0
+        let is_digit: i32 = if c >= '0' and c <= '9' then 1 else 0
+        let is_dash: i32 = if c == '-' or c == '_' then 1 else 0
+        if is_lower == 0 and is_upper == 0 and is_digit == 0 and is_dash == 0
+            return ctx_text(400, c"Invalid slug\n")
 
-    return ctx_ok(@response_buf[0])
+    # Build path: "wiki/<slug>.md"
+    var path_buf: [256]u8
+    var pp: i32 = 0
+    let prefix = c"wiki/"
+    for i in 0..5
+        path_buf[pp] = *(prefix + i)
+        pp += 1
+    for i in 0..slug_len
+        path_buf[pp] = slug_buf[i]
+        pp += 1
+    path_buf[pp] = '.'
+    pp += 1
+    path_buf[pp] = 'm'
+    pp += 1
+    path_buf[pp] = 'd'
+    pp += 1
+    path_buf[pp] = 0
+
+    # Open and read.  O_RDONLY = 0.
+    let fd: i32 = sys_open(@path_buf[0], 0)
+    if fd < 0
+        return ctx_text(404, c"page not found\n")
+
+    var body_buf: [8192]u8
+    var total: i64 = 0
+    while total < 8191
+        let n: i64 = sys_read(fd, @body_buf[total] as *u8, 8191 - total)
+        if n <= 0
+            break
+        total += n
+    sys_close(fd)
+    body_buf[total] = 0
+
+    return ctx_html(200, @body_buf[0])
 
 
 # GET /api/** - Catch-all API route
