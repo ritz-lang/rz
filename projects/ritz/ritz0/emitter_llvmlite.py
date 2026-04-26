@@ -887,6 +887,53 @@ class LLVMEmitter:
         # Call string_as_ptr(&mut string)
         return self.builder.call(fn, [string_ptr])
 
+    # ------------------------------------------------------------------
+    # *u8 → StrView implicit coercion (call-site only)
+    # ------------------------------------------------------------------
+    # Lets users pass cstrs (argv elements, syscall returns, c"..." literals)
+    # to functions taking StrView.  Wraps the cstr by calling
+    # strview_from_cstr at runtime — one strlen() per call.  Without this,
+    # idiomatic source like
+    #
+    #     eprints("error: ")
+    #     eprints(path)              # <-- path: *u8 from argv
+    #     eprints("\n")
+    #
+    # fails to compile with a confusing "StrView != i8*" type-check error.
+
+    def _is_strview_struct(self, ty: 'ir.Type') -> bool:
+        """True if `ty` is the StrView struct (named or literal { i8*, i64 })."""
+        # Named struct registered in the module
+        if "StrView" in self.struct_types and ty == self.struct_types["StrView"]:
+            return True
+        # Literal struct fallback (used when the module hasn't pulled in the
+        # full ritzlib.strview definition).
+        if isinstance(ty, ir.LiteralStructType) and len(ty.elements) == 2:
+            e0, e1 = ty.elements
+            return (isinstance(e0, ir.PointerType) and e0.pointee == self.i8
+                    and e1 == self.i64)
+        return False
+
+    def _is_u8_ptr_value(self, val: 'ir.Value') -> bool:
+        """True if `val` is an i8* (cstr) at the LLVM level."""
+        ty = val.type
+        return isinstance(ty, ir.PointerType) and ty.pointee == self.i8
+
+    def _coerce_cstr_to_strview(self, cstr_val: 'ir.Value') -> 'ir.Value':
+        """Wrap a cstr (*u8) as a StrView via strview_from_cstr.
+
+        Requires ritzlib.strview to be linked (which is always the case
+        when the *target* parameter is StrView — that type lives there).
+        """
+        if "strview_from_cstr" not in self.functions:
+            raise ValueError(
+                "*u8 → StrView coercion requires strview_from_cstr() to be "
+                "defined.  Import ritzlib.strview at the call site, or pass "
+                "an explicit StrView-typed value."
+            )
+        fn, _ = self.functions["strview_from_cstr"]
+        return self.builder.call(fn, [cstr_val])
+
     def _emit_global_var(self, var_def: rast.VarDef) -> None:
         """Emit a module-level mutable variable.
 
@@ -6944,6 +6991,15 @@ class LLVMEmitter:
                           and expected_type.pointee == self.i8):
                         # Extract ptr field from StrView struct
                         val = self.builder.extract_value(val, 0, name='strview.ptr')
+                    # Check for *u8 -> StrView implicit coercion: lets users pass
+                    # cstrs (e.g. argv elements) to functions that take StrView.
+                    # Wraps via strview_from_cstr (one runtime strlen per call).
+                    # The argument's static type may be reported as PtrType *u8
+                    # OR as a NamedType named "*u8" depending on the expression
+                    # shape — accept both.
+                    elif (self._is_strview_struct(expected_type)
+                          and self._is_u8_ptr_value(val)):
+                        val = self._coerce_cstr_to_strview(val)
                     else:
                         val = self._convert_type(val, expected_type)
                 args.append(val)
