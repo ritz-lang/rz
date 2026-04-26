@@ -1,0 +1,175 @@
+# Tests for 14_uniq - adjacent-line deduplication
+# Integration tests mirror test.sh scenarios (default mode + -c, -d, -u flags).
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+
+fn buf_eq(a: *u8, b: *u8, len: i64) -> i32
+    var i: i64 = 0
+    while i < len
+        if *(a + i) != *(b + i)
+            return 0
+        i += 1
+    return 1
+
+# Run ./uniq with given argv and stdin content; return exit code.
+# Captures the first 1024 bytes of stdout into out_buf and writes the
+# byte count to *out_len.  argv must be null-terminated.
+#
+# Implementation note: stdin is delivered via a temp file (not a pipe).
+# An earlier pipe-based approach was flaky (~20% failure rate) — even
+# pre-buffering before fork didn't fully fix it under ritz0 --test's
+# in-process test harness.  Temp files are race-free: write all data,
+# close, then fork+dup2 the read fd into the child's stdin.  The child
+# sees a regular file with full contents and EOF at end.
+fn uniq_exec(flag: *u8, stdin_content: *u8, stdin_len: i64, out_buf: *u8, out_len: *i64) -> i32
+    # Build a unique temp path with the parent's pid as suffix.
+    var path_buf: [64]u8
+    let path_prefix: *u8 = c"/tmp/ritz_uniq_stdin_"
+    var i: i64 = 0
+    while *(path_prefix + i) != 0
+        path_buf[i] = *(path_prefix + i)
+        i += 1
+    # Append pid in decimal
+    let pid_self: i32 = sys_getpid()
+    var n_self: i32 = pid_self
+    var d_buf: [16]u8
+    var d_len: i32 = 0
+    if n_self == 0
+        d_buf[0] = '0'
+        d_len = 1
+    else
+        while n_self > 0
+            d_buf[d_len] = ((n_self % 10) + 48) as u8
+            n_self = n_self / 10
+            d_len += 1
+        # Reverse digits into path_buf
+        var j: i32 = 0
+        while j < d_len
+            path_buf[i + j] = d_buf[d_len - 1 - j]
+            j += 1
+        i += d_len
+    path_buf[i] = 0
+
+    # Write stdin content to temp file.
+    let fd_w: i32 = sys_open3(@path_buf[0], O_WRONLY + O_CREAT + O_TRUNC, 384)  # 0o600
+    if fd_w < 0
+        return -1
+    if stdin_len > 0
+        sys_write(fd_w, stdin_content, stdin_len)
+    sys_close(fd_w)
+
+    # Open temp file for reading (will become child's stdin).
+    let fd_r: i32 = sys_open(@path_buf[0], O_RDONLY)
+    if fd_r < 0
+        sys_unlink(@path_buf[0])
+        return -2
+
+    # Pipe for capturing stdout.
+    var stdout_pipe: [2]i32
+    if sys_pipe(@stdout_pipe[0]) < 0
+        sys_close(fd_r)
+        sys_unlink(@path_buf[0])
+        return -3
+
+    let pid: i32 = sys_fork()
+    if pid < 0
+        sys_close(fd_r)
+        sys_close(stdout_pipe[0])
+        sys_close(stdout_pipe[1])
+        sys_unlink(@path_buf[0])
+        return -4
+
+    if pid == 0
+        sys_dup2(fd_r, 0)
+        sys_dup2(stdout_pipe[1], 1)
+        sys_close(fd_r)
+        sys_close(stdout_pipe[0])
+        sys_close(stdout_pipe[1])
+        var argv: [3]*u8
+        argv[0] = c"./uniq"
+        if flag != null
+            argv[1] = flag
+            argv[2] = null
+        else
+            argv[1] = null
+            argv[2] = null
+        sys_execve(c"./uniq", @argv[0], null)
+        sys_exit(127)
+
+    sys_close(fd_r)
+    sys_close(stdout_pipe[1])
+
+    # Loop on sys_read until EOF — pipes return as soon as ANY data is
+    # available, not when the writer is done.  Without the loop a fast
+    # parent read returns the first chunk only and we lose the rest of
+    # the child's output (was the source of the test_grep_basic_match
+    # flake — read returned 5 bytes of "apple\\napricot\\n" because grep
+    # wrote the second match between two reads).
+    var total: i64 = 0
+    while total < 1024
+        let r: i64 = sys_read(stdout_pipe[0], out_buf + total, 1024 - total)
+        if r <= 0
+            break
+        total += r
+    sys_close(stdout_pipe[0])
+    *out_len = total
+
+    var status: i32 = 0
+    sys_wait4(pid, @status, 0, null)
+    sys_unlink(@path_buf[0])
+    # WEXITSTATUS — high byte of status (POSIX spec)
+    return (status >> 8) & 0xFF
+
+[[test]]
+fn test_uniq_default_dedupe_adjacent() -> i32
+    # `printf 'a\na\nb\nb\nb\nc\n' | ./uniq` → "a\nb\nc\n"
+    var out: [1024]u8
+    var n: i64 = 0
+    let exit_code: i32 = uniq_exec(null, c"a\na\nb\nb\nb\nc\n", 12, @out[0], @n)
+    assert exit_code == 0, c"exit code should be 0"
+    assert n == 6, c"expected 6 bytes"
+    assert buf_eq(@out[0], c"a\nb\nc\n", 6) == 1, c"default dedupe failed"
+    0
+
+[[test]]
+fn test_uniq_dash_d_only_dupes() -> i32
+    # `./uniq -d` → "a\nb\n" (only lines that appear more than once)
+    var out: [1024]u8
+    var n: i64 = 0
+    let exit_code: i32 = uniq_exec(c"-d", c"a\na\nb\nb\nb\nc\n", 12, @out[0], @n)
+    assert exit_code == 0, c"exit code should be 0"
+    assert n == 4, c"expected 4 bytes"
+    assert buf_eq(@out[0], c"a\nb\n", 4) == 1, c"-d should emit only repeated lines"
+    0
+
+[[test]]
+fn test_uniq_dash_u_only_uniques() -> i32
+    # `./uniq -u` → "c\n" (only lines appearing exactly once)
+    var out: [1024]u8
+    var n: i64 = 0
+    let exit_code: i32 = uniq_exec(c"-u", c"a\na\nb\nb\nb\nc\n", 12, @out[0], @n)
+    assert exit_code == 0, c"exit code should be 0"
+    assert n == 2, c"expected 2 bytes (c\\n)"
+    assert buf_eq(@out[0], c"c\n", 2) == 1, c"-u should emit only unique lines"
+    0
+
+[[test]]
+fn test_uniq_empty_input() -> i32
+    var out: [1024]u8
+    var n: i64 = 0
+    let exit_code: i32 = uniq_exec(null, c"", 0, @out[0], @n)
+    assert exit_code == 0, c"exit code should be 0"
+    assert n == 0, c"empty in → empty out"
+    0
+
+[[test]]
+fn test_uniq_all_identical_collapses() -> i32
+    var out: [1024]u8
+    var n: i64 = 0
+    let exit_code: i32 = uniq_exec(null, c"x\nx\nx\nx\n", 8, @out[0], @n)
+    assert exit_code == 0, c"exit code should be 0"
+    assert n == 2, c"expected 2 bytes (x\\n)"
+    assert buf_eq(@out[0], c"x\n", 2) == 1, c"4 identical → 1 line"
+    0

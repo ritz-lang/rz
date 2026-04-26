@@ -1,0 +1,171 @@
+# Tests for 19_base64 - RFC 4648 base64 encoding
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+
+fn buf_eq(a: *u8, b: *u8, len: i64) -> i32
+    var i: i64 = 0
+    while i < len
+        if *(a + i) != *(b + i)
+            return 0
+        i += 1
+    return 1
+
+# Run ./base64 with given argv and stdin content; return exit code.
+# Captures the first 1024 bytes of stdout into out_buf and writes the
+# byte count to *out_len.  argv must be null-terminated.
+#
+# Implementation note: stdin is delivered via a temp file (not a pipe).
+# An earlier pipe-based approach was flaky (~20% failure rate) — even
+# pre-buffering before fork didn't fully fix it under ritz0 --test's
+# in-process test harness.  Temp files are race-free: write all data,
+# close, then fork+dup2 the read fd into the child's stdin.  The child
+# sees a regular file with full contents and EOF at end.
+fn base64_exec(stdin_content: *u8, stdin_len: i64, out_buf: *u8, out_len: *i64) -> i32
+    # Build a unique temp path with the parent's pid as suffix.
+    var path_buf: [64]u8
+    let path_prefix: *u8 = c"/tmp/ritz_base64_stdin_"
+    var i: i64 = 0
+    while *(path_prefix + i) != 0
+        path_buf[i] = *(path_prefix + i)
+        i += 1
+    # Append pid in decimal
+    let pid_self: i32 = sys_getpid()
+    var n_self: i32 = pid_self
+    var d_buf: [16]u8
+    var d_len: i32 = 0
+    if n_self == 0
+        d_buf[0] = '0'
+        d_len = 1
+    else
+        while n_self > 0
+            d_buf[d_len] = ((n_self % 10) + 48) as u8
+            n_self = n_self / 10
+            d_len += 1
+        # Reverse digits into path_buf
+        var j: i32 = 0
+        while j < d_len
+            path_buf[i + j] = d_buf[d_len - 1 - j]
+            j += 1
+        i += d_len
+    path_buf[i] = 0
+
+    # Write stdin content to temp file.
+    let fd_w: i32 = sys_open3(@path_buf[0], O_WRONLY + O_CREAT + O_TRUNC, 384)  # 0o600
+    if fd_w < 0
+        return -1
+    if stdin_len > 0
+        sys_write(fd_w, stdin_content, stdin_len)
+    sys_close(fd_w)
+
+    # Open temp file for reading (will become child's stdin).
+    let fd_r: i32 = sys_open(@path_buf[0], O_RDONLY)
+    if fd_r < 0
+        sys_unlink(@path_buf[0])
+        return -2
+
+    # Pipe for capturing stdout.
+    var stdout_pipe: [2]i32
+    if sys_pipe(@stdout_pipe[0]) < 0
+        sys_close(fd_r)
+        sys_unlink(@path_buf[0])
+        return -3
+
+    let pid: i32 = sys_fork()
+    if pid < 0
+        sys_close(fd_r)
+        sys_close(stdout_pipe[0])
+        sys_close(stdout_pipe[1])
+        sys_unlink(@path_buf[0])
+        return -4
+
+    if pid == 0
+        sys_dup2(fd_r, 0)
+        sys_dup2(stdout_pipe[1], 1)
+        sys_close(fd_r)
+        sys_close(stdout_pipe[0])
+        sys_close(stdout_pipe[1])
+        var argv: [2]*u8
+        argv[0] = c"./base64"
+        argv[1] = null
+        sys_execve(c"./base64", @argv[0], null)
+        sys_exit(127)
+
+    sys_close(fd_r)
+    sys_close(stdout_pipe[1])
+
+    # Loop on sys_read until EOF — pipes return as soon as ANY data is
+    # available, not when the writer is done.  Without the loop a fast
+    # parent read returns the first chunk only and we lose the rest of
+    # the child's output (was the source of the test_grep_basic_match
+    # flake — read returned 5 bytes of "apple\napricot\n" because grep
+    # wrote the second match between two reads).
+    var total: i64 = 0
+    while total < 1024
+        let r: i64 = sys_read(stdout_pipe[0], out_buf + total, 1024 - total)
+        if r <= 0
+            break
+        total += r
+    sys_close(stdout_pipe[0])
+    *out_len = total
+
+    var status: i32 = 0
+    sys_wait4(pid, @status, 0, null)
+    sys_unlink(@path_buf[0])
+    # WEXITSTATUS — high byte of status (POSIX spec)
+    return (status >> 8) & 0xFF
+
+[[test]]
+fn test_base64_encode_hello() -> i32
+    # `printf 'hello\n' | ./base64` → "aGVsbG8K\n" (or similar — may not have \n)
+    # Classic test vector. We assert prefix match against "aGVsbG8K".
+    var out: [1024]u8
+    var n: i64 = 0
+    let exit_code: i32 = base64_exec(c"hello\n", 6, @out[0], @n)
+    assert exit_code == 0, c"exit code should be 0"
+    assert n >= 8, c"expected at least 8 bytes (aGVsbG8K)"
+    assert buf_eq(@out[0], c"aGVsbG8K", 8) == 1, c"base64 hello mismatch"
+    0
+
+[[test]]
+fn test_base64_encode_empty() -> i32
+    var out: [1024]u8
+    var n: i64 = 0
+    let exit_code: i32 = base64_exec(c"", 0, @out[0], @n)
+    assert exit_code == 0, c"exit code should be 0"
+    assert n == 0, c"empty in → empty out"
+    0
+
+[[test]]
+fn test_base64_encode_one_byte() -> i32
+    # 'A' (1 byte) → "QQ==" (with double-pad)
+    var out: [1024]u8
+    var n: i64 = 0
+    let exit_code: i32 = base64_exec(c"A", 1, @out[0], @n)
+    assert exit_code == 0, c"exit code should be 0"
+    assert n >= 4, c"expected at least 4 bytes (QQ==)"
+    assert buf_eq(@out[0], c"QQ==", 4) == 1, c"single-byte encoding failed"
+    0
+
+[[test]]
+fn test_base64_encode_two_bytes() -> i32
+    # 'AB' → "QUI=" (single-pad boundary)
+    var out: [1024]u8
+    var n: i64 = 0
+    let exit_code: i32 = base64_exec(c"AB", 2, @out[0], @n)
+    assert exit_code == 0, c"exit code should be 0"
+    assert n >= 4, c"expected at least 4 bytes (QUI=)"
+    assert buf_eq(@out[0], c"QUI=", 4) == 1, c"two-byte encoding failed"
+    0
+
+[[test]]
+fn test_base64_encode_three_bytes() -> i32
+    # 'ABC' → "QUJD" (no padding needed)
+    var out: [1024]u8
+    var n: i64 = 0
+    let exit_code: i32 = base64_exec(c"ABC", 3, @out[0], @n)
+    assert exit_code == 0, c"exit code should be 0"
+    assert n >= 4, c"expected at least 4 bytes"
+    assert buf_eq(@out[0], c"QUJD", 4) == 1, c"three-byte encoding failed"
+    0
