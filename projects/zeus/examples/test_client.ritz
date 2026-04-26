@@ -1,0 +1,291 @@
+# examples/test_client.ritz - Reference client for Zeus daemon
+#
+# A minimal client that proves the request/response shm-ring path works:
+#
+#   1. Connect to zeus daemon over Unix socket
+#   2. Handshake (HELLO → WELCOME)
+#   3. Receive WORKER_INFO + shm fd via SCM_RIGHTS, mmap the region
+#   4. Write a path string into the data arena
+#   5. Build a GET RequestSlot, submit it
+#   6. Poll for the response, print status + body
+#
+# This is the harness valet's `--zeus-socket` mode will eventually use, and
+# the integration test future devs need to verify zeus workers from the
+# outside without spinning up valet.
+#
+# Usage:
+#
+#   $ zeus -f -v -w 1 -m 65536 -s /tmp/zeus.sock ./nexus &
+#   $ test_client /tmp/zeus.sock /wiki/welcome
+#   GET /wiki/welcome → 200 OK
+#   <html body...>
+
+import ritzlib.sys
+import ritzlib.io
+
+import zeus.zeus_client {
+    ZeusClient,
+    ZeusClientConfig,
+    zeus_client_config_default,
+    zeus_client_init,
+    zeus_client_destroy,
+    zeus_client_connect,
+    zeus_client_handshake,
+    zeus_client_recv_worker,
+    zeus_client_get_worker,
+    zeus_client_select_worker,
+    zeus_client_next_request_id,
+    zeus_client_submit_request,
+    zeus_client_poll_response,
+    worker_handle_get_arena
+}
+import zeus.zeus_client { WorkerHandle }
+import zeus.ring {
+    RequestSlot,
+    ResponseSlot,
+    request_slot_init,
+    response_slot_init,
+    HTTP_METHOD_GET,
+    REQ_FLAG_COMPLETE,
+    RESP_FLAG_COMPLETE
+}
+import zeus.arena {
+    DataArena,
+    data_arena_alloc,
+    data_arena_ptr_to_offset,
+    data_arena_offset_to_ptr
+}
+
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+fn cstr_len(s: *u8) -> i32
+    var len: i32 = 0
+    while *(s + len) != 0
+        len += 1
+    return len
+
+
+# Sleep for `ms` milliseconds.
+fn sleep_ms(ms: i64)
+    var ts: [2]i64
+    ts[0] = ms / 1000
+    ts[1] = (ms % 1000) * 1000000
+    sys_nanosleep(@ts[0], null)
+
+
+# Print an arena slice safely (bounded by `len`, no NUL assumption).
+fn print_bytes(buf: *u8, len: i32)
+    sys_write(1, buf, len as i64)
+
+
+# Print a u16 status code.
+fn print_status(status: u16)
+    var s: [8]u8
+    var n: i32 = 0
+    var v: u16 = status
+    if v == 0
+        s[0] = '0'
+        n = 1
+    else
+        var tmp: [8]u8
+        var ti: i32 = 0
+        while v > 0
+            tmp[ti] = ((v % 10) as u8) + 48
+            v = v / 10
+            ti += 1
+        while ti > 0
+            ti -= 1
+            s[n] = tmp[ti]
+            n += 1
+    sys_write(1, @s[0], n as i64)
+
+
+# ============================================================================
+# Main
+# ============================================================================
+
+pub fn main(argc: i32, argv: **u8) -> i32
+    if argc < 3
+        prints_cstr(c"Usage: test_client <socket-path> <request-path>\n")
+        prints_cstr(c"Example: test_client /tmp/zeus.sock /wiki/welcome\n")
+        return 1
+
+    let socket_path: *u8 = *(argv + 1)
+    let req_path: *u8 = *(argv + 2)
+    let req_path_len: i32 = cstr_len(req_path)
+
+    # ------------------------------------------------------------------
+    # 1. Initialize client
+    # ------------------------------------------------------------------
+    var cfg: ZeusClientConfig
+    zeus_client_config_default(@cfg)
+
+    var client: ZeusClient
+    let init_rc: i32 = zeus_client_init(@client, @cfg)
+    if init_rc != 0
+        prints_cstr(c"FAIL: zeus_client_init returned ")
+        print_int(init_rc as i64)
+        prints("\n")
+        return 1
+
+    # ------------------------------------------------------------------
+    # 2. Connect + handshake
+    # ------------------------------------------------------------------
+    let connect_rc: i32 = zeus_client_connect(@client, socket_path)
+    if connect_rc != 0
+        prints_cstr(c"FAIL: zeus_client_connect returned ")
+        print_int(connect_rc as i64)
+        prints("\n  socket: ")
+        prints_cstr(socket_path)
+        prints("\n")
+        zeus_client_destroy(@client)
+        return 1
+
+    let hs_rc: i32 = zeus_client_handshake(@client)
+    if hs_rc < 0
+        prints_cstr(c"FAIL: zeus_client_handshake returned ")
+        print_int(hs_rc as i64)
+        prints("\n")
+        zeus_client_destroy(@client)
+        return 1
+
+    prints("connected; received ")
+    print_int(hs_rc as i64)
+    prints(" worker(s) in welcome\n")
+
+    # ------------------------------------------------------------------
+    # 3. Receive worker(s) — handshake says how many to expect
+    # ------------------------------------------------------------------
+    var workers_attached: i32 = 0
+    while workers_attached < hs_rc
+        let widx: i32 = zeus_client_recv_worker(@client)
+        if widx < 0
+            prints_cstr(c"FAIL: zeus_client_recv_worker returned ")
+            print_int(widx as i64)
+            prints("\n")
+            zeus_client_destroy(@client)
+            return 1
+        workers_attached += 1
+
+    prints("attached ")
+    print_int(workers_attached as i64)
+    prints(" worker(s) via SCM_RIGHTS\n")
+
+    # ------------------------------------------------------------------
+    # 4. Pick a worker, get its arena, write the path
+    # ------------------------------------------------------------------
+    let worker_idx: i32 = zeus_client_select_worker(@client)
+    if worker_idx < 0
+        prints_cstr(c"FAIL: no worker available for dispatch\n")
+        zeus_client_destroy(@client)
+        return 1
+
+    let handle: *WorkerHandle = zeus_client_get_worker(@client, worker_idx)
+    if handle == null
+        prints_cstr(c"FAIL: zeus_client_get_worker returned null\n")
+        zeus_client_destroy(@client)
+        return 1
+
+    var arena: DataArena
+    worker_handle_get_arena(handle, @arena)
+    if arena.base == null
+        prints_cstr(c"FAIL: worker arena base is null\n")
+        zeus_client_destroy(@client)
+        return 1
+
+    # Allocate path bytes in arena and copy.
+    let path_dst: *u8 = data_arena_alloc(@arena, req_path_len as i64)
+    if path_dst == null
+        prints_cstr(c"FAIL: arena alloc for path returned null\n")
+        zeus_client_destroy(@client)
+        return 1
+    for i in 0..req_path_len
+        *(path_dst + i) = *(req_path + i)
+
+    let path_offset: i64 = data_arena_ptr_to_offset(@arena, path_dst)
+
+    # ------------------------------------------------------------------
+    # 5. Build + submit the request
+    # ------------------------------------------------------------------
+    var req: RequestSlot
+    request_slot_init(@req)
+    req.id = zeus_client_next_request_id(@client)
+    req.method = HTTP_METHOD_GET
+    req.flags = REQ_FLAG_COMPLETE
+    req.path_offset = path_offset as u32
+    req.path_len = req_path_len as u16
+
+    let submit_rc: i32 = zeus_client_submit_request(@client, worker_idx, @req)
+    if submit_rc != 0
+        prints_cstr(c"FAIL: zeus_client_submit_request returned ")
+        print_int(submit_rc as i64)
+        prints("\n")
+        zeus_client_destroy(@client)
+        return 1
+
+    prints("submitted GET ")
+    prints_cstr(req_path)
+    prints(" (id=")
+    print_int(req.id as i64)
+    prints(")\n")
+
+    # ------------------------------------------------------------------
+    # 6. Poll for response (up to 2s)
+    # ------------------------------------------------------------------
+    var resp: ResponseSlot
+    response_slot_init(@resp)
+    var got_worker_idx: i32 = -1
+    var attempts: i32 = 0
+    var poll_rc: i32 = -1
+
+    # 200 attempts × 10ms = 2s ceiling
+    while attempts < 200
+        poll_rc = zeus_client_poll_response(@client, @resp, @got_worker_idx)
+        if poll_rc == 0
+            break
+        sleep_ms(10)
+        attempts += 1
+
+    if poll_rc != 0
+        prints_cstr(c"FAIL: timed out waiting for response after 2s\n")
+        zeus_client_destroy(@client)
+        return 1
+
+    if resp.id != req.id
+        prints_cstr(c"WARN: response id ")
+        print_int(resp.id as i64)
+        prints(" != request id ")
+        print_int(req.id as i64)
+        prints("\n")
+
+    # ------------------------------------------------------------------
+    # 7. Render the response
+    # ------------------------------------------------------------------
+    prints("response: status=")
+    print_status(resp.status)
+    prints(" body_len=")
+    print_int(resp.body_len as i64)
+    prints(" headers_len=")
+    print_int(resp.headers_len as i64)
+    prints("\n")
+
+    if resp.body_len > 0
+        # Re-derive arena (offset reset is intentional — base is what we want).
+        var arena2: DataArena
+        worker_handle_get_arena(handle, @arena2)
+        let body_ptr: *u8 = data_arena_offset_to_ptr(@arena2, resp.body_offset as i64)
+        prints("--- body ---\n")
+        print_bytes(body_ptr, resp.body_len as i32)
+        prints("\n--- end ---\n")
+
+    # ------------------------------------------------------------------
+    # 8. Cleanup
+    # ------------------------------------------------------------------
+    zeus_client_destroy(@client)
+
+    if resp.status >= 200 and resp.status < 400
+        return 0
+    return 1
