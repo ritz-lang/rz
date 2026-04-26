@@ -916,7 +916,8 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
         # Link: runtime.o + all .bc/.ll files -> binary
         # Build link command with profile-specific options
         # -march=native enables CPU-specific features (SHA-NI, AES-NI, etc.) for code generation
-        link_cmd = linker_cmd + [str(runtime_obj)] + [str(f) for f in link_files] + ["-o", str(bin_path), "-nostdlib", "-march=native"]
+        # -msha matches the per-object compile flag (see clang_cmd above)
+        link_cmd = linker_cmd + [str(runtime_obj)] + [str(f) for f in link_files] + ["-o", str(bin_path), "-nostdlib", "-march=native", "-msha"]
 
         # Add optimization level
         opt_level = profile.get("opt_level", 0)
@@ -1116,6 +1117,13 @@ def compile_freestanding_binary(
                     "clang", "-c",
                     f"--target={target}",
                     "-march=native",  # Enable CPU-specific features (SHA-NI, AES-NI, etc.)
+                    "-msha",  # Force SHA extensions: cryptosec emits SHA intrinsics
+                              # in dead SHA-NI dispatch path; runtime detection
+                              # ensures they only execute on capable CPUs. Without
+                              # this, clang refuses to lower llvm.x86.sha256rnds2
+                              # on hosts where -march=native doesn't include +sha
+                              # (e.g. pre-Skylake). The disabled paths still need
+                              # to compile.
                 ]
                 # Add PIC flag if explicitly requested or for Linux targets
                 if pic or target.endswith("-linux"):
