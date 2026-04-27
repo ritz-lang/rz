@@ -28,6 +28,13 @@ import mausoleum.page
 import mausoleum.buffer_pool
 import mausoleum.storage
 import mausoleum.collection
+import mausoleum.btree {
+    btree_iter_valid,
+    btree_iter_next,
+    btree_iter_key,
+    btree_iter_value,
+    btree_iter_destroy
+}
 import mausoleum.document
 import mausoleum.server
 import mausoleum.client
@@ -667,30 +674,149 @@ fn handle_delete(reader: *MessageReader, resp: *MessageBuffer, request_id: i32, 
     build_delete_ok(resp, request_id)
 
 # Handle SCAN message - returns all documents in the collection
-# TODO: Implement collection scan iteration
-# For now, returns empty result and immediately sends SCAN_END
+# Handle MSG_SCAN by iterating every document in `collection` and
+# streaming SCAN_RESULT batches to the client, terminated by a single
+# SCAN_END (placed in `resp` so the main serve loop sends it last).
+#
+# Per-batch wire format (matches client_scan in lib/client.ritz):
+#   [4]  doc_count       (big-endian)
+#   [4]  has_more        (big-endian, 1 = more SCAN_RESULTs to follow)
+#   For each doc:
+#       [8]  doc_id
+#       [4]  data_len
+#       [data_len] serialized document bytes
+#
+# We keep `doc_count` + `has_more` as PLACEHOLDERS at the front of the
+# batch (written via the regular big-endian `msgbuf_write_i32`), then
+# back-patch them with hand-rolled big-endian byte stores once the batch
+# is closed.  Native i32 stores would silently corrupt the message on
+# little-endian hosts (the bug that bit me last attempt).
 fn handle_scan(reader: *MessageReader, resp: *MessageBuffer, request_id: i32, collection: *Collection, fd: i32)
     # Read max_results (0 = all)
     let max_results: i32 = msgreader_read_i32(reader)
 
     prints("  SCAN max_results=")
     print_i32(max_results)
-    prints(" (not implemented - returning empty)\n")
+    prints("\n")
 
-    # Build SCAN_RESULT with 0 documents
-    var scan_buf: [256]u8
+    # 32 KiB scratch fits ~16 docs at the 2 KiB MAX_DOC_SIZE ceiling —
+    # well above the typical wiki seed.  We flush early on byte-budget
+    # too so the buffer can never overflow.
+    var scan_buf: [32768]u8
     var scan_resp: MessageBuffer
-    msgbuf_init(@scan_resp, @scan_buf[0], 256)
 
-    msgbuf_start(@scan_resp, MSG_SCAN_RESULT, request_id)
-    msgbuf_write_i32(@scan_resp, 0)  # doc_count = 0
-    msgbuf_write_i32(@scan_resp, 0)  # has_more = 0
-    msgbuf_finish(@scan_resp)
+    let iter_opt = collection_scan(collection)
+    if option_is_none<*BTreeIter>(@iter_opt) == 1
+        # Empty / unopenable: emit one zero-doc SCAN_RESULT then SCAN_END.
+        msgbuf_init(@scan_resp, @scan_buf[0], 32768)
+        msgbuf_start(@scan_resp, MSG_SCAN_RESULT, request_id)
+        msgbuf_write_i32(@scan_resp, 0)
+        msgbuf_write_i32(@scan_resp, 0)
+        msgbuf_finish(@scan_resp)
+        sys_write(fd, msgbuf_data(@scan_resp), msgbuf_len(@scan_resp) as i64)
+        build_scan_end(resp, request_id)
+        return
 
-    let scan_len: i32 = msgbuf_len(@scan_resp)
-    sys_write(fd, msgbuf_data(@scan_resp), scan_len as i64)
+    let iter: *BTreeIter = option_unwrap_or<*BTreeIter>(@iter_opt, null)
+    if iter == null
+        msgbuf_init(@scan_resp, @scan_buf[0], 32768)
+        msgbuf_start(@scan_resp, MSG_SCAN_RESULT, request_id)
+        msgbuf_write_i32(@scan_resp, 0)
+        msgbuf_write_i32(@scan_resp, 0)
+        msgbuf_finish(@scan_resp)
+        sys_write(fd, msgbuf_data(@scan_resp), msgbuf_len(@scan_resp) as i64)
+        build_scan_end(resp, request_id)
+        return
 
-    # Send SCAN_END
+    var total_emitted: i32 = 0
+    var done: i32 = 0
+    let batch_target: i32 = 16          # max docs per SCAN_RESULT batch
+    let batch_byte_budget: i32 = 30000  # leave 2 KiB headroom in 32 KiB
+
+    while done == 0
+        msgbuf_init(@scan_resp, @scan_buf[0], 32768)
+        msgbuf_start(@scan_resp, MSG_SCAN_RESULT, request_id)
+
+        # Reserve doc_count and has_more (4 bytes each).  Capture their
+        # absolute offsets in the buffer so we can back-patch in
+        # big-endian once the batch is sealed.
+        let count_offset: i32 = msgbuf_len(@scan_resp)
+        msgbuf_write_i32(@scan_resp, 0)  # placeholder
+        let more_offset: i32 = msgbuf_len(@scan_resp)
+        msgbuf_write_i32(@scan_resp, 0)  # placeholder
+
+        var batch_count: i32 = 0
+        var key_buf: [16]u8
+        var val_buf: [2048]u8
+
+        while batch_count < batch_target
+            if btree_iter_valid(iter) == 0
+                done = 1
+                break
+
+            if max_results > 0 and total_emitted >= max_results
+                done = 1
+                break
+
+            var key_len: i32 = 0
+            btree_iter_key(iter, @key_buf[0], @key_len)
+
+            var val_len: i32 = 0
+            btree_iter_value(iter, @val_buf[0], @val_len)
+
+            # Stop early if appending this doc would overflow the buffer
+            let doc_overhead: i32 = 8 + 4   # doc_id + length prefix
+            let projected: i32 = msgbuf_len(@scan_resp) + doc_overhead + val_len
+            if projected > batch_byte_budget and batch_count > 0
+                break
+
+            # First 8 bytes of the key encode the i64 DocumentId
+            let id_ptr: *i64 = @key_buf[0] as *i64
+            let doc_id: i64 = *id_ptr
+
+            msgbuf_write_i64(@scan_resp, doc_id)
+            msgbuf_write_bytes(@scan_resp, @val_buf[0], val_len)
+
+            batch_count += 1
+            total_emitted += 1
+
+            btree_iter_next(iter)
+
+        # Back-patch doc_count and has_more in BIG-ENDIAN.  A native
+        # 4-byte store would write little-endian on x86_64 and the
+        # client's msgreader_read_i32 (which is BE) would mis-parse.
+        let buf_base: *u8 = msgbuf_data(@scan_resp)
+        let count_ptr: *u8 = buf_base + count_offset
+        *(count_ptr + 0) = ((batch_count >> 24) & 0xFF) as u8
+        *(count_ptr + 1) = ((batch_count >> 16) & 0xFF) as u8
+        *(count_ptr + 2) = ((batch_count >> 8) & 0xFF) as u8
+        *(count_ptr + 3) = (batch_count & 0xFF) as u8
+
+        var has_more_val: i32 = 1
+        if done != 0
+            has_more_val = 0
+        let more_ptr: *u8 = buf_base + more_offset
+        *(more_ptr + 0) = ((has_more_val >> 24) & 0xFF) as u8
+        *(more_ptr + 1) = ((has_more_val >> 16) & 0xFF) as u8
+        *(more_ptr + 2) = ((has_more_val >> 8) & 0xFF) as u8
+        *(more_ptr + 3) = (has_more_val & 0xFF) as u8
+
+        msgbuf_finish(@scan_resp)
+        sys_write(fd, msgbuf_data(@scan_resp), msgbuf_len(@scan_resp) as i64)
+
+        # Defense: if we somehow emitted zero rows in this batch (iter
+        # exhausted at start), bail to avoid spinning on empty batches.
+        if batch_count == 0
+            done = 1
+
+    btree_iter_destroy(iter)
+
+    prints("  SCAN emitted ")
+    print_i32(total_emitted)
+    prints(" doc(s)\n")
+
+    # Trailing SCAN_END goes into the caller's resp buffer; serve loop
+    # sends it after handle_scan returns.
     build_scan_end(resp, request_id)
 
 # ============================================================================
