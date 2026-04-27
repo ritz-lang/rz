@@ -721,6 +721,52 @@ pub fn store_get(s: *Store, key: *StrView) -> *u8
 
     return null
 
+# Like `store_get` but returns the value as a `StrView` (ptr + len).
+# Necessary for binary-safe values where the caller needs to know the
+# length without scanning for a NUL terminator.  Returns an empty
+# StrView (ptr=null, len=0) on miss / expired / non-string value.
+# Triggers lazy expiration like `store_get`.
+pub fn store_get_strview(s: *Store, key: *StrView) -> StrView
+    let h: u64 = hash_strview(key)
+    let mask: i64 = s.cap - 1
+    var idx: i64 = (h as i64) & mask
+    let now: i64 = time_now_secs()
+
+    var i: i64 = 0
+    while i < s.cap
+        let entry: *Entry = s.entries + idx
+
+        if entry.state == 0  # EMPTY - not found
+            return strview_from_ptr(null, 0)
+
+        if entry.state == 1  # OCCUPIED
+            if string_eq_strview(@entry.key, key) == 1
+                # Check expiration (lazy expiration)
+                if entry.expires_at > 0
+                    if now >= entry.expires_at
+                        let mem: i64 = entry_memory(entry)
+                        string_drop(@entry.key)
+                        if entry.value_type == VALUE_STRING
+                            string_drop(@entry.value)
+                        entry.state = 2  # TOMBSTONE
+                        entry.value_type = VALUE_NONE
+                        s.len -= 1
+                        s.tombstones += 1
+                        s.used_memory -= mem
+                        return strview_from_ptr(null, 0)
+
+                # Update access time for LRU
+                entry.last_access = now
+
+                if entry.value_type == VALUE_STRING
+                    return strview_from_ptr(string_as_ptr(@entry.value), string_len(@entry.value))
+                return strview_from_ptr(null, 0)
+
+        idx = (idx + 1) & mask
+        i += 1
+
+    return strview_from_ptr(null, 0)
+
 # Check if a key exists (not expired).
 # NOTE: This is a const operation - does not trigger lazy expiration.
 # Use store_get() if you want expired keys to be cleaned up.
