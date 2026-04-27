@@ -131,7 +131,7 @@ to the existing path if anything breaks.
 | 2 | M7SP framing: parse header, accumulate body into per-task buffer, dispatch by msg_type | 3-4 h | wiki-seed CLI works against `--async` mausoleum |
 | 3 | All message handlers wired (CONNECT, PING, INSERT, GET, UPDATE, DELETE, TXN_*, SCAN) | 2-3 h | nexus pass 1 (seed) works against `--async` |
 | 4 | SCAN multi-message response — emit one `SCAN_RESULT` per task event, track iter state in session | 2-3 h | nexus pass 2 (rebuild from existing 3 docs) works |
-| 5 | Concurrent client correctness — two clients hammering simultaneously without blocking each other | 1-2 h | parallel wiki-seed × 2 against same DB succeeds |
+| 5 | Concurrent client correctness — two clients hammering simultaneously without blocking each other | 1-2 h | parallel wiki-seed × 2 against same DB succeeds — **DONE**: `tools/concurrent_test.sh` (14/14 assertions); fixed two latent bugs unmasked by phase-5 stress (see Notes). |
 | 6 | Encryption variant (`serve_loop_encrypted` → `serve_async_encrypted`) | 4-6 h | TLS path works |
 | 7 | Make async the default; keep `--serial` as escape hatch for bisecting | 30 min | benchmark shows it's at least as fast |
 
@@ -149,6 +149,42 @@ on top — flip the default once we trust the new path.
 - **Phase 6**: `mausoleum shell` (which uses encryption) against
   `--async` mausoleum
 - All phases: `make matrix` 33/33
+
+## Phase 5 — Notes on bugs fixed
+
+Phase 5 stress-testing (parallel wiki-seed, slow-client isolation,
+concurrent SCAN starvation) surfaced two latent bugs that were
+invisible to phase 1-4 because none of those phases had two clients
+hitting the server in interleaved patterns under load.
+
+1. **`sys_io_uring_enter` was using `syscall4`** (`projects/ritz/
+   ritzlib/uring.ritz`).  The kernel's `io_uring_enter` actually takes
+   six args — `(fd, to_submit, min_complete, flags, argp, argsz)`.
+   With `syscall4`, registers `r8` and `r9` (argp / argsz) held
+   whatever the call site left there.  When the bytes happened to be
+   non-zero the kernel saw a "real" `argp` pointer, and because
+   `IORING_ENTER_EXT_ARG` wasn't set, it required `argsz ==
+   sizeof(sigset_t)` and rejected the call with `-EINVAL`.  Symptom:
+   the async serve loop crashed with `ret=-22` immediately after the
+   first client cleanly disconnected.  Fix: switch to `syscall6` and
+   pass explicit `argp=0, argsz=0`.
+
+2. **`client_scan` callback was cast as `*fn(...)`** instead of
+   `fn(...)` (`projects/mausoleum/lib/client.ritz`).  The emitter
+   compiled `(*cb)(...)` as "load eight bytes from the function's
+   entry point and call THAT pointer," which read raw machine code
+   and called into garbage.  For tiny scans (≤5 docs) the loaded
+   bytes occasionally landed somewhere survivable; longer scans were
+   guaranteed to crash.  Phase 4 hadn't seen it because it tested
+   SCAN through the nexus client (Ritz-side `client_scan` was
+   exercised here for the first time).  Fix: cast to `fn(...)` and
+   call `cb(...)` directly.
+
+After both fixes, `tools/concurrent_test.sh` reports 14/14 assertions:
+parallel seed succeeds, a silent `nc` client doesn't stall a
+concurrent wiki-seed (~7 ms wall), and 30 background SCAN iters
+(15,000 doc reads) interleave with 10 ping-loops with `max=10ms` —
+indistinguishable from the no-contention baseline.
 
 ## Risks
 
