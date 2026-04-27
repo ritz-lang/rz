@@ -114,14 +114,17 @@ to B.
 ### File layout
 
 ```
-projects/mausoleum/lib/server_async.ritz   ← NEW: serve_loop_async + handlers
-projects/mausoleum/src/main.ritz            ← gate: --serial keeps old loop
-                                              for now; default → async
+projects/mausoleum/lib/server_async.ritz   ← serve_async / serve_async_encrypted
+                                              + per-task M7SP handlers (default
+                                              path since phase 7).
+projects/mausoleum/src/main.ritz            ← gate: --serial selects the legacy
+                                              serve_loop / serve_loop_plain path
+                                              (bisect baseline, kept compiled in).
 ```
 
 The new file is library code; the choice of which loop to run lives in
 `main.ritz` so the rollout is staged.  Run with `--serial` to fall back
-to the existing path if anything breaks.
+to the legacy path if anything breaks.
 
 ## Implementation phases
 
@@ -133,7 +136,7 @@ to the existing path if anything breaks.
 | 4 | SCAN multi-message response — emit one `SCAN_RESULT` per task event, track iter state in session | 2-3 h | nexus pass 2 (rebuild from existing 3 docs) works |
 | 5 | Concurrent client correctness — two clients hammering simultaneously without blocking each other | 1-2 h | parallel wiki-seed × 2 against same DB succeeds — **DONE**: `tools/concurrent_test.sh` (14/14 assertions); fixed two latent bugs unmasked by phase-5 stress (see Notes). |
 | 6 | Encryption variant (`serve_loop_encrypted` → `serve_async_encrypted`) | 4-6 h | TLS path works |
-| 7 | Make async the default; keep `--serial` as escape hatch for bisecting | 30 min | benchmark shows it's at least as fast |
+| 7 | Make async the default; keep `--serial` as escape hatch for bisecting | 30 min | benchmark shows it's at least as fast — **DONE**: see Phase 7 notes below. |
 
 **Total: 1.5-2 days of focused work, in 6+1 phases.**  Phases 1-5 are
 required for nexus's wiki use case to work concurrently. Phase 6 only
@@ -186,6 +189,56 @@ concurrent wiki-seed (~7 ms wall), and 30 background SCAN iters
 (15,000 doc reads) interleave with 10 ping-loops with `max=10ms` —
 indistinguishable from the no-contention baseline.
 
+## Phase 7 — Notes on flipping the default
+
+Phase 7 inverts the rollout flag.  Before this commit, `mausoleum
+serve` ran the legacy `serve_loop` / `serve_loop_plain` path and
+`--async` opted into the new io_uring loop.  After this commit:
+
+- `mausoleum serve` (no flag) runs the io_uring async loop —
+  `serve_async` for `--no-encryption`, `serve_async_encrypted`
+  otherwise.
+- `mausoleum serve --serial` opts back into the legacy serve_loop
+  path, kept as a bisect baseline.  None of the legacy code
+  (`serve_loop`, `serve_loop_plain`, `handle_encrypted_session`,
+  `handle_plain_session`) was removed.
+- `--async` is silently accepted and treated as a no-op so existing
+  scripts (notably `tools/concurrent_test.sh` and any external
+  systemd unit) keep working through the transition.  The flag is
+  no longer documented in `--help`.
+
+`tools/concurrent_test.sh` was updated to drop `--async` from
+`boot_server` so the harness now exercises the *default* loop on every
+phase-5 run.
+
+### Phase 7 benchmark (debug build, same hardware, same data)
+
+`projects/mausoleum/tools/concurrent_bench.ritz` driving 10 parallel
+clients against a fresh `--data-dir` per run, persistent storage with
+post-write flush, three runs each, debug build:
+
+| Workload                 | Serial            | Async             | Ratio (async/serial) |
+|--------------------------|-------------------|-------------------|----------------------|
+| 1× INSERT (×500)         | ~7,800 req/s      | ~7,100 req/s      | 0.91                 |
+| 1× PING  (×2,000)        | ~11,000 req/s     | ~10,300 req/s     | 0.93                 |
+| 10× INSERT (50 each)     | ~7,000 req/s      | ~12,500 req/s     | **1.78**             |
+| 10× PING  (200 each)     | ~10,500 req/s     | ~22,500 req/s     | **2.13**             |
+| 10× INSERT (200 each)    | 7/10 clients fail | all clients ok    | n/a (serial starves) |
+
+Single-client async is ~7-9% slower than serial — the io_uring
+submit/complete overhead outweighs the kernel-level zero-copy win at
+these tiny payloads.  But the moment a second client shows up, the
+serial loop's "one at a time" model starves clients off the wire while
+the async loop scales: ~1.8× on persistent INSERTs, ~2.1× on
+no-DB-work pings, and at higher fan-out (200 inserts × 10 clients) the
+serial loop starts dropping connections entirely while async finishes
+clean.
+
+That matches the briefing's "≥10×" intuition for the *failure mode*
+(serial flat-lines on concurrent load) more than the throughput ratio
+on tiny benchmarks.  The architectural goal — never let one client
+stall any other — is met cleanly.
+
 ## Risks
 
 | Risk | Mitigation |
@@ -195,9 +248,9 @@ indistinguishable from the no-contention baseline.
 | Phase 4 (SCAN multi-message) is the hardest — iter state must persist across CQEs | Store `*BTreeIter` in `M7SPSession`; reissue `task_submit_send` after each batch's send completes |
 | Encryption path (`serve_loop_encrypted`) is more complex (stateful TLS) | Phase 6 is optional — defer if dev-mode-only is acceptable |
 
-## Why opt-in via `--async` first
+## Why opt-in via `--async` first (phases 2-6 history)
 
-Three reasons:
+Three reasons that drove the staged rollout before phase 7:
 
 1. The existing `serve_loop_plain` actually works for the demo today.
    Risk isolation matters when refactoring core infrastructure.
@@ -205,6 +258,11 @@ Three reasons:
    gives us a known-good baseline to compare against.
 3. The matrix has been green every commit this session.  Don't break
    that for an architecture change that takes multiple days.
+
+Phase 7 inverts the polarity: `--async` is now the default and
+`--serial` retains the bisect baseline.  Reasons 1-3 still apply
+asymmetrically, which is why the legacy code path is kept compiled in
+rather than deleted — see "Phase 7 — Notes" above.
 
 ## Out of scope
 

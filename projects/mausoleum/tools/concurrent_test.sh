@@ -66,13 +66,15 @@ wait_for_port() {
     return 1
 }
 
-# Boot a fresh --async mausoleum on $1, returns server PID via $SERVER_PID.
+# Boot a fresh mausoleum on $1 — async is the default loop since phase 7.
+# (Pre-phase-7 this script passed `--async`; that flag is now a no-op
+# preserved for back-compat with older harnesses.)
 boot_server() {
     local port="$1"
     local datadir="$2"
     rm -rf "$datadir"
     mkdir -p "$datadir"
-    "$MAUSOLEUM" serve --async --port "$port" --no-encryption --data-dir "$datadir" \
+    "$MAUSOLEUM" serve --port "$port" --no-encryption --data-dir "$datadir" \
         > "/tmp/m7sp_p5_${port}.log" 2>&1 &
     SERVER_PID=$!
     if ! wait_for_port "$port"; then
