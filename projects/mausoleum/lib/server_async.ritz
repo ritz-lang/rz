@@ -6,19 +6,18 @@
 # `Task` with a parallel `M7SPSession` carrying parser + handler state.
 # A single misbehaving client cannot block any other.
 #
-# Status (this commit): PHASE 3 — full single-message handlers wired
-# into Collection/Storage.
+# Status (this commit): PHASE 4 — SCAN multi-message wired.
 #   - CONNECT/PING/DISCONNECT
 #   - INSERT/GET/UPDATE/DELETE — real collection ops, post-write flush
 #     mirroring `handle_plain_session` in src/main.ritz
 #   - TXN_BEGIN/COMMIT/ABORT — real storage_*_txn calls in persistent
 #     mode, in-memory placeholder otherwise (matches serial path)
-#   - SCAN / SCAN_NEXT — explicit MSG_ERROR (phase 4 territory; choosing
-#     option (a) from the briefing for a clean baseline before adding
-#     multi-message responses)
-#
-# Phase 4 will replace the SCAN error stubs with multi-message
-# SCAN_RESULT batches driven from session state.
+#   - SCAN — opens a BTreeIter, emits one SCAN_RESULT per send completion
+#     (Option A from the design doc: ~7 KiB batches, no big-buffer alloc),
+#     then a trailing SCAN_END.  Iter state lives in M7SPSession and
+#     persists across CQEs.
+#   - SCAN_NEXT — protocol error; this server is push-driven (one batch
+#     per CQE off the in-flight iter), the client never sends SCAN_NEXT.
 
 import ritzlib.sys
 import ritzlib.io
@@ -45,6 +44,13 @@ import mausoleum.collection
 import mausoleum.document
 import mausoleum.buffer_pool
 import mausoleum.storage
+import mausoleum.btree {
+    btree_iter_valid,
+    btree_iter_next,
+    btree_iter_key,
+    btree_iter_value,
+    btree_iter_destroy
+}
 
 
 # ============================================================================
@@ -80,10 +86,17 @@ struct M7SPSession
     # but unread) so the struct layout is stable across phases.
     next_doc_id: i64
 
-    # SCAN-specific (phase 4): opaque iterator advanced one batch per
-    # send completion.  Currently unused.
-    scan_iter: i64             # 0 = no scan in progress
-    scan_request_id: i32       # request_id of the in-flight scan
+    # SCAN multi-message state (phase 4).  See "SCAN flow" comment above
+    # `m7sp_scan_build_batch` for the state machine.
+    #   scan_active: 0 = no scan in flight
+    #                1 = SCAN_RESULT batch in flight, more batches remain
+    #                2 = final SCAN_RESULT (has_more=0) in flight, SCAN_END is next
+    #                3 = SCAN_END in flight, reset to NEED_HEADER on completion
+    scan_active: i32
+    scan_iter: i64             # *BTreeIter cast through i64 (0 = none)
+    scan_request_id: i32       # request_id correlated with this scan
+    scan_max_results: i32      # max_results from MSG_SCAN payload (0 = all)
+    scan_total_emitted: i32    # docs emitted across all batches so far
 
     # Future (phase 4-B): heap-allocated big_send buffer for SCAN_RESULTs > 8 KiB
     big_send_ptr: i64          # 0 when unused
@@ -101,16 +114,24 @@ fn m7sp_session_init(idx: i32)
     g_sessions[idx].have = 0
     g_sessions[idx].active_txn = -1
     g_sessions[idx].next_doc_id = 1
+    g_sessions[idx].scan_active = 0
     g_sessions[idx].scan_iter = 0
     g_sessions[idx].scan_request_id = 0
+    g_sessions[idx].scan_max_results = 0
+    g_sessions[idx].scan_total_emitted = 0
     g_sessions[idx].big_send_ptr = 0
     g_sessions[idx].big_send_len = 0
     g_sessions[idx].big_send_pos = 0
 
 
 fn m7sp_session_destroy(idx: i32)
+    # Free any in-flight scan iterator (the connection may have died
+    # mid-scan; without this we'd leak the BTreeIter and pinned pages).
+    if g_sessions[idx].scan_iter != 0
+        btree_iter_destroy(g_sessions[idx].scan_iter as *BTreeIter)
+        g_sessions[idx].scan_iter = 0
+    g_sessions[idx].scan_active = 0
     g_sessions[idx].in_use = 0
-    # TODO phase 4: if scan_iter != 0, free it
     # TODO phase 4-B: if big_send_ptr != 0, munmap it
 
 
@@ -311,6 +332,133 @@ fn async_handle_delete(reader: *MessageReader, resp: *MessageBuffer, request_id:
 
 
 # ============================================================================
+# Phase 4 — SCAN multi-message support
+# ============================================================================
+#
+# SCAN flow (driven by `M7SPSession.scan_active`):
+#
+#   DISPATCHING (msg_type == MSG_SCAN)
+#     1. Open BTreeIter, store in session, capture max_results/request_id.
+#     2. Build first SCAN_RESULT batch into write_buf via
+#        `m7sp_scan_build_batch` (writes BE doc_count + has_more, then
+#        per-doc payload).
+#     3. If iter exhausted in that batch  → scan_active = 2 (next CQE: SCAN_END).
+#        Else                              → scan_active = 1 (next CQE: more batches).
+#     4. submit_send → PARSE_SENDING.
+#
+#   SENDING completes (scan_active != 0):
+#     scan_active == 1: build next batch, submit_send.  If that batch
+#       drained the iter, transition to scan_active = 2.
+#     scan_active == 2: build SCAN_END (small empty msg), submit_send,
+#       transition to scan_active = 3.
+#     scan_active == 3: destroy iter, scan_active = 0, fall through to
+#       the normal "send done — recv next" reset.
+#
+# Per the design doc, batches cap at ~7 KiB so a single SCAN_RESULT fits
+# inside `task.write_buf` (8 KiB).  Option B (heap-allocated big buffer)
+# is deferred.
+
+# Big-endian i32 store at a specific offset — used to back-patch
+# doc_count / has_more once we know the values for a batch.  Mirrors
+# `msgbuf_write_i32`'s on-wire encoding.  A native `*p = value` would
+# write little-endian on x86_64 and corrupt the protocol — explicit
+# byte stores are the only correct way here.
+fn put_i32_be(buf: *u8, offset: i32, value: i32)
+    let p: *u8 = buf + offset
+    *(p + 0) = ((value >> 24) & 0xFF) as u8
+    *(p + 1) = ((value >> 16) & 0xFF) as u8
+    *(p + 2) = ((value >> 8) & 0xFF) as u8
+    *(p + 3) = (value & 0xFF) as u8
+
+
+# Build one SCAN_RESULT batch into `resp`, advancing `session.scan_iter`
+# and bumping `session.scan_total_emitted`.
+#
+# Returns 1 if this batch is the last (iter exhausted, max_results hit,
+# or iter was null/invalid on entry) — caller should next emit SCAN_END.
+# Returns 0 if more batches remain.
+#
+# Wire format (matches client_scan + the serial handle_scan):
+#   [4]  doc_count (BE)
+#   [4]  has_more  (BE; 1 = more SCAN_RESULTs to follow, 0 = last)
+#   For each doc:
+#       [8] doc_id (BE)
+#       [4] data_len (BE) followed by data_len bytes
+#
+# `doc_count` and `has_more` are reserved up front via msgbuf_write_i32
+# and back-patched at the end via `put_i32_be`.
+fn m7sp_scan_build_batch(resp: *MessageBuffer, session: *M7SPSession) -> i32
+    let iter: *BTreeIter = session.scan_iter as *BTreeIter
+
+    msgbuf_start(resp, MSG_SCAN_RESULT, session.scan_request_id)
+
+    # Reserve doc_count + has_more (4 bytes each) — capture offsets so
+    # we can back-patch BE values once the loop closes.
+    let count_offset: i32 = msgbuf_len(resp)
+    msgbuf_write_i32(resp, 0)
+    let more_offset: i32 = msgbuf_len(resp)
+    msgbuf_write_i32(resp, 0)
+
+    var batch_count: i32 = 0
+    var done: i32 = 0
+    var key_buf: [16]u8
+    var val_buf: [2048]u8
+
+    let batch_target: i32 = 16          # safety cap on per-batch doc count
+    let batch_byte_budget: i32 = 7000   # ~1.2 KiB headroom in 8 KiB write_buf
+
+    if iter == null or btree_iter_valid(iter) == 0
+        # Empty / unopenable iter — emit a single zero-doc batch.
+        done = 1
+    else
+        while batch_count < batch_target
+            if btree_iter_valid(iter) == 0
+                done = 1
+                break
+
+            if session.scan_max_results > 0 and session.scan_total_emitted >= session.scan_max_results
+                done = 1
+                break
+
+            var key_len: i32 = 0
+            btree_iter_key(iter, @key_buf[0], @key_len)
+
+            var val_len: i32 = 0
+            btree_iter_value(iter, @val_buf[0], @val_len)
+
+            # Stop early if appending this doc would overflow the batch
+            # budget — keep at least one doc per non-final batch so we
+            # don't loop emitting empty results.
+            let doc_overhead: i32 = 8 + 4
+            let projected: i32 = msgbuf_len(resp) + doc_overhead + val_len
+            if projected > batch_byte_budget and batch_count > 0
+                break
+
+            # First 8 bytes of the key encode the i64 DocumentId
+            let id_ptr: *i64 = @key_buf[0] as *i64
+            let doc_id: i64 = *id_ptr
+
+            msgbuf_write_i64(resp, doc_id)
+            msgbuf_write_bytes(resp, @val_buf[0], val_len)
+
+            batch_count += 1
+            session.scan_total_emitted += 1
+
+            btree_iter_next(iter)
+
+    var has_more: i32 = 1
+    if done != 0
+        has_more = 0
+
+    let buf_base: *u8 = msgbuf_data(resp)
+    put_i32_be(buf_base, count_offset, batch_count)
+    put_i32_be(buf_base, more_offset, has_more)
+
+    msgbuf_finish(resp)
+    return done
+
+
+# ============================================================================
 # Phase 3 dispatch — real handlers
 # ============================================================================
 #
@@ -393,14 +541,48 @@ fn m7sp_dispatch(reader: *MessageReader, resp: *MessageBuffer, session: *M7SPSes
         session.active_txn = -1
         return
 
-    # SCAN / SCAN_NEXT: phase 4 territory.  Per the phase-3 briefing we
-    # opt for option (a) — emit MSG_ERROR so phase 4 starts from a known
-    # no-SCAN baseline rather than trying to evolve a partial response.
+    # SCAN — open the iterator and emit the first SCAN_RESULT batch into
+    # `resp`.  The post-send branch in `handle_task_event` advances the
+    # iter on each completed write (PARSE_SENDING → another batch), and
+    # finally emits a trailing SCAN_END before returning to NEED_HEADER.
+    # See the "SCAN flow" comment above `m7sp_scan_build_batch`.
     if msg_type == MSG_SCAN
-        build_error(resp, request_id, PROTO_ERR_INVALID_MSG_TYPE, "SCAN deferred to phase 4")
+        let max_results: i32 = msgreader_read_i32(reader)
+
+        prints("  [async] SCAN max_results=")
+        print_int(max_results as i64)
+        prints("\n")
+
+        # If a previous scan somehow leaked, free its iter before starting.
+        if session.scan_iter != 0
+            btree_iter_destroy(session.scan_iter as *BTreeIter)
+            session.scan_iter = 0
+
+        let iter_opt = collection_scan(collection)
+        var iter: *BTreeIter = null
+        if option_is_none<*BTreeIter>(@iter_opt) == 0
+            iter = option_unwrap_or<*BTreeIter>(@iter_opt, null)
+
+        session.scan_iter = iter as i64
+        session.scan_request_id = request_id
+        session.scan_max_results = max_results
+        session.scan_total_emitted = 0
+
+        let last: i32 = m7sp_scan_build_batch(resp, session)
+        if last != 0
+            # First batch was also the last (empty collection or
+            # single-batch result) — next CQE sends SCAN_END.
+            session.scan_active = 2
+        else
+            session.scan_active = 1
         return
+
+    # SCAN_NEXT: in this protocol, SCAN_RESULT batches are pushed by the
+    # server (driven off send completion), not pulled — there is no
+    # explicit per-batch request from the client.  Reject as protocol
+    # error if a client somehow sends one.
     if msg_type == MSG_SCAN_NEXT
-        build_error(resp, request_id, PROTO_ERR_INVALID_MSG_TYPE, "SCAN_NEXT deferred to phase 4")
+        build_error(resp, request_id, PROTO_ERR_INVALID_MSG_TYPE, "SCAN_NEXT not used by this server (push model)")
         return
 
     # Unknown type — well-formed protocol error.
@@ -448,8 +630,60 @@ fn handle_task_event(task: *Task) -> i32
     # ─── SENDING: send completed, prepare for next message (keep-alive) ───
     if session.parse_state == PARSE_SENDING
         if task.io_result < 0
+            # destroy will free any scan_iter still held
             m7sp_session_destroy(idx)
             return 1
+
+        # ─── SCAN continuations (phase 4) ───
+        # When scan_active != 0 the client expects more frames in this
+        # logical scan response.  Stay in PARSE_SENDING and keep
+        # submitting writes off the iter until SCAN_END has been sent.
+        if session.scan_active == 1
+            # Build the next SCAN_RESULT batch.  If this batch drains
+            # the iter, transition to scan_active=2 so the *next* CQE
+            # emits SCAN_END.
+            var resp1: MessageBuffer
+            msgbuf_init(@resp1, @task.write_buf[0], TASK_BUFFER_SIZE)
+            let last: i32 = m7sp_scan_build_batch(@resp1, session)
+            if last != 0
+                session.scan_active = 2
+            let resp1_len: i32 = msgbuf_len(@resp1)
+            let pool1: *TaskPool = task.user_data as *TaskPool
+            let send_ret1: i32 = task_submit_send(pool1, task, resp1_len)
+            if send_ret1 < 0
+                m7sp_session_destroy(idx)
+                return 1
+            return -1
+
+        if session.scan_active == 2
+            # Final SCAN_RESULT (has_more=0) has been delivered; emit
+            # the trailing SCAN_END terminator.
+            var resp2: MessageBuffer
+            msgbuf_init(@resp2, @task.write_buf[0], TASK_BUFFER_SIZE)
+            build_scan_end(@resp2, session.scan_request_id)
+            session.scan_active = 3
+            let resp2_len: i32 = msgbuf_len(@resp2)
+            let pool2: *TaskPool = task.user_data as *TaskPool
+            let send_ret2: i32 = task_submit_send(pool2, task, resp2_len)
+            if send_ret2 < 0
+                m7sp_session_destroy(idx)
+                return 1
+            return -1
+
+        if session.scan_active == 3
+            # SCAN_END acknowledged — tear down the iter and reset the
+            # session for the next request on this keep-alive connection.
+            prints("  [async] SCAN done - emitted ")
+            print_int(session.scan_total_emitted as i64)
+            prints(" doc(s)\n")
+            if session.scan_iter != 0
+                btree_iter_destroy(session.scan_iter as *BTreeIter)
+                session.scan_iter = 0
+            session.scan_active = 0
+            session.scan_request_id = 0
+            session.scan_max_results = 0
+            session.scan_total_emitted = 0
+            # Fall through to the normal post-send reset below.
 
         # Reset parser; keep slot/session alive
         session.parse_state = PARSE_NEED_HEADER
