@@ -6,14 +6,20 @@
 # `Task` with a parallel `M7SPSession` carrying parser + handler state.
 # A single misbehaving client cannot block any other.
 #
-# Status (this commit): SKELETON.  Phase 1 only — accepts connections,
-# echoes incoming bytes.  Subsequent phases (M7SP framing, message
-# dispatch, SCAN streaming, encryption) tracked in the design doc.
-# Opt-in via `mausoleum serve --async` so the existing `serve_loop_plain`
-# remains the default until this is feature-complete.
+# Status (this commit): PHASE 2 — M7SP framing.
+#   - Parses M7SP header (16 bytes, big-endian) on incoming bytes
+#   - Accumulates body across multiple recv CQEs
+#   - Dispatches by msg_type, sending back minimal ACKs for known types
+#   - Keep-alive: returns to NEED_HEADER after SENDING completes
+#
+# Phase 3 (full handlers wired into Collection/Storage) and phase 4
+# (multi-message SCAN responses) build on this.  Opt-in via
+# `mausoleum serve --async` so the existing `serve_loop_plain` remains
+# the default until this is feature-complete.
 
 import ritzlib.sys
 import ritzlib.io
+import ritzlib.uring
 import ritzlib.async_tasks {
     Task,
     TaskPool,
@@ -21,22 +27,13 @@ import ritzlib.async_tasks {
     task_server_create,
     task_server_free,
     task_server_run,
-    task_server_run_multishot,
     task_server_set_idle_timeout,
     task_server_set_max_connections,
-    task_pool_alloc,
     task_submit_recv,
     task_submit_send,
-    task_reset_for_recv
-}
-import ritzlib.net {
-    socket_tcp,
-    set_reuseaddr,
-    set_reuseport,
-    socket_set_nodelay,
-    tcp_bind,
-    tcp_listen,
-    inaddr_any
+    task_reset_for_recv,
+    TASK_BUFFER_SIZE,
+    TASK_WAITING
 }
 
 import mausoleum.m7m_types
@@ -53,12 +50,14 @@ import mausoleum.storage
 # `Task` (in ritzlib) gives us read_buf/write_buf and handler_state.
 # But it's HTTP-tuned and `task.user_data` is reserved for the runtime's
 # own pool-pointer convention.  So per-connection M7SP state lives in a
-# parallel array `g_sessions[]`, indexed by task pool slot.
+# parallel array `g_sessions[]`, indexed by task pool slot derived via
+# pointer arithmetic from `task.user_data` (the *TaskPool).
 #
 # Layout matches MAX_TASKS in async_tasks.ritz (256).
 
 const SESSION_MAX: i32 = 256
 
+# Parse-state values stored in M7SPSession.parse_state.
 const PARSE_NEED_HEADER: i32 = 0     # accumulating bytes 0..PROTO_HEADER_SIZE
 const PARSE_NEED_BODY:   i32 = 1     # have header, accumulating body
 const PARSE_DISPATCHING: i32 = 2     # full message in read_buf, building reply
@@ -72,11 +71,17 @@ struct M7SPSession
     have: i32                  # bytes accumulated so far in read_buf
     active_txn: i64            # -1 = none, else txn id
 
-    # SCAN-specific: opaque iterator, advanced one batch per send completion
-    scan_iter: i64             # 0 = no scan in progress, else *BTreeIter cast to i64
+    # Sticky doc-id counter for phase-2 INSERT stub responses; phase 3
+    # will replace this with real Collection inserts that allocate IDs
+    # via the storage engine.
+    next_doc_id: i64
+
+    # SCAN-specific (phase 4): opaque iterator advanced one batch per
+    # send completion.  Currently unused.
+    scan_iter: i64             # 0 = no scan in progress
     scan_request_id: i32       # request_id of the in-flight scan
 
-    # Future: heap-allocated big_send buffer for SCAN_RESULTs > 8 KiB
+    # Future (phase 4-B): heap-allocated big_send buffer for SCAN_RESULTs > 8 KiB
     big_send_ptr: i64          # 0 when unused
     big_send_len: i32
     big_send_pos: i32
@@ -91,6 +96,7 @@ fn m7sp_session_init(idx: i32)
     g_sessions[idx].msg_len = 0
     g_sessions[idx].have = 0
     g_sessions[idx].active_txn = -1
+    g_sessions[idx].next_doc_id = 1
     g_sessions[idx].scan_iter = 0
     g_sessions[idx].scan_request_id = 0
     g_sessions[idx].big_send_ptr = 0
@@ -104,16 +110,19 @@ fn m7sp_session_destroy(idx: i32)
     # TODO phase 4-B: if big_send_ptr != 0, munmap it
 
 
-# Find a session slot from a Task pointer.  Tasks live in pool.tasks[] —
-# the slot index is the offset of `task` from the pool's task array.
-# For phase 1 we conservatively scan; phase 2+ will cache the index in
-# Task creation.
-fn task_to_session_idx(srv: *TaskServer, task: *Task) -> i32
-    # Pointer arithmetic: idx = (task - &srv.pool.tasks[0]) / sizeof(Task)
-    # Avoiding sizeof until we confirm Ritz layout — for the skeleton we
-    # use task.id which is unique per task.  Phase 2 will replace this
-    # with proper slot derivation.
-    return (task.id as i32) % SESSION_MAX
+# Compute the index of `task` within the TaskPool.tasks[] array.
+# Uses pointer arithmetic on the pool stored in task.user_data
+# (set by spawn_task to `pool as *u8`).
+#
+# This is correct as long as Task structs in the array are contiguous
+# and equal-stride, which is the C-array-layout guarantee Ritz makes
+# for fixed-size struct arrays.
+fn task_to_session_idx(task: *Task) -> i32
+    let pool: *TaskPool = task.user_data as *TaskPool
+    let base: i64 = @pool.tasks[0] as i64
+    let task_addr: i64 = task as i64
+    let stride: i64 = sizeof(Task)
+    return ((task_addr - base) / stride) as i32
 
 
 # ============================================================================
@@ -137,112 +146,278 @@ fn get_storage() -> *Storage
 
 
 # ============================================================================
-# Phase 1: connection handler — echo (proves the wiring)
+# Recv into an offset of read_buf
 # ============================================================================
 #
-# The handler is invoked by the task server when a CQE arrives for `task`.
-# It returns 0 if the task should remain in the pool (more I/O pending),
-# or non-zero to retire it.  The pool itself manages the recv/send SQEs;
-# we just decide what to do with the bytes that came in.
-#
-# In phase 1, we do the simplest thing: send received bytes back as the
-# response, then re-arm a recv for the next round.  This proves:
-#   - accept worked
-#   - per-task state machine is reachable
-#   - SQE/CQE cycle is sound
-# without committing to M7SP semantics yet.
+# `task_submit_recv` always reads into `read_buf[0]`.  When we need to
+# accumulate bytes across multiple recv CQEs (header split from body,
+# or body arriving in fragments), we need to recv into `read_buf[have..]`.
+# This helper does that — same pattern as `task_submit_recv`, but with
+# a configurable buffer offset.
+fn m7sp_submit_recv_at(task: *Task, offset: i32) -> i32
+    let pool: *TaskPool = task.user_data as *TaskPool
+    let sqe = uring_get_sqe(pool.ring)
+    if sqe == null
+        return -12  # ENOMEM
 
+    let buf_ptr: *u8 = @task.read_buf[0] + offset
+    let remaining: i32 = TASK_BUFFER_SIZE - offset
+    if remaining <= 0
+        return -1  # buffer exhausted — message larger than 8 KiB
+
+    uring_prep_recv(sqe, task.fd, buf_ptr, remaining as u64, 0, task.id)
+    uring_sqe_submit(pool.ring)
+    task.state = TASK_WAITING
+    return 0
+
+
+# ============================================================================
+# Phase 2 dispatch — minimal ACKs for known msg_types
+# ============================================================================
+#
+# Builds a response for the given parsed message into `resp`.
+# Returns 0 on success; non-zero means we should still send (msgbuf has
+# an ERROR populated).  The session is updated in-place if the message
+# affects per-connection state (e.g., active_txn).
+#
+# Phase 3 will replace these stubs with real handlers that exercise
+# Collection/Storage and propagate per-handler errors via build_error.
+fn m7sp_phase2_dispatch(reader: *MessageReader, resp: *MessageBuffer, session: *M7SPSession, msg_type: i32, request_id: i32)
+    if msg_type == MSG_CONNECT
+        # Acknowledge with session_id = 1 (single-tenant for now).
+        build_connected(resp, request_id, 1)
+        return
+
+    if msg_type == MSG_PING
+        build_pong(resp, request_id)
+        return
+
+    if msg_type == MSG_DISCONNECT
+        # Best-effort response; the client closes its socket immediately
+        # after this send, so the next recv will return 0 (EOF) and we
+        # clean up the session.
+        if session.active_txn >= 0
+            # phase 3: storage_abort_txn(get_storage())
+            session.active_txn = -1
+        build_disconnected(resp, request_id)
+        return
+
+    if msg_type == MSG_INSERT
+        # Phase 2 stub: respond with monotonic doc IDs.  Phase 3 will
+        # invoke collection_insert against the real storage engine.
+        let id: i64 = session.next_doc_id
+        session.next_doc_id += 1
+        build_insert_ok(resp, request_id, id)
+        return
+
+    if msg_type == MSG_GET
+        # Phase 2: NOT_FOUND for everything (no real storage in async path
+        # yet).  Returning an ERROR rather than GET_OK lets the client
+        # distinguish "wrong code path" from "phase 3 incomplete".
+        build_error(resp, request_id, PROTO_ERR_NOT_FOUND, "GET not implemented in phase 2")
+        return
+
+    if msg_type == MSG_UPDATE
+        build_update_ok(resp, request_id)
+        return
+
+    if msg_type == MSG_DELETE
+        build_delete_ok(resp, request_id)
+        return
+
+    if msg_type == MSG_TXN_BEGIN
+        # Phase 2 stub: in-memory transaction id.
+        session.active_txn = 1
+        build_txn_begun(resp, request_id, session.active_txn)
+        return
+
+    if msg_type == MSG_TXN_COMMIT
+        session.active_txn = -1
+        build_txn_committed(resp, request_id)
+        return
+
+    if msg_type == MSG_TXN_ABORT
+        session.active_txn = -1
+        build_txn_aborted(resp, request_id)
+        return
+
+    # SCAN/SCAN_NEXT: phase 4 territory — error for now.
+    if msg_type == MSG_SCAN
+        build_error(resp, request_id, PROTO_ERR_INVALID_MSG_TYPE, "SCAN deferred to phase 4")
+        return
+    if msg_type == MSG_SCAN_NEXT
+        build_error(resp, request_id, PROTO_ERR_INVALID_MSG_TYPE, "SCAN_NEXT deferred to phase 4")
+        return
+
+    # Unknown type — well-formed protocol error.
+    build_error(resp, request_id, PROTO_ERR_INVALID_MSG_TYPE, "Unknown message type")
+
+
+# ============================================================================
+# Connection handler — M7SP framing state machine
+# ============================================================================
+#
+# Invoked by the task server when a CQE arrives for `task`.
+# Returns:
+#   < 0  — handler submitted I/O; runtime should wait for completion
+#   >= 0 — task is complete; runtime should close fd and free slot
+#
+# State transitions:
+#
+#   first call (session.in_use==0)        → init session, submit recv, return -1
+#   PARSE_NEED_HEADER, recv completes:
+#       have += io_result
+#       if have < PROTO_HEADER_SIZE → recv_at(have), return -1
+#       else parse header, set msg_len, transition to NEED_BODY
+#   PARSE_NEED_BODY:
+#       if have < msg_len → recv_at(have), return -1
+#       else transition to DISPATCHING
+#   PARSE_DISPATCHING:
+#       parse the buffered message, build response, submit_send, return -1
+#   PARSE_SENDING, send completes:
+#       reset session state (have=0, msg_len=0), submit recv, return -1
+#       (keep-alive — wait for next message on this connection)
 fn handle_task_event(task: *Task) -> i32
-    # task.io_result is the return value of the most recent syscall
-    # (recv or send).  Negative means error — close the connection.
-    if task.io_result <= 0
-        return 1   # done; task pool will close fd
+    let idx: i32 = task_to_session_idx(task)
+    let session: *M7SPSession = @g_sessions[idx]
 
-    # Phase 1: echo back whatever we just read.
-    if task.handler_state == PARSE_NEED_HEADER
-        # Just got bytes from recv — echo them
-        # Copy read_buf -> write_buf, kick off send.
-        let n: i32 = task.read_len
-        for i in 0..n
-            *(@task.write_buf[0] + i) = *(@task.read_buf[0] + i)
-        task.write_len = n
-        task.write_pos = 0
-        task.handler_state = PARSE_SENDING
+    # ─── First call: session not yet initialized for this slot ───
+    if session.in_use == 0
+        m7sp_session_init(idx)
+        let pool: *TaskPool = task.user_data as *TaskPool
+        let ret: i32 = task_submit_recv(pool, task)
+        if ret < 0
+            m7sp_session_destroy(idx)
+            return 1
+        return -1
 
-        return task_submit_send(g_pool as *TaskPool, task)
+    # ─── SENDING: send completed, prepare for next message (keep-alive) ───
+    if session.parse_state == PARSE_SENDING
+        if task.io_result < 0
+            m7sp_session_destroy(idx)
+            return 1
 
-    if task.handler_state == PARSE_SENDING
-        # Send completed — back to recv for next round (keep-alive)
-        return task_reset_for_recv(task)
+        # Reset parser; keep slot/session alive
+        session.parse_state = PARSE_NEED_HEADER
+        session.have = 0
+        session.msg_len = 0
 
-    # Unknown state — close
+        let ret: i32 = task_reset_for_recv(task)
+        if ret < 0
+            m7sp_session_destroy(idx)
+            return 1
+        return -1
+
+    # ─── A recv completed ───
+    let n: i32 = task.io_result
+    if n <= 0
+        # 0 = EOF (client closed cleanly), <0 = error.
+        m7sp_session_destroy(idx)
+        return 1
+
+    session.have += n
+
+    # ─── NEED_HEADER: collect 16 bytes, then parse length ───
+    if session.parse_state == PARSE_NEED_HEADER
+        if session.have < PROTO_HEADER_SIZE
+            let ret: i32 = m7sp_submit_recv_at(task, session.have)
+            if ret < 0
+                m7sp_session_destroy(idx)
+                return 1
+            return -1
+
+        # Have full header — extract length from bytes [4..8] big-endian.
+        let h: *u8 = @task.read_buf[0]
+        var msg_len: i32 = (*(h + 4) as i32) << 24
+        msg_len = msg_len | ((*(h + 5) as i32) << 16)
+        msg_len = msg_len | ((*(h + 6) as i32) << 8)
+        msg_len = msg_len | (*(h + 7) as i32)
+
+        if msg_len < PROTO_HEADER_SIZE
+            m7sp_session_destroy(idx)
+            return 1
+        if msg_len > TASK_BUFFER_SIZE
+            # Phase 2 cap: anything bigger than 8 KiB closes the connection.
+            # Phase 3 may upgrade to a per-session big buffer.
+            m7sp_session_destroy(idx)
+            return 1
+
+        session.msg_len = msg_len
+        session.parse_state = PARSE_NEED_BODY
+
+    # ─── NEED_BODY: collect bytes until we have msg_len total ───
+    if session.parse_state == PARSE_NEED_BODY
+        if session.have < session.msg_len
+            let ret: i32 = m7sp_submit_recv_at(task, session.have)
+            if ret < 0
+                m7sp_session_destroy(idx)
+                return 1
+            return -1
+        session.parse_state = PARSE_DISPATCHING
+
+    # ─── DISPATCHING: parse + build response + submit_send ───
+    if session.parse_state == PARSE_DISPATCHING
+        var reader: MessageReader
+        let parse_rc: i32 = msgreader_init(@reader, @task.read_buf[0], session.msg_len)
+        if parse_rc != PROTO_OK
+            m7sp_session_destroy(idx)
+            return 1
+
+        let msg_type: i32 = msgreader_msg_type(@reader)
+        let request_id: i32 = msgreader_request_id(@reader)
+
+        var resp: MessageBuffer
+        msgbuf_init(@resp, @task.write_buf[0], TASK_BUFFER_SIZE)
+
+        m7sp_phase2_dispatch(@reader, @resp, session, msg_type, request_id)
+
+        let resp_len: i32 = msgbuf_len(@resp)
+        if resp_len <= 0
+            # Dispatcher failed to populate a response — close to be safe.
+            m7sp_session_destroy(idx)
+            return 1
+
+        session.parse_state = PARSE_SENDING
+
+        let pool: *TaskPool = task.user_data as *TaskPool
+        let ret: i32 = task_submit_send(pool, task, resp_len)
+        if ret < 0
+            m7sp_session_destroy(idx)
+            return 1
+        return -1
+
+    # Unreachable in the normal state machine
+    m7sp_session_destroy(idx)
     return 1
-
-
-# ============================================================================
-# Phase 2-7 stubs (will be filled out per design doc)
-# ============================================================================
-
-# TODO phase 2: parse M7SP header from read_buf, dispatch by msg_type,
-# build response into write_buf.  Replace handle_task_event's echo.
-
-# TODO phase 4: when handler hits MSG_SCAN, capture *BTreeIter into
-# session.scan_iter, emit first SCAN_RESULT, then on each subsequent
-# send-completion CQE emit the next batch until iter exhausted, then
-# emit SCAN_END.  This is the only message that has multi-CQE responses.
-
-# TODO phase 6: serve_async_encrypted — TLS handshake state machine
-# layered on top of the connection state machine, mirroring valet's
-# valet_handle_tls_connection.
 
 
 # ============================================================================
 # Entry point
 # ============================================================================
 
-# Run the async serve loop.  Returns when the listening socket closes
-# or shutdown is signaled.  Public — main.ritz calls this when --async
-# is passed.
-pub fn serve_async(port: i32, pool: *BufferPool, storage: *Storage, collection: *Collection) -> i32
+# Run the async serve loop on the given (already-bound, already-listening)
+# socket.  Returns when the server stops (idle timeout, signal, or error).
+# Public — main.ritz calls this when --async is passed.
+#
+# Caller retains ownership of `listen_fd` — this function does NOT close it.
+pub fn serve_async(listen_fd: i32, pool: *BufferPool, storage: *Storage, collection: *Collection) -> i32
     # Stash the shared resources for the handler to find.
     g_pool = pool as i64
     g_storage = storage as i64
     g_collection = collection as i64
 
-    # Initialize session table
+    # Initialize session table — every slot starts free.
     for i in 0..SESSION_MAX
         g_sessions[i].in_use = 0
 
-    # Listening socket
-    let server_fd: i32 = socket_tcp()
-    if server_fd < 0
-        prints("serve_async: socket() failed\n")
-        return 1
-
-    set_reuseaddr(server_fd)
-    set_reuseport(server_fd)
-
-    let bind_rc: i32 = tcp_bind(server_fd, inaddr_any(), port)
-    if bind_rc < 0
-        prints("serve_async: bind failed\n")
-        sys_close(server_fd)
-        return 1
-
-    let listen_rc: i32 = tcp_listen(server_fd, 1024)
-    if listen_rc < 0
-        prints("serve_async: listen failed\n")
-        sys_close(server_fd)
-        return 1
-
-    prints("Mausoleum (async) listening on port ")
-    print_int(port as i64)
+    prints("Mausoleum (async) listening on fd ")
+    print_int(listen_fd as i64)
     prints("\n")
 
     # TaskServer — same runtime valet uses.
-    let srv: *TaskServer = task_server_create(server_fd)
+    let srv: *TaskServer = task_server_create(listen_fd)
     if srv == null
         prints("serve_async: task_server_create failed\n")
-        sys_close(server_fd)
         return 1
 
     srv.pool.ring = @srv.ring
@@ -255,5 +430,4 @@ pub fn serve_async(port: i32, pool: *BufferPool, storage: *Storage, collection: 
 
     prints("Mausoleum (async): shutting down\n")
     task_server_free(srv)
-    sys_close(server_fd)
     return ret

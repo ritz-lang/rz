@@ -37,6 +37,7 @@ import mausoleum.btree {
 }
 import mausoleum.document
 import mausoleum.server
+import mausoleum.server_async
 import mausoleum.client
 import mausoleum.protocol
 import mausoleum.encrypted_channel
@@ -47,7 +48,7 @@ import mausoleum.encrypted_channel
 
 const VERSION: i32 = 1
 const DEFAULT_PORT: i32 = 7777
-const POOL_SIZE: i32 = 1024    # 1024 pages = 4MB buffer pool
+const BUFFER_POOL_FRAMES: i32 = 1024    # 1024 pages = 4MB buffer pool
 
 # Default host as StrView (idiomatic Ritz)
 fn default_host() -> StrView
@@ -68,6 +69,7 @@ struct Args
     host: StrView       # Host as StrView (idiomatic Ritz)
     data_dir: *u8       # Data directory for persistence (null = in-memory)
     no_encryption: i32  # 1 = disable encryption (for development)
+    async_mode: i32     # 1 = use io_uring async serve loop (opt-in, phase 2)
 
 const CMD_HELP: i32 = 0
 const CMD_VERSION: i32 = 1
@@ -80,6 +82,7 @@ fn parse_args(argc: i32, argv: **u8, args: *Args)
     args.host = default_host()
     args.data_dir = null
     args.no_encryption = 0
+    args.async_mode = 0
 
     if argc < 2
         return
@@ -115,6 +118,9 @@ fn parse_args(argc: i32, argv: **u8, args: *Args)
                     i += 1
             else if arg_eq(arg, "--no-encryption") != 0
                 args.no_encryption = 1
+                i += 1
+            else if arg_eq(arg, "--async") != 0
+                args.async_mode = 1
                 i += 1
             else
                 i += 1
@@ -179,6 +185,8 @@ fn print_help()
     prints("  --data-dir, -d PATH                     Data directory for persistence\n")
     prints("                                          (default: in-memory)\n")
     prints("  --no-encryption                         Disable encryption (development only!)\n")
+    prints("  --async                                 Use io_uring async loop (opt-in,\n")
+    prints("                                          requires --no-encryption; phase 2 WIP)\n")
     prints("\n")
     prints("Security:\n")
     prints("  By default, connections use X25519 key exchange + ChaCha20-Poly1305.\n")
@@ -231,7 +239,7 @@ fn save_collection_metadata(storage: *Storage, col: *Collection)
 # Serve Command - Encrypted Database Server
 # ============================================================================
 
-fn cmd_serve(port: i32, data_dir: *u8, no_encryption: i32) -> i32
+fn cmd_serve(port: i32, data_dir: *u8, no_encryption: i32, async_mode: i32) -> i32
     prints("Starting Mausoleum server...\n")
     prints("  Port: ")
     print_i32(port)
@@ -246,6 +254,10 @@ fn cmd_serve(port: i32, data_dir: *u8, no_encryption: i32) -> i32
         prints("  Encryption: DISABLED (development mode)\n")
     else
         prints("  Encryption: X25519 + ChaCha20-Poly1305\n")
+    if async_mode != 0
+        prints("  Loop: io_uring async (phase 2 — opt-in)\n")
+    else
+        prints("  Loop: serial (default)\n")
     prints("\n")
 
     # Create buffer pool - either persistent or in-memory
@@ -265,7 +277,7 @@ fn cmd_serve(port: i32, data_dir: *u8, no_encryption: i32) -> i32
         prints("Opened persistent storage.\n")
     else
         # In-memory mode
-        let pool_opt = buffer_pool_new(POOL_SIZE)
+        let pool_opt = buffer_pool_new(BUFFER_POOL_FRAMES)
         if option_is_none<*BufferPool>(@pool_opt) == 1
             prints("Error: Failed to allocate buffer pool\n")
             return 1
@@ -332,10 +344,16 @@ fn cmd_serve(port: i32, data_dir: *u8, no_encryption: i32) -> i32
     prints("Note: Data is flushed after each write operation.\n")
     prints("\n")
 
-    # Accept loop - encrypted or plain depending on mode
-    if no_encryption != 0
+    # Accept loop - encrypted, plain, or async (phase 2 opt-in).
+    # Async requires --no-encryption for now (encryption support comes in phase 6).
+    if async_mode != 0 and no_encryption != 0
+        serve_async(sock.fd, pool, storage, @collection)
+    else if no_encryption != 0
         serve_loop_plain(sock.fd, pool, storage, @collection)
     else
+        if async_mode != 0
+            prints("Note: --async currently requires --no-encryption (TLS path is phase 6).\n")
+            prints("Falling back to serial encrypted loop.\n")
         serve_loop(sock.fd, pool, storage, @collection)
 
     # Cleanup
@@ -1134,7 +1152,7 @@ pub fn main(argc: i32, argv: **u8) -> i32
         return 0
 
     if args.command == CMD_SERVE
-        return cmd_serve(args.port, args.data_dir, args.no_encryption)
+        return cmd_serve(args.port, args.data_dir, args.no_encryption, args.async_mode)
 
     if args.command == CMD_SHELL
         return cmd_shell(args.host, args.port)
