@@ -6,16 +6,19 @@
 # `Task` with a parallel `M7SPSession` carrying parser + handler state.
 # A single misbehaving client cannot block any other.
 #
-# Status (this commit): PHASE 2 — M7SP framing.
-#   - Parses M7SP header (16 bytes, big-endian) on incoming bytes
-#   - Accumulates body across multiple recv CQEs
-#   - Dispatches by msg_type, sending back minimal ACKs for known types
-#   - Keep-alive: returns to NEED_HEADER after SENDING completes
+# Status (this commit): PHASE 3 — full single-message handlers wired
+# into Collection/Storage.
+#   - CONNECT/PING/DISCONNECT
+#   - INSERT/GET/UPDATE/DELETE — real collection ops, post-write flush
+#     mirroring `handle_plain_session` in src/main.ritz
+#   - TXN_BEGIN/COMMIT/ABORT — real storage_*_txn calls in persistent
+#     mode, in-memory placeholder otherwise (matches serial path)
+#   - SCAN / SCAN_NEXT — explicit MSG_ERROR (phase 4 territory; choosing
+#     option (a) from the briefing for a clean baseline before adding
+#     multi-message responses)
 #
-# Phase 3 (full handlers wired into Collection/Storage) and phase 4
-# (multi-message SCAN responses) build on this.  Opt-in via
-# `mausoleum serve --async` so the existing `serve_loop_plain` remains
-# the default until this is feature-complete.
+# Phase 4 will replace the SCAN error stubs with multi-message
+# SCAN_RESULT batches driven from session state.
 
 import ritzlib.sys
 import ritzlib.io
@@ -39,6 +42,7 @@ import ritzlib.async_tasks {
 import mausoleum.m7m_types
 import mausoleum.protocol
 import mausoleum.collection
+import mausoleum.document
 import mausoleum.buffer_pool
 import mausoleum.storage
 
@@ -71,9 +75,9 @@ struct M7SPSession
     have: i32                  # bytes accumulated so far in read_buf
     active_txn: i64            # -1 = none, else txn id
 
-    # Sticky doc-id counter for phase-2 INSERT stub responses; phase 3
-    # will replace this with real Collection inserts that allocate IDs
-    # via the storage engine.
+    # Vestigial — phase 2 used this for stub INSERT IDs.  Phase 3
+    # uses the real collection sequencer; field is kept (initialized
+    # but unread) so the struct layout is stable across phases.
     next_doc_id: i64
 
     # SCAN-specific (phase 4): opaque iterator advanced one batch per
@@ -172,19 +176,154 @@ fn m7sp_submit_recv_at(task: *Task, offset: i32) -> i32
 
 
 # ============================================================================
-# Phase 2 dispatch — minimal ACKs for known msg_types
+# Phase 3 helpers — mirror the serial path in src/main.ritz
+# ============================================================================
+
+# After every committed write (INSERT/UPDATE/DELETE) the serial loop
+# saves collection metadata + storage_flush so a process restart picks
+# up the latest counters.  `storage` may be null in --in-memory mode.
+fn async_flush_after_write(storage: *Storage, collection: *Collection)
+    if storage == null or collection == null
+        return
+    storage_set_root_page_id(storage, collection_root_page_id(collection))
+    storage_set_next_sequence(storage, collection_next_sequence(collection))
+    storage_set_doc_count(storage, collection_doc_count(collection))
+    storage_flush(storage)
+
+
+# INSERT — payload: [doc_data_len: i32][doc_data: bytes]
+# Identical contract to handle_insert in src/main.ritz; kept inline so
+# the async loop doesn't depend on private symbols there.
+fn async_handle_insert(reader: *MessageReader, resp: *MessageBuffer, request_id: i32, collection: *Collection)
+    var doc_len: i32 = 0
+    let doc_data: *u8 = msgreader_read_bytes(reader, @doc_len)
+    if doc_data == null or doc_len <= 0
+        build_error(resp, request_id, PROTO_ERR_INVALID_DOCUMENT, "Missing document data")
+        return
+
+    var doc: Document
+    let deser_result: i32 = doc_deserialize(doc_data, doc_len as i64, @doc)
+    if deser_result != ERR_OK
+        build_error(resp, request_id, PROTO_ERR_INVALID_DOCUMENT, "Failed to deserialize document")
+        return
+
+    var out_id: DocumentId
+    let insert_result: i32 = collection_insert(collection, @doc, @out_id)
+    if insert_result != ERR_OK
+        build_error(resp, request_id, PROTO_ERR_INTERNAL, "Failed to insert document")
+        return
+
+    prints("  [async] INSERT doc_id=")
+    print_i64(out_id.value)
+    prints("\n")
+
+    build_insert_ok(resp, request_id, out_id.value)
+
+
+# GET — payload: [doc_id: i64]
+fn async_handle_get(reader: *MessageReader, resp: *MessageBuffer, request_id: i32, collection: *Collection)
+    let doc_id_val: i64 = msgreader_read_i64(reader)
+    if doc_id_val < 0
+        build_error(resp, request_id, PROTO_ERR_INVALID_DOCUMENT, "Invalid document ID")
+        return
+
+    var doc_id: DocumentId
+    doc_id.value = doc_id_val
+
+    var doc: Document
+    let get_result: i32 = collection_get(collection, @doc_id, @doc)
+    if get_result == ERR_NOT_FOUND
+        build_error(resp, request_id, PROTO_ERR_NOT_FOUND, "Document not found")
+        return
+    if get_result != ERR_OK
+        build_error(resp, request_id, PROTO_ERR_INTERNAL, "Failed to get document")
+        return
+
+    # Serialize the document into a scratch buffer that lives on this
+    # frame; build_get_ok copies the bytes into `resp` before we return.
+    var doc_buf: [2048]u8
+    let doc_size: i64 = doc_serialize(@doc, @doc_buf[0], 2048)
+    if doc_size < 0
+        build_error(resp, request_id, PROTO_ERR_INTERNAL, "Failed to serialize document")
+        return
+
+    prints("  [async] GET doc_id=")
+    print_i64(doc_id_val)
+    prints(" size=")
+    print_i64(doc_size)
+    prints("\n")
+
+    build_get_ok(resp, request_id, @doc_buf[0], doc_size as i32)
+
+
+# UPDATE — payload: [doc_data_len: i32][doc_data: bytes]
+fn async_handle_update(reader: *MessageReader, resp: *MessageBuffer, request_id: i32, collection: *Collection)
+    var doc_len: i32 = 0
+    let doc_data: *u8 = msgreader_read_bytes(reader, @doc_len)
+    if doc_data == null or doc_len <= 0
+        build_error(resp, request_id, PROTO_ERR_INVALID_DOCUMENT, "Missing document data")
+        return
+
+    var doc: Document
+    let deser_result: i32 = doc_deserialize(doc_data, doc_len as i64, @doc)
+    if deser_result != ERR_OK
+        build_error(resp, request_id, PROTO_ERR_INVALID_DOCUMENT, "Failed to deserialize document")
+        return
+
+    let update_result: i32 = collection_update(collection, @doc)
+    if update_result == ERR_NOT_FOUND
+        build_error(resp, request_id, PROTO_ERR_NOT_FOUND, "Document not found")
+        return
+    if update_result != ERR_OK
+        build_error(resp, request_id, PROTO_ERR_INTERNAL, "Failed to update document")
+        return
+
+    prints("  [async] UPDATE doc_id=")
+    print_i64(doc.id.value)
+    prints("\n")
+
+    build_update_ok(resp, request_id)
+
+
+# DELETE — payload: [doc_id: i64]
+fn async_handle_delete(reader: *MessageReader, resp: *MessageBuffer, request_id: i32, collection: *Collection)
+    let doc_id_val: i64 = msgreader_read_i64(reader)
+    if doc_id_val < 0
+        build_error(resp, request_id, PROTO_ERR_INVALID_DOCUMENT, "Invalid document ID")
+        return
+
+    var doc_id: DocumentId
+    doc_id.value = doc_id_val
+
+    let delete_result: i32 = collection_delete(collection, @doc_id)
+    if delete_result == ERR_NOT_FOUND
+        build_error(resp, request_id, PROTO_ERR_NOT_FOUND, "Document not found")
+        return
+    if delete_result != ERR_OK
+        build_error(resp, request_id, PROTO_ERR_INTERNAL, "Failed to delete document")
+        return
+
+    prints("  [async] DELETE doc_id=")
+    print_i64(doc_id_val)
+    prints("\n")
+
+    build_delete_ok(resp, request_id)
+
+
+# ============================================================================
+# Phase 3 dispatch — real handlers
 # ============================================================================
 #
-# Builds a response for the given parsed message into `resp`.
-# Returns 0 on success; non-zero means we should still send (msgbuf has
-# an ERROR populated).  The session is updated in-place if the message
-# affects per-connection state (e.g., active_txn).
-#
-# Phase 3 will replace these stubs with real handlers that exercise
-# Collection/Storage and propagate per-handler errors via build_error.
-fn m7sp_phase2_dispatch(reader: *MessageReader, resp: *MessageBuffer, session: *M7SPSession, msg_type: i32, request_id: i32)
+# Builds a response for the given parsed message into `resp`.  The
+# session is updated in-place when the message affects per-connection
+# state (e.g., active_txn).  Behavior matches handle_plain_session in
+# src/main.ritz one-for-one (less SCAN, deferred to phase 4).
+fn m7sp_dispatch(reader: *MessageReader, resp: *MessageBuffer, session: *M7SPSession, msg_type: i32, request_id: i32)
+    let collection: *Collection = get_collection()
+    let storage: *Storage = get_storage()
+
     if msg_type == MSG_CONNECT
-        # Acknowledge with session_id = 1 (single-tenant for now).
+        # Single-tenant — session_id = 1 matches the serial loop.
         build_connected(resp, request_id, 1)
         return
 
@@ -193,55 +332,70 @@ fn m7sp_phase2_dispatch(reader: *MessageReader, resp: *MessageBuffer, session: *
         return
 
     if msg_type == MSG_DISCONNECT
-        # Best-effort response; the client closes its socket immediately
-        # after this send, so the next recv will return 0 (EOF) and we
-        # clean up the session.
-        if session.active_txn >= 0
-            # phase 3: storage_abort_txn(get_storage())
-            session.active_txn = -1
+        # Abort any txn we were holding before responding.  The client
+        # closes immediately after send completes; the next recv returns
+        # 0 and the runtime tears the session down.
+        if session.active_txn >= 0 and storage != null
+            storage_abort_txn(storage)
+        session.active_txn = -1
         build_disconnected(resp, request_id)
         return
 
     if msg_type == MSG_INSERT
-        # Phase 2 stub: respond with monotonic doc IDs.  Phase 3 will
-        # invoke collection_insert against the real storage engine.
-        let id: i64 = session.next_doc_id
-        session.next_doc_id += 1
-        build_insert_ok(resp, request_id, id)
+        async_handle_insert(reader, resp, request_id, collection)
+        async_flush_after_write(storage, collection)
         return
 
     if msg_type == MSG_GET
-        # Phase 2: NOT_FOUND for everything (no real storage in async path
-        # yet).  Returning an ERROR rather than GET_OK lets the client
-        # distinguish "wrong code path" from "phase 3 incomplete".
-        build_error(resp, request_id, PROTO_ERR_NOT_FOUND, "GET not implemented in phase 2")
+        async_handle_get(reader, resp, request_id, collection)
         return
 
     if msg_type == MSG_UPDATE
-        build_update_ok(resp, request_id)
+        async_handle_update(reader, resp, request_id, collection)
+        async_flush_after_write(storage, collection)
         return
 
     if msg_type == MSG_DELETE
-        build_delete_ok(resp, request_id)
+        async_handle_delete(reader, resp, request_id, collection)
+        async_flush_after_write(storage, collection)
         return
 
     if msg_type == MSG_TXN_BEGIN
-        # Phase 2 stub: in-memory transaction id.
-        session.active_txn = 1
-        build_txn_begun(resp, request_id, session.active_txn)
+        if storage != null
+            let txn_id: i64 = storage_begin_txn(storage)
+            if txn_id >= 0
+                session.active_txn = txn_id
+                build_txn_begun(resp, request_id, txn_id)
+            else
+                build_error(resp, request_id, PROTO_ERR_INTERNAL, "Failed to begin transaction")
+        else
+            # In-memory mode — placeholder txn id (matches serial path)
+            session.active_txn = 1
+            build_txn_begun(resp, request_id, session.active_txn)
         return
 
     if msg_type == MSG_TXN_COMMIT
+        if session.active_txn >= 0 and storage != null
+            let commit_result: i32 = storage_commit_txn(storage)
+            if commit_result == ERR_OK
+                build_txn_committed(resp, request_id)
+            else
+                build_error(resp, request_id, PROTO_ERR_INTERNAL, "Failed to commit")
+        else
+            build_txn_committed(resp, request_id)
         session.active_txn = -1
-        build_txn_committed(resp, request_id)
         return
 
     if msg_type == MSG_TXN_ABORT
-        session.active_txn = -1
+        if session.active_txn >= 0 and storage != null
+            storage_abort_txn(storage)
         build_txn_aborted(resp, request_id)
+        session.active_txn = -1
         return
 
-    # SCAN/SCAN_NEXT: phase 4 territory — error for now.
+    # SCAN / SCAN_NEXT: phase 4 territory.  Per the phase-3 briefing we
+    # opt for option (a) — emit MSG_ERROR so phase 4 starts from a known
+    # no-SCAN baseline rather than trying to evolve a partial response.
     if msg_type == MSG_SCAN
         build_error(resp, request_id, PROTO_ERR_INVALID_MSG_TYPE, "SCAN deferred to phase 4")
         return
@@ -369,7 +523,7 @@ fn handle_task_event(task: *Task) -> i32
         var resp: MessageBuffer
         msgbuf_init(@resp, @task.write_buf[0], TASK_BUFFER_SIZE)
 
-        m7sp_phase2_dispatch(@reader, @resp, session, msg_type, request_id)
+        m7sp_dispatch(@reader, @resp, session, msg_type, request_id)
 
         let resp_len: i32 = msgbuf_len(@resp)
         if resp_len <= 0
