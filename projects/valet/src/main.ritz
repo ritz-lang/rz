@@ -49,6 +49,7 @@ import zeus.zeus_client {
     zeus_client_next_request_id,
     zeus_client_submit_request,
     zeus_client_poll_response,
+    zeus_client_wait_response,
     worker_handle_get_arena,
     WorkerHandle
 }
@@ -333,18 +334,16 @@ fn handle_zeus_proxy(path: *u8, path_len: i32) -> i32
     if submit_rc != 0
         return ctx_text(503, c"zeus submit failed\n")
 
-    # Poll up to ~5s for the response.  500 attempts × 10ms.
+    # Wait up to ~5s for the response.  Spin a few thousand iterations
+    # (covers the common <100µs case without a syscall) then block on
+    # the worker's resp_futex — the worker wakes us via
+    # `signal_response_available` after committing.  This replaces a
+    # 500×10ms nanosleep poll loop that burned valet's idle CPU after
+    # any traffic burst.
     var resp: ResponseSlot
     response_slot_init(@resp)
     var got_widx: i32 = -1
-    var attempts: i32 = 0
-    var poll_rc: i32 = -1
-    while attempts < 500
-        poll_rc = zeus_client_poll_response(client, @resp, @got_widx)
-        if poll_rc == 0
-            break
-        proxy_sleep_ms(10)
-        attempts += 1
+    let poll_rc: i32 = zeus_client_wait_response(client, worker_idx, @resp, @got_widx, 4096, 5000)
 
     if poll_rc != 0
         return ctx_text(504, c"zeus worker timeout\n")

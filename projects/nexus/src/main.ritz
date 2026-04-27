@@ -29,7 +29,7 @@ import ritzlib.str
 import zeus.worker { WorkerContext }
 import zeus.worker { worker_init, worker_destroy }
 import zeus.worker { worker_set_running, worker_set_busy }
-import zeus.worker { worker_poll_request, worker_ack_request }
+import zeus.worker { worker_poll_request, worker_wait_request, worker_ack_request }
 import zeus.worker { worker_begin_response, worker_commit_response }
 import zeus.worker { worker_get_request_path, worker_get_request_body }
 import zeus.worker { worker_alloc_response_data, worker_ptr_to_offset }
@@ -641,10 +641,15 @@ pub fn main(argc: i32, argv: **u8) -> i32
 
     worker_set_running(@ctx)
 
-    # Main request loop
+    # Main request loop.  Use the futex-backed wait helper instead of a
+    # nanosleep poll — this drops idle CPU from ~1.5% (1ms-poll loop) to
+    # 0% (kernel-blocked on the request futex until valet wakes us).
+    # Spin 100 iters to avoid syscall overhead for fast back-to-back
+    # requests; otherwise sleep up to 1s before checking the running
+    # flag (the upper bound on shutdown latency).
     var running: i32 = 1
     while running != 0
-        let req: *RequestSlot = worker_poll_request(@ctx)
+        let req: *RequestSlot = worker_wait_request(@ctx, 100, 1000)
 
         if req != null
             worker_set_busy(@ctx)
@@ -657,12 +662,6 @@ pub fn main(argc: i32, argv: **u8) -> i32
 
             worker_ack_request(@ctx)
             worker_set_running(@ctx)
-        else
-            # No request - sleep briefly
-            var ts: [2]i64
-            ts[0] = 0       # seconds
-            ts[1] = 1000000 # nanoseconds (1ms)
-            sys_nanosleep(@ts[0], null)
 
     worker_destroy(@ctx)
     store_close()

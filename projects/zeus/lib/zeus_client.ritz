@@ -25,6 +25,7 @@ import zeus.shm
 import zeus.control
 import zeus.ring
 import zeus.arena
+import zeus.futex { signal_request_available, spin_wait_response }
 
 # ============================================================================
 # Constants
@@ -684,10 +685,39 @@ pub fn zeus_client_submit_request(client: *ZeusClient, worker_idx: i32, req: *Re
     target.body_offset = req.body_offset
     target.body_len = req.body_len
 
-    # Advance write index
+    # Advance write index, then wake any worker blocked on req_futex.
+    # Wake is a no-op (no syscall) when there are no waiters.
     control_block_req_write_inc(cb)
+    signal_request_available(cb)
 
     return 0
+
+# Wait for a response from a specific worker, blocking via futex when the
+# response ring is empty.  Spins for `spin_iters` cheap polls first, then
+# sleeps on `cb.resp_futex` for up to `timeout_ms` milliseconds.  Returns
+# 0 with `resp` and `*got_widx` populated on success, -1 if no response
+# arrived within the timeout, or another negative on argument error.
+#
+# Use this from valet's proxy path to keep an idle valet at 0% CPU
+# between requests; the worker wakes the futex via
+# `signal_response_available` after advancing `resp_write_idx`.
+pub fn zeus_client_wait_response(client: *ZeusClient, worker_idx: i32, resp: *ResponseSlot, got_widx: *i32, spin_iters: i32, timeout_ms: i64) -> i32
+    let handle: *WorkerHandle = zeus_client_get_worker(client, worker_idx)
+    if handle == null
+        return -1
+    if handle.attached == 0
+        return -1
+
+    let cb: *ControlBlock = worker_handle_get_control_block(handle)
+    if cb == null
+        return -1
+
+    # Block on the response futex for this specific worker.  Returns 0 if
+    # a response is available, -1 on timeout.  Either way we then try to
+    # poll across all attached workers — the response we want may belong
+    # to a different worker if pipelining is ever introduced.
+    spin_wait_response(cb, spin_iters, timeout_ms)
+    return zeus_client_poll_response(client, resp, got_widx)
 
 # Poll for response from any worker
 pub fn zeus_client_poll_response(client: *ZeusClient, resp: *ResponseSlot, worker_idx: *i32) -> i32

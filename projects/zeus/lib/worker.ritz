@@ -22,6 +22,7 @@ import zeus.shm
 import zeus.control
 import zeus.ring
 import zeus.arena
+import zeus.futex { signal_response_available, spin_wait_request }
 
 # ============================================================================
 # Worker Context
@@ -112,6 +113,20 @@ pub fn worker_poll_request(ctx: *WorkerContext) -> *RequestSlot
 
     return req_ring + slot_idx
 
+# Wait for a request, blocking via futex when the request ring is empty.
+# Spins for `spin_iters` cheap polls first (covers the common low-latency
+# case without a syscall), then sleeps on `cb.req_futex` for up to
+# `timeout_ms` milliseconds.  Returns the next request slot or null if
+# the timeout elapsed with no request.
+#
+# Use this instead of polling-with-nanosleep to keep idle workers at 0%
+# CPU; producers wake the futex via `signal_request_available` after
+# advancing `req_write_idx`.
+pub fn worker_wait_request(ctx: *WorkerContext, spin_iters: i32, timeout_ms: i64) -> *RequestSlot
+    let cb: *ControlBlock = shm_get_control_block(@ctx.region)
+    spin_wait_request(cb, spin_iters, timeout_ms)
+    return worker_poll_request(ctx)
+
 # Acknowledge that the current request has been processed
 # This advances the read index
 pub fn worker_ack_request(ctx: *WorkerContext)
@@ -146,10 +161,12 @@ pub fn worker_begin_response(ctx: *WorkerContext, request_id: u64) -> *ResponseS
     return slot
 
 # Commit the current response (make it visible to Valet)
-# This advances the write index
+# This advances the write index and wakes any client waiting on the
+# response futex (zero CPU cost when no one is waiting).
 pub fn worker_commit_response(ctx: *WorkerContext)
     let cb: *ControlBlock = shm_get_control_block(@ctx.region)
     control_block_resp_write_inc(cb)
+    signal_response_available(cb)
 
 # ============================================================================
 # Convenience Functions
