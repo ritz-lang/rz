@@ -52,6 +52,15 @@ import mausoleum.btree {
     btree_iter_destroy
 }
 
+# Phase 6: encrypted async path uses the same crypto primitives as the
+# serial `EncryptedChannel` (X25519 + ChaCha20-Poly1305 + HKDF-SHA256),
+# but driven by the io_uring state machine instead of blocking sockets.
+import cryptosec.x25519
+import cryptosec.chacha20_poly1305
+import cryptosec.hkdf
+import cryptosec.random
+import cryptosec.mem
+
 
 # ============================================================================
 # Per-connection session state
@@ -68,10 +77,33 @@ import mausoleum.btree {
 const SESSION_MAX: i32 = 256
 
 # Parse-state values stored in M7SPSession.parse_state.
-const PARSE_NEED_HEADER: i32 = 0     # accumulating bytes 0..PROTO_HEADER_SIZE
-const PARSE_NEED_BODY:   i32 = 1     # have header, accumulating body
-const PARSE_DISPATCHING: i32 = 2     # full message in read_buf, building reply
-const PARSE_SENDING:     i32 = 3     # write submitted, waiting for CQE
+#
+# Plain (--no-encryption) flow uses NEED_HEADER → NEED_BODY → DISPATCHING
+# → SENDING → NEED_HEADER (keep-alive).
+#
+# Encrypted (phase 6) flow prepends two handshake states:
+#   HANDSHAKE_RECV → HANDSHAKE_SEND → NEED_HEADER → NEED_BODY → DISPATCHING
+#   → SENDING → NEED_HEADER (keep-alive)
+# In encrypted mode the bytes accumulated in NEED_HEADER/NEED_BODY are the
+# *outer* encrypted-frame wire bytes ([4 BE length][12 nonce][ct][16 tag]),
+# and DISPATCHING decrypts to plaintext + dispatches + encrypts the reply.
+const PARSE_NEED_HEADER:    i32 = 0  # accumulating bytes 0..PROTO_HEADER_SIZE (plain)
+                                     #   or 0..4 of outer length prefix (encrypted)
+const PARSE_NEED_BODY:      i32 = 1  # have header, accumulating body
+const PARSE_DISPATCHING:    i32 = 2  # full message in read_buf, building reply
+const PARSE_SENDING:        i32 = 3  # write submitted, waiting for CQE
+const PARSE_HANDSHAKE_RECV: i32 = 4  # encrypted: collecting 32-byte client pubkey
+const PARSE_HANDSHAKE_SEND: i32 = 5  # encrypted: server pubkey send in flight
+
+# Outer encrypted-frame layout matches `channel_send` in encrypted_channel.ritz:
+#   [length: 4 BE][nonce: 12][ciphertext: N][tag: 16]
+# So the smallest valid encrypted payload (zero-byte plaintext) is 12+16=28
+# bytes after the 4-byte length prefix, total wire = 32 bytes.
+const ENC_LEN_PREFIX_SIZE: i32 = 4
+const ENC_NONCE_SIZE:      i32 = 12
+const ENC_TAG_SIZE:        i32 = 16
+const ENC_PUBKEY_SIZE:     i32 = 32
+const ENC_KEY_SIZE:        i32 = 32
 
 
 struct M7SPSession
@@ -103,6 +135,19 @@ struct M7SPSession
     big_send_len: i32
     big_send_pos: i32
 
+    # ─── Phase 6: encrypted-channel state (unused in plain mode) ───
+    # X25519 ephemeral keypair + peer pubkey.  After the handshake we
+    # derive a pair of ChaCha20-Poly1305 keys and incrementing nonces
+    # from the shared secret via HKDF-SHA256, matching the byte-for-byte
+    # protocol of `EncryptedChannel` in encrypted_channel.ritz.
+    cipher_private_key:   [32]u8
+    cipher_public_key:    [32]u8
+    cipher_peer_pubkey:   [32]u8
+    cipher_send_key:      [32]u8
+    cipher_recv_key:      [32]u8
+    cipher_send_nonce:    u64
+    cipher_recv_nonce:    u64
+
 
 var g_sessions: [256]M7SPSession
 
@@ -131,8 +176,178 @@ fn m7sp_session_destroy(idx: i32)
         btree_iter_destroy(g_sessions[idx].scan_iter as *BTreeIter)
         g_sessions[idx].scan_iter = 0
     g_sessions[idx].scan_active = 0
+
+    # Zero key material before clearing the slot so it can never leak
+    # into a subsequent session reusing the same index.
+    mem_zero(@g_sessions[idx].cipher_private_key[0], 32)
+    mem_zero(@g_sessions[idx].cipher_send_key[0], 32)
+    mem_zero(@g_sessions[idx].cipher_recv_key[0], 32)
+    g_sessions[idx].cipher_send_nonce = 0
+    g_sessions[idx].cipher_recv_nonce = 0
+
     g_sessions[idx].in_use = 0
     # TODO phase 4-B: if big_send_ptr != 0, munmap it
+
+
+# Encrypted-mode session init.  Mirrors `m7sp_session_init` for parser
+# state, then generates the ephemeral X25519 keypair the server will
+# present in its handshake response.  The peer pubkey + symmetric keys
+# are filled in after we receive the client's first 32 bytes.
+fn m7sp_session_init_encrypted(idx: i32)
+    g_sessions[idx].in_use = 1
+    g_sessions[idx].parse_state = PARSE_HANDSHAKE_RECV
+    g_sessions[idx].msg_len = 0
+    g_sessions[idx].have = 0
+    g_sessions[idx].active_txn = -1
+    g_sessions[idx].next_doc_id = 1
+    g_sessions[idx].scan_iter = 0
+    g_sessions[idx].scan_request_id = 0
+    g_sessions[idx].big_send_ptr = 0
+    g_sessions[idx].big_send_len = 0
+    g_sessions[idx].big_send_pos = 0
+
+    # Generate an ephemeral X25519 keypair.
+    getrandom(@g_sessions[idx].cipher_private_key[0], 32, 0)
+    x25519_clamp(@g_sessions[idx].cipher_private_key[0])
+    x25519_pubkey(@g_sessions[idx].cipher_public_key[0], @g_sessions[idx].cipher_private_key[0])
+
+    g_sessions[idx].cipher_send_nonce = 0
+    g_sessions[idx].cipher_recv_nonce = 0
+
+
+# After the client's pubkey has been copied into `cipher_peer_pubkey`,
+# derive the server's send/recv keys.  Byte-for-byte compatible with
+# `derive_keys` in encrypted_channel.ritz: HKDF-SHA256(salt=0x00, IKM=
+# x25519(priv, peer_pub), info="mausoleum-v1") → 64 bytes; first 32 →
+# server.send (i.e. client.recv), second 32 → server.recv (client.send).
+fn cipher_derive_session_keys(session: *M7SPSession)
+    var shared: [32]u8
+    x25519(@shared[0], @session.cipher_private_key[0], @session.cipher_peer_pubkey[0])
+
+    var prk: [32]u8
+    var salt: [1]u8
+    salt[0] = 0
+    hkdf_extract(@salt[0], 0, @shared[0], 32, @prk[0])
+
+    var okm: [64]u8
+    var info: [12]u8
+    info[0] = 109   # 'm'
+    info[1] = 97    # 'a'
+    info[2] = 117   # 'u'
+    info[3] = 115   # 's'
+    info[4] = 111   # 'o'
+    info[5] = 108   # 'l'
+    info[6] = 101   # 'e'
+    info[7] = 117   # 'u'
+    info[8] = 109   # 'm'
+    info[9] = 45    # '-'
+    info[10] = 118  # 'v'
+    info[11] = 49   # '1'
+    hkdf_expand(@prk[0], @info[0], 12, @okm[0], 64)
+
+    # Server side: send_key=okm[0..32], recv_key=okm[32..64].
+    # Client side mirrors this — see channel_init_client / derive_keys.
+    mem_copy(@session.cipher_send_key[0], @okm[0], 32)
+    mem_copy(@session.cipher_recv_key[0], @okm[32], 32)
+
+    mem_zero(@shared[0], 32)
+    mem_zero(@prk[0], 32)
+    mem_zero(@okm[0], 64)
+
+
+# Build a 12-byte ChaCha20-Poly1305 nonce from a u64 counter.
+# Format matches encrypted_channel.ritz:`build_nonce` exactly:
+#   [0..4] = 0x00 (zero pad)
+#   [4..12] = counter (little-endian)
+fn cipher_build_nonce(nonce: *u8, counter: u64)
+    mem_zero(nonce, 12)
+    *(nonce + 4) = (counter & 0xff) as u8
+    *(nonce + 5) = ((counter >> 8) & 0xff) as u8
+    *(nonce + 6) = ((counter >> 16) & 0xff) as u8
+    *(nonce + 7) = ((counter >> 24) & 0xff) as u8
+    *(nonce + 8) = ((counter >> 32) & 0xff) as u8
+    *(nonce + 9) = ((counter >> 40) & 0xff) as u8
+    *(nonce + 10) = ((counter >> 48) & 0xff) as u8
+    *(nonce + 11) = ((counter >> 56) & 0xff) as u8
+
+
+# Encrypt a plaintext M7SP message into the outer wire format.
+# Writes `[4 BE length][12 nonce][ciphertext: plaintext_len][16 tag]`
+# to wire_out and returns total wire bytes (4 + 12 + plaintext_len + 16),
+# or -1 if it would not fit in `wire_cap`.
+fn cipher_encrypt_msg(session: *M7SPSession, plaintext: *u8, plaintext_len: i32, wire_out: *u8, wire_cap: i32) -> i32
+    let payload_len: i32 = ENC_NONCE_SIZE + plaintext_len + ENC_TAG_SIZE
+    let wire_len: i32 = ENC_LEN_PREFIX_SIZE + payload_len
+    if wire_len > wire_cap
+        return -1
+
+    # 4-byte big-endian length prefix.
+    *(wire_out + 0) = ((payload_len >> 24) & 0xFF) as u8
+    *(wire_out + 1) = ((payload_len >> 16) & 0xFF) as u8
+    *(wire_out + 2) = ((payload_len >> 8) & 0xFF) as u8
+    *(wire_out + 3) = (payload_len & 0xFF) as u8
+
+    # Build the per-message nonce + advance the counter.  Storing into
+    # a local then copying to the wire matches the serial path and
+    # keeps the wire bytes contiguous with the ciphertext for the AEAD.
+    var nonce: [12]u8
+    cipher_build_nonce(@nonce[0], session.cipher_send_nonce)
+    session.cipher_send_nonce += 1
+    mem_copy(wire_out + ENC_LEN_PREFIX_SIZE, @nonce[0], 12)
+
+    let ciphertext: *u8 = wire_out + ENC_LEN_PREFIX_SIZE + ENC_NONCE_SIZE
+    let tag: *u8 = ciphertext + plaintext_len
+    chacha20_poly1305_encrypt(@session.cipher_send_key[0], @nonce[0], null, 0, plaintext, plaintext_len as i64, ciphertext, tag)
+    return wire_len
+
+
+# Decrypt one outer encrypted frame into plaintext.  `wire_in` points
+# at the start of the outer frame (with the 4-byte length prefix); the
+# caller has already validated `wire_len` matches the prefix.  Returns
+# plaintext length on success, or a negative error code:
+#   -1  malformed frame
+#   -2  plaintext would not fit in `plaintext_cap`
+#   -3  nonce zero-pad mismatch (anti-tamper)
+#   -4  nonce counter mismatch (replay)
+#   -5  AEAD authentication failed
+fn cipher_decrypt_msg(session: *M7SPSession, wire_in: *u8, wire_len: i32, plaintext_out: *u8, plaintext_cap: i32) -> i32
+    if wire_len < ENC_LEN_PREFIX_SIZE + ENC_NONCE_SIZE + ENC_TAG_SIZE
+        return -1
+    let payload_len: i32 = wire_len - ENC_LEN_PREFIX_SIZE
+    let ct_len: i32 = payload_len - ENC_NONCE_SIZE - ENC_TAG_SIZE
+    if ct_len < 0
+        return -1
+    if ct_len > plaintext_cap
+        return -2
+
+    let nonce: *u8 = wire_in + ENC_LEN_PREFIX_SIZE
+    if *(nonce + 0) != 0 or *(nonce + 1) != 0 or *(nonce + 2) != 0 or *(nonce + 3) != 0
+        return -3
+
+    var recv_counter: u64 = (*(nonce + 4)) as u64
+    recv_counter = recv_counter | (((*(nonce + 5)) as u64) << 8)
+    recv_counter = recv_counter | (((*(nonce + 6)) as u64) << 16)
+    recv_counter = recv_counter | (((*(nonce + 7)) as u64) << 24)
+    recv_counter = recv_counter | (((*(nonce + 8)) as u64) << 32)
+    recv_counter = recv_counter | (((*(nonce + 9)) as u64) << 40)
+    recv_counter = recv_counter | (((*(nonce + 10)) as u64) << 48)
+    recv_counter = recv_counter | (((*(nonce + 11)) as u64) << 56)
+    if recv_counter != session.cipher_recv_nonce
+        return -4
+    session.cipher_recv_nonce = recv_counter + 1
+
+    let ciphertext: *u8 = wire_in + ENC_LEN_PREFIX_SIZE + ENC_NONCE_SIZE
+    let tag: *u8 = ciphertext + ct_len
+    # `chacha20_poly1305_decrypt` returns 1 on AEAD success, 0 on tag
+    # mismatch — see cryptosec/test/test_chacha20_poly1305.ritz:296
+    # (`if result != 1 return 1`).  The serial path's `channel_recv` in
+    # encrypted_channel.ritz had this inverted historically; we get it
+    # right here AND fix it there in this same commit so both sides
+    # actually round-trip.
+    let result: i32 = chacha20_poly1305_decrypt(@session.cipher_recv_key[0], nonce, null, 0, ciphertext, ct_len as i64, tag, plaintext_out)
+    if result != 1
+        return -5
+    return ct_len
 
 
 # Compute the index of `task` within the TaskPool.tasks[] array.
@@ -780,6 +995,194 @@ fn handle_task_event(task: *Task) -> i32
 
 
 # ============================================================================
+# Phase 6: encrypted connection handler
+# ============================================================================
+#
+# Same shape as `handle_task_event`, but with two extra states ahead of
+# NEED_HEADER and a different interpretation of the bytes accumulated in
+# read_buf.  In encrypted mode:
+#   * read_buf bytes are the *outer* encrypted-frame wire bytes
+#   * NEED_HEADER collects the 4-byte length prefix
+#   * NEED_BODY collects the rest of the frame (nonce + ct + tag)
+#   * DISPATCHING decrypts to a stack plaintext buffer, parses M7SP,
+#     dispatches into the same `m7sp_dispatch` used by the plain path,
+#     and encrypts the response into write_buf before submit_send
+#
+# The dispatcher is shared with the plain path because the decrypted
+# plaintext IS standard M7SP wire format (handle_encrypted_session in
+# the serial path makes the same observation).  Only the I/O boundary
+# changes — Option A in the briefing.
+fn handle_task_event_encrypted(task: *Task) -> i32
+    let idx: i32 = task_to_session_idx(task)
+    let session: *M7SPSession = @g_sessions[idx]
+
+    # ─── First call: encrypted-mode session init, then await client pubkey ───
+    if session.in_use == 0
+        m7sp_session_init_encrypted(idx)
+        let pool: *TaskPool = task.user_data as *TaskPool
+        let ret: i32 = task_submit_recv(pool, task)
+        if ret < 0
+            m7sp_session_destroy(idx)
+            return 1
+        return -1
+
+    # ─── HANDSHAKE_SEND completed: server pubkey delivered.  Move to
+    #     post-handshake encrypted message loop. ───
+    if session.parse_state == PARSE_HANDSHAKE_SEND
+        if task.io_result < 0
+            m7sp_session_destroy(idx)
+            return 1
+        session.parse_state = PARSE_NEED_HEADER
+        session.have = 0
+        session.msg_len = 0
+        let ret: i32 = task_reset_for_recv(task)
+        if ret < 0
+            m7sp_session_destroy(idx)
+            return 1
+        return -1
+
+    # ─── SENDING completed (encrypted reply delivered): keep-alive ───
+    if session.parse_state == PARSE_SENDING
+        if task.io_result < 0
+            m7sp_session_destroy(idx)
+            return 1
+        session.parse_state = PARSE_NEED_HEADER
+        session.have = 0
+        session.msg_len = 0
+        let ret: i32 = task_reset_for_recv(task)
+        if ret < 0
+            m7sp_session_destroy(idx)
+            return 1
+        return -1
+
+    # ─── A recv completed ───
+    let n: i32 = task.io_result
+    if n <= 0
+        m7sp_session_destroy(idx)
+        return 1
+
+    session.have += n
+
+    # ─── HANDSHAKE_RECV: collect 32 bytes of client pubkey ───
+    if session.parse_state == PARSE_HANDSHAKE_RECV
+        if session.have < ENC_PUBKEY_SIZE
+            let ret: i32 = m7sp_submit_recv_at(task, session.have)
+            if ret < 0
+                m7sp_session_destroy(idx)
+                return 1
+            return -1
+
+        # Have full client pubkey — derive session keys, then queue the
+        # server's pubkey for send.  After it ships, the next recv
+        # starts the encrypted post-handshake stream.
+        mem_copy(@session.cipher_peer_pubkey[0], @task.read_buf[0], 32)
+        cipher_derive_session_keys(session)
+        mem_copy(@task.write_buf[0], @session.cipher_public_key[0], 32)
+
+        session.parse_state = PARSE_HANDSHAKE_SEND
+        let pool: *TaskPool = task.user_data as *TaskPool
+        let ret: i32 = task_submit_send(pool, task, ENC_PUBKEY_SIZE)
+        if ret < 0
+            m7sp_session_destroy(idx)
+            return 1
+        return -1
+
+    # ─── NEED_HEADER (encrypted): collect 4-byte outer length prefix ───
+    if session.parse_state == PARSE_NEED_HEADER
+        if session.have < ENC_LEN_PREFIX_SIZE
+            let ret: i32 = m7sp_submit_recv_at(task, session.have)
+            if ret < 0
+                m7sp_session_destroy(idx)
+                return 1
+            return -1
+
+        let h: *u8 = @task.read_buf[0]
+        var payload_len: i32 = (*(h + 0) as i32) << 24
+        payload_len = payload_len | ((*(h + 1) as i32) << 16)
+        payload_len = payload_len | ((*(h + 2) as i32) << 8)
+        payload_len = payload_len | (*(h + 3) as i32)
+
+        # Smallest valid payload: nonce (12) + tag (16); zero ciphertext.
+        if payload_len < ENC_NONCE_SIZE + ENC_TAG_SIZE
+            m7sp_session_destroy(idx)
+            return 1
+        let total_msg_len: i32 = ENC_LEN_PREFIX_SIZE + payload_len
+        # Cap matches the plain path: a single encrypted frame must fit
+        # in the per-task 8 KiB read_buf.  Plaintext capacity is then
+        # 8192 − 32 = 8160 bytes.
+        if total_msg_len > TASK_BUFFER_SIZE
+            m7sp_session_destroy(idx)
+            return 1
+
+        session.msg_len = total_msg_len
+        session.parse_state = PARSE_NEED_BODY
+
+    # ─── NEED_BODY (encrypted): collect bytes until full frame ───
+    if session.parse_state == PARSE_NEED_BODY
+        if session.have < session.msg_len
+            let ret: i32 = m7sp_submit_recv_at(task, session.have)
+            if ret < 0
+                m7sp_session_destroy(idx)
+                return 1
+            return -1
+        session.parse_state = PARSE_DISPATCHING
+
+    # ─── DISPATCHING: decrypt, parse, dispatch, encrypt, submit_send ───
+    if session.parse_state == PARSE_DISPATCHING
+        # Decrypt the inbound frame into a stack plaintext buffer.
+        # 8 KiB matches TASK_BUFFER_SIZE so any frame that fit in the
+        # read buffer also fits decrypted.  Stack frame is ~16 KiB
+        # total (in + out); well within the 8 MiB process default.
+        var plaintext_in: [8192]u8
+        let plaintext_len: i32 = cipher_decrypt_msg(session, @task.read_buf[0], session.msg_len, @plaintext_in[0], 8192)
+        if plaintext_len < 0
+            prints("  [async/enc] decrypt failed code=")
+            print_int(plaintext_len as i64)
+            prints("\n")
+            m7sp_session_destroy(idx)
+            return 1
+
+        var reader: MessageReader
+        let parse_rc: i32 = msgreader_init(@reader, @plaintext_in[0], plaintext_len)
+        if parse_rc != PROTO_OK
+            m7sp_session_destroy(idx)
+            return 1
+
+        let msg_type: i32 = msgreader_msg_type(@reader)
+        let request_id: i32 = msgreader_request_id(@reader)
+
+        # Build the plaintext response.  Cap at TASK_BUFFER_SIZE − 32
+        # so the encrypted form is guaranteed to fit in write_buf.
+        var plaintext_out: [8192]u8
+        var resp: MessageBuffer
+        msgbuf_init(@resp, @plaintext_out[0], 8192 - ENC_LEN_PREFIX_SIZE - ENC_NONCE_SIZE - ENC_TAG_SIZE)
+
+        m7sp_dispatch(@reader, @resp, session, msg_type, request_id)
+
+        let resp_len: i32 = msgbuf_len(@resp)
+        if resp_len <= 0
+            m7sp_session_destroy(idx)
+            return 1
+
+        let wire_len: i32 = cipher_encrypt_msg(session, @plaintext_out[0], resp_len, @task.write_buf[0], TASK_BUFFER_SIZE)
+        if wire_len < 0
+            m7sp_session_destroy(idx)
+            return 1
+
+        session.parse_state = PARSE_SENDING
+        let pool: *TaskPool = task.user_data as *TaskPool
+        let ret: i32 = task_submit_send(pool, task, wire_len)
+        if ret < 0
+            m7sp_session_destroy(idx)
+            return 1
+        return -1
+
+    # Unreachable in the normal state machine
+    m7sp_session_destroy(idx)
+    return 1
+
+
+# ============================================================================
 # Entry point
 # ============================================================================
 
@@ -817,5 +1220,41 @@ pub fn serve_async(listen_fd: i32, pool: *BufferPool, storage: *Storage, collect
     let ret: i32 = task_server_run(srv, handle_task_event)
 
     prints("Mausoleum (async): shutting down\n")
+    task_server_free(srv)
+    return ret
+
+
+# Phase 6: encrypted async serve loop.  Same shape as `serve_async` but
+# wires `handle_task_event_encrypted` into the TaskServer so each new
+# connection starts in PARSE_HANDSHAKE_RECV and runs the X25519 +
+# ChaCha20-Poly1305 handshake before any M7SP traffic.
+#
+# Caller retains ownership of `listen_fd` — this function does NOT close it.
+pub fn serve_async_encrypted(listen_fd: i32, pool: *BufferPool, storage: *Storage, collection: *Collection) -> i32
+    # Same globals as the plain path — the dispatcher is shared.
+    g_pool = pool as i64
+    g_storage = storage as i64
+    g_collection = collection as i64
+
+    for i in 0..SESSION_MAX
+        g_sessions[i].in_use = 0
+
+    prints("Mausoleum (async, encrypted) listening on fd ")
+    print_int(listen_fd as i64)
+    prints("\n")
+
+    let srv: *TaskServer = task_server_create(listen_fd)
+    if srv == null
+        prints("serve_async_encrypted: task_server_create failed\n")
+        return 1
+
+    srv.pool.ring = @srv.ring
+
+    task_server_set_idle_timeout(srv, 60)
+    task_server_set_max_connections(srv, 1000)
+
+    let ret: i32 = task_server_run(srv, handle_task_event_encrypted)
+
+    prints("Mausoleum (async, encrypted): shutting down\n")
     task_server_free(srv)
     return ret
