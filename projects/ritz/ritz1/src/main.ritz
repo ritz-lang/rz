@@ -239,9 +239,16 @@ fn import_is_ritzlib(imp: *ImportPath) -> i32
     seg_view.len = imp.segment_len as i64
     strview_eq_cstr(@seg_view, c"ritzlib")
 
-# Try to open an import file, checking source-dir first, then RITZ_PATH.
+# Try to open an import file, checking source-dir first, then each colon-
+# separated entry in RITZ_PATH (mirroring ritz0/Python's os.pathsep semantics).
 # Returns a fresh String with the resolved path, or empty String if not found.
 # Sets *found_via_ritz_path to 1 when RITZ_PATH was used.
+#
+# Multi-path RITZ_PATH support is essential for the workspace builds: `./rz`
+# orchestrates dependencies across many sibling projects (zeus, valet, nexus,
+# ...) and constructs RITZ_PATH like `/path/ritz:/path/zeus:/path/cryptosec`.
+# Earlier ritz1 only honored the first path, so any cross-project import
+# beyond ritzlib failed with "Could not read import: <module>".
 fn try_open_import(imp: *ImportPath, source_dir: StrView, ritz_path: StrView, found_via_ritz_path: *i32) -> String
     *found_via_ritz_path = 0
 
@@ -257,15 +264,30 @@ fn try_open_import(imp: *ImportPath, source_dir: StrView, ritz_path: StrView, fo
             return candidate
         string_drop(@candidate)
 
-    # Then try RITZ_PATH if set.
+    # Then try each colon-separated entry in RITZ_PATH.
     if ritz_path.len > 0
-        var candidate: String = build_import_path(ritz_path, imp)
-        let fd: i32 = sys_open(string_as_ptr(@candidate), O_RDONLY)
-        if fd >= 0
-            sys_close(fd)
-            *found_via_ritz_path = 1
-            return candidate
-        string_drop(@candidate)
+        var remaining: StrView = ritz_path
+        while remaining.len > 0
+            var seg: StrView
+            var rest: StrView
+            let had_delim: i32 = strview_split_once(@remaining, ':', @seg, @rest)
+
+            if seg.len > 0
+                var candidate: String = build_import_path(seg, imp)
+                let fd: i32 = sys_open(string_as_ptr(@candidate), O_RDONLY)
+                if fd >= 0
+                    sys_close(fd)
+                    *found_via_ritz_path = 1
+                    return candidate
+                string_drop(@candidate)
+
+            if had_delim == 0
+                # No more delimiters; we already tried `seg` (the full
+                # remaining view), so we're done.
+                remaining.ptr = null
+                remaining.len = 0
+            else
+                remaining = rest
 
     string_new()
 
@@ -430,17 +452,42 @@ fn parse_cli(argc: i32, argv: **u8, envp: **u8) -> CliArgs
         return args
     args.output_path = argv[3]
 
-    # Optional -I <path>
+    # Optional -I <path> — additive to RITZ_PATH, not a replacement.
+    # Treats `-I` like gcc's: prepends to the colon-separated lookup list.
+    var dash_i_view: StrView
+    dash_i_view.ptr = null
+    dash_i_view.len = 0
     if argc >= 6
         let dash_i: StrView = strview_from_cstr(argv[4])
         if strview_eq_cstr(@dash_i, c"-I") == 1
-            args.ritz_path = strview_from_cstr(argv[5])
+            dash_i_view = strview_from_cstr(argv[5])
 
-    # Fall back to RITZ_PATH environment variable if -I not provided.
-    if args.ritz_path.len == 0
-        let env_path: *u8 = getenv(envp, c"RITZ_PATH")
-        if env_path != null
-            args.ritz_path = strview_from_cstr(env_path)
+    # Pull RITZ_PATH from env (if any) and merge with -I.  Earlier behaviour
+    # was: -I OVERRIDES env, which broke workspace builds where the wrapper
+    # script (`./rz`) passes a multi-project RITZ_PATH for cross-project
+    # imports, but build.py also passes `-I <ritz_root>` for ritzlib.
+    let env_path: *u8 = getenv(envp, c"RITZ_PATH")
+    var env_view: StrView
+    env_view.ptr = null
+    env_view.len = 0
+    if env_path != null
+        env_view = strview_from_cstr(env_path)
+
+    if dash_i_view.len > 0 and env_view.len > 0
+        # Merge: <-I path>:<env path>.  We allocate a small buffer; this
+        # is leaked by design (the compiler runs once per process).
+        let total: i64 = dash_i_view.len + 1 + env_view.len + 1
+        let buf: *u8 = malloc(total)
+        memcpy(buf, dash_i_view.ptr, dash_i_view.len)
+        *(buf + dash_i_view.len) = ':' as u8
+        memcpy(buf + dash_i_view.len + 1, env_view.ptr, env_view.len)
+        *(buf + dash_i_view.len + 1 + env_view.len) = 0 as u8
+        args.ritz_path.ptr = buf
+        args.ritz_path.len = dash_i_view.len + 1 + env_view.len
+    else if dash_i_view.len > 0
+        args.ritz_path = dash_i_view
+    else if env_view.len > 0
+        args.ritz_path = env_view
 
     args
 
