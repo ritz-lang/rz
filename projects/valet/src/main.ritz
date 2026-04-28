@@ -276,6 +276,7 @@ fn proxy_sleep_ms(ms: i64)
 #     proper header forwarding.
 #   * No streaming, no chunked, no trailers.
 fn handle_zeus_proxy(path: *u8, path_len: i32) -> i32
+    g_proxy_total_entries = g_proxy_total_entries + 1
     let c: *HandlerContext = ctx()
     if c == null
         return -1
@@ -300,6 +301,7 @@ fn handle_zeus_proxy(path: *u8, path_len: i32) -> i32
     # other task can interleave a submit between here and there.
     let claimed_slot: i64 = zeus_client_peek_request_slot(client, worker_idx)
     if claimed_slot < 0
+        g_proxy_ring_full = g_proxy_ring_full + 1
         return ctx_text(503, c"zeus request ring full\n")
 
     var arena: DataArena
@@ -310,6 +312,7 @@ fn handle_zeus_proxy(path: *u8, path_len: i32) -> i32
     # Allocate + copy path bytes
     let path_dst: *u8 = data_arena_alloc(@arena, path_len as i64)
     if path_dst == null
+        g_proxy_arena_oversize = g_proxy_arena_oversize + 1
         return ctx_text(503, c"zeus arena: out of space for path\n")
     for i in 0..path_len
         *(path_dst + i) = *(path + i)
@@ -345,7 +348,9 @@ fn handle_zeus_proxy(path: *u8, path_len: i32) -> i32
 
     let submit_rc: i32 = zeus_client_submit_request(client, worker_idx, @req)
     if submit_rc != 0
+        g_proxy_submit_fail = g_proxy_submit_fail + 1
         return ctx_text(503, c"zeus submit failed\n")
+    g_proxy_total_submits = g_proxy_total_submits + 1
 
     # Cooperative yield: stash per-task state, arm a NOP SQE, return
     # STATUS_PROXY_PENDING.  The framework re-enters via the registered
@@ -369,15 +374,63 @@ fn handle_zeus_proxy(path: *u8, path_len: i32) -> i32
 
     let arm_rc: i32 = valet_proxy_arm_yield(task, 0)
     if arm_rc < 0
+        g_proxy_arm_fail = g_proxy_arm_fail + 1
         valet_proxy_state_clear(task)
         return ctx_text(503, c"zeus: failed to arm yield\n")
 
+    g_proxy_pending_returned = g_proxy_pending_returned + 1
     return STATUS_PROXY_PENDING
 
 
 # Cooperative-yield deadline: how long to keep re-arming yields before
 # giving up with 504.  Matches the legacy sync timeout.
 const PROXY_DEADLINE_SEC: i64 = 5
+
+# Atomic counters bumped only on specific error paths so we can see
+# what's actually firing without per-request log spam (which itself
+# tanks perf — we learned this the hard way at 67 r/s).
+var g_proxy_ring_full: i64 = 0
+var g_proxy_submit_fail: i64 = 0
+var g_proxy_arm_fail: i64 = 0
+var g_proxy_send_fail_continuation: i64 = 0
+var g_proxy_state_lost: i64 = 0       # st == null or in_use == 0 in continuation
+var g_proxy_handle_null: i64 = 0
+var g_proxy_deadline_504: i64 = 0
+var g_proxy_arena_oversize: i64 = 0
+var g_proxy_total_entries: i64 = 0     # handle_zeus_proxy entries
+var g_proxy_total_submits: i64 = 0
+var g_proxy_total_completions: i64 = 0
+var g_proxy_total_continuations: i64 = 0
+var g_proxy_pending_returned: i64 = 0  # times we returned STATUS_PROXY_PENDING
+
+pub fn proxy_dump_counters()
+    prints_cstr(c"[counters] entries=")
+    print_int(g_proxy_total_entries)
+    prints_cstr(c" pending_ret=")
+    print_int(g_proxy_pending_returned)
+    prints_cstr(c" submits=")
+    print_int(g_proxy_total_submits)
+    prints_cstr(c" completions=")
+    print_int(g_proxy_total_completions)
+    prints_cstr(c" continuations=")
+    print_int(g_proxy_total_continuations)
+    prints_cstr(c" ring_full=")
+    print_int(g_proxy_ring_full)
+    prints_cstr(c" submit_fail=")
+    print_int(g_proxy_submit_fail)
+    prints_cstr(c" arm_fail=")
+    print_int(g_proxy_arm_fail)
+    prints_cstr(c" send_fail_cont=")
+    print_int(g_proxy_send_fail_continuation)
+    prints_cstr(c" state_lost=")
+    print_int(g_proxy_state_lost)
+    prints_cstr(c" handle_null=")
+    print_int(g_proxy_handle_null)
+    prints_cstr(c" deadline_504=")
+    print_int(g_proxy_deadline_504)
+    prints_cstr(c" arena_oversize=")
+    print_int(g_proxy_arena_oversize)
+    prints_cstr(c"\n")
 
 
 # Continuation for the cooperative-yield proxy.  Invoked by valet's
@@ -388,8 +441,10 @@ const PROXY_DEADLINE_SEC: i64 = 5
 # reply into task.write_buf and transitions to CONN_STATE_SEND.  On
 # miss, re-arms the yield until the deadline elapses.
 fn handle_zeus_proxy_continuation(task: *Task) -> i32
+    g_proxy_total_continuations = g_proxy_total_continuations + 1
     let st: *ProxyState = valet_proxy_state(task)
     if st == null or st.in_use == 0
+        g_proxy_state_lost = g_proxy_state_lost + 1
         return 1
 
     let client: *ZeusClient = get_zeus_client()
@@ -397,14 +452,16 @@ fn handle_zeus_proxy_continuation(task: *Task) -> i32
         valet_proxy_state_clear(task)
         return 1
 
-    # Inline spin: fast path for responses that arrive within ~40 µs
-    # so we don't pay a yield round-trip when the worker is already
-    # done by the time we re-enter.
+    # Inline spin: most responses are in the ring within tens of
+    # microseconds.  Spinning here avoids the NOP-yield round-trip when
+    # the worker has already produced our response.  N=128 is small
+    # enough not to dominate when we miss (vs. 4096 in earlier
+    # iterations which crushed throughput at low concurrency).
     var resp: ResponseSlot
     response_slot_init(@resp)
     var peek_rc: i32 = 0
     var spin_i: i32 = 0
-    while spin_i < 4096
+    while spin_i < 128
         peek_rc = zeus_client_peek_response(client, st.worker_idx, st.request_id, @resp)
         if peek_rc != 0
             break
@@ -413,6 +470,7 @@ fn handle_zeus_proxy_continuation(task: *Task) -> i32
     if peek_rc == 1
         let handle: *WorkerHandle = zeus_client_get_worker(client, st.worker_idx)
         if handle == null
+            g_proxy_handle_null = g_proxy_handle_null + 1
             valet_proxy_state_clear(task)
             return 1
 
@@ -438,12 +496,15 @@ fn handle_zeus_proxy_continuation(task: *Task) -> i32
         task.handler_state = CONN_STATE_SEND
         let ret: i32 = valet_task_send(task, res.len)
         if ret < 0
+            g_proxy_send_fail_continuation = g_proxy_send_fail_continuation + 1
             return 1
+        g_proxy_total_completions = g_proxy_total_completions + 1
         return -1
 
     # Miss.  Deadline check.
     let now_sec: i64 = get_current_time()
     if now_sec >= st.deadline_sec
+        g_proxy_deadline_504 = g_proxy_deadline_504 + 1
         valet_proxy_state_clear(task)
         var res: Response
         response_init(@res, @task.write_buf[0], 8192)
@@ -466,6 +527,7 @@ fn handle_zeus_proxy_continuation(task: *Task) -> i32
     st.spin_count = st.spin_count + 1
     let arm_rc: i32 = valet_proxy_arm_yield(task, 0)
     if arm_rc < 0
+        g_proxy_arm_fail = g_proxy_arm_fail + 1
         valet_proxy_state_clear(task)
         return 1
     return -1

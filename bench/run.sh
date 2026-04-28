@@ -82,11 +82,40 @@ cleanup() {
     for pid in "${PIDS[@]}"; do
         kill -9 "$pid" 2>/dev/null || true
     done
-    # Belt and braces: also kill any of our debug binaries that linger.
-    pkill -9 -f "$BUILD_DIR/.*/build/debug/(valet|nexus|zeus|mausoleum)" 2>/dev/null || true
+    # Belt and braces: kill any project bench binaries that linger,
+    # using a relative-path regex against the cmdline (matches both
+    # absolute and relative spawns of the binaries — `pkill -f
+    # "$BUILD_DIR/..."` only catches the absolute case and leaves
+    # relative-path orphans behind, which silently steal the bench
+    # ports across runs and produce wildly wrong perf numbers).
+    pkill -9 -f 'projects/(valet|nexus|zeus|mausoleum)/build/' 2>/dev/null || true
     rm -f "$SOCK_PROXY" "$SOCK_PROXY_DB" 2>/dev/null || true
 }
 trap cleanup EXIT
+
+# ────────────────────────────────────────────────────────────────────
+# Orphan guard — refuse to start if there are leftover bench binaries
+# from earlier sessions still running.  These hold the bench ports and
+# cause new `valet -p 9099` spawns to bind their own port without
+# conflict (SO_REUSEPORT), so requests get serviced by the OLD valet
+# with stale code.  This silently invalidates every measurement until
+# someone manually finds and kills them.  Refuse to start so the user
+# notices.
+# ────────────────────────────────────────────────────────────────────
+
+# Note: `|| true` because `grep` exits 1 when there are no matches and
+# `set -e -o pipefail` would abort the whole script on that.
+orphan_pids=$(ps -eo pid,cmd \
+    | grep -E 'projects/(valet|nexus|zeus|mausoleum)/build/' \
+    | grep -v grep \
+    | awk '{print $1}' \
+    | tr '\n' ' ' || true)
+if [[ -n "$orphan_pids" ]]; then
+    echo "[bench] ABORT: orphaned bench binaries still running (pids: $orphan_pids)" >&2
+    echo "[bench]        kill them with:  kill -9 $orphan_pids" >&2
+    echo "[bench]        or:              pkill -9 -f 'projects/(valet|nexus|zeus|mausoleum)/build/'" >&2
+    exit 1
+fi
 
 # Render a config template, replacing BENCH_STATIC_ROOT with the
 # absolute path of the bundled static dir.  Writes the rendered file
