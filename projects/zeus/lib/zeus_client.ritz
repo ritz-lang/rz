@@ -844,3 +844,58 @@ pub fn zeus_client_peek_response(client: *ZeusClient, worker_idx: i32, expected_
     control_block_resp_read_inc(cb)
     return 1
 
+
+# Read a SPECIFIC response slot (by claimed slot index), bypassing the
+# FIFO read-head.  Used for pipelined dispatch where each in-flight
+# task knows the slot index it claimed at submit time.
+#
+# The slot's id field is overwritten by the worker only after the
+# response is fully written (via worker_commit_response which advances
+# resp_write_idx AFTER populating the slot), so checking
+# `slot.id == expected_id` is a reliable "is it ready?" probe.
+#
+# This avoids the FIFO head-of-line issue: with the head-based peek,
+# N concurrent waiters all peek the same head, but only the matching
+# task can consume — if the head's owner has died (connection closed
+# before response landed), every subsequent task gets stuck because
+# nobody removes the dead head.  Slot-direct peek lets each task
+# poll its own slot independently.
+#
+# Returns:
+#    1 — slot has our response; copied to `resp` and slot.id reset to 0.
+#    0 — not ready yet (slot.id != expected_id).
+#   -1 — bad worker_idx / unattached / slot_idx out of range.
+pub fn zeus_client_peek_response_slot(client: *ZeusClient, worker_idx: i32, slot_idx: i64, expected_id: u64, resp: *ResponseSlot) -> i32
+    let handle: *WorkerHandle = zeus_client_get_worker(client, worker_idx)
+    if handle == null
+        return -1
+
+    let cb: *ControlBlock = worker_handle_get_control_block(handle)
+    if cb == null
+        return -1
+
+    if slot_idx < 0 or slot_idx >= cb.ring_capacity
+        return -1
+
+    let ring: *ResponseSlot = worker_handle_get_response_ring(handle)
+    let src: *ResponseSlot = ring + slot_idx
+
+    if src.id != expected_id
+        return 0  # not yet written by the worker
+
+    # Match: copy.  We do NOT advance resp_read_idx (that's tied to the
+    # FIFO head) — the slot is now "consumed" by us, but the ring's
+    # resp_read_idx is just a producer-progress hint.  We mark the
+    # slot empty for our own future reuse by zeroing the id; the
+    # worker overwrites all fields on the next commit anyway.
+    resp.id = src.id
+    resp.status = src.status
+    resp.flags = src.flags
+    resp.headers_offset = src.headers_offset
+    resp.headers_len = src.headers_len
+    resp.body_offset = src.body_offset
+    resp.body_len = src.body_len
+
+    src.id = 0
+    return 1
+
