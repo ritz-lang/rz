@@ -750,3 +750,50 @@ pub fn zeus_client_poll_response(client: *ZeusClient, resp: *ResponseSlot, worke
 
     return -1  # No responses
 
+# Peek at the head of a specific worker's response ring.
+#
+# Pipelining-safe alternative to `zeus_client_poll_response` for use in
+# cooperative-yield proxy paths.  Each task waiting on its own request_id
+# calls this; we only consume the head when its id matches `expected_id`.
+# If the head belongs to another in-flight task, we leave it alone so its
+# owner can claim it.
+#
+# Returns:
+#    1 — head matched and was consumed; `resp` is filled.
+#    0 — ring empty OR head belongs to a different request id (no consume).
+#   -1 — bad worker_idx / unattached.
+#
+# Safe to call concurrently with the worker writing to the ring: the worker
+# advances `resp_write_idx` only AFTER fully populating the slot, so when
+# `control_block_resp_empty(cb) == 0` the head slot is fully visible.
+pub fn zeus_client_peek_response(client: *ZeusClient, worker_idx: i32, expected_id: u64, resp: *ResponseSlot) -> i32
+    let handle: *WorkerHandle = zeus_client_get_worker(client, worker_idx)
+    if handle == null
+        return -1
+
+    let cb: *ControlBlock = worker_handle_get_control_block(handle)
+    if cb == null
+        return -1
+
+    if control_block_resp_empty(cb) != 0
+        return 0  # ring empty
+
+    let ring: *ResponseSlot = worker_handle_get_response_ring(handle)
+    let ring_idx: i64 = control_block_slot_index(cb, cb.resp_read_idx)
+    let src: *ResponseSlot = ring + ring_idx
+
+    if src.id != expected_id
+        return 0  # head belongs to another task — leave alone
+
+    # Match: copy and consume.
+    resp.id = src.id
+    resp.status = src.status
+    resp.flags = src.flags
+    resp.headers_offset = src.headers_offset
+    resp.headers_len = src.headers_len
+    resp.body_offset = src.body_offset
+    resp.body_len = src.body_len
+
+    control_block_resp_read_inc(cb)
+    return 1
+

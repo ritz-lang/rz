@@ -257,6 +257,37 @@ pub fn task_timeout(task: *Task, ts: *KernelTimespec) -> i32
     return task_submit_timeout(pool, task, ts)
 
 
+# Submit a NOP SQE keyed on the task.  NOP fires immediately and is the
+# only universally-supported "wake me up when the kernel processes the
+# next batch" primitive — IORING_OP_TIMEOUT returns EINVAL on some
+# kernels (including WSL2 6.6), and IORING_OP_FUTEX_WAIT is 6.7+.
+#
+# Use cases:
+#   * Cooperative yield: a handler that's polling user-space state
+#     (e.g. a shm-ring response) submits a NOP and yields the task.
+#     The framework dispatches CQE→handler on next loop iteration,
+#     letting other tasks run in between.
+#
+# Cost: tight polling loop while the task is "yielded" — but cheaper
+# than blocking the whole io_uring loop on a futex_wait syscall, and it
+# allows N concurrent tasks to actually overlap their async work.
+pub fn task_submit_nop(pool: *TaskPool, task: *Task) -> i32
+    let sqe = uring_get_sqe(pool.ring)
+    if sqe == null
+        return -12  # ENOMEM
+
+    uring_prep_nop(sqe, task.id)
+    uring_sqe_submit(pool.ring)
+    task.state = TASK_WAITING
+    return 0
+
+
+# Submit NOP using pool from task.user_data
+pub fn task_yield(task: *Task) -> i32
+    let pool = task.user_data as *TaskPool
+    return task_submit_nop(pool, task)
+
+
 # Submit send using pool from task.user_data
 pub fn task_send(task: *Task, len: i32) -> i32
     let pool = task.user_data as *TaskPool
