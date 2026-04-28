@@ -18,6 +18,7 @@ Compilation Model:
 import sys
 import argparse
 from pathlib import Path
+from typing import List
 
 from lexer import Lexer, LexerError
 # Use generated parser with adapter (comment out to use hand-written parser)
@@ -124,6 +125,20 @@ def compile_file(source_path: str, output_path: str, no_runtime: bool = False,
             parser = Parser(tokens)
         module = parser.parse_module()
 
+        # Capture import paths BEFORE resolve_imports — that pass replaces
+        # `module.items` with merged items from all transitive imports and
+        # strips the original Import nodes.  Without this snapshot, the
+        # `import_paths` extraction below the emit step sees an empty list,
+        # which causes every `.ritz.sig` to be written with `imports: []`,
+        # which causes `invalidate_dependents` to never propagate signature
+        # changes to importers — the per-function caching layer silently
+        # never invalidates anyone, manifesting as "I edited a lib and the
+        # binary still has stale code" until you `rm -rf .ritz-cache`.
+        original_import_paths: List[str] = []
+        for _item in module.items:
+            if isinstance(_item, rast.Import):
+                original_import_paths.append('.'.join(_item.path))
+
         # Resolve imports (recursively parse and merge imported modules)
         # Note: use_cache=False because the cache creates stub functions without bodies,
         # which is incompatible with our current merged-module architecture.
@@ -221,18 +236,15 @@ def compile_file(source_path: str, output_path: str, no_runtime: bool = False,
 
         # --- Write .ritz.sig cache with emitted function IR ---
         try:
-            # Extract import paths from the module for the sig file
-            import_paths = []
-            for item in module.items:
-                if isinstance(item, rast.Import):
-                    import_paths.append('.'.join(item.path))
-
+            # Use the import paths captured BEFORE resolve_imports — the
+            # post-resolved module no longer contains Import nodes (they're
+            # replaced by the merged imported items).
             sig_data = build_sig_data(
                 source=source,
                 fn_hashes=fn_hashes,
                 sig_hashes=sig_hashes,
                 fn_ir=emitted_fn_ir,
-                imports=import_paths,
+                imports=original_import_paths,
                 old_sig_data=old_sig_data,
             )
             write_sig_file(source_abs_path, sig_data)

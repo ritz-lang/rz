@@ -595,3 +595,97 @@ class TestFullRoundTrip:
         finally:
             Path(source_path).unlink(missing_ok=True)
             _sig_path(source_path).unlink(missing_ok=True)
+
+
+# ============================================================================
+# Regression: imports must be populated in .sig files
+# ============================================================================
+
+class TestSigImportsPopulated:
+    """Regression: ensure ritz0 captures imports BEFORE resolve_imports strips them.
+
+    The bug: ritz0.compile_file() called resolve_imports(module), which replaces
+    module.items with merged items from all transitive imports and removes the
+    original Import nodes.  The post-emit code that scans module.items for
+    Import nodes then found nothing, so every .ritz.sig was written with
+    `imports: []`.  That broke `invalidate_dependents` — it could never find
+    anyone to invalidate, so signature changes silently never propagated to
+    importers, manifesting as "I edited a lib and the binary still has stale
+    code" until the user rm'd the entire cache.
+    """
+
+    @pytest.mark.integration
+    def test_sig_file_contains_imports_after_full_build(self, tmp_path):
+        """End-to-end: build a 2-file project, .sig file must list imports."""
+        import subprocess
+
+        # Create lib.ritz with a public function
+        lib = tmp_path / "lib.ritz"
+        lib.write_text("pub fn helper() -> i32\n    42\n")
+
+        # Create main.ritz that imports lib
+        main = tmp_path / "main.ritz"
+        main.write_text(
+            "import lib\n\n"
+            "fn main() -> i32\n"
+            "    helper()\n"
+        )
+
+        # Compile main.ritz
+        ritz0_dir = Path(__file__).parent.parent
+        result = subprocess.run(
+            [sys.executable, str(ritz0_dir / "ritz0.py"),
+             str(main), "-o", str(tmp_path / "main.ll")],
+            capture_output=True, text=True, cwd=str(tmp_path),
+        )
+        assert result.returncode == 0, f"compile failed: {result.stderr}"
+
+        # The .sig for main.ritz must include 'lib' in its imports list,
+        # otherwise invalidate_dependents can never find main.ritz when
+        # lib.ritz changes.
+        sig_path = tmp_path / "main.ritz.sig"
+        assert sig_path.exists(), "main.ritz.sig was not created"
+
+        sig_data = json.loads(sig_path.read_text())
+        imports = sig_data.get("imports", [])
+        assert "lib" in imports, (
+            f"main.ritz.sig imports={imports} — must contain 'lib'.  "
+            f"If this is empty, ritz0 is stripping Import nodes before "
+            f"capturing them (the bug this test guards against)."
+        )
+
+    @pytest.mark.unit
+    def test_invalidate_dependents_finds_dependent_via_sig_imports(self, tmp_path):
+        """When sig files have correct imports, invalidate_dependents finds them."""
+        # Setup: two sig files. main.ritz.sig declares it imports 'lib'.
+        lib_sig = tmp_path / "lib.ritz.sig"
+        lib_sig.write_text(json.dumps({
+            "source_hash": "abc",
+            "functions": {"helper": {"hash": "h1", "sig_hash": "s1", "ir": ""}},
+            "imports": [],
+        }))
+
+        main_sig = tmp_path / "main.ritz.sig"
+        main_sig.write_text(json.dumps({
+            "source_hash": "def",
+            "functions": {"main": {"hash": "h2", "sig_hash": "s2", "ir": ""}},
+            "imports": ["lib"],
+        }))
+
+        # Simulate lib.ritz signature changing.  invalidate_dependents should
+        # find main.ritz.sig (it imports 'lib') and delete it.
+        lib_path = tmp_path / "lib.ritz"
+        lib_path.write_text("pub fn helper() -> i32\n    99\n")
+
+        invalidated = invalidate_dependents(
+            str(lib_path),
+            changed_sigs=["helper"],
+            project_root=str(tmp_path),
+        )
+
+        assert str(main_sig) in invalidated, (
+            f"main.ritz.sig should have been invalidated; got {invalidated}"
+        )
+        assert not main_sig.exists(), "main.ritz.sig should have been deleted"
+        # lib.ritz.sig is the source of the change — should NOT be deleted
+        assert lib_sig.exists(), "lib.ritz.sig should not have been deleted"
