@@ -230,6 +230,32 @@ pub fn task_recv(task: *Task) -> i32
     let pool = task.user_data as *TaskPool
     return task_submit_recv(pool, task)
 
+# Submit a relative timeout SQE.  When the timer fires, the runtime
+# wakes the task with `io_result` set to the kernel return code
+# (typically -ETIME / -62 for a clean timeout).  Used to yield the
+# task while polling user-space state — e.g. valet's proxy waiting on
+# a shm-ring response from a zeus worker without blocking other
+# connections in-flight.
+#
+# The KernelTimespec MUST live until the CQE fires.  Pass a pointer
+# into stable storage (a Task field, a static, or the task's own
+# read/write buf) — not a stack temporary.
+pub fn task_submit_timeout(pool: *TaskPool, task: *Task, ts: *KernelTimespec) -> i32
+    let sqe = uring_get_sqe(pool.ring)
+    if sqe == null
+        return -12  # ENOMEM
+
+    # count=0, flags=0 means "fire after the relative duration in ts".
+    uring_prep_timeout(sqe, ts, 0, 0, task.id)
+    uring_sqe_submit(pool.ring)
+    task.state = TASK_WAITING
+    return 0
+
+# Submit timeout using pool from task.user_data
+pub fn task_timeout(task: *Task, ts: *KernelTimespec) -> i32
+    let pool = task.user_data as *TaskPool
+    return task_submit_timeout(pool, task, ts)
+
 
 # Submit send using pool from task.user_data
 pub fn task_send(task: *Task, len: i32) -> i32
