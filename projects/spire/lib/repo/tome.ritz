@@ -51,8 +51,13 @@ import tome.tome { store_exists, store_del, store_setex }
 import tome.tome { store_expire, store_ttl, store_persist }
 import tome.tome { store_clear, store_len, store_is_empty }
 
-import tome.client { TomeClient, client_new }
-import tome.client { client_connect, client_disconnect, client_is_connected }
+# NB: tome.client is intentionally NOT imported here.  Its `client_*`
+# symbols clash with mausoleum.client at the global linker level when a
+# binary uses both adapters (e.g. nexus, which uses mausoleum + tome).
+# TCP mode is structurally scaffolded but per-op routes return
+# CACHE_ERR_NOT_IMPLEMENTED — the client field is held as an opaque
+# `*u8` and lit up only when binary-safe RESP framing helpers land in
+# tome.client AND the client_* symbols are renamed (e.g. tome_client_*).
 
 # ============================================================================
 # Cache modes
@@ -87,8 +92,9 @@ pub struct Cache
     store: Store
 
     # TCP backing connection (used when mode == CACHE_MODE_TCP).
-    # Connection params + client handle.
-    client: *TomeClient
+    # Connection params + opaque client handle.  Held as `*u8` until
+    # tome.client's symbols are namespaced (see comment at top).
+    client: *u8
     host: [64]u8
     host_len: i32
     port: i32
@@ -146,19 +152,10 @@ pub fn cache_connect(c: *Cache) -> i32
         return CACHE_OK
 
     if c.mode == CACHE_MODE_TCP
-        if c.connected != 0
-            return CACHE_OK
-        # Lazily allocate the client.  Note `client_new` returns a value;
-        # we copy it onto the heap so we can pass `*TomeClient` around.
-        let raw: *u8 = malloc(8 * 16)  # rough TomeClient size
-        c.client = raw as *TomeClient
-        *(c.client) = client_new()
-        # `client_connect` takes host as i32 (likely an IP).  For now,
-        # only loopback is interesting (callers stash 127.0.0.1).
-        # See the tome client API; this needs a binary-safe wrapper.
-        # TODO: wire host string → numeric address; for now this branch
-        # is structurally complete but the connection itself returns
-        # CACHE_ERR_NOT_IMPLEMENTED until the address translation lands.
+        # TCP path is intentionally not wired yet.  See file header
+        # for the rationale (client_* symbol clash with mausoleum.client
+        # at link time).  The branch is shaped so adding a real connect
+        # is additive once tome's symbols are namespaced.
         return CACHE_ERR_NOT_IMPLEMENTED
 
     return CACHE_ERR_BAD_MODE
@@ -176,10 +173,12 @@ pub fn cache_close(c: *Cache)
         return
 
     if c.mode == CACHE_MODE_TCP
+        # No-op for now — TCP path never allocated a client (see
+        # cache_connect above).  When the symbol clash is resolved and
+        # we wire real connect, this branch will free the client and
+        # call client_disconnect.
         if c.client != null
-            if c.connected != 0
-                client_disconnect(c.client)
-            free(c.client as *u8)
+            free(c.client)
             c.client = null
         c.connected = 0
         return
