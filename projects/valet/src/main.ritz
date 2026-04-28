@@ -50,7 +50,9 @@ import zeus.zeus_client {
     zeus_client_submit_request,
     zeus_client_poll_response,
     zeus_client_wait_response,
+    zeus_client_peek_request_slot,
     worker_handle_get_arena,
+    worker_handle_get_slot_arena,
     WorkerHandle
 }
 import zeus.ring {
@@ -289,8 +291,17 @@ fn handle_zeus_proxy(path: *u8, path_len: i32) -> i32
     if handle == null
         return ctx_text(503, c"zeus worker handle null\n")
 
+    # Per-slot arena: peek the slot the next submit will write to and
+    # allocate path / body bytes inside that slot's exclusive region.
+    # In the single-threaded coroutine model this peek is sticky for
+    # the duration of straight-line code up to submit_request — no
+    # other task can interleave a submit between here and there.
+    let claimed_slot: i64 = zeus_client_peek_request_slot(client, worker_idx)
+    if claimed_slot < 0
+        return ctx_text(503, c"zeus request ring full\n")
+
     var arena: DataArena
-    worker_handle_get_arena(handle, @arena)
+    worker_handle_get_slot_arena(handle, claimed_slot, @arena)
     if arena.base == null
         return ctx_text(503, c"zeus arena unavailable\n")
 
@@ -348,9 +359,14 @@ fn handle_zeus_proxy(path: *u8, path_len: i32) -> i32
     if poll_rc != 0
         return ctx_text(504, c"zeus worker timeout\n")
 
-    # Re-derive arena and resolve body offset → pointer.
+    # Re-derive the same slot's arena view to resolve the response body
+    # offset.  Worker writes its response into the same slot it pulled
+    # the request from (`current_req_idx & ring_mask`), which is the
+    # same slot we claimed above — body_offset is global so any view
+    # over the same arena base would resolve correctly, but using the
+    # slot view keeps the symmetry explicit.
     var arena2: DataArena
-    worker_handle_get_arena(handle, @arena2)
+    worker_handle_get_slot_arena(handle, claimed_slot, @arena2)
     let body_ptr: *u8 = data_arena_offset_to_ptr(@arena2, resp.body_offset as i64)
 
     # Forward to the HTTP client.  Status from worker, Content-Length from

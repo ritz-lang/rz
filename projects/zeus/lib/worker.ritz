@@ -171,33 +171,61 @@ pub fn worker_commit_response(ctx: *WorkerContext)
 # ============================================================================
 # Convenience Functions
 # ============================================================================
+#
+# All arena accessors here use the per-slot partitioned arena keyed on
+# `ctx.current_req_idx & ring_mask`.  This is correct for both sync and
+# pipelined dispatch:
+#
+#   * Sync: worker processes one request at a time.  current_req_idx
+#     points at the slot in flight; reads and the response allocation
+#     all use that slot's region (overwriting request bytes once they're
+#     read is fine — they're the worker's to reuse).
+#
+#   * Pipelined (multiple producer tasks in flight): each producer
+#     allocated its path/body in its own slot's region, so when the
+#     worker pulls request N and asks for the path, it goes to slot N's
+#     region and finds the right bytes.  No producer-side overlap.
+#
+# Offsets are GLOBAL (relative to the arena base, not slot start), so
+# callers can pass them through ring slot fields unchanged.
+
+# Compute the slot index for the request currently being processed.
+# Valid only between worker_poll_request and worker_ack_request.
+pub fn worker_current_slot_idx(ctx: *WorkerContext) -> i64
+    let cb: *ControlBlock = shm_get_control_block(@ctx.region)
+    return ctx.current_req_idx & cb.ring_mask
 
 # Get pointer to request path in arena
 pub fn worker_get_request_path(ctx: *WorkerContext, req: *RequestSlot) -> *u8
     var arena: DataArena
-    shm_get_arena(@ctx.region, @arena)
+    shm_get_slot_arena(@ctx.region, worker_current_slot_idx(ctx), @arena)
     return data_arena_offset_to_ptr(@arena, req.path_offset as i64)
 
 # Get pointer to request body in arena
 pub fn worker_get_request_body(ctx: *WorkerContext, req: *RequestSlot) -> *u8
     var arena: DataArena
-    shm_get_arena(@ctx.region, @arena)
+    shm_get_slot_arena(@ctx.region, worker_current_slot_idx(ctx), @arena)
     return data_arena_offset_to_ptr(@arena, req.body_offset as i64)
 
 # Get pointer to request headers in arena
 pub fn worker_get_request_headers(ctx: *WorkerContext, req: *RequestSlot) -> *u8
     var arena: DataArena
-    shm_get_arena(@ctx.region, @arena)
+    shm_get_slot_arena(@ctx.region, worker_current_slot_idx(ctx), @arena)
     return data_arena_offset_to_ptr(@arena, req.headers_offset as i64)
 
-# Allocate space in arena for response data
+# Allocate space in arena for response data.  The allocation goes into
+# the same slot whose request we're processing — request bytes have
+# already been read by the time apps allocate response bytes, so
+# overwriting them is safe.
 pub fn worker_alloc_response_data(ctx: *WorkerContext, size: i64) -> *u8
     var arena: DataArena
-    shm_get_arena(@ctx.region, @arena)
+    shm_get_slot_arena(@ctx.region, worker_current_slot_idx(ctx), @arena)
     return data_arena_alloc(@arena, size)
 
-# Get offset for a pointer (for setting in response slots)
+# Get global offset for a pointer (for setting in response slots).
+# Stored in resp.body_offset / headers_offset and consumed by valet via
+# `data_arena_offset_to_ptr` against its own arena view.
 pub fn worker_ptr_to_offset(ctx: *WorkerContext, ptr: *u8) -> i64
     var arena: DataArena
-    shm_get_arena(@ctx.region, @arena)
+    shm_get_slot_arena(@ctx.region, worker_current_slot_idx(ctx), @arena)
     return data_arena_ptr_to_offset(@arena, ptr)

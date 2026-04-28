@@ -651,6 +651,53 @@ pub fn worker_handle_get_arena(handle: *WorkerHandle, arena: *DataArena)
     arena.size = size
     arena.offset = 0
 
+
+# Get the slot index that the next call to `zeus_client_submit_request`
+# will write into (assuming the ring isn't full).  Used by callers that
+# need to claim a per-slot arena partition BEFORE allocating path/body
+# bytes — e.g. cooperative-yield pipelining where multiple in-flight
+# requests must not overlap each other's arena regions.
+#
+# Returns -1 if the ring is full (caller should back off / retry).
+#
+# Single-threaded io_uring guarantee: between a successful peek and the
+# matching submit_request, no other coroutine in the same valet process
+# can interleave a submit (handler runs straight-line until it yields),
+# so the peek is sticky for the calling task.
+pub fn zeus_client_peek_request_slot(client: *ZeusClient, worker_idx: i32) -> i64
+    let handle: *WorkerHandle = zeus_client_get_worker(client, worker_idx)
+    if handle == null
+        return -1
+    let cb: *ControlBlock = worker_handle_get_control_block(handle)
+    if cb == null
+        return -1
+    if control_block_req_full(cb) != 0
+        return -1
+    return control_block_slot_index(cb, cb.req_write_idx)
+
+
+# Get the per-slot arena partition for a worker handle.  See
+# `shm_get_slot_arena` in shm.ritz — same semantics, but driven from
+# the client-side WorkerHandle (which doesn't have a ShmRegion struct).
+#
+# Use this in tandem with `zeus_client_peek_request_slot` to pick where
+# you'll write, then allocate path / body bytes inside that slot's
+# region before submitting.
+pub fn worker_handle_get_slot_arena(handle: *WorkerHandle, slot_idx: i64, arena: *DataArena)
+    if handle.shm_base == null
+        arena.base = null
+        arena.size = 0
+        arena.offset = 0
+        return
+
+    let cb: *ControlBlock = handle.shm_base as *ControlBlock
+    let arena_base_offset: i64 = calculate_arena_offset(cb)
+    let arena_total_size: i64 = handle.shm_size - arena_base_offset
+    let slot_size: i64 = arena_total_size / cb.ring_capacity
+    let slot_offset: i64 = slot_idx * slot_size
+
+    data_arena_attach_slot(arena, handle.shm_base + arena_base_offset, slot_offset, slot_size)
+
 # ============================================================================
 # Request/Response Operations
 # ============================================================================

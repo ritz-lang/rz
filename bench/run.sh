@@ -206,7 +206,7 @@ wait_ready "$PORT_STATIC" 5
 # D/E: zeus + nexus, in-memory (no mausoleum running) — proxied via valet:9003
 if [[ "$SKIP" != *proxy* ]]; then
     echo "[bench] starting zeus + nexus (in-memory) on $SOCK_PROXY" >&2
-    "$BUILD_DIR/zeus/build/debug/zeus" -f -v -w "$WORKERS" -m 65536 -s "$SOCK_PROXY" \
+    "$BUILD_DIR/zeus/build/debug/zeus" -f -v -w "$WORKERS" -m 1048576 -s "$SOCK_PROXY" \
         "$BUILD_DIR/nexus/build/debug/nexus" \
         >"$LOG_DIR/z-inmem.log" 2>&1 &
     record_pid "$!"
@@ -235,7 +235,7 @@ if [[ "$SKIP" != *mausoleum* ]] && [[ "$SKIP" != *proxy* ]]; then
     sleep 1
 
     echo "[bench] starting zeus + nexus (mausoleum-backed) on $SOCK_PROXY_DB" >&2
-    "$BUILD_DIR/zeus/build/debug/zeus" -f -v -w "$WORKERS" -m 65536 -s "$SOCK_PROXY_DB" \
+    "$BUILD_DIR/zeus/build/debug/zeus" -f -v -w "$WORKERS" -m 1048576 -s "$SOCK_PROXY_DB" \
         "$BUILD_DIR/nexus/build/debug/nexus" \
         >"$LOG_DIR/z-db.log" 2>&1 &
     record_pid "$!"
