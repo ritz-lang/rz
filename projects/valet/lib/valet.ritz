@@ -111,6 +111,8 @@ struct HandlerContext
     path_len: i32                   # Path length
     raw_buf: *u8                    # Raw request buffer (for header access)
     raw_len: i32                    # Length of raw request data
+    task: *Task                     # Owning task (cooperative-yield proxy uses this
+                                    # to arm yield SQEs and key the side-table)
 
 
 # ============================================================================
@@ -318,6 +320,16 @@ pub fn valet_static(app: *Valet, prefix: *u8, root: *u8)
 # Get current handler context (call from within a route handler)
 pub fn ctx() -> *HandlerContext
     return get_g_ctx()
+
+
+# Get the Task pointer for the current handler.  Only valid from inside
+# a route handler.  Used by the cooperative-yield proxy to arm yield
+# SQEs and key its per-task side-table (ProxyState).
+pub fn ctx_task() -> *Task
+    let c: *HandlerContext = get_g_ctx()
+    if c == null
+        return null
+    return c.task
 
 
 # Get captured route parameter by index
@@ -747,6 +759,129 @@ const CONN_STATE_RECV: i32 = 0
 const CONN_STATE_PARSE: i32 = 1
 const CONN_STATE_SEND: i32 = 2
 const CONN_STATE_STATIC: i32 = 3  # Serving static file
+const CONN_STATE_PROXY_WAIT: i32 = 4  # Cooperative-yield proxy: wakeup pending
+
+
+# ============================================================================
+# Cooperative-yield proxy support
+# ============================================================================
+#
+# The valet `--zeus-socket` proxy used to block its task on a futex_wait
+# while the zeus worker computed the response.  Single-threaded io_uring
+# means a blocked task = no other connection makes progress.  Throughput
+# was capped at one-roundtrip-at-a-time even with 100 concurrent
+# connections.
+#
+# This framework wires a cooperative-yield model: the proxy handler
+# submits the request to the shm ring, claims a per-task ProxyState
+# slot, arms an io_uring NOP SQE (the yield primitive — see ritzlib's
+# task_submit_nop), and returns STATUS_PROXY_PENDING.  The framework
+# transitions the connection to CONN_STATE_PROXY_WAIT and the io_uring
+# loop is free to dispatch other tasks.  When the NOP CQE fires, the
+# framework re-enters via the registered continuation, which peeks the
+# response ring (peek-by-id, see zeus_client_peek_response — only
+# consumes when the head matches our request_id) and either builds the
+# HTTP reply or re-arms the yield until the deadline elapses.
+#
+# Per-task state lives in a side-table keyed by task slot in the pool;
+# the slot index is computed via valet_task_slot_idx (O(MAX_TASKS) but
+# cheap — sub-microsecond).  Adding a slot-index field to ritzlib's
+# Task would avoid the iteration but would touch every binary that
+# uses the framework, which isn't worth the saving.
+
+# Sentinel return code from a route handler meaning "I've armed an SQE
+# and yielded — don't send any response yet, transition the connection
+# to CONN_STATE_PROXY_WAIT and re-enter via the registered continuation
+# when the next CQE wakes the task."  Outside any plausible HTTP-status
+# space and the normal 0/-1 handler-return convention.
+pub const STATUS_PROXY_PENDING: i32 = 0x70CEED
+
+
+# Per-task proxy state, indexed by task slot in the pool.  Lives across
+# yields (handler return ↔ CQE re-entry).
+pub struct ProxyState
+    in_use: i32              # 0 = free, 1 = a request is in flight
+    worker_idx: i32          # which zeus worker we submitted to
+    request_id: u64          # the response id we're waiting for
+    claimed_slot: i64        # ring slot we claimed for path/body bytes
+    deadline_sec: i64        # gettimeofday tv_sec at the give-up moment
+    spin_count: i32          # bookkeeping: number of yields so far
+    _pad: i32
+
+
+# Per-task side-table.  256 slots = MAX_TASKS in ritzlib.
+var g_proxies: [256]ProxyState
+
+
+# Continuation hook — set once at startup by valet_set_proxy_continuation.
+# Called when a CONN_STATE_PROXY_WAIT task wakes via a CQE.  Returns
+# the same convention as a route handler:
+#   0  — done, response sent (framework keeps connection alive)
+#   -1 — still pending (continuation re-armed yield or submitted send)
+#    1 — fatal error, close connection
+var g_proxy_continuation_ptr: i64 = 0
+
+
+pub fn valet_set_proxy_continuation(f: fn(*Task) -> i32)
+    g_proxy_continuation_ptr = f as i64
+
+
+fn get_proxy_continuation() -> fn(*Task) -> i32
+    return g_proxy_continuation_ptr as fn(*Task) -> i32
+
+
+# Find the slot index of a task within its pool.  O(MAX_TASKS) — sub-µs.
+pub fn valet_task_slot_idx(task: *Task) -> i32
+    let pool: *TaskPool = task.user_data as *TaskPool
+    if pool == null
+        return -1
+    var i: i32 = 0
+    while i < 256
+        if @pool.tasks[i] == task
+            return i
+        i = i + 1
+    return -1
+
+
+# Get the proxy state for a task.  Returns null if the slot can't be
+# resolved (shouldn't happen for an active task).
+pub fn valet_proxy_state(task: *Task) -> *ProxyState
+    let idx: i32 = valet_task_slot_idx(task)
+    if idx < 0
+        return null
+    return @g_proxies[idx]
+
+
+# Clear the proxy state for a task.  Call from the continuation when
+# the request is fully resolved or timed out so the slot can be reused
+# on the next request (keep-alive).
+pub fn valet_proxy_state_clear(task: *Task)
+    let st: *ProxyState = valet_proxy_state(task)
+    if st != null
+        st.in_use = 0
+        st.worker_idx = -1
+        st.request_id = 0
+        st.claimed_slot = 0
+        st.deadline_sec = 0
+        st.spin_count = 0
+
+
+# Yield the calling task and request a wake on the next event loop pass.
+#
+# Implementation: NOP SQE.  IORING_OP_TIMEOUT returns -EINVAL on some
+# kernels (notably WSL2 6.6 — see the disabled
+# task_server_submit_idle_timeout for the precedent), and
+# IORING_OP_FUTEX_WAIT is 6.7+.  NOP fires immediately, generating a
+# CQE that re-dispatches us through valet_handle_connection's
+# CONN_STATE_PROXY_WAIT branch.  Other tasks get to run between the
+# submit and the re-dispatch, which is the whole point of pipelining.
+#
+# `_micros` is reserved for future kernels with working timers; ignored
+# today.  The continuation manages an overall deadline (g_proxies
+# .deadline_sec) so we don't spin forever.
+pub fn valet_proxy_arm_yield(task: *Task, _micros: i64) -> i32
+    let pool: *TaskPool = task.user_data as *TaskPool
+    return task_submit_nop(pool, task)
 
 
 # Check if path matches static prefix and serve file if so
@@ -913,6 +1048,7 @@ pub fn valet_handle_connection(task: *Task) -> i32
         handler_ctx.path_len = req.path_len
         handler_ctx.raw_buf = @task.read_buf[0]
         handler_ctx.raw_len = task.read_len
+        handler_ctx.task = task
         set_g_ctx(@handler_ctx)
 
         # Run middleware pipeline
@@ -984,6 +1120,18 @@ pub fn valet_handle_connection(task: *Task) -> i32
                     let h: fn(*u8, i32) -> i32 = route_result.handler
                     let status: i32 = h(req.path_ptr, req.path_len)
 
+                    # Cooperative-yield proxy: handler armed a yield SQE
+                    # and asked for re-entry on CQE.  Don't send any
+                    # response yet — transition to CONN_STATE_PROXY_WAIT.
+                    # After-interceptors are deferred until the
+                    # continuation finalises the response (typical
+                    # interceptors don't run for the proxy path so this
+                    # is academic in current usage).
+                    if status == STATUS_PROXY_PENDING
+                        set_g_ctx(null)
+                        task.handler_state = CONN_STATE_PROXY_WAIT
+                        return -1
+
                     # Run per-route after interceptors (in reverse order)
                     route_run_after(route_result.route, req.path_ptr, req.path_len)
 
@@ -1011,6 +1159,18 @@ pub fn valet_handle_connection(task: *Task) -> i32
         if ret < 0
             return 1
         return -1
+
+    # State: PROXY_WAIT - cooperative-yield proxy continuation.
+    # Triggered by a NOP/timer/futex CQE for a task that earlier returned
+    # STATUS_PROXY_PENDING.  Dispatch to the registered continuation,
+    # which peeks the response ring (peek-by-id) and either builds the
+    # final reply (transition to CONN_STATE_SEND) or re-arms the yield.
+    if task.handler_state == CONN_STATE_PROXY_WAIT
+        let cont: fn(*Task) -> i32 = get_proxy_continuation()
+        if cont == null
+            # Nothing registered — bail out cleanly rather than spin.
+            return 1
+        return cont(task)
 
     # State: SEND - wait for send completion
     if task.handler_state == CONN_STATE_SEND
@@ -1238,6 +1398,7 @@ pub fn valet_handle_tls_connection(task: *Task) -> i32
         handler_ctx.path_len = req.path_len
         handler_ctx.raw_buf = @plaintext[0]
         handler_ctx.raw_len = plaintext_len as i32
+        handler_ctx.task = task
         set_g_ctx(@handler_ctx)
 
         # Run middleware

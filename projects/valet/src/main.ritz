@@ -25,6 +25,7 @@ import lib.log
 import lib.router
 import lib.json_builder
 import lib.response {
+    response_init,
     response_status,
     response_header,
     response_content_length,
@@ -50,6 +51,7 @@ import zeus.zeus_client {
     zeus_client_submit_request,
     zeus_client_poll_response,
     zeus_client_wait_response,
+    zeus_client_peek_response,
     zeus_client_peek_request_slot,
     worker_handle_get_arena,
     worker_handle_get_slot_arena,
@@ -345,39 +347,128 @@ fn handle_zeus_proxy(path: *u8, path_len: i32) -> i32
     if submit_rc != 0
         return ctx_text(503, c"zeus submit failed\n")
 
-    # Wait up to ~5s for the response.  Spin a few thousand iterations
-    # (covers the common <100µs case without a syscall) then block on
-    # the worker's resp_futex — the worker wakes us via
-    # `signal_response_available` after committing.  This replaces a
-    # 500×10ms nanosleep poll loop that burned valet's idle CPU after
-    # any traffic burst.
+    # Cooperative yield: stash per-task state, arm a NOP SQE, return
+    # STATUS_PROXY_PENDING.  The framework re-enters via the registered
+    # continuation when the CQE fires.  This decouples valet's task
+    # loop from any one worker's response time — pipelined requests
+    # actually overlap.
+    let task: *Task = ctx_task()
+    if task == null
+        return ctx_text(503, c"zeus: no task in ctx\n")
+
+    let st: *ProxyState = valet_proxy_state(task)
+    if st == null
+        return ctx_text(503, c"zeus: proxy state unavailable\n")
+
+    st.in_use = 1
+    st.worker_idx = worker_idx
+    st.request_id = req.id
+    st.claimed_slot = claimed_slot
+    st.spin_count = 0
+    st.deadline_sec = get_current_time() + PROXY_DEADLINE_SEC
+
+    let arm_rc: i32 = valet_proxy_arm_yield(task, 0)
+    if arm_rc < 0
+        valet_proxy_state_clear(task)
+        return ctx_text(503, c"zeus: failed to arm yield\n")
+
+    return STATUS_PROXY_PENDING
+
+
+# Cooperative-yield deadline: how long to keep re-arming yields before
+# giving up with 504.  Matches the legacy sync timeout.
+const PROXY_DEADLINE_SEC: i64 = 5
+
+
+# Continuation for the cooperative-yield proxy.  Invoked by valet's
+# framework whenever a CQE wakes a CONN_STATE_PROXY_WAIT task.  Peeks
+# the saved worker's response ring with peek-by-id (consumes only when
+# the head matches our request_id, leaves other in-flight requests'
+# heads alone for their owners to claim).  On hit, builds the HTTP
+# reply into task.write_buf and transitions to CONN_STATE_SEND.  On
+# miss, re-arms the yield until the deadline elapses.
+fn handle_zeus_proxy_continuation(task: *Task) -> i32
+    let st: *ProxyState = valet_proxy_state(task)
+    if st == null or st.in_use == 0
+        return 1
+
+    let client: *ZeusClient = get_zeus_client()
+    if client == null
+        valet_proxy_state_clear(task)
+        return 1
+
+    # Inline spin: fast path for responses that arrive within ~40 µs
+    # so we don't pay a yield round-trip when the worker is already
+    # done by the time we re-enter.
     var resp: ResponseSlot
     response_slot_init(@resp)
-    var got_widx: i32 = -1
-    let poll_rc: i32 = zeus_client_wait_response(client, worker_idx, @resp, @got_widx, 4096, 5000)
+    var peek_rc: i32 = 0
+    var spin_i: i32 = 0
+    while spin_i < 4096
+        peek_rc = zeus_client_peek_response(client, st.worker_idx, st.request_id, @resp)
+        if peek_rc != 0
+            break
+        spin_i = spin_i + 1
 
-    if poll_rc != 0
-        return ctx_text(504, c"zeus worker timeout\n")
+    if peek_rc == 1
+        let handle: *WorkerHandle = zeus_client_get_worker(client, st.worker_idx)
+        if handle == null
+            valet_proxy_state_clear(task)
+            return 1
 
-    # Re-derive the same slot's arena view to resolve the response body
-    # offset.  Worker writes its response into the same slot it pulled
-    # the request from (`current_req_idx & ring_mask`), which is the
-    # same slot we claimed above — body_offset is global so any view
-    # over the same arena base would resolve correctly, but using the
-    # slot view keeps the symmetry explicit.
-    var arena2: DataArena
-    worker_handle_get_slot_arena(handle, claimed_slot, @arena2)
-    let body_ptr: *u8 = data_arena_offset_to_ptr(@arena2, resp.body_offset as i64)
+        # Per-slot arena view to resolve the response body offset.
+        var arena: DataArena
+        worker_handle_get_slot_arena(handle, st.claimed_slot, @arena)
+        let body_ptr: *u8 = data_arena_offset_to_ptr(@arena, resp.body_offset as i64)
 
-    # Forward to the HTTP client.  Status from worker, Content-Length from
-    # worker, Content-Type fixed at text/html for now.  See limitations.
-    response_status(c.res, resp.status as i32)
-    response_header(c.res, c"Content-Type", c"text/html; charset=utf-8")
-    response_content_length(c.res, resp.body_len as i64)
-    response_header(c.res, c"Connection", c"keep-alive")
-    response_end_headers(c.res)
-    response_body(c.res, body_ptr, resp.body_len as i32)
-    return 0
+        # Build the HTTP reply directly into task.write_buf so the
+        # framework's CONN_STATE_SEND can drive the socket write.
+        var res: Response
+        response_init(@res, @task.write_buf[0], 8192)
+        response_status(@res, resp.status as i32)
+        response_header(@res, c"Content-Type", c"text/html; charset=utf-8")
+        response_content_length(@res, resp.body_len as i64)
+        response_header(@res, c"Connection", c"keep-alive")
+        response_end_headers(@res)
+        response_body(@res, body_ptr, resp.body_len as i32)
+
+        valet_proxy_state_clear(task)
+        task.write_len = res.len
+        task.write_pos = 0
+        task.handler_state = CONN_STATE_SEND
+        let ret: i32 = valet_task_send(task, res.len)
+        if ret < 0
+            return 1
+        return -1
+
+    # Miss.  Deadline check.
+    let now_sec: i64 = get_current_time()
+    if now_sec >= st.deadline_sec
+        valet_proxy_state_clear(task)
+        var res: Response
+        response_init(@res, @task.write_buf[0], 8192)
+        response_status(@res, 504)
+        response_header(@res, c"Content-Type", c"text/plain")
+        response_header(@res, c"Connection", c"close")
+        let body = c"zeus worker timeout\n"
+        response_content_length(@res, 20)
+        response_end_headers(@res)
+        response_body(@res, body, 20)
+        task.write_len = res.len
+        task.write_pos = 0
+        task.handler_state = CONN_STATE_SEND
+        let ret: i32 = valet_task_send(task, res.len)
+        if ret < 0
+            return 1
+        return -1
+
+    # Re-arm the yield.
+    st.spin_count = st.spin_count + 1
+    let arm_rc: i32 = valet_proxy_arm_yield(task, 0)
+    if arm_rc < 0
+        valet_proxy_state_clear(task)
+        return 1
+    return -1
 
 
 # Register the proxy handler under every method as a catch-all.
@@ -545,6 +636,10 @@ fn main(argc: i32, argv: **u8) -> i32
 
         g_zeus_client_ptr = client as i64
         g_zeus_attached = attached
+
+        # Wire the framework continuation hook BEFORE registering routes
+        # so dispatch is ready as soon as the first request lands.
+        valet_set_proxy_continuation(handle_zeus_proxy_continuation)
 
         register_zeus_proxy(@app)
     else
