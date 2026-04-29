@@ -105,10 +105,14 @@ trap cleanup EXIT
 
 # Note: `|| true` because `grep` exits 1 when there are no matches and
 # `set -e -o pipefail` would abort the whole script on that.
+#
+# Match only when the executable path appears as the *first* token of cmd
+# (i.e. the program being run), not as a -o argument inside a clang
+# invocation.  Without this, parallel agent worktrees rebuilding their
+# own valet with `-o /path/projects/valet/build/...` get false-positive
+# matched as bench orphans.
 orphan_pids=$(ps -eo pid,cmd \
-    | grep -E 'projects/(valet|nexus|zeus|mausoleum)/build/' \
-    | grep -v grep \
-    | awk '{print $1}' \
+    | awk '$2 ~ /projects\/(valet|nexus|zeus|mausoleum)\/build\// {print $1}' \
     | tr '\n' ' ' || true)
 if [[ -n "$orphan_pids" ]]; then
     echo "[bench] ABORT: orphaned bench binaries still running (pids: $orphan_pids)" >&2
