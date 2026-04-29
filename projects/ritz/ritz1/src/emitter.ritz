@@ -857,36 +857,96 @@ fn is_builtin_struct(name: *u8, len: i32) -> i32
         return 1
     0
 
+# Returns 1 if every value-type struct dependency of `st` has already been
+# emitted, 0 otherwise.  Pointer fields (TYPE_PTR / TYPE_PTR_PTR) are not
+# dependencies — LLVM's opaque `ptr` lets us reference a forward-declared
+# struct through a pointer.  Embedded structs (TYPE_STRUCT) and arrays of
+# structs (TYPE_ARRAY whose elem is TYPE_STRUCT) require the dependent
+# struct's body to be in scope before the use, so they DO count.
+# ritz-task-169.
+fn struct_deps_satisfied(s: *EmitterState, st: *StructDef) -> i32
+    var field: *StructField = st.fields
+    while field != null
+        if field.field_type == TYPE_STRUCT
+            if field.field_type_name != null
+                if field.field_type_name_len > 0
+                    if was_struct_emitted(s, field.field_type_name, field.field_type_name_len) == 0
+                        return 0
+        else if field.field_type == TYPE_ARRAY
+            if field.array_elem_type == TYPE_STRUCT
+                if field.array_elem_type_name != null
+                    if field.array_elem_type_name_len > 0
+                        if was_struct_emitted(s, field.array_elem_type_name, field.array_elem_type_name_len) == 0
+                            return 0
+        field = field.next
+    1
+
+# Emit a single `%Name = type { ... }` definition and mark it emitted.
+fn emit_one_struct_type(s: *EmitterState, st: *StructDef)
+    mark_struct_emitted(s, st.name, st.name_len)
+    emit_str(s, c"%")
+    emit_name(s, st.name, st.name_len)
+    emit_str(s, c" = type {")
+    var first: i32 = 1
+    var field: *StructField = st.fields
+    while field != null
+        if first == 0
+            emit_str(s, c", ")
+        first = 0
+        emit_field_llvm_type(s, field)
+        field = field.next
+    emit_str(s, c"}\n")
+
 fn emit_struct_types(s: *EmitterState)
-    var st: *StructDef = s.module.structs
-    while st != null
-        # Skip generic struct templates - they need monomorphization
-        if st.type_params != null
+    # Topologically sort struct emission by value-field containment so that
+    # `alloca %T` and `getelementptr %T, ...` never see an opaque %T.
+    # Source-order emission was breaking when an earlier-listed struct
+    # embedded a later-listed one (e.g. `struct PageStore { index:
+    # [100]IndexEntry, ... }` parsed before its imported deps Db/Cache, or
+    # `struct TomeServer { task_server: TaskServer, ... }` parsed before
+    # ritzlib's TaskServer).  ritz-task-169.
+    #
+    # Pass 1..N: emit any unemitted struct whose value-field deps are all
+    # already emitted; loop until a pass makes no progress.
+    var made_progress: i32 = 1
+    while made_progress == 1
+        made_progress = 0
+        var st: *StructDef = s.module.structs
+        while st != null
+            if st.type_params != null
+                st = st.next
+                continue
+            if is_builtin_struct(st.name, st.name_len) == 1
+                st = st.next
+                continue
+            if was_struct_emitted(s, st.name, st.name_len) == 1
+                st = st.next
+                continue
+            if struct_deps_satisfied(s, st) == 0
+                st = st.next
+                continue
+            emit_one_struct_type(s, st)
+            made_progress = 1
             st = st.next
+
+    # Final pass: emit anything still pending in source order.  This catches
+    # structs whose declared deps aren't in s.module.structs (unresolved
+    # imports, name typos, etc.) — we'd already have produced broken IR for
+    # those in the legacy path, so falling back here is no regression.
+    var st2: *StructDef = s.module.structs
+    while st2 != null
+        if st2.type_params != null
+            st2 = st2.next
             continue
-        # Skip builtin structs - they're emitted by emit_builtin_struct_types
-        if is_builtin_struct(st.name, st.name_len) == 1
-            st = st.next
+        if is_builtin_struct(st2.name, st2.name_len) == 1
+            st2 = st2.next
             continue
-        # Skip already-emitted structs (deduplication for imports)
-        if was_struct_emitted(s, st.name, st.name_len) == 1
-            st = st.next
+        if was_struct_emitted(s, st2.name, st2.name_len) == 1
+            st2 = st2.next
             continue
-        # Mark as emitted before emitting
-        mark_struct_emitted(s, st.name, st.name_len)
-        emit_str(s, c"%")
-        emit_name(s, st.name, st.name_len)
-        emit_str(s, c" = type {")
-        var first: i32 = 1
-        var field: *StructField = st.fields
-        while field != null
-            if first == 0
-                emit_str(s, c", ")
-            first = 0
-            emit_field_llvm_type(s, field)
-            field = field.next
-        emit_str(s, c"}\n")
-        st = st.next
+        emit_one_struct_type(s, st2)
+        st2 = st2.next
+
     emit_str(s, c"\n")
 
 # Emit one `%Result$... = type { i8, [N x i8] }` decl (dedup via
