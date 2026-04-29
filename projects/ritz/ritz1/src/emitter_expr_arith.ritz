@@ -928,6 +928,76 @@ fn emit_expr_unary(s: *EmitterState, e: *Expr) -> i32
                                     emit_reg(s, field_ptr)
                                     emit_str(s, c" to i64\n")
                                     return result
+        # AGAST #184: generic addr-of-MEMBER fallback. Anything that
+        # `emit_member_ptr` knows how to GEP — including the new
+        # `parent.fwd[i].field` over **Foo case — gets handled here
+        # without each shape needing its own bespoke OP_ADDR branch.
+        # Without this, the call-site emitted undef `%.0` after the
+        # explicit cases above all missed (e.g. EXPR_MEMBER over an
+        # EXPR_INDEX base).  Lives at the OP_ADDR level (outside the
+        # operand-kind branches) so it catches anything those missed.
+        if e.operand.kind == EXPR_MEMBER
+            var fb_result: MemberPtrResult
+            emit_member_ptr(s, e.operand, @fb_result)
+            if fb_result.success == 1
+                let fb_ret: i32 = next_reg(s)
+                emit_str(s, c"  ")
+                emit_reg(s, fb_ret)
+                emit_str(s, c" = ptrtoint ptr ")
+                emit_reg(s, fb_result.reg)
+                emit_str(s, c" to i64\n")
+                return fb_ret
+        # AGAST #184: addr-of-INDEX fallback for arbitrarily-deep
+        # MEMBER chains.  `@doc.fields[i].key[0]` (mausoleum's
+        # doc_find_field_index) is INDEX-of-MEMBER-of-INDEX-of-MEMBER-of-IDENT
+        # — the existing OP_ADDR branches only matched the simpler
+        # 1- or 2-level chains, leaving deeper shapes to fall through
+        # to "; ERROR: cannot take address" + undef %.0 at the call site.
+        #
+        # Strategy: when the operand is INDEX with a MEMBER base, use
+        # emit_member_ptr to compute the address of the (array) field,
+        # then GEP into it by the index using the array element type.
+        if e.operand.kind == EXPR_INDEX
+            if e.operand.left.kind == EXPR_MEMBER
+                var idx_fb: MemberPtrResult
+                emit_member_ptr(s, e.operand.left, @idx_fb)
+                if idx_fb.success == 1
+                    let idx_fb_field: *StructField = idx_fb.field
+                    if idx_fb_field.field_type == TYPE_ARRAY
+                        let idx_v: i32 = emit_expr(s, e.operand.right)
+                        let elem_ptr_fb: i32 = next_reg(s)
+                        emit_str(s, c"  ")
+                        emit_reg(s, elem_ptr_fb)
+                        emit_str(s, c" = getelementptr [")
+                        emit_int(s, idx_fb_field.array_size as i64)
+                        emit_str(s, c" x ")
+                        if idx_fb_field.array_elem_type == TYPE_STRUCT and idx_fb_field.array_elem_type_name_len > 0
+                            emit_str(s, c"%")
+                            emit_name(s, idx_fb_field.array_elem_type_name, idx_fb_field.array_elem_type_name_len)
+                        else if idx_fb_field.array_elem_type == TYPE_I32 or idx_fb_field.array_elem_type == TYPE_U32
+                            emit_str(s, c"i32")
+                        else if idx_fb_field.array_elem_type == TYPE_I64 or idx_fb_field.array_elem_type == TYPE_U64
+                            emit_str(s, c"i64")
+                        else if idx_fb_field.array_elem_type == TYPE_U8 or idx_fb_field.array_elem_type == TYPE_I8
+                            emit_str(s, c"i8")
+                        else if idx_fb_field.array_elem_type == TYPE_U16 or idx_fb_field.array_elem_type == TYPE_I16
+                            emit_str(s, c"i16")
+                        else if idx_fb_field.array_elem_type == TYPE_PTR or idx_fb_field.array_elem_type == TYPE_PTR_PTR
+                            emit_str(s, c"ptr")
+                        else
+                            emit_str(s, c"i64")
+                        emit_str(s, c"], ptr ")
+                        emit_reg(s, idx_fb.reg)
+                        emit_str(s, c", i64 0, i64 ")
+                        emit_reg(s, idx_v)
+                        emit_str(s, c"\n")
+                        let idx_fb_ret: i32 = next_reg(s)
+                        emit_str(s, c"  ")
+                        emit_reg(s, idx_fb_ret)
+                        emit_str(s, c" = ptrtoint ptr ")
+                        emit_reg(s, elem_ptr_fb)
+                        emit_str(s, c" to i64\n")
+                        return idx_fb_ret
         emit_str(s, c"  ; ERROR: cannot take address\n")
         return 0
     else if e.op == OP_ADDR_MUT

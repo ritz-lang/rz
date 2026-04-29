@@ -746,6 +746,44 @@ fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
                     emit_str(s, c" to i64\n")
                     return pti
                 return result
+            # AGAST #184: `obj.fwd[i]` value-read where `fwd: **Foo` is a
+            # pointer to an array of *Foo (skip-list / hash-bucket pattern).
+            # Pre-fix this fell through to "; ERROR: unhandled EXPR_MEMBER"
+            # then a wrong-byte-stride GEP using an undef base — see
+            # tome's `update[k].forward[k]` RHS-read.
+            #
+            # Lowering: load the field (a ptr to the *Foo array) → GEP by
+            # ptr stride → load to materialise the i-th *Foo → ptrtoint
+            # to i64 for the unified value model.
+            else if field.field_type == TYPE_PTR_PTR and field.field_type_name_len > 0
+                let idx_pp: i32 = emit_expr(s, e.right)
+                let arr_base_pp: i32 = next_reg(s)
+                emit_str(s, c"  ")
+                emit_reg(s, arr_base_pp)
+                emit_str(s, c" = load ptr, ptr ")
+                emit_reg(s, member_result.reg)
+                emit_str(s, c"\n")
+                let slot_pp: i32 = next_reg(s)
+                emit_str(s, c"  ")
+                emit_reg(s, slot_pp)
+                emit_str(s, c" = getelementptr ptr, ptr ")
+                emit_reg(s, arr_base_pp)
+                emit_str(s, c", i64 ")
+                emit_reg(s, idx_pp)
+                emit_str(s, c"\n")
+                let val_pp: i32 = next_reg(s)
+                emit_str(s, c"  ")
+                emit_reg(s, val_pp)
+                emit_str(s, c" = load ptr, ptr ")
+                emit_reg(s, slot_pp)
+                emit_str(s, c"\n")
+                let pti_pp: i32 = next_reg(s)
+                emit_str(s, c"  ")
+                emit_reg(s, pti_pp)
+                emit_str(s, c" = ptrtoint ptr ")
+                emit_reg(s, val_pp)
+                emit_str(s, c" to i64\n")
+                return pti_pp
             # Port of ritz0 bedc85b: Vec<T> field indexing — s.vec_field[i]
             # The field is a Vec$T struct: { *T data, i64 len, i64 cap }.
             # We already have a ptr to the Vec struct in member_result.reg; load

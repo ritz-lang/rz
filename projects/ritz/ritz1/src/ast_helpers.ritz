@@ -441,6 +441,18 @@ pub fn field_new(p: *Parser, name: *u8, len: i32, ty: i32, line: i32, col: i32) 
         else
             f.field_type_name = null
             f.field_type_name_len = 0
+    else if ty == TYPE_PTR_PTR
+        # AGAST #184: **Foo / **u8 distinction via last_inner_pointee_type
+        # (set by type_ptr's innermost call).  Only inherit last_type_name
+        # when the innermost pointee is a named struct — otherwise we'd
+        # inherit a stale name from a previous sibling field and
+        # downstream find_struct calls would mis-resolve.
+        if p.last_inner_pointee_type == TYPE_STRUCT
+            f.field_type_name = p.last_type_name as *u8
+            f.field_type_name_len = p.last_type_name_len
+        else
+            f.field_type_name = null
+            f.field_type_name_len = 0
     else if ty == TYPE_REF or ty == TYPE_MUT_REF
         # Refs store the inner type in last_ref_inner_type.
         if p.last_ref_inner_type == TYPE_STRUCT
@@ -668,6 +680,14 @@ pub fn type_array(p: *Parser, size_str: *u8, size_len: i32, elem_type: i32) -> i
     if elem_type == TYPE_STRUCT
         p.last_array_elem_type_name = p.last_type_name
         p.last_array_elem_type_name_len = p.last_type_name_len
+    else if (elem_type == TYPE_PTR or elem_type == TYPE_PTR_PTR) and p.last_inner_pointee_type == TYPE_STRUCT
+        # AGAST #184: [N]*Foo / [N]**Foo — array of pointer-to-struct.
+        # Save the deepest pointee struct name so emit_member_ptr can resolve
+        # `arr[i].field` by loading the *Foo and GEPing into Foo. Without this,
+        # ritz1's emit_member_ptr fell through to "; ERROR: unhandled
+        # EXPR_MEMBER" for tome's `update[k].forward[k]` pattern (zset_add).
+        p.last_array_elem_type_name = p.last_type_name
+        p.last_array_elem_type_name_len = p.last_type_name_len
     else
         p.last_array_elem_type_name = null
         p.last_array_elem_type_name_len = 0
@@ -678,6 +698,13 @@ pub fn type_array(p: *Parser, size_str: *u8, size_len: i32, elem_type: i32) -> i
 pub fn type_ptr(p: *Parser, inner_type: i32) -> i32
     # Store pointee type for emitter
     p.last_pointee_type = inner_type
+    # AGAST #184: track the deepest non-pointer pointee.  For **Foo the
+    # innermost type_ptr call has inner_type=TYPE_STRUCT and we lock that
+    # in; the outer call (inner_type=TYPE_PTR) leaves it alone.  This lets
+    # field_new tell **Foo from **u8 even though both end up with
+    # last_pointee_type=TYPE_PTR.
+    if inner_type != TYPE_PTR and inner_type != TYPE_PTR_PTR
+        p.last_inner_pointee_type = inner_type
     # Note: last_type_name/len was already set by parsing inner_type if it's a struct/generic
     # No need to modify it - stmt_var_decl will read both
     # Return TYPE_PTR_PTR for pointer-to-pointer types
@@ -826,6 +853,11 @@ pub fn stmt_var_decl(p: *Parser, name: *u8, len: i32, ty: i32, init: *Expr, line
         # For arrays of structs, store the struct name in var_type_name
         # so the emitter can allocate with correct element size
         if p.last_array_elem_type == TYPE_STRUCT
+            s.var_type_name = p.last_array_elem_type_name as *u8
+            s.var_type_name_len = p.last_array_elem_type_name_len
+        else if (p.last_array_elem_type == TYPE_PTR or p.last_array_elem_type == TYPE_PTR_PTR) and p.last_array_elem_type_name_len > 0
+            # AGAST #184: [N]*Foo arrays — propagate the inner pointee
+            # struct name so emit_member_ptr can resolve `arr[i].field`.
             s.var_type_name = p.last_array_elem_type_name as *u8
             s.var_type_name_len = p.last_array_elem_type_name_len
     else

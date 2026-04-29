@@ -1,0 +1,53 @@
+# AGAST #184: `@x.fwd[i].member` and `x.fwd[i].score` over a struct field
+# of type `**Foo` emitted `inttoptr i64 %.0 to ptr` — undef SSA reference.
+#
+# Shape: chained access (MEMBER over INDEX over MEMBER over IDENT) where
+# the innermost field is **Foo (pointer-to-pointer), e.g. tome.ritz's
+# ZSetNode.forward used in zset_compare(@x.forward[i].member, ...).
+#
+# Pre-fix:
+#   * emit_member_ptr's EXPR_INDEX-with-MEMBER-base only handled
+#     TYPE_ARRAY-of-struct, so the **Foo case fell through to "; ERROR:
+#     unhandled EXPR_MEMBER".
+#   * emit_expr_unary OP_ADDR's EXPR_MEMBER branch only matched IDENT-base,
+#     so @x.fwd[i].field hit "; ERROR: cannot take address" — the
+#     call-site reused undef %.0 for the i64 arg, producing
+#     `inttoptr i64 %.0 to ptr` and failing LLVM verification.
+#
+# Fix:
+#   * ast: new `last_inner_pointee_type` parser slot to distinguish
+#     **Foo (TYPE_STRUCT inner) from **u8 (TYPE_U8 inner).
+#   * field_new: capture last_type_name for TYPE_PTR_PTR fields when
+#     last_inner_pointee_type == TYPE_STRUCT.
+#   * emit_member_ptr: new branch handling TYPE_PTR_PTR-with-named-pointee
+#     (load ptr → GEP by ptr stride → load ptr → GEP into struct).
+#   * emit_expr_unary OP_ADDR: generic fallback that routes through
+#     emit_member_ptr + ptrtoint, so any chain it can GEP is automatically
+#     address-takeable without each shape needing its own bespoke case.
+#
+# Compile-only smoke test — building this file with ritz1 used to fail
+# with `error: use of undefined value '%.0'` during LLVM verification.
+
+struct Inner
+    score: i64
+    member: i64
+
+struct Outer
+    fwd: **Inner
+    pad: i64
+
+# Value-path read through `**Foo`-typed field: was emitting wrong
+# byte-stride fallback (load i8 instead of load ptr) and undef %.0.
+fn read_chain_score(o: *Outer, i: i32) -> i64
+    o.fwd[i].score
+
+# Address-of through the same chain — was emitting `inttoptr i64 %.0`.
+fn addr_chain_member(o: *Outer, i: i32) -> i64
+    @o.fwd[i].member
+
+[[test]]
+fn test_chained_deref_fwd_field() -> i32
+    # Compile-only smoke test: if we got here, the emitter produced a
+    # valid LLVM module for read_chain_score and addr_chain_member.
+    # Pre-fix, ritz1 failed at LLVM verification with undef-%.0.
+    0
