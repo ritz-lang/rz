@@ -263,7 +263,12 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
     else if var_type == TYPE_STRUCT
         add_local_struct(s, stmt.var_name, stmt.var_name_len, alloca_reg, var_type, stmt.var_type_name, stmt.var_type_name_len)
     else if var_type == TYPE_ARRAY
-        add_local_array(s, stmt.var_name, stmt.var_name_len, alloca_reg, stmt.var_array_size, stmt.var_array_elem_type)
+        # For arrays of structs, also stash the element struct name in
+        # type_name so emit_member_ptr can resolve `arr[i].field`.
+        if stmt.var_array_elem_type == TYPE_STRUCT and stmt.var_type_name_len > 0
+            add_local_full(s, stmt.var_name, stmt.var_name_len, alloca_reg, TYPE_ARRAY, stmt.var_type_name, stmt.var_type_name_len, TYPE_I64, stmt.var_array_size, stmt.var_array_elem_type)
+        else
+            add_local_array(s, stmt.var_name, stmt.var_name_len, alloca_reg, stmt.var_array_size, stmt.var_array_elem_type)
     else
         add_local(s, stmt.var_name, stmt.var_name_len, alloca_reg, var_type)
 
@@ -303,7 +308,7 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
                             emit_str(s, c", ptr ")
                             emit_reg(s, field_ptr)
                             emit_str(s, c"\n")
-                        else if field.field_type == TYPE_I32
+                        else if field.field_type == TYPE_I32 or field.field_type == TYPE_U32
                             let trunc: i32 = next_reg(s)
                             emit_str(s, c"  ")
                             emit_reg(s, trunc)
@@ -311,6 +316,30 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
                             emit_reg(s, val_reg)
                             emit_str(s, c" to i32\n")
                             emit_str(s, c"  store i32 ")
+                            emit_reg(s, trunc)
+                            emit_str(s, c", ptr ")
+                            emit_reg(s, field_ptr)
+                            emit_str(s, c"\n")
+                        else if field.field_type == TYPE_I16 or field.field_type == TYPE_U16
+                            let trunc: i32 = next_reg(s)
+                            emit_str(s, c"  ")
+                            emit_reg(s, trunc)
+                            emit_str(s, c" = trunc i64 ")
+                            emit_reg(s, val_reg)
+                            emit_str(s, c" to i16\n")
+                            emit_str(s, c"  store i16 ")
+                            emit_reg(s, trunc)
+                            emit_str(s, c", ptr ")
+                            emit_reg(s, field_ptr)
+                            emit_str(s, c"\n")
+                        else if field.field_type == TYPE_I8 or field.field_type == TYPE_U8
+                            let trunc: i32 = next_reg(s)
+                            emit_str(s, c"  ")
+                            emit_reg(s, trunc)
+                            emit_str(s, c" = trunc i64 ")
+                            emit_reg(s, val_reg)
+                            emit_str(s, c" to i8\n")
+                            emit_str(s, c"  store i8 ")
                             emit_reg(s, trunc)
                             emit_str(s, c", ptr ")
                             emit_reg(s, field_ptr)
@@ -456,6 +485,19 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
             emit_str(s, c", ptr ")
             emit_reg(s, alloca_reg)
             emit_str(s, c"\n")
+        else if var_type == TYPE_U16 or var_type == TYPE_I16
+            # Truncate i64 (unified value model) to i16 for the slot.
+            let trunc: i32 = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, trunc)
+            emit_str(s, c" = trunc i64 ")
+            emit_reg(s, init_reg)
+            emit_str(s, c" to i16\n")
+            emit_str(s, c"  store i16 ")
+            emit_reg(s, trunc)
+            emit_str(s, c", ptr ")
+            emit_reg(s, alloca_reg)
+            emit_str(s, c"\n")
         else if var_type == TYPE_U8 or var_type == TYPE_I8
             # Truncate i64 to i8 for byte types
             let trunc: i32 = next_reg(s)
@@ -535,7 +577,7 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
                 let val: i32 = emit_expr(s, stmt.assign_value)
                 let field: *StructField = member_result.field
                 # Store value based on field type
-                if field.field_type == TYPE_I32
+                if field.field_type == TYPE_I32 or field.field_type == TYPE_U32
                     let trunc: i32 = next_reg(s)
                     emit_str(s, c"  ")
                     emit_reg(s, trunc)
@@ -543,6 +585,32 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
                     emit_reg(s, val)
                     emit_str(s, c" to i32\n")
                     emit_str(s, c"  store i32 ")
+                    emit_reg(s, trunc)
+                    emit_str(s, c", ptr ")
+                    emit_reg(s, member_result.reg)
+                    emit_str(s, c"\n")
+                else if field.field_type == TYPE_I16 or field.field_type == TYPE_U16
+                    # Narrow field — value reg is always i64 (unified value
+                    # model in emit_expr); trunc before store.
+                    let trunc: i32 = next_reg(s)
+                    emit_str(s, c"  ")
+                    emit_reg(s, trunc)
+                    emit_str(s, c" = trunc i64 ")
+                    emit_reg(s, val)
+                    emit_str(s, c" to i16\n")
+                    emit_str(s, c"  store i16 ")
+                    emit_reg(s, trunc)
+                    emit_str(s, c", ptr ")
+                    emit_reg(s, member_result.reg)
+                    emit_str(s, c"\n")
+                else if field.field_type == TYPE_I8 or field.field_type == TYPE_U8
+                    let trunc: i32 = next_reg(s)
+                    emit_str(s, c"  ")
+                    emit_reg(s, trunc)
+                    emit_str(s, c" = trunc i64 ")
+                    emit_reg(s, val)
+                    emit_str(s, c" to i8\n")
+                    emit_str(s, c"  store i8 ")
                     emit_reg(s, trunc)
                     emit_str(s, c", ptr ")
                     emit_reg(s, member_result.reg)
@@ -736,6 +804,19 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
             emit_str(s, c", ptr ")
             emit_reg(s, ptr)
             emit_str(s, c"\n")
+        else if value_type == TYPE_U16 or value_type == TYPE_I16
+            # i16 store via deref — trunc i64 → i16
+            let trunc: i32 = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, trunc)
+            emit_str(s, c" = trunc i64 ")
+            emit_reg(s, val)
+            emit_str(s, c" to i16\n")
+            emit_str(s, c"  store i16 ")
+            emit_reg(s, trunc)
+            emit_str(s, c", ptr ")
+            emit_reg(s, ptr)
+            emit_str(s, c"\n")
         else if value_type == TYPE_U8 or value_type == TYPE_I8
             # Byte store
             let trunc: i32 = next_reg(s)
@@ -815,6 +896,19 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
             # Store i64 directly (pointers are stored as i64)
             emit_str(s, c"  store i64 ")
             emit_reg(s, val)
+            emit_str(s, c", ptr ")
+            emit_reg(s, loc)
+            emit_str(s, c"\n")
+        else if var_type == TYPE_U16 or var_type == TYPE_I16
+            # Truncate i64 (unified value model) back to i16 for the slot.
+            let trunc: i32 = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, trunc)
+            emit_str(s, c" = trunc i64 ")
+            emit_reg(s, val)
+            emit_str(s, c" to i16\n")
+            emit_str(s, c"  store i16 ")
+            emit_reg(s, trunc)
             emit_str(s, c", ptr ")
             emit_reg(s, loc)
             emit_str(s, c"\n")
@@ -951,7 +1045,7 @@ fn emit_return(s: *EmitterState, stmt: *Stmt, ret_type: i32)
             return
 
         let val: i32 = emit_expr(s, stmt.return_value)
-        if ret_type == TYPE_I32
+        if ret_type == TYPE_I32 or ret_type == TYPE_U32
             let trunc: i32 = next_reg(s)
             emit_str(s, c"  ")
             emit_reg(s, trunc)
@@ -959,6 +1053,17 @@ fn emit_return(s: *EmitterState, stmt: *Stmt, ret_type: i32)
             emit_reg(s, val)
             emit_str(s, c" to i32\n")
             emit_str(s, c"  ret i32 ")
+            emit_reg(s, trunc)
+            emit_str(s, c"\n")
+        else if ret_type == TYPE_U16 or ret_type == TYPE_I16
+            # Truncate i64 to i16 for narrow return types (e.g. htons / ntohs).
+            let trunc: i32 = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, trunc)
+            emit_str(s, c" = trunc i64 ")
+            emit_reg(s, val)
+            emit_str(s, c" to i16\n")
+            emit_str(s, c"  ret i16 ")
             emit_reg(s, trunc)
             emit_str(s, c"\n")
         else if ret_type == TYPE_U8 or ret_type == TYPE_I8

@@ -90,6 +90,7 @@ HAND_WRITTEN_TOKEN_IDS = {
     'PLUS': 70, 'MINUS': 71, 'STAR': 72, 'SLASH': 73, 'PERCENT': 74,
     'AMP': 75, 'PIPE': 76, 'CARET': 77, 'TILDE': 78, 'AT': 79,
     'BANG': 80, 'QUESTION': 81, 'SHL': 82, 'SHR': 83,
+    'ANDAND': 91, 'OROR': 92,
     # Comparison
     'EQ': 85, 'NE': 86, 'LT': 87, 'GT': 88, 'LE': 89, 'GE': 90,
     # Assignment/arrows
@@ -164,7 +165,7 @@ class RitzGenerator:
             (10, 49, 'Keywords'),
             (50, 59, 'Type keywords'),
             (70, 84, 'Operators'),
-            (85, 90, 'Comparison operators'),
+            (85, 92, 'Comparison operators'),
             (95, 102, 'Assignment and arrows'),
             (110, 115, 'Delimiters'),
             (120, 126, 'Punctuation'),
