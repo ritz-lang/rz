@@ -1479,11 +1479,78 @@ fn emit_const_array_entry(s: *EmitterState, c: *ConstEntry)
 
     emit_str(s, c"]\n")
 
+# =============================================================================
+# AGAST #189 — Scalar struct consts (`const FOO: StrView = "..."`)
+# =============================================================================
+# Lowers a top-level
+#
+#   const NAME: StrView = "/data.m7m"
+#
+# to an immutable global aggregate whose layout matches the struct shape:
+#
+#   @.const.NAME = private constant [10 x i8] c"/data.m7m\00"
+#   @NAME = internal constant %StrView { ptr @.const.NAME, i64 9 }
+#
+# Use sites then load the aggregate via `load %StrView, ptr @NAME`, which
+# produces a `%StrView` value that flows naturally into call args typed
+# `s: StrView` (the mausoleum/storage `build_path` failure).  Without this,
+# the const-ident path emitted `add i64 0, 0` and the verifier rejected the
+# i64-vs-%StrView mismatch at the call site.
+#
+# Currently restricted to the StrView shape `{ ptr, i64 }` driven by an
+# EXPR_STRING_LIT initializer — that's the only scalar-struct-const shape
+# observed in the codebase (mausoleum/storage.ritz, lexis/dom/attribute.ritz,
+# prism/test/test_text_rendering.ritz).  Other struct shapes fall through
+# to the legacy `add i64 0, 0` path, matching previous behaviour.
+fn emit_const_struct_entry(s: *EmitterState, c: *ConstEntry)
+    if c.const_type != TYPE_STRUCT
+        return
+    if c.type_name == null
+        return
+    if c.type_name_len <= 0
+        return
+    if c.value_expr == null
+        return
+    if c.value_expr.kind != EXPR_STRING_LIT
+        return
+    # Dedup across imports — same const may be reached via multiple paths.
+    if was_global_emitted(s, c.name, c.name_len) == 1
+        return
+    mark_global_emitted(s, c.name, c.name_len)
+
+    let strlen: i32 = c.value_expr.string_len
+
+    # Backing string global (private — only the @NAME global references it).
+    emit_str(s, c"@.const.")
+    emit_name(s, c.name, c.name_len)
+    emit_str(s, c" = private constant [")
+    emit_int(s, (strlen + 1) as i64)
+    emit_str(s, c" x i8] c\"")
+    for j in 0..strlen
+        emit_string_byte(s, *(c.value_expr.string_ptr + j))
+    emit_str(s, c"\\00\"\n")
+
+    # Top-level `%StructTy { ptr @.const.NAME, i64 N }` constant.
+    # Treats the target struct as `{ ptr, i64 }`-shaped (StrView / Span$u8).
+    emit_str(s, c"@")
+    emit_name(s, c.name, c.name_len)
+    emit_str(s, c" = internal constant %")
+    emit_name(s, c.type_name, c.type_name_len)
+    emit_str(s, c" { ptr @.const.")
+    emit_name(s, c.name, c.name_len)
+    emit_str(s, c", i64 ")
+    emit_int(s, strlen as i64)
+    emit_str(s, c" }\n")
+
 # Walk module constants and emit LLVM globals for const arrays of structs.
 fn emit_const_arrays(s: *EmitterState)
     var c: *ConstEntry = s.module.constants
     while c != null
         emit_const_array_entry(s, c)
+        # AGAST #189 — also lower scalar struct consts (`const FOO: StrView
+        # = "..."`).  Distinct from the array path: const_type is
+        # TYPE_STRUCT here, not TYPE_ARRAY.
+        emit_const_struct_entry(s, c)
         c = c.next
     emit_str(s, c"\n")
 
