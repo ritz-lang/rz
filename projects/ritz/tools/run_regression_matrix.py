@@ -38,6 +38,7 @@ TESTS = [
     "test_issue_match_pass_arm",
     "test_issue_method_autoborrow_rvalue",
     "test_issue_method_nonself_ptr_arg",
+    "test_issue_mut_ref_deref_assign",
     "test_issue_namespace_const_field",
     "test_issue_newtype_int_arg",
     "test_issue_option_unwrap_or_method",

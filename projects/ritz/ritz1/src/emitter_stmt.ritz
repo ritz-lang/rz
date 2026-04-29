@@ -739,7 +739,10 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
                             emit_str(s, c"\n")
                         return
 
-        # Deref assignment: *(expr) = value
+        # Deref assignment: *(expr) = value.  Note: stmt_assign_deref stashes
+        # JUST the deref OPERAND in if_cond (not a wrapping EXPR_UNARY), so
+        # `target_expr` here is the pointer expression itself (e.g. `p` for
+        # `*p = 0`), not an EXPR_UNARY/OP_DEREF.
         # Determine the store type. For `*ptr = value` we want the POINTEE
         # type of `ptr` (the destination slot's type), not the value's type.
         # Otherwise storing an i64 RHS into an i32 slot writes 4 extra bytes.
@@ -748,14 +751,22 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
         var struct_name_len: i32 = 0
 
         # Prefer the destination's pointee type when available
-        if target_expr.kind == EXPR_UNARY and target_expr.op == OP_DEREF
+        if target_expr.kind == EXPR_IDENT
+            let dst_loc: *LocalVar = find_local_struct_name(s, target_expr.ident_ptr, target_expr.ident_len)
+            if dst_loc != null and dst_loc.pointee_type != TYPE_I64
+                value_type = dst_loc.pointee_type
+                if dst_loc.pointee_type == TYPE_STRUCT
+                    struct_name = dst_loc.type_name
+                    struct_name_len = dst_loc.type_name_len
+        else if target_expr.kind == EXPR_UNARY and target_expr.op == OP_DEREF
+            # Defensive: legacy callers that DO wrap with EXPR_UNARY.
             if target_expr.operand.kind == EXPR_IDENT
-                let dst_loc: *LocalVar = find_local_struct_name(s, target_expr.operand.ident_ptr, target_expr.operand.ident_len)
-                if dst_loc != null and dst_loc.pointee_type != TYPE_I64
-                    value_type = dst_loc.pointee_type
-                    if dst_loc.pointee_type == TYPE_STRUCT
-                        struct_name = dst_loc.type_name
-                        struct_name_len = dst_loc.type_name_len
+                let dst_loc2: *LocalVar = find_local_struct_name(s, target_expr.operand.ident_ptr, target_expr.operand.ident_len)
+                if dst_loc2 != null and dst_loc2.pointee_type != TYPE_I64
+                    value_type = dst_loc2.pointee_type
+                    if dst_loc2.pointee_type == TYPE_STRUCT
+                        struct_name = dst_loc2.type_name
+                        struct_name_len = dst_loc2.type_name_len
 
         # Fall back to value's type if destination pointee was unknown (TYPE_I64 default)
         if value_type == TYPE_I64
@@ -783,22 +794,41 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
 
         let val: i32 = emit_expr(s, stmt.assign_value)
         # For `*ptr = value`, the store address IS the pointer — NOT the
-        # dereferenced value. emit_expr on the full deref expr would load
-        # through the pointer and produce the pointee's value, which we'd
-        # then incorrectly treat as an address (double-indirection bug).
-        # If target is EXPR_UNARY with OP_DEREF, emit just the operand (the pointer).
+        # dereferenced value. `target_expr` here IS the pointer expression
+        # (parser strips the leading `*`), so emit_expr produces the pointer
+        # value directly. Legacy callers wrapping with EXPR_UNARY still work
+        # via the else branch below.
         var addr: i32 = 0
-        if target_expr.kind == EXPR_UNARY and target_expr.op == OP_DEREF
+        # Track whether `addr` is already ptr-typed (no inttoptr needed).
+        # TYPE_MUT_REF locals load as `ptr` (emit_llvm_type maps it to "ptr"),
+        # while TYPE_PTR/TYPE_REF still load as i64. Without this guard,
+        # `*out = v` for `out: @&i64` emits `inttoptr i64 %p to ptr` where
+        # %p is already `ptr` — LLVM rejects (AGAST #173).
+        var addr_is_ptr: i32 = 0
+        if target_expr.kind == EXPR_IDENT
+            let opd_loc: *LocalVar = find_local_struct_name(s, target_expr.ident_ptr, target_expr.ident_len)
+            if opd_loc != null and opd_loc.var_type == TYPE_MUT_REF
+                addr_is_ptr = 1
+            addr = emit_expr(s, target_expr)
+        else if target_expr.kind == EXPR_UNARY and target_expr.op == OP_DEREF
+            if target_expr.operand.kind == EXPR_IDENT
+                let opd_loc2: *LocalVar = find_local_struct_name(s, target_expr.operand.ident_ptr, target_expr.operand.ident_len)
+                if opd_loc2 != null and opd_loc2.var_type == TYPE_MUT_REF
+                    addr_is_ptr = 1
             addr = emit_expr(s, target_expr.operand)
         else
             addr = emit_expr(s, target_expr)
-        # Convert i64 address to ptr
-        let ptr: i32 = next_reg(s)
-        emit_str(s, c"  ")
-        emit_reg(s, ptr)
-        emit_str(s, c" = inttoptr i64 ")
-        emit_reg(s, addr)
-        emit_str(s, c" to ptr\n")
+        # Convert i64 address to ptr (skip when source is already ptr)
+        var ptr: i32 = 0
+        if addr_is_ptr == 1
+            ptr = addr
+        else
+            ptr = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, ptr)
+            emit_str(s, c" = inttoptr i64 ")
+            emit_reg(s, addr)
+            emit_str(s, c" to ptr\n")
 
         # Store based on value type
         if value_type == TYPE_STRUCT and struct_name_len > 0
