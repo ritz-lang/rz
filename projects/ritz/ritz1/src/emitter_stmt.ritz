@@ -1028,6 +1028,22 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
                     emit_str(s, c", ptr ")
                     emit_reg(s, member_result.reg)
                     emit_str(s, c"\n")
+                else if field.field_type == TYPE_STRUCT and field.field_type_name_len > 0
+                    # AGAST #188: struct-typed field assigned a struct value
+                    # (e.g. `slot.value = *src` where `slot.value: Field` and
+                    # `*src` is a `load %Field, ...`).  Without this branch the
+                    # default fell through to `store i64 %val`, but %val is
+                    # a `%FieldType` aggregate, hitting LLVM's
+                    # `'%val' defined with type '%T' but expected 'i64'`.
+                    # Route through emit_llvm_type_struct so primitive-aliased
+                    # struct names (`u16`, etc.) and SIMD vectors lower right.
+                    emit_str(s, c"  store ")
+                    emit_llvm_type_struct(s, TYPE_STRUCT, field.field_type_name, field.field_type_name_len)
+                    emit_str(s, c" ")
+                    emit_reg(s, val)
+                    emit_str(s, c", ptr ")
+                    emit_reg(s, member_result.reg)
+                    emit_str(s, c"\n")
                 else
                     # Default: store i64
                     emit_str(s, c"  store i64 ")
@@ -1065,6 +1081,11 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
                             emit_str(s, c"i8")
                         else if field.array_elem_type == TYPE_PTR or field.array_elem_type == TYPE_PTR_PTR
                             emit_str(s, c"ptr")
+                        else if field.array_elem_type == TYPE_STRUCT and field.array_elem_type_name_len > 0
+                            # AGAST #188: struct-array LHS — emit `[N x %T]`
+                            # so the GEP and the store agree with the actual
+                            # element layout.
+                            emit_llvm_type_struct(s, TYPE_STRUCT, field.array_elem_type_name, field.array_elem_type_name_len)
                         else
                             emit_str(s, c"i64")
                         emit_str(s, c"], ptr ")
@@ -1106,6 +1127,17 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
                             emit_str(s, c" to ptr\n")
                             emit_str(s, c"  store ptr ")
                             emit_reg(s, ptr_val)
+                            emit_str(s, c", ptr ")
+                            emit_reg(s, elem_ptr)
+                            emit_str(s, c"\n")
+                        else if field.array_elem_type == TYPE_STRUCT and field.array_elem_type_name_len > 0
+                            # AGAST #188: struct array element store —
+                            # `store %T %val, ptr %elem` matches the
+                            # `load %T, ...` from the deref RHS.
+                            emit_str(s, c"  store ")
+                            emit_llvm_type_struct(s, TYPE_STRUCT, field.array_elem_type_name, field.array_elem_type_name_len)
+                            emit_str(s, c" ")
+                            emit_reg(s, val)
                             emit_str(s, c", ptr ")
                             emit_reg(s, elem_ptr)
                             emit_str(s, c"\n")
@@ -2556,6 +2588,11 @@ fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                         emit_str(s, c"i8")
                     else if field.array_elem_type == TYPE_PTR or field.array_elem_type == TYPE_PTR_PTR
                         emit_str(s, c"ptr")
+                    else if field.array_elem_type == TYPE_STRUCT and field.array_elem_type_name_len > 0
+                        # AGAST #188: struct-array LHS in `local.field[i] = *src`
+                        # — emit `[N x %T]` so the GEP and store match the
+                        # struct value loaded from `*src`.
+                        emit_llvm_type_struct(s, TYPE_STRUCT, field.array_elem_type_name, field.array_elem_type_name_len)
                     else
                         emit_str(s, c"i64")
                     emit_str(s, c"], ptr ")
@@ -2597,6 +2634,16 @@ fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                         emit_str(s, c" to ptr\n")
                         emit_str(s, c"  store ptr ")
                         emit_reg(s, ptr_val)
+                        emit_str(s, c", ptr ")
+                        emit_reg(s, elem_ptr)
+                        emit_str(s, c"\n")
+                    else if field.array_elem_type == TYPE_STRUCT and field.array_elem_type_name_len > 0
+                        # AGAST #188: struct-array LHS store — `store %T %val`
+                        # matches the `load %T, ...` from the deref RHS.
+                        emit_str(s, c"  store ")
+                        emit_llvm_type_struct(s, TYPE_STRUCT, field.array_elem_type_name, field.array_elem_type_name_len)
+                        emit_str(s, c" ")
+                        emit_reg(s, val_reg)
                         emit_str(s, c", ptr ")
                         emit_reg(s, elem_ptr)
                         emit_str(s, c"\n")

@@ -1,0 +1,84 @@
+# Regression (ritz-task-188): assigning a dereferenced struct value (`*ptr`)
+# into a struct-typed LHS slot must use the struct's LLVM type for the store
+# (and the GEP element type for array-of-struct LHS), not fall through to
+# `store i64`/`[N x i64]`.
+#
+# Failure mode (mausoleum doc_set_field): for
+#
+#     pub fn doc_set_field(doc: *Document, key: StrView, value: *Field) -> i32
+#         ...
+#         doc.fields[idx].value = *value
+#         doc.fields[doc.field_count].value = *value
+#
+# ritz1 emitted the RHS load as `%Field` (correct) but then
+# `store i64 %.32, ptr %.29` against a `%Field`-typed slot, hitting clang's
+# `'%.32' defined with type '%Field' but expected 'i64'` IR-verifier error.
+# 3 mausoleum sites (collection.ll, server.ll, document.ll).
+#
+# Fix shape: emit_assign EXPR_MEMBER LHS path now special-cases
+# `field.field_type == TYPE_STRUCT` and routes through emit_llvm_type_struct.
+# STMT_LOCAL_FIELD_INDEX_ASSIGN (`local.field[i] = expr`) gets the matching
+# struct-array element handling for both the GEP element type and the store.
+
+struct Field
+    ftype: i32
+    int_val: i64
+
+struct Slot
+    key: i32
+    value: Field
+
+struct Container
+    fields: [4]Field
+    count: i32
+
+struct Doc
+    slots: [4]Slot
+    count: i32
+
+# Shape 1: deref-store of struct value via plain pointer (`*dst = *src`).
+fn copy_field(dst: *Field, src: *Field)
+    *dst = *src
+
+# Shape 2: array element assignment from deref RHS (`local.field[i] = *src`).
+fn array_assign(c: *Container, idx: i32, src: *Field)
+    c.fields[idx] = *src
+
+# Shape 3: chained member-of-array-of-struct LHS (the doc_set_field shape).
+fn assign_chain(d: *Doc, idx: i32, src: *Field)
+    d.slots[idx].value = *src
+
+[[test]]
+fn test_struct_deref_store_plain() -> i32
+    var a: Field = Field{ftype: 1, int_val: 42}
+    var b: Field
+    copy_field(@b, @a)
+    if b.ftype != 1
+        return 1
+    if b.int_val != 42
+        return 2
+    return 0
+
+[[test]]
+fn test_struct_deref_store_array() -> i32
+    var a: Field = Field{ftype: 7, int_val: 100}
+    var c: Container
+    c.count = 0
+    array_assign(@c, 2, @a)
+    if c.fields[2].ftype != 7
+        return 1
+    if c.fields[2].int_val != 100
+        return 2
+    return 0
+
+[[test]]
+fn test_struct_deref_store_chain() -> i32
+    var a: Field = Field{ftype: 9, int_val: 9999}
+    var d: Doc
+    d.count = 0
+    assign_chain(@d, 1, @a)
+    if d.slots[1].value.ftype != 9
+        return 1
+    if d.slots[1].value.int_val != 9999
+        return 2
+    return 0

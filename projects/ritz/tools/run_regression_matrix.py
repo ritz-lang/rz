@@ -58,6 +58,7 @@ TESTS = [
     "test_issue_result_unwrap_method",
     "test_issue_sizeof_primitive",
     "test_issue_span_slice_range",
+    "test_issue_struct_deref_store",
     "test_issue_struct_destructure",
     "test_issue_strview_as_bytes",
     "test_issue_try_call",
