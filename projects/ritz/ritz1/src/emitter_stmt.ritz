@@ -70,6 +70,18 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
     # and callers reading i64 see garbage in the upper half.
     var var_type: i32 = stmt.var_type
 
+    # Bool slots use i64 storage in the unified value model.
+    # Init expressions / loads / `if x` comparisons are all expressed in
+    # i64 throughout the emitter — only function signatures and explicit
+    # bool returns truncate to/zext from i1. Keeping `var x: bool` as an
+    # i1 slot means the alloca is i1 but the init produces i64,
+    # mismatching the `store`. Squeeze's inflate/deflate trip this with
+    # `var found_uncompressed: bool = false`.  Promote the slot to i64
+    # so all subsequent var operations agree.
+    if var_type == TYPE_BOOL
+        var_type = TYPE_I64
+        stmt.var_type = TYPE_I64
+
     # Infer struct type for `var IDENT = expr` (no annotation).
     # The parser defaults missing annotations to TYPE_I64, which is
     # fine for numeric initializers but breaks when the initializer
@@ -95,6 +107,19 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
                     stmt.var_type = TYPE_STRUCT
                     stmt.var_type_name = fn_def.return_type_name
                     stmt.var_type_name_len = fn_def.return_type_name_len
+            else if fn_def != null and fn_def.return_type == TYPE_PTR and fn_def.return_type_name != null and fn_def.return_type_name_len > 0
+                # `let cqe = uring_peek_cqe(...)` — fn returns `*IoUringCqe`.
+                # Narrow the local to TYPE_PTR with the pointee struct name
+                # so `cqe.user_data` resolves the struct field via the
+                # ptr-to-struct member access path.  Matches the existing
+                # TYPE_STRUCT branch above; extension covers async_tasks
+                # `let cqe = uring_peek_cqe(...)`, which previously left the
+                # local at TYPE_I64 and tripped "; ERROR: unhandled
+                # EXPR_MEMBER".
+                var_type = TYPE_PTR
+                stmt.var_type = TYPE_PTR
+                stmt.var_type_name = fn_def.return_type_name
+                stmt.var_type_name_len = fn_def.return_type_name_len
             # Float-returning fn → narrow to TYPE_F32/F64 so the alloca
             # and downstream loads/stores are the right width (was
             # defaulting to i64 → `store i64 <float>` rejected by clang).
@@ -330,6 +355,58 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
                     stmt.var_type = TYPE_PTR
                     stmt.var_type_name = addr_pointee
                     stmt.var_type_name_len = addr_pointee_len
+
+    # `let task = @member.field[i]` — when the indexed field is an array
+    # of struct, infer the local as `*ElementStruct` so subsequent
+    # `task.state` member access resolves.  Without this, the local was
+    # left as TYPE_I64 (the parser default) and member access failed
+    # with "; ERROR: unhandled EXPR_MEMBER".  Surfaces in ritzlib's
+    # async_tasks `run_tasks` (`let task = @pool.tasks[i]`).
+    # Handles single-level (`pool.tasks[i]`) and one-level chained
+    # (`srv.pool.tasks[i]`) member access — the latter occurs in
+    # async_tasks's `task_server_poll_tasks(srv: *TaskServer)`.
+    if var_type == TYPE_I64 and stmt.var_type_name_len == 0 and stmt.var_init != null
+        if stmt.var_init.kind == EXPR_UNARY and stmt.var_init.op == OP_ADDR
+            let inner_addr: *Expr = stmt.var_init.operand
+            if inner_addr != null and inner_addr.kind == EXPR_INDEX
+                let mb: *Expr = inner_addr.left
+                if mb != null and mb.kind == EXPR_MEMBER
+                    # Resolve the receiver's struct type.  Two shapes:
+                    #   `pool.tasks[i]`     — mb.left = EXPR_IDENT (pool)
+                    #   `srv.pool.tasks[i]` — mb.left = EXPR_MEMBER
+                    var rcv_tn_a: *u8 = null
+                    var rcv_tn_a_len: i32 = 0
+                    if mb.left != null and mb.left.kind == EXPR_IDENT
+                        let rloc: *LocalVar = find_local_struct_name(s, mb.left.ident_ptr, mb.left.ident_len)
+                        if rloc != null and rloc.type_name_len > 0
+                            rcv_tn_a = rloc.type_name
+                            rcv_tn_a_len = rloc.type_name_len
+                    else if mb.left != null and mb.left.kind == EXPR_MEMBER
+                        # Walk one extra level: outer.middle.field[i]
+                        let mb_outer: *Expr = mb.left  # outer.middle
+                        if mb_outer.left != null and mb_outer.left.kind == EXPR_IDENT
+                            let rloc2: *LocalVar = find_local_struct_name(s, mb_outer.left.ident_ptr, mb_outer.left.ident_len)
+                            if rloc2 != null and rloc2.type_name_len > 0
+                                # Resolve the inner field (`outer.middle`) to its struct
+                                let outer_st: *StructDef = find_struct(s, rloc2.type_name, rloc2.type_name_len)
+                                if outer_st != null
+                                    let mid_idx: i32 = find_field_index(outer_st, mb_outer.ident_ptr, mb_outer.ident_len)
+                                    if mid_idx >= 0
+                                        let mid_field: *StructField = get_field_type(outer_st, mid_idx)
+                                        if mid_field.field_type == TYPE_STRUCT and mid_field.field_type_name_len > 0
+                                            rcv_tn_a = mid_field.field_type_name
+                                            rcv_tn_a_len = mid_field.field_type_name_len
+                    if rcv_tn_a != null
+                        let rst_a: *StructDef = find_struct(s, rcv_tn_a, rcv_tn_a_len)
+                        if rst_a != null
+                            let fid_a: i32 = find_field_index(rst_a, mb.ident_ptr, mb.ident_len)
+                            if fid_a >= 0
+                                let fa: *StructField = get_field_type(rst_a, fid_a)
+                                if fa.field_type == TYPE_ARRAY and fa.array_elem_type == TYPE_STRUCT and fa.array_elem_type_name_len > 0
+                                    var_type = TYPE_PTR
+                                    stmt.var_type = TYPE_PTR
+                                    stmt.var_type_name = fa.array_elem_type_name
+                                    stmt.var_type_name_len = fa.array_elem_type_name_len
 
     let alloca_reg: i32 = next_reg(s)
     emit_str(s, c"  ")
@@ -1273,6 +1350,19 @@ fn emit_return(s: *EmitterState, stmt: *Stmt, ret_type: i32)
             # Pointers are represented as i64 internally, return as i64
             emit_str(s, c"  ret i64 ")
             emit_reg(s, val)
+            emit_str(s, c"\n")
+        else if ret_type == TYPE_BOOL
+            # Bool returns: emit_expr always produces i64 (icmp result is
+            # zext-promoted to i64).  Truncate back to i1 for the return —
+            # squeeze.bits.bits_at_end and friends declare `-> bool`.
+            let bool_trunc: i32 = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, bool_trunc)
+            emit_str(s, c" = trunc i64 ")
+            emit_reg(s, val)
+            emit_str(s, c" to i1\n")
+            emit_str(s, c"  ret i1 ")
+            emit_reg(s, bool_trunc)
             emit_str(s, c"\n")
         else
             emit_str(s, c"  ret ")

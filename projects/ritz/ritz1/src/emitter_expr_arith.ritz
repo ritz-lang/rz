@@ -571,6 +571,70 @@ fn emit_expr_unary(s: *EmitterState, e: *Expr) -> i32
                         emit_reg(s, elem_ptr)
                         emit_str(s, c" to i64\n")
                         return result
+                    else if local.var_type == TYPE_PTR
+                        # @ptr_var[i] where ptr_var: *T — load the pointer,
+                        # GEP by element, convert to i64. Common in cryptosec
+                        # (e.g. `load_u64_be(@data[0])` with `data: *u8`).
+                        # Without this branch the address-of falls through
+                        # to "; ERROR: cannot take address" and the caller
+                        # references undef %.0.
+                        let loaded_p: i32 = emit_load_ptr(s, local.reg)
+                        let idx_p: i32 = emit_expr(s, e.operand.right)
+                        let elem_ptr_p: i32 = next_reg(s)
+                        emit_str(s, c"  ")
+                        emit_reg(s, elem_ptr_p)
+                        emit_str(s, c" = getelementptr ")
+                        if local.pointee_type == TYPE_I32 or local.pointee_type == TYPE_U32
+                            emit_str(s, c"i32")
+                        else if local.pointee_type == TYPE_I64 or local.pointee_type == TYPE_U64
+                            emit_str(s, c"i64")
+                        else if local.pointee_type == TYPE_I16 or local.pointee_type == TYPE_U16
+                            emit_str(s, c"i16")
+                        else if local.pointee_type == TYPE_PTR or local.pointee_type == TYPE_PTR_PTR
+                            emit_str(s, c"ptr")
+                        else
+                            # Default to i8 (covers *u8 / *i8 — most common).
+                            emit_str(s, c"i8")
+                        emit_str(s, c", ptr ")
+                        emit_reg(s, loaded_p)
+                        emit_str(s, c", i64 ")
+                        emit_reg(s, idx_p)
+                        emit_str(s, c"\n")
+                        let result_p: i32 = next_reg(s)
+                        emit_str(s, c"  ")
+                        emit_reg(s, result_p)
+                        emit_str(s, c" = ptrtoint ptr ")
+                        emit_reg(s, elem_ptr_p)
+                        emit_str(s, c" to i64\n")
+                        return result_p
+                # If `e.operand.left` is an ident but no matching local
+                # was found, try the global table.  Squeeze's inflate
+                # computes `@g_fixed_litlen_lengths[0]` and friends —
+                # the global is `[288]u8`.  GlobalVarDef doesn't track
+                # array element type, so we emit a byte-level GEP
+                # (`getelementptr i8, ptr @g, i64 <idx>`) which is
+                # correct for the u8/i8 element-type cases that surface
+                # in cryptosec / squeeze.  Non-u8 element globals would
+                # need extra type info on GlobalVarDef — out of scope
+                # for the valet build gate.
+                let glob_arr: *GlobalVarDef = find_global(s, e.operand.left.ident_ptr, e.operand.left.ident_len)
+                if glob_arr != null
+                    let ga_idx: i32 = emit_expr(s, e.operand.right)
+                    let ga_elem: i32 = next_reg(s)
+                    emit_str(s, c"  ")
+                    emit_reg(s, ga_elem)
+                    emit_str(s, c" = getelementptr i8, ptr @")
+                    emit_name(s, glob_arr.name, glob_arr.name_len)
+                    emit_str(s, c", i64 ")
+                    emit_reg(s, ga_idx)
+                    emit_str(s, c"\n")
+                    let ga_result: i32 = next_reg(s)
+                    emit_str(s, c"  ")
+                    emit_reg(s, ga_result)
+                    emit_str(s, c" = ptrtoint ptr ")
+                    emit_reg(s, ga_elem)
+                    emit_str(s, c" to i64\n")
+                    return ga_result
             # Handle @global.array_field[i] - address of global struct's array field element
             else if e.operand.left.kind == EXPR_MEMBER
                 if e.operand.left.left.kind == EXPR_IDENT
@@ -643,6 +707,49 @@ fn emit_expr_unary(s: *EmitterState, e: *Expr) -> i32
                                         emit_reg(s, elem_ptr)
                                         emit_str(s, c" to i64\n")
                                         return result
+                                    else if field.field_type == TYPE_PTR
+                                        # @ptr_to_struct.ptr_field[i] — the field
+                                        # is a raw pointer (e.g. *u8 buffer in
+                                        # cryptosec's DerElement.content).  Load
+                                        # the parent ptr, GEP to the field, load
+                                        # the field-pointer, then GEP into that
+                                        # buffer by index.  Element type defaults
+                                        # to i8 since the common case is *u8 and
+                                        # GlobalVarDef-style element-type info
+                                        # isn't tracked on StructField.
+                                        let parent_ptr: i32 = emit_load_ptr(s, local.reg)
+                                        let fld_addr: i32 = next_reg(s)
+                                        emit_str(s, c"  ")
+                                        emit_reg(s, fld_addr)
+                                        emit_str(s, c" = getelementptr %")
+                                        emit_name(s, st.name, st.name_len)
+                                        emit_str(s, c", ptr ")
+                                        emit_reg(s, parent_ptr)
+                                        emit_str(s, c", i32 0, i32 ")
+                                        emit_int(s, field_idx as i64)
+                                        emit_str(s, c"\n")
+                                        let buf_ptr: i32 = next_reg(s)
+                                        emit_str(s, c"  ")
+                                        emit_reg(s, buf_ptr)
+                                        emit_str(s, c" = load ptr, ptr ")
+                                        emit_reg(s, fld_addr)
+                                        emit_str(s, c"\n")
+                                        let pf_idx: i32 = emit_expr(s, e.operand.right)
+                                        let pf_elem: i32 = next_reg(s)
+                                        emit_str(s, c"  ")
+                                        emit_reg(s, pf_elem)
+                                        emit_str(s, c" = getelementptr i8, ptr ")
+                                        emit_reg(s, buf_ptr)
+                                        emit_str(s, c", i64 ")
+                                        emit_reg(s, pf_idx)
+                                        emit_str(s, c"\n")
+                                        let pf_result: i32 = next_reg(s)
+                                        emit_str(s, c"  ")
+                                        emit_reg(s, pf_result)
+                                        emit_str(s, c" = ptrtoint ptr ")
+                                        emit_reg(s, pf_elem)
+                                        emit_str(s, c" to i64\n")
+                                        return pf_result
                         # task-170: @local_struct.array_field[i] — local stack-
                         # allocated struct (TYPE_STRUCT, not PTR). e.g.
                         # `var addr: SockAddrIn` then `memset(@addr.zero[0],...)`

@@ -1391,6 +1391,50 @@ fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
     if name_eq(e.func_name, e.func_name_len, c"aesimc", 6) == 1
         return emit_x86_intrinsic_v2i64(s, e, c"llvm.x86.aesni.aesimc", 21, 1)
 
+    # Indirect call via local fn-ptr.  When `e.func_name` matches a
+    # local variable (e.g. `let h: fn(*Task) -> i32 = task.handler`),
+    # the call must load the function pointer from the slot and use
+    # `call ... %ptr(...)` rather than `call ... @h(...)`.  Without
+    # this, the linker fails with "undefined reference to `h`" because
+    # we mistakenly registered the symbol as an extern.  Common in
+    # ritzlib's async_tasks (`run_tasks`, `task_server_poll_tasks`,
+    # `task_server_run_multishot`) and valet's connection dispatcher.
+    let icall_local: i32 = find_local(s, e.func_name, e.func_name_len)
+    if icall_local >= 0 and e.call_type_suffix_len == 0
+        # Evaluate args first.
+        var icall_args: [16]i32
+        var icall_argc: i32 = 0
+        var icall_arg: *Expr = e.args
+        while icall_arg != null
+            if icall_argc < 16
+                icall_args[icall_argc] = emit_expr(s, icall_arg)
+                icall_argc += 1
+            icall_arg = icall_arg.next
+        # Load fn pointer from the slot.
+        let icall_fp: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, icall_fp)
+        emit_str(s, c" = load ptr, ptr ")
+        emit_reg(s, icall_local)
+        emit_str(s, c"\n")
+        # Emit indirect call. We don't know the return type precisely,
+        # so default to i64 (the unified value model).  Args are passed
+        # as i64 — fn-ptr locals are typed as `fn(*T) -> i32` etc., but
+        # ritz1's local tracker doesn't carry the signature.
+        let icall_result: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, icall_result)
+        emit_str(s, c" = call i64 ")
+        emit_reg(s, icall_fp)
+        emit_str(s, c"(")
+        for j in 0..icall_argc
+            if j > 0
+                emit_str(s, c", ")
+            emit_str(s, c"i64 ")
+            emit_reg(s, icall_args[j])
+        emit_str(s, c")\n")
+        return icall_result
+
     # Regular function call - register as external if not defined in this module
     # Build the full function name with type suffix (e.g., "vec_new$u8" for vec_new<u8>())
     var full_name: [128]u8
@@ -1441,6 +1485,8 @@ fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
             # emits `call void @eprints_cstr(i64 %.span)` and the IR verifier
             # rejects the aggregate-into-i64 mismatch.  helper returns the
             # coerced i64 reg or -1 (fall through to the regular cascade).
+            # Also subsumes the narrower string-literal coercion ritz-task-172
+            # added for cryptosec's hkdf_expand_label("key", …) call site.
             var s176_arg_iter: *Expr = e.args
             var s176_ai: i32 = 0
             while s176_ai < j and s176_arg_iter != null

@@ -303,23 +303,31 @@ fn collect_instantiations_from_module(m: *Module)
             collect_from_fn_body(m, f.body)
         f = f.next
 
-    # Walk impl block methods
+    # Walk impl block methods.  Skip generic impl blocks (those with
+    # type_params != null) — their methods are templates whose bodies
+    # reference the type parameter directly (e.g. `span_len<T>(self)` in
+    # `impl<T> Span<T>`).  Walking them would register bogus
+    # ("span_len", "$T") instantiations that get specialised into
+    # broken `span_len$T` functions with unsubstituted T references.
+    # Methods on generic impls get specialised via specialize_impl_methods
+    # once the parent struct is instantiated for a concrete type.
     var ib: *ImplBlock = m.impls
     while ib != null
-        var method: *FnDef = ib.methods
-        while method != null
-            reset_local_var_tracker()
-            var ipp: *Param = method.params
-            while ipp != null
-                if ipp.param_type == TYPE_STRUCT and ipp.param_type_name != null
-                    var ipsuf: *u8 = null
-                    var ipsuf_len: i32 = 0
-                    let ipkind: i32 = classify_collection_type(ipp.param_type_name, ipp.param_type_name_len, @ipsuf, @ipsuf_len)
-                    if ipkind > 0
-                        add_local_var(ipp.name, ipp.name_len, ipkind, ipsuf, ipsuf_len)
-                ipp = ipp.next
-            collect_from_fn_body(m, method.body)
-            method = method.next
+        if ib.type_params == null
+            var method: *FnDef = ib.methods
+            while method != null
+                reset_local_var_tracker()
+                var ipp: *Param = method.params
+                while ipp != null
+                    if ipp.param_type == TYPE_STRUCT and ipp.param_type_name != null
+                        var ipsuf: *u8 = null
+                        var ipsuf_len: i32 = 0
+                        let ipkind: i32 = classify_collection_type(ipp.param_type_name, ipp.param_type_name_len, @ipsuf, @ipsuf_len)
+                        if ipkind > 0
+                            add_local_var(ipp.name, ipp.name_len, ipkind, ipsuf, ipsuf_len)
+                    ipp = ipp.next
+                collect_from_fn_body(m, method.body)
+                method = method.next
         ib = ib.next
 
     # Walk global variable types — `var g: Vec<String>` at module scope
@@ -420,6 +428,27 @@ fn collect_from_stmt(m: *Module, s: *Stmt)
     else if k == STMT_RETURN
         if s.return_value != null
             collect_from_expr(m, s.return_value)
+    else if k == STMT_ASSERT
+        # `assert <cond>` — cond stored in if_cond (slot reuse).  Generic
+        # calls in the condition need to register for monomorphization.
+        if s.if_cond != null
+            collect_from_expr(m, s.if_cond)
+    else if k == STMT_TUPLE_DECL
+        # `let (a, b) = expr` — initializer in var_init.
+        if s.var_init != null
+            collect_from_expr(m, s.var_init)
+    else if k == STMT_MATCH
+        # `match scrutinee \n arm => body \n …` — scrutinee in if_cond,
+        # arms list in if_then (recast as *Stmt by the parser; see
+        # stmt_match in ast_helpers.ritz).  Walk the arm bodies as
+        # *Expr — they're real expressions, not Stmts.
+        if s.if_cond != null
+            collect_from_expr(m, s.if_cond)
+        var sarm: *MatchArm = s.if_then as *MatchArm
+        while sarm != null
+            if sarm.body != null
+                collect_from_expr(m, sarm.body)
+            sarm = sarm.next
 
 fn collect_from_expr(m: *Module, e: *Expr)
     if e == null
@@ -440,11 +469,19 @@ fn collect_from_expr(m: *Module, e: *Expr)
         # Check if struct literal is for a generic struct (has $ in name)
         if e.ident_ptr != null and e.ident_len > 0
             add_struct_from_mangled_name(m, e.ident_ptr, e.ident_len)
-        # Recurse into field values (stored in args)
-        var arg: *Expr = e.args
-        while arg != null
-            collect_from_expr(m, arg)
-            arg = arg.next
+        # Recurse into field initializers.  The parser stores a *FieldInit
+        # list in e.args (recast to *Expr — see ident_or_struct /
+        # generic_struct_lit in ast_helpers.ritz).  Walking it as *Expr is
+        # an alias-bug: FieldInit is 32 bytes so reading Expr.next at
+        # offset 120 returns heap garbage and segfaults on most non-null
+        # values (e.g. 0x8 from cryptosec/aes_gcm.ritz, which is what
+        # blocks valet).  Walk the FieldInit chain directly and recurse
+        # into each field's value expression.
+        var fi: *FieldInit = e.args as *FieldInit
+        while fi != null
+            if fi.value != null
+                collect_from_expr(m, fi.value)
+            fi = fi.next
     else if k == EXPR_BINARY
         collect_from_expr(m, e.left)
         collect_from_expr(m, e.right)
@@ -508,6 +545,25 @@ fn collect_from_expr(m: *Module, e: *Expr)
     else if k == EXPR_CAST
         # Parser stores operand in e.left, not e.operand
         collect_from_expr(m, e.left)
+    else if k == EXPR_RANGE
+        # Range: start..end (left=start, right=end).  Generic calls inside
+        # ranges (e.g. `for i in 0..vec_len<u8>(v)`) must propagate.
+        collect_from_expr(m, e.left)
+        collect_from_expr(m, e.right)
+    else if k == EXPR_TRY
+        # `expr?` — recurse into the wrapped expression.
+        collect_from_expr(m, e.left)
+    else if k == EXPR_MATCH
+        # match scrutinee \n pattern => body
+        # Scrutinee is e.left; arms are e.args recast as *MatchArm.
+        # Each arm has body: *Expr (or null for `pass` arms).  Walking
+        # arms as *Expr would crash for the same reason struct lits did.
+        collect_from_expr(m, e.left)
+        var arm: *MatchArm = e.args as *MatchArm
+        while arm != null
+            if arm.body != null
+                collect_from_expr(m, arm.body)
+            arm = arm.next
 
 # ============================================================================
 # Generic Function Lookup

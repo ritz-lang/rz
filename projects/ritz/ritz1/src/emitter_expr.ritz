@@ -139,7 +139,24 @@ fn emit_member_ptr(s: *EmitterState, e: *Expr, result: *MemberPtrResult)
                         return
 
     # Dereference case: ptr.field - e.left is EXPR_UNARY with OP_DEREF
+    # Also: address-of-then-member case: (@expr).field — when the inner
+    # expression already resolves through a struct pointer, the outer
+    # `.field` is effectively another step into the same struct.  E.g.
+    # `(@srv.pool).active_count` ≡ `srv.pool.active_count` since
+    # srv:*TaskServer already accesses pool by pointer-GEP. (async_tasks
+    # `task_server_handle_accept` uses this idiom.)
     else if e.left.kind == EXPR_UNARY
+        if e.left.op == OP_ADDR or e.left.op == OP_ADDR_MUT
+            # Treat (@inner).field as inner.field — recurse with a synthetic
+            # member expr where the OP_ADDR layer is stripped.
+            var sub_e: Expr
+            sub_e.kind = EXPR_MEMBER
+            sub_e.left = e.left.operand
+            sub_e.ident_ptr = e.ident_ptr
+            sub_e.ident_len = e.ident_len
+            emit_member_ptr(s, @sub_e, result)
+            if result.success == 1
+                return
         if e.left.op == OP_DEREF
             # The operand of the dereference should be a pointer-to-struct identifier
             if e.left.operand.kind == EXPR_IDENT

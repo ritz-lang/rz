@@ -691,6 +691,44 @@ fn emit_syscall_implementations(s: *EmitterState)
     emit_str(s, c"  ret i64 %ret\n")
     emit_str(s, c"}\n\n")
 
+    # ritz0 alias `__syscallN` — net.ritz / friends use the underscore
+    # variant.  Emit identical bodies under both names so the linker
+    # resolves either form.
+    emit_str(s, c"define weak_odr i64 @__syscall0(i64 %n) {\n")
+    emit_str(s, c"  %ret = call i64 asm sideeffect \"syscall\", \"={rax},{rax},~{rcx},~{r11},~{memory}\"(i64 %n)\n")
+    emit_str(s, c"  ret i64 %ret\n")
+    emit_str(s, c"}\n\n")
+
+    emit_str(s, c"define weak_odr i64 @__syscall1(i64 %n, i64 %a1) {\n")
+    emit_str(s, c"  %ret = call i64 asm sideeffect \"syscall\", \"={rax},{rax},{rdi},~{rcx},~{r11},~{memory}\"(i64 %n, i64 %a1)\n")
+    emit_str(s, c"  ret i64 %ret\n")
+    emit_str(s, c"}\n\n")
+
+    emit_str(s, c"define weak_odr i64 @__syscall2(i64 %n, i64 %a1, i64 %a2) {\n")
+    emit_str(s, c"  %ret = call i64 asm sideeffect \"syscall\", \"={rax},{rax},{rdi},{rsi},~{rcx},~{r11},~{memory}\"(i64 %n, i64 %a1, i64 %a2)\n")
+    emit_str(s, c"  ret i64 %ret\n")
+    emit_str(s, c"}\n\n")
+
+    emit_str(s, c"define weak_odr i64 @__syscall3(i64 %n, i64 %a1, i64 %a2, i64 %a3) {\n")
+    emit_str(s, c"  %ret = call i64 asm sideeffect \"syscall\", \"={rax},{rax},{rdi},{rsi},{rdx},~{rcx},~{r11},~{memory}\"(i64 %n, i64 %a1, i64 %a2, i64 %a3)\n")
+    emit_str(s, c"  ret i64 %ret\n")
+    emit_str(s, c"}\n\n")
+
+    emit_str(s, c"define weak_odr i64 @__syscall4(i64 %n, i64 %a1, i64 %a2, i64 %a3, i64 %a4) {\n")
+    emit_str(s, c"  %ret = call i64 asm sideeffect \"syscall\", \"={rax},{rax},{rdi},{rsi},{rdx},{r10},~{rcx},~{r11},~{memory}\"(i64 %n, i64 %a1, i64 %a2, i64 %a3, i64 %a4)\n")
+    emit_str(s, c"  ret i64 %ret\n")
+    emit_str(s, c"}\n\n")
+
+    emit_str(s, c"define weak_odr i64 @__syscall5(i64 %n, i64 %a1, i64 %a2, i64 %a3, i64 %a4, i64 %a5) {\n")
+    emit_str(s, c"  %ret = call i64 asm sideeffect \"syscall\", \"={rax},{rax},{rdi},{rsi},{rdx},{r10},{r8},~{rcx},~{r11},~{memory}\"(i64 %n, i64 %a1, i64 %a2, i64 %a3, i64 %a4, i64 %a5)\n")
+    emit_str(s, c"  ret i64 %ret\n")
+    emit_str(s, c"}\n\n")
+
+    emit_str(s, c"define weak_odr i64 @__syscall6(i64 %n, i64 %a1, i64 %a2, i64 %a3, i64 %a4, i64 %a5, i64 %a6) {\n")
+    emit_str(s, c"  %ret = call i64 asm sideeffect \"syscall\", \"={rax},{rax},{rdi},{rsi},{rdx},{r10},{r8},{r9},~{rcx},~{r11},~{memory}\"(i64 %n, i64 %a1, i64 %a2, i64 %a3, i64 %a4, i64 %a5, i64 %a6)\n")
+    emit_str(s, c"  ret i64 %ret\n")
+    emit_str(s, c"}\n\n")
+
     # Note: Higher-level syscall wrappers (sys_write, sys_read, etc.) are
     # defined in ritzlib/sys.ritz and will be included when that module is imported.
 
@@ -777,6 +815,23 @@ fn is_syscall_function(name: *u8, len: i32) -> i32
     if name_eq(name, len, c"syscall5", 8) == 1
         return 1
     if name_eq(name, len, c"syscall6", 8) == 1
+        return 1
+    # ritz0-style alias `__syscallN`. ritzlib.net uses these — without
+    # this branch, ritz1 emits `extern declare i64 @__syscall3` and the
+    # linker has no body to resolve.
+    if name_eq(name, len, c"__syscall0", 10) == 1
+        return 1
+    if name_eq(name, len, c"__syscall1", 10) == 1
+        return 1
+    if name_eq(name, len, c"__syscall2", 10) == 1
+        return 1
+    if name_eq(name, len, c"__syscall3", 10) == 1
+        return 1
+    if name_eq(name, len, c"__syscall4", 10) == 1
+        return 1
+    if name_eq(name, len, c"__syscall5", 10) == 1
+        return 1
+    if name_eq(name, len, c"__syscall6", 10) == 1
         return 1
     0
 
@@ -1833,13 +1888,20 @@ fn emit_module(m: *Module, out: *Vec<u8>) -> i32
             add_extern(@s, sys_fn.name, sys_fn.name_len)
         sys_fn = sys_fn.next
 
-    # Emit impl block methods with mangled names (Type_method)
+    # Emit impl block methods with mangled names (Type_method).
+    # Skip generic impl blocks: their methods are templates that
+    # reference the type parameter T directly (e.g.
+    # `fn len(self: *Span<T>) -> i64`).  Emitting them here would
+    # produce IR like `define %T @Span_get(...)` where `%T` is not
+    # a defined LLVM type.  Concrete specialisations are emitted
+    # via specialize_impl_methods in monomorph.ritz.
     var ib: *ImplBlock = m.impls
     while ib != null
-        var method: *FnDef = ib.methods
-        while method != null
-            emit_impl_method(@s, ib, method)
-            method = method.next
+        if ib.type_params == null
+            var method: *FnDef = ib.methods
+            while method != null
+                emit_impl_method(@s, ib, method)
+                method = method.next
         ib = ib.next
 
     emit_str(@s, c"\n")
