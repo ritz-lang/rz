@@ -157,6 +157,37 @@ fn emit_member_ptr(s: *EmitterState, e: *Expr, result: *MemberPtrResult)
                                 let base_ptr: i32 = emit_load_ptr(s, loc.reg)
                                 emit_member_gep_from_ptr(s, result, base_ptr, st, field_idx, field)
                                 return
+        # AGAST #175: address-of wrapper, e.g. `(@srv.pool).active_count` —
+        # the outer @ is a no-op for member access (the inner expression
+        # already yields a pointer-to-struct under the unified value model).
+        # Emit through the inner member chain to obtain the parent ptr, then
+        # GEP into the inner struct for the requested field.  Without this,
+        # the member access fell through to "; ERROR: unhandled EXPR_MEMBER"
+        # and a stale `%.0` flowed into the icmp downstream.
+        else if e.left.op == OP_ADDR or e.left.op == OP_ADDR_MUT
+            if e.left.operand != null and e.left.operand.kind == EXPR_MEMBER
+                var addr_inner: MemberPtrResult
+                emit_member_ptr(s, e.left.operand, @addr_inner)
+                if addr_inner.success == 1
+                    let af: *StructField = addr_inner.field
+                    if af.field_type == TYPE_STRUCT and af.field_type_name_len > 0
+                        let inner_st: *StructDef = find_struct(s, af.field_type_name, af.field_type_name_len)
+                        if inner_st != null
+                            let fidx2: i32 = find_field_index(inner_st, e.ident_ptr, e.ident_len)
+                            if fidx2 >= 0
+                                let f2: *StructField = get_field_type(inner_st, fidx2)
+                                emit_member_gep_from_ptr(s, result, addr_inner.reg, inner_st, fidx2, f2)
+                                return
+            else if e.left.operand != null and e.left.operand.kind == EXPR_IDENT
+                let aloc: *LocalVar = find_local_struct_name(s, e.left.operand.ident_ptr, e.left.operand.ident_len)
+                if aloc != null and aloc.var_type == TYPE_STRUCT and aloc.type_name_len > 0
+                    let st_a: *StructDef = find_struct(s, aloc.type_name, aloc.type_name_len)
+                    if st_a != null
+                        let fidx_a: i32 = find_field_index(st_a, e.ident_ptr, e.ident_len)
+                        if fidx_a >= 0
+                            let fa: *StructField = get_field_type(st_a, fidx_a)
+                            emit_member_gep_local(s, e, result, aloc, st_a, fidx_a, fa)
+                            return
 
     # Pointer arithmetic case: (ptr + offset).field - e.left is EXPR_BINARY
     else if e.left.kind == EXPR_BINARY

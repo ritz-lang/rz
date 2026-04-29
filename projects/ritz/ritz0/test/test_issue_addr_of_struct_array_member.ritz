@@ -1,0 +1,56 @@
+# AGAST #175: `let task = @pool.tasks[i]` lost pointee-type tracking.
+# var_type stayed TYPE_I64 with no type_name, so later `task.field` fell
+# through to "; ERROR: unhandled EXPR_MEMBER" and the icmp downstream got
+# `use of undefined value '%.0'`.
+#
+# Fix: var-decl narrowing for EXPR_UNARY OP_ADDR infers the pointee struct
+# (incl. chained `@srv.pool.tasks[i]`) and registers the local as TYPE_PTR
+# with the right type_name.
+
+struct Item
+    state: i32
+    value: i64
+
+struct Pool
+    items: [16]Item
+    count: i32
+
+struct Server
+    pool: Pool
+    name: i32
+
+fn count_ready(p: *Pool) -> i32
+    var matches: i32 = 0
+    for i in 0..16
+        let item = @p.items[i]
+        if item.state == 2
+            matches = matches + 1
+    matches
+
+fn count_ready_chained(s: *Server) -> i32
+    var matches: i32 = 0
+    for i in 0..16
+        # Chained-member addr-of: @s.pool.items[i] — distinct fix from the
+        # simple @p.items[i] case (resolves through resolve_member_chain_field).
+        let item = @s.pool.items[i]
+        if item.state == 2
+            matches = matches + 1
+    matches
+
+[[test]]
+fn test_addr_of_struct_array_member() -> i32
+    var srv: Server
+    srv.pool.count = 0
+    srv.name = 0
+    var i: i32 = 0
+    for j in 0..16
+        srv.pool.items[j].state = 0
+        srv.pool.items[j].value = 0
+    srv.pool.items[3].state = 2
+    srv.pool.items[7].state = 2
+    let direct = count_ready(@srv.pool)
+    let chained = count_ready_chained(@srv)
+    if direct == 2 and chained == 2
+        0
+    else
+        1

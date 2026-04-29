@@ -16,6 +16,52 @@ import emitter_core
 import emitter_expr
 import emitter_match
 
+# AGAST #175: type-only resolution of an EXPR_MEMBER chain rooted at an
+# identifier (local or global).  Returns the *StructField for the innermost
+# field (e.g. for `a.b.c` returns the field for `c`), or null if any link in
+# the chain can't be resolved.  Mirrors emit_member_ptr's traversal but
+# emits no IR — used by var-decl narrowing to infer pointee types for
+# `let x = @a.b.c[i]` so the binding registers as a *Struct with the right
+# type_name.  Without this, chained-member addr-of falls through to
+# "; ERROR: unhandled EXPR_MEMBER".
+fn resolve_member_chain_field(s: *EmitterState, e: *Expr) -> *StructField
+    if e == null
+        return null
+    if e.kind != EXPR_MEMBER
+        return null
+    var sname: *u8 = null
+    var sname_len: i32 = 0
+    if e.left.kind == EXPR_IDENT
+        let mloc: *LocalVar = find_local_struct_name(s, e.left.ident_ptr, e.left.ident_len)
+        if mloc != null and mloc.type_name_len > 0
+            if mloc.var_type == TYPE_PTR or mloc.var_type == TYPE_STRUCT or mloc.var_type == TYPE_REF or mloc.var_type == TYPE_MUT_REF
+                sname = mloc.type_name
+                sname_len = mloc.type_name_len
+        if sname == null
+            let mglob: *GlobalVarDef = find_global(s, e.left.ident_ptr, e.left.ident_len)
+            if mglob != null and mglob.var_type == TYPE_STRUCT and mglob.type_name_len > 0
+                sname = mglob.type_name
+                sname_len = mglob.type_name_len
+    else if e.left.kind == EXPR_MEMBER
+        # Recurse: resolve parent's field, then dereference into the field's struct
+        let parent_field: *StructField = resolve_member_chain_field(s, e.left)
+        if parent_field != null
+            if parent_field.field_type == TYPE_STRUCT and parent_field.field_type_name_len > 0
+                sname = parent_field.field_type_name
+                sname_len = parent_field.field_type_name_len
+            else if parent_field.field_type == TYPE_PTR and parent_field.field_type_name_len > 0
+                sname = parent_field.field_type_name
+                sname_len = parent_field.field_type_name_len
+    if sname == null or sname_len == 0
+        return null
+    let st: *StructDef = find_struct(s, sname, sname_len)
+    if st == null
+        return null
+    let fidx: i32 = find_field_index(st, e.ident_ptr, e.ident_len)
+    if fidx < 0
+        return null
+    return get_field_type(st, fidx)
+
 fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
     # Use the user's explicit type annotation. The parser defaults
     # missing annotations to TYPE_I64, so any TYPE_I32 we see here
@@ -55,6 +101,18 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
             else if fn_def != null and (fn_def.return_type == TYPE_F32 or fn_def.return_type == TYPE_F64)
                 var_type = fn_def.return_type
                 stmt.var_type = fn_def.return_type
+            # AGAST #175: pointer-returning fn (`-> *Foo`) - narrow to TYPE_PTR
+            # with the pointee struct name so `let x = peek_cqe(...)` registers
+            # x as a struct-pointer binding and `x.field` resolves via
+            # find_local_struct_name. Without this, var_type stays TYPE_I64,
+            # the local has no type_name, and member access falls through to
+            # "; ERROR: unhandled EXPR_MEMBER" with a stale `%.0`.
+            else if fn_def != null and fn_def.return_type == TYPE_PTR
+                if fn_def.return_type_name != null and fn_def.return_type_name_len > 0
+                    var_type = TYPE_PTR
+                    stmt.var_type = TYPE_PTR
+                    stmt.var_type_name = fn_def.return_type_name
+                    stmt.var_type_name_len = fn_def.return_type_name_len
         # task-101: builtin method return-type table. Method calls like
         # `s.as_bytes()` hit compiler intrinsics (try_emit_strview_as_bytes),
         # NOT a real fn_def, so the EXPR_CALL branch above can't find them
@@ -222,6 +280,56 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
                             stmt.var_type = TYPE_STRUCT
                             stmt.var_type_name = pay
                             stmt.var_type_name_len = pay_len
+        # AGAST #175: address-of expression. `let task = @pool.tasks[i]` used
+        # to keep var_type=TYPE_I64 with no type_name → the local was added as
+        # a plain i64 binding, so later `task.field` calls find_local_struct_name
+        # got null and emit_member_ptr fell through to "; ERROR: unhandled
+        # EXPR_MEMBER" with a stale `%.0` reference (use of undefined value
+        # in the icmp). Narrow var_type to TYPE_PTR + struct name when we can
+        # statically resolve the pointee struct, so add_local_struct registers
+        # the binding and `.field` access GEPs through the loaded pointer.
+        # Same family of fixes as ritz-task-170 (chained EXPR_MEMBER addr-of).
+        else if stmt.var_init.kind == EXPR_UNARY
+            if stmt.var_init.op == OP_ADDR or stmt.var_init.op == OP_ADDR_MUT
+                var addr_pointee: *u8 = null
+                var addr_pointee_len: i32 = 0
+                let addr_oper: *Expr = stmt.var_init.operand
+                if addr_oper != null
+                    # @ident: pointee = the local's struct type
+                    if addr_oper.kind == EXPR_IDENT
+                        let aloc: *LocalVar = find_local_struct_name(s, addr_oper.ident_ptr, addr_oper.ident_len)
+                        if aloc != null
+                            if aloc.var_type == TYPE_STRUCT and aloc.type_name_len > 0
+                                addr_pointee = aloc.type_name
+                                addr_pointee_len = aloc.type_name_len
+                    # @arr[i]  OR  @<chained-member>[i] — pointee = array element struct
+                    else if addr_oper.kind == EXPR_INDEX
+                        if addr_oper.left.kind == EXPR_IDENT
+                            let aarr: *LocalVar = find_local_struct_name(s, addr_oper.left.ident_ptr, addr_oper.left.ident_len)
+                            if aarr != null
+                                if aarr.var_type == TYPE_ARRAY and aarr.array_elem_type == TYPE_STRUCT and aarr.type_name_len > 0
+                                    addr_pointee = aarr.type_name
+                                    addr_pointee_len = aarr.type_name_len
+                        else if addr_oper.left.kind == EXPR_MEMBER
+                            # Walk arbitrary-depth member chain (`srv.pool.tasks[i]`)
+                            # and pick up the array element type from the leaf field.
+                            let arr_field: *StructField = resolve_member_chain_field(s, addr_oper.left)
+                            if arr_field != null
+                                if arr_field.field_type == TYPE_ARRAY and arr_field.array_elem_type == TYPE_STRUCT and arr_field.array_elem_type_name_len > 0
+                                    addr_pointee = arr_field.array_elem_type_name
+                                    addr_pointee_len = arr_field.array_elem_type_name_len
+                    # @<chained-member> — pointee = field's struct type
+                    else if addr_oper.kind == EXPR_MEMBER
+                        let mfield: *StructField = resolve_member_chain_field(s, addr_oper)
+                        if mfield != null
+                            if mfield.field_type == TYPE_STRUCT and mfield.field_type_name_len > 0
+                                addr_pointee = mfield.field_type_name
+                                addr_pointee_len = mfield.field_type_name_len
+                if addr_pointee != null and addr_pointee_len > 0
+                    var_type = TYPE_PTR
+                    stmt.var_type = TYPE_PTR
+                    stmt.var_type_name = addr_pointee
+                    stmt.var_type_name_len = addr_pointee_len
 
     let alloca_reg: i32 = next_reg(s)
     emit_str(s, c"  ")
