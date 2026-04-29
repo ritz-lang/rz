@@ -53,6 +53,7 @@ import zeus.zeus_client {
     zeus_client_wait_response,
     zeus_client_peek_response,
     zeus_client_peek_response_slot,
+    zeus_client_sweep_resp_ring,
     zeus_client_peek_request_slot,
     worker_handle_get_arena,
     worker_handle_get_slot_arena,
@@ -458,22 +459,25 @@ fn handle_zeus_proxy_continuation(task: *Task) -> i32
     # already produced our response.  N=128 catches the common fast
     # case without dominating CPU when we miss.
     #
-    # Known limitation: the FIFO ring head-of-line means concurrent
-    # waiters past ~c=18 stall on each others' heads.  Slot-direct
-    # peek (`zeus_client_peek_response_slot`) is the right fix but
-    # needs a parallel mechanism to advance resp_read_idx so the
-    # worker doesn't see the resp ring as full.  TODO.
+    # Slot-direct peek bypasses the FIFO head-of-line stall: each task
+    # checks its own claimed slot independently, so a stuck/dead head
+    # belonging to another task can't block us.  After a successful
+    # consume, sweep resp_read_idx forward past any contiguous already-
+    # consumed slots so the worker reclaims ring space.
     var resp: ResponseSlot
     response_slot_init(@resp)
     var peek_rc: i32 = 0
     var spin_i: i32 = 0
     while spin_i < 128
-        peek_rc = zeus_client_peek_response(client, st.worker_idx, st.request_id, @resp)
+        peek_rc = zeus_client_peek_response_slot(client, st.worker_idx, st.claimed_slot, st.request_id, @resp)
         if peek_rc != 0
             break
         spin_i = spin_i + 1
 
     if peek_rc == 1
+        # Reclaim ring space for the worker.  Cheap O(consecutive zero
+        # slots) walk; usually 1-3 slots per consume.
+        zeus_client_sweep_resp_ring(client, st.worker_idx)
         let handle: *WorkerHandle = zeus_client_get_worker(client, st.worker_idx)
         if handle == null
             g_proxy_handle_null = g_proxy_handle_null + 1

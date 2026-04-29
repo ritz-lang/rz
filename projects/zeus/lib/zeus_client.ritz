@@ -849,10 +849,20 @@ pub fn zeus_client_peek_response(client: *ZeusClient, worker_idx: i32, expected_
 # FIFO read-head.  Used for pipelined dispatch where each in-flight
 # task knows the slot index it claimed at submit time.
 #
-# The slot's id field is overwritten by the worker only after the
-# response is fully written (via worker_commit_response which advances
-# resp_write_idx AFTER populating the slot), so checking
-# `slot.id == expected_id` is a reliable "is it ready?" probe.
+# Synchronization with the worker:
+#   The worker (runtime_process_request) writes the slot in this order:
+#      1. resp.id = req.id           ← written FIRST
+#      2. handler runs → status/headers/body_offset/body_len populated
+#      3. resp.flags |= RESP_FLAG_COMPLETE  ← written LAST before publish
+#      4. resp_write_idx++
+#   So `slot.id == expected_id` is NOT sufficient — the id is written
+#   before the response body is populated, so if we matched on id alone
+#   we could read status=0/body_len=0 from a slot the worker is still
+#   filling in.  We must additionally check `RESP_FLAG_COMPLETE` is set,
+#   which the worker writes only after the slot is fully populated and
+#   immediately before bumping resp_write_idx.  On x86 (TSO) and ritz's
+#   plain memory writes, source-order stores are observed in order, so
+#   COMPLETE-after-id-and-fields is a safe release fence.
 #
 # This avoids the FIFO head-of-line issue: with the head-based peek,
 # N concurrent waiters all peek the same head, but only the matching
@@ -862,8 +872,10 @@ pub fn zeus_client_peek_response(client: *ZeusClient, worker_idx: i32, expected_
 # poll its own slot independently.
 #
 # Returns:
-#    1 — slot has our response; copied to `resp` and slot.id reset to 0.
-#    0 — not ready yet (slot.id != expected_id).
+#    1 — slot has our fully-published response; copied to `resp` and
+#         slot.id reset to 0.
+#    0 — not ready yet (id mismatch OR id matches but COMPLETE flag not
+#         yet set, meaning the worker is still mid-write).
 #   -1 — bad worker_idx / unattached / slot_idx out of range.
 pub fn zeus_client_peek_response_slot(client: *ZeusClient, worker_idx: i32, slot_idx: i64, expected_id: u64, resp: *ResponseSlot) -> i32
     let handle: *WorkerHandle = zeus_client_get_worker(client, worker_idx)
@@ -883,6 +895,12 @@ pub fn zeus_client_peek_response_slot(client: *ZeusClient, worker_idx: i32, slot
     if src.id != expected_id
         return 0  # not yet written by the worker
 
+    # ID matches but the worker may still be mid-write (writes id first,
+    # populates fields, sets COMPLETE last).  Treat as "not ready" until
+    # COMPLETE is observed.
+    if (src.flags & RESP_FLAG_COMPLETE) == 0
+        return 0
+
     # Match: copy.  We do NOT advance resp_read_idx (that's tied to the
     # FIFO head) — the slot is now "consumed" by us, but the ring's
     # resp_read_idx is just a producer-progress hint.  We mark the
@@ -898,4 +916,42 @@ pub fn zeus_client_peek_response_slot(client: *ZeusClient, worker_idx: i32, slot
 
     src.id = 0
     return 1
+
+
+# Sweep the response ring's `resp_read_idx` forward past any contiguous
+# already-consumed slots (id == 0).  Pairs with `zeus_client_peek_response_slot`:
+# each task that consumes its slot directly zeros that slot's id, but never
+# touches `resp_read_idx`.  The worker uses `resp_read_idx` to know how much
+# space the ring has, so without a sweep the worker eventually sees the ring
+# as full and blocks.  Call this after slot-direct consume(s) to reclaim
+# space — it advances resp_read_idx as far as possible without crossing
+# resp_write_idx.
+#
+# Single-threaded with respect to the consumer (valet's coroutine handler
+# is single-threaded per worker), so no atomicity needed on resp_read_idx
+# updates.  The worker only reads resp_read_idx; this writes it.
+#
+# Returns: number of slots swept (resp_read_idx advanced by N).
+pub fn zeus_client_sweep_resp_ring(client: *ZeusClient, worker_idx: i32) -> i64
+    let handle: *WorkerHandle = zeus_client_get_worker(client, worker_idx)
+    if handle == null
+        return 0
+
+    let cb: *ControlBlock = worker_handle_get_control_block(handle)
+    if cb == null
+        return 0
+
+    let ring: *ResponseSlot = worker_handle_get_response_ring(handle)
+    var swept: i64 = 0
+    # The condition `resp_read_idx < resp_write_idx` guarantees we never
+    # inspect a slot the worker may be mid-writing — the worker advances
+    # resp_write_idx only AFTER fully populating the slot.
+    while cb.resp_read_idx < cb.resp_write_idx
+        let idx: i64 = control_block_slot_index(cb, cb.resp_read_idx)
+        let slot: *ResponseSlot = ring + idx
+        if slot.id != 0
+            break  # this slot is still claimed by some other in-flight task
+        cb.resp_read_idx = cb.resp_read_idx + 1
+        swept = swept + 1
+    return swept
 
