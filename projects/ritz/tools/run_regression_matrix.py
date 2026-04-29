@@ -46,6 +46,7 @@ TESTS = [
     "test_issue_namespace_const_field",
     "test_issue_newtype_int_arg",
     "test_issue_newtype_struct_deref",
+    "test_issue_option_return",
     "test_issue_option_unwrap_or_method",
     "test_issue_pass_expr",
     "test_issue_ptr_param_forward",

@@ -1,0 +1,64 @@
+# AGAST #186: ritz1 dropped fns with `option_is_none<*T>(...)` calls (parser
+# rejected pointer-typed generic args), so cross-module callers fell through
+# to `call i64 @<name>(...)` while the surrounding `ret %Option$` kept the
+# struct type — clang IR verifier rejected the i64-into-struct mismatch.
+#
+# This test covers the simple Option$ early-return paths the original
+# briefing mentioned (return None / return Some(x) / branched return) AND
+# the pointer-typed generic call that uncovered the actual root cause.
+
+import ritzlib.option
+
+struct Bucket
+    n: i32
+
+fn maybe_none() -> Option<i32>
+    return None
+
+fn maybe_some(x: i32) -> Option<i32>
+    return Some(x)
+
+fn pick(b: bool) -> Option<i32>
+    if b
+        return Some(42)
+    return None
+
+# Pointer-typed generic call — the actual #186 trigger.  Without the parser
+# fix, ritz1 silently dropped this fn (and its callees) and downstream
+# emit_return saw `%Option$` (template) vs `i64` (call result fallback).
+fn make_bucket() -> Option<*Bucket>
+    return None
+
+# Exercises `option_is_none<*Bucket>(...)` — the angle-bracket-pointer-arg
+# syntax that the parser previously rejected (silently dropping this fn).
+fn bucket_is_empty() -> i32
+    let opt = make_bucket()
+    return option_is_none<*Bucket>(@opt)
+
+[[test]]
+fn test_option_return() -> i32
+    let n = maybe_none()
+    let s = maybe_some(7)
+    let pt = pick(true)
+    let pf = pick(false)
+    let bx = make_bucket()
+    let empty = bucket_is_empty()
+    let nx = match n
+        Some(_) => 99
+        None => 0
+    let sx = match s
+        Some(v) => v
+        None => 99
+    let pxv = match pt
+        Some(v) => v
+        None => 99
+    let pyv = match pf
+        Some(_) => 99
+        None => 1
+    let bxv = match bx
+        Some(_) => 99
+        None => 0
+    if nx == 0 and sx == 7 and pxv == 42 and pyv == 1 and bxv == 0 and empty == 1
+        0
+    else
+        1

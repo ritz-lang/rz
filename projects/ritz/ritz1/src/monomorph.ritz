@@ -585,11 +585,36 @@ fn find_generic_function(m: *Module, name: *u8, name_len: i32) -> *FnDef
 # ============================================================================
 # Given a type suffix like "$u8", parse out the type name
 
+# AGAST #186: detect ritz0-compatible pointer suffix `$ptr_<TypeName>` so the
+# monomorphizer can substitute T with `*Concrete` instead of treating
+# "ptr_Foo" as the literal struct name.  Returns 1 iff suffix starts with
+# `$ptr_` (5-char prefix after the `$`) and has at least one char of payload.
+fn suffix_is_ptr(suffix: *u8, suffix_len: i32) -> i32
+    if suffix_len < 6
+        return 0
+    if *(suffix + 0) != 36   # '$'
+        return 0
+    if *(suffix + 1) != 112  # 'p'
+        return 0
+    if *(suffix + 2) != 116  # 't'
+        return 0
+    if *(suffix + 3) != 114  # 'r'
+        return 0
+    if *(suffix + 4) != 95   # '_'
+        return 0
+    1
+
 fn parse_type_from_suffix(suffix: *u8, suffix_len: i32) -> i32
     # Suffix format: "$typename" where typename is u8, i32, etc.
     # Skip the leading $
     if suffix_len < 2
         return 0  # TYPE_VOID as unknown
+
+    # Pointer-typed generic instantiation (AGAST #186): suffix starts with
+    # `$ptr_` — substitute T → *<Pointee>.  TYPE_PTR represents the bare
+    # `*T` form; the pointee struct name is carried separately.
+    if suffix_is_ptr(suffix, suffix_len) == 1
+        return TYPE_PTR
 
     let type_name: *u8 = suffix + 1
     let type_len: i32 = suffix_len - 1
@@ -610,10 +635,18 @@ fn parse_type_from_suffix(suffix: *u8, suffix_len: i32) -> i32
     return TYPE_STRUCT
 
 fn get_type_name_from_suffix(suffix: *u8, suffix_len: i32, out_name: **u8, out_len: *i32)
-    # Suffix format: "$typename"
+    # Suffix format: "$typename" or (AGAST #186) "$ptr_<typename>".
+    # For the pointer form we return the underlying struct name (no `ptr_`
+    # prefix) so substitute_type_param_in_name can mangle dependent generics
+    # like `Option<T> -> Option$ptr_Page` correctly via the original
+    # `$ptr_Page` suffix passed alongside.
     if suffix_len < 2
         *out_name = null
         *out_len = 0
+        return
+    if suffix_is_ptr(suffix, suffix_len) == 1
+        *out_name = suffix + 5  # skip "$ptr_"
+        *out_len = suffix_len - 5
         return
     *out_name = suffix + 1
     *out_len = suffix_len - 1
@@ -920,6 +953,13 @@ fn clone_stmt(s: *Stmt, type_param: *u8, type_param_len: i32, subst_type: i32, s
         # Index expression is stored in while_cond (reused field)
         cloned.while_cond = clone_expr(s.while_cond, type_param, type_param_len, subst_type, subst_name, subst_len, suffix, suffix_len)
         cloned.assign_value = clone_expr(s.assign_value, type_param, type_param_len, subst_type, subst_name, subst_len, suffix, suffix_len)
+    else if k == STMT_MATCH
+        # AGAST #186: match-stmt cloning was missing — uninitialised cloned
+        # struct caused emit_match to dereference a null scrutinee.  STMT_MATCH
+        # stores scrutinee in if_cond, arms in if_then (recast as *MatchArm).
+        cloned.if_cond = clone_expr(s.if_cond, type_param, type_param_len, subst_type, subst_name, subst_len, suffix, suffix_len)
+        cloned.if_then = clone_match_arms(s.if_then as *MatchArm, type_param, type_param_len, subst_type, subst_name, subst_len, suffix, suffix_len) as *Stmt
+        cloned.if_else = null
 
     return cloned
 
@@ -1030,7 +1070,39 @@ fn clone_expr(e: *Expr, type_param: *u8, type_param_len: i32, subst_type: i32, s
     else if k == EXPR_NIL_LIT
         # Nil literal: no fields to clone
         0  # Placeholder statement to satisfy parser
+    else if k == EXPR_MATCH
+        # AGAST #186: match-expr cloning was missing — caused segfaults when
+        # generic fns had `match *opt` bodies (option_is_none<T>, etc).
+        # EXPR_MATCH stores scrutinee in left, arms in args (recast as *MatchArm).
+        cloned.left = clone_expr(e.left, type_param, type_param_len, subst_type, subst_name, subst_len, suffix, suffix_len)
+        cloned.args = clone_match_arms(e.args as *MatchArm, type_param, type_param_len, subst_type, subst_name, subst_len, suffix, suffix_len) as *Expr
 
+    return cloned
+
+# AGAST #186: clone a chain of MatchArm nodes when the enclosing fn is being
+# specialised.  Pattern fields (kind/int/name) carry no T references so they
+# pass through verbatim; only `body` (the arm's RHS expression) needs the
+# usual type-param substitution.  Cloning is required because emit_match
+# reads each arm's `body.kind` etc.; without this the arms would still point
+# at the template's expressions, but more importantly the surrounding STMT_
+# /EXPR_MATCH cloning did nothing without a copy strategy for arms either.
+fn clone_match_arms(arms: *MatchArm, type_param: *u8, type_param_len: i32, subst_type: i32, subst_name: *u8, subst_len: i32, suffix: *u8, suffix_len: i32) -> *MatchArm
+    if arms == null
+        return null
+    let cloned: *MatchArm = malloc(72) as *MatchArm
+    cloned.pattern_kind = arms.pattern_kind
+    cloned.pattern_int = arms.pattern_int
+    cloned.pattern_name = arms.pattern_name
+    cloned.pattern_name_len = arms.pattern_name_len
+    cloned.pattern_inner_kind = arms.pattern_inner_kind
+    cloned.pattern_inner_name = arms.pattern_inner_name
+    cloned.pattern_inner_name_len = arms.pattern_inner_name_len
+    cloned.is_pass = arms.is_pass
+    if arms.body != null
+        cloned.body = clone_expr(arms.body, type_param, type_param_len, subst_type, subst_name, subst_len, suffix, suffix_len)
+    else
+        cloned.body = null
+    cloned.next = clone_match_arms(arms.next, type_param, type_param_len, subst_type, subst_name, subst_len, suffix, suffix_len)
     return cloned
 
 fn clone_expr_list(list: *Expr, type_param: *u8, type_param_len: i32, subst_type: i32, subst_name: *u8, subst_len: i32, suffix: *u8, suffix_len: i32) -> *Expr
