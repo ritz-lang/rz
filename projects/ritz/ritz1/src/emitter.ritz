@@ -732,6 +732,42 @@ fn emit_syscall_implementations(s: *EmitterState)
     # Note: Higher-level syscall wrappers (sys_write, sys_read, etc.) are
     # defined in ritzlib/sys.ritz and will be included when that module is imported.
 
+# AGAST #185: cpuid_raw is a magic intrinsic name (no source body); ritz0
+# emits inline asm at the call site, but ritz1 leaves the call referring to
+# an external `@cpuid_raw` symbol.  Without an emitted body the linker fails
+# with `undefined reference to cpuid_raw`.  Detect the name as an extern and
+# emit a weak_odr definition wrapping the CPUID instruction in inline asm.
+fn is_cpuid_raw_function(name: *u8, len: i32) -> i32
+    if name_eq(name, len, c"cpuid_raw", 9) == 1
+        return 1
+    0
+
+# Emit the cpuid_raw implementation as a weak_odr function so multiple
+# modules can each emit it without linker conflicts.  Signature mirrors
+# what ritz1 generates at call sites: 6 i64 args (leaf, subleaf, eax_p,
+# ebx_p, ecx_p, edx_p) returning i64.  Truncate the leaf/subleaf to i32
+# and treat the four pointer args as ptr via inttoptr.
+fn emit_cpuid_raw_implementation(s: *EmitterState)
+    emit_str(s, c"; AGAST #185: cpuid_raw — weak_odr inline-asm wrapper for CPUID instruction\n")
+    emit_str(s, c"define weak_odr i64 @cpuid_raw(i64 %leaf.i64, i64 %sub.i64, i64 %eax.p64, i64 %ebx.p64, i64 %ecx.p64, i64 %edx.p64) {\n")
+    emit_str(s, c"  %leaf = trunc i64 %leaf.i64 to i32\n")
+    emit_str(s, c"  %sub = trunc i64 %sub.i64 to i32\n")
+    emit_str(s, c"  %eax_p = inttoptr i64 %eax.p64 to ptr\n")
+    emit_str(s, c"  %ebx_p = inttoptr i64 %ebx.p64 to ptr\n")
+    emit_str(s, c"  %ecx_p = inttoptr i64 %ecx.p64 to ptr\n")
+    emit_str(s, c"  %edx_p = inttoptr i64 %edx.p64 to ptr\n")
+    emit_str(s, c"  %r = call {i32, i32, i32, i32} asm sideeffect \"cpuid\", \"={ax},={bx},={cx},={dx},{ax},{cx},~{dirflag},~{fpsr},~{flags}\"(i32 %leaf, i32 %sub)\n")
+    emit_str(s, c"  %eax = extractvalue {i32, i32, i32, i32} %r, 0\n")
+    emit_str(s, c"  %ebx = extractvalue {i32, i32, i32, i32} %r, 1\n")
+    emit_str(s, c"  %ecx = extractvalue {i32, i32, i32, i32} %r, 2\n")
+    emit_str(s, c"  %edx = extractvalue {i32, i32, i32, i32} %r, 3\n")
+    emit_str(s, c"  store i32 %eax, ptr %eax_p\n")
+    emit_str(s, c"  store i32 %ebx, ptr %ebx_p\n")
+    emit_str(s, c"  store i32 %ecx, ptr %ecx_p\n")
+    emit_str(s, c"  store i32 %edx, ptr %edx_p\n")
+    emit_str(s, c"  ret i64 0\n")
+    emit_str(s, c"}\n\n")
+
 # AGAST #167: Recognize LLVM x86 intrinsic names registered as externs by
 # emit_x86_simd_intrinsic.  These need typed `declare <vec> @llvm.x86.foo(<vec>...)`
 # instead of the generic `declare i64 @name(...)`.
@@ -846,11 +882,25 @@ fn emit_extern_declarations(s: *EmitterState)
     if need_syscalls == 1
         emit_syscall_implementations(s)
 
+    # AGAST #185: emit cpuid_raw weak_odr body if any extern references it.
+    # Same rationale as syscalls — ritz1 can't emit inline-asm intrinsic
+    # bodies from source, so we provide one here.
+    var need_cpuid: i32 = 0
+    for i in 0..s.extern_count
+        let ex: *ExternFunc = @s.externs[i]
+        if is_cpuid_raw_function(ex.name, ex.name_len) == 1
+            need_cpuid = 1
+    if need_cpuid == 1
+        emit_cpuid_raw_implementation(s)
+
     # Emit remaining external declarations (non-syscall, non-local functions)
     for i in 0..s.extern_count
         let ex: *ExternFunc = @s.externs[i]
         # Skip syscalls (already emitted inline above)
         if is_syscall_function(ex.name, ex.name_len) == 1
+            continue
+        # Skip cpuid_raw (weak_odr body emitted above)
+        if is_cpuid_raw_function(ex.name, ex.name_len) == 1
             continue
         # AGAST #167: x86 LLVM intrinsics (`llvm.x86.sha256rnds2`, etc.) need
         # vector-typed declarations so clang accepts the inline calls emitted
