@@ -24,6 +24,7 @@ RITZLIB_MODULES = ["sys", "io", "str", "strview", "string", "hash", "memory",
 
 TESTS = [
     "test_issue_addr_of_struct_array_member",
+    "test_issue_array_fill_literal",
     "test_issue_array_value_to_span",
     "test_issue_binop_as_cast",
     "test_issue_const_struct_array",

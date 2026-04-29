@@ -562,6 +562,194 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
                     fi = fi.next
             return  # Done with struct literal init
 
+        # Array-fill init for typed [N]T slots: `let buf: [N]T = [v; N]`.
+        # squeeze/cryptosec/valet rely on this for inflate/sbox tables.
+        # Evaluate the value once, then write it into each slot[0..N).
+        #
+        # Strategy (mirrors ritz0):
+        #   * Zero fill (e.g. `[0; 65536]`)  → llvm.memset
+        #   * Small N (≤ 16)                  → straight-line unrolled stores
+        #   * Otherwise                        → a real LLVM loop
+        # Unrolling [0; 65536] would emit 65536 GEP+store pairs — clang -O2
+        # then spends minutes folding it.  (AGAST #178)
+        if var_type == TYPE_ARRAY and stmt.var_init.kind == EXPR_ARRAY_FILL
+            let fill_elem_ty: i32 = stmt.var_array_elem_type
+            let fill_arr_size: i32 = stmt.var_array_size
+            var fill_elem_llvm: *u8 = c"i64"
+            var fill_elem_bytes: i32 = 8
+            if fill_elem_ty == TYPE_I32 or fill_elem_ty == TYPE_U32
+                fill_elem_llvm = c"i32"
+                fill_elem_bytes = 4
+            else if fill_elem_ty == TYPE_U8 or fill_elem_ty == TYPE_I8
+                fill_elem_llvm = c"i8"
+                fill_elem_bytes = 1
+            else if fill_elem_ty == TYPE_U16 or fill_elem_ty == TYPE_I16
+                fill_elem_llvm = c"i16"
+                fill_elem_bytes = 2
+            else if fill_elem_ty == TYPE_PTR or fill_elem_ty == TYPE_PTR_PTR
+                fill_elem_llvm = c"ptr"
+                fill_elem_bytes = 8
+            # Fast path: integer-literal zero fill — collapse to memset.
+            # Detect EXPR_INT_LIT with int_val == 0 (common case for
+            # squeeze's `[0; 65536]` lz_symbols arrays) and EXPR_UNARY
+            # OP_NEG over int 0.  Anything else falls into the loop path.
+            var fill_is_zero_lit: i32 = 0
+            if stmt.var_init.left != null and stmt.var_init.left.kind == EXPR_INT_LIT and stmt.var_init.left.int_val == 0
+                fill_is_zero_lit = 1
+            if fill_is_zero_lit == 1
+                emit_str(s, c"  call void @llvm.memset.p0.i64(ptr ")
+                emit_reg(s, alloca_reg)
+                emit_str(s, c", i8 0, i64 ")
+                emit_int(s, (fill_arr_size * fill_elem_bytes) as i64)
+                emit_str(s, c", i1 false)\n")
+                return
+            # Evaluate the fill value ONCE — even if it's a function call we
+            # only want to invoke it once. Its i64 SSA result is reused for
+            # every store.
+            let fill_val_reg: i32 = emit_expr(s, stmt.var_init.left)
+            # Pre-truncate the value to the element width so we don't
+            # re-emit the trunc inside the loop body (and so a pointer
+            # element type gets one inttoptr we can reuse).
+            var fill_narrow: i32 = fill_val_reg
+            if fill_elem_ty == TYPE_U8 or fill_elem_ty == TYPE_I8
+                let t8: i32 = next_reg(s)
+                emit_str(s, c"  ")
+                emit_reg(s, t8)
+                emit_str(s, c" = trunc i64 ")
+                emit_reg(s, fill_val_reg)
+                emit_str(s, c" to i8\n")
+                fill_narrow = t8
+            else if fill_elem_ty == TYPE_U16 or fill_elem_ty == TYPE_I16
+                let t16: i32 = next_reg(s)
+                emit_str(s, c"  ")
+                emit_reg(s, t16)
+                emit_str(s, c" = trunc i64 ")
+                emit_reg(s, fill_val_reg)
+                emit_str(s, c" to i16\n")
+                fill_narrow = t16
+            else if fill_elem_ty == TYPE_I32 or fill_elem_ty == TYPE_U32
+                let t32: i32 = next_reg(s)
+                emit_str(s, c"  ")
+                emit_reg(s, t32)
+                emit_str(s, c" = trunc i64 ")
+                emit_reg(s, fill_val_reg)
+                emit_str(s, c" to i32\n")
+                fill_narrow = t32
+            else if fill_elem_ty == TYPE_PTR or fill_elem_ty == TYPE_PTR_PTR
+                let tp: i32 = next_reg(s)
+                emit_str(s, c"  ")
+                emit_reg(s, tp)
+                emit_str(s, c" = inttoptr i64 ")
+                emit_reg(s, fill_val_reg)
+                emit_str(s, c" to ptr\n")
+                fill_narrow = tp
+            if fill_arr_size <= 16
+                # Small N: unroll for simple straight-line IR.
+                var fi: i32 = 0
+                while fi < fill_arr_size
+                    let fep: i32 = next_reg(s)
+                    emit_str(s, c"  ")
+                    emit_reg(s, fep)
+                    emit_str(s, c" = getelementptr [")
+                    emit_int(s, fill_arr_size as i64)
+                    emit_str(s, c" x ")
+                    emit_str(s, fill_elem_llvm)
+                    emit_str(s, c"], ptr ")
+                    emit_reg(s, alloca_reg)
+                    emit_str(s, c", i64 0, i64 ")
+                    emit_int(s, fi as i64)
+                    emit_str(s, c"\n")
+                    emit_str(s, c"  store ")
+                    emit_str(s, fill_elem_llvm)
+                    emit_str(s, c" ")
+                    emit_reg(s, fill_narrow)
+                    emit_str(s, c", ptr ")
+                    emit_reg(s, fep)
+                    emit_str(s, c"\n")
+                    fi = fi + 1
+                return
+            # Larger N: real LLVM loop with i32 induction var on stack.
+            let fi_idx: i32 = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, fi_idx)
+            emit_str(s, c" = alloca i32\n")
+            emit_str(s, c"  store i32 0, ptr ")
+            emit_reg(s, fi_idx)
+            emit_str(s, c"\n")
+            let fi_cond: i32 = next_label(s)
+            let fi_body: i32 = next_label(s)
+            let fi_end: i32 = next_label(s)
+            emit_str(s, c"  br label %")
+            emit_label(s, fi_cond)
+            emit_str(s, c"\n")
+            emit_label(s, fi_cond)
+            emit_str(s, c":\n")
+            let fi_cur: i32 = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, fi_cur)
+            emit_str(s, c" = load i32, ptr ")
+            emit_reg(s, fi_idx)
+            emit_str(s, c"\n")
+            let fi_cmp: i32 = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, fi_cmp)
+            emit_str(s, c" = icmp ult i32 ")
+            emit_reg(s, fi_cur)
+            emit_str(s, c", ")
+            emit_int(s, fill_arr_size as i64)
+            emit_str(s, c"\n")
+            emit_str(s, c"  br i1 ")
+            emit_reg(s, fi_cmp)
+            emit_str(s, c", label %")
+            emit_label(s, fi_body)
+            emit_str(s, c", label %")
+            emit_label(s, fi_end)
+            emit_str(s, c"\n")
+            emit_label(s, fi_body)
+            emit_str(s, c":\n")
+            let fi_cur2: i32 = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, fi_cur2)
+            emit_str(s, c" = load i32, ptr ")
+            emit_reg(s, fi_idx)
+            emit_str(s, c"\n")
+            let fi_ep: i32 = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, fi_ep)
+            emit_str(s, c" = getelementptr [")
+            emit_int(s, fill_arr_size as i64)
+            emit_str(s, c" x ")
+            emit_str(s, fill_elem_llvm)
+            emit_str(s, c"], ptr ")
+            emit_reg(s, alloca_reg)
+            emit_str(s, c", i32 0, i32 ")
+            emit_reg(s, fi_cur2)
+            emit_str(s, c"\n")
+            emit_str(s, c"  store ")
+            emit_str(s, fill_elem_llvm)
+            emit_str(s, c" ")
+            emit_reg(s, fill_narrow)
+            emit_str(s, c", ptr ")
+            emit_reg(s, fi_ep)
+            emit_str(s, c"\n")
+            let fi_inc: i32 = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, fi_inc)
+            emit_str(s, c" = add i32 ")
+            emit_reg(s, fi_cur2)
+            emit_str(s, c", 1\n")
+            emit_str(s, c"  store i32 ")
+            emit_reg(s, fi_inc)
+            emit_str(s, c", ptr ")
+            emit_reg(s, fi_idx)
+            emit_str(s, c"\n")
+            emit_str(s, c"  br label %")
+            emit_label(s, fi_cond)
+            emit_str(s, c"\n")
+            emit_label(s, fi_end)
+            emit_str(s, c":\n")
+            return
+
         # Array-literal init for typed [N]T slots (ritz0 parity —
         # test_issue_span_slice_range and friends).  The generic fallthrough
         # below emits the literal into a shadow `[N x i64]` alloca and then

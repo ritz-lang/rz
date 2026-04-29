@@ -790,6 +790,48 @@ fn emit_expr(s: *EmitterState, e: *Expr) -> i32
     else if e.kind == EXPR_TRY
         return emit_expr_try(s, e)
 
+    else if e.kind == EXPR_ARRAY_FILL
+        # Array fill literal `[v; N]` — materialize a shadow `alloca [N x i64]`
+        # and `store` the value into each slot. Mirrors EXPR_ARRAY_LIT below
+        # but with one shared value instead of a list. The typed-array let
+        # path in emit_var_decl (emitter_stmt) handles the common case at
+        # the declared element width; this fallback only fires when an
+        # array-fill literal is used in expr position, which the language
+        # currently doesn't expose but the parser allows. (AGAST #178)
+        let fill_n: i32 = e.int_val as i32
+        let fill_alloca: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, fill_alloca)
+        emit_str(s, c" = alloca [")
+        emit_int(s, fill_n as i64)
+        emit_str(s, c" x i64]  ; array fill\n")
+        let fill_v: i32 = emit_expr(s, e.left)
+        var fi2: i32 = 0
+        while fi2 < fill_n
+            let fep2: i32 = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, fep2)
+            emit_str(s, c" = getelementptr [")
+            emit_int(s, fill_n as i64)
+            emit_str(s, c" x i64], ptr ")
+            emit_reg(s, fill_alloca)
+            emit_str(s, c", i64 0, i64 ")
+            emit_int(s, fi2 as i64)
+            emit_str(s, c"\n")
+            emit_str(s, c"  store i64 ")
+            emit_reg(s, fill_v)
+            emit_str(s, c", ptr ")
+            emit_reg(s, fep2)
+            emit_str(s, c"\n")
+            fi2 = fi2 + 1
+        let fill_pti: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, fill_pti)
+        emit_str(s, c" = ptrtoint ptr ")
+        emit_reg(s, fill_alloca)
+        emit_str(s, c" to i64\n")
+        return fill_pti
+
     else if e.kind == EXPR_ARRAY_LIT
         # Array literal: [e1, e2, ...] — materialize an `alloca [N x i64]`
         # and `store` each element. The alloca element type is always i64
