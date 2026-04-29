@@ -1,0 +1,42 @@
+# Regression (ritz-task-180): dereferencing a pointer-to-newtype-struct must
+# load the struct type, not the inner primitive.
+#
+# Failure mode: when emit_expr_unary encountered `*id` for `id: *DocumentId`
+# (newtype struct wrapping `i64`), it fell through to `load i64, ptr ...`
+# even though the deref's static type was TYPE_STRUCT.  Downstream
+# struct-field-assign correctly emitted `store %DocumentId %v, ptr ...`,
+# producing a clang IR-verifier mismatch:
+#
+#     '%v' defined with type 'i64' but expected '%DocumentId = type { i64 }'
+#
+# The four mausoleum sites (server, server_async, collection, document) all
+# came from the `doc.id = *id` shape inside `doc_init(doc: *Document, id: *DocumentId)`.
+# Fix: emit_expr_unary OP_DEREF resolves the pointee struct name from the
+# operand's local var (`loc.type_name` carries the pointee name when the
+# parameter was added via add_local_full).
+
+struct DocumentId
+    value: i64
+
+struct Document
+    id: DocumentId
+    version: i32
+
+fn doc_id_new(v: i64) -> DocumentId
+    var d: DocumentId
+    d.value = v
+    return d
+
+fn doc_init(doc: *Document, id: *DocumentId)
+    doc.id = *id
+    doc.version = 1
+
+[[test]]
+fn test_newtype_struct_deref_assign() -> i32
+    var d: Document
+    let id: DocumentId = doc_id_new(0x42)
+    doc_init(@d, @id)
+    if d.id.value == 0x42 and d.version == 1
+        0
+    else
+        1

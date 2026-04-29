@@ -478,14 +478,51 @@ fn emit_expr_unary(s: *EmitterState, e: *Expr) -> i32
             emit_str(s, c" to i64\n")
             return result
         else if deref_type == TYPE_STRUCT
-            # Load struct type - need to find the actual struct name
-            let field: *StructField = get_deref_struct_type(s, e)
-            if field != null and field.field_type_name_len > 0
+            # Load struct type - need to find the actual struct name.
+            # ritz-task-180: for `*id` where `id: *DocumentId` (newtype struct
+            # wrapping i64), the deref must load `%DocumentId`, not `i64`.
+            # Otherwise downstream `store %DocumentId %val, ptr ...` (e.g. in
+            # `doc.id = *id` field-assign) hits an LLVM type mismatch.
+            #
+            # Resolve the pointee struct name from the operand's local var.
+            # When a parameter `id: *DocumentId` is added to the locals table
+            # (emitter.ritz add_local_full), `loc.type_name` carries the
+            # pointee struct name and `loc.pointee_type == TYPE_STRUCT`.
+            var sname: *u8 = null
+            var sname_len: i32 = 0
+            if e.operand.kind == EXPR_IDENT
+                let lv: *LocalVar = find_local_struct_name(s, e.operand.ident_ptr, e.operand.ident_len)
+                if lv != null and lv.pointee_type == TYPE_STRUCT and lv.type_name_len > 0
+                    sname = lv.type_name
+                    sname_len = lv.type_name_len
+            else if e.operand.kind == EXPR_MEMBER
+                # `*x.field` where field is a pointer-to-struct.  Walk the
+                # struct def to find the field's `field_type_name`.
+                if e.operand.left.kind == EXPR_IDENT
+                    let outer: *LocalVar = find_local_struct_name(s, e.operand.left.ident_ptr, e.operand.left.ident_len)
+                    if outer != null and outer.type_name_len > 0
+                        let st: *StructDef = find_struct(s, outer.type_name, outer.type_name_len)
+                        if st != null
+                            let fidx: i32 = find_field_index(st, e.operand.ident_ptr, e.operand.ident_len)
+                            if fidx >= 0
+                                let f: *StructField = get_field_type(st, fidx)
+                                if f.field_type_name_len > 0
+                                    sname = f.field_type_name
+                                    sname_len = f.field_type_name_len
+
+            # Legacy fallback to (currently disabled) helper.
+            if sname_len == 0
+                let field: *StructField = get_deref_struct_type(s, e)
+                if field != null and field.field_type_name_len > 0
+                    sname = field.field_type_name
+                    sname_len = field.field_type_name_len
+
+            if sname_len > 0
                 let result: i32 = next_reg(s)
                 emit_str(s, c"  ")
                 emit_reg(s, result)
                 emit_str(s, c" = load %")
-                emit_name(s, field.field_type_name, field.field_type_name_len)
+                emit_name(s, sname, sname_len)
                 emit_str(s, c", ptr ")
                 emit_reg(s, ptr)
                 emit_str(s, c"\n")
