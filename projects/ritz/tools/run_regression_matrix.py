@@ -46,6 +46,7 @@ TESTS = [
     "test_issue_ptr_value_coercion",
     "test_issue_qualified_enum_variant",
     "test_issue_result_unwrap_method",
+    "test_issue_sizeof_primitive",
     "test_issue_span_slice_range",
     "test_issue_struct_destructure",
     "test_issue_strview_as_bytes",
