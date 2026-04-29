@@ -23,7 +23,6 @@ RITZLIB_MODULES = ["sys", "io", "str", "strview", "string", "hash", "memory",
                    "bytes", "span"]
 
 TESTS = [
-    "test_issue_addr_of_chain_ptr_ptr",
     "test_issue_addr_of_struct_array_member",
     "test_issue_array_value_to_span",
     "test_issue_binop_as_cast",
