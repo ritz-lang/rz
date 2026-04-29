@@ -694,6 +694,73 @@ fn emit_syscall_implementations(s: *EmitterState)
     # Note: Higher-level syscall wrappers (sys_write, sys_read, etc.) are
     # defined in ritzlib/sys.ritz and will be included when that module is imported.
 
+# AGAST #167: Recognize LLVM x86 intrinsic names registered as externs by
+# emit_x86_simd_intrinsic.  These need typed `declare <vec> @llvm.x86.foo(<vec>...)`
+# instead of the generic `declare i64 @name(...)`.
+fn is_llvm_x86_intrinsic_name(name: *u8, len: i32) -> i32
+    # Cheap prefix match on "llvm.x86.".
+    if len < 9
+        return 0
+    if *(name + 0) != 'l'
+        return 0
+    if *(name + 1) != 'l'
+        return 0
+    if *(name + 2) != 'v'
+        return 0
+    if *(name + 3) != 'm'
+        return 0
+    if *(name + 4) != '.'
+        return 0
+    if *(name + 5) != 'x'
+        return 0
+    if *(name + 6) != '8'
+        return 0
+    if *(name + 7) != '6'
+        return 0
+    if *(name + 8) != '.'
+        return 0
+    1
+
+# Emit a `declare` for one of the supported x86 SIMD LLVM intrinsics.  Keeps
+# signature data co-located with name detection so the ritz1 dispatch and
+# the module-level extern emission stay in sync.
+fn emit_llvm_x86_intrinsic_decl(s: *EmitterState, name: *u8, len: i32)
+    if name_eq(name, len, c"llvm.x86.sha256rnds2", 20) == 1
+        emit_str(s, c"declare <4 x i32> @llvm.x86.sha256rnds2(<4 x i32>, <4 x i32>, <4 x i32>)\n")
+        return
+    if name_eq(name, len, c"llvm.x86.sha256msg1", 19) == 1
+        emit_str(s, c"declare <4 x i32> @llvm.x86.sha256msg1(<4 x i32>, <4 x i32>)\n")
+        return
+    if name_eq(name, len, c"llvm.x86.sha256msg2", 19) == 1
+        emit_str(s, c"declare <4 x i32> @llvm.x86.sha256msg2(<4 x i32>, <4 x i32>)\n")
+        return
+    if name_eq(name, len, c"llvm.x86.aesni.aesenc", 21) == 1
+        emit_str(s, c"declare <2 x i64> @llvm.x86.aesni.aesenc(<2 x i64>, <2 x i64>)\n")
+        return
+    if name_eq(name, len, c"llvm.x86.aesni.aesenclast", 25) == 1
+        emit_str(s, c"declare <2 x i64> @llvm.x86.aesni.aesenclast(<2 x i64>, <2 x i64>)\n")
+        return
+    if name_eq(name, len, c"llvm.x86.aesni.aesdec", 21) == 1
+        emit_str(s, c"declare <2 x i64> @llvm.x86.aesni.aesdec(<2 x i64>, <2 x i64>)\n")
+        return
+    if name_eq(name, len, c"llvm.x86.aesni.aesdeclast", 25) == 1
+        emit_str(s, c"declare <2 x i64> @llvm.x86.aesni.aesdeclast(<2 x i64>, <2 x i64>)\n")
+        return
+    if name_eq(name, len, c"llvm.x86.aesni.aesimc", 21) == 1
+        emit_str(s, c"declare <2 x i64> @llvm.x86.aesni.aesimc(<2 x i64>)\n")
+        return
+    if name_eq(name, len, c"llvm.x86.sse2.psad.bw", 21) == 1
+        emit_str(s, c"declare <2 x i64> @llvm.x86.sse2.psad.bw(<16 x i8>, <16 x i8>)\n")
+        return
+    if name_eq(name, len, c"llvm.x86.pclmulqdq", 18) == 1
+        emit_str(s, c"declare <2 x i64> @llvm.x86.pclmulqdq(<2 x i64>, <2 x i64>, i8)\n")
+        return
+    # Unknown llvm.x86.* — fall back to a vague declare so the IR at least
+    # parses (caller handles the type-check).
+    emit_str(s, c"declare void @")
+    emit_name(s, name, len)
+    emit_str(s, c"(...)\n")
+
 # Check if an external name is a syscall function we implement inline
 # (Only the low-level syscall0-6 functions; higher-level wrappers come from ritzlib/sys.ritz)
 fn is_syscall_function(name: *u8, len: i32) -> i32
@@ -729,6 +796,14 @@ fn emit_extern_declarations(s: *EmitterState)
         let ex: *ExternFunc = @s.externs[i]
         # Skip syscalls (already emitted inline above)
         if is_syscall_function(ex.name, ex.name_len) == 1
+            continue
+        # AGAST #167: x86 LLVM intrinsics (`llvm.x86.sha256rnds2`, etc.) need
+        # vector-typed declarations so clang accepts the inline calls emitted
+        # by emit_x86_simd_intrinsic.  Detect by `llvm.x86.` prefix and emit
+        # the right vector signature; everything else falls through to the
+        # generic `declare i64 @name(...)` path below.
+        if is_llvm_x86_intrinsic_name(ex.name, ex.name_len) == 1
+            emit_llvm_x86_intrinsic_decl(s, ex.name, ex.name_len)
             continue
         # Skip if this function is defined in this module
         if is_local_function(s.module, ex.name, ex.name_len) == 0
@@ -920,6 +995,11 @@ fn emit_enum_fallback_decl(s: *EmitterState, name: *u8, len: i32)
     if is_tagged_enum_type(name, len) == 1
         return
     if is_primitive_type_name(name, len) == 1
+        return
+    # AGAST #167: SIMD vector type names lower to `<N x iM>` directly — they
+    # never need (and must not get) a `%v4i32 = type { i8 }` named-struct
+    # decl which would pin the LLVM type to a bogus `{ i8 }` layout.
+    if is_simd_vector_type_name(name, len) == 1
         return
     if was_struct_emitted(s, name, len) == 1
         return
@@ -1613,6 +1693,8 @@ fn emit_module(m: *Module, out: *Vec<u8>) -> i32
     s.emitted_global_count = 0
     s.ctx_enum_name = null
     s.ctx_enum_name_len = 0
+    s.ctx_simd_name = null
+    s.ctx_simd_name_len = 0
 
     emit_str(@s, c"; ModuleID = 'ritz1_output'\n")
     emit_str(@s, c"target triple = \"x86_64-unknown-linux-gnu\"\n\n")

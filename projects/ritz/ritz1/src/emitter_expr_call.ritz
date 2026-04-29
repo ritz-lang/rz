@@ -672,6 +672,506 @@ fn emit_variant_struct(s: *EmitterState, tag: i32, payload_expr: *Expr) -> i32
     emit_str(s, c"\n")
     return result
 
+# =============================================================================
+# AGAST #167 — SIMD builtin lowering
+#
+# ritz0 (Python) handles SIMD intrinsics in emitter/calls.py via direct LLVM
+# IR generation rather than going through the regular call path.  ritz1's
+# generic call path always emits `call i64 @name`, which mismatches when the
+# binding is a `<N x iM>` vector type.  These helpers port ritz0's inline
+# lowering for the simd_* builtins (simd_loadu, simd_xor, simd_add, etc.).
+# Vector-type selection: prefer the binding context (`s.ctx_simd_name`, set
+# by emit_var_decl / emit_assign) for simd_load/loadu where the type is not
+# encoded in the args; for binary ops fall back to walking the arg locals.
+# =============================================================================
+
+# Resolve SIMD vector type-name for an arg expression — looks at ident
+# locals first (they carry `type_name = "v4i32"` etc.), then falls back to
+# the binding context.  Returns 1 if resolved, 0 otherwise.
+fn resolve_simd_arg_type(s: *EmitterState, arg: *Expr, out_name: **u8, out_len: *i32) -> i32
+    if arg != null
+        if arg.kind == EXPR_IDENT
+            let lv: *LocalVar = find_local_struct_name(s, arg.ident_ptr, arg.ident_len)
+            if lv != null
+                if is_simd_vector_type_name(lv.type_name, lv.type_name_len) == 1
+                    *out_name = lv.type_name
+                    *out_len = lv.type_name_len
+                    return 1
+        else if arg.kind == EXPR_UNARY
+            # `*p` — check the operand (deref of *v4i32 → v4i32 value).
+            return resolve_simd_arg_type(s, arg.operand, out_name, out_len)
+    if s.ctx_simd_name != null
+        if s.ctx_simd_name_len > 0
+            *out_name = s.ctx_simd_name
+            *out_len = s.ctx_simd_name_len
+            return 1
+    # Fall through to the enclosing fn's return type — needed for tail-
+    # expression `return simd_loadu(...)` shapes (squeeze/crc32_simd has
+    # `fn load_vec(...) -> v2i64 \n  simd_loadu(data as *i64)`).
+    if s.ret_type_name != null
+        if s.ret_type_name_len > 0
+            if is_simd_vector_type_name(s.ret_type_name, s.ret_type_name_len) == 1
+                *out_name = s.ret_type_name
+                *out_len = s.ret_type_name_len
+                return 1
+    0
+
+# `simd_loadu(ptr) -> vec<N,T>` / `simd_load(...)`: emit an inline LLVM load
+# with the vector type pulled from `s.ctx_simd_name` (set by the enclosing
+# `let v: v4i32 = ...` / `v = ...`).  `unaligned == 1` → align 1; else use
+# 16-byte (SSE2) or 32-byte (AVX2) alignment based on the chosen vec type.
+fn emit_simd_loadu(s: *EmitterState, e: *Expr, unaligned: i32) -> i32
+    if e.args == null
+        emit_str(s, c"  ; ERROR: simd_load(u) requires a pointer argument\n")
+        let z: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, z)
+        emit_str(s, c" = add i64 0, 0\n")
+        return z
+    let arg_reg: i32 = emit_expr(s, e.args)
+    var vec_name: *u8 = null
+    var vec_name_len: i32 = 0
+    if resolve_simd_arg_type(s, null, @vec_name, @vec_name_len) == 0
+        # No context — default to v4i32 (most common SSE2 shape).  Keeps
+        # IR well-formed even when we can't infer; the user will get a
+        # clear type error downstream if it doesn't match the binding.
+        vec_name = c"v4i32"
+        vec_name_len = 5
+    # Convert i64 ptr-as-int to ptr (ritz1's unified value model passes
+    # all pointers as i64 except when the param is TYPE_MUT_REF).
+    let p: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, p)
+    emit_str(s, c" = inttoptr i64 ")
+    emit_reg(s, arg_reg)
+    emit_str(s, c" to ptr  ; simd_load: ptr cast\n")
+    let result: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, result)
+    emit_str(s, c" = load ")
+    emit_simd_vector_type(s, vec_name, vec_name_len)
+    emit_str(s, c", ptr ")
+    emit_reg(s, p)
+    if unaligned == 1
+        emit_str(s, c", align 1\n")
+    else
+        # AVX2 names use 32-byte alignment; SSE2 names use 16-byte.
+        let bits: i32 = simd_vector_elem_bits(vec_name, vec_name_len)
+        let count: i32 = simd_vector_elem_count(vec_name, vec_name_len)
+        if (bits * count) >= 256
+            emit_str(s, c", align 32\n")
+        else
+            emit_str(s, c", align 16\n")
+    return result
+
+# `simd_storeu(ptr, vec)` / `simd_store(...)`: emit inline LLVM store.
+fn emit_simd_storeu(s: *EmitterState, e: *Expr, unaligned: i32) -> i32
+    if e.args == null or e.args.next == null
+        emit_str(s, c"  ; ERROR: simd_store(u) requires (ptr, vec)\n")
+        let z: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, z)
+        emit_str(s, c" = add i64 0, 0\n")
+        return z
+    let ptr_reg: i32 = emit_expr(s, e.args)
+    let vec_reg: i32 = emit_expr(s, e.args.next)
+    var vec_name: *u8 = null
+    var vec_name_len: i32 = 0
+    if resolve_simd_arg_type(s, e.args.next, @vec_name, @vec_name_len) == 0
+        vec_name = c"v4i32"
+        vec_name_len = 5
+    let p: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, p)
+    emit_str(s, c" = inttoptr i64 ")
+    emit_reg(s, ptr_reg)
+    emit_str(s, c" to ptr  ; simd_store: ptr cast\n")
+    emit_str(s, c"  store ")
+    emit_simd_vector_type(s, vec_name, vec_name_len)
+    emit_str(s, c" ")
+    emit_reg(s, vec_reg)
+    emit_str(s, c", ptr ")
+    emit_reg(s, p)
+    if unaligned == 1
+        emit_str(s, c", align 1\n")
+    else
+        let bits2: i32 = simd_vector_elem_bits(vec_name, vec_name_len)
+        let count2: i32 = simd_vector_elem_count(vec_name, vec_name_len)
+        if (bits2 * count2) >= 256
+            emit_str(s, c", align 32\n")
+        else
+            emit_str(s, c", align 16\n")
+    # Void result — return a sentinel i64 0.  Callers that bind the result
+    # see a harmless no-op value; the typical use is statement-position
+    # `simd_storeu(...)` where the value is dropped.
+    let z2: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, z2)
+    emit_str(s, c" = add i64 0, 0  ; simd_store void\n")
+    return z2
+
+# `simd_xor(a,b)` / `simd_add(a,b)` — binary vector ops.  Vector type is
+# derived from the args (vector-typed locals) or context.
+fn emit_simd_binop(s: *EmitterState, e: *Expr, opname: *u8) -> i32
+    if e.args == null or e.args.next == null
+        emit_str(s, c"  ; ERROR: simd binop requires 2 vector args\n")
+        let z: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, z)
+        emit_str(s, c" = add i64 0, 0\n")
+        return z
+    let a_reg: i32 = emit_expr(s, e.args)
+    let b_reg: i32 = emit_expr(s, e.args.next)
+    var vec_name: *u8 = null
+    var vec_name_len: i32 = 0
+    if resolve_simd_arg_type(s, e.args, @vec_name, @vec_name_len) == 0
+        if resolve_simd_arg_type(s, e.args.next, @vec_name, @vec_name_len) == 0
+            vec_name = c"v4i32"
+            vec_name_len = 5
+    let result: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, result)
+    emit_str(s, c" = ")
+    emit_str(s, opname)
+    emit_str(s, c" ")
+    emit_simd_vector_type(s, vec_name, vec_name_len)
+    emit_str(s, c" ")
+    emit_reg(s, a_reg)
+    emit_str(s, c", ")
+    emit_reg(s, b_reg)
+    emit_str(s, c"\n")
+    return result
+
+# `simd_extract(vec, idx) -> elem` — `extractelement`.
+fn emit_simd_extract(s: *EmitterState, e: *Expr) -> i32
+    if e.args == null or e.args.next == null
+        emit_str(s, c"  ; ERROR: simd_extract requires (vec, idx)\n")
+        let z: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, z)
+        emit_str(s, c" = add i64 0, 0\n")
+        return z
+    let vec_reg: i32 = emit_expr(s, e.args)
+    let idx_reg: i32 = emit_expr(s, e.args.next)
+    var vec_name: *u8 = null
+    var vec_name_len: i32 = 0
+    if resolve_simd_arg_type(s, e.args, @vec_name, @vec_name_len) == 0
+        vec_name = c"v4i32"
+        vec_name_len = 5
+    # `idx_reg` is i64 in the unified value model; truncate to i32 for
+    # the extractelement opcode.
+    let i32idx: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, i32idx)
+    emit_str(s, c" = trunc i64 ")
+    emit_reg(s, idx_reg)
+    emit_str(s, c" to i32\n")
+    let elem: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, elem)
+    emit_str(s, c" = extractelement ")
+    emit_simd_vector_type(s, vec_name, vec_name_len)
+    emit_str(s, c" ")
+    emit_reg(s, vec_reg)
+    emit_str(s, c", i32 ")
+    emit_reg(s, i32idx)
+    emit_str(s, c"\n")
+    # Element is the vector's scalar type — extend to i64 for the unified
+    # value model so downstream consumers work uniformly.
+    let bits: i32 = simd_vector_elem_bits(vec_name, vec_name_len)
+    if bits == 64
+        return elem
+    let ext: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, ext)
+    emit_str(s, c" = sext ")
+    emit_simd_elem_type(s, vec_name, vec_name_len)
+    emit_str(s, c" ")
+    emit_reg(s, elem)
+    emit_str(s, c" to i64\n")
+    return ext
+
+# `simd_insert(vec, idx, val) -> vec` — `insertelement`.
+fn emit_simd_insert(s: *EmitterState, e: *Expr) -> i32
+    if e.args == null or e.args.next == null or e.args.next.next == null
+        emit_str(s, c"  ; ERROR: simd_insert requires (vec, idx, val)\n")
+        let z: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, z)
+        emit_str(s, c" = add i64 0, 0\n")
+        return z
+    let vec_reg: i32 = emit_expr(s, e.args)
+    let idx_reg: i32 = emit_expr(s, e.args.next)
+    let val_reg: i32 = emit_expr(s, e.args.next.next)
+    var vec_name: *u8 = null
+    var vec_name_len: i32 = 0
+    if resolve_simd_arg_type(s, e.args, @vec_name, @vec_name_len) == 0
+        vec_name = c"v4i32"
+        vec_name_len = 5
+    let i32idx: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, i32idx)
+    emit_str(s, c" = trunc i64 ")
+    emit_reg(s, idx_reg)
+    emit_str(s, c" to i32\n")
+    # Truncate val from i64 down to the element width.
+    let bits: i32 = simd_vector_elem_bits(vec_name, vec_name_len)
+    var val_narrow: i32 = val_reg
+    if bits != 64
+        val_narrow = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, val_narrow)
+        emit_str(s, c" = trunc i64 ")
+        emit_reg(s, val_reg)
+        emit_str(s, c" to ")
+        emit_simd_elem_type(s, vec_name, vec_name_len)
+        emit_str(s, c"\n")
+    let result: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, result)
+    emit_str(s, c" = insertelement ")
+    emit_simd_vector_type(s, vec_name, vec_name_len)
+    emit_str(s, c" ")
+    emit_reg(s, vec_reg)
+    emit_str(s, c", ")
+    emit_simd_elem_type(s, vec_name, vec_name_len)
+    emit_str(s, c" ")
+    emit_reg(s, val_narrow)
+    emit_str(s, c", i32 ")
+    emit_reg(s, i32idx)
+    emit_str(s, c"\n")
+    return result
+
+# `simd_shuffle(a, b, mask...)` — `shufflevector`.  Mask args must all be
+# integer literals (compile-time constants).
+fn emit_simd_shuffle(s: *EmitterState, e: *Expr) -> i32
+    if e.args == null or e.args.next == null or e.args.next.next == null
+        emit_str(s, c"  ; ERROR: simd_shuffle requires (vec, vec, mask...)\n")
+        let z: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, z)
+        emit_str(s, c" = add i64 0, 0\n")
+        return z
+    let a_reg: i32 = emit_expr(s, e.args)
+    let b_reg: i32 = emit_expr(s, e.args.next)
+    var vec_name: *u8 = null
+    var vec_name_len: i32 = 0
+    if resolve_simd_arg_type(s, e.args, @vec_name, @vec_name_len) == 0
+        vec_name = c"v4i32"
+        vec_name_len = 5
+    # Count + emit mask values.  All must be integer literals.
+    var mask_count: i32 = 0
+    var mask_arg: *Expr = e.args.next.next
+    while mask_arg != null
+        mask_count = mask_count + 1
+        mask_arg = mask_arg.next
+    let result: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, result)
+    emit_str(s, c" = shufflevector ")
+    emit_simd_vector_type(s, vec_name, vec_name_len)
+    emit_str(s, c" ")
+    emit_reg(s, a_reg)
+    emit_str(s, c", ")
+    emit_simd_vector_type(s, vec_name, vec_name_len)
+    emit_str(s, c" ")
+    emit_reg(s, b_reg)
+    emit_str(s, c", <")
+    emit_int(s, mask_count as i64)
+    emit_str(s, c" x i32> <")
+    mask_arg = e.args.next.next
+    var first: i32 = 1
+    while mask_arg != null
+        if first == 0
+            emit_str(s, c", ")
+        first = 0
+        emit_str(s, c"i32 ")
+        if mask_arg.kind == EXPR_INT_LIT
+            emit_int(s, mask_arg.int_val)
+        else
+            # Best-effort: emit 0 for non-literal (LLVM rejects but the
+            # compiler at least doesn't crash).  ritz0 raises here.
+            emit_int(s, 0)
+        mask_arg = mask_arg.next
+    emit_str(s, c">\n")
+    return result
+
+# `simd_rotl(vec, n)` — rotate-left by constant n.  Implemented as
+# `(v << n) | (v >> (bits - n))`.  `n` must be a compile-time integer
+# literal so we can broadcast the shift constants directly.
+fn emit_simd_rotl(s: *EmitterState, e: *Expr) -> i32
+    if e.args == null or e.args.next == null
+        emit_str(s, c"  ; ERROR: simd_rotl requires (vec, n)\n")
+        let z: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, z)
+        emit_str(s, c" = add i64 0, 0\n")
+        return z
+    let vec_reg: i32 = emit_expr(s, e.args)
+    var vec_name: *u8 = null
+    var vec_name_len: i32 = 0
+    if resolve_simd_arg_type(s, e.args, @vec_name, @vec_name_len) == 0
+        vec_name = c"v4i32"
+        vec_name_len = 5
+    # Extract shift amount as a compile-time constant.
+    var shift_amount: i64 = 0
+    var shift_expr: *Expr = e.args.next
+    if shift_expr.kind == EXPR_INT_LIT
+        shift_amount = shift_expr.int_val
+    else if shift_expr.kind == EXPR_CAST and shift_expr.left != null and shift_expr.left.kind == EXPR_INT_LIT
+        shift_amount = shift_expr.left.int_val
+    let bits: i32 = simd_vector_elem_bits(vec_name, vec_name_len)
+    let count: i32 = simd_vector_elem_count(vec_name, vec_name_len)
+    let right_shift: i64 = (bits as i64) - shift_amount
+    # Build broadcast splats for left/right shift constants.
+    let left_shifted: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, left_shifted)
+    emit_str(s, c" = shl ")
+    emit_simd_vector_type(s, vec_name, vec_name_len)
+    emit_str(s, c" ")
+    emit_reg(s, vec_reg)
+    emit_str(s, c", <")
+    var li: i32 = 0
+    while li < count
+        if li > 0
+            emit_str(s, c", ")
+        emit_simd_elem_type(s, vec_name, vec_name_len)
+        emit_str(s, c" ")
+        emit_int(s, shift_amount)
+        li = li + 1
+    emit_str(s, c">\n")
+    let right_shifted: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, right_shifted)
+    emit_str(s, c" = lshr ")
+    emit_simd_vector_type(s, vec_name, vec_name_len)
+    emit_str(s, c" ")
+    emit_reg(s, vec_reg)
+    emit_str(s, c", <")
+    var ri: i32 = 0
+    while ri < count
+        if ri > 0
+            emit_str(s, c", ")
+        emit_simd_elem_type(s, vec_name, vec_name_len)
+        emit_str(s, c" ")
+        emit_int(s, right_shift)
+        ri = ri + 1
+    emit_str(s, c">\n")
+    let result: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, result)
+    emit_str(s, c" = or ")
+    emit_simd_vector_type(s, vec_name, vec_name_len)
+    emit_str(s, c" ")
+    emit_reg(s, left_shifted)
+    emit_str(s, c", ")
+    emit_reg(s, right_shifted)
+    emit_str(s, c"\n")
+    return result
+
+# `simd_sad(a: v16i8, b: v16i8) -> v2i64` — sum of absolute differences,
+# routes to `llvm.x86.sse2.psad.bw`.  The result type differs from the args.
+fn emit_simd_sad(s: *EmitterState, e: *Expr) -> i32
+    if e.args == null or e.args.next == null
+        emit_str(s, c"  ; ERROR: simd_sad requires (vec, vec)\n")
+        let z: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, z)
+        emit_str(s, c" = add i64 0, 0\n")
+        return z
+    let a_reg: i32 = emit_expr(s, e.args)
+    let b_reg: i32 = emit_expr(s, e.args.next)
+    add_extern(s, c"llvm.x86.sse2.psad.bw", 21)
+    let result: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, result)
+    emit_str(s, c" = call <2 x i64> @llvm.x86.sse2.psad.bw(<16 x i8> ")
+    emit_reg(s, a_reg)
+    emit_str(s, c", <16 x i8> ")
+    emit_reg(s, b_reg)
+    emit_str(s, c")\n")
+    return result
+
+# `simd_clmul(a: v2i64, b: v2i64, imm8: u8) -> v2i64` — carryless multiply
+# (PCLMULQDQ).  imm must be a compile-time constant 0-255.
+fn emit_simd_clmul(s: *EmitterState, e: *Expr) -> i32
+    if e.args == null or e.args.next == null or e.args.next.next == null
+        emit_str(s, c"  ; ERROR: simd_clmul requires (vec, vec, imm8)\n")
+        let z: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, z)
+        emit_str(s, c" = add i64 0, 0\n")
+        return z
+    let a_reg: i32 = emit_expr(s, e.args)
+    let b_reg: i32 = emit_expr(s, e.args.next)
+    var imm: i64 = 0
+    let imm_expr: *Expr = e.args.next.next
+    if imm_expr.kind == EXPR_INT_LIT
+        imm = imm_expr.int_val
+    else if imm_expr.kind == EXPR_CAST and imm_expr.left != null and imm_expr.left.kind == EXPR_INT_LIT
+        imm = imm_expr.left.int_val
+    add_extern(s, c"llvm.x86.pclmulqdq", 18)
+    let result: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, result)
+    emit_str(s, c" = call <2 x i64> @llvm.x86.pclmulqdq(<2 x i64> ")
+    emit_reg(s, a_reg)
+    emit_str(s, c", <2 x i64> ")
+    emit_reg(s, b_reg)
+    emit_str(s, c", i8 ")
+    emit_int(s, imm)
+    emit_str(s, c")\n")
+    return result
+
+# Generic x86 LLVM-intrinsic dispatch — emit `call <vec_type> @<llvm_name>(...)`.
+# Used for the SHA-NI and AES-NI families which take and return SIMD vectors
+# but aren't simd_*-prefixed.  Adds the LLVM intrinsic name to the externs
+# table so the matching `declare` is emitted in emit_extern_declarations.
+# `vec_name` chooses the vector LLVM type for both args and result.
+# `arity` is the number of vector args (1, 2, or 3).
+fn emit_x86_simd_intrinsic(s: *EmitterState, e: *Expr, llvm_name: *u8, llvm_name_len: i32, arity: i32, vec_name: *u8, vec_name_len: i32) -> i32
+    var arg_regs: [4]i32
+    var arg_count: i32 = 0
+    var arg_it: *Expr = e.args
+    while arg_it != null and arg_count < 4
+        arg_regs[arg_count] = emit_expr(s, arg_it)
+        arg_count = arg_count + 1
+        arg_it = arg_it.next
+    if arg_count != arity
+        emit_str(s, c"  ; ERROR: x86 intrinsic arity mismatch\n")
+        let z: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, z)
+        emit_str(s, c" = add i64 0, 0\n")
+        return z
+    add_extern(s, llvm_name, llvm_name_len)
+    let result: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, result)
+    emit_str(s, c" = call ")
+    emit_simd_vector_type(s, vec_name, vec_name_len)
+    emit_str(s, c" @")
+    emit_name(s, llvm_name, llvm_name_len)
+    emit_str(s, c"(")
+    var k: i32 = 0
+    while k < arg_count
+        if k > 0
+            emit_str(s, c", ")
+        emit_simd_vector_type(s, vec_name, vec_name_len)
+        emit_str(s, c" ")
+        emit_reg(s, arg_regs[k])
+        k = k + 1
+    emit_str(s, c")\n")
+    return result
+
+# Convenience wrappers: v4i32-typed (SHA-NI family) and v2i64-typed (AES-NI).
+fn emit_x86_intrinsic_v4i32(s: *EmitterState, e: *Expr, llvm_name: *u8, llvm_name_len: i32, arity: i32) -> i32
+    return emit_x86_simd_intrinsic(s, e, llvm_name, llvm_name_len, arity, c"v4i32", 5)
+
+fn emit_x86_intrinsic_v2i64(s: *EmitterState, e: *Expr, llvm_name: *u8, llvm_name_len: i32, arity: i32) -> i32
+    return emit_x86_simd_intrinsic(s, e, llvm_name, llvm_name_len, arity, c"v2i64", 5)
+
 fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
     # Variant constructor: Some(x) / Ok(x) / None / Err(x) -> %Result$.../
     # Option$... struct.  Handled before the generic call path so
@@ -836,6 +1336,60 @@ fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
         emit_reg(s, alloca_reg)
         emit_str(s, c" to i64\n")
         return ptr_reg
+
+    # AGAST #167: SIMD intrinsic dispatch.  Before the regular call path
+    # (which always emits `call i64 @<name>` and registers an extern), look
+    # for `simd_*` builtin names and lower them inline to native LLVM
+    # vector instructions.  Without this, `let v: v4i32 = simd_loadu(...)`
+    # produced `call i64 @simd_loadu(ptr ...)` then `store %v4i32 ...` and
+    # the IR verifier rejected the type mismatch.  Mirrors ritz0's
+    # _try_emit_simd_builtin lowering.
+    if name_eq(e.func_name, e.func_name_len, c"simd_loadu", 10) == 1
+        return emit_simd_loadu(s, e, 1)
+    if name_eq(e.func_name, e.func_name_len, c"simd_load", 9) == 1
+        return emit_simd_loadu(s, e, 0)
+    if name_eq(e.func_name, e.func_name_len, c"simd_storeu", 11) == 1
+        return emit_simd_storeu(s, e, 1)
+    if name_eq(e.func_name, e.func_name_len, c"simd_store", 10) == 1
+        return emit_simd_storeu(s, e, 0)
+    if name_eq(e.func_name, e.func_name_len, c"simd_xor", 8) == 1
+        return emit_simd_binop(s, e, c"xor")
+    if name_eq(e.func_name, e.func_name_len, c"simd_add", 8) == 1
+        return emit_simd_binop(s, e, c"add")
+    if name_eq(e.func_name, e.func_name_len, c"simd_extract", 12) == 1
+        return emit_simd_extract(s, e)
+    if name_eq(e.func_name, e.func_name_len, c"simd_insert", 11) == 1
+        return emit_simd_insert(s, e)
+    if name_eq(e.func_name, e.func_name_len, c"simd_shuffle", 12) == 1
+        return emit_simd_shuffle(s, e)
+    if name_eq(e.func_name, e.func_name_len, c"simd_rotl", 9) == 1
+        return emit_simd_rotl(s, e)
+    if name_eq(e.func_name, e.func_name_len, c"simd_sad", 8) == 1
+        return emit_simd_sad(s, e)
+    if name_eq(e.func_name, e.func_name_len, c"simd_clmul", 10) == 1
+        return emit_simd_clmul(s, e)
+    # AGAST #167: x86 SHA-NI / AES-NI intrinsics that take and return SIMD
+    # vectors.  They map to LLVM intrinsics directly (`llvm.x86.sha256rnds2`,
+    # etc.); without explicit dispatch, ritz1's generic call path emits
+    # `call i64 @sha256rnds2(i64 %vec_arg, ...)` and the verifier rejects
+    # the vector-into-i64 mismatch.  v4i32-returning ones first; the v2i64
+    # AES family below.
+    if name_eq(e.func_name, e.func_name_len, c"sha256rnds2", 11) == 1
+        return emit_x86_intrinsic_v4i32(s, e, c"llvm.x86.sha256rnds2", 20, 3)
+    if name_eq(e.func_name, e.func_name_len, c"sha256msg1", 10) == 1
+        return emit_x86_intrinsic_v4i32(s, e, c"llvm.x86.sha256msg1", 19, 2)
+    if name_eq(e.func_name, e.func_name_len, c"sha256msg2", 10) == 1
+        return emit_x86_intrinsic_v4i32(s, e, c"llvm.x86.sha256msg2", 19, 2)
+    if name_eq(e.func_name, e.func_name_len, c"aesenc", 6) == 1
+        return emit_x86_intrinsic_v2i64(s, e, c"llvm.x86.aesni.aesenc", 21, 2)
+    if name_eq(e.func_name, e.func_name_len, c"aesenclast", 10) == 1
+        return emit_x86_intrinsic_v2i64(s, e, c"llvm.x86.aesni.aesenclast", 25, 2)
+    if name_eq(e.func_name, e.func_name_len, c"aesdec", 6) == 1
+        return emit_x86_intrinsic_v2i64(s, e, c"llvm.x86.aesni.aesdec", 21, 2)
+    if name_eq(e.func_name, e.func_name_len, c"aesdeclast", 10) == 1
+        return emit_x86_intrinsic_v2i64(s, e, c"llvm.x86.aesni.aesdeclast", 25, 2)
+    if name_eq(e.func_name, e.func_name_len, c"aesimc", 6) == 1
+        return emit_x86_intrinsic_v2i64(s, e, c"llvm.x86.aesni.aesimc", 21, 1)
 
     # Regular function call - register as external if not defined in this module
     # Build the full function name with type suffix (e.g., "vec_new$u8" for vec_new<u8>())

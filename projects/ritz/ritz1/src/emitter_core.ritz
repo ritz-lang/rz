@@ -80,6 +80,13 @@ struct EmitterState
     # returns inside a Result-returning fn).
     ctx_enum_name: *u8
     ctx_enum_name_len: i32
+    # AGAST #167: SIMD-typed binding context.  When emitting `let v: v4i32 =
+    # simd_loadu(...)`, the var-decl pre-sets these so emit_expr_call's
+    # SIMD intrinsic dispatch knows which `<N x iM>` type to produce.  Null
+    # means "no SIMD-typed enclosing binding" — intrinsic dispatch then
+    # tries to derive the type from arg idents (vector-typed locals).
+    ctx_simd_name: *u8
+    ctx_simd_name_len: i32
 
 # =============================================================================
 # Helpers
@@ -659,6 +666,107 @@ pub fn is_primitive_type_name(name: *u8, len: i32) -> i32
         return 1
     0
 
+# AGAST #167: SIMD vector type names (`v4i32`, `v16i8`, etc).  ritz0 treats
+# these as builtin types in name_resolver.BUILTIN_TYPES.  ritz1's parser
+# accepts them as struct-name annotations; without explicit recognition they
+# fall through to the `%v4i32 = type { i8 }` fallback decl, breaking the
+# stride for `simd_*` builtins which must produce/consume real LLVM `<N x iM>`
+# vectors.  Returns 1 for all SSE2 (128-bit) and AVX2 (256-bit) name shapes
+# the cryptosec / squeeze libs use.
+pub fn is_simd_vector_type_name(name: *u8, len: i32) -> i32
+    if name_eq(name, len, c"v16i8", 5) == 1
+        return 1
+    if name_eq(name, len, c"v8i16", 5) == 1
+        return 1
+    if name_eq(name, len, c"v4i32", 5) == 1
+        return 1
+    if name_eq(name, len, c"v2i64", 5) == 1
+        return 1
+    if name_eq(name, len, c"v32i8", 5) == 1
+        return 1
+    if name_eq(name, len, c"v16i16", 6) == 1
+        return 1
+    if name_eq(name, len, c"v8i32", 5) == 1
+        return 1
+    if name_eq(name, len, c"v4i64", 5) == 1
+        return 1
+    0
+
+# Emit the LLVM `<N x iM>` syntax for a SIMD vector type name.  Caller must
+# ensure `is_simd_vector_type_name(name, len) == 1` first.
+pub fn emit_simd_vector_type(s: *EmitterState, name: *u8, len: i32)
+    if name_eq(name, len, c"v16i8", 5) == 1
+        emit_str(s, c"<16 x i8>")
+    else if name_eq(name, len, c"v8i16", 5) == 1
+        emit_str(s, c"<8 x i16>")
+    else if name_eq(name, len, c"v4i32", 5) == 1
+        emit_str(s, c"<4 x i32>")
+    else if name_eq(name, len, c"v2i64", 5) == 1
+        emit_str(s, c"<2 x i64>")
+    else if name_eq(name, len, c"v32i8", 5) == 1
+        emit_str(s, c"<32 x i8>")
+    else if name_eq(name, len, c"v16i16", 6) == 1
+        emit_str(s, c"<16 x i16>")
+    else if name_eq(name, len, c"v8i32", 5) == 1
+        emit_str(s, c"<8 x i32>")
+    else if name_eq(name, len, c"v4i64", 5) == 1
+        emit_str(s, c"<4 x i64>")
+
+# Element bit width for a SIMD vector type — used by `simd_rotl` to compute
+# the wrap-around shift constants.  Returns 0 for non-SIMD names.
+pub fn simd_vector_elem_bits(name: *u8, len: i32) -> i32
+    if name_eq(name, len, c"v16i8", 5) == 1
+        return 8
+    if name_eq(name, len, c"v8i16", 5) == 1
+        return 16
+    if name_eq(name, len, c"v4i32", 5) == 1
+        return 32
+    if name_eq(name, len, c"v2i64", 5) == 1
+        return 64
+    if name_eq(name, len, c"v32i8", 5) == 1
+        return 8
+    if name_eq(name, len, c"v16i16", 6) == 1
+        return 16
+    if name_eq(name, len, c"v8i32", 5) == 1
+        return 32
+    if name_eq(name, len, c"v4i64", 5) == 1
+        return 64
+    0
+
+# Element count for a SIMD vector type — used by `simd_rotl` to broadcast
+# constant shift amounts.
+pub fn simd_vector_elem_count(name: *u8, len: i32) -> i32
+    if name_eq(name, len, c"v16i8", 5) == 1
+        return 16
+    if name_eq(name, len, c"v8i16", 5) == 1
+        return 8
+    if name_eq(name, len, c"v4i32", 5) == 1
+        return 4
+    if name_eq(name, len, c"v2i64", 5) == 1
+        return 2
+    if name_eq(name, len, c"v32i8", 5) == 1
+        return 32
+    if name_eq(name, len, c"v16i16", 6) == 1
+        return 16
+    if name_eq(name, len, c"v8i32", 5) == 1
+        return 8
+    if name_eq(name, len, c"v4i64", 5) == 1
+        return 4
+    0
+
+# Element scalar LLVM type ("i8"/"i16"/"i32"/"i64") for a SIMD vector name —
+# used for extractelement/insertelement opcodes.
+pub fn emit_simd_elem_type(s: *EmitterState, name: *u8, len: i32)
+    let bits: i32 = simd_vector_elem_bits(name, len)
+    if bits == 8
+        emit_str(s, c"i8")
+    else if bits == 16
+        emit_str(s, c"i16")
+    else if bits == 32
+        emit_str(s, c"i32")
+    else if bits == 64
+        emit_str(s, c"i64")
+
 fn emit_llvm_type_struct(s: *EmitterState, t: i32, name: *u8, name_len: i32)
     if t == TYPE_STRUCT
         # Post-monomorphization (and pre-monomorph for explicit primitive
@@ -690,6 +798,13 @@ fn emit_llvm_type_struct(s: *EmitterState, t: i32, name: *u8, name_len: i32)
             return
         if name_eq(name, name_len, c"usize", 5) == 1 or name_eq(name, name_len, c"isize", 5) == 1
             emit_str(s, c"i64")
+            return
+        # AGAST #167: SIMD vector types (`v4i32`, `v16i8`, etc) lower to
+        # native LLVM `<N x iM>` rather than the named-struct fallback.
+        # Without this, `let v: v4i32 = simd_loadu(...)` allocas a bogus
+        # `%v4i32 = type { i8 }` and stores type-mismatch the call result.
+        if is_simd_vector_type_name(name, name_len) == 1
+            emit_simd_vector_type(s, name, name_len)
             return
         emit_str(s, c"%")
         emit_name(s, name, name_len)

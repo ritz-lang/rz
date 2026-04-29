@@ -465,14 +465,25 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
         # restore around the init expression so nested decls don't leak.
         let _saved_ctx: *u8 = s.ctx_enum_name
         let _saved_ctx_len: i32 = s.ctx_enum_name_len
+        # AGAST #167: same shape, different ctx — when the binding's
+        # declared type is a SIMD vector (`v4i32`, ...) the inline SIMD
+        # intrinsic dispatch in emit_expr_call uses this to size the
+        # `<N x iM>` load result.
+        let _saved_simd: *u8 = s.ctx_simd_name
+        let _saved_simd_len: i32 = s.ctx_simd_name_len
         if var_type == TYPE_STRUCT
             if stmt.var_type_name_len > 0
                 if is_tagged_enum_type(stmt.var_type_name, stmt.var_type_name_len) == 1
                     s.ctx_enum_name = stmt.var_type_name
                     s.ctx_enum_name_len = stmt.var_type_name_len
+                if is_simd_vector_type_name(stmt.var_type_name, stmt.var_type_name_len) == 1
+                    s.ctx_simd_name = stmt.var_type_name
+                    s.ctx_simd_name_len = stmt.var_type_name_len
         let init_reg: i32 = emit_expr(s, stmt.var_init)
         s.ctx_enum_name = _saved_ctx
         s.ctx_enum_name_len = _saved_ctx_len
+        s.ctx_simd_name = _saved_simd
+        s.ctx_simd_name_len = _saved_simd_len
         if var_type == TYPE_I32 or var_type == TYPE_U32
             let trunc: i32 = next_reg(s)
             emit_str(s, c"  ")
@@ -873,9 +884,18 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
             if stmt.assign_value.kind == EXPR_STRUCT_LIT
                 emit_struct_lit_to_alloca(s, stmt.assign_value, loc)
                 return
+            # AGAST #167: thread SIMD ctx so the rhs intrinsic dispatch
+            # (e.g. `wk = simd_loadu(@k[0])`) knows which `<N x iM>` to load.
+            let _saved_simd_a: *u8 = s.ctx_simd_name
+            let _saved_simd_a_len: i32 = s.ctx_simd_name_len
+            let local: *LocalVar = find_local_struct_name(s, stmt.assign_target, stmt.assign_target_len)
+            if local != null and is_simd_vector_type_name(local.type_name, local.type_name_len) == 1
+                s.ctx_simd_name = local.type_name
+                s.ctx_simd_name_len = local.type_name_len
             # For function call or other expression returning struct
             let val: i32 = emit_expr(s, stmt.assign_value)
-            let local: *LocalVar = find_local_struct_name(s, stmt.assign_target, stmt.assign_target_len)
+            s.ctx_simd_name = _saved_simd_a
+            s.ctx_simd_name_len = _saved_simd_a_len
             if local != null
                 # AGAST #168: Span$u8 ↔ StrView layout coercion at assign sites
                 # (e.g. `path = "..."` where path: StrView).  See emit_var_decl
@@ -886,8 +906,13 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
                 resolve_expr_struct_name(s, stmt.assign_value, @src_name, @src_len)
                 if is_layout_equiv_pair(src_name, src_len, local.type_name, local.type_name_len) == 1
                     stored_reg = rebuild_layout_equiv(s, val, src_name, src_len, local.type_name, local.type_name_len)
-                emit_str(s, c"  store %")
-                emit_name(s, local.type_name, local.type_name_len)
+                # AGAST #167: emit_llvm_type_struct routes `v4i32`/`v16i8`
+                # etc. to `<N x iM>` so the store width matches the
+                # inline-SIMD call's vector result; primitive type names
+                # ("i32", "f32", …) lower to their LLVM scalar type for
+                # the post-monomorph TYPE_STRUCT-with-primitive-name shape.
+                emit_str(s, c"  store ")
+                emit_llvm_type_struct(s, var_type, local.type_name, local.type_name_len)
                 emit_str(s, c" ")
                 emit_reg(s, stored_reg)
                 emit_str(s, c", ptr ")
