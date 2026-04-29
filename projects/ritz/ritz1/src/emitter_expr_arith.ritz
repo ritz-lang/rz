@@ -643,6 +643,86 @@ fn emit_expr_unary(s: *EmitterState, e: *Expr) -> i32
                                         emit_reg(s, elem_ptr)
                                         emit_str(s, c" to i64\n")
                                         return result
+                        # task-170: @local_struct.array_field[i] — local stack-
+                        # allocated struct (TYPE_STRUCT, not PTR). e.g.
+                        # `var addr: SockAddrIn` then `memset(@addr.zero[0],...)`
+                        # in ritzlib/net.ritz. Without this branch it falls
+                        # through to "; ERROR: cannot take address" — same
+                        # symptom as the chained-member case but a different
+                        # base shape.
+                        if local.var_type == TYPE_STRUCT and local.type_name_len > 0
+                            let st_ls: *StructDef = find_struct(s, local.type_name, local.type_name_len)
+                            if st_ls != null
+                                let field_idx_ls: i32 = find_field_index(st_ls, e.operand.left.ident_ptr, e.operand.left.ident_len)
+                                if field_idx_ls >= 0
+                                    let field_ls: *StructField = get_field_type(st_ls, field_idx_ls)
+                                    if field_ls.field_type == TYPE_ARRAY
+                                        let idx_ls: i32 = emit_expr(s, e.operand.right)
+                                        let elem_ptr_ls: i32 = next_reg(s)
+                                        emit_str(s, c"  ")
+                                        emit_reg(s, elem_ptr_ls)
+                                        emit_str(s, c" = getelementptr %")
+                                        emit_name(s, st_ls.name, st_ls.name_len)
+                                        emit_str(s, c", ptr ")
+                                        emit_reg(s, local.reg)
+                                        emit_str(s, c", i32 0, i32 ")
+                                        emit_int(s, field_idx_ls as i64)
+                                        emit_str(s, c", i64 ")
+                                        emit_reg(s, idx_ls)
+                                        emit_str(s, c"\n")
+                                        let result_ls: i32 = next_reg(s)
+                                        emit_str(s, c"  ")
+                                        emit_reg(s, result_ls)
+                                        emit_str(s, c" = ptrtoint ptr ")
+                                        emit_reg(s, elem_ptr_ls)
+                                        emit_str(s, c" to i64\n")
+                                        return result_ls
+                # task-170 site-1: chained-member addr-of-index, e.g.
+                # `@p.command.args[i]` where `p.command` itself is a member
+                # access (RespParser.command yields a RespCommand struct
+                # field, whose `args` field is an array). emit_member_ptr
+                # already handles arbitrarily-nested member chains — use it
+                # to compute a ptr to the array field, then GEP by index.
+                else if e.operand.left.left.kind == EXPR_MEMBER
+                    var inner_result_cm: MemberPtrResult
+                    emit_member_ptr(s, e.operand.left, @inner_result_cm)
+                    if inner_result_cm.success == 1
+                        let inner_field_cm: *StructField = inner_result_cm.field
+                        if inner_field_cm.field_type == TYPE_ARRAY
+                            let idx_cm: i32 = emit_expr(s, e.operand.right)
+                            let elem_ptr_cm: i32 = next_reg(s)
+                            emit_str(s, c"  ")
+                            emit_reg(s, elem_ptr_cm)
+                            emit_str(s, c" = getelementptr [")
+                            emit_int(s, inner_field_cm.array_size as i64)
+                            emit_str(s, c" x ")
+                            if inner_field_cm.array_elem_type == TYPE_STRUCT and inner_field_cm.array_elem_type_name_len > 0
+                                emit_str(s, c"%")
+                                emit_name(s, inner_field_cm.array_elem_type_name, inner_field_cm.array_elem_type_name_len)
+                            else if inner_field_cm.array_elem_type == TYPE_I32 or inner_field_cm.array_elem_type == TYPE_U32
+                                emit_str(s, c"i32")
+                            else if inner_field_cm.array_elem_type == TYPE_I64 or inner_field_cm.array_elem_type == TYPE_U64
+                                emit_str(s, c"i64")
+                            else if inner_field_cm.array_elem_type == TYPE_U8 or inner_field_cm.array_elem_type == TYPE_I8
+                                emit_str(s, c"i8")
+                            else if inner_field_cm.array_elem_type == TYPE_U16 or inner_field_cm.array_elem_type == TYPE_I16
+                                emit_str(s, c"i16")
+                            else if inner_field_cm.array_elem_type == TYPE_PTR or inner_field_cm.array_elem_type == TYPE_PTR_PTR
+                                emit_str(s, c"ptr")
+                            else
+                                emit_str(s, c"i64")
+                            emit_str(s, c"], ptr ")
+                            emit_reg(s, inner_result_cm.reg)
+                            emit_str(s, c", i64 0, i64 ")
+                            emit_reg(s, idx_cm)
+                            emit_str(s, c"\n")
+                            let result_cm: i32 = next_reg(s)
+                            emit_str(s, c"  ")
+                            emit_reg(s, result_cm)
+                            emit_str(s, c" = ptrtoint ptr ")
+                            emit_reg(s, elem_ptr_cm)
+                            emit_str(s, c" to i64\n")
+                            return result_cm
         else if e.operand.kind == EXPR_MEMBER
             # Handle @local_struct.field - address of a field in a local struct
             if e.operand.left.kind == EXPR_IDENT
