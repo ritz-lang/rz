@@ -928,10 +928,16 @@ fn resolve_expr_struct_name(s: *EmitterState, e: *Expr, out_name: **u8, out_len:
                     return
                 ib = ib.next
         return
-    # Local binding to a known struct type.
+    # Local binding to a known struct type.  Gate on `var_type == TYPE_STRUCT`
+    # — pointer-typed locals (`s: *StrView`, `cstr: *u8`) carry the pointee
+    # name in `type_name` (set by param_new for TYPE_PTR per ast_helpers.ritz)
+    # but their loaded register holds an `i64`, not the struct aggregate.
+    # Reporting the struct name in that case fools callers like
+    # try_emit_span_to_i64_arg into emitting `extractvalue %StrView i64`.
+    # (AGAST #176)
     if e.kind == EXPR_IDENT
         let loc: *LocalVar = find_local_struct_name(s, e.ident_ptr, e.ident_len)
-        if loc != null and loc.type_name_len > 0
+        if loc != null and loc.type_name_len > 0 and loc.var_type == TYPE_STRUCT
             *out_name = loc.type_name
             *out_len = loc.type_name_len
         return
@@ -957,6 +963,57 @@ fn resolve_expr_struct_name(s: *EmitterState, e: *Expr, out_name: **u8, out_len:
             *out_name = e.ident_ptr as *u8
             *out_len = e.ident_len
         return
+
+# AGAST #176 — Span$u8 / StrView -> i64 coercion at call-site arg passing.
+#
+# rzrz (and any caller) passes bare `"..."` literals (which lower to %Span$u8
+# per #98) to legacy `*u8` / `i64` params (e.g. `eprints_cstr`).  Without a
+# coercion the %Span$u8 aggregate flows straight into the call as
+# `call ... (i64 %.span)` and the IR verifier rejects the type mismatch.
+#
+# Mirrors #168's store-site decompose-and-rebuild but emits a single
+# `extractvalue` + `ptrtoint` (we only need the ptr field; len is dropped).
+#
+# Returns a freshly-allocated i64 register holding the coerced value, or -1
+# when no coercion was applied (param isn't pointer/i64-shaped, or the arg
+# isn't statically resolvable as Span$u8/StrView — caller falls through to
+# its existing branch).  Both Span$u8 and StrView are `{ ptr, i64 }` so the
+# extract pattern is identical.
+fn try_emit_span_to_i64_arg(s: *EmitterState, arg_e: *Expr, param_type: i32, src_reg: i32) -> i32
+    # Param must lower to `i64` in the call signature.  TYPE_PTR / TYPE_PTR_PTR
+    # / TYPE_REF emit i64 (see emit_llvm_type); TYPE_I64 / TYPE_U64 are i64
+    # directly.  TYPE_MUT_REF emits `ptr` so it has its own inttoptr branch
+    # in the cascade — skip here to avoid double-handling.
+    if param_type != TYPE_PTR and param_type != TYPE_PTR_PTR and param_type != TYPE_REF and param_type != TYPE_I64 and param_type != TYPE_U64
+        return -1
+    if arg_e == null
+        return -1
+    var src_name: *u8 = null
+    var src_name_len: i32 = 0
+    resolve_expr_struct_name(s, arg_e, @src_name, @src_name_len)
+    if src_name == null
+        return -1
+    if src_name_len == 0
+        return -1
+    let is_span_u8: i32 = name_eq(src_name, src_name_len, c"Span$u8", 7)
+    let is_strview: i32 = name_eq(src_name, src_name_len, c"StrView", 7)
+    if is_span_u8 == 0 and is_strview == 0
+        return -1
+    let p: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, p)
+    emit_str(s, c" = extractvalue %")
+    emit_name(s, src_name, src_name_len)
+    emit_str(s, c" ")
+    emit_reg(s, src_reg)
+    emit_str(s, c", 0\n")
+    let pi: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, pi)
+    emit_str(s, c" = ptrtoint ptr ")
+    emit_reg(s, p)
+    emit_str(s, c" to i64\n")
+    pi
 
 # =============================================================================
 # Native-pointer load/store helpers (task #73 migration)

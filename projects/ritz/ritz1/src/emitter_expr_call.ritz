@@ -1435,8 +1435,22 @@ fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
     for j in 0..arg_count
         if param_ptr != null
             param_types[j] = param_ptr.param_type
+            # AGAST #176: Span$u8 / StrView -> i64 coercion for legacy *u8
+            # (TYPE_PTR / TYPE_REF / TYPE_I64) params.  Bare "..." lowers to
+            # %Span$u8 (#98); without this coercion `eprints_cstr("...")`
+            # emits `call void @eprints_cstr(i64 %.span)` and the IR verifier
+            # rejects the aggregate-into-i64 mismatch.  helper returns the
+            # coerced i64 reg or -1 (fall through to the regular cascade).
+            var s176_arg_iter: *Expr = e.args
+            var s176_ai: i32 = 0
+            while s176_ai < j and s176_arg_iter != null
+                s176_arg_iter = s176_arg_iter.next
+                s176_ai = s176_ai + 1
+            let s176_reg: i32 = try_emit_span_to_i64_arg(s, s176_arg_iter, param_ptr.param_type, arg_regs[j])
+            if s176_reg >= 0
+                converted_regs[j] = s176_reg
             # Truncate i64 values to smaller types if needed
-            if param_ptr.param_type == TYPE_U8 or param_ptr.param_type == TYPE_I8
+            else if param_ptr.param_type == TYPE_U8 or param_ptr.param_type == TYPE_I8
                 let trunc: i32 = next_reg(s)
                 emit_str(s, c"  ")
                 emit_reg(s, trunc)
@@ -1934,22 +1948,31 @@ fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
             while k < j and arg_expr != null
                 arg_expr = arg_expr.next
                 k = k + 1
-            var need_convert: i32 = 0
-            if arg_expr != null
-                let arg_type: i32 = get_expr_type(s, arg_expr)
-                if arg_type == TYPE_MUT_REF
-                    # Value is ptr, need to convert to i64
-                    need_convert = 1
-            if need_convert == 1
-                let pti: i32 = next_reg(s)
-                emit_str(s, c"  ")
-                emit_reg(s, pti)
-                emit_str(s, c" = ptrtoint ptr ")
-                emit_reg(s, arg_regs[j])
-                emit_str(s, c" to i64\n")
-                converted_regs[j] = pti
+            # AGAST #176: Span$u8 / StrView -> i64 coercion (extern path).
+            # When fn_def is missing we assume `i64` per arg; a %Span$u8
+            # aggregate would otherwise flow through unchanged and fail IR
+            # verification at the callsite.  The helper handles the resolve
+            # + extractvalue + ptrtoint and returns -1 on no-match.
+            let s176_ext_reg: i32 = try_emit_span_to_i64_arg(s, arg_expr, TYPE_I64, arg_regs[j])
+            if s176_ext_reg >= 0
+                converted_regs[j] = s176_ext_reg
             else
-                converted_regs[j] = arg_regs[j]
+                var need_convert: i32 = 0
+                if arg_expr != null
+                    let arg_type: i32 = get_expr_type(s, arg_expr)
+                    if arg_type == TYPE_MUT_REF
+                        # Value is ptr, need to convert to i64
+                        need_convert = 1
+                if need_convert == 1
+                    let pti: i32 = next_reg(s)
+                    emit_str(s, c"  ")
+                    emit_reg(s, pti)
+                    emit_str(s, c" = ptrtoint ptr ")
+                    emit_reg(s, arg_regs[j])
+                    emit_str(s, c" to i64\n")
+                    converted_regs[j] = pti
+                else
+                    converted_regs[j] = arg_regs[j]
 
     # Now emit the call with converted registers
     var call_result: i32 = 0
