@@ -1588,7 +1588,30 @@ fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
                     ref_arg = ref_arg.next
                     rk = rk + 1
                 var ref_done: i32 = 0
+                # AGAST #187 — narrow TYPE_MUT_REF → TYPE_REF coercion.
+                # Caller has `@&T` (lowered as `ptr`); callee expects `@T`
+                # (lowered as `i64`).  arg_regs[j] is a freshly-loaded `ptr`
+                # from the caller's MUT_REF slot; insert a `ptrtoint` so the
+                # call-site i64 signature matches.  Repro: tome.ritz:3327
+                # `pubsub_unsubscribe(ps: @&PubSub)` calling
+                # `pubsub_find_channel(ps: @PubSub, …)`.
+                #
+                # Narrow scoping: only when the actual arg is an EXPR_IDENT
+                # whose local has var_type == TYPE_MUT_REF.  An earlier
+                # broader attempt (#184 reverted) regressed
+                # test_issue_strview_as_bytes by hitting StrView struct args.
                 if ref_arg != null and ref_arg.kind == EXPR_IDENT
+                    let mr_loc: *LocalVar = find_local_struct_name(s, ref_arg.ident_ptr, ref_arg.ident_len)
+                    if mr_loc != null and mr_loc.var_type == TYPE_MUT_REF
+                        let pti_mr: i32 = next_reg(s)
+                        emit_str(s, c"  ")
+                        emit_reg(s, pti_mr)
+                        emit_str(s, c" = ptrtoint ptr ")
+                        emit_reg(s, arg_regs[j])
+                        emit_str(s, c" to i64  ; #187 @&T->@T\n")
+                        converted_regs[j] = pti_mr
+                        ref_done = 1
+                if ref_done == 0 and ref_arg != null and ref_arg.kind == EXPR_IDENT
                     let ref_loc: *LocalVar = find_local_struct_name(s, ref_arg.ident_ptr, ref_arg.ident_len)
                     if ref_loc != null and ref_loc.var_type == TYPE_STRUCT
                         let pti_r: i32 = next_reg(s)

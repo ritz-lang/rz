@@ -28,6 +28,7 @@ TESTS = [
     "test_issue_chained_deref_fwd_field",
     "test_issue_array_value_to_span",
     "test_issue_binop_as_cast",
+    "test_issue_call_mut_ref_to_ref_coerce",
     "test_issue_const_struct_array",
     "test_issue_const_strview_array",
     "test_issue_float_coercion",
