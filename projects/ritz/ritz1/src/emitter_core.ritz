@@ -697,6 +697,153 @@ fn emit_llvm_type_struct(s: *EmitterState, t: i32, name: *u8, name_len: i32)
         emit_llvm_type(s, t)
 
 # =============================================================================
+# AGAST #168: layout-equivalence coercion for Span$u8 ↔ StrView.
+#
+# Both have identical LLVM layout `{ ptr, i64 }` but are nominally distinct
+# named struct types — LLVM IR rejects `store %A, ptr <%B-typed slot>`.
+# A bare string literal `"..."` lowers to `%Span$u8`, but `let x: StrView = "..."`
+# allocates a `%StrView` slot.  We emit a decompose-and-rebuild
+# (extractvalue + insertvalue) on each store/assign/return whose source name
+# disagrees with the destination name.
+# =============================================================================
+
+# Returns 1 if (src_name, dst_name) is the StrView↔Span$u8 layout-equivalent
+# pair (in either direction), else 0.  Names of zero length / null pointers
+# return 0.
+fn is_layout_equiv_pair(src_name: *u8, src_len: i32, dst_name: *u8, dst_len: i32) -> i32
+    if src_name == null
+        return 0
+    if dst_name == null
+        return 0
+    if src_len == 0
+        return 0
+    if dst_len == 0
+        return 0
+    let src_is_span_u8: i32 = name_eq(src_name, src_len, c"Span$u8", 7)
+    let src_is_strview: i32 = name_eq(src_name, src_len, c"StrView", 7)
+    let dst_is_span_u8: i32 = name_eq(dst_name, dst_len, c"Span$u8", 7)
+    let dst_is_strview: i32 = name_eq(dst_name, dst_len, c"StrView", 7)
+    if src_is_span_u8 == 1 and dst_is_strview == 1
+        return 1
+    if src_is_strview == 1 and dst_is_span_u8 == 1
+        return 1
+    0
+
+# Decompose `%src_name { ptr, i64 }` and rebuild as `%dst_name { ptr, i64 }`.
+# Caller must verify is_layout_equiv_pair == 1 before invoking.  Returns
+# the register holding the rebuilt aggregate.
+fn rebuild_layout_equiv(s: *EmitterState, src_reg: i32, src_name: *u8, src_len: i32, dst_name: *u8, dst_len: i32) -> i32
+    let p: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, p)
+    emit_str(s, c" = extractvalue %")
+    emit_name(s, src_name, src_len)
+    emit_str(s, c" ")
+    emit_reg(s, src_reg)
+    emit_str(s, c", 0\n")
+    let l: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, l)
+    emit_str(s, c" = extractvalue %")
+    emit_name(s, src_name, src_len)
+    emit_str(s, c" ")
+    emit_reg(s, src_reg)
+    emit_str(s, c", 1\n")
+    let r1: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, r1)
+    emit_str(s, c" = insertvalue %")
+    emit_name(s, dst_name, dst_len)
+    emit_str(s, c" undef, ptr ")
+    emit_reg(s, p)
+    emit_str(s, c", 0\n")
+    let r2: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, r2)
+    emit_str(s, c" = insertvalue %")
+    emit_name(s, dst_name, dst_len)
+    emit_str(s, c" ")
+    emit_reg(s, r1)
+    emit_str(s, c", i64 ")
+    emit_reg(s, l)
+    emit_str(s, c", 1\n")
+    r2
+
+# Best-effort resolve the LLVM struct type-name produced by an expression.
+# Writes the name pointer and length into the out-pointers, or null/0 if
+# the producer's struct type isn't statically known.  Used to detect
+# Span$u8 ↔ StrView layout-equivalence pairs at store/assign sites.
+fn resolve_expr_struct_name(s: *EmitterState, e: *Expr, out_name: **u8, out_len: *i32)
+    *out_name = null
+    *out_len = 0
+    if e == null
+        return
+    # Bare "..." literal lowers to %Span$u8 (AGAST #98).
+    if e.kind == EXPR_STRING_LIT
+        *out_name = c"Span$u8"
+        *out_len = 7
+        return
+    # Builtin StrView.as_bytes() -> %Span$u8.
+    if e.kind == EXPR_METHOD
+        if name_eq(e.ident_ptr, e.ident_len, c"as_bytes", 8) == 1
+            *out_name = c"Span$u8"
+            *out_len = 7
+            return
+        # Impl-method call: walk receiver's struct type then impl table.
+        var recv_tn: *u8 = null
+        var recv_tn_len: i32 = 0
+        let rcv: *Expr = e.left
+        if rcv != null and rcv.kind == EXPR_IDENT
+            let loc: *LocalVar = find_local_struct_name(s, rcv.ident_ptr, rcv.ident_len)
+            if loc != null and loc.type_name_len > 0
+                recv_tn = loc.type_name
+                recv_tn_len = loc.type_name_len
+        if recv_tn != null and recv_tn_len > 0
+            var ib: *ImplBlock = s.module.impls
+            while ib != null
+                if name_eq(ib.type_name, ib.type_name_len, recv_tn, recv_tn_len) == 1
+                    var m: *FnDef = ib.methods
+                    while m != null
+                        if name_eq(m.name, m.name_len, e.ident_ptr, e.ident_len) == 1
+                            if m.return_type == TYPE_STRUCT and m.return_type_name_len > 0
+                                *out_name = m.return_type_name
+                                *out_len = m.return_type_name_len
+                            return
+                        m = m.next
+                    return
+                ib = ib.next
+        return
+    # Local binding to a known struct type.
+    if e.kind == EXPR_IDENT
+        let loc: *LocalVar = find_local_struct_name(s, e.ident_ptr, e.ident_len)
+        if loc != null and loc.type_name_len > 0
+            *out_name = loc.type_name
+            *out_len = loc.type_name_len
+        return
+    # Function-call return-type lookup.
+    if e.kind == EXPR_CALL
+        var fname: [256]u8
+        var flen: i32 = 0
+        for i in 0..e.func_name_len
+            fname[flen] = *(e.func_name + i)
+            flen += 1
+        if e.call_type_suffix_len > 0
+            for i in 0..e.call_type_suffix_len
+                fname[flen] = *(e.call_type_suffix + i)
+                flen += 1
+        let fdr: *FnDef = find_fn(s, @fname[0], flen)
+        if fdr != null and fdr.return_type == TYPE_STRUCT and fdr.return_type_name_len > 0
+            *out_name = fdr.return_type_name
+            *out_len = fdr.return_type_name_len
+        return
+    # Struct literal carries its own type name.
+    if e.kind == EXPR_STRUCT_LIT
+        if e.ident_ptr != null and e.ident_len > 0
+            *out_name = e.ident_ptr as *u8
+            *out_len = e.ident_len
+        return
+
+# =============================================================================
 # Native-pointer load/store helpers (task #73 migration)
 #
 # These replace the old pattern:

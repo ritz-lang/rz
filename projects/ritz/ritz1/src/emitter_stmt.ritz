@@ -522,10 +522,22 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
             # Store struct directly. emit_llvm_type_struct routes tagged-enum
             # Result$/Option$ to i64 so the store type matches the i64 value
             # produced by variant constructors (task-99 cluster #3).
+            #
+            # AGAST #168: Span$u8 ↔ StrView layout-equivalence coercion.
+            # When the init expression's nominal struct type differs from the
+            # slot's declared type but they share `{ ptr, i64 }` layout (e.g.
+            # `let x: StrView = "..."` where bare strings lower to %Span$u8),
+            # decompose-rebuild the aggregate so the store types agree.
+            var stored_reg: i32 = init_reg
+            var src_name: *u8 = null
+            var src_len: i32 = 0
+            resolve_expr_struct_name(s, stmt.var_init, @src_name, @src_len)
+            if is_layout_equiv_pair(src_name, src_len, stmt.var_type_name, stmt.var_type_name_len) == 1
+                stored_reg = rebuild_layout_equiv(s, init_reg, src_name, src_len, stmt.var_type_name, stmt.var_type_name_len)
             emit_str(s, c"  store ")
             emit_llvm_type_struct(s, TYPE_STRUCT, stmt.var_type_name, stmt.var_type_name_len)
             emit_str(s, c" ")
-            emit_reg(s, init_reg)
+            emit_reg(s, stored_reg)
             emit_str(s, c", ptr ")
             emit_reg(s, alloca_reg)
             emit_str(s, c"\n")
@@ -865,10 +877,19 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
             let val: i32 = emit_expr(s, stmt.assign_value)
             let local: *LocalVar = find_local_struct_name(s, stmt.assign_target, stmt.assign_target_len)
             if local != null
+                # AGAST #168: Span$u8 ↔ StrView layout coercion at assign sites
+                # (e.g. `path = "..."` where path: StrView).  See emit_var_decl
+                # for the same pattern.
+                var stored_reg: i32 = val
+                var src_name: *u8 = null
+                var src_len: i32 = 0
+                resolve_expr_struct_name(s, stmt.assign_value, @src_name, @src_len)
+                if is_layout_equiv_pair(src_name, src_len, local.type_name, local.type_name_len) == 1
+                    stored_reg = rebuild_layout_equiv(s, val, src_name, src_len, local.type_name, local.type_name_len)
                 emit_str(s, c"  store %")
                 emit_name(s, local.type_name, local.type_name_len)
                 emit_str(s, c" ")
-                emit_reg(s, val)
+                emit_reg(s, stored_reg)
                 emit_str(s, c", ptr ")
                 emit_reg(s, loc)
                 emit_str(s, c"\n")
@@ -1037,10 +1058,18 @@ fn emit_return(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                 return
             # For other expressions, emit normally and return
             let val: i32 = emit_expr(s, stmt.return_value)
+            # AGAST #168: Span$u8 ↔ StrView layout coercion at return sites
+            # (e.g. `return "..."` from a `-> StrView` fn).
+            var ret_reg: i32 = val
+            var src_name: *u8 = null
+            var src_len: i32 = 0
+            resolve_expr_struct_name(s, stmt.return_value, @src_name, @src_len)
+            if is_layout_equiv_pair(src_name, src_len, s.ret_type_name, s.ret_type_name_len) == 1
+                ret_reg = rebuild_layout_equiv(s, val, src_name, src_len, s.ret_type_name, s.ret_type_name_len)
             emit_str(s, c"  ret ")
             emit_llvm_type_struct(s, TYPE_STRUCT, s.ret_type_name, s.ret_type_name_len)
             emit_str(s, c" ")
-            emit_reg(s, val)
+            emit_reg(s, ret_reg)
             emit_str(s, c"\n")
             return
 
