@@ -858,23 +858,26 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
                 if pkg_dir:
                     compile_cmd.extend(["--project-root", str(pkg_dir)])
 
-            # ritz1 needs RITZ_PATH to resolve qualified `ritzlib.*` imports.
-            # ROOT (projects/ritz) is the canonical entry that lets ritz1 find
-            # ritzlib/* and self-host modules.  Preserve any caller-provided
-            # RITZ_PATH (e.g. `./rz` constructs a colon-separated list of
-            # workspace dependency roots so ritz1 can also resolve cross-
-            # project imports like `zeus.shm` or `mausoleum.client`).  ritz1
-            # supports colon-separated RITZ_PATH the same way ritz0 does.
+            # ritz1 needs RITZ_PATH to resolve qualified `ritzlib.*` imports
+            # AND cross-project imports (`zeus.shm`, `mausoleum.client`).
+            # ROOT (projects/ritz) lets ritz1 find ritzlib/* and self-host
+            # modules; ROOT.parent (projects/) lets the subdir-probe resolver
+            # find cross-project imports like `zeus.shm` → `projects/zeus/lib/shm.ritz`.
+            # Preserve any caller-provided RITZ_PATH (e.g. `./rz` may pre-build
+            # a list of workspace roots).  Colon-separated, gcc-style.
             env = os.environ.copy()
             if compiler == "ritz1":
                 caller_path = env.get("RITZ_PATH", "")
-                root_str = str(ROOT)
-                # Put ROOT first so ritzlib resolution is fastest, but keep
-                # any other entries the caller already provided.
-                if caller_path and root_str not in caller_path.split(os.pathsep):
-                    env["RITZ_PATH"] = root_str + os.pathsep + caller_path
-                else:
-                    env["RITZ_PATH"] = caller_path or root_str
+                root_str = str(ROOT)             # projects/ritz
+                workspace_str = str(ROOT.parent) # projects
+                # Put ROOT first (ritzlib priority), workspace root second
+                # (cross-project imports), then any caller-provided entries.
+                caller_entries = [e for e in caller_path.split(os.pathsep) if e]
+                entries = [root_str, workspace_str]
+                for e in caller_entries:
+                    if e not in entries:
+                        entries.append(e)
+                env["RITZ_PATH"] = os.pathsep.join(entries)
             result = subprocess.run(compile_cmd, capture_output=True, text=True, env=env)
             if result.returncode != 0:
                 print(f"  ✗ {compiler} failed for {src.name}: {result.stderr}", file=sys.stderr)
