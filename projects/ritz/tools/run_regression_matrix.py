@@ -34,6 +34,7 @@ TESTS = [
     "test_issue_for_iterables",
     "test_issue_for_range_wrapped",
     "test_issue_generic_call_resolution",
+    "test_issue_global_struct_assign",
     "test_issue_match_custom_87",
     "test_issue_match_option_u32",
     "test_issue_match_pass_arm",

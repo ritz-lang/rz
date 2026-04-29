@@ -1198,6 +1198,21 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
         # Check for global variable
         let glob: *GlobalVarDef = find_global(s, stmt.assign_target, stmt.assign_target_len)
         if glob != null
+            # AGAST #181: struct-typed globals (`var g: Store`) need
+            # `store %Store %val, ptr @g` not `store i64 %val` — the SSA
+            # value here is a `%Store` aggregate, not an i64.  Route through
+            # emit_llvm_type_struct so primitive-aliased struct names
+            # (`u16`, `f32`, etc.) and SIMD vector types lower correctly.
+            if glob.var_type == TYPE_STRUCT
+                let val: i32 = emit_expr(s, stmt.assign_value)
+                emit_str(s, c"  store ")
+                emit_llvm_type_struct(s, TYPE_STRUCT, glob.type_name, glob.type_name_len)
+                emit_str(s, c" ")
+                emit_reg(s, val)
+                emit_str(s, c", ptr @")
+                emit_name(s, glob.name, glob.name_len)
+                emit_str(s, c"\n")
+                return
             let val: i32 = emit_expr(s, stmt.assign_value)
             if glob.var_type == TYPE_I32 or glob.var_type == TYPE_U32
                 let trunc: i32 = next_reg(s)
@@ -1207,6 +1222,32 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
                 emit_reg(s, val)
                 emit_str(s, c" to i32\n")
                 emit_str(s, c"  store i32 ")
+                emit_reg(s, trunc)
+                emit_str(s, c", ptr @")
+                emit_name(s, glob.name, glob.name_len)
+                emit_str(s, c"\n")
+            else if glob.var_type == TYPE_I16 or glob.var_type == TYPE_U16
+                # i16 store via global — trunc i64 → i16 (unified value model).
+                let trunc: i32 = next_reg(s)
+                emit_str(s, c"  ")
+                emit_reg(s, trunc)
+                emit_str(s, c" = trunc i64 ")
+                emit_reg(s, val)
+                emit_str(s, c" to i16\n")
+                emit_str(s, c"  store i16 ")
+                emit_reg(s, trunc)
+                emit_str(s, c", ptr @")
+                emit_name(s, glob.name, glob.name_len)
+                emit_str(s, c"\n")
+            else if glob.var_type == TYPE_I8 or glob.var_type == TYPE_U8
+                # i8 store via global — trunc i64 → i8.
+                let trunc: i32 = next_reg(s)
+                emit_str(s, c"  ")
+                emit_reg(s, trunc)
+                emit_str(s, c" = trunc i64 ")
+                emit_reg(s, val)
+                emit_str(s, c" to i8\n")
+                emit_str(s, c"  store i8 ")
                 emit_reg(s, trunc)
                 emit_str(s, c", ptr @")
                 emit_name(s, glob.name, glob.name_len)
