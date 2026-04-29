@@ -213,6 +213,24 @@ fn path_dir(path: *u8) -> StrView
         sv.len = 0
     sv
 
+# Return the parent directory view of `dir` (which is expected to end in '/').
+# E.g. parent_dir_view("/a/b/c/") -> "/a/b/" with len pointing at trailing slash.
+# Returns an empty StrView when there is no parent component.
+fn parent_dir_view(dir: StrView) -> StrView
+    var out: StrView
+    out.ptr = dir.ptr
+    out.len = 0
+    if dir.len <= 1
+        return out
+    # Skip the trailing '/'.
+    var i: i64 = dir.len - 2
+    while i >= 0
+        if *(dir.ptr + i) == '/'
+            out.len = i + 1
+            return out
+        i -= 1
+    out
+
 # Build "dir/seg1/seg2/....ritz" from a dir view and import segment list.
 # Caller owns the returned String.
 fn build_import_path(dir: StrView, imp: *ImportPath) -> String
@@ -222,6 +240,37 @@ fn build_import_path(dir: StrView, imp: *ImportPath) -> String
         if string_char_at(@out, string_len(@out) - 1) != '/'
             string_push(@out, '/')
     var seg: *ImportPath = imp
+    while seg != null
+        string_push_bytes(@out, seg.segment, seg.segment_len as i64)
+        if seg.next != null
+            string_push(@out, '/')
+        seg = seg.next
+    string_push_strview(@out, ".ritz")
+    out
+
+# Build "dir/<pkg>/<sub>/<rest...>.ritz" — inserts `sub` after the first
+# import segment (the package name). Used to honor `sources = ["lib", "src"]`
+# in workspace ritz.toml files: ritz0 reads ritz.toml at resolve time; ritz1
+# probes the two values that every workspace project actually uses (lib, src).
+# Returns an empty String when there is no remaining segment after the pkg
+# name (e.g. bare `import pkg`) — the subdir probe would be meaningless.
+fn build_import_path_with_sub(dir: StrView, imp: *ImportPath, sub: *u8) -> String
+    if imp == null
+        return string_new()
+    if imp.next == null
+        return string_new()
+    var out: String = string_from_strview(@dir)
+    if string_len(@out) > 0
+        if string_char_at(@out, string_len(@out) - 1) != '/'
+            string_push(@out, '/')
+    # First segment: the package name.
+    string_push_bytes(@out, imp.segment, imp.segment_len as i64)
+    string_push(@out, '/')
+    # The subdir (e.g. "lib" or "src").
+    string_push_str(@out, sub)
+    string_push(@out, '/')
+    # Remaining segments.
+    var seg: *ImportPath = imp.next
     while seg != null
         string_push_bytes(@out, seg.segment, seg.segment_len as i64)
         if seg.next != null
@@ -256,13 +305,44 @@ fn try_open_import(imp: *ImportPath, source_dir: StrView, ritz_path: StrView, fo
     let is_ritzlib: i32 = import_is_ritzlib(imp)
 
     # First try relative to source file (unless this is a ritzlib import).
+    # We walk up the source_dir ancestry, probing `<ancestor>/<imp>.ritz` at
+    # each level. This mirrors ritz0's ImportResolver._try_resolve_path which
+    # resolves intra-project imports like `lib.m7m_types` (mausoleum) or
+    # `src.store` (nexus) by climbing to the project root, where ritz.toml's
+    # source_roots like ["src", "lib", "test"] live as actual directories.
+    # Cap the climb at 8 levels — workspace projects never go deeper.
     if is_ritzlib == 0
-        var candidate: String = build_import_path(source_dir, imp)
-        let fd: i32 = sys_open(string_as_ptr(@candidate), O_RDONLY)
-        if fd >= 0
-            sys_close(fd)
-            return candidate
-        string_drop(@candidate)
+        var sd_ptr: *u8 = source_dir.ptr
+        var sd_len: i64 = source_dir.len
+        var levels: i32 = 0
+        while levels < 8
+            if sd_len <= 0
+                levels = 8
+            else
+                var dir_view: StrView
+                dir_view.ptr = sd_ptr
+                dir_view.len = sd_len
+                var candidate: String = build_import_path(dir_view, imp)
+                let fd: i32 = sys_open(string_as_ptr(@candidate), O_RDONLY)
+                if fd >= 0
+                    sys_close(fd)
+                    return candidate
+                string_drop(@candidate)
+
+                # Climb to parent directory.
+                var parent_view: StrView
+                parent_view.ptr = sd_ptr
+                parent_view.len = sd_len
+                let parent: StrView = parent_dir_view(parent_view)
+                if parent.len == 0
+                    levels = 8
+                else
+                    if parent.len == sd_len
+                        # Defensive: parent didn't shrink — bail out.
+                        levels = 8
+                    else
+                        sd_len = parent.len
+                        levels += 1
 
     # Then try each colon-separated entry in RITZ_PATH.
     if ritz_path.len > 0
@@ -273,13 +353,54 @@ fn try_open_import(imp: *ImportPath, source_dir: StrView, ritz_path: StrView, fo
             let had_delim: i32 = strview_split_once(@remaining, ':', @seg, @rest)
 
             if seg.len > 0
-                var candidate: String = build_import_path(seg, imp)
+                # Snapshot fields — StrView is moved on by-value pass, so we
+                # rebuild a fresh view for each of the three probes below.
+                let seg_ptr: *u8 = seg.ptr
+                let seg_len: i64 = seg.len
+
+                # Direct probe: <entry>/<pkg>/<rest>.ritz
+                # Required for ritzlib (laid out flat under <entry>/ritzlib/).
+                var seg_direct: StrView
+                seg_direct.ptr = seg_ptr
+                seg_direct.len = seg_len
+                var candidate: String = build_import_path(seg_direct, imp)
                 let fd: i32 = sys_open(string_as_ptr(@candidate), O_RDONLY)
                 if fd >= 0
                     sys_close(fd)
                     *found_via_ritz_path = 1
                     return candidate
                 string_drop(@candidate)
+
+                # Workspace probes: <entry>/<pkg>/lib/<rest>.ritz and
+                # <entry>/<pkg>/src/<rest>.ritz. Mirrors ritz0's
+                # _auto_detect_dependencies_from_ritz_path: every workspace
+                # project (valet, zeus, nexus, mausoleum, tome, ...) puts its
+                # public API under one of `sources = [...]` in ritz.toml. We
+                # probe lib then src — those are the only two values used by
+                # the app stack, and ritz1 gets to skip the TOML parser.
+                var seg_lib: StrView
+                seg_lib.ptr = seg_ptr
+                seg_lib.len = seg_len
+                var c_lib: String = build_import_path_with_sub(seg_lib, imp, c"lib")
+                if string_len(@c_lib) > 0
+                    let fd_lib: i32 = sys_open(string_as_ptr(@c_lib), O_RDONLY)
+                    if fd_lib >= 0
+                        sys_close(fd_lib)
+                        *found_via_ritz_path = 1
+                        return c_lib
+                string_drop(@c_lib)
+
+                var seg_src: StrView
+                seg_src.ptr = seg_ptr
+                seg_src.len = seg_len
+                var c_src: String = build_import_path_with_sub(seg_src, imp, c"src")
+                if string_len(@c_src) > 0
+                    let fd_src: i32 = sys_open(string_as_ptr(@c_src), O_RDONLY)
+                    if fd_src >= 0
+                        sys_close(fd_src)
+                        *found_via_ritz_path = 1
+                        return c_src
+                string_drop(@c_src)
 
             if had_delim == 0
                 # No more delimiters; we already tried `seg` (the full
