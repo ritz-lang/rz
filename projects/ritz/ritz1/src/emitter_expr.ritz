@@ -401,6 +401,37 @@ fn emit_member_ptr(s: *EmitterState, e: *Expr, result: *MemberPtrResult)
                             emit_str(s, c"\n")
                             emit_member_gep_from_ptr(s, result, elem_ptr_ap, elem_st_ap, field_idx_ap, field_ap)
                             return
+            # AGAST #190: same shape but the base is a global array of struct
+            # (`var g_fallback: [100]FallbackPage; g_fallback[i].used`).
+            # Without this branch find_local_struct_name returned null and
+            # the path fell through to "; ERROR: unhandled EXPR_MEMBER" with
+            # a stale `%.0` flowing into the icmp downstream.  Sits at the
+            # same indent as `if arr_loc != null` so it doesn't tangle with
+            # the local branches above.
+            if arr_loc == null
+                let g_arr: *GlobalVarDef = find_global(s, e.left.left.ident_ptr, e.left.left.ident_len)
+                if g_arr != null
+                    if g_arr.var_type == TYPE_ARRAY and g_arr.array_elem_type == TYPE_STRUCT and g_arr.array_elem_type_name_len > 0
+                        let g_elem_st: *StructDef = find_struct(s, g_arr.array_elem_type_name, g_arr.array_elem_type_name_len)
+                        if g_elem_st != null
+                            let g_field_idx: i32 = find_field_index(g_elem_st, e.ident_ptr, e.ident_len)
+                            if g_field_idx >= 0
+                                let g_field: *StructField = get_field_type(g_elem_st, g_field_idx)
+                                let g_idx_reg: i32 = emit_expr(s, e.left.right)
+                                let g_elem_ptr: i32 = next_reg(s)
+                                emit_str(s, c"  ")
+                                emit_reg(s, g_elem_ptr)
+                                emit_str(s, c" = getelementptr [")
+                                emit_int(s, g_arr.array_size as i64)
+                                emit_str(s, c" x %")
+                                emit_name(s, g_elem_st.name, g_elem_st.name_len)
+                                emit_str(s, c"], ptr @")
+                                emit_name(s, g_arr.name, g_arr.name_len)
+                                emit_str(s, c", i64 0, i64 ")
+                                emit_reg(s, g_idx_reg)
+                                emit_str(s, c"\n")
+                                emit_member_gep_from_ptr(s, result, g_elem_ptr, g_elem_st, g_field_idx, g_field)
+                                return
 
 
 # =============================================================================

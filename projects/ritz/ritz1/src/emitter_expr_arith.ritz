@@ -593,6 +593,14 @@ fn emit_expr_unary(s: *EmitterState, e: *Expr) -> i32
                             emit_str(s, c"i8")
                         else if local.array_elem_type == TYPE_PTR or local.array_elem_type == TYPE_PTR_PTR
                             emit_str(s, c"ptr")
+                        else if local.array_elem_type == TYPE_STRUCT and local.type_name_len > 0
+                            # AGAST #190: `@arr[i]` over `var arr: [N]Struct`
+                            # — emit `[N x %T]` so the GEP stride matches the
+                            # struct-element layout.  Without this, the
+                            # downstream `ptrtoint` produces a pointer
+                            # computed against an `[N x i64]` stride that
+                            # disagrees with the alloca's `[N x %T]` layout.
+                            emit_llvm_type_struct(s, TYPE_STRUCT, local.type_name, local.type_name_len)
                         else
                             emit_str(s, c"i64")
                         emit_str(s, c"], ptr ")
@@ -647,15 +655,36 @@ fn emit_expr_unary(s: *EmitterState, e: *Expr) -> i32
                 # If `e.operand.left` is an ident but no matching local
                 # was found, try the global table.  Squeeze's inflate
                 # computes `@g_fixed_litlen_lengths[0]` and friends —
-                # the global is `[288]u8`.  GlobalVarDef doesn't track
-                # array element type, so we emit a byte-level GEP
-                # (`getelementptr i8, ptr @g, i64 <idx>`) which is
-                # correct for the u8/i8 element-type cases that surface
-                # in cryptosec / squeeze.  Non-u8 element globals would
-                # need extra type info on GlobalVarDef — out of scope
-                # for the valet build gate.
+                # the global is `[288]u8` so a byte-level GEP works.
+                # AGAST #190 extends this with a proper struct-array
+                # branch: nexus's `var g_fallback: [100]FallbackPage`
+                # needs `[100 x %FallbackPage]` GEP, not byte-level —
+                # otherwise `@g_fallback[idx]` returns a pointer that
+                # disagrees with the global's actual `[100 x %T]`
+                # layout and downstream member loads pull garbage.
                 let glob_arr: *GlobalVarDef = find_global(s, e.operand.left.ident_ptr, e.operand.left.ident_len)
                 if glob_arr != null
+                    if glob_arr.var_type == TYPE_ARRAY and glob_arr.array_elem_type == TYPE_STRUCT and glob_arr.array_elem_type_name_len > 0
+                        let gas_idx: i32 = emit_expr(s, e.operand.right)
+                        let gas_elem: i32 = next_reg(s)
+                        emit_str(s, c"  ")
+                        emit_reg(s, gas_elem)
+                        emit_str(s, c" = getelementptr [")
+                        emit_int(s, glob_arr.array_size as i64)
+                        emit_str(s, c" x ")
+                        emit_llvm_type_struct(s, TYPE_STRUCT, glob_arr.array_elem_type_name, glob_arr.array_elem_type_name_len)
+                        emit_str(s, c"], ptr @")
+                        emit_name(s, glob_arr.name, glob_arr.name_len)
+                        emit_str(s, c", i64 0, i64 ")
+                        emit_reg(s, gas_idx)
+                        emit_str(s, c"\n")
+                        let gas_result: i32 = next_reg(s)
+                        emit_str(s, c"  ")
+                        emit_reg(s, gas_result)
+                        emit_str(s, c" = ptrtoint ptr ")
+                        emit_reg(s, gas_elem)
+                        emit_str(s, c" to i64\n")
+                        return gas_result
                     let ga_idx: i32 = emit_expr(s, e.operand.right)
                     let ga_elem: i32 = next_reg(s)
                     emit_str(s, c"  ")

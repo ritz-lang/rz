@@ -1,0 +1,75 @@
+# Regression (ritz-task-190): `var arr: [N]Struct; arr[i] = ...; @arr[0]`
+# must use `[N x %Struct]` for both the element-assignment GEP/store and the
+# address-of GEP, not fall through to `[N x i64]` / `store i64`.
+#
+# Failure mode (nexus encode_page): for
+#
+#     fn encode_page(buf: *u8, slug: *u8, slug_len: i32,
+#                    content: *u8, content_len: i32) -> i32
+#         var fields: [2]DbField
+#         fields[0] = db_field(c"slug", 4, slug, slug_len)
+#         fields[1] = db_field(c"content", 7, content, content_len)
+#         let size: i64 = db_serialize_doc(buf, 8192, @fields[0], 2)
+#
+# ritz1 emitted the call return as `%DbField` (correct) but then
+# `getelementptr [2 x i64], ptr %fields` and `store i64 %dbf` against a
+# `%DbField`-typed slot, hitting clang's
+# `'%.16' defined with type '%DbField' but expected 'i64'`.  The same
+# `[2 x i64]` GEP also turned up in `@fields[0]` (address-of).
+#
+# Fix shape: STMT_INDEX_ASSIGN (`name[i] = expr`, where name is a local
+# `[N]Struct`) gets a TYPE_STRUCT branch on both the GEP element type and
+# the store, mirroring #188's STMT_LOCAL_FIELD_INDEX_ASSIGN.  EXPR_ADDR_OF
+# of EXPR_INDEX gets the same TYPE_STRUCT branch on its GEP.
+
+struct DbField
+    key: *u8
+    key_len: i32
+    value: *u8
+    value_len: i32
+
+# Function that returns a struct value — exercises the call-returning-struct
+# RHS (different from #188's deref-RHS).
+fn db_field(key: *u8, key_len: i32, value: *u8, value_len: i32) -> DbField
+    var f: DbField
+    f.key = key
+    f.key_len = key_len
+    f.value = value
+    f.value_len = value_len
+    return f
+
+# Read back a field — exercises the @arr[i] address-of path so we can
+# verify the GEP stride is right.
+fn read_keylen(p: *DbField) -> i32
+    return p.key_len
+
+[[test]]
+fn test_struct_local_array_assign() -> i32
+    var fields: [2]DbField
+    fields[0] = db_field(c"slug", 4, c"abc", 3)
+    fields[1] = db_field(c"content", 7, c"hello", 5)
+    if fields[0].key_len != 4
+        return 1
+    if fields[0].value_len != 3
+        return 2
+    if fields[1].key_len != 7
+        return 3
+    if fields[1].value_len != 5
+        return 4
+    return 0
+
+[[test]]
+fn test_struct_local_array_addrof() -> i32
+    var fields: [2]DbField
+    fields[0] = db_field(c"slug", 4, c"abc", 3)
+    fields[1] = db_field(c"content", 7, c"hello", 5)
+    # `@fields[0]` and `@fields[1]` exercise the EXPR_ADDR_OF / EXPR_INDEX
+    # GEP path — stride must be `%DbField` not `i64`, otherwise `@fields[1]`
+    # points 8 bytes into fields[0] instead of to fields[1].
+    let p0: *DbField = @fields[0]
+    let p1: *DbField = @fields[1]
+    if read_keylen(p0) != 4
+        return 1
+    if read_keylen(p1) != 7
+        return 2
+    return 0
