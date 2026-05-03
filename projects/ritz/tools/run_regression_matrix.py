@@ -62,6 +62,7 @@ TESTS = [
     "test_issue_struct_destructure",
     "test_issue_struct_local_array_assign",
     "test_issue_strview_as_bytes",
+    "test_issue_symbol_lookup_scaling",
     "test_issue_try_call",
     "test_issue_try_vec_payload_call",
     "test_issue_usize_suffix_fallback",

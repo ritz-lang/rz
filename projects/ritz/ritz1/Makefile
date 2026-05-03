@@ -42,7 +42,7 @@ SOURCES = \
 # ritzlib modules needed by ritz1
 # - json/option/result pulled in for fn_cache.ritz (.ritz.sig I/O)
 RITZLIB_DIR = ../ritzlib
-RITZLIB_MODULES = sys io str string strview hash memory gvec drop env option result json
+RITZLIB_MODULES = sys io str string strview hash hashmap eq memory gvec drop env option result json
 
 # Build artifacts
 BUILD_DIR = build
