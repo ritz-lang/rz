@@ -49,14 +49,19 @@ if str(RITZ0_DIR) not in sys.path:
     sys.path.insert(0, str(RITZ0_DIR))
 
 # Global build cache instance
-_build_cache = None
+_build_cache: dict[str, BuildCache] = {}
 
-def get_build_cache() -> BuildCache:
-    """Get or create the global build cache."""
-    global _build_cache
-    if _build_cache is None:
-        _build_cache = BuildCache(project_root=ROOT)
-    return _build_cache
+def get_build_cache(compiler: str = "ritz0") -> BuildCache:
+    """Get or create the per-compiler build cache.
+
+    The cache stores compiler-emitted IR/bitcode/object files; mixing
+    artifacts produced by ritz0 and ritz1 would silently return the wrong
+    file on a hit (different IR shape, different ABI assumptions), so each
+    compiler gets its own cache directory. See `BuildCache.cache_dir`.
+    """
+    if compiler not in _build_cache:
+        _build_cache[compiler] = BuildCache(project_root=ROOT, compiler=compiler)
+    return _build_cache[compiler]
 
 
 def detect_main_signature(source_path: Path) -> int:
@@ -715,15 +720,12 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
         profile = {"name": "debug", "opt_level": 0, "debug": True, "lto": False}
     bin_path = out_dir / name
 
-    # The build cache is keyed by source file hash only — it doesn't know which
-    # compiler produced the cached .ll/.bc. Using ritz1 with a cache warmed by
-    # ritz0 (or vice versa) would silently return the wrong artifact, so we
-    # disable the cache whenever compiler != "ritz0". This is Phase I; a future
-    # change could namespace the cache by compiler.
-    if compiler != "ritz0":
-        use_cache = False
-
-    cache = get_build_cache()
+    # AGAST #192: The build cache is now namespaced per-compiler (cache.py
+    # appends `-ritz1` to the cache dir for ritz1). That makes it safe to
+    # leave use_cache enabled for ritz1 — warm rebuilds reuse cached .ll/.bc
+    # artifacts produced by the same compiler, dropping no-op rebuild time
+    # by ~10× without risking cross-compiler contamination.
+    cache = get_build_cache(compiler)
 
     # Check for llvm-as (needed for .ll → .bc conversion)
     has_llvm_as = shutil_mod.which("llvm-as") is not None
@@ -761,6 +763,52 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
             if src not in all_sources:
                 all_sources.insert(-1, src)  # Insert before main
 
+    # AGAST #192: project-level fast path.  If the output binary exists
+    # and every transitive source is content-unchanged since the last
+    # build, the link is already up-to-date and we can skip emit/link
+    # entirely.  Mirrors what `make` does, but with a content-hash
+    # fallback so a bare `touch foo.ritz` (mtime bumped, content
+    # identical) doesn't trigger a 10× slower rebuild.
+    #
+    # Two-tier check per source:
+    #   1. mtime <= bin_mtime  → cheap, settles 99% of cases.
+    #   2. mtime is newer, but FNV1a(source) matches `<src>.ritz.sig`'s
+    #      `source_hash` (written by ritz1 on its previous run)  →
+    #      content unchanged, treat as fresh.
+    # `use_cache` gates the whole thing so debug runs always rebuild.
+    if use_cache and bin_path.exists():
+        try:
+            bin_mtime = bin_path.stat().st_mtime
+            stale = False
+            for src in all_sources:
+                if src.stat().st_mtime <= bin_mtime:
+                    continue
+                # Newer mtime — ask the .ritz.sig whether content actually changed.
+                sig_path = src.with_suffix('.ritz.sig')
+                if not sig_path.exists():
+                    stale = True
+                    break
+                try:
+                    content = src.read_bytes()
+                    # FNV1a-64 — must match `source_file_hash()` in
+                    # ritz1/src/fn_cache.ritz so cold/warm hashes line up.
+                    h = 14695981039346656037
+                    prime = 1099511628211
+                    mask = (1 << 64) - 1
+                    for b in content:
+                        h = ((h ^ b) * prime) & mask
+                    sig_data = json.loads(sig_path.read_text())
+                    if sig_data.get("source_hash") != f"{h:016x}":
+                        stale = True
+                        break
+                except (OSError, ValueError):
+                    stale = True
+                    break
+            if not stale:
+                return bin_path
+        except OSError:
+            pass
+
     # Use build/ directory for artifacts if keeping them, otherwise temp
     if keep_artifacts:
         artifact_dir = ROOT / "build"
@@ -794,8 +842,21 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
             src_name = f"{src.stem}_{path_hash}"
             ll_path = artifact_dir / f"{src_name}.ll"
             bc_path = artifact_dir / f"{src_name}.bc"
+            obj_path = artifact_dir / f"{src_name}.o"
 
-            # RFC #109 Phase 3: Check for cached .bc first (faster than .ll)
+            # AGAST #192: Fastest path — cached .o.  Skips ritz1 + clang -c
+            # entirely.  This is what makes the touched-source warm rebuild
+            # finish under 3s on zeus (otherwise the link step has to lower
+            # all 8 .ll files from text IR every time, ~3s of pure clang
+            # work even when their content is unchanged).
+            if use_cache:
+                cached_obj = cache.get_cached_obj(src)
+                if cached_obj:
+                    shutil_mod.copy2(cached_obj, obj_path)
+                    link_files.append(obj_path)
+                    continue
+
+            # RFC #109 Phase 3: Check for cached .bc next (faster than .ll)
             if use_cache and has_llvm_as:
                 cached_bc = cache.get_cached_bc(src)
                 if cached_bc:
@@ -811,7 +872,18 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
                     cached_ll = cache.get_cached_ll(src)
                     if cached_ll:
                         ll_path.write_text(cached_ll)
-                        # Convert to .bc if llvm-as available
+                        # Pre-compile cached IR to a native .o so the link
+                        # step doesn't have to re-lower it on every invocation.
+                        clang_obj = subprocess.run(
+                            ["clang", "-c", "-O2", "-fPIC",
+                             str(ll_path), "-o", str(obj_path)],
+                            capture_output=True, text=True,
+                        )
+                        if clang_obj.returncode == 0:
+                            cache.update_obj_cache(src, obj_path)
+                            link_files.append(obj_path)
+                            continue
+                        # Fall back to .bc / .ll on clang -c failure.
                         if has_llvm_as:
                             as_result = subprocess.run(
                                 ["llvm-as", str(ll_path), "-o", str(bc_path)],
@@ -888,7 +960,22 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
                 ll_content = ll_path.read_text()
                 cache.update_cache(src, ll_content)
 
-            # RFC #109 Phase 3: Convert .ll to .bc for faster linking
+            # AGAST #192: Pre-compile freshly emitted .ll to .o.  Without
+            # this, the link step pays for full IR lowering on every file
+            # (cached or not).  Caching the .o means subsequent rebuilds —
+            # even ones that re-invoke ritz1 — skip clang's slow path.
+            clang_obj = subprocess.run(
+                ["clang", "-c", "-O2", "-fPIC",
+                 str(ll_path), "-o", str(obj_path)],
+                capture_output=True, text=True,
+            )
+            if clang_obj.returncode == 0:
+                if use_cache:
+                    cache.update_obj_cache(src, obj_path)
+                link_files.append(obj_path)
+                continue
+
+            # Fall back to the legacy .bc / .ll → linker path if clang -c failed.
             if has_llvm_as:
                 as_result = subprocess.run(
                     ["llvm-as", str(ll_path), "-o", str(bc_path)],

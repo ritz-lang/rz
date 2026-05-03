@@ -234,14 +234,19 @@ def compute_compiler_hash(project_root: Path) -> str:
 class BuildCache:
     """Manages the build cache for incremental compilation."""
 
-    def __init__(self, project_root: Optional[Path] = None):
+    def __init__(self, project_root: Optional[Path] = None, compiler: str = "ritz0"):
         """Initialize the build cache.
 
         Args:
             project_root: Root directory of the project. If not provided,
                          will be auto-detected when needed.
+            compiler: Name of the compiler producing artifacts ("ritz0" or
+                     "ritz1"). The cache directory is namespaced by compiler
+                     so warm rebuilds across compilers don't pick up the
+                     wrong artifact (different IR, different ABI assumptions).
         """
         self.project_root = project_root
+        self.compiler = compiler
         self._state: Optional[CacheState] = None
         self._cache_dir: Optional[Path] = None
         self._compiler_hash: Optional[str] = None
@@ -249,12 +254,19 @@ class BuildCache:
 
     @property
     def cache_dir(self) -> Path:
-        """Get the cache directory path."""
+        """Get the cache directory path.
+
+        ritz0 uses ``.ritz-cache`` (legacy); ritz1 uses ``.ritz-cache-ritz1``
+        so its incremental .ll/.bc/.o store is partitioned from ritz0's. The
+        suffix is intentionally short — these directories live next to source
+        and end up in `.gitignore` patterns.
+        """
         if self._cache_dir is None:
-            if self.project_root:
-                self._cache_dir = self.project_root / CACHE_DIR_NAME
+            base = self.project_root if self.project_root else Path.cwd()
+            if self.compiler == "ritz0":
+                self._cache_dir = base / CACHE_DIR_NAME
             else:
-                self._cache_dir = Path.cwd() / CACHE_DIR_NAME
+                self._cache_dir = base / f"{CACHE_DIR_NAME}-{self.compiler}"
         return self._cache_dir
 
     @property
@@ -348,6 +360,18 @@ class BuildCache:
         """
         safe_name = self._get_safe_cache_name(source_path)
         return self.objects_dir / f"{safe_name}.bc"
+
+    def get_cached_obj_path(self, source_path: Path) -> Path:
+        """Path of the cached native ``.o`` produced by ``clang -c``.
+
+        AGAST #192: Caching .o (rather than re-running ``clang -c`` each
+        warm rebuild) is what makes the touched-source case meet the <3s
+        gate.  Without this, even though ritz1 itself short-circuits via
+        fn_cache.ritz, clang would still re-lower every cached .ll on each
+        invocation — ~3s for an 8-source project like zeus.
+        """
+        safe_name = self._get_safe_cache_name(source_path)
+        return self.objects_dir / f"{safe_name}.o"
 
     def scan_file(self, source_path: Path) -> FileInfo:
         """Scan a source file and return its FileInfo."""
@@ -537,6 +561,25 @@ class BuildCache:
         cached_bc = self.get_cached_bc_path(source_path)
         import shutil
         shutil.copy2(bc_path, cached_bc)
+
+    def get_cached_obj(self, source_path: Path) -> Optional[Path]:
+        """Path of a valid cached .o, or None if a rebuild is needed."""
+        source_path = source_path.resolve()
+        needs_rebuild, _ = self.needs_rebuild(source_path)
+        if needs_rebuild:
+            return None
+        cached_obj = self.get_cached_obj_path(source_path)
+        if cached_obj.exists():
+            return cached_obj
+        return None
+
+    def update_obj_cache(self, source_path: Path, obj_path: Path):
+        """Copy a freshly produced .o into the cache."""
+        source_path = source_path.resolve()
+        self.objects_dir.mkdir(parents=True, exist_ok=True)
+        cached_obj = self.get_cached_obj_path(source_path)
+        import shutil
+        shutil.copy2(obj_path, cached_obj)
 
 
 # ============================================================================

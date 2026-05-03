@@ -1,0 +1,70 @@
+# AGAST #192: .ritz.sig file format roundtrip.
+#
+# Smoke-tests the on-disk shape used by both ritz0/emitter/fn_cache.py
+# and ritz1/src/fn_cache.ritz: write a literal `{source_hash, functions,
+# imports}` blob to a temp file, read it back, and verify byte-equality.
+# This is the basic invariant both implementations rely on — the JSON
+# escaping / I/O path must round-trip cleanly so a file written by either
+# tool is parseable by either tool.
+#
+# A regression here would manifest as ritz1 failing to read a sig that
+# ritz0 just wrote (or vice versa) — the file-level fast path silently
+# falls back to a cold rebuild, defeating the AGAST #192 speedup.
+
+import ritzlib.sys
+
+
+fn cstr_len(s: *u8) -> i64
+    var n: i64 = 0
+    while *(s + n) != 0
+        n = n + 1
+    n
+
+
+[[test]]
+fn test_fn_cache_sig_roundtrip() -> i32
+    # Sample sig contents matching the format documented in fn_cache.py.
+    # Hex hashes are arbitrary but exactly 16 chars (width matches both
+    # SHA-256-trunc in ritz0 and FNV1a-64 in ritz1).  Inlined as a cstring
+    # because ritz0 doesn't accept `const X: *u8 = c"…"`.
+    let fixture: *u8 = c"{\n  \"source_hash\": \"deadbeefcafef00d\",\n  \"functions\": {\n    \"add\": {\n      \"hash\": \"0123456789abcdef\",\n      \"sig_hash\": \"fedcba9876543210\",\n      \"ir\": \"define i32 @add(i32 %a, i32 %b) { ret i32 0 }\"\n    }\n  },\n  \"imports\": [\"ritzlib.sys\"]\n}\n"
+    let path: *u8 = c"/tmp/test_fn_cache_roundtrip.ritz.sig"
+    let n: i64 = cstr_len(fixture)
+
+    # Write fixture.  Flags: O_WRONLY | O_CREAT | O_TRUNC = 1 | 64 | 512 = 577,
+    # mode 0644 = 420.
+    let wfd: i32 = sys_open3(path, 577, 420)
+    if wfd < 0
+        return 1
+    let written: i64 = sys_write(wfd, fixture, n)
+    sys_close(wfd)
+    if written != n
+        return 2
+
+    # Read back.
+    let rfd: i32 = sys_open(path, 0)  # O_RDONLY
+    if rfd < 0
+        return 3
+    var buf: [4096]u8
+    var total: i64 = 0
+    var done: i32 = 0
+    while done == 0
+        let got: i64 = sys_read(rfd, @buf[total], 4096 - total)
+        if got <= 0
+            done = 1
+        else
+            total = total + got
+    sys_close(rfd)
+
+    if total != n
+        return 4
+
+    # Bytewise compare.
+    var i: i64 = 0
+    while i < n
+        if buf[i] != *(fixture + i)
+            return 5
+        i = i + 1
+
+    sys_unlink(path)
+    0

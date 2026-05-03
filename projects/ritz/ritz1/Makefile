@@ -36,11 +36,13 @@ SOURCES = \
 	emitter_match \
 	emitter_stmt \
 	emitter \
+	fn_cache \
 	main
 
 # ritzlib modules needed by ritz1
+# - json/option/result pulled in for fn_cache.ritz (.ritz.sig I/O)
 RITZLIB_DIR = ../ritzlib
-RITZLIB_MODULES = sys io str string strview hash memory gvec drop env
+RITZLIB_MODULES = sys io str string strview hash memory gvec drop env option result json
 
 # Build artifacts
 BUILD_DIR = build

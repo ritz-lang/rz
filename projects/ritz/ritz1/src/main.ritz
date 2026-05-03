@@ -34,6 +34,7 @@ import ast_helpers
 import parser_gen
 import monomorph
 import emitter
+import fn_cache
 
 # =============================================================================
 # Error Reporting Helpers
@@ -653,6 +654,17 @@ fn main(argc: i32, argv: **u8, envp: **u8) -> i32
     if src.len == 0
         return 1
 
+    # File-level fast path: if the existing output .ll is newer than the
+    # source AND <src>.ritz.sig records a matching source_hash, we can
+    # skip lex/parse/emit entirely.  This is the single biggest win for
+    # no-op rebuilds (full-stack 12m30s → ~30s).
+    if check_source_unchanged(args.input_path, src.data, src.len - 1, args.output_path) == 1
+        var skip_msg: String = string_from("Skipped (unchanged): ")
+        string_push_str(@skip_msg, args.input_path)
+        println_string(@skip_msg)
+        string_drop(@skip_msg)
+        return 0
+
     # Tokenize. Typical compiler input files produce under 20K tokens;
     # bigger files realloc organically.
     var tokens: Vec<Token> = vec_with_cap<Token>(24000)
@@ -688,5 +700,27 @@ fn main(argc: i32, argv: **u8, envp: **u8) -> i32
     # Write output
     if write_file(args.output_path, ir.data, ir.len as i64) < 0
         return 1
+
+    # Update <src>.ritz.sig with the current source hash and a snapshot
+    # of the emitted IR.  Next invocation's `check_source_unchanged` can
+    # then short-circuit emission entirely — even if the orchestrator
+    # wiped its artifact tempdir, the cached IR lives next to the source
+    # in the .sig file and gets spliced back into the requested output.
+    var sig_out: *SigData = sig_data_new()
+    if sig_out != null
+        sig_out.source_hash = source_file_hash(src.data, src.len - 1)
+        # Take a heap copy of ir.data — sig_data_free() owns the buffer.
+        let ir_len: i64 = ir.len as i64
+        if ir_len > 0
+            let ir_copy: *u8 = malloc(ir_len + 1)
+            if ir_copy != null
+                memcpy(ir_copy, ir.data, ir_len)
+                *(ir_copy + ir_len) = 0
+                sig_out.module_ir = ir_copy
+                sig_out.module_ir_len = ir_len
+        var sig_path: String = sig_path_from_src(args.input_path)
+        write_sig_file(string_as_ptr(@sig_path), sig_out)
+        string_drop(@sig_path)
+        sig_data_free(sig_out)
 
     0

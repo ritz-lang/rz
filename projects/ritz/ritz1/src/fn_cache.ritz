@@ -1,0 +1,761 @@
+# ritz1/src/fn_cache.ritz
+#
+# Per-function incremental compilation cache (port of ritz0/emitter/fn_cache.py).
+#
+# JADE-inspired token hashing: hash each function's token stream (ignoring
+# whitespace/indent tokens) to detect which functions actually changed.
+# Functions whose hash is unchanged can reuse cached LLVM IR.
+#
+# Two layers of caching:
+#
+#   1. **File-level fast path** — `check_source_unchanged()` is consulted by
+#      `main.ritz` before any work is done.  When the input source's hash
+#      equals the value stored in `<src>.ritz.sig` AND the output `.ll` exists
+#      with mtime >= source mtime, the entire compile is skipped and the
+#      cached `.ll` is reused as-is.  This alone wipes out ~95% of the cost
+#      on no-change rebuilds.
+#
+#   2. **Per-function cache** — during `emit_module()`, each function's
+#      body-token hash is computed and looked up in the cache loaded from
+#      `<src>.ritz.sig`.  On a hit the cached LLVM IR is spliced into the
+#      output verbatim and `emit_fn()` is skipped.  On a miss the function is
+#      emitted normally and the resulting IR captured for the next run.
+#
+# .ritz.sig file format (JSON, established by ritz0):
+#   {
+#     "source_hash": "<16 hex>",
+#     "functions": {
+#       "<fn_name>": {
+#         "hash":     "<token-stream hash>",
+#         "sig_hash": "<signature-only hash>",
+#         "ir":       "<cached LLVM IR including 'define ...' line>"
+#       }
+#     },
+#     "imports": ["<module>", ...]
+#   }
+#
+# We use FNV1a-64 (16 hex chars) where ritz0 uses SHA-256-truncated.
+# Both produce 16-hex-char output, so the file format is identical and
+# `.ritz.sig` files written by ritz0 still parse cleanly here — the hash
+# values just won't match, so ritz1 treats them as cold-start cache misses.
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+import ritzlib.string
+import ritzlib.strview
+import ritzlib.gvec
+import ritzlib.memory
+import ritzlib.hash
+import ritzlib.json
+
+import tokens_gen
+import ast
+
+
+# ============================================================================
+# Hashing primitives
+# ============================================================================
+
+# FNV1a-64 hash of `len` bytes at `data`.
+pub fn fnv1a_bytes(data: *u8, len: i64) -> u64
+    var h: u64 = fnv1a_init()
+    var i: i64 = 0
+    while i < len
+        h = fnv1a_byte(h, *(data + i))
+        i = i + 1
+    return h
+
+# Hash entire source file contents.  ritz0 truncates SHA-256 to 16 hex
+# chars; we mirror the on-disk shape with FNV1a-64 (also 16 hex chars).
+pub fn source_file_hash(src: *u8, len: i64) -> u64
+    return fnv1a_bytes(src, len)
+
+# Format a u64 as exactly 16 lowercase hex chars.  Caller provides a
+# >= 16-byte buffer; we do NOT null-terminate (caller may extend).
+pub fn u64_to_hex16(h: u64, out: *u8)
+    var v: u64 = h
+    var i: i32 = 15
+    while i >= 0
+        let nib: u64 = v & 15
+        var c: u8 = 0
+        if nib < 10
+            c = (nib + 48) as u8       # '0' = 48
+        else
+            c = (nib - 10 + 97) as u8  # 'a' = 97
+        *(out + i) = c
+        v = v >> 4
+        i = i - 1
+
+# Parse a 16-hex-char string back to u64.  Returns 0 on malformed input
+# (only `[0-9a-fA-F]` accepted).  Stops at the first non-hex byte.
+pub fn hex16_to_u64(s: *u8) -> u64
+    if s == null
+        return 0
+    var v: u64 = 0
+    var i: i32 = 0
+    while i < 16
+        let c: u8 = *(s + i)
+        if c == 0
+            return v
+        var d: u64 = 0
+        if c >= 48 and c <= 57           # '0'-'9'
+            d = (c - 48) as u64
+        else if c >= 97 and c <= 102     # 'a'-'f'
+            d = (c - 97 + 10) as u64
+        else if c >= 65 and c <= 70      # 'A'-'F'
+            d = (c - 65 + 10) as u64
+        else
+            return v
+        v = (v << 4) | d
+        i = i + 1
+    return v
+
+
+# ============================================================================
+# Token-stream hashing
+# ============================================================================
+
+# Tokens to skip when hashing a function's body — whitespace / structural
+# markers that don't change semantics.  Comments are stripped by the lexer
+# already so they never appear here.  TOK_WHITESPACE is also dropped before
+# the parser sees it but we list it for safety.
+fn fn_cache_should_skip(kind: i32) -> i32
+    if kind == TOK_NEWLINE
+        return 1
+    if kind == TOK_INDENT
+        return 1
+    if kind == TOK_DEDENT
+        return 1
+    if kind == TOK_WHITESPACE
+        return 1
+    if kind == TOK_COMMENT
+        return 1
+    return 0
+
+# Hash a contiguous token range `[start_idx, end_idx)`.  Each significant
+# token contributes its `kind` (4 bytes) followed by its raw source bytes
+# `[start, start+len)`.  Skips whitespace/indent so cosmetic edits don't
+# invalidate the cache.
+pub fn fn_token_hash(tokens: *Token, count: i32, start_idx: i32, end_idx: i32) -> u64
+    var h: u64 = fnv1a_init()
+    var i: i32 = start_idx
+    var lim: i32 = end_idx
+    if lim > count
+        lim = count
+    while i < lim
+        let t: *Token = tokens + i
+        if fn_cache_should_skip(t.kind) == 0
+            # Mix the token kind in (4 bytes, little-endian).
+            let k: u64 = t.kind as u64
+            h = fnv1a_byte(h, (k & 255) as u8)
+            h = fnv1a_byte(h, ((k >> 8) & 255) as u8)
+            h = fnv1a_byte(h, ((k >> 16) & 255) as u8)
+            h = fnv1a_byte(h, ((k >> 24) & 255) as u8)
+            # Then the raw source slice for this token.  `start` may be null
+            # for synthetic tokens; in that case we hash only the kind.
+            if t.start != null
+                var j: i32 = 0
+                while j < t.len
+                    h = fnv1a_byte(h, *(t.start + j))
+                    j = j + 1
+        i = i + 1
+    return h
+
+# Hash only the signature portion of a function (everything up to the
+# first INDENT, which marks the start of the body).
+pub fn sig_token_hash(tokens: *Token, count: i32, start_idx: i32, end_idx: i32) -> u64
+    var h: u64 = fnv1a_init()
+    var i: i32 = start_idx
+    var lim: i32 = end_idx
+    if lim > count
+        lim = count
+    while i < lim
+        let t: *Token = tokens + i
+        if t.kind == TOK_INDENT
+            return h
+        if fn_cache_should_skip(t.kind) == 0
+            let k: u64 = t.kind as u64
+            h = fnv1a_byte(h, (k & 255) as u8)
+            h = fnv1a_byte(h, ((k >> 8) & 255) as u8)
+            h = fnv1a_byte(h, ((k >> 16) & 255) as u8)
+            h = fnv1a_byte(h, ((k >> 24) & 255) as u8)
+            if t.start != null
+                var j: i32 = 0
+                while j < t.len
+                    h = fnv1a_byte(h, *(t.start + j))
+                    j = j + 1
+        i = i + 1
+    return h
+
+
+# ============================================================================
+# Filename helpers
+# ============================================================================
+
+# Build "<src>.ritz.sig" from "<src>.ritz" (or "<x>.sig" from "<x>").  We
+# always append ".sig" to the source path — Path("foo.ritz").with_suffix(
+# ".ritz.sig") in Python yields "foo.ritz.sig", same shape we get by
+# appending ".sig".
+pub fn sig_path_from_src(src_path: *u8) -> String
+    var s: String = string_from_cstr(src_path)
+    string_push_str(@s, c".sig")
+    return s
+
+# Build "<sig_path>.tmp" — used for atomic writes.
+fn sig_tmp_path(sig_path: *u8) -> String
+    var s: String = string_from_cstr(sig_path)
+    string_push_str(@s, c".tmp")
+    return s
+
+
+# ============================================================================
+# In-memory sig representation
+# ============================================================================
+#
+# We keep a small custom struct rather than passing JsonValue trees around.
+# Rationale:
+#   - Fewer JSON allocations on the hot path (`lookup_fn_ir`).
+#   - The shape mirrors the on-disk JSON 1:1 so emit/parse are local.
+#   - Names + IR strings are heap-owned; SigData free walks them.
+
+struct SigEntry
+    name:     *u8       # null-terminated, heap
+    name_len: i32       # cached strlen
+    hash:     u64       # body-token hash
+    sig_hash: u64       # signature-only hash (0 if absent in cache)
+    ir:       *u8       # full LLVM IR for this fn (may be empty cstring)
+    ir_len:   i64
+
+struct SigData
+    source_hash: u64
+    entries:     *SigEntry
+    entry_count: i32
+    entry_cap:   i32
+    imports:     **u8        # array of cstring ptrs (heap)
+    import_count: i32
+    # Cached whole-module LLVM IR (the entire output .ll).  ritz1 stores
+    # this so the file-level fast path can short-circuit emission without
+    # depending on the orchestrator preserving the on-disk .ll.  Field is
+    # absent in sig files written by ritz0; we treat null as "no cache".
+    module_ir:     *u8
+    module_ir_len: i64
+
+# Allocate a fresh empty SigData on the heap.
+pub fn sig_data_new() -> *SigData
+    let sd: *SigData = malloc(72) as *SigData
+    if sd == null
+        return null
+    sd.source_hash = 0
+    sd.entries = null
+    sd.entry_count = 0
+    sd.entry_cap = 0
+    sd.imports = null
+    sd.import_count = 0
+    sd.module_ir = null
+    sd.module_ir_len = 0
+    return sd
+
+# Free SigData and all owned heap allocations.
+pub fn sig_data_free(sd: *SigData)
+    if sd == null
+        return
+    var i: i32 = 0
+    while i < sd.entry_count
+        let e: *SigEntry = sd.entries + i
+        if e.name != null
+            free(e.name)
+        if e.ir != null
+            free(e.ir)
+        i = i + 1
+    if sd.entries != null
+        free(sd.entries as *u8)
+    if sd.imports != null
+        var j: i32 = 0
+        while j < sd.import_count
+            let p: *u8 = *(sd.imports + j)
+            if p != null
+                free(p)
+            j = j + 1
+        free(sd.imports as *u8)
+    if sd.module_ir != null
+        free(sd.module_ir)
+    free(sd as *u8)
+
+fn sig_grow_entries(sd: *SigData)
+    var new_cap: i32 = sd.entry_cap * 2
+    if new_cap < 16
+        new_cap = 16
+    let bytes: i64 = (new_cap as i64) * 48     # sizeof(SigEntry) ~= 48
+    let new_buf: *SigEntry = malloc(bytes) as *SigEntry
+    if new_buf == null
+        return
+    if sd.entries != null and sd.entry_count > 0
+        memcpy(new_buf as *u8, sd.entries as *u8, (sd.entry_count as i64) * 48)
+    if sd.entries != null
+        free(sd.entries as *u8)
+    sd.entries = new_buf
+    sd.entry_cap = new_cap
+
+# Append a new function entry.  Steals (does not copy) `name` and `ir` —
+# both must be heap-owned by the caller.
+pub fn sig_data_add(sd: *SigData, name: *u8, name_len: i32, body_hash: u64, sig_hash: u64, ir: *u8, ir_len: i64)
+    if sd.entry_count >= sd.entry_cap
+        sig_grow_entries(sd)
+    if sd.entries == null
+        return
+    let e: *SigEntry = sd.entries + sd.entry_count
+    e.name = name
+    e.name_len = name_len
+    e.hash = body_hash
+    e.sig_hash = sig_hash
+    e.ir = ir
+    e.ir_len = ir_len
+    sd.entry_count = sd.entry_count + 1
+
+# Lookup by null-terminated cstring.  Returns -1 if not found.
+fn sig_data_find_cstr(sd: *SigData, name: *u8) -> i32
+    if sd == null
+        return -1
+    var i: i32 = 0
+    while i < sd.entry_count
+        let e: *SigEntry = sd.entries + i
+        if e.name != null and streq(e.name, name) == 1
+            return i
+        i = i + 1
+    return -1
+
+# Lookup by (ptr, len) — accepts non-null-terminated names from the AST.
+fn sig_data_find(sd: *SigData, name: *u8, name_len: i32) -> i32
+    if sd == null
+        return -1
+    var i: i32 = 0
+    while i < sd.entry_count
+        let e: *SigEntry = sd.entries + i
+        if e.name_len == name_len
+            var matched: i32 = 1
+            var j: i32 = 0
+            while j < name_len
+                if *(e.name + j) != *(name + j)
+                    matched = 0
+                    j = name_len
+                else
+                    j = j + 1
+            if matched == 1
+                return i
+        i = i + 1
+    return -1
+
+
+# ============================================================================
+# .ritz.sig parsing (read)
+# ============================================================================
+
+# Read entire file into a malloced buffer.  Returns null on missing/empty.
+# Sets `*out_len` to the number of bytes read.
+fn read_file_to_buf(path: *u8, out_len: *i64) -> *u8
+    *out_len = 0
+    let fd: i32 = sys_open(path, O_RDONLY)
+    if fd < 0
+        return null
+    # Use stat to learn size; fallback to incremental read if stat fails.
+    var st: Stat
+    let stres: i32 = sys_stat2(path, @st)
+    if stres != 0
+        sys_close(fd)
+        return null
+    let sz: i64 = st.st_size
+    if sz <= 0
+        sys_close(fd)
+        return null
+    let buf: *u8 = malloc(sz + 1)
+    if buf == null
+        sys_close(fd)
+        return null
+    var total: i64 = 0
+    while total < sz
+        let n: i64 = sys_read(fd, buf + total, sz - total)
+        if n <= 0
+            total = sz   # bail; partial read => skip remaining
+        else
+            total = total + n
+    sys_close(fd)
+    *(buf + total) = 0
+    *out_len = total
+    return buf
+
+# Parse a `.ritz.sig` file.  Returns null on missing/corrupt/structurally
+# unexpected — caller treats null as "no cache, cold start".
+pub fn read_sig_file(sig_path: *u8) -> *SigData
+    var sz: i64 = 0
+    let buf: *u8 = read_file_to_buf(sig_path, @sz)
+    if buf == null or sz <= 0
+        return null
+
+    let res: JsonResult = json_parse(buf, sz)
+    free(buf)
+    if res.ok != 1 or res.value == null
+        if res.value != null
+            json_free(res.value)
+        return null
+    let root: *JsonValue = res.value
+    if root.kind != JSON_OBJECT
+        json_free(root)
+        return null
+
+    let sd: *SigData = sig_data_new()
+    if sd == null
+        json_free(root)
+        return null
+
+    # source_hash (string)
+    let sh_node: *JsonValue = json_get_field(root, c"source_hash")
+    if sh_node != null and sh_node.kind == JSON_STRING and sh_node.str_val != null
+        sd.source_hash = hex16_to_u64(sh_node.str_val)
+
+    # functions (object: name -> {hash, sig_hash, ir})
+    let fns_node: *JsonValue = json_get_field(root, c"functions")
+    if fns_node != null and fns_node.kind == JSON_OBJECT
+        var i: i64 = 0
+        while i < fns_node.count
+            let key: *u8 = *(fns_node.keys + i)
+            let val: *JsonValue = *(fns_node.items + i)
+            if key != null and val != null and val.kind == JSON_OBJECT
+                # Copy the key — it lives in the JSON tree which we'll free.
+                let key_len: i64 = strlen(key)
+                let key_copy: *u8 = malloc(key_len + 1)
+                if key_copy != null
+                    memcpy(key_copy, key, key_len + 1)
+
+                    var body_h: u64 = 0
+                    var sig_h:  u64 = 0
+                    var ir_buf: *u8 = null
+                    var ir_len: i64 = 0
+
+                    let h_node: *JsonValue = json_get_field(val, c"hash")
+                    if h_node != null and h_node.kind == JSON_STRING and h_node.str_val != null
+                        body_h = hex16_to_u64(h_node.str_val)
+                    let sh2_node: *JsonValue = json_get_field(val, c"sig_hash")
+                    if sh2_node != null and sh2_node.kind == JSON_STRING and sh2_node.str_val != null
+                        sig_h = hex16_to_u64(sh2_node.str_val)
+                    let ir_node: *JsonValue = json_get_field(val, c"ir")
+                    if ir_node != null and ir_node.kind == JSON_STRING and ir_node.str_val != null
+                        ir_len = ir_node.str_len
+                        ir_buf = malloc(ir_len + 1)
+                        if ir_buf != null
+                            memcpy(ir_buf, ir_node.str_val, ir_len + 1)
+
+                    sig_data_add(sd, key_copy, key_len as i32, body_h, sig_h, ir_buf, ir_len)
+            i = i + 1
+
+    # module_ir (top-level string — ritz1 extension; absent in ritz0 sigs)
+    let mir_node: *JsonValue = json_get_field(root, c"module_ir")
+    if mir_node != null and mir_node.kind == JSON_STRING and mir_node.str_val != null
+        let ml: i64 = mir_node.str_len
+        if ml > 0
+            let mb: *u8 = malloc(ml + 1)
+            if mb != null
+                memcpy(mb, mir_node.str_val, ml + 1)
+                sd.module_ir = mb
+                sd.module_ir_len = ml
+
+    # imports (array of strings)
+    let imp_node: *JsonValue = json_get_field(root, c"imports")
+    if imp_node != null and imp_node.kind == JSON_ARRAY and imp_node.count > 0
+        let n: i64 = imp_node.count
+        sd.imports = malloc(n * 8) as **u8
+        if sd.imports != null
+            sd.import_count = n as i32
+            var k: i64 = 0
+            while k < n
+                let item: *JsonValue = *(imp_node.items + k)
+                var dst: *u8 = null
+                if item != null and item.kind == JSON_STRING and item.str_val != null
+                    let l: i64 = strlen(item.str_val)
+                    dst = malloc(l + 1)
+                    if dst != null
+                        memcpy(dst, item.str_val, l + 1)
+                *(sd.imports + k) = dst
+                k = k + 1
+
+    json_free(root)
+    return sd
+
+
+# ============================================================================
+# .ritz.sig emission (write)
+# ============================================================================
+
+# Emit a JSON-string-encoded byte sequence (`"..."`) into `buf`.  Mirrors
+# `json_emit_string` but lets us pass a (ptr, len) pair so we can emit IR
+# blobs that may contain arbitrary bytes.
+fn emit_json_string_bytes(buf: *Vec<u8>, s: *u8, len: i64)
+    vec_push<u8>(buf, 34)       # '"'
+    if s != null and len > 0
+        var i: i64 = 0
+        while i < len
+            let ch: u8 = *(s + i)
+            if ch == 34          # '"'
+                vec_push<u8>(buf, 92)   # '\'
+                vec_push<u8>(buf, 34)
+            else if ch == 92      # '\'
+                vec_push<u8>(buf, 92)
+                vec_push<u8>(buf, 92)
+            else if ch == 10      # '\n'
+                vec_push<u8>(buf, 92)
+                vec_push<u8>(buf, 110)  # 'n'
+            else if ch == 13      # '\r'
+                vec_push<u8>(buf, 92)
+                vec_push<u8>(buf, 114)  # 'r'
+            else if ch == 9       # '\t'
+                vec_push<u8>(buf, 92)
+                vec_push<u8>(buf, 116)  # 't'
+            else if ch < 32       # other control chars — emit \uXXXX
+                vec_push<u8>(buf, 92)
+                vec_push<u8>(buf, 117)  # 'u'
+                vec_push<u8>(buf, 48)   # '0'
+                vec_push<u8>(buf, 48)   # '0'
+                let hi: u8 = (ch >> 4) & 15
+                let lo: u8 = ch & 15
+                if hi < 10
+                    vec_push<u8>(buf, hi + 48)
+                else
+                    vec_push<u8>(buf, hi - 10 + 97)
+                if lo < 10
+                    vec_push<u8>(buf, lo + 48)
+                else
+                    vec_push<u8>(buf, lo - 10 + 97)
+            else
+                vec_push<u8>(buf, ch)
+            i = i + 1
+    vec_push<u8>(buf, 34)        # '"'
+
+fn emit_hex16_field(buf: *Vec<u8>, key: *u8, h: u64)
+    vec_push_str(buf, key)
+    vec_push_str(buf, c": \"")
+    var hex: [16]u8
+    u64_to_hex16(h, @hex[0])
+    var k: i64 = 0
+    while k < 16
+        vec_push<u8>(buf, hex[k])
+        k = k + 1
+    vec_push<u8>(buf, 34)        # '"'
+
+# Serialize SigData as JSON into a Vec<u8>.  We mirror ritz0's pretty
+# format (indent=2 + trailing newline) for byte-stable cross-tool diffs.
+fn sig_serialize(sd: *SigData, buf: *Vec<u8>)
+    vec_push_str(buf, c"{\n")
+
+    # source_hash
+    vec_push_str(buf, c"  \"source_hash\"")
+    vec_push_str(buf, c": \"")
+    var hex: [16]u8
+    u64_to_hex16(sd.source_hash, @hex[0])
+    var k: i64 = 0
+    while k < 16
+        vec_push<u8>(buf, hex[k])
+        k = k + 1
+    vec_push_str(buf, c"\",\n")
+
+    # functions
+    vec_push_str(buf, c"  \"functions\"")
+    vec_push_str(buf, c": {")
+    if sd.entry_count == 0
+        vec_push_str(buf, c"},\n")
+    else
+        vec_push<u8>(buf, 10)       # '\n'
+        var i: i32 = 0
+        while i < sd.entry_count
+            let e: *SigEntry = sd.entries + i
+            vec_push_str(buf, c"    ")
+            emit_json_string_bytes(buf, e.name, e.name_len as i64)
+            vec_push_str(buf, c": {\n")
+            # hash
+            vec_push_str(buf, c"      \"hash\": \"")
+            var bh: [16]u8
+            u64_to_hex16(e.hash, @bh[0])
+            var bj: i64 = 0
+            while bj < 16
+                vec_push<u8>(buf, bh[bj])
+                bj = bj + 1
+            vec_push_str(buf, c"\",\n")
+            # sig_hash
+            vec_push_str(buf, c"      \"sig_hash\": \"")
+            var sh: [16]u8
+            u64_to_hex16(e.sig_hash, @sh[0])
+            var sj: i64 = 0
+            while sj < 16
+                vec_push<u8>(buf, sh[sj])
+                sj = sj + 1
+            vec_push_str(buf, c"\",\n")
+            # ir
+            vec_push_str(buf, c"      \"ir\": ")
+            emit_json_string_bytes(buf, e.ir, e.ir_len)
+            vec_push<u8>(buf, 10)
+            vec_push_str(buf, c"    }")
+            if i + 1 < sd.entry_count
+                vec_push<u8>(buf, 44)   # ','
+            vec_push<u8>(buf, 10)
+            i = i + 1
+        vec_push_str(buf, c"  },\n")
+
+    # module_ir (ritz1 extension — ritz0 ignores).  Emit as `null` when
+    # we have no cached IR so the field is always present and the file
+    # is byte-stable for the no-op write path.
+    vec_push_str(buf, c"  \"module_ir\": ")
+    if sd.module_ir != null and sd.module_ir_len > 0
+        emit_json_string_bytes(buf, sd.module_ir, sd.module_ir_len)
+    else
+        vec_push_str(buf, c"null")
+    vec_push_str(buf, c",\n")
+
+    # imports
+    vec_push_str(buf, c"  \"imports\"")
+    vec_push_str(buf, c": [")
+    if sd.import_count == 0
+        vec_push_str(buf, c"]\n")
+    else
+        var ii: i32 = 0
+        while ii < sd.import_count
+            if ii > 0
+                vec_push_str(buf, c", ")
+            let p: *u8 = *(sd.imports + ii)
+            if p != null
+                let l: i64 = strlen(p)
+                emit_json_string_bytes(buf, p, l)
+            else
+                vec_push_str(buf, c"\"\"")
+            ii = ii + 1
+        vec_push_str(buf, c"]\n")
+
+    vec_push_str(buf, c"}\n")
+
+# Atomic write: serialize, write to "<sig>.tmp", rename to "<sig>".
+# Returns 0 on success, -1 on failure.
+pub fn write_sig_file(sig_path: *u8, sd: *SigData) -> i32
+    if sd == null or sig_path == null
+        return -1
+    var tmp: String = sig_tmp_path(sig_path)
+    let tmp_ptr: *u8 = string_as_ptr(@tmp)
+
+    var buf: Vec<u8> = vec_with_cap<u8>(8192)
+    sig_serialize(sd, @buf)
+
+    let fd: i32 = sys_open3(tmp_ptr, O_WRONLY + O_CREAT + O_TRUNC, 420)
+    if fd < 0
+        vec_drop<u8>(@buf)
+        string_drop(@tmp)
+        return -1
+    let n: i64 = sys_write(fd, buf.data, buf.len as i64)
+    sys_close(fd)
+    vec_drop<u8>(@buf)
+    if n < 0
+        sys_unlink(tmp_ptr)
+        string_drop(@tmp)
+        return -1
+    let r: i32 = sys_rename(tmp_ptr, sig_path)
+    string_drop(@tmp)
+    if r != 0
+        sys_unlink(tmp_ptr)
+        return -1
+    return 0
+
+
+# ============================================================================
+# File-level fast path
+# ============================================================================
+
+# Returns 1 when the requested compilation can be skipped — either:
+#   (a) <ll_path> exists, ll.mtime >= src.mtime, and sig.source_hash == FNV1a(src), OR
+#   (b) <src>.ritz.sig has a cached `module_ir` for the matching source_hash,
+#       in which case we WRITE it to <ll_path> here and return 1.
+# The (b) branch is what makes warm rebuilds fast even when the build
+# orchestrator wipes its artifact tempdir between invocations — the
+# `.ritz.sig` lives next to the source and persists across runs.
+# Returns 0 if the caller must do a full compile.
+pub fn check_source_unchanged(src_path: *u8, src: *u8, src_len: i64, ll_path: *u8) -> i32
+    if src_path == null or ll_path == null or src == null
+        return 0
+
+    # Read the sig once — both the mtime path and the splice path need it.
+    var sig_path: String = sig_path_from_src(src_path)
+    let sd: *SigData = read_sig_file(string_as_ptr(@sig_path))
+    string_drop(@sig_path)
+    if sd == null
+        return 0
+
+    let cur: u64 = source_file_hash(src, src_len)
+    if cur != sd.source_hash
+        sig_data_free(sd)
+        return 0
+
+    # Path (a): the requested .ll already exists and is up-to-date.
+    var ll_st: Stat
+    let lr: i32 = sys_stat2(ll_path, @ll_st)
+    if lr == 0
+        var src_st: Stat
+        let sr: i32 = sys_stat2(src_path, @src_st)
+        if sr == 0
+            if ll_st.st_mtime > src_st.st_mtime
+                sig_data_free(sd)
+                return 1
+            if ll_st.st_mtime == src_st.st_mtime and ll_st.st_mtime_ns >= src_st.st_mtime_ns
+                sig_data_free(sd)
+                return 1
+
+    # Path (b): the on-disk .ll is missing or stale, but we have cached IR
+    # from a previous run.  Splice it to the requested output path.
+    if sd.module_ir != null and sd.module_ir_len > 0
+        let fd: i32 = sys_open3(ll_path, O_WRONLY + O_CREAT + O_TRUNC, 420)
+        if fd >= 0
+            let n: i64 = sys_write(fd, sd.module_ir, sd.module_ir_len)
+            sys_close(fd)
+            if n == sd.module_ir_len
+                sig_data_free(sd)
+                return 1
+
+    sig_data_free(sd)
+    return 0
+
+
+# ============================================================================
+# Per-function cache lookup / append
+# ============================================================================
+
+# Look up cached IR for a function whose body-token hash matches.  Returns
+# null on miss.  The returned cstring is owned by the SigData — do NOT free.
+pub fn lookup_fn_ir(sd: *SigData, name: *u8, name_len: i32, body_hash: u64) -> *u8
+    if sd == null
+        return null
+    let idx: i32 = sig_data_find(sd, name, name_len)
+    if idx < 0
+        return null
+    let e: *SigEntry = sd.entries + idx
+    if e.hash != body_hash
+        return null
+    if e.ir == null or e.ir_len <= 0
+        return null
+    return e.ir
+
+# Append a freshly emitted function to a SigData (for write-back).  Copies
+# `name`/`ir` to the heap so callers can free their own buffers.
+pub fn cache_fn_ir(sd: *SigData, name: *u8, name_len: i32, body_hash: u64, sig_hash_v: u64, ir: *u8, ir_len: i64)
+    if sd == null or name == null
+        return
+    # Heap-copy the name (cstring).
+    let name_copy: *u8 = malloc((name_len as i64) + 1)
+    if name_copy == null
+        return
+    var i: i32 = 0
+    while i < name_len
+        *(name_copy + i) = *(name + i)
+        i = i + 1
+    *(name_copy + name_len) = 0
+    # Heap-copy the IR.
+    var ir_copy: *u8 = null
+    if ir != null and ir_len > 0
+        ir_copy = malloc(ir_len + 1)
+        if ir_copy != null
+            memcpy(ir_copy, ir, ir_len)
+            *(ir_copy + ir_len) = 0
+    sig_data_add(sd, name_copy, name_len, body_hash, sig_hash_v, ir_copy, ir_len)
