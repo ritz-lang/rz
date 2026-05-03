@@ -19,27 +19,23 @@ import emitter_expr
 import emitter_stmt
 
 fn emit_fn(s: *EmitterState, f: *FnDef)
-    # Check if this is an extern function (no body) - emit declare instead of define
+    # AGAST #194 modular emit: skip imports entirely. The owning .ll
+    # emits the body; this .ll just needs a `declare`, which the
+    # extern path produces only for fns actually called by local code
+    # (driven by add_extern at every emit_expr_call site). That avoids
+    # paying ~80 bytes per declare for fns this module doesn't reach.
+    if f.is_local == 0 and f.body != null
+        # Side-channel: register so emit_extern_declarations doesn't
+        # accidentally emit a `(...)` fallback declare for fns we'd
+        # otherwise resolve concretely.  Actually we don't add_extern
+        # here — we want the declare to be opt-in via call sites only.
+        return
+    # Check if this is an extern function (no body) — defer the declare
+    # to emit_extern_declarations so we don't duplicate it when a call
+    # site also adds the name to s.externs (matches AGAST #194's
+    # single-source-of-truth rule for declare emission).
     if f.body == null
-        # Skip syscall functions - they're emitted inline at the end
-        # But add them to the extern list so emit_syscall_implementations knows to emit them
-        if is_syscall_function(f.name, f.name_len) == 1
-            add_extern(s, f.name, f.name_len)
-            return
-        emit_str(s, c"declare ")
-        emit_llvm_type_struct(s, f.return_type, f.return_type_name, f.return_type_name_len)
-        emit_str(s, c" @")
-        emit_name(s, f.name, f.name_len)
-        emit_str(s, c"(")
-        var param: *Param = f.params
-        var first: i32 = 1
-        while param != null
-            if first == 0
-                emit_str(s, c", ")
-            first = 0
-            emit_llvm_type_struct(s, param.param_type, param.param_type_name, param.param_type_name_len)
-            param = param.next
-        emit_str(s, c")\n\n")
+        add_extern(s, f.name, f.name_len)
         return
 
     s.reg_counter = 1
@@ -55,17 +51,31 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
     s.ret_type_name = f.return_type_name
     s.ret_type_name_len = f.return_type_name_len
 
-    # Use weak_odr linkage for all function definitions so the linker
-    # can merge duplicates that occur when the same function is emitted
-    # in multiple modules (from transitively-resolved imports).
-    # This mirrors how C++ handles template instantiations.
-    # Exception: `main` must have external linkage so the runtime's _start can find it.
+    # Linkage selection — AGAST #194 modular emit:
+    #   - `main`: external (runtime _start needs it).
+    #   - generic monomorphizations (name contains '$'): linkonce_odr —
+    #     each user module emits its own copy; linker dedupes. Matches
+    #     ritz0's `is_monomorphized` linkage path.
+    #   - regular local fns: weak_odr — preserves cross-module dedup
+    #     for legacy paths and avoids breaking impl-method emit, which
+    #     emits the same Type_method from multiple .ll files when
+    #     impls live alongside their type.
     var is_main: i32 = 0
     if f.name_len == 4
         if *(f.name + 0) == 109 and *(f.name + 1) == 97 and *(f.name + 2) == 105 and *(f.name + 3) == 110
             is_main = 1
+    var is_monomorph: i32 = 0
+    var name_i: i32 = 0
+    while name_i < f.name_len
+        if *(f.name + name_i) == 36   # '$' marks a monomorph instantiation suffix
+            is_monomorph = 1
+            name_i = f.name_len
+        else
+            name_i = name_i + 1
     if is_main == 1
         emit_str(s, c"define ")
+    else if is_monomorph == 1
+        emit_str(s, c"define linkonce_odr ")
     else
         emit_str(s, c"define weak_odr ")
     emit_llvm_type_struct(s, f.return_type, f.return_type_name, f.return_type_name_len)
@@ -328,6 +338,13 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
 # Emit an impl block method with mangled name: Type_method
 # For `impl Point { fn sum(...) }` we emit `Point_sum`
 fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
+    # AGAST #194: imported impl methods are skipped here — the file that
+    # owns the impl will emit the body. Call sites elsewhere reach this
+    # method through emit_extern_declarations (declares get auto-emitted
+    # for any unresolved Type_method extern).
+    if method.is_local == 0
+        return
+
     # Check if already emitted (deduplication for imports)
     # Mangle name: Type_method
     # First build the mangled name: type_name + "_" + method_name
@@ -349,8 +366,21 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
     s.ret_type_name = method.return_type_name
     s.ret_type_name_len = method.return_type_name_len
 
-    # weak_odr: same as fn emission — linker merges duplicates across modules
-    emit_str(s, c"define weak_odr ")
+    # Linkage selection mirrors emit_fn:
+    #   - mangled name contains '$' (e.g. `Vec$u8_push`): linkonce_odr
+    #   - else: weak_odr (cross-module dedup safety)
+    var im_is_monomorph: i32 = 0
+    var im_i: i32 = 0
+    while im_i < ib.type_name_len
+        if *(ib.type_name + im_i) == 36   # '$'
+            im_is_monomorph = 1
+            im_i = ib.type_name_len
+        else
+            im_i = im_i + 1
+    if im_is_monomorph == 1
+        emit_str(s, c"define linkonce_odr ")
+    else
+        emit_str(s, c"define weak_odr ")
     # For struct-returning impl methods (where `method.return_type_name`
     # is set), emit `%Type` so call sites that walk the impl table can
     # match the signature.  Other return types route through
@@ -610,8 +640,14 @@ fn emit_string_constants(s: *EmitterState)
 fn is_local_function(m: *Module, name: *u8, len: i32) -> i32
     var f: *FnDef = m.functions
     while f != null
-        # Only consider functions with bodies (not extern declarations)
-        if f.body != null and f.name_len == len
+        # AGAST #194: a fn is "local" only when this .ll actually
+        # defines its body (is_local == 1, set by main() for fns
+        # parsed from the input file, and by monomorph for cloned
+        # instantiations). Imported fns merged from other source
+        # files carry is_local == 0 and must NOT short-circuit the
+        # extern-declare path here — otherwise call sites in the
+        # current .ll would reference unresolved symbols.
+        if f.body != null and f.is_local == 1 and f.name_len == len
             var j: i32 = 0
             var matched: i32 = 1
             while j < len
@@ -631,7 +667,10 @@ fn is_local_function(m: *Module, name: *u8, len: i32) -> i32
     while ib != null
         var method: *FnDef = ib.methods
         while method != null
-            if method.body != null
+            # AGAST #194: same rationale as the m.functions branch above —
+            # only methods this .ll actually defines (is_local==1) count
+            # as local for the extern-declare suppression check.
+            if method.body != null and method.is_local == 1
                 let type_len: i32 = ib.type_name_len
                 if type_len + 1 + method.name_len == len
                     var matched: i32 = 1
