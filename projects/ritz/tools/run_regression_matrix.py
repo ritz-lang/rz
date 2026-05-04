@@ -38,6 +38,7 @@ TESTS = [
     "test_issue_for_iterables",
     "test_issue_for_range_wrapped",
     "test_issue_generic_call_resolution",
+    "test_issue_long_if_else_chain_in_loop",
     "test_issue_global_struct_assign",
     "test_issue_inline_asm_cpuid",
     "test_issue_match_custom_87",

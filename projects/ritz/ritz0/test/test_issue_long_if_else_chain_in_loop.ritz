@@ -1,0 +1,75 @@
+# Regression: a `loop` containing a long `if / else if / ... / else if`
+# chain where one arm contains a value-producing call followed by `break`
+# used to make ritz1 emit invalid PHI nodes at the merge point.  The
+# exit-label captured for the break arm pointed at the pre-break basic
+# block, but the real CFG predecessor was the (unreachable) "dead" block
+# emitted *after* the `br label %loop_end`.  Clang's "Remove unreachable
+# blocks from the CFG" pass crashed in `PHINode::removeIncomingValue`
+# when it tried to detach the dead block from a PHI that listed the
+# wrong predecessor instead.
+#
+# Fix (ritz-task-195): STMT_BREAK/STMT_CONTINUE update s.current_label
+# to the freshly-emitted dead label and reset s.last_expr_reg, so the
+# enclosing IF emitter sees then_result=0 and skips the bad PHI.
+#
+# Triggering pattern (mirrors mausoleum::handle_encrypted_session):
+#   - bare-call STMT_EXPR setting last_expr_reg, immediately followed by
+#     `break`, in the THEN of an outer IF whose ELSE is an else-if chain
+#     where every arm also ends with a bare call (STMT_EXPR sets
+#     last_expr_reg too) so the IF emitter's "both branches produced a
+#     value" path fires and emits a PHI.
+
+fn returning_call(x: i32) -> i32
+    return x + 1
+
+fn run_chain(kind: i32) -> i32
+    var count: i32 = 0
+    loop
+        if kind == 1
+            count = count + 1
+            # Bare-call STMT_EXPR sets last_expr_reg, immediately
+            # followed by `break`.  Without the fix this leaves
+            # last_expr_reg pointing at this register and current_label
+            # pointing at the pre-break block, so the IF emitter emits
+            # a value-merging PHI whose predecessor label is wrong.
+            returning_call(count)
+            break
+        else if kind == 2
+            count = count + 1
+            # Bare call at the tail so this arm also produces a
+            # last_expr_reg — required to make `else_result > 0` and
+            # trigger the buggy PHI emit.
+            returning_call(count)
+        else if kind == 3
+            count = count + 1
+            returning_call(count)
+        else if kind == 4
+            count = count + 1
+            returning_call(count)
+        else
+            count = count + 1
+            returning_call(count)
+        if count >= 100
+            break
+        kind = 99  # next iteration drops to the trailing else
+    return count
+
+[[test]]
+fn test_break_arm_with_call_before_break() -> i32
+    # kind=1 takes the break arm immediately.  Without the fix the
+    # ritz1-emitted IR has a stale PHI predecessor in the merge block,
+    # which crashes clang's "Remove unreachable blocks from the CFG".
+    if run_chain(1) == 1
+        0
+    else
+        1
+
+[[test]]
+fn test_fallthrough_through_else_chain() -> i32
+    # kind=2: bumps once, then drops to else-arm forever; eventually the
+    # `count >= 100` guard fires.  Exercises the merge of multiple
+    # value-producing arms without the break-arm trigger.
+    if run_chain(2) == 100
+        0
+    else
+        1
