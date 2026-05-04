@@ -727,6 +727,21 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
     # by ~10× without risking cross-compiler contamination.
     cache = get_build_cache(compiler)
 
+    # If the compiler that produced the existing cache differs from the
+    # one we're about to invoke (ritz0 source edited, ritz1 binary
+    # rebuilt, etc.), every cached `.ll`/`.bc`/`.o` is stale. Invalidate
+    # the whole artifact store before any per-source decisions are made,
+    # otherwise `needs_rebuild()` will refresh the compiler-hash file
+    # mid-build and silently return stale artifacts for every source
+    # past the first one. See `BuildCache.invalidate_if_compiler_changed`.
+    #
+    # We also remember the verdict locally: if the compiler changed, the
+    # already-linked `bin_path` is stale too (it was linked from the
+    # now-discarded `.o` files), so the project-level fast path below
+    # must NOT return it. The fast path only re-uses `bin_path` when the
+    # compiler is unchanged.
+    compiler_changed = cache.invalidate_if_compiler_changed() if use_cache else False
+
     # Check for llvm-as (needed for .ll → .bc conversion)
     has_llvm_as = shutil_mod.which("llvm-as") is not None
 
@@ -770,13 +785,20 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
     # fallback so a bare `touch foo.ritz` (mtime bumped, content
     # identical) doesn't trigger a 10× slower rebuild.
     #
-    # Two-tier check per source:
-    #   1. mtime <= bin_mtime  → cheap, settles 99% of cases.
+    # Three-tier check:
+    #   0. compiler hash matches  → otherwise the cached `bin_path` was
+    #      produced by a different compiler revision and must not be
+    #      reused. Editing a ritz0 codegen file (e.g. `emitter/calls.py`)
+    #      or rebuilding the `ritz1` binary changes this hash. Without
+    #      this gate, the fast path silently returns yesterday's binary
+    #      and "the cache lies" — exactly the class of failure that
+    #      burned a session in early May 2026.
+    #   1. mtime <= bin_mtime     → cheap, settles 99% of cases.
     #   2. mtime is newer, but FNV1a(source) matches `<src>.ritz.sig`'s
     #      `source_hash` (written by ritz1 on its previous run)  →
     #      content unchanged, treat as fresh.
     # `use_cache` gates the whole thing so debug runs always rebuild.
-    if use_cache and bin_path.exists():
+    if use_cache and bin_path.exists() and not compiler_changed:
         try:
             bin_mtime = bin_path.stat().st_mtime
             stale = False

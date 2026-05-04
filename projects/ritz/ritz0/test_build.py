@@ -506,3 +506,144 @@ class TestCacheCompilerHash:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+# =============================================================================
+# Cache wholesale-invalidation regression (May 2026)
+# =============================================================================
+#
+# The cache used to silently return stale objects for every source past the
+# first one when the compiler changed: `update_cache` flipped the in-memory
+# "compiler-hash valid" flag mid-build, so subsequent `needs_rebuild` calls
+# returned False and handed back .o files produced by the old compiler.
+#
+# Burned a debugging session. Now: if the compiler hash mismatches what's on
+# disk, `invalidate_if_compiler_changed` wipes the entire artifact store
+# before any per-source decisions are made.
+
+class TestCacheWholesaleInvalidation:
+    """invalidate_if_compiler_changed wipes everything when compiler differs."""
+
+    def test_invalidate_wipes_all_objects_on_compiler_change(self, tmp_path):
+        from cache import BuildCache
+
+        ritz0_dir = tmp_path / "ritz0"
+        ritz0_dir.mkdir()
+        emitter = ritz0_dir / "emitter_llvmlite.py"
+        emitter.write_text("# v1")
+
+        cache = BuildCache(project_root=tmp_path)
+        # Seed cache with two fake artifacts and the v1 hash.
+        cache._update_compiler_hash()
+        cache.objects_dir.mkdir(parents=True, exist_ok=True)
+        (cache.objects_dir / "a.ll").write_text("ir-from-v1")
+        (cache.objects_dir / "b.o").write_bytes(b"obj-from-v1")
+        assert (cache.objects_dir / "a.ll").exists()
+        assert (cache.objects_dir / "b.o").exists()
+
+        # Compiler change → wholesale invalidation.
+        emitter.write_text("# v2")
+        cache._compiler_hash = None
+        cache._compiler_hash_valid = None
+        invalidated = cache.invalidate_if_compiler_changed()
+
+        assert invalidated is True
+        assert not (cache.objects_dir / "a.ll").exists(), "stale .ll survived"
+        assert not (cache.objects_dir / "b.o").exists(), "stale .o survived"
+        # Hash file is refreshed so artifacts produced *during* this build
+        # are recorded as produced by the new compiler.
+        assert cache._check_compiler_hash() is True
+
+    def test_invalidate_noop_when_compiler_unchanged(self, tmp_path):
+        from cache import BuildCache
+
+        ritz0_dir = tmp_path / "ritz0"
+        ritz0_dir.mkdir()
+        (ritz0_dir / "ritz0.py").write_text("# stable")
+
+        cache = BuildCache(project_root=tmp_path)
+        cache._update_compiler_hash()
+        cache.objects_dir.mkdir(parents=True, exist_ok=True)
+        (cache.objects_dir / "x.ll").write_text("warm-ir")
+
+        # No compiler change between builds.
+        cache._compiler_hash = None
+        cache._compiler_hash_valid = None
+        invalidated = cache.invalidate_if_compiler_changed()
+
+        assert invalidated is False
+        assert (cache.objects_dir / "x.ll").exists(), "warm cache wrongly nuked"
+
+    def test_ritz0_walk_finds_emitter_subpackage(self, tmp_path):
+        """The pre-fix bug: hand-curated list missed `emitter/*.py`. Adding
+        a file under `emitter/` must change the fingerprint."""
+        from cache import compute_compiler_hash
+
+        ritz0_dir = tmp_path / "ritz0"
+        ritz0_dir.mkdir()
+        (ritz0_dir / "ritz0.py").write_text("# main")
+        emitter_dir = ritz0_dir / "emitter"
+        emitter_dir.mkdir()
+        (emitter_dir / "calls.py").write_text("# v1")
+
+        h1 = compute_compiler_hash(tmp_path, "ritz0")
+        (emitter_dir / "calls.py").write_text("# v2")
+        h2 = compute_compiler_hash(tmp_path, "ritz0")
+        assert h1 != h2, "edit to emitter/calls.py did not change fingerprint"
+
+        # New file in emitter/ also changes fingerprint.
+        h3a = compute_compiler_hash(tmp_path, "ritz0")
+        (emitter_dir / "new_module.py").write_text("# new")
+        h3b = compute_compiler_hash(tmp_path, "ritz0")
+        assert h3a != h3b, "new file in emitter/ did not change fingerprint"
+
+    def test_ritz0_walk_excludes_tests_and_pycache(self, tmp_path):
+        """test_*.py and __pycache__ must NOT contribute to the fingerprint
+        (they don't affect codegen)."""
+        from cache import compute_compiler_hash
+
+        ritz0_dir = tmp_path / "ritz0"
+        ritz0_dir.mkdir()
+        (ritz0_dir / "ritz0.py").write_text("# stable")
+        (ritz0_dir / "test_lexer.py").write_text("# tests")
+        pycache = ritz0_dir / "__cache_test_temp_pycache__"
+        pycache.name  # placeholder to silence linter
+
+        h1 = compute_compiler_hash(tmp_path, "ritz0")
+        (ritz0_dir / "test_lexer.py").write_text("# different tests")
+        h2 = compute_compiler_hash(tmp_path, "ritz0")
+        assert h1 == h2, "editing a test file changed the fingerprint"
+
+    def test_ritz1_fingerprint_is_binary_hash(self, tmp_path):
+        from cache import compute_compiler_hash
+
+        ritz1_dir = tmp_path / "ritz1" / "build"
+        ritz1_dir.mkdir(parents=True)
+        ritz1_bin = ritz1_dir / "ritz1"
+        ritz1_bin.write_bytes(b"\x7fELF" + b"\x00" * 100 + b"v1-binary")
+        h1 = compute_compiler_hash(tmp_path, "ritz1")
+        ritz1_bin.write_bytes(b"\x7fELF" + b"\x00" * 100 + b"v2-binary")
+        h2 = compute_compiler_hash(tmp_path, "ritz1")
+        assert h1 != h2, "ritz1 binary edit did not change fingerprint"
+
+    def test_ritz1_missing_returns_sentinel(self, tmp_path):
+        from cache import compute_compiler_hash
+        # No ritz1 binary at all
+        h = compute_compiler_hash(tmp_path, "ritz1")
+        assert h == "ritz1-missing"
+
+    def test_namespacing_ritz0_vs_ritz1_differs(self, tmp_path):
+        """Same project content, different compiler ID → different hash.
+        Cross-compiler artifact contamination would be very bad."""
+        from cache import compute_compiler_hash
+
+        ritz0_dir = tmp_path / "ritz0"
+        ritz0_dir.mkdir()
+        (ritz0_dir / "ritz0.py").write_text("# x")
+        ritz1_dir = tmp_path / "ritz1" / "build"
+        ritz1_dir.mkdir(parents=True)
+        (ritz1_dir / "ritz1").write_bytes(b"binary")
+
+        h0 = compute_compiler_hash(tmp_path, "ritz0")
+        h1 = compute_compiler_hash(tmp_path, "ritz1")
+        assert h0 != h1

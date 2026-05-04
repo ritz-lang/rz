@@ -36,7 +36,31 @@ HASHES_FILE = "hashes.json"
 OBJECTS_DIR = "objects"
 COMPILER_HASH_FILE = "compiler_hash"
 
-# Files that affect code generation - changes invalidate all cached artifacts
+# Compiler fingerprint inputs — used by `compute_compiler_hash()` to invalidate
+# every cached artifact when the compiler that produced them changes.
+#
+# History: this used to be a hand-curated list of ten ritz0 paths, which was
+# fragile in two ways: (a) any new compiler file (like the post-#192 split-out
+# `ritz0/emitter/*.py`) silently slipped past it, returning stale `.o` files
+# from the cache after legitimate compiler edits; (b) it didn't cover ritz1 at
+# all, even though ritz1 is now the default compiler for the stack. Today's
+# debugging session burned hours chasing "codegen regressions" that turned out
+# to be stale-cache placebos — that's the second time this hole has cost us.
+#
+# New shape: discover compiler inputs by walking the relevant tree, so adding
+# a new file Just Works. Two compilers, two strategies:
+#
+#   ritz0 (Python source tree): walk `ritz0/`, hash every `.py` file except
+#       tests and bytecode caches. Source is the artifact — no separate binary.
+#
+#   ritz1 (self-hosted, single binary): hash the `ritz1` binary directly. The
+#       binary is the artifact; whatever produced it (ritz1/src/*.ritz at
+#       whatever revision) is captured by the binary's content hash. If the
+#       binary is missing, return a sentinel so any cache built without it is
+#       invalidated when it appears.
+#
+# The legacy constant below is retained for the existing `test_build.py`
+# tests, but is no longer used by `compute_compiler_hash()`.
 COMPILER_CRITICAL_FILES = [
     "ritz0/emitter_llvmlite.py",
     "ritz0/parser_gen.py",
@@ -49,6 +73,15 @@ COMPILER_CRITICAL_FILES = [
     "ritz0/ritz_ast.py",
     "ritz0/type_checker.py",
 ]
+
+# Directory- and filename-pattern excludes for the ritz0 fingerprint walk.
+# These do not affect codegen, so we leave them out of the fingerprint:
+#   - __pycache__/        : .pyc bytecode (regenerated on every run)
+#   - .pytest_cache/      : pytest run state
+#   - test/               : test fixtures and runner scaffolding
+#   - test_*.py           : individual test modules
+RITZ0_EXCLUDE_DIRS = {"__pycache__", ".pytest_cache", "test"}
+RITZ0_EXCLUDE_FILE_PREFIXES = ("test_",)
 
 
 # ============================================================================
@@ -202,29 +235,95 @@ def compute_file_hash(file_path: Path) -> str:
     return h.hexdigest()
 
 
-def compute_compiler_hash(project_root: Path) -> str:
-    """Compute a hash of all compiler-critical files.
+def _hash_file_into(h: "hashlib._Hash", file_path: Path) -> None:
+    """Stream `file_path` into the hash context `h`."""
+    with open(file_path, 'rb') as f:
+        for chunk in iter(lambda: f.read(8192), b''):
+            h.update(chunk)
 
-    This hash is used to invalidate the entire cache when the compiler
-    itself changes (e.g., emitter, parser, type checker modifications).
 
-    Currently only tracks ritz0 (Python) files since build.py uses ritz0.
-    When ritz1 becomes the primary compiler, we'll track the ritz1 source
-    files (in ritz1/src/) instead of the binary.
+def _collect_ritz0_sources(ritz0_root: Path) -> List[Path]:
+    """Walk the ritz0 Python tree and return every `.py` file that affects
+    code generation, sorted by relative path for deterministic hashing.
+
+    Excludes:
+      - directories listed in `RITZ0_EXCLUDE_DIRS` (bytecode caches, test trees)
+      - filenames starting with any prefix in `RITZ0_EXCLUDE_FILE_PREFIXES`
+        (i.e. `test_*.py` test modules)
+
+    Everything else under `ritz0/` is considered codegen-critical. This is
+    the *correct* default: a hand-curated allowlist will silently miss new
+    files (it has, twice).
+    """
+    sources: List[Path] = []
+    for dirpath, dirnames, filenames in os.walk(ritz0_root):
+        # Prune excluded directories in-place so os.walk doesn't descend.
+        dirnames[:] = [d for d in dirnames if d not in RITZ0_EXCLUDE_DIRS]
+        for fn in filenames:
+            if not fn.endswith(".py"):
+                continue
+            if fn.startswith(RITZ0_EXCLUDE_FILE_PREFIXES):
+                continue
+            sources.append(Path(dirpath) / fn)
+    sources.sort(key=lambda p: p.relative_to(ritz0_root).as_posix())
+    return sources
+
+
+def compute_compiler_hash(project_root: Path, compiler: str = "ritz0") -> str:
+    """Compute a fingerprint of the compiler that produced cached artifacts.
+
+    The fingerprint is what gates cache validity: if the compiler that
+    produced the cached `.ll`/`.bc`/`.o` files differs from the compiler
+    about to be invoked, the cache is invalidated wholesale.
+
+    Strategies are per-compiler:
+
+    ``ritz0`` (Python bootstrap)
+        Walk ``ritz0/`` and hash every ``.py`` file except tests and
+        bytecode caches. The source tree *is* the artifact — there is no
+        separate compiled binary.
+
+    ``ritz1`` (self-hosted, single binary)
+        Hash the ``ritz1`` binary at ``ritz1/build/ritz1``. The binary is
+        the artifact; whatever ritz1/src/*.ritz revision produced it is
+        captured by the binary's content hash. If the binary does not
+        exist, return a sentinel so cache built before the binary was
+        produced is invalidated when it appears.
+
+    Args:
+        project_root: directory containing ``ritz0/`` and ``ritz1/``.
+        compiler: "ritz0" or "ritz1".
+
+    Returns:
+        Hex-encoded SHA256 digest, or the sentinel ``"ritz1-missing"`` when
+        ``compiler == "ritz1"`` and the binary does not exist.
     """
     h = hashlib.sha256()
+    h.update(f"compiler={compiler}\n".encode())  # namespace the digest
 
-    # Hash critical Python files (ritz0)
-    for rel_path in sorted(COMPILER_CRITICAL_FILES):
-        file_path = project_root / rel_path
-        if file_path.exists():
-            h.update(rel_path.encode())
+    if compiler == "ritz0":
+        ritz0_root = project_root / "ritz0"
+        if not ritz0_root.is_dir():
+            # No ritz0 tree at all — fall through to an empty digest under
+            # the namespace prefix above. Any future ritz0 install will
+            # produce a different hash and invalidate.
+            return h.hexdigest()
+        for src in _collect_ritz0_sources(ritz0_root):
+            rel = src.relative_to(ritz0_root).as_posix()
+            h.update(rel.encode())
             h.update(b'\x00')
-            with open(file_path, 'rb') as f:
-                for chunk in iter(lambda: f.read(8192), b''):
-                    h.update(chunk)
+            _hash_file_into(h, src)
+        return h.hexdigest()
 
-    return h.hexdigest()
+    if compiler == "ritz1":
+        ritz1_bin = project_root / "ritz1" / "build" / "ritz1"
+        if not ritz1_bin.is_file():
+            return "ritz1-missing"
+        h.update(b"ritz1-binary\x00")
+        _hash_file_into(h, ritz1_bin)
+        return h.hexdigest()
+
+    raise ValueError(f"unknown compiler: {compiler!r}")
 
 
 # ============================================================================
@@ -280,11 +379,15 @@ class BuildCache:
         return self.cache_dir / COMPILER_HASH_FILE
 
     def _get_current_compiler_hash(self) -> str:
-        """Get the current compiler hash, computing if needed."""
+        """Get the current compiler hash, computing if needed.
+
+        The fingerprint is computed for `self.compiler` — ritz0 walks the
+        Python tree, ritz1 hashes the binary. See `compute_compiler_hash`.
+        """
         if self._compiler_hash is None:
             root = self.project_root or find_project_root(Path.cwd())
             if root:
-                self._compiler_hash = compute_compiler_hash(root)
+                self._compiler_hash = compute_compiler_hash(root, self.compiler)
             else:
                 self._compiler_hash = "unknown"
         return self._compiler_hash
@@ -314,6 +417,48 @@ class BuildCache:
         current_hash = self._get_current_compiler_hash()
         self.compiler_hash_file.write_text(current_hash)
         self._compiler_hash_valid = True
+
+    def invalidate_if_compiler_changed(self) -> bool:
+        """One-shot wholesale invalidation when the compiler has changed.
+
+        Call this *once* at the top of a build, before any per-source
+        decisions are made. If the on-disk compiler hash exists and
+        mismatches the current compiler's fingerprint, every cached
+        ``.ll``/``.bc``/``.o`` is stale (it was emitted by a different
+        compiler) and must be discarded. This wipes the objects directory,
+        the dependency graph, and the per-file hashes, then refreshes the
+        compiler hash file so that artifacts produced *by this build* are
+        treated as fresh.
+
+        Why this is necessary: ``needs_rebuild()`` checks the compiler hash
+        per-source. After the first source is recompiled, ``update_cache``
+        runs and refreshes the compiler-hash file as a side effect — which
+        flips ``_compiler_hash_valid`` to True. Every subsequent source
+        then sees a "fresh" compiler hash and returns the cached
+        (compiler-stale) ``.o``. So without this method the cache only
+        actually rebuilds the *first* source after a compiler change; the
+        rest are silently mismatched.
+
+        Returns:
+            True if invalidation actually happened (compiler changed),
+            False if cache was already up-to-date.
+        """
+        if self._check_compiler_hash():
+            # Compiler hash matches what produced the cached artifacts;
+            # nothing to invalidate. Each source still goes through
+            # `needs_rebuild()` for its own per-file freshness check.
+            return False
+
+        # Mismatch (or no record at all). Wipe the artifact store so
+        # every per-source cache lookup misses and triggers a fresh
+        # compile, then write the fingerprint of the *current* compiler
+        # so that artifacts emitted during this build are recorded as
+        # produced by it.
+        if self.objects_dir.exists():
+            shutil.rmtree(self.objects_dir)
+        self._state = CacheState()  # forget dep graph + hashes too
+        self._update_compiler_hash()
+        return True
 
     @property
     def state(self) -> CacheState:
