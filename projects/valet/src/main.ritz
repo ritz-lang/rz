@@ -484,20 +484,40 @@ fn handle_zeus_proxy_continuation(task: *Task) -> i32
             valet_proxy_state_clear(task)
             return 1
 
-        # Per-slot arena view to resolve the response body offset.
+        # Per-slot arena view to resolve the response header + body offsets.
         var arena: DataArena
         worker_handle_get_slot_arena(handle, st.claimed_slot, @arena)
         let body_ptr: *u8 = data_arena_offset_to_ptr(@arena, resp.body_offset as i64)
+        let headers_ptr: *u8 = data_arena_offset_to_ptr(@arena, resp.headers_offset as i64)
+        let headers_len: i32 = resp.headers_len as i32
 
-        # Build the HTTP reply directly into task.write_buf so the
-        # framework's CONN_STATE_SEND can drive the socket write.
+        # Pass the worker's pre-baked HTTP response prefix through verbatim.
+        # The worker writes the full status line + header block (terminated
+        # by \r\n\r\n) into its arena slice — see build_headers /
+        # build_redirect_headers in nexus/src/main.ritz for shape.  Valet
+        # used to ignore those bytes and reconstruct the response from
+        # `resp.status`, `resp.body_len`, plus a hardcoded Content-Type +
+        # Connection.  That dropped any worker-supplied header — most
+        # visibly Location, which silently turned 302 redirects into
+        # blank-body 302s with no follow target (browser sees no Location,
+        # stays on the POST URL, refresh recovers).  Letting the worker
+        # own the response prefix means it can also set custom headers
+        # (Cache-Control, Set-Cookie, ETag, etc.) without further
+        # extending the SHM-ring slot schema.
         var res: Response
         response_init(@res, @task.write_buf[0], 8192)
-        response_status(@res, resp.status as i32)
-        response_header(@res, c"Content-Type", c"text/html; charset=utf-8")
-        response_content_length(@res, resp.body_len as i64)
-        response_header(@res, c"Connection", c"keep-alive")
-        response_end_headers(@res)
+        if headers_len > 0
+            response_append_bytes(@res, headers_ptr, headers_len)
+        else
+            # Defensive fallback: worker didn't populate headers (null
+            # response).  Construct a minimal response so we don't ship
+            # garbage on the wire.  Should never fire from a well-formed
+            # worker but keeps the proxy honest if something regresses.
+            response_status(@res, resp.status as i32)
+            response_header(@res, c"Content-Type", c"text/html; charset=utf-8")
+            response_content_length(@res, resp.body_len as i64)
+            response_header(@res, c"Connection", c"keep-alive")
+            response_end_headers(@res)
         response_body(@res, body_ptr, resp.body_len as i32)
 
         valet_proxy_state_clear(task)

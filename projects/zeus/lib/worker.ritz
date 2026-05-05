@@ -32,6 +32,19 @@ pub struct WorkerContext
     region: ShmRegion         # Attached shared memory region
     current_req_idx: i64      # Index of request being processed
 
+    # Per-request response arena.  `worker_alloc_response_data` allocates
+    # from this struct directly — bumping `response_arena.offset` — so
+    # consecutive allocations within one request return non-overlapping
+    # pointers.  Initialized in `worker_begin_response` (which knows the
+    # slot to attach to).  Without this state, every alloc re-attached a
+    # fresh stack-local arena view to the slot's start, so all allocs
+    # returned the same pointer; the second alloc silently overwrote the
+    # first.  That bug was masked by valet's old proxy path, which
+    # ignored the worker's headers buffer and only consumed the body —
+    # whichever alloc happened to write last "won".  Surfaced once valet
+    # started honoring worker headers (Location for 302 redirects).
+    response_arena: DataArena
+
 # ============================================================================
 # Initialization
 # ============================================================================
@@ -158,6 +171,15 @@ pub fn worker_begin_response(ctx: *WorkerContext, request_id: u64) -> *ResponseS
     response_slot_init(slot)
     slot.id = request_id
 
+    # Attach `ctx.response_arena` to the SAME slot the request is in
+    # (current_req_idx), not the response slot.  Worker convention is
+    # that each request slot has its own arena partition; the response
+    # writes happen in that arena and are addressed by global offsets.
+    # The bytes the request brought in (path, body) have already been
+    # read by the time apps allocate response bytes, so reusing the
+    # request's arena slice is safe.
+    shm_get_slot_arena(@ctx.region, worker_current_slot_idx(ctx), @ctx.response_arena)
+
     return slot
 
 # Commit the current response (make it visible to Valet)
@@ -213,19 +235,19 @@ pub fn worker_get_request_headers(ctx: *WorkerContext, req: *RequestSlot) -> *u8
     shm_get_slot_arena(@ctx.region, worker_current_slot_idx(ctx), @arena)
     return data_arena_offset_to_ptr(@arena, req.headers_offset as i64)
 
-# Allocate space in arena for response data.  The allocation goes into
-# the same slot whose request we're processing — request bytes have
-# already been read by the time apps allocate response bytes, so
-# overwriting them is safe.
+# Allocate space in arena for response data.  Allocates from the
+# context-resident `response_arena` (initialized in worker_begin_response),
+# so consecutive calls in the same request bump the offset and return
+# distinct, non-overlapping pointers.  Request bytes have already been
+# read by the time apps allocate response bytes, so reusing the slot's
+# arena slice is safe.
 pub fn worker_alloc_response_data(ctx: *WorkerContext, size: i64) -> *u8
-    var arena: DataArena
-    shm_get_slot_arena(@ctx.region, worker_current_slot_idx(ctx), @arena)
-    return data_arena_alloc(@arena, size)
+    return data_arena_alloc(@ctx.response_arena, size)
 
 # Get global offset for a pointer (for setting in response slots).
 # Stored in resp.body_offset / headers_offset and consumed by valet via
-# `data_arena_offset_to_ptr` against its own arena view.
+# `data_arena_offset_to_ptr` against its own arena view.  The arena base
+# is the global SHM arena base, so offsets returned here are valid for
+# valet's view too — no slot-relative bookkeeping needed.
 pub fn worker_ptr_to_offset(ctx: *WorkerContext, ptr: *u8) -> i64
-    var arena: DataArena
-    shm_get_slot_arena(@ctx.region, worker_current_slot_idx(ctx), @arena)
-    return data_arena_ptr_to_offset(@arena, ptr)
+    return data_arena_ptr_to_offset(@ctx.response_arena, ptr)
