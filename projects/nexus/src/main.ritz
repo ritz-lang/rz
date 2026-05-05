@@ -258,6 +258,29 @@ fn extract_slug(path: *u8, path_len: i32, slug_out: *u8, max_len: i32) -> i32
     return len
 
 
+# Validate slug bytes: lowercase ASCII letters, digits, and hyphen only.
+# Returns 1 if valid, 0 otherwise.  Empty slugs and slugs longer than 128
+# bytes are rejected.  This guards against directory traversal, URL
+# escaping ambiguities, and DB key abuse on user-supplied input.
+fn validate_slug(slug: *u8, slug_len: i32) -> i32
+    if slug_len <= 0
+        return 0
+    if slug_len > 128
+        return 0
+    for i in 0..slug_len
+        let c: u8 = *(slug + i)
+        var is_lower: i32 = 0
+        if c >= 97 and c <= 122      # a-z
+            is_lower = 1
+        else if c >= 48 and c <= 57  # 0-9
+            is_lower = 1
+        else if c == 45              # -
+            is_lower = 1
+        if is_lower == 0
+            return 0
+    return 1
+
+
 # ============================================================================
 # Response Building
 # ============================================================================
@@ -552,6 +575,220 @@ fn handle_wiki_new(ctx: *WorkerContext, req: *RequestSlot, resp: *ResponseSlot) 
 
 
 # ============================================================================
+# Response helpers — used by the POST handlers below for short replies
+# and redirects.  Each takes ownership of the response slot and copies
+# the precomputed bytes into the worker's data arena.
+# ============================================================================
+
+fn send_redirect(ctx: *WorkerContext, resp: *ResponseSlot, location: *u8) -> i32
+    var headers: [256]u8
+    let headers_len: i32 = build_redirect_headers(@headers[0], location)
+
+    let arena_headers: *u8 = worker_alloc_response_data(ctx, headers_len as i64)
+    for i in 0..headers_len
+        *(arena_headers + i) = headers[i]
+
+    response_slot_set_status(resp, 302)
+    response_slot_set_headers(resp, worker_ptr_to_offset(ctx, arena_headers) as u32, headers_len as u16)
+    response_slot_set_body(resp, 0, 0)
+    response_slot_set_flags(resp, RESP_FLAG_COMPLETE)
+    return 0
+
+
+# Render a styled HTML error page with the given status, title and body
+# message.  Used by POST handlers when validation fails (400) or when a
+# duplicate slug is rejected (409).
+fn send_error_page(ctx: *WorkerContext, resp: *ResponseSlot, status: i32, title: *u8, message: *u8) -> i32
+    var body: [4096]u8
+    var p: i32 = 0
+
+    p = write_html_head(@body[0], p, title)
+    p = write_cstr(@body[0], p, c"<nav class=\"nav\"><a href=\"/\">&larr; Home</a></nav>")
+    p = write_cstr(@body[0], p, c"<h1>")
+    p = write_cstr(@body[0], p, title)
+    p = write_cstr(@body[0], p, c"</h1>")
+    p = write_cstr(@body[0], p, c"<p>")
+    p = write_cstr(@body[0], p, message)
+    p = write_cstr(@body[0], p, c"</p>")
+    p = write_html_footer(@body[0], p)
+
+    var headers: [256]u8
+    let headers_len: i32 = build_headers(@headers[0], status, c"text/html; charset=utf-8", p)
+
+    let arena_headers: *u8 = worker_alloc_response_data(ctx, headers_len as i64)
+    let arena_body: *u8 = worker_alloc_response_data(ctx, p as i64)
+
+    for i in 0..headers_len
+        *(arena_headers + i) = headers[i]
+    for i in 0..p
+        *(arena_body + i) = body[i]
+
+    response_slot_set_status(resp, status)
+    response_slot_set_headers(resp, worker_ptr_to_offset(ctx, arena_headers) as u32, headers_len as u16)
+    response_slot_set_body(resp, worker_ptr_to_offset(ctx, arena_body) as u32, p as u32)
+    response_slot_set_flags(resp, RESP_FLAG_COMPLETE)
+    return 0
+
+
+# POST /wiki - Create a new wiki page from form data.
+#
+# Body shape: application/x-www-form-urlencoded with fields `slug` and
+# `content`.  Both are URL-decoded by parse_form_field.  Slug is then
+# validated against [a-z0-9-]+; content has no character restrictions
+# beyond a length cap.  If a page with the slug already exists we
+# refuse with 409 rather than silently overwriting — use POST
+# /wiki/:slug for explicit updates.  On success we 302-redirect to the
+# new page so the browser ends up on a GET.
+fn handle_wiki_create(ctx: *WorkerContext, req: *RequestSlot, resp: *ResponseSlot) -> i32
+    let body_ptr: *u8 = worker_get_request_body(ctx, req)
+    let body_len: i32 = req.body_len as i32
+
+    if body_len <= 0
+        return send_error_page(ctx, resp, 400, c"Bad Request", c"Empty request body.")
+
+    var slug: [128]u8
+    let slug_len: i32 = parse_form_field(body_ptr, body_len, c"slug", @slug[0], 128)
+    if slug_len < 0
+        return send_error_page(ctx, resp, 400, c"Bad Request", c"Missing 'slug' field.")
+    if validate_slug(@slug[0], slug_len) == 0
+        return send_error_page(ctx, resp, 400, c"Bad Request", c"Slug must be 1-128 chars of [a-z], [0-9], or '-'.")
+
+    var content: [8192]u8
+    let content_len: i32 = parse_form_field(body_ptr, body_len, c"content", @content[0], 8192)
+    if content_len < 0
+        return send_error_page(ctx, resp, 400, c"Bad Request", c"Missing 'content' field.")
+
+    # Reject duplicate slug — caller should POST to /wiki/:slug to update
+    var probe: [8192]u8
+    var probe_len: i32 = 0
+    if wiki_store_get(@slug[0], slug_len, @probe[0], @probe_len) == 1
+        return send_error_page(ctx, resp, 409, c"Slug Already Exists", c"A page with that slug already exists. Edit it from its page, or pick a different slug.")
+
+    let saved: i32 = wiki_store_save(@slug[0], slug_len, @content[0], content_len)
+    if saved == 0
+        return send_error_page(ctx, resp, 500, c"Save Failed", c"Could not persist the new page.")
+
+    # Build redirect URL: /wiki/<slug>
+    var location: [200]u8
+    var lp: i32 = 0
+    lp = write_cstr(@location[0], lp, c"/wiki/")
+    lp = write_bytes(@location[0], lp, @slug[0], slug_len)
+    location[lp] = 0  # null terminate for build_redirect_headers
+    return send_redirect(ctx, resp, @location[0])
+
+
+# POST /wiki/:slug - Update an existing page (also creates if missing).
+#
+# Body shape: same as create but only `content` is read; the slug
+# comes from the URL.  This is the only POST that's idempotent in
+# practice — replaying it overwrites with the same bytes.
+fn handle_wiki_update(ctx: *WorkerContext, req: *RequestSlot, resp: *ResponseSlot) -> i32
+    let path: *u8 = worker_get_request_path(ctx, req)
+    let path_len: i32 = req.path_len as i32
+
+    var slug: [128]u8
+    let slug_len: i32 = extract_slug(path, path_len, @slug[0], 128)
+    if slug_len <= 0
+        return handle_not_found(ctx, req, resp)
+    if validate_slug(@slug[0], slug_len) == 0
+        return send_error_page(ctx, resp, 400, c"Bad Request", c"Slug must be 1-128 chars of [a-z], [0-9], or '-'.")
+
+    let body_ptr: *u8 = worker_get_request_body(ctx, req)
+    let body_len: i32 = req.body_len as i32
+    if body_len <= 0
+        return send_error_page(ctx, resp, 400, c"Bad Request", c"Empty request body.")
+
+    var content: [8192]u8
+    let content_len: i32 = parse_form_field(body_ptr, body_len, c"content", @content[0], 8192)
+    if content_len < 0
+        return send_error_page(ctx, resp, 400, c"Bad Request", c"Missing 'content' field.")
+
+    let saved: i32 = wiki_store_save(@slug[0], slug_len, @content[0], content_len)
+    if saved == 0
+        return send_error_page(ctx, resp, 500, c"Save Failed", c"Could not persist the page.")
+
+    var location: [200]u8
+    var lp: i32 = 0
+    lp = write_cstr(@location[0], lp, c"/wiki/")
+    lp = write_bytes(@location[0], lp, @slug[0], slug_len)
+    location[lp] = 0
+    return send_redirect(ctx, resp, @location[0])
+
+
+# GET /wiki/:slug/edit - Render the edit form pre-populated with the
+# current page content.  404s with a styled page if the slug is not
+# found, mirroring handle_wiki_view's behavior.
+fn handle_wiki_edit_form(ctx: *WorkerContext, req: *RequestSlot, resp: *ResponseSlot) -> i32
+    let path: *u8 = worker_get_request_path(ctx, req)
+    let path_len: i32 = req.path_len as i32
+
+    var slug: [128]u8
+    let slug_len: i32 = extract_slug(path, path_len, @slug[0], 128)
+    if slug_len <= 0
+        return handle_not_found(ctx, req, resp)
+
+    var content: [8192]u8
+    var content_len: i32 = 0
+    let found: i32 = wiki_store_get(@slug[0], slug_len, @content[0], @content_len)
+    if found == 0
+        return handle_not_found(ctx, req, resp)
+
+    var body: [16384]u8
+    var p: i32 = 0
+
+    p = write_html_head(@body[0], p, c"Edit - Nexus Wiki")
+    p = write_cstr(@body[0], p, c"<nav class=\"nav\"><a href=\"/wiki/")
+    p = write_bytes(@body[0], p, @slug[0], slug_len)
+    p = write_cstr(@body[0], p, c"\">&larr; ")
+    p = write_escaped(@body[0], p, @slug[0], slug_len)
+    p = write_cstr(@body[0], p, c"</a></nav>")
+    p = write_cstr(@body[0], p, c"<h1>Edit: ")
+    p = write_escaped(@body[0], p, @slug[0], slug_len)
+    p = write_cstr(@body[0], p, c"</h1>")
+    p = write_cstr(@body[0], p, c"<form method=\"POST\" action=\"/wiki/")
+    p = write_bytes(@body[0], p, @slug[0], slug_len)
+    p = write_cstr(@body[0], p, c"\">")
+    p = write_cstr(@body[0], p, c"<p><label>Content:</label></p>")
+    p = write_cstr(@body[0], p, c"<textarea name=\"content\">")
+    p = write_escaped(@body[0], p, @content[0], content_len)
+    p = write_cstr(@body[0], p, c"</textarea>")
+    p = write_cstr(@body[0], p, c"<p><button type=\"submit\">Save</button></p>")
+    p = write_cstr(@body[0], p, c"</form>")
+    p = write_html_footer(@body[0], p)
+
+    var headers: [256]u8
+    let headers_len: i32 = build_headers(@headers[0], 200, c"text/html; charset=utf-8", p)
+
+    let arena_headers: *u8 = worker_alloc_response_data(ctx, headers_len as i64)
+    let arena_body: *u8 = worker_alloc_response_data(ctx, p as i64)
+
+    for i in 0..headers_len
+        *(arena_headers + i) = headers[i]
+    for i in 0..p
+        *(arena_body + i) = body[i]
+
+    response_slot_set_status(resp, 200)
+    response_slot_set_headers(resp, worker_ptr_to_offset(ctx, arena_headers) as u32, headers_len as u16)
+    response_slot_set_body(resp, worker_ptr_to_offset(ctx, arena_body) as u32, p as u32)
+    response_slot_set_flags(resp, RESP_FLAG_COMPLETE)
+
+    return 0
+
+
+# Detect the trailing "/edit" suffix for a /wiki/:slug/edit GET.  We
+# match exactly five trailing bytes so /wiki/foo-edit-pet still routes
+# to the page view, not the edit form.
+fn path_ends_with_edit(path: *u8, path_len: i32) -> i32
+    if path_len < 11        # /wiki/x/edit minimum
+        return 0
+    let suffix: *u8 = c"/edit"
+    for i in 0..5
+        if *(path + path_len - 5 + i) != *(suffix + i)
+            return 0
+    return 1
+
+
+# ============================================================================
 # Router
 # ============================================================================
 
@@ -571,6 +808,19 @@ fn route_request(ctx: *WorkerContext, req: *RequestSlot, resp: *ResponseSlot) ->
     # GET /wiki/new — must come before /wiki/:slug so "new" isn't treated as a slug
     if method == HTTP_METHOD_GET and path_starts_with(path, path_len, c"/wiki/new") != 0
         return handle_wiki_new(ctx, req, resp)
+
+    # POST /wiki — create a new page from the form on /wiki/new.  Must
+    # be checked before the longer-prefix POST below.
+    if method == HTTP_METHOD_POST and path_len == 5 and path_starts_with(path, path_len, c"/wiki") != 0
+        return handle_wiki_create(ctx, req, resp)
+
+    # POST /wiki/:slug — update an existing page (called by the edit form).
+    if method == HTTP_METHOD_POST and path_starts_with(path, path_len, c"/wiki/") != 0
+        return handle_wiki_update(ctx, req, resp)
+
+    # GET /wiki/:slug/edit — render the edit form, pre-populated.
+    if method == HTTP_METHOD_GET and path_starts_with(path, path_len, c"/wiki/") != 0 and path_ends_with_edit(path, path_len) != 0
+        return handle_wiki_edit_form(ctx, req, resp)
 
     # GET /wiki/:slug — view a wiki page (mausoleum-backed via wiki_store_get)
     if method == HTTP_METHOD_GET and path_starts_with(path, path_len, c"/wiki/") != 0
