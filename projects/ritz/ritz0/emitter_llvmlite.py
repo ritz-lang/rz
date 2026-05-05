@@ -7559,6 +7559,60 @@ class LLVMEmitter:
                 return self.builder.bitcast(result, v4i32)
             return result
 
+        elif fname == 'aeskeygenassist':
+            # aeskeygenassist(key, rcon) -> same type as input (v4i32 or v2i64)
+            # AES key expansion helper.  The second arg is an i8 immediate
+            # (round constant byte) — LLVM declares this with `immarg`, which
+            # the verifier strictly enforces: the value must be a literal
+            # ConstantInt, NOT a runtime instruction (no `trunc`/`zext` allowed
+            # in front of it).  We therefore peek at the AST node directly: if
+            # it's a numeric literal, fold it into a constant i8; anything else
+            # is rejected at compile time with a Ritz-level error rather than
+            # producing IR that LLVM will refuse to assemble.
+            if len(args) != 2:
+                raise ValueError("aeskeygenassist() requires 2 arguments (key, rcon)")
+            key = self._emit_expr(args[0])
+
+            input_type = key.type
+            if input_type == v4i32:
+                key_i64 = self.builder.bitcast(key, v2i64)
+            elif input_type == v2i64:
+                key_i64 = key
+            else:
+                raise ValueError("aeskeygenassist() requires v4i32 or v2i64 first argument")
+
+            # Resolve rcon as a compile-time constant.  We accept any AST form
+            # whose final integer value can be determined statically (a bare
+            # int literal or a const-folded expression).  Use _emit_expr only
+            # to drive constant folding via llvmlite's IR layer, then assert
+            # the result is a ConstantInt.
+            rcon_val = self._emit_expr(args[1])
+            i8 = ir.IntType(8)
+            if isinstance(rcon_val, ir.Constant) and isinstance(rcon_val.type, ir.IntType):
+                rcon_const = ir.Constant(i8, rcon_val.constant & 0xFF)
+            else:
+                # Fall back to checking the AST node directly for a literal int
+                rcon_node = args[1]
+                lit = getattr(rcon_node, "value", None)
+                if isinstance(lit, int):
+                    rcon_const = ir.Constant(i8, lit & 0xFF)
+                else:
+                    raise ValueError(
+                        "aeskeygenassist() second arg (rcon) must be a compile-time integer constant; "
+                        "LLVM's @llvm.x86.aesni.aeskeygenassist requires an i8 immediate."
+                    )
+
+            intrinsic_name = 'llvm.x86.aesni.aeskeygenassist'
+            if intrinsic_name in self.module.globals:
+                intrinsic = self.module.globals[intrinsic_name]
+            else:
+                fnty = ir.FunctionType(v2i64, [v2i64, i8])
+                intrinsic = ir.Function(self.module, fnty, name=intrinsic_name)
+            result = self.builder.call(intrinsic, [key_i64, rcon_const])
+            if input_type == v4i32:
+                return self.builder.bitcast(result, v4i32)
+            return result
+
         # =====================================================================
         # SHA-NI: SHA Extensions for hardware SHA-256 (ritz#119)
         # =====================================================================

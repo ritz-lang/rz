@@ -17,6 +17,7 @@ Usage:
 
 import sys
 import os
+import re
 import subprocess
 import argparse
 import tempfile
@@ -1597,32 +1598,101 @@ def run_tests(pkg_dir: Path, config: dict) -> bool:
     if ritz_tests:
         tests_found = True
         print(f"  🧪 Running {len(ritz_tests)} .ritz test file(s)...")
-        # ritz0 --test compiles a test-harness binary and then EXECUTES it. The
-        # execution CWD matters for integration tests that `fork/exec ./binary`
+        # ritz0 --test compiles a test-harness binary and then EXECUTES it.
+        # We run files ONE AT A TIME rather than passing all files to a single
+        # ritz0 invocation: a single shared 5-minute deadline used to be enough
+        # to kill the whole suite when any one file (e.g. ed25519, p256) was
+        # slow to optimize, AND a single compile-time failure (e.g. an unknown
+        # intrinsic) would terminate the batch before later files could run.
+        # Per-file invocations cost a bit more on Python startup but give
+        # accurate aggregate results and let one bad file fail in isolation.
+        #
+        # Execution CWD matters for integration tests that `fork/exec ./binary`
         # (see tier1/01_hello's test_hello_output). We run from pkg_dir so those
         # relative paths work; imports still resolve via RITZ_PATH (env-based,
         # not CWD-based — see ritz0/import_resolver.py).
         test_env = os.environ.copy()
         test_env["RITZ_PATH"] = str(ROOT)  # needed for ritzlib.* resolution
-        result = subprocess.run(
-            [sys.executable, str(RITZ0), "--test"] + [str(t) for t in ritz_tests],
-            cwd=pkg_dir,
-            env=test_env,
-            capture_output=True, text=True,
-            timeout=300  # 5 minute timeout per test suite
+
+        # Per-file timeout budget. 180s handles even slow elliptic-curve
+        # bigint tests on a debug build; can be tuned via RITZ_TEST_TIMEOUT.
+        per_file_timeout = int(os.environ.get("RITZ_TEST_TIMEOUT", "180"))
+
+        total_passed = 0
+        total_failed = 0
+        failing_files: list[tuple[Path, str]] = []  # (file, reason)
+        timed_out_files: list[Path] = []
+        for tfile in ritz_tests:
+            try:
+                result = subprocess.run(
+                    [sys.executable, str(RITZ0), "--test", str(tfile)],
+                    cwd=pkg_dir,
+                    env=test_env,
+                    capture_output=True, text=True,
+                    timeout=per_file_timeout,
+                )
+            except subprocess.TimeoutExpired:
+                timed_out_files.append(tfile)
+                print(f"    ⏱  {tfile.name} — TIMEOUT after {per_file_timeout}s")
+                all_passed = False
+                continue
+
+            # Parse "N passed, M failed" from stdout (last matching line).
+            file_passed = 0
+            file_failed = 0
+            summary_seen = False
+            for line in result.stdout.splitlines():
+                m = re.search(r"(\d+) passed, (\d+) failed", line)
+                if m:
+                    file_passed = int(m.group(1))
+                    file_failed = int(m.group(2))
+                    summary_seen = True
+
+            if result.returncode != 0 or not summary_seen:
+                # Compile / link / runtime failure before harness summary
+                err_blob = (result.stderr or "") + (result.stdout or "")
+                # Try to surface the most actionable line
+                err_first = ""
+                for line in err_blob.splitlines():
+                    if any(tag in line for tag in (
+                        "Cannot select", "fatal error", "error:", "ValueError:",
+                        "Unknown function", "Illegal instruction", "Segmentation fault",
+                    )):
+                        err_first = line.strip()
+                        break
+                if not err_first:
+                    err_first = err_blob.strip().splitlines()[-1] if err_blob.strip() else "(no output)"
+                failing_files.append((tfile, err_first[:160]))
+                print(f"    ✗ {tfile.name} — {err_first[:120]}")
+                all_passed = False
+                continue
+
+            total_passed += file_passed
+            total_failed += file_failed
+            if file_failed > 0:
+                # Compiled and ran but some assertions failed
+                # Print the failure details from stdout
+                print(f"    ✗ {tfile.name} — {file_passed} passed, {file_failed} failed")
+                # Surface the failing harness messages (everything between the last
+                # "FAIL" or assertion line and the summary).
+                for line in result.stdout.splitlines():
+                    if "FAIL" in line or "assertion" in line.lower():
+                        print(f"        {line}")
+                all_passed = False
+            else:
+                print(f"    ✓ {tfile.name} — {file_passed} passed")
+
+        # Aggregate summary
+        n_compile_failures = len(failing_files)
+        n_timeouts = len(timed_out_files)
+        n_runtime_failures = max(0, total_failed)
+        print(
+            f"  Σ {total_passed} passed, "
+            f"{n_runtime_failures} failed, "
+            f"{n_compile_failures} compile-failed, "
+            f"{n_timeouts} timed-out "
+            f"(out of {len(ritz_tests)} files)"
         )
-        if result.returncode == 0:
-            # Extract summary from output
-            lines = result.stdout.strip().split('\n')
-            if lines:
-                print(f"    {lines[-1]}")
-        else:
-            print(f"  ✗ .ritz tests failed:")
-            if result.stdout:
-                print(result.stdout)
-            if result.stderr:
-                print(result.stderr)
-            all_passed = False
 
     # Run test.sh if it exists
     test_script = pkg_dir / "test.sh"

@@ -498,8 +498,17 @@ fn main() -> i32
             ll_files.append(ll_path)
 
     # Link all .ll files with clang
+    # -march=native enables host CPU features (AES-NI, AVX2, etc.).  -msha is
+    # added unconditionally because cryptosec's sha256.ritz defines a
+    # sha256_transform_ni function whose body emits SHA-NI intrinsics
+    # (sha256rnds2/msg1/msg2).  Even when the public API never calls it (it
+    # currently doesn't), LLVM's instruction selector still has to lower the
+    # function body and aborts with "Cannot select intrinsic" without +sha.
+    # On a host without SHA-NI silicon the binary will SIGILL only if the
+    # function is actually called — pure-soft callers are safe.  This mirrors
+    # the flag set used by build.py's link path.
     exe_path = os.path.join(tmpdir, "test")
-    clang_cmd = ["clang"] + ll_files + ["-o", exe_path, "-nostdlib", "-no-pie", "-g", "-march=native"]
+    clang_cmd = ["clang"] + ll_files + ["-o", exe_path, "-nostdlib", "-no-pie", "-g", "-march=native", "-msha"]
     result = subprocess.run(clang_cmd, capture_output=True, text=True)
     if result.returncode != 0:
         return None, f"clang failed: {result.stderr}"
@@ -824,7 +833,10 @@ def run_batch_tests(
             print(f"Linking {len(ll_files)} object files...")
 
         exe_path = os.path.join(tmpdir, "test_runner")
-        clang_cmd = ["clang"] + ll_files + ["-o", exe_path, "-nostdlib", "-no-pie", "-g", "-march=native"]
+        # See note above clang invocation in the per-file path: -msha is
+        # required even for callers that never invoke SHA-NI, because
+        # cryptosec/sha256.ritz defines sha256_transform_ni() unconditionally.
+        clang_cmd = ["clang"] + ll_files + ["-o", exe_path, "-nostdlib", "-no-pie", "-g", "-march=native", "-msha"]
         result = subprocess.run(clang_cmd, capture_output=True, text=True)
         if result.returncode != 0:
             print(f"Error linking: {result.stderr}", file=sys.stderr)
