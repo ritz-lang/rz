@@ -1042,10 +1042,78 @@ fn handle_task_event_encrypted(task: *Task) -> i32
         return -1
 
     # ─── SENDING completed (encrypted reply delivered): keep-alive ───
+    #
+    # Multi-frame responses (SCAN) need to keep emitting frames until the
+    # iter is drained AND the trailing SCAN_END is sent.  Mirrors the
+    # plain-path PARSE_SENDING continuation at the top of handle_task_event,
+    # but every outbound frame goes through cipher_encrypt_msg before
+    # task_submit_send (the client side is symmetric — channel_recv reads
+    # one encrypted frame per call, channel_send wraps one plaintext
+    # message per call, so frame ↔ message is 1:1 in both directions).
     if session.parse_state == PARSE_SENDING
         if task.io_result < 0
             m7sp_session_destroy(idx)
             return 1
+
+        # ─── Encrypted SCAN continuations (parity with plain handler) ───
+        if session.scan_active == 1
+            # Build the next SCAN_RESULT batch into a stack plaintext
+            # buffer, encrypt into task.write_buf, submit_send.  If this
+            # batch drained the iter, transition to scan_active=2 so the
+            # *next* CQE emits SCAN_END.
+            var pt1: [8192]u8
+            var resp1: MessageBuffer
+            msgbuf_init(@resp1, @pt1[0], 8192 - ENC_LEN_PREFIX_SIZE - ENC_NONCE_SIZE - ENC_TAG_SIZE)
+            let last1: i32 = m7sp_scan_build_batch(@resp1, session)
+            if last1 != 0
+                session.scan_active = 2
+            let pt1_len: i32 = msgbuf_len(@resp1)
+            let wire1: i32 = cipher_encrypt_msg(session, @pt1[0], pt1_len, @task.write_buf[0], TASK_BUFFER_SIZE)
+            if wire1 < 0
+                m7sp_session_destroy(idx)
+                return 1
+            let pool1: *TaskPool = task.user_data as *TaskPool
+            let send_ret1: i32 = task_submit_send(pool1, task, wire1)
+            if send_ret1 < 0
+                m7sp_session_destroy(idx)
+                return 1
+            return -1
+
+        if session.scan_active == 2
+            # Final SCAN_RESULT (has_more=0) has been delivered; emit the
+            # trailing SCAN_END terminator.  Tiny message — header only.
+            var pt2: [256]u8
+            var resp2: MessageBuffer
+            msgbuf_init(@resp2, @pt2[0], 256)
+            build_scan_end(@resp2, session.scan_request_id)
+            session.scan_active = 3
+            let pt2_len: i32 = msgbuf_len(@resp2)
+            let wire2: i32 = cipher_encrypt_msg(session, @pt2[0], pt2_len, @task.write_buf[0], TASK_BUFFER_SIZE)
+            if wire2 < 0
+                m7sp_session_destroy(idx)
+                return 1
+            let pool2: *TaskPool = task.user_data as *TaskPool
+            let send_ret2: i32 = task_submit_send(pool2, task, wire2)
+            if send_ret2 < 0
+                m7sp_session_destroy(idx)
+                return 1
+            return -1
+
+        if session.scan_active == 3
+            # SCAN_END acknowledged — tear down the iter and reset for the
+            # next request on this keep-alive connection.
+            prints("  [async/enc] SCAN done - emitted ")
+            print_int(session.scan_total_emitted as i64)
+            prints(" doc(s)\n")
+            if session.scan_iter != 0
+                btree_iter_destroy(session.scan_iter as *BTreeIter)
+                session.scan_iter = 0
+            session.scan_active = 0
+            session.scan_request_id = 0
+            session.scan_max_results = 0
+            session.scan_total_emitted = 0
+            # Fall through to the recv reset below.
+
         session.parse_state = PARSE_NEED_HEADER
         session.have = 0
         session.msg_len = 0

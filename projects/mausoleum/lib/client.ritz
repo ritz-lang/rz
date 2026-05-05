@@ -9,6 +9,9 @@ import ritzlib.memory
 import ritzlib.net
 
 import mausoleum.protocol
+import mausoleum.encrypted_channel { EncryptedChannel }
+import mausoleum.encrypted_channel { channel_init_client, channel_handshake_client }
+import mausoleum.encrypted_channel { channel_send, channel_recv, channel_free }
 
 # ============================================================================
 # Client Constants
@@ -21,15 +24,26 @@ const CLIENT_BUFFER_SIZE: i32 = 65536  # 64 KB buffer
 # ============================================================================
 
 struct Client
-    sock: Socket              # TCP socket
+    sock: Socket              # TCP socket (used directly only when encrypted == 0;
+                              # in encrypted mode the channel owns its own copy of
+                              # the same fd, see client_connect_encrypted)
     connected: i32            # Connection state (1 = connected)
     session_id: i64           # Server-assigned session ID
     next_request_id: i32      # Next request ID
     send_buf: *MessageBuffer  # Send buffer
     recv_buf: *u8             # Receive buffer
-    recv_len: i32             # Bytes in receive buffer
+    recv_len: i32             # Bytes in receive buffer (plaintext path only)
     last_error: i32           # Last error code
     txn_active: i32           # Transaction active flag
+
+    # Encryption state.  When `encrypted == 1`, send_message/recv_message
+    # route through `channel` (X25519 + ChaCha20-Poly1305 framing).  In
+    # plaintext mode the EncryptedChannel struct exists in memory but is
+    # never touched.  `client_connect_encrypted` sets the flag and
+    # initializes the channel; `client_connect` (plaintext) leaves them
+    # untouched.
+    encrypted: i32
+    channel: EncryptedChannel
 
 # ============================================================================
 # Internal helpers
@@ -78,15 +92,35 @@ pub fn client_new() -> *Client
     client.last_error = PROTO_OK
     client.txn_active = 0
 
+    # Encryption defaults to off.  client_connect leaves it that way;
+    # client_connect_encrypted flips the flag after a successful X25519
+    # handshake.  We DON'T zero the EncryptedChannel here — channel_init_*
+    # populates every field on entry, so the previous bytes don't matter.
+    client.encrypted = 0
+
     return client
 
-# Free client resources
+# Free client resources.  client_disconnect already tears down the
+# encrypted channel + socket on its way out (so a connected client gets
+# clean shutdown).  This function additionally handles two edge cases:
+# (1) caller created a client but never connected — channel is still
+# uninitialized, nothing to free; (2) caller called client_connect_
+# encrypted but the handshake failed mid-way — the channel may be
+# partially initialized (recv_buf allocated, keys generated) without
+# `connected` ever flipping to 1, so we need to release the channel's
+# heap allocation.  In that path channel_init_client always cleared
+# client.sock.fd to -1 on failure so socket_close is a no-op.
 pub fn client_free(client: *Client)
     if client == null
         return
 
     if client.connected != 0
         client_disconnect(client)
+    else if client.encrypted != 0
+        # Failed handshake left a half-initialized channel — free it so
+        # the recv buffer doesn't leak.
+        channel_free(@client.channel)
+        client.encrypted = 0
 
     if client.send_buf != null
         msgbuf_free(client.send_buf)
@@ -185,6 +219,116 @@ pub fn client_connect(client: *Client, host: *u8, port: i32, collection: *u8, co
     socket_set_io_timeout(@client.sock, 0)
     return 0
 
+# Connect to an encrypted server.  Mirrors client_connect except for the
+# X25519 + ChaCha20-Poly1305 handshake before the protocol-level CONNECT.
+#
+# Wire-level sequence on a successful encrypted connect:
+#
+#   1. TCP SYN/SYN-ACK/ACK                          (socket_connect_timeout)
+#   2. Client → Server: 32-byte X25519 public key   (channel_handshake_client)
+#   3. Server → Client: 32-byte X25519 public key   (channel_handshake_client)
+#   4. Both derive HKDF(send/recv) keys             (derive_keys, internal)
+#   5. Client → Server: encrypted CONNECT(collection)
+#   6. Server → Client: encrypted CONNECTED(session_id)
+#
+# Steps 5/6 use channel_send / channel_recv (which add the [4 BE len][12
+# nonce][ct][16 tag] framing), but build_connect / msgreader_init operate
+# on the plaintext payload — exactly the same shape the plain client uses.
+# So the protocol layer is identical; only the framing differs.
+pub fn client_connect_encrypted(client: *Client, host: *u8, port: i32, collection: *u8, collection_len: i32) -> i32
+    if client == null
+        return -1
+    if client.connected != 0
+        return -2  # Already connected
+
+    # Create socket
+    client.sock = socket_tcp()
+    if client.sock.fd < 0
+        client.last_error = PROTO_ERR_DISCONNECTED
+        return -3
+
+    socket_set_nodelay(@client.sock)
+
+    let result: i32 = socket_connect_timeout(@client.sock, host, port, DEFAULT_CONNECT_TIMEOUT_MS)
+    if result < 0
+        socket_close(@client.sock)
+        client.sock.fd = -1
+        client.last_error = PROTO_ERR_DISCONNECTED
+        return -4
+
+    socket_set_io_timeout(@client.sock, DEFAULT_CONNECT_TIMEOUT_MS)
+
+    # Initialize the encrypted channel.  channel_init_client allocates a
+    # 64K recv buffer and generates an ephemeral X25519 keypair.  We pass
+    # the socket by value — the channel makes its own copy of the fd, but
+    # we keep `client.sock` as the canonical record and only ever close
+    # the fd once (in client_free / client_disconnect).
+    if channel_init_client(@client.channel, client.sock) < 0
+        socket_close(@client.sock)
+        client.sock.fd = -1
+        client.last_error = PROTO_ERR_DISCONNECTED
+        return -5
+
+    # Perform handshake: send our pubkey, receive server's, derive keys.
+    if channel_handshake_client(@client.channel) < 0
+        # channel_free closes the socket — we set client.sock.fd = -1 to
+        # avoid a double-close in client_free.
+        channel_free(@client.channel)
+        client.sock.fd = -1
+        client.last_error = PROTO_ERR_DISCONNECTED
+        return -6
+
+    # Mark encrypted BEFORE the CONNECT roundtrip so send_message /
+    # recv_message route through the channel.
+    client.encrypted = 1
+
+    # Send protocol-level CONNECT (encrypted via channel_send)
+    let req_id: i32 = client.next_request_id
+    client.next_request_id += 1
+    build_connect(client.send_buf, req_id, collection, collection_len)
+
+    if send_message(client) < 0
+        client.encrypted = 0
+        channel_free(@client.channel)
+        client.sock.fd = -1
+        client.last_error = PROTO_ERR_DISCONNECTED
+        return -7
+
+    # Receive CONNECTED (or ERROR) — encrypted, so recv_message reads one
+    # full plaintext message from channel_recv and hands it to msgreader.
+    var reader: MessageReader
+    if recv_message(client, @reader) < 0
+        client.encrypted = 0
+        channel_free(@client.channel)
+        client.sock.fd = -1
+        client.last_error = PROTO_ERR_DISCONNECTED
+        return -8
+
+    let msg_type: i32 = msgreader_msg_type(@reader)
+    if msg_type == MSG_ERROR
+        let error_code: i32 = msgreader_read_i32(@reader)
+        client.last_error = error_code
+        client.encrypted = 0
+        channel_free(@client.channel)
+        client.sock.fd = -1
+        return -9
+
+    if msg_type != MSG_CONNECTED
+        client.last_error = PROTO_ERR_PROTOCOL
+        client.encrypted = 0
+        channel_free(@client.channel)
+        client.sock.fd = -1
+        return -10
+
+    client.session_id = msgreader_read_i64(@reader)
+    client.connected = 1
+    client.last_error = PROTO_OK
+    # Drop the connect-bound IO timeout for steady-state ops.  Note that
+    # socket_set_io_timeout works on the original fd; the channel's
+    # internal `ch.sock` shares it, so this lifts the timeout for both.
+    socket_set_io_timeout(@client.sock, 0)
+    return 0
+
 # Disconnect from server
 pub fn client_disconnect(client: *Client) -> i32
     if client == null
@@ -192,16 +336,28 @@ pub fn client_disconnect(client: *Client) -> i32
     if client.connected == 0
         return 0  # Already disconnected
 
-    # Send DISCONNECT message (best effort)
+    # Send DISCONNECT message (best effort).  In encrypted mode this
+    # routes through channel_send so the server sees a properly-framed
+    # encrypted DISCONNECT rather than plaintext bytes that would look
+    # like garbage and trigger a protocol-error close.
     let req_id: i32 = client.next_request_id
     client.next_request_id += 1
     msgbuf_start(client.send_buf, MSG_DISCONNECT, req_id)
     msgbuf_finish(client.send_buf)
     send_message(client)
 
-    # Close socket
-    socket_close(@client.sock)
-    client.sock.fd = -1
+    # Tear down channel + socket.  In encrypted mode, channel_free zeroes
+    # the keys and closes the (channel-owned) socket; we then mark
+    # client.sock.fd = -1 to keep client_free from trying to close it
+    # again.  In plaintext mode we close client.sock directly.
+    if client.encrypted != 0
+        channel_free(@client.channel)
+        client.sock.fd = -1
+        client.encrypted = 0
+    else
+        socket_close(@client.sock)
+        client.sock.fd = -1
+
     client.connected = 0
     client.session_id = 0
     client.txn_active = 0
@@ -230,10 +386,20 @@ pub fn client_last_error(client: *Client) -> i32
 # Internal helpers
 # ============================================================================
 
-# Send the message in send_buf
+# Send the message in send_buf.  Routes through the encrypted channel
+# when client.encrypted == 1; otherwise raw socket_send loop.
 fn send_message(client: *Client) -> i32
     let len: i32 = msgbuf_len(client.send_buf)
     var data: *u8 = msgbuf_data(client.send_buf)
+
+    if client.encrypted != 0
+        # channel_send handles framing ([4 BE len][12 nonce][ct][16 tag])
+        # and the actual socket_send loop internally; returns the number
+        # of plaintext bytes sent on success or a negative CHANNEL_ERR_*.
+        let n: i32 = channel_send(@client.channel, data, len)
+        if n != len
+            return -1
+        return 0
 
     var sent: i32 = 0
     while sent < len
@@ -244,8 +410,44 @@ fn send_message(client: *Client) -> i32
 
     return 0
 
-# Receive a complete message into reader
+# Receive a complete message into reader.  In encrypted mode, channel_recv
+# returns one decrypted protocol message in a single call (it reads its
+# own length prefix + nonce + ct + tag from the wire, decrypts, and
+# delivers the plaintext payload).  Plaintext mode keeps the original
+# two-step header-then-body recv with leftover-byte buffering for stream
+# decoupling.
 fn recv_message(client: *Client, reader: *MessageReader) -> i32
+    if client.encrypted != 0
+        # One encrypted frame == exactly one protocol message — channel_send
+        # always emits a single frame per send_message call, so we never
+        # get partial-message stitching here.  The plaintext (decrypted)
+        # bytes land in client.recv_buf and are then handed to msgreader.
+        let n: i32 = channel_recv(@client.channel, client.recv_buf, CLIENT_BUFFER_SIZE)
+        if n <= 0
+            return -1
+        if n < PROTO_HEADER_SIZE or n > PROTO_MAX_MESSAGE_SIZE
+            return -2
+
+        # Sanity-check that the header's encoded message length matches
+        # the frame plaintext length.  Catches a misframed peer / bug
+        # at the wire layer rather than letting it propagate as a
+        # parser failure further in.
+        var ptr: *u8 = client.recv_buf
+        var msg_len: i32 = (*(ptr + 4) as i32) << 24
+        msg_len = msg_len | ((*(ptr + 5) as i32) << 16)
+        msg_len = msg_len | ((*(ptr + 6) as i32) << 8)
+        msg_len = msg_len | (*(ptr + 7) as i32)
+        if msg_len != n
+            return -3
+
+        let result: i32 = msgreader_init(reader, client.recv_buf, n)
+        if result != PROTO_OK
+            return -4
+
+        # Encrypted frames do not produce leftover bytes; no buffer shift.
+        client.recv_len = 0
+        return 0
+
     # First receive the header
     while client.recv_len < PROTO_HEADER_SIZE
         let remain: i64 = (CLIENT_BUFFER_SIZE - client.recv_len) as i64

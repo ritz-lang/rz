@@ -36,7 +36,7 @@ import ritzlib.io
 import ritzlib.strview { StrView, strview_from_ptr }
 
 import mausoleum.client { Client, client_new, client_free }
-import mausoleum.client { client_connect, client_disconnect, client_is_connected }
+import mausoleum.client { client_connect, client_connect_encrypted, client_disconnect, client_is_connected }
 import mausoleum.client { client_insert, client_get, client_delete, client_scan }
 import mausoleum.protocol { MSG_SCAN_RESULT }
 import mausoleum.m7m_types { ERR_OK }
@@ -60,12 +60,21 @@ pub struct Db
     port: i32
     collection: [64]u8
     collection_len: i32
+    encrypted: i32        # 0 = plaintext (legacy / dev-only), 1 = encrypted
+                          # (X25519 + ChaCha20-Poly1305).  Defaults to 1 in
+                          # db_init so callers get encryption transparently;
+                          # use db_set_encryption(@db, 0) to override for a
+                          # mausoleum running with --no-encryption.
 
 # Initialize a database connection
 pub fn db_init(db: *Db, host: *u8, host_len: i32, port: i32, collection: *u8, collection_len: i32) -> i32
     db.client = null
     db.connected = 0
     db.port = port
+    # Default to encrypted — matches mausoleum's default serve mode.
+    # `wiki_store_init` (and equivalent callers) can flip this with
+    # db_set_encryption before db_connect if they need plaintext.
+    db.encrypted = 1
 
     # Copy host
     if host_len > 63
@@ -87,7 +96,15 @@ pub fn db_init(db: *Db, host: *u8, host_len: i32, port: i32, collection: *u8, co
 
     return 0
 
-# Connect to the database
+# Toggle encrypted vs plaintext transport.  Must be called before
+# db_connect — flipping this on a connected client is a no-op (the
+# handshake is already done one way or the other).
+pub fn db_set_encryption(db: *Db, enabled: i32)
+    db.encrypted = enabled
+
+# Connect to the database.  Routes through client_connect_encrypted
+# (X25519 + ChaCha20-Poly1305) when db.encrypted != 0; otherwise the
+# legacy plaintext path.  Default for newly-init'd Db is encrypted.
 pub fn db_connect(db: *Db) -> i32
     if db.connected != 0
         return 0  # Already connected
@@ -96,7 +113,12 @@ pub fn db_connect(db: *Db) -> i32
     if db.client == null
         return -1
 
-    let result: i32 = client_connect(db.client, @db.host[0], db.port, @db.collection[0], db.collection_len)
+    var result: i32 = 0
+    if db.encrypted != 0
+        result = client_connect_encrypted(db.client, @db.host[0], db.port, @db.collection[0], db.collection_len)
+    else
+        result = client_connect(db.client, @db.host[0], db.port, @db.collection[0], db.collection_len)
+
     if result < 0
         client_free(db.client)
         db.client = null
