@@ -1,8 +1,13 @@
 # V1 ABI / Idiom Cleanup
 
-**Status:** Design doc. Argue with this. Implementation starts when consensus exists.
-**Driver:** AGAST task `v1-abi-cleanup` (filed alongside this doc).
-**Estimated scope:** 3–5 days of focused work, stageable.
+**Status:** Decisions locked in 2026-05-06. Implementation in progress on
+worktree `adele-ritz-task-198`.
+**Driver:** AGAST `#198` (with phase subtasks).
+**Estimated scope:** ~5 days of focused work, hard cutover, single branch.
+
+**Sexiness lens:** every decision below was made through "no syntax for the
+common case." `pub fn main()` is the most-written program in any language;
+`println("hi")` is the most-written line. Both must be free of ceremony.
 
 ## The problem
 
@@ -28,17 +33,26 @@ boundary between the program and the rest of the world?**
 
 ## Goals
 
-- Single canonical entry signature: `pub fn main(args: Span<StrView>, env: Span<StrView>) -> i32`
+- Three accepted entry signatures, default zero-ceremony:
+  - `pub fn main() -> i32` — most code (the `hello world` shape)
+  - `pub fn main(args: Span<StrView>) -> i32` — when args are needed
+  - `pub fn main(args: Span<StrView>, env: Span<StrView>) -> i32` — rare
+- Optional return type — `pub fn main()` (no `-> i32`) implicitly returns 0
 - All argv/envp pre-measured into typed Ritz values; no `**u8` in user space
+- Env access via free functions in `ritzlib.os.env` (`env.get`, `env.get_or`,
+  `env.iter`) for the 99% case where you look up keys, not iterate them
 - Runtime path written in Ritz except for ~10 lines of `_start` asm that's
   forced by the kernel ABI
 - Interpolation (`{var}`, `{expr}`, `{x:08x}`) is the **canonical** print API
 - Trait-based output: `pub trait Display`, with standard impls in ritzlib and a
   trait-extension hook so user types opt in
+- Format specifiers (`x`, `X`, `b`, `o`, width, alignment, `?`) shipped in v1
 - `Writer` abstraction so prints can target stdout / stderr / a String / a
   `Span<u8>` / a socket uniformly
-- The chained `prints_cstr` / `print_int` style is removed (or kept as
-  one-release deprecated wrappers that call into the trait)
+- `print` / `println` / `eprint` / `eprintln` implicitly target stdout/stderr;
+  `write` / `writeln` / `format` take an explicit writer
+- Hard cutover: chained `prints_cstr` / `print_int` style and legacy main
+  signatures removed in the same branch — no deprecation window
 - All 17 binaries in the workspace migrated; ritzlib code itself migrated
 
 ## Non-goals
@@ -51,22 +65,57 @@ boundary between the program and the rest of the world?**
 
 ## New entry-point ABI
 
-### Signature
+### Signatures (three accepted; compiler picks the right adapter)
 
 ```ritz
-# ritzlib.entry — single canonical signature
-pub fn main(args: Span<StrView>, env: Span<StrView>) -> i32
-    if args.len > 0
-        println("Program: {args[0]}")
-    if args.len < 2
-        eprintln("usage: {args[0]} <command> [args...]")
-        return 1
+# Default — the "hello world" shape
+pub fn main() -> i32
+    println("hello world")
+    0
 
+# Implicit return 0 — optional `-> i32` for the common case
+pub fn main()
+    println("hello world")
+
+# When you need args
+pub fn main(args: Span<StrView>) -> i32
+    if args.len < 2
+        eprintln("usage: {args[0]} <command>")
+        return 1
     let cmd: StrView = args[1]
-    if cmd == "build"
-        return cmd_build(args.slice(2))
     ...
+
+# When you need env at startup (rare — most code uses env.get(name))
+pub fn main(args: Span<StrView>, env: Span<StrView>) -> i32
+    for var in env_iter(env)
+        println("{var.key}={var.value}")
+    0
 ```
+
+The compiler matches the user's `main` by arity (0, 1, 2) and arg shape
+(`Span<StrView>`). Three signatures, one runtime entry, one adapter generated
+at compile time per binary.
+
+### Env API for the 99% case
+
+Most code looks up keys, doesn't iterate. Free functions in `ritzlib.os.env`
+read `/proc/self/environ` lazily on first call:
+
+```ritz
+import ritzlib.os.env
+
+# Most common patterns
+let port = env.get_or("PORT", "8080")        # StrView
+let debug = env.get("DEBUG")                  # Option<StrView>
+let home = env.must("HOME")                   # StrView, exits 1 if missing
+
+# Rare path — full iteration
+for var in env.iter()
+    println("{var.key}={var.value}")
+```
+
+This means `pub fn main()` and `pub fn main(args)` programs can still read env;
+they just don't have to declare interest in it at the entry point.
 
 ### Runtime layering
 
@@ -93,25 +142,40 @@ The three existing .ll shims (`ritz_start.x86_64.ll`,
 
 ### Compiler enforcement
 
-- The compiler recognizes `pub fn main(args: Span<StrView>, env: Span<StrView>) -> i32`
-  as the canonical entry shape.
+- The compiler recognizes the three accepted shapes by arity and arg type;
+  anything else under the name `main` is a compile error with a friendly
+  hint pointing at the canonical signatures.
+- `pub fn main` (no return type) is treated as `-> i32`, with `0` returned
+  implicitly when the body falls through.
 - A program without `pub fn main` is a link error (`error: no public main`).
 - `fn main` (without `pub`) is a compile error: `error: main must be declared
-  pub` — addresses the consistency issue you spotted in rzrz.
-- The 5 legacy signatures (`()`, `(argc, argv)`, `(argc, argv, envp)`, with and
-  without `pub`) are accepted for one release with a deprecation warning, then
-  removed. During the deprecation window the compiler synthesizes an adapter
-  that calls the legacy main from the new ABI.
+  pub` — addresses the consistency issue spotted in rzrz.
+- **No deprecation window.** Legacy `main(argc: i32, argv: **u8, ...)`
+  signatures are rejected in the same branch that lands the new ABI.
+  Workspace migration happens in the same commit-set.
 
 ### Helpers
 
 ```ritz
-# ritzlib.entry — argv/envp helpers
+# ritzlib.entry — argv helpers
 pub fn args_program_name(args: Span<StrView>) -> StrView
 pub fn args_skip(args: Span<StrView>, n: i32) -> Span<StrView>
+
+# ritzlib.os.env — implicit env access (no Span<StrView> required)
+pub fn get(name: StrView) -> Option<StrView>
+pub fn get_or(name: StrView, default: StrView) -> StrView
+pub fn must(name: StrView) -> StrView   # missing → exits 1 with friendly error
+pub fn iter() -> EnvIter
+
+# When the user's main DID take env, they can also pass it explicitly:
 pub fn env_get(env: Span<StrView>, name: StrView) -> Option<StrView>
-pub fn env_iter(env: Span<StrView>) -> EnvIter   # yields (name, value) pairs
+pub fn env_iter(env: Span<StrView>) -> EnvIter
 ```
+
+`ritzlib.os.env` reads `/proc/self/environ` lazily on first call and caches
+the parsed `Span<StrView>`. The compiler ensures even a `pub fn main()`
+binary still links the env-reading code path *only* when something in the
+program references `ritzlib.os.env` — pay-for-what-you-use.
 
 ## Output: Display, Writer, interpolation
 
@@ -196,34 +260,47 @@ def _emit_interp_string_print(self, expr):
 Type without a `Display` impl → compile error: `type Foo doesn't implement
 Display; add 'impl Display for Foo'`. No more silent garbage prints.
 
-### Format specifiers (lexer + emitter)
+### Format specifiers (in scope for v1)
 
-Phase 6 work. Current `{x}` becomes `{x[:spec]}`:
+Current `{x}` becomes `{x[:spec]}`. **Shipped in v1**, scoped to the small
+useful set:
+
+| Spec | Use | Example |
+|---|---|---|
+| `{x:x}` / `{x:X}` | hex (lower/upper) | `{addr:x}` → `7ffe9a3c1234` |
+| `{x:08x}` | zero-padded hex of width 8 | `{err:08x}` → `0000002a` |
+| `{x:b}` | binary | `{flags:b}` → `1011010` |
+| `{x:o}` | octal | `{mode:o}` → `755` |
+| `{s:<20}` | left-justified width 20 | `{name:<20}` |
+| `{s:>20}` | right-justified width 20 | `{count:>4}` |
+| `{s:^20}` | center width 20 | `{title:^40}` |
+| `{p:?}` | Debug-trait formatting | `Point { x: 1, y: 2 }` |
+
+Out for v1.1+: float specs (no floats yet), locale, fill-char customization
+(`{x:*<8}`), `{:#?}` pretty-print, precision (`.3`).
+
+Lexer parses `:spec` as part of the interp token. Emitter passes `spec` as a
+compile-time `StrView` constant to `Display::show_with(self, w, spec)` (a
+default-method on `Display` that delegates to `show` when `spec.len == 0`).
+Common impls (`i64`, hex, padding) honor it; user types can ignore it.
+
+`{p:?}` resolves to `Debug::show(p, w)` instead of `Display::show`. Both
+traits coexist; a type can implement either or both. Default `Debug` for
+structs is auto-derived (struct-name + braces + field-name=value pairs) when
+no explicit impl is present.
+
+### `print` / `println` / `eprint` / `eprintln` (implicit sinks)
+
+Implicit stdout/stderr — Rust-style. The common case is zero ceremony.
 
 ```ritz
-println("hex: {x:08x}")           # zero-padded width 8 hex
-println("name: {name:<20}")       # left-justified width 20
-println("debug: {p:?}")           # uses Debug instead of Display
-println("escaped: {s:?}")         # debug-format the string (with quotes/escapes)
-```
+# All in ritzlib.fmt — implicit sink, no writer argument
+pub fn print(s: StrView)            # → stdout
+pub fn println(s: StrView)          # → stdout + newline
+pub fn eprint(s: StrView)           # → stderr
+pub fn eprintln(s: StrView)         # → stderr + newline
 
-Lexer parses `:spec` as part of the interp token. Emitter passes `spec` to
-`Display::show_with(self, w, spec)` (a default-method on the trait that ignores
-the spec unless the impl chooses to honor it). Common impls (i64, hex, padding)
-honor it; user types can ignore it.
-
-### `print` / `println` / `eprint` / `eprintln`
-
-Replaced by a single set:
-
-```ritz
-# All in ritzlib.fmt
-pub fn print(s: StrView)            # always interpolation-aware via emitter
-pub fn println(s: StrView)
-pub fn eprint(s: StrView)
-pub fn eprintln(s: StrView)
-
-# Targeted at a specific writer
+# Explicit writer ONLY when targeting something other than stdout/stderr
 pub fn write(w: *Writer, s: StrView) -> i32
 pub fn writeln(w: *Writer, s: StrView) -> i32
 
@@ -231,128 +308,145 @@ pub fn writeln(w: *Writer, s: StrView) -> i32
 pub fn format(s: StrView) -> String
 ```
 
-The interpolation is purely a lexer/emitter feature; the `print` / `println`
-are normal functions that *receive* the already-formatted `StrView`. The magic
-happens at compile time: `println("hello {name}")` lowers to a sequence of
-`write_str` / `Display::show` calls into stdout's writer.
+Interpolation is a lexer/emitter feature. `println("hello {name}")` lowers at
+compile time to a sequence of `write_str` / `Display::show` calls against
+stdout's writer. There is no runtime `printf`-style format-string parsing —
+the spec is statically known, errors are caught at compile time, and there's
+zero allocation in the hot path.
 
-## Migration plan
+**Rationale for implicit sinks:** Zig's `try stdout.print("...", .{})` is
+honest but the verbosity actively hurts readability. Rust's `println!("...")`
+is the right shape for the common case — and Ritz's existing API is already
+implicit-stdout, so this is the path of least surprise. Custom-writer code
+gets `write(@w, "...")`, which is still clean.
+
+## Migration plan — hard cutover, single branch
+
+All phases land in one worktree (`adele-ritz-task-198`), squash-merged or
+landed as a small ordered commit-set. **No deprecation window**, no
+intermediate-state main. The branch is broken until phase 4 is complete; that
+is fine because nobody else is committing to it.
 
 ### Phase 1 — runtime + ABI (1.5 days)
 
-1. Add `ritzlib/runtime/start.x86_64.S` (one canonical _start, replaces the
+1. Add `ritzlib/runtime/start.x86_64.S` (one canonical `_start`, replaces the
    three .ll shims).
 2. Add `ritzlib/entry/mod.ritz` with `ritz_start(argc, argv, envp)` that builds
    `Span<StrView>` and calls `main`.
-3. Compiler change: when the user's `pub fn main` matches the new shape, link
-   the new entry. When it matches a legacy shape, link the new entry **plus** a
-   synthesized adapter that converts back to the legacy signature; emit a
-   deprecation warning.
-4. Compile error for `fn main` (not pub).
-5. Build the workspace; expect zero migrations needed at this phase. Old
-   binaries link the same as before, just with one new warning.
+3. Compiler: recognize the three accepted main signatures (arity 0, 1, 2);
+   reject anything else; reject non-`pub` main; treat missing return-type as
+   `-> i32` with implicit 0.
+4. Add `ritzlib.os.env` lazily-loaded environment helpers.
+5. Workspace will not link at this phase — that's expected; phase 4 fixes it.
 
-### Phase 2 — Writer + Display + canonical print (1 day)
+### Phase 2 — Writer + Display + canonical print + format specs (1.5 days)
 
 1. `ritzlib.fmt.writer` (Writer struct + 6 standard sinks).
-2. `ritzlib.fmt.display` (Display trait).
+2. `ritzlib.fmt.display` (Display trait + Debug trait).
 3. `ritzlib.fmt.impls` (impls for built-in types).
 4. `ritzlib.fmt` re-exports `print` / `println` / `eprint` / `eprintln` /
    `write` / `writeln` / `format`.
-5. Old `prints_cstr` / `print_int` etc. become wrappers that call into the new
-   trait — no behavior change at this phase.
+5. Format-spec parsing in the lexer; spec passed compile-time-constant to
+   `Display::show_with` / `Debug::show_with`.
 
 ### Phase 3 — emitter dispatches via trait (0.5 day)
 
 1. Replace `_emit_print_value` hardcoded type-dispatch with trait-method
    resolution + call.
-2. Add the implicit `*Writer` argument: `print("...")` resolves to
-   `write(stdout_writer(), "...")` at lowering time.
+2. Implicit stdout writer for `print` / `println`; implicit stderr for
+   `eprint` / `eprintln`; explicit writer arg required for `write` / `writeln`.
 3. Compile error message tuned for missing impls: "type X doesn't implement
    Display; add `impl Display for X`".
+4. Auto-derive `Debug` for structs when no explicit impl is present.
 
 ### Phase 4 — migrate the workspace (1 day mechanical)
 
 1. Convert all 17 binaries' `main()` to the new ABI.
 2. Convert ritzlib's chained-print usage to interpolation.
 3. Convert nexus / mausoleum / zeus / valet / spire to interpolation.
-4. Drop deprecated `prints_cstr` / `print_int` wrappers (or keep one release —
-   decision below).
+4. Delete legacy `prints_cstr` / `print_int` / `print_hex` etc. — no
+   wrappers, no aliases. The tutorial says one thing, the STYLE.md says one
+   thing, the workspace `grep` returns zero hits for the old style.
 
-### Phase 5 — drop legacy (after one release)
+### Phase 5 — final cleanup (0.25 day)
 
-1. Remove the legacy main-signature compiler adapters.
-2. Remove the deprecated print wrappers.
-3. Remove the .ll shims.
-
-### Phase 6 — format specifiers (optional, 0.5–1 day)
-
-Lexer parses `:spec`; trait gets `show_with(self, w, spec)`; standard impls
-honor common specs (`x`, `X`, `o`, `b`, width, alignment, fill).
+1. Remove the three .ll shims.
+2. Remove any dead code paths the legacy main signatures referenced.
+3. Squash-merge the branch onto main (or keep the per-phase commits — call
+   it during land).
 
 ## Backwards compatibility
 
-| Surface | Phase 1 lands | Phase 4 lands | Phase 5 lands |
-|---|---|---|---|
-| Old main signatures | accepted, deprecation warning | accepted, deprecation warning | rejected |
-| Old print free functions | unchanged | wrappers around trait | removed |
-| Old .ll shims | still present, unused | still present, unused | removed |
+**None.** Hard cutover within the worktree. Branch is broken from phase 1
+through phase 3; phase 4 brings it back to green; phase 5 polishes. Single
+landing onto main.
 
-Workspace stays buildable through phases 1–4. Phase 5 is a clean cutover.
+## Decision log (resolved 2026-05-06)
 
-## Open questions
+1. **main ABI shape — RESOLVED: three accepted signatures.**
+   `pub fn main()`, `pub fn main(args: Span<StrView>)`,
+   `pub fn main(args: Span<StrView>, env: Span<StrView>)`. Compiler picks the
+   right runtime adapter from arity. Env access for the 99% case lives in
+   `ritzlib.os.env` as free functions (`env.get`, `env.get_or`, `env.must`,
+   `env.iter`). Most code never has to declare interest in env at the entry
+   point.
 
-1. **`@Self` vs `&Self` syntax.** Existing impl blocks use `self: @StrView` (`@`
-   for borrow) and `self: *StrView` (raw pointer). The trait sketch uses `@Self`.
-   Either is fine; need to pick one. I lean `@Self` — matches existing impl
-   blocks.
+2. **`pub fn main` return type — RESOLVED: optional, defaults to `-> i32`
+   with implicit 0.** Drives the absolute minimum-syntax `hello world`:
+   `pub fn main() { println("hi") }`.
+
+3. **Format specifiers — RESOLVED: in v1 scope.** Small useful set:
+   `{x:x}`, `{x:X}`, `{x:08x}`, `{x:b}`, `{x:o}`, `{s:<N}`, `{s:>N}`,
+   `{s:^N}`, `{p:?}`. Float specs, locale, fill-char customization,
+   pretty-print all v1.1+.
+
+4. **Migration sequence — RESOLVED: hard cutover, single branch.** Ritz is
+   pre-v1; backwards-compat exists to protect downstream users; we have none.
+   Two ways to write `main` and two ways to print is exactly the kind of
+   decay that makes a language feel old at v1.
+
+5. **Print sink — RESOLVED: implicit stdout/stderr.** `print` / `println` →
+   stdout, `eprint` / `eprintln` → stderr, `write` / `writeln` / `format`
+   take an explicit writer. Rust's path. Zig's `try stdout.print(...)` is
+   honest but the verbosity actively hurts readability for the common case.
+
+## Implementation-time questions (decide as we hit them)
+
+1. **`@Self` vs `&Self` syntax in trait declarations.** Existing impl blocks
+   use `self: @StrView` (`@` for borrow) and `self: *StrView` (raw pointer).
+   The trait sketch uses `@Self`. **Lean:** `@Self` — matches existing impl
+   blocks. Decide in Phase 2 when first writing trait declarations.
 
 2. **Generic Display impls** (`impl<T: Display> Display for Span<T>`,
-   `Option<T>`, `Result<T,E>`). Ritz1 supports trait bounds on generic params;
-   ritz0 needs to as well or we'll have impls available only when built with
-   ritz1. **Action:** confirm parity before phase 2.
+   `Option<T>`, `Result<T,E>`). Ritz1 supports trait bounds on generic
+   params; ritz0 needs to as well or we'll have impls available only when
+   built with ritz1. **Action:** confirm parity in Phase 2; if ritz0 needs
+   work, scope it out of v1 and ship monomorphic impls for the most common
+   `Span<T>` substitutions instead.
 
 3. **`fn main` not `pub` is currently silently accepted.** Whether this is
-   compiler magic or default linkage — if the latter, fixing the rule has wider
-   reach (other "private" functions might also be silently exported). **Action:**
-   check the emitter's linkage logic before calling this a one-line fix.
+   compiler magic or default linkage — if the latter, fixing the rule has
+   wider reach (other "private" functions might also be silently exported).
+   **Action:** check the emitter's linkage logic in Phase 1; if scope grows,
+   spin off as a separate task.
 
 4. **`Writer` lifetime.** With `state: *u8` carrying a sink-specific pointer,
-   we have no lifetime guarantees. A `string_writer(@my_string)` would be unsafe
-   if `my_string` outlives the writer or vice versa. The discipline is "writers
-   are short-lived stack values, sinks outlive them" — but should we encode that
-   in the type system? **Action:** ship the unsafe shape now; revisit if real
-   bugs surface.
-
-5. **Should `print` always implicitly use stdout, or should there be no implicit
-   default?** Rust takes the implicit-stdout path; Zig forces you to pass a
-   writer. Ritz's existing API is implicit-stdout. **Lean:** keep implicit
-   stdout for `print` / `println`; require explicit writer for `write` / `writeln`.
+   we have no lifetime guarantees. **Decision:** ship the unsafe shape now;
+   the discipline is "writers are short-lived stack values, sinks outlive
+   them"; revisit if real bugs surface.
 
 ## Estimate
 
 | Phase | Days |
 |---|---|
-| 1. Runtime + ABI | 1.5 |
-| 2. Writer + Display + ritzlib.fmt | 1.0 |
-| 3. Emitter dispatch | 0.5 |
+| 1. Runtime + ABI + env helpers | 1.5 |
+| 2. Writer + Display + ritzlib.fmt + format specs | 1.5 |
+| 3. Emitter trait dispatch | 0.5 |
 | 4. Migrate workspace | 1.0 |
-| 5. Drop legacy | 0.25 |
-| 6. Format specifiers (optional) | 0.5–1 |
-| **Total (1–5)** | **~4.25 days** |
-| **Total (1–6)** | **~5.25 days** |
+| 5. Final cleanup | 0.25 |
+| **Total** | **~4.75 days** |
 
-Stageable; phases 1–3 land independently and unlock the rest.
-
-## Decision points
-
-- **Sequence:** land phases 1–4 over 3–4 days, ship to main, run a release on
-  it, then phase 5? Or all-at-once cutover?
-- **Format specifiers (phase 6):** in scope for the v1 cleanup or follow-up?
-- **AGAST decomposition:** one task per phase, or one task with subtasks?
-- **Branch strategy:** worktree (`adele-ritz-task-NNN`) or main? This is a
-  cross-cutting change — worktree makes more sense than the per-task pattern
-  used for #192–#196.
+Single worktree, hard cutover. Each phase becomes an AGAST subtask of #198.
 
 ## Out of scope (file as separate AGAST tasks)
 
