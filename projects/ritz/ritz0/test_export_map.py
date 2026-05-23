@@ -11,7 +11,7 @@ import tempfile
 import ritz_ast as rast
 from lexer import Lexer
 from parser import Parser
-from import_resolver import ImportResolver, ExportEntry, ModuleExports
+from import_resolver import ImportResolver, ExportEntry, ModuleExports, resolve_imports
 
 
 def parse_module(code: str, filename: str = "test.ritz") -> rast.Module:
@@ -563,6 +563,87 @@ pub import nonexistent
         resolver._process_re_exports(module, "test.ritz", exports)
         assert len(exports.exports) == 0
 
+
+
+class TestAliasedImportRewrites:
+    """Behavior tests for alias-qualified import rewrites."""
+
+    def test_alias_import_without_items_exposes_all_qualified(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "mod.ritz").write_text("""
+pub fn foo() -> i32
+    1
+
+pub fn bar() -> i32
+    2
+""")
+            main = parse_module("""
+import mod as m
+
+fn call_foo() -> i32
+    m::foo()
+
+fn call_bar() -> i32
+    m::bar()
+""", str(root / "main.ritz"))
+
+            merged = resolve_imports(main, str(root / "main.ritz"), project_root=str(root), use_cache=False)
+            fn_names = {item.name for item in merged.items if isinstance(item, rast.FnDef)}
+
+            assert "__imp_m_foo" in fn_names
+            assert "__imp_m_bar" in fn_names
+
+    def test_selective_alias_only_allows_selected_names(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "mod.ritz").write_text("""
+pub fn foo() -> i32
+    1
+
+pub fn bar() -> i32
+    2
+""")
+            main = parse_module("""
+import mod { foo } as m
+
+fn call_foo() -> i32
+    m::foo()
+
+fn call_bar() -> i32
+    m::bar()
+""", str(root / "main.ritz"))
+
+            with pytest.raises(Exception) as exc:
+                resolve_imports(main, str(root / "main.ritz"), project_root=str(root), use_cache=False)
+
+            assert "not exported by aliased module 'm'" in str(exc.value)
+
+    def test_two_aliases_can_call_same_export_name(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "a.ritz").write_text("""
+pub fn init() -> i32
+    10
+""")
+            (root / "b.ritz").write_text("""
+pub fn init() -> i32
+    20
+""")
+            main = parse_module("""
+import a as aa
+import b as bb
+
+fn main() -> i32
+    aa::init() + bb::init()
+""", str(root / "main.ritz"))
+
+            merged = resolve_imports(main, str(root / "main.ritz"), project_root=str(root), use_cache=False)
+            fn_names = {item.name for item in merged.items if isinstance(item, rast.FnDef)}
+
+            assert "__imp_aa_init" in fn_names
+            assert "__imp_bb_init" in fn_names
+            assert "main" in fn_names
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
