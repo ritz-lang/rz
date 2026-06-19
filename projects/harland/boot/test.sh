@@ -98,7 +98,7 @@ FS0:\EFI\BOOT\BOOTX64.EFI
 EOF
 
 # Create a FAT disk image (larger to fit kernel)
-dd if=/dev/zero of="$TMPDIR/disk.img" bs=1M count=64 2>/dev/null
+truncate -s 64M "$TMPDIR/disk.img"
 mkfs.vfat "$TMPDIR/disk.img" >/dev/null
 mmd -i "$TMPDIR/disk.img" ::/EFI
 mmd -i "$TMPDIR/disk.img" ::/EFI/BOOT
@@ -228,9 +228,9 @@ if [ "$TAR_SIZE" -gt "$((DISK_SIZE - 1024 * 1024))" ]; then
     DISK_SIZE=$((TAR_SIZE + 1024 * 1024))
 fi
 
-# Create raw disk with TAR at the beginning
-dd if=/dev/zero of="$RAW_INITRAMFS" bs=1M count=$((DISK_SIZE / 1024 / 1024)) 2>/dev/null
-dd if="$TAR_FILE" of="$RAW_INITRAMFS" conv=notrunc 2>/dev/null
+# Create raw disk with TAR at the beginning (copy TAR then extend with zeros)
+cp "$TAR_FILE" "$RAW_INITRAMFS"
+truncate -s "$DISK_SIZE" "$RAW_INITRAMFS"
 echo "  Created raw disk: $(du -h "$RAW_INITRAMFS" | cut -f1)"
 
 # Convert to QCOW2 for QEMU
@@ -297,7 +297,10 @@ cat "$SERIAL_LOG"
 echo ""
 
 # Check for expected output - most advanced first (matching BIOS test milestones)
-if grep -q "ALL TESTS PASSED" "$SERIAL_LOG"; then
+if grep -q "\*\*\* KERNEL PANIC \*\*\*" "$SERIAL_LOG" || grep -q "!!! EXCEPTION !!!" "$SERIAL_LOG"; then
+    echo "FAIL: Kernel panic/exception detected"
+    exit 1
+elif grep -q "ALL TESTS PASSED" "$SERIAL_LOG"; then
     echo "========================================="
     echo "  UEFI: MILESTONE 12 COMPLETE: Tier 1 Test Suite!"
     echo "========================================="

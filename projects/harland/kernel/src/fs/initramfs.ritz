@@ -11,7 +11,7 @@
 
 import serial { StrView, prints, serial_print_dec }
 import io { halt_loop }
-import fs.knamespace { KNamespace, knamespace_get, knamespace_mkdir, knamespace_write, KNS_OK, KNS_NOT_FOUND, KNS_OUT_OF_SPACE }
+import fs.knamespace { KNamespace, knamespace_get, knamespace_mkdir, knamespace_write, KNS_OK, KNS_NOT_FOUND, KNS_ALREADY_EXISTS, KNS_OUT_OF_SPACE }
 import fs.kpath { strview_from_ptr }
 import fs.tar { TarEntry, TAR_ENTRY_SIZE, TAR_BLOCK_SIZE, TAR_TYPE_FILE, TAR_TYPE_FILE_ALT, TAR_TYPE_DIRECTORY, tar_parse_header, tar_data_blocks }
 import drivers.virtio.blk { VirtioBlkDevice, virtio_blk_get_device, virtio_blk_read }
@@ -27,6 +27,7 @@ const MAX_FILE_SIZE: u64 = 4194304   # 4 MB
 # Read buffer size (must be multiple of 512)
 const READ_BUFFER_SECTORS: u32 = 7   # 3584 bytes per read
 const READ_BUFFER_SIZE: u64 = 3584   # 7 * 512
+const INITRAMFS_READ_RETRIES: i32 = 3
 
 # ============================================================================
 # Public API
@@ -78,7 +79,7 @@ fn initramfs_load_from_disk() -> i32
     # Read loop - process TAR entries
     while empty_blocks < 2
         # Read one TAR header block (512 bytes = 1 sector)
-        let result: i32 = virtio_blk_read(dev, sector, 1, read_buf)
+        let result: i32 = initramfs_read_with_retry(dev, sector, 1, read_buf)
         if result != 0
             prints("[initramfs] Read error at sector " as StrView)
             serial_print_dec(sector)
@@ -216,7 +217,7 @@ fn load_file_from_tar(dev: *VirtioBlkDevice, ns: *KNamespace, entry: *TarEntry, 
                 sectors_to_read = 1
 
         # Read sectors
-        let result: i32 = virtio_blk_read(dev, current_sector, sectors_to_read, file_buf + bytes_read as i64)
+        let result: i32 = initramfs_read_with_retry(dev, current_sector, sectors_to_read, file_buf + bytes_read as i64)
         if result != 0
             prints("[initramfs] VirtIO read error at sector " as StrView)
             serial_print_dec(current_sector)
@@ -230,7 +231,12 @@ fn load_file_from_tar(dev: *VirtioBlkDevice, ns: *KNamespace, entry: *TarEntry, 
         current_sector = current_sector + sectors_to_read as u64
 
     # Create file in namespace
-    let write_result: i32 = knamespace_write(ns, @abs_path, file_buf, size)
+    var write_result: i32 = knamespace_write(ns, @abs_path, file_buf, size)
+    if write_result == KNS_NOT_FOUND
+        # Some TARs omit directory entries or order files before directories.
+        # Ensure parent path exists, then retry once.
+        ensure_parent_dirs(ns, @abs_path_buf[0], abs_len)
+        write_result = knamespace_write(ns, @abs_path, file_buf, size)
     kfree(file_buf)
 
     if write_result != KNS_OK
@@ -253,3 +259,36 @@ fn process_directory(ns: *KNamespace, path: *StrView) -> i32
 
     let abs_path: StrView = strview_from_ptr(@abs_path_buf[0], abs_len)
     knamespace_mkdir(ns, @abs_path)
+
+# Read with bounded retries to tolerate occasional VirtIO transient failures.
+fn initramfs_read_with_retry(dev: *VirtioBlkDevice, sector: u64, count: u32, buf: *u8) -> i32
+    var attempt: i32 = 0
+    while attempt < INITRAMFS_READ_RETRIES
+        let result: i32 = virtio_blk_read(dev, sector, count, buf)
+        if result == 0
+            return 0
+        attempt = attempt + 1
+    return -1
+
+# Ensure all parent directories exist for an absolute path.
+fn ensure_parent_dirs(ns: *KNamespace, abs_path: *u8, abs_len: i64)
+    if abs_len <= 1
+        return
+
+    var dir_buf: [256]u8
+    var i: i64 = 0
+    while i < abs_len and i < 255
+        dir_buf[i] = *(abs_path + i)
+        i = i + 1
+    dir_buf[i] = 0
+
+    i = 1
+    while i < abs_len
+        if dir_buf[i] == 47
+            dir_buf[i] = 0
+            let dir_path: StrView = strview_from_ptr(@dir_buf[0], i)
+            let mk_result: i32 = knamespace_mkdir(ns, @dir_path)
+            if mk_result != KNS_OK and mk_result != KNS_ALREADY_EXISTS
+                return
+            dir_buf[i] = 47
+        i = i + 1

@@ -1,0 +1,442 @@
+# Harland Syscall Runtime - Process
+
+import io { halt_loop }
+import serial { StrView, prints, serial_print_hex, serial_print_dec, serial_write_byte }
+import drivers.acpi.tables { acpi_poweroff }
+import fd { FdTable, fd_table_init }
+import mm.pmm { PAGE_SIZE }
+import mm.vmm { vmm_create_user_pml4, vmm_switch_pml4, vmm_get_current_pml4, vmm_free_pml4, vmm_read_pml4_entry }
+import fs.knamespace { KNamespace, knamespace_get, knamespace_read, knamespace_list }
+import fs.kdir_entry { KDirEntry }
+import fs.kpath { strview_from_ptr }
+import loader.elf { ElfLoadResult, ELF_OK, elf_load }
+import syscall.runtime.memory { runtime_memory_alloc_user_stack, runtime_memory_user_stack_top_unmapped }
+
+extern fn jump_to_userspace(entry: u64, stack: u64)
+extern fn jump_to_userspace_with_retval(entry: u64, stack: u64, retval: i64, parent_ctx: *ParentContext)
+extern fn jump_to_userspace_with_args(entry: u64, stack: u64, argc: i64, argv: u64)
+extern fn get_syscall_user_rip() -> u64
+extern fn get_syscall_user_rsp() -> u64
+extern fn get_syscall_user_rflags() -> u64
+extern fn get_syscall_user_rbx() -> u64
+extern fn get_syscall_user_rbp() -> u64
+extern fn get_syscall_user_r12() -> u64
+extern fn get_syscall_user_r13() -> u64
+extern fn get_syscall_user_r14() -> u64
+extern fn get_syscall_user_r15() -> u64
+
+struct ParentContext
+    user_rip: u64
+    user_rsp: u64
+    user_rflags: u64
+    user_pml4: u64
+    user_rbx: u64
+    user_rbp: u64
+    user_r12: u64
+    user_r13: u64
+    user_r14: u64
+    user_r15: u64
+
+var g_parent_ctx: ParentContext
+var g_has_parent: u8 = 0
+var g_child_pid: u64 = 1
+var g_child_pml4: u64 = 0
+var g_child_exit_code: i64 = 0
+
+const RUNTIME_MAX_FD_TABLES: i32 = 8
+
+struct RuntimeFdTableSlot
+    pid: u64
+    used: u8
+    table: FdTable
+
+var g_fd_table_slots: [8]RuntimeFdTableSlot
+
+fn runtime_process_fd_slot_for_pid(pid: u64) -> *RuntimeFdTableSlot
+    var i: i32 = 0
+    while i < RUNTIME_MAX_FD_TABLES
+        let slot: *RuntimeFdTableSlot = @g_fd_table_slots[i]
+        if (*slot).used != 0 and (*slot).pid == pid
+            return slot
+        i = i + 1
+
+    i = 0
+    while i < RUNTIME_MAX_FD_TABLES
+        let slot: *RuntimeFdTableSlot = @g_fd_table_slots[i]
+        if (*slot).used == 0
+            (*slot).pid = pid
+            (*slot).used = 1
+            fd_table_init(@(*slot).table)
+            return slot
+        i = i + 1
+
+    return 0 as *RuntimeFdTableSlot
+
+fn runtime_process_strlen(s: *u8) -> i64
+    var len: i64 = 0
+    var p: *u8 = s
+    while *p != 0
+        len = len + 1
+        p = p + 1
+    return len
+
+fn runtime_process_prints_str(s: *u8)
+    var p: *u8 = s
+    while *p != 0
+        serial_write_byte(*p)
+        p = p + 1
+
+pub fn runtime_process_current_pid() -> u32
+    return g_child_pid as u32
+
+pub fn runtime_process_set_init_process()
+    g_has_parent = 0
+    g_child_pid = 1
+    g_child_pml4 = 0
+    g_child_exit_code = 0
+    runtime_process_fd_slot_for_pid(1)
+
+pub fn runtime_process_current_fd_table() -> *FdTable
+    let slot: *RuntimeFdTableSlot = runtime_process_fd_slot_for_pid(g_child_pid)
+    if slot == 0 as *RuntimeFdTableSlot
+        return 0 as *FdTable
+    return @(*slot).table
+
+pub fn runtime_process_readdir(dir_path: *u8, buf: *u8, buf_size: i64) -> i64
+    let ns: *KNamespace = knamespace_get()
+    if ns == 0 as *KNamespace
+        return -1
+
+    let path_len: i64 = runtime_process_strlen(dir_path)
+    let path_view: StrView = strview_from_ptr(dir_path, path_len)
+
+    var entries: [64]KDirEntry
+    let count: i32 = knamespace_list(ns, @path_view, @entries[0], 64)
+    if count < 0
+        return -1
+
+    var bytes_written: i64 = 0
+    var i: i32 = 0
+    while i < count
+        let entry: *KDirEntry = @entries[i]
+
+        var name_len: i32 = (*entry).name_len as i32
+        if name_len == 0
+            while name_len < 255 and (*entry).name[name_len] != 0
+                name_len = name_len + 1
+
+        if bytes_written + name_len as i64 + 1 > buf_size
+            break
+
+        var j: i32 = 0
+        while j < name_len
+            *(buf + bytes_written) = (*entry).name[j]
+            bytes_written = bytes_written + 1
+            j = j + 1
+
+        *(buf + bytes_written) = 0
+        bytes_written = bytes_written + 1
+        i = i + 1
+
+    return bytes_written
+
+pub fn runtime_process_spawn(path: *u8) -> i64
+    let ns: *KNamespace = knamespace_get()
+    if ns == 0 as *KNamespace
+        return -1
+
+    let path_len: i64 = runtime_process_strlen(path)
+    let path_view: StrView = strview_from_ptr(path, path_len)
+    var file_size: u64 = 0
+    let elf_data: *u8 = knamespace_read(ns, @path_view, @file_size)
+    if elf_data == 0 as *u8
+        return -1
+
+    g_parent_ctx.user_rip = get_syscall_user_rip()
+    g_parent_ctx.user_rsp = get_syscall_user_rsp()
+    g_parent_ctx.user_rflags = get_syscall_user_rflags()
+    g_parent_ctx.user_pml4 = vmm_get_current_pml4()
+    g_parent_ctx.user_rbx = get_syscall_user_rbx()
+    g_parent_ctx.user_rbp = get_syscall_user_rbp()
+    g_parent_ctx.user_r12 = get_syscall_user_r12()
+    g_parent_ctx.user_r13 = get_syscall_user_r13()
+    g_parent_ctx.user_r14 = get_syscall_user_r14()
+    g_parent_ctx.user_r15 = get_syscall_user_r15()
+    g_has_parent = 1
+    g_child_pid = 2
+
+    let child_pml4: u64 = vmm_create_user_pml4()
+    if child_pml4 == 0
+        g_has_parent = 0
+        return -1
+
+    g_child_pml4 = child_pml4
+
+    prints("[spawn] Parent PML4[511] = 0x")
+    serial_print_hex(vmm_read_pml4_entry(g_parent_ctx.user_pml4, 511))
+    prints("\n")
+    prints("[spawn] Child  PML4[511] = 0x")
+    serial_print_hex(vmm_read_pml4_entry(child_pml4, 511))
+    prints("\n")
+
+    vmm_switch_pml4(child_pml4)
+
+    let child_load_base: u64 = 0x100000000
+    let load_result: ElfLoadResult = elf_load(elf_data, file_size, child_load_base)
+
+    if load_result.error != ELF_OK
+        vmm_switch_pml4(g_parent_ctx.user_pml4)
+        vmm_free_pml4(child_pml4)
+        g_has_parent = 0
+        g_child_pml4 = 0
+        return -1
+
+    let child_stack_top: u64 = runtime_memory_alloc_user_stack()
+    if child_stack_top == 0
+        vmm_switch_pml4(g_parent_ctx.user_pml4)
+        vmm_free_pml4(child_pml4)
+        g_has_parent = 0
+        g_child_pml4 = 0
+        return -1
+
+    jump_to_userspace(load_result.entry_point, child_stack_top)
+    return -1
+
+# Execute an init program in a fresh user address space without parent context.
+# Used by kernel boot path to enter userspace PID 1.
+pub fn runtime_process_exec_no_parent(path: *u8) -> i64
+    let ns: *KNamespace = knamespace_get()
+    if ns == 0 as *KNamespace
+        return -1
+
+    let path_len: i64 = runtime_process_strlen(path)
+    let path_view: StrView = strview_from_ptr(path, path_len)
+    var file_size: u64 = 0
+    let elf_data: *u8 = knamespace_read(ns, @path_view, @file_size)
+    if elf_data == 0 as *u8
+        return -1
+
+    g_has_parent = 0
+    g_child_pid = 1
+    g_child_pml4 = 0
+    g_child_exit_code = 0
+
+    let child_pml4: u64 = vmm_create_user_pml4()
+    if child_pml4 == 0
+        return -1
+
+    g_child_pml4 = child_pml4
+    vmm_switch_pml4(child_pml4)
+
+    let child_load_base: u64 = 0x100000000
+    let load_result: ElfLoadResult = elf_load(elf_data, file_size, child_load_base)
+    if load_result.error != ELF_OK
+        return -1
+
+    let child_stack_top: u64 = runtime_memory_alloc_user_stack()
+    if child_stack_top == 0
+        return -1
+
+    prints("[exec_init] entry=0x")
+    serial_print_hex(load_result.entry_point)
+    prints(" stack=0x")
+    serial_print_hex(child_stack_top)
+    prints("\n")
+
+    jump_to_userspace(load_result.entry_point, child_stack_top)
+    return -1
+
+pub fn runtime_process_spawn_args(path: *u8, argv: **u8, argc: i32) -> i64
+    prints("[spawn_args] spawn_args(")
+    runtime_process_prints_str(path)
+    prints(", argc=")
+    serial_print_dec(argc as u64)
+    prints(")\n")
+
+    let ns: *KNamespace = knamespace_get()
+    if ns == 0 as *KNamespace
+        prints("[spawn_args] No namespace\n")
+        return -1
+
+    let path_len: i64 = runtime_process_strlen(path)
+    let path_view: StrView = strview_from_ptr(path, path_len)
+    var file_size: u64 = 0
+    let elf_data: *u8 = knamespace_read(ns, @path_view, @file_size)
+
+    if elf_data == 0 as *u8
+        prints("[spawn_args] File not found: ")
+        runtime_process_prints_str(path)
+        prints("\n")
+        return -1
+
+    prints("[spawn_args] Loading ELF (")
+    serial_print_dec(file_size)
+    prints(" bytes)...\n")
+
+    g_parent_ctx.user_rip = get_syscall_user_rip()
+    g_parent_ctx.user_rsp = get_syscall_user_rsp()
+    g_parent_ctx.user_rflags = get_syscall_user_rflags()
+    g_parent_ctx.user_pml4 = vmm_get_current_pml4()
+    g_parent_ctx.user_rbx = get_syscall_user_rbx()
+    g_parent_ctx.user_rbp = get_syscall_user_rbp()
+    g_parent_ctx.user_r12 = get_syscall_user_r12()
+    g_parent_ctx.user_r13 = get_syscall_user_r13()
+    g_parent_ctx.user_r14 = get_syscall_user_r14()
+    g_parent_ctx.user_r15 = get_syscall_user_r15()
+    g_has_parent = 1
+    g_child_pid = 2
+
+    let child_pml4: u64 = vmm_create_user_pml4()
+    if child_pml4 == 0
+        prints("[spawn_args] Failed to create child page table\n")
+        g_has_parent = 0
+        return -1
+
+    g_child_pml4 = child_pml4
+
+    var total_string_bytes: i64 = 0
+    var i: i32 = 0
+    while i < argc
+        let arg: *u8 = *(argv + i)
+        total_string_bytes = total_string_bytes + runtime_process_strlen(arg) + 1
+        i = i + 1
+
+    var argv_copy: [4096]u8
+    var argv_offsets: [64]i64
+
+    if total_string_bytes > 4096
+        prints("[spawn_args] argv too large\n")
+        vmm_free_pml4(child_pml4)
+        g_has_parent = 0
+        g_child_pml4 = 0
+        return -1
+
+    if argc > 64
+        prints("[spawn_args] too many arguments\n")
+        vmm_free_pml4(child_pml4)
+        g_has_parent = 0
+        g_child_pml4 = 0
+        return -1
+
+    var copy_pos: i64 = 0
+    i = 0
+    while i < argc
+        argv_offsets[i] = copy_pos
+        let arg: *u8 = *(argv + i)
+        var j: i64 = 0
+        while *(arg + j) != 0
+            argv_copy[(copy_pos + j) as i32] = *(arg + j)
+            j = j + 1
+        argv_copy[(copy_pos + j) as i32] = 0
+        copy_pos = copy_pos + j + 1
+        i = i + 1
+
+    vmm_switch_pml4(child_pml4)
+
+    let child_load_base: u64 = 0x100000000
+    let load_result: ElfLoadResult = elf_load(elf_data, file_size, child_load_base)
+    if load_result.error != ELF_OK
+        prints("[spawn_args] Failed to load ELF\n")
+        vmm_switch_pml4(g_parent_ctx.user_pml4)
+        vmm_free_pml4(child_pml4)
+        g_has_parent = 0
+        g_child_pml4 = 0
+        return -1
+
+    let alloc_stack_top: u64 = runtime_memory_alloc_user_stack()
+    if alloc_stack_top == 0
+        prints("[spawn_args] Failed to allocate child stack\n")
+        vmm_switch_pml4(g_parent_ctx.user_pml4)
+        vmm_free_pml4(child_pml4)
+        g_has_parent = 0
+        g_child_pml4 = 0
+        return -1
+
+    var stack_ptr: u64 = runtime_memory_user_stack_top_unmapped()
+    stack_ptr = stack_ptr - (total_string_bytes as u64)
+    stack_ptr = stack_ptr & 0xFFFFFFFFFFFFFFF0
+    let strings_base: u64 = stack_ptr
+
+    i = 0
+    var child_argv_ptrs: [64]u64
+    var dst_offset: i64 = 0
+    while i < argc
+        child_argv_ptrs[i] = strings_base + (dst_offset as u64)
+        let src_offset: i64 = argv_offsets[i]
+        var j: i64 = 0
+        while argv_copy[(src_offset + j) as i32] != 0
+            *((strings_base + dst_offset as u64 + j as u64) as *u8) = argv_copy[(src_offset + j) as i32]
+            j = j + 1
+        *((strings_base + dst_offset as u64 + j as u64) as *u8) = 0
+        dst_offset = dst_offset + j + 1
+        i = i + 1
+
+    let argv_array_size: u64 = ((argc + 1) as u64) * 8
+    stack_ptr = stack_ptr - argv_array_size
+    stack_ptr = stack_ptr & 0xFFFFFFFFFFFFFFF0
+    let child_argv: u64 = stack_ptr
+
+    i = 0
+    while i < argc
+        *((child_argv + (i as u64) * 8) as *u64) = child_argv_ptrs[i]
+        i = i + 1
+    *((child_argv + (argc as u64) * 8) as *u64) = 0
+
+    stack_ptr = stack_ptr & 0xFFFFFFFFFFFFFFF0
+
+    prints("[spawn_args] Child argv at 0x")
+    serial_print_hex(child_argv)
+    prints(", stack=0x")
+    serial_print_hex(stack_ptr)
+    prints("\n")
+
+    if argc > 0
+        prints("[spawn_args] argv[0] = ")
+        runtime_process_prints_str(child_argv_ptrs[0] as *u8)
+        prints("\n")
+
+    prints("[spawn_args] Jumping to child with args...\n\n")
+    jump_to_userspace_with_args(load_result.entry_point, stack_ptr, argc as i64, child_argv)
+
+    prints("[spawn_args] ERROR: jump returned!\n")
+    return -1
+
+pub fn runtime_process_exit(code: i32) -> i64
+    if g_has_parent != 0
+        g_child_exit_code = code as i64
+        g_has_parent = 0
+
+        vmm_switch_pml4(g_parent_ctx.user_pml4)
+
+        if g_child_pml4 != 0
+            vmm_free_pml4(g_child_pml4)
+            g_child_pml4 = 0
+
+        var retval: i64 = 2
+        if code < 0
+            retval = -1
+
+        jump_to_userspace_with_retval(g_parent_ctx.user_rip, g_parent_ctx.user_rsp, retval, @g_parent_ctx)
+
+    if g_child_pid == 1
+        prints("[exit] init exited with code ")
+        serial_print_dec(code as u64)
+        prints(", attempting ACPI poweroff...\n")
+        let poweroff_result: i32 = acpi_poweroff()
+        if poweroff_result != 0
+            prints("[exit] ACPI poweroff failed, halting\n")
+    else
+        prints("[exit] process ")
+        serial_print_dec(g_child_pid)
+        prints(" exited without parent, halting\n")
+    halt_loop()
+    return 0
+
+pub fn runtime_process_wait(pid: i32) -> i64
+    if g_child_pid == 2
+        let code: i64 = g_child_exit_code
+        g_child_exit_code = 0
+        g_child_pid = 1
+        return code
+
+    return -1

@@ -1,0 +1,296 @@
+# Harland Kernel Post-Init Diagnostics
+
+import serial { prints, serial_print_hex, serial_print_dec, serial_write_byte }
+import mm.pmm { pmm_alloc_page, pmm_free_page }
+import mm.vmm { PTE_WRITABLE, vmm_map_page, vmm_unmap_page, vmm_virt_to_phys }
+import mm.heap { kalloc, kfree, heap_get_free }
+import ipc.message { Message, MSG_FLAG_NONE }
+import ipc.channel { ChannelEndpoint, ChannelPair, channel_create, channel_send, channel_recv }
+import drivers.pci { pci_print_all_devices }
+import drivers.virtio.blk { VirtioBlkDevice, virtio_blk_get_device, virtio_blk_test }
+import net.stack { net_stack_init, net_configure_dhcp, net_is_configured, net_poll }
+import net.ip { ip_get_gateway, ip_print_config }
+import net.icmp { icmp_ping }
+import loader.elf { test_elf_loader }
+
+pub fn run_postinit_diagnostics(has_boot_info: bool)
+    # Test VMM operations
+    if has_boot_info
+        prints("\nTesting Virtual Memory...\n")
+
+        # Verify identity mapping for kernel
+        let test_vaddr: u64 = 0x100000
+        let resolved: u64 = vmm_virt_to_phys(test_vaddr)
+        prints("  virt_to_phys(0x100000) = ")
+        serial_print_hex(resolved)
+        prints("\n")
+
+        # Allocate a new page and map it at a high address
+        let new_page: u64 = pmm_alloc_page()
+        prints("  Allocated page: ")
+        serial_print_hex(new_page)
+        prints("\n")
+
+        # Map at a test virtual address in higher-half kernel space
+        # Using address past the 1GB pre-mapped region (which uses 2MB huge pages)
+        let test_map_vaddr: u64 = 0xFFFFFFFFD0000000
+        let map_result: i32 = vmm_map_page(test_map_vaddr, new_page, PTE_WRITABLE)
+        prints("  Map 0xFFFFFFFFD0000000 -> result: ")
+        serial_print_dec(map_result as u64)
+        prints("\n")
+
+        if map_result == 0
+            # Verify the mapping
+            let verify_phys: u64 = vmm_virt_to_phys(test_map_vaddr)
+            prints("  virt_to_phys(0xFFFFFFFFD0000000) = ")
+            serial_print_hex(verify_phys)
+            prints("\n")
+
+            # Write to the mapped page (via identity-mapped physical address)
+            let data_ptr: *u64 = new_page as *u64
+            *data_ptr = 0xDEADBEEFCAFEBABE
+
+            # Read via the new virtual mapping
+            let mapped_ptr: *u64 = test_map_vaddr as *u64
+            let read_val: u64 = *mapped_ptr
+            prints("  Wrote 0xDEADBEEFCAFEBABE, read: ")
+            serial_print_hex(read_val)
+            prints("\n")
+
+            if read_val == 0xDEADBEEFCAFEBABE
+                prints("  VMM test PASSED!\n")
+            else
+                prints("  VMM test FAILED!\n")
+
+            # Unmap and free
+            vmm_unmap_page(test_map_vaddr)
+            pmm_free_page(new_page)
+        else
+            prints("  Mapping failed!\n")
+
+        # Test higher-half mapping
+        prints("\nTesting Higher-Half Mapping...\n")
+
+        # The kernel physical address 0x100000 should also be accessible
+        # at virtual address 0xFFFFFFFF80100000 (higher-half)
+        let kernel_virt_base: u64 = 0xFFFFFFFF80000000
+        let kernel_phys: u64 = 0x100000
+        let hh_vaddr: u64 = kernel_virt_base + kernel_phys
+
+        # Read from physical address (identity mapped)
+        let phys_ptr: *u64 = kernel_phys as *u64
+        let phys_val: u64 = *phys_ptr
+
+        # Read from higher-half virtual address
+        let hh_ptr: *u64 = hh_vaddr as *u64
+        let hh_val: u64 = *hh_ptr
+
+        prints("  Read from 0x100000: ")
+        serial_print_hex(phys_val)
+        prints("\n")
+        prints("  Read from 0xFFFFFFFF80100000: ")
+        serial_print_hex(hh_val)
+        prints("\n")
+
+        if phys_val == hh_val
+            prints("  Higher-half mapping PASSED!\n")
+        else
+            prints("  Higher-half mapping FAILED!\n")
+
+        # Test heap allocations
+        prints("\nTesting Kernel Heap...\n")
+
+        let alloc1: *u8 = kalloc(64)
+        prints("  kalloc(64) = ")
+        serial_print_hex(alloc1 as u64)
+        prints("\n")
+
+        let alloc2: *u8 = kalloc(128)
+        prints("  kalloc(128) = ")
+        serial_print_hex(alloc2 as u64)
+        prints("\n")
+
+        let alloc3: *u8 = kalloc(256)
+        prints("  kalloc(256) = ")
+        serial_print_hex(alloc3 as u64)
+        prints("\n")
+
+        prints("  Free space: ")
+        serial_print_dec(heap_get_free())
+        prints(" bytes\n")
+
+        # Write to allocated memory
+        let test_ptr: *u64 = alloc1 as *u64
+        *test_ptr = 0x1234567890ABCDEF
+        let read_back: u64 = *test_ptr
+        prints("  Write/read test: ")
+        serial_print_hex(read_back)
+        prints("\n")
+
+        # Free middle allocation
+        kfree(alloc2)
+        prints("  Freed alloc2\n")
+        prints("  Free space: ")
+        serial_print_dec(heap_get_free())
+        prints(" bytes\n")
+
+        # Reallocate should reuse freed block
+        let alloc4: *u8 = kalloc(100)
+        prints("  kalloc(100) = ")
+        serial_print_hex(alloc4 as u64)
+        prints("\n")
+
+        if read_back == 0x1234567890ABCDEF
+            prints("  Heap test PASSED!\n")
+        else
+            prints("  Heap test FAILED!\n")
+
+        # Cleanup
+        kfree(alloc1)
+        kfree(alloc3)
+        kfree(alloc4)
+
+        # Test IPC channels
+        prints("\nTesting IPC Channels...\n")
+        prints("  [1] Creating channel...\n")
+
+        # Create a channel pair
+        let pair: ChannelPair = channel_create(1, 2)
+        prints("  [2] Channel created\n")
+        if pair.endpoint_a != 0 as *ChannelEndpoint
+            prints("  Channel created, id=")
+            serial_print_dec(pair.channel_id as u64)
+            prints("\n")
+
+            # Allocate message on heap (4KB struct is too big for stack)
+            prints("  [3] Allocating send message on heap...\n")
+            let send_msg: *Message = kalloc(4096) as *Message
+            if send_msg == 0 as *Message
+                prints("  Failed to allocate send_msg!\n")
+            else
+                # Initialize the message
+                (*send_msg).header.msg_type = 42
+                (*send_msg).header.flags = MSG_FLAG_NONE
+                (*send_msg).header.seq = 0
+                (*send_msg).header.payload_len = 10
+
+                let payload_str: *u8 = c"Hello IPC!"
+                var i: i32 = 0
+                while i < 10
+                    (*send_msg).payload[i] = *(payload_str + i as i64)
+                    i = i + 1
+
+                prints("  [4] Sending message...\n")
+                let send_result: i32 = channel_send(pair.endpoint_a, send_msg, 1)
+                prints("  Send result: ")
+                serial_print_dec(send_result as u64)
+                prints("\n")
+
+                # Allocate receive buffer
+                prints("  [5] Allocating recv message on heap...\n")
+                let recv_msg: *Message = kalloc(4096) as *Message
+                if recv_msg == 0 as *Message
+                    prints("  Failed to allocate recv_msg!\n")
+                else
+                    var sender: u32 = 0
+                    prints("  [6] Receiving message...\n")
+                    let recv_result: i32 = channel_recv(pair.endpoint_b, recv_msg, @sender)
+                    prints("  Recv result: ")
+                    serial_print_dec(recv_result as u64)
+                    prints(", msg_type=")
+                    serial_print_dec((*recv_msg).header.msg_type as u64)
+                    prints(", sender=")
+                    serial_print_dec(sender as u64)
+                    prints("\n")
+
+                    # Check payload
+                    prints("  Payload: ")
+                    var k: i32 = 0
+                    while k < (*recv_msg).header.payload_len as i32 and k < 20
+                        serial_write_byte((*recv_msg).payload[k])
+                        k = k + 1
+                    prints("\n")
+
+                    if (*recv_msg).header.msg_type == 42 and sender == 1
+                        prints("  IPC test PASSED!\n")
+                    else
+                        prints("  IPC test FAILED!\n")
+
+                    kfree(recv_msg as *u8)
+
+                kfree(send_msg as *u8)
+
+            # Close channels - skip for now due to page fault
+            # channel_close(pair.endpoint_a)
+            # channel_close(pair.endpoint_b)
+            prints("  (channel close skipped)\n")
+        else
+            prints("  Channel creation failed!\n")
+
+        # Note: channel_debug_print causes page fault - skipped for now
+        # channel_debug_print()
+
+    prints("\nKernel initialized successfully.\n")
+
+    # PCI already initialized early - just print discovered devices
+    prints("\n=== PCI Devices ===\n")
+    pci_print_all_devices()
+
+    # Initialize network stack (includes VirtIO-net driver)
+    prints("\n=== Initializing Network Stack ===\n")
+    let net_result: i32 = net_stack_init()
+    if net_result == 0
+        prints("  Network stack ready!\n")
+
+        # Start DHCP configuration
+        prints("  Starting DHCP...\n")
+        net_configure_dhcp()
+
+        # Poll for packets until configured or timeout
+        prints("  Polling for network packets...\n")
+        var poll_count: i32 = 0
+        var ping_sent: u8 = 0
+        var arp_pending: u8 = 0
+        while poll_count < 1000
+            net_poll()
+            poll_count = poll_count + 1
+
+            # Small delay
+            var delay: i32 = 0
+            while delay < 100000
+                delay = delay + 1
+
+            # If we got configured, try a ping
+            if net_is_configured() and ping_sent == 0 and poll_count >= 100
+                if arp_pending == 0
+                    prints("\n  Got IP! Pinging gateway...\n")
+                let gateway: *u8 = ip_get_gateway()
+                let ping_result: i32 = icmp_ping(gateway)
+                if ping_result < 0
+                    # ARP lookup needed, wait for ARP reply
+                    arp_pending = 1
+                else
+                    ping_sent = 1
+                    prints("  ICMP echo request sent!\n")
+
+        if net_is_configured()
+            prints("\n  Network configured!\n")
+            ip_print_config()
+        else
+            prints("\n  DHCP timeout (no response in test window)\n")
+    else
+        prints("  Network stack initialization failed\n")
+
+    # VirtIO Block device already initialized early (for initramfs loading)
+    # Just run a test if it's available
+    prints("\n=== VirtIO Block Device ===\n")
+    let blk_dev: *VirtioBlkDevice = virtio_blk_get_device()
+    if blk_dev != 0 as *VirtioBlkDevice
+        prints("  (already initialized for initramfs)\n")
+        # Run a basic read test to verify it's still working
+        virtio_blk_test(blk_dev)
+    else
+        prints("  No VirtIO Block device found (add -drive to QEMU)\n")
+
+    # Test ELF loader (validates structures and parsing)
+    test_elf_loader()

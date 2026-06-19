@@ -34,6 +34,12 @@ user_rsp_save:
 .global syscall_user_rip
 .global syscall_user_rsp
 .global syscall_user_rflags
+.global syscall_user_rbx
+.global syscall_user_rbp
+.global syscall_user_r12
+.global syscall_user_r13
+.global syscall_user_r14
+.global syscall_user_r15
 
 syscall_user_rip:
     .quad 0
@@ -42,6 +48,18 @@ syscall_user_rsp:
 syscall_user_rflags:
     .quad 0
 syscall_user_rax:
+    .quad 0
+syscall_user_rbx:
+    .quad 0
+syscall_user_rbp:
+    .quad 0
+syscall_user_r12:
+    .quad 0
+syscall_user_r13:
+    .quad 0
+syscall_user_r14:
+    .quad 0
+syscall_user_r15:
     .quad 0
 
 .section .text
@@ -71,6 +89,48 @@ get_syscall_user_rflags:
     movq syscall_user_rflags(%rip), %rax
     ret
 .size get_syscall_user_rflags, . - get_syscall_user_rflags
+
+.global get_syscall_user_rbx
+.type get_syscall_user_rbx, @function
+get_syscall_user_rbx:
+    movq syscall_user_rbx(%rip), %rax
+    ret
+.size get_syscall_user_rbx, . - get_syscall_user_rbx
+
+.global get_syscall_user_rbp
+.type get_syscall_user_rbp, @function
+get_syscall_user_rbp:
+    movq syscall_user_rbp(%rip), %rax
+    ret
+.size get_syscall_user_rbp, . - get_syscall_user_rbp
+
+.global get_syscall_user_r12
+.type get_syscall_user_r12, @function
+get_syscall_user_r12:
+    movq syscall_user_r12(%rip), %rax
+    ret
+.size get_syscall_user_r12, . - get_syscall_user_r12
+
+.global get_syscall_user_r13
+.type get_syscall_user_r13, @function
+get_syscall_user_r13:
+    movq syscall_user_r13(%rip), %rax
+    ret
+.size get_syscall_user_r13, . - get_syscall_user_r13
+
+.global get_syscall_user_r14
+.type get_syscall_user_r14, @function
+get_syscall_user_r14:
+    movq syscall_user_r14(%rip), %rax
+    ret
+.size get_syscall_user_r14, . - get_syscall_user_r14
+
+.global get_syscall_user_r15
+.type get_syscall_user_r15, @function
+get_syscall_user_r15:
+    movq syscall_user_r15(%rip), %rax
+    ret
+.size get_syscall_user_r15, . - get_syscall_user_r15
 
 .section .text
 
@@ -106,6 +166,12 @@ syscall_entry:
     movq user_rsp_save(%rip), %rax         # Use RAX as scratch now (already saved)
     movq %rax, syscall_user_rsp(%rip)      # User RSP
     movq %r11, syscall_user_rflags(%rip)   # User RFLAGS
+    movq %rbx, syscall_user_rbx(%rip)      # User callee-saved
+    movq %rbp, syscall_user_rbp(%rip)
+    movq %r12, syscall_user_r12(%rip)
+    movq %r13, syscall_user_r13(%rip)
+    movq %r14, syscall_user_r14(%rip)
+    movq %r15, syscall_user_r15(%rip)
 
     # Restore RAX from saved value before pushing to frame
     movq syscall_user_rax(%rip), %rax
@@ -300,10 +366,10 @@ syscall_set_return_context:
 # ============================================================================
 # Jump to Userspace with Return Value
 # ============================================================================
-# void jump_to_userspace_with_retval(u64 entry_point, u64 user_stack, i64 retval)
+# void jump_to_userspace_with_retval(u64 entry_point, u64 user_stack, i64 retval, ParentContext* ctx)
 #
-# Similar to jump_to_userspace, but sets RAX to retval before jumping.
-# Used by sys_exit to return to parent with the child's exit code.
+# Returns to an existing userspace context (parent after child exit), restoring
+# callee-saved registers from ctx and setting RAX to retval.
 #
 .global jump_to_userspace_with_retval
 .type jump_to_userspace_with_retval, @function
@@ -312,6 +378,7 @@ jump_to_userspace_with_retval:
     #   RDI = entry point (user RIP)
     #   RSI = user stack pointer
     #   RDX = return value (to put in RAX)
+    #   RCX = ParentContext*
 
     # Disable interrupts during transition
     cli
@@ -321,28 +388,18 @@ jump_to_userspace_with_retval:
 
     pushq $0x23                  # SS (user data, ring 3)
     pushq %rsi                   # RSP (user stack)
-    pushq $0x202                 # RFLAGS (IF=1, reserved bit 1 = 1)
+    pushq 16(%rcx)               # RFLAGS (saved parent flags)
     pushq $0x1B                  # CS (user code, ring 3)
     pushq %rdi                   # RIP (entry point)
 
-    # Set return value in RAX (this is the key difference!)
+    # Set return value in RAX and restore parent callee-saved registers.
     movq %rdx, %rax
-
-    # Clear other registers (security)
-    xorq %rbx, %rbx
-    xorq %rcx, %rcx
-    xorq %rdx, %rdx
-    xorq %rdi, %rdi
-    xorq %rsi, %rsi
-    xorq %rbp, %rbp
-    xorq %r8, %r8
-    xorq %r9, %r9
-    xorq %r10, %r10
-    xorq %r11, %r11
-    xorq %r12, %r12
-    xorq %r13, %r13
-    xorq %r14, %r14
-    xorq %r15, %r15
+    movq 32(%rcx), %rbx
+    movq 40(%rcx), %rbp
+    movq 48(%rcx), %r12
+    movq 56(%rcx), %r13
+    movq 64(%rcx), %r14
+    movq 72(%rcx), %r15
 
     # Jump to userspace!
     iretq
