@@ -225,3 +225,58 @@ pub fn memcmp(a: *u8, b: *u8, n: i64) -> i32
         if *(a + i) > *(b + i)
             return 1
     return 0
+
+# ----------------------------------------------------------------------------
+# Compiler-synthesized primitives
+#
+# LLVM may emit calls to these even when no Ritz source names them:
+#   - at -O2 it rewrites `memcmp(a, b, n) == 0` into `bcmp`, since only
+#     equality is observed and bcmp need not compute an ordering;
+#   - it lowers copies it cannot prove non-overlapping into `memmove`.
+#
+# Ritz links freestanding with no libc, so ritzlib must supply the whole set
+# LLVM is entitled to synthesize (memcpy, memset, memcmp, bcmp, memmove).
+# Omitting one does not fail at compile time — it fails at link time, far from
+# the cause. That is how bootstrap stage 2 broke: building ritz1 died on
+# `undefined reference to 'bcmp'` from a comparison nobody wrote.
+#
+# Keep this set complete. Adding a definition here is cheap; diagnosing the
+# link error it prevents is not.
+# ----------------------------------------------------------------------------
+
+# Equality-only comparison. Returns 0 when the first n bytes match, non-zero
+# otherwise. Unlike memcmp the magnitude and sign carry no meaning, which is
+# what lets it stop at the first differing byte without ordering it.
+pub fn bcmp(a: *u8, b: *u8, n: i64) -> i32
+    for i in 0..n
+        if *(a + i) != *(b + i)
+            return 1
+    return 0
+
+# Copy that stays correct when the regions overlap.
+#
+# Direction matters: copying forward while dest > src overwrites source bytes
+# before they are read. Comparing as integers because Ritz has no relational
+# operator on raw pointers.
+pub fn memmove(dest: *u8, src: *u8, n: i64) -> *u8
+    if n <= 0
+        return dest
+
+    let d: i64 = dest as i64
+    let s: i64 = src as i64
+    if d == s
+        return dest
+
+    if d < s
+        # Destination is below the source: ascending order reads each byte
+        # before the write that would clobber it.
+        for i in 0..n
+            *(dest + i) = *(src + i)
+    else
+        # Destination overlaps above the source: walk down from the top.
+        var i: i64 = n
+        while i > 0
+            i = i - 1
+            *(dest + i) = *(src + i)
+
+    return dest

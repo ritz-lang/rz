@@ -44,6 +44,25 @@ RITZ_START = RUNTIME_DIR / f"ritz_start.{ARCH}.o"           # main(argc, argv)
 RITZ_START_NOARGS = RUNTIME_DIR / f"ritz_start_noargs.{ARCH}.o"  # main()
 RITZ_START_ENVP = RUNTIME_DIR / f"ritz_start_envp.{ARCH}.o"      # main(argc, argv, envp)
 
+# Ritz links freestanding: no libc, direct syscalls only. A hosted clang does
+# not know that. Its loop-idiom recognizer happily rewrites an ordinary byte
+# loop into a call to bcmp/memcpy/memset/memmove, so code that never named a
+# libc function still ends up referencing one — and the link fails with an
+# undefined reference far from the loop that caused it.
+#
+# This is not hypothetical. Building ritz1 failed with
+# `undefined reference to 'bcmp'` from monomorph.ritz, where the only source
+# construct was ritzlib's hand-written memcmp comparison loop, inlined and then
+# recognized by clang -O2.
+#
+# Worse, the same pass can rewrite ritzlib's own memcpy loop into a call to
+# memcpy, turning the definition into infinite self-recursion.
+#
+# -ffreestanding tells clang there is no hosted library; -fno-builtin stops it
+# assuming the semantics of any libc symbol we do define ourselves. The UEFI
+# path already passed -ffreestanding; the Linux path never did.
+FREESTANDING_FLAGS = ["-ffreestanding", "-fno-builtin"]
+
 # Add ritz0 to path for import resolver (must be done before importing)
 RITZ0_DIR = ROOT / "ritz0"
 if str(RITZ0_DIR) not in sys.path:
@@ -899,6 +918,7 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
                         # step doesn't have to re-lower it on every invocation.
                         clang_obj = subprocess.run(
                             ["clang", "-c", "-O2", "-fPIC",
+                             *FREESTANDING_FLAGS,
                              str(ll_path), "-o", str(obj_path)],
                             capture_output=True, text=True,
                         )
@@ -989,6 +1009,7 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
             # even ones that re-invoke ritz1 — skip clang's slow path.
             clang_obj = subprocess.run(
                 ["clang", "-c", "-O2", "-fPIC",
+                 *FREESTANDING_FLAGS,
                  str(ll_path), "-o", str(obj_path)],
                 capture_output=True, text=True,
             )
@@ -1240,6 +1261,7 @@ def compile_freestanding_binary(
                 clang_cmd = [
                     "clang", "-c",
                     f"--target={target}",
+                    *FREESTANDING_FLAGS,
                     "-march=native",  # Enable CPU-specific features (SHA-NI, AES-NI, etc.)
                     "-msha",  # Force SHA extensions: cryptosec emits SHA intrinsics
                               # in dead SHA-NI dispatch path; runtime detection
@@ -1782,6 +1804,18 @@ def cmd_build(args):
 
     success = True
     for pkg_dir, config in targets:
+        # A test-only package (`[build] test_only = true`) deliberately declares
+        # no [[bin]], so get_binaries() returns [] and build_package() returns an
+        # empty list. That is success, not failure.
+        #
+        # cmd_test() already special-cases these; cmd_build() did not, so the
+        # empty result silently flipped success to False and `build --all`
+        # exited 1 having printed no error whatsoever — the package name was the
+        # last thing on stdout. Keep the two commands in agreement.
+        if config.get("build", {}).get("test_only", False):
+            print(f"📦 {config['package']['name']} (test-only, nothing to build)")
+            continue
+
         built = build_package(pkg_dir, config, keep_artifacts=keep_artifacts, use_cache=use_cache, profile_name=profile_name, compiler=compiler)
         if not built:
             success = False

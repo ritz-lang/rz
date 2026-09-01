@@ -301,6 +301,22 @@ def compute_compiler_hash(project_root: Path, compiler: str = "ritz0") -> str:
     h = hashlib.sha256()
     h.update(f"compiler={compiler}\n".encode())  # namespace the digest
 
+    # build.py is codegen-critical for BOTH compilers: it owns the clang flag
+    # list (notably -ffreestanding/-fno-builtin), the runtime shim selection and
+    # the link order. Changing any of those changes the emitted objects just as
+    # surely as changing a file inside ritz0/ does.
+    #
+    # It was previously omitted, so the fingerprint could not see a codegen
+    # change that lived outside ritz0/. Adding -ffreestanding to the clang
+    # invocation left the fingerprint identical, every cached .o was reused
+    # verbatim, and the build kept failing with the exact same link error the
+    # flag was added to fix — including the same object hash, which is what
+    # gave it away.
+    build_driver = project_root / "build.py"
+    if build_driver.is_file():
+        h.update(b"build-driver\x00")
+        _hash_file_into(h, build_driver)
+
     if compiler == "ritz0":
         ritz0_root = project_root / "ritz0"
         if not ritz0_root.is_dir():
