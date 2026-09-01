@@ -65,7 +65,7 @@ boundary between the program and the rest of the world?**
 
 ## New entry-point ABI
 
-### Signatures (three accepted; compiler picks the right adapter)
+### Signatures (three accepted; one canonical entry symbol)
 
 ```ritz
 # Default — the "hello world" shape
@@ -93,8 +93,27 @@ pub fn main(args: Span<StrView>, env: Span<StrView>) -> i32
 ```
 
 The compiler matches the user's `main` by arity (0, 1, 2) and arg shape
-(`Span<StrView>`). Three signatures, one runtime entry, one adapter generated
-at compile time per binary.
+(`Span<StrView>`). All three are emitted under one canonical 2-arg ABI —
+`main(args: Span<StrView>, env: Span<StrView>) -> i32` — with unused
+parameters silently accepted and discarded. The runtime always calls
+`main(args, env)` with no arity branching.
+
+### Overriding the entry symbol
+
+The linker symbol the runtime calls is `main` by default. Any binary may
+override this in its `ritz.toml`:
+
+```toml
+[[bin]]
+name = "kernel"
+entry = "kernel_main"     # default: "main"
+```
+
+The named function must still match one of the three accepted shapes. This
+exists for niche cases (kernel entry points, embedded firmware, custom
+runtimes) — application code never needs it. The override only changes
+**which `pub fn`** the runtime dispatches to; the canonical 2-arg ABI and
+all `Display` / `Writer` machinery are unaffected.
 
 ### Env API for the 99% case
 
@@ -122,14 +141,19 @@ they just don't have to declare interest in it at the entry point.
 ```
 kernel exec()                   ← stack: argc, argv[], NULL, envp[], NULL, auxv...
   ↓
-_start (≤10 lines asm)          ← ritzlib/runtime/start.x86_64.S — forced by kernel ABI
+_start (≤10 lines asm)          ← ritzlib/runtime/start.x86_64.ll — forced by kernel ABI
   ↓
 fn ritz_start(argc, argv, envp) ← Ritz!  In ritzlib.entry
   ↓
-   builds Span<StrView> for argv, envp; calls user main
+   builds Span<StrView> for argv, envp; calls main(args, env) directly
   ↓
-pub fn main(args, env) -> i32   ← user code
+pub fn main(...) -> i32         ← user code, emitted under canonical 2-arg ABI
 ```
+
+No synthesized adapter symbol — the linker symbol called by `ritz_start` is
+literally the user's `pub fn main` (or whatever `[[bin]] entry` names). The
+compiler's only job for entry-point dispatch is **emitting** `main` with the
+canonical signature regardless of declared arity; no runtime indirection.
 
 The single `_start` is in assembly because the kernel sets up the stack layout
 in a way that's not accessible from a normal C-ABI Ritz function call (no
@@ -147,9 +171,13 @@ The three existing .ll shims (`ritz_start.x86_64.ll`,
   hint pointing at the canonical signatures.
 - `pub fn main` (no return type) is treated as `-> i32`, with `0` returned
   implicitly when the body falls through.
-- A program without `pub fn main` is a link error (`error: no public main`).
+- A program without `pub fn main` (or the configured `[[bin]] entry` symbol)
+  is a link error (`error: no public main`).
 - `fn main` (without `pub`) is a compile error: `error: main must be declared
   pub` — addresses the consistency issue spotted in rzrz.
+- `[[bin]] entry = "<name>"` in `ritz.toml` overrides which `pub fn` the
+  runtime dispatches to. Default is `main`. The named function must match
+  one of the three accepted shapes.
 - **No deprecation window.** Legacy `main(argc: i32, argv: **u8, ...)`
   signatures are rejected in the same branch that lands the new ABI.
   Workspace migration happens in the same commit-set.
@@ -383,13 +411,17 @@ landing onto main.
 
 ## Decision log (resolved 2026-05-06)
 
-1. **main ABI shape — RESOLVED: three accepted signatures.**
-   `pub fn main()`, `pub fn main(args: Span<StrView>)`,
-   `pub fn main(args: Span<StrView>, env: Span<StrView>)`. Compiler picks the
-   right runtime adapter from arity. Env access for the 99% case lives in
-   `ritzlib.os.env` as free functions (`env.get`, `env.get_or`, `env.must`,
-   `env.iter`). Most code never has to declare interest in env at the entry
-   point.
+1. **main ABI shape — RESOLVED: three accepted signatures, one canonical
+   entry symbol.** `pub fn main()`, `pub fn main(args: Span<StrView>)`,
+   `pub fn main(args: Span<StrView>, env: Span<StrView>)`. All three are
+   emitted under the canonical 2-arg ABI `main(args, env) -> i32` with
+   unused parameters silently accepted and discarded — the runtime always
+   calls `main(args, env)` directly with no synthesized adapter and no
+   arity branching. Env access for the 99% case lives in `ritzlib.os.env`
+   as free functions (`env.get`, `env.get_or`, `env.must`, `env.iter`).
+   Most code never has to declare interest in env at the entry point. The
+   entry symbol can be overridden per-binary via `[[bin]] entry = "..."`
+   in `ritz.toml`; default is `main`.
 
 2. **`pub fn main` return type — RESOLVED: optional, defaults to `-> i32`
    with implicit 0.** Drives the absolute minimum-syntax `hello world`:

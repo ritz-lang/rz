@@ -1,0 +1,126 @@
+# ritzlib/entry.ritz - Ritz-native runtime entry point
+#
+# This module replaces the C-shaped (argc, argv, envp) entry-point ABI with a
+# typed, pre-measured Ritz one. The asm `_start` shim in
+# `runtime/start.x86_64.ll` calls `ritz_start(argc, argv, envp)` here, which:
+#   1. Builds a `Span<StrView>` for argv (every C string measured by strlen).
+#   2. Builds a `Span<StrView>` for envp (NUL-terminated array, NUL-terminated
+#      strings — same shape as argv but len is computed by walking until NULL).
+#   3. Calls the binary's entry function (`main` by default) with the canonical
+#      2-arg signature `(args, env) -> i32`.
+#   4. Calls sys_exit with the return code; never returns.
+#
+# # Entry-point convention
+#
+# The linker symbol called by `ritz_start` is `main` by default. It may be
+# overridden per-binary via `[[bin]] entry = "<symbol>"` in `ritz.toml`. The
+# user writes one of three accepted signatures in source:
+#
+#   pub fn main() -> i32                                          # arity 0
+#   pub fn main(args: Span<StrView>) -> i32                       # arity 1
+#   pub fn main(args: Span<StrView>, env: Span<StrView>) -> i32   # arity 2
+#
+# The compiler emits the entry symbol under the canonical 2-arg ABI
+# regardless of declared arity — unused parameters are accepted and
+# discarded — so this file always calls `main(args, env)` with no branching.
+#
+# For `pub fn main()` with no return-type annotation, the compiler treats the
+# body as `-> i32` and inserts an implicit `return 0` at fall-through.
+
+import ritzlib.sys
+import ritzlib.span
+import ritzlib.strview
+import ritzlib.memory
+
+# ============================================================================
+# External: the binary's entry function
+# ============================================================================
+#
+# The compiler emits this symbol with the canonical 2-arg ABI. By default it
+# is the user's `pub fn main`; via `[[bin]] entry = "..."` in ritz.toml it can
+# be any other `pub fn` with one of the three accepted signatures.
+
+extern fn main(args: Span<StrView>, env: Span<StrView>) -> i32
+
+# ============================================================================
+# argv → Span<StrView>
+# ============================================================================
+#
+# argv is an array of `argc` C strings followed by NULL. Each string is
+# NUL-terminated. We walk argv, strlen() each pointer, and build a
+# StrView{ptr, len} for each.
+
+fn build_args_span(argc: i32, argv: **u8) -> Span<StrView>
+    if argc <= 0 or argv == null
+        return span_empty<StrView>()
+
+    let n: i64 = argc as i64
+    let bytes: i64 = n * 16     # sizeof(StrView) = 16 (ptr + i64 len)
+    let buf: *u8 = malloc(bytes)
+    if buf == null
+        return span_empty<StrView>()
+
+    let arr: *StrView = buf as *StrView
+    var i: i32 = 0
+    while i < argc
+        let cstr: *u8 = *(argv + i)
+        var view: StrView
+        view.ptr = cstr
+        view.len = strlen(cstr)
+        *(arr + i) = view
+        i = i + 1
+
+    return span_from_ptr<StrView>(arr, n)
+
+# ============================================================================
+# envp → Span<StrView>
+# ============================================================================
+#
+# envp is a NUL-terminated array of "KEY=VALUE" C strings. Walk to find the
+# count, then build StrView for each entry. The StrView covers the entire
+# "KEY=VALUE" — splitting into key/value happens in ritzlib.os.env.
+
+fn count_envp(envp: **u8) -> i32
+    if envp == null
+        return 0
+    var n: i32 = 0
+    while *(envp + n) != null
+        n = n + 1
+    return n
+
+fn build_env_span(envp: **u8) -> Span<StrView>
+    if envp == null
+        return span_empty<StrView>()
+
+    let count: i32 = count_envp(envp)
+    if count == 0
+        return span_empty<StrView>()
+
+    let n: i64 = count as i64
+    let bytes: i64 = n * 16
+    let buf: *u8 = malloc(bytes)
+    if buf == null
+        return span_empty<StrView>()
+
+    let arr: *StrView = buf as *StrView
+    var i: i32 = 0
+    while i < count
+        let cstr: *u8 = *(envp + i)
+        var view: StrView
+        view.ptr = cstr
+        view.len = strlen(cstr)
+        *(arr + i) = view
+        i = i + 1
+
+    return span_from_ptr<StrView>(arr, n)
+
+# ============================================================================
+# ritz_start — the Ritz-side entry, called from the asm _start shim
+# ============================================================================
+
+pub fn ritz_start(argc: i32, argv: **u8, envp: **u8) -> i32
+    let args: Span<StrView> = build_args_span(argc, argv)
+    let env: Span<StrView> = build_env_span(envp)
+    let rc: i32 = main(args, env)
+    sys_exit(rc as i64)
+    return 0   # unreachable — sys_exit doesn't return
