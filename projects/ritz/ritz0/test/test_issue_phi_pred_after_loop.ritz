@@ -1,0 +1,149 @@
+# Regression (ritz-task-1267): an `if / else` whose ELSE arm contains a
+# loop used to make ritz1 emit a PHI naming the wrong predecessor.
+#
+# `s.current_label` is the emitter's insertion point, and every PHI
+# predecessor label is derived from it.  STMT_WHILE / STMT_LOOP / STMT_FOR
+# opened their exit block with a bare `emit_label(...) + ":\n"` and never
+# refreshed `s.current_label`.  So after
+#
+#     if cond
+#         returning_call(x)        # then-arm value
+#     else
+#         while ...                # loop: body blocks emitted last
+#             ...
+#         returning_call(x)        # else-arm value, in the loop-EXIT block
+#
+# the IF emitter captured `else_exit_label` = the loop *body*'s last block
+# rather than the loop-exit block, producing
+#
+#     %m = phi i64 [ %then, %Lthen ], [ %else, %Lbody ]
+#
+# when the real CFG predecessor was %Lexit.  clang rejected it with both
+# "PHI node entries do not match predecessors!" and "Instruction does not
+# dominate all uses!" (the `sext i32 -> i64` of the i32-returning call lives
+# in %Lexit, which does not dominate %Lbody).
+#
+# Discovered self-compiling ritz1's own `fn_cache.ritz::sig_serialize`,
+# which has exactly this shape — it blocked bootstrap stage 4.
+#
+# Fix: `begin_block(s, label)` is now the only way to open a basic block;
+# it welds "emit the label" to "record the insertion point" so no construct
+# can leak a stale `current_label` into a PHI again.  Same bug family as
+# ritz-task-195 (STMT_BREAK/CONTINUE).
+
+# Returns i32 so the caller must `sext i32 -> i64` — that sext is what
+# ends up in the loop-exit block and fails to dominate the bad PHI.
+fn bump(x: i32) -> i32
+    return x + 1
+
+# ELSE arm ends *after* a `while` loop.
+fn while_in_else(cond: i32, n: i32) -> i32
+    var acc: i32 = 0
+    if cond == 1
+        acc = acc + 1
+        bump(acc)
+    else
+        var i: i32 = 0
+        while i < n
+            acc = acc + 2
+            i = i + 1
+        # Tail call in the loop-EXIT block: this is the else-arm value.
+        bump(acc)
+    return acc
+
+# ELSE arm ends after an infinite `loop` broken out of.
+fn loop_in_else(cond: i32, n: i32) -> i32
+    var acc: i32 = 0
+    if cond == 1
+        acc = acc + 1
+        bump(acc)
+    else
+        var i: i32 = 0
+        loop
+            if i >= n
+                break
+            acc = acc + 2
+            i = i + 1
+        bump(acc)
+    return acc
+
+# ELSE arm ends after a `for` range loop.
+fn for_in_else(cond: i32, n: i32) -> i32
+    var acc: i32 = 0
+    if cond == 1
+        acc = acc + 1
+        bump(acc)
+    else
+        for i in 0..n
+            acc = acc + 2
+        bump(acc)
+    return acc
+
+# THEN arm holds the loop instead — the mirror image, exercising
+# `then_exit_label` rather than `else_exit_label`.
+fn while_in_then(cond: i32, n: i32) -> i32
+    var acc: i32 = 0
+    if cond == 1
+        var i: i32 = 0
+        while i < n
+            acc = acc + 2
+            i = i + 1
+        bump(acc)
+    else
+        acc = acc + 1
+        bump(acc)
+    return acc
+
+# Nested: a loop inside a loop inside the else arm, so the stale label
+# would be two levels deep.
+fn nested_loops_in_else(cond: i32, n: i32) -> i32
+    var acc: i32 = 0
+    if cond == 1
+        acc = acc + 1
+        bump(acc)
+    else
+        var i: i32 = 0
+        while i < n
+            var j: i32 = 0
+            while j < 2
+                acc = acc + 1
+                j = j + 1
+            i = i + 1
+        bump(acc)
+    return acc
+
+
+[[test]]
+fn test_while_in_else() -> i32
+    assert while_in_else(1, 3) == 1
+    assert while_in_else(0, 3) == 6
+    assert while_in_else(0, 0) == 0
+    0
+
+[[test]]
+fn test_loop_in_else() -> i32
+    assert loop_in_else(1, 3) == 1
+    assert loop_in_else(0, 3) == 6
+    assert loop_in_else(0, 0) == 0
+    0
+
+[[test]]
+fn test_for_in_else() -> i32
+    assert for_in_else(1, 3) == 1
+    assert for_in_else(0, 3) == 6
+    assert for_in_else(0, 0) == 0
+    0
+
+[[test]]
+fn test_while_in_then() -> i32
+    assert while_in_then(1, 3) == 6
+    assert while_in_then(1, 0) == 0
+    assert while_in_then(0, 3) == 1
+    0
+
+[[test]]
+fn test_nested_loops_in_else() -> i32
+    assert nested_loops_in_else(1, 3) == 1
+    assert nested_loops_in_else(0, 3) == 6
+    assert nested_loops_in_else(0, 0) == 0
+    0

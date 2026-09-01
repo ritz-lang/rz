@@ -13,6 +13,7 @@ import tokens_gen
 import nfa
 import regex
 import ritzlib.strview
+import ritzlib.memory
 
 # Pre-allocated limits
 const MAX_PATTERNS: i32 = 64
@@ -31,8 +32,10 @@ struct TokenPattern
 # Maximum indentation depth (nested blocks)
 const MAX_INDENT_DEPTH: i32 = 64
 
-# Maximum size for processed string literals
-const MAX_STRING_LEN: i32 = 8192
+# Initial capacity of the cooked-string scratch buffer.  This is a starting
+# size, NOT a cap — `lexer_str_push` grows it geometrically.  See the
+# `string_buf` comment on `struct Lexer`.
+const STRING_SCRATCH_INIT: i32 = 256
 
 # Lexer state
 # NOTE: Using i64 for position/length fields to handle large files; i32 elsewhere for efficiency
@@ -53,9 +56,28 @@ struct Lexer
   at_line_start: i32       # 1 if at start of line, 0 otherwise
   pending_dedents: i32     # Number of DEDENT tokens to emit
   bracket_depth: i32       # Nesting depth of (), [], {} - suppress INDENT/DEDENT when > 0
-  # String buffer for processed string literals (escapes expanded)
-  string_buf: [8192]i8     # Buffer for cooked string data
-  string_pos: i32          # Current write position in string_buf
+  # Cooked-string scratch buffer (escapes expanded).  ritz-task-1267.
+  #
+  # This used to be a fixed `[8192]i8` arena shared by *every* string
+  # literal in the file, with each write guarded by `if pos < MAX_STRING_LEN`.
+  # Once a source file's literals totalled more than 8 KiB the guard
+  # silently stopped writing: the token that straddled the boundary got a
+  # truncated `string_len` and every literal after it got `string_len == 0`.
+  # ritz1 compiling its own `emitter.ritz` (8 KiB of literals by
+  # `register_builtin_structs`) therefore emitted `@.str.N = [1 x i8] c"\00"`
+  # for the tail of the module — producing, among other things, a struct
+  # named `%\00\00\00` and a `.ll` with no `; ModuleID` header.  A compiler
+  # must never silently drop source, and a fixed arena can't express
+  # "however many literals this file has", so the arena is gone.
+  #
+  # Now: a single heap scratch buffer that grows on demand and is rewound
+  # (`string_pos = 0`) at the start of each literal.  `lexer_str_finish`
+  # copies the finished literal into its own exact-sized heap allocation,
+  # so token `string_val` pointers are stable for the life of the process
+  # and are unaffected by later growth or by `lexer_reset` between files.
+  string_buf: *i8          # heap scratch; null until the first literal
+  string_cap: i32          # bytes allocated in string_buf
+  string_pos: i32          # write cursor within the literal being cooked
 
 # Reset lexer for new source (preserves NFA and patterns, resets state)
 # Use this when reusing a lexer for multiple files to avoid stack overflow
@@ -91,9 +113,57 @@ fn lexer_init(lex: *Lexer, src: *u8, len: i32, nfa: *NFA, patterns: *TokenPatter
   lex.at_line_start = 1    # Start at beginning of first line
   lex.pending_dedents = 0
   lex.bracket_depth = 0    # Not inside any brackets
-  # Initialize string buffer
+  # Initialize the cooked-string scratch.  Lexers are usually `var lex: Lexer`
+  # on the stack, so these MUST be zeroed here — a garbage `string_buf` would
+  # be handed straight to realloc.
+  lex.string_buf = null
+  lex.string_cap = 0
   lex.string_pos = 0
   0
+
+# ============================================================================
+# Cooked-string scratch buffer (ritz-task-1267)
+# ============================================================================
+#
+# Contract: `lexer_str_begin` before the first byte of a literal,
+# `lexer_str_push` per cooked byte, `lexer_str_finish` to take ownership of
+# an exact-sized, NUL-terminated heap copy.  The scratch itself is reused
+# across literals; the copy is what tokens point at.
+
+# Rewind the scratch to the start of a fresh literal.
+fn lexer_str_begin(lex: *Lexer)
+  lex.string_pos = 0
+
+# Append one cooked byte, growing the scratch geometrically.  There is
+# deliberately no upper bound: the only limit on a string literal's length
+# is available memory.
+fn lexer_str_push(lex: *Lexer, b: i8)
+  if lex.string_pos >= lex.string_cap
+    var new_cap: i32 = lex.string_cap * 2
+    if new_cap < STRING_SCRATCH_INIT
+      new_cap = STRING_SCRATCH_INIT
+    let grown: *u8 = realloc(lex.string_buf as *u8, new_cap as i64)
+    if grown == null
+      return
+    lex.string_buf = grown as *i8
+    lex.string_cap = new_cap
+  *(lex.string_buf + lex.string_pos) = b
+  lex.string_pos = lex.string_pos + 1
+
+# Copy the cooked literal into its own heap allocation and return it.
+# NUL-terminated so callers that treat it as a cstring keep working; the
+# authoritative length is `lex.string_pos` (embedded NULs are legal).
+fn lexer_str_finish(lex: *Lexer) -> *u8
+  let n: i32 = lex.string_pos
+  let out: *u8 = malloc((n as i64) + 1)
+  if out == null
+    return null
+  var i: i32 = 0
+  while i < n
+    *(out + i) = (*(lex.string_buf + i)) as u8
+    i = i + 1
+  *(out + n) = 0
+  out
 
 # Add a token pattern to the lexer.
 #
@@ -374,7 +444,7 @@ fn lexer_next(lex: *Lexer) -> Token
       lex.col = lex.col + 1
 
       # Reset string buffer position for this string
-      let str_start: i32 = lex.string_pos
+      lexer_str_begin(lex)
 
       # Scan until closing quote, processing escapes into string_buf
       var found_close: i32 = 0
@@ -411,16 +481,12 @@ fn lexer_next(lex: *Lexer) -> Token
               # Unknown escape - just emit the literal char
               cooked = esc_ch as i8
             # Store cooked char in buffer
-            if lex.string_pos < MAX_STRING_LEN
-              lex.string_buf[lex.string_pos] = cooked
-              lex.string_pos = lex.string_pos + 1
+            lexer_str_push(lex, cooked)
             lex.pos = lex.pos + 1
             lex.col = lex.col + 1
         else
           # Regular character - copy as-is
-          if lex.string_pos < MAX_STRING_LEN
-            lex.string_buf[lex.string_pos] = str_ch as i8
-            lex.string_pos = lex.string_pos + 1
+          lexer_str_push(lex, str_ch as i8)
           lex.pos = lex.pos + 1
           lex.col = lex.col + 1
 
@@ -429,8 +495,8 @@ fn lexer_next(lex: *Lexer) -> Token
         var tok: Token = token_new(TOK_STRING, start, len, line, col)
         tok.start = lex.src + start
         # Set cooked string pointer and length
-        tok.string_val = (@lex.string_buf[str_start]) as *u8
-        tok.string_len = lex.string_pos - str_start
+        tok.string_val = lexer_str_finish(lex)
+        tok.string_len = lex.string_pos
         return tok
       # If unterminated, fall through to error handling below
 
@@ -534,7 +600,7 @@ fn lexer_next(lex: *Lexer) -> Token
             let col: i32 = lex.col
             lex.pos = lex.pos + 2  # skip prefix + opening quote
             lex.col = lex.col + 2
-            let str_start: i32 = lex.string_pos
+            lexer_str_begin(lex)
             var found_close: i32 = 0
             while lex.pos < lex.len
                 let str_ch: i32 = lexer_peek_at(lex, 0)
@@ -563,23 +629,19 @@ fn lexer_next(lex: *Lexer) -> Token
                             cooked = 34
                         else if esc_ch == 48
                             cooked = 0
-                        if lex.string_pos < MAX_STRING_LEN
-                            lex.string_buf[lex.string_pos] = cooked
-                            lex.string_pos = lex.string_pos + 1
+                        lexer_str_push(lex, cooked)
                         lex.pos = lex.pos + 1
                         lex.col = lex.col + 1
                 else
-                    if lex.string_pos < MAX_STRING_LEN
-                        lex.string_buf[lex.string_pos] = str_ch as i8
-                        lex.string_pos = lex.string_pos + 1
+                    lexer_str_push(lex, str_ch as i8)
                     lex.pos = lex.pos + 1
                     lex.col = lex.col + 1
             if found_close == 1
                 let len: i32 = lex.pos - start
                 var tok: Token = token_new(TOK_CSTRING, start, len, line, col)
                 tok.start = lex.src + start
-                tok.string_val = (@lex.string_buf[str_start]) as *u8
-                tok.string_len = lex.string_pos - str_start
+                tok.string_val = lexer_str_finish(lex)
+                tok.string_len = lex.string_pos
                 return tok
 
     # Create and return the token
@@ -616,7 +678,7 @@ fn lexer_next(lex: *Lexer) -> Token
       if best_type == TOK_CSTRING
         prefix = 2  # `c"`
       var i: i32 = prefix
-      let str_start: i32 = lex.string_pos
+      lexer_str_begin(lex)
       while i < best_len - 1  # stop before closing quote
         let raw: i32 = (*(lex.src + start + i)) & 255
         if raw == 92 and i + 1 < best_len - 1  # backslash escape
@@ -634,17 +696,13 @@ fn lexer_next(lex: *Lexer) -> Token
             cooked = 34
           else if esc == 48   # \0
             cooked = 0
-          if lex.string_pos < MAX_STRING_LEN
-            lex.string_buf[lex.string_pos] = cooked
-            lex.string_pos = lex.string_pos + 1
+          lexer_str_push(lex, cooked)
           i = i + 2
         else
-          if lex.string_pos < MAX_STRING_LEN
-            lex.string_buf[lex.string_pos] = raw as i8
-            lex.string_pos = lex.string_pos + 1
+          lexer_str_push(lex, raw as i8)
           i = i + 1
-      tok.string_val = (@lex.string_buf[str_start]) as *u8
-      tok.string_len = lex.string_pos - str_start
+      tok.string_val = lexer_str_finish(lex)
+      tok.string_len = lex.string_pos
     return tok
 
   # End of input - emit any remaining DEDENTs
