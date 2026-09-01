@@ -16,6 +16,26 @@ import ritz_ast as rast
 from async_transform_v2 import generate_state_machine, AsyncStateMachine
 
 
+class EmitError(Exception):
+    """A user-facing error detected during emission, with a source location.
+
+    Some source errors are only reachable from the emitter. Matching on a
+    variant an enum does not declare is one: `type_checker._check_pattern`
+    silently ignores it, and `--check-types` is off by default, so emission is
+    the first and only pass that notices. Those are still *user* errors and
+    must read like one, so this mirrors the `file:line:column: message` format
+    used by `TypeError`, `OwnershipError`, `NameError` and friends rather than
+    escaping as a bare `ValueError` with a Python traceback attached.
+    """
+
+    def __init__(self, message: str, span: Optional[rast.Span] = None):
+        self.span = span
+        if span:
+            super().__init__(f"{span.file}:{span.line}:{span.column}: {message}")
+        else:
+            super().__init__(message)
+
+
 # ============================================================================
 # Struct Layout Registry
 # ============================================================================
@@ -1906,6 +1926,31 @@ class LLVMEmitter:
             if variant.name == variant_name:
                 return i
         raise ValueError(f"Unknown variant {variant_name} in enum {enum_name}")
+
+    def _has_enum_variant(self, enum_name: str, variant_name: str) -> bool:
+        """Is `variant_name` a declared variant of `enum_name`?
+
+        A non-raising probe, for the places that must *decide between* two
+        emission strategies rather than commit to one. `Enum.name(...)` is
+        ambiguous in the grammar between constructing a variant and calling an
+        inherent method, and only the enum's variant list can tell them apart.
+        """
+        if enum_name not in self.enum_types:
+            return False
+        _, variants = self.enum_types[enum_name]
+        return any(variant.name == variant_name for variant in variants)
+
+    def _require_enum_variant(self, enum_name: str, variant_name: str,
+                              span: Optional[rast.Span]) -> None:
+        """Assert `enum_name` declares `variant_name`, or raise a located error.
+
+        Callers that hold a span use this ahead of the tag/variant lookups so
+        the user sees `file:line:column: Unknown variant X in enum Y` instead of
+        a `ValueError` unwinding out of the emitter.
+        """
+        if not self._has_enum_variant(enum_name, variant_name):
+            raise EmitError(
+                f"Unknown variant {variant_name} in enum {enum_name}", span)
 
     def _get_enum_variant(self, enum_name: str, variant_name: str) -> rast.Variant:
         """Get the Variant object for an enum variant."""
@@ -7985,6 +8030,22 @@ class LLVMEmitter:
 
         For dyn Trait, we use dynamic dispatch through the vtable.
         """
+        # `Enum.Variant(args)` parses as a method call, but constructs a value
+        # rather than dispatching one. Resolve it here, before any receiver
+        # typing is attempted: the receiver is a *type name*, so the fallback
+        # below (emit the receiver, inspect its LLVM type) would try to
+        # evaluate the bare identifier as a value and fail with "Unknown
+        # identifier". The variant-list probe keeps genuine inherent methods on
+        # an enum — `Color.parse(s)` — on the normal dispatch path.
+        if isinstance(expr.expr, rast.Ident):
+            enum_name = expr.expr.name
+            if (enum_name in self.enum_types
+                    and enum_name not in self.locals
+                    and enum_name not in self.params
+                    and self._has_enum_variant(enum_name, expr.method)):
+                return self._emit_enum_variant_constructor_for_type(
+                    expr.method, expr.args, enum_name)
+
         # Check if this is a method call on a dyn Trait (dynamic dispatch)
         receiver_type = self._infer_ritz_type(expr.expr)
         if isinstance(receiver_type, rast.DynType):
@@ -8966,12 +9027,21 @@ class LLVMEmitter:
             pattern = arm.pattern
 
             if isinstance(pattern, rast.VariantPattern):
-                # Find the tag for this variant
+                # Find the tag for this variant. A pattern naming a variant the
+                # scrutinee's enum does not declare is a source error that no
+                # earlier pass rejects, so report it here against the pattern's
+                # own span instead of letting a bare ValueError escape.
+                self._require_enum_variant(enum_name, pattern.name, pattern.span)
                 tag_val = self._get_enum_variant_tag(enum_name, pattern.name)
                 switch.add_case(ir.Constant(self.i8, tag_val), arm_block)
             elif isinstance(pattern, rast.IdentPattern):
                 # IdentPattern with a variant name (e.g., just `None` without parens)
-                if pattern.name in self.variant_to_enum:
+                # `variant_to_enum` is global across every enum in scope, so a
+                # bare name belonging to a *different* enum used to pass this
+                # test and then crash in the tag lookup. An unqualified name is
+                # only a variant case when it belongs to *this* enum; otherwise
+                # it is an ordinary catch-all binding.
+                if self._has_enum_variant(enum_name, pattern.name):
                     tag_val = self._get_enum_variant_tag(enum_name, pattern.name)
                     switch.add_case(ir.Constant(self.i8, tag_val), arm_block)
                 else:

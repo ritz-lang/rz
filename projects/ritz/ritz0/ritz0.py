@@ -24,7 +24,7 @@ from lexer import Lexer, LexerError
 # Use generated parser with adapter (comment out to use hand-written parser)
 # from parser_adapter import Parser, ParseError  # Generated parser
 from parser import Parser, ParseError  # Hand-written parser
-from emitter_llvmlite import emit as emit_llvmlite, get_test_functions, generate_test_main_source
+from emitter_llvmlite import emit as emit_llvmlite, get_test_functions, generate_test_main_source, EmitError
 from import_resolver import resolve_imports, ImportError as RitzImportError
 from name_resolver import resolve_names, NameError as RitzNameError
 from move_checker import MoveChecker, OwnershipError
@@ -263,6 +263,12 @@ def compile_file(source_path: str, output_path: str, no_runtime: bool = False,
         return False
     except RitzImportError as e:
         print(f"Import error: {e}", file=sys.stderr)
+        return False
+    except EmitError as e:
+        # A source error the emitter is the first pass to notice. It already
+        # carries `file:line:column`, so report it like any other diagnostic
+        # and stop -- re-raising would bury it under a Python traceback.
+        print(f"Compiler error: {e}", file=sys.stderr)
         return False
     except Exception as e:
         print(f"Compiler error: {e}", file=sys.stderr)
