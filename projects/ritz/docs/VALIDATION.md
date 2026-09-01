@@ -144,6 +144,28 @@ Almost always a regression in `tools/ritz_lint`, or a missing import in the
 file. Run `python3 ritz0/ritz0.py <file>.ritz -o /tmp/x.ll --no-runtime` in
 isolation and read the error. Don't escalate to level 3 or 4.
 
+### "Clean and incremental give different matrix results"
+
+This is always a bug, never something to work around by cleaning. Make's
+dependency graph is correct and ritz1's caches are keyed to agree with it.
+
+Historically (AGAST #1279) it meant ritz1's file-level fast path was serving
+`.ll` output produced by a *previous* ritz1. The cache key was source hash +
+`.ll` mtime, neither of which mentions the compiler, so rebuilding ritz1 left
+every `<src>.ritz.sig` advertising IR from the binary that had just been
+replaced. Symptoms were spectacular and entirely fictional — an incremental
+`make matrix-full` failing with `PHI node entries do not match predecessors`
+on a tree whose emitter bug was already fixed, and a `ritz1_selfhosted 0/50`
+"NUL-byte miscompilation" that never reproduced from clean. Both were the
+cache talking, not the compiler.
+
+`.ritz.sig` now carries a `compiler_hash` (FNV1a-64 of `/proc/self/exe`) and
+ritz1 refuses to reuse anything — including the `module_ir` splice that
+re-materialises a deleted `.ll` — unless it matches the running binary. If you
+see clean and incremental disagree again, suspect a cache key before you
+suspect codegen, and reach for the A/B in
+`ritz0/test_fn_cache_compiler_identity.py` rather than `make clean`.
+
 ### "The matrix passes locally but fails in CI"
 
 Check that your local `ritz1/build/ritz1` is from the **current** source tree

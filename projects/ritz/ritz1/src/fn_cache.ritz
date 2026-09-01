@@ -11,9 +11,12 @@
 #   1. **File-level fast path** — `check_source_unchanged()` is consulted by
 #      `main.ritz` before any work is done.  When the input source's hash
 #      equals the value stored in `<src>.ritz.sig` AND the output `.ll` exists
-#      with mtime >= source mtime, the entire compile is skipped and the
-#      cached `.ll` is reused as-is.  This alone wipes out ~95% of the cost
-#      on no-change rebuilds.
+#      with mtime >= source mtime AND the sig's `compiler_hash` matches the
+#      running binary, the entire compile is skipped and the cached `.ll` is
+#      reused as-is.  This alone wipes out ~95% of the cost on no-change
+#      rebuilds.  The compiler-identity half of that condition is not
+#      optional: without it the fast path answers from whichever compiler
+#      happened to run last.  See `compiler_fingerprint()` below.
 #
 #   2. **Per-function cache** — during `emit_module()`, each function's
 #      body-token hash is computed and looked up in the cache loaded from
@@ -24,6 +27,7 @@
 # .ritz.sig file format (JSON, established by ritz0):
 #   {
 #     "source_hash": "<16 hex>",
+#     "compiler_hash": "<16 hex>",   # ritz1 extension — see below
 #     "functions": {
 #       "<fn_name>": {
 #         "hash":     "<token-stream hash>",
@@ -38,6 +42,11 @@
 # Both produce 16-hex-char output, so the file format is identical and
 # `.ritz.sig` files written by ritz0 still parse cleanly here — the hash
 # values just won't match, so ritz1 treats them as cold-start cache misses.
+#
+# `compiler_hash` is a ritz1 addition (AGAST #1279).  ritz0 does not write it
+# and ignores it on read; ritz1 requires it to match before reusing anything.
+# ritz0 and ritz1 write to the *same* `<src>.ritz.sig` path, so this field is
+# also what keeps the two from ever consuming each other's cached IR.
 
 import ritzlib.sys
 import ritzlib.io
@@ -70,6 +79,68 @@ pub fn fnv1a_bytes(data: *u8, len: i64) -> u64
 # chars; we mirror the on-disk shape with FNV1a-64 (also 16 hex chars).
 pub fn source_file_hash(src: *u8, len: i64) -> u64
     return fnv1a_bytes(src, len)
+
+# ----------------------------------------------------------------------------
+# Compiler identity
+# ----------------------------------------------------------------------------
+#
+# AGAST #1279.  Cached compilation output is only reusable if the *same
+# compiler* produced it.  Before this existed, `check_source_unchanged()`
+# keyed reuse on the source hash and the .ll mtime alone, so a rebuilt ritz1
+# would happily serve IR emitted by the previous ritz1 — including IR the new
+# compiler would no longer emit (e.g. the invalid-PHI output fixed in 9aab44f).
+# The bootstrap gate then reported pass/fail based on leftover build state
+# rather than on the commit under test, in both directions.
+#
+# `ritz1/Makefile` already lists `$(RITZ1)` as a prerequisite of every
+# `build/%_sh.ll`, so make *does* re-invoke ritz1 when the binary changes;
+# ritz1's own fast path was overriding make's correct decision.  The fix is to
+# make compiler identity part of the cache key so the two agree.
+#
+# This mirrors `cache.py:compute_compiler_hash()` on the ritz0 side, which
+# fingerprints the ritz1 binary by *content*.  We do the same rather than
+# using mtime so that a no-op relink producing a byte-identical binary keeps
+# the cache warm (reuse is genuinely correct in that case), while any change
+# to the emitted-code path invalidates it.
+
+# Read `/proc/self/exe` — the currently executing binary, symlink already
+# resolved by the kernel — and return an FNV1a-64 digest of its contents.
+#
+# Returns 0 when the binary cannot be read.  0 is reserved as the "unknown
+# compiler" sentinel: callers MUST treat it as a cache miss, never as a
+# match, so an unreadable /proc degrades to a full compile rather than to
+# silent reuse of foreign IR.  Sig files written by ritz0 have no
+# `compiler_hash` field and therefore also parse as 0, which is exactly the
+# behaviour we want — ritz0 and ritz1 share the `<src>.ritz.sig` path but
+# must never consume each other's cached IR.
+pub fn compiler_fingerprint() -> u64
+    var sz: i64 = 0
+    let buf: *u8 = read_file_to_buf(c"/proc/self/exe", @sz)
+    if buf == null
+        return 0
+    if sz <= 0
+        free(buf)
+        return 0
+    var h: u64 = fnv1a_bytes(buf, sz)
+    free(buf)
+    # Mix the byte count in too, so a short read can never alias the digest
+    # of a genuinely shorter binary.
+    h = fnv1a_mix_u64(h, sz as u64)
+    # 0 is the "unknown compiler" sentinel; never produce it as a real value.
+    if h == 0
+        h = 1
+    return h
+
+# Fold the 8 little-endian bytes of `v` into an in-progress FNV1a-64 state.
+fn fnv1a_mix_u64(h: u64, v: u64) -> u64
+    var acc: u64 = h
+    var x: u64 = v
+    var i: i32 = 0
+    while i < 8
+        acc = fnv1a_byte(acc, (x & 255) as u8)
+        x = x >> 8
+        i = i + 1
+    return acc
 
 # Format a u64 as exactly 16 lowercase hex chars.  Caller provides a
 # >= 16-byte buffer; we do NOT null-terminate (caller may extend).
@@ -240,13 +311,21 @@ struct SigData
     # absent in sig files written by ritz0; we treat null as "no cache".
     module_ir:     *u8
     module_ir_len: i64
+    # FNV1a-64 of the compiler binary that produced `module_ir` / the
+    # per-function `ir` blobs (AGAST #1279).  0 means "unknown compiler" —
+    # either the field was absent (a ritz0-written sig) or /proc/self/exe was
+    # unreadable at write time.  Cached IR is only reusable when this equals
+    # the running compiler's `compiler_fingerprint()`, and 0 never matches.
+    compiler_hash: u64
 
 # Allocate a fresh empty SigData on the heap.
 pub fn sig_data_new() -> *SigData
-    let sd: *SigData = malloc(72) as *SigData
+    # 96 bytes covers all fields with room for pointer alignment padding.
+    let sd: *SigData = malloc(96) as *SigData
     if sd == null
         return null
     sd.source_hash = 0
+    sd.compiler_hash = 0
     sd.entries = null
     sd.entry_count = 0
     sd.entry_cap = 0
@@ -412,6 +491,12 @@ pub fn read_sig_file(sig_path: *u8) -> *SigData
     let sh_node: *JsonValue = json_get_field(root, c"source_hash")
     if sh_node != null and sh_node.kind == JSON_STRING and sh_node.str_val != null
         sd.source_hash = hex16_to_u64(sh_node.str_val)
+
+    # compiler_hash (string; ritz1 extension — absent in ritz0-written sigs,
+    # in which case it stays 0 and every reuse check below fails closed).
+    let ch_node: *JsonValue = json_get_field(root, c"compiler_hash")
+    if ch_node != null and ch_node.kind == JSON_STRING and ch_node.str_val != null
+        sd.compiler_hash = hex16_to_u64(ch_node.str_val)
 
     # functions (object: name -> {hash, sig_hash, ir})
     let fns_node: *JsonValue = json_get_field(root, c"functions")
@@ -618,6 +703,19 @@ fn sig_serialize(sd: *SigData, buf: *Vec<u8>)
         k = k + 1
     vec_push_str(buf, c"\",\n")
 
+    # compiler_hash (ritz1 extension — ritz0 ignores unknown keys).  Always
+    # emitted so a sig written by ritz1 is unambiguously attributable to the
+    # binary that wrote it.
+    vec_push_str(buf, c"  \"compiler_hash\"")
+    vec_push_str(buf, c": \"")
+    var chex: [16]u8
+    u64_to_hex16(sd.compiler_hash, @chex[0])
+    var ck: i64 = 0
+    while ck < 16
+        vec_push<u8>(buf, chex[ck])
+        ck = ck + 1
+    vec_push_str(buf, c"\",\n")
+
     # functions
     vec_push_str(buf, c"  \"functions\"")
     vec_push_str(buf, c": {")
@@ -689,6 +787,14 @@ pub fn write_sig_file(sig_path: *u8, sd: *SigData) -> i32
 # orchestrator wipes its artifact tempdir between invocations — the
 # `.ritz.sig` lives next to the source and persists across runs.
 # Returns 0 if the caller must do a full compile.
+#
+# BOTH branches are additionally gated on compiler identity (AGAST #1279):
+# the sig's `compiler_hash` must equal this binary's `compiler_fingerprint()`.
+# Gating only (a) would be worse than useless — (b) is the branch that
+# *materialises* stale IR, re-creating a `.ll` that make had just deleted and
+# filling it with output from a compiler that no longer exists.  That is the
+# path that produced `PHI node entries do not match predecessors` on a tree
+# whose emitter bug was already fixed.
 pub fn check_source_unchanged(src_path: *u8, src: *u8, src_len: i64, ll_path: *u8) -> i32
     if src_path == null or ll_path == null or src == null
         return 0
@@ -702,6 +808,15 @@ pub fn check_source_unchanged(src_path: *u8, src: *u8, src_len: i64, ll_path: *u
 
     let cur: u64 = source_file_hash(src, src_len)
     if cur != sd.source_hash
+        sig_data_free(sd)
+        return 0
+
+    # Compiler identity gate.  `compiler_fingerprint()` returns 0 when
+    # /proc/self/exe is unreadable and `sd.compiler_hash` is 0 for sigs with
+    # no such field, so the explicit `== 0` rejection stops two unknowns from
+    # comparing equal and waving stale IR through.
+    let self_fp: u64 = compiler_fingerprint()
+    if self_fp == 0 or sd.compiler_hash == 0 or sd.compiler_hash != self_fp
         sig_data_free(sd)
         return 0
 
