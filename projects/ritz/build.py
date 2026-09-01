@@ -1422,8 +1422,14 @@ def compile_freestanding_binary(
             # This produces a proper PE32+ with optional header that UEFI expects
             import shutil as shutil_mod
 
-            # Check for lld-link
-            lld_link = shutil_mod.which("lld-link")
+            # Check for lld-link.
+            #
+            # Use find_llvm_tool so versioned installs (lld-link-19, ...) are
+            # found — a bare which("lld-link") misses every distro package that
+            # only ships the versioned name.
+            lld_link = find_llvm_tool("lld-link")
+            if not shutil_mod.which(lld_link):
+                lld_link = None
             if lld_link:
                 # Direct PE/COFF linking with lld-link
                 print(f"  📦 Linking PE/COFF with lld-link...")
@@ -1440,55 +1446,31 @@ def compile_freestanding_binary(
                     print(f"  ✗ lld-link failed: {result.stderr}", file=sys.stderr)
                     return None
             else:
-                # Fallback: Link as ELF shared object, then convert to PE with objcopy
-                # Note: This produces a minimal PE that may not work with all UEFI firmwares
-                elf_path = artifact_dir / f"{name}.so"
+                # No lld-link: fail loudly rather than attempt the impossible.
+                #
+                # The objects we just produced are PE/COFF (compiled with
+                # --target=x86_64-unknown-windows-gnu). The old fallback tried
+                # to link them as an ELF shared object with `lld`, which
+                # find_llvm_tool() silently degrades to GNU `ld` when LLVM's
+                # linker is absent. GNU ld cannot link COFF input, so it died
+                # on the Win64 ABI's mandatory SEH unwind data with:
+                #
+                #   dangerous relocation: R_AMD64_IMAGEBASE with __ImageBase
+                #   undefined
+                #
+                # That is not a fixable link — it is a category error, and the
+                # error text points at relocations rather than the real cause
+                # (a missing tool). `__ImageBase` is supplied by lld-link
+                # itself, so there is nothing to define our way out of.
+                print(
+                    f"  ✗ Cannot link UEFI target '{name}': lld-link not found.\n"
+                    f"    UEFI binaries are PE/COFF and require LLVM's COFF "
+                    f"linker; GNU ld cannot link COFF objects.\n"
+                    f"    Install it with:  sudo apt install lld",
+                    file=sys.stderr,
+                )
+                return None
 
-                link_cmd = [
-                    lld,
-                    "-shared",
-                    "-Bsymbolic",
-                    "--no-undefined",
-                    "-o", str(elf_path),
-                ]
-                link_cmd.extend([str(obj) for obj in object_files])
-
-                result = subprocess.run(link_cmd, capture_output=True, text=True)
-                if result.returncode != 0:
-                    print(f"  ✗ Linking failed: {result.stderr}", file=sys.stderr)
-                    return None
-
-                # Convert ELF to PE using objcopy
-                print(f"  📦 Converting to PE/COFF (objcopy fallback)...")
-                objcopy_cmd = [
-                    "objcopy",
-                    "-j", ".text",
-                    "-j", ".rodata",
-                    "-j", ".data",
-                    "-j", ".bss",
-                    "-j", ".rela",
-                    "-O", "pei-x86-64",
-                    str(elf_path),
-                    str(bin_path),
-                ]
-                result = subprocess.run(objcopy_cmd, capture_output=True, text=True)
-                if result.returncode != 0:
-                    print(f"  ✗ objcopy failed: {result.stderr}", file=sys.stderr)
-                    return None
-
-                # Fix PE subsystem field - objcopy doesn't set it correctly for UEFI
-                # The subsystem field is at offset 0x5C in the PE optional header
-                # Value 10 = EFI Application
-                print(f"  🔧 Fixing PE subsystem...")
-                with open(bin_path, 'r+b') as f:
-                    # Read DOS header to find PE header offset
-                    f.seek(0x3C)
-                    pe_offset = int.from_bytes(f.read(4), 'little')
-                    # Subsystem is at PE + 0x5C (in optional header)
-                    subsystem_offset = pe_offset + 0x5C
-                    f.seek(subsystem_offset)
-                    # Write EFI Application subsystem (10)
-                    f.write((10).to_bytes(2, 'little'))
         else:
             # Normal freestanding ELF linking
             link_cmd = [lld]
