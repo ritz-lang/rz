@@ -647,3 +647,50 @@ class TestCacheWholesaleInvalidation:
         h0 = compute_compiler_hash(tmp_path, "ritz0")
         h1 = compute_compiler_hash(tmp_path, "ritz1")
         assert h0 != h1
+
+    def test_ritz1_selfhosted_fingerprint_is_binary_hash(self, tmp_path):
+        """AGAST #1269: ritz1_selfhosted is a first-class compiler choice.
+        Its fingerprint is the hash of ritz1/build/ritz1_selfhosted."""
+        from cache import compute_compiler_hash
+
+        build_dir = tmp_path / "ritz1" / "build"
+        build_dir.mkdir(parents=True)
+        sh_bin = build_dir / "ritz1_selfhosted"
+        sh_bin.write_bytes(b"\x7fELF" + b"\x00" * 100 + b"v1-selfhosted")
+        h1 = compute_compiler_hash(tmp_path, "ritz1_selfhosted")
+        assert h1 not in ("ritz1-missing", "ritz1_selfhosted-missing")
+        sh_bin.write_bytes(b"\x7fELF" + b"\x00" * 100 + b"v2-selfhosted")
+        h2 = compute_compiler_hash(tmp_path, "ritz1_selfhosted")
+        assert h1 != h2, "ritz1_selfhosted binary edit did not change fingerprint"
+
+    def test_ritz1_selfhosted_missing_returns_sentinel(self, tmp_path):
+        """Missing binary → sentinel string, NOT a ValueError."""
+        from cache import compute_compiler_hash
+        h = compute_compiler_hash(tmp_path, "ritz1_selfhosted")
+        assert h == "ritz1_selfhosted-missing"
+
+    def test_ritz1_selfhosted_vs_ritz1_differs(self, tmp_path):
+        """Identical binary bytes under both names must still fingerprint
+        differently — the compiler ID namespaces the digest."""
+        from cache import compute_compiler_hash
+
+        build_dir = tmp_path / "ritz1" / "build"
+        build_dir.mkdir(parents=True)
+        (build_dir / "ritz1").write_bytes(b"same-bytes")
+        (build_dir / "ritz1_selfhosted").write_bytes(b"same-bytes")
+
+        h1 = compute_compiler_hash(tmp_path, "ritz1")
+        h2 = compute_compiler_hash(tmp_path, "ritz1_selfhosted")
+        assert h1 != h2
+
+    def test_cache_dir_namespacing_all_three_compilers(self, tmp_path):
+        """Each compiler resolves to a distinct cache directory —
+        no cross-compiler artifact reuse."""
+        from cache import BuildCache
+
+        dirs = {
+            c: BuildCache(project_root=tmp_path, compiler=c).cache_dir
+            for c in ("ritz0", "ritz1", "ritz1_selfhosted")
+        }
+        assert len(set(dirs.values())) == 3, f"cache dirs collide: {dirs}"
+        assert dirs["ritz1_selfhosted"].name == ".ritz-cache-ritz1_selfhosted"

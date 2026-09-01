@@ -541,6 +541,67 @@ fn emit_hex16_field(buf: *Vec<u8>, key: *u8, h: u64)
         k = k + 1
     vec_push<u8>(buf, 34)        # '"'
 
+# WORKAROUND (AGAST #1269): ritz1's emitter mislabels a phi predecessor for
+# a value-position if/else whose else branch contains a `while` loop before
+# its trailing call — the phi records the block label from before the loop
+# restructured control flow, producing invalid LLVM IR ("PHI node entries
+# do not match predecessors") that clang rejects.  ritz0 compiles the
+# original shape fine; only stage 2 (ritz1 compiling itself) breaks, which
+# blocked `make bootstrap`.  Hoisting the loop bodies into these helpers
+# keeps each if/else branch a single call, sidestepping the bug.  Remove
+# once the emitter bug is fixed (minimal repro in AGAST #1269 notes).
+fn sig_serialize_entries(sd: *SigData, buf: *Vec<u8>)
+    vec_push<u8>(buf, 10)       # '\n'
+    var i: i32 = 0
+    while i < sd.entry_count
+        let e: *SigEntry = sd.entries + i
+        vec_push_str(buf, c"    ")
+        emit_json_string_bytes(buf, e.name, e.name_len as i64)
+        vec_push_str(buf, c": {\n")
+        # hash
+        vec_push_str(buf, c"      \"hash\": \"")
+        var bh: [16]u8
+        u64_to_hex16(e.hash, @bh[0])
+        var bj: i64 = 0
+        while bj < 16
+            vec_push<u8>(buf, bh[bj])
+            bj = bj + 1
+        vec_push_str(buf, c"\",\n")
+        # sig_hash
+        vec_push_str(buf, c"      \"sig_hash\": \"")
+        var sh: [16]u8
+        u64_to_hex16(e.sig_hash, @sh[0])
+        var sj: i64 = 0
+        while sj < 16
+            vec_push<u8>(buf, sh[sj])
+            sj = sj + 1
+        vec_push_str(buf, c"\",\n")
+        # ir
+        vec_push_str(buf, c"      \"ir\": ")
+        emit_json_string_bytes(buf, e.ir, e.ir_len)
+        vec_push<u8>(buf, 10)
+        vec_push_str(buf, c"    }")
+        if i + 1 < sd.entry_count
+            vec_push<u8>(buf, 44)   # ','
+        vec_push<u8>(buf, 10)
+        i = i + 1
+    vec_push_str(buf, c"  },\n")
+
+# See workaround note above sig_serialize_entries.
+fn sig_serialize_imports(sd: *SigData, buf: *Vec<u8>)
+    var ii: i32 = 0
+    while ii < sd.import_count
+        if ii > 0
+            vec_push_str(buf, c", ")
+        let p: *u8 = *(sd.imports + ii)
+        if p != null
+            let l: i64 = strlen(p)
+            emit_json_string_bytes(buf, p, l)
+        else
+            vec_push_str(buf, c"\"\"")
+        ii = ii + 1
+    vec_push_str(buf, c"]\n")
+
 # Serialize SigData as JSON into a Vec<u8>.  We mirror ritz0's pretty
 # format (indent=2 + trailing newline) for byte-stable cross-tool diffs.
 fn sig_serialize(sd: *SigData, buf: *Vec<u8>)
@@ -563,41 +624,7 @@ fn sig_serialize(sd: *SigData, buf: *Vec<u8>)
     if sd.entry_count == 0
         vec_push_str(buf, c"},\n")
     else
-        vec_push<u8>(buf, 10)       # '\n'
-        var i: i32 = 0
-        while i < sd.entry_count
-            let e: *SigEntry = sd.entries + i
-            vec_push_str(buf, c"    ")
-            emit_json_string_bytes(buf, e.name, e.name_len as i64)
-            vec_push_str(buf, c": {\n")
-            # hash
-            vec_push_str(buf, c"      \"hash\": \"")
-            var bh: [16]u8
-            u64_to_hex16(e.hash, @bh[0])
-            var bj: i64 = 0
-            while bj < 16
-                vec_push<u8>(buf, bh[bj])
-                bj = bj + 1
-            vec_push_str(buf, c"\",\n")
-            # sig_hash
-            vec_push_str(buf, c"      \"sig_hash\": \"")
-            var sh: [16]u8
-            u64_to_hex16(e.sig_hash, @sh[0])
-            var sj: i64 = 0
-            while sj < 16
-                vec_push<u8>(buf, sh[sj])
-                sj = sj + 1
-            vec_push_str(buf, c"\",\n")
-            # ir
-            vec_push_str(buf, c"      \"ir\": ")
-            emit_json_string_bytes(buf, e.ir, e.ir_len)
-            vec_push<u8>(buf, 10)
-            vec_push_str(buf, c"    }")
-            if i + 1 < sd.entry_count
-                vec_push<u8>(buf, 44)   # ','
-            vec_push<u8>(buf, 10)
-            i = i + 1
-        vec_push_str(buf, c"  },\n")
+        sig_serialize_entries(sd, buf)
 
     # module_ir (ritz1 extension — ritz0 ignores).  Emit as `null` when
     # we have no cached IR so the field is always present and the file
@@ -615,18 +642,7 @@ fn sig_serialize(sd: *SigData, buf: *Vec<u8>)
     if sd.import_count == 0
         vec_push_str(buf, c"]\n")
     else
-        var ii: i32 = 0
-        while ii < sd.import_count
-            if ii > 0
-                vec_push_str(buf, c", ")
-            let p: *u8 = *(sd.imports + ii)
-            if p != null
-                let l: i64 = strlen(p)
-                emit_json_string_bytes(buf, p, l)
-            else
-                vec_push_str(buf, c"\"\"")
-            ii = ii + 1
-        vec_push_str(buf, c"]\n")
+        sig_serialize_imports(sd, buf)
 
     vec_push_str(buf, c"}\n")
 

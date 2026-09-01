@@ -292,11 +292,12 @@ def compute_compiler_hash(project_root: Path, compiler: str = "ritz0") -> str:
 
     Args:
         project_root: directory containing ``ritz0/`` and ``ritz1/``.
-        compiler: "ritz0" or "ritz1".
+        compiler: "ritz0", "ritz1", or "ritz1_selfhosted".
 
     Returns:
         Hex-encoded SHA256 digest, or the sentinel ``"ritz1-missing"`` when
-        ``compiler == "ritz1"`` and the binary does not exist.
+        ``compiler == "ritz1"`` and the binary does not exist (likewise
+        ``"ritz1_selfhosted-missing"`` for the self-hosted binary).
     """
     h = hashlib.sha256()
     h.update(f"compiler={compiler}\n".encode())  # namespace the digest
@@ -337,6 +338,14 @@ def compute_compiler_hash(project_root: Path, compiler: str = "ritz0") -> str:
             return "ritz1-missing"
         h.update(b"ritz1-binary\x00")
         _hash_file_into(h, ritz1_bin)
+        return h.hexdigest()
+
+    if compiler == "ritz1_selfhosted":
+        sh_bin = project_root / "ritz1" / "build" / "ritz1_selfhosted"
+        if not sh_bin.is_file():
+            return "ritz1_selfhosted-missing"
+        h.update(b"ritz1_selfhosted-binary\x00")
+        _hash_file_into(h, sh_bin)
         return h.hexdigest()
 
     raise ValueError(f"unknown compiler: {compiler!r}")

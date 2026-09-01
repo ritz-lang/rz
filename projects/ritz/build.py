@@ -35,6 +35,14 @@ from cache import BuildCache
 ROOT = Path(__file__).parent
 RITZ0 = ROOT / "ritz0" / "ritz0.py"
 RITZ1_BIN = ROOT / "ritz1" / "build" / "ritz1"   # self-hosted compiler binary
+RITZ1_SELFHOSTED_BIN = ROOT / "ritz1" / "build" / "ritz1_selfhosted"  # ritz1 compiled by itself
+
+# Map --compiler values to their ritz1-family binary and the make invocation
+# that (re)builds it. Both binaries share the same minimal CLI.
+RITZ1_FAMILY_BINS = {
+    "ritz1": (RITZ1_BIN, "make -C ritz1 ritz1"),
+    "ritz1_selfhosted": (RITZ1_SELFHOSTED_BIN, "make -C ritz1 bootstrap"),
+}
 RUNTIME_DIR = ROOT / "runtime"
 
 # Architecture-specific runtime files
@@ -940,7 +948,7 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
                         continue
 
             # All sources compiled without runtime - _start comes from external .o
-            if compiler == "ritz1":
+            if compiler.startswith("ritz1"):
                 # ritz1's CLI is minimal: <input> -o <output> [-I <ritz_path>]. It
                 # doesn't understand --no-runtime, --deps, --sources, or
                 # --project-root. Its default emitter is non-freestanding (no
@@ -950,12 +958,13 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
                 # and also ensure RITZ_PATH is set to the same root for
                 # `ritzlib.X` qualified imports (ritz1 strips the "ritzlib"
                 # prefix when RITZ_PATH-resolving those).
-                if not RITZ1_BIN.exists():
-                    print(f"  ✗ ritz1 binary not found at {RITZ1_BIN}", file=sys.stderr)
-                    print(f"    Run: cd {RITZ1_BIN.parent.parent} && make ritz1", file=sys.stderr)
+                ritz1_bin, make_hint = RITZ1_FAMILY_BINS[compiler]
+                if not ritz1_bin.exists():
+                    print(f"  ✗ {compiler} binary not found at {ritz1_bin}", file=sys.stderr)
+                    print(f"    Run: cd {ROOT} && {make_hint}", file=sys.stderr)
                     return None
                 i_root = str(ROOT)
-                compile_cmd = [str(RITZ1_BIN), str(src), "-o", str(ll_path), "-I", i_root]
+                compile_cmd = [str(ritz1_bin), str(src), "-o", str(ll_path), "-I", i_root]
             else:
                 compile_cmd = [sys.executable, str(RITZ0), str(src), "-o", str(ll_path), "--no-runtime"]
 
@@ -981,7 +990,7 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
             # Preserve any caller-provided RITZ_PATH (e.g. `./rz` may pre-build
             # a list of workspace roots).  Colon-separated, gcc-style.
             env = os.environ.copy()
-            if compiler == "ritz1":
+            if compiler.startswith("ritz1"):
                 caller_path = env.get("RITZ_PATH", "")
                 root_str = str(ROOT)             # projects/ritz
                 workspace_str = str(ROOT.parent) # projects
@@ -2201,8 +2210,9 @@ def main():
                               help="Keep intermediate files (.ll, .o) in build/ for debugging")
     build_parser.add_argument("--no-cache", action="store_true",
                               help="Disable build cache (always rebuild)")
-    build_parser.add_argument("--compiler", choices=["ritz0", "ritz1"], default="ritz0",
-                              help="Which compiler to use (default: ritz0). ritz1 is the self-hosted compiler.")
+    build_parser.add_argument("--compiler", choices=["ritz0", "ritz1", "ritz1_selfhosted"], default="ritz0",
+                              help="Which compiler to use (default: ritz0). ritz1 is the self-hosted "
+                                   "compiler; ritz1_selfhosted is ritz1 compiled by itself.")
 
     # test
     test_parser = subparsers.add_parser("test", help="Build and test packages")
@@ -2214,8 +2224,9 @@ def main():
                              help="Keep intermediate files (.ll, .o) in build/ for debugging")
     test_parser.add_argument("--no-cache", action="store_true",
                              help="Disable build cache (always rebuild)")
-    test_parser.add_argument("--compiler", choices=["ritz0", "ritz1"], default="ritz0",
-                             help="Which compiler to use (default: ritz0). ritz1 is the self-hosted compiler.")
+    test_parser.add_argument("--compiler", choices=["ritz0", "ritz1", "ritz1_selfhosted"], default="ritz0",
+                             help="Which compiler to use (default: ritz0). ritz1 is the self-hosted "
+                                  "compiler; ritz1_selfhosted is ritz1 compiled by itself.")
 
     # run
     run_parser = subparsers.add_parser("run", help="Compile and run a single .ritz file")
