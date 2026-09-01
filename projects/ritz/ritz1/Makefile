@@ -54,6 +54,15 @@ RITZLIB_OBJ = $(patsubst %,$(BUILD_DIR)/ritzlib_%.o,$(RITZLIB_MODULES))
 # ritz1 needs envp for RITZ_PATH environment variable access
 RUNTIME = ../runtime/ritz_start_envp.x86_64.o
 
+# The runtime .o files are gitignored build products of tracked .ll sources.
+# Without this rule a fresh clone dies with "No rule to make target
+# '../runtime/ritz_start_envp.x86_64.o'" — which is exactly how main CI
+# failed, since a CI checkout never has the stale .o a dev tree accumulates.
+# Delegate to runtime/Makefile so there is one place that knows how to
+# lower a shim, and so an edited .ll actually forces a relink.
+../runtime/%.o: ../runtime/%.ll
+	@$(MAKE) -C ../runtime $*.o
+
 # Compiler flags
 LLC_FLAGS = -O2
 LD_FLAGS = -dynamic-linker /lib64/ld-linux-x86-64.so.2 -lc

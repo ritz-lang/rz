@@ -129,6 +129,48 @@ def get_runtime_object(num_params: int) -> Path:
         return RITZ_START_NOARGS
 
 
+def ensure_runtime_object(obj_path: Path) -> bool:
+    """Build a runtime `_start` object from its tracked `.ll` if needed.
+
+    The runtime objects under `runtime/` are *derived* artifacts: the `.ll`
+    sources are tracked in git, the `.o` files are gitignored. Previously
+    nothing built them — `runtime/Makefile` existed but no build path ever
+    invoked it, so both `build.py` and `ritz1/Makefile` simply asserted the
+    `.o` was already on disk and told the user to "run make in runtime/".
+
+    That made a fresh clone unbuildable: every package with
+    `link_runtime` failed, and CI (which always starts from a clean
+    checkout) could never link a hosted binary. It only appeared to work
+    locally because stale `.o` files lingered in developers' trees — which
+    is worse than failing, because an edit to a `.ll` shim would silently
+    link against a months-old object.
+
+    A derived artifact must be a dependency, not a documented manual step.
+    Compile on demand, keyed on mtime so repeat builds stay free.
+
+    Returns True if `obj_path` exists (or was just built) and is current.
+    """
+    ll_path = obj_path.with_suffix(".ll")
+    if not ll_path.exists():
+        print(f"  ✗ Runtime source not found: {ll_path}", file=sys.stderr)
+        return False
+
+    # Up to date? Nothing to do.
+    if obj_path.exists() and obj_path.stat().st_mtime >= ll_path.stat().st_mtime:
+        return True
+
+    obj_path.parent.mkdir(parents=True, exist_ok=True)
+    result = subprocess.run(
+        ["clang", "-c", "-o", str(obj_path), str(ll_path)],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        print(f"  ✗ Failed to build runtime object {obj_path.name}:\n{result.stderr}",
+              file=sys.stderr)
+        return False
+    return True
+
+
 # =============================================================================
 # RFC #109 Phase 1: Entry Point Resolution, Source Discovery, Build Profiles
 # =============================================================================
@@ -873,10 +915,8 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
     main_params = detect_main_signature(src_path)
     runtime_obj = get_runtime_object(main_params)
 
-    # Check runtime object exists
-    if not runtime_obj.exists():
-        print(f"  ✗ Runtime object not found: {runtime_obj}", file=sys.stderr)
-        print(f"    Run 'make' in runtime/ directory to build", file=sys.stderr)
+    # Build the runtime object on demand — it is derived from a tracked .ll.
+    if not ensure_runtime_object(runtime_obj):
         return None
 
     try:
@@ -1365,12 +1405,14 @@ def compile_freestanding_binary(
             runtime_name = f"{runtime_variant}{runtime_suffix}"
             runtime_path = RITZ0_DIR.parent / "runtime" / runtime_name
 
-            if runtime_path.exists():
+            if ensure_runtime_object(runtime_path):
                 object_files.insert(0, runtime_path)  # Runtime should be first
                 print(f"  📦 Linking with runtime: {runtime_name}")
             else:
-                print(f"  ⚠ Runtime not found: {runtime_path}", file=sys.stderr)
-                print(f"    Run 'make' in projects/ritz/runtime/ to build", file=sys.stderr)
+                # A freestanding/UEFI target can legitimately have no shim,
+                # but link_runtime was explicitly requested — so this is fatal.
+                print(f"  ✗ Could not provide runtime object: {runtime_path}", file=sys.stderr)
+                return None
 
         # Step 4: Link
         print(f"  ⚡ Linking {len(object_files)} object files...")
