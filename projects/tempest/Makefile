@@ -1,97 +1,69 @@
-# Tempest Browser - Build System
+# Tempest Browser — delegates to the workspace `rz` tool.
 #
-# TDD-focused build system using ritz0 and ritzunit.
+# Tempest is described by ritz.toml ([[bin]] tempest, [[bin]] tempest-tab).
+# `rz` reads that and drives the compiler, dependency resolution and
+# RITZ_PATH. This file exists so `make` still does the right thing in this
+# directory — it is not a second build definition.
+#
+# Why this file was rewritten:
+#
+#   * `make test` shelled out to ./scripts/build_tests.sh, deleted in db2402e
+#     ("Remove 40 legacy build scripts") when every project moved to
+#     `rz build` / `rz test`. The target had been failing ever since.
+#
+#   * `make build` did not build. It ran the `check` target instead, with the
+#     comment "full build requires Prism, Iris, etc." — dependencies that
+#     ritz.toml now resolves, so `rz build tempest` does the real thing.
+#
+#   * The compiler paths were rooted at $(HOME)/dev/ritz-lang/ritz, which is
+#     not where ritz lives in this monorepo (projects/ritz). Worse, the file
+#     *assigned* RITZ_PATH, clobbering the value CI exports. Paths are now
+#     derived from $(CURDIR) so they follow the checkout.
 
-# Paths to ritz ecosystem
-RITZ_ROOT ?= $(HOME)/dev/ritz-lang
-RITZ_PATH = $(RITZ_ROOT)/ritz
-RITZUNIT_PATH = $(RITZ_ROOT)/ritzunit
-RITZLIB_PATH = $(RITZ_PATH)/ritzlib
+WORKSPACE := $(CURDIR)/../..
+RZ := $(WORKSPACE)/rz
+PROJECT := tempest
 
-# Compilers and tools
-RITZ0 = python3 $(RITZ_PATH)/ritz0/ritz0.py
-LIST_DEPS = python3 $(RITZ_PATH)/ritz0/list_deps.py
-RUNTIME = $(RITZ_PATH)/runtime/ritz_start.x86_64.o
+# Used only by the `check` target below.
+RITZ0 := python3 $(WORKSPACE)/projects/ritz/ritz0/ritz0.py
+LIB_SOURCES = $(wildcard lib/*.ritz)
 
-# Use RERITZ syntax mode (e.g., [[test]] instead of @test)
+# Tempest sources use RERITZ syntax ([[test]] rather than @test).
 export RITZ_SYNTAX=reritz
 
-# Build directories
-BUILD_DIR = build
-BIN_DIR = $(BUILD_DIR)/bin
-LL_DIR = $(BUILD_DIR)/ll
-
-# Source files
-BROWSER_SOURCES = src/main.ritz
-TAB_SOURCES = src/tab_process.ritz
-LIB_SOURCES = $(wildcard lib/*.ritz)
-TEST_SOURCES = $(wildcard tests/*.ritz)
-
-# Output binaries
-BROWSER_BIN = $(BIN_DIR)/tempest
-TAB_BIN = $(BIN_DIR)/tempest-tab
-TEST_BIN = $(BUILD_DIR)/tests
-
-.PHONY: all clean build test check dirs test-verbose test-list
+.PHONY: all build test clean check help
 
 all: build
 
-# Create build directories
-dirs:
-	@mkdir -p $(BUILD_DIR) $(BIN_DIR) $(LL_DIR)
+build:
+	@$(RZ) build $(PROJECT)
 
-# Build browser binary (placeholder - full build needs more deps)
-build: dirs
-	@echo "Building Tempest browser..."
-	@echo "(Full build requires Prism, Iris, etc. - using check for now)"
-	$(MAKE) check
+test:
+	@$(RZ) test $(PROJECT)
 
-# Run tests (main TDD entry point)
-test: dirs
-	@echo "=== Building Tempest Tests ==="
-	@./scripts/build_tests.sh
-	@echo ""
-	@echo "=== Running Tests ==="
-	@$(BUILD_DIR)/tempest_tests
+clean:
+	@$(RZ) clean $(PROJECT)
 
-# Verbose test output
-test-verbose: dirs
-	@./scripts/build_tests.sh
-	@$(BUILD_DIR)/tempest_tests -v
-
-# List tests without running
-test-list: dirs
-	@./scripts/build_tests.sh
-	@$(BUILD_DIR)/tempest_tests -l
-
-# Type check without building
-check: dirs
+# Type check the library without producing binaries. Kept because rz has no
+# check-only mode and this is a fast inner-loop for library work.
+check:
 	@echo "Type checking..."
 	@for f in $(LIB_SOURCES); do \
 		echo "  Checking $$f"; \
-		$(RITZ0) "$$f" -o /dev/null --no-runtime 2>&1 || exit 1; \
+		RITZ_PATH=$(WORKSPACE)/projects $(RITZ0) "$$f" -o /dev/null --no-runtime 2>&1 || exit 1; \
 	done
 	@echo "Type check complete."
 
-# Clean build artifacts
-clean:
-	rm -rf $(BUILD_DIR)
-
-# Show help
 help:
-	@echo "Tempest Browser Build System"
+	@echo "Tempest Browser"
 	@echo ""
-	@echo "TDD Targets:"
-	@echo "  test          - Build and run all tests"
-	@echo "  test-verbose  - Run tests with verbose output"
-	@echo "  test-list     - List all tests without running"
+	@echo "This Makefile delegates to the workspace 'rz' tool."
 	@echo ""
-	@echo "Build Targets:"
-	@echo "  all           - Build everything (default)"
-	@echo "  build         - Build browser binaries"
-	@echo "  check         - Type check without building"
-	@echo "  clean         - Remove build artifacts"
-	@echo "  help          - Show this help"
+	@echo "Targets:"
+	@echo "  build  - rz build $(PROJECT)"
+	@echo "  test   - rz test $(PROJECT)"
+	@echo "  clean  - rz clean $(PROJECT)"
+	@echo "  check  - type check lib/ without building"
 	@echo ""
-	@echo "Environment:"
-	@echo "  RITZ_ROOT     - Path to ritz-lang projects (default: ~/dev/ritz-lang)"
+	@echo "The old test flag variants (-v / -l) are not exposed by 'rz test'"
+	@echo "yet; run the built test binary directly if you need them."

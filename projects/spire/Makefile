@@ -1,114 +1,43 @@
-# Spire Makefile
+# Spire Makefile — delegates to the workspace `rz` tool.
 #
-# Build and test the Spire web framework
+# Spire is described by ritz.toml (a test_only package with a [[lib]] and a
+# [[test]] binary). `rz` reads that and drives the compiler, dependency
+# resolution and RITZ_PATH. This file exists so `make` still does the right
+# thing in this directory — it is not a second build definition.
 #
-# Usage:
-#   make build      - Build the library
-#   make test       - Run all tests
-#   make test-v     - Run tests verbose
-#   make clean      - Clean build artifacts
+# Why this file was rewritten:
+#
+#   * `make test` shelled out to ./scripts/build_tests.sh, deleted in db2402e
+#     ("Remove 40 legacy build scripts") when every project moved to
+#     `rz build` / `rz test`. The target had been failing ever since.
+#
+#   * `make build` looped over lib/*.ritz invoking ritz0 with
+#     `2>/dev/null || true`, so every compile error was discarded and the
+#     target always exited 0. CI reported Spire green while it was not being
+#     compiled in any meaningful sense.
 
-# Compiler settings
-RITZ0 = python3 ritz/ritz0/ritz0.py
-RITZ1 = ./ritz/ritz1_bin
-LIST_DEPS = python3 ritz/ritz0/list_deps.py
-RUNTIME = ritz/runtime/ritz_start.x86_64.o
+RZ := $(CURDIR)/../../rz
+PROJECT := spire
 
-# Directories
-BUILD_DIR = build
-TEST_BUILD_DIR = build/test
-
-# Colors for output
-GREEN = \033[0;32m
-YELLOW = \033[0;33m
-RED = \033[0;31m
-NC = \033[0m
-
-.PHONY: all build test test-v test-f clean help submodules
+.PHONY: all build test clean submodules dev loc help
 
 all: build
 
-# Initialize/update submodules
+# Initialise/update git submodules. Kept: this is Spire-specific and has no
+# equivalent in rz.
 submodules:
-	@echo "$(YELLOW)Updating submodules...$(NC)"
 	git submodule update --init --recursive
 
-# Build the library (compile to .ll files)
-build: submodules
-	@echo "$(YELLOW)Building Spire...$(NC)"
-	@mkdir -p $(BUILD_DIR)
-	@for f in lib/*.ritz lib/**/*.ritz; do \
-		if [ -f "$$f" ]; then \
-			basename=$$(basename "$$f" .ritz); \
-			echo "  Compiling $$f"; \
-			$(RITZ0) "$$f" -o "$(BUILD_DIR)/$$basename.ll" --no-runtime 2>/dev/null || true; \
-		fi \
-	done
-	@echo "$(GREEN)Build complete$(NC)"
+build:
+	@$(RZ) build $(PROJECT)
 
-# Build test binary
-build-tests: submodules
-	@echo "$(YELLOW)Building tests...$(NC)"
-	@mkdir -p $(TEST_BUILD_DIR)
-	@./scripts/build_tests.sh
-	@echo "$(GREEN)Test build complete$(NC)"
+test:
+	@$(RZ) test $(PROJECT)
 
-# Run all tests
-test: build-tests
-	@echo "$(YELLOW)Running tests...$(NC)"
-	@if [ -f $(TEST_BUILD_DIR)/tests ]; then \
-		$(TEST_BUILD_DIR)/tests; \
-	else \
-		echo "$(RED)Test binary not found. Run 'make build-tests' first.$(NC)"; \
-		exit 1; \
-	fi
-
-# Run tests verbose
-test-v: build-tests
-	@$(TEST_BUILD_DIR)/tests -v
-
-# Run tests with filter
-# Usage: make test-f FILTER=router
-test-f: build-tests
-	@$(TEST_BUILD_DIR)/tests -f $(FILTER)
-
-# Run tests quiet
-test-q: build-tests
-	@$(TEST_BUILD_DIR)/tests -q
-
-# List available tests
-test-list: build-tests
-	@$(TEST_BUILD_DIR)/tests -l
-
-# Clean build artifacts
 clean:
-	@echo "$(YELLOW)Cleaning...$(NC)"
-	rm -rf $(BUILD_DIR)
-	@echo "$(GREEN)Clean complete$(NC)"
+	@$(RZ) clean $(PROJECT)
 
-# Show help
-help:
-	@echo "Spire Makefile"
-	@echo ""
-	@echo "Targets:"
-	@echo "  make build       - Build the library"
-	@echo "  make test        - Run all tests"
-	@echo "  make test-v      - Run tests verbose"
-	@echo "  make test-q      - Run tests quiet (failures only)"
-	@echo "  make test-list   - List available tests"
-	@echo "  make test-f FILTER=<pattern> - Run tests matching pattern"
-	@echo "  make clean       - Clean build artifacts"
-	@echo "  make submodules  - Update git submodules"
-	@echo "  make help        - Show this help"
-	@echo ""
-	@echo "Examples:"
-	@echo "  make test-f FILTER=router  # Run router tests"
-	@echo "  make test-f FILTER=http    # Run HTTP tests"
-
-# Development helpers
-.PHONY: dev watch
-
-# Quick dev cycle - build and test
+# Quick dev cycle
 dev: clean build test
 
 # Count lines of code
@@ -118,3 +47,19 @@ loc:
 	@echo ""
 	@echo "Lines of test code:"
 	@find test -name "*.ritz" -exec wc -l {} + 2>/dev/null | tail -1 || echo "  0 total"
+
+help:
+	@echo "Spire — MVRSPT web framework for Ritz"
+	@echo ""
+	@echo "This Makefile delegates to the workspace 'rz' tool."
+	@echo ""
+	@echo "Targets:"
+	@echo "  build       - rz build $(PROJECT)"
+	@echo "  test        - rz test $(PROJECT)"
+	@echo "  clean       - rz clean $(PROJECT)"
+	@echo "  submodules  - git submodule update --init --recursive"
+	@echo "  dev         - clean + build + test"
+	@echo "  loc         - count lines of code"
+	@echo ""
+	@echo "The old test flag variants (-v / -q / -f / -l) are not exposed by"
+	@echo "'rz test' yet; run the built test binary directly if you need them."

@@ -3,6 +3,16 @@ on:
   push:
     branches: [main]
 
+# CI drives the workspace through `./rz`, the same entry point developers use.
+#
+# It used to loop over projects/*/ running `make build` / `make test`. That
+# predates db2402e ("Remove 40 legacy build scripts"), which moved every
+# project onto `rz build` / `rz test`. The loop kept several projects green by
+# accident: some Makefiles invoked scripts deleted in that commit, one had a
+# phony target colliding with its output directory so `build` only ran mkdir,
+# and another swallowed compiler errors with `2>/dev/null || true`. Calling rz
+# directly means CI exercises the real build graph from ritz.toml.
+
 jobs:
   build-all:
     runs-on: ubuntu-latest
@@ -17,21 +27,8 @@ jobs:
       - name: Install ritz0 dependencies
         run: python -m pip install --upgrade pip -r projects/ritz/requirements.txt
 
-      - name: Set up RITZ_PATH
-        run: echo "RITZ_PATH=$PWD/projects" >> $GITHUB_ENV
-
-      - name: Build all projects
-        run: |
-          for proj in projects/*/; do
-            [ -f "$proj/Makefile" ] || continue
-            name=$(basename "$proj")
-            if ! make -C "$proj" -n build >/dev/null 2>&1; then
-              echo "=== Skipping $name (no 'build' target) ==="
-              continue
-            fi
-            echo "=== Building $name ==="
-            (cd "$proj" && make build) || exit 1
-          done
+      - name: Build workspace
+        run: ./rz build --all
 
   test-all:
     runs-on: ubuntu-latest
@@ -46,21 +43,38 @@ jobs:
       - name: Install ritz0 dependencies
         run: python -m pip install --upgrade pip -r projects/ritz/requirements.txt
 
-      - name: Set up RITZ_PATH
-        run: echo "RITZ_PATH=$PWD/projects" >> $GITHUB_ENV
+      - name: Test workspace
+        run: ./rz test --all
 
-      - name: Test all projects
-        run: |
-          for proj in projects/*/; do
-            [ -f "$proj/Makefile" ] || continue
-            name=$(basename "$proj")
-            if ! make -C "$proj" -n test >/dev/null 2>&1; then
-              echo "=== Skipping $name (no 'test' target) ==="
-              continue
-            fi
-            echo "=== Testing $name ==="
-            (cd "$proj" && make test) || exit 1
-          done
+  # The bootstrap chain is the language's acceptance criterion:
+  #   1. compile examples with ritz0        (Python-hosted compiler)
+  #   2. compile the compiler with ritz0    -> ritz1
+  #   3. compile examples with ritz1
+  #   4. compile the compiler with ritz1    -> self-hosted ritz
+  #   5. compile examples with self-hosted ritz
+  # `make matrix-full` runs the bootstrap plus the regression matrix. This is
+  # the gate that matters most: the workspace can be green while self-hosting
+  # is broken, and that must not pass silently.
+  bootstrap:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install ritz0 dependencies
+        run: python -m pip install --upgrade pip -r projects/ritz/requirements.txt
+
+      - name: ritz0 unit tests
+        run: python -m pytest -q
+        working-directory: projects/ritz/ritz0
+
+      - name: Bootstrap chain + regression matrix
+        run: make matrix-full
+        working-directory: projects/ritz
 
   # ritz-lint is an AI-assisted reviewer: it shells out to the `claude` CLI and
   # needs an authenticated subscription. That is not available to CI runners, so

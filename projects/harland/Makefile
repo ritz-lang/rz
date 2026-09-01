@@ -21,9 +21,14 @@ ISO = $(BUILD_DIR)/harland.iso
 # Phony targets
 # ============================================================================
 
-.PHONY: all clean test test-boot test-uefi-boot test-uefi-gui run-gui kernel iso help
+.PHONY: all build clean test test-boot test-uefi-boot test-uefi-gui run-gui kernel iso help
 
 all: kernel
+
+# `build` is the conventional entry point every other project exposes, and
+# what CI invokes. Harland's equivalent has always been `kernel`; this alias
+# means the workspace-wide build loop no longer has to special-case it.
+build: kernel
 
 # ============================================================================
 # Build targets

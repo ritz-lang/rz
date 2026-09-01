@@ -1,98 +1,52 @@
-# Goliath Makefile
+# Goliath Makefile — delegates to the workspace `rz` tool.
 #
-# Build and test the Goliath content-addressable filesystem.
+# Goliath is described by ritz.toml. `rz` reads that and drives the compiler,
+# dependency resolution and RITZ_PATH. This file exists so `make` still does
+# the right thing in this directory — it is not a second build definition.
 #
-# Requires RITZ_PATH environment variable pointing to ritz-lang projects directory.
-# Example: export RITZ_PATH=~/dev/ritz-lang
+# Why this file was rewritten:
+#
+#   * `make test` shelled out to ./build_tests.sh, deleted in db2402e
+#     ("Remove 40 legacy build scripts") when every project moved to
+#     `rz build` / `rz test`. The Makefile kept calling it, so the target had
+#     been failing with "No such file or directory" ever since.
+#
+#   * `make build` was broken in a quieter way: the .PHONY `build` target and
+#     the `build/` output directory are the same name, so make merged them,
+#     warned "overriding recipe for target 'build'", dropped the compile rule
+#     as circular, and left a target whose entire effect was `mkdir -p build`.
+#     It exited 0 while compiling nothing.
 
-# Configuration
-RITZ_PATH ?= $(HOME)/dev/ritz-lang
-RITZ0 = python3 $(RITZ_PATH)/ritz/ritz0/ritz0.py
-LIST_DEPS = python3 $(RITZ_PATH)/ritz/ritz0/list_deps.py
-RUNTIME = $(RITZ_PATH)/ritz/runtime/ritz_start.x86_64.o
+RZ := $(CURDIR)/../../rz
+PROJECT := goliath
 
-# Build directories
-BUILD_DIR = build
-TEST_BUILD_DIR = $(BUILD_DIR)/test
+.PHONY: all build test clean check-env help
 
-# Source files
-SRC_FILES = $(wildcard src/*.ritz)
-TEST_FILES = $(wildcard test/*.ritz)
-
-# Default target
-.PHONY: all
 all: build
 
-# Build the library (compile to LLVM IR)
-.PHONY: build
-build: $(BUILD_DIR)/goliath.ll
-	@echo "Build complete: $(BUILD_DIR)/goliath.ll"
+build:
+	@$(RZ) build $(PROJECT)
 
-$(BUILD_DIR)/goliath.ll: $(SRC_FILES) | $(BUILD_DIR)
-	@echo "Compiling goliath library..."
-	$(RITZ0) src/main.ritz -o $@ --no-runtime
+test:
+	@$(RZ) test $(PROJECT)
 
-$(BUILD_DIR):
-	mkdir -p $(BUILD_DIR)
-
-$(TEST_BUILD_DIR):
-	mkdir -p $(TEST_BUILD_DIR)
-
-# Build and run tests
-.PHONY: test
-test: build-tests
-	@echo ""
-	@echo "Running tests..."
-	./$(TEST_BUILD_DIR)/tests
-
-.PHONY: test-verbose
-test-verbose: build-tests
-	./$(TEST_BUILD_DIR)/tests -v
-
-.PHONY: test-filter
-test-filter: build-tests
-	./$(TEST_BUILD_DIR)/tests -f $(FILTER)
-
-.PHONY: test-list
-test-list: build-tests
-	./$(TEST_BUILD_DIR)/tests -l
-
-# Build test binary
-.PHONY: build-tests
-build-tests: $(TEST_BUILD_DIR)/tests
-	@echo "Test binary ready: $(TEST_BUILD_DIR)/tests"
-
-$(TEST_BUILD_DIR)/tests: $(SRC_FILES) $(TEST_FILES) | $(TEST_BUILD_DIR)
-	@echo "Building test binary..."
-	./build_tests.sh
-
-# Clean build artifacts
-.PHONY: clean
 clean:
-	rm -rf $(BUILD_DIR)
+	@$(RZ) clean $(PROJECT)
 
-# Check environment
-.PHONY: check-env
 check-env:
-	@echo "RITZ_PATH: $(RITZ_PATH)"
-	@echo "RITZ0: $(RITZ0)"
-	@test -f "$(RITZ0)" || (echo "ERROR: ritz0 not found at $(RITZ0)" && exit 1)
-	@test -f "$(RUNTIME)" || (echo "ERROR: runtime not found at $(RUNTIME)" && exit 1)
-	@echo "Environment OK"
+	@test -x "$(RZ)" || (echo "ERROR: rz not found at $(RZ)" && exit 1)
+	@echo "rz: $(RZ)"
 
-# Help
-.PHONY: help
 help:
-	@echo "Goliath Makefile"
+	@echo "Goliath — content-addressable filesystem for Harland"
+	@echo ""
+	@echo "This Makefile delegates to the workspace 'rz' tool."
 	@echo ""
 	@echo "Targets:"
-	@echo "  build        - Compile library to LLVM IR"
-	@echo "  test         - Build and run all tests"
-	@echo "  test-verbose - Run tests with verbose output"
-	@echo "  test-filter  - Run tests matching FILTER=<pattern>"
-	@echo "  test-list    - List all tests without running"
-	@echo "  clean        - Remove build artifacts"
-	@echo "  check-env    - Verify RITZ_PATH and tools"
+	@echo "  build      - rz build $(PROJECT)"
+	@echo "  test       - rz test $(PROJECT)"
+	@echo "  clean      - rz clean $(PROJECT)"
+	@echo "  check-env  - verify rz is reachable"
 	@echo ""
-	@echo "Environment:"
-	@echo "  RITZ_PATH    - Path to ritz-lang projects (default: ~/dev/ritz-lang)"
+	@echo "The old test flag variants (-v / -f / -l) are not exposed by"
+	@echo "'rz test' yet; run the built test binary directly if you need them."
