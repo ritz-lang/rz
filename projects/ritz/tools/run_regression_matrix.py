@@ -50,6 +50,17 @@ TESTS = [
     "test_issue_phi_pred_after_loop",
     "test_issue_mut_ref_deref_assign",
     "test_issue_namespace_const_field",
+    # NOTE: test_issue_nested_generic_close (AGAST #1299, closing nested type
+    # argument lists with `>>`) is deliberately NOT listed here yet. The fix is
+    # ritz0-only: ritz0 splits a `>>`/`>=` token in type-argument context, but
+    # ritz1's parser is generated from grammars/ritz1.grammar and has no such
+    # rule. Worse, ritz1 does not even report an error -- it silently drops
+    # every function whose body or signature mentions `Vec<Vec<i64>>` and exits
+    # 0, so the harness fails at link time with an undefined symbol. That is a
+    # pre-existing ritz1 gap, not a regression from #1299. Add this entry once
+    # ritz1 gains `>>` splitting; until then the case is covered by
+    # `ritz0.py --test` and the parser unit tests
+    # (test_parser.py::TestNestedGenericClose). Same precedent as #1282.
     "test_issue_newtype_int_arg",
     "test_issue_newtype_struct_deref",
     "test_issue_option_return",

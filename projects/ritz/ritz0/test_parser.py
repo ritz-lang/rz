@@ -634,6 +634,82 @@ class TestGenerics:
         assert not s.is_generic()
 
 
+class TestNestedGenericClose:
+    """AGAST #1299 — nested generics must close with `>>` (the C++98 problem).
+
+    The lexer emits a single RSHIFT token for `>>`; the type-argument parser
+    splits it when it appears in a closing position. The shift operator must
+    keep working in expression context — both behaviours are asserted here so
+    neither can be "fixed" by breaking the other.
+    """
+
+    def test_nested_generic_struct_field(self):
+        mod = parse("struct Holder\n  items: Vec<Vec<i64>>")
+        s = mod.items[0]
+        outer = s.fields[0][1]
+        assert outer.name == "Vec"
+        inner = outer.args[0]
+        assert inner.name == "Vec"
+        assert inner.args[0].name == "i64"
+
+    def test_nested_generic_in_multi_arg_list(self):
+        mod = parse("struct Net\n  conns: HashMap<String, Vec<Connection>>")
+        outer = mod.items[0].fields[0][1]
+        assert outer.name == "HashMap"
+        assert len(outer.args) == 2
+        assert outer.args[0].name == "String"
+        assert outer.args[1].name == "Vec"
+        assert outer.args[1].args[0].name == "Connection"
+
+    def test_triple_nested_generic(self):
+        mod = parse("struct H\n  x: Vec<Vec<Vec<i64>>>")
+        t = mod.items[0].fields[0][1]
+        assert t.args[0].args[0].args[0].name == "i64"
+
+    def test_nested_generic_with_space_still_parses(self):
+        mod = parse("struct H\n  x: Vec<Vec<i64> >")
+        t = mod.items[0].fields[0][1]
+        assert t.args[0].args[0].name == "i64"
+
+    def test_nested_generic_fn_param_and_return(self):
+        mod = parse("fn f(v: Vec<Vec<i64>>) -> Vec<Vec<i64>>\n  v")
+        fn = mod.items[0]
+        assert fn.params[0].type.args[0].name == "Vec"
+        assert fn.ret_type.args[0].name == "Vec"
+
+    def test_nested_generic_call_type_args(self):
+        mod = parse("fn main()\n  make<Vec<i64>>()")
+        call = mod.items[0].body.expr
+        assert isinstance(call, rast.Call)
+        assert len(call.type_args) == 1
+        assert call.type_args[0].name == "Vec"
+
+    def test_rshift_still_works_in_expressions(self):
+        mod = parse("fn main()\n  a >> b")
+        expr = mod.items[0].body.expr
+        assert isinstance(expr, rast.BinOp)
+        assert expr.op == ">>"
+
+    def test_rshift_and_nested_generic_in_same_module(self):
+        mod = parse(
+            "struct H\n  x: Vec<Vec<i64>>\n\n"
+            "fn shift(a: i64, b: i64) -> i64\n  a >> b\n"
+        )
+        assert mod.items[0].fields[0][1].args[0].name == "Vec"
+        body = mod.items[1].body.expr
+        assert isinstance(body, rast.BinOp)
+        assert body.op == ">>"
+
+    def test_generic_comparison_followed_by_shift_not_type_args(self):
+        # `a < b >> c` is comparison + shift, not a type-arg list.
+        mod = parse("fn main()\n  a < b >> c")
+        expr = mod.items[0].body.expr
+        assert isinstance(expr, rast.BinOp)
+        assert expr.op == "<"
+        assert isinstance(expr.right, rast.BinOp)
+        assert expr.right.op == ">>"
+
+
 class TestTraitBounds:
     """Tests for trait bound syntax in generic parameters."""
 

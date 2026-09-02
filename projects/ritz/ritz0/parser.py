@@ -37,6 +37,9 @@ class Parser:
     def __init__(self, tokens: List[Token]):
         self.tokens = tokens
         self.pos = 0
+        # Undo log for `>>`/`>=` splits performed in type-argument context.
+        # See _split_leading_gt(); entries are (index, original_token).
+        self._angle_splits: List[tuple] = []
 
     def _current(self) -> Token:
         """Get the current token."""
@@ -74,6 +77,70 @@ class Parser:
                 msg = f"Expected {type.name}, got {tok.type.name}"
             raise ParseError(msg, tok.span)
         return self._advance()
+
+    # ------------------------------------------------------------------
+    # Closing angle brackets (AGAST #1299)
+    #
+    # The lexer greedily merges `>>` into RSHIFT and `>=` into GEQ, so a
+    # nested type-argument list like `Vec<Vec<i64>>` never presents two `>`
+    # tokens to the parser. Rather than teaching the lexer about type
+    # context (a parser-driven lexer mode is a classic source of subtle
+    # bugs), the parser splits the token *in type-argument context only*:
+    # the leading `>` is rewritten in place and the remainder is pushed back
+    # onto the token stream. Expression context is untouched, so `a >> b`
+    # still lexes and parses as a right shift.
+    #
+    # Splits are recorded in an undo log so speculative parses that
+    # backtrack (see _mark/_reset) restore the original RSHIFT/GEQ token.
+    # ------------------------------------------------------------------
+
+    # Tokens that begin with `>` and therefore may close a type-arg list.
+    _SPLITTABLE_GT = {
+        TokenType.RSHIFT: (TokenType.GT, '>'),      # >> -> > >
+        TokenType.GEQ: (TokenType.EQ, '='),         # >= -> > =
+    }
+
+    def _mark(self) -> tuple:
+        """Snapshot parser state for speculative parsing."""
+        return (self.pos, len(self._angle_splits))
+
+    def _reset(self, mark: tuple) -> None:
+        """Restore parser state captured by _mark(), undoing any angle splits."""
+        pos, split_depth = mark
+        while len(self._angle_splits) > split_depth:
+            index, original = self._angle_splits.pop()
+            self.tokens[index:index + 2] = [original]
+        self.pos = pos
+
+    def _split_leading_gt(self) -> bool:
+        """If the current token starts with `>` but is not GT, split it.
+
+        `>>` becomes `>` `>`; `>=` becomes `>` `=`. Returns True if a split
+        was performed (leaving a GT token at the current position).
+        """
+        tok = self._current()
+        rest = self._SPLITTABLE_GT.get(tok.type)
+        if rest is None:
+            return False
+        rest_type, rest_value = rest
+        span = tok.span
+        gt_span = Span(span.file, span.line, span.column, 1)
+        rest_span = Span(span.file, span.line, span.column + 1, len(rest_value))
+        self._angle_splits.append((self.pos, tok))
+        self.tokens[self.pos:self.pos + 1] = [
+            Token(TokenType.GT, '>', gt_span),
+            Token(rest_type, rest_value, rest_span),
+        ]
+        return True
+
+    def _at_type_args_close(self) -> bool:
+        """True if the current token can close a type-arg list (`>`, `>>`, `>=`)."""
+        return self._at(TokenType.GT) or self._current().type in self._SPLITTABLE_GT
+
+    def _expect_type_args_close(self, msg: str) -> Token:
+        """Consume one closing `>`, splitting a `>>`/`>=` token if needed."""
+        self._split_leading_gt()
+        return self._expect(TokenType.GT, msg)
 
     def _skip_newlines(self) -> None:
         """Skip any newline tokens."""
@@ -183,14 +250,14 @@ class Parser:
                 return type_args  # Not type args, leave < for expression parser
 
             self._advance()  # consume <
-            if not self._at(TokenType.GT):
+            if not self._at_type_args_close():
                 type_args.append(self.parse_type())
                 while self._at(TokenType.COMMA):
                     self._advance()
-                    if self._at(TokenType.GT):
+                    if self._at_type_args_close():
                         break  # trailing comma
                     type_args.append(self.parse_type())
-            self._expect(TokenType.GT, "Expected '>' after type arguments")
+            self._expect_type_args_close("Expected '>' after type arguments")
         return type_args
 
     def _try_parse_type_args_for_expr(self) -> List['rast.Type']:
@@ -205,26 +272,27 @@ class Parser:
         if not self._at(TokenType.LT):
             return []
 
-        # Save position for backtracking
-        saved_pos = self.pos
+        # Save position for backtracking (also undoes any `>>` splits)
+        mark = self._mark()
 
         try:
             self._advance()  # consume <
 
             type_args = []
-            if not self._at(TokenType.GT):
+            if not self._at_type_args_close():
                 type_args.append(self.parse_type())
                 while self._at(TokenType.COMMA):
                     self._advance()
-                    if self._at(TokenType.GT):
+                    if self._at_type_args_close():
                         break
                     type_args.append(self.parse_type())
 
-            if not self._at(TokenType.GT):
+            if not self._at_type_args_close():
                 # Not a valid type arg list
-                self.pos = saved_pos
+                self._reset(mark)
                 return []
 
+            self._split_leading_gt()
             self._advance()  # consume >
 
             # Check if followed by ( or { - this confirms it's type args
@@ -233,12 +301,12 @@ class Parser:
 
             # Not followed by ( or {, could be comparison
             # Backtrack and let expression parser handle it
-            self.pos = saved_pos
+            self._reset(mark)
             return []
 
         except ParseError:
             # Failed to parse as type args, backtrack
-            self.pos = saved_pos
+            self._reset(mark)
             return []
 
     def _parse_interp_expr(self, expr_str: str, parent_span: Span) -> rast.Expr:
