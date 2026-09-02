@@ -773,3 +773,134 @@ class TestCompileFailureReporting:
         err = self._report(capsys, [(Path("/p/a.ritz"), "line one\nline two")])
         assert "      line one" in err
         assert "      line two" in err
+
+
+class TestIRVerification:
+    """RITZ_VERIFY_IR runs the LLVM verifier at emission (AGAST #1308).
+
+    The point of the flag is to stop "is this IR valid?" from being answered
+    by whichever clang is installed. It only delivers that if it actually
+    runs, and its most dangerous property is that when no verifier is on PATH
+    it degrades to a warning and returns success. Ubuntu ships `opt` only
+    under /usr/lib/llvm-N/bin, so an un-pinned PATH hits that path routinely —
+    a `RITZ_VERIFY_IR=1` run can exit 0 having verified nothing at all.
+    That silent-success branch is tested here deliberately; it is the reason
+    a green run is not by itself evidence the IR was checked.
+    """
+
+    # Dominance violation: %y is never defined.
+    BAD_IR = ("define i32 @f() {\n"
+              "entry:\n"
+              "  br label %b\n"
+              "b:\n"
+              "  %x = add i32 1, 2\n"
+              "  ret i32 %y\n"
+              "}\n")
+
+    GOOD_IR = ("define i32 @f() {\n"
+               "entry:\n"
+               "  %x = add i32 1, 2\n"
+               "  ret i32 %x\n"
+               "}\n")
+
+    @pytest.fixture(autouse=True)
+    def _reset_warn_latch(self):
+        """verify_ir warns once per process; un-latch it between tests."""
+        _build_module._WARNED_NO_VERIFIER = False
+        yield
+        _build_module._WARNED_NO_VERIFIER = False
+
+    @staticmethod
+    def _has_verifier():
+        return _build_module._ir_verifier_cmd() is not None
+
+    def _write(self, tmp_path, text, name="mod.ll"):
+        p = tmp_path / name
+        p.write_text(text)
+        return p
+
+    @pytest.mark.unit
+    def test_disabled_by_default_accepts_invalid_ir(self, tmp_path, monkeypatch):
+        """No env var: ordinary `rz build` pays nothing and checks nothing."""
+        monkeypatch.delenv("RITZ_VERIFY_IR", raising=False)
+        ll = self._write(tmp_path, self.BAD_IR)
+        assert _build_module.verify_ir(ll, Path("src.ritz")) is None
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("val", ["1", "true", "yes", "on"])
+    def test_truthy_values_enable_verification(self, tmp_path, monkeypatch, val):
+        if not self._has_verifier():
+            pytest.skip("no `opt`/`llvm-as` on PATH")
+        monkeypatch.setenv("RITZ_VERIFY_IR", val)
+        ll = self._write(tmp_path, self.BAD_IR)
+        assert _build_module.verify_ir(ll, Path("src.ritz")) is not None
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("val", ["", "0", "false", "no", "off"])
+    def test_falsy_values_leave_it_off(self, tmp_path, monkeypatch, val):
+        monkeypatch.setenv("RITZ_VERIFY_IR", val)
+        ll = self._write(tmp_path, self.BAD_IR)
+        assert _build_module.verify_ir(ll, Path("src.ritz")) is None
+
+    @pytest.mark.unit
+    def test_rejects_invalid_ir_and_names_the_source(self, tmp_path, monkeypatch):
+        if not self._has_verifier():
+            pytest.skip("no `opt`/`llvm-as` on PATH")
+        monkeypatch.setenv("RITZ_VERIFY_IR", "1")
+        ll = self._write(tmp_path, self.BAD_IR)
+        err = _build_module.verify_ir(ll, Path("/p/emitter_stmt.ritz"))
+        assert err is not None
+        # The diagnostic must point at the .ritz that produced it, not just
+        # the .ll, or the failure is un-actionable.
+        assert "emitter_stmt.ritz" in err
+        assert str(ll) in err
+
+    @pytest.mark.unit
+    def test_accepts_valid_ir(self, tmp_path, monkeypatch):
+        if not self._has_verifier():
+            pytest.skip("no `opt`/`llvm-as` on PATH")
+        monkeypatch.setenv("RITZ_VERIFY_IR", "1")
+        ll = self._write(tmp_path, self.GOOD_IR)
+        assert _build_module.verify_ir(ll, Path("src.ritz")) is None
+
+    @pytest.mark.unit
+    def test_missing_module_is_not_an_error(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("RITZ_VERIFY_IR", "1")
+        assert _build_module.verify_ir(tmp_path / "absent.ll", Path("s.ritz")) is None
+
+    @pytest.mark.unit
+    def test_no_verifier_on_path_warns_and_passes(self, tmp_path, monkeypatch, capsys):
+        """The trap: enabled + no verifier == silent success.
+
+        This is why `RITZ_VERIFY_IR=1 regression.sh && echo ok` is not on its
+        own evidence that any IR was verified. CI pins the toolchain so the
+        versioned bindir is on PATH; without that pin this branch is taken.
+        """
+        monkeypatch.setenv("RITZ_VERIFY_IR", "1")
+        monkeypatch.setattr(_build_module.shutil, "which", lambda _n: None)
+        ll = self._write(tmp_path, self.BAD_IR)
+        assert _build_module.verify_ir(ll, Path("src.ritz")) is None
+        assert "not verified" in capsys.readouterr().err
+
+    @pytest.mark.unit
+    def test_no_verifier_warning_is_emitted_once(self, tmp_path, monkeypatch, capsys):
+        """~100 modules per bootstrap; repeating the warning buries the build."""
+        monkeypatch.setenv("RITZ_VERIFY_IR", "1")
+        monkeypatch.setattr(_build_module.shutil, "which", lambda _n: None)
+        ll = self._write(tmp_path, self.BAD_IR)
+        for _ in range(3):
+            _build_module.verify_ir(ll, Path("src.ritz"))
+        assert capsys.readouterr().err.count("not verified") == 1
+
+    @pytest.mark.unit
+    def test_prefers_opt_over_llvm_as(self, monkeypatch):
+        """`opt` reports every violation; `llvm-as` stops at the first."""
+        monkeypatch.setattr(_build_module.shutil, "which",
+                            lambda n: f"/usr/bin/{n}")
+        assert _build_module._ir_verifier_cmd()[0] == "opt"
+
+    @pytest.mark.unit
+    def test_falls_back_to_llvm_as(self, monkeypatch):
+        monkeypatch.setattr(_build_module.shutil, "which",
+                            lambda n: None if n == "opt" else f"/usr/bin/{n}")
+        assert _build_module._ir_verifier_cmd()[0] == "llvm-as"

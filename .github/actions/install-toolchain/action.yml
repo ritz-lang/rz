@@ -1,0 +1,102 @@
+name: Install pinned LLVM toolchain
+description: >
+  Install an explicit clang/LLVM version and put it on PATH as the unsuffixed
+  `clang`, `opt` and `llvm-as`, so that every machine building ritz agrees on
+  what "the compiler accepts this IR" means.
+
+# Why this action exists at all (AGAST #1308).
+#
+# build.py shells out to bare `clang`. Until now nothing said which clang that
+# was: CI got whatever ubuntu-latest shipped, developers got whatever their
+# distro shipped. That is fine for compiling C. It is not fine here, because
+# ritz's regression gate has an *allowlist* of examples ritz1 cannot compile,
+# and clang is the thing that decides "cannot compile". A list calibrated
+# against one verifier is noise against another.
+#
+# The observed damage: on commit eef15af, stage 3 reported 42 passed on a
+# clang-21 workstation and 50 passed on the CI runner, and CI printed fifteen
+# "on the allowlist but COMPILES - remove it" warnings on every green run. A
+# warning that always fires is a warning nobody reads, so the one mechanism
+# that makes the allowlist shrink had stopped working.
+
+inputs:
+  clang-version:
+    description: Major LLVM version to install and pin (e.g. "21").
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Install clang ${{ inputs.clang-version }} and lld
+      shell: bash
+      run: |
+        set -euo pipefail
+        version='${{ inputs.clang-version }}'
+
+        # Prefer the distro package when it already provides the pinned
+        # version -- it is much faster than adding the LLVM apt repo, and on
+        # newer runner images it is frequently present.
+        sudo apt-get update
+        if ! sudo apt-get install -y "clang-$version" "lld-$version" "llvm-$version"; then
+          echo "clang-$version not in the distro archive; adding apt.llvm.org"
+          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x /tmp/llvm.sh
+          sudo /tmp/llvm.sh "$version"
+          sudo apt-get install -y "lld-$version" "llvm-$version"
+        fi
+
+    - name: Pin it as the default clang
+      shell: bash
+      run: |
+        set -euo pipefail
+        version='${{ inputs.clang-version }}'
+        bindir="/usr/lib/llvm-$version/bin"
+        test -x "$bindir/clang" || { echo "::error::$bindir/clang missing"; exit 1; }
+
+        # Prepending the versioned bindir to PATH is what actually pins the
+        # toolchain. build.py invokes bare `clang`; without this the versioned
+        # package would be installed and then quietly not used, which is
+        # strictly worse than not pinning at all because it looks pinned.
+        #
+        # This also puts `opt` and `llvm-as` on PATH, which RITZ_VERIFY_IR
+        # (see build.py) requires -- ubuntu ships those only under the
+        # versioned directory, never as unsuffixed names.
+        echo "$bindir" >> "$GITHUB_PATH"
+
+        # lld provides lld-link, required to link PE/COFF UEFI targets
+        # (harland's bootx64). GNU ld cannot link COFF objects. The versioned
+        # package installs it as ld.lld-N / lld-N only, so alias the plain
+        # names that the UEFI build path looks for.
+        sudo update-alternatives --install /usr/bin/lld lld "/usr/bin/lld-$version" 100 || true
+        sudo update-alternatives --install /usr/bin/ld.lld ld.lld "/usr/bin/ld.lld-$version" 100 || true
+        sudo update-alternatives --install /usr/bin/lld-link lld-link "/usr/bin/lld-link-$version" 100 || true
+
+    - name: Report the pinned toolchain
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "clang:   $(command -v clang)"
+        clang --version
+        echo "opt:     $(command -v opt || echo '<missing>')"
+        echo "llvm-as: $(command -v llvm-as || echo '<missing>')"
+
+        # Fail loudly on a mismatch rather than running the gate against the
+        # wrong compiler and re-seeding an allowlist from it.
+        actual="$(clang --version | sed -n 's/.*clang version \([0-9]\+\).*/\1/p' | head -1)"
+        if [ "$actual" != '${{ inputs.clang-version }}' ]; then
+          echo "::error::expected clang ${{ inputs.clang-version }}, PATH resolves to $actual"
+          exit 1
+        fi
+
+        # RITZ_VERIFY_IR degrades to a warning when no verifier is on PATH
+        # (see build.py) -- by design, so developers who have not opted in are
+        # never blocked. In CI that default is a trap: the gate sets
+        # RITZ_VERIFY_IR=1, so a missing `opt` would produce a green run that
+        # verified nothing, and that is indistinguishable from a green run
+        # that verified everything. Pinning exists precisely because the
+        # versioned bindir carries these tools, so their absence means the pin
+        # did not take and must fail here rather than pass quietly.
+        if ! command -v opt >/dev/null && ! command -v llvm-as >/dev/null; then
+          echo "::error::neither opt nor llvm-as on PATH after pinning; RITZ_VERIFY_IR would silently no-op"
+          exit 1
+        fi

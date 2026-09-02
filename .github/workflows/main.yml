@@ -13,6 +13,26 @@ on:
 # and another swallowed compiler errors with `2>/dev/null || true`. Calling rz
 # directly means CI exercises the real build graph from ritz.toml.
 
+# The LLVM toolchain is PINNED. It used to be "whatever clang ubuntu-latest
+# happens to ship", which meant the regression allowlists described a
+# different compiler on every machine. Concretely (AGAST #1308): on the same
+# commit, stage 3 was 42 passed locally against clang 21 and 50 passed in CI
+# against the runner's older clang, and eight examples sat in the ritz1
+# allowlist labelled "cannot compile" when the truth was "ritz1 emits IR that
+# violates dominance and only the newer verifier rejects it".
+#
+# We pin FORWARD, to the newest clang we test against, not back to the
+# runner's default. Pinning back would have been stable and quiet, and would
+# have been the wrong call: a permissive verifier accepting dominance-
+# violating IR does not make the IR valid, it makes a real codegen bug
+# invisible until the toolchain moves under us. Pinning forward turns those
+# bugs into failures we can file and fix. See RITZ_VERIFY_IR below, which is
+# the durable version of the same idea.
+env:
+  # Keep in sync with projects/ritz/docs/TOOLCHAIN.md and the local
+  # requirement documented there.
+  CLANG_VERSION: '21'
+
 jobs:
   build-all:
     runs-on: ubuntu-latest
@@ -25,9 +45,9 @@ jobs:
           python-version: '3.12'
 
       - name: Install toolchain
-        # lld provides lld-link, required to link PE/COFF UEFI targets
-        # (harland's bootx64). GNU ld cannot link COFF objects.
-        run: sudo apt-get update && sudo apt-get install -y lld
+        uses: ./.github/actions/install-toolchain
+        with:
+          clang-version: ${{ env.CLANG_VERSION }}
 
       - name: Install ritz0 dependencies
         run: python -m pip install --upgrade pip -r projects/ritz/requirements.txt
@@ -46,9 +66,9 @@ jobs:
           python-version: '3.12'
 
       - name: Install toolchain
-        # lld provides lld-link, required to link PE/COFF UEFI targets
-        # (harland's bootx64). GNU ld cannot link COFF objects.
-        run: sudo apt-get update && sudo apt-get install -y lld
+        uses: ./.github/actions/install-toolchain
+        with:
+          clang-version: ${{ env.CLANG_VERSION }}
 
       - name: Install ritz0 dependencies
         run: python -m pip install --upgrade pip -r projects/ritz/requirements.txt
@@ -88,9 +108,9 @@ jobs:
           python-version: '3.12'
 
       - name: Install toolchain
-        # lld provides lld-link, required to link PE/COFF UEFI targets
-        # (harland's bootx64). GNU ld cannot link COFF objects.
-        run: sudo apt-get update && sudo apt-get install -y lld
+        uses: ./.github/actions/install-toolchain
+        with:
+          clang-version: ${{ env.CLANG_VERSION }}
 
       - name: Install ritz0 dependencies
         run: python -m pip install --upgrade pip -r projects/ritz/requirements.txt
@@ -108,11 +128,21 @@ jobs:
         run: make matrix-full
         working-directory: projects/ritz
         timeout-minutes: 20
+        env:
+          RITZ_VERIFY_IR: '1'
 
       - name: Differential corpus regression (ritz0 vs ritz1 vs self-hosted)
         run: ./scripts/regression.sh
         working-directory: projects/ritz
         timeout-minutes: 25
+        # Run the LLVM verifier on every module we emit, before handing it to
+        # clang. Pinning the toolchain makes the allowlist mean one thing;
+        # this makes it stop depending on the toolchain at all. Invalid IR now
+        # fails at the point of emission with the offending function named,
+        # rather than surviving until some future clang tightens its verifier
+        # and turns a two-year-old codegen bug into a mystery CI break.
+        env:
+          RITZ_VERIFY_IR: '1'
 
   # ritz-lint is an AI-assisted reviewer: it shells out to the `claude` CLI and
   # needs an authenticated subscription. That is not available to CI runners, so

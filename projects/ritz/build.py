@@ -19,11 +19,12 @@ import sys
 import os
 import re
 import subprocess
+import shutil
 import argparse
 import tempfile
 from pathlib import Path
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 try:
     import tomllib
@@ -52,6 +53,90 @@ ARCH = platform.machine()  # e.g., 'x86_64'
 RITZ_START = RUNTIME_DIR / f"ritz_start.{ARCH}.o"           # main(argc, argv)
 RITZ_START_NOARGS = RUNTIME_DIR / f"ritz_start_noargs.{ARCH}.o"  # main()
 RITZ_START_ENVP = RUNTIME_DIR / f"ritz_start_envp.{ARCH}.o"      # main(argc, argv, envp)
+
+
+# =============================================================================
+# LLVM IR verification (AGAST #1308)
+# =============================================================================
+#
+# Set RITZ_VERIFY_IR=1 to run the LLVM verifier over every module we emit,
+# immediately after emission and before clang ever sees it.
+#
+# The problem this solves: build.py lowers .ll via bare `clang`, so "is this
+# IR valid?" was answered by whichever clang happened to be installed. Those
+# answers disagreed. On commit eef15af, stage 3 of the regression gate scored
+# 42 passed on a clang-21 workstation and 50 passed on the CI runner's older
+# clang, and eight examples sat in regression-known-failures-ritz1.txt
+# labelled "ritz1 cannot compile this" when the truth was "ritz1 emits IR that
+# violates dominance and only the newer verifier objects". For example
+# tier2_stdlib_16_tr:
+#
+#     clang linking failed: invalid LLVM IR input:
+#     Instruction does not dominate all uses!
+#
+# A permissive verifier accepting that does not make the IR valid. It makes a
+# real codegen bug invisible until the toolchain moves, whereupon it comes
+# back as an unexplained CI break a long way from the commit that caused it.
+#
+# Pinning clang (see .github/actions/install-toolchain) makes the allowlists
+# mean one thing everywhere. This makes them stop depending on the toolchain
+# at all: invalid IR fails at the point of emission, naming the function,
+# regardless of what clang is on PATH.
+#
+# Off by default so ordinary `rz build` does not pay for a verifier pass per
+# module. CI turns it on for both bootstrap gate steps.
+def _ir_verifier_cmd() -> Optional[List[str]]:
+    """Return an argv prefix that verifies a .ll file, or None if unavailable.
+
+    Prefers `opt -passes=verify`, which reports every violation with the
+    enclosing function named. Falls back to `llvm-as`, whose parser runs the
+    same verifier but stops at the first error.
+
+    Ubuntu ships neither under an unsuffixed name outside
+    /usr/lib/llvm-N/bin, so an unpinned PATH may legitimately have no
+    verifier. That is a reason to warn, not to fail: developers who have not
+    opted in should not be blocked, and CI pins the toolchain precisely so
+    the tools are present there.
+    """
+    if shutil.which("opt"):
+        return ["opt", "-passes=verify", "-disable-output"]
+    if shutil.which("llvm-as"):
+        return ["llvm-as", "-o", os.devnull]
+    return None
+
+
+def verify_ir(ll_path: Path, source: Path) -> Optional[str]:
+    """Verify freshly emitted IR. Returns an error string, or None if OK.
+
+    No-op unless RITZ_VERIFY_IR is set to a truthy value.
+    """
+    if os.environ.get("RITZ_VERIFY_IR", "") not in ("1", "true", "yes", "on"):
+        return None
+    if not ll_path.exists():
+        return None
+
+    cmd = _ir_verifier_cmd()
+    if cmd is None:
+        # Warn once per process; repeating it for all ~100 modules of a
+        # bootstrap would bury the build output it is meant to draw attention
+        # to.
+        global _WARNED_NO_VERIFIER
+        if not _WARNED_NO_VERIFIER:
+            _WARNED_NO_VERIFIER = True
+            print("  ⚠ RITZ_VERIFY_IR set but neither `opt` nor `llvm-as` is on "
+                  "PATH; IR not verified. See docs/TOOLCHAIN.md.", file=sys.stderr)
+        return None
+
+    result = subprocess.run(cmd + [str(ll_path)], capture_output=True, text=True)
+    if result.returncode == 0:
+        return None
+    return (f"invalid LLVM IR emitted for {source}\n"
+            f"    module: {ll_path}\n"
+            f"    verifier: {' '.join(cmd)}\n"
+            f"{result.stderr.strip()}")
+
+
+_WARNED_NO_VERIFIER = False
 
 # Ritz links freestanding: no libc, direct syscalls only. A hosted clang does
 # not know that. Its loop-idiom recognizer happily rewrites an ordinary byte
@@ -1089,6 +1174,15 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
                 compile_failures.append((src, result.stderr))
                 continue
 
+            # AGAST #1308: verify before clang, and before the .ll is cached.
+            # Caching invalid IR would make the bug survive a rebuild and then
+            # reappear on a machine whose clang is stricter, which is exactly
+            # the failure mode this is here to kill.
+            ir_error = verify_ir(ll_path, src)
+            if ir_error is not None:
+                compile_failures.append((src, ir_error))
+                continue
+
             # Update .ll cache
             if use_cache:
                 ll_content = ll_path.read_text()
@@ -1345,6 +1439,12 @@ def compile_freestanding_binary(
                 # AGAST #1286: collect rather than bail, so all broken files
                 # surface in one build. See `report_compile_failures`.
                 ritz0_failures.append((src, result.stderr))
+                continue
+
+            # AGAST #1308: see verify_ir. No-op unless RITZ_VERIFY_IR is set.
+            ir_error = verify_ir(ll_path, src)
+            if ir_error is not None:
+                ritz0_failures.append((src, ir_error))
                 continue
 
             # Compile LLVM IR to object file with target-specific options
