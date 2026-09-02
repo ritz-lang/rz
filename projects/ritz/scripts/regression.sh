@@ -6,6 +6,7 @@
 #   Stage 2: ritz0 compiles ritz1
 #   Stage 3: ritz1 compiles examples, compare output with Stage 1
 #   Stage 4: ritz1 self-compiles (bootstrap), compile examples, compare
+#   Stage 5: assert stage 3 and stage 4 accepted the *same* set of examples
 #
 # Note: "Stages" refer to compiler development progression.
 #       Examples have their own "Tiers" based on language features used.
@@ -13,7 +14,7 @@
 # Usage:
 #   ./scripts/regression.sh             # Run all stages
 #   ./scripts/regression.sh --stage 1   # Run specific stage
-#   ./scripts/regression.sh --quick     # Skip Stage 4 (slower)
+#   ./scripts/regression.sh --quick     # Skip Stages 4 and 5 (slower)
 #   ./scripts/regression.sh --verbose   # Show detailed output
 #
 # Exit codes:
@@ -70,8 +71,8 @@ while [[ $# -gt 0 ]]; do
             echo "Usage: $0 [OPTIONS]"
             echo ""
             echo "Options:"
-            echo "  --stage N    Run only stage N (1-4)"
-            echo "  --quick      Skip Stage 4 (self-hosted bootstrap)"
+            echo "  --stage N    Run only stage N (1-5)"
+            echo "  --quick      Skip Stage 4 (self-hosted bootstrap) and Stage 5"
             echo "  --verbose    Show detailed output"
             echo "  --help       Show this message"
             exit 0
@@ -154,8 +155,32 @@ get_examples() {
 # between "we know about these" and "we assert nothing".
 # One file per compiler: ritz0 and ritz1 have genuinely different gaps, and a
 # shared list would let a ritz1 regression hide behind a ritz0 entry.
-# ritz1_selfhosted shares ritz1's list — if the two ever disagree, that is a
-# self-hosting fixed-point bug and must go red, never be allowlisted.
+#
+# ritz1_selfhosted deliberately shares ritz1's list, and that sharing is SAFE
+# only because of Stage 5.  The reasoning matters, so read it before changing
+# either the file layout or the resolution below.
+#
+# The header of the allowlist files states the design rule: compile failures
+# may be allowlisted, behavioural mismatches never.  That rule was written for
+# ritz0-vs-ritzN *behaviour*.  It said nothing about ritz1-vs-ritz1_selfhosted
+# *compile* divergence — and because both stages resolved to the same file,
+# each stage independently skipped a listed entry.  "ritz1 accepts it,
+# ritz1_selfhosted rejects it" was therefore indistinguishable from "both are
+# known-broken": the divergence never reached a comparison and the suite exited
+# 0.  Real instance (CI 33679700130, commit eef15af): stage 3 reported 50
+# passed / 35 skipped, stage 4 reported 49 passed / 36 skipped, and the single
+# example in the difference — tier5_async_49_ritzgen — compiled under ritz1 and
+# failed under the compiler ritz1 had built from its own source.  The
+# self-hosting fixed point was not reached and the gate said 🎉.
+#
+# An allowlist may say "this program is known not to compile."  It must never
+# be able to say "these two compilers may disagree."  Stage 5 enforces exactly
+# that distinction: it compares the accepted sets of stages 3 and 4 directly,
+# consulting NO allowlist, so no entry in any list can silence a divergence.
+#
+# Consequently, do not "fix" a red Stage 5 by editing an allowlist — adding the
+# example to the list, or removing it, cannot change the Stage 5 verdict by
+# construction.  A red Stage 5 is a self-hosting bug in the compiler.
 known_failures_file() {
     case "$1" in
         ritz1|ritz1_selfhosted) echo "$SCRIPT_DIR/regression-known-failures-ritz1.txt" ;;
@@ -168,6 +193,36 @@ is_known_failure() {
     local f=$(known_failures_file "$1")
     [[ -f "$f" ]] || return 1
     grep -qxF "$2" <(sed 's/#.*//; s/[[:space:]]*$//; /^$/d' "$f")
+}
+
+# --- Differential accept-set recording (feeds Stage 5) ----------------------
+#
+# Deliberately independent of the allowlist machinery above.  These record the
+# raw, observed outcome of `compile_with` — did this compiler accept this
+# program, yes or no — *before* any allowlist is consulted, so an allowlisted
+# entry is recorded as rejected exactly like an unlisted one.  That is the
+# whole point: Stage 5 must see the truth, not the filtered view each stage
+# reports to the user.
+#
+# Args: $1=compiler, $2=example key, $3="accepted"|"rejected"
+record_compile_outcome() {
+    echo "$2" >> "$BUILD_DIR/acceptset_$1.$3"
+}
+
+# Declare that a stage ran to completion over the example corpus, so Stage 5
+# can tell "this compiler accepted nothing" from "this stage never ran".
+# Without this an aborted or skipped stage would present an empty accept set,
+# and comparing two empty sets trivially succeeds — a green built out of two
+# things that never happened, which is the exact failure mode this suite keeps
+# being bitten by.
+#
+# Call this *after* the corpus loop, never before: a stage that dies partway
+# through must not be able to claim it ran.  The empty-file creation matters
+# for the legitimate zero-accept case, where no append ever happened.
+mark_stage_ran() {
+    : >> "$BUILD_DIR/acceptset_$1.accepted"
+    : >> "$BUILD_DIR/acceptset_$1.rejected"
+    echo "1" > "$BUILD_DIR/acceptset_$1.ran"
 }
 
 # Stable, collision-free key for an example dir.  basename() is not unique
@@ -629,6 +684,7 @@ run_stage3() {
 
         # Compile with ritz1
         if ! compile_with "ritz1" "$src" "$bin" 2>/dev/null; then
+            record_compile_outcome ritz1 "$name" rejected
             if is_known_failure ritz1 "$name"; then
                 warn "$name: ritz1 compile failed (known, allowlisted)"
                 skipped=$((skipped + 1))
@@ -638,6 +694,7 @@ run_stage3() {
             fi
             continue
         fi
+        record_compile_outcome ritz1 "$name" accepted
         if is_known_failure ritz1 "$name"; then
             warn "$name: on the ritz1 allowlist but COMPILES — remove it"
         fi
@@ -673,6 +730,8 @@ run_stage3() {
             failed=$((failed + 1))
         fi
     done
+
+    mark_stage_ran ritz1
 
     echo ""
     echo "Stage 3: $passed passed, $failed failed, $skipped skipped"
@@ -748,6 +807,7 @@ run_stage4() {
 
         # Compile with self-hosted ritz1
         if ! compile_with "ritz1_selfhosted" "$src" "$bin" 2>/dev/null; then
+            record_compile_outcome ritz1_selfhosted "$name" rejected
             if is_known_failure ritz1_selfhosted "$name"; then
                 warn "$name: self-hosted ritz1 compile failed (known, allowlisted)"
                 skipped=$((skipped + 1))
@@ -757,6 +817,7 @@ run_stage4() {
             fi
             continue
         fi
+        record_compile_outcome ritz1_selfhosted "$name" accepted
         if is_known_failure ritz1_selfhosted "$name"; then
             warn "$name: on the ritz1_selfhosted allowlist but COMPILES — remove it"
         fi
@@ -793,6 +854,8 @@ run_stage4() {
         fi
     done
 
+    mark_stage_ran ritz1_selfhosted
+
     echo ""
     echo "Stage 4: $passed passed, $failed failed, $skipped skipped"
     STAGE_RESULTS+=("Stage 4: $passed passed, $failed failed, $skipped skipped")
@@ -804,8 +867,102 @@ run_stage4() {
 }
 
 # ============================================================================
+# STAGE 5: self-hosting fixed-point check (ritz1 vs ritz1_selfhosted)
+# ============================================================================
+#
+# Asserts one thing, and asserts it unconditionally:
+#
+#     accepted_by_ritz1  ==  accepted_by_ritz1_selfhosted
+#
+# ritz1_selfhosted is the compiler that ritz1 built from ritz1's own source.
+# If the two disagree about whether a given program compiles, then compiling
+# the compiler changed the compiler's behaviour — the self-hosting fixed point
+# has not been reached.  That is a more serious defect than any single example
+# failing to build, because it means the artefact stages 3 and 4 are testing is
+# not stable under its own construction.
+#
+# This stage reads NO allowlist, by design.  Stages 3 and 4 each consult the
+# (shared) ritz1 allowlist and downgrade a listed compile failure to a skip;
+# that is legitimate for "we know ritz1 can't build this yet", but it made the
+# divergence invisible, because each stage skipped its side independently and
+# the two sides were never brought together.  Here the two accept sets are
+# compared directly, so no allowlist entry — present, absent, or added later in
+# a panic — can change the verdict.  There is deliberately no escape hatch:
+#
+#   * An allowlist may say "this program is known not to compile."
+#   * It must never be able to say "these two compilers may disagree."
+#
+# If this stage is red, do not edit an allowlist.  It will not help, and the
+# next reader will have to rediscover why.  Fix the compiler.
+run_stage5() {
+    log "STAGE 5: self-hosting fixed-point check (ritz1 vs ritz1_selfhosted)"
+    echo "----------------------------------------"
+
+    local a="$BUILD_DIR/acceptset_ritz1.accepted"
+    local b="$BUILD_DIR/acceptset_ritz1_selfhosted.accepted"
+
+    # Both stages must actually have run over the corpus.  Comparing a set
+    # against a set that was never populated is not a check, it is a green.
+    if [[ ! -f "$BUILD_DIR/acceptset_ritz1.ran" || \
+          ! -f "$BUILD_DIR/acceptset_ritz1_selfhosted.ran" ]]; then
+        warn "Stage 3 and/or Stage 4 did not run — fixed-point check not performed"
+        STAGE_RESULTS+=("Stage 5: SKIPPED - needs both Stage 3 and Stage 4")
+        return 0
+    fi
+
+    local only_a only_b
+    only_a=$(comm -23 <(sort -u "$a") <(sort -u "$b"))
+    only_b=$(comm -13 <(sort -u "$a") <(sort -u "$b"))
+
+    if [[ -z "$only_a" && -z "$only_b" ]]; then
+        local n
+        n=$(sort -u "$a" | grep -c . || true)
+        success "ritz1 and ritz1_selfhosted accept an identical set of $n examples"
+        STAGE_RESULTS+=("Stage 5: fixed point holds ($n examples, sets identical)")
+        TOTAL_PASSED=$((TOTAL_PASSED + 1))
+        return 0
+    fi
+
+    local divergent=0
+    while IFS= read -r k; do
+        [[ -n "$k" ]] || continue
+        fail "$k: accepted by ritz1, REJECTED by ritz1_selfhosted"
+        divergent=$((divergent + 1))
+    done <<< "$only_a"
+    while IFS= read -r k; do
+        [[ -n "$k" ]] || continue
+        fail "$k: REJECTED by ritz1, accepted by ritz1_selfhosted"
+        divergent=$((divergent + 1))
+    done <<< "$only_b"
+
+    echo ""
+    fail "Self-hosting fixed point NOT reached: $divergent example(s) diverge."
+    echo "  ritz1_selfhosted is ritz1 compiled by ritz1.  The two disagreeing"
+    echo "  about what compiles means compiling the compiler changed it."
+    echo "  This is NOT allowlistable — no entry in any known-failures file can"
+    echo "  silence it, and adding one will not turn this stage green."
+
+    STAGE_RESULTS+=("Stage 5: FAILED - $divergent example(s) diverge between ritz1 and ritz1_selfhosted")
+    TOTAL_FAILED=$((TOTAL_FAILED + divergent))
+    return 1
+}
+
+# ============================================================================
 # Main
 # ============================================================================
+
+# Allow a test to source this file for its helper functions without running the
+# suite.  Stage 5 is the one check here that no allowlist can silence, which
+# makes it exactly the check that must not be allowed to rot silently — but
+# exercising it end-to-end costs a full bootstrap (~6 min), so in practice it
+# would never be re-verified.  Sourcing lets scripts/test-regression-stage5.sh
+# feed it synthetic accept sets and assert the verdict in well under a second.
+#
+# Sourcers MUST reset BUILD_DIR and clear the EXIT trap installed above; see
+# that test for the pattern.
+if [[ -n "${RITZ_REGRESSION_LIB_ONLY:-}" ]]; then
+    return 0 2>/dev/null || exit 0
+fi
 
 echo ""
 echo "🎭 Ritz Regression Test Suite"
@@ -819,8 +976,11 @@ if [[ -n "$RUN_STAGE" ]]; then
         2) run_stage2 ;;
         3) run_stage1; run_stage2; run_stage3 ;;
         4) run_stage1; run_stage2; run_stage4 ;;
+        # Stage 5 compares stages 3 and 4, so selecting it runs both.  It
+        # cannot be run standalone: there is nothing to compare.
+        5) run_stage1; run_stage2; run_stage3; run_stage4; echo ""; run_stage5 ;;
         *)
-            echo "Invalid stage: $RUN_STAGE (must be 1-4)"
+            echo "Invalid stage: $RUN_STAGE (must be 1-5)"
             exit 1
             ;;
     esac
@@ -836,9 +996,16 @@ else
     if [[ $QUICK_MODE -eq 0 ]]; then
         run_stage4
         echo ""
+        run_stage5
+        echo ""
     else
         echo "Stage 4: SKIPPED (--quick mode)"
         STAGE_RESULTS+=("Stage 4: SKIPPED (--quick mode)")
+        # Stage 5 needs stage 4's accept set, so --quick necessarily forgoes
+        # the fixed-point check.  Say so explicitly rather than letting a
+        # quick run look like a full one in the summary.
+        echo "Stage 5: SKIPPED (--quick mode: needs Stage 4)"
+        STAGE_RESULTS+=("Stage 5: SKIPPED (--quick mode: needs Stage 4)")
     fi
 fi
 
