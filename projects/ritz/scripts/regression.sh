@@ -330,12 +330,44 @@ run_binary() {
     local sandbox="$BUILD_DIR/sandbox"
     _build_fixture_tree "$sandbox"
 
-    # Close stdin (</dev/null) to prevent programs like cat/grep from hanging
-    # Use timeout with KILL signal to ensure cleanup
-    # Limit output to 1MB to prevent disk-filling runaway output
-    ( cd "$sandbox" && timeout --signal=KILL 5s "$binary" < /dev/null 2>&1 ) \
-        | head -c 1048576 > "$stdout_file"
-    local exit_code=${PIPESTATUS[0]}
+    # Close stdin (</dev/null) to prevent programs like cat/grep from hanging.
+    # Use timeout with KILL signal to ensure cleanup.
+    #
+    # Write straight to a file.  Do NOT reintroduce a pipe here.  The original
+    # form was:
+    #
+    #     ( timeout --signal=KILL 5s "$binary" ) | head -c 1048576 > "$stdout_file"
+    #
+    # `timeout` signals only its *direct* child.  A program that forks and then
+    # exits -- a server that daemonises, anything that spawns a helper -- leaves
+    # a grandchild holding the pipe's write end open.  `head` then blocks on an
+    # EOF that never arrives, and because the 5s timeout has already fired there
+    # is no outer bound left: the suite hangs forever.  That is a deadlock, not
+    # a slow test.  It stalled the CI job past 110 minutes against a 6m25s
+    # baseline, and it only shows up where a forking example actually forks --
+    # which is why it never reproduced locally.
+    #
+    # No pipe means nothing can hold an EOF hostage.  The runaway-output cap
+    # that `head -c` used to provide is now an RLIMIT_FSIZE (`ulimit -f`),
+    # enforced by the kernel on the process itself.  bash counts `ulimit -f` in
+    # 1024-byte blocks (not the 512 that POSIX names for some other tools), so
+    # 1024 here is 1 MiB -- the same cap `head -c 1048576` applied, kept in
+    # agreement with the truncation check below.
+    local raw="${stdout_file}.raw"
+    rm -f "$raw"
+    ( cd "$sandbox" && ulimit -f 1024 && \
+      exec timeout --signal=KILL 5s "$binary" < /dev/null > "$raw" 2>&1 )
+    local exit_code=$?
+
+    # Reap anything the program forked and left behind.  Orphans are harmless
+    # to *this* measurement now that the pipe is gone, but a surviving server
+    # still holds its listening port and would break a later stage's run of the
+    # same example.  Binary paths are stage-prefixed and unique, so matching on
+    # the full path cannot hit an unrelated process.
+    pkill -KILL -f "^${binary}$" 2>/dev/null || true
+
+    head -c 1048576 "$raw" > "$stdout_file" 2>/dev/null || : > "$stdout_file"
+    rm -f "$raw"
     rm -rf "$sandbox"
     echo "$exit_code" > "$exit_file"
 
@@ -352,9 +384,14 @@ run_binary() {
     # Record the fact instead: for these, the assertion downgrades from "same
     # output" to "still non-terminating", which is the strongest claim the data
     # actually supports.  See compare_runs.
+    #
+    # 153 is 128+25 (SIGXFSZ): the kernel killed the program for exceeding the
+    # `ulimit -f` output cap.  That is the rlimit's way of saying what `head -c`
+    # used to say by closing the pipe -- a runaway generator -- so it belongs in
+    # the same bucket as 124/137 rather than being reported as a crash.
     local truncated=0
     [[ $(wc -c < "$stdout_file") -ge 1048576 ]] && truncated=1
-    if [[ "$exit_code" == "124" || "$exit_code" == "137" || $truncated -eq 1 ]]; then
+    if [[ "$exit_code" == "124" || "$exit_code" == "137" || "$exit_code" == "153" || $truncated -eq 1 ]]; then
         echo "1" > "${exit_file}.nonterminating"
     fi
     return 0
