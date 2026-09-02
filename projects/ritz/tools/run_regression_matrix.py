@@ -50,6 +50,7 @@ TESTS = [
     "test_issue_phi_pred_after_loop",
     "test_issue_mut_ref_deref_assign",
     "test_issue_namespace_const_field",
+    "test_issue_narrow_field_assign",
     # NOTE: test_issue_nested_generic_close (AGAST #1299, closing nested type
     # argument lists with `>>`) is deliberately NOT listed here yet. The fix is
     # ritz0-only: ritz0 splits a `>>`/`>=` token in type-argument context, but

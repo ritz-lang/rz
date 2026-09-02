@@ -1,0 +1,79 @@
+# Regression (AGAST #1303): assigning a narrow field of a *local* struct used
+# to clobber the fields after it.
+#
+# ritz1's STMT_LOCAL_FIELD_ASSIGN emitter dispatched on i32/ptr/struct only and
+# fell through to `store i64` for everything else.  Values are i64 in the
+# unified value model, so `opts.type_filter = 'f'` on a `u8` field wrote eight
+# bytes and wiped whatever followed it in the struct.
+#
+# Repro shape pulled from examples/tier3_coreutils/30_find: a `u8` flag
+# immediately followed by an `i32` sentinel.  Writing the flag reset
+# `maxdepth` from -1 to 0, which means "do not descend", so find printed the
+# root directory and stopped.  The program was well-typed, compiled without a
+# diagnostic and exited 0 -- only the behaviour differed, which is why nothing
+# short of the differential gate caught it.
+
+struct NarrowOpts
+  name_pattern: *u8
+  type_filter: u8     # 1-byte field...
+  maxdepth: i32       # ...whose 8-byte store used to land here
+
+struct NarrowAll
+  a: u8
+  b: u8
+  c: u16
+  d: i32
+
+# The 30_find shape: narrow flag directly ahead of a negative sentinel.
+[[test]]
+fn test_narrow_field_does_not_clobber_neighbour() -> i32
+    var opts: NarrowOpts
+    opts.name_pattern = null
+    opts.maxdepth = 0 - 1
+    opts.type_filter = 102          # 'f'
+    assert opts.maxdepth == 0 - 1
+    assert opts.type_filter as i64 == 102
+    0
+
+# Every narrow width, written front to back and then back to front, so a store
+# cannot reach forwards or backwards out of its own field.
+[[test]]
+fn test_narrow_fields_all_widths() -> i32
+    var n: NarrowAll
+    n.a = 1
+    n.b = 2
+    n.c = 3
+    n.d = 4
+    assert n.a as i64 == 1
+    assert n.b as i64 == 2
+    assert n.c as i64 == 3
+    assert n.d as i64 == 4
+
+    n.d = 40
+    n.c = 30
+    n.b = 20
+    n.a = 10
+    assert n.a as i64 == 10
+    assert n.b as i64 == 20
+    assert n.c as i64 == 30
+    assert n.d as i64 == 40
+    0
+
+# A value wider than the field keeps only its low bytes instead of spilling
+# the high bytes into the next field.
+[[test]]
+fn test_narrow_field_truncates() -> i32
+    var n: NarrowAll
+    n.a = 0
+    n.b = 20
+    n.c = 30
+    n.d = 40
+    n.a = 257                       # 0x101 -> 0x01
+    assert n.a as i64 == 1
+    assert n.b as i64 == 20
+    assert n.c as i64 == 30
+    assert n.d as i64 == 40
+    0
+
+fn main() -> i32
+    0
