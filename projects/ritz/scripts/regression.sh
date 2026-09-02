@@ -85,7 +85,21 @@ done
 
 # Setup
 mkdir -p "$BUILD_DIR"
-trap "rm -rf $BUILD_DIR" EXIT
+
+# Keep the captured stdout/exit files when anything failed.  This used to be an
+# unconditional `rm -rf` on EXIT, which meant a failing run in CI destroyed the
+# only evidence of *why* it failed -- you got "output mismatch" and nothing to
+# diff.  On success there is nothing worth keeping, so clean up as before.
+cleanup_build_dir() {
+    if [[ ${KEEP_ARTIFACTS:-0} -eq 1 ]]; then
+        echo ""
+        echo "Captured stdout/exit files kept for inspection:"
+        echo "  $BUILD_DIR"
+        return
+    fi
+    rm -rf "$BUILD_DIR"
+}
+trap cleanup_build_dir EXIT
 
 log() {
     echo -e "${BLUE}==>${NC} $1"
@@ -203,11 +217,26 @@ compile_with() {
         # that: the old fallback globbed any executable sitting in the example
         # dir, which meant a stale committed binary could stand in for a build
         # that never happened.
-        local bin_name=$(awk '/^\[\[bin\]\]/{found=1} found && /^name\s*=/{gsub(/.*=\s*"|".*/, ""); print; exit}' "$example_dir/ritz.toml" 2>/dev/null)
+        #
+        # The binary name comes from [[bin]] name, else [package] name.  Most
+        # examples have no [[bin]] section at all, so the [package] fallback is
+        # the common case, not the exception.
+        local bin_name=$(awk '/^\[\[bin\]\]/{found=1} found && /^name[[:space:]]*=/{gsub(/.*=[[:space:]]*"|".*/, ""); print; exit}' "$example_dir/ritz.toml" 2>/dev/null)
+        if [[ -z "$bin_name" ]]; then
+            bin_name=$(awk '/^\[package\]/{found=1} found && /^name[[:space:]]*=/{gsub(/.*=[[:space:]]*"|".*/, ""); print; exit}' "$example_dir/ritz.toml" 2>/dev/null)
+        fi
         local built_bin=""
-        for cand in "$example_dir/build/debug/$bin_name" \
-                    "$example_dir/build/debug/$example_name"; do
-            if [[ -n "$bin_name$example_name" && -x "$cand" ]]; then
+        for cand_name in "$bin_name" "$example_name"; do
+            # Skip an empty name: "$dir/build/debug/" is the *directory*, and
+            # `-x` is true for directories, so an empty bin_name used to select
+            # the build dir itself.  `cp` then failed with "omitting directory"
+            # and the caller sailed on to `return 0` -- a build reported as
+            # successful with no binary produced.  Downstream, `timeout` on the
+            # missing path yielded exit 127, which every stage happily recorded
+            # as a legitimate baseline.  41 of 68 stage-1 "passes" were that.
+            [[ -n "$cand_name" ]] || continue
+            local cand="$example_dir/build/debug/$cand_name"
+            if [[ -f "$cand" && -x "$cand" ]]; then
                 built_bin="$cand"
                 break
             fi
@@ -218,7 +247,11 @@ compile_with() {
         if [[ -z "$built_bin" ]]; then
             return 1
         fi
-        cp "$built_bin" "$output"
+        # Propagate cp's status.  This used to be the last command in the
+        # block, followed by an unconditional `return 0`, so a failed copy was
+        # indistinguishable from a successful build.
+        cp "$built_bin" "$output" || return 1
+        [[ -f "$output" && -x "$output" ]] || return 1
     }
 
     return 0
@@ -226,17 +259,105 @@ compile_with() {
 
 # Run a binary and capture output/exit code
 # Args: $1=binary, $2=output_file (for stdout), $3=exit_file
+# Build a small, deterministic directory tree for a binary to run inside.
+#
+# Every stage gets a byte-identical tree, so filesystem-inspecting programs
+# (du, find, ls, wc -c) produce stable output that is genuinely a function of
+# the compiled program.  Kept deliberately small and flat-ish: entries are
+# created in a fixed order with fixed sizes and fixed content, and the
+# directory name is fixed, so nothing about the host leaks into the output.
+#
+# Sizes are exact multiples chosen so `du`'s block rounding is stable across
+# filesystems.  Do not add entries with host-dependent content (timestamps,
+# hostnames, $USER) -- that would silently reintroduce the nondeterminism this
+# exists to eliminate.
+_build_fixture_tree() {
+    local root="$1"
+    rm -rf "$root"
+    mkdir -p "$root/alpha/nested" "$root/beta"
+
+    # Fixed-size files: 1024, 2048 and 512 bytes of a constant byte.
+    head -c 1024 /dev/zero | tr '\0' 'a' > "$root/alpha/one.txt"
+    head -c 2048 /dev/zero | tr '\0' 'b' > "$root/alpha/nested/two.txt"
+    head -c 512  /dev/zero | tr '\0' 'c' > "$root/beta/three.txt"
+    printf 'line one\nline two\nline three\n' > "$root/readme.txt"
+
+    # Fixed mtimes so anything printing timestamps stays stable.
+    find "$root" -exec touch -t 202001010000.00 {} + 2>/dev/null || true
+}
+
 run_binary() {
     local binary="$1"
     local stdout_file="$2"
     local exit_file="$3"
 
+    # A missing binary must never become a baseline.  `timeout` reports 127
+    # ("command not found") for a path that does not exist, which is
+    # indistinguishable from a program that genuinely exited 127 -- so an
+    # absent binary used to be recorded as "exit=127, no output", and the next
+    # stage's equally-absent binary matched it perfectly.  Two things that
+    # never ran comparing equal is not a passing test.
+    if [[ ! -f "$binary" || ! -x "$binary" ]]; then
+        return 1
+    fi
+
+    # Clear any marker left by a previous run before recording this one.  A
+    # stale `.nonterminating` file would silently downgrade this run's strict
+    # byte comparison to the weaker "still non-terminating" property check --
+    # a state-dependent weakening of the assertion, which is the same
+    # stale-artifact class this suite exists to catch.
+    rm -f "${exit_file}.nonterminating"
+
+    # Run inside a freshly built, byte-identical fixture tree.
+    #
+    # Programs that inspect their working directory -- 29_du, 30_find, 21_ls --
+    # produce output that is a function of the filesystem, not of the compiled
+    # program.  Stages run minutes apart with builds in between (stage 2 builds
+    # ritz1), so CWD differs every time and byte-comparing their output across
+    # stages compares the build tree, not the compiler.  That is how 29_du and
+    # 30_find reported "output mismatch" for a compiler that was behaving
+    # perfectly: `.ritz-cache/objects` had grown from 11128 to 11480 KB between
+    # stage 1 and stage 3.
+    #
+    # Allowlisting them would silence a whole category of program -- anything
+    # that reads the filesystem -- and those are exactly the programs where a
+    # miscompile matters most.  So instead we make the environment identical
+    # and keep the strict comparison: same fixture, same expected output, and a
+    # real difference is now genuinely attributable to the compiler.
+    # A *fixed* path, not mktemp: a random directory name would leak into the
+    # output of any program that prints its own cwd, reintroducing the very
+    # nondeterminism this is meant to remove.
+    local sandbox="$BUILD_DIR/sandbox"
+    _build_fixture_tree "$sandbox"
+
     # Close stdin (</dev/null) to prevent programs like cat/grep from hanging
     # Use timeout with KILL signal to ensure cleanup
     # Limit output to 1MB to prevent disk-filling runaway output
-    timeout --signal=KILL 5s "$binary" < /dev/null 2>&1 | head -c 1048576 > "$stdout_file"
+    ( cd "$sandbox" && timeout --signal=KILL 5s "$binary" < /dev/null 2>&1 ) \
+        | head -c 1048576 > "$stdout_file"
     local exit_code=${PIPESTATUS[0]}
+    rm -rf "$sandbox"
     echo "$exit_code" > "$exit_file"
+
+    # Mark runs whose observed behaviour is a function of wall-clock time
+    # rather than of the program.  Servers and infinite generators (50_http,
+    # 76_tier3_http, 09_yes) never terminate: what we capture is however much
+    # they managed to emit before the 5s KILL or the 1MB cap cut them off, and
+    # whether the kill or the SIGPIPE won the race.  On a loaded runner those
+    # differ run to run.
+    #
+    # Byte-comparing that against another stage is a coin flip, and behavioural
+    # mismatches are deliberately NOT allowlistable -- so left alone these would
+    # flake the suite red for reasons having nothing to do with the compiler.
+    # Record the fact instead: for these, the assertion downgrades from "same
+    # output" to "still non-terminating", which is the strongest claim the data
+    # actually supports.  See compare_runs.
+    local truncated=0
+    [[ $(wc -c < "$stdout_file") -ge 1048576 ]] && truncated=1
+    if [[ "$exit_code" == "124" || "$exit_code" == "137" || $truncated -eq 1 ]]; then
+        echo "1" > "${exit_file}.nonterminating"
+    fi
+    return 0
 }
 
 # Run example's test.sh if it exists
@@ -288,6 +409,22 @@ compare_runs() {
     local code_a=$(cat "$exit_a")
     local code_b=$(cat "$exit_b")
 
+    # Non-terminating programs (see run_binary): compare the *property*, not
+    # the bytes.  Both sides must agree the program still runs forever; if one
+    # side suddenly terminates on its own, that IS a behavioural change and
+    # goes red.  What we refuse to assert is how far a killed process got.
+    local nt_a=0 nt_b=0
+    [[ -f "${exit_a}.nonterminating" ]] && nt_a=1
+    [[ -f "${exit_b}.nonterminating" ]] && nt_b=1
+    if [[ $nt_a -eq 1 || $nt_b -eq 1 ]]; then
+        if [[ $nt_a -ne $nt_b ]]; then
+            fail "$name: termination behaviour changed (A non-terminating=$nt_a, B=$nt_b)"
+            return 1
+        fi
+        success "$name (non-terminating; output not byte-compared)"
+        return 0
+    fi
+
     if [[ "$code_a" != "$code_b" ]]; then
         fail "$name: exit code mismatch (A=$code_a, B=$code_b)"
         return 1
@@ -295,12 +432,13 @@ compare_runs() {
 
     if ! diff -q "$stdout_a" "$stdout_b" >/dev/null 2>&1; then
         fail "$name: output mismatch"
-        if [[ $VERBOSE -eq 1 ]]; then
-            echo "  --- Expected (A) ---"
-            head -5 "$stdout_a"
-            echo "  --- Got (B) ---"
-            head -5 "$stdout_b"
-        fi
+        # Always show the diff, not just under -v.  A behavioural mismatch is
+        # the most serious thing this suite can report -- it means one compiler
+        # miscompiled the program -- and "output mismatch" with no detail is
+        # not actionable, least of all in a CI log you cannot re-run locally.
+        # Bounded so a runaway diff cannot bury the summary.
+        echo "  --- diff (A=baseline, B=this stage), first 15 lines ---"
+        diff "$stdout_a" "$stdout_b" 2>&1 | head -15 | sed 's/^/  /'
         return 1
     fi
 
@@ -360,7 +498,11 @@ run_stage1() {
         fi
 
         # Non-interactive: run and save results for later comparison
-        run_binary "$bin" "$BUILD_DIR/stage1_${name}.stdout" "$BUILD_DIR/stage1_${name}.exit"
+        if ! run_binary "$bin" "$BUILD_DIR/stage1_${name}.stdout" "$BUILD_DIR/stage1_${name}.exit"; then
+            fail "$name: ritz0 build reported success but produced no runnable binary"
+            failed=$((failed + 1))
+            continue
+        fi
 
         local exit_code=$(cat "$BUILD_DIR/stage1_${name}.exit")
         success "$name (exit=$exit_code)"
@@ -479,7 +621,11 @@ run_stage3() {
         fi
 
         # Run
-        run_binary "$bin" "$BUILD_DIR/stage3_${name}.stdout" "$BUILD_DIR/stage3_${name}.exit"
+        if ! run_binary "$bin" "$BUILD_DIR/stage3_${name}.stdout" "$BUILD_DIR/stage3_${name}.exit"; then
+            fail "$name: ritz1 build reported success but produced no runnable binary"
+            failed=$((failed + 1))
+            continue
+        fi
 
         # Compare with Stage 1
         if compare_runs "$name" \
@@ -594,7 +740,11 @@ run_stage4() {
         fi
 
         # Run
-        run_binary "$bin" "$BUILD_DIR/stage4_${name}.stdout" "$BUILD_DIR/stage4_${name}.exit"
+        if ! run_binary "$bin" "$BUILD_DIR/stage4_${name}.stdout" "$BUILD_DIR/stage4_${name}.exit"; then
+            fail "$name: self-hosted ritz1 build reported success but produced no runnable binary"
+            failed=$((failed + 1))
+            continue
+        fi
 
         # Compare with Stage 1
         if compare_runs "$name" \
@@ -671,5 +821,8 @@ if [[ $TOTAL_FAILED -eq 0 ]]; then
     exit 0
 else
     echo -e "${RED}💥 Some regression tests failed${NC}"
+    # Preserve the captured stdout/exit files so the failure can be diagnosed
+    # after the fact.  See cleanup_build_dir.
+    KEEP_ARTIFACTS=1
     exit 1
 fi
