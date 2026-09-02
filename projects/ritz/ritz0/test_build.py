@@ -694,3 +694,82 @@ class TestCacheWholesaleInvalidation:
         }
         assert len(set(dirs.values())) == 3, f"cache dirs collide: {dirs}"
         assert dirs["ritz1_selfhosted"].name == ".ritz-cache-ritz1_selfhosted"
+
+
+class TestCompileFailureReporting:
+    """A build must surface every broken source file, not just the first.
+
+    AGAST #1286: the per-file compile loops bailed on the first non-zero exit.
+    Paired with a hash-seed-dependent compile order, that meant `tempest` —
+    which has five independently broken files — reported a different single
+    "root cause" on almost every run. Reporting all of them is what makes the
+    real scope of the breakage visible in one build.
+    """
+
+    def _report(self, capsys, failures, compiler="ritz0"):
+        _build_module.report_compile_failures(failures, compiler)
+        return capsys.readouterr().err
+
+    @pytest.mark.unit
+    def test_no_failures_prints_nothing(self, capsys):
+        assert self._report(capsys, []) == ""
+
+    @pytest.mark.unit
+    def test_every_failing_file_is_named(self, capsys):
+        failures = [
+            (Path("/p/document.ritz"), "Compiler error: Cannot dereference"),
+            (Path("/p/history.ritz"), "Compiler error: arg mismatch"),
+            (Path("/p/tab_process.ritz"), "Compiler error: Unknown function: printi"),
+        ]
+        err = self._report(capsys, failures)
+        # The regression: only the first file used to appear.
+        for name in ("document.ritz", "history.ritz", "tab_process.ritz"):
+            assert name in err, f"{name} missing from report:\n{err}"
+
+    @pytest.mark.unit
+    def test_every_diagnostic_is_included(self, capsys):
+        failures = [
+            (Path("/p/a.ritz"), "Compiler error: first problem"),
+            (Path("/p/b.ritz"), "Compiler error: second problem"),
+        ]
+        err = self._report(capsys, failures)
+        assert "first problem" in err
+        assert "second problem" in err
+
+    @pytest.mark.unit
+    def test_failure_count_is_reported(self, capsys):
+        failures = [(Path(f"/p/f{i}.ritz"), "boom") for i in range(5)]
+        err = self._report(capsys, failures)
+        assert "5 source files" in err
+
+    @pytest.mark.unit
+    def test_single_failure_uses_singular(self, capsys):
+        err = self._report(capsys, [(Path("/p/only.ritz"), "boom")])
+        assert "1 source file:" in err
+
+    @pytest.mark.unit
+    def test_compiler_name_is_reported(self, capsys):
+        err = self._report(capsys, [(Path("/p/a.ritz"), "boom")], compiler="ritz1")
+        assert "ritz1" in err
+
+    @pytest.mark.unit
+    def test_report_order_follows_input_order(self, capsys):
+        """Compile order is deterministic (AGAST #1286), so the report is too."""
+        failures = [(Path("/p/a.ritz"), "x"), (Path("/p/b.ritz"), "y"),
+                    (Path("/p/c.ritz"), "z")]
+        err = self._report(capsys, failures)
+        assert err.index("a.ritz") < err.index("b.ritz") < err.index("c.ritz")
+
+    @pytest.mark.unit
+    def test_empty_stderr_gets_placeholder(self, capsys):
+        """A compiler that dies without writing stderr must still name the file."""
+        err = self._report(capsys, [(Path("/p/silent.ritz"), "")])
+        assert "silent.ritz" in err
+        assert "no diagnostic output" in err
+
+    @pytest.mark.unit
+    def test_multiline_diagnostics_are_indented(self, capsys):
+        """Multi-line tracebacks stay visually grouped under their file."""
+        err = self._report(capsys, [(Path("/p/a.ritz"), "line one\nline two")])
+        assert "      line one" in err
+        assert "      line two" in err

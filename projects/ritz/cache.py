@@ -627,7 +627,13 @@ class BuildCache:
             return True, "source file changed"
 
         # Check if any transitive dependency changed
-        all_deps = self.get_transitive_dependencies(source_path)
+        # Sorted (AGAST #1286): `get_transitive_dependencies` returns a set, so
+        # iterating it raw picks a hash-seed-dependent order. The rebuild
+        # *decision* is order-independent, but the reason string is not — with
+        # several changed deps this named a different one each run, which is the
+        # same "reports a different thing every time" symptom that made build
+        # failures impossible to diagnose.
+        all_deps = sorted(self.get_transitive_dependencies(source_path))
         for dep_path in all_deps:
             if dep_path == source_str:
                 continue  # Skip self
@@ -662,7 +668,12 @@ class BuildCache:
         cached_ll.write_text(ll_content)
 
         # Scan and update dependency info for the source file and all its deps
-        all_deps = self.get_transitive_dependencies(source_path)
+        # Sorted (AGAST #1286): this populates `self.state.deps`, a plain dict
+        # that `CacheState.save` serialises to `deps.json` in insertion order.
+        # Set iteration order made that file's key order vary run to run —
+        # harmless for build decisions, but it left the cache non-reproducible
+        # and noisy to diff when investigating "the cache lies" reports.
+        all_deps = sorted(self.get_transitive_dependencies(source_path))
         for dep_path in all_deps:
             dep_path_obj = Path(dep_path)
             info = self.scan_file(dep_path_obj)

@@ -21,8 +21,8 @@ Metadata caching:
   - Allows incremental compilation without re-parsing unchanged files
 """
 
-from pathlib import Path
-from typing import Set, Dict, Optional, List
+from pathlib import Path, PurePath
+from typing import Set, Dict, Iterable, Optional, List
 from dataclasses import replace
 import os
 import ritz_ast as rast
@@ -1412,6 +1412,47 @@ def resolve_imports(
     return resolver.resolve(module, source_path)
 
 
+def order_source_files(processed_files: Iterable[str], main_file: str) -> List[str]:
+    """Put a set of resolved source files into a stable compile order.
+
+    Returns every file in `processed_files` except `main_file`, sorted by its
+    POSIX path, with `main_file` appended last.
+
+    Why this exists (AGAST #1286): `ImportResolver.processed_files` is a
+    `set`, which it should be — it is a membership check, and `_process_import`
+    hits it once per import to skip already-resolved modules. But iterating a
+    set of strings yields a *hash-seed-dependent* order: CPython randomises
+    string hashing per process unless `PYTHONHASHSEED` is pinned, so the same
+    tree produced a different compile order on every single build. Because the
+    build stops at the first file that fails to compile, a project with N
+    independently-broken files reported a different one of the N each run —
+    `./rz build tempest` rotated between three unrelated "root causes" with
+    zero changes to the tree.
+
+    The sort happens *here*, where the ordered collection is built, rather
+    than in any caller — a future caller that forgets to sort would silently
+    reintroduce the nondeterminism. This mirrors
+    `cache.py::_collect_ritz0_sources`, which sorts its `os.walk` result by
+    relative POSIX path for exactly the same reason.
+
+    `main_file` stays last because callers depend on it: `build.py` does
+    `all_sources.insert(-1, src)` to splice extra sources in "before main".
+
+    Args:
+        processed_files: All resolved source paths (absolute), in any order.
+        main_file: The entry-point source path, which must come last.
+
+    Returns:
+        Deterministically ordered list: sorted imports first, `main_file` last.
+    """
+    ordered = sorted(
+        (f for f in processed_files if f != main_file),
+        key=lambda f: PurePath(f).as_posix(),
+    )
+    ordered.append(main_file)
+    return ordered
+
+
 def collect_all_source_files(
     source_path: str,
     project_root: Optional[str] = None,
@@ -1430,8 +1471,10 @@ def collect_all_source_files(
         source_roots: List of source directories to search for imports
 
     Returns:
-        List of absolute paths to all required source files, in dependency order
-        (imports first, main file last)
+        List of absolute paths to all required source files, in a deterministic
+        order (imports sorted by POSIX path first, main file last). The order is
+        stable across processes regardless of `PYTHONHASHSEED` — see
+        `order_source_files`.
     """
     # Ensure ritz0 directory is in path for local imports
     import sys
@@ -1458,7 +1501,4 @@ def collect_all_source_files(
     # Resolve imports (this populates resolver.processed_files)
     resolver.resolve(module, source_path)
 
-    # Return all files in dependency order (imports first, then main)
-    result = [f for f in resolver.processed_files if f != source_path]
-    result.append(source_path)
-    return result
+    return order_source_files(resolver.processed_files, source_path)

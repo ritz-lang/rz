@@ -683,10 +683,24 @@ class Monomorphizer:
         # Iterate until no new instantiations are found
         max_iterations = 100  # Safety limit
         for iteration in range(max_iterations):
-            # Find new instantiations
-            new_structs = {k for k in self.struct_instantiations.keys() if k not in processed_structs}
-            new_enums = {k for k in self.enum_instantiations.keys() if k not in processed_enums}
-            new_functions = {k for k in self.function_instantiations.keys() if k not in processed_functions}
+            # Find new instantiations.
+            #
+            # These MUST be lists, not sets (AGAST #1286). The keys are
+            # `(base_name, type_args_key)` string tuples, so a set comprehension
+            # would iterate in `PYTHONHASHSEED`-dependent order — and that order
+            # escapes all the way into the emitted IR: the loops below append to
+            # `specialized_structs` / `specialized_enums` / `specialized_functions`
+            # / `specialized_impls`, which are spliced into the module item list
+            # in `_apply_specializations`, which is the order the emitter walks.
+            # Same tree, different process, different `.ll` byte-for-byte.
+            #
+            # A list comprehension inherits the instantiation dicts' insertion
+            # order, which is deterministic (driven by module item order and the
+            # scan order of `_scan_for_new_instantiations`) and more meaningful
+            # than sorting: specializations are emitted in discovery order.
+            new_structs = [k for k in self.struct_instantiations if k not in processed_structs]
+            new_enums = [k for k in self.enum_instantiations if k not in processed_enums]
+            new_functions = [k for k in self.function_instantiations if k not in processed_functions]
 
             if not new_structs and not new_enums and not new_functions:
                 # Fixpoint reached

@@ -23,6 +23,7 @@ import argparse
 import tempfile
 from pathlib import Path
 from dataclasses import dataclass
+from typing import List, Tuple
 
 try:
     import tomllib
@@ -90,6 +91,43 @@ def get_build_cache(compiler: str = "ritz0") -> BuildCache:
     if compiler not in _build_cache:
         _build_cache[compiler] = BuildCache(project_root=ROOT, compiler=compiler)
     return _build_cache[compiler]
+
+
+def report_compile_failures(failures: List[Tuple[Path, str]], compiler: str) -> None:
+    """Print every source file that failed to compile, not just the first.
+
+    AGAST #1286: the per-file compile loops used to `return None` on the first
+    non-zero exit, so a project with N independently-broken files only ever
+    showed one of them. Combined with the nondeterministic compile order that
+    task also fixed, that meant the *same* tree reported a *different* single
+    root cause on every run — three distinct "root causes" were observed for
+    `tempest` with zero changes in between.
+
+    Reporting all N is what makes the difference visible: with a stable order
+    you get the same first error every time, and with this you get the whole
+    list, so nobody has to build N times to discover there were N problems.
+
+    Compile failures are independent — each source is compiled from scratch in
+    its own subprocess and does not consume the previous file's artifacts — so
+    continuing after one failure yields real diagnostics, not cascade noise.
+
+    Args:
+        failures: `(source_path, stderr)` pairs, in compile order.
+        compiler: Compiler name, for the message (e.g. `ritz0`, `ritz1`).
+    """
+    if not failures:
+        return
+
+    count = len(failures)
+    plural = "file" if count == 1 else "files"
+    print(f"\n  ✗ {compiler} failed for {count} source {plural}:", file=sys.stderr)
+    for src, stderr in failures:
+        detail = (stderr or "").strip() or "(no diagnostic output)"
+        # Indent every line so multi-line diagnostics stay visually grouped
+        # under the file they belong to.
+        indented = "\n".join(f"      {line}" for line in detail.splitlines())
+        print(f"\n    {src.name}:\n{indented}", file=sys.stderr)
+    print(file=sys.stderr)
 
 
 def detect_main_signature(source_path: Path) -> int:
@@ -922,6 +960,7 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
     try:
         # Compile each source file to LLVM IR, optionally convert to bitcode
         # All sources compiled with --no-runtime; _start comes from runtime .o
+        compile_failures: List[Tuple[Path, str]] = []
         for i, src in enumerate(all_sources):
             is_main = (i == len(all_sources) - 1)
 
@@ -1044,8 +1083,11 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
                 env["RITZ_PATH"] = os.pathsep.join(entries)
             result = subprocess.run(compile_cmd, capture_output=True, text=True, env=env)
             if result.returncode != 0:
-                print(f"  ✗ {compiler} failed for {src.name}: {result.stderr}", file=sys.stderr)
-                return None
+                # AGAST #1286: collect and keep going so every broken file is
+                # reported, not just whichever one happened to be compiled
+                # first. Checked after the loop, before linking.
+                compile_failures.append((src, result.stderr))
+                continue
 
             # Update .ll cache
             if use_cache:
@@ -1083,6 +1125,14 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
                     link_files.append(ll_path)
             else:
                 link_files.append(ll_path)
+
+        # AGAST #1286: every source has now been attempted. If any failed,
+        # report them all and stop before linking — linking a partial set of
+        # objects would only produce confusing undefined-symbol errors on top
+        # of the real diagnostics.
+        if compile_failures:
+            report_compile_failures(compile_failures, compiler)
+            return None
 
         # Link all .bc/.ll files with the runtime .o
         # Use -g to preserve DWARF debug info, -nostdlib for bare-metal
@@ -1262,6 +1312,7 @@ def compile_freestanding_binary(
 
         # Step 2: Compile each Ritz source to LLVM IR, then to object file
         print(f"  Compiling {len(all_sources)} Ritz source file(s)...")
+        ritz0_failures: List[Tuple[Path, str]] = []
         for src in all_sources:
             import hashlib
             path_hash = hashlib.md5(str(src).encode()).hexdigest()[:8]
@@ -1291,8 +1342,10 @@ def compile_freestanding_binary(
 
             result = subprocess.run(compile_cmd, capture_output=True, text=True)
             if result.returncode != 0:
-                print(f"  ✗ ritz0 failed for {src.name}: {result.stderr}", file=sys.stderr)
-                return None
+                # AGAST #1286: collect rather than bail, so all broken files
+                # surface in one build. See `report_compile_failures`.
+                ritz0_failures.append((src, result.stderr))
+                continue
 
             # Compile LLVM IR to object file with target-specific options
             # Use clang -c which can compile .ll files directly (more portable than llc)
@@ -1344,6 +1397,12 @@ def compile_freestanding_binary(
                 return None
 
             object_files.append(obj_path)
+
+        # AGAST #1286: report every source that failed to compile, then stop
+        # before assembling/linking a partial object set.
+        if ritz0_failures:
+            report_compile_failures(ritz0_failures, "ritz0")
+            return None
 
         # Step 3: Assemble .s files
         if asm_files:
