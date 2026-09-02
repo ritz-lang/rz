@@ -32,6 +32,113 @@ from metadata import MetadataCache, extract_metadata, ModuleMetadata
 from emitter.fn_cache import read_sig_file, source_file_hash, check_source_hash
 
 
+_CACHED_SPAN = rast.Span("<cached>", 0, 0, 0)
+
+
+def parse_type_string(type_str: str) -> rast.Type:
+    """Parse a type string back to a Type AST node."""
+    if type_str is None or type_str == "void":
+        return None
+    if type_str.startswith('*'):
+        # Pointer type
+        mutable = False
+        inner_str = type_str[1:]
+        if inner_str.startswith('mut '):
+            mutable = True
+            inner_str = inner_str[4:]
+        return rast.PtrType(_CACHED_SPAN, parse_type_string(inner_str), mutable)
+    if type_str.startswith('&'):
+        # Reference type
+        mutable = False
+        inner_str = type_str[1:]
+        if inner_str.startswith('mut '):
+            mutable = True
+            inner_str = inner_str[4:]
+        return rast.RefType(_CACHED_SPAN, parse_type_string(inner_str), mutable)
+    if type_str.startswith('[') and ']' in type_str:
+        # Array or slice type
+        bracket_end = type_str.index(']')
+        size_str = type_str[1:bracket_end]
+        inner_str = type_str[bracket_end + 1:]
+        if size_str == '':
+            # Slice type: []T — sugar for `Span<T>` (see make_slice_type).
+            # Metadata written before the desugaring landed still spells
+            # slices this way, so keep reading it.
+            return rast.make_slice_type(_CACHED_SPAN, parse_type_string(inner_str))
+        else:
+            # Array type: [N]T
+            return rast.ArrayType(_CACHED_SPAN, int(size_str), parse_type_string(inner_str))
+    if type_str.startswith('fn('):
+        # Function type: fn(params) -> ret
+        # Parse to proper FnType AST node
+        try:
+            # Find the matching closing paren for params
+            depth = 0
+            params_end = -1
+            for i, c in enumerate(type_str):
+                if c == '(':
+                    depth += 1
+                elif c == ')':
+                    depth -= 1
+                    if depth == 0:
+                        params_end = i
+                        break
+
+            if params_end == -1:
+                # Malformed, fall back to NamedType
+                return rast.NamedType(_CACHED_SPAN, type_str, [])
+
+            # Extract params and return type
+            params_str = type_str[3:params_end]  # Skip 'fn('
+            remainder = type_str[params_end + 1:].strip()
+
+            # Parse params (simple split, doesn't handle nested fn types perfectly)
+            param_types = []
+            if params_str.strip():
+                # Split by comma, but be careful with nested types
+                parts = []
+                current = ""
+                depth = 0
+                for c in params_str:
+                    if c == '(' or c == '<':
+                        depth += 1
+                    elif c == ')' or c == '>':
+                        depth -= 1
+                    if c == ',' and depth == 0:
+                        parts.append(current.strip())
+                        current = ""
+                    else:
+                        current += c
+                if current.strip():
+                    parts.append(current.strip())
+                param_types = [parse_type_string(p) for p in parts]
+
+            # Parse return type (after ' -> ')
+            ret_type = None
+            if remainder.startswith('-> '):
+                ret_str = remainder[3:].strip()
+                if ret_str and ret_str != 'void':
+                    ret_type = parse_type_string(ret_str)
+
+            return rast.FnType(_CACHED_SPAN, param_types, ret_type)
+        except Exception:
+            # On any parse error, fall back to NamedType
+            return rast.NamedType(_CACHED_SPAN, type_str, [])
+    if ' | ' in type_str:
+        # Union type
+        variants = [parse_type_string(v.strip()) for v in type_str.split(' | ')]
+        return rast.UnionType(_CACHED_SPAN, variants)
+    if '<' in type_str and type_str.endswith('>'):
+        # Generic type: Name<Args>
+        bracket_pos = type_str.index('<')
+        name = type_str[:bracket_pos]
+        args_str = type_str[bracket_pos + 1:-1]
+        # Simple split by comma (doesn't handle nested generics perfectly)
+        args = [parse_type_string(a.strip()) for a in args_str.split(',') if a.strip()]
+        return rast.NamedType(_CACHED_SPAN, name, args)
+    # Simple named type
+    return rast.NamedType(_CACHED_SPAN, type_str, [])
+
 class ImportError(Exception):
     """Error during import resolution."""
     pass
@@ -882,107 +989,6 @@ class ImportResolver:
 
         dummy_span = rast.Span("<cached>", 0, 0, 0)
 
-        def parse_type_string(type_str: str) -> rast.Type:
-            """Parse a type string back to a Type AST node."""
-            if type_str is None or type_str == "void":
-                return None
-            if type_str.startswith('*'):
-                # Pointer type
-                mutable = False
-                inner_str = type_str[1:]
-                if inner_str.startswith('mut '):
-                    mutable = True
-                    inner_str = inner_str[4:]
-                return rast.PtrType(dummy_span, parse_type_string(inner_str), mutable)
-            if type_str.startswith('&'):
-                # Reference type
-                mutable = False
-                inner_str = type_str[1:]
-                if inner_str.startswith('mut '):
-                    mutable = True
-                    inner_str = inner_str[4:]
-                return rast.RefType(dummy_span, parse_type_string(inner_str), mutable)
-            if type_str.startswith('[') and ']' in type_str:
-                # Array or slice type
-                bracket_end = type_str.index(']')
-                size_str = type_str[1:bracket_end]
-                inner_str = type_str[bracket_end + 1:]
-                if size_str == '':
-                    # Slice type: []T
-                    return rast.SliceType(dummy_span, parse_type_string(inner_str))
-                else:
-                    # Array type: [N]T
-                    return rast.ArrayType(dummy_span, int(size_str), parse_type_string(inner_str))
-            if type_str.startswith('fn('):
-                # Function type: fn(params) -> ret
-                # Parse to proper FnType AST node
-                try:
-                    # Find the matching closing paren for params
-                    depth = 0
-                    params_end = -1
-                    for i, c in enumerate(type_str):
-                        if c == '(':
-                            depth += 1
-                        elif c == ')':
-                            depth -= 1
-                            if depth == 0:
-                                params_end = i
-                                break
-
-                    if params_end == -1:
-                        # Malformed, fall back to NamedType
-                        return rast.NamedType(dummy_span, type_str, [])
-
-                    # Extract params and return type
-                    params_str = type_str[3:params_end]  # Skip 'fn('
-                    remainder = type_str[params_end + 1:].strip()
-
-                    # Parse params (simple split, doesn't handle nested fn types perfectly)
-                    param_types = []
-                    if params_str.strip():
-                        # Split by comma, but be careful with nested types
-                        parts = []
-                        current = ""
-                        depth = 0
-                        for c in params_str:
-                            if c == '(' or c == '<':
-                                depth += 1
-                            elif c == ')' or c == '>':
-                                depth -= 1
-                            if c == ',' and depth == 0:
-                                parts.append(current.strip())
-                                current = ""
-                            else:
-                                current += c
-                        if current.strip():
-                            parts.append(current.strip())
-                        param_types = [parse_type_string(p) for p in parts]
-
-                    # Parse return type (after ' -> ')
-                    ret_type = None
-                    if remainder.startswith('-> '):
-                        ret_str = remainder[3:].strip()
-                        if ret_str and ret_str != 'void':
-                            ret_type = parse_type_string(ret_str)
-
-                    return rast.FnType(dummy_span, param_types, ret_type)
-                except Exception:
-                    # On any parse error, fall back to NamedType
-                    return rast.NamedType(dummy_span, type_str, [])
-            if ' | ' in type_str:
-                # Union type
-                variants = [parse_type_string(v.strip()) for v in type_str.split(' | ')]
-                return rast.UnionType(dummy_span, variants)
-            if '<' in type_str and type_str.endswith('>'):
-                # Generic type: Name<Args>
-                bracket_pos = type_str.index('<')
-                name = type_str[:bracket_pos]
-                args_str = type_str[bracket_pos + 1:-1]
-                # Simple split by comma (doesn't handle nested generics perfectly)
-                args = [parse_type_string(a.strip()) for a in args_str.split(',') if a.strip()]
-                return rast.NamedType(dummy_span, name, args)
-            # Simple named type
-            return rast.NamedType(dummy_span, type_str, [])
 
         # Register functions
         for fn_sig in meta.functions:

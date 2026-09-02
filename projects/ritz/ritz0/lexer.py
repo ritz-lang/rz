@@ -14,7 +14,7 @@ Syntax features:
     See RERITZ.md for full specification.
 """
 from dataclasses import dataclass
-from typing import Iterator, List
+from typing import Iterator, List, Optional
 from tokens import Token, TokenType, Span, KEYWORDS
 
 # RERITZ mode is now the ONLY mode - legacy mode has been removed
@@ -337,6 +337,24 @@ class Lexer:
 
         return Token(TokenType.CSTRING, ''.join(chars), start_span)
 
+    # Numeric literal type suffixes, longest first so `0usize` is not read as
+    # `0u` + `size`. Written as `0u32`, `1i64`, `2.5f32`.
+    NUMBER_SUFFIXES = ('usize', 'isize', 'u16', 'u32', 'u64', 'i16', 'i32',
+                       'i64', 'f32', 'f64', 'u8', 'i8')
+
+    def _lex_number_suffix(self) -> Optional[str]:
+        """Consume a numeric literal type suffix at the current position."""
+        for suffix in self.NUMBER_SUFFIXES:
+            if not self.source.startswith(suffix, self.pos):
+                continue
+            after = self.source[self.pos + len(suffix):self.pos + len(suffix) + 1]
+            if after and (after.isalnum() or after == '_'):
+                continue  # part of a longer identifier, not a suffix
+            for _ in range(len(suffix)):
+                self._advance()
+            return suffix
+        return None
+
     def _lex_number(self) -> Token:
         """Lex a number literal (int or float)."""
         start_span = self._span()
@@ -348,14 +366,15 @@ class Lexer:
             if next_ch == 'x' or next_ch == 'X':
                 self._advance()  # 0
                 self._advance()  # x
-                while self._peek().isalnum() or self._peek() == '_':
+                while self._peek() in '0123456789abcdefABCDEF_':
                     self._advance()
                 text = self.source[start_pos:self.pos].replace('_', '')
                 try:
                     value = int(text, 16)
                 except ValueError:
                     raise LexerError(f"Invalid hex literal: {text}", start_span)
-                return Token(TokenType.INT, value, start_span)
+                return Token(TokenType.INT, value, start_span,
+                             self._lex_number_suffix())
             elif next_ch == 'b' or next_ch == 'B':
                 self._advance()  # 0
                 self._advance()  # b
@@ -366,7 +385,8 @@ class Lexer:
                     value = int(text, 2)
                 except ValueError:
                     raise LexerError(f"Invalid binary literal: {text}", start_span)
-                return Token(TokenType.INT, value, start_span)
+                return Token(TokenType.INT, value, start_span,
+                             self._lex_number_suffix())
 
         # Decimal number
         while self._peek().isdigit() or self._peek() == '_':
@@ -393,10 +413,14 @@ class Lexer:
 
         text = self.source[start_pos:self.pos].replace('_', '')
 
+        suffix = self._lex_number_suffix()
+        if suffix in ('f32', 'f64'):
+            is_float = True
+
         if is_float:
-            return Token(TokenType.FLOAT, float(text), start_span)
+            return Token(TokenType.FLOAT, float(text), start_span, suffix)
         else:
-            return Token(TokenType.INT, int(text), start_span)
+            return Token(TokenType.INT, int(text), start_span, suffix)
 
     def _lex_ident_or_keyword(self) -> Token:
         """Lex an identifier or keyword."""

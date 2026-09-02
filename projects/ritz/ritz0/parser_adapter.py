@@ -346,10 +346,11 @@ class ASTConverter:
                             inner=self.convert_type(inner)
                         )
                     # Slice type: LBRACKET RBRACKET type
+                    # `[T]` is sugar for `Span<T>` (see make_slice_type).
                     inner = node.get('2')
-                    return ast.SliceType(
-                        span=_make_span(token0),
-                        inner=self.convert_type(inner)
+                    return ast.make_slice_type(
+                        _make_span(token0),
+                        self.convert_type(inner)
                     )
 
                 # Check for parenthesized type

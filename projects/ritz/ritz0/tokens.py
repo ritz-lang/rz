@@ -6,7 +6,7 @@ Token types for the ritz0 lexer.
 
 from enum import Enum, auto
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Optional
 
 
 class TokenType(Enum):
@@ -201,6 +201,8 @@ class Token:
     type: TokenType
     value: Any
     span: Span
+    # Numeric literal type suffix, e.g. the `u32` in `0u32`. None otherwise.
+    suffix: Optional[str] = None
 
     def __repr__(self) -> str:
         if self.value is not None:

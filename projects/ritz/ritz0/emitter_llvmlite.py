@@ -363,6 +363,19 @@ class LLVMEmitter:
             if layout:
                 return (layout.size, layout.alignment)
 
+            # Unmangled generic instantiation (e.g. `Span<u8>`): the registry
+            # is keyed by the specialized name, and built-in generics may not
+            # be materialized yet. Resolve it rather than guessing 8 bytes.
+            if ty.args:
+                specialized = self._get_specialized_type_name(ty)
+                layout = self.struct_registry.get_layout(specialized)
+                if layout:
+                    return (layout.size, layout.alignment)
+                synthesized = self._ensure_builtin_generic_struct_specialization(ty)
+                if synthesized and synthesized in self.struct_types:
+                    llvm_ty = self.struct_types[synthesized]
+                    return (self._type_size_bytes(llvm_ty), 8)
+
             # Fallback for unknown types (treat as 8-byte pointer-sized)
             return (8, 8)
 
@@ -488,6 +501,13 @@ class LLVMEmitter:
                     return self.enum_types[legacy_name][0]
                 if legacy_name in self.struct_types:
                     return self.struct_types[legacy_name]
+            # StrView is a built-in `{ ptr, len }` view. A module that only
+            # meets it through an imported signature (e.g. `Result<u8,
+            # StrView>` from a selective import) has no struct registered for
+            # it; falling through to the i8 placeholder would silently size an
+            # enum payload at 1 byte instead of 16 and corrupt the ABI.
+            if ty.name == 'StrView':
+                return self._ensure_strview_type()
             # Treat unknown types as opaque struct types (i8 placeholder)
             # This allows forward references and unknown struct types
             return self.i8
@@ -543,6 +563,19 @@ class LLVMEmitter:
             return ir.LiteralStructType(element_types)
         else:
             raise ValueError(f"Unknown type: {ty}")
+
+    def _ensure_strview_type(self) -> ir.Type:
+        """Materialize the built-in `StrView` struct: `{ *u8, i64 }`."""
+        if 'StrView' in self.struct_types:
+            return self.struct_types['StrView']
+        strview_ty = self.module.context.get_identified_type('StrView')
+        strview_ty.set_body(self.i8_ptr, self.i64)
+        self.struct_types['StrView'] = strview_ty
+        self.struct_fields['StrView'] = [
+            ('ptr', rast.PtrType(None, rast.NamedType(None, 'u8', []), mutable=False)),
+            ('len', rast.NamedType(None, 'i64', [])),
+        ]
+        return strview_ty
 
     def _ensure_builtin_generic_struct_specialization(self, ty: rast.NamedType) -> Optional[str]:
         """Synthesize lightweight generic structs used by built-ins (Span<T>).
@@ -740,6 +773,23 @@ class LLVMEmitter:
                         expr.span, 'Span',
                         [rast.NamedType(expr.span, 'u8', [])],
                     )
+            # User-defined methods: impl methods are emitted as free functions
+            # named `<Type>_<method>`, so resolve the receiver's type and look
+            # the mangled function up to recover the declared return type.
+            # Without this, `recv.method()?` had no inferrable Result type.
+            recv_type = self._infer_ritz_type(expr.expr)
+            while isinstance(recv_type, (rast.PtrType, rast.RefType)):
+                recv_type = recv_type.inner
+            if isinstance(recv_type, rast.NamedType):
+                candidates = [recv_type.name]
+                if recv_type.args:
+                    candidates.insert(0, self._get_specialized_type_name(recv_type))
+                for type_name in candidates:
+                    mangled = f"{type_name}_{expr.method}"
+                    if mangled in self.functions:
+                        fn_def = self.functions[mangled][1]
+                        if fn_def is not None and fn_def.ret_type is not None:
+                            return fn_def.ret_type
             return None  # Complex - would need full type resolution
         elif isinstance(expr, rast.Field):
             # Field access - resolve struct type and return field type
@@ -1470,11 +1520,18 @@ class LLVMEmitter:
             elif isinstance(item, rast.EnumDef):
                 self._declare_enum(item)
 
-        # Second pass: define struct and enum bodies (now all type names are known)
+        # Second pass: define struct bodies, then enum bodies.
+        #
+        # Order matters: an enum's payload buffer is sized from its variant
+        # field types, so every struct that can appear as a payload must have
+        # a registered layout first. Interleaving them in source order sized
+        # e.g. `Option<Span<u8>>` from a still-opaque `Span$u8` (8 bytes
+        # instead of 16), silently truncating the payload's length field.
         for item in module.items:
             if isinstance(item, rast.StructDef):
                 self._define_struct(item)
-            elif isinstance(item, rast.EnumDef):
+        for item in module.items:
+            if isinstance(item, rast.EnumDef):
                 self._define_enum(item)
 
         # Process type aliases (must come after struct types)
@@ -1999,7 +2056,15 @@ class LLVMEmitter:
             # For each field in the variant, store the corresponding arg
             offset = 0
             for i, (field_type, arg) in enumerate(zip(variant.fields, args)):
-                arg_val = self._emit_expr(arg)
+                # The payload's declared type is the expected type of the
+                # argument (so e.g. a `[u8]` payload asks a Vec range-index for
+                # a view rather than a copy).
+                saved_expected = self.expected_ritz_type
+                self.expected_ritz_type = field_type
+                try:
+                    arg_val = self._emit_expr(arg)
+                finally:
+                    self.expected_ritz_type = saved_expected
                 llvm_field_type = self._ritz_type_to_llvm(field_type)
                 # Generic placeholder fields (e.g., T/E in unspecialized Result/Option)
                 # lower to i8; use the argument's concrete LLVM type instead so the
@@ -2116,7 +2181,15 @@ class LLVMEmitter:
             # For each field in the variant, store the corresponding arg
             offset = 0
             for i, (field_type, arg) in enumerate(zip(variant.fields, args)):
-                arg_val = self._emit_expr(arg)
+                # The payload's declared type is the expected type of the
+                # argument (so e.g. a `[u8]` payload asks a Vec range-index for
+                # a view rather than a copy).
+                saved_expected = self.expected_ritz_type
+                self.expected_ritz_type = field_type
+                try:
+                    arg_val = self._emit_expr(arg)
+                finally:
+                    self.expected_ritz_type = saved_expected
                 llvm_field_type = self._ritz_type_to_llvm(field_type)
                 # Generic placeholder fields (e.g., T/E in unspecialized Result/Option)
                 # lower to i8; use the argument's concrete LLVM type instead so the
@@ -2945,6 +3018,7 @@ class LLVMEmitter:
         self.drop_flags.clear()  # Clear drop flags from previous function
         self.simd_expected_type = None  # Clear SIMD type context from previous function
         self.closure_expected_type = None  # Clear closure type context from previous function
+        self.expected_ritz_type = None  # Expected Ritz type of the value being emitted
 
         # [[naked]] functions have special semantics:
         # - No prologue/epilogue generated by LLVM
@@ -3201,17 +3275,31 @@ class LLVMEmitter:
                 # Set expected type for closure inference if return type is a function type
                 if self.current_fn_def and isinstance(self.current_fn_def.ret_type, rast.FnType):
                     self.closure_expected_type = self.current_fn_def.ret_type
+                # Expected Ritz type, used to resolve associated calls whose
+                # type argument is only implied (`return Span.empty()`).
+                if self.current_fn_def:
+                    self.expected_ritz_type = self.current_fn_def.ret_type
 
                 # Check if this is an enum variant constructor that needs type context
                 # This handles return None, return Some(x), etc. for generic enum types
                 if (self._is_enum_variant_call(stmt.value) and
                     self.current_fn_def and
                     isinstance(self.current_fn_def.ret_type, rast.NamedType)):
-                    # Use function return type to construct the correct variant
-                    val = self._emit_enum_variant_with_type(stmt.value, self.current_fn_def.ret_type.name)
+                    # Use function return type to construct the correct variant.
+                    # The return type may still carry its type arguments (e.g.
+                    # `Result<i16, StrView>` when Result comes from cached
+                    # metadata rather than a local generic def), so resolve the
+                    # specialization instead of using the bare base name.
+                    ret_named = self.current_fn_def.ret_type
+                    enum_type_name = self._resolve_enum_type_name(ret_named)
+                    if enum_type_name is None and ret_named.args:
+                        enum_type_name = self._ensure_builtin_generic_specialization(ret_named)
+                    val = self._emit_enum_variant_with_type(
+                        stmt.value, enum_type_name or ret_named.name)
                 else:
                     val = self._emit_expr(stmt.value)
                 self.closure_expected_type = None  # Clear context
+                self.expected_ritz_type = None
                 val = self._convert_type(val, ret_type)
                 # Emit drops for all scopes before return (excluding moved variable)
                 self._emit_drop_for_all_scopes(exclude_var)
@@ -3316,9 +3404,11 @@ class LLVMEmitter:
                     if stmt.type.name in ('v8i32', 'v4i64', 'v16i16', 'v32i8',
                                           'v4i32', 'v2i64', 'v8i16', 'v16i8'):
                         self.simd_expected_type = stmt.type
+                self.expected_ritz_type = stmt.type
                 val = self._emit_expr(stmt.value)
                 self.closure_expected_type = None  # Clear context
                 self.simd_expected_type = None  # Clear SIMD context
+                self.expected_ritz_type = None
             if stmt.type:
                 # Use declared type and convert value if needed
                 declared_ty = self._ritz_type_to_llvm(stmt.type)
@@ -3358,7 +3448,25 @@ class LLVMEmitter:
             return None
 
         elif isinstance(stmt, rast.AssignStmt):
-            val = self._emit_expr(stmt.value)
+            # `x = Some(v)` must build the variant for the *target's* enum.
+            # Variant names are global (`Some` -> whichever Option was
+            # specialized last), so without the target type an assignment to
+            # `Option<CmapTable>` could be handed an `Option<Glyph>`.
+            target_ritz_type = None
+            if self._is_enum_variant_call(stmt.value):
+                target_ritz_type = self._infer_ritz_type(stmt.target)
+                while isinstance(target_ritz_type, (rast.PtrType, rast.RefType)):
+                    target_ritz_type = target_ritz_type.inner
+            target_enum = None
+            if isinstance(target_ritz_type, rast.NamedType):
+                target_enum = self._resolve_enum_type_name(target_ritz_type)
+                if target_enum is None and target_ritz_type.args:
+                    target_enum = self._ensure_builtin_generic_specialization(
+                        target_ritz_type)
+            if target_enum is not None:
+                val = self._emit_enum_variant_with_type(stmt.value, target_enum)
+            else:
+                val = self._emit_expr(stmt.value)
             if isinstance(stmt.target, rast.Ident):
                 name = stmt.target.name
                 if name in self.locals:
@@ -3442,6 +3550,21 @@ class LLVMEmitter:
                                     val = self.builder.sext(val, self.i64)
                                 self.builder.call(fn, [map_ptr, index, val])
                                 return None
+
+                # Vec<T> element assignment: `v[i] = x` writes into the Vec's
+                # heap buffer.
+                vec_addr = self._try_vec_lvalue_base(stmt.target.expr)
+                if vec_addr is not None:
+                    zero = ir.Constant(self.i32, 0)
+                    data_ptr = self.builder.load(
+                        self.builder.gep(vec_addr, [zero, ir.Constant(self.i32, 0)]))
+                    idx = index
+                    if idx.type != self.i64:
+                        idx = self._convert_type(idx, self.i64)
+                    ptr = self.builder.gep(data_ptr, [idx])
+                    val = self._convert_type(val, data_ptr.type.pointee)
+                    self.builder.store(val, ptr)
+                    return None
 
                 # General case - pointer indexing
                 base = self._emit_expr(stmt.target.expr)
@@ -4825,6 +4948,20 @@ class LLVMEmitter:
 
             op = expr.op
 
+            # Unify float widths: `f32_value + 1.0` has an f32 operand and a
+            # double literal. Narrow the literal side (its value is exact in
+            # the source), otherwise widen so both sides agree.
+            if (self._is_float_type(left.type) and self._is_float_type(right.type)
+                    and left.type != right.type):
+                if isinstance(expr.right, rast.FloatLit):
+                    right = self._convert_type(right, left.type)
+                elif isinstance(expr.left, rast.FloatLit):
+                    left = self._convert_type(left, right.type)
+                elif left.type == self.f32:
+                    left = self.builder.fpext(left, right.type)
+                else:
+                    right = self.builder.fpext(right, left.type)
+
             # Handle pointer comparison with integer 0 (null pointer check)
             # Only for comparison operators, not arithmetic
             if op in ('==', '!=', '<', '<=', '>', '>='):
@@ -5289,23 +5426,34 @@ class LLVMEmitter:
                     if type_name == 'String':
                         return self._emit_string_slice(expr)
 
-                    # Handle Vec<T> slicing
+                    # Handle Vec<T> slicing. A range index over a Vec copies
+                    # (`vec_slice<T>`) unless the context asks for a view.
                     if type_name.startswith('Vec$') or type_name == 'Vec':
+                        if self._expects_span():
+                            return self._emit_vec_span_slice(expr, base_ritz_type, type_name)
                         return self._emit_vec_slice(expr, type_name, base_ritz_type)
 
                     # Handle Span<T> slicing: s[a..b] returns a sub-span.
                     if type_name.startswith('Span$') or type_name == 'Span':
                         return self._emit_span_slice(expr)
 
-        # Non-identifier receivers (e.g., parameters, call results) — if the
-        # inferred Ritz type is a Span, dispatch to span slicing directly.
+        # Non-identifier receivers (e.g. `self.data[a..b]`, parameters, call
+        # results): fall back to the inferred Ritz type.
         inferred = self._infer_ritz_type(expr.expr)
+        while isinstance(inferred, (rast.PtrType, rast.RefType)):
+            inferred = inferred.inner
         if isinstance(inferred, rast.NamedType):
             if inferred.name == 'Span' or inferred.name.startswith('Span$'):
                 return self._emit_span_slice(expr)
+            if inferred.name == 'String':
+                return self._emit_string_slice(expr)
+            if inferred.name == 'Vec' or inferred.name.startswith('Vec$'):
+                if self._expects_span():
+                    return self._emit_vec_span_slice(expr, inferred, inferred.name)
+                return self._emit_vec_slice(expr, inferred.name, inferred)
 
         raise ValueError(f"Slice operation not supported for this type. "
-                         f"Only String and Vec types support slicing.")
+                         f"Only String, Vec and Span types support slicing.")
 
     def _emit_span_slice(self, expr: rast.SliceExpr) -> ir.Value:
         """Emit span slice: `s[a..b]` -> `Span<T> { ptr + a, b - a }`.
@@ -5418,6 +5566,65 @@ class LLVMEmitter:
 
         return self.builder.call(fn, [vec_ptr, start, end])
 
+    def _emit_vec_span_slice(self, expr: rast.SliceExpr,
+                             base_ritz_type: rast.NamedType,
+                             type_name: str) -> ir.Value:
+        """Emit `v[a..b]` on a Vec<T> as a zero-copy `Span<T>` view.
+
+        `v[a..b]` normally produces an owned `Vec<T>` copy (`vec_slice<T>`).
+        When the surrounding context asks for a span - `let s: Span<u8> = v[a..b]`,
+        or a `[u8]` payload/return - copying would be wrong twice over: the
+        shapes differ, and the caller asked for a view of `v`, not a clone.
+        """
+        elem_ty = self._vec_element_ritz_type(base_ritz_type, type_name)
+
+        vec_ptr = self._emit_lvalue_addr(expr.expr)
+        zero = ir.Constant(self.i32, 0)
+        data_ptr = self.builder.load(
+            self.builder.gep(vec_ptr, [zero, ir.Constant(self.i32, 0)]))
+        vec_len = self.builder.load(
+            self.builder.gep(vec_ptr, [zero, ir.Constant(self.i32, 1)]))
+        if vec_len.type != self.i64:
+            vec_len = self._convert_type(vec_len, self.i64)
+
+        if expr.start is not None:
+            start = self._emit_expr(expr.start)
+            if start.type != self.i64:
+                start = self._convert_type(start, self.i64)
+        else:
+            start = ir.Constant(self.i64, 0)
+
+        if expr.end is not None:
+            end = self._emit_expr(expr.end)
+            if end.type != self.i64:
+                end = self._convert_type(end, self.i64)
+        else:
+            end = vec_len
+
+        span_ty = self._ritz_type_to_llvm(
+            rast.NamedType(expr.span, 'Span', [elem_ty]))
+        new_ptr = self.builder.gep(data_ptr, [start])
+        new_len = self.builder.sub(end, start)
+        out = self.builder.insert_value(ir.Constant(span_ty, ir.Undefined), new_ptr, 0)
+        return self.builder.insert_value(out, new_len, 1)
+
+    def _vec_element_ritz_type(self, base_ritz_type: rast.NamedType,
+                               type_name: str) -> rast.Type:
+        """Recover the element type of a Vec, mangled (`Vec$u8`) or not."""
+        if base_ritz_type.args:
+            return base_ritz_type.args[0]
+        if type_name.startswith('Vec$'):
+            return rast.NamedType(base_ritz_type.span, type_name[4:], [])
+        raise ValueError("Vec type without element type")
+
+    def _expects_span(self) -> bool:
+        """True when the value being emitted is required to be a Span."""
+        expected = self.expected_ritz_type
+        while isinstance(expected, (rast.PtrType, rast.RefType)):
+            expected = expected.inner
+        return (isinstance(expected, rast.NamedType)
+                and (expected.name == 'Span' or expected.name.startswith('Span$')))
+
     def _emit_struct_lit(self, expr: rast.StructLit) -> ir.Value:
         """Emit a struct literal: MyStruct { field: value, ... }."""
         struct_name = expr.name
@@ -5453,11 +5660,33 @@ class LLVMEmitter:
     def _emit_array_lit(self, expr: rast.ArrayLit) -> ir.Value:
         """Emit an array literal: [a, b, c]."""
         if not expr.elements:
-            raise ValueError("Empty array literals not supported")
+            # `let a: [0]u8 = []` - an empty literal carries no element type of
+            # its own, so it is only meaningful against a declared array type.
+            expected = self.expected_ritz_type
+            if isinstance(expected, rast.ArrayType):
+                return ir.Constant(self._ritz_type_to_llvm(expected), None)
+            raise ValueError(
+                "Empty array literal needs a declared array type "
+                "(e.g. `let a: [0]u8 = []`)")
 
         # Emit all elements and infer type from first element
         values = [self._emit_expr(e) for e in expr.elements]
         elem_type = values[0].type
+
+        # A declared array type wins over inference: `let b: [4]u8 = [1, 2]`
+        # must produce [4 x i8], not [2 x i64]. Without this the literal kept
+        # its own shape and every later use of the binding silently mismatched.
+        declared_count = None
+        expected = self.expected_ritz_type
+        if isinstance(expected, rast.ArrayType):
+            elem_type = self._ritz_type_to_llvm(expected.inner)
+            declared_count = (expected.size.value
+                              if isinstance(expected.size, rast.IntLit)
+                              else expected.size)
+            if isinstance(declared_count, int) and len(values) > declared_count:
+                raise ValueError(
+                    f"Array literal has {len(values)} elements but the declared "
+                    f"type holds {declared_count}")
 
         # Convert all values to same type
         converted = []
@@ -5465,7 +5694,8 @@ class LLVMEmitter:
             converted.append(self._convert_type(val, elem_type))
 
         # Create array type
-        arr_type = ir.ArrayType(elem_type, len(converted))
+        count = declared_count if isinstance(declared_count, int) else len(converted)
+        arr_type = ir.ArrayType(elem_type, count)
 
         # Build array aggregate
         result = ir.Constant(arr_type, ir.Undefined)
@@ -5760,6 +5990,24 @@ class LLVMEmitter:
         # Continue after loop
         self.builder.position_at_end(loop_end)
 
+    def _try_vec_lvalue_base(self, expr: rast.Expr) -> Optional[ir.Value]:
+        """Address of `expr` when it denotes a Vec<T>, else None."""
+        ritz_type = self._infer_ritz_type(expr)
+        while isinstance(ritz_type, (rast.PtrType, rast.RefType)):
+            ritz_type = ritz_type.inner
+        if not isinstance(ritz_type, rast.NamedType):
+            return None
+        if not (ritz_type.name == 'Vec' or ritz_type.name.startswith('Vec$')):
+            return None
+        try:
+            addr = self._emit_lvalue_addr(expr)
+        except ValueError:
+            return None
+        if (isinstance(addr.type, ir.PointerType)
+                and isinstance(addr.type.pointee, ir.BaseStructType)):
+            return addr
+        return None
+
     def _emit_lvalue_addr(self, expr: rast.Expr) -> ir.Value:
         """
         Get the address of an lvalue expression (for assignment purposes).
@@ -5821,6 +6069,18 @@ class LLVMEmitter:
                     else:
                         # Inner is pointer to element - GEP with [index]
                         return self.builder.gep(inner_addr, [index])
+            # Vec<T> element as an lvalue (`v[i] = x`, `@v[i]`): the element
+            # lives in the Vec's heap buffer, so take the address out of the
+            # data pointer rather than the { ptr, len, cap } value.
+            vec_addr = self._try_vec_lvalue_base(expr.expr)
+            if vec_addr is not None:
+                zero = ir.Constant(self.i32, 0)
+                data_ptr = self.builder.load(
+                    self.builder.gep(vec_addr, [zero, ir.Constant(self.i32, 0)]))
+                if index.type != self.i64:
+                    index = self._convert_type(index, self.i64)
+                return self.builder.gep(data_ptr, [index])
+
             base = self._emit_expr(expr.expr)
             if isinstance(base.type, ir.PointerType):
                 return self.builder.gep(base, [index])
@@ -6572,10 +6832,24 @@ class LLVMEmitter:
                 raise ValueError(f"Unknown field {field_name} in struct {struct_name}")
 
             idx = field_indices[field_name]
-            field_val = self._emit_expr(field_expr)
 
             # Get the expected type for this field
             _, expected_type = field_defs[idx]
+
+            # `S { opt: None }` must build the variant for *this field's* enum:
+            # variant names are global, so `None`/`Some` would otherwise pick
+            # whichever Option specialization was registered last.
+            field_enum = None
+            if (self._is_enum_variant_call(field_expr)
+                    and isinstance(expected_type, rast.NamedType)):
+                field_enum = self._resolve_enum_type_name(expected_type)
+                if field_enum is None and expected_type.args:
+                    field_enum = self._ensure_builtin_generic_specialization(expected_type)
+            if field_enum is not None:
+                field_val = self._emit_enum_variant_with_type(field_expr, field_enum)
+            else:
+                field_val = self._emit_expr(field_expr)
+
             expected_llvm_type = self._ritz_type_to_llvm(expected_type)
 
             # Convert if needed
@@ -6972,8 +7246,21 @@ class LLVMEmitter:
                             self.builder.store(tmp_val, tmp)
                             val = tmp
                 else:
-                    # Moved/value parameter: emit value normally
-                    val = self._emit_expr(arg)
+                    # Moved/value parameter: emit value normally.
+                    # `f(Some(x))` must build the variant for the *parameter's*
+                    # enum - variant names are global, so otherwise `Some`
+                    # resolves to whichever Option was specialized last.
+                    param_enum = None
+                    if (self._is_enum_variant_call(arg)
+                            and isinstance(param_def.type, rast.NamedType)):
+                        param_enum = self._resolve_enum_type_name(param_def.type)
+                        if param_enum is None and param_def.type.args:
+                            param_enum = self._ensure_builtin_generic_specialization(
+                                param_def.type)
+                    if param_enum is not None:
+                        val = self._emit_enum_variant_with_type(arg, param_enum)
+                    else:
+                        val = self._emit_expr(arg)
 
                     # Check for String -> *u8 implicit coercion (Issue #89)
                     arg_ritz_type = self._infer_ritz_type(arg)
@@ -8016,6 +8303,93 @@ class LLVMEmitter:
             phi.add_incoming(bad_val, bad_exit)
         return phi
 
+    BUILTIN_GENERIC_TYPES = ('Vec', 'Span', 'Option', 'Result', 'Box')
+
+    def _try_emit_associated_builtin_call(self, expr: rast.MethodCall) -> Optional[ir.Value]:
+        """Emit `Span.empty()` / `Vec.new()` style associated calls.
+
+        `Type.method(args)` parses as a method call whose receiver is the bare
+        type name. For the built-in generics the concrete type argument is not
+        spelled, so take it from the expected type of the surrounding context
+        and dispatch through the usual UFCS mangling (`span_empty$u8`).
+        """
+        if not isinstance(expr.expr, rast.Ident):
+            return None
+        base_name = expr.expr.name
+        if base_name not in self.BUILTIN_GENERIC_TYPES:
+            return None
+        # A local shadowing the type name is a value, not a type.
+        if (base_name in self.locals or base_name in self.params
+                or base_name in self.ritz_types):
+            return None
+
+        expected = self.expected_ritz_type
+        while isinstance(expected, (rast.PtrType, rast.RefType)):
+            expected = expected.inner
+        if not isinstance(expected, rast.NamedType):
+            return None
+        if expected.args:
+            if expected.name != base_name:
+                return None
+            type_name = self._get_specialized_type_name(expected)
+        elif expected.name.startswith(base_name + '$'):
+            type_name = expected.name
+        else:
+            return None
+
+        fn_name = self._find_method_fallback(type_name, expr.method)
+        if fn_name is None:
+            # `Span<T>.empty()` is `{ null, 0 }` - a built-in shape, so it must
+            # work without importing ritzlib.span.
+            if base_name == 'Span' and expr.method == 'empty' and not expr.args:
+                span_ty = self._ritz_type_to_llvm(expected)
+                out = ir.Constant(span_ty, ir.Undefined)
+                out = self.builder.insert_value(
+                    out, ir.Constant(span_ty.elements[0], None), 0)
+                return self.builder.insert_value(out, ir.Constant(self.i64, 0), 1)
+            return None
+        fn, fn_def = self.functions[fn_name]
+        args = [self._emit_expr(a) for a in expr.args]
+        if fn_def is not None and fn_def.params:
+            for i, param in enumerate(fn_def.params):
+                if i < len(args):
+                    args[i] = self._convert_type(
+                        args[i], self._ritz_type_to_llvm(param.type))
+        return self.builder.call(fn, args)
+
+    def _try_emit_builtin_span_method(self, expr: rast.MethodCall,
+                                      type_name: str) -> Optional[ir.Value]:
+        """Emit the intrinsic `Span<T>` methods without a ritzlib import.
+
+        `Span<T>` is `{ ptr, len }`, so `len`/`ptr`/`is_empty`/`slice` are pure
+        struct operations. A module that only ever *receives* a span (e.g. via
+        an imported signature) must not be forced to import ritzlib.span to
+        use them.
+        """
+        if not (type_name == 'Span' or type_name.startswith('Span$')):
+            return None
+
+        if expr.method == 'slice' and len(expr.args) == 2:
+            return self._emit_span_slice(rast.SliceExpr(
+                span=expr.span,
+                expr=expr.expr,
+                start=expr.args[0],
+                end=expr.args[1],
+            ))
+
+        if expr.method in ('len', 'ptr', 'is_empty') and not expr.args:
+            span_val = self._emit_expr(expr.expr)
+            if isinstance(span_val.type, ir.PointerType):
+                span_val = self.builder.load(span_val)
+            if expr.method == 'ptr':
+                return self.builder.extract_value(span_val, 0)
+            length = self.builder.extract_value(span_val, 1)
+            if expr.method == 'len':
+                return length
+            return self.builder.icmp_signed('==', length, ir.Constant(length.type, 0))
+
+        return None
+
     def _emit_method_call(self, expr: rast.MethodCall) -> ir.Value:
         """Emit a method call: receiver.method(args...).
 
@@ -8030,6 +8404,14 @@ class LLVMEmitter:
 
         For dyn Trait, we use dynamic dispatch through the vtable.
         """
+        # Associated function on a built-in generic type: `Span.empty()`,
+        # `Vec.new()`, ... The receiver is a *type*, not a value, so there is
+        # no receiver argument and the type parameter comes from the context
+        # the call sits in (return type, let annotation).
+        assoc = self._try_emit_associated_builtin_call(expr)
+        if assoc is not None:
+            return assoc
+
         # `Enum.Variant(args)` parses as a method call, but constructs a value
         # rather than dispatching one. Resolve it here, before any receiver
         # typing is attempted: the receiver is a *type name*, so the fallback
@@ -8184,6 +8566,11 @@ class LLVMEmitter:
             # Span$u8.len() -> span_len$u8(&self)
             mangled_name = self._find_method_fallback(type_name, expr.method)
             if mangled_name is None:
+                # Core Span<T> operations are built-in shapes ({ ptr, len }),
+                # so they must work without importing ritzlib.span.
+                builtin_span = self._try_emit_builtin_span_method(expr, type_name)
+                if builtin_span is not None:
+                    return builtin_span
                 raise ValueError(f"No method '{expr.method}' found for type '{type_name}'")
             used_ufcs_fallback = True  # UFCS fallback functions take receiver as first param
 
@@ -8999,7 +9386,12 @@ class LLVMEmitter:
         """
         enum_type, variants = self.enum_types[enum_name]
 
-        # Store enum to memory so we can extract tag and data
+        # Store enum to memory so we can extract tag and data. Matching on a
+        # place (`match self.cmap`) can hand us a pointer to the enum rather
+        # than the value; load through it first.
+        if (isinstance(enum_val.type, ir.PointerType)
+                and enum_val.type.pointee == enum_type):
+            enum_val = self.builder.load(enum_val)
         enum_alloca = self.builder.alloca(enum_type, name="match.enum")
         self.builder.store(enum_val, enum_alloca)
 
@@ -9121,6 +9513,12 @@ class LLVMEmitter:
         if arm_values and arm_exit_blocks:
             # Filter out terminated blocks (those that returned)
             incoming = [(val, block) for val, block in zip(arm_values, arm_exit_blocks) if block is not None]
+            # A match used as a *statement* has arms that produce no value
+            # (an assignment, a `let`, an early return...). Those emit
+            # ir.Undefined, which has no `.type` and cannot be phi'd - the
+            # match simply has no value, so fall through to the dummy below.
+            if not all(hasattr(val, 'type') for val, _ in incoming):
+                incoming = []
             if incoming:
                 # All values should have the same type (or be convertible)
                 # For now assume they're all the same type
@@ -9270,8 +9668,13 @@ class LLVMEmitter:
         if not enum_name:
             raise ValueError(f"Try operator requires a Result type, got expression: {type(expr.expr)}")
 
+        if enum_name == 'Option' or enum_name.startswith("Option$"):
+            # `opt?` on an Option<T>: unwrap Some, or return None early.
+            return self._emit_try_op_option(expr, result_val, enum_name)
+
         if not enum_name.startswith("Result$"):
-            raise ValueError(f"Try operator requires a Result type, got: {enum_name}")
+            raise ValueError(
+                f"Try operator requires a Result or Option type, got: {enum_name}")
 
         # Get the Result type info
         enum_type, variants = self.enum_types[enum_name]
@@ -9377,6 +9780,83 @@ class LLVMEmitter:
         phi = self.builder.phi(llvm_ok_type, name="try.val")
         phi.add_incoming(ok_val, ok_exit)
 
+        return phi
+
+    def _resolve_fn_return_enum_name(self) -> Optional[str]:
+        """Name of the enum the enclosing function returns, if it returns one."""
+        ret_ritz_type = self.current_fn_def.ret_type if self.current_fn_def else None
+        if not isinstance(ret_ritz_type, rast.NamedType):
+            return None
+        if ret_ritz_type.args:
+            name = self._get_specialized_type_name(ret_ritz_type)
+            if name in self.enum_types:
+                return name
+            return self._ensure_builtin_generic_specialization(ret_ritz_type)
+        if ret_ritz_type.name in self.enum_types:
+            return ret_ritz_type.name
+        return None
+
+    def _emit_try_op_option(self, expr: rast.TryOp, opt_val: ir.Value,
+                            enum_name: str) -> ir.Value:
+        """Emit `opt?`: yield the Some payload, or return None from the caller.
+
+        The enclosing function must itself return an Option.
+        """
+        enum_type, variants = self.enum_types[enum_name]
+
+        if (isinstance(opt_val.type, ir.PointerType)
+                and opt_val.type.pointee == enum_type):
+            opt_val = self.builder.load(opt_val)
+
+        opt_alloca = self.builder.alloca(enum_type, name="try.opt")
+        self.builder.store(opt_val, opt_alloca)
+
+        zero = ir.Constant(self.i32, 0)
+        tag = self.builder.load(self.builder.gep(opt_alloca, [zero, zero]))
+        some_tag = self._get_enum_variant_tag(enum_name, 'Some')
+
+        some_block = self.current_fn.append_basic_block("try.some")
+        none_block = self.current_fn.append_basic_block("try.none")
+        merge_block = self.current_fn.append_basic_block("try.merge")
+
+        is_some = self.builder.icmp_unsigned(
+            '==', tag, ir.Constant(self.i8, some_tag))
+        self.builder.cbranch(is_some, some_block, none_block)
+
+        # None: return None of the *caller's* Option type.
+        self.builder.position_at_end(none_block)
+        fn_ret_enum = self._resolve_fn_return_enum_name()
+        if fn_ret_enum is None or not (
+                fn_ret_enum == 'Option' or fn_ret_enum.startswith('Option$')):
+            raise ValueError(
+                "Try operator on an Option used in a function that does not "
+                f"return an Option (got {fn_ret_enum})")
+        ret_enum_type, _ = self.enum_types[fn_ret_enum]
+        ret_alloca = self.builder.alloca(ret_enum_type, name="try.ret")
+        self.builder.store(
+            ir.Constant(self.i8, self._get_enum_variant_tag(fn_ret_enum, 'None')),
+            self.builder.gep(ret_alloca, [zero, zero]))
+        ret_val = self.builder.load(ret_alloca)
+        self._emit_drop_for_all_scopes(None)
+        self.builder.ret(ret_val)
+
+        # Some: extract the payload.
+        self.builder.position_at_end(some_block)
+        some_variant = next((v for v in variants if v.name == 'Some'), None)
+        if not some_variant or not some_variant.fields:
+            raise ValueError(f"Option type {enum_name} has no Some payload")
+        llvm_payload_type = self._ritz_type_to_llvm(some_variant.fields[0])
+        data_index = self._get_enum_data_index(enum_name)
+        data_ptr = self.builder.gep(
+            opt_alloca, [zero, ir.Constant(self.i32, data_index)])
+        payload = self.builder.load(
+            self.builder.bitcast(data_ptr, ir.PointerType(llvm_payload_type)))
+        self.builder.branch(merge_block)
+        some_exit = self.builder.block
+
+        self.builder.position_at_end(merge_block)
+        phi = self.builder.phi(llvm_payload_type, name="try.val")
+        phi.add_incoming(payload, some_exit)
         return phi
 
     def _get_specialized_type_name(self, ty: rast.NamedType) -> str:
@@ -9552,6 +10032,21 @@ class LLVMEmitter:
                             # Simple named type (possibly already monomorphized)
                             if ret_type.name in self.enum_types:
                                 return ret_type.name
+
+        # General fallback: anything the cases above do not special-case
+        # (method calls, field access, indexing, ...) goes through the type
+        # inferencer, so `expr?` works on any expression with a Result type.
+        inferred = self._infer_ritz_type(expr)
+        if isinstance(inferred, rast.NamedType):
+            if inferred.args:
+                # Only consult already-materialized specializations: this is a
+                # query, and synthesizing one here would rebind the global
+                # variant->enum map (`Some`/`Ok`) as a side effect.
+                specialized = self._get_specialized_type_name(inferred)
+                if specialized in self.enum_types:
+                    return specialized
+            elif inferred.name in self.enum_types:
+                return inferred.name
         return None
 
     def _emit_cast_to_union(self, expr: rast.Cast) -> ir.Value:

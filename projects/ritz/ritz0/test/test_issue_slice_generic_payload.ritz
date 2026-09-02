@@ -1,0 +1,110 @@
+# Regression (AGAST #1285): slice types must be usable as generic type
+# arguments.
+#
+# `[T]` is sugar for `Span<T>` — both are the same `{ ptr, len }` shape — so
+# `Option<[u8]>` / `Result<[u8], E>` must specialize, construct, match and
+# round-trip exactly like `Option<Span<u8>>` does.
+#
+# Before the fix this died in the emitter with:
+#   ValueError: Unknown type: SliceType(inner=NamedType(name='u8'))
+# while specializing the builtin generic.
+
+import ritzlib.result
+import ritzlib.span
+
+# --- Option<[u8]> -----------------------------------------------------------
+
+fn take_prefix(data: Span<u8>, n: i64) -> Option<[u8]>
+    if data.len < n
+        return None
+    Some(data[0..n])
+
+[[test]]
+fn test_option_slice_some() -> i32
+    let buf: [4]u8 = [2, 4, 6, 8]
+    let r = match take_prefix(@buf, 2)
+        Some(s) => s[0] as i32 + s[1] as i32
+        None => 99
+    if r == 6
+        0
+    else
+        1
+
+[[test]]
+fn test_option_slice_none() -> i32
+    let buf: [4]u8 = [2, 4, 6, 8]
+    let r = match take_prefix(@buf, 9)
+        Some(s) => s[0] as i32
+        None => 7
+    if r == 7
+        0
+    else
+        1
+
+# --- Result<[u8], i32> ------------------------------------------------------
+
+fn read_slice(data: Span<u8>, n: i64) -> Result<[u8], i32>
+    if data.len < n
+        return Err(42)
+    Ok(data[0..n])
+
+[[test]]
+fn test_result_slice_ok() -> i32
+    let buf: [4]u8 = [10, 20, 30, 40]
+    let r = match read_slice(@buf, 3)
+        Ok(s) => s[2] as i32
+        Err(e) => e
+    if r == 30
+        0
+    else
+        1
+
+[[test]]
+fn test_result_slice_err() -> i32
+    let buf: [4]u8 = [10, 20, 30, 40]
+    let r = match read_slice(@buf, 5)
+        Ok(s) => s[0] as i32
+        Err(e) => e
+    if r == 42
+        0
+    else
+        1
+
+# --- Round-trip: payload survives the match with ptr AND len intact ---------
+
+[[test]]
+fn test_slice_payload_roundtrip() -> i32
+    let buf: [6]u8 = [1, 2, 3, 4, 5, 6]
+    let outer = read_slice(@buf, 4)
+    let inner = match outer
+        Ok(s) => s[1..3]
+        Err(e) => span_empty<u8>()
+    if inner.len != 2
+        return 1
+    if inner[0] != 2
+        return 2
+    if inner[1] != 3
+        return 3
+    0
+
+# --- A slice payload behaves identically to an explicit Span payload --------
+#
+# NOTE: `Option<Span<u8>>` cannot be spelled directly today — the lexer does not
+# split the `>>` that closes two nested type-argument lists — so the Span side of
+# the comparison is expressed through an unwrapped Span<u8> instead.
+
+fn prefix_span(data: Span<u8>, n: i64) -> Span<u8>
+    data[0..n]
+
+[[test]]
+fn test_slice_and_span_payloads_agree() -> i32
+    let buf: [4]u8 = [9, 8, 7, 6]
+    let a = match take_prefix(@buf, 3)
+        Some(s) => s.len as i32
+        None => 0
+    let direct = prefix_span(@buf, 3)
+    let b = direct.len as i32
+    if a == b and a == 3
+        0
+    else
+        1

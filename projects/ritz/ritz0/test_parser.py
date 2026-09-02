@@ -418,11 +418,14 @@ class TestTypes:
         assert t.mutable
 
     def test_slice_type(self):
+        """`[T]` is sugar for `Span<T>` and desugars at parse time."""
         mod = parse("fn foo(x: [u8])\n  x")
         fn = mod.items[0]
         t = fn.params[0].type
-        assert isinstance(t, rast.SliceType)
-        assert t.inner.name == "u8"
+        assert isinstance(t, rast.NamedType)
+        assert t.name == "Span"
+        assert len(t.args) == 1
+        assert t.args[0].name == "u8"
 
 
 class TestAttributes:

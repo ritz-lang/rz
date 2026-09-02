@@ -197,11 +197,12 @@ class TestArraySizeParsing:
         assert isinstance(ty.size, rast.BinOp)
 
     def test_slice_type_still_works(self):
-        """Slice types [T] still parse correctly."""
+        """Slice types [T] still parse correctly - as their `Span<T>` sugar."""
         ty = parse_type("[u8]")
-        assert isinstance(ty, rast.SliceType)
-        assert isinstance(ty.inner, rast.NamedType)
-        assert ty.inner.name == "u8"
+        assert isinstance(ty, rast.NamedType)
+        assert ty.name == "Span"
+        assert len(ty.args) == 1
+        assert ty.args[0].name == "u8"
 
 
 class TestConstEvalPass:

@@ -112,8 +112,27 @@ class PtrType(Type):
 
 @dataclass
 class SliceType(Type):
-    """A slice type: [T]."""
+    """A slice type: [T].
+
+    DEPRECATED as a surface type. `[T]` is sugar for `Span<T>` — both denote
+    the same non-owning `{ ptr, len }` view — and the front-end now desugars
+    it at construction time via `make_slice_type()`. Nothing in the pipeline
+    should produce a `SliceType` any more; the node is retained only so that
+    stale pickled/cached ASTs and third-party tooling keep importing cleanly.
+    """
     inner: Type
+
+
+def make_slice_type(span: 'Span', inner: Type) -> 'NamedType':
+    """Build the type denoted by the slice syntax `[T]`.
+
+    `[T]` is surface sugar for `Span<T>`: a non-owning `{ ptr, len }` view.
+    Desugaring here — rather than in each consumer — means name resolution,
+    type checking, monomorphization, name mangling and LLVM lowering all see
+    exactly one type, so a slice works anywhere a `Span<T>` works (including
+    as a generic type argument, e.g. `Result<[u8], E>`).
+    """
+    return NamedType(span, 'Span', [inner])
 
 
 @dataclass

@@ -461,8 +461,9 @@ class Parser:
                         inner = self._parse_type_primary(allow_type_args)
                         return rast.ArrayType(span, rast.Ident(ident.span, ident.value), inner)
                     else:
-                        # Slice type [T] where T was an identifier
-                        return rast.SliceType(span, rast.NamedType(ident.span, ident.value))
+                        # Slice type [T] where T was an identifier.
+                        # `[T]` is sugar for `Span<T>` (see make_slice_type).
+                        return rast.make_slice_type(span, rast.NamedType(ident.span, ident.value))
                 else:
                     # More complex expression after IDENT (e.g., SIZE * 2)
                     self.pos = saved_pos
@@ -471,10 +472,10 @@ class Parser:
                     inner = self._parse_type_primary(allow_type_args)
                     return rast.ArrayType(span, size_expr, inner)
             else:
-                # Slice type: [T]
+                # Slice type: [T] — sugar for `Span<T>` (see make_slice_type).
                 inner = self.parse_type()
                 self._expect(TokenType.RBRACKET)
-                return rast.SliceType(span, inner)
+                return rast.make_slice_type(span, inner)
 
         # Tuple type: (T1, T2, ...) or (T,) or ()
         # Distinguished from grouped types by comma presence
@@ -602,8 +603,12 @@ class Parser:
         TokenType.STAR: 10,      # *
         TokenType.SLASH: 10,     # /
         TokenType.PERCENT: 10,   # %
-        TokenType.DOTDOT: 11,    # ..
-        TokenType.DOTDOTEQ: 11,  # ..=
+        # Ranges bind loosest of all the binary operators (as in Rust), so
+        # `a..b + 1` is `a .. (b + 1)` and `0..n as usize` is `0 .. (n as usize)`.
+        # They used to bind *tighter* than arithmetic, which silently produced
+        # `(a..b) + 1` and forced every consumer to un-pick it.
+        TokenType.DOTDOT: 1,     # ..
+        TokenType.DOTDOTEQ: 1,   # ..=
         TokenType.AS: 12,        # as (type cast) - high precedence
     }
 
@@ -856,15 +861,15 @@ class Parser:
         if self._at(TokenType.PIPE):
             return self.parse_closure()
 
-        # Integer literal
+        # Integer literal (with optional type suffix: `0u32`)
         if self._at(TokenType.INT):
             self._advance()
-            return rast.IntLit(span, tok.value)
+            return self._apply_literal_suffix(rast.IntLit(span, tok.value), tok)
 
-        # Float literal
+        # Float literal (with optional type suffix: `1.5f32`)
         if self._at(TokenType.FLOAT):
             self._advance()
-            return rast.FloatLit(span, tok.value)
+            return self._apply_literal_suffix(rast.FloatLit(span, tok.value), tok)
 
         # String literal
         if self._at(TokenType.STRING):
@@ -1294,6 +1299,17 @@ class Parser:
 
         body = self.parse_expr()
         return rast.Lambda(span, params, ret_type, body)
+
+    def _apply_literal_suffix(self, lit, tok):
+        """Apply a numeric literal's type suffix: `0u32` -> `0 as u32`.
+
+        Lowering to a cast keeps one representation of "this literal has this
+        type" for every downstream pass.
+        """
+        suffix = getattr(tok, 'suffix', None)
+        if not suffix:
+            return lit
+        return rast.Cast(lit.span, lit, rast.NamedType(lit.span, suffix, []))
 
     def parse_closure(self) -> rast.Closure:
         """Parse a closure expression: |params| body.

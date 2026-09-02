@@ -163,9 +163,34 @@ class Monomorphizer:
         # e.g., "String" -> {"Drop"}, "Vec$i32" -> {"Drop"}
         self.trait_impls: Dict[str, Set[str]] = {}
 
+        # Mangled type key -> the actual type it was mangled from.
+        # Mangling is lossy, so keep the originals for _parse_type_args_key.
+        self.type_args_by_key: Dict[str, rast.Type] = {}
+
+        # Non-generic function name -> definition (for return-type inference).
+        self.fn_signatures: Dict[str, rast.FnDef] = {}
+
+        # All struct definitions by name (for field-type inference).
+        self.struct_defs: Dict[str, rast.StructDef] = {}
+
+        # Expected type of the value currently being visited (return type or
+        # `let` annotation). Resolves associated calls like `Span.empty()`
+        # whose type argument is only implied by context.
+        self.expected_type: Optional[rast.Type] = None
+        self.current_ret_type: Optional[rast.Type] = None
+
     def _type_to_key(self, ty: rast.Type) -> str:
         """Convert a type to a string key for deduplication."""
-        return mangle_type_name(ty)
+        key = mangle_type_name(ty)
+        # Remember the type behind the mangled key. Reconstructing a type from
+        # its mangled name is lossy: `Span<u8>` mangles to "Span_u8", which
+        # parses back as an *opaque* NamedType called "Span_u8" with no type
+        # arguments. Downstream that looks like an unknown struct, so e.g. a
+        # `Span<u8>` payload bound out of `Result<Span<u8>, E>` lost its
+        # spanness and could no longer be indexed or sliced.
+        if key not in self.type_args_by_key:
+            self.type_args_by_key[key] = copy.deepcopy(ty)
+        return key
 
     def _type_args_to_key(self, type_args: List[rast.Type]) -> Tuple[str, ...]:
         """Convert type arguments to a tuple key for deduplication."""
@@ -247,10 +272,18 @@ class Monomorphizer:
         for item in module.items:
             if isinstance(item, rast.StructDef) and item.is_generic():
                 self.generic_structs[item.name] = item
+                self.struct_defs[item.name] = item
+            elif isinstance(item, rast.StructDef):
+                self.struct_defs[item.name] = item
             elif isinstance(item, rast.EnumDef) and item.is_generic():
                 self.generic_enums[item.name] = item
             elif isinstance(item, rast.FnDef) and item.is_generic():
                 self.generic_functions[item.name] = item
+            elif isinstance(item, rast.FnDef):
+                # Non-generic signatures still matter: they let us infer the
+                # type of `let x = f()` and so register instantiations for the
+                # generic machinery x is later used with (`x[i]` -> vec_get<T>).
+                self.fn_signatures[item.name] = item
             elif isinstance(item, rast.ImplBlock) and item.type_params:
                 # Generic impl block like `impl<T> Drop for Box<T>`
                 if item.type_name not in self.generic_impls:
@@ -262,7 +295,7 @@ class Monomorphizer:
         for item in module.items:
             self._visit_item(item)
 
-    def _visit_item(self, item: rast.Item) -> None:
+    def _visit_item(self, item: rast.Item, impl_type_name: Optional[str] = None) -> None:
         """Visit an item to find instantiations."""
         if isinstance(item, rast.FnDef):
             # Skip generic functions - they contain calls like vec_grow<T>
@@ -275,8 +308,13 @@ class Monomorphizer:
             # Register parameter types
             for param in item.params:
                 self._visit_type(param.type)
-                self.var_types[param.name] = param.type
+                param_type = param.type
+                if param_type is None and param.name == 'self' and impl_type_name:
+                    # `fn m(self)` in an impl block: self is the impl type.
+                    param_type = rast.NamedType(item.span, impl_type_name, [])
+                self.var_types[param.name] = param_type
             # Visit return type
+            self.current_ret_type = item.ret_type
             if item.ret_type:
                 self._visit_type(item.ret_type)
             # Visit body
@@ -292,7 +330,7 @@ class Monomorphizer:
             # Visit non-generic impl blocks to find generic calls in their methods
             # e.g., impl Drop for String { fn drop() { vec_drop<u8>(...) } }
             for method in item.methods:
-                self._visit_item(method)
+                self._visit_item(method, impl_type_name=item.type_name)
 
     def _visit_type(self, ty: rast.Type) -> None:
         """Visit a type to find instantiations."""
@@ -340,6 +378,7 @@ class Monomorphizer:
                 self._visit_type(stmt.type)
                 # Track variable type
                 self.var_types[stmt.name] = stmt.type
+                self.expected_type = stmt.type
             elif stmt.value is not None:
                 # No explicit type — try to infer from the rhs so that subsequent
                 # method calls (`v.push(...)`) can register UFCS instantiations.
@@ -351,6 +390,7 @@ class Monomorphizer:
                     self._visit_type(inferred)
             if stmt.value:
                 self._visit_expr(stmt.value)
+            self.expected_type = None
         elif isinstance(stmt, rast.VarStmt):
             if stmt.type:
                 self._visit_type(stmt.type)
@@ -370,7 +410,10 @@ class Monomorphizer:
             self._visit_expr(stmt.value)
         elif isinstance(stmt, rast.ReturnStmt):
             if stmt.value:
+                saved = self.expected_type
+                self.expected_type = self.current_ret_type
                 self._visit_expr(stmt.value)
+                self.expected_type = saved
         elif isinstance(stmt, rast.WhileStmt):
             self._visit_expr(stmt.cond)
             self._visit_block(stmt.body)
@@ -465,14 +508,9 @@ class Monomorphizer:
 
     def _register_slice_instantiation(self, expr: rast.SliceExpr) -> None:
         """Register vec_slice<T> instantiation for slice expressions on Vec types."""
-        if not isinstance(expr.expr, rast.Ident):
-            return
-
-        var_name = expr.expr.name
-        if var_name not in self.var_types:
-            return
-
-        var_type = self.var_types[var_name]
+        var_type = self._infer_value_type(expr.expr)
+        while isinstance(var_type, (rast.PtrType, rast.RefType)):
+            var_type = var_type.inner
         if not isinstance(var_type, rast.NamedType):
             return
 
@@ -493,14 +531,9 @@ class Monomorphizer:
         `v[i]` on a Vec<T> desugars to `vec_get<T>(&v, i)` in the emitter — so
         the monomorphizer needs to specialize vec_get<T> alongside the call.
         """
-        if not isinstance(expr.expr, rast.Ident):
-            return
-
-        var_name = expr.expr.name
-        if var_name not in self.var_types:
-            return
-
-        var_type = self.var_types[var_name]
+        var_type = self._infer_value_type(expr.expr)
+        while isinstance(var_type, (rast.PtrType, rast.RefType)):
+            var_type = var_type.inner
         if not isinstance(var_type, rast.NamedType):
             return
 
@@ -517,6 +550,28 @@ class Monomorphizer:
         an explicit type annotation. Limited to patterns that gate UFCS
         method-instantiation registration (e.g. `var v = vec_new<u16>()`).
         """
+        # A plain variable: whatever we recorded for it.
+        if isinstance(expr, rast.Ident):
+            return self.var_types.get(expr.name)
+
+        # Field access: resolve the base struct and look the field up. This is
+        # what makes `self.edges.push(x)` register vec_push<Edge>.
+        if isinstance(expr, rast.Field):
+            base_type = self._infer_value_type(expr.expr)
+            while isinstance(base_type, (rast.PtrType, rast.RefType)):
+                base_type = base_type.inner
+            if isinstance(base_type, rast.NamedType):
+                struct_def = self.struct_defs.get(base_type.name)
+                if struct_def is not None:
+                    for field_name, field_type in struct_def.fields:
+                        if field_name == expr.field:
+                            if struct_def.type_params and base_type.args:
+                                subst = TypeSubstitution(dict(zip(
+                                    struct_def.type_params, base_type.args)))
+                                return subst.apply(field_type)
+                            return field_type
+            return None
+
         # Direct call to a generic function with explicit type args:
         #   vec_new<u16>() -> Vec<u16>
         if isinstance(expr, rast.Call) and isinstance(expr.func, rast.Ident):
@@ -529,6 +584,24 @@ class Monomorphizer:
                 }
                 subst = TypeSubstitution(mapping=mapping)
                 return subst.apply(fn_def.ret_type)
+            # Plain call to a known non-generic function: use its return type.
+            plain = self.fn_signatures.get(fn_name)
+            if plain is not None and plain.ret_type is not None:
+                return plain.ret_type
+
+        # `expr.unwrap()` / `expr.expect(..)` / `expr.unwrap_or(..)` on a
+        # Result<T, E> or Option<T> yields T. Without this the binding type is
+        # unknown and later generic sugar on it (e.g. `v[i]` -> vec_get<T>)
+        # never gets instantiated.
+        if isinstance(expr, rast.MethodCall) and expr.method in (
+                'unwrap', 'expect', 'unwrap_or', 'unwrap_or_default'):
+            recv_type = self._infer_value_type(expr.expr)
+            while isinstance(recv_type, (rast.PtrType, rast.RefType)):
+                recv_type = recv_type.inner
+            if (isinstance(recv_type, rast.NamedType)
+                    and recv_type.name in ('Result', 'Option')
+                    and recv_type.args):
+                return recv_type.args[0]
         return None
 
     def _register_method_instantiation(self, expr: rast.MethodCall) -> None:
@@ -540,15 +613,22 @@ class Monomorphizer:
           - Span<T>.method() -> span_method<T>
           - Option<T>.method() -> option_method<T>
         """
-        # Only handle method calls on identifiers for now
-        if not isinstance(expr.expr, rast.Ident):
+        # Associated call on a built-in generic type: `Span.empty()`. The
+        # receiver names a type, so the type argument comes from the expected
+        # type of the surrounding context.
+        if (isinstance(expr.expr, rast.Ident)
+                and expr.expr.name in ('Vec', 'Span', 'Option', 'Result', 'Box')
+                and expr.expr.name not in self.var_types):
+            expected = self.expected_type
+            while isinstance(expected, (rast.PtrType, rast.RefType)):
+                expected = expected.inner
+            if (isinstance(expected, rast.NamedType)
+                    and expected.name == expr.expr.name and expected.args):
+                self._register_ufcs_instantiation(expected.name, expr.method,
+                                                  expected.args)
             return
 
-        var_name = expr.expr.name
-        if var_name not in self.var_types:
-            return
-
-        var_type = self.var_types[var_name]
+        var_type = self._infer_value_type(expr.expr)
 
         # Unwrap pointer/reference types: &Vec<T>, *Vec<T>, &mut Vec<T> -> Vec<T>
         while isinstance(var_type, rast.RefType):
@@ -559,33 +639,34 @@ class Monomorphizer:
         if not isinstance(var_type, rast.NamedType):
             return
 
-        # Map type names to their function prefixes
-        type_to_prefix = {
-            'Vec': 'vec_',
-            'Span': 'span_',
-            'Option': 'option_',
-            'Result': 'result_',
-            'Box': 'box_',
-        }
-
         type_name = var_type.name
-        if type_name not in type_to_prefix:
-            return
-
-        prefix = type_to_prefix[type_name]
-        fn_name = f"{prefix}{expr.method}"
-
-        # Only if this is a generic function
-        if fn_name not in self.generic_functions:
+        if type_name not in self.TYPE_TO_UFCS_PREFIX:
             return
 
         # Register instantiation with the type's type args
         if var_type.args:
-            type_args = var_type.args
-            key = (fn_name, self._type_args_to_key(type_args))
-            if key not in self.function_instantiations:
-                mangled = mangle_generic_name(fn_name, type_args)
-                self.function_instantiations[key] = mangled
+            self._register_ufcs_instantiation(type_name, expr.method, var_type.args)
+
+    TYPE_TO_UFCS_PREFIX = {
+        'Vec': 'vec_',
+        'Span': 'span_',
+        'Option': 'option_',
+        'Result': 'result_',
+        'Box': 'box_',
+    }
+
+    def _register_ufcs_instantiation(self, type_name: str, method: str,
+                                     type_args: List[rast.Type]) -> None:
+        """Register the UFCS free function backing `Type<T>.method()`."""
+        prefix = self.TYPE_TO_UFCS_PREFIX.get(type_name)
+        if prefix is None:
+            return
+        fn_name = f"{prefix}{method}"
+        if fn_name not in self.generic_functions:
+            return
+        key = (fn_name, self._type_args_to_key(type_args))
+        if key not in self.function_instantiations:
+            self.function_instantiations[key] = mangle_generic_name(fn_name, type_args)
 
     def _generate_specializations_iterative(self) -> None:
         """Generate specialized versions iteratively until no new instantiations are found.
@@ -770,6 +851,12 @@ class Monomorphizer:
         # In a full implementation, we'd store the original type args
         result = []
         for key in type_args_key:
+            # Preferred path: the exact type this key was mangled from.
+            remembered = self.type_args_by_key.get(key)
+            if remembered is not None:
+                result.append(copy.deepcopy(remembered))
+                continue
+            # Fallback: recover what we can from the mangled name.
             # Handle pointer types
             if key.startswith("ptr_"):
                 inner_name = key[4:]
@@ -1348,6 +1435,24 @@ class Monomorphizer:
                              self._rewrite_expr(expr.start) if expr.start else None,
                              self._rewrite_expr(expr.end) if expr.end else None,
                              expr.inclusive)
+        elif isinstance(expr, rast.Match):
+            # Match arms are ordinary expressions: a generic call in an arm
+            # body must be rewritten to its mangled name like anywhere else.
+            new_arms = [
+                rast.MatchArm(arm.span,
+                              arm.pattern,
+                              self._rewrite_expr(arm.guard) if arm.guard else None,
+                              self._rewrite_expr(arm.body))
+                for arm in expr.arms
+            ]
+            return rast.Match(expr.span, self._rewrite_expr(expr.expr), new_arms)
+        elif isinstance(expr, rast.SliceExpr):
+            return rast.SliceExpr(expr.span,
+                                  self._rewrite_expr(expr.expr),
+                                  self._rewrite_expr(expr.start) if expr.start else None,
+                                  self._rewrite_expr(expr.end) if expr.end else None)
+        elif isinstance(expr, rast.TryOp):
+            return rast.TryOp(expr.span, self._rewrite_expr(expr.expr))
         else:
             return expr
 
