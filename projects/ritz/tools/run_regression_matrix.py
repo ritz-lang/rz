@@ -32,6 +32,7 @@ TESTS = [
     "test_issue_const_struct_array",
     "test_issue_const_strview_arg",
     "test_issue_const_strview_array",
+    "test_issue_deref_ptr_field_assign",
     "test_issue_float_coercion",
     "test_issue_fn_ptr_param_autoborrow",
     "test_issue_fn_ref_param_rvalue",

@@ -1146,10 +1146,14 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
                             emit_str(s, c"\n")
                         return
 
-        # Deref assignment: *(expr) = value.  Note: stmt_assign_deref stashes
-        # JUST the deref OPERAND in if_cond (not a wrapping EXPR_UNARY), so
-        # `target_expr` here is the pointer expression itself (e.g. `p` for
-        # `*p = 0`), not an EXPR_UNARY/OP_DEREF.
+        # Deref assignment: *(expr) = value.  As of AGAST #1304
+        # stmt_assign_deref wraps the target in EXPR_UNARY/OP_DEREF, so
+        # `target_expr` is that unary node and its `.operand` is the pointer
+        # expression (e.g. `p` for `*p = 0`).  The wrapper matters: without
+        # it a `*s.field = v` target arrived here as a bare EXPR_MEMBER and
+        # was swallowed by the struct-field-assignment branch above, storing
+        # into the pointer field instead of through it.  The EXPR_IDENT /
+        # bare-expression arms below remain for stmt_assign_expr targets.
         # Determine the store type. For `*ptr = value` we want the POINTEE
         # type of `ptr` (the destination slot's type), not the value's type.
         # Otherwise storing an i64 RHS into an i32 slot writes 4 extra bytes.
@@ -1166,14 +1170,40 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
                     struct_name = dst_loc.type_name
                     struct_name_len = dst_loc.type_name_len
         else if target_expr.kind == EXPR_UNARY and target_expr.op == OP_DEREF
-            # Defensive: legacy callers that DO wrap with EXPR_UNARY.
+            # AGAST #1304: this is now the ONLY shape stmt_assign_deref
+            # produces.  Resolve the destination slot's width so `*p = v`
+            # stores exactly as wide as `*p` reads — covering locals,
+            # globals, `*(base + i)` and `*s.field` uniformly.  The old code
+            # only understood a bare ident operand, so `*ring.sq_tail = ...`
+            # (a *i32 field) fell back to `store i64` and scribbled 4 bytes
+            # past the slot.  get_deref_store_type reports TYPE_VOID rather
+            # than guessing when it cannot tell, so an unresolved pointee
+            # still defers to the RHS's own type below.
+            #
+            # One exception: the destination width is used to TRUNCATE an
+            # i64 RHS register.  A monomorph-substituted value is already
+            # native-width — in `vec_push<u16>`, `*(v.data + v.len) = item`
+            # loads `item: T` as `i16`, so `trunc i64 %item to i16` is
+            # invalid IR.  Such a value's local carries var_type TYPE_STRUCT
+            # with a primitive type_name ("u16"); leave value_type alone and
+            # let the TYPE_STRUCT arm below store it at its own width via
+            # emit_llvm_type_struct.
+            var rhs_is_named_type: i32 = 0
+            if stmt.assign_value.kind == EXPR_IDENT
+                let rhs_loc: *LocalVar = find_local_struct_name(s, stmt.assign_value.ident_ptr, stmt.assign_value.ident_len)
+                if rhs_loc != null and rhs_loc.var_type == TYPE_STRUCT
+                    rhs_is_named_type = 1
+            let dst_type: i32 = get_deref_store_type(s, target_expr.operand)
+            if dst_type != TYPE_VOID and dst_type != TYPE_I64 and rhs_is_named_type == 0
+                value_type = dst_type
+            # get_deref_store_type reports TYPE_STRUCT but not which struct,
+            # so recover the name from the operand for the aggregate store.
             if target_expr.operand.kind == EXPR_IDENT
                 let dst_loc2: *LocalVar = find_local_struct_name(s, target_expr.operand.ident_ptr, target_expr.operand.ident_len)
-                if dst_loc2 != null and dst_loc2.pointee_type != TYPE_I64
-                    value_type = dst_loc2.pointee_type
-                    if dst_loc2.pointee_type == TYPE_STRUCT
-                        struct_name = dst_loc2.type_name
-                        struct_name_len = dst_loc2.type_name_len
+                if dst_loc2 != null and dst_loc2.pointee_type == TYPE_STRUCT
+                    value_type = TYPE_STRUCT
+                    struct_name = dst_loc2.type_name
+                    struct_name_len = dst_loc2.type_name_len
 
         # Fall back to value's type if destination pointee was unknown (TYPE_I64 default)
         if value_type == TYPE_I64

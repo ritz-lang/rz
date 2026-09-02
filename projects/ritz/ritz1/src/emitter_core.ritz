@@ -1313,8 +1313,24 @@ fn get_ptr_elem_size(s: *EmitterState, e: *Expr) -> i64
     return 1
 
 # Helper: get pointee type for a struct member that is a pointer
-# e.g., for span.ptr (where ptr is *u8), returns TYPE_U8
+# e.g., for span.ptr (where ptr is *u8), returns TYPE_U8.
+#
+# AGAST #1304: this GUESSES TYPE_U8 for a pointer field whose pointee it
+# cannot determine (monomorphised `Vec<T>.data`, for one).  That guess is
+# right often enough for loads, but callers that need to know the
+# difference between "it is a u8" and "no idea" must use
+# get_member_pointee_type_exact below, which returns TYPE_VOID (0) for the
+# unknown case.  emit_assign's deref-store depends on that distinction:
+# guessing u8 there truncates a struct RHS to one byte.
 fn get_member_pointee_type(s: *EmitterState, e: *Expr) -> i32
+    let exact: i32 = get_member_pointee_type_exact(s, e)
+    if exact == TYPE_VOID
+        return TYPE_U8
+    return exact
+
+# Like get_member_pointee_type but returns TYPE_VOID (0) rather than
+# guessing TYPE_U8 when the field's pointee type is not recorded.
+fn get_member_pointee_type_exact(s: *EmitterState, e: *Expr) -> i32
     if e.kind != EXPR_MEMBER
         return TYPE_I64
     # Resolve the receiver's struct name for both single-level
@@ -1375,11 +1391,45 @@ fn get_member_pointee_type(s: *EmitterState, e: *Expr) -> i32
                         return field.array_elem_type
                     if field.array_elem_type == TYPE_U64 or field.array_elem_type == TYPE_I64
                         return field.array_elem_type
-                    # For *u8 in Span<u8>, the pointee is u8
-                    # TODO: Parser should set array_elem_type for pointer fields
-                    # For now, if it's TYPE_PTR with no array_elem_type, assume u8
-                    return TYPE_U8
+                    # Pointee not recorded — e.g. `data: *T` in a
+                    # monomorphised generic, where the substituted field
+                    # carries no array_elem_type.  Report "unknown" and let
+                    # the caller decide; get_member_pointee_type still
+                    # guesses u8 for the load paths that relied on it.
+                    return TYPE_VOID
     return TYPE_I64
+
+# AGAST #1304: pointee type of the pointer expression `ptr` in `*ptr = v`,
+# i.e. the width of the destination slot.  Mirrors get_expr_type's OP_DEREF
+# arm but returns TYPE_VOID instead of guessing when the pointee is not
+# recorded, so emit_assign can fall back to the RHS's own type rather than
+# truncating it.  TYPE_I64 doubles as "unknown" in the local/global pointee
+# tables, and an i64 store is the default anyway, so it is reported as-is.
+fn get_deref_store_type(s: *EmitterState, ptr_expr: *Expr) -> i32
+    if ptr_expr.kind == EXPR_IDENT
+        let lpt: i32 = find_local_pointee_type(s, ptr_expr.ident_ptr, ptr_expr.ident_len)
+        if lpt != TYPE_I64
+            return lpt
+        let glob: *GlobalVarDef = find_global(s, ptr_expr.ident_ptr, ptr_expr.ident_len)
+        if glob != null
+            return glob.pointee_type
+        return TYPE_VOID
+    if ptr_expr.kind == EXPR_MEMBER
+        return get_member_pointee_type_exact(s, ptr_expr)
+    if ptr_expr.kind == EXPR_BINARY
+        # `*(base + i) = v` — the slot width comes from `base`.
+        let base: *Expr = find_base_expr(ptr_expr)
+        if base.kind == EXPR_IDENT
+            let blpt: i32 = find_local_pointee_type(s, base.ident_ptr, base.ident_len)
+            if blpt != TYPE_I64
+                return blpt
+            let bglob: *GlobalVarDef = find_global(s, base.ident_ptr, base.ident_len)
+            if bglob != null
+                return bglob.pointee_type
+            return TYPE_VOID
+        if base.kind == EXPR_MEMBER
+            return get_member_pointee_type_exact(s, base)
+    return TYPE_VOID
 
 fn get_expr_type(s: *EmitterState, e: *Expr) -> i32
     # Returns the Ritz type of an expression

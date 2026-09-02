@@ -495,6 +495,19 @@ pub fn field_new(p: *Parser, name: *u8, len: i32, ty: i32, line: i32, col: i32) 
         f.array_elem_type = 0
         f.array_elem_type_name = null
         f.array_elem_type_name_len = 0
+        # AGAST #1304: record the pointee of a primitive pointer field.
+        # `array_elem_type` is the established slot for this — see
+        # make_ptr_prim_field, which populates it for compiler-builtin
+        # structs (Vec$T.data, Nfa.state_trans_offset).  User-declared
+        # fields were never given one, so get_member_pointee_type fell
+        # through to its `assume u8` default and `*ring.sq_tail` (a *i32)
+        # emitted `load i8`, and get_ptr_elem_size scaled `field + i` by 1
+        # instead of 4.  Struct pointer fields now carry the same pointee
+        # info that local pointer vars do via LocalVar.pointee_type.
+        # Struct pointees keep using field_type_name (set above); only
+        # primitives are recorded here.
+        if ty == TYPE_PTR and p.last_pointee_type != TYPE_STRUCT
+            f.array_elem_type = p.last_pointee_type
     f.next = null
     return f
 
@@ -1042,8 +1055,20 @@ pub fn stmt_assign_deref(p: *Parser, target: *Expr, val: *Expr, line: i32, col: 
     s.assign_target = null
     s.assign_target_len = 0
     s.assign_value = val
-    # Store deref target in if_cond as workaround (ugly but works)
-    s.if_cond = target
+    # AGAST #1304: store the target WRAPPED in EXPR_UNARY/OP_DEREF.
+    #
+    # This used to stash the bare deref OPERAND, which made `*b.p = v`
+    # indistinguishable from `b.p = v` — both produced STMT_ASSIGN with
+    # assign_target_len == 0 and an EXPR_MEMBER in if_cond.  emit_assign
+    # checks EXPR_MEMBER first, so every `*expr.field = value` compiled to
+    # a plain field store: it overwrote the POINTER instead of writing
+    # through it.  That is what corrupted IoUring.sq_tail in
+    # uring_sqe_submit (`*ring.sq_tail = tail + 1`) and segfaulted the
+    # async_net / echo_server examples.
+    #
+    # Keeping the `*` in the AST matches ritz0, whose emitter likewise
+    # tests UnaryOp('*') before Field.
+    s.if_cond = expr_unary(p, OP_DEREF, target, line, col)
     s.next = null
     return s
 

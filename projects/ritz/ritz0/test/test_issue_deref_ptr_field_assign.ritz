@@ -1,0 +1,88 @@
+# Regression (AGAST #1304): `*s.field = value`, where `field` is a pointer
+# held in a struct, must store THROUGH the pointer -- not overwrite the
+# pointer field itself.
+#
+# ritz1 lost the `*` on the way to the emitter: stmt_assign_deref stashed the
+# bare deref operand, so `*s.field = v` and `s.field = v` produced identical
+# STMT_ASSIGN nodes and emit_assign's struct-field branch claimed both. The
+# generated code stored the RHS into the field, clobbering the pointer.
+#
+# Found via a SIGSEGV in examples/tier5_async/59_async_net and
+# 60_echo_server. Both call ritzlib.uring's
+#     pub fn uring_sqe_submit(ring: *IoUring)
+#         let tail: i32 = *ring.sq_tail
+#         *ring.sq_tail = tail + 1
+# which overwrote IoUring.sq_tail (a *i32 into the mmap'd ring) with the
+# literal 1; the next read of *ring.sq_tail then dereferenced address 1.
+#
+# The second half of the bug is width: struct pointer fields recorded no
+# pointee type, so get_member_pointee_type fell through to its "assume u8"
+# default and `*ring.sq_tail` emitted `load i8` for a *i32. Each field below
+# is therefore checked for both a correct value AND an intact pointer.
+
+struct Slots
+    guard_before: i64
+    p8: *u8
+    p16: *u16
+    p32: *i32
+    p64: *i64
+    guard_after: i64
+
+# Each of these is the uring_sqe_submit shape: read through the field,
+# write back through the field.
+fn bump8(s: *Slots)
+    let v: u8 = *s.p8
+    *s.p8 = v + 1
+
+fn bump16(s: *Slots)
+    let v: u16 = *s.p16
+    *s.p16 = v + 1
+
+fn bump32(s: *Slots)
+    let v: i32 = *s.p32
+    *s.p32 = v + 1
+
+fn bump64(s: *Slots)
+    let v: i64 = *s.p64
+    *s.p64 = v + 1
+
+[[test]]
+fn test_deref_ptr_field_assign() -> i32
+    var v8: u8 = 200
+    var v16: u16 = 40000
+    # Values chosen so a truncating (i8/i16) load or store is visible:
+    # 0x11223344 read as i8 is 0x44, and 0x44 + 1 stored back as i8 leaves
+    # the upper three bytes untouched -- the assert below catches both.
+    var v32: i32 = 287454020      # 0x11223344
+    var v64: i64 = 1234605616436508552  # 0x1122334455667788
+
+    var s: Slots
+    s.guard_before = 111
+    s.p8 = @v8
+    s.p16 = @v16
+    s.p32 = @v32
+    s.p64 = @v64
+    s.guard_after = 222
+
+    bump8(@s)
+    bump16(@s)
+    bump32(@s)
+    bump64(@s)
+
+    # Stored through the pointer, at the right width.
+    assert v8 == 201
+    assert v16 == 40001
+    assert v32 == 287454021
+    assert v64 == 1234605616436508553
+
+    # The pointer fields themselves must be untouched. This is what the
+    # miscompile broke: each `*s.pN = ...` wrote into s.pN instead.
+    assert s.p8 == @v8
+    assert s.p16 == @v16
+    assert s.p32 == @v32
+    assert s.p64 == @v64
+
+    # A too-wide store through a narrow pointer would land in a neighbour.
+    assert s.guard_before == 111
+    assert s.guard_after == 222
+    0
