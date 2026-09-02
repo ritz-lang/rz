@@ -119,16 +119,63 @@ is_interactive_example() {
 }
 
 # Get list of example directories with main.ritz
+#
+# Examples are NOT all at examples/<name>/ — the tier5_async corpus lives one
+# level deeper at examples/tier5_async/<name>/.  A `-maxdepth 1` walk (what
+# this used to do) saw 17 of 85 example dirs, and the 11 of those with a
+# src/main.ritz happened to be exactly the known-broken set.  Every stage
+# then skipped everything and the suite exited 0 having asserted nothing.
+# Walk the whole tree and let the src/main.ritz probe decide.
 get_examples() {
-    find "$EXAMPLES_DIR" -mindepth 1 -maxdepth 1 -type d | sort | while read dir; do
-        if [[ -f "$dir/src/main.ritz" ]]; then
-            echo "$dir"
-        fi
-    done
+    find "$EXAMPLES_DIR" -mindepth 1 -type f -path '*/src/main.ritz' \
+        -not -path '*/build/*' -printf '%h\n' | sed 's|/src$||' | sort -u
 }
 
-# Compile a .ritz file with a given compiler
-# Args: $1=compiler, $2=source, $3=output_binary
+# Examples ritz0 is known not to compile yet, one key per line (`#` comments
+# allowed).  These are reported and excluded rather than failing the suite —
+# but anything NOT on the list that fails to compile is a hard failure.
+#
+# Previously every ritz0 compile failure was a silent `skip`, so the suite
+# could not go red no matter how much broke.  The allowlist is the difference
+# between "we know about these" and "we assert nothing".
+# One file per compiler: ritz0 and ritz1 have genuinely different gaps, and a
+# shared list would let a ritz1 regression hide behind a ritz0 entry.
+# ritz1_selfhosted shares ritz1's list — if the two ever disagree, that is a
+# self-hosting fixed-point bug and must go red, never be allowlisted.
+known_failures_file() {
+    case "$1" in
+        ritz1|ritz1_selfhosted) echo "$SCRIPT_DIR/regression-known-failures-ritz1.txt" ;;
+        *)                      echo "$SCRIPT_DIR/regression-known-failures.txt" ;;
+    esac
+}
+
+# Args: $1=compiler, $2=example key
+is_known_failure() {
+    local f=$(known_failures_file "$1")
+    [[ -f "$f" ]] || return 1
+    grep -qxF "$2" <(sed 's/#.*//; s/[[:space:]]*$//; /^$/d' "$f")
+}
+
+# Stable, collision-free key for an example dir.  basename() is not unique
+# across tiers (and silently overwrote baselines when it collided), so key on
+# the path relative to examples/ with separators flattened.
+example_key() {
+    local rel="${1#$EXAMPLES_DIR/}"
+    echo "${rel//\//_}"
+}
+
+# Compile an example with a given compiler.
+#
+# Args: $1=compiler ("ritz0" | "ritz1" | "ritz1_selfhosted"), $2=source,
+#       $3=output_binary
+#
+# All three compilers go through build.py.  The old ritz1 path hand-rolled
+#     $compiler main.ritz -o out.ll && clang out.ll -o bin -nostdlib
+# which links neither the runtime `_start` shim nor any ritzlib object, so it
+# could only ever have worked for a single-file program with no imports.  In
+# practice every multi-module example failed to link and the handful that did
+# link segfaulted immediately for want of an entry point (exit 139).  That is
+# a property of the harness, not of ritz1 — measuring it told us nothing.
 compile_with() {
     local compiler="$1"
     local source="$2"
@@ -136,43 +183,43 @@ compile_with() {
     local example_dir=$(dirname $(dirname "$source"))
     local example_name=$(basename "$example_dir")
 
-    # Handle different compiler types
-    if [[ "$compiler" == "ritz0" ]]; then
-        # Use build.py for ritz0 - it handles separate compilation properly
-        if ! python3 "$ROOT_DIR/build.py" build "$example_name" >/dev/null 2>&1; then
+    {
+        # Clear the output dir first.  All three stages build into the same
+        # <pkg>/build/debug, so a stage-3 build failure would otherwise leave
+        # stage 1's ritz0-built binary sitting there for us to pick up and
+        # "verify" — a stale artifact masquerading as a ritz1 pass.  That is
+        # the same class of bug that made `make matrix-full` report a phantom
+        # failure on main and a phantom 0/50 on the 1269 branch.
+        rm -rf "$example_dir/build/debug"
+
+        # Build by *path*, not by basename.  Example dir names are not package
+        # names (and are not unique across tiers), so resolving by name picked
+        # the wrong package — or none — for the tier5_async corpus.
+        if ! python3 "$ROOT_DIR/build.py" build "$example_dir" \
+                --compiler "$compiler" >/dev/null 2>&1; then
             return 1
         fi
-        # Copy binary to expected location
-        # First try the directory name as binary name
-        local built_bin="$example_dir/$example_name"
-        if [[ -f "$built_bin" ]]; then
-            cp "$built_bin" "$output"
-        else
-            # Try reading [[bin]] name from ritz.toml (look in [[bin]] section)
-            local bin_name=$(awk '/^\[\[bin\]\]/{found=1} found && /^name\s*=/{gsub(/.*=\s*"|".*/, ""); print; exit}' "$example_dir/ritz.toml" 2>/dev/null)
-            if [[ -n "$bin_name" && -f "$example_dir/$bin_name" ]]; then
-                cp "$example_dir/$bin_name" "$output"
-            else
-                # Fallback: find any executable in example dir
-                local found_bin=$(find "$example_dir" -maxdepth 1 -type f -executable ! -name "*.sh" 2>/dev/null | head -1)
-                if [[ -n "$found_bin" ]]; then
-                    cp "$found_bin" "$output"
-                else
-                    return 1
-                fi
+        # build.py emits to <pkg>/build/debug/<bin>.  Locate that, and *only*
+        # that: the old fallback globbed any executable sitting in the example
+        # dir, which meant a stale committed binary could stand in for a build
+        # that never happened.
+        local bin_name=$(awk '/^\[\[bin\]\]/{found=1} found && /^name\s*=/{gsub(/.*=\s*"|".*/, ""); print; exit}' "$example_dir/ritz.toml" 2>/dev/null)
+        local built_bin=""
+        for cand in "$example_dir/build/debug/$bin_name" \
+                    "$example_dir/build/debug/$example_name"; do
+            if [[ -n "$bin_name$example_name" && -x "$cand" ]]; then
+                built_bin="$cand"
+                break
             fi
+        done
+        if [[ -z "$built_bin" ]]; then
+            built_bin=$(find "$example_dir/build/debug" -maxdepth 1 -type f -executable 2>/dev/null | head -1)
         fi
-    else
-        # ritz1 binary - use direct compilation
-        local ll_file="${output}.ll"
-        if ! "$compiler" "$source" -o "$ll_file" >/dev/null 2>&1; then
+        if [[ -z "$built_bin" ]]; then
             return 1
         fi
-        # Compile LLVM IR to binary
-        if ! clang "$ll_file" -o "$output" -nostdlib -g 2>/dev/null; then
-            return 1
-        fi
-    fi
+        cp "$built_bin" "$output"
+    }
 
     return 0
 }
@@ -273,19 +320,28 @@ run_stage1() {
     local skipped=0
 
     for example_dir in $(get_examples); do
-        local name=$(basename "$example_dir")
+        local name=$(example_key "$example_dir")
+        local base=$(basename "$example_dir")
         local src="$example_dir/src/main.ritz"
         local bin="$BUILD_DIR/stage1_$name"
 
         # Compile with ritz0
         if ! compile_with "ritz0" "$src" "$bin"; then
-            warn "$name: ritz0 compile failed"
-            skipped=$((skipped + 1))
+            if is_known_failure ritz0 "$name"; then
+                warn "$name: ritz0 compile failed (known, allowlisted)"
+                skipped=$((skipped + 1))
+            else
+                fail "$name: ritz0 compile failed"
+                failed=$((failed + 1))
+            fi
             continue
+        fi
+        if is_known_failure ritz0 "$name"; then
+            warn "$name: on the known-failure allowlist but COMPILES — remove it"
         fi
 
         # Handle interactive examples (need stdin/file args)
-        if is_interactive_example "$name"; then
+        if is_interactive_example "$base"; then
             # Try to use test.sh if available
             if run_test_script "$example_dir" "$bin"; then
                 success "$name (test.sh passed)"
@@ -329,7 +385,7 @@ run_stage2() {
     echo "----------------------------------------"
 
     local ritz1_dir="$ROOT_DIR/ritz1"
-    local ritz1_bin="$BUILD_DIR/ritz1"
+    local ritz1_bin="$ROOT_DIR/ritz1/build/ritz1"
 
     # Use the Makefile's approach
     cd "$ritz1_dir"
@@ -367,7 +423,7 @@ run_stage3() {
     log "STAGE 3: Compile examples with ritz1 & compare"
     echo "----------------------------------------"
 
-    local ritz1_bin="$BUILD_DIR/ritz1"
+    local ritz1_bin="$ROOT_DIR/ritz1/build/ritz1"
 
     if [[ ! -x "$ritz1_bin" ]]; then
         warn "ritz1 not available, skipping Stage 3"
@@ -380,7 +436,8 @@ run_stage3() {
     local skipped=0
 
     for example_dir in $(get_examples); do
-        local name=$(basename "$example_dir")
+        local name=$(example_key "$example_dir")
+        local base=$(basename "$example_dir")
         local src="$example_dir/src/main.ritz"
         local bin="$BUILD_DIR/stage3_$name"
 
@@ -392,14 +449,22 @@ run_stage3() {
         fi
 
         # Compile with ritz1
-        if ! compile_with "$ritz1_bin" "$src" "$bin" 2>/dev/null; then
-            fail "$name: ritz1 compile failed"
-            failed=$((failed + 1))
+        if ! compile_with "ritz1" "$src" "$bin" 2>/dev/null; then
+            if is_known_failure ritz1 "$name"; then
+                warn "$name: ritz1 compile failed (known, allowlisted)"
+                skipped=$((skipped + 1))
+            else
+                fail "$name: ritz1 compile failed"
+                failed=$((failed + 1))
+            fi
             continue
+        fi
+        if is_known_failure ritz1 "$name"; then
+            warn "$name: on the ritz1 allowlist but COMPILES — remove it"
         fi
 
         # Handle interactive examples via test.sh
-        if is_interactive_example "$name"; then
+        if is_interactive_example "$base"; then
             if run_test_script "$example_dir" "$bin"; then
                 success "$name (test.sh passed)"
                 passed=$((passed + 1))
@@ -444,14 +509,27 @@ run_stage4() {
     echo "----------------------------------------"
 
     local ritz1_dir="$ROOT_DIR/ritz1"
-    local ritz1_selfhosted="$BUILD_DIR/ritz1_selfhosted"
+    local ritz1_selfhosted="$ROOT_DIR/ritz1/build/ritz1_selfhosted"
 
     # Bootstrap ritz1 (ritz1 compiles itself)
     cd "$ritz1_dir"
 
     if make -s bootstrap BUILD_DIR="$BUILD_DIR" 2>/dev/null; then
         success "ritz1 self-hosted bootstrap complete"
-        cp "$BUILD_DIR/ritz1_selfhosted" "$ritz1_selfhosted" 2>/dev/null || true
+        # The bootstrap target ignores BUILD_DIR and always emits into
+        # ritz1/build/.  The old line here copied "$BUILD_DIR/ritz1_selfhosted"
+        # onto $ritz1_selfhosted — the same path — so cp errored, `|| true`
+        # swallowed it, and the -x check below always failed.  Stage 4 has
+        # therefore never run: it announced "bootstrap complete" and then
+        # skipped itself in the same breath.
+        local produced=""
+        for cand in "$ritz1_dir/build/ritz1_selfhosted" \
+                    "$BUILD_DIR/ritz1_selfhosted"; do
+            if [[ -x "$cand" ]]; then produced="$cand"; break; fi
+        done
+        if [[ -n "$produced" && "$produced" != "$ritz1_selfhosted" ]]; then
+            cp "$produced" "$ritz1_selfhosted"
+        fi
     else
         fail "ritz1 bootstrap failed"
         STAGE_RESULTS+=("Stage 4: FAILED - bootstrap error")
@@ -473,7 +551,8 @@ run_stage4() {
     local skipped=0
 
     for example_dir in $(get_examples); do
-        local name=$(basename "$example_dir")
+        local name=$(example_key "$example_dir")
+        local base=$(basename "$example_dir")
         local src="$example_dir/src/main.ritz"
         local bin="$BUILD_DIR/stage4_$name"
 
@@ -485,14 +564,22 @@ run_stage4() {
         fi
 
         # Compile with self-hosted ritz1
-        if ! compile_with "$ritz1_selfhosted" "$src" "$bin" 2>/dev/null; then
-            fail "$name: self-hosted ritz1 compile failed"
-            failed=$((failed + 1))
+        if ! compile_with "ritz1_selfhosted" "$src" "$bin" 2>/dev/null; then
+            if is_known_failure ritz1_selfhosted "$name"; then
+                warn "$name: self-hosted ritz1 compile failed (known, allowlisted)"
+                skipped=$((skipped + 1))
+            else
+                fail "$name: self-hosted ritz1 compile failed"
+                failed=$((failed + 1))
+            fi
             continue
+        fi
+        if is_known_failure ritz1_selfhosted "$name"; then
+            warn "$name: on the ritz1_selfhosted allowlist but COMPILES — remove it"
         fi
 
         # Handle interactive examples via test.sh
-        if is_interactive_example "$name"; then
+        if is_interactive_example "$base"; then
             if run_test_script "$example_dir" "$bin"; then
                 success "$name (test.sh passed)"
                 passed=$((passed + 1))
