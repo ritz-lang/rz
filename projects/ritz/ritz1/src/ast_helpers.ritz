@@ -30,6 +30,9 @@ pub fn get_fn_count() -> i32
     g_fn_count
 
 pub fn module_new(p: *Parser) -> *Module
+    # One module_new per file parsed, so this is the per-parse reset point
+    # for the dropped-item counter checked by module_require_eof.
+    parser_reset_diagnostics()
     let m: *Module = parser_alloc(p, 56) as *Module  # Increased for impls field
     m.imports = null
     m.constants = null
@@ -138,6 +141,130 @@ pub fn item_dispatch_global(p: *Parser, g: *GlobalVarDef) -> i32
 pub fn item_dispatch_enum(p: *Parser) -> i32
     # enum has no AST node yet; just reset skip flag and report progress.
     p.skip_item = 0
+    return 1
+
+# =============================================================================
+# Top-level parse termination check (AGAST #1301)
+# =============================================================================
+#
+# `item*` in the module rule stops at the first item it cannot parse.  That
+# stop is silent by construction: "no more items" and "this item is
+# unparseable" look identical to the generated star-loop.  Before this
+# check, the consequence was a module containing only the items before the
+# failure, emitted as IR with a zero exit status — a genuine parser gap
+# reported as an undefined symbol at link time, or (if nothing referenced
+# the dropped function) as a silently wrong binary with no error at all.
+#
+# module_require_eof runs after item* and asserts the whole token stream was
+# consumed.  If it wasn't, it reports file:line:col plus the leading tokens
+# of the offending construct and sets p.error, which makes parse_module
+# return null and the driver exit non-zero *before* any artifact is written.
+#
+# Fail loudly.  Partial output is strictly worse than a hard error.
+
+# Path of the file currently being parsed, for diagnostics.  Set by the
+# driver (main.ritz) before each parse; null renders as "<input>".
+var g_parse_file: *u8
+
+# Count of top-level items the anchor-skip recovery had to throw away for
+# the module currently being parsed.  Reset by module_new (i.e. once per
+# file), checked by module_require_eof.  Non-zero ⇒ hard parse failure.
+var g_dropped_items: i32 = 0
+
+pub fn parser_set_source_file(path: *u8)
+    g_parse_file = path
+
+pub fn parser_reset_diagnostics()
+    g_dropped_items = 0
+
+pub fn parser_dropped_items() -> i32
+    g_dropped_items
+
+# Write a token's raw lexeme (not NUL-terminated) to stderr.
+fn eprint_lexeme(start: *u8, len: i32)
+    if start == null
+        return
+    var i: i32 = 0
+    while i < len
+        eprint_char(*(start + i))
+        i = i + 1
+
+# Print "<file>:<line>:<col>: " for the token at p.pos.
+fn eprint_parse_location(p: *Parser)
+    if g_parse_file != null
+        eprints_cstr(g_parse_file)
+    else
+        eprints_cstr(c"<input>")
+    eprint_char(':')
+    if p.pos < p.token_count
+        let tok: *Token = p.tokens + p.pos
+        eprint_i64(tok.line as i64)
+        eprint_char(':')
+        eprint_i64(tok.col as i64)
+    else
+        eprints_cstr(c"0:0")
+    eprints_cstr(c": ")
+
+# Print the leading tokens of the construct at p.pos: the first token's
+# lexeme plus, when it is followed by an identifier, that identifier — so
+# `fn nested(...)` reports as `fn nested` rather than a bare `fn`.
+fn eprint_construct(p: *Parser)
+    if p.pos >= p.token_count
+        eprints_cstr(c"<end of file>")
+        return
+    let tok: *Token = p.tokens + p.pos
+    eprint_lexeme(tok.start, tok.len)
+    if p.pos + 1 < p.token_count
+        let nxt: *Token = p.tokens + (p.pos + 1)
+        if nxt.kind == TOK_IDENT
+            eprint_char(' ')
+            eprint_lexeme(nxt.start, nxt.len)
+
+# Called by the generated anchor-skip recovery in parse_item BEFORE it
+# skips the construct it could not parse.  p.pos is still at the first
+# token of that construct (every failed alternative rewinds to start_pos).
+#
+# The skip itself is fine — it lets us report every bad item in one run —
+# but it must not be silent, and it must not leave the parse "successful".
+# Recording the drop here is what turns a vanished function into a
+# compile-time error instead of a link-time mystery (AGAST #1301).
+pub fn parser_report_dropped_item(p: *Parser) -> i32
+    g_dropped_items = g_dropped_items + 1
+    eprints_cstr(c"error: ")
+    eprint_parse_location(p)
+    eprints_cstr(c"cannot parse item starting at '")
+    eprint_construct(p)
+    eprintln_cstr(c"'")
+    return 1
+
+pub fn module_require_eof(p: *Parser) -> i32
+    # Any item the recovery skipped is a dropped top-level definition.
+    if g_dropped_items > 0
+        eprints_cstr(c"error: ")
+        if g_parse_file != null
+            eprints_cstr(g_parse_file)
+        else
+            eprints_cstr(c"<input>")
+        eprints_cstr(c": ")
+        eprint_i64(g_dropped_items as i64)
+        eprintln_cstr(c" top-level item(s) failed to parse; refusing to emit a partial module")
+        p.error = 1
+        return 1
+
+    if p.pos >= p.token_count
+        return 0
+    let tok: *Token = p.tokens + p.pos
+    if tok.kind == TOK_EOF
+        return 0
+
+    # Unconsumed tokens remain: item* stopped early without recovering.
+    eprints_cstr(c"error: ")
+    eprint_parse_location(p)
+    eprints_cstr(c"cannot parse top-level item starting at '")
+    eprint_construct(p)
+    eprintln_cstr(c"'")
+    eprintln_cstr(c"note: the rest of the file was not parsed; refusing to emit a partial module")
+    p.error = 1
     return 1
 
 pub fn module_add_struct(m: *Module, s: *StructDef)

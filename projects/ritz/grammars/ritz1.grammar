@@ -151,12 +151,26 @@ item = FN PUB IMPL STRUCT CONST IMPORT EXTERN ENUM ;
 
 # Module is the top-level AST node
 # Note: module_init creates p.module FIRST, then item* can add to it
+#
+# module_end is NOT decoration.  `item*` stops at the first item it cannot
+# parse and, on its own, that failure is indistinguishable from "no more
+# items" — the parser would return a module missing every item from the
+# failure point on, and the driver would happily emit IR for it (AGAST
+# #1301: functions silently vanished, surfacing as undefined symbols at
+# link time, or as a wrong binary with no error at all).  module_end
+# asserts the token stream was actually consumed to EOF and raises a hard,
+# located parse error otherwise.
 module -> *Module
-    : module_init item* { p.module }
+    : module_init item* module_end { p.module }
     ;
 
 module_init -> *Module
     : { module_new(p) }
+    ;
+
+# Assert item* consumed everything; hard-fail with file:line:col otherwise.
+module_end -> i32
+    : { module_require_eof(p) }
     ;
 
 # Attributes: [[name = "value"]] or [[name]]
@@ -201,9 +215,14 @@ enum_def -> i32
       { enum_def_skip(p) }
     ;
 
+# Longest alternative FIRST: alternatives are tried in order and the caller
+# does not backtrack into this rule, so a leading bare `IDENT` alternative
+# would match `Option` in `enum Option<T>`, leave `<` unconsumed and sink
+# the whole enum_def.  That is how ritzlib's `enum Option<T>` / `enum
+# Result<T, E>` came to be dropped (silently, until AGAST #1301).
 enum_def_header -> i32
-    : IDENT { enum_def_start(p, $1.start, $1.len) }
-    | IDENT generic_params { enum_def_start(p, $1.start, $1.len) }
+    : IDENT generic_params { enum_def_start(p, $1.start, $1.len) }
+    | IDENT { enum_def_start(p, $1.start, $1.len) }
     ;
 
 enum_variants -> i32
@@ -248,6 +267,13 @@ param -> *Param
     # (...)` extern instead of a real definition.
     : SELF COLON type_spec { param_self(p, $1.start, $1.len, $1.line, $1.col) }
     | SELF { param_self(p, $1.start, $1.len, $1.line, $1.col) }
+    # `name:& T` — mutable-borrow parameter (ritz0's COLON_AMP form).  ritz1
+    # lexes it as COLON AMP, and the type is the same TYPE_MUT_REF that `@&T`
+    # produces, so it lowers identically.  Listed before the plain
+    # `IDENT COLON type_spec` alternative because that one cannot start with
+    # AMP.  Missing this alternative is why ritzlib's strview_split_once was
+    # silently dropped from every ritz1 build (AGAST #1301).
+    | IDENT COLON AMP type_spec { param_new(p, $1.start, $1.len, type_mut_ref(p, $4), $1.line, $1.col) }
     | IDENT COLON type_spec { param_new(p, $1.start, $1.len, $3, $1.line, $1.col) }
     ;
 

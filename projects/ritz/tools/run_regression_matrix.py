@@ -56,10 +56,12 @@ TESTS = [
     # argument lists with `>>`) is deliberately NOT listed here yet. The fix is
     # ritz0-only: ritz0 splits a `>>`/`>=` token in type-argument context, but
     # ritz1's parser is generated from grammars/ritz1.grammar and has no such
-    # rule. Worse, ritz1 does not even report an error -- it silently drops
-    # every function whose body or signature mentions `Vec<Vec<i64>>` and exits
-    # 0, so the harness fails at link time with an undefined symbol. That is a
-    # pre-existing ritz1 gap, not a regression from #1299. Add this entry once
+    # rule, so any function whose body or signature mentions `Vec<Vec<i64>>`
+    # fails to parse under ritz1. As of AGAST #1301 that failure is at least
+    # loud: ritz1 reports `file:line:col: cannot parse item ...` and exits
+    # non-zero instead of silently dropping the function and emitting a module
+    # without it (which used to surface as an undefined symbol at link time).
+    # That is a pre-existing ritz1 gap, not a regression from #1299. Add this entry once
     # ritz1 gains `>>` splitting; until then the case is covered by
     # `ritz0.py --test` and the parser unit tests
     # (test_parser.py::TestNestedGenericClose). Same precedent as #1282.

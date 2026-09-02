@@ -501,8 +501,13 @@ class RitzGenerator:
         if recovery_tokens:
             recovery_ret = '1' if rt == 'i32' else default_ret
             self._emit('')
-            self._emit('    # Recovery: skip to next anchor token, report progress.')
-            self._emit('    if p.pos < p.token_count')
+            self._emit('    # Recovery: report the failure, skip to the next anchor token,')
+            self._emit('    # then report progress so the enclosing loop keeps going.')
+            self._emit('    # parser_report_dropped_item records the drop; the rule that')
+            self._emit('    # closes the enclosing loop turns it into a hard parse error, so')
+            self._emit('    # skipped input can never yield a silently partial parse tree.')
+            self._emit('    if p.pos < p.token_count and p_peek(p) != TOK_EOF')
+            self._emit('        parser_report_dropped_item(p)')
             self._emit('        p.pos = p.pos + 1')
             self._emit('        while p.pos < p.token_count')
             self._emit('            let t: Token = p_current_token(p)')
