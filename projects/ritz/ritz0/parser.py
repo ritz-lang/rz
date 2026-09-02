@@ -1942,7 +1942,9 @@ class Parser:
             var_span = self._current().span
             var_name = self._expect(TokenType.IDENT)
             var_fields = []
+            var_field_names = []
             if self._at(TokenType.LPAREN):
+                # Tuple variant: Reload(i32), SetViewport(u32, u32)
                 self._advance()
                 if not self._at(TokenType.RPAREN):
                     var_fields.append(self.parse_type())
@@ -1952,7 +1954,53 @@ class Parser:
                             break
                         var_fields.append(self.parse_type())
                 self._expect(TokenType.RPAREN)
-            variants.append(rast.Variant(var_span, var_name.value, var_fields))
+                self._skip_newlines()
+            else:
+                # Either a bare variant (Stop) or a struct variant, which is a
+                # bare name followed by an indented block of `name: Type`
+                # fields -- lexically the same shape as a struct body:
+                #
+                #     SetViewport
+                #         width: u32
+                #         height: u32
+                #
+                # The field names are recorded alongside the positional types;
+                # the payload layout is identical to the equivalent tuple
+                # variant. See docs/ENUM_VARIANTS.md.
+                self._skip_newlines()
+                if self._at(TokenType.INDENT):
+                    self._advance()
+                    while not self._at(TokenType.DEDENT, TokenType.EOF):
+                        field_name = self._expect(TokenType.IDENT)
+                        if not self._at(TokenType.COLON):
+                            raise ParseError(
+                                f"Expected ':' after field name "
+                                f"'{field_name.value}' in enum variant "
+                                f"'{var_name.value}'",
+                                field_name.span)
+                        self._advance()
+                        var_fields.append(self.parse_type())
+                        var_field_names.append(field_name.value)
+                        self._skip_newlines()
+                    if self._at(TokenType.DEDENT):
+                        self._advance()
+
+                    if not var_fields:
+                        raise ParseError(
+                            f"Enum variant '{var_name.value}' has an empty "
+                            f"field block; omit the block for a bare variant",
+                            var_span)
+
+                    dupes = [n for n in set(var_field_names)
+                             if var_field_names.count(n) > 1]
+                    if dupes:
+                        raise ParseError(
+                            f"Duplicate field '{sorted(dupes)[0]}' in enum "
+                            f"variant '{var_name.value}'",
+                            var_span)
+
+            variants.append(rast.Variant(var_span, var_name.value, var_fields,
+                                         field_names=var_field_names))
             self._skip_newlines()  # Skip newlines after enum variant
 
         if self._at(TokenType.DEDENT):

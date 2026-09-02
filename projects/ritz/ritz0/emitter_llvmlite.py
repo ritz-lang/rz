@@ -1914,11 +1914,9 @@ class LLVMEmitter:
         max_size = 0
         max_align = 1
         for variant in variants:
-            variant_size = 0
-            for field_type in variant.fields:
-                size, align = self._ritz_type_size_and_align(field_type)
-                variant_size += size
-                max_align = max(max_align, align)
+            _, variant_size, variant_align = \
+                self._enum_variant_field_layout(variant)
+            max_align = max(max_align, variant_align)
             if variant_size > max_size:
                 max_size = variant_size
 
@@ -1942,6 +1940,47 @@ class LLVMEmitter:
         else:
             # All unit variants - just a tag
             enum_type.set_body(self.i8)
+
+    def _enum_variant_field_layout(self, variant):
+        """Compute payload field offsets for one enum variant.
+
+        Returns (offsets, size, align):
+          offsets -- byte offset of each field within the payload buffer,
+                     in declaration order
+          size    -- total payload size for this variant, rounded up to its
+                     own alignment
+          align   -- the strictest alignment any of its fields requires
+
+        Fields are placed in declaration order, each rounded up to its own
+        alignment. The interior padding is not optional: the emitter bitcasts
+        the payload buffer to a typed pointer and loads through it, so LLVM
+        assumes natural alignment. Laying `message: String` (align 8) directly
+        after `level: i32` at offset 4 produces a misaligned load, which is
+        undefined behaviour rather than merely slow.
+
+        This is the single source of truth for payload offsets. Enum layout,
+        variant construction and match binding all call it, so they cannot
+        drift apart -- a divergence there reads fields from the wrong address
+        without any diagnostic.
+        """
+        offsets = []
+        offset = 0
+        max_align = 1
+        for field_type in variant.fields:
+            size, align = self._ritz_type_size_and_align(field_type)
+            align = max(align, 1)
+            if offset % align != 0:
+                offset += align - (offset % align)
+            offsets.append(offset)
+            offset += size
+            max_align = max(max_align, align)
+
+        # Round the variant's total size up to its own alignment so that the
+        # enum's data buffer is large enough for a correctly padded payload.
+        if offset % max_align != 0:
+            offset += max_align - (offset % max_align)
+
+        return offsets, offset, max_align
 
     def _get_enum_data_index(self, enum_name: str) -> int:
         """Get the struct index of the data buffer in an enum.
@@ -2053,8 +2092,10 @@ class LLVMEmitter:
             data_index = self._get_enum_data_index(enum_name)
             data_ptr = self.builder.gep(enum_alloca, [ir.Constant(self.i32, 0), ir.Constant(self.i32, data_index)])
 
-            # For each field in the variant, store the corresponding arg
-            offset = 0
+            # For each field in the variant, store the corresponding arg.
+            # Offsets come from the shared layout helper so that construction
+            # and match binding agree on where each field lives.
+            field_offsets, _, _ = self._enum_variant_field_layout(variant)
             for i, (field_type, arg) in enumerate(zip(variant.fields, args)):
                 # The payload's declared type is the expected type of the
                 # argument (so e.g. a `[u8]` payload asks a Vec range-index for
@@ -2086,13 +2127,21 @@ class LLVMEmitter:
                 if arg_val.type != llvm_field_type and llvm_field_type == self.i8:
                     llvm_field_type = arg_val.type
 
-                # Cast data buffer to pointer to field type
+                # Cast data buffer to pointer to field type.
+                # data_ptr has type [N x i8]* -- a *pointer to array* -- so the
+                # GEP needs two indices: the first (0) steps through the
+                # pointer, the second selects the byte within the array. A
+                # single index strides by whole [N x i8] arrays instead of by
+                # bytes, so every field past the first was written N*offset
+                # bytes away, outside the enum, silently corrupting the stack.
+                # Must stay in lockstep with the match binding in
+                # _emit_enum_match.
                 field_ptr = self.builder.bitcast(
-                    self.builder.gep(data_ptr, [ir.Constant(self.i32, offset)]),
+                    self.builder.gep(data_ptr, [ir.Constant(self.i32, 0),
+                                                ir.Constant(self.i32, field_offsets[i])]),
                     ir.PointerType(llvm_field_type)
                 )
                 self.builder.store(arg_val, field_ptr)
-                offset += self._type_size_bytes(llvm_field_type)
 
         # Load and return the enum value
         return self.builder.load(enum_alloca)
@@ -2178,8 +2227,10 @@ class LLVMEmitter:
             data_index = self._get_enum_data_index(enum_name)
             data_ptr = self.builder.gep(enum_alloca, [ir.Constant(self.i32, 0), ir.Constant(self.i32, data_index)])
 
-            # For each field in the variant, store the corresponding arg
-            offset = 0
+            # For each field in the variant, store the corresponding arg.
+            # Offsets come from the shared layout helper so that construction
+            # and match binding agree on where each field lives.
+            field_offsets, _, _ = self._enum_variant_field_layout(variant)
             for i, (field_type, arg) in enumerate(zip(variant.fields, args)):
                 # The payload's declared type is the expected type of the
                 # argument (so e.g. a `[u8]` payload asks a Vec range-index for
@@ -2211,13 +2262,21 @@ class LLVMEmitter:
                 if arg_val.type != llvm_field_type and llvm_field_type == self.i8:
                     llvm_field_type = arg_val.type
 
-                # Cast data buffer to pointer to field type
+                # Cast data buffer to pointer to field type.
+                # data_ptr has type [N x i8]* -- a *pointer to array* -- so the
+                # GEP needs two indices: the first (0) steps through the
+                # pointer, the second selects the byte within the array. A
+                # single index strides by whole [N x i8] arrays instead of by
+                # bytes, so every field past the first was written N*offset
+                # bytes away, outside the enum, silently corrupting the stack.
+                # Must stay in lockstep with the match binding in
+                # _emit_enum_match.
                 field_ptr = self.builder.bitcast(
-                    self.builder.gep(data_ptr, [ir.Constant(self.i32, offset)]),
+                    self.builder.gep(data_ptr, [ir.Constant(self.i32, 0),
+                                                ir.Constant(self.i32, field_offsets[i])]),
                     ir.PointerType(llvm_field_type)
                 )
                 self.builder.store(arg_val, field_ptr)
-                offset += self._type_size_bytes(llvm_field_type)
 
         # Load and return the enum value
         return self.builder.load(enum_alloca)
@@ -9465,14 +9524,21 @@ class LLVMEmitter:
                 data_index = self._get_enum_data_index(enum_name)
                 data_ptr = self.builder.gep(enum_alloca, [ir.Constant(self.i32, 0), ir.Constant(self.i32, data_index)])
 
-                # Extract and bind each field
-                offset = 0
+                # Extract and bind each field. Offsets come from the shared
+                # layout helper, the same one the constructor uses.
+                field_offsets, _, _ = self._enum_variant_field_layout(variant)
                 for j, (field_pattern, field_type) in enumerate(zip(pattern.fields, variant.fields)):
                     llvm_field_type = self._ritz_type_to_llvm(field_type)
 
-                    # Cast data buffer to pointer to field type at offset
+                    # Cast data buffer to pointer to field type at offset.
+                    # data_ptr is [N x i8]* (pointer to array), so the GEP needs
+                    # two indices -- 0 to step through the pointer, then the
+                    # byte offset within the array. A single index strides by
+                    # whole arrays and reads past the end of the enum. Must
+                    # stay in lockstep with _emit_enum_variant_constructor.
                     field_ptr = self.builder.bitcast(
-                        self.builder.gep(data_ptr, [ir.Constant(self.i32, offset)]),
+                        self.builder.gep(data_ptr, [ir.Constant(self.i32, 0),
+                                                    ir.Constant(self.i32, field_offsets[j])]),
                         ir.PointerType(llvm_field_type)
                     )
                     field_val = self.builder.load(field_ptr)
@@ -9484,8 +9550,6 @@ class LLVMEmitter:
                         # Also store the Ritz type for field access on reference types
                         self.ritz_types[field_pattern.name] = field_type
                     # Wildcard patterns just discard the value
-
-                    offset += self._type_size_bytes(llvm_field_type)
 
             # Emit the arm body
             arm_val = self._emit_expr(arm.body)

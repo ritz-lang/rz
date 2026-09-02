@@ -1,0 +1,170 @@
+# Struct-style enum variants (AGAST #1282)
+#
+# A variant may declare its payload as an indented block of `name: Type`
+# fields instead of a positional tuple. Named fields are sugar: the tag and
+# payload layout are identical to the equivalent tuple variant, so a struct
+# variant can still be matched positionally.
+#
+# These cases also cover multi-field payloads generally, which were silently
+# miscompiled before #1282 -- the payload buffer GEP used a single index on a
+# `[N x i8]*`, striding by whole arrays instead of bytes, so every field after
+# the first landed outside the enum. Single-field variants (all ritzlib used)
+# masked it because offset 0 is correct either way.
+#
+# See docs/ENUM_VARIANTS.md.
+
+enum Msg
+    # Bare variant - no payload
+    Stop
+
+    # Tuple variant - positional payload
+    Reload(i32)
+
+    # Struct variant - single named field
+    Navigate
+        url: u64
+
+    # Struct variant - two named fields
+    SetViewport
+        width: u32
+        height: u32
+
+    # Struct variant - four named fields
+    MouseButton
+        x: i32
+        y: i32
+        button: i32
+        pressed: i32
+
+# Mixed field widths: `tail` needs 8-byte alignment but follows a 1-byte and
+# a 4-byte field, so it only lands correctly if interior alignment padding is
+# applied to the payload offsets.
+enum Mixed
+    Packed
+        flag: u8
+        count: i32
+        tail: u64
+    None2
+
+# A struct variant inside a generic enum: field names must survive
+# monomorphization along with the substituted payload types.
+enum Slot<T>
+    Filled
+        value: T
+        version: u32
+    Empty
+
+
+[[test]]
+fn test_struct_variant_single_field() -> i32
+    let m = Navigate(4242)
+    var got: u64 = 0
+    match m
+        Stop => got = 1
+        Reload(r) => got = 2
+        Navigate(u) => got = u
+        SetViewport(w, h) => got = 3
+        MouseButton(a, b, c, d) => got = 4
+    assert got == 4242
+    0
+
+
+[[test]]
+fn test_struct_variant_two_fields() -> i32
+    let m = SetViewport(640, 480)
+    var w2: u32 = 0
+    var h2: u32 = 0
+    match m
+        Stop => w2 = 1
+        Reload(r) => w2 = 2
+        Navigate(u) => w2 = 3
+        SetViewport(w, h) =>
+            w2 = w
+            h2 = h
+        MouseButton(a, b, c, d) => w2 = 4
+    assert w2 == 640
+    assert h2 == 480
+    0
+
+
+[[test]]
+fn test_struct_variant_four_fields() -> i32
+    let m = MouseButton(11, 22, 33, 1)
+    var sum: i32 = 0
+    var last: i32 = 0
+    match m
+        Stop => sum = 1
+        Reload(r) => sum = 2
+        Navigate(u) => sum = 3
+        SetViewport(w, h) => sum = 4
+        MouseButton(x, y, button, pressed) =>
+            sum = x + y + button
+            last = pressed
+    assert sum == 66
+    assert last == 1
+    0
+
+
+[[test]]
+fn test_tuple_and_bare_variants_still_work() -> i32
+    # Struct and tuple variants coexist in the same enum.
+    let a = Reload(9)
+    var got: i32 = 0
+    match a
+        Stop => got = 1
+        Reload(r) => got = r
+        Navigate(u) => got = 2
+        SetViewport(w, h) => got = 3
+        MouseButton(x, y, b, p) => got = 4
+    assert got == 9
+
+    let b = Stop
+    var got2: i32 = 0
+    match b
+        Stop => got2 = 77
+        Reload(r) => got2 = 1
+        Navigate(u) => got2 = 2
+        SetViewport(w, h) => got2 = 3
+        MouseButton(x, y, bb, p) => got2 = 4
+    assert got2 == 77
+    0
+
+
+[[test]]
+fn test_mixed_width_field_alignment() -> i32
+    let m = Packed(1, 100000, 9000000000)
+    var f: u8 = 0
+    var c: i32 = 0
+    var t: u64 = 0
+    match m
+        Packed(flag, count, tail) =>
+            f = flag
+            c = count
+            t = tail
+        None2 => c = -1
+    assert f == 1
+    assert c == 100000
+    assert t == 9000000000
+    0
+
+
+[[test]]
+fn test_struct_variant_in_generic_enum() -> i32
+    let s: Slot<i32> = Filled(77, 3)
+    var v: i32 = 0
+    var ver: u32 = 0
+    match s
+        Filled(value, version) =>
+            v = value
+            ver = version
+        Empty => v = -1
+    assert v == 77
+    assert ver == 3
+
+    let e: Slot<i32> = Empty
+    var v2: i32 = 0
+    match e
+        Filled(value, version) => v2 = value
+        Empty => v2 = 5
+    assert v2 == 5
+    0

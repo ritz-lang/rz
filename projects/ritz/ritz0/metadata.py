@@ -244,7 +244,12 @@ def extract_metadata(module: rast.Module, source_path: str) -> ModuleMetadata:
 
         elif isinstance(item, rast.EnumDef):
             variants = [
-                {"name": v.name, "fields": [type_to_string(f) for f in v.fields]}
+                # `field_names` is emitted only for struct-style variants, so
+                # metadata written before this feature stays readable and
+                # round-trips to an equivalent tuple variant.
+                {"name": v.name,
+                 "fields": [type_to_string(f) for f in v.fields],
+                 **({"field_names": list(v.field_names)} if v.field_names else {})}
                 for v in item.variants
             ]
             enums.append(EnumMeta(

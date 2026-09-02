@@ -14,6 +14,7 @@ A systems programming language that compiles to native code via LLVM. No runtime
 6. [Pointers](#6-pointers)
 7. [Arrays](#7-arrays)
 8. [Structs](#8-structs)
+8a. [Enums](#8a-enums)
 9. [Type Casting](#9-type-casting)
 10. [Syscalls](#10-syscalls)
 11. [Memory Management](#11-memory-management)
@@ -352,6 +353,103 @@ struct Rectangle
     width: i32
     height: i32
 ```
+
+---
+
+## 8a. Enums
+
+An enum is a tagged union: a value is exactly one of its variants, and the
+compiler tracks which one.
+
+### Bare Variants
+
+The simplest enums are C-style — variants with no payload:
+
+```ritz
+pub enum Color
+    Red
+    Green
+    Blue
+```
+
+### Variants With a Payload
+
+A variant can carry data. Write the payload positionally, as a tuple:
+
+```ritz
+enum Shape
+    Circle(f64)
+    Rect(f64, f64)
+    Empty
+```
+
+...or with named fields, as an indented block. This is usually clearer once a
+variant has more than two fields:
+
+```ritz
+pub enum Msg
+    Stop
+
+    Navigate
+        url: String
+
+    SetViewport
+        width: u32
+        height: u32
+```
+
+Named fields are **sugar**: `SetViewport` above has exactly the same tag and
+memory layout as `SetViewport(u32, u32)` would. Field order is therefore
+significant — reordering fields changes the layout, just as it does in a
+`struct`.
+
+### Matching
+
+Use `match` to inspect a value and bind its payload. Fields bind positionally,
+for tuple and struct variants alike:
+
+```ritz
+match msg
+    Stop => stop_loading(renderer)
+    Navigate(url) => start_navigation(renderer, @url)
+    SetViewport(width, height) => set_viewport(renderer, width, height)
+```
+
+Use `_` to ignore a field you do not need:
+
+```ritz
+match shape
+    Rect(w, _) => w
+    Circle(r) => r
+    Empty => 0.0
+```
+
+### Generic Enums
+
+Enums can take type parameters. `Option` and `Result` from ritzlib are ordinary
+generic enums:
+
+```ritz
+enum Option<T>
+    Some(T)
+    None
+
+enum Result<T, E>
+    Ok(T)
+    Err(E)
+```
+
+### Qualifying a Variant
+
+When a variant name is ambiguous, qualify it with its enum:
+
+```ritz
+let c = Color.Red
+let s = Shape.Rect(3.0, 4.0)
+```
+
+For the full specification — memory layout, pattern-matching rules, and the
+design rationale — see `docs/ENUM_VARIANTS.md`.
 
 ---
 

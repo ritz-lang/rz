@@ -936,9 +936,36 @@ class EnumDef(Item):
 
 @dataclass
 class Variant(Node):
-    """Enum variant."""
+    """Enum variant.
+
+    Covers all three declaration forms. `fields` is always the positional
+    payload; the form only affects how it was written:
+
+        Stop                    -> fields=[],            field_names=[]
+        Reload(i32)             -> fields=[i32],         field_names=[]
+        SetViewport             -> fields=[u32, u32],    field_names=['width',
+            width: u32                                                'height']
+            height: u32
+
+    Field names are sugar: a struct-style variant has exactly the same tag and
+    payload layout as the tuple variant with the same field types, so it can
+    still be matched positionally. See docs/ENUM_VARIANTS.md.
+    """
     name: str
     fields: List[Type]  # empty for unit variants
+    # Parallel to `fields` for struct-style variants; empty for bare and
+    # tuple variants. When non-empty, len(field_names) == len(fields).
+    field_names: List[str] = field(default_factory=list)
+
+    def is_struct_variant(self) -> bool:
+        """True if this variant was declared with named fields."""
+        return bool(self.field_names)
+
+    def field_index(self, name: str) -> int:
+        """Index of a named field, or -1 if this variant has no such field."""
+        if name in self.field_names:
+            return self.field_names.index(name)
+        return -1
 
 
 @dataclass

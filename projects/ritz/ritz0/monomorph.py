@@ -906,7 +906,10 @@ class Monomorphizer:
         new_variants = []
         for variant in generic_def.variants:
             new_fields = [subst.apply(field_type) for field_type in variant.fields]
-            new_variants.append(rast.Variant(variant.span, variant.name, new_fields))
+            # Field names are independent of the type substitution, so
+            # they carry through specialization unchanged.
+            new_variants.append(rast.Variant(variant.span, variant.name, new_fields,
+                                             field_names=list(variant.field_names)))
 
         return rast.EnumDef(
             generic_def.span,
@@ -1231,7 +1234,10 @@ class Monomorphizer:
         new_variants = []
         for variant in enum.variants:
             new_fields = [self._rewrite_type(field_type) for field_type in variant.fields]
-            new_variants.append(rast.Variant(variant.span, variant.name, new_fields))
+            # Field names are independent of the type substitution, so
+            # they carry through specialization unchanged.
+            new_variants.append(rast.Variant(variant.span, variant.name, new_fields,
+                                             field_names=list(variant.field_names)))
 
         new_enum = rast.EnumDef(enum.span, enum.name, new_variants,
                                 type_params=enum.type_params)

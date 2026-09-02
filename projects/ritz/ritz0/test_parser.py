@@ -346,6 +346,53 @@ class TestItems:
         assert e.variants[1].name == "None"
         assert len(e.variants[1].fields) == 0
 
+    def test_struct_variant_single_field(self):
+        # AGAST #1282: a variant's payload may be an indented block of
+        # `name: Type` fields instead of a positional tuple.
+        mod = parse("enum Msg\n  Navigate\n    url: u64\n  Stop")
+        e = mod.items[0]
+        assert isinstance(e, rast.EnumDef)
+        assert [v.name for v in e.variants] == ["Navigate", "Stop"]
+        nav = e.variants[0]
+        assert nav.is_struct_variant()
+        assert nav.field_names == ["url"]
+        assert len(nav.fields) == 1
+        # The bare variant that follows is unaffected.
+        assert e.variants[1].fields == []
+        assert not e.variants[1].is_struct_variant()
+
+    def test_struct_variant_multi_field(self):
+        mod = parse("enum Msg\n  SetViewport\n    width: u32\n    height: u32")
+        v = mod.items[0].variants[0]
+        assert v.field_names == ["width", "height"]
+        assert len(v.fields) == 2
+        assert v.field_index("height") == 1
+        assert v.field_index("nope") == -1
+
+    def test_struct_and_tuple_variants_in_one_enum(self):
+        mod = parse("enum Msg\n  Stop\n  Reload(i32)\n  Nav\n    url: u64\n")
+        e = mod.items[0]
+        assert [v.name for v in e.variants] == ["Stop", "Reload", "Nav"]
+        # Tuple variants carry no names; struct variants do.
+        assert e.variants[1].field_names == []
+        assert e.variants[1].is_struct_variant() is False
+        assert e.variants[2].field_names == ["url"]
+
+    def test_struct_variant_in_generic_enum(self):
+        mod = parse("enum Slot<T>\n  Filled\n    value: T\n    version: u32\n  Empty")
+        e = mod.items[0]
+        assert e.type_params == ['T']
+        assert e.variants[0].field_names == ["value", "version"]
+        assert len(e.variants[0].fields) == 2
+
+    def test_struct_variant_missing_colon_is_error(self):
+        with pytest.raises(ParseError):
+            parse("enum Msg\n  Navigate\n    url u64\n")
+
+    def test_struct_variant_duplicate_field_is_error(self):
+        with pytest.raises(ParseError):
+            parse("enum Msg\n  Navigate\n    url: u64\n    url: u32\n")
+
     def test_generic_enum_result(self):
         mod = parse("enum Result<T, E>\n  Ok(T)\n  Err(E)")
         e = mod.items[0]

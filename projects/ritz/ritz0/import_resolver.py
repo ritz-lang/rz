@@ -1052,7 +1052,10 @@ class ImportResolver:
             variants = []
             for v in enum_meta.variants:
                 variant_fields = [parse_type_string(f) for f in v['fields']]
-                variants.append(rast.Variant(dummy_span, v['name'], variant_fields))
+                # Absent for bare/tuple variants and for metadata written
+                # before struct variants existed.
+                variants.append(rast.Variant(dummy_span, v['name'], variant_fields,
+                                             field_names=list(v.get('field_names', []))))
             enum_def = rast.EnumDef(
                 span=dummy_span,
                 name=enum_meta.name,
@@ -1322,6 +1325,11 @@ class ImportResolver:
             for af, bf in zip(av.fields, bv.fields):
                 if not self._types_equal(af, bf):
                     return False
+            # Field names are part of the variant's interface: two definitions
+            # that differ only in field names are not interchangeable for
+            # named construction or named patterns.
+            if list(av.field_names) != list(bv.field_names):
+                return False
         return True
 
     def _consts_equal(self, a: rast.ConstDef, b: rast.ConstDef) -> bool:

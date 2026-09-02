@@ -61,6 +61,15 @@ TESTS = [
     "test_issue_result_unwrap_method",
     "test_issue_sizeof_primitive",
     "test_issue_span_slice_range",
+    # NOTE: test_issue_struct_enum_variants (AGAST #1282, struct-style enum
+    # variants) is deliberately NOT listed here yet. It passes under ritz0,
+    # but every entry in this list also runs against ritz1 and
+    # ritz1_selfhosted, and ritz1 has no support for user-defined enums with
+    # payloads at all -- its fallback lowering emits `%Enum = type { i8 }`,
+    # tag only. That is a pre-existing gap, not a regression from #1282.
+    # Add this entry once ritz1 gains payload-carrying user enums; until then
+    # the case is covered by `ritz0.py --test` and the parser unit tests.
+    # See docs/ENUM_VARIANTS.md §6.
     "test_issue_struct_deref_store",
     "test_issue_struct_destructure",
     "test_issue_struct_local_array_assign",
