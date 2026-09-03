@@ -31,29 +31,54 @@ RITZ_ROOT = Path(__file__).resolve().parent.parent
 RITZ1_BIN = RITZ_ROOT / "ritz1" / "build" / "ritz1"
 
 
+def _build_ritz1() -> None:
+    """Bring `RITZ1_BIN` up to date, delegating staleness to make.
+
+    `make` is invoked *unconditionally* and its dependency graph decides what,
+    if anything, needs rebuilding: `$(RITZ1)` depends on `$(OBJ_FILES)`,
+    `$(RITZLIB_OBJ)` and `$(RUNTIME)`, which in turn depend on the `.ritz`
+    sources.  An mtime comparison here would be a second, weaker copy of that
+    graph — it would miss generator and toolchain changes.
+
+    This is AGAST #1322.  The fixture used to rebuild only when the binary was
+    *absent*, never when it was *stale*, which made a green run meaningless:
+    break `parse_module_end` in `parser_gen.ritz` so ritz1 stops requiring EOF,
+    run pytest without rebuilding, and `test_trailing_garbage_is_not_silently_
+    ignored` passes against the previous binary.  The exact regression #1301
+    exists to prevent would ship green, and nobody would ever look — a false
+    *failure* is self-correcting, a false *pass* is invisible.  That direction
+    is pinned by `test_ritz1_bin_staleness.py`; see it before weakening this.
+
+    An up-to-date `make -C ritz1 ritz1` is a ~9ms no-op, so paying it on every
+    module is cheaper than any staleness heuristic we could write here.
+    """
+    env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
+    proc = subprocess.run(
+        ["make", "-C", "ritz1", "ritz1"],
+        cwd=RITZ_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=1800,
+    )
+    if proc.returncode != 0 or not RITZ1_BIN.exists():
+        pytest.fail(
+            "could not build ritz1 for the parse-error regression tests:\n"
+            f"{proc.stdout[-4000:]}\n{proc.stderr[-4000:]}"
+        )
+
+
 @pytest.fixture(scope="module")
 def ritz1_bin() -> Path:
-    """Path to the ritz1 binary, building it if it is not present.
+    """Path to an up-to-date ritz1 binary.
 
     Deliberately does NOT skip when the binary is missing: a skipped test is
     indistinguishable from a passing one in aggregate output, and "reported
     success while asserting nothing" is the exact failure family #1301 is about.
+    Equally deliberately, it does not trust a binary that is merely *present* —
+    a stale one asserts nothing just as effectively.  See `_build_ritz1`.
     """
-    if not RITZ1_BIN.exists():
-        env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
-        proc = subprocess.run(
-            ["make", "-C", "ritz1", "ritz1"],
-            cwd=RITZ_ROOT,
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=1800,
-        )
-        if proc.returncode != 0 or not RITZ1_BIN.exists():
-            pytest.fail(
-                "could not build ritz1 for the parse-error regression tests:\n"
-                f"{proc.stdout[-4000:]}\n{proc.stderr[-4000:]}"
-            )
+    _build_ritz1()
     return RITZ1_BIN
 
 
