@@ -8,6 +8,7 @@ Tests:
 - Build profiles (debug/release)
 """
 
+import os
 import pytest
 import tempfile
 from pathlib import Path
@@ -1051,3 +1052,167 @@ class TestPartialBuildExitCode:
         assert not (pkg / "build" / "debug" / "bad").exists(), output
         assert proc.returncode != 0, (
             "build.py exited 0 with one of two declared binaries missing\n" + output)
+
+
+# ---------------------------------------------------------------------------
+# AGAST #1313: freestanding IR must not acquire libc calls from loop-idiom
+# recognition.
+# ---------------------------------------------------------------------------
+
+FREESTANDING_LIBC_SYMBOLS = {
+    "strlen", "memcpy", "memset", "memmove", "memcmp", "bcmp",
+    "strcpy", "strncpy", "strcmp", "strncmp",
+}
+
+# Hand-written scan/copy/compare loops. None of these names a libc function,
+# but clang's loop-idiom recognizer will rewrite each into a call to one
+# unless the IR says not to. Ritz links -nostdlib, so such a call is an
+# undefined reference at link time -- or, for ritzlib's own memcpy, infinite
+# self-recursion at runtime.
+_LOOP_IDIOM_SOURCE = """\
+var src_buf: [256]u8
+var dst_buf: [256]u8
+
+fn str_len(s: *u8) -> i64
+    var len: i64 = 0
+    while *(s + len) != 0
+        len = len + 1
+    return len
+
+fn mem_copy(dst: *u8, src: *u8, n: i64)
+    var i: i64 = 0
+    while i < n
+        *(dst + i) = *(src + i)
+        i = i + 1
+
+fn mem_set(dst: *u8, v: u8, n: i64)
+    var i: i64 = 0
+    while i < n
+        *(dst + i) = v
+        i = i + 1
+
+fn mem_cmp(a: *u8, b: *u8, n: i64) -> i64
+    var i: i64 = 0
+    while i < n
+        if *(a + i) != *(b + i)
+            return 1
+        i = i + 1
+    return 0
+
+fn main() -> i32
+    mem_set(@dst_buf[0], 0, 256)
+    mem_copy(@dst_buf[0], @src_buf[0], 128)
+    var n: i64 = str_len(@src_buf[0])
+    return (n + mem_cmp(@dst_buf[0], @src_buf[0], 64)) as i32
+"""
+
+
+def _undefined_libc_symbols(obj_path):
+    """Return the libc symbols `obj_path` leaves undefined."""
+    import subprocess
+    proc = subprocess.run(["nm", "-u", str(obj_path)],
+                          capture_output=True, text=True)
+    assert proc.returncode == 0, f"nm failed: {proc.stderr}"
+    found = set()
+    for line in proc.stdout.splitlines():
+        parts = line.split()
+        if parts:
+            found.add(parts[-1])
+    return found & FREESTANDING_LIBC_SYMBOLS
+
+
+@pytest.mark.integration
+class TestFreestandingIRHasNoLibcCalls:
+    """AGAST #1313: emitted IR must survive `clang -c -O2` with no libc refs.
+
+    Regression guard for the zeus `undefined reference to strlen` link
+    failure under clang 21. Asserted via `nm -u` over the whole libc set
+    rather than grepping for strlen, so memcpy/memset/bcmp regressions are
+    caught by the same test.
+    """
+
+    def _emit_ll(self, tmp_path):
+        """Run ritz0 over the loop-idiom source and return the emitted .ll."""
+        import shutil
+        import subprocess
+        for tool in ("clang", "nm"):
+            if shutil.which(tool) is None:
+                pytest.skip(f"{tool} not on PATH")
+
+        src = tmp_path / "loops.ritz"
+        src.write_text(_LOOP_IDIOM_SOURCE)
+        ll = tmp_path / "loops.ll"
+
+        ritz_root = Path(__file__).parent.parent
+        env = dict(os.environ, RITZ_PATH=str(ritz_root))
+        emit = subprocess.run(
+            [sys.executable, str(ritz_root / "ritz0" / "ritz0.py"),
+             str(src), "-o", str(ll)],
+            capture_output=True, text=True, env=env)
+        assert emit.returncode == 0, f"ritz0 failed:\n{emit.stdout}\n{emit.stderr}"
+        return ll
+
+    def _compile_ll(self, ll, obj, extra_flags=()):
+        """Compile a .ll exactly as build.py does, and return the object file."""
+        import subprocess
+        # Mirror build.py's IR-compile step, -O2 included: the rewrite only
+        # happens at -O2, so a lower level would make this test vacuous.
+        comp = subprocess.run(
+            ["clang", "-c", "-O2", "-fPIC", *extra_flags, str(ll), "-o", str(obj)],
+            capture_output=True, text=True)
+        assert comp.returncode == 0, f"clang failed:\n{comp.stderr}"
+        return obj
+
+    def _compile(self, tmp_path, extra_flags=()):
+        return self._compile_ll(self._emit_ll(tmp_path),
+                                tmp_path / "loops.o", extra_flags)
+
+    def test_emitted_ir_has_no_undefined_libc_references(self, tmp_path):
+        """The real assertion: ritz0-emitted IR links freestanding.
+
+        FAILS before the #1313 fix with {'strlen'} (and, depending on
+        clang version, memcpy/memset/bcmp).
+        """
+        leaked = _undefined_libc_symbols(self._compile(tmp_path))
+        assert not leaked, (
+            "clang synthesised libc calls from hand-written loops in "
+            f"freestanding IR: {sorted(leaked)}. The emitted IR is missing "
+            'the "no-builtins" function attribute (AGAST #1313).')
+
+    def test_frontend_freestanding_flags_do_not_help_on_ir_input(self, tmp_path):
+        """Pins WHY the fix lives in the IR and not in build.py's flags.
+
+        `-ffreestanding -fno-builtin` are frontend flags. build.py compiles
+        already-emitted .ll, so the frontend never runs and never attaches
+        the attributes the IR-level passes consult.
+
+        Comparing flagged vs unflagged on the SHIPPED IR would be vacuous:
+        the attribute already suppresses the rewrite, so both sides are empty
+        and `set() == set()` holds no matter what clang does. The comparison
+        is only meaningful on IR that would otherwise leak, so this strips
+        "no-builtins" back out first and asserts the leak is still there with
+        the flags applied. If a future clang makes the frontend flags work on
+        IR input, `flagged` goes empty and this test fails -- which is the
+        signal the comment in build.py needs revisiting.
+        """
+        ll = self._emit_ll(tmp_path)
+        stripped = tmp_path / "loops_stripped.ll"
+        stripped.write_text(ll.read_text().replace(' "no-builtins"', ""))
+        assert '"no-builtins"' not in stripped.read_text(), (
+            "strip failed; the rest of this test would be vacuous")
+
+        bare = _undefined_libc_symbols(
+            self._compile_ll(stripped, tmp_path / "bare.o"))
+        flagged = _undefined_libc_symbols(
+            self._compile_ll(stripped, tmp_path / "flagged.o",
+                             ["-ffreestanding", "-fno-builtin"]))
+
+        # Non-vacuity guard: without the attribute clang MUST synthesise the
+        # calls, otherwise the comparison below is between two empty sets.
+        assert bare, (
+            "stripping \"no-builtins\" did not reproduce the libc leak, so "
+            "this test can no longer distinguish the flags from the fix")
+        assert flagged == bare, (
+            "-ffreestanding/-fno-builtin changed the outcome on .ll input "
+            f"({sorted(bare)} -> {sorted(flagged)}); they are now "
+            "load-bearing and build.py's comment is stale")

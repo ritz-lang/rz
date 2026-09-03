@@ -155,6 +155,28 @@ _WARNED_NO_VERIFIER = False
 # -ffreestanding tells clang there is no hosted library; -fno-builtin stops it
 # assuming the semantics of any libc symbol we do define ourselves. The UEFI
 # path already passed -ffreestanding; the Linux path never did.
+#
+# AGAST #1313 -- IMPORTANT, READ BEFORE TRUSTING THESE FLAGS:
+# These flags do NOT prevent the rewrite described above, and never did. They
+# are FRONTEND flags, and every site below hands clang an already-emitted .ll
+# (`clang -c foo.ll`). The frontend does not run on IR input, so it never
+# attaches the `nobuiltin` / "no-builtins" attributes that the IR-level passes
+# actually consult. Measured on clang 21.1.8: compiling the same .ll with and
+# without these flags produces byte-identical libc references. The bcmp
+# incident above was fixed by the flags only because that path still compiled
+# from source.
+#
+# The real fix is that ritz0 and ritz1 now emit "no-builtins" on every
+# function definition, so the property travels with the IR and holds no
+# matter how clang is invoked. See
+# ritz0/emitter_llvmlite.py:_add_alignstack_to_all_functions and
+# ritz1/src/emitter.ritz. test_build.py::TestFreestandingIRHasNoLibcCalls
+# pins both halves: that the IR stays clean, and that these flags are not the
+# mechanism keeping it clean.
+#
+# They are retained because they are still correct and load-bearing for the
+# paths that DO compile C/Ritz source (and for the UEFI target), but do not
+# add them somewhere new expecting them to fix a libc-call regression on IR.
 FREESTANDING_FLAGS = ["-ffreestanding", "-fno-builtin"]
 
 # Add ritz0 to path for import resolver (must be done before importing)

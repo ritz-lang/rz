@@ -1611,11 +1611,8 @@ class LLVMEmitter:
         # Generate IR string
         ir_str = str(self.module)
 
-        # Post-process IR to add alignstack(16) to ALL functions.
-        # This ensures proper 16-byte stack alignment even when clang's -O2
-        # introduces SIMD instructions (movaps requires 16-byte aligned memory).
-        # The x86-64 ABI requires 16-byte stack alignment at function entry,
-        # and alignstack(16) forces LLVM to maintain this guarantee.
+        # Post-process IR to add alignstack(16) and "no-builtins" to ALL
+        # functions. See _add_alignstack_to_all_functions.
         ir_str = self._add_alignstack_to_all_functions(ir_str)
 
         # Add header comment
@@ -1624,17 +1621,32 @@ class LLVMEmitter:
         return '\n'.join(lines)
 
     def _add_alignstack_to_all_functions(self, ir_str: str) -> str:
-        """Add alignstack(16) attribute to ALL function definitions.
+        """Add alignstack(16) and "no-builtins" to ALL function definitions.
 
-        Clang's -O2 optimizer can introduce SIMD instructions (movaps, etc.)
-        in ANY function, not just those that explicitly use SIMD types.
-        These SIMD instructions require 16-byte aligned stack addresses.
+        alignstack(16): clang's -O2 optimizer can introduce SIMD instructions
+        (movaps, etc.) in ANY function, not just those that explicitly use
+        SIMD types. These require 16-byte aligned stack addresses. The x86-64
+        ABI guarantees 16-byte stack alignment at function entry, and
+        alignstack(16) makes LLVM maintain it in prologue/epilogue code. This
+        fixes SIGSEGV crashes when SIMD accesses a misaligned stack.
 
-        The x86-64 ABI guarantees 16-byte stack alignment at function entry.
-        Adding alignstack(16) ensures LLVM maintains this alignment when
-        it generates prologue/epilogue code.
+        "no-builtins" (AGAST #1313): Ritz links -nostdlib, so no libc symbol
+        can be bound at link time. LLVM's loop-idiom recognizer does not know
+        that: at -O2 it rewrites an ordinary byte loop into a call to
+        strlen/memcpy/memset/bcmp, so code that never named a libc function
+        still references one. zeus's hand-written `while *(s + len) != 0` scan
+        became `call @strlen` under clang 21 and failed to link; the same pass
+        can rewrite ritzlib's own memcpy loop into a call to memcpy, i.e.
+        infinite self-recursion.
 
-        This fixes SIGSEGV crashes when SIMD instructions access misaligned stack.
+        The attribute must live in the IR, not on clang's command line.
+        build.py's FREESTANDING_FLAGS (-ffreestanding -fno-builtin) are
+        FRONTEND flags, and the compile step is `clang -c foo.ll` on IR we
+        already emitted -- the frontend never runs, so it never attaches the
+        attributes the IR-level passes consult. Verified: those flags change
+        nothing on .ll input (test_build.py pins this). Emitting the
+        attribute here makes the IR self-describing, so it holds for every
+        consumer regardless of how it is invoked.
         """
         import re
 
@@ -1646,7 +1658,7 @@ class LLVMEmitter:
         # We use negative lookbehind to skip if alignstack already present
         # Pattern: start of line, define, type, @"name"(...), optional space, !dbg or {
         pattern = r'^(define [^\n]+@"[^"]+"\([^)]*\))(?! alignstack)(\s*)(!dbg|\{)'
-        replacement = r'\1 alignstack(16)\2\3'
+        replacement = r'\1 alignstack(16) "no-builtins"\2\3'
         ir_str = re.sub(pattern, replacement, ir_str, flags=re.MULTILINE)
 
         return ir_str
