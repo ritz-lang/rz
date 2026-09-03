@@ -2,7 +2,7 @@
 
 Display server and window compositor for Harland - capability-based windowing with async scanline compositing.
 
-**Part of the [Ritz Ecosystem](../larb/docs/ECOSYSTEM.md)**
+**Part of the [Ritz Ecosystem](../ritz/docs/ECOSYSTEM.md)**
 
 ## Overview
 

@@ -2,7 +2,7 @@
 
 High-performance compression library for Ritz - gzip, deflate, and zlib implemented in pure Ritz.
 
-**Part of the [Ritz Ecosystem](../larb/docs/ECOSYSTEM.md)**
+**Part of the [Ritz Ecosystem](../ritz/docs/ECOSYSTEM.md)**
 
 ## Overview
 

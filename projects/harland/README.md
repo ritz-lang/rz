@@ -2,7 +2,7 @@
 
 A microkernel operating system written in Ritz, designed for portability and clean syscall abstraction.
 
-**Part of the [Ritz Ecosystem](../larb/docs/ECOSYSTEM.md)**
+**Part of the [Ritz Ecosystem](../ritz/docs/ECOSYSTEM.md)**
 
 ## Overview
 

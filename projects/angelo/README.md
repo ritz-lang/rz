@@ -2,7 +2,7 @@
 
 Font loading and rendering library for Prism - TrueType/OpenType parsing, text shaping, and glyph rasterization.
 
-**Part of the [Ritz Ecosystem](../larb/docs/ECOSYSTEM.md)**
+**Part of the [Ritz Ecosystem](../ritz/docs/ECOSYSTEM.md)**
 
 ## Overview
 

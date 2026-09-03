@@ -2,7 +2,7 @@
 
 HTTP protocol implementation for Ritz - wire protocol, parsing, and framing for HTTP/1.x, HTTP/2, and HTTP/3.
 
-**Part of the [Ritz Ecosystem](../larb/docs/ECOSYSTEM.md)**
+**Part of the [Ritz Ecosystem](../ritz/docs/ECOSYSTEM.md)**
 
 ## Overview
 

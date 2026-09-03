@@ -2,7 +2,7 @@
 
 Content-addressable filesystem for Harland - immutable blob storage with mutable namespace overlays.
 
-**Part of the [Ritz Ecosystem](../larb/docs/ECOSYSTEM.md)**
+**Part of the [Ritz Ecosystem](../ritz/docs/ECOSYSTEM.md)**
 
 ## Overview
 

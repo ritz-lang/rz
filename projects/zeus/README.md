@@ -2,7 +2,7 @@
 
 Zero-copy process runner for Ritz - shared memory ring buffer IPC between Valet and isolated worker processes.
 
-**Part of the [Ritz Ecosystem](../larb/docs/ECOSYSTEM.md)**
+**Part of the [Ritz Ecosystem](../ritz/docs/ECOSYSTEM.md)**
 
 ## Overview
 

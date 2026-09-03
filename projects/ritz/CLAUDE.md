@@ -57,9 +57,12 @@ fn main() -> i32
 ```
 
 **String literals:**
-- `"hello"` → `String` (heap-allocated)
-- `c"hello"` → `*u8` (C string)
-- `s"hello"` → `Span<u8>` (zero-copy)
+- `"hello"` → `StrView` (a `{ ptr, len }` pair; no allocation)
+- `c"hello"` → `*u8` (NUL-terminated C string)
+
+`s"hello"` was removed by AGAST #98: bare `"..."` now produces a `StrView` of
+the same `{ ptr, len }` shape, so the prefix was redundant. `make
+check-no-s-strings` fails the build if one reappears.
 
 **Testing:**
 ```ritz
@@ -84,7 +87,18 @@ and the four harness gotchas (read-until-EOF, temp-file stdin, etc.).
 - `docs/EXAMPLES.md` - Example program guide
 - `docs/TESTING.md` - Test system documentation
 - `docs/VALIDATION.md` - **Validation workflow & build cadence** (read this!)
-- `STYLE.md` - Code style guide
+- `STYLE.md` - Code style guide (compiler-project conventions)
+
+Moved here from `projects/larb/docs/` on 2026-09-03 (AGAST #1311), because
+living outside `projects/ritz` is why they went seven months without a
+migration pass. Every fenced ` ```ritz ` block in these four is compiled by
+`make check-doc-examples` on every build:
+
+- `docs/LANGUAGE_SPEC.md` - Language specification
+- `docs/STDLIB_REFERENCE.md` - ritzlib reference
+- `docs/STYLE.md` - Ecosystem-wide style guide (broader than `STYLE.md` above;
+  the two have not been merged — see AGAST #1311's notes)
+- `docs/ECOSYSTEM.md` - Ecosystem overview
 - `TODO.md` / `DONE.md` - Work tracking
 - `docs/XARGS_WATCH_BLOCKER.md` - Pre-existing StrView/i8* type-mismatch
   blocking 37_xargs and 40_watch builds. Fix sketch included.

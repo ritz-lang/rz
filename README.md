@@ -112,10 +112,10 @@ export RITZ_PATH=$PWD/projects
 
 ## Documentation
 
-- [Language Specification](projects/larb/docs/LANGUAGE_SPEC.md)
-- [Style Guide](projects/larb/docs/STYLE.md)
-- [Ecosystem Overview](projects/larb/docs/ECOSYSTEM.md)
-- [Standard Library Reference](projects/larb/docs/STDLIB_REFERENCE.md)
+- [Language Specification](projects/ritz/docs/LANGUAGE_SPEC.md)
+- [Style Guide](projects/ritz/docs/STYLE.md)
+- [Ecosystem Overview](projects/ritz/docs/ECOSYSTEM.md)
+- [Standard Library Reference](projects/ritz/docs/STDLIB_REFERENCE.md)
 
 ## Philosophy
 

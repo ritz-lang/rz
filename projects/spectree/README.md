@@ -2,7 +2,7 @@
 
 Hierarchical specification and planning tree for AI-assisted software development.
 
-**Part of the [Ritz Ecosystem](../larb/docs/ECOSYSTEM.md)**
+**Part of the [Ritz Ecosystem](../ritz/docs/ECOSYSTEM.md)**
 
 ## Overview
 

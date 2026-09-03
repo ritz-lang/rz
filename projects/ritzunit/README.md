@@ -2,7 +2,7 @@
 
 A modern unit testing framework for the Ritz programming language with ELF-based test discovery and fork isolation.
 
-**Part of the [Ritz Ecosystem](../larb/docs/ECOSYSTEM.md)**
+**Part of the [Ritz Ecosystem](../ritz/docs/ECOSYSTEM.md)**
 
 ## Overview
 

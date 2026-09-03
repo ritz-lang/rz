@@ -2,7 +2,7 @@
 
 Embedded document database for Ritz with tree semantics, versioning, and graph-relational capabilities.
 
-**Part of the [Ritz Ecosystem](../larb/docs/ECOSYSTEM.md)**
+**Part of the [Ritz Ecosystem](../ritz/docs/ECOSYSTEM.md)**
 
 ## Overview
 

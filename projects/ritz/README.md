@@ -2,7 +2,7 @@
 
 A minimalistic, type-safe systems programming language with ownership semantics and modern ergonomics.
 
-**Part of the [Ritz Ecosystem](../larb/docs/ECOSYSTEM.md)**
+**Part of the [Ritz Ecosystem](docs/ECOSYSTEM.md)**
 
 ## Overview
 

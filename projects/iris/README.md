@@ -2,7 +2,7 @@
 
 Rendering engine for the Tempest web browser - layout, painting, and compositing of styled DOM content.
 
-**Part of the [Ritz Ecosystem](../larb/docs/ECOSYSTEM.md)**
+**Part of the [Ritz Ecosystem](../ritz/docs/ECOSYSTEM.md)**
 
 ## Overview
 

@@ -2,7 +2,7 @@
 
 Web browser built on the Ritz ecosystem - multi-process architecture with full HTML5, CSS, and JavaScript support.
 
-**Part of the [Ritz Ecosystem](../larb/docs/ECOSYSTEM.md)**
+**Part of the [Ritz Ecosystem](../ritz/docs/ECOSYSTEM.md)**
 
 ## Overview
 

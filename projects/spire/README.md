@@ -2,7 +2,7 @@
 
 MVRSPT web application framework for Ritz - Django/Rails-style productivity built on Zeus and Valet.
 
-**Part of the [Ritz Ecosystem](../larb/docs/ECOSYSTEM.md)**
+**Part of the [Ritz Ecosystem](../ritz/docs/ECOSYSTEM.md)**
 
 ## Overview
 

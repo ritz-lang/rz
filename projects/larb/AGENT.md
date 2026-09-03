@@ -423,11 +423,11 @@ Co-Authored-By: Claude <noreply@anthropic.com>
 
 | Resource | Location |
 |----------|----------|
-| Language Spec | `larb/docs/LANGUAGE_SPEC.md` |
+| Language Spec | `projects/ritz/docs/LANGUAGE_SPEC.md` |
 | Design Decisions | `larb/docs/DESIGN_DECISIONS.md` |
-| Style Guide | `larb/docs/STYLE.md` |
-| Ecosystem Overview | `larb/docs/ECOSYSTEM.md` |
-| ritzlib Reference | `larb/docs/STDLIB_REFERENCE.md` |
+| Style Guide | `projects/ritz/docs/STYLE.md` |
+| Ecosystem Overview | `projects/ritz/docs/ECOSYSTEM.md` |
+| ritzlib Reference | `projects/ritz/docs/STDLIB_REFERENCE.md` |
 
 ---
 

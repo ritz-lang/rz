@@ -376,11 +376,11 @@ ritzlib,squeeze,valet: 🤖 <description>
 
 | Resource | Location |
 |----------|----------|
-| Language Spec | `projects/larb/docs/LANGUAGE_SPEC.md` |
+| Language Spec | `projects/ritz/docs/LANGUAGE_SPEC.md` |
 | Design Decisions | `projects/larb/docs/DESIGN_DECISIONS.md` |
-| Style Guide | `projects/larb/docs/STYLE.md` |
-| Ecosystem Overview | `projects/larb/docs/ECOSYSTEM.md` |
-| ritzlib Reference | `projects/larb/docs/STDLIB_REFERENCE.md` |
+| Style Guide | `projects/ritz/docs/STYLE.md` |
+| Ecosystem Overview | `projects/ritz/docs/ECOSYSTEM.md` |
+| ritzlib Reference | `projects/ritz/docs/STDLIB_REFERENCE.md` |
 
 ---
 

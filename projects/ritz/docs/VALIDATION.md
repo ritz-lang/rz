@@ -74,6 +74,43 @@ These are not suggestions:
    `make matrix-full` run `make regen-check` automatically and refuse to run
    the matrix if drift is detected — but you can also run `make regen-check`
    directly any time to verify.
+6. **Never change documented syntax without running `make check-doc-examples`.**
+   Every fenced ` ```ritz ` block in the four documents listed in the Makefile's
+   `DOC_EXAMPLE_DOCS` is compiled by ritz0 on every build. This rule exists
+   because we once shipped a *bespoke migration diagnostic* — "Legacy `&T`
+   reference syntax is no longer supported" — while the document that taught
+   `&T` sat unchanged for seven months (AGAST #1311). Changing a diagnostic is
+   the moment to check what documents that construct.
+
+---
+
+## Documentation examples
+
+`make check-doc-examples` extracts every fenced ` ```ritz ` block from the
+language documentation and compiles it with ritz0, the reference compiler. It
+takes about 15 seconds and gates in CI's `bootstrap` job.
+
+The fence info-string is the block's contract:
+
+| Fence | Meaning |
+|---|---|
+| ` ```ritz ` | top-level items; must compile |
+| ` ```ritz body ` | statements; wrapped in a function, then compiled |
+| ` ```ritz expect-error="…" ` | must *fail*, with that text in the diagnostic |
+| ` ```ritz no-compile="reason" ` | not compiled; reason mandatory and printed |
+
+Two of those are load-bearing in a way worth spelling out:
+
+- **`expect-error` does not skip.** A block that demonstrates a mistake asserts
+  the mistake, including *which* diagnostic it produces. If the compiler ever
+  starts accepting that block, the build goes red and someone reads the prose.
+- **`no-compile` is deliberately awkward.** The reason is mandatory, must be a
+  sentence, and every one is printed on every run — the set of exemptions is
+  visible rather than filed away somewhere nobody opens. An opt-out that is easy
+  and unlabelled becomes the next allowlist nobody prunes.
+
+Adding a document to `DOC_EXAMPLE_DOCS` in the Makefile is how it becomes
+load-bearing. There is deliberately no mechanism for exempting a whole file.
 
 ---
 

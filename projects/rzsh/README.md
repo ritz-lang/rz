@@ -2,7 +2,7 @@
 
 Minimal cross-platform shell for Harland and Linux - interactive command execution with built-in commands.
 
-**Part of the [Ritz Ecosystem](../larb/docs/ECOSYSTEM.md)**
+**Part of the [Ritz Ecosystem](../ritz/docs/ECOSYSTEM.md)**
 
 ## Overview
 

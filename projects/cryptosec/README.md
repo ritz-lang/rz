@@ -2,7 +2,7 @@
 
 Cryptographic primitives and security library for Ritz - pure Ritz implementation targeting TLS 1.3.
 
-**Part of the [Ritz Ecosystem](../larb/docs/ECOSYSTEM.md)**
+**Part of the [Ritz Ecosystem](../ritz/docs/ECOSYSTEM.md)**
 
 ## Overview
 

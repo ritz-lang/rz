@@ -80,7 +80,7 @@ Critical features surfaced from real-world database engine development:
 Update all docs to finalized syntax (prevents agents writing bad code):
 
 - [x] **ritz/AGENT.md** — Update to `[[test]]`, remove `c""` prefixes, use StrView default (PR #128)
-- [ ] **larb/docs/LANGUAGE_SPEC.md** — Update `@test` → `[[test]]`, keep `and`/`or`/`not`
+- [ ] **ritz/docs/LANGUAGE_SPEC.md** — Update `@test` → `[[test]]`, keep `and`/`or`/`not`
 - [ ] **larb/docs/QUICK_REFERENCE.md** — Same syntax updates
 - [ ] **larb/docs/GRAMMAR_SPEC.md** — Update attribute syntax to `[[attr]]`
 - [ ] Archive superseded docs (LANGUAGE_REVIEW.md, SYNTAX_PROPOSALS.md)

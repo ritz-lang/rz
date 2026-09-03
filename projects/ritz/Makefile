@@ -28,7 +28,7 @@ all: test
 # Run everything
 # AGAST #98: check-no-s-strings runs first so any resurrected s"..." literal
 # fails CI before we burn compile cycles on it.
-test: check-no-s-strings unit ritz ritz1 examples
+test: check-no-s-strings check-doc-examples unit tools-unit ritz ritz1 examples
 	@echo "✓ All tests passed!"
 
 # AGAST #98 guard: ensure no s"..." span-string literals leak back in.
@@ -38,6 +38,35 @@ test: check-no-s-strings unit ritz ritz1 examples
 check-no-s-strings:
 	@echo "=== Checking no s\"...\" literals remain ==="
 	@$(PYTHON) tools/check_no_s_strings.py .
+
+# AGAST #1311 guard: every fenced ```ritz block in the language documentation
+# is compiled by ritz0. The docs linked from the top-level README spent seven
+# months teaching `let mut`, `&T` and `String::from` — syntax the compiler
+# rejects, in one case with a bespoke migration diagnostic we wrote and then
+# never applied to the document that taught it. Prose with no mechanism that
+# can fail will rot; this is the mechanism.
+#
+# DOC_EXAMPLE_DOCS is the checked set. Adding a document here is how a doc
+# becomes load-bearing; there is deliberately no way to exempt one silently.
+DOC_EXAMPLE_DOCS := \
+	docs/LANGUAGE_SPEC.md \
+	docs/STDLIB_REFERENCE.md \
+	docs/STYLE.md \
+	docs/ECOSYSTEM.md
+
+.PHONY: check-doc-examples
+check-doc-examples:
+	@echo "=== Compiling documentation examples ==="
+	@$(PYTHON) tools/check_doc_examples.py $(DOC_EXAMPLE_DOCS)
+
+# Python unit tests for the tools/ scripts themselves. These existed but were
+# wired into nothing — tools/test_check_no_s_strings.py had never been run by
+# make or by CI. A guard whose own tests do not run is a guard on the honour
+# system.
+.PHONY: tools-unit
+tools-unit:
+	@echo "=== Running tools/ unit tests ==="
+	@$(PYTHON) -m pytest -q tools/
 
 # Python unit tests for ritz0 compiler
 unit:

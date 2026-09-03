@@ -2,7 +2,7 @@
 
 The standard library for the Ritz programming language - system calls, I/O, collections, async I/O, and more.
 
-**Part of the [Ritz Ecosystem](../larb/docs/ECOSYSTEM.md)**
+**Part of the [Ritz Ecosystem](../docs/ECOSYSTEM.md)**
 
 ## Overview
 

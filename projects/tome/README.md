@@ -2,7 +2,7 @@
 
 In-memory data store for Ritz - embedded cache and data structure server with Redis-compatible semantics.
 
-**Part of the [Ritz Ecosystem](../larb/docs/ECOSYSTEM.md)**
+**Part of the [Ritz Ecosystem](../ritz/docs/ECOSYSTEM.md)**
 
 ## Overview
 

@@ -2,7 +2,7 @@
 
 The Ritz knowledge base - documentation and wiki platform built on the full Ritz ecosystem stack.
 
-**Part of the [Ritz Ecosystem](../larb/docs/ECOSYSTEM.md)**
+**Part of the [Ritz Ecosystem](../ritz/docs/ECOSYSTEM.md)**
 
 ## Overview
 

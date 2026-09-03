@@ -2,7 +2,7 @@
 
 High-performance async HTTP server for Ritz, built on Linux io_uring for minimal syscall overhead.
 
-**Part of the [Ritz Ecosystem](../larb/docs/ECOSYSTEM.md)**
+**Part of the [Ritz Ecosystem](../ritz/docs/ECOSYSTEM.md)**
 
 ## Overview
 

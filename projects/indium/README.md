@@ -2,7 +2,7 @@
 
 Distribution built on the Harland microkernel - userspace programs, init system, and bootable image tooling.
 
-**Part of the [Ritz Ecosystem](../larb/docs/ECOSYSTEM.md)**
+**Part of the [Ritz Ecosystem](../ritz/docs/ECOSYSTEM.md)**
 
 ## Overview
 

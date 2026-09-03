@@ -124,7 +124,7 @@ fn test_crc32_known_vector() -> i32
 
 ### 2. Follow Ritz Style Guide
 
-See `projects/larb/docs/STYLE.md` for full details. Key points:
+See `projects/ritz/docs/STYLE.md` for full details. Key points:
 
 | Item | Convention | Example |
 |------|------------|---------|

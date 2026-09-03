@@ -2,7 +2,7 @@
 
 HTML5 and CSS parser for the Tempest web browser - streaming tokenization, DOM events, and style cascade.
 
-**Part of the [Ritz Ecosystem](../larb/docs/ECOSYSTEM.md)**
+**Part of the [Ritz Ecosystem](../ritz/docs/ECOSYSTEM.md)**
 
 ## Overview
 
