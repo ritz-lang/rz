@@ -904,3 +904,150 @@ class TestIRVerification:
         monkeypatch.setattr(_build_module.shutil, "which",
                             lambda n: None if n == "opt" else f"/usr/bin/{n}")
         assert _build_module._ir_verifier_cmd()[0] == "llvm-as"
+
+
+# ---------------------------------------------------------------------------
+# AGAST #1314 — partial package builds must fail
+#
+# build_package() returned only the binaries that SUCCEEDED, so the only
+# available predicate was `if not built:` — true solely when ZERO binaries
+# built. A package declaring two binaries where the primary one fails to link
+# still returned a non-empty list, so `build.py build` exited 0 with the main
+# binary absent. These tests pin the accounting, not any particular package.
+# ---------------------------------------------------------------------------
+
+RITZ_DIR = Path(__file__).parent.parent
+
+
+def _two_binary_package(tmp_path, bad_source):
+    """Package declaring two binaries: `good` compiles, `bad` does not."""
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "good.ritz").write_text("fn main() -> i32\n    0\n")
+    (src / "bad.ritz").write_text(bad_source)
+    (tmp_path / "ritz.toml").write_text(
+        '[package]\n'
+        'name = "partial"\n'
+        'version = "0.1.0"\n'
+        '\n'
+        '[[bin]]\n'
+        'name = "good"\n'
+        'path = "src/good.ritz"\n'
+        '\n'
+        '[[bin]]\n'
+        'name = "bad"\n'
+        'path = "src/bad.ritz"\n'
+    )
+    return tmp_path
+
+
+class TestPartialBuildIsFailure:
+    """One binary of two failing must fail the package."""
+
+    def _config(self, pkg_dir):
+        import tomllib
+        return tomllib.loads((pkg_dir / "ritz.toml").read_text())
+
+    def _fake_compiler(self, monkeypatch, failing_names):
+        """Stub compile_binary: produce an artifact unless the name is failing."""
+        def fake(name, src_path, out_dir, **kwargs):
+            if name in failing_names:
+                return None
+            out_dir.mkdir(parents=True, exist_ok=True)
+            artifact = out_dir / name
+            artifact.write_text("")
+            return artifact
+        monkeypatch.setattr(_build_module, "compile_binary", fake)
+
+    @pytest.mark.unit
+    def test_result_records_the_failed_binary_by_name(self, tmp_path, monkeypatch):
+        """The failure is data, not just a line of stdout that gets discarded."""
+        pkg = _two_binary_package(tmp_path, "fn main() -> i32\n    0\n")
+        self._fake_compiler(monkeypatch, {"bad"})
+        result = _build_module.build_package(pkg, self._config(pkg))
+        assert result.failed == ["bad"]
+        assert len(result.built) == 1
+        assert result.ok is False
+
+    @pytest.mark.unit
+    def test_partial_build_is_falsy(self, tmp_path, monkeypatch):
+        """`if not <result>` must mean 'did the package build', not 'did anything'."""
+        pkg = _two_binary_package(tmp_path, "fn main() -> i32\n    0\n")
+        self._fake_compiler(monkeypatch, {"bad"})
+        assert not _build_module.build_package(pkg, self._config(pkg))
+
+    @pytest.mark.unit
+    def test_full_build_is_ok(self, tmp_path, monkeypatch):
+        pkg = _two_binary_package(tmp_path, "fn main() -> i32\n    0\n")
+        self._fake_compiler(monkeypatch, set())
+        result = _build_module.build_package(pkg, self._config(pkg))
+        assert result.ok and result.failed == [] and len(result.built) == 2
+
+    @pytest.mark.unit
+    def test_summary_names_the_failure(self, tmp_path, monkeypatch):
+        pkg = _two_binary_package(tmp_path, "fn main() -> i32\n    0\n")
+        self._fake_compiler(monkeypatch, {"bad"})
+        summary = _build_module.build_package(pkg, self._config(pkg)).summary()
+        assert "bad" in summary and "1 of 2" in summary
+
+    @pytest.mark.unit
+    def test_unresolved_entry_point_is_a_failure_not_an_absence(self, tmp_path):
+        """A declared Ritz binary whose source cannot be found must fail."""
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "good.ritz").write_text("fn main() -> i32\n    0\n")
+        (tmp_path / "ritz.toml").write_text(
+            '[package]\nname = "p"\nversion = "0.1.0"\n'
+            '\n[[bin]]\nname = "good"\nentry = "good::main"\n'
+            '\n[[bin]]\nname = "ghost"\nentry = "ghost::main"\n'
+        )
+        plan = _build_module.plan_binaries(tmp_path, self._config(tmp_path))
+        assert [b.name for b in plan.buildable] == ["good"]
+        assert [u.name for u in plan.unresolved] == ["ghost"]
+        assert plan.skipped == []
+
+    @pytest.mark.unit
+    def test_script_binary_is_an_explicit_named_skip(self, tmp_path):
+        """A non-Ritz [[bin]] is skipped — but the skip is named, not inferred."""
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "good.ritz").write_text("fn main() -> i32\n    0\n")
+        (tmp_path / "tool.py").write_text("")
+        (tmp_path / "ritz.toml").write_text(
+            '[package]\nname = "p"\nversion = "0.1.0"\n'
+            '\n[[bin]]\nname = "good"\npath = "src/good.ritz"\n'
+            '\n[[bin]]\nname = "tool"\npath = "tool.py"\n'
+        )
+        plan = _build_module.plan_binaries(tmp_path, self._config(tmp_path))
+        assert [b.name for b in plan.buildable] == ["good"]
+        assert [(s.name, "not a Ritz source" in s.reason) for s in plan.skipped] == [("tool", True)]
+        assert plan.unresolved == []
+        # A named skip is not a failure.
+        result = _build_module.PackageBuildResult(built=[Path("good")], failed=[],
+                                                  skipped=plan.skipped)
+        assert result.ok
+
+
+class TestPartialBuildExitCode:
+    """End-to-end: the process exit code, via a real compiler run."""
+
+    @pytest.mark.integration
+    def test_build_exits_nonzero_when_one_of_two_binaries_fails(self, tmp_path):
+        """The acceptance test for #1314. Real ritz0, real ritz.toml, real exit code."""
+        import os
+        import subprocess
+        pkg = _two_binary_package(
+            tmp_path,
+            # Deliberately unparseable Ritz.
+            "fn main() -> i32\n    @@@ this is not ritz @@@\n",
+        )
+        env = dict(os.environ, RITZ_PATH=str(RITZ_DIR))
+        proc = subprocess.run(
+            [sys.executable, "build.py", "build", str(pkg)],
+            cwd=RITZ_DIR, env=env, capture_output=True, text=True, timeout=600,
+        )
+        output = proc.stdout + proc.stderr
+        # The good binary DID build — that is exactly the condition under which
+        # the old code reported success.
+        assert (pkg / "build" / "debug" / "good").exists(), output
+        assert not (pkg / "build" / "debug" / "bad").exists(), output
+        assert proc.returncode != 0, (
+            "build.py exited 0 with one of two declared binaries missing\n" + output)

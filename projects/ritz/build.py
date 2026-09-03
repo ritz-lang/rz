@@ -746,28 +746,49 @@ def find_packages() -> list[tuple[Path, dict]]:
     return find_all_packages()
 
 
-def get_binaries(pkg_dir: Path, config: dict) -> list[BinaryConfig]:
-    """Get list of BinaryConfig objects for all binary targets in a package.
+@dataclass
+class SkippedBinary:
+    """A declared [[bin]] that this build deliberately does not compile.
 
-    Returns empty list for test-only packages (no binary to build).
-
-    Supports both RFC #109 syntax and legacy syntax:
-    - RFC #109: entry = "module::main"  → resolves to src/module.ritz
-    - Legacy:   path = "src/main.ritz"  → direct file path
-
-    Also supports freestanding builds with:
-    - freestanding = true
-    - target = "x86_64-none-elf"
-    - [bin.NAME.linker] script = "linker.ld"
-    - [bin.NAME.asm] files = ["boot.s", "isr.s"]
-    - [bin.NAME.flags] code-model = "kernel", no-red-zone = true
+    A skip is only legitimate when it is *named*: which target, and why. An
+    empty/short binary list must never be inferred to mean "nothing to do" —
+    that is how a missing binary passes for a successful build.
     """
-    binaries = []
+    name: str
+    reason: str
+
+
+@dataclass
+class BinaryPlan:
+    """What get_binaries() decided about every declared [[bin]] in a package.
+
+    Three disjoint buckets, and every declared target lands in exactly one:
+
+    - buildable:  compile these; each must produce an artifact
+    - skipped:    deliberately not compiled, with a stated reason (success)
+    - unresolved: declared as a Ritz binary but its source could not be found
+                  (failure — a target we were asked for and cannot deliver)
+    """
+    buildable: list[BinaryConfig]
+    skipped: list[SkippedBinary]
+    unresolved: list[SkippedBinary]
+
+
+def plan_binaries(pkg_dir: Path, config: dict) -> BinaryPlan:
+    """Resolve every declared [[bin]] into buildable / skipped / unresolved.
+
+    get_binaries() returns only the buildable bucket, which is all most callers
+    need. Anything deciding whether a *package* built must use this instead, so
+    that a target dropped during resolution is visibly accounted for rather
+    than silently absent from the list.
+    """
+    plan = BinaryPlan(buildable=[], skipped=[], unresolved=[])
+    binaries = plan.buildable
 
     # Check if this is a test-only package
     is_test_only = config.get("build", {}).get("test_only", False)
     if is_test_only:
-        return []  # Test-only packages have no binaries
+        return plan  # Test-only packages have no binaries
 
     # Get package-level sources configuration (RFC #109)
     # Check top-level, [package], and [build] sections (TOML puts keys in current section)
@@ -795,14 +816,22 @@ def get_binaries(pkg_dir: Path, config: dict) -> list[BinaryConfig]:
                     bin_sources_list = [bin_sources_list]
                 result = resolve_entry_point(entry, pkg_dir, bin_sources_list)
                 if result is None:
+                    # Not a skip: the package declares a Ritz binary whose
+                    # source we cannot find. Record it as unresolved so the
+                    # package build fails instead of quietly building N-1.
                     print(f"  ⚠ Could not resolve entry point: {entry}", file=sys.stderr)
+                    plan.unresolved.append(SkippedBinary(
+                        name, f"could not resolve entry point '{entry}'"))
                     continue
                 src_path, _fn_name = result
             # Legacy: path = "src/main.ritz"
             elif "path" in bin_entry:
                 src_path = pkg_dir / bin_entry["path"]
-                # Skip non-.ritz files (e.g., .py or .sh scripts)
+                # Legitimate skip: a [[bin]] pointing at a .py/.sh script is
+                # not something this compiler builds. Named, not inferred.
                 if not src_path.suffix == ".ritz":
+                    plan.skipped.append(SkippedBinary(
+                        name, f"not a Ritz source ({src_path.name})"))
                     continue
             # Default: src/{name}.ritz
             else:
@@ -879,7 +908,29 @@ def get_binaries(pkg_dir: Path, config: dict) -> list[BinaryConfig]:
             additional_sources=[],
         ))
 
-    return binaries
+    return plan
+
+
+def get_binaries(pkg_dir: Path, config: dict) -> list[BinaryConfig]:
+    """Get list of BinaryConfig objects for all buildable binary targets.
+
+    Returns empty list for test-only packages (no binary to build).
+
+    Supports both RFC #109 syntax and legacy syntax:
+    - RFC #109: entry = "module::main"  → resolves to src/module.ritz
+    - Legacy:   path = "src/main.ritz"  → direct file path
+
+    Also supports freestanding builds with:
+    - freestanding = true
+    - target = "x86_64-none-elf"
+    - [bin.NAME.linker] script = "linker.ld"
+    - [bin.NAME.asm] files = ["boot.s", "isr.s"]
+    - [bin.NAME.flags] code-model = "kernel", no-red-zone = true
+
+    NOTE: this is a lossy view — targets that were skipped or failed to resolve
+    are simply absent. Use plan_binaries() when the difference matters.
+    """
+    return plan_binaries(pkg_dir, config).buildable
 
 
 def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources: list[Path] = None, keep_artifacts: bool = False, use_cache: bool = True, profile: dict = None, dependencies: dict[str, DependencySpec] = None, pkg_dir: Path = None, source_roots: list[str] = None, compiler: str = "ritz0") -> Path:
@@ -1659,7 +1710,47 @@ def compile_freestanding_binary(
             shutil.rmtree(artifact_dir, ignore_errors=True)
 
 
-def build_package(pkg_dir: Path, config: dict, keep_artifacts: bool = False, use_cache: bool = True, profile_name: str = None, compiler: str = "ritz0") -> list[Path]:
+@dataclass
+class PackageBuildResult:
+    """Outcome of building one package: what built, what did NOT, what was skipped.
+
+    build_package() used to return only the list of binaries that succeeded, so
+    `if not built:` was the only available predicate — and that is true only
+    when *zero* binaries built. A package declaring two binaries where the
+    primary one failed to link still returned a non-empty list and therefore
+    reported success (AGAST #1314: `build.py build ../zeus` exited 0 with
+    `zeus` itself absent from build/debug/).
+
+    The predicate is not "did anything build" but "did every target we were
+    asked to build produce an artifact". Skips are permitted, but only when
+    explicitly named in `skipped` — never inferred from a short list.
+    """
+    built: list[Path]
+    failed: list[str]
+    skipped: list[SkippedBinary]
+
+    @property
+    def ok(self) -> bool:
+        """True only when no declared target failed."""
+        return not self.failed
+
+    def __bool__(self) -> bool:
+        # Deliberate: truth-testing the result means "did the package build?",
+        # so the historical `if not built:` shape stays correct rather than
+        # silently reverting to "did anything build?".
+        return self.ok
+
+    def summary(self) -> str:
+        """One-line human description of the failure, for callers to print."""
+        parts = [f"{len(self.failed)} of {len(self.built) + len(self.failed)} "
+                 f"binaries failed: {', '.join(self.failed)}"]
+        if self.skipped:
+            parts.append("skipped: " + ", ".join(
+                f"{s.name} ({s.reason})" for s in self.skipped))
+        return "; ".join(parts)
+
+
+def build_package(pkg_dir: Path, config: dict, keep_artifacts: bool = False, use_cache: bool = True, profile_name: str = None, compiler: str = "ritz0") -> PackageBuildResult:
     """Build all binaries in a package.
 
     Args:
@@ -1700,8 +1791,14 @@ def build_package(pkg_dir: Path, config: dict, keep_artifacts: bool = False, use
     else:
         print(f"📦 Building {pkg_name} ({profile['name']})...")
 
-    binaries = get_binaries(pkg_dir, config)
+    plan = plan_binaries(pkg_dir, config)
+    binaries = plan.buildable
     built = []
+    # A target that could not even be resolved is a failure, not an absence.
+    failed = [u.name for u in plan.unresolved]
+
+    for skipped in plan.skipped:
+        print(f"  ⏭ {skipped.name} skipped: {skipped.reason}")
 
     for bin_config in binaries:
         # Show source files being compiled
@@ -1784,8 +1881,9 @@ def build_package(pkg_dir: Path, config: dict, keep_artifacts: bool = False, use
                       file=sys.stderr)
         else:
             print(f"\n  ✗ Failed to build {bin_config.name}")
+            failed.append(bin_config.name)
 
-    return built
+    return PackageBuildResult(built=built, failed=failed, skipped=plan.skipped)
 
 
 def run_tests(pkg_dir: Path, config: dict) -> bool:
@@ -2008,8 +2106,12 @@ def cmd_build(args):
             print(f"📦 {config['package']['name']} (test-only, nothing to build)")
             continue
 
-        built = build_package(pkg_dir, config, keep_artifacts=keep_artifacts, use_cache=use_cache, profile_name=profile_name, compiler=compiler)
-        if not built:
+        result = build_package(pkg_dir, config, keep_artifacts=keep_artifacts, use_cache=use_cache, profile_name=profile_name, compiler=compiler)
+        # `result.ok` is "every declared binary produced an artifact", NOT
+        # "at least one did" — see PackageBuildResult (AGAST #1314).
+        if not result.ok:
+            print(f"  ✗ Failed to build {config['package']['name']}: {result.summary()}",
+                  file=sys.stderr)
             success = False
 
     if keep_artifacts:
@@ -2061,22 +2163,22 @@ def cmd_test(args):
                 all_passed = False
         else:
             # Normal package: build then test
-            built = build_package(pkg_dir, config, keep_artifacts=keep_artifacts, use_cache=use_cache, profile_name=profile_name, compiler=compiler)
-            # Check if there are any .ritz binaries to build
-            binaries = get_binaries(pkg_dir, config)
-            has_ritz_binaries = len(binaries) > 0
+            result = build_package(pkg_dir, config, keep_artifacts=keep_artifacts, use_cache=use_cache, profile_name=profile_name, compiler=compiler)
 
-            if has_ritz_binaries:
-                # Package has ritz binaries - build result matters
-                if built:
-                    if not run_tests(pkg_dir, config):
-                        all_passed = False
-                else:
-                    all_passed = False
-            else:
-                # No ritz binaries (e.g., only scripts) - just run tests
-                if not run_tests(pkg_dir, config):
-                    all_passed = False
+            # A partial build is a build failure: running the test suite
+            # against a package whose main binary does not exist reports on a
+            # program that was never produced (AGAST #1314). The old predicate
+            # here was `if built:` — truthy on a partial build.
+            #
+            # A package with nothing to build (only script [[bin]]s, all named
+            # skips) has result.ok == True and goes straight to its tests, as
+            # before.
+            if not result.ok:
+                print(f"  ✗ Failed to build {config['package']['name']}: {result.summary()}",
+                      file=sys.stderr)
+                all_passed = False
+            elif not run_tests(pkg_dir, config):
+                all_passed = False
 
     if keep_artifacts:
         print(f"\n📁 Debug artifacts kept in build/")
