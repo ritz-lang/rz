@@ -9424,15 +9424,44 @@ class LLVMEmitter:
         if not isinstance(recv.type, (ir.FloatType, ir.DoubleType)):
             return None
 
-        intrinsic_name = {
-            'ceil': 'llvm.ceil',
-            'floor': 'llvm.floor',
-            'round': 'llvm.round',
-            'abs': 'llvm.fabs',
-        }[method]
-        fn_type = ir.FunctionType(recv.type, [recv.type])
-        intrinsic = self.module.declare_intrinsic(intrinsic_name, [recv.type], fnty=fn_type)
-        return self.builder.call(intrinsic, [recv])
+        if method == 'abs':
+            # llvm.fabs lowers to an and-mask — never a libcall, safe to keep.
+            fn_type = ir.FunctionType(recv.type, [recv.type])
+            intrinsic = self.module.declare_intrinsic(
+                'llvm.fabs', [recv.type], fnty=fn_type)
+            return self.builder.call(intrinsic, [recv])
+
+        # floor/ceil/round: the llvm.* intrinsics lower to floorf/ceilf/roundf
+        # *libcalls* on baseline x86-64 (no SSE4.1 assumed), and ritz links no
+        # libc — angelo's rasterizer was the first corpus user and died at
+        # link (AGAST #1321). Lower inline via fptosi/sitofp + select instead.
+        # Valid for |x| < 2^63; NaN/inf and huge values fall back to the
+        # round-trip result, which is acceptable for coordinate math.
+        i64 = self.i64
+        one = ir.Constant(recv.type, 1.0)
+        half = ir.Constant(recv.type, 0.5)
+        zero = ir.Constant(recv.type, 0.0)
+
+        def _trunc(v):
+            return self.builder.sitofp(
+                self.builder.fptosi(v, i64), recv.type)
+
+        if method == 'floor':
+            t = _trunc(recv)
+            gt = self.builder.fcmp_ordered('>', t, recv)
+            return self.builder.select(
+                gt, self.builder.fsub(t, one), t, name='floor')
+        if method == 'ceil':
+            t = _trunc(recv)
+            lt = self.builder.fcmp_ordered('<', t, recv)
+            return self.builder.select(
+                lt, self.builder.fadd(t, one), t, name='ceil')
+        # round: half away from zero — trunc(x + copysign(0.5, x))
+        is_neg = self.builder.fcmp_ordered('<', recv, zero)
+        adj = self.builder.select(
+            is_neg, self.builder.fsub(recv, half),
+            self.builder.fadd(recv, half))
+        return _trunc(adj)
 
     def _infer_float_expr(self, expr: rast.Expr) -> bool:
         """Check if an expression produces a floating-point type.
