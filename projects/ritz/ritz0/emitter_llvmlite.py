@@ -628,13 +628,21 @@ class LLVMEmitter:
         for variant in variants:
             self.variant_to_enum[variant.name] = specialized_name
 
+        # Layout MUST come from the shared helper (the documented single
+        # source of truth) so synthesis agrees with every consumer:
+        # `_get_enum_data_index`, variant construction and match binding all
+        # recompute the layout at use time via `_enum_variant_field_layout` /
+        # `_ritz_type_size_and_align`. The previous ad-hoc sizing here used
+        # `_type_size_bytes(_ritz_type_to_llvm(field))`, which (a) conflated
+        # alignment with size and (b) lowered a not-yet-registered payload
+        # struct (e.g. String) to the 1-byte generic placeholder — producing
+        # a `{i8, [1 x i8]}` body that use-time layout (align 8, data at
+        # index 2) then GEPed past the end of. AGAST #1321.
         max_size = 0
         max_align = 1
         for variant in variants:
             if variant.fields:
-                field_llvm_ty = self._ritz_type_to_llvm(variant.fields[0])
-                size = self._type_size_bytes(field_llvm_ty)
-                align = self._type_size_bytes(field_llvm_ty)
+                _, size, align = self._enum_variant_field_layout(variant)
                 max_size = max(max_size, size)
                 max_align = max(max_align, align)
 
