@@ -289,10 +289,18 @@ fn find_local(s: *EmitterState, name: *u8, len: i32) -> i32
     let loc: *LocalVar = @s.locals[idx]
     return loc.reg
 
+# AGAST #1328: "not a local" miss value for find_local_type.  The old miss
+# value was TYPE_I64, which is indistinguishable from a real i64 local —
+# twice now (#1325 deref form, #1328 subscript form) a caller treated a
+# global pointer as an i64 and silently loaded the wrong width.  -1 collides
+# with no TYPE_* kind, so a caller that forgets to handle the miss now takes
+# its explicit "unknown" branch instead of impersonating an i64.
+const TYPE_UNKNOWN: i32 = -1
+
 fn find_local_type(s: *EmitterState, name: *u8, len: i32) -> i32
     let idx: i32 = find_local_idx(s, name, len)
     if idx < 0
-        return TYPE_I64
+        return TYPE_UNKNOWN
     let loc: *LocalVar = @s.locals[idx]
     return loc.var_type
 
@@ -1518,13 +1526,28 @@ fn get_expr_type(s: *EmitterState, e: *Expr) -> i32
             return glob.var_type
         return TYPE_I64
     else if e.kind == EXPR_INDEX
-        # Indexing: result type depends on base type
+        # Indexing: result type depends on base type.
+        # AGAST #1328: resolve the base through locals THEN globals — the old
+        # code only saw locals, and find_local_type's TYPE_I64 miss value made
+        # a global pointer base look like an i64, so `g[i]` on `var g: *i32`
+        # skipped both pointer branches and fell to the i64 default.
         if e.left.kind == EXPR_IDENT
-            let base_type: i32 = find_local_type(s, e.left.ident_ptr, e.left.ident_len)
+            var base_type: i32 = find_local_type(s, e.left.ident_ptr, e.left.ident_len)
+            var pointee: i32 = TYPE_UNKNOWN
+            if base_type == TYPE_UNKNOWN
+                let glob: *GlobalVarDef = find_global(s, e.left.ident_ptr, e.left.ident_len)
+                if glob != null
+                    base_type = glob.var_type
+                    pointee = glob.pointee_type
+            else
+                pointee = find_local_pointee_type(s, e.left.ident_ptr, e.left.ident_len)
             if base_type == TYPE_PTR_PTR
                 return TYPE_PTR  # **u8 indexed gives *u8
             else if base_type == TYPE_PTR
-                return TYPE_U8   # *u8 indexed gives u8
+                # Element type of *T indexing is the pointee when recorded.
+                if pointee == TYPE_I32 or pointee == TYPE_U32 or pointee == TYPE_I16 or pointee == TYPE_U16 or pointee == TYPE_I64 or pointee == TYPE_U64 or pointee == TYPE_I8
+                    return pointee
+                return TYPE_U8   # *u8 (or unrecorded pointee) indexed gives u8
         return TYPE_I64  # Default
     else if e.kind == EXPR_UNARY
         if e.op == OP_ADDR

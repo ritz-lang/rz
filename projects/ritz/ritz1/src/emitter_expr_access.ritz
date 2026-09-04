@@ -223,11 +223,30 @@ fn emit_expr_ident(s: *EmitterState, e: *Expr) -> i32
 
 fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
     # Check if base is an array, pointer-to-pointer (e.g., argv: **u8), or pointer
+    #
+    # AGAST #1328: resolve the base through locals THEN globals, and carry the
+    # pointee kind so the fallback pointer path below can load the element at
+    # its real width.  Previously (a) a global base hit find_local_type's
+    # TYPE_I64 miss value and fell into the byte path (`g[i]` on a global
+    # *i32 read one byte of a 4-byte slot), and (b) even for locals there was
+    # no pointee-typed path at all — `p[i]` on a local *i32 also byte-loaded.
     var base_type: i32 = TYPE_PTR
+    var elem_pointee: i32 = TYPE_UNKNOWN
     var local: *LocalVar = null
     if e.left.kind == EXPR_IDENT
         base_type = find_local_type(s, e.left.ident_ptr, e.left.ident_len)
         local = find_local_struct_name(s, e.left.ident_ptr, e.left.ident_len)
+        if base_type == TYPE_UNKNOWN
+            let glob: *GlobalVarDef = find_global(s, e.left.ident_ptr, e.left.ident_len)
+            if glob != null
+                base_type = glob.var_type
+                elem_pointee = glob.pointee_type
+            else
+                # Neither local nor global: preserve the historical byte-path
+                # default rather than letting TYPE_UNKNOWN leak downstream.
+                base_type = TYPE_PTR
+        else if local != null
+            elem_pointee = local.pointee_type
 
     # AGAST #110 — range-index lowering: a[lo..hi] → pointer-into-base as i64.
     # We compute `new_ptr = base_ptr + lo * sizeof(elem)` and return the
@@ -1122,6 +1141,56 @@ fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
         emit_reg(s, result)
         emit_str(s, c" to i64\n")
         return pti
+    else if (base_type == TYPE_PTR or base_type == TYPE_REF or base_type == TYPE_MUT_REF) and (elem_pointee == TYPE_I16 or elem_pointee == TYPE_U16 or elem_pointee == TYPE_I32 or elem_pointee == TYPE_U32 or elem_pointee == TYPE_I64 or elem_pointee == TYPE_U64 or elem_pointee == TYPE_I8)
+        # AGAST #1328: pointee-typed pointer indexing — GEP by the element
+        # stride and load at the element width, then extend to i64 for the
+        # uniform value representation.  Covers `p[i]` / `g[i]` where the
+        # base is a local or global *i16/*u16/*i32/*u32/*i64/*u64/*i8.
+        var elem_ty: *u8 = c"i64"
+        if elem_pointee == TYPE_I8
+            elem_ty = c"i8"
+        else if elem_pointee == TYPE_I16 or elem_pointee == TYPE_U16
+            elem_ty = c"i16"
+        else if elem_pointee == TYPE_I32 or elem_pointee == TYPE_U32
+            elem_ty = c"i32"
+        let base_ptr: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, base_ptr)
+        emit_str(s, c" = inttoptr i64 ")
+        emit_reg(s, base)
+        emit_str(s, c" to ptr\n")
+        let ptr: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, ptr)
+        emit_str(s, c" = getelementptr ")
+        emit_str(s, elem_ty)
+        emit_str(s, c", ptr ")
+        emit_reg(s, base_ptr)
+        emit_str(s, c", i64 ")
+        emit_reg(s, idx)
+        emit_str(s, c"\n")
+        let result: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, result)
+        emit_str(s, c" = load ")
+        emit_str(s, elem_ty)
+        emit_str(s, c", ptr ")
+        emit_reg(s, ptr)
+        emit_str(s, c"\n")
+        if elem_pointee == TYPE_I64 or elem_pointee == TYPE_U64
+            return result
+        let ext: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, ext)
+        if elem_pointee == TYPE_U16 or elem_pointee == TYPE_U32
+            emit_str(s, c" = zext ")
+        else
+            emit_str(s, c" = sext ")
+        emit_str(s, elem_ty)
+        emit_str(s, c" ")
+        emit_reg(s, result)
+        emit_str(s, c" to i64\n")
+        return ext
     else
         # Pointer-to-byte: index by 1, load byte
         # First convert i64 value back to ptr

@@ -1,10 +1,22 @@
-# Indexed load/store through GLOBAL pointer variables.
+# Indexed load/store through GLOBAL pointer variables — BOTH access forms.
 #
 # AGAST #1325.  The identical code through a `let` local always worked; only
 # the global path was broken, which is why this went unnoticed for so long —
 # it needed a global `*i32` array indexed at a non-zero offset, and
 # monomorph.ritz's instantiation tracker was the one place that did that in
 # anger.
+#
+# AGAST #1328.  #1325's fix covered only the deref form `*(g + i)`; the
+# subscript form `g[i]` still hit find_local_type's TYPE_I64 miss value and
+# byte-loaded through a global *i32/**u8 (7/8 and 8/8 mismatches at 8e3e8f8).
+# The check_*_sub functions below read every element through BOTH forms so
+# the corpus can distinguish them — and, since the same fix added the
+# pointee-typed load path, check_local_sub covers `p[i]` on a local *i32,
+# which was ALSO byte-loaded pre-#1328.
+#
+# Stores here intentionally use the deref form only: subscript STORES
+# (`g[i] = x` / `p[i] = x` on a typed pointer) lower via STMT_INDEX_ASSIGN
+# and are still miscompiled — tracked separately, out of #1328's scope.
 #
 # Each check prints its result so a mismatch is legible in the diff Stage 3/4
 # take, and main returns non-zero so the failure is also an exit-code failure.
@@ -81,12 +93,102 @@ fn check_ptrs() -> i32
     print(c"\n")
     bad
 
+# --- AGAST #1328: subscript-form loads (g[i]) on global pointers ---------
+# Stores stay deref-form (see header); loads are checked via BOTH forms.
+
+fn check_i32_sub() -> i32
+    for i in 0..N
+        *(g_i32 + i) = i * 11
+    var bad: i32 = 0
+    for i in 0..N
+        if g_i32[i] != i * 11
+            bad = bad + 1
+        if g_i32[i] != *(g_i32 + i)
+            bad = bad + 1
+    print(c"i32 sub mismatches=")
+    print_int(bad as i64)
+    print(c"\n")
+    bad
+
+fn check_i64_sub() -> i32
+    for i in 0..N
+        *(g_i64 + i) = (i * 101) as i64
+    var bad: i32 = 0
+    for i in 0..N
+        if g_i64[i] != (i * 101) as i64
+            bad = bad + 1
+        if g_i64[i] != *(g_i64 + i)
+            bad = bad + 1
+    print(c"i64 sub mismatches=")
+    print_int(bad as i64)
+    print(c"\n")
+    bad
+
+fn check_u8_sub() -> i32
+    for i in 0..N
+        *(g_u8 + i) = (i + 97) as u8
+    var bad: i32 = 0
+    for i in 0..N
+        if g_u8[i] != (i + 97) as u8
+            bad = bad + 1
+        if g_u8[i] != *(g_u8 + i)
+            bad = bad + 1
+    print(c"u8 sub mismatches=")
+    print_int(bad as i64)
+    print(c"\n")
+    bad
+
+fn check_ptrs_sub() -> i32
+    let a: *u8 = c"gamma"
+    let b: *u8 = c"delta"
+    for i in 0..N
+        if i % 2 == 0
+            *(g_ptrs + i) = a
+        else
+            *(g_ptrs + i) = b
+    var bad: i32 = 0
+    for i in 0..N
+        if i % 2 == 0
+            if g_ptrs[i] != a
+                bad = bad + 1
+        else
+            if g_ptrs[i] != b
+                bad = bad + 1
+        if g_ptrs[i] != *(g_ptrs + i)
+            bad = bad + 1
+    print(c"ptr sub mismatches=")
+    print_int(bad as i64)
+    print(c"\n")
+    bad
+
+# Local *i32 subscript load — byte-loaded pre-#1328 (no pointee-typed path
+# existed at all; the global miss just guaranteed the broken fallback).
+fn check_local_sub() -> i32
+    let p: *i32 = malloc(N * 4) as *i32
+    for i in 0..N
+        *(p + i) = i * 13
+    var bad: i32 = 0
+    for i in 0..N
+        if p[i] != i * 13
+            bad = bad + 1
+        if p[i] != *(p + i)
+            bad = bad + 1
+    print(c"local i32 sub mismatches=")
+    print_int(bad as i64)
+    print(c"\n")
+    bad
+
 fn main() -> i32
     var bad: i32 = 0
     bad = bad + check_i32()
     bad = bad + check_i64()
     bad = bad + check_u8()
     bad = bad + check_ptrs()
+    bad = bad + check_i32_sub()
+    bad = bad + check_i64_sub()
+    bad = bad + check_u8_sub()
+    bad = bad + check_ptrs_sub()
+    bad = bad + check_local_sub()
     if bad == 0
         print(c"OK\n")
         return 0
