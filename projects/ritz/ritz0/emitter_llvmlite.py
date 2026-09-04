@@ -9568,8 +9568,16 @@ class LLVMEmitter:
             self.builder.position_at_end(arm_block)
 
             # Emit the arm body (which may include casts like `x as i32`)
+            # A `return` inside one arm must not leak has_returned past
+            # the match — _emit_if saves/restores per branch; matches must
+            # too, or the function's trailing expression is skipped and the
+            # merge block is left empty and unterminated (AGAST #1321,
+            # angelo loader/ttf.ritz). Reset per arm, recombined at merge.
+            _saved_arm_returned = self.has_returned
+            self.has_returned = False
             arm_val = self._emit_expr_with_expected_enum(
                 arm.body, getattr(self, '_expected_enum_name', None))
+            self.has_returned = _saved_arm_returned
             arm_values.append(arm_val)
 
             # Remember which block we're in after emitting the body
@@ -9581,6 +9589,11 @@ class LLVMEmitter:
 
         # Position at merge block
         self.builder.position_at_end(merge_block)
+        # The function has definitively returned only if *every* arm
+        # terminated (nothing reaches the merge block). Otherwise control
+        # continues here and later statements/tail must still be emitted.
+        if arm_exit_blocks and all(b is None for b in arm_exit_blocks):
+            self.has_returned = True
 
         # Create phi node for the result if arms have values
         if arm_values and arm_exit_blocks:
@@ -9766,8 +9779,16 @@ class LLVMEmitter:
                     # Wildcard patterns just discard the value
 
             # Emit the arm body
+            # A `return` inside one arm must not leak has_returned past
+            # the match — _emit_if saves/restores per branch; matches must
+            # too, or the function's trailing expression is skipped and the
+            # merge block is left empty and unterminated (AGAST #1321,
+            # angelo loader/ttf.ritz). Reset per arm, recombined at merge.
+            _saved_arm_returned = self.has_returned
+            self.has_returned = False
             arm_val = self._emit_expr_with_expected_enum(
                 arm.body, getattr(self, '_expected_enum_name', None))
+            self.has_returned = _saved_arm_returned
 
             # Remember which block we're in after emitting the body
             if not self.builder.block.is_terminated:
@@ -9787,6 +9808,11 @@ class LLVMEmitter:
 
         # Position at merge block
         self.builder.position_at_end(merge_block)
+        # The function has definitively returned only if *every* arm
+        # terminated (nothing reaches the merge block). Otherwise control
+        # continues here and later statements/tail must still be emitted.
+        if arm_exit_blocks and all(b is None for b in arm_exit_blocks):
+            self.has_returned = True
 
         # Create phi node for the result if arms have values
         if arm_values and arm_exit_blocks:
@@ -9910,8 +9936,16 @@ class LLVMEmitter:
                 self.params[pattern.name] = (match_val, int_type)
 
             # Emit the arm body
+            # A `return` inside one arm must not leak has_returned past
+            # the match — _emit_if saves/restores per branch; matches must
+            # too, or the function's trailing expression is skipped and the
+            # merge block is left empty and unterminated (AGAST #1321,
+            # angelo loader/ttf.ritz). Reset per arm, recombined at merge.
+            _saved_arm_returned = self.has_returned
+            self.has_returned = False
             arm_val = self._emit_expr_with_expected_enum(
                 arm.body, getattr(self, '_expected_enum_name', None))
+            self.has_returned = _saved_arm_returned
             arm_values.append(arm_val)
 
             # Check if the arm already terminated (e.g., with return)
@@ -9927,6 +9961,11 @@ class LLVMEmitter:
 
         # Position at merge block
         self.builder.position_at_end(merge_block)
+        # The function has definitively returned only if *every* arm
+        # terminated (nothing reaches the merge block). Otherwise control
+        # continues here and later statements/tail must still be emitted.
+        if arm_exit_blocks and all(b is None for b in arm_exit_blocks):
+            self.has_returned = True
 
         # Create phi node for the result if arms have values
         if arm_values and arm_exit_blocks:
