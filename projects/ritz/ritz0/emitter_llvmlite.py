@@ -781,6 +781,20 @@ class LLVMEmitter:
                         expr.span, 'Span',
                         [rast.NamedType(expr.span, 'u8', [])],
                     )
+            # Static method call `Type.method(...)`: the receiver is a *type
+            # name*, not a value, so value inference below can never resolve
+            # it. Look the mangled function up directly. Without this,
+            # `var reader = Reader.new(data)` recorded no type for `reader`,
+            # and a later `reader.read_u16()?` failed with "Try operator
+            # requires a Result type" (AGAST #1321, cmap/hmtx/loca trio).
+            if isinstance(expr.expr, rast.Ident) and (
+                    expr.expr.name in self.struct_types
+                    or expr.expr.name in self.enum_types):
+                mangled = f"{expr.expr.name}_{expr.method}"
+                if mangled in self.functions:
+                    fn_def = self.functions[mangled][1]
+                    if fn_def is not None and fn_def.ret_type is not None:
+                        return fn_def.ret_type
             # User-defined methods: impl methods are emitted as free functions
             # named `<Type>_<method>`, so resolve the receiver's type and look
             # the mangled function up to recover the declared return type.
