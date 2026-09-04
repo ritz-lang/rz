@@ -41,3 +41,32 @@ WIP enumeration notes. Squashed/removed before final; parent squashes on reap.
    range` in `_emit_enum_match` (~9547) GEP for `data_index`: enum matched
    with tag-only/unspecialized layout — same class as tests.ritz raw generic
    `Option` name gap (item 3). Confirms the predicted hidden Option failure.
+
+## Post-cascade findings (discovery/font/interpreter fully peeled)
+
+The "8 failures / 4 classes" triage was the *first layer*. Peeling revealed
+the full defect graph — final tally 12 distinct defects:
+
+**ritz0 defects (fixed here, each with regression tests):**
+- Auto-borrow rvalue args, `_emit_method_call` arm (item 4) — 6c80cdd, 711907d
+- Auto-borrow rvalue args, `_emit_call`/#1290 arm — 1261578 (separate commit,
+  revertable; parent closes #1290 at merge)
+- Synthesized Option/Result specializations: ad-hoc layout (align:=size,
+  placeholder payloads) disagreeing with the shared layout helper → 6f7d325.
+  Item 5's real root — NOT the item-3 class as first suspected.
+- Static-style UFCS calls rejected (`String.from` → `string_from`) — 1d49997
+- Nested-pattern located diagnostic (item 2 deliverable) — df08623
+- Expected-enum threading: if/match arm tails, block tails, and
+  `_emit_assign_expr` (arm-position assignments) — df08623
+- Match on method-call scrutinee: identified-struct-type fallback — df08623
+- Match phi over ir.Undefined (mixed value/assignment-tail arms) — df08623
+
+**angelo fantasy-API defects (angelo-side rewrites):**
+- `String.concat` → push_strview; `Vec.clone` → `[:]` (ritzlib gap filed as
+  AGAST #1338); `vec pop as Option` → emptiness guard; `rfind`/`to_lowercase`/
+  `char_at`-on-StrView/u8 case predicates → agent adding ritzlib fns +
+  rewrites (discovery.ritz, subpixel.ritz)
+- font.ritz nested pattern → two-level match (df08623)
+
+**Still open (agent-owned):** item 1 (?-trio: cmap/hmtx/loca), item 3
+(tests.ritz raw-generic Option let/var path).
