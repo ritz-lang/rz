@@ -8676,8 +8676,14 @@ class LLVMEmitter:
 
         # Check if this is a static method (no self parameter)
         # Static methods are called as Type.method() with no receiver instance
-        # For UFCS fallback functions, treat first parameter as receiver even if not named 'self'
-        has_self_param = len(fn_def.params) > 0 and (fn_def.params[0].name == 'self' or used_ufcs_fallback)
+        # For UFCS fallback functions, treat first parameter as receiver even
+        # if not named 'self' — but only when the call actually *has* a
+        # receiver instance. A static-style UFCS call (`String.from(x)` ->
+        # `string_from(x)`) passes its arguments plainly; forcing a self param
+        # here made the static-call check below reject it. AGAST #1321.
+        has_self_param = len(fn_def.params) > 0 and (
+            fn_def.params[0].name == 'self'
+            or (used_ufcs_fallback and not is_static_call))
 
         # For static calls (Type.method()), verify there's no self parameter
         if is_static_call and has_self_param:
