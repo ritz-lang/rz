@@ -10139,6 +10139,15 @@ class LLVMEmitter:
             return ty.name
         elif isinstance(ty, rast.PtrType):
             return "ptr_" + self._type_to_name_suffix(ty.inner)
+        elif isinstance(ty, rast.TupleType):
+            # str(ty) embeds the source *span*, so `Result<(), E>` written in
+            # two places produced two distinct enum names for the same type —
+            # invalid IR at the ret boundary (AGAST #1321,
+            # angelo hinting/interpreter.ritz).
+            if not ty.elements:
+                return "unit"
+            return "tuple_" + "_".join(
+                self._type_to_name_suffix(e) for e in ty.elements)
         else:
             return str(ty)
 
