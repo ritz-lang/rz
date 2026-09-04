@@ -3489,8 +3489,18 @@ class LLVMEmitter:
                     self._emit_array_fill_to_alloca(stmt.value, alloca, ty)
                 # Check if this is an enum variant constructor that needs type context
                 elif self._is_enum_variant_call(stmt.value) and stmt.type and isinstance(stmt.type, rast.NamedType):
-                    # Use declared enum type to construct the correct variant
-                    val = self._emit_enum_variant_with_type(stmt.value, stmt.type.name)
+                    # Use declared enum type to construct the correct variant.
+                    # A generic annotation (`Option<Foo>`) must resolve to its
+                    # specialization (`Option$Foo`) — the raw name is not a
+                    # registered enum and raised "Unknown enum type: Option"
+                    # (AGAST #1321, tests.ritz). Mirrors the AssignStmt path.
+                    target_enum = self._resolve_enum_type_name(stmt.type)
+                    if target_enum is None and stmt.type.args:
+                        target_enum = self._ensure_builtin_generic_specialization(
+                            stmt.type)
+                    if target_enum is None:
+                        target_enum = stmt.type.name
+                    val = self._emit_enum_variant_with_type(stmt.value, target_enum)
                     val = self._convert_type(val, ty)
                     self.builder.store(val, alloca)
                 else:
