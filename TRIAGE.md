@@ -20,12 +20,24 @@ WIP enumeration notes. Squashed/removed before final; parent squashes on reap.
    name to enum lookup while the assignment path resolves it properly.
    Mechanical fix, mirrors existing code.
 
-## Open
+## Classified (cont.)
 
-4. **discovery.ritz StrView\*** — `TypeError: Type of #2 arg mismatch:
-   %"struct.ritz_module_1.StrView"* != %"struct.ritz_module_1.StrView"`.
-   Question: is this the #1290 auto-borrow gap (by-value struct passed where
-   callee expects `*T`, codegen fails to auto-take address —
-   known case `vec_get$Point2D`)? Diagnosis in progress — first diagnostic
-   agent lost to a permission-prompt stall (AGAST #1337).
-   NOTE: a sibling `Option` failure may hide behind this one in discovery.ritz.
+4. **discovery.ritz StrView\*** — CONFIRMED same defect *class* as #1290
+   (auto-borrow gap: value passed where callee expects pointer), but a
+   *sibling site*, not the identical code path:
+   - `_emit_call` (~7313): has the rvalue-spill fallback (`arg.tmp`) but only
+     triggers auto-borrow for ritz-level RefType/mutable-borrow params —
+     misses `*T` PtrType-expected params → the #1290 `vec_get$Point2D` shape.
+   - `_emit_method_call` (~8746): triggers on the right condition (LLVM
+     pointer-typed param) but on unaddressable args fell back to emitting the
+     struct BY VALUE → the discovery.ritz crash.
+   FIXED: method-call fallback now spills rvalue args to an entry-block
+   alloca (mirrors receiver path and `_emit_call`). Verified: StrView*
+   mismatch gone; discovery.ritz progresses to next error.
+   TODO: regression test in ritz0/tests; check whether same trigger-condition
+   fix in `_emit_call` closes #1290 proper (separate ticket unless trivial).
+
+5. **discovery.ritz sibling (was hidden)** — `IndexError: tuple index out of
+   range` in `_emit_enum_match` (~9547) GEP for `data_index`: enum matched
+   with tag-only/unspecialized layout — same class as tests.ritz raw generic
+   `Option` name gap (item 3). Confirms the predicted hidden Option failure.

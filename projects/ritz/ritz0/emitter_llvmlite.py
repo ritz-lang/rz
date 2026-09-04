@@ -8745,7 +8745,17 @@ class LLVMEmitter:
                 try:
                     all_args.append(self._emit_lvalue_addr(arg))
                 except ValueError:
-                    all_args.append(self._emit_expr(arg))
+                    # Rvalue argument (literal, call result, ...): spill to a
+                    # stack slot so we can pass its address (auto-borrow
+                    # rvalue), mirroring the receiver path and _emit_call.
+                    tmp_val = self._emit_expr(arg)
+                    if (not isinstance(tmp_val.type, ir.PointerType)
+                            and tmp_val.type == expected_type.pointee):
+                        tmp = self._alloca_in_entry_block(tmp_val.type, "arg.tmp")
+                        self.builder.store(tmp_val, tmp)
+                        all_args.append(tmp)
+                    else:
+                        all_args.append(tmp_val)
             else:
                 all_args.append(self._emit_expr(arg))
 
