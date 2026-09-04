@@ -28,6 +28,7 @@ Examples:
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -106,13 +107,18 @@ def collect_dependency_paths(project_name, seen=None):
     return paths
 
 
-def run_build(project_name, extra_args=None):
-    """Run build.py for a specific project."""
-    project_dir = PROJECTS_DIR / project_name
-    if not project_dir.exists():
-        print(f"Error: Project '{project_name}' not found", file=sys.stderr)
-        return 1
+def child_env(project_name):
+    """Environment for a build.py child: dependency RITZ_PATH + unbuffered stdio.
 
+    PYTHONUNBUFFERED matters more than it looks. When CI pipes our stdout,
+    the parent's "Testing: <project>" banners sit in an 8 KB block buffer
+    until this process exits, while each child's diagnostics flush when the
+    child exits. The CI log then shows all the diagnostics first (orphaned,
+    unattributed) and every banner back-to-back at the end — which is how
+    `rz test --all` came to report "12 projects failed" with apparently zero
+    output between the banners (AGAST #1324). Unbuffered children plus
+    flushed banners (see the --all loops) keep cause next to effect.
+    """
     # Collect all dependency paths for RITZ_PATH (for lib.* imports in dependencies)
     dep_paths = collect_dependency_paths(project_name)
     # Always include ritz for ritzlib
@@ -122,6 +128,114 @@ def run_build(project_name, extra_args=None):
 
     env = os.environ.copy()
     env["RITZ_PATH"] = ritz_path
+    env["PYTHONUNBUFFERED"] = "1"
+    return env
+
+
+def gate_outcome(failed, known_failing, ran):
+    """Classify an --all sweep against the known-failing list.
+
+    Returns (hard, known, xpass):
+      hard  — failed and NOT excused: these gate.
+      known — failed and excused in [ci.known_failing.*]: advisory, visible.
+      xpass — excused but PASSED: stale exclusion; gates too (strict), so
+              the list can only shrink. Entries not in `ran` are ignored
+              (a project filtered out of this sweep is not an xpass).
+    """
+    ran_set = set(ran)
+    failed_set = set(failed)
+    hard = [p for p in failed if p not in known_failing]
+    known = [p for p in failed if p in known_failing]
+    xpass = [p for p in known_failing if p in ran_set and p not in failed_set]
+    return hard, known, xpass
+
+
+def summarize_gate(kind, failed, known_failing, ran, list_kind=None):
+    """Print the end-of-sweep gate summary; return the process exit code.
+
+    The known-failing list is deliberately NOT continue-on-error: excused
+    failures are printed with their justification (each carries an AGAST
+    task reference — enforced at load time by validate_known_failing and
+    again in tools/test_rz_cli.py), and an excused project that starts
+    passing fails the gate until it is delisted. Strict xpass forces stale
+    entries OUT; it does not prevent new entries being added — additions
+    are a review-time concern.
+
+    `list_kind` names which rz.toml table the excuses came from, when that
+    differs from the sweep kind (the test sweep consults the BUILD list —
+    see cmd_test for why there is no [ci.known_failing.test]).
+    """
+    list_kind = list_kind or kind
+    hard, known, xpass = gate_outcome(failed, known_failing, ran)
+
+    print(flush=True)
+    if known:
+        print(f"⚠ {len(known)} known-failing project(s) still failing "
+              f"(advisory, tracked in rz.toml [ci.known_failing.{list_kind}]):",
+              flush=True)
+        for p in known:
+            print(f"    {p} — {known_failing[p]}", flush=True)
+    if xpass:
+        print(f"🎉 known-failing project(s) now PASS: {', '.join(xpass)}",
+              flush=True)
+        print(f"    Remove them from [ci.known_failing.{list_kind}] in rz.toml "
+              f"(and close the task) — this gate fails until the list is "
+              f"accurate.", flush=True)
+    if hard:
+        print(f"✗ Failed {kind}: {', '.join(hard)}", flush=True)
+        return 1
+    if xpass:
+        return 1
+    gating = len(ran) - len(known)
+    print(f"✓ All {gating} gating project(s) passed {kind} "
+          f"({len(known)} known-failing excluded, listed above)."
+          if known else
+          f"✓ All {gating} project(s) passed {kind}.", flush=True)
+    return 0
+
+
+# An excuse must cite a tracking task by number. Enforced at runtime (below),
+# not only in pytest — `rz` itself refuses a malformed excuse rather than
+# honouring it.
+AGAST_REF_RE = re.compile(r"#\d+")
+
+
+def validate_known_failing(kind, entries):
+    """Validate a [ci.known_failing.<kind>] table; exit(2) on malformed input.
+
+    Rules: the table must map project -> string reason, and every reason
+    must cite an AGAST task as `#<number>`. A bare '#' or a prose excuse
+    without a ticket is rejected — an unjustified exclusion is exactly the
+    fail-open this gate exists to remove.
+    """
+    if not isinstance(entries, dict):
+        sys.exit(f"rz.toml [ci.known_failing.{kind}] must be a table of "
+                 f'project = "AGAST #<n> — reason" entries, '
+                 f"got: {entries!r}")
+    for project, reason in entries.items():
+        if not isinstance(reason, str) or not AGAST_REF_RE.search(reason):
+            sys.exit(f"rz.toml [ci.known_failing.{kind}] {project}: "
+                     f"justification must cite an AGAST task number "
+                     f"(e.g. 'AGAST #1321 — why'), got: {reason!r}")
+    return dict(entries)
+
+
+def known_failing_from_config(kind):
+    """Load [ci.known_failing.<kind>] from rz.toml as a validated
+    {project: reason} dict. Exits with an error on malformed entries."""
+    config = load_workspace_config()
+    entries = config.get("ci", {}).get("known_failing", {}).get(kind, {})
+    return validate_known_failing(kind, entries)
+
+
+def run_build(project_name, extra_args=None):
+    """Run build.py for a specific project."""
+    project_dir = PROJECTS_DIR / project_name
+    if not project_dir.exists():
+        print(f"Error: Project '{project_name}' not found", file=sys.stderr)
+        return 1
+
+    env = child_env(project_name)
 
     cmd = [sys.executable, str(RITZ_BUILD), "build", str(project_dir)]
     if extra_args:
@@ -138,15 +252,7 @@ def run_test(project_name, extra_args=None):
         print(f"Error: Project '{project_name}' not found", file=sys.stderr)
         return 1
 
-    # Collect all dependency paths for RITZ_PATH (for lib.* imports in dependencies)
-    dep_paths = collect_dependency_paths(project_name)
-    # Always include ritz for ritzlib
-    dep_paths.append(PROJECTS_DIR / "ritz")
-    # Build colon-separated RITZ_PATH using absolute paths
-    ritz_path = ":".join(str(p.resolve()) for p in dep_paths)
-
-    env = os.environ.copy()
-    env["RITZ_PATH"] = ritz_path
+    env = child_env(project_name)
 
     cmd = [sys.executable, str(RITZ_BUILD), "test", str(project_dir)]
     if extra_args:
@@ -166,17 +272,19 @@ def cmd_build(args):
         projects = discover_projects()
         failed = []
         for project in projects:
-            print(f"\n{'='*60}")
-            print(f"Building: {project}  (compiler={compiler})")
-            print('='*60)
-            if run_build(project, extra_args) != 0:
+            # flush=True on the banner (and the verdict below) is load-bearing:
+            # with stdout piped (CI), unflushed banners detach from the child
+            # diagnostics that follow them. See child_env().
+            print(f"\n{'='*60}", flush=True)
+            print(f"Building: {project}  (compiler={compiler})", flush=True)
+            print('='*60, flush=True)
+            rc = run_build(project, extra_args)
+            if rc != 0:
                 failed.append(project)
+                print(f"✗ {project}: build failed (exit {rc})", flush=True)
 
-        if failed:
-            print(f"\nFailed projects: {', '.join(failed)}")
-            return 1
-        print(f"\nAll {len(projects)} projects built successfully!")
-        return 0
+        return summarize_gate(
+            "build", failed, known_failing_from_config("build"), projects)
 
     if not args.project:
         print("Error: Specify a project or use --all", file=sys.stderr)
@@ -207,17 +315,29 @@ def cmd_test(args):
             # test/ and tests/ globs, test_only packages, test.sh) and prints
             # "No tests found, skipping" without failing. Deferring to it
             # keeps discovery in one place instead of two that disagree.
-            print(f"\n{'='*60}")
-            print(f"Testing: {project}  (compiler={compiler})")
-            print('='*60)
-            if run_test(project, extra_args) != 0:
+            # flush=True is load-bearing under a piped stdout — see child_env().
+            print(f"\n{'='*60}", flush=True)
+            print(f"Testing: {project}  (compiler={compiler})", flush=True)
+            print('='*60, flush=True)
+            rc = run_test(project, extra_args)
+            if rc != 0:
                 failed.append(project)
+                print(f"✗ {project}: tests failed (exit {rc})", flush=True)
 
-        if failed:
-            print(f"\nFailed tests: {', '.join(failed)}")
-            return 1
-        print("\nAll tests passed!")
-        return 0
+        # There is deliberately NO [ci.known_failing.test]. House rule
+        # (scripts/regression.sh): an allowlist may say "this program is
+        # known not to compile"; it must never excuse behavioural failure.
+        # A test-side excuse would do exactly that. But a project that
+        # cannot COMPILE also fails its test sweep for the same compile
+        # reason — that is the build fact again, not new behavioural
+        # information — so the test gate consults the BUILD list and
+        # nothing else. If an excused project starts compiling, the build
+        # sweep xpass-fails and forces delisting, which immediately
+        # re-exposes any genuine behavioural failure here. Every other
+        # test failure gates, always.
+        return summarize_gate(
+            "test", failed, known_failing_from_config("build"), projects,
+            list_kind="build")
 
     if not args.project:
         print("Error: Specify a project or use --all", file=sys.stderr)

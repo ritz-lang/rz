@@ -1908,6 +1908,24 @@ def build_package(pkg_dir: Path, config: dict, keep_artifacts: bool = False, use
     return PackageBuildResult(built=built, failed=failed, skipped=plan.skipped)
 
 
+def ritz_path_for_tests(caller_path: str) -> str:
+    """RITZ_PATH for test children: this tree's ROOT first, then the
+    caller's entries, deduplicated by resolved path.
+
+    ROOT goes FIRST because import resolution is first-match-wins and a
+    leaked RITZ_PATH from a parent shell may point at a *different
+    worktree* — its ritzlib must not shadow this tree's when build.py is
+    invoked directly (`python3 build.py test ...`, `make test`). This
+    matches the ritz1 compile-step ordering ("Put ROOT first (ritzlib
+    priority)") elsewhere in this file. ROOT is resolved so symlinked or
+    relative spellings of the same directory don't survive as duplicates.
+    """
+    root_str = str(ROOT.resolve())
+    caller_entries = [p for p in caller_path.split(":") if p]
+    kept = [p for p in caller_entries if str(Path(p).resolve()) != root_str]
+    return ":".join([root_str] + kept)
+
+
 def run_tests(pkg_dir: Path, config: dict) -> bool:
     """Run tests for a package."""
     pkg_name = config["package"]["name"]
@@ -1946,7 +1964,12 @@ def run_tests(pkg_dir: Path, config: dict) -> bool:
         # relative paths work; imports still resolve via RITZ_PATH (env-based,
         # not CWD-based — see ritz0/import_resolver.py).
         test_env = os.environ.copy()
-        test_env["RITZ_PATH"] = str(ROOT)  # needed for ritzlib.* resolution
+        # Preserve any caller-provided RITZ_PATH — the workspace `rz` CLI
+        # builds a per-project dependency path list and passes it down; this
+        # used to REPLACE it with just the ritz root, silently breaking
+        # `lib.*` imports from path-dependencies in tests (AGAST #1324).
+        test_env["RITZ_PATH"] = ritz_path_for_tests(
+            test_env.get("RITZ_PATH", ""))
 
         # Per-file timeout budget. 180s handles even slow elliptic-curve
         # bigint tests on a debug build; can be tuned via RITZ_TEST_TIMEOUT.
@@ -1988,16 +2011,23 @@ def run_tests(pkg_dir: Path, config: dict) -> bool:
                 # Try to surface the most actionable line
                 err_first = ""
                 for line in err_blob.splitlines():
-                    if any(tag in line for tag in (
-                        "Cannot select", "fatal error", "error:", "ValueError:",
-                        "Unknown function", "Illegal instruction", "Segmentation fault",
+                    # Case-insensitive "error" so compiler diagnostics like
+                    # "Error in <file>: ..." match. The old tag list required
+                    # a literal "error:", missed them, and fell through to the
+                    # last line of output — which for a compile failure is the
+                    # content-free "  - <file>: error" harness summary line
+                    # (AGAST #1324).
+                    low = line.lower()
+                    if any(tag in low for tag in (
+                        "cannot select", "fatal error", "error", "valueerror:",
+                        "unknown function", "illegal instruction", "segmentation fault",
                     )):
                         err_first = line.strip()
                         break
                 if not err_first:
                     err_first = err_blob.strip().splitlines()[-1] if err_blob.strip() else "(no output)"
-                failing_files.append((tfile, err_first[:160]))
-                print(f"    ✗ {tfile.name} — {err_first[:120]}")
+                failing_files.append((tfile, err_first[:200]))
+                print(f"    ✗ {tfile.name} — {err_first[:200]}")
                 all_passed = False
                 continue
 
