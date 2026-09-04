@@ -132,3 +132,32 @@ def test_ptr_arith_arg_to_u8_param_not_spilled(tmp_path):
     assert result.returncode == 0, (
         f"pointer-arithmetic arg to *u8 param failed to compile:\n{result.stderr}"
     )
+
+
+# An Ident that already *holds* a `*T` must be passed through, not
+# re-borrowed. Inference can report the binding as the pointee type `T`
+# (ritzlib async_tasks.ritz: `*Task` locals), and taking the lvalue
+# address of the binding passed `T**` where `T*` was expected.
+PTR_LOCAL_TO_PTR_PARAM = """\
+pub struct Task
+    id: i32
+
+fn find(t: *Task) -> *Task
+    return t
+
+fn use_task(t: *Task) -> i32
+    return t.id
+
+fn main() -> i32
+    var slot: Task = Task { id: 9 }
+    var task = find(@slot)
+    return use_task(task) - 9
+"""
+
+
+def test_ptr_local_arg_not_double_borrowed(tmp_path):
+    result = _compile(tmp_path, PTR_LOCAL_TO_PTR_PARAM)
+    assert result.returncode == 0, (
+        f"*T-holding local passed to *T param failed to compile:\n"
+        f"{result.stderr}"
+    )

@@ -7442,7 +7442,35 @@ class LLVMEmitter:
                     and arg_ritz_type.name in self.struct_types
                 )
 
-                if is_mutable_borrow or is_ref_type or is_matching_ptr_param:
+                if is_matching_ptr_param and not (is_mutable_borrow or is_ref_type):
+                    # `*T` param whose pointee matches the arg's inferred named
+                    # type. Inference is not authoritative here: an Ident
+                    # *holding* a `*Task` can infer as `Task` (ritzlib
+                    # async_tasks.ritz), and taking its lvalue address would
+                    # pass `Task**`. Decide from the actual emitted types:
+                    #   - lvalue address matches the param -> borrow in place
+                    #   - emitted value matches the param  -> already a pointer
+                    #   - emitted value matches the pointee -> rvalue, spill
+                    val = None
+                    try:
+                        addr = self._emit_lvalue_addr(arg)
+                        if addr.type == expected_type:
+                            val = addr
+                    except ValueError:
+                        pass
+                    if val is None:
+                        tmp_val = self._emit_expr(arg)
+                        if tmp_val.type == expected_type:
+                            val = tmp_val
+                        elif (isinstance(expected_type, ir.PointerType)
+                                and tmp_val.type == expected_type.pointee):
+                            tmp = self._alloca_in_entry_block(
+                                tmp_val.type, "arg.tmp")
+                            self.builder.store(tmp_val, tmp)
+                            val = tmp
+                        else:
+                            val = self._convert_type(tmp_val, expected_type)
+                elif is_mutable_borrow or is_ref_type:
                     if arg_is_ref or arg_is_ptr or arg_is_addr_of:
                         # Argument is already a pointer type - just emit it
                         val = self._emit_expr(arg)
@@ -8890,20 +8918,32 @@ class LLVMEmitter:
             arg_is_addr_of = isinstance(arg, rast.UnaryOp) and arg.op in ('&', '@', '@&', '&mut')
             if (expected_type is not None and isinstance(expected_type, ir.PointerType)
                     and not (arg_is_ref or arg_is_ptr or arg_is_addr_of)):
+                # Decide from actual emitted types, not inference: an Ident
+                # holding a `*T` infers as `T`, and its lvalue address is
+                # `T**` — passing that where `T*` is expected broke
+                # mausoleum/tome/valet (same hazard as _emit_call's arm).
+                val = None
                 try:
-                    all_args.append(self._emit_lvalue_addr(arg))
+                    addr = self._emit_lvalue_addr(arg)
+                    if addr.type == expected_type:
+                        val = addr
                 except ValueError:
-                    # Rvalue argument (literal, call result, ...): spill to a
-                    # stack slot so we can pass its address (auto-borrow
-                    # rvalue), mirroring the receiver path and _emit_call.
+                    pass
+                if val is None:
+                    # Already-pointer value, or an rvalue (literal, call
+                    # result, ...) that must be spilled to a stack slot so we
+                    # can pass its address (auto-borrow rvalue).
                     tmp_val = self._emit_expr(arg)
-                    if (not isinstance(tmp_val.type, ir.PointerType)
+                    if tmp_val.type == expected_type:
+                        val = tmp_val
+                    elif (not isinstance(tmp_val.type, ir.PointerType)
                             and tmp_val.type == expected_type.pointee):
                         tmp = self._alloca_in_entry_block(tmp_val.type, "arg.tmp")
                         self.builder.store(tmp_val, tmp)
-                        all_args.append(tmp)
+                        val = tmp
                     else:
-                        all_args.append(tmp_val)
+                        val = tmp_val
+                all_args.append(val)
             else:
                 all_args.append(self._emit_expr(arg))
 
