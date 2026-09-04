@@ -3239,9 +3239,19 @@ class LLVMEmitter:
                 last_val = self._emit_expr_with_expected_enum(fn_def.body.expr, expected_enum_name)
                 self.closure_expected_type = None  # Clear context
                 last_val = self._convert_type(last_val, ret_type)
-                # Emit drops before returning (excluding moved variable)
-                self._emit_drop_for_all_scopes(exclude_var)
-                self.builder.ret(last_val)
+                # A fn with no declared return type is a procedure: its tail
+                # expression is evaluated for effect only. _convert_type
+                # silently no-ops on aggregates, so without this check a
+                # struct-valued tail (e.g. `self.entries.pop()`) was emitted
+                # as `ret %Struct` in an i32 function — invalid IR (AGAST
+                # #1321, angelo cache.ritz evict_lru).
+                if fn_def.ret_type is None and last_val.type != ret_type:
+                    self._emit_drop_for_all_scopes(exclude_var)
+                    self.builder.ret(ir.Constant(ret_type, 0))
+                else:
+                    # Emit drops before returning (excluding moved variable)
+                    self._emit_drop_for_all_scopes(exclude_var)
+                    self.builder.ret(last_val)
             else:
                 # Emit drops before implicit return
                 self._emit_drop_for_all_scopes()
