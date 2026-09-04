@@ -1980,6 +1980,88 @@ fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: i32)
     s.break_label = old_break
     s.continue_label = old_continue
 
+# AGAST #1332 — subscript STORE through a pointer base (`b[i] = v` where b
+# is *T / **T).  The old STMT_INDEX_ASSIGN pointer arm hardcoded
+# `getelementptr i64` + `store i64` for every non-** pointer, so a *i32/*u8
+# base was written with an 8-byte stride AND an 8-byte width (7/8–8/8
+# corruption in 92_subscript_store), and a GLOBAL base emitted no store at
+# all — the whole arm was guarded by `find_local() >= 0` with no else, so
+# `g[i] = v` was silently dropped.  This is the store-side companion of
+# #1325/#1328, which fixed only the loads.
+#
+# `base_ptr` must already be a `ptr`-typed register; `pointee` may be
+# TYPE_UNKNOWN (unresolvable base), which falls back to the legacy i64
+# stride/width.  Index and value are emitted here to preserve the historical
+# evaluation order (index before value, both after the base load).
+fn emit_index_assign_ptr_store(s: *EmitterState, stmt: *Stmt, base_ptr: i32, base_type: i32, pointee: i32)
+    let idx_reg: i32 = emit_expr(s, stmt.while_cond)
+    let val_reg: i32 = emit_expr(s, stmt.assign_value)
+    let elem_ptr: i32 = next_reg(s)
+    if base_type == TYPE_PTR_PTR
+        # Pointer-to-pointer: element is a pointer.
+        emit_str(s, c"  ")
+        emit_reg(s, elem_ptr)
+        emit_str(s, c" = getelementptr ptr, ptr ")
+        emit_reg(s, base_ptr)
+        emit_str(s, c", i64 ")
+        emit_reg(s, idx_reg)
+        emit_str(s, c"\n")
+        let ptr_val: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, ptr_val)
+        emit_str(s, c" = inttoptr i64 ")
+        emit_reg(s, val_reg)
+        emit_str(s, c" to ptr\n")
+        emit_str(s, c"  store ptr ")
+        emit_reg(s, ptr_val)
+        emit_str(s, c", ptr ")
+        emit_reg(s, elem_ptr)
+        emit_str(s, c"\n")
+        return
+    # Element type from the pointee kind; unknown/i64/u64 → i64.
+    var elem_ty: *u8 = c"i64"
+    var narrow: i32 = 0
+    if pointee == TYPE_U8 or pointee == TYPE_I8
+        elem_ty = c"i8"
+        narrow = 1
+    else if pointee == TYPE_U16 or pointee == TYPE_I16
+        elem_ty = c"i16"
+        narrow = 1
+    else if pointee == TYPE_U32 or pointee == TYPE_I32
+        elem_ty = c"i32"
+        narrow = 1
+    emit_str(s, c"  ")
+    emit_reg(s, elem_ptr)
+    emit_str(s, c" = getelementptr ")
+    emit_str(s, elem_ty)
+    emit_str(s, c", ptr ")
+    emit_reg(s, base_ptr)
+    emit_str(s, c", i64 ")
+    emit_reg(s, idx_reg)
+    emit_str(s, c"\n")
+    if narrow == 1
+        let trunc: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, trunc)
+        emit_str(s, c" = trunc i64 ")
+        emit_reg(s, val_reg)
+        emit_str(s, c" to ")
+        emit_str(s, elem_ty)
+        emit_str(s, c"\n")
+        emit_str(s, c"  store ")
+        emit_str(s, elem_ty)
+        emit_str(s, c" ")
+        emit_reg(s, trunc)
+        emit_str(s, c", ptr ")
+        emit_reg(s, elem_ptr)
+        emit_str(s, c"\n")
+    else
+        emit_str(s, c"  store i64 ")
+        emit_reg(s, val_reg)
+        emit_str(s, c", ptr ")
+        emit_reg(s, elem_ptr)
+        emit_str(s, c"\n")
+
 fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
     if stmt.kind == STMT_VAR_DECL
         emit_var_decl(s, stmt)
@@ -2852,7 +2934,10 @@ fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                     emit_reg(s, elem_ptr)
                     emit_str(s, c"\n")
             else
-                # Pointer type - load the i64 value and convert to ptr
+                # Pointer local — load the i64 slot, convert to ptr, then
+                # GEP + store at the POINTEE's width (AGAST #1332; this was
+                # hardcoded `getelementptr i64` + `store i64` for every
+                # non-** pointer, byte-smearing *i32/*u8 stores).
                 let loaded_i64: i32 = next_reg(s)
                 emit_str(s, c"  ")
                 emit_reg(s, loaded_i64)
@@ -2865,48 +2950,33 @@ fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                 emit_str(s, c" = inttoptr i64 ")
                 emit_reg(s, loaded_i64)
                 emit_str(s, c" to ptr\n")
-                # Emit index expression (stored in while_cond)
-                let idx_reg: i32 = emit_expr(s, stmt.while_cond)
-                # Emit value expression
-                let val_reg: i32 = emit_expr(s, stmt.assign_value)
-                # GEP to get element pointer
-                let elem_ptr: i32 = next_reg(s)
+                var pointee: i32 = TYPE_UNKNOWN
+                if local != null
+                    pointee = local.pointee_type
+                emit_index_assign_ptr_store(s, stmt, base_ptr, base_type, pointee)
+        else
+            # AGAST #1332: GLOBAL pointer base.  Previously `base_reg >= 0`
+            # had no else, so `g[i] = v` through a global *T / **T emitted
+            # NO store at all — a silent drop that read back as malloc
+            # garbage (7/8–8/8 mismatches in 92_subscript_store).
+            let glob: *GlobalVarDef = find_global(s, stmt.assign_target, stmt.assign_target_len)
+            if glob != null
+                # Globals of pointer type are stored as i64 (emit_llvm_type):
+                # load the slot, convert to ptr, then share the pointee-width
+                # store path with the local arm.
+                let gloaded: i32 = next_reg(s)
                 emit_str(s, c"  ")
-                emit_reg(s, elem_ptr)
-                # Determine element type from base type
-                if base_type == TYPE_PTR_PTR
-                    # *(*i64) - pointer to pointers, element is ptr
-                    emit_str(s, c" = getelementptr ptr, ptr ")
-                    emit_reg(s, base_ptr)
-                    emit_str(s, c", i64 ")
-                    emit_reg(s, idx_reg)
-                    emit_str(s, c"\n")
-                    # Convert value to ptr and store
-                    let ptr_val: i32 = next_reg(s)
-                    emit_str(s, c"  ")
-                    emit_reg(s, ptr_val)
-                    emit_str(s, c" = inttoptr i64 ")
-                    emit_reg(s, val_reg)
-                    emit_str(s, c" to ptr\n")
-                    emit_str(s, c"  store ptr ")
-                    emit_reg(s, ptr_val)
-                    emit_str(s, c", ptr ")
-                    emit_reg(s, elem_ptr)
-                    emit_str(s, c"\n")
-                else
-                    # *T - pointer to values, element is the pointed-to type
-                    # For *i64, element type is i64
-                    emit_str(s, c" = getelementptr i64, ptr ")
-                    emit_reg(s, base_ptr)
-                    emit_str(s, c", i64 ")
-                    emit_reg(s, idx_reg)
-                    emit_str(s, c"\n")
-                    # Store value
-                    emit_str(s, c"  store i64 ")
-                    emit_reg(s, val_reg)
-                    emit_str(s, c", ptr ")
-                    emit_reg(s, elem_ptr)
-                    emit_str(s, c"\n")
+                emit_reg(s, gloaded)
+                emit_str(s, c" = load i64, ptr @")
+                emit_name(s, glob.name, glob.name_len)
+                emit_str(s, c"\n")
+                let gbase_ptr: i32 = next_reg(s)
+                emit_str(s, c"  ")
+                emit_reg(s, gbase_ptr)
+                emit_str(s, c" = inttoptr i64 ")
+                emit_reg(s, gloaded)
+                emit_str(s, c" to ptr\n")
+                emit_index_assign_ptr_store(s, stmt, gbase_ptr, glob.var_type, glob.pointee_type)
     else if stmt.kind == STMT_MEMBER_ASSIGN
         # ptr_expr.field = value
         # stmt.if_cond = ptr expression (the thing being dereferenced)

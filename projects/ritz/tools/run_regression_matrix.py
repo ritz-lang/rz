@@ -76,6 +76,7 @@ TESTS = [
     "test_issue_result_unwrap_method",
     "test_issue_sizeof_primitive",
     "test_issue_span_slice_range",
+    "test_issue_subscript_ptr_store",
     # NOTE: test_issue_struct_enum_variants (AGAST #1282, struct-style enum
     # variants) is deliberately NOT listed here yet. It passes under ritz0,
     # but every entry in this list also runs against ritz1 and
