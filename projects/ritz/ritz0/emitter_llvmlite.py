@@ -5182,11 +5182,13 @@ class LLVMEmitter:
             elif op == '==':
                 if is_float:
                     return self.builder.fcmp_ordered('==', left, right)
+                self._reject_aggregate_compare(op, left, expr)
                 # Equality is sign-agnostic
                 return self.builder.icmp_signed('==', left, right)
             elif op == '!=':
                 if is_float:
                     return self.builder.fcmp_ordered('!=', left, right)
+                self._reject_aggregate_compare(op, left, expr)
                 # Inequality is sign-agnostic
                 return self.builder.icmp_signed('!=', left, right)
             elif op == '<':
@@ -10194,6 +10196,28 @@ class LLVMEmitter:
                 self._type_to_name_suffix(e) for e in ty.elements)
         else:
             return str(ty)
+
+    def _reject_aggregate_compare(self, op: str, left_val: ir.Value,
+                                  expr: rast.BinOp) -> None:
+        """Raise a located diagnostic for `==`/`!=` on aggregate operands.
+
+        `icmp` only takes integers/pointers; letting a struct through emits
+        invalid IR that surfaces at link time as "icmp requires integer
+        operands" pointing at generated IR — a red herring (AGAST #1321,
+        angelo hinting/instructions.ritz comparing StrViews with `==`).
+        """
+        ty = left_val.type
+        if isinstance(ty, (ir.LiteralStructType, ir.IdentifiedStructType,
+                           ir.ArrayType)):
+            type_name = getattr(ty, 'name', None) or str(ty)
+            hint = ""
+            if type_name == 'StrView' or str(type_name).startswith('StrView'):
+                hint = " — use strview_eq(@a, @b) from ritzlib.strview"
+            elif type_name == 'String':
+                hint = " — use string_eq(@a, @b) from ritzlib.string"
+            raise EmitError(
+                f"'{op}' is not supported for struct type '{type_name}'"
+                f"{hint}", getattr(expr, 'span', None))
 
     def _emit_cast(self, expr: rast.Cast) -> ir.Value:
         """Emit a type cast: expr as Type.
