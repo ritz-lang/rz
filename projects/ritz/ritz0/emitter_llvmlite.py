@@ -7377,11 +7377,17 @@ class LLVMEmitter:
                 # match because their inferred type is a PtrType, not a
                 # NamedType. This is the `_emit_call` arm of the two-sited
                 # auto-borrow defect; the `_emit_method_call` arm is #1321.
+                # Restricted to *struct* pointees: primitive pointees like
+                # `*u8` are byte-buffer/cstr params whose arguments are often
+                # pointer arithmetic (`@buf[0] + n`) that _infer_ritz_type
+                # reports as the element type `u8` — spilling those passes
+                # `i8**` where `i8*` is expected (broke ritzlib/fs.ritz).
                 is_matching_ptr_param = (
                     isinstance(param_def.type, rast.PtrType)
                     and isinstance(param_def.type.inner, rast.NamedType)
                     and isinstance(arg_ritz_type, rast.NamedType)
                     and arg_ritz_type.name == param_def.type.inner.name
+                    and arg_ritz_type.name in self.struct_types
                 )
 
                 if is_mutable_borrow or is_ref_type or is_matching_ptr_param:

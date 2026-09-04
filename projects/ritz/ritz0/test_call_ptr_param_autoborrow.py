@@ -109,3 +109,26 @@ def test_u8_ptr_param_keeps_coercion_path(tmp_path):
         "c-string to *u8 parameter regressed:\n"
         f"{result.stderr}"
     )
+
+
+# Pointer arithmetic into a byte buffer, passed to a `*u8` param. The
+# predicate must NOT treat this as a borrow site: `_infer_ritz_type` reports
+# the BinOp as its element type `u8`, which name-matches the `*u8` pointee,
+# but the emitted value is already an `i8*`. Spilling it passed `i8**` where
+# `i8*` was expected and broke ritzlib/fs.ritz (sys_write of `@buf[0] + n`).
+PTR_ARITH_TO_U8_PARAM = """\
+fn sink(p: *u8) -> i32
+    return 0
+
+fn main() -> i32
+    var buf: [16]u8
+    var n: i64 = 4
+    return sink(@buf[0] + n)
+"""
+
+
+def test_ptr_arith_arg_to_u8_param_not_spilled(tmp_path):
+    result = _compile(tmp_path, PTR_ARITH_TO_U8_PARAM)
+    assert result.returncode == 0, (
+        f"pointer-arithmetic arg to *u8 param failed to compile:\n{result.stderr}"
+    )
