@@ -120,10 +120,30 @@ stack. Every fix below revealed the next; none were visible at triage time.
  - duplicate `test_rasterize_with_antialiasing` symbol (tests.ritz vs
    render.ritz) → renamed — `f3120ef`
 
-### Gate results (rebased onto f336bae)
- - ritz0 pytest: 762 passed, 8 skipped, 3 xpassed, 0 failed
+### Post-gate additions (defects 19–21, found by rz build --all)
+19. Auto-borrow over-borrowing: Ident holding `*T` infers as `T`; lvalue-
+    address borrowing passed `T**` where `T*` expected — broke mausoleum,
+    nexus, tome, valet via ritzlib async_tasks. Both arms now decide from
+    emitted types (verify lvalue addr against param; pass matching pointer
+    value; spill rvalue) — `457b5eb`
+20. #1290 predicate over-broad for `*u8` byte-buffer params (ptr-arith args
+    infer as `u8`) — `dc8eeed` (listed above as 3; same class as 19)
+21. tome hand-rolled private `string_eq_strview` collided with the new
+    ritzlib symbol at link — renamed `tome_string_eq_strview` (`457b5eb`);
+    more workaround evidence for the #1339 sweep
+
+### FINAL gate results (rebased onto f336bae, after 457b5eb)
+ - ritz0 pytest: 763 passed, 0 failed (8 skipped, 3 xpassed)
  - make matrix-full (clean ritz1/build): 53/53 × 3
- - angelo: builds, both configured binaries run exit 0
-   (NOTE: ritz.toml defines TWO binaries — angelo-test, simple-test — not three)
- - rz.toml: angelo removed from [ci.known_failing.build]
- - regression.sh + rz build --all: see reap callback
+ - RITZ_VERIFY_IR=1 regression.sh: 179 passed / 0 failed,
+   Stage 1: 71/0, Stage 3: 53/0, Stage 4: 53/0, Stage 5 fixed point HOLDS
+ - ritzlib tests: 261 passed / 0 failed; 3 residual failures
+   (fs runtime, string_methods compile, uring linker) all pre-exist at
+   branch base 9b39093 — base had 230 passed / 4 compile-failed
+ - angelo: python3 build.py build ../angelo exit 0; both configured
+   binaries build AND run exit 0
+   (NOTE: angelo ritz.toml defines TWO binaries — angelo-test,
+   simple-test — the ticket said three; flagging, not inventing a third)
+ - rz.toml: angelo removed from [ci.known_failing.build] (strict xpass)
+ - ./rz build --all: everything builds except harland, which fails ONLY on
+   the pre-excused local 'lld-link not found' (CI-only-green per parent)
