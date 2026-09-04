@@ -2150,16 +2150,24 @@ fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
             emit_label(s, end_label)
         emit_str(s, c"\n")
 
-        # Save current last_expr_reg before entering branches
+        # Save current last_expr_reg before entering branches.  The defining
+        # label rides along so the restore path below puts back a coherent
+        # (value, block) pair rather than re-dating the value to the merge
+        # block. (ritz-task-1309)
         let saved_last: i32 = s.last_expr_reg
+        let saved_last_label: i32 = s.last_expr_label
 
         begin_block(s, then_label)
-        s.last_expr_reg = 0  # Reset before then branch
+        clear_last_expr(s)  # Reset before then branch
         var then_stmt: *Stmt = stmt.if_then
         while then_stmt != null
             emit_stmt(s, then_stmt, ret_type)
             then_stmt = then_stmt.next
-        let then_result: i32 = s.last_expr_reg  # Capture then branch result
+        # ritz-task-1309 — `last_expr_here` (not `s.last_expr_reg`) so a value
+        # produced in a block nested inside the then-arm, which the insertion
+        # point has since left, is reported as "no value" instead of being
+        # falsely attributed to `then_exit_label` below.
+        let then_result: i32 = last_expr_here(s)  # Capture then branch result
         let then_exit_label: i32 = s.current_label  # Capture actual exit block
         emit_str(s, c"  br label %")
         emit_label(s, end_label)
@@ -2169,12 +2177,12 @@ fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         var else_exit_label: i32 = else_label
         if stmt.if_else != null
             begin_block(s, else_label)
-            s.last_expr_reg = 0  # Reset before else branch
+            clear_last_expr(s)  # Reset before else branch
             var else_stmt: *Stmt = stmt.if_else
             while else_stmt != null
                 emit_stmt(s, else_stmt, ret_type)
                 else_stmt = else_stmt.next
-            else_result = s.last_expr_reg  # Capture else branch result
+            else_result = last_expr_here(s)  # Capture else branch result
             else_exit_label = s.current_label  # Capture actual exit block
             emit_str(s, c"  br label %")
             emit_label(s, end_label)
@@ -2210,11 +2218,26 @@ fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
             emit_str(s, c", %")
             emit_label(s, else_exit_label)
             emit_str(s, c" ]\n")
-            s.last_expr_reg = phi_reg
-        else if then_result > 0
-            s.last_expr_reg = then_result
+            set_last_expr(s, phi_reg)
         else
+            # ritz-task-1309 — no phi, so this `if` contributes no value that
+            # is live in the merge block.
+            #
+            # There used to be a `then_result > 0` case here that propagated
+            # the then-arm's value out of the merge block.  That was one of
+            # the two confirmed leak paths: `then_result` is defined in the
+            # then-arm's exit block, which is NOT the merge block and does not
+            # dominate it (the else edge bypasses it).  An enclosing `if` then
+            # picked it up as a phi incoming and named the merge block as its
+            # predecessor — the exact `phi i64 [ %x, %L20 ]` shape this task
+            # exists to kill.  An if-without-else genuinely has no value on
+            # all paths, so there is nothing correct to propagate.
+            #
+            # Restore the pre-`if` value with its original defining label, so
+            # the pair stays coherent: still usable by an implicit return that
+            # it dominates, still correctly rejected as a phi incoming here.
             s.last_expr_reg = saved_last  # Restore if no result
+            s.last_expr_label = saved_last_label
 
     else if stmt.kind == STMT_WHILE
         let cond_label: i32 = next_label(s)
@@ -2434,7 +2457,7 @@ fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
             # tries to remove the real (dead) predecessor from the PHI.
             # (ritz-task-195)
             begin_block(s, dead_label)
-            s.last_expr_reg = 0
+            clear_last_expr(s)
 
     else if stmt.kind == STMT_CONTINUE
         if s.continue_label >= 0
@@ -2444,7 +2467,7 @@ fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
             let dead_label: i32 = next_label(s)
             # Same rationale as STMT_BREAK above. (ritz-task-195)
             begin_block(s, dead_label)
-            s.last_expr_reg = 0
+            clear_last_expr(s)
 
     else if stmt.kind == STMT_EXPR
         # Note: Implicit return only at function body level, not in nested blocks
@@ -2454,14 +2477,14 @@ fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
             eprints_cstr(c"ERROR: STMT_EXPR with null expr field!\n")
         else
             let expr_reg: i32 = emit_expr(s, stmt.expr)
-            s.last_expr_reg = expr_reg  # Track for if/else phi nodes
+            set_last_expr(s, expr_reg)  # Track for if/else phi nodes
     else if stmt.kind == STMT_MATCH
         # Statement-form match: `match scrut \n pattern => body ...`
         # The statement's result is tracked in last_expr_reg so an implicit
         # return picks up the phi value. See emitter_match.ritz.
         let arms: *MatchArm = stmt.if_then as *MatchArm
         let match_reg: i32 = emit_match(s, stmt.if_cond, arms)
-        s.last_expr_reg = match_reg
+        set_last_expr(s, match_reg)
     else if stmt.kind == STMT_LOCAL_FIELD_ASSIGN
         # local_var.field = value
         # stmt.var_name = variable name

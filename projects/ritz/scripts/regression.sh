@@ -894,6 +894,21 @@ run_stage4() {
 #
 # If this stage is red, do not edit an allowlist.  It will not help, and the
 # next reader will have to rediscover why.  Fix the compiler.
+# Known blind spot, worth stating because it has already cost us once:
+# this check compares ACCEPT sets, so it can only see divergence among
+# examples at least one compiler handles.  Wherever BOTH compilers reject
+# the same program, the name is absent from both sets, the sets match, and
+# Stage 5 goes green — agreement-by-shared-breakage, not a fixed point.
+# That is exactly how AGAST #1325 (a monomorphization divergence) hid behind
+# #1309's phi bug: the phi bug made both compilers reject 49_ritzgen, so the
+# sets agreed.  Fixing the phi bug made ritz1 accept it, ritz1_selfhosted
+# still rejected it, and only then did Stage 5 correctly go red.
+#
+# It is the same failure shape as the S3/S4 allowlist hole one level up: a
+# gate that passes because two things are equally broken.  A green Stage 5
+# means "the two compilers agree on what they accept", never "the compiler
+# is correct".  Shrinking the known-failures lists is what narrows the blind
+# spot; nothing inside this function can.
 run_stage5() {
     log "STAGE 5: self-hosting fixed-point check (ritz1 vs ritz1_selfhosted)"
     echo "----------------------------------------"

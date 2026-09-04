@@ -69,6 +69,22 @@ struct EmitterState
     emitted_global_count: i32
     # Track last expression value for if/else phi nodes
     last_expr_reg: i32
+    # ritz-task-1309 — the block that DEFINED `last_expr_reg`.
+    #
+    # `last_expr_reg` on its own is just "some register"; it carries no record
+    # of where it was produced.  Phi emission needs both halves — the incoming
+    # value AND the predecessor block it flows from — and it used to pair
+    # `last_expr_reg` with `s.current_label`, silently assuming the two agree.
+    # They disagree whenever the value was produced in a *nested* block that
+    # the insertion point has since moved past (an inner `if`'s then-block, a
+    # loop body).  The result was `phi i64 [ %x, %L20 ]` where %x is neither
+    # defined in nor dominated by L20 — SSA-invalid IR that permissive
+    # verifiers accepted and LLVM 21 correctly rejects.
+    #
+    # Keeping the defining label welded to the value makes the mismatch
+    # detectable: `last_expr_here` returns the register only when it was
+    # defined in the block we are currently emitting into, and 0 otherwise.
+    last_expr_label: i32
     # Track current label for phi node predecessors (needed for nested control flow)
     current_label: i32
     # Current function's return type name (for struct returns)
@@ -182,6 +198,39 @@ fn begin_block(s: *EmitterState, label: i32)
     emit_label(s, label)
     emit_str(s, c":\n")
     s.current_label = label
+
+# ritz-task-1309 — the three sanctioned accessors for `last_expr_reg`.
+#
+# Nothing outside these should assign `last_expr_reg` directly: the register
+# and the label that defines it must move together or the pair goes stale,
+# which is the whole defect these exist to prevent.
+
+# Record `reg` as the last expression value, produced by the block we are
+# currently emitting into.
+fn set_last_expr(s: *EmitterState, reg: i32)
+    s.last_expr_reg = reg
+    s.last_expr_label = s.current_label
+
+# Drop the tracked value.  Used where control flow makes any previous value
+# unavailable at the new insertion point (break/continue dead blocks, and the
+# start of each `if` branch).
+fn clear_last_expr(s: *EmitterState)
+    s.last_expr_reg = 0
+    s.last_expr_label = s.current_label
+
+# Read the last expression value, but ONLY if it was defined in the block we
+# are currently emitting into; 0 otherwise.
+#
+# This is the guard for phi incoming values.  A phi entry `[ %v, %L ]` requires
+# %v to be available along the edge from L, and equality of defining block and
+# predecessor block is the conservative way to guarantee that without a
+# dominator tree.  A value produced in a nested block that the insertion point
+# has already left is reported as "no value", which correctly suppresses the
+# phi rather than emitting a dominance-violating one.
+fn last_expr_here(s: *EmitterState) -> i32
+    if s.last_expr_label != s.current_label
+        return 0
+    return s.last_expr_reg
 
 # ritz-task-193 — Resolve `name` to an index into `s.locals[]` using the
 # per-fn HashMap (fnv1a hash of name bytes).  Falls back to a from-end
@@ -1450,8 +1499,24 @@ fn get_expr_type(s: *EmitterState, e: *Expr) -> i32
     else if e.kind == EXPR_NIL_LIT
         return TYPE_PTR  # nil is a null pointer
     else if e.kind == EXPR_IDENT
-        let var_type: i32 = find_local_type(s, e.ident_ptr, e.ident_len)
-        return var_type
+        # AGAST #1325: locals first (they shadow globals), then globals.
+        # This arm used to consult only the locals table, so a global
+        # `var g: *i32` reported TYPE_I64 — find_local_type's miss value,
+        # indistinguishable from a real i64 local.  Every caller that
+        # branches on TYPE_PTR therefore skipped its pointer path for
+        # globals, which made the global-pointee fallbacks in the OP_DEREF
+        # arm below unreachable: `*(g + i)` fell through to the i64-load
+        # default and read two i32 slots as one i64.  Stores were already
+        # global-aware (get_deref_store_type), so the corruption was
+        # load-side only and silent.
+        let lidx: i32 = find_local_idx(s, e.ident_ptr, e.ident_len)
+        if lidx >= 0
+            let loc: *LocalVar = @s.locals[lidx]
+            return loc.var_type
+        let glob: *GlobalVarDef = find_global(s, e.ident_ptr, e.ident_len)
+        if glob != null
+            return glob.var_type
+        return TYPE_I64
     else if e.kind == EXPR_INDEX
         # Indexing: result type depends on base type
         if e.left.kind == EXPR_IDENT
