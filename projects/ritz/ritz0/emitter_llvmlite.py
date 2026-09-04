@@ -9591,6 +9591,18 @@ class LLVMEmitter:
             # mixing `self.pop()?` value arms with `self.gs.rp0 = p` tails).
             if any(val is ir.Undefined for val, _ in incoming):
                 return ir.Undefined
+            # Irreconcilable arm types (e.g. an assignment arm yielding its
+            # enum value next to a `pass` arm's dummy i32 0) mean nobody can
+            # consume this match as a value: it is a statement. Building a
+            # phi would put an integer constant into an enum-typed phi —
+            # invalid IR (AGAST #1321, angelo font.ritz ensure_cmap).
+            # All-integer mixes are fine: they widen below / convert.
+            if incoming and not all(
+                    v.type == incoming[0][0].type
+                    or (isinstance(v.type, ir.IntType)
+                        and isinstance(incoming[0][0].type, ir.IntType))
+                    for v, _ in incoming):
+                return ir.Undefined
             if incoming:
                 # Find the common type for all arms
                 # For integer types, use the widest type
@@ -9784,6 +9796,16 @@ class LLVMEmitter:
             # match simply has no value, so fall through to the dummy below.
             if not all(hasattr(val, 'type') for val, _ in incoming):
                 incoming = []
+            # Irreconcilable arm types (assignment arm yielding its enum
+            # value next to a `pass` arm's dummy i32 0) also make this a
+            # statement match — a phi would mix an integer constant into an
+            # enum-typed phi, invalid IR (AGAST #1321, font.ritz ensure_cmap).
+            if incoming and not all(
+                    v.type == incoming[0][0].type
+                    or (isinstance(v.type, ir.IntType)
+                        and isinstance(incoming[0][0].type, ir.IntType))
+                    for v, _ in incoming):
+                incoming = []
             if incoming:
                 # All values should have the same type (or be convertible)
                 # For now assume they're all the same type
@@ -9914,6 +9936,18 @@ class LLVMEmitter:
             # AGAST #1321 (angelo hinting interpreter: opcode-dispatch match
             # mixing `self.pop()?` value arms with `self.gs.rp0 = p` tails).
             if any(val is ir.Undefined for val, _ in incoming):
+                return ir.Undefined
+            # Irreconcilable arm types (e.g. an assignment arm yielding its
+            # enum value next to a `pass` arm's dummy i32 0) mean nobody can
+            # consume this match as a value: it is a statement. Building a
+            # phi would put an integer constant into an enum-typed phi —
+            # invalid IR (AGAST #1321, angelo font.ritz ensure_cmap).
+            # All-integer mixes are fine: they widen below / convert.
+            if incoming and not all(
+                    v.type == incoming[0][0].type
+                    or (isinstance(v.type, ir.IntType)
+                        and isinstance(incoming[0][0].type, ir.IntType))
+                    for v, _ in incoming):
                 return ir.Undefined
             if incoming:
                 phi = self.builder.phi(incoming[0][0].type)
