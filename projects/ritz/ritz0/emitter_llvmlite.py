@@ -7301,7 +7301,23 @@ class LLVMEmitter:
                 # Also check if argument is explicit &x or @x (address-of expression)
                 arg_is_addr_of = isinstance(arg, rast.UnaryOp) and arg.op in ('&', '@', '@&', '&mut')
 
-                if is_mutable_borrow or is_ref_type:
+                # AGAST #1290: a `*T` PtrType param whose pointee is the
+                # argument's own named type is a borrow site too — an rvalue
+                # argument (e.g. a call result) must be spilled so its address
+                # can be taken. Requiring the pointee to *match* the argument's
+                # named type keeps `*u8` params on the String/StrView coercion
+                # path below, and pointer-typed arguments (arg_is_ptr) never
+                # match because their inferred type is a PtrType, not a
+                # NamedType. This is the `_emit_call` arm of the two-sited
+                # auto-borrow defect; the `_emit_method_call` arm is #1321.
+                is_matching_ptr_param = (
+                    isinstance(param_def.type, rast.PtrType)
+                    and isinstance(param_def.type.inner, rast.NamedType)
+                    and isinstance(arg_ritz_type, rast.NamedType)
+                    and arg_ritz_type.name == param_def.type.inner.name
+                )
+
+                if is_mutable_borrow or is_ref_type or is_matching_ptr_param:
                     if arg_is_ref or arg_is_ptr or arg_is_addr_of:
                         # Argument is already a pointer type - just emit it
                         val = self._emit_expr(arg)
