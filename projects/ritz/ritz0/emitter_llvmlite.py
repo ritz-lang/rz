@@ -3100,7 +3100,23 @@ class LLVMEmitter:
             self.builder.debug_metadata = di_loc
 
     def _emit_function_body(self, fn_def: rast.FnDef) -> ir.Function:
-        """Emit a function body (second pass, after all functions declared)."""
+        """Emit a function body (second pass, after all functions declared).
+
+        `ritz_types` is snapshotted and restored around the body: unlike
+        `locals`/`params` (cleared below), it also carries module-level
+        entries, so it cannot simply be cleared — but function-local binding
+        types must not leak into later functions. A reused name whose fresh
+        inference misses would otherwise dispatch against the *previous*
+        function's type (AGAST #1321: `let metrics = font.metrics()` in one
+        test, `let metrics = font.glyph_metrics(0)` in the next).
+        """
+        saved_ritz_types = dict(self.ritz_types)
+        try:
+            return self._emit_function_body_inner(fn_def)
+        finally:
+            self.ritz_types = saved_ritz_types
+
+    def _emit_function_body_inner(self, fn_def: rast.FnDef) -> ir.Function:
         fn, _ = self.functions[fn_def.name]
         ret_type = self._ritz_type_to_llvm(fn_def.ret_type) if fn_def.ret_type else self.i32
 
@@ -8755,6 +8771,7 @@ class LLVMEmitter:
                 builtin_span = self._try_emit_builtin_span_method(expr, type_name)
                 if builtin_span is not None:
                     return builtin_span
+                import sys as _s; print(f"PROBE-M recv={type(expr.expr).__name__} name={getattr(expr.expr,'name',None)} type_name={type_name} method={expr.method}", file=_s.stderr)
                 raise ValueError(f"No method '{expr.method}' found for type '{type_name}'")
             used_ufcs_fallback = True  # UFCS fallback functions take receiver as first param
 
