@@ -205,7 +205,6 @@ def _emit_ir(tmp_path: Path, seed: str) -> str:
 
 
 @pytest.mark.integration
-@pytest.mark.skipif(not IR_SAMPLE.exists(), reason=f"sample program {IR_SAMPLE} not present")
 def test_emitted_ir_identical_across_hash_seeds(tmp_path):
     """The compiler must emit byte-identical IR regardless of hash seed.
 
@@ -219,6 +218,15 @@ def test_emitted_ir_identical_across_hash_seeds(tmp_path):
     Non-reproducible codegen undermines every content-hash the build system
     relies on, so this is pinned rather than left to chance.
     """
+    # This used to be a `skipif(not IR_SAMPLE.exists())` — the same
+    # collection-time-skip shape as AGAST #1327.  The sample is a tracked repo
+    # file: if it goes missing that is a repo defect and must FAIL, not
+    # silently drop the only reproducible-codegen coverage.
+    assert IR_SAMPLE.exists(), (
+        f"sample program {IR_SAMPLE} is missing — it is tracked in-repo, so "
+        "this is a moved/deleted example, not an environment to skip for"
+    )
+
     seeds = ["0", "1", "42", "777", "31337"]
     irs = {seed: _emit_ir(tmp_path, seed) for seed in seeds}
 

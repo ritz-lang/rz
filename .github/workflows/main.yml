@@ -2,6 +2,12 @@ name: Main Branch Validation
 on:
   push:
     branches: [main]
+  # AGAST #1327: allow running this workflow against a branch. Nothing in
+  # pr.yml executes the ritz0 pytest suite (`rz test ritz` runs the [[test]]
+  # suites via build.py, not `make test`), so without this the bootstrap
+  # job's unit-test gate can only ever be observed AFTER a merge — the
+  # exact "first execution happens on main" failure mode #1327 removes.
+  workflow_dispatch:
 
 # CI drives the workspace through `./rz`, the same entry point developers use.
 #
@@ -148,8 +154,21 @@ jobs:
         run: make tools-unit
         working-directory: projects/ritz
 
+      # AGAST #1327. This step runs BEFORE the bootstrap chain builds ritz1,
+      # so any test gated on a prebuilt artifact would silently skip here —
+      # exactly what happened to the 10 cache-identity tests from #1279, which
+      # never executed in CI until their collection-time skipif was replaced
+      # with a build-it-instead fixture. The grep is defence in depth: if an
+      # artifact-existence skip ever reappears, fail loudly instead of
+      # reporting success while asserting nothing.
       - name: ritz0 unit tests
-        run: python -m pytest -q
+        run: |
+          set -o pipefail
+          python -m pytest -q -rs | tee pytest-report.txt
+          if grep -iE "SKIPPED.*(not built|not present|does not exist|no such file)" pytest-report.txt; then
+            echo "::error::a test skipped because a build artifact was missing — build it in the test instead of skipping (see AGAST #1327)"
+            exit 1
+          fi
         working-directory: projects/ritz/ritz0
 
       # Both steps carry an explicit timeout. GitHub's default is the job-level

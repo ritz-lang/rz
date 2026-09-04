@@ -47,12 +47,42 @@ import pytest
 RITZ_ROOT = Path(__file__).resolve().parent.parent
 RITZ1 = RITZ_ROOT / "ritz1" / "build" / "ritz1"
 
-# The whole suite is about the behaviour of a compiled artifact, so there is
-# nothing meaningful to assert when it has not been built yet.
-requires_ritz1 = pytest.mark.skipif(
-    not RITZ1.exists(),
-    reason=f"ritz1 binary not built ({RITZ1}); run `make -C ritz1 ritz1`",
-)
+# This suite is about the behaviour of a compiled artifact, so build it rather
+# than skip.  It used to carry a module-level `skipif(not RITZ1.exists())`,
+# evaluated at COLLECTION time — before any fixture can run — which meant CI's
+# bootstrap job (unit tests at step 6, ritz1 built at step 7) skipped all 10
+# tests on every run since #1279 landed.  A suite about cache staleness,
+# silently disabled by a staleness-shaped condition, in the one environment
+# that is supposed to be authoritative (AGAST #1327).
+#
+# Mirroring #1322's fix for test_ritz1_parse_errors.py: always invoke make.
+# An up-to-date `make -C ritz1 ritz1` is a ~9ms no-op, so the warm case costs
+# nothing, and we additionally stop trusting a binary that is merely *present*
+# but stale.
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _ritz1_built():
+    """Build (or freshen) the ritz1 binary; fail loudly rather than skip.
+
+    A skipped test is indistinguishable from a passing one in aggregate
+    output — "reported success while asserting nothing" is the exact failure
+    family #1301/#1322/#1327 are about.
+    """
+    env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
+    proc = subprocess.run(
+        ["make", "-C", "ritz1", "ritz1"],
+        cwd=RITZ_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=1800,
+    )
+    if proc.returncode != 0 or not RITZ1.exists():
+        pytest.fail(
+            "could not build ritz1 for the cache-identity tests:\n"
+            f"{proc.stdout[-4000:]}\n{proc.stderr[-4000:]}"
+        )
 
 # Deliberately import-free: these tests exercise the cache, not the language,
 # and a standalone source keeps the compile fast and RITZ_PATH-independent.
@@ -104,7 +134,6 @@ def _write_sig(sig: Path, data: dict) -> None:
     sig.write_text(json.dumps(data, indent=2) + "\n")
 
 
-@requires_ritz1
 class TestSigRecordsCompilerIdentity:
     """The written sig must attribute its cached IR to a specific binary."""
 
@@ -134,7 +163,6 @@ class TestSigRecordsCompilerIdentity:
         assert _read_sig(_sig_path(other_src))["compiler_hash"] == first
 
 
-@requires_ritz1
 class TestFastPathHonoursCompilerIdentity:
     """Reuse when the compiler matches; refuse when it does not."""
 
@@ -232,7 +260,6 @@ class TestFastPathHonoursCompilerIdentity:
         assert "Skipped (unchanged)" not in result.stdout
 
 
-@requires_ritz1
 class TestAgainstARealDifferentBinary:
     """The end-to-end shape of the bug: rebuild the compiler, then rebuild."""
 
