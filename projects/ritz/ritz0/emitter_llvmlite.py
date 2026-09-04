@@ -2216,10 +2216,28 @@ class LLVMEmitter:
         return None
 
     def _emit_expr_with_expected_enum(self, expr: rast.Expr, expected_enum_name: Optional[str]) -> ir.Value:
-        """Emit expression, forcing enum variant constructors to a specific enum type."""
+        """Emit expression, forcing enum variant constructors to a specific enum type.
+
+        If the expression is not itself a variant call, the expectation is
+        *threaded* through control-flow tails: `_emit_if`, `_emit_enum_match`
+        and `_emit_integer_match` re-consult `self._expected_enum_name` for
+        their arm/branch tail expressions, and `_emit_block_expr` for its tail.
+        `_emit_stmt` clears it, so statements nested inside those tails do not
+        inherit an expectation that belongs to the enclosing value position.
+        (AGAST #1321: `Some(outline)` two match levels below an
+        `Option<GlyphOutline>` fn tail otherwise resolves `Some` through the
+        global variant map — whichever specialization registered last.)
+        """
         if expected_enum_name and self._is_enum_variant_call(expr):
             return self._emit_enum_variant_with_type(expr, expected_enum_name)
-        return self._emit_expr(expr)
+        if not expected_enum_name:
+            return self._emit_expr(expr)
+        saved = getattr(self, '_expected_enum_name', None)
+        self._expected_enum_name = expected_enum_name
+        try:
+            return self._emit_expr(expr)
+        finally:
+            self._expected_enum_name = saved
 
     def _emit_enum_variant_constructor_for_type(self, variant_name: str, args: List[rast.Expr], enum_name: str) -> ir.Value:
         """Emit code to construct an enum variant for a specific enum type.
@@ -3336,6 +3354,22 @@ class LLVMEmitter:
         builder.ret(dest)
 
     def _emit_stmt(self, stmt: rast.Stmt) -> Union[bool, ir.Value, None]:
+        """Emit a statement. Returns True if block terminated.
+
+        Clears `_expected_enum_name` for the statement's duration: the
+        expectation belongs to the enclosing *value* position (a fn tail or
+        arm tail), and statements nested inside such a tail must not inherit
+        it (e.g. `let flag = match n ...` inside an arm of an Option-typed
+        match). See `_emit_expr_with_expected_enum`.
+        """
+        saved_expected_enum = getattr(self, '_expected_enum_name', None)
+        self._expected_enum_name = None
+        try:
+            return self._emit_stmt_inner(stmt)
+        finally:
+            self._expected_enum_name = saved_expected_enum
+
+    def _emit_stmt_inner(self, stmt: rast.Stmt) -> Union[bool, ir.Value, None]:
         """Emit a statement. Returns True if block terminated."""
         # Set debug location for source-level debugging
         self._set_debug_loc(stmt)
@@ -4315,7 +4349,9 @@ class LLVMEmitter:
             if isinstance(if_expr.then_block.expr, rast.If):
                 then_value = self._emit_if(if_expr.then_block.expr)
             else:
-                then_value = self._emit_expr(if_expr.then_block.expr)
+                then_value = self._emit_expr_with_expected_enum(
+                    if_expr.then_block.expr,
+                    getattr(self, '_expected_enum_name', None))
 
         # DON'T branch yet - we may need to add type conversion first
         then_exit_block = self.builder.block  # Remember where we are after then block
@@ -4340,7 +4376,9 @@ class LLVMEmitter:
                 if isinstance(if_expr.else_block.expr, rast.If):
                     else_value = self._emit_if(if_expr.else_block.expr)
                 else:
-                    else_value = self._emit_expr(if_expr.else_block.expr)
+                    else_value = self._emit_expr_with_expected_enum(
+                        if_expr.else_block.expr,
+                        getattr(self, '_expected_enum_name', None))
 
             # DON'T branch yet
             else_exit_block = self.builder.block  # Remember where we are after else block
@@ -6513,9 +6551,11 @@ class LLVMEmitter:
         for stmt in block.stmts:
             self._emit_stmt(stmt)
 
-        # Emit and return the final expression
+        # Emit and return the final expression (threading any expected enum
+        # from the enclosing value position through the block tail)
         if block.expr is not None:
-            return self._emit_expr(block.expr)
+            return self._emit_expr_with_expected_enum(
+                block.expr, getattr(self, '_expected_enum_name', None))
         else:
             # Void block - return undefined
             return ir.Undefined
@@ -6528,7 +6568,26 @@ class LLVMEmitter:
 
         Returns the assigned value.
         """
-        val = self._emit_expr(expr.value)
+        # `self.field = Some(v)` must build the variant for the *target's*
+        # enum, exactly as the AssignStmt path does — variant names are
+        # global, so `Some` otherwise resolves to whichever Option was
+        # specialized last (font.ritz: `Ok(cmap) => self.cmap = Some(cmap)`
+        # built an Option$Glyph). AGAST #1321.
+        target_ritz_type = None
+        if self._is_enum_variant_call(expr.value):
+            target_ritz_type = self._infer_ritz_type(expr.target)
+            while isinstance(target_ritz_type, (rast.PtrType, rast.RefType)):
+                target_ritz_type = target_ritz_type.inner
+        target_enum = None
+        if isinstance(target_ritz_type, rast.NamedType):
+            target_enum = self._resolve_enum_type_name(target_ritz_type)
+            if target_enum is None and target_ritz_type.args:
+                target_enum = self._ensure_builtin_generic_specialization(
+                    target_ritz_type)
+        if target_enum is not None:
+            val = self._emit_enum_variant_with_type(expr.value, target_enum)
+        else:
+            val = self._emit_expr(expr.value)
 
         # Handle different target types (similar to AssignStmt handling)
         if isinstance(expr.target, rast.Ident):
@@ -9381,6 +9440,16 @@ class LLVMEmitter:
         if enum_name and enum_name in self.enum_types:
             return self._emit_enum_match(expr, match_val, enum_name)
 
+        # Source-level classification can fail — a UFCS method-call scrutinee
+        # (`match v.pop()`) has no inferable declared type. But the emitted
+        # value already knows: its LLVM type is the enum's identified struct,
+        # and enum_types is keyed by the same name. Falling through instead
+        # sent Option matches to _emit_integer_match, where `Some(x)` binds
+        # nothing and the arm dies with `Unknown identifier: x`. AGAST #1321.
+        struct_name = getattr(match_val.type, 'name', None)
+        if struct_name and struct_name in self.enum_types:
+            return self._emit_enum_match(expr, match_val, struct_name)
+
         # Check if matching on an integer type
         if isinstance(match_val.type, ir.IntType):
             return self._emit_integer_match(expr, match_val)
@@ -9440,7 +9509,8 @@ class LLVMEmitter:
             self.builder.position_at_end(arm_block)
 
             # Emit the arm body (which may include casts like `x as i32`)
-            arm_val = self._emit_expr(arm.body)
+            arm_val = self._emit_expr_with_expected_enum(
+                arm.body, getattr(self, '_expected_enum_name', None))
             arm_values.append(arm_val)
 
             # Remember which block we're in after emitting the body
@@ -9457,6 +9527,13 @@ class LLVMEmitter:
         if arm_values and arm_exit_blocks:
             # Filter out terminated blocks (those that returned)
             incoming = [(val, block) for val, block in zip(arm_values, arm_exit_blocks) if block is not None]
+            # A live arm yielding ir.Undefined (a block ending in a statement,
+            # or a unit-typed `?`) makes the match a statement, not a value —
+            # ir.Undefined cannot be a phi incoming, it has no reference.
+            # AGAST #1321 (angelo hinting interpreter: opcode-dispatch match
+            # mixing `self.pop()?` value arms with `self.gs.rp0 = p` tails).
+            if any(val is ir.Undefined for val, _ in incoming):
+                return ir.Undefined
             if incoming:
                 # Find the common type for all arms
                 # For integer types, use the widest type
@@ -9535,6 +9612,20 @@ class LLVMEmitter:
                 # earlier pass rejects, so report it here against the pattern's
                 # own span instead of letting a bare ValueError escape.
                 self._require_enum_variant(enum_name, pattern.name, pattern.span)
+                # Nested variant patterns (`Ok(Simple(x))`) are not supported:
+                # only one pattern level is compiled. Without this check the
+                # inner pattern silently binds nothing and the arm body fails
+                # with `Unknown identifier: x` — a red herring pointing
+                # nowhere near the construct. Name it and locate it instead.
+                # AGAST #1321 (angelo font.ritz).
+                for field_pattern in pattern.fields:
+                    if isinstance(field_pattern, rast.VariantPattern):
+                        raise EmitError(
+                            f"Nested variant patterns are not supported: "
+                            f"'{pattern.name}({field_pattern.name}(...))' — "
+                            f"match on '{pattern.name}(inner)' first, then "
+                            f"match 'inner' in a second match expression",
+                            field_pattern.span or pattern.span)
                 tag_val = self._get_enum_variant_tag(enum_name, pattern.name)
                 switch.add_case(ir.Constant(self.i8, tag_val), arm_block)
             elif isinstance(pattern, rast.IdentPattern):
@@ -9604,7 +9695,8 @@ class LLVMEmitter:
                     # Wildcard patterns just discard the value
 
             # Emit the arm body
-            arm_val = self._emit_expr(arm.body)
+            arm_val = self._emit_expr_with_expected_enum(
+                arm.body, getattr(self, '_expected_enum_name', None))
 
             # Remember which block we're in after emitting the body
             if not self.builder.block.is_terminated:
@@ -9737,7 +9829,8 @@ class LLVMEmitter:
                 self.params[pattern.name] = (match_val, int_type)
 
             # Emit the arm body
-            arm_val = self._emit_expr(arm.body)
+            arm_val = self._emit_expr_with_expected_enum(
+                arm.body, getattr(self, '_expected_enum_name', None))
             arm_values.append(arm_val)
 
             # Check if the arm already terminated (e.g., with return)
@@ -9758,6 +9851,13 @@ class LLVMEmitter:
         if arm_values and arm_exit_blocks:
             # Filter out terminated blocks (those that returned)
             incoming = [(val, block) for val, block in zip(arm_values, arm_exit_blocks) if block is not None]
+            # A live arm yielding ir.Undefined (a block ending in a statement,
+            # or a unit-typed `?`) makes the match a statement, not a value —
+            # ir.Undefined cannot be a phi incoming, it has no reference.
+            # AGAST #1321 (angelo hinting interpreter: opcode-dispatch match
+            # mixing `self.pop()?` value arms with `self.gs.rp0 = p` tails).
+            if any(val is ir.Undefined for val, _ in incoming):
+                return ir.Undefined
             if incoming:
                 phi = self.builder.phi(incoming[0][0].type)
                 for val, block in incoming:
