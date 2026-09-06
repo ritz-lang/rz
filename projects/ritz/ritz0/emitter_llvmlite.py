@@ -3238,6 +3238,27 @@ class LLVMEmitter:
                 expected_enum_name = self._resolve_enum_type_name(fn_def.ret_type, ret_type)
                 last_val = self._emit_expr_with_expected_enum(fn_def.body.expr, expected_enum_name)
                 self.closure_expected_type = None  # Clear context
+                # A tail that yields no value at all (ir.Undefined): a match
+                # used as a statement, whose arms are assignments/`pass`. That
+                # is legal ONLY in a procedure, where the tail runs for effect
+                # — a fn with a declared return type must actually produce one.
+                # Handled here rather than by giving the match a dummy `i32 0`,
+                # because only this site knows whether the value is wanted:
+                # the dummy made an ill-typed `let v = match ...` in VALUE
+                # position compile clean and silently evaluate to 0.
+                # AGAST #1321 (angelo font.ritz ensure_cmap is the procedure
+                # case); see test_match_mixed_type_arms.py for both directions.
+                if last_val is ir.Undefined:
+                    if fn_def.ret_type is not None:
+                        raise EmitError(
+                            f"function '{fn_def.name}' declares a return type "
+                            f"but its trailing expression produces no value "
+                            f"(match arms have irreconcilable types, or are "
+                            f"statements)",
+                            getattr(fn_def.body.expr, 'span', None))
+                    self._emit_drop_for_all_scopes(exclude_var)
+                    self.builder.ret(ir.Constant(ret_type, 0))
+                    return fn
                 last_val = self._convert_type(last_val, ret_type)
                 # A fn with no declared return type is a procedure: its tail
                 # expression is evaluated for effect only. _convert_type
@@ -8811,7 +8832,6 @@ class LLVMEmitter:
                 builtin_span = self._try_emit_builtin_span_method(expr, type_name)
                 if builtin_span is not None:
                     return builtin_span
-                import sys as _s; print(f"PROBE-M recv={type(expr.expr).__name__} name={getattr(expr.expr,'name',None)} type_name={type_name} method={expr.method}", file=_s.stderr)
                 raise ValueError(f"No method '{expr.method}' found for type '{type_name}'")
             used_ufcs_fallback = True  # UFCS fallback functions take receiver as first param
 
@@ -9897,12 +9917,26 @@ class LLVMEmitter:
             # value next to a `pass` arm's dummy i32 0) also make this a
             # statement match — a phi would mix an integer constant into an
             # enum-typed phi, invalid IR (AGAST #1321, font.ritz ensure_cmap).
+            #
+            # Return ir.Undefined rather than falling through to the `i32 0`
+            # dummy at the end of this function, and match what the other two
+            # match emitters do for this same condition. In STATEMENT position
+            # (the case above) nobody consumes the result, so both spellings
+            # work. In VALUE position the dummy was a fail-open: an ill-typed
+            # `let v: i64 = match s { A(q) => p; B(q) => 7 }` compiled clean
+            # and silently evaluated to 0, where main rejects it with
+            # "Type of #1 arg mismatch". ir.Undefined has no `.type`, so a
+            # value consumer fails loudly instead. See
+            # test_match_mixed_type_arms.py::test_mixed_type_value_match_is_rejected.
+            # The resulting diagnostic is a raw AttributeError — poor, and
+            # tracked with the other bare-traceback exits, but rejecting an
+            # ill-typed program badly beats accepting it silently.
             if incoming and not all(
                     v.type == incoming[0][0].type
                     or (isinstance(v.type, ir.IntType)
                         and isinstance(incoming[0][0].type, ir.IntType))
                     for v, _ in incoming):
-                incoming = []
+                return ir.Undefined
             if incoming:
                 # All values should have the same type (or be convertible)
                 # For now assume they're all the same type
