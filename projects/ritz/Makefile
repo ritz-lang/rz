@@ -93,6 +93,23 @@ harness-selftest:
 	echo "$$found harness self-test(s) run."; \
 	exit $$rc
 
+# Run exactly what .github/workflows/main.yml runs, by PARSING it — AGAST #1363.
+#
+# Not a restatement of the gate commands. A remembered list drifts from CI, and
+# every drift is a green tick asserting less than you think:
+#   `./regression.sh` instead of `scripts/regression.sh`      -> exit 127
+#   `make -C projects/ritz ...` from inside projects/ritz/ritz0 -> exit 2
+# Both look like a suite complaining rather than a command that never ran.
+#
+# Defaults to the `bootstrap` job (the compiler gate). `--jobs` runs everything,
+# including the 26-project `test-all` sweep (~50 min).
+#   make ci-local                       bootstrap
+#   make ci-local ARGS="--list"         what CI declares
+#   make ci-local ARGS="--jobs"         everything
+.PHONY: ci-local
+ci-local:
+	@$(PYTHON) tools/ci_local.py $(ARGS)
+
 # Python unit tests for ritz0 compiler
 unit:
 	@echo "=== Running ritz0 unit tests ==="
