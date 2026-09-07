@@ -22,6 +22,73 @@ RITZLIB_MODULES = ["sys", "io", "str", "strview", "string", "hash", "memory",
                    "gvec", "drop", "env", "option", "result", "hashmap",
                    "bytes", "span"]
 
+# Cells that are known to fail, keyed by (compiler, test) so an excuse for
+# ritz1 never silently covers ritz1_selfhosted — the two disagreeing is a
+# self-hosting bug, and scripts/regression.sh's allowlist header is explicit
+# that such a divergence must go red rather than be recorded.
+#
+# Every entry must name an AGAST task (enforced by
+# tools/test_run_regression_matrix_gate.py), and the list is STRICT-XPASS: a
+# cell listed here that starts passing fails the gate until the line is
+# deleted. That is the rule from rz.toml's [ci.known_failing.*] and, since
+# AGAST #1365, from scripts/regression.sh too. An allowlist that cannot go red
+# is an allowlist nobody edits — #1365 found two entries blaming the async
+# framework for what was really a syntax migration.
+EXPECTED_FAILURES = {
+    ("ritz1", "test_issue_float_coercion"):
+        "AGAST #1370 — ritz1 has no float method dispatch; x.ceil() fails even "
+        "with an identifier receiver. It previously 'passed' because the "
+        "emitter substituted a zero and said nothing (#1369), and because the "
+        "matrix only runs the file's FIRST [[test]] fn (#1371) — the assertion "
+        "that would have caught it is the third.",
+    ("ritz1_selfhosted", "test_issue_float_coercion"):
+        "AGAST #1370 — same gap, listed separately on purpose: an excuse for "
+        "ritz1 must not cover its self-compiled twin.",
+}
+
+
+def matrix_outcome(compiler, results, expected):
+    """Classify one compiler's results against the expected-failure list.
+
+    Mirrors rz's gate_outcome (rz:135) so the workspace has one grammar for
+    this, not two that drift.
+
+    Returns (hard, known, xpass), each a sorted list of test names:
+      hard  — failed and not expected. Fails the gate.
+      known — failed and expected. Advisory; printed with its AGAST reference.
+      xpass — expected to fail but passed. Also fails the gate, so the entry
+              gets deleted rather than accumulating.
+
+    Only tests that actually RAN are considered, so `--tests <regex>` cannot
+    turn every unselected entry into a spurious xpass.
+    """
+    hard, known, xpass = [], [], []
+    for test_name, (status, _code, _info) in results.items():
+        is_expected = (compiler, test_name) in expected
+        if status == "pass":
+            if is_expected:
+                xpass.append(test_name)
+        elif is_expected:
+            known.append(test_name)
+        else:
+            hard.append(test_name)
+    return sorted(hard), sorted(known), sorted(xpass)
+
+
+def matrix_exit_code(outcomes):
+    """0 only when no compiler has a hard failure or an xpass.
+
+    This function existing at all is the fix for AGAST #1372: main() used to
+    end in an unconditional `return 0`, so `make matrix-full` — the gate cited
+    in nearly every commit message in this repo, and a CI step — exited 0 with
+    red cells in its own printed summary.
+    """
+    for hard, _known, xpass in outcomes.values():
+        if hard or xpass:
+            return 1
+    return 0
+
+
 TESTS = [
     "test_issue_addr_of_struct_array_member",
     "test_issue_array_fill_literal",
@@ -292,7 +359,27 @@ def main():
             for t, (status, code, info) in fails:
                 print(f"  {t}: {status} (code={code}) {info[:120]}")
 
-    return 0
+        # AGAST #1372 — classify, report, and let the outcome reach the exit
+        # code. Everything above this point already existed; what did not was
+        # any path from a red cell to a non-zero status.
+        outcomes = {
+            cname: matrix_outcome(cname, results[cname], EXPECTED_FAILURES)
+            for cname, _ in compilers
+        }
+        print("\n=== Gate ===")
+        for cname, (hard, known, xpass) in outcomes.items():
+            if hard:
+                print(f"  ✗ {cname}: {len(hard)} unexpected failure(s): "
+                      f"{', '.join(hard)}")
+            for t in known:
+                print(f"  ⚠ {cname}: {t} — {EXPECTED_FAILURES[(cname, t)]}")
+            for t in xpass:
+                print(f"  ✗ {cname}: {t} is in EXPECTED_FAILURES but PASSES — "
+                      f"delete that entry in tools/run_regression_matrix.py")
+        rc = matrix_exit_code(outcomes)
+        print("  ✓ matrix gate green" if rc == 0 else "  💥 matrix gate FAILED")
+
+    return rc
 
 
 if __name__ == "__main__":
