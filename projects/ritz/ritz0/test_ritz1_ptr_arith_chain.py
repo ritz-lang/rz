@@ -42,11 +42,21 @@ import pytest
 RITZ_ROOT = Path(__file__).resolve().parent.parent
 RITZ1_BIN = RITZ_ROOT / "ritz1" / "build" / "ritz1"
 RITZ0 = RITZ_ROOT / "ritz0" / "ritz0.py"
-# ritz1 compiles to a module with `main`; `_start` comes from this tracked
-# runtime object, exactly as build.py links it. Linking WITHOUT it "works"
-# (ld defaults the entry point to 0x1000) and then segfaults — which would
-# make every case here fail for a reason that has nothing to do with #1361.
-RITZ_START = RITZ_ROOT / "runtime" / f"ritz_start.x86_64.o"
+# ritz1 compiles to a module with `main`; `_start` comes from this runtime
+# object, exactly as build.py links it. Linking WITHOUT it "works" (ld
+# defaults the entry point to 0x1000) and then segfaults — which would make
+# every case here fail for a reason that has nothing to do with #1361.
+#
+# It is a BUILD PRODUCT, not a tracked file: runtime/.gitignore ignores *.o
+# and only the .ll sources are committed. An earlier version of this file
+# asserted the .o existed and told the reader to run `make -C runtime`. That
+# passes on any developer machine that has ever built and fails on a fresh
+# checkout — which is exactly how it broke main CI (bootstrap/"ritz0 unit
+# tests", run ebb5a48). Note also that ritz1's own Makefile links
+# ritz_start_ENVP.x86_64.o, so building ritz1 does not incidentally produce
+# this one. So build it, the same way ritz1/Makefile's ../runtime/%.o rule
+# does: delegate to runtime/Makefile and let make decide whether to do work.
+RITZ_START = RITZ_ROOT / "runtime" / "ritz_start.x86_64.o"
 
 
 def _build_ritz1() -> None:
@@ -72,9 +82,29 @@ def _build_ritz1() -> None:
         )
 
 
+def _build_runtime_start() -> None:
+    """Bring RITZ_START up to date. See the RITZ_START comment for why this
+    builds rather than asserts: the .o is gitignored, so asserting is a test
+    that only ever passes on a machine that has already built something else.
+    """
+    proc = subprocess.run(
+        ["make", "-C", "runtime", RITZ_START.name],
+        cwd=RITZ_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    if proc.returncode != 0 or not RITZ_START.exists():
+        pytest.fail(
+            f"could not build the runtime start object {RITZ_START}:\n"
+            f"{proc.stdout[-2000:]}\n{proc.stderr[-2000:]}"
+        )
+
+
 @pytest.fixture(scope="module")
 def ritz1_bin() -> Path:
     _build_ritz1()
+    _build_runtime_start()
     return RITZ1_BIN
 
 
