@@ -147,6 +147,41 @@ Also: `git fetch origin && git rebase origin/main` to ensure we're on latest.
    adele status
    ```
 
+## The Scratchpad Is A FIFO Queue, Not A Report
+
+When a child room's `REAP ...` callback arrives, the parent appends **one line** to
+the scratchpad. The scratchpad's only job is recording **what order to reap in**.
+Everything else about the work lives in AGAST and in git.
+
+**The format is exactly this — one line, nothing more:**
+
+```
+reap ritz-task-<id> — rz-task-<id>
+```
+
+Example: `reap ritz-task-1321 — rz-task-1321`
+
+```
+mcp__adele-context__append_scratchpad_item(
+    room_id="ritz-lang",
+    text="reap ritz-task-1321 — rz-task-1321"
+)
+```
+
+**NEVER put any of this in a scratchpad entry:**
+
+- Gate results, test counts, pass/fail numbers, CI status
+- Commit SHAs, diffstats, file counts, branch comparisons
+- Defect lists, ticket numbers, triage notes, "conditions honoured"
+- Anomalies, caveats, follow-ups, or anything starting "worth noting"
+- The child's callback text pasted verbatim
+
+If you are tempted to write a second sentence, **stop** — it belongs in the AGAST
+task (`mcp__agast__update_task`), not here. A scratchpad entry that needs a scroll
+bar has already failed at its one job: telling you which room is next.
+
+The queue is FIFO. Reap position 1, `check_scratchpad_item` it, then position 2.
+
 ## Batch Spawning
 
 When spawning multiple rooms, commit first, then create all worktrees, install all,
