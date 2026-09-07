@@ -3598,6 +3598,7 @@ class LLVMEmitter:
                 # Use declared type and convert value if needed
                 declared_ty = self._ritz_type_to_llvm(stmt.type)
                 val = self._convert_type(val, declared_ty)
+                self._check_let_annotation(stmt, val, declared_ty)
                 self.params[stmt.name] = (val, declared_ty)
                 self.ritz_types[stmt.name] = stmt.type  # Store Ritz type for signedness
                 # Note: let bindings don't get allocas, they're just SSA values
@@ -9422,6 +9423,54 @@ class LLVMEmitter:
                         return span
 
         return val
+
+    @staticmethod
+    def _is_aggregate(ty: ir.Type) -> bool:
+        return isinstance(ty, (ir.BaseStructType, ir.ArrayType))
+
+    @staticmethod
+    def _is_scalar(ty: ir.Type) -> bool:
+        return isinstance(ty, (ir.IntType, ir.FloatType, ir.DoubleType))
+
+    def _check_let_annotation(self, stmt, val: ir.Value, declared_ty: ir.Type) -> None:
+        """Reject `let x: T = expr` where expr cannot possibly be a T.
+
+        AGAST #1364.  _convert_type ends in a bare `return val`: when it does
+        not know how to convert, it hands the value back unchanged.  LetStmt
+        then filed the DECLARED type against a value that did not have it, so
+        the annotation was discarded and the eventual error surfaced a line or
+        two later naming a type the programmer never wrote.  ritz0 has no
+        separate type checker (`--check-types` is off by default), so emission
+        is the first and only pass that could notice.
+
+        Scope is deliberately the irreconcilable case only -- a scalar
+        annotation on an aggregate value, or the reverse.  Implicit NARROWING
+        (`let n: i32 = <i64>`, which truncates silently) is untouched: whether
+        that stays legal is an open language question in #1364, not something
+        to settle inside a bug fix.
+
+        The check must not simply compare LLVM types.  _convert_type returns a
+        value of a deliberately different type in several cases the compiler
+        depends on -- see the controls in test_let_annotation_mismatch.py --
+        so it asks the narrower question: is one side an aggregate and the
+        other a scalar?
+        """
+        actual = val.type
+        if actual == declared_ty:
+            return
+        if not ((self._is_aggregate(actual) and self._is_scalar(declared_ty))
+                or (self._is_scalar(actual) and self._is_aggregate(declared_ty))):
+            return
+        raise EmitError(
+            f"`{stmt.name}` is declared `{self._format_ritz_type(stmt.type)}` "
+            f"but its initialiser has type `{actual}`",
+            getattr(stmt, "span", None),
+        )
+
+    def _format_ritz_type(self, ty: rast.Type) -> str:
+        """Best-effort source spelling of a declared type, for diagnostics."""
+        name = getattr(ty, "name", None)
+        return name if isinstance(name, str) else str(ty)
 
     def _is_unsigned_type(self, ty: rast.Type) -> bool:
         """Check if a Ritz type is unsigned."""
