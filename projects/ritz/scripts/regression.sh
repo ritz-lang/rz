@@ -498,8 +498,37 @@ run_binary() {
     # agreement with the truncation check below.
     local raw="${stdout_file}.raw"
     rm -f "$raw"
+    # Fixed process environment, for exactly the reason the fixture tree above
+    # exists.  31_env and 33_printenv print `environ` verbatim, so their output
+    # is a function of the ambient environment rather than of the compiled
+    # program -- and the harness itself perturbs that environment between
+    # stages: stage 2 does `cd "$ritz1_dir"` then `cd "$ROOT_DIR"` to build
+    # ritz1, which changes OLDPWD.  Stage 1 captured
+    #     OLDPWD=/home/aaron/dev/ritz-lang/rz
+    # and stage 3 ran with
+    #     OLDPWD=/home/aaron/dev/ritz-lang/rz/projects/ritz
+    # so the byte comparison reported "output mismatch" on line 50 for a
+    # compiler that was behaving perfectly.  It only surfaced at all because
+    # the invocation cwd happened to differ from ROOT_DIR that run, which makes
+    # it worse, not better: the suite's verdict depended on where you typed the
+    # command from.
+    #
+    # `env -i` with an explicit allowlist rather than unsetting OLDPWD alone:
+    # unsetting the one variable that bit us today is whack-a-mole, and the
+    # whole point of the sandbox above is that we make the environment
+    # identical and KEEP the strict comparison instead of allowlisting the
+    # programs that notice.  PWD is omitted deliberately -- `cd` sets it, and
+    # to the fixed sandbox path.
     ( cd "$sandbox" && ulimit -f 1024 && \
-      exec timeout --signal=KILL 5s "$binary" < /dev/null > "$raw" 2>&1 )
+      exec env -i \
+        PATH=/usr/local/bin:/usr/bin:/bin \
+        HOME=/nonexistent \
+        LANG=C \
+        LC_ALL=C \
+        TZ=UTC \
+        SHELL=/bin/sh \
+        TERM=dumb \
+        timeout --signal=KILL 5s "$binary" < /dev/null > "$raw" 2>&1 )
     local exit_code=$?
 
     # Reap anything the program forked and left behind.  Orphans are harmless
