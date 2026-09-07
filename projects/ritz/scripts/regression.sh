@@ -254,6 +254,28 @@ is_known_failure() {
     grep -qxF "$2" <(sed 's/#.*//; s/[[:space:]]*$//; /^$/d' "$f")
 }
 
+# Strict xpass: an allowlisted example that COMPILES fails the stage.
+#
+# This used to be a warn().  A warning does not force anything: the entry stays,
+# the suite stays green, and the list drifts from the compiler it claims to
+# describe.  That is the same "advisory gate is not a gate" shape main.yml
+# rejects for continue-on-error, and this file's own header already asserts the
+# stricter rule -- "The list should shrink" -- without enforcing it.  rz.toml's
+# [ci.known_failing.build] has enforced strict-xpass all along; this list, which
+# guards the compiler corpus, was the weaker of the two.
+#
+# Discovered 2026-09-07 (AGAST #1365): 74_async_tiers and 75_tier2_uring were
+# allowlisted as "async/uring corpus -- unmigrated against the current async
+# framework".  Both were in fact blocked only on the legacy `&x` address-of
+# syntax that commit 6da1440 migrated everywhere else; 76_tier3_http, the third
+# member of the same ladder, was migrated and is not on the list.  Two lines of
+# sed made both compile.  Nothing told anyone, because the check only warned.
+#
+# Args: $1=compiler, $2=example key.  Returns 0 if this is an xpass.
+report_xpass() {
+    fail "$2: on the $1 known-failure allowlist but COMPILES — delete the line in $(basename "$(known_failures_file "$1")")"
+}
+
 # --- Differential accept-set recording (feeds Stage 5) ----------------------
 #
 # Deliberately independent of the allowlist machinery above.  These record the
@@ -747,7 +769,9 @@ run_stage1() {
             continue
         fi
         if is_known_failure ritz0 "$name"; then
-            warn "$name: on the known-failure allowlist but COMPILES — remove it"
+            report_xpass ritz0 "$name"
+            failed=$((failed + 1))
+            continue
         fi
 
         # Correctness gate: the example's own test.sh, if it ships one.
@@ -874,7 +898,9 @@ run_stage3() {
         fi
         record_compile_outcome ritz1 "$name" accepted
         if is_known_failure ritz1 "$name"; then
-            warn "$name: on the ritz1 allowlist but COMPILES — remove it"
+            report_xpass ritz1 "$name"
+            failed=$((failed + 1))
+            continue
         fi
 
         # Correctness gate, then the differential.  Same shape as Stage 1: a
@@ -989,7 +1015,9 @@ run_stage4() {
         fi
         record_compile_outcome ritz1_selfhosted "$name" accepted
         if is_known_failure ritz1_selfhosted "$name"; then
-            warn "$name: on the ritz1_selfhosted allowlist but COMPILES — remove it"
+            report_xpass ritz1_selfhosted "$name"
+            failed=$((failed + 1))
+            continue
         fi
 
         # Correctness gate, then the differential -- see Stage 3.
