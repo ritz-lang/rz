@@ -9,6 +9,7 @@ This requires external `llc` to compile since llvmlite's bundled LLVM
 doesn't include the x86 asm parser.
 """
 
+import re
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple, List, Union, Set
 from llvmlite import ir
@@ -7289,7 +7290,72 @@ class LLVMEmitter:
         else:
             raise ValueError(f"Cannot access field on non-struct type: {struct_val.type}")
 
+    # llvmlite raises TypeError from ir.CallInstr.__init__ when a call's
+    # arguments do not match the callee's signature. Its message is the only
+    # thing the user ever saw: no file, no line, no callee, and LLVM's spelling
+    # of the types rather than the `*u8` / `StrView` they wrote.
+    _LLVMLITE_CALL_MISMATCH = (
+        "arg mismatch",          # "Type of #1 arg mismatch: %StrView != i8*"
+        "Incorrect number of arguments",
+    )
+
     def _emit_call(self, call: rast.Call) -> ir.Value:
+        """Emit a function call, converting llvmlite's signature complaints
+        into located diagnostics.
+
+        AGAST #1366. `47_lisp` and `51_loadtest` sat misfiled on the
+        known-failure allowlist for months because the error named neither the
+        file nor the callee; locating them by reading the source picked the
+        wrong call site twice, and what actually worked was patching this
+        method to print `fname` — which a user cannot do to their own
+        compiler.
+
+        Only llvmlite's *signature* TypeErrors are converted (see
+        _LLVMLITE_CALL_MISMATCH). Anything else re-raises untouched, so a
+        genuine bug in the emitter still surfaces as a Python traceback
+        instead of being disguised as a user error.
+        """
+        try:
+            return self._emit_call_inner(call)
+        except TypeError as exc:
+            msg = str(exc)
+            if not any(k in msg for k in self._LLVMLITE_CALL_MISMATCH):
+                raise
+            # llvmlite counts arguments from 1; point at that argument's own
+            # span when we can, so the caret lands on the wrong value rather
+            # than on the call as a whole.
+            m = re.search(r"#(\d+) arg mismatch", msg)
+            arg_index = int(m.group(1)) - 1 if m else None
+            raise EmitError(
+                self._call_mismatch_message(call, msg),
+                self._call_span(call, arg_index),
+            ) from None
+
+    @staticmethod
+    def _call_span(call: rast.Call, arg_index: Optional[int] = None):
+        """Span for a call diagnostic: the offending argument if we can
+        identify it, else the call itself.
+
+        llvmlite counts arguments from 1.
+        """
+        if arg_index is not None and 0 <= arg_index < len(call.args):
+            arg_span = getattr(call.args[arg_index], "span", None)
+            if arg_span is not None:
+                return arg_span
+        return getattr(call, "span", None)
+
+    def _call_mismatch_message(self, call: rast.Call, llvm_msg: str) -> str:
+        """Rewrite llvmlite's message with the callee's name in front of it."""
+        fname = call.func.name if isinstance(call.func, rast.Ident) else "<expression>"
+        m = re.search(r"#(\d+) arg mismatch", llvm_msg)
+        if m:
+            n = int(m.group(1))
+            return (
+                f"argument {n} of `{fname}` has the wrong type: {llvm_msg}"
+            )
+        return f"call to `{fname}`: {llvm_msg}"
+
+    def _emit_call_inner(self, call: rast.Call) -> ir.Value:
         """Emit a function call.
 
         Supports:
@@ -7425,7 +7491,15 @@ class LLVMEmitter:
 
             # Check argument count BEFORE processing
             if len(call.args) != len(fn.function_type.args):
-                raise ValueError(f"Function '{fname}' called with {len(call.args)} args but defined with {len(fn.function_type.args)} params")
+                # AGAST #1366. This one already named the function — that is
+                # why 52_uring's identical-class failure was fixed in one step
+                # while 47_lisp's anonymous one sat on the allowlist. It still
+                # arrived as a bare ValueError with a traceback and no
+                # location, so give it the same treatment.
+                raise EmitError(
+                    f"`{fname}` called with {len(call.args)} argument(s) but "
+                    f"defined with {len(fn.function_type.args)}",
+                    self._call_span(call))
 
             # Emit arguments with type conversion and String -> *u8 coercion
             # Also handle RERITZ Borrow semantics - borrowed params need addresses
