@@ -118,32 +118,91 @@ warn() {
     echo -e "${YELLOW}⚠${NC} $1"
 }
 
-# Examples that require special handling (stdin input, file arguments, etc.)
-# These will use their test.sh if available, otherwise skip
-INTERACTIVE_EXAMPLES="05_cat 06_grep 07_wc 08_echo 09_head 10_tail"
-
-# Check if example needs special handling
-is_interactive_example() {
-    local name="$1"
-    for ex in $INTERACTIVE_EXAMPLES; do
-        if [[ "$name" == "$ex" ]]; then
-            return 0
-        fi
-    done
-    return 1
+# An example's test.sh is the ONLY thing in this suite that asserts a program
+# produces the *right* answer.  Everything else compares stage against stage,
+# which three compilers agreeing on the same wrong output passes.
+#
+# This used to be gated on a hardcoded name list:
+#
+#     INTERACTIVE_EXAMPLES="05_cat 06_grep 07_wc 08_echo 09_head 10_tail"
+#
+# Four of those six names no longer existed (the corpus was renumbered: 08_echo
+# is 03_echo, 09_head is 06_head, 06_grep and 10_tail are gone).  So of the 68
+# examples that ship a test.sh, exactly 2 ever had it executed.  66 files of
+# real assertions -- 06_head/test.sh checks default-10-lines, `-n 5` and the
+# stdin path against `seq` output and exits 1 on mismatch -- had never run in
+# CI.  See AGAST #1359.
+#
+# The trigger is now the file's existence.  There is no list to rot, and
+# assert_test_scripts_all_ran() below fails the suite if the number executed
+# ever drops below the number on disk, so adding an example with a test.sh
+# cannot silently opt out of correctness checking.
+has_test_script() {
+    [[ -f "$1/test.sh" ]]
 }
 
-# Get list of example directories with main.ritz
+# Examples whose test.sh we actually executed this run, one key per line.
+# Written to a file rather than a shell array because the stage loops run in
+# `$(...)` subshells in some invocations.
+TEST_SCRIPTS_RAN_FILE=""
+
+note_test_script_ran() {
+    [[ -n "$TEST_SCRIPTS_RAN_FILE" ]] && echo "$1" >> "$TEST_SCRIPTS_RAN_FILE"
+}
+
+# Resolve the binary name build.py will emit for an example: [[bin]] name if
+# present, else [package] name.  50 of 81 examples have no [[bin]] section, so
+# the [package] branch is the common case.  basename($dir) is NOT a valid
+# fallback -- the dir is `02_exitcode`, the package is `exitcode` -- and using
+# it made run_test_script symlink the binary under a name test.sh never looks
+# for, producing empty output that scored as a failure (or, for a test
+# expecting empty output, as a false pass).
+#
+# resolve_bin_names emits ALL of them, one per line; resolve_bin_name emits the
+# first.  An example may declare several: 04_true_false builds `true` and
+# `false` from src/true.ritz and src/false.ritz, and its test.sh exercises both.
+resolve_bin_names() {
+    local toml="$1/ritz.toml"
+    local n
+    n=$(awk '/^\[\[bin\]\]/{inbin=1; next} /^\[/{inbin=0} inbin && /^name[[:space:]]*=/{gsub(/.*=[[:space:]]*"|".*/, ""); print}' "$toml" 2>/dev/null)
+    if [[ -z "$n" ]]; then
+        n=$(awk '/^\[package\]/{found=1} found && /^name[[:space:]]*=/{gsub(/.*=[[:space:]]*"|".*/, ""); print; exit}' "$toml" 2>/dev/null)
+    fi
+    echo "$n"
+}
+
+resolve_bin_name() {
+    resolve_bin_names "$1" | head -1
+}
+
+# Get the list of example directories.
 #
 # Examples are NOT all at examples/<name>/ — the tier5_async corpus lives one
 # level deeper at examples/tier5_async/<name>/.  A `-maxdepth 1` walk (what
 # this used to do) saw 17 of 85 example dirs, and the 11 of those with a
 # src/main.ritz happened to be exactly the known-broken set.  Every stage
 # then skipped everything and the suite exited 0 having asserted nothing.
-# Walk the whole tree and let the src/main.ritz probe decide.
+# Walk the whole tree and let the per-directory probe decide.
+#
+# src/main.ritz is the usual entry point but NOT the only one.  An example that
+# declares its binaries explicitly is free to name their sources anything:
+# 04_true_false builds `true` from src/true.ritz and `false` from src/false.ritz
+# and has no main.ritz at all.  Keying discovery on main.ritz made that example
+# invisible to every stage of this suite -- never compiled, never run, and its
+# test.sh (which checks `./true` exits 0 and `./false` exits 1) never executed.
+# It was reported neither as a pass nor a failure; it simply did not appear.
+#
+# So: a directory is an example if it has src/main.ritz, OR if its ritz.toml
+# declares at least one [[bin]].  A ritz.toml with neither (test_deps/squeeze,
+# a library dependency) is correctly still excluded.
 get_examples() {
-    find "$EXAMPLES_DIR" -mindepth 1 -type f -path '*/src/main.ritz' \
-        -not -path '*/build/*' -printf '%h\n' | sed 's|/src$||' | sort -u
+    {
+        find "$EXAMPLES_DIR" -mindepth 1 -type f -path '*/src/main.ritz' \
+            -not -path '*/build/*' -printf '%h\n' | sed 's|/src$||'
+        while read -r toml; do
+            grep -q '^\[\[bin\]\]' "$toml" 2>/dev/null && dirname "$toml"
+        done < <(find "$EXAMPLES_DIR" -mindepth 1 -type f -name ritz.toml -not -path '*/build/*')
+    } | sort -u
 }
 
 # Examples ritz0 is known not to compile yet, one key per line (`#` comments
@@ -245,11 +304,18 @@ example_key() {
 # practice every multi-module example failed to link and the handful that did
 # link segfaulted immediately for want of an entry point (exit 139).  That is
 # a property of the harness, not of ritz1 — measuring it told us nothing.
+# Args: $1=compiler, $2=example_dir, $3=output_binary
+#
+# Takes the example DIRECTORY, not a source path.  It used to take
+# "$example_dir/src/main.ritz" and recover the directory with
+# dirname(dirname(...)) -- which happened to work even for examples that have
+# no main.ritz, but only by accident, and it made the callers assert a file
+# exists that for 04_true_false does not.  build.py builds the package by path
+# and decides for itself which sources to compile.
 compile_with() {
     local compiler="$1"
-    local source="$2"
+    local example_dir="$2"
     local output="$3"
-    local example_dir=$(dirname $(dirname "$source"))
     local example_name=$(basename "$example_dir")
 
     {
@@ -275,11 +341,11 @@ compile_with() {
         #
         # The binary name comes from [[bin]] name, else [package] name.  Most
         # examples have no [[bin]] section at all, so the [package] fallback is
-        # the common case, not the exception.
-        local bin_name=$(awk '/^\[\[bin\]\]/{found=1} found && /^name[[:space:]]*=/{gsub(/.*=[[:space:]]*"|".*/, ""); print; exit}' "$example_dir/ritz.toml" 2>/dev/null)
-        if [[ -z "$bin_name" ]]; then
-            bin_name=$(awk '/^\[package\]/{found=1} found && /^name[[:space:]]*=/{gsub(/.*=[[:space:]]*"|".*/, ""); print; exit}' "$example_dir/ritz.toml" 2>/dev/null)
-        fi
+        # the common case, not the exception.  Shared with run_test_script so
+        # the two cannot drift apart -- they did, and run_test_script's copy
+        # (which fell back to basename) is what #1359 records.
+        local bin_name
+        bin_name=$(resolve_bin_name "$example_dir")
         local built_bin=""
         for cand_name in "$bin_name" "$example_name"; do
             # Skip an empty name: "$dir/build/debug/" is the *directory*, and
@@ -459,34 +525,141 @@ run_test_script() {
     local binary="$2"
     local test_script="$example_dir/test.sh"
 
-    if [[ ! -x "$test_script" ]]; then
-        return 2  # No test script
+    if [[ ! -f "$test_script" ]]; then
+        return 200  # No test script -- sentinel, see below
     fi
 
-    # Run test.sh from the example's directory with the binary
+    # Sentinels are 200/201, not 2/3.  A test.sh is free to `exit 2`, and the
+    # callers distinguish "no test script" from "test failed" by return value;
+    # overlapping the two ranges would let a genuinely failing test be reported
+    # as an absent one.  Nothing in the corpus exits 200+.
+
+    # Invoke through `bash`, not by executing the file, so a lost +x bit is not
+    # silently equivalent to "this example has no tests".  Four test.sh files
+    # (52_uring, 53_async, 54_async_fs, 55_async_state_machine) are committed
+    # mode 100644; under the old `[[ ! -x ]]` guard they returned 2 and were
+    # counted as skips.  The +x bits are being restored too, but the harness
+    # should not depend on a file mode to decide whether assertions exist.
+    # Resolve before cd: $binary is given relative to the caller's cwd.
+    local abs_binary
+    abs_binary=$(cd "$(dirname "$binary")" && pwd)/$(basename "$binary")
+
+    local bin_name
+    bin_name=$(resolve_bin_name "$example_dir")
+    if [[ -z "$bin_name" ]]; then
+        return 201  # ritz.toml declares no usable name -- NOT a pass
+    fi
+
     local orig_dir=$(pwd)
     cd "$example_dir"
 
-    # Get the actual binary name from ritz.toml (bin.name field)
-    # test.sh scripts reference ./cat, ./ls, etc., not ./05_cat, ./21_ls
-    local bin_name
-    if [[ -f "ritz.toml" ]]; then
-        bin_name=$(grep -A1 '^\[\[bin\]\]' ritz.toml 2>/dev/null | grep '^name' | head -1 | sed 's/.*=[ ]*"\([^"]*\)".*/\1/')
-    fi
-    # Fallback to directory-based name if not found
-    if [[ -z "$bin_name" ]]; then
-        bin_name=$(basename "$example_dir")
-    fi
-
-    # Create a temp symlink so test.sh can find the binary at expected location
-    ln -sf "$binary" "./$bin_name" 2>/dev/null || cp "$binary" "./$bin_name"
+    # Link EVERY declared binary, not just the first.  04_true_false's test.sh
+    # runs `./true` and `./false`; linking only `./true` would leave `./false`
+    # missing, the script would exit 127, and the example would be reported as
+    # a behavioural failure of the compiler rather than of the harness.
+    #
+    # Each name resolves to build/debug/<name>, which compile_with just
+    # produced with the compiler under test (it rm -rf's that dir first, so
+    # nothing stale can survive there).  $abs_binary is the copy compile_with
+    # took of the primary binary and stands in if the build dir has moved on.
+    local -a linked=()
+    local n
+    while read -r n; do
+        [[ -n "$n" ]] || continue
+        if [[ -x "build/debug/$n" ]]; then
+            ln -sf "$PWD/build/debug/$n" "./$n" 2>/dev/null || cp "build/debug/$n" "./$n"
+        else
+            ln -sf "$abs_binary" "./$n" 2>/dev/null || cp "$abs_binary" "./$n"
+        fi
+        linked+=("$n")
+    done < <(resolve_bin_names "$example_dir")
 
     timeout --signal=KILL 30s bash "$test_script" >/dev/null 2>&1
     local result=$?
 
-    rm -f "./$bin_name"
+    for n in "${linked[@]}"; do rm -f "./$n"; done
     cd "$orig_dir"
     return $result
+}
+
+# Run an example's test.sh, if it has one, and report.
+# Args: $1=example_dir, $2=example_key, $3=binary
+# Returns 0 if there is nothing to run or the test passed; 1 if it failed.
+# Records the example in the "ran" ledger so assert_test_scripts_all_ran() can
+# prove no example silently dropped out of correctness checking.
+check_test_script() {
+    local example_dir="$1"
+    local name="$2"
+    local bin="$3"
+
+    has_test_script "$example_dir" || return 0
+
+    run_test_script "$example_dir" "$bin"
+    local rc=$?
+
+    case $rc in
+        0)
+            note_test_script_ran "$name"
+            return 0
+            ;;
+        201)
+            # Present but unrunnable: ritz.toml gives no binary name, so the
+            # symlink test.sh expects could not be created.  Deliberately NOT
+            # recorded as "ran" and deliberately a failure -- an example whose
+            # assertions cannot be executed is the exact shape of the defect
+            # this whole change exists to stop reporting as green.
+            fail "$name: test.sh present but ritz.toml declares no package/bin name"
+            return 1
+            ;;
+        200)
+            return 0  # has_test_script said yes; unreachable
+            ;;
+        *)
+            note_test_script_ran "$name"
+            fail "$name: test.sh failed (exit $rc)"
+            return 1
+            ;;
+    esac
+}
+
+# Fail the suite if any example that ships a test.sh did not have it executed.
+#
+# The point of this is that the fix above must not itself rot.  The previous
+# mechanism was correct on the day it was written and matched 2 of 68 examples
+# by the time anyone looked; #1327 and #1333 are two more allowlists that
+# decayed the same way.  A floor keyed off the filesystem cannot drift: add an
+# example with a test.sh and either it runs or the suite goes red.
+#
+# Legitimate non-runs are compile failures, which are already reported (or
+# allowlisted) by the caller.  Those are passed in as $@ and excluded.
+assert_test_scripts_all_ran() {
+    local -a excused=("$@")
+    local on_disk ran missing=0
+
+    while read -r ts; do
+        local dir="${ts%/test.sh}"
+        local key
+        key=$(example_key "$dir")
+        local is_excused=0
+        for e in "${excused[@]}"; do
+            [[ "$e" == "$key" ]] && is_excused=1 && break
+        done
+        [[ $is_excused -eq 1 ]] && continue
+        if ! grep -qxF "$key" "$TEST_SCRIPTS_RAN_FILE" 2>/dev/null; then
+            fail "$key: ships a test.sh that was never executed"
+            missing=$((missing + 1))
+        fi
+    done < <(find "$EXAMPLES_DIR" -mindepth 2 -name test.sh -not -path '*/build/*')
+
+    on_disk=$(find "$EXAMPLES_DIR" -mindepth 2 -name test.sh -not -path '*/build/*' | wc -l)
+    ran=$(sort -u "$TEST_SCRIPTS_RAN_FILE" 2>/dev/null | wc -l)
+    echo "test.sh coverage: $ran executed / $on_disk on disk (${#excused[@]} excused: compile failure)"
+
+    if [[ $missing -gt 0 ]]; then
+        fail "$missing example(s) ship assertions that never ran — see AGAST #1359"
+        return 1
+    fi
+    return 0
 }
 
 # Compare two runs
@@ -548,15 +721,22 @@ run_stage1() {
     local passed=0
     local failed=0
     local skipped=0
+    local -a nocompile=()
+
+    TEST_SCRIPTS_RAN_FILE="$BUILD_DIR/test_scripts_ran.txt"
+    : > "$TEST_SCRIPTS_RAN_FILE"
 
     for example_dir in $(get_examples); do
         local name=$(example_key "$example_dir")
         local base=$(basename "$example_dir")
-        local src="$example_dir/src/main.ritz"
         local bin="$BUILD_DIR/stage1_$name"
 
         # Compile with ritz0
-        if ! compile_with "ritz0" "$src" "$bin"; then
+        if ! compile_with "ritz0" "$example_dir" "$bin"; then
+            # Excused from the test.sh coverage floor: you cannot run a binary
+            # that was never produced.  The compile failure itself is already
+            # reported (or allowlisted) on the next two lines.
+            nocompile+=("$name")
             if is_known_failure ritz0 "$name"; then
                 warn "$name: ritz0 compile failed (known, allowlisted)"
                 skipped=$((skipped + 1))
@@ -570,26 +750,20 @@ run_stage1() {
             warn "$name: on the known-failure allowlist but COMPILES — remove it"
         fi
 
-        # Handle interactive examples (need stdin/file args)
-        if is_interactive_example "$base"; then
-            # Try to use test.sh if available
-            if run_test_script "$example_dir" "$bin"; then
-                success "$name (test.sh passed)"
-                # Mark as tested so stage3 knows it was validated
-                echo "0" > "$BUILD_DIR/stage1_${name}.exit"
-                echo "TESTED_VIA_SCRIPT" > "$BUILD_DIR/stage1_${name}.stdout"
-                passed=$((passed + 1))
-            elif [[ $? -eq 2 ]]; then
-                warn "$name: interactive example, no test.sh"
-                skipped=$((skipped + 1))
-            else
-                fail "$name: test.sh failed"
-                failed=$((failed + 1))
-            fi
+        # Correctness gate: the example's own test.sh, if it ships one.
+        #
+        # This no longer REPLACES the run-and-record below -- it precedes it.
+        # The old code, for the 2 examples it reached, wrote the literal string
+        # "TESTED_VIA_SCRIPT" as the stage-1 baseline, which removed those
+        # examples from the cross-stage differential entirely.  Running both
+        # means an example with a test.sh is checked for the right answer here
+        # AND for ritz0/ritz1/ritz1_selfhosted agreement in stages 3 and 4.
+        if ! check_test_script "$example_dir" "$name" "$bin"; then
+            failed=$((failed + 1))
             continue
         fi
 
-        # Non-interactive: run and save results for later comparison
+        # Run and save results for later cross-stage comparison
         if ! run_binary "$bin" "$BUILD_DIR/stage1_${name}.stdout" "$BUILD_DIR/stage1_${name}.exit"; then
             fail "$name: ritz0 build reported success but produced no runnable binary"
             failed=$((failed + 1))
@@ -600,6 +774,11 @@ run_stage1() {
         success "$name (exit=$exit_code)"
         passed=$((passed + 1))
     done
+
+    echo ""
+    if ! assert_test_scripts_all_ran "${nocompile[@]}"; then
+        failed=$((failed + 1))
+    fi
 
     echo ""
     echo "Stage 1: $passed passed, $failed failed, $skipped skipped"
@@ -672,7 +851,6 @@ run_stage3() {
     for example_dir in $(get_examples); do
         local name=$(example_key "$example_dir")
         local base=$(basename "$example_dir")
-        local src="$example_dir/src/main.ritz"
         local bin="$BUILD_DIR/stage3_$name"
 
         # Check if we have Stage 1 results to compare against
@@ -683,7 +861,7 @@ run_stage3() {
         fi
 
         # Compile with ritz1
-        if ! compile_with "ritz1" "$src" "$bin" 2>/dev/null; then
+        if ! compile_with "ritz1" "$example_dir" "$bin" 2>/dev/null; then
             record_compile_outcome ritz1 "$name" rejected
             if is_known_failure ritz1 "$name"; then
                 warn "$name: ritz1 compile failed (known, allowlisted)"
@@ -699,18 +877,11 @@ run_stage3() {
             warn "$name: on the ritz1 allowlist but COMPILES — remove it"
         fi
 
-        # Handle interactive examples via test.sh
-        if is_interactive_example "$base"; then
-            if run_test_script "$example_dir" "$bin"; then
-                success "$name (test.sh passed)"
-                passed=$((passed + 1))
-            elif [[ $? -eq 2 ]]; then
-                warn "$name: interactive example, no test.sh"
-                skipped=$((skipped + 1))
-            else
-                fail "$name: test.sh failed"
-                failed=$((failed + 1))
-            fi
+        # Correctness gate, then the differential.  Same shape as Stage 1: a
+        # ritz1-built binary must satisfy the example's own assertions AND
+        # agree byte-for-byte with the ritz0 baseline.
+        if ! check_test_script "$example_dir" "$name" "$bin"; then
+            failed=$((failed + 1))
             continue
         fi
 
@@ -795,7 +966,6 @@ run_stage4() {
     for example_dir in $(get_examples); do
         local name=$(example_key "$example_dir")
         local base=$(basename "$example_dir")
-        local src="$example_dir/src/main.ritz"
         local bin="$BUILD_DIR/stage4_$name"
 
         # Check if we have Stage 1 results
@@ -806,7 +976,7 @@ run_stage4() {
         fi
 
         # Compile with self-hosted ritz1
-        if ! compile_with "ritz1_selfhosted" "$src" "$bin" 2>/dev/null; then
+        if ! compile_with "ritz1_selfhosted" "$example_dir" "$bin" 2>/dev/null; then
             record_compile_outcome ritz1_selfhosted "$name" rejected
             if is_known_failure ritz1_selfhosted "$name"; then
                 warn "$name: self-hosted ritz1 compile failed (known, allowlisted)"
@@ -822,18 +992,9 @@ run_stage4() {
             warn "$name: on the ritz1_selfhosted allowlist but COMPILES — remove it"
         fi
 
-        # Handle interactive examples via test.sh
-        if is_interactive_example "$base"; then
-            if run_test_script "$example_dir" "$bin"; then
-                success "$name (test.sh passed)"
-                passed=$((passed + 1))
-            elif [[ $? -eq 2 ]]; then
-                warn "$name: interactive example, no test.sh"
-                skipped=$((skipped + 1))
-            else
-                fail "$name: test.sh failed"
-                failed=$((failed + 1))
-            fi
+        # Correctness gate, then the differential -- see Stage 3.
+        if ! check_test_script "$example_dir" "$name" "$bin"; then
+            failed=$((failed + 1))
             continue
         fi
 

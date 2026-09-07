@@ -28,7 +28,7 @@ all: test
 # Run everything
 # AGAST #98: check-no-s-strings runs first so any resurrected s"..." literal
 # fails CI before we burn compile cycles on it.
-test: check-no-s-strings check-doc-examples unit tools-unit ritz ritz1 examples
+test: check-no-s-strings check-doc-examples unit tools-unit harness-selftest ritz ritz1 examples
 	@echo "✓ All tests passed!"
 
 # AGAST #98 guard: ensure no s"..." span-string literals leak back in.
@@ -67,6 +67,31 @@ check-doc-examples:
 tools-unit:
 	@echo "=== Running tools/ unit tests ==="
 	@$(PYTHON) -m pytest -q tools/
+
+# Self-tests for scripts/regression.sh's own logic. Same problem as tools-unit
+# above, one layer down: scripts/test-regression-stage5.sh existed since the
+# Stage 5 work and was wired into NOTHING — not make, not CI. A test that never
+# runs is documentation with a shebang.
+#
+# Globbed, not listed, so a new self-test is picked up by existing. The suite
+# these protect is the one that gates every merge, and both of the holes they
+# cover (Stage 5's allowlist escape hatch, #1359's rotted example allowlist)
+# were things the end-to-end run reported green.
+.PHONY: harness-selftest
+harness-selftest:
+	@echo "=== Running regression harness self-tests ==="
+	@found=0; rc=0; \
+	for t in scripts/test-regression-*.sh; do \
+	    [ -e "$$t" ] || continue; \
+	    found=$$((found + 1)); \
+	    echo "--- $$t"; \
+	    bash "$$t" || rc=1; \
+	done; \
+	if [ $$found -eq 0 ]; then \
+	    echo "no scripts/test-regression-*.sh found — the glob has rotted"; exit 1; \
+	fi; \
+	echo "$$found harness self-test(s) run."; \
+	exit $$rc
 
 # Python unit tests for ritz0 compiler
 unit:
