@@ -5203,12 +5203,18 @@ class LLVMEmitter:
             elif op == '==':
                 if is_float:
                     return self.builder.fcmp_ordered('==', left, right)
+                enum_cmp = self._try_enum_tag_compare(op, left, right)
+                if enum_cmp is not None:
+                    return enum_cmp
                 self._reject_aggregate_compare(op, left, expr)
                 # Equality is sign-agnostic
                 return self.builder.icmp_signed('==', left, right)
             elif op == '!=':
                 if is_float:
                     return self.builder.fcmp_ordered('!=', left, right)
+                enum_cmp = self._try_enum_tag_compare(op, left, right)
+                if enum_cmp is not None:
+                    return enum_cmp
                 self._reject_aggregate_compare(op, left, expr)
                 # Inequality is sign-agnostic
                 return self.builder.icmp_signed('!=', left, right)
@@ -10339,6 +10345,53 @@ class LLVMEmitter:
         else:
             return str(ty)
 
+    def _fieldless_enum_variants(self, ty: ir.Type) -> Optional[list]:
+        """Variants of `ty` if it is an enum whose variants ALL carry no payload.
+
+        Returns None for anything else — a plain struct, or an enum with a
+        payload. The distinction is the whole point: an enum is laid out as
+        `{ i8 tag, [pad], [payload] }`, so when no variant has a payload the
+        tag IS the value and comparing it is exact equality. The moment one
+        variant carries data, tag equality stops being value equality
+        (`Some(1) == Some(2)` would answer true), so those keep falling
+        through to `_reject_aggregate_compare`.
+        """
+        if not isinstance(ty, (ir.LiteralStructType, ir.IdentifiedStructType)):
+            return None
+        ty_name = getattr(ty, 'name', None)
+        if not ty_name:
+            return None
+        for enum_type, variants in self.enum_types.values():
+            # Match on the identified type itself where possible; the name
+            # comparison covers enums re-fetched from the module context.
+            if enum_type is ty or getattr(enum_type, 'name', None) == ty_name:
+                if all(not v.fields for v in variants):
+                    return variants
+                return None
+        return None
+
+    def _try_enum_tag_compare(self, op: str, left_val: ir.Value,
+                              right_val: ir.Value) -> Optional[ir.Value]:
+        """Lower `==`/`!=` on a payload-less enum to a tag comparison.
+
+        docs/STYLE.md documents `token.kind == TokenKind.Ident` as the idiom
+        to prefer over `match` for a single-variant test, and it had never
+        worked: ritz0 emitted `icmp eq %"enum.mod.TokenKind"` — invalid IR,
+        because `icmp` takes integers and pointers only. It survived because
+        `make check-doc-examples` stops at .ll and never links; a real build
+        died at clang with "icmp requires integer operands" pointing into
+        generated IR (AGAST #1358).
+
+        Field 0 is the tag for every enum layout in `_define_enum`.
+        """
+        if self._fieldless_enum_variants(left_val.type) is None:
+            return None
+        if right_val.type != left_val.type:
+            return None
+        left_tag = self.builder.extract_value(left_val, 0, name="enum.lhs.tag")
+        right_tag = self.builder.extract_value(right_val, 0, name="enum.rhs.tag")
+        return self.builder.icmp_unsigned(op, left_tag, right_tag)
+
     def _reject_aggregate_compare(self, op: str, left_val: ir.Value,
                                   expr: rast.BinOp) -> None:
         """Raise a located diagnostic for `==`/`!=` on aggregate operands.
@@ -10357,6 +10410,13 @@ class LLVMEmitter:
                 hint = " — use strview_eq(@a, @b) from ritzlib.strview"
             elif type_name == 'String':
                 hint = " — use string_eq(@a, @b) from ritzlib.string"
+            elif any(getattr(t, 'name', None) == type_name
+                     for t, _ in self.enum_types.values()):
+                # A payload-less enum never reaches here (tag comparison
+                # handles it). So this is an enum carrying data, where tag
+                # equality would not be value equality.
+                hint = (" — a variant carries a payload, so `==` would compare"
+                        " tags only; use `match` to test the variant")
             raise EmitError(
                 f"'{op}' is not supported for struct type '{type_name}'"
                 f"{hint}", getattr(expr, 'span', None))
