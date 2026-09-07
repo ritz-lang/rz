@@ -1369,6 +1369,81 @@ fn get_ptr_elem_size(s: *EmitterState, e: *Expr) -> i64
         return 1
     return 1
 
+# Classify an operand of `+`/`-` as pointer arithmetic, and if so give its
+# element stride.  Returns 0 for "not a pointer", otherwise the element size
+# in bytes (never 0, so 0 is an unambiguous sentinel).
+#
+# AGAST #1361.  This was previously inline in emit_expr_binary and handled
+# exactly two shapes: EXPR_IDENT (`p + i`) and EXPR_MEMBER (`s.ptr + i`).
+# An unparenthesised chain associates to the left:
+#
+#     lines.data + i - 1   ==   SUB( ADD( MEMBER(lines,data), i ), 1 )
+#
+# so the outer SUB's left operand is EXPR_BINARY, matched neither arm, and
+# the `- 1` was emitted as a raw BYTE subtraction.  For a 16-byte element
+# that lands 15 bytes short and every field load reads across the element
+# boundary.  It does not crash — it silently computes a wrong address, which
+# is how `tier2_stdlib/14_uniq` shipped passing every line through instead of
+# deduplicating for as long as ritz1 has existed.
+#
+# The recursion is deliberately down the LEFT spine only: `p + i` is a
+# pointer, `i + p` is not treated as one here (that asymmetry is pre-existing
+# and shared with the two original arms).  Pointer DIFFERENCE (`p - q`, which
+# yields an integer, not a pointer) is likewise still mis-scaled — but it was
+# already mis-scaled at depth 0 before this change, so propagating the same
+# classification through a chain keeps behaviour consistent rather than
+# introducing a second, differently-wrong rule.  Tracked separately.
+fn ptr_arith_elem_size(s: *EmitterState, e: *Expr) -> i64
+    if e.kind == EXPR_IDENT
+        let lt: i32 = find_local_type(s, e.ident_ptr, e.ident_len)
+        if lt == TYPE_PTR or lt == TYPE_PTR_PTR or lt == TYPE_REF or lt == TYPE_MUT_REF
+            return get_ptr_elem_size(s, e)
+        if lt == TYPE_UNKNOWN
+            # Global pointer var: the ident isn't a local (find_local_type
+            # returns TYPE_UNKNOWN since AGAST #1328; it used to return a
+            # TYPE_I64 miss value, so this arm previously also ran for real
+            # i64 locals that shadow a global — now it is miss-only).
+            # Without this branch, `*(g_arr + i) = ...` for `var g_arr: *T`
+            # emits raw `add i64 base, i` (no stride), then stores i64 —
+            # wrong for *i32 globals (which the monomorph instantiation
+            # tracker uses heavily).  Was the source of the selfhost 8-test
+            # gap (vec_push\$T not specialized → declare i64 extern instead
+            # of `define i32`).
+            let glob: *GlobalVarDef = find_global(s, e.ident_ptr, e.ident_len)
+            if glob != null
+                if glob.var_type == TYPE_PTR_PTR
+                    return 8
+                if glob.var_type == TYPE_PTR or glob.var_type == TYPE_REF or glob.var_type == TYPE_MUT_REF
+                    if glob.pointee_type == TYPE_U16 or glob.pointee_type == TYPE_I16
+                        return 2
+                    if glob.pointee_type == TYPE_U32 or glob.pointee_type == TYPE_I32
+                        return 4
+                    if glob.pointee_type == TYPE_U64 or glob.pointee_type == TYPE_I64
+                        return 8
+                    return 1
+        return 0
+    if e.kind == EXPR_MEMBER
+        # Member field access — check if the field is a pointer type
+        if e.left.kind == EXPR_IDENT
+            let base_loc: *LocalVar = find_local_struct_name(s, e.left.ident_ptr, e.left.ident_len)
+            if base_loc != null and base_loc.type_name_len > 0
+                let base_st: *StructDef = find_struct(s, base_loc.type_name, base_loc.type_name_len)
+                if base_st != null
+                    let fi: i32 = find_field_index(base_st, e.ident_ptr, e.ident_len)
+                    if fi >= 0
+                        let fld: *StructField = get_field_type(base_st, fi)
+                        if fld.field_type == TYPE_PTR or fld.field_type == TYPE_PTR_PTR or fld.field_type == TYPE_REF or fld.field_type == TYPE_MUT_REF
+                            return get_ptr_elem_size(s, e)
+        return 0
+    if e.kind == EXPR_BINARY
+        # A chain: `(ptr ± a) ± b`.  The inner result is a pointer iff the
+        # inner expression was itself pointer arithmetic, and it carries the
+        # same stride.
+        if e.op == OP_ADD or e.op == OP_SUB
+            return ptr_arith_elem_size(s, e.left)
+        return 0
+    return 0
+
 # Helper: get pointee type for a struct member that is a pointer
 # e.g., for span.ptr (where ptr is *u8), returns TYPE_U8.
 #
