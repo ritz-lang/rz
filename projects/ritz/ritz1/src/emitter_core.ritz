@@ -125,6 +125,15 @@ struct EmitterState
     fn_map: HashMapI64
     struct_map: HashMapI64
     const_map: HashMapI64
+    # AGAST #1369 — count of expressions the emitter could not lower.
+    # The emitter used to have NO way to report failure: when it met something
+    # it could not emit it wrote `; ERROR: ...` into the IR as a comment,
+    # substituted a zero (or, for an assignment, dropped the store), and
+    # returned success.  ritz1 then exited 0, build.py printed its tick, and
+    # the program segfaulted or silently computed the wrong answer.
+    # emit_module returns this count and main refuses to write the output when
+    # it is non-zero.  See emit_ir_error().
+    error_count: i32
 
 # =============================================================================
 # Helpers
@@ -138,6 +147,48 @@ fn emit_str(s: *EmitterState, text: *u8)
 
 fn emit_name(s: *EmitterState, name: *u8, len: i32)
     vec_push_bytes<u8>(s.out, name, len as i64)
+
+# AGAST #1369 — record that the emitter could not lower something.
+#
+# Every caller used to be a bare `emit_str(s, c"  ; ERROR: ...")` that wrote
+# the failure into the IR as a COMMENT and carried on.  A comment is not a
+# diagnostic: llvm ignores it, the process exits 0, and the caller links
+# whatever came out.  For `unknown identifier` the emitter went on to
+# substitute `add i64 0, 0`, so `apply(double, 5)` became a call through a
+# null pointer; for `unknown variable` it dropped the store outright and the
+# program ran to completion with a stale value.
+#
+# This keeps the IR comment — it is genuinely useful when reading emitted IR
+# by hand — but also prints the message to stderr and counts it, so
+# emit_module can return non-zero and main can refuse to write the output.
+# The IR comment is deliberately still written FIRST, so a developer dumping
+# a failed compile's buffer sees the marker in place.
+fn emit_ir_error(s: *EmitterState, msg: *u8)
+    emit_str(s, c"  ; ERROR: ")
+    emit_str(s, msg)
+    emit_str(s, c"\n")
+    eprints_cstr(c"error: ritz1 cannot emit: ")
+    eprints_cstr(msg)
+    eprints_cstr(c"\n")
+    s.error_count = s.error_count + 1
+
+# Same, for the two sites that append a name to the message before the
+# newline.  The caller follows this with emit_name + emit_ir_error_end.
+fn emit_ir_error_begin(s: *EmitterState, msg: *u8)
+    emit_str(s, c"  ; ERROR: ")
+    emit_str(s, msg)
+    eprints_cstr(c"error: ritz1 cannot emit: ")
+    eprints_cstr(msg)
+
+fn emit_ir_error_end(s: *EmitterState, name: *u8, len: i32)
+    emit_name(s, name, len)
+    emit_str(s, c"'\n")
+    var i: i32 = 0
+    while i < len
+        eprint_char(*(name + i))
+        i += 1
+    eprints_cstr(c"'\n")
+    s.error_count = s.error_count + 1
 
 fn emit_int(s: *EmitterState, n: i64)
     if n < 0
@@ -1744,6 +1795,50 @@ fn get_expr_type(s: *EmitterState, e: *Expr) -> i32
         # Target type stored in e.op (set by expr_cast helper).
         return e.op
     TYPE_I64  # Default fallback
+
+# Does emit_expr leave this condition expression in an i1 register?
+#
+# AGAST #1367.  Condition sites (STMT_IF, STMT_WHILE) need to know whether the
+# register emit_expr just produced can be fed straight into `br i1`, or whether
+# it must first be narrowed with `icmp ne i64 ..., 0`.  They used to decide
+# that by asking get_expr_type and treating TYPE_BOOL as "already an i1".
+#
+# That is not the same question.  get_expr_type reports the RITZ type; the br
+# needs the LLVM REGISTER WIDTH, and the two disagree wherever emit_expr
+# zero-extends a bool into ritz1's uniform i64 value representation:
+#
+#     %.1 = call i1 @yes()
+#     %.2 = zext i1 %.1 to i64     <- TYPE_BOOL, but the register is i64
+#     br i1 %.2, ...               <- rejected by clang
+#
+# get_expr_type's OP_NOT arm already documents exactly this hazard and works
+# around it by reporting TYPE_I64; that workaround only covers `not`.  Rather
+# than lie about more types, ask the width question directly.
+#
+# The leaking forms below were MEASURED by sweeping every condition shape and
+# classifying the br operand's defining instruction, not derived from reading
+# the emitter — reading it predicted that `b and c` on two bool identifiers
+# would leak, and it does not.  Measured leaking: a call, a *bool deref, and a
+# logical binary whose left operand leaks (get_expr_type delegates EXPR_BINARY
+# to its left, so this mirrors the type it will report).  Measured NOT
+# leaking: bool identifier, bool struct field, bool array element, `and`/`or`
+# over those, comparisons (which report TYPE_I64 and are coerced anyway),
+# `not`, and assert's operand.
+#
+# Enumerating the leakers rather than the safe forms is deliberate: it leaves
+# every currently-working shape byte-identical, and any future shape that
+# starts leaking fails loudly at clang ("defined with type 'i64' but expected
+# 'i1'") instead of silently miscompiling.
+fn cond_leaves_i1(s: *EmitterState, e: *Expr) -> i32
+    if get_expr_type(s, e) != TYPE_BOOL
+        return 0
+    if e.kind == EXPR_CALL
+        return 0
+    if e.kind == EXPR_UNARY and e.op == OP_DEREF
+        return 0
+    if e.kind == EXPR_BINARY
+        return cond_leaves_i1(s, e.left)
+    return 1
 
 # Get the struct type name for a dereference expression that returns TYPE_STRUCT
 # Returns the field info if found, null otherwise

@@ -1050,7 +1050,7 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
                     emit_str(s, c"\n")
                 return
             # Fall through to emit error if member access failed
-            emit_str(s, c"  ; ERROR: unhandled EXPR_MEMBER in assignment\n")
+            emit_ir_error(s, c"unhandled EXPR_MEMBER in assignment")
             return
 
         # Check for array field element assignment: s.field[idx] = value
@@ -1513,9 +1513,8 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
                 emit_name(s, glob.name, glob.name_len)
                 emit_str(s, c"\n")
         else
-            emit_str(s, c"  ; ERROR: unknown variable '")
-            emit_name(s, stmt.assign_target, stmt.assign_target_len)
-            emit_str(s, c"'\n")
+            emit_ir_error_begin(s, c"unknown variable '")
+            emit_ir_error_end(s, stmt.assign_target, stmt.assign_target_len)
 
 fn emit_return(s: *EmitterState, stmt: *Stmt, ret_type: i32)
     if stmt.return_value != null
@@ -2206,14 +2205,18 @@ fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         begin_block(s, a_ok)
     else if stmt.kind == STMT_IF
         let cond: i32 = emit_expr(s, stmt.if_cond)
-        # If the condition is already i1 (TYPE_BOOL identifier/load), use it
-        # directly in the br — otherwise coerce i64 -> i1 via `icmp ne ..., 0`.
-        # Without this check, `if boolvar` emits `icmp ne i64 %i1reg, 0` which
-        # clang rejects. Comparison exprs already zext to i64 in emit_binary,
-        # so only direct bool identifiers hit this path. (task-99 cluster #2)
-        let cond_type: i32 = get_expr_type(s, stmt.if_cond)
+        # If the condition register is already an i1, use it directly in the
+        # br — otherwise coerce i64 -> i1 via `icmp ne ..., 0`.  Without the
+        # check, `if boolvar` emits `icmp ne i64 %i1reg, 0`, which clang
+        # rejects. (task-99 cluster #2)
+        #
+        # This used to ask `get_expr_type(...) != TYPE_BOOL`, whose comment
+        # claimed "only direct bool identifiers hit this path".  They do not:
+        # a bool-returning CALL also reports TYPE_BOOL while emit_expr zexts
+        # its i1 to i64, so `if f()` wired an i64 into `br i1` and clang
+        # rejected the module.  See cond_leaves_i1 (AGAST #1367).
         var cond_i1: i32 = cond
-        if cond_type != TYPE_BOOL
+        if cond_leaves_i1(s, stmt.if_cond) == 0
             cond_i1 = next_reg(s)
             emit_str(s, c"  ")
             emit_reg(s, cond_i1)
@@ -2341,10 +2344,11 @@ fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
 
         begin_block(s, cond_label)
         let cond: i32 = emit_expr(s, stmt.while_cond)
-        # Same i1/i64 handling as STMT_IF — skip icmp for direct bool conds.
-        let cond_type: i32 = get_expr_type(s, stmt.while_cond)
+        # Same i1/i64 handling as STMT_IF — skip the icmp only when the
+        # register genuinely is an i1.  `while f()` on a bool-returning f hit
+        # the identical #1367 defect.
         var cond_i1: i32 = cond
-        if cond_type != TYPE_BOOL
+        if cond_leaves_i1(s, stmt.while_cond) == 0
             cond_i1 = next_reg(s)
             emit_str(s, c"  ")
             emit_reg(s, cond_i1)
