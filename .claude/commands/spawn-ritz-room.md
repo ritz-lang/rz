@@ -4,6 +4,26 @@ Spawn a new Adele agent room for parallel ritz development tasks.
 
 Arguments: $ARGUMENTS
 
+## The parent room is `rz`
+
+Every `room_id` below that refers to the parent is literally **`rz`**.
+
+**It is NOT `ritz-lang`.** That is the name of the *directory* the monorepo sits
+in (`~/dev/ritz-lang/rz`), and it reads like a plausible room name, which is
+exactly why it gets used by mistake. A callback addressed to `ritz-lang` goes to
+a room the parent is not listening in — the child reports done, the parent never
+hears it, and the branch sits unreaped with no error anywhere.
+
+```
+room id      rz                     ← what send_room_message / scratchpad take
+worktree     ~/dev/ritz-lang/rz     ← a filesystem path, unrelated
+child room   ritz-task-<id>
+child tree   ~/dev/ritz-lang/rz-task-<id>
+```
+
+Do not infer the room id from a path. If unsure, `mcp__adele-context__list_conversations`
+names it.
+
 ## What to do
 
 Parse the arguments:
@@ -35,7 +55,7 @@ Also: `git fetch origin && git rebase origin/main` to ensure we're on latest.
    mcp__adele-context__send_room_message(
        room_id="ritz-task-<id>",
        message="Room initialized for AGAST #<id>.",
-       sender_name="Adele (ritz-lang)"
+       sender_name="Adele (rz)"
    )
    ```
 
@@ -131,7 +151,7 @@ Also: `git fetch origin && git rebase origin/main` to ensure we're on latest.
 
    **You must NOT merge into main, push to main, or clean up your own worktree.**
    Your job ends when you commit on YOUR branch and send the callback below.
-   The parent room (`ritz-lang`) orchestrates all merges, rebases, and cleanup.
+   The parent room (`rz`) orchestrates all merges, rebases, and cleanup.
 
    Do NOT:
    - `git checkout main` or `git merge` into main
@@ -146,7 +166,7 @@ Also: `git fetch origin && git rebase origin/main` to ensure we're on latest.
 
    ```
    mcp__adele-context__send_room_message(
-       room_id="ritz-lang",
+       room_id="rz",
        message="REAP ritz-task-{id} — worktree ~/dev/ritz-lang/rz-task-{id} ready.",
        sender_name="ritz-task-{id}",
        ask_claude=True
@@ -164,7 +184,7 @@ Also: `git fetch origin && git rebase origin/main` to ensure we're on latest.
    mcp__adele-context__send_room_message(
        room_id="ritz-task-<id>",
        message=briefing_message,
-       sender_name="Adele (ritz-lang)",
+       sender_name="Adele (rz)",
        ask_claude=True
    )
    ```
@@ -195,7 +215,7 @@ Example: `reap ritz-task-1321 — rz-task-1321`
 
 ```
 mcp__adele-context__append_scratchpad_item(
-    room_id="ritz-lang",
+    room_id="rz",
     text="reap ritz-task-1321 — rz-task-1321"
 )
 ```

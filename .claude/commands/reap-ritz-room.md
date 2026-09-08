@@ -4,6 +4,12 @@ Integrate completed task room work back into main with linear history.
 
 Arguments: $ARGUMENTS
 
+## The parent room is `rz`
+
+Scratchpad calls below take `room_id="rz"`. **Not `ritz-lang`** — that is the
+directory the monorepo sits in (`~/dev/ritz-lang/rz`), not a room. Addressing a
+room that isn't listening fails silently: no error, no queue entry, no reap.
+
 ## What to do
 
 Parse the arguments:
@@ -115,11 +121,11 @@ onto the updated main. Order by risk: smallest/safest first.
 The scratchpad is the FIFO queue and holds **one line per pending reap**
 (`reap ritz-task-<id> — rz-task-<id>`; see `/spawn-ritz-room`). Work it in order:
 
-1. `mcp__adele-context__get_scratchpad(room_id="ritz-lang")` — re-read it, always.
+1. `mcp__adele-context__get_scratchpad(room_id="rz")` — re-read it, always.
    Never address an item by a remembered index; positions are stable but your
    memory of them is not.
 2. Reap position 1 to **full completion** — merged, pushed, CI green.
-3. `mcp__adele-context__check_scratchpad_item(room_id="ritz-lang", index=<n>)`.
+3. `mcp__adele-context__check_scratchpad_item(room_id="rz", index=<n>)`.
 4. Only then move to the next.
 
 A callback that arrives mid-reap is **queued, not an interrupt**: append the
