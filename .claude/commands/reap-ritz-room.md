@@ -63,13 +63,53 @@ room until the current one is merged, pushed, and verified.
    * Keep it brief
    ```
 
-6. **Run the full test suite** (HARD GATE):
+6. **Run the gate** (HARD GATE — run it, do not recite it):
+
+   **6a. Everything CI's `bootstrap` job runs, in CI's own order:**
    ```bash
-   cd ~/dev/ritz-lang/rz-task-<id>/projects/ritz/ritz0
-   python -m pytest -x -q
+   cd ~/dev/ritz-lang/rz-task-<id>
+   make -C projects/ritz ci-local
    ```
 
-   **If tests fail: DO NOT merge. Fix the issue, re-run, repeat.**
+   `-C projects/ritz` is **required** — there is no root `Makefile`, so running
+   `make ci-local` from the repo root fails with `No rule to make target`
+   (exit 2, which reads like a test failure and is not one). `ci_local.py`
+   parses `.github/workflows/main.yml` and executes each `run:` step in its
+   declared `working-directory`, so this cannot drift from CI (AGAST #1363).
+
+   This subsumes the old gate. `pytest` alone was step 9 of 11 — it never ran
+   the doc examples, the regression harness self-tests, the 5-stage corpus
+   regression, or the bootstrap chain. A green pytest with a red corpus was
+   indistinguishable from a clean reap.
+
+   **6b. The project suites the diff actually touches.** `ci-local` covers the
+   *compiler*; it does not run the workspace projects. Derive the list from the
+   diff, don't guess it:
+   ```bash
+   git diff --name-only main | grep '^projects/' | cut -d/ -f2 | sort -u
+   ```
+   Then for each project `P`: `./rz test P`
+
+   **Compare against `main`, not against zero.** Several projects have
+   pre-existing compile failures (see `rz.toml [ci.known_failing.build]` and
+   the CI `test-all` set). A residual failure is only acceptable if it is
+   present on `main` too, so run the same command on both sides and diff the
+   counts. "N failed" is not a verdict; "N failed on both sides" is.
+
+   **Nested packages are invisible to `./rz test`.** A `ritz.toml` nested
+   inside another project (e.g. `projects/ritzunit/inventory`) is not
+   discovered by the workspace globber, so `./rz test <parent>` silently
+   skips it and `./rz test <path>` answers "Project not found" (AGAST #1383).
+   If the diff touches one, build it directly:
+   `python3 projects/ritz/build.py test <path-to-nested-pkg>`
+
+   **Beware the pipeline exit code.** `./rz test P | tail` reports `tail`'s
+   status, not `rz`'s. Capture the exit code before piping, or use
+   `set -o pipefail`.
+
+   **If any gate fails: DO NOT merge. Fix the issue, re-run, repeat.**
+   A failure here is a release-blocking defect caught before it reached main
+   — that is the gate working, not an obstacle to route around.
 
 7. **Merge into main** with fast-forward only:
    ```bash
