@@ -47,7 +47,34 @@ Also: `git fetch origin && git rebase origin/main` to ensure we're on latest.
 
    **Location convention:** `~/dev/ritz-lang/rz-task-<id>` — sibling to `rz/`.
 
-4. **Install the room** using `adele install`:
+4. **Provision room permissions — MANDATORY, and it is not optional plumbing:**
+   ```bash
+   .claude/provision-room.sh ~/dev/ritz-lang/rz-task-<id>
+   ```
+
+   The script exits non-zero unless both facts hold afterwards. **If it fails,
+   stop — do not start the agent.** A room that cannot write is worse than no
+   room: it looks healthy, burns budget, and produces nothing.
+
+   **Why this step exists.** A brand-new worktree is a path Claude Code has
+   never seen, so it is an **untrusted workspace**, and Claude Code *silently
+   ignores every `permissions.allow` entry* in an untrusted workspace. Nothing
+   then shadows adele's `can_use_tool` callback, which classifies `Write` as
+   DESTRUCTIVE and blocks on a WebSocket approval from a human. **There is no
+   human in a spawned room.** It waits the full 1800 s and the write is denied:
+
+   ```
+   21:35:53  ⚠️ DESTRUCTIVE tool requires approval: Write — /tmp/migrate_amp.py
+   22:05:53  ⏰ approval timed out after 1800.0s → deny
+   ```
+
+   That is 30 minutes of wall clock, from `ritz-task-1373`, for one file. The
+   parent room never hits it because `~/dev/ritz-lang/rz` was trusted long ago.
+   Every worktree we spawn starts without it. See AGAST **#1378** and the header
+   of `provision-room.sh` for the measured chain and two rule-syntax traps that
+   look like typos and are not.
+
+5. **Install the room** using `adele install`:
    ```bash
    adele install --room ritz-task-<id> \
        --name ritz-task-<id> \
@@ -57,17 +84,17 @@ Also: `git fetch origin && git rebase origin/main` to ensure we're on latest.
        --server wss://adele.lab.amazingland.live
    ```
 
-5. **Start the agent**:
+6. **Start the agent**:
    ```bash
    systemctl --user start adele-agent@ritz-task-<id>.service
    ```
 
-6. **Claim the AGAST task**:
+7. **Claim the AGAST task**:
    ```
    mcp__agast__claim_task(task_id=<id>, agent_name="ritz-task-<id>")
    ```
 
-7. **Send the briefing** with verification commands and merge rules:
+8. **Send the briefing** with verification commands and merge rules:
 
    ````markdown
    ## Task Briefing
@@ -142,10 +169,15 @@ Also: `git fetch origin && git rebase origin/main` to ensure we're on latest.
    )
    ```
 
-8. **Verify** the room is running:
+9. **Verify** the room is running **and can write**:
    ```bash
    adele status
+   .claude/provision-room.sh --verify ~/dev/ritz-lang/rz-task-<id>
    ```
+
+   `adele status` reports `active` for a room that is stalled on an approval
+   nobody will answer — it did exactly that for `ritz-task-1373`. Both checks,
+   every spawn.
 
 ## The Scratchpad Is A FIFO Queue, Not A Report
 
@@ -194,6 +226,11 @@ git add ... && git commit ...
 # 2. Create worktrees
 git worktree add ~/dev/ritz-lang/rz-task-69 -b ritz-task-69
 git worktree add ~/dev/ritz-lang/rz-task-70 -b ritz-task-70
+
+# 2b. Provision EVERY worktree — a batch spawn is where this is easiest to
+#     forget, and a room that cannot write still reports `active`.
+.claude/provision-room.sh ~/dev/ritz-lang/rz-task-69
+.claude/provision-room.sh ~/dev/ritz-lang/rz-task-70
 
 # 3. Install + start
 adele install --room ritz-task-69 ...

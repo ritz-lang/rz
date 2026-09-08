@@ -89,6 +89,12 @@ room until the current one is merged, pushed, and verified.
    cd ~/dev/ritz-lang/rz
    git worktree remove ~/dev/ritz-lang/rz-task-<id>
    git branch -D ritz-task-<id>
+
+   # Drop the workspace-trust entry /spawn-ritz-room added to ~/.claude.json.
+   # Safe to run after the directory is gone — that is the expected ordering.
+   # Left behind, these accumulate one dead absolute path per reap and quietly
+   # grant trust to whatever later occupies that path.
+   .claude/provision-room.sh --remove ~/dev/ritz-lang/rz-task-<id>
    ```
 
 10. **Mark AGAST task complete** (if not already done by the child room):
