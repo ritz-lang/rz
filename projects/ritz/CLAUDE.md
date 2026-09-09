@@ -15,8 +15,15 @@ Systems programming language compiling to LLVM IR. No libc - direct Linux syscal
 ## Quick Start
 
 ```bash
-# Build an example
-python3 build.py build 21_ls
+# Build an example — build.py takes a PATH to the package, not a bare name.
+# `build.py build 21_ls` answers "Package '21_ls' not found"; the bare-name
+# form documented here until 2026-09-09 never worked.
+python3 build.py build examples/tier3_coreutils/21_ls
+
+# ritzlib imports resolve via RITZ_PATH. Without it, every example that
+# imports ritzlib fails with "Cannot find module: ritzlib.io" — which reads
+# like a broken package rather than a missing environment variable.
+RITZ_PATH=$PWD python3 build.py build examples/tier1_basics/03_echo
 
 # Pre-commit validation (incremental ritz1, 30-60s)
 make matrix
