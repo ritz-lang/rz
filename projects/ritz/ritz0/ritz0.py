@@ -374,7 +374,13 @@ def main():
 
     # Test mode
     if args.test or args.test_all:
-        from test_runner import run_test_file
+        from test_runner import run_test_file, install_signal_handlers
+
+        # AGAST #1392: this is the entry point build.py drives, and the one
+        # that was being killed by an outer `timeout`. Without a handler the
+        # scratch-dir `finally` never ran and the leaked `ritzlib` symlink
+        # formed a collection-wedging cycle.
+        install_signal_handlers()
 
         # Determine which test files to run
         if args.test_all:

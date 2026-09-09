@@ -8,11 +8,13 @@ Each test is compiled by appending a main() that calls the test function.
 
 import sys
 import argparse
+import signal
 import subprocess
 import tempfile
 import hashlib
 import os
 import shutil
+import threading
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict
 
@@ -116,6 +118,80 @@ def parse_project_dependencies(project_root: Path) -> dict:
                 )
 
     return dependencies
+
+# AGAST #1392. Scratch directories used to be created with
+# `tempfile.mkdtemp(dir='.')`, i.e. inside the package under test, and populated
+# with a `ritzlib` symlink so imports resolve. When the package under test was
+# ritzlib itself, a leaked scratch dir left `ritzlib/tests/tmpXXXX/ritzlib`
+# pointing at its own ancestor -- a cycle. pytest follows directory symlinks
+# while collecting, so the ritz0 suite spent 739 s and collected zero tests.
+#
+# Putting scratch under the system temp dir makes that cycle unconstructible
+# rather than merely unlikely: a directory outside the tree cannot be an
+# ancestor of anything inside it. `run_batch_tests` below already did this, so
+# the two remaining sites were the anomaly, not the convention.
+_SCRATCH_PREFIX = "ritz_test_"
+
+# Registry of live scratch dirs, so a signal handler has something to clean.
+# Without it the paths are locals in whichever frame happens to be running.
+_SCRATCH_DIRS: set = set()
+_SCRATCH_LOCK = threading.Lock()
+
+
+def make_scratch_dir() -> str:
+    """Create a scratch directory outside the tree under test, and register it."""
+    path = tempfile.mkdtemp(prefix=_SCRATCH_PREFIX)
+    with _SCRATCH_LOCK:
+        _SCRATCH_DIRS.add(path)
+    return path
+
+
+def cleanup_scratch_dir(tmpdir: Optional[str]):
+    """Remove a scratch directory and deregister it. Safe to call twice."""
+    if not tmpdir:
+        return
+    with _SCRATCH_LOCK:
+        _SCRATCH_DIRS.discard(tmpdir)
+    if os.path.exists(tmpdir):
+        cleanup_tmpdir_with_symlinks(tmpdir)
+
+
+def _cleanup_all_scratch_dirs():
+    with _SCRATCH_LOCK:
+        live = list(_SCRATCH_DIRS)
+    for path in live:
+        cleanup_scratch_dir(path)
+
+
+def install_signal_handlers():
+    """Make SIGTERM/SIGINT unwind so the existing `finally` blocks run.
+
+    A `finally` covers exceptions but not process death: CPython services the
+    default SIGTERM by terminating without unwinding, which is why every
+    `finally: cleanup...` in this file was silently bypassed whenever a run was
+    killed or hit an outer `timeout`. Raising SystemExit from the handler turns
+    the signal back into an ordinary unwind.
+
+    Signal handlers can only be installed from the main thread; callers that are
+    not on it get a no-op rather than an exception, since cleanup is a
+    best-effort tidy-up and must never break a working run.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        return
+
+    def _handler(signum, _frame):
+        _cleanup_all_scratch_dirs()
+        # 128+n is the conventional shell encoding for "killed by signal n";
+        # preserving it keeps `timeout`'s 124/143 exit codes meaningful.
+        raise SystemExit(128 + signum)
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(sig, _handler)
+        except (ValueError, OSError):
+            # Some embedding contexts disallow this. Not fatal.
+            pass
+
 
 def cleanup_tmpdir_with_symlinks(tmpdir: str):
     """Clean up a temp directory that may contain symlinks.
@@ -537,7 +613,7 @@ def run_test_file(source_path: str, verbose: bool = False, lib_files: List[str] 
     # This allows us to cache compiled .ll files across tests
     tmpdir = None
     try:
-        tmpdir = tempfile.mkdtemp(dir='.')
+        tmpdir = make_scratch_dir()
 
         # Step 1: Set up environment and discover dependencies ONCE
         if verbose:
@@ -548,7 +624,7 @@ def run_test_file(source_path: str, verbose: bool = False, lib_files: List[str] 
             # Fall back to per-test compilation on setup error
             if verbose:
                 print(f"  Warning: {error}, falling back to per-test compilation")
-            cleanup_tmpdir_with_symlinks(tmpdir)
+            cleanup_scratch_dir(tmpdir)
             return _run_test_file_legacy(source_path, verbose, lib_files)
 
         # Step 2: Compile all dependencies ONCE
@@ -561,7 +637,7 @@ def run_test_file(source_path: str, verbose: bool = False, lib_files: List[str] 
         if error:
             if verbose:
                 print(f"  Warning: {error}, falling back to per-test compilation")
-            cleanup_tmpdir_with_symlinks(tmpdir)
+            cleanup_scratch_dir(tmpdir)
             return _run_test_file_legacy(source_path, verbose, lib_files)
 
         # Step 3: Run each test (only need to compile harness + link)
@@ -621,7 +697,7 @@ def run_test_file(source_path: str, verbose: bool = False, lib_files: List[str] 
     finally:
         # Clean up temp directory with proper symlink handling
         if tmpdir and os.path.exists(tmpdir):
-            cleanup_tmpdir_with_symlinks(tmpdir)
+            cleanup_scratch_dir(tmpdir)
 
     return (passed, failed, failures)
 
@@ -642,7 +718,7 @@ def _run_test_file_legacy(source_path: str, verbose: bool = False, lib_files: Li
 
         tmpdir = None
         try:
-            tmpdir = tempfile.mkdtemp(dir='.')
+            tmpdir = make_scratch_dir()
             exe_path, error = compile_test(
                 source_path,
                 test_name,
@@ -684,7 +760,7 @@ def _run_test_file_legacy(source_path: str, verbose: bool = False, lib_files: Li
                 print(f"FAIL ({e})")
         finally:
             if tmpdir and os.path.exists(tmpdir):
-                cleanup_tmpdir_with_symlinks(tmpdir)
+                cleanup_scratch_dir(tmpdir)
 
     return (passed, failed, failures)
 
@@ -875,6 +951,11 @@ def main():
                         help='Use legacy per-test compilation (for benchmarking)')
 
     args = parser.parse_args()
+
+    # AGAST #1392: turn SIGTERM/SIGINT into an unwind so the `finally` blocks
+    # below actually run. Installed after argument parsing so `--help` and a
+    # usage error still behave like an ordinary CLI.
+    install_signal_handlers()
 
     # Use batch mode if requested
     if args.batch:
