@@ -215,13 +215,35 @@ let bad = s"hello"
 
 **Escape sequences:** `\n`, `\t`, `\r`, `\\`, `\"`, `\'`, `\0`
 
-**String interpolation:** `{name}` inside a string literal passed to the
-`print` builtin substitutes the named variable.
+**String interpolation:** `{expr}` inside a **plain** string literal passed to
+the `print` builtin substitutes the value of `expr`. It is not restricted to
+bare variable names — any expression works, including a call:
 
-```ritz body
-let x = 42
-print("x = {x}\n")
+```ritz
+fn twice(n: i64) -> i64
+    return n * 2
+
+fn main() -> i32
+    let x: i64 = 21
+    print("x = {x}\n")
+    print("twice = {twice(x)}\n")
+    return 0
 ```
+
+Use `{{` for a literal brace.
+
+**Interpolation does NOT apply to `c"..."` literals** (AGAST #1374). A
+c-string is opaque bytes, so `print(c"x = {x}\n")` would print the placeholder
+verbatim. That used to compile clean and exit 0 with wrong output; it is now a
+compile error directing you at the plain-string form.
+
+The asymmetry is deliberate rather than an oversight. Making c-strings
+interpolate would break 48 sites across the workspace that rely on `{...}`
+staying opaque -- including ritz1's own emitter, which builds LLVM inline-asm
+constraint strings such as `"={rax},{rax},{rdi},~{rcx}"`, where `{rax}` and
+`{rdi}` are register constraints. Interpolating those corrupts every syscall
+the self-hosted compiler emits. A c-string containing braces is therefore
+still perfectly legal; only passing one to `print` is rejected.
 
 Interpolation is an integer-formatting facility: interpolating a `StrView`
 fails with `Cannot print value of type {i8*, i64}`. To compose strings, call

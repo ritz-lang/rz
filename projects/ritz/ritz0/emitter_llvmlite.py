@@ -7501,6 +7501,27 @@ class LLVMEmitter:
         if fname == 'print':
             if len(call.args) == 1:
                 arg = call.args[0]
+                if isinstance(arg, rast.CStringLit) and self._has_interp_placeholder(arg.value):
+                    # AGAST #1374. `print(c"...{x}...")` used to compile clean,
+                    # exit 0, and print the placeholder verbatim. 72_raii
+                    # shipped exactly that: it built, linked and ran green while
+                    # emitting `id={id}` against an expected `id=1`.
+                    #
+                    # We reject rather than interpolate. Interpolating c-strings
+                    # was measured and rejected: 48 corpus sites rely on `{...}`
+                    # staying opaque, 14 of them ritz1's own LLVM inline-asm
+                    # constraints (`"={rax},{rax},{rdi}"`). Interpolating those
+                    # corrupts every syscall the self-hosted compiler emits.
+                    #
+                    # The check lives HERE, in the print builtin's lowering, and
+                    # not in the lexer or parser, for exactly that reason: those
+                    # would hit all 48 sites.
+                    raise EmitError(
+                        "`c\"...\"` literals do not interpolate: the placeholder "
+                        "would be printed verbatim. Use a plain string literal "
+                        "`\"...\"` here, or `{{` to print a literal brace",
+                        getattr(arg, "span", None) or getattr(call, "span", None),
+                    )
                 if isinstance(arg, (rast.StringLit, rast.CStringLit)):
                     s = arg.value
                     # Get or create the string constant
@@ -9472,6 +9493,39 @@ class LLVMEmitter:
     @staticmethod
     def _is_scalar(ty: ir.Type) -> bool:
         return isinstance(ty, (ir.IntType, ir.FloatType, ir.DoubleType))
+
+    @staticmethod
+    def _has_interp_placeholder(s: str) -> bool:
+        """Would this text have interpolated, had it been a plain string?
+
+        AGAST #1374. Mirrors the lexer's rule in `_lex_string` (lexer.py:206):
+        a `{` starts interpolation only when a matching `}` follows, and `{{`
+        is an escaped literal brace. Reproducing the lexer's rule rather than
+        inventing one matters in both directions -- a stricter test would
+        reject c-strings that `"..."` would have left alone, and a looser one
+        would miss the defect it exists to catch.
+
+        This runs on the token VALUE, not on source text, so the lexer's
+        stop-at-closing-quote has no analogue here. `{{` is NOT collapsed in a
+        c-string -- only `_lex_string` does that -- so it survives to be seen.
+        """
+        i, n = 0, len(s)
+        while i < n:
+            if s[i] == '{':
+                if i + 1 < n and s[i + 1] == '{':
+                    i += 2          # escaped brace, not a placeholder
+                    continue
+                depth, j = 1, i + 1
+                while j < n:
+                    if s[j] == '{':
+                        depth += 1
+                    elif s[j] == '}':
+                        depth -= 1
+                        if depth == 0:
+                            return True
+                    j += 1
+            i += 1
+        return False
 
     def _check_let_annotation(self, stmt, val: ir.Value, declared_ty: ir.Type) -> None:
         """Reject `let x: T = expr` where expr cannot possibly be a T.
