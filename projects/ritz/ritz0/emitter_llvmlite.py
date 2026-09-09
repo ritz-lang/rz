@@ -3428,8 +3428,49 @@ class LLVMEmitter:
         self._expected_enum_name = None
         try:
             return self._emit_stmt_inner(stmt)
+        except TypeError as exc:
+            # AGAST #1384. #1366 gave call-argument mismatches a location by
+            # wrapping `_emit_call`; stores were never covered, and stores are
+            # where the workspace's remaining anonymous diagnostics come from
+            # (`projects/http`, `projects/tempest`). There are 90 distinct
+            # `builder.store` call sites in this file, so the location is
+            # recovered here — at the innermost statement, which is the
+            # tightest span that covers all of them — rather than at each one.
+            #
+            # Only llvmlite's *store* complaint is converted; anything else
+            # re-raises untouched so a genuine emitter bug still surfaces as a
+            # traceback instead of being disguised as a user error. An inner
+            # frame that already raised EmitError propagates unchanged: it is
+            # not a TypeError, so the innermost location wins.
+            msg = str(exc)
+            if not any(k in msg for k in self._LLVMLITE_STORE_MISMATCH):
+                raise
+            raise EmitError(
+                self._store_mismatch_message(stmt, msg),
+                getattr(stmt, 'span', None),
+            ) from None
         finally:
             self._expected_enum_name = saved_expected_enum
+
+    # llvmlite's IRBuilder.store raises TypeError with this text when the
+    # value's type does not match the destination pointer's pointee.
+    _LLVMLITE_STORE_MISMATCH = ("cannot store",)
+
+    @staticmethod
+    def _store_mismatch_message(stmt: rast.Stmt, llvm_msg: str) -> str:
+        """Name the assignment target in front of llvmlite's message.
+
+        The LLVM type spellings are the only useful part of the original and
+        are kept verbatim; this adds who was being assigned to, which is what
+        `cannot store {i8*, i64} to i8**` on its own does not say.
+        """
+        if isinstance(stmt, rast.AssignStmt):
+            target = stmt.target
+            if isinstance(target, rast.Ident):
+                return f"cannot assign to `{target.name}`: {llvm_msg}"
+            if isinstance(target, rast.Field):
+                return f"cannot assign to field `{target.field}`: {llvm_msg}"
+        return llvm_msg
 
     def _emit_stmt_inner(self, stmt: rast.Stmt) -> Union[bool, ir.Value, None]:
         """Emit a statement. Returns True if block terminated."""
