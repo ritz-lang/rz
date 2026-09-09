@@ -23,7 +23,7 @@ export RITZ_PATH=/home/aaron/dev/nevelis/langdev
 ./valet -w 4 -m         # Combined: 4 workers + multishot
 
 # Test
-./tests/run_all.sh      # Run test suite
+./test/run_all.sh      # Run test suite
 wrk -t4 -c100 -d10s http://localhost:8080/  # Benchmark
 ```
 

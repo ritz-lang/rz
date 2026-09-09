@@ -2,8 +2,8 @@
 # run_all.sh - Run all Valet tests
 #
 # Usage:
-#   ./tests/run_all.sh          # Run all tests
-#   VALET=/path/to/valet ./tests/run_all.sh  # Use custom binary
+#   ./test/run_all.sh          # Run all tests
+#   VALET=/path/to/valet ./test/run_all.sh  # Use custom binary
 
 set -e
 
