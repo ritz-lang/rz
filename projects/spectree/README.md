@@ -14,6 +14,8 @@ Spectree is served as an MCP (Model Context Protocol) server, enabling any MCP-c
 
 ## Features
 
+> **Planned/partial.** The list below describes the design. See [Status](#status) — there is no executable and no MCP server yet.
+
 - Three node types: Org (root), Spec (declarative), Plan (imperative)
 - Tree structure with parent/child relationships
 - Graph links between nodes (Implements, DependsOn, RelatedTo)
@@ -27,13 +29,21 @@ Spectree is served as an MCP (Model Context Protocol) server, enabling any MCP-c
 ## Installation
 
 ```bash
-# Build from source
-export RITZ_PATH=/path/to/ritz
-./ritz build .
+# Build from source (run from the monorepo root; `rz` sets RITZ_PATH itself).
+# spectree's ritz.toml sets `test_only = true` and declares no [[bin]], so this
+# reports "nothing to build" — that is the correct, successful outcome.
+./rz build spectree
 
-# Run the Spectree MCP server
-./build/debug/spectree serve --port 9090
+# Run its tests
+./rz test spectree
 ```
+
+**There is no `spectree` executable and no MCP server to run.** spectree is
+currently a library (`lib/`) plus its tests; `projects/spectree/build/` does not
+exist. An earlier version of this README documented
+`./build/debug/spectree serve --port 9090` — that binary has never been
+buildable from this manifest. Shipping the MCP server requires adding a
+`[[bin]]` section to `ritz.toml` and an entry point first.
 
 ## Usage
 
@@ -90,7 +100,15 @@ Org: "Ritz Language"
 
 ## Status
 
-**Alpha** - Data model, node types, and MCP interface are designed. Core tree operations and persistence via Mausoleum are being implemented. Agent collaboration features and MCP server are planned once the data layer stabilizes.
+**Alpha — library and tests only, no runnable server.** `lib/` holds 5 modules
+and the project carries 91 `[[test]]` markers across 5 test files.
+`./rz test spectree` exits 0 with `Σ 91 passed, 0 failed` (measured 2026-09-12).
+
+`./rz build spectree` exits 0 reporting "nothing to build" (`test_only = true`,
+no `[[bin]]`), and `projects/spectree/build/` does not exist. The MCP server is
+**not implemented** — it needs a `[[bin]]`, an entry point and a transport before
+any `spectree serve` command can exist. Agent collaboration features are likewise
+still planned.
 
 ## License
 

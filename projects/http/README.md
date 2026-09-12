@@ -32,9 +32,13 @@ HTTP/2 support includes the full binary framing layer with stream multiplexing, 
 # [dependencies]
 # http = { path = "../http" }
 
-# Build from source
-export RITZ_PATH=/path/to/ritz
-./ritz build .
+# Build from source (run from the monorepo root; `rz` sets RITZ_PATH itself).
+# http is a library with `test_only = true` in its ritz.toml, so this reports
+# "nothing to build" — that is the correct, successful outcome.
+./rz build http
+
+# Run its tests
+./rz test http
 ```
 
 ## Usage
@@ -78,7 +82,16 @@ match frame.frame_type
 
 ## Status
 
-**Alpha** - Core type definitions, HTTP/1.1 parser, and basic response building are in progress. HTTP/2 framing, HTTP/3/QUIC, and full TLS integration are planned in subsequent phases.
+**Alpha, but larger than "in progress" suggests.** `lib/` holds 23 modules and
+the project carries **551** `[[test]]` markers across 22 test files. Run
+`./rz test http` for the current pass count.
+
+`ritz.toml` sets `test_only = true` with no `[[bin]]`, so `./rz build http`
+correctly reports "nothing to build" and exits 0 — there is no `http` executable
+and none is intended. Consumers link it as a library.
+
+HTTP/2 framing, HTTP/3/QUIC and full TLS integration remain incomplete; check
+`lib/` for what is actually present before relying on a feature listed above.
 
 ## License
 

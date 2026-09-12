@@ -14,6 +14,8 @@ Nexus is the dogfooding platform for the Ritz ecosystem - every component is bui
 
 ## Features
 
+> **Partially implemented.** The list below describes the design. See [Status](#status) — nexus builds, but the binary is a Zeus worker with no usable standalone entry point.
+
 - Hierarchical wiki pages with parent/child tree structure
 - Complete version history for all content via Mausoleum
 - Automatic backlinks between pages
@@ -27,16 +29,36 @@ Nexus is the dogfooding platform for the Ritz ecosystem - every component is bui
 ## Installation
 
 ```bash
-# Clone with dependencies
-git clone --recursive https://github.com/ritz-lang/nexus.git
-cd nexus
+# Nexus lives in the rz monorepo; there is no separate nexus repository.
+git clone git@github.com:ritz-lang/rz.git
+cd rz
 
-# Build
-./ritz build .
-
-# Start development server
-./build/debug/nexus serve --dev
+# Build (run from the monorepo root; `rz` sets RITZ_PATH itself)
+./rz build nexus
+# Produces projects/nexus/build/debug/nexus
 ```
+
+**There is no `nexus serve` subcommand and no standalone dev server.** The
+binary is a Zeus worker process, not a server; its own usage string is:
+
+```
+Usage: nexus <shm_size> <worker_id>
+  (This binary is spawned by Zeus daemon)
+```
+
+Run with no arguments it prints that and exits 1. Run as
+`nexus serve --dev` it parses `serve` as `shm_size` and `--dev` as `worker_id`,
+both coercing to 0, then segfaults on the zero-sized shared-memory region:
+
+```bash
+./projects/nexus/build/debug/nexus serve --dev ; echo $?   # 139, reproducible
+```
+
+Before the crash it does reach the store layer — it tries mausoleum over Spire
+at 127.0.0.1:7777, falls back to in-memory mode and seeds 3 pages — so the
+failure is the zero `shm_size`, not the wiki code. Running it for real means
+bringing up Zeus and letting Zeus spawn it with a valid SHM size and worker id;
+that path is not wired up in this repo yet.
 
 ## Usage
 
@@ -92,7 +114,28 @@ fn main() -> i32
 
 ## Status
 
-**Design phase** - Architecture, content structure, and data model are defined. Core wiki functionality (page CRUD, versioning, Markdown rendering) is being implemented using TDD once the underlying Spire, Mausoleum, and Tome libraries stabilize.
+**Not "design phase" — it is implemented and compiles.** This README described
+nexus as design-only while the project had 16 source files and a green build.
+
+Measured 2026-09-12: `./rz build nexus` exits 0 against 6 dependencies,
+producing `build/debug/nexus`. 37 `[[test]]` markers across 4 test files.
+
+`./rz test nexus` **exits 1**: `Σ 3 passed, 0 failed, 3 compile-failed` — three
+of the four test files fail to compile with
+`Import resolution failed: Cannot find module: services.wiki_service`. Real
+failures, not excused anywhere.
+
+What is *not* done is the entry point. The binary is a Zeus worker
+(`nexus <shm_size> <worker_id>`), there is no `serve` subcommand, and invoking it
+by hand segfaults — see Installation above. Page CRUD, versioning and Markdown
+rendering exist in source; the store layer reaches mausoleum over Spire and falls
+back to in-memory with 3 seeded pages.
+
+It also does not build with the self-hosted compiler:
+`./rz clean nexus && ./rz build nexus --compiler ritz1` fails at exit 1 with
+`cannot determine receiver type for method call` (×4) and
+`unknown identifier 'scan_rebuild_callback'`. Those are ritz1 gaps, not nexus
+bugs — see [docs/STACK_MATRIX.md](../../docs/STACK_MATRIX.md).
 
 ## License
 

@@ -32,9 +32,8 @@ The primary use case is as the persistence backend for Spectree (hierarchical sp
 # [dependencies]
 # mausoleum = { path = "../mausoleum" }
 
-# Build from source
-export RITZ_PATH=/path/to/ritz
-./ritz build .
+# Build from source (run from the monorepo root; `rz` sets RITZ_PATH itself)
+./rz build mausoleum
 ```
 
 ## Usage
@@ -70,7 +69,20 @@ let old = db.at_version(spec.id, history[0].version_id)
 
 ## Status
 
-**Alpha** - Architecture, data model, and file format are designed. Core storage engine and document insertion are being implemented. Tree operations, versioning, and graph queries are planned for subsequent phases.
+**Active development**, further along than "Alpha — architecture designed", which
+is what this README said while the code was already building and running.
+
+Measured 2026-09-12: `./rz build mausoleum` exits 0, producing five binaries —
+`mausoleum`, `wiki-seed`, `concurrent_bench`, `test_integration` and
+`test_storage`. `lib/` holds 18 modules and the project carries 401 `[[test]]`
+markers across 19 test files. Run `./rz test mausoleum` for the current pass
+count.
+
+Not yet proven: it does **not** build with the self-hosted compiler.
+`./rz clean mausoleum && ./rz build mausoleum --compiler ritz1` fails at exit 1
+with `ritz1 cannot emit: cannot determine receiver type for method call` (×4) and
+`unknown identifier 'handle_task_event'`. Those are ritz1 gaps, not mausoleum
+bugs — see [docs/STACK_MATRIX.md](../../docs/STACK_MATRIX.md).
 
 ## License
 

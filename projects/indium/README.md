@@ -23,12 +23,16 @@ Named after Indium, a soft malleable metal - the distribution that wraps around 
 - UEFI disk image builder (qcow2 format)
 - QEMU launch targets for both UEFI and BIOS boot
 - GPU framebuffer support with prism_demo
-- **AWS EC2 deployment** via Terraform
+- EC2-compatible GPT disk image builder (`make ec2-disk`)
 
 ## Installation
 
 ```bash
-# Prerequisites: qemu-system-x86, grub-efi, mtools
+# Prerequisites. `lld` is required: indium builds harland, whose UEFI
+# bootloader target links with lld-link. Without it the build fails at
+# exit 1 with "Cannot link UEFI target 'bootx64': lld-link not found".
+sudo apt install qemu-system-x86 grub-efi mtools clang lld
+
 cd projects/indium
 
 # Build everything and create bootable ISO
@@ -45,7 +49,7 @@ make test-uefi-gui
 
 # Build with GDB debug server
 make debug
-# Then: gdb -ex "target remote :1234" ../harland/build/harland.elf
+# Then: gdb -ex "target remote :1234" ../harland/build/debug/harland.elf
 ```
 
 ## Usage
@@ -64,132 +68,45 @@ make debug        # Boot with GDB server on :1234
 make clean        # Remove build artifacts
 ```
 
-## AWS EC2 Deployment
+## AWS EC2 Deployment — NOT IMPLEMENTED
 
-Indium can run on real AWS EC2 hardware using UEFI boot. The deployment uses Terraform to automate the entire process.
+**There is no deployment tooling in this project.** `projects/indium/deploy/`
+does not exist, so neither does `deploy/terraform`. Every `terraform init`,
+`terraform apply`, `terraform output` and `terraform destroy` command this
+section used to document would fail immediately on a missing directory. (The
+only `deploy/` directory in the monorepo belongs to `projects/nexus`, and it is
+unrelated.)
 
-### Architecture
-
-The deployment works using a **builder pattern**:
-
-1. **Builder Instance** - Ubuntu t3.micro that burns the disk image to EBS
-2. **EBS Volume** - 1GB volume that holds the Harland OS
-3. **Snapshot + AMI** - EBS snapshot registered as UEFI-bootable AMI
-4. **Harland Instance** - t3.micro running Harland from the custom AMI
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                       Terraform Deployment Flow                          │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  ┌──────────┐     ┌─────────────┐     ┌──────────────┐                  │
-│  │  Local   │ SCP │   Ubuntu    │ dd  │     EBS      │                  │
-│  │ GPT Disk ├────▶│   Builder   ├────▶│    Volume    │                  │
-│  │  Image   │     │  Instance   │     │   (1 GB)     │                  │
-│  └──────────┘     └─────────────┘     └──────┬───────┘                  │
-│       │                                       │                          │
-│       │  make ec2-disk                        │ snapshot                 │
-│       │                                       ▼                          │
-│  ┌──────────┐                         ┌──────────────┐                  │
-│  │  Harland │◀───────────────────────│    UEFI      │                  │
-│  │ Instance │     boot from AMI       │     AMI      │                  │
-│  │ (t3.micro)│                        │ (ena_support)│                  │
-│  └──────────┘                         └──────────────┘                  │
-│       │                                                                  │
-│       │ serial output                                                    │
-│       ▼                                                                  │
-│  aws ec2 get-console-output                                             │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
-### Prerequisites
+What does exist is the disk image itself:
 
 ```bash
-# Install AWS CLI and Terraform
-brew install awscli terraform    # macOS
-sudo apt install awscli terraform  # Ubuntu
-
-# Configure AWS credentials
-aws configure
-
-# Create S3 bucket for Terraform state (one-time)
-aws s3 mb s3://ritz-harland-terraform-state --region us-west-2
-```
-
-### Deployment
-
-```bash
-# Build the EC2-compatible disk image
-cd projects/indium
-make ec2-disk
-
-# Initialize Terraform (first time only)
-cd deploy/terraform
-terraform init
-
-# Deploy to AWS
-terraform apply
-
-# View serial console output (boot log)
-terraform output -raw get_console_output | sh
-
-# Or manually:
-aws ec2 get-console-output --instance-id $(terraform output -raw harland_instance_id) --region us-west-2 --output text
+make ec2-disk        # builds build/ec2-boot.img
 ```
 
 ### Disk Image Format
 
-The EC2 disk image (`build/ec2-boot.img`) uses:
+`build/ec2-boot.img` is shaped for UEFI boot on EC2:
+
 - **GPT partition table** (required for UEFI boot)
-- **EFI System Partition (ESP)** - FAT32, type code `EF00`
-- **Partition layout:**
-  - Sectors 2048-131038 (~63MB ESP)
-  - Contains `/EFI/BOOT/BOOTX64.EFI` (bootloader)
-  - Contains `/harland/kernel.elf` (kernel)
+- **EFI System Partition (ESP)** — FAT32, type code `EF00`
+- Sectors 2048-131038 (~63MB ESP), containing
+  `/EFI/BOOT/BOOTX64.EFI` (bootloader) and `/harland/kernel.elf` (kernel)
 
 ### Hardware Support (Nitro Instances)
 
-EC2 Nitro instances (t3, c5, m5, etc.) use:
-- **NVMe for storage** - Amazon EBS appears as `/dev/nvme*`
-- **ENA for networking** - Elastic Network Adapter (VF device)
-- **UEFI firmware** - Required for custom OS boot
+EC2 Nitro instances (t3, c5, m5, etc.) use NVMe for storage (EBS appears as
+`/dev/nvme*`), ENA for networking, and UEFI firmware. Driver status in the
+harland kernel:
 
-Current driver status:
-- ✅ **NVMe** - Working, reads/writes to EBS volumes
-- 🔄 **ENA** - In progress, reset sequence being debugged
-- ✅ **Serial Console** - Working via `aws ec2 get-console-output`
+- **NVMe** — implemented
+- **ENA** — in progress
+- **Serial console** — implemented (readable via `aws ec2 get-console-output`)
 
-### Terraform Resources
-
-| Resource | Purpose |
-|----------|---------|
-| `aws_instance.builder` | Ubuntu instance for burning images |
-| `aws_ebs_volume.harland` | Target volume for OS image |
-| `aws_ebs_snapshot.harland` | Snapshot for AMI creation |
-| `aws_ami.harland` | UEFI-bootable AMI with ENA support |
-| `aws_instance.harland` | Running Harland OS instance |
-
-### Outputs
-
-```bash
-# Get all outputs
-terraform output
-
-# Specific outputs
-terraform output harland_instance_id   # Instance ID
-terraform output harland_ami_id        # AMI ID
-terraform output get_console_output    # Command to view boot log
-```
-
-### Destroying Resources
-
-```bash
-cd deploy/terraform
-terraform destroy
-```
-
-This will terminate instances, delete snapshots, deregister the AMI, and clean up all resources.
+None of the above has been re-validated against live EC2 hardware recently; treat
+it as a design target. Actually deploying would mean writing the Terraform (or
+equivalent) that this section previously described as already present: a builder
+instance to `dd` the image onto an EBS volume, a snapshot registered as a
+UEFI-bootable AMI with `ena_support`, and an instance booted from it.
 
 ## Userspace Programs
 
@@ -208,7 +125,21 @@ This will terminate instances, delete snapshots, deregister the AMI, and clean u
 | `ping` | Network connectivity test |
 | `args_test` | Test argument passing |
 | `mmap_test` | Test mmap syscall |
-| `prism_demo` | GPU framebuffer graphics demo |
+| `cwd_test` | Test working-directory syscalls |
+| `hello_tier1` | Minimal hello (tier-1 language subset) |
+| `minimal_syscall` | Smallest possible syscall program |
+| `portable_getpid` | getpid via the portable libharland interface |
+
+All of the above appear as `*.elf` in `projects/indium/build/debug/` after
+`./rz build indium` (exit 0, measured 2026-09-12).
+
+Two entries that are **not** built by indium, despite earlier revisions of this
+table listing them here:
+
+| Program | Where it actually comes from |
+|---------|------------------------------|
+| `rzsh` | `projects/rzsh` → `build/debug/rzsh.elf`; indium's `make rzsh` target pulls it in |
+| `prism_demo` | `projects/prism` → `build/debug/prism_demo.elf` |
 
 ## Dependencies
 
@@ -216,7 +147,22 @@ This will terminate instances, delete snapshots, deregister the AMI, and clean u
 
 ## Status
 
-**Active development** - Init, basic utilities (hello, true, false, echo, wc, seq10), and rzsh shell all run on Harland. UEFI and BIOS bootable images are buildable. mmap and args passing work. GPU framebuffer support with prism_demo. Multi-process support and more utilities are in progress.
+**Active development.** `./rz build indium` is green (exit 0, measured
+2026-09-12) and produces all 17 userspace `.elf` binaries. Init, the basic
+utilities (hello, true, false, echo, wc, seq10) and the rzsh shell run on
+Harland; mmap and argument passing work; UEFI and BIOS bootable images are
+buildable. Multi-process support and more utilities are in progress.
+
+Two caveats this README previously omitted:
+
+- Booting requires `lld` for harland's `bootx64` target — see Installation.
+- There is no AWS deployment tooling; `make ec2-disk` builds an image, nothing
+  ships it. See the EC2 section above.
+
+QEMU boot targets (`make run`, `make run-iso`, `make test-uefi-gui`,
+`make debug`) all resolve as real Make targets, but none of them were executed
+as part of this documentation pass — they need QEMU and a display/serial session.
+Treat their behaviour as unverified here.
 
 ## License
 

@@ -27,12 +27,11 @@ Angelo provides all font rasterization and text shaping for Iris text rendering.
 ## Installation
 
 ```bash
-# Build from source
-export RITZ_PATH=/path/to/ritz
-./ritz build .
+# Build from source (run from the monorepo root; `rz` sets RITZ_PATH itself)
+./rz build iris
 
-# Run tests
-./run_all_tests.sh
+# Run tests (3 files, 30 assertions)
+./rz test iris
 ```
 
 ## Usage
@@ -79,7 +78,15 @@ struct Layer
 
 ## Status
 
-**Alpha** - Architecture, render tree design, and layer model are specified. Basic render tree construction and block layout are being implemented. Full CSS layout (flex, grid), layer compositing, and Prism IPC integration are planned for subsequent phases.
+**Alpha, with a passing suite.** Measured 2026-09-12: `./rz build iris` exits 0
+producing `build/debug/iris`, and `./rz test iris` exits 0 with
+`30 passed, 0 failed` across 3 test files (`test_layout_box`, `test_render_tree`,
+`test_style_types`).
+
+Render tree construction and block layout are implemented. Full CSS layout
+(flex, grid), layer compositing and Prism IPC integration are still planned.
+Note that iris's upstream, [lexis](../lexis), does not currently compile
+(AGAST #1289), so the parse → layout path cannot be exercised end to end.
 
 ## License
 

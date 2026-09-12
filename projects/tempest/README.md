@@ -14,6 +14,8 @@ Tempest demonstrates the Ritz ecosystem end-to-end: from raw TCP bytes arriving 
 
 ## Features
 
+> **Planned/partial.** The list below describes the design. See [Status](#status) — tempest does not currently compile (AGAST #1302).
+
 - Multi-process architecture (browser process + per-tab processes)
 - HTML5 parsing via Lexis with streaming incremental rendering
 - CSS cascade and computed styles via Lexis
@@ -28,23 +30,35 @@ Tempest demonstrates the Ritz ecosystem end-to-end: from raw TCP bytes arriving 
 ## Installation
 
 ```bash
-# Build from source (requires all ecosystem dependencies)
-export RITZ_PATH=/path/to/ritz
-./ritz build .
-
-# Launch browser
-./build/debug/tempest
+# Build from source (run from the monorepo root; `rz` sets RITZ_PATH itself)
+./rz build tempest
 ```
+
+**This build currently fails (exit 1).** Both declared binaries (`tempest` and
+`tempest-tab`) fail to compile. Two distinct errors remain:
+
+- `lib/tab_renderer.ritz:48` — `cannot store IpcChannel to IpcChannel**`
+  (an indirection-depth bug in the llvmlite emitter)
+- `No method 'as_strview' found for type 'String'`
+
+Tracked as **AGAST #1302** (with the no-file-no-line reporting half as #1384),
+and listed in the workspace manifest's `[ci.known_failing.build]`, so `rz build
+--all` reports it as an advisory failure rather than gating.
+
+Consequently there is no `tempest` binary — `projects/tempest/build/debug/` is
+empty. The `./build/debug/tempest …` invocations this README used to document
+cannot work until #1302 is fixed.
 
 ## Usage
 
-```bash
-# Open a URL
-./build/debug/tempest https://example.com
+The intended CLI, once the build is fixed (see Installation — AGAST #1302), is:
 
-# With debugging
-./build/debug/tempest --debug-layout https://example.com
 ```
+tempest https://example.com                    # open a URL
+tempest --debug-layout https://example.com     # with layout debugging
+```
+
+Neither can be run today: there is no `tempest` binary.
 
 ```ritz
 # Browser process entry point
@@ -108,7 +122,22 @@ Prism (display server)
 
 ## Status
 
-**Alpha** - Browser and tab process scaffolding, multi-process architecture, and basic navigation are in place. Full HTML5, CSS, and JavaScript support depends on the maturity of Lexis, Sage, and Iris respectively. End-to-end HTTPS browsing requires cryptosec TLS completion.
+**Does not compile.** This is the honest headline; the README previously said
+"Alpha — … in place", which reads as though it builds.
+
+`./rz build tempest` exits 1; both `tempest` and `tempest-tab` fail. Tracked as
+**AGAST #1302**. Two remaining error classes:
+
+- `cannot store IpcChannel to IpcChannel**` at `lib/tab_renderer.ritz:48` — an
+  indirection-depth bug in the llvmlite emitter, reported with no file or line
+  of its own (**#1384**)
+- `No method 'as_strview' found for type 'String'`
+
+Browser and tab process scaffolding, the multi-process architecture and basic
+navigation exist in source. Beyond the compile failure, tempest's dependencies
+block it anyway: [lexis](../lexis) does not compile either (#1289), and
+[sage](../sage) builds but ignores its arguments. End-to-end HTTPS browsing also
+needs cryptosec TLS proven end to end, which has not been measured.
 
 ## License
 

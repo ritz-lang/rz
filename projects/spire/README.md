@@ -31,9 +31,13 @@ The primary reference implementation built on Spire is Nexus, the Ritz knowledge
 # [dependencies]
 # spire = { path = "../spire" }
 
-# Build from source
-export RITZ_PATH=/path/to/ritz
-./ritz build .
+# Build from source (run from the monorepo root; `rz` sets RITZ_PATH itself).
+# spire is a library with `test_only = true` in its ritz.toml, so this reports
+# "nothing to build" — that is the correct, successful outcome.
+./rz build spire
+
+# Run its tests
+./rz test spire
 ```
 
 ## Usage
@@ -75,8 +79,8 @@ impl TaskPresenter
 ```
 
 ```ritz
-# tests/task_service_test.ritz - Unit tests with mocks
-@test
+# test/task_service_test.ritz - Unit tests with mocks
+[[test]]
 fn test_title_too_short() -> i32
     let repo = MockTaskRepository.new()
     let service = TaskService { repo: repo }
@@ -95,7 +99,33 @@ fn test_title_too_short() -> i32
 
 ## Status
 
-**Alpha** - Architecture and patterns are designed. Core routing, request/response handling, and repository traits are being implemented with TDD. Full Mausoleum and Tome integration is planned once those libraries stabilize.
+**Alpha. The test suite does not currently compile.**
+
+`lib/` holds only 2 modules, yet the project carries **796** `[[test]]` markers
+across 12 test files — the tests are where most of spire currently lives. But
+`./rz test spire` **exits 1**: 10 of those 12 files fail to compile (measured
+2026-09-12, `Σ 13 passed, 0 failed, 10 compile-failed`). Three distinct causes:
+
+- **Missing modules** (7 files) — `Cannot find module: spire.http.method`,
+  `spire.http.status`, `spire.app`. The tests import a module layout that `lib/`
+  does not provide.
+- **Signature drift** — `headers_get` called with 2 arguments but defined with 3
+  (`test_http_headers.ritz`).
+- **Missing functions** — `Unknown function: clock_gettime`
+  (`test_model_timestamp.ritz`), `Unknown function: uuid_to_str`
+  (`test_model_uuid.ritz`).
+
+These are real failures, not environment problems, and they are not excused
+anywhere in `rz.toml` — note that `rz.toml` deliberately has no
+`[ci.known_failing.test]` section, so this should be gating.
+
+`ritz.toml` sets `test_only = true` with no `[[bin]]`, so `./rz build spire`
+correctly reports "nothing to build" and exits 0 — on all three compilers. Do
+not read spire's green row in [docs/STACK_MATRIX.md](../../docs/STACK_MATRIX.md)
+as evidence that the self-hosted compiler can handle it; there is nothing for it
+to compile.
+
+Full Mausoleum and Tome integration is still pending.
 
 ## License
 

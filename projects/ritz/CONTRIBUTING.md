@@ -248,14 +248,21 @@ For new examples, add valgrind verification:
 #!/bin/bash
 set -e
 
-# Build
-../../ritz build .
+# Do NOT build here. The regression harness builds the example before
+# invoking test.sh, and the binary is already sitting in the example
+# directory. Every real test.sh under examples/ just runs it.
 
 # Run with valgrind
 valgrind --error-exitcode=1 --leak-check=full -q ./myprogram "$@"
 
 # Verify output
 ./myprogram | diff - expected_output.txt
+```
+
+To build an example by hand while iterating, from `projects/ritz`:
+
+```bash
+RITZ_PATH=$PWD python3 build.py build examples/tier3_coreutils/21_ls
 ```
 
 ### CI Expectations

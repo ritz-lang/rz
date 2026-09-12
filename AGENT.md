@@ -39,7 +39,9 @@ When you encounter a limitation:
 > "Warnings are the ghosts of future production outages."
 
 - Fix anomalies when discovered, not later
-- Track issues properly in GitHub Issues
+- Track issues properly in AGAST — `rz.toml` requires every
+  `[ci.known_failing.build]` entry to cite an AGAST task number (`#NNNN`), and
+  that citation is validated at load time
 - Test flakiness must be investigated immediately
 - Compiler warnings are bugs to be fixed
 
@@ -59,15 +61,20 @@ The `rz` monorepo contains all ecosystem projects:
 
 ```
 rz/                              # Monorepo root
-├── rz.toml                      # Workspace manifest
+├── rz                           # Workspace CLI (Python) — build/test/run/list/clean
+├── rz.toml                      # Workspace manifest + known-failing list
 ├── AGENT.md                     # This file
+├── docs/STACK_MATRIX.md         # Compiler bootstrap layering
 ├── .github/workflows/           # CI configuration
 └── projects/                    # All ecosystem projects
     ├── ritz/                    # Core compiler + ritzlib
     │   ├── ritz0/               # Bootstrap compiler (Python)
     │   ├── ritz1/               # Self-hosted compiler
-    │   └── ritzlib/             # Standard library
+    │   ├── ritzlib/             # Standard library
+    │   ├── build.py             # Package build system (rz delegates to this)
+    │   └── Makefile             # unit / matrix-full / ci-local / valgrind
     ├── ritzunit/                # Test framework
+    ├── rzrz/                    # rz rewritten in Ritz
     ├── squeeze/                 # Compression
     ├── cryptosec/               # Cryptography
     ├── valet/                   # HTTP server
@@ -76,25 +83,39 @@ rz/                              # Monorepo root
     ├── tome/                    # In-memory cache
     ├── spire/                   # Web framework
     ├── harland/                 # Microkernel
-    ├── larb/                    # Standards & docs
+    ├── larb/                    # Standards & docs (no ritz.toml, nothing to build)
+    ├── ritzlib -> ritz/ritzlib  # symlink, not a separate project
     └── ...                      # Other projects
 ```
 
+`./rz list` is the authoritative project list (26 projects). `larb` and the
+`ritzlib` symlink are deliberately excluded from it.
+
+Each project keeps **library code in `lib/`** and **binary entry points in
+`src/`**. A few projects are `test_only = true` in their `ritz.toml`
+(`http`, `spire`, `squeeze`, `spectree`) and build no binary at all — `rz build`
+correctly reports "nothing to build" and exits 0 for those.
+
 ### RITZ_PATH
 
-Set `RITZ_PATH` to the projects directory:
+**Using `./rz`, you do not need to set this.** The workspace CLI sets
+`RITZ_PATH` itself; exporting it is a no-op. Set it only when invoking
+`projects/ritz/build.py` directly, in which case the value is the compiler
+project, not the projects directory:
 
 ```bash
-export RITZ_PATH=~/dev/rz/projects
+export RITZ_PATH=$PWD/projects/ritz       # only for direct build.py use
 ```
 
-This allows any project to import from any other:
+Module resolution lets any project import from any other. Note that libraries in
+this repo keep their modules in `lib/`, not `src/` — `src/` holds binary entry
+points:
 
 ```ritz
 import ritzlib.sys           # From projects/ritz/ritzlib/
-import squeeze.gzip          # From projects/squeeze/src/
-import cryptosec.sha256      # From projects/cryptosec/src/
-import valet.http            # From projects/valet/src/
+import lib.gzip              # From projects/squeeze/lib/
+import lib.sha256            # From projects/cryptosec/lib/
+import lib.router            # From projects/valet/lib/
 ```
 
 ---
@@ -135,12 +156,12 @@ hotfix/critical-parser-null         # Urgent fix
 git checkout -b squeeze/gzip-streaming main
 
 # 2. Work on your changes (can touch multiple projects)
-vim projects/squeeze/src/gzip.ritz
-vim projects/valet/src/compress.ritz
+vim projects/squeeze/lib/gzip.ritz
+vim projects/valet/lib/compress.ritz
 
-# 3. Build and test affected projects
-make -C projects/squeeze test
-make -C projects/valet test
+# 3. Build and test affected projects (from the workspace root)
+./rz test squeeze
+./rz test valet
 
 # 4. Commit (can include multiple projects in one commit)
 git add projects/squeeze projects/valet
@@ -165,9 +186,8 @@ Each agent works in an isolated git worktree. Agents join a "room" (workspace) a
 # Create a worktree for a room (e.g., "squeeze" room works on squeeze)
 git worktree add ~/dev/rz-worktrees/squeeze -b squeeze/current-work main
 
-# Work in isolation
+# Work in isolation (no RITZ_PATH export needed — ./rz sets it)
 cd ~/dev/rz-worktrees/squeeze
-export RITZ_PATH=$PWD/projects
 
 # Your changes don't affect other rooms
 # Other rooms' changes don't affect you
@@ -194,9 +214,9 @@ The monorepo makes cross-project changes trivial:
 
 ```bash
 # Fix a bug in ritzlib that affects squeeze and valet
-vim projects/ritz/ritzlib/vec.ritz      # Fix the bug
-vim projects/squeeze/src/deflate.ritz   # Update usage
-vim projects/valet/src/handler.ritz     # Update usage
+vim projects/ritz/ritzlib/gvec.ritz     # Fix the bug (the vector module is gvec)
+vim projects/squeeze/lib/deflate.ritz   # Update usage
+vim projects/valet/lib/valet.ritz       # Update usage
 
 # One commit captures the entire change
 git add projects/ritz projects/squeeze projects/valet
@@ -210,8 +230,8 @@ git commit -m "ritzlib,squeeze,valet: Fix vec_push edge case
 ### Finding Affected Projects
 
 ```bash
-# What depends on ritzlib?
-grep -r "import ritzlib" projects/*/src/ | cut -d: -f1 | xargs dirname | sort -u
+# What depends on ritzlib? (search lib/ and src/ — libraries live in lib/)
+grep -rl "import ritzlib" projects/*/lib/ projects/*/src/ | xargs -n1 dirname | sort -u
 
 # What files changed since main?
 git diff --name-only main | grep "^projects/"
@@ -333,8 +353,19 @@ fn test_addition() -> i32
 ### Before Committing
 
 ```bash
-make -C projects/<project> test     # Tests pass
-make -C projects/<project> valgrind # No memory leaks (if applicable)
+./rz test <project>                 # Tests pass
+```
+
+**Do not use `make -C projects/<project> test`.** Only 6 of the 28 directories
+under `projects/` have a Makefile, and in the other 22 `make` matches the `test/`
+*directory* as an already-up-to-date target: it prints
+`make: Nothing to be done for 'test'.` and **exits 0 without running anything**.
+That is a false success — it looks like a green suite and is not one.
+
+Likewise `make -C projects/<project> valgrind` exists only in `projects/ritz`:
+
+```bash
+make -C projects/ritz valgrind      # the only project with this target
 ```
 
 ### Commit Message Format
@@ -381,6 +412,13 @@ ritzlib,squeeze,valet: 🤖 <description>
 | Style Guide | `projects/ritz/docs/STYLE.md` |
 | Ecosystem Overview | `projects/ritz/docs/ECOSYSTEM.md` |
 | ritzlib Reference | `projects/ritz/docs/STDLIB_REFERENCE.md` |
+| Compiler bootstrap layering | `docs/STACK_MATRIX.md` |
+| Per-project status | `projects/<name>/README.md` |
+
+All paths above verified to exist on 2026-09-12. Note the canonical copies of the
+spec, style guide, stdlib reference and ecosystem overview moved from
+`projects/larb/docs/` to `projects/ritz/docs/` on 2026-09-03 (AGAST #1311) — the
+`projects/larb/docs/` copies still exist but are historical.
 
 ---
 

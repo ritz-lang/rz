@@ -30,15 +30,17 @@ Tome provides rich data structures beyond simple key-value pairs: lists, sets, s
 # [dependencies]
 # tome = { path = "../tome" }
 
-# Build all binaries
-export RITZ_PATH=/path/to/ritz
-./ritz build .
+# Build all binaries (run from the monorepo root; `rz` sets RITZ_PATH itself)
+./rz build tome
 
 # Start the standalone server
-./build/debug/tome-server --port 6379
+./projects/tome/build/debug/tome-server --port 6379
+
+# On WSL, or anywhere io_uring is unavailable, add -b for blocking I/O
+./projects/tome/build/debug/tome-server --port 6379 -b
 
 # Interactive CLI
-./build/debug/tome-cli
+./projects/tome/build/debug/tome-cli
 ```
 
 ## Usage
@@ -84,7 +86,23 @@ Tome has no required dependencies beyond `ritzlib`. Optional integrations:
 
 ## Status
 
-**Alpha** - API design and data structure internals are being defined. Basic string and list operations are being implemented with the embedded server mode. Persistence, pub/sub, and Zeus integration are planned for subsequent phases.
+**Active development**, further along than "Alpha — API design being defined",
+which is what this README said while the server was already running.
+
+Measured 2026-09-12: `./rz build tome` exits 0, producing `tome-server`,
+`tome-cli` and `run-tests`. `tome-server --port 6379` starts and serves; `-b`
+selects blocking I/O for environments without io_uring (WSL); `tome-cli --help`
+works. `lib/` holds 8 modules.
+
+`./rz test tome` **exits 1**: `Σ 0 passed, 0 failed, 1 compile-failed` out of 5
+files — `test_server_auth.ritz` fails with `exited with code 2`, and nothing
+else reports. A real failure, not excused anywhere.
+
+Not yet proven: it does **not** build with the self-hosted compiler.
+`./rz clean tome && ./rz build tome --compiler ritz1` fails at exit 1 with
+`ritz1 cannot emit: unknown identifier 'handle_connection'` — a ritz1 gap around
+taking a function's address by bare identifier, not a tome bug. See
+[docs/STACK_MATRIX.md](../../docs/STACK_MATRIX.md).
 
 ## License
 

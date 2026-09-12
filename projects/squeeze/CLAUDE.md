@@ -40,35 +40,40 @@ squeeze/
 │   ├── test_squeeze.ritz
 │   ├── test_zlib.ritz
 │   └── test_zlib_stream.ritz
-├── ritz.toml               # Build configuration
-├── run_tests.sh            # Build and run tests with ritzunit
-├── TODO.md                 # Development roadmap
-├── DONE.md                 # Completed work
+├── tools/                  # Helper scripts
+├── ritz.toml               # Build configuration (test_only = true)
 ├── README.md               # Public documentation
+├── RERITZ_MIGRATION.md     # Migration notes
+├── REVIEW.md               # Review notes
 └── CLAUDE.md               # This file
 ```
 
+There is no `build/` directory and no `run_tests.sh`; earlier revisions of this
+file documented both. squeeze is `test_only = true` with no `[[bin]]`, so
+`./rz build squeeze` correctly reports "nothing to build".
+
 ## Building and Testing
 
-Tests run using **ritzunit**, the standard Ritz test framework:
+Run from the **monorepo root**. `rz` sets `RITZ_PATH` itself.
 
 ```bash
-# Run all tests
-./run_tests.sh
-
-# Filter by test name (substring match)
-./run_tests.sh --filter crc32
-./run_tests.sh --filter inflate
-
-# Verbose output (shows each test as it runs)
-./run_tests.sh --verbose
-
-# List tests without running
-./run_tests.sh --list
-
-# Set timeout (default 5000ms)
-./run_tests.sh --timeout 10000
+# Run all tests — 15 .ritz test files, 199 [[test]] functions.
+# Takes several minutes; budget for it.
+./rz test squeeze
 ```
+
+`rz test` has no `--filter`, `--verbose`, `--list` or `--timeout` options:
+
+```
+usage: rz test [-h] [--all] [--compiler {ritz0,ritz1,ritz1_selfhosted}] [project]
+```
+
+Those flags belong to the **ritzunit** binary, which is what consumes a compiled
+test executable. squeeze's tests are compiled and run by `build.py` rather than
+handed to `ritzunit`, so there is currently no supported way to filter a subset
+of squeeze's tests from the command line. If you need one, the honest options
+are to add filtering to `rz test` or to wire squeeze's tests through the
+`ritzunit` binary — not to re-add a shell script that drifts.
 
 ### Test Discovery
 
@@ -291,38 +296,69 @@ let final = gzip_writer_finish(@writer, @out[0], 65536)
 
 ### Preserve Build Artifacts
 
+`build.py` has a `-g/--debug` flag documented as "Keep intermediate files
+(.ll, .o) in build/ for debugging". There is no `ritz/ritz` script — the form
+`python3 ritz/ritz build -g lib/crc32` documented here previously exits 2.
+
+**`-g` does not currently produce artifacts for squeeze.** Both of these exit 0
+and print `📁 Debug artifacts kept in build/`, yet
+`projects/squeeze/build/` is never created and no `.ll` or `.o` file appears
+anywhere (verified 2026-09-12):
+
 ```bash
-# Build with debug info
-python3 ritz/ritz build -g lib/crc32
-# Creates build/*.ll files for inspection
+cd projects/ritz
+export RITZ_PATH=$PWD           # only needed for direct build.py use
+python3 build.py build -g ../squeeze   # exit 0 — "test-only, nothing to build"
+python3 build.py test  -g ../squeeze   # exit 0 — message printed, no files kept
+```
+
+So the message is a lie and `-g` is not a usable route to inspectable IR for a
+`test_only` package yet. If you need the IR, compile a module directly with
+`ritz0.py`:
+
+```bash
+cd projects/ritz
+RITZ_PATH=$PWD python3 ritz0/ritz0.py ../squeeze/lib/crc32.ritz -o /tmp/crc32.ll
+# exit 0: "Compiled ../squeeze/lib/crc32.ritz -> /tmp/crc32.ll" (15 KB of IR)
 ```
 
 ### Compare with Reference
 
 ```bash
-# Create test file
-echo -n "123456789" > test.txt
-
-# Get reference CRC32 from gzip
+cd /tmp
+printf '123456789' > test.txt
 gzip -c test.txt > test.txt.gz
-hexdump -C test.txt.gz | tail -1  # CRC32 in trailer
-
-# Compare with squeeze output
-./build/test_crc32
+xxd test.txt.gz | tail -1       # CRC32 sits in the gzip trailer
 ```
+
+Then check squeeze's own value against it. The expected constant is already
+asserted in `test/test_crc32.ritz`:
+`crc32("123456789") == 0xCBF43926`. Run `./rz test squeeze` from the monorepo
+root to evaluate it.
 
 ### GDB Debugging
 
-```bash
-gdb ./build/test_crc32
-(gdb) break crc32_update
-(gdb) run
-(gdb) print/x state
-```
+There are **no standalone per-module test binaries** — no `build/test_crc32`
+exists, and neither `./build/test_crc32` nor `gdb ./build/test_crc32` can work
+(both exit 127). `rz test` compiles each `test/test_*.ritz` into a temporary
+executable, runs it, and discards it.
+
+`-g` is no help here either (see above — it keeps nothing). To get a debuggable
+binary today you have to drive the pipeline by hand: emit IR with `ritz0.py` for
+the module under test plus a small `main()` that calls it, `clang -c -g` each
+`.ll`, then link with `-nostdlib -no-pie` against the runtime object in
+`projects/ritz/runtime/`, and run `gdb` on the result.
+
+If per-module test binaries are wanted as a first-class feature, that is a
+`build.py` change — and fixing `-g` to actually keep its artifacts is the
+prerequisite. Do not document either as if it already works.
 
 ## Phase Progression
 
-See `TODO.md` for detailed tasks. Completed phases:
+All six planned phases are complete — squeeze's public README described phases 3
+and 4 as "in progress" long after this list said otherwise; the README has been
+corrected to match. (`TODO.md`, referenced here previously, no longer exists;
+work tracking is in AGAST.)
 
 1. **Foundations** - CRC32, Adler32, BitReader/Writer ✅
 2. **Huffman** - Decoding tables, encoding tables, code generation ✅
@@ -333,20 +369,20 @@ See `TODO.md` for detailed tasks. Completed phases:
 
 ## Related Projects
 
-- **ritz/** - Ritz compiler (monorepo: `projects/ritz`)
-- **ritzunit/** - Test framework (monorepo: `projects/ritz/ritzunit`)
-- **valet** - HTTP server that uses squeeze (monorepo: `projects/valet`)
-- **cryptosec** - Cryptographic library (similar structure, good reference)
-- **ritzlib** - Standard library modules (monorepo: `projects/ritz/ritzlib`)
+- **ritz** — Ritz compiler (`projects/ritz`)
+- **ritzunit** — Test framework (`projects/ritzunit`, **not**
+  `projects/ritz/ritzunit`, which does not exist)
+- **valet** — HTTP server that uses squeeze (`projects/valet`)
+- **cryptosec** — Cryptographic library (`projects/cryptosec`; similar structure,
+  good reference)
+- **ritzlib** — Standard library modules (`projects/ritz/ritzlib`; also reachable
+  as `projects/ritzlib`, which is a symlink)
 
 ## Notes
 
-- Binaries go in `build/`, not `/tmp` (noexec mount)
 - All code should be valgrind-clean
-- Clear `.ritz-cache` if you see stale constant values
+- The dependency cache lives at `projects/ritz/.ritz-cache/` (and a sibling per
+  compiler). Clear it if you see stale constant values; `./rz clean squeeze` is
+  the supported way.
 - Use `"string"` for StrView literals (not `c"string"`)
 - Use `[[test]]` attribute syntax (not `@test`)
-
----
-
-*Last updated: 2026-02-16*

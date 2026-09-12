@@ -24,29 +24,44 @@ The server is written entirely in Ritz itself, making it a useful showcase of ri
 
 ## Installation
 
+ritz-lsp lives in the `rz` monorepo; there is no separate `ritz-lsp` repository
+and there are no submodules.
+
 ```bash
-# Quick install (installs vim syntax, builds binary, configures coc.nvim)
-git clone --recursive https://github.com/ritz-lang/ritz-lsp.git
-cd ritz-lsp
-./install.sh
+git clone git@github.com:ritz-lang/rz.git
+cd rz
 
-# Install only vim syntax highlighting
-./install.sh --vim
+# Build the server (run from the monorepo root; `rz` sets RITZ_PATH itself)
+./rz build ritz-lsp
+# Produces projects/ritz-lsp/build/debug/ritz-lsp
 
-# Build only
-./install.sh --build
-
-# Configure coc.nvim only
-./install.sh --coc
+# Install Vim syntax highlighting into ~/.vim/
+./projects/ritz-lsp/install.sh --vim
 ```
+
+### `install.sh` is half-broken — use `./rz build` instead
+
+`install.sh --vim` works (exit 0). The build paths do not:
+
+| Command | Result |
+|---|---|
+| `./install.sh --vim` | ✅ exit 0, installs syntax files to `~/.vim/` |
+| `./install.sh --build` | ❌ exit 1 — `cd: ritz/runtime: No such file or directory` |
+| `./install.sh` (no args) | ❌ exit 1 — same failure, after doing the `--vim` step |
+
+Cause: `install.sh:169-178` runs `git submodule update --init --recursive` and
+then `cd ritz/runtime`, expecting a `ritz` submodule inside this directory. That
+layout predates the February 2026 consolidation into the monorepo; the repo has
+no `.gitmodules`, so the submodule command is a silent no-op and the `cd` fails.
+`./rz build ritz-lsp` is the supported build.
 
 ## Usage
 
 ```bash
-# The LSP server communicates over stdio - editors launch it automatically
-# Manual test:
+# The LSP server communicates over stdio - editors launch it automatically.
+# Manual smoke test (exit 0, replies with its capabilities):
 printf 'Content-Length: 58\r\n\r\n{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
-    | ./build/debug/ritz-lsp
+    | ./projects/ritz-lsp/build/debug/ritz-lsp
 ```
 
 ### Vim with coc.nvim
@@ -87,18 +102,25 @@ ritz-lsp depends only on `ritzlib` (which ships with the Ritz compiler). No exte
 
 ## Status
 
-**MVP complete** - JSON-RPC transport, initialize/shutdown, document synchronization, and Vim syntax highlighting all work. Diagnostics integration (connecting to the ritz compiler for error reporting) is in active development. Hover, go-to-definition, and completions are planned.
+**MVP complete.** Measured 2026-09-12: `./rz build ritz-lsp` exits 0, and the
+binary answers an `initialize` request over stdio at exit 0.
 
 | Feature | Status |
 |---------|--------|
 | JSON-RPC transport | Working |
 | Initialize/shutdown | Working |
 | Document sync | Working |
-| Vim syntax highlighting | Working |
+| Vim syntax highlighting | Working (`install.sh --vim`) |
+| `install.sh --build` | **Broken** — expects a pre-consolidation `ritz` submodule; use `./rz build ritz-lsp` |
 | Diagnostics | In progress |
-| Hover | Planned |
-| Go to definition | Planned |
-| Completions | Planned |
+| Hover | Advertised in capabilities, not implemented |
+| Go to definition | Advertised in capabilities, not implemented |
+| Completions | Planned, not advertised |
+
+The hover/definition rows need care: the server's `initialize` reply claims
+`"hoverProvider":true,"definitionProvider":true`, so editors will offer both and
+then get nothing useful back. Either implement them or stop advertising them —
+advertising an unimplemented capability is worse than omitting it.
 
 ## License
 

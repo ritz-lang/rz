@@ -60,9 +60,10 @@ The installer:
 ### Manual
 
 ```bash
-git submodule update --init --recursive
-./ritz/ritz build .
-# Binary at: build/debug/ritz-lsp
+# From the monorepo root. There are no submodules — the projects were
+# consolidated into one repo, so `git submodule update` is a no-op fossil.
+./rz build ritz-lsp
+# Binary at: projects/ritz-lsp/build/debug/ritz-lsp
 ```
 
 ---

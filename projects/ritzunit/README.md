@@ -6,7 +6,7 @@ A modern unit testing framework for the Ritz programming language with ELF-based
 
 ## Overview
 
-Ritzunit is the standard testing framework for Ritz projects. It discovers tests automatically at runtime by parsing the ELF symbol table of the compiled test binary - no test registration required. Tests marked with the `@test` attribute are found and run without any boilerplate.
+Ritzunit is the standard testing framework for Ritz projects. It discovers tests automatically at runtime by parsing the ELF symbol table of the compiled test binary - no test registration required. Tests marked with the `[[test]]` attribute are found and run without any boilerplate.
 
 Each test runs in a forked process for complete isolation: a crashing test cannot affect other tests or the runner. Ritzunit supports rich filtering with glob patterns and boolean expressions, and outputs results in human-readable, JSON, or JUnit XML formats for CI/CD integration.
 
@@ -28,9 +28,12 @@ The framework handles ASLR and PIE (position-independent executables) correctly 
 ## Installation
 
 ```bash
-# Build from source (requires ritz compiler)
-export RITZ_PATH=/path/to/ritz
-./ritz build .
+# Build from source (run from the monorepo root; `rz` sets RITZ_PATH itself)
+./rz build ritzunit
+# Produces projects/ritzunit/build/debug/ritzunit
+
+# Run ritzunit's own tests (6 files, 27 assertions)
+./rz test ritzunit
 
 # The library is available as a dependency in ritz.toml:
 # [dependencies]
@@ -39,16 +42,19 @@ export RITZ_PATH=/path/to/ritz
 
 ## Usage
 
+Mark tests with `[[test]]`. (`@test` was the old syntax and is no longer
+correct — see `projects/ritz/docs/STYLE.md`.)
+
 ```ritz
 import ritzlib.sys
 
-@test
+[[test]]
 fn test_addition() -> i32
     if 2 + 2 != 4
         return 1  # FAIL
     return 0      # PASS
 
-@test
+[[test]]
 fn test_string_length() -> i32
     let s: *u8 = "hello"
     if strlen(s) != 5
@@ -56,44 +62,57 @@ fn test_string_length() -> i32
     return 0
 ```
 
+### Running tests
+
+Most projects in this workspace run their tests through the workspace CLI, which
+compiles and executes each `test/test_*.ritz` for you:
+
 ```bash
-# Run all tests
-./build/debug/myproject-tests
-
-# Verbose output
-./build/debug/myproject-tests -v
-
-# Filter by glob pattern
-./build/debug/myproject-tests -f "test_add*"
-
-# Boolean filter expressions
-./build/debug/myproject-tests -f "add and not slow"
-
-# JSON output
-./build/debug/myproject-tests --json
-
-# JUnit XML for CI
-./build/debug/myproject-tests --junit
+./rz test <project>
 ```
 
-## CLI Reference
+The `ritzunit` binary is the alternative path: it takes a *compiled test
+executable* and discovers `[[test]]` functions in its ELF symbol table. Substitute
+your own test binary for `<TESTS>` below — there is no `myproject-tests` in this
+repo; it is a placeholder:
+
+```bash
+TESTS=path/to/your-tests
+
+$TESTS                       # Run all tests
+$TESTS -v                    # Verbose output
+$TESTS -l                    # List tests without running
+$TESTS -f "test_add*"        # Filter by glob pattern
+$TESTS -f "add and not slow" # Boolean filter expressions
+$TESTS --json                # JSON output
+$TESTS --junit               # JUnit XML for CI
+```
+
+### CLI Reference
+
+From `./projects/ritzunit/build/debug/ritzunit --help` (exit 0, verified
+2026-09-12):
 
 ```
 Usage: ritzunit [OPTIONS]
 
+Unit test framework for Ritz
+
 Options:
   -v, --verbose        Show detailed output
-  -q, --quiet          Minimal output (failures + summary only)
+  -q, --quiet          Minimal output - only failures and summary
   -l, --list           List tests without running them
   -h, --help           Show this help message
-  -f, --filter=EXPR    Filter tests by expression
+  -f, --filter=EXPR    Filter tests by EXPR (glob, @attr, bool)
   -t, --timeout=MS     Timeout per test in milliseconds (default: 5000)
+      --no-fork        Disable fork isolation (run tests in main process)
   -x, --fail-fast      Stop on first test failure
   -s, --shuffle        Randomize test execution order
       --seed=N         Random seed for shuffling (0 = auto)
   -j, --json           Output results in JSON format
       --junit          Output results in JUnit XML format
-      --no-fork        Disable fork isolation (for debugging)
+      --color          Force colored output (even when not a TTY)
+      --no-color       Disable colored output
 ```
 
 ## Dependencies

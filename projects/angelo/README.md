@@ -30,10 +30,9 @@ The glyph cache uses LRU eviction and is keyed by font ID, glyph ID, pixel size,
 # [dependencies]
 # angelo = { path = "../angelo" }
 
-# Build and test
-export RITZ_PATH=/path/to/ritz
-./ritz build .
-./build/debug/angelo-test
+# Build and test (run from the monorepo root; `rz` sets RITZ_PATH itself)
+./rz build angelo
+./projects/angelo/build/debug/angelo-test
 ```
 
 ## Usage
@@ -73,7 +72,26 @@ Angelo has no required runtime dependencies beyond `ritzlib`. It operates entire
 
 ## Status
 
-**Alpha** - Font file parser architecture, type definitions, cache design, and the test binary are in place. TTF/OTF table parsing, shaper, and rasterizer are being implemented. The test binary exercises font loading and basic glyph rendering.
+**Alpha. The test suite is not wired up.** Measured 2026-09-12:
+`./rz build angelo` exits 0, producing `build/debug/angelo-test` and
+`build/debug/simple-test`; running `angelo-test` exits 0.
+
+But `./rz test angelo` reports `⚠ No tests found, skipping` and **exits 0** —
+a false green. The project has **106** `[[test]]` markers, all of them inside
+`src/` (including `src/tests.ritz`), and `ritz.toml` declares `sources = ["src"]`
+with no `[test]` section. The `tests/` directory here contains only `fixtures/`.
+`rz test` looks for a `test/` directory (singular) or a `[test]` section, finds
+neither, and passes vacuously. Until that is fixed, the only way to exercise
+angelo is to run the `angelo-test` binary:
+
+```bash
+./rz build angelo && ./projects/angelo/build/debug/angelo-test   # exit 0
+```
+
+Font file parser architecture, type definitions and cache design are in place.
+TTF/OTF table parsing, the shaper and the rasterizer are still being
+implemented. For a standalone rasterisation smoke test that writes a PGM image,
+see [angelo-simple](../angelo-simple).
 
 ## License
 

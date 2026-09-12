@@ -1,80 +1,97 @@
 # LARB - Language and Architecture Review Board
 
-LARB is the overarching design direction and implementation planning repository for the **Ritz programming language ecosystem**. This repository serves as:
+LARB holds the design direction and implementation-planning documents for the
+**Ritz programming language ecosystem**:
 
-1. **Language Specification** - Authoritative documentation of Ritz syntax, semantics, and behavior
-2. **Architecture Review** - Design decisions, RFCs, and architectural guidance
-3. **Ecosystem Coordination** - Version standards across Ritz projects via git submodules
-4. **Agent Context** - Minimal, efficient references for AI agents to work productively
+1. **Language Specification** — syntax, semantics, and behavior
+2. **Architecture Review** — design decisions, RFCs, and architectural guidance
+3. **Agent Context** — minimal, efficient references for AI agents
+
+## This is a documentation directory, not a project
+
+`projects/larb/` contains **only** Markdown, a couple of Python tools, and
+archived session logs. There is no `ritz.toml`, nothing to compile, and nothing
+to test — `./rz list` deliberately excludes it (it reports 26 buildable
+projects; larb is not one of them).
+
+It is also **not a separate repository**. larb was consolidated into the `rz`
+monorepo in February 2026. Specifically:
+
+- There is no `github.com/ritz-lang/larb`. The remote is
+  `git@github.com:ritz-lang/rz.git`.
+- There are no git submodules. The repository has no `.gitmodules`, so
+  `git submodule update --init --recursive` is a silent no-op.
+- There is no `projects/larb/projects/` directory and no `projects/larb/specs/`
+  directory. Earlier revisions of this README described both.
+
+To get these docs, clone the monorepo:
+
+```bash
+git clone git@github.com:ritz-lang/rz.git
+cd rz/projects/larb
+```
 
 ## Quick Links
 
-- [Language Quick Reference](docs/QUICK_REFERENCE.md) - Minimal context for productive agents
-- [Language Specification](docs/LANGUAGE_SPEC.md) - Complete language documentation
-- [Ecosystem Overview](docs/ECOSYSTEM.md) - All Ritz projects explained
-- [Open Issues & Roadmap](docs/ROADMAP.md) - What needs to be done next
-- [LSP Server Requirements](docs/LSP_REQUIREMENTS.md) - Language server protocol spec
+- [Language Quick Reference](docs/QUICK_REFERENCE.md) — minimal context for productive agents
+- [Design Decisions](docs/DESIGN_DECISIONS.md) — why the language is the way it is
+- [Ecosystem Overview](docs/ECOSYSTEM.md) — all Ritz projects explained
+- [Open Issues & Roadmap](docs/ROADMAP.md)
+- [LSP Server Requirements](docs/LSP_REQUIREMENTS.md)
+- [ritz.toml Specification](docs/RITZ_TOML_SPEC.md)
+- [PR Checklist](docs/PR_CHECKLIST.md)
+
+Note that the **canonical** language spec, style guide, stdlib reference and
+ecosystem overview moved to `projects/ritz/docs/` on 2026-09-03 (AGAST #1311),
+because those are the copies `make -C projects/ritz check-doc-examples`
+compiles on every build. The copies here are historical; prefer
+`projects/ritz/docs/` when they disagree.
 
 ## Ritz Ecosystem Projects
 
-| Project | Description | Status |
-|---------|-------------|--------|
-| [ritz](projects/ritz) | Core compiler (ritz0 Python, ritz1 Ritz) | Active - 324 tests |
-| [ritzunit](projects/ritzunit) | Unit testing framework | Active - ELF self-discovery |
-| [squeeze](projects/squeeze) | Compression library (gzip/deflate) | Active - 132 tests |
-| [valet](projects/valet) | HTTP/1.1 server (1.47M req/sec) | Active - 85 tests |
-| [cryptosec](projects/cryptosec) | Cryptographic primitives | Active - 331 tests |
+Status and test counts are not tracked here — they go stale. Run the tools:
+
+```bash
+./rz list                      # the 26 buildable projects, from rz.toml
+./rz build --all               # what compiles today
+./rz test <project>            # what passes today
+```
+
+Each project's own `README.md` carries its status. For the compiler bootstrap
+specifically, see [`docs/STACK_MATRIX.md`](../../docs/STACK_MATRIX.md).
+
+This table previously carried per-project test counts (ritz 324, squeeze 132,
+valet 85, cryptosec 331) and a throughput figure for valet of "1.47M req/sec".
+All were stale or unsourced. The `[[test]]` marker counts as of 2026-09-12 are
+ritz 1214, cryptosec 485, squeeze 199, valet 99 — which is why hardcoding them
+here was a mistake worth not repeating. The 1.47M figure has no measurement
+behind it anywhere in this repo; `projects/valet/test/test_basic.sh` measured
+28,108 and 34,850 req/s across two runs on 2026-09-12.
 
 ## Design Principles
 
-1. **Minimal syntax, big library** - Python-style indentation, no semicolons or braces
-2. **Type-safe with inference** - Static types with extensive type inference
-3. **Ownership without annotations** - Rust semantics with simpler surface syntax
-4. **One language for everything** - From kernel to script, same syntax
-5. **Bootstrappable** - Self-hosting compiler shipped as LLVM IR
+1. **Minimal syntax, big library** — Python-style indentation, no semicolons or braces
+2. **Type-safe with inference** — static types with extensive type inference
+3. **Ownership without annotations** — Rust semantics with simpler surface syntax
+4. **One language for everything** — from kernel to script, same syntax
+5. **Bootstrappable** — self-hosting compiler shipped as LLVM IR
 
-## Repository Structure
+## Directory Structure
 
 ```
-larb/
-├── docs/                   # Primary documentation
-│   ├── QUICK_REFERENCE.md  # Agent-optimized language summary
-│   ├── LANGUAGE_SPEC.md    # Full language specification
-│   ├── ECOSYSTEM.md        # Project descriptions and relationships
-│   ├── ROADMAP.md          # Open issues and priorities
-│   └── LSP_REQUIREMENTS.md # Language server requirements
-├── specs/                  # Formal specifications and RFCs
-│   └── rfcs/               # Request for Comments
-├── projects/               # Git submodules to ecosystem projects
-│   ├── ritz/               # Core compiler
-│   ├── ritzunit/           # Test framework
-│   ├── squeeze/            # Compression library
-│   ├── valet/              # HTTP server
-│   └── cryptosec/          # Crypto library
-├── TODO.md                 # Current work items
-└── DONE.md                 # Completed milestones
+projects/larb/
+├── docs/                   # Specs, RFCs, design decisions, reviews
+├── review/                 # Review instructions
+├── tools/                  # migrate_cstr.py, ritz-lint/
+├── logs/                   # Archived session transcripts (Feb 2026)
+├── CAPABILITY_SPEC.md
+├── DEFAULTS.md
+├── MISSING_FEATURES_SPEC.md
+└── AGENT.md
 ```
-
-## Getting Started
-
-```bash
-# Clone with submodules
-git clone --recursive https://github.com/ritz-lang/larb.git
-
-# Or initialize submodules after clone
-git submodule update --init --recursive
-```
-
-## Standards Versioning
-
-LARB uses git tags to mark ecosystem-wide standards:
-
-- `v0.1.0` - Initial language spec with basic features
-- `v0.2.0` - Generics, ownership, and async (current)
-- `v1.0.0` - Self-hosting compiler (future)
-
-Each tag ensures all submodule projects conform to that version of the language specification.
 
 ## Contributing
 
-Design discussions happen in GitHub Issues and Discussions. Code contributions go to the individual project repositories.
+Design discussions happen in GitHub Issues and Discussions on the `rz`
+repository. Code changes go to the relevant `projects/<name>/` directory in the
+same monorepo — cross-project changes are a single commit.

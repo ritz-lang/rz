@@ -24,15 +24,15 @@ The shell provides basic interactive use: a prompt, command history, line editin
 ## Installation
 
 ```bash
-# Build for Harland (freestanding PIE)
-export RITZ_PATH=/path/to/ritz
-./ritz build . --target harland
+# Build both targets (run from the monorepo root; `rz` sets RITZ_PATH itself).
+# Per-target selection is declared in ritz.toml's [[bin]] sections, not on the
+# command line — `rz build` has no --target flag.
+./rz build rzsh
 
-# Build for Linux (for testing)
-./ritz build . --target linux
-
-# The Linux binary is at:
-./build/debug/rzsh.linux
+# Harland binary (freestanding PIE):
+#   projects/rzsh/build/debug/rzsh.elf
+# Linux binary (for testing):
+./projects/rzsh/build/debug/rzsh.linux --help
 ```
 
 ## Usage
@@ -80,7 +80,15 @@ fn os_readdir(path: *u8, buf: *u8, buf_size: i64) -> i64
 
 ## Status
 
-**Active development** - Interactive shell loop, built-in commands, line editing, and external command execution all work on both Linux and Harland. The shell runs on Harland as part of the Indium distribution's init sequence. Pipes, redirection, environment variables, and history are planned for future phases.
+**Active development.** Measured 2026-09-12: `./rz build rzsh` exits 0, producing
+both `build/debug/rzsh.elf` (Harland) and `build/debug/rzsh.linux`;
+`rzsh.linux --help` exits 0, and `./rz test rzsh` exits 0 with
+`Σ 15 passed, 0 failed` across 3 test files.
+
+Interactive shell loop, built-in commands, line editing and external command
+execution work on both Linux and Harland. The shell runs on Harland as part of
+the Indium distribution's init sequence (`make -C projects/indium rzsh` pulls it
+in). Pipes, redirection, environment variables and history are still planned.
 
 ## License
 

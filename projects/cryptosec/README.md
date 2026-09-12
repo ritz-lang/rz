@@ -34,9 +34,11 @@ Cryptosec is also used by Goliath (content-addressable filesystem) for SHA-256 c
 # [dependencies]
 # cryptosec = { path = "../cryptosec" }
 
-# Build from source
-export RITZ_PATH=/path/to/ritz
-./ritz build .
+# Build from source (run from the monorepo root; `rz` sets RITZ_PATH itself)
+./rz build cryptosec
+
+# Run the test suite (485 [[test]] functions; takes several minutes)
+./rz test cryptosec
 ```
 
 ## Usage
@@ -81,7 +83,11 @@ x25519_shared(private_key, peer_public, @shared_secret[0])
 
 ## Status
 
-**Active development** - SHA-256, HMAC, and foundational primitives are implemented. AES-GCM, ChaCha20-Poly1305, X25519, and TLS 1.3 handshake are in progress as part of Valet HTTPS integration.
+**Active development** - `./rz build cryptosec` is green. AES-GCM,
+ChaCha20-Poly1305, X25519, Ed25519, P-256, SHA-2, HMAC and the TLS 1.3 handshake
+all have implementations in `lib/` with tests — this README described them as
+"in progress" long after they landed. 485 `[[test]]` functions are present; run
+`./rz test cryptosec` for the current pass count (it takes several minutes).
 
 ## License
 

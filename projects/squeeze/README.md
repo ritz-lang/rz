@@ -31,9 +31,13 @@ Squeeze is a pure Ritz implementation with no C dependencies, targeting both cor
 # [dependencies]
 # squeeze = { path = "../squeeze" }
 
-# Build from source
-export RITZ_PATH=/path/to/ritz
-./ritz build .
+# Build from source (run from the monorepo root; `rz` sets RITZ_PATH itself).
+# squeeze is a library with `test_only = true` in its ritz.toml, so this
+# reports "nothing to build" — that is the correct, successful outcome.
+./rz build squeeze
+
+# Run the test suite (199 [[test]] functions; takes several minutes)
+./rz test squeeze
 ```
 
 ## Usage
@@ -79,7 +83,13 @@ let checksum: u32 = crc32_final(state)
 
 ## Status
 
-**Active development** - CRC-32, Adler-32, bit stream I/O, and Huffman tables are implemented. Deflate compression/decompression and Gzip/Zlib container support are in progress as part of Valet HTTP integration.
+**Active development** - CRC-32, Adler-32, bit stream I/O, Huffman tables,
+Deflate (compress and decompress), the Gzip and Zlib container formats, the
+streaming reader/writer pair for both, and the SIMD paths are all implemented in
+`lib/`; `CLAUDE.md` marks phases 1-6 complete. This README described Deflate and
+the containers as "in progress" long after they landed. 199 `[[test]]` functions
+are present; run `./rz test squeeze` for the current pass count (it takes several
+minutes).
 
 ## License
 

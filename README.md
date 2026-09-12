@@ -8,33 +8,96 @@ The language compiles to LLVM IR and runs on multiple platforms:
 
 This monorepo (`rz`) contains everything: the compiler, standard library, an operating system, a web stack, a browser engine, and real-world applications — all serving as reference implementations that demonstrate idiomatic Ritz.
 
-## Quick Start
+## Prerequisites
 
 ```bash
-# Set up the environment
-export RITZ_PATH=$PWD/projects
+sudo apt install clang lld python3 make
+```
+
+`lld` is not optional: harland's UEFI bootloader target (`bootx64`) links with
+`lld-link`, and without it `./rz build --all` fails at exit 1 with
+`Cannot link UEFI target 'bootx64': lld-link not found`. No other project needs
+`lld` — but installing it does not make `build --all` green on its own, because
+`lexis` and `tempest` fail for unrelated compiler reasons. See the
+[build status table](#build-status) below.
+
+`clang` 20 or newer is required. This machine has 21.1.8 (with `clang-20` also
+present); no version is pinned anywhere, so plain `clang` is what gets used.
+
+## Quick Start
+
+Run everything from the workspace root. `rz` sets `RITZ_PATH` itself — you do
+not need to export it.
+
+```bash
+# List the projects rz knows about
+./rz list
 
 # Build a project
 ./rz build valet
 
-# Run tests
-./rz test ritz
-
 # Build everything
 ./rz build --all
+
+# Run a project's test suite
+./rz test valet
 ```
 
+`./rz test` is **not currently green everywhere**: `spire`, `prism`, `nexus` and
+`tome` all exit 1 (mostly test files that no longer compile), and `angelo` exits 0
+while running nothing at all. See
+[PROJECTS.md § Test suite status](PROJECTS.md#test-suite-status) for the measured
+per-project table before trusting a green `rz test`.
+
+### Testing the compiler
+
+`./rz test ritz` exits 0 but only runs the **2** `.ritz` test files that live
+under `projects/ritz` itself (11 assertions). It is not the compiler's test
+suite and passing it does not mean the compiler is tested. The real gates are:
+
+```bash
+# ritz0 Python unit tests — 58 pytest files (~2 min)
+make -C projects/ritz unit
+# measured 2026-09-12: 846 passed, 8 skipped, 3 xpassed, exit 0
+
+# Language regression matrix across all three compilers (~35s)
+make -C projects/ritz matrix-full
+# measured 2026-09-12: ritz0 53/53, ritz1 52/53, ritz1_selfhosted 52/53, exit 0.
+# The one failure (test_issue_float_coercion) is excused as AGAST #1370, which
+# is why the gate is green — "exit 0" here does not mean "53/53 everywhere".
+
+# What CI declares (fast, prints the job list)
+make -C projects/ritz ci-local ARGS="--list"
+
+# CI's bootstrap job end to end (several minutes; not timed here).
+# ARGS="--jobs" additionally runs the 26-project sweep (~50 min).
+make -C projects/ritz ci-local
+```
+
+For reference, `projects/ritz` contains 1214 `[[test]]` markers across 208
+`.ritz` files. Only 2 of those files sit in `projects/ritz/test/`, which is all
+`rz test ritz` looks at — the rest live under `ritz0/` (115 files), `examples/`
+(72), `ritzlib/` (18) and `ritz1/` (1), and are driven by `make test` /
+`python3 build.py test --all`, not by `rz test`.
+
 ## Projects
+
+`./rz list` is the authoritative list — it reports **26** buildable projects.
+Two directories under `projects/` are deliberately not among them:
+
+- `projects/ritzlib` is a symlink to `projects/ritz/ritzlib`; it is built as part
+  of `ritz`, not as a project of its own.
+- `projects/larb` is documentation only (specs, RFCs, review notes). Nothing to
+  build or test.
 
 ### Core Toolchain
 
 | Project | Description |
 |---------|-------------|
-| **ritz** | Core compiler — Python-based bootstrap (ritz0) compiling to LLVM IR, plus self-hosted compiler (ritz1) |
-| **ritzlib** | Standard library — sys (syscalls), io, memory, strings, collections, async primitives |
+| **ritz** | Core compiler — Python-based bootstrap (ritz0) compiling to LLVM IR, plus self-hosted compiler (ritz1) and the `ritzlib` standard library |
 | **ritzunit** | Test framework — fork-based isolation, assertions, test discovery, valgrind integration |
-| **ritz-lsp** | Language server — IDE support with completions, hover, go-to-definition |
-| **larb** | Language Architecture Review Board — specs, RFCs, style guides, tooling standards |
+| **ritz-lsp** | Language server — JSON-RPC transport and document sync work; diagnostics, hover, completions are not done |
+| **rzrz** | `rz` reimplemented in Ritz — the Ritz-native workspace CLI (see [docs/STACK_MATRIX.md](docs/STACK_MATRIX.md)) |
 
 ### Core Libraries
 
@@ -85,6 +148,24 @@ export RITZ_PATH=$PWD/projects
 | **spectree** | Specification tree — hierarchical specs and actions that drive each other, planning tool |
 | **indium** | Harland distribution — packaging, installation, system images |
 | **rzsh** | Ritz shell — terminal shell with raw mode input, line editing, history, runs on Linux and Harland |
+| **ritzutils** | Coreutils-style Harland userspace utilities (currently `cat`) |
+| **angelo-simple** | Minimal Angelo render smoke test |
+
+### Build status
+
+The descriptions above state each project's *intent*. For what actually builds
+and runs today, read the project's own README — several are further from their
+description than the table suggests, and three have known failures:
+
+| Project | `./rz build` | Note |
+|---|---|---|
+| **harland** | ✗ exit 1 locally | `bootx64` needs `lld`; see Prerequisites |
+| **lexis** | ✗ exit 1 | 424 ownership errors, AGAST #1289 |
+| **tempest** | ✗ exit 1 | emitter indirection-depth bug, AGAST #1302 |
+
+`lexis` and `tempest` are excused in `rz.toml`'s `[ci.known_failing.build]`, so
+`./rz build --all` reports them as advisory rather than gating. Measured
+2026-09-12; every other project in `./rz list` built at exit 0.
 
 ## Architecture
 
@@ -106,7 +187,7 @@ export RITZ_PATH=$PWD/projects
 │  harland (microkernel)  │  goliath (filesystem)  │  indium      │
 ├─────────────────────────────────────────────────────────────────┤
 │                        Core Toolchain                            │
-│  ritz (compiler)  │  ritzlib (stdlib)  │  ritzunit (testing)    │
+│  ritz (compiler + ritzlib stdlib)  │  ritzunit (testing)        │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -116,12 +197,18 @@ export RITZ_PATH=$PWD/projects
 - [Style Guide](projects/ritz/docs/STYLE.md)
 - [Ecosystem Overview](projects/ritz/docs/ECOSYSTEM.md)
 - [Standard Library Reference](projects/ritz/docs/STDLIB_REFERENCE.md)
+- [Stack Matrix — bootstrap layering](docs/STACK_MATRIX.md)
 
 ## Philosophy
 
 Ritz follows a "no concessions" doctrine: if the language can't express something cleanly, we fix the language rather than work around it. Every project in this repo is both a useful tool and a test case for the language itself.
 
-The ecosystem is designed to be self-hosting: Ritz compiles itself, runs on its own OS, serves its own web applications, and renders its own fonts.
+The ecosystem is *designed* to be self-hosting: Ritz compiles itself, runs on its
+own OS, serves its own web applications, and renders its own fonts. The language
+half of that is real — `make -C projects/ritz matrix-full` exercises all three
+compiler stages. The application half is not finished; see
+[docs/STACK_MATRIX.md](docs/STACK_MATRIX.md) for which columns are actually
+proven and which are still claims.
 
 ## License
 

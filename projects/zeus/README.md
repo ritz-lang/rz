@@ -31,9 +31,9 @@ Named as a hat tip to the OG homies.
 # [dependencies]
 # zeus = { path = "../zeus" }
 
-# Build from source
-export RITZ_PATH=/path/to/ritz
-./ritz build .
+# Build from source (run from the monorepo root; `rz` sets RITZ_PATH itself)
+./rz build zeus
+# Produces projects/zeus/build/debug/zeus and .../test_client
 ```
 
 ## Usage
@@ -73,7 +73,19 @@ Shared Memory Region (configurable, default 64MB)
 
 ## Status
 
-**Alpha** - Ring buffer design and shared memory protocol are defined. Core IPC primitives and worker lifecycle management are being implemented. The full integration with Valet and Spire is in progress.
+**Active development**, further along than "Alpha — design defined", which is
+what this README said while the binary was already building and running.
+
+Measured 2026-09-12: `./rz build zeus` exits 0, producing `zeus` and
+`test_client`; `zeus --help` prints its full option list. `lib/` holds 15
+modules and the project carries 178 `[[test]]` markers across 17 test files.
+Run `./rz test zeus` for the current pass count.
+
+zeus is also the **only** application project that is green in all three
+compiler columns: ritz0, ritz1 and ritz1_selfhosted each build it at exit 0
+(after `./rz clean zeus`, which is required — see
+[docs/STACK_MATRIX.md](../../docs/STACK_MATRIX.md) and AGAST #1360). valet
+reverse-proxies to zeus via `valet -z <socket>`.
 
 ## License
 

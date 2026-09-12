@@ -31,10 +31,9 @@ Goliath is usable as a standalone library on Linux as well as the native filesys
 # [dependencies]
 # goliath = { path = "../goliath" }
 
-# Build and run tests
-export RITZ_PATH=/path/to/ritz
-./ritz build .
-./build/debug/goliath-tests
+# Build and run tests (run from the monorepo root; `rz` sets RITZ_PATH itself)
+./rz build goliath
+./projects/goliath/build/debug/goliath-tests    # 33 passed, 0 failed
 ```
 
 ## Usage
@@ -79,7 +78,13 @@ store.gc(ns.all_blob_ids())
 
 ## Status
 
-**Alpha** - Architecture, blob ID design, and test infrastructure are in place. Core blob store (put/get/exists) and namespace operations are being implemented via TDD. Garbage collection and snapshot support are planned for subsequent phases.
+**Alpha, with a passing suite.** Measured 2026-09-12: `./rz build goliath` exits
+0, and the resulting `build/debug/goliath-tests` binary runs to
+`Results: 33 passed, 0 failed` at exit 0. 33 `[[test]]` markers across 5 test
+files.
+
+Core blob store (put/get/exists), namespaces and path handling are implemented.
+Garbage collection and snapshot support are still planned.
 
 ## License
 
