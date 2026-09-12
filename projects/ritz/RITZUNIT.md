@@ -336,7 +336,7 @@ Ritzunit is approximately **90x faster** than ritz0's built-in test runner.
 
 ## Future Enhancements
 
-See ritzunit's TODO.md for planned features:
+Tracked in AGAST. Previously-listed candidates:
 - Glob pattern matching (`test_add*`)
 - Parallel test execution (`--jobs N`)
 - JUnit XML output

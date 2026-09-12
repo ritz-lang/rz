@@ -470,5 +470,5 @@ Each syscall should have:
 
 ## See Also
 
-- [Filesystem Architecture](./FILESYSTEM_ARCHITECTURE.md)
+- Filesystem architecture: not yet written (this link pointed at a file that has never existed)
 - [Goliath Design](../../goliath/docs/DESIGN.md)

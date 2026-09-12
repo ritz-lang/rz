@@ -25,9 +25,10 @@ When you encounter a limitation:
 > "Warnings are the ghosts of future production outages."
 
 - Fix anomalies when you discover them, not later
-- Track issues in GitHub Issues
+- Track issues in AGAST, the task tracker
 - Investigate test flakiness immediately
 - Treat compiler warnings as bugs
+- Distrust a green result you did not watch go red first
 
 ---
 
@@ -55,26 +56,33 @@ TDD Cycle:
 
 ## Setup
 
-### Clone the Ecosystem
+### Clone the monorepo
+
+Everything lives in one repository. The per-project repos this page used to tell
+you to clone (`ritz`, `squeeze`, `cryptosec`, `valet`, …) were consolidated on
+2026-02-15; they are private and frozen at that date, so cloning them gets you a
+stale snapshot.
 
 ```bash
-mkdir -p ~/dev/ritz-lang
-cd ~/dev/ritz-lang
-git clone https://github.com/ritz-lang/ritz.git ritz
-# Clone other projects as needed
-git clone https://github.com/ritz-lang/squeeze.git squeeze
-git clone https://github.com/ritz-lang/cryptosec.git cryptosec
-git clone https://github.com/ritz-lang/valet.git valet
+git clone git@github.com:ritz-lang/rz.git
+cd rz
 ```
 
-### Set RITZ_PATH
+### RITZ_PATH
+
+You usually do not need to set it. The workspace-root `./rz` CLI sets `RITZ_PATH`
+itself, and overrides whatever you exported.
+
+You only need it when invoking the compiler or build system directly, and the
+correct value is the ritz package root — **not** the workspace root and not the
+`ritzlib` directory:
 
 ```bash
-export RITZ_PATH=~/dev/ritz-lang
-export PATH="$RITZ_PATH/ritz:$PATH"
+RITZ_PATH=$PWD/projects/ritz python3 projects/ritz/build.py build <path/to/package>
 ```
 
-Add to your `~/.bashrc` or `~/.zshrc`.
+Without it, anything importing ritzlib fails with `Cannot find module: ritzlib.io`,
+which reads like a broken package rather than a missing variable.
 
 ---
 
@@ -82,75 +90,73 @@ Add to your `~/.bashrc` or `~/.zshrc`.
 
 ### Working on a Feature
 
-```bash
-# 1. Go to the relevant project
-cd $RITZ_PATH/ritz         # or squeeze, valet, etc.
+All commands run from the repository root — there is one repo, one branch, one
+history.
 
-# 2. Create a branch
+```bash
+# 1. Create a branch
 git checkout -b feature/my-feature
 
-# 3. TDD: write failing test
-# edit src/mymodule.ritz
+# 2. TDD: write the failing test first
+#    edit projects/<project>/test/test_mymodule.ritz
 
-# 4. Run tests (should fail)
-make test
+# 3. Run it and confirm it fails for the RIGHT reason
+./rz test <project>
 
-# 5. Implement the feature
-# edit src/mymodule.ritz
+# 4. Implement
+#    edit projects/<project>/lib/mymodule.ritz
 
-# 6. Run tests (should pass)
-make test
+# 5. Run again — should pass
+./rz test <project>
 
-# 7. Commit
+# 6. Commit
 git add -p
 git commit -m "ritzlib: 🤖 Add vec_sort_by function
 
 * Enables custom comparator for Vec sorting
 * 3 tests covering normal, reverse, and stable sort"
 
-# 8. Push and open PR
+# 7. Push and open a PR
 git push -u origin feature/my-feature
 gh pr create --title "Add vec_sort_by function" --body "..."
 ```
 
-### Fixing a Bug in a Dependency
+Step 3 is not optional. A test that passes before you implement anything is
+testing nothing, and that has happened here often enough to be worth a step of its
+own.
 
-If you're working in `myapp` and find a bug in `squeeze`:
+### Fixing a bug in a dependency
 
-```bash
-cd $RITZ_PATH/squeeze
-git checkout -b fix/deflate-edge-case
-
-# Write failing test for the bug
-# Fix the bug
-# Verify tests pass
-
-git push -u origin fix/deflate-edge-case
-gh pr create ...
-
-# Continue working in myapp — it already sees the fix
-cd $RITZ_PATH/myapp
-```
+Dependencies are directories in this repo, not separate checkouts. Fix
+`projects/squeeze` in the same branch as the caller that needed it, and add the
+regression test next to the fix. There is no cross-repo PR dance and no version to
+bump.
 
 ---
 
-## Which Repository?
+## Which directory?
 
-| Change | Repository |
-|--------|------------|
-| Language feature or syntax | `ritz` |
-| Standard library (ritzlib) | `ritz` |
-| Test framework | `ritzunit` |
-| Compression | `squeeze` |
-| Cryptography | `cryptosec` |
-| HTTP server | `valet` |
-| App server | `zeus` |
-| Database | `mausoleum` |
-| Cache | `tome` |
-| Web framework | `spire` |
-| Kernel | `harland` |
-| Language standards/docs | `larb` |
-| This wiki | `nexus` |
+One repository; these are paths within it. `./rz list` prints the authoritative
+set of buildable projects.
+
+| Change | Path |
+|--------|------|
+| Language feature or syntax | `projects/ritz/ritz0` (and `ritz1` for the self-hosted compiler) |
+| Standard library (ritzlib) | `projects/ritz/ritzlib` |
+| Language standard / style | `projects/ritz/docs/LANGUAGE_SPEC.md`, `projects/ritz/docs/STYLE.md` |
+| Test framework | `projects/ritzunit` |
+| Compression | `projects/squeeze` |
+| Cryptography | `projects/cryptosec` |
+| HTTP server | `projects/valet` |
+| App server | `projects/zeus` |
+| Database | `projects/mausoleum` |
+| Cache | `projects/tome` |
+| Web framework | `projects/spire` |
+| Kernel | `projects/harland` |
+| This wiki | `projects/nexus/wiki` |
+
+`projects/larb` is a documentation-only directory and is not a buildable project;
+the language standard moved into `projects/ritz/docs/` on 2026-09-03.
 
 ---
 
@@ -217,20 +223,28 @@ Examples:
 
 ## Testing
 
-Before submitting a PR:
+Before submitting a PR, from the repository root:
 
 ```bash
-# Run all tests
-make test
+# Tests for one project
+./rz test <project>
 
-# For memory safety (if applicable)
-make valgrind
+# The compiler's full gate — exactly what CI runs, in CI's order
+make -C projects/ritz ci-local
 
-# Run with specific filter
-ritz test . --filter test_my_feature
+# Memory safety (only projects/ritz has this target)
+make -C projects/ritz valgrind
 ```
 
-Tests must pass. The CI will verify.
+Tests must pass. CI will verify.
+
+Two traps this page used to walk into, both of which report success while doing
+nothing:
+
+- `make -C projects/<project> test` exits 0 with "Nothing to be done for 'test'"
+  for most projects, because only a handful have a Makefile and `make` matches the
+  existing `test/` *directory* as an already-up-to-date target. Use `./rz test`.
+- There is no `ritz` binary, so `ritz test . --filter …` exits 127.
 
 ---
 
@@ -284,18 +298,24 @@ Wiki pages use standard Markdown with internal links:
 ```markdown
 # My Page
 
-See [related concept](../language/ownership.md) for details.
+See [related concept](language/ownership.md) for details.
 
-Or link to a project: [Valet](../projects/valet.md).
+Or link to a project: [Valet](projects/valet.md).
 ```
 
 ---
 
 ## Finding Work
 
-- **GitHub Issues** — Each repository has an issues list
-- **TODO.md** — Each project has a `TODO.md` with planned work
-- **DONE.md** — Each project has a `DONE.md` for reference
+- **AGAST** — the task tracker, and the single source of truth for what is open,
+  what is blocked, and why. Work is claimed and completed there.
+- **The regression allowlists** — `projects/ritz/scripts/regression-known-failures*.txt`
+  list the examples each compiler cannot yet handle. Each entry is a claim about
+  the compiler, with its reasoning in the file's header comments.
+
+Per-project `TODO.md` / `DONE.md` files used to be listed here. They were deleted
+on 2026-09-12 after going seven months stale — several listed work as unstarted
+that had already shipped. Do not recreate them.
 
 Good first contributions:
 - Add tests for untested edge cases

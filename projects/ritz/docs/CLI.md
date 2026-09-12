@@ -326,6 +326,6 @@ ritz test myproject
 ## See Also
 
 - `docs/EXAMPLES.md` - Example programs by tier
-- `docs/LANGUAGE.md` - Language reference
+- `docs/LANGUAGE_SPEC.md` - Language standard (normative, compile-gated)
 - `docs/TESTING.md` - Testing guide
-- `TODO.md` - Development roadmap
+- `docs/ROADMAP.md` - The plan, and which command answers which question

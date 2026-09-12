@@ -56,7 +56,11 @@ The ritz project follows strict TDD:
 
 - ritz0 (Python) is the bootstrap compiler - flexibility over performance
 - ritz1 (Ritz) is the self-hosted compiler - the real implementation
-- Both must produce identical output for the same input
+- Both must produce identical output for the same input — meaning the *programs
+  they emit* behave identically (same stdout, same exit code). This is not a claim
+  of byte-identical LLVM IR; nothing in the suite has ever checked for that, and
+  earlier documents demanding a "bit-for-bit IR" gate were describing an
+  aspiration rather than a check that exists.
 - Self-hosting is the ultimate validation of language design
 
 ---
@@ -64,11 +68,20 @@ The ritz project follows strict TDD:
 ## Issue Tracking
 
 Bugs discovered during development MUST be tracked:
-- Create GitHub issues for non-trivial bugs
-- Include reproduction steps
-- Document the investigation done
-- Don't rely on memory or TODO comments
+- File them in **AGAST**, the task tracker. Not GitHub issues, and not a file in
+  this repo — per-project `TODO.md` / `DONE.md` were deleted on 2026-09-12 after
+  going seven months stale.
+- Include reproduction steps, and prefer a command whose exit code tells the story
+  over a description of what you saw.
+- Document the investigation done, *including* what turned out to be wrong. A
+  retracted diagnosis is worth recording; the next person will otherwise repeat it.
+- Don't rely on memory or TODO comments.
+- State plainly whether a claim was measured or inferred. An anonymous compiler
+  error is not evidence about whose bug it is — several allowlist entries sat for
+  months blamed on the compiler when the example was at fault.
 
 ---
 
-*Last updated: 2024-12-26*
+*Last updated: 2025-12-26. (This file previously read "2024-12-26" — the year digit
+was wrong. `ritz-lang/ritz` was created 2025-12-24, so the month and day were
+right. The same off-by-one-year appears throughout `docs/archive/`.)*

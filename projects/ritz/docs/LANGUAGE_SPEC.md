@@ -130,22 +130,30 @@ Block comments are not supported.
 
 ### 2.4 Keywords
 
-The reserved words recognised by the lexer:
+The 39 reserved words recognised by the lexer (`ritz0/tokens.py:KEYWORDS`):
 
 ```
-and       as        assert    async     await     break
-const     continue  dyn       else      enum      extern
-false     fn        for       heap      if        impl
-import    in        let       loop      match     mut
-not       null      or        pub       return    static_assert
-struct    then      trait     true      type      unsafe
-var       while
+and       as        asm       assert    async     await
+break     const     continue  dyn       else      enum
+extern    false     fn        for       heap      if
+impl      import    in        let       loop      match
+mut       not       null      or        pub       return
+static_assert       struct    then      trait     true
+type      unsafe    var       while
 ```
 
 `self` and `pass` are **not** keywords — they are ordinary identifiers with
 special meaning by convention (`self` as a method receiver name, `pass` as a
 no-op expression that evaluates to `0`). `mut` is reserved but only valid in
 `*mut T`; `let mut` was removed by RERITZ (see [§4.2](#42-mutable-bindings-var)).
+
+`asm` is reserved but has no syntax behind it yet; it is listed here because
+using it as an identifier is an error, which is the only thing a reader needs
+from this table:
+
+```ritz body expect-error="Expected IDENT, got ASM"
+let asm = 1
+```
 
 ### 2.5 Identifiers
 
@@ -585,10 +593,32 @@ struct Task
     id: i32
 ```
 
-Function pointers lower to opaque LLVM `ptr`, and ritz0 cannot yet *call*
-through a function-typed binding — `fn apply(f: BinaryOp, ...)` followed by
-`f(a, b)` fails with `Unknown function: f`. Dispatch through an `impl` method
-or a `match` in the meantime.
+Function pointers lower to opaque LLVM `ptr`. A parameter whose type is written
+out **inline** is callable, and passing a named function as the argument works:
+
+```ritz
+fn add(a: i32, b: i32) -> i32
+    a + b
+
+fn apply(f: fn(i32, i32) -> i32, a: i32, b: i32) -> i32
+    f(a, b)
+
+fn main() -> i32
+    return apply(add, 1, 2)
+```
+
+Two spellings do *not* work, both failing with `Unknown function: f`:
+
+- the parameter type written through a **type alias** (`type BinaryOp =
+  fn(i32, i32) -> i32` then `fn apply(f: BinaryOp, ...)`). This is the alias
+  resolution bug in [§3.8](#38-type-aliases), not a function-pointer
+  limitation — aliases are accepted at their declaration and then not resolved
+  at use sites.
+- calling through a **local binding** (`let f = add` then `f(1, 2)`). ritz0 has
+  no lowering for a function-valued `let`.
+
+Until those are fixed, spell the `fn(...)` type out at the parameter, or
+dispatch through an `impl` method or a `match`.
 
 ### 5.6 Closures
 
@@ -616,7 +646,27 @@ else
     print("many\n")
 ```
 
-`if` is a statement, not an expression. Use `match` where you want a value.
+`if` is also an **expression**: an `if`/`else` whose branches end in a value can
+initialise a binding, and it lowers to a real LLVM `phi` rather than to a
+temporary:
+
+```ritz body
+let c = true
+let x = if c
+    1
+else
+    2
+```
+
+This document claimed the opposite until 2026-09-12 ("`if` is a statement, not
+an expression; use `match` where you want a value"). `match` remains the better
+choice when you are discriminating a tagged union, but not because `if` cannot
+produce a value.
+
+Always give an `if`-expression its `else` arm. ritz0 does **not** currently
+reject an else-less one: `let x = if c` followed by an indented `1` compiles,
+emits no `phi`, discards the `1`, and silently binds `x` to `0`. Verified on
+2026-09-12; treat it as a compiler bug to avoid, not a feature.
 
 ### 6.2 While Loop
 
@@ -924,21 +974,56 @@ fn main() -> i32
 
 ## 10. Enums
 
+An enum is a tagged union: a value is exactly one of its variants, and the
+compiler tracks which one.
+
 ### 10.1 Definition
+
+The simplest enums are C-style — variants with no payload:
 
 ```ritz
 enum Color
     Red
     Green
     Blue
-
-enum Shape
-    Circle(i32)
-    Square(i32)
 ```
+
+A variant can carry data. Write the payload positionally, as a tuple:
+
+```ritz
+enum Shape
+    Circle(f64)
+    Rect(f64, f64)
+    Empty
+```
+
+...or with named fields, as an indented block. This is usually clearer once a
+variant has more than two fields:
+
+```ritz
+import ritzlib.strview
+
+pub enum Msg
+    Stop
+
+    Navigate
+        url: StrView
+
+    SetViewport
+        width: u32
+        height: u32
+```
+
+Named fields are **sugar**: `SetViewport` above has exactly the same tag and
+memory layout as `SetViewport(u32, u32)` would. Field order is therefore
+significant — reordering fields changes the layout, just as it does in a
+`struct`.
 
 `Option<T>` and `Result<T, E>` are defined in `ritzlib.option` and
 `ritzlib.result` respectively; import them rather than redeclaring them.
+
+For the full treatment — memory layout, exhaustiveness rules and the design
+rationale — see [`docs/ENUM_VARIANTS.md`](ENUM_VARIANTS.md).
 
 ### 10.2 Usage
 
@@ -984,6 +1069,51 @@ fn main() -> i32
         Some(value) => print_int(value)
         None => prints("none\n")
     0
+```
+
+Fields bind **positionally**, for tuple and named-field variants alike — the
+field names in the declaration do not appear in the pattern:
+
+```ritz
+import ritzlib.strview
+
+enum Msg
+    Stop
+
+    Navigate
+        url: StrView
+
+    SetViewport
+        width: u32
+        height: u32
+
+fn handle(m: Msg) -> i32
+    match m
+        Stop => 0
+        Navigate(url) => 1
+        SetViewport(width, height) => 2
+
+fn main() -> i32
+    return handle(Msg.Stop)
+```
+
+Use `_` for a field you do not need:
+
+```ritz
+enum Shape
+    Circle(f64)
+    Rect(f64, f64)
+    Empty
+
+fn width_ish(s: Shape) -> f64
+    match s
+        Rect(w, _) => w
+        Circle(r) => r
+        Empty => 0.0
+
+fn main() -> i32
+    let x = width_ish(Shape.Rect(3.0, 4.0))
+    return 0
 ```
 
 ---
@@ -1039,8 +1169,19 @@ enum Either<T, E>
 ### 11.4 Monomorphization
 
 Generics are monomorphized at compile time; each instantiation generates
-specialized code. Only the *first* type argument participates in name
-mangling: `Result<i32, StrView>` mangles to `Result$i32`.
+specialized code. *Every* type argument participates in name mangling, joined
+by `_`: `Result<i32, StrView>` mangles to `Result$i32_StrView`, and
+`Result<i32, i32>` to `Result$i32_i32`. You can read the mangled names straight
+out of the emitted IR:
+
+```bash
+RITZ_PATH=$PWD python3 ritz0/ritz0.py prog.ritz -o prog.ll --no-runtime
+grep -o 'Result\$[A-Za-z0-9_]*' prog.ll | sort -u
+```
+
+This document claimed until 2026-09-12 that only the first type argument
+mangled — which would have made `Result<i32, StrView>` and `Result<i32, i64>`
+collide. They do not.
 
 ---
 
@@ -1451,7 +1592,36 @@ See `docs/STDLIB_REFERENCE.md` for the function-level reference.
 |----------|-------------|
 | `print(literal)` | Print a string literal, with `{var}` interpolation |
 | `sizeof(T)` / `sizeof(expr)` | Size in bytes |
-| `assert cond` | Runtime check; exits non-zero on failure |
+| `assert cond` | Runtime check; exits non-zero on failure. **`[[test]]` functions only** |
+| `assert cond, "message"` | As above, naming what the check was for |
+
+`assert` is legal **only inside a `[[test]]` function**, and the compiler
+enforces it rather than leaving it to convention — an `assert` in ordinary code
+is a compile error naming the offending function:
+
+```ritz expect-error="assert is only allowed in"
+fn main() -> i32
+    assert 1 == 1
+    return 0
+```
+
+Note that the diagnostic itself still reads *"assert is only allowed in @test
+functions"*. `@test` is removed syntax ([§17.3](#173-the--attribute-syntax-was-removed));
+the attribute to write is `[[test]]`. The message is a compiler bug, not a hint
+to use `@test`.
+
+Both the one- and two-argument forms work inside a test:
+
+```ritz
+[[test]]
+fn test_arithmetic() -> i32
+    assert 2 + 2 == 4
+    assert 2 + 2 == 4, "addition is broken"
+    0
+
+fn main() -> i32
+    return 0
+```
 
 `print` is the only builtin that takes a string, and it requires a literal:
 

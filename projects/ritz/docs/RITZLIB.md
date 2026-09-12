@@ -1,13 +1,16 @@
 # ritzlib: Standard Library
 
-> **Status:** 🔮 **FUTURE DESIGN** - This document describes the *target* architecture for ritzlib.
+> **Status:** 🔮 **FUTURE DESIGN** — this document describes a *target* architecture
+> for ritzlib, not what exists. Nothing below has been implemented as described.
 >
-> **Current State:** ritzlib is a flat 35-file structure. Reorganization into hierarchical modules is
-> planned for after Phase 2 (module system) is complete.
+> **Current state:** ritzlib is a flat layout of top-level `.ritz` modules plus a
+> few subdirectories (`async/`, `os/`, `lang/`, `tests/`). For what actually exists
+> and its real signatures, use `docs/STDLIB_REFERENCE.md` — it is compile-gated,
+> so its examples cannot drift from the compiler. This document is not gated.
 >
 > **See also:**
-> - [Current ritzlib files](../ritzlib/) - What exists now
-> - [MODULE_SYSTEM_IMPLEMENTATION.md](../MODULE_SYSTEM_IMPLEMENTATION.md) - Phase 1-2 complete
+> - [Current ritzlib files](../ritzlib/) — what exists now
+> - `docs/STDLIB_REFERENCE.md` — the authoritative API reference
 
 The Ritz standard library, built on Linux syscalls.
 

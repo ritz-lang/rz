@@ -358,7 +358,7 @@ projects/ritzunit/
 
 ## What's next
 
-See `TODO.md` for the broader plan. Testing-relevant items:
+The broader plan lives in AGAST, the task tracker. Testing-relevant items:
 
 1. **Backfill tier 3 (coreutils 21-30)** — same template, ~5 tests
    each, mostly mechanical.

@@ -319,9 +319,11 @@ const TOK_EOF:    i32 = 4
 
 Ritz accepts both spellings of each logical operator — `and` and `&&`, `or` and
 `||`, `not` and `!` — and they mean exactly the same thing. **House style is the
-word form.** In `ritzlib`, `ritz1` and `examples` the word form outnumbers the
-symbol form by roughly 700 uses to 2; a `&&` in new code reads as an import from
-another language.
+word form.** Measured across `ritzlib`, `ritz1` and `examples` on 2026-09-12,
+with comments and string literals excluded, the word form outnumbers the symbol
+form 1,678 uses to 2 — so a `&&` in new code reads as an import from another
+language. (The earlier figure in this document, "roughly 700 uses to 2", counted
+only part of the tree; the "2" happened to be right.)
 
 ```ritz
 fn in_window(x: i64, lo: i64, hi: i64, closed: bool) -> bool
@@ -608,11 +610,23 @@ i += 1
 
 Ritz uses colon-modifiers in function **signatures** to express ownership:
 
-| Syntax | Meaning | Frequency |
-|--------|---------|-----------|
-| `x: T` | Const borrow (immutable reference) | ~70% |
-| `x:& T` | Mutable borrow (can modify) | ~20% |
-| `x:= T` | Move ownership (caller gives up ownership) | ~10% |
+| Syntax | Meaning |
+|--------|---------|
+| `x: T` | Const borrow (immutable reference) |
+| `x:& T` | Mutable borrow (can modify) |
+| `x:= T` | Move ownership (caller gives up ownership) |
+
+All three parse and compile. Be aware, though, that the two modifier forms are
+close to unused in the tree as it stands: measured on 2026-09-12 across
+`ritzlib`, `ritz1` and `examples`, `:&` appears in 2 parameter positions and `:=`
+in none. Existing code reaches instead for an explicit reference type in the
+annotation — `: @T` (267 parameters) and, where the callee mutates, `: @&T`
+(105). Use `:&` and `:=` deliberately, not because the table above makes them
+look canonical.
+
+A "Frequency" column here gave `~70% / ~20% / ~10%` until 2026-09-12. Those
+numbers were not measured against anything and were wrong by two orders of
+magnitude on two of three rows; they are deleted rather than re-estimated.
 
 **The Golden Rule:** The common case (const borrow) has zero syntax overhead.
 
@@ -1453,6 +1467,8 @@ fn fetch_user(id: i64) -> Result<User, DbError>
 ---
 
 *This style guide lives in `projects/ritz/docs/STYLE.md` and is validated on every
-build by `tools/check_doc_examples.py`. A shorter, compiler-project-specific
-style guide lives at `projects/ritz/STYLE.md`; the two have not been merged. For
-questions or proposed changes, open an AGAST task against the ritz project.*
+build by `tools/check_doc_examples.py`. It is the only style guide for Ritz:
+`projects/ritz/STYLE.md` was a competing, ungated copy from 2026-02-11 and was
+stubbed on 2026-09-12 after it was found to disagree with this document on every
+point of conflict and to be wrong each time. For questions or proposed changes,
+open an AGAST task against the ritz project.*

@@ -2,15 +2,23 @@
 
 Systems programming language compiling to LLVM IR. No libc - direct Linux syscalls.
 
-## Status (April 2026)
+## Status
 
-| Component | Status |
-|-----------|--------|
-| **ritz0** (Python bootstrap) | ✅ 33/33 regression matrix |
-| **ritz1** (self-hosted, ritz0-built) | ✅ 33/33 regression matrix |
-| **ritz1_selfhosted** (ritz1 self-compiling) | ✅ 33/33 regression matrix |
-| **ritzlib** | 34 modules |
-| **examples** | 75+ programs |
+Three compilers are in play: **ritz0** (Python bootstrap), **ritz1** (written in
+Ritz, built by ritz0), and **ritz1_selfhosted** (ritz1 compiled by itself). The
+bootstrap closes — the regression suite's last stage asserts ritz1 and
+ritz1_selfhosted accept an identical set of programs.
+
+For current numbers, run the gate rather than reading a table:
+
+```bash
+make -C projects/ritz ci-local      # everything CI runs, in CI's order
+```
+
+A hardcoded status table lived here until 2026-09-12 claiming "33/33" for each
+compiler, 34 ritzlib modules and "75+" examples, under a heading dated five months
+earlier. Every figure had drifted. Counts belong in command output; work status
+belongs in AGAST.
 
 ## Quick Start
 
@@ -90,22 +98,30 @@ and the four harness gotchas (read-until-EOF, temp-file stdin, etc.).
 
 ## Documentation
 
-- `docs/LANGUAGE.md` - Full language reference
-- `docs/EXAMPLES.md` - Example program guide
-- `docs/TESTING.md` - Test system documentation
-- `docs/VALIDATION.md` - **Validation workflow & build cadence** (read this!)
-- `STYLE.md` - Code style guide (compiler-project conventions)
+**Normative and compile-gated.** Every fenced ` ```ritz ` block in these four is
+compiled by `make check-doc-examples` on every build, so their examples cannot
+drift from the compiler. Membership in that gate is the only thing that has
+actually prevented doc rot here — docs inside it are accurate, docs outside it
+have not been:
 
-Moved here from `projects/larb/docs/` on 2026-09-03 (AGAST #1311), because
-living outside `projects/ritz` is why they went seven months without a
-migration pass. Every fenced ` ```ritz ` block in these four is compiled by
-`make check-doc-examples` on every build:
-
-- `docs/LANGUAGE_SPEC.md` - Language specification
+- `docs/LANGUAGE_SPEC.md` - **the language standard. Start here.**
 - `docs/STDLIB_REFERENCE.md` - ritzlib reference
-- `docs/STYLE.md` - Ecosystem-wide style guide (broader than `STYLE.md` above;
-  the two have not been merged — see AGAST #1311's notes)
-- `docs/ECOSYSTEM.md` - Ecosystem overview
-- `TODO.md` / `DONE.md` - Work tracking
-- `docs/XARGS_WATCH_BLOCKER.md` - Pre-existing StrView/i8* type-mismatch
-  blocking 37_xargs and 40_watch builds. Fix sketch included.
+- `docs/STYLE.md` - style guide
+- `docs/ECOSYSTEM.md` - ecosystem overview
+
+These four moved here from `projects/larb/docs/` on 2026-09-03 (AGAST #1311):
+living outside `projects/ritz` is why they went seven months without a migration
+pass.
+
+**Guides** (prose, not gated — treat specifics with more suspicion):
+
+- `docs/ROADMAP.md` - the plan, and which command answers which question
+- `docs/EXAMPLES.md` - example program guide
+- `docs/TESTING.md` - test system documentation
+- `docs/VALIDATION.md` - **validation workflow & build cadence** (read this!)
+
+**Work tracking lives in AGAST**, the external task tracker — not in this repo.
+Per-project `TODO.md` / `DONE.md` files were deleted on 2026-09-12 after going
+seven months stale; git retains them. Do not recreate them. `docs/archive/` holds
+historical session logs and superseded status reports, and is not authoritative —
+see `docs/archive/README.md`.
