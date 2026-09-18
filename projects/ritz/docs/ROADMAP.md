@@ -31,7 +31,7 @@ commands are in the next section and they are the same ones CI runs.
 | What is being worked on, what is blocked, why | **AGAST** — the task tracker. Not any file in this repo. |
 | Does the compiler work, right now | `make -C projects/ritz ci-local` — runs CI's job list, in CI's order |
 | Which examples does each compiler accept | `projects/ritz/scripts/regression.sh` — the 5-stage differential suite |
-| Which failures are known and excused | `scripts/regression-known-failures.txt` (ritz0) and `scripts/regression-known-failures-ritz1.txt` (ritz1 / ritz1_selfhosted) |
+| Which failures are known and excused | `projects/ritz/scripts/regression-known-failures.txt` (ritz0) and `projects/ritz/scripts/regression-known-failures-ritz1.txt` (ritz1 / ritz1_selfhosted) |
 | What the language *is* | `docs/LANGUAGE_SPEC.md` — the normative standard, and its examples are compiled by CI |
 | How to build and test a package | the workspace-root `./rz` CLI, and `projects/ritz/build.py` |
 
