@@ -720,6 +720,154 @@ class LLVMEmitter:
         else:
             return 64  # Default to 64 for unknown types
 
+    # Widths of the built-in integer types, for contextual literal typing.
+    # AGAST #1396.
+    _INT_TYPE_WIDTHS = {
+        'i8': 8, 'u8': 8, 'i16': 16, 'u16': 16, 'i32': 32, 'u32': 32,
+        'i64': 64, 'u64': 64, 'isize': 64, 'usize': 64,
+    }
+
+    def _arith_context_nodes(self, root: rast.Expr) -> set:
+        """Ids of the BinOps whose result is consumed at the declared type.
+
+        AGAST #1396. A literal may only adopt the declared width when the
+        expression's result is consumed AT that width, because that is what
+        makes the narrowing lossless — the existing IR truncates to exactly
+        that width, so the high bits are provably discarded.
+
+        `self.expected_ritz_type` alone is too blunt to decide this: it is
+        ambient for the whole initialiser and does not narrow as emission
+        descends, so it leaks into positions that are consumed at some OTHER
+        type. That leak is not hypothetical:
+
+            fn takes64(v: i64) -> u32
+            let q: u32 = takes64(x * 1000)        # x: u32
+
+        The multiply feeds an i64 parameter and must happen in 64 bits. Under
+        the ambient type alone the literal became u32, the multiply wrapped at
+        32 bits, and the wrapped value was then widened — silent data loss.
+
+        So the qualifying set is computed by descending from the declared
+        value through arithmetic only. It stops at a Call, an Index, a Field
+        or a Cast, because at each of those the value is consumed at a
+        position whose type we have not established.
+        """
+        qualifying = set()
+        stack = [root]
+        seen = set()
+        while stack:
+            node = stack.pop()
+            if node is None or id(node) in seen:
+                continue
+            seen.add(id(node))
+            if isinstance(node, rast.BinOp):
+                qualifying.add(id(node))
+                stack.append(node.left)
+                stack.append(node.right)
+            elif isinstance(node, rast.UnaryOp):
+                # `-(x + 1)` is still consumed at the declared width.
+                stack.append(node.operand)
+        return qualifying
+
+    def _untyped_int_literal(self, expr: rast.Expr) -> Optional[int]:
+        """The value of an untyped integer literal, or None.
+
+        `-1` parses as `UnaryOp('-', IntLit)`, so the negated form counts —
+        otherwise `x + -1` would keep the i64 round-trip that `x + 1` loses.
+        """
+        if isinstance(expr, rast.IntLit):
+            return expr.value
+        if (isinstance(expr, rast.UnaryOp) and expr.op == '-'
+                and isinstance(expr.operand, rast.IntLit)):
+            return -expr.operand.value
+        return None
+
+    def _expected_int_width(self) -> Optional[int]:
+        """Width demanded by the declared type currently in context, else None.
+
+        Reads `self.expected_ritz_type`, the existing contextual-type channel
+        set by LetStmt/VarStmt/ReturnStmt. None means "no declared type in
+        scope", in which case callers must leave behaviour exactly as it was.
+        """
+        expected = getattr(self, 'expected_ritz_type', None)
+        if isinstance(expected, rast.NamedType) and not expected.args:
+            return self._INT_TYPE_WIDTHS.get(expected.name)
+        return None
+
+    def _int_literal_fits(self, value: int, width: int, unsigned: bool) -> bool:
+        """Whether a literal is representable in `width` bits."""
+        if unsigned:
+            return 0 <= value < (1 << width)
+        return -(1 << (width - 1)) <= value < (1 << (width - 1))
+
+    def _retype_literal_operand(self, expr: rast.BinOp, left: ir.Value,
+                                right: ir.Value):
+        """Re-materialise an untyped integer literal at the declared width.
+
+        AGAST #1396. `_emit_expr` types every integer literal as i64, so in
+        `x + 1` (x: u32) the literal dragged its neighbour up to 64 bits and
+        the result was truncated back down — while `x + y` stayed 32-bit. That
+        artifact accounted for 292 of the 309 narrowing sites found across 115
+        packages, all in code that was already correctly annotated.
+
+        The width comes from the DECLARED type in context, deliberately NOT
+        from the sibling operand. Under a sibling rule
+
+            let big: i64 = x * 1000        # x: u32
+
+        would multiply in 32 bits and silently wrap, where today it cannot
+        overflow. Keying on the declaration fixes `let q: u32 = x + 1` and
+        leaves that case alone, because the declared widths differ (32 vs 64).
+
+        Narrowing is safe where it applies because the existing IR already
+        truncates the result to this exact width, so the high bits it computes
+        are provably discarded: for `+ - * << & | ^`, `trunc(op(zext a, zext
+        b))` is congruent to `op(a, b)` mod 2**width.
+
+        Returns the adjusted `(left, right)` pair, or None to leave the
+        existing widening path untouched.
+        """
+        want = self._expected_int_width()
+        if want is None:
+            return None            # no declared type in scope — change nothing
+
+        # The declared type is ambient; this BinOp must actually be the thing
+        # being declared, not something nested inside a call argument or an
+        # index that is consumed at a different type. See _arith_context_nodes.
+        if id(expr) not in getattr(self, '_literal_ctx_nodes', ()):
+            return None
+
+        lit_left = self._untyped_int_literal(expr.left)
+        lit_right = self._untyped_int_literal(expr.right)
+        # Exactly one side must be a literal: `x + y` has nothing to re-type
+        # and `1 + 2` needs no help from us.
+        if (lit_left is None) == (lit_right is None):
+            return None
+
+        if lit_left is None:
+            lit_val, other, other_expr = lit_right, left, expr.left
+        else:
+            lit_val, other, other_expr = lit_left, right, expr.right
+
+        # Only ever narrow, and only to the width the declaration asks for.
+        # If the other operand is not already that width, the declaration is
+        # asking for something wider (the `let big: i64` case) and the
+        # existing widening is the correct answer.
+        if not isinstance(other.type, ir.IntType) or other.type.width != want:
+            return None
+        if want >= 64:
+            return None
+
+        unsigned = self._infer_unsigned_expr(other_expr)
+        if not self._int_literal_fits(lit_val, want, unsigned):
+            # The literal cannot be represented at the declared width. Leave
+            # it alone rather than truncating it here; `_check_let_annotation`
+            # reports it with a location.
+            return None
+
+        const = ir.Constant(ir.IntType(want), lit_val)
+        return (const, right) if lit_left is not None else (left, const)
+
     def _infer_ritz_type(self, expr: rast.Expr, llvm_val: ir.Value = None) -> Optional[rast.Type]:
         """Infer a Ritz type from an expression, for signedness tracking.
 
@@ -3147,6 +3295,7 @@ class LLVMEmitter:
         self.simd_expected_type = None  # Clear SIMD type context from previous function
         self.closure_expected_type = None  # Clear closure type context from previous function
         self.expected_ritz_type = None  # Expected Ritz type of the value being emitted
+        self._literal_ctx_nodes = set()  # AGAST #1396: BinOps consumed at that type
 
         # [[naked]] functions have special semantics:
         # - No prologue/epilogue generated by LLVM
@@ -3495,6 +3644,7 @@ class LLVMEmitter:
                 # type argument is only implied (`return Span.empty()`).
                 if self.current_fn_def:
                     self.expected_ritz_type = self.current_fn_def.ret_type
+                    self._literal_ctx_nodes = self._arith_context_nodes(stmt.value)
 
                 # Check if this is an enum variant constructor that needs type context
                 # This handles return None, return Some(x), etc. for generic enum types
@@ -3598,8 +3748,23 @@ class LLVMEmitter:
                         if stmt.type.name in ('v8i32', 'v4i64', 'v16i16', 'v32i8',
                                               'v4i32', 'v2i64', 'v8i16', 'v16i8'):
                             self.simd_expected_type = stmt.type
-                    val = self._emit_expr(stmt.value)
+                    # AGAST #1396: `var` carried no declared-type context, so
+                    # `var q: u32 = x + 1` kept the i64 round-trip that `let`
+                    # no longer has. Saved and restored rather than cleared,
+                    # so a `var` nested inside a typed initialiser does not
+                    # destroy the enclosing context.
+                    saved_expected = getattr(self, 'expected_ritz_type', None)
+                    saved_ctx = getattr(self, '_literal_ctx_nodes', set())
+                    if stmt.type:
+                        self.expected_ritz_type = stmt.type
+                        self._literal_ctx_nodes = self._arith_context_nodes(stmt.value)
+                    try:
+                        val = self._emit_expr(stmt.value)
+                    finally:
+                        self.expected_ritz_type = saved_expected
+                        self._literal_ctx_nodes = saved_ctx
                     self.simd_expected_type = None  # Clear SIMD context
+                    self._check_int_literal_fits_declaration(stmt)
                     val = self._convert_type(val, ty)
                     self.builder.store(val, alloca)
             self.locals[stmt.name] = (alloca, ty)
@@ -3631,6 +3796,7 @@ class LLVMEmitter:
                                           'v4i32', 'v2i64', 'v8i16', 'v16i8'):
                         self.simd_expected_type = stmt.type
                 self.expected_ritz_type = stmt.type
+                self._literal_ctx_nodes = self._arith_context_nodes(stmt.value)
                 val = self._emit_expr(stmt.value)
                 self.closure_expected_type = None  # Clear context
                 self.simd_expected_type = None  # Clear SIMD context
@@ -3639,6 +3805,7 @@ class LLVMEmitter:
                 # Use declared type and convert value if needed
                 declared_ty = self._ritz_type_to_llvm(stmt.type)
                 val = self._convert_type(val, declared_ty)
+                self._check_int_literal_fits_declaration(stmt)
                 self._check_let_annotation(stmt, val, declared_ty)
                 self.params[stmt.name] = (val, declared_ty)
                 self.ritz_types[stmt.name] = stmt.type  # Store Ritz type for signedness
@@ -5161,7 +5328,19 @@ class LLVMEmitter:
             # Ensure same type
             if left.type != right.type:
                 if isinstance(left.type, ir.IntType) and isinstance(right.type, ir.IntType):
-                    # Determine signedness for proper extension
+                    # AGAST #1396: prefer re-typing an untyped integer literal
+                    # to the declared width over widening its neighbour to 64
+                    # bits. Returns None whenever the declaration is absent or
+                    # asks for something wider, in which case the original
+                    # widening below runs unchanged.
+                    retyped = self._retype_literal_operand(expr, left, right)
+                    if retyped is not None:
+                        left, right = retyped
+
+                # Determine signedness for proper extension
+                if (left.type != right.type
+                        and isinstance(left.type, ir.IntType)
+                        and isinstance(right.type, ir.IntType)):
                     left_unsigned = self._infer_unsigned_expr(expr.left)
                     right_unsigned = self._infer_unsigned_expr(expr.right)
 
@@ -9526,6 +9705,38 @@ class LLVMEmitter:
                     j += 1
             i += 1
         return False
+
+    def _check_int_literal_fits_declaration(self, stmt) -> None:
+        """Reject `let n: u32 = 4294967301` — a literal that cannot be a u32.
+
+        AGAST #1396. Contextual literal typing means an untyped integer
+        literal now adopts its declared type, so a literal that does not fit
+        that type is no longer a narrowing question at all: there is no
+        possible value of the declared type the programmer could have meant.
+        `_convert_type` used to truncate it silently (4294967301 -> 5).
+
+        Deliberately narrower than #1393/#1364's open question about implicit
+        narrowing in general. This fires only on a literal whose value is
+        known at compile time and provably out of range — the corpus sweep
+        across 115 packages found ZERO such sites, so it cannot red any
+        existing code.
+        """
+        declared = getattr(stmt, "type", None)
+        if not isinstance(declared, rast.NamedType) or declared.args:
+            return
+        width = self._INT_TYPE_WIDTHS.get(declared.name)
+        if width is None:
+            return
+        value = self._untyped_int_literal(getattr(stmt, "value", None))
+        if value is None:
+            return
+        if self._int_literal_fits(value, width, self._is_unsigned_type(declared)):
+            return
+        raise EmitError(
+            f"`{value}` does not fit in `{declared.name}` "
+            f"(declared type of `{stmt.name}`)",
+            getattr(stmt, "span", None),
+        )
 
     def _check_let_annotation(self, stmt, val: ir.Value, declared_ty: ir.Type) -> None:
         """Reject `let x: T = expr` where expr cannot possibly be a T.
