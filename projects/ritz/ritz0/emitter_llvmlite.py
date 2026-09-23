@@ -3386,7 +3386,63 @@ class LLVMEmitter:
                 # function's return type refers to, so we use the right
                 # specialization instead of an arbitrary one from variant_to_enum.
                 expected_enum_name = self._resolve_enum_type_name(fn_def.ret_type, ret_type)
-                last_val = self._emit_expr_with_expected_enum(fn_def.body.expr, expected_enum_name)
+                # The parser puts a block's FINAL `if` into body.expr rather
+                # than body.stmts, so every trailing `if` — a guard, an
+                # if/else chain of assignments, a loop wrapped in a guard —
+                # arrives here looking exactly like an `if` in value position.
+                # Most are not: the tail of a function body is evaluated for
+                # effect whenever it has no value to give.
+                #
+                # So dispatch trailing `if`s straight to _emit_if, which is
+                # what _emit_while/_emit_for already do for their own body
+                # tails, and keep #1406's value-position rejection out of
+                # this path entirely. The enum expectation is threaded by
+                # hand because _emit_if re-consults `_expected_enum_name`
+                # (see _emit_expr_with_expected_enum, AGAST #1321).
+                #
+                # A narrower version of this carve-out — procedures only,
+                # else-less only — shipped past pytest and then redded
+                # ritzlib/hashmap.ritz:210 (a trailing if/else of
+                # assignments in a procedure) and two tier1/tier2 examples.
+                # The corpus is the arbiter of what "value position" means
+                # here, not the shapes that happened to be in my tests.
+                if isinstance(fn_def.body.expr, rast.If):
+                    saved_expected_enum = getattr(self, '_expected_enum_name', None)
+                    if expected_enum_name:
+                        self._expected_enum_name = expected_enum_name
+                    try:
+                        tail_val = self._emit_if(fn_def.body.expr)
+                    finally:
+                        self._expected_enum_name = saved_expected_enum
+                    if tail_val is None:
+                        # No phi: the tail produced nothing. Emit the implicit
+                        # zero this site has always emitted. When the function
+                        # DECLARES a return type this is a missing return
+                        # value and arguably its own defect — but it is a
+                        # different one from #1406, it exists in the corpus
+                        # today (examples/tier1_basics/91_loop_trailing_expr),
+                        # and widening #1406 to cover it silently would be a
+                        # scope increase disguised as a bug fix. Tracked
+                        # separately; do not fold it in here.
+                        self.closure_expected_type = None
+                        self._emit_drop_for_all_scopes(exclude_var)
+                        # Route the zero through _convert_type, which is what
+                        # the pre-#1406 path did: this tail can belong to a
+                        # function returning a POINTER, and `ir.Constant(ptr,
+                        # 0)` emits `ret %"struct.Expr"* 0` — rejected by
+                        # clang with "integer constant must have integer
+                        # type". ritz1/src/ast_helpers.ritz has exactly that
+                        # shape, so the first version of this hunk built a
+                        # ritz1 that could not compile itself; Stage 4 of the
+                        # differential suite caught it after pytest, the doc
+                        # gate and Stages 1-3 had all passed.
+                        self.builder.ret(
+                            self._convert_type(ir.Constant(self.i32, 0), ret_type))
+                        return fn
+                    last_val = tail_val
+                else:
+                    last_val = self._emit_expr_with_expected_enum(
+                        fn_def.body.expr, expected_enum_name)
                 self.closure_expected_type = None  # Clear context
                 # A tail that yields no value at all (ir.Undefined): a match
                 # used as a statement, whose arms are assignments/`pass`. That
@@ -5496,8 +5552,44 @@ class LLVMEmitter:
             result = self._emit_if(expr)
             if result is not None:
                 return result
-            # If no value (shouldn't happen for well-formed if expressions), return 0
-            return ir.Constant(self.i32, 0)
+            # No phi means the arms produced nothing to merge, and the only
+            # way to reach _emit_expr is value position. Until AGAST #1406
+            # this manufactured `ir.Constant(self.i32, 0)` under a comment
+            # reading "shouldn't happen for well-formed if expressions" — so
+            # the taken branch was discarded and the binding silently became
+            # zero, at exit 0, with no diagnostic.
+            #
+            # Do NOT "fix" this by synthesising a zero or an undef for the
+            # missing arm: that keeps every one of these programs compiling
+            # and merely makes the wrong answer deliberate. An `if` with no
+            # `else` has no value on the path where the condition is false.
+            # There is nothing to name, so the program is asking for a value
+            # that does not exist and the only answer that cannot be silently
+            # wrong is to refuse it.
+            #
+            # Statement position does not come through here — _emit_stmt's
+            # ExprStmt branch dispatches straight to _emit_if — so an
+            # else-less `if` used as a statement is unaffected.
+            # `None` does not always mean "no value". When every arm ends in
+            # a `return`, the merge point is unreachable and nothing can want
+            # a value there — that is the total, correct shape docs/STYLE.md
+            # teaches, and rejecting it redded the doc-example gate at
+            # 195/197. So the diagnostic is conditioned on the merge point
+            # being REACHABLE, not merely on the absence of a phi. The
+            # constant below lands in dead code.
+            if self.has_returned:
+                return ir.Constant(self.i32, 0)
+            if expr.else_block is None:
+                raise EmitError(
+                    "an `if` with no `else` has no value, so it cannot be "
+                    "used as one; add an `else` branch, or use the `if` as "
+                    "a statement and assign inside its body",
+                    expr.span,
+                )
+            raise EmitError(
+                "this `if` expression produced no value to bind",
+                expr.span,
+            )
 
         elif isinstance(expr, rast.UnaryOp):
             return self._emit_unary(expr)
