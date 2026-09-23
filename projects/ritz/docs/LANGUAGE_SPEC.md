@@ -663,38 +663,10 @@ an expression; use `match` where you want a value"). `match` remains the better
 choice when you are discriminating a tagged union, but not because `if` cannot
 produce a value.
 
-An `if`-expression **must** have its `else` arm, and ritz0 rejects one that
-does not:
-
-```ritz body expect-error="an `if` with no `else` has no value"
-let c = true
-let x = if c
-    1
-```
-
-An `if` with no `else` has no value on the path where the condition is false,
-so there is nothing for the binding to name. Until 2026-09-18 this compiled at
-exit 0: no `phi` was emitted, the `1` was discarded, and `x` was silently bound
-to `0` whichever way the condition went. It is rejected rather than defaulted
-because synthesising a zero for the missing arm would keep those programs
-compiling and merely make the wrong answer deliberate.
-
-The restriction is on *value* position only. An else-less `if` used as a
-statement — including as the last thing a procedure does — is ordinary code
-and is unaffected:
-
-```ritz body
-var r = 0
-let c = true
-if c
-    r = 1
-```
-
-One neighbouring case is still accepted and still wrong: a function that
-declares a return type and whose *last* statement is such an `if` falls through
-to an implicit `0` rather than being rejected. 41 sites in this repo are built
-on that behaviour, so it is being migrated before it becomes an error (AGAST
-#1429). Do not rely on it in new code.
+Always give an `if`-expression its `else` arm. ritz0 does **not** currently
+reject an else-less one: `let x = if c` followed by an indented `1` compiles,
+emits no `phi`, discards the `1`, and silently binds `x` to `0`. Verified on
+2026-09-12; treat it as a compiler bug to avoid, not a feature.
 
 ### 6.2 While Loop
 
