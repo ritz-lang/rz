@@ -3621,10 +3621,68 @@ class LLVMEmitter:
                 return f"cannot assign to field `{target.field}`: {llvm_msg}"
         return llvm_msg
 
+    @staticmethod
+    def _consumed_value(stmt: rast.Stmt) -> Optional[rast.Expr]:
+        """The expression whose value `stmt` consumes, if it consumes one.
+
+        Only these four statements bind or return a value. An `ExprStmt`
+        evaluates for effect, so its `if`/`match` is a statement even when it
+        is syntactically an expression.
+        """
+        if isinstance(stmt, (rast.LetStmt, rast.VarStmt, rast.ReturnStmt,
+                             rast.AssignStmt)):
+            return stmt.value
+        return None
+
+    def _find_valueless_if(self, expr: Optional[rast.Expr]) -> Optional[rast.If]:
+        """The first else-less `if` on a RESULT path of `expr`, or None.
+
+        A result path is where the value of `expr` comes from: the arms of an
+        `if`, the tail of a block, the body of a `match` arm. Nothing else is
+        walked — not a block's statements (they run for effect), not operands
+        or call arguments (AGAST #1435, deliberately out of scope), not lambda
+        bodies. Returning the innermost offender lets the diagnostic point at
+        the `if` that actually lacks the `else`, not the total one around it.
+        """
+        if isinstance(expr, rast.If):
+            if expr.else_block is None:
+                return expr
+            return (self._find_valueless_if(expr.then_block)
+                    or self._find_valueless_if(expr.else_block))
+        if isinstance(expr, rast.Block):
+            return self._find_valueless_if(expr.expr)
+        if isinstance(expr, rast.Match):
+            for arm in expr.arms:
+                found = self._find_valueless_if(arm.body)
+                if found is not None:
+                    return found
+        return None
+
+    def _reject_valueless_if(self, stmt: rast.Stmt) -> None:
+        """AGAST #1406: an else-less `if` has no value to bind or return.
+
+        Checked here, at the statement that consumes the value, because only
+        the statement knows the value is wanted. Four earlier versions decided
+        it inside the expression emitter and each rejected live code: a
+        procedure ending in a guard, ritzlib/hashmap.ritz:210, two tier
+        examples, and angelo's statement-position `match` whose arm ends in a
+        guard. None of those shapes is a consuming statement, so none is
+        reached from here.
+        """
+        offender = self._find_valueless_if(self._consumed_value(stmt))
+        if offender is not None:
+            raise EmitError(
+                "an `if` with no `else` has no value when its condition is "
+                "false, so it cannot be used as a value here; add an `else` "
+                "arm",
+                getattr(offender, 'span', None) or getattr(stmt, 'span', None),
+            )
+
     def _emit_stmt_inner(self, stmt: rast.Stmt) -> Union[bool, ir.Value, None]:
         """Emit a statement. Returns True if block terminated."""
         # Set debug location for source-level debugging
         self._set_debug_loc(stmt)
+        self._reject_valueless_if(stmt)
 
         if isinstance(stmt, rast.ReturnStmt):
             ret_type = self.current_fn.function_type.return_type
@@ -5496,7 +5554,12 @@ class LLVMEmitter:
             result = self._emit_if(expr)
             if result is not None:
                 return result
-            # If no value (shouldn't happen for well-formed if expressions), return 0
+            # No value. This DOES happen: an else-less `if` in a
+            # let/var/assign/return is rejected earlier (AGAST #1406,
+            # `_reject_valueless_if`), but one used as an operand or call
+            # argument still arrives here and still becomes this zero — a
+            # silent wrong answer tracked as AGAST #1435. Statement-position
+            # `if`s never reach this branch; they go straight to `_emit_if`.
             return ir.Constant(self.i32, 0)
 
         elif isinstance(expr, rast.UnaryOp):

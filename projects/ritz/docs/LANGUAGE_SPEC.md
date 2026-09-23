@@ -663,10 +663,48 @@ an expression; use `match` where you want a value"). `match` remains the better
 choice when you are discriminating a tagged union, but not because `if` cannot
 produce a value.
 
-Always give an `if`-expression its `else` arm. ritz0 does **not** currently
-reject an else-less one: `let x = if c` followed by an indented `1` compiles,
-emits no `phi`, discards the `1`, and silently binds `x` to `0`. Verified on
-2026-09-12; treat it as a compiler bug to avoid, not a feature.
+An `if`-expression **must** have its `else` arm, and ritz0 rejects one that
+does not:
+
+```ritz body expect-error="an `if` with no `else` has no value"
+let c = true
+let x = if c
+    1
+```
+
+An `if` with no `else` has no value on the path where the condition is false,
+so there is nothing for the binding to name. Before AGAST #1406 this compiled
+at exit 0: no `phi` was emitted, the `1` was discarded, and `x` was silently
+bound to `0` whichever way the condition went. It is rejected rather than
+defaulted because synthesising a zero for the missing arm would keep those
+programs compiling and merely make the wrong answer deliberate.
+
+The rule applies wherever a `let`, `var`, assignment or `return` takes the
+`if`'s value — including through the arms of an enclosing `if`/`else`, the
+last line of a block, or the arm of a `match` that is itself being bound. The
+diagnostic points at the `if` that lacks the `else`, which in an
+`if`/`else if` chain is the innermost one.
+
+An else-less `if` used as a *statement* is ordinary code and is unaffected —
+including as the last thing a procedure does, and as the last thing in an arm
+of a `match` that is itself a statement:
+
+```ritz body
+var r = 0
+let c = true
+if c
+    r = 1
+```
+
+Two neighbouring cases are still accepted and still wrong. Do not rely on
+either in new code:
+
+- An else-less `if` used as an operand or call argument (`5 + if c ...`)
+  still evaluates to `0`. Tracked as AGAST #1435.
+- A function that declares a return type and whose *last* statement is such
+  an `if` falls through to an implicit `0` rather than being rejected. Sites
+  in this repo are built on that behaviour, so it is being migrated before it
+  becomes an error (AGAST #1429).
 
 ### 6.2 While Loop
 
