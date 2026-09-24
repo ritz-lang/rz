@@ -9,15 +9,18 @@
 # - Epsilon transitions for alternation/optionals
 # - State arrays pre-allocated on stack (ritz1 bootstrap limitation)
 
+import ritzlib.sys
+
 # Transition kinds
 const TR_CHAR: i32 = 0      # Single character match
 const TR_RANGE: i32 = 1     # Character range [lo..hi]
 const TR_EPSILON: i32 = 2   # Epsilon (empty) transition
 const TR_ANY: i32 = 3       # Match any character (.)
 
-# Pre-allocated limits for ritz1 bootstrap
-const MAX_STATES: i32 = 256
-const MAX_TRANS: i32 = 512
+# Capacity is NOT a constant here: the caller owns the storage and passes its
+# size to nfa_init (ritz1/src/main.ritz sizes it). Two dead constants,
+# MAX_STATES = 256 and MAX_TRANS = 512, used to sit here, referenced nowhere
+# and disagreeing with the real 4096/8192 storage (#1433).
 
 # NOTE: Using i64 for all non-pointer fields to ensure 8-byte alignment for ritz1 self-hosting
 struct NFAState
@@ -51,9 +54,15 @@ struct NFA
   state_trans_offset: *i64
   state_trans_count: *i64
   trans_indices: *i64
+  max_states: i64
+  max_trans: i64
 
-# Initialize an NFA with pre-allocated storage
-fn nfa_init(nfa: *NFA, states: *NFAState, trans: *Transition, sto: *i64, stc: *i64, ti: *i64) -> i32
+# Initialize an NFA with pre-allocated storage.
+#
+# max_states sizes `states`, `sto` and `stc`; max_trans sizes `trans` and `ti`.
+# They are i32 on purpose: every nfa_add_* keeps its count below its capacity,
+# so count <= 2^31-1 and narrowing a count to an i32 ID is lossless (#1436).
+fn nfa_init(nfa: *NFA, states: *NFAState, trans: *Transition, sto: *i64, stc: *i64, ti: *i64, max_states: i32, max_trans: i32) -> i32
   nfa.states = states
   nfa.state_count = 0
   nfa.transitions = trans
@@ -62,11 +71,40 @@ fn nfa_init(nfa: *NFA, states: *NFAState, trans: *Transition, sto: *i64, stc: *i
   nfa.state_trans_offset = sto
   nfa.state_trans_count = stc
   nfa.trans_indices = ti
+  nfa.max_states = max_states
+  nfa.max_trans = max_trans
   0
+
+# Overflowing the caller's storage would silently overwrite ritz1's stack, so
+# stop instead. Not recoverable: the grammar is fixed at build time, so the
+# fix is to grow the storage in main.ritz.
+fn nfa_eprint(s: *u8) -> i32
+  var len: i64 = 0
+  while *(s + len) != 0
+    len = len + 1
+  sys_write(2, s, len)
+  0
+
+fn nfa_capacity_exceeded(what: *u8) -> i32
+  nfa_eprint(c"[FATAL] NFA ")
+  nfa_eprint(what)
+  nfa_eprint(c" capacity exceeded - grow the storage passed to nfa_init\n")
+  sys_exit(1)
+  0
+
+# Index of the next transition slot, after checking there is one.
+fn nfa_next_trans(nfa: *NFA) -> i32
+  if nfa.trans_count >= nfa.max_trans
+    nfa_capacity_exceeded(c"transition")
+  # Lossless: trans_count < max_trans, which is an i32.
+  nfa.trans_count as i32
 
 # Add a new state, returns state ID
 fn nfa_add_state(nfa: *NFA, is_accept: i32, token_type: i32) -> i32
-  let id: i32 = nfa.state_count
+  if nfa.state_count >= nfa.max_states
+    nfa_capacity_exceeded(c"state")
+  # Lossless: state_count < max_states, which is an i32.
+  let id: i32 = nfa.state_count as i32
   let state_ptr: *NFAState = nfa.states + id
   state_ptr.id = id
   state_ptr.is_accept = is_accept
@@ -76,7 +114,7 @@ fn nfa_add_state(nfa: *NFA, is_accept: i32, token_type: i32) -> i32
 
 # Add a character transition
 fn nfa_add_char_trans(nfa: *NFA, from: i32, to: i32, ch: i32) -> i32
-  let idx: i32 = nfa.trans_count
+  let idx: i32 = nfa_next_trans(nfa)
   let trans_ptr: *Transition = nfa.transitions + idx
   trans_ptr.kind = TR_CHAR
   trans_ptr.char_lo = ch
@@ -88,7 +126,7 @@ fn nfa_add_char_trans(nfa: *NFA, from: i32, to: i32, ch: i32) -> i32
 
 # Add a character range transition [lo..hi]
 fn nfa_add_range_trans(nfa: *NFA, from: i32, to: i32, lo: i32, hi: i32) -> i32
-  let idx: i32 = nfa.trans_count
+  let idx: i32 = nfa_next_trans(nfa)
   let trans_ptr: *Transition = nfa.transitions + idx
   trans_ptr.kind = TR_RANGE
   trans_ptr.char_lo = lo
@@ -100,7 +138,7 @@ fn nfa_add_range_trans(nfa: *NFA, from: i32, to: i32, lo: i32, hi: i32) -> i32
 
 # Add an epsilon transition
 fn nfa_add_epsilon_trans(nfa: *NFA, from: i32, to: i32) -> i32
-  let idx: i32 = nfa.trans_count
+  let idx: i32 = nfa_next_trans(nfa)
   let trans_ptr: *Transition = nfa.transitions + idx
   trans_ptr.kind = TR_EPSILON
   trans_ptr.char_lo = 0
@@ -112,7 +150,7 @@ fn nfa_add_epsilon_trans(nfa: *NFA, from: i32, to: i32) -> i32
 
 # Add a "match any" transition (.)
 fn nfa_add_any_trans(nfa: *NFA, from: i32, to: i32) -> i32
-  let idx: i32 = nfa.trans_count
+  let idx: i32 = nfa_next_trans(nfa)
   let trans_ptr: *Transition = nfa.transitions + idx
   trans_ptr.kind = TR_ANY
   trans_ptr.char_lo = 0

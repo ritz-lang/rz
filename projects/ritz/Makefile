@@ -186,28 +186,46 @@ matrix-full: regen-check | _matrix_ritz1_built
 	@echo "    This will incrementally rebuild ritz1_selfhosted (~3 min if ritz1 source changed)."
 	@$(PYTHON) tools/run_regression_matrix.py --rebuild
 
-# Guard against the cardinal sin: hand-editing parser_gen.ritz instead of
+# Guard against the cardinal sin: hand-editing a generated file instead of
 # regenerating from grammars/ritz1.grammar.  Runs the generator into a tmp
-# dir and diffs against the committed parser_gen.ritz.  If they differ, the
-# committed file has drifted from the grammar — fix the grammar, regen, or
-# both.
+# dir and diffs each generated file against its committed copy.  If they
+# differ, the committed file has drifted from the grammar or the generator —
+# fix the source, regen, or both.
+#
+# Covers every generated file that is committed verbatim: parser_gen,
+# tokens_gen and lexer_setup_gen (the last was unchecked until #1436, which had
+# to change the generator and the generated file in step). ast_helpers.ritz is
+# NOT checked: ritz1's copy is hand-maintained and has diverged by design.
+#
+# A generator crash fails the check. It used to pass: the diff ran behind `&&`,
+# so a failed generator skipped it and the trailing `rm` returned 0.
 #
 # See docs/VALIDATION.md "Hard rules" — the grammar is the source of truth.
+REGEN_PAIRS := parser.ritz:parser_gen.ritz tokens.ritz:tokens_gen.ritz lexer_setup_gen.ritz:lexer_setup_gen.ritz
 regen-check:
-	@TMPDIR=$$(mktemp -d) && \
-	  $(PYTHON) tools/ritzgen_py/ritz_generator.py grammars/ritz1.grammar \
-	    --monolithic --output-dir $$TMPDIR >/dev/null 2>&1 && \
-	  if ! diff -q $$TMPDIR/parser.ritz ritz1/src/parser_gen.ritz >/dev/null 2>&1; then \
-	    echo "❌ regen-check FAILED — parser_gen.ritz has drifted from grammars/ritz1.grammar." ; \
-	    echo "   Either:" ; \
-	    echo "     (a) edit grammars/ritz1.grammar and regenerate," ; \
-	    echo "     (b) revert hand-edits to ritz1/src/parser_gen.ritz." ; \
-	    echo "   First few diff lines:" ; \
-	    diff $$TMPDIR/parser.ritz ritz1/src/parser_gen.ritz | head -10 ; \
+	@TMPDIR=$$(mktemp -d) ; \
+	  if ! $(PYTHON) tools/ritzgen_py/ritz_generator.py grammars/ritz1.grammar \
+	    --monolithic --output-dir $$TMPDIR >$$TMPDIR/.gen.log 2>&1; then \
+	    echo "❌ regen-check FAILED — the generator itself failed:" ; \
+	    tail -10 $$TMPDIR/.gen.log ; \
 	    rm -rf $$TMPDIR ; \
 	    exit 1 ; \
 	  fi ; \
-	  rm -rf $$TMPDIR
+	  status=0 ; \
+	  for pair in $(REGEN_PAIRS); do \
+	    gen=$${pair%%:*} ; committed=ritz1/src/$${pair##*:} ; \
+	    if ! diff -q $$TMPDIR/$$gen $$committed >/dev/null 2>&1; then \
+	      echo "❌ regen-check FAILED — $$committed has drifted from grammars/ritz1.grammar + the generator." ; \
+	      echo "   Either:" ; \
+	      echo "     (a) edit the grammar or tools/ritzgen_py and regenerate," ; \
+	      echo "     (b) revert hand-edits to $$committed." ; \
+	      echo "   First few diff lines:" ; \
+	      diff $$TMPDIR/$$gen $$committed | head -10 ; \
+	      status=1 ; \
+	    fi ; \
+	  done ; \
+	  rm -rf $$TMPDIR ; \
+	  exit $$status
 
 # Internal: ensure ritz1 binary is up-to-date before running the matrix.
 .PHONY: _matrix_ritz1_built
@@ -238,7 +256,7 @@ help:
 	@echo "  make valgrind - Run valgrind memory checks on Tier 1 examples"
 	@echo "  make matrix       - Pre-commit gate: incremental ritz1 + ritz1-only matrix (~30-60s)"
 	@echo "  make matrix-full  - Pre-push gate: incremental ritz1 + selfhost + full matrix (~4-5min)"
-	@echo "  make regen-check  - Verify parser_gen.ritz matches a fresh regen from the grammar"
+	@echo "  make regen-check  - Verify the generated ritz1 sources match a fresh regen from the grammar"
 	@echo "  make regression       - Full regression suite (all 4 tiers)"
 	@echo "  make regression-quick - Quick regression (skip bootstrap)"
 	@echo "  make check-no-s-strings - Guard that no s\"...\" literals leak back in"
