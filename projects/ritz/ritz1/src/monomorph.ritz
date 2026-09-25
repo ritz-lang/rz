@@ -271,22 +271,73 @@ fn add_struct_from_mangled_name(m: *Module, name: *u8, len: i32)
     let suffix: *u8 = name + dollar_pos
     let suffix_len: i32 = len - dollar_pos
 
+    # `Vec$T`: the unsubstituted placeholder of a generic signature, not an
+    # instantiation.  A lone ASCII capital after `$` is a type parameter —
+    # unless the module defines a concrete struct by that name: `Vec<P>` for
+    # a user `struct P` mangles to `Vec$P`, the same shape (AGAST #1487).
+    if suffix_len == 2
+        let ch: i32 = *(suffix + 1) as i32
+        if ch >= 65 and ch <= 90
+            if find_concrete_struct(m, suffix + 1, 1) == null
+                return
+
     add_struct_instantiation(base_name, base_len, suffix, suffix_len)
+
+# Find a non-generic struct by name.
+fn find_concrete_struct(m: *Module, name: *u8, name_len: i32) -> *StructDef
+    var st: *StructDef = m.structs
+    while st != null
+        if st.type_params == null
+            if st.name_len == name_len
+                if memcmp(st.name, name, name_len as i64) == 0
+                    return st
+        st = st.next
+    return null
+
+# Register the generic-struct instantiations named by a fn's signature.
+# Every type kind counts, not just by-value TYPE_STRUCT: `v: @&Vec<T>`
+# specialised at u8 is a TYPE_REF named `Vec$u8`, and the body's `v.len`
+# needs `struct Vec$u8` to exist.  ritz1 used to paper over this with a
+# hard-coded Vec$u8/i32/... layout table (AGAST #1440); without it, the
+# layout must come from instantiating `struct Vec<T>`.
+fn collect_struct_types_from_signature(m: *Module, f: *FnDef)
+    if f.return_type_name != null
+        add_struct_from_mangled_name(m, f.return_type_name, f.return_type_name_len)
+    var p: *Param = f.params
+    while p != null
+        if p.param_type_name != null
+            add_struct_from_mangled_name(m, p.param_type_name, p.param_type_name_len)
+        p = p.next
+
+# Same, for a specialised fn: its signature and every var-decl type in its
+# body.  Only struct instantiations are gathered here — fn instantiations in
+# a specialised body are registered by clone_body as it substitutes them.
+fn collect_struct_types_from_fn(m: *Module, f: *FnDef)
+    collect_struct_types_from_signature(m, f)
+    collect_struct_types_from_stmts(m, f.body)
+
+fn collect_struct_types_from_stmts(m: *Module, body: *Stmt)
+    var s: *Stmt = body
+    while s != null
+        let k: i32 = s.kind
+        if k == STMT_VAR_DECL
+            if s.var_type_name != null
+                add_struct_from_mangled_name(m, s.var_type_name, s.var_type_name_len)
+        else if k == STMT_IF
+            collect_struct_types_from_stmts(m, s.if_then)
+            collect_struct_types_from_stmts(m, s.if_else)
+        else if k == STMT_WHILE or k == STMT_LOOP
+            collect_struct_types_from_stmts(m, s.while_body)
+        else if k == STMT_FOR
+            collect_struct_types_from_stmts(m, s.for_body)
+        s = s.next
 
 fn collect_instantiations_from_module(m: *Module)
     # Walk all non-generic functions to find instantiations
     var f: *FnDef = m.functions
     while f != null
         if f.type_params == null
-            # Check return type for generic struct usage
-            if f.return_type == TYPE_STRUCT and f.return_type_name != null
-                add_struct_from_mangled_name(m, f.return_type_name, f.return_type_name_len)
-            # Check parameters for generic struct usage
-            var p: *Param = f.params
-            while p != null
-                if p.param_type == TYPE_STRUCT and p.param_type_name != null
-                    add_struct_from_mangled_name(m, p.param_type_name, p.param_type_name_len)
-                p = p.next
+            collect_struct_types_from_signature(m, f)
             # Reset local-var tracker per fn body, then seed from fn params so
             # `fn foo(v: Vec<T>)` lets `v.push(...)` resolve UFCS-style.
             reset_local_var_tracker()
@@ -337,7 +388,7 @@ fn collect_instantiations_from_module(m: *Module)
     # "ERROR: unhandled EXPR_MEMBER" inside vec_len$String.
     var g: *GlobalVarDef = m.globals
     while g != null
-        if g.var_type == TYPE_STRUCT and g.type_name != null
+        if g.type_name != null
             add_struct_from_mangled_name(m, g.type_name, g.type_name_len)
         g = g.next
 
@@ -352,8 +403,9 @@ fn collect_from_stmt(m: *Module, s: *Stmt)
     if k == STMT_EXPR
         collect_from_expr(m, s.expr)
     else if k == STMT_VAR_DECL
-        # Check if variable type is a generic struct
-        if s.var_type == TYPE_STRUCT and s.var_type_name != null
+        # Check if variable type is a generic struct — by value or behind a
+        # pointer/reference (`var v: *Vec<u8>` needs Vec$u8 just the same).
+        if s.var_type_name != null
             add_struct_from_mangled_name(m, s.var_type_name, s.var_type_name_len)
         # Record local-var → Vec/Span suffix mapping for UFCS-driven generic
         # instantiation.  Two paths:
@@ -1185,6 +1237,38 @@ fn clone_and_specialize_struct(m: *Module, template: *StructDef, suffix: *u8, su
 
     return specialized
 
+# TYPE_* for a primitive type name as it appears in a mangled suffix
+# (`$u16` -> "u16"), or 0 if the name is not a primitive.
+fn primitive_type_from_name(name: *u8, len: i32) -> i32
+    if name == null
+        return 0
+    if len == 2
+        if memcmp(name, c"u8", 2) == 0
+            return TYPE_U8
+        if memcmp(name, c"i8", 2) == 0
+            return TYPE_I8
+    if len == 3
+        if memcmp(name, c"u16", 3) == 0
+            return TYPE_U16
+        if memcmp(name, c"i16", 3) == 0
+            return TYPE_I16
+        if memcmp(name, c"u32", 3) == 0
+            return TYPE_U32
+        if memcmp(name, c"i32", 3) == 0
+            return TYPE_I32
+        if memcmp(name, c"u64", 3) == 0
+            return TYPE_U64
+        if memcmp(name, c"i64", 3) == 0
+            return TYPE_I64
+        if memcmp(name, c"f32", 3) == 0
+            return TYPE_F32
+        if memcmp(name, c"f64", 3) == 0
+            return TYPE_F64
+    if len == 4
+        if memcmp(name, c"bool", 4) == 0
+            return TYPE_BOOL
+    0
+
 fn clone_struct_fields(fields: *StructField, type_param: *u8, type_param_len: i32, subst_type: i32, subst_name: *u8, subst_len: i32, suffix: *u8, suffix_len: i32) -> *StructField
     if fields == null
         return null
@@ -1212,14 +1296,36 @@ fn clone_struct_fields(fields: *StructField, type_param: *u8, type_param_len: i3
             cloned.field_type_name_len = fields.field_type_name_len
     else
         cloned.field_type = fields.field_type
-        cloned.field_type_name = null
-        cloned.field_type_name_len = 0
+        cloned.field_type_name = fields.field_type_name
+        cloned.field_type_name_len = fields.field_type_name_len
 
     # Copy array info
     cloned.array_size = fields.array_size
     cloned.array_elem_type = fields.array_elem_type
     cloned.array_elem_type_name = fields.array_elem_type_name
     cloned.array_elem_type_name_len = fields.array_elem_type_name_len
+
+    # `data: *T` — substitute the pointee.  The parser records a struct
+    # pointee in field_type_name and a primitive one in array_elem_type; `T`
+    # parses as a struct named "T".  Dropping it (as this used to) left
+    # `Vec$Token.data + i` striding by 1 byte instead of sizeof(Token); the
+    # hard-coded Vec$ layouts in the emitter hid that until #1440 removed them.
+    if fields.field_type == TYPE_PTR or fields.field_type == TYPE_REF or fields.field_type == TYPE_MUT_REF
+        if fields.field_type_name != null and fields.field_type_name_len == type_param_len
+            if memcmp(fields.field_type_name, type_param, type_param_len as i64) == 0
+                let prim: i32 = primitive_type_from_name(subst_name, subst_len)
+                if prim != 0
+                    cloned.field_type_name = null
+                    cloned.field_type_name_len = 0
+                    cloned.array_elem_type = prim
+                else if subst_type == TYPE_PTR
+                    # `*T` at T = *X is `**X`: the element is a pointer.
+                    cloned.field_type = TYPE_PTR_PTR
+                    cloned.field_type_name = subst_name
+                    cloned.field_type_name_len = subst_len
+                else
+                    cloned.field_type_name = subst_name
+                    cloned.field_type_name_len = subst_len
 
     # Clone rest of the list
     cloned.next = clone_struct_fields(fields.next, type_param, type_param_len, subst_type, subst_name, subst_len, suffix, suffix_len)
@@ -1275,6 +1381,7 @@ fn specialize_impl_methods(m: *Module, type_name: *u8, type_name_len: i32, suffi
     while method != null
         let specialized: *FnDef = specialize_impl_method(m, method, type_name, type_name_len, suffix, suffix_len, type_param_name, type_param_len, subst_type, subst_type_name, subst_type_len)
         if specialized != null
+            collect_struct_types_from_fn(m, specialized)
             # Add to module's function list
             if m.functions == null
                 m.functions = specialized
@@ -1390,12 +1497,26 @@ fn monomorphize_module(m: *Module)
     eprint_int(g_struct_count as i64)
     eprints_cstr(c"\n")
 
-    # Generate specialized structs first (functions may reference them)
-    for i in 0..g_struct_count
-        let name: *u8 = get_struct_instantiation_name(i)
-        let name_len: i32 = get_struct_instantiation_name_len(i)
-        let suffix: *u8 = get_struct_instantiation_suffix(i)
-        let suffix_len: i32 = get_struct_instantiation_suffix_len(i)
+    # Structs and fns are specialised to a fixpoint: specialising `vec_push<T>`
+    # at u8 yields a fn whose signature names `Vec$u8`, which is a struct
+    # instantiation that no call site spelled out; and specialising a struct
+    # specialises its impl methods, which may name further instantiations.
+    var s_done: i32 = 0
+    var i: i32 = 0
+    while s_done < g_struct_count or i < g_inst_count
+        s_done = specialize_pending_structs(m, s_done)
+        i = specialize_pending_fns(m, i)
+
+# Specialise struct instantiations [start, g_struct_count); returns the new
+# high-water mark.
+fn specialize_pending_structs(m: *Module, start: i32) -> i32
+    var si: i32 = start
+    while si < g_struct_count
+        let name: *u8 = get_struct_instantiation_name(si)
+        let name_len: i32 = get_struct_instantiation_name_len(si)
+        let suffix: *u8 = get_struct_instantiation_suffix(si)
+        let suffix_len: i32 = get_struct_instantiation_suffix_len(si)
+        si = si + 1
 
         # Find the generic template
         let template: *StructDef = find_generic_struct(m, name, name_len)
@@ -1411,10 +1532,13 @@ fn monomorphize_module(m: *Module)
             # Also specialize impl block methods for this struct
             specialize_impl_methods(m, name, name_len, suffix, suffix_len)
 
-    # Generate specialized functions
-    # Use index-based loop instead of for-loop to handle newly added instantiations
-    # during cloning (e.g., vec_push<T> calls vec_ensure_cap<T> which calls vec_grow<T>)
-    var i: i32 = 0
+    si
+
+# Specialise fn instantiations [start, g_inst_count); returns the new
+# high-water mark.  Index-based because cloning adds instantiations as it goes
+# (e.g., vec_push<T> calls vec_ensure_cap<T> which calls vec_grow<T>).
+fn specialize_pending_fns(m: *Module, start: i32) -> i32
+    var i: i32 = start
     while i < g_inst_count
         let name: *u8 = get_instantiation_name(i)
         let name_len: i32 = get_instantiation_name_len(i)
@@ -1437,4 +1561,7 @@ fn monomorphize_module(m: *Module)
                     while f.next != null
                         f = f.next
                     f.next = specialized
+                collect_struct_types_from_fn(m, specialized)
         i = i + 1
+
+    i

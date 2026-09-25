@@ -1010,34 +1010,6 @@ fn emit_extern_declarations(s: *EmitterState)
                     emit_str(s, c"(...)\n")
     if s.extern_count > 0
         emit_str(s, c"\n")
-# Check if a struct name is one of the builtin types (already emitted by emit_builtin_struct_types)
-fn is_builtin_struct(name: *u8, len: i32) -> i32
-    if name_eq(name, len, c"Vec$u8", 6) == 1
-        return 1
-    if name_eq(name, len, c"Vec$i32", 7) == 1
-        return 1
-    if name_eq(name, len, c"Vec$i64", 7) == 1
-        return 1
-    if name_eq(name, len, c"Vec$Token", 9) == 1
-        return 1
-    if name_eq(name, len, c"Vec$LineBounds", 14) == 1
-        return 1
-    if name_eq(name, len, c"Span$u8", 7) == 1
-        return 1
-    if name_eq(name, len, c"Span$i32", 8) == 1
-        return 1
-    if name_eq(name, len, c"LineBounds", 10) == 1
-        return 1
-    if name_eq(name, len, c"OptDef", 6) == 1
-        return 1
-    if name_eq(name, len, c"PosDef", 6) == 1
-        return 1
-    if name_eq(name, len, c"ArgParser", 9) == 1
-        return 1
-    if name_eq(name, len, c"String", 6) == 1
-        return 1
-    0
-
 # Returns 1 if every value-type struct dependency of `st` has already been
 # emitted, 0 otherwise.  Pointer fields (TYPE_PTR / TYPE_PTR_PTR) are not
 # dependencies — LLVM's opaque `ptr` lets us reference a forward-declared
@@ -1097,9 +1069,6 @@ fn emit_struct_types(s: *EmitterState)
             if st.type_params != null
                 st = st.next
                 continue
-            if is_builtin_struct(st.name, st.name_len) == 1
-                st = st.next
-                continue
             if was_struct_emitted(s, st.name, st.name_len) == 1
                 st = st.next
                 continue
@@ -1117,9 +1086,6 @@ fn emit_struct_types(s: *EmitterState)
     var st2: *StructDef = s.module.structs
     while st2 != null
         if st2.type_params != null
-            st2 = st2.next
-            continue
-        if is_builtin_struct(st2.name, st2.name_len) == 1
             st2 = st2.next
             continue
         if was_struct_emitted(s, st2.name, st2.name_len) == 1
@@ -1655,108 +1621,27 @@ fn emit_const_arrays(s: *EmitterState)
     emit_str(s, c"\n")
 
 # =============================================================================
-# Builtin Struct Types (from ritzlib)
+# The string-literal type
 # =============================================================================
-# Hardcoded struct layouts for commonly used ritzlib types.
-# This allows ritz1 to compile code using Vec<T>, Span<T>, ArgParser, etc.
-# without requiring full import resolution.
+# Struct layouts come from source: the module's own structs, imported ones,
+# and monomorphised instantiations of generic ones (`Vec$u8` from
+# `struct Vec<T>`).  ritz1 used to carry hard-coded copies of ~20 of them
+# (NFA, Transition, ArgParser, String, LineBounds, Vec$*, ...) which were
+# installed ahead of the source and shadowed it, so every edit to one of
+# those structs needed a matching hand-edit here, and any user program that
+# named a struct `Transition` got ritz1's layout instead of its own.  The
+# copies are gone (AGAST #1440).
+#
+# The one exception is `Span$u8`: a bare `"..."` literal lowers to a
+# `%Span$u8` aggregate (AGAST #98), so the type is needed even by a program
+# that imports nothing.  It is supplied only when the source does not define
+# it, and through the same StructDef path as every other struct.  When the
+# source DOES define it (an imported `Span<T>` instantiated at u8), the
+# source wins — and because the literal lowering hard-codes `{ ptr, i64 }`,
+# a source layout that differs is an error, not a silent shadow.
 
-fn emit_builtin_struct_types(s: *EmitterState)
-    # Vec<T> = { ptr, i64, i64 } - data, len, cap
-    # Common instantiations: Vec$u8, Vec$i32, Vec$i64, Vec$Token, Vec$LineBounds
-    emit_str(s, c"%Vec$u8 = type { ptr, i64, i64 }\n")
-    emit_str(s, c"%Vec$i8 = type { ptr, i64, i64 }\n")
-    emit_str(s, c"%Vec$u16 = type { ptr, i64, i64 }\n")
-    emit_str(s, c"%Vec$i16 = type { ptr, i64, i64 }\n")
-    emit_str(s, c"%Vec$u32 = type { ptr, i64, i64 }\n")
-    emit_str(s, c"%Vec$i32 = type { ptr, i64, i64 }\n")
-    emit_str(s, c"%Vec$u64 = type { ptr, i64, i64 }\n")
-    emit_str(s, c"%Vec$i64 = type { ptr, i64, i64 }\n")
-    emit_str(s, c"%Vec$Token = type { ptr, i64, i64 }\n")
-    emit_str(s, c"%Vec$LineBounds = type { ptr, i64, i64 }\n")
-
-    # Span<T> = { ptr, i64 } - ptr, len
-    emit_str(s, c"%Span$u8 = type { ptr, i64 }\n")
-    emit_str(s, c"%Span$i32 = type { ptr, i64 }\n")
-
-    # LineBounds = { i64, i64 } - start, length
-    emit_str(s, c"%LineBounds = type { i64, i64 }\n")
-
-    # OptDef = { i8, ptr, ptr, ptr, ptr, i32, i32, ptr }
-    # short_name, long_name, value_name, description, default_value, opt_type, is_set, value
-    emit_str(s, c"%OptDef = type { i8, ptr, ptr, ptr, ptr, i32, i32, ptr }\n")
-
-    # PosDef = { ptr, ptr, i32, i32 } - name, description, min_count, max_count
-    emit_str(s, c"%PosDef = type { ptr, ptr, i32, i32 }\n")
-
-    # ArgParser = { ptr, ptr, [32 x %OptDef], i32, [8 x %PosDef], i32, [256 x ptr], i32, ptr }
-    emit_str(s, c"%ArgParser = type { ptr, ptr, [32 x %OptDef], i32, [8 x %PosDef], i32, [256 x ptr], i32, ptr }\n")
-
-    # String = { %Vec$u8 } = { { ptr, i64, i64 } } = { ptr, i64, i64 }
-    # String wraps Vec<u8> internally - same layout
-    emit_str(s, c"%String = type { ptr, i64, i64 }\n")
-
-    # NFA-related types (used by lexer/parser)
-    # NFAFragment = { i64, i64 } - start, end
-    emit_str(s, c"%NFAFragment = type { i64, i64 }\n")
-    # TokenPattern = { i64, i64, %NFAFragment } - token_type, priority, frag
-    emit_str(s, c"%TokenPattern = type { i64, i64, %NFAFragment }\n")
-    # NFAState = { i64, i64, i64 } - id, is_accept, token_type
-    emit_str(s, c"%NFAState = type { i64, i64, i64 }\n")
-    # Transition = { i64, i64, i64, i64, i64 } - kind, char_lo, char_hi, from_state, to_state
-    emit_str(s, c"%Transition = type { i64, i64, i64, i64, i64 }\n")
-    # NFA = { ptr, i64, ptr, i64, i64, ptr, ptr, ptr, i64, i64 } - states, state_count,
-    # transitions, trans_count, start_state, state_trans_offset, state_trans_count,
-    # trans_indices, max_states, max_trans
-    # (state_trans_offset..trans_indices: Tier 1 per-state transition index;
-    #  max_states/max_trans: storage capacity checked by nfa_add_* (#1433/#1436))
-    # MUST match `struct NFA` in src/nfa.ritz AND the field table in
-    # register_builtin_structs — this copy shadows the source definition.
-    emit_str(s, c"%NFA = type { ptr, i64, ptr, i64, i64, ptr, ptr, ptr, i64, i64 }\n")
-
-    emit_str(s, c"\n")
-
-    # Mark all builtin types as emitted so emit_struct_types won't re-emit them
-    mark_struct_emitted(s, c"Vec$u8", 6)
-    mark_struct_emitted(s, c"Vec$i8", 6)
-    mark_struct_emitted(s, c"Vec$u16", 7)
-    mark_struct_emitted(s, c"Vec$i16", 7)
-    mark_struct_emitted(s, c"Vec$u32", 7)
-    mark_struct_emitted(s, c"Vec$i32", 7)
-    mark_struct_emitted(s, c"Vec$u64", 7)
-    mark_struct_emitted(s, c"Vec$i64", 7)
-    mark_struct_emitted(s, c"Vec$Token", 9)
-    mark_struct_emitted(s, c"Vec$LineBounds", 14)
-    mark_struct_emitted(s, c"Span$u8", 7)
-    mark_struct_emitted(s, c"Span$i32", 8)
-    mark_struct_emitted(s, c"LineBounds", 10)
-    mark_struct_emitted(s, c"OptDef", 6)
-    mark_struct_emitted(s, c"PosDef", 6)
-    mark_struct_emitted(s, c"ArgParser", 9)
-    mark_struct_emitted(s, c"String", 6)
-    # Also mark generic base names (not instantiations) to prevent emission
-    # These are template types that shouldn't be emitted without type parameters
-    # Note: Vec<T> and Span<T> in ritzlib have type_params set, so they'll be skipped
-    # via the `st.type_params != null` check. We mark Vec here to prevent any
-    # accidental emission of a non-generic Vec. We do NOT mark Span because
-    # ast.ritz has a non-generic Span struct that needs to be emitted.
-    mark_struct_emitted(s, c"Vec", 3)
-    # NFA-related types
-    mark_struct_emitted(s, c"NFAFragment", 11)
-    mark_struct_emitted(s, c"TokenPattern", 12)
-    mark_struct_emitted(s, c"NFAState", 8)
-    mark_struct_emitted(s, c"Transition", 10)
-    mark_struct_emitted(s, c"NFA", 3)
-
-# =============================================================================
-# Builtin Struct AST Registration
-# =============================================================================
-# Add builtin struct definitions to module AST so find_struct() can find them.
-# This enables field access on imported struct types like ArgParser.
-
-fn make_field(name: *u8, len: i32, ty: i32) -> *StructField
-    # StructField is 64 bytes (with alignment)
-    let f: *StructField = malloc(64) as *StructField
+fn string_literal_field(name: *u8, len: i32, ty: i32) -> *StructField
+    let f: *StructField = malloc(64) as *StructField   # sizeof(StructField)
     f.name = name
     f.name_len = len
     f.field_type = ty
@@ -1769,265 +1654,59 @@ fn make_field(name: *u8, len: i32, ty: i32) -> *StructField
     f.next = null
     f
 
-# Like make_field but records the pointer's pointee type name. Needed for
-# Vec$X.data etc. so get_ptr_elem_size can look up sizeof(X) instead of
-# defaulting to 1 byte — which otherwise breaks `v.data + v.len` pointer
-# arithmetic for struct-typed generics (Token-sized stride emitted as 1).
-fn make_ptr_field(name: *u8, len: i32, pointee_name: *u8, pointee_name_len: i32) -> *StructField
-    let f: *StructField = malloc(64) as *StructField
-    f.name = name
-    f.name_len = len
-    f.field_type = TYPE_PTR
-    f.field_type_name = pointee_name
-    f.field_type_name_len = pointee_name_len
-    f.array_size = 0
-    f.array_elem_type = 0
-    f.array_elem_type_name = null
-    f.array_elem_type_name_len = 0
-    f.next = null
-    f
+fn find_module_struct(m: *Module, name: *u8, len: i32) -> *StructDef
+    var st: *StructDef = m.structs
+    while st != null
+        if st.type_params == null
+            if name_eq(st.name, st.name_len, name, len) == 1
+                return st
+        st = st.next
+    null
 
-# Like make_field but records the pointer's pointee primitive type via
-# array_elem_type (the channel get_ptr_elem_size reads for primitive
-# pointees, e.g. Vec$i32.data → 4, Vec$i64.data → 8).
-fn make_ptr_prim_field(name: *u8, len: i32, pointee_type: i32) -> *StructField
-    let f: *StructField = malloc(64) as *StructField
-    f.name = name
-    f.name_len = len
-    f.field_type = TYPE_PTR
-    f.field_type_name = null
-    f.field_type_name_len = 0
-    f.array_size = 0
-    f.array_elem_type = pointee_type
-    f.array_elem_type_name = null
-    f.array_elem_type_name_len = 0
-    f.next = null
-    f
+# Returns 1 if `st` has exactly the `{ ptr, i64 }` shape string literals are
+# lowered to.
+fn is_string_literal_layout(st: *StructDef) -> i32
+    let f1: *StructField = st.fields
+    if f1 == null
+        return 0
+    if f1.field_type != TYPE_PTR
+        return 0
+    let f2: *StructField = f1.next
+    if f2 == null
+        return 0
+    if f2.field_type != TYPE_I64
+        return 0
+    if f2.next != null
+        return 0
+    1
 
-fn make_array_field(name: *u8, len: i32, ty: i32, arr_size: i32, elem_ty: i32) -> *StructField
-    # StructField is 64 bytes (with alignment)
-    let f: *StructField = malloc(64) as *StructField
-    f.name = name
-    f.name_len = len
-    f.field_type = ty
-    f.field_type_name = null
-    f.field_type_name_len = 0
-    f.array_size = arr_size
-    f.array_elem_type = elem_ty
-    f.array_elem_type_name = null
-    f.array_elem_type_name_len = 0
-    f.next = null
-    f
-
-fn make_array_struct_field(name: *u8, len: i32, ty: i32, arr_size: i32, elem_ty: i32, elem_name: *u8, elem_name_len: i32) -> *StructField
-    # StructField is 64 bytes (with alignment)
-    let f: *StructField = malloc(64) as *StructField
-    f.name = name
-    f.name_len = len
-    f.field_type = ty
-    f.field_type_name = null
-    f.field_type_name_len = 0
-    f.array_size = arr_size
-    f.array_elem_type = elem_ty
-    f.array_elem_type_name = elem_name
-    f.array_elem_type_name_len = elem_name_len
-    f.next = null
-    f
-
-fn make_struct(name: *u8, len: i32, fields: *StructField) -> *StructDef
-    # StructDef: name(8) + name_len(4) + pad(4) + fields(8) + next(8) + type_params(8) = 40 bytes
-    let s: *StructDef = malloc(40) as *StructDef
-    s.name = name
-    s.name_len = len
-    s.fields = fields
-    s.next = null
-    s.type_params = null
-    s
-
-fn link_fields_2(f1: *StructField, f2: *StructField) -> *StructField
-    f1.next = f2
-    f1
-
-fn link_fields_3(f1: *StructField, f2: *StructField, f3: *StructField) -> *StructField
-    f1.next = f2
-    f2.next = f3
-    f1
-
-fn register_builtin_structs(m: *Module)
-    # Vec$u8 = { *u8 data, i64 len, i64 cap }
-    var vec_u8_fields: *StructField = make_ptr_prim_field(c"data", 4, TYPE_U8)
-    vec_u8_fields = link_fields_3(vec_u8_fields, make_field(c"len", 3, TYPE_I64), make_field(c"cap", 3, TYPE_I64))
-    var vec_u8: *StructDef = make_struct(c"Vec$u8", 6, vec_u8_fields)
-
-    # Vec$i8 = { *i8 data, i64 len, i64 cap }
-    var vec_i8_fields: *StructField = make_ptr_prim_field(c"data", 4, TYPE_I8)
-    vec_i8_fields = link_fields_3(vec_i8_fields, make_field(c"len", 3, TYPE_I64), make_field(c"cap", 3, TYPE_I64))
-    var vec_i8: *StructDef = make_struct(c"Vec$i8", 6, vec_i8_fields)
-
-    # Vec$u16 = { *u16 data, i64 len, i64 cap }
-    # Required for vec_push<u16> generic-body member access (test_issue_vec_push_u16_method).
-    var vec_u16_fields: *StructField = make_ptr_prim_field(c"data", 4, TYPE_U16)
-    vec_u16_fields = link_fields_3(vec_u16_fields, make_field(c"len", 3, TYPE_I64), make_field(c"cap", 3, TYPE_I64))
-    var vec_u16: *StructDef = make_struct(c"Vec$u16", 7, vec_u16_fields)
-
-    # Vec$i16 = { *i16 data, i64 len, i64 cap }
-    var vec_i16_fields: *StructField = make_ptr_prim_field(c"data", 4, TYPE_I16)
-    vec_i16_fields = link_fields_3(vec_i16_fields, make_field(c"len", 3, TYPE_I64), make_field(c"cap", 3, TYPE_I64))
-    var vec_i16: *StructDef = make_struct(c"Vec$i16", 7, vec_i16_fields)
-
-    # Vec$u32 = { *u32 data, i64 len, i64 cap }
-    var vec_u32_fields: *StructField = make_ptr_prim_field(c"data", 4, TYPE_U32)
-    vec_u32_fields = link_fields_3(vec_u32_fields, make_field(c"len", 3, TYPE_I64), make_field(c"cap", 3, TYPE_I64))
-    var vec_u32: *StructDef = make_struct(c"Vec$u32", 7, vec_u32_fields)
-
-    # Vec$u64 = { *u64 data, i64 len, i64 cap }
-    var vec_u64_fields: *StructField = make_ptr_prim_field(c"data", 4, TYPE_U64)
-    vec_u64_fields = link_fields_3(vec_u64_fields, make_field(c"len", 3, TYPE_I64), make_field(c"cap", 3, TYPE_I64))
-    var vec_u64: *StructDef = make_struct(c"Vec$u64", 7, vec_u64_fields)
-
-    # Vec$Token = { *Token data, i64 len, i64 cap }
-    # Stride must be sizeof(Token) for `vec.data + i` arithmetic.
-    var vec_token_fields: *StructField = make_ptr_field(c"data", 4, c"Token", 5)
-    vec_token_fields = link_fields_3(vec_token_fields, make_field(c"len", 3, TYPE_I64), make_field(c"cap", 3, TYPE_I64))
-    var vec_token: *StructDef = make_struct(c"Vec$Token", 9, vec_token_fields)
-
-    # Vec$i32 = { *i32 data, i64 len, i64 cap }
-    var vec_i32_fields: *StructField = make_ptr_prim_field(c"data", 4, TYPE_I32)
-    vec_i32_fields = link_fields_3(vec_i32_fields, make_field(c"len", 3, TYPE_I64), make_field(c"cap", 3, TYPE_I64))
-    var vec_i32: *StructDef = make_struct(c"Vec$i32", 7, vec_i32_fields)
-
-    # Vec$i64 = { *i64 data, i64 len, i64 cap }
-    var vec_i64_fields: *StructField = make_ptr_prim_field(c"data", 4, TYPE_I64)
-    vec_i64_fields = link_fields_3(vec_i64_fields, make_field(c"len", 3, TYPE_I64), make_field(c"cap", 3, TYPE_I64))
-    var vec_i64: *StructDef = make_struct(c"Vec$i64", 7, vec_i64_fields)
-
-    # LineBounds = { i64 start, i64 length } (from ritzlib/gvec.ritz)
-    var linebounds_fields: *StructField = make_field(c"start", 5, TYPE_I64)
-    linebounds_fields = link_fields_2(linebounds_fields, make_field(c"length", 6, TYPE_I64))
-    var linebounds: *StructDef = make_struct(c"LineBounds", 10, linebounds_fields)
-
-    # Vec$LineBounds = { *LineBounds data, i64 len, i64 cap }
-    var vec_lb_fields: *StructField = make_ptr_field(c"data", 4, c"LineBounds", 10)
-    vec_lb_fields = link_fields_3(vec_lb_fields, make_field(c"len", 3, TYPE_I64), make_field(c"cap", 3, TYPE_I64))
-    var vec_lb: *StructDef = make_struct(c"Vec$LineBounds", 14, vec_lb_fields)
-
-    # Span$u8 = { ptr ptr, i64 len }
-    var span_u8_fields: *StructField = make_field(c"ptr", 3, TYPE_PTR)
-    span_u8_fields = link_fields_2(span_u8_fields, make_field(c"len", 3, TYPE_I64))
-    var span_u8: *StructDef = make_struct(c"Span$u8", 7, span_u8_fields)
-
-    # ArgParser - complex struct with arrays
-    # Fields: program_name, description, options[32], option_count, pos_defs[8], pos_def_count, positionals[256], positional_count, error_msg
-    var ap_f1: *StructField = make_field(c"program_name", 12, TYPE_PTR)
-    var ap_f2: *StructField = make_field(c"description", 11, TYPE_PTR)
-    var ap_f3: *StructField = make_array_struct_field(c"options", 7, TYPE_ARRAY, 32, TYPE_STRUCT, c"OptDef", 6)
-    var ap_f4: *StructField = make_field(c"option_count", 12, TYPE_I32)
-    var ap_f5: *StructField = make_array_struct_field(c"pos_defs", 8, TYPE_ARRAY, 8, TYPE_STRUCT, c"PosDef", 6)
-    var ap_f6: *StructField = make_field(c"pos_def_count", 13, TYPE_I32)
-    var ap_f7: *StructField = make_array_field(c"positionals", 11, TYPE_ARRAY, 256, TYPE_PTR)
-    var ap_f8: *StructField = make_field(c"positional_count", 16, TYPE_I32)
-    var ap_f9: *StructField = make_field(c"error_msg", 9, TYPE_PTR)
-    ap_f1.next = ap_f2
-    ap_f2.next = ap_f3
-    ap_f3.next = ap_f4
-    ap_f4.next = ap_f5
-    ap_f5.next = ap_f6
-    ap_f6.next = ap_f7
-    ap_f7.next = ap_f8
-    ap_f8.next = ap_f9
-    var arg_parser: *StructDef = make_struct(c"ArgParser", 9, ap_f1)
-
-    # NFAFragment = { i64 start, i64 end }
-    var nfafrag_fields: *StructField = make_field(c"start", 5, TYPE_I64)
-    nfafrag_fields = link_fields_2(nfafrag_fields, make_field(c"end", 3, TYPE_I64))
-    var nfafrag: *StructDef = make_struct(c"NFAFragment", 11, nfafrag_fields)
-
-    # TokenPattern = { i64 token_type, i64 priority, NFAFragment frag }
-    var tokpat_f1: *StructField = make_field(c"token_type", 10, TYPE_I64)
-    var tokpat_f2: *StructField = make_field(c"priority", 8, TYPE_I64)
-    var tokpat_f3: *StructField = make_field(c"frag", 4, TYPE_STRUCT)
-    tokpat_f3.field_type_name = c"NFAFragment"
-    tokpat_f3.field_type_name_len = 11
-    tokpat_f1.next = tokpat_f2
-    tokpat_f2.next = tokpat_f3
-    var tokpat: *StructDef = make_struct(c"TokenPattern", 12, tokpat_f1)
-
-    # NFAState = { i64 id, i64 is_accept, i64 token_type }
-    var nfastate_f1: *StructField = make_field(c"id", 2, TYPE_I64)
-    var nfastate_f2: *StructField = make_field(c"is_accept", 9, TYPE_I64)
-    var nfastate_f3: *StructField = make_field(c"token_type", 10, TYPE_I64)
-    nfastate_f1.next = nfastate_f2
-    nfastate_f2.next = nfastate_f3
-    var nfastate: *StructDef = make_struct(c"NFAState", 8, nfastate_f1)
-
-    # Transition = { i64 kind, i64 char_lo, i64 char_hi, i64 from_state, i64 to_state }
-    var trans_f1: *StructField = make_field(c"kind", 4, TYPE_I64)
-    var trans_f2: *StructField = make_field(c"char_lo", 7, TYPE_I64)
-    var trans_f3: *StructField = make_field(c"char_hi", 7, TYPE_I64)
-    var trans_f4: *StructField = make_field(c"from_state", 10, TYPE_I64)
-    var trans_f5: *StructField = make_field(c"to_state", 8, TYPE_I64)
-    trans_f1.next = trans_f2
-    trans_f2.next = trans_f3
-    trans_f3.next = trans_f4
-    trans_f4.next = trans_f5
-    var transition: *StructDef = make_struct(c"Transition", 10, trans_f1)
-
-    # NFA = { *NFAState states, i64 state_count, *Transition transitions, i64 trans_count, i64 start_state,
-    #         *i64 state_trans_offset, *i64 state_trans_count, *i64 trans_indices,
-    #         i64 max_states, i64 max_trans }
-    # f6..f8 are the Tier 1 NFA state-indexed transition table; f9/f10 are the
-    # storage capacities nfa_add_* check (#1433/#1436). Must match src/nfa.ritz:
-    # a field missing here is unreadable, and a STORE to it is silently dropped.
-    var nfa_f1: *StructField = make_field(c"states", 6, TYPE_PTR)
-    nfa_f1.field_type_name = c"NFAState"
-    nfa_f1.field_type_name_len = 8
-    var nfa_f2: *StructField = make_field(c"state_count", 11, TYPE_I64)
-    var nfa_f3: *StructField = make_field(c"transitions", 11, TYPE_PTR)
-    nfa_f3.field_type_name = c"Transition"
-    nfa_f3.field_type_name_len = 10
-    var nfa_f4: *StructField = make_field(c"trans_count", 11, TYPE_I64)
-    var nfa_f5: *StructField = make_field(c"start_state", 11, TYPE_I64)
-    var nfa_f6: *StructField = make_ptr_prim_field(c"state_trans_offset", 18, TYPE_I64)
-    var nfa_f7: *StructField = make_ptr_prim_field(c"state_trans_count", 17, TYPE_I64)
-    var nfa_f8: *StructField = make_ptr_prim_field(c"trans_indices", 13, TYPE_I64)
-    var nfa_f9: *StructField = make_field(c"max_states", 10, TYPE_I64)
-    var nfa_f10: *StructField = make_field(c"max_trans", 9, TYPE_I64)
-    nfa_f1.next = nfa_f2
-    nfa_f2.next = nfa_f3
-    nfa_f3.next = nfa_f4
-    nfa_f4.next = nfa_f5
-    nfa_f5.next = nfa_f6
-    nfa_f6.next = nfa_f7
-    nfa_f7.next = nfa_f8
-    nfa_f8.next = nfa_f9
-    nfa_f9.next = nfa_f10
-    var nfa: *StructDef = make_struct(c"NFA", 3, nfa_f1)
-
-    # Link the builtin structs and prepend to module's struct list
-    vec_u8.next = vec_i8
-    vec_i8.next = vec_u16
-    vec_u16.next = vec_i16
-    vec_i16.next = vec_u32
-    vec_u32.next = vec_u64
-    vec_u64.next = vec_token
-    vec_token.next = vec_i32
-    vec_i32.next = vec_i64
-    vec_i64.next = linebounds
-    linebounds.next = vec_lb
-    vec_lb.next = span_u8
-    span_u8.next = arg_parser
-    arg_parser.next = nfafrag
-    nfafrag.next = tokpat
-    tokpat.next = nfastate
-    nfastate.next = transition
-    transition.next = nfa
-    nfa.next = m.structs
-    m.structs = vec_u8
+fn ensure_string_literal_struct(s: *EmitterState, m: *Module)
+    let existing: *StructDef = find_module_struct(m, c"Span$u8", 7)
+    if existing != null
+        if is_string_literal_layout(existing) == 0
+            emit_ir_error(s, c"struct Span$u8 must be { ptr: *u8, len: i64 }: string literals are lowered to that layout")
+        return
+    # Span$u8 = { ptr: *u8, len: i64 } — the monomorph of ritzlib's
+    # `struct Span<T> { ptr: *T, len: i64 }` at T = u8.
+    let f1: *StructField = string_literal_field(c"ptr", 3, TYPE_PTR)
+    f1.array_elem_type = TYPE_U8   # pointee, for `span.ptr + i` stride
+    f1.next = string_literal_field(c"len", 3, TYPE_I64)
+    let st: *StructDef = malloc(40) as *StructDef   # sizeof(StructDef)
+    st.name = c"Span$u8"
+    st.name_len = 7
+    st.fields = f1
+    st.type_params = null
+    # Appended, not prepended: nothing it could shadow exists (checked above).
+    st.next = null
+    if m.structs == null
+        m.structs = st
+        return
+    var last: *StructDef = m.structs
+    while last.next != null
+        last = last.next
+    last.next = st
 
 fn emit_module(m: *Module, out: *Vec<u8>) -> i32
-    # Register builtin struct definitions so find_struct() can find them
-    register_builtin_structs(m)
-
     var s: EmitterState
     s.out = out
     s.reg_counter = 1
@@ -2046,6 +1725,8 @@ fn emit_module(m: *Module, out: *Vec<u8>) -> i32
     s.ctx_simd_name = null
     s.ctx_simd_name_len = 0
     s.error_count = 0   # AGAST #1369 — see emit_ir_error / the return below
+    # Before build_symbol_maps, so find_struct sees the fallback if added.
+    ensure_string_literal_struct(@s, m)
     # ritz-task-193 — allocate the five symbol-table HashMaps before any
     # add_local / find_* call.  build_symbol_maps then snapshots the
     # post-monomorph module-level lists so find_global / find_fn /
@@ -2055,9 +1736,6 @@ fn emit_module(m: *Module, out: *Vec<u8>) -> i32
 
     emit_str(@s, c"; ModuleID = 'ritz1_output'\n")
     emit_str(@s, c"target triple = \"x86_64-unknown-linux-gnu\"\n\n")
-
-    # Emit builtin ritzlib struct types (hardcoded for bootstrap)
-    emit_builtin_struct_types(@s)
 
     # Emit struct type definitions from source
     emit_struct_types(@s)
