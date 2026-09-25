@@ -32,8 +32,12 @@ at least one `; ERROR` comment into their IR: 44_csv, 50_http, 57_fn_ptr,
 57_fn_ptr was the one that had just become reachable.
 
 What is asserted here is only the honesty property — that ritz1 refuses —
-NOT that ritz1 can compile these programs. Function pointers remain
-unimplemented in ritz1; the point is that "unimplemented" must exit non-zero.
+NOT that ritz1 can compile these programs; "unimplemented" must exit non-zero.
+
+AGAST #1503 taught ritz1 function values, so the function-pointer program is
+no longer a refusal case: `test_ritz1_fn_value.py` now asserts ritz1 compiles
+it and returns 10. The identifier case here is re-pointed at a name that
+really does not exist, which exercises the same `unknown identifier` site.
 """
 
 import os
@@ -70,9 +74,9 @@ def ritz1_bin() -> Path:
     return RITZ1_BIN
 
 
-# A function used as a value. ritz1 cannot lower this; ritz0 can, and returns
-# 10, which is what makes the silent-zero substitution a WRONG ANSWER rather
-# than merely an unsupported one.
+# A function used as a value. ritz0 lowers this and returns 10, which is what
+# made ritz1's old silent-zero substitution a WRONG ANSWER rather than merely
+# an unsupported one. ritz1 handles it since #1503; kept as the ritz0 oracle.
 FN_POINTER = """\
 fn double(x: i32) -> i32
     return x * 2
@@ -92,8 +96,15 @@ fn main() -> i32
     return 0
 """
 
+# A value-position read of a name that is neither a local, a global nor a
+# function: the `unknown identifier` site that FN_POINTER used to reach.
+UNKNOWN_IDENTIFIER = """\
+fn main() -> i32
+    return no_such_name
+"""
+
 UNEMITTABLE = {
-    "fn_pointer": FN_POINTER,
+    "unknown_identifier": UNKNOWN_IDENTIFIER,
     "unknown_variable": UNKNOWN_VARIABLE,
 }
 
@@ -162,9 +173,9 @@ def test_ritz1_does_not_leave_a_usable_output_file(ritz1_bin, tmp_path, name):
 def test_ritz0_compiles_the_function_pointer_case(tmp_path):
     """The oracle, and the reason the silent zero was a wrong ANSWER.
 
-    ritz0 lowers this correctly. If ritz1 is ever taught function pointers,
-    this test stays true and the ones above must then be re-pointed at a
-    construct ritz1 still cannot emit — they assert honesty, not incapacity.
+    ritz0 lowers this correctly. ritz1 was taught function pointers by #1503,
+    so the tests above were re-pointed at a construct ritz1 still cannot emit —
+    they assert honesty, not incapacity.
     """
     proc, ll = _compile("ritz0", tmp_path, "fn_pointer", FN_POINTER)
     assert proc.returncode == 0 and ll.exists(), (
