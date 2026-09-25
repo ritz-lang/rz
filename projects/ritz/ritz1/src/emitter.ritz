@@ -1289,6 +1289,183 @@ fn emit_enum_fallback_types(s: *EmitterState)
 
     emit_str(s, c"\n")
 
+# =============================================================================
+# Global initializers (AGAST #1501)
+# =============================================================================
+# `var g: i32 = 5` used to be emitted as `i32 zeroinitializer` — init_expr was
+# parsed and never read, so every global started at 0 with no diagnostic
+# (zeus's `var g_running: i32 = 1` quit its event loop at once).
+#
+# An initializer is folded to one of the GINIT_* shapes below and written in
+# the global's EXISTING storage type (narrow ints, bool and floats keep their
+# i64 slot; widening that storage is a separate change).  Anything that does
+# not fold gets a located error instead of a silent zero.
+
+const GINIT_BAD: i32 = 0     # not a constant ritz1 can lower
+const GINIT_INT: i32 = 1     # integer/bool/char value in int_val
+const GINIT_FLOAT: i32 = 2   # float literal text in text/text_len, sign in neg
+const GINIT_NULL: i32 = 3    # null / nil
+
+struct GlobalInit
+    kind: i32
+    int_val: i64
+    text: *u8
+    text_len: i32
+    neg: i32
+
+# Fold a global initializer: literals, unary - ~ ! of a literal, null, and
+# `as` casts of any of those.  The cast target is not consulted: the value is
+# written in the global's own storage type, as ritz0 does.
+fn global_init_fold(e: *Expr, out: *GlobalInit)
+    out.kind = GINIT_BAD
+    if e == null
+        return
+    if e.kind == EXPR_INT_LIT or e.kind == EXPR_CHAR_LIT
+        out.kind = GINIT_INT
+        out.int_val = e.int_val
+        return
+    if e.kind == EXPR_FLOAT_LIT
+        out.kind = GINIT_FLOAT
+        out.text = e.string_ptr
+        out.text_len = e.string_len
+        out.neg = 0
+        return
+    if e.kind == EXPR_NIL_LIT
+        out.kind = GINIT_NULL
+        return
+    if e.kind == EXPR_CAST
+        global_init_fold(e.left, out)
+        return
+    if e.kind == EXPR_UNARY
+        global_init_fold(e.operand, out)
+        if e.op == OP_NEG
+            if out.kind == GINIT_INT
+                out.int_val = 0 - out.int_val
+                return
+            if out.kind == GINIT_FLOAT
+                out.neg = 1 - out.neg
+                return
+        else if e.op == OP_BIT_NOT and out.kind == GINIT_INT
+            out.int_val = 0 - out.int_val - 1
+            return
+        else if e.op == OP_NOT and out.kind == GINIT_INT
+            if out.int_val == 0
+                out.int_val = 1
+            else
+                out.int_val = 0
+            return
+        out.kind = GINIT_BAD
+        return
+
+# 1 if a float literal's text is +0.0 (FLOAT is /[0-9]+\.[0-9]+/: no exponent).
+fn global_init_float_is_pos_zero(gi: *GlobalInit) -> i32
+    if gi.neg != 0
+        return 0
+    var i: i32 = 0
+    while i < gi.text_len
+        let c: u8 = *(gi.text + i)
+        if c != 48 and c != 46   # '0' '.'
+            return 0
+        i += 1
+    1
+
+# "<file>:<line>:<col>: error: global '<name>' <why>" on stderr, an IR marker,
+# and a counted error so main refuses to write the output.
+fn global_init_error(s: *EmitterState, g: *GlobalVarDef, why: *u8)
+    if g.src_file != null
+        eprints_cstr(g.src_file)
+    else
+        eprints_cstr(c"<input>")
+    eprint_char(':')
+    eprint_i64(g.line as i64)
+    eprint_char(':')
+    eprint_i64(g.col as i64)
+    eprints_cstr(c": error: global '")
+    var i: i32 = 0
+    while i < g.name_len
+        eprint_char(*(g.name + i))
+        i += 1
+    eprints_cstr(c"' ")
+    eprints_cstr(why)
+    eprints_cstr(c"\n")
+    emit_str(s, c"; ERROR: global initializer for @")
+    emit_name(s, g.name, g.name_len)
+    emit_str(s, c": ")
+    emit_str(s, why)
+    emit_str(s, c"\n")
+    s.error_count = s.error_count + 1
+
+# Write " <initializer>" for g, whose storage type has just been emitted.
+fn emit_global_init(s: *EmitterState, g: *GlobalVarDef, gi: *GlobalInit)
+    if gi.kind == GINIT_BAD
+        emit_str(s, c" zeroinitializer")
+        return
+    # Storage `ptr`.
+    if g.var_type == TYPE_PTR
+        if gi.kind == GINIT_NULL or (gi.kind == GINIT_INT and gi.int_val == 0)
+            emit_str(s, c" null")
+        else
+            emit_str(s, c" inttoptr (i64 ")
+            emit_int(s, gi.int_val)
+            emit_str(s, c" to ptr)")
+        return
+    # f64 lives in an i64 slot and is loaded as `double`: store its bits.
+    if g.var_type == TYPE_F64
+        emit_str(s, c" bitcast (double ")
+        if gi.kind == GINIT_FLOAT
+            if gi.neg != 0
+                emit_str(s, c"-")
+            emit_name(s, gi.text, gi.text_len)
+        else
+            emit_int(s, gi.int_val)
+            emit_str(s, c".0")
+        emit_str(s, c" to i64)")
+        return
+    # f32: only +0 reaches here (anything else was rejected up front).
+    if g.var_type == TYPE_F32
+        emit_str(s, c" zeroinitializer")
+        return
+    # Every other storage type is an LLVM integer.
+    emit_str(s, c" ")
+    if gi.kind == GINIT_NULL
+        emit_int(s, 0)
+    else
+        emit_int(s, gi.int_val)
+
+# Fold g.init_expr into gi, reporting a located error when it cannot be
+# lowered.  An absent initializer leaves gi.kind == GINIT_BAD with no error,
+# which emit_global_init writes as zeroinitializer.
+fn global_init_check(s: *EmitterState, g: *GlobalVarDef, gi: *GlobalInit)
+    gi.kind = GINIT_BAD
+    if g.init_expr == null
+        return
+    if g.var_type == TYPE_STRUCT or g.var_type == TYPE_ARRAY
+        global_init_error(s, g, c"has an aggregate initializer; ritz1 only lowers scalar constants")
+        return
+    global_init_fold(g.init_expr, gi)
+    if gi.kind == GINIT_BAD
+        global_init_error(s, g, c"has a non-constant initializer; ritz1 lowers only literals, unary -/~/! of one, null and casts of those")
+        return
+    let is_float: i32 = is_float_type(g.var_type, g.type_name, g.type_name_len)
+    if gi.kind == GINIT_FLOAT and is_float == 0
+        global_init_error(s, g, c"is not a float type but has a float initializer")
+        gi.kind = GINIT_BAD
+        return
+    if gi.kind == GINIT_NULL and is_float == 1
+        global_init_error(s, g, c"is a float type but has a null initializer")
+        gi.kind = GINIT_BAD
+        return
+    if g.var_type == TYPE_F32
+        var zero: i32 = 0
+        if gi.kind == GINIT_INT and gi.int_val == 0
+            zero = 1
+        else if gi.kind == GINIT_FLOAT
+            zero = global_init_float_is_pos_zero(gi)
+        if zero == 0
+            global_init_error(s, g, c"is f32 with a non-zero initializer, which ritz1 cannot lower yet")
+            gi.kind = GINIT_BAD
+        return
+
 # Emit global variable declarations
 fn emit_global_vars(s: *EmitterState)
     var g: *GlobalVarDef = s.module.globals
@@ -1298,6 +1475,10 @@ fn emit_global_vars(s: *EmitterState)
             g = g.next
             continue
         mark_global_emitted(s, g.name, g.name_len)
+        # Fold (and diagnose) the initializer before the declaration line so
+        # any IR error marker lands on its own line.
+        var gi: GlobalInit
+        global_init_check(s, g, @gi)
         emit_str(s, c"@")
         emit_name(s, g.name, g.name_len)
         # weak_odr: merge duplicates across modules (same as functions)
@@ -1338,7 +1519,8 @@ fn emit_global_vars(s: *EmitterState)
             emit_str(s, c"]")
         else
             emit_str(s, c"i64")
-        emit_str(s, c" zeroinitializer\n")
+        emit_global_init(s, g, @gi)
+        emit_str(s, c"\n")
         g = g.next
     emit_str(s, c"\n")
 
