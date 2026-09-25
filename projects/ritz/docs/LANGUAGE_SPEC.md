@@ -685,6 +685,21 @@ last line of a block, or the arm of a `match` that is itself being bound. The
 diagnostic points at the `if` that lacks the `else`, which in an
 `if`/`else if` chain is the innermost one.
 
+It applies equally to an operand: the operand of an operator, a call or method
+argument, an index, a cast, a field of a struct literal, a loop condition. An
+operand's value is always used, so this is rejected even when the enclosing
+call is itself a statement (AGAST #1435; before it, the `if` evaluated to `0`):
+
+```ritz expect-error="an `if` with no `else` has no value"
+fn id(v: i32) -> i32
+    return v
+
+fn pick(c: i32) -> i32
+    return 5 + id(if c == 1
+        1
+    )
+```
+
 An else-less `if` used as a *statement* is ordinary code and is unaffected —
 including as the last thing a procedure does, and as the last thing in an arm
 of a `match` that is itself a statement:
@@ -696,15 +711,11 @@ if c
     r = 1
 ```
 
-Two neighbouring cases are still accepted and still wrong. Do not rely on
-either in new code:
-
-- An else-less `if` used as an operand or call argument (`5 + if c ...`)
-  still evaluates to `0`. Tracked as AGAST #1435.
-- A function that declares a return type and whose *last* statement is such
-  an `if` falls through to an implicit `0` rather than being rejected. Sites
-  in this repo are built on that behaviour, so it is being migrated before it
-  becomes an error (AGAST #1429).
+One neighbouring case is still accepted and still wrong. Do not rely on it in
+new code: a function that declares a return type and whose *last* statement is
+such an `if` falls through to an implicit `0` rather than being rejected. Sites
+in this repo are built on that behaviour, so it is being migrated before it
+becomes an error (AGAST #1429).
 
 ### 6.2 While Loop
 

@@ -3368,6 +3368,13 @@ class LLVMEmitter:
         # Handle trailing expression and implicit return
         if not self.has_returned and not self.builder.block.is_terminated:
             if fn_def.body.expr:
+                # AGAST #1435: operands in the tail are consumed even though
+                # the tail itself is not treated as one (#1429's carve-out,
+                # hence consumed=False). The tail is no statement, so
+                # `_reject_valueless_if` never sees it.
+                offender = self._find_valueless_if(fn_def.body.expr, consumed=False)
+                if offender is not None:
+                    self._raise_valueless_if(offender, fn_def.body.expr)
                 # Check if we're returning a local variable - it should be moved, not dropped
                 exclude_var = None
                 if isinstance(fn_def.body.expr, rast.Ident):
@@ -3622,61 +3629,152 @@ class LLVMEmitter:
         return llvm_msg
 
     @staticmethod
-    def _consumed_value(stmt: rast.Stmt) -> Optional[rast.Expr]:
-        """The expression whose value `stmt` consumes, if it consumes one.
+    def _stmt_value_roots(stmt: rast.Stmt) -> List[tuple]:
+        """`(expr, consumed)` pairs for the valueless-`if` walk of `stmt`.
 
-        Only these four statements bind or return a value. An `ExprStmt`
-        evaluates for effect, so its `if`/`match` is a statement even when it
-        is syntactically an expression.
+        `consumed` is True only where the statement itself takes the value:
+        the initialiser of `let`/`var`, the right side of an assignment, a
+        `return` value, and the conditions/iterables that are evaluated for
+        their result. Everything else — an `ExprStmt`, an assignment target,
+        a loop or `unsafe` body's tail — is walked with `consumed=False`,
+        which still reaches the operands inside it (AGAST #1435) but never
+        treats a statement-position `if`/`match` as a value.
+
+        Loop and `unsafe` bodies contribute only their TAIL here: their
+        statements pass through `_emit_stmt_inner` one by one and are checked
+        there, and their tail is the one expression that does not.
         """
         if isinstance(stmt, (rast.LetStmt, rast.VarStmt, rast.ReturnStmt,
-                             rast.AssignStmt)):
-            return stmt.value
-        return None
+                             rast.LetTupleStmt)):
+            return [(stmt.value, True)]
+        if isinstance(stmt, rast.AssignStmt):
+            return [(stmt.target, False), (stmt.value, True)]
+        if isinstance(stmt, rast.ExprStmt):
+            return [(stmt.expr, False)]
+        if isinstance(stmt, rast.WhileStmt):
+            return [(stmt.cond, True), (stmt.body, False)]
+        if isinstance(stmt, rast.ForStmt):
+            return [(stmt.iter, True), (stmt.body, False)]
+        if isinstance(stmt, rast.AssertStmt):
+            return [(stmt.condition, True)]
+        if isinstance(stmt, rast.UnsafeBlock):
+            return [(stmt.body, False)]
+        return []
 
-    def _find_valueless_if(self, expr: Optional[rast.Expr]) -> Optional[rast.If]:
-        """The first else-less `if` on a RESULT path of `expr`, or None.
+    @staticmethod
+    def _operands(expr: rast.Expr) -> List[Optional[rast.Expr]]:
+        """Sub-expressions whose value `expr` always consumes (AGAST #1435).
 
-        A result path is where the value of `expr` comes from: the arms of an
-        `if`, the tail of a block, the body of a `match` arm. Nothing else is
-        walked — not a block's statements (they run for effect), not operands
-        or call arguments (AGAST #1435, deliberately out of scope), not lambda
-        bodies. Returning the innermost offender lets the diagnostic point at
-        the `if` that actually lacks the `else`, not the total one around it.
+        An operator needs its operands, a call its callee and arguments, an
+        index its base and subscript, and so on — whatever statement `expr`
+        sits in. Deliberately absent: `Block` (its statements run for effect
+        and are checked one by one when emitted), `Lambda`/`Closure` (their
+        body is a separate function), and the result paths of `If`/`Match`,
+        which `_find_valueless_if` handles itself because whether THOSE are
+        consumed depends on the context.
         """
+        if isinstance(expr, rast.BinOp):
+            return [expr.left, expr.right]
+        if isinstance(expr, rast.UnaryOp):
+            return [expr.operand]
+        if isinstance(expr, rast.Call):
+            return [expr.func, *expr.args]
+        if isinstance(expr, rast.MethodCall):
+            return [expr.expr, *expr.args]
+        if isinstance(expr, rast.Index):
+            return [expr.expr, expr.index]
+        if isinstance(expr, rast.SliceExpr):
+            return [expr.expr, expr.start, expr.end]
+        if isinstance(expr, (rast.Field, rast.Cast, rast.TryOp, rast.Await,
+                             rast.HeapExpr)):
+            return [expr.expr]
+        if isinstance(expr, rast.StructLit):
+            return [value for _, value in expr.fields]
+        if isinstance(expr, (rast.ArrayLit, rast.TupleLit)):
+            return list(expr.elements)
+        if isinstance(expr, rast.ArrayFill):
+            return [expr.value]
+        if isinstance(expr, rast.InterpString):
+            return list(expr.exprs)
+        if isinstance(expr, rast.Range):
+            return [expr.start, expr.end]
+        if isinstance(expr, rast.ReturnExpr):
+            return [expr.value]
         if isinstance(expr, rast.If):
-            if expr.else_block is None:
-                return expr
-            return (self._find_valueless_if(expr.then_block)
-                    or self._find_valueless_if(expr.else_block))
+            return [expr.cond]
+        if isinstance(expr, rast.Match):
+            return [expr.expr, *(arm.guard for arm in expr.arms)]
+        return []
+
+    @staticmethod
+    def _find_valueless_if(expr: Optional[rast.Expr],
+                           consumed: bool = True) -> Optional[rast.If]:
+        """The first else-less `if` whose value is used, or None.
+
+        `consumed` says whether the value of `expr` itself is used. When it
+        is, an else-less `if` at `expr` is the offender (AGAST #1406), and its
+        RESULT paths — `if` arms, block tails, `match` arm bodies — are
+        consumed too. When it is not (an expression statement, a procedure's
+        tail) those result paths are walked with `consumed=False` as well.
+
+        Operands (`_operands`) are always walked with `consumed=True`: their
+        value is used whatever the context (AGAST #1435).
+
+        Never walked: a block's statements and lambda/closure bodies. This
+        is a syntactic walk called from statement level; it is NOT a check
+        inside `_emit_expr`, which is what v4 of #1406 did and why it broke
+        angelo. Returning the innermost offender lets the diagnostic point at
+        the `if` that actually lacks the `else`.
+        """
+        find = LLVMEmitter._find_valueless_if
+        if expr is None:
+            return None
+        if isinstance(expr, rast.If) and consumed and expr.else_block is None:
+            return expr
+        if isinstance(expr, rast.Grouped):
+            return find(expr.expr, consumed)
+        if isinstance(expr, rast.AssignExpr):
+            return find(expr.target, False) or find(expr.value, True)
+        for operand in LLVMEmitter._operands(expr):
+            found = find(operand, True)
+            if found is not None:
+                return found
+        if isinstance(expr, rast.If):
+            return (find(expr.then_block, consumed)
+                    or find(expr.else_block, consumed))
         if isinstance(expr, rast.Block):
-            return self._find_valueless_if(expr.expr)
+            return find(expr.expr, consumed)
         if isinstance(expr, rast.Match):
             for arm in expr.arms:
-                found = self._find_valueless_if(arm.body)
+                found = find(arm.body, consumed)
                 if found is not None:
                     return found
         return None
 
-    def _reject_valueless_if(self, stmt: rast.Stmt) -> None:
-        """AGAST #1406: an else-less `if` has no value to bind or return.
+    @staticmethod
+    def _raise_valueless_if(offender: rast.If, fallback: object) -> None:
+        raise EmitError(
+            "an `if` with no `else` has no value when its condition is "
+            "false, so it cannot be used as a value here; add an `else` "
+            "arm",
+            getattr(offender, 'span', None) or getattr(fallback, 'span', None),
+        )
 
-        Checked here, at the statement that consumes the value, because only
-        the statement knows the value is wanted. Four earlier versions decided
-        it inside the expression emitter and each rejected live code: a
-        procedure ending in a guard, ritzlib/hashmap.ritz:210, two tier
-        examples, and angelo's statement-position `match` whose arm ends in a
-        guard. None of those shapes is a consuming statement, so none is
-        reached from here.
+    def _reject_valueless_if(self, stmt: rast.Stmt) -> None:
+        """AGAST #1406/#1435: an else-less `if` has no value to use.
+
+        Checked here, at statement level, because only the statement knows
+        whether its expression's value is wanted. Four earlier versions of
+        #1406 decided it inside the expression emitter and each rejected live
+        code: a procedure ending in a guard, ritzlib/hashmap.ritz:210, two
+        tier examples, and angelo's statement-position `match` whose arm ends
+        in a guard. None of those shapes consumes the `if`'s value, so none
+        is reached from here.
         """
-        offender = self._find_valueless_if(self._consumed_value(stmt))
-        if offender is not None:
-            raise EmitError(
-                "an `if` with no `else` has no value when its condition is "
-                "false, so it cannot be used as a value here; add an `else` "
-                "arm",
-                getattr(offender, 'span', None) or getattr(stmt, 'span', None),
-            )
+        for expr, consumed in self._stmt_value_roots(stmt):
+            offender = self._find_valueless_if(expr, consumed)
+            if offender is not None:
+                self._raise_valueless_if(offender, stmt)
 
     def _emit_stmt_inner(self, stmt: rast.Stmt) -> Union[bool, ir.Value, None]:
         """Emit a statement. Returns True if block terminated."""

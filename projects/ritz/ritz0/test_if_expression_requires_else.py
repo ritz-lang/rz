@@ -53,10 +53,15 @@ assignment, `return` — and walks only that value's result paths: `if` arms,
 block tails and `match` arm bodies. A `match` used as a statement is never
 walked, so angelo's shape cannot be reached.
 
+AGAST #1435 extends the walk into operand positions (operator operands, call
+and method arguments, index, field base, cast, struct-literal fields, ...).
+An operand's value is consumed no matter which statement holds it, so that
+part of the walk runs from every statement and from a function's tail too.
+It still never enters `Block.stmts` or a lambda/closure body.
+
 The function-tail shape (a fn declaring `-> T` whose last statement is an
-else-less `if`) is deliberately NOT covered; it is AGAST #1429. Operands and
-call arguments (`5 + if c ...`) are deliberately NOT covered; that is AGAST
-#1435. Both are pinned below so a change to either is made on purpose.
+else-less `if`) is deliberately NOT covered; it is AGAST #1429, pinned below
+so a change to it is made on purpose.
 """
 
 import os
@@ -256,28 +261,237 @@ def test_the_value_was_really_zero_before_and_is_one_after_adding_else(tmp_path)
 
 
 # ---------------------------------------------------------------------------
-# Scope pins. Each is a KNOWN hole, tracked on its own ticket. When that
-# ticket lands, replace the test on purpose — do not delete it quietly.
+# AGAST #1435: operand positions. An operand's value is always consumed —
+# by the operator, the callee, the index, the cast — whatever statement the
+# expression sits in. So the walk descends into operands from EVERY statement,
+# including an `ExprStmt` and a function's tail, not only from the four
+# consuming statements. It still never enters `Block.stmts` (each statement is
+# checked on its own when emitted) or a lambda/closure body.
+#
+# Every entry compiled at exit 0 before the fix and used 0 for the `if`.
 # ---------------------------------------------------------------------------
 
-@pytest.mark.unit
-def test_else_less_if_inside_an_operand_is_out_of_scope(tmp_path):
-    """AGAST #1435: the walk follows result paths, not operands.
+_ID = "fn id(v: i32) -> i32\n    return v\n"
+_ID_P = "fn idp(p: *i32, v: i32)\n    *p = v\n"
 
-    `5 + if c == 1 / 1` still compiles and still evaluates the `if` to 0.
-    That is wrong, and it is pinned here so that fixing it is a deliberate
-    act that also updates LANGUAGE_SPEC.md §6.1's sentence naming the hole.
-    """
-    rc, output, _ = _compile(tmp_path, (
+OPERAND_POSITIONS = {
+    "binop_right": (
         "fn pick(c: i32) -> i32\n"
         "    let x = 5 + if c == 1\n"
         "        1\n"
         "    return x\n"
-    ))
-    assert rc == 0, (
-        "operand position is #1435's scope; if this is now rejected, update "
-        f"the spec and #1435 and replace this test:\n{output}"
+    ),
+    # `(if ...) + 5` does not parse; a unary wrapper puts the `if` on the
+    # left operand's side regardless.
+    "binop_left_in_return": (
+        "fn pick(c: i32) -> i32\n"
+        "    return (-(if c == 1\n"
+        "        1\n"
+        "    )) + 5\n"
+    ),
+    "unary_operand": (
+        "fn pick(c: i32) -> i32\n"
+        "    let x = -(if c == 1\n"
+        "        1\n"
+        "    )\n"
+        "    return x\n"
+    ),
+    "call_argument": _ID + (
+        "fn pick(c: i32) -> i32\n"
+        "    return id(if c == 1\n"
+        "        1\n"
+        "    )\n"
+    ),
+    # The call is a statement, but its argument is still consumed.
+    "call_argument_of_an_expr_stmt": _ID_P + (
+        "fn pick(c: i32) -> i32\n"
+        "    var r: i32 = 7\n"
+        "    idp(@r, if c == 1\n"
+        "        1\n"
+        "    )\n"
+        "    return r\n"
+    ),
+    # A procedure's tail is not a consuming statement (#1429's carve-out),
+    # but an argument inside it is consumed.
+    "call_argument_in_a_procedure_tail": _ID_P + (
+        "fn g(p: *i32, c: i32)\n"
+        "    idp(p, if c == 1\n"
+        "        1\n"
+        "    )\n"
+    ),
+    # Tail of a statement `if`'s arm: reached through the arm's block tail.
+    "call_argument_in_a_statement_if_arm": _ID_P + (
+        "fn g(p: *i32, c: i32, d: i32)\n"
+        "    if d == 1\n"
+        "        idp(p, if c == 1\n"
+        "            1\n"
+        "        )\n"
+        "    *p = 3\n"
+    ),
+    "call_argument_in_a_while_body_tail": _ID_P + (
+        "fn g(p: *i32, c: i32)\n"
+        "    while *p < 10\n"
+        "        idp(p, if c == 1\n"
+        "            1\n"
+        "        )\n"
+    ),
+    "method_call_argument": (
+        "struct S\n"
+        "    v: i32\n"
+        "impl S\n"
+        "    fn add(self:&, n: i32) -> i32\n"
+        "        return self.v + n\n"
+        "fn pick(s: *S, c: i32) -> i32\n"
+        "    return s.add(if c == 1\n"
+        "        1\n"
+        "    )\n"
+    ),
+    "index": (
+        "fn pick(a: *i32, c: i32) -> i32\n"
+        "    return a[if c == 1\n"
+        "        1\n"
+        "    ]\n"
+    ),
+    "assignment_target_index": (
+        "fn g(a: *i32, c: i32)\n"
+        "    a[if c == 1\n"
+        "        1\n"
+        "    ] = 3\n"
+    ),
+    # `(if ...) as T` does not parse; the cast's operand is a BinOp holding
+    # the `if`, so the walk must pass through Cast to reach it.
+    "cast": (
+        "fn pick(c: i32) -> i64\n"
+        "    return (2 * if c == 1\n"
+        "        1\n"
+        "    ) as i64\n"
+    ),
+    "struct_literal_field": (
+        "struct S\n"
+        "    v: i32\n"
+        "fn pick(c: i32) -> i32\n"
+        "    let s = S { v: if c == 1\n"
+        "        1\n"
+        "    }\n"
+        "    return s.v\n"
+    ),
+    "while_condition": (
+        "fn g(c: i32)\n"
+        "    while (if c == 1\n"
+        "        true\n"
+        "    )\n"
+        "        pass\n"
+    ),
+    # Result path and operand compose: the `if` is an operand inside the
+    # value arm of a total if/else.
+    "operand_inside_a_value_arm": (
+        "fn pick(c: i32, d: i32) -> i32\n"
+        "    let x = if d == 1\n"
+        "        5 + if c == 1\n"
+        "            1\n"
+        "    else\n"
+        "        2\n"
+        "    return x\n"
+    ),
+}
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("position", sorted(OPERAND_POSITIONS))
+def test_else_less_if_in_an_operand_position_is_rejected(tmp_path, position):
+    """AGAST #1435: the same zero, one level further in."""
+    rc, output, _ = _compile(tmp_path, OPERAND_POSITIONS[position])
+    assert rc != 0, (
+        f"{position}: compiled at exit 0 — the `if` silently evaluates to 0"
     )
+    assert re.search(r"no `else`", output), (
+        f"{position}: rejected, but not for the missing else:\n{output}"
+    )
+    assert "Traceback (most recent call last)" not in output, output
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("shape", [
+    "binop_left", "binop_right", "unary", "call_arg", "call_func",
+    "method_receiver", "method_arg", "index_base", "index_index",
+    "field_base", "cast", "struct_field", "array_elem", "tuple_elem",
+    "grouped", "try", "interp", "match_scrutinee", "match_guard",
+    "if_cond", "return_expr", "assign_expr_value", "slice_start",
+])
+def test_walker_reaches_every_operand_node(shape):
+    """Direct AST check for positions the parser cannot produce from source.
+
+    `(if c / 1).v` and `(if c / 1) as T` do not parse, so Field base and
+    Cast have no source-level test; this builds the tree by hand. Every
+    shape wraps the offender in a NON-consuming position (an expression
+    statement), so only the operand walk can find it.
+    """
+    import ritz_ast as rast
+    from emitter_llvmlite import LLVMEmitter
+
+    S = None  # spans are irrelevant to the walk
+
+    x = rast.Ident(S, "x")
+    bad = rast.If(S, rast.BoolLit(S, True), rast.Block(S, [], rast.IntLit(S, 1)), None)
+    def arm(body, guard=None):
+        return rast.MatchArm(S, rast.WildcardPattern(S), guard, body)
+    tree = {
+        "binop_left": rast.BinOp(S, "+", bad, x),
+        "binop_right": rast.BinOp(S, "+", x, bad),
+        "unary": rast.UnaryOp(S, "-", bad),
+        "call_arg": rast.Call(S, x, [x, bad]),
+        "call_func": rast.Call(S, bad, []),
+        "method_receiver": rast.MethodCall(S, bad, "m", []),
+        "method_arg": rast.MethodCall(S, x, "m", [bad]),
+        "index_base": rast.Index(S, bad, x),
+        "index_index": rast.Index(S, x, bad),
+        "field_base": rast.Field(S, bad, "v"),
+        "cast": rast.Cast(S, bad, rast.NamedType(S, "i64")),
+        "struct_field": rast.StructLit(S, "S", [("v", bad)]),
+        "array_elem": rast.ArrayLit(S, [x, bad]),
+        "tuple_elem": rast.TupleLit(S, [bad]),
+        "grouped": rast.Call(S, x, [rast.Grouped(S, bad)]),
+        "try": rast.TryOp(S, bad),
+        "interp": rast.InterpString(S, ["", ""], [bad]),
+        "match_scrutinee": rast.Match(S, bad, [arm(x)]),
+        "match_guard": rast.Match(S, x, [arm(x, bad)]),
+        "if_cond": rast.If(S, bad, rast.Block(S, [], None), None),
+        "return_expr": rast.ReturnExpr(S, bad),
+        "assign_expr_value": rast.AssignExpr(S, x, bad),
+        "slice_start": rast.SliceExpr(S, x, bad, None),
+    }[shape]
+    found = LLVMEmitter._find_valueless_if(tree, consumed=False)
+    assert found is bad, f"{shape}: operand walk did not reach the `if`"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("shape", ["expr_stmt_if", "block_stmts", "lambda", "closure"])
+def test_walker_does_not_flag_unconsumed_positions(shape):
+    """Statement `if`, `Block.stmts`, lambda and closure bodies stay unwalked."""
+    import ritz_ast as rast
+    from emitter_llvmlite import LLVMEmitter
+
+    S = None  # spans are irrelevant to the walk
+
+    bad = rast.If(S, rast.BoolLit(S, True), rast.Block(S, [], rast.IntLit(S, 1)), None)
+    def call_of(e):
+        return rast.Call(S, rast.Ident(S, "f"), [e])
+    tree = {
+        "expr_stmt_if": bad,
+        "block_stmts": call_of(rast.Block(S, 
+            [rast.ExprStmt(S, call_of(bad))], rast.IntLit(S, 1))),
+        "lambda": call_of(rast.Lambda(S, [], None, call_of(bad))),
+        "closure": call_of(rast.Closure(S, [], call_of(bad))),
+    }[shape]
+    assert LLVMEmitter._find_valueless_if(tree, consumed=False) is None
+
+
+@pytest.mark.unit
+def test_operand_diagnostic_points_at_the_if(tmp_path):
+    """Line 2 holds `5 + if ...`; the `if` itself is the located node."""
+    rc, output, _ = _compile(tmp_path, OPERAND_POSITIONS["binop_right"])
+    assert rc != 0
+    assert re.search(r"unit\.ritz:2:\d+:", output), output
 
 
 # ---------------------------------------------------------------------------
@@ -305,6 +519,63 @@ def test_statement_match_whose_arm_ends_in_an_else_less_if_still_runs(tmp_path):
         "    g(@v, 1)\n"
         "    return v\n"
     )) == 1
+
+
+@pytest.mark.integration
+def test_else_ful_if_as_operand_and_argument_still_runs(tmp_path):
+    """#1435 control: the total forms in operand position keep their value."""
+    assert _run(tmp_path, (
+        "fn id(v: i32) -> i32\n"
+        "    return v\n"
+        "fn main() -> i32\n"
+        "    let c: i32 = 1\n"
+        "    let x = 5 + if c == 1\n"
+        "        1\n"
+        "    else\n"
+        "        0\n"
+        "    return x + id(if c == 1\n"
+        "        10\n"
+        "    else\n"
+        "        0\n"
+        "    )\n"
+    )) == 16
+
+
+@pytest.mark.unit
+def test_else_less_if_statement_inside_an_argument_arm_compiles(tmp_path):
+    """#1435 control: the operand walk never enters `Block.stmts`.
+
+    The argument is a total if/else; inside its then-arm an else-less `if`
+    is a statement, and the arm's value is the tail `1`.
+    """
+    rc, output, _ = _compile(tmp_path, (
+        "fn id(v: i32) -> i32\n"
+        "    return v\n"
+        "fn pick(c: i32, d: i32) -> i32\n"
+        "    var r: i32 = 0\n"
+        "    return id(if c == 1\n"
+        "        if d == 1\n"
+        "            r = 5\n"
+        "        1\n"
+        "    else\n"
+        "        2\n"
+        "    )\n"
+    ))
+    assert rc == 0, f"walked into a block's statements:\n{output}"
+
+
+@pytest.mark.unit
+def test_statement_if_whose_condition_is_a_call_still_compiles(tmp_path):
+    """#1435 control: walking a statement `if` must not flag the `if` itself."""
+    rc, output, _ = _compile(tmp_path, (
+        "fn id(v: i32) -> i32\n"
+        "    return v\n"
+        "fn g(p: *i32, c: i32)\n"
+        "    if id(c) == 1\n"
+        "        *p = id(1)\n"
+        "    *p = 2\n"
+    ))
+    assert rc == 0, f"rejected a statement if with calls in it:\n{output}"
 
 
 @pytest.mark.unit
