@@ -1993,8 +1993,12 @@ def format_test_summary(n_files: int, tests_passed: int, tests_failed: int,
             f" | {ok} file(s) passed, {tests_passed} tests passed")
 
 
-def run_tests(pkg_dir: Path, config: dict) -> bool:
-    """Run tests for a package."""
+def run_tests(pkg_dir: Path, config: dict, compiler: str = "ritz0") -> bool:
+    """Run tests for a package with `compiler`.
+
+    .ritz test files only run under ritz0 (`ritz0 --test`). For ritz1 and
+    ritz1_selfhosted they are reported as NOT run and the package fails.
+    """
     pkg_name = config["package"]["name"]
     all_passed = True
     tests_found = False
@@ -2014,7 +2018,17 @@ def run_tests(pkg_dir: Path, config: dict) -> bool:
 
     ritz_tests = sorted(set(ritz_tests))  # Dedupe and sort
 
-    if ritz_tests:
+    if ritz_tests and compiler != "ritz0":
+        # The only .ritz test harness is `ritz0 --test`; ritz1 has no --test
+        # mode. This used to run every file through ritz0 regardless of
+        # --compiler, so each "ritz1" verdict was ritz0's (AGAST #1500). Do
+        # NOT fall back to ritz0 and do not skip quietly: a run that tested
+        # nothing with the requested compiler is a named failure.
+        tests_found = True
+        print(f"  ✗ {pkg_name}: {compiler} has no --test harness; "
+              f"{len(ritz_tests)} test file(s) NOT run")
+        all_passed = False
+    elif ritz_tests:
         tests_found = True
         print(f"  🧪 Running {len(ritz_tests)} .ritz test file(s)...")
         # ritz0 --test compiles a test-harness binary and then EXECUTES it.
@@ -2278,7 +2292,7 @@ def cmd_test(args):
         if is_test_only:
             # For test-only packages, run tests directly without building a binary
             print(f"📦 {config['package']['name']} (test-only)")
-            if not run_tests(pkg_dir, config):
+            if not run_tests(pkg_dir, config, compiler):
                 all_passed = False
         else:
             # Normal package: build then test
@@ -2296,7 +2310,7 @@ def cmd_test(args):
                 print(f"  ✗ Failed to build {config['package']['name']}: {result.summary()}",
                       file=sys.stderr)
                 all_passed = False
-            elif not run_tests(pkg_dir, config):
+            elif not run_tests(pkg_dir, config, compiler):
                 all_passed = False
 
     if keep_artifacts:
