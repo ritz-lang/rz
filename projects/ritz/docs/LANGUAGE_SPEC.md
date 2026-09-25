@@ -825,6 +825,36 @@ let p: *u8 = null as *u8
 let addr: i64 = p as i64
 ```
 
+#### Implicit narrowing is an error
+
+A typed `let` or `var` whose initialiser is a wider integer is rejected, unless
+the compiler can prove the value fits the declared type:
+
+```ritz expect-error="implicit narrowing: `n` is declared `i32` but its initialiser has type `i64`"
+fn big() -> i64
+    return 4294967301
+
+fn main() -> i32
+    let n: i32 = big()      # would silently become 5
+    return n
+```
+
+Write `as` when truncation is what you mean: `let n: i32 = big() as i32`.
+
+Three shapes are provably lossless and need no `as`:
+
+```ritz body
+let x: i64 = 1000
+let flags: i32 = 0x02 | 0x20     # a constant expression that fits
+let low: u8 = x & 255            # a mask `e & K`, K >= 0, K fits the type
+let bit: u8 = if x > 0 then 1 else 0   # an if/match whose every arm is one of these
+```
+
+The rule does no range analysis beyond that: `if n < 255 then n else 255`
+is rejected even though it is safe, and needs an `as`. Only typed `let` and
+`var` initialisers are checked. An assignment, a call argument or a `return`
+still converts silently (#1444).
+
 ### 7.6 Reference Operations
 
 ```ritz body

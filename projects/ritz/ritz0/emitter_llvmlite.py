@@ -3823,6 +3823,8 @@ class LLVMEmitter:
                         self._literal_ctx_nodes = saved_ctx
                     self.simd_expected_type = None  # Clear SIMD context
                     self._check_int_literal_fits_declaration(stmt)
+                    if stmt.type:
+                        self._check_implicit_narrowing(stmt, val.type, ty)
                     val = self._convert_type(val, ty)
                     self.builder.store(val, alloca)
             self.locals[stmt.name] = (alloca, ty)
@@ -3862,8 +3864,10 @@ class LLVMEmitter:
             if stmt.type:
                 # Use declared type and convert value if needed
                 declared_ty = self._ritz_type_to_llvm(stmt.type)
+                src_ty = val.type  # before _convert_type hides any narrowing
                 val = self._convert_type(val, declared_ty)
                 self._check_int_literal_fits_declaration(stmt)
+                self._check_implicit_narrowing(stmt, src_ty, declared_ty)
                 self._check_let_annotation(stmt, val, declared_ty)
                 self.params[stmt.name] = (val, declared_ty)
                 self.ritz_types[stmt.name] = stmt.type  # Store Ritz type for signedness
@@ -9798,6 +9802,166 @@ class LLVMEmitter:
         raise EmitError(
             f"`{value}` does not fit in `{declared.name}` "
             f"(declared type of `{stmt.name}`)",
+            getattr(stmt, "span", None),
+        )
+
+    # Ring operations folded by `_const_int_value`: their low bits do not
+    # depend on the width the intermediate was computed at, so the folded
+    # value truncated to the declared width is exactly what the generated
+    # code produces, even if an intermediate wrapped. `/`, `%` and `>>` are
+    # NOT ring operations and are folded separately, under stricter guards.
+    _RING_FOLD_OPS = {
+        '+': lambda a, b: a + b,
+        '-': lambda a, b: a - b,
+        '*': lambda a, b: a * b,
+        '&': lambda a, b: a & b,
+        '|': lambda a, b: a | b,
+        '^': lambda a, b: a ^ b,
+    }
+
+    def _const_int_value(self, expr, whole: bool = False) -> Optional[int]:
+        """Exact value of a compile-time integer expression, or None.
+
+        AGAST #1393. Used only to decide whether a narrowing is provably
+        lossless, so every case must be sound: None means "not proven", which
+        makes the caller demand an explicit `as`.
+
+        A named constant narrower than 64 bits is accepted only when it is the
+        WHOLE initialiser (`whole=True`). Inside an expression it would be
+        computed at its own width -- `A + A` with `A: u8 = 200` wraps before
+        any widening -- so its exact value would not be the generated one.
+        """
+        if isinstance(expr, rast.IntLit):
+            return expr.value
+        if isinstance(expr, rast.Grouped):
+            return self._const_int_value(expr.expr, whole)
+        if isinstance(expr, rast.Ident):
+            # Same precedence as emission: constants shadow locals.
+            entry = self.constants.get(expr.name)
+            if entry is None:
+                return None
+            value, ty = entry
+            if not isinstance(value, int) or not isinstance(ty, ir.IntType):
+                return None
+            if ty.width < 64 and not whole:
+                return None
+            return value
+        if isinstance(expr, rast.UnaryOp) and expr.op in ('-', '~'):
+            inner = self._const_int_value(expr.operand)
+            if inner is None:
+                return None
+            return -inner if expr.op == '-' else ~inner
+        if isinstance(expr, rast.BinOp):
+            left = self._const_int_value(expr.left)
+            right = self._const_int_value(expr.right)
+            if left is None or right is None:
+                return None
+            if expr.op == '<<':
+                # A shift of 64 or more is poison in LLVM, not 0.
+                return left << right if 0 <= right < 64 else None
+            if expr.op in ('>>', '/', '%'):
+                # Operands here are computed at 64 bits (see the Ident case),
+                # and these results depend on the operand VALUES, not only on
+                # their low bits. They equal the exact values only when both
+                # lie in [0, 2^63): then signed and unsigned forms (ashr/lshr,
+                # sdiv/udiv, srem/urem) agree, and no intermediate wrapped.
+                # `(1 << 62) * 4 >> 60` is 16 exactly but 0 at runtime.
+                if not (0 <= left < (1 << 63) and 0 <= right < (1 << 63)):
+                    return None
+                if expr.op == '>>':
+                    return left >> right if right < 64 else None
+                if right == 0:
+                    return None
+                return left // right if expr.op == '/' else left % right
+            fold = self._RING_FOLD_OPS.get(expr.op)
+            return fold(left, right) if fold else None
+        return None
+
+    def _provable_int_range(self, expr, whole: bool = False):
+        """(lo, hi) bounding every value `expr` can produce, or None.
+
+        AGAST #1393. Deliberately small -- exactly the shapes the corpus sweep
+        found to be lossless in practice:
+
+          * a compile-time constant           -> (v, v)
+          * `e & K` with constant K >= 0      -> (0, K), either operand order
+          * `if`/`match` whose every arm has a range -> their union
+
+        No reasoning about comparisons, loop bounds or variables. Widening
+        this is a language decision, pinned by test_implicit_narrowing.py.
+        """
+        value = self._const_int_value(expr, whole)
+        if value is not None:
+            return (value, value)
+        if isinstance(expr, rast.Grouped):
+            return self._provable_int_range(expr.expr)
+        if isinstance(expr, rast.BinOp) and expr.op == '&':
+            masks = [k for k in (self._const_int_value(expr.left),
+                                 self._const_int_value(expr.right))
+                     if k is not None and k >= 0]
+            if masks:
+                return (0, min(masks))
+            return None
+        if isinstance(expr, rast.Block):
+            return self._provable_int_range(expr.expr) if expr.expr is not None else None
+        if isinstance(expr, rast.If):
+            if expr.else_block is None:
+                return None
+            arms = [expr.then_block, expr.else_block]
+        elif isinstance(expr, rast.Match):
+            arms = [arm.body for arm in expr.arms]
+        else:
+            return None
+        ranges = [self._provable_int_range(arm) for arm in arms]
+        if not ranges or any(r is None for r in ranges):
+            return None
+        return (min(r[0] for r in ranges), max(r[1] for r in ranges))
+
+    def _check_implicit_narrowing(self, stmt, src_ty: ir.Type,
+                                  declared_ty: ir.Type) -> None:
+        """Reject `let n: i32 = <i64 expr>` unless it provably loses no bits.
+
+        AGAST #1393, the decision taken in #1364: implicit narrowing is an
+        error and an explicit `as T` is required. Refined 2026-09-24 so that
+        narrowings the compiler can PROVE lossless stay legal (see
+        `_provable_int_range`): of the 35 sites a 115-package sweep found,
+        28 were such constants and masks, and demanding `as` on them would
+        have taught people to cast reflexively -- the habit that hides the
+        one real defect the sweep found (#1443).
+
+        `src_ty` must be the initialiser's type BEFORE `_convert_type`; after
+        it the truncation has already happened and the narrowing is
+        invisible. An explicit `as T` needs no special case: the Cast has
+        already produced the declared width, so nothing narrows here.
+        """
+        if not (isinstance(src_ty, ir.IntType) and isinstance(declared_ty, ir.IntType)):
+            return
+        if src_ty.width <= declared_ty.width or declared_ty.width == 1:
+            return
+        declared = getattr(stmt, "type", None)
+        unsigned = self._is_unsigned_type(declared)
+        rng = self._provable_int_range(getattr(stmt, "value", None), whole=True)
+        if rng is not None:
+            lo, hi = rng
+            if (self._int_literal_fits(lo, declared_ty.width, unsigned)
+                    and self._int_literal_fits(hi, declared_ty.width, unsigned)):
+                return
+        declared_name = self._format_ritz_type(declared)
+        src_name = None
+        try:
+            inferred = self._infer_ritz_type(stmt.value)
+            if isinstance(inferred, rast.NamedType) and inferred.name in self._INT_TYPE_WIDTHS:
+                src_name = inferred.name
+        except Exception:
+            src_name = None
+        if src_name is None or self._INT_TYPE_WIDTHS.get(src_name) != src_ty.width:
+            src_name = f"i{src_ty.width}"
+        raise EmitError(
+            f"implicit narrowing: `{stmt.name}` is declared `{declared_name}` "
+            f"but its initialiser has type `{src_name}`, and the compiler "
+            f"cannot prove the value fits. Write `<expr> as {declared_name}` "
+            f"if truncation is intended, or declare `{stmt.name}` as "
+            f"`{src_name}`",
             getattr(stmt, "span", None),
         )
 

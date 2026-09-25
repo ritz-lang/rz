@@ -27,9 +27,10 @@ emission is the first and only pass that could notice.
 
 SCOPE, deliberately narrow. This rejects only the irreconcilable case: a scalar
 annotation on an aggregate value, or an aggregate annotation on a scalar value.
-Nothing here touches implicit *narrowing* (`let n: i32 = <i64>`, which today
-compiles and silently truncates) — that is a language decision recorded in
-#1364 and not one to make from inside a bug fix.
+Implicit *narrowing* (`let n: i32 = <i64>`) was deliberately left alone here as
+an open language question. #1364 has since settled it: it is an error unless
+provably lossless (#1393). That rule lives in `_check_implicit_narrowing` and is
+tested in test_implicit_narrowing.py; the single test below only marks the flip.
 
 The controls are not padding. `_convert_type` legitimately returns a value
 whose LLVM type differs from the target in several cases the compiler depends
@@ -187,21 +188,21 @@ fn main() -> i32
     assert r.returncode == 0, f"`let p: *P = @q` was rejected:\n{r.stderr[-2000:]}"
 
 
-def test_implicit_narrowing_is_still_accepted(tmp_path):
-    """NOT an endorsement — a marker.
+def test_implicit_narrowing_is_rejected(tmp_path):
+    """Flipped on purpose — this is not a regression.
 
-    `let n: i32 = <i64>` truncates silently today. Whether that stays legal is
-    the open language question in #1364, and this fix deliberately does not
-    answer it. If someone later decides narrowing must be an error, this test
-    is the one to change, and changing it should be a conscious act rather
-    than a surprise.
+    This test used to be `test_implicit_narrowing_is_still_accepted`, a marker
+    pinning the old silent truncation while #1364 was undecided. The user
+    settled #1364 on 2026-09-09 (narrowing is an error, explicit `as T`
+    required) and refined it on 2026-09-24 to exempt provably lossless
+    constants and masks (#1393). `five()` returns an i64 the compiler cannot
+    bound, so it must now be rejected. The full rule is tested in
+    test_implicit_narrowing.py.
     """
     r = _compile(tmp_path, STRUCT_PRELUDE + """\
 fn main() -> i32
     let n: i32 = five()
     return n
 """)
-    assert r.returncode == 0, (
-        "narrowing now rejected — that is a language change, see #1364:\n"
-        f"{r.stderr[-2000:]}"
-    )
+    assert r.returncode != 0, "`let n: i32 = five()` (i64) compiled; #1393 makes it an error"
+    assert "implicit narrowing" in r.stderr, r.stderr[-2000:]
