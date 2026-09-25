@@ -981,8 +981,8 @@ High-level console I/O functions.
 |----------|-----------|-------------|
 | `prints` | `fn(s: StrView)` | Print a StrView (`"text"` literal) |
 | `println` | `fn(s: StrView)` | Print a StrView with newline |
-| `prints_cstr` | `fn(s: *u8)` | Print a NUL-terminated C string (`c"text"`) |
-| `println_cstr` | `fn(s: *u8)` | Print a C string with newline |
+| `prints_cstr` | `fn(s: *u8)` | C interop: print a NUL-terminated C string (`c"text"`, argv). Prefer `prints` |
+| `println_cstr` | `fn(s: *u8)` | C interop: print a C string with newline. Prefer `println` |
 | `print_char` | `fn(c: u8)` | Print character |
 | `print_int` | `fn(n: i64)` | Print integer |
 | `print_hex` | `fn(n: i64)` | Print hex with 0x prefix |
@@ -995,8 +995,8 @@ High-level console I/O functions.
 |----------|-----------|-------------|
 | `eprints` | `fn(s: StrView)` | Print a StrView to stderr |
 | `eprintln` | `fn(s: StrView)` | Print a StrView to stderr with newline |
-| `eprints_cstr` | `fn(s: *u8)` | Print a C string to stderr |
-| `eprintln_cstr` | `fn(s: *u8)` | Print a C string to stderr with newline |
+| `eprints_cstr` | `fn(s: *u8)` | C interop: print a C string to stderr. Prefer `eprints` |
+| `eprintln_cstr` | `fn(s: *u8)` | C interop: print a C string to stderr with newline. Prefer `eprintln` |
 | `eprint_char` | `fn(c: u8)` | Print char to stderr |
 | `eprint_int` | `fn(n: i64)` | Print int to stderr |
 
@@ -1004,10 +1004,10 @@ High-level console I/O functions.
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `print_string` | `fn(s: *String)` | Print String |
-| `println_string` | `fn(s: *String)` | Print String with newline |
-| `eprint_string` | `fn(s: *String)` | Print String to stderr |
-| `eprintln_string` | `fn(s: *String)` | Print String to stderr with newline |
+| `print_string` | `fn(s: @String)` | Print String |
+| `println_string` | `fn(s: @String)` | Print String with newline |
+| `eprint_string` | `fn(s: @String)` | Print String to stderr |
+| `eprintln_string` | `fn(s: @String)` | Print String to stderr with newline |
 | `print_i64` | `fn(n: i64)` | Print i64 as String |
 | `println_i64` | `fn(n: i64)` | Print i64 with newline |
 | `eprint_i64` | `fn(n: i64)` | Print i64 to stderr |
