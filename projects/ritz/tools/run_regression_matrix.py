@@ -18,9 +18,20 @@ RITZ0 = [sys.executable, str(RITZ_ROOT / "ritz0/ritz0.py")]
 RITZ1 = str(RITZ_ROOT / "ritz1/build/ritz1")
 RITZ1_SH = str(RITZ_ROOT / "ritz1/build/ritz1_selfhosted")
 
+# The ritzlib modules compiled and linked into every matrix cell. Every name
+# must exist as ritzlib/<name>.ritz; a missing one is a hard error
+# (resolve_ritzlib_modules). It used to be a silent `continue`, so "bytes",
+# which has never existed in git history and which nothing imports, sat here
+# for months as 15 names, 14 links and no diagnostic (AGAST #1345). It was
+# deleted, not written: ritzlib/buf.ritz is the byte-buffer module.
+#
+# This is NOT ritzlib coverage. The list is what the test_issue_* repros need
+# to link, a minority of the modules on disk; ritzlib_coverage_line() prints
+# the real denominator on every run. Widening it is separate work.
+RITZLIB_DIR = RITZ_ROOT / "ritzlib"
 RITZLIB_MODULES = ["sys", "io", "str", "strview", "string", "hash", "memory",
                    "gvec", "drop", "env", "option", "result", "hashmap",
-                   "bytes", "span"]
+                   "span"]
 
 # Cells that are known to fail, keyed by (compiler, test) so an excuse for
 # ritz1 never silently covers ritz1_selfhosted — the two disagreeing is a
@@ -216,12 +227,42 @@ def compile_with_ritz1(binary, src_path, out_ll, env):
     return subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=60)
 
 
+def resolve_ritzlib_modules(modules=None, ritzlib_dir=None):
+    """(sources, missing) for the named ritzlib modules, in list order.
+
+    Defaults are resolved at call time, not bound as default arguments, so
+    a test that monkeypatches RITZLIB_MODULES is honoured.
+    """
+    modules = RITZLIB_MODULES if modules is None else modules
+    ritzlib_dir = RITZLIB_DIR if ritzlib_dir is None else Path(ritzlib_dir)
+    srcs, missing = [], []
+    for mod in modules:
+        src = ritzlib_dir / f"{mod}.ritz"
+        if src.is_file():
+            srcs.append(src)
+        else:
+            missing.append(mod)
+    return srcs, missing
+
+
+def ritzlib_coverage_line(modules=None, ritzlib_dir=None):
+    """Say how much of ritzlib the matrix links, so green is not over-read."""
+    modules = RITZLIB_MODULES if modules is None else modules
+    ritzlib_dir = RITZLIB_DIR if ritzlib_dir is None else Path(ritzlib_dir)
+    on_disk = len(list(ritzlib_dir.glob("*.ritz")))
+    return (f"# Linking {len(modules)} of {on_disk} ritzlib modules on disk "
+            f"(RITZLIB_MODULES). A green matrix does NOT mean ritzlib is covered.")
+
+
 def build_ritzlib_objs(tmpdir, env):
+    srcs, missing = resolve_ritzlib_modules()
+    if missing:
+        return None, (f"RITZLIB_MODULES names module(s) with no source file in "
+                      f"{RITZLIB_DIR}: {', '.join(missing)}. Write the module "
+                      f"or delete the name, and say which in the commit.")
     objs = []
-    for mod in RITZLIB_MODULES:
-        src = RITZ_ROOT / "ritzlib" / f"{mod}.ritz"
-        if not src.exists():
-            continue
+    for src in srcs:
+        mod = src.stem
         ll = Path(tmpdir) / f"ritzlib_{mod}.ll"
         o = Path(tmpdir) / f"ritzlib_{mod}.o"
         cmd = RITZ0 + [str(src), "-o", str(ll), "--no-runtime",
@@ -323,6 +364,7 @@ def main():
     tests = [t for t in TESTS if test_re.search(t)]
 
     with tempfile.TemporaryDirectory(prefix="matrix_") as tmpdir:
+        print(ritzlib_coverage_line(), flush=True)
         print(f"# Building ritzlib objects in {tmpdir} ...", flush=True)
         ritzlib_objs, err = build_ritzlib_objs(tmpdir, env)
         if err:

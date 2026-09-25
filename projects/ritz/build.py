@@ -1926,6 +1926,73 @@ def ritz_path_for_tests(caller_path: str) -> str:
     return ":".join([root_str] + kept)
 
 
+_HARNESS_SUMMARY = re.compile(r"(\d+) passed, (\d+) failed")
+
+
+def classify_test_file(returncode: int, stdout: str) -> tuple[str, int, int]:
+    """Classify one `ritz0 --test <file>` run as (status, passed, failed).
+
+    status is one of:
+      pass   exited 0, printed a harness summary, at least one test ran, none failed
+      fail   the harness ran and at least one test failed
+      error  non-zero exit or no harness summary: compile, link or crash
+      empty  exited 0 and ran ZERO tests
+
+    `empty` is a failure, not a pass (AGAST #1345). `ritz0 --test` prints
+    "0 passed, 0 failed" and exits 0 for a file with no [[test]] function,
+    and this used to be reported as "✓ file — 0 passed". A test file that
+    cannot fail cannot be told apart from one that does not exist.
+    """
+    passed = failed = 0
+    seen = False
+    for line in stdout.splitlines():
+        m = _HARNESS_SUMMARY.search(line)
+        if m:  # last matching line wins
+            passed, failed = int(m.group(1)), int(m.group(2))
+            seen = True
+    # Checked BEFORE the exit code: `ritz0 --test` exits 1 when a test fails.
+    # The old inline parser tested `returncode != 0` first, so every
+    # assertion failure was reported as a compile failure and the Σ line's
+    # "failed" count could only ever be 0.
+    if failed > 0:
+        return "fail", passed, failed
+    if returncode != 0 or not seen:
+        return "error", passed, failed
+    if passed == 0:
+        return "empty", passed, failed
+    return "pass", passed, failed
+
+
+def format_test_summary(n_files: int, tests_passed: int, tests_failed: int,
+                        n_fail: int, n_error: int, n_empty: int,
+                        n_timeout: int) -> str:
+    """The Σ line for a package's .ritz test files.
+
+    The headline counts FILES that did not pass. It used to read
+
+        Σ 255 passed, 0 failed, 3 compile-failed, 0 timed-out
+
+    and "0 failed" beside three compile failures reads as green to anyone
+    scanning a log (AGAST #1345). A file that failed to compile has not
+    passed. Zero counts are left out, so nothing prints "0 failed".
+    """
+    not_passing = n_fail + n_error + n_empty + n_timeout
+    if not_passing == 0:
+        return f"  Σ ✓ {n_files} of {n_files} files passed ({tests_passed} tests)"
+    parts = []
+    if n_fail:
+        parts.append(f"{n_fail} with failing tests ({tests_failed} failed)")
+    if n_error:
+        parts.append(f"{n_error} compile-failed")
+    if n_empty:
+        parts.append(f"{n_empty} with no [[test]] functions")
+    if n_timeout:
+        parts.append(f"{n_timeout} timed-out")
+    ok = n_files - not_passing
+    return (f"  Σ ✗ {not_passing} of {n_files} files FAILED: {', '.join(parts)}"
+            f" | {ok} file(s) passed, {tests_passed} tests passed")
+
+
 def run_tests(pkg_dir: Path, config: dict) -> bool:
     """Run tests for a package."""
     pkg_name = config["package"]["name"]
@@ -1979,6 +2046,8 @@ def run_tests(pkg_dir: Path, config: dict) -> bool:
         total_failed = 0
         failing_files: list[tuple[Path, str]] = []  # (file, reason)
         timed_out_files: list[Path] = []
+        empty_files: list[Path] = []
+        n_fail_files = 0
         for tfile in ritz_tests:
             try:
                 result = subprocess.run(
@@ -1994,18 +2063,17 @@ def run_tests(pkg_dir: Path, config: dict) -> bool:
                 all_passed = False
                 continue
 
-            # Parse "N passed, M failed" from stdout (last matching line).
-            file_passed = 0
-            file_failed = 0
-            summary_seen = False
-            for line in result.stdout.splitlines():
-                m = re.search(r"(\d+) passed, (\d+) failed", line)
-                if m:
-                    file_passed = int(m.group(1))
-                    file_failed = int(m.group(2))
-                    summary_seen = True
+            status, file_passed, file_failed = classify_test_file(
+                result.returncode, result.stdout)
 
-            if result.returncode != 0 or not summary_seen:
+            if status == "empty":
+                empty_files.append(tfile)
+                print(f"    ✗ {tfile.name} — ran 0 tests: no [[test]] functions "
+                      f"(a test file that cannot fail is not a test)")
+                all_passed = False
+                continue
+
+            if status == "error":
                 # Compile / link / runtime failure before harness summary
                 err_blob = (result.stderr or "") + (result.stdout or "")
                 # Try to surface the most actionable line
@@ -2033,9 +2101,10 @@ def run_tests(pkg_dir: Path, config: dict) -> bool:
 
             total_passed += file_passed
             total_failed += file_failed
-            if file_failed > 0:
+            if status == "fail":
                 # Compiled and ran but some assertions failed
                 # Print the failure details from stdout
+                n_fail_files += 1
                 print(f"    ✗ {tfile.name} — {file_passed} passed, {file_failed} failed")
                 # Surface the failing harness messages (everything between the last
                 # "FAIL" or assertion line and the summary).
@@ -2046,17 +2115,15 @@ def run_tests(pkg_dir: Path, config: dict) -> bool:
             else:
                 print(f"    ✓ {tfile.name} — {file_passed} passed")
 
-        # Aggregate summary
-        n_compile_failures = len(failing_files)
-        n_timeouts = len(timed_out_files)
-        n_runtime_failures = max(0, total_failed)
-        print(
-            f"  Σ {total_passed} passed, "
-            f"{n_runtime_failures} failed, "
-            f"{n_compile_failures} compile-failed, "
-            f"{n_timeouts} timed-out "
-            f"(out of {len(ritz_tests)} files)"
-        )
+        print(format_test_summary(
+            n_files=len(ritz_tests),
+            tests_passed=total_passed,
+            tests_failed=total_failed,
+            n_fail=n_fail_files,
+            n_error=len(failing_files),
+            n_empty=len(empty_files),
+            n_timeout=len(timed_out_files),
+        ))
 
     # Run test.sh if it exists
     test_script = pkg_dir / "test.sh"
