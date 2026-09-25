@@ -71,7 +71,8 @@ Ritzlib is built on three core principles:
    - [uring](#uring) - io_uring bindings
 9. [Process Management](#process-management)
    - [process](#process) - Subprocess spawning
-   - [args](#args) - Argument parsing
+   - [argspec](#argspec) - Argument parsing
+   - [args](#args) - Argument parsing (deprecated)
    - [env](#env) - Environment variables
 10. [Utilities](#utilities)
     - [timer](#timer) - High-precision timing
@@ -1631,11 +1632,111 @@ struct ProcessResult
 
 ---
 
+### argspec
+
+**Module**: `ritzlib.argspec`
+
+Command-line parsing, the idiomatic way (AGAST #1448); replaces the deprecated
+[args](#args).  `examples/tier2_stdlib/77_args` exercises every function.
+
+Arguments are `StrView`s pointing into argv (nothing is copied), the spec is a
+struct holding a `Vec<ArgFlag>`, lookups return `Option`, and parse failures
+come back as `Result<_, ArgError>` rather than being printed by the parser.
+A lookup `name` matches an option's long name, or its short name if it is one
+byte (`"count"` or `"n"`).
+
+**argv**:
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `args_from_argv` | `fn(argc: i32, argv: **u8) -> Vec<StrView>` | Every argv entry, argv[0] included |
+| `args_tail` | `fn(all: @Vec<StrView>) -> Span<StrView>` | The arguments after the program name |
+| `args_get` | `fn(args: @Span<StrView>, i: i64) -> Option<StrView>` | Bounds-checked element |
+
+**Spec**:
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `argspec_new` | `fn(program: StrView, about: StrView) -> ArgSpec` | Empty spec |
+| `argspec_switch` | `fn(spec: @&ArgSpec, short: u8, long: StrView, help: StrView)` | Boolean option (`short` 0 / `long` `""` to omit a form) |
+| `argspec_option` | `fn(spec: @&ArgSpec, short: u8, long: StrView, value_name: StrView, help: StrView, default: Option<StrView>)` | Option taking a value |
+| `argspec_positionals` | `fn(spec: @&ArgSpec, name: StrView, help: StrView, min: i64, max: i64)` | Accept min..max positionals (`ARGS_UNLIMITED` = no max); none without this call |
+| `argspec_find` | `fn(spec: @ArgSpec, name: StrView) -> Option<i64>` | Index of an option |
+| `argspec_parse` | `fn(spec: @ArgSpec, args: Span<StrView>) -> Result<ParsedArgs, ArgError>` | Parse |
+| `argspec_print_help` | `fn(spec: @ArgSpec)` | Usage, options and arguments on stdout |
+| `argspec_drop` | `fn(spec: @&ArgSpec)` | Release the spec |
+
+**Result** (a `ParsedArgs` shares the spec's storage; drop it first):
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `parsed_switch` | `fn(p: @ParsedArgs, name: StrView) -> bool` | Switch given? (false for value options) |
+| `parsed_is_set` | `fn(p: @ParsedArgs, name: StrView) -> bool` | Option given at all? |
+| `parsed_value` | `fn(p: @ParsedArgs, name: StrView) -> Option<StrView>` | Given value, else default, else None |
+| `parsed_int` | `fn(p: @ParsedArgs, name: StrView) -> Result<i64, ArgError>` | `parsed_value` as an i64 |
+| `parsed_positional` | `fn(p: @ParsedArgs, i: i64) -> Option<StrView>` | i-th positional |
+| `parsed_positionals` | `fn(p: @ParsedArgs) -> Span<StrView>` | All positionals |
+| `parsed_drop` | `fn(p: @&ParsedArgs)` | Release the result |
+
+**Errors**: `ArgError` is a struct `{ kind: ArgErrorKind, text: StrView, limit: i64 }`
+with kinds `UnknownOption`, `MissingValue`, `UnexpectedValue`,
+`MissingPositional`, `TooManyPositionals`, `NotANumber` and `NotSet`.
+`arg_error_print(spec, @e)` writes `"<program>: <message>"` to stderr, and
+`arg_parse_i64(s: StrView) -> Result<i64, ArgError>` is the strict decimal
+parser `parsed_int` uses (sign, digits, range-checked).
+
+**Example**:
+```ritz
+import ritzlib.io
+import ritzlib.option
+import ritzlib.result
+import ritzlib.strview
+import ritzlib.gvec
+import ritzlib.argspec
+
+fn run(p: ParsedArgs) -> i32
+    var parsed = p
+    if parsed_switch(@parsed, "verbose")
+        prints("verbose\n")
+    let count: i64 = match parsed_int(@parsed, "count")
+        Ok(n) => n
+        Err(e) => -1
+    parsed_drop(@&parsed)
+    count as i32
+
+fn fail(spec: @ArgSpec, e: ArgError) -> i32
+    arg_error_print(spec, @e)
+    2
+
+fn main(argc: i32, argv: **u8) -> i32
+    var all = args_from_argv(argc, argv)
+    var spec = argspec_new("myprogram", "Description")
+    argspec_switch(@&spec, 'v', "verbose", "Enable verbose output")
+    argspec_option(@&spec, 'n', "count", "NUM", "Number of items", Some("10"))
+    argspec_positionals(@&spec, "FILE", "Input file(s)", 0, ARGS_UNLIMITED)
+    let status: i32 = match argspec_parse(@spec, args_tail(@all))
+        Ok(p) => run(p)
+        Err(e) => fail(@spec, e)
+    argspec_drop(@&spec)
+    vec_drop<StrView>(@&all)
+    status
+```
+
+ritz1 cannot compile this module yet (#1487, #1488, #1497, #1498; see the
+`77_args` entry in `scripts/regression-known-failures-ritz1.txt`).  That is also why it is a
+separate module rather than part of `args`: ritz1 compiles every function of an
+imported module, so housing it in `args.ritz` would break every `args` caller
+under ritz1.
+
+---
+
 ### args
 
 **Module**: `ritzlib.args`
 
-Declarative argument parsing.
+**Deprecated** — use [argspec](#argspec) in new code.  `ArgParser` is C in
+Ritz's clothing (`*u8` strings, `i32` booleans, errors printed from inside
+`args_parse`) and stays only until its callers are ported.
 
 ```ritz
 struct ArgParser

@@ -1,0 +1,158 @@
+# Tests for ritzlib.argspec (AGAST #1448): every ArgErrorKind argspec_parse can return.
+#
+# Split across test_argspec_*.ritz because the runner compiles one harness
+# per test and gives each FILE 180s; the helpers below are repeated per file.
+#
+# The legacy ArgParser API (args_init / args_parse / ...) is deliberately not
+# covered here: its layout is pinned by ritz1 (#1440) and it is on its way out
+# once callers are ported.  Everything below goes through ArgSpec/ParsedArgs.
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.option
+import ritzlib.result
+import ritzlib.strview
+import ritzlib.span
+import ritzlib.gvec
+import ritzlib.argspec
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+# A spec shaped like a small coreutil:  demo [-v] [-q] [-n NUM] [--name=S] FILE...
+fn demo_spec() -> ArgSpec
+    var spec = argspec_new("demo", "A demo program")
+    argspec_switch(@&spec, 'v', "verbose", "Say more")
+    argspec_switch(@&spec, 'q', "", "Say less (short only)")
+    argspec_option(@&spec, 'n', "count", "NUM", "How many", Some("10"))
+    argspec_option(@&spec, 0, "name", "S", "Who (long only, no default)", None)
+    argspec_positionals(@&spec, "FILE", "Input files", 1, 3)
+    spec
+
+fn kind_code(k: ArgErrorKind) -> i64
+    match k
+        UnknownOption => 1
+        MissingValue => 2
+        UnexpectedValue => 3
+        MissingPositional => 4
+        TooManyPositionals => 5
+        NotANumber => 6
+        NotSet => 7
+
+fn err_code(e: ArgError) -> i64
+    kind_code(e.kind)
+
+fn err_text(e: ArgError) -> StrView
+    e.text
+
+fn err_limit(e: ArgError) -> i64
+    e.limit
+
+fn parse_err_code(spec: @ArgSpec, args: Span<StrView>) -> i64
+    match argspec_parse(spec, args)
+        Ok(p) => 0
+        Err(e) => err_code(e)
+
+fn parse_err_text(spec: @ArgSpec, args: Span<StrView>) -> StrView
+    match argspec_parse(spec, args)
+        Ok(p) => "<ok>"
+        Err(e) => err_text(e)
+
+fn parse_err_limit(spec: @ArgSpec, args: Span<StrView>) -> i64
+    match argspec_parse(spec, args)
+        Ok(p) => -100
+        Err(e) => err_limit(e)
+
+fn sv_eq(a: StrView, b: StrView) -> bool
+    strview_eq(@a, @b) != 0
+
+# ============================================================================
+# Parsing: every error variant
+# ============================================================================
+
+fn one(s: StrView) -> Span<StrView>
+    # Leaks one small allocation per call; fine in a test.
+    var v = vec_new<StrView>()
+    vec_push<StrView>(@&v, s)
+    vec_push<StrView>(@&v, "f")
+    span_from_ptr<StrView>(vec_as_ptr<StrView>(@v), 2)
+
+[[test]]
+fn test_error_unknown_long() -> i32
+    var spec = demo_spec()
+    assert parse_err_code(@spec, one("--bogus")) == 1
+    assert sv_eq(parse_err_text(@spec, one("--bogus")), "bogus")
+    assert sv_eq(parse_err_text(@spec, one("--bogus=3")), "bogus")
+    0
+
+[[test]]
+fn test_error_unknown_short() -> i32
+    var spec = demo_spec()
+    assert parse_err_code(@spec, one("-vx")) == 1
+    assert sv_eq(parse_err_text(@spec, one("-vx")), "x")
+    0
+
+[[test]]
+fn test_error_missing_value_long_and_short() -> i32
+    var spec = demo_spec()
+    var a: [2]StrView
+    a[0] = "f"
+    a[1] = "--count"
+    assert parse_err_code(@spec, span_from_ptr<StrView>(@a[0], 2)) == 2
+    assert sv_eq(parse_err_text(@spec, span_from_ptr<StrView>(@a[0], 2)), "count")
+    a[1] = "-vn"
+    assert parse_err_code(@spec, span_from_ptr<StrView>(@a[0], 2)) == 2
+    assert sv_eq(parse_err_text(@spec, span_from_ptr<StrView>(@a[0], 2)), "n")
+    0
+
+[[test]]
+fn test_error_switch_given_a_value() -> i32
+    var spec = demo_spec()
+    assert parse_err_code(@spec, one("--verbose=yes")) == 3
+    assert sv_eq(parse_err_text(@spec, one("--verbose=yes")), "verbose")
+    0
+
+[[test]]
+fn test_error_missing_positional() -> i32
+    var spec = demo_spec()
+    var a: [1]StrView
+    a[0] = "-v"
+    assert parse_err_code(@spec, span_from_ptr<StrView>(@a[0], 1)) == 4
+    assert sv_eq(parse_err_text(@spec, span_from_ptr<StrView>(@a[0], 1)), "FILE")
+    0
+
+[[test]]
+fn test_error_too_many_positionals() -> i32
+    var spec = demo_spec()
+    var a: [4]StrView
+    a[0] = "a"
+    a[1] = "b"
+    a[2] = "c"
+    a[3] = "d"
+    assert parse_err_code(@spec, span_from_ptr<StrView>(@a[0], 3)) == 0
+    assert parse_err_code(@spec, span_from_ptr<StrView>(@a[0], 4)) == 5
+    assert sv_eq(parse_err_text(@spec, span_from_ptr<StrView>(@a[0], 4)), "d")
+    assert parse_err_limit(@spec, span_from_ptr<StrView>(@a[0], 4)) == 3
+    0
+
+[[test]]
+fn test_unlimited_positionals() -> i32
+    var spec = argspec_new("cat", "")
+    argspec_positionals(@&spec, "FILE", "", 0, ARGS_UNLIMITED)
+    var a: [4]StrView
+    a[0] = "a"
+    a[1] = "b"
+    a[2] = "c"
+    a[3] = "d"
+    assert parse_err_code(@spec, span_from_ptr<StrView>(@a[0], 4)) == 0
+    assert parse_err_code(@spec, span_from_ptr<StrView>(@a[0], 0)) == 0
+    0
+
+[[test]]
+fn test_no_positional_spec_rejects_positionals() -> i32
+    var spec = argspec_new("true", "")
+    var a: [1]StrView
+    a[0] = "a"
+    assert parse_err_code(@spec, span_from_ptr<StrView>(@a[0], 1)) == 5
+    0

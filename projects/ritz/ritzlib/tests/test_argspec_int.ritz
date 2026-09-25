@@ -1,0 +1,113 @@
+# Tests for ritzlib.argspec (AGAST #1448): arg_parse_i64 and parsed_int.
+#
+# Split across test_argspec_*.ritz because the runner compiles one harness
+# per test and gives each FILE 180s; the helpers below are repeated per file.
+#
+# The legacy ArgParser API (args_init / args_parse / ...) is deliberately not
+# covered here: its layout is pinned by ritz1 (#1440) and it is on its way out
+# once callers are ported.  Everything below goes through ArgSpec/ParsedArgs.
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.option
+import ritzlib.result
+import ritzlib.strview
+import ritzlib.span
+import ritzlib.gvec
+import ritzlib.argspec
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+# A spec shaped like a small coreutil:  demo [-v] [-q] [-n NUM] [--name=S] FILE...
+fn demo_spec() -> ArgSpec
+    var spec = argspec_new("demo", "A demo program")
+    argspec_switch(@&spec, 'v', "verbose", "Say more")
+    argspec_switch(@&spec, 'q', "", "Say less (short only)")
+    argspec_option(@&spec, 'n', "count", "NUM", "How many", Some("10"))
+    argspec_option(@&spec, 0, "name", "S", "Who (long only, no default)", None)
+    argspec_positionals(@&spec, "FILE", "Input files", 1, 3)
+    spec
+
+fn kind_code(k: ArgErrorKind) -> i64
+    match k
+        UnknownOption => 1
+        MissingValue => 2
+        UnexpectedValue => 3
+        MissingPositional => 4
+        TooManyPositionals => 5
+        NotANumber => 6
+        NotSet => 7
+
+fn err_code(e: ArgError) -> i64
+    kind_code(e.kind)
+
+# ============================================================================
+# Integers
+# ============================================================================
+
+fn int_or(r: Result<i64, ArgError>, fallback: i64) -> i64
+    match r
+        Ok(n) => n
+        Err(e) => fallback
+
+fn int_err(r: Result<i64, ArgError>) -> i64
+    match r
+        Ok(n) => 0
+        Err(e) => err_code(e)
+
+[[test]]
+fn test_arg_parse_i64_accepts_signed_decimal() -> i32
+    assert int_or(arg_parse_i64("0"), -1) == 0
+    assert int_or(arg_parse_i64("42"), -1) == 42
+    assert int_or(arg_parse_i64("-17"), 0) == -17
+    assert int_or(arg_parse_i64("+5"), 0) == 5
+    assert int_or(arg_parse_i64("9223372036854775807"), 0) == 9223372036854775807
+    assert int_or(arg_parse_i64("-9223372036854775808"), 0) == -9223372036854775807 - 1
+    0
+
+[[test]]
+fn test_arg_parse_i64_rejects_garbage() -> i32
+    assert int_err(arg_parse_i64("")) == 6
+    assert int_err(arg_parse_i64("-")) == 6
+    assert int_err(arg_parse_i64("12x")) == 6
+    assert int_err(arg_parse_i64(" 1")) == 6
+    assert int_err(arg_parse_i64("9223372036854775808")) == 6
+    assert int_err(arg_parse_i64("99999999999999999999")) == 6
+    assert int_err(arg_parse_i64("-9223372036854775809")) == 6
+    0
+
+[[test]]
+fn test_parsed_int_value_default_and_errors() -> i32
+    var spec = demo_spec()
+    var a: [3]StrView
+    a[0] = "--name=zed"
+    a[1] = "f"
+    a[2] = "-n-3"
+    match argspec_parse(@spec, span_from_ptr<StrView>(@a[0], 2))
+        Ok(p) => check_int_defaults(@p)
+        Err(e) => (100 + err_code(e)) as i32
+
+fn check_int_defaults(p: @ParsedArgs) -> i32
+    if (int_or(parsed_int(p, "count"), -1) == 10) == false     # from the default
+        return 29
+    if (int_err(parsed_int(p, "name")) == 6) == false          # "zed"
+        return 30
+    if (int_err(parsed_int(p, "bogus")) == 7) == false         # no such option
+        return 31
+    0
+
+[[test]]
+fn test_parsed_int_not_set_without_default() -> i32
+    var spec = demo_spec()
+    var a: [1]StrView
+    a[0] = "f"
+    match argspec_parse(@spec, span_from_ptr<StrView>(@a[0], 1))
+        Ok(p) => check_int_not_set(@p)
+        Err(e) => (100 + err_code(e)) as i32
+
+fn check_int_not_set(p: @ParsedArgs) -> i32
+    if (int_err(parsed_int(p, "name")) == 7) == false
+        return 32
+    0

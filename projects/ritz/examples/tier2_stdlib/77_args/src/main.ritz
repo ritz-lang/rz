@@ -1,0 +1,144 @@
+# argdemo — the idiomatic ritzlib.argspec API, end to end (AGAST #1448).
+#
+#   argdemo [-h] [-v] [-q] [-s] [-n NUM] [--name=S] [--lookup=OPT] [ITEM]...
+#
+# Prints what it was given, one fact per line, so test.sh can pin the parse
+# and the regression suite can diff ritz0's binary against ritz1's.  Exit
+# status: 0 on success, 2 on a usage error (reported on stderr).
+#
+# Every public function of the new API is called from here.  The style is
+# shaped by ritz1's current limits (see the header of ritzlib/argspec.ritz):
+# each `match` is a value-producing expression whose arms are single calls,
+# and match-bound payloads are handed to a helper rather than dereferenced.
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.option
+import ritzlib.result
+import ritzlib.strview
+import ritzlib.span
+import ritzlib.gvec
+import ritzlib.argspec
+
+fn build_spec() -> ArgSpec
+    var spec = argspec_new("argdemo", "Report how a command line parses.")
+    argspec_switch(@&spec, 'h', "help", "Show this help")
+    argspec_switch(@&spec, 'v', "verbose", "Say more")
+    argspec_switch(@&spec, 'q', "", "Say less")
+    argspec_switch(@&spec, 's', "sum", "Add up the ITEMs as integers")
+    argspec_option(@&spec, 'n', "count", "NUM", "A number", Some("10"))
+    argspec_option(@&spec, 0, "name", "S", "A name", None)
+    argspec_option(@&spec, 0, "lookup", "OPT", "Report where OPT sits in the spec", None)
+    argspec_positionals(@&spec, "ITEM", "Things to report on", 0, ARGS_UNLIMITED)
+    spec
+
+# ---------------------------------------------------------------------------
+# Small printers.  Each returns 0 so it can stand as a match arm's value.
+# ---------------------------------------------------------------------------
+
+fn yes_no(b: bool) -> StrView
+    if b
+        return "yes"
+    "no"
+
+fn or_none(o: Option<StrView>) -> StrView
+    match o
+        Some(s) => s
+        None => "(none)"
+
+fn line(label: StrView, value: StrView) -> i32
+    prints(label)
+    prints(": ")
+    prints(value)
+    prints("\n")
+    0
+
+fn int_line(label: StrView, n: i64) -> i32
+    prints(label)
+    prints(": ")
+    print_int(n)
+    prints("\n")
+    0
+
+fn fail(spec: @ArgSpec, e: ArgError) -> i32
+    arg_error_print(spec, @e)
+    2
+
+# ---------------------------------------------------------------------------
+# The report
+# ---------------------------------------------------------------------------
+
+fn report_lookup(spec: @ArgSpec, opt: StrView) -> i32
+    match argspec_find(spec, opt)
+        Some(i) => int_line("lookup", i)
+        None => line("lookup", "not an option")
+
+fn lookup(spec: @ArgSpec, p: @ParsedArgs) -> i32
+    match parsed_value(p, "lookup")
+        Some(opt) => report_lookup(spec, opt)
+        None => 0
+
+fn item_line(i: i64, item: StrView) -> i32
+    prints("  ")
+    print_int(i)
+    prints(": ")
+    prints(item)
+    prints("\n")
+    0
+
+fn items_from(p: @ParsedArgs, i: i64) -> i32
+    match parsed_positional(p, i)
+        Some(item) => item_line(i, item) + items_from(p, i + 1)
+        None => 0
+
+# --sum: fold the positionals through arg_parse_i64, stopping at the first
+# one that isn't a number.
+fn sum_from(spec: @ArgSpec, p: @ParsedArgs, i: i64, total: i64) -> i32
+    match parsed_positional(p, i)
+        Some(item) => sum_item(spec, p, i, total, item)
+        None => int_line("sum", total)
+
+fn sum_item(spec: @ArgSpec, p: @ParsedArgs, i: i64, total: i64, item: StrView) -> i32
+    match arg_parse_i64(item)
+        Ok(n) => sum_from(spec, p, i + 1, total + n)
+        Err(e) => fail(spec, e)
+
+fn report(spec: @ArgSpec, p: @ParsedArgs) -> i32
+    if parsed_switch(p, "help")
+        argspec_print_help(spec)
+        return 0
+    line("verbose", yes_no(parsed_switch(p, "verbose")))
+    line("quiet", yes_no(parsed_switch(p, "q")))
+    line("count given", yes_no(parsed_is_set(p, "count")))
+    let count_status: i32 = match parsed_int(p, "count")
+        Ok(n) => int_line("count", n)
+        Err(e) => fail(spec, e)
+    if count_status != 0
+        return count_status
+    line("name", or_none(parsed_value(p, "name")))
+    lookup(spec, p)
+    let items = parsed_positionals(p)
+    int_line("items", items.len)
+    items_from(p, 0)
+    if parsed_switch(p, "sum")
+        return sum_from(spec, p, 0, 0)
+    0
+
+fn run(spec: @ArgSpec, p: ParsedArgs) -> i32
+    var parsed = p
+    let status = report(spec, @parsed)
+    parsed_drop(@&parsed)
+    status
+
+fn main(argc: i32, argv: **u8) -> i32
+    var all = args_from_argv(argc, argv)
+    var spec = build_spec()
+    let args = args_tail(@all)
+    int_line("args", args.len)
+    line("first", or_none(args_get(@args, 0)))
+    let status: i32 = match argspec_parse(@spec, args)
+        Ok(p) => run(@spec, p)
+        Err(e) => fail(@spec, e)
+    argspec_drop(@&spec)
+    vec_drop<StrView>(@&all)
+    status
