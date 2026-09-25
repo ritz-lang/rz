@@ -41,6 +41,47 @@ EXAMPLES_DIR="$ROOT_DIR/examples"
 # Set RITZ_PATH for import resolution (ritz1 needs this to find ritzlib)
 export RITZ_PATH="$ROOT_DIR"
 
+# One TCP port per regression run, for the server examples (AGAST #1535).
+#
+# 74_async_tiers, 75_tier2_uring and 76_tier3_http used to bind fixed ports.
+# Rooms gate in parallel on one host, so the second run to reach 75 found 9002
+# taken, printed "Failed to bind", exited 0 -- and compare_runs called that a
+# termination change: a false red that teaches people to rerun until green.
+#
+# The port reaches the program as RITZ_EXAMPLE_PORT in run_binary's fixed
+# `env -i` environment.  It is chosen once per run, NOT per stage: 31_env and
+# 33_printenv print their environment verbatim, and a per-stage value would
+# make them mismatch between stages.
+#
+# Picked at random from 20000-32767 -- below Linux's ephemeral range
+# (32768-60999), so an outgoing connection elsewhere on the host cannot be
+# handed it -- and probed free before use.  Nothing holds it between the
+# probe and the bind, so a collision is still possible, just rare; when it
+# happens run_binary classifies it as an infrastructure error (see there),
+# never as a compiler result.  A caller-supplied RITZ_EXAMPLE_PORT wins, so a
+# failing run can be reproduced exactly.
+pick_example_port() {
+    python3 - <<'PY'
+import random, socket
+for _ in range(200):
+    p = random.randint(20000, 32767)
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind(("0.0.0.0", p))
+    except OSError:
+        continue
+    finally:
+        s.close()
+    print(p)
+    break
+PY
+}
+REGRESSION_EXAMPLE_PORT="${RITZ_EXAMPLE_PORT:-$(pick_example_port)}"
+if [[ ! "$REGRESSION_EXAMPLE_PORT" =~ ^[0-9]+$ ]]; then
+    echo "regression.sh: could not choose a free port for the server examples" >&2
+    exit 1
+fi
+
 # Counters
 TOTAL_PASSED=0
 TOTAL_FAILED=0
@@ -449,7 +490,7 @@ run_binary() {
     # byte comparison to the weaker "still non-terminating" property check --
     # a state-dependent weakening of the assertion, which is the same
     # stale-artifact class this suite exists to catch.
-    rm -f "${exit_file}.nonterminating"
+    rm -f "${exit_file}.nonterminating" "${exit_file}.infra"
 
     # Run inside a freshly built, byte-identical fixture tree.
     #
@@ -528,6 +569,7 @@ run_binary() {
         TZ=UTC \
         SHELL=/bin/sh \
         TERM=dumb \
+        RITZ_EXAMPLE_PORT="$REGRESSION_EXAMPLE_PORT" \
         timeout --signal=KILL 5s "$binary" < /dev/null > "$raw" 2>&1 )
     local exit_code=$?
 
@@ -565,6 +607,16 @@ run_binary() {
     [[ $(wc -c < "$stdout_file") -ge 1048576 ]] && truncated=1
     if [[ "$exit_code" == "124" || "$exit_code" == "137" || "$exit_code" == "153" || $truncated -eq 1 ]]; then
         echo "1" > "${exit_file}.nonterminating"
+    fi
+
+    # A server that could not bind its port never ran: what we captured says
+    # something about the host (another process, another regression run),
+    # nothing about the compiler.  Record that separately so compare_runs can
+    # say so, rather than reading "exited at once" as a termination change --
+    # AGAST #1535.  Matches every server's wording ("Failed to bind",
+    # "Failed to bind to port N") at the start of a line.
+    if grep -q '^Failed to bind' "$stdout_file" 2>/dev/null; then
+        echo "1" > "${exit_file}.infra"
     fi
     return 0
 }
@@ -724,6 +776,19 @@ compare_runs() {
 
     local code_a=$(cat "$exit_a")
     local code_b=$(cat "$exit_b")
+
+    # Infrastructure first (see run_binary): a side that could not bind its
+    # port never really ran, so no behavioural verdict -- termination, exit
+    # code or bytes -- can be drawn from it.  Still a failure, since nothing
+    # was verified, but a distinct one: rerunning is the right response here
+    # and ONLY here.
+    local side
+    for side in A:"$exit_a" B:"$exit_b"; do
+        if [[ -f "${side#*:}.infra" ]]; then
+            fail "$name: infrastructure error — side ${side%%:*} could not bind its port (RITZ_EXAMPLE_PORT=$REGRESSION_EXAMPLE_PORT in use?); not a compiler result"
+            return 1
+        fi
+    done
 
     # Non-terminating programs (see run_binary): compare the *property*, not
     # the bytes.  Both sides must agree the program still runs forever; if one
