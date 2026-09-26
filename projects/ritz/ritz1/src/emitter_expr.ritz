@@ -62,6 +62,68 @@ fn emit_member_gep_from_ptr(s: *EmitterState, result: *MemberPtrResult, base_ptr
     result.field = field
     result.success = 1
 
+# AGAST #1487: `w[i].field` on a `Vec<Struct>` local. Pre-fix this fell
+# through to "unhandled EXPR_MEMBER" even when w was annotated: the index
+# branches of emit_member_ptr handled `[N]St`, `[N]*St` and `**St`, not Vec.
+#
+# The element struct comes from the instantiated Vec's own `data: *T` field
+# (its pointee survives monomorphisation, #1440), not from decoding the
+# "Vec$" suffix, so `Vec$P` and `Vec$Pair` resolve alike.
+#
+# Only a Vec VALUE local: ritz0 (the oracle) rejects `w[i]` through a
+# `@&Vec<T>` param, so ritz1 does not accept it either.
+#
+# Lowering: GEP %Vec$T field `data` →
+# load `data` → GEP %T by index → GEP into %T for the field.
+# Returns 1 on success, 0 (nothing emitted) if `loc` is not a Vec<Struct>.
+fn emit_vec_elem_member_ptr(s: *EmitterState, e: *Expr, result: *MemberPtrResult, loc: *LocalVar) -> i32
+    if loc.type_name_len <= 4
+        return 0
+    if *(loc.type_name + 0) != 'V' or *(loc.type_name + 1) != 'e' or *(loc.type_name + 2) != 'c' or *(loc.type_name + 3) != '$'
+        return 0
+    if loc.var_type != TYPE_STRUCT
+        return 0
+    let vec_st: *StructDef = find_struct(s, loc.type_name, loc.type_name_len)
+    if vec_st == null
+        return 0
+    let data_idx: i32 = find_field_index(vec_st, c"data", 4)
+    if data_idx < 0
+        return 0
+    let data_field: *StructField = get_field_type(vec_st, data_idx)
+    if data_field.field_type != TYPE_PTR or data_field.field_type_name_len <= 0
+        return 0
+    let elem_st: *StructDef = find_struct(s, data_field.field_type_name, data_field.field_type_name_len)
+    if elem_st == null
+        return 0
+    let field_idx: i32 = find_field_index(elem_st, e.ident_ptr, e.ident_len)
+    if field_idx < 0
+        return 0
+    let field: *StructField = get_field_type(elem_st, field_idx)
+    let data_pp: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, data_pp)
+    emit_str(s, c" = getelementptr %")
+    emit_name(s, vec_st.name, vec_st.name_len)
+    emit_str(s, c", ptr ")
+    emit_reg(s, loc.reg)
+    emit_str(s, c", i32 0, i32 ")
+    emit_int(s, data_idx as i64)
+    emit_str(s, c"\n")
+    let data_p: i32 = emit_load_ptr(s, data_pp)
+    let idx_reg: i32 = emit_expr(s, e.left.right)
+    let elem_ptr: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, elem_ptr)
+    emit_str(s, c" = getelementptr %")
+    emit_name(s, elem_st.name, elem_st.name_len)
+    emit_str(s, c", ptr ")
+    emit_reg(s, data_p)
+    emit_str(s, c", i64 ")
+    emit_reg(s, idx_reg)
+    emit_str(s, c"\n")
+    emit_member_gep_from_ptr(s, result, elem_ptr, elem_st, field_idx, field)
+    return 1
+
 fn emit_member_ptr(s: *EmitterState, e: *Expr, result: *MemberPtrResult)
     result.reg = 0
     result.field = null
@@ -401,6 +463,9 @@ fn emit_member_ptr(s: *EmitterState, e: *Expr, result: *MemberPtrResult)
                             emit_str(s, c"\n")
                             emit_member_gep_from_ptr(s, result, elem_ptr_ap, elem_st_ap, field_idx_ap, field_ap)
                             return
+                # AGAST #1487: `w[i].field` where w is a Vec<Struct> local.
+                else if emit_vec_elem_member_ptr(s, e, result, arr_loc) == 1
+                    return
             # AGAST #190: same shape but the base is a global array of struct
             # (`var g_fallback: [100]FallbackPage; g_fallback[i].used`).
             # Without this branch find_local_struct_name returned null and
