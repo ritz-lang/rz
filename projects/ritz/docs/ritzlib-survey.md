@@ -141,6 +141,7 @@ tickets were needed. `77_args` arrived with `d8d79f6` and its blockers (#1487,
 | `69_result_string` | `%.13` is `i64`, expected `%String` | match arm binding a struct payload gets `alloca i64` | #1515 |
 | `72_raii` | unhandled `EXPR_MEMBER` in assignment | `self`-named param; generic impl methods; `{x}` interpolation | #1375, #1520, #1521 |
 | `75_async_reference` | cannot parse `async` | `async fn` items | #1456 |
+| `76_option` (added by #1460) | struct literal not in var initializer context | `Some(Point {..})`; match arm binding a struct payload gets `i64` (`Some(p) => p.x`) | #1362, #1515 |
 
 The allowlist is dominated by three causes: `async fn` (4 examples, #1456),
 `if` expressions (2, #1524) and function values (2, #1503). Those three fixes
