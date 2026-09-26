@@ -22,10 +22,14 @@ Repeat until the goal is met:
    - Don't run two rooms that will rewrite the same heavily edited file
      (for example `ritz1/src/emitter*.ritz`, `ritz0/emitter_llvmlite.py`). Queue
      the second behind the first with an AGAST dependency instead.
-3. **No tickets for the milestone?** Spawn a **survey room**: it measures the
+3. **Nudge idle rooms.** A room with no journal activity for 30+ minutes and
+   no REAP has probably ended its turn with work pending (#1533). Send it one
+   message (`ask_claude=True`) stating its last known state and the current
+   `main`, and tell it to resume.
+4. **No tickets for the milestone?** Spawn a **survey room**: it measures the
    milestone, files one AGAST ticket per defect found, and REAPs with only its
    notes (or no commit at all; see "Survey rooms").
-4. **Wait.** Schedule a long fallback wakeup (`ScheduleWakeup`, 1800s,
+5. **Wait.** Schedule a long fallback wakeup (`ScheduleWakeup`, 1800s,
    prompt `/rz-iterate`). REAP messages arrive with `ask_claude=True` and wake
    the room sooner.
 
@@ -57,8 +61,22 @@ brief, verify the agent woke), with these ritz values:
 | Model | `opus` |
 | Callback room | `rz` |
 
-Create the room on the server (`update_room_description`) **before**
-`systemctl start`, or the agent crash-loops on HTTP 400.
+Create the room on the server **before** `systemctl start`, or the agent
+crash-loops on HTTP 400. Use `send_room_message` ("Room initialized for AGAST
+#<id>."); `update_room_description` does NOT create a room, it returns "not
+found".
+
+**Provision every worktree** with `.claude/provision-room.sh <worktree>` after
+`git worktree add` and before starting the agent. It must print "room
+permissions OK". Without it the worktree is untrusted, and every `Write` blocks
+for 30 minutes on an approval nobody gives (#1378). On cleanup, run
+`.claude/provision-room.sh --remove <worktree>` after `git worktree remove`.
+
+**Before spawning, check the ticket isn't already fixed on `main`.** Many
+`ready` tickets were fixed in-session and never closed (#1369 and #1372 were
+found that way). A quick grep for the fix the ticket describes is enough; if
+it's there, `complete_task` with the evidence instead of spawning. Also add a
+"step 0: is it already fixed?" to each briefing.
 
 ### The briefing (send verbatim, with the placeholders filled)
 
@@ -81,6 +99,8 @@ Create the room on the server (`update_room_description`) **before**
 `rz` trusts your REAP message. It runs `git merge --ff-only` on the SHA you send
 and pushes. Nobody re-runs your tests. Your REAP vouches for that exact commit.
 
+0. **Is it already fixed on `origin/main`?** If so, `complete_task` with the
+   evidence and REAP `none`.
 1. **Test first.** Write failing tests, confirm they fail for the reason they
    name, then fix. Mutation-check the fix: break each part and confirm only its
    own tests go red.
@@ -115,6 +135,11 @@ and pushes. Nobody re-runs your tests. Your REAP vouches for that exact commit.
    ```
 9. **If `rz` sends you back** ("rebase: main moved"), rebase onto `origin/main`,
    re-run the gate, push, and send a new REAP line.
+
+**Never end a turn with work pending.** Nothing wakes you when a gate, subagent
+or test run finishes after your turn ends (#1533). Run `run-gate.sh --wait` in
+the foreground of the same turn. If you must end a turn early, schedule a
+wakeup first.
 
 **Never:** check out or push `main`, merge anything, remove your worktree, stop
 your unit, or delete your branch. `rz` does all of that after merging.
