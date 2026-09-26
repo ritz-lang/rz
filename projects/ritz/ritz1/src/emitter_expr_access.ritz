@@ -239,6 +239,66 @@ fn emit_expr_ident(s: *EmitterState, e: *Expr) -> i32
     emit_str(s, c" = add i64 0, 0\n")
     return zero
 
+# LLVM element type of a primitive const array, matching the emit_llvm_type
+# spelling emit_const_array_entry used for the `@NAME = internal constant
+# [N x T]` global, so the GEP stride equals the stored stride. Null for
+# element kinds emit_global_array_index cannot load and widen to i64
+# (struct, float, bool) — those keep their previous lowering.
+fn const_array_elem_llvm(t: i32) -> *u8
+    if t == TYPE_I8 or t == TYPE_U8
+        return c"i8"
+    if t == TYPE_I16 or t == TYPE_U16
+        return c"i16"
+    if t == TYPE_I32 or t == TYPE_U32
+        return c"i32"
+    if t == TYPE_I64 or t == TYPE_U64
+        return c"i64"
+    return null
+
+# `name[idx]` on a module-level `[size x elem_ty]` global (a `var` global or a
+# primitive const array): GEP the global directly, load the element at its
+# width, and widen it to the i64 every expression value is carried in.
+fn emit_global_array_index(s: *EmitterState, name: *u8, name_len: i32, size: i32, elem_t: i32, elem_ty: *u8, idx_expr: *Expr) -> i32
+    let gidx: i32 = emit_expr(s, idx_expr)
+    let gptr: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, gptr)
+    emit_str(s, c" = getelementptr [")
+    emit_int(s, size as i64)
+    emit_str(s, c" x ")
+    emit_str(s, elem_ty)
+    emit_str(s, c"], ptr @")
+    emit_name(s, name, name_len)
+    emit_str(s, c", i64 0, i64 ")
+    emit_reg(s, gidx)
+    emit_str(s, c"\n")
+    let gval: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, gval)
+    emit_str(s, c" = load ")
+    emit_str(s, elem_ty)
+    emit_str(s, c", ptr ")
+    emit_reg(s, gptr)
+    emit_str(s, c"\n")
+    var widen: *u8 = null
+    if elem_t == TYPE_U8 or elem_t == TYPE_U16 or elem_t == TYPE_U32
+        widen = c" = zext "
+    else if elem_t == TYPE_I8 or elem_t == TYPE_I16 or elem_t == TYPE_I32
+        widen = c" = sext "
+    else if elem_t == TYPE_PTR or elem_t == TYPE_PTR_PTR
+        widen = c" = ptrtoint "
+    if widen == null
+        return gval
+    let gwide: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, gwide)
+    emit_str(s, widen)
+    emit_str(s, elem_ty)
+    emit_str(s, c" ")
+    emit_reg(s, gval)
+    emit_str(s, c" to i64\n")
+    return gwide
+
 fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
     # Check if base is an array, pointer-to-pointer (e.g., argv: **u8), or pointer
     #
@@ -493,48 +553,21 @@ fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
     if base_type == TYPE_ARRAY and local == null and e.left.kind == EXPR_IDENT
         let garr: *GlobalVarDef = find_global(s, e.left.ident_ptr, e.left.ident_len)
         if garr != null and garr.array_elem_type != TYPE_STRUCT
-            let gidx: i32 = emit_expr(s, e.right)
-            let gty: *u8 = global_array_elem_llvm(garr)
-            let gptr: i32 = next_reg(s)
-            emit_str(s, c"  ")
-            emit_reg(s, gptr)
-            emit_str(s, c" = getelementptr [")
-            emit_int(s, garr.array_size as i64)
-            emit_str(s, c" x ")
-            emit_str(s, gty)
-            emit_str(s, c"], ptr @")
-            emit_name(s, garr.name, garr.name_len)
-            emit_str(s, c", i64 0, i64 ")
-            emit_reg(s, gidx)
-            emit_str(s, c"\n")
-            let gval: i32 = next_reg(s)
-            emit_str(s, c"  ")
-            emit_reg(s, gval)
-            emit_str(s, c" = load ")
-            emit_str(s, gty)
-            emit_str(s, c", ptr ")
-            emit_reg(s, gptr)
-            emit_str(s, c"\n")
-            # Widen to the i64 every expression value is carried in.
-            let gt: i32 = garr.array_elem_type
-            var widen: *u8 = null
-            if gt == TYPE_U8 or gt == TYPE_U16 or gt == TYPE_U32
-                widen = c" = zext "
-            else if gt == TYPE_I8 or gt == TYPE_I16 or gt == TYPE_I32
-                widen = c" = sext "
-            else if gt == TYPE_PTR or gt == TYPE_PTR_PTR
-                widen = c" = ptrtoint "
-            if widen == null
-                return gval
-            let gwide: i32 = next_reg(s)
-            emit_str(s, c"  ")
-            emit_reg(s, gwide)
-            emit_str(s, widen)
-            emit_str(s, gty)
-            emit_str(s, c" ")
-            emit_reg(s, gval)
-            emit_str(s, c" to i64\n")
-            return gwide
+            return emit_global_array_index(s, garr.name, garr.name_len, garr.array_size, garr.array_elem_type, global_array_elem_llvm(garr), e.right)
+
+    # AGAST #1534: a module `const T: [N]X = [...]`. emit_const_array_entry
+    # emits it as `@T = internal constant [N x X]`, but T is neither a local
+    # nor a global, so it fell to the pointer fallback below, where
+    # emit_expr_ident inlined the const's scalar value (0) as the base:
+    # `inttoptr i64 0` plus a byte-wide GEP — a segfault (cryptosec SBOX/RCON).
+    # Index the const's global at its real element width instead. A local of
+    # the same name shadows the const (local != null skips this).
+    if local == null and e.left.kind == EXPR_IDENT
+        let carr: *ConstEntry = find_const_entry(s, e.left.ident_ptr, e.left.ident_len)
+        if carr != null and carr.const_type == TYPE_ARRAY and carr.value_expr != null and carr.value_expr.kind == EXPR_ARRAY_LIT
+            let cty: *u8 = const_array_elem_llvm(carr.array_elem_type)
+            if cty != null
+                return emit_global_array_index(s, carr.name, carr.name_len, carr.array_size, carr.array_elem_type, cty, e.right)
 
     # task-101: Span$T indexing on a struct local — `let b = s.as_bytes(); b[0]`
     # or `let b = "ABC"; b[0]`. Without this, emit_expr(e.left) loads the whole
