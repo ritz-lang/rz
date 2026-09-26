@@ -11163,7 +11163,7 @@ class LLVMEmitter:
             if type_name == 'StrView' or str(type_name).startswith('StrView'):
                 hint = " — use strview_eq(@a, @b) from ritzlib.strview"
             elif type_name == 'String':
-                hint = " — use string_eq(@a, @b) from ritzlib.string"
+                hint = " — use string_eq_string(@a, @b) from ritzlib.string"
             elif any(getattr(t, 'name', None) == type_name
                      for t, _ in self.enum_types.values()):
                 # A payload-less enum never reaches here (tag comparison

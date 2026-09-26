@@ -463,7 +463,8 @@ struct String
 | Function | Signature | Description |
 |----------|-----------|-------------|
 | `string_push` | `fn(s: @&String, b: u8) -> i32` | Push byte |
-| `string_push_str` | `fn(s: @&String, cstr: *u8) -> i32` | Push C string |
+| `string_push_str` | `fn(s: @&String, sv: StrView) -> i32` | Push StrView (a `"..."` literal) |
+| `string_push_cstr` | `fn(s: @&String, cstr: *u8) -> i32` | Push NUL-terminated C string |
 | `string_push_string` | `fn(s: @&String, other: @String) -> i32` | Push String |
 | `string_push_bytes` | `fn(s: @&String, bytes: *u8, len: i64) -> i32` | Push bytes |
 | `string_push_i64` | `fn(s: @&String, n: i64) -> i32` | Push an integer in decimal (all of i64); replaces `itoa` |
@@ -476,7 +477,8 @@ struct String
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `string_eq` | `fn(a: @String, b: @String) -> i32` | Compare for equality |
+| `string_eq` | `fn(s: @String, other: StrView) -> bool` | Compare to a StrView (a `"..."` literal) |
+| `string_eq_string` | `fn(a: @String, b: @String) -> i32` | Compare two Strings |
 | `string_eq_cstr` | `fn(s: @String, cstr: *u8) -> i32` | Compare to C string |
 | `string_hash` | `fn(s: @String) -> u64` | Hash the string |
 
@@ -484,9 +486,9 @@ struct String
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `string_starts_with` | `fn(s: @String, prefix: *u8) -> i32` | Check prefix |
-| `string_ends_with` | `fn(s: @String, suffix: *u8) -> i32` | Check suffix |
-| `string_contains` | `fn(s: @String, needle: *u8) -> i32` | Check contains |
+| `string_starts_with` | `fn(s: @String, prefix: StrView) -> i32` | Check prefix |
+| `string_ends_with` | `fn(s: @String, suffix: StrView) -> i32` | Check suffix |
+| `string_contains` | `fn(s: @String, needle: StrView) -> i32` | Check contains |
 | `string_find` | `fn(s: @String, needle: @String) -> i64` | Find substring (-1 if not found) |
 | `string_slice` | `fn(s: @String, start: i64, end: i64) -> String` | Extract substring |
 | `string_clone` | `fn(s: @String) -> String` | Deep copy |
@@ -625,7 +627,7 @@ New code uses `StrView` (`ritzlib.strview`, borrowed) and `String`
 | `strrchr` | `strview_rfind` |
 | `strstr` | `strview_find`, `strview_contains` |
 | `strcpy`, `strncpy` | `string_from` (a `String` owns its copy); `strview_take` to bound it |
-| `strcat` | `string_push_strview`, `string_push_string` |
+| `strcat` | `string_push_str`, `string_push_string` |
 | `atoi` | `strview_parse_i64(s: @StrView) -> Option<i64>`: `None` for empty, junk or overflow, where `atoi` returns 0 or a prefix |
 | `itoa` | `string_push_i64(s: @&String, n: i64) -> i32` / `string_from_i64`: no caller-sized buffer |
 

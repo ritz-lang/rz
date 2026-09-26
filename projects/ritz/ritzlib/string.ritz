@@ -77,8 +77,8 @@ struct String
 #         return string_push_string(self, other)
 #
 #     # Push a C string onto this string.
-#     fn push_str(self: @&String, cstr: *u8) -> i32
-#         return string_push_str(self, cstr)
+#     fn push_str(self: @&String, sv: StrView) -> i32
+#         return string_push_str(self, sv)
 #
 #     # Push an i64 value onto the string.
 #     fn push_i64(self: @&String, n: i64) -> i32
@@ -126,7 +126,7 @@ struct String
 #
 #     # Compare for equality.
 #     fn eq(self: @String, other: @String) -> i32
-#         return string_eq(self, other)
+#         return string_eq_string(self, other)
 #
 #     # Hash the string.
 #     fn hash(self: @String) -> u64
@@ -249,8 +249,13 @@ pub fn string_get(s: @String, idx: i64) -> u8
 pub fn string_push(s: @&String, b: u8) -> i32
     return vec_push<u8>(@s.data, b)
 
-# Push a C string onto the string.
-pub fn string_push_str(s: @&String, cstr: *u8) -> i32
+# Push a StrView onto the string. A "..." literal is a StrView, so it passes
+# straight in. For a NUL-terminated C string use string_push_cstr.
+pub fn string_push_str(s: @&String, sv: StrView) -> i32
+    return string_push_bytes(s, sv.ptr, sv.len)
+
+# Push a NUL-terminated C string onto the string (FFI / *u8 interop).
+pub fn string_push_cstr(s: @&String, cstr: *u8) -> i32
     var i: i64 = 0
     while *(cstr + i) != 0
         if vec_push<u8>(@s.data, *(cstr + i)) != 0
@@ -273,10 +278,8 @@ pub fn string_push_bytes(s: @&String, bytes: *u8, len: i64) -> i32
             return -1
     return 0
 
-# Push the contents of a StrView onto this string.
-# Convenience wrapper over string_push_bytes — lets callers append string
-# literals (which are StrView in ritz) without going through c"..." FFI.
-# Takes StrView by value so callers can pass literals directly.
+# Alias of string_push_str (which now takes a StrView), kept for callers
+# written before #1474.
 pub fn string_push_strview(s: @&String, sv: StrView) -> i32
     return string_push_bytes(s, sv.ptr, sv.len)
 
@@ -292,8 +295,13 @@ pub fn string_pop(s: @&String) -> u8
 # Comparison
 # ============================================================================
 
-# Compare two strings for equality.
-pub fn string_eq(a: @String, b: @String) -> i32
+# Compare a String with a StrView for equality. A "..." literal is a StrView:
+#     if string_eq(@s, "hello")
+pub fn string_eq(s: @String, other: StrView) -> bool
+    return string_eq_strview(s, other) == 1
+
+# Compare two Strings for equality.
+pub fn string_eq_string(a: @String, b: @String) -> i32
     let len_a: i64 = a.data.len
     let len_b: i64 = b.data.len
 
@@ -470,30 +478,24 @@ pub fn string_set_char(s: @&String, idx: i64, c: u8) -> i32
     return 0
 
 # ============================================================================
-# Legacy C-interop predicates (for string literals)
+# StrView predicates (a "..." literal is a StrView)
 # ============================================================================
 
-# Check if string starts with a prefix (C string - for literals only).
-pub fn string_starts_with(s: @String, prefix: *u8) -> i32
+# Check if string starts with a prefix.
+pub fn string_starts_with(s: @String, prefix: StrView) -> i32
+    if prefix.len > s.data.len
+        return 0
     var i: i64 = 0
-    let len: i64 = s.data.len
-
-    while *(prefix + i) != 0
-        if i >= len
-            return 0
-        if vec_get<u8>(@s.data, i) != *(prefix + i)
+    while i < prefix.len
+        if vec_get<u8>(@s.data, i) != *(prefix.ptr + i)
             return 0
         i += 1
 
     return 1
 
-# Check if string ends with a suffix (C string - for literals only).
-pub fn string_ends_with(s: @String, suffix: *u8) -> i32
-    # Calculate suffix length
-    var suffix_len: i64 = 0
-    while *(suffix + suffix_len) != 0
-        suffix_len += 1
-
+# Check if string ends with a suffix.
+pub fn string_ends_with(s: @String, suffix: StrView) -> i32
+    let suffix_len: i64 = suffix.len
     let len: i64 = s.data.len
     if suffix_len > len
         return 0
@@ -501,18 +503,15 @@ pub fn string_ends_with(s: @String, suffix: *u8) -> i32
     let start: i64 = len - suffix_len
     var i: i64 = 0
     while i < suffix_len
-        if vec_get<u8>(@s.data, start + i) != *(suffix + i)
+        if vec_get<u8>(@s.data, start + i) != *(suffix.ptr + i)
             return 0
         i += 1
 
     return 1
 
-# Check if string contains a substring (C string - for literals only).
-pub fn string_contains(s: @String, needle: *u8) -> i32
-    # Calculate needle length
-    var needle_len: i64 = 0
-    while *(needle + needle_len) != 0
-        needle_len += 1
+# Check if string contains a substring.
+pub fn string_contains(s: @String, needle: StrView) -> i32
+    let needle_len: i64 = needle.len
 
     if needle_len == 0
         return 1  # Empty needle always matches
@@ -526,7 +525,7 @@ pub fn string_contains(s: @String, needle: *u8) -> i32
         var j: i64 = 0
         var found: i32 = 1
         while j < needle_len
-            if vec_get<u8>(@s.data, i + j) != *(needle + j)
+            if vec_get<u8>(@s.data, i + j) != *(needle.ptr + j)
                 found = 0
                 j = needle_len  # Break
             j += 1
@@ -580,10 +579,10 @@ pub fn string_from_hex(n: u64) -> String
     var s: String = string_new()
 
     if n == 0
-        string_push_str(@s, c"0x0")
+        string_push_str(@s, "0x0")
         return s
 
-    string_push_str(@s, c"0x")
+    string_push_str(@s, "0x")
 
     var val: u64 = n
     # Build hex digits in reverse order
