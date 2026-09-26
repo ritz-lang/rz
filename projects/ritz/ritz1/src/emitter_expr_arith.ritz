@@ -144,10 +144,25 @@ fn emit_expr_binary(s: *EmitterState, e: *Expr) -> i32
     var is_ptr_arith: i32 = 0
     var ptr_elem_size: i64 = 1
     if e.op == OP_ADD or e.op == OP_SUB
-        let elem: i64 = ptr_arith_elem_size(s, e.left)
-        if elem != 0
+        # AGAST #1505: a left operand statically known to be `*S` strides by
+        # sizeof(S) — the same resolution the OP_DEREF arm loads through, so
+        # `*(q + i)` steps and loads the same type.  ptr_arith_elem_size
+        # alone does not scale a nested `a.b.items` field at all.
+        var ps_name: *u8 = null
+        var ps_len: i32 = 0
+        deref_pointee_struct_name(s, e.left, @ps_name, @ps_len)
+        # Only a StructDef has a size here; get_struct_size_by_name says 8
+        # for a tagged enum, so those keep ptr_arith_elem_size's answer.
+        if ps_len > 0 and find_struct(s, ps_name, ps_len) == null
+            ps_len = 0
+        if ps_len > 0
             is_ptr_arith = 1
-            ptr_elem_size = elem
+            ptr_elem_size = get_struct_size_by_name(s, ps_name, ps_len)
+        else
+            let elem: i64 = ptr_arith_elem_size(s, e.left)
+            if elem != 0
+                is_ptr_arith = 1
+                ptr_elem_size = elem
 
     let left_reg: i32 = emit_expr(s, e.left)
     let right_reg: i32 = emit_expr(s, e.right)
@@ -344,6 +359,110 @@ fn emit_expr_binary(s: *EmitterState, e: *Expr) -> i32
 
     return result
 
+# AGAST #1505 — static pointee struct of a deref operand.
+#
+# `*op` must load the pointee's LLVM type.  The OP_DEREF arm used to name the
+# struct only for a bare parameter identifier (`*p`) and silently `load i64`
+# for everything else, which clang rejects the moment the value is stored into
+# a struct slot:
+#
+#     let d: D = *(p + i)         # pointer arithmetic on a *D
+#     let q: *D = ...; *q         # let-local pointer
+#     *(h.items + i)              # pointer-typed struct field (21_ls)
+#     *name                       # `name: @StrView` reference param (ritzunit)
+#
+# Walks the operand's static type: `+`/`-` keep the pointer's type, so the
+# chain is followed down its left spine to the base pointer; the base is a
+# local/global pointer or reference, or a struct field.  A candidate name is
+# accepted only if it names a struct find_struct knows or a tagged enum
+# (`Option$T`) — primitive pointees the parser spelt as type names (`*u8` →
+# "u8") never resolve, so they keep their width-specific loads.  A bare `*p`
+# keeps its pre-#1505 unverified trust.  Writes null/0 when the pointee is not
+# a known aggregate.
+fn deref_pointee_struct_name(s: *EmitterState, op: *Expr, out_name: **u8, out_len: *i32)
+    *out_name = null
+    *out_len = 0
+    var base: *Expr = op
+    while base != null and base.kind == EXPR_BINARY and (base.op == OP_ADD or base.op == OP_SUB)
+        base = base.left
+    if base == null
+        return
+    var cand: *u8 = null
+    var cand_len: i32 = 0
+    # The pre-#1505 path: a bare `*p` on a local with a recorded struct
+    # pointee loaded `%<type_name>` unverified.  Keep trusting it — its names
+    # include tagged enums and other aggregates find_struct does not list.
+    var trusted: i32 = 0
+    if base.kind == EXPR_IDENT
+        let lv: *LocalVar = find_local_struct_name(s, base.ident_ptr, base.ident_len)
+        if lv != null
+            # Only a recorded TYPE_STRUCT pointee is trusted: the parser can
+            # leave a stale type_name on a primitive pointer param
+            # (`lex: *Lexer, out: *i64` gives `out` the name "Lexer").
+            let is_ptr: i32 = lv.var_type == TYPE_PTR or lv.var_type == TYPE_REF or lv.var_type == TYPE_MUT_REF
+            if base == op and lv.pointee_type == TYPE_STRUCT
+                cand = lv.type_name
+                cand_len = lv.type_name_len
+                trusted = 1
+            else if is_ptr and lv.pointee_type == TYPE_STRUCT
+                cand = lv.type_name
+                cand_len = lv.type_name_len
+        else
+            let glob: *GlobalVarDef = find_global(s, base.ident_ptr, base.ident_len)
+            if glob != null and glob.var_type == TYPE_PTR and glob.pointee_type == TYPE_STRUCT
+                cand = glob.type_name
+                cand_len = glob.type_name_len
+    else if base.kind == EXPR_MEMBER
+        let f: *StructField = deref_member_field(s, base)
+        if f != null and f.field_type == TYPE_PTR
+            # make_ptr_prim_field records primitive pointees here.
+            let pe: i32 = f.array_elem_type
+            let prim: i32 = pe == TYPE_U8 or pe == TYPE_I8 or pe == TYPE_U16 or pe == TYPE_I16 or pe == TYPE_U32 or pe == TYPE_I32 or pe == TYPE_U64 or pe == TYPE_I64
+            if not prim
+                cand = f.field_type_name
+                cand_len = f.field_type_name_len
+    if cand == null or cand_len <= 0
+        return
+    # `Option$T` / `Result$T,E` are tagged-enum aggregates, not StructDefs.
+    if trusted == 0 and is_tagged_enum_type(cand, cand_len) == 0
+        let st: *StructDef = find_struct(s, cand, cand_len)
+        if st == null
+            return
+    *out_name = cand
+    *out_len = cand_len
+
+# The StructField a member expression `recv.field` names, following nested
+# receivers (`a.b.field`) and struct-pointer receivers.  null if unresolved.
+fn deref_member_field(s: *EmitterState, e: *Expr) -> *StructField
+    if e == null or e.kind != EXPR_MEMBER or e.left == null
+        return null
+    var recv: *u8 = null
+    var recv_len: i32 = 0
+    if e.left.kind == EXPR_IDENT
+        let lv: *LocalVar = find_local_struct_name(s, e.left.ident_ptr, e.left.ident_len)
+        if lv != null
+            recv = lv.type_name
+            recv_len = lv.type_name_len
+        else
+            let glob: *GlobalVarDef = find_global(s, e.left.ident_ptr, e.left.ident_len)
+            if glob != null
+                recv = glob.type_name
+                recv_len = glob.type_name_len
+    else if e.left.kind == EXPR_MEMBER
+        let pf: *StructField = deref_member_field(s, e.left)
+        if pf != null and (pf.field_type == TYPE_STRUCT or pf.field_type == TYPE_PTR)
+            recv = pf.field_type_name
+            recv_len = pf.field_type_name_len
+    if recv == null or recv_len <= 0
+        return null
+    let st: *StructDef = find_struct(s, recv, recv_len)
+    if st == null
+        return null
+    let idx: i32 = find_field_index(st, e.ident_ptr, e.ident_len)
+    if idx < 0
+        return null
+    get_field_type(st, idx)
+
 fn emit_expr_unary(s: *EmitterState, e: *Expr) -> i32
     if e.op == OP_NEG
         let operand: i32 = emit_expr(s, e.operand)
@@ -378,6 +497,22 @@ fn emit_expr_unary(s: *EmitterState, e: *Expr) -> i32
         emit_str(s, c" = inttoptr i64 ")
         emit_reg(s, addr)
         emit_str(s, c" to ptr\n")
+        # AGAST #1505: a pointee statically known to be a struct loads that
+        # struct, whatever get_expr_type guessed (it reports TYPE_I64 for a
+        # let-local `*S` and TYPE_U8 for an unrecorded `*S` field pointee).
+        var sname: *u8 = null
+        var sname_len: i32 = 0
+        deref_pointee_struct_name(s, e.operand, @sname, @sname_len)
+        if sname_len > 0
+            let sresult: i32 = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, sresult)
+            emit_str(s, c" = load %")
+            emit_name(s, sname, sname_len)
+            emit_str(s, c", ptr ")
+            emit_reg(s, ptr)
+            emit_str(s, c"\n")
+            return sresult
         # Determine load type based on pointee type
         let deref_type: i32 = get_expr_type(s, e)
         if deref_type == TYPE_U8 or deref_type == TYPE_I8
@@ -434,64 +569,22 @@ fn emit_expr_unary(s: *EmitterState, e: *Expr) -> i32
             emit_str(s, c" to i64\n")
             return result
         else if deref_type == TYPE_STRUCT
-            # Load struct type - need to find the actual struct name.
-            # ritz-task-180: for `*id` where `id: *DocumentId` (newtype struct
-            # wrapping i64), the deref must load `%DocumentId`, not `i64`.
-            # Otherwise downstream `store %DocumentId %val, ptr ...` (e.g. in
-            # `doc.id = *id` field-assign) hits an LLVM type mismatch.
-            #
-            # Resolve the pointee struct name from the operand's local var.
-            # When a parameter `id: *DocumentId` is added to the locals table
-            # (emitter.ritz add_local_full), `loc.type_name` carries the
-            # pointee struct name and `loc.pointee_type == TYPE_STRUCT`.
-            var sname: *u8 = null
-            var sname_len: i32 = 0
-            if e.operand.kind == EXPR_IDENT
-                let lv: *LocalVar = find_local_struct_name(s, e.operand.ident_ptr, e.operand.ident_len)
-                if lv != null and lv.pointee_type == TYPE_STRUCT and lv.type_name_len > 0
-                    sname = lv.type_name
-                    sname_len = lv.type_name_len
-            else if e.operand.kind == EXPR_MEMBER
-                # `*x.field` where field is a pointer-to-struct.  Walk the
-                # struct def to find the field's `field_type_name`.
-                if e.operand.left.kind == EXPR_IDENT
-                    let outer: *LocalVar = find_local_struct_name(s, e.operand.left.ident_ptr, e.operand.left.ident_len)
-                    if outer != null and outer.type_name_len > 0
-                        let st: *StructDef = find_struct(s, outer.type_name, outer.type_name_len)
-                        if st != null
-                            let fidx: i32 = find_field_index(st, e.operand.ident_ptr, e.operand.ident_len)
-                            if fidx >= 0
-                                let f: *StructField = get_field_type(st, fidx)
-                                if f.field_type_name_len > 0
-                                    sname = f.field_type_name
-                                    sname_len = f.field_type_name_len
-
-            # Legacy fallback to (currently disabled) helper.
-            if sname_len == 0
-                let field: *StructField = get_deref_struct_type(s, e)
-                if field != null and field.field_type_name_len > 0
-                    sname = field.field_type_name
-                    sname_len = field.field_type_name_len
-
-            if sname_len > 0
-                let result: i32 = next_reg(s)
-                emit_str(s, c"  ")
-                emit_reg(s, result)
-                emit_str(s, c" = load %")
-                emit_name(s, sname, sname_len)
-                emit_str(s, c", ptr ")
-                emit_reg(s, ptr)
-                emit_str(s, c"\n")
-                return result
-            else
-                # Fallback to i64 if we can't determine struct name
-                let result: i32 = next_reg(s)
-                emit_str(s, c"  ")
-                emit_reg(s, result)
-                emit_str(s, c" = load i64, ptr ")
-                emit_reg(s, ptr)
-                emit_str(s, c"\n")
-                return result
+            # AGAST #1505: the pointee is a struct but deref_pointee_struct_name
+            # could not name it.  This used to fall back silently to
+            # `load i64`, which clang rejects as soon as the value meets a
+            # struct slot.  Report it at the deref's source position instead.
+            eprint_i64(e.span.line as i64)
+            eprint_char(':')
+            eprint_i64(e.span.col as i64)
+            eprints_cstr(c": ")
+            emit_ir_error(s, c"cannot determine the struct type loaded by this '*' deref")
+            let result: i32 = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, result)
+            emit_str(s, c" = load i64, ptr ")
+            emit_reg(s, ptr)
+            emit_str(s, c"\n")
+            return result
         else
             # Default: load i64
             let result: i32 = next_reg(s)
