@@ -955,6 +955,46 @@ def get_binaries(pkg_dir: Path, config: dict) -> list[BinaryConfig]:
     return plan_binaries(pkg_dir, config).buildable
 
 
+def ritz1_compile_cmd(compiler: str, src: Path, ll_path: Path) -> Optional[list]:
+    """The ritz1-family command that compiles one source to LLVM IR.
+
+    ritz1's CLI is minimal: <input> -o <output> [-I <ritz_path>]. It doesn't
+    understand --no-runtime, --deps, --sources, --project-root or --target-os.
+    Its default emitter is non-freestanding (no _start embedded), so the
+    "--no-runtime" semantics come for free. Import resolution: ritz1 tries
+    source_dir first, then RITZ_PATH (see `ritz1_env`). `-I` points at the ritz
+    ROOT so ritzlib/* imports resolve.
+
+    Returns None (after saying why) if the binary is missing.
+    """
+    ritz1_bin, make_hint = RITZ1_FAMILY_BINS[compiler]
+    if not ritz1_bin.exists():
+        print(f"  ✗ {compiler} binary not found at {ritz1_bin}", file=sys.stderr)
+        print(f"    Run: cd {ROOT} && {make_hint}", file=sys.stderr)
+        return None
+    return [str(ritz1_bin), str(src), "-o", str(ll_path), "-I", str(ROOT)]
+
+
+def ritz1_env() -> dict:
+    """Environment for a ritz1-family compile.
+
+    ritz1 needs RITZ_PATH to resolve qualified `ritzlib.*` imports AND
+    cross-project imports (`zeus.shm`, `mausoleum.client`). ROOT
+    (projects/ritz) lets ritz1 find ritzlib/* and self-host modules;
+    ROOT.parent (projects/) lets the subdir-probe resolver find cross-project
+    imports like `zeus.shm` → `projects/zeus/lib/shm.ritz`. Any caller-provided
+    RITZ_PATH (e.g. `./rz` pre-building a list of workspace roots) is kept,
+    after those two. Colon-separated, gcc-style.
+    """
+    env = os.environ.copy()
+    entries = [str(ROOT), str(ROOT.parent)]
+    for e in env.get("RITZ_PATH", "").split(os.pathsep):
+        if e and e not in entries:
+            entries.append(e)
+    env["RITZ_PATH"] = os.pathsep.join(entries)
+    return env
+
+
 def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources: list[Path] = None, keep_artifacts: bool = False, use_cache: bool = True, profile: dict = None, dependencies: dict[str, DependencySpec] = None, pkg_dir: Path = None, source_roots: list[str] = None, compiler: str = "ritz0") -> Path:
     """Compile Ritz source file(s) to a binary.
 
@@ -1186,22 +1226,9 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
 
             # All sources compiled without runtime - _start comes from external .o
             if compiler.startswith("ritz1"):
-                # ritz1's CLI is minimal: <input> -o <output> [-I <ritz_path>]. It
-                # doesn't understand --no-runtime, --deps, --sources, or
-                # --project-root. Its default emitter is non-freestanding (no
-                # _start embedded), so the "--no-runtime" semantics come for free.
-                # Import resolution: ritz1 tries source_dir first, then RITZ_PATH.
-                # We point `-I` at the ritz ROOT so ritzlib/* imports resolve,
-                # and also ensure RITZ_PATH is set to the same root for
-                # `ritzlib.X` qualified imports (ritz1 strips the "ritzlib"
-                # prefix when RITZ_PATH-resolving those).
-                ritz1_bin, make_hint = RITZ1_FAMILY_BINS[compiler]
-                if not ritz1_bin.exists():
-                    print(f"  ✗ {compiler} binary not found at {ritz1_bin}", file=sys.stderr)
-                    print(f"    Run: cd {ROOT} && {make_hint}", file=sys.stderr)
+                compile_cmd = ritz1_compile_cmd(compiler, src, ll_path)
+                if compile_cmd is None:
                     return None
-                i_root = str(ROOT)
-                compile_cmd = [str(ritz1_bin), str(src), "-o", str(ll_path), "-I", i_root]
             else:
                 compile_cmd = [sys.executable, str(RITZ0), str(src), "-o", str(ll_path), "--no-runtime"]
 
@@ -1219,26 +1246,7 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
                 if pkg_dir:
                     compile_cmd.extend(["--project-root", str(pkg_dir)])
 
-            # ritz1 needs RITZ_PATH to resolve qualified `ritzlib.*` imports
-            # AND cross-project imports (`zeus.shm`, `mausoleum.client`).
-            # ROOT (projects/ritz) lets ritz1 find ritzlib/* and self-host
-            # modules; ROOT.parent (projects/) lets the subdir-probe resolver
-            # find cross-project imports like `zeus.shm` → `projects/zeus/lib/shm.ritz`.
-            # Preserve any caller-provided RITZ_PATH (e.g. `./rz` may pre-build
-            # a list of workspace roots).  Colon-separated, gcc-style.
-            env = os.environ.copy()
-            if compiler.startswith("ritz1"):
-                caller_path = env.get("RITZ_PATH", "")
-                root_str = str(ROOT)             # projects/ritz
-                workspace_str = str(ROOT.parent) # projects
-                # Put ROOT first (ritzlib priority), workspace root second
-                # (cross-project imports), then any caller-provided entries.
-                caller_entries = [e for e in caller_path.split(os.pathsep) if e]
-                entries = [root_str, workspace_str]
-                for e in caller_entries:
-                    if e not in entries:
-                        entries.append(e)
-                env["RITZ_PATH"] = os.pathsep.join(entries)
+            env = ritz1_env() if compiler.startswith("ritz1") else os.environ.copy()
             result = subprocess.run(compile_cmd, capture_output=True, text=True, env=env)
             if result.returncode != 0:
                 # AGAST #1286: collect and keep going so every broken file is
@@ -1397,6 +1405,7 @@ def compile_freestanding_binary(
     profile: dict = None,
     dependencies: dict[str, DependencySpec] = None,
     source_roots: list[str] = None,
+    compiler: str = "ritz0",
 ) -> Path:
     """Compile a freestanding binary (kernel, bootloader, etc.).
 
@@ -1415,6 +1424,9 @@ def compile_freestanding_binary(
         profile: Build profile
         dependencies: RFC #109 dependencies
         source_roots: List of source directories to search for imports
+        compiler: "ritz0", "ritz1" or "ritz1_selfhosted". Never silently
+            substituted (AGAST #1473): a ritz1-family build that ritz1 cannot
+            honour fails with the reason instead of falling back to ritz0.
     """
     import json
     import shutil as shutil_mod
@@ -1431,6 +1443,15 @@ def compile_freestanding_binary(
     code_model = bin_config.code_model
     no_red_zone = bin_config.no_red_zone
     pic = bin_config.pic
+
+    # AGAST #1473: ritz1 has no --target-os, so it cannot evaluate
+    # [[target_os = "..."]] conditional compilation. Say so and fail, rather
+    # than build something else (or, as before, quietly use ritz0).
+    ritz1_family = compiler.startswith("ritz1")
+    if ritz1_family and target_os:
+        print(f"  ✗ {compiler} does not support freestanding target_os '{target_os}' "
+              f"(no --target-os); {name} NOT built", file=sys.stderr)
+        return None
 
     # UEFI targets need special handling
     is_uefi = "uefi" in target.lower()
@@ -1479,7 +1500,7 @@ def compile_freestanding_binary(
 
         # Step 2: Compile each Ritz source to LLVM IR, then to object file
         print(f"  Compiling {len(all_sources)} Ritz source file(s)...")
-        ritz0_failures: List[Tuple[Path, str]] = []
+        compile_failures: List[Tuple[Path, str]] = []
         for src in all_sources:
             import hashlib
             path_hash = hashlib.md5(str(src).encode()).hexdigest()[:8]
@@ -1488,36 +1509,45 @@ def compile_freestanding_binary(
             obj_path = artifact_dir / f"{src_name}.o"
 
             # Compile Ritz to LLVM IR
-            compile_cmd = [
-                sys.executable, str(RITZ0), str(src),
-                "-o", str(ll_path),
-                "--no-runtime"
-            ]
-            # Pass target OS for [[target_os = "..."]] conditional compilation
-            if target_os:
-                compile_cmd.extend(["--target-os", target_os])
-            if dependencies:
-                deps_json = {
-                    dep_name: {"path": str(spec.path), "sources": spec.sources}
-                    for dep_name, spec in dependencies.items()
-                }
-                compile_cmd.extend(["--deps", json.dumps(deps_json)])
-            if source_roots:
-                # Resolve source roots to absolute paths relative to pkg_dir
-                abs_source_roots = [str(pkg_dir / sr) for sr in source_roots]
-                compile_cmd.extend(["--sources", json.dumps(abs_source_roots)])
+            if ritz1_family:
+                # Same command as compile_binary's ritz1 path. ritz1 emits no
+                # _start by default, which is what --no-runtime asks of ritz0.
+                compile_cmd = ritz1_compile_cmd(compiler, src, ll_path)
+                if compile_cmd is None:
+                    return None
+                env = ritz1_env()
+            else:
+                compile_cmd = [
+                    sys.executable, str(RITZ0), str(src),
+                    "-o", str(ll_path),
+                    "--no-runtime"
+                ]
+                # Pass target OS for [[target_os = "..."]] conditional compilation
+                if target_os:
+                    compile_cmd.extend(["--target-os", target_os])
+                if dependencies:
+                    deps_json = {
+                        dep_name: {"path": str(spec.path), "sources": spec.sources}
+                        for dep_name, spec in dependencies.items()
+                    }
+                    compile_cmd.extend(["--deps", json.dumps(deps_json)])
+                if source_roots:
+                    # Resolve source roots to absolute paths relative to pkg_dir
+                    abs_source_roots = [str(pkg_dir / sr) for sr in source_roots]
+                    compile_cmd.extend(["--sources", json.dumps(abs_source_roots)])
+                env = None
 
-            result = subprocess.run(compile_cmd, capture_output=True, text=True)
+            result = subprocess.run(compile_cmd, capture_output=True, text=True, env=env)
             if result.returncode != 0:
                 # AGAST #1286: collect rather than bail, so all broken files
                 # surface in one build. See `report_compile_failures`.
-                ritz0_failures.append((src, result.stderr))
+                compile_failures.append((src, result.stderr))
                 continue
 
             # AGAST #1308: see verify_ir. No-op unless RITZ_VERIFY_IR is set.
             ir_error = verify_ir(ll_path, src)
             if ir_error is not None:
-                ritz0_failures.append((src, ir_error))
+                compile_failures.append((src, ir_error))
                 continue
 
             # Compile LLVM IR to object file with target-specific options
@@ -1573,8 +1603,8 @@ def compile_freestanding_binary(
 
         # AGAST #1286: report every source that failed to compile, then stop
         # before assembling/linking a partial object set.
-        if ritz0_failures:
-            report_compile_failures(ritz0_failures, "ritz0")
+        if compile_failures:
+            report_compile_failures(compile_failures, compiler)
             return None
 
         # Step 3: Assemble .s files
@@ -1844,6 +1874,7 @@ def build_package(pkg_dir: Path, config: dict, keep_artifacts: bool = False, use
                 profile=profile,
                 dependencies=dependencies,
                 source_roots=source_roots,
+                compiler=compiler,
             )
         else:
             # Standard hosted build
