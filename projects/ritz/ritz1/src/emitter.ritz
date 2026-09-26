@@ -1466,6 +1466,46 @@ fn global_init_check(s: *EmitterState, g: *GlobalVarDef, gi: *GlobalInit)
             gi.kind = GINIT_BAD
         return
 
+# =============================================================================
+# Integer const resolution (AGAST #1502)
+# =============================================================================
+# const_new folds an integer const's initializer at parse time.  One that
+# names a const not parsed yet (later in its file, or imported) is left
+# PENDING; resolve it here against the merged module list.  Anything that
+# still does not fold is a located error, never the silent 0 ritz1 used to
+# store for `-7`.
+
+fn const_fold_error(s: *EmitterState, c: *ConstEntry)
+    if c.src_file != null
+        eprints_cstr(c.src_file)
+    else
+        eprints_cstr(c"<input>")
+    eprint_char(':')
+    eprint_i64(c.line as i64)
+    eprint_char(':')
+    eprint_i64(c.col as i64)
+    eprints_cstr(c": error: const '")
+    var i: i32 = 0
+    while i < c.name_len
+        eprint_char(*(c.name + i))
+        i += 1
+    eprints_cstr(c"' has an initializer that is not a constant integer expression (ritz1 folds literals, other integer consts, unary - ~ !, casts and binary operators)\n")
+    emit_str(s, c"; ERROR: const ")
+    emit_name(s, c.name, c.name_len)
+    emit_str(s, c" is not a constant integer expression\n")
+    s.error_count = s.error_count + 1
+
+# The loop visits each const once, so each BAD one is reported once — whether
+# it failed on its own turn or earlier, while resolving a const that names it.
+fn resolve_const_values(s: *EmitterState)
+    var c: *ConstEntry = s.module.constants
+    while c != null
+        if c.fold_state == CONST_FOLD_PENDING
+            const_resolve(s.module.constants, c)
+        if c.fold_state == CONST_FOLD_BAD
+            const_fold_error(s, c)
+        c = c.next
+
 # Emit global variable declarations
 fn emit_global_vars(s: *EmitterState)
     var g: *GlobalVarDef = s.module.globals
@@ -1915,6 +1955,8 @@ fn emit_module(m: *Module, out: *Vec<u8>) -> i32
     # find_struct / find_const_entry are O(1) for the rest of emit_module.
     init_emitter_maps(@s)
     build_symbol_maps(@s)
+    # AGAST #1502 — fold consts that name a later / imported const.
+    resolve_const_values(@s)
 
     emit_str(@s, c"; ModuleID = 'ritz1_output'\n")
     emit_str(@s, c"target triple = \"x86_64-unknown-linux-gnu\"\n\n")

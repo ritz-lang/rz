@@ -745,12 +745,28 @@ pub fn const_new(p: *Parser, name: *u8, len: i32, ty: i32, val: *Expr, line: i32
     c.name = name as *u8
     c.name_len = len
     c.const_type = ty
-    # Integer fast path: preserves existing `c.value` contract for callers
-    # that still read it directly (find_const, builtin lookups, etc.).
-    if val != null
+    # AGAST #1502: `c.value` is what every use site reads (find_const), so it
+    # must be the folded initializer.  It used to be `val.int_val`, which is
+    # only meaningful on an int literal: `-7` is a unary-minus node whose
+    # int_val is 0, so every negative const silently became 0.
+    c.value = 0
+    c.fold_state = CONST_FOLD_DONE
+    c.src_file = null
+    c.line = line
+    c.col = col
+    var folded: i64 = 0
+    if val != null and const_fold_int(p.module.constants, val, 0, @folded) == 1
+        c.value = folded
+    else if is_int_const_type(ty) == 1
+        # Names a const not seen yet (later in this file, or imported), or
+        # is not a constant at all: the emitter decides once every module is
+        # merged, and reports a located error if it still does not fold.
+        c.fold_state = CONST_FOLD_PENDING
+        c.src_file = parse_file_copy(p)
+    else if val != null and val.kind == EXPR_INT_LIT
+        # Non-integer declared types (float, struct/alias, ...) keep the
+        # legacy literal fast path; their real lowering reads value_expr.
         c.value = val.int_val
-    else
-        c.value = 0
     c.next = null
     # Preserve the full AST so the emitter can lower complex const shapes
     # (array literals, struct literals, string literals) later on.
@@ -780,6 +796,174 @@ pub fn const_new(p: *Parser, name: *u8, len: i32, ty: i32, val: *Expr, line: i32
         c.type_name = null
         c.type_name_len = 0
     return c
+
+# -----------------------------------------------------------------------------
+# Integer const folding (AGAST #1502)
+# -----------------------------------------------------------------------------
+
+# 1 if `ty` is a declared type whose const must fold to an integer.
+pub fn is_int_const_type(ty: i32) -> i32
+    if ty == TYPE_I8 or ty == TYPE_I16 or ty == TYPE_I32 or ty == TYPE_I64
+        return 1
+    if ty == TYPE_U8 or ty == TYPE_U16 or ty == TYPE_U32 or ty == TYPE_U64
+        return 1
+    if ty == TYPE_BOOL
+        return 1
+    0
+
+fn const_name_eq(c: *ConstEntry, name: *u8, len: i32) -> i32
+    if c.name_len != len
+        return 0
+    var i: i32 = 0
+    while i < len
+        if *(c.name + i) != *(name + i)
+            return 0
+        i += 1
+    1
+
+# Resolve a PENDING integer const in place against `consts`: 1 and DONE if
+# it folds, 0 and BAD otherwise (including a cycle back to itself).
+pub fn const_resolve(consts: *ConstEntry, c: *ConstEntry) -> i32
+    if c.fold_state == CONST_FOLD_DONE
+        return 1
+    if c.fold_state != CONST_FOLD_PENDING
+        return 0
+    c.fold_state = CONST_FOLD_ACTIVE
+    var v: i64 = 0
+    if c.value_expr != null and const_fold_int(consts, c.value_expr, 1, @v) == 1
+        c.value = v
+        c.fold_state = CONST_FOLD_DONE
+        return 1
+    c.fold_state = CONST_FOLD_BAD
+    0
+
+# The value of the integer const `name` in `consts` (first occurrence wins,
+# as in the emitter's const_map).  With resolve == 0 (parse time) only an
+# already-folded const counts; with resolve == 1 (emit time, every module
+# merged) a PENDING one is resolved first.
+fn const_fold_ident(consts: *ConstEntry, name: *u8, len: i32, resolve: i32, out: *i64) -> i32
+    var c: *ConstEntry = consts
+    while c != null
+        if const_name_eq(c, name, len) == 1
+            if c.fold_state == CONST_FOLD_PENDING and resolve == 1
+                const_resolve(consts, c)
+            if c.fold_state != CONST_FOLD_DONE
+                return 0
+            # A float/struct const's `value` is not its value.
+            if is_int_const_type(c.const_type) == 0
+                return 0
+            *out = c.value
+            return 1
+        c = c.next
+    0
+
+# Fold a constant integer expression into *out: int / char / bool literals,
+# unary - ~ !, `as` casts (the value is kept; the const's own type governs its
+# use), binary arithmetic, bitwise, shift, comparison and logical operators,
+# and references to integer consts in `consts`.  Returns 1 on success, 0 if
+# `e` is not such an expression (a call, an unknown name, division by zero,
+# an out-of-range shift, ...).
+pub fn const_fold_int(consts: *ConstEntry, e: *Expr, resolve: i32, out: *i64) -> i32
+    if e == null
+        return 0
+    if e.kind == EXPR_INT_LIT or e.kind == EXPR_CHAR_LIT
+        *out = e.int_val
+        return 1
+    if e.kind == EXPR_IDENT
+        return const_fold_ident(consts, e.ident_ptr, e.ident_len, resolve, out)
+    if e.kind == EXPR_CAST
+        return const_fold_int(consts, e.left, resolve, out)
+    if e.kind == EXPR_UNARY
+        var x: i64 = 0
+        if const_fold_int(consts, e.operand, resolve, @x) == 0
+            return 0
+        if e.op == OP_NEG
+            *out = 0 - x
+            return 1
+        if e.op == OP_BIT_NOT
+            *out = 0 - x - 1
+            return 1
+        if e.op == OP_NOT
+            if x == 0
+                *out = 1
+            else
+                *out = 0
+            return 1
+        return 0
+    if e.kind == EXPR_BINARY
+        var a: i64 = 0
+        var b: i64 = 0
+        if const_fold_int(consts, e.left, resolve, @a) == 0
+            return 0
+        if const_fold_int(consts, e.right, resolve, @b) == 0
+            return 0
+        return const_fold_binary(e.op, a, b, out)
+    0
+
+fn const_fold_binary(op: i32, a: i64, b: i64, out: *i64) -> i32
+    if op == OP_ADD
+        *out = a + b
+    else if op == OP_SUB
+        *out = a - b
+    else if op == OP_MUL
+        *out = a * b
+    else if op == OP_DIV or op == OP_MOD
+        if b == 0
+            return 0
+        if op == OP_DIV
+            *out = a / b
+        else
+            *out = a % b
+    else if op == OP_BIT_AND
+        *out = a & b
+    else if op == OP_BIT_OR
+        *out = a | b
+    else if op == OP_BIT_XOR
+        *out = a ^ b
+    else if op == OP_SHL or op == OP_SHR
+        if b < 0 or b > 63
+            return 0
+        if op == OP_SHL
+            *out = a << b
+        else
+            *out = a >> b
+    else
+        let t: i32 = const_fold_compare(op, a, b)
+        if t < 0
+            return 0
+        *out = t as i64
+    1
+
+# 1 / 0 for a comparison or logical operator, -1 if `op` is neither.
+fn const_fold_compare(op: i32, a: i64, b: i64) -> i32
+    var t: i32 = 0
+    if op == OP_EQ
+        if a == b
+            t = 1
+    else if op == OP_NE
+        if a != b
+            t = 1
+    else if op == OP_LT
+        if a < b
+            t = 1
+    else if op == OP_GT
+        if a > b
+            t = 1
+    else if op == OP_LE
+        if a <= b
+            t = 1
+    else if op == OP_GE
+        if a >= b
+            t = 1
+    else if op == OP_AND
+        if a != 0 and b != 0
+            t = 1
+    else if op == OP_OR
+        if a != 0 or b != 0
+            t = 1
+    else
+        return -1
+    t
 
 # =============================================================================
 # Import helpers
