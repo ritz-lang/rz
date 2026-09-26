@@ -167,13 +167,18 @@ fn find_generic_struct(m: *Module, name: *u8, name_len: i32) -> *StructDef
 # receiver, register the corresponding `vec_<method>$<T>` / `span_<method>$<T>`
 # instantiation when a matching generic template exists.
 
-const MAX_LOCAL_VARS: i32 = 64
+# Sized for the Vec/Span locals AND the plain-struct locals (kind 0) that
+# field receivers resolve through (AGAST #1512); an entry past the cap is
+# silently dropped, so keep it well above any real fn's local count.
+const MAX_LOCAL_VARS: i32 = 256
 
 var g_lv_names: **u8 = null
 var g_lv_name_lens: *i32 = null
-var g_lv_prefix_kind: *i32 = null      # 1 = Vec, 2 = Span
+var g_lv_prefix_kind: *i32 = null      # 0 = plain struct, 1 = Vec, 2 = Span
 var g_lv_suffixes: **u8 = null         # The "$T" portion (with leading $)
 var g_lv_suffix_lens: *i32 = null
+var g_lv_type_names: **u8 = null       # Kind 0: the struct's name (e.g. "R")
+var g_lv_type_name_lens: *i32 = null
 var g_lv_count: i32 = 0
 var g_lv_initialized: i32 = 0
 
@@ -185,6 +190,8 @@ fn init_local_var_tracker()
     g_lv_prefix_kind = malloc(MAX_LOCAL_VARS * 4) as *i32
     g_lv_suffixes = malloc(MAX_LOCAL_VARS * 8) as **u8
     g_lv_suffix_lens = malloc(MAX_LOCAL_VARS * 4) as *i32
+    g_lv_type_names = malloc(MAX_LOCAL_VARS * 8) as **u8
+    g_lv_type_name_lens = malloc(MAX_LOCAL_VARS * 4) as *i32
     g_lv_initialized = 1
     g_lv_count = 0
 
@@ -199,7 +206,93 @@ fn add_local_var(name: *u8, name_len: i32, prefix_kind: i32, suffix: *u8, suffix
     *(g_lv_prefix_kind + g_lv_count) = prefix_kind
     *(g_lv_suffixes + g_lv_count) = suffix
     *(g_lv_suffix_lens + g_lv_count) = suffix_len
+    *(g_lv_type_names + g_lv_count) = null
+    *(g_lv_type_name_lens + g_lv_count) = 0
     g_lv_count = g_lv_count + 1
+
+# Record a local/param whose type is a (non-collection) struct or a pointer
+# or reference to one, so a field receiver rooted at it — `r.raw.push(9)` —
+# can resolve the field's type (AGAST #1512).  Kind 0 never matches a UFCS
+# prefix, so the ident-receiver path ignores these entries.
+fn add_local_struct_var(name: *u8, name_len: i32, type_name: *u8, type_name_len: i32)
+    if type_name == null or type_name_len <= 0
+        return
+    if g_lv_count >= MAX_LOCAL_VARS
+        return
+    add_local_var(name, name_len, 0, null, 0)
+    *(g_lv_type_names + g_lv_count - 1) = type_name
+    *(g_lv_type_name_lens + g_lv_count - 1) = type_name_len
+
+# Record a binding of type `type_kind`/`type_name`: Vec/Span by-value go to
+# the UFCS kinds; any other named struct (by value, *T, @T, @&T) is kind 0.
+fn track_typed_local(name: *u8, name_len: i32, type_kind: i32, type_name: *u8, type_name_len: i32)
+    if type_name == null or type_name_len <= 0
+        return
+    if type_kind != TYPE_STRUCT and type_kind != TYPE_PTR and type_kind != TYPE_REF and type_kind != TYPE_MUT_REF
+        return
+    var suf: *u8 = null
+    var suf_len: i32 = 0
+    let kind: i32 = classify_collection_type(type_name, type_name_len, @suf, @suf_len)
+    if kind > 0
+        if type_kind == TYPE_STRUCT
+            add_local_var(name, name_len, kind, suf, suf_len)
+        return
+    add_local_struct_var(name, name_len, type_name, type_name_len)
+
+# Resolve the type of the field named by an EXPR_MEMBER chain rooted at a
+# tracked local: `r.raw` → "Vec$u8", `o.q.a` → "A".  Emits nothing.  Returns
+# the *StructField, or null when any link is unknown.  (AGAST #1512)
+fn resolve_member_field(m: *Module, e: *Expr) -> *StructField
+    if e == null or e.kind != EXPR_MEMBER or e.left == null
+        return null
+    var sname: *u8 = null
+    var sname_len: i32 = 0
+    if e.left.kind == EXPR_IDENT
+        let idx: i32 = find_local_var_idx(e.left.ident_ptr, e.left.ident_len)
+        if idx >= 0
+            sname = *(g_lv_type_names + idx)
+            sname_len = *(g_lv_type_name_lens + idx)
+    else if e.left.kind == EXPR_MEMBER
+        let parent: *StructField = resolve_member_field(m, e.left)
+        if parent != null
+            if parent.field_type == TYPE_STRUCT or parent.field_type == TYPE_PTR
+                sname = parent.field_type_name
+                sname_len = parent.field_type_name_len
+    if sname == null or sname_len <= 0
+        return null
+    let st: *StructDef = find_concrete_struct(m, sname, sname_len)
+    if st == null
+        return null
+    var f: *StructField = st.fields
+    while f != null
+        if f.name_len == e.ident_len
+            if memcmp(f.name, e.ident_ptr, e.ident_len as i64) == 0
+                return f
+        f = f.next
+    return null
+
+# Register `<prefix><method>$T` (vec_/span_) for a UFCS call on a Vec/Span
+# receiver of the given kind and "$T" suffix, if that generic template exists.
+fn register_ufcs_instantiation(m: *Module, kind: i32, suf: *u8, suf_len: i32, method: *u8, method_len: i32)
+    var prefix: *u8 = null
+    var prefix_len: i32 = 0
+    if kind == 1
+        prefix = c"vec_"
+        prefix_len = 4
+    else if kind == 2
+        prefix = c"span_"
+        prefix_len = 5
+    if prefix_len == 0 or suf == null or suf_len <= 0
+        return
+    let mangled_len: i32 = prefix_len + method_len
+    let mangled: *u8 = malloc(mangled_len as i64 + 1) as *u8
+    for i in 0..prefix_len
+        *(mangled + i) = *(prefix + i)
+    for i in 0..method_len
+        *(mangled + prefix_len + i) = *(method + i)
+    *(mangled + mangled_len) = 0
+    if find_generic_function(m, mangled, mangled_len) != null
+        add_instantiation(mangled, mangled_len, suf, suf_len)
 
 fn find_local_var_idx(name: *u8, name_len: i32) -> i32
     for i in 0..g_lv_count
@@ -343,12 +436,7 @@ fn collect_instantiations_from_module(m: *Module)
             reset_local_var_tracker()
             var pp: *Param = f.params
             while pp != null
-                if pp.param_type == TYPE_STRUCT and pp.param_type_name != null
-                    var psuf: *u8 = null
-                    var psuf_len: i32 = 0
-                    let pkind: i32 = classify_collection_type(pp.param_type_name, pp.param_type_name_len, @psuf, @psuf_len)
-                    if pkind > 0
-                        add_local_var(pp.name, pp.name_len, pkind, psuf, psuf_len)
+                track_typed_local(pp.name, pp.name_len, pp.param_type, pp.param_type_name, pp.param_type_name_len)
                 pp = pp.next
             # Walk function body
             collect_from_fn_body(m, f.body)
@@ -370,12 +458,7 @@ fn collect_instantiations_from_module(m: *Module)
                 reset_local_var_tracker()
                 var ipp: *Param = method.params
                 while ipp != null
-                    if ipp.param_type == TYPE_STRUCT and ipp.param_type_name != null
-                        var ipsuf: *u8 = null
-                        var ipsuf_len: i32 = 0
-                        let ipkind: i32 = classify_collection_type(ipp.param_type_name, ipp.param_type_name_len, @ipsuf, @ipsuf_len)
-                        if ipkind > 0
-                            add_local_var(ipp.name, ipp.name_len, ipkind, ipsuf, ipsuf_len)
+                    track_typed_local(ipp.name, ipp.name_len, ipp.param_type, ipp.param_type_name, ipp.param_type_name_len)
                     ipp = ipp.next
                 collect_from_fn_body(m, method.body)
                 method = method.next
@@ -437,6 +520,12 @@ fn collect_from_stmt(m: *Module, s: *Stmt)
                                 lv_suf_len = s.var_init.call_type_suffix_len
         if lv_kind > 0 and lv_suf != null and lv_suf_len > 0
             add_local_var(s.var_name, s.var_name_len, lv_kind, lv_suf, lv_suf_len)
+        else if s.var_type_name != null and s.var_type_name_len > 0
+            # Plain struct (or pointer/ref to one): root of a field receiver.
+            track_typed_local(s.var_name, s.var_name_len, s.var_type, s.var_type_name, s.var_type_name_len)
+        else if s.var_init != null and s.var_init.kind == EXPR_STRUCT_LIT
+            # Un-annotated `var r = R { ... }`: the literal names the type.
+            add_local_struct_var(s.var_name, s.var_name_len, s.var_init.ident_ptr, s.var_init.ident_len)
         if s.var_init != null
             collect_from_expr(m, s.var_init)
     else if k == STMT_ASSIGN
@@ -556,39 +645,19 @@ fn collect_from_expr(m: *Module, e: *Expr)
         if e.left != null and e.left.kind == EXPR_IDENT
             let lv_idx: i32 = find_local_var_idx(e.left.ident_ptr, e.left.ident_len)
             if lv_idx >= 0
-                let lv_kind: i32 = *(g_lv_prefix_kind + lv_idx)
-                let lv_suf: *u8 = *(g_lv_suffixes + lv_idx)
-                let lv_suf_len: i32 = *(g_lv_suffix_lens + lv_idx)
-                # Pick the fn-name prefix for the kind
-                var prefix_buf: [16]u8
-                var prefix_len: i32 = 0
-                if lv_kind == 1
-                    # "vec_"
-                    prefix_buf[0] = 'v'
-                    prefix_buf[1] = 'e'
-                    prefix_buf[2] = 'c'
-                    prefix_buf[3] = '_'
-                    prefix_len = 4
-                else if lv_kind == 2
-                    # "span_"
-                    prefix_buf[0] = 's'
-                    prefix_buf[1] = 'p'
-                    prefix_buf[2] = 'a'
-                    prefix_buf[3] = 'n'
-                    prefix_buf[4] = '_'
-                    prefix_len = 5
-                if prefix_len > 0
-                    # Build "<prefix><method>" for the fn name
-                    let mangled_len: i32 = prefix_len + e.ident_len
-                    let mangled: *u8 = malloc(mangled_len as i64 + 1) as *u8
-                    for i in 0..prefix_len
-                        *(mangled + i) = prefix_buf[i]
-                    for i in 0..e.ident_len
-                        *(mangled + prefix_len + i) = *(e.ident_ptr + i)
-                    *(mangled + mangled_len) = 0
-                    # Only register if a generic template by this name exists
-                    if find_generic_function(m, mangled, mangled_len) != null
-                        add_instantiation(mangled, mangled_len, lv_suf, lv_suf_len)
+                register_ufcs_instantiation(m, *(g_lv_prefix_kind + lv_idx), *(g_lv_suffixes + lv_idx), *(g_lv_suffix_lens + lv_idx), e.ident_ptr, e.ident_len)
+        else if e.left != null and e.left.kind == EXPR_MEMBER
+            # Field receiver `r.raw.push(9)`: resolve the field's type through
+            # the tracked root local, then register as for an ident receiver.
+            # A `*Vec<T>` field dispatches to the same `vec_<method>$T` as a
+            # by-value one (the emitter passes the pointer it holds).
+            # (AGAST #1512)
+            let rf: *StructField = resolve_member_field(m, e.left)
+            if rf != null and (rf.field_type == TYPE_STRUCT or rf.field_type == TYPE_PTR)
+                var fsuf: *u8 = null
+                var fsuf_len: i32 = 0
+                let fkind: i32 = classify_collection_type(rf.field_type_name, rf.field_type_name_len, @fsuf, @fsuf_len)
+                register_ufcs_instantiation(m, fkind, fsuf, fsuf_len, e.ident_ptr, e.ident_len)
         collect_from_expr(m, e.left)  # receiver
         var arg: *Expr = e.args
         while arg != null
