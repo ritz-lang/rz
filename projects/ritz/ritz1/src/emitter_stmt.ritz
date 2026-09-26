@@ -139,6 +139,19 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
                     stmt.var_type = TYPE_PTR
                     stmt.var_type_name = fn_def.return_type_name
                     stmt.var_type_name_len = fn_def.return_type_name_len
+            # AGAST #1453: reference-returning fn (`-> @L` / `-> @&L`).  A
+            # reference is a pointer at the LLVM level, so register the local
+            # exactly like #175's `-> *Foo` case: `let m = get(l); m.x` then
+            # GEPs through the loaded pointer.  Without this the local stayed
+            # TYPE_I64 — reads failed "unhandled EXPR_MEMBER" and a store
+            # `m.x = v` was silently dropped (#1439).
+            else if fn_def != null and (fn_def.return_type == TYPE_REF or fn_def.return_type == TYPE_MUT_REF)
+                if fn_def.return_type_name != null and fn_def.return_type_name_len > 0
+                    if find_struct(s, fn_def.return_type_name, fn_def.return_type_name_len) != null
+                        var_type = TYPE_PTR
+                        stmt.var_type = TYPE_PTR
+                        stmt.var_type_name = fn_def.return_type_name
+                        stmt.var_type_name_len = fn_def.return_type_name_len
         # task-101: builtin method return-type table. Method calls like
         # `s.as_bytes()` hit compiler intrinsics (try_emit_strview_as_bytes),
         # NOT a real fn_def, so the EXPR_CALL branch above can't find them
@@ -306,6 +319,28 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
                             stmt.var_type = TYPE_STRUCT
                             stmt.var_type_name = pay
                             stmt.var_type_name_len = pay_len
+        # AGAST #1453: `let p = raw as *P`.  The parser records the cast's
+        # pointee on the EXPR_CAST node (int_val = pointee kind, ident_ptr =
+        # struct name; see apply_cast_tail).  Narrow the local exactly as the
+        # annotated `let p: *P = raw as *P` would be: TYPE_PTR plus the struct
+        # name for `p.field`, or the primitive pointee kind so `*(q + i)` on
+        # `raw as *i32` is scaled and loaded as i32.  Without this the local
+        # stayed TYPE_I64: member reads failed "unhandled EXPR_MEMBER",
+        # member stores were silently dropped, and arithmetic stepped by 1.
+        else if stmt.var_init.kind == EXPR_CAST
+            if stmt.var_init.op == TYPE_PTR and stmt.var_init.int_val != TYPE_VOID as i64
+                let cast_pointee: i32 = stmt.var_init.int_val as i32
+                if cast_pointee == TYPE_STRUCT
+                    if stmt.var_init.ident_ptr != null and stmt.var_init.ident_len > 0
+                        var_type = TYPE_PTR
+                        stmt.var_type = TYPE_PTR
+                        stmt.var_type_name = stmt.var_init.ident_ptr
+                        stmt.var_type_name_len = stmt.var_init.ident_len
+                        stmt.var_pointee_type = TYPE_STRUCT
+                else
+                    var_type = TYPE_PTR
+                    stmt.var_type = TYPE_PTR
+                    stmt.var_pointee_type = cast_pointee
         # AGAST #175: address-of expression. `let task = @pool.tasks[i]` used
         # to keep var_type=TYPE_I64 with no type_name → the local was added as
         # a plain i64 binding, so later `task.field` calls find_local_struct_name

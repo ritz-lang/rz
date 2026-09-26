@@ -1020,6 +1020,12 @@ pub fn capture_fn_return_type(p: *Parser, ret: i32) -> i32
     if ret == TYPE_STRUCT
         p.fn_return_type_name = p.last_type_name
         p.fn_return_type_name_len = p.last_type_name_len
+    else if (ret == TYPE_REF or ret == TYPE_MUT_REF) and p.last_ref_inner_type != TYPE_STRUCT
+        # AGAST #1453: `-> @i64` leaves last_type_name stale (from an earlier
+        # `@P` param, say).  Only a struct referent names itself; var-decl
+        # narrowing trusts this name for `let m = get(...)`.
+        p.fn_return_type_name = null
+        p.fn_return_type_name_len = 0
     else if ret == TYPE_PTR or ret == TYPE_PTR_PTR or ret == TYPE_REF or ret == TYPE_MUT_REF
         if p.last_type_name != null and p.last_type_name_len > 0
             p.fn_return_type_name = p.last_type_name
@@ -2021,6 +2027,9 @@ pub fn expr_cast(p: *Parser, left: *Expr, target_type: i32) -> *Expr
     e.span = left.span
     e.left = left
     e.op = target_type
+    e.int_val = TYPE_VOID
+    e.ident_ptr = null
+    e.ident_len = 0
     e.next = null
     return e
 
@@ -2158,9 +2167,25 @@ pub fn apply_binary_opt_p(p: *Parser, left: *Expr, chain: *BinaryOp) -> *Expr
 # =============================================================================
 
 pub fn cast_tail_new(p: *Parser, ty: i32, next: *CastTail) -> *CastTail
-    let ct: *CastTail = parser_alloc(p, 16) as *CastTail
+    let ct: *CastTail = parser_alloc(p, 32) as *CastTail
     ct.cast_type = ty
     ct.next = next
+    ct.pointee_type = TYPE_VOID
+    ct.pointee_name = null
+    ct.pointee_name_len = 0
+    # AGAST #1453: record the pointee of `as *T`.  parse_cast_tail parses
+    # this tail's type, THEN the rest of the chain, THEN calls us, so the
+    # parser's last_* state belongs to this tail's type only when it is the
+    # last in the chain (next == null).  That is the outermost cast — the
+    # one whose type a `let x = ... as *T` takes.  Earlier tails stay
+    # unknown rather than pick up a later type's name.
+    if next == null and ty == TYPE_PTR
+        ct.pointee_type = p.last_pointee_type
+        # last_type_name is stale for a primitive pointee (`*u8`); only a
+        # struct pointee names itself (same rule as stmt_var_decl).
+        if p.last_pointee_type == TYPE_STRUCT
+            ct.pointee_name = p.last_type_name as *u8
+            ct.pointee_name_len = p.last_type_name_len
     return ct
 
 pub fn apply_cast_tail(p: *Parser, expr: *Expr, tail: *CastTail) -> *Expr
@@ -2170,6 +2195,9 @@ pub fn apply_cast_tail(p: *Parser, expr: *Expr, tail: *CastTail) -> *Expr
     var ct: *CastTail = tail
     while ct != null
         result = expr_cast(p, result, ct.cast_type)
+        result.int_val = ct.pointee_type as i64
+        result.ident_ptr = ct.pointee_name
+        result.ident_len = ct.pointee_name_len
         ct = ct.next
     return result
 
