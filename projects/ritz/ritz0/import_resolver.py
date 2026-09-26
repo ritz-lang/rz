@@ -642,7 +642,9 @@ class ImportResolver:
             new_match_expr = self._transform_expr(expr.expr, aliases)
             new_arms = []
             for arm in expr.arms:
-                new_body = self._transform_block(arm.body, aliases)
+                # An arm body is any Expr: a Block only for an indented arm,
+                # otherwise e.g. `Some(_) => 1`. _transform_expr handles both.
+                new_body = self._transform_expr(arm.body, aliases)
                 new_arms.append(replace(arm, body=new_body))
             return replace(expr, expr=new_match_expr, arms=new_arms)
         elif isinstance(expr, rast.Cast):
