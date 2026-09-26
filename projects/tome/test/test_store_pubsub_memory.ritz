@@ -1,0 +1,494 @@
+# test/test_store_pubsub_memory.ritz - Tome pub/sub, glob matching, memory/eviction
+#
+# Split out of test_store.ritz: `ritz0 --test` recompiles the file once per
+# test, so one 68-test file overran build.py's 180s per-file budget.
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+import ritzlib.timer
+import lib.tome
+
+# ============================================================================
+# Pub/Sub Tests
+# ============================================================================
+
+# Global variables for tracking callback invocations
+var g_callback_count: i64 = 0
+var g_last_channel: *u8 = null
+var g_last_message: *u8 = null
+
+# A simple callback that increments counter
+fn my_callback(channel: *u8, message: *u8, ctx: *u8) -> i32
+    g_callback_count += 1
+    g_last_channel = channel
+    g_last_message = message
+    return 0  # Continue receiving
+
+# A callback that auto-unsubscribes after first message
+fn my_callback_once(channel: *u8, message: *u8, ctx: *u8) -> i32
+    g_callback_count += 1
+    return 1  # Unsubscribe
+
+# Test: Basic subscribe and publish
+[[test]]
+fn test_pubsub_basic() -> i32
+    var ps: PubSub = pubsub_new()
+    g_callback_count = 0
+
+    # Subscribe to a channel
+    let res: i32 = pubsub_subscribe(@ps, c"news", my_callback, null)
+    if res != 1  # Should be new subscription
+        return 1
+
+    # Double subscribe should return 0
+    let res2: i32 = pubsub_subscribe(@ps, c"news", my_callback, null)
+    if res2 != 0
+        return 1
+
+    # Publish a message
+    let count: i64 = pubsub_publish(@ps, c"news", c"hello")
+    if count != 1
+        return 1
+
+    if g_callback_count != 1
+        return 1
+
+    if strcmp(g_last_message, c"hello") != 0
+        return 1
+
+    pubsub_drop(@ps)
+    return 0
+
+# Test: Multiple subscribers
+[[test]]
+fn test_pubsub_multi_sub() -> i32
+    var ps: PubSub = pubsub_new()
+    g_callback_count = 0
+
+    # Subscribe same callback with different contexts
+    pubsub_subscribe(@ps, c"events", my_callback, null)
+    pubsub_subscribe(@ps, c"events", my_callback, c"ctx1" as *u8)
+    pubsub_subscribe(@ps, c"events", my_callback, c"ctx2" as *u8)
+
+    # Check subscriber count
+    if pubsub_numsub(@ps, c"events") != 3
+        return 1
+
+    # Publish should hit all 3
+    let count: i64 = pubsub_publish(@ps, c"events", c"test")
+    if count != 3
+        return 1
+
+    if g_callback_count != 3
+        return 1
+
+    pubsub_drop(@ps)
+    return 0
+
+# Test: Unsubscribe
+[[test]]
+fn test_pubsub_unsubscribe() -> i32
+    var ps: PubSub = pubsub_new()
+    g_callback_count = 0
+
+    pubsub_subscribe(@ps, c"ch", my_callback, null)
+    pubsub_subscribe(@ps, c"ch", my_callback, c"ctx" as *u8)
+
+    if pubsub_numsub(@ps, c"ch") != 2
+        return 1
+
+    # Unsubscribe one
+    let res: i32 = pubsub_unsubscribe(@ps, c"ch", my_callback, null)
+    if res != 1
+        return 1
+
+    if pubsub_numsub(@ps, c"ch") != 1
+        return 1
+
+    # Publish should only hit remaining subscriber
+    pubsub_publish(@ps, c"ch", c"msg")
+    if g_callback_count != 1
+        return 1
+
+    pubsub_drop(@ps)
+    return 0
+
+# Test: Auto-unsubscribe on callback return non-zero
+[[test]]
+fn test_pubsub_auto_unsub() -> i32
+    var ps: PubSub = pubsub_new()
+    g_callback_count = 0
+
+    pubsub_subscribe(@ps, c"once", my_callback_once, null)
+    pubsub_subscribe(@ps, c"once", my_callback, null)  # This one stays
+
+    if pubsub_numsub(@ps, c"once") != 2
+        return 1
+
+    # First publish triggers both, one auto-unsubscribes
+    pubsub_publish(@ps, c"once", c"first")
+    if g_callback_count != 2
+        return 1
+
+    if pubsub_numsub(@ps, c"once") != 1
+        return 1
+
+    # Second publish only hits the remaining one
+    pubsub_publish(@ps, c"once", c"second")
+    if g_callback_count != 3
+        return 1
+
+    pubsub_drop(@ps)
+    return 0
+
+# Test: Pattern subscribe
+[[test]]
+fn test_pubsub_pattern() -> i32
+    var ps: PubSub = pubsub_new()
+    g_callback_count = 0
+
+    # Subscribe to pattern
+    let res: i32 = pubsub_psubscribe(@ps, c"news.*", my_callback, null)
+    if res != 1
+        return 1
+
+    if pubsub_numpat(@ps) != 1
+        return 1
+
+    # Publish to matching channels
+    pubsub_publish(@ps, c"news.sports", c"goal!")
+    if g_callback_count != 1
+        return 1
+
+    pubsub_publish(@ps, c"news.weather", c"sunny")
+    if g_callback_count != 2
+        return 1
+
+    # Non-matching channel
+    pubsub_publish(@ps, c"alerts.urgent", c"fire")
+    if g_callback_count != 2  # Should not increase
+        return 1
+
+    pubsub_drop(@ps)
+    return 0
+
+# Test: Pattern unsubscribe
+[[test]]
+fn test_pubsub_punsubscribe() -> i32
+    var ps: PubSub = pubsub_new()
+    g_callback_count = 0
+
+    pubsub_psubscribe(@ps, c"foo.*", my_callback, null)
+    pubsub_psubscribe(@ps, c"bar.*", my_callback, null)
+
+    if pubsub_numpat(@ps) != 2
+        return 1
+
+    # Unsubscribe one pattern
+    let res: i32 = pubsub_punsubscribe(@ps, c"foo.*", my_callback, null)
+    if res != 1
+        return 1
+
+    if pubsub_numpat(@ps) != 1
+        return 1
+
+    # Only bar.* should match now
+    pubsub_publish(@ps, c"foo.test", c"x")
+    if g_callback_count != 0
+        return 1
+
+    pubsub_publish(@ps, c"bar.test", c"y")
+    if g_callback_count != 1
+        return 1
+
+    pubsub_drop(@ps)
+    return 0
+
+# Test: Mixed channel and pattern
+[[test]]
+fn test_pubsub_mixed() -> i32
+    var ps: PubSub = pubsub_new()
+    g_callback_count = 0
+
+    # Direct subscription
+    pubsub_subscribe(@ps, c"events.login", my_callback, null)
+
+    # Pattern subscription that also matches
+    pubsub_psubscribe(@ps, c"events.*", my_callback, c"pattern" as *u8)
+
+    # Publish to the matching channel - both should fire
+    let count: i64 = pubsub_publish(@ps, c"events.login", c"user123")
+    if count != 2
+        return 1
+
+    if g_callback_count != 2
+        return 1
+
+    pubsub_drop(@ps)
+    return 0
+
+# Test: pubsub_channels listing
+[[test]]
+fn test_pubsub_channels_list() -> i32
+    var ps: PubSub = pubsub_new()
+
+    pubsub_subscribe(@ps, c"ch1", my_callback, null)
+    pubsub_subscribe(@ps, c"ch2", my_callback, null)
+    pubsub_subscribe(@ps, c"ch3", my_callback, null)
+
+    var count: i64 = 0
+    let channels: **u8 = pubsub_channels(@ps, @count)
+    if count != 3
+        if channels != null
+            free(channels as *u8)
+        return 1
+
+    free(channels as *u8)
+    pubsub_drop(@ps)
+    return 0
+
+# Test: Glob pattern matching edge cases
+[[test]]
+fn test_glob_patterns() -> i32
+    var ps: PubSub = pubsub_new()
+    g_callback_count = 0
+
+    # Test various patterns
+    pubsub_psubscribe(@ps, c"*", my_callback, c"all" as *u8)
+    pubsub_psubscribe(@ps, c"h?llo", my_callback, c"hello" as *u8)
+    pubsub_psubscribe(@ps, c"foo*bar", my_callback, c"foobar" as *u8)
+
+    if pubsub_numpat(@ps) != 3
+        return 1
+
+    # Test * matches everything
+    g_callback_count = 0
+    pubsub_publish(@ps, c"anything", c"msg")
+    if g_callback_count != 1
+        return 1
+
+    # Test ? matches single char
+    g_callback_count = 0
+    pubsub_publish(@ps, c"hello", c"msg")
+    if g_callback_count != 2  # * and h?llo
+        return 1
+
+    g_callback_count = 0
+    pubsub_publish(@ps, c"hallo", c"msg")
+    if g_callback_count != 2  # * and h?llo
+        return 1
+
+    # Test foo*bar
+    g_callback_count = 0
+    pubsub_publish(@ps, c"foobar", c"msg")
+    if g_callback_count != 2  # * and foo*bar
+        return 1
+
+    g_callback_count = 0
+    pubsub_publish(@ps, c"foo123bar", c"msg")
+    if g_callback_count != 2  # * and foo*bar
+        return 1
+
+    pubsub_drop(@ps)
+    return 0
+
+# ============================================================================
+# Memory Management Tests
+# ============================================================================
+
+# Test: Memory tracking on set/get/del
+[[test]]
+fn test_memory_tracking() -> i32
+    var store: Store = store_new()
+
+    # Initially 0
+    if store_memory_usage(@store) != 0
+        return 1
+
+    # Set a key - should increase memory
+    store_set_cstr(@store, c"key1", c"value1")
+    let mem1: i64 = store_memory_usage(@store)
+    if mem1 <= 0
+        return 1
+
+    # Set another key - memory increases
+    store_set_cstr(@store, c"key2", c"value2")
+    let mem2: i64 = store_memory_usage(@store)
+    if mem2 <= mem1
+        return 1
+
+    # Delete a key - memory decreases
+    store_del_cstr(@store, c"key1")
+    let mem3: i64 = store_memory_usage(@store)
+    if mem3 >= mem2
+        return 1
+
+    return 0
+
+# Test: Max memory and eviction policy configuration
+[[test]]
+fn test_maxmemory_config() -> i32
+    var store: Store = store_new()
+
+    # Default is no limit
+    if store_get_maxmemory(@store) != 0
+        return 1
+
+    # Set a limit
+    store_set_maxmemory(@store, 1000)
+    if store_get_maxmemory(@store) != 1000
+        return 1
+
+    # Set eviction policy
+    store_set_eviction_policy(@store, EVICT_LRU)
+
+    return 0
+
+# Test: LRU eviction
+[[test]]
+fn test_eviction_lru() -> i32
+    var store: Store = store_new()
+
+    # Set small max memory
+    store_set_maxmemory(@store, 100)
+    store_set_eviction_policy(@store, EVICT_LRU)
+
+    # Add some keys
+    store_set_cstr(@store, c"old1", c"x")
+    store_set_cstr(@store, c"old2", c"y")
+
+    # Access old1 to make it more recently used
+    store_get_cstr(@store, c"old1")
+
+    # Add more keys to trigger eviction
+    store_set_cstr(@store, c"new1", c"aaaaaaaaaaaaaaaaaaaaaaaaaa")
+    store_set_cstr(@store, c"new2", c"bbbbbbbbbbbbbbbbbbbbbbbbbb")
+    store_set_cstr(@store, c"new3", c"cccccccccccccccccccccccccc")
+
+    # Memory should be under limit (or close to it)
+    let mem: i64 = store_memory_usage(@store)
+    if mem > 150  # Allow some slack
+        return 1
+
+    # old1 should be more likely to survive (accessed recently)
+    # old2 should be more likely evicted (older access)
+    # Can't guarantee order but eviction should have happened
+
+    return 0
+
+# Test: Random eviction
+[[test]]
+fn test_eviction_random() -> i32
+    var store: Store = store_new()
+
+    store_set_maxmemory(@store, 80)
+    store_set_eviction_policy(@store, EVICT_RANDOM)
+
+    # Add keys until we hit the limit
+    store_set_cstr(@store, c"k1", c"value1")
+    store_set_cstr(@store, c"k2", c"value2")
+    store_set_cstr(@store, c"k3", c"value3")
+    store_set_cstr(@store, c"k4", c"value4")
+
+    # Memory should be under or around limit
+    let mem: i64 = store_memory_usage(@store)
+    if mem > 120
+        return 1
+
+    # Some keys may have been evicted
+    let count: i64 = store_len(@store)
+    if count > 4
+        return 1
+
+    return 0
+
+# Test: Volatile TTL eviction (only evicts keys with expiration)
+[[test]]
+fn test_eviction_volatile_ttl() -> i32
+    var store: Store = store_new()
+
+    store_set_maxmemory(@store, 60)
+    store_set_eviction_policy(@store, EVICT_VOLATILE_TTL)
+
+    # Add persistent key
+    store_set_cstr(@store, c"persistent", c"stays")
+
+    # Add keys with TTL
+    store_setex_cstr(@store, c"expires1", c"data1", 100)
+    store_setex_cstr(@store, c"expires2", c"data2", 50)  # Closer to expiration
+    store_setex_cstr(@store, c"expires3", c"data3", 200)
+
+    # Add more to trigger eviction
+    store_setex_cstr(@store, c"expires4", c"moredata", 150)
+
+    # Persistent key should still exist (no TTL)
+    if store_exists_cstr(@store, c"persistent") != 1
+        return 1
+
+    return 0
+
+# Test: No eviction policy (default)
+[[test]]
+fn test_eviction_none() -> i32
+    var store: Store = store_new()
+
+    # Default policy is EVICT_NONE
+    store_set_maxmemory(@store, 50)
+    # Don't set eviction policy - defaults to NONE
+
+    # Add keys - should still work even with limit
+    store_set_cstr(@store, c"k1", c"v1")
+    store_set_cstr(@store, c"k2", c"v2")
+    store_set_cstr(@store, c"k3", c"v3")
+
+    # With EVICT_NONE, no eviction happens
+    # Keys are still added (memory tracking happens but no eviction)
+    if store_len(@store) != 3
+        return 1
+
+    return 0
+
+# Test: Memory tracking with complex types
+# Note: Memory for complex types is tracked on key creation and deletion,
+# but not on every element add (for performance). This test verifies
+# that deletion properly frees memory.
+[[test]]
+fn test_memory_complex_types() -> i32
+    var store: Store = store_new()
+
+    # Add string key for baseline
+    store_set_cstr(@store, c"baseline", c"value")
+    let baseline: i64 = store_memory_usage(@store)
+    if baseline <= 0
+        return 1
+
+    # Add complex types - memory should increase (key + initial struct)
+    store_lpush_cstr(@store, c"mylist", c"a")
+    store_lpush_cstr(@store, c"mylist", c"b")
+    store_sadd_cstr(@store, c"myset", c"x")
+    store_hset_cstr(@store, c"myhash", c"f1", c"v1")
+
+    let with_complex: i64 = store_memory_usage(@store)
+    # Memory should have increased due to key strings at minimum
+    if with_complex <= baseline
+        return 1
+
+    # Delete complex types - memory should decrease significantly
+    # because entry_memory calculates full value size on deletion
+    store_del_cstr(@store, c"mylist")
+    let after_list_del: i64 = store_memory_usage(@store)
+    if after_list_del >= with_complex
+        return 1
+
+    store_del_cstr(@store, c"myset")
+    let after_set_del: i64 = store_memory_usage(@store)
+    if after_set_del >= after_list_del
+        return 1
+
+    store_del_cstr(@store, c"myhash")
+    let after_hash_del: i64 = store_memory_usage(@store)
+    if after_hash_del >= after_set_del
+        return 1
+
+    return 0

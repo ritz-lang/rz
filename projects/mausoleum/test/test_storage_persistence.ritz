@@ -1,0 +1,164 @@
+# test/test_storage_persistence.ritz - Storage open / commit / reopen round trip
+#
+# Opens a fresh on-disk store, allocates a heap page inside a committed
+# transaction, closes it, reopens it from disk and checks the page survived.
+# Each test process uses its own /tmp/mausoleum_persist_<pid> directory and
+# removes it again on every path, so concurrent runs cannot collide.
+
+import ritzlib.sys
+import ritzlib.str
+import ritzlib.option
+
+import lib.m7m_types
+import lib.page
+import lib.buffer_pool
+import lib.storage
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+# Append the decimal digits of n (n >= 0) at buf[pos]; returns the new pos.
+fn append_uint(buf: *u8, pos: i64, n: i32) -> i64
+    var digits: [16]u8
+    var len: i32 = 0
+    var v: i32 = n
+    if v == 0
+        digits[0] = 48
+        len = 1
+    while v > 0
+        digits[len] = ((v % 10) + 48) as u8
+        v = v / 10
+        len += 1
+    var p: i64 = pos
+    while len > 0
+        len -= 1
+        *(buf + p) = digits[len]
+        p += 1
+    return p
+
+# Append a NUL-terminated string at buf[pos]; returns the new pos.
+fn append_cstr(buf: *u8, pos: i64, s: *u8) -> i64
+    var p: i64 = pos
+    var i: i64 = 0
+    while *(s + i) != 0
+        *(buf + p) = *(s + i)
+        p += 1
+        i += 1
+    return p
+
+# Write "/tmp/mausoleum_persist_<pid>" (NUL-terminated) into buf.
+fn make_tmp_path(buf: *u8)
+    var p: i64 = append_cstr(buf, 0, c"/tmp/mausoleum_persist_")
+    p = append_uint(buf, p, sys_getpid())
+    *(buf + p) = 0
+
+# Remove every entry of a flat directory, then the directory itself.
+# Returns 0 if the directory is gone afterwards (or never existed).
+fn rm_dir_flat(dir: *u8) -> i32
+    let fd: i32 = sys_open(dir, O_RDONLY + O_DIRECTORY)
+    if fd >= 0
+        var ents: [4096]u8
+        var child: [512]u8
+        let dir_len: i64 = strlen(dir)
+        loop
+            let n: i64 = sys_getdents64(fd, @ents[0], 4096)
+            if n <= 0
+                break
+            var off: i64 = 0
+            while off < n
+                let rec: *u8 = @ents[off]
+                let reclen: i64 = (*(rec + 16) as i64) + ((*(rec + 17) as i64) << 8)
+                let name: *u8 = rec + 19
+                let is_dot: bool = *name == 46 and *(name + 1) == 0
+                let is_dotdot: bool = *name == 46 and *(name + 1) == 46 and *(name + 2) == 0
+                if not is_dot and not is_dotdot and dir_len + strlen(name) + 2 < 512
+                    var p: i64 = append_cstr(@child[0], 0, dir)
+                    p = append_cstr(@child[0], p, c"/")
+                    p = append_cstr(@child[0], p, name)
+                    child[p] = 0
+                    sys_unlink(@child[0])
+                off += reclen
+        sys_close(fd)
+    sys_rmdir(dir)
+    # Gone iff it can no longer be opened.
+    let check: i32 = sys_open(dir, O_RDONLY + O_DIRECTORY)
+    if check >= 0
+        sys_close(check)
+        return 1
+    return 0
+
+# The actual round trip. Every early return destroys whatever storage it
+# opened; the caller removes the directory.
+fn run_open_commit_reopen(path: *u8) -> i32
+    let storage_opt: Option<*Storage> = storage_open(path)
+    if option_is_none<*Storage>(@storage_opt) == 1
+        return 1
+    let storage: *Storage = option_unwrap_or<*Storage>(@storage_opt, null)
+    if storage_is_open(storage) != 1
+        storage_destroy(storage)
+        return 2
+
+    let pages_before: i64 = storage_page_count(storage)
+
+    let txn: i64 = storage_begin_txn(storage)
+    if txn < 0
+        storage_destroy(storage)
+        return 3
+
+    let page_opt: Option<*Page> = storage_alloc_page(storage, PAGE_MAGIC_HEAP)
+    if option_is_none<*Page>(@page_opt) == 1
+        storage_destroy(storage)
+        return 4
+    let page: *Page = option_unwrap_or<*Page>(@page_opt, null)
+    if page_type(page) != PAGE_MAGIC_HEAP
+        storage_destroy(storage)
+        return 5
+
+    if storage_commit_txn(storage) != ERR_OK
+        storage_destroy(storage)
+        return 6
+
+    let pages_committed: i64 = storage_page_count(storage)
+    if pages_committed != pages_before + 1
+        storage_destroy(storage)
+        return 7
+
+    storage_destroy(storage)
+
+    # Reopen from disk: the committed page must still be there.
+    let storage2_opt: Option<*Storage> = storage_open(path)
+    if option_is_none<*Storage>(@storage2_opt) == 1
+        return 8
+    let storage2: *Storage = option_unwrap_or<*Storage>(@storage2_opt, null)
+    if storage_is_open(storage2) != 1
+        storage_destroy(storage2)
+        return 9
+
+    let pages_reopened: i64 = storage_page_count(storage2)
+    storage_destroy(storage2)
+    if pages_reopened < 1
+        return 10
+    if pages_reopened != pages_committed
+        return 11
+    return 0
+
+# ============================================================================
+# Tests
+# ============================================================================
+
+[[test]]
+fn test_storage_open_commit_reopen() -> i32
+    var path: [64]u8
+    make_tmp_path(@path[0])
+    if rm_dir_flat(@path[0]) != 0
+        return 20  # stale directory we cannot remove
+
+    let rc: i32 = run_open_commit_reopen(@path[0])
+
+    let cleaned: i32 = rm_dir_flat(@path[0])
+    if rc != 0
+        return rc
+    if cleaned != 0
+        return 21  # storage left something rm_dir_flat could not delete
+    return 0

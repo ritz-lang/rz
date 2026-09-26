@@ -89,8 +89,8 @@ Tome has no required dependencies beyond `ritzlib`. Optional integrations:
 **Active development**, further along than "Alpha — API design being defined",
 which is what this README said while the server was already running.
 
-Measured 2026-09-12: `./rz build tome` exits 0, producing `tome-server`,
-`tome-cli` and `run-tests`. `tome-server --port 6379` starts and serves; `-b`
+Measured 2026-09-26: `./rz build tome` exits 0, producing `tome-server`
+and `tome-cli`. `tome-server --port 6379` starts and serves; `-b`
 selects blocking I/O for environments without io_uring (WSL); `tome-cli --help`
 works. `lib/` holds 8 modules.
 

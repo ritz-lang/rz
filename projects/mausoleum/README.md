@@ -72,11 +72,13 @@ let old = db.at_version(spec.id, history[0].version_id)
 **Active development**, further along than "Alpha — architecture designed", which
 is what this README said while the code was already building and running.
 
-Measured 2026-09-12: `./rz build mausoleum` exits 0, producing five binaries —
-`mausoleum`, `wiki-seed`, `concurrent_bench`, `test_integration` and
-`test_storage`. `lib/` holds 18 modules and the project carries 401 `[[test]]`
-markers across 19 test files. Run `./rz test mausoleum` for the current pass
-count.
+Measured 2026-09-26: `./rz build mausoleum` exits 0, producing three binaries —
+`mausoleum`, `wiki-seed` and `concurrent_bench`. (The former `test_integration`
+and `test_storage` binaries are now `[[test]]` files: `test/test_integration.ritz`
+starts its own `mausoleum serve --no-encryption` on a pid-derived port, and
+`test/test_storage_persistence.ritz` does the open/commit/reopen round trip.)
+`lib/` holds 18 modules and the project carries 406 `[[test]]` markers across
+19 test files. Run `./rz test mausoleum` for the current pass count.
 
 Not yet proven: it does **not** build with the self-hosted compiler.
 `./rz clean mausoleum && ./rz build mausoleum --compiler ritz1` fails at exit 1

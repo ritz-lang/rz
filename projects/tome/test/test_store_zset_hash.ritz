@@ -1,0 +1,557 @@
+# test/test_store_zset_hash.ritz - Tome store sorted-set and hash operations
+#
+# Split out of test_store.ritz: `ritz0 --test` recompiles the file once per
+# test, so one 68-test file overran build.py's 180s per-file budget.
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+import ritzlib.timer
+import lib.tome
+
+# ============================================================================
+# Test: ZADD and ZSCORE
+# ============================================================================
+
+[[test]]
+fn test_zadd_zscore() -> i32
+    var store: Store = store_new()
+
+    # ZADD creates sorted set and adds member with score
+    let added1: i64 = store_zadd_cstr(@store, c"myzset", 1, c"one")
+    if added1 != 1
+        return 1
+
+    # Adding same member again returns 0 (updated)
+    let added2: i64 = store_zadd_cstr(@store, c"myzset", 10, c"one")
+    if added2 != 0
+        return 1
+
+    # Add more members
+    store_zadd_cstr(@store, c"myzset", 2, c"two")
+    store_zadd_cstr(@store, c"myzset", 3, c"three")
+
+    # ZSCORE gets score
+    var score: i64 = 0
+    let found: i32 = store_zscore_cstr(@store, c"myzset", c"one", @score)
+    if found != 1
+        return 1
+    if score != 10  # Updated score
+        return 1
+
+    # Non-existent member
+    let found2: i32 = store_zscore_cstr(@store, c"myzset", c"four", @score)
+    if found2 != 0
+        return 1
+
+    return 0
+
+# ============================================================================
+# Test: ZREM
+# ============================================================================
+
+[[test]]
+fn test_zrem() -> i32
+    var store: Store = store_new()
+
+    store_zadd_cstr(@store, c"myzset", 1, c"one")
+    store_zadd_cstr(@store, c"myzset", 2, c"two")
+    store_zadd_cstr(@store, c"myzset", 3, c"three")
+
+    # Remove a member
+    let removed: i64 = store_zrem_cstr(@store, c"myzset", c"two")
+    if removed != 1
+        return 1
+
+    # Verify it's gone
+    var score: i64 = 0
+    if store_zscore_cstr(@store, c"myzset", c"two", @score) != 0
+        return 1
+
+    # Others still there
+    if store_zscore_cstr(@store, c"myzset", c"one", @score) != 1
+        return 1
+
+    # Remove non-existent member
+    let removed2: i64 = store_zrem_cstr(@store, c"myzset", c"four")
+    if removed2 != 0
+        return 1
+
+    return 0
+
+# ============================================================================
+# Test: ZCARD
+# ============================================================================
+
+[[test]]
+fn test_zcard() -> i32
+    var store: Store = store_new()
+
+    # Non-existent zset has cardinality 0
+    if store_zcard_cstr(@store, c"nozset") != 0
+        return 1
+
+    store_zadd_cstr(@store, c"myzset", 1, c"one")
+    if store_zcard_cstr(@store, c"myzset") != 1
+        return 1
+
+    store_zadd_cstr(@store, c"myzset", 2, c"two")
+    store_zadd_cstr(@store, c"myzset", 3, c"three")
+    if store_zcard_cstr(@store, c"myzset") != 3
+        return 1
+
+    # Update doesn't increase cardinality
+    store_zadd_cstr(@store, c"myzset", 10, c"one")
+    if store_zcard_cstr(@store, c"myzset") != 3
+        return 1
+
+    return 0
+
+# ============================================================================
+# Test: ZRANK and ZREVRANK
+# ============================================================================
+
+[[test]]
+fn test_zrank() -> i32
+    var store: Store = store_new()
+
+    store_zadd_cstr(@store, c"myzset", 1, c"one")
+    store_zadd_cstr(@store, c"myzset", 2, c"two")
+    store_zadd_cstr(@store, c"myzset", 3, c"three")
+    # Order: one(1), two(2), three(3)
+    # Ranks: 0, 1, 2
+
+    if store_zrank_cstr(@store, c"myzset", c"one") != 0
+        return 1
+    if store_zrank_cstr(@store, c"myzset", c"two") != 1
+        return 1
+    if store_zrank_cstr(@store, c"myzset", c"three") != 2
+        return 1
+
+    # ZREVRANK: highest score = 0
+    if store_zrevrank_cstr(@store, c"myzset", c"three") != 0
+        return 1
+    if store_zrevrank_cstr(@store, c"myzset", c"two") != 1
+        return 1
+    if store_zrevrank_cstr(@store, c"myzset", c"one") != 2
+        return 1
+
+    # Non-existent member
+    if store_zrank_cstr(@store, c"myzset", c"four") != -1
+        return 1
+
+    return 0
+
+# ============================================================================
+# Test: ZRANGE
+# ============================================================================
+
+[[test]]
+fn test_zrange() -> i32
+    var store: Store = store_new()
+
+    store_zadd_cstr(@store, c"myzset", 1, c"one")
+    store_zadd_cstr(@store, c"myzset", 2, c"two")
+    store_zadd_cstr(@store, c"myzset", 3, c"three")
+    store_zadd_cstr(@store, c"myzset", 4, c"four")
+    store_zadd_cstr(@store, c"myzset", 5, c"five")
+    # Order: one, two, three, four, five (by score)
+
+    # Full range
+    var count: i64 = 0
+    let all: **u8 = store_zrange_cstr(@store, c"myzset", 0, -1, @count)
+    if count != 5
+        if all != null
+            free(all as *u8)
+        return 1
+    if strcmp(*all, c"one") != 0 || strcmp(*(all + 4), c"five") != 0
+        free(all as *u8)
+        return 1
+    free(all as *u8)
+
+    # Partial range
+    let partial: **u8 = store_zrange_cstr(@store, c"myzset", 1, 3, @count)
+    if count != 3
+        if partial != null
+            free(partial as *u8)
+        return 1
+    if strcmp(*partial, c"two") != 0 || strcmp(*(partial + 2), c"four") != 0
+        free(partial as *u8)
+        return 1
+    free(partial as *u8)
+
+    return 0
+
+# ============================================================================
+# Test: ZREVRANGE
+# ============================================================================
+
+[[test]]
+fn test_zrevrange() -> i32
+    var store: Store = store_new()
+
+    store_zadd_cstr(@store, c"myzset", 1, c"one")
+    store_zadd_cstr(@store, c"myzset", 2, c"two")
+    store_zadd_cstr(@store, c"myzset", 3, c"three")
+    # Forward order: one, two, three
+    # Reverse order: three, two, one
+
+    var count: i64 = 0
+    let all: **u8 = store_zrevrange_cstr(@store, c"myzset", 0, -1, @count)
+    if count != 3
+        if all != null
+            free(all as *u8)
+        return 1
+
+    # Should be reversed: three, two, one
+    if strcmp(*all, c"three") != 0
+        free(all as *u8)
+        return 1
+    if strcmp(*(all + 1), c"two") != 0
+        free(all as *u8)
+        return 1
+    if strcmp(*(all + 2), c"one") != 0
+        free(all as *u8)
+        return 1
+    free(all as *u8)
+
+    return 0
+
+# ============================================================================
+# Test: Sorted set type mismatch
+# ============================================================================
+
+[[test]]
+fn test_zset_type_mismatch() -> i32
+    var store: Store = store_new()
+
+    # Set a string key
+    store_set_cstr(@store, c"key", c"value")
+
+    # Try to use zset operations on it
+    let added: i64 = store_zadd_cstr(@store, c"key", 1, c"member")
+    if added != -1  # Should fail with -1
+        return 1
+
+    let card: i64 = store_zcard_cstr(@store, c"key")
+    if card != -1  # Should fail with -1
+        return 1
+
+    return 0
+
+# ============================================================================
+# Test: Delete zset key
+# ============================================================================
+
+[[test]]
+fn test_del_zset() -> i32
+    var store: Store = store_new()
+
+    store_zadd_cstr(@store, c"myzset", 1, c"one")
+    store_zadd_cstr(@store, c"myzset", 2, c"two")
+    store_zadd_cstr(@store, c"myzset", 3, c"three")
+
+    # Delete should work
+    let deleted: i32 = store_del_cstr(@store, c"myzset")
+    if deleted != 1
+        return 1
+
+    # Zset should be gone
+    if store_zcard_cstr(@store, c"myzset") != 0
+        return 1
+
+    return 0
+
+# ============================================================================
+# Test: Sorted set with same scores (lexicographic ordering)
+# ============================================================================
+
+[[test]]
+fn test_zset_same_scores() -> i32
+    var store: Store = store_new()
+
+    # All same score - should be sorted lexicographically
+    store_zadd_cstr(@store, c"myzset", 1, c"charlie")
+    store_zadd_cstr(@store, c"myzset", 1, c"alpha")
+    store_zadd_cstr(@store, c"myzset", 1, c"bravo")
+    # Expected order: alpha, bravo, charlie (lexicographic)
+
+    var count: i64 = 0
+    let members: **u8 = store_zrange_cstr(@store, c"myzset", 0, -1, @count)
+    if count != 3
+        if members != null
+            free(members as *u8)
+        return 1
+
+    if strcmp(*members, c"alpha") != 0
+        free(members as *u8)
+        return 1
+    if strcmp(*(members + 1), c"bravo") != 0
+        free(members as *u8)
+        return 1
+    if strcmp(*(members + 2), c"charlie") != 0
+        free(members as *u8)
+        return 1
+    free(members as *u8)
+
+    return 0
+
+# ============================================================================
+# Hash Tests
+# ============================================================================
+
+# Test: HSET and HGET basic operations
+[[test]]
+fn test_hset_hget() -> i32
+    var store: Store = store_new()
+
+    # Set a field in a new hash
+    let res1: i32 = store_hset_cstr(@store, c"myhash", c"field1", c"value1")
+    if res1 != 1  # New field
+        return 1
+
+    # Get the field
+    let val1: *u8 = store_hget_cstr(@store, c"myhash", c"field1")
+    if val1 == null
+        return 1
+    if strcmp(val1, c"value1") != 0
+        return 1
+
+    # Update existing field
+    let res2: i32 = store_hset_cstr(@store, c"myhash", c"field1", c"newvalue")
+    if res2 != 0  # Updated, not new
+        return 1
+
+    let val2: *u8 = store_hget_cstr(@store, c"myhash", c"field1")
+    if strcmp(val2, c"newvalue") != 0
+        return 1
+
+    # Get non-existent field
+    let val3: *u8 = store_hget_cstr(@store, c"myhash", c"nofield")
+    if val3 != null
+        return 1
+
+    # Get from non-existent key
+    let val4: *u8 = store_hget_cstr(@store, c"nokey", c"field1")
+    if val4 != null
+        return 1
+
+    return 0
+
+# Test: HDEL field deletion
+[[test]]
+fn test_hdel() -> i32
+    var store: Store = store_new()
+
+    store_hset_cstr(@store, c"myhash", c"f1", c"v1")
+    store_hset_cstr(@store, c"myhash", c"f2", c"v2")
+    store_hset_cstr(@store, c"myhash", c"f3", c"v3")
+
+    # Delete existing field
+    let del1: i32 = store_hdel_cstr(@store, c"myhash", c"f2")
+    if del1 != 1
+        return 1
+
+    # Verify deleted
+    if store_hget_cstr(@store, c"myhash", c"f2") != null
+        return 1
+
+    # Other fields still exist
+    if store_hget_cstr(@store, c"myhash", c"f1") == null
+        return 1
+    if store_hget_cstr(@store, c"myhash", c"f3") == null
+        return 1
+
+    # Delete non-existent field
+    let del2: i32 = store_hdel_cstr(@store, c"myhash", c"nofield")
+    if del2 != 0
+        return 1
+
+    # Delete from non-existent key
+    let del3: i32 = store_hdel_cstr(@store, c"nokey", c"f1")
+    if del3 != 0
+        return 1
+
+    return 0
+
+# Test: HEXISTS and HLEN
+[[test]]
+fn test_hexists_hlen() -> i32
+    var store: Store = store_new()
+
+    store_hset_cstr(@store, c"myhash", c"f1", c"v1")
+    store_hset_cstr(@store, c"myhash", c"f2", c"v2")
+
+    # HEXISTS
+    if store_hexists_cstr(@store, c"myhash", c"f1") != 1
+        return 1
+    if store_hexists_cstr(@store, c"myhash", c"nofield") != 0
+        return 1
+    if store_hexists_cstr(@store, c"nokey", c"f1") != 0
+        return 1
+
+    # HLEN
+    let len1: i64 = store_hlen_cstr(@store, c"myhash")
+    if len1 != 2
+        return 1
+
+    store_hset_cstr(@store, c"myhash", c"f3", c"v3")
+    if store_hlen_cstr(@store, c"myhash") != 3
+        return 1
+
+    # Non-existent key returns 0
+    if store_hlen_cstr(@store, c"nokey") != 0
+        return 1
+
+    return 0
+
+# Test: HKEYS
+[[test]]
+fn test_hkeys() -> i32
+    var store: Store = store_new()
+
+    store_hset_cstr(@store, c"myhash", c"name", c"John")
+    store_hset_cstr(@store, c"myhash", c"age", c"30")
+    store_hset_cstr(@store, c"myhash", c"city", c"NYC")
+
+    var count: i64 = 0
+    let keys: **u8 = store_hkeys_cstr(@store, c"myhash", @count)
+    if count != 3
+        if keys != null
+            free(keys as *u8)
+        return 1
+
+    # Check all keys present (order may vary due to hashing)
+    var found_name: i32 = 0
+    var found_age: i32 = 0
+    var found_city: i32 = 0
+    for i in 0..count
+        let k: *u8 = *(keys + i)
+        if strcmp(k, c"name") == 0
+            found_name = 1
+        if strcmp(k, c"age") == 0
+            found_age = 1
+        if strcmp(k, c"city") == 0
+            found_city = 1
+
+    free(keys as *u8)
+
+    if found_name != 1 || found_age != 1 || found_city != 1
+        return 1
+
+    return 0
+
+# Test: HVALS
+[[test]]
+fn test_hvals() -> i32
+    var store: Store = store_new()
+
+    store_hset_cstr(@store, c"myhash", c"a", c"1")
+    store_hset_cstr(@store, c"myhash", c"b", c"2")
+
+    var count: i64 = 0
+    let vals: **u8 = store_hvals_cstr(@store, c"myhash", @count)
+    if count != 2
+        if vals != null
+            free(vals as *u8)
+        return 1
+
+    # Check values present
+    var found_1: i32 = 0
+    var found_2: i32 = 0
+    for i in 0..count
+        let v: *u8 = *(vals + i)
+        if strcmp(v, c"1") == 0
+            found_1 = 1
+        if strcmp(v, c"2") == 0
+            found_2 = 1
+
+    free(vals as *u8)
+
+    if found_1 != 1 || found_2 != 1
+        return 1
+
+    return 0
+
+# Test: HGETALL
+[[test]]
+fn test_hgetall() -> i32
+    var store: Store = store_new()
+
+    store_hset_cstr(@store, c"myhash", c"x", c"10")
+    store_hset_cstr(@store, c"myhash", c"y", c"20")
+
+    var count: i64 = 0
+    let pairs: **u8 = store_hgetall_cstr(@store, c"myhash", @count)
+    if count != 4  # 2 fields * 2 (field + value)
+        if pairs != null
+            free(pairs as *u8)
+        return 1
+
+    # Should have field-value pairs
+    # pairs[0], pairs[1] = first field, first value
+    # pairs[2], pairs[3] = second field, second value
+    var found_x10: i32 = 0
+    var found_y20: i32 = 0
+    var i: i64 = 0
+    while i < count
+        let field: *u8 = *(pairs + i)
+        let val: *u8 = *(pairs + i + 1)
+        if strcmp(field, c"x") == 0 && strcmp(val, c"10") == 0
+            found_x10 = 1
+        if strcmp(field, c"y") == 0 && strcmp(val, c"20") == 0
+            found_y20 = 1
+        i += 2
+
+    free(pairs as *u8)
+
+    if found_x10 != 1 || found_y20 != 1
+        return 1
+
+    return 0
+
+# Test: Hash type mismatch
+[[test]]
+fn test_hash_type_mismatch() -> i32
+    var store: Store = store_new()
+
+    # Set string key
+    store_set_cstr(@store, c"key", c"value")
+
+    # Hash ops on string should fail with -1
+    let res: i32 = store_hset_cstr(@store, c"key", c"field", c"val")
+    if res != -1
+        return 1
+
+    if store_hexists_cstr(@store, c"key", c"field") != -1
+        return 1
+
+    if store_hlen_cstr(@store, c"key") != -1
+        return 1
+
+    if store_hdel_cstr(@store, c"key", c"field") != -1
+        return 1
+
+    return 0
+
+# Test: Delete hash key
+[[test]]
+fn test_del_hash() -> i32
+    var store: Store = store_new()
+
+    store_hset_cstr(@store, c"myhash", c"f1", c"v1")
+    store_hset_cstr(@store, c"myhash", c"f2", c"v2")
+
+    # Delete should work
+    let deleted: i32 = store_del_cstr(@store, c"myhash")
+    if deleted != 1
+        return 1
+
+    # Hash should be gone
+    if store_hlen_cstr(@store, c"myhash") != 0
+        return 1
+
+    if store_hget_cstr(@store, c"myhash", c"f1") != null
+        return 1
+
+    return 0

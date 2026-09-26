@@ -1,0 +1,558 @@
+# test/test_store_list_set.ritz - Tome store list and set operations
+#
+# Split out of test_store.ritz: `ritz0 --test` recompiles the file once per
+# test, so one 68-test file overran build.py's 180s per-file budget.
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+import ritzlib.timer
+import lib.tome
+
+# ============================================================================
+# Test: LPUSH and RPUSH
+# ============================================================================
+
+[[test]]
+fn test_lpush_rpush() -> i32
+    var store: Store = store_new()
+
+    # LPUSH creates list and adds to head
+    let len1: i64 = store_lpush_cstr(@store, c"mylist", c"a")
+    if len1 != 1
+        return 1
+
+    # LPUSH again - adds to head
+    let len2: i64 = store_lpush_cstr(@store, c"mylist", c"b")
+    if len2 != 2
+        return 1
+
+    # RPUSH - adds to tail
+    let len3: i64 = store_rpush_cstr(@store, c"mylist", c"c")
+    if len3 != 3
+        return 1
+
+    # Order should be: b, a, c
+    let v0: *u8 = store_lindex_cstr(@store, c"mylist", 0)
+    let v1: *u8 = store_lindex_cstr(@store, c"mylist", 1)
+    let v2: *u8 = store_lindex_cstr(@store, c"mylist", 2)
+
+    if strcmp(v0, c"b") != 0
+        return 1
+    if strcmp(v1, c"a") != 0
+        return 1
+    if strcmp(v2, c"c") != 0
+        return 1
+
+    return 0
+
+# ============================================================================
+# Test: LPOP and RPOP
+# ============================================================================
+
+[[test]]
+fn test_lpop_rpop() -> i32
+    var store: Store = store_new()
+
+    store_rpush_cstr(@store, c"mylist", c"a")
+    store_rpush_cstr(@store, c"mylist", c"b")
+    store_rpush_cstr(@store, c"mylist", c"c")
+    # List: a, b, c
+
+    # LPOP removes from head
+    var val1: String = store_lpop_cstr(@store, c"mylist")
+    if strcmp(string_as_ptr(@val1), c"a") != 0
+        string_drop(@val1)
+        return 1
+    string_drop(@val1)
+
+    # List: b, c
+    var val2: String = store_rpop_cstr(@store, c"mylist")
+    if strcmp(string_as_ptr(@val2), c"c") != 0
+        string_drop(@val2)
+        return 1
+    string_drop(@val2)
+
+    # List: b
+    if store_llen_cstr(@store, c"mylist") != 1
+        return 1
+
+    return 0
+
+# ============================================================================
+# Test: LLEN
+# ============================================================================
+
+[[test]]
+fn test_llen() -> i32
+    var store: Store = store_new()
+
+    # Non-existent list has length 0
+    if store_llen_cstr(@store, c"nolist") != 0
+        return 1
+
+    store_rpush_cstr(@store, c"mylist", c"a")
+    if store_llen_cstr(@store, c"mylist") != 1
+        return 1
+
+    store_rpush_cstr(@store, c"mylist", c"b")
+    store_rpush_cstr(@store, c"mylist", c"c")
+    if store_llen_cstr(@store, c"mylist") != 3
+        return 1
+
+    return 0
+
+# ============================================================================
+# Test: LINDEX with negative indices
+# ============================================================================
+
+[[test]]
+fn test_lindex_negative() -> i32
+    var store: Store = store_new()
+
+    store_rpush_cstr(@store, c"mylist", c"a")
+    store_rpush_cstr(@store, c"mylist", c"b")
+    store_rpush_cstr(@store, c"mylist", c"c")
+    # List: a, b, c (indices 0, 1, 2 or -3, -2, -1)
+
+    # Positive indices
+    let v0: *u8 = store_lindex_cstr(@store, c"mylist", 0)
+    if strcmp(v0, c"a") != 0
+        return 1
+
+    # Negative indices
+    let v_1: *u8 = store_lindex_cstr(@store, c"mylist", -1)
+    if strcmp(v_1, c"c") != 0
+        return 1
+
+    let v_2: *u8 = store_lindex_cstr(@store, c"mylist", -2)
+    if strcmp(v_2, c"b") != 0
+        return 1
+
+    # Out of bounds returns null
+    let v_out: *u8 = store_lindex_cstr(@store, c"mylist", 10)
+    if v_out != null
+        return 1
+
+    return 0
+
+# ============================================================================
+# Test: LRANGE
+# ============================================================================
+
+[[test]]
+fn test_lrange() -> i32
+    var store: Store = store_new()
+
+    store_rpush_cstr(@store, c"mylist", c"a")
+    store_rpush_cstr(@store, c"mylist", c"b")
+    store_rpush_cstr(@store, c"mylist", c"c")
+    store_rpush_cstr(@store, c"mylist", c"d")
+    store_rpush_cstr(@store, c"mylist", c"e")
+    # List: a, b, c, d, e
+
+    # Full range
+    var count: i64 = 0
+    let all: **u8 = store_lrange_cstr(@store, c"mylist", 0, -1, @count)
+    if count != 5
+        if all != null
+            free(all as *u8)
+        return 1
+    if strcmp(*all, c"a") != 0 || strcmp(*(all + 4), c"e") != 0
+        free(all as *u8)
+        return 1
+    free(all as *u8)
+
+    # Partial range
+    let partial: **u8 = store_lrange_cstr(@store, c"mylist", 1, 3, @count)
+    if count != 3
+        if partial != null
+            free(partial as *u8)
+        return 1
+    if strcmp(*partial, c"b") != 0 || strcmp(*(partial + 2), c"d") != 0
+        free(partial as *u8)
+        return 1
+    free(partial as *u8)
+
+    # Negative indices
+    let tail: **u8 = store_lrange_cstr(@store, c"mylist", -2, -1, @count)
+    if count != 2
+        if tail != null
+            free(tail as *u8)
+        return 1
+    if strcmp(*tail, c"d") != 0 || strcmp(*(tail + 1), c"e") != 0
+        free(tail as *u8)
+        return 1
+    free(tail as *u8)
+
+    return 0
+
+# ============================================================================
+# Test: List type mismatch
+# ============================================================================
+
+[[test]]
+fn test_list_type_mismatch() -> i32
+    var store: Store = store_new()
+
+    # Set a string key
+    store_set_cstr(@store, c"key", c"value")
+
+    # Try to use list operations on it
+    let len: i64 = store_lpush_cstr(@store, c"key", c"item")
+    if len != -1  # Should fail with -1
+        return 1
+
+    let llen: i64 = store_llen_cstr(@store, c"key")
+    if llen != -1  # Should fail with -1
+        return 1
+
+    return 0
+
+# ============================================================================
+# Test: Empty list operations
+# ============================================================================
+
+[[test]]
+fn test_empty_list_ops() -> i32
+    var store: Store = store_new()
+
+    # Pop from non-existent list
+    var val: String = store_lpop_cstr(@store, c"nolist")
+    if string_len(@val) != 0  # Should be empty string
+        string_drop(@val)
+        return 1
+    string_drop(@val)
+
+    # Create list, pop everything
+    store_rpush_cstr(@store, c"mylist", c"only")
+    var popped: String = store_lpop_cstr(@store, c"mylist")
+    string_drop(@popped)
+
+    # Now empty - pop again
+    var empty_pop: String = store_lpop_cstr(@store, c"mylist")
+    if string_len(@empty_pop) != 0
+        string_drop(@empty_pop)
+        return 1
+    string_drop(@empty_pop)
+
+    # Length of empty list
+    if store_llen_cstr(@store, c"mylist") != 0
+        return 1
+
+    return 0
+
+# ============================================================================
+# Test: Delete list key
+# ============================================================================
+
+[[test]]
+fn test_del_list() -> i32
+    var store: Store = store_new()
+
+    store_rpush_cstr(@store, c"mylist", c"a")
+    store_rpush_cstr(@store, c"mylist", c"b")
+    store_rpush_cstr(@store, c"mylist", c"c")
+
+    # Delete should work
+    let deleted: i32 = store_del_cstr(@store, c"mylist")
+    if deleted != 1
+        return 1
+
+    # List should be gone
+    if store_llen_cstr(@store, c"mylist") != 0
+        return 1
+
+    return 0
+
+# ============================================================================
+# Test: SADD and SISMEMBER
+# ============================================================================
+
+[[test]]
+fn test_sadd_sismember() -> i32
+    var store: Store = store_new()
+
+    # SADD creates set and adds member
+    let added1: i64 = store_sadd_cstr(@store, c"myset", c"a")
+    if added1 != 1
+        return 1
+
+    # Adding same member again returns 0
+    let added2: i64 = store_sadd_cstr(@store, c"myset", c"a")
+    if added2 != 0
+        return 1
+
+    # Add more members
+    store_sadd_cstr(@store, c"myset", c"b")
+    store_sadd_cstr(@store, c"myset", c"c")
+
+    # SISMEMBER checks membership
+    if store_sismember_cstr(@store, c"myset", c"a") != 1
+        return 1
+    if store_sismember_cstr(@store, c"myset", c"b") != 1
+        return 1
+    if store_sismember_cstr(@store, c"myset", c"d") != 0  # Not a member
+        return 1
+
+    return 0
+
+# ============================================================================
+# Test: SREM
+# ============================================================================
+
+[[test]]
+fn test_srem() -> i32
+    var store: Store = store_new()
+
+    store_sadd_cstr(@store, c"myset", c"a")
+    store_sadd_cstr(@store, c"myset", c"b")
+    store_sadd_cstr(@store, c"myset", c"c")
+
+    # Remove a member
+    let removed: i64 = store_srem_cstr(@store, c"myset", c"b")
+    if removed != 1
+        return 1
+
+    # Verify it's gone
+    if store_sismember_cstr(@store, c"myset", c"b") != 0
+        return 1
+
+    # Others still there
+    if store_sismember_cstr(@store, c"myset", c"a") != 1
+        return 1
+
+    # Remove non-existent member
+    let removed2: i64 = store_srem_cstr(@store, c"myset", c"x")
+    if removed2 != 0
+        return 1
+
+    return 0
+
+# ============================================================================
+# Test: SCARD
+# ============================================================================
+
+[[test]]
+fn test_scard() -> i32
+    var store: Store = store_new()
+
+    # Non-existent set has cardinality 0
+    if store_scard_cstr(@store, c"noset") != 0
+        return 1
+
+    store_sadd_cstr(@store, c"myset", c"a")
+    if store_scard_cstr(@store, c"myset") != 1
+        return 1
+
+    store_sadd_cstr(@store, c"myset", c"b")
+    store_sadd_cstr(@store, c"myset", c"c")
+    if store_scard_cstr(@store, c"myset") != 3
+        return 1
+
+    # Duplicate doesn't increase cardinality
+    store_sadd_cstr(@store, c"myset", c"a")
+    if store_scard_cstr(@store, c"myset") != 3
+        return 1
+
+    return 0
+
+# ============================================================================
+# Test: SMEMBERS
+# ============================================================================
+
+[[test]]
+fn test_smembers() -> i32
+    var store: Store = store_new()
+
+    store_sadd_cstr(@store, c"myset", c"a")
+    store_sadd_cstr(@store, c"myset", c"b")
+    store_sadd_cstr(@store, c"myset", c"c")
+
+    var count: i64 = 0
+    let members: **u8 = store_smembers_cstr(@store, c"myset", @count)
+
+    if count != 3
+        if members != null
+            free(members as *u8)
+        return 1
+
+    # Members are returned in hash order (unordered)
+    # Just verify we got 3 non-null strings
+    if members == null
+        return 1
+
+    var found_a: i32 = 0
+    var found_b: i32 = 0
+    var found_c: i32 = 0
+
+    for i in 0..count
+        let m: *u8 = *(members + i)
+        if strcmp(m, c"a") == 0
+            found_a = 1
+        if strcmp(m, c"b") == 0
+            found_b = 1
+        if strcmp(m, c"c") == 0
+            found_c = 1
+
+    free(members as *u8)
+
+    if found_a != 1 || found_b != 1 || found_c != 1
+        return 1
+
+    return 0
+
+# ============================================================================
+# Test: SUNION
+# ============================================================================
+
+[[test]]
+fn test_sunion() -> i32
+    var store: Store = store_new()
+
+    store_sadd_cstr(@store, c"set1", c"a")
+    store_sadd_cstr(@store, c"set1", c"b")
+    store_sadd_cstr(@store, c"set2", c"b")
+    store_sadd_cstr(@store, c"set2", c"c")
+
+    let result: *Set = store_sunion_cstr(@store, c"set1", c"set2")
+    if result == null
+        return 1
+
+    if set_len(result) != 3  # {a, b, c}
+        set_drop(result)
+        return 1
+
+    # Verify all members present
+    if set_contains(result, c"a") != 1
+        set_drop(result)
+        return 1
+    if set_contains(result, c"b") != 1
+        set_drop(result)
+        return 1
+    if set_contains(result, c"c") != 1
+        set_drop(result)
+        return 1
+
+    set_drop(result)
+    return 0
+
+# ============================================================================
+# Test: SINTER
+# ============================================================================
+
+[[test]]
+fn test_sinter() -> i32
+    var store: Store = store_new()
+
+    store_sadd_cstr(@store, c"set1", c"a")
+    store_sadd_cstr(@store, c"set1", c"b")
+    store_sadd_cstr(@store, c"set1", c"c")
+    store_sadd_cstr(@store, c"set2", c"b")
+    store_sadd_cstr(@store, c"set2", c"c")
+    store_sadd_cstr(@store, c"set2", c"d")
+
+    let result: *Set = store_sinter_cstr(@store, c"set1", c"set2")
+    if result == null
+        return 1
+
+    if set_len(result) != 2  # {b, c}
+        set_drop(result)
+        return 1
+
+    # Verify members
+    if set_contains(result, c"b") != 1
+        set_drop(result)
+        return 1
+    if set_contains(result, c"c") != 1
+        set_drop(result)
+        return 1
+    # 'a' should NOT be in intersection
+    if set_contains(result, c"a") != 0
+        set_drop(result)
+        return 1
+
+    set_drop(result)
+    return 0
+
+# ============================================================================
+# Test: SDIFF
+# ============================================================================
+
+[[test]]
+fn test_sdiff() -> i32
+    var store: Store = store_new()
+
+    store_sadd_cstr(@store, c"set1", c"a")
+    store_sadd_cstr(@store, c"set1", c"b")
+    store_sadd_cstr(@store, c"set1", c"c")
+    store_sadd_cstr(@store, c"set2", c"b")
+    store_sadd_cstr(@store, c"set2", c"d")
+
+    let result: *Set = store_sdiff_cstr(@store, c"set1", c"set2")
+    if result == null
+        return 1
+
+    if set_len(result) != 2  # {a, c} - items in set1 but not set2
+        set_drop(result)
+        return 1
+
+    # Verify members
+    if set_contains(result, c"a") != 1
+        set_drop(result)
+        return 1
+    if set_contains(result, c"c") != 1
+        set_drop(result)
+        return 1
+    # 'b' should NOT be in diff (it's in set2)
+    if set_contains(result, c"b") != 0
+        set_drop(result)
+        return 1
+
+    set_drop(result)
+    return 0
+
+# ============================================================================
+# Test: Set type mismatch
+# ============================================================================
+
+[[test]]
+fn test_set_type_mismatch() -> i32
+    var store: Store = store_new()
+
+    # Set a string key
+    store_set_cstr(@store, c"key", c"value")
+
+    # Try to use set operations on it
+    let added: i64 = store_sadd_cstr(@store, c"key", c"member")
+    if added != -1  # Should fail with -1
+        return 1
+
+    let card: i64 = store_scard_cstr(@store, c"key")
+    if card != -1  # Should fail with -1
+        return 1
+
+    return 0
+
+# ============================================================================
+# Test: Delete set key
+# ============================================================================
+
+[[test]]
+fn test_del_set() -> i32
+    var store: Store = store_new()
+
+    store_sadd_cstr(@store, c"myset", c"a")
+    store_sadd_cstr(@store, c"myset", c"b")
+    store_sadd_cstr(@store, c"myset", c"c")
+
+    # Delete should work
+    let deleted: i32 = store_del_cstr(@store, c"myset")
+    if deleted != 1
+        return 1
+
+    # Set should be gone
+    if store_scard_cstr(@store, c"myset") != 0
+        return 1
+
+    return 0

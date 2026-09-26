@@ -78,10 +78,10 @@ store.gc(ns.all_blob_ids())
 
 ## Status
 
-**Alpha, with a passing suite.** Measured 2026-09-12: `./rz build goliath` exits
-0, and the resulting `build/debug/goliath-tests` binary runs to
-`Results: 33 passed, 0 failed` at exit 0. 33 `[[test]]` markers across 5 test
-files.
+**Alpha, with a passing suite.** Measured 2026-09-26: `./rz test goliath` runs
+4 test files, 33 tests passed. Run it to get today's numbers. The hand-rolled
+`goliath-tests` binary (`test/test_main.ritz`) was removed by AGAST #1484. It
+only re-ran the same `[[test]]` functions that `ritz0 --test` already runs.
 
 Core blob store (put/get/exists), namespaces and path handling are implemented.
 Garbage collection and snapshot support are still planned.
