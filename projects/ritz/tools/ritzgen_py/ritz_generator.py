@@ -82,6 +82,7 @@ HAND_WRITTEN_TOKEN_IDS = {
     'DEFER': 31, 'LOOP': 32, 'UNSAFE': 33, 'IN': 34,
     'AND': 35, 'OR': 36, 'NOT': 37, 'TRUE': 38, 'FALSE': 39,
     'NULL': 40, 'SELF': 41, 'MUT': 42, 'PASS': 43, 'ASSERT': 44, 'FLOAT': 45,
+    'TYPE': 46,
     # Type keywords
     'I8': 50, 'I16': 51, 'I32': 52, 'I64': 53,
     'U8': 54, 'U16': 55, 'U32': 56, 'U64': 57,
@@ -109,6 +110,11 @@ HAND_WRITTEN_TOKEN_IDS = {
     # Whitespace
     'WHITESPACE': 140, 'COMMENT': 141,
 }
+
+
+def unmapped_tokens(grammar: Grammar) -> List[str]:
+    """Grammar tokens that have no ritz1 token ID (and so can't be lexed)."""
+    return [t.name for t in grammar.tokens if t.name not in HAND_WRITTEN_TOKEN_IDS]
 
 
 class RitzGenerator:
@@ -872,6 +878,17 @@ def main():
     args = parser.parse_args()
 
     grammar = parse_grammar_file(args.grammar_file)
+
+    # A grammar token with no entry in HAND_WRITTEN_TOKEN_IDS used to be
+    # dropped from tokens.ritz and lexer_setup_gen.ritz without a word, while
+    # parser.ritz still referenced TOK_<NAME>: the lexer never produced it and
+    # the build failed far from the cause (hit adding TYPE for AGAST #1475).
+    unmapped = unmapped_tokens(grammar)
+    if unmapped:
+        print(f"error: grammar token(s) with no ID in HAND_WRITTEN_TOKEN_IDS: "
+              f"{', '.join(unmapped)}. Add them to tools/ritzgen_py/ritz_generator.py.",
+              file=sys.stderr)
+        sys.exit(1)
 
     if args.verbose:
         print(f"Loaded {len(grammar.tokens)} tokens, {len(grammar.rules)} rules",

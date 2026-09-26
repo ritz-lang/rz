@@ -48,6 +48,7 @@ LOCAL_MODULES = {
     "check_no_s_strings",
     "run_regression_matrix",
     "ab_test",
+    "ritzgen_py",
 }
 
 # Distribution name -> module name, where they differ.

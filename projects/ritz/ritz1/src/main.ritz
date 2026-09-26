@@ -644,6 +644,41 @@ fn print_usage()
     eprintln("Usage: ritz1 <input.ritz> -o <output.ll> [-I <ritz_path>]")
     eprintln("       ritz1 -- <input.ritz>")
 
+# Parse the main file's tokens, mark its fns local, and resolve (parse and
+# merge) its imports.  Returns null on any failure (already reported).
+# Called twice when the first pass records a type alias (AGAST #1475).
+fn parse_program(tokens: *Vec<Token>, input_path: *u8, source_dir: StrView, ritz_path: StrView) -> *Module
+    # Parse
+    parser_set_source_file(input_path)
+    let m: *Module = parse_tokens(tokens)
+    if m == null
+        return null
+
+    # AGAST #194: mark every FnDef parsed from THIS file as is_local=1
+    # *before* resolve_imports prepends imported FnDefs (those stay
+    # is_local=0). emit_fn uses the flag to decide define-vs-declare —
+    # only local fns get a body, imports become extern declarations.
+    # This is the core of modular emit: each .ll contains only the
+    # current file's bodies + linkonce_odr monomorph instantiations.
+    var local_fn: *FnDef = m.functions
+    while local_fn != null
+        local_fn.is_local = 1
+        local_fn = local_fn.next
+    var local_ib: *ImplBlock = m.impls
+    while local_ib != null
+        var local_method: *FnDef = local_ib.methods
+        while local_method != null
+            local_method.is_local = 1
+            local_method = local_method.next
+        local_ib = local_ib.next
+
+    # Resolve imports recursively
+    if resolve_imports(m, source_dir, ritz_path) < 0
+        eprintln("Error: Import resolution failed")
+        return null
+
+    m
+
 # =============================================================================
 # Main Entry Point
 # =============================================================================
@@ -681,38 +716,31 @@ fn main(argc: i32, argv: **u8, envp: **u8) -> i32
         string_drop(@msg)
         return 1
 
-    # Parse
-    parser_set_source_file(args.input_path)
-    let m: *Module = parse_tokens(@tokens)
-    if m == null
-        return 1
-
-    # AGAST #194: mark every FnDef parsed from THIS file as is_local=1
-    # *before* resolve_imports prepends imported FnDefs (those stay
-    # is_local=0). emit_fn uses the flag to decide define-vs-declare —
-    # only local fns get a body, imports become extern declarations.
-    # This is the core of modular emit: each .ll contains only the
-    # current file's bodies + linkonce_odr monomorph instantiations.
-    var local_fn: *FnDef = m.functions
-    while local_fn != null
-        local_fn.is_local = 1
-        local_fn = local_fn.next
-    var local_ib: *ImplBlock = m.impls
-    while local_ib != null
-        var local_method: *FnDef = local_ib.methods
-        while local_method != null
-            local_method.is_local = 1
-            local_method = local_method.next
-        local_ib = local_ib.next
-
     # Get source directory for relative imports
     let source_dir: StrView = path_dir(args.input_path)
     let ritz_path: StrView = normalize_ritz_path(args.ritz_path)
 
-    # Resolve imports recursively
-    if resolve_imports(m, source_dir, ritz_path) < 0
-        eprintln("Error: Import resolution failed")
+    # Parse this file and everything it imports.
+    var m: *Module = parse_program(@tokens, args.input_path, source_dir, ritz_path)
+    if m == null
         return 1
+
+    # AGAST #1475: type aliases resolve at parse time (type_named replays the
+    # target's parse state).  The first pass can't see an alias used before
+    # its declaration, or declared in an imported module (imports are parsed
+    # after their importer), so if it recorded any alias, parse everything
+    # again with the alias table populated.  Programs without aliases (ritz1
+    # itself included) pay nothing.
+    if type_alias_count() > 0
+        vec_clear<String>(@g_processed)
+        enum_tracker_reset()
+        # Fresh views: ritz0's move checker treats StrView as move-only
+        # (AGAST #1489), so the first pass's copies can't be passed again.
+        let source_dir2: StrView = path_dir(args.input_path)
+        let ritz_path2: StrView = normalize_ritz_path(args.ritz_path)
+        m = parse_program(@tokens, args.input_path, source_dir2, ritz_path2)
+        if m == null
+            return 1
 
     # Monomorphize: generate specialized versions of generic functions
     monomorphize_module(m)

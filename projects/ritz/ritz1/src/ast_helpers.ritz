@@ -783,6 +783,11 @@ pub fn path_new(p: *Parser, seg: *u8, len: i32, rest: *ImportPath) -> *ImportPat
 # =============================================================================
 
 pub fn type_named(p: *Parser, name: *u8, len: i32) -> i32
+    # AGAST #1475: a type alias resolves to its target's parse state.
+    if g_alias_count > 0
+        let alias_ty: i32 = type_alias_resolve(p, name, len)
+        if alias_ty != TYPE_VOID
+            return alias_ty
     # Float types: f32 / f64 are first-class type kinds, not TYPE_STRUCT+name.
     # Detect by exact name and return the proper kind so downstream type-
     # tracking (get_expr_type, param_type, etc.) doesn't fall through to
@@ -883,6 +888,132 @@ pub fn type_ptr(p: *Parser, inner_type: i32) -> i32
     if inner_type == TYPE_PTR or inner_type == TYPE_PTR_PTR
         return TYPE_PTR_PTR
     return TYPE_PTR
+
+# =============================================================================
+# Type aliases (AGAST #1475)
+# =============================================================================
+#
+# `type Name = T` is transparent, as in ritz0: the alias IS T.  ritz1 has no
+# type objects, only a kind (TYPE_*) plus side-channel parser state that
+# type_spec leaves behind (last_type_name for structs/generics, pointee info
+# for pointers, element info for arrays, inner kind for refs).  So an alias
+# is a snapshot of exactly that state, taken when its declaration is parsed,
+# and type_named replays it wherever the alias name is used as a type.  The
+# emitter and monomorph never see an alias name.
+#
+# The table is process-wide, not per-Parser: aliases must be visible across
+# modules (goliath: `import goliath.error { ErrorCode }`).  Because an
+# importer is parsed before its imports, and items may be used before they
+# are declared, the driver re-parses everything once when the first pass
+# recorded any alias (main.ritz, reparse_with_aliases).  Re-recording in that
+# pass overwrites each entry by name, which is also how an alias of an alias
+# declared later in the file settles.
+#
+# Parallel pointer arrays of heap entries (not an array of structs), the
+# same shape the enum tracker below uses under self-hosting.
+
+struct AliasEntry
+    name: *u8
+    name_len: i32
+    kind: i32
+    type_name: *u8
+    type_name_len: i32
+    pointee_type: i32
+    inner_pointee_type: i32
+    array_size: i32
+    array_elem_type: i32
+    array_elem_type_name: *u8
+    array_elem_type_name_len: i32
+    ref_inner_type: i32
+
+const MAX_TYPE_ALIASES: i32 = 1024
+const ALIAS_ENTRY_BYTES: i64 = 128   # >= sizeof(AliasEntry), with headroom
+
+var g_alias_table: **u8 = null
+var g_alias_count: i32 = 0
+
+pub fn type_alias_count() -> i32
+    g_alias_count
+
+fn type_alias_find(name: *u8, len: i32) -> *AliasEntry
+    var i: i32 = 0
+    while i < g_alias_count
+        let e: *AliasEntry = *(g_alias_table + i) as *AliasEntry
+        if buf_eq(e.name, e.name_len, name, len) == 1
+            return e
+        i = i + 1
+    return null
+
+# Does replaying this kind need the side-channel state?  Primitive kinds
+# carry everything in the kind itself, and type_spec's primitive
+# alternatives leave the parser state untouched, so an alias of one must
+# too (otherwise it would replay whatever stale struct name happened to be
+# in last_type_name when the alias was declared).
+fn type_alias_kind_has_state(kind: i32) -> i32
+    if kind == TYPE_PTR or kind == TYPE_PTR_PTR
+        return 1
+    if kind == TYPE_STRUCT or kind == TYPE_ARRAY or kind == TYPE_REF or kind == TYPE_MUT_REF
+        return 1
+    return 0
+
+# Grammar action for type_alias_def.  Runs after type_spec, so the parser
+# state is exactly the target type's.  attrs ran first, so p.skip_item is
+# already set for a [[target_os = "<not linux>"]] alias: don't record it.
+pub fn type_alias_record(p: *Parser, name: *u8, len: i32, kind: i32) -> i32
+    if p.skip_item != 0
+        return kind
+    var e: *AliasEntry = type_alias_find(name, len)
+    if e == null
+        if g_alias_table == null
+            g_alias_table = malloc((MAX_TYPE_ALIASES as i64) * 8) as **u8
+        if g_alias_count >= MAX_TYPE_ALIASES
+            # Never drop a declaration silently: an unrecorded alias would
+            # surface much later as an unknown struct type.
+            eprint_parse_location(p)
+            eprintln_cstr(c"error: too many type aliases (raise MAX_TYPE_ALIASES)")
+            p.error = 1
+            return kind
+        e = malloc(ALIAS_ENTRY_BYTES) as *AliasEntry
+        *(g_alias_table + g_alias_count) = e as *u8
+        g_alias_count = g_alias_count + 1
+    e.name = name
+    e.name_len = len
+    e.kind = kind
+    e.type_name = p.last_type_name
+    e.type_name_len = p.last_type_name_len
+    e.pointee_type = p.last_pointee_type
+    e.inner_pointee_type = p.last_inner_pointee_type
+    e.array_size = p.last_array_size
+    e.array_elem_type = p.last_array_elem_type
+    e.array_elem_type_name = p.last_array_elem_type_name
+    e.array_elem_type_name_len = p.last_array_elem_type_name_len
+    e.ref_inner_type = p.last_ref_inner_type
+    return kind
+
+# Called from type_named.  Returns the alias's kind with its parse state
+# replayed into p, or TYPE_VOID when `name` is not an alias (no alias can
+# have kind TYPE_VOID: type_spec never yields it).
+pub fn type_alias_resolve(p: *Parser, name: *u8, len: i32) -> i32
+    let e: *AliasEntry = type_alias_find(name, len)
+    if e == null
+        return TYPE_VOID
+    if type_alias_kind_has_state(e.kind) == 1
+        p.last_type_name = e.type_name
+        p.last_type_name_len = e.type_name_len
+        p.last_pointee_type = e.pointee_type
+        p.last_inner_pointee_type = e.inner_pointee_type
+        p.last_array_size = e.array_size
+        p.last_array_elem_type = e.array_elem_type
+        p.last_array_elem_type_name = e.array_elem_type_name
+        p.last_array_elem_type_name_len = e.array_elem_type_name_len
+        p.last_ref_inner_type = e.ref_inner_type
+    return e.kind
+
+# item dispatcher for type_alias_def: like item_dispatch_enum, the alias
+# has no AST node (it lives in the alias table), so only reset skip_item.
+pub fn item_dispatch_alias(p: *Parser) -> i32
+    p.skip_item = 0
+    return 1
 
 # Handle immutable reference type @T
 # References are semantically pointers for now - store the inner type info
@@ -2356,6 +2487,13 @@ fn init_enum_tracker()
     g_enum_variant_names = malloc(MAX_ENUM_VARIANTS * 8) as **u8
     g_enum_variant_name_lens = malloc(MAX_ENUM_VARIANTS * 4) as *i32
     g_enum_initialized = 1
+    g_enum_count = 0
+    g_enum_variant_total = 0
+
+# Forget every recorded enum.  The driver's alias re-parse (AGAST #1475)
+# parses every module a second time; without this each enum would be
+# recorded twice and the fixed-size table would fill at half its capacity.
+pub fn enum_tracker_reset()
     g_enum_count = 0
     g_enum_variant_total = 0
 
