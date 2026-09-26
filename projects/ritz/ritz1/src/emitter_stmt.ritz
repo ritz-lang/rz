@@ -3021,7 +3021,35 @@ fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
             # NO store at all — a silent drop that read back as malloc
             # garbage (7/8–8/8 mismatches in 92_subscript_store).
             let glob: *GlobalVarDef = find_global(s, stmt.assign_target, stmt.assign_target_len)
-            if glob != null and glob.var_type == TYPE_ARRAY and glob.array_elem_type != TYPE_STRUCT
+            if glob != null and glob.var_type == TYPE_ARRAY and glob.array_elem_type == TYPE_STRUCT and glob.array_elem_type_name_len > 0
+                # AGAST #1553/#1555: a whole struct element (`g[i] = q`,
+                # `g_slot[2] = *v`, `g[i] = g[j]`). The value is a %T struct
+                # value, so GEP the `[N x %T]` global and `store %T` — the
+                # global form of the local-array struct arm (#190) above.
+                # Previously this fell to the pointer arm below: `load i64
+                # @g` as a base address and `store i64 %T-value` (bad IR).
+                let sidx: i32 = emit_expr(s, stmt.while_cond)
+                let sval: i32 = emit_expr(s, stmt.assign_value)
+                let sptr: i32 = next_reg(s)
+                emit_str(s, c"  ")
+                emit_reg(s, sptr)
+                emit_str(s, c" = getelementptr [")
+                emit_int(s, glob.array_size as i64)
+                emit_str(s, c" x ")
+                emit_llvm_type_struct(s, TYPE_STRUCT, glob.array_elem_type_name, glob.array_elem_type_name_len)
+                emit_str(s, c"], ptr @")
+                emit_name(s, glob.name, glob.name_len)
+                emit_str(s, c", i64 0, i64 ")
+                emit_reg(s, sidx)
+                emit_str(s, c"\n")
+                emit_str(s, c"  store ")
+                emit_llvm_type_struct(s, TYPE_STRUCT, glob.array_elem_type_name, glob.array_elem_type_name_len)
+                emit_str(s, c" ")
+                emit_reg(s, sval)
+                emit_str(s, c", ptr ")
+                emit_reg(s, sptr)
+                emit_str(s, c"\n")
+            else if glob != null and glob.var_type == TYPE_ARRAY and glob.array_elem_type != TYPE_STRUCT
                 # AGAST #1504: a global `[N]T` array is the storage itself,
                 # not a pointer slot. The pointer arm below loaded g[0] as a
                 # base address and stored through it (segfault). GEP @g

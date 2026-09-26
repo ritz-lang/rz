@@ -289,6 +289,22 @@ pub fn main() -> i32
     return (arr[2].a + arr[2].b) as i32
 """
 
+# AGAST #1555: the same whole-element store into a GLOBAL struct array stored
+# the %D value as `i64` (full coverage in test_ritz1_global_struct_array.py).
+GLOBAL_INDEX_STORE = STRUCT_D + """\
+var g_slot: [4]D
+
+fn put(v: @D)
+    g_slot[2] = *v
+
+pub fn main() -> i32
+    var d: D
+    d.a = 3
+    d.b = 4
+    put(@d)
+    return (g_slot[2].a + g_slot[2].b) as i32
+"""
+
 BROKEN_FORMS = {
     "ptr_add": PTR_ADD,
     "let_local": LET_LOCAL,
@@ -302,6 +318,7 @@ BROKEN_FORMS = {
     "deref_store": DEREF_STORE,
     "deref_store_let": DEREF_STORE_LET,
     "local_index_store": LOCAL_INDEX_STORE,
+    "global_index_store": GLOBAL_INDEX_STORE,
 }
 
 # --- forms that already worked, pinned against regression -------------------

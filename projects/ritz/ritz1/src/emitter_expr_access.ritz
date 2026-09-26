@@ -548,10 +548,35 @@ fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
     # array local, so a global array fell through to the pointer fallback
     # (`load i64 @g; inttoptr; gep`), which used the array's first element as
     # a base address and segfaulted. GEP the global directly instead.
-    # Struct elements (`g[i]` as a whole struct value) are left to the
-    # struct-by-value load work; `g[i].field` goes through emit_member_ptr.
+    # `g[i].field` goes through emit_member_ptr, not here.
     if base_type == TYPE_ARRAY and local == null and e.left.kind == EXPR_IDENT
         let garr: *GlobalVarDef = find_global(s, e.left.ident_ptr, e.left.ident_len)
+        if garr != null and garr.array_elem_type == TYPE_STRUCT and garr.array_elem_type_name_len > 0
+            # AGAST #1553: a whole struct element (`let q: P = g[i]`) is a
+            # struct value: `load %P` from the `[N x %P]` GEP, the same form
+            # a struct-valued deref or call yields, so a %P slot can take it.
+            let sidx: i32 = emit_expr(s, e.right)
+            let sptr: i32 = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, sptr)
+            emit_str(s, c" = getelementptr [")
+            emit_int(s, garr.array_size as i64)
+            emit_str(s, c" x ")
+            emit_llvm_type_struct(s, TYPE_STRUCT, garr.array_elem_type_name, garr.array_elem_type_name_len)
+            emit_str(s, c"], ptr @")
+            emit_name(s, garr.name, garr.name_len)
+            emit_str(s, c", i64 0, i64 ")
+            emit_reg(s, sidx)
+            emit_str(s, c"\n")
+            let sval: i32 = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, sval)
+            emit_str(s, c" = load ")
+            emit_llvm_type_struct(s, TYPE_STRUCT, garr.array_elem_type_name, garr.array_elem_type_name_len)
+            emit_str(s, c", ptr ")
+            emit_reg(s, sptr)
+            emit_str(s, c"\n")
+            return sval
         if garr != null and garr.array_elem_type != TYPE_STRUCT
             return emit_global_array_index(s, garr.name, garr.name_len, garr.array_size, garr.array_elem_type, global_array_elem_llvm(garr), e.right)
 
