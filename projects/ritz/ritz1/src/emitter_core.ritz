@@ -1372,29 +1372,60 @@ fn get_struct_size_by_name(s: *EmitterState, name: *u8, name_len: i32) -> i64
             offset = offset + (max_align - rem2)
     return offset
 
+# Byte size of one element of a pointer whose pointee is `pointee`
+# (a TYPE_* kind; for TYPE_STRUCT, `name`/`name_len` name the struct).
+# Returns 0 when the pointee is not known — never guesses.  0 is not a valid
+# element size, so callers can tell "unknown" apart from every real answer.
+fn ptr_pointee_size(s: *EmitterState, pointee: i32, name: *u8, name_len: i32) -> i64
+    if pointee == TYPE_STRUCT
+        # get_struct_size_by_name answers 8 for a name it cannot resolve;
+        # that is exactly the guess this function exists to refuse.
+        if name_len > 0 and find_struct(s, name, name_len) != null
+            return get_struct_size_by_name(s, name, name_len)
+        return 0
+    if pointee == TYPE_U8 or pointee == TYPE_I8 or pointee == TYPE_BOOL
+        return 1
+    if pointee == TYPE_U16 or pointee == TYPE_I16
+        return 2
+    if pointee == TYPE_U32 or pointee == TYPE_I32 or pointee == TYPE_F32
+        return 4
+    if pointee == TYPE_U64 or pointee == TYPE_I64 or pointee == TYPE_F64
+        return 8
+    if pointee == TYPE_PTR or pointee == TYPE_PTR_PTR
+        return 8
+    return 0
+
+# "pointer arithmetic on '<name>': element size unknown" — a counted error,
+# so main refuses to write the output.  Returns 1 only so the caller can
+# finish emitting a syntactically complete instruction; the result is never
+# linked because the error count is non-zero.
+fn ptr_elem_size_unknown(s: *EmitterState, name: *u8, name_len: i32) -> i64
+    emit_ir_error_begin(s, c"pointer arithmetic: element size of pointee unknown for '")
+    emit_ir_error_end(s, name, name_len)
+    return 1
+
 # Compute size of pointed-to element for pointer arithmetic on a pointer expression.
 # Handles identifiers (looks up LocalVar.pointee_type + type_name) and member accesses
-# (looks up struct field's pointee info). Returns 1 if unknown.
+# (looks up struct field's pointee info).
+#
+# AGAST #1451: fails CLOSED.  This used to answer 1 (or 8, via
+# get_struct_size_by_name's miss value) for anything it could not resolve,
+# and every such guess was a silent wrong address: `let base: *LB` locals
+# were registered with pointee TYPE_I64 and scaled by 8 instead of 16.  An
+# unknown pointee is now a located emitter error naming the operand.
 fn get_ptr_elem_size(s: *EmitterState, e: *Expr) -> i64
     if e.kind == EXPR_IDENT
         let loc: *LocalVar = find_local_struct_name(s, e.ident_ptr, e.ident_len)
         if loc == null
-            return 1
+            return ptr_elem_size_unknown(s, e.ident_ptr, e.ident_len)
         # For TYPE_PTR_PTR the element is a pointer (8 bytes)
         if loc.var_type == TYPE_PTR_PTR
             return 8
         if loc.var_type == TYPE_PTR or loc.var_type == TYPE_REF or loc.var_type == TYPE_MUT_REF
-            # Pointee is a struct — use struct size
-            if loc.pointee_type == TYPE_STRUCT and loc.type_name_len > 0
-                return get_struct_size_by_name(s, loc.type_name, loc.type_name_len)
-            if loc.pointee_type == TYPE_U16 or loc.pointee_type == TYPE_I16
-                return 2
-            if loc.pointee_type == TYPE_U32 or loc.pointee_type == TYPE_I32
-                return 4
-            if loc.pointee_type == TYPE_U64 or loc.pointee_type == TYPE_I64
-                return 8
-            return 1  # Default *u8/*i8
-        return 1
+            let size: i64 = ptr_pointee_size(s, loc.pointee_type, loc.type_name, loc.type_name_len)
+            if size > 0
+                return size
+        return ptr_elem_size_unknown(s, e.ident_ptr, e.ident_len)
     if e.kind == EXPR_MEMBER
         if e.left.kind == EXPR_IDENT
             let loc2: *LocalVar = find_local_struct_name(s, e.left.ident_ptr, e.left.ident_len)
@@ -1407,17 +1438,18 @@ fn get_ptr_elem_size(s: *EmitterState, e: *Expr) -> i64
                         if field.field_type == TYPE_PTR_PTR
                             return 8
                         if field.field_type == TYPE_PTR or field.field_type == TYPE_REF or field.field_type == TYPE_MUT_REF
-                            # Field is pointer-to-something — field_type_name holds the pointee struct name
+                            # A struct pointee is named by field_type_name; a
+                            # primitive one is recorded in array_elem_type
+                            # (ast_helpers field_new, AGAST #1304).
+                            var fsize: i64 = 0
                             if field.field_type_name_len > 0
-                                return get_struct_size_by_name(s, field.field_type_name, field.field_type_name_len)
-                            if field.array_elem_type == TYPE_U16 or field.array_elem_type == TYPE_I16
-                                return 2
-                            if field.array_elem_type == TYPE_U32 or field.array_elem_type == TYPE_I32
-                                return 4
-                            if field.array_elem_type == TYPE_U64 or field.array_elem_type == TYPE_I64
-                                return 8
-                            return 1
-        return 1
+                                fsize = ptr_pointee_size(s, TYPE_STRUCT, field.field_type_name, field.field_type_name_len)
+                            else
+                                fsize = ptr_pointee_size(s, field.array_elem_type, null, 0)
+                            if fsize > 0
+                                return fsize
+        return ptr_elem_size_unknown(s, e.ident_ptr, e.ident_len)
+    emit_ir_error(s, c"pointer arithmetic: element size of pointee unknown for a non-name operand")
     return 1
 
 # Classify an operand of `+`/`-` as pointer arithmetic, and if so give its
