@@ -2986,7 +2986,54 @@ fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
             # NO store at all — a silent drop that read back as malloc
             # garbage (7/8–8/8 mismatches in 92_subscript_store).
             let glob: *GlobalVarDef = find_global(s, stmt.assign_target, stmt.assign_target_len)
-            if glob != null
+            if glob != null and glob.var_type == TYPE_ARRAY and glob.array_elem_type != TYPE_STRUCT
+                # AGAST #1504: a global `[N]T` array is the storage itself,
+                # not a pointer slot. The pointer arm below loaded g[0] as a
+                # base address and stored through it (segfault). GEP @g
+                # directly, at the width the global is declared with.
+                let gidx: i32 = emit_expr(s, stmt.while_cond)
+                let gval: i32 = emit_expr(s, stmt.assign_value)
+                let gty: *u8 = global_array_elem_llvm(glob)
+                let gptr: i32 = next_reg(s)
+                emit_str(s, c"  ")
+                emit_reg(s, gptr)
+                emit_str(s, c" = getelementptr [")
+                emit_int(s, glob.array_size as i64)
+                emit_str(s, c" x ")
+                emit_str(s, gty)
+                emit_str(s, c"], ptr @")
+                emit_name(s, glob.name, glob.name_len)
+                emit_str(s, c", i64 0, i64 ")
+                emit_reg(s, gidx)
+                emit_str(s, c"\n")
+                # Values are carried as i64: narrow ints truncate, pointers
+                # convert back to ptr, i64 stores as-is.
+                let get: i32 = glob.array_elem_type
+                var gstore: i32 = gval
+                if get == TYPE_PTR or get == TYPE_PTR_PTR
+                    gstore = next_reg(s)
+                    emit_str(s, c"  ")
+                    emit_reg(s, gstore)
+                    emit_str(s, c" = inttoptr i64 ")
+                    emit_reg(s, gval)
+                    emit_str(s, c" to ptr\n")
+                else if get == TYPE_U8 or get == TYPE_I8 or get == TYPE_U16 or get == TYPE_I16 or get == TYPE_U32 or get == TYPE_I32
+                    gstore = next_reg(s)
+                    emit_str(s, c"  ")
+                    emit_reg(s, gstore)
+                    emit_str(s, c" = trunc i64 ")
+                    emit_reg(s, gval)
+                    emit_str(s, c" to ")
+                    emit_str(s, gty)
+                    emit_str(s, c"\n")
+                emit_str(s, c"  store ")
+                emit_str(s, gty)
+                emit_str(s, c" ")
+                emit_reg(s, gstore)
+                emit_str(s, c", ptr ")
+                emit_reg(s, gptr)
+                emit_str(s, c"\n")
+            else if glob != null
                 # Globals of pointer type are stored as i64 (emit_llvm_type):
                 # load the slot, convert to ptr, then share the pointee-width
                 # store path with the local arm.

@@ -484,6 +484,58 @@ fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
             return pti
         return result
 
+    # AGAST #1504: a GLOBAL `[N]T` array. The branch above covers only an
+    # array local, so a global array fell through to the pointer fallback
+    # (`load i64 @g; inttoptr; gep`), which used the array's first element as
+    # a base address and segfaulted. GEP the global directly instead.
+    # Struct elements (`g[i]` as a whole struct value) are left to the
+    # struct-by-value load work; `g[i].field` goes through emit_member_ptr.
+    if base_type == TYPE_ARRAY and local == null and e.left.kind == EXPR_IDENT
+        let garr: *GlobalVarDef = find_global(s, e.left.ident_ptr, e.left.ident_len)
+        if garr != null and garr.array_elem_type != TYPE_STRUCT
+            let gidx: i32 = emit_expr(s, e.right)
+            let gty: *u8 = global_array_elem_llvm(garr)
+            let gptr: i32 = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, gptr)
+            emit_str(s, c" = getelementptr [")
+            emit_int(s, garr.array_size as i64)
+            emit_str(s, c" x ")
+            emit_str(s, gty)
+            emit_str(s, c"], ptr @")
+            emit_name(s, garr.name, garr.name_len)
+            emit_str(s, c", i64 0, i64 ")
+            emit_reg(s, gidx)
+            emit_str(s, c"\n")
+            let gval: i32 = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, gval)
+            emit_str(s, c" = load ")
+            emit_str(s, gty)
+            emit_str(s, c", ptr ")
+            emit_reg(s, gptr)
+            emit_str(s, c"\n")
+            # Widen to the i64 every expression value is carried in.
+            let gt: i32 = garr.array_elem_type
+            var widen: *u8 = null
+            if gt == TYPE_U8 or gt == TYPE_U16 or gt == TYPE_U32
+                widen = c" = zext "
+            else if gt == TYPE_I8 or gt == TYPE_I16 or gt == TYPE_I32
+                widen = c" = sext "
+            else if gt == TYPE_PTR or gt == TYPE_PTR_PTR
+                widen = c" = ptrtoint "
+            if widen == null
+                return gval
+            let gwide: i32 = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, gwide)
+            emit_str(s, widen)
+            emit_str(s, gty)
+            emit_str(s, c" ")
+            emit_reg(s, gval)
+            emit_str(s, c" to i64\n")
+            return gwide
+
     # task-101: Span$T indexing on a struct local — `let b = s.as_bytes(); b[0]`
     # or `let b = "ABC"; b[0]`. Without this, emit_expr(e.left) loads the whole
     # %Span$u8 aggregate and the ptr-to-byte fallback's
