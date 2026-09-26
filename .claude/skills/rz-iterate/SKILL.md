@@ -154,7 +154,7 @@ nothing more than it takes to act on it:
 reap ritz-task-1450 1a2b3c4
 ```
 
-1. **REAP arrives:** `append_scratchpad_item` immediately (even mid-reap), then
+1. **REAP arrives:** (this section, not `/reap-ritz-room`, handles it) `append_scratchpad_item` immediately (even mid-reap), then
    say in one line what's queued. Don't interrupt a reap in progress.
 2. **Take the oldest unchecked item** (`get_scratchpad` first, never from memory).
 3. **Two checks only, no tests:**

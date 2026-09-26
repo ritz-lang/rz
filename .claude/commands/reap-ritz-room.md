@@ -4,6 +4,16 @@ Integrate completed task room work back into main with linear history.
 
 Arguments: $ARGUMENTS
 
+> **STOP — superseded for `REAP ritz-…` callbacks.** When the incoming message
+> is a one-line `REAP ritz-task-<id> <sha>` (or `REAP ritz-survey-<slug> none`),
+> `rz` is running the `rz-iterate` loop: invoke `/rz-iterate` and follow its
+> **Reaping** section instead of this file. That means: append to the scratchpad,
+> run only the SHA / on-main / one-commit checks, `git merge --ff-only`, push.
+> Do **not** stop the room's agent, rebase or squash its branch, run a gate or
+> tests, review the diff, or wait for GitHub CI. If `main` moved, send the room
+> one line ("rebase: main moved to <sha7>; re-gate and REAP again") and check
+> the item. The procedure below is for legacy, non-`rz-iterate` reaps only.
+
 ## The parent room is `rz`
 
 Scratchpad calls below take `room_id="rz"`. **Not `ritz-lang`** — that is the
