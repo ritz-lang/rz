@@ -160,7 +160,7 @@ make unit
 # Language tests (.ritz files)
 make ritz
 
-# ritz1 self-hosted tests
+# Build the ritz1 compiler (ritz1 correctness is gated by `make matrix`)
 make ritz1
 
 # Build and test all examples

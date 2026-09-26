@@ -120,10 +120,16 @@ ritz:
 	@echo "=== Running .ritz language tests ==="
 	@$(PYTHON) build.py ritz-tests
 
-# Run ritz1 self-hosting lexer tests
+# Build the ritz1 compiler with ritz0 (incremental; fails if ritz1 fails to compile).
+# This target used to run `build.py ritz1-tests`, a hardcoded list of 15 lexer
+# tests that had all moved to docs/archive/ritz1_old/ -- it skipped every file and
+# exited 0, so `make test` carried a gate that could not fail (AGAST #1485).
+# Those tests described a ritz1 that no longer exists and were deleted, not
+# repointed.  Keep this target defined and .PHONY: without it, the ritz1/
+# directory would satisfy `make ritz1` and it would report "Nothing to be done".
 ritz1:
-	@echo "=== Running ritz1 lexer tests ==="
-	@$(PYTHON) build.py ritz1-tests
+	@echo "=== Building ritz1 ==="
+	@$(MAKE) -C ritz1 ritz1
 
 # Build and test all examples (always runs)
 .PHONY: examples
@@ -248,7 +254,7 @@ help:
 	@echo "  make test     - Same as above"
 	@echo "  make unit     - Run Python unit tests (ritz0)"
 	@echo "  make ritz     - Run .ritz language tests (test levels)"
-	@echo "  make ritz1    - Run ritz1 self-hosting lexer tests"
+	@echo "  make ritz1    - Build the ritz1 compiler (make -C ritz1 ritz1)"
 	@echo "  make examples - Build and test example packages"
 	@echo "  make build    - Build all examples (no tests)"
 	@echo "  make list     - List all packages"
