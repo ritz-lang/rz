@@ -2377,91 +2377,6 @@ def cmd_ritz_tests(args):
     return result.returncode
 
 
-# ritz1 test configuration: (test_file, lib_files)
-RITZ1_TESTS = [
-    ("test_nfa.ritz", ["mem.ritz", "nfa.ritz", "utf8.ritz"]),
-    ("test_thompson.ritz", ["mem.ritz", "nfa.ritz", "utf8.ritz"]),
-    ("test_utf8.ritz", ["mem.ritz", "utf8.ritz"]),
-    ("test_regex.ritz", ["mem.ritz", "nfa.ritz", "utf8.ritz", "regex.ritz"]),
-    ("test_multi_lexer.ritz", ["mem.ritz", "nfa.ritz", "utf8.ritz", "regex.ritz", "tokens.ritz", "lexer.ritz"]),
-    ("test_token_dsl.ritz", ["mem.ritz", "nfa.ritz", "utf8.ritz", "regex.ritz", "tokens.ritz", "lexer.ritz", "token_dsl.ritz"]),
-    ("test_ritz_lexer.ritz", ["mem.ritz", "nfa.ritz", "utf8.ritz", "regex.ritz", "tokens.ritz", "lexer.ritz", "token_dsl.ritz", "ritz_tokens.ritz"]),
-    ("test_grammar_parser_basic.ritz", ["mem.ritz", "nfa.ritz", "utf8.ritz", "regex.ritz", "tokens.ritz", "lexer.ritz", "grammar_parser.ritz"]),
-    ("test_grammar_builder.ritz", ["mem.ritz", "nfa.ritz", "utf8.ritz", "regex.ritz", "tokens.ritz", "lexer.ritz", "grammar_parser.ritz", "grammar_builder.ritz"]),
-    ("test_break.ritz", []),
-    ("test_parser_ast.ritz", []),  # Self-contained AST structure tests
-    ("test_parser_minimal.ritz", ["mem.ritz", "nfa.ritz", "utf8.ritz", "regex.ritz", "tokens.ritz", "lexer.ritz", "token_dsl.ritz", "ritz_tokens.ritz", "parser.ritz"]),
-    ("test_types.ritz", []),  # Self-contained type system tests
-    ("test_symbols.ritz", []),  # Self-contained symbol table tests
-    ("test_pipeline.ritz", ["mem.ritz", "nfa.ritz", "utf8.ritz", "regex.ritz", "tokens.ritz", "lexer.ritz", "token_dsl.ritz", "ritz_tokens.ritz"]),  # E2E pipeline tests
-]
-
-
-def cmd_ritz1_tests(args):
-    """Run ritz1's .ritz test suite (self-hosting lexer tests)."""
-    ritz1_dir = ROOT / "ritz1"
-    test_dir = ritz1_dir / "test"
-    src_dir = ritz1_dir / "src"
-
-    if not test_dir.exists():
-        print("No ritz1/test directory found", file=sys.stderr)
-        return 1
-
-    print(f"🧪 Running ritz1 test suite ({len(RITZ1_TESTS)} test files)...")
-
-    total_passed = 0
-    total_failed = 0
-    failures = []
-
-    for test_file, lib_files in RITZ1_TESTS:
-        test_path = test_dir / test_file
-        if not test_path.exists():
-            print(f"  ⚠ {test_file} not found, skipping")
-            continue
-
-        # Build command
-        cmd = [sys.executable, str(RITZ0), "--test", str(test_path)]
-        if lib_files:
-            cmd.append("--lib")
-            cmd.extend(str(src_dir / f) for f in lib_files)
-
-        result = subprocess.run(cmd, capture_output=True, text=True)
-
-        # Parse output for pass/fail counts
-        output = result.stdout + result.stderr
-        lines = output.strip().split('\n')
-
-        # Find summary line (e.g., "7 passed, 0 failed")
-        for line in lines:
-            if "passed" in line and "failed" in line:
-                parts = line.split()
-                try:
-                    passed = int(parts[0])
-                    failed = int(parts[2])
-                    total_passed += passed
-                    total_failed += failed
-                    if failed > 0:
-                        failures.append((test_file, output))
-                except (ValueError, IndexError):
-                    pass
-                break
-
-        if result.returncode == 0:
-            print(f"  ✓ {test_file}")
-        else:
-            print(f"  ✗ {test_file}")
-
-    print(f"\n{total_passed} passed, {total_failed} failed")
-
-    if failures:
-        print("\nFailures:")
-        for test_file, output in failures:
-            print(f"\n--- {test_file} ---")
-            print(output)
-
-    return 0 if total_failed == 0 else 1
-
-
 def cmd_run(args):
     """Compile and run a single .ritz file."""
     src_path = Path(args.file)
@@ -2690,9 +2605,6 @@ def main():
     # ritz-tests
     subparsers.add_parser("ritz-tests", help="Run ritz0's .ritz test suite")
 
-    # ritz1-tests
-    subparsers.add_parser("ritz1-tests", help="Run ritz1's .ritz test suite (self-hosting lexer)")
-
     # cache-status
     cache_status_parser = subparsers.add_parser("cache-status", help="Show build cache status")
     cache_status_parser.add_argument("-v", "--verbose", action="store_true",
@@ -2736,7 +2648,6 @@ def main():
         "run": cmd_run,
         "clean": cmd_clean,
         "ritz-tests": cmd_ritz_tests,
-        "ritz1-tests": cmd_ritz1_tests,
         "cache-status": cmd_cache_status,
         "cache-clear": cmd_cache_clear,
         "install": cmd_install,

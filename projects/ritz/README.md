@@ -64,9 +64,10 @@ make unit
 make test
 ```
 
-Note that `make ritz1` at this level does **not** build anything — it runs
-ritz1's lexer test suite (`build.py ritz1-tests`). Use `make -C ritz1 ritz1` to
-build the binary.
+`make ritz1` at this level builds the ritz1 compiler (it delegates to
+`make -C ritz1 ritz1`). It used to run a `build.py ritz1-tests` lexer suite whose
+files had all moved to `docs/archive/`, so it skipped everything and exited 0;
+that command was deleted (AGAST #1485).
 
 ## Usage
 
