@@ -64,7 +64,11 @@ def test_make_ritz1_builds_the_compiler():
     result = _make_dry_run("ritz1")
     out = result.stdout + result.stderr
     assert result.returncode == 0, out
-    assert "Nothing to be done" not in out
+    # Only the TOP-LEVEL make ("make: ...") saying "Nothing to be done" is the
+    # vacuous directory-target trap. The sub-make ("make[N]: ...") legitimately
+    # says it when ritz1/build/ritz1 is already up to date -- which it is in the
+    # gate, since earlier steps build it.
+    assert not re.search(r"^make: Nothing to be done", out, re.MULTILINE), out
     assert "ritz1-tests" not in out
     assert re.search(r"make\S*\s+-C\s+ritz1\s+ritz1\b", out), out
 

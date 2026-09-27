@@ -131,6 +131,22 @@ pub fn compiler_fingerprint() -> u64
         h = 1
     return h
 
+# The identity cached IR is stamped with, and must match to be reused: the
+# compiler binary (#1279) plus the target OS (#1550), since `--target-os`
+# decides which `[[target_os]]` variants reach the IR.  Without the target
+# OS, a harland compile of a file reuses IR a linux compile left behind.
+# 0 (unknown) whenever the compiler fingerprint is.
+pub fn cache_fingerprint(target_os: *u8, target_os_len: i64) -> u64
+    let fp: u64 = compiler_fingerprint()
+    if fp == 0
+        return 0
+    var h: u64 = fnv1a_mix_u64(fp, target_os_len as u64)
+    if target_os_len > 0
+        h = fnv1a_mix_u64(h, fnv1a_bytes(target_os, target_os_len))
+    if h == 0
+        h = 1
+    return h
+
 # Fold the 8 little-endian bytes of `v` into an in-progress FNV1a-64 state.
 fn fnv1a_mix_u64(h: u64, v: u64) -> u64
     var acc: u64 = h
@@ -795,7 +811,7 @@ pub fn write_sig_file(sig_path: *u8, sd: *SigData) -> i32
 # filling it with output from a compiler that no longer exists.  That is the
 # path that produced `PHI node entries do not match predecessors` on a tree
 # whose emitter bug was already fixed.
-pub fn check_source_unchanged(src_path: *u8, src: *u8, src_len: i64, ll_path: *u8) -> i32
+pub fn check_source_unchanged(src_path: *u8, src: *u8, src_len: i64, ll_path: *u8, self_fp: u64) -> i32
     if src_path == null or ll_path == null or src == null
         return 0
 
@@ -811,11 +827,10 @@ pub fn check_source_unchanged(src_path: *u8, src: *u8, src_len: i64, ll_path: *u
         sig_data_free(sd)
         return 0
 
-    # Compiler identity gate.  `compiler_fingerprint()` returns 0 when
-    # /proc/self/exe is unreadable and `sd.compiler_hash` is 0 for sigs with
-    # no such field, so the explicit `== 0` rejection stops two unknowns from
-    # comparing equal and waving stale IR through.
-    let self_fp: u64 = compiler_fingerprint()
+    # Compiler + target identity gate (`self_fp` is `cache_fingerprint()`).
+    # It is 0 when /proc/self/exe is unreadable and `sd.compiler_hash` is 0
+    # for sigs with no such field, so the explicit `== 0` rejection stops two
+    # unknowns from comparing equal and waving stale IR through.
     if self_fp == 0 or sd.compiler_hash == 0 or sd.compiler_hash != self_fp
         sig_data_free(sd)
         return 0

@@ -550,6 +550,9 @@ struct CliArgs
     output_path: *u8
     ritz_path: StrView    # .len == 0 if none was supplied
     dash_dash: i32
+    # `--target-os <os>` (AGAST #1550): selects `[[target_os = "..."]]`
+    # variants.  Defaults to "linux", as ritz0's --target-os does.
+    target_os: StrView
 
 fn parse_cli(argc: i32, argv: **u8, envp: **u8) -> CliArgs
     var args: CliArgs
@@ -558,6 +561,7 @@ fn parse_cli(argc: i32, argv: **u8, envp: **u8) -> CliArgs
     args.ritz_path.ptr = null
     args.ritz_path.len = 0
     args.dash_dash = 0
+    args.target_os = strview_from_cstr(c"linux")
 
     if argc < 2
         return args
@@ -584,15 +588,34 @@ fn parse_cli(argc: i32, argv: **u8, envp: **u8) -> CliArgs
         return args
     args.output_path = argv[3]
 
-    # Optional -I <path> — additive to RITZ_PATH, not a replacement.
-    # Treats `-I` like gcc's: prepends to the colon-separated lookup list.
+    # Options after `-o <out>`, in any order:
+    #   -I <path>          additive to RITZ_PATH, not a replacement.  Treats
+    #                      `-I` like gcc's: prepends to the lookup list.
+    #   --target-os <os>   see CliArgs.target_os.
+    # Anything else is ignored, as it always has been.
     var dash_i_view: StrView
     dash_i_view.ptr = null
     dash_i_view.len = 0
-    if argc >= 6
-        let dash_i: StrView = strview_from_cstr(argv[4])
-        if strview_eq_cstr(@dash_i, c"-I") == 1
-            dash_i_view = strview_from_cstr(argv[5])
+    var i: i32 = 4
+    while i < argc
+        let opt: StrView = strview_from_cstr(argv[i])
+        let is_dash_i: i32 = strview_eq_cstr(@opt, c"-I")
+        let is_target_os: i32 = strview_eq_cstr(@opt, c"--target-os")
+        if is_dash_i == 1 or is_target_os == 1
+            if i + 1 >= argc
+                if is_dash_i == 1
+                    eprintln("Error: -I needs a path")
+                else
+                    eprintln("Error: --target-os needs an OS name")
+                args.input_path = null
+                return args
+            if is_dash_i == 1
+                dash_i_view = strview_from_cstr(argv[i + 1])
+            else
+                args.target_os = strview_from_cstr(argv[i + 1])
+            i = i + 2
+        else
+            i = i + 1
 
     # Pull RITZ_PATH from env (if any) and merge with -I.  Earlier behaviour
     # was: -I OVERRIDES env, which broke workspace builds where the wrapper
@@ -641,7 +664,7 @@ fn normalize_ritz_path(rp: StrView) -> StrView
     out
 
 fn print_usage()
-    eprintln("Usage: ritz1 <input.ritz> -o <output.ll> [-I <ritz_path>]")
+    eprintln("Usage: ritz1 <input.ritz> -o <output.ll> [-I <ritz_path>] [--target-os <os>]")
     eprintln("       ritz1 -- <input.ritz>")
 
 # Parse the main file's tokens, mark its fns local, and resolve (parse and
@@ -688,6 +711,9 @@ fn main(argc: i32, argv: **u8, envp: **u8) -> i32
     if args.input_path == null
         print_usage()
         return 1
+    set_target_os(args.target_os.ptr, args.target_os.len as i32)
+    # Cached IR (<src>.ritz.sig) depends on the compiler AND the target OS.
+    let cache_fp: u64 = cache_fingerprint(args.target_os.ptr, args.target_os.len)
 
     # Read source file
     var src: Vec<u8> = read_file(args.input_path)
@@ -698,7 +724,7 @@ fn main(argc: i32, argv: **u8, envp: **u8) -> i32
     # source AND <src>.ritz.sig records a matching source_hash, we can
     # skip lex/parse/emit entirely.  This is the single biggest win for
     # no-op rebuilds (full-stack 12m30s → ~30s).
-    if check_source_unchanged(args.input_path, src.data, src.len - 1, args.output_path) == 1
+    if check_source_unchanged(args.input_path, src.data, src.len - 1, args.output_path, cache_fp) == 1
         var skip_msg: String = string_from("Skipped (unchanged): ")
         string_push_cstr(@skip_msg, args.input_path)
         println_string(@skip_msg)
@@ -780,7 +806,8 @@ fn main(argc: i32, argv: **u8, envp: **u8) -> i32
         # Stamp the sig with *this* binary's identity (AGAST #1279).  Without
         # it the cache is keyed on the source alone, so a rebuilt ritz1 reuses
         # IR emitted by the compiler it replaced.
-        sig_out.compiler_hash = compiler_fingerprint()
+        # AGAST #1550: and with the target OS, which picks the variants.
+        sig_out.compiler_hash = cache_fp
         # Take a heap copy of ir.data — sig_data_free() owns the buffer.
         let ir_len: i64 = ir.len as i64
         if ir_len > 0

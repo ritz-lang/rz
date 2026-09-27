@@ -958,8 +958,9 @@ def get_binaries(pkg_dir: Path, config: dict) -> list[BinaryConfig]:
 def ritz1_compile_cmd(compiler: str, src: Path, ll_path: Path) -> Optional[list]:
     """The ritz1-family command that compiles one source to LLVM IR.
 
-    ritz1's CLI is minimal: <input> -o <output> [-I <ritz_path>]. It doesn't
-    understand --no-runtime, --deps, --sources, --project-root or --target-os.
+    ritz1's CLI is minimal: <input> -o <output> [-I <ritz_path>]
+    [--target-os <os>]. It doesn't understand --no-runtime, --deps, --sources
+    or --project-root; callers append --target-os when they need it.
     Its default emitter is non-freestanding (no _start embedded), so the
     "--no-runtime" semantics come for free. Import resolution: ritz1 tries
     source_dir first, then RITZ_PATH (see `ritz1_env`). `-I` points at the ritz
@@ -1517,14 +1518,7 @@ def compile_freestanding_binary(
     no_red_zone = bin_config.no_red_zone
     pic = bin_config.pic
 
-    # AGAST #1473: ritz1 has no --target-os, so it cannot evaluate
-    # [[target_os = "..."]] conditional compilation. Say so and fail, rather
-    # than build something else (or, as before, quietly use ritz0).
     ritz1_family = compiler.startswith("ritz1")
-    if ritz1_family and target_os:
-        print(f"  ✗ {compiler} does not support freestanding target_os '{target_os}' "
-              f"(no --target-os); {name} NOT built", file=sys.stderr)
-        return None
 
     # UEFI targets need special handling
     is_uefi = "uefi" in target.lower()
@@ -1588,6 +1582,9 @@ def compile_freestanding_binary(
                 compile_cmd = ritz1_compile_cmd(compiler, src, ll_path)
                 if compile_cmd is None:
                     return None
+                # [[target_os = "..."]] conditional compilation (AGAST #1550)
+                if target_os:
+                    compile_cmd.extend(["--target-os", target_os])
                 env = ritz1_env()
             else:
                 compile_cmd = [

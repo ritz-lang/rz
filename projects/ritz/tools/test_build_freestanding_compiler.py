@@ -8,8 +8,8 @@ These tests replace ritz0 and ritz1 with call-recording stubs:
 
 * a ritz1 stub that exits 1 must make a freestanding build FAIL. Before the
   fix it passed, because ritz1 was never run.
-* ritz1 has no `--target-os`, so a bin that needs one must fail with a named
-  reason, running neither compiler, instead of falling back to ritz0.
+* a bin's `target_os` reaches ritz1 as `--target-os` (AGAST #1550; until then
+  build.py refused such bins rather than fall back to ritz0).
 * ritz0 builds are unchanged.
 
 Source discovery still goes through ritz0/list_deps.py (a resolver, not a
@@ -180,17 +180,34 @@ def test_ritz1_command_matches_hosted_path(buildpy, stubs, fs_pkg, monkeypatch):
 
 @pytest.mark.unit
 @pytest.mark.parametrize("compiler", ["ritz1", "ritz1_selfhosted"])
-def test_ritz1_cannot_honour_target_os_fails_loudly(
+def test_ritz1_is_passed_target_os(
     buildpy, stubs, fs_pkg_target_os, monkeypatch, capsys, compiler
 ):
-    stubs.set_ritz1(fail=False)  # even a "working" ritz1 must not be used
-    rc = _build(buildpy, monkeypatch, fs_pkg_target_os, compiler)
+    # AGAST #1550: ritz1 takes --target-os, so the #1473 refusal is gone and
+    # the bin's target_os reaches ritz1 exactly as it reaches ritz0.
+    stubs.set_ritz1(fail=False)
+    _build(buildpy, monkeypatch, fs_pkg_target_os, compiler)  # link outcome irrelevant
     text = _text(capsys)
 
-    assert rc != 0
     assert stubs.ritz0_calls() == [], "fell back to ritz0"
-    assert stubs.ritz1_calls() == [], "ran ritz1 without the target_os it needs"
-    assert f"{compiler} does not support freestanding target_os 'harland'" in text
+    calls = stubs.ritz1_calls()
+    assert len(calls) == 1, "the requested compiler was never run"
+    parts = calls[0].split(" || RITZ_PATH=")[0].split(" ")
+    assert parts[0] == str(fs_pkg_target_os / "src" / "kern.ritz")
+    assert parts[1] == "-o" and parts[2].endswith(".ll")
+    assert parts[3:] == ["-I", str(buildpy.ROOT), "--target-os", "harland"]
+    assert "does not support freestanding target_os" not in text
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("compiler", ["ritz1", "ritz1_selfhosted"])
+def test_ritz1_failure_with_target_os_still_fails(
+    buildpy, stubs, fs_pkg_target_os, monkeypatch, capsys, compiler
+):
+    rc = _build(buildpy, monkeypatch, fs_pkg_target_os, compiler)  # stub exits 1
+    assert rc != 0
+    assert stubs.ritz0_calls() == []
+    assert f"✗ {compiler} failed for 1 source file" in _text(capsys)
 
 
 @pytest.mark.unit
