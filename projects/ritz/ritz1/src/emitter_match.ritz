@@ -172,6 +172,70 @@ fn emit_variant_tag_check_i64(s: *EmitterState, scrut_reg: i32, tag_one: i32) ->
     emit_str(s, c", true\n")
     return inv
 
+# AGAST #1515: the struct type carried by a tagged enum's carrier variant.
+# ritz1 mangles `Option<Point>` to `Option$Point` and `Result<String, E>` to
+# `Result$String` (only the first type argument survives), so the carrier's
+# (Ok/Some) payload type is everything after the first `$`.  When that names
+# a known struct, fills (out_name, out_len); otherwise leaves them null/0 and
+# the caller keeps the scalar i64 binding (primitives, pointers, the Err/None
+# side, whose type the mangled name does not record).
+fn carrier_payload_struct(s: *EmitterState, arm: *MatchArm, enum_name: *u8, enum_name_len: i32, out_name: **u8, out_len: *i32)
+    *out_name = null
+    *out_len = 0
+    if enum_name == null or enum_name_len <= 0
+        return
+    if is_tagged_enum_type(enum_name, enum_name_len) == 0
+        return
+    if variant_is_tag_one(arm.pattern_name, arm.pattern_name_len) == 0
+        return
+    var dollar: i32 = 0
+    while dollar < enum_name_len and *(enum_name + dollar) != 36   # '$'
+        dollar = dollar + 1
+    let sfx: *u8 = enum_name + dollar + 1
+    let sfx_len: i32 = enum_name_len - dollar - 1
+    if sfx_len <= 0
+        return
+    if find_struct(s, sfx, sfx_len) == null
+        return
+    *out_name = sfx
+    *out_len = sfx_len
+
+# AGAST #1515: bind `Some(p)` / `Ok(s)` to a copy of a struct payload.  The
+# payload sits at field 1 of the spilled scrutinee; copy it into its own
+# `alloca %Name` and register a struct local, so `p.x` and by-value passing
+# see `%Name` rather than an i64.
+fn emit_struct_payload_bind(s: *EmitterState, arm: *MatchArm, slot_reg: i32, enum_name: *u8, enum_name_len: i32, st_name: *u8, st_name_len: i32)
+    let pay_ptr: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, pay_ptr)
+    emit_str(s, c" = getelementptr %")
+    emit_name(s, enum_name, enum_name_len)
+    emit_str(s, c", ptr ")
+    emit_reg(s, slot_reg)
+    emit_str(s, c", i32 0, i32 1\n")
+    let val: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, val)
+    emit_str(s, c" = load %")
+    emit_name(s, st_name, st_name_len)
+    emit_str(s, c", ptr ")
+    emit_reg(s, pay_ptr)
+    emit_str(s, c"\n")
+    let alloca_reg: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, alloca_reg)
+    emit_str(s, c" = alloca %")
+    emit_name(s, st_name, st_name_len)
+    emit_str(s, c"  ; match struct payload bind\n")
+    emit_str(s, c"  store %")
+    emit_name(s, st_name, st_name_len)
+    emit_str(s, c" ")
+    emit_reg(s, val)
+    emit_str(s, c", ptr ")
+    emit_reg(s, alloca_reg)
+    emit_str(s, c"\n")
+    add_local_struct(s, arm.pattern_inner_name, arm.pattern_inner_name_len, alloca_reg, TYPE_STRUCT, st_name, st_name_len)
+
 # Emit match body, returning (result_reg, exit_label) via MatchResult slot.
 # For PAT_VARIANT arms with PAT_IDENT inner (e.g. `Ok(v) => v`), the inner
 # name is bound to the extracted payload for the duration of the arm body,
@@ -188,7 +252,13 @@ fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_s
                 if arm.pattern_inner_name_len == 1
                     if *arm.pattern_inner_name == 95   # '_'
                         is_wildcard = 1
-                if is_wildcard == 0
+                var pay_struct: *u8 = null
+                var pay_struct_len: i32 = 0
+                if is_wildcard == 0 and scrut_slot != 0
+                    carrier_payload_struct(s, arm, enum_name, enum_name_len, @pay_struct, @pay_struct_len)
+                if is_wildcard == 0 and pay_struct != null
+                    emit_struct_payload_bind(s, arm, scrut_slot, enum_name, enum_name_len, pay_struct, pay_struct_len)
+                else if is_wildcard == 0
                     var payload_reg: i32 = 0
                     if scrut_slot != 0 and enum_name != null and enum_name_len > 0
                         payload_reg = emit_variant_payload(s, scrut_slot, enum_name, enum_name_len)
