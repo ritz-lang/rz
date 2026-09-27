@@ -173,10 +173,48 @@ FORMS = {
     "for_in_sum": FOR_IN_SUM,
 }
 
-# ritz0's _extract_int_from_expr only takes a literal or `-literal`, so it
-# rejects these forms and can't act as their oracle (AGAST #1568). Their
-# expected values are written by hand into each program instead.
-RITZ0_UNSUPPORTED = {"const_expr", "const_expr_later", "bit_not"}
+# Forms ritz0 folds that exercise the rest of its const evaluator (AGAST
+# #1568): `as` casts, char literals, `!` on a named const, C-style truncating
+# `/` and `%` on negative operands, and an expression in the fill form. They
+# are checked against ritz0 only; ritz1 parity for them is not this ticket.
+CAST_CHAR = """\
+const A: i32 = 2
+
+const T: [3]i32 = [(A + 1) as i32, 'a' as i32, !A]
+
+pub fn main() -> i32
+    if T[1] != 97
+        return 10
+    if T[2] != 0
+        return 11
+    return T[0]
+"""
+
+TRUNC_DIV = """\
+const T: [3]i32 = [-7 / 2, -7 % 2, 7 / -2]
+
+pub fn main() -> i32
+    if T[1] != -1
+        return 10
+    if T[2] != -3
+        return 11
+    return T[0] + 6
+"""
+
+FILL_EXPR = """\
+const A: i32 = 1
+
+const T: [4]i32 = [A + 2; 4]
+
+pub fn main() -> i32
+    return T[3]
+"""
+
+RITZ0_ONLY_FORMS = {
+    "cast_char": CAST_CHAR,
+    "trunc_div": TRUNC_DIV,
+    "fill_expr": FILL_EXPR,
+}
 
 
 def _compile(compiler: str, tmp_path: Path, name: str, program: str):
@@ -213,10 +251,16 @@ def _run(compiler: str, tmp_path: Path, name: str, program: str) -> int:
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(set(FORMS) - RITZ0_UNSUPPORTED))
+@pytest.mark.parametrize("name", sorted(FORMS))
 def test_ritz0_oracle(name: str, tmp_path: Path) -> None:
     """ritz0 is the reference: every program is written to exit 3."""
     assert _run("ritz0", tmp_path, name, FORMS[name]) == 3
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("name", sorted(RITZ0_ONLY_FORMS))
+def test_ritz0_folds_const_expr_elements(name: str, tmp_path: Path) -> None:
+    assert _run("ritz0", tmp_path, name, RITZ0_ONLY_FORMS[name]) == 3
 
 
 @pytest.mark.integration
@@ -272,3 +316,22 @@ def test_ritz1_rejects_unfoldable_element(
     )
     assert "error: const 'T'" in comp.stderr, comp.stderr
     assert f"element {elem}" in comp.stderr, comp.stderr
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "name,program,elem,line",
+    [("call", UNFOLDABLE_CALL, 0, 4), ("unknown_name", UNFOLDABLE_UNKNOWN, 1, 1)],
+)
+def test_ritz0_rejects_unfoldable_element(
+    name: str, program: str, elem: int, line: int, tmp_path: Path
+) -> None:
+    """AGAST #1568: a located error naming the const and element, no traceback."""
+    comp, _ = _compile("ritz0", tmp_path, name, program)
+    assert comp.returncode != 0, (
+        f"ritz0 accepted a non-constant array element for {name}:\n{comp.stderr}"
+    )
+    out = comp.stdout + comp.stderr
+    assert "Traceback" not in out, out
+    assert f"{name}_ritz0.ritz:{line}:" in out, out
+    assert "const 'T'" in out and f"element {elem}" in out, out

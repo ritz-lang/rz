@@ -359,3 +359,25 @@ class TestEvaluateConstExpr:
         """Expression with provided constants."""
         expr = parse_expr("X * Y")
         assert evaluate_const_expr(expr, {"X": 10, "Y": 5}) == 50
+
+
+class TestConstArrayElementForms:
+    """AGAST #1568: forms const array elements use, matching ritz1's const_fold_int."""
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "src,expected",
+        [
+            ("-7 / 2", -3),  # truncates toward zero like sdiv, not floor (-4)
+            ("7 / -2", -3),
+            ("-7 % 2", -1),  # sign follows the dividend like srem, not Python (1)
+            ("7 % -2", 1),
+            ("!0", 1),
+            ("!5", 0),
+            ("'a'", 97),
+            ("(A + 1) as i32", 3),
+            ("true", 1),
+        ],
+    )
+    def test_element_form(self, src: str, expected: int) -> None:
+        assert ConstEvaluator({"A": 2}).evaluate(parse_expr(src)) == expected

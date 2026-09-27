@@ -23,8 +23,11 @@ class ConstEvaluator:
     - Integer literals
     - Named constants
     - Binary operations: +, -, *, /, %, <<, >>, &, |, ^
-    - Unary operations: -, ~
-    - Parenthesized expressions
+    - Unary operations: -, ~, ! (logical: 0 -> 1, nonzero -> 0)
+    - Char and bool literals, `as` casts (the value is kept; the target's
+      own type governs its use), parenthesized expressions
+
+    `/` and `%` truncate toward zero, as the generated sdiv/srem do.
     """
 
     def __init__(self, constants: Optional[Dict[str, int]] = None):
@@ -51,8 +54,14 @@ class ConstEvaluator:
         Raises:
             ConstEvalError: If the expression cannot be evaluated at compile time
         """
-        if isinstance(expr, rast.IntLit):
+        if isinstance(expr, (rast.IntLit, rast.CharLit)):
             return expr.value
+
+        elif isinstance(expr, rast.BoolLit):
+            return 1 if expr.value else 0
+
+        elif isinstance(expr, rast.Cast):
+            return self.evaluate(expr.expr)
 
         elif isinstance(expr, rast.Ident):
             name = expr.name
@@ -68,6 +77,8 @@ class ConstEvaluator:
                 return -operand
             elif expr.op == '~':
                 return ~operand
+            elif expr.op == '!':
+                return 1 if operand == 0 else 0
             else:
                 raise ConstEvalError(
                     f"Unsupported unary operator '{expr.op}' in constant expression"
@@ -87,11 +98,13 @@ class ConstEvaluator:
             elif op == '/':
                 if right == 0:
                     raise ConstEvalError("Division by zero in constant expression")
-                return left // right
+                quotient = abs(left) // abs(right)
+                return quotient if (left < 0) == (right < 0) else -quotient
             elif op == '%':
                 if right == 0:
                     raise ConstEvalError("Modulo by zero in constant expression")
-                return left % right
+                remainder = abs(left) % abs(right)
+                return -remainder if left < 0 else remainder
             elif op == '<<':
                 if right < 0:
                     raise ConstEvalError("Negative shift amount in constant expression")

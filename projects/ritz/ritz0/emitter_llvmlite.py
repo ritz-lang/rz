@@ -15,6 +15,7 @@ from typing import Dict, Optional, Tuple, List, Union, Set
 from llvmlite import ir
 import ritz_ast as rast
 from async_transform_v2 import generate_state_machine, AsyncStateMachine
+from const_eval import ConstEvaluator, ConstEvalError
 
 
 class EmitError(Exception):
@@ -1266,14 +1267,14 @@ class LLVMEmitter:
                 elif isinstance(elem, rast.StructLit):
                     elements.append(self._make_const_struct_value(elem, elem_type, f"{name}.arr"))
                 else:
-                    elem_val = self._extract_int_from_expr(elem)
+                    elem_val = self._fold_const_array_elem(name, len(elements), elem, elem_type)
                     elements.append(ir.Constant(elem_type, elem_val))
         elif isinstance(value, rast.ArrayFill):
             if isinstance(value.value, rast.StringLit) and is_strview_array:
                 fill = self._make_const_strview_value(value.value.value, f"{name}.fill", elem_type)
                 elements = [fill] * value.count
             else:
-                fill_val = self._extract_int_from_expr(value.value)
+                fill_val = self._fold_const_array_elem(name, 0, value.value, elem_type)
                 elements = [ir.Constant(elem_type, fill_val)] * value.count
         else:
             raise ValueError(f"Const array '{name}' must be array literal or fill")
@@ -1360,14 +1361,36 @@ class LLVMEmitter:
         length_const = ir.Constant(self.i64, len(value))
         return ir.Constant(strview_ty, [str_ptr, length_const])
 
-    def _extract_int_from_expr(self, expr: rast.Expr) -> int:
-        """Extract an integer value from a constant expression."""
-        if isinstance(expr, rast.IntLit):
-            return expr.value
-        elif isinstance(expr, rast.UnaryOp) and expr.op == '-':
-            if isinstance(expr.operand, rast.IntLit):
-                return -expr.operand.value
-        raise ValueError(f"Expected integer literal, got {expr}")
+    def _fold_const_array_elem(self, name: str, index: int, expr: rast.Expr,
+                               elem_type: ir.Type) -> int:
+        """Fold element `index` of const array `name` to an integer.
+
+        AGAST #1568. Elements go through the general const evaluator, so
+        `[A + 1, ~0, 'a' as i32]` folds exactly as ritz1's const_fold_int does
+        (#1557). Named integer consts from anywhere in the module are visible:
+        const arrays are emitted after every scalar const is collected. An
+        element that does not fold is a located error, never a silent value.
+        """
+        known = {
+            cname: cval for cname, (cval, cty) in self.constants.items()
+            if isinstance(cval, int) and isinstance(cty, ir.IntType)
+        }
+        try:
+            value = ConstEvaluator(known).evaluate(expr)
+        except ConstEvalError as e:
+            raise EmitError(
+                f"const '{name}': element {index} is not a constant integer "
+                f"expression ({e})",
+                getattr(expr, "span", None),
+            ) from None
+        if isinstance(elem_type, ir.IntType):
+            # Wrap to the element width, as the runtime arithmetic would,
+            # and keep the signed form llvmlite prints.
+            bits = elem_type.width
+            value &= (1 << bits) - 1
+            if bits > 1 and value >= 1 << (bits - 1):
+                value -= 1 << bits
+        return value
 
     def _emit_const_strview(self, name: str, value: str) -> None:
         """Emit a module-level constant StrView as a global.
@@ -1723,6 +1746,7 @@ class LLVMEmitter:
                 self._process_type_alias(item)
 
         # Third pass: collect constants, module-level vars, and extern declarations
+        const_arrays = []
         for item in module.items:
             if isinstance(item, rast.ConstDef):
                 ty = self._ritz_type_to_llvm(item.type)
@@ -1739,8 +1763,9 @@ class LLVMEmitter:
                     else:
                         raise ValueError(f"Const value must be numeric literal: {item.value}")
                 elif isinstance(item.value, (rast.ArrayLit, rast.ArrayFill)):
-                    # Array constants - emit as global constant
-                    self._emit_const_array(item.name, item.type, item.value)
+                    # Array constants - emitted once every scalar const is
+                    # known, so an element may name a const declared later.
+                    const_arrays.append(item)
                 elif isinstance(item.value, rast.StringLit):
                     # String constant - emit as global StrView
                     self._emit_const_strview(item.name, item.value.value)
@@ -1750,6 +1775,8 @@ class LLVMEmitter:
                 self._emit_global_var(item)
             elif isinstance(item, rast.ExternFn):
                 self._declare_extern(item)
+        for item in const_arrays:
+            self._emit_const_array(item.name, item.type, item.value)
 
         # Fourth pass: process traits and impl blocks
         # Traits just store method signatures for validation
