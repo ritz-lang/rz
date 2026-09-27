@@ -14,8 +14,13 @@ full. It keeps looping until the goal at the bottom of this file is met.
 
 Repeat until the goal is met:
 
-1. **Drain the reap queue** (see "Reaping"). Merges first, because every merge
-   moves `main` and the rooms still running rebase onto it.
+1. **Drain the reap queue** (see "Reaping"). Merges first. Only the room at
+   the head of the queue ever rebases; see "One rebase at a time".
+   **First, recover dropped REAPs:** a REAP turn can be interrupted by the
+   next REAP's turn before it queues anything (1485 was lost this way twice).
+   `get_conversation_messages(room_id="rz", message_type="chat", since=<last check>)`,
+   and queue any REAP whose SHA is not on `origin/main`, not already in the
+   scratchpad, and not already superseded by a newer REAP from the same room.
 2. **Fill free slots.** Up to **6 rooms** at once. Pick `ready` AGAST tickets that
    move the current milestone forward (see "Where to start"). Spawn every one
    that can run in parallel in the same turn.
@@ -122,8 +127,10 @@ and pushes. Nobody re-runs your tests. Your REAP vouches for that exact commit.
    their tests; compare any failure against `origin/main` before calling it
    pre-existing.
 6. **Gate exit 0 is required.** On failure, fix, re-squash, re-run.
-7. **If `origin/main` moved** while you worked, rebase again and re-run the gate.
-   The SHA you report must sit directly on the current `origin/main`.
+7. **Don't chase `main`.** If `origin/main` moves after your step-4 rebase,
+   ignore it: REAP the commit you gated. `rz` merges one room at a time and
+   tells only the next room in line to rebase, so rebasing on every move only
+   costs you and every other room a re-gate.
 8. **Push your branch** (`git push -f origin ritz-task-<id>`), then send exactly one
    message:
    ```
@@ -133,8 +140,11 @@ and pushes. Nobody re-runs your tests. Your REAP vouches for that exact commit.
        sender_name="ritz-task-<id>",
        ask_claude=True)
    ```
-9. **If `rz` sends you back** ("rebase: main moved"), rebase onto `origin/main`,
-   re-run the gate, push, and send a new REAP line.
+9. **When `rz` says it's your turn** ("your turn: rebase onto <sha7>"), rebase
+   onto `origin/main`, re-run the gate, push, and send a new REAP line
+   straight away. You're holding the merge queue: nothing else merges until
+   you REAP, so don't pick up other work first. Until that message arrives,
+   stay on your current base, even after you've REAPed.
 
 **Never end a turn with work pending.** Nothing wakes you when a gate, subagent
 or test run finishes after your turn ends (#1533). Run `run-gate.sh --wait` in
@@ -169,11 +179,40 @@ reap ritz-task-1450 1a2b3c4
    (`systemctl --user stop/disable adele-agent@ritz-task-<id>`, remove
    `~/.config/adele/rooms/ritz-task-<id>`, `git worktree remove`,
    `git branch -D`, `git push origin --delete ritz-task-<id>`).
-5. **Fail (main moved, SHA mismatch, more than one commit):** don't touch the
-   branch. Send the room one line with `ask_claude=True`, for example
-   "rebase: main moved to <sha7>; re-gate and REAP again". Check the item
-   (it's done; the room's next REAP goes to the back of the queue).
-6. **All items checked:** `clear_scratchpad`.
+5. **Not on current main (the usual case):** this room is next, so it gets
+   the turn. Send it one line with `ask_claude=True`:
+   "your turn: rebase onto <sha7>, re-gate and REAP again". Leave its item
+   **unchecked** at the head; it keeps its place. Then **stop merging** until
+   that room REAPs again, even if a later item would fast-forward cleanly.
+   Merging anything else would move `main` under the rebase and waste its gate.
+6. **The head room's new REAP:** check its old item and handle the new one
+   next, wherever the scratchpad put it (it holds the turn). Run step 3
+   again. It only fails if something else moved `main`; if so, give it the
+   turn again.
+7. **SHA mismatch or more than one commit:** these are the room's mistakes.
+   Send it one line saying which check failed, check the item, and move on;
+   its next REAP goes to the back of the queue.
+8. **All items checked:** `clear_scratchpad`.
+
+### One rebase at a time
+
+Rebasing is serialised through the queue, not broadcast:
+
+- **Never tell running rooms that `main` moved.** No "main moved, rebase"
+  messages to rooms that aren't at the head of the queue, whether they're
+  still working, gating or already REAPed. They keep their base until their
+  turn. (Broadcasting made five rooms re-gate at once, filling both gate
+  slots with work that was stale again by the next merge.)
+- **Exactly one room holds the turn at a time**: the head of the queue. On a
+  context reset, the head is the oldest unchecked scratchpad item. If its
+  room was already sent "your turn", don't send it again unless the room has
+  been idle for 30+ minutes (see "Nudge idle rooms").
+- **A room holding the turn that goes quiet** gets the usual idle nudge. If it
+  still can't produce a gated REAP (its rebase conflicts or the gate fails),
+  check its item, tell it to REAP again when it's fixed, and give the turn
+  to the next item.
+- **Committing to `main` from this room** (skill edits and the like) doesn't
+  need any rooms told; the head room finds out when its turn comes.
 
 GitHub CI: glance at `gh run list -L 3` each turn. Red on an already-known
 failure set is normal (`test-all` has known reds). A **new** failure becomes a
@@ -218,4 +257,4 @@ Iterate from the bottom up:
 4. In parallel, work down the ritz1 known-failure list and `#1440`.
 
 Prefer many small tickets over one large one: small commits merge cleanly
-through `--ff-only`, and a room that has to rebase repeatedly is wasted work.
+through `--ff-only`, and a room's rebase and re-gate hold up the whole queue.
