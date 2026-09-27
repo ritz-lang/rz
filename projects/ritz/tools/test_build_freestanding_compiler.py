@@ -173,8 +173,11 @@ def test_ritz1_command_matches_hosted_path(buildpy, stubs, fs_pkg, monkeypatch):
     assert parts[0] == str(fs_pkg / "src" / "kern.ritz")
     assert parts[1] == "-o" and parts[2].endswith(".ll")
     assert parts[3:] == ["-I", str(buildpy.ROOT)]
+    # Last: fs_pkg's parent, so ritz1 can resolve the package's own
+    # `fs_pkg.*` imports (its self namespace, AGAST #1538).
     assert ritz_path.split(os.pathsep) == [
-        str(buildpy.ROOT), str(buildpy.ROOT.parent), "/caller/extra"
+        str(buildpy.ROOT), str(buildpy.ROOT.parent), "/caller/extra",
+        str(fs_pkg.resolve().parent),
     ]
 
 

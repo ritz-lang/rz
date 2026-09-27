@@ -649,6 +649,39 @@ def parse_dependencies(config: dict, pkg_dir: Path) -> dict[str, DependencySpec]
     return deps
 
 
+def package_import_namespaces(config: dict, pkg_dir: Path) -> dict[str, DependencySpec]:
+    """Import namespaces visible to a package's own sources.
+
+    The declared [dependencies], plus the package's OWN name mapped onto its
+    own source roots, so `import tome.resp` inside tome resolves to
+    tome/lib/resp.ritz exactly as it does for a consumer that declares
+    `tome = { path = "../tome" }` (AGAST #1538).
+
+    Before this, a package's self-qualified imports resolved only when
+    something happened to put the package itself on RITZ_PATH (`./rz`
+    does, as a side effect of collecting dependency paths); a plain
+    `build.py build projects/tome` failed "Cannot find module: tome.resp".
+
+    An explicit dependency of the same name always wins over the
+    self-mapping.
+    """
+    namespaces = parse_dependencies(config, pkg_dir)
+    pkg_name = config.get("package", {}).get("name")
+    if pkg_name and pkg_name not in namespaces:
+        sources = config.get("sources")
+        if sources is None:
+            sources = config.get("package", {}).get("sources")
+        if sources is None:
+            sources = config.get("build", {}).get("sources")
+        if sources is None:
+            sources = ["src"]
+        if isinstance(sources, str):
+            sources = [sources]
+        namespaces[pkg_name] = DependencySpec(
+            name=pkg_name, path=pkg_dir.resolve(), sources=list(sources))
+    return namespaces
+
+
 def get_transitive_dependencies(
     pkg_dir: Path,
     config: dict,
@@ -976,7 +1009,7 @@ def ritz1_compile_cmd(compiler: str, src: Path, ll_path: Path) -> Optional[list]
     return [str(ritz1_bin), str(src), "-o", str(ll_path), "-I", str(ROOT)]
 
 
-def ritz1_env() -> dict:
+def ritz1_env(namespaces: dict | None = None) -> dict:
     """Environment for a ritz1-family compile.
 
     ritz1 needs RITZ_PATH to resolve qualified `ritzlib.*` imports AND
@@ -986,12 +1019,22 @@ def ritz1_env() -> dict:
     imports like `zeus.shm` → `projects/zeus/lib/shm.ritz`. Any caller-provided
     RITZ_PATH (e.g. `./rz` pre-building a list of workspace roots) is kept,
     after those two. Colon-separated, gcc-style.
+
+    `namespaces` (from `package_import_namespaces`) covers what ritz1's
+    minimal CLI can't take as --deps: for each namespace whose directory is
+    named after it, the directory's parent is appended, so ritz1's
+    `<entry>/<pkg>/{lib,src}/...` probe finds it — including a package
+    importing itself by name from outside projects/ (AGAST #1538). Appended
+    last, so it only affects imports that would otherwise fail.
     """
     env = os.environ.copy()
     entries = [str(ROOT), str(ROOT.parent)]
     for e in env.get("RITZ_PATH", "").split(os.pathsep):
         if e and e not in entries:
             entries.append(e)
+    for name, spec in (namespaces or {}).items():
+        if spec.path.name == name and str(spec.path.parent) not in entries:
+            entries.append(str(spec.path.parent))
     env["RITZ_PATH"] = os.pathsep.join(entries)
     return env
 
@@ -1318,7 +1361,7 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
                 if pkg_dir:
                     compile_cmd.extend(["--project-root", str(pkg_dir)])
 
-            env = ritz1_env() if compiler.startswith("ritz1") else os.environ.copy()
+            env = ritz1_env(dependencies) if compiler.startswith("ritz1") else os.environ.copy()
             result = subprocess.run(compile_cmd, capture_output=True, text=True, env=env)
             if result.returncode != 0:
                 # AGAST #1286: collect and keep going so every broken file is
@@ -1585,7 +1628,7 @@ def compile_freestanding_binary(
                 # [[target_os = "..."]] conditional compilation (AGAST #1550)
                 if target_os:
                     compile_cmd.extend(["--target-os", target_os])
-                env = ritz1_env()
+                env = ritz1_env(dependencies)
             else:
                 compile_cmd = [
                     sys.executable, str(RITZ0), str(src),
@@ -1913,6 +1956,11 @@ def build_package(pkg_dir: Path, config: dict, keep_artifacts: bool = False, use
     else:
         print(f"📦 Building {pkg_name} ({profile['name']})...")
 
+    # What the compiler resolves imports against: the declared dependencies
+    # plus the package's own name (AGAST #1538). Kept separate from
+    # `dependencies` so the banner above still counts only declared deps.
+    namespaces = package_import_namespaces(config, pkg_dir)
+
     plan = plan_binaries(pkg_dir, config)
     binaries = plan.buildable
     built = []
@@ -1945,7 +1993,7 @@ def build_package(pkg_dir: Path, config: dict, keep_artifacts: bool = False, use
                 keep_artifacts=keep_artifacts,
                 use_cache=use_cache,
                 profile=profile,
-                dependencies=dependencies,
+                dependencies=namespaces,
                 source_roots=source_roots,
                 compiler=compiler,
             )
@@ -1975,7 +2023,7 @@ def build_package(pkg_dir: Path, config: dict, keep_artifacts: bool = False, use
                 keep_artifacts=keep_artifacts,
                 use_cache=use_cache,
                 profile=profile,
-                dependencies=dependencies,
+                dependencies=namespaces,
                 pkg_dir=pkg_dir,
                 source_roots=source_roots,
                 compiler=compiler,

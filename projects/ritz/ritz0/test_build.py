@@ -1055,6 +1055,123 @@ class TestPartialBuildExitCode:
 
 
 # ---------------------------------------------------------------------------
+# AGAST #1538: a package can import its own modules by its package name.
+#
+# tome/lib/client.ritz imports `tome.resp` (the fully-qualified form, so that
+# spire and nexus can consume it through `tome = { path = "../tome" }`). Under
+# `./rz` that resolved only because rz happens to put the project itself on
+# RITZ_PATH; a plain `build.py build projects/tome` failed with
+# "Cannot find module: tome.resp". build.py now registers the package's own
+# name as an import namespace over its own source roots.
+# ---------------------------------------------------------------------------
+
+# Deliberately unlike any real workspace project, so RITZ_PATH's
+# projects/ subdir auto-detection can't mask a missing self-mapping.
+_SELF_PKG = "selfref1538"
+
+
+def _self_import_package(tmp_path):
+    """bin/main imports lib.b (relative form); lib/b imports selfref1538.a (qualified form)."""
+    # Named after the package: ritz1 has no --deps, and finds a namespace
+    # by probing <RITZ_PATH entry>/<name>/{lib,src}. It lives outside
+    # projects/, so only build.py's self-mapping can make it visible.
+    pkg = tmp_path / _SELF_PKG
+    (pkg / "lib").mkdir(parents=True)
+    (pkg / "bin").mkdir()
+    (pkg / "lib" / "a.ritz").write_text("pub fn seven() -> i32\n    7\n")
+    (pkg / "lib" / "b.ritz").write_text(
+        f"import {_SELF_PKG}.a\n\npub fn fourteen() -> i32\n    seven() * 2\n")
+    (pkg / "bin" / "main.ritz").write_text(
+        "import lib.b\n\nfn main() -> i32\n    fourteen() - 14\n")
+    (pkg / "ritz.toml").write_text(
+        f'[package]\nname = "{_SELF_PKG}"\nversion = "0.1.0"\n'
+        '\n[build]\nsources = ["lib", "bin"]\n'
+        '\n[[bin]]\nname = "selfref"\nentry = "main::main"\n'
+    )
+    return pkg
+
+
+class TestSelfNamespace:
+    """build.py maps a package's own name onto its source roots (AGAST #1538)."""
+
+    @pytest.mark.unit
+    def test_own_name_maps_to_own_source_roots(self, tmp_path):
+        config = {"package": {"name": "tome"}, "build": {"sources": ["lib", "test", "bin"]}}
+        ns = _build_module.package_import_namespaces(config, tmp_path)
+        assert set(ns) == {"tome"}
+        assert ns["tome"].path == tmp_path.resolve()
+        assert ns["tome"].sources == ["lib", "test", "bin"]
+        (tmp_path / "lib").mkdir()
+        (tmp_path / "lib" / "resp.ritz").write_text("")
+        assert ns["tome"].resolve_import(["resp"]) == tmp_path / "lib" / "resp.ritz"
+
+    @pytest.mark.unit
+    def test_default_source_root_is_src(self, tmp_path):
+        ns = _build_module.package_import_namespaces({"package": {"name": "p"}}, tmp_path)
+        assert ns["p"].sources == ["src"]
+
+    @pytest.mark.unit
+    def test_declared_dependencies_are_kept(self, tmp_path):
+        dep = tmp_path / "dep"
+        dep.mkdir()
+        config = {"package": {"name": "me"}, "dependencies": {"dep": {"path": "dep", "sources": ["lib"]}}}
+        ns = _build_module.package_import_namespaces(config, tmp_path)
+        assert set(ns) == {"me", "dep"}
+        assert ns["dep"].sources == ["lib"]
+
+    @pytest.mark.unit
+    def test_declared_dependency_of_same_name_wins(self, tmp_path):
+        """An explicit [dependencies] entry is never shadowed by the self-mapping."""
+        other = tmp_path / "other"
+        other.mkdir()
+        config = {"package": {"name": "me"}, "dependencies": {"me": {"path": "other", "sources": ["x"]}}}
+        ns = _build_module.package_import_namespaces(config, tmp_path)
+        assert ns["me"].path == other.resolve()
+        assert ns["me"].sources == ["x"]
+
+    @pytest.mark.unit
+    def test_ritz1_env_appends_parent_of_self_named_namespace_dirs(self, tmp_path, monkeypatch):
+        """ritz1 takes no --deps: a namespace reaches it as <parent>/<name> on RITZ_PATH."""
+        monkeypatch.setenv("RITZ_PATH", "")
+        me = tmp_path / "me"
+        odd = tmp_path / "elsewhere" / "odd_dir"
+        me.mkdir()
+        odd.mkdir(parents=True)
+        spec = _build_module.DependencySpec
+        env = _build_module.ritz1_env({
+            "me": spec(name="me", path=me, sources=["lib"]),
+            "odd": spec(name="odd", path=odd, sources=["lib"]),  # dir name != ns: not probe-able
+        })
+        entries = env["RITZ_PATH"].split(os.pathsep)
+        assert entries[:2] == [str(_build_module.ROOT), str(_build_module.ROOT.parent)]
+        assert str(tmp_path) in entries[2:]
+        assert str(odd.parent) not in entries
+        assert _build_module.ritz1_env()["RITZ_PATH"].split(os.pathsep)[:2] == entries[:2]
+
+    @pytest.mark.integration
+    @pytest.mark.parametrize("compiler", ["ritz0", "ritz1"])
+    def test_package_builds_when_it_imports_itself_by_name(self, tmp_path, compiler):
+        """The #1538 acceptance test: real build.py, RITZ_PATH = ritz root only."""
+        import os
+        import subprocess
+        if compiler == "ritz1" and not (RITZ_DIR / "ritz1" / "build" / "ritz1").exists():
+            pytest.skip("ritz1 binary not built")
+        pkg = _self_import_package(tmp_path)
+        env = dict(os.environ, RITZ_PATH=str(RITZ_DIR))
+        proc = subprocess.run(
+            [sys.executable, "build.py", "build", str(pkg), "--compiler", compiler],
+            cwd=RITZ_DIR, env=env, capture_output=True, text=True, timeout=600,
+        )
+        output = proc.stdout + proc.stderr
+        assert f"Cannot find module: {_SELF_PKG}.a" not in output, output
+        assert proc.returncode == 0, output
+        binary = pkg / "build" / "debug" / "selfref"
+        assert binary.exists(), output
+        run = subprocess.run([str(binary)], capture_output=True, timeout=30)
+        assert run.returncode == 0, f"expected exit 0 (14 - 14), got {run.returncode}"
+
+
+# ---------------------------------------------------------------------------
 # AGAST #1313: freestanding IR must not acquire libc calls from loop-idiom
 # recognition.
 # ---------------------------------------------------------------------------
