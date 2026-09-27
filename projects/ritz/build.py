@@ -995,7 +995,98 @@ def ritz1_env() -> dict:
     return env
 
 
-def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources: list[Path] = None, keep_artifacts: bool = False, use_cache: bool = True, profile: dict = None, dependencies: dict[str, DependencySpec] = None, pkg_dir: Path = None, source_roots: list[str] = None, compiler: str = "ritz0") -> Path:
+# ---------------------------------------------------------------------------
+# AGAST #1382: binary provenance.
+#
+# The only question the project-level fast path may ask is "was THIS binary
+# produced from THESE sources by THIS compiler with THIS link profile?".
+# Nothing answered that before: the fast path forgave any source whose mtime
+# was `<=` the binary's (so a same-second edit, `cp -p`, `tar -x` or a git
+# checkout served a stale binary), and for newer sources it consulted the
+# source's own `.ritz.sig` -- which describes the SOURCE, not the binary, and
+# is shared by ritz0 and ritz1 (both write it; see ritz0/ritz0.py).
+#
+# So each link writes `<name>.manifest.json` next to the binary, recording
+# the content hash of every source it was built from (in link order), the
+# compiler name and hash, the link-relevant profile keys, and the binary's
+# own hash. The fast path recomputes that record and compares. mtime is not
+# an input at all: sha256 over a package's sources costs milliseconds, which
+# is noise next to a ritz0/ritz1 invocation.
+# ---------------------------------------------------------------------------
+
+BINARY_MANIFEST_VERSION = 1
+_PROFILE_LINK_KEYS = ("opt_level", "debug", "lto")
+
+
+def binary_manifest_path(bin_path: Path) -> Path:
+    """`build/<profile>/<name>` -> `build/<profile>/<name>.manifest.json`."""
+    return bin_path.with_name(bin_path.name + ".manifest.json")
+
+
+def _sha256_file(path: Path) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 16), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def binary_provenance(sources: list[Path], compiler: str, compiler_hash: str, profile: dict,
+                      runtime: list[Path] = ()) -> dict:
+    """What a binary linked right now from `sources` would be built from.
+
+    `runtime` lists the `_start` shim sources (`runtime/*.ll`) the link may
+    pull in; they are not Ritz sources and not part of the compiler hash, so
+    they are recorded separately.
+
+    Hash the sources BEFORE compiling them: if one is edited mid-build, the
+    manifest records the pre-edit content and the next build sees a
+    mismatch and rebuilds. That's the safe direction. Raises OSError if a
+    source is unreadable.
+    """
+    return {
+        "version": BINARY_MANIFEST_VERSION,
+        "compiler": compiler,
+        "compiler_hash": compiler_hash,
+        "profile": {k: profile.get(k) for k in _PROFILE_LINK_KEYS},
+        "sources": [[str(Path(s).resolve()), _sha256_file(Path(s))] for s in sources],
+        "runtime": [[str(Path(r).resolve()), _sha256_file(Path(r))] for r in runtime],
+    }
+
+
+def write_binary_manifest(bin_path: Path, provenance: dict) -> None:
+    """Record that `bin_path` (as it is on disk now) came from `provenance`."""
+    import json
+    record = dict(provenance, binary_sha256=_sha256_file(bin_path))
+    manifest = binary_manifest_path(bin_path)
+    tmp = manifest.with_name(manifest.name + ".tmp")
+    tmp.write_text(json.dumps(record, indent=1, sort_keys=True) + "\n")
+    os.replace(tmp, manifest)
+
+
+def binary_is_up_to_date(bin_path: Path, provenance: dict) -> bool:
+    """True only if `bin_path`'s manifest proves it was built from `provenance`.
+
+    Every doubt is a rebuild: missing/corrupt manifest, missing binary, a
+    binary rewritten by something that did not update the manifest, or an
+    unidentifiable compiler (`compute_compiler_hash` failed -> "unknown").
+    """
+    import json
+    if provenance.get("compiler_hash") in (None, "", "unknown"):
+        return False
+    try:
+        recorded = json.loads(binary_manifest_path(bin_path).read_text())
+        if not isinstance(recorded, dict):
+            return False
+        if recorded.pop("binary_sha256", None) != _sha256_file(bin_path):
+            return False
+    except (OSError, ValueError):
+        return False
+    return recorded == provenance
+
+
+def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources: list[Path] = None, keep_artifacts: bool = False, use_cache: bool = True, profile: dict = None, dependencies: dict[str, DependencySpec] = None, pkg_dir: Path = None, source_roots: list[str] = None, compiler: str = "ritz0", on_rebuild=None) -> Path:
     """Compile Ritz source file(s) to a binary.
 
     Args:
@@ -1009,6 +1100,10 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
         dependencies: RFC #109 dependency specs for namespace resolution
         pkg_dir: Package directory for project root (defaults to ROOT for standalone builds)
         source_roots: List of source directories to search for imports (e.g., ["src", "kernel/src"])
+        on_rebuild: Optional zero-arg callable, invoked once just before real
+            compile/link work starts. NOT invoked when the binary is proven up
+            to date (AGAST #1382), so the caller can tell "rebuilt" from
+            "already up to date" and never report work it did not do.
 
     Uses separate compilation model:
     1. Discover all source files via import resolution
@@ -1084,58 +1179,34 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
             if src not in all_sources:
                 all_sources.insert(-1, src)  # Insert before main
 
-    # AGAST #192: project-level fast path.  If the output binary exists
-    # and every transitive source is content-unchanged since the last
-    # build, the link is already up-to-date and we can skip emit/link
-    # entirely.  Mirrors what `make` does, but with a content-hash
-    # fallback so a bare `touch foo.ritz` (mtime bumped, content
-    # identical) doesn't trigger a 10× slower rebuild.
+    # AGAST #192 / #1382: project-level fast path. Skip emit/link entirely
+    # only when the binary's manifest proves it was built from exactly the
+    # current content of every transitive source, by the current compiler
+    # (name + hash: editing a ritz0 codegen file or rebuilding ritz1 changes
+    # it), with the current link profile. See `binary_is_up_to_date`.
     #
-    # Three-tier check:
-    #   0. compiler hash matches  → otherwise the cached `bin_path` was
-    #      produced by a different compiler revision and must not be
-    #      reused. Editing a ritz0 codegen file (e.g. `emitter/calls.py`)
-    #      or rebuilding the `ritz1` binary changes this hash. Without
-    #      this gate, the fast path silently returns yesterday's binary
-    #      and "the cache lies" — exactly the class of failure that
-    #      burned a session in early May 2026.
-    #   1. mtime <= bin_mtime     → cheap, settles 99% of cases.
-    #   2. mtime is newer, but FNV1a(source) matches `<src>.ritz.sig`'s
-    #      `source_hash` (written by ritz1 on its previous run)  →
-    #      content unchanged, treat as fresh.
-    # `use_cache` gates the whole thing so debug runs always rebuild.
-    if use_cache and bin_path.exists() and not compiler_changed:
-        try:
-            bin_mtime = bin_path.stat().st_mtime
-            stale = False
-            for src in all_sources:
-                if src.stat().st_mtime <= bin_mtime:
-                    continue
-                # Newer mtime — ask the .ritz.sig whether content actually changed.
-                sig_path = src.with_suffix('.ritz.sig')
-                if not sig_path.exists():
-                    stale = True
-                    break
-                try:
-                    content = src.read_bytes()
-                    # FNV1a-64 — must match `source_file_hash()` in
-                    # ritz1/src/fn_cache.ritz so cold/warm hashes line up.
-                    h = 14695981039346656037
-                    prime = 1099511628211
-                    mask = (1 << 64) - 1
-                    for b in content:
-                        h = ((h ^ b) * prime) & mask
-                    sig_data = json.loads(sig_path.read_text())
-                    if sig_data.get("source_hash") != f"{h:016x}":
-                        stale = True
-                        break
-                except (OSError, ValueError):
-                    stale = True
-                    break
-            if not stale:
-                return bin_path
-        except OSError:
-            pass
+    # mtime is deliberately NOT consulted: `<=` forgave same-second edits and
+    # older-mtime restores (cp -p, tar -x, git ops), and the `.ritz.sig`
+    # next to each source answers a question about the source, not about
+    # this binary. A bare `touch` still hits the fast path because content
+    # is what's compared. `use_cache` gates it so debug runs always rebuild.
+    try:
+        provenance = binary_provenance(
+            all_sources, compiler, cache._get_current_compiler_hash(), profile,
+            runtime=[ll for o in (RITZ_START_NOARGS, RITZ_START, RITZ_START_ENVP)
+                     if (ll := o.with_suffix(".ll")).exists()])
+    except OSError:
+        provenance = None
+    if (use_cache and provenance is not None and not compiler_changed
+            and binary_is_up_to_date(bin_path, provenance)):
+        return bin_path
+
+    # No need to delete the old manifest here: it records the binary's own
+    # sha256, so a failed or interrupted link that disturbs `bin_path` can
+    # never match it, and a build that fails before linking leaves the old
+    # binary/manifest pair consistent.
+    if on_rebuild is not None:
+        on_rebuild()
 
     # Use build/ directory for artifacts if keeping them, otherwise temp
     if keep_artifacts:
@@ -1360,6 +1431,8 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
             print(f"  ✗ {linker_name} linking failed: {result.stderr}", file=sys.stderr)
             return None
 
+        if provenance is not None:
+            write_binary_manifest(bin_path, provenance)
         return bin_path
     finally:
         # Clean up temp directory if not keeping artifacts
@@ -1859,6 +1932,9 @@ def build_package(pkg_dir: Path, config: dict, keep_artifacts: bool = False, use
         except ValueError:
             src_rel = bin_config.src_path
 
+        # Did this target print its 🔨 line? Freestanding does so up front;
+        # the hosted branch below defers it (AGAST #1382).
+        announced = True
         if bin_config.freestanding:
             # Freestanding build (kernel, bootloader)
             asm_count = len(bin_config.asm_files) if bin_config.asm_files else 0
@@ -1877,13 +1953,24 @@ def build_package(pkg_dir: Path, config: dict, keep_artifacts: bool = False, use
                 compiler=compiler,
             )
         else:
-            # Standard hosted build
+            # Standard hosted build.
+            #
+            # AGAST #1382 (the #1360 rule): build.py never prints 🔨/✓ for
+            # work it did not do. Either it rebuilt, and says 🔨 ... ✓, or the
+            # binary was proven up to date, and it says exactly that. So the
+            # 🔨 line is deferred until compile_binary commits to a rebuild.
             if bin_config.additional_sources:
                 all_srcs = [src_rel] + [s.relative_to(pkg_dir) for s in bin_config.additional_sources]
                 src_display = ", ".join(str(s) for s in all_srcs)
-                print(f"  🔨 {bin_config.name} <- [{src_display}]", end="")
+                hammer = f"  🔨 {bin_config.name} <- [{src_display}]"
             else:
-                print(f"  🔨 {bin_config.name} <- {src_rel}", end="")
+                hammer = f"  🔨 {bin_config.name} <- {src_rel}"
+            announced = False
+
+            def announce_rebuild(hammer=hammer):
+                nonlocal announced
+                announced = True
+                print(hammer, end="")
 
             bin_path = compile_binary(
                 bin_config.name, bin_config.src_path, out_dir,
@@ -1895,7 +1982,12 @@ def build_package(pkg_dir: Path, config: dict, keep_artifacts: bool = False, use
                 pkg_dir=pkg_dir,
                 source_roots=source_roots,
                 compiler=compiler,
+                on_rebuild=announce_rebuild,
             )
+            if not bin_path and not announced:
+                # Failed before committing to a rebuild (e.g. import
+                # resolution): still name the target the error belongs to.
+                print(hammer, end="")
         if bin_path:
             try:
                 rel_path = bin_path.relative_to(ROOT)
@@ -1906,7 +1998,10 @@ def build_package(pkg_dir: Path, config: dict, keep_artifacts: bool = False, use
                     rel_path = bin_path.relative_to(Path.cwd())
                 except ValueError:
                     rel_path = bin_path
-            print(f"\n  ✓ {rel_path}")
+            if announced:
+                print(f"\n  ✓ {rel_path}")
+            else:
+                print(f"  = {bin_config.name} up to date: {rel_path}")
             built.append(bin_path)
 
             # RFC convention: maintain a symlink at pkg_dir/<name> pointing at
@@ -2391,10 +2486,20 @@ def cmd_run(args):
     out_dir = ROOT / "build"
     out_dir.mkdir(exist_ok=True)
 
-    print(f"🔨 Compiling {src_path}...")
-    bin_path = compile_binary(name, src_path, out_dir, keep_artifacts=keep_artifacts)
+    # AGAST #1382: announce 🔨 only if compile_binary actually rebuilds.
+    announced = False
+
+    def announce_rebuild():
+        nonlocal announced
+        announced = True
+        print(f"🔨 Compiling {src_path}...")
+
+    bin_path = compile_binary(name, src_path, out_dir, keep_artifacts=keep_artifacts,
+                              on_rebuild=announce_rebuild)
     if not bin_path:
         return 1
+    if not announced:
+        print(f"= {bin_path.name} up to date")
 
     print(f"🚀 Running {bin_path.name}...", flush=True)
     print(flush=True)  # Blank line before output
