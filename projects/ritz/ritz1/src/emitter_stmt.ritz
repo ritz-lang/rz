@@ -2916,15 +2916,10 @@ fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                 emit_str(s, c" = getelementptr [")
                 emit_int(s, local.array_size as i64)
                 emit_str(s, c" x ")
-                if local.array_elem_type == TYPE_I32
-                    emit_str(s, c"i32")
-                else if local.array_elem_type == TYPE_I64
-                    emit_str(s, c"i64")
-                else if local.array_elem_type == TYPE_U8 or local.array_elem_type == TYPE_I8
-                    emit_str(s, c"i8")
-                else if local.array_elem_type == TYPE_PTR or local.array_elem_type == TYPE_PTR_PTR
-                    emit_str(s, c"ptr")
-                else if local.array_elem_type == TYPE_STRUCT and local.type_name_len > 0
+                # AGAST #1564: every non-struct element uses the alloca's own
+                # spelling (array_elem_llvm); u32/u16/i16 used to fall to i64.
+                let elem_ty: *u8 = array_elem_llvm(local.array_elem_type)
+                if local.array_elem_type == TYPE_STRUCT and local.type_name_len > 0
                     # AGAST #190: struct-array LHS — emit `[N x %T]` so the
                     # GEP and the store agree with the actual element layout.
                     # Mirrors #188's STMT_LOCAL_FIELD_INDEX_ASSIGN fix but on
@@ -2934,50 +2929,13 @@ fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                     # was emitting `[2 x i64]` GEP / `store i64 %DbField`.
                     emit_llvm_type_struct(s, TYPE_STRUCT, local.type_name, local.type_name_len)
                 else
-                    emit_str(s, c"i64")
+                    emit_str(s, elem_ty)
                 emit_str(s, c"], ptr ")
                 emit_reg(s, base_reg)
                 emit_str(s, c", i64 0, i64 ")
                 emit_reg(s, idx_reg)
                 emit_str(s, c"\n")
-                # Store value - truncate to element type if needed
-                if local.array_elem_type == TYPE_U8 or local.array_elem_type == TYPE_I8
-                    let trunc: i32 = next_reg(s)
-                    emit_str(s, c"  ")
-                    emit_reg(s, trunc)
-                    emit_str(s, c" = trunc i64 ")
-                    emit_reg(s, val_reg)
-                    emit_str(s, c" to i8\n")
-                    emit_str(s, c"  store i8 ")
-                    emit_reg(s, trunc)
-                    emit_str(s, c", ptr ")
-                    emit_reg(s, elem_ptr)
-                    emit_str(s, c"\n")
-                else if local.array_elem_type == TYPE_I32
-                    let trunc: i32 = next_reg(s)
-                    emit_str(s, c"  ")
-                    emit_reg(s, trunc)
-                    emit_str(s, c" = trunc i64 ")
-                    emit_reg(s, val_reg)
-                    emit_str(s, c" to i32\n")
-                    emit_str(s, c"  store i32 ")
-                    emit_reg(s, trunc)
-                    emit_str(s, c", ptr ")
-                    emit_reg(s, elem_ptr)
-                    emit_str(s, c"\n")
-                else if local.array_elem_type == TYPE_PTR or local.array_elem_type == TYPE_PTR_PTR
-                    let ptr_val: i32 = next_reg(s)
-                    emit_str(s, c"  ")
-                    emit_reg(s, ptr_val)
-                    emit_str(s, c" = inttoptr i64 ")
-                    emit_reg(s, val_reg)
-                    emit_str(s, c" to ptr\n")
-                    emit_str(s, c"  store ptr ")
-                    emit_reg(s, ptr_val)
-                    emit_str(s, c", ptr ")
-                    emit_reg(s, elem_ptr)
-                    emit_str(s, c"\n")
-                else if local.array_elem_type == TYPE_STRUCT and local.type_name_len > 0
+                if local.array_elem_type == TYPE_STRUCT and local.type_name_len > 0
                     # AGAST #190: struct-array element store — `store %T %val`
                     # matches the value loaded/returned as the element struct
                     # type (e.g. `%DbField` from `call %DbField @db_field(..)`).
@@ -2985,15 +2943,17 @@ fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                     emit_llvm_type_struct(s, TYPE_STRUCT, local.type_name, local.type_name_len)
                     emit_str(s, c" ")
                     emit_reg(s, val_reg)
-                    emit_str(s, c", ptr ")
-                    emit_reg(s, elem_ptr)
-                    emit_str(s, c"\n")
                 else
-                    emit_str(s, c"  store i64 ")
-                    emit_reg(s, val_reg)
-                    emit_str(s, c", ptr ")
-                    emit_reg(s, elem_ptr)
-                    emit_str(s, c"\n")
+                    # Store at the element width: narrow ints truncate, pointers
+                    # convert back to ptr, i64 stores as-is.
+                    let store_val: i32 = emit_array_elem_narrow(s, val_reg, local.array_elem_type, elem_ty)
+                    emit_str(s, c"  store ")
+                    emit_str(s, elem_ty)
+                    emit_str(s, c" ")
+                    emit_reg(s, store_val)
+                emit_str(s, c", ptr ")
+                emit_reg(s, elem_ptr)
+                emit_str(s, c"\n")
             else
                 # Pointer local — load the i64 slot, convert to ptr, then
                 # GEP + store at the POINTEE's width (AGAST #1332; this was

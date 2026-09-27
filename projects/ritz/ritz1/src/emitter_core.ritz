@@ -776,7 +776,15 @@ pub fn build_symbol_maps(s: *EmitterState)
 # emit_llvm_type, which lowers pointers to i64 and bool to i1. Struct elements
 # are not covered here; the declaration names `%T` for those.
 fn global_array_elem_llvm(g: *GlobalVarDef) -> *u8
-    let t: i32 = g.array_elem_type
+    return array_elem_llvm(g.array_elem_type)
+
+# The LLVM element type of a non-struct `[N]T` array, global or local. It is
+# the spelling both emit_globals and emit_var_decl's `alloca [N x T]` use, so
+# every GEP / load / store over the array must use it too. AGAST #1564: the
+# local-array index arms kept their own i8/i32/i64/ptr chains, so a local
+# `[N]u32` / `[N]u16` / `[N]i16` was addressed as `[N x i64]` over a narrower
+# alloca — 8-byte strides and stores that overran it.
+fn array_elem_llvm(t: i32) -> *u8
     if t == TYPE_I32 or t == TYPE_U32
         return c"i32"
     if t == TYPE_U8 or t == TYPE_I8
@@ -786,6 +794,49 @@ fn global_array_elem_llvm(g: *GlobalVarDef) -> *u8
     if t == TYPE_PTR or t == TYPE_PTR_PTR
         return c"ptr"
     return c"i64"
+
+# Widen an array element just loaded as `ty` (array_elem_llvm(t)) to the i64
+# every expression value is carried in: zext unsigned, sext signed, ptrtoint
+# pointers. i64 elements are returned as-is.
+fn emit_array_elem_widen(s: *EmitterState, val: i32, t: i32, ty: *u8) -> i32
+    var op: *u8 = null
+    if t == TYPE_U8 or t == TYPE_U16 or t == TYPE_U32
+        op = c" = zext "
+    else if t == TYPE_I8 or t == TYPE_I16 or t == TYPE_I32
+        op = c" = sext "
+    else if t == TYPE_PTR or t == TYPE_PTR_PTR
+        op = c" = ptrtoint "
+    if op == null
+        return val
+    let wide: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, wide)
+    emit_str(s, op)
+    emit_str(s, ty)
+    emit_str(s, c" ")
+    emit_reg(s, val)
+    emit_str(s, c" to i64\n")
+    return wide
+
+# The inverse of emit_array_elem_widen for a store: narrow an i64 value to the
+# element type `ty` (trunc ints, inttoptr pointers). i64 is returned as-is.
+fn emit_array_elem_narrow(s: *EmitterState, val: i32, t: i32, ty: *u8) -> i32
+    var op: *u8 = null
+    if t == TYPE_U8 or t == TYPE_I8 or t == TYPE_U16 or t == TYPE_I16 or t == TYPE_U32 or t == TYPE_I32
+        op = c" = trunc i64 "
+    else if t == TYPE_PTR or t == TYPE_PTR_PTR
+        op = c" = inttoptr i64 "
+    if op == null
+        return val
+    let narrow: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, narrow)
+    emit_str(s, op)
+    emit_reg(s, val)
+    emit_str(s, c" to ")
+    emit_str(s, ty)
+    emit_str(s, c"\n")
+    return narrow
 
 fn emit_llvm_type(s: *EmitterState, t: i32)
     if t == TYPE_VOID

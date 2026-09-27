@@ -280,24 +280,7 @@ fn emit_global_array_index(s: *EmitterState, name: *u8, name_len: i32, size: i32
     emit_str(s, c", ptr ")
     emit_reg(s, gptr)
     emit_str(s, c"\n")
-    var widen: *u8 = null
-    if elem_t == TYPE_U8 or elem_t == TYPE_U16 or elem_t == TYPE_U32
-        widen = c" = zext "
-    else if elem_t == TYPE_I8 or elem_t == TYPE_I16 or elem_t == TYPE_I32
-        widen = c" = sext "
-    else if elem_t == TYPE_PTR or elem_t == TYPE_PTR_PTR
-        widen = c" = ptrtoint "
-    if widen == null
-        return gval
-    let gwide: i32 = next_reg(s)
-    emit_str(s, c"  ")
-    emit_reg(s, gwide)
-    emit_str(s, widen)
-    emit_str(s, elem_ty)
-    emit_str(s, c" ")
-    emit_reg(s, gval)
-    emit_str(s, c" to i64\n")
-    return gwide
+    return emit_array_elem_widen(s, gval, elem_t, elem_ty)
 
 fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
     # Check if base is an array, pointer-to-pointer (e.g., argv: **u8), or pointer
@@ -468,7 +451,10 @@ fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
         return rng_ri
 
     if base_type == TYPE_ARRAY and local != null
-        # Array local - use GEP [0, index] to get element, then load
+        # Array local - use GEP [0, index] to get element, then load.
+        # AGAST #1564: at the alloca's own element type (array_elem_llvm);
+        # u32/u16/i16 used to fall to `[N x i64]` over a narrower alloca.
+        let elem_ty: *u8 = array_elem_llvm(local.array_elem_type)
         let idx: i32 = emit_expr(s, e.right)
         let elem_ptr: i32 = next_reg(s)
         emit_str(s, c"  ")
@@ -476,73 +462,21 @@ fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
         emit_str(s, c" = getelementptr [")
         emit_int(s, local.array_size as i64)
         emit_str(s, c" x ")
-        if local.array_elem_type == TYPE_I32
-            emit_str(s, c"i32")
-        else if local.array_elem_type == TYPE_I64
-            emit_str(s, c"i64")
-        else if local.array_elem_type == TYPE_U8 or local.array_elem_type == TYPE_I8
-            emit_str(s, c"i8")
-        else if local.array_elem_type == TYPE_PTR or local.array_elem_type == TYPE_PTR_PTR
-            emit_str(s, c"ptr")
-        else
-            emit_str(s, c"i64")
+        emit_str(s, elem_ty)
         emit_str(s, c"], ptr ")
         emit_reg(s, local.reg)
         emit_str(s, c", i64 0, i64 ")
         emit_reg(s, idx)
         emit_str(s, c"\n")
-        # Load element
         let result: i32 = next_reg(s)
         emit_str(s, c"  ")
         emit_reg(s, result)
         emit_str(s, c" = load ")
-        if local.array_elem_type == TYPE_I32
-            emit_str(s, c"i32")
-        else if local.array_elem_type == TYPE_I64
-            emit_str(s, c"i64")
-        else if local.array_elem_type == TYPE_U8 or local.array_elem_type == TYPE_I8
-            emit_str(s, c"i8")
-        else if local.array_elem_type == TYPE_PTR or local.array_elem_type == TYPE_PTR_PTR
-            emit_str(s, c"ptr")
-        else
-            emit_str(s, c"i64")
+        emit_str(s, elem_ty)
         emit_str(s, c", ptr ")
         emit_reg(s, elem_ptr)
         emit_str(s, c"\n")
-        # Extend to i64 if needed
-        if local.array_elem_type == TYPE_U8
-            let ext: i32 = next_reg(s)
-            emit_str(s, c"  ")
-            emit_reg(s, ext)
-            emit_str(s, c" = zext i8 ")
-            emit_reg(s, result)
-            emit_str(s, c" to i64\n")
-            return ext
-        else if local.array_elem_type == TYPE_I8
-            let ext: i32 = next_reg(s)
-            emit_str(s, c"  ")
-            emit_reg(s, ext)
-            emit_str(s, c" = sext i8 ")
-            emit_reg(s, result)
-            emit_str(s, c" to i64\n")
-            return ext
-        else if local.array_elem_type == TYPE_I32
-            let ext: i32 = next_reg(s)
-            emit_str(s, c"  ")
-            emit_reg(s, ext)
-            emit_str(s, c" = sext i32 ")
-            emit_reg(s, result)
-            emit_str(s, c" to i64\n")
-            return ext
-        else if local.array_elem_type == TYPE_PTR or local.array_elem_type == TYPE_PTR_PTR
-            let pti: i32 = next_reg(s)
-            emit_str(s, c"  ")
-            emit_reg(s, pti)
-            emit_str(s, c" = ptrtoint ptr ")
-            emit_reg(s, result)
-            emit_str(s, c" to i64\n")
-            return pti
-        return result
+        return emit_array_elem_widen(s, result, local.array_elem_type, elem_ty)
 
     # AGAST #1504: a GLOBAL `[N]T` array. The branch above covers only an
     # array local, so a global array fell through to the pointer fallback
