@@ -130,19 +130,15 @@ TESTS = [
     "test_issue_mut_ref_deref_assign",
     "test_issue_namespace_const_field",
     "test_issue_narrow_field_assign",
-    # NOTE: test_issue_nested_generic_close (AGAST #1299, closing nested type
-    # argument lists with `>>`) is deliberately NOT listed here yet. The fix is
-    # ritz0-only: ritz0 splits a `>>`/`>=` token in type-argument context, but
-    # ritz1's parser is generated from grammars/ritz1.grammar and has no such
-    # rule, so any function whose body or signature mentions `Vec<Vec<i64>>`
-    # fails to parse under ritz1. As of AGAST #1301 that failure is at least
-    # loud: ritz1 reports `file:line:col: cannot parse item ...` and exits
-    # non-zero instead of silently dropping the function and emitting a module
-    # without it (which used to surface as an undefined symbol at link time).
-    # That is a pre-existing ritz1 gap, not a regression from #1299. Add this entry once
-    # ritz1 gains `>>` splitting; until then the case is covered by
-    # `ritz0.py --test` and the parser unit tests
-    # (test_parser.py::TestNestedGenericClose). Same precedent as #1282.
+    "test_issue_nested_generic_close",
+    # NOTE: test_issue_nested_generic_close_pair (AGAST #1300, the
+    # `Pair<i64, Vec<i64>> { ... }` struct-literal case split out of the file
+    # above) is deliberately NOT listed here yet. ritz1 parses it but
+    # monomorphises generic structs on their first type argument only, so a
+    # two-parameter struct emits an undefined `%B$i64` field type. That gap
+    # predates #1300 (`Pair<i64, i32>` fails the same way). Add this entry once
+    # AGAST #1574 lands; until then ritz0 covers it via `ritz0.py --test` and
+    # ritz0/test_ritz1_nested_generic_close.py checks that ritz1 parses it.
     "test_issue_newtype_int_arg",
     "test_issue_newtype_struct_deref",
     "test_issue_option_return",
