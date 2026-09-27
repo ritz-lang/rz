@@ -142,6 +142,97 @@ fn try_emit_len_builtin(s: *EmitterState, e: *Expr, type_name: *u8, type_name_le
     emit_str(s, c"\n")
     return len_val
 
+# A string literal passed to a `StrView` param, rebuilt as a %StrView value.
+# `reg` is emit_expr's result for `arg`. Returns the %StrView register, or -1
+# when `arg` is not a literal (the caller passes the value through).
+fn emit_strview_from_lit(s: *EmitterState, arg: *Expr, reg: i32) -> i32
+    if arg == null
+        return -1
+    var p: i32 = 0 - 1
+    var l: i32 = 0 - 1
+    if arg.kind == EXPR_STRING_LIT
+        # Bare "..." already produced a %Span$u8 aggregate. Span<u8> and
+        # StrView are layout-compatible but nominally distinct in LLVM IR,
+        # so rebuild the aggregate under the StrView name.
+        p = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, p)
+        emit_str(s, c" = extractvalue %Span$u8 ")
+        emit_reg(s, reg)
+        emit_str(s, c", 0\n")
+        l = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, l)
+        emit_str(s, c" = extractvalue %Span$u8 ")
+        emit_reg(s, reg)
+        emit_str(s, c", 1\n")
+    else if arg.kind == EXPR_CSTRING_LIT
+        # c"..." is a pointer (as i64); its length is known statically.
+        p = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, p)
+        emit_str(s, c" = inttoptr i64 ")
+        emit_reg(s, reg)
+        emit_str(s, c" to ptr\n")
+    else
+        return -1
+    let sv1: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, sv1)
+    emit_str(s, c" = insertvalue %StrView undef, ptr ")
+    emit_reg(s, p)
+    emit_str(s, c", 0\n")
+    let sv2: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, sv2)
+    emit_str(s, c" = insertvalue %StrView ")
+    emit_reg(s, sv1)
+    emit_str(s, c", i64 ")
+    if l >= 0
+        emit_reg(s, l)
+    else
+        emit_int(s, arg.string_len as i64)
+    emit_str(s, c", 1\n")
+    return sv2
+
+# The impl method `type_name.method` defined in this module, or null.
+fn find_impl_method(s: *EmitterState, type_name: *u8, type_name_len: i32, method: *u8, method_len: i32) -> *FnDef
+    var ib: *ImplBlock = s.module.impls
+    while ib != null
+        if name_eq(ib.type_name, ib.type_name_len, type_name, type_name_len) == 1
+            var mm: *FnDef = ib.methods
+            while mm != null
+                if name_eq(mm.name, mm.name_len, method, method_len) == 1
+                    return mm
+                mm = mm.next
+        ib = ib.next
+    return null
+
+# One row of the non-generic UFCS table: `pfx` when nothing matched yet and
+# the receiver type is `ty`, else the earlier result unchanged.
+fn ufcs_row(found: *u8, type_name: *u8, type_name_len: i32, ty: *u8, ty_len: i32, pfx: *u8, pfx_len: i32, out_len: *i32) -> *u8
+    if found != null
+        return found
+    if name_eq(type_name, type_name_len, ty, ty_len) == 0
+        return null
+    *out_len = pfx_len
+    return pfx
+
+# Free-function prefix for a method on a non-generic ritzlib type
+# (`s.push_str(x)` -> `string_push_str(@s, x)`), or null. NOT the lowercased
+# type name: Buffer -> buf_, ArgParser -> args_. Mirrors ritz0's
+# UFCS_NON_GENERIC_PREFIXES (emitter_llvmlite.py); test_ritz1_ufcs_prefix.py
+# asserts the two tables agree, so edit both. (AGAST #1368)
+fn ufcs_non_generic_prefix(type_name: *u8, type_name_len: i32, out_len: *i32) -> *u8
+    var p: *u8 = null
+    # BEGIN UFCS_NON_GENERIC_PREFIXES
+    p = ufcs_row(p, type_name, type_name_len, c"String", 6, c"string_", 7, out_len)
+    p = ufcs_row(p, type_name, type_name_len, c"GrowBuf", 7, c"growbuf_", 8, out_len)
+    p = ufcs_row(p, type_name, type_name_len, c"Buffer", 6, c"buf_", 4, out_len)
+    p = ufcs_row(p, type_name, type_name_len, c"ArgParser", 9, c"args_", 5, out_len)
+    # END UFCS_NON_GENERIC_PREFIXES
+    return p
+
 # UFCS fallback: when the receiver has a known container type, dispatch
 # `v.method(args)` to the monomorphized helper — `vec_method$T`, `span_method$T`,
 # or `strview_method`. The receiver is passed as a pointer (ptr), consistent
@@ -185,7 +276,18 @@ fn try_emit_ufcs_method(s: *EmitterState, e: *Expr, type_name: *u8, type_name_le
         prefix_len = 8
         append_suffix = 0
     else
-        return -1
+        # Non-generic ritzlib types. A user impl method of the same name
+        # wins, so the table can never shadow a real `impl String`.
+        var ng_len: i32 = 0
+        let ng: *u8 = ufcs_non_generic_prefix(type_name, type_name_len, @ng_len)
+        if ng == null
+            return -1
+        if find_impl_method(s, type_name, type_name_len, e.ident_ptr, e.ident_len) != null
+            return -1
+        for i in 0..ng_len
+            prefix_buf[i] = *(ng + i)
+        prefix_len = ng_len
+        append_suffix = 0
 
     # Build: <prefix><method>[<$T>]
     var mangled: [128]u8
@@ -310,7 +412,12 @@ fn try_emit_ufcs_method(s: *EmitterState, e: *Expr, type_name: *u8, type_name_le
                     let at: i32 = get_expr_type(s, arg_expr)
                     if at == TYPE_I8 or at == TYPE_U8 or at == TYPE_I16 or at == TYPE_U16 or at == TYPE_I32 or at == TYPE_U32 or at == TYPE_I64 or at == TYPE_U64
                         is_scalar_int = 1
-                if is_scalar_int == 0
+                var sv_lit: i32 = 0 - 1
+                if name_eq(param_ptr.param_type_name, param_ptr.param_type_name_len, c"StrView", 7) == 1
+                    sv_lit = emit_strview_from_lit(s, arg_expr, arg_regs[j])
+                if sv_lit >= 0
+                    converted_regs[j] = sv_lit
+                else if is_scalar_int == 0
                     converted_regs[j] = arg_regs[j]
                 else if name_eq(param_ptr.param_type_name, param_ptr.param_type_name_len, c"u16", 3) == 1 or name_eq(param_ptr.param_type_name, param_ptr.param_type_name_len, c"i16", 3) == 1
                     # Post-monomorph primitive (vec_push_u16_method parity):
@@ -1911,63 +2018,9 @@ fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
                     while k < j and arg_expr != null
                         arg_expr = arg_expr.next
                         k = k + 1
-                    if arg_expr != null and arg_expr.kind == EXPR_STRING_LIT
-                        # Bare "..." already produced a %Span$u8 aggregate in
-                        # arg_regs[j]. Span<u8> and StrView are layout-
-                        # compatible but nominally distinct in LLVM IR, so
-                        # rebuild the aggregate under the StrView name rather
-                        # than try to bitcast.
-                        let p: i32 = next_reg(s)
-                        emit_str(s, c"  ")
-                        emit_reg(s, p)
-                        emit_str(s, c" = extractvalue %Span$u8 ")
-                        emit_reg(s, arg_regs[j])
-                        emit_str(s, c", 0\n")
-                        let l: i32 = next_reg(s)
-                        emit_str(s, c"  ")
-                        emit_reg(s, l)
-                        emit_str(s, c" = extractvalue %Span$u8 ")
-                        emit_reg(s, arg_regs[j])
-                        emit_str(s, c", 1\n")
-                        let sv1: i32 = next_reg(s)
-                        emit_str(s, c"  ")
-                        emit_reg(s, sv1)
-                        emit_str(s, c" = insertvalue %StrView undef, ptr ")
-                        emit_reg(s, p)
-                        emit_str(s, c", 0\n")
-                        let sv2: i32 = next_reg(s)
-                        emit_str(s, c"  ")
-                        emit_reg(s, sv2)
-                        emit_str(s, c" = insertvalue %StrView ")
-                        emit_reg(s, sv1)
-                        emit_str(s, c", i64 ")
-                        emit_reg(s, l)
-                        emit_str(s, c", 1\n")
-                        converted_regs[j] = sv2
-                    else if arg_expr != null and arg_expr.kind == EXPR_CSTRING_LIT
-                        # c"..." literal being passed to StrView param.
-                        # arg_regs[j] is the pointer (as i64) — build %StrView { ptr, len }
-                        let inttoptr_reg: i32 = next_reg(s)
-                        emit_str(s, c"  ")
-                        emit_reg(s, inttoptr_reg)
-                        emit_str(s, c" = inttoptr i64 ")
-                        emit_reg(s, arg_regs[j])
-                        emit_str(s, c" to ptr\n")
-                        let sv1: i32 = next_reg(s)
-                        emit_str(s, c"  ")
-                        emit_reg(s, sv1)
-                        emit_str(s, c" = insertvalue %StrView undef, ptr ")
-                        emit_reg(s, inttoptr_reg)
-                        emit_str(s, c", 0\n")
-                        let sv2: i32 = next_reg(s)
-                        emit_str(s, c"  ")
-                        emit_reg(s, sv2)
-                        emit_str(s, c" = insertvalue %StrView ")
-                        emit_reg(s, sv1)
-                        emit_str(s, c", i64 ")
-                        emit_int(s, arg_expr.string_len as i64)
-                        emit_str(s, c", 1\n")
-                        converted_regs[j] = sv2
+                    let sv_lit: i32 = emit_strview_from_lit(s, arg_expr, arg_regs[j])
+                    if sv_lit >= 0
+                        converted_regs[j] = sv_lit
                     else
                         converted_regs[j] = arg_regs[j]
                 else
