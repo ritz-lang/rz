@@ -3074,76 +3074,39 @@ fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                 emit_str(s, c" to ptr\n")
                 emit_index_assign_ptr_store(s, stmt, gbase_ptr, glob.var_type, glob.pointee_type)
     else if stmt.kind == STMT_MEMBER_ASSIGN
-        # ptr_expr.field = value
-        # stmt.if_cond = ptr expression (the thing being dereferenced)
-        # stmt.assign_target = field name
-        # stmt.assign_target_len = field name length
-        # stmt.assign_value = value expression
-        # First, emit the pointer expression
-        let ptr_reg: i32 = emit_expr(s, stmt.if_cond)
-        # Convert i64 to ptr
-        let ptr: i32 = next_reg(s)
-        emit_str(s, c"  ")
-        emit_reg(s, ptr)
-        emit_str(s, c" = inttoptr i64 ")
-        emit_reg(s, ptr_reg)
-        emit_str(s, c" to ptr\n")
-        # Need to determine the struct type from the pointer expression
-        # For now, try to infer from the identifier if it's a simple identifier
-        if stmt.if_cond.kind == EXPR_IDENT
-            let loc: *LocalVar = find_local_struct_name(s, stmt.if_cond.ident_ptr, stmt.if_cond.ident_len)
-            if loc != null
-                if loc.var_type == TYPE_PTR
-                    # Look up the pointed-to struct type
-                    let st: *StructDef = find_struct(s, loc.type_name, loc.type_name_len)
-                    if st != null
-                        let field_idx: i32 = find_field_index(st, stmt.assign_target, stmt.assign_target_len)
-                        if field_idx >= 0
-                            let field: *StructField = get_field_type(st, field_idx)
-                            # GEP to the field
-                            let field_ptr: i32 = next_reg(s)
-                            emit_str(s, c"  ")
-                            emit_reg(s, field_ptr)
-                            emit_str(s, c" = getelementptr %")
-                            emit_name(s, st.name, st.name_len)
-                            emit_str(s, c", ptr ")
-                            emit_reg(s, ptr)
-                            emit_str(s, c", i32 0, i32 ")
-                            emit_int(s, field_idx as i64)
-                            emit_str(s, c"\n")
-                            # Emit the value
-                            let val_reg: i32 = emit_expr(s, stmt.assign_value)
-                            # Store the value based on field type
-                            if field.field_type == TYPE_I32
-                                let trunc: i32 = next_reg(s)
-                                emit_str(s, c"  ")
-                                emit_reg(s, trunc)
-                                emit_str(s, c" = trunc i64 ")
-                                emit_reg(s, val_reg)
-                                emit_str(s, c" to i32\n")
-                                emit_str(s, c"  store i32 ")
-                                emit_reg(s, trunc)
-                                emit_str(s, c", ptr ")
-                                emit_reg(s, field_ptr)
-                                emit_str(s, c"\n")
-                            else if field.field_type == TYPE_PTR or field.field_type == TYPE_PTR_PTR
-                                let ptr_val: i32 = next_reg(s)
-                                emit_str(s, c"  ")
-                                emit_reg(s, ptr_val)
-                                emit_str(s, c" = inttoptr i64 ")
-                                emit_reg(s, val_reg)
-                                emit_str(s, c" to ptr\n")
-                                emit_str(s, c"  store ptr ")
-                                emit_reg(s, ptr_val)
-                                emit_str(s, c", ptr ")
-                                emit_reg(s, field_ptr)
-                                emit_str(s, c"\n")
-                            else
-                                emit_str(s, c"  store i64 ")
-                                emit_reg(s, val_reg)
-                                emit_str(s, c", ptr ")
-                                emit_reg(s, field_ptr)
-                                emit_str(s, c"\n")
+        # `(*X).field = value` (and the desugared `(*X).field op= value`):
+        # stmt.if_cond = X, stmt.assign_target = field name,
+        # stmt.assign_value = value expression.
+        #
+        # AGAST #1510: lower as an expression assignment to the member
+        # `(*X).field`, so emit_assign resolves it through emit_member_ptr
+        # like every other field store.  The old inline lowering only knew a
+        # bare-identifier X; for `(**pp).n = v` or `(*(*b).ops).n = v` it
+        # evaluated X and then emitted NO store and no error -- the write was
+        # silently dropped.  An unresolvable X now fails loudly in
+        # emit_assign ("unhandled EXPR_MEMBER in assignment").
+        var mdr: Expr
+        mdr.kind = EXPR_UNARY
+        mdr.span = stmt.span
+        mdr.op = OP_DEREF
+        mdr.operand = stmt.if_cond
+        mdr.next = null
+        var mmem: Expr
+        mmem.kind = EXPR_MEMBER
+        mmem.span = stmt.span
+        mmem.left = @mdr
+        mmem.ident_ptr = stmt.assign_target
+        mmem.ident_len = stmt.assign_target_len
+        mmem.next = null
+        var mst: Stmt
+        mst.kind = STMT_ASSIGN
+        mst.span = stmt.span
+        mst.if_cond = @mmem
+        mst.assign_target = null
+        mst.assign_target_len = 0
+        mst.assign_value = stmt.assign_value
+        mst.next = null
+        emit_assign(s, @mst)
     else
         emit_str(s, c"  ; TODO: statement kind ")
         emit_int(s, stmt.kind as i64)

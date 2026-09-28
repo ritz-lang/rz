@@ -124,6 +124,75 @@ fn emit_vec_elem_member_ptr(s: *EmitterState, e: *Expr, result: *MemberPtrResult
     emit_member_gep_from_ptr(s, result, elem_ptr, elem_st, field_idx, field)
     return 1
 
+# AGAST #1510: the VALUE of `x`, where x is a pointer to a struct through
+# one or more levels of indirection.  Sets *out_st to that struct and
+# *out_levels to the number of pointer levels: 1 = `*St`, 2 = `**St`.
+# Returns the register holding the loaded pointer, or 0 if the shape or
+# static type isn't recognised.
+#
+# Recursive over the shapes a deref operand takes in practice:
+#   IDENT          local `*St` / `@St` / `@&St` (1) or `**St` (2)
+#   EXPR_MEMBER    a field of type `*St` (1) or `**St` (2), via emit_member_ptr
+#   `*y`           y at levels L >= 2, loaded once more (L - 1)
+# So `(*(*b).ops).n`, `(*b.ops).n` and `(**pp).n` all resolve here.
+#
+# The IDENT arm checks the struct before emitting anything.  The member arm
+# may leave dead loads behind when it gives up; the caller reports the
+# error, so they are never reached.
+fn emit_deref_operand_ptr(s: *EmitterState, x: *Expr, out_st: **StructDef, out_levels: *i32) -> i32
+    *out_st = null
+    *out_levels = 0
+    if x == null
+        return 0
+    if x.kind == EXPR_IDENT
+        let loc: *LocalVar = find_local_struct_name(s, x.ident_ptr, x.ident_len)
+        if loc == null or loc.type_name_len <= 0
+            return 0
+        var levels: i32 = 0
+        if loc.var_type == TYPE_PTR or loc.var_type == TYPE_REF or loc.var_type == TYPE_MUT_REF
+            levels = 1
+        else if loc.var_type == TYPE_PTR_PTR
+            levels = 2
+        if levels == 0
+            return 0
+        let st: *StructDef = find_struct(s, loc.type_name, loc.type_name_len)
+        if st == null
+            return 0
+        *out_st = st
+        *out_levels = levels
+        return emit_load_ptr(s, loc.reg)
+    if x.kind == EXPR_MEMBER
+        var inner: MemberPtrResult
+        emit_member_ptr(s, x, @inner)
+        if inner.success != 1
+            return 0
+        let f: *StructField = inner.field
+        if f.field_type_name_len <= 0
+            return 0
+        var flevels: i32 = 0
+        if f.field_type == TYPE_PTR
+            flevels = 1
+        else if f.field_type == TYPE_PTR_PTR
+            flevels = 2
+        if flevels == 0
+            return 0
+        let fst: *StructDef = find_struct(s, f.field_type_name, f.field_type_name_len)
+        if fst == null
+            return 0
+        *out_st = fst
+        *out_levels = flevels
+        return emit_load_ptr(s, inner.reg)
+    if x.kind == EXPR_UNARY and x.op == OP_DEREF
+        var sub_st: *StructDef = null
+        var sub_levels: i32 = 0
+        let sub_reg: i32 = emit_deref_operand_ptr(s, x.operand, @sub_st, @sub_levels)
+        if sub_reg == 0 or sub_levels < 2
+            return 0
+        *out_st = sub_st
+        *out_levels = sub_levels - 1
+        return emit_load_ptr(s, sub_reg)
+    return 0
+
 fn emit_member_ptr(s: *EmitterState, e: *Expr, result: *MemberPtrResult)
     result.reg = 0
     result.field = null
@@ -236,6 +305,19 @@ fn emit_member_ptr(s: *EmitterState, e: *Expr, result: *MemberPtrResult)
                                 let base_ptr: i32 = emit_load_ptr(s, loc.reg)
                                 emit_member_gep_from_ptr(s, result, base_ptr, st, field_idx, field)
                                 return
+            # AGAST #1510: the operand is itself a field or a deref —
+            # `(*(*b).ops).n`, `(*b.ops).n`, `(**pp).n`.  Resolve its
+            # pointee struct recursively, then GEP on it.
+            else
+                var d_st: *StructDef = null
+                var d_levels: i32 = 0
+                let d_base: i32 = emit_deref_operand_ptr(s, e.left.operand, @d_st, @d_levels)
+                if d_base != 0 and d_levels == 1
+                    let d_idx: i32 = find_field_index(d_st, e.ident_ptr, e.ident_len)
+                    if d_idx >= 0
+                        let d_field: *StructField = get_field_type(d_st, d_idx)
+                        emit_member_gep_from_ptr(s, result, d_base, d_st, d_idx, d_field)
+                        return
         # AGAST #175: address-of wrapper, e.g. `(@srv.pool).active_count` —
         # the outer @ is a no-op for member access (the inner expression
         # already yields a pointer-to-struct under the unified value model).
