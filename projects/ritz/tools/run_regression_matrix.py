@@ -131,14 +131,7 @@ TESTS = [
     "test_issue_namespace_const_field",
     "test_issue_narrow_field_assign",
     "test_issue_nested_generic_close",
-    # NOTE: test_issue_nested_generic_close_pair (AGAST #1300, the
-    # `Pair<i64, Vec<i64>> { ... }` struct-literal case split out of the file
-    # above) is deliberately NOT listed here yet. ritz1 parses it but
-    # monomorphises generic structs on their first type argument only, so a
-    # two-parameter struct emits an undefined `%B$i64` field type. That gap
-    # predates #1300 (`Pair<i64, i32>` fails the same way). Add this entry once
-    # AGAST #1574 lands; until then ritz0 covers it via `ritz0.py --test` and
-    # ritz0/test_ritz1_nested_generic_close.py checks that ritz1 parses it.
+    "test_issue_nested_generic_close_pair",
     "test_issue_newtype_int_arg",
     "test_issue_newtype_struct_deref",
     "test_issue_option_return",

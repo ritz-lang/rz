@@ -14,14 +14,16 @@ cannot reach every shape:
 * runnable programs, ritz0 as the oracle: 2-, 3- and 4-deep nests, a
   `>>`-closed generic call type argument, and the right-shift / comparison
   expressions that must NOT become generics.
-* parse-only shapes whose codegen ritz1 does not support yet
-  (multi-parameter generic structs, AGAST #1574): `HashMap<String,
-  Vec<Connection>>` fields, `Pair<i64, Vec<i64>> { ... }` literals and `>>` in
-  impl headers. These assert that ritz1 accepts the source and, where it
-  matters, mangles on the FIRST type argument.
+* multi-parameter generic structs (AGAST #1574): `HashMap<Key,
+  Vec<Connection>>` fields, `Pair<i64, Vec<i64>> { ... }` literals, `>>` in
+  impl headers, and plain `Pair<i64, i32>`. ritz1 used to mangle and
+  substitute on the FIRST type argument only (`%Pair$i64 = type {i64,
+  %B$i64}`); it now mangles on every argument (`Pair$i64$i32`) and
+  substitutes every parameter.
 """
 
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -325,7 +327,7 @@ def test_ritz1_generic_call_suffix_is_nested_type(ritz1_bin, tmp_path):
     assert "@make$Box$i64(" in ir, ir[:3000]
 
 
-# --- parse-only: ritz1 codegen for multi-parameter generics is #1574 --------
+# --- multi-parameter generic structs (AGAST #1574) -------------------------
 
 PAIR = """\
 struct Pair<A, B>
@@ -334,11 +336,81 @@ struct Pair<A, B>
 
 """
 
-PARSE_ONLY = {
-    # The tempest shape (#1299): a nested generic LAST in a multi-arg list.
+MULTI_ARG = {
+    # The ticket's shape: the second parameter used to stay `%B$i64`.
+    "pair_prims": PAIR
+    + """\
+pub fn main() -> i32
+    var p: Pair<i64, i32>
+    p.first = 3
+    p.second = 4
+    return (p.first + p.second as i64) as i32
+""",
+    # Two instantiations sharing the FIRST argument must stay two types:
+    # mangling on the first argument alone collapsed both into Pair$i64.
+    "pair_same_first_arg": PAIR
+    + """\
+pub fn main() -> i32
+    var a: Pair<i64, i8>
+    a.first = 1
+    a.second = 2
+    var b: Pair<i64, i64>
+    b.first = 0
+    b.second = 4294967300
+    return (a.first + a.second as i64 + b.second - 4294967296) as i32
+""",
+    # Parameters in the other order, and three of them.
+    "triple_reordered": """\
+struct Triple<A, B, C>
+    c: C
+    a: A
+    b: B
+
+pub fn main() -> i32
+    var t: Triple<i8, i32, i64>
+    t.a = 1
+    t.b = 2
+    t.c = 4
+    return (t.a as i64 + t.b as i64 + t.c) as i32
+""",
+    # A field typed by a generic OVER a parameter: `b: Box<B>` is `Box$B` in
+    # the template and must become `Box$i32`, not `Box$B$i64$i32`.
+    "field_generic_over_param": BOX
+    + """\
+struct Wrap<A, B>
+    a: A
+    b: Box<B>
+
+pub fn main() -> i32
+    var inner: Box<i32>
+    inner.v = 4
+    var w: Wrap<i64, i32>
+    w.a = 3
+    w.b = inner
+    let o: Box<i32> = w.b
+    return (w.a + o.v as i64) as i32
+""",
+    # A generic ENUM argument: `Option$i64` owns the `$i64` after it, so the
+    # suffix `$Option$i64$i32` splits into two arguments, not three.  (Only
+    # `second` is touched: storing `Some(..)` into a struct field is a
+    # separate ritz1 gap, as is defining `%Option$i64` when only a struct
+    # field names it — hence the `none` local.)
+    "option_arg": PAIR
+    + """\
+pub fn main() -> i32
+    let none: Option<i64> = None
+    var p: Pair<Option<i64>, i32>
+    p.second = 7
+    return p.second
+""",
+    # The tempest shape (#1299): a nested generic LAST in a multi-arg list,
+    # as a struct field and as a local.
     "multi_arg_field": """\
 struct Connection
     id: i64
+
+struct Key
+    k: i64
 
 struct HashMap<K, V>
     key: K
@@ -348,19 +420,33 @@ struct Vec<T>
     item: T
 
 struct Network
-    connections: HashMap<String, Vec<Connection>>
+    connections: HashMap<Key, Vec<Connection>>
 
 pub fn main() -> i32
-    0
+    var c: Connection
+    c.id = 7
+    var v: Vec<Connection>
+    v.item = c
+    var n: Network
+    n.connections.value = v
+    let hm: HashMap<Key, Vec<Connection>> = n.connections
+    let v2: Vec<Connection> = hm.value
+    let c2: Connection = v2.item
+    return c2.id as i32
 """,
     "multi_arg_struct_lit": PAIR
     + BOX
     + """\
 pub fn main() -> i32
     var inner: Box<i64>
-    let p: Pair<i64, Box<i64>> = Pair<i64, Box<i64>> { first: 7, second: inner }
-    return p.first as i32
+    inner.v = 4
+    let p: Pair<i64, Box<i64>> = Pair<i64, Box<i64>> { first: 3, second: inner }
+    let b: Box<i64> = p.second
+    return (p.first + b.v) as i32
 """,
+    # `>>` in an impl header. The method is compiled but not called: neither
+    # compiler dispatches `b2.seven()` to an impl on a concrete instantiation
+    # (ritz0: "No method 'seven' found for type 'Box$Box_i64'").
     "impl_header": BOX
     + """\
 impl Box<Box<i64>>
@@ -368,32 +454,46 @@ impl Box<Box<i64>>
         return 7
 
 pub fn main() -> i32
-    0
+    var b1: Box<i64>
+    b1.v = 7
+    var b2: Box<Box<i64>>
+    b2.v = b1
+    let o1: Box<i64> = b2.v
+    return o1.v as i32
 """,
 }
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(PARSE_ONLY))
-def test_ritz0_accepts_parse_only_shapes(tmp_path, name):
-    """ritz0 (#1299) accepts every shape ritz1 is asked to parse."""
-    _compiled_ir("ritz0", tmp_path, name, PARSE_ONLY[name])
+@pytest.mark.parametrize("name", sorted(MULTI_ARG))
+def test_ritz0_is_the_oracle_multi_arg(tmp_path, name):
+    """The reference answer for the multi-parameter shapes."""
+    assert _run("ritz0", tmp_path, name, MULTI_ARG[name]) == EXPECTED
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(PARSE_ONLY))
-def test_ritz1_parses_multi_arg_nested_close(ritz1_bin, tmp_path, name):
-    """AGAST #1300. ritz1 accepts the source (codegen for these is #1574)."""
-    _compiled_ir("ritz1", tmp_path, name, PARSE_ONLY[name])
+@pytest.mark.parametrize("name", sorted(MULTI_ARG))
+def test_ritz1_runs_multi_arg_generic_struct(ritz1_bin, tmp_path, name):
+    """AGAST #1574. Before the fix: `use of undefined type named 'B$i64'`."""
+    assert _run("ritz1", tmp_path, name, MULTI_ARG[name]) == EXPECTED
 
 
 @pytest.mark.integration
-def test_ritz1_multi_arg_mangles_on_first_arg(ritz1_bin, tmp_path):
-    """`HashMap<String, Vec<Connection>>` mangles as HashMap$String.
+def test_ritz1_pair_substitutes_every_param(ritz1_bin, tmp_path):
+    """`Pair<i64, i32>` is `%Pair$i64$i32 = type {i64, i32}`: no `$B`."""
+    ir = _compiled_ir("ritz1", tmp_path, "pair_ir", MULTI_ARG["pair_prims"])
+    assert re.search(r"%Pair\$i64\$i32 = type \{\s*i64,\s*i32\s*\}", ir), ir[:3000]
+    assert "$B" not in ir, ir[:3000]
 
-    The first argument used to live in one global save slot that the tail's
-    own generic (`Vec<Connection>`) overwrote, giving HashMap$Connection.
+
+@pytest.mark.integration
+def test_ritz1_multi_arg_mangles_on_every_arg(ritz1_bin, tmp_path):
+    """`HashMap<Key, Vec<Connection>>` mangles as HashMap$Key$Vec$Connection.
+
+    Not HashMap$Key (first argument only, #1574), and not HashMap$Connection
+    (the tail's own generic clobbering a single global save slot, #1300).
     """
-    ir = _compiled_ir("ritz1", tmp_path, "mangle", PARSE_ONLY["multi_arg_field"])
-    assert "HashMap$String" in ir, ir[:3000]
+    ir = _compiled_ir("ritz1", tmp_path, "mangle", MULTI_ARG["multi_arg_field"])
+    assert "%HashMap$Key$Vec$Connection = type" in ir, ir[:3000]
     assert "HashMap$Connection" not in ir, ir[:3000]
+    assert not re.search(r"HashMap\$Key\b(?!\$)", ir), ir[:3000]

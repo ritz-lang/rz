@@ -364,6 +364,16 @@ fn add_struct_from_mangled_name(m: *Module, name: *u8, len: i32)
     let suffix: *u8 = name + dollar_pos
     let suffix_len: i32 = len - dollar_pos
 
+    # AGAST #1574: a multi-parameter template needs exactly one argument per
+    # parameter.  (Unlike `Vec$T` below, no placeholder check: nothing
+    # registers a `Pair$T$i64` today — see AGAST #1582.)
+    if count_type_params(template.type_params) >= 2
+        let starts: *i32 = malloc(4 * MAX_GENERIC_ARGS as i64) as *i32
+        let lens: *i32 = malloc(4 * MAX_GENERIC_ARGS as i64) as *i32
+        if split_mangled_args(m, suffix, suffix_len, starts, lens) == count_type_params(template.type_params)
+            add_struct_instantiation(base_name, base_len, suffix, suffix_len)
+        return
+
     # `Vec$T`: the unsubstituted placeholder of a generic signature, not an
     # instantiation.  A lone ASCII capital after `$` is a type parameter —
     # unless the module defines a concrete struct by that name: `Vec<P>` for
@@ -375,6 +385,135 @@ fn add_struct_from_mangled_name(m: *Module, name: *u8, len: i32)
                 return
 
     add_struct_instantiation(base_name, base_len, suffix, suffix_len)
+
+# ----------------------------------------------------------------------------
+# Multi-parameter generic structs (AGAST #1574)
+# ----------------------------------------------------------------------------
+# The parser mangles EVERY type argument, `$`-separated: `Pair<i64, i32>` is
+# `Pair$i64$i32` and `Pair<i64, Box<i64>>` is `Pair$i64$Box$i64`.  Nested
+# generics share the separator, so splitting a suffix into its arguments
+# needs each component's arity: `Box` (one parameter) owns the `$i64` after
+# it.  Single-parameter templates never split — their whole suffix is the
+# one argument, exactly as before #1574.
+
+const MAX_GENERIC_ARGS: i32 = 8
+
+fn count_type_params(tp: *TypeParam) -> i32
+    var n: i32 = 0
+    var cur: *TypeParam = tp
+    while cur != null
+        n = n + 1
+        cur = cur.next
+    n
+
+# Arity of the generic type named by one `$`-component of a mangled name: a
+# generic struct template's parameter count, or Result/Option's (ritz1 keeps
+# no enum definitions, but their mangled names nest like structs).  0 for a
+# primitive or a concrete struct: a leaf.
+fn mangled_component_arity(m: *Module, name: *u8, len: i32) -> i32
+    let t: *StructDef = find_generic_struct(m, name, len)
+    if t != null
+        return count_type_params(t.type_params)
+    if len == 6 and memcmp(name, c"Result", 6) == 0
+        return 2
+    if len == 6 and memcmp(name, c"Option", 6) == 0
+        return 1
+    0
+
+# End (exclusive) of the mangled type argument that starts at s[pos]: its
+# first component plus, if that names a generic, one nested argument per
+# parameter.  Stops early at the end of a truncated name.
+fn mangled_arg_end(m: *Module, s: *u8, len: i32, pos: i32) -> i32
+    var end: i32 = pos
+    while end < len and *(s + end) != 36   # '$'
+        end = end + 1
+    let arity: i32 = mangled_component_arity(m, s + pos, end - pos)
+    for k in 0..arity
+        if end >= len
+            return end
+        end = mangled_arg_end(m, s, len, end + 1)
+    end
+
+# Split a suffix "$a1$a2..." into its top-level arguments.  Each
+# (suffix + starts[i], lens[i]) is itself a one-argument suffix "$ai", the
+# form parse_type_from_suffix / get_type_name_from_suffix take.  Returns the
+# argument count, or -1 for a malformed suffix or more than MAX_GENERIC_ARGS.
+fn split_mangled_args(m: *Module, suffix: *u8, suffix_len: i32, starts: *i32, lens: *i32) -> i32
+    var n: i32 = 0
+    var pos: i32 = 0
+    while pos < suffix_len
+        if *(suffix + pos) != 36   # '$'
+            return -1
+        if n >= MAX_GENERIC_ARGS
+            return -1
+        let end: i32 = mangled_arg_end(m, suffix, suffix_len, pos + 1)
+        *(starts + n) = pos
+        *(lens + n) = end - pos
+        n = n + 1
+        pos = end
+    n
+
+# Index of the type parameter named (name, len), or -1.
+fn type_param_index(tp: *TypeParam, name: *u8, len: i32) -> i32
+    var i: i32 = 0
+    var cur: *TypeParam = tp
+    while cur != null
+        if cur.name_len == len and memcmp(cur.name, name, len as i64) == 0
+            return i
+        i = i + 1
+        cur = cur.next
+    -1
+
+# Rewrite a mangled name, replacing every `$`-component that is a type
+# parameter with its argument: `Box$B` at <A=i64, B=i32> is `Box$i32`.
+# Returns `name` itself when no component is a parameter.
+fn substitute_params_in_mangled(tp: *TypeParam, suffix: *u8, starts: *i32, lens: *i32, name: *u8, len: i32, out_len: *i32) -> *u8
+    # Pass 1: the rewritten length (0 extra when nothing matches).
+    var total: i32 = 0
+    var hit: i32 = 0
+    var pos: i32 = 0
+    while pos <= len
+        var end: i32 = pos
+        while end < len and *(name + end) != 36
+            end = end + 1
+        let idx: i32 = type_param_index(tp, name + pos, end - pos)
+        if idx >= 0
+            hit = 1
+            total = total + *(lens + idx) - 1
+        else
+            total = total + end - pos
+        if end < len
+            total = total + 1
+        pos = end + 1
+    if hit == 0
+        *out_len = len
+        return name
+    # Pass 2: build it.
+    let out: *u8 = malloc(total as i64 + 1) as *u8
+    var o: i32 = 0
+    pos = 0
+    while pos <= len
+        var end: i32 = pos
+        while end < len and *(name + end) != 36
+            end = end + 1
+        let idx: i32 = type_param_index(tp, name + pos, end - pos)
+        if idx >= 0
+            let a: *u8 = suffix + *(starts + idx) + 1
+            let a_len: i32 = *(lens + idx) - 1
+            for j in 0..a_len
+                *(out + o) = *(a + j)
+                o = o + 1
+        else
+            for j in pos..end
+                *(out + o) = *(name + j)
+                o = o + 1
+        if end < len
+            *(out + o) = 36
+            o = o + 1
+        pos = end + 1
+    *(out + o) = 0
+    *out_len = o
+    out
 
 # Find a non-generic struct by name.
 fn find_concrete_struct(m: *Module, name: *u8, name_len: i32) -> *StructDef
@@ -1283,6 +1422,20 @@ fn clone_and_specialize_struct(m: *Module, template: *StructDef, suffix: *u8, su
         *(mangled_name + template.name_len + j) = *(suffix + j)
     *(mangled_name + mangled_name_len) = 0
 
+    # AGAST #1574: substitute EVERY parameter of a multi-parameter template.
+    if count_type_params(template.type_params) >= 2
+        let starts: *i32 = malloc(4 * MAX_GENERIC_ARGS as i64) as *i32
+        let lens: *i32 = malloc(4 * MAX_GENERIC_ARGS as i64) as *i32
+        if split_mangled_args(m, suffix, suffix_len, starts, lens) != count_type_params(template.type_params)
+            return null
+        let multi: *StructDef = malloc(40) as *StructDef  # Size of StructDef
+        multi.name = mangled_name
+        multi.name_len = mangled_name_len
+        multi.fields = clone_struct_fields_multi(template.fields, template.type_params, suffix, starts, lens)
+        multi.type_params = null
+        multi.next = null
+        return multi
+
     # Get the type parameter name from template
     var type_param_name: *u8 = null
     var type_param_len: i32 = 0
@@ -1351,9 +1504,7 @@ fn clone_struct_fields(fields: *StructField, type_param: *u8, type_param_len: i3
         if fields.field_type_name != null and fields.field_type_name_len == type_param_len
             if memcmp(fields.field_type_name, type_param, type_param_len as i64) == 0
                 # Substitute with concrete type
-                cloned.field_type = subst_type
-                cloned.field_type_name = subst_name
-                cloned.field_type_name_len = subst_len
+                subst_value_field(cloned, subst_type, subst_name, subst_len)
             else
                 # Not the type param, but might be a generic struct - mangle it
                 cloned.field_type = fields.field_type
@@ -1382,23 +1533,83 @@ fn clone_struct_fields(fields: *StructField, type_param: *u8, type_param_len: i3
     if fields.field_type == TYPE_PTR or fields.field_type == TYPE_REF or fields.field_type == TYPE_MUT_REF
         if fields.field_type_name != null and fields.field_type_name_len == type_param_len
             if memcmp(fields.field_type_name, type_param, type_param_len as i64) == 0
-                let prim: i32 = primitive_type_from_name(subst_name, subst_len)
-                if prim != 0
-                    cloned.field_type_name = null
-                    cloned.field_type_name_len = 0
-                    cloned.array_elem_type = prim
-                else if subst_type == TYPE_PTR
-                    # `*T` at T = *X is `**X`: the element is a pointer.
-                    cloned.field_type = TYPE_PTR_PTR
-                    cloned.field_type_name = subst_name
-                    cloned.field_type_name_len = subst_len
-                else
-                    cloned.field_type_name = subst_name
-                    cloned.field_type_name_len = subst_len
+                subst_pointee_field(cloned, subst_type, subst_name, subst_len)
 
     # Clone rest of the list
     cloned.next = clone_struct_fields(fields.next, type_param, type_param_len, subst_type, subst_name, subst_len, suffix, suffix_len)
 
+    return cloned
+
+# A by-value field `x: T`, at T = the argument (subst_type, subst_name).
+fn subst_value_field(cloned: *StructField, subst_type: i32, subst_name: *u8, subst_len: i32)
+    cloned.field_type = subst_type
+    cloned.field_type_name = subst_name
+    cloned.field_type_name_len = subst_len
+
+# A `*T` / `@T` / `@&T` field at T = the argument.  The parser records a
+# struct pointee in field_type_name and a primitive one in array_elem_type.
+fn subst_pointee_field(cloned: *StructField, subst_type: i32, subst_name: *u8, subst_len: i32)
+    let prim: i32 = primitive_type_from_name(subst_name, subst_len)
+    if prim != 0
+        cloned.field_type_name = null
+        cloned.field_type_name_len = 0
+        cloned.array_elem_type = prim
+    else if subst_type == TYPE_PTR
+        # `*T` at T = *X is `**X`: the element is a pointer.
+        cloned.field_type = TYPE_PTR_PTR
+        cloned.field_type_name = subst_name
+        cloned.field_type_name_len = subst_len
+    else
+        cloned.field_type_name = subst_name
+        cloned.field_type_name_len = subst_len
+
+# AGAST #1574: clone a multi-parameter template's fields, substituting every
+# parameter.  A field typed by a parameter takes that parameter's argument; a
+# field typed by a generic over the parameters (`Box$B`) has them rewritten
+# in its mangled name; any other type is copied as-is.  (The single-parameter
+# path appends the suffix to every non-parameter struct name instead, which
+# here would name `%B$i64`-style types.)
+fn clone_struct_fields_multi(fields: *StructField, tp: *TypeParam, suffix: *u8, starts: *i32, lens: *i32) -> *StructField
+    if fields == null
+        return null
+
+    let cloned: *StructField = malloc(72) as *StructField  # Size of StructField
+    cloned.name = fields.name
+    cloned.name_len = fields.name_len
+    cloned.field_type = fields.field_type
+    cloned.field_type_name = fields.field_type_name
+    cloned.field_type_name_len = fields.field_type_name_len
+    cloned.array_size = fields.array_size
+    cloned.array_elem_type = fields.array_elem_type
+    cloned.array_elem_type_name = fields.array_elem_type_name
+    cloned.array_elem_type_name_len = fields.array_elem_type_name_len
+
+    let ft: i32 = fields.field_type
+    var by_value: i32 = 0
+    if ft == TYPE_STRUCT
+        by_value = 1
+    var by_ptr: i32 = 0
+    if ft == TYPE_PTR or ft == TYPE_REF or ft == TYPE_MUT_REF
+        by_ptr = 1
+    if (by_value == 1 or by_ptr == 1) and fields.field_type_name != null
+        let idx: i32 = type_param_index(tp, fields.field_type_name, fields.field_type_name_len)
+        if idx >= 0
+            let arg: *u8 = suffix + *(starts + idx)
+            let arg_len: i32 = *(lens + idx)
+            var subst_name: *u8 = null
+            var subst_len: i32 = 0
+            get_type_name_from_suffix(arg, arg_len, @subst_name, @subst_len)
+            let subst_type: i32 = parse_type_from_suffix(arg, arg_len)
+            if by_value == 1
+                subst_value_field(cloned, subst_type, subst_name, subst_len)
+            else
+                subst_pointee_field(cloned, subst_type, subst_name, subst_len)
+        else
+            var new_len: i32 = 0
+            cloned.field_type_name = substitute_params_in_mangled(tp, suffix, starts, lens, fields.field_type_name, fields.field_type_name_len, @new_len)
+            cloned.field_type_name_len = new_len
+
+    cloned.next = clone_struct_fields_multi(fields.next, tp, suffix, starts, lens)
     return cloned
 
 # ============================================================================

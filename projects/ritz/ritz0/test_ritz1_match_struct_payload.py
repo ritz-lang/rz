@@ -138,6 +138,28 @@ pub fn main() -> i32
         Err(e) => e
 """
 
+# AGAST #1574: `Result<Box<i64>, i32>` mangles as `Result$Box$i64$i32`, so the
+# Ok payload is the shortest `$`-prefix naming a concrete struct: `Box$i64`.
+# The whole suffix (`Box$i64$i32`) or its first component (`Box`, the
+# generic template) would bind `b` as a scalar.
+RESULT_NESTED_GENERIC = """\
+import ritzlib.result
+
+struct Box<T>
+    v: T
+
+fn mk(x: i64) -> Result<Box<i64>, i32>
+    var b: Box<i64>
+    b.v = x
+    return Ok(b)
+
+pub fn main() -> i32
+    let r: Result<Box<i64>, i32> = mk(40)
+    match r
+        Ok(b) => (b.v + 2) as i32
+        Err(e) => e
+"""
+
 CASES = {
     "option_member": (OPTION_MEMBER, 0),
     "option_to_fn": (OPTION_TO_FN, 43),
@@ -148,6 +170,7 @@ CASES = {
 PKG_CASES = {
     "result_string": (RESULT_STRING, 3),
     "result_string_err": (RESULT_STRING_ERR, 9),
+    "result_nested_generic": (RESULT_NESTED_GENERIC, 42),
 }
 
 

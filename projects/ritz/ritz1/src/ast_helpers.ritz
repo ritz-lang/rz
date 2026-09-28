@@ -1249,24 +1249,29 @@ pub fn type_mut_ref(p: *Parser, inner_type: i32) -> i32
     p.last_ref_inner_type = inner_type
     return TYPE_MUT_REF
 
-# Saved identity of a generic's FIRST type argument, captured BEFORE
-# type_arg_tail consumes additional args.  Without it, the mangling in
-# type_generic for `Result<Vec<u8>, StrView>` would read StrView as the
-# first-arg name (parsing the tail's StrView clobbered last_type_name).
+# Saved identity of ONE generic type argument, captured right after it
+# parses.  Without it, mangling `Result<Vec<u8>, StrView>` would read StrView
+# as the first argument's name (parsing a later arg clobbers last_type_name).
 #
 # AGAST #1300: this used to be a single global save slot, which a generic in
 # the TAIL overwrote before the outer type was mangled —
 # `HashMap<String, Vec<Connection>>` mangled as `HashMap$Connection`.  Each
 # capture now gets its own arena record, so nesting is reentrant.
+#
+# AGAST #1574: the records form the whole argument list (`next`), and EVERY
+# argument drives mangling: `Pair<i64, i32>` is `Pair$i64$i32`, not
+# `Pair$i64` (which left the second parameter unsubstituted and collided
+# with `Pair<i64, i64>`).
 struct GenericArg
     ty: i32
     name: *u8
     name_len: i32
+    next: *GenericArg
 
 # Called from grammar rules first_generic_type_arg / first_generic_type_arg_shr
 # right after the argument's type_spec parses, while last_type_name is fresh.
 pub fn capture_first_generic_arg(p: *Parser, ty: i32) -> *GenericArg
-    let ga: *GenericArg = parser_alloc(p, 24) as *GenericArg
+    let ga: *GenericArg = parser_alloc(p, 32) as *GenericArg
     ga.ty = ty
     if ty == TYPE_STRUCT
         ga.name = p.last_type_name
@@ -1274,20 +1279,79 @@ pub fn capture_first_generic_arg(p: *Parser, ty: i32) -> *GenericArg
     else
         ga.name = null
         ga.name_len = 0
+    ga.next = null
     return ga
 
+# Prepend one captured argument to the (possibly null) list of those after it.
+pub fn link_generic_arg(first: *GenericArg, rest: *GenericArg) -> *GenericArg
+    first.next = rest
+    return first
+
 # Make a captured TYPE_STRUCT argument's name current again, for helpers that
-# read p.last_type_name (type_generic, generic_struct_lit).
+# read p.last_type_name (type_generic).
 fn restore_generic_arg_name(p: *Parser, ga: *GenericArg)
     if ga.ty == TYPE_STRUCT
         p.last_type_name = ga.name
         p.last_type_name_len = ga.name_len
 
-# Mangle a generic type like Result<Vec<u8>, StrView> → Result$Vec$u8,
-# keyed off the FIRST type arg as captured by capture_first_generic_arg.
+# Mangled spelling of one argument: the primitive's name, or the captured
+# struct/generic name.  Same coverage as type_generic.  Returns its length and
+# stores the bytes' address in *out.
+fn generic_arg_spelling(ga: *GenericArg, out: **u8) -> i32
+    if ga.ty == TYPE_U8
+        *out = c"u8"
+        return 2
+    if ga.ty == TYPE_I8
+        *out = c"i8"
+        return 2
+    if ga.ty == TYPE_I32
+        *out = c"i32"
+        return 3
+    if ga.ty == TYPE_I64
+        *out = c"i64"
+        return 3
+    if ga.ty == TYPE_STRUCT
+        *out = ga.name
+        return ga.name_len
+    *out = null
+    return 0
+
+# Mangle `base<a1, a2, ...>` as "base$a1$a2..." (AGAST #1574), from the
+# captured argument list.  Returns an arena-allocated, NUL-terminated name
+# and its length in *out_len.
+fn mangle_generic_args(p: *Parser, base_name: *u8, base_len: i32, ga: *GenericArg, out_len: *i32) -> *u8
+    var total: i32 = base_len
+    var spell: *u8 = null
+    var cur: *GenericArg = ga
+    while cur != null
+        total = total + 1 + generic_arg_spelling(cur, @spell)
+        cur = cur.next
+    let mangled: *u8 = parser_alloc(p, (total + 1) as i64)
+    var pos: i32 = 0
+    for i in 0..base_len
+        *(mangled + pos) = *(base_name + i)
+        pos = pos + 1
+    cur = ga
+    while cur != null
+        *(mangled + pos) = 36  # '$'
+        pos = pos + 1
+        let n: i32 = generic_arg_spelling(cur, @spell)
+        for j in 0..n
+            *(mangled + pos) = *(spell + j)
+            pos = pos + 1
+        cur = cur.next
+    *(mangled + pos) = 0
+    *out_len = pos
+    return mangled
+
+# Mangle a generic type like Result<Vec<u8>, StrView> → Result$Vec$u8$StrView
+# from the arguments captured by capture_first_generic_arg.  Returns
+# TYPE_STRUCT with the name in p.last_type_name, like type_generic.
 pub fn type_generic_with_saved(p: *Parser, base_name: *u8, base_len: i32, ga: *GenericArg) -> i32
-    restore_generic_arg_name(p, ga)
-    return type_generic(p, base_name, base_len, ga.ty)
+    var len: i32 = 0
+    p.last_type_name = mangle_generic_args(p, base_name, base_len, ga, @len)
+    p.last_type_name_len = len
+    return TYPE_STRUCT
 
 # Handle generic type like Vec<u8>
 # Returns TYPE_STRUCT and stores mangled name (e.g., "Vec$u8") in parser state
@@ -2425,74 +2489,22 @@ pub fn ident_or_struct(p: *Parser, tok: Token, lit: *StructLit) -> *Expr
         e.next = null
         return e
 
-# Generic struct literal: Pair<i32> { first: 1, second: 2 }
-# The parser has: tok = "Pair", type_kind = TYPE_I32 (or TYPE_STRUCT for nested generics)
-# We need to mangle: "Pair" + "$" + "i32" -> "Pair$i32"
-pub fn generic_struct_lit(p: *Parser, tok: Token, type_kind: i32, lit: *StructLit) -> *Expr
+# Generic struct literal parsed through generic_args (AGAST #1300):
+# `Pair<i64, Vec<i64>> { ... }`.  Mangles on every argument (AGAST #1574),
+# from the capture records: parsing the literal's fields clobbers
+# p.last_type_name.
+pub fn generic_struct_lit_arg(p: *Parser, tok: Token, ga: *GenericArg, lit: *StructLit) -> *Expr
     let e: *Expr = parser_alloc(p, 128) as *Expr
     e.kind = EXPR_STRUCT_LIT
     e.span.line = tok.line
     e.span.col = tok.col
-
-    # Build mangled name using type_kind (not last_type_name, which may be stale)
-    let mangled: *u8 = parser_alloc(p, 64) as *u8
-    var pos: i32 = 0
-
-    # Copy base name from token
-    for i in 0..tok.len
-        *(mangled + pos) = *(tok.start + i)
-        pos = pos + 1
-
-    # Add "$" separator
-    *(mangled + pos) = 36  # '$'
-    pos = pos + 1
-
-    # Add type argument name based on type_kind (like type_generic does)
-    if type_kind == TYPE_U8
-        *(mangled + pos) = 117  # 'u'
-        pos = pos + 1
-        *(mangled + pos) = 56   # '8'
-        pos = pos + 1
-    else if type_kind == TYPE_I8
-        *(mangled + pos) = 105  # 'i'
-        pos = pos + 1
-        *(mangled + pos) = 56   # '8'
-        pos = pos + 1
-    else if type_kind == TYPE_I32
-        *(mangled + pos) = 105  # 'i'
-        pos = pos + 1
-        *(mangled + pos) = 51   # '3'
-        pos = pos + 1
-        *(mangled + pos) = 50   # '2'
-        pos = pos + 1
-    else if type_kind == TYPE_I64
-        *(mangled + pos) = 105  # 'i'
-        pos = pos + 1
-        *(mangled + pos) = 54   # '6'
-        pos = pos + 1
-        *(mangled + pos) = 52   # '4'
-        pos = pos + 1
-    else if type_kind == TYPE_STRUCT
-        # Nested generic type - use last_type_name (e.g., Vec<Token> has last_type_name="Token")
-        for j in 0..p.last_type_name_len
-            *(mangled + pos) = *(p.last_type_name + j)
-            pos = pos + 1
-
-    *(mangled + pos) = 0  # null terminate
-    e.ident_ptr = mangled
-    e.ident_len = pos
+    var len: i32 = 0
+    e.ident_ptr = mangle_generic_args(p, tok.start, tok.len, ga, @len)
+    e.ident_len = len
     # Store field inits in args field (reuse)
     e.args = lit as *Expr
     e.next = null
     return e
-
-# Generic struct literal parsed through generic_args (AGAST #1300):
-# `Pair<i64, Vec<i64>> { ... }`.  Mangles on the first argument, restored from
-# its capture record because parsing the literal's fields (and any tail args)
-# clobbers p.last_type_name.
-pub fn generic_struct_lit_arg(p: *Parser, tok: Token, ga: *GenericArg, lit: *StructLit) -> *Expr
-    restore_generic_arg_name(p, ga)
-    return generic_struct_lit(p, tok, ga.ty, lit)
 
 # =============================================================================
 # Numeric parsing
