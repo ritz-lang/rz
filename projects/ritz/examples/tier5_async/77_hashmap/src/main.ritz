@@ -1,0 +1,314 @@
+# Example 77: HashMap, hash and eq
+#
+# ritz1 links ritzlib.hashmap, ritzlib.hash and ritzlib.eq into itself, so
+# this example makes the ritz0-vs-ritz1 differential stages exercise them
+# (AGAST #1458).  Three parts:
+#
+# 1. Golden hash values.  fnv1a_str / hash_i32 / hash_i64 / hash_u64 and the
+#    fnv1a_* combinators on fixed inputs, printed as 16 hex digits.  test.sh
+#    holds the reference values (computed independently from the FNV-1a
+#    spec), so a hash that drifts under either compiler shows up.
+# 2. The HashMapI64 API on integer keys: new / with_cap / insert / get /
+#    contains / remove / len / is_empty / cap / clear / grow (free-function
+#    form; method form waits on #1518), plus eq_i32 / eq_i64 / eq_u64.
+# 3. A word-frequency counter over stdin.  Words are runs of ASCII letters
+#    and digits, lower-cased.  Each word is keyed by its FNV-1a hash; one
+#    map counts, a second maps hash -> first occurrence.  "the" is removed
+#    as a stop word, then the surviving entries are collected by iterating
+#    the table and printed sorted by word, so the output does not depend on
+#    iteration order.  Empty stdin (the regression suite runs every example
+#    with </dev/null) counts a built-in sentence instead.
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.hash
+import ritzlib.eq
+import ritzlib.hashmap
+
+const BUF_SIZE: i64 = 65536
+const MAX_WORDS: i64 = 1024
+
+# ============================================================================
+# Output helpers
+# ============================================================================
+
+# Print exactly 16 lower-case hex digits, so the golden values are fixed-width
+# and a u64 with the top bit set prints the same as any other.
+fn print_hex16(v: u64)
+    var shift: i64 = 60
+    while shift >= 0
+        let d: u64 = (v >> (shift as u64)) & 15
+        if d < 10
+            print_char((d + 48) as u8)
+        else
+            print_char((d + 87) as u8)
+        shift -= 4
+
+fn show_hash(label: *u8, h: u64)
+    prints_cstr(label)
+    print_hex16(h)
+    print_char('\n')
+
+fn show(label: *u8, v: i64)
+    prints_cstr(label)
+    print_int(v)
+    print_char('\n')
+
+fn cstr_len(s: *u8) -> i32
+    var n: i32 = 0
+    while *(s + n) != 0
+        n += 1
+    return n
+
+fn hash_cstr(s: *u8) -> u64
+    return fnv1a_str(s, cstr_len(s))
+
+# ============================================================================
+# Part 1: golden hashes
+# ============================================================================
+
+fn golden_hashes()
+    println("== hash ==")
+    show_hash(c"fnv1a_init: ", fnv1a_init())
+    show_hash(c"fnv1a_str(\"\"): ", hash_cstr(c""))
+    show_hash(c"fnv1a_str(\"a\"): ", hash_cstr(c"a"))
+    show_hash(c"fnv1a_str(\"foobar\"): ", hash_cstr(c"foobar"))
+    show_hash(c"fnv1a_str(\"hashmap\"): ", hash_cstr(c"hashmap"))
+    show_hash(c"fnv1a_byte(init, 255): ", fnv1a_byte(fnv1a_init(), 255))
+    show_hash(c"hash_i32(0): ", hash_i32(0))
+    show_hash(c"hash_i32(-1): ", hash_i32(-1))
+    show_hash(c"hash_i32(305419896): ", hash_i32(305419896))
+    show_hash(c"hash_i64(0): ", hash_i64(0))
+    show_hash(c"hash_i64(42): ", hash_i64(42))
+    show_hash(c"hash_i64(-42): ", hash_i64(-42))
+    show_hash(c"hash_u64(1): ", hash_u64(1))
+    show_hash(c"hash_u64(hash_i64(42)): ", hash_u64(hash_i64(42)))
+    # Combinators chain: i32 then i64 then u64 into one running hash.
+    var h: u64 = fnv1a_init()
+    h = fnv1a_i32(h, 7)
+    h = fnv1a_i64(h, -7)
+    h = fnv1a_u64(h, 7)
+    show_hash(c"fnv1a_i32/i64/u64 chain: ", h)
+
+# ============================================================================
+# Part 2: eq and the HashMapI64 API on integer keys
+# ============================================================================
+
+fn eq_checks()
+    println("== eq ==")
+    show(c"eq_i32(3, 3): ", eq_i32(3, 3) as i64)
+    show(c"eq_i32(3, -3): ", eq_i32(3, -3) as i64)
+    show(c"eq_i64(1 << 40, 1 << 40): ", eq_i64(1 << 40, 1 << 40) as i64)
+    show(c"eq_i64(-1, 1): ", eq_i64(-1, 1) as i64)
+    show(c"eq_i64(1, -1): ", eq_i64(1, -1) as i64)
+    show(c"eq_u64(hash a, hash a): ", eq_u64(hash_cstr(c"a"), hash_cstr(c"a")) as i64)
+    show(c"eq_u64(hash a, hash b): ", eq_u64(hash_cstr(c"a"), hash_cstr(c"b")) as i64)
+
+fn map_api()
+    println("== map ==")
+    var sized: HashMapI64 = hashmap_i64_with_cap(100)
+    show(c"with_cap(100).cap: ", hashmap_i64_cap(@sized))
+
+    var m: HashMapI64 = hashmap_i64_new()
+    show(c"new.len: ", hashmap_i64_len(@m))
+    show(c"new.is_empty: ", hashmap_i64_is_empty(@m) as i64)
+    show(c"new.cap: ", hashmap_i64_cap(@m))
+
+    # 20 keys: past the 75% load factor of a 16-slot table, so this grows.
+    var i: i64 = 0
+    while i < 20
+        hashmap_i64_insert(@m, i * i, i)
+        i += 1
+    show(c"after 20 inserts len: ", hashmap_i64_len(@m))
+    show(c"after 20 inserts cap: ", hashmap_i64_cap(@m))
+    show(c"get(49): ", hashmap_i64_get(@m, 49))
+    show(c"get(361): ", hashmap_i64_get(@m, 361))
+    show(c"contains(50): ", hashmap_i64_contains(@m, 50) as i64)
+    show(c"get(50) (missing): ", hashmap_i64_get(@m, 50))
+
+    # Update in place: same key, len unchanged.
+    hashmap_i64_insert(@m, 49, 700)
+    show(c"update get(49): ", hashmap_i64_get(@m, 49))
+    show(c"update len: ", hashmap_i64_len(@m))
+
+    # Remove leaves a tombstone; a probe past it must still find later keys.
+    show(c"remove(49): ", hashmap_i64_remove(@m, 49) as i64)
+    show(c"remove(49) again: ", hashmap_i64_remove(@m, 49) as i64)
+    show(c"contains(49): ", hashmap_i64_contains(@m, 49) as i64)
+    show(c"len after remove: ", hashmap_i64_len(@m))
+    var sum: i64 = 0
+    i = 0
+    while i < 20
+        sum += hashmap_i64_get(@m, i * i)
+        i += 1
+    show(c"sum of values: ", sum)
+    hashmap_i64_insert(@m, 49, 7)
+    show(c"reinsert len: ", hashmap_i64_len(@m))
+
+    # Negative and large keys hash like any other.
+    hashmap_i64_insert(@m, -5, 55)
+    hashmap_i64_insert(@m, 1 << 62, 62)
+    show(c"get(-5): ", hashmap_i64_get(@m, -5))
+    show(c"get(1 << 62): ", hashmap_i64_get(@m, 1 << 62))
+
+    # The method form (m.insert / m.get / m.len / ...) is not used here yet:
+    # ritz1 never declares an impl method from an imported module, so any
+    # `m.len()` fails to link under ritz1 (AGAST #1518).  #1518's acceptance
+    # adds the method-form calls back to this example.
+
+    # clear keeps the allocation.
+    hashmap_i64_clear(@m)
+    show(c"clear len: ", hashmap_i64_len(@m))
+    show(c"clear is_empty: ", hashmap_i64_is_empty(@m) as i64)
+    show(c"clear cap: ", hashmap_i64_cap(@m))
+    show(c"clear get(0): ", hashmap_i64_get(@m, 0))
+
+    # Explicit drop on one map; `sized` is released by Drop at scope exit.
+    hashmap_i64_drop(@m)
+    show(c"drop cap: ", hashmap_i64_cap(@m))
+
+# ============================================================================
+# Part 3: word frequencies
+# ============================================================================
+
+fn is_word_byte(c: u8) -> bool
+    if c >= 'a' && c <= 'z'
+        return true
+    if c >= 'A' && c <= 'Z'
+        return true
+    if c >= '0' && c <= '9'
+        return true
+    return false
+
+fn lower(c: u8) -> u8
+    if c >= 'A' && c <= 'Z'
+        return c + 32
+    return c
+
+# Lexicographic byte compare of two words in `buf`: <0, 0, >0.
+fn word_cmp(buf: *u8, a_start: i64, a_len: i64, b_start: i64, b_len: i64) -> i64
+    var i: i64 = 0
+    while i < a_len && i < b_len
+        let ca: i64 = *(buf + a_start + i) as i64
+        let cb: i64 = *(buf + b_start + i) as i64
+        if ca != cb
+            return ca - cb
+        i += 1
+    return a_len - b_len
+
+fn print_word(buf: *u8, start: i64, len: i64)
+    sys_write(STDOUT, buf + start, len)
+
+fn word_counts()
+    println("== words ==")
+    var buf: [65536]u8
+    let p: *u8 = @buf[0]
+
+    # Slurp stdin; fall back to a built-in sentence when it is empty.
+    var n: i64 = 0
+    while n < BUF_SIZE
+        let got: i64 = sys_read(0, p + n, BUF_SIZE - n)
+        if got <= 0
+            break
+        n += got
+    if n == 0
+        let text: *u8 = c"The quick brown fox jumps over the lazy dog. The dog barks; the fox runs, and the quick cat naps in a warm sunny spot near the old red barn."
+        let tlen: i64 = cstr_len(text) as i64
+        var k: i64 = 0
+        while k < tlen
+            buf[k] = *(text + k)
+            k += 1
+        n = tlen
+        println("source: builtin")
+    else
+        println("source: stdin")
+
+    # counts: word hash -> occurrences.  first: word hash -> slot in the word
+    # table (start/len of the word's first occurrence in buf).
+    var counts: HashMapI64 = hashmap_i64_new()
+    var first: HashMapI64 = hashmap_i64_new()
+    var wstart: [1024]i64
+    var wlen: [1024]i64
+    var nwords: i64 = 0
+    var total: i64 = 0
+
+    var pos: i64 = 0
+    while pos < n
+        if !is_word_byte(buf[pos])
+            pos += 1
+            continue
+        let start: i64 = pos
+        while pos < n && is_word_byte(buf[pos])
+            buf[pos] = lower(buf[pos])
+            pos += 1
+        let len: i64 = pos - start
+        let key: i64 = fnv1a_str(p + start, len as i32) as i64
+        total += 1
+        if hashmap_i64_contains(@counts, key) == 1
+            # A 64-bit FNV collision between two different words would merge
+            # their counts silently; refuse instead.
+            let slot: i64 = hashmap_i64_get(@first, key)
+            if word_cmp(p, wstart[slot], wlen[slot], start, len) != 0
+                println("error: hash collision")
+                return
+            hashmap_i64_insert(@counts, key, hashmap_i64_get(@counts, key) + 1)
+        else
+            if nwords == MAX_WORDS
+                println("error: too many distinct words")
+                return
+            wstart[nwords] = start
+            wlen[nwords] = len
+            hashmap_i64_insert(@first, key, nwords)
+            hashmap_i64_insert(@counts, key, 1)
+            nwords += 1
+
+    show(c"words: ", total)
+    show(c"distinct: ", hashmap_i64_len(@counts))
+    show(c"cap: ", hashmap_i64_cap(@counts))
+
+    # Drop the stop word "the" from the counts (not from `first`).
+    let the_key: i64 = hash_cstr(c"the") as i64
+    show(c"the: ", hashmap_i64_get(@counts, the_key))
+    show(c"remove the: ", hashmap_i64_remove(@counts, the_key) as i64)
+    show(c"remove the again: ", hashmap_i64_remove(@counts, the_key) as i64)
+    show(c"distinct without the: ", hashmap_i64_len(@counts))
+
+    # Iterate the table: every occupied slot is one surviving word.
+    var order: [1024]i64
+    var norder: i64 = 0
+    var s: i64 = 0
+    while s < counts.cap
+        let e: *HashMapEntryI64 = counts.entries + s
+        if e.state == 1
+            order[norder] = hashmap_i64_get(@first, e.key)
+            norder += 1
+        s += 1
+    show(c"iterated: ", norder)
+
+    # Insertion sort by word.
+    var i: i64 = 1
+    while i < norder
+        let cur: i64 = order[i]
+        var j: i64 = i - 1
+        while j >= 0 && word_cmp(p, wstart[order[j]], wlen[order[j]], wstart[cur], wlen[cur]) > 0
+            order[j + 1] = order[j]
+            j -= 1
+        order[j + 1] = cur
+        i += 1
+
+    i = 0
+    while i < norder
+        let w: i64 = order[i]
+        let key: i64 = fnv1a_str(p + wstart[w], wlen[w] as i32) as i64
+        print_word(p, wstart[w], wlen[w])
+        print_char(' ')
+        print_int(hashmap_i64_get(@counts, key))
+        print_char('\n')
+        i += 1
+
+fn main() -> i32
+    golden_hashes()
+    eq_checks()
+    map_api()
+    word_counts()
+    return 0
