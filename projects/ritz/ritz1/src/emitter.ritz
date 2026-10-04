@@ -1729,13 +1729,52 @@ fn const_array_elem_error(s: *EmitterState, c: *ConstEntry, idx: i32)
     emit_str(s, c" is not a constant integer expression\n")
     s.error_count = s.error_count + 1
 
+# AGAST #1606: emit `const NAME: [N]T = [v; N]` (primitive T) as
+#   @NAME = internal constant [N x T] [T v, T v, ...]
+# A `v` that doesn't fold to a constant integer is a located error (reported
+# as element 0), never a silent 0 or a missing global.
+fn emit_const_array_fill_entry(s: *EmitterState, c: *ConstEntry)
+    if was_global_emitted(s, c.name, c.name_len) == 1
+        return
+    mark_global_emitted(s, c.name, c.name_len)
+    var v: i64 = 0
+    if c.value_expr.left == null or const_fold_int(s.module.constants, c.value_expr.left, 1, @v) == 0
+        const_array_elem_error(s, c, 0)
+        return
+    emit_str(s, c"@")
+    emit_name(s, c.name, c.name_len)
+    emit_str(s, c" = internal constant [")
+    emit_int(s, c.array_size as i64)
+    emit_str(s, c" x ")
+    emit_llvm_type(s, c.array_elem_type)
+    emit_str(s, c"] [")
+    var i: i32 = 0
+    while i < c.array_size
+        if i > 0
+            emit_str(s, c", ")
+        emit_llvm_type(s, c.array_elem_type)
+        emit_str(s, c" ")
+        emit_int(s, v)
+        i = i + 1
+    emit_str(s, c"]\n")
+
 # Emit a single ConstEntry as an LLVM global constant (if applicable).
 fn emit_const_array_entry(s: *EmitterState, c: *ConstEntry)
     if c.const_type != TYPE_ARRAY
         return
     if c.value_expr == null
         return
-    if c.value_expr.kind != EXPR_ARRAY_LIT
+    var is_fill: i32 = 0
+    if c.value_expr.kind == EXPR_ARRAY_FILL
+        is_fill = 1
+    if c.value_expr.kind != EXPR_ARRAY_LIT and is_fill == 0
+        return
+    # AGAST #1606: the fill form `const Z: [N]T = [v; N]` of a primitive
+    # array.  It used to emit no global, so `Z[i]` indexed through
+    # `inttoptr i64 0`.  Fold `v` once and repeat it for all N elements.
+    if is_fill == 1
+        if c.array_elem_type != TYPE_STRUCT
+            emit_const_array_fill_entry(s, c)
         return
     # Primitive-element arrays — `const VALUES: [3]i32 = [2, 3, 5]`.
     # Required so `for v in VALUES` (iterable form) can reference the

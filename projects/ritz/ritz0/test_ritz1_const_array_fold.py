@@ -162,6 +162,40 @@ pub fn main() -> i32
     return sum
 """
 
+# AGAST #1606: the fill form `[v; N]`. ritz1 emitted no global for it, so
+# `T[i]` indexed through `inttoptr i64 0` (SIGSEGV). Every element is checked.
+FILL_EXPR = """\
+const A: i32 = 1
+
+const T: [4]i32 = [A + 2; 4]
+
+pub fn main() -> i32
+    return T[3]
+"""
+
+FILL_NEG_I8 = """\
+const T: [5]i8 = [-3; 5]
+
+pub fn main() -> i32
+    for i in 0..5
+        if T[i] != -3
+            return 10
+    return (T[4] + 6) as i32
+"""
+
+# Needs the high word, and reads the global through the iterable form.
+FILL_I64_FOR_IN = """\
+const T: [3]i64 = [0x100000001; 3]
+
+pub fn main() -> i32
+    var sum: i64 = 0
+    for v in T
+        sum = sum + v
+    if sum != 0x300000003
+        return 10
+    return 3
+"""
+
 FORMS = {
     "i32_neg_repro": I32_NEG_REPRO,
     "i32_neg_all": I32_NEG_ALL,
@@ -171,6 +205,9 @@ FORMS = {
     "hex": HEX,
     "bit_not": BIT_NOT,
     "for_in_sum": FOR_IN_SUM,
+    "fill_expr": FILL_EXPR,
+    "fill_neg_i8": FILL_NEG_I8,
+    "fill_i64_for_in": FILL_I64_FOR_IN,
 }
 
 # Forms ritz0 folds that exercise the rest of its const evaluator (AGAST
@@ -201,19 +238,9 @@ pub fn main() -> i32
     return T[0] + 6
 """
 
-FILL_EXPR = """\
-const A: i32 = 1
-
-const T: [4]i32 = [A + 2; 4]
-
-pub fn main() -> i32
-    return T[3]
-"""
-
 RITZ0_ONLY_FORMS = {
     "cast_char": CAST_CHAR,
     "trunc_div": TRUNC_DIV,
-    "fill_expr": FILL_EXPR,
 }
 
 
@@ -282,6 +309,16 @@ def test_ritz1_emits_folded_global(ritz1_bin: Path, tmp_path: Path) -> None:
     assert "@T = internal constant [3 x i32] [i32 -5, i32 3, i32 -7]" in ir, ir
 
 
+@pytest.mark.integration
+def test_ritz1_emits_fill_global(ritz1_bin: Path, tmp_path: Path) -> None:
+    """AGAST #1606: `[v; N]` becomes a real global holding N folded copies."""
+    comp, ll = _compile("ritz1", tmp_path, "fill_ir", FILL_EXPR)
+    assert comp.returncode == 0, comp.stderr
+    ir = ll.read_text()
+    assert "@T = internal constant [4 x i32] [i32 3, i32 3, i32 3, i32 3]" in ir, ir
+    assert "inttoptr i64 0" not in ir, ir
+
+
 # --- unfoldable elements are errors, not a silent 0 ---------------------------
 
 UNFOLDABLE_CALL = """\
@@ -301,11 +338,22 @@ pub fn main() -> i32
     return T[0]
 """
 
+UNFOLDABLE_FILL = """\
+const T: [4]i32 = [NOPE; 4]
+
+pub fn main() -> i32
+    return T[0]
+"""
+
 
 @pytest.mark.integration
 @pytest.mark.parametrize(
     "name,program,elem",
-    [("call", UNFOLDABLE_CALL, 0), ("unknown_name", UNFOLDABLE_UNKNOWN, 1)],
+    [
+        ("call", UNFOLDABLE_CALL, 0),
+        ("unknown_name", UNFOLDABLE_UNKNOWN, 1),
+        ("fill", UNFOLDABLE_FILL, 0),
+    ],
 )
 def test_ritz1_rejects_unfoldable_element(
     name: str, program: str, elem: int, ritz1_bin: Path, tmp_path: Path
