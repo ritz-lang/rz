@@ -392,3 +392,59 @@ fn main() -> i32
 """)
         # x should be usable after modify() releases its borrow
         assert len(errors) == 0, f"Unexpected errors: {errors}"
+
+
+class TestStrViewIsCopy:
+    """StrView is a borrowed `{ ptr, len }` view — passing it by value must
+    not move it (AGAST #1560). AGAST #98 made bare "..." literals produce
+    StrView and documented it as Copy, but never added it to COPY_TYPES, so
+    reusing a StrView key after `doc_set_field(@doc, key, ...)` was rejected
+    as "use of moved value" (all 29 mausoleum test_document tests)."""
+
+    SV = """
+struct StrView
+    ptr: *u8
+    len: i64
+
+fn takes_sv(s: StrView) -> i64
+    return s.len
+"""
+
+    def test_annotated_strview_reused_after_by_value_call(self):
+        errors = check(self.SV + """
+fn main() -> i32
+    let key: StrView = "age"
+    takes_sv(key)
+    takes_sv(key)
+    return 0
+""")
+        assert errors == []
+
+    def test_inferred_strview_literal_reused_after_by_value_call(self):
+        errors = check(self.SV + """
+fn main() -> i32
+    let key = "age"
+    takes_sv(key)
+    takes_sv(key)
+    return 0
+""")
+        assert errors == []
+
+    def test_non_copy_struct_still_moves(self):
+        """Guard: the fix must not make every struct Copy."""
+        errors = check(self.SV + """
+struct Owned
+    p: *u8
+    n: i64
+
+fn takes_owned(o: Owned) -> i64
+    return o.n
+
+fn main() -> i32
+    var o: Owned = Owned { p: null, n: 0 }
+    takes_owned(o)
+    takes_owned(o)
+    return 0
+""")
+        assert len(errors) == 1
+        assert "moved" in str(errors[0])

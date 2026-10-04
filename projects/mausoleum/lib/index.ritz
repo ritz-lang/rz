@@ -17,6 +17,8 @@
 import ritzlib.sys
 import ritzlib.str
 import ritzlib.memory
+import ritzlib.strview
+import ritzlib.option
 
 import mausoleum.m7m_types
 import mausoleum.buffer_pool
@@ -149,7 +151,7 @@ fn build_index_key(idx: *Index, doc: *Document, buf: *u8, buf_len: i32) -> i32
     while i < idx.field_count
         var field_name: *u8 = @idx.fields[i].name[0]
         var field_val: Field
-        var err: i32 = doc_get_field(doc, field_name, @field_val)
+        var err: i32 = doc_get_field(doc, strview_from_cstr(field_name), @field_val)
 
         if err != ERR_OK
             # Field not present - use null
@@ -233,7 +235,8 @@ pub fn index_create(mgr: *IndexManager, name: *u8, field: *u8, unique: i32) -> i
         idx.flags = idx.flags | INDEX_FLAG_UNIQUE
 
     # Create B-tree for index
-    idx.tree = btree_create(mgr.pool)
+    let tree_opt = btree_create(mgr.pool)
+    idx.tree = option_unwrap_or<*BTree>(@tree_opt, null)
     if idx.tree == null
         return ERR_NO_MEMORY
 
@@ -288,7 +291,8 @@ pub fn index_create_composite(mgr: *IndexManager, name: *u8, fields: **u8, field
         idx.flags = idx.flags | INDEX_FLAG_UNIQUE
 
     # Create B-tree for index
-    idx.tree = btree_create(mgr.pool)
+    let tree_opt = btree_create(mgr.pool)
+    idx.tree = option_unwrap_or<*BTree>(@tree_opt, null)
     if idx.tree == null
         return ERR_NO_MEMORY
 
@@ -308,9 +312,10 @@ pub fn index_create_composite(mgr: *IndexManager, name: *u8, fields: **u8, field
 # Build index entries for all existing documents
 fn index_build(mgr: *IndexManager, idx: *Index) -> i32
     # Scan all documents in the collection
-    var iter: *BTreeIter = btree_scan(mgr.collection.tree, null, 0, null, 0)
-    if iter == null
+    let iter_opt = btree_scan(mgr.collection.tree, null, 0, null, 0)
+    if option_is_none<*BTreeIter>(@iter_opt) == 1
         return ERR_OK  # Empty collection is fine
+    var iter: *BTreeIter = option_unwrap_or<*BTreeIter>(@iter_opt, null)
 
     while btree_iter_valid(iter) != 0
         # Get document
@@ -521,22 +526,22 @@ pub fn index_field_count(idx: *Index) -> i32
 
 # Scan an index for a specific value
 # Returns iterator positioned at first matching entry
-pub fn index_scan_eq(idx: *Index, value: *Field) -> *BTreeIter
+pub fn index_scan_eq(idx: *Index, value: *Field) -> Option<*BTreeIter>
     if idx == null or value == null
-        return null
+        return None
 
     # Build search key
     var key: [256]u8
     var key_len: i32 = serialize_field_key(value, @key[0], 256)
     if key_len <= 0
-        return null
+        return None
 
     return btree_scan(idx.tree, @key[0], key_len, null, 0)
 
 # Scan an index for a range of values
-pub fn index_scan_range(idx: *Index, start: *Field, end: *Field) -> *BTreeIter
+pub fn index_scan_range(idx: *Index, start: *Field, end: *Field) -> Option<*BTreeIter>
     if idx == null
-        return null
+        return None
 
     var start_key: [256]u8
     var start_len: i32 = 0

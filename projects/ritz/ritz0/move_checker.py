@@ -114,6 +114,10 @@ class MoveChecker:
         # Small structs with only Copy fields are Copy
         # TODO: Implement proper Copy trait checking
         'Point2D', 'Bounds', 'BoundsRect',  # Geometry types
+        # StrView is a borrowed { ptr, len } view with no ownership — the type
+        # bare "..." literals produce (AGAST #98). Omitting it here made every
+        # by-value StrView argument a move (AGAST #1560).
+        'StrView',
     }
 
     def __init__(self):
