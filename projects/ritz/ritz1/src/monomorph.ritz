@@ -916,7 +916,104 @@ fn get_type_name_from_suffix(suffix: *u8, suffix_len: i32, out_name: **u8, out_l
 # ============================================================================
 # Clone a generic function and substitute the type parameter
 
+# ----------------------------------------------------------------------------
+# Multi-parameter generic fns (AGAST #1612)
+# ----------------------------------------------------------------------------
+# `second<T, U>` called as `second<i64, i32>` carries the suffix "$i64$i32".
+# The cloning machinery below substitutes ONE parameter at a time, so a
+# multi-parameter template is specialised in one pass per parameter: T at
+# "$i64" gives `second$i64` (U still free), then U at "$i32" gives
+# `second$i64$i32`.  Each pass appends its argument to the name, so the last
+# pass's name is the template's plus the whole suffix — the call site's
+# spelling.
+#
+# While those passes run, g_mono_component_mode switches name rewriting to
+# whole `$`-components: `Result$T$E` must become `Result$i32$E` and then
+# `Result$i32$i64`, where single-parameter mode only rewrites a trailing
+# `$T` and otherwise APPENDS the suffix (its `@&Vec<T>` -> "Vec" + "$u8"
+# convention).  Nested generic calls are not registered mid-way — a pass-1
+# `helper<T, U>` would register the half-substituted `helper$i64$U` — but
+# once, from the finished body (collect_from_fn_body).
+var g_mono_component_mode: i32 = 0
+
 fn clone_and_specialize_function(m: *Module, template: *FnDef, suffix: *u8, suffix_len: i32) -> *FnDef
+    let n: i32 = count_type_params(template.type_params)
+    if n < 2
+        var tp_name: *u8 = null
+        var tp_len: i32 = 0
+        if template.type_params != null
+            tp_name = template.type_params.name
+            tp_len = template.type_params.name_len
+        return specialize_fn_one_param(m, template, tp_name, tp_len, suffix, suffix_len)
+
+    let starts: *i32 = malloc(4 * MAX_GENERIC_ARGS as i64) as *i32
+    let lens: *i32 = malloc(4 * MAX_GENERIC_ARGS as i64) as *i32
+    if split_mangled_args(m, suffix, suffix_len, starts, lens) != n
+        # Wrong arity for this template (e.g. `pair<i64>`): nothing sound to
+        # emit.  The call stays unresolved and fails at link, loudly.
+        return null
+    g_mono_component_mode = 1
+    var cur: *FnDef = template
+    var tp: *TypeParam = template.type_params
+    var i: i32 = 0
+    while tp != null
+        cur = specialize_fn_one_param(m, cur, tp.name, tp.name_len, suffix + *(starts + i), *(lens + i))
+        tp = tp.next
+        i = i + 1
+    g_mono_component_mode = 0
+    collect_from_fn_body(m, cur.body)
+    cur
+
+# Rewrite every `$`-separated component of `name` that equals type_param to
+# the argument of the one-argument suffix "$arg" (new_suffix):
+# `Result$T$E` at T="$i32" is `Result$i32$E`; `T` alone is `i32`.  Returns
+# `name` itself (and *out_len = name_len) when no component matches.
+fn replace_param_component(name: *u8, name_len: i32, type_param: *u8, type_param_len: i32, new_suffix: *u8, new_suffix_len: i32, out_len: *i32) -> *u8
+    *out_len = name_len
+    if name == null or type_param == null or new_suffix_len < 1
+        return name
+    let arg: *u8 = new_suffix + 1
+    let arg_len: i32 = new_suffix_len - 1
+    # Pass 1: count matches to size the output.
+    var hits: i32 = 0
+    var pos: i32 = 0
+    while pos <= name_len
+        var end: i32 = pos
+        while end < name_len and *(name + end) != 36   # '$'
+            end = end + 1
+        if end - pos == type_param_len and memcmp(name + pos, type_param, type_param_len as i64) == 0
+            hits = hits + 1
+        pos = end + 1
+    if hits == 0
+        return name
+    # Pass 2: build it.
+    let total: i32 = name_len + hits * (arg_len - type_param_len)
+    let out: *u8 = malloc(total as i64 + 1) as *u8
+    var o: i32 = 0
+    pos = 0
+    while pos <= name_len
+        var end: i32 = pos
+        while end < name_len and *(name + end) != 36
+            end = end + 1
+        if end - pos == type_param_len and memcmp(name + pos, type_param, type_param_len as i64) == 0
+            for j in 0..arg_len
+                *(out + o) = *(arg + j)
+                o = o + 1
+        else
+            for j in pos..end
+                *(out + o) = *(name + j)
+                o = o + 1
+        if end < name_len
+            *(out + o) = 36
+            o = o + 1
+        pos = end + 1
+    *(out + o) = 0
+    *out_len = o
+    out
+
+# Specialise `template` at ONE type parameter (type_param_name) bound to the
+# one-argument suffix "$arg".  The result's name is template.name + suffix.
+fn specialize_fn_one_param(m: *Module, template: *FnDef, type_param_name: *u8, type_param_len: i32, suffix: *u8, suffix_len: i32) -> *FnDef
     # Create a new FnDef with mangled name
     let mangled_name_len: i32 = template.name_len + suffix_len
     let mangled_name: *u8 = malloc(mangled_name_len as i64 + 1) as *u8
@@ -929,13 +1026,6 @@ fn clone_and_specialize_function(m: *Module, template: *FnDef, suffix: *u8, suff
     for j in 0..suffix_len
         *(mangled_name + template.name_len + j) = *(suffix + j)
     *(mangled_name + mangled_name_len) = 0
-
-    # Get the type parameter name from template
-    var type_param_name: *u8 = null
-    var type_param_len: i32 = 0
-    if template.type_params != null
-        type_param_name = template.type_params.name
-        type_param_len = template.type_params.name_len
 
     # Get the substitution type from suffix
     var subst_type_name: *u8 = null
@@ -1076,6 +1166,11 @@ fn mangle_struct_name(name: *u8, name_len: i32, suffix: *u8, suffix_len: i32) ->
 # Input: name = "Vec$T", type_param = "T", new_suffix = "$u8"
 # Output: "Vec$u8"
 fn substitute_type_param_in_name(name: *u8, name_len: i32, type_param: *u8, type_param_len: i32, new_suffix: *u8, new_suffix_len: i32, out_name: **u8, out_len: *i32)
+    # AGAST #1612: multi-parameter passes rewrite whole components, anywhere
+    # in the name, and never append (see g_mono_component_mode).
+    if g_mono_component_mode != 0
+        *out_name = replace_param_component(name, name_len, type_param, type_param_len, new_suffix, new_suffix_len, out_len)
+        return
     # Check if name ends with "$T" where T is the type param
     # Expected pattern: "Base$T" where Base is some prefix
     let expected_suffix_len: i32 = type_param_len + 1  # "$" + type_param
@@ -1270,8 +1365,12 @@ fn clone_expr(e: *Expr, type_param: *u8, type_param_len: i32, subst_type: i32, s
             if subst_suffix != null
                 cloned.call_type_suffix = subst_suffix
                 cloned.call_type_suffix_len = subst_suffix_len
-                # Register this new instantiation for later generation
-                add_instantiation(cloned.func_name, cloned.func_name_len, subst_suffix, subst_suffix_len)
+                # Register this new instantiation for later generation —
+                # unless a multi-parameter pass is mid-way, when the suffix
+                # may still name a later parameter (AGAST #1612; the finished
+                # body is collected instead).
+                if g_mono_component_mode == 0
+                    add_instantiation(cloned.func_name, cloned.func_name_len, subst_suffix, subst_suffix_len)
 
         # Special case: sizeof(T) where T is a type parameter
         # The argument to sizeof is a type name (identifier), so we need to substitute
@@ -1391,6 +1490,13 @@ fn clone_field_inits(fi: *FieldInit, type_param: *u8, type_param_len: i32, subst
     return cloned
 
 fn check_and_substitute_suffix(old_suffix: *u8, old_suffix_len: i32, type_param: *u8, type_param_len: i32, new_suffix: *u8, new_suffix_len: i32, out_len: *i32) -> *u8
+    # AGAST #1612: in a multi-parameter pass a call suffix may name several
+    # parameters (`helper<T, U>` is "$T$U"); rewrite the matching component.
+    if g_mono_component_mode != 0
+        let rewritten: *u8 = replace_param_component(old_suffix, old_suffix_len, type_param, type_param_len, new_suffix, new_suffix_len, out_len)
+        if rewritten == old_suffix
+            return null
+        return rewritten
     # Check if old_suffix is "$T" where T matches type_param
     if old_suffix_len != type_param_len + 1
         return null

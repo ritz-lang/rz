@@ -137,7 +137,7 @@ tickets were needed. `77_args` arrived with `d8d79f6` and its blockers (#1487,
 | `64_async_io` | cannot parse `async` | `async fn` items | #1456 |
 | `65_async_main` | cannot parse `async` | `async fn` items | #1456 |
 | `66_for_loops` | cannot parse `fn main` | inclusive range `1..=5` | #1530 (item 1) |
-| `68_result_error_handling` | cannot parse `fn main` | call with two explicit type args `f<i64, i32>(..)` (one arg is fine) | #1471 |
+| ~~`68_result_error_handling`~~ | ~~cannot parse `fn main`~~ | call with two explicit type args `f<i64, i32>(..)` — **fixed by #1612**, removed from the allowlist (output matches ritz0) | #1471, #1612 |
 | `69_result_string` | `%.13` is `i64`, expected `%String` | match arm binding a struct payload gets `alloca i64` | #1515 |
 | `72_raii` | unhandled `EXPR_MEMBER` in assignment | `self`-named param; generic impl methods; `{x}` interpolation | #1375, #1520, #1521 |
 | `75_async_reference` | cannot parse `async` | `async fn` items | #1456 |

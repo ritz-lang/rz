@@ -1218,7 +1218,28 @@ fn main() -> i32
 ```
 
 Type arguments are explicit at the call site (`identity<i32>(x)`), including
-pointer arguments (`option_is_none<*Page>(@p)`).
+pointer arguments (`option_is_none<*Page>(@p)`). A function with several type
+parameters takes one argument per parameter, in order:
+
+```ritz
+fn second<T, U>(a: T, b: U) -> U
+    b
+
+fn main() -> i32
+    second<i64, i32>(100, 0)
+```
+
+`f(a < b, c > (d))` lexes exactly like a call to `a<b, c>(d)`. ritz1 reads a
+list of two or more type arguments as a call only if none of them is a bare
+lowercase identifier: by naming convention (`docs/STYLE.md`: types are
+PascalCase, variables snake_case) such a name is a value, so
+the example above stays two comparison arguments. ritz0 does not make this
+distinction yet; it always reads `<...>(` as type arguments.
+
+```
+f(a < b, c > (d))          # ritz1: f((a < b), (c > (d)))
+second<i64, Counter>(x, y) # a generic call under both compilers
+```
 
 ### 11.2 Generic Structs
 

@@ -2446,6 +2446,54 @@ pub fn postfix_generic_call_arg(p: *Parser, ga: *GenericArg, args: *Expr) -> *Po
     op.next = null
     return op
 
+# Is this captured type argument spelled like a VALUE — a bare lowercase
+# identifier such as `b` in `f(a < b, c > (d))`?  Types are primitive
+# keywords (lexed as their own tokens, never TYPE_STRUCT), PascalCase names,
+# or lowercase primitives that lex as IDENT (usize/isize; f32/f64 already
+# come back as TYPE_F32/TYPE_F64).  A generic instantiation's captured name
+# contains '$' and is a type whatever its case.
+fn generic_arg_is_value_like(ga: *GenericArg) -> i32
+    if ga.ty != TYPE_STRUCT or ga.name == null or ga.name_len <= 0
+        return 0
+    let c0: u8 = *ga.name
+    if c0 != 95 and (c0 < 97 or c0 > 122)  # not '_' and not 'a'..'z'
+        return 0
+    for i in 0..ga.name_len
+        if *(ga.name + i) == 36  # '$'
+            return 0
+    if ga.name_len == 5 and *(ga.name + 1) == 115 and *(ga.name + 2) == 105 and *(ga.name + 3) == 122 and *(ga.name + 4) == 101
+        if c0 == 117 or c0 == 105  # "usize" / "isize"
+            return 0
+    return 1
+
+# Generic call with a full type-argument list (AGAST #1612): `second<i64,
+# i32>(a, b)` → suffix "$i64$i32", the same per-argument mangling as generic
+# struct types (#1574) and ritz0's fn instantiation names.
+#
+# `f(a < b, c > (d))` produces the same token stream.  A single-argument list
+# is always a call (unchanged since #1300).  A list of two or more is a call
+# unless an argument is value-like (generic_arg_is_value_like); then this
+# action fails — p.error = 1 makes postfix_ops backtrack to before the `<`,
+# which then parses as a comparison.  ritz0 differs here: it takes any list
+# followed by `(` as type arguments (test_ritz1_multi_arg_generic_call.py).
+pub fn postfix_generic_call_list(p: *Parser, ga: *GenericArg, args: *Expr) -> *PostfixOp
+    if ga.next == null
+        return postfix_generic_call_arg(p, ga, args)
+    var cur: *GenericArg = ga
+    while cur != null
+        if generic_arg_is_value_like(cur) == 1
+            p.error = 1
+            return null
+        cur = cur.next
+    let op: *PostfixOp = parser_alloc(p, 80) as *PostfixOp
+    op.kind = POSTFIX_CALL
+    op.args = args
+    var len: i32 = 0
+    op.call_type_suffix = mangle_generic_args(p, null, 0, ga, @len)
+    op.call_type_suffix_len = len
+    op.next = null
+    return op
+
 pub fn postfix_index(p: *Parser, index: *Expr) -> *PostfixOp
     let op: *PostfixOp = parser_alloc(p, 64) as *PostfixOp
     op.kind = POSTFIX_INDEX
