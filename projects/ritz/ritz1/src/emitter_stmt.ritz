@@ -1049,6 +1049,22 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
                     emit_str(s, c", ptr ")
                     emit_reg(s, member_result.reg)
                     emit_str(s, c"\n")
+                else if field.field_type == TYPE_BOOL
+                    # AGAST #1439: global-struct field stores now route here
+                    # (`flags.on = true`); without this arm a bool fell to
+                    # the 8-byte `store i64` default and clobbered the next
+                    # 7 bytes.  Mirrors STMT_LOCAL_FIELD_ASSIGN's i1 arm.
+                    let trunc1: i32 = next_reg(s)
+                    emit_str(s, c"  ")
+                    emit_reg(s, trunc1)
+                    emit_str(s, c" = trunc i64 ")
+                    emit_reg(s, val)
+                    emit_str(s, c" to i1\n")
+                    emit_str(s, c"  store i1 ")
+                    emit_reg(s, trunc1)
+                    emit_str(s, c", ptr ")
+                    emit_reg(s, member_result.reg)
+                    emit_str(s, c"\n")
                 else if field.field_type == TYPE_PTR or field.field_type == TYPE_PTR_PTR
                     let ptr_val: i32 = next_reg(s)
                     emit_str(s, c"  ")
@@ -1181,6 +1197,15 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
                             emit_reg(s, elem_ptr)
                             emit_str(s, c"\n")
                         return
+                # AGAST #1439: `x.f[i] = v` whose member did not resolve, or
+                # whose field is not an inline array, must not fall through
+                # to the generic deref store below: that path evaluates
+                # `x.f[i]` as a VALUE and stores through it as an address
+                # (segfault or a wild write).  Pointer-field indexing is
+                # AGAST #1596; until it is lowered properly, refuse
+                # rather than miscompile.
+                emit_ir_error(s, c"unhandled indexed EXPR_MEMBER in assignment")
+                return
 
         # Deref assignment: *(expr) = value.  As of AGAST #1304
         # stmt_assign_deref wraps the target in EXPR_UNARY/OP_DEREF, so
@@ -2110,6 +2135,49 @@ fn emit_index_assign_ptr_store(s: *EmitterState, stmt: *Stmt, base_ptr: i32, bas
         emit_reg(s, elem_ptr)
         emit_str(s, c"\n")
 
+# AGAST #1439: `name.field = v` / `name.field[i] = v` that the fast
+# STMT_LOCAL_FIELD_ASSIGN / STMT_LOCAL_FIELD_INDEX_ASSIGN lowering could not
+# resolve (no such local or param, unknown struct, unknown field).  Those arms
+# used to emit NOTHING — no store, no diagnostic, exit 0 — while a read of the
+# same member failed closed.  Re-lower the statement as an expression
+# assignment to the member `name.field` (wrapped in an index when
+# `with_index` is 1), so emit_assign resolves it through emit_member_ptr like
+# every other field store: a field of a GLOBAL struct gets a real GEP + store
+# (`ops.n = 5`), and anything still unresolved hits emit_assign's
+# emit_ir_error instead of vanishing.
+fn emit_local_field_store_fallback(s: *EmitterState, stmt: *Stmt, with_index: i32)
+    var fb_base: Expr
+    fb_base.kind = EXPR_IDENT
+    fb_base.span = stmt.span
+    fb_base.ident_ptr = stmt.var_name
+    fb_base.ident_len = stmt.var_name_len
+    fb_base.next = null
+    var fb_mem: Expr
+    fb_mem.kind = EXPR_MEMBER
+    fb_mem.span = stmt.span
+    fb_mem.left = @fb_base
+    fb_mem.ident_ptr = stmt.assign_target
+    fb_mem.ident_len = stmt.assign_target_len
+    fb_mem.next = null
+    var fb_idx: Expr
+    fb_idx.kind = EXPR_INDEX
+    fb_idx.span = stmt.span
+    fb_idx.left = @fb_mem
+    fb_idx.right = stmt.while_cond
+    fb_idx.next = null
+    var fb_st: Stmt
+    fb_st.kind = STMT_ASSIGN
+    fb_st.span = stmt.span
+    if with_index == 1
+        fb_st.if_cond = @fb_idx
+    else
+        fb_st.if_cond = @fb_mem
+    fb_st.assign_target = null
+    fb_st.assign_target_len = 0
+    fb_st.assign_value = stmt.assign_value
+    fb_st.next = null
+    emit_assign(s, @fb_st)
+
 fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
     if stmt.kind == STMT_VAR_DECL
         emit_var_decl(s, stmt)
@@ -2641,6 +2709,7 @@ fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         # stmt.var_name = variable name
         # stmt.assign_target = field name
         # stmt.assign_value = value expression
+        var lfa_done: i32 = 0
         let loc: *LocalVar = find_local_struct_name(s, stmt.var_name, stmt.var_name_len)
         if loc != null
             let st: *StructDef = find_struct(s, loc.type_name, loc.type_name_len)
@@ -2648,6 +2717,7 @@ fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                 let field_idx: i32 = find_field_index(st, stmt.assign_target, stmt.assign_target_len)
                 if field_idx >= 0
                     let field: *StructField = get_field_type(st, field_idx)
+                    lfa_done = 1
                     # Get the base pointer - differs for TYPE_PTR/TYPE_REF/TYPE_MUT_REF vs TYPE_STRUCT
                     var base_ptr_reg: i32 = loc.reg
                     if loc.var_type == TYPE_PTR or loc.var_type == TYPE_REF or loc.var_type == TYPE_MUT_REF
@@ -2764,12 +2834,16 @@ fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                         emit_str(s, c", ptr ")
                         emit_reg(s, field_ptr)
                         emit_str(s, c"\n")
+        # AGAST #1439: unresolved here -> shared member-store path.
+        if lfa_done == 0
+            emit_local_field_store_fallback(s, stmt, 0)
     else if stmt.kind == STMT_LOCAL_FIELD_INDEX_ASSIGN
         # local_var.field[index] = value
         # stmt.var_name = variable name
         # stmt.assign_target = field name
         # stmt.while_cond = index expression (reused)
         # stmt.assign_value = value expression
+        var lfia_done: i32 = 0
         let loc: *LocalVar = find_local_struct_name(s, stmt.var_name, stmt.var_name_len)
         if loc != null
             let st: *StructDef = find_struct(s, loc.type_name, loc.type_name_len)
@@ -2777,6 +2851,7 @@ fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                 let field_idx: i32 = find_field_index(st, stmt.assign_target, stmt.assign_target_len)
                 if field_idx >= 0
                     let field: *StructField = get_field_type(st, field_idx)
+                    lfia_done = 1
                     # Get the base pointer - differs for TYPE_PTR/TYPE_REF/TYPE_MUT_REF vs TYPE_STRUCT
                     var base_ptr_reg: i32 = loc.reg
                     if loc.var_type == TYPE_PTR or loc.var_type == TYPE_REF or loc.var_type == TYPE_MUT_REF
@@ -2888,6 +2963,9 @@ fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                         emit_str(s, c", ptr ")
                         emit_reg(s, elem_ptr)
                         emit_str(s, c"\n")
+        # AGAST #1439: unresolved here -> shared member-store path.
+        if lfia_done == 0
+            emit_local_field_store_fallback(s, stmt, 1)
     else if stmt.kind == STMT_INDEX_ASSIGN
         # name[index] = value (array or pointer index assignment)
         # stmt.assign_target = base variable name (as *u8)
