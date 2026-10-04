@@ -81,8 +81,6 @@ _RITZ1_TWINS = {
         "AGAST #1602 — int→int `as` cast is a no-op (0x95511559 as i32)",
     "test_level15::test_slice_subslice":
         "AGAST #1603 — `@arr[i] + n` pointer arithmetic not scaled by element size",
-    "test_level16::test_u64_large_values":
-        "AGAST #1604 — u64 compare/div/mod emit signed ops",
     "test_level9::test_indent_stack_struct":
         "AGAST #1605 — `[v; N]` array field in a struct literal stores a pointer",
     "test_level38::test_const_array_fill":
