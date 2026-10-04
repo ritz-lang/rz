@@ -305,9 +305,11 @@ that no code in the repo had ever used a variant with more than one field:
    ritz1 must compute exact sizes, which requires the parser to stop discarding
    variant payload types.
 
-Because the regression matrix runs every case against ritz0, ritz1 and
-ritz1_selfhosted, a struct-variant test cannot be added to the matrix until
-ritz1 supports the form. See AGAST #1282 for sequencing.
+The regression matrix runs every case against ritz0, ritz1 and
+ritz1_selfhosted. Since AGAST #1371 it discovers every file in `ritz0/test/`,
+so `test_issue_struct_enum_variants` runs on ritz1 today and is listed in
+`EXPECTED_FAILURES` against #1295. That entry is strict-xpass: the change that
+makes ritz1 build the file must delete it. See AGAST #1282 for sequencing.
 
 ---
 

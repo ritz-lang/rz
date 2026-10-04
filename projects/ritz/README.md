@@ -145,10 +145,14 @@ Run the gate and read its output:
 make matrix-full
 ```
 
-Measured 2026-09-12, exit 0: `ritz0 53/53`, `ritz1 52/53`,
-`ritz1_selfhosted 52/53`. The single failure is `test_issue_float_coercion`
-(ritz1 has no float method dispatch, **AGAST #1370**), explicitly excused, which
-is why the gate is green — *exit 0 does not mean 53/53 on every stage*.
+Until AGAST #1371 the matrix reported "53/53": it ran only the FIRST
+`[[test]]` fn of each of 53 hardcoded files — 53 of 560 test fns. It now runs
+every `[[test]]` fn of every file in `ritz0/test/`. Measured 2026-10-04, exit 0:
+`ritz0 550/564`, `ritz1 381/564`, `ritz1_selfhosted 381/564` (4 skipped on a
+host without SHA-NI). Every failure is listed in `EXPECTED_FAILURES` in
+`tools/run_regression_matrix.py` against its own AGAST ticket, and the list is
+strict-xpass — *exit 0 means "nothing unexpected", not "everything passes"*;
+read the gate's summary for the real counts.
 
 `ritz2`, an optimizing compiler, is a future idea with no code.
 

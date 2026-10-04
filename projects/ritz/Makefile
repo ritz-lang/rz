@@ -172,7 +172,9 @@ valgrind: build
 	@$(VALGRIND) examples/10_sleep/sleep 0.001
 	@echo "✓ All valgrind checks passed!"
 
-# Validation matrix: 33-test regression × {ritz0, ritz1, ritz1_selfhosted}.
+# Validation matrix: every [[test]] fn in ritz0/test/*.ritz × {ritz0, ritz1,
+# ritz1_selfhosted}. Files are discovered, not listed, and a floor fails the
+# run if fewer fns executed than are on disk (AGAST #1371).
 # See docs/VALIDATION.md for the full validation workflow.
 #
 # Three escalating thoroughness levels:

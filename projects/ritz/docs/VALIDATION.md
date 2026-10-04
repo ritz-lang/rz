@@ -38,10 +38,10 @@ rare.
   `ritz1` only. Catches almost all regressions you'd care about during inner-loop
   work.
 - **ritz1 full (level 2)** — Same incremental `ritz1` build, then runs the full
-  33-test matrix against `ritz1`. Skips selfhost. Catches anything the filtered
+  matrix (every `[[test]]` fn in `ritz0/test/`) against `ritz1`. Skips selfhost. Catches anything the filtered
   level 1 would miss.
 - **Full matrix (level 3)** — Incremental `ritz1` rebuild **and** incremental
-  `ritz1_selfhosted` rebuild, then runs all 33 tests against all three compilers
+  `ritz1_selfhosted` rebuild, then runs every test fn against all three compilers
   (ritz0, ritz1, ritz1_selfhosted). Catches "ritz1 itself miscompiles its own
   source" bugs.
 - **Pristine (level 4)** — `make clean` + full bootstrap + matrix. Only useful
@@ -218,12 +218,27 @@ The matrix runner has flags for every level above:
 
 | Flag | What it does |
 |---|---|
-| (no flags) | Run all 33 tests against all 3 compilers (~1 min) |
+| (no flags) | Run every `[[test]]` fn in every `ritz0/test/*.ritz` against all 3 compilers (~1 min at -j8) |
 | `--compiler ritz1` | Skip ritz0 and selfhost (~24 s) |
 | `--compiler ritz1_selfhosted` | Just selfhost (~33 s) |
-| `--tests <regex>` | Filter test names |
+| `--tests <regex>` | Filter test FILE names (every fn in a selected file runs) |
+| `--jobs N / -j N` | Parallel (file, compiler) cells; default min(8, nproc) |
 | `--rebuild` | `make -C ritz1 bootstrap` first (incremental — fast unless source changed) |
-| `--verbose / -v` | Per-test output |
+| `--verbose / -v` | Full diagnostic per failing fn |
+
+What runs, and why it cannot quietly shrink (AGAST #1371): the runner used to
+call only the FIRST `[[test]]` fn of each file in a hardcoded 53-name list — 53
+of 560 fns. Now every `*.ritz` in `ritz0/test/` is discovered (minus
+`NOT_TESTS`, files with nothing to execute), every `[[test]]` fn is its own
+unit (`file::fn`, own process), a file with no tests but a `main` runs that
+main, and the gate fails if any `[[test]]` line on disk did not become an
+executed unit. Files using ISA extensions the host lacks (`REQUIRES_CPU`) are
+reported as skipped, never as passes.
+
+`EXPECTED_FAILURES` is strict-xpass and keyed `(compiler, "file")` or
+`(compiler, "file::fn")`. A file-level entry excuses only build failures
+(compile/asm/link), which hit every fn at once; a runtime failure needs a
+per-fn entry. Each entry cites the AGAST ticket for its root cause.
 
 The `make matrix` and `make matrix-full` targets in the project Makefile wrap
 the most common combinations.
