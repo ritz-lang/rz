@@ -1154,8 +1154,19 @@ class TestSelfNamespace:
         """The #1538 acceptance test: real build.py, RITZ_PATH = ritz root only."""
         import os
         import subprocess
-        if compiler == "ritz1" and not (RITZ_DIR / "ritz1" / "build" / "ritz1").exists():
-            pytest.skip("ritz1 binary not built")
+        if compiler == "ritz1":
+            # AGAST #1595: build ritz1 here, don't skip. CI runs this suite
+            # before the bootstrap chain builds ritz1, so a skip-if-missing
+            # here never ran in CI and tripped main.yml's #1327 guard. Always
+            # call make: an up-to-date make is a no-op, and a stale binary
+            # (present but out of date) gets rebuilt (#1322).
+            build = subprocess.run(
+                ["make", "-C", "ritz1", "ritz1"],
+                cwd=RITZ_DIR, env=dict(os.environ, RITZ_PATH=str(RITZ_DIR)),
+                capture_output=True, text=True, timeout=1800,
+            )
+            if build.returncode != 0 or not (RITZ_DIR / "ritz1" / "build" / "ritz1").exists():
+                pytest.fail(f"could not build ritz1:\n{build.stdout[-4000:]}\n{build.stderr[-4000:]}")
         pkg = _self_import_package(tmp_path)
         env = dict(os.environ, RITZ_PATH=str(RITZ_DIR))
         proc = subprocess.run(
