@@ -79,8 +79,6 @@ _RITZ1_TWINS = {
         "AGAST #1602 — int→int `as` cast is a no-op (0xffffffff as i32 stays i64)",
     "test_avx2::test_simd_xor_v8i32":
         "AGAST #1602 — int→int `as` cast is a no-op (0x95511559 as i32)",
-    "test_level9::test_indent_stack_struct":
-        "AGAST #1605 — `[v; N]` array field in a struct literal stores a pointer",
     # --- codegen, build failures ---
     "test_mut_ref":
         "AGAST #1607 — instance-method args not narrowed to param width (invalid IR)",
