@@ -491,6 +491,409 @@ fn deref_member_field(s: *EmitterState, e: *Expr) -> *StructField
         return null
     get_field_type(st, idx)
 
+# AGAST #1488: the address of an lvalue, as a `ptr` register, or -1 when
+# `op` is not an lvalue this emitter can address.  Shared by `@` (OP_ADDR,
+# which ptrtoints the result to the i64 value model) and `@&` (OP_ADDR_MUT,
+# which yields the ptr itself).  Before #1488 these shapes lived inline in
+# OP_ADDR only, and `@&` handled nothing but a bare local, so `@&s.field`,
+# `@&p.a.b`, `@&arr[i].f` and `@&g` were all "cannot take mutable address".
+# Emits no diagnostic of its own: the caller reports the failure.
+fn emit_lvalue_ptr(s: *EmitterState, op: *Expr) -> i32
+    if op.kind == EXPR_IDENT
+        let loc: i32 = find_local(s, op.ident_ptr, op.ident_len)
+        if loc >= 0
+            # Convert ptr (alloca) to i64
+            return loc
+        # Fall through: not a local, try a global. `@g_processed` (a
+        # `var g_processed: Vec<String>` at module scope) used to silently
+        # produce "ERROR: cannot take address" because this branch only
+        # checked find_local — pre-existing limitation that didn't fire
+        # until idiomatic main.ritz introduced struct-typed globals.
+        let glob: *GlobalVarDef = find_global(s, op.ident_ptr, op.ident_len)
+        if glob != null
+            # A global's address is the constant `@name`; GEP it by 0 to get
+            # it into a register, since callers want a reg for both @ and @&.
+            let result: i32 = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, result)
+            emit_str(s, c" = getelementptr i8, ptr @")
+            emit_name(s, glob.name, glob.name_len)
+            emit_str(s, c", i64 0\n")
+            return result
+    else if op.kind == EXPR_INDEX
+        # Handle @arr[i] - address of array element
+        if op.left.kind == EXPR_IDENT
+            let local: *LocalVar = find_local_struct_name(s, op.left.ident_ptr, op.left.ident_len)
+            if local != null
+                if local.var_type == TYPE_ARRAY
+                    # Array local - use GEP [0, index] to get element address
+                    let idx: i32 = emit_expr(s, op.right)
+                    let elem_ptr: i32 = next_reg(s)
+                    emit_str(s, c"  ")
+                    emit_reg(s, elem_ptr)
+                    emit_str(s, c" = getelementptr [")
+                    emit_int(s, local.array_size as i64)
+                    emit_str(s, c" x ")
+                    if local.array_elem_type == TYPE_STRUCT and local.type_name_len > 0
+                        # AGAST #190: `@arr[i]` over `var arr: [N]Struct`
+                        # — emit `[N x %T]` so the GEP stride matches the
+                        # struct-element layout.  Without this, the
+                        # downstream `ptrtoint` produces a pointer
+                        # computed against an `[N x i64]` stride that
+                        # disagrees with the alloca's `[N x %T]` layout.
+                        emit_llvm_type_struct(s, TYPE_STRUCT, local.type_name, local.type_name_len)
+                    else
+                        # AGAST #1564: the alloca's own element type;
+                        # u32/u16/i16 used to stride as i64.
+                        emit_str(s, array_elem_llvm(local.array_elem_type))
+                    emit_str(s, c"], ptr ")
+                    emit_reg(s, local.reg)
+                    emit_str(s, c", i64 0, i64 ")
+                    emit_reg(s, idx)
+                    emit_str(s, c"\n")
+                    # Convert to i64
+                    return elem_ptr
+                else if local.var_type == TYPE_PTR
+                    # @ptr_var[i] where ptr_var: *T — load the pointer,
+                    # GEP by element, convert to i64. Common in cryptosec
+                    # (e.g. `load_u64_be(@data[0])` with `data: *u8`).
+                    # Without this branch the address-of falls through
+                    # to "; ERROR: cannot take address" and the caller
+                    # references undef %.0.
+                    let loaded_p: i32 = emit_load_ptr(s, local.reg)
+                    let idx_p: i32 = emit_expr(s, op.right)
+                    let elem_ptr_p: i32 = next_reg(s)
+                    emit_str(s, c"  ")
+                    emit_reg(s, elem_ptr_p)
+                    emit_str(s, c" = getelementptr ")
+                    if local.pointee_type == TYPE_I32 or local.pointee_type == TYPE_U32
+                        emit_str(s, c"i32")
+                    else if local.pointee_type == TYPE_I64 or local.pointee_type == TYPE_U64
+                        emit_str(s, c"i64")
+                    else if local.pointee_type == TYPE_I16 or local.pointee_type == TYPE_U16
+                        emit_str(s, c"i16")
+                    else if local.pointee_type == TYPE_PTR or local.pointee_type == TYPE_PTR_PTR
+                        emit_str(s, c"ptr")
+                    else
+                        # Default to i8 (covers *u8 / *i8 — most common).
+                        emit_str(s, c"i8")
+                    emit_str(s, c", ptr ")
+                    emit_reg(s, loaded_p)
+                    emit_str(s, c", i64 ")
+                    emit_reg(s, idx_p)
+                    emit_str(s, c"\n")
+                    return elem_ptr_p
+            # If `op.left` is an ident but no matching local
+            # was found, try the global table.  Squeeze's inflate
+            # computes `@g_fixed_litlen_lengths[0]` and friends —
+            # the global is `[288]u8` so a byte-level GEP works.
+            # AGAST #190 extends this with a proper struct-array
+            # branch: nexus's `var g_fallback: [100]FallbackPage`
+            # needs `[100 x %FallbackPage]` GEP, not byte-level —
+            # otherwise `@g_fallback[idx]` returns a pointer that
+            # disagrees with the global's actual `[100 x %T]`
+            # layout and downstream member loads pull garbage.
+            let glob_arr: *GlobalVarDef = find_global(s, op.left.ident_ptr, op.left.ident_len)
+            if glob_arr != null
+                if glob_arr.var_type == TYPE_ARRAY and glob_arr.array_elem_type == TYPE_STRUCT and glob_arr.array_elem_type_name_len > 0
+                    let gas_idx: i32 = emit_expr(s, op.right)
+                    let gas_elem: i32 = next_reg(s)
+                    emit_str(s, c"  ")
+                    emit_reg(s, gas_elem)
+                    emit_str(s, c" = getelementptr [")
+                    emit_int(s, glob_arr.array_size as i64)
+                    emit_str(s, c" x ")
+                    emit_llvm_type_struct(s, TYPE_STRUCT, glob_arr.array_elem_type_name, glob_arr.array_elem_type_name_len)
+                    emit_str(s, c"], ptr @")
+                    emit_name(s, glob_arr.name, glob_arr.name_len)
+                    emit_str(s, c", i64 0, i64 ")
+                    emit_reg(s, gas_idx)
+                    emit_str(s, c"\n")
+                    return gas_elem
+                let ga_idx: i32 = emit_expr(s, op.right)
+                let ga_elem: i32 = next_reg(s)
+                emit_str(s, c"  ")
+                emit_reg(s, ga_elem)
+                emit_str(s, c" = getelementptr i8, ptr @")
+                emit_name(s, glob_arr.name, glob_arr.name_len)
+                emit_str(s, c", i64 ")
+                emit_reg(s, ga_idx)
+                emit_str(s, c"\n")
+                return ga_elem
+        # Handle @global.array_field[i] - address of global struct's array field element
+        else if op.left.kind == EXPR_MEMBER
+            if op.left.left.kind == EXPR_IDENT
+                # Try to find as global variable
+                let glob: *GlobalVarDef = find_global(s, op.left.left.ident_ptr, op.left.left.ident_len)
+                if glob != null
+                    if glob.var_type == TYPE_STRUCT
+                        let st: *StructDef = find_struct(s, glob.type_name, glob.type_name_len)
+                        if st != null
+                            let field_idx: i32 = find_field_index(st, op.left.ident_ptr, op.left.ident_len)
+                            if field_idx >= 0
+                                let field: *StructField = get_field_type(st, field_idx)
+                                if field.field_type == TYPE_ARRAY
+                                    # Found an array field in global struct
+                                    # Emit GEP to array field, then index into it
+                                    # getelementptr %StructType, ptr @global, i32 0, i32 field_idx, i64 index
+                                    let idx: i32 = emit_expr(s, op.right)
+                                    let elem_ptr: i32 = next_reg(s)
+                                    emit_str(s, c"  ")
+                                    emit_reg(s, elem_ptr)
+                                    emit_str(s, c" = getelementptr %")
+                                    emit_name(s, st.name, st.name_len)
+                                    emit_str(s, c", ptr @")
+                                    emit_name(s, glob.name, glob.name_len)
+                                    emit_str(s, c", i32 0, i32 ")
+                                    emit_int(s, field_idx as i64)
+                                    emit_str(s, c", i64 ")
+                                    emit_reg(s, idx)
+                                    emit_str(s, c"\n")
+                                    # Convert to i64
+                                    return elem_ptr
+                # Handle @ptr_to_struct.array_field[i] - address of element in array field via pointer
+                let local: *LocalVar = find_local_struct_name(s, op.left.left.ident_ptr, op.left.left.ident_len)
+                if local != null
+                    if local.var_type == TYPE_PTR and local.type_name_len > 0
+                        # It's a pointer to a struct with a known type name
+                        let st: *StructDef = find_struct(s, local.type_name, local.type_name_len)
+                        if st != null
+                            let field_idx: i32 = find_field_index(st, op.left.ident_ptr, op.left.ident_len)
+                            if field_idx >= 0
+                                let field: *StructField = get_field_type(st, field_idx)
+                                if field.field_type == TYPE_ARRAY
+                                    # Load the pointer from the local, GEP to array field, index into it
+                                    let loaded_ptr: i32 = emit_load_ptr(s, local.reg)
+                                    # GEP to array field, then to element
+                                    let idx: i32 = emit_expr(s, op.right)
+                                    let elem_ptr: i32 = next_reg(s)
+                                    emit_str(s, c"  ")
+                                    emit_reg(s, elem_ptr)
+                                    emit_str(s, c" = getelementptr %")
+                                    emit_name(s, st.name, st.name_len)
+                                    emit_str(s, c", ptr ")
+                                    emit_reg(s, loaded_ptr)
+                                    emit_str(s, c", i32 0, i32 ")
+                                    emit_int(s, field_idx as i64)
+                                    emit_str(s, c", i64 ")
+                                    emit_reg(s, idx)
+                                    emit_str(s, c"\n")
+                                    # Convert to i64
+                                    return elem_ptr
+                                else if field.field_type == TYPE_PTR
+                                    # @ptr_to_struct.ptr_field[i] — the field
+                                    # is a raw pointer (e.g. *u8 buffer in
+                                    # cryptosec's DerElement.content).  Load
+                                    # the parent ptr, GEP to the field, load
+                                    # the field-pointer, then GEP into that
+                                    # buffer by index.  Element type defaults
+                                    # to i8 since the common case is *u8 and
+                                    # GlobalVarDef-style element-type info
+                                    # isn't tracked on StructField.
+                                    let parent_ptr: i32 = emit_load_ptr(s, local.reg)
+                                    let fld_addr: i32 = next_reg(s)
+                                    emit_str(s, c"  ")
+                                    emit_reg(s, fld_addr)
+                                    emit_str(s, c" = getelementptr %")
+                                    emit_name(s, st.name, st.name_len)
+                                    emit_str(s, c", ptr ")
+                                    emit_reg(s, parent_ptr)
+                                    emit_str(s, c", i32 0, i32 ")
+                                    emit_int(s, field_idx as i64)
+                                    emit_str(s, c"\n")
+                                    let buf_ptr: i32 = next_reg(s)
+                                    emit_str(s, c"  ")
+                                    emit_reg(s, buf_ptr)
+                                    emit_str(s, c" = load ptr, ptr ")
+                                    emit_reg(s, fld_addr)
+                                    emit_str(s, c"\n")
+                                    let pf_idx: i32 = emit_expr(s, op.right)
+                                    let pf_elem: i32 = next_reg(s)
+                                    emit_str(s, c"  ")
+                                    emit_reg(s, pf_elem)
+                                    emit_str(s, c" = getelementptr i8, ptr ")
+                                    emit_reg(s, buf_ptr)
+                                    emit_str(s, c", i64 ")
+                                    emit_reg(s, pf_idx)
+                                    emit_str(s, c"\n")
+                                    return pf_elem
+                    # task-170: @local_struct.array_field[i] — local stack-
+                    # allocated struct (TYPE_STRUCT, not PTR). e.g.
+                    # `var addr: SockAddrIn` then `memset(@addr.zero[0],...)`
+                    # in ritzlib/net.ritz. Without this branch it falls
+                    # through to "; ERROR: cannot take address" — same
+                    # symptom as the chained-member case but a different
+                    # base shape.
+                    if local.var_type == TYPE_STRUCT and local.type_name_len > 0
+                        let st_ls: *StructDef = find_struct(s, local.type_name, local.type_name_len)
+                        if st_ls != null
+                            let field_idx_ls: i32 = find_field_index(st_ls, op.left.ident_ptr, op.left.ident_len)
+                            if field_idx_ls >= 0
+                                let field_ls: *StructField = get_field_type(st_ls, field_idx_ls)
+                                if field_ls.field_type == TYPE_ARRAY
+                                    let idx_ls: i32 = emit_expr(s, op.right)
+                                    let elem_ptr_ls: i32 = next_reg(s)
+                                    emit_str(s, c"  ")
+                                    emit_reg(s, elem_ptr_ls)
+                                    emit_str(s, c" = getelementptr %")
+                                    emit_name(s, st_ls.name, st_ls.name_len)
+                                    emit_str(s, c", ptr ")
+                                    emit_reg(s, local.reg)
+                                    emit_str(s, c", i32 0, i32 ")
+                                    emit_int(s, field_idx_ls as i64)
+                                    emit_str(s, c", i64 ")
+                                    emit_reg(s, idx_ls)
+                                    emit_str(s, c"\n")
+                                    return elem_ptr_ls
+            # task-170 site-1: chained-member addr-of-index, e.g.
+            # `@p.command.args[i]` where `p.command` itself is a member
+            # access (RespParser.command yields a RespCommand struct
+            # field, whose `args` field is an array). emit_member_ptr
+            # already handles arbitrarily-nested member chains — use it
+            # to compute a ptr to the array field, then GEP by index.
+            else if op.left.left.kind == EXPR_MEMBER
+                var inner_result_cm: MemberPtrResult
+                emit_member_ptr(s, op.left, @inner_result_cm)
+                if inner_result_cm.success == 1
+                    let inner_field_cm: *StructField = inner_result_cm.field
+                    if inner_field_cm.field_type == TYPE_ARRAY
+                        let idx_cm: i32 = emit_expr(s, op.right)
+                        let elem_ptr_cm: i32 = next_reg(s)
+                        emit_str(s, c"  ")
+                        emit_reg(s, elem_ptr_cm)
+                        emit_str(s, c" = getelementptr [")
+                        emit_int(s, inner_field_cm.array_size as i64)
+                        emit_str(s, c" x ")
+                        if inner_field_cm.array_elem_type == TYPE_STRUCT and inner_field_cm.array_elem_type_name_len > 0
+                            emit_str(s, c"%")
+                            emit_name(s, inner_field_cm.array_elem_type_name, inner_field_cm.array_elem_type_name_len)
+                        else if inner_field_cm.array_elem_type == TYPE_I32 or inner_field_cm.array_elem_type == TYPE_U32
+                            emit_str(s, c"i32")
+                        else if inner_field_cm.array_elem_type == TYPE_I64 or inner_field_cm.array_elem_type == TYPE_U64
+                            emit_str(s, c"i64")
+                        else if inner_field_cm.array_elem_type == TYPE_U8 or inner_field_cm.array_elem_type == TYPE_I8
+                            emit_str(s, c"i8")
+                        else if inner_field_cm.array_elem_type == TYPE_U16 or inner_field_cm.array_elem_type == TYPE_I16
+                            emit_str(s, c"i16")
+                        else if inner_field_cm.array_elem_type == TYPE_PTR or inner_field_cm.array_elem_type == TYPE_PTR_PTR
+                            emit_str(s, c"ptr")
+                        else
+                            emit_str(s, c"i64")
+                        emit_str(s, c"], ptr ")
+                        emit_reg(s, inner_result_cm.reg)
+                        emit_str(s, c", i64 0, i64 ")
+                        emit_reg(s, idx_cm)
+                        emit_str(s, c"\n")
+                        return elem_ptr_cm
+    else if op.kind == EXPR_MEMBER
+        # Handle @local_struct.field - address of a field in a local struct
+        if op.left.kind == EXPR_IDENT
+            # Try to find as local struct variable
+            let local: *LocalVar = find_local_struct_name(s, op.left.ident_ptr, op.left.ident_len)
+            if local != null
+                # Check if it's a struct, or a pointer/reference to a struct
+                var is_struct_or_ref: i32 = 0
+                if local.var_type == TYPE_STRUCT
+                    is_struct_or_ref = 1
+                else if local.var_type == TYPE_PTR or local.var_type == TYPE_REF or local.var_type == TYPE_MUT_REF
+                    # Check if it points to a struct (has type_name set)
+                    if local.type_name_len > 0
+                        is_struct_or_ref = 1
+                if is_struct_or_ref == 1
+                    # Found a local struct or ref to struct - get the struct definition
+                    let st: *StructDef = find_struct(s, local.type_name, local.type_name_len)
+                    if st != null
+                        let field_idx: i32 = find_field_index(st, op.ident_ptr, op.ident_len)
+                        if field_idx >= 0
+                            if local.var_type == TYPE_STRUCT
+                                # Direct struct - GEP from local.reg directly
+                                let field_ptr: i32 = next_reg(s)
+                                emit_str(s, c"  ")
+                                emit_reg(s, field_ptr)
+                                emit_str(s, c" = getelementptr %")
+                                emit_name(s, st.name, st.name_len)
+                                emit_str(s, c", ptr ")
+                                emit_reg(s, local.reg)
+                                emit_str(s, c", i32 0, i32 ")
+                                emit_int(s, field_idx as i64)
+                                emit_str(s, c"\n")
+                                # Convert pointer to i64
+                                return field_ptr
+                            else
+                                # Ptr/ref - native ptr load (task #73 migration)
+                                let loaded_ptr: i32 = emit_load_ptr(s, local.reg)
+                                let field_ptr: i32 = next_reg(s)
+                                emit_str(s, c"  ")
+                                emit_reg(s, field_ptr)
+                                emit_str(s, c" = getelementptr %")
+                                emit_name(s, st.name, st.name_len)
+                                emit_str(s, c", ptr ")
+                                emit_reg(s, loaded_ptr)
+                                emit_str(s, c", i32 0, i32 ")
+                                emit_int(s, field_idx as i64)
+                                emit_str(s, c"\n")
+                                # Convert pointer to i64
+                                return field_ptr
+    # AGAST #184: generic addr-of-MEMBER fallback. Anything that
+    # `emit_member_ptr` knows how to GEP — including the new
+    # `parent.fwd[i].field` over **Foo case — gets handled here
+    # without each shape needing its own bespoke OP_ADDR branch.
+    # Without this, the call-site emitted undef `%.0` after the
+    # explicit cases above all missed (e.g. EXPR_MEMBER over an
+    # EXPR_INDEX base).  Lives at the OP_ADDR level (outside the
+    # operand-kind branches) so it catches anything those missed.
+    if op.kind == EXPR_MEMBER
+        var fb_result: MemberPtrResult
+        emit_member_ptr(s, op, @fb_result)
+        if fb_result.success == 1
+            return fb_result.reg
+    # AGAST #184: addr-of-INDEX fallback for arbitrarily-deep
+    # MEMBER chains.  `@doc.fields[i].key[0]` (mausoleum's
+    # doc_find_field_index) is INDEX-of-MEMBER-of-INDEX-of-MEMBER-of-IDENT
+    # — the existing OP_ADDR branches only matched the simpler
+    # 1- or 2-level chains, leaving deeper shapes to fall through
+    # to "; ERROR: cannot take address" + undef %.0 at the call site.
+    #
+    # Strategy: when the operand is INDEX with a MEMBER base, use
+    # emit_member_ptr to compute the address of the (array) field,
+    # then GEP into it by the index using the array element type.
+    if op.kind == EXPR_INDEX
+        if op.left.kind == EXPR_MEMBER
+            var idx_fb: MemberPtrResult
+            emit_member_ptr(s, op.left, @idx_fb)
+            if idx_fb.success == 1
+                let idx_fb_field: *StructField = idx_fb.field
+                if idx_fb_field.field_type == TYPE_ARRAY
+                    let idx_v: i32 = emit_expr(s, op.right)
+                    let elem_ptr_fb: i32 = next_reg(s)
+                    emit_str(s, c"  ")
+                    emit_reg(s, elem_ptr_fb)
+                    emit_str(s, c" = getelementptr [")
+                    emit_int(s, idx_fb_field.array_size as i64)
+                    emit_str(s, c" x ")
+                    if idx_fb_field.array_elem_type == TYPE_STRUCT and idx_fb_field.array_elem_type_name_len > 0
+                        emit_str(s, c"%")
+                        emit_name(s, idx_fb_field.array_elem_type_name, idx_fb_field.array_elem_type_name_len)
+                    else if idx_fb_field.array_elem_type == TYPE_I32 or idx_fb_field.array_elem_type == TYPE_U32
+                        emit_str(s, c"i32")
+                    else if idx_fb_field.array_elem_type == TYPE_I64 or idx_fb_field.array_elem_type == TYPE_U64
+                        emit_str(s, c"i64")
+                    else if idx_fb_field.array_elem_type == TYPE_U8 or idx_fb_field.array_elem_type == TYPE_I8
+                        emit_str(s, c"i8")
+                    else if idx_fb_field.array_elem_type == TYPE_U16 or idx_fb_field.array_elem_type == TYPE_I16
+                        emit_str(s, c"i16")
+                    else if idx_fb_field.array_elem_type == TYPE_PTR or idx_fb_field.array_elem_type == TYPE_PTR_PTR
+                        emit_str(s, c"ptr")
+                    else
+                        emit_str(s, c"i64")
+                    emit_str(s, c"], ptr ")
+                    emit_reg(s, idx_fb.reg)
+                    emit_str(s, c", i64 0, i64 ")
+                    emit_reg(s, idx_v)
+                    emit_str(s, c"\n")
+                    return elem_ptr_fb
+    return -1
+
 fn emit_expr_unary(s: *EmitterState, e: *Expr) -> i32
     if e.op == OP_NEG
         let operand: i32 = emit_expr(s, e.operand)
@@ -623,490 +1026,23 @@ fn emit_expr_unary(s: *EmitterState, e: *Expr) -> i32
             emit_str(s, c"\n")
             return result
     else if e.op == OP_ADDR
-        if e.operand.kind == EXPR_IDENT
-            let loc: i32 = find_local(s, e.operand.ident_ptr, e.operand.ident_len)
-            if loc >= 0
-                # Convert ptr (alloca) to i64
-                let result: i32 = next_reg(s)
-                emit_str(s, c"  ")
-                emit_reg(s, result)
-                emit_str(s, c" = ptrtoint ptr ")
-                emit_reg(s, loc)
-                emit_str(s, c" to i64\n")
-                return result
-            # Fall through: not a local, try a global. `@g_processed` (a
-            # `var g_processed: Vec<String>` at module scope) used to silently
-            # produce "ERROR: cannot take address" because this branch only
-            # checked find_local — pre-existing limitation that didn't fire
-            # until idiomatic main.ritz introduced struct-typed globals.
-            let glob: *GlobalVarDef = find_global(s, e.operand.ident_ptr, e.operand.ident_len)
-            if glob != null
-                let result: i32 = next_reg(s)
-                emit_str(s, c"  ")
-                emit_reg(s, result)
-                emit_str(s, c" = ptrtoint ptr @")
-                emit_name(s, glob.name, glob.name_len)
-                emit_str(s, c" to i64\n")
-                return result
-        else if e.operand.kind == EXPR_INDEX
-            # Handle @arr[i] - address of array element
-            if e.operand.left.kind == EXPR_IDENT
-                let local: *LocalVar = find_local_struct_name(s, e.operand.left.ident_ptr, e.operand.left.ident_len)
-                if local != null
-                    if local.var_type == TYPE_ARRAY
-                        # Array local - use GEP [0, index] to get element address
-                        let idx: i32 = emit_expr(s, e.operand.right)
-                        let elem_ptr: i32 = next_reg(s)
-                        emit_str(s, c"  ")
-                        emit_reg(s, elem_ptr)
-                        emit_str(s, c" = getelementptr [")
-                        emit_int(s, local.array_size as i64)
-                        emit_str(s, c" x ")
-                        if local.array_elem_type == TYPE_STRUCT and local.type_name_len > 0
-                            # AGAST #190: `@arr[i]` over `var arr: [N]Struct`
-                            # — emit `[N x %T]` so the GEP stride matches the
-                            # struct-element layout.  Without this, the
-                            # downstream `ptrtoint` produces a pointer
-                            # computed against an `[N x i64]` stride that
-                            # disagrees with the alloca's `[N x %T]` layout.
-                            emit_llvm_type_struct(s, TYPE_STRUCT, local.type_name, local.type_name_len)
-                        else
-                            # AGAST #1564: the alloca's own element type;
-                            # u32/u16/i16 used to stride as i64.
-                            emit_str(s, array_elem_llvm(local.array_elem_type))
-                        emit_str(s, c"], ptr ")
-                        emit_reg(s, local.reg)
-                        emit_str(s, c", i64 0, i64 ")
-                        emit_reg(s, idx)
-                        emit_str(s, c"\n")
-                        # Convert to i64
-                        let result: i32 = next_reg(s)
-                        emit_str(s, c"  ")
-                        emit_reg(s, result)
-                        emit_str(s, c" = ptrtoint ptr ")
-                        emit_reg(s, elem_ptr)
-                        emit_str(s, c" to i64\n")
-                        return result
-                    else if local.var_type == TYPE_PTR
-                        # @ptr_var[i] where ptr_var: *T — load the pointer,
-                        # GEP by element, convert to i64. Common in cryptosec
-                        # (e.g. `load_u64_be(@data[0])` with `data: *u8`).
-                        # Without this branch the address-of falls through
-                        # to "; ERROR: cannot take address" and the caller
-                        # references undef %.0.
-                        let loaded_p: i32 = emit_load_ptr(s, local.reg)
-                        let idx_p: i32 = emit_expr(s, e.operand.right)
-                        let elem_ptr_p: i32 = next_reg(s)
-                        emit_str(s, c"  ")
-                        emit_reg(s, elem_ptr_p)
-                        emit_str(s, c" = getelementptr ")
-                        if local.pointee_type == TYPE_I32 or local.pointee_type == TYPE_U32
-                            emit_str(s, c"i32")
-                        else if local.pointee_type == TYPE_I64 or local.pointee_type == TYPE_U64
-                            emit_str(s, c"i64")
-                        else if local.pointee_type == TYPE_I16 or local.pointee_type == TYPE_U16
-                            emit_str(s, c"i16")
-                        else if local.pointee_type == TYPE_PTR or local.pointee_type == TYPE_PTR_PTR
-                            emit_str(s, c"ptr")
-                        else
-                            # Default to i8 (covers *u8 / *i8 — most common).
-                            emit_str(s, c"i8")
-                        emit_str(s, c", ptr ")
-                        emit_reg(s, loaded_p)
-                        emit_str(s, c", i64 ")
-                        emit_reg(s, idx_p)
-                        emit_str(s, c"\n")
-                        let result_p: i32 = next_reg(s)
-                        emit_str(s, c"  ")
-                        emit_reg(s, result_p)
-                        emit_str(s, c" = ptrtoint ptr ")
-                        emit_reg(s, elem_ptr_p)
-                        emit_str(s, c" to i64\n")
-                        return result_p
-                # If `e.operand.left` is an ident but no matching local
-                # was found, try the global table.  Squeeze's inflate
-                # computes `@g_fixed_litlen_lengths[0]` and friends —
-                # the global is `[288]u8` so a byte-level GEP works.
-                # AGAST #190 extends this with a proper struct-array
-                # branch: nexus's `var g_fallback: [100]FallbackPage`
-                # needs `[100 x %FallbackPage]` GEP, not byte-level —
-                # otherwise `@g_fallback[idx]` returns a pointer that
-                # disagrees with the global's actual `[100 x %T]`
-                # layout and downstream member loads pull garbage.
-                let glob_arr: *GlobalVarDef = find_global(s, e.operand.left.ident_ptr, e.operand.left.ident_len)
-                if glob_arr != null
-                    if glob_arr.var_type == TYPE_ARRAY and glob_arr.array_elem_type == TYPE_STRUCT and glob_arr.array_elem_type_name_len > 0
-                        let gas_idx: i32 = emit_expr(s, e.operand.right)
-                        let gas_elem: i32 = next_reg(s)
-                        emit_str(s, c"  ")
-                        emit_reg(s, gas_elem)
-                        emit_str(s, c" = getelementptr [")
-                        emit_int(s, glob_arr.array_size as i64)
-                        emit_str(s, c" x ")
-                        emit_llvm_type_struct(s, TYPE_STRUCT, glob_arr.array_elem_type_name, glob_arr.array_elem_type_name_len)
-                        emit_str(s, c"], ptr @")
-                        emit_name(s, glob_arr.name, glob_arr.name_len)
-                        emit_str(s, c", i64 0, i64 ")
-                        emit_reg(s, gas_idx)
-                        emit_str(s, c"\n")
-                        let gas_result: i32 = next_reg(s)
-                        emit_str(s, c"  ")
-                        emit_reg(s, gas_result)
-                        emit_str(s, c" = ptrtoint ptr ")
-                        emit_reg(s, gas_elem)
-                        emit_str(s, c" to i64\n")
-                        return gas_result
-                    let ga_idx: i32 = emit_expr(s, e.operand.right)
-                    let ga_elem: i32 = next_reg(s)
-                    emit_str(s, c"  ")
-                    emit_reg(s, ga_elem)
-                    emit_str(s, c" = getelementptr i8, ptr @")
-                    emit_name(s, glob_arr.name, glob_arr.name_len)
-                    emit_str(s, c", i64 ")
-                    emit_reg(s, ga_idx)
-                    emit_str(s, c"\n")
-                    let ga_result: i32 = next_reg(s)
-                    emit_str(s, c"  ")
-                    emit_reg(s, ga_result)
-                    emit_str(s, c" = ptrtoint ptr ")
-                    emit_reg(s, ga_elem)
-                    emit_str(s, c" to i64\n")
-                    return ga_result
-            # Handle @global.array_field[i] - address of global struct's array field element
-            else if e.operand.left.kind == EXPR_MEMBER
-                if e.operand.left.left.kind == EXPR_IDENT
-                    # Try to find as global variable
-                    let glob: *GlobalVarDef = find_global(s, e.operand.left.left.ident_ptr, e.operand.left.left.ident_len)
-                    if glob != null
-                        if glob.var_type == TYPE_STRUCT
-                            let st: *StructDef = find_struct(s, glob.type_name, glob.type_name_len)
-                            if st != null
-                                let field_idx: i32 = find_field_index(st, e.operand.left.ident_ptr, e.operand.left.ident_len)
-                                if field_idx >= 0
-                                    let field: *StructField = get_field_type(st, field_idx)
-                                    if field.field_type == TYPE_ARRAY
-                                        # Found an array field in global struct
-                                        # Emit GEP to array field, then index into it
-                                        # getelementptr %StructType, ptr @global, i32 0, i32 field_idx, i64 index
-                                        let idx: i32 = emit_expr(s, e.operand.right)
-                                        let elem_ptr: i32 = next_reg(s)
-                                        emit_str(s, c"  ")
-                                        emit_reg(s, elem_ptr)
-                                        emit_str(s, c" = getelementptr %")
-                                        emit_name(s, st.name, st.name_len)
-                                        emit_str(s, c", ptr @")
-                                        emit_name(s, glob.name, glob.name_len)
-                                        emit_str(s, c", i32 0, i32 ")
-                                        emit_int(s, field_idx as i64)
-                                        emit_str(s, c", i64 ")
-                                        emit_reg(s, idx)
-                                        emit_str(s, c"\n")
-                                        # Convert to i64
-                                        let result: i32 = next_reg(s)
-                                        emit_str(s, c"  ")
-                                        emit_reg(s, result)
-                                        emit_str(s, c" = ptrtoint ptr ")
-                                        emit_reg(s, elem_ptr)
-                                        emit_str(s, c" to i64\n")
-                                        return result
-                    # Handle @ptr_to_struct.array_field[i] - address of element in array field via pointer
-                    let local: *LocalVar = find_local_struct_name(s, e.operand.left.left.ident_ptr, e.operand.left.left.ident_len)
-                    if local != null
-                        if local.var_type == TYPE_PTR and local.type_name_len > 0
-                            # It's a pointer to a struct with a known type name
-                            let st: *StructDef = find_struct(s, local.type_name, local.type_name_len)
-                            if st != null
-                                let field_idx: i32 = find_field_index(st, e.operand.left.ident_ptr, e.operand.left.ident_len)
-                                if field_idx >= 0
-                                    let field: *StructField = get_field_type(st, field_idx)
-                                    if field.field_type == TYPE_ARRAY
-                                        # Load the pointer from the local, GEP to array field, index into it
-                                        let loaded_ptr: i32 = emit_load_ptr(s, local.reg)
-                                        # GEP to array field, then to element
-                                        let idx: i32 = emit_expr(s, e.operand.right)
-                                        let elem_ptr: i32 = next_reg(s)
-                                        emit_str(s, c"  ")
-                                        emit_reg(s, elem_ptr)
-                                        emit_str(s, c" = getelementptr %")
-                                        emit_name(s, st.name, st.name_len)
-                                        emit_str(s, c", ptr ")
-                                        emit_reg(s, loaded_ptr)
-                                        emit_str(s, c", i32 0, i32 ")
-                                        emit_int(s, field_idx as i64)
-                                        emit_str(s, c", i64 ")
-                                        emit_reg(s, idx)
-                                        emit_str(s, c"\n")
-                                        # Convert to i64
-                                        let result: i32 = next_reg(s)
-                                        emit_str(s, c"  ")
-                                        emit_reg(s, result)
-                                        emit_str(s, c" = ptrtoint ptr ")
-                                        emit_reg(s, elem_ptr)
-                                        emit_str(s, c" to i64\n")
-                                        return result
-                                    else if field.field_type == TYPE_PTR
-                                        # @ptr_to_struct.ptr_field[i] — the field
-                                        # is a raw pointer (e.g. *u8 buffer in
-                                        # cryptosec's DerElement.content).  Load
-                                        # the parent ptr, GEP to the field, load
-                                        # the field-pointer, then GEP into that
-                                        # buffer by index.  Element type defaults
-                                        # to i8 since the common case is *u8 and
-                                        # GlobalVarDef-style element-type info
-                                        # isn't tracked on StructField.
-                                        let parent_ptr: i32 = emit_load_ptr(s, local.reg)
-                                        let fld_addr: i32 = next_reg(s)
-                                        emit_str(s, c"  ")
-                                        emit_reg(s, fld_addr)
-                                        emit_str(s, c" = getelementptr %")
-                                        emit_name(s, st.name, st.name_len)
-                                        emit_str(s, c", ptr ")
-                                        emit_reg(s, parent_ptr)
-                                        emit_str(s, c", i32 0, i32 ")
-                                        emit_int(s, field_idx as i64)
-                                        emit_str(s, c"\n")
-                                        let buf_ptr: i32 = next_reg(s)
-                                        emit_str(s, c"  ")
-                                        emit_reg(s, buf_ptr)
-                                        emit_str(s, c" = load ptr, ptr ")
-                                        emit_reg(s, fld_addr)
-                                        emit_str(s, c"\n")
-                                        let pf_idx: i32 = emit_expr(s, e.operand.right)
-                                        let pf_elem: i32 = next_reg(s)
-                                        emit_str(s, c"  ")
-                                        emit_reg(s, pf_elem)
-                                        emit_str(s, c" = getelementptr i8, ptr ")
-                                        emit_reg(s, buf_ptr)
-                                        emit_str(s, c", i64 ")
-                                        emit_reg(s, pf_idx)
-                                        emit_str(s, c"\n")
-                                        let pf_result: i32 = next_reg(s)
-                                        emit_str(s, c"  ")
-                                        emit_reg(s, pf_result)
-                                        emit_str(s, c" = ptrtoint ptr ")
-                                        emit_reg(s, pf_elem)
-                                        emit_str(s, c" to i64\n")
-                                        return pf_result
-                        # task-170: @local_struct.array_field[i] — local stack-
-                        # allocated struct (TYPE_STRUCT, not PTR). e.g.
-                        # `var addr: SockAddrIn` then `memset(@addr.zero[0],...)`
-                        # in ritzlib/net.ritz. Without this branch it falls
-                        # through to "; ERROR: cannot take address" — same
-                        # symptom as the chained-member case but a different
-                        # base shape.
-                        if local.var_type == TYPE_STRUCT and local.type_name_len > 0
-                            let st_ls: *StructDef = find_struct(s, local.type_name, local.type_name_len)
-                            if st_ls != null
-                                let field_idx_ls: i32 = find_field_index(st_ls, e.operand.left.ident_ptr, e.operand.left.ident_len)
-                                if field_idx_ls >= 0
-                                    let field_ls: *StructField = get_field_type(st_ls, field_idx_ls)
-                                    if field_ls.field_type == TYPE_ARRAY
-                                        let idx_ls: i32 = emit_expr(s, e.operand.right)
-                                        let elem_ptr_ls: i32 = next_reg(s)
-                                        emit_str(s, c"  ")
-                                        emit_reg(s, elem_ptr_ls)
-                                        emit_str(s, c" = getelementptr %")
-                                        emit_name(s, st_ls.name, st_ls.name_len)
-                                        emit_str(s, c", ptr ")
-                                        emit_reg(s, local.reg)
-                                        emit_str(s, c", i32 0, i32 ")
-                                        emit_int(s, field_idx_ls as i64)
-                                        emit_str(s, c", i64 ")
-                                        emit_reg(s, idx_ls)
-                                        emit_str(s, c"\n")
-                                        let result_ls: i32 = next_reg(s)
-                                        emit_str(s, c"  ")
-                                        emit_reg(s, result_ls)
-                                        emit_str(s, c" = ptrtoint ptr ")
-                                        emit_reg(s, elem_ptr_ls)
-                                        emit_str(s, c" to i64\n")
-                                        return result_ls
-                # task-170 site-1: chained-member addr-of-index, e.g.
-                # `@p.command.args[i]` where `p.command` itself is a member
-                # access (RespParser.command yields a RespCommand struct
-                # field, whose `args` field is an array). emit_member_ptr
-                # already handles arbitrarily-nested member chains — use it
-                # to compute a ptr to the array field, then GEP by index.
-                else if e.operand.left.left.kind == EXPR_MEMBER
-                    var inner_result_cm: MemberPtrResult
-                    emit_member_ptr(s, e.operand.left, @inner_result_cm)
-                    if inner_result_cm.success == 1
-                        let inner_field_cm: *StructField = inner_result_cm.field
-                        if inner_field_cm.field_type == TYPE_ARRAY
-                            let idx_cm: i32 = emit_expr(s, e.operand.right)
-                            let elem_ptr_cm: i32 = next_reg(s)
-                            emit_str(s, c"  ")
-                            emit_reg(s, elem_ptr_cm)
-                            emit_str(s, c" = getelementptr [")
-                            emit_int(s, inner_field_cm.array_size as i64)
-                            emit_str(s, c" x ")
-                            if inner_field_cm.array_elem_type == TYPE_STRUCT and inner_field_cm.array_elem_type_name_len > 0
-                                emit_str(s, c"%")
-                                emit_name(s, inner_field_cm.array_elem_type_name, inner_field_cm.array_elem_type_name_len)
-                            else if inner_field_cm.array_elem_type == TYPE_I32 or inner_field_cm.array_elem_type == TYPE_U32
-                                emit_str(s, c"i32")
-                            else if inner_field_cm.array_elem_type == TYPE_I64 or inner_field_cm.array_elem_type == TYPE_U64
-                                emit_str(s, c"i64")
-                            else if inner_field_cm.array_elem_type == TYPE_U8 or inner_field_cm.array_elem_type == TYPE_I8
-                                emit_str(s, c"i8")
-                            else if inner_field_cm.array_elem_type == TYPE_U16 or inner_field_cm.array_elem_type == TYPE_I16
-                                emit_str(s, c"i16")
-                            else if inner_field_cm.array_elem_type == TYPE_PTR or inner_field_cm.array_elem_type == TYPE_PTR_PTR
-                                emit_str(s, c"ptr")
-                            else
-                                emit_str(s, c"i64")
-                            emit_str(s, c"], ptr ")
-                            emit_reg(s, inner_result_cm.reg)
-                            emit_str(s, c", i64 0, i64 ")
-                            emit_reg(s, idx_cm)
-                            emit_str(s, c"\n")
-                            let result_cm: i32 = next_reg(s)
-                            emit_str(s, c"  ")
-                            emit_reg(s, result_cm)
-                            emit_str(s, c" = ptrtoint ptr ")
-                            emit_reg(s, elem_ptr_cm)
-                            emit_str(s, c" to i64\n")
-                            return result_cm
-        else if e.operand.kind == EXPR_MEMBER
-            # Handle @local_struct.field - address of a field in a local struct
-            if e.operand.left.kind == EXPR_IDENT
-                # Try to find as local struct variable
-                let local: *LocalVar = find_local_struct_name(s, e.operand.left.ident_ptr, e.operand.left.ident_len)
-                if local != null
-                    # Check if it's a struct, or a pointer/reference to a struct
-                    var is_struct_or_ref: i32 = 0
-                    if local.var_type == TYPE_STRUCT
-                        is_struct_or_ref = 1
-                    else if local.var_type == TYPE_PTR or local.var_type == TYPE_REF or local.var_type == TYPE_MUT_REF
-                        # Check if it points to a struct (has type_name set)
-                        if local.type_name_len > 0
-                            is_struct_or_ref = 1
-                    if is_struct_or_ref == 1
-                        # Found a local struct or ref to struct - get the struct definition
-                        let st: *StructDef = find_struct(s, local.type_name, local.type_name_len)
-                        if st != null
-                            let field_idx: i32 = find_field_index(st, e.operand.ident_ptr, e.operand.ident_len)
-                            if field_idx >= 0
-                                if local.var_type == TYPE_STRUCT
-                                    # Direct struct - GEP from local.reg directly
-                                    let field_ptr: i32 = next_reg(s)
-                                    emit_str(s, c"  ")
-                                    emit_reg(s, field_ptr)
-                                    emit_str(s, c" = getelementptr %")
-                                    emit_name(s, st.name, st.name_len)
-                                    emit_str(s, c", ptr ")
-                                    emit_reg(s, local.reg)
-                                    emit_str(s, c", i32 0, i32 ")
-                                    emit_int(s, field_idx as i64)
-                                    emit_str(s, c"\n")
-                                    # Convert pointer to i64
-                                    let result: i32 = next_reg(s)
-                                    emit_str(s, c"  ")
-                                    emit_reg(s, result)
-                                    emit_str(s, c" = ptrtoint ptr ")
-                                    emit_reg(s, field_ptr)
-                                    emit_str(s, c" to i64\n")
-                                    return result
-                                else
-                                    # Ptr/ref - native ptr load (task #73 migration)
-                                    let loaded_ptr: i32 = emit_load_ptr(s, local.reg)
-                                    let field_ptr: i32 = next_reg(s)
-                                    emit_str(s, c"  ")
-                                    emit_reg(s, field_ptr)
-                                    emit_str(s, c" = getelementptr %")
-                                    emit_name(s, st.name, st.name_len)
-                                    emit_str(s, c", ptr ")
-                                    emit_reg(s, loaded_ptr)
-                                    emit_str(s, c", i32 0, i32 ")
-                                    emit_int(s, field_idx as i64)
-                                    emit_str(s, c"\n")
-                                    # Convert pointer to i64
-                                    let result: i32 = next_reg(s)
-                                    emit_str(s, c"  ")
-                                    emit_reg(s, result)
-                                    emit_str(s, c" = ptrtoint ptr ")
-                                    emit_reg(s, field_ptr)
-                                    emit_str(s, c" to i64\n")
-                                    return result
-        # AGAST #184: generic addr-of-MEMBER fallback. Anything that
-        # `emit_member_ptr` knows how to GEP — including the new
-        # `parent.fwd[i].field` over **Foo case — gets handled here
-        # without each shape needing its own bespoke OP_ADDR branch.
-        # Without this, the call-site emitted undef `%.0` after the
-        # explicit cases above all missed (e.g. EXPR_MEMBER over an
-        # EXPR_INDEX base).  Lives at the OP_ADDR level (outside the
-        # operand-kind branches) so it catches anything those missed.
-        if e.operand.kind == EXPR_MEMBER
-            var fb_result: MemberPtrResult
-            emit_member_ptr(s, e.operand, @fb_result)
-            if fb_result.success == 1
-                let fb_ret: i32 = next_reg(s)
-                emit_str(s, c"  ")
-                emit_reg(s, fb_ret)
-                emit_str(s, c" = ptrtoint ptr ")
-                emit_reg(s, fb_result.reg)
-                emit_str(s, c" to i64\n")
-                return fb_ret
-        # AGAST #184: addr-of-INDEX fallback for arbitrarily-deep
-        # MEMBER chains.  `@doc.fields[i].key[0]` (mausoleum's
-        # doc_find_field_index) is INDEX-of-MEMBER-of-INDEX-of-MEMBER-of-IDENT
-        # — the existing OP_ADDR branches only matched the simpler
-        # 1- or 2-level chains, leaving deeper shapes to fall through
-        # to "; ERROR: cannot take address" + undef %.0 at the call site.
-        #
-        # Strategy: when the operand is INDEX with a MEMBER base, use
-        # emit_member_ptr to compute the address of the (array) field,
-        # then GEP into it by the index using the array element type.
-        if e.operand.kind == EXPR_INDEX
-            if e.operand.left.kind == EXPR_MEMBER
-                var idx_fb: MemberPtrResult
-                emit_member_ptr(s, e.operand.left, @idx_fb)
-                if idx_fb.success == 1
-                    let idx_fb_field: *StructField = idx_fb.field
-                    if idx_fb_field.field_type == TYPE_ARRAY
-                        let idx_v: i32 = emit_expr(s, e.operand.right)
-                        let elem_ptr_fb: i32 = next_reg(s)
-                        emit_str(s, c"  ")
-                        emit_reg(s, elem_ptr_fb)
-                        emit_str(s, c" = getelementptr [")
-                        emit_int(s, idx_fb_field.array_size as i64)
-                        emit_str(s, c" x ")
-                        if idx_fb_field.array_elem_type == TYPE_STRUCT and idx_fb_field.array_elem_type_name_len > 0
-                            emit_str(s, c"%")
-                            emit_name(s, idx_fb_field.array_elem_type_name, idx_fb_field.array_elem_type_name_len)
-                        else if idx_fb_field.array_elem_type == TYPE_I32 or idx_fb_field.array_elem_type == TYPE_U32
-                            emit_str(s, c"i32")
-                        else if idx_fb_field.array_elem_type == TYPE_I64 or idx_fb_field.array_elem_type == TYPE_U64
-                            emit_str(s, c"i64")
-                        else if idx_fb_field.array_elem_type == TYPE_U8 or idx_fb_field.array_elem_type == TYPE_I8
-                            emit_str(s, c"i8")
-                        else if idx_fb_field.array_elem_type == TYPE_U16 or idx_fb_field.array_elem_type == TYPE_I16
-                            emit_str(s, c"i16")
-                        else if idx_fb_field.array_elem_type == TYPE_PTR or idx_fb_field.array_elem_type == TYPE_PTR_PTR
-                            emit_str(s, c"ptr")
-                        else
-                            emit_str(s, c"i64")
-                        emit_str(s, c"], ptr ")
-                        emit_reg(s, idx_fb.reg)
-                        emit_str(s, c", i64 0, i64 ")
-                        emit_reg(s, idx_v)
-                        emit_str(s, c"\n")
-                        let idx_fb_ret: i32 = next_reg(s)
-                        emit_str(s, c"  ")
-                        emit_reg(s, idx_fb_ret)
-                        emit_str(s, c" = ptrtoint ptr ")
-                        emit_reg(s, elem_ptr_fb)
-                        emit_str(s, c" to i64\n")
-                        return idx_fb_ret
+        let addr_ptr: i32 = emit_lvalue_ptr(s, e.operand)
+        if addr_ptr >= 0
+            # `@expr` is an i64 in ritz1's value model.
+            let result: i32 = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, result)
+            emit_str(s, c" = ptrtoint ptr ")
+            emit_reg(s, addr_ptr)
+            emit_str(s, c" to i64\n")
+            return result
         emit_ir_error(s, c"cannot take address")
         return 0
     else if e.op == OP_ADDR_MUT
         # @&expr - mutable address-of, returns ptr type (not i64)
-        if e.operand.kind == EXPR_IDENT
-            let loc: i32 = find_local(s, e.operand.ident_ptr, e.operand.ident_len)
-            if loc >= 0
-                # loc is already a ptr (alloca result), return it directly
-                return loc
+        let addr_mut_ptr: i32 = emit_lvalue_ptr(s, e.operand)
+        if addr_mut_ptr >= 0
+            return addr_mut_ptr
         emit_ir_error(s, c"cannot take mutable address")
         return 0
     else if e.op == OP_BIT_NOT
