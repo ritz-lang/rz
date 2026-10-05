@@ -1343,6 +1343,105 @@ fn emit_struct_lit_array_fill_field(s: *EmitterState, st: *StructDef, field_idx:
     emit_array_fill_into(s, field_ptr, field.array_size, field.array_elem_type, value.left)
     1
 
+# Evaluate struct-literal field `field_idx` of `st` and store it into the
+# struct at `base_reg`, at the field's own width.
+#
+# The ONE field-store dispatch for struct literals: emit_var_decl's
+# `let s = S { ... }` loop and emit_struct_lit_to_alloca (tail / return /
+# reassignment literals) both call it, so the two cannot drift again. Before
+# AGAST #1497 they had: the let loop stored a bool with an 8-byte `store i64`
+# (clobbering the next field), and the alloca loop had no bool, u32, i16/u16
+# or struct arm and silently dropped those fields.
+#
+# Values are i64 in ritz1's value model, so narrow fields `trunc` first. The
+# exception is a bool expression that emit_expr leaves in an i1 register (a
+# bool struct field or array element; see cond_leaves_i1), stored as is.
+# An unlowerable field type is a located error, never a silent skip.
+fn emit_struct_lit_field_store(s: *EmitterState, st: *StructDef, field_idx: i32, value: *Expr, base_reg: i32)
+    let field: *StructField = get_field_type(st, field_idx)
+    let val_reg: i32 = emit_expr(s, value)
+    let field_ptr: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, field_ptr)
+    emit_str(s, c" = getelementptr %")
+    emit_name(s, st.name, st.name_len)
+    emit_str(s, c", ptr ")
+    emit_reg(s, base_reg)
+    emit_str(s, c", i32 0, i32 ")
+    emit_int(s, field_idx as i64)
+    emit_str(s, c"\n")
+    let ft: i32 = field.field_type
+    # What to store: the register and its LLVM type.
+    var stored: i32 = val_reg
+    var store_ty: *u8 = null
+    var trunc_ty: *u8 = null
+    if ft == TYPE_I64
+        store_ty = c"i64"
+    else if ft == TYPE_I32 or ft == TYPE_U32
+        trunc_ty = c"i32"
+    else if ft == TYPE_I16 or ft == TYPE_U16
+        trunc_ty = c"i16"
+    else if ft == TYPE_I8 or ft == TYPE_U8
+        trunc_ty = c"i8"
+    else if ft == TYPE_BOOL
+        if cond_leaves_i1(s, value) == 1
+            store_ty = c"i1"
+        else
+            trunc_ty = c"i1"
+    else if ft == TYPE_PTR or ft == TYPE_PTR_PTR
+        stored = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, stored)
+        emit_str(s, c" = inttoptr i64 ")
+        emit_reg(s, val_reg)
+        emit_str(s, c" to ptr\n")
+        store_ty = c"ptr"
+    else if ft == TYPE_F32
+        # Float lit emits as `double`; narrow to f32 before store.
+        # Cast-from-explicit-as-f32 already emitted float, so we
+        # only fptrunc when the source is f64.
+        if get_expr_type(s, value) == TYPE_F64
+            stored = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, stored)
+            emit_str(s, c" = fptrunc double ")
+            emit_reg(s, val_reg)
+            emit_str(s, c" to float\n")
+        store_ty = c"float"
+    else if ft == TYPE_F64
+        store_ty = c"double"
+    else if ft == TYPE_STRUCT and field.field_type_name_len > 0
+        # task-103: struct-by-value field (e.g. `Vec$T` in `Wrap`).
+        # val_reg is the loaded aggregate (`%Vec$T`), not an i64.
+        emit_str(s, c"  store %")
+        emit_name(s, field.field_type_name, field.field_type_name_len)
+        emit_str(s, c" ")
+        emit_reg(s, val_reg)
+        emit_str(s, c", ptr ")
+        emit_reg(s, field_ptr)
+        emit_str(s, c"\n")
+        return
+    else
+        emit_ir_error(s, c"struct literal field of this type is not lowered")
+        return
+    if trunc_ty != null
+        stored = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, stored)
+        emit_str(s, c" = trunc i64 ")
+        emit_reg(s, val_reg)
+        emit_str(s, c" to ")
+        emit_str(s, trunc_ty)
+        emit_str(s, c"\n")
+        store_ty = trunc_ty
+    emit_str(s, c"  store ")
+    emit_str(s, store_ty)
+    emit_str(s, c" ")
+    emit_reg(s, stored)
+    emit_str(s, c", ptr ")
+    emit_reg(s, field_ptr)
+    emit_str(s, c"\n")
+
 # =============================================================================
 # Struct Literal to Alloca Helper
 # =============================================================================
@@ -1364,87 +1463,7 @@ fn emit_struct_lit_to_alloca(s: *EmitterState, e: *Expr, alloca_reg: i32) -> i32
             if emit_struct_lit_array_fill_field(s, st, field_idx, fi.value, alloca_reg) == 1
                 field_idx = -1  # done (AGAST #1605)
         if field_idx >= 0
-            let field: *StructField = get_field_type(st, field_idx)
-            # Emit value expression
-            let val_reg: i32 = emit_expr(s, fi.value)
-            # GEP to get field pointer
-            let field_ptr: i32 = next_reg(s)
-            emit_str(s, c"  ")
-            emit_reg(s, field_ptr)
-            emit_str(s, c" = getelementptr %")
-            emit_name(s, st.name, st.name_len)
-            emit_str(s, c", ptr ")
-            emit_reg(s, alloca_reg)
-            emit_str(s, c", i32 0, i32 ")
-            emit_int(s, field_idx as i64)
-            emit_str(s, c"\n")
-            # Store value based on field type
-            if field.field_type == TYPE_I64
-                emit_str(s, c"  store i64 ")
-                emit_reg(s, val_reg)
-                emit_str(s, c", ptr ")
-                emit_reg(s, field_ptr)
-                emit_str(s, c"\n")
-            else if field.field_type == TYPE_I32
-                let trunc: i32 = next_reg(s)
-                emit_str(s, c"  ")
-                emit_reg(s, trunc)
-                emit_str(s, c" = trunc i64 ")
-                emit_reg(s, val_reg)
-                emit_str(s, c" to i32\n")
-                emit_str(s, c"  store i32 ")
-                emit_reg(s, trunc)
-                emit_str(s, c", ptr ")
-                emit_reg(s, field_ptr)
-                emit_str(s, c"\n")
-            else if field.field_type == TYPE_PTR or field.field_type == TYPE_PTR_PTR
-                let ptr_val: i32 = next_reg(s)
-                emit_str(s, c"  ")
-                emit_reg(s, ptr_val)
-                emit_str(s, c" = inttoptr i64 ")
-                emit_reg(s, val_reg)
-                emit_str(s, c" to ptr\n")
-                emit_str(s, c"  store ptr ")
-                emit_reg(s, ptr_val)
-                emit_str(s, c", ptr ")
-                emit_reg(s, field_ptr)
-                emit_str(s, c"\n")
-            else if field.field_type == TYPE_U8 or field.field_type == TYPE_I8
-                let trunc: i32 = next_reg(s)
-                emit_str(s, c"  ")
-                emit_reg(s, trunc)
-                emit_str(s, c" = trunc i64 ")
-                emit_reg(s, val_reg)
-                emit_str(s, c" to i8\n")
-                emit_str(s, c"  store i8 ")
-                emit_reg(s, trunc)
-                emit_str(s, c", ptr ")
-                emit_reg(s, field_ptr)
-                emit_str(s, c"\n")
-            else if field.field_type == TYPE_F32
-                # Float lit emits as `double`; narrow to f32 before store.
-                # Cast-from-explicit-as-f32 already emitted float, so we
-                # only fptrunc when the source is f64.
-                var stored: i32 = val_reg
-                let src_ty: i32 = get_expr_type(s, fi.value)
-                if src_ty == TYPE_F64
-                    stored = next_reg(s)
-                    emit_str(s, c"  ")
-                    emit_reg(s, stored)
-                    emit_str(s, c" = fptrunc double ")
-                    emit_reg(s, val_reg)
-                    emit_str(s, c" to float\n")
-                emit_str(s, c"  store float ")
-                emit_reg(s, stored)
-                emit_str(s, c", ptr ")
-                emit_reg(s, field_ptr)
-                emit_str(s, c"\n")
-            else if field.field_type == TYPE_F64
-                emit_str(s, c"  store double ")
-                emit_reg(s, val_reg)
-                emit_str(s, c", ptr ")
-                emit_reg(s, field_ptr)
-                emit_str(s, c"\n")
+            emit_struct_lit_field_store(s, st, field_idx, fi.value, alloca_reg)
         fi = fi.next
     alloca_reg
 

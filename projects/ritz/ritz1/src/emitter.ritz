@@ -123,6 +123,39 @@ fn emit_implicit_return_tail(s: *EmitterState, has_explicit_return: i32, ret_typ
     else if ret_type == TYPE_VOID and has_explicit_return == 0
         emit_str(s, c"  ret void\n")
 
+# Spill a bool parameter into an i64 slot and register it as TYPE_I64.
+#
+# AGAST #1497. The ABI passes a bool as i1, but ritz1's value model is i64 for
+# every scalar, and bool LOCALS were already promoted to i64 slots for that
+# reason (emit_var_decl). A bool param used to keep an `alloca i1` slot, so
+# loading it gave an i1 that every i64 consumer then mangled: `store i64` into
+# a struct literal or typed let, `trunc i64` in a field assign. Widening at
+# the prologue makes a param read exactly like a bool local: condition sites
+# `icmp ne i64` it, and bool call args / bool returns `trunc` it back to i1.
+fn emit_bool_param_spill(s: *EmitterState, param: *Param)
+    let alloca_reg: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, alloca_reg)
+    emit_str(s, c" = alloca i64\n")
+    let wide: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, wide)
+    emit_str(s, c" = zext i1 %")
+    emit_name(s, param.name, param.name_len)
+    emit_str(s, c".arg to i64\n")
+    emit_str(s, c"  store i64 ")
+    emit_reg(s, wide)
+    emit_str(s, c", ptr ")
+    emit_reg(s, alloca_reg)
+    emit_str(s, c"\n")
+    add_local(s, param.name, param.name_len, alloca_reg, TYPE_I64)
+    # AGAST #1521: the slot is i64, but print interpolation must still see a
+    # bool (`print("{b}")` prints true/false), the same as emit_var_decl's
+    # bool locals.
+    if s.local_count > 0
+        let bool_loc: *LocalVar = @s.locals[s.local_count - 1]
+        bool_loc.is_bool = 1
+
 fn emit_fn(s: *EmitterState, f: *FnDef)
     # AGAST #194 modular emit: skip imports entirely. The owning .ll
     # emits the body; this .ll just needs a `declare`, which the
@@ -217,6 +250,10 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
 
     var param3: *Param = f.params
     while param3 != null
+        if param3.param_type == TYPE_BOOL
+            emit_bool_param_spill(s, param3)
+            param3 = param3.next
+            continue
         let alloca_reg: i32 = next_reg(s)
         emit_str(s, c"  ")
         emit_reg(s, alloca_reg)
@@ -488,6 +525,10 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
 
     var param2: *Param = method.params
     while param2 != null
+        if param2.param_type == TYPE_BOOL
+            emit_bool_param_spill(s, param2)
+            param2 = param2.next
+            continue
         var p2_is_self: i32 = 0
         if param2.name_len == 4
             if *param2.name == 115 and *(param2.name + 1) == 101 and *(param2.name + 2) == 108 and *(param2.name + 3) == 102
