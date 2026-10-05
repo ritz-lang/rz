@@ -27,11 +27,13 @@ SOURCES = \
 	ast \
 	ast_helpers \
 	parser_gen \
+	interp \
 	monomorph \
 	emitter_core \
 	emitter_expr_arith \
 	emitter_expr_access \
 	emitter_expr_call \
+	emitter_print \
 	emitter_expr \
 	emitter_match \
 	emitter_stmt \

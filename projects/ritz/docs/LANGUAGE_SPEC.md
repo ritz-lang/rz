@@ -253,9 +253,17 @@ constraint strings such as `"={rax},{rax},{rdi},~{rcx}"`, where `{rax}` and
 the self-hosted compiler emits. A c-string containing braces is therefore
 still perfectly legal; only passing one to `print` is rejected.
 
-Interpolation is an integer-formatting facility: interpolating a `StrView`
-fails with `Cannot print value of type {i8*, i64}`. To compose strings, call
-`prints` more than once, or build a `String` with `string_push_strview`.
+A placeholder is `{` with a matching `}` before the end of the literal; a `{`
+with no match is a literal brace, as is a lone `}`, `}}`, `\{` or `\}`.
+Whitespace around the expression is ignored, and an empty or unparseable
+placeholder is a compile error.
+
+What a placeholder prints depends on the value's type. Integers print in
+decimal, `bool` prints `true` or `false`, and a pointer prints the
+NUL-terminated bytes it points at. Every other type, including `StrView`,
+`String` and floats, is a compile error. To compose strings, call `prints`
+more than once, or build a `String` with `string_push_strview`. ritz0 and
+ritz1 follow the same rules and print the same bytes (AGAST #1521).
 
 ### 2.7 Operators
 

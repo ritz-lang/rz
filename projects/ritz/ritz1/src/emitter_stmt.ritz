@@ -70,6 +70,8 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
     # otherwise `var best_type: i32 = -1` stores i32 into an i64 slot,
     # and callers reading i64 see garbage in the upper half.
     var var_type: i32 = stmt.var_type
+    # AGAST #1521: remember a declared bool past the i64 promotion below.
+    let declared_bool: i32 = (var_type == TYPE_BOOL) as i32
 
     # Bool slots use i64 storage in the unified value model.
     # Init expressions / loads / `if x` comparisons are all expressed in
@@ -497,6 +499,17 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
             add_local_array(s, stmt.var_name, stmt.var_name_len, alloca_reg, stmt.var_array_size, stmt.var_array_elem_type)
     else
         add_local(s, stmt.var_name, stmt.var_name_len, alloca_reg, var_type)
+    # `let ok = is_big(x)`: inference above leaves a bool-returning call's
+    # local at TYPE_I64. (Indistinguishable here from `let ok: i64 = ...`;
+    # assigning a bool call to an explicit i64 is the rare case.)
+    var inferred_bool: i32 = 0
+    if var_type == TYPE_I64 and stmt.var_type_name_len == 0 and stmt.var_init != null
+        if stmt.var_init.kind == EXPR_CALL or stmt.var_init.kind == EXPR_METHOD
+            if get_expr_type(s, stmt.var_init) == TYPE_BOOL
+                inferred_bool = 1
+    if (declared_bool == 1 or inferred_bool == 1) and s.local_count > 0
+        let bool_loc: *LocalVar = @s.locals[s.local_count - 1]
+        bool_loc.is_bool = 1
 
     if stmt.var_init != null
         # Check for struct literal initializer

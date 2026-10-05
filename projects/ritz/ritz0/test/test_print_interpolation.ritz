@@ -1,0 +1,87 @@
+# AGAST #1521: `print("x={x}")` interpolates under every compiler.
+#
+# ritz1 used to print the placeholder verbatim (`x={x}`) and exit 0. The
+# matrix runs this file under ritz0, ritz1 and ritz1_selfhosted, so the
+# self-hosted compiler's lowering is checked too, not just the one ritz0
+# built. ritz0/test_ritz1_print_interpolation.py holds the wider cases.
+#
+# Each test points fd 1 at a pipe, prints, puts fd 1 back, and compares the
+# bytes that came out of the pipe with what ritz0 prints.
+
+import ritzlib.sys
+
+# The capture's state: the pipe's read end, and the saved stdout.
+var g_rd: i32 = 0
+var g_saved: i32 = 0
+
+fn capture_begin() -> i32
+    var fds: [2]i32
+    if sys_pipe(@fds[0]) != 0
+        return 1
+    g_rd = fds[0]
+    g_saved = sys_dup(1)
+    sys_dup2(fds[1], 1)
+    sys_close(fds[1])
+    0
+
+# Restore stdout, read what was printed, and compare it with `want`.
+# Returns 0 on an exact byte match.
+fn capture_end_expect(want: *u8) -> i32
+    sys_dup2(g_saved, 1)
+    sys_close(g_saved)
+    var buf: [256]u8
+    var got: i64 = 0
+    var n: i64 = 1
+    while n > 0 and got < 256
+        n = sys_read(g_rd, @buf[got], 256 - got)
+        if n > 0
+            got = got + n
+    sys_close(g_rd)
+    var i: i64 = 0
+    while *(want + i) != 0
+        if i >= got
+            return 2
+        if buf[i] != *(want + i)
+            return 3
+        i = i + 1
+    if i != got
+        return 4
+    0
+
+fn twice(n: i64) -> i64
+    return n * 2
+
+[[test]]
+fn test_interp_repro() -> i32
+    assert capture_begin() == 0
+    let x: i64 = 5
+    print("x={x}\n")
+    assert capture_end_expect(c"x=5\n") == 0
+    0
+
+[[test]]
+fn test_interp_types() -> i32
+    assert capture_begin() == 0
+    let a: i64 = -120
+    let b: i32 = 0
+    let t: bool = true
+    let s: *u8 = c"str"
+    print("{a},{b},{t},{a > 0},{s}\n")
+    assert capture_end_expect(c"-120,0,true,false,str\n") == 0
+    0
+
+[[test]]
+fn test_interp_expressions() -> i32
+    assert capture_begin() == 0
+    let x: i64 = 21
+    print("{twice(x)} { x + 1 }\n")
+    assert capture_end_expect(c"42 22\n") == 0
+    0
+
+[[test]]
+fn test_interp_braces() -> i32
+    assert capture_begin() == 0
+    let x: i64 = 1
+    print("{{x}} \{x\} a } b { c\n")
+    assert capture_end_expect(c"{x} {x} a } b { c\n") == 0
+    0

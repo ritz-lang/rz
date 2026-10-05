@@ -1,0 +1,152 @@
+# ritz1/src/interp.ritz - the text half of print interpolation (AGAST #1521)
+#
+# `print("x={x}\n")` prints `x=5` in ritz0. ritz1 used to print `x={x}` and
+# exit 0, because nothing in ritz1 knew about placeholders. This module has
+# the rules for reading them. emitter_print.ritz does the lowering.
+#
+# The rules are ritz0's, copied rather than reinvented (ritz0/lexer.py
+# `_lex_string` and emitter_llvmlite.py `_has_interp_placeholder`):
+#
+#   * `{` opens a placeholder only when a matching `}` follows before the
+#     closing quote or end of line. Nested braces count, so `{a{b}}` is one.
+#   * `{{` and `}}` are one literal brace each. A lone `}` is literal.
+#   * `\{` and `\}` are literal braces (ritz1's lexer already cooks an
+#     unknown escape to its own character).
+#   * The text between the braces is trimmed, then lexed and parsed as one
+#     expression. Empty or unparseable text is an error, not literal text.
+#
+# Placeholders belong to the print BUILTIN, not to the literal (#1374): a
+# `"..."` or `c"..."` used anywhere else keeps its braces as plain bytes.
+# ritz1's own emitter depends on that (`"={rax},{rax},{rdi}"` inline-asm
+# constraints), so nothing here runs at lex or parse time.
+
+import ritzlib.sys
+import ritzlib.memory
+import ritzlib.gvec
+import tokens_gen
+import nfa
+import lexer_nfa
+import lexer_setup_gen
+import ast
+import ast_helpers
+import parser_gen
+
+# Python's str.strip() whitespace, which ritz0 trims the expression with:
+# space, \t, \n, \v, \f, \r.
+fn interp_is_space(c: i32) -> i32
+    if c == 32 or (c >= 9 and c <= 13)
+        return 1
+    0
+
+# `raw[open]` is a `{` in a "..." literal's raw source text. Return the index
+# of the `}` that closes it, or -1 if the literal ends first (in which case
+# the `{` is a literal brace). Stops at `"` and newline as ritz0's lexer
+# does; the raw text cannot hold an unescaped `"`, so a `"` here is the
+# second half of `\"`.
+pub fn interp_match_brace(raw: *u8, len: i32, open: i32) -> i32
+    var depth: i32 = 1
+    var j: i32 = open + 1
+    while j < len
+        let c: i32 = *(raw + j) as i32
+        if c == 34 or c == 10
+            return -1
+        if c == 123
+            depth = depth + 1
+        else if c == 125
+            depth = depth - 1
+            if depth == 0
+                return j
+        j = j + 1
+    -1
+
+# Would this c"..." text have interpolated had it been a "..." literal?
+# ritz0's `_has_interp_placeholder`, run on the cooked bytes. `{{` is not
+# collapsed in a c-string, so it is skipped here as an escaped brace.
+pub fn interp_cstr_has_placeholder(text: *u8, len: i32) -> i32
+    var i: i32 = 0
+    while i < len
+        if *(text + i) == 123
+            if i + 1 < len and *(text + i + 1) == 123
+                i = i + 2
+                continue
+            var depth: i32 = 1
+            var j: i32 = i + 1
+            while j < len
+                let c: i32 = *(text + j) as i32
+                if c == 123
+                    depth = depth + 1
+                else if c == 125
+                    depth = depth - 1
+                    if depth == 0
+                        return 1
+                j = j + 1
+        i = i + 1
+    0
+
+# Lex and parse one placeholder's text as an expression. Returns null if the
+# trimmed text is empty or is not exactly one expression. Every token gets
+# the print literal's line and column, so the nodes point at the literal.
+#
+# The copied text, the tokens and the AST nodes are never freed: AST
+# identifiers point into them for the rest of the compile, the same as every
+# other source buffer (see keep_source_alive in main.ritz).
+pub fn interp_parse_expr(text: *u8, len: i32, line: i32, col: i32) -> *Expr
+    var lo: i32 = 0
+    var hi: i32 = len
+    while lo < hi and interp_is_space(*(text + lo) as i32) == 1
+        lo = lo + 1
+    while hi > lo and interp_is_space(*(text + hi - 1) as i32) == 1
+        hi = hi - 1
+    if hi == lo
+        return null
+    let n: i32 = hi - lo
+    let src: *u8 = malloc((n + 1) as i64)
+    if src == null
+        return null
+    var k: i32 = 0
+    while k < n
+        *(src + k) = *(text + lo + k)
+        k = k + 1
+    *(src + n) = 0
+
+    # The same lexer main.ritz's tokenize() builds. Keep the sizes in step
+    # with it: setup_lexer refuses to grow past what it is told.
+    var nfa_storage: NFA
+    var patterns_storage: [128]TokenPattern
+    var states_storage: [4096]NFAState
+    var trans_storage: [8192]Transition
+    var sto_storage: [4096]i64
+    var stc_storage: [4096]i64
+    var ti_storage: [8192]i64
+    var lex: Lexer
+    setup_lexer(@lex, @nfa_storage, @patterns_storage[0], @states_storage[0], @trans_storage[0], @sto_storage[0], @stc_storage[0], @ti_storage[0], 4096, 8192)
+    lexer_reset(@lex, src, n as i64)
+
+    var tokens: Vec<Token> = vec_new<Token>()
+    while 1 == 1
+        var tok: Token = lexer_next(@lex)
+        let kind: i32 = tok.kind
+        if kind == TOK_ERROR
+            return null
+        tok.line = line
+        tok.col = col
+        vec_push<Token>(@tokens, tok)
+        if kind == TOK_EOF
+            break
+
+    # parse_expr allocates a few 128-byte nodes per token; a token is at
+    # least one byte of text, so this cannot run out.
+    let arena: *u8 = malloc(4096 + (n as i64) * 1024)
+    if arena == null
+        return null
+    var p: Parser
+    parser_init(@p, tokens.data, tokens.len as i32, arena)
+    let e: *Expr = parse_expr(@p)
+    if p.error != 0 or e == null
+        return null
+    # Exactly one expression: only the end of the text may follow it.
+    while p_peek(@p) == TOK_NEWLINE or p_peek(@p) == TOK_DEDENT
+        p_advance(@p)
+    if p_peek(@p) != TOK_EOF
+        return null
+    e

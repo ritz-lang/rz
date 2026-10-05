@@ -1,0 +1,341 @@
+# ritz1/src/emitter_print.ritz - lowering of the print builtin (AGAST #1521)
+#
+# `print("a={a} b={f(b)}\n")` becomes a write of "a=", the value of `a`, a
+# write of " b=", the value of `f(b)`, and a write of "\n". This is ritz0's
+# `_emit_interp_string_print` / `_emit_print_value`, and the output must be
+# byte-identical to ritz0's. Values print by type:
+#
+#   integers   decimal. ritz0 sign-extends every LLVM integer, so a u8/u16/u32
+#              is truncated to its width and sign-extended the same way.
+#   bool       `true` / `false`
+#   pointers   the NUL-terminated bytes they point at
+#   anything   else is a compile error, as in ritz0
+#
+# Every entry point takes the output fd. print passes 1; an fd-2 builtin
+# (eprint, #1641) only needs to pass 2.
+#
+# Integer, bool and string printing are small helper functions
+# (`@__ritz_print_*`), defined once per module that uses them by
+# emit_print_helpers, rather than ritz0's inline loops.
+#
+# interp.ritz holds the placeholder rules and the expression parser.
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.memory
+import ast
+import emitter_core
+import emitter_expr
+import interp
+
+# Report an error at a print literal: an IR comment, a stderr line naming
+# the literal's line, and one more on s.error_count (AGAST #1369), so ritz1
+# exits non-zero instead of writing the output.
+fn emit_print_error(s: *EmitterState, lit: *Expr, msg: *u8)
+    emit_str(s, c"  ; ERROR: ")
+    emit_str(s, msg)
+    emit_str(s, c"\n")
+    eprints_cstr(c"error: ritz1 cannot emit: line ")
+    eprint_int(lit.span.line as i64)
+    eprints_cstr(c": ")
+    eprints_cstr(msg)
+    eprints_cstr(c"\n")
+    s.error_count = s.error_count + 1
+
+fn emit_print_zero(s: *EmitterState) -> i32
+    let z: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, z)
+    emit_str(s, c" = add i64 0, 0\n")
+    z
+
+# write(fd, data, len) for bytes known at compile time. Returns the register
+# holding the syscall's result (bytes written).
+pub fn emit_print_bytes(s: *EmitterState, fd: i64, data: *u8, len: i32) -> i32
+    let str_idx: i32 = add_string(s, data, len)
+    let gep_reg: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, gep_reg)
+    emit_str(s, c" = getelementptr [")
+    emit_int(s, (len + 1) as i64)
+    emit_str(s, c" x i8], ptr @.str.")
+    emit_int(s, str_idx as i64)
+    emit_str(s, c", i64 0, i64 0\n")
+    let ptr_reg: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, ptr_reg)
+    emit_str(s, c" = ptrtoint ptr ")
+    emit_reg(s, gep_reg)
+    emit_str(s, c" to i64\n")
+    let result: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, result)
+    emit_str(s, c" = call i64 asm sideeffect \"syscall\", ")
+    emit_str(s, c"\"=&{rax},{rax},{rdi},{rsi},{rdx},~{rcx},~{r11},~{memory}\"")
+    emit_str(s, c"(i64 1, i64 ")
+    emit_int(s, fd)
+    emit_str(s, c", i64 ")
+    emit_reg(s, ptr_reg)
+    emit_str(s, c", i64 ")
+    emit_int(s, len as i64)
+    emit_str(s, c")\n")
+    result
+
+# Is `e` a bool in ritz0's eyes (an i1 there)? get_expr_type alone cannot
+# say: bool locals live in i64 slots typed TYPE_I64, and comparisons report
+# TYPE_I64. So also count comparison, logical and `not` operators, and
+# locals emit_var_decl marked is_bool. A `true` / `false` literal is an int
+# literal by the time it gets here and prints as 1 / 0.
+fn interp_is_bool(s: *EmitterState, e: *Expr) -> i32
+    if get_expr_type(s, e) == TYPE_BOOL
+        return 1
+    if e.kind == EXPR_BINARY and e.op >= OP_EQ and e.op <= OP_OR
+        return 1
+    if e.kind == EXPR_UNARY and e.op == OP_NOT
+        return 1
+    if e.kind == EXPR_IDENT
+        let lidx: i32 = find_local_idx(s, e.ident_ptr, e.ident_len)
+        if lidx >= 0
+            let loc: *LocalVar = @s.locals[lidx]
+            return loc.is_bool
+    # An element of a local `[N]bool` (get_expr_type reports TYPE_I64).
+    if e.kind == EXPR_INDEX and e.left != null and e.left.kind == EXPR_IDENT
+        let aidx: i32 = find_local_idx(s, e.left.ident_ptr, e.left.ident_len)
+        if aidx >= 0
+            let arr: *LocalVar = @s.locals[aidx]
+            if arr.var_type == TYPE_ARRAY and arr.array_elem_type == TYPE_BOOL
+                return 1
+    0
+
+# Does emit_expr leave this bool in an i1 register rather than an i64?
+# A load of a TYPE_BOOL slot does: a bool parameter, struct field or array
+# element. Operators and calls zext to i64, and `: bool` locals live in i64
+# slots. (cond_leaves_i1 answers this for condition sites, where `and` /
+# `or` are lowered as branches; here they are values, so it does not fit.)
+fn interp_bool_reg_is_i1(s: *EmitterState, e: *Expr) -> i32
+    if get_expr_type(s, e) != TYPE_BOOL
+        return 0
+    if e.kind == EXPR_IDENT or e.kind == EXPR_MEMBER or e.kind == EXPR_INDEX
+        return 1
+    0
+
+# Print the value of placeholder expression `e` to fd. Returns 0 and reports
+# an error if its type has no printed form.
+fn emit_print_value(s: *EmitterState, fd: i64, lit: *Expr, e: *Expr) -> i32
+    let ty: i32 = get_expr_type(s, e)
+    var helper: *u8 = null
+    var narrow: *u8 = null
+    let is_bool: i32 = interp_is_bool(s, e)
+    if is_bool == 1
+        helper = c"__ritz_print_bool"
+    else if ty == TYPE_I64 or ty == TYPE_U64
+        helper = c"__ritz_print_i64"
+    else if ty == TYPE_I32 or ty == TYPE_U32
+        helper = c"__ritz_print_i64"
+        narrow = c"i32"
+    else if ty == TYPE_I16 or ty == TYPE_U16
+        helper = c"__ritz_print_i64"
+        narrow = c"i16"
+    else if ty == TYPE_I8 or ty == TYPE_U8
+        helper = c"__ritz_print_i64"
+        narrow = c"i8"
+    else if ty == TYPE_PTR or ty == TYPE_PTR_PTR or ty == TYPE_REF or ty == TYPE_MUT_REF
+        helper = c"__ritz_print_cstr"
+    if helper == null
+        emit_print_error(s, lit, c"cannot print this value in a print interpolation: only integers, bool and pointers have a printed form")
+        return 0
+    var v: i32 = emit_expr(s, e)
+    if is_bool == 1 and interp_bool_reg_is_i1(s, e) == 1
+        # A bool slot's load is an i1; the helper takes an i64.
+        let z: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, z)
+        emit_str(s, c" = zext i1 ")
+        emit_reg(s, v)
+        emit_str(s, c" to i64\n")
+        v = z
+    if narrow != null
+        # ritz0 holds a narrow int in its own LLVM width and sign-extends it
+        # to print. ritz1 keeps it in i64 (zero-extended when unsigned), so
+        # rebuild ritz0's value: truncate, then sign-extend.
+        let t: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, t)
+        emit_str(s, c" = trunc i64 ")
+        emit_reg(s, v)
+        emit_str(s, c" to ")
+        emit_str(s, narrow)
+        emit_str(s, c"\n")
+        let x: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, x)
+        emit_str(s, c" = sext ")
+        emit_str(s, narrow)
+        emit_str(s, c" ")
+        emit_reg(s, t)
+        emit_str(s, c" to i64\n")
+        v = x
+    emit_str(s, c"  call void @")
+    emit_str(s, helper)
+    emit_str(s, c"(i64 ")
+    emit_int(s, fd)
+    emit_str(s, c", i64 ")
+    emit_reg(s, v)
+    emit_str(s, c")\n")
+    s.print_helpers_used = 1
+    1
+
+# Cook one escape the way ritz1's lexer does (lexer_nfa.ritz): the six
+# named escapes, and any other character stands for itself (`\{` is `{`).
+fn interp_cook_escape(c: i32) -> u8
+    if c == 110
+        return 10
+    if c == 116
+        return 9
+    if c == 114
+        return 13
+    if c == 48
+        return 0
+    c as u8
+
+# Lower print(<literal>) to fd. Returns the result register: the write's
+# byte count when the literal has no placeholder, else 0, as in ritz0.
+pub fn emit_print_literal(s: *EmitterState, fd: i64, lit: *Expr) -> i32
+    if lit.kind == EXPR_CSTRING_LIT
+        if interp_cstr_has_placeholder(lit.string_ptr, lit.string_len) == 1
+            # #1374/#1394: c"..." does not interpolate, so this would print
+            # the placeholder verbatim. Reject it, as ritz0 does.
+            emit_print_error(s, lit, c"`c\"...\"` literals do not interpolate: the placeholder would be printed verbatim. Use a plain string literal `\"...\"` here, or `{{` to print a literal brace")
+            return emit_print_zero(s)
+        return emit_print_bytes(s, fd, lit.string_ptr, lit.string_len)
+
+    # A "..." literal: split its RAW source text. The cooked text in
+    # string_ptr cannot tell `\{x}` from `{x}`. expr_string records the raw
+    # token, quotes included, in ident_ptr / ident_len.
+    let raw: *u8 = lit.ident_ptr
+    if raw == null or lit.ident_len < 2
+        return emit_print_bytes(s, fd, lit.string_ptr, lit.string_len)
+    let body: *u8 = raw + 1
+    let n: i32 = lit.ident_len - 2
+    # Cooked text is never longer than raw. add_string keeps the pointer, so
+    # each chunk stays in this buffer for the rest of the compile.
+    let buf: *u8 = malloc((n + 1) as i64)
+    var start: i32 = 0     # first byte of the chunk not yet written
+    var w: i32 = 0         # write cursor in buf
+    var placeholders: i32 = 0
+    var i: i32 = 0
+    while i < n
+        let c: i32 = *(body + i) as i32
+        if c == 92 and i + 1 < n
+            *(buf + w) = interp_cook_escape(*(body + i + 1) as i32)
+            w = w + 1
+            i = i + 2
+        else if c == 123 and i + 1 < n and *(body + i + 1) == 123
+            *(buf + w) = 123
+            w = w + 1
+            i = i + 2
+        else if c == 125 and i + 1 < n and *(body + i + 1) == 125
+            *(buf + w) = 125
+            w = w + 1
+            i = i + 2
+        else if c == 123 and interp_match_brace(body, n, i) >= 0
+            let close: i32 = interp_match_brace(body, n, i)
+            if w > start
+                emit_print_bytes(s, fd, buf + start, w - start)
+            start = w
+            placeholders = placeholders + 1
+            let e: *Expr = interp_parse_expr(body + i + 1, close - i - 1, lit.span.line, lit.span.col)
+            if e == null
+                emit_print_error(s, lit, c"invalid interpolation expression: a `{...}` placeholder must hold exactly one expression (write `{{` for a literal brace)")
+            else
+                emit_print_value(s, fd, lit, e)
+            i = close + 1
+        else
+            *(buf + w) = c as u8
+            w = w + 1
+            i = i + 1
+
+    if placeholders == 0
+        return emit_print_bytes(s, fd, buf, w)
+    if w > start
+        emit_print_bytes(s, fd, buf + start, w - start)
+    emit_print_zero(s)
+
+# The helpers emit_print_value calls. Emitted once, after the functions, by
+# a module that used any of them.
+pub fn emit_print_helpers(s: *EmitterState)
+    if s.print_helpers_used == 0
+        return
+    emit_str(s, c"\n; print interpolation helpers (AGAST #1521), as ritz0's _emit_print_value\n")
+    # Decimal, written back to front into a 21-byte buffer: ritz0's
+    # _emit_print_int_inline step for step, so even i64::MIN (whose
+    # negation overflows) prints the same bytes.
+    emit_str(s, c"define internal void @__ritz_print_i64(i64 %fd, i64 %v) {\n")
+    emit_str(s, c"entry:\n")
+    emit_str(s, c"  %buf = alloca [21 x i8]\n")
+    emit_str(s, c"  %end = getelementptr [21 x i8], ptr %buf, i64 0, i64 20\n")
+    emit_str(s, c"  %neg = icmp slt i64 %v, 0\n")
+    emit_str(s, c"  %negv = sub i64 0, %v\n")
+    emit_str(s, c"  %mag = select i1 %neg, i64 %negv, i64 %v\n")
+    emit_str(s, c"  %isz = icmp eq i64 %mag, 0\n")
+    emit_str(s, c"  br i1 %isz, label %zero, label %digit\n")
+    emit_str(s, c"zero:\n")
+    emit_str(s, c"  %zp = getelementptr i8, ptr %end, i64 -1\n")
+    emit_str(s, c"  store i8 48, ptr %zp\n")
+    emit_str(s, c"  br label %sign\n")
+    emit_str(s, c"digit:\n")
+    emit_str(s, c"  %p = phi ptr [ %end, %entry ], [ %np, %digit ]\n")
+    emit_str(s, c"  %val = phi i64 [ %mag, %entry ], [ %q, %digit ]\n")
+    emit_str(s, c"  %d = srem i64 %val, 10\n")
+    emit_str(s, c"  %ch64 = add i64 %d, 48\n")
+    emit_str(s, c"  %ch = trunc i64 %ch64 to i8\n")
+    emit_str(s, c"  %np = getelementptr i8, ptr %p, i64 -1\n")
+    emit_str(s, c"  store i8 %ch, ptr %np\n")
+    emit_str(s, c"  %q = sdiv i64 %val, 10\n")
+    emit_str(s, c"  %more = icmp ne i64 %q, 0\n")
+    emit_str(s, c"  br i1 %more, label %digit, label %sign\n")
+    emit_str(s, c"sign:\n")
+    emit_str(s, c"  %p2 = phi ptr [ %zp, %zero ], [ %np, %digit ]\n")
+    emit_str(s, c"  br i1 %neg, label %minus, label %write\n")
+    emit_str(s, c"minus:\n")
+    emit_str(s, c"  %mp = getelementptr i8, ptr %p2, i64 -1\n")
+    emit_str(s, c"  store i8 45, ptr %mp\n")
+    emit_str(s, c"  br label %write\n")
+    emit_str(s, c"write:\n")
+    emit_str(s, c"  %from = phi ptr [ %p2, %sign ], [ %mp, %minus ]\n")
+    emit_str(s, c"  %fi = ptrtoint ptr %from to i64\n")
+    emit_str(s, c"  %ei = ptrtoint ptr %end to i64\n")
+    emit_str(s, c"  %len = sub i64 %ei, %fi\n")
+    emit_str(s, c"  %r = call i64 asm sideeffect \"syscall\", \"=&{rax},{rax},{rdi},{rsi},{rdx},~{rcx},~{r11},~{memory}\"(i64 1, i64 %fd, i64 %fi, i64 %len)\n")
+    emit_str(s, c"  ret void\n")
+    emit_str(s, c"}\n\n")
+    # NUL-terminated bytes at a pointer: strlen, then one write.
+    emit_str(s, c"define internal void @__ritz_print_cstr(i64 %fd, i64 %p) {\n")
+    emit_str(s, c"entry:\n")
+    emit_str(s, c"  %ptr = inttoptr i64 %p to ptr\n")
+    emit_str(s, c"  br label %scan\n")
+    emit_str(s, c"scan:\n")
+    emit_str(s, c"  %n = phi i64 [ 0, %entry ], [ %n1, %next ]\n")
+    emit_str(s, c"  %cp = getelementptr i8, ptr %ptr, i64 %n\n")
+    emit_str(s, c"  %c = load i8, ptr %cp\n")
+    emit_str(s, c"  %nul = icmp eq i8 %c, 0\n")
+    emit_str(s, c"  br i1 %nul, label %done, label %next\n")
+    emit_str(s, c"next:\n")
+    emit_str(s, c"  %n1 = add i64 %n, 1\n")
+    emit_str(s, c"  br label %scan\n")
+    emit_str(s, c"done:\n")
+    emit_str(s, c"  %r = call i64 asm sideeffect \"syscall\", \"=&{rax},{rax},{rdi},{rsi},{rdx},~{rcx},~{r11},~{memory}\"(i64 1, i64 %fd, i64 %p, i64 %n)\n")
+    emit_str(s, c"  ret void\n")
+    emit_str(s, c"}\n\n")
+    # bool: `true` or `false`.
+    emit_str(s, c"@.ritz_print_true = private unnamed_addr constant [4 x i8] c\"true\"\n")
+    emit_str(s, c"@.ritz_print_false = private unnamed_addr constant [5 x i8] c\"false\"\n")
+    emit_str(s, c"define internal void @__ritz_print_bool(i64 %fd, i64 %b) {\n")
+    emit_str(s, c"entry:\n")
+    emit_str(s, c"  %t = icmp ne i64 %b, 0\n")
+    emit_str(s, c"  %ptr = select i1 %t, ptr @.ritz_print_true, ptr @.ritz_print_false\n")
+    emit_str(s, c"  %len = select i1 %t, i64 4, i64 5\n")
+    emit_str(s, c"  %pi = ptrtoint ptr %ptr to i64\n")
+    emit_str(s, c"  %r = call i64 asm sideeffect \"syscall\", \"=&{rax},{rax},{rdi},{rsi},{rdx},~{rcx},~{r11},~{memory}\"(i64 1, i64 %fd, i64 %pi, i64 %len)\n")
+    emit_str(s, c"  ret void\n")
+    emit_str(s, c"}\n")
