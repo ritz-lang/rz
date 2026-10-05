@@ -23,6 +23,8 @@
 import ritzlib.sys
 import ritzlib.io
 import ritzlib.str
+import ritzlib.strview
+import ritzlib.result
 import ritzlib.fs
 import ritzlib.args
 
@@ -185,13 +187,15 @@ fn print_mode(mode: i32)
 # Entry sorting (simple insertion sort on names)
 # ============================================================================
 
-struct DirEntry
+# One stored listing row. Named LsEntry so it does not collide with
+# ritzlib.fs's DirEntry, which is what list_directory reads entries as.
+struct LsEntry
     name_offset: i64   # Offset into name buffer
     name_len: i64      # Length of name
     d_type: i32        # File type from dirent
 
 struct DirEntries
-    entries: *DirEntry
+    entries: *LsEntry
     count: i64
     capacity: i64
     names: *u8          # Name buffer
@@ -201,12 +205,12 @@ struct DirEntries
 fn sort_entries(entries: *DirEntries)
     # Simple insertion sort
     for i in 1..entries.count
-        let entry: DirEntry = *(entries.entries + i)
+        let entry: LsEntry = *(entries.entries + i)
         let entry_name: *u8 = entries.names + entry.name_offset
 
         var j: i64 = i - 1
         while j >= 0
-            let other: *DirEntry = entries.entries + j
+            let other: *LsEntry = entries.entries + j
             let other_name: *u8 = entries.names + other.name_offset
             if strcmp(entry_name, other_name) >= 0
                 break
@@ -220,6 +224,43 @@ fn sort_entries(entries: *DirEntries)
 # List a single entry
 # ============================================================================
 
+# `ls -l` row for an entry we could lstat: mode, links, size, name, suffix.
+# Returns 0. The listing printers return i32 rather than nothing because ritz1
+# cannot yet lower a match whose arms are void calls (AGAST #1654).
+fn print_long_entry(name: *u8, st: @Stat, opts: *LsOptions) -> i32
+    print_mode(st.st_mode)
+    print_char(32)  # space
+
+    # Link count
+    print_int_width(st.st_nlink, 3)
+    print_char(32)
+
+    # Size
+    if opts.human != 0
+        print_size_human_width(st.st_size)
+    else
+        print_int_width(st.st_size, 8)
+    print_char(32)
+
+    # Name
+    prints_cstr(name)
+
+    # Classify suffix
+    if opts.classify != 0
+        if mode_is_dir(st.st_mode) != 0
+            print_char(47)  # '/'
+        else if is_executable(st.st_mode) != 0
+            print_char(42)  # '*'
+        else if mode_is_link(st.st_mode) != 0
+            print_char(64)  # '@'
+    0
+
+# `ls -l` row for an entry whose lstat failed: just the name. Returns 1.
+fn print_unstatable_entry(name: *u8) -> i32
+    prints_cstr(c"?????????? ??? ???????? ")
+    prints_cstr(name)
+    1
+
 fn list_entry(dir: *u8, name: *u8, d_type: i32, opts: *LsOptions)
     # Skip hidden files unless -a
     if opts.show_all == 0 and *name == '.'  # '.'
@@ -231,44 +272,10 @@ fn list_entry(dir: *u8, name: *u8, d_type: i32, opts: *LsOptions)
         path_join(dir, name, @path_buf[0])
 
         # Get file info
-        var statbuf: [144]u8  # STAT_SIZE
-        let stat_result: i32 = sys_lstat(@path_buf[0], @statbuf[0])
-
-        if stat_result == 0
-            let mode: i32 = stat_get_mode(@statbuf[0])
-            let size: i64 = stat_get_size(@statbuf[0])
-            let nlink: i64 = stat_get_nlink(@statbuf[0])
-
-            # Mode
-            print_mode(mode)
-            print_char(32)  # space
-
-            # Link count
-            print_int_width(nlink, 3)
-            print_char(32)
-
-            # Size
-            if opts.human != 0
-                print_size_human_width(size)
-            else
-                print_int_width(size, 8)
-            print_char(32)
-
-            # Name
-            prints_cstr(name)
-
-            # Classify suffix
-            if opts.classify != 0
-                if mode_is_dir(mode) != 0
-                    print_char(47)  # '/'
-                else if is_executable(mode) != 0
-                    print_char(42)  # '*'
-                else if mode_is_link(mode) != 0
-                    print_char(64)  # '@'
-        else
-            # Stat failed, just print name
-            prints_cstr(c"?????????? ??? ???????? ")
-            prints_cstr(name)
+        var info: Result<Stat, i32> = lstat(strview_from_cstr(@path_buf[0]))
+        match info
+            Ok(st) => print_long_entry(name, @st, opts)
+            Err(_) => print_unstatable_entry(name)
 
         print_char(10)  # newline
     else
@@ -292,10 +299,27 @@ fn list_entry(dir: *u8, name: *u8, d_type: i32, opts: *LsOptions)
 # List a directory
 # ============================================================================
 
+# Copy one directory entry's name into the listing, if there is room.
+fn store_entry(entries: *DirEntries, e: @DirEntry)
+    let name_len: i64 = e.name.len
+    if entries.count >= entries.capacity or entries.names_len + name_len + 1 >= entries.names_cap
+        return
+    let row: *LsEntry = entries.entries + entries.count
+    row.name_offset = entries.names_len
+    row.name_len = name_len
+    row.d_type = e.kind as i32
+
+    # Copy the name and NUL-terminate it (e.name is a view, not a C string)
+    let dst: *u8 = entries.names + entries.names_len
+    for i in 0..name_len
+        *(dst + i) = *(e.name.ptr + i)
+    *(dst + name_len) = 0
+    entries.names_len = entries.names_len + name_len + 1
+    entries.count = entries.count + 1
+
 fn list_directory(path: *u8, opts: *LsOptions, show_dirname: i32) -> i32
-    # Open directory (O_RDONLY | O_DIRECTORY)
-    let fd: i32 = sys_open(path, O_DIRECTORY)
-    if fd < 0
+    var dir: DirIter = dir_open(path)
+    if dir_valid(@dir) == 0
         prints_cstr(c"ls: cannot access '")
         prints_cstr(path)
         prints_cstr(c"'\n")
@@ -306,12 +330,10 @@ fn list_directory(path: *u8, opts: *LsOptions, show_dirname: i32) -> i32
         prints_cstr(path)
         prints_cstr(c":\n")
 
-    # Read directory entries
-    var buf: [8192]u8
     var entries: DirEntries
 
     # Allocate entry storage (we'll use stack for simplicity, up to 256 entries)
-    var entry_storage: [256]DirEntry
+    var entry_storage: [256]LsEntry
     var name_storage: [8192]u8
 
     entries.entries = @entry_storage[0]
@@ -322,45 +344,18 @@ fn list_directory(path: *u8, opts: *LsOptions, show_dirname: i32) -> i32
     entries.names_cap = 8192
 
     # Read all entries
-    loop
-        let nread: i64 = sys_getdents64(fd, @buf[0], 8192)
-        if nread <= 0
-            break
+    while dir_next(@dir)
+        let e: DirEntry = dir_entry(@dir)
+        store_entry(@entries, @e)
 
-        # Process entries in buffer
-        var pos: i64 = 0
-        while pos < nread
-            let entry: *u8 = @buf[0] + pos
-            let reclen: i32 = dirent_get_reclen(entry)
-            let d_type: u8 = dirent_get_type(entry)
-            let name: *u8 = dirent_get_name(entry)
-            let name_len: i64 = strlen(name)
-
-            # Store entry if we have room
-            if entries.count < entries.capacity and entries.names_len + name_len + 1 < entries.names_cap
-                let e: *DirEntry = entries.entries + entries.count
-                e.name_offset = entries.names_len
-                e.name_len = name_len
-                e.d_type = d_type as i32
-
-                # Copy name
-                var i: i64 = 0
-                while i <= name_len
-                    *(entries.names + entries.names_len + i) = *(name + i)
-                    i += 1
-                entries.names_len = entries.names_len + name_len + 1
-                entries.count = entries.count + 1
-
-            pos += reclen as i64
-
-    sys_close(fd)
+    dir_close(@dir)
 
     # Sort entries
     sort_entries(@entries)
 
     # Print entries
     for i in 0..entries.count
-        let e: *DirEntry = entries.entries + i
+        let e: *LsEntry = entries.entries + i
         let name: *u8 = entries.names + e.name_offset
         list_entry(path, name, e.d_type, opts)
 

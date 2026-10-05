@@ -285,7 +285,7 @@ gated on closing part of that gap.
 | Struct variants | this task | this task |
 | Payload types retained by parser | yes | **no — discarded** |
 | Enum AST node | yes (`EnumDef`/`Variant`) | **none** — a global name side-table |
-| Payload sizing | exact, per enum | fixed `[32 x i8]` upper bound |
+| Payload sizing | exact, per enum | fixed `[144 x i8]` upper bound (`TAGGED_ENUM_PAYLOAD_BYTES`; was 32 until #1476) |
 | Payload load | per-field, typed | always `load i64` at index 1 |
 | Match bindings per pattern | N | **exactly 1** (`IDENT LPAREN IDENT RPAREN`) |
 | Generic enum specialization | yes | none (name mangling only) |

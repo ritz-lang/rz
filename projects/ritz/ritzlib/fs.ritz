@@ -8,50 +8,108 @@
 # Note: Stat struct and STAT_SIZE are defined in ritzlib/sys.ritz
 
 import ritzlib.sys
+import ritzlib.str
 import ritzlib.string
+import ritzlib.strview
 import ritzlib.result
+import ritzlib.option
 
 # ============================================================================
-# Stat buffer accessors (legacy - use Stat struct fields directly)
+# stat / lstat -> Result<Stat, i32>
 # ============================================================================
-# These functions exist for backward compatibility with code that
-# uses raw u8 buffers. New code should use Stat struct directly.
+# `Stat` is the kernel's x86_64 `struct stat`, declared once in ritzlib/sys.ritz
+# (st_dev @0, st_ino @8, st_nlink @16, st_mode @24, st_uid @28, st_gid @32,
+# st_size @48, st_blksize @56, st_blocks @64; 144 bytes). fs reuses it rather
+# than declaring a second type.
+#
+#     match stat("/etc/passwd")
+#         Ok(st) => print_int(st.st_size)
+#         Err(errno) => ...            # positive errno, e.g. 2 = ENOENT
+#
+# Err carries the positive kernel errno. A path longer than FS_PATH_MAX
+# (PATH_MAX, 4096 including the NUL) fails with ENAMETOOLONG (36) without a
+# syscall.
+
+const FS_PATH_MAX: i64 = 4096
+const FS_ENAMETOOLONG: i32 = 36
+
+# Copy a (ptr, len) path into `buf` and NUL-terminate it. A StrView carries no
+# terminator, so it cannot be handed to the kernel directly.
+# Returns 0 on success, FS_ENAMETOOLONG if it does not fit.
+fn fs_path_cstr(path: @StrView, buf: *u8) -> i32
+    if path.len >= FS_PATH_MAX
+        return FS_ENAMETOOLONG
+    for i in 0..path.len
+        *(buf + i) = *(path.ptr + i)
+    *(buf + path.len) = 0
+    0
+
+# Shared body of stat/lstat. `follow` selects stat(2) (1) or lstat(2) (0).
+fn fs_stat_impl(path: @StrView, follow: i32) -> Result<Stat, i32>
+    var cpath: [4096]u8
+    let perr: i32 = fs_path_cstr(path, @cpath[0])
+    if perr != 0
+        return Err(perr)
+    var st: Stat
+    var ret: i32 = 0
+    if follow != 0
+        ret = sys_stat2(@cpath[0], @st)
+    else
+        ret = sys_lstat2(@cpath[0], @st)
+    if ret < 0
+        return Err(-ret)
+    Ok(st)
+
+# Status of the file at `path`, following symlinks.
+pub fn stat(path: StrView) -> Result<Stat, i32>
+    fs_stat_impl(@path, 1)
+
+# Status of the file at `path`; a symlink is reported as itself.
+pub fn lstat(path: StrView) -> Result<Stat, i32>
+    fs_stat_impl(@path, 0)
+
+# ============================================================================
+# Stat buffer accessors (legacy)
+# ============================================================================
+# Kept for code that still stats into a raw [144]u8. They read through the
+# Stat struct, so the field offsets live in one place (sys.ritz).
+# New code: `stat(path)` / `lstat(path)` and the Stat fields.
 
 pub fn stat_get_dev(statbuf: *u8) -> i64
-    let ptr: *i64 = statbuf as *i64
-    return *ptr
+    let st: *Stat = statbuf as *Stat
+    st.st_dev
 
 pub fn stat_get_ino(statbuf: *u8) -> i64
-    let ptr: *i64 = (statbuf + 8) as *i64
-    return *ptr
+    let st: *Stat = statbuf as *Stat
+    st.st_ino
 
 pub fn stat_get_nlink(statbuf: *u8) -> i64
-    let ptr: *i64 = (statbuf + 16) as *i64
-    return *ptr
+    let st: *Stat = statbuf as *Stat
+    st.st_nlink
 
 pub fn stat_get_mode(statbuf: *u8) -> i32
-    let ptr: *i32 = (statbuf + 24) as *i32
-    return *ptr
+    let st: *Stat = statbuf as *Stat
+    st.st_mode
 
 pub fn stat_get_uid(statbuf: *u8) -> i32
-    let ptr: *i32 = (statbuf + 28) as *i32
-    return *ptr
+    let st: *Stat = statbuf as *Stat
+    st.st_uid
 
 pub fn stat_get_gid(statbuf: *u8) -> i32
-    let ptr: *i32 = (statbuf + 32) as *i32
-    return *ptr
+    let st: *Stat = statbuf as *Stat
+    st.st_gid
 
 pub fn stat_get_size(statbuf: *u8) -> i64
-    let ptr: *i64 = (statbuf + 48) as *i64
-    return *ptr
+    let st: *Stat = statbuf as *Stat
+    st.st_size
 
 pub fn stat_get_blksize(statbuf: *u8) -> i64
-    let ptr: *i64 = (statbuf + 56) as *i64
-    return *ptr
+    let st: *Stat = statbuf as *Stat
+    st.st_blksize
 
 pub fn stat_get_blocks(statbuf: *u8) -> i64
-    let ptr: *i64 = (statbuf + 64) as *i64
-    return *ptr
+    let st: *Stat = statbuf as *Stat
+    st.st_blocks
 
 # ============================================================================
 # File type helpers
@@ -127,22 +185,52 @@ pub fn file_size(path: *u8) -> i64
 #   u8  d_type;          // 18: 1 byte
 #   char d_name[];       // 19: variable
 # }
+#
+# The fixed part is sys.ritz's Dirent64. A DirEntry is the decoded, typed view
+# of one record: `name` points into the DirIter's buffer, so it is valid only
+# until the next dir_next/dir_next_entry or dir_close on that iterator.
+
+pub struct DirEntry
+    ino: i64             # inode number
+    kind: u8             # DT_REG, DT_DIR, DT_LNK, ... (sys.ritz)
+    name: StrView        # entry name, without the trailing NUL
+
+const DIRENT_NAME_OFFSET: i64 = 19
+
+# Built field by field rather than as `DirEntry { .., name: strview_..() }`:
+# ritz1 drops a struct-valued field of a struct literal (it GEPs the field and
+# never stores to it), which leaves `name` uninitialised (AGAST #1655).
+fn direntry_make(ino: i64, kind: u8, name: *u8, name_len: i64) -> DirEntry
+    var e: DirEntry
+    e.ino = ino
+    e.kind = kind
+    e.name.ptr = name
+    e.name.len = name_len
+    e
+
+# Decode the linux_dirent64 record at `entry`.
+pub fn dirent_entry(entry: *u8) -> DirEntry
+    let d: *Dirent64 = entry as *Dirent64
+    let name: *u8 = entry + DIRENT_NAME_OFFSET
+    direntry_make(d.d_ino, d.d_type, name, strlen(name))
 
 pub fn dirent_get_ino(entry: *u8) -> i64
-    let ptr: *i64 = entry as *i64
-    return *ptr
+    let d: *Dirent64 = entry as *Dirent64
+    d.d_ino
 
 pub fn dirent_get_reclen(entry: *u8) -> i32
-    let ptr: *u8 = entry + 16
-    let low: i32 = (*ptr) as i32
-    let high: i32 = (*(ptr + 1)) as i32
-    return low + high * 256
+    let d: *Dirent64 = entry as *Dirent64
+    d.d_reclen as i32
 
+# Legacy: prefer dirent_entry(entry).kind.
 pub fn dirent_get_type(entry: *u8) -> u8
-    return *(entry + 18)
+    let d: *Dirent64 = entry as *Dirent64
+    d.d_type
 
+# Legacy: prefer dirent_entry(entry).name (a StrView). Same pointer, but this
+# form skips the strlen that building the view costs.
 pub fn dirent_get_name(entry: *u8) -> *u8
-    return entry + 19
+    entry + DIRENT_NAME_OFFSET
 
 # Note: DT_* constants are defined in ritzlib/sys.ritz
 
@@ -524,11 +612,13 @@ pub fn copy_file_string(src: *String, dest: *String, mode: i32) -> Result<i64, i
 # High-level directory iteration API using getdents64.
 #
 # Usage:
-#     var dir: DirIter = dir_open("/path/to/dir")
+#     var dir: DirIter = dir_open(c"/path/to/dir")
 #     while dir_next(@dir)
-#         let name: *u8 = dir_entry_name(@dir)
+#         let e: DirEntry = dir_entry(@dir)   # e.ino, e.kind, e.name (StrView)
 #         # process entry...
 #     dir_close(@dir)
+#
+# dir_entry_name / dir_entry_type are the older *u8 / u8 accessors.
 
 const DIR_BUF_SIZE: i64 = 4096
 
@@ -558,9 +648,11 @@ pub fn dir_open_string(path: *String) -> DirIter
 pub fn dir_valid(dir: *DirIter) -> i32
     (dir.fd >= 0) as i32
 
-# Advance to next directory entry.
-# Returns 1 if an entry is available, 0 if done.
-pub fn dir_next(dir: *DirIter) -> i32
+# Advance to the next record; 1 if `dir.entry` now points at one, 0 at the end.
+# Shared by dir_next and dir_next_entry. It takes @&DirIter and only touches
+# fields, because ritz1 cannot forward an @&T parameter into a *T one
+# (AGAST #1652).
+fn dir_advance(dir: @&DirIter) -> i32
     # Need more data?
     if dir.buf_pos >= dir.buf_len
         # Read next batch of entries
@@ -579,6 +671,34 @@ pub fn dir_next(dir: *DirIter) -> i32
     dir.buf_pos = dir.buf_pos + reclen as i64
 
     1
+
+# Advance to next directory entry.
+# Returns 1 if an entry is available, 0 if done.
+pub fn dir_next(dir: *DirIter) -> i32
+    dir_advance(dir)
+
+# The current entry as a typed DirEntry. Only valid after dir_next() returns 1;
+# before that (or after the end) it is { ino: 0, kind: DT_UNKNOWN, name: "" }.
+pub fn dir_entry(dir: @DirIter) -> DirEntry
+    if dir.entry == null
+        return direntry_make(0, DT_UNKNOWN, null, 0)
+    dirent_entry(dir.entry)
+
+# Advance and return the next entry, or None when the directory is exhausted
+# (or was never opened). The entry's name borrows the iterator's buffer.
+#
+#     loop
+#         var next: Option<DirEntry> = dir_next_entry(@&dir)
+#         if option_is_none<DirEntry>(@next) == 1
+#             break
+#         match next
+#             Some(e) => handle(@e)        # handle returns a value, see #1654
+#             None => 0
+pub fn dir_next_entry(dir: @&DirIter) -> Option<DirEntry>
+    # An unopened iterator (fd < 0) ends here too: getdents64 fails, buf_len <= 0.
+    if dir_advance(dir) == 0
+        return None
+    Some(dirent_entry(dir.entry))
 
 # Get name of current entry.
 # Only valid after dir_next() returns 1.

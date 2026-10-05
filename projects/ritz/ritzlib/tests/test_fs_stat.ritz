@@ -1,0 +1,177 @@
+# test_fs_stat.ritz - Typed fs API: stat()/lstat() -> Result<Stat, i32>
+# (AGAST #1476). DirEntry tests live in test_fs_dirent.ritz; the split keeps
+# each file under build.py's 180s per-file test timeout.
+#
+# Each test owns its fixtures under /tmp and removes them, so the verdict does
+# not depend on the cwd build.py happens to run the binary from.
+
+import ritzlib.sys
+import ritzlib.fs
+import ritzlib.strview
+import ritzlib.result
+import ritzlib.option
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+fn zero_stat() -> Stat
+    var s: Stat
+    s.st_dev = 0
+    s.st_ino = 0
+    s.st_nlink = 0
+    s.st_mode = 0
+    s.st_uid = 0
+    s.st_gid = 0
+    s.st_size = -1
+    s.st_blksize = 0
+    s.st_blocks = 0
+    s
+
+fn stat_or_zero(r: *Result<Stat, i32>) -> Stat
+    match *r
+        Ok(s) => s
+        Err(_) => zero_stat()
+
+fn err_of(r: *Result<Stat, i32>) -> i32
+    # Err arm first: ritz0 types the match phi from the first arm, and a bare
+    # `Ok(_) => 0` makes it i64 against Err's i32 (invalid IR, AGAST #1653).
+    match *r
+        Err(e) => e
+        Ok(_) => 0
+
+fn write_fixture(path: *u8, len: i64) -> i32
+    let fd: i32 = sys_open3(path, 577, 420)
+    if fd < 0
+        return fd
+    var buf: [64]u8
+    for i in 0..len
+        buf[i] = 'x' as u8
+    sys_write(fd, @buf[0], len)
+    sys_close(fd)
+    0
+
+# ============================================================================
+# stat / lstat
+# ============================================================================
+
+[[test]]
+fn test_stat_directory_ok() -> i32
+    var r: Result<Stat, i32> = stat("/tmp")
+    if result_is_ok<Stat, i32>(@r) == 0
+        return 1
+    let st: Stat = stat_or_zero(@r)
+    if mode_is_dir(st.st_mode) == 0
+        return 2
+    if st.st_ino == 0
+        return 3
+    0
+
+[[test]]
+fn test_stat_missing_is_enoent() -> i32
+    var r: Result<Stat, i32> = stat("/nonexistent/ritz_1476/x")
+    if result_is_err<Stat, i32>(@r) == 0
+        return 1
+    # Err carries the positive kernel errno: 2 = ENOENT.
+    if err_of(@r) != 2
+        return 2
+    0
+
+[[test]]
+fn test_stat_size_matches_written_bytes() -> i32
+    let p: *u8 = c"/tmp/ritz_1476_size.tmp"
+    if write_fixture(p, 37) != 0
+        return 1
+    var r: Result<Stat, i32> = stat(strview_from_cstr(p))
+    let st: Stat = stat_or_zero(@r)
+    sys_unlink(p)
+    if st.st_size != 37
+        return 2
+    if mode_is_file(st.st_mode) == 0
+        return 3
+    if st.st_nlink != 1
+        return 4
+    0
+
+[[test]]
+fn test_stat_unterminated_view() -> i32
+    # A StrView is (ptr, len) with no NUL. "/tmpXYZ" sliced to 4 bytes must
+    # stat "/tmp", not "/tmpXYZ" -- stat() has to terminate the path itself.
+    let v: StrView = strview_from_ptr(c"/tmpXYZ", 4)
+    var r: Result<Stat, i32> = stat(v)
+    if result_is_ok<Stat, i32>(@r) == 0
+        return 1
+    if mode_is_dir(stat_or_zero(@r).st_mode) == 0
+        return 2
+    var l: Result<Stat, i32> = lstat(v)
+    if result_is_ok<Stat, i32>(@l) == 0
+        return 3
+    0
+
+[[test]]
+fn test_stat_path_too_long() -> i32
+    var big: [5000]u8
+    for i in 0..5000
+        big[i] = 'a' as u8
+    var r: Result<Stat, i32> = stat(strview_from_ptr(@big[0], 5000))
+    # 36 = ENAMETOOLONG, reported without touching the kernel.
+    if err_of(@r) != 36
+        return 1
+    0
+
+[[test]]
+fn test_lstat_vs_stat_on_symlink() -> i32
+    let target: *u8 = c"/tmp/ritz_1476_target.tmp"
+    let link: *u8 = c"/tmp/ritz_1476_link.tmp"
+    sys_unlink(link)
+    if write_fixture(target, 5) != 0
+        return 1
+    if sys_symlink(target, link) != 0
+        sys_unlink(target)
+        return 2
+    var rl: Result<Stat, i32> = lstat(strview_from_cstr(link))
+    var rs: Result<Stat, i32> = stat(strview_from_cstr(link))
+    let sl: Stat = stat_or_zero(@rl)
+    let ss: Stat = stat_or_zero(@rs)
+    sys_unlink(link)
+    sys_unlink(target)
+    if mode_is_link(sl.st_mode) == 0
+        return 3
+    if mode_is_file(ss.st_mode) == 0
+        return 4
+    if ss.st_size != 5
+        return 5
+    0
+
+[[test]]
+fn test_legacy_stat_getters_agree_with_struct() -> i32
+    let p: *u8 = c"/tmp/ritz_1476_legacy.tmp"
+    if write_fixture(p, 11) != 0
+        return 1
+    var buf: [144]u8
+    if sys_stat(p, @buf[0]) != 0
+        return 2
+    var r: Result<Stat, i32> = stat(strview_from_cstr(p))
+    let st: Stat = stat_or_zero(@r)
+    sys_unlink(p)
+    let b: *u8 = @buf[0]
+    if stat_get_dev(b) != st.st_dev
+        return 3
+    if stat_get_ino(b) != st.st_ino
+        return 4
+    if stat_get_nlink(b) != st.st_nlink
+        return 5
+    if stat_get_mode(b) != st.st_mode
+        return 6
+    if stat_get_uid(b) != st.st_uid
+        return 7
+    if stat_get_gid(b) != st.st_gid
+        return 8
+    if stat_get_size(b) != 11
+        return 9
+    if stat_get_blksize(b) != st.st_blksize
+        return 10
+    if stat_get_blocks(b) != st.st_blocks
+        return 11
+    0
+

@@ -1062,7 +1062,60 @@ High-level filesystem operations.
 | `mode_is_file` | `fn(mode: i32) -> i32` | Check mode is regular file |
 | `mode_is_link` | `fn(mode: i32) -> i32` | Check mode is symlink |
 
-**Stat Buffer Accessors** (legacy):
+**stat / lstat**:
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `stat` | `fn(path: StrView) -> Result<Stat, i32>` | Status of `path`, following symlinks |
+| `lstat` | `fn(path: StrView) -> Result<Stat, i32>` | Status of `path`; a symlink is reported as itself |
+
+`Stat` is the kernel's x86_64 `struct stat`, defined once in `ritzlib.sys`
+(`st_dev`, `st_ino`, `st_nlink`, `st_mode`, `st_uid`, `st_gid`, `st_size`,
+`st_blksize`, `st_blocks`, timestamps). The path is a `StrView` and needn't be
+NUL-terminated, because it's copied into a terminated buffer first. `Err` holds
+the positive errno (`2` = ENOENT). A path of 4096 bytes or more gives `36`
+(ENAMETOOLONG) without making a syscall.
+
+```ritz
+import ritzlib.fs
+import ritzlib.result
+
+fn size_or_minus_one(path: StrView) -> i64
+    var r: Result<Stat, i32> = lstat(path)
+    match r
+        Ok(st) => st.st_size
+        Err(_) => -1
+```
+
+**Directory entries**:
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `dir_entry` | `fn(dir: @DirIter) -> DirEntry` | Current entry after `dir_next` returns 1 |
+| `dir_next_entry` | `fn(dir: @&DirIter) -> Option<DirEntry>` | Advance and return the next entry, `None` at the end |
+| `dirent_entry` | `fn(entry: *u8) -> DirEntry` | Decode one raw `linux_dirent64` record |
+
+```ritz
+import ritzlib.sys
+import ritzlib.fs
+import ritzlib.strview
+
+# Count regular files in `path` (0 if it can't be opened).
+fn count_files(path: *u8) -> i64
+    var dir: DirIter = dir_open(path)
+    var n: i64 = 0
+    while dir_next(@dir)
+        let e: DirEntry = dir_entry(@dir)    # e.ino, e.kind, e.name: StrView
+        if e.kind == DT_REG
+            n += 1
+    dir_close(@dir)
+    n
+```
+
+`DirEntry.name` points into the iterator's buffer and doesn't include the NUL.
+It is valid until the next `dir_next`/`dir_next_entry` or `dir_close` call.
+
+**Stat Buffer Accessors** (legacy; use `stat`/`lstat` and the `Stat` fields):
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
@@ -1071,7 +1124,10 @@ High-level filesystem operations.
 | `stat_get_uid` | `fn(statbuf: *u8) -> i32` | Get UID |
 | `stat_get_gid` | `fn(statbuf: *u8) -> i32` | Get GID |
 
-**Dirent Helpers**:
+These and `stat_get_dev/ino/nlink/blksize/blocks` read through `*Stat`, so
+the field offsets are defined only in `ritzlib.sys`.
+
+**Dirent Helpers** (legacy; use `DirEntry`):
 
 ```ritz
 struct Dirent64

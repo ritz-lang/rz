@@ -1,0 +1,130 @@
+# test_fs_dirent.ritz - Typed fs API: DirEntry { ino, kind, name: StrView }
+# from dir_next_entry / dir_entry (AGAST #1476). stat tests: test_fs_stat.ritz.
+#
+# Each test owns its fixtures under /tmp and removes them, so the verdict does
+# not depend on the cwd build.py happens to run the binary from.
+
+import ritzlib.sys
+import ritzlib.fs
+import ritzlib.strview
+import ritzlib.result
+import ritzlib.option
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+fn inode_of(path: *u8) -> i64
+    var r: Result<Stat, i32> = stat(strview_from_cstr(path))
+    match r
+        Ok(st) => st.st_ino
+        Err(_) => -1
+
+fn entry_or_empty(o: *Option<DirEntry>) -> DirEntry
+    match *o
+        Some(e) => e
+        None => DirEntry { ino: -1, kind: 0, name: strview_empty() }
+
+fn write_fixture(path: *u8, len: i64) -> i32
+    let fd: i32 = sys_open3(path, 577, 420)
+    if fd < 0
+        return fd
+    var buf: [64]u8
+    for i in 0..len
+        buf[i] = 'x' as u8
+    sys_write(fd, @buf[0], len)
+    sys_close(fd)
+    0
+
+# ============================================================================
+# DirEntry
+# ============================================================================
+
+[[test]]
+fn test_dir_next_entry_yields_typed_entries() -> i32
+    let d: *u8 = c"/tmp/ritz_1476_dir"
+    let f: *u8 = c"/tmp/ritz_1476_dir/alpha"
+    let sub: *u8 = c"/tmp/ritz_1476_dir/beta"
+    sys_unlink(f)
+    sys_rmdir(sub)
+    sys_rmdir(d)
+    if sys_mkdir(d, 493) != 0
+        return 1
+    if write_fixture(f, 3) != 0
+        return 2
+    if sys_mkdir(sub, 493) != 0
+        return 3
+    let f_ino: i64 = inode_of(f)
+
+    var seen_alpha: i32 = 0
+    var seen_beta: i32 = 0
+    var count: i32 = 0
+    var bad: i32 = 0
+    var dir: DirIter = dir_open(d)
+    loop
+        var o: Option<DirEntry> = dir_next_entry(@dir)
+        if option_is_none<DirEntry>(@o) == 1
+            break
+        let e: DirEntry = entry_or_empty(@o)
+        count += 1
+        if strview_eq_cstr(@e.name, c"alpha") == 1
+            seen_alpha = 1
+            # The view spans exactly the name; the NUL is not counted.
+            if e.name.len != 5
+                bad = 10
+            if e.kind != DT_REG
+                bad = 11
+            if e.ino != f_ino
+                bad = 12
+        else if strview_eq_cstr(@e.name, c"beta") == 1
+            seen_beta = 1
+            if e.kind != DT_DIR
+                bad = 13
+    dir_close(@dir)
+    sys_unlink(f)
+    sys_rmdir(sub)
+    sys_rmdir(d)
+    if bad != 0
+        return bad
+    if seen_alpha == 0
+        return 4
+    if seen_beta == 0
+        return 5
+    # alpha, beta, ".", ".."
+    if count != 4
+        return 6
+    0
+
+[[test]]
+fn test_dir_next_entry_invalid_dir_is_none() -> i32
+    var dir: DirIter = dir_open(c"/nonexistent/ritz_1476")
+    var o: Option<DirEntry> = dir_next_entry(@dir)
+    if option_is_none<DirEntry>(@o) == 0
+        return 1
+    # With no current record, dir_entry is the empty entry, not stale bytes.
+    let e: DirEntry = dir_entry(@dir)
+    if e.ino != 0 or e.kind != DT_UNKNOWN or e.name.len != 0
+        return 2
+    0
+
+[[test]]
+fn test_dir_entry_matches_legacy_getters() -> i32
+    var dir: DirIter = dir_open(c"/tmp")
+    var checked: i32 = 0
+    while dir_next(@dir)
+        let e: DirEntry = dir_entry(@dir)
+        if e.ino != dirent_get_ino(dir.entry)
+            return 1
+        if e.kind != dirent_get_type(dir.entry)
+            return 2
+        if e.name.ptr != dirent_get_name(dir.entry)
+            return 3
+        if e.name.ptr != dir_entry_name(@dir)
+            return 4
+        if strview_eq_cstr(@e.name, dir_entry_name(@dir)) == 0
+            return 5
+        checked += 1
+    dir_close(@dir)
+    if checked == 0
+        return 6
+    0
