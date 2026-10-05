@@ -81,9 +81,6 @@ _RITZ1_TWINS = {
         "AGAST #1602 — int→int `as` cast is a no-op (0x95511559 as i32)",
     "test_level9::test_indent_stack_struct":
         "AGAST #1605 — `[v; N]` array field in a struct literal stores a pointer",
-    "test_async_echo::main":
-        "AGAST #1628 — ~4.4MB stack TaskPool inlined into main at -O2 overflows "
-        "the 8MB stack under ritz1's IR",
     # --- codegen, build failures ---
     "test_mut_ref":
         "AGAST #1607 — instance-method args not narrowed to param width (invalid IR)",

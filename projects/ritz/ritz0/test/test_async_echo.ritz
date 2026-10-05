@@ -10,6 +10,7 @@ import ritzlib.sys
 import ritzlib.io
 import ritzlib.uring
 import ritzlib.async_tasks
+import ritzlib.memory
 
 
 # ============================================================================
@@ -51,17 +52,16 @@ fn test_echo_handler(task: *Task) -> i32
 # Test 1: Handler state machine
 # ============================================================================
 
-fn test_handler_state_machine() -> i32
+fn test_handler_state_machine(pool: *TaskPool) -> i32
     var ring: IoUring
     uring_init(@ring, 64)
 
-    var pool: TaskPool
-    task_pool_init(@pool, @ring)
+    task_pool_init(pool, @ring)
 
     # Spawn a task with our echo handler
-    spawn_task(@pool, -1, test_echo_handler)
+    spawn_task(pool, -1, test_echo_handler)
 
-    var task = task_pool_find(@pool, 1)
+    var task = task_pool_find(pool, 1)
     if task == null
         prints("FAIL: Could not find spawned task\n")
         uring_destroy(@ring)
@@ -113,16 +113,15 @@ fn test_handler_state_machine() -> i32
 # Test 2: Task buffer handling
 # ============================================================================
 
-fn test_task_buffers() -> i32
+fn test_task_buffers(pool: *TaskPool) -> i32
     var ring: IoUring
     uring_init(@ring, 64)
 
-    var pool: TaskPool
-    task_pool_init(@pool, @ring)
+    task_pool_init(pool, @ring)
 
-    spawn_task(@pool, -1, test_echo_handler)
+    spawn_task(pool, -1, test_echo_handler)
 
-    var task = task_pool_find(@pool, 1)
+    var task = task_pool_find(pool, 1)
 
     # Call handler to populate read buffer
     test_echo_handler(task)
@@ -154,16 +153,15 @@ fn test_task_buffers() -> i32
 # Test 3: Multiple concurrent tasks
 # ============================================================================
 
-fn test_multiple_tasks() -> i32
+fn test_multiple_tasks(pool: *TaskPool) -> i32
     var ring: IoUring
     uring_init(@ring, 64)
 
-    var pool: TaskPool
-    task_pool_init(@pool, @ring)
+    task_pool_init(pool, @ring)
 
     # Spawn 5 tasks
     for i in 0..5
-        let ret = spawn_task(@pool, -(i + 1), test_echo_handler)
+        let ret = spawn_task(pool, -(i + 1), test_echo_handler)
         if ret < 0
             print("FAIL: spawn_task {i} failed\n")
             uring_destroy(@ring)
@@ -176,7 +174,7 @@ fn test_multiple_tasks() -> i32
 
     # Verify all tasks exist and are in correct state
     for i in 0..5
-        let task = task_pool_find(@pool, (i + 1) as i64)
+        let task = task_pool_find(pool, (i + 1) as i64)
         if task == null
             print("FAIL: task {i} not found\n")
             uring_destroy(@ring)
@@ -189,8 +187,8 @@ fn test_multiple_tasks() -> i32
 
     # Complete all tasks
     for i in 0..5
-        let task = task_pool_find(@pool, (i + 1) as i64)
-        task_complete(@pool, task)
+        let task = task_pool_find(pool, (i + 1) as i64)
+        task_complete(pool, task)
 
     if pool.active_count != 0
         prints("FAIL: active_count should be 0 after completing all tasks\n")
@@ -206,16 +204,15 @@ fn test_multiple_tasks() -> i32
 # Test 4: Task request counter
 # ============================================================================
 
-fn test_request_counter() -> i32
+fn test_request_counter(pool: *TaskPool) -> i32
     var ring: IoUring
     uring_init(@ring, 64)
 
-    var pool: TaskPool
-    task_pool_init(@pool, @ring)
+    task_pool_init(pool, @ring)
 
-    spawn_task(@pool, -1, test_echo_handler)
+    spawn_task(pool, -1, test_echo_handler)
 
-    var task = task_pool_find(@pool, 1)
+    var task = task_pool_find(pool, 1)
 
     # Initial request count should be 0
     if task.request_count != 0
@@ -249,12 +246,23 @@ fn main() -> i32
     prints("Running async echo framework tests...\n")
     prints("====================================\n")
 
+    # The pool is ~4.4MB ([256]Task with inline buffers). It lives on the heap,
+    # shared by every test (each re-inits it), because a stack TaskPool per
+    # test fn overflowed the 8MB stack once clang inlined two of them into
+    # main at -O2 — and whether it overflowed depended on the host (AGAST #1628).
+    let pool: *TaskPool = malloc(sizeof(TaskPool)) as *TaskPool
+    if pool == null
+        prints("FAIL: could not allocate TaskPool\n")
+        return 1
+
     var failures: i32 = 0
 
-    failures += test_handler_state_machine()
-    failures += test_task_buffers()
-    failures += test_multiple_tasks()
-    failures += test_request_counter()
+    failures += test_handler_state_machine(pool)
+    failures += test_task_buffers(pool)
+    failures += test_multiple_tasks(pool)
+    failures += test_request_counter(pool)
+
+    free(pool as *u8)
 
     prints("====================================\n")
     if failures == 0
