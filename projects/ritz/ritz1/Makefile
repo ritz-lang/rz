@@ -83,15 +83,33 @@ $(BUILD_DIR):
 
 # === Pattern rules for module compilation ===
 
-# Compile .ritz to .ll (1:1, with imports as external declarations)
-# All modules except main_new use --no-runtime (no _start)
+# === Import dependencies (AGAST #1659) ===
+# A module's IR bakes in the field offsets of every struct it reaches through
+# its imports, so `foo.ll` must rebuild when any (transitively) imported .ritz
+# changes -- not just foo.ritz.  Without this, changing a struct in
+# emitter_core.ritz left every importer's .o with stale offsets and ritz1
+# linked silently miscompiled (#1497).
+#
+# gcc -MMD style: each .ll recipe writes build/<name>.d listing its transitive
+# imports (for both the ritz0 .ll and the self-hosted _sh.ll).  A missing .d
+# means the .ll is missing too, so the first build is still correct.  The .d
+# is written BEFORE compiling: a .ll that exists without its .d would never
+# rebuild on an import change.
+MKDEPS = python3 mkdeps.py
+-include $(wildcard $(BUILD_DIR)/*.d)
+
+# Keep the .ll files.  They are intermediates of .ritz → .ll → .o, so make
+# would delete them after a build; the next run then sees the .d naming a
+# missing .ll and recompiles every module.
+.SECONDARY: $(LL_FILES) $(patsubst %,$(BUILD_DIR)/ritzlib_%.ll,$(RITZLIB_MODULES)) \
+	$(patsubst %,$(BUILD_DIR)/%_sh.ll,$(SOURCES))
+
+# Compile .ritz to .ll (1:1, with imports as external declarations).
+# All modules use --no-runtime: main.ritz defines main(), and _start comes
+# from runtime/ritz_start*.o at link time.
 $(BUILD_DIR)/%.ll: $(SRC_DIR)/%.ritz | $(BUILD_DIR)
 	@echo "Compiling $< → $@"
-	$(RITZ0) $< --no-runtime -o $@
-
-# main is special - it has main() but _start comes from runtime/ritz_start*.o
-$(BUILD_DIR)/main.ll: $(SRC_DIR)/main.ritz | $(BUILD_DIR)
-	@echo "Compiling $< → $@ (main function, runtime provides _start)"
+	@$(MKDEPS) $< $@ $(BUILD_DIR)/$*_sh.ll > $(BUILD_DIR)/$*.d.tmp && mv $(BUILD_DIR)/$*.d.tmp $(BUILD_DIR)/$*.d
 	$(RITZ0) $< --no-runtime -o $@
 
 # Compile .ll to .o (use clang directly for LLVM IR)
@@ -102,6 +120,7 @@ $(BUILD_DIR)/%.o: $(BUILD_DIR)/%.ll
 # === Compile ritzlib modules ===
 $(BUILD_DIR)/ritzlib_%.ll: $(RITZLIB_DIR)/%.ritz | $(BUILD_DIR)
 	@echo "Compiling ritzlib/$*.ritz → $@"
+	@$(MKDEPS) $< $@ > $(BUILD_DIR)/ritzlib_$*.d.tmp && mv $(BUILD_DIR)/ritzlib_$*.d.tmp $(BUILD_DIR)/ritzlib_$*.d
 	$(RITZ0) $< --no-runtime -o $@
 
 $(BUILD_DIR)/ritzlib_%.o: $(BUILD_DIR)/ritzlib_%.ll
@@ -178,7 +197,7 @@ stats:
 # === Clean ===
 clean:
 	@echo "Cleaning build artifacts..."
-	rm -f $(BUILD_DIR)/*.ll $(BUILD_DIR)/*.s $(BUILD_DIR)/*.o
+	rm -f $(BUILD_DIR)/*.ll $(BUILD_DIR)/*.s $(BUILD_DIR)/*.o $(BUILD_DIR)/*.d
 	@echo "✓ Build artifacts cleaned"
 
 distclean: clean
