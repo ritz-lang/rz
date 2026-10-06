@@ -569,105 +569,19 @@ pub fn param_link(first: *Param, rest: *Param) -> *Param
     first.next = rest
     return first
 
-# Bare `self` receiver in impl methods — `fn foo(self)`.  The receiver type
-# is resolved by emit_impl_method against the enclosing ImplBlock's
-# type_name; we just record a Param named "self".  TYPE_STRUCT matches the
-# by-value-receiver convention; the emitter special-cases the "self" name
-# to emit `ptr` at the LLVM level so UFCS callers can pass the receiver
-# as a pointer regardless of the surface-syntax-by-value spelling.
-#
-# AGAST #1375: the grammar's `self: T` / `self:& T` alternatives call this
-# without passing T, so a FREE fn's `self` had no type and every `self.field`
-# failed ("unhandled EXPR_MEMBER"); the same fn with the parameter renamed
-# compiled.  The type_spec was still parsed, though, so its tokens sit just
-# before p.pos and its side-channel state (last_type_name, pointee/ref inner
-# kinds) is still in p.  self_annotation_kind recovers the kind type_spec
-# returned, and the Param is built exactly as `IDENT COLON type_spec` builds
-# one.  impl methods are unaffected: emit_impl_method recognises `self` by
-# name and takes the receiver type from the impl block, whatever the Param says.
+# Untyped `self` receiver in impl methods: `fn foo(self)` or `fn foo(self:&)`.
+# The receiver type is resolved by emit_impl_method against the enclosing
+# ImplBlock's type_name, so we just record a Param named "self".  TYPE_STRUCT
+# matches the by-value-receiver convention.  The emitter special-cases the
+# "self" name to emit `ptr` at the LLVM level, so UFCS callers can pass the
+# receiver as a pointer even when the source spells it by value.  Typed
+# `self: T` / `self:& T` receivers do not come here: the grammar passes T to
+# param_new, as it does for any other name (AGAST #1375, #1632).
 pub fn param_self(p: *Parser, name: *u8, len: i32, line: i32, col: i32) -> *Param
-    let ty: i32 = self_annotation_kind(p, name)
-    if ty != TYPE_VOID
-        return param_new(p, name, len, ty, line, col)
-    # Untyped receiver (`self`, `self:&`): there is no type to keep.  Clear
-    # any "last type name" left by an earlier type_spec.  emit_impl_method
-    # fills in the real type from the impl block's target type.
+    # Clear any "last type name" left by an earlier type_spec.
     p.last_type_name = null
     p.last_type_name_len = 0
     return param_new(p, name, len, TYPE_STRUCT, line, col)
-
-# The kind type_spec returned for the annotation on the `self` token at
-# `name`, or TYPE_VOID when there is no annotation.  Called with p.pos just
-# past the param's last token.  Every type_spec alternative is covered.
-# The outermost alternative's action ran last, so the parser state it set
-# is still current.
-fn self_annotation_kind(p: *Parser, name: *u8) -> i32
-    # Find the SELF token: the param is `self`, `self:&`, `self: T` or
-    # `self:& T`, so it starts a few tokens before p.pos.
-    var i: i32 = p.pos - 1
-    var found: i32 = 0
-    while i >= 0 and found == 0
-        if (p.tokens + i).start == name
-            found = 1
-        else
-            i = i - 1
-    if found == 0 or i + 2 >= p.pos
-        return TYPE_VOID                    # bare `self`
-    var t: i32 = i + 2                      # first token after the COLON
-    var mut_borrow: i32 = 0
-    if (p.tokens + t).kind == TOK_AMP       # `self:& T` (`:&` lexes as COLON AMP)
-        mut_borrow = 1
-        t = t + 1
-        if t >= p.pos
-            return TYPE_VOID                # bare `self:&`
-    let k: i32 = type_spec_kind_at(p, t)
-    if mut_borrow == 1
-        return type_mut_ref(p, k)
-    return k
-
-# The kind returned by the type_spec spanning tokens t .. p.pos-1.  This
-# mirrors the type_spec rule in grammars/ritz1.grammar: keep the two in step.
-fn type_spec_kind_at(p: *Parser, t: i32) -> i32
-    let first: i32 = (p.tokens + t).kind
-    if first == TOK_I8
-        return TYPE_I8
-    if first == TOK_I16
-        return TYPE_I16
-    if first == TOK_I32
-        return TYPE_I32
-    if first == TOK_I64
-        return TYPE_I64
-    if first == TOK_U8
-        return TYPE_U8
-    if first == TOK_U16
-        return TYPE_U16
-    if first == TOK_U32
-        return TYPE_U32
-    if first == TOK_U64
-        return TYPE_U64
-    if first == TOK_BOOL
-        return TYPE_BOOL
-    if first == TOK_STAR
-        # type_ptr's rule: its argument is still in last_pointee_type.
-        if p.last_pointee_type == TYPE_PTR or p.last_pointee_type == TYPE_PTR_PTR
-            return TYPE_PTR_PTR
-        return TYPE_PTR
-    if first == TOK_LBRACKET
-        return TYPE_ARRAY
-    if first == TOK_AT
-        if t + 1 < p.pos and (p.tokens + (t + 1)).kind == TOK_AMP
-            return TYPE_MUT_REF
-        return TYPE_REF
-    if first == TOK_FN
-        return TYPE_PTR
-    if first == TOK_IDENT
-        if t + 1 < p.pos
-            return TYPE_STRUCT              # `Name<...>`: type_generic_with_saved
-        # A lone name: f32/f64, an alias or a struct.  type_named is the
-        # action that ran; calling it again sets the same state and returns
-        # the same kind.
-        return type_named(p, (p.tokens + t).start, (p.tokens + t).len)
-    return TYPE_VOID
 
 # =============================================================================
 # Struct definition helpers

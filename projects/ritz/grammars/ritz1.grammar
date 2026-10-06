@@ -281,22 +281,24 @@ params -> *Param
     ;
 
 param -> *Param
-    # Bare `self` receiver in impl methods — type is resolved post-parse
-    # against the enclosing ImplBlock's target type.  Also accept the
-    # explicitly-typed forms `self: Point` and `self: @Point` — the
-    # type annotation is consumed for syntax acceptance but discarded
-    # because emit_impl_method always derives the receiver type from
-    # the enclosing impl block.  Without this alt, `fn scale(self:
-    # @Point, ...)` fails parse → the entire impl method is dropped
-    # (silent recovery), so call sites see only `declare i64 @T_method
-    # (...)` extern instead of a real definition.
-    : SELF COLON type_spec { param_self(p, $1.start, $1.len, $1.line, $1.col) }
+    # `self` receivers.  `self` lexes as SELF, not IDENT, so these are
+    # separate alternatives.  A typed `self: T` builds exactly the Param that
+    # `IDENT COLON type_spec` builds for any other name: a FREE fn's `self`
+    # has no impl block, so it needs the annotated type to lower `self.field`
+    # (AGAST #1375).  In impl methods, emit_impl_method recognises `self` by
+    # name and takes the receiver type from the impl block, so the annotation
+    # changes nothing there.  Without these alternatives, `fn scale(self:
+    # @Point, ...)` failed to parse and the whole impl method was dropped
+    # (silent recovery), so call sites saw only an extern
+    # `declare i64 @T_method(...)` and never a real definition.
+    : SELF COLON type_spec { param_new(p, $1.start, $1.len, $3, $1.line, $1.col) }
     # `self:& T` and bare `self:&` are mutable-borrow receivers (ritz0's
-    # COLON_AMP), and ritz1 lexes `:&` as COLON AMP.  Like `self: @&T` above,
-    # the type is discarded and the receiver comes from the impl block.
-    # Without these alternatives the whole impl block failed to parse
-    # (AGAST #1522: 68 angelo methods, plus prism and lexis).
-    | SELF COLON AMP type_spec { param_self(p, $1.start, $1.len, $1.line, $1.col) }
+    # COLON_AMP).  ritz1 lexes `:&` as COLON AMP, and `self:& T` gets the same
+    # TYPE_MUT_REF as `name:& T` below.  Bare `self:&` and bare `self` have no
+    # type, so param_self records the impl-receiver placeholder.  Without
+    # these alternatives the whole impl block failed to parse (AGAST #1522:
+    # 68 angelo methods, plus prism and lexis).
+    | SELF COLON AMP type_spec { param_new(p, $1.start, $1.len, type_mut_ref(p, $4), $1.line, $1.col) }
     | SELF COLON AMP { param_self(p, $1.start, $1.len, $1.line, $1.col) }
     | SELF { param_self(p, $1.start, $1.len, $1.line, $1.col) }
     # `name:& T` — mutable-borrow parameter (ritz0's COLON_AMP form).  ritz1
@@ -568,6 +570,15 @@ control_stmt -> *Stmt
     | continue_stmt
     ;
 
+# Name bound by `let` / `var`.  `self` lexes as SELF, not IDENT, but ritz0
+# accepts it as an ordinary binding name (63_executor binds
+# `let self: *SimpleFuture = ...`).  Reads need nothing extra: primary_expr
+# already turns SELF into an EXPR_IDENT (AGAST #1632).
+binding_name -> Token
+    : IDENT { $1 }
+    | SELF { $1 }
+    ;
+
 let_stmt -> *Stmt
     # Tuple-destructure: `let (x, y) = expr` — see stmt_tuple_decl.
     # Two-name only for now; >2 fields needs a list rule.
@@ -576,13 +587,13 @@ let_stmt -> *Stmt
     # Match-expression RHS forms — match_expr ends in DEDENT, not NEWLINE,
     # so the trailing NEWLINE in the regular forms cannot match.  These
     # alternatives must come first so they win the start_pos race.
-    | LET IDENT COLON var_type ASSIGN match_expr_rhs
+    | LET binding_name COLON var_type ASSIGN match_expr_rhs
       { stmt_var_decl(p, $2.start, $2.len, $4, $6, $1.line, $1.col) }
-    | LET IDENT ASSIGN match_expr_rhs
+    | LET binding_name ASSIGN match_expr_rhs
       { stmt_var_decl(p, $2.start, $2.len, 0, $4, $1.line, $1.col) }
-    | LET IDENT COLON var_type ASSIGN expr NEWLINE
+    | LET binding_name COLON var_type ASSIGN expr NEWLINE
       { stmt_var_decl(p, $2.start, $2.len, $4, $6, $1.line, $1.col) }
-    | LET IDENT ASSIGN expr NEWLINE
+    | LET binding_name ASSIGN expr NEWLINE
       { stmt_var_decl(p, $2.start, $2.len, 0, $4, $1.line, $1.col) }
     ;
 
@@ -595,15 +606,15 @@ match_expr_rhs -> *Expr
 
 var_stmt -> *Stmt
     # Match-expression RHS forms — see let_stmt for rationale.
-    : VAR IDENT COLON var_type ASSIGN match_expr_rhs
+    : VAR binding_name COLON var_type ASSIGN match_expr_rhs
       { stmt_var_decl(p, $2.start, $2.len, $4, $6, $1.line, $1.col) }
-    | VAR IDENT ASSIGN match_expr_rhs
+    | VAR binding_name ASSIGN match_expr_rhs
       { stmt_var_decl(p, $2.start, $2.len, 0, $4, $1.line, $1.col) }
-    | VAR IDENT COLON var_type ASSIGN expr NEWLINE
+    | VAR binding_name COLON var_type ASSIGN expr NEWLINE
       { stmt_var_decl(p, $2.start, $2.len, $4, $6, $1.line, $1.col) }
-    | VAR IDENT COLON type_spec NEWLINE
+    | VAR binding_name COLON type_spec NEWLINE
       { stmt_var_decl(p, $2.start, $2.len, $4, 0 as *Expr, $1.line, $1.col) }
-    | VAR IDENT ASSIGN expr NEWLINE
+    | VAR binding_name ASSIGN expr NEWLINE
       { stmt_var_decl(p, $2.start, $2.len, 0, $4, $1.line, $1.col) }
     ;
 
@@ -699,9 +710,12 @@ continue_stmt -> *Stmt
     ;
 
 assign_stmt -> *Stmt
-    : IDENT ASSIGN expr NEWLINE
+    # binding_name, so a `var self` can be reassigned.  With IDENT here,
+    # `self = v` fell through to `postfix_expr ASSIGN`, which stored v through
+    # self's VALUE as if it were an address (AGAST #1632).
+    : binding_name ASSIGN expr NEWLINE
       { stmt_assign_name(p, $1.start, $1.len, $3, $1.line, $1.col) }
-    | IDENT compound_op expr NEWLINE
+    | binding_name compound_op expr NEWLINE
       { stmt_compound_assign(p, $1.start, $1.len, $2, $3, $1.line, $1.col) }
     | IDENT LBRACKET expr RBRACKET ASSIGN expr NEWLINE
       { stmt_assign_index(p, $1.start, $1.len, $3, $6, $1.line, $1.col) }

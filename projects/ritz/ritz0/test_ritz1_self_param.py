@@ -13,13 +13,13 @@ receiver's type from the impl block. A free fn has no impl block, so its `self`
 had no type and every `self.field` failed: read, assignment, and `@self.field`
 ("cannot take address").
 
-THE FIX (ritz1/src/ast_helpers.ritz, no grammar change)
+THE FIX
 
-param_self rebuilds the type it was given from the tokens type_spec consumed and
-the parser state type_spec left behind. That produces the same Param the
-`IDENT COLON type_spec` alternative builds for any other name. impl_block_new
-then resets each method's `self` to the old receiver form, so impl methods are
-unchanged.
+#1375 first recovered the type inside param_self from the tokens type_spec had
+consumed. #1632 replaced that: the grammar's `self: T` / `self:& T` actions now
+pass T to param_new, which builds the same Param the `IDENT COLON type_spec`
+alternative builds for any other name. impl methods are unchanged, because
+emit_impl_method takes the receiver type from the impl block.
 
 ORACLE
 
@@ -168,8 +168,8 @@ pub fn main() -> i32
     return 42
 """
 
-# Control: impl receivers in every spelling. param_self now records the
-# annotation, so impl_block_new has to reset these. They must behave as before.
+# Control: impl receivers in every spelling. The grammar now records the
+# annotation on a typed `self`, and impl methods must behave as before.
 # (Generic impl receivers are left out: ritz1 does not yet emit generic impl
 # methods at all, #1520.)
 IMPL_CONTROL = """\
