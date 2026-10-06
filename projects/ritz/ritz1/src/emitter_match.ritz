@@ -17,7 +17,9 @@
 #   arms become dead code (emitted but unreachable).
 # - `pass` arms emit a zero value for their body result.
 # - Match result is collected via phi over (arm_body_result, arm_exit_label)
-#   pairs so `let x = match ...` works.
+#   pairs so `let x = match ...` works.  The phi is i64 unless an arm yields
+#   a known struct (`Some(v) => v` over Option<StrView>), in which case it is
+#   that struct type (AGAST #1645).
 #
 # Variant patterns (Some(v) / None / Ok(v) / Err(_)) use a tag convention:
 #   Some(x) / Ok(x) -> high 16 bits = 1, low 48 bits = x
@@ -48,6 +50,11 @@ struct MatchResult
     values: [64]i32   # register numbers holding each arm's result
     labels: [64]i32   # exit label numbers for each arm's result
     count: i32
+    # AGAST #1645: LLVM struct type the arms yield (`%StrView`, `%Point`),
+    # or null when they yield the usual i64 scalar.  The merge phi and the
+    # non-exhaustive fallthrough value are emitted at this type.
+    agg_name: *u8
+    agg_name_len: i32
 
 # Check if a variant name denotes the "Some/Ok" (tagged) side of its enum.
 # Returns 1 if tag should be 1, 0 otherwise.
@@ -271,6 +278,15 @@ fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_s
         emit_str(s, c" = add i64 0, 0  ; match arm: pass\n")
     else if arm.body != null
         body_reg = emit_expr(s, arm.body)
+        # AGAST #1645: record the arm's struct type while its pattern
+        # binding (`Some(v) => v`) is still in scope; it is popped below.
+        if result.agg_name == null
+            var arm_ty: *u8 = null
+            var arm_ty_len: i32 = 0
+            resolve_expr_struct_name(s, arm.body, @arm_ty, @arm_ty_len)
+            if arm_ty != null and arm_ty_len > 0
+                result.agg_name = arm_ty
+                result.agg_name_len = arm_ty_len
     else
         body_reg = next_reg(s)
         emit_str(s, c"  ")
@@ -451,6 +467,8 @@ fn emit_match(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm) -> i32
     let end_label: i32 = next_label(s)
     var result: MatchResult
     result.count = 0
+    result.agg_name = null
+    result.agg_name_len = 0
 
     var arm: *MatchArm = arms
     var idx: i32 = 0
@@ -461,11 +479,16 @@ fn emit_match(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm) -> i32
 
     # Current block is the last "next" block — it has no matching arm, so
     # fall through to match end with a default value. This is the
-    # non-exhaustive safety net.
-    let fallthrough_reg: i32 = next_reg(s)
-    emit_str(s, c"  ")
-    emit_reg(s, fallthrough_reg)
-    emit_str(s, c" = add i64 0, 0  ; match: non-exhaustive fallthrough\n")
+    # non-exhaustive safety net.  For struct-valued arms (AGAST #1645) the
+    # default is the aggregate `zeroinitializer` constant, written straight
+    # into the phi below, so no instruction is emitted for it here.
+    let is_agg: i32 = result.agg_name != null and result.agg_name_len > 0
+    var fallthrough_reg: i32 = 0
+    if is_agg == 0
+        fallthrough_reg = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, fallthrough_reg)
+        emit_str(s, c" = add i64 0, 0  ; match: non-exhaustive fallthrough\n")
     let fallthrough_label: i32 = s.current_label
     emit_str(s, c"  br label %")
     emit_label(s, end_label)
@@ -483,7 +506,12 @@ fn emit_match(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm) -> i32
     let phi_reg: i32 = next_reg(s)
     emit_str(s, c"  ")
     emit_reg(s, phi_reg)
-    emit_str(s, c" = phi i64 ")
+    emit_str(s, c" = phi ")
+    if is_agg == 1
+        emit_llvm_type_struct(s, TYPE_STRUCT, result.agg_name, result.agg_name_len)
+    else
+        emit_str(s, c"i64")
+    emit_str(s, c" ")
     var i: i32 = 0
     while i < result.count
         if i > 0
@@ -496,7 +524,10 @@ fn emit_match(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm) -> i32
         i = i + 1
     # Add fallthrough entry
     emit_str(s, c", [ ")
-    emit_reg(s, fallthrough_reg)
+    if is_agg == 1
+        emit_str(s, c"zeroinitializer")
+    else
+        emit_reg(s, fallthrough_reg)
     emit_str(s, c", %")
     emit_label(s, fallthrough_label)
     emit_str(s, c" ]\n")
