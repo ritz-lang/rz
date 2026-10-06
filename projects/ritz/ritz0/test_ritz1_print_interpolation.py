@@ -269,7 +269,8 @@ pub fn main() -> i32
 
 
 def test_bool_struct_field_and_array_element(tmp_path):
-    """Loads of a bool slot leave an i1 register, unlike `: bool` locals."""
+    """Bool fields (an i1 in memory, zext'd at the load since #1646) and
+    `[N]bool` elements print as true/false, like `: bool` locals."""
     program = """\
 struct F
     ok: bool

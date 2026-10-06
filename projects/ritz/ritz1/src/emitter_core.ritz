@@ -2006,9 +2006,23 @@ fn get_expr_type(s: *EmitterState, e: *Expr) -> i32
         return e.op
     TYPE_I64  # Default fallback
 
-# Does emit_expr leave this condition expression in an i1 register?
+# Does emit_expr leave this bool expression in an i1 register?
 #
-# AGAST #1367.  Condition sites (STMT_IF, STMT_WHILE) need to know whether the
+# AGAST #1646: ritz1 has ONE convention for bools.  Every bool value lives in
+# an i64 register; i1 exists only at the ABI edges (call args, `ret`, struct
+# field stores) and at `br`, and those sites narrow with `trunc` / `icmp ne`.
+# Bool locals (emit_var_decl) and bool params (emit_bool_param_spill, #1497)
+# live in i64 slots, bool calls / comparisons / `not` / `and` / `or` zext,
+# and bool struct fields zext at the load (emit_expr_member).
+#
+# The one remaining i1 producer is the load of a bool GLOBAL, which still
+# reads its slot as i1 (AGAST #1532 owns bool globals).  Locals and params
+# register as TYPE_I64, so a TYPE_BOOL identifier is that global.  Every site
+# that must pick between "use as i1" and "narrow an i64" asks this one
+# predicate: if / while / assert conditions, bool call args, struct-literal
+# bool field stores and print interpolation.
+#
+# History (AGAST #1367).  Condition sites (STMT_IF, STMT_WHILE) need to know whether the
 # register emit_expr just produced can be fed straight into `br i1`, or whether
 # it must first be narrowed with `icmp ne i64 ..., 0`.  They used to decide
 # that by asking get_expr_type and treating TYPE_BOOL as "already an i1".
@@ -2035,20 +2049,16 @@ fn get_expr_type(s: *EmitterState, e: *Expr) -> i32
 # over those, comparisons (which report TYPE_I64 and are coerced anyway),
 # `not`, and assert's operand.
 #
-# Enumerating the leakers rather than the safe forms is deliberate: it leaves
-# every currently-working shape byte-identical, and any future shape that
-# starts leaking fails loudly at clang ("defined with type 'i64' but expected
-# 'i1'") instead of silently miscompiling.
-fn cond_leaves_i1(s: *EmitterState, e: *Expr) -> i32
+# (That #1367 measurement predates #1646.  Its "bool struct field does not
+# leak" was the i1 field load; `and` / `or` over one only "worked" because a
+# raw field was never their left operand in a passing program: the operator
+# `icmp ne i64`s it, which is invalid IR.  Both now produce i64.)
+fn bool_reg_is_i1(s: *EmitterState, e: *Expr) -> i32
     if get_expr_type(s, e) != TYPE_BOOL
         return 0
-    if e.kind == EXPR_CALL
-        return 0
-    if e.kind == EXPR_UNARY and e.op == OP_DEREF
-        return 0
-    if e.kind == EXPR_BINARY
-        return cond_leaves_i1(s, e.left)
-    return 1
+    if e.kind == EXPR_IDENT
+        return 1
+    0
 
 # Get the struct type name for a dereference expression that returns TYPE_STRUCT
 # Returns the field info if found, null otherwise
