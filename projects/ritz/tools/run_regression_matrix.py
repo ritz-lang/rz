@@ -101,13 +101,16 @@ _RITZ1_TWINS = {
         "emits invalid IR",
     # --- grammar / missing features ---
     "test_level25":
-        "AGAST #1611 — ritz1 cannot parse `trait` declarations",
+        "AGAST #1607 — `p.move_by(10, 20)`: instance-method args not narrowed "
+        "to param width (invalid IR)",
     "test_level30":
-        "AGAST #1611 — ritz1 cannot parse `trait` declarations",
+        "AGAST #1520 — methods of a generic impl (`impl<T> Describable for "
+        "Wrapper<T>`) are never specialized: undefined `Wrapper$i64_describe`",
     "test_level40":
-        "AGAST #1611 — `trait` declarations; then AGAST #1620 (`dyn Trait`)",
+        "AGAST #1620 — `dyn Trait`",
     "test_trait_bounds":
-        "AGAST #1611 — `trait` declarations; also AGAST #1621 (trait bounds)",
+        "AGAST #1621 — trait bounds on generic params; also AGAST #1612 "
+        "(multi-arg generic calls)",
     "test_issue_slice_generic_payload":
         "AGAST #1614 — slice type `[T]` (ritz0-only sugar)",
     "test_issue_slice_generic_siblings":

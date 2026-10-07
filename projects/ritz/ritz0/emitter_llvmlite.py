@@ -2601,7 +2601,7 @@ class LLVMEmitter:
             param_types = [self.i8_ptr]  # self as opaque ptr
             # Add other parameters (skip self param from method signature)
             for param in method.params[1:]:  # Skip self
-                param_types.append(self._ritz_type_to_llvm(param.param_type))
+                param_types.append(self._ritz_type_to_llvm(param.type))
             ret_type = self._ritz_type_to_llvm(method.ret_type) if method.ret_type else self.void
             fn_type = ir.FunctionType(ret_type, param_types)
             vtable_fields.append(ir.PointerType(fn_type))

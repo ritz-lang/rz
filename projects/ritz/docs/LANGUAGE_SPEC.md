@@ -1766,6 +1766,7 @@ self-hosted parser is generated. A sketch:
 program      := item*
 item         := attrs? (fn_def | extern_fn | struct_def | enum_def
                         | const_def | global_var | import | impl_block)
+              | trait_def
 
 attr         := '[[' IDENT ']]' | '[[' IDENT '=' STRING ']]'
 fn_def       := 'pub'? 'fn' IDENT generic_params? '(' params? ')'
@@ -1774,6 +1775,8 @@ struct_def   := 'pub'? 'struct' IDENT generic_params? NEWLINE INDENT field+ DEDE
 enum_def     := 'pub'? 'enum' IDENT generic_params? NEWLINE INDENT variant+ DEDENT
 impl_block   := 'impl' generic_params? (IDENT 'for')? IDENT NEWLINE
                 INDENT fn_def* DEDENT
+trait_def    := 'pub'? 'trait' IDENT NEWLINE INDENT trait_sig+ DEDENT
+trait_sig    := 'fn' IDENT '(' params? ')' ('->' type)? NEWLINE
 
 type         := 'i8'|'i16'|'i32'|'i64'|'u8'|'u16'|'u32'|'u64'|'bool'
               | '*' type | '@' type | '@' '&' type | '[' NUMBER ']' type
@@ -1787,8 +1790,9 @@ expr         := binary | unary | cast | call | field | index | try | match
               | literal | struct_lit | array_lit | IDENT
 ```
 
-`trait` blocks are accepted by ritz0 but have no production in
-`ritz1.grammar` yet — the self-hosted compiler does not parse them.
+`trait` declarations parse in both compilers. ritz1 checks only their
+syntax: methods are resolved statically from the receiver's concrete type
+(§12.2), so a declaration adds nothing to the emitted module.
 
 ### B. Compilation
 
