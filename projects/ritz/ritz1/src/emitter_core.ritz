@@ -12,6 +12,7 @@ import ritzlib.hash
 import ritzlib.hashmap
 
 import ast
+import ast_helpers   # is_enum_type / enum_variant_index (AGAST #1660)
 import tokens_gen
 
 # =============================================================================
@@ -1358,6 +1359,92 @@ fn resolve_expr_struct_name(s: *EmitterState, e: *Expr, out_name: **u8, out_len:
             *out_name = e.ident_ptr as *u8
             *out_len = e.ident_len
         return
+
+# AGAST #175: type-only resolution of an EXPR_MEMBER chain rooted at an
+# identifier (local or global).  Returns the *StructField for the innermost
+# field (e.g. for `a.b.c` returns the field for `c`), or null if any link in
+# the chain can't be resolved.  Mirrors emit_member_ptr's traversal but
+# emits no IR — used by var-decl narrowing to infer pointee types for
+# `let x = @a.b.c[i]` so the binding registers as a *Struct with the right
+# type_name.  Without this, chained-member addr-of falls through to
+# "; ERROR: unhandled EXPR_MEMBER".
+fn resolve_member_chain_field(s: *EmitterState, e: *Expr) -> *StructField
+    if e == null
+        return null
+    if e.kind != EXPR_MEMBER
+        return null
+    var sname: *u8 = null
+    var sname_len: i32 = 0
+    if e.left.kind == EXPR_IDENT
+        let mloc: *LocalVar = find_local_struct_name(s, e.left.ident_ptr, e.left.ident_len)
+        if mloc != null and mloc.type_name_len > 0
+            if mloc.var_type == TYPE_PTR or mloc.var_type == TYPE_STRUCT or mloc.var_type == TYPE_REF or mloc.var_type == TYPE_MUT_REF
+                sname = mloc.type_name
+                sname_len = mloc.type_name_len
+        if sname == null
+            let mglob: *GlobalVarDef = find_global(s, e.left.ident_ptr, e.left.ident_len)
+            if mglob != null and mglob.var_type == TYPE_STRUCT and mglob.type_name_len > 0
+                sname = mglob.type_name
+                sname_len = mglob.type_name_len
+    else if e.left.kind == EXPR_MEMBER
+        # Recurse: resolve parent's field, then dereference into the field's struct
+        let parent_field: *StructField = resolve_member_chain_field(s, e.left)
+        if parent_field != null
+            if parent_field.field_type == TYPE_STRUCT and parent_field.field_type_name_len > 0
+                sname = parent_field.field_type_name
+                sname_len = parent_field.field_type_name_len
+            else if parent_field.field_type == TYPE_PTR and parent_field.field_type_name_len > 0
+                sname = parent_field.field_type_name
+                sname_len = parent_field.field_type_name_len
+    if sname == null or sname_len == 0
+        return null
+    let st: *StructDef = find_struct(s, sname, sname_len)
+    if st == null
+        return null
+    let fidx: i32 = find_field_index(st, e.ident_ptr, e.ident_len)
+    if fidx < 0
+        return null
+    return get_field_type(st, fidx)
+
+# AGAST #1660 — the unit (fieldless) enum an expression's value is, if any.
+#
+# ritz1 holds a unit-enum value as its `%Enum = type { i8 }` aggregate, never
+# as an i64: the qualified-variant ctor (`Kind.A`), an enum-typed param or
+# `let` local, an enum-returning call and an enum-typed field load all hand
+# back a `%Kind` register.  Callers that would otherwise treat the register as
+# i64 (var-decl slot inference, `==` / `!=`) ask this first.  Writes the enum
+# name, or null/0 when `e` is not statically a unit enum.  Result$/Option$
+# tagged enums are excluded: their aggregate is `{ i8, [N x i8] }`.
+fn unit_enum_expr_name(s: *EmitterState, e: *Expr, out_name: **u8, out_len: *i32)
+    *out_name = null
+    *out_len = 0
+    if e == null
+        return
+    var name: *u8 = null
+    var name_len: i32 = 0
+    if e.kind == EXPR_MEMBER
+        # Qualified variant `Kind.A` (same test as emit_expr_member).
+        if e.left != null and e.left.kind == EXPR_IDENT
+            if is_enum_type(e.left.ident_ptr, e.left.ident_len) == 1
+                if enum_variant_index(e.left.ident_ptr, e.left.ident_len, e.ident_ptr, e.ident_len) >= 0
+                    name = e.left.ident_ptr as *u8
+                    name_len = e.left.ident_len
+        # Enum-typed struct field, at any depth / through any pointer.
+        if name == null
+            let fld: *StructField = resolve_member_chain_field(s, e)
+            if fld != null and fld.field_type == TYPE_STRUCT and fld.field_type_name_len > 0
+                name = fld.field_type_name
+                name_len = fld.field_type_name_len
+    else
+        resolve_expr_struct_name(s, e, @name, @name_len)
+    if name == null or name_len == 0
+        return
+    if is_tagged_enum_type(name, name_len) == 1
+        return
+    if is_enum_type(name, name_len) == 0
+        return
+    *out_name = name
+    *out_len = name_len
 
 # AGAST #176 — Span$u8 / StrView -> i64 coercion at call-site arg passing.
 #

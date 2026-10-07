@@ -17,51 +17,8 @@ import emitter_expr
 import emitter_expr_arith    # deref_pointee_struct_name (AGAST #1505)
 import emitter_match
 
-# AGAST #175: type-only resolution of an EXPR_MEMBER chain rooted at an
-# identifier (local or global).  Returns the *StructField for the innermost
-# field (e.g. for `a.b.c` returns the field for `c`), or null if any link in
-# the chain can't be resolved.  Mirrors emit_member_ptr's traversal but
-# emits no IR — used by var-decl narrowing to infer pointee types for
-# `let x = @a.b.c[i]` so the binding registers as a *Struct with the right
-# type_name.  Without this, chained-member addr-of falls through to
-# "; ERROR: unhandled EXPR_MEMBER".
-fn resolve_member_chain_field(s: *EmitterState, e: *Expr) -> *StructField
-    if e == null
-        return null
-    if e.kind != EXPR_MEMBER
-        return null
-    var sname: *u8 = null
-    var sname_len: i32 = 0
-    if e.left.kind == EXPR_IDENT
-        let mloc: *LocalVar = find_local_struct_name(s, e.left.ident_ptr, e.left.ident_len)
-        if mloc != null and mloc.type_name_len > 0
-            if mloc.var_type == TYPE_PTR or mloc.var_type == TYPE_STRUCT or mloc.var_type == TYPE_REF or mloc.var_type == TYPE_MUT_REF
-                sname = mloc.type_name
-                sname_len = mloc.type_name_len
-        if sname == null
-            let mglob: *GlobalVarDef = find_global(s, e.left.ident_ptr, e.left.ident_len)
-            if mglob != null and mglob.var_type == TYPE_STRUCT and mglob.type_name_len > 0
-                sname = mglob.type_name
-                sname_len = mglob.type_name_len
-    else if e.left.kind == EXPR_MEMBER
-        # Recurse: resolve parent's field, then dereference into the field's struct
-        let parent_field: *StructField = resolve_member_chain_field(s, e.left)
-        if parent_field != null
-            if parent_field.field_type == TYPE_STRUCT and parent_field.field_type_name_len > 0
-                sname = parent_field.field_type_name
-                sname_len = parent_field.field_type_name_len
-            else if parent_field.field_type == TYPE_PTR and parent_field.field_type_name_len > 0
-                sname = parent_field.field_type_name
-                sname_len = parent_field.field_type_name_len
-    if sname == null or sname_len == 0
-        return null
-    let st: *StructDef = find_struct(s, sname, sname_len)
-    if st == null
-        return null
-    let fidx: i32 = find_field_index(st, e.ident_ptr, e.ident_len)
-    if fidx < 0
-        return null
-    return get_field_type(st, fidx)
+# resolve_member_chain_field moved to emitter_core (AGAST #1660) so the
+# binary-op emitter can type enum-valued member operands too.
 
 fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
     # Use the user's explicit type annotation. The parser defaults
@@ -269,13 +226,19 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
         # %Shade so the store width matches.  Without this narrowing, the
         # alloca defaulted to i64 → "store %Shade %.X, ptr <i64-slot>" was
         # rejected by clang.
+        #
+        # AGAST #1660: an enum-typed FIELD (`let k = e.kind`) loads the same
+        # %Kind aggregate, so it narrows the same way.  The slot stayed i64
+        # and argspec's `store i64 %<%ArgErrorKind>` was rejected by clang.
         else if stmt.var_init.kind == EXPR_MEMBER
-            if stmt.var_init.left != null and stmt.var_init.left.kind == EXPR_IDENT
-                if is_enum_type(stmt.var_init.left.ident_ptr, stmt.var_init.left.ident_len) == 1
-                    var_type = TYPE_STRUCT
-                    stmt.var_type = TYPE_STRUCT
-                    stmt.var_type_name = stmt.var_init.left.ident_ptr
-                    stmt.var_type_name_len = stmt.var_init.left.ident_len
+            var en_name: *u8 = null
+            var en_len: i32 = 0
+            unit_enum_expr_name(s, stmt.var_init, @en_name, @en_len)
+            if en_len > 0
+                var_type = TYPE_STRUCT
+                stmt.var_type = TYPE_STRUCT
+                stmt.var_type_name = en_name
+                stmt.var_type_name_len = en_len
         # try-expression: `let data = read_bytes()?`. The try-emit hands back
         # the unwrapped Ok payload, which is a struct (e.g., %Vec$u8) when
         # the Result's Ok variant carries a struct.  Narrow var_type to that

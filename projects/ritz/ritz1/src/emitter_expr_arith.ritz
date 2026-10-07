@@ -164,8 +164,16 @@ fn emit_expr_binary(s: *EmitterState, e: *Expr) -> i32
                 is_ptr_arith = 1
                 ptr_elem_size = elem
 
-    let left_reg: i32 = emit_expr(s, e.left)
-    let right_reg: i32 = emit_expr(s, e.right)
+    var left_reg: i32 = emit_expr(s, e.left)
+    var right_reg: i32 = emit_expr(s, e.right)
+
+    # AGAST #1660: a unit-enum operand is a `%Kind = { i8 }` aggregate, not
+    # an i64 (`k == Kind.A`, `e.kind != c`, `x == y` on enum params).
+    # Compare the tags: extract field 0 and widen it to the i64 the integer
+    # compare below expects.  Either side may be the enum.
+    if e.op == OP_EQ or e.op == OP_NE
+        left_reg = unit_enum_tag_to_i64(s, e.left, left_reg)
+        right_reg = unit_enum_tag_to_i64(s, e.right, right_reg)
 
     # For pointer arithmetic, scale the offset
     var scaled_right: i32 = right_reg
@@ -386,6 +394,31 @@ fn emit_expr_binary(s: *EmitterState, e: *Expr) -> i32
         return ext_result
 
     return result
+
+# AGAST #1660 — `reg` (the value of `operand`) as an i64.  A unit-enum
+# operand's `%Kind` aggregate becomes its zero-extended i8 tag; any other
+# operand is already i64 and is returned unchanged.
+fn unit_enum_tag_to_i64(s: *EmitterState, operand: *Expr, reg: i32) -> i32
+    var en_name: *u8 = null
+    var en_len: i32 = 0
+    unit_enum_expr_name(s, operand, @en_name, @en_len)
+    if en_len == 0
+        return reg
+    let tag: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, tag)
+    emit_str(s, c" = extractvalue %")
+    emit_name(s, en_name, en_len)
+    emit_str(s, c" ")
+    emit_reg(s, reg)
+    emit_str(s, c", 0\n")
+    let wide: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, wide)
+    emit_str(s, c" = zext i8 ")
+    emit_reg(s, tag)
+    emit_str(s, c" to i64\n")
+    wide
 
 # AGAST #1505 — static pointee struct of a deref operand.
 #
