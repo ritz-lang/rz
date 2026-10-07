@@ -1,11 +1,29 @@
 # Test ritzlib/buf.ritz - Buffer and GrowBuf types
 #
 # Tests both:
-# - Buffer: read-only view with position tracking
+# - Buffer: read-only cursor over bytes it does not own
 # - GrowBuf: owned growable buffer with Drop trait
+#
+# Written against the idiomatic API (#1478): StrView in, StrView slices out
+# (zero-copy, no caller-sized out-buffers), bool predicates, and a typed
+# `fn(u8) -> bool` predicate for buf_take_while.  The old
+# `(out: *u8, max_len)` forms are kept for one release; their own section at
+# the bottom pins them until they are removed.
 
 import ritzlib.sys
 import ritzlib.buf
+import ritzlib.string
+import ritzlib.strview
+
+# "abc" == view, as a bool (strview_eq returns i32).
+fn view_is(v: StrView, want: StrView) -> bool
+    return strview_eq(@v, @want) == 1
+
+fn is_vowel(c: u8) -> bool
+    return c == 'a' or c == 'e' or c == 'i' or c == 'o' or c == 'u'
+
+fn never(c: u8) -> bool
+    return false
 
 # ============================================================================
 # GrowBuf tests
@@ -38,32 +56,45 @@ fn test_growbuf_with_cap() -> i32
 fn test_growbuf_append_byte() -> i32
     # Append single bytes
     var b: GrowBuf = growbuf_new()
-    growbuf_append_byte(@b, 65)  # 'A'
-    growbuf_append_byte(@b, 66)  # 'B'
-    growbuf_append_byte(@b, 67)  # 'C'
-
-    if b.len != 3
+    growbuf_append_byte(@b, 'A')
+    growbuf_append_byte(@b, 'B')
+    growbuf_append_byte(@b, 'C')
+    if not view_is(growbuf_view(@b), "ABC")
         return 1
-    if *(b.data) != 65
-        return 2
-    if *(b.data + 1) != 66
-        return 3
-    if *(b.data + 2) != 67
-        return 4
     return 0
 
 [[test]]
 fn test_growbuf_append() -> i32
     # Append multiple bytes at once
     var b: GrowBuf = growbuf_new()
-    let data = c"hello" as *u8
-    growbuf_append(@b, data, 5)
-
-    if b.len != 5
+    growbuf_append(@b, c"hello", 5)
+    if not view_is(growbuf_view(@b), "hello")
         return 1
-    if *(b.data) != 104  # 'h'
+    return 0
+
+[[test]]
+fn test_growbuf_append_view() -> i32
+    # A "..." literal is a StrView and appends without a length argument.
+    var b: GrowBuf = growbuf_new()
+    if growbuf_append_view(@&b, "key") != 0
+        return 1
+    growbuf_append_view(@&b, "")
+    growbuf_append_view(@&b, "=val")
+    if not view_is(growbuf_view(@b), "key=val")
         return 2
-    if *(b.data + 4) != 111  # 'o'
+    return 0
+
+[[test]]
+fn test_growbuf_view_is_zero_copy() -> i32
+    var b: GrowBuf = growbuf_new()
+    let empty: StrView = growbuf_view(@b)
+    if empty.len != 0
+        return 1
+    growbuf_append(@b, c"xyz", 3)
+    let v: StrView = growbuf_view(@b)
+    if v.ptr != b.data
+        return 2
+    if v.len != 3
         return 3
     return 0
 
@@ -73,12 +104,9 @@ fn test_growbuf_clear() -> i32
     var b: GrowBuf = growbuf_with_cap(64)
     growbuf_append_byte(@b, 65)
     growbuf_append_byte(@b, 66)
-
     if b.len != 2
         return 1
-
     growbuf_clear(@b)
-
     if b.len != 0
         return 2
     if b.cap != 64
@@ -91,30 +119,21 @@ fn test_growbuf_grow() -> i32
     var b: GrowBuf = growbuf_new()
     growbuf_append_byte(@b, 65)
     growbuf_append_byte(@b, 66)
-
-    let old_cap: i64 = b.cap
     growbuf_grow(@b, 1024)
-
     if b.cap != 1024
         return 1
-    if b.len != 2
+    if not view_is(growbuf_view(@b), "AB")
         return 2
-    if *(b.data) != 65
-        return 3
-    if *(b.data + 1) != 66
-        return 4
     return 0
 
 [[test]]
 fn test_growbuf_accessors() -> i32
-    # Test accessor functions
     var b: GrowBuf = growbuf_with_cap(32)
     growbuf_append_byte(@b, 65)
     growbuf_append_byte(@b, 66)
-
     if growbuf_len(@b) != 2
         return 1
-    if growbuf_cap(@b) != ' '
+    if growbuf_cap(@b) != 32
         return 2
     if growbuf_data(@b) != b.data
         return 3
@@ -122,36 +141,33 @@ fn test_growbuf_accessors() -> i32
         return 4
     if growbuf_get(@b, 1) != 66
         return 5
-    if growbuf_is_empty(@b) != 0
+    if growbuf_is_empty(@b)
         return 6
     return 0
 
 [[test]]
 fn test_growbuf_is_empty() -> i32
+    # bool predicate
     var b: GrowBuf = growbuf_new()
-    if growbuf_is_empty(@b) != 1
+    if not growbuf_is_empty(@b)
         return 1
-
     growbuf_append_byte(@b, 65)
-    if growbuf_is_empty(@b) != 0
+    if growbuf_is_empty(@b)
         return 2
-
     growbuf_clear(@b)
-    if growbuf_is_empty(@b) != 1
+    if not growbuf_is_empty(@b)
         return 3
     return 0
 
 # ============================================================================
-# Buffer (read-only view) tests
+# Buffer: construction and position
 # ============================================================================
 
 [[test]]
 fn test_buffer_init() -> i32
-    # Initialize buffer from pointer and length
+    # buf_init stays as the *u8 + len interop constructor
     var buf: Buffer
-    let data = c"hello world" as *u8
-    buf_init(@buf, data, 11)
-
+    buf_init(@buf, c"hello world", 11)
     if buf.len != 11
         return 1
     if buf.pos != 0
@@ -159,11 +175,35 @@ fn test_buffer_init() -> i32
     return 0
 
 [[test]]
-fn test_buffer_from_str() -> i32
-    # Initialize buffer from C string
-    var buf: Buffer
-    buf_from_str(@buf, c"hello" as *u8)
+fn test_buf_new_from_view() -> i32
+    # buf_new takes a StrView and returns the cursor by value
+    let sv: StrView = "hello"
+    let buf: Buffer = buf_new(sv)
+    if buf.len != 5
+        return 1
+    if buf.pos != 0
+        return 2
+    if buf.data != sv.ptr
+        return 3
+    return 0
 
+[[test]]
+fn test_buf_new_sub_view() -> i32
+    # A StrView carries its own length: no NUL is needed or read.
+    let whole: StrView = "abc123_x9 rest"
+    var buf: Buffer = buf_new(strview_take(@whole, 9))
+    let id: StrView = buf_take_ident(@&buf)
+    if not view_is(id, "abc123_x9")
+        return 1
+    if not buf_eof(@buf)
+        return 2
+    return 0
+
+[[test]]
+fn test_buffer_from_str() -> i32
+    # buf_from_str takes a StrView (a "..." literal)
+    var buf: Buffer
+    buf_from_str(@buf, "hello")
     if buf.len != 5
         return 1
     if buf.pos != 0
@@ -171,94 +211,116 @@ fn test_buffer_from_str() -> i32
     return 0
 
 [[test]]
-fn test_buffer_peek() -> i32
-    # Peek should not advance position
-    var buf: Buffer
-    buf_from_str(@buf, c"abc" as *u8)
+fn test_buffer_eof() -> i32
+    # bool predicate
+    var buf: Buffer = buf_new("ab")
+    if buf_eof(@buf)
+        return 1
+    buf_advance(@buf)
+    buf_advance(@buf)
+    if not buf_eof(@buf)
+        return 2
+    return 0
 
-    if buf_peek(@buf) != 97  # 'a'
+[[test]]
+fn test_buffer_remaining() -> i32
+    var buf: Buffer = buf_new("hello")
+    if buf_remaining(@buf) != 5
+        return 1
+    buf_advance(@buf)
+    buf_advance(@buf)
+    if buf_remaining(@buf) != 3
+        return 2
+    return 0
+
+[[test]]
+fn test_buf_rest() -> i32
+    # The unread tail as a zero-copy slice
+    var buf: Buffer = buf_new("hello")
+    buf_skip(@buf, 2)
+    let rest: StrView = buf_rest(@buf)
+    if not view_is(rest, "llo")
+        return 1
+    if rest.ptr != buf.data + 2
+        return 2
+    if buf.pos != 2
+        return 3
+    buf_skip(@buf, 10)
+    if buf_rest(@buf).len != 0
+        return 4
+    return 0
+
+# ============================================================================
+# Buffer: peek and advance
+# ============================================================================
+
+[[test]]
+fn test_buffer_peek() -> i32
+    var buf: Buffer = buf_new("abc")
+    if buf_peek(@buf) != 'a'
         return 1
     if buf.pos != 0
         return 2
-    if buf_peek(@buf) != 97  # Still 'a'
+    if buf_peek(@buf) != 'a'
         return 3
     return 0
 
 [[test]]
 fn test_buffer_peek_at() -> i32
-    # Peek at offset
-    var buf: Buffer
-    buf_from_str(@buf, c"abc" as *u8)
-
-    if buf_peek_at(@buf, 0) != 97  # 'a'
+    var buf: Buffer = buf_new("abc")
+    if buf_peek_at(@buf, 0) != 'a'
         return 1
-    if buf_peek_at(@buf, 1) != 98  # 'b'
+    if buf_peek_at(@buf, 1) != 'b'
         return 2
-    if buf_peek_at(@buf, 2) != 99  # 'c'
+    if buf_peek_at(@buf, 2) != 'c'
         return 3
     if buf_peek_at(@buf, 3) != 0   # Out of bounds
         return 4
     return 0
 
 [[test]]
-fn test_buffer_advance() -> i32
-    # Advance should return current char and move position
-    var buf: Buffer
-    buf_from_str(@buf, c"abc" as *u8)
+fn test_buf_peek_view() -> i32
+    # Up to n bytes from the cursor, without consuming them
+    var buf: Buffer = buf_new("hello")
+    if not view_is(buf_peek_view(@buf, 3), "hel")
+        return 1
+    if buf.pos != 0
+        return 2
+    # Clamped to what is left, not truncated to a caller's array
+    buf_skip(@buf, 3)
+    if not view_is(buf_peek_view(@buf, 100), "lo")
+        return 3
+    if buf_peek_view(@buf, 0).len != 0
+        return 4
+    if buf_peek_view(@buf, -1).len != 0
+        return 5
+    return 0
 
-    if buf_advance(@buf) != 97  # 'a'
+[[test]]
+fn test_buffer_advance() -> i32
+    var buf: Buffer = buf_new("abc")
+    if buf_advance(@buf) != 'a'
         return 1
     if buf.pos != 1
         return 2
-    if buf_advance(@buf) != 98  # 'b'
+    if buf_advance(@buf) != 'b'
         return 3
     if buf.pos != 2
         return 4
     return 0
 
-[[test]]
-fn test_buffer_eof() -> i32
-    # EOF detection
-    var buf: Buffer
-    buf_from_str(@buf, c"ab" as *u8)
-
-    if buf_eof(@buf) != 0
-        return 1
-
-    buf_advance(@buf)
-    buf_advance(@buf)
-
-    if buf_eof(@buf) != 1
-        return 2
-    return 0
-
-[[test]]
-fn test_buffer_remaining() -> i32
-    # Remaining bytes calculation
-    var buf: Buffer
-    buf_from_str(@buf, c"hello" as *u8)
-
-    if buf_remaining(@buf) != 5
-        return 1
-
-    buf_advance(@buf)
-    buf_advance(@buf)
-
-    if buf_remaining(@buf) != 3
-        return 2
-    return 0
+# ============================================================================
+# Buffer: matching (bool predicates, StrView patterns)
+# ============================================================================
 
 [[test]]
 fn test_buffer_match_char() -> i32
-    # Match single character
-    var buf: Buffer
-    buf_from_str(@buf, c"abc" as *u8)
-
-    if buf_match_char(@buf, 97) != 1  # 'a'
+    var buf: Buffer = buf_new("abc")
+    if not buf_match_char(@buf, 'a')
         return 1
     if buf.pos != 1
         return 2
-    if buf_match_char(@buf, 97) != 0  # 'a' again - should fail
+    if buf_match_char(@buf, 'a')    # 'a' again - should fail
         return 3
     if buf.pos != 1
         return 4
@@ -266,53 +328,311 @@ fn test_buffer_match_char() -> i32
 
 [[test]]
 fn test_buffer_match_str() -> i32
-    # Match string
-    var buf: Buffer
-    buf_from_str(@buf, c"hello world" as *u8)
-
-    if buf_match_str(@buf, c"hello" as *u8) != 1
+    var buf: Buffer = buf_new("hello world")
+    if not buf_match_str(@buf, "hello")
         return 1
     if buf.pos != 5
         return 2
-    if buf_match_str(@buf, c" world" as *u8) != 1
+    if buf_match_str(@buf, " there")
         return 3
+    if buf.pos != 5
+        return 4
+    if not buf_match_str(@buf, " world")
+        return 5
     if buf.pos != 11
+        return 6
+    # Empty pattern matches anywhere, even at EOF
+    if not buf_match_str(@buf, "")
+        return 7
+    # Pattern longer than what is left
+    buf_restore(@buf, 9)
+    if buf_match_str(@buf, "ldx")
+        return 8
+    return 0
+
+[[test]]
+fn test_buffer_match_str_not_nul_terminated() -> i32
+    # The pattern's length comes from the StrView, so a slice that stops
+    # mid-string matches only its own bytes.
+    let pat: StrView = "help me"
+    var buf: Buffer = buf_new("hello")
+    if not buf_match_str(@buf, strview_take(@pat, 3))
+        return 1
+    if buf.pos != 3
+        return 2
+    return 0
+
+[[test]]
+fn test_buffer_starts_with() -> i32
+    var buf: Buffer = buf_new("hello world")
+    if not buf_starts_with(@buf, "hello")
+        return 1
+    if buf.pos != 0  # Position unchanged
+        return 2
+    if buf_starts_with(@buf, "world")
+        return 3
+    if buf_starts_with(@buf, "hello world!")
         return 4
     return 0
 
 [[test]]
-fn test_buffer_skip_whitespace() -> i32
-    # Skip whitespace
-    var buf: Buffer
-    buf_from_str(@buf, c"   abc" as *u8)
+fn test_buffer_starts_with_stops_at_len() -> i32
+    # The bytes after the view DO match: only buf.len may stop the compare.
+    let whole: StrView = "hello world"
+    var buf: Buffer = buf_new(strview_take(@whole, 5))
+    if buf_starts_with(@buf, "hello ")
+        return 1
+    if buf_match_str(@buf, "hello w")
+        return 2
+    if buf.pos != 0
+        return 3
+    if not buf_match_str(@buf, "hello")
+        return 4
+    return 0
 
-    let skipped: i64 = buf_skip_whitespace(@buf)
-    if skipped != 3
+# ============================================================================
+# Buffer: skipping
+# ============================================================================
+
+[[test]]
+fn test_buffer_skip_whitespace() -> i32
+    var buf: Buffer = buf_new("   abc")
+    if buf_skip_whitespace(@buf) != 3
         return 1
     if buf.pos != 3
         return 2
-    if buf_peek(@buf) != 97  # 'a'
+    if buf_peek(@buf) != 'a'
         return 3
     return 0
 
 [[test]]
+fn test_buf_take_while_typed_pred() -> i32
+    # pred is a real `fn(u8) -> bool`.  (ritz0 only: ritz1 miscompiles
+    # indirect calls until #1671, and this file runs under ritz0 --test.)
+    var buf: Buffer = buf_new("aeiXou")
+    if buf_take_while(@&buf, is_vowel).len != 3
+        return 1
+    if buf_peek(@buf) != 'X'
+        return 2
+    if buf_take_while(@&buf, is_vowel).len != 0
+        return 3
+    buf_advance(@buf)
+    if not view_is(buf_take_while(@&buf, is_vowel), "ou")
+        return 4
+    if not buf_eof(@buf)
+        return 5
+    if buf_take_while(@&buf, is_vowel).len != 0
+        return 6
+    return 0
+
+[[test]]
+fn test_buf_take_while_with_byte_predicates() -> i32
+    var buf: Buffer = buf_new(" \t42x_9 ")
+    if buf_take_while(@&buf, buf_is_space).len != 2
+        return 1
+    if not view_is(buf_take_while(@&buf, buf_is_digit), "42")
+        return 2
+    if not view_is(buf_take_while(@&buf, buf_is_ident), "x_9")
+        return 3
+    return 0
+
+[[test]]
+fn test_byte_predicates() -> i32
+    if not buf_is_digit('0') or not buf_is_digit('9')
+        return 1
+    if buf_is_digit('a') or buf_is_digit('/') or buf_is_digit(':')
+        return 2
+    if not buf_is_ident('_') or not buf_is_ident('Z') or not buf_is_ident('a') or not buf_is_ident('7')
+        return 3
+    if buf_is_ident('-') or buf_is_ident(' ') or buf_is_ident('@') or buf_is_ident('[')
+        return 4
+    if not buf_is_space(' ') or not buf_is_space('\t') or not buf_is_space('\n') or not buf_is_space('\r')
+        return 5
+    if buf_is_space('x') or buf_is_space(0)
+        return 6
+    return 0
+
+# ============================================================================
+# Buffer: zero-copy reads (StrView slices of the underlying bytes)
+# ============================================================================
+
+[[test]]
+fn test_buf_take_until() -> i32
+    var buf: Buffer = buf_new("name:value")
+    let key: StrView = buf_take_until(@&buf, ':')
+    if not view_is(key, "name")
+        return 1
+    # Slice of the buffer itself, no copy
+    if key.ptr != buf.data
+        return 2
+    # Stops before the delimiter
+    if buf_peek(@buf) != ':'
+        return 3
+    buf_advance(@buf)
+    # No delimiter: everything that is left
+    if not view_is(buf_take_until(@&buf, '#'), "value")
+        return 4
+    if not buf_eof(@buf)
+        return 5
+    # At EOF: empty view
+    if buf_take_until(@&buf, ':').len != 0
+        return 6
+    return 0
+
+[[test]]
+fn test_buf_take_until_no_truncation() -> i32
+    # The old form silently truncated at max_len; a slice cannot.
+    var g: GrowBuf = growbuf_new()
+    var i: i64 = 0
+    while i < 5000
+        growbuf_append_byte(@g, 'a' + (i % 26) as u8)
+        i += 1
+    growbuf_append_byte(@g, ';')
+    var buf: Buffer = buf_new(growbuf_view(@g))
+    let v: StrView = buf_take_until(@&buf, ';')
+    if v.len != 5000
+        return 1
+    if buf.pos != 5000
+        return 2
+    return 0
+
+[[test]]
+fn test_buf_take_while() -> i32
+    var buf: Buffer = buf_new("ouch")
+    let v: StrView = buf_take_while(@&buf, is_vowel)
+    if not view_is(v, "ou")
+        return 1
+    if buf.pos != 2
+        return 2
+    if buf_take_while(@&buf, never).len != 0
+        return 3
+    if buf.pos != 2
+        return 4
+    return 0
+
+[[test]]
+fn test_buf_take_digits() -> i32
+    var buf: Buffer = buf_new("12345abc")
+    let v: StrView = buf_take_digits(@&buf)
+    if not view_is(v, "12345")
+        return 1
+    if buf.pos != 5
+        return 2
+    # Not at a digit: empty, position unchanged
+    if buf_take_digits(@&buf).len != 0
+        return 3
+    if buf.pos != 5
+        return 4
+    return 0
+
+[[test]]
+fn test_buf_take_ident() -> i32
+    var buf: Buffer = buf_new("abc_123 end")
+    if not view_is(buf_take_ident(@&buf), "abc_123")
+        return 1
+    if buf_peek(@buf) != ' '
+        return 2
+    if buf_take_ident(@&buf).len != 0
+        return 3
+    return 0
+
+[[test]]
+fn test_buf_take_quoted_escapes() -> i32
+    # Escapes are decoded, so the result cannot be a slice; it is appended
+    # to a String the caller owns.  No max_len, no truncation.
+    var buf: Buffer = buf_new("\"a\\tb\\\"c\\\\d\\n\\qe\" tail")
+    var s: String = string_new()
+    if not buf_take_quoted(@&buf, '"', @&s)
+        return 1
+    if not string_eq(@s, "a\tb\"c\\d\nqe")
+        return 2
+    # Past the closing quote
+    if buf.pos != 17
+        return 3
+    if buf_peek(@buf) != ' '
+        return 4
+    return 0
+
+[[test]]
+fn test_buf_take_quoted_appends() -> i32
+    var buf: Buffer = buf_new("'x' 'yz'")
+    var s: String = string_new()
+    string_push_str(@&s, "<")
+    buf_take_quoted(@&buf, '\'', @&s)
+    buf_skip_whitespace(@buf)
+    buf_take_quoted(@&buf, '\'', @&s)
+    if not string_eq(@s, "<xyz")
+        return 1
+    return 0
+
+[[test]]
+fn test_buf_take_quoted_not_at_quote() -> i32
+    var buf: Buffer = buf_new("abc")
+    var s: String = string_new()
+    if buf_take_quoted(@&buf, '"', @&s)
+        return 1
+    if buf.pos != 0
+        return 2
+    if string_len(@s) != 0
+        return 3
+    return 0
+
+[[test]]
+fn test_buf_take_quoted_unterminated() -> i32
+    # false; the partial content is left in `out`, the cursor at EOF
+    var buf: Buffer = buf_new("'unterminated")
+    var s: String = string_new()
+    if buf_take_quoted(@&buf, '\'', @&s)
+        return 1
+    if not string_eq(@s, "unterminated")
+        return 2
+    if not buf_eof(@buf)
+        return 3
+    # A trailing lone backslash is unterminated too
+    var b2: Buffer = buf_new("\"ab\\")
+    var s2: String = string_new()
+    if buf_take_quoted(@&b2, '"', @&s2)
+        return 4
+    if not string_eq(@s2, "ab")
+        return 5
+    return 0
+
+[[test]]
+fn test_buf_take_quoted_long() -> i32
+    # Longer than any old out-buffer: nothing is dropped
+    var g: GrowBuf = growbuf_new()
+    growbuf_append_byte(@g, '"')
+    var i: i64 = 0
+    while i < 3000
+        growbuf_append_byte(@g, 'q')
+        i += 1
+    growbuf_append_byte(@g, '"')
+    var buf: Buffer = buf_new(growbuf_view(@g))
+    var s: String = string_new()
+    if not buf_take_quoted(@&buf, '"', @&s)
+        return 1
+    if string_len(@s) != 3000
+        return 2
+    if not buf_eof(@buf)
+        return 3
+    return 0
+
+# ============================================================================
+# Buffer: save/restore and line:col
+# ============================================================================
+
+[[test]]
 fn test_buffer_save_restore() -> i32
-    # Save and restore position
-    var buf: Buffer
-    buf_from_str(@buf, c"hello" as *u8)
-
+    var buf: Buffer = buf_new("hello")
     buf_advance(@buf)
     buf_advance(@buf)
-
     let saved: i64 = buf_save(@buf)
     if saved != 2
         return 1
-
     buf_advance(@buf)
     buf_advance(@buf)
     if buf.pos != 4
         return 2
-
     buf_restore(@buf, saved)
     if buf.pos != 2
         return 3
@@ -320,21 +640,15 @@ fn test_buffer_save_restore() -> i32
 
 [[test]]
 fn test_buffer_get_loc() -> i32
-    # Line/column tracking
-    var buf: Buffer
-    let text = c"line1\nline2\nline3" as *u8
-    buf_from_str(@buf, text)
-
+    var buf: Buffer = buf_new("line1\nline2\nline3")
     var loc: BufLoc
 
-    # At start
     buf_get_loc(@buf, @loc)
     if loc.line != 1
         return 1
     if loc.col != 1
         return 2
 
-    # Skip to second line
     buf_skip(@buf, 6)  # "line1\n"
     buf_get_loc(@buf, @loc)
     if loc.line != 2
@@ -342,62 +656,59 @@ fn test_buffer_get_loc() -> i32
     if loc.col != 1
         return 4
 
-    # Middle of second line
     buf_skip(@buf, 2)  # "li"
     buf_get_loc(@buf, @loc)
     if loc.line != 2
         return 5
     if loc.col != 3
         return 6
-
     return 0
 
+# ============================================================================
+# Deprecated out-buffer forms (kept for one release after #1478)
+# ============================================================================
+
 [[test]]
-fn test_buffer_read_until() -> i32
-    # Read until delimiter
-    var buf: Buffer
-    buf_from_str(@buf, c"hello,world" as *u8)
-
+fn test_legacy_read_until() -> i32
+    var buf: Buffer = buf_new("hello,world")
     var out: [16]u8
-    let count: i64 = buf_read_until(@buf, 44, @out[0], 16)  # comma
-
+    let count: i64 = buf_read_until(@buf, ',', @out[0], 16)
     if count != 5
         return 1
-    if out[0] != 104  # 'h'
+    if out[0] != 'h'
         return 2
-    if out[4] != 111  # 'o'
+    if out[4] != 'o'
         return 3
-    if out[5] != 0    # null terminator
+    if out[5] != 0    # NUL terminator
         return 4
     return 0
 
 [[test]]
-fn test_buffer_read_while_digit() -> i32
-    # Read digits
-    var buf: Buffer
-    buf_from_str(@buf, c"12345abc" as *u8)
-
+fn test_legacy_read_while_digit() -> i32
+    var buf: Buffer = buf_new("12345abc")
     var out: [16]u8
-    let count: i64 = buf_read_while_digit(@buf, @out[0], 16)
-
-    if count != 5
+    if buf_read_while_digit(@buf, @out[0], 16) != 5
         return 1
-    if out[0] != 49  # '1'
+    if out[0] != '1' or out[4] != '5'
         return 2
-    if out[4] != 53  # '5'
-        return 3
     return 0
 
 [[test]]
-fn test_buffer_starts_with() -> i32
-    # Check prefix without consuming
-    var buf: Buffer
-    buf_from_str(@buf, c"hello world" as *u8)
-
-    if buf_starts_with(@buf, c"hello" as *u8) != 1
+fn test_legacy_peek_n() -> i32
+    var buf: Buffer = buf_new("hello")
+    var out: [8]u8
+    if buf_peek_n(@buf, @out[0], 3) != 3
         return 1
-    if buf.pos != 0  # Position unchanged
+    if out[0] != 'h' or out[2] != 'l'
         return 2
-    if buf_starts_with(@buf, c"world" as *u8) != 0  # Not at start
-        return 3
+    return 0
+
+[[test]]
+fn test_legacy_skip_while_placeholder() -> i32
+    # Ignores its *u8 argument and returns 0, as before #1478.
+    var buf: Buffer = buf_new("123")
+    if buf_skip_while(@&buf, null) != 0
+        return 1
+    if buf.pos != 0
+        return 2
     return 0

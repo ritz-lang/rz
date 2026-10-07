@@ -7,11 +7,32 @@
 # - GrowBuf: Growable byte buffer for accumulating data (type alias for Vec<u8>)
 #
 # GrowBuf is now backed by Vec<u8> with automatic Drop cleanup.
+#
+# API shape (#1478):
+# - Text goes in as a StrView ("..." literals are StrViews) and comes out as a
+#   StrView slice of the underlying bytes: zero-copy, never truncated.
+#       var b = buf_new("key = value")
+#       let key: StrView = buf_take_ident(@&b)
+# - The one read that must decode (buf_take_quoted) appends to an @&String.
+# - Predicates return bool; buf_take_while takes a typed `fn(u8) -> bool`
+#   (buf_is_digit, buf_is_ident, buf_is_space, or your own).  Under ritz1 it
+#   is unreliable until #1671; the named buf_take_* forms are not affected.
+# - Receivers are @Buffer / @GrowBuf when read-only and @&Buffer / @&GrowBuf
+#   when they move the cursor or mutate; a local passes as @b either way.
+# - buf_init(*u8, len) and growbuf_data() remain for C interop.
+#
+# DEPRECATED, kept for one release after #1478: the caller-sized out-buffer
+# forms buf_peek_n, buf_read_until, buf_read_while_digit,
+# buf_read_while_alnum and buf_read_quoted.  They NUL-terminate inside
+# max_len and silently truncate.  Use buf_peek_view / buf_take_* instead.
+# Also buf_skip_while, an ignored-`*u8` placeholder: use buf_take_while.
 
 import ritzlib.sys
 import ritzlib.str
 import ritzlib.memory
 import ritzlib.drop
+import ritzlib.strview
+import ritzlib.string
 
 # ============================================================================
 # Buffer: In-memory byte buffer with position tracking
@@ -22,50 +43,78 @@ struct Buffer
     len: i64        # Length of data
     pos: i64        # Current read position
 
-pub fn buf_init(buf: *Buffer, data: *u8, len: i64) -> i32
+pub fn buf_init(buf: @&Buffer, data: *u8, len: i64) -> i32
     buf.data = data
     buf.len = len
     buf.pos = 0
     return 0
 
-pub fn buf_from_str(buf: *Buffer, s: *u8) -> i32
-    buf.data = s
-    buf.len = strlen(s)
+# Point `buf` at the bytes of `s` (a "..." literal is a StrView).
+pub fn buf_from_str(buf: @&Buffer, s: StrView) -> i32
+    buf.data = s.ptr
+    buf.len = s.len
     buf.pos = 0
     return 0
+
+# A cursor at the start of `s`.  The Buffer borrows s's bytes; it must not
+# outlive them.
+pub fn buf_new(s: StrView) -> Buffer
+    var buf: Buffer
+    buf.data = s.ptr
+    buf.len = s.len
+    buf.pos = 0
+    return buf
 
 # ============================================================================
 # Position and bounds
 # ============================================================================
 
-pub fn buf_pos(buf: *Buffer) -> i64
+pub fn buf_pos(buf: @Buffer) -> i64
     return buf.pos
 
-pub fn buf_len(buf: *Buffer) -> i64
+pub fn buf_len(buf: @Buffer) -> i64
     return buf.len
 
-pub fn buf_remaining(buf: *Buffer) -> i64
+pub fn buf_remaining(buf: @Buffer) -> i64
     return buf.len - buf.pos
 
-pub fn buf_eof(buf: *Buffer) -> i32
-    return (buf.pos >= buf.len) as i32
+pub fn buf_eof(buf: @Buffer) -> bool
+    return buf.pos >= buf.len
+
+# The unread bytes, as a slice (does not advance).
+pub fn buf_rest(buf: @Buffer) -> StrView
+    if buf.pos >= buf.len
+        return strview_from_ptr(buf.data + buf.len, 0)
+    return strview_from_ptr(buf.data + buf.pos, buf.len - buf.pos)
 
 # ============================================================================
 # Peek operations (don't advance position)
 # ============================================================================
 
-pub fn buf_peek(buf: *Buffer) -> u8
+pub fn buf_peek(buf: @Buffer) -> u8
     if buf.pos >= buf.len
         return 0
     return *(buf.data + buf.pos)
 
-pub fn buf_peek_at(buf: *Buffer, offset: i64) -> u8
+pub fn buf_peek_at(buf: @Buffer, offset: i64) -> u8
     let pos: i64 = buf.pos + offset
     if pos < 0 or pos >= buf.len
         return 0
     return *(buf.data + pos)
 
-pub fn buf_peek_n(buf: *Buffer, out: *u8, n: i64) -> i64
+# Up to `n` bytes from the cursor, as a slice (does not advance).  Fewer
+# than `n` near the end; empty for n <= 0.
+pub fn buf_peek_view(buf: @Buffer, n: i64) -> StrView
+    var take: i64 = n
+    let avail: i64 = buf.len - buf.pos
+    if take > avail
+        take = avail
+    if take < 0
+        take = 0
+    return strview_from_ptr(buf.data + buf.pos, take)
+
+# DEPRECATED (#1478): copies into a caller-sized buffer.  Use buf_peek_view.
+pub fn buf_peek_n(buf: @Buffer, out: *u8, n: i64) -> i64
     var i: i64 = 0
     while i < n and buf.pos + i < buf.len
         *(out + i) = *(buf.data + buf.pos + i)
@@ -76,21 +125,21 @@ pub fn buf_peek_n(buf: *Buffer, out: *u8, n: i64) -> i64
 # Consume operations (advance position)
 # ============================================================================
 
-pub fn buf_advance(buf: *Buffer) -> u8
+pub fn buf_advance(buf: @&Buffer) -> u8
     if buf.pos >= buf.len
         return 0
     let c: u8 = *(buf.data + buf.pos)
     buf.pos = buf.pos + 1
     return c
 
-pub fn buf_advance_n(buf: *Buffer, n: i64) -> i64
+pub fn buf_advance_n(buf: @&Buffer, n: i64) -> i64
     let avail: i64 = buf.len - buf.pos
     if n > avail
         n = avail
     buf.pos = buf.pos + n
     return n
 
-pub fn buf_skip(buf: *Buffer, n: i64) -> i32
+pub fn buf_skip(buf: @&Buffer, n: i64) -> i32
     buf.pos = buf.pos + n
     if buf.pos > buf.len
         buf.pos = buf.len
@@ -100,36 +149,34 @@ pub fn buf_skip(buf: *Buffer, n: i64) -> i32
 # Pattern matching (peek-based, don't advance unless match)
 # ============================================================================
 
-pub fn buf_match_char(buf: *Buffer, c: u8) -> i32
+# Consume `c` if it is next.
+pub fn buf_match_char(buf: @&Buffer, c: u8) -> bool
     if buf.pos < buf.len and *(buf.data + buf.pos) == c
         buf.pos = buf.pos + 1
-        return 1
-    return 0
+        return true
+    return false
 
-pub fn buf_match_str(buf: *Buffer, s: *u8) -> i32
-    let slen: i64 = strlen(s)
-    if buf.pos + slen > buf.len
-        return 0
-    for i in 0..slen
-        if *(buf.data + buf.pos + i) != *(s + i)
-            return 0
-    buf.pos = buf.pos + slen
-    return 1
+# Consume `s` if the unread bytes start with it.
+pub fn buf_match_str(buf: @&Buffer, s: StrView) -> bool
+    if not buf_starts_with(buf, s)
+        return false
+    buf.pos = buf.pos + s.len
+    return true
 
-pub fn buf_starts_with(buf: *Buffer, s: *u8) -> i32
-    let slen: i64 = strlen(s)
-    if buf.pos + slen > buf.len
-        return 0
-    for i in 0..slen
-        if *(buf.data + buf.pos + i) != *(s + i)
-            return 0
-    return 1
+# Do the unread bytes start with `s`?  (does not advance)
+pub fn buf_starts_with(buf: @Buffer, s: StrView) -> bool
+    if buf.pos + s.len > buf.len
+        return false
+    for i in 0..s.len
+        if *(buf.data + buf.pos + i) != *(s.ptr + i)
+            return false
+    return true
 
 # ============================================================================
 # Skip utilities
 # ============================================================================
 
-pub fn buf_skip_whitespace(buf: *Buffer) -> i64
+pub fn buf_skip_whitespace(buf: @&Buffer) -> i64
     var count: i64 = 0
     while buf.pos < buf.len
         let c: u8 = *(buf.data + buf.pos)
@@ -139,23 +186,109 @@ pub fn buf_skip_whitespace(buf: *Buffer) -> i64
         count += 1
     return count
 
-pub fn buf_skip_until(buf: *Buffer, c: u8) -> i64
+pub fn buf_skip_until(buf: @&Buffer, c: u8) -> i64
     var count: i64 = 0
     while buf.pos < buf.len and *(buf.data + buf.pos) != c
         buf.pos = buf.pos + 1
         count += 1
     return count
 
-pub fn buf_skip_while(buf: *Buffer, pred_fn: *u8) -> i64
-    # Note: This is a placeholder - would need function pointers
-    # For now, use specialized skip functions
+# DEPRECATED (#1478): a placeholder from before function types; `pred_fn`
+# is ignored and it always returns 0.  Use buf_take_while(buf, pred).len.
+# It stays (rather than taking `fn(u8) -> bool`) for one release, and as the
+# ritz1-safe form until #1671: ritz1 emits indirect calls as i64(i64), so a
+# bool predicate called through a fn value reads garbage under ritz1.
+pub fn buf_skip_while(buf: @&Buffer, pred_fn: *u8) -> i64
     return 0
 
 # ============================================================================
-# Read utilities
+# Byte predicates (for buf_take_while)
 # ============================================================================
 
-pub fn buf_read_until(buf: *Buffer, c: u8, out: *u8, max_len: i64) -> i64
+pub fn buf_is_digit(c: u8) -> bool
+    return c >= '0' and c <= '9'
+
+# [A-Za-z0-9_]
+pub fn buf_is_ident(c: u8) -> bool
+    return (c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z') or (c >= '0' and c <= '9') or c == '_'
+
+# space, tab, newline, carriage return (the set buf_skip_whitespace skips)
+pub fn buf_is_space(c: u8) -> bool
+    return c == ' ' or c == '\t' or c == '\n' or c == '\r'
+
+# ============================================================================
+# Zero-copy reads: each returns a StrView slice of the buffer's own bytes,
+# valid as long as those bytes are.  Nothing is copied or truncated.
+# ============================================================================
+
+# Consume bytes while `pred` holds and return them.
+# NOTE: wrong under ritz1 until #1671 (indirect calls lose their bool return
+# type); ritz0 is correct.  buf_take_digits / buf_take_ident below loop
+# directly so they are safe under every compiler.
+pub fn buf_take_while(buf: @&Buffer, pred: fn(u8) -> bool) -> StrView
+    let start: i64 = buf.pos
+    while buf.pos < buf.len and pred(*(buf.data + buf.pos))
+        buf.pos = buf.pos + 1
+    return strview_from_ptr(buf.data + start, buf.pos - start)
+
+# Consume up to (not including) `c`, or to the end, and return it.
+pub fn buf_take_until(buf: @&Buffer, c: u8) -> StrView
+    let start: i64 = buf.pos
+    while buf.pos < buf.len and *(buf.data + buf.pos) != c
+        buf.pos = buf.pos + 1
+    return strview_from_ptr(buf.data + start, buf.pos - start)
+
+# Consume a run of [0-9].
+pub fn buf_take_digits(buf: @&Buffer) -> StrView
+    let start: i64 = buf.pos
+    while buf.pos < buf.len and buf_is_digit(*(buf.data + buf.pos))
+        buf.pos = buf.pos + 1
+    return strview_from_ptr(buf.data + start, buf.pos - start)
+
+# Consume a run of [A-Za-z0-9_].
+pub fn buf_take_ident(buf: @&Buffer) -> StrView
+    let start: i64 = buf.pos
+    while buf.pos < buf.len and buf_is_ident(*(buf.data + buf.pos))
+        buf.pos = buf.pos + 1
+    return strview_from_ptr(buf.data + start, buf.pos - start)
+
+# Read a `quote`-delimited string, decoding \n \t \r \\ and \<quote> (any
+# other \x yields x), and APPEND the decoded bytes to `out`.
+#   true:  terminated; the cursor is past the closing quote.
+#   false: not at `quote` (cursor and `out` untouched), or unterminated (the
+#          partial content is in `out`, the cursor at the end).
+pub fn buf_take_quoted(buf: @&Buffer, quote: u8, out: @&String) -> bool
+    if buf.pos >= buf.len or *(buf.data + buf.pos) != quote
+        return false
+    buf.pos = buf.pos + 1  # opening quote
+
+    while buf.pos < buf.len
+        var c: u8 = *(buf.data + buf.pos)
+        buf.pos = buf.pos + 1
+        if c == quote
+            return true
+        if c == '\\'
+            if buf.pos >= buf.len
+                return false
+            c = *(buf.data + buf.pos)
+            buf.pos = buf.pos + 1
+            if c == 'n'
+                c = '\n'
+            else if c == 't'
+                c = '\t'
+            else if c == 'r'
+                c = '\r'
+        string_push(out, c)
+    return false
+
+# ============================================================================
+# DEPRECATED out-buffer reads (kept for one release after #1478)
+# ============================================================================
+# Each copies into a caller-sized `out`, NUL-terminates within `max_len`
+# (so max_len 4 yields at most 3 bytes) and silently truncates.  Use the
+# buf_take_* forms above.
+
+pub fn buf_read_until(buf: @&Buffer, c: u8, out: *u8, max_len: i64) -> i64
     var count: i64 = 0
     while buf.pos < buf.len and count < max_len - 1
         let ch: u8 = *(buf.data + buf.pos)
@@ -167,7 +300,7 @@ pub fn buf_read_until(buf: *Buffer, c: u8, out: *u8, max_len: i64) -> i64
     *(out + count) = 0
     return count
 
-pub fn buf_read_while_digit(buf: *Buffer, out: *u8, max_len: i64) -> i64
+pub fn buf_read_while_digit(buf: @&Buffer, out: *u8, max_len: i64) -> i64
     var count: i64 = 0
     while buf.pos < buf.len and count < max_len - 1
         let c: u8 = *(buf.data + buf.pos)
@@ -179,7 +312,7 @@ pub fn buf_read_while_digit(buf: *Buffer, out: *u8, max_len: i64) -> i64
     *(out + count) = 0
     return count
 
-pub fn buf_read_while_alnum(buf: *Buffer, out: *u8, max_len: i64) -> i64
+pub fn buf_read_while_alnum(buf: @&Buffer, out: *u8, max_len: i64) -> i64
     var count: i64 = 0
     while buf.pos < buf.len and count < max_len - 1
         let c: u8 = *(buf.data + buf.pos)
@@ -194,7 +327,7 @@ pub fn buf_read_while_alnum(buf: *Buffer, out: *u8, max_len: i64) -> i64
     *(out + count) = 0
     return count
 
-pub fn buf_read_quoted(buf: *Buffer, quote: u8, out: *u8, max_len: i64) -> i64
+pub fn buf_read_quoted(buf: @&Buffer, quote: u8, out: *u8, max_len: i64) -> i64
     # Read a quoted string, handling escapes
     if buf.pos >= buf.len or *(buf.data + buf.pos) != quote
         return -1  # Not starting with quote
@@ -239,10 +372,10 @@ pub fn buf_read_quoted(buf: *Buffer, quote: u8, out: *u8, max_len: i64) -> i64
 # Position save/restore (for backtracking)
 # ============================================================================
 
-pub fn buf_save(buf: *Buffer) -> i64
+pub fn buf_save(buf: @Buffer) -> i64
     return buf.pos
 
-pub fn buf_restore(buf: *Buffer, pos: i64) -> i32
+pub fn buf_restore(buf: @&Buffer, pos: i64) -> i32
     buf.pos = pos
     return 0
 
@@ -255,7 +388,7 @@ struct BufLoc
     col: i32
     offset: i64
 
-pub fn buf_get_loc(buf: *Buffer, loc: *BufLoc) -> i32
+pub fn buf_get_loc(buf: @Buffer, loc: @&BufLoc) -> i32
     loc.line = 1
     loc.col = 1
     loc.offset = buf.pos
@@ -330,7 +463,7 @@ pub fn growbuf_with_cap(cap: i64) -> GrowBuf
 
 # Free the buffer (deprecated - GrowBuf has automatic Drop).
 # Kept for backward compatibility with existing code.
-pub fn growbuf_free(b: *GrowBuf) -> i32
+pub fn growbuf_free(b: @&GrowBuf) -> i32
     if b.data != null
         free(b.data)
     b.data = null
@@ -343,7 +476,7 @@ pub fn growbuf_free(b: *GrowBuf) -> i32
 # ============================================================================
 
 # Grow the buffer to a new capacity.
-pub fn growbuf_grow(b: *GrowBuf, new_cap: i64) -> i32
+pub fn growbuf_grow(b: @&GrowBuf, new_cap: i64) -> i32
     if new_cap <= b.cap
         return 0
 
@@ -356,7 +489,7 @@ pub fn growbuf_grow(b: *GrowBuf, new_cap: i64) -> i32
     return 0
 
 # Ensure the buffer has at least the given capacity.
-pub fn growbuf_ensure_cap(b: *GrowBuf, needed: i64) -> i32
+pub fn growbuf_ensure_cap(b: @&GrowBuf, needed: i64) -> i32
     if b.cap >= needed
         return 0
 
@@ -373,7 +506,7 @@ pub fn growbuf_ensure_cap(b: *GrowBuf, needed: i64) -> i32
 # ============================================================================
 
 # Append bytes to the buffer.
-pub fn growbuf_append(b: *GrowBuf, data: *u8, len: i64) -> i32
+pub fn growbuf_append(b: @&GrowBuf, data: *u8, len: i64) -> i32
     if growbuf_ensure_cap(b, b.len + len) != 0
         return -1
 
@@ -382,8 +515,12 @@ pub fn growbuf_append(b: *GrowBuf, data: *u8, len: i64) -> i32
     b.len = b.len + len
     return 0
 
+# Append the bytes of `s` (a "..." literal is a StrView).
+pub fn growbuf_append_view(b: @&GrowBuf, s: StrView) -> i32
+    return growbuf_append(b, s.ptr, s.len)
+
 # Append a single byte to the buffer.
-pub fn growbuf_append_byte(b: *GrowBuf, byte: u8) -> i32
+pub fn growbuf_append_byte(b: @&GrowBuf, byte: u8) -> i32
     if growbuf_ensure_cap(b, b.len + 1) != 0
         return -1
     *(b.data + b.len) = byte
@@ -395,40 +532,43 @@ pub fn growbuf_append_byte(b: *GrowBuf, byte: u8) -> i32
 # ============================================================================
 
 # Clear all bytes (keeps capacity).
-pub fn growbuf_clear(b: *GrowBuf) -> i32
+pub fn growbuf_clear(b: @&GrowBuf) -> i32
     b.len = 0
     return 0
 
 # Get length (number of bytes).
-pub fn growbuf_len(b: *GrowBuf) -> i64
+pub fn growbuf_len(b: @GrowBuf) -> i64
     return b.len
 
 # Get capacity (allocated bytes).
-pub fn growbuf_cap(b: *GrowBuf) -> i64
+pub fn growbuf_cap(b: @GrowBuf) -> i64
     return b.cap
 
-# Get raw data pointer.
-pub fn growbuf_data(b: *GrowBuf) -> *u8
+# Get raw data pointer (C interop; prefer growbuf_view).
+pub fn growbuf_data(b: @GrowBuf) -> *u8
     return b.data
 
+# The bytes appended so far, as a slice.  Invalidated by the next append
+# (which may reallocate), clear or free.
+pub fn growbuf_view(b: @GrowBuf) -> StrView
+    return strview_from_ptr(b.data, b.len)
+
 # Get byte at index.
-pub fn growbuf_get(b: *GrowBuf, idx: i64) -> u8
+pub fn growbuf_get(b: @GrowBuf, idx: i64) -> u8
     if idx < 0 or idx >= b.len
         return 0
     return *(b.data + idx)
 
 # Check if buffer is empty.
-pub fn growbuf_is_empty(b: *GrowBuf) -> i32
-    if b.len == 0
-        return 1
-    return 0
+pub fn growbuf_is_empty(b: @GrowBuf) -> bool
+    return b.len == 0
 
 # ============================================================================
 # File reading utilities
 # ============================================================================
 # Common patterns for reading files into buffers.
 
-pub fn read_all_fd(fd: i32, b: *GrowBuf) -> i64
+pub fn read_all_fd(fd: i32, b: @&GrowBuf) -> i64
     # Read entire file descriptor into GrowBuf, return bytes read or -1 on error
     let chunk_size: i64 = 4096
     var temp: [4096]u8

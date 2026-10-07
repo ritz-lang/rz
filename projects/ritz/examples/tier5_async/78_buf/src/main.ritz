@@ -1,10 +1,13 @@
 # Example 78: buf — Buffer cursor, GrowBuf and read_all_fd
 #
 # ritzlib.buf had no example, so neither differential ritz0-vs-ritz1 stage
-# exercised it (AGAST #1457).  This one pins buf's CURRENT behaviour —
-# including its `(out: *u8, max_len)` truncation and -1 return quirks — as the
-# safety net for the StrView / @&String API cleanup (#1478).  If that cleanup
-# changes a result here on purpose, update test.sh in the same commit.
+# exercised it (AGAST #1457).  It was written against the old
+# `(out: *u8, max_len)` API and pinned that behaviour in test.sh; #1478 ported
+# it to the idiomatic API (StrView in, zero-copy StrView slices out, bool
+# predicates, a typed `fn(u8) -> bool` predicate, quoted strings decoded into
+# a String) with test.sh's golden output left byte-for-byte unchanged.  The
+# lines whose labels say "max N" still call the deprecated out-buffer forms,
+# which stay for one release: they pin the truncation the new forms remove.
 #
 # Two parts:
 #
@@ -27,8 +30,9 @@
 import ritzlib.sys
 import ritzlib.io
 import ritzlib.buf
+import ritzlib.string
+import ritzlib.strview
 
-const TOK_MAX: i64 = 256
 const DQUOTE: u8 = 34
 const SQUOTE: u8 = 39
 
@@ -59,6 +63,9 @@ fn show_bytes(s: *u8, n: i64)
         i += 1
     print_char(']')
 
+fn show_view(v: StrView)
+    show_bytes(v.ptr, v.len)
+
 # `label` [text] (n)
 fn show_str(label: *u8, s: *u8, n: i64)
     prints_cstr(label)
@@ -67,7 +74,20 @@ fn show_str(label: *u8, s: *u8, n: i64)
     print_int(n)
     prints_cstr(c")\n")
 
-fn show_loc(b: *Buffer)
+fn show_sv(label: *u8, v: StrView)
+    show_str(label, v.ptr, v.len)
+
+# The decoded bytes of a String, as a view (valid until `s` changes).
+fn string_view(s: @&String) -> StrView
+    return strview_from_ptr(string_as_ptr(s), string_len(s))
+
+# buf_take_quoted's bool, in the -1 / length form the golden output uses.
+fn quoted_result(ok: bool, s: @String) -> i64
+    if ok
+        return string_len(s)
+    return -1
+
+fn show_loc(b: @Buffer)
     var loc: BufLoc
     buf_get_loc(b, @loc)
     print_int(loc.line as i64)
@@ -79,10 +99,10 @@ fn show_loc(b: *Buffer)
 # ============================================================================
 
 fn api_buffer()
-    var b: Buffer
+    var b: Buffer = buf_new("hello, world")
     var out: [16]u8
+    var q: String = string_new()
 
-    buf_from_str(@b, c"hello, world")
     show(c"from_str len: ", buf_len(@b))
     show(c"pos: ", buf_pos(@b))
     show(c"remaining: ", buf_remaining(@b))
@@ -91,20 +111,22 @@ fn api_buffer()
     show(c"peek_at(4): ", buf_peek_at(@b, 4) as i64)
     show(c"peek_at(-1): ", buf_peek_at(@b, -1) as i64)
     show(c"peek_at(12): ", buf_peek_at(@b, 12) as i64)
-    let pn: i64 = buf_peek_n(@b, @out[0], 5)
-    show_str(c"peek_n(5): ", @out[0], pn)
+    show_sv(c"peek_n(5): ", buf_peek_view(@b, 5))
     show(c"pos after peeks: ", buf_pos(@b))
-    show(c"starts_with(hell): ", buf_starts_with(@b, c"hell") as i64)
-    show(c"starts_with(help): ", buf_starts_with(@b, c"help") as i64)
+    show(c"starts_with(hell): ", buf_starts_with(@b, "hell") as i64)
+    show(c"starts_with(help): ", buf_starts_with(@b, "help") as i64)
     show(c"pos after starts_with: ", buf_pos(@b))
-    show(c"match_str(help): ", buf_match_str(@b, c"help") as i64)
-    show(c"match_str(hello): ", buf_match_str(@b, c"hello") as i64)
+    show(c"match_str(help): ", buf_match_str(@b, "help") as i64)
+    show(c"match_str(hello): ", buf_match_str(@b, "hello") as i64)
     show(c"pos: ", buf_pos(@b))
     show(c"match_char(';'): ", buf_match_char(@b, ';') as i64)
     show(c"match_char(','): ", buf_match_char(@b, ',') as i64)
     show(c"skip_whitespace: ", buf_skip_whitespace(@b))
     show(c"advance: ", buf_advance(@b) as i64)
-    show(c"skip_while (placeholder): ", buf_skip_while(@b, null))
+    # Still the deprecated placeholder: its typed replacement, buf_take_while,
+    # is miscompiled by ritz1 until #1671, and this output is diffed across
+    # ritz0, ritz1 and ritz1_selfhosted.
+    show(c"skip_while (placeholder): ", buf_skip_while(@&b, null))
     let saved: i64 = buf_save(@b)
     show(c"save: ", saved)
     show(c"skip_until('d'): ", buf_skip_until(@b, 'd'))
@@ -115,7 +137,7 @@ fn api_buffer()
     show(c"eof: ", buf_eof(@b) as i64)
     show(c"advance at eof: ", buf_advance(@b) as i64)
     show(c"peek at eof: ", buf_peek(@b) as i64)
-    show(c"match_str(\"\") at eof: ", buf_match_str(@b, c"") as i64)
+    show(c"match_str(\"\") at eof: ", buf_match_str(@b, "") as i64)
     buf_restore(@b, 0)
     buf_skip(@b, 7)
     show(c"skip(7) pos: ", buf_pos(@b))
@@ -123,59 +145,59 @@ fn api_buffer()
     show(c"skip(50) pos: ", buf_pos(@b))
     # A view into the middle of a string: the byte before it is 'x', so
     # peek_at(-1) returning 0 shows the lower bound is checked.
-    let mid: *u8 = c"xyz"
-    buf_init(@b, mid + 1, 2)
+    let mid: StrView = "xyz"
+    b = buf_new(strview_slice(@mid, 1, 3))
     show(c"interior peek_at(-1): ", buf_peek_at(@b, -1) as i64)
     show(c"interior peek_at(0): ", buf_peek_at(@b, 0) as i64)
     show(c"interior peek_at(2): ", buf_peek_at(@b, 2) as i64)
 
-    # buf_init on a sub-range: only the first 9 bytes are visible.
-    buf_init(@b, c"abc123_x9 rest", 9)
+    # A sub-view: only the first 9 bytes are visible.
+    let whole: StrView = "abc123_x9 rest"
+    b = buf_new(strview_take(@whole, 9))
     show(c"init len: ", buf_len(@b))
-    var n: i64 = buf_read_while_digit(@b, @out[0], 16)
-    show_str(c"read_while_digit (at 'a'): ", @out[0], n)
-    n = buf_read_while_alnum(@b, @out[0], 16)
-    show_str(c"read_while_alnum: ", @out[0], n)
+    show_sv(c"read_while_digit (at 'a'): ", buf_take_digits(@&b))
+    show_sv(c"read_while_alnum: ", buf_take_ident(@&b))
     show(c"eof (len-bounded): ", buf_eof(@b) as i64)
-    buf_init(@b, c"2026-10-05", 10)
-    n = buf_read_while_digit(@b, @out[0], 16)
-    show_str(c"read_while_digit: ", @out[0], n)
-    # max_len counts the NUL: 3 leaves room for 2 bytes.
+    b = buf_new("2026-10-05")
+    show_sv(c"read_while_digit: ", buf_take_digits(@&b))
+    # DEPRECATED form: max_len counts the NUL, 3 leaves room for 2 bytes.
     buf_match_char(@b, '-')
-    n = buf_read_while_digit(@b, @out[0], 3)
+    var n: i64 = buf_read_while_digit(@b, @out[0], 3)
     show_str(c"read_while_digit max 3: ", @out[0], n)
     show(c"pos: ", buf_pos(@b))
 
-    buf_from_str(@b, c"name:value")
-    n = buf_read_until(@b, ':', @out[0], 16)
-    show_str(c"read_until(':'): ", @out[0], n)
+    buf_from_str(@b, "name:value")
+    show_sv(c"read_until(':'): ", buf_take_until(@&b, ':'))
     show(c"stops before delim, peek: ", buf_peek(@b) as i64)
     buf_restore(@b, 0)
+    # DEPRECATED form: truncates to max_len - 1 bytes.
     n = buf_read_until(@b, ':', @out[0], 4)
     show_str(c"read_until max 4: ", @out[0], n)
     show(c"pos: ", buf_pos(@b))
     buf_restore(@b, 5)
-    n = buf_read_until(@b, '#', @out[0], 16)
-    show_str(c"read_until (no delim): ", @out[0], n)
+    show_sv(c"read_until (no delim): ", buf_take_until(@&b, '#'))
 
-    buf_from_str(@b, c"\"a\\tb\\\"c\\\\d\\n\\qe\" tail")
-    n = buf_read_quoted(@b, DQUOTE, @out[0], 16)
-    show_str(c"read_quoted escapes: ", @out[0], n)
+    buf_from_str(@b, "\"a\\tb\\\"c\\\\d\\n\\qe\" tail")
+    var ok: bool = buf_take_quoted(@&b, DQUOTE, @&q)
+    show_str(c"read_quoted escapes: ", string_as_ptr(@&q), quoted_result(ok, @q))
     show(c"pos after closing quote: ", buf_pos(@b))
-    n = buf_read_quoted(@b, DQUOTE, @out[0], 16)
-    show(c"read_quoted (not at quote): ", n)
+    string_clear(@&q)
+    ok = buf_take_quoted(@&b, DQUOTE, @&q)
+    show(c"read_quoted (not at quote): ", quoted_result(ok, @q))
     show(c"pos unchanged: ", buf_pos(@b))
-    buf_from_str(@b, c"'unterminated")
-    n = buf_read_quoted(@b, SQUOTE, @out[0], 16)
-    show(c"read_quoted unterminated: ", n)
-    show_str(c"  partial: ", @out[0], 12)
-    buf_from_str(@b, c"\"abcdef\"")
+    buf_from_str(@b, "'unterminated")
+    ok = buf_take_quoted(@&b, SQUOTE, @&q)
+    show(c"read_quoted unterminated: ", quoted_result(ok, @q))
+    show_sv(c"  partial: ", string_view(@&q))
+    string_drop(@&q)
+    # DEPRECATED form: running out of max_len is reported as -1 too.
+    buf_from_str(@b, "\"abcdef\"")
     n = buf_read_quoted(@b, DQUOTE, @out[0], 4)
     show(c"read_quoted max 4: ", n)
     show_str(c"  partial: ", @out[0], 3)
     show(c"  pos: ", buf_pos(@b))
 
-    buf_from_str(@b, c"ab\ncd\n\nx")
+    buf_from_str(@b, "ab\ncd\n\nx")
     buf_restore(@b, 4)
     prints_cstr(c"loc at 4: ")
     show_loc(@b)
@@ -189,7 +211,7 @@ fn api_buffer()
     show_loc(@b)
     print_char('\n')
 
-fn show_growbuf(label: *u8, g: *GrowBuf)
+fn show_growbuf(label: *u8, g: @GrowBuf)
     prints_cstr(label)
     prints_cstr(c" len=")
     print_int(growbuf_len(g))
@@ -205,9 +227,9 @@ fn api_growbuf()
     show(c"new data null: ", (growbuf_data(@g) == null) as i64)
     growbuf_append_byte(@g, 'x')
     show_growbuf(c"append_byte:", @g)
-    growbuf_append(@g, c"yz0123456789", 12)
+    growbuf_append_view(@&g, "yz0123456789")
     show_growbuf(c"append 12:", @g)
-    show_str(c"contents: ", growbuf_data(@g), growbuf_len(@g))
+    show_sv(c"contents: ", growbuf_view(@g))
     show(c"get(0): ", growbuf_get(@g, 0) as i64)
     show(c"get(12): ", growbuf_get(@g, 12) as i64)
     show(c"get(13) (out of range): ", growbuf_get(@g, 13) as i64)
@@ -222,7 +244,7 @@ fn api_growbuf()
     show_growbuf(c"  ->", @g)
     show(c"grow(1000): ", growbuf_grow(@g, 1000) as i64)
     show_growbuf(c"  ->", @g)
-    show_str(c"contents kept: ", growbuf_data(@g), growbuf_len(@g))
+    show_sv(c"contents kept: ", growbuf_view(@g))
     var i: i64 = 0
     while i < 1000
         growbuf_append_byte(@g, ('a' + (i % 26) as u8))
@@ -248,19 +270,29 @@ fn api_growbuf()
 # Part 2: a config tokenizer over stdin
 # ============================================================================
 
-fn is_value_end(c: u8) -> i32
-    if c == 0 or c == '\n' or c == '\r' or c == ' ' or c == '\t' or c == '#'
-        return 1
-    return 0
+fn is_value_end(c: u8) -> bool
+    return c == 0 or c == '\n' or c == '\r' or c == ' ' or c == '\t' or c == '#'
 
-fn token_head(b: *Buffer, kind: *u8)
+fn is_blank(c: u8) -> bool
+    return c == ' ' or c == '\t'
+
+fn token_head(b: @Buffer, kind: *u8)
     show_loc(b)
     print_char(' ')
     prints_cstr(kind)
     print_char(' ')
 
+# token_head for an item that started at `pos`; the cursor is left where it
+# was.  (Saving a position rather than copying the Buffer: ritz1 cannot yet
+# dereference an @&Buffer param by value.)
+fn token_head_at(b: @&Buffer, pos: i64, kind: *u8)
+    let here: i64 = buf_save(b)
+    buf_restore(b, pos)
+    token_head(b, kind)
+    buf_restore(b, here)
+
 # Report an error at the cursor and skip the rest of the line.
-fn token_error(b: *Buffer, msg: *u8)
+fn token_error(b: @&Buffer, msg: *u8)
     token_head(b, c"error")
     prints_cstr(msg)
     prints_cstr(c" (got ")
@@ -269,82 +301,83 @@ fn token_error(b: *Buffer, msg: *u8)
     buf_skip_until(b, '\n')
 
 # Value after `=`: quoted, number, or bare text to end of line.
-fn read_value(b: *Buffer, tok: *u8)
+fn read_value(b: @&Buffer, tok: @&String)
     let c: u8 = buf_peek(b)
     if c == DQUOTE or c == SQUOTE
         token_head(b, c"string")
-        let n: i64 = buf_read_quoted(b, c, tok, TOK_MAX)
-        if n < 0
+        string_clear(tok)
+        if not buf_take_quoted(b, c, tok)
             prints_cstr(c"unterminated\n")
             buf_skip_until(b, '\n')
             return
-        show_bytes(tok, n)
+        show_view(string_view(tok))
         print_char('\n')
         return
     # Try a number; backtrack if it runs straight into more text (42abc).
     let mark: i64 = buf_save(b)
-    let start: Buffer = *b
-    let nd: i64 = buf_read_while_digit(b, tok, TOK_MAX)
-    if nd > 0 and is_value_end(buf_peek(b)) == 1
-        token_head(@start, c"number")
-        show_bytes(tok, nd)
+    let digits: StrView = buf_take_digits(b)
+    if digits.len > 0 and is_value_end(buf_peek(b))
+        token_head_at(b, mark, c"number")
+        show_view(digits)
         print_char('\n')
         return
     buf_restore(b, mark)
     token_head(b, c"bare")
-    var n: i64 = buf_read_until(b, '\n', tok, TOK_MAX)
+    let line: StrView = buf_take_until(b, '\n')
     # Trim trailing whitespace and a '\r' (CRLF input).
-    while n > 0 and (*(tok + n - 1) == ' ' or *(tok + n - 1) == '\t' or *(tok + n - 1) == '\r')
+    var n: i64 = line.len
+    while n > 0 and (is_blank(*(line.ptr + n - 1)) or *(line.ptr + n - 1) == '\r')
         n -= 1
-    show_bytes(tok, n)
+    show_view(strview_take(@line, n))
     print_char('\n')
 
-fn tokenize(b: *Buffer) -> i64
-    var tok: [256]u8
+fn tokenize(b: @&Buffer) -> i64
+    var tok: String = string_new()
     var count: i64 = 0
     loop
         buf_skip_whitespace(b)
-        if buf_eof(b) == 1
+        if buf_eof(b)
             break
         count += 1
-        # Copy of the cursor at the item's first byte, for its line:col.
-        let at: Buffer = *b
-        if buf_peek(b) == '#' or buf_starts_with(b, c"//") == 1
+        # The item's first byte, for its line:col.
+        let at: i64 = buf_save(b)
+        if buf_peek(b) == '#' or buf_starts_with(b, "//")
             token_head(b, c"comment")
-            if buf_match_char(b, '#') == 0
+            if not buf_match_char(b, '#')
                 buf_advance_n(b, 2)
             buf_skip_whitespace(b)
-            let n: i64 = buf_read_until(b, '\n', @tok[0], TOK_MAX)
-            show_bytes(@tok[0], n)
+            show_view(buf_take_until(b, '\n'))
             print_char('\n')
-        else if buf_match_char(b, '[') == 1
-            token_head(@at, c"section")
-            let n: i64 = buf_read_until(b, ']', @tok[0], TOK_MAX)
-            if buf_match_char(b, ']') == 0
+        else if buf_match_char(b, '[')
+            token_head_at(b, at, c"section")
+            let name: StrView = buf_take_until(b, ']')
+            if not buf_match_char(b, ']')
                 prints_cstr(c"unclosed\n")
                 continue
-            show_bytes(@tok[0], n)
+            show_view(name)
             print_char('\n')
         else
-            let n: i64 = buf_read_while_alnum(b, @tok[0], TOK_MAX)
-            if n == 0
+            let key: StrView = buf_take_ident(b)
+            if key.len == 0
                 token_error(b, c"expected key")
                 continue
-            token_head(@at, c"key")
-            show_bytes(@tok[0], n)
+            token_head_at(b, at, c"key")
+            show_view(key)
             print_char('\n')
-            while buf_peek(b) == ' ' or buf_peek(b) == '\t'
+            # A loop, not buf_take_while(b, is_blank): see #1671.
+            while is_blank(buf_peek(b))
                 buf_advance(b)
-            if buf_match_char(b, '=') == 0
+            if not buf_match_char(b, '=')
                 token_error(b, c"expected '='")
                 continue
-            while buf_peek(b) == ' ' or buf_peek(b) == '\t'
+            while is_blank(buf_peek(b))
                 buf_advance(b)
-            read_value(b, @tok[0])
+            read_value(b, @&tok)
+    string_drop(@&tok)
     return count
 
-fn builtin_config() -> *u8
-    return c"# built-in config\n[server]\nhost = \"example.org\"\nport = 8080\n\n// motd\nmotd = 'hi\\tthere'\nname = web 01  \nid = 42abc\noops\n= 3\n"
+fn builtin_config() -> StrView
+    return "# built-in config\n[server]\nhost = \"example.org\"\nport = 8080\n\n// motd\nmotd = 'hi\\tthere'\nname = web 01  \nid = 42abc\noops\n= 3\n"
 
 fn main() -> i32
     println("== api ==")
@@ -357,19 +390,15 @@ fn main() -> i32
     if got < 0
         println("read_all_fd failed")
         return 1
-    if growbuf_is_empty(@input) == 1
+    if growbuf_is_empty(@input)
         println("source: builtin")
-        let text: *u8 = builtin_config()
-        var s: Buffer
-        buf_from_str(@s, text)
-        growbuf_append(@input, text, buf_len(@s))
+        growbuf_append_view(@&input, builtin_config())
     else
         println("source: stdin")
     show(c"bytes: ", growbuf_len(@input))
 
-    var b: Buffer
-    buf_init(@b, growbuf_data(@input), growbuf_len(@input))
-    let count: i64 = tokenize(@b)
+    var b: Buffer = buf_new(growbuf_view(@input))
+    let count: i64 = tokenize(@&b)
     show(c"items: ", count)
     prints_cstr(c"end: ")
     show_loc(@b)
