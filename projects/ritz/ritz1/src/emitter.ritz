@@ -124,6 +124,29 @@ fn emit_implicit_return_tail(s: *EmitterState, has_explicit_return: i32, ret_typ
     else if ret_type == TYPE_VOID and has_explicit_return == 0
         emit_str(s, c"  ret void\n")
 
+# AGAST #1644: bind a scalar `name:& T` borrow param whose ptr was just
+# spilled to `alloca_reg`.  ritz0 auto-dereferences the borrow: `x` reads the
+# pointee, `x = v` / `x += v` write it, and `@&x` is the caller's pointer.
+# Load the ptr once at entry and register `x` as a plain T local whose slot IS
+# that pointer, so every read, store and address-of lowers exactly as for the
+# caller's own variable.  Returns 1 when bound; 0 leaves the param to the
+# normal path (struct pointees keep the pointer lowering `c.n` already uses,
+# `@&T` params are not borrows, and non-integer pointees are not lowered yet).
+fn bind_scalar_borrow_param(s: *EmitterState, param: *Param, alloca_reg: i32) -> i32
+    if param.is_borrow != 1 or param.param_type != TYPE_MUT_REF
+        return 0
+    let pt: i32 = param.param_pointee_type
+    if pt != TYPE_I8 and pt != TYPE_U8 and pt != TYPE_I16 and pt != TYPE_U16 and pt != TYPE_I32 and pt != TYPE_U32 and pt != TYPE_I64 and pt != TYPE_U64
+        return 0
+    let slot: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, slot)
+    emit_str(s, c" = load ptr, ptr ")
+    emit_reg(s, alloca_reg)
+    emit_str(s, c"  ; #1644 scalar borrow\n")
+    add_local(s, param.name, param.name_len, slot, pt)
+    return 1
+
 # Spill a bool parameter into an i64 slot and register it as TYPE_I64.
 #
 # AGAST #1497. The ABI passes a bool as i1, but ritz1's value model is i64 for
@@ -272,6 +295,9 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
         # For pointer-to-struct params like *Vec<u8>, we need both:
         # - param_pointee_type (TYPE_STRUCT) to know it's a pointer to struct
         # - param_type_name ("Vec$u8") to mangle method calls correctly
+        if bind_scalar_borrow_param(s, param3, alloca_reg) == 1
+            param3 = param3.next
+            continue
         if param3.param_type == TYPE_PTR or param3.param_type == TYPE_PTR_PTR or param3.param_type == TYPE_REF or param3.param_type == TYPE_MUT_REF
             add_local_full(s, param3.name, param3.name_len, alloca_reg, param3.param_type, param3.param_type_name, param3.param_type_name_len, param3.param_pointee_type, 0, 0)
         else if param3.param_type == TYPE_STRUCT
@@ -557,6 +583,9 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
         emit_reg(s, alloca_reg)
         emit_str(s, c"\n")
         # Track parameter type including struct name for method calls
+        if p2_is_self == 0 and bind_scalar_borrow_param(s, param2, alloca_reg) == 1
+            param2 = param2.next
+            continue
         if p2_is_self == 1
             # Register `self` as a pointer-to-struct local so `self.field`
             # member access resolves via the impl type. (task-99 cluster #1)

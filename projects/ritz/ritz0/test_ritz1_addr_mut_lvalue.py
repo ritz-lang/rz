@@ -75,9 +75,9 @@ def ritz1_bin() -> Path:
 
 
 # Shared prelude: `bump` writes through an `@&C`. The pointee is a struct
-# because that is argspec's shape (`@&Vec<T>`), and because ritz1 mis-lowers a
-# read through a SCALAR `@&i64` param independently of #1488 (#1644), which
-# would mask what these tests are about.
+# because that is argspec's shape (`@&Vec<T>`). (A read through a SCALAR
+# `@&i64` param was a separate ritz1 bug, fixed by #1644 and covered in
+# test_ritz1_scalar_mut_borrow.py.)
 _BUMP = """\
 struct C
     n: i64
