@@ -10398,6 +10398,81 @@ class LLVMEmitter:
 
         raise NotImplementedError(f"Match on type {match_val.type} not yet supported")
 
+    @staticmethod
+    def _int_const_fits(const: ir.Constant, width: int) -> bool:
+        """True if integer constant `const` is representable in `width` bits.
+
+        Accepts the signed range and the unsigned range, so `0xFFFFFFFF` fits a
+        u32-typed (i32) arm just as `-1` does.
+        """
+        value = const.constant
+        return -(1 << (width - 1)) <= value < (1 << width)
+
+    def _merge_match_arms(self, incoming: list) -> ir.Value:
+        """Build the merge phi for a value-producing match.
+
+        `incoming` is a non-empty list of (value, exit_block) pairs whose types
+        are all equal or all integers (callers reject anything else). The builder
+        must be positioned at the (empty) start of the merge block.
+
+        The phi type is NOT the first arm's type (AGAST #1653): an untyped
+        integer literal is an i64 constant, so `Ok(_) => 0` followed by
+        `Err(e) => e` (i32) produced `phi i64 [0, ..], [%i32val, ..]` — invalid
+        IR. Instead:
+
+        * Integer-literal arms (int constants) adopt the widest *non-constant*
+          arm type, provided their value fits it.
+        * Otherwise (a literal that does not fit, or differing non-constant
+          widths) everything widens to the widest arm type.
+        * A non-constant arm that must widen is converted in its OWN exit
+          block, just before that block's branch to the merge block. Converting
+          in the merge block would put the instruction after/among the phis
+          and fail to dominate its phi use.
+        """
+        first_type = incoming[0][0].type
+        if all(v.type == first_type for v, _ in incoming):
+            phi = self.builder.phi(first_type)
+            for val, block in incoming:
+                phi.add_incoming(val, block)
+            return phi
+
+        def is_int_literal(v):
+            return isinstance(v, ir.Constant) and isinstance(v.constant, int)
+
+        typed = [v for v, _ in incoming if not is_int_literal(v)]
+        if typed:
+            common_type = max((v.type for v in typed), key=lambda t: t.width)
+            if not all(self._int_const_fits(v, common_type.width)
+                       for v, _ in incoming if is_int_literal(v)):
+                common_type = max((v.type for v, _ in incoming),
+                                  key=lambda t: t.width)
+        else:
+            common_type = max((v.type for v, _ in incoming),
+                              key=lambda t: t.width)
+
+        merge_block = self.builder.block
+        converted = []
+        for val, block in incoming:
+            if val.type != common_type:
+                if is_int_literal(val):
+                    # Retype the literal; width only shrinks when it fits.
+                    # Store it in signed form so `i32 4294967295` prints as
+                    # `i32 -1`.
+                    value, width = val.constant, common_type.width
+                    if value >= (1 << (width - 1)):
+                        value -= 1 << width
+                    val = ir.Constant(common_type, value)
+                else:
+                    self.builder.position_before(block.terminator)
+                    val = self._convert_type(val, common_type)
+            converted.append((val, block))
+        self.builder.position_at_end(merge_block)
+
+        phi = self.builder.phi(common_type)
+        for val, block in converted:
+            phi.add_incoming(val, block)
+        return phi
+
     def _emit_union_match(self, expr: rast.Match, union_val: ir.Value, union_name: str) -> ir.Value:
         """Emit a match on a union type with TypePattern arms."""
         union_type, variants = self.union_types[union_name]
@@ -10502,22 +10577,7 @@ class LLVMEmitter:
                     for v, _ in incoming):
                 return ir.Undefined
             if incoming:
-                # Find the common type for all arms
-                # For integer types, use the widest type
-                common_type = incoming[0][0].type
-                for val, _ in incoming[1:]:
-                    if isinstance(val.type, ir.IntType) and isinstance(common_type, ir.IntType):
-                        if val.type.width > common_type.width:
-                            common_type = val.type
-
-                # Create phi node with the common type
-                phi = self.builder.phi(common_type)
-                for val, block in incoming:
-                    # Convert value to common type if needed
-                    if val.type != common_type:
-                        val = self._convert_type(val, common_type)
-                    phi.add_incoming(val, block)
-                return phi
+                return self._merge_match_arms(incoming)
 
         # Return a dummy value if no arms produce values
         return ir.Constant(self.i32, 0)
@@ -10732,12 +10792,7 @@ class LLVMEmitter:
                     for v, _ in incoming):
                 return ir.Undefined
             if incoming:
-                # All values should have the same type (or be convertible)
-                # For now assume they're all the same type
-                phi = self.builder.phi(incoming[0][0].type)
-                for val, block in incoming:
-                    phi.add_incoming(val, block)
-                return phi
+                return self._merge_match_arms(incoming)
 
         # Return a dummy value if no arms produce values
         return ir.Constant(self.i32, 0)
@@ -10888,10 +10943,7 @@ class LLVMEmitter:
                     for v, _ in incoming):
                 return ir.Undefined
             if incoming:
-                phi = self.builder.phi(incoming[0][0].type)
-                for val, block in incoming:
-                    phi.add_incoming(val, block)
-                return phi
+                return self._merge_match_arms(incoming)
 
         # Return a dummy value if no arms produce values
         return ir.Constant(self.i32, 0)
