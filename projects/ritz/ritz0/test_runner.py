@@ -427,6 +427,127 @@ def compile_dependencies(
     return ll_files, None
 
 
+def _compile_harness(
+    harness_path: str,
+    harness_ll: str,
+    project_root: Optional[Path],
+    dependencies: Optional[Dict[str, DependencyMapping]],
+) -> Optional[str]:
+    """Compile a harness (a test file with a generated `main`) to LLVM IR.
+
+    Compiled *with* the runtime, since the harness supplies `main`. Returns an
+    error message, or None on success.
+    """
+    import json
+    ritz0_py = Path(__file__).parent / "ritz0.py"
+    compile_cmd = [sys.executable, str(ritz0_py), harness_path, "-o", harness_ll]
+
+    # Pass dependencies to ritz0 for harness compilation (Issue #48)
+    if dependencies:
+        deps_json = {
+            name: {"path": str(spec.path), "sources": spec.sources}
+            for name, spec in dependencies.items()
+        }
+        compile_cmd.extend(["--deps", json.dumps(deps_json)])
+
+    # Pass project root for import resolution
+    if project_root:
+        compile_cmd.extend(["--project-root", str(project_root)])
+
+    result = subprocess.run(compile_cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        return f"ritz0 failed for harness: {result.stderr}"
+    return None
+
+
+def _link(ll_files: List[str], exe_path: str) -> Tuple[Optional[str], Optional[str]]:
+    """Link .ll files into an executable. Returns (exe_path, error)."""
+    # -march=native enables host CPU features (AES-NI, AVX2, etc.).  -msha is
+    # added unconditionally because cryptosec's sha256.ritz defines a
+    # sha256_transform_ni function whose body emits SHA-NI intrinsics
+    # (sha256rnds2/msg1/msg2).  Even when the public API never calls it (it
+    # currently doesn't), LLVM's instruction selector still has to lower the
+    # function body and aborts with "Cannot select intrinsic" without +sha.
+    # On a host without SHA-NI silicon the binary will SIGILL only if the
+    # function is actually called — pure-soft callers are safe.  This mirrors
+    # the flag set used by build.py's link path.
+    clang_cmd = ["clang"] + ll_files + ["-o", exe_path, "-nostdlib", "-no-pie", "-g", "-march=native", "-msha"]
+    result = subprocess.run(clang_cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        return None, f"clang failed: {result.stderr}"
+    return exe_path, None
+
+
+# AGAST #1633: one harness per test FILE, not per test.
+#
+# Recompiling the whole test file once per [[test]] (only to change which test
+# `main` calls) made mausoleum's test_query.ritz -- 52 tests at ~25 s of ritz0
+# each -- take ~22 minutes. Instead the file is compiled once with a `main` that
+# picks a test from argc, linked once, and executed once per test. Each test
+# still runs in its own process under its own timeout, so crashes and hangs stay
+# attributed to the test that caused them.
+#
+# argc rather than parsing argv[1]: comparing an integer needs no pointer or
+# byte arithmetic in generated Ritz, so the dispatcher cannot itself be the
+# thing that fails to compile. Test i is selected by passing i + 1 arguments.
+
+_DISPATCH_ARGC = "__ritz_test_argc"
+
+
+def dispatch_args(index: int) -> List[str]:
+    """Extra argv entries that select test `index` in the dispatch harness."""
+    return ["t"] * (index + 1)
+
+
+def generate_dispatch_main(test_names: List[str]) -> str:
+    """Generate a `main` that runs the test selected by argc.
+
+    Each branch is `return <test>()`, i.e. the test's result becomes the exit
+    code -- the same as the old per-test harness, whose `fn main() -> i32` had
+    the test call as its tail. That covers `-> i32`, `-> i64` (narrowed, as
+    before) and unit tests (ritz0 lowers a missing return type to i32).
+    """
+    lines = [
+        "",
+        "",
+        f"fn main({_DISPATCH_ARGC}: i32, __ritz_test_argv: **u8, __ritz_test_envp: **u8) -> i32",
+    ]
+    for i, name in enumerate(test_names):
+        lines.append(f"    if {_DISPATCH_ARGC} == {i + 2}")
+        lines.append(f"        return {name}()")
+    # No test selected: a harness bug, never a pass.
+    lines.append("    127")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def compile_test_dispatcher(
+    source_path: str,
+    tests: List[Tuple[str, rast.FnDef]],
+    tmpdir: str,
+    dep_ll_files: List[str],
+    project_root: Optional[Path] = None,
+    dependencies: Optional[Dict[str, DependencyMapping]] = None,
+) -> Tuple[Optional[str], Optional[str]]:
+    """Compile and link ONE executable that can run any test in the file.
+
+    Run it with `dispatch_args(i)` to execute `tests[i]`.
+
+    Returns:
+        (exe_path, error_message) - exe_path is None on failure
+    """
+    source_no_main = strip_main_from_source(Path(source_path).read_text())
+    dispatch = generate_dispatch_main([name for name, _fn in tests])
+    harness_path = os.path.join(tmpdir, "test_main.ritz")
+    Path(harness_path).write_text(source_no_main + dispatch)
+
+    harness_ll = os.path.join(tmpdir, "harness_dispatch.ll")
+    error = _compile_harness(harness_path, harness_ll, project_root, dependencies)
+    if error:
+        return None, error
+    return _link(list(dep_ll_files) + [harness_ll], os.path.join(tmpdir, "test"))
+
+
 def compile_test(
     source_path: str,
     test_name: str,
@@ -472,31 +593,12 @@ fn main() -> i32
 
     # If we have pre-compiled dependencies, just compile the harness
     if dep_ll_files is not None:
-        import json as json_module
         ll_files = list(dep_ll_files)
-
-        # Compile the test harness (with runtime since it has main)
         harness_hash = hashlib.md5(test_name.encode()).hexdigest()[:8]
         harness_ll = os.path.join(tmpdir, f"harness_{harness_hash}.ll")
-
-        compile_cmd = [sys.executable, str(ritz0_py), test_file_path, "-o", harness_ll]
-
-        # Pass dependencies to ritz0 for harness compilation (Issue #48)
-        if dependencies:
-            deps_json = {
-                name: {"path": str(spec.path), "sources": spec.sources}
-                for name, spec in dependencies.items()
-            }
-            compile_cmd.extend(["--deps", json_module.dumps(deps_json)])
-
-        # Pass project root for import resolution
-        if project_root:
-            compile_cmd.extend(["--project-root", str(project_root)])
-
-        result = subprocess.run(compile_cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            return None, f"ritz0 failed for harness: {result.stderr}"
-
+        error = _compile_harness(test_file_path, harness_ll, project_root, dependencies)
+        if error:
+            return None, error
         ll_files.append(harness_ll)
     else:
         # Legacy path: compile everything from scratch
@@ -573,31 +675,16 @@ fn main() -> i32
                 ll_cache[src_key] = ll_path
             ll_files.append(ll_path)
 
-    # Link all .ll files with clang
-    # -march=native enables host CPU features (AES-NI, AVX2, etc.).  -msha is
-    # added unconditionally because cryptosec's sha256.ritz defines a
-    # sha256_transform_ni function whose body emits SHA-NI intrinsics
-    # (sha256rnds2/msg1/msg2).  Even when the public API never calls it (it
-    # currently doesn't), LLVM's instruction selector still has to lower the
-    # function body and aborts with "Cannot select intrinsic" without +sha.
-    # On a host without SHA-NI silicon the binary will SIGILL only if the
-    # function is actually called — pure-soft callers are safe.  This mirrors
-    # the flag set used by build.py's link path.
-    exe_path = os.path.join(tmpdir, "test")
-    clang_cmd = ["clang"] + ll_files + ["-o", exe_path, "-nostdlib", "-no-pie", "-g", "-march=native", "-msha"]
-    result = subprocess.run(clang_cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        return None, f"clang failed: {result.stderr}"
-
-    return exe_path, None
+    return _link(ll_files, os.path.join(tmpdir, "test"))
 
 
 def run_test_file(source_path: str, verbose: bool = False, lib_files: List[str] = None) -> Tuple[int, int, List[str]]:
     """
     Run all tests in a file using proper separate compilation.
 
-    OPTIMIZED: Compiles dependencies ONCE and reuses them for all tests in the file.
-    This is ~10-20x faster for files with many tests and complex dependency trees.
+    Dependencies are compiled ONCE, and the test file itself is compiled and
+    linked ONCE into a dispatch harness (AGAST #1633); each test then runs in
+    its own process, selected by argc.
 
     Returns (passed, failed, failure_messages).
     """
@@ -640,32 +727,33 @@ def run_test_file(source_path: str, verbose: bool = False, lib_files: List[str] 
             cleanup_scratch_dir(tmpdir)
             return _run_test_file_legacy(source_path, verbose, lib_files)
 
-        # Step 3: Run each test (only need to compile harness + link)
-        for test_name, test_fn in tests:
+        # Step 3: Compile and link the test file ONCE (AGAST #1633)
+        exe_path, compile_error = compile_test_dispatcher(
+            source_path,
+            tests,
+            tmpdir,
+            dep_ll_files,
+            project_root=project_root,
+            dependencies=dependencies,  # Issue #48: import resolution
+        )
+
+        # Step 4: Run each test in its own process
+        for index, (test_name, test_fn) in enumerate(tests):
             if verbose:
                 print(f"  Running {test_name}...", end=" ", flush=True)
 
             try:
-                exe_path, error = compile_test(
-                    source_path,
-                    test_name,
-                    tmpdir,
-                    lib_files,
-                    ll_cache=ll_cache,
-                    dep_ll_files=dep_ll_files,
-                    project_root=project_root,
-                    dependencies=dependencies  # Issue #48: Pass dependencies for import resolution
-                )
-
-                if error:
+                if compile_error:
                     failed += 1
-                    failures.append(f"{test_name}: {error}")
+                    failures.append(f"{test_name}: {compile_error}")
                     if verbose:
                         print("FAIL (compile)")
                     continue
 
                 # Run the test
-                result = subprocess.run([exe_path], capture_output=True, timeout=10)
+                result = subprocess.run(
+                    [exe_path] + dispatch_args(index), capture_output=True, timeout=10
+                )
                 if result.returncode == 0:
                     passed += 1
                     if verbose:
