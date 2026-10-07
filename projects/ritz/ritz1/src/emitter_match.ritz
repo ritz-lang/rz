@@ -19,7 +19,9 @@
 # - Match result is collected via phi over (arm_body_result, arm_exit_label)
 #   pairs so `let x = match ...` works.  The phi is i64 unless an arm yields
 #   a known struct (`Some(v) => v` over Option<StrView>), in which case it is
-#   that struct type (AGAST #1645).
+#   that struct type (AGAST #1645).  Arms yielding the layout-equivalent
+#   Span$u8/StrView pair are rebuilt to the phi's type in their own block, and
+#   a `"..."` arm counts as StrView (AGAST #1662).
 #
 # Variant patterns (Some(v) / None / Ok(v) / Err(_)) use a tag convention:
 #   Some(x) / Ok(x) -> high 16 bits = 1, low 48 bits = x
@@ -278,15 +280,27 @@ fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_s
         emit_str(s, c" = add i64 0, 0  ; match arm: pass\n")
     else if arm.body != null
         body_reg = emit_expr(s, arm.body)
-        # AGAST #1645: record the arm's struct type while its pattern
+        # AGAST #1645: resolve the arm's struct type while its pattern
         # binding (`Some(v) => v`) is still in scope; it is popped below.
-        if result.agg_name == null
-            var arm_ty: *u8 = null
-            var arm_ty_len: i32 = 0
-            resolve_expr_struct_name(s, arm.body, @arm_ty, @arm_ty_len)
-            if arm_ty != null and arm_ty_len > 0
+        var arm_ty: *u8 = null
+        var arm_ty_len: i32 = 0
+        resolve_expr_struct_name(s, arm.body, @arm_ty, @arm_ty_len)
+        # The first struct-valued arm fixes the phi type.  A `"..."` arm is a
+        # StrView in the language; its `%Span$u8` lowering (#98) is an
+        # artefact, so a leading literal arm types the phi as StrView, the
+        # same type a later `Some(s) => s` over Option<StrView> yields.
+        if result.agg_name == null and arm_ty != null and arm_ty_len > 0
+            if arm.body.kind == EXPR_STRING_LIT
+                result.agg_name = c"StrView"
+                result.agg_name_len = 7
+            else
                 result.agg_name = arm_ty
                 result.agg_name_len = arm_ty_len
+        # AGAST #1662: rebuild a layout-equivalent arm value (Span$u8 <->
+        # StrView, #168) as the phi's type here, in the arm's own block before
+        # its `br`, so every phi incoming value has the phi's type.
+        if is_layout_equiv_pair(arm_ty, arm_ty_len, result.agg_name, result.agg_name_len) == 1
+            body_reg = rebuild_layout_equiv(s, body_reg, arm_ty, arm_ty_len, result.agg_name, result.agg_name_len)
     else
         body_reg = next_reg(s)
         emit_str(s, c"  ")
