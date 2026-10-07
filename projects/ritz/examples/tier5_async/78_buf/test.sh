@@ -5,7 +5,8 @@
 #   - every `max_len` counts the NUL, so max 4 yields 3 bytes;
 #   - buf_read_quoted returns -1 both for an unterminated string and when
 #     max_len runs out (leaving pos inside the string);
-#   - buf_skip_while is a placeholder that returns 0;
+#   - buf_skip_while takes a typed `fn(u8) -> bool` since #1671 (it was a
+#     placeholder returning 0); here it skips no digits, so still 0;
 #   - growbuf_ensure_cap doubles from 64; growbuf_grow sets cap exactly.
 # Values were checked by hand against buf.ritz (byte counts, line:col, cap
 # doubling), not just captured from a compiler.  If #1478 changes one on
@@ -54,7 +55,7 @@ match_char(';'): 0
 match_char(','): 1
 skip_whitespace: 1
 advance: 119
-skip_while (placeholder): 0
+skip_while(digit): 0
 save: 8
 skip_until('d'): 3
 pos: 11

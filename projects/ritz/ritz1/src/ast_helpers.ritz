@@ -564,6 +564,10 @@ pub fn param_new(p: *Parser, name: *u8, len: i32, ty: i32, line: i32, col: i32) 
         param.param_pointee_type = TYPE_I64  # Default
     param.next = null
     param.is_borrow = 0
+    # AGAST #1671: a `fn(...) -> T` param keeps its signature.
+    param.fn_sig = null
+    if ty == TYPE_PTR
+        param.fn_sig = fresh_fn_sig(p)
     return param
 
 # `name:& T` (AGAST #1644): a TYPE_MUT_REF param that ritz0 auto-derefs.
@@ -1069,7 +1073,52 @@ pub fn capture_var_type(p: *Parser, ty: i32) -> i32
     else
         p.var_type_name = null
         p.var_type_name_len = 0
+    # AGAST #1671: latch a `let f: fn(...) -> T` signature before the
+    # initializer is parsed (it may contain fn types of its own).
+    p.var_fn_sig = null
+    if ty == TYPE_PTR
+        p.var_fn_sig = fresh_fn_sig(p)
     return ty
+
+# =============================================================================
+# Function-pointer types (AGAST #1671)
+# =============================================================================
+#
+# `fn(u8) -> bool` lowers to TYPE_PTR like any pointer, but a call through
+# such a value must use the callee's real LLVM signature: the callee is
+# `define i1 @is_d(i8 ...)`, and calling it as `call i64 %f(i64 ...)` reads
+# rax's garbage upper bits as the bool.  type_fn keeps the signature as a
+# nameless FnDef (params + return type), the same shape a direct call
+# consults, and leaves it in p.last_fn_sig tagged with the token position
+# the type ended at.  fresh_fn_sig hands it out only while p.pos is still
+# there, so it attaches to exactly the declaration whose type it is.
+pub fn type_fn(p: *Parser, params: *Param, ret: i32) -> i32
+    let f: *FnDef = parser_alloc(p, sizeof(FnDef)) as *FnDef
+    f.name = null
+    f.name_len = 0
+    f.params = params
+    f.return_type = ret
+    f.return_type_name = null
+    f.return_type_name_len = 0
+    # A struct return names itself in last_type_name, which the return
+    # type_spec just set (it is the last thing parsed before this action).
+    if ret == TYPE_STRUCT
+        f.return_type_name = p.last_type_name as *u8
+        f.return_type_name_len = p.last_type_name_len
+    f.body = null
+    f.line = 0
+    f.next = null
+    f.type_params = null
+    f.is_local = 0
+    p.last_fn_sig = f
+    p.last_fn_sig_pos = p.pos
+    return TYPE_PTR
+
+# The signature of the fn type that ends at the current token, or null.
+pub fn fresh_fn_sig(p: *Parser) -> *FnDef
+    if p.last_fn_sig != null and p.last_fn_sig_pos == p.pos
+        return p.last_fn_sig
+    return null
 
 # Parse array size from digit string and store array info in parser state
 pub fn type_array(p: *Parser, size_str: *u8, size_len: i32, elem_type: i32) -> i32
@@ -1421,6 +1470,11 @@ pub fn type_generic(p: *Parser, base_name: *u8, base_len: i32, type_arg: i32) ->
 pub fn stmt_var_decl(p: *Parser, name: *u8, len: i32, ty: i32, init: *Expr, line: i32, col: i32) -> *Stmt
     let s: *Stmt = parser_alloc(p, sizeof(Stmt)) as *Stmt
     s.kind = STMT_VAR_DECL
+    # AGAST #1671: typed decls go through capture_var_type, which latched
+    # var_fn_sig (null unless the type is a fn type).  Untyped ones have none.
+    s.var_fn_sig = null
+    if ty == TYPE_PTR
+        s.var_fn_sig = p.var_fn_sig
     s.span.line = line
     s.span.col = col
     s.var_name = name as *u8

@@ -14,9 +14,8 @@
 #       var b = buf_new("key = value")
 #       let key: StrView = buf_take_ident(@&b)
 # - The one read that must decode (buf_take_quoted) appends to an @&String.
-# - Predicates return bool; buf_take_while takes a typed `fn(u8) -> bool`
-#   (buf_is_digit, buf_is_ident, buf_is_space, or your own).  Under ritz1 it
-#   is unreliable until #1671; the named buf_take_* forms are not affected.
+# - Predicates return bool; buf_take_while / buf_skip_while take a typed
+#   `fn(u8) -> bool` (buf_is_digit, buf_is_ident, buf_is_space, or your own).
 # - Receivers are @Buffer / @GrowBuf when read-only and @&Buffer / @&GrowBuf
 #   when they move the cursor or mutate; a local passes as @b either way.
 # - buf_init(*u8, len) and growbuf_data() remain for C interop.
@@ -25,7 +24,6 @@
 # forms buf_peek_n, buf_read_until, buf_read_while_digit,
 # buf_read_while_alnum and buf_read_quoted.  They NUL-terminate inside
 # max_len and silently truncate.  Use buf_peek_view / buf_take_* instead.
-# Also buf_skip_while, an ignored-`*u8` placeholder: use buf_take_while.
 
 import ritzlib.sys
 import ritzlib.str
@@ -193,16 +191,15 @@ pub fn buf_skip_until(buf: @&Buffer, c: u8) -> i64
         count += 1
     return count
 
-# DEPRECATED (#1478): a placeholder from before function types; `pred_fn`
-# is ignored and it always returns 0.  Use buf_take_while(buf, pred).len.
-# It stays (rather than taking `fn(u8) -> bool`) for one release, and as the
-# ritz1-safe form until #1671: ritz1 emits indirect calls as i64(i64), so a
-# bool predicate called through a fn value reads garbage under ritz1.
-pub fn buf_skip_while(buf: @&Buffer, pred_fn: *u8) -> i64
-    return 0
+# Skip bytes while `pred` holds; returns how many were skipped.
+pub fn buf_skip_while(buf: @&Buffer, pred: fn(u8) -> bool) -> i64
+    let start: i64 = buf.pos
+    while buf.pos < buf.len and pred(*(buf.data + buf.pos))
+        buf.pos = buf.pos + 1
+    return buf.pos - start
 
 # ============================================================================
-# Byte predicates (for buf_take_while)
+# Byte predicates (for buf_take_while / buf_skip_while)
 # ============================================================================
 
 pub fn buf_is_digit(c: u8) -> bool
@@ -222,9 +219,6 @@ pub fn buf_is_space(c: u8) -> bool
 # ============================================================================
 
 # Consume bytes while `pred` holds and return them.
-# NOTE: wrong under ritz1 until #1671 (indirect calls lose their bool return
-# type); ritz0 is correct.  buf_take_digits / buf_take_ident below loop
-# directly so they are safe under every compiler.
 pub fn buf_take_while(buf: @&Buffer, pred: fn(u8) -> bool) -> StrView
     let start: i64 = buf.pos
     while buf.pos < buf.len and pred(*(buf.data + buf.pos))
@@ -240,17 +234,11 @@ pub fn buf_take_until(buf: @&Buffer, c: u8) -> StrView
 
 # Consume a run of [0-9].
 pub fn buf_take_digits(buf: @&Buffer) -> StrView
-    let start: i64 = buf.pos
-    while buf.pos < buf.len and buf_is_digit(*(buf.data + buf.pos))
-        buf.pos = buf.pos + 1
-    return strview_from_ptr(buf.data + start, buf.pos - start)
+    return buf_take_while(buf, buf_is_digit)
 
 # Consume a run of [A-Za-z0-9_].
 pub fn buf_take_ident(buf: @&Buffer) -> StrView
-    let start: i64 = buf.pos
-    while buf.pos < buf.len and buf_is_ident(*(buf.data + buf.pos))
-        buf.pos = buf.pos + 1
-    return strview_from_ptr(buf.data + start, buf.pos - start)
+    return buf_take_while(buf, buf_is_ident)
 
 # Read a `quote`-delimited string, decoding \n \t \r \\ and \<quote> (any
 # other \x yields x), and APPEND the decoded bytes to `out`.

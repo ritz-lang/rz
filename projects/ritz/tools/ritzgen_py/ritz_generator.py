@@ -395,6 +395,10 @@ class RitzGenerator:
         self._emit('    # parsed fn lands on a non-zero skip_item and silently disappears,')
         self._emit('    # leaving callers with extern declarations only at link time.')
         self._emit('    p.skip_item = 0')
+        self._emit('    # AGAST #1671: fn-type signature side channel (see ast.ritz).')
+        self._emit('    p.last_fn_sig = null')
+        self._emit('    p.last_fn_sig_pos = -1')
+        self._emit('    p.var_fn_sig = null')
 
     def _generate_parser_helpers(self):
         self._emit('fn p_peek(p: *Parser) -> i32')

@@ -1101,7 +1101,7 @@ fn clone_params_with_suffix(params: *Param, type_param: *u8, type_param_len: i32
     if params == null
         return null
 
-    let cloned: *Param = malloc(48) as *Param
+    let cloned: *Param = malloc(sizeof(Param)) as *Param
     cloned.name = params.name
     cloned.name_len = params.name_len
     cloned.param_type = substitute_type(params.param_type, type_param, type_param_len, subst_type, subst_name, subst_len)
@@ -1109,6 +1109,7 @@ fn clone_params_with_suffix(params: *Param, type_param: *u8, type_param_len: i32
     cloned.param_type_name_len = params.param_type_name_len
     cloned.param_pointee_type = params.param_pointee_type
     cloned.is_borrow = params.is_borrow
+    cloned.fn_sig = clone_fn_sig(params.fn_sig, type_param, type_param_len, subst_type, subst_name, subst_len, suffix, suffix_len)  # AGAST #1671
 
     # Handle struct type name substitution for TYPE_STRUCT
     if cloned.param_type == TYPE_STRUCT
@@ -1139,6 +1140,37 @@ fn clone_params_with_suffix(params: *Param, type_param: *u8, type_param_len: i32
 
     cloned.next = clone_params_with_suffix(params.next, type_param, type_param_len, subst_type, subst_name, subst_len, suffix, suffix_len)
     return cloned
+
+# AGAST #1671: a `fn(T) -> T` type inside a generic body is specialized
+# like the enclosing fn's own params and return type, so a call through it
+# uses the instantiation's signature (`fn(u8) -> u8`), not `%T`.
+fn clone_fn_sig(sig: *FnDef, type_param: *u8, type_param_len: i32, subst_type: i32, subst_name: *u8, subst_len: i32, suffix: *u8, suffix_len: i32) -> *FnDef
+    if sig == null
+        return null
+    let c: *FnDef = malloc(sizeof(FnDef)) as *FnDef
+    c.name = sig.name
+    c.name_len = sig.name_len
+    c.params = clone_params_with_suffix(sig.params, type_param, type_param_len, subst_type, subst_name, subst_len, suffix, suffix_len)
+    c.return_type = sig.return_type
+    c.return_type_name = sig.return_type_name
+    c.return_type_name_len = sig.return_type_name_len
+    if sig.return_type == TYPE_STRUCT and sig.return_type_name != null
+        if sig.return_type_name_len == type_param_len and memcmp(sig.return_type_name, type_param, type_param_len as i64) == 0
+            c.return_type = subst_type
+            c.return_type_name = subst_name
+            c.return_type_name_len = subst_len
+        else
+            var rn: *u8 = null
+            var rl: i32 = 0
+            substitute_type_param_in_name(sig.return_type_name, sig.return_type_name_len, type_param, type_param_len, suffix, suffix_len, @rn, @rl)
+            c.return_type_name = rn
+            c.return_type_name_len = rl
+    c.body = null
+    c.line = sig.line
+    c.next = null
+    c.type_params = null
+    c.is_local = 0
+    return c
 
 fn clone_params(params: *Param, type_param: *u8, type_param_len: i32, subst_type: i32, subst_name: *u8, subst_len: i32) -> *Param
     # Legacy wrapper - doesn't handle pointer-to-struct substitution
@@ -1256,6 +1288,7 @@ fn clone_stmt(s: *Stmt, type_param: *u8, type_param_len: i32, subst_type: i32, s
         cloned.var_array_size = s.var_array_size
         cloned.var_array_elem_type = s.var_array_elem_type
         cloned.var_pointee_type = s.var_pointee_type
+        cloned.var_fn_sig = clone_fn_sig(s.var_fn_sig, type_param, type_param_len, subst_type, subst_name, subst_len, suffix, suffix_len)  # AGAST #1671
         # Substitute type param in variable type name (e.g., Vec<T> -> Vec$u8)
         if s.var_type == TYPE_STRUCT and s.var_type_name != null
             var new_name_ptr: *u8 = null

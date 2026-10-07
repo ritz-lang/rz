@@ -774,6 +774,7 @@ struct Buffer
 |----------|-----------|-------------|
 | `buf_skip_whitespace` | `fn(buf: @&Buffer) -> i64` | Skip space/tab/CR/LF |
 | `buf_skip_until` | `fn(buf: @&Buffer, c: u8) -> i64` | Skip until char |
+| `buf_skip_while` | `fn(buf: @&Buffer, pred: fn(u8) -> bool) -> i64` | Skip a run matching `pred`; returns the count |
 
 **Zero-Copy Reads** (each returns a slice of the buffer's bytes):
 
@@ -782,10 +783,10 @@ struct Buffer
 | `buf_take_until` | `fn(buf: @&Buffer, c: u8) -> StrView` | Up to (not including) `c`, or to the end |
 | `buf_take_digits` | `fn(buf: @&Buffer) -> StrView` | Run of `[0-9]` |
 | `buf_take_ident` | `fn(buf: @&Buffer) -> StrView` | Run of `[A-Za-z0-9_]` |
-| `buf_take_while` | `fn(buf: @&Buffer, pred: fn(u8) -> bool) -> StrView` | Run matching `pred` (unreliable under ritz1 until AGAST #1671) |
+| `buf_take_while` | `fn(buf: @&Buffer, pred: fn(u8) -> bool) -> StrView` | Run matching `pred` |
 | `buf_take_quoted` | `fn(buf: @&Buffer, quote: u8, out: @&String) -> bool` | Decode a quoted string, appending to `out`; false if not at `quote` or unterminated |
 
-**Byte Predicates** (for `buf_take_while`):
+**Byte Predicates** (for `buf_take_while` / `buf_skip_while`):
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
@@ -804,7 +805,6 @@ copy into a caller-sized `out`, NUL-terminate within `max_len` (so `max_len`
 | `buf_read_while_digit` | `fn(buf: @&Buffer, out: *u8, max_len: i64) -> i64` | `buf_take_digits` |
 | `buf_read_while_alnum` | `fn(buf: @&Buffer, out: *u8, max_len: i64) -> i64` | `buf_take_ident` |
 | `buf_read_quoted` | `fn(buf: @&Buffer, quote: u8, out: *u8, max_len: i64) -> i64` | `buf_take_quoted` |
-| `buf_skip_while` | `fn(buf: @&Buffer, pred_fn: *u8) -> i64` | `buf_take_while(...).len` (this one ignores `pred_fn` and returns 0) |
 
 **Location Tracking**:
 
