@@ -74,11 +74,6 @@ EXPECTED_FAILURES = {
 # excuse the other: each is still its own key, and if the twins ever diverge
 # the passing one turns xpass and the gate goes red.
 _RITZ1_TWINS = {
-    # --- codegen, silent wrong results ---
-    "test_avx2::test_simd_rotl_v8i32_16":
-        "AGAST #1602 — int→int `as` cast is a no-op (0xffffffff as i32 stays i64)",
-    "test_avx2::test_simd_xor_v8i32":
-        "AGAST #1602 — int→int `as` cast is a no-op (0x95511559 as i32)",
     # --- codegen, build failures ---
     "test_mut_ref":
         "AGAST #1607 — instance-method args not narrowed to param width (invalid IR)",
