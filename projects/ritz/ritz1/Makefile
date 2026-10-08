@@ -30,6 +30,7 @@ SOURCES = \
 	interp \
 	monomorph \
 	emitter_core \
+	narrowing \
 	emitter_expr_arith \
 	emitter_expr_access \
 	emitter_expr_call \

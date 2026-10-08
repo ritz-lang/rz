@@ -411,6 +411,25 @@ fn parse_file_copy(p: *Parser) -> *u8
         i = i + 1
     buf
 
+# parse_file_copy, shared between consecutive callers that see the same path.
+# AGAST #1364 records a path on every narrow-integer let/var, and a fresh copy
+# each time would grow the arena by a path per declaration.  The cache is
+# keyed on CONTENT, never on the g_parse_file pointer: that String is freed
+# after each import, so a later file can arrive at the same address.
+var g_shared_file_copy: *u8 = null
+
+fn parse_file_copy_shared(p: *Parser) -> *u8
+    if g_parse_file == null
+        return null
+    if g_shared_file_copy != null
+        var i: i64 = 0
+        while *(g_parse_file + i) != 0 and *(g_parse_file + i) == *(g_shared_file_copy + i)
+            i = i + 1
+        if *(g_parse_file + i) == 0 and *(g_shared_file_copy + i) == 0
+            return g_shared_file_copy
+    g_shared_file_copy = parse_file_copy(p)
+    g_shared_file_copy
+
 # =============================================================================
 # Function definition helpers
 # =============================================================================
@@ -1479,6 +1498,11 @@ pub fn stmt_var_decl(p: *Parser, name: *u8, len: i32, ty: i32, init: *Expr, line
     s.span.col = col
     s.var_name = name as *u8
     s.var_name_len = len
+    # AGAST #1364: keep the written annotation for the narrowing check.
+    s.var_declared_type = ty
+    s.var_src_file = null
+    if ty == TYPE_I8 or ty == TYPE_U8 or ty == TYPE_I16 or ty == TYPE_U16 or ty == TYPE_I32 or ty == TYPE_U32
+        s.var_src_file = parse_file_copy_shared(p)
     # Default to i64 for type inference (when ty == 0 aka TYPE_VOID)
     if ty == 0
         s.var_type = TYPE_I64

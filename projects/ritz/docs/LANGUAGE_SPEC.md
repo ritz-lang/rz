@@ -885,6 +885,12 @@ is rejected even though it is safe, and needs an `as`. Only typed `let` and
 `var` initialisers are checked. An assignment, a call argument or a `return`
 still converts silently (#1444).
 
+ritz0 and ritz1 both enforce this rule, and `ritz0/test_ritz1_implicit_narrowing.py`
+checks that they give the same verdict on every case in
+`ritz0/test_implicit_narrowing.py`. ritz1 infers the initialiser's type from its
+Ritz types. Where that inference is unsure, for example for an unannotated
+local, ritz1 accepts the initialiser rather than guess (#1364).
+
 ### 7.6 Reference Operations
 
 ```ritz body

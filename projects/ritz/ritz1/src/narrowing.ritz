@@ -1,0 +1,516 @@
+# ritz1/src/narrowing.ritz - implicit narrowing in a typed let/var is an error
+#
+# AGAST #1364 (decision, option b) / #1446 (ritz1 parity with #1393).
+#
+#     fn big() -> i64
+#         return 4294967301
+#     let n: i32 = big()          # error; write `big() as i32`
+#
+# This is a port of ritz0's `_check_implicit_narrowing`,
+# `_provable_int_range` and `_const_int_value` (emitter_llvmlite.py).  The
+# rule is identical: a narrowing is rejected unless it is PROVABLY lossless --
+#
+#   * a compile-time constant expression whose value fits the declared type
+#   * a mask `e & K` with constant K >= 0 that fits the declared type
+#   * a match whose every arm is one of the above
+#
+# ritz0/test_implicit_narrowing.py is the specification of the rule, and
+# ritz0/test_ritz1_implicit_narrowing.py feeds its tables to both compilers.
+#
+# THE ONE REAL DIFFERENCE: how the initialiser's type is known.  ritz0 reads
+# the LLVM width of the value it just emitted.  ritz1 cannot: its unified
+# value model keeps every integer in an i64 register, so every initialiser
+# would look 64-bit.  The source type is therefore inferred from RITZ types
+# by narrow_src_type below, and that inference is deliberately one-sided: when
+# it is not sure, it answers NARROW_UNKNOWN and the check stays silent.  A
+# missed rejection is a parity gap; a false rejection would refuse a program
+# ritz0 accepts, which the regression suite would (rightly) fail on.  In
+# particular an unannotated local is NOT trusted -- the parser defaults it to
+# TYPE_I64 whatever its initialiser is -- so identifiers resolve through the
+# per-function table of WRITTEN annotations kept here, not through s.locals.
+
+import ritzlib.sys
+import ritzlib.io
+
+import ast
+import ast_helpers
+import emitter_core
+
+# narrow_src_type results that are not a TYPE_* kind.
+# Positive and far from every TYPE_* kind (consts must be plain literals).
+const NARROW_UNKNOWN: i32 = 9001   # cannot tell: never reject on this
+const NARROW_LIT: i32 = 9002       # a bare integer literal: adopts the
+                                   # declared type (#1396), never narrows
+
+const I64_MAX: i64 = 9223372036854775807
+
+# =============================================================================
+# Per-function state
+# =============================================================================
+
+# Called at the start of every fn and impl method, where s.locals is reset.
+fn narrowing_begin_fn(s: *EmitterState, params: *Param)
+    s.narrow_params = params
+    s.narrow_decl_count = 0
+    s.narrow_decl_overflow = 0
+
+fn narrow_record_decl(s: *EmitterState, stmt: *Stmt)
+    if s.narrow_decl_count >= 256
+        # Lookups could miss a shadowing entry: stop trusting the table.
+        s.narrow_decl_overflow = 1
+        return
+    var t: i32 = NARROW_UNKNOWN
+    if narrow_int_width(stmt.var_declared_type) > 0
+        t = stmt.var_declared_type
+    let idx: i32 = s.narrow_decl_count
+    s.narrow_decls[idx].name = stmt.var_name
+    s.narrow_decls[idx].name_len = stmt.var_name_len
+    s.narrow_decls[idx].decl_type = t
+    s.narrow_decl_count = idx + 1
+
+# =============================================================================
+# Types
+# =============================================================================
+
+# Bit width of an integer (or bool) type kind; 0 for anything else.
+fn narrow_int_width(t: i32) -> i32
+    if t == TYPE_BOOL
+        return 1
+    if t == TYPE_I8 or t == TYPE_U8
+        return 8
+    if t == TYPE_I16 or t == TYPE_U16
+        return 16
+    if t == TYPE_I32 or t == TYPE_U32
+        return 32
+    if t == TYPE_I64 or t == TYPE_U64
+        return 64
+    0
+
+fn narrow_is_unsigned(t: i32) -> i32
+    if t == TYPE_U8 or t == TYPE_U16 or t == TYPE_U32 or t == TYPE_U64
+        return 1
+    0
+
+fn narrow_type_name(t: i32) -> *u8
+    if t == TYPE_I8
+        return c"i8"
+    if t == TYPE_U8
+        return c"u8"
+    if t == TYPE_I16
+        return c"i16"
+    if t == TYPE_U16
+        return c"u16"
+    if t == TYPE_I32
+        return c"i32"
+    if t == TYPE_U32
+        return c"u32"
+    if t == TYPE_U64
+        return c"u64"
+    if t == TYPE_BOOL
+        return c"bool"
+    c"i64"
+
+# A type kind if it is an integer/bool, else NARROW_UNKNOWN.
+fn narrow_known(t: i32) -> i32
+    if narrow_int_width(t) > 0
+        return t
+    NARROW_UNKNOWN
+
+# Ritz type of an identifier, or NARROW_UNKNOWN.  Same precedence as
+# emission: constants shadow locals.
+fn narrow_ident_type(s: *EmitterState, e: *Expr) -> i32
+    let ce: *ConstEntry = find_const_entry(s, e.ident_ptr, e.ident_len)
+    if ce != null
+        if ce.fold_state != CONST_FOLD_DONE
+            return NARROW_UNKNOWN
+        return narrow_known(ce.const_type)
+    if s.narrow_decl_overflow != 0
+        return NARROW_UNKNOWN
+    # Newest declaration first.  Block scopes are not tracked, so if two
+    # declarations of the name disagree the answer is unknown, not a guess.
+    var found: i32 = 0
+    var t: i32 = NARROW_UNKNOWN
+    var i: i32 = s.narrow_decl_count - 1
+    while i >= 0
+        let d: *NarrowDecl = @s.narrow_decls[i]
+        if name_eq(d.name, d.name_len, e.ident_ptr, e.ident_len) == 1
+            if found == 0
+                found = 1
+                t = d.decl_type
+            else if d.decl_type != t
+                return NARROW_UNKNOWN
+        i = i - 1
+    if found == 1
+        return t
+    var p: *Param = s.narrow_params
+    while p != null
+        if name_eq(p.name, p.name_len, e.ident_ptr, e.ident_len) == 1
+            return narrow_known(p.param_type)
+        p = p.next
+    # A global's TYPE_I64 may be the parser's default for a missing
+    # annotation, so only a narrower (necessarily written) type is trusted.
+    let g: *GlobalVarDef = find_global(s, e.ident_ptr, e.ident_len)
+    if g != null
+        let gw: i32 = narrow_int_width(g.var_type)
+        if gw > 1 and gw < 64
+            return g.var_type
+    NARROW_UNKNOWN
+
+# Ritz type of `local.field` / `ptr.field`; field types are always written.
+fn narrow_member_type(s: *EmitterState, e: *Expr) -> i32
+    if e.left == null or e.left.kind != EXPR_IDENT
+        return NARROW_UNKNOWN
+    let local: *LocalVar = find_local_struct_name(s, e.left.ident_ptr, e.left.ident_len)
+    if local == null or local.type_name_len == 0
+        return NARROW_UNKNOWN
+    let st: *StructDef = find_struct(s, local.type_name, local.type_name_len)
+    if st == null
+        return NARROW_UNKNOWN
+    let idx: i32 = find_field_index(st, e.ident_ptr, e.ident_len)
+    if idx < 0
+        return NARROW_UNKNOWN
+    let field: *StructField = get_field_type(st, idx)
+    narrow_known(field.field_type)
+
+fn narrow_call_type(s: *EmitterState, e: *Expr) -> i32
+    var full_name: [256]u8
+    var full_len: i32 = 0
+    if e.func_name_len + e.call_type_suffix_len > 256
+        return NARROW_UNKNOWN
+    for i in 0..e.func_name_len
+        full_name[full_len] = *(e.func_name + i)
+        full_len += 1
+    for i in 0..e.call_type_suffix_len
+        full_name[full_len] = *(e.call_type_suffix + i)
+        full_len += 1
+    let fn_def: *FnDef = find_fn(s, @full_name[0], full_len)
+    if fn_def == null
+        return NARROW_UNKNOWN
+    narrow_known(fn_def.return_type)
+
+# The type ritz0 would give an arithmetic result: the wider operand, with a
+# bare literal adopting the other side (#1396).  Two literals stay i64 in
+# ritz0 (#1445), so `2 << 8` is an i64 that the constant rule must clear.
+fn narrow_join(a: i32, b: i32) -> i32
+    if a == NARROW_UNKNOWN or b == NARROW_UNKNOWN
+        return NARROW_UNKNOWN
+    if a == NARROW_LIT and b == NARROW_LIT
+        return TYPE_I64
+    if a == NARROW_LIT
+        return b
+    if b == NARROW_LIT
+        return a
+    if a == TYPE_BOOL or b == TYPE_BOOL
+        return NARROW_UNKNOWN
+    if narrow_int_width(b) > narrow_int_width(a)
+        return b
+    a
+
+fn narrow_is_arith_op(op: i32) -> i32
+    if op == OP_ADD or op == OP_SUB or op == OP_MUL or op == OP_DIV or op == OP_MOD
+        return 1
+    if op == OP_BIT_AND or op == OP_BIT_OR or op == OP_BIT_XOR or op == OP_SHL or op == OP_SHR
+        return 1
+    0
+
+# Ritz type of an initialiser, NARROW_LIT, or NARROW_UNKNOWN (see header).
+fn narrow_src_type(s: *EmitterState, e: *Expr) -> i32
+    if e == null
+        return NARROW_UNKNOWN
+    let k: i32 = e.kind
+    if k == EXPR_INT_LIT
+        return NARROW_LIT
+    if k == EXPR_CHAR_LIT
+        return TYPE_U8
+    if k == EXPR_IDENT
+        return narrow_ident_type(s, e)
+    if k == EXPR_CALL
+        return narrow_call_type(s, e)
+    if k == EXPR_CAST
+        return narrow_known(e.op)
+    if k == EXPR_MEMBER
+        return narrow_member_type(s, e)
+    if k == EXPR_BINARY
+        if e.op >= OP_EQ and e.op <= OP_OR
+            return TYPE_BOOL
+        if narrow_is_arith_op(e.op) == 1
+            return narrow_join(narrow_src_type(s, e.left), narrow_src_type(s, e.right))
+        return NARROW_UNKNOWN
+    if k == EXPR_UNARY
+        if e.op == OP_NOT
+            return TYPE_BOOL
+        if e.op == OP_NEG or e.op == OP_BIT_NOT
+            return narrow_src_type(s, e.operand)
+        return NARROW_UNKNOWN
+    if k == EXPR_MATCH
+        # Measured against ritz0, not assumed: a literal arm takes the type
+        # of the non-literal arms (`match o: A => x_i32, B => 0` is i32), and
+        # a match whose arms are ALL literals is i64.  (#1445's "literal arms
+        # stay i64" is about `if` arms, which ritz1 cannot parse.)
+        var t: i32 = NARROW_LIT
+        var arm: *MatchArm = e.args as *MatchArm
+        if arm == null
+            return NARROW_UNKNOWN
+        while arm != null
+            if arm.is_pass != 0 or arm.body == null
+                return NARROW_UNKNOWN
+            let at: i32 = narrow_src_type(s, arm.body)
+            if at == NARROW_UNKNOWN
+                return NARROW_UNKNOWN
+            if at != NARROW_LIT
+                if t == NARROW_LIT
+                    t = at
+                else
+                    t = narrow_join(t, at)
+                if t == NARROW_UNKNOWN
+                    return NARROW_UNKNOWN
+            arm = arm.next
+        if t == NARROW_LIT
+            return TYPE_I64
+        return t
+    NARROW_UNKNOWN
+
+# =============================================================================
+# Constant folding -- port of ritz0's _const_int_value
+# =============================================================================
+#
+# ritz0 folds with Python's unbounded integers; here an intermediate that
+# leaves i64 makes the fold give up (return 0 = "not proven").  The two agree
+# on every verdict that matters: ritz0's ring ops (+ - * & | ^ <<) only accept
+# a result that fits a <= 32-bit declared type, and `>>` / `/` / `%` refuse an
+# operand outside [0, 2^63) -- exactly the values that would overflow here.
+
+fn narrow_add_ok(a: i64, b: i64) -> i32
+    if b > 0 and a > I64_MAX - b
+        return 0
+    if b < 0 and a < (0 - I64_MAX - 1) - b
+        return 0
+    1
+
+fn narrow_sub_ok(a: i64, b: i64) -> i32
+    if b < 0 and a > I64_MAX + b
+        return 0
+    if b > 0 and a < (0 - I64_MAX - 1) + b
+        return 0
+    1
+
+fn narrow_mul_ok(a: i64, b: i64) -> i32
+    if a == 0 or b == 0
+        return 1
+    let min: i64 = 0 - I64_MAX - 1
+    if (a == 0 - 1 and b == min) or (b == 0 - 1 and a == min)
+        return 0
+    let r: i64 = a * b
+    if r / b != a
+        return 0
+    1
+
+# Exact value of a compile-time integer expression into *out; 1 if proven.
+# A named constant narrower than 64 bits is trusted only as the WHOLE
+# initialiser: inside an expression it is computed at its own width and
+# could wrap before any widening.
+fn narrow_const_value(s: *EmitterState, e: *Expr, whole: i32, out: *i64) -> i32
+    if e == null
+        return 0
+    if e.kind == EXPR_INT_LIT
+        *out = e.int_val
+        return 1
+    if e.kind == EXPR_IDENT
+        let ce: *ConstEntry = find_const_entry(s, e.ident_ptr, e.ident_len)
+        if ce == null or ce.fold_state != CONST_FOLD_DONE
+            return 0
+        let w: i32 = narrow_int_width(ce.const_type)
+        if w < 8
+            return 0
+        if w < 64 and whole == 0
+            return 0
+        *out = ce.value
+        return 1
+    if e.kind == EXPR_UNARY
+        var v: i64 = 0
+        if e.op != OP_NEG and e.op != OP_BIT_NOT
+            return 0
+        if narrow_const_value(s, e.operand, 0, @v) == 0
+            return 0
+        if e.op == OP_NEG
+            if v == 0 - I64_MAX - 1
+                return 0
+            *out = 0 - v
+        else
+            *out = (0 - 1) - v    # ~v
+        return 1
+    if e.kind != EXPR_BINARY
+        return 0
+    var l: i64 = 0
+    var r: i64 = 0
+    if narrow_const_value(s, e.left, 0, @l) == 0
+        return 0
+    if narrow_const_value(s, e.right, 0, @r) == 0
+        return 0
+    let op: i32 = e.op
+    if op == OP_SHL
+        # A shift of 64 or more is poison in LLVM, not 0.
+        if r < 0 or r >= 64
+            return 0
+        if l >= 0 and l > (I64_MAX >> r)
+            return 0
+        if l < 0 and l < ((0 - I64_MAX - 1) >> r)
+            return 0
+        *out = l << r
+        return 1
+    if op == OP_SHR or op == OP_DIV or op == OP_MOD
+        # Signed and unsigned forms (ashr/lshr, sdiv/udiv) agree only for
+        # non-negative operands; see ritz0's comment on `(1 << 62) * 4 >> 60`.
+        if l < 0 or r < 0
+            return 0
+        if op == OP_SHR
+            if r >= 64
+                return 0
+            *out = l >> r
+            return 1
+        if r == 0
+            return 0
+        if op == OP_DIV
+            *out = l / r
+        else
+            *out = l % r
+        return 1
+    if op == OP_ADD
+        if narrow_add_ok(l, r) == 0
+            return 0
+        *out = l + r
+        return 1
+    if op == OP_SUB
+        if narrow_sub_ok(l, r) == 0
+            return 0
+        *out = l - r
+        return 1
+    if op == OP_MUL
+        if narrow_mul_ok(l, r) == 0
+            return 0
+        *out = l * r
+        return 1
+    if op == OP_BIT_AND
+        *out = l & r
+        return 1
+    if op == OP_BIT_OR
+        *out = l | r
+        return 1
+    if op == OP_BIT_XOR
+        *out = l ^ r
+        return 1
+    0
+
+# [*lo, *hi] bounding every value of e; 1 if proven.  Port of ritz0's
+# _provable_int_range: constants, `e & K` masks, and match over those.  No
+# reasoning about comparisons, loop bounds or variables -- widening this is a
+# language decision, pinned by test_implicit_narrowing.py.
+fn narrow_provable_range(s: *EmitterState, e: *Expr, whole: i32, lo: *i64, hi: *i64) -> i32
+    var v: i64 = 0
+    if narrow_const_value(s, e, whole, @v) == 1
+        *lo = v
+        *hi = v
+        return 1
+    if e == null
+        return 0
+    if e.kind == EXPR_BINARY and e.op == OP_BIT_AND
+        var found: i32 = 0
+        var best: i64 = 0
+        var k: i64 = 0
+        if narrow_const_value(s, e.left, 0, @k) == 1 and k >= 0
+            best = k
+            found = 1
+        if narrow_const_value(s, e.right, 0, @k) == 1 and k >= 0
+            if found == 0 or k < best
+                best = k
+            found = 1
+        if found == 0
+            return 0
+        *lo = 0
+        *hi = best
+        return 1
+    if e.kind == EXPR_MATCH
+        var arm: *MatchArm = e.args as *MatchArm
+        if arm == null
+            return 0
+        var any: i32 = 0
+        var alo: i64 = 0
+        var ahi: i64 = 0
+        while arm != null
+            if arm.is_pass != 0 or arm.body == null
+                return 0
+            if narrow_provable_range(s, arm.body, 0, @alo, @ahi) == 0
+                return 0
+            if any == 0 or alo < *lo
+                *lo = alo
+            if any == 0 or ahi > *hi
+                *hi = ahi
+            any = 1
+            arm = arm.next
+        return 1
+    0
+
+fn narrow_fits(v: i64, t: i32) -> i32
+    let w: i32 = narrow_int_width(t)
+    if narrow_is_unsigned(t) == 1
+        return (v >= 0 and v <= ((1 as i64) << w) - 1) as i32
+    let half: i64 = (1 as i64) << (w - 1)
+    (v >= 0 - half and v <= half - 1) as i32
+
+# =============================================================================
+# The check
+# =============================================================================
+
+fn narrow_eprint_name(name: *u8, len: i32)
+    var i: i32 = 0
+    while i < len
+        eprint_char(*(name + i))
+        i += 1
+
+# Reject `let n: i32 = <i64 expr>` unless it provably loses no bits.  Called
+# at the top of emit_var_decl, before the declaration is in scope, so
+# `let x: i32 = x` still sees the outer x.
+fn check_implicit_narrowing(s: *EmitterState, stmt: *Stmt)
+    let decl: i32 = stmt.var_declared_type
+    let init: *Expr = stmt.var_init
+    let dw: i32 = narrow_int_width(decl)
+    if init != null and dw > 1 and dw < 64
+        let src: i32 = narrow_src_type(s, init)
+        let sw: i32 = narrow_int_width(src)
+        if src != NARROW_UNKNOWN and src != NARROW_LIT and sw > dw
+            var lo: i64 = 0
+            var hi: i64 = 0
+            var proven: i32 = 0
+            if narrow_provable_range(s, init, 1, @lo, @hi) == 1
+                if narrow_fits(lo, decl) == 1 and narrow_fits(hi, decl) == 1
+                    proven = 1
+            if proven == 0
+                narrow_report(s, stmt, decl, src)
+    narrow_record_decl(s, stmt)
+
+fn narrow_report(s: *EmitterState, stmt: *Stmt, decl: i32, src: i32)
+    if stmt.var_src_file != null
+        eprints_cstr(stmt.var_src_file)
+    else
+        eprints_cstr(c"<input>")
+    eprint_char(':')
+    eprint_i64(stmt.span.line as i64)
+    eprint_char(':')
+    eprint_i64(stmt.span.col as i64)
+    eprints_cstr(c": error: implicit narrowing: `")
+    narrow_eprint_name(stmt.var_name, stmt.var_name_len)
+    eprints_cstr(c"` is declared `")
+    eprints_cstr(narrow_type_name(decl))
+    eprints_cstr(c"` but its initialiser has type `")
+    eprints_cstr(narrow_type_name(src))
+    eprints_cstr(c"`, and the compiler cannot prove the value fits. Write `<expr> as ")
+    eprints_cstr(narrow_type_name(decl))
+    eprints_cstr(c"` if truncation is intended, or declare `")
+    narrow_eprint_name(stmt.var_name, stmt.var_name_len)
+    eprints_cstr(c"` as `")
+    eprints_cstr(narrow_type_name(src))
+    eprints_cstr(c"`\n")
+    emit_str(s, c"  ; ERROR: implicit narrowing of `")
+    emit_name(s, stmt.var_name, stmt.var_name_len)
+    emit_str(s, c"`\n")
+    s.error_count = s.error_count + 1
