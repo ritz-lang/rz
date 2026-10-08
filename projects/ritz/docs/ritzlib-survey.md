@@ -100,7 +100,7 @@ same-named non-pub helper.
 |---|---|---|
 | `async.task` | unannotated `let p = x as *T` loses its type, so member access fails ("unhandled EXPR_MEMBER") | #1453 |
 | `async_fs` | `async fn` items unparsed | #1456 (split from #1310) |
-| `lang.tokens` | array-repeat of a struct literal `[S { .. }; N]` | #1362 (updated) |
+| ~~`lang.tokens`~~ | ~~array-repeat of a struct literal `[S { .. }; N]`~~ — **fixed by #1362** (struct literals lower in any value position: call/variant-ctor args, `[S { .. }; N]` elements) | #1362 |
 | `os.env` | block-bodied match arm `None =>` plus indented block | #1454 (split from #1310) |
 | `testing` | inline `asm x86_64:` block in a fn body | #1455 (split from #1310) |
 | ~~`testlib`~~ | ~~trailing comma in a fn parameter list (testlib.ritz:168)~~ — **fixed by #1452** (params and call args accept a trailing comma); testlib now compiles under ritz1 and `33_printenv`'s testlib-based tests pass 4/4 through the matrix harness. Running package `.ritz` tests under ritz1 via `build.py test` is #1536 | #1452 |
@@ -141,7 +141,7 @@ tickets were needed. `77_args` arrived with `d8d79f6` and its blockers (#1487,
 | `69_result_string` | `%.13` is `i64`, expected `%String` | match arm binding a struct payload gets `alloca i64` | #1515 |
 | `72_raii` | unhandled `EXPR_MEMBER` in assignment | `self`-named param; generic impl methods; `{x}` interpolation | #1375, #1520, #1521 |
 | `75_async_reference` | cannot parse `async` | `async fn` items | #1456 |
-| `76_option` (added by #1460) | struct literal not in var initializer context | `Some(Point {..})`; match arm binding a struct payload gets `i64` (`Some(p) => p.x`) | #1362, #1515 |
+| ~~`76_option`~~ (added by #1460) | ~~struct literal not in var initializer context~~ | `Some(Point {..})`; match arm binding a struct payload gets `i64` (`Some(p) => p.x`) — **fixed by #1515 and #1362**, removed from the allowlist (test.sh passes) | #1362, #1515 |
 
 The allowlist is dominated by three causes: `async fn` (4 examples, #1456),
 `if` expressions (2, #1524) and function values (2, #1503). Those three fixes

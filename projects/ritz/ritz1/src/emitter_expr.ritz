@@ -1038,17 +1038,14 @@ fn emit_expr(s: *EmitterState, e: *Expr) -> i32
         return sv2
 
     else if e.kind == EXPR_STRUCT_LIT
-        # Struct literal: TypeName { field: value, ... }
-        # e.ident_ptr/ident_len = struct type name
-        # e.args = pointer to FieldInit list (recast)
-        # Returns 0 - struct literals are only valid as var initializers
-        # The var_decl handler will special-case this
-        emit_ir_error(s, c"struct literal not in var initializer context")
-        let zero: i32 = next_reg(s)
-        emit_str(s, c"  ")
-        emit_reg(s, zero)
-        emit_str(s, c" = add i64 0, 0\n")
-        return zero
+        # Struct literal as an rvalue: TypeName { field: value, ... }
+        # (e.ident_ptr/ident_len = struct type name, e.args = FieldInit list).
+        # let/var, return, reassignment, nested-field and receiver literals
+        # are written straight into their destination slot elsewhere. Every
+        # other position (fn/method arg, variant-ctor payload, `[T{..}; N]`
+        # element) lands here: fill a temp through the shared field-store
+        # loop, then yield the loaded `%T` aggregate. (AGAST #1362)
+        return emit_struct_lit_value(s, e)
 
     else if e.kind == EXPR_MEMBER
         return emit_expr_member(s, e)
@@ -1186,6 +1183,81 @@ fn emit_expr(s: *EmitterState, e: *Expr) -> i32
 # EXPR_ARRAY_FILL fallback, which builds a shadow `[N x i64]` alloca and
 # returns its ADDRESS — stored as an i64 over the field's first slots, with
 # the fill value never reaching the field at all.  (AGAST #1605)
+# Store the `%T` aggregate `agg` into every slot of the `[N x %T]` array at
+# `base_reg`. Always a counted loop: clang unrolls the small ones, and a
+# large struct array stays O(1) in IR size. (AGAST #1362)
+fn emit_array_fill_struct_loop(s: *EmitterState, base_reg: i32, arr_size: i32, st: *StructDef, agg: i32)
+    let idx: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, idx)
+    emit_str(s, c" = alloca i32\n")
+    emit_str(s, c"  store i32 0, ptr ")
+    emit_reg(s, idx)
+    emit_str(s, c"\n")
+    let l_cond: i32 = next_label(s)
+    let l_body: i32 = next_label(s)
+    let l_end: i32 = next_label(s)
+    emit_str(s, c"  br label %")
+    emit_label(s, l_cond)
+    emit_str(s, c"\n")
+    begin_block(s, l_cond)
+    let cur: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, cur)
+    emit_str(s, c" = load i32, ptr ")
+    emit_reg(s, idx)
+    emit_str(s, c"\n")
+    let cmp: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, cmp)
+    emit_str(s, c" = icmp ult i32 ")
+    emit_reg(s, cur)
+    emit_str(s, c", ")
+    emit_int(s, arr_size as i64)
+    emit_str(s, c"\n")
+    emit_str(s, c"  br i1 ")
+    emit_reg(s, cmp)
+    emit_str(s, c", label %")
+    emit_label(s, l_body)
+    emit_str(s, c", label %")
+    emit_label(s, l_end)
+    emit_str(s, c"\n")
+    begin_block(s, l_body)
+    let ep: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, ep)
+    emit_str(s, c" = getelementptr [")
+    emit_int(s, arr_size as i64)
+    emit_str(s, c" x %")
+    emit_name(s, st.name, st.name_len)
+    emit_str(s, c"], ptr ")
+    emit_reg(s, base_reg)
+    emit_str(s, c", i32 0, i32 ")
+    emit_reg(s, cur)
+    emit_str(s, c"\n")
+    emit_str(s, c"  store %")
+    emit_name(s, st.name, st.name_len)
+    emit_str(s, c" ")
+    emit_reg(s, agg)
+    emit_str(s, c", ptr ")
+    emit_reg(s, ep)
+    emit_str(s, c"\n")
+    let inc: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, inc)
+    emit_str(s, c" = add i32 ")
+    emit_reg(s, cur)
+    emit_str(s, c", 1\n")
+    emit_str(s, c"  store i32 ")
+    emit_reg(s, inc)
+    emit_str(s, c", ptr ")
+    emit_reg(s, idx)
+    emit_str(s, c"\n")
+    emit_str(s, c"  br label %")
+    emit_label(s, l_cond)
+    emit_str(s, c"\n")
+    begin_block(s, l_end)
+
 fn emit_array_fill_into(s: *EmitterState, base_reg: i32, arr_size: i32, elem_ty: i32, fill_val: *Expr)
     let fill_elem_ty: i32 = elem_ty
     let fill_arr_size: i32 = arr_size
@@ -1203,6 +1275,14 @@ fn emit_array_fill_into(s: *EmitterState, base_reg: i32, arr_size: i32, elem_ty:
     else if fill_elem_ty == TYPE_PTR or fill_elem_ty == TYPE_PTR_PTR
         fill_elem_llvm = c"ptr"
         fill_elem_bytes = 8
+    # `[T { .. }; N]`: the element is the literal's own struct type, stored
+    # as a `%T` aggregate built once by the rvalue lowering. (AGAST #1362)
+    if fill_val != null and fill_val.kind == EXPR_STRUCT_LIT
+        let lit_st: *StructDef = find_struct(s, fill_val.ident_ptr, fill_val.ident_len)
+        if lit_st != null
+            let agg: i32 = emit_struct_lit_value(s, fill_val)
+            emit_array_fill_struct_loop(s, base_reg, fill_arr_size, lit_st, agg)
+            return
     # Fast path: integer-literal zero fill — collapse to memset.
     # Detect EXPR_INT_LIT with int_val == 0 (common case for
     # squeeze's `[0; 65536]` lz_symbols arrays) and EXPR_UNARY
@@ -1526,6 +1606,36 @@ fn emit_struct_lit_to_alloca(s: *EmitterState, e: *Expr, alloca_reg: i32) -> i32
             emit_struct_lit_field_store(s, st, field_idx, fi.value, alloca_reg)
         fi = fi.next
     alloca_reg
+
+# Lower a struct literal to a value: `alloca %T`, fill it field by field via
+# emit_struct_lit_to_alloca, then `load %T`. Returns the aggregate register.
+# Unknown struct names are a located error (from emit_struct_lit_to_alloca's
+# lookup), never a silently wrong value. (AGAST #1362)
+fn emit_struct_lit_value(s: *EmitterState, e: *Expr) -> i32
+    let st: *StructDef = find_struct(s, e.ident_ptr, e.ident_len)
+    if st == null
+        emit_ir_error(s, c"struct not found for literal")
+        let zero: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, zero)
+        emit_str(s, c" = add i64 0, 0\n")
+        return zero
+    let tmp: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, tmp)
+    emit_str(s, c" = alloca %")
+    emit_name(s, st.name, st.name_len)
+    emit_str(s, c"  ; rvalue struct literal\n")
+    emit_struct_lit_to_alloca(s, e, tmp)
+    let val: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, val)
+    emit_str(s, c" = load %")
+    emit_name(s, st.name, st.name_len)
+    emit_str(s, c", ptr ")
+    emit_reg(s, tmp)
+    emit_str(s, c"\n")
+    val
 
 # =============================================================================
 # Statement Emission
