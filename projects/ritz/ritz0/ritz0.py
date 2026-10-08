@@ -25,7 +25,7 @@ from lexer import Lexer, LexerError
 # from parser_adapter import Parser, ParseError  # Generated parser
 from parser import Parser, ParseError  # Hand-written parser
 from emitter_llvmlite import emit as emit_llvmlite, get_test_functions, generate_test_main_source, EmitError
-from import_resolver import resolve_imports, ImportError as RitzImportError
+from import_resolver import ImportResolver, ImportError as RitzImportError
 from name_resolver import resolve_names, NameError as RitzNameError
 from move_checker import MoveChecker, OwnershipError
 from type_checker import TypeChecker, TypeError as RitzTypeError
@@ -33,6 +33,7 @@ from const_eval import evaluate_array_sizes, ConstEvalError
 from emitter.fn_cache import (
     source_file_hash, build_hash_map, build_sig_hash_map,
     read_sig_file, write_sig_file, check_cache, check_source_hash,
+    check_import_hashes, build_import_hashes,
     build_sig_data, detect_sig_changes, invalidate_dependents,
 )
 import ritz_ast as rast
@@ -98,13 +99,19 @@ def compile_file(source_path: str, output_path: str, no_runtime: bool = False,
         source_abs_path = str(Path(source_path).resolve())
 
         # --- Incremental compilation: source-file-level hash check ---
-        # If the .ll output exists, is newer than the source, and the
-        # source hash matches the cached hash in .ritz.sig, skip everything.
+        # If the .ll output exists, is newer than the source, the source hash
+        # matches the cached hash in .ritz.sig, AND every transitive import
+        # still hashes as recorded, skip everything. The import check matters:
+        # the .ll bakes in imported struct layouts (field offsets), constants
+        # and signatures, so an unchanged module over a changed import is
+        # still stale (AGAST #1674).
         output_file = Path(output_path)
         if output_file.exists():
             source_mtime = Path(source_path).stat().st_mtime
             output_mtime = output_file.stat().st_mtime
-            if output_mtime >= source_mtime and check_source_hash(source, source_abs_path):
+            if (output_mtime >= source_mtime
+                    and check_source_hash(source, source_abs_path)
+                    and check_import_hashes(read_sig_file(source_abs_path))):
                 print(f"Skipped {source_path} (unchanged)")
                 return True
 
@@ -143,7 +150,13 @@ def compile_file(source_path: str, output_path: str, no_runtime: bool = False,
         # Note: use_cache=False because the cache creates stub functions without bodies,
         # which is incompatible with our current merged-module architecture.
         # For separate compilation, the cache would be appropriate.
-        module = resolve_imports(module, source_path, project_root=project_root, use_cache=False, dependencies=dependencies, source_roots=source_roots)
+        resolver = ImportResolver(project_root, use_cache=False, dependencies=dependencies, source_roots=source_roots)
+        module = resolver.resolve(module, source_path)
+
+        # Hash every transitive import now, before emission, so the sig vouches
+        # for the sources this .ll was actually built from (AGAST #1674).
+        import_hashes = build_import_hashes(
+            f for f in resolver.processed_files if f != source_abs_path)
 
         # Filter out items that don't match target_os
         # This must happen after import resolution but before name resolution
@@ -246,6 +259,7 @@ def compile_file(source_path: str, output_path: str, no_runtime: bool = False,
                 fn_ir=emitted_fn_ir,
                 imports=original_import_paths,
                 old_sig_data=old_sig_data,
+                import_hashes=import_hashes,
             )
             write_sig_file(source_abs_path, sig_data)
         except Exception as e:

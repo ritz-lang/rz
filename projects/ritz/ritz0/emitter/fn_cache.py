@@ -23,8 +23,13 @@ Key components:
       "ir": "<cached LLVM IR for this function>"
     }
   },
-  "imports": ["ritzlib.sys", "ritzlib.io"]
+  "imports": ["ritzlib.sys", "ritzlib.io"],
+  "import_hashes": {"/abs/path/ritzlib/sys.ritz": "<sha256 of that file>"}
 }
+
+`import_hashes` covers every TRANSITIVE import (AGAST #1674): the emitted .ll
+bakes in imported struct layouts, constants and signatures, so the
+"unchanged" fast path is only sound if none of those sources changed either.
 """
 
 import hashlib
@@ -379,6 +384,52 @@ def check_source_hash(source: str, source_path: str) -> bool:
     return current_hash == cached_hash
 
 
+def check_import_hashes(sig_data: Optional[Dict[str, Any]]) -> bool:
+    """Check that every transitive import recorded in a sig is unchanged.
+
+    A module's .ll depends on more than its own source: imported struct
+    layouts become field offsets/GEP indices, imported constants are folded,
+    imported signatures become declares. If any of those sources changed, the
+    cached .ll is stale even though the module's own source is identical
+    (AGAST #1674: a field added to ritz1's LocalVar left emitter_expr_arith.ll
+    reading EmitterState fields at their old offsets).
+
+    Args:
+        sig_data: Parsed .ritz.sig data (or None)
+
+    Returns:
+        True only if the sig records `import_hashes` and every listed file
+        still exists with the same content hash. A sig without the record
+        (written before #1674) is treated as stale: it cannot vouch for its
+        imports.
+    """
+    if not sig_data:
+        return False
+    import_hashes = sig_data.get('import_hashes')
+    if not isinstance(import_hashes, dict):
+        return False
+    for path, cached_hash in import_hashes.items():
+        try:
+            current = Path(path).read_text()
+        except (OSError, UnicodeDecodeError):
+            return False
+        if source_file_hash(current) != cached_hash:
+            return False
+    return True
+
+
+def build_import_hashes(paths) -> Dict[str, str]:
+    """Hash each source file in `paths` -> {path: source_file_hash}.
+
+    Args:
+        paths: Absolute paths of the module's transitive imports
+
+    Returns:
+        Mapping suitable for the sig's `import_hashes` field
+    """
+    return {str(p): source_file_hash(Path(p).read_text()) for p in sorted(paths)}
+
+
 def build_sig_data(
     source: str,
     fn_hashes: Dict[str, str],
@@ -386,6 +437,7 @@ def build_sig_data(
     fn_ir: Optional[Dict[str, str]] = None,
     imports: Optional[List[str]] = None,
     old_sig_data: Optional[Dict[str, Any]] = None,
+    import_hashes: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """Build a .ritz.sig data dict.
 
@@ -396,6 +448,8 @@ def build_sig_data(
         fn_ir: {fn_name: ir_text} (optional, cached IR)
         imports: List of import paths (e.g., ["ritzlib.sys"])
         old_sig_data: Previous sig data (to preserve cached IR for unchanged fns)
+        import_hashes: {abs_path: source hash} for every transitive import;
+            consulted by check_import_hashes() on the next build
 
     Returns:
         Dict suitable for write_sig_file()
@@ -431,6 +485,7 @@ def build_sig_data(
         'source_hash': source_file_hash(source),
         'functions': functions,
         'imports': imports,
+        'import_hashes': dict(import_hashes or {}),
     }
 
 
