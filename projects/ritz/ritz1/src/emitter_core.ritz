@@ -911,6 +911,54 @@ fn emit_array_elem_narrow(s: *EmitterState, val: i32, t: i32, ty: *u8) -> i32
     emit_str(s, c"\n")
     return narrow
 
+# AGAST #1596: the element kind for indexing THROUGH a pointer-typed struct
+# field (`s.data[i]` with `data: *T` or `**T`). `**T` elements are pointers;
+# a `*Struct` element is TYPE_STRUCT (spelled `%T` from field_type_name);
+# primitive integer pointees come from array_elem_type (#1304). Anything
+# else (bool, floats, an unrecorded pointee, a non-pointer field) is
+# TYPE_UNKNOWN: ritz1 cannot address it at the right width, so callers must
+# fail closed rather than guess a stride.
+fn ptr_field_elem_kind(field: *StructField) -> i32
+    if field.field_type == TYPE_PTR_PTR
+        return TYPE_PTR
+    if field.field_type != TYPE_PTR
+        return TYPE_UNKNOWN
+    if field.field_type_name_len > 0
+        return TYPE_STRUCT
+    let t: i32 = field.array_elem_type
+    if t == TYPE_I8 or t == TYPE_U8 or t == TYPE_I16 or t == TYPE_U16
+        return t
+    if t == TYPE_I32 or t == TYPE_U32 or t == TYPE_I64 or t == TYPE_U64
+        return t
+    return TYPE_UNKNOWN
+
+# AGAST #1596: address of element `idx` (an i64 register) through the
+# pointer held in a struct field. `field_slot` points AT the field; the
+# pointer is loaded from it and the GEP strides by the pointee (`kind` from
+# ptr_field_elem_kind, never TYPE_UNKNOWN). The old lowering GEP'd the field
+# slot itself as an inline `[0 x T]` array, writing into the struct.
+fn emit_ptr_field_elem_addr(s: *EmitterState, field_slot: i32, field: *StructField, kind: i32, idx: i32) -> i32
+    let base: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, base)
+    emit_str(s, c" = load ptr, ptr ")
+    emit_reg(s, field_slot)
+    emit_str(s, c"\n")
+    let elem_ptr: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, elem_ptr)
+    emit_str(s, c" = getelementptr ")
+    if kind == TYPE_STRUCT
+        emit_llvm_type_struct(s, TYPE_STRUCT, field.field_type_name, field.field_type_name_len)
+    else
+        emit_str(s, array_elem_llvm(kind))
+    emit_str(s, c", ptr ")
+    emit_reg(s, base)
+    emit_str(s, c", i64 ")
+    emit_reg(s, idx)
+    emit_str(s, c"\n")
+    return elem_ptr
+
 fn emit_llvm_type(s: *EmitterState, t: i32)
     if t == TYPE_VOID
         emit_str(s, c"void")

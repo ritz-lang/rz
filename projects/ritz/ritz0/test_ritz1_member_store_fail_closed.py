@@ -16,7 +16,8 @@ Two consequences, both covered here:
 
 `x.f[i] = v` where `x.f` is not an inline array used to fall through to
 emit_assign's generic deref store, which evaluates `x.f[i]` as a value and
-stores THROUGH it (segfault). It now fails closed until #1596 lowers it.
+stores THROUGH it (segfault). Pointer fields are lowered since #1596; any
+other shape still fails closed.
 """
 
 import os
@@ -152,22 +153,23 @@ pub fn main() -> i32
 """,
         INDEXED,
     ),
-    # Valid fields, but a pointer field indexed through a nested chain:
-    # used to store THROUGH the loaded element value (segfault). #1596.
-    "nested_ptr_field_index": (
+    # A pointer field whose pointee ritz1 cannot address at a known width.
+    # (Integer, pointer and struct pointees are lowered since #1596 — see
+    # test_ritz1_ptr_field_index.py.)
+    "nested_bool_ptr_field_index": (
         """\
 struct B
-    data: *i32
+    data: *bool
 
 struct A
     b: B
 
 pub fn main() -> i32
-    var buf: [4]i32
+    var buf: [4]bool
     var a: A
     a.b.data = @buf[0]
-    a.b.data[2] = 42
-    return buf[2]
+    a.b.data[2] = true
+    return 0
 """,
         INDEXED,
     ),

@@ -926,13 +926,16 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
                             emit_reg(s, elem_ptr)
                             emit_str(s, c"\n")
                         return
+                    # AGAST #1596: `x.f[i] = v` with `f: *T` / `**T` —
+                    # store THROUGH the pointer held in the field.
+                    if emit_ptr_field_index_store(s, member_result.reg, field, target_expr.right, stmt.assign_value) == 1
+                        return
                 # AGAST #1439: `x.f[i] = v` whose member did not resolve, or
-                # whose field is not an inline array, must not fall through
-                # to the generic deref store below: that path evaluates
-                # `x.f[i]` as a VALUE and stores through it as an address
-                # (segfault or a wild write).  Pointer-field indexing is
-                # AGAST #1596; until it is lowered properly, refuse
-                # rather than miscompile.
+                # whose field is neither an inline array nor a pointer with
+                # an addressable pointee, must not fall through to the
+                # generic deref store below: that path evaluates `x.f[i]`
+                # as a VALUE and stores through it as an address (segfault
+                # or a wild write).  Refuse rather than miscompile.
                 emit_ir_error(s, c"unhandled indexed EXPR_MEMBER in assignment")
                 return
 
@@ -1859,6 +1862,37 @@ fn emit_index_assign_ptr_store(s: *EmitterState, stmt: *Stmt, base_ptr: i32, bas
         emit_reg(s, elem_ptr)
         emit_str(s, c"\n")
 
+# AGAST #1596: `x.f[i] = v` where `f` is a pointer field (`*T` / `**T`):
+# load the pointer from the field slot `field_slot`, GEP by the pointee, and
+# store `v` at the pointee's width. Returns 0 WITHOUT emitting anything when
+# the pointee cannot be addressed at a known width (bool, floats, unrecorded)
+# so the caller can fail closed.
+fn emit_ptr_field_index_store(s: *EmitterState, field_slot: i32, field: *StructField, idx_expr: *Expr, val_expr: *Expr) -> i32
+    let kind: i32 = ptr_field_elem_kind(field)
+    if kind == TYPE_UNKNOWN
+        return 0
+    let idx: i32 = emit_expr(s, idx_expr)
+    let val: i32 = emit_expr(s, val_expr)
+    let elem_ptr: i32 = emit_ptr_field_elem_addr(s, field_slot, field, kind, idx)
+    if kind == TYPE_STRUCT
+        # Struct element: the value register is a `%T` aggregate (#188).
+        emit_str(s, c"  store ")
+        emit_llvm_type_struct(s, TYPE_STRUCT, field.field_type_name, field.field_type_name_len)
+        emit_str(s, c" ")
+        emit_reg(s, val)
+    else
+        # Narrow the i64 value to the element width (trunc / inttoptr).
+        let elem_ty: *u8 = array_elem_llvm(kind)
+        let narrow: i32 = emit_array_elem_narrow(s, val, kind, elem_ty)
+        emit_str(s, c"  store ")
+        emit_str(s, elem_ty)
+        emit_str(s, c" ")
+        emit_reg(s, narrow)
+    emit_str(s, c", ptr ")
+    emit_reg(s, elem_ptr)
+    emit_str(s, c"\n")
+    return 1
+
 # AGAST #1439: `name.field = v` / `name.field[i] = v` that the fast
 # STMT_LOCAL_FIELD_ASSIGN / STMT_LOCAL_FIELD_INDEX_ASSIGN lowering could not
 # resolve (no such local or param, unknown struct, unknown field).  Those arms
@@ -2566,7 +2600,16 @@ fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
             let st: *StructDef = find_struct(s, loc.type_name, loc.type_name_len)
             if st != null
                 let field_idx: i32 = find_field_index(st, stmt.assign_target, stmt.assign_target_len)
+                # AGAST #1596: a pointer field is not an inline array — the
+                # arm below GEP'd the field slot itself and wrote INTO the
+                # struct. Leave lfia_done = 0 so the fallback lowers it via
+                # emit_assign, which loads the pointer and indexes through it.
+                var lfia_field_is_ptr: i32 = 0
                 if field_idx >= 0
+                    let pf: *StructField = get_field_type(st, field_idx)
+                    if pf.field_type == TYPE_PTR or pf.field_type == TYPE_PTR_PTR
+                        lfia_field_is_ptr = 1
+                if field_idx >= 0 and lfia_field_is_ptr == 0
                     let field: *StructField = get_field_type(st, field_idx)
                     lfia_done = 1
                     # Get the base pointer - differs for TYPE_PTR/TYPE_REF/TYPE_MUT_REF vs TYPE_STRUCT
