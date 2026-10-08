@@ -2,8 +2,18 @@
 #
 # High-level filesystem operations built on sys.ritz syscalls.
 #
-# String-based API with Result error handling for safety.
-# Legacy *u8 functions kept for backward compatibility.
+# One path API over `StrView` (AGAST #1477). A "..." literal is a StrView;
+# a String passes string_as_view(@s); a C string passes strview_from_cstr(p).
+#
+#   predicates   path_exists / is_dir / is_file / is_symlink    -> bool
+#   queries      stat / lstat -> Result<Stat, i32>, file_size -> Result<i64, i32>
+#   whole files  read_file -> Result<String, i32>, write_file -> Result<i64, i32>
+#   mutation     mkdir / unlink / rmdir -> Result<i32, i32> (Ok(0)), copy_file
+#   paths        path_join -> String; path_basename / dirname / extension / stem
+#                -> StrView, a view into the input (no allocation)
+#
+# Every Err carries the positive kernel errno (2 = ENOENT, 17 = EEXIST, ...).
+# A path of FS_PATH_MAX bytes or more fails with ENAMETOOLONG (36).
 #
 # Note: Stat struct and STAT_SIZE are defined in ritzlib/sys.ritz
 
@@ -144,36 +154,49 @@ pub fn mode_is_socket(mode: i32) -> i32
     return (type_bits == 12) as i32
 
 # ============================================================================
-# Path checking
+# Path predicates -> bool
 # ============================================================================
+# These use lstat(2): a symlink is reported as itself, never as its target, so
+# is_dir(link-to-dir) is false and a recursive walk does not follow links.
 
-pub fn path_exists(path: *u8) -> i32
-    var statbuf: [144]u8
-    return (sys_lstat(path, @statbuf[0]) == 0) as i32
+# st_mode of `path` (lstat), or -1 if it cannot be statted.
+fn fs_lstat_mode(path: @StrView) -> i32
+    var r: Result<Stat, i32> = fs_stat_impl(path, 0)
+    match r
+        Ok(st) => st.st_mode
+        Err(_) => -1
 
-pub fn is_directory(path: *u8) -> i32
-    var statbuf: [144]u8
-    if sys_lstat(path, @statbuf[0]) != 0
-        return 0
-    return mode_is_dir(stat_get_mode(@statbuf[0]))
+# True if anything (file, directory, dangling symlink, ...) exists at `path`.
+pub fn path_exists(path: StrView) -> bool
+    fs_lstat_mode(@path) >= 0
 
-pub fn is_regular_file(path: *u8) -> i32
-    var statbuf: [144]u8
-    if sys_lstat(path, @statbuf[0]) != 0
-        return 0
-    return mode_is_file(stat_get_mode(@statbuf[0]))
+pub fn is_dir(path: StrView) -> bool
+    let mode: i32 = fs_lstat_mode(@path)
+    mode >= 0 and mode_is_dir(mode) != 0
 
-pub fn is_symlink(path: *u8) -> i32
-    var statbuf: [144]u8
-    if sys_lstat(path, @statbuf[0]) != 0
-        return 0
-    return mode_is_link(stat_get_mode(@statbuf[0]))
+pub fn is_file(path: StrView) -> bool
+    let mode: i32 = fs_lstat_mode(@path)
+    mode >= 0 and mode_is_file(mode) != 0
 
-pub fn file_size(path: *u8) -> i64
-    var statbuf: [144]u8
-    if sys_lstat(path, @statbuf[0]) != 0
-        return -1
-    return stat_get_size(@statbuf[0])
+pub fn is_symlink(path: StrView) -> bool
+    let mode: i32 = fs_lstat_mode(@path)
+    mode >= 0 and mode_is_link(mode) != 0
+
+# Size in bytes of `path` (lstat: a symlink's own size).
+pub fn file_size(path: StrView) -> Result<i64, i32>
+    let n: i64 = fs_lstat_size(@path)
+    if n < 0
+        return Err(-(n as i32))
+    Ok(n)
+
+# st_size of `path` (lstat), or -errno. A scalar helper rather than a tail
+# `match` building Ok/Err: ritz1 types the phi of a match that yields an
+# aggregate as i64 and emits invalid IR (#1682).
+fn fs_lstat_size(path: @StrView) -> i64
+    var r: Result<Stat, i32> = fs_stat_impl(path, 0)
+    match r
+        Ok(st) => st.st_size
+        Err(e) => -(e as i64)
 
 # ============================================================================
 # Dirent helpers (getdents64 structure)
@@ -224,376 +247,194 @@ pub fn dirent_get_name(entry: *u8) -> *u8
 # Note: DT_* constants are defined in ritzlib/sys.ritz
 
 # ============================================================================
-# Path utilities
+# Path utilities (pure string work; no syscalls)
 # ============================================================================
 
-pub fn path_join(dir: *u8, name: *u8, buf: *u8) -> i64
-    var pos: i64 = 0
-    var i: i64 = 0
+# Join `dir` and `name` with exactly one '/' between them, into a new String.
+# An empty `dir` yields `name` unchanged; a `dir` ending in '/' adds none.
+pub fn path_join(dir: StrView, name: StrView) -> String
+    var r: String = string_with_cap(dir.len + name.len + 2)
+    string_push_bytes(@r, dir.ptr, dir.len)
+    if dir.len > 0 and *(dir.ptr + dir.len - 1) != '/'
+        string_push(@r, '/')
+    string_push_bytes(@r, name.ptr, name.len)
+    r
 
-    # Copy directory
-    while *(dir + i) != 0
-        *(buf + pos) = *(dir + i)
-        pos += 1
-        i += 1
+# Index of the last '/' in `path`, or -1.
+fn fs_last_slash(path: @StrView) -> i64
+    var last: i64 = -1
+    for i in 0..path.len
+        if *(path.ptr + i) == '/'
+            last = i
+    last
 
-    # Add separator if needed
-    if pos > 0 and *(buf + pos - 1) != 47
-        *(buf + pos) = 47  # '/'
-        pos += 1
-
-    # Copy name
-    i = 0
-    while *(name + i) != 0
-        *(buf + pos) = *(name + i)
-        pos += 1
-        i += 1
-
-    *(buf + pos) = 0
-    return pos
-
-pub fn path_basename(path: *u8) -> *u8
-    var last_slash: *u8 = null
-    var i: i64 = 0
-    while *(path + i) != 0
-        if *(path + i) == '/'
-            last_slash = path + i
-        i += 1
-    if last_slash != null
-        return last_slash + 1
-    return path
-
-pub fn path_dirname(path: *u8, buf: *u8) -> *u8
-    var last_slash: i64 = -1
-    var i: i64 = 0
-    while *(path + i) != 0
-        if *(path + i) == '/'
-            last_slash = i
-        i += 1
-
-    if last_slash < 0
-        # No slash, dirname is "."
-        *buf = 46
-        *(buf + 1) = 0
-        return buf
-
-    if last_slash == 0
-        # Root
-        *buf = 47
-        *(buf + 1) = 0
-        return buf
-
-    # Copy up to last slash
-    for i in 0..last_slash
-        *(buf + i) = *(path + i)
-    *(buf + i) = 0
-    return buf
-
-# ============================================================================
-# Copy file helper
-# ============================================================================
-
-pub fn copy_file(src: *u8, dest: *u8, mode: i32) -> i32
-    let src_fd: i32 = sys_open(src, O_RDONLY)
-    if src_fd < 0
-        return -1
-
-    # O_WRONLY | O_CREAT | O_TRUNC = 1 + 64 + 512 = 577
-    let dest_fd: i32 = sys_open3(dest, 577, mode)
-    if dest_fd < 0
-        sys_close(src_fd)
-        return -1
-
-    var buf: [8192]u8
-    var result: i32 = 0
-
-    loop
-        let nread: i64 = sys_read(src_fd, @buf[0], 8192)
-        if nread < 0
-            result = -1
-            break
-        if nread == 0
-            break
-
-        var written: i64 = 0
-        while written < nread
-            let n: i64 = sys_write(dest_fd, @buf[0] + written, nread - written)
-            if n <= 0
-                result = -1
-                break
-            written += n
-        if result != 0
-            break
-
-    sys_close(src_fd)
-    sys_close(dest_fd)
-    return result
-
-# ============================================================================
-# String-based path utilities (no null-termination dependency)
-# ============================================================================
-
-# Join two path components into a new String.
-pub fn path_join_string(dir: *String, name: *String) -> String
-    var result: String = string_clone(dir)
-
-    # Add separator if needed
-    let dir_len: i64 = string_len(dir)
-    if dir_len > 0 and string_char_at(dir, dir_len - 1) != 47  # '/'
-        string_push(@result, 47)
-
-    # Append name
-    string_push_string(@result, name)
-    return result
-
-# Get the filename component from a path (after last '/').
-pub fn path_basename_string(path: *String) -> String
-    let len: i64 = string_len(path)
-    var last_slash: i64 = -1
-
-    for i in 0..len
-        if string_char_at(path, i) == '/'  # '/'
-            last_slash = i
-
-    if last_slash < 0
-        return string_clone(path)
-
-    return string_slice(path, last_slash + 1, len)
-
-# Get the directory component from a path (before last '/').
-pub fn path_dirname_string(path: *String) -> String
-    let len: i64 = string_len(path)
-    var last_slash: i64 = -1
-
-    for i in 0..len
-        if string_char_at(path, i) == '/'  # '/'
-            last_slash = i
-
-    if last_slash < 0
-        # No slash - return "."
-        return string_from(".")
-
-    if last_slash == 0
-        # Root - return "/"
-        return string_from("/")
-
-    return string_slice(path, 0, last_slash)
-
-# Get file extension (after last '.', or empty if none).
-pub fn path_extension_string(path: *String) -> String
-    let len: i64 = string_len(path)
+# Index of the dot that starts the extension of `path`'s final component, or
+# -1 if it has none. A dot that opens the component (".gitignore") is not one.
+fn fs_ext_dot(path: @StrView) -> i64
     var last_dot: i64 = -1
     var last_slash: i64 = -1
-
-    for i in 0..len
-        let c: u8 = string_char_at(path, i)
-        if c == '/'  # '/'
+    for i in 0..path.len
+        let c: u8 = *(path.ptr + i)
+        if c == '/'
             last_slash = i
-        else if c == '.'  # '.'
+        else if c == '.'
             last_dot = i
-
-    # No dot, or dot before last slash, or dot at start of basename
     if last_dot < 0 or last_dot < last_slash or last_dot == last_slash + 1
-        return string_new()
+        return -1
+    last_dot
 
-    return string_slice(path, last_dot + 1, len)
+# The final component: everything after the last '/' ("/a/b.txt" -> "b.txt").
+# A view into `path`.
+pub fn path_basename(path: StrView) -> StrView
+    let slash: i64 = fs_last_slash(@path)
+    if slash < 0
+        return path
+    strview_from_ptr(path.ptr + slash + 1, path.len - slash - 1)
 
-# Strip extension from path.
-pub fn path_stem_string(path: *String) -> String
-    let len: i64 = string_len(path)
-    var last_dot: i64 = -1
-    var last_slash: i64 = -1
+# Everything before the last '/' ("/a/b.txt" -> "/a"); "/" for a top-level
+# path and "." when there is no '/'. A view into `path` (or the literal ".").
+pub fn path_dirname(path: StrView) -> StrView
+    let slash: i64 = fs_last_slash(@path)
+    if slash < 0
+        return "."
+    if slash == 0
+        return strview_from_ptr(path.ptr, 1)
+    strview_from_ptr(path.ptr, slash)
 
-    for i in 0..len
-        let c: u8 = string_char_at(path, i)
-        if c == '/'  # '/'
-            last_slash = i
-        else if c == '.'  # '.'
-            last_dot = i
+# The extension without its dot ("/a/b.txt" -> "txt"), or an empty view.
+pub fn path_extension(path: StrView) -> StrView
+    let dot: i64 = fs_ext_dot(@path)
+    if dot < 0
+        return strview_from_ptr(path.ptr + path.len, 0)
+    strview_from_ptr(path.ptr + dot + 1, path.len - dot - 1)
 
-    # No dot, or dot before last slash, or dot at start of basename
-    if last_dot < 0 or last_dot < last_slash or last_dot == last_slash + 1
-        return string_clone(path)
-
-    return string_slice(path, 0, last_dot)
+# `path` without its extension ("/a/b.txt" -> "/a/b"); `path` if it has none.
+pub fn path_stem(path: StrView) -> StrView
+    let dot: i64 = fs_ext_dot(@path)
+    if dot < 0
+        return path
+    strview_from_ptr(path.ptr, dot)
 
 # ============================================================================
-# File operations with String paths and Result types
+# File operations -> Result (Err = positive errno)
 # ============================================================================
 
-# Error codes for filesystem operations
-const FS_ERR_NOT_FOUND: i32 = 1
-const FS_ERR_PERMISSION: i32 = 2
-const FS_ERR_IO: i32 = 3
-const FS_ERR_NOT_DIR: i32 = 4
-const FS_ERR_IS_DIR: i32 = 5
-const FS_ERR_EXISTS: i32 = 6
-const FS_ERR_UNKNOWN: i32 = 99
+const FS_EIO: i32 = 5
 
-# Check if path exists (String version).
-pub fn path_exists_string(path: *String) -> i32
-    var statbuf: [144]u8
-    # Need to null-terminate for syscall
-    let cstr: *u8 = string_as_ptr(path)
-    return (sys_lstat(cstr, @statbuf[0]) == 0) as i32
+# open(2) a StrView path. Returns the fd, or -errno.
+fn fs_open(path: @StrView, flags: i32, mode: i32) -> i32
+    var cpath: [4096]u8
+    let perr: i32 = fs_path_cstr(path, @cpath[0])
+    if perr != 0
+        return -perr
+    sys_open3(@cpath[0], flags, mode)
 
-# Check if path is a directory (String version).
-pub fn is_directory_string(path: *String) -> i32
-    var statbuf: [144]u8
-    let cstr: *u8 = string_as_ptr(path)
-    if sys_lstat(cstr, @statbuf[0]) != 0
-        return 0
-    return mode_is_dir(stat_get_mode(@statbuf[0]))
+# Write all `len` bytes at `data` to `fd`. Returns 0, or a positive errno.
+fn fs_write_all(fd: i32, data: *u8, len: i64) -> i32
+    var written: i64 = 0
+    while written < len
+        let n: i64 = sys_write(fd, data + written, len - written)
+        if n < 0
+            return -(n as i32)
+        if n == 0
+            return FS_EIO
+        written += n
+    0
 
-# Check if path is a regular file (String version).
-pub fn is_regular_file_string(path: *String) -> i32
-    var statbuf: [144]u8
-    let cstr: *u8 = string_as_ptr(path)
-    if sys_lstat(cstr, @statbuf[0]) != 0
-        return 0
-    return mode_is_file(stat_get_mode(@statbuf[0]))
-
-# Get file size with Result error handling.
-pub fn file_size_string(path: *String) -> Result<i64, i32>
-    var statbuf: [144]u8
-    let cstr: *u8 = string_as_ptr(path)
-    if sys_lstat(cstr, @statbuf[0]) != 0
-        return Err(FS_ERR_NOT_FOUND)
-    return Ok(stat_get_size(@statbuf[0]))
-
-# Read entire file contents into a String.
-# Returns error code (0 = success, negative = error).
-# TODO: Migrate to Result<String, i32> now that struct-in-enum works.
-pub fn read_file_string(path: *String, out: *String) -> i32
-    let cstr: *u8 = string_as_ptr(path)
-    let fd: i32 = sys_open(cstr, O_RDONLY)
+# The whole contents of the file at `path`.
+pub fn read_file(path: StrView) -> Result<String, i32>
+    let fd: i32 = fs_open(@path, O_RDONLY, 0)
     if fd < 0
-        return -FS_ERR_NOT_FOUND
-
-    # Get file size first
-    var statbuf: [144]u8
-    if sys_fstat(fd, @statbuf[0]) != 0
-        sys_close(fd)
-        return -FS_ERR_IO
-
-    # Ensure capacity
-    string_clear(out)
-
-    # Read in chunks
+        return Err(-fd)
+    var out: String = string_new()
     var buf: [4096]u8
     loop
         let n: i64 = sys_read(fd, @buf[0], 4096)
         if n < 0
             sys_close(fd)
-            return -FS_ERR_IO
+            string_drop(@out)
+            return Err(-(n as i32))
         if n == 0
             break
-        for i in 0..n
-            string_push(out, buf[i])
-
+        string_push_bytes(@out, @buf[0], n)
     sys_close(fd)
-    return 0
+    Ok(out)
 
-# Write string contents to a file, creating it if needed.
-# Returns Err on permission error or write failure.
-pub fn write_file_string(path: *String, content: *String) -> Result<i64, i32>
-    let cstr: *u8 = string_as_ptr(path)
-    # O_WRONLY | O_CREAT | O_TRUNC = 1 + 64 + 512 = 577
-    let fd: i32 = sys_open3(cstr, 577, 420)  # 0644 octal = 420 decimal
+# Create or truncate `path` (mode 0644) and write `content` to it.
+# Ok carries the number of bytes written.
+pub fn write_file(path: StrView, content: StrView) -> Result<i64, i32>
+    # O_WRONLY | O_CREAT | O_TRUNC = 1 + 64 + 512 = 577; 0644 = 420
+    let fd: i32 = fs_open(@path, 577, 420)
     if fd < 0
-        return Err(FS_ERR_PERMISSION)
-
-    let data: *u8 = string_as_ptr(content)
-    let len: i64 = string_len(content)
-    var written: i64 = 0
-
-    while written < len
-        let n: i64 = sys_write(fd, data + written, len - written)
-        if n <= 0
-            sys_close(fd)
-            return Err(FS_ERR_IO)
-        written += n
-
+        return Err(-fd)
+    let werr: i32 = fs_write_all(fd, content.ptr, content.len)
     sys_close(fd)
-    return Ok(written)
+    if werr != 0
+        return Err(werr)
+    Ok(content.len)
 
-# Create a directory with the given mode.
-# Returns 0 on success, or negative error code.
-pub fn mkdir_string(path: *String, mode: i32) -> i32
-    let cstr: *u8 = string_as_ptr(path)
-    let ret: i32 = sys_mkdir(cstr, mode)
-    if ret < 0
-        if ret == -17  # EEXIST
-            return -FS_ERR_EXISTS
-        return -FS_ERR_PERMISSION
-    return 0
-
-# Remove a file.
-# Returns 0 on success, or negative error code.
-pub fn unlink_string(path: *String) -> i32
-    let cstr: *u8 = string_as_ptr(path)
-    let ret: i32 = sys_unlink(cstr)
-    if ret < 0
-        if ret == -2  # ENOENT
-            return -FS_ERR_NOT_FOUND
-        if ret == -21  # EISDIR
-            return -FS_ERR_IS_DIR
-        return -FS_ERR_PERMISSION
-    return 0
-
-# Remove an empty directory.
-# Returns 0 on success, or negative error code.
-pub fn rmdir_string(path: *String) -> i32
-    let cstr: *u8 = string_as_ptr(path)
-    let ret: i32 = sys_rmdir(cstr)
-    if ret < 0
-        if ret == -2  # ENOENT
-            return -FS_ERR_NOT_FOUND
-        if ret == -20  # ENOTDIR
-            return -FS_ERR_NOT_DIR
-        return -FS_ERR_PERMISSION
-    return 0
-
-# Copy a file to a new location.
-pub fn copy_file_string(src: *String, dest: *String, mode: i32) -> Result<i64, i32>
-    let src_cstr: *u8 = string_as_ptr(src)
-    let dest_cstr: *u8 = string_as_ptr(dest)
-
-    let src_fd: i32 = sys_open(src_cstr, O_RDONLY)
+# Copy `src` to `dest` (created or truncated with `mode`).
+# Ok carries the number of bytes copied. `dest` is not created if `src`
+# cannot be opened.
+pub fn copy_file(src: StrView, dest: StrView, mode: i32) -> Result<i64, i32>
+    let src_fd: i32 = fs_open(@src, O_RDONLY, 0)
     if src_fd < 0
-        return Err(FS_ERR_NOT_FOUND)
-
-    # O_WRONLY | O_CREAT | O_TRUNC = 577
-    let dest_fd: i32 = sys_open3(dest_cstr, 577, mode)
+        return Err(-src_fd)
+    let dest_fd: i32 = fs_open(@dest, 577, mode)
     if dest_fd < 0
         sys_close(src_fd)
-        return Err(FS_ERR_PERMISSION)
+        return Err(-dest_fd)
 
     var buf: [8192]u8
     var total: i64 = 0
-
+    var err: i32 = 0
     loop
         let nread: i64 = sys_read(src_fd, @buf[0], 8192)
         if nread < 0
-            sys_close(src_fd)
-            sys_close(dest_fd)
-            return Err(FS_ERR_IO)
+            err = -(nread as i32)
+            break
         if nread == 0
             break
-
-        var written: i64 = 0
-        while written < nread
-            let n: i64 = sys_write(dest_fd, @buf[0] + written, nread - written)
-            if n <= 0
-                sys_close(src_fd)
-                sys_close(dest_fd)
-                return Err(FS_ERR_IO)
-            written += n
-        total += written
+        err = fs_write_all(dest_fd, @buf[0], nread)
+        if err != 0
+            break
+        total += nread
 
     sys_close(src_fd)
     sys_close(dest_fd)
-    return Ok(total)
+    if err != 0
+        return Err(err)
+    Ok(total)
+
+# Map a raw syscall return (0 or -errno) to Result<i32, i32>.
+fn fs_unit(ret: i32) -> Result<i32, i32>
+    if ret < 0
+        return Err(-ret)
+    Ok(0)
+
+# Create directory `path` with `mode` (e.g. 493 = 0755). EEXIST if present.
+pub fn mkdir(path: StrView, mode: i32) -> Result<i32, i32>
+    var cpath: [4096]u8
+    let perr: i32 = fs_path_cstr(@path, @cpath[0])
+    if perr != 0
+        return Err(perr)
+    fs_unit(sys_mkdir(@cpath[0], mode))
+
+# Remove the (non-directory) entry at `path`.
+pub fn unlink(path: StrView) -> Result<i32, i32>
+    var cpath: [4096]u8
+    let perr: i32 = fs_path_cstr(@path, @cpath[0])
+    if perr != 0
+        return Err(perr)
+    fs_unit(sys_unlink(@cpath[0]))
+
+# Remove the empty directory at `path`.
+pub fn rmdir(path: StrView) -> Result<i32, i32>
+    var cpath: [4096]u8
+    let perr: i32 = fs_path_cstr(@path, @cpath[0])
+    if perr != 0
+        return Err(perr)
+    fs_unit(sys_rmdir(@cpath[0]))
 
 # ============================================================================
 # Directory Iteration
@@ -601,7 +442,7 @@ pub fn copy_file_string(src: *String, dest: *String, mode: i32) -> Result<i64, i
 # High-level directory iteration API using getdents64.
 #
 # Usage:
-#     var dir: DirIter = dir_open(c"/path/to/dir")
+#     var dir: DirIter = dir_open("/path/to/dir")
 #     while dir_next(@dir)
 #         let e: DirEntry = dir_entry(@dir)   # e.ino, e.kind, e.name (StrView)
 #         # process entry...
@@ -620,18 +461,13 @@ pub struct DirIter
 
 # Open a directory for iteration.
 # Returns a DirIter - check with dir_valid() before using.
-pub fn dir_open(path: *u8) -> DirIter
+pub fn dir_open(path: StrView) -> DirIter
     var dir: DirIter
-    dir.fd = sys_open(path, O_RDONLY + O_DIRECTORY)
+    dir.fd = fs_open(@path, O_RDONLY + O_DIRECTORY, 0)
     dir.buf_pos = 0
     dir.buf_len = 0
     dir.entry = null
     dir
-
-# Open a directory for iteration (String version).
-pub fn dir_open_string(path: *String) -> DirIter
-    let cstr: *u8 = string_as_ptr(path)
-    dir_open(cstr)
 
 # Check if directory was opened successfully.
 pub fn dir_valid(dir: *DirIter) -> i32

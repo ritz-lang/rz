@@ -1,0 +1,226 @@
+# Tests for fs.ritz filesystem operations over StrView paths (AGAST #1477).
+#
+# Predicates (path_exists/is_dir/is_file/is_symlink) return bool. Fallible
+# operations return Result whose Err is the positive kernel errno, as stat()
+# does (#1476): 2 = ENOENT, 17 = EEXIST.
+#
+# Each test owns its fixtures under /tmp and removes them, so the verdict does
+# not depend on the cwd build.py runs the binary from.
+
+import ritzlib.sys
+import ritzlib.fs
+import ritzlib.string
+import ritzlib.strview
+import ritzlib.result
+
+fn i64_err(r: *Result<i64, i32>) -> i32
+    match *r
+        Ok(_) => 0
+        Err(e) => e
+
+fn i64_ok(r: *Result<i64, i32>) -> i64
+    match *r
+        Ok(v) => v
+        Err(_) => -1
+
+fn unit_err(r: *Result<i32, i32>) -> i32
+    match *r
+        Ok(_) => 0
+        Err(e) => e
+
+fn string_err(r: *Result<String, i32>) -> i32
+    match *r
+        Ok(_) => 0
+        Err(e) => e
+
+# 1 if `r` is Ok and its String equals `want`.
+fn string_ok_is(r: *Result<String, i32>, want: StrView) -> i32
+    match *r
+        Ok(s) => string_eq(@s, want) as i32
+        Err(_) => 0
+
+# ============================================================================
+# Predicates -> bool
+# ============================================================================
+
+[[test]]
+fn test_path_exists() -> i32
+    if not path_exists("/tmp")
+        return 1
+    if path_exists("/nonexistent/path/that/should/not/exist")
+        return 2
+    0
+
+[[test]]
+fn test_path_exists_uses_view_length() -> i32
+    # "/tmp" followed by bytes outside the view: the kernel must see "/tmp".
+    let whole: StrView = "/tmpNOPE_NOT_A_DIR"
+    if not path_exists(strview_slice(@whole, 0, 4))
+        return 1
+    0
+
+[[test]]
+fn test_is_dir() -> i32
+    if not is_dir("/tmp")
+        return 1
+    if is_dir("/nonexistent/x")
+        return 2
+    0
+
+[[test]]
+fn test_is_file() -> i32
+    let path: StrView = "/tmp/ritzlib_test_fs_ops_file.tmp"
+    var w: Result<i64, i32> = write_file(path, "x")
+    if i64_err(@w) != 0
+        return 1
+    if not is_file(path)
+        return 2
+    # A directory must not satisfy the predicate.
+    if is_file("/tmp")
+        return 3
+    unlink(path)
+    if is_file(path)
+        return 4
+    0
+
+[[test]]
+fn test_is_symlink() -> i32
+    let link: StrView = "/tmp/ritzlib_test_fs_ops_link.tmp"
+    unlink(link)
+    if sys_symlink(c"/tmp", c"/tmp/ritzlib_test_fs_ops_link.tmp") != 0
+        return 1
+    if not is_symlink(link)
+        return 2
+    # Predicates use lstat: the link itself is not a directory.
+    if is_dir(link)
+        return 3
+    if is_symlink("/tmp")
+        return 4
+    unlink(link)
+    0
+
+# ============================================================================
+# file_size -> Result<i64, i32>
+# ============================================================================
+
+[[test]]
+fn test_file_size_ok() -> i32
+    let path: StrView = "/tmp/ritzlib_test_fs_ops_size.tmp"
+    var w: Result<i64, i32> = write_file(path, "12345")
+    if i64_err(@w) != 0
+        return 1
+    var r: Result<i64, i32> = file_size(path)
+    unlink(path)
+    if i64_ok(@r) != 5
+        return 2
+    0
+
+[[test]]
+fn test_file_size_err_is_errno() -> i32
+    var r: Result<i64, i32> = file_size("/nonexistent/path")
+    if i64_err(@r) != 2
+        return 1
+    0
+
+# ============================================================================
+# read_file -> Result<String, i32>, write_file -> Result<i64, i32>
+# ============================================================================
+
+[[test]]
+fn test_write_then_read_file() -> i32
+    let path: StrView = "/tmp/ritzlib_test_fs_ops_rw.tmp"
+    var w: Result<i64, i32> = write_file(path, "Hello, Result!")
+    if i64_ok(@w) != 14
+        return 1
+    var r: Result<String, i32> = read_file(path)
+    unlink(path)
+    if string_ok_is(@r, "Hello, Result!") == 0
+        return 2
+    0
+
+[[test]]
+fn test_read_file_missing_is_enoent() -> i32
+    var r: Result<String, i32> = read_file("/tmp/ritzlib_does_not_exist_xyz.tmp")
+    if string_err(@r) != 2
+        return 1
+    0
+
+[[test]]
+fn test_write_file_bad_dir_is_enoent() -> i32
+    var w: Result<i64, i32> = write_file("/nonexistent/dir/f", "x")
+    if i64_err(@w) != 2
+        return 1
+    0
+
+# ============================================================================
+# mkdir / rmdir / unlink -> Result<i32, i32>
+# ============================================================================
+
+[[test]]
+fn test_mkdir_rmdir() -> i32
+    let path: StrView = "/tmp/ritzlib_test_fs_ops_dir"
+    rmdir(path)
+    var mk: Result<i32, i32> = mkdir(path, 493)  # 0755
+    if unit_err(@mk) != 0
+        return 1
+    if not is_dir(path)
+        return 2
+    var again: Result<i32, i32> = mkdir(path, 493)
+    if unit_err(@again) != 17
+        return 3
+    var rm: Result<i32, i32> = rmdir(path)
+    if unit_err(@rm) != 0
+        return 4
+    if path_exists(path)
+        return 5
+    0
+
+[[test]]
+fn test_unlink_missing_is_enoent() -> i32
+    var r: Result<i32, i32> = unlink("/tmp/ritzlib_does_not_exist_xyz.tmp")
+    if unit_err(@r) != 2
+        return 1
+    0
+
+# ============================================================================
+# copy_file -> Result<i64, i32>
+# ============================================================================
+
+[[test]]
+fn test_copy_file() -> i32
+    let src: StrView = "/tmp/ritzlib_test_fs_ops_src.tmp"
+    let dst: StrView = "/tmp/ritzlib_test_fs_ops_dst.tmp"
+    write_file(src, "Content to copy")
+    var c: Result<i64, i32> = copy_file(src, dst, 420)  # 0644
+    if i64_ok(@c) != 15
+        return 1
+    var r: Result<String, i32> = read_file(dst)
+    unlink(src)
+    unlink(dst)
+    if string_ok_is(@r, "Content to copy") == 0
+        return 2
+    0
+
+[[test]]
+fn test_copy_file_missing_src_is_enoent() -> i32
+    var c: Result<i64, i32> = copy_file("/tmp/ritzlib_does_not_exist_xyz.tmp", "/tmp/ritzlib_test_fs_ops_never.tmp", 420)
+    if i64_err(@c) != 2
+        return 1
+    if path_exists("/tmp/ritzlib_test_fs_ops_never.tmp")
+        return 2
+    0
+
+# ============================================================================
+# dir_open(StrView)
+# ============================================================================
+
+[[test]]
+fn test_dir_open_view() -> i32
+    var dir: DirIter = dir_open("/tmp")
+    if dir_valid(@dir) == 0
+        return 1
+    dir_close(@dir)
+    var bad: DirIter = dir_open("/nonexistent/x")
+    if dir_valid(@bad) != 0
+        return 2
+    0

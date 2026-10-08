@@ -455,7 +455,7 @@ struct String
 | `string_cap` | `fn(s: @String) -> i64` | Get capacity |
 | `string_is_empty` | `fn(s: @String) -> i32` | Check if empty |
 | `string_as_ptr` | `fn(s: @&String) -> *u8` | Get null-terminated C string |
-| `string_as_view` | `fn(s: @String) -> StrView` | Borrow the bytes as a StrView (no copy); how a String prints in `print`/`eprint` interpolation |
+| `string_as_view` | `fn(s: @String) -> StrView` | Borrow the bytes as a StrView (no copy), valid until `s` is modified or dropped; how a String prints in `print`/`eprint` interpolation or reaches a StrView API |
 | `string_get` | `fn(s: @String, idx: i64) -> u8` | Get byte at index |
 | `string_char_at` | `fn(s: @String, idx: i64) -> u8` | Get char at index |
 
@@ -1093,15 +1093,22 @@ High-level console I/O functions.
 
 High-level filesystem operations.
 
-**Path Checking**:
+There is one path API, and every path is a `StrView`. A `"..."` literal is
+already a StrView; a `String` passes `string_as_view(@s)`; a C string passes
+`strview_from_cstr(p)`. Every `Err` holds the positive kernel errno (`2` =
+ENOENT, `17` = EEXIST, ...). A path of 4096 bytes or more fails with `36`
+(ENAMETOOLONG) without making a syscall.
+
+**Path Checking** (lstat: a symlink is reported as itself, so `is_dir` of a
+link to a directory is `false`):
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `path_exists` | `fn(path: *u8) -> i32` | Check if path exists |
-| `is_directory` | `fn(path: *u8) -> i32` | Is directory? |
-| `is_regular_file` | `fn(path: *u8) -> i32` | Is regular file? |
-| `is_symlink` | `fn(path: *u8) -> i32` | Is symlink? |
-| `file_size` | `fn(path: *u8) -> i64` | Get file size |
+| `path_exists` | `fn(path: StrView) -> bool` | Anything exists at `path` (including a dangling symlink) |
+| `is_dir` | `fn(path: StrView) -> bool` | Is directory? |
+| `is_file` | `fn(path: StrView) -> bool` | Is regular file? |
+| `is_symlink` | `fn(path: StrView) -> bool` | Is symlink? |
+| `file_size` | `fn(path: StrView) -> Result<i64, i32>` | Size in bytes (a symlink's own size) |
 
 **Mode Helpers**:
 
@@ -1140,6 +1147,10 @@ fn size_or_minus_one(path: StrView) -> i64
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
+| `dir_open` | `fn(path: StrView) -> DirIter` | Open a directory; check `dir_valid` |
+| `dir_valid` | `fn(dir: *DirIter) -> i32` | 1 if the directory was opened |
+| `dir_next` | `fn(dir: *DirIter) -> i32` | Advance; 1 if an entry is available, 0 at the end |
+| `dir_close` | `fn(dir: *DirIter)` | Close the iterator |
 | `dir_entry` | `fn(dir: @DirIter) -> DirEntry` | Current entry after `dir_next` returns 1 |
 | `dir_next_entry` | `fn(dir: @&DirIter) -> Option<DirEntry>` | Advance and return the next entry, `None` at the end |
 | `dirent_entry` | `fn(entry: *u8) -> DirEntry` | Decode one raw `linux_dirent64` record |
@@ -1150,7 +1161,7 @@ import ritzlib.fs
 import ritzlib.strview
 
 # Count regular files in `path` (0 if it can't be opened).
-fn count_files(path: *u8) -> i64
+fn count_files(path: StrView) -> i64
     var dir: DirIter = dir_open(path)
     var n: i64 = 0
     while dir_next(@dir)
@@ -1195,45 +1206,50 @@ struct Dirent64
 | `dirent_get_type` | `fn(entry: *u8) -> u8` | Get type |
 | `dirent_get_name` | `fn(entry: *u8) -> *u8` | Get name pointer |
 
-**Path Utilities**:
+**Path Utilities** (pure string work, no syscalls):
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `path_join` | `fn(dir: *u8, name: *u8, buf: *u8) -> i64` | Join paths |
-| `path_basename` | `fn(path: *u8) -> *u8` | Get filename |
-| `path_dirname` | `fn(path: *u8, buf: *u8) -> *u8` | Get directory |
+| `path_join` | `fn(dir: StrView, name: StrView) -> String` | Join with exactly one `/`; an empty `dir` yields `name` |
+| `path_basename` | `fn(path: StrView) -> StrView` | Final component (`"/a/b.txt"` -> `"b.txt"`) |
+| `path_dirname` | `fn(path: StrView) -> StrView` | Before the last `/` (`"/a"`); `"/"` at top level, `"."` with no `/` |
+| `path_extension` | `fn(path: StrView) -> StrView` | Extension without the dot (`"txt"`), or empty |
+| `path_stem` | `fn(path: StrView) -> StrView` | `path` without its extension (`"/a/b"`) |
 
-**String-based Path Utilities**:
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `path_join_string` | `fn(dir: *String, name: *String) -> String` | Join paths |
-| `path_basename_string` | `fn(path: *String) -> String` | Get filename |
-| `path_dirname_string` | `fn(path: *String) -> String` | Get directory |
-| `path_extension_string` | `fn(path: *String) -> String` | Get extension |
-| `path_stem_string` | `fn(path: *String) -> String` | Strip extension |
+`path_basename`, `path_dirname`, `path_extension` and `path_stem` return views
+into the input and don't allocate. A leading dot (`".gitignore"`) isn't an
+extension.
 
 **File Operations**:
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `copy_file` | `fn(src: *u8, dest: *u8, mode: i32) -> i32` | Copy file |
+| `read_file` | `fn(path: StrView) -> Result<String, i32>` | Whole contents of a file |
+| `write_file` | `fn(path: StrView, content: StrView) -> Result<i64, i32>` | Create/truncate (0644) and write; `Ok` = bytes written |
+| `copy_file` | `fn(src: StrView, dest: StrView, mode: i32) -> Result<i64, i32>` | Copy; `Ok` = bytes copied |
+| `mkdir` | `fn(path: StrView, mode: i32) -> Result<i32, i32>` | Create directory (`Ok(0)`; `Err(17)` if it exists) |
+| `unlink` | `fn(path: StrView) -> Result<i32, i32>` | Remove a non-directory (`Ok(0)`) |
+| `rmdir` | `fn(path: StrView) -> Result<i32, i32>` | Remove an empty directory (`Ok(0)`) |
 
-**String-based File Operations with Result**:
+```ritz
+import ritzlib.fs
+import ritzlib.string
+import ritzlib.result
 
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `path_exists_string` | `fn(path: *String) -> i32` | Check exists |
-| `is_directory_string` | `fn(path: *String) -> i32` | Is directory |
-| `file_size_string` | `fn(path: *String) -> Result<i64, i32>` | Get size |
-| `read_file_string` | `fn(path: *String, out: *String) -> i32` | Read file |
-| `write_file_string` | `fn(path: *String, content: *String) -> Result<i64, i32>` | Write file |
-| `mkdir_string` | `fn(path: *String, mode: i32) -> i32` | Create directory |
-| `unlink_string` | `fn(path: *String) -> i32` | Remove file |
-| `rmdir_string` | `fn(path: *String) -> i32` | Remove directory |
-| `copy_file_string` | `fn(src: *String, dest: *String, mode: i32) -> Result<i64, i32>` | Copy file |
-
-**Error Codes**: `FS_ERR_NOT_FOUND`, `FS_ERR_PERMISSION`, `FS_ERR_IO`, `FS_ERR_NOT_DIR`, `FS_ERR_IS_DIR`, `FS_ERR_EXISTS`
+# Write `text` to dir/name; 0 on success, else the errno.
+fn save(dir: StrView, name: StrView, text: StrView) -> i32
+    if not is_dir(dir)
+        var made: Result<i32, i32> = mkdir(dir, 493)    # 0755
+        match made
+            Ok(_) => 0
+            Err(e) => return e
+    var path: String = path_join(dir, name)
+    var r: Result<i64, i32> = write_file(string_as_view(@path), text)
+    string_drop(@path)
+    match r
+        Ok(_) => 0
+        Err(e) => e
+```
 
 ---
 
@@ -2226,13 +2242,16 @@ import ritzlib.async_tasks # Async server
 import ritzlib.fs
 import ritzlib.string
 import ritzlib.io
+import ritzlib.result
 
-fn show_file(path: *String) -> i32
-    var content: String = string_new()
-    if read_file_string(path, @content) == 0
-        print_string(@content)
-    string_drop(@content)
-    0
+fn show_file(path: StrView) -> i32
+    var r: Result<String, i32> = read_file(path)
+    match r
+        Ok(content) =>
+            print_string(@content)
+            string_drop(@content)
+            0
+        Err(errno) => errno
 ```
 
 **Creating a TCP server**:
