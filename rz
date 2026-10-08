@@ -77,22 +77,100 @@ def discover_projects():
     named thing that has vanished from disk must not quietly disable its
     own coverage. The regression matrix's RITZLIB_MODULES follows the same
     rule.
+
+    Patterns are pathlib globs, so `projects/**` reaches packages at any
+    depth (AGAST #1383). With a one-level `projects/*`, a nested package
+    nobody remembered to list was in no gate, and nothing said so:
+    ritzunit/inventory went from compile-failed to 24 passing unobserved.
+    Anything a `**` walk must NOT sweep goes in [workspace.exclude], each
+    entry naming the gate that does cover it (see workspace_exclusions).
     """
     config = load_workspace_config()
     patterns = config.get("workspace", {}).get("members")
     if not patterns:
         sys.exit("rz.toml: [workspace].members is missing or empty")
+    exclusions = workspace_exclusions(config)
+    excluded_dirs = [(WORKSPACE_ROOT / e).resolve() for e in exclusions]
 
     projects = set()
+    used = set()
     for pattern in patterns:
-        matches = [p for p in sorted(WORKSPACE_ROOT.glob(pattern))
-                   if p.is_dir() and (p / "ritz.toml").is_file()]
+        # Glob for the manifest, not the directory: `projects/**` would
+        # otherwise yield every directory in the tree only to discard most.
+        matches = sorted(m.parent.resolve()
+                         for m in WORKSPACE_ROOT.glob(f"{pattern}/ritz.toml")
+                         if m.is_file())
         if not matches:
             sys.exit(f"rz.toml: workspace member {pattern!r} matches no "
                      f"package (no directory with a ritz.toml)")
         for pkg in matches:
-            projects.add(os.path.relpath(pkg.resolve(), PROJECTS_DIR.resolve()))
+            hits = {e for e, d in zip(exclusions, excluded_dirs)
+                    if pkg == d or d in pkg.parents}
+            if hits:
+                used |= hits
+                continue
+            projects.add(os.path.relpath(pkg, PROJECTS_DIR.resolve()))
+
+    # A stale exclusion is a rotted allowlist: once its package moves, it
+    # keeps "excusing" nothing while looking like a decision.
+    stale = [e for e in exclusions if e not in used]
+    if stale:
+        sys.exit(f"rz.toml: [workspace.exclude] entries match no package "
+                 f"that `members` would sweep: {', '.join(stale)}")
     return sorted(projects)
+
+
+def workspace_exclusions(config=None):
+    """rz.toml [workspace.exclude] as a validated {path: reason} dict.
+
+    Each key is a workspace-relative directory. It removes that directory
+    and everything below it from discovery, matched by path component, so
+    excluding `a/ex` leaves `a/examples` alone. Each value says which gate
+    covers the excluded packages instead. An empty reason is an error,
+    because an exclusion with no stated cover is just a package hidden
+    from every gate.
+    """
+    if config is None:
+        config = load_workspace_config()
+    table = config.get("workspace", {}).get("exclude", {})
+    if not isinstance(table, dict):
+        sys.exit("rz.toml: [workspace.exclude] must be a table of "
+                 "path = \"reason\"")
+    out = {}
+    for path, reason in table.items():
+        if not isinstance(reason, str) or not reason.strip():
+            sys.exit(f"rz.toml: [workspace.exclude] {path!r} needs a reason "
+                     f"naming the gate that covers it")
+        out[path.rstrip("/")] = reason
+    return out
+
+
+def resolve_project(arg):
+    """Map a project argument to its project id, or None if it is no package.
+
+    Accepts a project id ("ritz", "ritzunit/inventory") or a path to the
+    package directory: workspace-relative ("projects/ritzunit/inventory"),
+    cwd-relative, or absolute. `rz test projects/ritzunit/inventory` used to
+    join the argument onto projects/ and report "Project not found"
+    (AGAST #1383).
+
+    Resolution is by ritz.toml, not by membership: an excluded package such
+    as an example can still be built by path, it just is not swept by --all.
+    """
+    for base in (PROJECTS_DIR, WORKSPACE_ROOT, Path.cwd()):
+        pkg = (base / arg).resolve()
+        if (pkg / "ritz.toml").is_file():
+            return os.path.relpath(pkg, PROJECTS_DIR.resolve())
+    return None
+
+
+def _resolve_or_report(arg):
+    """resolve_project for a CLI argument, printing the error on failure."""
+    project = resolve_project(arg)
+    if project is None:
+        print(f"Error: Project '{arg}' not found (no ritz.toml there)",
+              file=sys.stderr)
+    return project
 
 
 def get_project_config(project_name):
@@ -318,7 +396,10 @@ def cmd_build(args):
         print("Error: Specify a project or use --all", file=sys.stderr)
         return 1
 
-    return run_build(args.project, extra_args)
+    project = _resolve_or_report(args.project)
+    if project is None:
+        return 1
+    return run_build(project, extra_args)
 
 
 def cmd_test(args):
@@ -378,7 +459,10 @@ def cmd_test(args):
         print("Error: Specify a project or use --all", file=sys.stderr)
         return 1
 
-    return run_test(args.project, extra_args)
+    project = _resolve_or_report(args.project)
+    if project is None:
+        return 1
+    return run_test(project, extra_args)
 
 
 def cmd_run(args):
@@ -392,19 +476,25 @@ def cmd_run(args):
     if getattr(args, "release", False):
         extra_args.append("--release")
 
+    project = _resolve_or_report(args.project)
+    if project is None:
+        return 1
+
     # First build
-    if run_build(args.project, extra_args) != 0:
+    if run_build(project, extra_args) != 0:
         return 1
 
     # Then run - look for the binary
-    project_dir = PROJECTS_DIR / args.project
+    project_dir = PROJECTS_DIR / project
     build_dir = project_dir / "build"
 
-    # Find the binary (typically named after the project)
-    binary = build_dir / args.project
+    # Find the binary (typically named after the package directory; for a
+    # nested id like "a/b" that is "b", not the id)
+    bin_name = Path(project).name
+    binary = build_dir / bin_name
     if not binary.exists():
         # Try debug subdirectory
-        binary = build_dir / "debug" / args.project
+        binary = build_dir / "debug" / bin_name
 
     if not binary.exists():
         print(f"Error: Could not find binary for '{args.project}'", file=sys.stderr)
@@ -441,7 +531,10 @@ def cmd_clean(args):
     if args.all:
         projects = discover_projects()
     elif args.project:
-        projects = [args.project]
+        project = _resolve_or_report(args.project)
+        if project is None:
+            return 1
+        projects = [project]
     else:
         print("Error: Specify a project or use --all", file=sys.stderr)
         return 1
@@ -855,13 +948,19 @@ def compute_impacted_projects(changed_files, projects, deps_graph, reverse_graph
         impacted = set(projects)
         return impacted, set(projects)
 
+    # A change belongs to the innermost project containing it: a file under
+    # projects/ritzunit/inventory/ changes "ritzunit/inventory", not
+    # "ritzunit" (AGAST #1383). Project ids are relative to projects/.
     directly_changed = set()
     for path in changed_files:
         parts = Path(path).parts
-        if len(parts) >= 2 and parts[0] == "projects":
-            candidate = parts[1]
+        if len(parts) < 2 or parts[0] != "projects":
+            continue
+        for depth in range(len(parts) - 1, 1, -1):
+            candidate = "/".join(parts[1:depth])
             if candidate in projects:
                 directly_changed.add(candidate)
+                break
 
     impacted = set(directly_changed)
     queue = list(directly_changed)
