@@ -8,11 +8,12 @@
 #   integers   decimal. ritz0 sign-extends every LLVM integer, so a u8/u16/u32
 #              is truncated to its width and sign-extended the same way.
 #   bool       `true` / `false`
+#   StrView    its `len` bytes from `ptr` (also the %Span$u8 a bare "..."
+#              lowers to, and a @StrView / *StrView), as ritz0 (#1641)
 #   pointers   the NUL-terminated bytes they point at
 #   anything   else is a compile error, as in ritz0
 #
-# Every entry point takes the output fd. print passes 1; an fd-2 builtin
-# (eprint, #1641) only needs to pass 2.
+# Every entry point takes the output fd: print passes 1, eprint 2 (#1641).
 #
 # Integer, bool and string printing are small helper functions
 # (`@__ritz_print_*`), defined once per module that uses them by
@@ -107,9 +108,110 @@ fn interp_is_bool(s: *EmitterState, e: *Expr) -> i32
                 return 1
     0
 
+# Is `name` one of the two `{ ptr, i64 }` view types: StrView, or the
+# %Span$u8 a bare "..." literal lowers to (AGAST #98)?
+fn interp_is_view_name(name: *u8, len: i32) -> i32
+    if name == null
+        return 0
+    if name_eq(name, len, c"StrView", 7) == 1
+        return 1
+    name_eq(name, len, c"Span$u8", 7)
+
+# Is `e` a StrView? Returns 1 for a view value (an aggregate register),
+# 2 for a pointer or reference to a StrView (an i64 register), else 0.
+# Writes the aggregate's LLVM type name. ritz0 decides by LLVM type
+# (_is_strview_llvm_type); this finds the same set from ritz1's locals,
+# struct fields, calls, consts and literals.
+fn interp_strview_kind(s: *EmitterState, e: *Expr, out_name: **u8, out_len: *i32) -> i32
+    *out_name = null
+    *out_len = 0
+    if e.kind == EXPR_MEMBER
+        let fld: *StructField = resolve_member_chain_field(s, e)
+        if fld == null or interp_is_view_name(fld.field_type_name, fld.field_type_name_len) == 0
+            return 0
+        *out_name = fld.field_type_name
+        *out_len = fld.field_type_name_len
+        if fld.field_type == TYPE_STRUCT
+            return 1
+        if fld.field_type == TYPE_PTR or fld.field_type == TYPE_REF or fld.field_type == TYPE_MUT_REF
+            return 2
+        return 0
+    if e.kind == EXPR_IDENT
+        let loc: *LocalVar = find_local_struct_name(s, e.ident_ptr, e.ident_len)
+        if loc != null and interp_is_view_name(loc.type_name, loc.type_name_len) == 1
+            if loc.var_type == TYPE_PTR or loc.var_type == TYPE_REF or loc.var_type == TYPE_MUT_REF
+                *out_name = loc.type_name
+                *out_len = loc.type_name_len
+                return 2
+    var n: *u8 = null
+    var l: i32 = 0
+    resolve_expr_struct_name(s, e, @n, @l)
+    if interp_is_view_name(n, l) == 1
+        *out_name = n
+        *out_len = l
+        return 1
+    0
+
+# Print the StrView `e` (interp_strview_kind `kind`, type `name`) to fd:
+# exactly `len` bytes from `ptr`, never a strlen.
+fn emit_print_strview(s: *EmitterState, fd: i64, e: *Expr, kind: i32, name: *u8, name_len: i32)
+    var v: i32 = emit_expr(s, e)
+    if kind == 2
+        let p: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, p)
+        emit_str(s, c" = inttoptr i64 ")
+        emit_reg(s, v)
+        emit_str(s, c" to ptr\n")
+        let agg: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, agg)
+        emit_str(s, c" = load %")
+        emit_name(s, name, name_len)
+        emit_str(s, c", ptr ")
+        emit_reg(s, p)
+        emit_str(s, c"\n")
+        v = agg
+    let ptr: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, ptr)
+    emit_str(s, c" = extractvalue %")
+    emit_name(s, name, name_len)
+    emit_str(s, c" ")
+    emit_reg(s, v)
+    emit_str(s, c", 0\n")
+    let len: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, len)
+    emit_str(s, c" = extractvalue %")
+    emit_name(s, name, name_len)
+    emit_str(s, c" ")
+    emit_reg(s, v)
+    emit_str(s, c", 1\n")
+    let pi: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, pi)
+    emit_str(s, c" = ptrtoint ptr ")
+    emit_reg(s, ptr)
+    emit_str(s, c" to i64\n")
+    emit_str(s, c"  call void @__ritz_print_bytes(i64 ")
+    emit_int(s, fd)
+    emit_str(s, c", i64 ")
+    emit_reg(s, pi)
+    emit_str(s, c", i64 ")
+    emit_reg(s, len)
+    emit_str(s, c")\n")
+    s.print_helpers_used = 1
+
 # Print the value of placeholder expression `e` to fd. Returns 0 and reports
 # an error if its type has no printed form.
 fn emit_print_value(s: *EmitterState, fd: i64, lit: *Expr, e: *Expr) -> i32
+    var sv_name: *u8 = null
+    var sv_len: i32 = 0
+    let sv_kind: i32 = interp_strview_kind(s, e, @sv_name, @sv_len)
+    if sv_kind != 0
+        emit_print_strview(s, fd, e, sv_kind, sv_name, sv_len)
+        return 1
     let ty: i32 = get_expr_type(s, e)
     var helper: *u8 = null
     var narrow: *u8 = null
@@ -130,7 +232,7 @@ fn emit_print_value(s: *EmitterState, fd: i64, lit: *Expr, e: *Expr) -> i32
     else if ty == TYPE_PTR or ty == TYPE_PTR_PTR or ty == TYPE_REF or ty == TYPE_MUT_REF
         helper = c"__ritz_print_cstr"
     if helper == null
-        emit_print_error(s, lit, c"cannot print this value in a print interpolation: only integers, bool and pointers have a printed form")
+        emit_print_error(s, lit, c"cannot print this value in a print interpolation: only integers, bool, StrView and pointers have a printed form")
         return 0
     var v: i32 = emit_expr(s, e)
     if is_bool == 1 and bool_reg_is_i1(s, e) == 1
@@ -295,6 +397,12 @@ pub fn emit_print_helpers(s: *EmitterState)
     emit_str(s, c"  %ei = ptrtoint ptr %end to i64\n")
     emit_str(s, c"  %len = sub i64 %ei, %fi\n")
     emit_str(s, c"  %r = call i64 asm sideeffect \"syscall\", \"=&{rax},{rax},{rdi},{rsi},{rdx},~{rcx},~{r11},~{memory}\"(i64 1, i64 %fd, i64 %fi, i64 %len)\n")
+    emit_str(s, c"  ret void\n")
+    emit_str(s, c"}\n\n")
+    # A StrView's bytes: one write of exactly len bytes (#1641).
+    emit_str(s, c"define internal void @__ritz_print_bytes(i64 %fd, i64 %p, i64 %n) {\n")
+    emit_str(s, c"entry:\n")
+    emit_str(s, c"  %r = call i64 asm sideeffect \"syscall\", \"=&{rax},{rax},{rdi},{rsi},{rdx},~{rcx},~{r11},~{memory}\"(i64 1, i64 %fd, i64 %p, i64 %n)\n")
     emit_str(s, c"  ret void\n")
     emit_str(s, c"}\n\n")
     # NUL-terminated bytes at a pointer: strlen, then one write.

@@ -455,6 +455,7 @@ struct String
 | `string_cap` | `fn(s: @String) -> i64` | Get capacity |
 | `string_is_empty` | `fn(s: @String) -> i32` | Check if empty |
 | `string_as_ptr` | `fn(s: @&String) -> *u8` | Get null-terminated C string |
+| `string_as_view` | `fn(s: @String) -> StrView` | Borrow the bytes as a StrView (no copy); how a String prints in `print`/`eprint` interpolation |
 | `string_get` | `fn(s: @String, idx: i64) -> u8` | Get byte at index |
 | `string_char_at` | `fn(s: @String, idx: i64) -> u8` | Get char at index |
 

@@ -4267,8 +4267,10 @@ class LLVMEmitter:
         else:
             raise NotImplementedError(f"Statement: {type(stmt)}")
 
-    def _emit_interp_string_print(self, expr: rast.InterpString):
-        """Emit print calls for an interpolated string.
+    def _emit_interp_string_print(self, expr: rast.InterpString, fd: int = 1):
+        """Emit print calls for an interpolated string, writing to `fd`.
+
+        `print` passes 1 and `eprint` passes 2 (AGAST #1641).
 
         Desugars "x = {x}, y = {y}" to:
             prints("x = ")
@@ -4281,34 +4283,50 @@ class LLVMEmitter:
             if part:
                 str_const = self._get_string_constant(part)
                 ptr = self.builder.gep(str_const, [ir.Constant(self.i64, 0), ir.Constant(self.i64, 0)])
-                self._emit_write_syscall(ir.Constant(self.i64, 1), ptr, ir.Constant(self.i64, len(part)))
+                self._emit_write_syscall(ir.Constant(self.i64, fd), ptr, ir.Constant(self.i64, len(part)))
 
             # Print expression (if not past the last part)
             if i < len(expr.exprs):
                 value = self._emit_expr(expr.exprs[i])
-                self._emit_print_value(value, expr.exprs[i])
+                self._emit_print_value(value, expr.exprs[i], fd)
 
         # Return the byte count of the last write (or 0 if no parts)
         return ir.Constant(self.i64, 0)
 
-    def _emit_print_value(self, value: ir.Value, expr: rast.Expr):
-        """Emit code to print a value based on its type.
+    def _emit_print_value(self, value: ir.Value, expr: rast.Expr, fd: int = 1):
+        """Emit code to print a value to `fd` based on its type.
 
-        Handles: integers, pointers (as strings), booleans.
+        Handles: integers, booleans, StrView-shaped `{ i8*, i64 }` values
+        (StrView, and the Span$u8 a bare "..." produces) and pointers to them,
+        which write their `len` bytes (AGAST #1641), and other pointers, which
+        print as NUL-terminated strings.
         Always uses inline printing (syscalls) for self-contained output.
         """
         ty = value.type
+        fd_val = ir.Constant(self.i64, fd)
+
+        # @StrView / *StrView: print the view it points at.
+        if isinstance(ty, ir.PointerType) and self._is_strview_llvm_type(ty.pointee):
+            value = self.builder.load(value)
+            ty = value.type
 
         # Integer types - print using inline itoa + write
         if ty in (self.i8, self.i16, self.i32, self.i64):
             # Extend to i64 if needed
             if ty != self.i64:
                 value = self.builder.sext(value, self.i64)
-            self._emit_print_int_inline(value)
+            self._emit_print_int_inline(value, fd)
+
+        # StrView: write exactly `len` bytes from `ptr` (no strlen, so a view
+        # into a longer buffer prints only its own bytes).
+        elif self._is_strview_llvm_type(ty):
+            ptr = self.builder.extract_value(value, 0)
+            length = self.builder.extract_value(value, 1)
+            self._emit_write_syscall(fd_val, ptr, length)
 
         # Pointer types (assume *u8 = string) - use strlen + write
         elif isinstance(ty, ir.PointerType):
-            self._emit_write_str(value)
+            self._emit_write_str(value, fd)
 
         # Boolean - print "true" or "false"
         elif ty == self.i1:
@@ -4318,17 +4336,17 @@ class LLVMEmitter:
             false_ptr = self.builder.gep(false_str, [ir.Constant(self.i64, 0), ir.Constant(self.i64, 0)])
             ptr = self.builder.select(value, true_ptr, false_ptr)
             length = self.builder.select(value, ir.Constant(self.i64, 4), ir.Constant(self.i64, 5))
-            self._emit_write_syscall(ir.Constant(self.i64, 1), ptr, length)
+            self._emit_write_syscall(fd_val, ptr, length)
 
         else:
             # For other types, try to print as integer
             if hasattr(ty, 'width'):
                 value = self.builder.zext(value, self.i64) if ty.width < 64 else value
-                self._emit_print_int_inline(value)
+                self._emit_print_int_inline(value, fd)
             else:
                 raise ValueError(f"Cannot print value of type {ty}")
 
-    def _emit_print_int_inline(self, value: ir.Value):
+    def _emit_print_int_inline(self, value: ir.Value, fd: int = 1):
         """Inline integer printing using itoa and write syscall.
 
         Algorithm: Extract digits in reverse order, store in buffer from end,
@@ -4421,14 +4439,14 @@ class LLVMEmitter:
         ptr_int = self.builder.ptrtoint(final_ptr, self.i64)
         end_int = self.builder.ptrtoint(buf_end, self.i64)
         length = self.builder.sub(end_int, ptr_int)
-        self._emit_write_syscall(ir.Constant(self.i64, 1), final_ptr, length)
+        self._emit_write_syscall(ir.Constant(self.i64, fd), final_ptr, length)
 
         done_block = self.current_fn.append_basic_block("print_int.done")
         self.builder.branch(done_block)
         self.builder.position_at_end(done_block)
 
-    def _emit_write_str(self, ptr: ir.Value):
-        """Write a null-terminated string using strlen + write."""
+    def _emit_write_str(self, ptr: ir.Value, fd: int = 1):
+        """Write a null-terminated string to `fd` using strlen + write."""
         # Calculate length with loop
         len_loop = self.current_fn.append_basic_block("strlen.loop")
         len_body = self.current_fn.append_basic_block("strlen.body")
@@ -4457,7 +4475,7 @@ class LLVMEmitter:
         # Done: call write
         self.builder.position_at_end(len_done)
         final_len = self.builder.load(len_ptr)
-        self._emit_write_syscall(ir.Constant(self.i64, 1), ptr, final_len)
+        self._emit_write_syscall(ir.Constant(self.i64, fd), ptr, final_len)
 
     def _emit_unsafe_block(self, stmt: rast.UnsafeBlock):
         """Emit an unsafe block.
@@ -7875,8 +7893,10 @@ class LLVMEmitter:
 
             raise ValueError(f"sizeof() argument must be a type name, got: {type(arg)}")
 
-        # Handle print builtin - print(string_literal) -> write(1, ptr, len)
-        if fname == 'print':
+        # Handle print / eprint builtins - print(string_literal) -> write(1, ptr, len).
+        # eprint is the same lowering to fd 2 (AGAST #1641).
+        if fname in ('print', 'eprint'):
+            out_fd = 1 if fname == 'print' else 2
             if len(call.args) == 1:
                 arg = call.args[0]
                 if isinstance(arg, rast.CStringLit) and self._has_interp_placeholder(arg.value):
@@ -7907,12 +7927,12 @@ class LLVMEmitter:
                     # GEP to get i8* pointer to string data
                     ptr = self.builder.gep(str_const, [ir.Constant(self.i64, 0), ir.Constant(self.i64, 0)])
                     length = len(s)
-                    # Call write(1, ptr, length) via syscall
-                    return self._emit_write_syscall(ir.Constant(self.i64, 1), ptr, ir.Constant(self.i64, length))
+                    # Call write(out_fd, ptr, length) via syscall
+                    return self._emit_write_syscall(ir.Constant(self.i64, out_fd), ptr, ir.Constant(self.i64, length))
                 elif isinstance(arg, rast.InterpString):
                     # Handle interpolated string - desugar to print calls
-                    return self._emit_interp_string_print(arg)
-            raise ValueError("print() requires a single string literal argument")
+                    return self._emit_interp_string_print(arg, out_fd)
+            raise ValueError(f"{fname}() requires a single string literal argument")
 
         # Handle named syscalls
         if fname in ('write', 'read', 'open', 'close', 'nanosleep'):

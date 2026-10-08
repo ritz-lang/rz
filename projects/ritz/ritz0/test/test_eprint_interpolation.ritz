@@ -1,0 +1,102 @@
+# AGAST #1641: `eprint("...{x}...")` writes to stderr, and a StrView
+# placeholder prints its bytes, under every compiler.
+#
+# The matrix runs this file under ritz0, ritz1 and ritz1_selfhosted, so the
+# self-hosted compiler's lowering is checked too. The wider cases are in
+# ritz0/test_eprint_interpolation.py.
+#
+# Each test points one fd (1 or 2) at a pipe, prints, restores the fd, and
+# compares the bytes that came out of the pipe with what ritz0 prints.
+
+import ritzlib.sys
+import ritzlib.string
+
+var g_rd: i32 = 0
+var g_saved: i32 = 0
+var g_fd: i32 = 0
+
+fn capture_begin(fd: i32) -> i32
+    var fds: [2]i32
+    if sys_pipe(@fds[0]) != 0
+        return 1
+    g_fd = fd
+    g_rd = fds[0]
+    g_saved = sys_dup(fd)
+    sys_dup2(fds[1], fd)
+    sys_close(fds[1])
+    0
+
+# Restore the captured fd, read what was written, compare it with `want`.
+# Returns 0 on an exact byte match.
+fn capture_end_expect(want: *u8) -> i32
+    sys_dup2(g_saved, g_fd)
+    sys_close(g_saved)
+    var buf: [256]u8
+    var got: i64 = 0
+    var n: i64 = 1
+    while n > 0 and got < 256
+        n = sys_read(g_rd, @buf[got], 256 - got)
+        if n > 0
+            got = got + n
+    sys_close(g_rd)
+    var i: i64 = 0
+    while *(want + i) != 0
+        if i >= got
+            return 2
+        if buf[i] != *(want + i)
+            return 3
+        i = i + 1
+    if i != got
+        return 4
+    0
+
+fn twice(n: i64) -> i64
+    return n * 2
+
+[[test]]
+fn test_eprint_goes_to_stderr() -> i32
+    assert capture_begin(2) == 0
+    let x: i64 = 5
+    let t: bool = true
+    eprint("x={x} t={t} call={twice(x)} {{lit}}\n")
+    assert capture_end_expect(c"x=5 t=true call=10 {lit}\n") == 0
+    0
+
+[[test]]
+fn test_eprint_leaves_stdout_alone() -> i32
+    assert capture_begin(1) == 0
+    eprint("")
+    print("only stdout\n")
+    assert capture_end_expect(c"only stdout\n") == 0
+    0
+
+[[test]]
+fn test_print_strview() -> i32
+    assert capture_begin(1) == 0
+    let v: StrView = "view"
+    let part: StrView = StrView { ptr: c"hello", len: 2 }
+    print("[{v}] [{part}]\n")
+    assert capture_end_expect(c"[view] [he]\n") == 0
+    0
+
+[[test]]
+fn test_eprint_strview() -> i32
+    assert capture_begin(2) == 0
+    let name: StrView = "--out"
+    eprint("option '{name}' needs a value\n")
+    assert capture_end_expect(c"option '--out' needs a value\n") == 0
+    0
+
+# A String prints through its view (ritzlib.string string_as_view).
+[[test]]
+fn test_string_through_its_view() -> i32
+    var s: String = string_from("owned")
+    string_push_str(@&s, "!")
+    assert capture_begin(2) == 0
+    eprint("e=[{string_as_view(@s)}] n={string_len(@s)}\n")
+    assert capture_end_expect(c"e=[owned!] n=6\n") == 0
+    assert capture_begin(1) == 0
+    print("s=[{string_as_view(@s)}]\n")
+    assert capture_end_expect(c"s=[owned!]\n") == 0
+    string_drop(@&s)
+    0

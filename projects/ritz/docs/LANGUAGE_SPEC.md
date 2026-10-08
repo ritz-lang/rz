@@ -224,8 +224,10 @@ let bad = s"hello"
 **Escape sequences:** `\n`, `\t`, `\r`, `\\`, `\"`, `\'`, `\0`
 
 **String interpolation:** `{expr}` inside a **plain** string literal passed to
-the `print` builtin substitutes the value of `expr`. It is not restricted to
-bare variable names — any expression works, including a call:
+the `print` or `eprint` builtin substitutes the value of `expr`. `print` writes
+to stdout (fd 1) and `eprint` to stderr (fd 2); otherwise the two are the same
+(AGAST #1641). A placeholder is not restricted to bare variable names. Any
+expression works, including a call:
 
 ```ritz
 fn twice(n: i64) -> i64
@@ -233,8 +235,10 @@ fn twice(n: i64) -> i64
 
 fn main() -> i32
     let x: i64 = 21
+    let name: StrView = "--out"
     print("x = {x}\n")
     print("twice = {twice(x)}\n")
+    eprint("option '{name}' needs a value\n")
     return 0
 ```
 
@@ -251,19 +255,26 @@ staying opaque -- including ritz1's own emitter, which builds LLVM inline-asm
 constraint strings such as `"={rax},{rax},{rdi},~{rcx}"`, where `{rax}` and
 `{rdi}` are register constraints. Interpolating those corrupts every syscall
 the self-hosted compiler emits. A c-string containing braces is therefore
-still perfectly legal; only passing one to `print` is rejected.
+still perfectly legal; only passing one to `print` or `eprint` is rejected.
 
 A placeholder is `{` with a matching `}` before the end of the literal; a `{`
 with no match is a literal brace, as is a lone `}`, `}}`, `\{` or `\}`.
 Whitespace around the expression is ignored, and an empty or unparseable
 placeholder is a compile error.
 
-What a placeholder prints depends on the value's type. Integers print in
-decimal, `bool` prints `true` or `false`, and a pointer prints the
-NUL-terminated bytes it points at. Every other type, including `StrView`,
-`String` and floats, is a compile error. To compose strings, call `prints`
-more than once, or build a `String` with `string_push_strview`. ritz0 and
-ritz1 follow the same rules and print the same bytes (AGAST #1521).
+What a placeholder prints depends on the value's type:
+
+| Type | Prints |
+|------|--------|
+| integers | decimal |
+| `bool` | `true` or `false` |
+| `StrView`, `@StrView`, `*StrView` | exactly `len` bytes from `ptr` (no NUL needed, none past `len`) |
+| other pointers (`*u8`, ...) | the NUL-terminated bytes they point at |
+
+A `String` prints through its view: `print("s = {string_as_view(@s)}\n")`
+(`ritzlib.string`). Every other type, including floats and other structs, is a
+compile error. ritz0 and ritz1 follow the same rules and print the same bytes
+(AGAST #1521, #1641).
 
 ### 2.7 Operators
 
@@ -1698,7 +1709,8 @@ See `docs/STDLIB_REFERENCE.md` for the function-level reference.
 
 | Function | Description |
 |----------|-------------|
-| `print(literal)` | Print a string literal, with `{var}` interpolation |
+| `print(literal)` | Print a string literal to stdout, with `{expr}` interpolation |
+| `eprint(literal)` | As `print`, to stderr |
 | `sizeof(T)` / `sizeof(expr)` | Size in bytes |
 | `assert cond` | Runtime check; exits non-zero on failure. **`[[test]]` functions only** |
 | `assert cond, "message"` | As above, naming what the check was for |
@@ -1731,7 +1743,7 @@ fn main() -> i32
     return 0
 ```
 
-`print` is the only builtin that takes a string, and it requires a literal:
+`print` and `eprint` are the only builtins that take a string, and they require a literal:
 
 ```ritz body expect-error="print() requires a single string literal argument"
 let s = "hi"

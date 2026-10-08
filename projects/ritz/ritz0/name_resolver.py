@@ -45,7 +45,7 @@ class NameResolver:
     BUILTINS = {
         '__syscall0', '__syscall1', '__syscall2', '__syscall3',
         '__syscall4', '__syscall5', '__syscall6',
-        '__builtin_alloca', 'print', 'sizeof', 'typeof',
+        '__builtin_alloca', 'print', 'eprint', 'sizeof', 'typeof',
         'assert',
         # SIMD vector operations
         'simd_load', 'simd_loadu', 'simd_store', 'simd_storeu',

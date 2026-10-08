@@ -23,7 +23,7 @@ lexer and `parse_expr`, then printed by type, as ritz0's
 `_emit_print_value` does: integers in decimal, bool as true/false, and
 pointers as NUL-terminated strings. Anything else is a compile error, as it
 is in ritz0. The lowering takes the output fd as a parameter (1 for print),
-so #1641's `eprint` only adds a name.
+so #1641's `eprint` passes 2.
 
 ORACLE
 
@@ -219,9 +219,9 @@ REJECT = {
     # Same rule as ritz0 (#1394): c"..." does not interpolate, so passing one
     # with a placeholder to print is an error rather than verbatim output.
     "cstring": 'let x: i64 = 1\n    print(c"c={x}\\n")',
-    # No printable form in ritz0's _emit_print_value. #1641 adds StrView.
+    # No printable form in ritz0's _emit_print_value. (StrView prints since
+    # #1641: test_eprint_interpolation.py.)
     "float": 'let f: f64 = 1.5\n    print("f={f}\\n")',
-    "strview": 'let v: StrView = "sv"\n    print("v={v}\\n")',
     "empty": 'print("e={}\\n")',
     "bad_expr": 'print("b={1 +}\\n")',
 }

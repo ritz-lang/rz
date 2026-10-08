@@ -590,8 +590,8 @@ class TypeChecker:
                     self._infer_type(arg)
                 return rast.NamedType(expr.span, 'i64', [])
 
-            # print(str) -> void
-            if fn_name == 'print':
+            # print(str) / eprint(str) -> void (eprint: AGAST #1641)
+            if fn_name in ('print', 'eprint'):
                 for arg in expr.args:
                     self._infer_type(arg)
                 return rast.NamedType(expr.span, 'void', [])
