@@ -180,9 +180,7 @@ def _args_program() -> str:
     )
 
 
-# case -> (exit status, stdout, stderr).  Case 2: the option character goes to
-# STDOUT (print_char) and the rest of the message to stderr — a pre-existing
-# bug, kept byte-for-byte by #1642.
+# case -> (exit status, stdout, stderr).
 ARGS_CASES = {
     "1": (
         4,
@@ -192,7 +190,8 @@ ARGS_CASES = {
         b"prog: unknown option '--bogus'\n"
         b"prog: option '--count' requires a value\n",
     ),
-    "2": (2, b"zn", b"prog: unknown option '-'\nprog: option '-' requires a value\n"),
+    # #1683: the option char goes to stderr with the rest of the message.
+    "2": (2, b"", b"prog: unknown option '-z'\nprog: option '-n' requires a value\n"),
     "3": (
         2,
         b"",
