@@ -41,6 +41,8 @@ import ast_helpers
 import tokens_gen
 import emitter_core
 import emitter_expr
+import emitter_expr_call     # is_variant_carrier, is_variant_null, resolve_enum_ctx
+import emitter_expr_access   # is_ident_none
 
 # Phi result tracking during emit_match.
 # We need to collect (value_reg, exit_label) pairs across all non-pass arms
@@ -182,9 +184,10 @@ fn emit_variant_tag_check_i64(s: *EmitterState, scrut_reg: i32, tag_one: i32) ->
     return inv
 
 # AGAST #1515: the struct type carried by a tagged enum's carrier variant
-# (Ok/Some): see tagged_enum_payload_struct.  When it names a known struct,
+# (Ok/Some): see tagged_enum_payload_struct.  AGAST #1667 adds Result's Err
+# side (tagged_enum_err_payload_struct).  When it names a known struct,
 # fills (out_name, out_len); otherwise leaves them null/0 and the caller
-# keeps the scalar i64 binding (primitives, pointers, the Err/None side).
+# keeps the scalar i64 binding (primitives, pointers, None).
 fn carrier_payload_struct(s: *EmitterState, arm: *MatchArm, enum_name: *u8, enum_name_len: i32, out_name: **u8, out_len: *i32)
     *out_name = null
     *out_len = 0
@@ -193,6 +196,9 @@ fn carrier_payload_struct(s: *EmitterState, arm: *MatchArm, enum_name: *u8, enum
     if is_tagged_enum_type(enum_name, enum_name_len) == 0
         return
     if variant_is_tag_one(arm.pattern_name, arm.pattern_name_len) == 0
+        # AGAST #1667: `Err(e)` over Result<T, E> with a struct E binds at %E.
+        if arm.pattern_name_len == 3 and *arm.pattern_name == 69 and *(arm.pattern_name + 1) == 114 and *(arm.pattern_name + 2) == 114   # "Err"
+            *out_name = tagged_enum_err_payload_struct(s, enum_name, enum_name_len, out_len)
         return
     *out_name = tagged_enum_payload_struct(s, enum_name, enum_name_len, out_len)
 
@@ -231,6 +237,29 @@ fn emit_struct_payload_bind(s: *EmitterState, arm: *MatchArm, slot_reg: i32, enu
     emit_reg(s, alloca_reg)
     emit_str(s, c"\n")
     add_local_struct(s, arm.pattern_inner_name, arm.pattern_inner_name_len, alloca_reg, TYPE_STRUCT, st_name, st_name_len)
+
+# AGAST #1667: an arm yielding a bare `Ok(..)` / `Err(..)` / `Some(..)` /
+# `None` builds whichever enum its context dictates (resolve_enum_ctx, the
+# same lookup emit_variant_struct made while emitting the arm), so the merge
+# phi must have that type rather than i64.  `arg_parse_i64`'s
+# `Some(n) => Ok(n)` / `None => Err(..)` emitted `phi i64 [%Result$..]`.
+fn variant_ctor_arm_type(s: *EmitterState, e: *Expr, out_name: **u8, out_len: *i32)
+    *out_name = null
+    *out_len = 0
+    if e == null
+        return
+    var is_ctor: i32 = 0
+    if e.kind == EXPR_CALL
+        if is_variant_carrier(e.func_name, e.func_name_len) == 1 or is_variant_null(e.func_name, e.func_name_len) == 1
+            is_ctor = 1
+    else if e.kind == EXPR_IDENT
+        # Unshadowed `None`, mirroring emit_expr_ident.
+        if is_ident_none(e.ident_ptr, e.ident_len) == 1
+            if is_const(s, e.ident_ptr, e.ident_len) == 0 and find_local(s, e.ident_ptr, e.ident_len) < 0
+                if find_global(s, e.ident_ptr, e.ident_len) == null
+                    is_ctor = 1
+    if is_ctor == 1
+        resolve_enum_ctx(s, out_name, out_len)
 
 # Emit match body, returning (result_reg, exit_label) via MatchResult slot.
 # For PAT_VARIANT arms with PAT_IDENT inner (e.g. `Ok(v) => v`), the inner
@@ -285,6 +314,8 @@ fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_s
         var arm_ty: *u8 = null
         var arm_ty_len: i32 = 0
         resolve_expr_struct_name(s, arm.body, @arm_ty, @arm_ty_len)
+        if arm_ty == null
+            variant_ctor_arm_type(s, arm.body, @arm_ty, @arm_ty_len)
         # The first struct-valued arm fixes the phi type.  A `"..."` arm is a
         # StrView in the language; its `%Span$u8` lowering (#98) is an
         # artefact, so a leading literal arm types the phi as StrView, the
