@@ -1,0 +1,177 @@
+# Byte-exact stdout/stderr of the legacy ritzlib.args parser (AGAST #1642).
+#
+# args_parse's error reports and args_print_help were eprints/prints chains;
+# #1642 turned them into print/eprint interpolation.  These goldens pin every
+# byte and the fd it lands on.  Note the short-option errors: the option
+# character goes to STDOUT via print_char while the rest of the message goes
+# to stderr.  That is a pre-existing bug, pinned here so the conversion stays
+# byte-identical; it is fixed (or not) separately.
+#
+# Capture helpers: see test_argspec_output.ritz.
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.args
+
+# ============================================================================
+# Capture helpers
+# ============================================================================
+
+var g_out: [4096]u8
+var g_out_len: i64 = 0
+var g_err: [4096]u8
+var g_err_len: i64 = 0
+
+fn read_all(fd: i32, buf: *u8, cap: i64) -> i64
+    var got: i64 = 0
+    var n: i64 = 1
+    while n > 0 and got < cap
+        n = sys_read(fd, buf + got, cap - got)
+        if n > 0
+            got = got + n
+    got
+
+# 0 when buf[0..len] is exactly `want`.
+fn bytes_differ(buf: *u8, len: i64, want: StrView) -> i32
+    if len != want.len
+        return 1
+    var i: i64 = 0
+    while i < len
+        if *(buf + i) != *(want.ptr + i)
+            return 2
+        i += 1
+    0
+
+# Run case `which` in a child with stdout/stderr captured into g_out/g_err.
+# Returns the child's exit status.
+fn run_case(which: i32) -> i32
+    var o: [2]i32
+    var e: [2]i32
+    sys_pipe(@o[0])
+    sys_pipe(@e[0])
+    let pid: i32 = sys_fork()
+    if pid == 0
+        sys_dup2(o[1], 1)
+        sys_dup2(e[1], 2)
+        sys_close(o[0])
+        sys_close(o[1])
+        sys_close(e[0])
+        sys_close(e[1])
+        sys_exit(run_body(which))
+    sys_close(o[1])
+    sys_close(e[1])
+    g_out_len = read_all(o[0], @g_out[0], 4096)
+    g_err_len = read_all(e[0], @g_err[0], 4096)
+    sys_close(o[0])
+    sys_close(e[0])
+    var status: i32 = 0
+    sys_wait4(pid, @status, 0, null)
+    (status >> 8) & 255
+
+fn out_is(want: StrView) -> i32
+    bytes_differ(@g_out[0], g_out_len, want)
+
+fn err_is(want: StrView) -> i32
+    bytes_differ(@g_err[0], g_err_len, want)
+# ============================================================================
+# Cases
+# ============================================================================
+
+fn setup(p: *ArgParser)
+    args_init(p, c"prog", c"Does things")
+    args_flag(p, 'v', c"verbose", c"Say more")
+    args_flag(p, 'q', null, c"Quiet")
+    args_option(p, 'n', c"count", c"NUM", c"How many", c"10")
+    args_option(p, 0, c"name", c"S", c"Who", null)
+    args_option(p, 'x', null, c"N", c"Short value", c"3")
+    args_positional(p, c"FILE", c"Input files", 1, 2)
+
+# Parse prog + up to three arguments (null = absent) with a fresh parser.
+fn parse3(a: *u8, b: *u8, c: *u8) -> i32
+    var p: ArgParser
+    setup(@p)
+    var argv: [4]*u8
+    argv[0] = c"prog"
+    argv[1] = a
+    argv[2] = b
+    argv[3] = c
+    var argc: i32 = 1
+    if a != null
+        argc = 2
+    if b != null
+        argc = 3
+    if c != null
+        argc = 4
+    args_parse(@p, argc, @argv[0])
+
+fn case_long_errors() -> i32
+    var rc: i32 = 0
+    rc += parse3(c"--bogus=1", null, null)
+    rc += parse3(c"--verbose=1", null, null)
+    rc += parse3(c"--bogus", null, null)
+    rc += parse3(c"--count", null, null)
+    rc
+
+fn case_short_errors() -> i32
+    var rc: i32 = 0
+    rc += parse3(c"-z", null, null)
+    rc += parse3(c"-vn", null, null)
+    rc
+
+fn case_positional_errors() -> i32
+    var rc: i32 = 0
+    rc += parse3(null, null, null)
+    rc += parse3(c"a", c"b", c"c")
+    rc += parse3(c"a", null, null)
+    rc
+
+fn case_help() -> i32
+    var p: ArgParser
+    setup(@p)
+    args_print_help(@p)
+    var q: ArgParser
+    args_init(@q, c"bare", null)
+    args_positional(@q, c"ARG", c"An arg", 0, -1)
+    args_print_help(@q)
+    0
+
+fn run_body(which: i32) -> i32
+    if which == 1
+        return case_long_errors()
+    if which == 2
+        return case_short_errors()
+    if which == 3
+        return case_positional_errors()
+    case_help()
+
+# ============================================================================
+# Tests
+# ============================================================================
+
+[[test]]
+fn test_long_option_errors_exact() -> i32
+    assert run_case(1) == 4
+    assert out_is("") == 0
+    assert err_is("prog: unknown option '--bogus'\nprog: option '--verbose' doesn't accept a value\nprog: unknown option '--bogus'\nprog: option '--count' requires a value\n") == 0
+    0
+
+[[test]]
+fn test_short_option_errors_exact() -> i32
+    assert run_case(2) == 2
+    assert out_is("zn") == 0
+    assert err_is("prog: unknown option '-'\nprog: option '-' requires a value\n") == 0
+    0
+
+[[test]]
+fn test_positional_errors_exact() -> i32
+    assert run_case(3) == 2
+    assert out_is("") == 0
+    assert err_is("prog: missing required argument 'FILE'\nprog: too many arguments\n") == 0
+    0
+
+[[test]]
+fn test_help_exact() -> i32
+    assert run_case(4) == 0
+    assert err_is("") == 0
+    assert out_is("Usage: prog [OPTIONS] FILE...\n\nDoes things\n\nOptions:\n  -v, --verbose\n        Say more\n  -q\n        Quiet\n  -n, --count=NUM\n        How many (default: 10)\n      --name=S\n        Who\n  -x\n        Short value (default: 3)\n\nArguments:\n  FILE\n        Input files\nUsage: bare [OPTIONS] [ARG...]\n\nArguments:\n  ARG\n        An arg\n") == 0
+    0
