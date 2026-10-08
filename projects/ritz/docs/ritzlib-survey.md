@@ -103,7 +103,7 @@ same-named non-pub helper.
 | `lang.tokens` | array-repeat of a struct literal `[S { .. }; N]` | #1362 (updated) |
 | `os.env` | block-bodied match arm `None =>` plus indented block | #1454 (split from #1310) |
 | `testing` | inline `asm x86_64:` block in a fn body | #1455 (split from #1310) |
-| `testlib` | trailing comma in a fn parameter list (testlib.ritz:168) — **not** block match arms, which #1310 had blamed | #1452 |
+| ~~`testlib`~~ | ~~trailing comma in a fn parameter list (testlib.ritz:168)~~ — **fixed by #1452** (params and call args accept a trailing comma); testlib now compiles under ritz1 and `33_printenv`'s testlib-based tests pass 4/4 through the matrix harness. Running package `.ritz` tests under ritz1 via `build.py test` is #1536 | #1452 |
 
 Found while reducing these: #1451, ritz1 scales pointer arithmetic on
 `*Struct` locals by 8 rather than `sizeof(Struct)` (`get_ptr_elem_size`,

@@ -1789,6 +1789,8 @@ impl_block   := 'impl' generic_params? (IDENT 'for')? IDENT NEWLINE
                 INDENT fn_def* DEDENT
 trait_def    := 'pub'? 'trait' IDENT NEWLINE INDENT trait_sig+ DEDENT
 trait_sig    := 'fn' IDENT '(' params? ')' ('->' type)? NEWLINE
+params       := param (',' param)* ','?
+call         := expr '(' (expr (',' expr)* ','?)? ')'
 
 type         := 'i8'|'i16'|'i32'|'i64'|'u8'|'u16'|'u32'|'u64'|'bool'
               | '*' type | '@' type | '@' '&' type | '[' NUMBER ']' type
@@ -1805,6 +1807,9 @@ expr         := binary | unary | cast | call | field | index | try | match
 `trait` declarations parse in both compilers. ritz1 checks only their
 syntax: methods are resolved statically from the receiver's concrete type
 (§12.2), so a declaration adds nothing to the emitted module.
+
+Parameter lists and call argument lists accept one trailing comma, so a
+one-item-per-line list can end each line with `,`.
 
 ### B. Compilation
 
