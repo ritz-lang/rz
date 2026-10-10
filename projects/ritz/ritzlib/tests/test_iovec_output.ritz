@@ -1,0 +1,114 @@
+# Byte-exact stdout of ritzlib.iovec's iovec_debug_print (AGAST #1684).
+#
+# It was a prints/print_int chain; #1684 made it interpolated print.
+# examples/tier5_async/51_iovec calls it too (and is built by ritz1), but
+# checks nothing about the debug text.
+#
+# ritz1 parity: ritz0/test_ritzlib_output_goldens.py.
+# Capture helpers: see test_argspec_output.ritz.
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.strview
+import ritzlib.iovec
+
+
+# ============================================================================
+# Capture helpers
+# ============================================================================
+
+var g_out: [4096]u8
+var g_out_len: i64 = 0
+var g_err: [4096]u8
+var g_err_len: i64 = 0
+
+fn read_all(fd: i32, buf: *u8, cap: i64) -> i64
+    var got: i64 = 0
+    var n: i64 = 1
+    while n > 0 and got < cap
+        n = sys_read(fd, buf + got, cap - got)
+        if n > 0
+            got = got + n
+    got
+
+# 0 when buf[0..len] is exactly `want`.
+fn bytes_differ(buf: *u8, len: i64, want: StrView) -> i32
+    if len != want.len
+        return 1
+    var i: i64 = 0
+    while i < len
+        if *(buf + i) != *(want.ptr + i)
+            return 2
+        i += 1
+    0
+
+# Run case `which` in a child with stdout/stderr captured into g_out/g_err.
+# Returns the child's exit status.
+fn run_case(which: i32) -> i32
+    var o: [2]i32
+    var e: [2]i32
+    sys_pipe(@o[0])
+    sys_pipe(@e[0])
+    let pid: i32 = sys_fork()
+    if pid == 0
+        sys_dup2(o[1], 1)
+        sys_dup2(e[1], 2)
+        sys_close(o[0])
+        sys_close(o[1])
+        sys_close(e[0])
+        sys_close(e[1])
+        sys_exit(run_body(which))
+    sys_close(o[1])
+    sys_close(e[1])
+    g_out_len = read_all(o[0], @g_out[0], 4096)
+    g_err_len = read_all(e[0], @g_err[0], 4096)
+    sys_close(o[0])
+    sys_close(e[0])
+    var status: i32 = 0
+    sys_wait4(pid, @status, 0, null)
+    (status >> 8) & 255
+
+fn out_is(want: StrView) -> i32
+    bytes_differ(@g_out[0], g_out_len, want)
+
+fn err_is(want: StrView) -> i32
+    bytes_differ(@g_err[0], g_err_len, want)
+
+# ============================================================================
+# Cases
+# ============================================================================
+
+fn case_empty() -> i32
+    var b: IoVecBuilder
+    iovec_builder_init(@b)
+    iovec_debug_print(@b)
+    0
+
+fn case_mixed() -> i32
+    var b: IoVecBuilder
+    iovec_builder_init(@b)
+    iovec_append_static(@b, c"GET ")
+    iovec_append_copy(@b, c"/index.html")
+    iovec_append_int(@b, -1234)
+    iovec_append_crlf(@b)
+    iovec_debug_print(@b)
+    0
+
+fn run_body(which: i32) -> i32
+    if which == 1
+        return case_empty()
+    case_mixed()
+
+[[test]]
+fn test_iovec_debug_print_empty_exact() -> i32
+    assert run_case(1) == 0
+    assert out_is("IoVecBuilder: 0 iovecs, 0 pool bytes, 0 total bytes\n") == 0
+    assert err_is("") == 0
+    0
+
+[[test]]
+fn test_iovec_debug_print_exact() -> i32
+    assert run_case(2) == 0
+    assert out_is("IoVecBuilder: 4 iovecs, 16 pool bytes, 22 total bytes\n  [0] len=4\n  [1] len=11\n  [2] len=5\n  [3] len=2\n") == 0
+    assert err_is("") == 0
+    0

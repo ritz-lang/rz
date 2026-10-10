@@ -1,0 +1,158 @@
+# Byte-exact stdout of ritzlib.elf's elf_print_test_functions (AGAST #1684).
+#
+# It was a prints/prints_cstr chain; #1684 made each line one interpolated
+# print.  The child reads this test binary (/proc/self/exe) and prints its
+# test functions; the parent builds the expected bytes independently by
+# walking the same symbol table, and requires the two `pub fn
+# test_elf_output_marker*` below to be among them (the harness gives non-pub
+# functions, [[test]] ones included, internal linkage, so they are not
+# listed).  ritzlib/tests/test_elf.ritz is a manual tool that needs a file
+# argument, so nothing exercised the printer before.
+#
+# Capture helpers: see test_argspec_output.ritz (buffers are larger here).
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.memory
+import ritzlib.strview
+import ritzlib.elf
+
+
+# ============================================================================
+# Capture helpers
+# ============================================================================
+
+var g_out: [65536]u8
+var g_out_len: i64 = 0
+var g_err: [65536]u8
+var g_err_len: i64 = 0
+
+fn read_all(fd: i32, buf: *u8, cap: i64) -> i64
+    var got: i64 = 0
+    var n: i64 = 1
+    while n > 0 and got < cap
+        n = sys_read(fd, buf + got, cap - got)
+        if n > 0
+            got = got + n
+    got
+
+# 0 when buf[0..len] is exactly `want`.
+fn bytes_differ(buf: *u8, len: i64, want: StrView) -> i32
+    if len != want.len
+        return 1
+    var i: i64 = 0
+    while i < len
+        if *(buf + i) != *(want.ptr + i)
+            return 2
+        i += 1
+    0
+
+# Run case `which` in a child with stdout/stderr captured into g_out/g_err.
+# Returns the child's exit status.
+fn run_case(which: i32) -> i32
+    var o: [2]i32
+    var e: [2]i32
+    sys_pipe(@o[0])
+    sys_pipe(@e[0])
+    let pid: i32 = sys_fork()
+    if pid == 0
+        sys_dup2(o[1], 1)
+        sys_dup2(e[1], 2)
+        sys_close(o[0])
+        sys_close(o[1])
+        sys_close(e[0])
+        sys_close(e[1])
+        sys_exit(run_body(which))
+    sys_close(o[1])
+    sys_close(e[1])
+    g_out_len = read_all(o[0], @g_out[0], 65536)
+    g_err_len = read_all(e[0], @g_err[0], 65536)
+    sys_close(o[0])
+    sys_close(e[0])
+    var status: i32 = 0
+    sys_wait4(pid, @status, 0, null)
+    (status >> 8) & 255
+
+fn out_is(want: StrView) -> i32
+    bytes_differ(@g_out[0], g_out_len, want)
+
+fn err_is(want: StrView) -> i32
+    bytes_differ(@g_err[0], g_err_len, want)
+
+# ============================================================================
+# Cases
+# ============================================================================
+
+var g_want: [65536]u8
+var g_want_len: i64 = 0
+
+fn want_add(s: *u8)
+    var i: i64 = 0
+    while *(s + i) != 0 and g_want_len < 65536
+        g_want[g_want_len] = *(s + i)
+        g_want_len += 1
+        i += 1
+
+# Load /proc/self/exe into `reader`; 0 on success.
+fn load_self(reader: *ElfReader) -> i32
+    let fd: i32 = sys_open(c"/proc/self/exe", O_RDONLY)
+    if fd < 0
+        return 1
+    let size: i64 = sys_lseek(fd, 0, 2)
+    sys_lseek(fd, 0, 0)
+    let data: *u8 = malloc(size)
+    var got: i64 = read_all(fd, data, size)
+    sys_close(fd)
+    if got != size
+        return 2
+    if elf_init(reader, data, size) != 0
+        return 3
+    if elf_parse_sections(reader) != 0
+        return 4
+    0
+
+fn run_body(which: i32) -> i32
+    var reader: ElfReader
+    let rc = load_self(@reader)
+    if rc != 0
+        return rc
+    elf_print_test_functions(@reader)
+    0
+
+# Expected bytes, assembled from the symbol table without the printer.
+# Returns how many of this file's markers were listed.
+fn build_want() -> i32
+    var reader: ElfReader
+    if load_self(@reader) != 0
+        return -1
+    want_add(c"Test functions found:\n")
+    var mine: i32 = 0
+    var i: i64 = 0
+    while i < reader.symtab_count
+        let info: u8 = elf_get_symbol_info(@reader, i)
+        if elf_is_function(info) != 0 and elf_is_global(info) != 0
+            let name: *u8 = elf_get_symbol_name(@reader, i)
+            if name != null and starts_with(name, c"test_") != 0
+                want_add(c"  ")
+                want_add(name)
+                want_add(c"\n")
+                if starts_with(name, c"test_elf_output_marker") != 0
+                    mine += 1
+        i += 1
+    mine
+
+[[test]]
+fn test_elf_print_test_functions_exact() -> i32
+    assert build_want() == 2
+    assert run_case(1) == 0
+    let want = StrView { ptr: @g_want[0], len: g_want_len }
+    assert out_is(want) == 0
+    assert err_is("") == 0
+    0
+
+# Global `test_` functions for the printer to find (see the header).
+pub fn test_elf_output_marker_a() -> i32
+    1
+
+pub fn test_elf_output_marker_b() -> i32
+    2
