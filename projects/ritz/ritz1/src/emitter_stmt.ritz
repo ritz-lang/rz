@@ -44,6 +44,27 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
         var_type = TYPE_I64
         stmt.var_type = TYPE_I64
 
+    # AGAST #1666: untyped `let v = match ...`.  The merge phi's type is only
+    # known once the arms are emitted (#1645: `%StrView`, `%Point`, or i64),
+    # and the slot below is sized before the init is emitted.  So emit the
+    # match first and take the slot type from emit_match's phi.  Without
+    # this the slot stayed i64 and clang rejected `store i64 <%StrView phi>`.
+    # Shadowing is unaffected: `v` is registered after its initializer.
+    var pre_init_reg: i32 = 0
+    var pre_emitted: i32 = 0
+    if var_type == TYPE_I64 and stmt.var_type_name_len == 0 and stmt.var_init != null
+        if stmt.var_init.kind == EXPR_MATCH
+            # Clear first so a stale type from an earlier match can't leak in.
+            s.last_match_agg_name = null
+            s.last_match_agg_name_len = 0
+            pre_init_reg = emit_expr(s, stmt.var_init)
+            pre_emitted = 1
+            if s.last_match_agg_name != null and s.last_match_agg_name_len > 0
+                var_type = TYPE_STRUCT
+                stmt.var_type = TYPE_STRUCT
+                stmt.var_type_name = s.last_match_agg_name
+                stmt.var_type_name_len = s.last_match_agg_name_len
+
     # Infer struct type for `var IDENT = expr` (no annotation).
     # The parser defaults missing annotations to TYPE_I64, which is
     # fine for numeric initializers but breaks when the initializer
@@ -621,7 +642,9 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
                 if is_simd_vector_type_name(stmt.var_type_name, stmt.var_type_name_len) == 1
                     s.ctx_simd_name = stmt.var_type_name
                     s.ctx_simd_name_len = stmt.var_type_name_len
-        let init_reg: i32 = emit_expr(s, stmt.var_init)
+        var init_reg: i32 = pre_init_reg
+        if pre_emitted == 0
+            init_reg = emit_expr(s, stmt.var_init)
         s.ctx_enum_name = _saved_ctx
         s.ctx_enum_name_len = _saved_ctx_len
         s.ctx_simd_name = _saved_simd
