@@ -3105,7 +3105,37 @@ fn emit_expr_method(s: *EmitterState, e: *Expr) -> i32
             mp = mp.next
     for j in 0..arg_count
         if mp != null
-            if mp.param_type == TYPE_REF and mp.param_type_name_len > 0
+            # Integer args are i64 registers; narrow them to the param width
+            # like the free-fn and UFCS paths do, or the call passes an i64
+            # register under an iN type (AGAST #1607, #1580).
+            var narrow_to: *u8 = null
+            if mp.param_type == TYPE_I8 or mp.param_type == TYPE_U8
+                narrow_to = c" to i8\n"
+            else if mp.param_type == TYPE_I16 or mp.param_type == TYPE_U16
+                narrow_to = c" to i16\n"
+            else if mp.param_type == TYPE_I32 or mp.param_type == TYPE_U32
+                narrow_to = c" to i32\n"
+            else if mp.param_type == TYPE_BOOL
+                # Bool values are i64 registers except a bool global's i1
+                # load (see bool_reg_is_i1, AGAST #1646).
+                var mbe: *Expr = e.args
+                var mbk: i32 = 0
+                while mbk < j and mbe != null
+                    mbe = mbe.next
+                    mbk = mbk + 1
+                narrow_to = c" to i1\n"
+                if mbe != null
+                    if bool_reg_is_i1(s, mbe) == 1
+                        narrow_to = null
+            if narrow_to != null
+                let mtr: i32 = next_reg(s)
+                emit_str(s, c"  ")
+                emit_reg(s, mtr)
+                emit_str(s, c" = trunc i64 ")
+                emit_reg(s, arg_regs[j])
+                emit_str(s, narrow_to)
+                conv_regs[j] = mtr
+            else if mp.param_type == TYPE_REF and mp.param_type_name_len > 0
                 var mae: *Expr = e.args
                 var mk: i32 = 0
                 while mk < j and mae != null
@@ -3171,11 +3201,19 @@ fn emit_expr_method(s: *EmitterState, e: *Expr) -> i32
     if mfn != null
         rtype = mfn.return_type
 
-    # Emit the call with the correct return type keyword.
-    let result: i32 = next_reg(s)
-    emit_str(s, c"  ")
-    emit_reg(s, result)
-    if rtype == TYPE_BOOL
+    # Emit the call with the correct return type keyword.  A void method is
+    # `call void` with no result register; binding one to `call i64` would
+    # mismatch the `define void` (AGAST #1581).
+    var result: i32 = 0
+    if rtype == TYPE_VOID
+        emit_str(s, c"  call void @")
+    else
+        result = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, result)
+    if rtype == TYPE_VOID
+        result = 0
+    else if rtype == TYPE_BOOL
         emit_str(s, c" = call i1 @")
     else if rtype == TYPE_I32 or rtype == TYPE_U32
         emit_str(s, c" = call i32 @")

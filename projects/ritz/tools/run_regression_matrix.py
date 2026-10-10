@@ -75,8 +75,6 @@ EXPECTED_FAILURES = {
 # the passing one turns xpass and the gate goes red.
 _RITZ1_TWINS = {
     # --- codegen, build failures ---
-    "test_mut_ref":
-        "AGAST #1607 — instance-method args not narrowed to param width (invalid IR)",
     "test_level12":
         "AGAST #1608 — struct literal nested in a field/array literal rejected",
     "test_aesni":
@@ -99,10 +97,11 @@ _RITZ1_TWINS = {
     "test_level33":
         "AGAST #1635 — unspecified ritz0-only `m[k]` sugar for HashMapI64; ritz1 "
         "emits invalid IR",
+    # --- codegen, runtime failures ---
+    "test_level25::test_method_on_pointer":
+        "AGAST #1692 — `p.sum()` with `p: *Point`: the method call passes the "
+        "pointer's stack slot, not the pointer",
     # --- grammar / missing features ---
-    "test_level25":
-        "AGAST #1607 — `p.move_by(10, 20)`: instance-method args not narrowed "
-        "to param width (invalid IR)",
     "test_level30":
         "AGAST #1520 — methods of a generic impl (`impl<T> Describable for "
         "Wrapper<T>`) are never specialized: undefined `Wrapper$i64_describe`",
