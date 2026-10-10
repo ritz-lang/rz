@@ -101,10 +101,8 @@ pub fn main() -> i32
     let o = Outer { k: 9, inner: Inner { tag: 5, name: "xyz" }, label: "lbl!" }
     if o.inner.name.len != 3
         return 1
-    # Read the bytes through a one-level chain: `*(o.inner.name.ptr + 1)`
-    # loads i64 under ritz1, a separate deref-width bug (filed from #1669).
-    let nm: StrView = o.inner.name
-    if *(nm.ptr + 1) != 121
+    # Read the byte straight through the 3-level chain (AGAST #1673).
+    if *(o.inner.name.ptr + 1) != 121
         return 2
     if o.label.len != 4 or *(o.label.ptr + 3) != 33
         return 3
