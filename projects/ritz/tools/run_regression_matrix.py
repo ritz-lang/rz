@@ -120,8 +120,7 @@ _RITZ1_TWINS = {
         "AGAST #1295 — payload-carrying user enums / struct variants / N-ary "
         "patterns; also AGAST #1617 (assignment match-arm bodies)",
     "test_level24":
-        "AGAST #1622 — union type aliases + type-name patterns; also AGAST #1618 "
-        "(`return match`)",
+        "AGAST #1622 — union type aliases + type-name patterns",
     "test_level39":
         "AGAST #1623 — closures / anonymous fns (spec says not implemented)",
     "test_issue99":
