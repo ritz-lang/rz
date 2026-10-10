@@ -9453,6 +9453,12 @@ class LLVMEmitter:
             else:
                 # For other lvalues (field, index), use normal lvalue_addr
                 receiver_val = self._emit_lvalue_addr(expr.expr)
+                # A pointer-typed field/element (`o.q` with `q: *P`) has a
+                # slot that holds the pointer: pass the pointer, not the
+                # slot's address (AGAST #1692).
+                if (receiver_val.type != first_param_type
+                        and isinstance(receiver_val.type.pointee, ir.PointerType)):
+                    receiver_val = self.builder.load(receiver_val)
         else:
             # Emit as normal expression
             receiver_val = self._emit_expr(expr.expr)

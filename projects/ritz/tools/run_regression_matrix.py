@@ -97,10 +97,6 @@ _RITZ1_TWINS = {
     "test_level33":
         "AGAST #1635 — unspecified ritz0-only `m[k]` sugar for HashMapI64; ritz1 "
         "emits invalid IR",
-    # --- codegen, runtime failures ---
-    "test_level25::test_method_on_pointer":
-        "AGAST #1692 — `p.sum()` with `p: *Point`: the method call passes the "
-        "pointer's stack slot, not the pointer",
     # --- grammar / missing features ---
     "test_level30":
         "AGAST #1520 — methods of a generic impl (`impl<T> Describable for "

@@ -100,9 +100,10 @@ pub fn main() -> i32
     return 42
 """
 
-# Receiver forms that reach the Type_method fallback: a local, a field and a
-# nested field. Pointer-typed receivers (`pp: *P`, `q: *P`) are left out:
-# the fallback passes the pointer's slot, not the pointer (AGAST #1692).
+# Receiver forms that reach the Type_method fallback: a local, a field, a
+# nested field, and the pointer-typed ones: a pointer local, a pointer param
+# and a pointer field. A pointer receiver must pass the pointer itself, not
+# the stack slot holding it (AGAST #1692).
 RECEIVER_FORMS = """\
 struct P
     v: i32
@@ -113,23 +114,41 @@ impl P
 
 struct O
     p: P
+    q: *P
 
 struct OO
     o: O
+
+fn via_param(pp: *P)
+    pp.put(30, 3)
 
 pub fn main() -> i32
     var p: P = P { v: 0 }
     p.put(1, 2)
     if p.v != 3
         return 1
-    var o: O = O { p: P { v: 0 } }
+    let pp: *P = @p
+    pp.put(4, 5)
+    if p.v != 9
+        return 2
+    var other: P = P { v: 0 }
+    var o: O = O { p: P { v: 0 }, q: @other }
     o.p.put(10, 1)
     if o.p.v != 11
         return 3
-    var oo: OO = OO { o: O { p: P { v: 0 } } }
+    o.q.put(20, 2)
+    if other.v != 22
+        return 5
+    via_param(@other)
+    if other.v != 33
+        return 6
+    var oo: OO = OO { o: O { p: P { v: 0 }, q: @p } }
     oo.o.p.put(20, 2)
     if oo.o.p.v != 22
         return 4
+    oo.o.q.put(7, 1)
+    if p.v != 8
+        return 7
     return 42
 """
 
@@ -216,6 +235,15 @@ def test_method_args_match_ritz0(ritz1_bin, tmp_path, name, program):  # noqa: F
     expected = _run("ritz0", tmp_path, name, program)
     got = _run("ritz1", tmp_path, name, program)
     assert got == expected, f"{name}: ritz1 exit {got}, ritz0 exit {expected}"
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", ["ritz0", "ritz1"])
+def test_pointer_receivers_pass_the_pointer(ritz1_bin, tmp_path, compiler):  # noqa: F811
+    """Both compilers must get RECEIVER_FORMS right, not merely agree: ritz0
+    also passed a pointer field's slot (`o.q.put`, exit 5) (AGAST #1692)."""
+    got = _run(compiler, tmp_path, "ptr_recv", RECEIVER_FORMS)
+    assert got == 42, f"{compiler}: exit {got}"
 
 
 @pytest.mark.integration
