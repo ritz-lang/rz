@@ -453,7 +453,9 @@ fn read_file_to_buf(path: *u8, out_len: *i64) -> *u8
     let fd: i32 = sys_open(path, O_RDONLY)
     if fd < 0
         return null
-    # Use stat to learn size; fallback to incremental read if stat fails.
+    # Use stat to learn size.  It is only an upper bound: the file can shrink
+    # before we read it, and under valgrind `stat("/proc/self/exe")`
+    # describes memcheck while `open` is redirected to the client binary.
     var st: Stat
     let stres: i32 = sys_stat2(path, @st)
     if stres != 0
@@ -467,14 +469,25 @@ fn read_file_to_buf(path: *u8, out_len: *i64) -> *u8
     if buf == null
         sys_close(fd)
         return null
+    # Report only the bytes actually read.  This used to set `total = sz` on
+    # EOF/error, claiming an uninitialised tail as file contents, so the
+    # compiler fingerprint hashed garbage (AGAST #1663).
     var total: i64 = 0
-    while total < sz
+    var done: i32 = 0
+    while done == 0 and total < sz
         let n: i64 = sys_read(fd, buf + total, sz - total)
-        if n <= 0
-            total = sz   # bail; partial read => skip remaining
+        if n < 0
+            sys_close(fd)
+            free(buf)
+            return null
+        if n == 0
+            done = 1     # EOF: the file is shorter than stat said
         else
             total = total + n
     sys_close(fd)
+    if total <= 0
+        free(buf)
+        return null
     *(buf + total) = 0
     *out_len = total
     return buf
