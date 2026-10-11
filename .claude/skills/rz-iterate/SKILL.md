@@ -21,9 +21,15 @@ Repeat until the goal is met:
    `get_conversation_messages(room_id="rz", message_type="chat", since=<last check>)`,
    and queue any REAP whose SHA is not on `origin/main`, not already in the
    scratchpad, and not already superseded by a newer REAP from the same room.
-2. **Fill free slots.** Up to **6 rooms** at once. Pick `ready` AGAST tickets that
-   move the current milestone forward (see "Where to start"). Spawn every one
-   that can run in parallel in the same turn.
+2. **Fill free slots.** Up to **2 rooms** at once (lowered from 6: six agents
+   plus their builds exhausted the machine's memory).
+   - **Paused rooms come first.** A room whose agent unit is stopped and
+     disabled (`systemctl --user disable --now adele-agent@ritz-task-<id>`) but
+     whose worktree still exists is paused, not finished. Resume it
+     (`enable --now`, then a message stating `main` and its last state) before
+     spawning anything new.
+   - Otherwise pick `ready` AGAST tickets that move the current milestone
+     forward (see "Where to start"), up to the limit.
    - Don't run two rooms that will rewrite the same heavily edited file
      (for example `ritz1/src/emitter*.ritz`, `ritz0/emitter_llvmlite.py`). Queue
      the second behind the first with an AGAST dependency instead.
