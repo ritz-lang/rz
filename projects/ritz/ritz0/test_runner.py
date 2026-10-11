@@ -47,6 +47,33 @@ def get_sources_from_config(config: dict) -> list:
     return sources
 
 
+def project_source_roots(project_root: Optional[Path]) -> List[str]:
+    """Absolute, existing `sources` directories from project_root/ritz.toml.
+
+    Passed to every ritz0 compile as `--sources` so a test file resolves
+    imports the same way `rz build` resolves the package's own sources.
+    Discovery (setup_test_environment) always used these roots; the dependency
+    and harness compiles did not, so `import types.color` was found and then
+    "Cannot find module" at compile time (AGAST #1686).
+    """
+    if project_root is None:
+        return []
+    toml_path = Path(project_root) / "ritz.toml"
+    if not toml_path.exists():
+        return []
+    with open(toml_path, "rb") as f:
+        config = tomllib.load(f)
+    roots = [Path(project_root) / s for s in get_sources_from_config(config)]
+    return [str(r) for r in roots if r.is_dir()]
+
+
+def _sources_args(project_root: Optional[Path]) -> List[str]:
+    """`--sources <json>` for a ritz0 compile, or nothing if there are none."""
+    import json
+    roots = project_source_roots(project_root)
+    return ["--sources", json.dumps(roots)] if roots else []
+
+
 def parse_project_dependencies(project_root: Path) -> dict:
     """Parse dependencies from project's ritz.toml.
 
@@ -297,12 +324,7 @@ def setup_test_environment(source_path: str, tmpdir: str) -> Tuple[Optional[Path
         dependencies = parse_project_dependencies(project_root)
 
         # Read source roots from project's ritz.toml
-        toml_path = project_root / "ritz.toml"
-        if toml_path.exists():
-            with open(toml_path, "rb") as f:
-                config = tomllib.load(f)
-            sources = get_sources_from_config(config)
-            source_roots = [str(project_root / s) for s in sources]
+        source_roots = project_source_roots(project_root) or None
 
         # Add ritzlib to source roots (from ritz project or RITZ_PATH)
         ritz0_dir = Path(__file__).parent.resolve()
@@ -416,6 +438,7 @@ def compile_dependencies(
         # Pass project root if provided
         if project_root:
             compile_cmd.extend(["--project-root", str(project_root)])
+        compile_cmd.extend(_sources_args(project_root))
 
         result = subprocess.run(compile_cmd, capture_output=True, text=True)
         if result.returncode != 0:
@@ -453,6 +476,7 @@ def _compile_harness(
     # Pass project root for import resolution
     if project_root:
         compile_cmd.extend(["--project-root", str(project_root)])
+    compile_cmd.extend(_sources_args(project_root))
 
     result = subprocess.run(compile_cmd, capture_output=True, text=True)
     if result.returncode != 0:

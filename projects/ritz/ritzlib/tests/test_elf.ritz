@@ -1,78 +1,103 @@
-# Test the ELF parser by reading a compiled object file
+# Test ritzlib.elf against a real ELF64 file: the running test binary.
+#
+# This used to be a CLI tool (`test_elf <file.o>`) with a main() and no
+# [[test]] functions, so the harness ran zero tests and reported the file as
+# "a test file that cannot fail" (AGAST #1686). /proc/self/exe is always a
+# valid, unstripped ELF64 executable that contains this file's test functions.
 
 import ritzlib.sys
-import ritzlib.io
 import ritzlib.memory
 import ritzlib.elf
 
-# lseek whence values
 const SEEK_SET: i32 = 0
-const SEEK_CUR: i32 = 1
 const SEEK_END: i32 = 2
 
-fn main(argc: i32, argv: **i8) -> i32
-    if argc < 2
-        prints("Usage: test_elf <file.o>\n")
-        return 1
-
-    let filename: *i8 = *(argv + 1)
-    prints("Reading ELF file: ")
-    prints(filename)
-    prints("\n")
-
-    # Open and read the file
-    let fd: i32 = sys_open(filename as *u8, O_RDONLY)
+# Read the whole file at `path` into a malloc'd buffer; writes its size to
+# `out_size`. Returns null on any failure.
+fn read_whole_file(path: *u8, out_size: *i64) -> *u8
+    let fd: i32 = sys_open(path, O_RDONLY)
     if fd < 0
-        prints("Error: Could not open file\n")
-        return 1
-
-    # Get file size using lseek
+        return null
     let size: i64 = sys_lseek(fd, 0, SEEK_END)
     sys_lseek(fd, 0, SEEK_SET)
-
-    prints("File size: ")
-    print_int(size as i32)
-    prints(" bytes\n")
-
-    # Allocate buffer and read file
+    if size <= 0
+        sys_close(fd)
+        return null
     let data: *u8 = malloc(size)
     if data == null
-        prints("Error: Could not allocate memory\n")
         sys_close(fd)
-        return 1
-
-    let bytes_read: i64 = sys_read(fd, data, size)
+        return null
+    # read() may return short counts on large files; loop until done.
+    var got: i64 = 0
+    while got < size
+        let n: i64 = sys_read(fd, data + got, size - got)
+        if n <= 0
+            break
+        got += n
     sys_close(fd)
+    if got != size
+        free(data)
+        return null
+    *out_size = size
+    data
 
-    if bytes_read != size
-        prints("Error: Could not read entire file\n")
-        return 1
-
-    # Initialize ELF reader
+[[test]]
+fn test_elf_parses_self_exe() -> i32
+    var size: i64 = 0
+    let data: *u8 = read_whole_file(c"/proc/self/exe", @size)
+    assert data != null
     var reader: ElfReader
-    if elf_init(@reader, data, size) != 0
-        prints("Error: Not a valid ELF64 file\n")
-        return 1
-
-    prints("Valid ELF64 file\n")
-
-    # Parse sections
-    if elf_parse_sections(@reader) != 0
-        prints("Error: Could not parse sections\n")
-        return 1
-
-    prints("Symbol count: ")
-    print_int(elf_symbol_count(@reader) as i32)
-    prints("\n")
-
-    # Find test functions
-    let test_count: i32 = elf_find_test_functions(@reader, null, null)
-    prints("Test functions: ")
-    print_int(test_count)
-    prints("\n")
-
-    # Print them
-    elf_print_test_functions(@reader)
-
+    assert elf_init(@reader, data, size) == 0
+    assert elf_parse_sections(@reader) == 0
+    assert elf_symbol_count(@reader) > 0
     free(data)
-    return 0
+    0
+
+[[test]]
+fn test_elf_finds_own_test_symbols() -> i32
+    var size: i64 = 0
+    let data: *u8 = read_whole_file(c"/proc/self/exe", @size)
+    assert data != null
+    var reader: ElfReader
+    assert elf_init(@reader, data, size) == 0
+    assert elf_parse_sections(@reader) == 0
+    # This file defines several [[test]] functions named test_elf_*. The test
+    # harness links them with LOCAL binding, so elf_find_test_functions (which
+    # wants GLOBAL symbols, as in a .o) is not the right probe here; walk the
+    # symbol table by name instead, which exercises symtab + strtab parsing.
+    var found: i32 = 0
+    var i: i64 = 0
+    while i < elf_symbol_count(@reader)
+        let name: *u8 = elf_get_symbol_name(@reader, i)
+        if name != null and starts_with(name, c"test_elf_") != 0
+            assert elf_is_function(elf_get_symbol_info(@reader, i)) == 1
+            found += 1
+        i += 1
+    assert found >= 4
+    free(data)
+    0
+
+[[test]]
+fn test_elf_symbol_info_predicates() -> i32
+    # st_info = (binding << 4) | type
+    let global_func: u8 = ((STB_GLOBAL << 4) | STT_FUNC) as u8
+    let local_func: u8 = STT_FUNC as u8
+    let global_obj: u8 = (STB_GLOBAL << 4) as u8
+    assert elf_is_function(global_func) == 1
+    assert elf_is_global(global_func) == 1
+    assert elf_is_function(local_func) == 1
+    assert elf_is_global(local_func) == 0
+    assert elf_is_function(global_obj) == 0
+    assert elf_is_global(global_obj) == 1
+    0
+
+[[test]]
+fn test_elf_rejects_non_elf() -> i32
+    var buf: [64]u8
+    var i: i32 = 0
+    while i < 64
+        buf[i] = 0x41
+        i += 1
+    var reader: ElfReader
+    assert elf_init(@reader, @buf[0], 64) != 0
+    0
