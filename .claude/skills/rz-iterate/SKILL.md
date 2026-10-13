@@ -21,8 +21,10 @@ Repeat until the goal is met:
    `get_conversation_messages(room_id="rz", message_type="chat", since=<last check>)`,
    and queue any REAP whose SHA is not on `origin/main`, not already in the
    scratchpad, and not already superseded by a newer REAP from the same room.
-2. **Fill free slots.** Up to **2 rooms** at once (lowered from 6: six agents
-   plus their builds exhausted the machine's memory).
+2. **Fill the free slot.** **1 room** at a time (lowered from 6, then 2: WSL
+   kept going down from OOM with several agents plus their builds and gates
+   running at once). Spawn the next room only after the current one has
+   merged or been paused.
    - **Paused rooms come first.** A room whose agent unit is stopped and
      disabled (`systemctl --user disable --now adele-agent@ritz-task-<id>`) but
      whose worktree still exists is paused, not finished. Resume it
@@ -126,7 +128,7 @@ and pushes. Nobody re-runs your tests. Your REAP vouches for that exact commit.
    LOG=$(~/dev/ritz-lang/rz/.claude/skills/rz-iterate/run-gate.sh ~/dev/ritz-lang/rz-task-<id> <id>)
    ~/dev/ritz-lang/rz/.claude/skills/rz-iterate/run-gate.sh --wait "$LOG"
    ```
-   It runs a clean `make -C projects/ritz ci-local`, at most 2 gates at once
+   It runs a clean `make -C projects/ritz ci-local`, 1 gate at a time
    machine-wide, and exits with the gate's code (98 = died with no verdict,
    99 = HEAD moved during the run; neither is a pass). If your change touches
    packages outside `projects/ritz`, also build them (`./rz build <pkg>`) and run

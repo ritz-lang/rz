@@ -8,7 +8,7 @@
 #
 # Env overrides:
 #   RZ_GATE_CMD    command run from <worktree>   (default: clean ci-local)
-#   RZ_GATE_SLOTS  gates allowed at once         (default: 2)
+#   RZ_GATE_SLOTS  gates allowed at once         (default: 1)
 #   RZ_GATE_DIR    where logs and slot locks go  (default: ~/dev/ritz-lang/gate-logs)
 #
 # Why each piece exists (rz-iterate):
@@ -16,6 +16,7 @@
 #     starts (AGAST #1441).  Two #1436 gates died that way, silently.
 #   * slots: 12 cores.  ci-local has 180 s timed tests; six concurrent gates
 #     turn them into timeouts that look like regressions and are not.
+#     Default is 1: concurrent gates OOM'd the WSL VM and took it down.
 #   * SHA in the log name, and the HEAD-moved check: the callback claims a
 #     specific commit passed.  A gate that ran while HEAD moved proves nothing.
 #   * EXIT line always written, and --wait reports a unit that died without
@@ -48,7 +49,7 @@ fi
 
 WT="$(cd "$1" && pwd -P)"
 NAME="$2"
-SLOTS="${RZ_GATE_SLOTS:-2}"
+SLOTS="${RZ_GATE_SLOTS:-1}"
 # Wipe ritz1/build too: a gate is a verdict on the commit, not on whatever
 # objects an earlier base left behind.  Reusing it is how #1497 got 30 bogus
 # failures from stale struct layouts (AGAST #1659).
