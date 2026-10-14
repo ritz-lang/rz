@@ -93,6 +93,8 @@ fn emit_implicit_return_tail(s: *EmitterState, has_explicit_return: i32, ret_typ
                 emit_str(s, c"  ret i16 ")
                 emit_reg(s, btrunc16)
                 emit_str(s, c"\n")
+            else if named_struct == 1 and s.ret_sret == 1
+                emit_sret_ret_value(s, ival)   # AGAST #1730
             else if named_struct == 1
                 # tagged-enum or named-struct return: use the named type
                 # (ritz-task-133).  Without this the tail-expression phi
@@ -110,7 +112,9 @@ fn emit_implicit_return_tail(s: *EmitterState, has_explicit_return: i32, ret_typ
                 emit_str(s, c"\n")
         else
             # No value available, return 0
-            if named_struct == 1
+            if named_struct == 1 and s.ret_sret == 1
+                emit_sret_ret_zero(s)   # AGAST #1730
+            else if named_struct == 1
                 emit_str(s, c"  ret ")
                 emit_llvm_type_struct(s, TYPE_STRUCT, ret_type_name, ret_type_name_len)
                 emit_str(s, c" zeroinitializer\n")
@@ -216,6 +220,10 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
     # Store return type name for struct returns
     s.ret_type_name = f.return_type_name
     s.ret_type_name_len = f.return_type_name_len
+    # AGAST #1730 — large struct returns go through `ptr sret(%T) %ret.sret`.
+    s.ret_sret = struct_ret_uses_sret(s, f.return_type, f.return_type_name, f.return_type_name_len)
+    s.sret_last_val = 0
+    s.sret_last_slot = 0
 
     # Linkage selection — AGAST #194 modular emit:
     #   - `main`: external (runtime _start needs it).
@@ -244,13 +252,20 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
         emit_str(s, c"define linkonce_odr ")
     else
         emit_str(s, c"define weak_odr ")
-    emit_llvm_type_struct(s, f.return_type, f.return_type_name, f.return_type_name_len)
+    if s.ret_sret == 1
+        emit_str(s, c"void")
+    else
+        emit_llvm_type_struct(s, f.return_type, f.return_type_name, f.return_type_name_len)
     emit_str(s, c" @")
     emit_name(s, f.name, f.name_len)
     emit_str(s, c"(")
 
     var param2: *Param = f.params
     var first2: i32 = 1
+    if s.ret_sret == 1
+        emit_sret_attr(s, f.return_type_name, f.return_type_name_len)
+        emit_str(s, c"%ret.sret")
+        first2 = 0
     while param2 != null
         if first2 == 0
             emit_str(s, c", ")
@@ -326,27 +341,32 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
                 emit_name(s, stmt.expr.ident_ptr, stmt.expr.ident_len)
                 emit_str(s, c"\n")
                 emit_struct_lit_to_alloca(s, stmt.expr, alloca_reg)
-                # Load the struct value and return it
-                let val: i32 = next_reg(s)
-                emit_str(s, c"  ")
-                emit_reg(s, val)
-                emit_str(s, c" = load %")
-                emit_name(s, stmt.expr.ident_ptr, stmt.expr.ident_len)
-                emit_str(s, c", ptr ")
-                emit_reg(s, alloca_reg)
-                emit_str(s, c"\n")
-                emit_str(s, c"  ret %")
-                emit_name(s, stmt.expr.ident_ptr, stmt.expr.ident_len)
-                emit_str(s, c" ")
-                emit_reg(s, val)
-                emit_str(s, c"\n")
+                if s.ret_sret == 1
+                    emit_sret_ret_from_ptr(s, alloca_reg)   # AGAST #1730
+                else
+                    # Load the struct value and return it
+                    let val: i32 = next_reg(s)
+                    emit_str(s, c"  ")
+                    emit_reg(s, val)
+                    emit_str(s, c" = load %")
+                    emit_name(s, stmt.expr.ident_ptr, stmt.expr.ident_len)
+                    emit_str(s, c", ptr ")
+                    emit_reg(s, alloca_reg)
+                    emit_str(s, c"\n")
+                    emit_str(s, c"  ret %")
+                    emit_name(s, stmt.expr.ident_ptr, stmt.expr.ident_len)
+                    emit_str(s, c" ")
+                    emit_reg(s, val)
+                    emit_str(s, c"\n")
             else if f.return_type == TYPE_STRUCT
                 # Struct return — handle ident (load from alloca) or call result.
                 # Use emit_llvm_type_struct so tagged-enum types (Result$/Option$)
                 # auto-route to `i64` instead of `%<name>` (task-99 cluster #3).
                 if stmt.expr.kind == EXPR_IDENT
                     let local: *LocalVar = find_local_struct_name(s, stmt.expr.ident_ptr, stmt.expr.ident_len)
-                    if local != null
+                    if local != null and s.ret_sret == 1
+                        emit_sret_ret_from_ptr(s, find_local(s, stmt.expr.ident_ptr, stmt.expr.ident_len))   # AGAST #1730
+                    else if local != null
                         let loc: i32 = find_local(s, stmt.expr.ident_ptr, stmt.expr.ident_len)
                         let val: i32 = next_reg(s)
                         emit_str(s, c"  ")
@@ -361,6 +381,8 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
                         emit_str(s, c" ")
                         emit_reg(s, val)
                         emit_str(s, c"\n")
+                    else if s.ret_sret == 1
+                        emit_sret_ret_value(s, emit_expr(s, stmt.expr))   # AGAST #1730
                     else
                         let val: i32 = emit_expr(s, stmt.expr)
                         emit_str(s, c"  ret ")
@@ -368,6 +390,8 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
                         emit_str(s, c" ")
                         emit_reg(s, val)
                         emit_str(s, c"\n")
+                else if s.ret_sret == 1
+                    emit_sret_ret_value(s, emit_expr(s, stmt.expr))   # AGAST #1730
                 else
                     # Function call or other expression returning struct.
                     # AGAST #1643: a tail `"..."` is a %Span$u8; coerce it to a
@@ -486,6 +510,10 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
     # earlier and last set s.ret_type_name.
     s.ret_type_name = method.return_type_name
     s.ret_type_name_len = method.return_type_name_len
+    # AGAST #1730 — large struct returns go through `ptr sret(%T) %ret.sret`.
+    s.ret_sret = struct_ret_uses_sret(s, method.return_type, method.return_type_name, method.return_type_name_len)
+    s.sret_last_val = 0
+    s.sret_last_slot = 0
 
     # Linkage selection mirrors emit_fn:
     #   - mangled name contains '$' (e.g. `Vec$u8_push`): linkonce_odr
@@ -508,7 +536,9 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
     # emit_llvm_type which preserves the legacy i64 default for
     # TYPE_STRUCT-without-name (impl methods whose return slot lost the
     # name during parse — strview_slice etc. land here).
-    if method.return_type == TYPE_STRUCT and method.return_type_name != null and method.return_type_name_len > 0
+    if s.ret_sret == 1
+        emit_str(s, c"void")
+    else if method.return_type == TYPE_STRUCT and method.return_type_name != null and method.return_type_name_len > 0
         emit_llvm_type_struct(s, method.return_type, method.return_type_name, method.return_type_name_len)
     else
         emit_llvm_type(s, method.return_type)
@@ -521,6 +551,10 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
 
     var param: *Param = method.params
     var first: i32 = 1
+    if s.ret_sret == 1
+        emit_sret_attr(s, method.return_type_name, method.return_type_name_len)
+        emit_str(s, c"%ret.sret")
+        first = 0
     while param != null
         if first == 0
             emit_str(s, c", ")
@@ -619,20 +653,23 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
                 emit_name(s, stmt.expr.ident_ptr, stmt.expr.ident_len)
                 emit_str(s, c"\n")
                 emit_struct_lit_to_alloca(s, stmt.expr, alloca_reg)
-                # Load the struct value and return it
-                let val: i32 = next_reg(s)
-                emit_str(s, c"  ")
-                emit_reg(s, val)
-                emit_str(s, c" = load %")
-                emit_name(s, stmt.expr.ident_ptr, stmt.expr.ident_len)
-                emit_str(s, c", ptr ")
-                emit_reg(s, alloca_reg)
-                emit_str(s, c"\n")
-                emit_str(s, c"  ret %")
-                emit_name(s, stmt.expr.ident_ptr, stmt.expr.ident_len)
-                emit_str(s, c" ")
-                emit_reg(s, val)
-                emit_str(s, c"\n")
+                if s.ret_sret == 1
+                    emit_sret_ret_from_ptr(s, alloca_reg)   # AGAST #1730
+                else
+                    # Load the struct value and return it
+                    let val: i32 = next_reg(s)
+                    emit_str(s, c"  ")
+                    emit_reg(s, val)
+                    emit_str(s, c" = load %")
+                    emit_name(s, stmt.expr.ident_ptr, stmt.expr.ident_len)
+                    emit_str(s, c", ptr ")
+                    emit_reg(s, alloca_reg)
+                    emit_str(s, c"\n")
+                    emit_str(s, c"  ret %")
+                    emit_name(s, stmt.expr.ident_ptr, stmt.expr.ident_len)
+                    emit_str(s, c" ")
+                    emit_reg(s, val)
+                    emit_str(s, c"\n")
             else
                 let val: i32 = emit_expr(s, stmt.expr)
                 if method.return_type == TYPE_I32 or method.return_type == TYPE_U32
@@ -691,7 +728,17 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
                     #  * EXPR_CALL (`return strview_slice(...)`): the
                     #    call already produced a `%T` register, so
                     #    just `ret %T <val>` directly.
-                    if stmt.expr.kind == EXPR_IDENT
+                    if stmt.expr.kind == EXPR_IDENT and s.ret_sret == 1
+                        let spp: i32 = next_reg(s)
+                        emit_str(s, c"  ")
+                        emit_reg(s, spp)
+                        emit_str(s, c" = inttoptr i64 ")
+                        emit_reg(s, val)
+                        emit_str(s, c" to ptr\n")
+                        emit_sret_ret_from_ptr(s, spp)   # AGAST #1730
+                    else if s.ret_sret == 1
+                        emit_sret_ret_value(s, val)   # AGAST #1730
+                    else if stmt.expr.kind == EXPR_IDENT
                         let pp: i32 = next_reg(s)
                         emit_str(s, c"  ")
                         emit_reg(s, pp)
@@ -1103,7 +1150,12 @@ fn emit_extern_declarations(s: *EmitterState)
         if is_local_function(s.module, ex.name, ex.name_len) == 0
                 # Look up the function's return type from its definition
                 let fn_def: *FnDef = find_fn(s, ex.name, ex.name_len)
-                if fn_def != null and fn_def.return_type == TYPE_STRUCT
+                if fn_def != null and struct_ret_uses_sret(s, fn_def.return_type, fn_def.return_type_name, fn_def.return_type_name_len) == 1
+                    # AGAST #1730 — the call sites pass `ptr sret(%T)`.
+                    emit_str(s, c"declare void @")
+                    emit_name(s, ex.name, ex.name_len)
+                    emit_str(s, c"(...)\n")
+                else if fn_def != null and fn_def.return_type == TYPE_STRUCT
                     emit_str(s, c"declare %")
                     emit_name(s, fn_def.return_type_name, fn_def.return_type_name_len)
                     emit_str(s, c" @")
@@ -2153,6 +2205,10 @@ fn emit_module(m: *Module, out: *Vec<u8>) -> i32
     s.last_match_agg_name = null   # AGAST #1666
     s.last_match_agg_name_len = 0
     s.error_count = 0   # AGAST #1369 — see emit_ir_error / the return below
+    s.ret_sret = 0   # AGAST #1730 — set per fn by emit_fn / emit_impl_method
+    s.sret_last_val = 0
+    s.sret_last_slot = 0
+    s.sret_helpers_used = 0
     s.print_helpers_used = 0   # AGAST #1521 — see emit_print_helpers
     # Before build_symbol_maps, so find_struct sees the fallback if added.
     ensure_string_literal_struct(@s, m)
@@ -2290,6 +2346,7 @@ fn emit_module(m: *Module, out: *Vec<u8>) -> i32
     # the link step when no fill is used because LLVM elides unreferenced
     # intrinsic decls.
     emit_str(@s, c"declare void @llvm.memset.p0.i64(ptr nocapture writeonly, i8, i64, i1 immarg)\n")
+    emit_sret_helpers(@s)   # AGAST #1730
 
     # Note: _start is provided by runtime/ritz_crt0.o which properly sets up argc/argv
 

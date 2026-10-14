@@ -106,6 +106,16 @@ struct EmitterState
     # Current function's return type name (for struct returns)
     ret_type_name: *u8
     ret_type_name_len: i32
+    # AGAST #1730 — 1 when the current fn returns its (large) struct through
+    # a `ptr sret(%T) %ret.sret` first parameter; see struct_ret_uses_sret.
+    ret_sret: i32
+    # The value register of the most recent sret call result and the slot it
+    # was loaded from, so `return f()` copies the slot instead of the value.
+    sret_last_val: i32
+    sret_last_slot: i32
+    # 1 once any sret copy/zero is emitted: emit_sret_helpers then defines
+    # @__ritz_sret_copy / @__ritz_sret_zero for this module.
+    sret_helpers_used: i32
     # Tagged-enum context for variant constructors (ritz-task-133).
     # When non-null, `Some(x)` / `Ok(x)` / `None` / `Err(x)` allocas use this
     # struct name instead of falling back to `ret_type_name`.  Set by
@@ -1404,6 +1414,165 @@ fn rebuild_layout_equiv(s: *EmitterState, src_reg: i32, src_name: *u8, src_len: 
     emit_reg(s, l)
     emit_str(s, c", 1\n")
     r2
+
+# =============================================================================
+# AGAST #1730 — large struct returns go through an sret pointer
+# =============================================================================
+#
+# ritz1 used to return every struct as a first-class LLVM aggregate
+# (`%v = load %T, ptr %slot` / `ret %T %v`).  For a big struct such as
+# ritzlib/lang/tokens.ritz's 22 KB %TokenDefs, InstCombine at -O2 unpacks
+# that load into one scalar per leaf (~21k) and clang grows past 13 GB.  Any
+# first-class value of such a type does it — a call result stored to a
+# local, or a load stored to the sret slot — so the only IR that stays fast
+# copies the bytes from pointer to pointer.
+#
+# A function whose struct return is at least SRET_MIN_BYTES is therefore
+# defined `define void @f(ptr sret(%T) %ret.sret, ...)`, every `ret` site
+# copies into %ret.sret, and every call site passes a fresh `alloca %T`.
+#
+# The copy is NOT llvm.memcpy: at these sizes codegen lowers that intrinsic
+# to a call to libc `memcpy`, and Ritz links -nostdlib.  It calls a
+# module-internal byte loop instead (emit_sret_helpers), which carries
+# "no-builtins" so loop-idiom recognition cannot turn it back into memcpy.
+#
+# This is ABI-identical to the first-class form ritz0 still emits: LLVM
+# already demotes a first-class return that does not fit in the return
+# registers to a hidden pointer in the first argument register, and returns
+# that pointer, exactly as an explicit sret does.  256 bytes is far above
+# the largest register return on any target LLVM supports (x86-64: 2 GPRs
+# + 2 XMM; AArch64: 8 GPRs + 8 Q regs = 192 B), so objects from either
+# compiler keep linking.  Below the threshold nothing changes.
+const SRET_MIN_BYTES: i64 = 256
+
+fn struct_ret_uses_sret(s: *EmitterState, t: i32, name: *u8, len: i32) -> i32
+    if t != TYPE_STRUCT or name == null or len <= 0
+        return 0
+    if is_primitive_type_name(name, len) == 1
+        return 0
+    # Tagged enums (Result$/Option$) are not StructDefs and keep their ABI.
+    if is_tagged_enum_type(name, len) == 1
+        return 0
+    if find_struct(s, name, len) == null
+        return 0
+    # get_struct_size_by_name rounds nested alignment up, so it may slightly
+    # overestimate; that only matters near the threshold, where any size is
+    # still memory-returned.  The memcpy length is exact (emit_sret_size).
+    if get_struct_size_by_name(s, name, len) < SRET_MIN_BYTES
+        return 0
+    1
+
+# The exact LLVM alloc size of %T as a constant expression, prefixed `i64 `.
+fn emit_sret_size(s: *EmitterState, name: *u8, len: i32)
+    emit_str(s, c"i64 ptrtoint (ptr getelementptr (%")
+    emit_name(s, name, len)
+    emit_str(s, c", ptr null, i32 1) to i64)")
+
+# `ptr sret(%T) ` — the attribute both the definition and every call carry.
+fn emit_sret_attr(s: *EmitterState, name: *u8, len: i32)
+    emit_str(s, c"ptr sret(%")
+    emit_name(s, name, len)
+    emit_str(s, c") ")
+
+# Return from an sret fn by copying the %T at register `src_ptr` (a `ptr`).
+fn emit_sret_ret_from_ptr(s: *EmitterState, src_ptr: i32)
+    emit_str(s, c"  call void @__ritz_sret_copy(ptr %ret.sret, ptr ")
+    emit_reg(s, src_ptr)
+    emit_str(s, c", ")
+    emit_sret_size(s, s.ret_type_name, s.ret_type_name_len)
+    emit_str(s, c")\n")
+    emit_str(s, c"  ret void\n")
+    s.sret_helpers_used = 1
+
+# Module-internal byte copy / zero used by every sret return.  Defined once
+# per module, only when used.  "no-builtins" keeps clang from rewriting the
+# loops into libc memcpy/memset calls (see build.py FREESTANDING_FLAGS).
+fn emit_sret_helpers(s: *EmitterState)
+    if s.sret_helpers_used == 0
+        return
+    emit_str(s, c"define internal void @__ritz_sret_copy(ptr %d, ptr %s, i64 %n) \"no-builtins\" {\n")
+    emit_str(s, c"entry:\n")
+    emit_str(s, c"  %z = icmp eq i64 %n, 0\n")
+    emit_str(s, c"  br i1 %z, label %done, label %loop\n")
+    emit_str(s, c"loop:\n")
+    emit_str(s, c"  %i = phi i64 [ 0, %entry ], [ %i1, %loop ]\n")
+    emit_str(s, c"  %sp = getelementptr i8, ptr %s, i64 %i\n")
+    emit_str(s, c"  %c = load i8, ptr %sp\n")
+    emit_str(s, c"  %dp = getelementptr i8, ptr %d, i64 %i\n")
+    emit_str(s, c"  store i8 %c, ptr %dp\n")
+    emit_str(s, c"  %i1 = add i64 %i, 1\n")
+    emit_str(s, c"  %more = icmp ult i64 %i1, %n\n")
+    emit_str(s, c"  br i1 %more, label %loop, label %done\n")
+    emit_str(s, c"done:\n")
+    emit_str(s, c"  ret void\n")
+    emit_str(s, c"}\n\n")
+    emit_str(s, c"define internal void @__ritz_sret_zero(ptr %d, i64 %n) \"no-builtins\" {\n")
+    emit_str(s, c"entry:\n")
+    emit_str(s, c"  %z = icmp eq i64 %n, 0\n")
+    emit_str(s, c"  br i1 %z, label %done, label %loop\n")
+    emit_str(s, c"loop:\n")
+    emit_str(s, c"  %i = phi i64 [ 0, %entry ], [ %i1, %loop ]\n")
+    emit_str(s, c"  %dp = getelementptr i8, ptr %d, i64 %i\n")
+    emit_str(s, c"  store i8 0, ptr %dp\n")
+    emit_str(s, c"  %i1 = add i64 %i, 1\n")
+    emit_str(s, c"  %more = icmp ult i64 %i1, %n\n")
+    emit_str(s, c"  br i1 %more, label %loop, label %done\n")
+    emit_str(s, c"done:\n")
+    emit_str(s, c"  ret void\n")
+    emit_str(s, c"}\n\n")
+
+# Return a zeroed %T from an sret fn (the implicit `ret zeroinitializer`).
+fn emit_sret_ret_zero(s: *EmitterState)
+    emit_str(s, c"  call void @__ritz_sret_zero(ptr %ret.sret, ")
+    emit_sret_size(s, s.ret_type_name, s.ret_type_name_len)
+    emit_str(s, c")\n")
+    emit_str(s, c"  ret void\n")
+    s.sret_helpers_used = 1
+
+# Return from an sret fn given a first-class %T value register.  When `val`
+# is the load of an sret call's slot (`return f()`), copy the slot itself;
+# otherwise spill the value and copy that.
+fn emit_sret_ret_value(s: *EmitterState, val: i32)
+    if val == s.sret_last_val and s.sret_last_slot > 0
+        emit_sret_ret_from_ptr(s, s.sret_last_slot)
+        return
+    let tmp: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, tmp)
+    emit_str(s, c" = alloca %")
+    emit_name(s, s.ret_type_name, s.ret_type_name_len)
+    emit_str(s, c"\n  store %")
+    emit_name(s, s.ret_type_name, s.ret_type_name_len)
+    emit_str(s, c" ")
+    emit_reg(s, val)
+    emit_str(s, c", ptr ")
+    emit_reg(s, tmp)
+    emit_str(s, c"\n")
+    emit_sret_ret_from_ptr(s, tmp)
+
+# Caller side: allocate the result slot for a call to an sret fn.  Emit it
+# BEFORE the `call` line; pass it with emit_sret_attr + emit_reg.
+fn emit_sret_call_slot(s: *EmitterState, name: *u8, len: i32) -> i32
+    let slot: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, slot)
+    emit_str(s, c" = alloca %")
+    emit_name(s, name, len)
+    emit_str(s, c"\n")
+    slot
+
+# Caller side, after the call: load the result into `result` as the
+# first-class value every consumer expects, and remember the slot.
+fn emit_sret_call_result(s: *EmitterState, result: i32, slot: i32, name: *u8, len: i32)
+    emit_str(s, c"  ")
+    emit_reg(s, result)
+    emit_str(s, c" = load %")
+    emit_name(s, name, len)
+    emit_str(s, c", ptr ")
+    emit_reg(s, slot)
+    emit_str(s, c"\n")
+    s.sret_last_val = result
+    s.sret_last_slot = slot
 
 # Coerce the struct value `val` produced by `expr` to the named return type
 # `dst_name` when the two are the Span$u8 ↔ StrView layout-equivalent pair;

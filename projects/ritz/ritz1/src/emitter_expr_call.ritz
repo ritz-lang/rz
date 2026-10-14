@@ -497,7 +497,14 @@ fn try_emit_ufcs_method(s: *EmitterState, e: *Expr, type_name: *u8, type_name_le
     # Emit the call. Receiver goes in as ptr; then the converted args.
     let ret_type: i32 = fn_def.return_type
     var call_result: i32 = 0
-    if ret_type == TYPE_VOID
+    # AGAST #1730 — a large struct comes back through a caller-owned slot.
+    var ufcs_sret: i32 = 0
+    if struct_ret_uses_sret(s, ret_type, fn_def.return_type_name, fn_def.return_type_name_len) == 1
+        ufcs_sret = emit_sret_call_slot(s, fn_def.return_type_name, fn_def.return_type_name_len)
+    if ufcs_sret > 0
+        call_result = next_reg(s)
+        emit_str(s, c"  call void @")
+    else if ret_type == TYPE_VOID
         emit_str(s, c"  call void @")
     else
         call_result = next_reg(s)
@@ -520,7 +527,12 @@ fn try_emit_ufcs_method(s: *EmitterState, e: *Expr, type_name: *u8, type_name_le
         else
             emit_str(s, c" = call i64 @")
     emit_name(s, @mangled[0], mangled_len)
-    emit_str(s, c"(ptr ")
+    emit_str(s, c"(")
+    if ufcs_sret > 0
+        emit_sret_attr(s, fn_def.return_type_name, fn_def.return_type_name_len)
+        emit_reg(s, ufcs_sret)
+        emit_str(s, c", ")
+    emit_str(s, c"ptr ")
     emit_reg(s, recv_ptr)
 
     # Emit the args with their parameter types
@@ -537,6 +549,8 @@ fn try_emit_ufcs_method(s: *EmitterState, e: *Expr, type_name: *u8, type_name_le
         emit_str(s, c" ")
         emit_reg(s, converted_regs[j])
     emit_str(s, c")\n")
+    if ufcs_sret > 0
+        emit_sret_call_result(s, call_result, ufcs_sret, fn_def.return_type_name, fn_def.return_type_name_len)
 
     # Register as an external so link-time lookups succeed even if monomorphization
     # instantiated this helper in a sibling module.
@@ -2191,7 +2205,15 @@ fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
         emit_reg(s, icall_local)
         emit_str(s, c"\n")
     var call_result: i32 = 0
-    if ret_type == TYPE_VOID
+    # AGAST #1730 — a large struct comes back through a caller-owned slot
+    # (also for typed indirect calls: the pointee was defined the same way).
+    var call_sret: i32 = 0
+    if struct_ret_uses_sret(s, ret_type, ret_struct_name, ret_struct_name_len) == 1
+        call_sret = emit_sret_call_slot(s, ret_struct_name, ret_struct_name_len)
+    if call_sret > 0
+        call_result = next_reg(s)
+        emit_str(s, c"  call void ")
+    else if ret_type == TYPE_VOID
         # void call - no result register assignment
         emit_str(s, c"  call void ")
     else
@@ -2233,9 +2255,12 @@ fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
         emit_str(s, c"@")
         emit_name(s, @full_name[0], full_len)
     emit_str(s, c"(")
+    if call_sret > 0
+        emit_sret_attr(s, ret_struct_name, ret_struct_name_len)
+        emit_reg(s, call_sret)
 
     for j in 0..arg_count
-        if j > 0
+        if j > 0 or call_sret > 0
             emit_str(s, c", ")
         if fn_def != null
             # Reset param_ptr to walk params again
@@ -2254,6 +2279,8 @@ fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
         emit_reg(s, converted_regs[j])
 
     emit_str(s, c")\n")
+    if call_sret > 0
+        emit_sret_call_result(s, call_result, call_sret, ret_struct_name, ret_struct_name_len)
 
     # Extend smaller return types to i64 for consistent value representation
     if ret_type == TYPE_BOOL
@@ -2863,19 +2890,29 @@ fn emit_expr_method(s: *EmitterState, e: *Expr) -> i32
                     if sm_arg_e != null
                         sm_arg_e = sm_arg_e.next
                 # Emit the call: %r = call <ret_type> @<Type>_<method>(args)
+                # AGAST #1730 — large struct results come back via an sret slot.
+                var sm_sret: i32 = 0
+                if struct_ret_uses_sret(s, sm_method.return_type, sm_method.return_type_name, sm_method.return_type_name_len) == 1
+                    sm_sret = emit_sret_call_slot(s, sm_method.return_type_name, sm_method.return_type_name_len)
                 let sm_result: i32 = next_reg(s)
-                emit_str(s, c"  ")
-                emit_reg(s, sm_result)
-                emit_str(s, c" = call ")
-                emit_llvm_type_struct(s, sm_method.return_type, sm_method.return_type_name, sm_method.return_type_name_len)
+                if sm_sret > 0
+                    emit_str(s, c"  call void")
+                else
+                    emit_str(s, c"  ")
+                    emit_reg(s, sm_result)
+                    emit_str(s, c" = call ")
+                    emit_llvm_type_struct(s, sm_method.return_type, sm_method.return_type_name, sm_method.return_type_name_len)
                 emit_str(s, c" @")
                 emit_name(s, e.left.ident_ptr, e.left.ident_len)
                 emit_str(s, c"_")
                 emit_name(s, e.ident_ptr, e.ident_len)
                 emit_str(s, c"(")
+                if sm_sret > 0
+                    emit_sret_attr(s, sm_method.return_type_name, sm_method.return_type_name_len)
+                    emit_reg(s, sm_sret)
                 var sm_p2: *Param = sm_method.params
                 for k in 0..sm_arg_count
-                    if k > 0
+                    if k > 0 or sm_sret > 0
                         emit_str(s, c", ")
                     if sm_p2 != null
                         emit_llvm_type_struct(s, sm_p2.param_type, sm_p2.param_type_name, sm_p2.param_type_name_len)
@@ -2885,6 +2922,8 @@ fn emit_expr_method(s: *EmitterState, e: *Expr) -> i32
                     emit_str(s, c" ")
                     emit_reg(s, sm_conv[k])
                 emit_str(s, c")\n")
+                if sm_sret > 0
+                    emit_sret_call_result(s, sm_result, sm_sret, sm_method.return_type_name, sm_method.return_type_name_len)
                 return sm_result
     if e.left.kind == EXPR_IDENT
         # Look up the receiver type from locals
@@ -3216,39 +3255,54 @@ fn emit_expr_method(s: *EmitterState, e: *Expr) -> i32
     # `call void` with no result register; binding one to `call i64` would
     # mismatch the `define void` (AGAST #1581).
     var result: i32 = 0
-    if rtype == TYPE_VOID
+    # AGAST #1730 — large struct results come back via an sret slot.
+    var m_sret: i32 = 0
+    if mfn != null and struct_ret_uses_sret(s, rtype, mfn.return_type_name, mfn.return_type_name_len) == 1
+        m_sret = emit_sret_call_slot(s, mfn.return_type_name, mfn.return_type_name_len)
+    if m_sret > 0
+        result = next_reg(s)
+        emit_str(s, c"  call void @")
+    else if rtype == TYPE_VOID
         emit_str(s, c"  call void @")
     else
         result = next_reg(s)
         emit_str(s, c"  ")
         emit_reg(s, result)
-    if rtype == TYPE_VOID
-        result = 0
-    else if rtype == TYPE_BOOL
-        emit_str(s, c" = call i1 @")
-    else if rtype == TYPE_I32 or rtype == TYPE_U32
-        emit_str(s, c" = call i32 @")
-    else if rtype == TYPE_I16 or rtype == TYPE_U16
-        emit_str(s, c" = call i16 @")
-    else if rtype == TYPE_I8 or rtype == TYPE_U8
-        emit_str(s, c" = call i8 @")
-    else if rtype == TYPE_F32
-        emit_str(s, c" = call float @")
-    else if rtype == TYPE_F64
-        emit_str(s, c" = call double @")
-    else if rtype == TYPE_STRUCT and mfn != null and mfn.return_type_name_len > 0
-        # Struct-returning impl methods (e.g. `clone_self(self) -> S`).
-        # Match the `define weak_odr %S @S_clone_self(...)` signature
-        # rather than the i64 fallback — clang rejects the type mismatch.
-        emit_str(s, c" = call ")
-        emit_llvm_type_struct(s, TYPE_STRUCT, mfn.return_type_name, mfn.return_type_name_len)
-        emit_str(s, c" @")
-    else
-        emit_str(s, c" = call i64 @")
+    # An sret call already wrote `call void @`; the result type keyword
+    # below is for the first-class forms only.
+    if m_sret == 0
+        if rtype == TYPE_VOID
+            result = 0
+        else if rtype == TYPE_BOOL
+            emit_str(s, c" = call i1 @")
+        else if rtype == TYPE_I32 or rtype == TYPE_U32
+            emit_str(s, c" = call i32 @")
+        else if rtype == TYPE_I16 or rtype == TYPE_U16
+            emit_str(s, c" = call i16 @")
+        else if rtype == TYPE_I8 or rtype == TYPE_U8
+            emit_str(s, c" = call i8 @")
+        else if rtype == TYPE_F32
+            emit_str(s, c" = call float @")
+        else if rtype == TYPE_F64
+            emit_str(s, c" = call double @")
+        else if rtype == TYPE_STRUCT and mfn != null and mfn.return_type_name_len > 0
+            # Struct-returning impl methods (e.g. `clone_self(self) -> S`).
+            # Match the `define weak_odr %S @S_clone_self(...)` signature
+            # rather than the i64 fallback — clang rejects the type mismatch.
+            emit_str(s, c" = call ")
+            emit_llvm_type_struct(s, TYPE_STRUCT, mfn.return_type_name, mfn.return_type_name_len)
+            emit_str(s, c" @")
+        else
+            emit_str(s, c" = call i64 @")
     emit_name(s, type_name, type_name_len)
     emit_str(s, c"_")
     emit_name(s, e.ident_ptr, e.ident_len)
-    emit_str(s, c"(ptr ")
+    emit_str(s, c"(")
+    if m_sret > 0
+        emit_sret_attr(s, mfn.return_type_name, mfn.return_type_name_len)
+        emit_reg(s, m_sret)
+        emit_str(s, c", ")
+    emit_str(s, c"ptr ")
     emit_reg(s, receiver_reg)
 
     # Emit args with formal types (or i64 fallback when fn_def missing).
@@ -3267,6 +3321,8 @@ fn emit_expr_method(s: *EmitterState, e: *Expr) -> i32
         emit_str(s, c" ")
         emit_reg(s, conv_regs[j])
     emit_str(s, c")\n")
+    if m_sret > 0
+        emit_sret_call_result(s, result, m_sret, mfn.return_type_name, mfn.return_type_name_len)
 
     # Add method to extern declarations (uses malloc for stable name storage).
     # When mfn is non-null the method is defined in this module, so emitting
