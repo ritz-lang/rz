@@ -18,6 +18,7 @@ import tokens_gen
 import emitter_core
 import emitter_expr
 import emitter_stmt
+import ll_copy_scan   # AGAST #1732
 import emitter_print
 import narrowing         # narrowing_begin_fn (AGAST #1364)
 
@@ -241,6 +242,67 @@ fn hoist_line_len(p: *u8, end: *u8) -> i64
     if q < end
         len += 1
     len
+
+# AGAST #1732 — copy large structs pointer-to-pointer, never first-class.
+#
+# #1730 moved large struct RETURNS to sret, but every other copy of a large
+# struct still went through a first-class value:
+#
+#     %.5 = load %Big, ptr %.4
+#     store %Big %.5, ptr %.2
+#
+# That is `var x: Big = *p`, `x = y`, `x = f()` (the sret slot is loaded
+# and re-stored), `var x: Big = f()`, `*q = *p`, `o.big = *p`.  clang -O2's
+# InstCombine splits such a load/store into one scalar per leaf, and for a
+# 22 KB struct (~21k leaves) it grows without bound.
+#
+# Like hoist_entry_allocas, this runs once over the finished body rather
+# than at the dozens of sites that emit a struct store.  A store of a
+# struct %T at the sret threshold, whose value register is `load %T, ptr
+# SRC` with nothing that can write memory in between, is rewritten to
+#
+#     call void @__ritz_sret_copy(ptr DST, ptr SRC, i64 sizeof(%T))
+#
+# Nothing wrote memory since the load, so the bytes at SRC still ARE the
+# loaded value.  (Two %T objects cannot partially overlap, and an exact
+# overlap copies onto itself.)  The load is left dead for -O2 to delete.
+
+# The scanning lives in ll_copy_scan.ritz; here we only decide whether %T is
+# large and emit the replacement.  Returns 1 when `line` was replaced.
+fn try_emit_large_copy(s: *EmitterState, base: *u8, line: *u8, len: i64) -> i32
+    var cp: LlCopy
+    if ll_find_copy(base, line, len, @cp) == 0
+        return 0
+    let tname: *u8 = line + cp.tname_off
+    let tlen: i32 = cp.tname_len as i32
+    if struct_ret_uses_sret(s, TYPE_STRUCT, tname, tlen) == 0
+        return 0
+    emit_str(s, c"  call void @__ritz_sret_copy(ptr ")
+    emit_name(s, line + cp.dst_off, cp.dst_len as i32)
+    emit_str(s, c", ptr ")
+    emit_name(s, cp.src, cp.src_len as i32)
+    emit_str(s, c", ")
+    emit_sret_size(s, tname, tlen)
+    emit_str(s, c")\n")
+    s.sret_helpers_used = 1
+    1
+
+fn rewrite_large_struct_copies(s: *EmitterState, body_start: i64)
+    let n: i64 = s.out.len - body_start
+    if n <= 0
+        return
+    # Rebuild the body into s.out from a copy: a rewritten line changes length.
+    let base: *u8 = malloc(n)
+    memcpy(base, s.out.data + body_start, n)
+    let end: *u8 = base + n
+    s.out.len = body_start
+    var p: *u8 = base
+    while p < end
+        let ll: i64 = ll_line_len(p, end)
+        if try_emit_large_copy(s, base, p, ll) == 0
+            vec_push_bytes<u8>(s.out, p, ll)
+        p = p + ll
+    free(base)
 
 fn hoist_entry_allocas(s: *EmitterState, body_start: i64)
     let n: i64 = s.out.len - body_start
@@ -550,6 +612,7 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
         stmt = stmt.next
 
     emit_implicit_return_tail(s, has_explicit_return, f.return_type, f.return_type_name, f.return_type_name_len)
+    rewrite_large_struct_copies(s, body_start)   # AGAST #1732
     hoist_entry_allocas(s, body_start)
     emit_str(s, c"}\n\n")
 
@@ -871,6 +934,7 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
     # AGAST #1573 — same tail as emit_fn: close the final block if the body
     # did not already end in a `ret`.
     emit_implicit_return_tail(s, has_explicit_return, method.return_type, method.return_type_name, method.return_type_name_len)
+    rewrite_large_struct_copies(s, body_start)   # AGAST #1732
     hoist_entry_allocas(s, body_start)
     emit_str(s, c"}\n\n")
 

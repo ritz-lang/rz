@@ -1,0 +1,143 @@
+# ll_copy_scan.ritz — find large-struct copies in emitted LLVM IR text (AGAST #1732)
+#
+# Pure text scanning, no EmitterState: emitter.ritz's
+# rewrite_large_struct_copies decides which struct types are large and emits
+# the replacement; this module only answers "is this `store` line a copy of
+# a value that was loaded from some address, with nothing in between that
+# could have changed the bytes at that address?".  It is a separate module
+# so ritz0/test_large_struct_copy.py can drive it with hand-written IR.
+
+# 1 when the line `p[0..len)` starts with the C string `lit`.
+pub fn ll_starts_with(p: *u8, len: i64, lit: *u8) -> i32
+    var i: i64 = 0
+    while *(lit + i) != 0
+        if i >= len or *(p + i) != *(lit + i)
+            return 0
+        i += 1
+    1
+
+# 1 when `a[0..n)` equals `b[0..n)`.
+pub fn ll_text_eq_n(a: *u8, b: *u8, n: i64) -> i32
+    var i: i64 = 0
+    while i < n
+        if *(a + i) != *(b + i)
+            return 0
+        i += 1
+    1
+
+# Offset of the first `ch` in `p[from..len)`, or -1.
+pub fn ll_find(p: *u8, len: i64, from: i64, ch: u8) -> i64
+    var i: i64 = from
+    while i < len
+        if *(p + i) == ch
+            return i
+        i += 1
+    0 - 1
+
+# End of the operand starting at `from`: the next ',', ' ', ';' or '\n'.
+pub fn ll_operand_end(p: *u8, len: i64, from: i64) -> i64
+    var i: i64 = from
+    while i < len
+        let c: u8 = *(p + i)
+        if c == 44 or c == 32 or c == 59 or c == 10
+            return i
+        i += 1
+    len
+
+# Length of the line starting at `p` (up to `end`), including its '\n'.
+pub fn ll_line_len(p: *u8, end: *u8) -> i64
+    var q: *u8 = p
+    var len: i64 = 0
+    while q < end and *q != 10
+        q = q + 1
+        len += 1
+    if q < end
+        len += 1
+    len
+
+# Start of the line before the one at `line` (base < line).
+pub fn ll_prev_line(base: *u8, line: *u8) -> *u8
+    var q: *u8 = line - 1    # the previous line's '\n'
+    while q > base and *(q - 1) != 10
+        q = q - 1
+    q
+
+# 1 when the line cannot write memory: an assignment `  %x = <op> ...`
+# whose op is not a call / invoke / atomic RMW, and not an ordered load.
+# Everything else — `store`, `call void`, branches, labels, comments — is
+# treated as a possible write.
+pub fn ll_line_cannot_write(p: *u8, len: i64) -> i32
+    if ll_starts_with(p, len, c"  %") == 0
+        return 0
+    let sp: i64 = ll_find(p, len, 3, 32)
+    if sp < 0 or ll_starts_with(p + sp, len - sp, c" = ") == 0
+        return 0
+    let op: *u8 = p + sp + 3
+    let oplen: i64 = len - sp - 3
+    if ll_starts_with(op, oplen, c"call ") == 1 or ll_starts_with(op, oplen, c"tail call ") == 1
+        return 0
+    if ll_starts_with(op, oplen, c"invoke ") == 1 or ll_starts_with(op, oplen, c"atomicrmw ") == 1
+        return 0
+    if ll_starts_with(op, oplen, c"cmpxchg ") == 1
+        return 0
+    if ll_starts_with(op, oplen, c"load atomic ") == 1 or ll_starts_with(op, oplen, c"load volatile ") == 1
+        return 0
+    1
+
+# A copy found by ll_find_copy: offsets are into the store line, except
+# `src`, which points into the load line.
+pub struct LlCopy
+    tname_off: i64     # `T` of `store %T`
+    tname_len: i64
+    dst_off: i64       # DST of `, ptr DST`
+    dst_len: i64
+    src: *u8           # SRC of the defining `load %T, ptr SRC`
+    src_len: i64
+
+# For the line `  store %T %.V, ptr DST` at `line` (length `len`), find the
+# line in [base, line) that defines `%.V`.  Return 1 and fill `out` when it
+# is `  %.V = load %T, ptr SRC` and every line between it and the store
+# cannot write memory (ll_line_cannot_write).  Otherwise return 0.
+pub fn ll_find_copy(base: *u8, line: *u8, len: i64, out: *LlCopy) -> i32
+    if ll_starts_with(line, len, c"  store %") == 0
+        return 0
+    let tsp: i64 = ll_find(line, len, 9, 32)
+    if tsp < 0
+        return 0
+    let tlen: i64 = tsp - 9
+    # Value register `%.V` (a constant such as zeroinitializer is left alone).
+    let vstart: i64 = tsp + 1
+    if ll_starts_with(line + vstart, len - vstart, c"%.") == 0
+        return 0
+    let vend: i64 = ll_operand_end(line, len, vstart)
+    let vlen: i64 = vend - vstart
+    if ll_starts_with(line + vend, len - vend, c", ptr ") == 0
+        return 0
+    let dstart: i64 = vend + 6
+    let dend: i64 = ll_operand_end(line, len, dstart)
+    var q: *u8 = line
+    while q > base
+        q = ll_prev_line(base, q)
+        let qlen: i64 = ll_line_len(q, line)
+        # Does this line define %.V?  `  %.V = ...`
+        if qlen > vlen + 5 and ll_starts_with(q, qlen, c"  ") == 1 and ll_text_eq_n(q + 2, line + vstart, vlen) == 1 and ll_starts_with(q + 2 + vlen, qlen - 2 - vlen, c" = ") == 1
+            let rest: *u8 = q + 2 + vlen + 3
+            let rlen: i64 = qlen - 2 - vlen - 3
+            # `load %T, ptr SRC` — the same %T as the store.
+            if ll_starts_with(rest, rlen, c"load %") == 0
+                return 0
+            if rlen < 6 + tlen + 6 or ll_text_eq_n(rest + 6, line + 9, tlen) == 0
+                return 0
+            if ll_starts_with(rest + 6 + tlen, rlen - 6 - tlen, c", ptr ") == 0
+                return 0
+            let sstart: i64 = 6 + tlen + 6
+            out.tname_off = 9
+            out.tname_len = tlen
+            out.dst_off = dstart
+            out.dst_len = dend - dstart
+            out.src = rest + sstart
+            out.src_len = ll_operand_end(rest, rlen, sstart) - sstart
+            return 1
+        if ll_line_cannot_write(q, qlen) == 0
+            return 0
+    0

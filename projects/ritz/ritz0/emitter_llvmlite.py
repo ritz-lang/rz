@@ -69,6 +69,29 @@ SRET_MIN_BYTES = 256
 # used `\([^)]*\)`, which stops inside `sret(` (AGAST #1736).
 _IR_PARAMS = r'\((?:[^()]|\([^()]*\))*\)'
 
+# AGAST #1732: instructions that cannot write memory.  A large-struct
+# `store (load src), dst` may become a copy from `src` only when everything
+# emitted between the load and the store is one of these.
+_NO_WRITE_OPNAMES = frozenset({
+    'alloca', 'load', 'getelementptr', 'extractvalue', 'insertvalue',
+    'extractelement', 'insertelement', 'select', 'icmp', 'fcmp',
+    'bitcast', 'ptrtoint', 'inttoptr', 'trunc', 'zext', 'sext',
+    'fptrunc', 'fpext', 'fptoui', 'fptosi', 'uitofp', 'sitofp',
+    'add', 'sub', 'mul', 'udiv', 'sdiv', 'urem', 'srem',
+    'fadd', 'fsub', 'fmul', 'fdiv', 'frem', 'fneg',
+    'and', 'or', 'xor', 'shl', 'lshr', 'ashr',
+})
+
+
+def _cannot_write_memory(inst) -> bool:
+    if isinstance(inst, ir.CallInstr):
+        # Debug intrinsics only describe variables.
+        callee = getattr(inst, 'callee', None)
+        return getattr(callee, 'name', '').startswith('llvm.dbg.')
+    if isinstance(inst, ir.LoadInstr) and getattr(inst, 'ordering', None):
+        return False   # atomic load: an ordering point
+    return inst.opname in _NO_WRITE_OPNAMES
+
 
 class _SretAwareBuilder(ir.IRBuilder):
     """IRBuilder that lowers calls to and returns from sret functions."""
@@ -101,6 +124,20 @@ class _SretAwareBuilder(ir.IRBuilder):
             return em._alloca_in_entry_block(ty, name)
         with self.goto_entry_block():
             return self.alloca(ty, name=name)
+
+    def store(self, value, ptr, align=None):
+        """AGAST #1732: copy a large struct pointer-to-pointer.
+
+        `store %T (load %T, src), dst` is a first-class copy that sends
+        clang -O2's InstCombine superlinear for a large %T.  When no
+        instruction between the load and here can write memory, the bytes
+        at `src` are still the loaded value, so copy them directly.  The
+        load is left dead; -O2 deletes it before InstCombine sees it.
+        """
+        src = self._emitter._large_copy_source(value, ptr, self.block)
+        if src is None:
+            return super().store(value, ptr, align=align)
+        return self._emitter._emit_large_copy(self, ptr, src, value.type)
 
     def ret(self, value):
         fn = self.function
@@ -3153,6 +3190,73 @@ class LLVMEmitter:
     def _fn_ret_type(self, fn: ir.Function) -> ir.Type:
         """`fn`'s logical return type (the struct, for an sret function)."""
         return self._sret_type_of(fn) or fn.function_type.return_type
+
+    # --- large struct copies (AGAST #1732) ----------------------------------
+
+    def _large_copy_source(self, value, ptr, block):
+        """The pointer to copy from, if `store value, ptr` is a large copy.
+
+        `value` must be `load %T, src` of a struct %T at the sret threshold,
+        emitted earlier in `block`, with only instructions after it that
+        cannot write memory.  Returns `src`, or None to store normally.
+        """
+        if not isinstance(value, ir.LoadInstr) or value.parent is not block:
+            return None
+        if self._sret_struct_type(value.type) is None:
+            return None
+        if ptr.type != value.operands[0].type:
+            return None
+        insts = block.instructions
+        try:
+            idx = next(i for i in range(len(insts) - 1, -1, -1) if insts[i] is value)
+        except StopIteration:
+            return None
+        if not all(_cannot_write_memory(inst) for inst in insts[idx + 1:]):
+            return None
+        return value.operands[0]
+
+    def _large_copy_helper(self) -> ir.Function:
+        """`internal void @__ritz_sret_copy(i8* d, i8* s, i64 n)`: a byte loop.
+
+        Not llvm.memcpy: at these sizes that lowers to libc memcpy, and Ritz
+        links -nostdlib.  Every definition gets "no-builtins" (see
+        _add_alignstack_to_functions), so loop-idiom cannot re-form memcpy.
+        Same name and body as ritz1's helper; both are internal.
+        """
+        fn = self.module.globals.get('__ritz_sret_copy')
+        if fn is not None:
+            return fn
+        i8p = ir.IntType(8).as_pointer()
+        fn = ir.Function(self.module, ir.FunctionType(self.void, [i8p, i8p, self.i64]),
+                         name='__ritz_sret_copy')
+        fn.linkage = 'internal'
+        d, s, n = fn.args
+        d.name, s.name, n.name = 'd', 's', 'n'
+        entry = fn.append_basic_block('entry')
+        loop = fn.append_basic_block('loop')
+        done = fn.append_basic_block('done')
+        b = ir.IRBuilder(entry)
+        b.cbranch(b.icmp_unsigned('==', n, ir.Constant(self.i64, 0)), done, loop)
+        b.position_at_end(loop)
+        i = b.phi(self.i64, name='i')
+        i.add_incoming(ir.Constant(self.i64, 0), entry)
+        c = b.load(b.gep(s, [i]), name='c')
+        b.store(c, b.gep(d, [i]))
+        i1 = b.add(i, ir.Constant(self.i64, 1), name='i1')
+        i.add_incoming(i1, loop)
+        b.cbranch(b.icmp_unsigned('<', i1, n), loop, done)
+        b.position_at_end(done)
+        b.ret_void()
+        return fn
+
+    def _emit_large_copy(self, builder, dst, src, ty):
+        """Emit `call @__ritz_sret_copy(dst, src, sizeof(ty))` at `builder`."""
+        i8p = ir.IntType(8).as_pointer()
+        # sizeof via `gep (T* null, 1)`: the exact LLVM alloc size.
+        size = ir.Constant(ty.as_pointer(), None).gep(
+            [ir.Constant(self.i32, 1)]).ptrtoint(self.i64)
+        return ir.IRBuilder.call(builder, self._large_copy_helper(), [
+            builder.bitcast(dst, i8p), builder.bitcast(src, i8p), size])
 
     def _retarget_sret_result(self, value, dest) -> bool:
         """Make the sret call that produced `value` write into `dest`.
