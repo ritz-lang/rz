@@ -185,6 +185,90 @@ fn emit_bool_param_spill(s: *EmitterState, param: *Param)
         let bool_loc: *LocalVar = @s.locals[s.local_count - 1]
         bool_loc.is_bool = 1
 
+# AGAST #1685 — hoist every fixed-size alloca into the entry block.
+#
+# The emitter writes `%r = alloca T` wherever a local or temp first appears:
+# emit_var_decl, the rvalue struct-literal temp, the method-receiver slot,
+# the variant-ctor slot, the newtype arg box, emit_array_fill_into's
+# counter, match payload binds, sret result slots, ...  Inside a loop body
+# that is a FRESH stack slot every iteration — LLVM treats a non-entry
+# alloca as dynamic and never hoists or reclaims it — so a 10M-iteration
+# loop with a 16-byte `let` in it needed 160 MB of stack and segfaulted.
+#
+# Rather than teach ~30 emission sites to write into a separate prologue
+# buffer (and every future site to remember to), emit_fn / emit_impl_method
+# record where the body starts (just after `entry:`) and call this once the
+# body is complete.  It stably partitions the body's lines: every fixed-size
+# alloca moves up to `body_start` in its original order, everything else
+# follows in its original order.  A fixed-size alloca has no operands, so
+# moving it above the code that precedes it cannot break dominance.
+#
+# A DYNAMIC alloca — `alloca i8, i64 %.N` from `__builtin_alloca(n)` — is
+# left in place: its size register is defined later than `entry:`, and its
+# per-call allocation is the point of the builtin.
+fn hoist_line_is_static_alloca(p: *u8, len: i64) -> i32
+    # `  %<name> = alloca <operand>[  ; comment]`
+    if len < 4
+        return 0
+    if *p != 32 or *(p + 1) != 32 or *(p + 2) != 37
+        return 0
+    var i: i64 = 3
+    while i < len and *(p + i) != 32
+        i += 1
+    let kw: *u8 = c" = alloca "
+    var k: i64 = 0
+    while k < 10
+        if i + k >= len or *(p + i + k) != *(kw + k)
+            return 0
+        k += 1
+    i += 10
+    # Reject an operand that names a register (`%.N`): a runtime size.
+    # Type names (`%P`, `%Option$i64`) never start with `%.`.  Stop at `;`
+    # so a trailing comment cannot influence the decision.
+    while i < len and *(p + i) != 59
+        if *(p + i) == 37 and i + 1 < len and *(p + i + 1) == 46
+            return 0
+        i += 1
+    1
+
+# Length of the line starting at `p` (up to `end`), including its '\n'.
+fn hoist_line_len(p: *u8, end: *u8) -> i64
+    var q: *u8 = p
+    var len: i64 = 0
+    while q < end and *q != 10
+        q = q + 1
+        len += 1
+    if q < end
+        len += 1
+    len
+
+fn hoist_entry_allocas(s: *EmitterState, body_start: i64)
+    let n: i64 = s.out.len - body_start
+    if n <= 0
+        return
+    let base: *u8 = s.out.data + body_start
+    let end: *u8 = base + n
+    let tmp: *u8 = malloc(n)
+    # Pass 1: the allocas, in order.
+    var w: i64 = 0
+    var p: *u8 = base
+    while p < end
+        let ll: i64 = hoist_line_len(p, end)
+        if hoist_line_is_static_alloca(p, ll) == 1
+            memcpy(tmp + w, p, ll)
+            w = w + ll
+        p = p + ll
+    # Pass 2: everything else, in order.
+    p = base
+    while p < end
+        let ll2: i64 = hoist_line_len(p, end)
+        if hoist_line_is_static_alloca(p, ll2) == 0
+            memcpy(tmp + w, p, ll2)
+            w = w + ll2
+        p = p + ll2
+    memcpy(base, tmp, n)
+    free(tmp)
+
 fn emit_fn(s: *EmitterState, f: *FnDef)
     # AGAST #194 modular emit: skip imports entirely. The owning .ll
     # emits the body; this .ll just needs a `declare`, which the
@@ -288,6 +372,8 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
     # never runs. The property has to travel with the IR.
     emit_str(s, c") alignstack(16) \"no-builtins\" {\n")
     emit_str(s, c"entry:\n")
+    # AGAST #1685: allocas emitted below this point are hoisted back here.
+    let body_start: i64 = s.out.len
 
     var param3: *Param = f.params
     while param3 != null
@@ -464,6 +550,7 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
         stmt = stmt.next
 
     emit_implicit_return_tail(s, has_explicit_return, f.return_type, f.return_type_name, f.return_type_name_len)
+    hoist_entry_allocas(s, body_start)
     emit_str(s, c"}\n\n")
 
 # =============================================================================
@@ -590,6 +677,8 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
     # never runs. The property has to travel with the IR.
     emit_str(s, c") alignstack(16) \"no-builtins\" {\n")
     emit_str(s, c"entry:\n")
+    # AGAST #1685: allocas emitted below this point are hoisted back here.
+    let body_start: i64 = s.out.len
 
     var param2: *Param = method.params
     while param2 != null
@@ -782,6 +871,7 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
     # AGAST #1573 — same tail as emit_fn: close the final block if the body
     # did not already end in a `ret`.
     emit_implicit_return_tail(s, has_explicit_return, method.return_type, method.return_type_name, method.return_type_name_len)
+    hoist_entry_allocas(s, body_start)
     emit_str(s, c"}\n\n")
 
 # =============================================================================
