@@ -6,7 +6,11 @@
 # - File creation and deletion
 # - Buffer manipulation
 #
-# Note: These tests use /tmp for temporary files
+# Note: These tests use /tmp for temporary files. Every path is built by
+# l11_tmp_path, never written as a literal: the regression matrix runs this
+# file under ritz0, ritz1 and ritz1_selfhosted concurrently (and other rooms
+# gate on the same host), so a shared fixed path let one run's O_TRUNC land
+# between another's write and read-back (AGAST #1735).
 
 # Syscall wrappers - prefixed to avoid conflict with sys.ritz
 fn l11_read(fd: i32, buf: *i8, count: i64) -> i64
@@ -54,7 +58,48 @@ fn strncmp(a: *i8, b: *i8, n: i64) -> i32
     i = i + 1
   0
 
+# Build "/tmp/ritz_l11_<tag>_<pid>" into buf (>= 40 bytes) and return buf.
+# The pid makes the path unique to this process, so concurrent runs of the
+# same test cannot see each other's files.
+fn l11_tmp_path(buf: *i8, tag: i8) -> *i8
+  let prefix: *i8 = c"/tmp/ritz_l11_"
+  var len: i64 = 0
+  while *(prefix + len) != 0
+    *(buf + len) = *(prefix + len)
+    len = len + 1
+  *(buf + len) = tag
+  *(buf + len + 1) = 95  # '_'
+  len = len + 2
+  var pid: i64 = syscall0(39)  # getpid
+  var digits: [20]i8 = [0; 20]
+  var nd: i64 = 0
+  while pid > 0
+    digits[nd] = (48 + pid % 10) as i8
+    pid = pid / 10
+    nd = nd + 1
+  while nd > 0
+    nd = nd - 1
+    *(buf + len) = digits[nd]
+    len = len + 1
+  *(buf + len) = 0
+  buf
+
 # ===== TESTS =====
+
+[[test]]
+fn test_tmp_path_is_per_process() -> i32
+  var buf: [40]i8 = [0; 40]
+  let path: *i8 = l11_tmp_path(@buf[0], 98)  # 'b'
+  assert strncmp(path, c"/tmp/ritz_l11_b_", 16) == 0
+  # Decode the pid suffix and check it is ours.
+  var pid: i64 = 0
+  var i: i64 = 16
+  while *(path + i) != 0
+    pid = pid * 10 + (*(path + i) as i64 - 48)
+    i = i + 1
+  assert i > 16
+  assert pid == syscall0(39)
+  0
 
 [[test]]
 fn test_open_close() -> i32
@@ -96,7 +141,8 @@ fn test_read_from_devzero() -> i32
 [[test]]
 fn test_create_write_read_file() -> i32
   # Create temp file
-  let path: *i8 = c"/tmp/ritz_test_11a.txt"
+  var path_buf: [40]i8 = [0; 40]
+  let path: *i8 = l11_tmp_path(@path_buf[0], 97)  # 'a'
 
   # Write to file
   let fd_w: i32 = l11_open(path, O_WRONLY + O_CREAT + O_TRUNC, 420)  # 0644
@@ -124,13 +170,15 @@ fn test_create_write_read_file() -> i32
 [[test]]
 fn test_file_not_found() -> i32
   # Opening non-existent file should fail
-  let fd: i32 = l11_open(c"/tmp/nonexistent_ritz_test_xyz.txt", O_RDONLY, 0)
+  var path_buf: [40]i8 = [0; 40]
+  let fd: i32 = l11_open(l11_tmp_path(@path_buf[0], 110), O_RDONLY, 0)  # 'n'
   assert fd < 0  # -ENOENT
   0
 
 [[test]]
 fn test_write_multiple_chunks() -> i32
-  let path: *i8 = c"/tmp/ritz_test_11b.txt"
+  var path_buf: [40]i8 = [0; 40]
+  let path: *i8 = l11_tmp_path(@path_buf[0], 98)  # 'b'
 
   # Write in chunks
   let fd: i32 = l11_open(path, O_WRONLY + O_CREAT + O_TRUNC, 420)
@@ -155,7 +203,8 @@ fn test_write_multiple_chunks() -> i32
 
 [[test]]
 fn test_large_buffer() -> i32
-  let path: *i8 = c"/tmp/ritz_test_11c.txt"
+  var path_buf: [40]i8 = [0; 40]
+  let path: *i8 = l11_tmp_path(@path_buf[0], 99)  # 'c'
 
   # Create file with 256 'X' characters
   var buf: [256]i8 = [88; 256]  # 88 = 'X'
