@@ -52,6 +52,21 @@ FAKE_CLANG = textwrap.dedent(
         sys.stderr.write("noise line\\n" * 50)
         sys.stderr.write("fake clang: LLVM ERROR: deliberate -O2 failure\\n")
         sys.exit(1)
+    if mode == "crash":
+        # The shape of a real clang backend crash (AGAST #1736): the cause is
+        # at the top, followed by dozens of stack frames.
+        sys.stderr.write(
+            "fatal error: error in backend: Cannot select: intrinsic %llvm.x86.sha256rnds2\\n"
+            "PLEASE submit a bug report to https://github.com/llvm/llvm-project/issues/\\n"
+            "Stack dump:\\n"
+            "0.\\tProgram arguments: clang -c -O2 sha256.ll\\n"
+            "1.\\tCode generation\\n"
+            "2.\\tRunning pass 'Function Pass Manager' on module 'sha256.ll'.\\n"
+            "3.\\tRunning pass 'X86 DAG->DAG Instruction Selection' on function '@sha256_transform_ni'\\n")
+        for i in range(40):
+            sys.stderr.write(f" {{i}} libLLVM.so.21.1 0x00007ebc2792ec2c frame{{i}}\\n")
+        sys.stderr.write("clang: error: clang frontend command failed with exit code 70\\n")
+        sys.exit(1)
     if mode == "sleep":
         # A grandchild too, so the test can prove the whole group is killed.
         child = subprocess.Popen(["sleep", "600"])
@@ -170,6 +185,25 @@ def test_failing_o2_compile_fails_the_build_loudly(buildpy, fake_clang, pkg,
     assert "deliberate -O2 failure" in text
     assert text.count("noise line") < 50, "should show the tail, not all of stderr"
     assert "Linking" not in text, "a failed object compile must stop before the link"
+
+
+@pytest.mark.unit
+def test_clang_crash_report_shows_the_cause_not_just_stack_frames(
+        buildpy, fake_clang, pkg, monkeypatch, capsys):
+    """AGAST #1736: CI showed only the last 20 stack frames of a clang crash,
+    so the cause (the backend error and the pass that crashed) was cut off.
+    The report must keep both, plus the tail, and still not dump everything."""
+    fake_clang.mode("crash")
+    rc = _build(buildpy, monkeypatch, pkg)
+    text = _text(capsys)
+
+    assert rc != 0
+    assert buildpy.CLANG_OBJ_FAILURES == 1
+    assert "Cannot select: intrinsic %llvm.x86.sha256rnds2" in text
+    assert "Running pass 'X86 DAG->DAG Instruction Selection'" in text
+    assert "@sha256_transform_ni" in text
+    assert "exit code 70" in text, "the tail must still be shown"
+    assert text.count("libLLVM.so.21.1") < 40, "should not dump every stack frame"
 
 
 @pytest.mark.unit

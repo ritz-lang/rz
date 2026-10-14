@@ -39,6 +39,82 @@ class EmitError(Exception):
 
 
 # ============================================================================
+# Large struct returns via sret (AGAST #1736)
+# ============================================================================
+#
+# A function whose return type is a named struct of at least SRET_MIN_BYTES
+# is emitted as `define void @f(%T* sret(%T) %"ret.sret", <params>...)`, the
+# same ABI ritz1 uses since #1730. x86-64 SysV already returns an aggregate
+# that large through a hidden pointer in %rdi, so it is ABI-identical to the
+# old first-class form: objects built before and after still link.
+#
+# The emitter keeps working with *logical* signatures (the Ritz parameters
+# and the struct return type). Only two places know the physical form:
+#
+#   * _SretAwareBuilder.call: a call to an sret function passes a slot and
+#     yields `load %T, slot`, so every existing consumer still sees a %T.
+#   * _SretAwareBuilder.ret: in an sret function, `ret %T v` becomes
+#     `store v, ret.sret; ret void`.
+#
+# Neither of those removes a first-class %T on its own. What does is
+# LLVMEmitter._retarget_sret_result: when the %T goes straight into memory (a
+# `var` initialiser, or `return f()`), the call's slot is replaced by the
+# destination and the load is deleted. That is what tome_cli needed:
+# `var client: TomeClient = client_new()` stored an 8 KB first-class value
+# into a debug-declared alloca, and clang -O2 took 6.5 GB to lower it.
+SRET_MIN_BYTES = 256
+
+# An LLVM parameter list, allowing one level of nested parens for typed
+# attributes such as `sret(%T)`. The regexes over `define`/`declare` lines
+# used `\([^)]*\)`, which stops inside `sret(` (AGAST #1736).
+_IR_PARAMS = r'\((?:[^()]|\([^()]*\))*\)'
+
+
+class _SretAwareBuilder(ir.IRBuilder):
+    """IRBuilder that lowers calls to and returns from sret functions."""
+
+    def __init__(self, block, emitter: 'LLVMEmitter'):
+        super().__init__(block)
+        self._emitter = emitter
+
+    def call(self, fn, args, name='', cconv=None, tail=False, fastmath=(),
+             attrs=(), arg_attrs=None):
+        sret_ty = self._emitter._sret_type_of(fn)
+        # Callers pass logical args. Only an sret fn called with one arg fewer
+        # than it physically takes needs the slot.
+        if sret_ty is None or len(args) != len(fn.function_type.args) - 1:
+            return super().call(fn, args, name=name, cconv=cconv, tail=tail,
+                                fastmath=fastmath, attrs=attrs,
+                                arg_attrs=arg_attrs)
+        slot = self._entry_alloca(sret_ty, "sret.slot")
+        shifted = {k + 1: v for k, v in (arg_attrs or {}).items()}
+        shifted[0] = ('sret',)
+        call = super().call(fn, [slot, *args], cconv=cconv, fastmath=fastmath,
+                            attrs=attrs, arg_attrs=shifted)
+        result = self.load(slot, name=name)
+        self._emitter._sret_results[id(result)] = (result, call, slot)
+        return result
+
+    def _entry_alloca(self, ty, name):
+        em = self._emitter
+        if em.builder is self and em.current_fn is self.function:
+            return em._alloca_in_entry_block(ty, name)
+        with self.goto_entry_block():
+            return self.alloca(ty, name=name)
+
+    def ret(self, value):
+        fn = self.function
+        sret_ty = self._emitter._sret_type_of(fn)
+        if sret_ty is None:
+            return super().ret(value)
+        dest = fn.args[0]
+        # `return f()`: let f write the caller's sret slot directly.
+        if not self._emitter._retarget_sret_result(value, dest):
+            self.store(value, dest)
+        return self.ret_void()
+
+
+# ============================================================================
 # Struct Layout Registry
 # ============================================================================
 
@@ -250,6 +326,11 @@ class LLVMEmitter:
         self.const_arrays: Dict[str, Tuple[ir.GlobalVariable, ir.Type]] = {}  # name -> (gvar, type)
         self.globals: Dict[str, Tuple[ir.GlobalVariable, ir.Type]] = {}  # name -> (gvar, type)
         self.extern_fns: Dict[str, ir.Function] = {}
+        # AGAST #1736: LLVM function name -> struct type it returns via sret,
+        # and live `load %T, slot` results of sret calls (keyed by id()) that
+        # may still be retargeted at their destination.
+        self._sret_fns: Dict[str, ir.Type] = {}
+        self._sret_results: Dict[int, tuple] = {}
         self.struct_types: Dict[str, ir.BaseStructType] = {}  # name -> LLVM struct type
         self.struct_fields: Dict[str, List[Tuple[str, rast.Type]]] = {}  # name -> [(field_name, type)]
         self.ritz_types: Dict[str, rast.Type] = {}  # name -> Ritz AST type (for signedness)
@@ -1825,6 +1906,10 @@ class LLVMEmitter:
         # functions. See _add_alignstack_to_all_functions.
         ir_str = self._add_alignstack_to_all_functions(ir_str)
 
+        # AGAST #1736: functions calling ISA-extension intrinsics declare
+        # the CPU features those intrinsics need.
+        ir_str = _add_intrinsic_target_features(ir_str)
+
         # Add header comment
         lines = ir_str.split('\n')
         lines.insert(0, '; Ritz compiled module')
@@ -1867,7 +1952,9 @@ class LLVMEmitter:
         # 3. Not already have alignstack
         # We use negative lookbehind to skip if alignstack already present
         # Pattern: start of line, define, type, @"name"(...), optional space, !dbg or {
-        pattern = r'^(define [^\n]+@"[^"]+"\([^)]*\))(?! alignstack)(\s*)(!dbg|\{)'
+        # The parameter list may itself contain parens: `sret(%T)` (#1736).
+        pattern = (r'^(define [^\n]+@"[^"]+"' + _IR_PARAMS
+                   + r')(?! alignstack)(\s*)(!dbg|\{)')
         replacement = r'\1 alignstack(16) "no-builtins"\2\3'
         ir_str = re.sub(pattern, replacement, ir_str, flags=re.MULTILINE)
 
@@ -3019,6 +3106,78 @@ class LLVMEmitter:
             flag_alloca = self.drop_flags[alloca_id]
             self.builder.store(ir.Constant(self.i1, 1), flag_alloca)
 
+    # --- sret (AGAST #1736; see the note above _SretAwareBuilder) -----------
+
+    def _sret_struct_type(self, ret_type: ir.Type) -> Optional[ir.Type]:
+        """`ret_type` if a function returning it should do so via sret.
+
+        Named user structs only, as in ritz1 (#1730): enums and builtin
+        aggregates (StrView, Span, Result/Option) keep their ABI.
+        """
+        if (isinstance(ret_type, ir.IdentifiedStructType)
+                and ret_type.name.startswith('struct.')
+                and ret_type.elements is not None
+                and self._type_size_bytes(ret_type) >= SRET_MIN_BYTES):
+            return ret_type
+        return None
+
+    def _sret_type_of(self, fn) -> Optional[ir.Type]:
+        """The struct `fn` returns via sret, or None."""
+        if not isinstance(fn, ir.Function):
+            return None
+        return self._sret_fns.get(fn.name)
+
+    def _new_function(self, name: str, ret_type: ir.Type,
+                      param_types: List[ir.Type]) -> ir.Function:
+        """Create a user function from its *logical* signature, adding the
+        sret parameter when the return type calls for one."""
+        sret_ty = self._sret_struct_type(ret_type)
+        if sret_ty is None:
+            return ir.Function(self.module, ir.FunctionType(ret_type, param_types), name=name)
+        fn_type = ir.FunctionType(self.void, [ir.PointerType(sret_ty), *param_types])
+        fn = ir.Function(self.module, fn_type, name=name)
+        fn.args[0].add_attribute('sret')
+        fn.args[0].name = 'ret.sret'
+        self._sret_fns[name] = sret_ty
+        return fn
+
+    def _fn_param_types(self, fn: ir.Function) -> list:
+        """`fn`'s logical parameter types (without the sret pointer)."""
+        args = fn.function_type.args
+        return list(args[1:]) if self._sret_type_of(fn) is not None else list(args)
+
+    def _fn_value_args(self, fn: ir.Function) -> list:
+        """`fn`'s logical arguments (without the sret pointer)."""
+        return list(fn.args[1:]) if self._sret_type_of(fn) is not None else list(fn.args)
+
+    def _fn_ret_type(self, fn: ir.Function) -> ir.Type:
+        """`fn`'s logical return type (the struct, for an sret function)."""
+        return self._sret_type_of(fn) or fn.function_type.return_type
+
+    def _retarget_sret_result(self, value, dest) -> bool:
+        """Make the sret call that produced `value` write into `dest`.
+
+        `value` must be the `load %T, slot` an sret call just produced, and
+        still the last instruction of the current block, so that nothing can
+        have used it yet. Then the call is pointed at `dest`, and the load and
+        the now-unused slot are deleted. No first-class %T is left behind.
+        Returns False, changing nothing, otherwise.
+
+        The caller vouches that `dest` is fresh storage the call's arguments
+        cannot alias: a new `var`'s alloca, or this function's own sret slot.
+        """
+        entry = self._sret_results.pop(id(value), None)
+        if entry is None or entry[0] is not value:
+            return False
+        load, call, slot = entry
+        block = load.parent
+        if dest.type != slot.type or not block.instructions or block.instructions[-1] is not load:
+            return False
+        block.instructions.remove(load)
+        call.replace_usage(slot, dest)
+        slot.parent.instructions.remove(slot)
+        return True
+
     def _alloca_in_entry_block(self, ty: ir.Type, name: str) -> ir.AllocaInstr:
         """Allocate space in the entry block.
 
@@ -3121,8 +3280,10 @@ class LLVMEmitter:
             return None
 
         # Actually declare the extern function in the LLVM module
-        # This allows linking with external assembly/object files
-        fn = ir.Function(self.module, fn_type, name=extern.name)
+        # This allows linking with external assembly/object files.
+        # extern_fns keeps the logical fn_type; the declaration is sret for a
+        # large struct return (AGAST #1736), matching its definition.
+        fn = self._new_function(extern.name, ret_type, param_types)
         fn.linkage = 'external'
 
         # Store for later reference - use tuple format (fn, fn_def) like regular functions
@@ -3201,8 +3362,8 @@ class LLVMEmitter:
         param_types = [self._param_to_llvm_type(p) for p in fn_def.params]
         ret_type = self._ritz_type_to_llvm(fn_def.ret_type) if fn_def.ret_type else self.i32
 
-        fn_type = ir.FunctionType(ret_type, param_types)
-        fn = ir.Function(self.module, fn_type, name=fn_def.name)
+        # AGAST #1736: large struct returns become an sret parameter.
+        fn = self._new_function(fn_def.name, ret_type, param_types)
 
         # Set linkage: non-pub functions get internal linkage (not visible to linker)
         # This prevents symbol collisions when linking multiple modules
@@ -3316,9 +3477,10 @@ class LLVMEmitter:
 
         # Create entry block
         block = fn.append_basic_block(name="entry")
-        self.builder = ir.IRBuilder(block)
+        self.builder = _SretAwareBuilder(block, self)
 
         # Reset state
+        self._sret_results.clear()
         self.locals.clear()
         self.params.clear()
         self.has_returned = False
@@ -3356,7 +3518,7 @@ class LLVMEmitter:
         fn_span = getattr(fn_def, 'span', None)
         fn_line = fn_span.line if fn_span else 1
 
-        for arg, param in zip(fn.args, fn_def.params):
+        for arg, param in zip(self._fn_value_args(fn), fn_def.params):
             arg.name = f"{param.name}.arg"
 
             # Check if parameter is a reference type or mutable borrow
@@ -3817,7 +3979,7 @@ class LLVMEmitter:
         self._reject_valueless_if(stmt)
 
         if isinstance(stmt, rast.ReturnStmt):
-            ret_type = self.current_fn.function_type.return_type
+            ret_type = self._fn_ret_type(self.current_fn)
             if stmt.value:
                 # Check if we're returning a local variable - it should be moved, not dropped
                 exclude_var = None
@@ -3890,7 +4052,9 @@ class LLVMEmitter:
                     self.ritz_types[stmt.name] = ritz_type
                 # Always allocate in entry block to prevent stack leaks in loops
                 alloca = self._alloca_in_entry_block(ty, f"{stmt.name}.addr")
-                self.builder.store(val, alloca)
+                # AGAST #1736: an sret call writes the new var in place.
+                if not self._retarget_sret_result(val, alloca):
+                    self.builder.store(val, alloca)
                 self.locals[stmt.name] = (alloca, ty)
                 # Register for Drop if type was inferred and implements Drop
                 if ritz_type:
@@ -3957,8 +4121,11 @@ class LLVMEmitter:
                     self._check_int_literal_fits_declaration(stmt)
                     if stmt.type:
                         self._check_implicit_narrowing(stmt, val.type, ty)
-                    val = self._convert_type(val, ty)
-                    self.builder.store(val, alloca)
+                    # AGAST #1736: an sret call writes the new var in place
+                    # (no first-class %T, which clang -O2 lowers per byte).
+                    if not self._retarget_sret_result(val, alloca):
+                        val = self._convert_type(val, ty)
+                        self.builder.store(val, alloca)
             self.locals[stmt.name] = (alloca, ty)
             # Register for Drop if type is known and implements Drop
             if ritz_type:
@@ -5257,7 +5424,7 @@ class LLVMEmitter:
             elem_val = self.builder.load(elem_ptr)
         else:
             if vec_get_fn is not None:
-                get_index_ty = vec_get_fn.function_type.args[1]
+                get_index_ty = self._fn_param_types(vec_get_fn)[1]
                 get_idx = idx_val if idx_val.type == get_index_ty else self._convert_type(idx_val, get_index_ty)
                 elem_val = self.builder.call(vec_get_fn, [vec_ptr, get_idx])
             else:
@@ -6933,7 +7100,7 @@ class LLVMEmitter:
         emit_args = []
         for i, arg in enumerate(args):
             val = self._emit_expr(arg)
-            expected_type = constructor_fn.function_type.args[i]
+            expected_type = self._fn_param_types(constructor_fn)[i]
             val = self._convert_type(val, expected_type)
             emit_args.append(val)
 
@@ -7046,7 +7213,7 @@ class LLVMEmitter:
         Emits the return instruction and returns an undefined value
         (since we're diverging, the value is never used).
         """
-        ret_type = self.current_fn.function_type.return_type
+        ret_type = self._fn_ret_type(self.current_fn)
         if expr.value is not None:
             ret_val = self._emit_expr(expr.value)
             ret_val = self._convert_type(ret_val, ret_type)
@@ -7216,7 +7383,7 @@ class LLVMEmitter:
 
         # Create entry block
         block = fn.append_basic_block(name="entry")
-        self.builder = ir.IRBuilder(block)
+        self.builder = _SretAwareBuilder(block, self)
 
         # Set up regular parameters
         num_regular_params = len(closure.params)
@@ -7951,7 +8118,7 @@ class LLVMEmitter:
             fn, fn_def = self.functions[fname]
 
             # Check argument count BEFORE processing
-            if len(call.args) != len(fn.function_type.args):
+            if len(call.args) != len(self._fn_param_types(fn)):
                 # AGAST #1366. This one already named the function — that is
                 # why 52_uring's identical-class failure was fixed in one step
                 # while 47_lisp's anonymous one sat on the allowlist. It still
@@ -7959,7 +8126,7 @@ class LLVMEmitter:
                 # location, so give it the same treatment.
                 raise EmitError(
                     f"`{fname}` called with {len(call.args)} argument(s) but "
-                    f"defined with {len(fn.function_type.args)}",
+                    f"defined with {len(self._fn_param_types(fn))}",
                     self._call_span(call))
 
             # Emit arguments with type conversion and String -> *u8 coercion
@@ -7967,7 +8134,7 @@ class LLVMEmitter:
             args = []
             for i, arg in enumerate(call.args):
                 param_def = fn_def.params[i]
-                expected_type = fn.function_type.args[i]
+                expected_type = self._fn_param_types(fn)[i]
 
                 # Check if this parameter is a reference type (@T or @&T in RERITZ, or :& borrow)
                 # References pass by pointer - we need to pass the address of the argument
@@ -8100,7 +8267,7 @@ class LLVMEmitter:
 
             # Declare the extern function in LLVM if not already done
             if fname not in self.module.globals:
-                fn = ir.Function(self.module, fn_type, name=fname)
+                fn = self._new_function(fname, fn_type.return_type, list(fn_type.args))
             else:
                 fn = self.module.globals[fname]
 
@@ -9406,13 +9573,13 @@ class LLVMEmitter:
             # Convert argument types as needed
             converted_args = []
             for i, arg in enumerate(all_args):
-                expected_type = fn.function_type.args[i]
+                expected_type = self._fn_param_types(fn)[i]
                 converted = self._convert_type(arg, expected_type)
                 converted_args.append(converted)
 
             return self.builder.call(fn, converted_args)
 
-        first_param_type = fn.function_type.args[0]
+        first_param_type = self._fn_param_types(fn)[0]
 
         # Determine whether to pass by value or by pointer (auto-borrow)
         # If method expects pointer and receiver is lvalue, get address
@@ -9478,7 +9645,7 @@ class LLVMEmitter:
         # Auto-borrow addressable args when the method expects a pointer param.
         all_args = [receiver_val]
         for j, arg in enumerate(expr.args, start=1):
-            expected_type = fn.function_type.args[j] if j < len(fn.function_type.args) else None
+            expected_type = self._fn_param_types(fn)[j] if j < len(self._fn_param_types(fn)) else None
             arg_ritz_type = self._infer_ritz_type(arg)
             arg_is_ref = isinstance(arg_ritz_type, rast.RefType) if arg_ritz_type else False
             arg_is_ptr = isinstance(arg_ritz_type, rast.PtrType) if arg_ritz_type else False
@@ -9517,7 +9684,7 @@ class LLVMEmitter:
         # Convert argument types as needed
         converted_args = []
         for i, arg in enumerate(all_args):
-            expected_type = fn.function_type.args[i]
+            expected_type = self._fn_param_types(fn)[i]
             converted = self._convert_type(arg, expected_type)
             converted_args.append(converted)
 
@@ -11023,7 +11190,7 @@ class LLVMEmitter:
         self.builder.position_at_end(err_block)
 
         # Get the function's return type - must also be a Result
-        ret_type = self.current_fn.function_type.return_type
+        ret_type = self._fn_ret_type(self.current_fn)
         ret_ritz_type = self.current_fn_def.ret_type if self.current_fn_def else None
 
         # Extract the Err payload from the result
@@ -11660,6 +11827,68 @@ def _extract_fn_ir_blocks(ir_str: str) -> Dict[str, str]:
     return fn_blocks
 
 
+# AGAST #1736: the CPU feature each family of x86 intrinsics needs, keyed by
+# intrinsic-name prefix. Without the feature, instruction selection aborts
+# with "Cannot select: intrinsic %llvm.x86.sha256rnds2" (clang exit 70)
+# unless clang happens to be run with -msha / -maes / -mpclmul / -march=native.
+# llvm.x86.sse2.* is baseline x86-64 and needs nothing.
+_X86_INTRINSIC_FEATURES = (
+    ('llvm.x86.sha', '+sha'),
+    ('llvm.x86.aesni.', '+aes'),
+    ('llvm.x86.pclmulqdq', '+pclmul'),
+)
+
+_INTRINSIC_CALL_RE = re.compile(r'@"?(llvm\.x86\.[A-Za-z0-9_.]+)"?\(')
+
+
+def _add_intrinsic_target_features(ir_str: str) -> str:
+    """Give every function that calls an ISA-extension intrinsic the matching
+    `"target-features"` attribute.
+
+    This is what clang does for a C function marked
+    `__attribute__((target("sha")))`: the feature is enabled for that function
+    alone. The rest of the module stays baseline x86-64, so the run-time CPU
+    check that guards the call (cryptosec's cpu_has_sha_ni and friends) still
+    decides whether the instructions ever execute.
+
+    It must live in the IR. build.py's per-source `clang -c -O2` passes no
+    -march flags, and the .ll fallback that used to re-lower the IR at link time
+    (with `-march=native -msha`) is gone since AGAST #1731.
+    """
+    lines = ir_str.split('\n')
+    define_idx = None
+    features: List[str] = []
+    for i, line in enumerate(lines):
+        if line.startswith('define '):
+            define_idx, features = i, []
+            continue
+        if define_idx is None:
+            continue
+        if line == '}':
+            if features:
+                lines[define_idx] = _with_target_features(lines[define_idx], features)
+            define_idx = None
+            continue
+        if 'llvm.x86.' not in line:
+            continue
+        for name in _INTRINSIC_CALL_RE.findall(line):
+            for prefix, feature in _X86_INTRINSIC_FEATURES:
+                if name.startswith(prefix) and feature not in features:
+                    features.append(feature)
+    return '\n'.join(lines)
+
+
+def _with_target_features(define_line: str, features: List[str]) -> str:
+    """Add `"target-features"="..."` to a `define` line, keeping `!dbg` last."""
+    if '"target-features"' in define_line:
+        return define_line  # idempotent (cached IR is already processed)
+    attr = f'"target-features"="{",".join(sorted(features))}"'
+    m = re.search(r'\s(!dbg !\d+)\s*$', define_line)
+    if m:
+        return f'{define_line[:m.start()]} {attr} {m.group(1)}'
+    return f'{define_line.rstrip()} {attr}'
+
+
 def _splice_cached_ir(ir_str: str, cached_fns: Dict[str, str]) -> str:
     """Replace 'declare' lines with cached 'define' blocks for cached functions.
 
@@ -11677,7 +11906,8 @@ def _splice_cached_ir(ir_str: str, cached_fns: Dict[str, str]) -> str:
         # declare <ret> @"<name>"(<params>)
         escaped_name = re.escape(fn_name)
         # Try both quoted and unquoted forms
-        pattern = rf'^declare\s+[^@]+@"?{escaped_name}"?\([^)]*\)\s*$'
+        # _IR_PARAMS: an sret declare has `sret(%T)` inside its params (#1736).
+        pattern = rf'^declare\s+[^@]+@"?{escaped_name}"?{_IR_PARAMS}\s*$'
         match = re.search(pattern, ir_str, re.MULTILINE)
         if match:
             # Replace declare with the cached define block

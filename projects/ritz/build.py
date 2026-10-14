@@ -230,9 +230,23 @@ def _limit_address_space(limit_bytes: int):
     return apply
 
 
+# AGAST #1736: a clang crash puts its cause at the top (the backend error,
+# then "N. Running pass '...' on function '@f'") and then dozens of stack
+# frames, so a bare tail is all frames. These lines are kept from the head.
+_CLANG_CRASH_CAUSE = re.compile(
+    r"error in backend|LLVM ERROR|^fatal error|Running pass|Program arguments")
+CLANG_OBJ_CRASH_HEAD = 8  # most cause lines kept from before the tail
+
+
 def _stderr_tail(stderr: str, lines: int = CLANG_OBJ_STDERR_TAIL) -> str:
-    tail = (stderr or "").rstrip().splitlines()[-lines:]
-    return "\n".join(tail) if tail else "(no stderr)"
+    all_lines = (stderr or "").rstrip().splitlines()
+    tail = all_lines[-lines:]
+    if not tail:
+        return "(no stderr)"
+    cause = [ln for ln in all_lines[:-lines] if _CLANG_CRASH_CAUSE.search(ln)]
+    if cause:
+        return "\n".join(cause[:CLANG_OBJ_CRASH_HEAD] + ["..."] + tail)
+    return "\n".join(tail)
 
 
 def compile_ll_to_obj(ll_path: Path, obj_path: Path, src: Path) -> Optional[str]:
