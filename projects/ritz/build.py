@@ -20,8 +20,10 @@ import os
 import re
 import subprocess
 import shutil
+import signal
 import argparse
 import tempfile
+import textwrap
 from pathlib import Path
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
@@ -178,6 +180,117 @@ _WARNED_NO_VERIFIER = False
 # paths that DO compile C/Ritz source (and for the UEFI target), but do not
 # add them somewhere new expecting them to fix a libc-call regression on IR.
 FREESTANDING_FLAGS = ["-ffreestanding", "-fno-builtin"]
+
+# AGAST #1731: bounds for the per-source `clang -c -O2 <x>.ll` object compile.
+#
+# That compile used to run unbounded, and a failure quietly fell back to
+# handing the .ll to the link step. Together those hid #1730 for a whole gate:
+# under `ulimit -v` clang hit the cap on ritz1's tokens.ll, build.py swallowed
+# it and reported success; without the ulimit, every gate hung or OOM'd the
+# host (13+ GB clang, WSL down twice).
+#
+# Now the compile runs under a wall-clock timeout and an RLIMIT_AS cap, and
+# any failure (non-zero exit, timeout, cap) fails the build, naming the file,
+# the exit status and the stderr tail. There is no fallback. Pathological IR
+# is a compiler bug to fix, not something to link around.
+#
+# Both bounds can be overridden from the environment. Defaults are generous:
+# a healthy -O2 compile of the largest ritz1 module takes seconds and well
+# under 1 GB.
+CLANG_OBJ_TIMEOUT_ENV = "RITZ_CLANG_OBJ_TIMEOUT"   # seconds
+CLANG_OBJ_MEM_ENV = "RITZ_CLANG_OBJ_MEM_MB"        # MiB of address space
+CLANG_OBJ_TIMEOUT_DEFAULT = 300
+CLANG_OBJ_MEM_MB_DEFAULT = 4096
+CLANG_OBJ_STDERR_TAIL = 20  # lines of clang stderr shown on failure
+
+# Count of failed object compiles in this process. Every failure fails the
+# build, so this exists for tests and post-mortems: it must be zero for any
+# build that reported success.
+CLANG_OBJ_FAILURES = 0
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        print(f"  ⚠ ignoring {name}={raw!r} (not an integer); using {default}",
+              file=sys.stderr)
+        return default
+    return value if value > 0 else default
+
+
+def _limit_address_space(limit_bytes: int):
+    """Return a preexec_fn that caps the child's address space at `limit_bytes`."""
+    def apply() -> None:
+        import resource
+        resource.setrlimit(resource.RLIMIT_AS, (limit_bytes, limit_bytes))
+    return apply
+
+
+def _stderr_tail(stderr: str, lines: int = CLANG_OBJ_STDERR_TAIL) -> str:
+    tail = (stderr or "").rstrip().splitlines()[-lines:]
+    return "\n".join(tail) if tail else "(no stderr)"
+
+
+def compile_ll_to_obj(ll_path: Path, obj_path: Path, src: Path) -> Optional[str]:
+    """Run the bounded `clang -c -O2` for one .ll. Return None on success.
+
+    On failure, increments CLANG_OBJ_FAILURES and returns a message naming the
+    file, the exit status (or timeout) and clang's stderr tail. The caller
+    must fail the build with it. See the AGAST #1731 note above.
+    """
+    global CLANG_OBJ_FAILURES
+    timeout = _env_int(CLANG_OBJ_TIMEOUT_ENV, CLANG_OBJ_TIMEOUT_DEFAULT)
+    mem_mb = _env_int(CLANG_OBJ_MEM_ENV, CLANG_OBJ_MEM_MB_DEFAULT)
+    cmd = ["clang", "-c", "-O2", "-fPIC", *FREESTANDING_FLAGS,
+           str(ll_path), "-o", str(obj_path)]
+
+    # Own session, so a timeout kills clang and anything it spawned (cc1 when
+    # not integrated), not just the driver.
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        start_new_session=True,
+        preexec_fn=_limit_address_space(mem_mb * 1024 * 1024),
+    )
+    try:
+        _, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        _, stderr = proc.communicate()
+        status = f"timed out after {timeout}s ({CLANG_OBJ_TIMEOUT_ENV})"
+    else:
+        if proc.returncode == 0:
+            return None
+        if proc.returncode < 0:
+            status = f"killed by signal {-proc.returncode}"
+        else:
+            status = f"exit status {proc.returncode}"
+
+    CLANG_OBJ_FAILURES += 1
+    obj_path.unlink(missing_ok=True)  # never link a partial object
+    return (
+        f"clang -c -O2 failed on {ll_path} (from {src}): {status}\n"
+        f"  bounds: timeout {timeout}s, address space {mem_mb} MiB "
+        f"({CLANG_OBJ_MEM_ENV})\n"
+        f"  stderr tail:\n" + textwrap.indent(_stderr_tail(stderr), "    ")
+    )
+
+
+def report_obj_failures(failures: List[str]) -> None:
+    """Report every failed `clang -c -O2`. AGAST #1731: never silent."""
+    if not failures:
+        return
+    n = len(failures)
+    print(f"\n  ✗ clang -c -O2 failed for {n} IR file{'s' if n != 1 else ''} "
+          f"(no fallback; see AGAST #1731):", file=sys.stderr)
+    for msg in failures:
+        print(f"\n  {msg}", file=sys.stderr)
 
 # Add ritz0 to path for import resolver (must be done before importing)
 RITZ0_DIR = ROOT / "ritz0"
@@ -1274,6 +1387,7 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
         # Compile each source file to LLVM IR, optionally convert to bitcode
         # All sources compiled with --no-runtime; _start comes from runtime .o
         compile_failures: List[Tuple[Path, str]] = []
+        obj_failures: List[str] = []  # AGAST #1731
         for i, src in enumerate(all_sources):
             is_main = (i == len(all_sources) - 1)
 
@@ -1316,27 +1430,13 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
                         ll_path.write_text(cached_ll)
                         # Pre-compile cached IR to a native .o so the link
                         # step doesn't have to re-lower it on every invocation.
-                        clang_obj = subprocess.run(
-                            ["clang", "-c", "-O2", "-fPIC",
-                             *FREESTANDING_FLAGS,
-                             str(ll_path), "-o", str(obj_path)],
-                            capture_output=True, text=True,
-                        )
-                        if clang_obj.returncode == 0:
-                            cache.update_obj_cache(src, obj_path)
-                            link_files.append(obj_path)
+                        # AGAST #1731: bounded, and a failure fails the build.
+                        obj_error = compile_ll_to_obj(ll_path, obj_path, src)
+                        if obj_error is not None:
+                            obj_failures.append(obj_error)
                             continue
-                        # Fall back to .bc / .ll on clang -c failure.
-                        if has_llvm_as:
-                            as_result = subprocess.run(
-                                ["llvm-as", str(ll_path), "-o", str(bc_path)],
-                                capture_output=True, text=True
-                            )
-                            if as_result.returncode == 0:
-                                cache.update_bc_cache(src, bc_path)
-                                link_files.append(bc_path)
-                                continue
-                        link_files.append(ll_path)
+                        cache.update_obj_cache(src, obj_path)
+                        link_files.append(obj_path)
                         continue
 
             # All sources compiled without runtime - _start comes from external .o
@@ -1388,40 +1488,25 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
             # this, the link step pays for full IR lowering on every file
             # (cached or not).  Caching the .o means subsequent rebuilds —
             # even ones that re-invoke ritz1 — skip clang's slow path.
-            clang_obj = subprocess.run(
-                ["clang", "-c", "-O2", "-fPIC",
-                 *FREESTANDING_FLAGS,
-                 str(ll_path), "-o", str(obj_path)],
-                capture_output=True, text=True,
-            )
-            if clang_obj.returncode == 0:
-                if use_cache:
-                    cache.update_obj_cache(src, obj_path)
-                link_files.append(obj_path)
+            #
+            # AGAST #1731: there is deliberately no .bc / .ll fallback here.
+            # One used to swallow a failed (or capped) -O2 compile and link the
+            # .ll instead, which hid #1730 for a whole gate.
+            obj_error = compile_ll_to_obj(ll_path, obj_path, src)
+            if obj_error is not None:
+                obj_failures.append(obj_error)
                 continue
-
-            # Fall back to the legacy .bc / .ll → linker path if clang -c failed.
-            if has_llvm_as:
-                as_result = subprocess.run(
-                    ["llvm-as", str(ll_path), "-o", str(bc_path)],
-                    capture_output=True, text=True
-                )
-                if as_result.returncode == 0:
-                    if use_cache:
-                        cache.update_bc_cache(src, bc_path)
-                    link_files.append(bc_path)
-                else:
-                    # Fallback to .ll if llvm-as fails
-                    link_files.append(ll_path)
-            else:
-                link_files.append(ll_path)
+            if use_cache:
+                cache.update_obj_cache(src, obj_path)
+            link_files.append(obj_path)
 
         # AGAST #1286: every source has now been attempted. If any failed,
         # report them all and stop before linking — linking a partial set of
         # objects would only produce confusing undefined-symbol errors on top
         # of the real diagnostics.
-        if compile_failures:
+        if compile_failures or obj_failures:
             report_compile_failures(compile_failures, compiler)
+            report_obj_failures(obj_failures)
             return None
 
         # Link all .bc/.ll files with the runtime .o
