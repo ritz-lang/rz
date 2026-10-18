@@ -153,6 +153,26 @@ fn bind_scalar_borrow_param(s: *EmitterState, param: *Param, alloca_reg: i32) ->
     add_local(s, param.name, param.name_len, slot, pt)
     return 1
 
+# AGAST #1739: bind a large by-value struct param (`ptr byval(%T) %x.arg`,
+# see param_uses_byval).  The byval memory is the callee's own copy, so it
+# IS the param's slot: no alloca and no first-class `store %T`, which is
+# what hung clang -O2.  A no-op GEP names the pointer with a fresh `%.N`
+# register (locals are keyed by register number), and the param registers
+# exactly like a spilled struct param.  Writes to the param stay local.
+# Returns 0 for every other param.
+fn bind_byval_param(s: *EmitterState, param: *Param) -> i32
+    if param_uses_byval(s, param) == 0
+        return 0
+    let slot: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, slot)
+    emit_str(s, c" = getelementptr i8, ptr %")
+    emit_name(s, param.name, param.name_len)
+    emit_str(s, c".arg, i64 0  ; #1739 byval param\n")
+    add_local_struct(s, param.name, param.name_len, slot, param.param_type, param.param_type_name, param.param_type_name_len)
+    set_local_fn_sig(s, param.name, param.name_len, param.fn_sig)  # AGAST #1671
+    return 1
+
 # Spill a bool parameter into an i64 slot and register it as TYPE_I64.
 #
 # AGAST #1497. The ABI passes a bool as i1, but ritz1's value model is i64 for
@@ -416,7 +436,7 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
         if first2 == 0
             emit_str(s, c", ")
         first2 = 0
-        emit_llvm_type_struct(s, param2.param_type, param2.param_type_name, param2.param_type_name_len)
+        emit_param_llvm_type(s, param2)   # AGAST #1739: large struct -> ptr byval
         emit_str(s, c" %")
         emit_name(s, param2.name, param2.name_len)
         emit_str(s, c".arg")
@@ -441,6 +461,9 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
     while param3 != null
         if param3.param_type == TYPE_BOOL
             emit_bool_param_spill(s, param3)
+            param3 = param3.next
+            continue
+        if bind_byval_param(s, param3) == 1   # AGAST #1739
             param3 = param3.next
             continue
         let alloca_reg: i32 = next_reg(s)
@@ -722,7 +745,7 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
             # emit_llvm_type_struct so struct params declare `%Tag` rather
             # than the i64 fallback — keeps the definition in sync with
             # call sites that walk the same FnDef.params.
-            emit_llvm_type_struct(s, param.param_type, param.param_type_name, param.param_type_name_len)
+            emit_param_llvm_type(s, param)   # AGAST #1739: large struct -> ptr byval
         emit_str(s, c" %")
         emit_name(s, param.name, param.name_len)
         emit_str(s, c".arg")
@@ -753,6 +776,10 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
         if param2.name_len == 4
             if *param2.name == 115 and *(param2.name + 1) == 101 and *(param2.name + 2) == 108 and *(param2.name + 3) == 102
                 p2_is_self = 1
+        # `self` is always passed as `ptr` (see the header above).
+        if p2_is_self == 0 and bind_byval_param(s, param2) == 1   # AGAST #1739
+            param2 = param2.next
+            continue
         let alloca_reg: i32 = next_reg(s)
         emit_str(s, c"  ")
         emit_reg(s, alloca_reg)
@@ -1261,6 +1288,45 @@ fn is_syscall_function(name: *u8, len: i32) -> i32
         return 1
     0
 
+# AGAST #1739: 1 when `f` has a large by-value struct param (param_uses_byval).
+fn fn_has_byval_param(s: *EmitterState, f: *FnDef) -> i32
+    if f == null
+        return 0
+    var p: *Param = f.params
+    while p != null
+        if param_uses_byval(s, p) == 1
+            return 1
+        p = p.next
+    0
+
+# AGAST #1739: a `(...)` declare cannot carry a `byval` attribute, so a fn
+# with a large by-value struct param is declared with its concrete
+# signature, written exactly as emit_fn writes the definition (sret first).
+fn emit_concrete_extern_declare(s: *EmitterState, f: *FnDef, name: *u8, name_len: i32)
+    let sret: i32 = struct_ret_uses_sret(s, f.return_type, f.return_type_name, f.return_type_name_len)
+    emit_str(s, c"declare ")
+    if sret == 1
+        emit_str(s, c"void")
+    else
+        emit_llvm_type_struct(s, f.return_type, f.return_type_name, f.return_type_name_len)
+    emit_str(s, c" @")
+    emit_name(s, name, name_len)
+    emit_str(s, c"(")
+    var first: i32 = 1
+    if sret == 1
+        emit_str(s, c"ptr sret(%")
+        emit_name(s, f.return_type_name, f.return_type_name_len)
+        emit_str(s, c")")
+        first = 0
+    var p: *Param = f.params
+    while p != null
+        if first == 0
+            emit_str(s, c", ")
+        first = 0
+        emit_param_llvm_type(s, p)
+        p = p.next
+    emit_str(s, c")\n")
+
 fn emit_extern_declarations(s: *EmitterState)
     # Check ALL externs for syscalls — even "local" ones (imported from ritzlib.sys),
     # because ritz1 can't emit their inline asm bodies. We provide our own implementations.
@@ -1304,7 +1370,9 @@ fn emit_extern_declarations(s: *EmitterState)
         if is_local_function(s.module, ex.name, ex.name_len) == 0
                 # Look up the function's return type from its definition
                 let fn_def: *FnDef = find_fn(s, ex.name, ex.name_len)
-                if fn_def != null and struct_ret_uses_sret(s, fn_def.return_type, fn_def.return_type_name, fn_def.return_type_name_len) == 1
+                if fn_has_byval_param(s, fn_def) == 1
+                    emit_concrete_extern_declare(s, fn_def, ex.name, ex.name_len)   # AGAST #1739
+                else if fn_def != null and struct_ret_uses_sret(s, fn_def.return_type, fn_def.return_type_name, fn_def.return_type_name_len) == 1
                     # AGAST #1730 — the call sites pass `ptr sret(%T)`.
                     emit_str(s, c"declare void @")
                     emit_name(s, ex.name, ex.name_len)

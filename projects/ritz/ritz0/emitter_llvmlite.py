@@ -64,6 +64,26 @@ class EmitError(Exception):
 # into a debug-declared alloca, and clang -O2 took 6.5 GB to lower it.
 SRET_MIN_BYTES = 256
 
+# ============================================================================
+# Large by-value struct params via byval (AGAST #1739)
+# ============================================================================
+#
+# A by-value param of a named struct of at least SRET_MIN_BYTES (the same
+# _sret_struct_type test) is `%T* byval(%T) align 8`: what clang emits for a C
+# `struct T` param on x86-64 SysV, and what ritz1 emits since #1739.  Unlike
+# sret this IS an ABI change (a first-class aggregate arg is split into one
+# scalar per leaf), so both compilers changed together.
+#
+#   * _new_function: the physical param is a pointer with byval + align 8;
+#     _fn_param_types still answers the logical %T.
+#   * _SretAwareBuilder.call: a %T arg is passed as a pointer to its bytes:
+#     the load's own source when nothing since the load can write memory
+#     (LLVM copies byval args at the call), else a fresh slot filled by an
+#     sret retarget or a #1732 pointer-to-pointer copy.
+#   * the callee binds the param to the byval pointer itself (the callee owns
+#     that copy), so no first-class `store %T %b.arg` is emitted.
+BYVAL_ALIGN = 8
+
 # An LLVM parameter list, allowing one level of nested parens for typed
 # attributes such as `sret(%T)`. The regexes over `define`/`declare` lines
 # used `\([^)]*\)`, which stops inside `sret(` (AGAST #1736).
@@ -101,22 +121,75 @@ class _SretAwareBuilder(ir.IRBuilder):
         self._emitter = emitter
 
     def call(self, fn, args, name='', cconv=None, tail=False, fastmath=(),
-             attrs=(), arg_attrs=None):
-        sret_ty = self._emitter._sret_type_of(fn)
+             attrs=(), arg_attrs=None, byval=None):
+        # `byval` overrides the {logical index: %T} map for an indirect call,
+        # whose callee is a bare pointer with no _byval_fns entry (#1739).
+        em = self._emitter
+        sret_ty = em._sret_type_of(fn)
+        if byval is None:
+            byval = em._byval_params_of(fn)
         # Callers pass logical args. Only an sret fn called with one arg fewer
         # than it physically takes needs the slot.
-        if sret_ty is None or len(args) != len(fn.function_type.args) - 1:
-            return super().call(fn, args, name=name, cconv=cconv, tail=tail,
+        needs_slot = sret_ty is not None and len(args) == len(fn.function_type.args) - 1
+        if byval:
+            # AGAST #1739: logical index i is args[i + lead].
+            lead = 1 if sret_ty is not None and not needs_slot else 0
+            args, arg_attrs = self._byval_args(byval, list(args), dict(arg_attrs or {}), lead)
+        if not needs_slot:
+            call = super().call(fn, args, name=name, cconv=cconv, tail=tail,
                                 fastmath=fastmath, attrs=attrs,
                                 arg_attrs=arg_attrs)
+            self._set_byval_align(call, byval, 1 if sret_ty is not None else 0)
+            return call
         slot = self._entry_alloca(sret_ty, "sret.slot")
         shifted = {k + 1: v for k, v in (arg_attrs or {}).items()}
         shifted[0] = ('sret',)
         call = super().call(fn, [slot, *args], cconv=cconv, fastmath=fastmath,
                             attrs=attrs, arg_attrs=shifted)
+        self._set_byval_align(call, byval, 1)
         result = self.load(slot, name=name)
-        self._emitter._sret_results[id(result)] = (result, call, slot)
+        em._sret_results[id(result)] = (result, call, slot)
         return result
+
+    def _byval_args(self, byval, args, arg_attrs, lead):
+        """AGAST #1739: pass each large by-value %T arg as a pointer.
+
+        Sources are chosen for every arg before any spill is emitted: a
+        spill writes memory, which would hide a later arg's still-valid load
+        source from _large_copy_source.
+        """
+        em = self._emitter
+        spills = []
+        for i, ty in byval.items():
+            j = i + lead
+            if j >= len(args):
+                continue
+            v = args[j]
+            arg_attrs[j] = tuple(arg_attrs.get(j, ())) + ('byval',)
+            if v.type != ty:
+                continue   # already a pointer
+            src = None
+            if isinstance(v, ir.LoadInstr):
+                src = em._large_copy_source(v, v.operands[0], self.block)
+            if src is not None:
+                # LLVM copies a byval arg at the call; nothing since the load
+                # wrote memory, so the bytes at `src` are still the value.
+                args[j] = src
+            else:
+                spills.append((j, v, ty))
+        for j, v, ty in spills:
+            tmp = self._entry_alloca(ty, "byval.tmp")
+            if not em._retarget_sret_result(v, tmp):
+                self.store(v, tmp)
+            args[j] = tmp
+        return args, arg_attrs
+
+    @staticmethod
+    def _set_byval_align(call, byval, offset):
+        for i in byval:
+            attrs = call.arg_attributes.get(i + offset)
+            if attrs is not None:
+                attrs.align = BYVAL_ALIGN
 
     def _entry_alloca(self, ty, name):
         em = self._emitter
@@ -367,6 +440,9 @@ class LLVMEmitter:
         # and live `load %T, slot` results of sret calls (keyed by id()) that
         # may still be retargeted at their destination.
         self._sret_fns: Dict[str, ir.Type] = {}
+        # AGAST #1739: LLVM function name -> {logical param index: %T} of its
+        # large by-value struct params, passed `%T* byval(%T) align 8`.
+        self._byval_fns: Dict[str, Dict[int, ir.Type]] = {}
         self._sret_results: Dict[int, tuple] = {}
         self.struct_types: Dict[str, ir.BaseStructType] = {}  # name -> LLVM struct type
         self.struct_fields: Dict[str, List[Tuple[str, rast.Type]]] = {}  # name -> [(field_name, type)]
@@ -670,6 +746,12 @@ class LLVMEmitter:
             # Function pointer type: fn(T1, T2, ...) -> R
             # Compiles to LLVM function pointer
             param_types = [self._ritz_type_to_llvm(p) for p in ty.params]
+            # AGAST #1739: a large by-value struct param is physically a
+            # `%T*` (byval), exactly as in _new_function, so that a named fn
+            # converts to this type without a by-value bitcast.  The byval
+            # attribute itself goes on each indirect call (_fn_type_byval).
+            param_types = [ir.PointerType(t) if self._sret_struct_type(t) is not None else t
+                           for t in param_types]
             ret_type = self._ritz_type_to_llvm(ty.ret) if ty.ret else self.void
             fn_type = ir.FunctionType(ret_type, param_types)
             return ir.PointerType(fn_type)
@@ -3168,20 +3250,53 @@ class LLVMEmitter:
                       param_types: List[ir.Type]) -> ir.Function:
         """Create a user function from its *logical* signature, adding the
         sret parameter when the return type calls for one."""
+        # AGAST #1739: large by-value struct params become `%T* byval(%T)`.
+        byval = {i: t for i, t in enumerate(param_types)
+                 if self._sret_struct_type(t) is not None}
+        phys_params = [ir.PointerType(t) if i in byval else t
+                       for i, t in enumerate(param_types)]
         sret_ty = self._sret_struct_type(ret_type)
         if sret_ty is None:
-            return ir.Function(self.module, ir.FunctionType(ret_type, param_types), name=name)
-        fn_type = ir.FunctionType(self.void, [ir.PointerType(sret_ty), *param_types])
-        fn = ir.Function(self.module, fn_type, name=name)
-        fn.args[0].add_attribute('sret')
-        fn.args[0].name = 'ret.sret'
-        self._sret_fns[name] = sret_ty
+            fn = ir.Function(self.module, ir.FunctionType(ret_type, phys_params), name=name)
+            lead = 0
+        else:
+            fn_type = ir.FunctionType(self.void, [ir.PointerType(sret_ty), *phys_params])
+            fn = ir.Function(self.module, fn_type, name=name)
+            fn.args[0].add_attribute('sret')
+            fn.args[0].name = 'ret.sret'
+            self._sret_fns[name] = sret_ty
+            lead = 1
+        for i in byval:
+            fn.args[i + lead].add_attribute('byval')
+            fn.args[i + lead].attributes.align = BYVAL_ALIGN
+        if byval:
+            self._byval_fns[name] = byval
         return fn
 
+    def _fn_type_byval(self, fn_type: rast.FnType) -> Dict[int, ir.Type]:
+        """Logical param index -> %T for the byval params of a Ritz fn-pointer
+        type: what _byval_params_of answers for a named fn (AGAST #1739)."""
+        byval = {}
+        for i, p in enumerate(fn_type.params):
+            ty = self._sret_struct_type(self._ritz_type_to_llvm(p))
+            if ty is not None:
+                byval[i] = ty
+        return byval
+
+    def _byval_params_of(self, fn) -> Dict[int, ir.Type]:
+        """Logical param index -> %T for `fn`'s byval params (AGAST #1739)."""
+        if not isinstance(fn, ir.Function):
+            return {}
+        return self._byval_fns.get(fn.name, {})
+
     def _fn_param_types(self, fn: ir.Function) -> list:
-        """`fn`'s logical parameter types (without the sret pointer)."""
+        """`fn`'s logical parameter types (without the sret pointer, and with
+        each byval pointer shown as the struct it carries)."""
         args = fn.function_type.args
-        return list(args[1:]) if self._sret_type_of(fn) is not None else list(args)
+        params = list(args[1:]) if self._sret_type_of(fn) is not None else list(args)
+        for i, ty in self._byval_params_of(fn).items():
+            params[i] = ty
+        return params
 
     def _fn_value_args(self, fn: ir.Function) -> list:
         """`fn`'s logical arguments (without the sret pointer)."""
@@ -3622,14 +3737,24 @@ class LLVMEmitter:
         fn_span = getattr(fn_def, 'span', None)
         fn_line = fn_span.line if fn_span else 1
 
-        for arg, param in zip(self._fn_value_args(fn), fn_def.params):
+        byval = self._byval_params_of(fn)
+        for idx, (arg, param) in enumerate(zip(self._fn_value_args(fn), fn_def.params)):
             arg.name = f"{param.name}.arg"
 
             # Check if parameter is a reference type or mutable borrow
             is_mutable_borrow = hasattr(param, 'borrow') and param.borrow == rast.Borrow.MUTABLE
             is_ref_type = isinstance(param.type, rast.RefType)
 
-            if is_mutable_borrow:
+            if idx in byval:
+                # AGAST #1739: a large by-value struct arrives `byval`: `arg`
+                # points at the callee's own copy, so it IS the param's slot.
+                # No alloca, and no first-class `store %T %arg`.
+                self.locals[param.name] = (arg, byval[idx])
+                self.ritz_types[param.name] = param.type
+                self._register_drop_variable(param.name, arg, param.type)
+                self._mark_drop_variable_initialized(arg)
+                self._emit_dbg_declare(arg, param.name, param.type, fn_line)
+            elif is_mutable_borrow:
                 # :& borrow: arg is *T where T is param.type
                 # Store in locals so `x = val` assignments work (load/store through pointer)
                 # The arg IS the alloca-like storage (a pointer passed from caller)
@@ -8096,7 +8221,9 @@ class LLVMEmitter:
                     for arg_val, param_type in zip(args, ritz_type.params):
                         expected_llvm = self._ritz_type_to_llvm(param_type)
                         converted_args.append(self._convert_type(arg_val, expected_llvm))
-                    return self.builder.call(fn_ptr, converted_args)
+                    # AGAST #1739: large struct args go byval, as for a direct call.
+                    return self.builder.call(fn_ptr, converted_args,
+                                             byval=self._fn_type_byval(ritz_type))
         else:
             # Non-identifier function expression (e.g., field access returning fn ptr)
             fn_ptr = self._emit_expr(call.func)

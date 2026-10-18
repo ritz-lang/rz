@@ -1474,6 +1474,38 @@ fn emit_sret_attr(s: *EmitterState, name: *u8, len: i32)
     emit_name(s, name, len)
     emit_str(s, c") ")
 
+# AGAST #1739 — large by-value struct PARAMS are `ptr byval(%T) align 8`.
+#
+# A param of a struct at the sret threshold used to be a first-class %T
+# argument (`define @f(%Big %b.arg)` + `store %Big %b.arg, ptr %slot`, and
+# every caller loaded the argument first-class), which hangs clang -O2 for
+# the same reason #1730 fixed for returns.  It was also not the C ABI: LLVM
+# splits a first-class aggregate argument into one scalar per leaf, while C
+# passes a large struct in memory.  `ptr byval(%T) align 8` is exactly what
+# clang emits for a C `struct T` param on x86-64 SysV (Ritz structs are at
+# most 8-aligned).  The callee binds the param to the byval pointer, which it
+# owns; the caller spills the argument into a fresh slot right after
+# evaluating it (emit_call_arg), so rewrite_large_struct_copies (#1732)
+# turns that spill into a pointer-to-pointer copy.  Uses the sret threshold,
+# so small structs, tagged enums and primitives keep their ABI.
+fn param_uses_byval(s: *EmitterState, p: *Param) -> i32
+    if p == null
+        return 0
+    struct_ret_uses_sret(s, p.param_type, p.param_type_name, p.param_type_name_len)
+
+# `ptr byval(%T) align 8` — what the definition, declare and every call carry.
+fn emit_byval_attr(s: *EmitterState, name: *u8, len: i32)
+    emit_str(s, c"ptr byval(%")
+    emit_name(s, name, len)
+    emit_str(s, c") align 8")
+
+# The LLVM type of param `p` in a signature or call argument list.
+fn emit_param_llvm_type(s: *EmitterState, p: *Param)
+    if param_uses_byval(s, p) == 1
+        emit_byval_attr(s, p.param_type_name, p.param_type_name_len)
+        return
+    emit_llvm_type_struct(s, p.param_type, p.param_type_name, p.param_type_name_len)
+
 # Return from an sret fn by copying the %T at register `src_ptr` (a `ptr`).
 fn emit_sret_ret_from_ptr(s: *EmitterState, src_ptr: i32)
     emit_str(s, c"  call void @__ritz_sret_copy(ptr %ret.sret, ptr ")
