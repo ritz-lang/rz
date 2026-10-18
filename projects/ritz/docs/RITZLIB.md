@@ -30,7 +30,7 @@ Currently (as of January 2026), ritzlib is a flat collection of 35 modules:
 - `io.ritz` - I/O interfaces
 - `errno.ritz` - Error codes
 - `fs.ritz` - File system operations
-- `env.ritz` - Environment variables
+- `os/env.ritz` - Environment variables (`ritzlib.os.env`)
 - `args.ritz` - Command-line arguments
 
 **Async & networking:**

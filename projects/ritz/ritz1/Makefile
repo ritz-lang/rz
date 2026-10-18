@@ -45,8 +45,12 @@ SOURCES = \
 
 # ritzlib modules needed by ritz1
 # - json/option/result pulled in for fn_cache.ritz (.ritz.sig I/O)
+# - os_env (ritzlib/os/env.ritz) + span: main.ritz's RITZ_PATH lookup
+#   (AGAST #1750).  A nested module is named with `_` for `/`: see the
+#   explicit ritzlib_os_env rules below, since the ritzlib_% pattern only
+#   reaches top-level ritzlib/*.ritz.
 RITZLIB_DIR = ../ritzlib
-RITZLIB_MODULES = sys io str string strview hash hashmap eq memory gvec drop env option result json
+RITZLIB_MODULES = sys io str string strview hash hashmap eq memory gvec drop option result json span os_env
 
 # Build artifacts
 BUILD_DIR = build
@@ -54,13 +58,14 @@ LL_FILES = $(patsubst %,$(BUILD_DIR)/%.ll,$(SOURCES))
 OBJ_FILES = $(patsubst %,$(BUILD_DIR)/%.o,$(SOURCES))
 RITZLIB_OBJ = $(patsubst %,$(BUILD_DIR)/ritzlib_%.o,$(RITZLIB_MODULES))
 
-# Runtime - entry point that calls main(argc, argv, envp) and handles exit
-# ritz1 needs envp for RITZ_PATH environment variable access
-RUNTIME = ../runtime/ritz_start_envp.x86_64.o
+# Runtime - entry point that calls main(argc, argv) and handles exit.
+# ritz1 reads RITZ_PATH through ritzlib.os.env (/proc/self/environ), so it no
+# longer takes envp and does not need ritz_start_envp (AGAST #1750).
+RUNTIME = ../runtime/ritz_start.x86_64.o
 
 # The runtime .o files are gitignored build products of tracked .ll sources.
 # Without this rule a fresh clone dies with "No rule to make target
-# '../runtime/ritz_start_envp.x86_64.o'" — which is exactly how main CI
+# '../runtime/ritz_start.x86_64.o'" — which is exactly how main CI
 # failed, since a CI checkout never has the stale .o a dev tree accumulates.
 # Delegate to runtime/Makefile so there is one place that knows how to
 # lower a shim, and so an edited .ll actually forces a relink.
@@ -123,6 +128,13 @@ $(BUILD_DIR)/%.o: $(BUILD_DIR)/%.ll
 $(BUILD_DIR)/ritzlib_%.ll: $(RITZLIB_DIR)/%.ritz | $(BUILD_DIR)
 	@echo "Compiling ritzlib/$*.ritz → $@"
 	@$(MKDEPS) $< $@ > $(BUILD_DIR)/ritzlib_$*.d.tmp && mv $(BUILD_DIR)/ritzlib_$*.d.tmp $(BUILD_DIR)/ritzlib_$*.d
+	$(RITZ0) $< --no-runtime -o $@
+
+# Nested ritzlib modules (ritzlib/os/env.ritz -> ritzlib_os_env).  Explicit
+# rules beat the ritzlib_% pattern above, which would look for os_env.ritz.
+$(BUILD_DIR)/ritzlib_os_env.ll: $(RITZLIB_DIR)/os/env.ritz | $(BUILD_DIR)
+	@echo "Compiling ritzlib/os/env.ritz → $@"
+	@$(MKDEPS) $< $@ > $(BUILD_DIR)/ritzlib_os_env.d.tmp && mv $(BUILD_DIR)/ritzlib_os_env.d.tmp $(BUILD_DIR)/ritzlib_os_env.d
 	$(RITZ0) $< --no-runtime -o $@
 
 $(BUILD_DIR)/ritzlib_%.o: $(BUILD_DIR)/ritzlib_%.ll

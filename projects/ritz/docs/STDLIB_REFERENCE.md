@@ -74,7 +74,6 @@ Ritzlib is built on three core principles:
    - [argspec](#argspec) - Argument parsing
    - [args](#args) - Argument parsing (deprecated)
    - [os.env](#osenv) - Environment variables
-   - [env](#env) - Environment variables (legacy, raw `envp`)
 10. [Utilities](#utilities)
     - [timer](#timer) - High-precision timing
     - [json](#json) - JSON parsing
@@ -1735,7 +1734,7 @@ struct ProcessResult
 |----------|-----------|-------------|
 | `spawn` | `fn(cmd: *u8) -> Process` | Spawn command |
 | `spawn_args` | `fn(cmd: *u8, argv: **u8) -> Process` | Spawn with args |
-| `spawn_full` | `fn(cmd: *u8, argv: **u8, envp: **u8) -> Process` | Spawn with env |
+| `spawn_full` | `fn(cmd: *u8, argv: **u8, envp: **u8) -> Process` | Spawn with env; a null `envp` inherits ours (`env_raw_envp()`) |
 | `process_valid` | `fn(p: *Process) -> i32` | Check if valid |
 
 **I/O Operations**:
@@ -1999,42 +1998,6 @@ fn main() -> i32
 To run a child with the current environment, pass `env_raw_envp()` as
 `sys_execve`'s third argument. It is the only raw-pointer accessor, kept for
 that interop; the strings are the cached entries, so it costs no copying.
-
----
-
-### env
-
-**Module**: `ritzlib.env`
-
-Environment variable access through a raw `envp`. **Legacy**: new code should
-use [`ritzlib.os.env`](#osenv). The examples have moved off this module; it is
-kept only until ritz1 and its remaining callers do.
-
-**Usage**: Use 3-argument main to receive envp.
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `getenv` | `fn(envp: **u8, name: *u8) -> *u8` | Get env variable value |
-| `env_count` | `fn(envp: **u8) -> i32` | Count env variables |
-| `env_get` | `fn(envp: **u8, index: i32) -> *u8` | Get entry at index |
-| `env_get_name` | `fn(entry: *u8, buf: *u8, bufsize: i64) -> i64` | Extract name from "NAME=VALUE" |
-| `env_get_value` | `fn(entry: *u8) -> *u8` | Get value from "NAME=VALUE" |
-
-**Example**:
-```ritz
-import ritzlib.env
-import ritzlib.io
-
-fn main(argc: i32, argv: **u8, envp: **u8) -> i32
-    let path: *u8 = getenv(envp, c"PATH")
-    if path != null
-        prints_cstr(path)
-    0
-```
-
-`getenv` takes and returns C strings, so the name is a `c"..."` literal and the
-result is printed with `prints_cstr` rather than `prints` (which takes a
-`StrView`).
 
 ---
 

@@ -1,0 +1,98 @@
+# ritzlib.process: what environment does a spawned child get? (AGAST #1750)
+#
+# spawn_full(cmd, argv, envp):
+#   - envp != null  -> the child gets exactly that environment.
+#   - envp == null  -> the child INHERITS the parent's environment
+#                      (ritzlib.os.env's env_raw_envp()).
+#
+# Before #1750 a null envp went straight to execve(2), which on Linux means an
+# EMPTY environment, despite the comment in spawn_full claiming inheritance.
+# spawn() and spawn_args() both pass null, so every child they started ran
+# with no PATH, no HOME, nothing.
+#
+# The child is /usr/bin/env with no arguments: it prints its environment as
+# "KEY=VALUE\n" lines, in environ order, which makes the expected output
+# exactly computable from the parent's env_iter().
+
+import ritzlib.sys
+import ritzlib.str
+import ritzlib.gvec
+import ritzlib.strview
+import ritzlib.span
+import ritzlib.option
+import ritzlib.process
+import ritzlib.os.env
+
+# The bytes /usr/bin/env prints for the parent's own environment.
+fn expected_env_output() -> Vec<u8>
+    var out: Vec<u8> = vec_new<u8>()
+    let entries: Span<StrView> = env_iter()
+    var i: i64 = 0
+    while i < entries.len
+        let e: *StrView = entries.ptr + i
+        vec_push_bytes<u8>(@out, e.ptr, e.len)
+        vec_push<u8>(@out, '\n' as u8)
+        i += 1
+    out
+
+fn bytes_eq(a: *Vec<u8>, b: *Vec<u8>) -> i32
+    if a.len != b.len
+        return 0
+    var i: i64 = 0
+    while i < a.len
+        if *(a.data + i) != *(b.data + i)
+            return 0
+        i += 1
+    1
+
+# Read a spawned child's stdout into *out, reap it; 1 if it exited 0.
+fn collect(p: *Process, out: *Vec<u8>) -> i32
+    *out = process_read_stdout_all(p)
+    let r: ProcessResult = process_wait(p)
+    process_cleanup(p)
+    result_success(@r)
+
+# Run /usr/bin/env via spawn_full with the given envp; stdout into *out.
+fn run_env(envp: **u8, out: *Vec<u8>) -> i32
+    var argv: [2]*u8
+    argv[0] = c"/usr/bin/env"
+    argv[1] = null
+    var p: Process = spawn_full(c"/usr/bin/env", @argv[0], envp)
+    collect(@p, out)
+
+[[test]]
+fn test_spawn_full_null_envp_inherits_parent_env() -> i32
+    # The harness environment always has at least PATH, so "inherited" and
+    # "empty" are distinguishable.
+    assert env_iter().len > 0
+    var got: Vec<u8> = vec_new<u8>()
+    assert run_env(null, @got) == 1
+    var want: Vec<u8> = expected_env_output()
+    assert got.len > 0
+    assert bytes_eq(@got, @want) == 1
+    0
+
+[[test]]
+fn test_spawn_full_explicit_envp_is_exact() -> i32
+    # An explicit envp is passed through untouched, NOT merged with ours.
+    var envp: [2]*u8
+    envp[0] = c"RITZ_PROCESS_ENV_TEST=1"
+    envp[1] = null
+    var got: Vec<u8> = vec_new<u8>()
+    assert run_env(@envp[0], @got) == 1
+    let v: StrView = strview_from_ptr(got.data, got.len)
+    assert strview_eq_cstr(@v, c"RITZ_PROCESS_ENV_TEST=1\n") == 1
+    0
+
+[[test]]
+fn test_spawn_args_inherits_parent_env() -> i32
+    # spawn_args passes a null envp: same inheritance as spawn_full(null).
+    var argv: [2]*u8
+    argv[0] = c"/usr/bin/env"
+    argv[1] = null
+    var p: Process = spawn_args(c"/usr/bin/env", @argv[0])
+    var got: Vec<u8> = vec_new<u8>()
+    assert collect(@p, @got) == 1
+    var want: Vec<u8> = expected_env_output()
+    assert bytes_eq(@got, @want) == 1
+    0

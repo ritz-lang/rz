@@ -31,7 +31,7 @@ RITZ1_SH = str(RITZ_ROOT / "ritz1/build/ritz1_selfhosted")
 # the real denominator on every run. Widening it is separate work.
 RITZLIB_DIR = RITZ_ROOT / "ritzlib"
 RITZLIB_MODULES = ["sys", "io", "str", "strview", "string", "hash", "memory",
-                   "gvec", "drop", "env", "option", "result", "hashmap",
+                   "gvec", "drop", "option", "result", "hashmap",
                    "span"]
 
 # Cells that are known to fail, keyed by (compiler, test) so an excuse for

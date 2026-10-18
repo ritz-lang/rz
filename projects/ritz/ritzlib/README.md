@@ -70,7 +70,7 @@ fn main(argc: i32, argv: **u8) -> i32
 | `hashmap.ritz` | Hash map data structure |
 | `hash.ritz` | Hash functions |
 | `fs.ritz` | File system operations |
-| `env.ritz` | Environment variables and args |
+| `os/env.ritz` | Environment variables (`ritzlib.os.env`) |
 | `args.ritz` | Command-line argument parsing |
 | `process.ritz` | Process control (fork, exec, wait) |
 | `net.ritz` | Network socket operations |
