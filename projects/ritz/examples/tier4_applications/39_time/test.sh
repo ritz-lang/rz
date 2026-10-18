@@ -25,4 +25,15 @@ out=$(cat /tmp/time_out.$$)
 rm -f /tmp/time_out.$$
 [[ "$out" == *"real"* ]] || fail "expected 'real' for /bin/false, got:\n$out"
 
-echo "ok - 2 time scenarios"
+# --- environment passthrough: the child inherits our environment exactly — same entries, same
+# order, '=' inside a value and empty values intact (AGAST #1480: the envp
+# handed to execve comes from ritzlib.os.env's env_raw_envp).
+expected=$(printf 'A=1\nB==2\nEMPTY=\nPATH=/usr/bin:/bin')
+result=$(env -i A=1 B==2 EMPTY= PATH=/usr/bin:/bin "$TIME" env 2>/dev/null)
+if [ "$result" = "$expected" ]; then
+    true
+else
+    fail "expected environment:\n$expected\ngot:\n$result"
+fi
+
+echo "ok - 3 time scenarios"

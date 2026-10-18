@@ -30,7 +30,9 @@ import ritzlib.io
 import ritzlib.str
 import ritzlib.strview
 import ritzlib.string
-import ritzlib.env
+import ritzlib.option
+import ritzlib.span
+import ritzlib.os.env
 import ritzlib.args
 
 # Diagnostic helper — see 24_cp.  Used for the many timeout error
@@ -107,7 +109,7 @@ fn parse_duration(s: *u8, out_sec: *i64, out_nsec: *i64) -> i32
 # ============================================================================
 
 # Search PATH for command and return full path, or return command if it contains /
-fn find_command(envp: **u8, name: *u8, buf: *u8, bufsize: i64) -> *u8
+fn find_command(name: *u8, buf: *u8, bufsize: i64) -> *u8
     # If name contains a /, use it directly
     var i: i64 = 0
     while *(name + i) != 0
@@ -115,23 +117,21 @@ fn find_command(envp: **u8, name: *u8, buf: *u8, bufsize: i64) -> *u8
             return name
         i += 1
 
-    # Get PATH from environment
-    let path_val: *u8 = getenv(envp, c"PATH")
-    if path_val == null
-        return null
+    # Get PATH from environment.  Unset and empty both search nothing.
+    let path: StrView = env_get_or("PATH", "")
 
     var pos: i64 = 0
 
-    while *(path_val + pos) != 0
+    while pos < path.len
         # Extract next PATH component (up to ':' or end)
         var len: i64 = 0
-        while *(path_val + pos + len) != 0 and *(path_val + pos + len) != 58  # ':'
+        while pos + len < path.len and *(path.ptr + pos + len) != 58  # ':'
             len += 1
 
         # Build full path: dir/name
         var j: i64 = 0
         while j < len and j < bufsize - 2
-            *(buf + j) = *(path_val + pos + j)
+            *(buf + j) = *(path.ptr + pos + j)
             j += 1
 
         # Add '/' separator
@@ -153,7 +153,7 @@ fn find_command(envp: **u8, name: *u8, buf: *u8, bufsize: i64) -> *u8
 
         # Move to next PATH component
         pos += len
-        if *(path_val + pos) == ':'  # ':'
+        if pos < path.len and *(path.ptr + pos) == ':'  # ':'
             pos += 1
 
     return null
@@ -183,11 +183,11 @@ fn wtermsig(status: i32) -> i32
 # Main timeout logic
 # ============================================================================
 
-fn run_timeout(envp: **u8, timeout_sec: i64, timeout_nsec: i64, kill_sec: i64, kill_nsec: i64, use_kill: i32, signal: i32, cmd_argc: i32, cmd_argv: **u8) -> i32
+fn run_timeout(timeout_sec: i64, timeout_nsec: i64, kill_sec: i64, kill_nsec: i64, use_kill: i32, signal: i32, cmd_argc: i32, cmd_argv: **u8) -> i32
     # Find the command
     var path_buf: [4096]u8
     let cmd_name: *u8 = *(cmd_argv + 0)
-    let cmd_path: *u8 = find_command(envp, cmd_name, @path_buf[0], 4096)
+    let cmd_path: *u8 = find_command(cmd_name, @path_buf[0], 4096)
 
     if cmd_path == null
         timeout_err2("timeout: '", cmd_name, "': No such file or directory")
@@ -212,7 +212,7 @@ fn run_timeout(envp: **u8, timeout_sec: i64, timeout_nsec: i64, kill_sec: i64, k
         # Replace first arg with full path for execve
         child_argv[0] = cmd_path
 
-        let ret: i32 = sys_execve(cmd_path, @child_argv[0], envp)
+        let ret: i32 = sys_execve(cmd_path, @child_argv[0], env_raw_envp())
 
         # If we get here, exec failed
         if ret == (0 - ENOENT) or ret == (0 - EACCES)
@@ -285,7 +285,7 @@ fn run_timeout(envp: **u8, timeout_sec: i64, timeout_nsec: i64, kill_sec: i64, k
 # Main
 # ============================================================================
 
-fn main(argc: i32, argv: **u8, envp: **u8) -> i32
+fn main(argc: i32, argv: **u8) -> i32
     if argc < 3
         eprintln("Usage: timeout [OPTION]... DURATION COMMAND [ARG]...")
         eprintln("Run COMMAND with a time limit.")
@@ -406,4 +406,4 @@ fn main(argc: i32, argv: **u8, envp: **u8) -> i32
     let cmd_argc: i32 = argc - cmd_start
     let cmd_argv: **u8 = argv + cmd_start
 
-    return run_timeout(envp, timeout_sec, timeout_nsec, kill_sec, kill_nsec, use_kill, signal, cmd_argc, cmd_argv)
+    return run_timeout(timeout_sec, timeout_nsec, kill_sec, kill_nsec, use_kill, signal, cmd_argc, cmd_argv)

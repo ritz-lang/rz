@@ -56,4 +56,18 @@ else
     exit 1
 fi
 
+echo "Test 6: Environment passthrough"
+
+# Test 6: the child inherits our environment exactly — same entries, same
+# order, '=' inside a value and empty values intact (AGAST #1480: the envp
+# handed to execve comes from ritzlib.os.env's env_raw_envp).
+expected=$(printf 'A=1\nB==2\nEMPTY=\nPATH=/usr/bin:/bin')
+result=$(env -i A=1 B==2 EMPTY= PATH=/usr/bin:/bin ./nohup env 2>&1)
+if [ "$result" = "$expected" ]; then
+    echo "PASS: Environment passed to command"
+else
+    echo "FAIL: Expected '$expected', got '$result'"
+    exit 1
+fi
+
 echo "All tests passed!"

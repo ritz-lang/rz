@@ -73,7 +73,8 @@ Ritzlib is built on three core principles:
    - [process](#process) - Subprocess spawning
    - [argspec](#argspec) - Argument parsing
    - [args](#args) - Argument parsing (deprecated)
-   - [env](#env) - Environment variables
+   - [os.env](#osenv) - Environment variables
+   - [env](#env) - Environment variables (legacy, raw `envp`)
 10. [Utilities](#utilities)
     - [timer](#timer) - High-precision timing
     - [json](#json) - JSON parsing
@@ -1951,11 +1952,63 @@ Every `args_*` string parameter is a `*u8`, so the literals must be written
 
 ---
 
+### os.env
+
+**Module**: `ritzlib.os.env`
+
+Environment variable access from any function, whatever `main`'s signature.
+The first call reads `/proc/self/environ` once and caches it; every key and
+value is a zero-copy `StrView` into that cache.
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `env_get` | `fn(name: StrView) -> Option<StrView>` | Value of `name`, or `None` if unset |
+| `env_get_p` | `fn(name: *StrView) -> Option<StrView>` | `env_get` taking the name by pointer |
+| `env_get_or` | `fn(name: StrView, default: StrView) -> StrView` | Value of `name`, or `default` |
+| `env_must` | `fn(name: StrView) -> StrView` | Value of `name`; exits 1 with an error if unset |
+| `env_iter` | `fn() -> Span<StrView>` | Every `"KEY=VALUE"` entry, in order |
+| `env_raw_envp` | `fn() -> **u8` | The same entries as a NULL-terminated C `envp`, for `sys_execve` only |
+
+**Example**:
+```ritz
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.option
+import ritzlib.strview
+import ritzlib.span
+import ritzlib.os.env
+
+fn show(o: Option<StrView>) -> i32
+    match o
+        Some(v) => prints(v)
+        None => prints("(unset)")
+    prints("\n")
+    0
+
+fn main() -> i32
+    show(env_get("HOME"))
+    let port: StrView = env_get_or("PORT", "8080")
+    prints(port)
+    prints("\n")
+    let entries: Span<StrView> = env_iter()
+    print_int(entries.len)
+    prints(" variables\n")
+    0
+```
+
+To run a child with the current environment, pass `env_raw_envp()` as
+`sys_execve`'s third argument. It is the only raw-pointer accessor, kept for
+that interop; the strings are the cached entries, so it costs no copying.
+
+---
+
 ### env
 
 **Module**: `ritzlib.env`
 
-Environment variable access.
+Environment variable access through a raw `envp`. **Legacy**: new code should
+use [`ritzlib.os.env`](#osenv). The examples have moved off this module; it is
+kept only until ritz1 and its remaining callers do.
 
 **Usage**: Use 3-argument main to receive envp.
 

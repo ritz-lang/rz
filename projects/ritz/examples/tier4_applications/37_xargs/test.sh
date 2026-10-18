@@ -116,4 +116,20 @@ else
     exit 1
 fi
 
+echo -n "Test 11 (environment passthrough): "
+
+# Test 11: the child inherits our environment exactly — same entries, same
+# order, '=' inside a value and empty values intact (AGAST #1480: the envp
+# handed to execve comes from ritzlib.os.env's env_raw_envp).
+expected=$(printf 'A=1\nB==2\nEMPTY=\nPATH=/usr/bin:/bin')
+# `env -u NOPE` unsets a name that is not there, so it prints its whole
+# environment (xargs runs nothing on empty input, so we feed it the name).
+result=$(echo NOPE | env -i A=1 B==2 EMPTY= PATH=/usr/bin:/bin "$XARGS" -- env -u)
+if [ "$result" = "$expected" ]; then
+    echo "PASS"
+else
+    echo "FAIL: expected '$expected', got '$result'"
+    exit 1
+fi
+
 echo "All tests passed!"
