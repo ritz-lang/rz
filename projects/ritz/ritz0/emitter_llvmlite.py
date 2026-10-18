@@ -121,11 +121,12 @@ class _SretAwareBuilder(ir.IRBuilder):
         self._emitter = emitter
 
     def call(self, fn, args, name='', cconv=None, tail=False, fastmath=(),
-             attrs=(), arg_attrs=None, byval=None):
-        # `byval` overrides the {logical index: %T} map for an indirect call,
-        # whose callee is a bare pointer with no _byval_fns entry (#1739).
+             attrs=(), arg_attrs=None, byval=None, sret=None):
+        # `byval` overrides the {logical index: %T} map, and `sret` the
+        # returned-via-sret struct, for an indirect call, whose callee is a
+        # bare pointer with no _byval_fns / _sret_fns entry (#1739, #1745).
         em = self._emitter
-        sret_ty = em._sret_type_of(fn)
+        sret_ty = sret if sret is not None else em._sret_type_of(fn)
         if byval is None:
             byval = em._byval_params_of(fn)
         # Callers pass logical args. Only an sret fn called with one arg fewer
@@ -753,6 +754,14 @@ class LLVMEmitter:
             param_types = [ir.PointerType(t) if self._sret_struct_type(t) is not None else t
                            for t in param_types]
             ret_type = self._ritz_type_to_llvm(ty.ret) if ty.ret else self.void
+            # AGAST #1745: a large struct return is an sret pointer, again as
+            # in _new_function: `fn(i32) -> Big` is `void (%Big*, i32)*`.
+            # The sret attribute and result slot come from each indirect call
+            # (_fn_type_sret).
+            sret_ty = self._sret_struct_type(ret_type)
+            if sret_ty is not None:
+                param_types = [ir.PointerType(sret_ty), *param_types]
+                ret_type = self.void
             fn_type = ir.FunctionType(ret_type, param_types)
             return ir.PointerType(fn_type)
         elif isinstance(ty, rast.VectorType):
@@ -3282,6 +3291,13 @@ class LLVMEmitter:
             if ty is not None:
                 byval[i] = ty
         return byval
+
+    def _fn_type_sret(self, fn_type: rast.FnType) -> Optional[ir.Type]:
+        """The struct a Ritz fn-pointer type returns via sret, or None: what
+        _sret_type_of answers for a named fn (AGAST #1745)."""
+        if fn_type.ret is None:
+            return None
+        return self._sret_struct_type(self._ritz_type_to_llvm(fn_type.ret))
 
     def _byval_params_of(self, fn) -> Dict[int, ir.Type]:
         """Logical param index -> %T for `fn`'s byval params (AGAST #1739)."""
@@ -7591,10 +7607,14 @@ class LLVMEmitter:
 
         ret_type = self._ritz_type_to_llvm(expected_type.ret) if expected_type.ret else self.void
 
-        # Create the function type and function
-        fn_type = ir.FunctionType(ret_type, param_types)
-        fn = ir.Function(self.module, fn_type, name=closure_name)
+        # Create the function from its logical signature.  AGAST #1745: via
+        # _new_function, so a large struct return is sret (and a large
+        # by-value param byval, #1739), matching the fn-pointer type
+        # (_ritz_type_to_llvm(FnType)) the closure is used through.
+        fn = self._new_function(closure_name, ret_type, param_types)
         fn.linkage = 'private'  # Not visible outside this module
+        closure_byval = self._byval_params_of(fn)
+        closure_args = self._fn_value_args(fn)
 
         # Save current state
         saved_builder = self.builder
@@ -7616,14 +7636,18 @@ class LLVMEmitter:
 
         # Set up regular parameters
         num_regular_params = len(closure.params)
-        for i, (arg, param) in enumerate(zip(fn.args[:num_regular_params], closure.params)):
+        for i, (arg, param) in enumerate(zip(closure_args[:num_regular_params], closure.params)):
             param_name = param.name
             arg.name = f"{param_name}.arg"
 
-            # Allocate storage for the parameter (so it can be used like a local)
-            alloca = self.builder.alloca(arg.type, name=param_name)
-            self.builder.store(arg, alloca)
-            self.locals[param_name] = (alloca, arg.type)
+            if i in closure_byval:
+                # A byval arg points at the callee's own copy: it IS the slot.
+                self.locals[param_name] = (arg, closure_byval[i])
+            else:
+                # Allocate storage for the parameter (so it can be used like a local)
+                alloca = self.builder.alloca(arg.type, name=param_name)
+                self.builder.store(arg, alloca)
+                self.locals[param_name] = (alloca, arg.type)
 
             # Store Ritz type
             if i < len(expected_type.params):
@@ -7631,13 +7655,16 @@ class LLVMEmitter:
 
         # Set up captured variables as parameters
         for i, (cap_name, cap_ritz_type) in enumerate(zip(captures, capture_ritz_types)):
-            arg = fn.args[num_regular_params + i]
+            arg = closure_args[num_regular_params + i]
             arg.name = f"{cap_name}.cap"
 
-            # Allocate storage for the captured value
-            alloca = self.builder.alloca(arg.type, name=cap_name)
-            self.builder.store(arg, alloca)
-            self.locals[cap_name] = (alloca, arg.type)
+            if num_regular_params + i in closure_byval:
+                self.locals[cap_name] = (arg, closure_byval[num_regular_params + i])
+            else:
+                # Allocate storage for the captured value
+                alloca = self.builder.alloca(arg.type, name=cap_name)
+                self.builder.store(arg, alloca)
+                self.locals[cap_name] = (alloca, arg.type)
 
             # Store Ritz type
             if cap_ritz_type:
@@ -7727,19 +7754,22 @@ class LLVMEmitter:
         thunk_array_name = f"__closure_thunks_{self.closure_counter}"
         if thunk_array_name not in self._closure_thunk_arrays:
             thunk_param_types = [self._ritz_type_to_llvm(p) for p in expected_type.params]
-            thunk_fn_type = ir.FunctionType(ret_type, thunk_param_types)
 
             thunks = []
             for slot_idx in range(MAX_CLOSURE_INSTANCES):
                 thunk_name = f"__closure_thunk_{self.closure_counter}_{slot_idx}"
-                thunk_fn = ir.Function(self.module, thunk_fn_type, name=thunk_name)
+                # AGAST #1745: same physical signature as the fn-pointer type.
+                thunk_fn = self._new_function(thunk_name, ret_type, thunk_param_types)
                 thunk_fn.linkage = 'private'
 
                 # Build thunk body
                 thunk_block = thunk_fn.append_basic_block(name="entry")
-                thunk_builder = ir.IRBuilder(thunk_block)
+                thunk_builder = _SretAwareBuilder(thunk_block, self)
 
-                # Gather arguments: regular params + captured values from this slot
+                # Gather arguments: regular params + captured values from this
+                # slot.  The thunk's physical args (its sret pointer and byval
+                # pointers) are forwarded as-is to the closure fn, which has
+                # the same leading physical signature.
                 call_args = list(thunk_fn.args)
                 for i in range(len(captures)):
                     ptr = thunk_builder.gep(env_array, [
@@ -7753,7 +7783,7 @@ class LLVMEmitter:
                 # Call the real closure function
                 result = thunk_builder.call(fn, call_args)
 
-                if ret_type == self.void:
+                if ret_type == self.void or self._sret_type_of(thunk_fn) is not None:
                     thunk_builder.ret_void()
                 else:
                     thunk_builder.ret(result)
@@ -7761,7 +7791,7 @@ class LLVMEmitter:
                 thunks.append(thunk_fn)
 
             # Create array of thunk function pointers
-            thunk_ptr_type = ir.PointerType(thunk_fn_type)
+            thunk_ptr_type = thunks[0].type
             thunk_array_type = ir.ArrayType(thunk_ptr_type, MAX_CLOSURE_INSTANCES)
             thunk_array = ir.GlobalVariable(self.module, thunk_array_type, name=thunk_array_name)
             thunk_array.linkage = 'private'
@@ -8221,13 +8251,22 @@ class LLVMEmitter:
                     for arg_val, param_type in zip(args, ritz_type.params):
                         expected_llvm = self._ritz_type_to_llvm(param_type)
                         converted_args.append(self._convert_type(arg_val, expected_llvm))
-                    # AGAST #1739: large struct args go byval, as for a direct call.
+                    # AGAST #1739 / #1745: large struct args go byval and a
+                    # large struct result via sret, as for a direct call.
                     return self.builder.call(fn_ptr, converted_args,
-                                             byval=self._fn_type_byval(ritz_type))
+                                             byval=self._fn_type_byval(ritz_type),
+                                             sret=self._fn_type_sret(ritz_type))
         else:
             # Non-identifier function expression (e.g., field access returning fn ptr)
             fn_ptr = self._emit_expr(call.func)
             args = [self._emit_expr(arg) for arg in call.args]
+            ritz_type = self._infer_ritz_type(call.func, fn_ptr)
+            if isinstance(ritz_type, rast.FnType):
+                args = [self._convert_type(a, self._ritz_type_to_llvm(p))
+                        for a, p in zip(args, ritz_type.params)]
+                return self.builder.call(fn_ptr, args,
+                                         byval=self._fn_type_byval(ritz_type),
+                                         sret=self._fn_type_sret(ritz_type))
             return self.builder.call(fn_ptr, args)
 
         fname = call.func.name
