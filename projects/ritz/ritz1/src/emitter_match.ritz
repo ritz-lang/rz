@@ -43,6 +43,7 @@ import emitter_core
 import emitter_expr
 import emitter_expr_call     # is_variant_carrier, is_variant_null, resolve_enum_ctx
 import emitter_expr_access   # is_ident_none
+import emitter_stmt          # emit_stmt, for block-bodied arms (AGAST #1454)
 
 # Phi result tracking during emit_match.
 # We need to collect (value_reg, exit_label) pairs across all non-pass arms
@@ -261,6 +262,22 @@ fn variant_ctor_arm_type(s: *EmitterState, e: *Expr, out_name: **u8, out_len: *i
     if is_ctor == 1
         resolve_enum_ctx(s, out_name, out_len)
 
+# Emit a block arm's statements (AGAST #1454).  `return` leaves the block
+# terminated by `ret`, but the arm still records a phi incoming and emits its
+# `br` to the match end.  Without a fresh block the phi would name the block
+# holding the `ret` as a predecessor, and clang rejects the module ("PHI node
+# entries do not match predecessors").  Opening an (unreachable) block after
+# each `ret` makes current_label the block that really branches to the end,
+# exactly as STMT_BREAK / STMT_CONTINUE already do (ritz-task-195).
+fn emit_match_arm_stmts(s: *EmitterState, stmts: *Stmt)
+    var st: *Stmt = stmts
+    while st != null
+        emit_stmt(s, st, s.fn_ret_type)
+        if st.kind == STMT_RETURN
+            begin_block(s, next_label(s))
+            clear_last_expr(s)
+        st = st.next
+
 # Emit match body, returning (result_reg, exit_label) via MatchResult slot.
 # For PAT_VARIANT arms with PAT_IDENT inner (e.g. `Ok(v) => v`), the inner
 # name is bound to the extracted payload for the duration of the arm body,
@@ -300,6 +317,12 @@ fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_s
                     emit_reg(s, alloca_reg)
                     emit_str(s, c"\n")
                     add_local(s, arm.pattern_inner_name, arm.pattern_inner_name_len, alloca_reg, TYPE_I64)
+
+    # Block-bodied / statement arm (AGAST #1454, #1617): run the leading
+    # statements in the arm's own scope (they are popped with the payload
+    # binding below), then fall into the value path, which reads the
+    # trailing expression match_arm_set_block left in arm.body.
+    emit_match_arm_stmts(s, arm.body_stmts)
 
     var body_reg: i32 = 0
     if arm.is_pass == 1

@@ -2728,7 +2728,7 @@ pub fn parse_binary(start: *u8, len: i32) -> i64
 
 # Allocate a new MatchArm with int-literal pattern. Caller fills body + is_pass.
 pub fn match_arm_int(p: *Parser, val: i64) -> *MatchArm
-    let a: *MatchArm = parser_alloc(p, 72) as *MatchArm
+    let a: *MatchArm = parser_alloc(p, sizeof(MatchArm)) as *MatchArm
     a.pattern_kind = PAT_INT_LIT
     a.pattern_int = val
     a.pattern_name = null
@@ -2738,12 +2738,13 @@ pub fn match_arm_int(p: *Parser, val: i64) -> *MatchArm
     a.pattern_inner_name_len = 0
     a.body = null
     a.is_pass = 0
+    a.body_stmts = null
     a.next = null
     return a
 
 # Allocate a new MatchArm with wildcard pattern (_). Caller fills body + is_pass.
 pub fn match_arm_wildcard(p: *Parser) -> *MatchArm
-    let a: *MatchArm = parser_alloc(p, 72) as *MatchArm
+    let a: *MatchArm = parser_alloc(p, sizeof(MatchArm)) as *MatchArm
     a.pattern_kind = PAT_WILDCARD
     a.pattern_int = 0
     a.pattern_name = null
@@ -2753,12 +2754,13 @@ pub fn match_arm_wildcard(p: *Parser) -> *MatchArm
     a.pattern_inner_name_len = 0
     a.body = null
     a.is_pass = 0
+    a.body_stmts = null
     a.next = null
     return a
 
 # Allocate a new MatchArm with identifier binding OR unit-variant (e.g. x, None).
 pub fn match_arm_ident(p: *Parser, name: *u8, name_len: i32) -> *MatchArm
-    let a: *MatchArm = parser_alloc(p, 72) as *MatchArm
+    let a: *MatchArm = parser_alloc(p, sizeof(MatchArm)) as *MatchArm
     a.pattern_kind = PAT_IDENT
     a.pattern_int = 0
     a.pattern_name = name
@@ -2768,13 +2770,14 @@ pub fn match_arm_ident(p: *Parser, name: *u8, name_len: i32) -> *MatchArm
     a.pattern_inner_name_len = 0
     a.body = null
     a.is_pass = 0
+    a.body_stmts = null
     a.next = null
     return a
 
 # Allocate a new MatchArm with variant pattern Name(inner).
 # inner_kind is PAT_WILDCARD or PAT_IDENT.
 pub fn match_arm_variant(p: *Parser, name: *u8, name_len: i32, inner_kind: i32, inner_name: *u8, inner_name_len: i32) -> *MatchArm
-    let a: *MatchArm = parser_alloc(p, 72) as *MatchArm
+    let a: *MatchArm = parser_alloc(p, sizeof(MatchArm)) as *MatchArm
     a.pattern_kind = PAT_VARIANT
     a.pattern_int = 0
     a.pattern_name = name
@@ -2784,6 +2787,7 @@ pub fn match_arm_variant(p: *Parser, name: *u8, name_len: i32, inner_kind: i32, 
     a.pattern_inner_name_len = inner_name_len
     a.body = null
     a.is_pass = 0
+    a.body_stmts = null
     a.next = null
     return a
 
@@ -2856,6 +2860,36 @@ pub fn match_arm_set_body_or_pass(arm: *MatchArm, body: *Expr) -> *MatchArm
         match_arm_set_body(arm, null as *Expr, 1)
     else
         match_arm_set_body(arm, body, 0)
+    return arm
+
+# match_arm action for a statement-bodied arm (AGAST #1454 / #1617):
+#   `None =>` NEWLINE INDENT stmts DEDENT     (block arm)
+#   `5 => r = 5`                              (assignment arm, one stmt)
+# Like an `if` branch or a fn body, the block's value is its trailing bare
+# expression.  That expression is detached from the statement list into
+# arm.body, so emit_match_arm_body, narrowing and monomorph keep reading the
+# arm's value from `body` exactly as for an expression arm; the remaining
+# statements go to arm.body_stmts and are emitted first.  A block that does
+# not end in a bare expression yields no value and is marked is_pass, the
+# same default (`i64 0`) a `pass` arm contributes.
+pub fn match_arm_set_block(arm: *MatchArm, stmts: *Stmt) -> *MatchArm
+    var prev: *Stmt = null
+    var last: *Stmt = stmts
+    while last != null and last.next != null
+        prev = last
+        last = last.next
+    if last != null and last.kind == STMT_EXPR and last.expr != null
+        arm.body = last.expr
+        arm.is_pass = 0
+        if prev == null
+            arm.body_stmts = null
+        else
+            prev.next = null
+            arm.body_stmts = stmts
+    else
+        arm.body = null
+        arm.is_pass = 1
+        arm.body_stmts = stmts
     return arm
 
 # postfix_op : '?'  →  POSTFIX_TRY.  apply_postfix_p wraps the running

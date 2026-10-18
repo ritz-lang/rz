@@ -110,10 +110,10 @@ _RITZ1_TWINS = {
         "AGAST #1614 — slice type `[T]` (ritz0-only sugar)",
     "test_issue_slice_generic_siblings":
         "AGAST #1614 — `[T]`; also AGAST #1613 (if-expression), #1615 (2.5f32), "
-        "#1616 (empty []), #1617 (assignment match-arm bodies)",
+        "#1616 (empty [])",
     "test_issue_struct_enum_variants":
         "AGAST #1295 — payload-carrying user enums / struct variants / N-ary "
-        "patterns; also AGAST #1617 (assignment match-arm bodies)",
+        "patterns",
     "test_level24":
         "AGAST #1622 — union type aliases + type-name patterns",
     "test_level39":
