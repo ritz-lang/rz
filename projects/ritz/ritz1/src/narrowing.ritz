@@ -12,7 +12,7 @@
 #
 #   * a compile-time constant expression whose value fits the declared type
 #   * a mask `e & K` with constant K >= 0 that fits the declared type
-#   * a match whose every arm is one of the above
+#   * an if/else or match whose every arm is one of the above
 #
 # ritz0/test_implicit_narrowing.py is the specification of the rule, and
 # ritz0/test_ritz1_implicit_narrowing.py feeds its tables to both compilers.
@@ -215,10 +215,19 @@ fn narrow_is_arith_op(op: i32) -> i32
 
 # Ritz type of an initialiser, NARROW_LIT, or NARROW_UNKNOWN (see header).
 fn narrow_src_type(s: *EmitterState, e: *Expr) -> i32
+    narrow_src_type_in(s, e, 0)
+
+# `lit_i64` is 1 inside the arms of an `if` expression, where ritz0 emits
+# integer literals with no expected type, so they are i64 there and do NOT
+# adopt the other operand or arm (#1445): measured, `if c` + `x` / `else` +
+# `0` into an i32 is rejected, as is `x + 1` / `y`; `x` / `y` is accepted.
+fn narrow_src_type_in(s: *EmitterState, e: *Expr, lit_i64: i32) -> i32
     if e == null
         return NARROW_UNKNOWN
     let k: i32 = e.kind
     if k == EXPR_INT_LIT
+        if lit_i64 == 1
+            return TYPE_I64
         return NARROW_LIT
     if k == EXPR_CHAR_LIT
         return TYPE_U8
@@ -234,19 +243,28 @@ fn narrow_src_type(s: *EmitterState, e: *Expr) -> i32
         if e.op >= OP_EQ and e.op <= OP_OR
             return TYPE_BOOL
         if narrow_is_arith_op(e.op) == 1
-            return narrow_join(narrow_src_type(s, e.left), narrow_src_type(s, e.right))
+            return narrow_join(narrow_src_type_in(s, e.left, lit_i64), narrow_src_type_in(s, e.right, lit_i64))
         return NARROW_UNKNOWN
     if k == EXPR_UNARY
         if e.op == OP_NOT
             return TYPE_BOOL
         if e.op == OP_NEG or e.op == OP_BIT_NOT
-            return narrow_src_type(s, e.operand)
+            return narrow_src_type_in(s, e.operand, lit_i64)
         return NARROW_UNKNOWN
+    if k == EXPR_IF
+        # AGAST #1613: the wider of the two arms, literals counting as i64.
+        let then_arm: *MatchArm = e.args as *MatchArm
+        let else_arm: *MatchArm = then_arm.next
+        if then_arm.is_pass != 0 or then_arm.body == null
+            return NARROW_UNKNOWN
+        if else_arm.is_pass != 0 or else_arm.body == null
+            return NARROW_UNKNOWN
+        return narrow_join(narrow_src_type_in(s, then_arm.body, 1), narrow_src_type_in(s, else_arm.body, 1))
     if k == EXPR_MATCH
         # Measured against ritz0, not assumed: a literal arm takes the type
         # of the non-literal arms (`match o: A => x_i32, B => 0` is i32), and
         # a match whose arms are ALL literals is i64.  (#1445's "literal arms
-        # stay i64" is about `if` arms, which ritz1 cannot parse.)
+        # stay i64" is about `if` arms; see EXPR_IF above and lit_i64.)
         var t: i32 = NARROW_LIT
         var arm: *MatchArm = e.args as *MatchArm
         if arm == null
@@ -254,7 +272,7 @@ fn narrow_src_type(s: *EmitterState, e: *Expr) -> i32
         while arm != null
             if arm.is_pass != 0 or arm.body == null
                 return NARROW_UNKNOWN
-            let at: i32 = narrow_src_type(s, arm.body)
+            let at: i32 = narrow_src_type_in(s, arm.body, lit_i64)
             if at == NARROW_UNKNOWN
                 return NARROW_UNKNOWN
             if at != NARROW_LIT
@@ -429,7 +447,8 @@ fn narrow_provable_range(s: *EmitterState, e: *Expr, whole: i32, lo: *i64, hi: *
         *lo = 0
         *hi = best
         return 1
-    if e.kind == EXPR_MATCH
+    # An if expression (#1613) is the union of its two arms, as in ritz0.
+    if e.kind == EXPR_MATCH or e.kind == EXPR_IF
         var arm: *MatchArm = e.args as *MatchArm
         if arm == null
             return 0

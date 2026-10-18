@@ -31,8 +31,10 @@ _spec = importlib.util.spec_from_file_location(
 RULE = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(RULE)
 
-# ritz1's grammar has no `if c then a else b` EXPRESSION, so these cases cannot
-# reach the narrowing check at all. They are not skipped silently: the test
+# ritz1 parses the block-form if-expression (AGAST #1613; its cases are the
+# if_block_* entries below) but not the inline `if c then a else b` form
+# (no `then` token, AGAST #1753), so these cases cannot reach the narrowing
+# check at all. They are not skipped silently: the test
 # below requires ritz1 to reject them with a parse error, so the day ritz1
 # learns the construct this list goes red and the cases join the parity run.
 RITZ1_CANNOT_PARSE = {"if_bounded_by_comparison", "if_constant_arms"}
@@ -125,6 +127,15 @@ RITZ1_EXTRA_REJECTED = {
                               "        RGB => 1\n"
                               "        BGR => 2", "x: i32, o: Order, w: i16"),
 }
+# Block-form if-expressions (AGAST #1613), measured against ritz0: inside an
+# `if` arm a literal is i64 and does not adopt the other arm or operand.
+_IF = "let n: {t} = if x > 0\n        {a}\n    else\n        {b}"
+RITZ1_EXTRA_REJECTED.update({
+    "if_block_literal_arm_is_i64": (_IF.format(t="i32", a="x", b="0"), None),
+    "if_block_literal_first":      (_IF.format(t="i32", a="0", b="x"), None),
+    "if_block_literal_operand":    (_IF.format(t="i32", a="x + 1", b="x"), None),
+    "if_block_i64_arm":            (_IF.format(t="i32", a="x", b="five()"), None),
+})
 RITZ1_EXTRA_ACCEPTED = {
     # An UNANNOTATED local: ritz1 records it as i64 whatever its initialiser,
     # and ritz0 infers i32 here. A check that trusted ritz1's default would
@@ -141,6 +152,9 @@ RITZ1_EXTRA_ACCEPTED = {
                                  "        Gray => x\n"
                                  "        RGB => 0\n"
                                  "        BGR => 1", None),
+    "if_block_same_type_arms": (_IF.format(t="i32", a="x", b="SMALL32"), None),
+    "if_block_constant_arms":  (_IF.format(t="u8", a="1", b="0"), None),
+    "if_block_const_arm":      (_IF.format(t="i32", a="SMALL32", b="x"), None),
     "match_literal_arms_first": ("let n: i32 = match o\n"
                                  "        Gray => 0\n"
                                  "        RGB => 1\n"

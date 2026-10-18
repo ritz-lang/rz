@@ -2826,6 +2826,46 @@ pub fn expr_match(p: *Parser, scrutinee: *Expr, arms: *MatchArm, line: i32, col:
     e.next = null
     return e
 
+# Create EXPR_IF (AGAST #1613): `if cond` + then block + `else` + else block,
+# used as a value.  Each block becomes a wildcard MatchArm whose value is the
+# block's trailing bare expression (match_arm_set_block), so emit_if_expr,
+# monomorph and narrowing read the arms exactly as they read EXPR_MATCH arms.
+# `args` holds the then-arm; its `next` is the else-arm.
+pub fn expr_if(p: *Parser, cond: *Expr, then_body: *Stmt, else_body: *Stmt, line: i32, col: i32) -> *Expr
+    let then_arm: *MatchArm = if_arm_from_block(p, then_body)
+    let else_arm: *MatchArm = if_arm_from_block(p, else_body)
+    then_arm.next = else_arm
+    let e: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    e.kind = EXPR_IF
+    e.span.line = line
+    e.span.col = col
+    e.left = cond
+    e.args = then_arm as *Expr  # Reinterpret arm list as Expr* slot
+    e.next = null
+    return e
+
+# One arm of an EXPR_IF.  A block ending in an `if`/`else` STATEMENT takes
+# that if's value: the grammar parses the nested `if` (and an `else if`
+# chain, whose else block is a single if_stmt) as STMT_IF, so it is rewritten
+# here into a trailing EXPR_IF expression statement before the value is
+# detached.  An else-less trailing `if` is left alone: it has no value, and
+# emit_if_expr reports the arm as valueless.
+fn if_arm_from_block(p: *Parser, stmts: *Stmt) -> *MatchArm
+    var head: *Stmt = stmts
+    var prev: *Stmt = null
+    var last: *Stmt = stmts
+    while last != null and last.next != null
+        prev = last
+        last = last.next
+    if last != null and last.kind == STMT_IF and last.if_else != null
+        let inner: *Expr = expr_if(p, last.if_cond, last.if_then, last.if_else, last.span.line, last.span.col)
+        let st: *Stmt = stmt_expr(p, inner, last.span.line, last.span.col)
+        if prev == null
+            head = st
+        else
+            prev.next = st
+    return match_arm_set_block(match_arm_wildcard(p), head)
+
 # =============================================================================
 # Wave 5F.2 — wrappers called from the canonical grammar (ritz1.grammar)
 # =============================================================================

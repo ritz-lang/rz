@@ -609,3 +609,106 @@ fn emit_match(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm) -> i32
     emit_label(s, fallthrough_label)
     emit_str(s, c" ]\n")
     return phi_reg
+
+# AGAST #1613: does an if-expression arm end by leaving the block (`return`,
+# `break`, `continue`)?  Such an arm reaches the merge only through the
+# unreachable block emit_match_arm_stmts opens after it, so its lack of a
+# value is harmless; any other valueless arm is an error.
+fn if_arm_diverges(arm: *MatchArm) -> i32
+    var last: *Stmt = arm.body_stmts
+    if last == null
+        return 0
+    while last.next != null
+        last = last.next
+    if last.kind == STMT_RETURN or last.kind == STMT_BREAK or last.kind == STMT_CONTINUE
+        return 1
+    0
+
+# Reject a valueless arm before anything is emitted for it.  A trailing
+# else-less `if` gets ritz0's wording (LANGUAGE_SPEC §6.1, AGAST #1406);
+# expr_if already turned every trailing if/else into the arm's value.
+fn if_arm_check_value(s: *EmitterState, arm: *MatchArm)
+    if arm.is_pass == 0 or if_arm_diverges(arm) == 1
+        return
+    var last: *Stmt = arm.body_stmts
+    while last != null and last.next != null
+        last = last.next
+    if last != null and last.kind == STMT_IF
+        emit_ir_error(s, c"an `if` with no `else` has no value when its condition is false, so it cannot be used as a value here; add an `else` arm")
+    else
+        emit_ir_error(s, c"an `if` expression arm does not end in a value")
+
+# Emit an if/else expression (AGAST #1613): `left` is the condition, `args`
+# the then-arm and its `next` the else-arm (see expr_if).  Lowered like a
+# two-arm match with no fallthrough: each arm goes through
+# emit_match_arm_body, which emits its block statements, its value and the
+# `br` to the merge, and types a struct-valued arm (#1645) so the phi is
+# `%StrView` / `%Point` rather than i64.  Returns the phi register.
+fn emit_if_expr(s: *EmitterState, e: *Expr) -> i32
+    let then_arm: *MatchArm = e.args as *MatchArm
+    let else_arm: *MatchArm = then_arm.next
+    if_arm_check_value(s, then_arm)
+    if_arm_check_value(s, else_arm)
+
+    # Same i1 / i64 decision as STMT_IF (bool_reg_is_i1, AGAST #1367, #1646).
+    let cond: i32 = emit_expr(s, e.left)
+    var cond_i1: i32 = cond
+    if bool_reg_is_i1(s, e.left) == 0
+        cond_i1 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, cond_i1)
+        emit_str(s, c" = icmp ne i64 ")
+        emit_reg(s, cond)
+        emit_str(s, c", 0\n")
+
+    let then_label: i32 = next_label(s)
+    let else_label: i32 = next_label(s)
+    let end_label: i32 = next_label(s)
+    emit_str(s, c"  br i1 ")
+    emit_reg(s, cond_i1)
+    emit_str(s, c", label %")
+    emit_label(s, then_label)
+    emit_str(s, c", label %")
+    emit_label(s, else_label)
+    emit_str(s, c"\n")
+
+    var result: MatchResult
+    result.count = 0
+    result.agg_name = null
+    result.agg_name_len = 0
+    begin_block(s, then_label)
+    emit_match_arm_body(s, then_arm, 0, 0, null, 0, @result, 0, end_label)
+    begin_block(s, else_label)
+    emit_match_arm_body(s, else_arm, 0, 0, null, 0, @result, 1, end_label)
+    begin_block(s, end_label)
+
+    # Publish the phi type for an untyped `let v = if ...` (#1666's path);
+    # set after both arms so a nested if/match inside an arm can't clobber it.
+    let is_agg: i32 = result.agg_name != null and result.agg_name_len > 0
+    if is_agg == 1
+        s.last_match_agg_name = result.agg_name
+        s.last_match_agg_name_len = result.agg_name_len
+    else
+        s.last_match_agg_name = null
+        s.last_match_agg_name_len = 0
+
+    let phi_reg: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, phi_reg)
+    emit_str(s, c" = phi ")
+    if is_agg == 1
+        emit_llvm_type_struct(s, TYPE_STRUCT, result.agg_name, result.agg_name_len)
+    else
+        emit_str(s, c"i64")
+    var i: i32 = 0
+    while i < 2
+        if i > 0
+            emit_str(s, c",")
+        emit_str(s, c" [ ")
+        emit_reg(s, result.values[i])
+        emit_str(s, c", %")
+        emit_label(s, result.labels[i])
+        emit_str(s, c" ]")
+        i = i + 1
+    emit_str(s, c"\n")
+    return phi_reg
