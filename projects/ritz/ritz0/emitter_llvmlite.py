@@ -4259,6 +4259,15 @@ class LLVMEmitter:
                         enum_type_name = self._ensure_builtin_generic_specialization(ret_named)
                     val = self._emit_enum_variant_with_type(
                         stmt.value, enum_type_name or ret_named.name)
+                elif self._emit_large_lit_into(
+                        stmt.value, self._sret_dest(self.current_fn, ret_type)):
+                    # AGAST #1741: the literal was built in the sret slot.
+                    self.closure_expected_type = None
+                    self.expected_ritz_type = None
+                    self._emit_drop_for_all_scopes(exclude_var)
+                    self.builder.ret_void()
+                    self.has_returned = True
+                    return True
                 else:
                     val = self._emit_expr(stmt.value)
                 self.closure_expected_type = None  # Clear context
@@ -4325,6 +4334,9 @@ class LLVMEmitter:
                 # This avoids loading/storing huge arrays which crashes LLVM SelectionDAG
                 elif isinstance(stmt.value, rast.ArrayFill) and stmt.value.count > 64:
                     self._emit_array_fill_to_alloca(stmt.value, alloca, ty)
+                # AGAST #1741: a large struct literal is built in the new var.
+                elif self._emit_large_lit_into(stmt.value, alloca):
+                    pass
                 # Check if this is an enum variant constructor that needs type context
                 elif self._is_enum_variant_call(stmt.value) and stmt.type and isinstance(stmt.type, rast.NamedType):
                     # Use declared enum type to construct the correct variant.
@@ -7895,49 +7907,24 @@ class LLVMEmitter:
 
     def _emit_struct_lit(self, expr: rast.StructLit) -> ir.Value:
         """Emit a struct literal: MyStruct { field1: value1, field2: value2 }."""
-        struct_name = expr.name
-        if struct_name not in self.struct_types:
-            raise ValueError(f"Unknown struct: {struct_name}")
+        struct_type, field_defs = self._struct_lit_layout(expr)
 
-        struct_type = self.struct_types[struct_name]
-        field_defs = self.struct_fields[struct_name]
-
-        # Create a map of field name -> index
-        field_indices = {name: i for i, (name, _) in enumerate(field_defs)}
+        # AGAST #1741: a large literal is built field-by-field in memory and
+        # yields `load %T, slot`, which its consumer turns into an sret
+        # store, a #1732 pointer-to-pointer copy or a byval pointer.  An
+        # insertvalue chain of a 22 KB %T timed clang -O2 out.
+        if self._sret_struct_type(struct_type) is not None:
+            slot = self._alloca_in_entry_block(struct_type, "lit.tmp")
+            self._emit_struct_lit_into(expr, slot)
+            return self.builder.load(slot)
 
         # Build an array of field values in the correct order
         field_values = [None] * len(field_defs)
 
         # Fill in the field values as provided in the struct literal
-        for field_name, field_expr in expr.fields:
-            if field_name not in field_indices:
-                raise ValueError(f"Unknown field {field_name} in struct {struct_name}")
-
-            idx = field_indices[field_name]
-
-            # Get the expected type for this field
+        for idx, field_expr in self._struct_lit_field_indices(expr, field_defs):
             _, expected_type = field_defs[idx]
-
-            # `S { opt: None }` must build the variant for *this field's* enum:
-            # variant names are global, so `None`/`Some` would otherwise pick
-            # whichever Option specialization was registered last.
-            field_enum = None
-            if (self._is_enum_variant_call(field_expr)
-                    and isinstance(expected_type, rast.NamedType)):
-                field_enum = self._resolve_enum_type_name(expected_type)
-                if field_enum is None and expected_type.args:
-                    field_enum = self._ensure_builtin_generic_specialization(expected_type)
-            if field_enum is not None:
-                field_val = self._emit_enum_variant_with_type(field_expr, field_enum)
-            else:
-                field_val = self._emit_expr(field_expr)
-
-            expected_llvm_type = self._ritz_type_to_llvm(expected_type)
-
-            # Convert if needed
-            field_val = self._convert_type(field_val, expected_llvm_type)
-
-            field_values[idx] = field_val
+            field_values[idx] = self._emit_struct_lit_field(field_expr, expected_type)
 
         # Zero-initialize any fields not provided in the struct literal
         for i, val in enumerate(field_values):
@@ -7953,6 +7940,107 @@ class LLVMEmitter:
             result = self.builder.insert_value(result, val, i)
 
         return result
+
+    def _struct_lit_layout(self, expr: rast.StructLit):
+        """(%T, [(field name, Ritz type)]) for a struct literal's struct."""
+        if expr.name not in self.struct_types:
+            raise ValueError(f"Unknown struct: {expr.name}")
+        return self.struct_types[expr.name], self.struct_fields[expr.name]
+
+    @staticmethod
+    def _struct_lit_field_indices(expr: rast.StructLit, field_defs):
+        """[(field index, initialiser)] in source (= evaluation) order."""
+        field_indices = {name: i for i, (name, _) in enumerate(field_defs)}
+        out = []
+        for field_name, field_expr in expr.fields:
+            if field_name not in field_indices:
+                raise ValueError(f"Unknown field {field_name} in struct {expr.name}")
+            out.append((field_indices[field_name], field_expr))
+        return out
+
+    def _emit_struct_lit_field(self, field_expr: rast.Expr,
+                               expected_type: rast.Type) -> ir.Value:
+        """One struct literal initialiser, converted to its field's type."""
+        # `S { opt: None }` must build the variant for *this field's* enum:
+        # variant names are global, so `None`/`Some` would otherwise pick
+        # whichever Option specialization was registered last.
+        field_enum = None
+        if (self._is_enum_variant_call(field_expr)
+                and isinstance(expected_type, rast.NamedType)):
+            field_enum = self._resolve_enum_type_name(expected_type)
+            if field_enum is None and expected_type.args:
+                field_enum = self._ensure_builtin_generic_specialization(expected_type)
+        if field_enum is not None:
+            field_val = self._emit_enum_variant_with_type(field_expr, field_enum)
+        else:
+            field_val = self._emit_expr(field_expr)
+        return self._convert_type(field_val, self._ritz_type_to_llvm(expected_type))
+
+    def _sret_dest(self, fn: ir.Function, ret_type: ir.Type) -> Optional[ir.Value]:
+        """`fn`'s sret pointer when it returns `ret_type` through one."""
+        if self._sret_type_of(fn) is ret_type:
+            return fn.args[0]
+        return None
+
+    def _emit_large_lit_into(self, expr: rast.Expr, dest: Optional[ir.Value]) -> bool:
+        """AGAST #1741: build `expr` in place at `dest` if it is a literal of
+        exactly `dest`'s large struct type; False (emitting nothing) otherwise.
+
+        The caller vouches that `dest` is fresh storage no initialiser can
+        observe (a new var's alloca, or this function's own sret slot), the
+        same contract as _retarget_sret_result.
+        """
+        if dest is None or not isinstance(expr, rast.StructLit):
+            return False
+        ty = self.struct_types.get(expr.name)
+        if (ty is None or dest.type != ir.PointerType(ty)
+                or self._sret_struct_type(ty) is None):
+            return False
+        self._emit_struct_lit_into(expr, dest)
+        return True
+
+    def _emit_struct_lit_into(self, expr: rast.StructLit, dest: ir.Value) -> None:
+        """AGAST #1741: build a struct literal in place at `dest` (a %T*).
+
+        As ritz1's emit_struct_lit_to_alloca: one GEP + store per field, in
+        source order.  An array-fill field is filled in place and a nested
+        large literal is built into its field, so neither forms a
+        first-class aggregate either; an omitted field is zeroed (memset
+        when large).  `dest` must be storage no initialiser can observe.
+        """
+        struct_type, field_defs = self._struct_lit_layout(expr)
+        zero = ir.Constant(self.i32, 0)
+        given = set()
+        for idx, field_expr in self._struct_lit_field_indices(expr, field_defs):
+            given.add(idx)
+            _, expected_type = field_defs[idx]
+            field_ty = struct_type.elements[idx]
+            field_ptr = self.builder.gep(dest, [zero, ir.Constant(self.i32, idx)],
+                                         inbounds=True)
+            if (isinstance(field_expr, rast.ArrayFill)
+                    and isinstance(field_ty, ir.ArrayType)
+                    and field_expr.count == field_ty.count):
+                self._emit_array_fill_to_alloca(field_expr, field_ptr, field_ty)
+            elif self._emit_large_lit_into(field_expr, field_ptr):
+                pass
+            else:
+                val = self._emit_struct_lit_field(field_expr, expected_type)
+                # An sret call writes the field directly (dest is private).
+                if not self._retarget_sret_result(val, field_ptr):
+                    self.builder.store(val, field_ptr)
+        for idx, field_ty in enumerate(struct_type.elements):
+            if idx in given:
+                continue
+            field_ptr = self.builder.gep(dest, [zero, ir.Constant(self.i32, idx)],
+                                         inbounds=True)
+            if self._type_size_bytes(field_ty) >= SRET_MIN_BYTES:
+                # Exact alloc size (padding included): `gep (T* null, 1)`.
+                size = ir.Constant(field_ty.as_pointer(), None).gep(
+                    [ir.Constant(self.i32, 1)]).ptrtoint(self.i64)
+                self._emit_memset(self.builder.bitcast(field_ptr, self.i8.as_pointer()),
+                                  ir.Constant(self.i8, 0), size)
+            else:
+                self.builder.store(self._zero_constant(field_ty), field_ptr)
 
     def _get_local_alloca(self, expr: rast.Expr) -> Optional[ir.AllocaInstr]:
         """Get the alloca for a local variable expression, if applicable.
