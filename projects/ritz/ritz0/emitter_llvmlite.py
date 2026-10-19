@@ -3173,6 +3173,33 @@ class LLVMEmitter:
         # The method lookup stores (type_name, method_name) -> mangled_fn_name
         return self.method_lookup.get((type_name, 'drop'))
 
+    # AGAST #1755: `let` bindings live in self.params (SSA values) and `var`
+    # bindings in self.locals (allocas). Neither map is block-scoped, and
+    # Ident lookup tries self.locals first, so a `var v` anywhere earlier in
+    # the function used to hide every later `let v`. That included a
+    # sibling-branch `let v`:
+    #
+    #     if c
+    #         var v = f()      # self.locals['v'] = %v.addr
+    #     else
+    #         let v = h()      # self.params['v'] = %h  ... but `v` -> %v.addr
+    #
+    # The else arm read the then arm's never-stored slot. Inside ritz1 that
+    # made every global scalar assignment `store i64 %.N` with %.N undefined.
+    # A binding must replace the same-named binding of the OTHER kind too,
+    # so the most recent binding wins whichever map it lives in. That is
+    # ritz1's rule (find_local_idx: innermost/latest wins), so ritz0 and
+    # ritz1 agree.
+    def _bind_let(self, name: str, val: ir.Value, ty: ir.Type) -> None:
+        """Bind an immutable `let` name, replacing any `var` of that name."""
+        self.locals.pop(name, None)
+        self.params[name] = (val, ty)
+
+    def _bind_var(self, name: str, alloca: ir.Value, ty: ir.Type) -> None:
+        """Bind a mutable `var` name, replacing any `let` of that name."""
+        self.params.pop(name, None)
+        self.locals[name] = (alloca, ty)
+
     def _push_drop_scope(self):
         """Enter a new scope for Drop tracking."""
         self.drop_scope_stack.append([])
@@ -4309,7 +4336,7 @@ class LLVMEmitter:
                 # AGAST #1736: an sret call writes the new var in place.
                 if not self._retarget_sret_result(val, alloca):
                     self.builder.store(val, alloca)
-                self.locals[stmt.name] = (alloca, ty)
+                self._bind_var(stmt.name, alloca, ty)
                 # Register for Drop if type was inferred and implements Drop
                 if ritz_type:
                     self._register_drop_variable(stmt.name, alloca, ritz_type)
@@ -4383,7 +4410,7 @@ class LLVMEmitter:
                     if not self._retarget_sret_result(val, alloca):
                         val = self._convert_type(val, ty)
                         self.builder.store(val, alloca)
-            self.locals[stmt.name] = (alloca, ty)
+            self._bind_var(stmt.name, alloca, ty)
             # Register for Drop if type is known and implements Drop
             if ritz_type:
                 self._register_drop_variable(stmt.name, alloca, ritz_type)
@@ -4425,14 +4452,14 @@ class LLVMEmitter:
                 self._check_int_literal_fits_declaration(stmt)
                 self._check_implicit_narrowing(stmt, src_ty, declared_ty)
                 self._check_let_annotation(stmt, val, declared_ty)
-                self.params[stmt.name] = (val, declared_ty)
+                self._bind_let(stmt.name, val, declared_ty)
                 self.ritz_types[stmt.name] = stmt.type  # Store Ritz type for signedness
                 # Note: let bindings don't get allocas, they're just SSA values
                 # For Drop to work, the variable needs to be addressable (use var instead of let)
             else:
                 # Infer Ritz type from expression for signedness tracking
                 inferred_ritz_type = self._infer_ritz_type(stmt.value, val)
-                self.params[stmt.name] = (val, val.type)
+                self._bind_let(stmt.name, val, val.type)
                 if inferred_ritz_type:
                     self.ritz_types[stmt.name] = inferred_ritz_type
             return None
@@ -4456,7 +4483,7 @@ class LLVMEmitter:
 
             for i, name in enumerate(stmt.names):
                 elem_val = self.builder.extract_value(tuple_val, i)
-                self.params[name] = (elem_val, elem_val.type)
+                self._bind_let(name, elem_val, elem_val.type)
             return None
 
         elif isinstance(stmt, rast.AssignStmt):
@@ -5658,6 +5685,9 @@ class LLVMEmitter:
         self.builder.branch(cond_block)
 
         prev_param = self.params.get(stmt.var)
+        # AGAST #1755: the element binding is a `let`, so it must also hide
+        # a same-named `var` for the body, and give it back afterwards.
+        prev_local = self.locals.get(stmt.var)
         prev_ritz = self.ritz_types.get(stmt.var) if stmt.var in self.ritz_types else None
 
         self.builder.position_at_end(cond_block)
@@ -5690,7 +5720,7 @@ class LLVMEmitter:
                 elem_ptr = self.builder.gep(data_ptr, [idx_val])
                 elem_val = self.builder.load(elem_ptr)
 
-        self.params[stmt.var] = (elem_val, elem_val.type)
+        self._bind_let(stmt.var, elem_val, elem_val.type)
         for s in stmt.body.stmts:
             result = self._emit_stmt(s)
             if result is True:
@@ -5718,6 +5748,8 @@ class LLVMEmitter:
             self.params.pop(stmt.var, None)
         else:
             self.params[stmt.var] = prev_param
+        if prev_local is not None:
+            self.locals[stmt.var] = prev_local
         if prev_ritz is None:
             self.ritz_types.pop(stmt.var, None)
         else:
