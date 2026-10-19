@@ -235,6 +235,16 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
                 stmt.var_type = TYPE_STRUCT
                 stmt.var_type_name = src_loc.type_name
                 stmt.var_type_name_len = src_loc.type_name_len
+            # AGAST #1754: `let q = s` with `s: @&S` / `@S` -- `q` takes `s`'s
+            # reference type and pointee, so `q.a` resolves and the slot holds
+            # the same `ptr` / i64 `s` loads as.  (Was i64 with no struct name:
+            # "unhandled EXPR_MEMBER".)
+            else if src_loc != null and (src_loc.var_type == TYPE_MUT_REF or src_loc.var_type == TYPE_REF) and src_loc.type_name_len > 0
+                var_type = src_loc.var_type
+                stmt.var_type = src_loc.var_type
+                stmt.var_type_name = src_loc.type_name
+                stmt.var_type_name_len = src_loc.type_name_len
+                stmt.var_pointee_type = src_loc.pointee_type
         # task-101: bare "..." literal lowers to a %Span$u8 aggregate
         # (see emit_expr EXPR_STRING_LIT). Without widening, `let s = "ABC"`
         # hits the same store-i64-of-%Span$u8 mismatch that as_bytes does.
@@ -480,6 +490,10 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
         # reaches here with a type name (annotated `*Struct`, or one of the
         # narrowings above) names the pointee struct.
         add_local_full(s, stmt.var_name, stmt.var_name_len, alloca_reg, var_type, stmt.var_type_name, stmt.var_type_name_len, TYPE_STRUCT, 0, 0)
+    else if (var_type == TYPE_REF or var_type == TYPE_MUT_REF) and stmt.var_type_name_len > 0
+        # AGAST #1754: `@S` / `@&S` local -- registered like a param of the
+        # same type (struct name + pointee) so `q.a` resolves.
+        add_local_full(s, stmt.var_name, stmt.var_name_len, alloca_reg, var_type, stmt.var_type_name, stmt.var_type_name_len, stmt.var_pointee_type, 0, 0)
     else if var_type == TYPE_PTR or var_type == TYPE_PTR_PTR or var_type == TYPE_REF or var_type == TYPE_MUT_REF
         add_local_ptr(s, stmt.var_name, stmt.var_name_len, alloca_reg, var_type, stmt.var_pointee_type)
     else if var_type == TYPE_STRUCT
@@ -688,7 +702,17 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
             emit_str(s, c", ptr ")
             emit_reg(s, alloca_reg)
             emit_str(s, c"\n")
-        else if var_type == TYPE_PTR or var_type == TYPE_PTR_PTR or var_type == TYPE_REF or var_type == TYPE_MUT_REF
+        else if var_type == TYPE_MUT_REF
+            # AGAST #1754: an `@&T` slot holds the `ptr` it loads as (like an
+            # `@&T` param); an i64 init (a `*T` value, a `-> @&T`
+            # call result) gets an inttoptr.
+            let init_pval: i32 = i64_value_to_ptr(s, stmt.var_init, init_reg)
+            emit_str(s, c"  store ptr ")
+            emit_reg(s, init_pval)
+            emit_str(s, c", ptr ")
+            emit_reg(s, alloca_reg)
+            emit_str(s, c"\n")
+        else if var_type == TYPE_PTR or var_type == TYPE_PTR_PTR or var_type == TYPE_REF
             # Store i64 directly (pointers are stored as i64).  AGAST #1652:
             # an `@&T` init (`let p: *S = s`) is a `ptr`; ptrtoint it first.
             let init_ival: i32 = ptr_slot_value(s, var_type, stmt.var_init, init_reg)
@@ -1484,9 +1508,10 @@ fn emit_return(s: *EmitterState, stmt: *Stmt, ret_type: i32)
             emit_str(s, c"  ret i8 ")
             emit_reg(s, trunc)
             emit_str(s, c"\n")
-        else if ret_type == TYPE_PTR or ret_type == TYPE_PTR_PTR
+        else if ret_type == TYPE_PTR or ret_type == TYPE_PTR_PTR or ret_type == TYPE_REF
             # Pointers are represented as i64 internally, return as i64.
-            # AGAST #1652: `return s` with `s: @&S` is a `ptr`.
+            # AGAST #1652: `return s` with `s: @&S` is a `ptr`.  #1754: so is
+            # `-> @S`, which lowers to i64 too.
             let ret_ival: i32 = ptr_value_to_i64(s, stmt.return_value, val)
             emit_str(s, c"  ret i64 ")
             emit_reg(s, ret_ival)

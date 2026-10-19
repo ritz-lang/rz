@@ -1,4 +1,4 @@
-"""Regression tests for AGAST #1652 / #1672: an `@&T` value used where a `*T`
+"""Regression tests for AGAST #1652 / #1672 / #1754: an `@&T` value used where a `*T`
 is expected.
 
 ritz1 lowers `*T` as i64 (its value model) but `@&T` as `ptr`.  When an
@@ -83,6 +83,10 @@ struct O
     h: H
 
 fn bump(s: *S) -> i32
+    s.a = s.a + 2
+    s.a
+
+fn bump_mut(s: @&S) -> i32
     s.a = s.a + 2
     s.a
 """
@@ -307,8 +311,159 @@ pub fn main() -> i32
 """,
 }
 
+# --- AGAST #1754: the leftovers ----------------------------------------------
+
+# A local initialised from an `@&S` ident must stay a struct pointer, so
+# `q.a` resolves (was "unhandled EXPR_MEMBER").
+LOCAL_FROM_MUT_REF = {
+    "let_untyped": """\
+fn f(s: @&S) -> i32
+    let q = s
+    q.a = q.a + 2
+    0
+
+pub fn main() -> i32
+    var s: S = S { a: 40 }
+    f(@&s)
+    s.a
+""",
+    "let_untyped_read": """\
+fn f(s: @&S) -> i32
+    let q = s
+    q.a + 2
+
+pub fn main() -> i32
+    var s: S = S { a: 40 }
+    f(@&s)
+""",
+    "let_mut_ref_typed": """\
+fn f(s: @&S) -> i32
+    let q: @&S = s
+    q.a = q.a + 2
+    0
+
+pub fn main() -> i32
+    var s: S = S { a: 40 }
+    f(@&s)
+    s.a
+""",
+    # A `@&S` slot fed an i64 `*S` cast: inttoptr, then `q.a` writes through.
+    "let_mut_ref_from_cast": """\
+pub fn main() -> i32
+    var s: S = S { a: 40 }
+    let p: *S = @s
+    let q: @&S = p as @&S
+    q.a = q.a + 2
+    s.a
+""",
+    # `@S` (TYPE_REF) slot from an `@&S` value.
+    "let_ref_typed": """\
+fn f(s: @&S) -> i32
+    let r: @S = s
+    r.a + 2
+
+pub fn main() -> i32
+    var s: S = S { a: 40 }
+    f(@&s)
+""",
+    # The untyped local is still usable as a `*S` / `@&S` argument.
+    "let_untyped_as_args": """\
+fn f(s: @&S) -> i32
+    let q = s
+    bump(q)
+    bump_mut(q)
+    q.a
+
+pub fn main() -> i32
+    var s: S = S { a: 38 }
+    f(@&s)
+""",
+}
+
+# `*S -> @&S`: the i64 address must be inttoptr'd into the `ptr` model.
+CAST_TO_MUT_REF = {
+    "return_cast": """\
+fn g(s: *S) -> @&S
+    return s as @&S
+
+pub fn main() -> i32
+    var s: S = S { a: 40 }
+    let r = g(@s)
+    bump_mut(r)
+""",
+    "tail_cast": """\
+fn g(s: *S) -> @&S
+    s as @&S
+
+pub fn main() -> i32
+    var s: S = S { a: 40 }
+    let r: @&S = g(@s)
+    r.a = r.a + 2
+    s.a
+""",
+    "call_arg_cast": """\
+pub fn main() -> i32
+    var s: S = S { a: 40 }
+    let p: *S = @s
+    bump_mut(p as @&S)
+""",
+    # `@&S` -> `@&S` cast stays a ptr (no bogus inttoptr of a ptr).
+    "mut_ref_to_mut_ref_cast": """\
+fn f(s: @&S) -> i32
+    bump_mut(s as @&S)
+
+pub fn main() -> i32
+    var s: S = S { a: 40 }
+    f(@&s)
+""",
+}
+
+# `-> @S` is i64 like `*S`: an `@&S` value returned there needs the ptrtoint.
+REF_RETURN = {
+    "ref_return_stmt": """\
+fn view(s: @&S) -> @S
+    return s
+
+pub fn main() -> i32
+    var s: S = S { a: 40 }
+    let r = view(@&s)
+    r.a + 2
+""",
+    "ref_return_tail": """\
+fn view(s: @&S) -> @S
+    s
+
+pub fn main() -> i32
+    var s: S = S { a: 40 }
+    let r = view(@&s)
+    r.a + 2
+""",
+}
+
+# `*S == @&S`: both operands must be compared as i64.
+COMPARE = {
+    "cmp_mixed": """\
+fn f(s: @&S) -> i32
+    let p: *S = s
+    let n: *S = null
+    if n == s
+        return 1
+    if p != s
+        return 2
+    if s == p
+        return 42
+    3
+
+pub fn main() -> i32
+    var s: S = S { a: 40 }
+    f(@&s)
+""",
+}
+
+LEFTOVERS = {**LOCAL_FROM_MUT_REF, **CAST_TO_MUT_REF, **REF_RETURN, **COMPARE}
+
 BROKEN = {**LET_ASSIGN, **CAST, **RET_FIELD}
-ALL = {**BROKEN, **WORKING}
+ALL = {**BROKEN, **WORKING, **LEFTOVERS}
 
 
 def _compile(compiler: str, tmp_path: Path, name: str, program: str):
@@ -387,3 +542,31 @@ def test_ritz1_ptr_let_from_addr_is_not_cast_again(ritz1_bin, tmp_path):
     main_ir = ll.read_text().split("define i32 @main", 1)[1]
     assert main_ir.count("ptrtoint ptr") == 1, main_ir  # the `@s` itself
     assert "#1652" not in main_ir, main_ir
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("name", sorted(LOCAL_FROM_MUT_REF))
+def test_ritz1_local_from_mut_ref_is_struct_ptr(ritz1_bin, tmp_path, name):
+    """#1754: `let q = s` / `let q: @&S = s` / `let r: @S = s` keep `q.a` working."""
+    assert _run("ritz1", tmp_path, name, LOCAL_FROM_MUT_REF[name]) == 42
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("name", sorted(CAST_TO_MUT_REF))
+def test_ritz1_cast_ptr_to_mut_ref(ritz1_bin, tmp_path, name):
+    """#1754: `p as @&S` (p: *S) inttoptrs the i64 address."""
+    assert _run("ritz1", tmp_path, name, CAST_TO_MUT_REF[name]) == 42
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("name", sorted(REF_RETURN))
+def test_ritz1_mut_ref_into_ref_return(ritz1_bin, tmp_path, name):
+    """#1754: `return s` / tail `s` from `-> @S` ptrtoints into its i64."""
+    assert _run("ritz1", tmp_path, name, REF_RETURN[name]) == 42
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("name", sorted(COMPARE))
+def test_ritz1_compare_ptr_with_mut_ref(ritz1_bin, tmp_path, name):
+    """#1754: `p == s` with `p: *S`, `s: @&S` compares two i64s."""
+    assert _run("ritz1", tmp_path, name, COMPARE[name]) == 42
