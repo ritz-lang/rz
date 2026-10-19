@@ -689,9 +689,11 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
             emit_reg(s, alloca_reg)
             emit_str(s, c"\n")
         else if var_type == TYPE_PTR or var_type == TYPE_PTR_PTR or var_type == TYPE_REF or var_type == TYPE_MUT_REF
-            # Store i64 directly (pointers are stored as i64)
+            # Store i64 directly (pointers are stored as i64).  AGAST #1652:
+            # an `@&T` init (`let p: *S = s`) is a `ptr`; ptrtoint it first.
+            let init_ival: i32 = ptr_slot_value(s, var_type, stmt.var_init, init_reg)
             emit_str(s, c"  store i64 ")
-            emit_reg(s, init_reg)
+            emit_reg(s, init_ival)
             emit_str(s, c", ptr ")
             emit_reg(s, alloca_reg)
             emit_str(s, c"\n")
@@ -821,11 +823,13 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
                     emit_reg(s, member_result.reg)
                     emit_str(s, c"\n")
                 else if field.field_type == TYPE_PTR or field.field_type == TYPE_PTR_PTR
+                    # AGAST #1652: `h.p = s` with `s: @&S` is already a `ptr`.
+                    let ival: i32 = ptr_value_to_i64(s, stmt.assign_value, val)
                     let ptr_val: i32 = next_reg(s)
                     emit_str(s, c"  ")
                     emit_reg(s, ptr_val)
                     emit_str(s, c" = inttoptr i64 ")
-                    emit_reg(s, val)
+                    emit_reg(s, ival)
                     emit_str(s, c" to ptr\n")
                     emit_str(s, c"  store ptr ")
                     emit_reg(s, ptr_val)
@@ -1224,7 +1228,10 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
                 emit_reg(s, loc)
                 emit_str(s, c"\n")
             return
-        let val: i32 = emit_expr(s, stmt.assign_value)
+        # AGAST #1652: `p = s` (`s: @&S`) into a `*S` local.  `let` only;
+        # see the #1755 note in emit_fn.
+        let assign_raw: i32 = emit_expr(s, stmt.assign_value)
+        let val: i32 = ptr_slot_value(s, var_type, stmt.assign_value, assign_raw)
         if var_type == TYPE_I32 or var_type == TYPE_U32
             let trunc: i32 = next_reg(s)
             emit_str(s, c"  ")
@@ -1478,9 +1485,11 @@ fn emit_return(s: *EmitterState, stmt: *Stmt, ret_type: i32)
             emit_reg(s, trunc)
             emit_str(s, c"\n")
         else if ret_type == TYPE_PTR or ret_type == TYPE_PTR_PTR
-            # Pointers are represented as i64 internally, return as i64
+            # Pointers are represented as i64 internally, return as i64.
+            # AGAST #1652: `return s` with `s: @&S` is a `ptr`.
+            let ret_ival: i32 = ptr_value_to_i64(s, stmt.return_value, val)
             emit_str(s, c"  ret i64 ")
-            emit_reg(s, val)
+            emit_reg(s, ret_ival)
             emit_str(s, c"\n")
         else if ret_type == TYPE_BOOL
             # Bool returns: emit_expr always produces i64 (icmp result is
@@ -2597,11 +2606,13 @@ fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                         emit_reg(s, field_ptr)
                         emit_str(s, c"\n")
                     else if field.field_type == TYPE_PTR or field.field_type == TYPE_PTR_PTR
+                        # AGAST #1652: `h.p = s` with `s: @&S` is already a `ptr`.
+                        let ival: i32 = ptr_value_to_i64(s, stmt.assign_value, val_reg)
                         let ptr_val: i32 = next_reg(s)
                         emit_str(s, c"  ")
                         emit_reg(s, ptr_val)
                         emit_str(s, c" = inttoptr i64 ")
-                        emit_reg(s, val_reg)
+                        emit_reg(s, ival)
                         emit_str(s, c" to ptr\n")
                         emit_str(s, c"  store ptr ")
                         emit_reg(s, ptr_val)
