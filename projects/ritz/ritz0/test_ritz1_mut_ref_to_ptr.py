@@ -460,7 +460,50 @@ pub fn main() -> i32
 """,
 }
 
-LEFTOVERS = {**LOCAL_FROM_MUT_REF, **CAST_TO_MUT_REF, **REF_RETURN, **COMPARE}
+# AGAST #1757: a `-> @&S` call result is i64 (ptrtoint'd into the value
+# model), so passing it straight into an `@&S` param needs the inttoptr even
+# though get_expr_type says TYPE_MUT_REF.
+CALL_RESULT_TO_MUT_REF = {
+    "call_result_arg": """\
+fn g(s: @&S) -> @&S
+    s
+
+pub fn main() -> i32
+    var s: S = S { a: 40 }
+    bump_mut(g(@&s))
+""",
+    # Nested: the inner call's `@&S` result feeds the outer `@&S` param.
+    "call_result_nested": """\
+fn g(s: @&S) -> @&S
+    s
+
+pub fn main() -> i32
+    var s: S = S { a: 38 }
+    bump_mut(g(g(@&s)))
+    s.a + 2
+""",
+    # Second argument position, after a plain i64.
+    "call_result_second_arg": """\
+fn g(s: @&S) -> @&S
+    s
+
+fn add_to(n: i32, s: @&S) -> i32
+    s.a = s.a + n
+    s.a
+
+pub fn main() -> i32
+    var s: S = S { a: 40 }
+    add_to(2, g(@&s))
+""",
+}
+
+LEFTOVERS = {
+    **LOCAL_FROM_MUT_REF,
+    **CAST_TO_MUT_REF,
+    **REF_RETURN,
+    **COMPARE,
+    **CALL_RESULT_TO_MUT_REF,
+}
 
 BROKEN = {**LET_ASSIGN, **CAST, **RET_FIELD}
 ALL = {**BROKEN, **WORKING, **LEFTOVERS}
@@ -570,3 +613,10 @@ def test_ritz1_mut_ref_into_ref_return(ritz1_bin, tmp_path, name):
 def test_ritz1_compare_ptr_with_mut_ref(ritz1_bin, tmp_path, name):
     """#1754: `p == s` with `p: *S`, `s: @&S` compares two i64s."""
     assert _run("ritz1", tmp_path, name, COMPARE[name]) == 42
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("name", sorted(CALL_RESULT_TO_MUT_REF))
+def test_ritz1_call_result_into_mut_ref_param(ritz1_bin, tmp_path, name):
+    """#1757: a `-> @&S` call result (i64) passed to an `@&S` param is inttoptr'd."""
+    assert _run("ritz1", tmp_path, name, CALL_RESULT_TO_MUT_REF[name]) == 42
