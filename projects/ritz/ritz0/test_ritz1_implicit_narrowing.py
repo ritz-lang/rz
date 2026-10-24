@@ -31,13 +31,10 @@ _spec = importlib.util.spec_from_file_location(
 RULE = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(RULE)
 
-# ritz1 parses the block-form if-expression (AGAST #1613; its cases are the
-# if_block_* entries below) but not the inline `if c then a else b` form
-# (no `then` token, AGAST #1753), so these cases cannot reach the narrowing
-# check at all. They are not skipped silently: the test
-# below requires ritz1 to reject them with a parse error, so the day ritz1
-# learns the construct this list goes red and the cases join the parity run.
-RITZ1_CANNOT_PARSE = {"if_bounded_by_comparison", "if_constant_arms"}
+# Every case in both tables is in the parity run: ritz1 parses the block-form
+# if-expression (AGAST #1613, the if_block_* entries) and the inline
+# `if c then a else b` form (AGAST #1753, if_bounded_by_comparison and
+# if_constant_arms), so no case is held back as unparseable.
 
 
 @pytest.fixture(scope="module")
@@ -62,7 +59,7 @@ def _ritz1(ritz1_bin, tmp_path, body):
 
 
 def _parity_cases(table):
-    return sorted(name for name in table if name not in RITZ1_CANNOT_PARSE)
+    return sorted(table)
 
 
 @pytest.mark.integration
@@ -185,13 +182,3 @@ def test_ritz1_extra_shapes_accepted_by_both(ritz1_bin, tmp_path, name):
         f"{name}: ritz0 is the oracle and rejected it -- fix the case:\n{r0.stderr[-800:]}")
     r1 = _ritz1(ritz1_bin, tmp_path, body)
     assert r1.returncode == 0, f"{name}: ritz1 rejected `{stmt}`:\n{r1.stderr[-1500:]}"
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(RITZ1_CANNOT_PARSE))
-def test_ritz1_still_cannot_parse_if_expressions(ritz1_bin, tmp_path, name):
-    table = RULE.REJECTED if name in RULE.REJECTED else RULE.ACCEPTED
-    r = _ritz1(ritz1_bin, tmp_path, RULE._fn(table[name]))
-    assert r.returncode != 0 and "implicit narrowing" not in r.stderr, (
-        f"{name}: ritz1 now gets past the parser -- remove it from "
-        f"RITZ1_CANNOT_PARSE so it joins the parity run:\n{r.stderr[-800:]}")

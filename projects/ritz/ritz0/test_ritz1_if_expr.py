@@ -18,10 +18,10 @@ match_arm_set_block, and the merge is one phi typed exactly as a match's.
 A nested `if`/`else` that ends an arm (including an `else if` chain) is that
 arm's value.
 
-Not covered: the inline `if c then a else b` form (ritz1 has no `then`
-token, AGAST #1753) — see RITZ1_CANNOT_PARSE in
-test_ritz1_implicit_narrowing.py.  The narrowing parity cases for the block
-form are the if_block_* entries there.
+The inline_* programs cover the single-line `if c then a else b` form
+(AGAST #1753): primary_expr's `IF expr THEN expr ELSE expr`, lowered through
+the same EXPR_IF / expr_if path by expr_if_inline.  The narrowing parity
+cases for both forms live in test_ritz1_implicit_narrowing.py.
 
 ritz0 is the oracle. Every program exits 42 on success.
 """
@@ -293,7 +293,79 @@ fn main() -> i32
     (n * 2) as i32
 """
 
+# --- inline `if c then a else b` (AGAST #1753) ----------------------------------
+
+# #1753's repro (tier4 36_timeout:207 / 39_time:162), taken both ways.
+INLINE_REPRO = """\
+fn clamp(a: i32) -> i32
+    let m: i32 = if a < 255 then a else 255 as i32
+    return m
+
+fn main() -> i32
+    if clamp(300) != 255
+        return 1
+    clamp(42)
+"""
+
+# No annotation: the slot takes its type from the phi.
+INLINE_UNTYPED = """\
+fn f(c: i64) -> i64
+    let n = if c == 1 then 40 else 7
+    n + 2
+
+fn main() -> i32
+    if f(0) != 9
+        return 1
+    f(1) as i32
+"""
+
+# `return if ...`, and an inline if as a call argument and an operand.
+INLINE_POSITIONS = """\
+fn twice(x: i32) -> i32
+    x * 2
+
+fn f(c: i32) -> i32
+    return if c > 0 then 20 else 1
+
+fn main() -> i32
+    let a: i32 = twice(if f(1) == 20 then 10 else 0)
+    let b: i64 = (a as i64) + (if a == 20 then 22 else 0)
+    if f(0) != 1
+        return 1
+    b as i32
+"""
+
+# Both arms take a whole expression, as in ritz0: `else 2 + 40` is 42, and
+# `else if` chains right-nest.
+INLINE_ARM_EXTENT = """\
+fn classify(x: i32) -> i32
+    if x < 0 then 1 else if x == 0 then 2 else 3
+
+fn main() -> i32
+    let c: i32 = 0
+    let n: i32 = if c == 1 then 1 else 2 + 40
+    let r: i32 = classify(0 - 5) * 100 + classify(0) * 10 + classify(9)
+    if r != 123
+        return 1
+    n
+"""
+
+# Nested inline ifs as the then-arm, in a loop.
+INLINE_NESTED_LOOP = """\
+fn main() -> i32
+    var total: i32 = 0
+    for i in 0..10
+        let d: i32 = if i % 2 == 0 then if i < 3 then 6 else 2 else 0
+        total = total + d
+    total + 24
+"""
+
 PROGRAMS = {
+    "inline_repro": INLINE_REPRO,
+    "inline_untyped": INLINE_UNTYPED,
+    "inline_positions": INLINE_POSITIONS,
+    "inline_arm_extent": INLINE_ARM_EXTENT,
+    "inline_nested_loop": INLINE_NESTED_LOOP,
     "generic_call_in_arm": GENERIC_CALL_IN_ARM,
     "repro": REPRO,
     "untyped_let": UNTYPED_LET,
@@ -335,6 +407,15 @@ fn f(c: i32, d: i32) -> i32
 
 fn main() -> i32
     f(1, 1)
+""",
+    # Inline form with no `else` (AGAST #1753).
+    "inline_no_else": """\
+fn f(c: i32) -> i32
+    let n: i32 = if c == 1 then 1
+    n
+
+fn main() -> i32
+    f(1)
 """,
     "return_no_else": """\
 fn f(c: i32) -> i32
