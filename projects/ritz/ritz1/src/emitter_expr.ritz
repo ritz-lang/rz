@@ -1457,13 +1457,111 @@ fn emit_array_fill_into(s: *EmitterState, base_reg: i32, arr_size: i32, elem_ty:
     emit_str(s, c"\n")
     begin_block(s, fi_end)
 
+# Write the array literal `lit` (`[a, b, ..]`) element by element into the
+# `[arr_size x elem]` storage at `base_reg` (a `ptr` register: a local alloca
+# or a struct-field GEP). Elements past `arr_size` are ignored.
+#
+# Shared by `let a: [N]T = [..]` (emit_var_decl) and by `[..]` as an array
+# field of a struct literal (emit_struct_lit_array_fill_field). Element
+# handling depends on the element type:
+#   * scalars: evaluate to i64, then trunc / inttoptr to the element width.
+#   * structs (`elem_ty == TYPE_STRUCT`, named by `elem_name`): a struct
+#     literal element is written in place into its slot with
+#     emit_struct_lit_to_alloca. emit_expr has no lowering for a bare literal
+#     that matches the slot. Any other element (a local, a call) is a loaded
+#     `%T` aggregate and is stored as one.
+# The generic EXPR_ARRAY_LIT arm of emit_expr builds an `[N x i64]` shadow and
+# stored each struct element as an i64 (invalid IR). (AGAST #1608)
+fn emit_array_lit_into(s: *EmitterState, base_reg: i32, arr_size: i32, elem_ty: i32, elem_name: *u8, elem_name_len: i32, lit: *Expr)
+    var is_struct: i32 = 0
+    if elem_ty == TYPE_STRUCT and elem_name_len > 0
+        is_struct = 1
+    var elem_llvm: *u8 = c"i64"
+    var needs_trunc: i32 = 0
+    if elem_ty == TYPE_I32 or elem_ty == TYPE_U32
+        elem_llvm = c"i32"
+        needs_trunc = 1
+    else if elem_ty == TYPE_U8 or elem_ty == TYPE_I8
+        elem_llvm = c"i8"
+        needs_trunc = 1
+    else if elem_ty == TYPE_U16 or elem_ty == TYPE_I16
+        elem_llvm = c"i16"
+        needs_trunc = 1
+    else if elem_ty == TYPE_PTR or elem_ty == TYPE_PTR_PTR
+        elem_llvm = c"ptr"
+    var idx: i32 = 0
+    var it: *Expr = lit.args
+    while it != null and idx < arr_size
+        # A struct-literal element has no value register; GEP first, then
+        # write it in place.
+        var val_reg: i32 = -1
+        if is_struct == 0 or it.kind != EXPR_STRUCT_LIT
+            val_reg = emit_expr(s, it)
+        let elem_ptr: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, elem_ptr)
+        emit_str(s, c" = getelementptr [")
+        emit_int(s, arr_size as i64)
+        emit_str(s, c" x ")
+        if is_struct == 1
+            emit_str(s, c"%")
+            emit_name(s, elem_name, elem_name_len)
+        else
+            emit_str(s, elem_llvm)
+        emit_str(s, c"], ptr ")
+        emit_reg(s, base_reg)
+        emit_str(s, c", i64 0, i64 ")
+        emit_int(s, idx as i64)
+        emit_str(s, c"\n")
+        if is_struct == 1
+            if val_reg < 0
+                emit_struct_lit_to_alloca(s, it, elem_ptr)
+            else
+                let agg: i32 = coerce_struct_ret_value(s, it, val_reg, elem_name, elem_name_len)
+                emit_str(s, c"  store %")
+                emit_name(s, elem_name, elem_name_len)
+                emit_str(s, c" ")
+                emit_reg(s, agg)
+                emit_str(s, c", ptr ")
+                emit_reg(s, elem_ptr)
+                emit_str(s, c"\n")
+        else
+            # Narrow the i64 expression value to the element type.
+            var stored: i32 = val_reg
+            if elem_ty == TYPE_PTR or elem_ty == TYPE_PTR_PTR
+                stored = next_reg(s)
+                emit_str(s, c"  ")
+                emit_reg(s, stored)
+                emit_str(s, c" = inttoptr i64 ")
+                emit_reg(s, val_reg)
+                emit_str(s, c" to ptr\n")
+            else if needs_trunc == 1
+                stored = next_reg(s)
+                emit_str(s, c"  ")
+                emit_reg(s, stored)
+                emit_str(s, c" = trunc i64 ")
+                emit_reg(s, val_reg)
+                emit_str(s, c" to ")
+                emit_str(s, elem_llvm)
+                emit_str(s, c"\n")
+            emit_str(s, c"  store ")
+            emit_str(s, elem_llvm)
+            emit_str(s, c" ")
+            emit_reg(s, stored)
+            emit_str(s, c", ptr ")
+            emit_reg(s, elem_ptr)
+            emit_str(s, c"\n")
+        idx = idx + 1
+        it = it.next
+
 
 # If struct literal field `field_idx` of `st` is an inline array initialised
-# with `[v; N]`, GEP to the field inside `base_reg` and fill it in place;
-# return 1. Otherwise emit nothing and return 0 so the caller's generic
-# evaluate-then-store path handles the field. (AGAST #1605)
+# with `[v; N]` (AGAST #1605) or `[a, b, ..]` (AGAST #1608), GEP to the field
+# inside `base_reg` and write it in place; return 1. Otherwise emit nothing
+# and return 0 so the caller's generic evaluate-then-store path handles the
+# field.
 fn emit_struct_lit_array_fill_field(s: *EmitterState, st: *StructDef, field_idx: i32, value: *Expr, base_reg: i32) -> i32
-    if value == null or value.kind != EXPR_ARRAY_FILL
+    if value == null or (value.kind != EXPR_ARRAY_FILL and value.kind != EXPR_ARRAY_LIT)
         return 0
     let field: *StructField = get_field_type(st, field_idx)
     if field.field_type != TYPE_ARRAY
@@ -1478,7 +1576,10 @@ fn emit_struct_lit_array_fill_field(s: *EmitterState, st: *StructDef, field_idx:
     emit_str(s, c", i32 0, i32 ")
     emit_int(s, field_idx as i64)
     emit_str(s, c"\n")
-    emit_array_fill_into(s, field_ptr, field.array_size, field.array_elem_type, value.left)
+    if value.kind == EXPR_ARRAY_LIT
+        emit_array_lit_into(s, field_ptr, field.array_size, field.array_elem_type, field.array_elem_type_name, field.array_elem_type_name_len, value)
+    else
+        emit_array_fill_into(s, field_ptr, field.array_size, field.array_elem_type, value.left)
     1
 
 # Evaluate struct-literal field `field_idx` of `st` and store it into the

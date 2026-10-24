@@ -75,8 +75,6 @@ EXPECTED_FAILURES = {
 # the passing one turns xpass and the gate goes red.
 _RITZ1_TWINS = {
     # --- codegen, build failures ---
-    "test_level12":
-        "AGAST #1608 — struct literal nested in a field/array literal rejected",
     "test_aesni":
         "AGAST #1609 — AES-NI intrinsics do not bitcast v4i32 operands",
     "test_level34":
