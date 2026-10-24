@@ -83,9 +83,6 @@ _RITZ1_TWINS = {
         "AGAST #1627 — unspecified ritz0-only String coercions (\"...\"→String, String→*u8)",
     "test_string_coercion":
         "AGAST #1627 — unspecified ritz0-only String→*u8 coercion",
-    "test_level22":
-        "AGAST #1519 — `Vec<*u8>` annotation mangles to `Vec$` (invalid IR vs "
-        "`Vec$ptr_u8`)",
     "test_level23":
         "AGAST #1514 — `let tmp: T` in a generic fn becomes `alloca %T$i32` "
         "(unsized type)",

@@ -1371,45 +1371,94 @@ pub fn capture_first_generic_arg(p: *Parser, ty: i32) -> *GenericArg
     if ty == TYPE_STRUCT
         ga.name = p.last_type_name
         ga.name_len = p.last_type_name_len
+    else if ty == TYPE_PTR or ty == TYPE_PTR_PTR
+        # AGAST #1519: a pointer's pointee is only in parser state now, so
+        # spell it here ("ptr_u8", "ptr_ptr_Foo"); generic_arg_spelling
+        # returns the saved name.
+        var n: i32 = 0
+        ga.name = spell_ptr_generic_arg(p, ty, @n)
+        ga.name_len = n
     else
         ga.name = null
         ga.name_len = 0
     ga.next = null
     return ga
 
+# Spelling of a primitive type argument, as ritz0 mangles it.  Returns its
+# length (0 when not spelled yet: AGAST #1639) and the bytes in *out.
+fn primitive_arg_spelling(ty: i32, out: **u8) -> i32
+    if ty == TYPE_U8
+        *out = c"u8"
+        return 2
+    if ty == TYPE_I8
+        *out = c"i8"
+        return 2
+    if ty == TYPE_I32
+        *out = c"i32"
+        return 3
+    if ty == TYPE_I64
+        *out = c"i64"
+        return 3
+    if ty == TYPE_U64
+        *out = c"u64"
+        return 3
+    *out = null
+    return 0
+
+# Mangle the pointer type that just parsed as ritz0 does (monomorph.py
+# mangle_type_name): "ptr_" per level, then the pointee's spelling — a
+# primitive's name or the struct/generic name in last_type_name.  `*u8` is
+# "ptr_u8", `**Foo` "ptr_ptr_Foo".  type_ptr records only the immediate and
+# the innermost pointee, so depth is exact up to two levels; a deeper
+# pointer spells as "" (clang then rejects the IR loudly).
+fn spell_ptr_generic_arg(p: *Parser, ty: i32, out_len: *i32) -> *u8
+    var depth: i32 = 1
+    if ty == TYPE_PTR_PTR
+        if p.last_pointee_type != TYPE_PTR
+            *out_len = 0
+            return null
+        depth = 2
+    let inner: i32 = p.last_inner_pointee_type
+    var base: *u8 = null
+    var base_len: i32 = 0
+    if inner == TYPE_STRUCT
+        base = p.last_type_name
+        base_len = p.last_type_name_len
+    else
+        base_len = primitive_arg_spelling(inner, @base)
+    if base_len <= 0
+        *out_len = 0
+        return null
+    let total: i32 = depth * 4 + base_len
+    let name: *u8 = parser_alloc(p, (total + 1) as i64)
+    var pos: i32 = 0
+    for d in 0..depth
+        *(name + pos) = 112      # 'p'
+        *(name + pos + 1) = 116  # 't'
+        *(name + pos + 2) = 114  # 'r'
+        *(name + pos + 3) = 95   # '_'
+        pos = pos + 4
+    for i in 0..base_len
+        *(name + pos) = *(base + i)
+        pos = pos + 1
+    *(name + pos) = 0
+    *out_len = pos
+    return name
+
 # Prepend one captured argument to the (possibly null) list of those after it.
 pub fn link_generic_arg(first: *GenericArg, rest: *GenericArg) -> *GenericArg
     first.next = rest
     return first
 
-# Make a captured TYPE_STRUCT argument's name current again, for helpers that
-# read p.last_type_name (type_generic).
-fn restore_generic_arg_name(p: *Parser, ga: *GenericArg)
-    if ga.ty == TYPE_STRUCT
-        p.last_type_name = ga.name
-        p.last_type_name_len = ga.name_len
-
 # Mangled spelling of one argument: the primitive's name, or the captured
-# struct/generic name.  Same coverage as type_generic.  Returns its length and
-# stores the bytes' address in *out.
+# struct/generic/pointer name.  The one speller for generic type annotations,
+# struct literals and generic-call suffixes.  Returns its length and stores
+# the bytes' address in *out.
 fn generic_arg_spelling(ga: *GenericArg, out: **u8) -> i32
-    if ga.ty == TYPE_U8
-        *out = c"u8"
-        return 2
-    if ga.ty == TYPE_I8
-        *out = c"i8"
-        return 2
-    if ga.ty == TYPE_I32
-        *out = c"i32"
-        return 3
-    if ga.ty == TYPE_I64
-        *out = c"i64"
-        return 3
-    if ga.ty == TYPE_STRUCT
+    if ga.ty == TYPE_STRUCT or ga.ty == TYPE_PTR or ga.ty == TYPE_PTR_PTR
         *out = ga.name
         return ga.name_len
-    *out = null
-    return 0
+    return primitive_arg_spelling(ga.ty, out)
 
 # Mangle `base<a1, a2, ...>` as "base$a1$a2..." (AGAST #1574), from the
 # captured argument list.  Returns an arena-allocated, NUL-terminated name
@@ -1446,59 +1495,6 @@ pub fn type_generic_with_saved(p: *Parser, base_name: *u8, base_len: i32, ga: *G
     var len: i32 = 0
     p.last_type_name = mangle_generic_args(p, base_name, base_len, ga, @len)
     p.last_type_name_len = len
-    return TYPE_STRUCT
-
-# Handle generic type like Vec<u8>
-# Returns TYPE_STRUCT and stores mangled name (e.g., "Vec$u8") in parser state
-pub fn type_generic(p: *Parser, base_name: *u8, base_len: i32, type_arg: i32) -> i32
-    # Allocate space for the mangled name in parser heap
-    # Format: base_name + "$" + type_name (e.g., "Vec$u8")
-    var mangled: *u8 = parser_alloc(p, 64) as *u8
-    var pos: i32 = 0
-
-    # Copy base name
-    for i in 0..base_len
-        *(mangled + pos) = *(base_name + i)
-        pos = pos + 1
-
-    # Add "$" separator
-    *(mangled + pos) = 36  # '$'
-    pos = pos + 1
-
-    # Add type argument name based on type
-    if type_arg == TYPE_U8
-        *(mangled + pos) = 117  # 'u'
-        pos = pos + 1
-        *(mangled + pos) = 56   # '8'
-        pos = pos + 1
-    else if type_arg == TYPE_I8
-        *(mangled + pos) = 105  # 'i'
-        pos = pos + 1
-        *(mangled + pos) = 56   # '8'
-        pos = pos + 1
-    else if type_arg == TYPE_I32
-        *(mangled + pos) = 105  # 'i'
-        pos = pos + 1
-        *(mangled + pos) = 51   # '3'
-        pos = pos + 1
-        *(mangled + pos) = 50   # '2'
-        pos = pos + 1
-    else if type_arg == TYPE_I64
-        *(mangled + pos) = 105  # 'i'
-        pos = pos + 1
-        *(mangled + pos) = 54   # '6'
-        pos = pos + 1
-        *(mangled + pos) = 52   # '4'
-        pos = pos + 1
-    else if type_arg == TYPE_STRUCT
-        # Nested generic or struct type - use the last_type_name
-        for i in 0..p.last_type_name_len
-            *(mangled + pos) = *(p.last_type_name + i)
-            pos = pos + 1
-
-    # Store the mangled name
-    p.last_type_name = mangled
-    p.last_type_name_len = pos
     return TYPE_STRUCT
 
 # =============================================================================
@@ -2480,15 +2476,10 @@ pub fn postfix_generic_call_arg(p: *Parser, ga: *GenericArg, args: *Expr) -> *Po
     let op: *PostfixOp = parser_alloc(p, 80) as *PostfixOp
     op.kind = POSTFIX_CALL
     op.args = args
-    # Reuse type_generic's arg spelling: mangle "" + "$" + arg → "$<arg>".
-    restore_generic_arg_name(p, ga)
-    let saved_name: *u8 = p.last_type_name
-    let saved_len: i32 = p.last_type_name_len
-    type_generic(p, null, 0, ga.ty)
-    op.call_type_suffix = p.last_type_name
-    op.call_type_suffix_len = p.last_type_name_len
-    p.last_type_name = saved_name
-    p.last_type_name_len = saved_len
+    # "" + "$" + arg → "$<arg>", from the same speller as type annotations.
+    var len: i32 = 0
+    op.call_type_suffix = mangle_generic_args(p, null, 0, ga, @len)
+    op.call_type_suffix_len = len
     op.next = null
     return op
 
