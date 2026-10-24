@@ -96,7 +96,7 @@ HAND_WRITTEN_TOKEN_IDS = {
     'EQ': 85, 'NE': 86, 'LT': 87, 'GT': 88, 'LE': 89, 'GE': 90,
     # Assignment/arrows
     'ASSIGN': 95, 'PLUS_EQ': 96, 'MINUS_EQ': 97, 'STAR_EQ': 98, 'SLASH_EQ': 99,
-    'ARROW': 100, 'FAT_ARROW': 101, 'DOTDOT': 102,
+    'ARROW': 100, 'FAT_ARROW': 101, 'DOTDOT': 102, 'DOTDOTEQ': 103,  # AGAST #1530
     # Delimiters
     'LPAREN': 110, 'RPAREN': 111, 'LBRACKET': 112, 'RBRACKET': 113,
     'LBRACE': 114, 'RBRACE': 115,
@@ -172,12 +172,23 @@ class RitzGenerator:
             (50, 59, 'Type keywords'),
             (70, 84, 'Operators'),
             (85, 92, 'Comparison operators'),
-            (95, 102, 'Assignment and arrows'),
+            (95, 109, 'Assignment, arrows and ranges'),
             (110, 115, 'Delimiters'),
             (120, 126, 'Punctuation'),
             (130, 135, 'Identifiers and literals'),
             (140, 141, 'Whitespace'),
         ]
+
+        # AGAST #1530: an ID outside every group used to vanish from
+        # tokens.ritz without a word (DOTDOTEQ = 103 did), while parser.ritz
+        # and lexer_setup_gen.ritz still referenced TOK_<NAME>.
+        ungrouped = [name for tid, name in all_user_toks
+                     if not any(lo <= tid <= hi for lo, hi, _ in groups)]
+        if ungrouped:
+            raise ValueError(
+                f"token ID(s) outside every tokens.ritz group: {', '.join(ungrouped)}. "
+                "Widen a group in RitzGenerator.generate_tokens."
+            )
 
         for lo, hi, label in groups:
             toks_in_group = [(tid, name) for tid, name in all_user_toks if lo <= tid <= hi]

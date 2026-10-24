@@ -44,3 +44,27 @@ def test_generator_fails_on_a_token_with_no_id(tmp_path):
     assert proc.returncode != 0
     assert "BOGUSKW" in proc.stderr
     assert not (out / "parser.ritz").exists()
+
+
+def test_tokens_ritz_defines_every_grammar_token():
+    """AGAST #1530: generate_tokens grouped IDs by hardcoded ranges and
+    silently dropped any outside them (DOTDOTEQ = 103 fell past 95-102), so
+    tokens.ritz lacked TOK_DOTDOTEQ while the parser and lexer used it."""
+    from ritzgen_py.ritz_generator import RitzGenerator
+
+    grammar = parse_grammar_file(str(GRAMMAR))
+    tokens = RitzGenerator(grammar).generate_tokens()
+    missing = [t.name for t in grammar.tokens if f"const TOK_{t.name}: i32 =" not in tokens]
+    assert missing == []
+
+
+def test_generate_tokens_fails_on_an_ungrouped_id(monkeypatch):
+    import pytest
+
+    from ritzgen_py import ritz_generator
+
+    ids = dict(ritz_generator.HAND_WRITTEN_TOKEN_IDS, DOTDOTEQ=200)
+    monkeypatch.setattr(ritz_generator, "HAND_WRITTEN_TOKEN_IDS", ids)
+    gen = ritz_generator.RitzGenerator(parse_grammar_file(str(GRAMMAR)))
+    with pytest.raises(ValueError, match="DOTDOTEQ"):
+        gen.generate_tokens()
