@@ -21,10 +21,10 @@ Repeat until the goal is met:
    `get_conversation_messages(room_id="rz", message_type="chat", since=<last check>)`,
    and queue any REAP whose SHA is not on `origin/main`, not already in the
    scratchpad, and not already superseded by a newer REAP from the same room.
-2. **Fill the free slot.** **1 room** at a time (lowered from 6, then 2: WSL
-   kept going down from OOM with several agents plus their builds and gates
-   running at once). Spawn the next room only after the current one has
-   merged or been paused.
+2. **Fill the free slots.** **At most 2 rooms** at a time (user limit,
+   2026-10-24: 4 parallel rooms kill WSL with OOM from agents plus their
+   builds and gates). Never exceed 2, survey rooms included. Spawn a new
+   room only when a running one has merged or been paused.
    - **Paused rooms come first.** A room whose agent unit is stopped and
      disabled (`systemctl --user disable --now adele-agent@ritz-task-<id>`) but
      whose worktree still exists is paused, not finished. Resume it
