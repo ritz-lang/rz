@@ -726,6 +726,54 @@ fn name_eq(name: *u8, len: i32, target: *u8, target_len: i32) -> i32
     1
 
 # =============================================================================
+# Named syscall builtins (AGAST #1791)
+# =============================================================================
+#
+# ritz0 lowers a bare call to `write`, `read`, `open`, `close` or `nanosleep`
+# to an inline `syscall` (emitter_llvmlite.py, `_emit_syscall`). It tests these
+# names AFTER fn-pointer locals and BEFORE user functions, so a module's own
+# `fn write` never receives a bare `write(..)` call.
+#
+# ritz1 redirects such a call to `@__ritz_builtin_<name>`, a weak_odr body
+# emitted by emit_builtin_syscall_implementations (emitter.ritz). Because the
+# symbol is reserved, it cannot collide with a user's `@write` or libc's.
+
+# 1 if `name` is one of ritz0's named syscall builtins.
+fn is_named_syscall_builtin(name: *u8, len: i32) -> i32
+    if name_eq(name, len, c"write", 5) == 1
+        return 1
+    if name_eq(name, len, c"read", 4) == 1
+        return 1
+    if name_eq(name, len, c"open", 4) == 1
+        return 1
+    if name_eq(name, len, c"close", 5) == 1
+        return 1
+    if name_eq(name, len, c"nanosleep", 9) == 1
+        return 1
+    0
+
+# 1 if this call is lowered as a named syscall builtin: a bare, non-generic
+# call to one of the five names that is not a call through a local (ritz0
+# resolves fn-pointer locals first).
+fn call_is_named_syscall_builtin(s: *EmitterState, e: *Expr) -> i32
+    if e.call_type_suffix_len != 0
+        return 0
+    if is_named_syscall_builtin(e.func_name, e.func_name_len) == 0
+        return 0
+    if find_local(s, e.func_name, e.func_name_len) >= 0
+        return 0
+    1
+
+# The builtin's result type as ritz0 gives it: `open` and `close` are
+# narrowed to i32, the rest are i64.
+fn named_syscall_builtin_type(name: *u8, len: i32) -> i32
+    if name_eq(name, len, c"open", 4) == 1
+        return TYPE_I32
+    if name_eq(name, len, c"close", 5) == 1
+        return TYPE_I32
+    TYPE_I64
+
+# =============================================================================
 # Deduplication Helpers - Track emitted structs/functions to avoid duplicates
 # =============================================================================
 
@@ -2451,6 +2499,9 @@ fn get_expr_type(s: *EmitterState, e: *Expr) -> i32
             return mfield.field_type
         return TYPE_I64  # Default for unknown member access
     else if e.kind == EXPR_CALL
+        # AGAST #1791: the builtin shadows any user fn of the same name.
+        if call_is_named_syscall_builtin(s, e) == 1
+            return named_syscall_builtin_type(e.func_name, e.func_name_len)
         # Look up function return type
         # Build full function name with type suffix if generic
         var full_name: [256]u8

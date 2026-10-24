@@ -1685,7 +1685,23 @@ fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
     # indirect call (AGAST #1671) uses the fn type's signature instead and
     # names no symbol, so it registers no extern.
     var fn_def: *FnDef = icall_sig
-    if icall_sig == null
+    # AGAST #1791: ritz0's named syscall builtins (`write`, `open`, ..).  The
+    # call goes to the reserved weak_odr body @__ritz_builtin_<name>, never
+    # to a user fn of that name (ritz0 tests builtins first).  fn_def stays
+    # null, so the args take the extern path's i64 conversions.
+    var sys_builtin: i32 = 0
+    if call_is_named_syscall_builtin(s, e) == 1   # no local of that name
+        sys_builtin = 1
+        let prefix: *u8 = c"__ritz_builtin_"
+        full_len = 0
+        for i in 0..15
+            full_name[full_len] = *(prefix + i)
+            full_len += 1
+        for i in 0..e.func_name_len
+            full_name[full_len] = *(e.func_name + i)
+            full_len += 1
+        add_extern(s, @full_name[0], full_len)
+    else if icall_sig == null
         add_extern(s, @full_name[0], full_len)
         fn_def = find_fn(s, @full_name[0], full_len)
 
@@ -1702,6 +1718,21 @@ fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
         if ap != null
             ap = ap.next
         arg2 = arg2.next
+
+    # AGAST #1791: ritz0 takes 1 to 3 arguments for any named syscall builtin
+    # and leaves the unused argument registers unset.  Every body takes three,
+    # so pad with zeros (the kernel ignores them).
+    if sys_builtin == 1
+        if arg_count < 1 or arg_count > 3
+            emit_ir_error_begin(s, c"named syscall builtin takes 1 to 3 arguments: '")
+            emit_ir_error_end(s, e.func_name, e.func_name_len)
+        while arg_count < 3
+            let pad: i32 = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, pad)
+            emit_str(s, c" = add i64 0, 0\n")
+            arg_regs[arg_count] = pad
+            arg_count += 1
 
     var ret_type: i32 = TYPE_I64  # Default for unknown functions
     var ret_struct_name: *u8 = null
