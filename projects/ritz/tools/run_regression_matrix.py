@@ -93,9 +93,6 @@ _RITZ1_TWINS = {
         "AGAST #1635 — unspecified ritz0-only `m[k]` sugar for HashMapI64; ritz1 "
         "emits invalid IR",
     # --- grammar / missing features ---
-    "test_level30":
-        "AGAST #1520 — methods of a generic impl (`impl<T> Describable for "
-        "Wrapper<T>`) are never specialized: undefined `Wrapper$i64_describe`",
     "test_level40":
         "AGAST #1620 — `dyn Trait`",
     "test_trait_bounds":

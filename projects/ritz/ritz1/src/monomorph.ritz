@@ -1781,49 +1781,32 @@ fn clone_struct_fields_multi(fields: *StructField, tp: *TypeParam, suffix: *u8, 
 # ============================================================================
 # Find impl block for a generic type and specialize its methods
 
-fn find_generic_impl(m: *Module, type_name: *u8, type_name_len: i32) -> *ImplBlock
-    # Look for impl block with matching type_name prefix (before $)
-    # e.g., for type_name="Vec", find impl with type_name="Vec$T"
-    var ib: *ImplBlock = m.impls
+# AGAST #1520: the parser records an impl's type as its bare name (`Box`
+# for `impl<T> Box<T>` and `impl<T> Drop for Box<T>`; see impl_block in
+# grammars/ritz1.grammar), so a generic impl is one with type params whose
+# type name equals the instantiated struct's base name.  This used to look for
+# a `$` in the impl's type name, which the parser never produces, so no
+# generic impl method was ever specialized.  `start` resumes the search after
+# a previous match: a type can have several generic impls.
+fn find_generic_impl(start: *ImplBlock, type_name: *u8, type_name_len: i32) -> *ImplBlock
+    var ib: *ImplBlock = start
     while ib != null
-        if ib.type_params != null  # Is a generic impl
-            # Find $ in impl block type name
-            var dollar_pos: i32 = -1
-            for i in 0..ib.type_name_len
-                if *(ib.type_name + i) == 36  # '$'
-                    dollar_pos = i
-                    break
-            if dollar_pos > 0
-                # Compare the prefix before $ with our type name
-                if dollar_pos == type_name_len
-                    if memcmp(ib.type_name, type_name, type_name_len as i64) == 0
-                        return ib
+        if ib.type_params != null and ib.type_name_len == type_name_len
+            if memcmp(ib.type_name, type_name, type_name_len as i64) == 0
+                return ib
         ib = ib.next
     return null
 
 fn specialize_impl_methods(m: *Module, type_name: *u8, type_name_len: i32, suffix: *u8, suffix_len: i32)
-    # Find the generic impl block for this type
-    let ib: *ImplBlock = find_generic_impl(m, type_name, type_name_len)
-    if ib == null
-        return  # No generic impl block for this type
+    var ib: *ImplBlock = find_generic_impl(m.impls, type_name, type_name_len)
+    while ib != null
+        specialize_one_impl(m, ib, type_name, type_name_len, suffix, suffix_len)
+        ib = find_generic_impl(ib.next, type_name, type_name_len)
 
-    # Get type parameter from impl block
-    var type_param_name: *u8 = null
-    var type_param_len: i32 = 0
-    if ib.type_params != null
-        type_param_name = ib.type_params.name
-        type_param_len = ib.type_params.name_len
-
-    # Get substitution type from suffix
-    var subst_type_name: *u8 = null
-    var subst_type_len: i32 = 0
-    get_type_name_from_suffix(suffix, suffix_len, @subst_type_name, @subst_type_len)
-    let subst_type: i32 = parse_type_from_suffix(suffix, suffix_len)
-
-    # For each method in the impl block, create a specialized version
+fn specialize_one_impl(m: *Module, ib: *ImplBlock, type_name: *u8, type_name_len: i32, suffix: *u8, suffix_len: i32)
     var method: *FnDef = ib.methods
     while method != null
-        let specialized: *FnDef = specialize_impl_method(m, method, type_name, type_name_len, suffix, suffix_len, type_param_name, type_param_len, subst_type, subst_type_name, subst_type_len)
+        let specialized: *FnDef = specialize_impl_method(m, ib, method, type_name, type_name_len, suffix, suffix_len)
         if specialized != null
             collect_struct_types_from_fn(m, specialized)
             # Add to module's function list
@@ -1836,59 +1819,38 @@ fn specialize_impl_methods(m: *Module, type_name: *u8, type_name_len: i32, suffi
                 f.next = specialized
         method = method.next
 
-fn specialize_impl_method(m: *Module, method: *FnDef, type_name: *u8, type_name_len: i32, suffix: *u8, suffix_len: i32, type_param: *u8, type_param_len: i32, subst_type: i32, subst_name: *u8, subst_len: i32) -> *FnDef
-    # Build mangled method name: TypeName$suffix_methodName
-    # e.g., Vec$u8_get_len
-    let mangled_type_len: i32 = type_name_len + suffix_len
-    let mangled_name_len: i32 = mangled_type_len + 1 + method.name_len  # Type$suffix_method
-    let mangled_name: *u8 = malloc(mangled_name_len as i64 + 1) as *u8
+# Specialise one method of generic impl `ib` at `suffix`.  The method is
+# specialised exactly as a generic fn whose type params are the impl's
+# (clone_and_specialize_function: a `T` return becomes the argument, `*W<T>`
+# becomes `*W$i32`, and multi-parameter impls are handled), then renamed to
+# the method mangling `Type$suffix_method` (e.g. `Box$i64_set`).
+fn specialize_impl_method(m: *Module, ib: *ImplBlock, method: *FnDef, type_name: *u8, type_name_len: i32, suffix: *u8, suffix_len: i32) -> *FnDef
+    let template: *FnDef = malloc(sizeof(FnDef)) as *FnDef
+    memcpy(template as *u8, method as *u8, sizeof(FnDef))
+    template.type_params = ib.type_params
+    let specialized: *FnDef = clone_and_specialize_function(m, template, suffix, suffix_len)
+    free(template as *u8)
+    if specialized == null
+        return null
 
+    let mangled_name_len: i32 = type_name_len + suffix_len + 1 + method.name_len
+    let mangled_name: *u8 = malloc(mangled_name_len as i64 + 1) as *u8
     var pos: i32 = 0
-    # Copy type name
     for i in 0..type_name_len
         *(mangled_name + pos) = *(type_name + i)
         pos = pos + 1
-    # Copy suffix (e.g., "$u8")
     for j in 0..suffix_len
         *(mangled_name + pos) = *(suffix + j)
         pos = pos + 1
-    # Add underscore separator
     *(mangled_name + pos) = 95  # '_'
     pos = pos + 1
-    # Copy method name
     for k in 0..method.name_len
         *(mangled_name + pos) = *(method.name + k)
         pos = pos + 1
-    *(mangled_name + pos) = 0  # Null terminate
-
-    # Clone the function with specialized name and body
-    let specialized: *FnDef = malloc(sizeof(FnDef)) as *FnDef
+    *(mangled_name + pos) = 0
     specialized.name = mangled_name
     specialized.name_len = mangled_name_len
-    specialized.line = method.line
-
-    # Specialize return type
-    specialized.return_type = substitute_type(method.return_type, type_param, type_param_len, subst_type, subst_name, subst_len)
-    if method.return_type == TYPE_STRUCT and method.return_type_name != null
-        # Substitute type name if needed
-        substitute_type_param_in_name(method.return_type_name, method.return_type_name_len, type_param, type_param_len, suffix, suffix_len, @specialized.return_type_name, @specialized.return_type_name_len)
-    else
-        specialized.return_type_name = method.return_type_name
-        specialized.return_type_name_len = method.return_type_name_len
-
-    # Clone and specialize parameters (with suffix for pointer-to-struct substitution)
-    specialized.params = clone_params_with_suffix(method.params, type_param, type_param_len, subst_type, subst_name, subst_len, suffix, suffix_len)
-
-    # Clone and specialize body
-    specialized.body = clone_body(method.body, type_param, type_param_len, subst_type, subst_name, subst_len, suffix, suffix_len)
-
-    # Clear type params (not generic anymore)
-    specialized.type_params = null
-    specialized.next = null
-    # AGAST #194: see clone_and_specialize_function — same rationale.
-    specialized.is_local = 1
-
-    return specialized
+    specialized
 
 # ============================================================================
 # Main Monomorphization Entry Point
