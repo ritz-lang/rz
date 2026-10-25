@@ -80,7 +80,7 @@ The problems are structural:
 ## Dead modules (no production importers in `projects/*`)
 - **No importers at all:** `async.ritz`, `heap.ritz`, `crt0.ritz` (whose own comment at `:73` says it contains no code), `entry.ritz` (`build.py:55-57` links `ritz_start*.o` instead).
 - **Test-only, with green tests:** `async/*`, `meta.ritz`, `lang/lexer`, `lang/tokens`, `timer`.
-- **Not dead, even though nothing imports it:** `testing.ritz`, which ritz0 injects (`emitter_llvmlite.py:12406`).
+- **Corrected 2026-10-25 (packages.md):** `testing.ritz` was listed here as "not dead, ritz0 injects it" (`emitter_llvmlite.py:12406`). That injection only happens via `--emit-test-main`, which calls the undefined `run_tests_array` (`:12429`); only a golden test uses `testing.ritz`. It is effectively dead; #1868 replaces it.
 
 ## Documentation claims that are false (prose, outside the compile gate)
 - **README:**
