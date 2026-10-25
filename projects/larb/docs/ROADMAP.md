@@ -1,206 +1,37 @@
-# Ritz Ecosystem Roadmap
+# Ritz Ecosystem Roadmap: superseded
 
-## Open Issues & Priorities
+**This file was retired on 2026-10-25 by the LARB retrospective (AGAST #1800).**
 
-### Critical Path: Self-Hosting Compiler
+The one current roadmap is
+[`projects/ritz/docs/ROADMAP.md`](../../ritz/docs/ROADMAP.md), in the section
+"The destination, and the tracks that get there". It holds structure only:
+epics, milestones and their definitions of done, each with an AGAST ID. Status
+lives in AGAST and in the commands that roadmap cites.
 
-The primary goal is achieving a **self-hosting Ritz compiler** (ritz1 compiles itself).
+The previous contents were written on 2026-02-15 and never updated. By October,
+almost every row was stale:
 
-| Issue | Description | Status | Blocker |
-|-------|-------------|--------|---------|
-| #72 | Complete ritz1 bootstrap | Open | Monomorphization |
-| - | ritz1 monomorphization | Blocked | Core blocker |
-| #62 | Compiler pipeline diagrams | Open | Documentation |
-| #60 | Improve compiler diagnostics | Open | Quality of life |
-| #71 | Standardize 4-space indentation | Open | Code quality |
+- **Self-hosting:** listed as blocked on monomorphization. In fact ritz1 self-hosts, and regression.sh Stage 5 asserts the fixed point.
+- **DWARF:** listed as open. ritz0 already emits it.
+- **Squeeze:** dynamic Huffman listed as open, but it is implemented (`squeeze/lib/deflate.ritz`).
+- **ritzunit:** filters listed as open, but they are implemented (`ritzunit/src/filter.ritz`).
+- **cryptosec:** the TLS 1.3 handshake listed as open, but it is implemented (`cryptosec/lib/tls13_client.ritz`).
+- **Kernel track:** it never mentioned harland, the kernel track, EC2 or inline `asm`.
 
-### Open Feature Requests
+Git keeps the old text (`git show 7eedf4f:projects/larb/docs/ROADMAP.md`).
 
-| Issue | Description | Priority | Effort |
-|-------|-------------|----------|--------|
-| #107 | RFC: Package Distribution & Shared Libraries | High | Large |
-| #101 | Compile-time function evaluation (comptime) | Medium | Large |
-| #100 | RFC: Parameterized Tests | Medium | Medium |
-| #95 | Const struct literals at module level | Low | Small |
+## Items carried forward
 
----
+These feature ideas from the old file still have no home in a track. They are
+parked, not dropped. Each one goes into AGAST when a track depends on it.
 
-## Phase Priorities
-
-### Phase 1: Self-Hosting (Highest Priority)
-
-**Goal:** ritz1 can compile itself
-
-1. **Fix ritz1 monomorphization** - Generic instantiation in self-hosted compiler
-2. **Complete type checker in ritz1** - Full type inference and checking
-3. **Bootstrap validation** - 4-stage regression test (ritz0 → ritz1 → ritz1' → diff)
-
-**Acceptance Criteria:**
-- ritz1 compiles ritz1 producing identical output
-- All 324 language tests pass with ritz1-compiled ritz1
-- Performance within 2x of ritz0
-
-### Phase 2: LSP Server (High Priority)
-
-**Goal:** Language server for IDE support
-
-See [LSP_REQUIREMENTS.md](LSP_REQUIREMENTS.md) for full specification.
-
-Key features:
-- Go to definition
-- Find references
-- Hover information
-- Completions
-- Diagnostics
-- Rename
-
-### Phase 3: Package Ecosystem (Medium Priority)
-
-**Goal:** Robust dependency management
-
-1. **RFC #107 Phase 3:** Shared library support (.so/.dylib)
-2. **Central registry:** Package discovery and versioning
-3. **Build caching:** Content-addressed remote cache
-
-### Phase 4: Tooling (Medium Priority)
-
-**Goal:** Developer productivity
-
-1. **Formatter:** Automatic code formatting (`ritz fmt`)
-2. **Documentation generator:** API docs from source
-3. **Debugger integration:** DWARF debug info (#51)
-
-### Phase 5: Performance (Lower Priority)
-
-**Goal:** Production-ready performance
-
-1. **Incremental compilation:** Only recompile changed modules
-2. **Parallel compilation:** Multi-threaded module compilation
-3. **Better codegen:** LLVM optimization tuning
-
----
-
-## Recently Completed
-
-### February 2026
-
-- ✅ RFC #107 Phase 2: Lock files and vendoring
-- ✅ RFC #107 Phase 1: Global install system
-- ✅ Build System Phase 3: LLVM BC caching (3.4x speedup)
-- ✅ #112: Add pub to all ritzlib public functions
-- ✅ #111: Non-pub functions get internal linkage
-- ✅ #110: Fix debug info crash with IntLit array sizes
-- ✅ #109: Build system with ritz.toml
-- ✅ #108: AVX2 256-bit SIMD support
-- ✅ #106: BitOps intrinsics for primitive types
-- ✅ #105: Const expressions in array size
-- ✅ #104: @inline attribute
-- ✅ #103: static_assert
-- ✅ #102: SIMD types and intrinsics
-- ✅ #99: Qualified import resolution
-- ✅ #98: Struct array member comparison fix
-- ✅ #97: Bit manipulation trait methods
-
-### January 2026
-
-- ✅ Testing framework integration (ritzunit)
-- ✅ External runtime linking
-- ✅ Examples reorganization (5 tiers)
-- ✅ Grammar-driven parser
-- ✅ Native string literals
-- ✅ Async/await improvements
-- ✅ Phase 14: Process library
-- ✅ Phase 12: Valet HTTP server (1.47M req/sec)
-
----
-
-## Project-Specific Roadmaps
-
-### Ritz Compiler
-
-| Priority | Task | Issue |
-|----------|------|-------|
-| P0 | ritz1 monomorphization | #72 |
-| P0 | ritz1 type checker | #72 |
-| P1 | Improved diagnostics | #60 |
-| P1 | DWARF debug info | #51 |
-| P2 | Comptime evaluation | #101 |
-
-### Ritzunit
-
-| Priority | Task |
-|----------|------|
-| P1 | Filter expressions (glob patterns) |
-| P1 | Attribute filters (@ignore, @slow) |
-| P2 | Parallel test execution |
-| P2 | JUnit XML output |
-
-### Squeeze
-
-| Priority | Task |
-|----------|------|
-| P1 | Dynamic Huffman encoding |
-| P2 | Lazy matching |
-| P2 | Runtime CPU detection |
-
-### Valet
-
-| Priority | Task |
-|----------|------|
-| P0 | TLS 1.3 handshake |
-| P1 | HTTP/2 support |
-| P2 | WebSocket support |
-
-### Cryptosec
-
-| Priority | Task |
-|----------|------|
-| P0 | TLS 1.3 handshake state machine |
-| P1 | Certificate chain validation polish |
-| P2 | AES-NI acceleration |
-
----
-
-## New Project: LSP Server
-
-A new project `ritz-lsp` should be created to provide IDE support.
-
-See [LSP_REQUIREMENTS.md](LSP_REQUIREMENTS.md) for detailed requirements.
-
-**Initial Scope:**
-- Diagnostics (errors, warnings)
-- Go to definition
-- Hover for type information
-- Basic completions
-
----
-
-## Contribution Guidelines
-
-### For LARB
-
-- Design discussions in GitHub Issues
-- RFCs for significant changes
-- Update specs when features land
-
-### For Code Projects
-
-- Follow TDD methodology
-- Add tests before implementation
-- Update project TODO.md/DONE.md
-- Use conventional commit messages
-
-### Commit Message Format
-
-```
-<project>: <emoji> <description>
-
-* Details if needed
-```
-
-Emojis:
-- 🤖 AI-assisted
-- 🐛 Bug fix
-- ✨ New feature
-- 📝 Documentation
-- ♻️ Refactor
+| Idea | Old reference | Where it would land |
+|---|---|---|
+| Package distribution and shared libraries (RFC) | GH #107 | Tooling epic #1833, after the manifest schema (#1837) |
+| Compile-time function evaluation (comptime) | GH #101 | Track 1, M1.2 (#1829), as a language decision |
+| Parameterized tests (RFC) | GH #100 | Track 1, M1.2 (#1829) |
+| Const struct literals at module level | GH #95 | Track 1, M1.2 (#1829). Check first whether it already works. |
+| LSP: completion, diagnostics, references (definition and hover exist in `projects/ritz-lsp`) | Phase 2 | Parked. Resumes after M1.4 (#1831), when ritz1 is the compiler to embed. |
+| `rz fmt`, doc generator | Phase 4 | Tooling epic #1833 |
+| Compiler performance (incremental, parallel) | Phase 5 | Track 0, epic #1801 (fast iteration) |
+| ritzunit parallel execution, JUnit XML; squeeze lazy matching; valet HTTP/2 and WebSocket; cryptosec AES-NI | Project tables | Parked with PHASE 8 (#50) |

@@ -4,8 +4,9 @@
 **Method:** `INSTRUCTIONS_v4.md`, read-only (no builds were permitted). Scope:
 `projects/ritz/ritz1/src` (23 files, 34,760 lines, 25,641 SLOC, 758 functions),
 plus the generator and grammar. Each finding was checked against the code by
-the reviewer before it was written down. Claims that need a build to confirm are marked
-**(unconfirmed)**, and their tickets start with a red test.
+the reviewer before it was written down. Builds became available partway through. The
+suspected bugs were then re-run as differential repros (ritz0 vs ritz1, from
+main `30815af`), and each result is marked **Confirmed** or **Not reproduced**.
 
 ## Summary
 
@@ -37,16 +38,22 @@ though ritz0 implements it. One is a parity gap: ritz1 payload enums.
   `:295/:743/:1418`). That is the table whose saturation caused #1325.
 - `ptr.field[i] = v` parses (`parser_gen.ritz:4892` → `STMT_MEMBER_INDEX_ASSIGN`,
   `ast_helpers.ritz:1767`), but no emitter arm handles it. `emit_stmt`'s
-  default arm writes `; TODO: statement kind N` (`emitter_stmt.ritz:2948-2951`)
-  and the compile succeeds **(unconfirmed)**.
+  default arm writes `; TODO: statement kind N` (`emitter_stmt.ritz:2948-2951`).
+  **Not reproduced** for `p.a[2] = 7` through `var p: *S` (it takes another
+  alternative). The input that reaches alternative a9 still needs finding.
 - A tab in indentation: `lexer_handle_indent` returns `TOK_ERROR` without
   advancing (`lexer_nfa.ritz:332-334`), and `tokenize` loops on it
-  (`main.ritz:120-145`), so it probably never terminates **(unconfirmed)**.
+  (`main.ritz:120-145`). **Confirmed:** ritz1 never terminates and prints
+  "Lexer error at line 2, column 1" until it is killed; ritz0 reports one located error.
   `indent_stack[64]` has no bound, and `MAX_INDENT_DEPTH` is unused (`:33`, `:361`).
 - `find_fn/find_struct/find_global` treat an fnv1a collision as "not found"
   (`emitter_core.ritz:580-625`).
 
 ### F2. Eleven type tables that disagree [cleanup] — Critical → #1814
+**Confirmed:** for `struct S { a: [4]u16, b: i64 }`, ritz0 emits `{[4 x i16], i64}`
+while ritz1 emits `{[4 x i64], i64}` (40 bytes), even though ritz1's own
+`sizeof(S)` is 16. The two compilers disagree on the struct's layout, and a
+heap struct allocated by `sizeof` gets overflowed.
 - A `[N]u16` struct field is declared `[N x i64]`: the array-element ladder in
   `emit_field_llvm_type` has no u16/i16/u32 arm (`emitter_core.ritz:2620-2638`).
 - The same field is sized 2N by `get_struct_size_by_name` (`:2000-2062`).
@@ -113,12 +120,13 @@ The grammar and generator problems:
 
 ### F8. The compiler works around its own miscompiles [language-gap: compiler bugs] — Major → #1815
 - **Pointer arithmetic:** `(p + a) + b` gets no stride scaling on the second `+` (`nfa.ritz:228-234`).
+  **Not reproduced** today: both compilers return 42 for `(p + 1) + 1`. The workaround is probably stale.
 - **Store width:** the `*i32` store width at `main.ritz:109`.
 - **Compound dereference:** a compare and read-modify-write quirk, worked around three times in `ast_helpers.ritz:3067-3124`.
 - **Field access:** `(*a.b).c` (`lexer_nfa.ritz:510`).
 - **Possibly stale:** a PHI workaround (`fn_cache.ritz:658`).
 
-Under No Concessions these are compiler bugs that every user hits.
+Under No Concessions, each of these is either a compiler bug that every user hits or stale code that should be deleted.
 
 ### F9. Runtime NFA lexer [generator] — Minor → #1821
 The lexer is rebuilt from regex strings for every file and every placeholder, using about 557 KB of stack, and it matches by recursive backtracking. Its tie-break rule contradicts the file header. The escape cooker is copied three times. `lexer_next` has CC 98 and nests 14 deep.
@@ -164,7 +172,7 @@ Epic **#1812**. Ordered: correctness → language → architecture → cleanup.
 |---|---|---|
 | #1813 | 80 | F1: silent capacity drops, unhandled statement kind, tab hang, hash collisions |
 | #1814 | 80 | F2: one TypeRef and one type table (`[N]u16` layout bug) |
-| #1815 | 80 | F8: pointer-stride and other miscompiles worked around in ritz1's source |
+| #1815 | 60 | F8: workarounds in ritz1's source (pointer stride not reproduced; each needs proof or removal) |
 | #1807 | 90 | F10: stale-IR cache (fast-iteration epic #1801) |
 | #1824 | 70 | Language: format into a buffer |
 | #1825 | 70 | Language: specify `asm`, port it to ritz1, move the syscall shims into ritzlib |

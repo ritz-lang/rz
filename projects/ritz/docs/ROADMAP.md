@@ -79,6 +79,53 @@ Layers above 0 are deliberately not decomposed here. Decomposing work that is no
 about to start is how the previous roadmap filled up with phases that were
 obsolete before anyone read them.
 
+## The destination, and the tracks that get there
+
+*Reconciled by LARB, 2026-10 (AGAST #1800). This section supersedes
+`projects/larb/docs/ROADMAP.md`. It names epics and milestones and states what
+"done" means for each. Their status lives only in AGAST, under the IDs given.*
+
+**Destination:** a language written in itself, used to build a kernel (harland)
+that boots under QEMU, on AWS EC2 (Nitro), and on a laptop. In February 2026 a
+proof of concept built by ritz0 booted harland under QEMU with userland. It
+probably also reached serial output on an EC2 t3.micro. No log of the EC2 run
+survives. Since then, the language was reworked underneath it, and the kernel
+was neither gated nor built by ritz1. The tracks below
+reconnect them.
+
+| Track | AGAST | Done when |
+|---|---|---|
+| **0. Fast iteration** | epic #1801 | A smoke tier catches "fully broken" in ≤ 2 min; the full gate takes ≤ 12 min uncontended; every module is compiled once per (content, compiler, flags). Design: `projects/larb/review/4/fast-iteration.md`. This track goes first, because every other track pays for the gate. |
+| **1. Self-hosted language** | epic #46 | ritz1 is *the* compiler, and ritz0 is only used for bootstrap. |
+| &nbsp;&nbsp;M1.1 ritz1 parity | #1828 | `regression-known-failures-ritz1.txt` and the matrix's ritz1 expected-failures are empty, and every package that builds under ritz0 builds under ritz1. |
+| &nbsp;&nbsp;M1.2 One language | #1829 | The spec, ritz0 and ritz1 agree. Every ritz0-only feature (asm, closures, `dyn`, trait bounds, …) is either specified and ported, or removed. Ownership and Drop are decided. ritz0's type checker is on by default. |
+| &nbsp;&nbsp;M1.3 Structural quality | #1830 → #1812 | The LARB v4 compiler findings are closed: a sema phase, a typed IR builder, one type table, no silent capacity limits. |
+| &nbsp;&nbsp;M1.4 ritz1 by default | #1831 | `rz` builds with ritz1. ritz0 only builds stage-1 and acts as the differential oracle. |
+| **2. Kernel: harland boots** | epic #48 | |
+| &nbsp;&nbsp;M2.1 Recover and gate the POC | #1839 | The unmerged `origin/harland-main` work has landed, and a QEMU/OVMF boot test in CI asserts serial output plus Tier-1 userland. |
+| &nbsp;&nbsp;M2.2 ritz1 builds the kernel | #1840 | Inline `asm`, `[[packed]]` and `[[naked]]` work in ritz1. harland and indium build with ritz1, and the boot gate passes for the ritz1-built image. |
+| &nbsp;&nbsp;M2.3 Boots on AWS EC2 | #1841 | An AMI from the pipeline boots on Nitro to rzsh with a captured serial log. The kernel has its own NVMe driver reading EBS. ENA gets a DHCP lease. MSI-X and the timer are on. |
+| &nbsp;&nbsp;M2.4 Boots on a laptop | #1842 | One named model boots to an interactive rzsh on the framebuffer, using its own keyboard and storage. |
+| &nbsp;&nbsp;M2.5 Capability model | #1843 | The capability-handle security design (`projects/larb/docs/CAPABILITY_SPEC.md`) is enforced, not just declared. |
+| **3. Standard library** | epic #47 | Ownership and Drop are decided and behave identically under both compilers. There is one async runtime and one byte/string view. Integer formatting is correct. A freestanding core builds for harland. |
+| **Tooling** | epic #1833 | One import resolver, one known-failures format, `build.py` split, dead tooling removed. |
+
+**Ordering.** Track 0 comes first. After that, M1.1 and M2.1 can run in
+parallel: M2.1 uses ritz0 and does not wait for the language. M2.2 needs M1.2's
+`asm` decision (#1825) and the type table (#1814). M2.3 needs M2.1. M1.4 needs
+M1.1 and M1.2. The dependency edges are in AGAST and are the authority.
+
+**Parked.** These are not on the path to the destination. They resume only
+when they become a dependency of a track above:
+- PHASE 7: goliath, prism, angelo (#49)
+- PHASE 8: infrastructure packages (#50)
+- PHASE 9: browser stack (#51)
+- PHASE 10: self-development (#52)
+- the virtualization proposal (`projects/harland/docs/LARB_PROPOSAL_VIRTUALIZATION.md`)
+
+Their packages stay in the build and test gates so they don't rot. No new
+feature work goes to them by default.
+
 ### What "done" means for a layer
 
 A layer is complete when all four hold:
