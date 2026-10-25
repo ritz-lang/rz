@@ -127,6 +127,29 @@ for _key, _reason in _ALL_COMPILERS.items():
         EXPECTED_FAILURES[(_c, _key)] = _reason
 
 
+def ritz1_make_jobs():
+    """-j level for building ritz1: RITZ1_JOBS, else min(nproc, 8) (AGAST #1802).
+
+    Mirrors scripts/ritz1-jobs.sh, which explains why it is a cap.  An empty,
+    zero or non-numeric override falls back to the default.
+    """
+    raw = os.environ.get("RITZ1_JOBS", "")
+    if raw.isdigit() and int(raw) > 0:
+        return int(raw)
+    return min(8, os.cpu_count() or 1)
+
+
+def rebuild_ritz1(env):
+    """`make -jN -C ritz1 bootstrap`; returns make's exit code.
+
+    A no-op when the gate already ran `make ritz1-bootstrap` -- make decides.
+    """
+    ritz1_dir = RITZ_ROOT / "ritz1"
+    return subprocess.run(
+        ["make", f"-j{ritz1_make_jobs()}", "-C", str(ritz1_dir), "bootstrap"],
+        env=env, timeout=600).returncode
+
+
 def matrix_outcome(compiler, results, expected):
     """Classify one compiler's results against the expected-failure list.
 
@@ -669,11 +692,9 @@ def main():
 
     if args.rebuild:
         print("# Rebuilding ritz1 + ritz1_selfhosted...", flush=True)
-        ritz1_dir = RITZ_ROOT / "ritz1"
-        r = subprocess.run(["make", "-C", str(ritz1_dir), "bootstrap"],
-                           env=env, timeout=600)
-        if r.returncode != 0:
-            print(f"FATAL: make bootstrap failed (rc={r.returncode})")
+        rc = rebuild_ritz1(env)
+        if rc != 0:
+            print(f"FATAL: make bootstrap failed (rc={rc})")
             return 3
 
     compilers = []

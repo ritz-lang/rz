@@ -42,6 +42,15 @@ venv. `--with-setup` includes them. Skipped steps are PRINTED, not silently
 dropped -- a runner that quietly omits work is the thing this file exists to
 prevent.
 
+Every step prints `[<step>] START <iso>` and `[<step>] END <iso> <secs>s rc=<n>`,
+and the run ends with a timing table (AGAST #1802): before this, every gate
+baseline had to be reconstructed from log timestamps.
+
+`--fail-fast` stops at the first failing step and names the steps it did not
+run. The gate runner (`run-gate.sh`) turns it on, so a broken ritz1 costs
+minutes rather than the whole gate. Without it every step runs, matching CI's
+per-step reporting.
+
 Exit code: 0 only if every step it ran exited 0.
 """
 
@@ -50,6 +59,8 @@ from __future__ import annotations
 import argparse
 import subprocess
 import sys
+import time
+from datetime import datetime
 from pathlib import Path
 
 import yaml
@@ -118,6 +129,31 @@ def jobs_in(steps: list[Step]) -> list[str]:
     return seen
 
 
+def _now() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def timed_step(step: Step, dry_run: bool = False) -> tuple[int, float]:
+    """Run one step between START/END lines; return (rc, seconds)."""
+    print(f"[{step.name}] START {_now()}", flush=True)
+    t0 = time.monotonic()
+    rc = run_step(step, dry_run=dry_run)
+    secs = time.monotonic() - t0
+    print(f"[{step.name}] END {_now()} {secs:.1f}s rc={rc}", flush=True)
+    return rc, secs
+
+
+def print_timings(timings: list[tuple[str, float, int]]) -> None:
+    if not timings:
+        return
+    width = max(len(n) for n, _, _ in timings)
+    print("step timings:")
+    for name, secs, rc in timings:
+        print(f"  {name:<{width}}  {secs:8.1f}s  rc={rc}")
+    total = sum(secs for _, secs, _ in timings)
+    print(f"  {'total':<{width}}  {total:8.1f}s")
+
+
 def run_step(step: Step, dry_run: bool = False) -> int:
     cwd = (REPO_ROOT / step.workdir).resolve()
     print(f"\n{'=' * 70}", flush=True)
@@ -146,6 +182,8 @@ def main(argv: list[str] | None = None) -> int:
                    help="print each command instead of running it")
     p.add_argument("--with-setup", action="store_true",
                    help="also run toolchain/dependency install steps")
+    p.add_argument("--fail-fast", action="store_true",
+                   help="stop at the first failing step (the gate's default)")
     args = p.parse_args(argv)
 
     if not WORKFLOW.is_file():
@@ -175,17 +213,29 @@ def main(argv: list[str] | None = None) -> int:
 
     failures: list[str] = []
     skipped: list[str] = []
+    not_run: list[str] = []
+    timings: list[tuple[str, float, int]] = []
     for s in steps:
         if s.job not in selected:
             continue
         if s.is_setup and not args.with_setup:
             skipped.append(f"[{s.job}] {s.name}")
             continue
-        rc = run_step(s, dry_run=args.dry_run)
+        if failures and args.fail_fast:
+            not_run.append(f"[{s.job}] {s.name}")
+            continue
+        rc, secs = timed_step(s, dry_run=args.dry_run)
+        timings.append((s.name, secs, rc))
         if rc != 0:
             failures.append(f"[{s.job}] {s.name} (exit {rc})")
 
     print(f"\n{'=' * 70}")
+    print_timings(timings)
+    if not_run:
+        # Named, never silent: a fail-fast run asserts less than a full one.
+        print("not run (--fail-fast stopped after the first failure):")
+        for s in not_run:
+            print(f"  - {s}")
     if skipped:
         # Printed, never silent: see the module docstring.
         print("skipped (environment setup; --with-setup to include):")

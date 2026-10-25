@@ -13,7 +13,7 @@
 #   make build-<name>  - Build a specific package
 #   make test-<name>   - Build and test a specific package
 
-.PHONY: all test unit ritz ritz1 build clean list help valgrind regression regression-quick check-no-s-strings matrix matrix-full matrix-quick regen-check
+.PHONY: all test unit ritz ritz1 ritz1-bootstrap build clean list help valgrind regression regression-quick check-no-s-strings matrix matrix-full matrix-quick regen-check
 
 PYTHON ?= python3
 VALGRIND ?= valgrind --error-exitcode=1 --leak-check=full -q
@@ -22,6 +22,11 @@ VALGRIND ?= valgrind --error-exitcode=1 --leak-check=full -q
 # This allows 'import ritzlib.sys' to resolve to $(ROOT)/ritzlib/sys.ritz
 ROOT := $(shell pwd)
 export RITZ_PATH := $(ROOT)
+
+# -j level for every ritz1 build (AGAST #1802): RITZ1_JOBS, else min(nproc, 8).
+# The #1659 .d files make -j safe; a cold bootstrap goes 278 s -> 101 s with
+# byte-identical binaries.  See scripts/ritz1-jobs.sh for why it is a cap.
+RITZ1_J := $(shell RITZ1_JOBS='$(RITZ1_JOBS)' sh scripts/ritz1-jobs.sh)
 
 all: test
 
@@ -129,7 +134,15 @@ ritz:
 # directory would satisfy `make ritz1` and it would report "Nothing to be done".
 ritz1:
 	@echo "=== Building ritz1 ==="
-	@$(MAKE) -C ritz1 ritz1
+	@$(MAKE) -j$(RITZ1_J) -C ritz1 ritz1
+
+# Build ritz1 AND ritz1_selfhosted once, in parallel (AGAST #1802).  main.yml
+# runs this before pytest, so the ~80 module fixtures that `make -C ritz1 ritz1`
+# find it current instead of racing a cold serial build, and matrix-full and
+# regression.sh Stage 4 reuse both binaries.
+ritz1-bootstrap:
+	@echo "=== Building ritz1 + ritz1_selfhosted (-j$(RITZ1_J)) ==="
+	@$(MAKE) -j$(RITZ1_J) -C ritz1 bootstrap
 
 # Build and test all examples (always runs)
 .PHONY: examples
@@ -238,7 +251,7 @@ regen-check:
 # Internal: ensure ritz1 binary is up-to-date before running the matrix.
 .PHONY: _matrix_ritz1_built
 _matrix_ritz1_built:
-	@$(MAKE) -C ritz1 ritz1 >/dev/null 2>&1 || $(MAKE) -C ritz1 ritz1
+	@$(MAKE) -j$(RITZ1_J) -C ritz1 ritz1 >/dev/null 2>&1 || $(MAKE) -j$(RITZ1_J) -C ritz1 ritz1
 
 # Regression test suite (all tiers)
 regression:
@@ -256,7 +269,8 @@ help:
 	@echo "  make test     - Same as above"
 	@echo "  make unit     - Run Python unit tests (ritz0)"
 	@echo "  make ritz     - Run .ritz language tests (test levels)"
-	@echo "  make ritz1    - Build the ritz1 compiler (make -C ritz1 ritz1)"
+	@echo "  make ritz1    - Build the ritz1 compiler (make -j -C ritz1 ritz1)"
+	@echo "  make ritz1-bootstrap - Build ritz1 + ritz1_selfhosted in parallel (RITZ1_JOBS caps -j)"
 	@echo "  make examples - Build and test example packages"
 	@echo "  make build    - Build all examples (no tests)"
 	@echo "  make list     - List all packages"

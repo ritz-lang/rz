@@ -923,7 +923,7 @@ run_stage2() {
 
     # Build ritz1 using the Makefile (it has its own build/ dir)
     local make_output
-    make_output=$(make ritz1 2>&1)
+    make_output=$(make -j"$(sh "$SCRIPT_DIR/ritz1-jobs.sh")" ritz1 2>&1)
     local make_status=$?
 
     if [[ $make_status -eq 0 ]]; then
@@ -1034,6 +1034,31 @@ run_stage3() {
     return 0
 }
 
+# --- Per-stage timing (AGAST #1802) -----------------------------------------
+# Nobody could say where the gate's time went: every baseline in the
+# fast-iteration review had to be reconstructed from log timestamps.  Each
+# stage the suite runs goes through run_timed, and the Summary prints the list.
+STAGE_TIMES=()
+
+# Args: $1=label, rest=command.  Returns the command's exit code.
+run_timed() {
+    local label="$1"; shift
+    local t0=$SECONDS
+    "$@"
+    local rc=$?
+    STAGE_TIMES+=("$label: $((SECONDS - t0))s")
+    return $rc
+}
+
+print_stage_times() {
+    [[ ${#STAGE_TIMES[@]} -eq 0 ]] && return 0
+    echo "Stage timings:"
+    local t
+    for t in "${STAGE_TIMES[@]}"; do
+        echo "  $t"
+    done
+}
+
 # ============================================================================
 # STAGE 4: Self-hosted ritz1 compiles examples, compare with Stage 1
 # ============================================================================
@@ -1044,34 +1069,28 @@ run_stage4() {
     local ritz1_dir="$ROOT_DIR/ritz1"
     local ritz1_selfhosted="$ROOT_DIR/ritz1/build/ritz1_selfhosted"
 
-    # Bootstrap ritz1 (ritz1 compiles itself)
-    cd "$ritz1_dir"
-
-    if make -s bootstrap BUILD_DIR="$BUILD_DIR" 2>/dev/null; then
+    # Make ritz1_selfhosted current, reusing the one matrix-full (or
+    # `make ritz1-bootstrap`) already built -- AGAST #1802.
+    #
+    # This used to be `make -s bootstrap BUILD_DIR="$BUILD_DIR" 2>/dev/null`.
+    # A command-line BUILD_DIR overrides ritz1/Makefile's for every object and
+    # .d file (only build/ritz1 and build/ritz1_selfhosted are hard-coded), so
+    # Stage 4 recompiled all of ritz1 into an empty .regression/, relinked
+    # build/ritz1 mid-run and rebuilt ritz1_selfhosted from scratch: 55 s on
+    # CI, 3-4 min locally, with the build's stderr thrown away.  Now make
+    # decides: the -q probe answers "current" and nothing is built; otherwise
+    # it is an ordinary incremental build in ritz1/build, -j capped by
+    # RITZ1_JOBS, with its output in the log.
+    if make -C "$ritz1_dir" -q build/ritz1_selfhosted 2>/dev/null; then
+        success "ritz1_selfhosted is current; reusing it"
+    elif make -C "$ritz1_dir" -s -j"$(sh "$SCRIPT_DIR/ritz1-jobs.sh")" bootstrap; then
         success "ritz1 self-hosted bootstrap complete"
-        # The bootstrap target ignores BUILD_DIR and always emits into
-        # ritz1/build/.  The old line here copied "$BUILD_DIR/ritz1_selfhosted"
-        # onto $ritz1_selfhosted — the same path — so cp errored, `|| true`
-        # swallowed it, and the -x check below always failed.  Stage 4 has
-        # therefore never run: it announced "bootstrap complete" and then
-        # skipped itself in the same breath.
-        local produced=""
-        for cand in "$ritz1_dir/build/ritz1_selfhosted" \
-                    "$BUILD_DIR/ritz1_selfhosted"; do
-            if [[ -x "$cand" ]]; then produced="$cand"; break; fi
-        done
-        if [[ -n "$produced" && "$produced" != "$ritz1_selfhosted" ]]; then
-            cp "$produced" "$ritz1_selfhosted"
-        fi
     else
-        fail "ritz1 bootstrap failed"
+        fail "ritz1 bootstrap failed (make output above)"
         STAGE_RESULTS+=("Stage 4: FAILED - bootstrap error")
         TOTAL_FAILED=$((TOTAL_FAILED + 1))
-        cd "$ROOT_DIR"
         return 2
     fi
-
-    cd "$ROOT_DIR"
 
     if [[ ! -x "$ritz1_selfhosted" ]]; then
         warn "Self-hosted ritz1 not available"
@@ -1267,16 +1286,21 @@ echo "🎭 Ritz Regression Test Suite"
 echo "======================================"
 echo ""
 
-# Run selected stages
+# Run selected stages.  Every stage goes through run_timed so the Summary can
+# say where the time went (scripts/test-regression-stage4.sh checks this).
 if [[ -n "$RUN_STAGE" ]]; then
     case $RUN_STAGE in
-        1) run_stage1 ;;
-        2) run_stage2 ;;
-        3) run_stage1; run_stage2; run_stage3 ;;
-        4) run_stage1; run_stage2; run_stage4 ;;
+        1) run_timed "Stage 1" run_stage1 ;;
+        2) run_timed "Stage 2" run_stage2 ;;
+        3) run_timed "Stage 1" run_stage1; run_timed "Stage 2" run_stage2
+           run_timed "Stage 3" run_stage3 ;;
+        4) run_timed "Stage 1" run_stage1; run_timed "Stage 2" run_stage2
+           run_timed "Stage 4" run_stage4 ;;
         # Stage 5 compares stages 3 and 4, so selecting it runs both.  It
         # cannot be run standalone: there is nothing to compare.
-        5) run_stage1; run_stage2; run_stage3; run_stage4; echo ""; run_stage5 ;;
+        5) run_timed "Stage 1" run_stage1; run_timed "Stage 2" run_stage2
+           run_timed "Stage 3" run_stage3; run_timed "Stage 4" run_stage4
+           echo ""; run_timed "Stage 5" run_stage5 ;;
         *)
             echo "Invalid stage: $RUN_STAGE (must be 1-5)"
             exit 1
@@ -1284,17 +1308,17 @@ if [[ -n "$RUN_STAGE" ]]; then
     esac
 else
     # Run all stages
-    run_stage1
+    run_timed "Stage 1" run_stage1
     echo ""
-    run_stage2
+    run_timed "Stage 2" run_stage2
     echo ""
-    run_stage3
+    run_timed "Stage 3" run_stage3
     echo ""
 
     if [[ $QUICK_MODE -eq 0 ]]; then
-        run_stage4
+        run_timed "Stage 4" run_stage4
         echo ""
-        run_stage5
+        run_timed "Stage 5" run_stage5
         echo ""
     else
         echo "Stage 4: SKIPPED (--quick mode)"
@@ -1314,6 +1338,8 @@ echo "======================================"
 for result in "${STAGE_RESULTS[@]}"; do
     echo "  $result"
 done
+echo ""
+print_stage_times
 echo ""
 echo "Total: $TOTAL_PASSED passed, $TOTAL_FAILED failed, $TOTAL_SKIPPED skipped"
 echo ""

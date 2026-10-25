@@ -70,7 +70,8 @@ def test_make_ritz1_builds_the_compiler():
     # gate, since earlier steps build it.
     assert not re.search(r"^make: Nothing to be done", out, re.MULTILINE), out
     assert "ritz1-tests" not in out
-    assert re.search(r"make\S*\s+-C\s+ritz1\s+ritz1\b", out), out
+    # `-jN` (AGAST #1802) may sit between make and -C.
+    assert re.search(r"make\S*\s+(?:-j\d+\s+)?-C\s+ritz1\s+ritz1\b", out), out
 
 
 @pytest.mark.unit
