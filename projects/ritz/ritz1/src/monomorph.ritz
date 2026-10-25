@@ -234,8 +234,11 @@ fn track_typed_local(name: *u8, name_len: i32, type_kind: i32, type_name: *u8, t
     var suf_len: i32 = 0
     let kind: i32 = classify_collection_type(type_name, type_name_len, @suf, @suf_len)
     if kind > 0
-        if type_kind == TYPE_STRUCT
-            add_local_var(name, name_len, kind, suf, suf_len)
+        # By value or through *T / @T / @&T alike: the emitter's UFCS
+        # dispatch loads a pointer receiver itself, so `points:& Vec<P>`
+        # needs `vec_slice$P` registered just as a local Vec would
+        # (angelo's `points[:]`, AGAST #1794).
+        add_local_var(name, name_len, kind, suf, suf_len)
         return
     add_local_struct_var(name, name_len, type_name, type_name_len)
 
@@ -852,20 +855,20 @@ fn find_generic_function(m: *Module, name: *u8, name_len: i32) -> *FnDef
 # monomorphizer can substitute T with `*Concrete` instead of treating
 # "ptr_Foo" as the literal struct name.  Returns 1 iff suffix starts with
 # `$ptr_` (5-char prefix after the `$`) and has at least one char of payload.
+# AGAST #1794: `$ref_` (`id<@E>`, same length) counts too — a reference is a
+# pointer at the IR level, so T substitutes as `*E` either way.
 fn suffix_is_ptr(suffix: *u8, suffix_len: i32) -> i32
     if suffix_len < 6
         return 0
     if *(suffix + 0) != 36   # '$'
         return 0
-    if *(suffix + 1) != 112  # 'p'
-        return 0
-    if *(suffix + 2) != 116  # 't'
-        return 0
-    if *(suffix + 3) != 114  # 'r'
-        return 0
     if *(suffix + 4) != 95   # '_'
         return 0
-    1
+    if *(suffix + 1) == 112 and *(suffix + 2) == 116 and *(suffix + 3) == 114  # "ptr"
+        return 1
+    if *(suffix + 1) == 114 and *(suffix + 2) == 101 and *(suffix + 3) == 102  # "ref"
+        return 1
+    0
 
 fn parse_type_from_suffix(suffix: *u8, suffix_len: i32) -> i32
     # Suffix format: "$typename" where typename is u8, i32, etc.
@@ -1295,7 +1298,16 @@ fn clone_stmt(s: *Stmt, type_param: *u8, type_param_len: i32, subst_type: i32, s
         cloned.var_pointee_type = s.var_pointee_type
         cloned.var_fn_sig = clone_fn_sig(s.var_fn_sig, type_param, type_param_len, subst_type, subst_name, subst_len, suffix, suffix_len)  # AGAST #1671
         # Substitute type param in variable type name (e.g., Vec<T> -> Vec$u8)
-        if s.var_type == TYPE_STRUCT and s.var_type_name != null
+        if s.var_type == TYPE_STRUCT and s.var_type_name != null and s.var_type_name_len == type_param_len and memcmp(s.var_type_name, type_param, type_param_len as i64) == 0
+            # A bare `T` local (`let item: T`, vec_slice<T>) becomes the
+            # argument type itself, as clone_params_with_suffix does for a
+            # bare `T` param.  The name path below would append the suffix
+            # and declare the struct `%T$i32` (AGAST #1794).
+            cloned.var_type = subst_type
+            cloned.var_declared_type = subst_type
+            cloned.var_type_name = subst_name
+            cloned.var_type_name_len = subst_len
+        else if s.var_type == TYPE_STRUCT and s.var_type_name != null
             var new_name_ptr: *u8 = null
             var new_name_len: i32 = 0
             substitute_type_param_in_name(s.var_type_name, s.var_type_name_len, type_param, type_param_len, suffix, suffix_len, @new_name_ptr, @new_name_len)

@@ -3139,3 +3139,77 @@ pub fn is_enum_type(name: *u8, len: i32) -> i32
                 return 1
         ei = ei + 1
     return 0
+
+# =============================================================================
+# AGAST #1794: `id<@E>(e)` and `a[:]`
+# =============================================================================
+# Kept together here, apart from the generic-arg speller, so they stay out of
+# that code's way.
+
+# Reference-typed generic call: `id<@E>(e)` builds the suffix `$ref_E`, as
+# ritz0 mangles a RefType argument (monomorph.py mangle_type_name).
+# monomorph substitutes T with a pointer to E for it, as for `$ptr_E`
+# (suffix_is_ptr): a reference is a pointer at the IR level.
+pub fn postfix_generic_call_ref(p: *Parser, type_tok: Token, args: *Expr) -> *PostfixOp
+    let op: *PostfixOp = parser_alloc(p, 80) as *PostfixOp
+    op.kind = POSTFIX_CALL
+    op.args = args
+    # "$ref_" + type_name.
+    let suffix_len: i32 = type_tok.len + 5
+    let suffix_buf: *u8 = parser_alloc(p, suffix_len + 1) as *u8
+    *(suffix_buf + 0) = 36   # '$'
+    *(suffix_buf + 1) = 114  # 'r'
+    *(suffix_buf + 2) = 101  # 'e'
+    *(suffix_buf + 3) = 102  # 'f'
+    *(suffix_buf + 4) = 95   # '_'
+    for i in 0..type_tok.len
+        *(suffix_buf + 5 + i) = *(type_tok.start + i)
+    *(suffix_buf + suffix_len) = 0
+    op.call_type_suffix = suffix_buf
+    op.call_type_suffix_len = suffix_len
+    op.next = null
+    return op
+
+# full_slice_tail : '[' ':' ']' postfix_ops  →  a marker whose `next` holds
+# the postfix ops that follow the slice.  Never null, so `full_slice_tail?`
+# can tell "present with nothing after" from "absent".
+pub fn full_slice_tail_new(p: *Parser, rest: *PostfixOp) -> *PostfixOp
+    let op: *PostfixOp = parser_alloc(p, 80) as *PostfixOp
+    op.kind = POSTFIX_INDEX
+    op.args = null
+    op.call_type_suffix = null
+    op.call_type_suffix_len = 0
+    op.index = null
+    op.member_name = null
+    op.member_len = 0
+    op.next = rest
+    return op
+
+# The method call `recv.name(args)` (no generic suffix) as EXPR_METHOD.
+fn method_call_expr(p: *Parser, recv: *Expr, name: *u8, name_len: i32, args: *Expr) -> *Expr
+    let m: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    m.kind = EXPR_METHOD
+    m.span = recv.span
+    m.left = recv
+    m.ident_ptr = name
+    m.ident_len = name_len
+    m.args = args
+    m.call_type_suffix = null
+    m.call_type_suffix_len = 0
+    m.next = null
+    return m
+
+# `a[:]`  →  `a.slice(0, a.len())`, then the ops after the slice.  This is
+# ritz0's lowering (emitter _emit_slice): vec_slice<T>(&v, 0, len) for a Vec
+# (a COPY: angelo's documented clone idiom), string_slice for a String, a
+# sub-span for a Span.  Lowering through the method keeps it visible to
+# monomorph, which instantiates vec_slice$T from the method call.  The
+# receiver node is shared by both calls; ritz0 likewise requires an lvalue
+# receiver, so evaluating it twice has no side effects to repeat.
+pub fn apply_full_slice_p(p: *Parser, recv: *Expr, tail: *PostfixOp) -> *Expr
+    if tail == null
+        return recv
+    let len_call: *Expr = method_call_expr(p, recv, c"len", 3, null)
+    let zero: *Expr = expr_int(p, 0, recv.span.line, recv.span.col)
+    let slice: *Expr = method_call_expr(p, recv, c"slice", 5, expr_link(zero, len_call))
+    return apply_postfix_p(p, slice, tail.next)

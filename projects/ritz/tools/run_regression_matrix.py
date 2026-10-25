@@ -83,9 +83,6 @@ _RITZ1_TWINS = {
         "AGAST #1627 — unspecified ritz0-only String coercions (\"...\"→String, String→*u8)",
     "test_string_coercion":
         "AGAST #1627 — unspecified ritz0-only String→*u8 coercion",
-    "test_level23":
-        "AGAST #1514 — `let tmp: T` in a generic fn becomes `alloca %T$i32` "
-        "(unsized type)",
     "test_level32":
         "AGAST #1634 — unspecified ritz0-only `Box<T>` implicit field deref "
         "(`b.x`); ritz1: unhandled EXPR_MEMBER",

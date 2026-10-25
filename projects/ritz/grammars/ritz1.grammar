@@ -777,6 +777,13 @@ match_arm -> *MatchArm
 
 pattern -> *MatchArm
     : NUMBER { pattern_lit_int(p, $1.start, $1.len) }
+    # Qualified variant patterns `Opt.None =>` / `Opt.Some(v) =>` (AGAST
+    # #1794; #1466 is the constructor side).  Arms resolve variants by name,
+    # exactly as for the unqualified forms below, so the enum qualifier is
+    # dropped.  Listed before `IDENT ...`, which would otherwise take `Opt`
+    # alone as a binding and fail at the DOT.
+    | IDENT DOT IDENT LPAREN IDENT RPAREN { pattern_variant_inner(p, $3.start, $3.len, $5.start, $5.len) }
+    | IDENT DOT IDENT { pattern_ident_or_wildcard(p, $3.start, $3.len) }
     | IDENT LPAREN IDENT RPAREN { pattern_variant_inner(p, $1.start, $1.len, $3.start, $3.len) }
     | IDENT { pattern_ident_or_wildcard(p, $1.start, $1.len) }
     ;
@@ -978,7 +985,17 @@ addr_expr -> *Expr
     ;
 
 postfix_expr -> *Expr
-    : primary_expr postfix_ops { apply_postfix_p(p, $1, $2) }
+    # `a[:]` (AGAST #1794) is split off as full_slice_tail because it needs
+    # the receiver built so far: it becomes `a.slice(0, a.len())`, ritz0's
+    # lowering for Vec (a copy), String and Span.  Absent, $3 is null and
+    # apply_full_slice_p returns the postfix chain unchanged.
+    : primary_expr postfix_ops full_slice_tail? { apply_full_slice_p(p, apply_postfix_p(p, $1, $2), $3) }
+    ;
+
+# `[:]` plus any postfix ops after it (`a[:].len()`).  Returns a marker op
+# whose `next` is that trailing chain, so it is never null when present.
+full_slice_tail -> *PostfixOp
+    : LBRACKET COLON RBRACKET postfix_ops { full_slice_tail_new(p, $4) }
     ;
 
 postfix_ops -> *PostfixOp
@@ -994,6 +1011,10 @@ postfix_op -> *PostfixOp
     # plain rule's parse-failure cascade and the enclosing fn gets dropped
     # by parse_item's anchor-skip recovery (AGAST #186).
     : LT STAR type_name GT LPAREN call_args? RPAREN { postfix_generic_call_ptr(p, $3, $6) }
+    # Reference-typed generic call: `id<@E>(e)` mangles to `$ref_E` as in
+    # ritz0 (AGAST #1794).  Without this the generic_args form below parsed
+    # it but gave the argument no spelling: `call void @id$(void ...)`.
+    | LT AT type_name GT LPAREN call_args? RPAREN { postfix_generic_call_ref(p, $3, $6) }
     | LT type_name GT LPAREN call_args? RPAREN { postfix_generic_call(p, $2, $5) }
     # Generic call with a full type-argument list: `vec_new<Vec<i64>>()`
     # (closed by SHR, AGAST #1300), `second<i64, i32>(a, b)` (AGAST #1612).
@@ -1086,6 +1107,8 @@ primary_expr -> *Expr
     # and slice/Span coercions.  Stored as EXPR_ARRAY_LIT with elements as
     # a linked list in `args`.
     | LBRACKET args RBRACKET { expr_array(p, $2, $1.line, $1.col) }
+    # Empty array literal: `let d: [0]u8 = []` (AGAST #1794).
+    | LBRACKET RBRACKET { expr_array(p, 0 as *Expr, $1.line, $1.col) }
     # Same, with one optional trailing comma: `[1, 2, 3,]`.  Multi-line
     # tables (cryptosec's AES S-boxes, ed25519's L_BYTES) end every row in
     # a comma, including the last.  Scoped to the array literal rather than
