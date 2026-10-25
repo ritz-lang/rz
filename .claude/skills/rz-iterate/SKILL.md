@@ -25,6 +25,16 @@ Repeat until the goal is met:
    2026-10-24: 4 parallel rooms kill WSL with OOM from agents plus their
    builds and gates). Never exceed 2, survey rooms included. Spawn a new
    room only when a running one has merged or been paused.
+   - **`rz-larb` (LARB retrospective, #1800) holds one of the 2 slots**
+     (Aaron, 2026-10-25). It started as a 3rd agent with builds banned,
+     while #1794 and #1518 were running. When #1794 merges, don't refill
+     that slot: tell `rz-larb` "you may build" (`ask_claude=True`). From
+     then on only 1 ritz task room runs alongside it. Its REAP lines
+     (`REAP rz-larb <sha>`) go through the normal queue. It's a long-lived
+     room, so after merging don't remove its worktree, unit or branch.
+   - **Test-speed tickets from `rz-larb` (smoke tier, faster suite,
+     IR/object caching; priority 90) come first**, ahead of ritz1 bug
+     fixes (Aaron, 2026-10-25).
    - **Paused rooms come first.** A room whose agent unit is stopped and
      disabled (`systemctl --user disable --now adele-agent@ritz-task-<id>`) but
      whose worktree still exists is paused, not finished. Resume it
