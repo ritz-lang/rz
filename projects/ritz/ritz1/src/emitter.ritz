@@ -1045,37 +1045,46 @@ fn is_local_function(m: *Module, name: *u8, len: i32) -> i32
     # method referenced from a call site (e.g. `tag.eq()` -> `Tag_eq`),
     # clashing with the `define` emitted by emit_impl_method and producing
     # LLVM's "invalid redefinition" error.
+    # AGAST #194: same rationale as the m.functions branch above — only
+    # methods this .ll actually defines (is_local==1) count as local for the
+    # extern-declare suppression check.
+    let method: *FnDef = find_impl_method_by_symbol(m, name, len)
+    if method != null and method.is_local == 1
+        return 1
+    0
+
+# 1 if `name` is the mangled symbol `<ib.type_name>_<method.name>`.
+fn impl_method_symbol_eq(ib: *ImplBlock, method: *FnDef, name: *u8, len: i32) -> i32
+    let type_len: i32 = ib.type_name_len
+    if type_len + 1 + method.name_len != len
+        return 0
+    for mj in 0..type_len
+        if *(ib.type_name + mj) != *(name + mj)
+            return 0
+    if *(name + type_len) != 95  # '_'
+        return 0
+    for mk in 0..method.name_len
+        if *(method.name + mk) != *(name + type_len + 1 + mk)
+            return 0
+    1
+
+# The impl method (with a body) whose mangled `Type_method` symbol is `name`,
+# or null. A method defined by this .ll (is_local == 1) is preferred over an
+# imported copy of the same symbol.
+fn find_impl_method_by_symbol(m: *Module, name: *u8, len: i32) -> *FnDef
+    var found: *FnDef = null
     var ib: *ImplBlock = m.impls
     while ib != null
         var method: *FnDef = ib.methods
         while method != null
-            # AGAST #194: same rationale as the m.functions branch above —
-            # only methods this .ll actually defines (is_local==1) count
-            # as local for the extern-declare suppression check.
-            if method.body != null and method.is_local == 1
-                let type_len: i32 = ib.type_name_len
-                if type_len + 1 + method.name_len == len
-                    var matched: i32 = 1
-                    var mj: i32 = 0
-                    while mj < type_len
-                        if *(ib.type_name + mj) != *(name + mj)
-                            matched = 0
-                            break
-                        mj += 1
-                    if matched == 1 and *(name + type_len) != 95  # '_'
-                        matched = 0
-                    if matched == 1
-                        var mk: i32 = 0
-                        while mk < method.name_len
-                            if *(method.name + mk) != *(name + type_len + 1 + mk)
-                                matched = 0
-                                break
-                            mk += 1
-                    if matched == 1
-                        return 1
+            if method.body != null and impl_method_symbol_eq(ib, method, name, len) == 1
+                if method.is_local == 1
+                    return method
+                if found == null
+                    found = method
             method = method.next
         ib = ib.next
-    0
+    found
 
 # Emit inline syscall implementations for commonly used syscall functions
 fn emit_syscall_implementations(s: *EmitterState)
@@ -1346,7 +1355,9 @@ fn fn_has_byval_param(s: *EmitterState, f: *FnDef) -> i32
 # AGAST #1739: a `(...)` declare cannot carry a `byval` attribute, so a fn
 # with a large by-value struct param is declared with its concrete
 # signature, written exactly as emit_fn writes the definition (sret first).
-fn emit_concrete_extern_declare(s: *EmitterState, f: *FnDef, name: *u8, name_len: i32)
+# `is_method` = 1 for an impl method: emit_impl_method spells its `self`
+# param as plain `ptr` whatever its declared type, so the declare must too.
+fn emit_concrete_extern_declare(s: *EmitterState, f: *FnDef, name: *u8, name_len: i32, is_method: i32)
     let sret: i32 = struct_ret_uses_sret(s, f.return_type, f.return_type_name, f.return_type_name_len)
     emit_str(s, c"declare ")
     if sret == 1
@@ -1367,7 +1378,10 @@ fn emit_concrete_extern_declare(s: *EmitterState, f: *FnDef, name: *u8, name_len
         if first == 0
             emit_str(s, c", ")
         first = 0
-        emit_param_llvm_type(s, p)
+        if is_method == 1 and name_eq(p.name, p.name_len, c"self", 4) == 1
+            emit_str(s, c"ptr")
+        else
+            emit_param_llvm_type(s, p)
         p = p.next
     emit_str(s, c")\n")
 
@@ -1425,9 +1439,17 @@ fn emit_extern_declarations(s: *EmitterState)
         # Skip if this function is defined in this module
         if is_local_function(s.module, ex.name, ex.name_len) == 0
                 # Look up the function's return type from its definition
-                let fn_def: *FnDef = find_fn(s, ex.name, ex.name_len)
+                var fn_def: *FnDef = find_fn(s, ex.name, ex.name_len)
+                # AGAST #1518: an imported impl method (`Type_method`) is not
+                # in fn_map; take its signature from the impl table so the
+                # declare matches the call site (sret / byval / i32 / struct).
+                var is_method: i32 = 0
+                if fn_def == null
+                    fn_def = find_impl_method_by_symbol(s.module, ex.name, ex.name_len)
+                    if fn_def != null
+                        is_method = 1
                 if fn_has_byval_param(s, fn_def) == 1
-                    emit_concrete_extern_declare(s, fn_def, ex.name, ex.name_len)   # AGAST #1739
+                    emit_concrete_extern_declare(s, fn_def, ex.name, ex.name_len, is_method)   # AGAST #1739
                 else if fn_def != null and struct_ret_uses_sret(s, fn_def.return_type, fn_def.return_type_name, fn_def.return_type_name_len) == 1
                     # AGAST #1730 — the call sites pass `ptr sret(%T)`.
                     emit_str(s, c"declare void @")

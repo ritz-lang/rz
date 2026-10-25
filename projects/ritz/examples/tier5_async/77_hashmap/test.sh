@@ -76,6 +76,12 @@ sum of values: 183
 reinsert len: 20
 get(-5): 55
 get(1 << 62): 62
+m.get(1000): 2
+m.contains(1000): 1
+m.remove(1000): 1
+m.len(): 22
+m.is_empty(): 0
+m.cap(): 32
 clear len: 0
 clear is_empty: 1
 clear cap: 32
