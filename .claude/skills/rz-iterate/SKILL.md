@@ -25,13 +25,13 @@ Repeat until the goal is met:
    2026-10-24: 4 parallel rooms kill WSL with OOM from agents plus their
    builds and gates). Never exceed 2, survey rooms included. Spawn a new
    room only when a running one has merged or been paused.
-   - **`rz-larb` (LARB retrospective, #1800) holds one of the 2 slots**
-     (Aaron, 2026-10-25). It started as a 3rd agent with builds banned,
-     while #1794 and #1518 were running. When #1794 merges, don't refill
-     that slot: tell `rz-larb` "you may build" (`ask_claude=True`). From
-     then on only 1 ritz task room runs alongside it. Its REAP lines
-     (`REAP rz-larb <sha>`) go through the normal queue. It's a long-lived
-     room, so after merging don't remove its worktree, unit or branch.
+   - **`rz-larb` (LARB retrospective, #1800) has given up its slot**
+     (Aaron, 2026-10-25, after its three reviews merged), so both slots go
+     to ritz task rooms. Its unit is stopped and its worktree and branch are
+     kept. It's a long-lived room: bring it back for follow-up reviews only
+     when Aaron asks, and it takes a slot when it runs. Its REAP lines
+     (`REAP rz-larb <sha>`) go through the normal queue, and after merging
+     don't remove its worktree, unit or branch.
    - **Test-speed tickets from `rz-larb` (smoke tier, faster suite,
      IR/object caching; priority 90) come first**, ahead of ritz1 bug
      fixes (Aaron, 2026-10-25).
@@ -87,7 +87,13 @@ brief, verify the agent woke), with these ritz values:
 Create the room on the server **before** `systemctl start`, or the agent
 crash-loops on HTTP 400. Use `send_room_message` ("Room initialized for AGAST
 #<id>."); `update_room_description` does NOT create a room, it returns "not
-found".
+found". Once the room exists, give it a description from the ticket:
+`update_room_description(room_id="ritz-task-<id>", description="...")`. The
+room keeps the description current from then on (briefing step 0).
+
+**Room descriptions** are one concise sentence saying what the room is doing:
+about 20-30 characters, 60 at most (Aaron, 2026-10-25). For example "Lower
+build priority for rooms" or "Re-gating after rebase".
 
 **Provision every worktree** with `.claude/provision-room.sh <worktree>` after
 `git worktree add` and before starting the agent. It must print "room
@@ -108,49 +114,43 @@ it's there, `complete_task` with the evidence instead of spawning. Also add a
 
 **<title>**
 
-<2-3 sentence summary. The ticket in AGAST is the full spec; read it.>
+<2-3 sentence summary. The AGAST ticket is the full spec; read it.>
 
-| Parameter | Value |
-|---|---|
-| AGAST Task | `#<id>` |
-| Branch | `ritz-task-<id>` |
-| Worktree | `~/dev/ritz-lang/rz-task-<id>` |
-| Callback room | `rz` |
+Room and branch `ritz-task-<id>`, worktree `~/dev/ritz-lang/rz-task-<id>`,
+callback room `rz`.
 
-### You own this completely — `rz` will merge your commit WITHOUT re-testing it
+### You own this: `rz` merges your commit without re-testing it
 
-`rz` trusts your REAP message. It runs `git merge --ff-only` on the SHA you send
-and pushes. Nobody re-runs your tests. Your REAP vouches for that exact commit.
+`rz` runs `git merge --ff-only` on the SHA you REAP and pushes it. Your REAP
+vouches for that exact commit.
 
-0. **Is it already fixed on `origin/main`?** If so, `complete_task` with the
-   evidence and REAP `none`.
-1. **Test first.** Write failing tests, confirm they fail for the reason they
-   name, then fix. Mutation-check the fix: break each part and confirm only its
-   own tests go red.
-2. **Parallelise inside the room** with subagents (Agent tool) for
-   independent work. Do NOT spawn rooms of your own; only `rz` merges.
-3. **Out of scope?** File a new AGAST ticket and keep going. Don't widen the
-   change.
-4. **Finish on top of main:** `git fetch origin && git rebase origin/main`, then
-   squash to **one commit** (`ritz-task-<id>: 🤖 <terse description>`).
-5. **Run the gate on that commit**, detached so a new message can't kill it:
+0. **Keep your room description current.** Whenever your focus changes, call
+   `update_room_description(room_id="ritz-task-<id>", description="...")`: one
+   concise sentence, about 20-30 characters, 60 at most ("Fix ritz1 slice
+   bounds checks", "Re-gating after rebase").
+1. **Already fixed on `origin/main`?** `complete_task` with the evidence and
+   REAP `none`.
+2. **Test first.** Write tests that fail for the reason they name, then fix.
+   Mutation-check: break each part of the fix and confirm only its own tests
+   go red.
+3. **Subagents (Agent tool) for parallel work.** No rooms of your own.
+4. **Out of scope?** File an AGAST ticket. Don't widen the change.
+5. **Finish on main:** `git fetch origin && git rebase origin/main`, then
+   squash to one commit: `ritz-task-<id>: 🤖 <terse description>`.
+6. **Gate that commit**, detached so a new message can't kill it:
    ```bash
    LOG=$(~/dev/ritz-lang/rz/.claude/skills/rz-iterate/run-gate.sh ~/dev/ritz-lang/rz-task-<id> <id>)
    ~/dev/ritz-lang/rz/.claude/skills/rz-iterate/run-gate.sh --wait "$LOG"
    ```
-   It runs a clean `make -C projects/ritz ci-local`, 1 gate at a time
-   machine-wide, and exits with the gate's code (98 = died with no verdict,
-   99 = HEAD moved during the run; neither is a pass). If your change touches
-   packages outside `projects/ritz`, also build them (`./rz build <pkg>`) and run
-   their tests; compare any failure against `origin/main` before calling it
-   pre-existing.
-6. **Gate exit 0 is required.** On failure, fix, re-squash, re-run.
-7. **Don't chase `main`.** If `origin/main` moves after your step-4 rebase,
-   ignore it: REAP the commit you gated. `rz` merges one room at a time and
-   tells only the next room in line to rebase, so rebasing on every move only
-   costs you and every other room a re-gate.
-8. **Push your branch** (`git push -f origin ritz-task-<id>`), then send exactly one
-   message:
+   It runs a clean `make -C projects/ritz ci-local`, one gate machine-wide,
+   and exits with the gate's code (98 = no verdict, 99 = HEAD moved; neither
+   passes). If you touched packages outside `projects/ritz`, also
+   `./rz build <pkg>` and run their tests; compare failures against
+   `origin/main` before calling them pre-existing. **Only exit 0 passes.**
+   Otherwise fix, re-squash, re-run.
+7. **Don't chase `main`.** REAP the commit you gated. `rz` tells you when to
+   rebase.
+8. **Push and REAP:** `git push -f origin ritz-task-<id>`, then exactly one:
    ```
    mcp__adele-context__send_room_message(
        room_id="rz",
@@ -158,19 +158,16 @@ and pushes. Nobody re-runs your tests. Your REAP vouches for that exact commit.
        sender_name="ritz-task-<id>",
        ask_claude=True)
    ```
-9. **When `rz` says it's your turn** ("your turn: rebase onto <sha7>"), rebase
-   onto `origin/main`, re-run the gate, push, and send a new REAP line
-   straight away. You're holding the merge queue: nothing else merges until
-   you REAP, so don't pick up other work first. Until that message arrives,
-   stay on your current base, even after you've REAPed.
+9. **On "your turn: rebase onto <sha7>"**: rebase, re-gate, push and REAP
+   again straight away. Nothing merges until you do. Until that message, stay
+   on your base, even after REAPing.
 
-**Never end a turn with work pending.** Nothing wakes you when a gate, subagent
-or test run finishes after your turn ends (#1533). Run `run-gate.sh --wait` in
-the foreground of the same turn. If you must end a turn early, schedule a
-wakeup first.
+**Never end a turn with work pending:** nothing wakes you when a gate or
+subagent finishes (#1533). Run `--wait` in the foreground, or schedule a
+wakeup before ending the turn.
 
-**Never:** check out or push `main`, merge anything, remove your worktree, stop
-your unit, or delete your branch. `rz` does all of that after merging.
+**Never** check out or push `main`, merge anything, remove your worktree,
+stop your unit or delete your branch. `rz` does that after merging.
 ````
 
 ## Reaping
