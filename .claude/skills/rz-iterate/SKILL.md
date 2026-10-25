@@ -101,6 +101,16 @@ permissions OK". Without it the worktree is untrusted, and every `Write` blocks
 for 30 minutes on an approval nobody gives (#1378). On cleanup, run
 `.claude/provision-room.sh --remove <worktree>` after `git worktree remove`.
 
+**Put every room on the machine budget** with `.claude/host-budget.sh
+ritz-task-<id>` before `systemctl --user start` (it must print "host budget
+OK"). It moves the room's unit into `ritz-rooms.slice`: CPUWeight=20,
+MemoryHigh=3.5G / MemoryMax=5G per room, 8G for all rooms together. Gates run in
+`ritz-gate.slice` at CPUWeight=100 (`run-gate.sh` does that). Without it the
+gate competes with the rooms on equal terms and its wall time doubles (#1811).
+The cap is per room, not per command, so a room can't bypass it by running
+`make` directly. It applies from the unit's next start. On cleanup, run
+`.claude/host-budget.sh --remove ritz-task-<id>`.
+
 **Before spawning, check the ticket isn't already fixed on `main`.** Many
 `ready` tickets were fixed in-session and never closed (#1369 and #1372 were
 found that way). A quick grep for the fix the ticket describes is enough; if
@@ -144,9 +154,12 @@ vouches for that exact commit.
    ```
    It runs a clean `make -C projects/ritz ci-local`, one gate machine-wide,
    and exits with the gate's code (98 = no verdict, 99 = HEAD moved; neither
-   passes). If you touched packages outside `projects/ritz`, also
-   `./rz build <pkg>` and run their tests; compare failures against
-   `origin/main` before calling them pre-existing. **Only exit 0 passes.**
+   passes). The gate runs at full CPU weight; your room runs at CPUWeight=20
+   under a 5G memory cap, so room builds can't starve it (#1811). Don't
+   escape the cap with your own `systemd-run`. If you touched packages
+   outside `projects/ritz`, also `./rz build <pkg>` and run their tests;
+   compare failures against `origin/main` before calling them pre-existing.
+   **Only exit 0 passes.**
    Otherwise fix, re-squash, re-run.
 7. **Don't chase `main`.** REAP the commit you gated. `rz` tells you when to
    rebase.
@@ -192,7 +205,8 @@ reap ritz-task-1450 1a2b3c4
 4. **Pass:** `git merge --ff-only <sha> && git push origin main`. Then
    `complete_task` in AGAST, `check_scratchpad_item`, and clean up
    (`systemctl --user stop/disable adele-agent@ritz-task-<id>`, remove
-   `~/.config/adele/rooms/ritz-task-<id>`, `git worktree remove`,
+   `~/.config/adele/rooms/ritz-task-<id>`, `.claude/host-budget.sh --remove
+   ritz-task-<id>`, `git worktree remove`,
    `git branch -D`, `git push origin --delete ritz-task-<id>`).
 5. **Not on current main (the usual case):** this room is next, so it gets
    the turn. Send it one line with `ask_claude=True`:

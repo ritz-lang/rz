@@ -151,6 +151,9 @@ room until the current one is merged, pushed, and verified.
    # Left behind, these accumulate one dead absolute path per reap and quietly
    # grant trust to whatever later occupies that path.
    .claude/provision-room.sh --remove ~/dev/ritz-lang/rz-task-<id>
+
+   # Drop the room's machine-budget drop-in (AGAST #1811). The shared slices stay.
+   .claude/host-budget.sh --remove ritz-task-<id>
    ```
 
 10. **Mark AGAST task complete** (if not already done by the child room):

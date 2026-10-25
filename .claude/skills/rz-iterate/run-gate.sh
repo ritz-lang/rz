@@ -17,6 +17,13 @@
 #   * slots: 12 cores.  ci-local has 180 s timed tests; six concurrent gates
 #     turn them into timeouts that look like regressions and are not.
 #     Default is 1: concurrent gates OOM'd the WSL VM and took it down.
+#   * ritz-gate.slice at CPUWeight=100: the slot protects gates from gates,
+#     not from room builds.  Task rooms run in ritz-rooms.slice at
+#     CPUWeight=20 under a memory cap (.claude/host-budget.sh, AGAST #1811),
+#     so under contention the gate gets 5x a room's share of the CPU.  Both
+#     slices nest under ritz.slice, so they are siblings; in app.slice the
+#     gate would be weighed against all of app-adele\x2dagent.slice instead.
+#     No memory cap on the gate: an OOM kill there is a false red.
 #   * SHA in the log name, and the HEAD-moved check: the callback claims a
 #     specific commit passed.  A gate that ran while HEAD moved proves nothing.
 #   * EXIT line always written, and --wait reports a unit that died without
@@ -98,6 +105,7 @@ echo "EXIT=$rc" >> "$RZ_LOG"
 EOF
 
 systemd-run --user --quiet --unit="$UNIT" --collect --working-directory="$WT" \
+    --slice=ritz-gate.slice --property=CPUWeight=100 \
     --setenv=PATH="$PATH" --setenv=HOME="$HOME" \
     --setenv=RZ_LOG="$LOG" --setenv=RZ_SHA="$SHA" --setenv=RZ_CMD="$CMD" \
     --setenv=RZ_SLOTS="$SLOTS" --setenv=RZ_DIR="$GATES" \

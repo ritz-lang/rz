@@ -94,6 +94,23 @@ Also: `git fetch origin && git rebase origin/main` to ensure we're on latest.
    of `provision-room.sh` for the measured chain and two rule-syntax traps that
    look like typos and are not.
 
+4b. **Put the room on the machine budget — MANDATORY, before step 6:**
+   ```bash
+   .claude/host-budget.sh ritz-task-<id>
+   ```
+
+   Must print "host budget OK". It installs a drop-in on
+   `adele-agent@ritz-task-<id>.service` that moves the whole room (agent,
+   shells, `make`, `pytest`) into `ritz-rooms.slice`: CPUWeight=20,
+   MemoryHigh=3.5G / MemoryMax=5G per room, 8G for all rooms together. The gate
+   runs in `ritz-gate.slice` at CPUWeight=100 (`run-gate.sh`). Per room, not
+   per command: a wrapper is bypassed the moment a room runs `make` directly.
+   A drop-in only takes effect when the unit starts, so do this first.
+
+   **Why:** gate wall time doubled in a week (21 → 44–54 min) from room
+   builds running unthrottled next to it on the 12-core / 15 GB VM (AGAST
+   **#1811**; the numbers are in the script's header).
+
 5. **Install the room** using `adele install`:
    ```bash
    adele install --room ritz-task-<id> \
@@ -193,6 +210,8 @@ Also: `git fetch origin && git rebase origin/main` to ensure we're on latest.
    ```bash
    adele status
    .claude/provision-room.sh --verify ~/dev/ritz-lang/rz-task-<id>
+   .claude/host-budget.sh --verify ritz-task-<id>
+   systemctl --user show -p Slice adele-agent@ritz-task-<id>   # Slice=ritz-rooms.slice
    ```
 
    `adele status` reports `active` for a room that is stalled on an approval
@@ -251,6 +270,10 @@ git worktree add ~/dev/ritz-lang/rz-task-70 -b ritz-task-70
 #     forget, and a room that cannot write still reports `active`.
 .claude/provision-room.sh ~/dev/ritz-lang/rz-task-69
 .claude/provision-room.sh ~/dev/ritz-lang/rz-task-70
+
+# 2c. Machine budget for EVERY room, before it starts.
+.claude/host-budget.sh ritz-task-69
+.claude/host-budget.sh ritz-task-70
 
 # 3. Install + start
 adele install --room ritz-task-69 ...
