@@ -4,7 +4,7 @@
 Background
 ----------
 ``compile_file`` skips all work when the ``.ll`` is newer than the source and
-the source hash matches ``source_hash`` in ``<src>.ritz.sig``. That checked the
+the source hash matches ``source_hash`` in the source's sig file. That checked the
 module's OWN source only. But a module's ``.ll`` also depends on every
 transitive import: struct layouts (field offsets, GEP indices), constants,
 and declared signatures are all baked in from imported sources.
@@ -32,6 +32,7 @@ sys.path.insert(0, str(RITZ0_DIR))
 from emitter.fn_cache import (  # noqa: E402
     build_sig_data,
     check_import_hashes,
+    sig_path_for,
     source_file_hash,
 )
 
@@ -124,7 +125,7 @@ class TestFastPathHonoursImports:
         tmp, _base, _mid, main = three_level
         out = tmp / "main.ll"
         _compile(main, out)
-        sig_path = tmp / "main.ritz.sig"
+        sig_path = sig_path_for(main)
         data = json.loads(sig_path.read_text())
         data.pop("import_hashes", None)
         sig_path.write_text(json.dumps(data))

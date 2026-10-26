@@ -3,8 +3,10 @@
 
 Background
 ----------
-``ritz1`` keeps a per-source ``<src>.ritz.sig`` next to every input file.  Two
-things live in it that let a rebuild skip work entirely:
+``ritz1`` keeps a per-source sig file (once ``<src>.ritz.sig`` beside the
+source; since AGAST #1807 in a per-compiler cache directory — see
+``emitter.fn_cache.sig_path_for``).  Two things live in it that let a rebuild
+skip work entirely:
 
 * ``source_hash`` — used to prove the source text has not changed, and
 * ``module_ir``  — a verbatim snapshot of the last emitted ``.ll``.
@@ -40,9 +42,13 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from emitter.fn_cache import sig_path_for  # noqa: E402
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
 RITZ1 = RITZ_ROOT / "ritz1" / "build" / "ritz1"
@@ -106,8 +112,20 @@ def _compile(compiler: Path, src: Path, out: Path) -> subprocess.CompletedProces
 
 
 def _sig_path(src: Path) -> Path:
-    """`.ritz.sig` lives beside the source, with the extension replaced."""
-    return src.with_suffix(".ritz.sig")
+    """ritz1's sig for `src`, in the "ritz1" namespace of the sig cache."""
+    return sig_path_for(src, "ritz1")
+
+
+def _rebuilt_copy(tmp_path: Path, padding: int) -> Path:
+    """A padded copy of ritz1: same name, so same cache namespace (#1807),
+    different content, so a different compiler fingerprint."""
+    rebuilt = tmp_path / "rebuilt" / "ritz1"
+    rebuilt.parent.mkdir(exist_ok=True)
+    shutil.copy2(RITZ1, rebuilt)
+    with rebuilt.open("ab") as fh:
+        fh.write(b"\0" * padding)
+    rebuilt.chmod(0o755)
+    return rebuilt
 
 
 @pytest.fixture
@@ -243,11 +261,10 @@ class TestFastPathHonoursCompilerIdentity:
         assert out.read_text() == SENTINEL_IR
 
     def test_absent_compiler_hash_is_treated_as_unknown(self, project):
-        """ritz0 writes the same `.ritz.sig` path and omits this field.
+        """A sig without this field (ritz0 never wrote it) must fail closed.
 
-        Two compilers sharing one sig file must never consume each other's
-        cached IR, so a missing field has to fail closed rather than being
-        read as 'no compiler constraint'.
+        ritz0 and ritz1 no longer share a sig file (#1807), but a missing
+        field still has to mean 'unknown compiler', never 'no constraint'.
         """
         src, out, sig = project
 
@@ -277,11 +294,7 @@ class TestAgainstARealDifferentBinary:
         """
         src, out, _ = project
 
-        rebuilt = tmp_path / "ritz1_rebuilt"
-        shutil.copy2(RITZ1, rebuilt)
-        with rebuilt.open("ab") as fh:
-            fh.write(b"\0" * 4096)
-        rebuilt.chmod(0o755)
+        rebuilt = _rebuilt_copy(tmp_path, 4096)
 
         # Sanity: the stand-in is a working compiler, not a corpse. If this
         # assertion fires the test below proves nothing.
@@ -303,11 +316,7 @@ class TestAgainstARealDifferentBinary:
         src, out, sig = project
         original_hash = _read_sig(sig)["compiler_hash"]
 
-        rebuilt = tmp_path / "ritz1_rebuilt"
-        shutil.copy2(RITZ1, rebuilt)
-        with rebuilt.open("ab") as fh:
-            fh.write(b"\0" * 8192)
-        rebuilt.chmod(0o755)
+        rebuilt = _rebuilt_copy(tmp_path, 8192)
 
         result = _compile(rebuilt, src, out)
         assert result.returncode == 0, result.stderr

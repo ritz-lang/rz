@@ -196,9 +196,15 @@ on a tree whose emitter bug was already fixed, and a `ritz1_selfhosted 0/50`
 "NUL-byte miscompilation" that never reproduced from clean. Both were the
 cache talking, not the compiler.
 
-`.ritz.sig` now carries a `compiler_hash` (FNV1a-64 of `/proc/self/exe`) and
-ritz1 refuses to reuse anything — including the `module_ir` splice that
-re-materialises a deleted `.ll` — unless it matches the running binary. If you
+The sig now carries a `compiler_hash` (FNV1a-64 of `/proc/self/exe`, the
+target OS and the import search path) and ritz1 refuses to reuse anything —
+including the `module_ir` splice that re-materialises a deleted `.ll` — unless
+it matches the running binary. Since AGAST #1807 it also records
+`import_hashes` for every transitive import, so a struct change in an
+imported module invalidates its importers, and sigs no longer live beside the
+source: each compiler keeps its own under
+`$RITZ_CACHE_DIR` (default `~/.cache/ritz`) `/<compiler>/<abs source path>.sig`,
+so ritz0, ritz1 and ritz1_selfhosted stop evicting each other. If you
 see clean and incremental disagree again, suspect a cache key before you
 suspect codegen, and reach for the A/B in
 `ritz0/test_fn_cache_compiler_identity.py` rather than `make clean`.

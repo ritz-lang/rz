@@ -44,7 +44,7 @@ SOURCES = \
 	main
 
 # ritzlib modules needed by ritz1
-# - json/option/result pulled in for fn_cache.ritz (.ritz.sig I/O)
+# - json/option/result pulled in for fn_cache.ritz (sig file I/O)
 # - os_env (ritzlib/os/env.ritz) + span: main.ritz's RITZ_PATH lookup
 #   (AGAST #1750).  A nested module is named with `_` for `/`: see the
 #   explicit ritzlib_os_env rules below, since the ritzlib_% pattern only

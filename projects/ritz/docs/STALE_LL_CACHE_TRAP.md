@@ -25,7 +25,7 @@ We have two layers:
 | Layer | Path | Owner | Role |
 |---|---|---|---|
 | Per-source `.ll` | `.ritz-cache/objects/<src>.ll` | `build.py` (cache.py) | Skip ritz0 invocation entirely when source + transitive deps unchanged |
-| Per-function IR | `<src>.ritz.sig` | `ritz0` internal | Within a ritz0 run, skip emitting unchanged functions and splice cached IR back |
+| Per-function IR | `~/.cache/ritz/ritz0/<abs src>.sig` (was `<src>.ritz.sig`; AGAST #1807) | `ritz0` internal | Within a ritz0 run, skip emitting unchanged functions and splice cached IR back |
 
 `build.py` consults the .ll cache *first*; if it hits, ritz0 never runs.
 That means a stale .ll *masks* the .sig (which would have caught this

@@ -491,6 +491,9 @@ fn load_and_parse(path: @String) -> *Module
         err2("Parse error in: ", path_ptr)
         return null
 
+    # The cached IR depends on these exact bytes (AGAST #1807).
+    dep_record_note(path_ptr, src.data, src.len - 1)
+
     # Keep source buffer alive: AST nodes point into it.
     keep_source_alive(src.data)
     src.data = null  # Prevent Vec Drop from freeing.
@@ -719,17 +722,18 @@ fn main(argc: i32, argv: **u8) -> i32
         print_usage()
         return 1
     set_target_os(args.target_os.ptr, args.target_os.len as i32)
-    # Cached IR (<src>.ritz.sig) depends on the compiler AND the target OS.
-    let cache_fp: u64 = cache_fingerprint(args.target_os.ptr, args.target_os.len)
+    # Cached IR depends on the compiler, the target OS and the import search
+    # path (see cache_fingerprint in fn_cache.ritz).
+    let cache_fp: u64 = cache_fingerprint(args.target_os.ptr, args.target_os.len, args.ritz_path.ptr, args.ritz_path.len)
 
     # Read source file
     var src: Vec<u8> = read_file(args.input_path)
     if src.len == 0
         return 1
 
-    # File-level fast path: if the existing output .ll is newer than the
-    # source AND <src>.ritz.sig records a matching source_hash, we can
-    # skip lex/parse/emit entirely.  This is the single biggest win for
+    # File-level fast path: if the sig records this source, this compiler
+    # identity and unchanged imports, and the .ll is current (or can be
+    # spliced from the sig), skip lex/parse/emit entirely.  This is the single biggest win for
     # no-op rebuilds (full-stack 12m30s → ~30s).
     if check_source_unchanged(args.input_path, src.data, src.len - 1, args.output_path, cache_fp) == 1
         var skip_msg: String = string_from("Skipped (unchanged): ")
@@ -766,6 +770,7 @@ fn main(argc: i32, argv: **u8) -> i32
     # itself included) pay nothing.
     if type_alias_count() > 0
         vec_clear<String>(@g_processed)
+        dep_record_reset()
         enum_tracker_reset()
         # Fresh views: ritz0's move checker treats StrView as move-only
         # (AGAST #1489), so the first pass's copies can't be passed again.
@@ -802,11 +807,11 @@ fn main(argc: i32, argv: **u8) -> i32
     if write_file(args.output_path, ir.data, ir.len as i64) < 0
         return 1
 
-    # Update <src>.ritz.sig with the current source hash and a snapshot
-    # of the emitted IR.  Next invocation's `check_source_unchanged` can
-    # then short-circuit emission entirely — even if the orchestrator
-    # wiped its artifact tempdir, the cached IR lives next to the source
-    # in the .sig file and gets spliced back into the requested output.
+    # Write the sig: source hash, compiler identity, import hashes and a
+    # snapshot of the emitted IR.  Next invocation's `check_source_unchanged`
+    # can then short-circuit emission entirely — even if the orchestrator
+    # wiped its artifact tempdir, the cached IR lives in the sig cache and
+    # gets spliced back into the requested output.
     var sig_out: *SigData = sig_data_new()
     if sig_out != null
         sig_out.source_hash = source_file_hash(src.data, src.len - 1)
@@ -824,6 +829,8 @@ fn main(argc: i32, argv: **u8) -> i32
                 *(ir_copy + ir_len) = 0
                 sig_out.module_ir = ir_copy
                 sig_out.module_ir_len = ir_len
+        # Every file the resolver loaded, with the bytes it parsed (#1807).
+        sig_take_deps(sig_out)
         var sig_path: String = sig_path_from_src(args.input_path)
         write_sig_file(string_as_ptr(@sig_path), sig_out)
         string_drop(@sig_path)

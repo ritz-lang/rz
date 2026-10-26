@@ -36,6 +36,16 @@ BUILD_PY = PKG_DIR / "build.py"
 EXAMPLE = PKG_DIR / "examples" / "tier1_basics" / "02_exitcode"
 
 
+def sig_path_for(src: Path, compiler: str) -> Path:
+    """ritz0's mapping of a source to its sig file (AGAST #1807), loaded by
+    path: ritz0 is not an installed package."""
+    spec = importlib.util.spec_from_file_location(
+        "ritz0_fn_cache_1807", PKG_DIR / "ritz0" / "emitter" / "fn_cache.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.sig_path_for(src, compiler)
+
+
 # ---------------------------------------------------------------------------
 # End-to-end helpers: real `build.py build` over a copy of 02_exitcode.
 # ---------------------------------------------------------------------------
@@ -148,8 +158,11 @@ def test_repro_c_matching_sig_does_not_forgive_binary_built_from_other_content(p
     src = main_src(pkg)
     t = binary(pkg).stat().st_mtime + 60
     os.utime(src, (t, t))
-    sig = src.with_suffix(".ritz.sig")
-    sig.write_text(json.dumps({"source_hash": fnv1a64(src.read_bytes())}))
+    # Plant it wherever either compiler would look (AGAST #1807 namespaces).
+    for compiler in ("ritz0", "ritz1"):
+        sig = sig_path_for(src, compiler)
+        sig.parent.mkdir(parents=True, exist_ok=True)
+        sig.write_text(json.dumps({"source_hash": fnv1a64(src.read_bytes())}))
 
     build(pkg)
     assert run_exit(pkg) == 8

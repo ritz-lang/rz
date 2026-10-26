@@ -25,7 +25,19 @@ AGAST #1392. Two things live here, and they are independent.
    `@pytest.mark.integration`, which were unregistered. That emitted 99
    PytestUnknownMarkWarnings per run and, more importantly, meant `-m unit`
    silently selected on a typo'd name rather than erroring.
+
+3. `RITZ_CACHE_DIR` (AGAST #1807) — compilers keep their sig files in a cache
+   directory that mirrors each source's absolute path.  Tests compile sources
+   under the temp directory, so without this every run would leave a mirror
+   of its tmp_path trees in ~/.cache/ritz.  Each session (each xdist worker)
+   gets a private cache, removed at exit; an explicit RITZ_CACHE_DIR wins.
 """
+
+import os
+import shutil
+import tempfile
+
+_SESSION_CACHE = None
 
 collect_ignore_glob = [
     "tmp*",
@@ -35,9 +47,18 @@ collect_ignore_glob = [
 
 
 def pytest_configure(config):
+    global _SESSION_CACHE
+    if not os.environ.get("RITZ_CACHE_DIR"):
+        _SESSION_CACHE = tempfile.mkdtemp(prefix="ritz-test-cache-")
+        os.environ["RITZ_CACHE_DIR"] = _SESSION_CACHE
     config.addinivalue_line(
         "markers", "unit: fast, in-process test with no compiler subprocess"
     )
     config.addinivalue_line(
         "markers", "integration: drives a real compile/link/run subprocess"
     )
+
+
+def pytest_unconfigure(config):
+    if _SESSION_CACHE is not None:
+        shutil.rmtree(_SESSION_CACHE, ignore_errors=True)

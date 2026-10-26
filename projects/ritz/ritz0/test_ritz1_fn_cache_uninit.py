@@ -5,7 +5,7 @@ read until it had `st_size` bytes.  When `read()` returned 0 (EOF) or an error
 before that, it set `total = sz` and reported the *whole* buffer as read, so
 the unread tail was uninitialised heap.  `compiler_fingerprint()` reads
 `/proc/self/exe` through it, so the compiler hash stamped into every
-`.ritz.sig` (and compared on every cache lookup) could hash garbage:
+sig file (and compared on every cache lookup) could hash garbage:
 
 * valgrind: `stat("/proc/self/exe")` reports memcheck's size while `open` is
   redirected to the client binary, which is how the bug was found
@@ -27,9 +27,13 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from emitter.fn_cache import sig_path_for  # noqa: E402
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
 RITZ1_SRC = RITZ_ROOT / "ritz1" / "src"
@@ -86,7 +90,7 @@ def _compile(cmd_prefix: list, ritz1: Path, tmp: Path) -> tuple:
     """Cold-compile SOURCE in `tmp`; return (process, parsed sig)."""
     src = tmp / "g.ritz"
     src.write_text(SOURCE)
-    sig = src.with_suffix(".ritz.sig")
+    sig = sig_path_for(src, "ritz1")
     if sig.exists():
         sig.unlink()
     proc = subprocess.run(

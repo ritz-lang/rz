@@ -33,6 +33,7 @@ bakes in imported struct layouts, constants and signatures, so the
 """
 
 import hashlib
+import os
 import json
 import sys
 from pathlib import Path
@@ -240,19 +241,58 @@ def _extract_fn_tokens(all_tokens: list, fn_def) -> list:
 # .ritz.sig File I/O
 # ============================================================================
 
-def _sig_path(source_path: str) -> Path:
-    """Get the .ritz.sig path for a source file.
+# Where sig files live (AGAST #1807, absorbing #1280).
+#
+# Sig files used to sit next to their sources as `<src>.ritz.sig`, shared by
+# ritz0, ritz1 and ritz1_selfhosted.  The three write different schemas, so
+# every compiler boundary in a gate (make ritz1, matrix-full, regression
+# stages) threw away the others' entries, and the files littered the source
+# tree (418 under projects/ritz), racing between worktrees and xdist workers.
+#
+# Decision: namespace them per compiler, outside the tree:
+#
+#     <cache root>/<compiler>/<realpath of source>.sig
+#
+# * cache root: $RITZ_CACHE_DIR, else $XDG_CACHE_HOME/ritz, else
+#   $HOME/.cache/ritz, else /tmp/ritz-cache.
+# * compiler:   "ritz0" here; ritz1 uses the basename of its own binary
+#   ("ritz1", "ritz1_selfhosted"), so the two ritz1 builds stop evicting
+#   each other too.  ritz1/src/fn_cache.ritz implements the same mapping.
+# * realpath:   the source's canonical absolute path, so two worktrees (or
+#   two checkouts) never share an entry.
+#
+# Rejected alternatives (from #1280): read-modify-write of one shared file
+# keeps the schemas coupled and still writes into the source tree; "accept
+# and document" leaves the ≥4 full invalidations per gate in place.
 
-    .ritz.sig files live alongside source files:
-      foo.ritz -> foo.ritz.sig
 
-    Args:
-        source_path: Path to the source file
+def sig_cache_root() -> Path:
+    """Root directory of the per-compiler sig caches (see note above)."""
+    explicit = os.environ.get('RITZ_CACHE_DIR')
+    if explicit:
+        return Path(explicit)
+    xdg = os.environ.get('XDG_CACHE_HOME')
+    if xdg:
+        return Path(xdg) / 'ritz'
+    home = os.environ.get('HOME')
+    if home:
+        return Path(home) / '.cache' / 'ritz'
+    return Path('/tmp/ritz-cache')
 
-    Returns:
-        Path to the .ritz.sig file
+
+def sig_path_for(source_path, compiler: str = 'ritz0') -> Path:
+    """Sig file for `source_path` in `compiler`'s namespace.
+
+    Tests use this with compiler="ritz1" (or a ritz1 binary's basename) to
+    find the file ritz1 writes; ritz0 itself only ever uses its own.
     """
-    return Path(source_path).with_suffix('.ritz.sig')
+    real = os.path.realpath(str(source_path))
+    return sig_cache_root() / compiler / (real.lstrip('/') + '.sig')
+
+
+def _sig_path(source_path: str) -> Path:
+    """ritz0's own sig file for a source file (never beside the source)."""
+    return sig_path_for(source_path, 'ritz0')
 
 
 def read_sig_file(source_path: str) -> Optional[Dict[str, Any]]:
@@ -287,9 +327,16 @@ def write_sig_file(source_path: str, data: Dict[str, Any]) -> None:
         data: Sig data dict to write
     """
     sig_file = _sig_path(source_path)
+    # The cache tree is shared by every worktree and xdist worker, so write
+    # to a per-process temp file and rename: a reader sees the old sig or the
+    # new one, never a torn one.
+    tmp = sig_file.with_name(f"{sig_file.name}.tmp.{os.getpid()}")
     try:
-        sig_file.write_text(json.dumps(data, indent=2) + '\n')
+        sig_file.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps(data, indent=2) + '\n')
+        os.replace(tmp, sig_file)
     except OSError as e:
+        tmp.unlink(missing_ok=True)
         print(f"Warning: could not write {sig_file}: {e}", file=sys.stderr)
 
 
@@ -561,11 +608,13 @@ def invalidate_dependents(
     if not module_import_name:
         return []
 
-    # Find all .ritz.sig files in the project
+    # Scan ritz0's sigs for the project.  They mirror source paths under
+    # the cache root, so the project's subtree of the namespace holds exactly
+    # its sigs — no walk over the source tree (or other worktrees) any more.
     if project_root:
-        search_root = Path(project_root)
+        search_root = _sig_path(os.path.join(project_root, '_')).parent
     else:
-        search_root = Path(source_path).parent
+        search_root = _sig_path(source_path).parent
 
     invalidated = []
     for sig_file in search_root.rglob('*.ritz.sig'):

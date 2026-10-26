@@ -213,6 +213,7 @@ class TestSigFileIO:
 
         try:
             sig_file = _sig_path(source_path)
+            sig_file.parent.mkdir(parents=True, exist_ok=True)
             sig_file.write_text("not valid json {{{")
             result = read_sig_file(source_path)
             assert result is None
@@ -228,6 +229,7 @@ class TestSigFileIO:
 
         try:
             sig_file = _sig_path(source_path)
+            sig_file.parent.mkdir(parents=True, exist_ok=True)
             sig_file.write_text(json.dumps({"not_functions": {}}))
             result = read_sig_file(source_path)
             assert result is None
@@ -643,7 +645,7 @@ class TestSigImportsPopulated:
         # The .sig for main.ritz must include 'lib' in its imports list,
         # otherwise invalidate_dependents can never find main.ritz when
         # lib.ritz changes.
-        sig_path = tmp_path / "main.ritz.sig"
+        sig_path = _sig_path(str(main))
         assert sig_path.exists(), "main.ritz.sig was not created"
 
         sig_data = json.loads(sig_path.read_text())
@@ -658,14 +660,15 @@ class TestSigImportsPopulated:
     def test_invalidate_dependents_finds_dependent_via_sig_imports(self, tmp_path):
         """When sig files have correct imports, invalidate_dependents finds them."""
         # Setup: two sig files. main.ritz.sig declares it imports 'lib'.
-        lib_sig = tmp_path / "lib.ritz.sig"
+        lib_sig = _sig_path(str(tmp_path / "lib.ritz"))
+        lib_sig.parent.mkdir(parents=True, exist_ok=True)
         lib_sig.write_text(json.dumps({
             "source_hash": "abc",
             "functions": {"helper": {"hash": "h1", "sig_hash": "s1", "ir": ""}},
             "imports": [],
         }))
 
-        main_sig = tmp_path / "main.ritz.sig"
+        main_sig = _sig_path(str(tmp_path / "main.ritz"))
         main_sig.write_text(json.dumps({
             "source_hash": "def",
             "functions": {"main": {"hash": "h2", "sig_hash": "s2", "ir": ""}},

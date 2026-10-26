@@ -14,7 +14,7 @@ The contract, matching ritz0 (`ritz0.py --target-os`, default "linux"):
 ritz0 is the oracle: every program is compiled by both and must agree on the
 exit code, which says which variant of `pick()` / `K` was kept.
 
-ritz1 also caches IR next to the source (`<src>.ritz.sig`). That cache must
+ritz1 also caches IR per source (its sig file; AGAST #1807). That cache must
 be keyed on the target OS too, or a harland compile of a file reuses the IR a
 linux compile of the same file left behind. The cache tests pin that.
 """
@@ -208,7 +208,7 @@ def test_ritz1_unmatched_os_keeps_unattributed_items(ritz1_bin, tmp_path):
     assert _run_ritz1(tmp_path, "unmatched", program, "prism") == 5
 
 
-# --- the .ritz.sig cache must be keyed on the target OS -------------------
+# --- the sig cache must be keyed on the target OS -------------------
 
 
 @pytest.mark.integration
