@@ -552,6 +552,10 @@ class LLVMEmitter:
                 'i16': (2, 2), 'u16': (2, 2),
                 'i32': (4, 4), 'u32': (4, 4),
                 'i64': (8, 8), 'u64': (8, 8),
+                # AGAST #1814: f32 had no entry and fell back to (8, 8), so
+                # sizeof of a struct with an f32 field disagreed with the
+                # `{float, ...}` layout LLVM gives it.
+                'f32': (4, 4), 'f64': (8, 8),
                 'bool': (1, 1),
                 # SIMD vector types (SSE2 128-bit, 16-byte aligned)
                 'v2i64': (16, 16),  # 2 x 8 = 16 bytes
@@ -8428,6 +8432,7 @@ class LLVMEmitter:
                     'i16': 2, 'u16': 2,
                     'i32': 4, 'u32': 4,
                     'i64': 8, 'u64': 8,
+                    'f32': 4, 'f64': 8,
                     'bool': 1,
                 }
                 if type_name in primitives:

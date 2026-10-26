@@ -763,6 +763,13 @@ fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
         if member_result.success == 1
             let field: *StructField = member_result.field
             if field.field_type == TYPE_ARRAY
+                let et: i32 = field.array_elem_type
+                if et == TYPE_F32
+                    # AGAST #1814: the field is now `[N x float]` (ritz0's
+                    # layout); ritz1 has no f32 element value model, and an
+                    # i64 read would stride 8 over 4-byte slots. Fail closed.
+                    emit_ir_error(s, c"indexing a [N]f32 struct field is not supported by ritz1")
+                    return 0
                 # Array field in struct - GEP directly into it
                 let idx: i32 = emit_expr(s, e.right)
                 let elem_ptr: i32 = next_reg(s)
@@ -771,15 +778,7 @@ fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
                 emit_str(s, c" = getelementptr [")
                 emit_int(s, field.array_size as i64)
                 emit_str(s, c" x ")
-                if field.array_elem_type == TYPE_I32
-                    emit_str(s, c"i32")
-                else if field.array_elem_type == TYPE_I64
-                    emit_str(s, c"i64")
-                else if field.array_elem_type == TYPE_U8 or field.array_elem_type == TYPE_I8
-                    emit_str(s, c"i8")
-                else if field.array_elem_type == TYPE_PTR or field.array_elem_type == TYPE_PTR_PTR
-                    emit_str(s, c"ptr")
-                else if field.array_elem_type == TYPE_STRUCT and field.array_elem_type_name_len > 0
+                if et == TYPE_STRUCT and field.array_elem_type_name_len > 0
                     # AGAST #188: struct-array RHS — `[N x %T]` so the GEP
                     # element stride matches the actual struct layout.  Without
                     # this, `doc.fields[i + 1]` (RHS-read) used `[64 x i64]`
@@ -788,67 +787,45 @@ fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
                     # in mausoleum doc_remove_field's compaction loop.
                     emit_llvm_type_struct(s, TYPE_STRUCT, field.array_elem_type_name, field.array_elem_type_name_len)
                 else
-                    emit_str(s, c"i64")
+                    # AGAST #1814: the field's declared element type.
+                    emit_str(s, field_array_elem_llvm(et))
                 emit_str(s, c"], ptr ")
                 emit_reg(s, member_result.reg)
                 emit_str(s, c", i64 0, i64 ")
                 emit_reg(s, idx)
                 emit_str(s, c"\n")
-                # Load element
+                # Load element. Integer/pointer elements load at their own
+                # width (array_elem_llvm) and widen to i64. f64 elements keep
+                # their historical i64 bit-load (same 8-byte slot). Bool loads
+                # its i1 and zero-extends.
+                var load_ty: *u8 = array_elem_llvm(et)
+                if et == TYPE_BOOL
+                    load_ty = c"i1"
                 let result: i32 = next_reg(s)
                 emit_str(s, c"  ")
                 emit_reg(s, result)
                 emit_str(s, c" = load ")
-                if field.array_elem_type == TYPE_I32
-                    emit_str(s, c"i32")
-                else if field.array_elem_type == TYPE_I64
-                    emit_str(s, c"i64")
-                else if field.array_elem_type == TYPE_U8 or field.array_elem_type == TYPE_I8
-                    emit_str(s, c"i8")
-                else if field.array_elem_type == TYPE_PTR or field.array_elem_type == TYPE_PTR_PTR
-                    emit_str(s, c"ptr")
-                else if field.array_elem_type == TYPE_STRUCT and field.array_elem_type_name_len > 0
+                if et == TYPE_STRUCT and field.array_elem_type_name_len > 0
                     # AGAST #188: load the struct value as `%T`, not as i64.
                     emit_llvm_type_struct(s, TYPE_STRUCT, field.array_elem_type_name, field.array_elem_type_name_len)
                 else
-                    emit_str(s, c"i64")
+                    emit_str(s, load_ty)
                 emit_str(s, c", ptr ")
                 emit_reg(s, elem_ptr)
                 emit_str(s, c"\n")
-                # Extend to i64 if needed
-                if field.array_elem_type == TYPE_U8
-                    let ext: i32 = next_reg(s)
+                if et == TYPE_STRUCT and field.array_elem_type_name_len > 0
+                    return result
+                if et == TYPE_BOOL
+                    let bext: i32 = next_reg(s)
                     emit_str(s, c"  ")
-                    emit_reg(s, ext)
-                    emit_str(s, c" = zext i8 ")
+                    emit_reg(s, bext)
+                    emit_str(s, c" = zext i1 ")
                     emit_reg(s, result)
                     emit_str(s, c" to i64\n")
-                    return ext
-                else if field.array_elem_type == TYPE_I8
-                    let ext: i32 = next_reg(s)
-                    emit_str(s, c"  ")
-                    emit_reg(s, ext)
-                    emit_str(s, c" = sext i8 ")
-                    emit_reg(s, result)
-                    emit_str(s, c" to i64\n")
-                    return ext
-                else if field.array_elem_type == TYPE_I32
-                    let ext: i32 = next_reg(s)
-                    emit_str(s, c"  ")
-                    emit_reg(s, ext)
-                    emit_str(s, c" = sext i32 ")
-                    emit_reg(s, result)
-                    emit_str(s, c" to i64\n")
-                    return ext
-                else if field.array_elem_type == TYPE_PTR or field.array_elem_type == TYPE_PTR_PTR
-                    let pti: i32 = next_reg(s)
-                    emit_str(s, c"  ")
-                    emit_reg(s, pti)
-                    emit_str(s, c" = ptrtoint ptr ")
-                    emit_reg(s, result)
-                    emit_str(s, c" to i64\n")
-                    return pti
-                return result
+                    return bext
+                # Extend to i64 if needed (zext unsigned, sext signed,
+                # ptrtoint pointers; i64 as-is).
+                return emit_array_elem_widen(s, result, et, load_ty)
             # AGAST #184: `obj.fwd[i]` value-read where `fwd: **Foo` is a
             # pointer to an array of *Foo (skip-list / hash-bucket pattern).
             # Pre-fix this fell through to "; ERROR: unhandled EXPR_MEMBER"

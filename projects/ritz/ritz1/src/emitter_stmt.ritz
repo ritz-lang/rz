@@ -829,86 +829,7 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
                         # Array field in struct - GEP to element, then store
                         let idx: i32 = emit_expr(s, target_expr.right)
                         let val: i32 = emit_expr(s, stmt.assign_value)
-                        let elem_ptr: i32 = next_reg(s)
-                        emit_str(s, c"  ")
-                        emit_reg(s, elem_ptr)
-                        emit_str(s, c" = getelementptr [")
-                        emit_int(s, field.array_size as i64)
-                        emit_str(s, c" x ")
-                        if field.array_elem_type == TYPE_I32
-                            emit_str(s, c"i32")
-                        else if field.array_elem_type == TYPE_I64
-                            emit_str(s, c"i64")
-                        else if field.array_elem_type == TYPE_U8 or field.array_elem_type == TYPE_I8
-                            emit_str(s, c"i8")
-                        else if field.array_elem_type == TYPE_PTR or field.array_elem_type == TYPE_PTR_PTR
-                            emit_str(s, c"ptr")
-                        else if field.array_elem_type == TYPE_STRUCT and field.array_elem_type_name_len > 0
-                            # AGAST #188: struct-array LHS — emit `[N x %T]`
-                            # so the GEP and the store agree with the actual
-                            # element layout.
-                            emit_llvm_type_struct(s, TYPE_STRUCT, field.array_elem_type_name, field.array_elem_type_name_len)
-                        else
-                            emit_str(s, c"i64")
-                        emit_str(s, c"], ptr ")
-                        emit_reg(s, member_result.reg)
-                        emit_str(s, c", i64 0, i64 ")
-                        emit_reg(s, idx)
-                        emit_str(s, c"\n")
-                        # Store element
-                        if field.array_elem_type == TYPE_I32
-                            let trunc: i32 = next_reg(s)
-                            emit_str(s, c"  ")
-                            emit_reg(s, trunc)
-                            emit_str(s, c" = trunc i64 ")
-                            emit_reg(s, val)
-                            emit_str(s, c" to i32\n")
-                            emit_str(s, c"  store i32 ")
-                            emit_reg(s, trunc)
-                            emit_str(s, c", ptr ")
-                            emit_reg(s, elem_ptr)
-                            emit_str(s, c"\n")
-                        else if field.array_elem_type == TYPE_U8 or field.array_elem_type == TYPE_I8
-                            let trunc: i32 = next_reg(s)
-                            emit_str(s, c"  ")
-                            emit_reg(s, trunc)
-                            emit_str(s, c" = trunc i64 ")
-                            emit_reg(s, val)
-                            emit_str(s, c" to i8\n")
-                            emit_str(s, c"  store i8 ")
-                            emit_reg(s, trunc)
-                            emit_str(s, c", ptr ")
-                            emit_reg(s, elem_ptr)
-                            emit_str(s, c"\n")
-                        else if field.array_elem_type == TYPE_PTR or field.array_elem_type == TYPE_PTR_PTR
-                            let ptr_val: i32 = next_reg(s)
-                            emit_str(s, c"  ")
-                            emit_reg(s, ptr_val)
-                            emit_str(s, c" = inttoptr i64 ")
-                            emit_reg(s, val)
-                            emit_str(s, c" to ptr\n")
-                            emit_str(s, c"  store ptr ")
-                            emit_reg(s, ptr_val)
-                            emit_str(s, c", ptr ")
-                            emit_reg(s, elem_ptr)
-                            emit_str(s, c"\n")
-                        else if field.array_elem_type == TYPE_STRUCT and field.array_elem_type_name_len > 0
-                            # AGAST #188: struct array element store —
-                            # `store %T %val, ptr %elem` matches the
-                            # `load %T, ...` from the deref RHS.
-                            emit_str(s, c"  store ")
-                            emit_llvm_type_struct(s, TYPE_STRUCT, field.array_elem_type_name, field.array_elem_type_name_len)
-                            emit_str(s, c" ")
-                            emit_reg(s, val)
-                            emit_str(s, c", ptr ")
-                            emit_reg(s, elem_ptr)
-                            emit_str(s, c"\n")
-                        else
-                            emit_str(s, c"  store i64 ")
-                            emit_reg(s, val)
-                            emit_str(s, c", ptr ")
-                            emit_reg(s, elem_ptr)
-                            emit_str(s, c"\n")
+                        emit_field_array_elem_store(s, member_result.reg, field, idx, val, stmt.assign_value)
                         return
                     # AGAST #1596: `x.f[i] = v` with `f: *T` / `**T` —
                     # store THROUGH the pointer held in the field.
@@ -1864,6 +1785,73 @@ fn emit_index_assign_ptr_store(s: *EmitterState, stmt: *Stmt, base_ptr: i32, bas
         emit_reg(s, elem_ptr)
         emit_str(s, c"\n")
 
+# AGAST #1814: `x.f[i] = v` where `f` is an inline `[N]T` array field at
+# `field_ptr`. GEP the element at the field's DECLARED element type
+# (field_array_elem_llvm, ritz0's layout) and store `val` at that width.
+# Shared by both member-index store paths, which used to carry their own
+# i8/i32/i64/ptr ladders and stored u16/u32/bool elements as 8-byte i64.
+fn emit_field_array_elem_store(s: *EmitterState, field_ptr: i32, field: *StructField, idx: i32, val: i32, val_expr: *Expr)
+    let et: i32 = field.array_elem_type
+    var is_struct: i32 = 0
+    if et == TYPE_STRUCT and field.array_elem_type_name_len > 0
+        is_struct = 1
+    if et == TYPE_F32
+        # `[N x float]`: ritz1 has no f32 element store. Fail closed rather
+        # than stride 8 over 4-byte slots.
+        emit_ir_error(s, c"assigning to a [N]f32 struct field element is not supported by ritz1")
+        return
+    let elem_ptr: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, elem_ptr)
+    emit_str(s, c" = getelementptr [")
+    emit_int(s, field.array_size as i64)
+    emit_str(s, c" x ")
+    if is_struct == 1
+        # AGAST #188: struct-array LHS — `[N x %T]` so the GEP and the store
+        # agree with the struct value being stored.
+        emit_llvm_type_struct(s, TYPE_STRUCT, field.array_elem_type_name, field.array_elem_type_name_len)
+    else
+        emit_str(s, field_array_elem_llvm(et))
+    emit_str(s, c"], ptr ")
+    emit_reg(s, field_ptr)
+    emit_str(s, c", i64 0, i64 ")
+    emit_reg(s, idx)
+    emit_str(s, c"\n")
+    var sty: *u8 = c"i64"
+    var sval: i32 = val
+    if is_struct == 1
+        # AGAST #188: `store %T %val` matches the `load %T` of the RHS.
+        emit_str(s, c"  store ")
+        emit_llvm_type_struct(s, TYPE_STRUCT, field.array_elem_type_name, field.array_elem_type_name_len)
+        emit_str(s, c" ")
+        emit_reg(s, val)
+        emit_str(s, c", ptr ")
+        emit_reg(s, elem_ptr)
+        emit_str(s, c"\n")
+        return
+    if et == TYPE_BOOL
+        # An i1 register stores as-is; an i64 bool truncates.
+        sty = c"i1"
+        if bool_reg_is_i1(s, val_expr) == 0
+            sval = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, sval)
+            emit_str(s, c" = trunc i64 ")
+            emit_reg(s, val)
+            emit_str(s, c" to i1\n")
+    else
+        # Integers / pointers at their own width (trunc / inttoptr); i64 and
+        # f64 elements store all 8 bytes, as before.
+        sty = array_elem_llvm(et)
+        sval = emit_array_elem_narrow(s, val, et, sty)
+    emit_str(s, c"  store ")
+    emit_str(s, sty)
+    emit_str(s, c" ")
+    emit_reg(s, sval)
+    emit_str(s, c", ptr ")
+    emit_reg(s, elem_ptr)
+    emit_str(s, c"\n")
+
 # AGAST #1596: `x.f[i] = v` where `f` is a pointer field (`*T` / `**T`):
 # load the pointer from the field slot `field_slot`, GEP by the pointee, and
 # store `v` at the pointee's width. Returns 0 WITHOUT emitting anything when
@@ -2651,86 +2639,7 @@ fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                     let idx_reg: i32 = emit_expr(s, stmt.while_cond)
                     # Emit value expression
                     let val_reg: i32 = emit_expr(s, stmt.assign_value)
-                    # Second GEP to get array element
-                    let elem_ptr: i32 = next_reg(s)
-                    emit_str(s, c"  ")
-                    emit_reg(s, elem_ptr)
-                    emit_str(s, c" = getelementptr [")
-                    emit_int(s, field.array_size as i64)
-                    emit_str(s, c" x ")
-                    if field.array_elem_type == TYPE_I32
-                        emit_str(s, c"i32")
-                    else if field.array_elem_type == TYPE_I64
-                        emit_str(s, c"i64")
-                    else if field.array_elem_type == TYPE_U8 or field.array_elem_type == TYPE_I8
-                        emit_str(s, c"i8")
-                    else if field.array_elem_type == TYPE_PTR or field.array_elem_type == TYPE_PTR_PTR
-                        emit_str(s, c"ptr")
-                    else if field.array_elem_type == TYPE_STRUCT and field.array_elem_type_name_len > 0
-                        # AGAST #188: struct-array LHS in `local.field[i] = *src`
-                        # — emit `[N x %T]` so the GEP and store match the
-                        # struct value loaded from `*src`.
-                        emit_llvm_type_struct(s, TYPE_STRUCT, field.array_elem_type_name, field.array_elem_type_name_len)
-                    else
-                        emit_str(s, c"i64")
-                    emit_str(s, c"], ptr ")
-                    emit_reg(s, field_ptr)
-                    emit_str(s, c", i64 0, i64 ")
-                    emit_reg(s, idx_reg)
-                    emit_str(s, c"\n")
-                    # Store value - handle type conversion
-                    if field.array_elem_type == TYPE_U8 or field.array_elem_type == TYPE_I8
-                        let trunc: i32 = next_reg(s)
-                        emit_str(s, c"  ")
-                        emit_reg(s, trunc)
-                        emit_str(s, c" = trunc i64 ")
-                        emit_reg(s, val_reg)
-                        emit_str(s, c" to i8\n")
-                        emit_str(s, c"  store i8 ")
-                        emit_reg(s, trunc)
-                        emit_str(s, c", ptr ")
-                        emit_reg(s, elem_ptr)
-                        emit_str(s, c"\n")
-                    else if field.array_elem_type == TYPE_I32
-                        let trunc: i32 = next_reg(s)
-                        emit_str(s, c"  ")
-                        emit_reg(s, trunc)
-                        emit_str(s, c" = trunc i64 ")
-                        emit_reg(s, val_reg)
-                        emit_str(s, c" to i32\n")
-                        emit_str(s, c"  store i32 ")
-                        emit_reg(s, trunc)
-                        emit_str(s, c", ptr ")
-                        emit_reg(s, elem_ptr)
-                        emit_str(s, c"\n")
-                    else if field.array_elem_type == TYPE_PTR or field.array_elem_type == TYPE_PTR_PTR
-                        let ptr_val: i32 = next_reg(s)
-                        emit_str(s, c"  ")
-                        emit_reg(s, ptr_val)
-                        emit_str(s, c" = inttoptr i64 ")
-                        emit_reg(s, val_reg)
-                        emit_str(s, c" to ptr\n")
-                        emit_str(s, c"  store ptr ")
-                        emit_reg(s, ptr_val)
-                        emit_str(s, c", ptr ")
-                        emit_reg(s, elem_ptr)
-                        emit_str(s, c"\n")
-                    else if field.array_elem_type == TYPE_STRUCT and field.array_elem_type_name_len > 0
-                        # AGAST #188: struct-array LHS store — `store %T %val`
-                        # matches the `load %T, ...` from the deref RHS.
-                        emit_str(s, c"  store ")
-                        emit_llvm_type_struct(s, TYPE_STRUCT, field.array_elem_type_name, field.array_elem_type_name_len)
-                        emit_str(s, c" ")
-                        emit_reg(s, val_reg)
-                        emit_str(s, c", ptr ")
-                        emit_reg(s, elem_ptr)
-                        emit_str(s, c"\n")
-                    else
-                        emit_str(s, c"  store i64 ")
-                        emit_reg(s, val_reg)
-                        emit_str(s, c", ptr ")
-                        emit_reg(s, elem_ptr)
-                        emit_str(s, c"\n")
+                    emit_field_array_elem_store(s, field_ptr, field, idx_reg, val_reg, stmt.assign_value)
         # AGAST #1439: unresolved here -> shared member-store path.
         if lfia_done == 0
             emit_local_field_store_fallback(s, stmt, 1)

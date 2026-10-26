@@ -989,6 +989,20 @@ fn array_elem_llvm(t: i32) -> *u8
         return c"ptr"
     return c"i64"
 
+# The LLVM element type of a non-struct `[N]T` STRUCT FIELD. This is the
+# spelling emit_field_llvm_type declares the field with, so it must match
+# ritz0's (the cross-compiler struct ABI) and every GEP over the field must
+# use it. AGAST #1814: the field ladder lacked u16/i16/u32/f32/f64/bool, so
+# `a: [4]u16` was declared `[4 x i64]` (32 bytes) while sizeof counted 8.
+fn field_array_elem_llvm(t: i32) -> *u8
+    if t == TYPE_F32
+        return c"float"
+    if t == TYPE_F64
+        return c"double"
+    if t == TYPE_BOOL
+        return c"i1"
+    return array_elem_llvm(t)
+
 # Widen an array element just loaded as `ty` (array_elem_llvm(t)) to the i64
 # every expression value is carried in: zext unsigned, sext signed, ptrtoint
 # pointers. i64 elements are returned as-is.
@@ -2007,39 +2021,14 @@ fn get_struct_size_by_name(s: *EmitterState, name: *u8, name_len: i32) -> i64
     var max_align: i64 = 1
     var f: *StructField = st.fields
     while f != null
-        var fsize: i64 = 8
         var falign: i64 = 8
-        if f.field_type == TYPE_U8 or f.field_type == TYPE_I8
-            fsize = 1
-            falign = 1
-        else if f.field_type == TYPE_U16 or f.field_type == TYPE_I16
-            fsize = 2
-            falign = 2
-        else if f.field_type == TYPE_U32 or f.field_type == TYPE_I32
-            fsize = 4
-            falign = 4
-        else if f.field_type == TYPE_ARRAY
+        var fsize: i64 = 8
+        if f.field_type == TYPE_ARRAY
             # Array: size = elem_size * count, align = elem_align
-            var esize: i64 = 8
-            var ealign: i64 = 8
-            if f.array_elem_type == TYPE_U8 or f.array_elem_type == TYPE_I8
-                esize = 1
-                ealign = 1
-            else if f.array_elem_type == TYPE_U16 or f.array_elem_type == TYPE_I16
-                esize = 2
-                ealign = 2
-            else if f.array_elem_type == TYPE_U32 or f.array_elem_type == TYPE_I32
-                esize = 4
-                ealign = 4
-            else if f.array_elem_type == TYPE_STRUCT and f.array_elem_type_name_len > 0
-                esize = get_struct_size_by_name(s, f.array_elem_type_name, f.array_elem_type_name_len)
-                ealign = 8  # struct alignment (simplified to 8)
-            fsize = esize * (f.array_size as i64)
-            falign = ealign
-        else if f.field_type == TYPE_STRUCT and f.field_type_name_len > 0
-            fsize = get_struct_size_by_name(s, f.field_type_name, f.field_type_name_len)
-            falign = 8  # struct alignment (simplified to 8)
-        # else: pointer/i64/ref — size 8, align 8 (default)
+            fsize = elem_size_align(s, f.array_elem_type, f.array_elem_type_name, f.array_elem_type_name_len, @falign)
+            fsize = fsize * (f.array_size as i64)
+        else
+            fsize = elem_size_align(s, f.field_type, f.field_type_name, f.field_type_name_len, @falign)
 
         # Align offset up to falign
         let rem: i64 = offset % falign
@@ -2056,6 +2045,59 @@ fn get_struct_size_by_name(s: *EmitterState, name: *u8, name_len: i32) -> i64
         if rem2 != 0
             offset = offset + (max_align - rem2)
     return offset
+
+# Alignment of a named struct: its most-aligned field (LLVM DataLayout
+# natural alignment). 8 for a name that does not resolve, matching
+# get_struct_size_by_name's fallback.
+fn get_struct_align_by_name(s: *EmitterState, name: *u8, name_len: i32) -> i64
+    if name == null or name_len == 0
+        return 8
+    let st: *StructDef = find_struct(s, name, name_len)
+    if st == null
+        return 8
+    var max_align: i64 = 1
+    var f: *StructField = st.fields
+    while f != null
+        var falign: i64 = 8
+        if f.field_type == TYPE_ARRAY
+            elem_size_align(s, f.array_elem_type, f.array_elem_type_name, f.array_elem_type_name_len, @falign)
+        else
+            elem_size_align(s, f.field_type, f.field_type_name, f.field_type_name_len, @falign)
+        if falign > max_align
+            max_align = falign
+        f = f.next
+    return max_align
+
+# Byte size of the primitive type spelled `name` (`sizeof(u16)` = 2), or 0
+# when `name` is not a primitive (a struct name, to be measured instead).
+fn prim_name_size(name: *u8, len: i32) -> i64
+    if name_eq(name, len, c"u8", 2) == 1 or name_eq(name, len, c"i8", 2) == 1 or name_eq(name, len, c"bool", 4) == 1
+        return 1
+    if name_eq(name, len, c"u16", 3) == 1 or name_eq(name, len, c"i16", 3) == 1
+        return 2
+    if name_eq(name, len, c"u32", 3) == 1 or name_eq(name, len, c"i32", 3) == 1 or name_eq(name, len, c"f32", 3) == 1
+        return 4
+    if name_eq(name, len, c"u64", 3) == 1 or name_eq(name, len, c"i64", 3) == 1 or name_eq(name, len, c"f64", 3) == 1
+        return 8
+    if name_eq(name, len, c"usize", 5) == 1 or name_eq(name, len, c"isize", 5) == 1
+        return 8
+    return 0
+
+# Natural size of one value of kind `t` (a TYPE_* primitive, or TYPE_STRUCT
+# named `name`), with its alignment written to `*align`. AGAST #1814: bool
+# and f32 were sized 8 and nested structs aligned to 8, so sizeof disagreed
+# with the `%T = type` body LLVM lays out. Kinds with no recorded size
+# (enums, refs, unresolved names) keep the historical 8/8.
+fn elem_size_align(s: *EmitterState, t: i32, name: *u8, name_len: i32, align: *i64) -> i64
+    if t == TYPE_STRUCT and name_len > 0
+        *align = get_struct_align_by_name(s, name, name_len)
+        return get_struct_size_by_name(s, name, name_len)
+    let sz: i64 = ptr_pointee_size(s, t, null, 0)
+    if sz == 0
+        *align = 8
+        return 8
+    *align = sz
+    return sz
 
 # Byte size of one element of a pointer whose pointee is `pointee`
 # (a TYPE_* kind; for TYPE_STRUCT, `name`/`name_len` name the struct).
@@ -2622,20 +2664,12 @@ fn emit_field_llvm_type(s: *EmitterState, f: *StructField)
         emit_str(s, c"[")
         emit_int(s, f.array_size as i64)
         emit_str(s, c" x ")
-        if f.array_elem_type == TYPE_I32
-            emit_str(s, c"i32")
-        else if f.array_elem_type == TYPE_I64
-            emit_str(s, c"i64")
-        else if f.array_elem_type == TYPE_U8 or f.array_elem_type == TYPE_I8
-            emit_str(s, c"i8")
-        else if f.array_elem_type == TYPE_PTR or f.array_elem_type == TYPE_PTR_PTR
-            emit_str(s, c"ptr")
-        else if f.array_elem_type == TYPE_STRUCT
+        if f.array_elem_type == TYPE_STRUCT
             # Emit struct type reference: %StructName
             emit_str(s, c"%")
             emit_name(s, f.array_elem_type_name, f.array_elem_type_name_len)
         else
-            emit_str(s, c"i64")
+            emit_str(s, field_array_elem_llvm(f.array_elem_type))
         emit_str(s, c"]")
     else
         emit_str(s, c"i64")
