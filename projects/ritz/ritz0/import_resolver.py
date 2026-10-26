@@ -980,6 +980,39 @@ class ImportResolver:
 
         return None
 
+    def direct_imports(self, source_path: str) -> List[str]:
+        """Resolved paths of the modules `source_path` imports directly.
+
+        Parses the file with the real lexer/parser, so every import form
+        counts: `import a.b`, `import a.b { X }`, `pub import a.b`,
+        `import a.b as y`, multi-line brace lists. Resolution goes through
+        `_resolve_import_path`, the same code the compiler uses, with this
+        resolver's project root, source roots and dependency namespaces.
+
+        AGAST #1832: the build cache (`cache.py`) builds its per-module
+        import graph from this. It used to run its own regex, which matched
+        only the bare form and missed 30% of imports.
+
+        Unresolvable imports are skipped. Compiling the file reports them.
+
+        Returns:
+            Absolute paths in source order, without duplicates.
+        """
+        source_path = str(Path(source_path).resolve())
+        if self.project_root is None:
+            # Same auto-detection `resolve()` does for the main file.
+            self.project_root = self._find_project_root(Path(source_path).parent)
+        source = Path(source_path).read_text()
+        module = Parser(Lexer(source, source_path).tokenize()).parse_module()
+        found: List[str] = []
+        for item in module.items:
+            if not isinstance(item, rast.Import):
+                continue
+            resolved = self._resolve_import_path(item.path, source_path)
+            if resolved is not None and resolved not in found:
+                found.append(resolved)
+        return found
+
     def _register_items_from_metadata(self, meta: ModuleMetadata, source_file: str):
         """Register AST items from cached metadata (avoids re-parsing).
 

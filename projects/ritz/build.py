@@ -1327,6 +1327,14 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
     # This ensures ritzlib is resolved consistently across all dependencies
     project_root = pkg_dir if pkg_dir else ROOT
     cmd.extend(["--project-root", str(project_root)])
+    # AGAST #1832: the per-module cache must resolve imports exactly as
+    # list_deps does, or modules found via source roots / dependency
+    # namespaces drop out of its import graph.
+    cache.set_import_context(
+        project_root=project_root,
+        dependencies={n: (s.path, s.sources) for n, s in (dependencies or {}).items()},
+        source_roots=source_roots,
+    )
     if dependencies:
         # Convert DependencySpec to JSON for passing to subprocess
         deps_json = {

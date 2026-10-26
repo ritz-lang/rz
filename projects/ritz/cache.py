@@ -19,7 +19,6 @@ Cache directory structure:
 import json
 import hashlib
 import os
-import re
 import shutil
 from pathlib import Path
 from typing import Optional, Dict, List, Set, Tuple
@@ -32,6 +31,9 @@ from dataclasses import dataclass, field, asdict
 
 CACHE_DIR_NAME = ".ritz-cache"
 DEPS_FILE = "deps.json"
+# Persisted direct-import scans (AGAST #1832): "<context>\0<path>" ->
+# {"hash": content hash, "imports": [resolved paths]}.
+IMPORTS_FILE = "imports.json"
 HASHES_FILE = "hashes.json"
 OBJECTS_DIR = "objects"
 COMPILER_HASH_FILE = "compiler_hash"
@@ -92,22 +94,33 @@ RITZ0_EXCLUDE_FILE_PREFIXES = ("test_",)
 class FileInfo:
     """Information about a source file for caching purposes."""
     hash: str                    # SHA256 of file content
-    imports: List[str]           # List of import paths (e.g., ["ritzlib/sys.ritz"])
+    imports: List[str]           # Resolved paths of direct imports
     mtime: float                 # Last modification time
+    # Transitive import closure (excluding self) -> content hash of each file
+    # when THIS file's .ll was cached. AGAST #1832: dependency hashes must be
+    # recorded per dependent. With one shared hash per file, compiling b
+    # refreshed b's entry, so main (compiled later in the same build) saw b
+    # as unchanged and reused an object built against b's old layout.
+    # None = no snapshot (scanned only, or an old-format deps.json): rebuild.
+    built_against: Optional[Dict[str, str]] = None
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "hash": self.hash,
             "imports": self.imports,
             "mtime": self.mtime
         }
+        if self.built_against is not None:
+            d["built_against"] = self.built_against
+        return d
 
     @classmethod
     def from_dict(cls, data: dict) -> "FileInfo":
         return cls(
             hash=data["hash"],
             imports=data["imports"],
-            mtime=data["mtime"]
+            mtime=data["mtime"],
+            built_against=data.get("built_against"),
         )
 
 
@@ -147,67 +160,24 @@ class CacheState:
 # Dependency Scanner
 # ============================================================================
 
-# Regex to match import statements: import foo, import foo.bar
-IMPORT_PATTERN = re.compile(r'^import\s+([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*)\s*$', re.MULTILINE)
+# AGAST #1832: there is deliberately no import scanner in this file. A regex
+# that used to live here matched only bare `import a.b` lines and missed
+# `import a.b { X }`, `pub import` and `import a as b`: 30% of the imports in
+# the tree. A struct change in a module imported that way left its dependents'
+# cached .ll/.o stale. The import graph now comes from ritz0's
+# `ImportResolver.direct_imports`, the resolver the compiler and list_deps.py
+# use. Do not reintroduce a second resolver here.
+
+_RITZ0_DIR = Path(__file__).resolve().parent / "ritz0"
 
 
-def scan_imports(source: str) -> List[str]:
-    """Extract import paths from source code.
-
-    Returns a list of import paths like ["ritzlib.sys", "mem"].
-    """
-    imports = []
-    for match in IMPORT_PATTERN.finditer(source):
-        imports.append(match.group(1))
-    return imports
-
-
-def resolve_import_path(import_path: str, source_file: Path, project_root: Optional[Path] = None) -> Optional[Path]:
-    """Resolve an import path to an actual file path.
-
-    Resolution order:
-    1. Relative to importing file: foo.ritz, foo/bar.ritz
-    2. From project root: ritzlib/sys.ritz
-    3. From RITZ_PATH directories
-    """
-    parts = import_path.split('.')
-    base_dir = source_file.parent
-
-    # Try 1: Relative to importing file - foo/bar.ritz
-    relative_path = Path(*parts[:-1]) / f"{parts[-1]}.ritz" if len(parts) > 1 else Path(f"{parts[0]}.ritz")
-    candidate = base_dir / relative_path
-    if candidate.exists():
-        return candidate.resolve()
-
-    # Try 1b: Relative to importing file - foo.bar.ritz (flat name)
-    flat_name = '.'.join(parts) + '.ritz'
-    candidate = base_dir / flat_name
-    if candidate.exists():
-        return candidate.resolve()
-
-    # Try 2: From project root
-    if project_root:
-        candidate = project_root / relative_path
-        if candidate.exists():
-            return candidate.resolve()
-        candidate = project_root / flat_name
-        if candidate.exists():
-            return candidate.resolve()
-
-    # Try 3: From RITZ_PATH directories
-    ritz_path = os.environ.get('RITZ_PATH', '')
-    if ritz_path:
-        for p in ritz_path.split(':'):
-            if p and Path(p).exists():
-                import_dir = Path(p).resolve()
-                candidate = import_dir / relative_path
-                if candidate.exists():
-                    return candidate.resolve()
-                candidate = import_dir / flat_name
-                if candidate.exists():
-                    return candidate.resolve()
-
-    return None
+def _import_resolver_module():
+    """Import ritz0's import_resolver (it needs ritz0/ on sys.path)."""
+    import sys
+    if str(_RITZ0_DIR) not in sys.path:
+        sys.path.insert(0, str(_RITZ0_DIR))
+    import import_resolver
+    return import_resolver
 
 
 def find_project_root(start_dir: Path) -> Optional[Path]:
@@ -375,6 +345,113 @@ class BuildCache:
         self._cache_dir: Optional[Path] = None
         self._compiler_hash: Optional[str] = None
         self._compiler_hash_valid: Optional[bool] = None
+        # Import resolution context (AGAST #1832). See `set_import_context`.
+        self._import_root: Optional[Path] = None
+        self._import_deps: Dict[str, Tuple[Path, List[str]]] = {}
+        self._import_source_roots: List[str] = []
+        self._resolver = None
+        # (resolved path, content hash) -> direct imports. A file is parsed
+        # at most once per content per context, however many sources a build
+        # checks.
+        self._direct_imports: Dict[Tuple[str, str], List[str]] = {}
+        # On-disk scan store (IMPORTS_FILE), loaded lazily. Lexing+parsing is
+        # slow (~7s cold for ritz1's 39-file closure), so a new build process
+        # re-parses only files whose content changed.
+        self._imports_db: Optional[Dict[str, dict]] = None
+        self._imports_db_dirty = False
+
+    def set_import_context(
+        self,
+        project_root: Optional[Path] = None,
+        dependencies: Optional[Dict[str, Tuple[Path, List[str]]]] = None,
+        source_roots: Optional[List[str]] = None,
+    ) -> None:
+        """Resolve imports exactly as the build does.
+
+        build.py resolves a package's imports with `--project-root <pkg>`,
+        its `sources` roots and its dependency namespaces (list_deps.py and
+        ritz0 both get them). Pass the same values here, or a module found
+        through a source root or a dependency is missing from the cache's
+        import graph, and edits to it never invalidate dependents.
+
+        Args:
+            project_root: Package directory (defaults to this cache's root).
+            dependencies: name -> (dependency root, its source dirs).
+            source_roots: Source directories, relative to `project_root`.
+        """
+        root = Path(project_root).resolve() if project_root else None
+        deps = {name: (Path(p), list(srcs)) for name, (p, srcs) in (dependencies or {}).items()}
+        roots = list(source_roots or [])
+        if (root, deps, roots) == (self._import_root, self._import_deps, self._import_source_roots):
+            return
+        self._import_root, self._import_deps, self._import_source_roots = root, deps, roots
+        self._resolver = None
+        self._direct_imports.clear()
+
+    def _context_key(self) -> str:
+        """Identifies the resolution context of a persisted scan."""
+        root = self._import_root or self.project_root
+        return json.dumps([
+            str(root) if root else None,
+            sorted((n, str(p), s) for n, (p, s) in self._import_deps.items()),
+            self._import_source_roots,
+            os.environ.get("RITZ_PATH", ""),
+        ])
+
+    def _load_imports_db(self) -> Dict[str, dict]:
+        if self._imports_db is None:
+            self._imports_db = {}
+            path = self.cache_dir / IMPORTS_FILE
+            if path.exists():
+                try:
+                    self._imports_db = json.loads(path.read_text())
+                except (OSError, ValueError):
+                    pass  # corrupt or unreadable: rescan
+        return self._imports_db
+
+    def _save_imports_db(self) -> None:
+        if self._imports_db_dirty and self._imports_db is not None:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            tmp = self.cache_dir / (IMPORTS_FILE + ".tmp")
+            tmp.write_text(json.dumps(self._imports_db, indent=1, sort_keys=True))
+            tmp.replace(self.cache_dir / IMPORTS_FILE)
+            self._imports_db_dirty = False
+
+    def _scan_direct_imports(self, path: str, file_hash: str) -> List[str]:
+        """Direct imports of `path`, from memory, disk, or a fresh parse."""
+        key = (path, file_hash)
+        imports = self._direct_imports.get(key)
+        if imports is not None:
+            return imports
+        db = self._load_imports_db()
+        db_key = f"{self._context_key()}\0{path}"
+        entry = db.get(db_key)
+        # Reuse only for identical content, and only while every target still
+        # exists (a moved module can resolve the same import elsewhere).
+        if (entry is not None and entry.get("hash") == file_hash
+                and all(Path(p).exists() for p in entry.get("imports", []))):
+            imports = list(entry["imports"])
+        else:
+            imports = self._get_resolver().direct_imports(path)
+            db[db_key] = {"hash": file_hash, "imports": imports}
+            self._imports_db_dirty = True
+        self._direct_imports[key] = imports
+        return imports
+
+    def _get_resolver(self):
+        if self._resolver is None:
+            ir = _import_resolver_module()
+            root = self._import_root or self.project_root
+            self._resolver = ir.ImportResolver(
+                str(root) if root else None,
+                use_cache=False,  # discovery only; never write .ritz-meta
+                dependencies={
+                    name: ir.DependencyMapping(name=name, path=path, sources=srcs)
+                    for name, (path, srcs) in self._import_deps.items()
+                },
+                source_roots=self._import_source_roots,
+            )
+        return self._resolver
 
     @property
     def cache_dir(self) -> Path:
@@ -482,6 +559,10 @@ class BuildCache:
         if self.objects_dir.exists():
             shutil.rmtree(self.objects_dir)
         self._state = CacheState()  # forget dep graph + hashes too
+        # A ritz0 change can change how imports parse or resolve.
+        self._imports_db = {}
+        self._imports_db_dirty = True
+        self._direct_imports.clear()
         self._update_compiler_hash()
         return True
 
@@ -496,12 +577,16 @@ class BuildCache:
         """Save the cache state to disk."""
         if self._state is not None:
             self._state.save(self.cache_dir)
+        self._save_imports_db()
 
     def clear(self):
         """Clear the entire cache."""
         if self.cache_dir.exists():
             shutil.rmtree(self.cache_dir)
         self._state = CacheState()
+        self._imports_db = {}
+        self._imports_db_dirty = False
+        self._direct_imports.clear()
 
     def _get_safe_cache_name(self, source_path: Path) -> str:
         """Get a safe filename for caching based on source path."""
@@ -546,31 +631,15 @@ class BuildCache:
     def scan_file(self, source_path: Path) -> FileInfo:
         """Scan a source file and return its FileInfo."""
         source_path = source_path.resolve()
-
-        # Read file content
-        content = source_path.read_text()
-
-        # Compute hash
         file_hash = compute_file_hash(source_path)
 
-        # Scan imports
-        import_strs = scan_imports(content)
-
-        # Resolve imports to actual file paths
-        project_root = self.project_root or find_project_root(source_path.parent)
-        resolved_imports = []
-        for imp in import_strs:
-            resolved = resolve_import_path(imp, source_path, project_root)
-            if resolved:
-                resolved_imports.append(str(resolved))
-
-        # Get mtime
-        mtime = source_path.stat().st_mtime
+        # Every import form, resolved by ritz0's resolver (AGAST #1832).
+        imports = self._scan_direct_imports(str(source_path), file_hash)
 
         return FileInfo(
             hash=file_hash,
-            imports=resolved_imports,
-            mtime=mtime
+            imports=list(imports),
+            mtime=source_path.stat().st_mtime,
         )
 
     def get_transitive_dependencies(self, source_path: Path, visited: Optional[Set[str]] = None) -> Set[str]:
@@ -633,18 +702,36 @@ class BuildCache:
         # several changed deps this named a different one each run, which is the
         # same "reports a different thing every time" symptom that made build
         # failures impossible to diagnose.
-        all_deps = sorted(self.get_transitive_dependencies(source_path))
+        try:
+            all_deps = sorted(self.get_transitive_dependencies(source_path))
+        except Exception as e:  # lex/parse error in some module of the closure
+            # The import graph is unknown, so the cached artifact cannot be
+            # trusted. Recompiling reports the real error.
+            return True, f"import scan failed: {e}"
+        # Persist any fresh scans now: a fully cached build never reaches
+        # update_cache (which is what calls save()).
+        self._save_imports_db()
+        # Compare against the hashes THIS file was built against, never the
+        # shared per-file entries (AGAST #1832, see FileInfo.built_against).
+        built_against = cached_info.built_against
+        if built_against is None:
+            return True, "no dependency snapshot"
         for dep_path in all_deps:
             if dep_path == source_str:
                 continue  # Skip self
 
-            if dep_path not in self.state.deps:
-                return True, f"dependency not in cache: {dep_path}"
+            if dep_path not in built_against:
+                return True, f"new dependency: {dep_path}"
 
-            dep_info = self.state.deps[dep_path]
             current_dep_hash = compute_file_hash(Path(dep_path))
-            if current_dep_hash != dep_info.hash:
+            if current_dep_hash != built_against[dep_path]:
                 return True, f"dependency changed: {dep_path}"
+
+        # A dropped import changes the closure too; the cached object may
+        # still reference symbols from it, so recompile.
+        dropped = sorted(set(built_against) - set(all_deps))
+        if dropped:
+            return True, f"dependency removed: {dropped[0]}"
 
         return False, "cache is valid"
 
@@ -667,17 +754,20 @@ class BuildCache:
         cached_ll = self.get_cached_ll_path(source_path)
         cached_ll.write_text(ll_content)
 
-        # Scan and update dependency info for the source file and all its deps
-        # Sorted (AGAST #1286): this populates `self.state.deps`, a plain dict
-        # that `CacheState.save` serialises to `deps.json` in insertion order.
-        # Set iteration order made that file's key order vary run to run —
-        # harmless for build decisions, but it left the cache non-reproducible
-        # and noisy to diff when investigating "the cache lies" reports.
+        # Record this file's entry with a snapshot of every transitive
+        # dependency's hash (AGAST #1832). Only the compiled file's entry is
+        # written: overwriting a dependency's entry would wipe its own
+        # snapshot.
+        # Sorted (AGAST #1286): `deps.json` is serialised in insertion order;
+        # set iteration order made it differ run to run, which left the cache
+        # non-reproducible and noisy to diff.
+        source_str = str(source_path)
         all_deps = sorted(self.get_transitive_dependencies(source_path))
-        for dep_path in all_deps:
-            dep_path_obj = Path(dep_path)
-            info = self.scan_file(dep_path_obj)
-            self.state.deps[dep_path] = info
+        info = self.scan_file(source_path)
+        info.built_against = {
+            dep: compute_file_hash(Path(dep)) for dep in all_deps if dep != source_str
+        }
+        self.state.deps[source_str] = info
 
         # Save state to disk
         self.save()
