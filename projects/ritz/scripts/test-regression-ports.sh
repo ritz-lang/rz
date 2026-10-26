@@ -14,10 +14,12 @@
 #
 # The fix has two halves, and this file pins both:
 #
-#   1. Isolation.  regression.sh picks ONE free port per run and hands it to
-#      every example as RITZ_EXAMPLE_PORT in the fixed `env -i` environment.
-#      One value per run (not per stage), so 31_env/33_printenv still print
-#      byte-identical output in every stage.  The server examples read it.
+#   1. Isolation.  regression.sh picks a free block of ports per run.  Since
+#      examples run in parallel (AGAST #1806) each server example gets its
+#      own, base + its corpus index -- the same in every stage -- as
+#      RITZ_EXAMPLE_PORT in the fixed `env -i` environment.  Only examples
+#      that read RITZ_EXAMPLE_PORT get one, so 31_env/33_printenv print the
+#      same bytes in every stage AND every run (Stage 1's results are cached).
 #
 #   2. Classification.  If a bind fails anyway (port stolen between pick and
 #      use, or someone runs an example by hand), run_binary marks the run as an
@@ -90,6 +92,9 @@ check "the port is in the unprivileged, non-ephemeral range" yes \
 p1=$(pick_example_port)
 check "pick_example_port returns a port" yes \
     "$([[ "$p1" =~ ^[0-9]+$ ]] && echo yes || echo no)"
+p2=$(pick_example_port 64)
+check "pick_example_port N returns a block that fits below 32768" yes \
+    "$([[ "$p2" =~ ^[0-9]+$ && $p2 -ge 20000 && $((p2 + 64)) -le 32768 ]] && echo yes || echo no)"
 
 # A value handed in by the caller wins, so a human can reproduce a run.
 over=$(RITZ_EXAMPLE_PORT=23456 RITZ_REGRESSION_LIB_ONLY=1 bash -c \
@@ -97,12 +102,23 @@ over=$(RITZ_EXAMPLE_PORT=23456 RITZ_REGRESSION_LIB_ONLY=1 bash -c \
 check "RITZ_EXAMPLE_PORT from the caller overrides the pick" 23456 "$over"
 
 # ---------------------------------------------------------------------------
-# 2. run_binary hands the port to the program under test.
+# 2. run_binary hands a server its port, and nobody else one.
 # ---------------------------------------------------------------------------
-b=$(fake_bin echo_port 'echo "port=$RITZ_EXAMPLE_PORT"')
+b=$(fake_bin echo_port 'echo "port=${RITZ_EXAMPLE_PORT-unset}"')
+RUN_PORT=$((REGRESSION_EXAMPLE_PORT + 7)) run_binary "$b" "$SCRATCH/p.out" "$SCRATCH/p.exit"
+check "the program sees its RITZ_EXAMPLE_PORT under env -i" \
+    "port=$((REGRESSION_EXAMPLE_PORT + 7))" "$(cat "$SCRATCH/p.out")"
 run_binary "$b" "$SCRATCH/p.out" "$SCRATCH/p.exit"
-check "the program sees RITZ_EXAMPLE_PORT under env -i" \
-    "port=$REGRESSION_EXAMPLE_PORT" "$(cat "$SCRATCH/p.out")"
+check "a program given no port has no RITZ_EXAMPLE_PORT at all" \
+    "port=unset" "$(cat "$SCRATCH/p.out")"
+
+mkdir -p "$SCRATCH/ex_srv/src" "$SCRATCH/ex_plain/src"
+echo 'let p = getenv(c"RITZ_EXAMPLE_PORT")' > "$SCRATCH/ex_srv/src/main.ritz"
+echo 'fn main() -> i32' > "$SCRATCH/ex_plain/src/main.ritz"
+check "example_port gives a server base + its index" \
+    "$((REGRESSION_EXAMPLE_PORT + 3))" "$(example_port "$SCRATCH/ex_srv" 3)"
+check "example_port gives any other example nothing" \
+    "" "$(example_port "$SCRATCH/ex_plain" 3)"
 
 # ---------------------------------------------------------------------------
 # 3. The exact false red from the ticket: stage A ran forever, stage B could

@@ -195,16 +195,21 @@ done
 # ---------------------------------------------------------------------------
 rs="$SCRIPT_DIR/regression.sh"
 
-check "all three stages call report_xpass" 3 \
+# Two call sites since #1806: Stage 1's judge, and the differential worker
+# that Stages 3 and 4 share (run_differential).
+check "every stage's code path calls report_xpass" 2 \
     "$(grep -cE '^\s*report_xpass ' "$rs")"
+check "Stages 3 and 4 both go through the shared differential worker" 2 \
+    "$(grep -cE '^\s*run_differential ritz1(_selfhosted)? ' "$rs")"
 
 check "no stage still only warns about an allowlisted example that compiles" 0 \
     "$(grep -cE 'warn .*(but COMPILES|allowlist but)' "$rs")"
 
-# Each report_xpass must be followed by a failed++ — printing a failure while
-# leaving the counter alone is the same non-gate in a different costume.
-check "every report_xpass increments the failure counter" 3 \
-    "$(grep -A 1 -E '^\s*report_xpass ' "$rs" | grep -cE 'failed=\$\(\(failed \+ 1\)\)')"
+# Each report_xpass must be followed by a fail verdict -- printing a failure
+# while the example still counts as passed is the same non-gate in a
+# different costume.
+check "every report_xpass records a fail verdict" 2 \
+    "$(grep -A 1 -E '^\s*report_xpass ' "$rs" | grep -cE '_verdict "\$out" fail')"
 
 echo
 echo "-----------------------------------------------"

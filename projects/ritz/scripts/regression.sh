@@ -16,6 +16,8 @@
 #   ./scripts/regression.sh --stage 1   # Run specific stage
 #   ./scripts/regression.sh --quick     # Skip Stages 4 and 5 (slower)
 #   ./scripts/regression.sh --verbose   # Show detailed output
+#   ./scripts/regression.sh --jobs 4    # Examples built/run at once (default 8)
+#   ./scripts/regression.sh --no-baseline-cache   # Recompute Stage 1
 #
 # Exit codes:
 #   0 - All tests passed
@@ -41,42 +43,54 @@ EXAMPLES_DIR="$ROOT_DIR/examples"
 # Set RITZ_PATH for import resolution (ritz1 needs this to find ritzlib)
 export RITZ_PATH="$ROOT_DIR"
 
-# One TCP port per regression run, for the server examples (AGAST #1535).
+# A block of TCP ports per regression run, for the server examples (AGAST
+# #1535, per example since #1806).
 #
 # 74_async_tiers, 75_tier2_uring and 76_tier3_http used to bind fixed ports.
 # Rooms gate in parallel on one host, so the second run to reach 75 found 9002
 # taken, printed "Failed to bind", exited 0 -- and compare_runs called that a
 # termination change: a false red that teaches people to rerun until green.
 #
+# Examples now run in parallel (AGAST #1806), so each server needs its own
+# port: example number i (its position in the sorted corpus) gets base + i.
 # The port reaches the program as RITZ_EXAMPLE_PORT in run_binary's fixed
-# `env -i` environment.  It is chosen once per run, NOT per stage: 31_env and
-# 33_printenv print their environment verbatim, and a per-stage value would
-# make them mismatch between stages.
+# `env -i` environment, and ONLY for examples whose source reads
+# RITZ_EXAMPLE_PORT (example_port).  31_env and 33_printenv print their
+# environment verbatim; handing them a random per-run port would make their
+# output differ from run to run, which the Stage 1 baseline cache cannot have.
+# The index is the same in every stage, so a server sees the same port in each.
 #
-# Picked at random from 20000-32767 -- below Linux's ephemeral range
-# (32768-60999), so an outgoing connection elsewhere on the host cannot be
-# handed it -- and probed free before use.  Nothing holds it between the
+# The block's base is picked at random from 20000-32767 -- below Linux's
+# ephemeral range (32768-60999), so an outgoing connection elsewhere on the
+# host cannot be handed one -- and every port in it is probed free.  Nothing holds it between the
 # probe and the bind, so a collision is still possible, just rare; when it
 # happens run_binary classifies it as an infrastructure error (see there),
 # never as a compiler result.  A caller-supplied RITZ_EXAMPLE_PORT wins, so a
 # failing run can be reproduced exactly.
+# Args: [$1=block size, default 1].  Prints the base of a free block.
 pick_example_port() {
-    python3 - <<'PY'
-import random, socket
-for _ in range(200):
-    p = random.randint(20000, 32767)
+    python3 - "${1:-1}" <<'PY'
+import random, socket, sys
+n = int(sys.argv[1])
+def free(p):
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         s.bind(("0.0.0.0", p))
+        return True
     except OSError:
-        continue
+        return False
     finally:
         s.close()
-    print(p)
-    break
+for _ in range(200):
+    p = random.randint(20000, 32768 - n)
+    if all(free(p + i) for i in range(n)):
+        print(p)
+        break
 PY
 }
-REGRESSION_EXAMPLE_PORT="${RITZ_EXAMPLE_PORT:-$(pick_example_port)}"
+# Ports per run; example i uses base + (i % EXAMPLE_PORT_BLOCK).
+EXAMPLE_PORT_BLOCK=256
+REGRESSION_EXAMPLE_PORT="${RITZ_EXAMPLE_PORT:-$(pick_example_port "$EXAMPLE_PORT_BLOCK")}"
 if [[ ! "$REGRESSION_EXAMPLE_PORT" =~ ^[0-9]+$ ]]; then
     echo "regression.sh: could not choose a free port for the server examples" >&2
     exit 1
@@ -93,6 +107,37 @@ RUN_STAGE=""
 QUICK_MODE=0
 VERBOSE=0
 
+# Examples built and run at once in Stages 1, 3 and 4 (AGAST #1806).  Output
+# is still printed in corpus order, so a log does not depend on this.
+REGRESSION_JOBS="${REGRESSION_JOBS:-8}"
+
+# Stage 1 baseline cache (AGAST #1806): ritz0's observation of an example
+# (built? test.sh result, stdout, exit) depends only on inputs that
+# regression_baseline_keys.py hashes, so it is reused until one changes.
+# Outside BUILD_DIR, which the gate wipes.  Only clean passes are cached.
+BASELINE_CACHE_DIR="${RITZ_REGRESSION_BASELINE_CACHE:-$ROOT_DIR/.regression-cache}"
+USE_BASELINE_CACHE=1
+
+# Run budget for an ordinary example, and for one declared below as never
+# exiting.  A server or generator is killed either way; the short budget just
+# stops it costing 5 s per stage.
+RUN_BUDGET=5s
+NONTERM_BUDGET="${REGRESSION_NONTERM_BUDGET:-2s}"
+
+# Examples that never exit on their own: servers waiting for a client, and
+# 09_yes, which writes until the 1 MiB output cap kills it.  Each gets
+# NONTERM_BUDGET and the verdict "ran until killed, as expected".  The list
+# cannot rot quietly: a declared example that exits on its own, or that is no
+# longer in the corpus, fails Stage 1.  An undeclared example that has to be
+# killed is still compared as non-terminating, with a warning to declare it.
+NONTERMINATING_EXAMPLES=(
+    tier1_basics_09_yes
+    tier5_async_50_http
+    74_async_tiers
+    75_tier2_uring
+    76_tier3_http
+)
+
 # Parse arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -108,6 +153,14 @@ while [[ $# -gt 0 ]]; do
             VERBOSE=1
             shift
             ;;
+        --jobs|-j)
+            REGRESSION_JOBS="$2"
+            shift 2
+            ;;
+        --no-baseline-cache)
+            USE_BASELINE_CACHE=0
+            shift
+            ;;
         --help|-h)
             echo "Usage: $0 [OPTIONS]"
             echo ""
@@ -115,6 +168,9 @@ while [[ $# -gt 0 ]]; do
             echo "  --stage N    Run only stage N (1-5)"
             echo "  --quick      Skip Stage 4 (self-hosted bootstrap) and Stage 5"
             echo "  --verbose    Show detailed output"
+            echo "  --jobs N     Examples built and run at once (default \$REGRESSION_JOBS or 8)"
+            echo "  --no-baseline-cache"
+            echo "               Recompute Stage 1 instead of reusing cached ritz0 results"
             echo "  --help       Show this message"
             exit 0
             ;;
@@ -124,6 +180,11 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+if [[ ! "$REGRESSION_JOBS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "regression.sh: --jobs / REGRESSION_JOBS must be a positive integer, got '$REGRESSION_JOBS'" >&2
+    exit 1
+fi
 
 # Setup
 mkdir -p "$BUILD_DIR"
@@ -470,6 +531,16 @@ _build_fixture_tree() {
     find "$root" -exec touch -t 202001010000.00 {} + 2>/dev/null || true
 }
 
+# Per-run settings, read by run_binary.  A stage worker sets them as locals
+# for its one example (bash locals are dynamically scoped, and every worker is
+# its own subshell), so parallel examples cannot see each other's:
+#   RUN_SANDBOX  the example's own sandbox dir (default: a shared one)
+#   RUN_PORT     RITZ_EXAMPLE_PORT for a server example (default: none)
+#   RUN_TIMEOUT  kill budget (default: RUN_BUDGET)
+RUN_SANDBOX=""
+RUN_PORT=""
+RUN_TIMEOUT=""
+
 run_binary() {
     local binary="$1"
     local stdout_file="$2"
@@ -510,8 +581,10 @@ run_binary() {
     # real difference is now genuinely attributable to the compiler.
     # A *fixed* path, not mktemp: a random directory name would leak into the
     # output of any program that prints its own cwd, reintroducing the very
-    # nondeterminism this is meant to remove.
-    local sandbox="$BUILD_DIR/sandbox"
+    # nondeterminism this is meant to remove.  Per example since #1806
+    # ($BUILD_DIR/sandbox/<key>, set by the stage worker): the same path in
+    # every stage, and never shared with an example running alongside.
+    local sandbox="${RUN_SANDBOX:-$BUILD_DIR/sandbox/default}"
     _build_fixture_tree "$sandbox"
 
     # Close stdin (</dev/null) to prevent programs like cat/grep from hanging.
@@ -560,7 +633,18 @@ run_binary() {
     # identical and KEEP the strict comparison instead of allowlisting the
     # programs that notice.  PWD is omitted deliberately -- `cd` sets it, and
     # to the fixed sandbox path.
-    ( cd "$sandbox" && ulimit -f 1024 && \
+    #
+    # RITZ_EXAMPLE_PORT only when the worker assigned one (a server example;
+    # see example_port), so it is not part of every program's environment.
+    local -a port_env=()
+    [[ -n "$RUN_PORT" ]] && port_env=(RITZ_EXAMPLE_PORT="$RUN_PORT")
+    #
+    # The `{ ...; } 2>/dev/null` is for bash, not the program (whose stderr
+    # goes to $raw): when the output cap kills 09_yes with SIGXFSZ, bash
+    # reports "File size limit exceeded" with the whole command line on its
+    # own stderr, three times per gate.  That death is the expected outcome
+    # and is recorded below as exit 153 / non-terminating.
+    { ( cd "$sandbox" && ulimit -f 1024 && \
       exec env -i \
         PATH=/usr/local/bin:/usr/bin:/bin \
         HOME=/nonexistent \
@@ -569,8 +653,8 @@ run_binary() {
         TZ=UTC \
         SHELL=/bin/sh \
         TERM=dumb \
-        RITZ_EXAMPLE_PORT="$REGRESSION_EXAMPLE_PORT" \
-        timeout --signal=KILL 5s "$binary" < /dev/null > "$raw" 2>&1 )
+        "${port_env[@]}" \
+        timeout --signal=KILL "${RUN_TIMEOUT:-$RUN_BUDGET}" "$binary" < /dev/null > "$raw" 2>&1 ); } 2>/dev/null
     local exit_code=$?
 
     # Reap anything the program forked and left behind.  Orphans are harmless
@@ -785,7 +869,7 @@ compare_runs() {
     local side
     for side in A:"$exit_a" B:"$exit_b"; do
         if [[ -f "${side#*:}.infra" ]]; then
-            fail "$name: infrastructure error — side ${side%%:*} could not bind its port (RITZ_EXAMPLE_PORT=$REGRESSION_EXAMPLE_PORT in use?); not a compiler result"
+            fail "$name: infrastructure error — side ${side%%:*} could not bind its port (its RITZ_EXAMPLE_PORT, from base $REGRESSION_EXAMPLE_PORT, in use?); not a compiler result"
             return 1
         fi
     done
@@ -828,8 +912,296 @@ compare_runs() {
 }
 
 # ============================================================================
+# Parallel corpus runs (AGAST #1806)
+# ============================================================================
+#
+# Stages 1, 3 and 4 each build and run every example.  One at a time that was
+# 4-6 minutes a stage locally.  Each example's work is now a worker function
+# run in a bounded pool of REGRESSION_JOBS background subshells.  A worker
+# writes everything it reports to its own log and its verdict to its own
+# file; once the pool drains, the stage prints the logs in corpus order and
+# tallies the verdicts.  So the output of a stage is the same, byte for byte,
+# for any REGRESSION_JOBS: gate logs stay diffable, and a parallel run can be
+# diffed against a serial one (REGRESSION_JOBS=1).
+#
+# What made the examples unsafe to run side by side, and what fixed it:
+#   * one $BUILD_DIR/sandbox for every run      -> RUN_SANDBOX per example
+#   * one RITZ_EXAMPLE_PORT for every server    -> base + example index
+#   * build.py's shared .ritz-cache rewritten   -> cache.py merges entries
+#     wholesale, in place                          under a lock, atomically
+# Anything a worker appends to a shared ledger (accept sets, test.sh ledger)
+# is one short line, which O_APPEND writes whole.
+
+# A worker records its verdict.  Args: $1=result prefix, $2=pass|fail|skip
+_verdict() { echo "$2" > "$1.verdict"; }
+
+# Args: $1=results dir, $2=worker fn, rest=example dirs.  Runs
+# "$fn <index> <example_dir> <result prefix>" for each, REGRESSION_JOBS at
+# a time; stdout and stderr go to "<result prefix>.log".
+run_pool() {
+    local rdir="$1" fn="$2"; shift 2
+    rm -rf "$rdir"
+    mkdir -p "$rdir"
+    local i=0 running=0 dir out
+    for dir in "$@"; do
+        if (( running >= REGRESSION_JOBS )); then
+            wait -n
+            running=$((running - 1))
+        fi
+        out="$rdir/$(printf '%05d' "$i")"
+        echo "$dir" > "$out.dir"
+        ( "$fn" "$i" "$dir" "$out" ) > "$out.log" 2>&1 &
+        running=$((running + 1))
+        i=$((i + 1))
+    done
+    wait
+}
+
+# Print a pool's logs in corpus order and tally its verdicts into the
+# caller's `passed`/`failed`/`skipped` (bash dynamic scope).
+collect_pool() {
+    local rdir="$1" f v
+    for f in "$rdir"/*.log; do
+        [[ -e "$f" ]] || continue
+        cat "$f"
+        v=$(cat "${f%.log}.verdict" 2>/dev/null)
+        case "$v" in
+            pass) passed=$((passed + 1)) ;;
+            skip) skipped=$((skipped + 1)) ;;
+            fail) failed=$((failed + 1)) ;;
+            *)
+                # A worker that died before recording a verdict asserted
+                # nothing; it must not vanish from the count.
+                fail "worker $(basename "${f%.log}") ($(head -c 200 "${f%.log}.dir" 2>/dev/null)) recorded no verdict"
+                failed=$((failed + 1))
+                ;;
+        esac
+    done
+}
+
+is_declared_nonterminating() {
+    local k
+    for k in "${NONTERMINATING_EXAMPLES[@]}"; do
+        [[ "$k" == "$1" ]] && return 0
+    done
+    return 1
+}
+
+# The port a server example is given, or nothing for any other example.
+# Args: $1=example_dir, $2=corpus index
+example_port() {
+    if grep -rqs --exclude-dir=build 'RITZ_EXAMPLE_PORT' "$1"/src; then
+        echo $((REGRESSION_EXAMPLE_PORT + $2 % EXAMPLE_PORT_BLOCK))
+    fi
+}
+
+# Set a worker's run_binary settings for one example.  Must be called as
+# `local RUN_SANDBOX RUN_PORT RUN_TIMEOUT; example_run_settings ...` so they
+# stay local to that worker.  Args: $1=example_dir, $2=key, $3=index
+example_run_settings() {
+    RUN_SANDBOX="$BUILD_DIR/sandbox/$2"
+    RUN_PORT=$(example_port "$1" "$3")
+    RUN_TIMEOUT="$RUN_BUDGET"
+    is_declared_nonterminating "$2" && RUN_TIMEOUT="$NONTERM_BUDGET"
+    return 0
+}
+
+# ============================================================================
 # STAGE 1: Compile all examples with ritz0 and run them
 # ============================================================================
+#
+# Split in two so the expensive half can be cached:
+#
+#   stage1_observe  build with ritz0, run test.sh, run the binary.  Raw facts
+#                   only, into an observation dir: `compiled`, `testrc` (only
+#                   if a test.sh ran), `ran`, `stdout`, `exit` and its
+#                   markers.  Consults no allowlist.
+#   stage1_judge    turn an observation into a verdict with the allowlist,
+#                   the declared non-terminating list and the test.sh ledger,
+#                   and publish stage1_<key>.{stdout,exit} -- the baseline
+#                   Stages 3 and 4 compare against -- only for a pass.
+#
+# The judge runs every time; only the observation comes from the cache.  So
+# an allowlist edit takes effect at once, and a cache hit reports exactly
+# what a cold run would.
+
+# Args: $1=example_dir, $2=key, $3=observation dir.  Uses the caller's
+# RUN_* settings.  Stops where the old serial loop stopped: no test.sh run
+# without a binary, no binary run after a failed test.sh.
+stage1_observe() {
+    local example_dir="$1" name="$2" obs="$3"
+    local bin="$BUILD_DIR/stage1_$name"
+    rm -rf "$obs"
+    mkdir -p "$obs"
+    if ! compile_with "ritz0" "$example_dir" "$bin"; then
+        echo 0 > "$obs/compiled"
+        return 0
+    fi
+    echo 1 > "$obs/compiled"
+    if has_test_script "$example_dir"; then
+        run_test_script "$example_dir" "$bin"
+        local rc=$?
+        echo "$rc" > "$obs/testrc"
+        [[ $rc -eq 0 ]] || return 0
+    fi
+    if run_binary "$bin" "$obs/stdout" "$obs/exit"; then
+        echo 1 > "$obs/ran"
+    else
+        echo 0 > "$obs/ran"
+    fi
+}
+
+# A clean pass, safe to cache: built, test.sh (if any) passed, ran, and no
+# infrastructure error (a port collision is about the host, not ritz0).
+# Failures are never cached, so a flaky failure cannot outlive its run.
+stage1_cacheable() {
+    local obs="$1"
+    [[ "$(cat "$obs/compiled" 2>/dev/null)" == 1 ]] || return 1
+    [[ ! -f "$obs/testrc" || "$(cat "$obs/testrc")" == 0 ]] || return 1
+    [[ "$(cat "$obs/ran" 2>/dev/null)" == 1 ]] || return 1
+    [[ ! -f "$obs/exit.infra" ]]
+}
+
+# Args: $1=example_dir, $2=key, $3=observation dir, $4=result prefix
+stage1_judge() {
+    local example_dir="$1" name="$2" obs="$3" out="$4"
+
+    if [[ "$(cat "$obs/compiled" 2>/dev/null)" != 1 ]]; then
+        # Excused from the test.sh coverage floor: you cannot run a binary
+        # that was never produced.  The compile failure itself is reported
+        # (or allowlisted) here.
+        : > "$out.nocompile"
+        if is_known_failure ritz0 "$name"; then
+            warn "$name: ritz0 compile failed (known, allowlisted)"
+            _verdict "$out" skip
+        else
+            fail "$name: ritz0 compile failed"
+            _verdict "$out" fail
+        fi
+        return 0
+    fi
+    if is_known_failure ritz0 "$name"; then
+        report_xpass ritz0 "$name"
+        _verdict "$out" fail
+        return 0
+    fi
+
+    # Correctness gate: the example's own test.sh, if it ships one.
+    #
+    # This no longer REPLACES the run-and-record below -- it precedes it.
+    # The old code, for the 2 examples it reached, wrote the literal string
+    # "TESTED_VIA_SCRIPT" as the stage-1 baseline, which removed those
+    # examples from the cross-stage differential entirely.  Running both
+    # means an example with a test.sh is checked for the right answer here
+    # AND for ritz0/ritz1/ritz1_selfhosted agreement in stages 3 and 4.
+    # (Reported as check_test_script does; see there.)
+    if [[ -f "$obs/testrc" ]]; then
+        local rc
+        rc=$(cat "$obs/testrc")
+        case "$rc" in
+            0) note_test_script_ran "$name" ;;
+            201)
+                fail "$name: test.sh present but ritz.toml declares no package/bin name"
+                _verdict "$out" fail
+                return 0
+                ;;
+            *)
+                note_test_script_ran "$name"
+                fail "$name: test.sh failed (exit $rc)"
+                _verdict "$out" fail
+                return 0
+                ;;
+        esac
+    fi
+
+    if [[ "$(cat "$obs/ran" 2>/dev/null)" != 1 ]]; then
+        fail "$name: ritz0 build reported success but produced no runnable binary"
+        _verdict "$out" fail
+        return 0
+    fi
+
+    local exit_code
+    exit_code=$(cat "$obs/exit")
+    if is_declared_nonterminating "$name"; then
+        if [[ ! -f "$obs/exit.nonterminating" && ! -f "$obs/exit.infra" ]]; then
+            fail "$name: declared non-terminating but exited on its own (exit=$exit_code) — fix it, or remove it from NONTERMINATING_EXAMPLES"
+            _verdict "$out" fail
+            return 0
+        fi
+    fi
+
+    # Publish the baseline for Stages 3 and 4.
+    local f
+    for f in stdout exit exit.nonterminating exit.infra; do
+        [[ -f "$obs/$f" ]] && cp "$obs/$f" "$BUILD_DIR/stage1_${name}.$f"
+    done
+
+    if [[ -f "$obs/exit.nonterminating" ]]; then
+        if is_declared_nonterminating "$name"; then
+            success "$name (ran until killed, as expected)"
+        else
+            warn "$name: ran until killed (exit=$exit_code) but is not in NONTERMINATING_EXAMPLES; declare it so it gets the short budget"
+            success "$name (exit=$exit_code)"
+        fi
+    else
+        success "$name (exit=$exit_code)"
+    fi
+    _verdict "$out" pass
+}
+
+# Stage 1 cache keys, by example key.  Filled once per Stage 1 run.
+declare -gA BASELINE_KEYS=()
+
+compute_baseline_keys() {
+    BASELINE_KEYS=()
+    local -a pairs=()
+    local d
+    for d in "$@"; do
+        pairs+=("$(example_key "$d")=$d")
+    done
+    local name key
+    while IFS=$'\t' read -r name key; do
+        [[ -n "$name" ]] && BASELINE_KEYS[$name]="$key"
+    done < <(python3 "$SCRIPT_DIR/regression_baseline_keys.py" \
+                "$ROOT_DIR" "$BUILD_DIR" "$SCRIPT_DIR/regression.sh" \
+                "run=$RUN_BUDGET nonterm=$NONTERM_BUDGET declared=${NONTERMINATING_EXAMPLES[*]}" \
+                -- "${pairs[@]}")
+}
+
+# Args: $1=index, $2=example_dir, $3=result prefix
+stage1_worker() {
+    local idx="$1" example_dir="$2" out="$3"
+    local name
+    name=$(example_key "$example_dir")
+    local RUN_SANDBOX RUN_PORT RUN_TIMEOUT
+    example_run_settings "$example_dir" "$name" "$idx"
+
+    local obs="$BUILD_DIR/stage1_obs/$name"
+    local key="${BASELINE_KEYS[$name]:-}"
+    local entry=""
+    [[ $USE_BASELINE_CACHE -eq 1 && -n "$key" ]] && entry="$BASELINE_CACHE_DIR/stage1/$key"
+
+    if [[ -n "$entry" && -f "$entry/complete" ]]; then
+        rm -rf "$obs"
+        mkdir -p "$(dirname "$obs")"
+        cp -r "$entry" "$obs"
+        touch "$entry/complete"  # last used, for pruning
+        : > "$out.hit"
+    else
+        stage1_observe "$example_dir" "$name" "$obs"
+        if [[ -n "$entry" ]] && stage1_cacheable "$obs"; then
+            # Atomic publish: a reader sees a complete entry or none.
+            local tmp="$BASELINE_CACHE_DIR/stage1/.tmp.$key.$$.$BASHPID"
+            mkdir -p "$BASELINE_CACHE_DIR/stage1"
+            rm -rf "$tmp"
+            cp -r "$obs" "$tmp" && : > "$tmp/complete" \
+                && mv -T "$tmp" "$entry" 2>/dev/null
+            rm -rf "$tmp"
+        fi
+    fi
+    stage1_judge "$example_dir" "$name" "$obs" "$out"
+}
+
 run_stage1() {
     log "STAGE 1: Compile examples with ritz0 & run"
     echo "----------------------------------------"
@@ -842,56 +1214,46 @@ run_stage1() {
     TEST_SCRIPTS_RAN_FILE="$BUILD_DIR/test_scripts_ran.txt"
     : > "$TEST_SCRIPTS_RAN_FILE"
 
-    for example_dir in $(get_examples); do
-        local name=$(example_key "$example_dir")
-        local base=$(basename "$example_dir")
-        local bin="$BUILD_DIR/stage1_$name"
+    local -a examples
+    mapfile -t examples < <(get_examples)
 
-        # Compile with ritz0
-        if ! compile_with "ritz0" "$example_dir" "$bin"; then
-            # Excused from the test.sh coverage floor: you cannot run a binary
-            # that was never produced.  The compile failure itself is already
-            # reported (or allowlisted) on the next two lines.
-            nocompile+=("$name")
-            if is_known_failure ritz0 "$name"; then
-                warn "$name: ritz0 compile failed (known, allowlisted)"
-                skipped=$((skipped + 1))
-            else
-                fail "$name: ritz0 compile failed"
-                failed=$((failed + 1))
-            fi
-            continue
-        fi
-        if is_known_failure ritz0 "$name"; then
-            report_xpass ritz0 "$name"
-            failed=$((failed + 1))
-            continue
-        fi
+    if [[ $USE_BASELINE_CACHE -eq 1 ]]; then
+        compute_baseline_keys "${examples[@]}"
+    else
+        BASELINE_KEYS=()
+    fi
 
-        # Correctness gate: the example's own test.sh, if it ships one.
-        #
-        # This no longer REPLACES the run-and-record below -- it precedes it.
-        # The old code, for the 2 examples it reached, wrote the literal string
-        # "TESTED_VIA_SCRIPT" as the stage-1 baseline, which removed those
-        # examples from the cross-stage differential entirely.  Running both
-        # means an example with a test.sh is checked for the right answer here
-        # AND for ritz0/ritz1/ritz1_selfhosted agreement in stages 3 and 4.
-        if ! check_test_script "$example_dir" "$name" "$bin"; then
-            failed=$((failed + 1))
-            continue
-        fi
+    local rdir="$BUILD_DIR/results/stage1"
+    run_pool "$rdir" stage1_worker "${examples[@]}"
+    collect_pool "$rdir"
 
-        # Run and save results for later cross-stage comparison
-        if ! run_binary "$bin" "$BUILD_DIR/stage1_${name}.stdout" "$BUILD_DIR/stage1_${name}.exit"; then
-            fail "$name: ritz0 build reported success but produced no runnable binary"
-            failed=$((failed + 1))
-            continue
-        fi
-
-        local exit_code=$(cat "$BUILD_DIR/stage1_${name}.exit")
-        success "$name (exit=$exit_code)"
-        passed=$((passed + 1))
+    local f
+    for f in "$rdir"/*.nocompile; do
+        [[ -e "$f" ]] || continue
+        nocompile+=("$(example_key "${examples[$((10#$(basename "$f" .nocompile)))]}")")
     done
+
+    # The declared list must describe the corpus.
+    local k
+    for k in "${NONTERMINATING_EXAMPLES[@]}"; do
+        local found=0 d
+        for d in "${examples[@]}"; do
+            [[ "$(example_key "$d")" == "$k" ]] && found=1 && break
+        done
+        if [[ $found -eq 0 ]]; then
+            fail "$k: declared non-terminating but not in the corpus — remove it from NONTERMINATING_EXAMPLES"
+            failed=$((failed + 1))
+        fi
+    done
+
+    if [[ $USE_BASELINE_CACHE -eq 1 ]]; then
+        local hits
+        hits=$(find "$rdir" -name '*.hit' | wc -l)
+        echo "Stage 1 baseline cache: $hits hit, $(( ${#examples[@]} - hits )) recomputed ($BASELINE_CACHE_DIR)"
+        # Entries unused for two weeks belong to compilers long gone.
+        find "$BASELINE_CACHE_DIR/stage1" -mindepth 1 -maxdepth 1 \
+            \( -name '.tmp.*' -o ! -newermt '-14 days' \) -exec rm -rf {} + 2>/dev/null
+    fi
 
     echo ""
     if ! assert_test_scripts_all_ran "${nocompile[@]}"; then
@@ -948,6 +1310,87 @@ run_stage2() {
 }
 
 # ============================================================================
+# STAGES 3 and 4: the differential, one worker per example
+# ============================================================================
+#
+# Same per-example steps for ritz1 (Stage 3) and ritz1_selfhosted (Stage 4):
+# compile, record the raw accept/reject for Stage 5 (before any allowlist),
+# run the example's test.sh, run it and compare with the Stage 1 baseline.
+
+# Set by run_differential for its workers.
+DIFF_COMPILER=""
+DIFF_PREFIX=""
+DIFF_LABEL=""
+
+# Args: $1=index, $2=example_dir, $3=result prefix
+differential_worker() {
+    local idx="$1" example_dir="$2" out="$3"
+    local name
+    name=$(example_key "$example_dir")
+    local bin="$BUILD_DIR/${DIFF_PREFIX}_$name"
+    local RUN_SANDBOX RUN_PORT RUN_TIMEOUT
+    example_run_settings "$example_dir" "$name" "$idx"
+
+    # Check if we have Stage 1 results to compare against
+    if [[ ! -f "$BUILD_DIR/stage1_${name}.exit" ]]; then
+        warn "$name: no Stage 1 baseline"
+        _verdict "$out" skip
+        return 0
+    fi
+
+    if ! compile_with "$DIFF_COMPILER" "$example_dir" "$bin" 2>/dev/null; then
+        record_compile_outcome "$DIFF_COMPILER" "$name" rejected
+        if is_known_failure "$DIFF_COMPILER" "$name"; then
+            warn "$name: $DIFF_LABEL compile failed (known, allowlisted)"
+            _verdict "$out" skip
+        else
+            fail "$name: $DIFF_LABEL compile failed"
+            _verdict "$out" fail
+        fi
+        return 0
+    fi
+    record_compile_outcome "$DIFF_COMPILER" "$name" accepted
+    if is_known_failure "$DIFF_COMPILER" "$name"; then
+        report_xpass "$DIFF_COMPILER" "$name"
+        _verdict "$out" fail
+        return 0
+    fi
+
+    # Correctness gate, then the differential.  Same shape as Stage 1: a
+    # ritz1-built binary must satisfy the example's own assertions AND
+    # agree byte-for-byte with the ritz0 baseline.
+    if ! check_test_script "$example_dir" "$name" "$bin"; then
+        _verdict "$out" fail
+        return 0
+    fi
+
+    if ! run_binary "$bin" "$BUILD_DIR/${DIFF_PREFIX}_${name}.stdout" "$BUILD_DIR/${DIFF_PREFIX}_${name}.exit"; then
+        fail "$name: $DIFF_LABEL build reported success but produced no runnable binary"
+        _verdict "$out" fail
+        return 0
+    fi
+
+    if compare_runs "$name" \
+        "$BUILD_DIR/stage1_${name}.stdout" "$BUILD_DIR/stage1_${name}.exit" \
+        "$BUILD_DIR/${DIFF_PREFIX}_${name}.stdout" "$BUILD_DIR/${DIFF_PREFIX}_${name}.exit"; then
+        _verdict "$out" pass
+    else
+        _verdict "$out" fail
+    fi
+}
+
+# Run the differential over the corpus, tallying into the caller's
+# passed/failed/skipped.  Args: $1=compiler, $2=file prefix, $3=label
+run_differential() {
+    DIFF_COMPILER="$1" DIFF_PREFIX="$2" DIFF_LABEL="$3"
+    local -a examples
+    mapfile -t examples < <(get_examples)
+    local rdir="$BUILD_DIR/results/$2"
+    run_pool "$rdir" differential_worker "${examples[@]}"
+    collect_pool "$rdir"
+}
+
+# ============================================================================
 # STAGE 3: Compile examples with ritz1, compare output with Stage 1
 # ============================================================================
 run_stage3() {
@@ -966,62 +1409,7 @@ run_stage3() {
     local failed=0
     local skipped=0
 
-    for example_dir in $(get_examples); do
-        local name=$(example_key "$example_dir")
-        local base=$(basename "$example_dir")
-        local bin="$BUILD_DIR/stage3_$name"
-
-        # Check if we have Stage 1 results to compare against
-        if [[ ! -f "$BUILD_DIR/stage1_${name}.exit" ]]; then
-            warn "$name: no Stage 1 baseline"
-            skipped=$((skipped + 1))
-            continue
-        fi
-
-        # Compile with ritz1
-        if ! compile_with "ritz1" "$example_dir" "$bin" 2>/dev/null; then
-            record_compile_outcome ritz1 "$name" rejected
-            if is_known_failure ritz1 "$name"; then
-                warn "$name: ritz1 compile failed (known, allowlisted)"
-                skipped=$((skipped + 1))
-            else
-                fail "$name: ritz1 compile failed"
-                failed=$((failed + 1))
-            fi
-            continue
-        fi
-        record_compile_outcome ritz1 "$name" accepted
-        if is_known_failure ritz1 "$name"; then
-            report_xpass ritz1 "$name"
-            failed=$((failed + 1))
-            continue
-        fi
-
-        # Correctness gate, then the differential.  Same shape as Stage 1: a
-        # ritz1-built binary must satisfy the example's own assertions AND
-        # agree byte-for-byte with the ritz0 baseline.
-        if ! check_test_script "$example_dir" "$name" "$bin"; then
-            failed=$((failed + 1))
-            continue
-        fi
-
-        # Run
-        if ! run_binary "$bin" "$BUILD_DIR/stage3_${name}.stdout" "$BUILD_DIR/stage3_${name}.exit"; then
-            fail "$name: ritz1 build reported success but produced no runnable binary"
-            failed=$((failed + 1))
-            continue
-        fi
-
-        # Compare with Stage 1
-        if compare_runs "$name" \
-            "$BUILD_DIR/stage1_${name}.stdout" "$BUILD_DIR/stage1_${name}.exit" \
-            "$BUILD_DIR/stage3_${name}.stdout" "$BUILD_DIR/stage3_${name}.exit"; then
-            passed=$((passed + 1))
-        else
-            failed=$((failed + 1))
-        fi
-    done
-
+    run_differential ritz1 stage3 "ritz1"
     mark_stage_ran ritz1
 
     echo ""
@@ -1102,60 +1490,7 @@ run_stage4() {
     local failed=0
     local skipped=0
 
-    for example_dir in $(get_examples); do
-        local name=$(example_key "$example_dir")
-        local base=$(basename "$example_dir")
-        local bin="$BUILD_DIR/stage4_$name"
-
-        # Check if we have Stage 1 results
-        if [[ ! -f "$BUILD_DIR/stage1_${name}.exit" ]]; then
-            warn "$name: no Stage 1 baseline"
-            skipped=$((skipped + 1))
-            continue
-        fi
-
-        # Compile with self-hosted ritz1
-        if ! compile_with "ritz1_selfhosted" "$example_dir" "$bin" 2>/dev/null; then
-            record_compile_outcome ritz1_selfhosted "$name" rejected
-            if is_known_failure ritz1_selfhosted "$name"; then
-                warn "$name: self-hosted ritz1 compile failed (known, allowlisted)"
-                skipped=$((skipped + 1))
-            else
-                fail "$name: self-hosted ritz1 compile failed"
-                failed=$((failed + 1))
-            fi
-            continue
-        fi
-        record_compile_outcome ritz1_selfhosted "$name" accepted
-        if is_known_failure ritz1_selfhosted "$name"; then
-            report_xpass ritz1_selfhosted "$name"
-            failed=$((failed + 1))
-            continue
-        fi
-
-        # Correctness gate, then the differential -- see Stage 3.
-        if ! check_test_script "$example_dir" "$name" "$bin"; then
-            failed=$((failed + 1))
-            continue
-        fi
-
-        # Run
-        if ! run_binary "$bin" "$BUILD_DIR/stage4_${name}.stdout" "$BUILD_DIR/stage4_${name}.exit"; then
-            fail "$name: self-hosted ritz1 build reported success but produced no runnable binary"
-            failed=$((failed + 1))
-            continue
-        fi
-
-        # Compare with Stage 1
-        if compare_runs "$name" \
-            "$BUILD_DIR/stage1_${name}.stdout" "$BUILD_DIR/stage1_${name}.exit" \
-            "$BUILD_DIR/stage4_${name}.stdout" "$BUILD_DIR/stage4_${name}.exit"; then
-            passed=$((passed + 1))
-        else
-            failed=$((failed + 1))
-        fi
-    done
-
+    run_differential ritz1_selfhosted stage4 "self-hosted ritz1"
     mark_stage_ran ritz1_selfhosted
 
     echo ""

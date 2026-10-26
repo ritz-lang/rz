@@ -16,10 +16,13 @@ Cache directory structure:
         └── main.ritz.o   # Compiled object
 """
 
+import fcntl
 import json
 import hashlib
 import os
 import shutil
+import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional, Dict, List, Set, Tuple
 from dataclasses import dataclass, field, asdict
@@ -87,6 +90,91 @@ RITZ0_EXCLUDE_FILE_PREFIXES = ("test_",)
 
 
 # ============================================================================
+# Concurrent-safe file writes (AGAST #1806)
+# ============================================================================
+#
+# Several build.py processes share one cache directory: regression.sh builds
+# up to REGRESSION_JOBS examples at once, and they all compile ritzlib. So:
+#
+# * Every file is written to a private temp file in the same directory and
+#   renamed over the target. A reader sees the old file or the new one, never
+#   a truncated one. (In place, a reader could link half an object or fail to
+#   parse half a deps.json.) The temp name is unique per writer: one fixed
+#   `<name>.tmp` shared by two writers is the same race one level down.
+# * Read-modify-write of a shared index (deps.json, imports.json) happens
+#   under an flock, and a save merges only the entries this process changed
+#   into what is on disk. Rewriting the whole file from memory let the last
+#   process to save drop every entry the others had added.
+
+LOCK_FILE = ".lock"
+
+
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    _atomic_write_bytes(path, text.encode())
+
+
+def _atomic_copy(src: Path, dst: Path) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=dst.parent, prefix=f".{dst.name}.", suffix=".tmp")
+    os.close(fd)
+    try:
+        shutil.copy2(src, tmp)
+        os.replace(tmp, dst)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+@contextmanager
+def _cache_lock(cache_dir: Path):
+    """Exclusive lock over one cache directory's shared index files."""
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    with open(cache_dir / LOCK_FILE, "a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def _read_json(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _merge_json(path: Path, updates: dict, indent: int = 2, sort_keys: bool = False) -> dict:
+    """Write `updates` over the on-disk dict at `path`; return the result.
+
+    Caller holds `_cache_lock`.
+    """
+    merged = _read_json(path)
+    merged.update(updates)
+    _atomic_write_text(path, json.dumps(merged, indent=indent, sort_keys=sort_keys))
+    return merged
+
+
+# ============================================================================
 # Data structures
 # ============================================================================
 
@@ -128,16 +216,23 @@ class FileInfo:
 class CacheState:
     """The complete cache state."""
     deps: Dict[str, FileInfo] = field(default_factory=dict)  # path -> FileInfo
+    # Entries this process changed; only these are written (AGAST #1806).
+    dirty: Set[str] = field(default_factory=set)
 
     def save(self, cache_dir: Path):
-        """Save cache state to disk."""
-        cache_dir.mkdir(parents=True, exist_ok=True)
-
-        # Save deps.json
-        deps_data = {path: info.to_dict() for path, info in self.deps.items()}
-        deps_file = cache_dir / DEPS_FILE
-        with open(deps_file, 'w') as f:
-            json.dump(deps_data, f, indent=2)
+        """Merge this process's changed entries into deps.json."""
+        if not self.dirty:
+            return
+        with _cache_lock(cache_dir):
+            merged = _merge_json(
+                cache_dir / DEPS_FILE,
+                {p: self.deps[p].to_dict() for p in self.dirty if p in self.deps},
+            )
+        # Pick up what other processes recorded meanwhile.
+        for path, info in merged.items():
+            if path not in self.dirty:
+                self.deps[path] = FileInfo.from_dict(info)
+        self.dirty.clear()
 
     @classmethod
     def load(cls, cache_dir: Path) -> "CacheState":
@@ -146,8 +241,9 @@ class CacheState:
 
         deps_file = cache_dir / DEPS_FILE
         if deps_file.exists():
-            with open(deps_file, 'r') as f:
-                deps_data = json.load(f)
+            # Torn reads are impossible now (atomic replace); a corrupt file
+            # from an older writer is just a cold cache.
+            deps_data = _read_json(deps_file)
             state.deps = {
                 path: FileInfo.from_dict(info)
                 for path, info in deps_data.items()
@@ -411,10 +507,9 @@ class BuildCache:
 
     def _save_imports_db(self) -> None:
         if self._imports_db_dirty and self._imports_db is not None:
-            self.cache_dir.mkdir(parents=True, exist_ok=True)
-            tmp = self.cache_dir / (IMPORTS_FILE + ".tmp")
-            tmp.write_text(json.dumps(self._imports_db, indent=1, sort_keys=True))
-            tmp.replace(self.cache_dir / IMPORTS_FILE)
+            with _cache_lock(self.cache_dir):
+                self._imports_db = _merge_json(
+                    self.cache_dir / IMPORTS_FILE, self._imports_db, indent=1, sort_keys=True)
             self._imports_db_dirty = False
 
     def _scan_direct_imports(self, path: str, file_hash: str) -> List[str]:
@@ -517,7 +612,11 @@ class BuildCache:
         """Update the stored compiler hash."""
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         current_hash = self._get_current_compiler_hash()
-        self.compiler_hash_file.write_text(current_hash)
+        if (self.compiler_hash_file.exists()
+                and self.compiler_hash_file.read_text().strip() == current_hash):
+            self._compiler_hash_valid = True
+            return
+        _atomic_write_text(self.compiler_hash_file, current_hash)
         self._compiler_hash_valid = True
 
     def invalidate_if_compiler_changed(self) -> bool:
@@ -545,6 +644,14 @@ class BuildCache:
             True if invalidation actually happened (compiler changed),
             False if cache was already up-to-date.
         """
+        # Under the lock, re-reading the hash file: with several builds
+        # starting at once, the first wipes and records the new compiler, the
+        # rest then see a match and keep what it is building (AGAST #1806).
+        with _cache_lock(self.cache_dir):
+            self._compiler_hash_valid = None
+            return self._invalidate_if_compiler_changed_locked()
+
+    def _invalidate_if_compiler_changed_locked(self) -> bool:
         if self._check_compiler_hash():
             # Compiler hash matches what produced the cached artifacts;
             # nothing to invalidate. Each source still goes through
@@ -558,10 +665,16 @@ class BuildCache:
         # produced by it.
         if self.objects_dir.exists():
             shutil.rmtree(self.objects_dir)
-        self._state = CacheState()  # forget dep graph + hashes too
-        # A ritz0 change can change how imports parse or resolve.
+        # Forget the dep graph and import scans too, on disk as well: a ritz0
+        # change can change how imports parse or resolve.
+        for name in (DEPS_FILE, IMPORTS_FILE):
+            try:
+                (self.cache_dir / name).unlink()
+            except FileNotFoundError:
+                pass
+        self._state = CacheState()
         self._imports_db = {}
-        self._imports_db_dirty = True
+        self._imports_db_dirty = False
         self._direct_imports.clear()
         self._update_compiler_hash()
         return True
@@ -752,7 +865,7 @@ class BuildCache:
 
         # Write the .ll file to cache
         cached_ll = self.get_cached_ll_path(source_path)
-        cached_ll.write_text(ll_content)
+        _atomic_write_text(cached_ll, ll_content)
 
         # Record this file's entry with a snapshot of every transitive
         # dependency's hash (AGAST #1832). Only the compiled file's entry is
@@ -768,6 +881,7 @@ class BuildCache:
             dep: compute_file_hash(Path(dep)) for dep in all_deps if dep != source_str
         }
         self.state.deps[source_str] = info
+        self.state.dirty.add(source_str)
 
         # Save state to disk
         self.save()
@@ -830,8 +944,7 @@ class BuildCache:
 
         # Copy the .bc file to cache
         cached_bc = self.get_cached_bc_path(source_path)
-        import shutil
-        shutil.copy2(bc_path, cached_bc)
+        _atomic_copy(bc_path, cached_bc)
 
     def get_cached_obj(self, source_path: Path) -> Optional[Path]:
         """Path of a valid cached .o, or None if a rebuild is needed."""
@@ -849,8 +962,7 @@ class BuildCache:
         source_path = source_path.resolve()
         self.objects_dir.mkdir(parents=True, exist_ok=True)
         cached_obj = self.get_cached_obj_path(source_path)
-        import shutil
-        shutil.copy2(obj_path, cached_obj)
+        _atomic_copy(obj_path, cached_obj)
 
 
 # ============================================================================
