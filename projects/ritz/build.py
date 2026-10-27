@@ -2280,6 +2280,159 @@ def format_test_summary(n_files: int, tests_passed: int, tests_failed: int,
             f" | {ok} file(s) passed, {tests_passed} tests passed")
 
 
+def discover_test_files(pkg_dir: Path, config: dict) -> list[Path]:
+    """The package's .ritz test files, sorted: test/*.ritz, plus the root's
+    test_*.ritz for a `test_only` package.
+
+    The single owner of test-file discovery. `run_tests` (serial) and the
+    `--unit-plan` entry point that `rz test --all -j N` schedules from both
+    call this, so the parallel sweep cannot cover a different file set from
+    the serial one (AGAST #1809).
+    """
+    ritz_tests = []
+    test_dir = pkg_dir / "test"
+    if test_dir.exists():
+        ritz_tests.extend(test_dir.glob("*.ritz"))
+    if config.get("build", {}).get("test_only", False):
+        ritz_tests.extend(pkg_dir.glob("test_*.ritz"))
+    return sorted(set(ritz_tests))  # Dedupe and sort
+
+
+def test_env_for_files() -> dict:
+    """Environment for `ritz0 --test` children.
+
+    Preserve any caller-provided RITZ_PATH — the workspace `rz` CLI builds a
+    per-project dependency path list and passes it down; this used to
+    REPLACE it with just the ritz root, silently breaking `lib.*` imports
+    from path-dependencies in tests (AGAST #1324).
+    """
+    test_env = os.environ.copy()
+    test_env["RITZ_PATH"] = ritz_path_for_tests(test_env.get("RITZ_PATH", ""))
+    return test_env
+
+
+def per_file_timeout() -> int:
+    """Per-file timeout budget. 180s handles even slow elliptic-curve bigint
+    tests on a debug build; can be tuned via RITZ_TEST_TIMEOUT."""
+    return int(os.environ.get("RITZ_TEST_TIMEOUT", "180"))
+
+
+def run_test_file(tfile: Path, pkg_dir: Path, test_env: dict,
+                  timeout: int) -> dict:
+    """Run one `ritz0 --test <tfile>` and print its verdict line(s).
+
+    Returns {"status", "passed", "failed"}, status being one of
+    classify_test_file's statuses or "timeout". Shared by the serial loop
+    in run_tests and by the `--unit-file` entry point, so a file's verdict
+    and its printed lines are identical in both modes.
+
+    Execution CWD matters for integration tests that `fork/exec ./binary`
+    (see tier1/01_hello's test_hello_output). We run from pkg_dir so those
+    relative paths work; imports still resolve via RITZ_PATH (env-based,
+    not CWD-based — see ritz0/import_resolver.py).
+    """
+    try:
+        result = subprocess.run(
+            [sys.executable, str(RITZ0), "--test", str(tfile)],
+            cwd=pkg_dir,
+            env=test_env,
+            capture_output=True, text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        print(f"    ⏱  {tfile.name} — TIMEOUT after {timeout}s")
+        return {"status": "timeout", "passed": 0, "failed": 0}
+
+    status, file_passed, file_failed = classify_test_file(
+        result.returncode, result.stdout)
+    outcome = {"status": status, "passed": file_passed, "failed": file_failed}
+
+    if status == "empty":
+        print(f"    ✗ {tfile.name} — ran 0 tests: no [[test]] functions "
+              f"(a test file that cannot fail is not a test)")
+    elif status == "error":
+        # Compile / link / runtime failure before harness summary
+        err_blob = (result.stderr or "") + (result.stdout or "")
+        # Try to surface the most actionable line
+        err_first = ""
+        for line in err_blob.splitlines():
+            # Case-insensitive "error" so compiler diagnostics like
+            # "Error in <file>: ..." match. The old tag list required
+            # a literal "error:", missed them, and fell through to the
+            # last line of output — which for a compile failure is the
+            # content-free "  - <file>: error" harness summary line
+            # (AGAST #1324).
+            low = line.lower()
+            if any(tag in low for tag in (
+                "cannot select", "fatal error", "error", "valueerror:",
+                "unknown function", "illegal instruction", "segmentation fault",
+            )):
+                err_first = line.strip()
+                break
+        if not err_first:
+            err_first = err_blob.strip().splitlines()[-1] if err_blob.strip() else "(no output)"
+        print(f"    ✗ {tfile.name} — {err_first[:200]}")
+    elif status == "fail":
+        # Compiled and ran but some assertions failed: surface the failing
+        # harness messages.
+        print(f"    ✗ {tfile.name} — {file_passed} passed, {file_failed} failed")
+        for line in result.stdout.splitlines():
+            if "FAIL" in line or "assertion" in line.lower():
+                print(f"        {line}")
+    else:
+        print(f"    ✓ {tfile.name} — {file_passed} passed")
+    return outcome
+
+
+def summarize_file_outcomes(outcomes: list[dict]) -> str:
+    """The Σ line for a list of run_test_file outcomes."""
+    by = lambda s: sum(1 for o in outcomes if o["status"] == s)  # noqa: E731
+    # Assertion counts only from files whose harness summary was trusted,
+    # exactly as the serial loop always counted them.
+    counted = [o for o in outcomes if o["status"] in ("pass", "fail")]
+    return format_test_summary(
+        n_files=len(outcomes),
+        tests_passed=sum(o["passed"] for o in counted),
+        tests_failed=sum(o["failed"] for o in counted),
+        n_fail=by("fail"),
+        n_error=by("error"),
+        n_empty=by("empty"),
+        n_timeout=by("timeout"),
+    )
+
+
+def run_test_sh(pkg_dir: Path) -> bool:
+    """Run pkg_dir/test.sh (caller checks it exists); print its verdict."""
+    print(f"  🧪 Running test.sh...")
+    result = subprocess.run(
+        ["bash", str(pkg_dir / "test.sh")],
+        cwd=pkg_dir,
+        capture_output=True, text=True
+    )
+    if result.returncode == 0:
+        print(f"    ✓ test.sh passed")
+        return True
+    print(f"  ✗ test.sh failed:")
+    if result.stdout:
+        print(result.stdout)
+    if result.stderr:
+        print(result.stderr)
+    return False
+
+
+def report_no_harness(pkg_name: str, compiler: str, n_files: int) -> None:
+    """The ritz1/ritz1_selfhosted 'files NOT run' failure line.
+
+    The only .ritz test harness is `ritz0 --test`; ritz1 has no --test mode.
+    This used to run every file through ritz0 regardless of --compiler, so
+    each "ritz1" verdict was ritz0's (AGAST #1500). Do NOT fall back to ritz0
+    and do not skip quietly: a run that tested nothing with the requested
+    compiler is a named failure.
+    """
+    print(f"  ✗ {pkg_name}: {compiler} has no --test harness; "
+          f"{n_files} test file(s) NOT run")
+
+
 def run_tests(pkg_dir: Path, config: dict, compiler: str = "ritz0") -> bool:
     """Run tests for a package with `compiler`.
 
@@ -2290,30 +2443,11 @@ def run_tests(pkg_dir: Path, config: dict, compiler: str = "ritz0") -> bool:
     all_passed = True
     tests_found = False
 
-    # Collect all .ritz test files
-    ritz_tests = []
-
-    # Check test/ subdirectory
-    test_dir = pkg_dir / "test"
-    if test_dir.exists():
-        ritz_tests.extend(test_dir.glob("*.ritz"))
-
-    # For test-only packages, also check package root for test_*.ritz files
-    is_test_only = config.get("build", {}).get("test_only", False)
-    if is_test_only:
-        ritz_tests.extend(pkg_dir.glob("test_*.ritz"))
-
-    ritz_tests = sorted(set(ritz_tests))  # Dedupe and sort
+    ritz_tests = discover_test_files(pkg_dir, config)
 
     if ritz_tests and compiler != "ritz0":
-        # The only .ritz test harness is `ritz0 --test`; ritz1 has no --test
-        # mode. This used to run every file through ritz0 regardless of
-        # --compiler, so each "ritz1" verdict was ritz0's (AGAST #1500). Do
-        # NOT fall back to ritz0 and do not skip quietly: a run that tested
-        # nothing with the requested compiler is a named failure.
         tests_found = True
-        print(f"  ✗ {pkg_name}: {compiler} has no --test harness; "
-              f"{len(ritz_tests)} test file(s) NOT run")
+        report_no_harness(pkg_name, compiler, len(ritz_tests))
         all_passed = False
     elif ritz_tests:
         tests_found = True
@@ -2326,125 +2460,20 @@ def run_tests(pkg_dir: Path, config: dict, compiler: str = "ritz0") -> bool:
         # intrinsic) would terminate the batch before later files could run.
         # Per-file invocations cost a bit more on Python startup but give
         # accurate aggregate results and let one bad file fail in isolation.
-        #
-        # Execution CWD matters for integration tests that `fork/exec ./binary`
-        # (see tier1/01_hello's test_hello_output). We run from pkg_dir so those
-        # relative paths work; imports still resolve via RITZ_PATH (env-based,
-        # not CWD-based — see ritz0/import_resolver.py).
-        test_env = os.environ.copy()
-        # Preserve any caller-provided RITZ_PATH — the workspace `rz` CLI
-        # builds a per-project dependency path list and passes it down; this
-        # used to REPLACE it with just the ritz root, silently breaking
-        # `lib.*` imports from path-dependencies in tests (AGAST #1324).
-        test_env["RITZ_PATH"] = ritz_path_for_tests(
-            test_env.get("RITZ_PATH", ""))
-
-        # Per-file timeout budget. 180s handles even slow elliptic-curve
-        # bigint tests on a debug build; can be tuned via RITZ_TEST_TIMEOUT.
-        per_file_timeout = int(os.environ.get("RITZ_TEST_TIMEOUT", "180"))
-
-        total_passed = 0
-        total_failed = 0
-        failing_files: list[tuple[Path, str]] = []  # (file, reason)
-        timed_out_files: list[Path] = []
-        empty_files: list[Path] = []
-        n_fail_files = 0
-        for tfile in ritz_tests:
-            try:
-                result = subprocess.run(
-                    [sys.executable, str(RITZ0), "--test", str(tfile)],
-                    cwd=pkg_dir,
-                    env=test_env,
-                    capture_output=True, text=True,
-                    timeout=per_file_timeout,
-                )
-            except subprocess.TimeoutExpired:
-                timed_out_files.append(tfile)
-                print(f"    ⏱  {tfile.name} — TIMEOUT after {per_file_timeout}s")
-                all_passed = False
-                continue
-
-            status, file_passed, file_failed = classify_test_file(
-                result.returncode, result.stdout)
-
-            if status == "empty":
-                empty_files.append(tfile)
-                print(f"    ✗ {tfile.name} — ran 0 tests: no [[test]] functions "
-                      f"(a test file that cannot fail is not a test)")
-                all_passed = False
-                continue
-
-            if status == "error":
-                # Compile / link / runtime failure before harness summary
-                err_blob = (result.stderr or "") + (result.stdout or "")
-                # Try to surface the most actionable line
-                err_first = ""
-                for line in err_blob.splitlines():
-                    # Case-insensitive "error" so compiler diagnostics like
-                    # "Error in <file>: ..." match. The old tag list required
-                    # a literal "error:", missed them, and fell through to the
-                    # last line of output — which for a compile failure is the
-                    # content-free "  - <file>: error" harness summary line
-                    # (AGAST #1324).
-                    low = line.lower()
-                    if any(tag in low for tag in (
-                        "cannot select", "fatal error", "error", "valueerror:",
-                        "unknown function", "illegal instruction", "segmentation fault",
-                    )):
-                        err_first = line.strip()
-                        break
-                if not err_first:
-                    err_first = err_blob.strip().splitlines()[-1] if err_blob.strip() else "(no output)"
-                failing_files.append((tfile, err_first[:200]))
-                print(f"    ✗ {tfile.name} — {err_first[:200]}")
-                all_passed = False
-                continue
-
-            total_passed += file_passed
-            total_failed += file_failed
-            if status == "fail":
-                # Compiled and ran but some assertions failed
-                # Print the failure details from stdout
-                n_fail_files += 1
-                print(f"    ✗ {tfile.name} — {file_passed} passed, {file_failed} failed")
-                # Surface the failing harness messages (everything between the last
-                # "FAIL" or assertion line and the summary).
-                for line in result.stdout.splitlines():
-                    if "FAIL" in line or "assertion" in line.lower():
-                        print(f"        {line}")
-                all_passed = False
-            else:
-                print(f"    ✓ {tfile.name} — {file_passed} passed")
-
-        print(format_test_summary(
-            n_files=len(ritz_tests),
-            tests_passed=total_passed,
-            tests_failed=total_failed,
-            n_fail=n_fail_files,
-            n_error=len(failing_files),
-            n_empty=len(empty_files),
-            n_timeout=len(timed_out_files),
-        ))
+        # (`rz test --all -j N` runs these same per-file units concurrently
+        # across the workspace via --unit-file; AGAST #1809.)
+        test_env = test_env_for_files()
+        timeout = per_file_timeout()
+        outcomes = [run_test_file(t, pkg_dir, test_env, timeout)
+                    for t in ritz_tests]
+        if any(o["status"] != "pass" for o in outcomes):
+            all_passed = False
+        print(summarize_file_outcomes(outcomes))
 
     # Run test.sh if it exists
-    test_script = pkg_dir / "test.sh"
-    if test_script.exists():
+    if (pkg_dir / "test.sh").exists():
         tests_found = True
-        print(f"  🧪 Running test.sh...")
-        result = subprocess.run(
-            ["bash", str(test_script)],
-            cwd=pkg_dir,
-            capture_output=True, text=True
-        )
-
-        if result.returncode == 0:
-            print(f"    ✓ test.sh passed")
-        else:
-            print(f"  ✗ test.sh failed:")
-            if result.stdout:
-                print(result.stdout)
-            if result.stderr:
-                print(result.stderr)
+        if not run_test_sh(pkg_dir):
             all_passed = False
 
     if not tests_found:
@@ -2540,6 +2569,89 @@ def cmd_build(args):
     return 0 if success else 1
 
 
+# --- `rz test --all -j N` units (AGAST #1809) ------------------------------
+#
+# The workspace `rz` schedules a package's test run as independent units on
+# one bounded worker pool, so files from different packages (and different
+# files of one package) run concurrently:
+#
+#   --unit-plan PATH     build the package (exactly what `test` builds) and
+#                        write the plan: which test files to run, whether
+#                        test.sh exists. Exit 0 iff the build succeeded and
+#                        the files can be run with this compiler.
+#   --unit-file F        run ONE test file (no build); write its outcome to
+#                        --unit-result. Exit 0 iff it passed.
+#   --unit-test-sh       run test.sh only (no build).
+#
+# Each unit prints exactly the lines the serial `test` prints for that step
+# (same helpers), and `rz` prints the buffered units back in serial order with
+# the same Σ line (summarize_file_outcomes), so the verdict and the log read
+# the same in both modes. Discovery stays here (discover_test_files); `rz`
+# never globs test files itself.
+
+def _test_unit_mode(args) -> Optional[str]:
+    modes = [m for m, v in (("plan", getattr(args, "unit_plan", None)),
+                            ("file", getattr(args, "unit_file", None)),
+                            ("test-sh", getattr(args, "unit_test_sh", False)))
+             if v]
+    if len(modes) > 1:
+        sys.exit("build.py test: --unit-plan, --unit-file and --unit-test-sh "
+                 "are mutually exclusive")
+    if modes == ["file"] and not getattr(args, "unit_result", None):
+        sys.exit("build.py test: --unit-file needs --unit-result PATH")
+    return modes[0] if modes else None
+
+
+def unit_plan(pkg_dir: Path, config: dict, plan_path: Path, *,
+              keep_artifacts: bool, use_cache: bool,
+              profile_name: Optional[str], compiler: str) -> int:
+    """Build step of a package's test run; writes the plan JSON.
+
+    Mirrors cmd_test's per-package build branch and run_tests' preamble:
+    a failed build runs nothing (built=false); a non-ritz0 compiler with
+    test files is the named no-harness failure, and test.sh still runs.
+    """
+    import json
+    pkg_name = config["package"]["name"]
+    built = True
+    if config.get("build", {}).get("test_only", False):
+        print(f"📦 {pkg_name} (test-only)")
+    else:
+        result = build_package(pkg_dir, config, keep_artifacts=keep_artifacts,
+                               use_cache=use_cache, profile_name=profile_name,
+                               compiler=compiler)
+        if not result.ok:
+            print(f"  ✗ Failed to build {pkg_name}: {result.summary()}",
+                  file=sys.stderr)
+            built = False
+
+    files: list[Path] = []
+    no_harness = False
+    if built:
+        files = discover_test_files(pkg_dir, config)
+        if files and compiler != "ritz0":
+            report_no_harness(pkg_name, compiler, len(files))
+            no_harness = True
+            files = []
+    plan = {
+        "built": built,
+        "no_harness": no_harness,
+        "files": [str(f) for f in files],
+        "test_sh": built and (pkg_dir / "test.sh").exists(),
+    }
+    plan_path.write_text(json.dumps(plan))
+    return 0 if built and not no_harness else 1
+
+
+def unit_file(pkg_dir: Path, tfile: Path, result_path: Path) -> int:
+    """Run one test file; write its run_test_file outcome as JSON."""
+    import json
+    outcome = run_test_file(tfile, pkg_dir, test_env_for_files(),
+                            per_file_timeout())
+    result_path.write_text(json.dumps(outcome))
+    return 0 if outcome["status"] == "pass" else 1
+
+
 def cmd_test(args):
     """Build and test packages."""
     keep_artifacts = getattr(args, 'debug', False)
@@ -2570,6 +2682,22 @@ def cmd_test(args):
             print("No ritz.toml found in current directory", file=sys.stderr)
             print("Usage: ritz test [path] or ritz test --all", file=sys.stderr)
             return 1
+
+    unit = _test_unit_mode(args)
+    if unit:
+        if len(targets) != 1 or args.all:
+            print(f"--unit-{unit} takes exactly one package, not --all",
+                  file=sys.stderr)
+            return 2
+        pkg_dir, config = targets[0]
+        if unit == "plan":
+            return unit_plan(pkg_dir, config, Path(args.unit_plan),
+                             keep_artifacts=keep_artifacts, use_cache=use_cache,
+                             profile_name=profile_name, compiler=compiler)
+        if unit == "file":
+            return unit_file(pkg_dir, Path(args.unit_file),
+                             Path(args.unit_result))
+        return 0 if run_test_sh(pkg_dir) else 1
 
     all_passed = True
     for pkg_dir, config in targets:
@@ -2857,6 +2985,16 @@ def main():
     test_parser.add_argument("--compiler", choices=["ritz0", "ritz1", "ritz1_selfhosted"], default="ritz0",
                              help="Which compiler to use (default: ritz0). ritz1 is the self-hosted "
                                   "compiler; ritz1_selfhosted is ritz1 compiled by itself.")
+    # Unit entry points for the workspace `rz test --all -j N` worker pool
+    # (AGAST #1809); see unit_plan / unit_file. Not meant for direct use.
+    test_parser.add_argument("--unit-plan", metavar="PATH",
+                             help=argparse.SUPPRESS)
+    test_parser.add_argument("--unit-file", metavar="FILE",
+                             help=argparse.SUPPRESS)
+    test_parser.add_argument("--unit-result", metavar="PATH",
+                             help=argparse.SUPPRESS)
+    test_parser.add_argument("--unit-test-sh", action="store_true",
+                             help=argparse.SUPPRESS)
 
     # run
     run_parser = subparsers.add_parser("run", help="Compile and run a single .ritz file")

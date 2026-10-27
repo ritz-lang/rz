@@ -368,6 +368,307 @@ def run_test(project_name, extra_args=None):
     return result.returncode
 
 
+# ---------------------------------------------------------------------------
+# Parallel --all sweeps (AGAST #1809)
+#
+# `rz build --all` and `rz test --all` used to run one project at a time, and
+# build.py ran each project's test files one at a time: 196 files back to
+# back, 23m31s on CI, while #1808 had already made compiles cheap and
+# concurrency-safe (content-addressed store, atomic writes, no shared index).
+#
+# Now every sweep is a flat set of UNITS on ONE bounded worker pool, so -j is
+# the true ceiling on concurrent compiler/test processes (no per-project pool
+# multiplying it):
+#
+#   build: one unit per project  (build.py build P)
+#   test:  per project, a plan unit (build.py test P --unit-plan: builds the
+#          package, reports its test files), then one unit per test file
+#          (--unit-file) and one for test.sh (--unit-test-sh), scheduled when
+#          the plan finishes.
+#
+# Output is buffered per unit and printed per project in discovery order,
+# units in serial order — the same lines the serial sweep prints, whatever
+# order units finish in. Verdicts feed summarize_gate unchanged, so the
+# known_failing / strict-xpass semantics are the serial ones.
+#
+# -j 1 keeps the original streaming serial path; the acceptance check for
+# this change is "same per-project verdicts serial vs parallel".
+# ---------------------------------------------------------------------------
+
+import heapq
+import tempfile
+import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from dataclasses import dataclass, field
+
+
+def resolve_jobs(cli_jobs, config=None):
+    """Worker count: -j, else rz.toml [build] (parallel=false → 1,
+    else max_jobs), else os.cpu_count(). Invalid values exit(2)."""
+    if cli_jobs is not None:
+        if isinstance(cli_jobs, bool) or not isinstance(cli_jobs, int) \
+                or cli_jobs < 1:
+            sys.exit(f"rz: -j must be a positive integer, got {cli_jobs!r}")
+        return cli_jobs
+    build = (config if config is not None else load_workspace_config()).get(
+        "build", {})
+    if build.get("parallel", True) is False:
+        return 1
+    if "max_jobs" in build:
+        mj = build["max_jobs"]
+        if isinstance(mj, bool) or not isinstance(mj, int) or mj < 1:
+            sys.exit(f"rz.toml [build] max_jobs must be a positive integer, "
+                     f"got {mj!r}")
+        return mj
+    return os.cpu_count() or 1
+
+
+@dataclass
+class Unit:
+    """One schedulable subprocess. `order` is its print position (project
+    index first); `sched` its priority on the pool (lower runs first)."""
+    project: str
+    order: tuple
+    sched: tuple
+    kind: str            # build | plan | file | test-sh
+    cmd: list
+    env: dict
+    path: Path = None    # JSON the unit writes (plan / file result)
+    file: str = None     # test file, for kind == "file"
+    rc: int = None
+    output: str = ""
+
+
+def run_unit(unit):
+    """Run a unit to completion, stdout+stderr merged in one buffer (so a
+    unit's own diagnostics stay in order and next to its banner)."""
+    proc = subprocess.run(unit.cmd, env=unit.env, cwd=WORKSPACE_ROOT,
+                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                          text=True, errors="replace")
+    unit.rc, unit.output = proc.returncode, proc.stdout
+    return unit
+
+
+def run_pool(jobs, units, on_done):
+    """Run `units` on at most `jobs` workers, lowest `sched` first.
+
+    on_done(unit) is called on the calling thread as each unit finishes and
+    returns follow-up units to schedule. Single-threaded bookkeeping: only
+    run_unit runs on workers.
+    """
+    seq = 0
+    ready = []
+
+    def push(u):
+        nonlocal seq
+        heapq.heappush(ready, (u.sched, seq, u))
+        seq += 1
+
+    for u in units:
+        push(u)
+    running = set()
+    with ThreadPoolExecutor(max_workers=jobs) as ex:
+        while ready or running:
+            while ready and len(running) < jobs:
+                running.add(ex.submit(run_unit, heapq.heappop(ready)[2]))
+            done, running = wait(running, return_when=FIRST_COMPLETED)
+            for fut in sorted(done, key=lambda f: f.result().order):
+                for nxt in on_done(fut.result()) or []:
+                    push(nxt)
+
+
+def _emit(text):
+    if text:
+        sys.stdout.write(text if text.endswith("\n") else text + "\n")
+
+
+def _read_json(path):
+    try:
+        return json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return None
+
+
+_BUILDPY = None
+
+
+def _buildpy():
+    """build.py as a module, for summarize_file_outcomes: the Σ line must be
+    build.py's own, not a copy that can drift from it."""
+    global _BUILDPY
+    if _BUILDPY is None:
+        import importlib.util
+        sys.path.insert(0, str(RITZ_BUILD.parent))
+        spec = importlib.util.spec_from_file_location("_rz_buildpy",
+                                                      RITZ_BUILD)
+        _BUILDPY = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(_BUILDPY)
+    return _BUILDPY
+
+
+class _InOrderPrinter:
+    """Prints finished projects strictly in discovery order."""
+
+    def __init__(self, n, render):
+        self.done = [False] * n
+        self.next = 0
+        self.render = render
+
+    def finish(self, idx):
+        self.done[idx] = True
+        while self.next < len(self.done) and self.done[self.next]:
+            self.render(self.next)
+            self.next += 1
+        sys.stdout.flush()
+
+
+def _banner(verb, project, compiler):
+    return (f"\n{'='*60}\n{verb}: {project}  (compiler={compiler})\n"
+            f"{'='*60}\n")
+
+
+def build_projects_parallel(projects, jobs, extra_args):
+    """`rz build --all` on the pool. Returns failed projects, in order."""
+    compiler = extra_args[extra_args.index("--compiler") + 1] \
+        if "--compiler" in extra_args else "ritz0"
+    units = [Unit(project=p, order=(i,), sched=(i,), kind="build",
+                  cmd=[sys.executable, str(RITZ_BUILD), "build",
+                       str(PROJECTS_DIR / p), *extra_args],
+                  env=child_env(p))
+             for i, p in enumerate(projects)]
+    failed = []
+
+    def render(i):
+        u = units[i]
+        _emit(_banner("Building", u.project, compiler))
+        _emit(u.output)
+        if u.rc != 0:
+            failed.append(u.project)
+            _emit(f"✗ {u.project}: build failed (exit {u.rc})")
+
+    printer = _InOrderPrinter(len(projects), render)
+    t0 = time.monotonic()
+    run_pool(jobs, units, lambda u: printer.finish(u.order[0]))
+    _emit(f"rz: built {len(projects)} project(s) on {jobs} worker(s) "
+          f"in {time.monotonic() - t0:.1f}s")
+    return failed
+
+
+@dataclass
+class _ProjectRun:
+    project: str
+    plan_unit: Unit = None
+    plan: dict = None
+    files: list = field(default_factory=list)   # file Units, serial order
+    test_sh: Unit = None
+    pending: int = 0
+
+
+def test_projects_parallel(projects, jobs, compiler):
+    """`rz test --all` on the pool. Returns failed projects, in order.
+
+    A project fails iff any of its units exits non-zero — exactly when the
+    serial `build.py test P` exits non-zero.
+    """
+    tmp = tempfile.TemporaryDirectory(prefix="rz-units-")
+    tmpdir = Path(tmp.name)
+    runs = [_ProjectRun(p) for p in projects]
+    envs = {}
+    base = [sys.executable, str(RITZ_BUILD), "test"]
+
+    def env_for(p):
+        if p not in envs:
+            envs[p] = child_env(p)
+        return envs[p]
+
+    def pdir(p):
+        return str(PROJECTS_DIR / p)
+
+    initial = []
+    for i, r in enumerate(runs):
+        plan_path = tmpdir / f"{i}.plan.json"
+        # Plans (package builds) schedule ahead of every file so the ready
+        # set fills as early as possible; files then run project by project.
+        r.plan_unit = Unit(project=r.project, order=(i, 0), sched=(0, i),
+                           kind="plan", path=plan_path, env=env_for(r.project),
+                           cmd=[*base, pdir(r.project), "--compiler", compiler,
+                                "--unit-plan", str(plan_path)])
+        r.pending = 1
+        initial.append(r.plan_unit)
+
+    failed = []
+
+    def render(i):
+        r = runs[i]
+        _emit(_banner("Testing", r.project, compiler))
+        _emit(r.plan_unit.output)
+        plan = r.plan or {}
+        if r.files:
+            _emit(f"  🧪 Running {len(r.files)} .ritz test file(s)...")
+            outcomes = []
+            for u in r.files:
+                _emit(u.output)
+                res = _read_json(u.path)
+                if not isinstance(res, dict) or "status" not in res:
+                    # The unit died before writing a verdict: count it as a
+                    # file that did not pass, never as a missing file.
+                    res = {"status": "error", "passed": 0, "failed": 0}
+                outcomes.append(res)
+            _emit(_buildpy().summarize_file_outcomes(outcomes))
+        if r.test_sh:
+            _emit(r.test_sh.output)
+        if (plan.get("built") and not plan.get("no_harness")
+                and not r.files and not r.test_sh):
+            _emit("  ⚠ No tests found, skipping")
+        units = [r.plan_unit, *r.files, *([r.test_sh] if r.test_sh else [])]
+        rc = next((u.rc for u in units if u.rc != 0), 0)
+        _emit("\n✓ All tests passed!" if rc == 0 else "\n✗ Some tests failed")
+        if rc != 0:
+            failed.append(r.project)
+            _emit(f"✗ {r.project}: tests failed (exit {rc})")
+
+    printer = _InOrderPrinter(len(runs), render)
+
+    def on_done(u):
+        i = u.order[0]
+        r = runs[i]
+        r.pending -= 1
+        follow = []
+        if u.kind == "plan":
+            r.plan = _read_json(u.path)
+            plan = r.plan if isinstance(r.plan, dict) else {}
+            if plan.get("built"):
+                for j, f in enumerate(plan.get("files", [])):
+                    res = tmpdir / f"{i}.{j}.result.json"
+                    follow.append(Unit(
+                        project=r.project, order=(i, 1, j), sched=(1, i, j),
+                        kind="file", path=res, file=f, env=env_for(r.project),
+                        cmd=[*base, pdir(r.project), "--compiler", compiler,
+                             "--unit-file", f, "--unit-result", str(res)]))
+                r.files = list(follow)
+                if plan.get("test_sh"):
+                    r.test_sh = Unit(
+                        project=r.project, order=(i, 2), sched=(1, i, -1),
+                        kind="test-sh", env=env_for(r.project),
+                        cmd=[*base, pdir(r.project), "--compiler", compiler,
+                             "--unit-test-sh"])
+                    follow.append(r.test_sh)
+            r.pending += len(follow)
+        if r.pending == 0:
+            printer.finish(i)
+        return follow
+
+    t0 = time.monotonic()
+    try:
+        run_pool(jobs, initial, on_done)
+    finally:
+        tmp.cleanup()
+    n_units = sum(1 + len(r.files) + bool(r.test_sh) for r in runs)
+    _emit(f"rz: tested {len(projects)} project(s), {n_units} unit(s) on "
+          f"{jobs} worker(s) in {time.monotonic() - t0:.1f}s")
+    return failed
+
+
 def cmd_build(args):
     """Handle 'rz build' command."""
     extra_args = ["--release"] if getattr(args, "release", False) else []
@@ -376,6 +677,11 @@ def cmd_build(args):
 
     if args.all:
         projects = discover_projects()
+        jobs = resolve_jobs(getattr(args, "jobs", None))
+        if jobs > 1:
+            failed = build_projects_parallel(projects, jobs, extra_args)
+            return summarize_gate(
+                "build", failed, known_failing_from_config("build"), projects)
         failed = []
         for project in projects:
             # flush=True on the banner (and the verdict below) is load-bearing:
@@ -409,37 +715,11 @@ def cmd_test(args):
 
     if args.all:
         projects = discover_projects()
-        failed = []
-        for project in projects:
-            # No pre-filter here on purpose.
-            #
-            # This used to skip any project whose [build] table lacked a
-            # literal `test` key. Almost nothing sets that key — projects
-            # declare tests via [[test]] sections, `test_only`, or simply a
-            # test/ directory — so `rz test --all` silently covered 2 of 26
-            # projects while reporting "All tests passed!". A gate that skips
-            # 92% of the workspace is worse than no gate: it reports green.
-            #
-            # build.py already owns test discovery (ritz.toml [[test]],
-            # the test/ glob, test_only packages, test.sh) and prints
-            # "No tests found, skipping" without failing. Deferring to it
-            # keeps discovery in one place instead of two that disagree.
-            #
-            # This comment used to say "test/ and tests/ globs". build.py does
-            # NOT glob tests/ — run_tests() reads pkg_dir/"test" only
-            # (build.py:1939). That false claim was the only written record of
-            # a tests/ convention, and five packages followed it: iris (30
-            # test fns), valet (99), lexis (115), tempest (7) and ritz1 (3)
-            # were invisible to every gate. See AGAST #1386.
-            # flush=True is load-bearing under a piped stdout — see child_env().
-            print(f"\n{'='*60}", flush=True)
-            print(f"Testing: {project}  (compiler={compiler})", flush=True)
-            print('='*60, flush=True)
-            rc = run_test(project, extra_args)
-            if rc != 0:
-                failed.append(project)
-                print(f"✗ {project}: tests failed (exit {rc})", flush=True)
-
+        jobs = resolve_jobs(getattr(args, "jobs", None))
+        if jobs > 1:
+            failed = test_projects_parallel(projects, jobs, compiler)
+        else:
+            failed = serial_test_sweep(projects, extra_args, compiler)
         # There is deliberately NO [ci.known_failing.test]. House rule
         # (scripts/regression.sh): an allowlist may say "this program is
         # known not to compile"; it must never excuse behavioural failure.
@@ -463,6 +743,42 @@ def cmd_test(args):
     if project is None:
         return 1
     return run_test(project, extra_args)
+
+
+def serial_test_sweep(projects, extra_args, compiler):
+    """The original one-project-at-a-time `rz test --all` (-j 1)."""
+    failed = []
+    for project in projects:
+        # No pre-filter here on purpose.
+        #
+        # This used to skip any project whose [build] table lacked a
+        # literal `test` key. Almost nothing sets that key — projects
+        # declare tests via [[test]] sections, `test_only`, or simply a
+        # test/ directory — so `rz test --all` silently covered 2 of 26
+        # projects while reporting "All tests passed!". A gate that skips
+        # 92% of the workspace is worse than no gate: it reports green.
+        #
+        # build.py already owns test discovery (ritz.toml [[test]],
+        # the test/ glob, test_only packages, test.sh) and prints
+        # "No tests found, skipping" without failing. Deferring to it
+        # keeps discovery in one place instead of two that disagree.
+        #
+        # This comment used to say "test/ and tests/ globs". build.py does
+        # NOT glob tests/ — run_tests() reads pkg_dir/"test" only
+        # (build.py:1939). That false claim was the only written record of
+        # a tests/ convention, and five packages followed it: iris (30
+        # test fns), valet (99), lexis (115), tempest (7) and ritz1 (3)
+        # were invisible to every gate. See AGAST #1386.
+        # flush=True is load-bearing under a piped stdout — see child_env().
+        print(f"\n{'='*60}", flush=True)
+        print(f"Testing: {project}  (compiler={compiler})", flush=True)
+        print('='*60, flush=True)
+        rc = run_test(project, extra_args)
+        if rc != 0:
+            failed.append(project)
+            print(f"✗ {project}: tests failed (exit {rc})", flush=True)
+
+    return failed
 
 
 def cmd_run(args):
@@ -1477,7 +1793,21 @@ def cmd_ci(args):
 
 
 
-def main():
+def _positive_int(text):
+    try:
+        n = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not an integer: {text!r}")
+    if n < 1:
+        raise argparse.ArgumentTypeError(f"must be >= 1, got {n}")
+    return n
+
+
+JOBS_HELP = ("Run up to N build/test units at once for --all (default: "
+             "rz.toml [build] max_jobs; 1 = the serial, streaming sweep)")
+
+
+def build_parser():
     parser = argparse.ArgumentParser(
         description="Unified workspace CLI for the Ritz ecosystem",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1493,6 +1823,8 @@ def main():
     build_parser.add_argument("--release", action="store_true", help="Build with release profile")
     build_parser.add_argument("--compiler", choices=["ritz0", "ritz1", "ritz1_selfhosted"], default="ritz0",
                               help="Compiler to use (default: ritz0)")
+    build_parser.add_argument("-j", "--jobs", type=_positive_int, metavar="N",
+                              help=JOBS_HELP)
 
     # test
     test_parser = subparsers.add_parser("test", help="Run tests")
@@ -1500,6 +1832,8 @@ def main():
     test_parser.add_argument("--all", action="store_true", help="Test all projects")
     test_parser.add_argument("--compiler", choices=["ritz0", "ritz1", "ritz1_selfhosted"], default="ritz0",
                              help="Compiler to use (default: ritz0)")
+    test_parser.add_argument("-j", "--jobs", type=_positive_int, metavar="N",
+                             help=JOBS_HELP)
 
     # run
     run_parser = subparsers.add_parser("run", help="Build and run a project")
@@ -1544,12 +1878,6 @@ def main():
     ci_gen.add_argument("--provider", required=True, choices=["github", "gitlab", "circleci"])
     ci_gen.add_argument("--output", help="Output file path (defaults to provider convention)")
 
-    args = parser.parse_args()
-
-    if not args.command:
-        parser.print_help()
-        return 1
-
     commands = {
         "build": cmd_build,
         "test": cmd_test,
@@ -1559,8 +1887,20 @@ def main():
         "compare": cmd_compare,
         "ci": cmd_ci,
     }
+    for name, sub in subparsers.choices.items():
+        sub.set_defaults(func=commands[name])
+    return parser
 
-    return commands[args.command](args)
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        return 1
+
+    return args.func(args)
 
 
 if __name__ == "__main__":
