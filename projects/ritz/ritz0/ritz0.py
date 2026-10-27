@@ -26,6 +26,7 @@ from lexer import Lexer, LexerError
 from parser import Parser, ParseError  # Hand-written parser
 from emitter_llvmlite import emit as emit_llvmlite, get_test_functions, generate_test_main_source, EmitError
 from import_resolver import ImportResolver, ImportError as RitzImportError
+import module_interface
 from name_resolver import resolve_names, NameError as RitzNameError
 from move_checker import MoveChecker, OwnershipError
 from type_checker import TypeChecker, TypeError as RitzTypeError
@@ -120,17 +121,8 @@ def compile_file(source_path: str, output_path: str, no_runtime: bool = False,
         source_file = source_path_obj.name
         source_dir = str(source_path_obj.parent.resolve()) if source_path_obj.parent else "."
 
-        # Lex
-        lexer = Lexer(source, source_path)
-        tokens = lexer.tokenize()
-
-        # Parse
-        # Note: Parser may accept source= kwarg (needed for generated parser adapter)
-        try:
-            parser = Parser(tokens, source=source)
-        except TypeError:
-            parser = Parser(tokens)
-        module = parser.parse_module()
+        # Lex and parse (counted: RITZ0_PARSE_LOG, module_interface.PARSED)
+        module = module_interface.parse_source(source, source_path)
 
         # Capture import paths BEFORE resolve_imports — that pass replaces
         # `module.items` with merged items from all transitive imports and
@@ -146,11 +138,13 @@ def compile_file(source_path: str, output_path: str, no_runtime: bool = False,
             if isinstance(_item, rast.Import):
                 original_import_paths.append('.'.join(_item.path))
 
-        # Resolve imports (recursively parse and merge imported modules)
-        # Note: use_cache=False because the cache creates stub functions without bodies,
-        # which is incompatible with our current merged-module architecture.
-        # For separate compilation, the cache would be appropriate.
-        resolver = ImportResolver(project_root, use_cache=False, dependencies=dependencies, source_roots=source_roots)
+        # Resolve imports and merge them into one module. Imported modules
+        # come from their interfaces (G9, AGAST #1810: module_interface.py),
+        # so only this file is parsed; only its bodies are emitted anyway.
+        # use_cache=False: the older .ritz-meta stubs lose generic bodies.
+        resolver = ImportResolver(project_root, use_cache=False, dependencies=dependencies,
+                                  source_roots=source_roots,
+                                  use_interfaces=module_interface.enabled())
         module = resolver.resolve(module, source_path)
 
         # Hash every transitive import now, before emission, so the sig vouches

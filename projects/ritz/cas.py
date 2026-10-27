@@ -52,7 +52,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Callable, Dict, Iterable, List, Optional
 
 CAS_DIR_ENV = "RITZ_CACHE_DIR"
 STATS_ENV = "RITZ_CAS_STATS"
@@ -151,15 +151,21 @@ def module_key(
     flags: Dict[str, object],
     target: Optional[str] = None,
     repo_root: Optional[Path] = None,
+    dep_digest: Optional[Callable[[Path], str]] = None,
 ) -> str:
     """The store key of one compiled module. See the module docstring.
 
     `closure` is the module's transitive imports; the module itself may be
-    in it and is skipped.
+    in it and is skipped. `dep_digest` names each import's content; the
+    default is its source sha256. A compiler that reads only its imports'
+    interfaces passes the interface hash (G9, AGAST #1810), so a body-only
+    edit to an import does not change the key. The caller must put which
+    digest it used into `flags`.
     """
     src = Path(source).resolve()
+    digest = dep_digest if dep_digest is not None else file_sha256
     deps = sorted(
-        (module_identity(d, repo_root), file_sha256(d))
+        (module_identity(d, repo_root), digest(d))
         for d in {Path(d).resolve() for d in closure}
         if d != src
     )

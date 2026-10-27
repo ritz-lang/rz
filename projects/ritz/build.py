@@ -316,6 +316,7 @@ def report_obj_failures(failures: List[str]) -> None:
 RITZ0_DIR = ROOT / "ritz0"
 if str(RITZ0_DIR) not in sys.path:
     sys.path.insert(0, str(RITZ0_DIR))
+import module_interface  # noqa: E402  (ritz0/, G9 interface hashes)
 
 # Global build cache instance. Since AGAST #1808 it only supplies the import
 # graph (resolver scans, persisted per worktree) and the compiler fingerprint;
@@ -355,13 +356,28 @@ def cas_module_key(src: Path, cache: BuildCache, compiler: str) -> Optional[str]
         return None
     # Persist fresh scans: a fully cached build never writes them otherwise.
     cache._save_imports_db()
-    return cas.module_key(
-        compiler_fp=cache._get_current_compiler_hash(),
-        source=Path(src),
-        closure=[Path(p) for p in closure],
-        flags={"compiler": compiler, "emit": "no-runtime",
-               "obj": OBJ_CLANG_FLAGS, "verify_ir": _verify_ir_enabled()},
-    )
+    flags = {"compiler": compiler, "emit": "no-runtime",
+             "obj": OBJ_CLANG_FLAGS, "verify_ir": _verify_ir_enabled()}
+    dep_digest = None
+    # G9 (AGAST #1810): ritz0 reads its imports' interfaces, not their
+    # sources, so its objects depend on interface hashes: a body-only edit
+    # to an import keeps every importer's key. ritz1 still parses import
+    # sources, so its key stays on source hashes.
+    if compiler == "ritz0" and module_interface.enabled():
+        flags["deps"] = module_interface.SCHEMA
+        dep_digest = lambda p: module_interface.interface_hash(str(p))  # noqa: E731
+    try:
+        return cas.module_key(
+            compiler_fp=cache._get_current_compiler_hash(),
+            source=Path(src),
+            closure=[Path(p) for p in closure],
+            flags=flags,
+            dep_digest=dep_digest,
+        )
+    except Exception:
+        # An import that does not parse has no interface: compile uncached
+        # and let the compiler report the real error.
+        return None
 
 
 def report_compile_failures(failures: List[Tuple[Path, str]], compiler: str) -> None:

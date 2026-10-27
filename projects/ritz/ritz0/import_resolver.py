@@ -26,8 +26,7 @@ from typing import Set, Dict, Iterable, Optional, List
 from dataclasses import replace
 import os
 import ritz_ast as rast
-from lexer import Lexer
-from parser import Parser
+import module_interface
 from metadata import MetadataCache, extract_metadata, ModuleMetadata
 from emitter.fn_cache import read_sig_file, source_file_hash, check_source_hash
 
@@ -242,8 +241,13 @@ class ImportResolver:
         project_root: Optional[str] = None,
         use_cache: bool = True,
         dependencies: Optional[Dict[str, DependencyMapping]] = None,
-        source_roots: Optional[List[str]] = None
+        source_roots: Optional[List[str]] = None,
+        use_interfaces: bool = False,
     ):
+        # G9 (AGAST #1810): load imported modules as their interfaces
+        # (module_interface.py) -- non-generic fn bodies stripped, cached in
+        # the artifact store -- instead of lexing and parsing their sources.
+        self.use_interfaces = use_interfaces
         # Track which files have been processed to avoid cycles
         self.processed_files: Set[str] = set()
         # Track which files are currently being processed (for cycle detection)
@@ -875,12 +879,13 @@ class ImportResolver:
                             self._process_import(nested_imp, import_path)
                         return
 
-            # Cache miss or disabled - read and parse the imported file
-            source = Path(import_path).read_text()
-            lexer = Lexer(source, import_path)
-            tokens = lexer.tokenize()
-            parser = Parser(tokens)
-            imported_module = parser.parse_module()
+            # Cache miss or disabled - load the module's interface, or read
+            # and parse the imported file
+            if self.use_interfaces:
+                imported_module = module_interface.load_interface(import_path)
+            else:
+                source = Path(import_path).read_text()
+                imported_module = module_interface.parse_source(source, import_path)
 
             # Process imports in the imported module
             for item in imported_module.items:
@@ -1002,8 +1007,13 @@ class ImportResolver:
         if self.project_root is None:
             # Same auto-detection `resolve()` does for the main file.
             self.project_root = self._find_project_root(Path(source_path).parent)
-        source = Path(source_path).read_text()
-        module = Parser(Lexer(source, source_path).tokenize()).parse_module()
+        # The interface keeps every import, and is the entry the compiler
+        # loads next (G9, AGAST #1810).
+        if module_interface.enabled():
+            module = module_interface.load_interface(source_path)
+        else:
+            source = Path(source_path).read_text()
+            module = module_interface.parse_source(source, source_path)
         found: List[str] = []
         for item in module.items:
             if not isinstance(item, rast.Import):
@@ -1517,21 +1527,20 @@ def collect_all_source_files(
     if ritz0_dir not in sys.path:
         sys.path.insert(0, ritz0_dir)
 
-    from parser import Parser
-    from lexer import Lexer
-
-    # Don't use cache - this is just for discovery, not compilation.
-    # Using cache here would write stub metadata that could interfere
-    # with later compilation that needs full function bodies.
-    resolver = ImportResolver(project_root, use_cache=False, dependencies=dependencies, source_roots=source_roots)
+    # Don't use the .ritz-meta cache - it writes stub metadata that could
+    # interfere with later compilation that needs full function bodies.
+    # Module interfaces (G9, AGAST #1810) are safe: they keep every import,
+    # and are the same entries the compiler loads next.
+    use_interfaces = module_interface.enabled()
+    resolver = ImportResolver(project_root, use_cache=False, dependencies=dependencies,
+                              source_roots=source_roots, use_interfaces=use_interfaces)
     source_path = str(Path(source_path).resolve())
 
-    # Parse main module
-    source_code = Path(source_path).read_text()
-    lexer = Lexer(source_code)
-    tokens = lexer.tokenize()
-    parser = Parser(tokens)
-    module = parser.parse_module()
+    # Parse main module (only its imports matter here)
+    if use_interfaces:
+        module = module_interface.load_interface(source_path)
+    else:
+        module = module_interface.parse_source(Path(source_path).read_text(), source_path)
 
     # Resolve imports (this populates resolver.processed_files)
     resolver.resolve(module, source_path)

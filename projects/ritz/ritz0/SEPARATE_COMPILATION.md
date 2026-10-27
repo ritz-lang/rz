@@ -137,3 +137,21 @@ Goodbye world
 2. Cache `.ll` and `.o` files in `.ritz-cache/`
 3. Parallel compilation of independent modules
 4. Header/interface file generation for faster imports
+
+## Module interfaces (G9, AGAST #1810)
+
+Since #1810 ritz0 no longer parses imported sources. `ImportResolver(use_interfaces=True)`
+loads each import's *interface* from `module_interface.py`: the parsed module with
+every body it does not export stripped (bodies of generic fns, async fns and
+generic-impl methods are kept; the importer instantiates them). Interfaces live
+in the G7 artifact store (`cas.py`, `$RITZ_CACHE_DIR`) as `<k>.rzi` / `<k>.rzih`,
+keyed by parser fingerprint, absolute path and source hash.
+
+`build.cas_module_key` keys ritz0 objects on their imports' *interface hashes*,
+which ignore positions outside kept bodies: a body-only edit to an import no
+longer invalidates its importers. ritz1 still parses its closure (AGAST #1899).
+
+- `RITZ0_PARSE_LOG=<file>` appends every parsed source path (one per line).
+- `RITZ0_NO_INTERFACES=1` restores full parsing, e.g. to compare IR.
+
+Tests: `test_module_interface.py`.
