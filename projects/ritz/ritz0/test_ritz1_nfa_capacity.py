@@ -35,13 +35,15 @@ The probe links ritz1's *real* nfa.ritz, compiled by ritz0.
 
 import os
 import subprocess
-import sys
 from pathlib import Path
 
 import pytest
 
+from ritz0_inproc import run_ritz0
+
+pytestmark = pytest.mark.integration
+
 RITZ_ROOT = Path(__file__).resolve().parent.parent
-RITZ0 = RITZ_ROOT / "ritz0" / "ritz0.py"
 RITZ1_SRC = RITZ_ROOT / "ritz1" / "src"
 
 CAP = 4
@@ -82,10 +84,7 @@ ADDERS = [
 
 def _ritz0(src: Path, out: Path, *extra: str) -> None:
     env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
-    proc = subprocess.run(
-        [sys.executable, str(RITZ0), str(src), "-o", str(out), *extra],
-        cwd=src.parent, capture_output=True, text=True, env=env, timeout=600,
-    )
+    proc = run_ritz0([str(src), "-o", str(out), *extra], cwd=src.parent, env=env, timeout=600)
     assert proc.returncode == 0, (
         f"ritz0 failed on {src.name}:\n{proc.stdout[-2000:]}\n{proc.stderr[-2000:]}"
     )

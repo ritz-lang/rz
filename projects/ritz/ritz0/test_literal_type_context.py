@@ -60,13 +60,16 @@ because a test that only checked "it compiles" would have passed before the fix.
 import os
 import re
 import subprocess
-import sys
 from pathlib import Path
 
 import pytest
 
+from ritz0_inproc import run_ritz0
+
 RITZ_ROOT = Path(__file__).resolve().parent.parent
-RITZ0 = RITZ_ROOT / "ritz0" / "ritz0.py"
+
+# Every test compiles with ritz0 (AGAST #1805).
+pytestmark = pytest.mark.integration
 
 
 def _emit_ir(tmp_path, source):
@@ -75,9 +78,9 @@ def _emit_ir(tmp_path, source):
     src.write_text(source)
     out = tmp_path / "unit.ll"
     env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
-    proc = subprocess.run(
-        [sys.executable, str(RITZ0), str(src), "-o", str(out), "--no-runtime"],
-        capture_output=True, text=True, env=env, timeout=300,
+    proc = run_ritz0(
+        [str(src), "-o", str(out), "--no-runtime"],
+        env=env, timeout=300,
     )
     assert proc.returncode == 0, (
         f"compile failed:\nstdout={proc.stdout}\nstderr={proc.stderr}"
@@ -315,10 +318,7 @@ def test_arithmetic_results_are_unchanged_at_the_declared_width(tmp_path):
     ll = tmp_path / "rt.ll"
     exe = tmp_path / "rt"
     env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
-    build = subprocess.run(
-        [sys.executable, str(RITZ0), str(src), "-o", str(ll)],
-        capture_output=True, text=True, env=env, timeout=300,
-    )
+    build = run_ritz0([str(src), "-o", str(ll)], env=env, timeout=300)
     assert build.returncode == 0, build.stderr
     # -nostdlib matches build.py: ritz0 emits its own `_start`.
     link = subprocess.run(
@@ -347,10 +347,9 @@ def test_a_literal_too_large_for_its_context_is_a_located_error(tmp_path):
         "    return bad\n"
     )
     env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
-    proc = subprocess.run(
-        [sys.executable, str(RITZ0), str(src),
-         "-o", str(tmp_path / "toobig.ll"), "--no-runtime"],
-        capture_output=True, text=True, env=env, timeout=300,
+    proc = run_ritz0(
+        [str(src), "-o", str(tmp_path / "toobig.ll"), "--no-runtime"],
+        env=env, timeout=300,
     )
     assert proc.returncode != 0, "a literal that cannot fit was accepted"
     combined = proc.stdout + proc.stderr

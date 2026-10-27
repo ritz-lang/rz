@@ -1,0 +1,222 @@
+# Regression tests for AGAST #1664: `Some(s.value)` / `Ok(s.value)` where
+# `value` is a struct-typed field (StrView) under ritz1.
+#
+# ritzlib/argspec.ritz:427 (77_args):
+#
+#     fn value_at(p: @ArgParser, idx: i32) -> Option<StrView>
+#         let s = slot_at(p, idx)
+#         if s.present
+#             return Some(s.value)        # value: StrView
+#
+# ritz1 loaded the field as `%StrView` and then stored it into the Option
+# payload with `store i64 %<%StrView>` — emit_variant_struct only recognised an
+# ident, a string literal or a call as an aggregate payload.  A member chain
+# whose innermost field is a struct is an aggregate too.
+#
+# Each program returns 42 when correct and a distinct small code naming the
+# check that failed otherwise.  ritz0 is the oracle; everything runs at RUNTIME
+# and reads the payload back (len and bytes), so a zeroed or truncated payload
+# cannot pass.
+#
+# String literals reach StrView fields through a typed `let svN: StrView`
+# local: a bare "..." initialiser in a struct literal is the separate #1669.
+#
+# Migrated from ritz0/test_ritz1_variant_member_payload.py by AGAST #1805: each case was a pure
+# ritz0-vs-ritz1 differential (same exit code under both), so it is a
+# test fn here and the regression matrix runs it under ritz0, ritz1
+# and ritz1_selfhosted.  Each case's `main` is renamed `<case>_main`;
+# top-level names shared between cases carry a `_<n>` suffix.
+
+import ritzlib.option
+import ritzlib.strview
+import ritzlib.result
+
+# --- by_value_and_default --------------------------------------------------
+
+struct Spec
+    id: i64
+    default: StrView
+
+fn dflt(f: Spec) -> Option<StrView>
+    Some(f.default)
+
+fn local_some() -> Option<StrView>
+    let sv3: StrView = "abcd"
+    let f = Spec { id: 1, default: sv3 }
+    return Some(f.default)
+
+fn olen_0(o: Option<StrView>) -> i64
+    match o
+        Some(v) => v.len
+        None => -1
+
+fn obyte_0(o: Option<StrView>, i: i64) -> i64
+    match o
+        Some(v) => *(v.ptr + i) as i64
+        None => -1
+
+fn by_value_and_default_main() -> i32
+    let sv4: StrView = "hello"
+    let f1 = Spec { id: 7, default: sv4 }
+    if olen_0(dflt(f1)) != 5
+        return 1
+    let sv5: StrView = "hello"
+    let f2 = Spec { id: 8, default: sv5 }
+    if obyte_0(dflt(f2), 4) != 111
+        return 2
+    if olen_0(local_some()) != 4
+        return 3
+    if obyte_0(local_some(), 0) != 97
+        return 4
+    return 42
+
+[[test]]
+fn test_by_value_and_default() -> i32
+    assert by_value_and_default_main() == 42
+    0
+
+
+# --- nested_ptr_and_ok -----------------------------------------------------
+
+struct Inner_1
+    tag: i32
+    name: StrView
+
+struct Outer
+    k: i64
+    inner: Inner_1
+
+fn nested(o: @Outer) -> Option<StrView>
+    Some(o.inner.name)
+
+fn via_ptr(p: *Inner_1) -> Option<StrView>
+    Some(p.name)
+
+fn as_ok(i: @Inner_1) -> Result<StrView, i32>
+    if i.tag < 0
+        return Err(i.tag)
+    Ok(i.name)
+
+fn olen_1(o: Option<StrView>) -> i64
+    match o
+        Some(v) => v.len
+        None => -1
+
+fn obyte_1(o: Option<StrView>, i: i64) -> i64
+    match o
+        Some(v) => *(v.ptr + i) as i64
+        None => -1
+
+fn rlen(r: Result<StrView, i32>) -> i64
+    match r
+        Ok(v) => v.len
+        Err(e) => e as i64 - 100
+
+fn rbyte(r: Result<StrView, i32>, i: i64) -> i64
+    match r
+        Ok(v) => *(v.ptr + i) as i64
+        Err(e) => -1
+
+fn nested_ptr_and_ok_main() -> i32
+    let sv6: StrView = "xyz"
+    let i0 = Inner_1 { tag: 5, name: sv6 }
+    let o = Outer { k: 9, inner: i0 }
+    if olen_1(nested(@o)) != 3
+        return 1
+    if obyte_1(nested(@o), 1) != 121
+        return 2
+    let sv7: StrView = "uvwz"
+    let i = Inner_1 { tag: 5, name: sv7 }
+    if olen_1(via_ptr(@i)) != 4
+        return 3
+    if obyte_1(via_ptr(@i), 3) != 122
+        return 4
+    if rlen(as_ok(@i)) != 4
+        return 5
+    if rbyte(as_ok(@i), 0) != 117
+        return 6
+    let sv8: StrView = "q"
+    let bad = Inner_1 { tag: -4, name: sv8 }
+    if rlen(as_ok(@bad)) != -104
+        return 7
+    return 42
+
+[[test]]
+fn test_nested_ptr_and_ok() -> i32
+    assert nested_ptr_and_ok_main() == 42
+    0
+
+
+# --- ptr_field_stays_scalar ------------------------------------------------
+
+struct Inner_2
+    tag: i32
+    name: StrView
+
+struct Holder
+    k: i64
+    target: *Inner_2
+
+fn pick(h: @Holder) -> Option<*Inner_2>
+    Some(h.target)
+
+fn read_tag(p: *Inner_2) -> i64
+    p.tag as i64
+
+fn tag_of(o: Option<*Inner_2>) -> i64
+    match o
+        Some(p) => read_tag(p)
+        None => -1
+
+fn ptr_field_stays_scalar_main() -> i32
+    let sv: StrView = "ab"
+    var i = Inner_2 { tag: 11, name: sv }
+    let h = Holder { k: 3, target: @i }
+    if tag_of(pick(@h)) != 11
+        return 1
+    return 42
+
+[[test]]
+fn test_ptr_field_stays_scalar() -> i32
+    assert ptr_field_stays_scalar_main() == 42
+    0
+
+
+# --- ticket_repro_ref ------------------------------------------------------
+
+struct Slot
+    present: bool
+    value: StrView
+
+fn get(s: @Slot) -> Option<StrView>
+    if s.present
+        return Some(s.value)
+    None
+
+fn olen_3(o: Option<StrView>) -> i64
+    match o
+        Some(v) => v.len
+        None => -1
+
+fn obyte_3(o: Option<StrView>, i: i64) -> i64
+    match o
+        Some(v) => *(v.ptr + i) as i64
+        None => -1
+
+fn ticket_repro_ref_main() -> i32
+    let sv1: StrView = "hey"
+    let s = Slot { present: true, value: sv1 }
+    if olen_3(get(@s)) != 3
+        return 1
+    if obyte_3(get(@s), 2) != 121
+        return 2
+    let sv2: StrView = "x"
+    let n = Slot { present: false, value: sv2 }
+    if olen_3(get(@n)) != -1
+        return 3
+    return 42
+
+[[test]]
+fn test_ticket_repro_ref() -> i32
+    assert ticket_repro_ref_main() == 42
+    0

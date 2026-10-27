@@ -39,9 +39,10 @@ from pathlib import Path
 
 import pytest
 
+from ritz0_inproc import run_ritz0
+
 RITZ_ROOT = Path(__file__).resolve().parent.parent
 RITZ1_BIN = RITZ_ROOT / "ritz1" / "build" / "ritz1"
-RITZ0 = RITZ_ROOT / "ritz0" / "ritz0.py"
 # ritz1 compiles to a module with `main`; `_start` comes from this runtime
 # object, exactly as build.py links it. Linking WITHOUT it "works" (ld
 # defaults the entry point to 0x1000) and then segfaults — which would make
@@ -92,12 +93,12 @@ def _run(compiler: str, tmp_path: Path, offset_expr: str) -> int:
     env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
 
     if compiler == "ritz0":
-        cmd = ["python3", str(RITZ0), str(src), "-o", str(ll)]
+        comp = run_ritz0([str(src), "-o", str(ll)], cwd=tmp_path, env=env, timeout=300)
     else:
         cmd = [str(RITZ1_BIN), str(src), "-o", str(ll)]
-    comp = subprocess.run(
-        cmd, cwd=tmp_path, env=env, capture_output=True, text=True, timeout=300
-    )
+        comp = subprocess.run(
+            cmd, cwd=tmp_path, env=env, capture_output=True, text=True, timeout=300
+        )
     assert comp.returncode == 0 and ll.exists(), (
         f"{compiler} failed to compile `{offset_expr}`:\n"
         f"{comp.stdout[-2000:]}\n{comp.stderr[-2000:]}"

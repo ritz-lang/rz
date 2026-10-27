@@ -42,9 +42,10 @@ from pathlib import Path
 
 import pytest
 
+from ritz0_inproc import run_ritz0
+
 RITZ0_DIR = Path(__file__).resolve().parent
 RITZ_ROOT = RITZ0_DIR.parent
-RITZ0 = RITZ0_DIR / "ritz0.py"
 RITZ_START = RITZ_ROOT / "runtime" / "ritz_start.x86_64.o"
 
 sys.path.insert(0, str(RITZ0_DIR))
@@ -73,10 +74,10 @@ def _ritz0_ll(tmp_path: Path, name: str, program: str, *extra: str) -> Path:
     src = tmp_path / f"{name}.ritz"
     src.write_text(program)
     ll = tmp_path / f"{name}.ll"
-    r = subprocess.run(
-        [sys.executable, str(RITZ0), str(src), "-o", str(ll), *extra],
+    r = run_ritz0(
+        [str(src), "-o", str(ll), *extra],
         cwd=tmp_path, env=dict(os.environ, RITZ_PATH=str(RITZ_ROOT)),
-        capture_output=True, text=True, timeout=300)
+        timeout=300)
     assert r.returncode == 0 and ll.exists(), (
         f"ritz0 failed on {name}:\n{r.stdout[-2000:]}\n{r.stderr[-2000:]}")
     return ll
@@ -149,6 +150,7 @@ def test_tome_cli_shape_compiles_at_O2_within_bound(tmp_path):
     _assert_no_libc_mem(obj)
 
 
+@pytest.mark.integration
 @pytest.mark.unit
 def test_var_init_from_sret_call_fills_the_var_in_place(tmp_path):
     ir = _ritz0_ll(tmp_path, "tome_cli_shape", TOME_CLI, "--no-runtime").read_text()
@@ -160,6 +162,7 @@ def test_var_init_from_sret_call_fills_the_var_in_place(tmp_path):
     assert not big, f"a first-class %Client value survives in main: {big}"
 
 
+@pytest.mark.integration
 @pytest.mark.unit
 def test_extern_large_struct_return_is_declared_sret(tmp_path):
     ir = _ritz0_ll(tmp_path, "tome_cli_shape", TOME_CLI, "--no-runtime").read_text()
@@ -220,6 +223,7 @@ fn main() -> i32
 PROGRAM_EXIT = 89
 
 
+@pytest.mark.integration
 @pytest.mark.unit
 @pytest.mark.parametrize("fn", ["big_make", "big_fwd", "big_pick", "Big_twice", "Big_zero"])
 def test_large_struct_return_is_defined_sret(tmp_path, fn):
@@ -230,6 +234,7 @@ def test_large_struct_return_is_defined_sret(tmp_path, fn):
     assert "ret void" in body and not re.search(r'ret %"struct', body), body
 
 
+@pytest.mark.integration
 @pytest.mark.unit
 @pytest.mark.parametrize("fn,callee", [
     ("big_fwd", "big_make"),     # `return f()`
@@ -245,6 +250,7 @@ def test_return_of_sret_call_forwards_the_callers_slot(tmp_path, fn, callee):
     assert "sret.slot" not in body and not re.search(r'(load|store) %"struct', body), body
 
 
+@pytest.mark.integration
 @pytest.mark.unit
 def test_small_struct_return_keeps_first_class_abi(tmp_path):
     ir = _ritz0_ll(tmp_path, "prog", PROGRAM, "--no-runtime").read_text()
@@ -252,6 +258,7 @@ def test_small_struct_return_keeps_first_class_abi(tmp_path):
                     _sig_line(ir, "define", "small_make"))
 
 
+@pytest.mark.integration
 @pytest.mark.unit
 @pytest.mark.parametrize("callee,var", [
     ("big_make", "a"),       # typed var, direct call
@@ -351,6 +358,7 @@ def test_sret_is_abi_compatible_with_first_class_return(tmp_path):
     assert run.returncode == INTEROP_EXIT, f"exit {run.returncode}, want {INTEROP_EXIT}"
 
 
+@pytest.mark.integration
 @pytest.mark.unit
 @pytest.mark.parametrize("fn", ["big_make", "Big_twice"])
 def test_sret_definition_keeps_freestanding_attrs(tmp_path, fn):
@@ -365,6 +373,7 @@ def test_sret_definition_keeps_freestanding_attrs(tmp_path, fn):
 
 # --- per-fn IR cache --------------------------------------------------------
 
+@pytest.mark.integration
 @pytest.mark.unit
 def test_cache_extracts_sret_definitions(tmp_path):
     """The per-fn cache stores each `define` block. It must find sret ones."""

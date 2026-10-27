@@ -38,12 +38,15 @@ on, and a guard that merely compared LLVM types would reject all of them.
 """
 
 import os
-import subprocess
-import sys
 from pathlib import Path
 
+import pytest
+
+from ritz0_inproc import run_ritz0
+
+pytestmark = pytest.mark.integration
+
 RITZ_ROOT = Path(__file__).resolve().parent.parent
-RITZ0 = RITZ_ROOT / "ritz0" / "ritz0.py"
 
 STRUCT_PRELUDE = """\
 struct P
@@ -63,14 +66,7 @@ def _compile(tmp_path, source, name="unit.ritz"):
     src = tmp_path / name
     src.write_text(source)
     env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
-    return subprocess.run(
-        [sys.executable, str(RITZ0), str(src),
-         "-o", str(tmp_path / "unit.ll"), "--no-runtime"],
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=300,
-    )
+    return run_ritz0([str(src), "-o", str(tmp_path / "unit.ll"), "--no-runtime"], env=env, timeout=300)
 
 
 def test_struct_value_into_scalar_annotation_is_rejected(tmp_path):

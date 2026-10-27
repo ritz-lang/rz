@@ -67,13 +67,13 @@ so a change to it is made on purpose.
 import os
 import re
 import subprocess
-import sys
 from pathlib import Path
 
 import pytest
 
+from ritz0_inproc import run_ritz0
+
 RITZ_ROOT = Path(__file__).resolve().parent.parent
-RITZ0 = RITZ_ROOT / "ritz0" / "ritz0.py"
 
 
 def _compile(tmp_path, source):
@@ -82,10 +82,7 @@ def _compile(tmp_path, source):
     src.write_text(source)
     out = tmp_path / "unit.ll"
     env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
-    proc = subprocess.run(
-        [sys.executable, str(RITZ0), str(src), "-o", str(out), "--no-runtime"],
-        capture_output=True, text=True, env=env, timeout=300,
-    )
+    proc = run_ritz0([str(src), "-o", str(out), "--no-runtime"], env=env, timeout=300)
     combined = proc.stdout + proc.stderr
     ir_text = out.read_text() if out.exists() else None
     return proc.returncode, combined, ir_text
@@ -103,10 +100,7 @@ def _run(tmp_path, source):
     ll = tmp_path / "prog.ll"
     exe = tmp_path / "prog"
     env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
-    proc = subprocess.run(
-        [sys.executable, str(RITZ0), str(src), "-o", str(ll)],
-        capture_output=True, text=True, env=env, timeout=300,
-    )
+    proc = run_ritz0([str(src), "-o", str(ll)], env=env, timeout=300)
     assert proc.returncode == 0, f"compile failed:\n{proc.stdout}{proc.stderr}"
     link = subprocess.run(
         ["clang", "-w", "-O0", "-nostdlib", str(ll), "-o", str(exe)],
@@ -182,6 +176,7 @@ VALUE_POSITIONS = {
 }
 
 
+@pytest.mark.integration
 @pytest.mark.unit
 @pytest.mark.parametrize("position", sorted(VALUE_POSITIONS))
 def test_else_less_if_in_value_position_is_rejected(tmp_path, position):
@@ -196,6 +191,7 @@ def test_else_less_if_in_value_position_is_rejected(tmp_path, position):
     )
 
 
+@pytest.mark.integration
 @pytest.mark.unit
 @pytest.mark.parametrize("position", sorted(VALUE_POSITIONS))
 def test_rejection_never_manufactures_a_zero(tmp_path, position):
@@ -218,6 +214,7 @@ def test_rejection_never_manufactures_a_zero(tmp_path, position):
         )
 
 
+@pytest.mark.integration
 @pytest.mark.unit
 def test_diagnostic_is_located_and_not_a_python_traceback(tmp_path):
     """`file:line:col:` — the same shape every other user error uses."""
@@ -231,6 +228,7 @@ def test_diagnostic_is_located_and_not_a_python_traceback(tmp_path):
     )
 
 
+@pytest.mark.integration
 @pytest.mark.unit
 def test_diagnostic_points_at_the_inner_if_that_lacks_the_else(tmp_path):
     """In an open chain the outer `if` HAS an else; the inner one does not.
@@ -396,6 +394,7 @@ OPERAND_POSITIONS = {
 }
 
 
+@pytest.mark.integration
 @pytest.mark.unit
 @pytest.mark.parametrize("position", sorted(OPERAND_POSITIONS))
 def test_else_less_if_in_an_operand_position_is_rejected(tmp_path, position):
@@ -486,6 +485,7 @@ def test_walker_does_not_flag_unconsumed_positions(shape):
     assert LLVMEmitter._find_valueless_if(tree, consumed=False) is None
 
 
+@pytest.mark.integration
 @pytest.mark.unit
 def test_operand_diagnostic_points_at_the_if(tmp_path):
     """Line 2 holds `5 + if ...`; the `if` itself is the located node."""
@@ -541,6 +541,7 @@ def test_else_ful_if_as_operand_and_argument_still_runs(tmp_path):
     )) == 16
 
 
+@pytest.mark.integration
 @pytest.mark.unit
 def test_else_less_if_statement_inside_an_argument_arm_compiles(tmp_path):
     """#1435 control: the operand walk never enters `Block.stmts`.
@@ -564,6 +565,7 @@ def test_else_less_if_statement_inside_an_argument_arm_compiles(tmp_path):
     assert rc == 0, f"walked into a block's statements:\n{output}"
 
 
+@pytest.mark.integration
 @pytest.mark.unit
 def test_statement_if_whose_condition_is_a_call_still_compiles(tmp_path):
     """#1435 control: walking a statement `if` must not flag the `if` itself."""
@@ -578,6 +580,7 @@ def test_statement_if_whose_condition_is_a_call_still_compiles(tmp_path):
     assert rc == 0, f"rejected a statement if with calls in it:\n{output}"
 
 
+@pytest.mark.integration
 @pytest.mark.unit
 def test_statement_match_arm_guard_in_a_method_still_compiles(tmp_path):
     """angelo tests.ritz:727's variant: the match is a method body's tail."""
@@ -595,6 +598,7 @@ def test_statement_match_arm_guard_in_a_method_still_compiles(tmp_path):
     assert rc == 0, f"rejected a statement match whose arm ends in a guard:\n{output}"
 
 
+@pytest.mark.integration
 @pytest.mark.unit
 def test_else_less_if_nested_in_a_statement_block_of_a_value_arm_compiles(tmp_path):
     """The walk follows block TAILS only, never a block's statements.
@@ -616,6 +620,7 @@ def test_else_less_if_nested_in_a_statement_block_of_a_value_arm_compiles(tmp_pa
     assert rc == 0, f"rejected an else-less if statement inside a value arm:\n{output}"
 
 
+@pytest.mark.integration
 @pytest.mark.unit
 def test_else_ful_if_in_value_position_still_compiles(tmp_path):
     """The form that was always correct: both arms, so there is a phi."""
@@ -631,6 +636,7 @@ def test_else_ful_if_in_value_position_still_compiles(tmp_path):
     assert "phi " in ir_text, f"no phi node merging the arms:\n{ir_text}"
 
 
+@pytest.mark.integration
 @pytest.mark.unit
 def test_else_less_if_as_a_statement_still_compiles(tmp_path):
     """The overwhelmingly common case, and the one a careless fix breaks.
@@ -651,6 +657,7 @@ def test_else_less_if_as_a_statement_still_compiles(tmp_path):
     assert "phi " not in ir_text, "a statement-position if must not emit a phi"
 
 
+@pytest.mark.integration
 @pytest.mark.unit
 def test_else_less_if_statement_containing_a_return_still_compiles(tmp_path):
     """Early-return guards are else-less ifs whose arm terminates."""
@@ -663,6 +670,7 @@ def test_else_less_if_statement_containing_a_return_still_compiles(tmp_path):
     assert rc == 0, f"rejected an early-return guard:\n{output}"
 
 
+@pytest.mark.integration
 @pytest.mark.unit
 def test_procedure_whose_tail_is_an_else_less_if_still_compiles(tmp_path):
     """A procedure's trailing expression runs for effect, so it needs no value.
@@ -686,6 +694,7 @@ def test_procedure_whose_tail_is_an_else_less_if_still_compiles(tmp_path):
     )
 
 
+@pytest.mark.integration
 @pytest.mark.unit
 def test_procedure_whose_tail_is_an_if_else_of_assignments_still_compiles(tmp_path):
     """Verbatim shape of `ritzlib/hashmap.ritz:210`.
@@ -715,6 +724,7 @@ def test_procedure_whose_tail_is_an_if_else_of_assignments_still_compiles(tmp_pa
     )
 
 
+@pytest.mark.integration
 @pytest.mark.unit
 def test_declared_return_type_tailing_a_valueless_if_is_unchanged(tmp_path):
     """Scope boundary, pinned deliberately: this is NOT #1406's defect.
@@ -750,6 +760,7 @@ def test_declared_return_type_tailing_a_valueless_if_is_unchanged(tmp_path):
     )
 
 
+@pytest.mark.integration
 @pytest.mark.unit
 def test_valueless_tail_if_in_a_pointer_returning_fn_emits_valid_ir(tmp_path):
     """The implicit zero must be CONVERTED to the return type, not typed at it.
@@ -779,6 +790,7 @@ def test_valueless_tail_if_in_a_pointer_returning_fn_emits_valid_ir(tmp_path):
     )
 
 
+@pytest.mark.integration
 @pytest.mark.unit
 def test_if_whose_arms_both_return_still_compiles(tmp_path):
     """Both arms terminate, so the merge point is unreachable.
@@ -804,6 +816,7 @@ def test_if_whose_arms_both_return_still_compiles(tmp_path):
     assert rc == 0, f"rejected an if whose arms both return:\n{output}"
 
 
+@pytest.mark.integration
 @pytest.mark.unit
 def test_else_less_if_whose_arm_returns_still_compiles(tmp_path):
     """The guard shape, as a function's whole body.
@@ -822,6 +835,7 @@ def test_else_less_if_whose_arm_returns_still_compiles(tmp_path):
     assert rc == 0, f"rejected an early-return guard:\n{output}"
 
 
+@pytest.mark.integration
 @pytest.mark.unit
 def test_else_if_chain_terminating_in_else_still_compiles(tmp_path):
     """A chain is nested ifs; only the innermost `else` makes it total."""

@@ -267,6 +267,7 @@ class TestInterfaceHash:
         assert _hash_of(lib, LIB.replace("pub fn ident<T>(x: T) -> T\n    x\n",
                                          "pub fn ident<T>(x: T) -> T\n    let y: T = x\n    y\n")) != h0
 
+    @pytest.mark.integration  # starts fresh interpreters (#1805 guard)
     def test_hash_stable_across_processes(self, proj, store):
         """No set/hash-seed ordering may leak into the digest."""
         code = ("import sys; sys.path[:0] = [%r, %r]; import module_interface as mi; "
@@ -319,7 +320,8 @@ class TestCompiler:
 # build.py: importers' artifact keys follow interface hashes (ritz0 only)
 # ---------------------------------------------------------------------------
 
-@pytest.mark.unit
+# cas_module_key hashes the compiler's identity, which runs it (#1805 guard).
+@pytest.mark.integration
 class TestBuildKey:
     def _key(self, proj, compiler):
         import build

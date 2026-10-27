@@ -5,6 +5,7 @@ from lexer import tokenize
 from parser import Parser
 from tokens import TokenType
 import ritz_ast as rast
+from ritz0_inproc import run_ritz0
 
 
 class TestAsmLexer:
@@ -146,12 +147,12 @@ fn halt()
         assert ". spin" not in asm_stmt.template
 
 
+@pytest.mark.integration
 class TestAsmIntegration:
     """Integration tests for asm compilation."""
 
     def test_asm_compiles_to_llvm(self):
         """Test that asm statements produce valid LLVM IR."""
-        import subprocess
         import tempfile
         import os
 
@@ -174,12 +175,7 @@ fn main() -> i32
             # Get the directory containing this test file (ritz0/)
             ritz0_dir = os.path.dirname(os.path.abspath(__file__))
             project_root = os.path.dirname(ritz0_dir)
-            result = subprocess.run(
-                ['python3', 'ritz0/ritz0.py', src_path, '-o', ll_path],
-                capture_output=True,
-                text=True,
-                cwd=project_root
-            )
+            result = run_ritz0([src_path, '-o', ll_path], cwd=project_root)
             assert result.returncode == 0, f"Compilation failed: {result.stderr}"
 
             # Check the generated IR contains inline asm
@@ -198,12 +194,12 @@ if __name__ == '__main__':
     pytest.main([__file__, '-v'])
 
 
+@pytest.mark.integration
 class TestAsmOutputOperands:
     """Test asm output operand detection and code generation."""
 
     def test_asm_output_operand(self):
         """Test that asm output operands are properly detected and stored back."""
-        import subprocess
         import tempfile
         import os
 
@@ -228,12 +224,7 @@ fn main() -> i32
             ll_path = src_path.replace('.ritz', '.ll')
             ritz0_dir = os.path.dirname(os.path.abspath(__file__))
             project_root = os.path.dirname(ritz0_dir)
-            result = subprocess.run(
-                ['python3', 'ritz0/ritz0.py', src_path, '-o', ll_path],
-                capture_output=True,
-                text=True,
-                cwd=project_root
-            )
+            result = run_ritz0([src_path, '-o', ll_path], cwd=project_root)
             assert result.returncode == 0, f"Compilation failed: {result.stderr}"
 
             # Check the generated IR
@@ -252,12 +243,12 @@ fn main() -> i32
                 os.unlink(ll_path)
 
 
+@pytest.mark.integration
 class TestNestedArrayAddressing:
     """Test nested array indexing and address-of operations."""
 
     def test_nested_array_addr(self):
         """Test taking address of nested array element: @arr[i][j]."""
-        import subprocess
         import tempfile
         import os
 
@@ -283,12 +274,7 @@ fn main() -> i32
             ll_path = src_path.replace('.ritz', '.ll')
             ritz0_dir = os.path.dirname(os.path.abspath(__file__))
             project_root = os.path.dirname(ritz0_dir)
-            result = subprocess.run(
-                ['python3', 'ritz0/ritz0.py', src_path, '-o', ll_path],
-                capture_output=True,
-                text=True,
-                cwd=project_root
-            )
+            result = run_ritz0([src_path, '-o', ll_path], cwd=project_root)
             assert result.returncode == 0, f"Compilation failed: {result.stderr}"
 
             # Check the generated IR uses proper GEP for nested access
@@ -304,7 +290,6 @@ fn main() -> i32
 
     def test_nested_array_read(self):
         """Test reading from nested array: arr[i][j]."""
-        import subprocess
         import tempfile
         import os
 
@@ -334,12 +319,7 @@ fn main() -> i32
             ll_path = src_path.replace('.ritz', '.ll')
             ritz0_dir = os.path.dirname(os.path.abspath(__file__))
             project_root = os.path.dirname(ritz0_dir)
-            result = subprocess.run(
-                ['python3', 'ritz0/ritz0.py', src_path, '-o', ll_path],
-                capture_output=True,
-                text=True,
-                cwd=project_root
-            )
+            result = run_ritz0([src_path, '-o', ll_path], cwd=project_root)
             assert result.returncode == 0, f"Compilation failed: {result.stderr}"
 
         finally:

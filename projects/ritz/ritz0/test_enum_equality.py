@@ -35,19 +35,21 @@ A payload-carrying enum must STAY rejected: tag-only equality would make
 
 import subprocess
 import sys
-from pathlib import Path
 
-RITZ0 = Path(__file__).resolve().parent / "ritz0.py"
+import pytest
+
+from ritz0_inproc import run_ritz0
+
+# Every test compiles with ritz0 (AGAST #1805).
+pytestmark = pytest.mark.integration
 
 
 def _compile(tmp_path, source):
     src = tmp_path / "unit.ritz"
     src.write_text(source)
-    return subprocess.run(
-        [sys.executable, str(RITZ0), str(src),
+    return run_ritz0(
+        [str(src),
          "-o", str(tmp_path / "unit.ll"), "--no-runtime"],
-        capture_output=True,
-        text=True,
     )
 
 
@@ -148,9 +150,7 @@ def test_enum_equality_discriminates(tmp_path):
     """Red == Red, Red != Blue. Expect 1 + 100; 10 would mean always-equal."""
     src = tmp_path / "disc.ritz"
     src.write_text(DISCRIMINATING_EQ)
-    compiled = subprocess.run(
-        [sys.executable, str(RITZ0), str(src), "-o", str(tmp_path / "disc.ll")],
-        capture_output=True, text=True)
+    compiled = run_ritz0([str(src), "-o", str(tmp_path / "disc.ll")])
     assert compiled.returncode == 0, compiled.stderr
 
     exe = tmp_path / "disc"

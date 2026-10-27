@@ -35,26 +35,22 @@ or the parser. A lexer/parser-level fix would hit all 48 sites.
 """
 
 import os
-import subprocess
-import sys
 from pathlib import Path
 
+import pytest
+
+from ritz0_inproc import run_ritz0
+
+pytestmark = pytest.mark.integration
+
 RITZ_ROOT = Path(__file__).resolve().parent.parent
-RITZ0 = RITZ_ROOT / "ritz0" / "ritz0.py"
 
 
 def _compile(tmp_path, name, source):
     src = tmp_path / name
     src.write_text(source)
     env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
-    return subprocess.run(
-        [sys.executable, str(RITZ0), str(src),
-         "-o", str(tmp_path / "unit.ll"), "--no-runtime"],
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=300,
-    )
+    return run_ritz0([str(src), "-o", str(tmp_path / "unit.ll"), "--no-runtime"], env=env, timeout=300)
 
 
 CSTR_INTERP = """\

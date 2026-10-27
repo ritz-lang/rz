@@ -1,0 +1,191 @@
+# AGAST #1487: ritz1 instantiates `Vec<T>` for a struct element type.
+#
+# THE DEFECT
+#
+# ritz1's monomorphiser collected struct instantiations only from a
+# `TYPE_STRUCT` param or an annotated var decl. So `Vec$StrView` was never
+# instantiated when the only mention of it was
+#
+#   (a) a `@&Vec<StrView>` parameter,
+#   (b) an un-annotated local `var w = vec_new<StrView>()`, or
+#   (c) the body of a specialised fn (`vec_drop$StrView`'s `v: @&Vec<T>`),
+#
+# and every member access on it failed with "unhandled EXPR_MEMBER" (or, for
+# (b), ritz1 emitted `alloca %Vec$StrView` for an undeclared type). #1440
+# (c3aa409) fixed collection. These tests pin it down for `Vec<StrView>`, an
+# imported struct, and a user struct, in each of the three shapes.
+#
+# The ticket also lists `w[i].field` (index a `Vec<Struct>`, then take a
+# member). That one failed with "unhandled EXPR_MEMBER" EVEN WHEN ANNOTATED:
+# it is an emitter gap, not a collection gap. emit_member_ptr's index branches
+# knew `[N]St`, `[N]*St` and `**St` but not Vec. emit_vec_elem_member_ptr
+# (emitter_expr.ritz) now lowers it through the Vec's `data: *T` field.
+# `w[1].b` checks the stride is sizeof(T), not 1 or 8.
+#
+# `w[i]` through a `@&Vec<T>` param is not covered: ritz0 rejects it too.
+#
+# Oracle: ritz0 builds and runs every program with the same exit code.
+#
+# Migrated from ritz0/test_ritz1_vec_struct_elem.py by AGAST #1805: each case was a pure
+# ritz0-vs-ritz1 differential (same exit code under both), so it is a
+# test fn here and the regression matrix runs it under ritz0, ritz1
+# and ritz1_selfhosted.  Each case's `main` is renamed `<case>_main`;
+# top-level names shared between cases carry a `_<n>` suffix.
+
+import ritzlib.memory
+import ritzlib.gvec
+import ritzlib.strview
+
+# --- index_member_p_inferred -----------------------------------------------
+
+struct P
+    a: i64
+    b: i64
+
+fn index_member_p_inferred_main() -> i32
+    var w = vec_new<P>()
+    var x: P
+    x.a = 1
+    x.b = 2
+    var y: P
+    y.a = 3
+    y.b = 40
+    vec_push<P>(@w, x)
+    vec_push<P>(@w, y)
+    return (w[1].b + w[0].b) as i32
+
+[[test]]
+fn test_index_member_p_inferred() -> i32
+    assert index_member_p_inferred_main() == 42
+    0
+
+
+# --- index_member_pair_annotated -------------------------------------------
+
+struct Pair_1
+    a: i64
+    b: i64
+
+fn index_member_pair_annotated_main() -> i32
+    var w: Vec<Pair_1> = vec_new<Pair_1>()
+    var x: Pair_1
+    x.a = 1
+    x.b = 2
+    var y: Pair_1
+    y.a = 3
+    y.b = 40
+    vec_push<Pair_1>(@w, x)
+    vec_push<Pair_1>(@w, y)
+    return (w[1].b + w[0].b) as i32
+
+[[test]]
+fn test_index_member_pair_annotated() -> i32
+    assert index_member_pair_annotated_main() == 42
+    0
+
+
+# --- index_member_pair_inferred --------------------------------------------
+
+struct Pair_2
+    a: i64
+    b: i64
+
+fn index_member_pair_inferred_main() -> i32
+    var w = vec_new<Pair_2>()
+    var x: Pair_2
+    x.a = 1
+    x.b = 2
+    var y: Pair_2
+    y.a = 3
+    y.b = 40
+    vec_push<Pair_2>(@w, x)
+    vec_push<Pair_2>(@w, y)
+    return (w[1].b + w[0].b) as i32
+
+[[test]]
+fn test_index_member_pair_inferred() -> i32
+    assert index_member_pair_inferred_main() == 42
+    0
+
+
+# --- strview_annotated_local -----------------------------------------------
+
+fn second_len_3(w: @&Vec<StrView>) -> i64
+    let second: *StrView = w.data + 1
+    second.len
+
+fn strview_annotated_local_main() -> i32
+    var w: Vec<StrView> = vec_new<StrView>()
+    vec_push<StrView>(@w, strview_from_cstr(c"hi"))
+    vec_push<StrView>(@w, strview_from_cstr(c"0123456789012345678901234567890123456789"))
+    let r: i32 = second_len_3(@&w) as i32 + w.len as i32
+    vec_drop<StrView>(@&w)
+    return r
+
+[[test]]
+fn test_strview_annotated_local() -> i32
+    assert strview_annotated_local_main() == 42
+    0
+
+
+# --- strview_inferred_local ------------------------------------------------
+
+fn second_len_4(w: @&Vec<StrView>) -> i64
+    let second: *StrView = w.data + 1
+    second.len
+
+fn strview_inferred_local_main() -> i32
+    var w = vec_new<StrView>()
+    vec_push<StrView>(@w, strview_from_cstr(c"hi"))
+    vec_push<StrView>(@w, strview_from_cstr(c"0123456789012345678901234567890123456789"))
+    let r: i32 = second_len_4(@&w) as i32 + w.len as i32
+    vec_drop<StrView>(@&w)
+    return r
+
+[[test]]
+fn test_strview_inferred_local() -> i32
+    assert strview_inferred_local_main() == 42
+    0
+
+
+# --- strview_ref_param_only ------------------------------------------------
+
+fn use_vec_5(w: @&Vec<StrView>) -> i64
+    vec_push<StrView>(w, strview_from_cstr(c"abc"))
+    let p: *StrView = vec_get_ptr<StrView>(w, 0)
+    let n: i64 = p.len + w.len
+    vec_drop<StrView>(w)
+    n
+
+fn strview_ref_param_only_main() -> i32
+    42
+
+[[test]]
+fn test_strview_ref_param_only() -> i32
+    assert strview_ref_param_only_main() == 42
+    0
+
+
+# --- user_ref_param_only ---------------------------------------------------
+
+struct Pair_6
+    a: i64
+    b: i64
+
+fn use_vec_6(w: @&Vec<Pair_6>) -> i64
+    var x: Pair_6
+    x.a = 1
+    x.b = 2
+    vec_push<Pair_6>(w, x)
+    let p: *Pair_6 = vec_get_ptr<Pair_6>(w, 0)
+    let n: i64 = p.b + w.len
+    vec_drop<Pair_6>(w)
+    n
+
+fn user_ref_param_only_main() -> i32
+    42
+
+[[test]]
+fn test_user_ref_param_only() -> i32
+    assert user_ref_param_only_main() == 42
+    0

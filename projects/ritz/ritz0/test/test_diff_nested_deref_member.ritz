@@ -1,0 +1,198 @@
+# AGAST #1510: ritz1 reads/writes a field through a nested deref.
+#
+# THE DEFECT
+#
+# emit_member_ptr / emit_expr_member (ritz1) resolved the struct type of a
+# deref base `(*X).f` only when X was a bare identifier. A deref of a field
+# (`(*(*b).ops).n`, `(*b.ops).n`) or of a deref (`(**pp).n`) left the
+# struct type unresolved and the member failed "unhandled EXPR_MEMBER".
+#
+# The fix resolves the deref operand's static pointee type recursively
+# (deref of member of deref ...) and GEPs on it.
+#
+# Oracle: ritz0 builds and runs every program with the same exit code.
+#
+# Migrated from ritz0/test_ritz1_nested_deref_member.py by AGAST #1805: each case was a pure
+# ritz0-vs-ritz1 differential (same exit code under both), so it is a
+# test fn here and the regression matrix runs it under ritz0, ritz1
+# and ritz1_selfhosted.  Each case's `main` is renamed `<case>_main`;
+# top-level names shared between cases carry a `_<n>` suffix.
+
+# --- compound_store --------------------------------------------------------
+
+struct Ops_0
+    pad: i32
+    n: i32
+
+struct B_0
+    tag: i32
+    ops: *Ops_0
+
+struct C_0
+    b: B_0
+    bp: *B_0
+
+fn g_0(pp: **Ops_0, b: *B_0)
+    (**pp).n += 5
+    (*(*b).ops).pad *= 3
+
+fn compound_store_main() -> i32
+    var o: Ops_0 = Ops_0 { pad: 1, n: 6 }
+    var p: *Ops_0 = @o
+    var b: B_0 = B_0 { tag: 9, ops: @o }
+    g_0(@p, @b)
+    return o.n * 10 + o.pad
+
+[[test]]
+fn test_compound_store() -> i32
+    assert compound_store_main() == 113
+    0
+
+
+# --- deep_chain_store ------------------------------------------------------
+
+struct Ops_1
+    pad: i32
+    n: i32
+
+struct B_1
+    tag: i32
+    ops: *Ops_1
+
+struct C_1
+    b: B_1
+    bp: *B_1
+
+fn g_1(c: *C_1) -> i32
+    (*(*(*c).bp).ops).n = 30
+    (*(*c).b.ops).pad = 7
+    return (*(*(*c).bp).ops).n + (*c.b.ops).pad
+
+fn deep_chain_store_main() -> i32
+    var o: Ops_1 = Ops_1 { pad: 1, n: 2 }
+    var o2: Ops_1 = Ops_1 { pad: 3, n: 4 }
+    var b: B_1 = B_1 { tag: 9, ops: @o }
+    var c: C_1
+    c.b.tag = 1
+    c.b.ops = @o2
+    c.bp = @b
+    let r: i32 = g_1(@c)
+    return r + o.n - 30 + o2.pad - 7
+
+[[test]]
+fn test_deep_chain_store() -> i32
+    assert deep_chain_store_main() == 37
+    0
+
+
+# --- deref_auto_member -----------------------------------------------------
+
+struct Ops_2
+    pad: i32
+    n: i32
+
+struct B_2
+    tag: i32
+    ops: *Ops_2
+
+struct C_2
+    b: B_2
+    bp: *B_2
+
+fn g_2(b: *B_2) -> i32
+    return (*b.ops).n
+
+fn deref_auto_member_main() -> i32
+    var o: Ops_2 = Ops_2 { pad: 1, n: 5 }
+    var b: B_2 = B_2 { tag: 9, ops: @o }
+    return g_2(@b)
+
+[[test]]
+fn test_deref_auto_member() -> i32
+    assert deref_auto_member_main() == 5
+    0
+
+
+# --- deref_member_deref ----------------------------------------------------
+
+struct Ops_3
+    pad: i32
+    n: i32
+
+struct B_3
+    tag: i32
+    ops: *Ops_3
+
+struct C_3
+    b: B_3
+    bp: *B_3
+
+fn g_3(b: *B_3) -> i32
+    return (*(*b).ops).n
+
+fn deref_member_deref_main() -> i32
+    var o: Ops_3 = Ops_3 { pad: 1, n: 4 }
+    var b: B_3 = B_3 { tag: 9, ops: @o }
+    return g_3(@b)
+
+[[test]]
+fn test_deref_member_deref() -> i32
+    assert deref_member_deref_main() == 4
+    0
+
+
+# --- double_deref ----------------------------------------------------------
+
+struct Ops_4
+    pad: i32
+    n: i32
+
+struct B_4
+    tag: i32
+    ops: *Ops_4
+
+struct C_4
+    b: B_4
+    bp: *B_4
+
+fn g_4(pp: **Ops_4) -> i32
+    return (**pp).n
+
+fn double_deref_main() -> i32
+    var o: Ops_4 = Ops_4 { pad: 1, n: 6 }
+    var p: *Ops_4 = @o
+    return g_4(@p)
+
+[[test]]
+fn test_double_deref() -> i32
+    assert double_deref_main() == 6
+    0
+
+
+# --- double_deref_store ----------------------------------------------------
+
+struct Ops_5
+    pad: i32
+    n: i32
+
+struct B_5
+    tag: i32
+    ops: *Ops_5
+
+struct C_5
+    b: B_5
+    bp: *B_5
+
+fn g_5(pp: **Ops_5)
+    (**pp).n = 11
+
+fn double_deref_store_main() -> i32
+    var o: Ops_5 = Ops_5 { pad: 1, n: 6 }
+    var p: *Ops_5 = @o
+    g_5(@p)
+    return o.n
+
+[[test]]
+fn test_double_deref_store() -> i32
+    assert double_deref_store_main() == 11
+    0

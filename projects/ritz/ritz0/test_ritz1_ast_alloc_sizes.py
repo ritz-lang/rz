@@ -93,6 +93,7 @@ fn main() -> i32
 """
 
 
+@pytest.mark.integration
 def test_generic_body_diagnostic_names_source_line(ritz1_bin, tmp_path):
     src = tmp_path / "span.ritz"
     src.write_text(SPAN_PROGRAM)
@@ -136,6 +137,7 @@ fn main() -> i32
 """
 
 
+@pytest.mark.integration
 @pytest.mark.skipif(shutil.which("valgrind") is None, reason="valgrind not installed")
 def test_monomorph_clone_writes_stay_in_bounds(ritz1_bin, tmp_path):
     src = tmp_path / "ovf.ritz"

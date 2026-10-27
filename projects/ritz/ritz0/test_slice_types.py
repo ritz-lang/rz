@@ -12,12 +12,13 @@ constructed (hand-written parser, generated-parser adapter, and the metadata
 type-string parser), so *every* downstream consumer — name resolution, type
 checking, monomorphization, mangling, emission — sees one type.
 
-These tests pin both halves: the desugaring itself, and the end-to-end
-behaviour of slice payloads inside `Option`/`Result`.
+These tests pin the desugaring itself.  The end-to-end behaviour of slice
+payloads inside `Option`/`Result` lives in ritz0/test/
+test_issue_slice_generic_{payload,siblings}.ritz, which the regression matrix
+runs fn by fn (`make matrix`); a pytest copy that ran the same files under
+`ritz0 --test` was deleted by AGAST #1805.
 """
 
-import os
-import subprocess
 import sys
 from pathlib import Path
 
@@ -28,8 +29,6 @@ from emitter_llvmlite import emit  # noqa: E402
 from lexer import Lexer  # noqa: E402
 from parser import Parser  # noqa: E402
 
-RITZ0_DIR = Path(__file__).parent
-PROJECTS_DIR = RITZ0_DIR.parent.parent  # <root>/projects
 
 
 def parse(source: str) -> rast.Module:
@@ -134,38 +133,6 @@ class TestSliceGenericSpecialization:
             "    Some(d[0..1])\n"
         )
         assert "Option$Span$u8" in ir
-
-
-def run_ritzunit(name: str) -> None:
-    """Run a ritzunit suite from ritz0/test and assert every case passed."""
-    test_file = RITZ0_DIR / "test" / name
-    assert test_file.exists(), test_file
-
-    env = dict(os.environ)
-    env.setdefault("RITZ_PATH", str(PROJECTS_DIR))
-    result = subprocess.run(
-        [sys.executable, str(RITZ0_DIR / "ritz0.py"), str(test_file), "--test"],
-        capture_output=True,
-        text=True,
-        env=env,
-        cwd=str(RITZ0_DIR),
-    )
-    assert "0 failed" in result.stdout, (
-        f"ritzunit run failed\n--- stdout ---\n{result.stdout}\n"
-        f"--- stderr ---\n{result.stderr}"
-    )
-    assert result.returncode == 0, result.stderr
-
-
-class TestSliceGenericRuntime:
-    """End-to-end: the ritzunit suites for this work pass."""
-
-    def test_slice_generic_payload_suite(self):
-        run_ritzunit("test_issue_slice_generic_payload.ritz")
-
-    def test_slice_generic_sibling_suite(self):
-        """The gaps found alongside the slice-as-generic-argument bug."""
-        run_ritzunit("test_issue_slice_generic_siblings.ritz")
 
 
 class TestNumericLiteralSuffixes:

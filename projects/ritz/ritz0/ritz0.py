@@ -335,7 +335,24 @@ def emit_test_main(source_paths: list, output_path: str) -> bool:
     return True
 
 
+def _log_launch() -> None:
+    """Append one line per ritz0 process to $RITZ_TEST_RITZ0_LOG, if set.
+
+    AGAST #1805: lets the pytest suite count how many times it pays ritz0's
+    start-up cost (import of the emitter + llvmlite) — see
+    ritz0_inproc.py.  A run forked by ritz0_inproc (no interpreter start-up)
+    is tagged `inproc `, so the log tells the two apart.
+    """
+    import os
+    log = os.environ.get("RITZ_TEST_RITZ0_LOG")
+    if log:
+        tag = "inproc " if os.environ.get("RITZ_TEST_RITZ0_INPROC") else ""
+        with open(log, "a") as f:
+            f.write(f"{tag}{os.getpid()} {' '.join(sys.argv[1:])}\n")
+
+
 def main():
+    _log_launch()
     parser = argparse.ArgumentParser(
         description='ritz0 - The Ritz Bootstrap Compiler',
         epilog='Compilation model: one .ritz file → one .ll file. Imports become external declarations.'

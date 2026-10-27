@@ -34,9 +34,10 @@ from pathlib import Path
 
 import pytest
 
+from ritz0_inproc import run_ritz0
+
 RITZ_ROOT = Path(__file__).resolve().parent.parent
 RITZ1_BIN = RITZ_ROOT / "ritz1" / "build" / "ritz1"
-RITZ0 = RITZ_ROOT / "ritz0" / "ritz0.py"
 # Build product, not a tracked file — see test_ritz1_ptr_arith_chain.py.
 RITZ_START = RITZ_ROOT / "runtime" / "ritz_start.x86_64.o"
 
@@ -388,12 +389,12 @@ def _compile(compiler: str, tmp_path: Path, name: str, program: str):
     ll = tmp_path / f"{name}_{compiler}.ll"
     env = dict(os.environ, RITZ_PATH=f"{tmp_path}:{RITZ_ROOT}")
     if compiler == "ritz0":
-        cmd = ["python3", str(RITZ0), str(src), "-o", str(ll)]
+        proc = run_ritz0([str(src), "-o", str(ll)], cwd=tmp_path, env=env, timeout=300)
     else:
         cmd = [str(RITZ1_BIN), str(src), "-o", str(ll)]
-    proc = subprocess.run(
-        cmd, cwd=tmp_path, env=env, capture_output=True, text=True, timeout=300
-    )
+        proc = subprocess.run(
+            cmd, cwd=tmp_path, env=env, capture_output=True, text=True, timeout=300
+        )
     return proc, ll
 
 

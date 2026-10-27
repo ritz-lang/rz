@@ -36,15 +36,19 @@ import os
 import re
 import resource
 import subprocess
-import sys
 from pathlib import Path
 
 import pytest
 
+from ritz0_inproc import run_ritz0
+
 RITZ0_DIR = Path(__file__).resolve().parent
 RITZ_ROOT = RITZ0_DIR.parent
 PROJECTS = RITZ_ROOT.parent
-RITZ0 = RITZ0_DIR / "ritz0.py"
+
+# Every test reads IR compiled by ritz0 (the module fixture) or runs ritz0
+# itself, so the whole module is integration (AGAST #1805).
+pytestmark = pytest.mark.integration
 
 # build.py's compile_ll_to_obj flags (AGAST #1731), and nothing else. In
 # particular no -march=native / -msha / -maes / -mpclmul.
@@ -99,10 +103,10 @@ def _limit_mem() -> None:
 
 
 def _ritz0(src: Path, ll: Path, *extra: str) -> None:
-    r = subprocess.run(
-        [sys.executable, str(RITZ0), str(src), "-o", str(ll), *extra],
+    r = run_ritz0(
+        [str(src), "-o", str(ll), *extra],
         env=dict(os.environ, RITZ_PATH=str(RITZ_ROOT)),
-        capture_output=True, text=True, timeout=600,
+        timeout=600,
     )
     assert r.returncode == 0 and ll.exists(), (
         f"ritz0 failed on {src.name}:\n{r.stdout[-2000:]}\n{r.stderr[-2000:]}")

@@ -29,12 +29,16 @@ documented single source of truth, so synthesis and use cannot drift.
 """
 
 import os
-import subprocess
-import sys
 from pathlib import Path
 
-RITZ0 = Path(__file__).resolve().parent / "ritz0.py"
-RITZ_ROOT = RITZ0.parent.parent
+import pytest
+
+from ritz0_inproc import run_ritz0
+
+RITZ_ROOT = Path(__file__).resolve().parent.parent
+
+# Every test compiles with ritz0 (AGAST #1805).
+pytestmark = pytest.mark.integration
 
 
 def _compile(tmp_path, source):
@@ -42,11 +46,9 @@ def _compile(tmp_path, source):
     src.write_text(source)
     # String lives in ritzlib; the compiler resolves it through RITZ_PATH.
     env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
-    return subprocess.run(
-        [sys.executable, str(RITZ0), str(src),
+    return run_ritz0(
+        [str(src),
          "-o", str(tmp_path / "unit.ll")],
-        capture_output=True,
-        text=True,
         env=env,
     )
 

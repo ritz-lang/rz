@@ -32,7 +32,7 @@ pytestmark = pytest.mark.xdist_group("tree")
 HERE = Path(__file__).resolve().parent
 
 # Two modules that need ritz1, so a per-module build would show up as two makes.
-NESTED_TESTS = ["test_ritz1_int_cast.py", "test_ritz1_bool_fields.py"]
+NESTED_TESTS = ["test_ritz1_pub_var.py", "test_ritz1_bool_fields.py"]
 
 # A make invocation aimed at ritz1/ or runtime/, in any of the shapes the
 # deleted helpers used: ["make", "-C", "ritz1", ...] or _make("ritz1", ...).

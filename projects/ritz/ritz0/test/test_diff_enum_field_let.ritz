@@ -1,0 +1,213 @@
+# Regression tests for AGAST #1660: unit-enum values read from struct fields,
+# bound with an un-annotated `let`, and compared with `==` / `!=` under ritz1.
+#
+# ritz1 holds a unit (fieldless) enum value as its `%Enum = type { i8 }`
+# aggregate: the qualified-variant ctor (`Kind.A`), an enum-typed parameter,
+# `let a = Kind.A` and a struct-field load all produce a `%Kind` register.
+# ritzlib/argspec.ritz:214 (77_args) broke that model three ways:
+#
+#     fn eprint_arg_error_message(e: @ArgError)
+#         let k = e.kind                  # slot stayed i64: `store i64 %<%Kind>`
+#         if k == ArgErrorKind.UnknownOption
+#                                         # `icmp eq i64 %<%Kind>, %<%Kind>`
+#
+# and an enum named only by a struct field never got its `{ i8 }` type decl
+# ("base element of getelementptr must be sized").  The fix keeps the `%Enum`
+# representation: a `let` from an enum-typed field gets an `%Enum` slot, and
+# `==` / `!=` with an enum operand compares the extracted i8 tags.
+#
+# Each program returns 42 when correct and a distinct small code naming the
+# check that failed otherwise.  ritz0 is the oracle; everything runs at
+# RUNTIME, and every comparison is exercised with both outcomes so a constant
+# or inverted lowering cannot pass.
+#
+# Migrated from ritz0/test_ritz1_enum_field_let.py by AGAST #1805: each case was a pure
+# ritz0-vs-ritz1 differential (same exit code under both), so it is a
+# test fn here and the regression matrix runs it under ritz0, ritz1
+# and ritz1_selfhosted.  Each case's `main` is renamed `<case>_main`;
+# top-level names shared between cases carry a `_<n>` suffix.
+
+# --- enum_vs_enum ----------------------------------------------------------
+
+enum Kind_0
+    A
+    B
+    C
+
+struct Err_0
+    kind: Kind_0
+    n: i32
+
+fn same(x: Kind_0, y: Kind_0) -> bool
+    x == y
+
+fn differ(x: Kind_0, y: Kind_0) -> i32
+    if x != y
+        return 1
+    return 0
+
+fn enum_vs_enum_main() -> i32
+    let a = Kind_0.A
+    let c = Kind_0.C
+    if a == c
+        return 1
+    if not (a != c)
+        return 2
+    if not same(Kind_0.B, Kind_0.B)
+        return 3
+    if same(Kind_0.A, Kind_0.B)
+        return 4
+    if differ(Kind_0.C, Kind_0.C) != 0
+        return 5
+    if differ(Kind_0.C, Kind_0.A) != 1
+        return 6
+    let e = Err_0 { kind: Kind_0.C, n: 1 }
+    let k = e.kind
+    if k != c
+        return 7
+    if e.kind == a
+        return 8
+    if c != e.kind
+        return 9
+    return 42
+
+[[test]]
+fn test_enum_vs_enum() -> i32
+    assert enum_vs_enum_main() == 42
+    0
+
+
+# --- field_compare_forms ---------------------------------------------------
+
+enum Kind_1
+    A
+    B
+    C
+
+struct Err_1
+    n: i32
+    kind: Kind_1
+
+struct Outer
+    tag: i64
+    err: Err_1
+
+fn kind_of(k: Kind_1) -> Kind_1
+    k
+
+fn field_compare_forms_main() -> i32
+    let b = Err_1 { n: 2, kind: kind_of(Kind_1.B) }
+    if b.kind == Kind_1.A
+        return 1
+    if b.kind != Kind_1.B
+        return 2
+    let is_b = b.kind == Kind_1.B
+    let is_c: bool = b.kind == Kind_1.C
+    if not is_b
+        return 3
+    if is_c
+        return 4
+    let k = b.kind
+    if k != Kind_1.B
+        return 5
+    let p: *Err_1 = @b
+    let pk = p.kind
+    if pk == Kind_1.C
+        return 6
+    if p.kind != Kind_1.B
+        return 7
+    let inner = Err_1 { n: 3, kind: Kind_1.C }
+    let o = Outer { tag: 7, err: inner }
+    let ok = o.err.kind
+    if ok != Kind_1.C
+        return 8
+    if o.err.kind == Kind_1.A
+        return 9
+    if o.tag != 7
+        return 10
+    return 42
+
+[[test]]
+fn test_field_compare_forms() -> i32
+    assert field_compare_forms_main() == 42
+    0
+
+
+# --- field_only_enum -------------------------------------------------------
+
+enum Kind_2
+    A
+    B
+    C
+
+struct Err_2
+    kind: Kind_2
+    n: i32
+
+fn classify_2(e: @Err_2) -> i32
+    let k = e.kind
+    if k == Kind_2.A
+        return 1
+    else if k == Kind_2.B
+        return 2
+    else
+        return 3
+
+fn field_only_enum_main() -> i32
+    let a = Err_2 { kind: Kind_2.A, n: 1 }
+    let b = Err_2 { kind: Kind_2.B, n: 2 }
+    let c = Err_2 { kind: Kind_2.C, n: 3 }
+    if classify_2(@a) != 1
+        return 1
+    if classify_2(@b) != 2
+        return 2
+    if classify_2(@c) != 3
+        return 3
+    return 42
+
+[[test]]
+fn test_field_only_enum() -> i32
+    assert field_only_enum_main() == 42
+    0
+
+
+# --- ticket_repro ----------------------------------------------------------
+
+enum Kind_3
+    A
+    B
+    C
+
+struct Err_3
+    kind: Kind_3
+    n: i32
+
+fn make(kind: Kind_3, n: i32) -> Err_3
+    Err_3 { kind: kind, n: n }
+
+fn classify_3(e: @Err_3) -> i32
+    let k = e.kind
+    if k == Kind_3.A
+        return 1
+    else if k == Kind_3.B
+        return 2
+    else if k == Kind_3.C
+        return 3
+    return 9
+
+fn ticket_repro_main() -> i32
+    let a = make(Kind_3.A, 1)
+    let b = make(Kind_3.B, 2)
+    let c = make(Kind_3.C, 3)
+    if classify_3(@a) != 1
+        return 1
+    if classify_3(@b) != 2
+        return 2
+    if classify_3(@c) != 3
+        return 3
+    return 42
+
+[[test]]
+fn test_ticket_repro() -> i32
+    assert ticket_repro_main() == 42
+    0

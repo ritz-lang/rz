@@ -24,9 +24,10 @@ from pathlib import Path
 
 import pytest
 
+from ritz0_inproc import run_ritz0
+
 RITZ_ROOT = Path(__file__).resolve().parent.parent
 RITZ1_BIN = RITZ_ROOT / "ritz1" / "build" / "ritz1"
-RITZ0 = RITZ_ROOT / "ritz0" / "ritz0.py"
 # Build product, not a tracked file — see test_ritz1_ptr_arith_chain.py.
 RITZ_START = RITZ_ROOT / "runtime" / "ritz_start.x86_64.o"
 
@@ -108,12 +109,12 @@ CROSS_MODULE = {
 def _compile(compiler: str, cwd: Path, src: Path, ll: Path):
     env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
     if compiler == "ritz0":
-        cmd = ["python3", str(RITZ0), str(src), "-o", str(ll)]
+        return run_ritz0([str(src), "-o", str(ll)], cwd=cwd, env=env, timeout=300)
     else:
         cmd = [str(RITZ1_BIN), str(src), "-o", str(ll), "-I", str(cwd)]
-    return subprocess.run(
-        cmd, cwd=cwd, env=env, capture_output=True, text=True, timeout=300
-    )
+        return subprocess.run(
+            cmd, cwd=cwd, env=env, capture_output=True, text=True, timeout=300
+        )
 
 
 def _link_run(compiler: str, cwd: Path, lls: list, exe: Path) -> int:

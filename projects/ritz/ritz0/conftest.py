@@ -88,6 +88,22 @@ AGAST #1392. Two things live here, and they are independent.
    smoke runs before ritz1 is built and must not build it.  Run it serially
    (no `-n`): under xdist the controller builds ritz1 before any worker starts
    (item 4), which is exactly the cost the smoke tier avoids.
+
+8. `ritz0_oracle` / `run_ritz0` (AGAST #1805) — ritz0 without launching
+   ritz0.  ~600 `python3 ritz0.py` processes per session each spent ~0.8 s
+   importing the emitter and llvmlite to compile a program in milliseconds.
+   ritz0_inproc.py forks each compile from a forkserver that has ritz0
+   imported (a fresh process per compile, so emitter state cannot leak) and
+   caches by sha256 of the inputs.  Use `run_ritz0(args, cwd=, env=)` where a
+   test would `subprocess.run(["python3", RITZ0, *args])`, and
+   `ritz0_oracle(src) -> Oracle(ir_ok, stdout, rc, diagnostics)` for "what
+   does ritz0 make of this single-module program".  Both are importable
+   (`from ritz0_inproc import ...`) and offered as fixtures.  Set
+   RITZ_TEST_RITZ0_LOG to count launches (`inproc `-tagged lines are forks).
+
+9. `spawn_guard` (AGAST #1805) — a test that starts any process (or runs
+   ritz0 in-process) without `@pytest.mark.integration` fails, naming the
+   command.  So `-m "not integration"` really is the no-subprocess tier.
 """
 
 import os
@@ -97,6 +113,10 @@ import tempfile
 from pathlib import Path
 
 import pytest
+
+import ritz0_inproc
+
+pytest_plugins = ["spawn_guard"]
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
 RITZ1_BIN = RITZ_ROOT / "ritz1" / "build" / "ritz1"
@@ -299,3 +319,15 @@ def ritz1_bin(request) -> Path:
 def ritz_start(ritz1_bin) -> Path:
     """Path to the runtime start object; built alongside ritz1 by `ritz1_bin`."""
     return RITZ_START
+
+
+@pytest.fixture(scope="session")
+def ritz0_oracle():
+    """`ritz0_oracle(src) -> Oracle(ir_ok, stdout, rc, diagnostics)` (item 8)."""
+    return ritz0_inproc.ritz0_oracle
+
+
+@pytest.fixture(scope="session")
+def run_ritz0():
+    """`run_ritz0(args, cwd=, env=, timeout=)`: in-process `ritz0.py` (item 8)."""
+    return ritz0_inproc.run_ritz0

@@ -527,6 +527,7 @@ def test_ritz0_and_ritz1_link_by_value_param(ritz1_bin, tmp_path, caller, callee
     )
 
 
+@pytest.mark.integration
 def test_c_reference_abi_is_byval_align_8(tmp_path):
     """Pin the target: clang passes C `struct Big` as `ptr byval align 8`."""
     c = tmp_path / "ref.c"

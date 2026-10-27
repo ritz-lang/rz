@@ -47,9 +47,11 @@ from pathlib import Path
 
 import pytest
 
-from test_ritz1_builtin_struct_shadow import RITZ0, RITZ1_BIN, RITZ_ROOT, _run_pkg
+from test_ritz1_builtin_struct_shadow import RITZ1_BIN, RITZ_ROOT, _run_pkg
 
 import emitter_llvmlite
+
+from ritz0_inproc import run_ritz0
 
 RITZ1_CALL_SRC = RITZ_ROOT / "ritz1" / "src" / "emitter_expr_call.ritz"
 
@@ -216,12 +218,12 @@ def _called_symbols(compiler: str, tmp_path: Path) -> set:
     ll = tmp_path / f"repro_{compiler}.ll"
     env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
     if compiler == "ritz0":
-        cmd = ["python3", str(RITZ0), str(src), "-o", str(ll)]
+        proc = run_ritz0([str(src), "-o", str(ll)], cwd=tmp_path, env=env, timeout=300)
     else:
         cmd = [str(RITZ1_BIN), str(src), "-o", str(ll)]
-    proc = subprocess.run(
-        cmd, cwd=tmp_path, env=env, capture_output=True, text=True, timeout=300
-    )
+        proc = subprocess.run(
+            cmd, cwd=tmp_path, env=env, capture_output=True, text=True, timeout=300
+        )
     assert proc.returncode == 0, proc.stdout[-2000:] + proc.stderr[-2000:]
     text = ll.read_text()
     # Only main's body: ritz0 also emits ritzlib bodies into the module.

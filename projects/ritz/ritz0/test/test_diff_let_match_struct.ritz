@@ -1,0 +1,174 @@
+# AGAST #1666: an untyped `let v = match ...` over struct-valued arms.
+#
+# THE DEFECT
+#
+# emit_var_decl (ritz1/src/emitter_stmt.ritz) sizes an unannotated local's slot
+# from its initializer *before* emitting it, and had no EXPR_MATCH case. The
+# #1645 merge phi of a struct-valued match is `%StrView` / `%Point`, but the
+# slot kept the parser default TYPE_I64, so ritz1 emitted `alloca i64` +
+# `store i64 <%StrView phi>` and clang rejected the IR:
+#
+#     fn first(o: Option<StrView>, d: StrView) -> StrView
+#         let v = match o
+#             Some(s) => s
+#             None => d
+#         return v
+#
+# ("'%.17' defined with type '%StrView' but expected 'i64'").  The annotated
+# `let v: StrView = match o ...` already worked.
+#
+# THE FIX
+#
+# For an untyped EXPR_MATCH initializer, the match is emitted first and the
+# local takes the phi's aggregate type (MatchResult.agg_name, exposed by
+# emit_match), so the slot is `alloca %StrView` and `.field` access resolves.
+# A scalar match still binds an i64.
+#
+# Oracle: ritz0 builds and runs every program with the same exit code.  Each
+# program returns 42 when correct and a small code naming the failed check.
+#
+# Migrated from ritz0/test_ritz1_let_match_struct.py by AGAST #1805: each case was a pure
+# ritz0-vs-ritz1 differential (same exit code under both), so it is a
+# test fn here and the regression matrix runs it under ritz0, ritz1
+# and ritz1_selfhosted.  Each case's `main` is renamed `<case>_main`;
+# top-level names shared between cases carry a `_<n>` suffix.
+
+import ritzlib.strview
+
+# --- bound_then_literal ----------------------------------------------------
+
+fn or_none_0(o: Option<StrView>) -> StrView
+    let v = match o
+        Some(s) => s
+        None => "(none)"
+    if v.len == 0
+        return v
+    return v
+
+fn bound_then_literal_main() -> i32
+    let a = or_none_0(Some("Seven"))
+    if a.len != 5 or *a.ptr != 83
+        return 1
+    let b = or_none_0(None)
+    if b.len != 6 or *b.ptr != 40
+        return 2
+    return 42
+
+[[test]]
+fn test_bound_then_literal() -> i32
+    assert bound_then_literal_main() == 42
+    0
+
+
+# --- bound_then_param ------------------------------------------------------
+
+fn first_1(o: Option<StrView>, d: StrView) -> StrView
+    let v = match o
+        Some(s) => s
+        None => d
+    return v
+
+fn bound_then_param_main() -> i32
+    let a = first_1(Some("Seven"), "zz")
+    if a.len != 5 or *a.ptr != 83
+        return 1
+    let b = first_1(None, "zz")
+    if b.len != 2 or *b.ptr != 122
+        return 2
+    return 42
+
+[[test]]
+fn test_bound_then_param() -> i32
+    assert bound_then_param_main() == 42
+    0
+
+
+# --- literal_then_bound ----------------------------------------------------
+
+fn or_none_2(o: Option<StrView>) -> i64
+    let v = match o
+        None => "(none)"
+        Some(s) => s
+    return v.len
+
+fn literal_then_bound_main() -> i32
+    if or_none_2(Some("Seven")) != 5
+        return 1
+    if or_none_2(None) != 6
+        return 2
+    return 42
+
+[[test]]
+fn test_literal_then_bound() -> i32
+    assert literal_then_bound_main() == 42
+    0
+
+
+# --- param_then_bound ------------------------------------------------------
+
+fn first_3(o: Option<StrView>, d: StrView) -> StrView
+    let v = match o
+        None => d
+        Some(s) => s
+    return v
+
+fn param_then_bound_main() -> i32
+    let a = first_3(Some("Seven"), "zz")
+    if a.len != 5 or *a.ptr != 83
+        return 1
+    let b = first_3(None, "zz")
+    if b.len != 2 or *b.ptr != 122
+        return 2
+    return 42
+
+[[test]]
+fn test_param_then_bound() -> i32
+    assert param_then_bound_main() == 42
+    0
+
+
+# --- scalar_match ----------------------------------------------------------
+
+fn val(o: Option<i64>) -> i64
+    let n = match o
+        Some(x) => x
+        None => 0
+    return n + 1
+
+fn scalar_match_main() -> i32
+    if val(Some(40)) != 41
+        return 1
+    if val(None) != 1
+        return 2
+    return 42
+
+[[test]]
+fn test_scalar_match() -> i32
+    assert scalar_match_main() == 42
+    0
+
+
+# --- user_struct_var -------------------------------------------------------
+
+struct Point
+    x: i64
+    y: i64
+
+fn pick(o: Option<Point>) -> i64
+    var p = match o
+        Some(q) => q
+        None => Point { x: 1, y: 2 }
+    p.y = p.y + 100
+    return p.x * 1000 + p.y
+
+fn user_struct_var_main() -> i32
+    if pick(Some(Point { x: 3, y: 4 })) != 3104
+        return 1
+    if pick(None) != 1102
+        return 2
+    return 42
+
+[[test]]
+fn test_user_struct_var() -> i32
+    assert user_struct_var_main() == 42
+    0

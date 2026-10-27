@@ -34,136 +34,6 @@ import pytest
 
 from test_ritz1_builtin_struct_shadow import _run_pkg
 
-# The exact #1477 shape: struct Ok payload, ctor arms, tail position.
-FILE_SIZE_SHAPE = """\
-import ritzlib.result
-
-struct St
-    dev: i64
-    size: i64
-
-fn stat_impl(bad: i64) -> Result<St, i32>
-    if bad != 0
-        return Err(13)
-    return Ok(St { dev: 1, size: 40 })
-
-fn size_of(bad: i64) -> Result<i64, i32>
-    var r: Result<St, i32> = stat_impl(bad)
-    match r
-        Ok(st) => Ok(st.size + 2)
-        Err(e) => Err(e)
-
-pub fn main() -> i32
-    let a: i64 = match size_of(0)
-        Ok(n) => n
-        Err(e) => 100 + e as i64
-    let b: i64 = match size_of(1)
-        Ok(n) => n
-        Err(e) => 100 + e as i64
-    if a != 42
-        return 1
-    if b != 113
-        return 2
-    return 42
-"""
-
-# Scalar scrutinee, ctor arms with a non-exhaustive integer match: the
-# fallthrough value must be a Result zero, not `add i64 0, 0`.
-INT_SCRUT_NON_EXHAUSTIVE = """\
-import ritzlib.result
-
-fn classify(x: i64) -> Result<i64, i32>
-    match x
-        1 => Ok(10)
-        2 => Err(20)
-
-pub fn main() -> i32
-    let a: i64 = match classify(1)
-        Ok(n) => n
-        Err(e) => e as i64
-    let b: i64 = match classify(2)
-        Ok(n) => n
-        Err(e) => e as i64
-    if a != 10
-        return 1
-    if b != 20
-        return 2
-    return 42
-"""
-
-# Option<StrView> from ctor arms, exhaustive (`_` arm) and over a
-# Result scrutinee.
-OPTION_STRVIEW = """\
-import ritzlib.option
-import ritzlib.result
-import ritzlib.strview
-
-fn name_of(x: i64) -> Option<StrView>
-    match x
-        1 => Some("one")
-        2 => Some("three")
-        _ => None
-
-fn pick(r: Result<i64, i32>) -> Option<StrView>
-    match r
-        Ok(n) => Some("ok")
-        Err(e) => None
-
-pub fn main() -> i32
-    let a: i64 = match name_of(1)
-        Some(s) => s.len
-        None => 100
-    let b: i64 = match name_of(2)
-        Some(s) => s.len
-        None => 100
-    let c: i64 = match name_of(9)
-        Some(s) => s.len
-        None => 100
-    let d: i64 = match pick(Ok(1))
-        Some(s) => s.len
-        None => 200
-    let e: i64 = match pick(Err(1))
-        Some(s) => s.len
-        None => 200
-    if a != 3
-        return 1
-    if b != 5
-        return 2
-    if c != 100
-        return 3
-    if d != 2
-        return 4
-    if e != 200
-        return 5
-    return 42
-"""
-
-# Mixed arms: a ctor arm and an arm that is a call returning the enum.
-MIXED_CALL_ARM = """\
-import ritzlib.result
-
-fn fallback(x: i64) -> Result<i64, i32>
-    return Err(x as i32)
-
-fn f(x: i64) -> Result<i64, i32>
-    match x
-        0 => Ok(5)
-        _ => fallback(x)
-
-pub fn main() -> i32
-    let a: i64 = match f(0)
-        Ok(n) => n
-        Err(e) => 100 + e as i64
-    let b: i64 = match f(7)
-        Ok(n) => n
-        Err(e) => 100 + e as i64
-    if a != 5
-        return 1
-    if b != 107
-        return 2
-    return 42
-"""
-
 # The real thing: ritzlib.fs `file_size` is the direct tail match again
 # (the #1477 `fs_lstat_size` workaround is reverted), and ritz1 must link it.
 RITZLIB_FS_FILE_SIZE = """\
@@ -188,12 +58,12 @@ pub fn main() -> i32
     return 42
 """
 
+# The other cases moved to ritz0/test/test_diff_match_ctor_tail_phi.ritz (AGAST #1805), where the
+# regression matrix runs them under all three compilers.  This one stays:
+# the matrix links ritzlib built by ritz0 into every cell, so its ritz1 cell
+# would not be the all-ritz1 build this test checks.
 PKG_CASES = {
-    "file_size_shape": (FILE_SIZE_SHAPE, 42),
     "ritzlib_fs_file_size": (RITZLIB_FS_FILE_SIZE, 42),
-    "int_scrut_non_exhaustive": (INT_SCRUT_NON_EXHAUSTIVE, 42),
-    "option_strview": (OPTION_STRVIEW, 42),
-    "mixed_call_arm": (MIXED_CALL_ARM, 42),
 }
 
 

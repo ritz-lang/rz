@@ -33,14 +33,16 @@ TypeError" from passing by rejecting everything.
 
 import os
 import re
-import subprocess
-import sys
 from pathlib import Path
 
 import pytest
 
+from ritz0_inproc import run_ritz0
+
 RITZ_ROOT = Path(__file__).resolve().parent.parent
-RITZ0 = RITZ_ROOT / "ritz0" / "ritz0.py"
+
+# Every test compiles with ritz0 (AGAST #1805).
+pytestmark = pytest.mark.integration
 
 # file:line:column: — the format EmitError shares with TypeError,
 # OwnershipError and NameError.
@@ -51,11 +53,9 @@ def _compile(tmp_path, name, source):
     src = tmp_path / name
     src.write_text(source)
     env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
-    return subprocess.run(
-        [sys.executable, str(RITZ0), str(src),
+    return run_ritz0(
+        [str(src),
          "-o", str(tmp_path / "unit.ll"), "--no-runtime"],
-        capture_output=True,
-        text=True,
         env=env,
         timeout=300,
     )

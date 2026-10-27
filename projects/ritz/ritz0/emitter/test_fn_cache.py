@@ -44,6 +44,7 @@ from emitter.fn_cache import (
 )
 from lexer import Lexer
 from tokens import TokenType, Token, Span
+from ritz0_inproc import run_ritz0
 
 
 # ============================================================================
@@ -619,8 +620,6 @@ class TestSigImportsPopulated:
     @pytest.mark.integration
     def test_sig_file_contains_imports_after_full_build(self, tmp_path):
         """End-to-end: build a 2-file project, .sig file must list imports."""
-        import subprocess
-
         # Create lib.ritz with a public function
         lib = tmp_path / "lib.ritz"
         lib.write_text("pub fn helper() -> i32\n    42\n")
@@ -634,12 +633,8 @@ class TestSigImportsPopulated:
         )
 
         # Compile main.ritz
-        ritz0_dir = Path(__file__).parent.parent
-        result = subprocess.run(
-            [sys.executable, str(ritz0_dir / "ritz0.py"),
-             str(main), "-o", str(tmp_path / "main.ll")],
-            capture_output=True, text=True, cwd=str(tmp_path),
-        )
+        result = run_ritz0([str(main), "-o", str(tmp_path / "main.ll")],
+                           cwd=str(tmp_path))
         assert result.returncode == 0, f"compile failed: {result.stderr}"
 
         # The .sig for main.ritz must include 'lib' in its imports list,

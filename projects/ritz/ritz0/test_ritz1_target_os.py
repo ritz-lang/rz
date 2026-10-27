@@ -25,9 +25,10 @@ from pathlib import Path
 
 import pytest
 
+from ritz0_inproc import run_ritz0
+
 RITZ_ROOT = Path(__file__).resolve().parent.parent
 RITZ1_BIN = RITZ_ROOT / "ritz1" / "build" / "ritz1"
-RITZ0 = RITZ_ROOT / "ritz0" / "ritz0.py"
 # Build product, not a tracked file — see test_ritz1_ptr_arith_chain.py.
 RITZ_START = RITZ_ROOT / "runtime" / "ritz_start.x86_64.o"
 
@@ -109,11 +110,11 @@ def _run_ritz0(tmp_path: Path, name: str, program: str, target_os) -> int:
     src = tmp_path / f"{name}.ritz"
     src.write_text(program)
     ll = tmp_path / f"{name}.r0.ll"
-    cmd = ["python3", str(RITZ0), str(src), "-o", str(ll), "--no-runtime"]
+    args = [str(src), "-o", str(ll), "--no-runtime"]
     if target_os is not None:
-        cmd += ["--target-os", target_os]
+        args += ["--target-os", target_os]
     env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
-    comp = subprocess.run(cmd, cwd=tmp_path, env=env, capture_output=True, text=True, timeout=300)
+    comp = run_ritz0(args, cwd=tmp_path, env=env, timeout=300)
     assert comp.returncode == 0, f"ritz0 failed on {name}:\n{comp.stderr[-2000:]}"
     return _link_run("ritz0", tmp_path, ll, tmp_path / f"{name}.r0")
 

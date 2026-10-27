@@ -2,10 +2,13 @@
 
 import os
 import subprocess
-import sys
 import tempfile
 import pytest
 from pathlib import Path
+
+from ritz0_inproc import run_ritz0
+
+pytestmark = pytest.mark.integration
 
 
 def has_cpu_feature(feature: str) -> bool:
@@ -22,12 +25,7 @@ def has_cpu_feature(feature: str) -> bool:
 
 def compile_ritz_to_ll(source_path: str, output_ll: str) -> tuple[bool, str]:
     """Compile a .ritz file to LLVM IR (.ll)."""
-    ritz0_py = Path(__file__).parent / 'ritz0.py'
-    result = subprocess.run(
-        [sys.executable, str(ritz0_py), source_path, '-o', output_ll],
-        capture_output=True,
-        text=True
-    )
+    result = run_ritz0([source_path, '-o', output_ll])
     return result.returncode == 0, result.stderr
 
 
@@ -50,12 +48,7 @@ class TestAesNiIntrinsics:
         assert test_file.exists(), f"Test file not found: {test_file}"
 
         # Use the test runner
-        result = subprocess.run(
-            [sys.executable, str(Path(__file__).parent / 'ritz0.py'),
-             str(test_file), '--test'],
-            capture_output=True,
-            text=True
-        )
+        result = run_ritz0([str(test_file), '--test'])
         # Check output for success
         assert '6 passed, 0 failed' in result.stdout or result.returncode == 0
 
@@ -230,12 +223,7 @@ fn main() -> i32
         test_file = Path(__file__).parent / 'test' / 'test_shani.ritz'
         assert test_file.exists(), f"Test file not found: {test_file}"
 
-        result = subprocess.run(
-            [sys.executable, str(Path(__file__).parent / 'ritz0.py'),
-             str(test_file), '--test'],
-            capture_output=True,
-            text=True
-        )
+        result = run_ritz0([str(test_file), '--test'])
         assert '4 passed, 0 failed' in result.stdout or result.returncode == 0
 
 

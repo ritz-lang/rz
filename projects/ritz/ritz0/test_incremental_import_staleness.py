@@ -35,14 +35,12 @@ from emitter.fn_cache import (  # noqa: E402
     sig_path_for,
     source_file_hash,
 )
+from ritz0_inproc import run_ritz0  # noqa: E402
 
 
 def _compile(main: Path, out: Path) -> subprocess.CompletedProcess:
-    """Run ritz0 on ``main`` as make would: a fresh process per invocation."""
-    result = subprocess.run(
-        [sys.executable, str(RITZ0_DIR / "ritz0.py"), str(main), "-o", str(out)],
-        capture_output=True, text=True, cwd=str(main.parent),
-    )
+    """Run ritz0 on ``main`` as make would: a fresh process (fork) per invocation."""
+    result = run_ritz0([str(main), "-o", str(out)], cwd=str(main.parent))
     assert result.returncode == 0, f"compile failed:\n{result.stdout}\n{result.stderr}"
     return result
 

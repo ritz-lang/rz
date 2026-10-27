@@ -1,0 +1,143 @@
+# AGAST #1681: ritz1 types an untyped `var q = p` from a by-value struct param.
+#
+# THE DEFECT
+#
+# emit_var_decl (ritz1/src/emitter_stmt.ritz) narrows an unannotated local's
+# type from its initializer (call, method, struct lit, member, try, cast,
+# addr-of), but had no EXPR_IDENT case. `var parsed = p` with `p: ParsedArgs`
+# kept the parser default TYPE_I64, so the slot was `alloca i64` and the
+# `%ParsedArgs` load was stored into it; clang rejected the IR ("'%.4' defined
+# with type '%ParsedArgs' but expected 'i64'"). This blocked
+# examples/tier2_stdlib/77_args (`run(spec, p)` does `var parsed = p`).
+#
+# THE FIX
+#
+# An EXPR_IDENT initializer naming a struct-typed local (by-value param or
+# `let`) gives the new local that struct type, so it gets an `alloca %S` slot
+# and is registered for `.field` access.
+#
+# Oracle: ritz0 builds and runs every program with the same exit code.
+#
+# Migrated from ritz0/test_ritz1_var_from_struct_param.py by AGAST #1805: each case was a pure
+# ritz0-vs-ritz1 differential (same exit code under both), so it is a
+# test fn here and the regression matrix runs it under ritz0, ritz1
+# and ritz1_selfhosted.  Each case's `main` is renamed `<case>_main`;
+# top-level names shared between cases carry a `_<n>` suffix.
+
+# --- let_nested ------------------------------------------------------------
+
+struct Inner_0
+    x: i64
+    y: i64
+
+struct Outer
+    tag: i64
+    inner: Inner_0
+    tail: i64
+
+fn total(o: Outer) -> i64
+    let q = o
+    return q.tag + q.inner.x * 10 + q.inner.y * 100 + q.tail * 1000
+
+fn let_nested_main() -> i32
+    let i = Inner_0 { x: 2, y: 3 }
+    let o = Outer { tag: 1, inner: i, tail: 0 }
+    if total(o) != 321
+        return 1
+    return 42
+
+[[test]]
+fn test_let_nested() -> i32
+    assert let_nested_main() == 42
+    0
+
+
+# --- ref_and_mut -----------------------------------------------------------
+
+struct Inner_1
+    x: i64
+    y: i64
+
+struct Box
+    n: i64
+    inner: Inner_1
+
+fn peek(b: @Box) -> i64
+    return b.n + b.inner.x + b.inner.y
+
+fn bump(b: @&Box)
+    b.n = b.n + 100
+    b.inner.y = b.inner.y + 1000
+
+fn run(p: Box) -> i64
+    var parsed = p
+    let before = peek(@parsed)
+    bump(@&parsed)
+    let after = peek(@parsed)
+    return after - before
+
+fn ref_and_mut_main() -> i32
+    let i = Inner_1 { x: 1, y: 2 }
+    let b = Box { n: 3, inner: i }
+    if run(b) != 1100
+        return 1
+    return 42
+
+[[test]]
+fn test_ref_and_mut() -> i32
+    assert ref_and_mut_main() == 42
+    0
+
+
+# --- scalar_ident ----------------------------------------------------------
+
+fn twice(n: i64) -> i64
+    var m = n
+    m = m + n
+    return m
+
+fn scalar_ident_main() -> i32
+    return twice(21) as i32
+
+[[test]]
+fn test_scalar_ident() -> i32
+    assert scalar_ident_main() == 42
+    0
+
+
+# --- var_from_local --------------------------------------------------------
+
+struct Pair_3
+    a: i64
+    b: i64
+
+fn var_from_local_main() -> i32
+    let p = Pair_3 { a: 1, b: 2 }
+    var q = p
+    q.a = 40
+    return (q.a + q.b) as i32
+
+[[test]]
+fn test_var_from_local() -> i32
+    assert var_from_local_main() == 42
+    0
+
+
+# --- var_from_param --------------------------------------------------------
+
+struct Pair_4
+    a: i64
+    b: i64
+
+fn sum(p: Pair_4) -> i64
+    var q = p
+    return q.a + q.b
+
+fn var_from_param_main() -> i32
+    let p = Pair_4 { a: 40, b: 2 }
+    return sum(p) as i32
+
+[[test]]
+fn test_var_from_param() -> i32
+    assert var_from_param_main() == 42
+    0

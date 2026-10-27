@@ -24,22 +24,18 @@ A match with a void arm is a statement, not a value: when any live arm yields
 `Undefined` the phi must be skipped.
 """
 
-import subprocess
-import sys
-from pathlib import Path
 
-RITZ0 = Path(__file__).resolve().parent / "ritz0.py"
+import pytest
+
+from ritz0_inproc import run_ritz0
+
+pytestmark = pytest.mark.integration
 
 
 def _compile(tmp_path, source):
     src = tmp_path / "unit.ritz"
     src.write_text(source)
-    return subprocess.run(
-        [sys.executable, str(RITZ0), str(src),
-         "-o", str(tmp_path / "unit.ll"), "--no-runtime"],
-        capture_output=True,
-        text=True,
-    )
+    return run_ritz0([str(src), "-o", str(tmp_path / "unit.ll"), "--no-runtime"])
 
 
 MIXED_ARMS = """\

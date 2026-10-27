@@ -22,6 +22,9 @@ from pathlib import Path
 
 import pytest
 
+# Every test runs a compiler process (AGAST #1805).
+pytestmark = pytest.mark.integration
+
 RITZ_ROOT = Path(__file__).resolve().parent.parent
 RITZ1_BIN = RITZ_ROOT / "ritz1" / "build" / "ritz1"
 

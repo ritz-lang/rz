@@ -36,10 +36,11 @@ from pathlib import Path
 
 import pytest
 
-from test_ritz1_builtin_struct_shadow import RITZ0, RITZ1_BIN, RITZ_ROOT, RITZ_START
+from ritz0_inproc import run_ritz0
+from test_ritz1_builtin_struct_shadow import RITZ1_BIN, RITZ_ROOT, RITZ_START
 
 # Build ritz1 (and the runtime start object) once for the module.
-pytestmark = pytest.mark.usefixtures("ritz1_bin")
+pytestmark = [pytest.mark.integration, pytest.mark.usefixtures("ritz1_bin")]
 
 COMPILERS = ("ritz0", "ritz1")
 
@@ -51,12 +52,12 @@ def _compile(compiler: str, tmp_path: Path, name: str, program: str):
     ll = tmp_path / f"{name}_{compiler}.ll"
     env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
     if compiler == "ritz0":
-        cmd = ["python3", str(RITZ0), str(src), "-o", str(ll)]
+        proc = run_ritz0([str(src), "-o", str(ll)], cwd=tmp_path, env=env, timeout=300)
     else:
         cmd = [str(RITZ1_BIN), str(src), "-o", str(ll)]
-    proc = subprocess.run(
-        cmd, cwd=tmp_path, env=env, capture_output=True, text=True, timeout=300
-    )
+        proc = subprocess.run(
+            cmd, cwd=tmp_path, env=env, capture_output=True, text=True, timeout=300
+        )
     return proc, ll
 
 

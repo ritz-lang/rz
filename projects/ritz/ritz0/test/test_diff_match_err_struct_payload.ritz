@@ -1,0 +1,223 @@
+# AGAST #1667 (dup #1670): ritz1 binds `Err(e)`'s struct payload at its real type.
+#
+# THE DEFECT
+#
+# #1515 taught emit_match_arm_body (ritz1/src/emitter_match.ritz) to bind a
+# carrier payload (`Ok(s)`, `Some(p)`) at its struct type, but the Err side of
+# `Result<T, E>` still fell back to `alloca i64` / TYPE_I64. With a struct `E`,
+# `Err(e) => fail(e)` handed an i64 to a fn taking `%E`, and clang rejected the
+# IR ("'%.N' defined with type 'i64' but expected '%ArgError'"); `e.code` failed
+# with "unhandled EXPR_MEMBER". This was the next blocker for
+# examples/tier2_stdlib/77_args (`sum_item`'s `match arg_parse_i64(item)`).
+#
+# THE FIX
+#
+# E is the trailing `$`-bounded component(s) of the mangled `Result$T$E` name:
+# the shortest `$`-suffix naming a concrete struct (`Result$i64$ArgError` ->
+# `ArgError`, `Result$i32$Box$i64` -> `Box$i64`). When it names one, `Err(e)`
+# binds a copy of the payload as an `alloca %E` struct local, as Ok does.
+#
+# A second blocker on the same path: argspec's `arg_parse_i64` is a match
+# whose arms are bare ctors (`Some(n) => Ok(n)`, `None => Err(..)`), and its
+# merge phi was typed i64. emit_match_arm_body now types the phi with the
+# enum the ctor built (resolve_enum_ctx).
+#
+# Oracle: ritz0 builds and runs every program with the same exit code.
+#
+# Migrated from ritz0/test_ritz1_match_err_struct_payload.py by AGAST #1805: each case was a pure
+# ritz0-vs-ritz1 differential (same exit code under both), so it is a
+# test fn here and the regression matrix runs it under ritz0, ritz1
+# and ritz1_selfhosted.  Each case's `main` is renamed `<case>_main`;
+# top-level names shared between cases carry a `_<n>` suffix.
+
+import ritzlib.result
+import ritzlib.option
+
+# --- both_struct -----------------------------------------------------------
+
+struct Point_0
+    x: i64
+    y: i64
+
+struct Oops_0
+    a: i64
+    b: i64
+    c: i64
+
+fn ok_val_0(p: Point_0) -> i64
+    return p.x + p.y * 10
+
+fn err_val(e: Oops_0) -> i64
+    return e.a + e.b * 10 + e.c * 100
+
+fn mk_0(bad: i64) -> Result<Point_0, Oops_0>
+    if bad != 0
+        let e = Oops_0 { a: 5, b: 6, c: 7 }
+        return Err(e)
+    let p = Point_0 { x: 3, y: 4 }
+    return Ok(p)
+
+fn pick_0(bad: i64) -> i64
+    match mk_0(bad)
+        Ok(p) => ok_val_0(p)
+        Err(e) => err_val(e)
+
+fn both_struct_main() -> i32
+    if pick_0(0) != 43
+        return 1
+    if pick_0(1) != 765
+        return 2
+    return 42
+
+[[test]]
+fn test_both_struct() -> i32
+    assert both_struct_main() == 42
+    0
+
+
+# --- ctor_arms -------------------------------------------------------------
+
+struct Oops_1
+    a: i64
+    b: i64
+
+fn oops(a: i64) -> Oops_1
+    return Oops_1 { a: a, b: 2 }
+
+fn opt(x: i64) -> Option<i64>
+    if x > 0
+        return Some(x)
+    return None
+
+fn conv(x: i64) -> Result<i64, Oops_1>
+    match opt(x)
+        Some(n) => Ok(n)
+        None => Err(oops(30))
+
+fn get(x: i64) -> i64
+    match conv(x)
+        Ok(n) => n
+        Err(e) => e.a + e.b
+
+fn ctor_arms_main() -> i32
+    if get(7) != 7
+        return 1
+    if get(0) != 32
+        return 2
+    return 42
+
+[[test]]
+fn test_ctor_arms() -> i32
+    assert ctor_arms_main() == 42
+    0
+
+
+# --- err_nested_generic ----------------------------------------------------
+
+struct Box<T>
+    v: T
+
+fn mk_2(x: i64) -> Result<i32, Box<i64>>
+    var b: Box<i64>
+    b.v = x
+    return Err(b)
+
+fn err_nested_generic_main() -> i32
+    match mk_2(40)
+        Ok(v) => v
+        Err(b) => (b.v + 2) as i32
+
+[[test]]
+fn test_err_nested_generic() -> i32
+    assert err_nested_generic_main() == 42
+    0
+
+
+# --- err_struct_member -----------------------------------------------------
+
+struct Oops_3
+    code: i64
+    extra: i64
+
+fn mk_3() -> Result<i32, Oops_3>
+    let e = Oops_3 { code: 40, extra: 2 }
+    return Err(e)
+
+fn err_struct_member_main() -> i32
+    let x: i64 = match mk_3()
+        Ok(v) => v as i64
+        Err(e) => e.code + e.extra
+    return x as i32
+
+[[test]]
+fn test_err_struct_member() -> i32
+    assert err_struct_member_main() == 42
+    0
+
+
+# --- err_struct_to_fn ------------------------------------------------------
+
+struct Oops_4
+    a: i64
+    b: i64
+    c: i64
+
+fn fail(e: Oops_4) -> i64
+    return e.a + e.b * 10 + e.c * 100
+
+fn mk_4(bad: i64) -> Result<i64, Oops_4>
+    if bad != 0
+        let e = Oops_4 { a: 1, b: 2, c: 3 }
+        return Err(e)
+    return Ok(7)
+
+fn err_struct_to_fn_main() -> i32
+    let r1: i64 = match mk_4(1)
+        Ok(n) => n
+        Err(e) => fail(e)
+    let r2: i64 = match mk_4(0)
+        Ok(n) => n
+        Err(e) => fail(e)
+    if r1 != 321
+        return 1
+    if r2 != 7
+        return 2
+    return 42
+
+[[test]]
+fn test_err_struct_to_fn() -> i32
+    assert err_struct_to_fn_main() == 42
+    0
+
+
+# --- ok_struct -------------------------------------------------------------
+
+struct Point_5
+    x: i64
+    y: i64
+
+fn ok_val_5(p: Point_5) -> i64
+    return p.x + p.y * 10
+
+fn mk_5(bad: i64) -> Result<Point_5, i64>
+    if bad != 0
+        return Err(9)
+    let p = Point_5 { x: 3, y: 4 }
+    return Ok(p)
+
+fn pick_5(bad: i64) -> i64
+    match mk_5(bad)
+        Ok(p) => ok_val_5(p)
+        Err(e) => e
+
+fn ok_struct_main() -> i32
+    if pick_5(0) != 43
+        return 1
+    if pick_5(1) != 9
+        return 2
+    return 42
+
+[[test]]
+fn test_ok_struct() -> i32
+    assert ok_struct_main() == 42
+    0

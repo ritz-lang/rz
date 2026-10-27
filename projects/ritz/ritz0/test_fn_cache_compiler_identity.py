@@ -50,6 +50,9 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from emitter.fn_cache import sig_path_for  # noqa: E402
 
+# Every test runs a compiler process (AGAST #1805).
+pytestmark = pytest.mark.integration
+
 RITZ_ROOT = Path(__file__).resolve().parent.parent
 RITZ1 = RITZ_ROOT / "ritz1" / "build" / "ritz1"
 

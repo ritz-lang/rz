@@ -35,7 +35,8 @@ from test_ritz1_builtin_struct_shadow import RITZ_ROOT
 # xdist_group("tree") (AGAST #1804): build.py without --no-cache reads and writes the
 # shared projects/ritz/.ritz-cache{,-ritz1}.  Tests in the group
 # run on one xdist worker, one at a time; see conftest.py.
-pytestmark = pytest.mark.xdist_group("tree")
+# Every test compiles and runs programs, so the module is integration (AGAST #1805).
+pytestmark = [pytest.mark.xdist_group("tree"), pytest.mark.integration]
 
 
 def _manifest(name: str) -> str:

@@ -20,25 +20,22 @@ identified struct name before giving up.
 """
 
 import os
-import subprocess
-import sys
 from pathlib import Path
 
-RITZ0 = Path(__file__).resolve().parent / "ritz0.py"
-RITZ_ROOT = RITZ0.parent.parent
+import pytest
+
+from ritz0_inproc import run_ritz0
+
+pytestmark = pytest.mark.integration
+
+RITZ_ROOT = Path(__file__).resolve().parent.parent
 
 
 def _compile(tmp_path, source):
     src = tmp_path / "unit.ritz"
     src.write_text(source)
     env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
-    return subprocess.run(
-        [sys.executable, str(RITZ0), str(src),
-         "-o", str(tmp_path / "unit.ll")],
-        capture_output=True,
-        text=True,
-        env=env,
-    )
+    return run_ritz0([str(src), "-o", str(tmp_path / "unit.ll")], env=env)
 
 
 # The font.ritz shape: the receiver is bound from a static method call

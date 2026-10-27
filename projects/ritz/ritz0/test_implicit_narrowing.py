@@ -32,14 +32,15 @@ every rejection test by rejecting every narrowing, including `let ok: i32 = 5`.
 """
 
 import os
-import subprocess
-import sys
 from pathlib import Path
 
 import pytest
 
+from ritz0_inproc import run_ritz0
+
 RITZ_ROOT = Path(__file__).resolve().parent.parent
-RITZ0 = RITZ_ROOT / "ritz0" / "ritz0.py"
+
+pytestmark = pytest.mark.integration
 
 PRELUDE = """\
 const SMALL: i64 = 7
@@ -66,11 +67,8 @@ def _compile(tmp_path, body):
     src = tmp_path / "unit.ritz"
     src.write_text(PRELUDE + body)
     env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
-    return subprocess.run(
-        [sys.executable, str(RITZ0), str(src),
-         "-o", str(tmp_path / "unit.ll"), "--no-runtime"],
-        capture_output=True, text=True, env=env, timeout=300,
-    )
+    return run_ritz0([str(src), "-o", str(tmp_path / "unit.ll"), "--no-runtime"],
+                     env=env, timeout=300)
 
 
 def _fn(stmt, params="x: i32, o: Order"):

@@ -35,6 +35,7 @@ RITZ1 = RITZ_ROOT / "ritz1" / "build" / "ritz1"
 sys.path.insert(0, str(RITZ0_DIR))
 
 from emitter.fn_cache import sig_path_for  # noqa: E402
+from ritz0_inproc import run_ritz0  # noqa: E402
 
 SKIPPED = "Skipped (unchanged)"
 
@@ -70,10 +71,8 @@ def _ritz1(src: Path, out: Path, *extra, env=None) -> subprocess.CompletedProces
 
 
 def _ritz0(src: Path, out: Path) -> subprocess.CompletedProcess:
-    proc = subprocess.run(
-        [sys.executable, str(RITZ0_DIR / "ritz0.py"), str(src), "-o", str(out)],
-        capture_output=True, text=True, cwd=str(src.parent), env=_env(), timeout=300,
-    )
+    proc = run_ritz0([str(src), "-o", str(out)], cwd=str(src.parent), env=_env(),
+                     timeout=300)
     assert proc.returncode == 0, f"ritz0 failed:\n{proc.stdout}\n{proc.stderr}"
     return proc
 

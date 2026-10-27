@@ -30,18 +30,17 @@ from pathlib import Path
 
 import pytest
 
-RITZ0 = Path(__file__).resolve().parent / "ritz0.py"
+from ritz0_inproc import run_ritz0
+
+RITZ_ROOT = Path(__file__).resolve().parent.parent
+
+pytestmark = pytest.mark.integration
 
 
 def _compile(tmp_path, source):
     src = tmp_path / "unit.ritz"
     src.write_text(source)
-    return subprocess.run(
-        [sys.executable, str(RITZ0), str(src),
-         "-o", str(tmp_path / "unit.ll"), "--no-runtime"],
-        capture_output=True,
-        text=True,
-    )
+    return run_ritz0([str(src), "-o", str(tmp_path / "unit.ll"), "--no-runtime"])
 
 
 def _verify_ir(tmp_path):
@@ -79,10 +78,9 @@ def _run(tmp_path):
         return None
     ll = tmp_path / "run.ll"
     exe = tmp_path / "run"
-    env = dict(os.environ, RITZ_PATH=str(RITZ0.parent.parent))
-    build = subprocess.run(
-        [sys.executable, str(RITZ0), str(tmp_path / "unit.ritz"), "-o", str(ll)],
-        capture_output=True, text=True, env=env, timeout=300)
+    env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
+    build = run_ritz0([str(tmp_path / "unit.ritz"), "-o", str(ll)],
+                      env=env, timeout=300)
     assert build.returncode == 0, build.stderr
     link = subprocess.run([clang, str(ll), "-o", str(exe), "-nostdlib"],
                           capture_output=True, text=True, timeout=300)
