@@ -58,6 +58,12 @@ run. The gate runner (`run-gate.sh`) turns it on, so a broken ritz1 costs
 minutes rather than the whole gate. Without it every step runs, matching CI's
 per-step reporting.
 
+`--skip <step name>` (repeatable, exact name) leaves a step out; the gate
+runner skips "Smoke" because it has just run `make smoke` itself (AGAST #1897).
+A name that matches no step in the selected job(s) exits 2 before anything
+runs, so a renamed step cannot quietly turn the skip into a no-op. Skipped
+steps are listed in the summary.
+
 Exit code: 0 only if every step it ran exited 0.
 """
 
@@ -283,6 +289,9 @@ def main(argv: list[str] | None = None) -> int:
                    help="also run toolchain/dependency install steps")
     p.add_argument("--fail-fast", action="store_true",
                    help="stop at the first failing step (the gate's default)")
+    p.add_argument("--skip", action="append", default=[], metavar="STEP",
+                   help="do not run the step with this exact name (repeatable); "
+                        "an unknown name is an error")
     args = p.parse_args(argv)
 
     if not WORKFLOW.is_file():
@@ -310,6 +319,16 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         selected = [job]
 
+    # A --skip that matches nothing would be a silent no-op the day the step
+    # is renamed, and the gate would quietly pay for it again (AGAST #1897).
+    known = [s.name for s in steps if s.job in selected]
+    unknown = [n for n in args.skip if n not in known]
+    if unknown:
+        print(f"--skip names no step in {', '.join(selected)}: "
+              f"{', '.join(repr(n) for n in unknown)}; steps: "
+              f"{', '.join(repr(n) for n in known)}", file=sys.stderr)
+        return 2
+
     cas_log = None
     if not args.dry_run and not os.environ.get("RITZ_CAS_STATS_LOG"):
         fd, name = tempfile.mkstemp(prefix="ritz-cas-stats-", suffix=".jsonl")
@@ -320,9 +339,13 @@ def main(argv: list[str] | None = None) -> int:
     failures: list[str] = []
     skipped: list[str] = []
     not_run: list[str] = []
+    skipped_by_request: list[str] = []
     timings: list[tuple[str, float, int]] = []
     for s in steps:
         if s.job not in selected:
+            continue
+        if s.name in args.skip:
+            skipped_by_request.append(f"[{s.job}] {s.name}")
             continue
         if s.is_setup and not args.with_setup:
             skipped.append(f"[{s.job}] {s.name}")
@@ -345,6 +368,11 @@ def main(argv: list[str] | None = None) -> int:
         # Named, never silent: a fail-fast run asserts less than a full one.
         print("not run (--fail-fast stopped after the first failure):")
         for s in not_run:
+            print(f"  - {s}")
+    if skipped_by_request:
+        # A gate that skipped a step asserts less than CI; say which.
+        print("skipped (--skip):")
+        for s in skipped_by_request:
             print(f"  - {s}")
     if skipped:
         # Printed, never silent: see the module docstring.

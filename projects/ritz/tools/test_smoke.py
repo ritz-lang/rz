@@ -290,11 +290,14 @@ def test_run_gate_runs_smoke_before_ci_local():
     text = (REPO_ROOT / ".claude" / "skills" / "rz-iterate" / "run-gate.sh").read_text()
     m = re.search(r'^CMD="\$\{RZ_GATE_CMD:-(.*)\}"$', text, re.M)
     assert m, "default RZ_GATE_CMD not found"
-    cmd = m.group(1)
+    cmd = m.group(1).replace('\\"', '"')  # as bash expands the default
     assert "make -C projects/ritz smoke &&" in cmd
     assert cmd.index("smoke") < cmd.index("ci-local")
     # Still a clean gate: the wipe comes before anything builds.
     assert cmd.index("rm -rf") < cmd.index("smoke")
+    # AGAST #1897: ci-local must not run main.yml's Smoke step a second time.
+    assert re.search(r'ci-local ARGS="[^"]*--skip Smoke\b[^"]*"', cmd), cmd
+    assert "--fail-fast" in cmd[cmd.index("ci-local"):]
 
 
 @pytest.mark.unit

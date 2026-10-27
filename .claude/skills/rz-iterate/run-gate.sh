@@ -62,8 +62,9 @@ SLOTS="${RZ_GATE_SLOTS:-1}"
 # failures from stale struct layouts (AGAST #1659).
 #
 # `make smoke` first (AGAST #1803): a fully broken commit fails in ~2 min, not
-# ~26.  ci-local repeats it as main.yml's first step, warm (~1 min).
-CMD="${RZ_GATE_CMD:-rm -rf projects/ritz/.regression projects/ritz/ritz1/build && make -C projects/ritz smoke && make -C projects/ritz ci-local ARGS=--fail-fast}"
+# ~26.  main.yml's bootstrap job also starts with "Smoke"; ci-local skips it
+# (`--skip Smoke`, AGAST #1897) rather than pay ~30 s to run it again.
+CMD="${RZ_GATE_CMD:-rm -rf projects/ritz/.regression projects/ritz/ritz1/build && make -C projects/ritz smoke && make -C projects/ritz ci-local ARGS=\"--fail-fast --skip Smoke\"}"
 UNIT="ritz-gate-$NAME"
 
 # Uncommitted tracked changes would be tested but not merged.

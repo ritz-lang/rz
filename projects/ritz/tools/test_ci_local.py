@@ -230,6 +230,53 @@ def test_final_timing_table_lists_every_step_run(three_steps, capsys):
     assert re.search(r"total\s+\d+(\.\d+)?s", table), table
 
 
+# --------------------------------------------------------------------------
+# AGAST #1897: --skip <step>, so run-gate's up-front smoke is not repeated.
+# --------------------------------------------------------------------------
+
+
+def test_skip_does_not_run_the_named_step(three_steps, capsys):
+    assert ci_local.main(["--skip", "Second fails"]) == 0
+    assert three_steps.exists(), "--skip stopped later steps from running"
+    out = capsys.readouterr().out
+    assert "[Second fails] START" not in out
+    # Named in the summary, never silently dropped.
+    summary = out[out.index("skipped (--skip)"):]
+    assert "Second fails" in summary
+
+
+def test_skip_is_repeatable(three_steps, capsys):
+    assert ci_local.main(["--skip", "Second fails",
+                          "--skip", "Third leaves a marker"]) == 0
+    assert not three_steps.exists()
+    out = capsys.readouterr().out
+    assert "[First ok] START" in out
+
+
+def test_skip_of_an_unknown_step_fails_before_running_anything(three_steps, capsys):
+    """A renamed step must not turn the skip into a silent no-op."""
+    assert ci_local.main(["--skip", "Second fail"]) == 2
+    assert not three_steps.exists()
+    captured = capsys.readouterr()
+    assert "[First ok] START" not in captured.out
+    assert "'Second fail'" in captured.err
+    assert "Second fails" in captured.err, "valid step names should be listed"
+
+
+def test_skip_must_name_a_step_in_the_selected_job(tmp_path, monkeypatch, capsys):
+    wf = tmp_path / "main.yml"
+    wf.write_text("jobs:\n  alpha:\n    steps:\n      - name: A\n        run: 'true'\n"
+                  "  beta:\n    steps:\n      - name: B\n        run: 'true'\n")
+    monkeypatch.setattr(ci_local, "WORKFLOW", wf)
+    monkeypatch.setattr(ci_local, "REPO_ROOT", tmp_path)
+    assert ci_local.main(["--job", "alpha", "--skip", "B"]) == 2
+
+
+def test_real_bootstrap_job_has_the_step_the_gate_skips():
+    names = [s.name for s in ci_local.load_steps() if s.job == ci_local.DEFAULT_JOB]
+    assert "Smoke" in names, names
+
+
 def test_ritz1_is_built_before_pytest_in_the_bootstrap_job():
     """pytest's ~80 module fixtures must find ritz1 already built, not each
     race a cold serial build (design §2)."""
@@ -254,7 +301,7 @@ def test_gate_runner_defaults_to_fail_fast():
         pytest.skip("run-gate.sh is not part of this checkout")
     cmd_line = next(line for line in gate.read_text().splitlines()
                     if line.startswith("CMD="))
-    assert "ARGS=--fail-fast" in cmd_line, cmd_line
+    assert re.search(r"ci-local ARGS=\S*--fail-fast", cmd_line), cmd_line
 
 
 # --------------------------------------------------------------------------
