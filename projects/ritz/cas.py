@@ -7,6 +7,9 @@ every worktree on the machine:
     $RITZ_CACHE_DIR            (default ~/.cache/ritz/cas)
     ├── objects/<k[:2]>/<k>.ll   LLVM IR emitted for the module
     ├── objects/<k[:2]>/<k>.o    `clang -c` of that IR
+    ├── objects/<m[:2]>/<m>.keymemo  a module key or import closure, valid
+    │                            while its closure's files are unchanged
+    │                            (build.py closure_memo_get, AGAST #1920)
     └── meta/<k[:2]>/<k>.json    what the key was built from (debugging aid)
 
 `k` is a sha256 over everything that determines the artifact (`module_key`):

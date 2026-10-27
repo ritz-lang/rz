@@ -17,6 +17,8 @@ Usage:
 
 import sys
 import os
+import hashlib
+import json
 import re
 import subprocess
 import shutil
@@ -356,16 +358,120 @@ def cas_module_key(src: Path, cache: BuildCache, compiler: str,
     another way (compile_freestanding_binary: its target, target_os and
     clang flags), so the two never share an entry.
     """
+    flags = {"compiler": compiler, "emit": "no-runtime",
+             "obj": OBJ_CLANG_FLAGS if object_flags is None else object_flags,
+             "verify_ir": _verify_ir_enabled()}
+    # AGAST #1920: every `rz test --all` file unit is its own process and
+    # re-keyed the same ritzlib/ritzunit modules (~5 ms each: closure scan,
+    # an interface-hash lookup per import, module identities).
+    src = Path(src).resolve()
+    memo = {"kind": "cas_module_key", "src": str(src), "flags": flags,
+            "context": cache._context_key(),
+            "compiler_fp": cache._get_current_compiler_hash()}
+    hit = closure_memo_get(memo)
+    if hit is not None:
+        return hit["key"]
     try:
-        closure = cache.get_transitive_dependencies(Path(src))
+        closure = cache.get_transitive_dependencies(src)
     except Exception:
         return None
     # Persist fresh scans: a fully cached build never writes them otherwise.
     cache._save_imports_db()
-    flags = {"compiler": compiler, "emit": "no-runtime",
-             "obj": OBJ_CLANG_FLAGS if object_flags is None else object_flags,
-             "verify_ir": _verify_ir_enabled()}
-    return _cas_key(src, closure, cache, compiler, flags)
+    key = _cas_key(src, closure, cache, compiler, flags)
+    if key is not None:
+        closure_memo_put(memo, {"key": key}, [src, *closure])
+    return key
+
+
+# ---------------------------------------------------------------------------
+# Closure memo (AGAST #1920)
+# ---------------------------------------------------------------------------
+#
+# A result computed from a module's import closure (its store key, or the
+# closure itself), persisted in the artifact store as
+# `objects/<m[:2]>/<m>.keymemo` so a later process skips the resolution.
+# `m` digests everything the result depends on except the contents of the
+# closure's files (the caller's `material`, plus what this function adds:
+# the target, the key schema, the repository root and the parser/resolver
+# fingerprint). The entry records the sha256 of every file of the closure
+# and is used only while each still has that content. It lives under
+# `objects/` so `gc` trims it by least-recent use like any artifact; reading
+# it is not counted as a store hit or miss.
+#
+# Like the import-scan store (cache.IMPORTS_FILE) it trusts that unchanged
+# files resolve their imports to the same files: a new file that shadows an
+# import elsewhere on the search path is not seen. RITZ_NO_KEY_MEMO=1
+# bypasses it.
+
+KEY_MEMO_ENV = "RITZ_NO_KEY_MEMO"
+KEY_MEMO_EXT = "keymemo"
+KEY_MEMO_SCHEMA = "ritz-keymemo-v1"
+_RESOLVER_FP: Optional[str] = None
+
+
+def _resolver_fingerprint() -> str:
+    """What import scanning and resolution (and interface hashes) depend on
+    beyond the files themselves: ritz0's parser and resolver, cache.py."""
+    global _RESOLVER_FP
+    if _RESOLVER_FP is None:
+        h = hashlib.sha256(module_interface.parser_fingerprint().encode())
+        for f in (RITZ0_DIR / "import_resolver.py", ROOT / "cache.py"):
+            h.update(f.name.encode() + b"\0" + f.read_bytes())
+        _RESOLVER_FP = h.hexdigest()
+    return _RESOLVER_FP
+
+
+def _closure_memo_id(material: dict) -> Optional[str]:
+    if os.environ.get(KEY_MEMO_ENV, "") not in ("", "0"):
+        return None
+    full = {"schema": KEY_MEMO_SCHEMA, "key_schema": cas.KEY_SCHEMA,
+            "target": cas.target_id(), "repo": str(cas.REPO_ROOT),
+            "resolver": _resolver_fingerprint(),
+            "interfaces": [module_interface.enabled(), module_interface.SCHEMA],
+            "material": material}
+    blob = json.dumps(full, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(blob.encode()).hexdigest()
+
+
+def _closure_memo_path(memo_id: str) -> Path:
+    return cas.ArtifactStore().path(memo_id, KEY_MEMO_EXT)
+
+
+def closure_memo_get(material: dict) -> Optional[dict]:
+    """The value stored for `material` if every file it was computed from
+    still has the content it had, else None."""
+    memo_id = _closure_memo_id(material)
+    if memo_id is None:
+        return None
+    path = _closure_memo_path(memo_id)
+    try:
+        entry = json.loads(path.read_text())
+        for f, digest in entry["files"].items():
+            if cas.file_sha256(Path(f)) != digest:
+                return None
+        value = entry["value"]
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None  # absent, torn, foreign, or a file is gone
+    try:
+        os.utime(path)  # least-recently-used order for gc
+    except OSError:
+        pass
+    return value
+
+
+def closure_memo_put(material: dict, value: dict, files) -> None:
+    """Record `value` as computed from `material` and the current content of
+    `files` (every file of the closure, the root included)."""
+    memo_id = _closure_memo_id(material)
+    if memo_id is None:
+        return
+    try:
+        entry = {"files": {str(Path(f).resolve()): cas.file_sha256(Path(f)) for f in files},
+                 "value": value}
+        cas._atomic_write(_closure_memo_path(memo_id),
+                          json.dumps(entry, sort_keys=True).encode())
+    except OSError:
+        pass  # a memo is an optimisation; never fail a build over it
 
 
 def _cas_key(src: Path, closure, cache: BuildCache, compiler: str,

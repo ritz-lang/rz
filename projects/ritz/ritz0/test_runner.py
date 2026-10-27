@@ -704,6 +704,33 @@ def _ritzunit_import_context():
     return deps, roots
 
 
+def _ritzunit_sources() -> List[str]:
+    """ritzunit's source closure, as collect_all_source_files orders it.
+
+    AGAST #1920: every file unit is its own process and resolved the same
+    closure again (~900 Path.resolve calls, ~0.07 s); it is kept in the
+    build.py closure memo, reused while every file has the same content.
+    Raises what resolution raises.
+    """
+    deps, roots = _ritzunit_import_context()
+    build = _build_module() if _cas_enabled() else None
+    memo = None
+    if build is not None:
+        memo = {"kind": "ritzunit_sources", "main": str(RITZUNIT_MAIN),
+                "root": str(RITZUNIT_ROOT), "roots": roots,
+                "deps": sorted((n, str(d.path), list(d.sources)) for n, d in deps.items()),
+                "ritz_path": os.environ.get("RITZ_PATH", "")}
+        hit = build.closure_memo_get(memo)
+        if hit is not None:
+            return list(hit["sources"])
+    sources = collect_all_source_files(
+        str(RITZUNIT_MAIN), project_root=str(RITZUNIT_ROOT),
+        dependencies=deps, source_roots=roots)
+    if memo is not None:
+        build.closure_memo_put(memo, {"sources": sources}, sources)
+    return sources
+
+
 def _as_object(path: str, tmpdir: str) -> Tuple[Optional[str], Optional[str]]:
     """An object file for `path`: itself if already one, else `clang -c` of the .ll."""
     if path.endswith(".o"):
@@ -732,11 +759,9 @@ def build_runner_objects(tmpdir: str, ll_cache: dict, test_modules=(),
 
     Returns (objects, error).
     """
-    deps, roots = _ritzunit_import_context()
+    deps, _roots = _ritzunit_import_context()
     try:
-        sources = collect_all_source_files(
-            str(RITZUNIT_MAIN), project_root=str(RITZUNIT_ROOT),
-            dependencies=deps, source_roots=roots)
+        sources = _ritzunit_sources()
     except Exception as e:  # noqa: BLE001 -- reported as the file's failure
         return [], f"ritzunit import resolution failed: {e}"
     compiled, error = compile_dependencies(
