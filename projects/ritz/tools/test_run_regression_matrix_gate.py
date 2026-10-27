@@ -382,6 +382,40 @@ def test_requires_cpu_names_real_files():
         assert flags, f"REQUIRES_CPU[{name!r}] is empty"
 
 
+class _ReachedBuild(Exception):
+    pass
+
+
+class _FlagsOnlyDeps:
+    """A Deps whose host CPU flags are forced; reaching the build raises."""
+
+    def __init__(self, flags):
+        self.cpu_flags = set(flags)
+
+    def closure(self, src_path):
+        raise _ReachedBuild(src_path)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("name", sorted(matrix.REQUIRES_CPU))
+def test_run_file_skips_every_unit_when_a_flag_is_absent(tmp_path, name):
+    """AGAST #1921: run_file is what the CI ritz0/ritz1 cells call. With the
+    feature forced absent, nothing is compiled or run and every unit says so."""
+    out = matrix.run_file(name, "ritz0", "/nonexistent", _FlagsOnlyDeps(set()),
+                          {}, tmp_path)
+    assert out and {s for s, _, _ in out.values()} == {"skip-cpu"}, out
+    assert all("host CPU lacks" in info for _, _, info in out.values())
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("name", sorted(matrix.REQUIRES_CPU))
+def test_run_file_builds_when_every_flag_is_present(tmp_path, name):
+    """The skip must not swallow a capable host: a SIGILL there is a failure."""
+    deps = _FlagsOnlyDeps(matrix.REQUIRES_CPU[name])
+    with pytest.raises(_ReachedBuild):
+        matrix.run_file(name, "ritz0", "/nonexistent", deps, {}, tmp_path)
+
+
 @pytest.mark.unit
 def test_harness_lowers_and_runs_under_ritz0(tmp_path):
     """End to end on ritz0: every fn is selected, a failing fn's code is its own,

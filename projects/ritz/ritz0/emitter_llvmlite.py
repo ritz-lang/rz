@@ -12419,11 +12419,22 @@ def _add_intrinsic_target_features(ir_str: str) -> str:
     return '\n'.join(lines)
 
 
+# AGAST #1921: the CPU that an intrinsic-calling function is compiled for.
+# LLVM builds a function's subtarget from its own "target-cpu" (else the
+# command line's) and its own "target-features", which REPLACES the command
+# line's feature string instead of extending it. With "+sha" alone the function
+# took `-march=native`'s CPU name but none of its "-feature" masks, so on a VM
+# that hides AVX the function got AVX code and SIGILLed. Pinning the CPU makes
+# it exactly baseline x86-64 plus the features it calls, under any -march.
+_INTRINSIC_FN_CPU = 'x86-64'
+
+
 def _with_target_features(define_line: str, features: List[str]) -> str:
-    """Add `"target-features"="..."` to a `define` line, keeping `!dbg` last."""
+    """Add `"target-cpu"`/`"target-features"` to a `define` line, keeping `!dbg` last."""
     if '"target-features"' in define_line:
         return define_line  # idempotent (cached IR is already processed)
-    attr = f'"target-features"="{",".join(sorted(features))}"'
+    attr = (f'"target-cpu"="{_INTRINSIC_FN_CPU}" '
+            f'"target-features"="{",".join(sorted(features))}"')
     m = re.search(r'\s(!dbg !\d+)\s*$', define_line)
     if m:
         return f'{define_line[:m.start()]} {attr} {m.group(1)}'

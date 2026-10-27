@@ -192,6 +192,73 @@ def test_program_compiles_at_O2_without_march_flags(program_ll):
         f"clang {' '.join(OBJ_FLAGS)} failed on ritz0 IR:\n{_crash_head(r.stderr)}")
 
 
+# AGAST #1921: an LLVM function's "target-features" REPLACES the target
+# machine's feature string rather than adding to it, while the CPU still comes
+# from the command line. `-march=native` on a VM gives clang the host's CPU
+# name plus explicit "-feature" masks for whatever the hypervisor hides; a bare
+# "+sha" attribute dropped those masks, so the intrinsic function was compiled
+# for the CPU name's full nominal ISA and SIGILLed (CI run 40552056133: ritz0
+# test_aesni/test_shani/test_simd, on a runner where ritz1's identical
+# instructions ran fine). Pinning "target-cpu" makes the function exactly
+# baseline x86-64 + its feature, whatever -march the consumer passes.
+BASELINE_CPU = "x86-64"
+# A CPU name that implies AVX..AVX-512 plus sha/aes/pclmul, with AVX masked
+# off: the shape of `-march=native` on a host whose hypervisor hides AVX.
+MASKED_NATIVE = ["-march=icelake-server", "-mno-avx"]
+
+
+def _cpu(ir: str, fn: str):
+    m = re.search(r'"target-cpu"="([^"]*)"', _define_attrs(ir, fn))
+    return m.group(1) if m else None
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("fn", ["use_sha", "use_aes", "use_clmul"])
+def test_intrinsic_caller_pins_baseline_cpu(program_ll, fn):
+    cpu = _cpu(program_ll.read_text(), fn)
+    assert cpu == BASELINE_CPU, (
+        f"@{fn} has target-features but target-cpu={cpu!r}: its subtarget "
+        f"would take the command line's CPU with none of its feature masks")
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("fn", ["plain", "main"])
+def test_functions_without_intrinsics_keep_command_line_cpu(program_ll, fn):
+    assert _cpu(program_ll.read_text(), fn) is None
+
+
+def _disasm_by_fn(obj: Path) -> dict:
+    out = subprocess.run(["objdump", "-d", "--no-show-raw-insn", str(obj)],
+                         capture_output=True, text=True, check=True).stdout
+    fns, cur = {}, None
+    for line in out.splitlines():
+        m = re.match(r"^[0-9a-f]+ <([^>]+)>:$", line)
+        if m:
+            cur = fns.setdefault(m.group(1), [])
+        elif cur is not None and "\t" in line:
+            cur.append(line.split("\t", 1)[1].strip())
+    return fns
+
+
+@pytest.mark.integration
+def test_intrinsic_fns_honour_masked_native_features(program_ll, tmp_path):
+    """No AVX encoding in an intrinsic fn when the command line masks AVX."""
+    obj = tmp_path / "masked.o"
+    r = subprocess.run(
+        ["clang", *OBJ_FLAGS, *MASKED_NATIVE, str(program_ll), "-o", str(obj)],
+        capture_output=True, text=True, timeout=CLANG_TIMEOUT_S,
+        preexec_fn=_limit_mem)
+    assert r.returncode == 0, _crash_head(r.stderr)
+    fns = _disasm_by_fn(obj)
+    for fn in ("use_sha", "use_aes", "use_clmul"):
+        assert fn in fns, f"no {fn} in {sorted(fns)}"
+        # Every VEX/EVEX mnemonic starts with 'v'; no SSE or baseline one does.
+        avx = [ins for ins in fns[fn] if ins.startswith("v")]
+        assert not avx, (
+            f"{fn} uses AVX under {' '.join(MASKED_NATIVE)} (SIGILL on such a "
+            f"host): {avx[:4]}")
+
+
 # The ticket's crashing sources, compiled the way build.py compiles a
 # dependency of goliath/mausoleum/nexus/tome/valet.
 CRYPTOSEC = PROJECTS / "cryptosec"
