@@ -30,8 +30,11 @@ different key, old entries stay valid for whoever still has the old inputs
 
 Concurrency: entries are immutable once written. A writer goes through a
 private temp file and `os.replace`, so a reader sees the whole file or no
-file. Two processes that miss on the same key both compile and both write
-equivalent bytes; there is no shared index file to fight over.
+file; there is no shared index file to fight over. Compiles are single-flight
+(AGAST #1911): `get_or_build` holds a per-key flock on
+`objects/<k[:2]>/.<k>.lock` and re-checks the store under it, so when several
+processes (or threads) miss on one key together, one compiles and the others
+wait and hit. Before that, a gate compiled ~40 keys twice.
 
 Consumers (AGAST #1894): build.py compile_binary, ritz0/test_runner's
 dependency objects, tools/run_regression_matrix.py's ritzlib and dependency
@@ -213,7 +216,7 @@ class Stats:
         self.hits = 0
         self.misses = 0
         self.bytes_written = 0
-        self.missed: List[List[str]] = []  # [key, ext, identity]
+        self.missed: List[List[str]] = []  # [key, ext, identity, store root]
 
     def as_dict(self) -> dict:
         return {"pid": os.getpid(), "argv0": Path(sys.argv[0]).name if sys.argv else "",
@@ -278,6 +281,11 @@ def _atomic_write(dst: Path, data: bytes) -> None:
         raise
 
 
+class BuildFailed(Exception):
+    """A `get_or_build` build_fn's way to report a compile error: nothing is
+    stored, the lock is released, and the caller gets the message back."""
+
+
 class ArtifactStore:
     """Immutable key -> file store. See the module docstring."""
 
@@ -294,12 +302,7 @@ class ArtifactStore:
         """The stored artifact, or None. Counts a hit or a miss."""
         p = self.path(key, ext)
         if p.is_file():
-            STATS.hits += 1
-            try:
-                os.utime(p)  # least-recently-used order for gc
-            except OSError:
-                pass
-            return p
+            return self._hit(p)
         STATS.misses += 1
         return None
 
@@ -308,11 +311,76 @@ class ArtifactStore:
         dst = self.path(key, ext)
         STATS.bytes_written += _atomic_copy(Path(src), dst)
         if identity:
-            STATS.missed.append([key, ext, identity])
+            # The store root too: test sessions use private stores, and one
+            # compile per store is not a double compile (AGAST #1911).
+            STATS.missed.append([key, ext, identity, str(self.root)])
         return dst
 
     def put_meta(self, key: str, meta: dict) -> None:
         _atomic_write(self.meta_path(key), json.dumps(meta, indent=1, sort_keys=True).encode())
+
+    def lock_path(self, key: str) -> Path:
+        """The per-key single-flight lock (AGAST #1911). A dotfile next to the
+        objects, so gc (which skips dotfiles) never counts or removes it."""
+        return self.root / "objects" / key[:2] / f".{key}.lock"
+
+    def get_or_build(self, key: str, ext: str,
+                     build_fn: Callable[[], Dict[str, Path]], *,
+                     identity: str = "", meta: Optional[dict] = None) -> tuple:
+        """(stored path of (key, ext), built): the artifact, built at most once
+        machine-wide however many processes and threads miss on it together.
+
+        A hit returns at once. On a miss, take an exclusive flock on
+        `lock_path(key)` and look again: whoever held the lock may just have
+        stored it (a hit; `build_fn` is not called). Only a caller that still
+        misses while holding the lock runs `build_fn()`, which returns the
+        files to store as {ext: path} and must include `ext`; they are stored,
+        with `meta`, before the lock is released. An exception from `build_fn`
+        propagates, stores nothing and releases the lock, so the next waiter
+        builds (and reports the same error) itself.
+
+        `built` tells the caller whether its own `build_fn` produced the files
+        (so they are already where it wanted them) or it must copy the stored
+        artifact.
+        """
+        p = self.path(key, ext)
+        if p.is_file():
+            return self._hit(p), False
+        lock = self.lock_path(key)
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        with open(lock, "a") as lf:
+            fcntl.flock(lf, fcntl.LOCK_EX)
+            try:
+                if p.is_file():
+                    # Somebody built it while we waited for the lock.
+                    return self._hit(p), False
+                STATS.misses += 1
+                files = build_fn()
+                if ext not in files:
+                    raise ValueError(f"build_fn for {key[:12]} produced {sorted(files)}, not {ext!r}")
+                for e in files:
+                    self.put(key, e, files[e], identity=identity if e == ext else "")
+                if meta is not None:
+                    self.put_meta(key, meta)
+                # Unlinked while held, and only once the entry exists: anyone
+                # still waiting on this inode re-checks and hits; anyone who
+                # opens a fresh lock file after this re-checks and hits too.
+                # A failed build leaves the file for the next builder.
+                try:
+                    lock.unlink()
+                except OSError:
+                    pass
+                return p, True
+            finally:
+                fcntl.flock(lf, fcntl.LOCK_UN)
+
+    def _hit(self, p: Path) -> Path:
+        STATS.hits += 1
+        try:
+            os.utime(p)  # least-recently-used order for gc
+        except OSError:
+            pass
+        return p
 
     def gc(self, max_bytes: int) -> tuple:
         """Delete least-recently-used entries until the store fits `max_bytes`.
@@ -369,9 +437,13 @@ def summarise(log: Path) -> dict:
         hits += rec.get("hits", 0)
         misses += rec.get("misses", 0)
         written += rec.get("bytes_written", 0)
-        for key, ext, ident in rec.get("missed", []):
-            seen.setdefault((key, ext), []).append(ident)
-    dup = {f"{k[:12]}.{e}": ids[0] for (k, e), ids in seen.items() if len(ids) > 1}
+        for key, ext, ident, *root in rec.get("missed", []):
+            # Records from before AGAST #1911 carry no store root.
+            seen.setdefault((key, ext, root[0] if root else ""), []).append(ident)
+    # Per store: a key compiled once in each of two stores (a pytest
+    # session's private store and the user's) was compiled once per store.
+    dup = {f"{k[:12]}.{e}" + (f" in {r}" if r else ""): ids[0]
+           for (k, e, r), ids in seen.items() if len(ids) > 1}
     return {"processes": procs, "hits": hits, "misses": misses,
             "bytes_written": written, "compiled": len(seen),
             "compiled_more_than_once": dup}

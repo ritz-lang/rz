@@ -483,45 +483,53 @@ def compile_dependencies(
         if ctx is not None:
             build, cache, store = ctx
             cas_key = build.cas_module_key(Path(src_key), cache, "ritz0")
-            if cas_key is not None:
-                cached = store.get(cas_key, "o")
-                if cached is not None:
-                    shutil.copyfile(cached, obj_path)
-                    ll_cache[src_key] = obj_path
-                    ll_files.append(obj_path)
-                    continue
 
-        # Compile to .ll
+        def emit_ll(src=src, ll_path=ll_path) -> Optional[str]:
+            """ritz0 --no-runtime of `src` into ll_path; an error, or None."""
+            compile_cmd = [sys.executable, str(ritz0_py), str(src), "-o", ll_path, "--no-runtime"]
 
-        compile_cmd = [sys.executable, str(ritz0_py), str(src), "-o", ll_path, "--no-runtime"]
+            # Pass dependencies to ritz0 if provided (Issue #48)
+            if dependencies:
+                deps_json = {
+                    name: {"path": str(spec.path), "sources": spec.sources}
+                    for name, spec in dependencies.items()
+                }
+                compile_cmd.extend(["--deps", json.dumps(deps_json)])
 
-        # Pass dependencies to ritz0 if provided (Issue #48)
-        if dependencies:
-            deps_json = {
-                name: {"path": str(spec.path), "sources": spec.sources}
-                for name, spec in dependencies.items()
-            }
-            compile_cmd.extend(["--deps", json.dumps(deps_json)])
+            # Pass project root if provided
+            if project_root:
+                compile_cmd.extend(["--project-root", str(project_root)])
+            compile_cmd.extend(_sources_args(project_root))
 
-        # Pass project root if provided
-        if project_root:
-            compile_cmd.extend(["--project-root", str(project_root)])
-        compile_cmd.extend(_sources_args(project_root))
+            result = subprocess.run(compile_cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                return f"ritz0 failed for {Path(src).name}: {result.stderr}"
+            return None
 
-        result = subprocess.run(compile_cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            return None, f"ritz0 failed for {Path(src).name}: {result.stderr}"
-
-        if cas_key is not None:
-            # Same pipeline as build.py: verify (if asked), clang -c, store.
-            error = (build.verify_ir(Path(ll_path), Path(src_key))
-                     or build.compile_ll_to_obj(Path(ll_path), Path(obj_path), Path(src_key)))
+        if cas_key is None:
+            error = emit_ll()
             if error:
                 return None, error
+        else:
+            def build_fn(emit_ll=emit_ll, ll_path=ll_path, obj_path=obj_path):
+                # Same pipeline as build.py: ritz0, verify (if asked), clang -c.
+                error = (emit_ll()
+                         or build.verify_ir(Path(ll_path), Path(src_key))
+                         or build.compile_ll_to_obj(Path(ll_path), Path(obj_path), Path(src_key)))
+                if error:
+                    raise build.cas.BuildFailed(error)
+                return {"ll": Path(ll_path), "o": Path(obj_path)}
+            # AGAST #1911: single-flight. Parallel test_runner processes that
+            # miss on one key together compile it once; the rest wait and hit.
             ident = build.cas.module_identity(Path(src_key))
-            store.put(cas_key, "ll", Path(ll_path))
-            store.put(cas_key, "o", Path(obj_path), identity=ident)
-            store.put_meta(cas_key, {"module": ident, "compiler": "ritz0"})
+            try:
+                stored, built = store.get_or_build(
+                    cas_key, "o", build_fn, identity=ident,
+                    meta={"module": ident, "compiler": "ritz0"})
+            except build.cas.BuildFailed as e:
+                return None, str(e)
+            if not built:
+                shutil.copyfile(stored, obj_path)
             ll_path = obj_path
 
         ll_cache[src_key] = ll_path

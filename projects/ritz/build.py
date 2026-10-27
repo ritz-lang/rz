@@ -420,31 +420,43 @@ def cas_object(src: Path, out_obj: Path, *, project_root: Path,
     with _CAS_CONTEXT_LOCK:
         cache.set_import_context(project_root=project_root)
         key = cas_module_key(src, cache, "ritz0")
-    store = cas.ArtifactStore()
-    if key is not None:
-        hit = store.get(key, "o")
-        if hit is not None:
-            shutil.copyfile(hit, out_obj)
-            return None
     ll_path = out_obj.with_suffix(".ll")
-    cmd = [sys.executable, str(RITZ0), str(src), "-o", str(ll_path), "--no-runtime",
-           "--project-root", str(project_root)]
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        return f"{src.name}: ritz0 timed out after {timeout}s"
-    if r.returncode != 0:
-        out_obj.unlink(missing_ok=True)
-        return f"{src.name}: ritz0 failed: {r.stderr[-300:]}"
-    error = verify_ir(ll_path, src) or compile_ll_to_obj(ll_path, out_obj, src)
-    if error:
-        out_obj.unlink(missing_ok=True)
+
+    def compile_it() -> Optional[str]:
+        cmd = [sys.executable, str(RITZ0), str(src), "-o", str(ll_path), "--no-runtime",
+               "--project-root", str(project_root)]
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return f"{src.name}: ritz0 timed out after {timeout}s"
+        if r.returncode != 0:
+            out_obj.unlink(missing_ok=True)
+            return f"{src.name}: ritz0 failed: {r.stderr[-300:]}"
+        error = verify_ir(ll_path, src) or compile_ll_to_obj(ll_path, out_obj, src)
+        if error:
+            out_obj.unlink(missing_ok=True)
         return error
-    if key is not None:
-        ident = cas.module_identity(src)
-        store.put(key, "ll", ll_path)
-        store.put(key, "o", out_obj, identity=ident)
-        store.put_meta(key, {"module": ident, "compiler": "ritz0"})
+
+    if key is None:
+        return compile_it()
+
+    def build_fn() -> dict:
+        error = compile_it()
+        if error:
+            raise cas.BuildFailed(error)
+        return {"ll": ll_path, "o": out_obj}
+
+    # AGAST #1911: single-flight, so parallel callers missing on one key
+    # compile it once between them.
+    ident = cas.module_identity(src)
+    try:
+        stored, built = cas.ArtifactStore().get_or_build(
+            key, "o", build_fn, identity=ident,
+            meta={"module": ident, "compiler": "ritz0"})
+    except cas.BuildFailed as e:
+        return str(e)
+    if not built:
+        shutil.copyfile(stored, out_obj)
     return None
 
 
@@ -1549,70 +1561,92 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
             # It replaces the per-worktree .ritz-cache objects (and the
             # .bc/.ll tiers, which a hit on the .o always made unreachable).
             cas_key = cas_module_key(src, cache, compiler) if use_cache else None
-            if cas_key is not None:
-                cached_obj = store.get(cas_key, "o")
-                if cached_obj is not None:
-                    shutil_mod.copyfile(cached_obj, obj_path)
-                    link_files.append(obj_path)
-                    continue
 
-            # All sources compiled without runtime - _start comes from external .o
-            if compiler.startswith("ritz1"):
-                compile_cmd = ritz1_compile_cmd(compiler, src, ll_path)
-                if compile_cmd is None:
-                    return None
+            def compile_src(src=src, ll_path=ll_path, obj_path=obj_path) -> Optional[tuple]:
+                """Emit, verify and `clang -c` one module into obj_path.
+                None on success, else ("compile" | "obj" | "no-compiler", msg)."""
+                # All sources compiled without runtime - _start comes from external .o
+                if compiler.startswith("ritz1"):
+                    compile_cmd = ritz1_compile_cmd(compiler, src, ll_path)
+                    if compile_cmd is None:
+                        return ("no-compiler", "")
+                else:
+                    compile_cmd = [sys.executable, str(RITZ0), str(src), "-o", str(ll_path), "--no-runtime"]
+
+                    # Pass dependencies if any (RFC #109 Phase 2)
+                    if dependencies:
+                        deps_json = {
+                            name: {"path": str(spec.path), "sources": spec.sources}
+                            for name, spec in dependencies.items()
+                        }
+                        compile_cmd.extend(["--deps", json.dumps(deps_json)])
+                    # Pass source roots if any (for import resolution)
+                    if source_roots:
+                        compile_cmd.extend(["--sources", json.dumps(source_roots)])
+                    # Pass project root (package directory) for source root resolution
+                    if pkg_dir:
+                        compile_cmd.extend(["--project-root", str(pkg_dir)])
+
+                env = ritz1_env(dependencies) if compiler.startswith("ritz1") else os.environ.copy()
+                result = subprocess.run(compile_cmd, capture_output=True, text=True, env=env)
+                if result.returncode != 0:
+                    return ("compile", result.stderr)
+
+                # AGAST #1308: verify before clang, and before the .ll is cached.
+                # Caching invalid IR would make the bug survive a rebuild and then
+                # reappear on a machine whose clang is stricter, which is exactly
+                # the failure mode this is here to kill.
+                ir_error = verify_ir(ll_path, src)
+                if ir_error is not None:
+                    return ("compile", ir_error)
+
+                # AGAST #192: Pre-compile freshly emitted .ll to .o.  Without
+                # this, the link step pays for full IR lowering on every file
+                # (cached or not).  Caching the .o means subsequent rebuilds —
+                # even ones that re-invoke ritz1 — skip clang's slow path.
+                #
+                # AGAST #1731: there is deliberately no .bc / .ll fallback here.
+                # One used to swallow a failed (or capped) -O2 compile and link the
+                # .ll instead, which hid #1730 for a whole gate.
+                obj_error = compile_ll_to_obj(ll_path, obj_path, src)
+                if obj_error is not None:
+                    return ("obj", obj_error)
+                return None
+
+            if cas_key is None:
+                failure = compile_src()
             else:
-                compile_cmd = [sys.executable, str(RITZ0), str(src), "-o", str(ll_path), "--no-runtime"]
-
-                # Pass dependencies if any (RFC #109 Phase 2)
-                if dependencies:
-                    deps_json = {
-                        name: {"path": str(spec.path), "sources": spec.sources}
-                        for name, spec in dependencies.items()
-                    }
-                    compile_cmd.extend(["--deps", json.dumps(deps_json)])
-                # Pass source roots if any (for import resolution)
-                if source_roots:
-                    compile_cmd.extend(["--sources", json.dumps(source_roots)])
-                # Pass project root (package directory) for source root resolution
-                if pkg_dir:
-                    compile_cmd.extend(["--project-root", str(pkg_dir)])
-
-            env = ritz1_env(dependencies) if compiler.startswith("ritz1") else os.environ.copy()
-            result = subprocess.run(compile_cmd, capture_output=True, text=True, env=env)
-            if result.returncode != 0:
-                # AGAST #1286: collect and keep going so every broken file is
-                # reported, not just whichever one happened to be compiled
-                # first. Checked after the loop, before linking.
-                compile_failures.append((src, result.stderr))
-                continue
-
-            # AGAST #1308: verify before clang, and before the .ll is cached.
-            # Caching invalid IR would make the bug survive a rebuild and then
-            # reappear on a machine whose clang is stricter, which is exactly
-            # the failure mode this is here to kill.
-            ir_error = verify_ir(ll_path, src)
-            if ir_error is not None:
-                compile_failures.append((src, ir_error))
-                continue
-
-            # AGAST #192: Pre-compile freshly emitted .ll to .o.  Without
-            # this, the link step pays for full IR lowering on every file
-            # (cached or not).  Caching the .o means subsequent rebuilds —
-            # even ones that re-invoke ritz1 — skip clang's slow path.
-            #
-            # AGAST #1731: there is deliberately no .bc / .ll fallback here.
-            # One used to swallow a failed (or capped) -O2 compile and link the
-            # .ll instead, which hid #1730 for a whole gate.
-            obj_error = compile_ll_to_obj(ll_path, obj_path, src)
-            if obj_error is not None:
-                obj_failures.append(obj_error)
-                continue
-            if cas_key is not None:
+                def build_fn(compile_src=compile_src, ll_path=ll_path, obj_path=obj_path):
+                    failure = compile_src()
+                    if failure is not None:
+                        raise cas.BuildFailed(failure)
+                    return {"ll": ll_path, "o": obj_path}
+                # AGAST #1911: single-flight. A hit, or a key another
+                # process is compiling right now, is copied; only a caller
+                # that still misses under the key's lock compiles.
                 ident = cas.module_identity(src)
-                store.put(cas_key, "ll", ll_path)
-                store.put(cas_key, "o", obj_path, identity=ident)
-                store.put_meta(cas_key, {"module": ident, "compiler": compiler})
+                try:
+                    stored, built = store.get_or_build(
+                        cas_key, "o", build_fn, identity=ident,
+                        meta={"module": ident, "compiler": compiler})
+                    failure = None
+                    if not built:
+                        shutil_mod.copyfile(stored, obj_path)
+                except cas.BuildFailed as e:
+                    failure = e.args[0]
+
+            if failure is not None:
+                kind, msg = failure
+                if kind == "no-compiler":
+                    return None
+                if kind == "obj":
+                    obj_failures.append(msg)
+                else:
+                    # AGAST #1286: collect and keep going so every broken file is
+                    # reported, not just whichever one happened to be compiled
+                    # first. Checked after the loop, before linking.
+                    compile_failures.append((src, msg))
+                continue
             link_files.append(obj_path)
 
         # AGAST #1286: every source has now been attempted. If any failed,
