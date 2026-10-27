@@ -7,13 +7,15 @@
 #   "summary": { "total": N, "passed": N, "failed": N, ... },
 #   "tests": [
 #     { "name": "test_foo", "status": "pass", "duration_ms": N },
+#     { "name": "test_bar", "status": "fail", "duration_ms": N,
+#       "exit_code": N, "output": "captured stdout+stderr" },
 #     ...
 #   ]
 # }
 
 import ritzlib.io
 import ritzlib.str
-import ritzlib.gvec
+import ritzlib.memory
 import ritzlib.sys
 import ritzlib.strview
 
@@ -44,76 +46,97 @@ struct JsonTestResult
     duration_ms: i64
     exit_code: i32
     signal: i32
+    output: StrView      # captured stdout+stderr of a test that did not pass
 
-# Global array for collecting results
-var g_json_results: [1024]JsonTestResult
+# Results, grown as needed: there is no cap on the number of tests.
+var g_json_results: *JsonTestResult = 0 as *JsonTestResult
 var g_json_result_count: i32 = 0
+var g_json_result_cap: i32 = 0
 
 # ============================================================================
 # Result Collection
 # ============================================================================
 
-pub fn json_record_result(name: @StrView, status: @StrView, duration_ms: i64, exit_code: i32, signal: i32)
-    if g_json_result_count >= 1024
-        return
-    g_json_results[g_json_result_count].name = *name
-    g_json_results[g_json_result_count].status = *status
-    g_json_results[g_json_result_count].duration_ms = duration_ms
-    g_json_results[g_json_result_count].exit_code = exit_code
-    g_json_results[g_json_result_count].signal = signal
+pub fn json_record_result(name: @StrView, status: @StrView, duration_ms: i64, exit_code: i32, signal: i32, output: @StrView)
+    if g_json_result_count == g_json_result_cap
+        var cap: i32 = g_json_result_cap * 2
+        if cap == 0
+            cap = 64
+        let grown: *u8 = realloc(g_json_results as *u8, (cap as i64) * sizeof(JsonTestResult))
+        if grown == null
+            eprints("ritzunit: out of memory recording results\n")
+            sys_exit(2)
+        g_json_results = grown as *JsonTestResult
+        g_json_result_cap = cap
+    let r: *JsonTestResult = @g_json_results[g_json_result_count]
+    r.name = *name
+    r.status = *status
+    r.duration_ms = duration_ms
+    r.exit_code = exit_code
+    r.signal = signal
+    r.output = *output
     g_json_result_count += 1
 
 pub fn json_record_pass(name: @StrView, duration_ms: i64)
     var st: StrView = status_pass()
-    json_record_result(name, @st, duration_ms, 0, 0)
+    var none: StrView = strview_empty()
+    json_record_result(name, @st, duration_ms, 0, 0, @none)
 
-pub fn json_record_fail(name: @StrView, duration_ms: i64, exit_code: i32)
+pub fn json_record_fail(name: @StrView, duration_ms: i64, exit_code: i32, output: @StrView)
     var st: StrView = status_fail()
-    json_record_result(name, @st, duration_ms, exit_code, 0)
+    json_record_result(name, @st, duration_ms, exit_code, 0, output)
 
-pub fn json_record_crash(name: @StrView, duration_ms: i64, signal: i32)
+pub fn json_record_crash(name: @StrView, duration_ms: i64, signal: i32, output: @StrView)
     var st: StrView = status_crash()
-    json_record_result(name, @st, duration_ms, 0, signal)
+    json_record_result(name, @st, duration_ms, 0, signal, output)
 
-pub fn json_record_timeout(name: @StrView, duration_ms: i64)
+pub fn json_record_timeout(name: @StrView, duration_ms: i64, output: @StrView)
     var st: StrView = status_timeout()
-    json_record_result(name, @st, duration_ms, 0, 0)
+    json_record_result(name, @st, duration_ms, 0, 0, output)
 
 # ============================================================================
 # JSON Output Helpers
 # ============================================================================
 
-# Print a single character
-fn json_print_char(c: u8)
-    var buf: [2]u8
-    buf[0] = c
-    buf[1] = 0
-    prints_cstr(@buf[0])
+fn hex_digit(d: u8) -> u8
+    if d < 10
+        return '0' + d
+    return 'a' + d - 10
 
-# Print a double-quote character
-fn print_quote()
-    json_print_char(34)  # ASCII for "
-
-# Print escaped JSON string from StrView (handles " and \ and newlines)
-fn print_json_string_sv(s: @StrView)
-    print_quote()
+# Print `s` as a JSON string literal. Every byte below 0x20 is escaped (JSON
+# forbids them raw), as are `"` and `\`. Unescaped runs are written with one
+# write each, not one write per byte.
+pub fn print_json_string_sv(s: @StrView)
+    prints("\"")
+    var run_start: i64 = 0
     for i in 0..s.len
         let c: u8 = strview_get(s, i)
-        if c == 34  # "
-            json_print_char(92)  # \
-            json_print_char(34)  # "
-        else if c == 92  # \
-            json_print_char(92)
-            json_print_char(92)
-        else if c == 10  # newline
-            json_print_char(92)
-            json_print_char(110)  # n
-        else if c == 9  # tab
-            json_print_char(92)
-            json_print_char(116)  # t
-        else
-            json_print_char(c)
-    print_quote()
+        if c < 32 || c == 34 || c == 92
+            if i > run_start
+                sys_write(1, s.ptr + run_start, i - run_start)
+            run_start = i + 1
+            if c == 34
+                prints("\\\"")
+            else if c == 92
+                prints("\\\\")
+            else if c == 10
+                prints("\\n")
+            else if c == 9
+                prints("\\t")
+            else if c == 13
+                prints("\\r")
+            else
+                var esc: [6]u8
+                esc[0] = 92
+                esc[1] = 'u'
+                esc[2] = '0'
+                esc[3] = '0'
+                esc[4] = hex_digit(c >> 4)
+                esc[5] = hex_digit(c & 15)
+                sys_write(1, @esc[0], 6)
+    if s.len > run_start
+        sys_write(1, s.ptr + run_start, s.len - run_start)
+    prints("\"")
 
 # ============================================================================
 # JSON Output
@@ -168,6 +191,9 @@ pub fn json_print_report(total: i32, passed: i32, failed: i32, crashed: i32, tim
         if r.signal != 0
             prints(", \"signal\": ")
             print_int(r.signal as i64)
+        if r.output.len != 0
+            prints(", \"output\": ")
+            print_json_string_sv(@r.output)
         prints("}}")
         if i < g_json_result_count - 1
             prints(",")

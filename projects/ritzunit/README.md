@@ -1,12 +1,12 @@
 # Ritzunit
 
-A modern unit testing framework for the Ritz programming language with ELF-based test discovery and fork isolation.
+The test runner of every Ritz test binary: compiler-emitted test discovery and fork isolation.
 
 **Part of the [Ritz Ecosystem](../ritz/docs/ECOSYSTEM.md)**
 
 ## Overview
 
-Ritzunit is the standard testing framework for Ritz projects. It discovers tests automatically at runtime by parsing the ELF symbol table of the compiled test binary - no test registration required. Tests marked with the `[[test]]` attribute are found and run without any boilerplate.
+Ritzunit is the `main` of every Ritz test binary (LANGUAGE_SPEC.md §17.1). The compiler, in test mode, emits a table of a test file's `[[test]]` functions; ritzunit runs each entry. No registration and no naming convention: `[[test]]` decides what is a test.
 
 Each test runs in a forked process for complete isolation: a crashing test cannot affect other tests or the runner. Ritzunit supports rich filtering with glob patterns and boolean expressions, and outputs results in human-readable, JSON, or JUnit XML formats for CI/CD integration.
 
@@ -14,7 +14,9 @@ The framework handles ASLR and PIE (position-independent executables) correctly 
 
 ## Features
 
-- Automatic test discovery via ELF symbol table parsing - no registration needed
+- Discovery from the compiler's `[[test]]` table - no registration, no `test_` naming rule
+- Each test's stdout/stderr captured; shown (and put in `--json`) only for tests that did not pass
+- Exit status 0 iff every selected test passed, else 1
 - Fork-based process isolation - crashes don't abort the test run
 - Glob pattern and boolean expression filtering
 - Attribute-based test tagging via naming conventions (`@slow`, `@ignore`, `@fast`)
@@ -28,11 +30,7 @@ The framework handles ASLR and PIE (position-independent executables) correctly 
 ## Installation
 
 ```bash
-# Build from source (run from the monorepo root; `rz` sets RITZ_PATH itself)
-./rz build ritzunit
-# Produces projects/ritzunit/build/debug/ritzunit
-
-# Run ritzunit's own tests (6 files, 27 assertions)
+# Run ritzunit's own tests
 ./rz test ritzunit
 
 # The library is available as a dependency in ritz.toml:
@@ -64,34 +62,20 @@ fn test_string_length() -> i32
 
 ### Running tests
 
-Most projects in this workspace run their tests through the workspace CLI, which
-compiles and executes each `test/test_*.ritz` for you:
-
 ```bash
 ./rz test <project>
 ```
 
-The `ritzunit` binary is the alternative path: it takes a *compiled test
-executable* and discovers `[[test]]` functions in its ELF symbol table. Substitute
-your own test binary for `<TESTS>` below — there is no `myproject-tests` in this
-repo; it is a placeholder:
-
-```bash
-TESTS=path/to/your-tests
-
-$TESTS                       # Run all tests
-$TESTS -v                    # Verbose output
-$TESTS -l                    # List tests without running
-$TESTS -f "test_add*"        # Filter by glob pattern
-$TESTS -f "add and not slow" # Boolean filter expressions
-$TESTS --json                # JSON output
-$TESTS --junit               # JUnit XML for CI
-```
+For each `test/*.ritz`, `ritz0 --test` builds one test binary: the file
+compiled in test mode (`ritz0 --test-table`), linked with `src/bin_main.ritz`
+and the runner as one object whose only global symbol is `main` (so the
+runner's names cannot collide with yours), and runs it once with `--json`.
+That logic lives in `projects/ritz/ritz0/test_runner.py` (`build_test_binary`).
+A test binary takes the options below.
 
 ### CLI Reference
 
-From `./projects/ritzunit/build/debug/ritzunit --help` (exit 0, verified
-2026-09-12):
+From a test binary's `--help`:
 
 ```
 Usage: ritzunit [OPTIONS]
@@ -121,7 +105,7 @@ Options:
 
 ## Status
 
-**Production** - Used by goliath, cryptosec, spire, spectree, squeeze, and other ecosystem projects. ELF self-discovery, fork isolation, filtering, and output formats are all working.
+Runs every `./rz test` of every package under ritz0. ritz1 does not emit the test table yet (tracked in AGAST).
 
 ## License
 

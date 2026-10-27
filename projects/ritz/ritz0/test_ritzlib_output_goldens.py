@@ -5,10 +5,9 @@ print/eprint interpolations.  Output must stay byte-identical, on the same fd,
 with the same exit status.  ritzlib/tests/test_{argspec,args,env}_output.ritz
 pin most of it under ritz0; this file covers the two things they can't:
 
-* ritzlib/testing.ritz defines its own `main` (calling the program's
-  `__init_tests`), so it cannot be linked into a `[[test]]` harness.  It is
-  built here as a package, one case per process via $TGOLD_CASE.  ritz0 only:
-  ritz1 cannot parse the module's `asm` block.
+* ritzlib/testing.ritz's assertion helpers exit the process on failure, so
+  each case is its own process, selected by $TGOLD_CASE.  (The module's test
+  runner and its `main` were deleted by AGAST #1868: ritzunit is the runner.)
 * ritzlib/args.ritz is compiled by ritz1 for every example that imports it, so
   its converted printers are also built with `--compiler ritz1` and both
   binaries must print the same pinned bytes.  The cases are the ones in
@@ -92,14 +91,7 @@ import ritzlib.strview
 import ritzlib.os.env
 import ritzlib.testing
 
-fn t_ok() -> i32
-    0
-
-fn t_bad() -> i32
-    1
-
-# ritzlib.testing's main calls this; the case comes from $TGOLD_CASE.
-fn __init_tests()
+fn main() -> i32
     let case = env_get_or("TGOLD_CASE", "0")
     let which: u8 = strview_get(@case, 0)
     if which == '1'
@@ -114,21 +106,12 @@ fn __init_tests()
         assert_not_null(null, "want ptr")
     else if which == '6'
         assert_null(c"x", "want null")
-    else if which == '8'
-        register_test("t_ok", t_ok as *u8)
-        register_test("t_bad", t_bad as *u8)
-        register_test("t_ok2", t_ok as *u8)
-    else if which == '9'
-        var i: i32 = 0
-        while i <= 1024
-            register_test("t", t_ok as *u8)
-            i += 1
-    return
+    0
 """
 
 # case -> (exit status, stdout, stderr)
 TESTING_CASES = {
-    "0": (0, b"No tests registered.\n", b""),
+    "0": (0, b"", b""),
     "1": (1, b"", b"Assertion failed: boom\n"),
     "2": (1, b"", b"Assertion failed: i64 differ\n  expected: -7\n  actual:   5\n"),
     # assert_eq_i64 reports both sides truncated to i32: 2^32 + 1 shows as 1,
@@ -137,13 +120,6 @@ TESTING_CASES = {
     "4": (1, b"", b"Assertion failed: i32 differ\n  expected: 4\n  actual:   -3\n"),
     "5": (1, b"", b"Assertion failed (null pointer): want ptr\n"),
     "6": (1, b"", b"Assertion failed (expected null): want null\n"),
-    "8": (
-        1,
-        b"Running 3 tests:\n  [OK] t_ok\n  [FAIL] t_bad\n  [OK] t_ok2\n"
-        b"\n2 passed, 1 failed\n",
-        b"",
-    ),
-    "9": (1, b"", b"Error: Too many tests registered\n"),
 }
 
 

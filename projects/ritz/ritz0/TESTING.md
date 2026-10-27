@@ -49,10 +49,9 @@ python test_runner.py test/test_level*.ritz -v
    - Enforces that `assert` only appears in `@test` functions
 
 5. **Test Runner** (`test_runner.py`)
-   - Discovers `@test` functions in source files
-   - Creates test harnesses (main functions that call tests)
-   - Compiles each test to machine code (LLVM IR → asm → binary)
-   - Executes binary and checks exit code (0 = pass, non-zero = fail)
+   - Builds one test binary per file (LANGUAGE_SPEC.md §17.1): the file
+     compiled with `--test-table`, linked with ritzunit as `main`
+   - Runs it once with `--json`; ritzunit forks a child per `[[test]]`
    - Reports results with optional verbose output
 
 ## Test Levels

@@ -1,9 +1,18 @@
 #!/usr/bin/env python3
 """
-Ritz Test Runner
+Ritz Test Runner: builds and runs one test binary per test file.
 
-Discovers and runs @test functions in .ritz files using proper separate compilation.
-Each test is compiled by appending a main() that calls the test function.
+A test binary (LANGUAGE_SPEC.md §17.1, AGAST #1868) is
+
+    the test file, compiled by `ritz0 --test-table`: its `[[test]]` table and
+        a `_start` that calls `main`
+  + ritzunit's `main` and runner, linked as ONE object whose only global
+        symbol is `main` (so no runner name can collide with the program's)
+  + the dependency objects of both.
+
+It is compiled and linked once, run once with `--json`, and ritzunit runs each
+test in its own forked child. This module turns the JSON report into
+`run_test_file`'s (passed, failed, failures) for `ritz0 --test`.
 """
 
 import sys
@@ -12,6 +21,7 @@ import signal
 import subprocess
 import tempfile
 import hashlib
+import json
 import os
 import shutil
 import threading
@@ -155,8 +165,8 @@ def parse_project_dependencies(project_root: Path) -> dict:
 #
 # Putting scratch under the system temp dir makes that cycle unconstructible
 # rather than merely unlikely: a directory outside the tree cannot be an
-# ancestor of anything inside it. `run_batch_tests` below already did this, so
-# the two remaining sites were the anomaly, not the convention.
+# ancestor of anything inside it. The (since deleted) batch runner already did
+# this, so the two remaining sites were the anomaly, not the convention.
 _SCRATCH_PREFIX = "ritz_test_"
 
 # Registry of live scratch dirs, so a signal handler has something to clean.
@@ -526,14 +536,14 @@ def _compile_harness(
     project_root: Optional[Path],
     dependencies: Optional[Dict[str, DependencyMapping]],
 ) -> Optional[str]:
-    """Compile a harness (a test file with a generated `main`) to LLVM IR.
+    """Compile a test file in test mode (`--test-table`) to LLVM IR.
 
-    Compiled *with* the runtime, since the harness supplies `main`. Returns an
+    Compiled *with* the runtime: its `_start` calls ritzunit's `main`. Returns an
     error message, or None on success.
     """
     import json
     ritz0_py = Path(__file__).parent / "ritz0.py"
-    compile_cmd = [sys.executable, str(ritz0_py), harness_path, "-o", harness_ll]
+    compile_cmd = [sys.executable, str(ritz0_py), harness_path, "-o", harness_ll, "--test-table"]
 
     # Pass dependencies to ritz0 for harness compilation (Issue #48)
     if dependencies:
@@ -554,8 +564,8 @@ def _compile_harness(
     return None
 
 
-def _link(ll_files: List[str], exe_path: str) -> Tuple[Optional[str], Optional[str]]:
-    """Link .ll files into an executable. Returns (exe_path, error)."""
+def _link(objects: List[str], exe_path: str) -> Tuple[Optional[str], Optional[str]]:
+    """Link objects / .ll files into an executable. Returns (exe_path, error)."""
     # -march=native enables host CPU features (AES-NI, AVX2, etc.).  -msha is
     # added unconditionally because cryptosec's sha256.ritz defines a
     # sha256_transform_ni function whose body emits SHA-NI intrinsics
@@ -565,573 +575,222 @@ def _link(ll_files: List[str], exe_path: str) -> Tuple[Optional[str], Optional[s
     # On a host without SHA-NI silicon the binary will SIGILL only if the
     # function is actually called — pure-soft callers are safe.  This mirrors
     # the flag set used by build.py's link path.
-    clang_cmd = ["clang"] + ll_files + ["-o", exe_path, "-nostdlib", "-no-pie", "-g", "-march=native", "-msha"]
+    clang_cmd = ["clang"] + objects + ["-o", exe_path, "-nostdlib", "-no-pie", "-g", "-march=native", "-msha"]
     result = subprocess.run(clang_cmd, capture_output=True, text=True)
     if result.returncode != 0:
         return None, f"clang failed: {result.stderr}"
     return exe_path, None
 
 
-# AGAST #1633: one harness per test FILE, not per test.
-#
-# Recompiling the whole test file once per [[test]] (only to change which test
-# `main` calls) made mausoleum's test_query.ritz -- 52 tests at ~25 s of ritz0
-# each -- take ~22 minutes. Instead the file is compiled once with a `main` that
-# picks a test from argc, linked once, and executed once per test. Each test
-# still runs in its own process under its own timeout, so crashes and hangs stay
-# attributed to the test that caused them.
-#
-# argc rather than parsing argv[1]: comparing an integer needs no pointer or
-# byte arithmetic in generated Ritz, so the dispatcher cannot itself be the
-# thing that fails to compile. Test i is selected by passing i + 1 arguments.
+# ---------------------------------------------------------------------------
+# ritzunit: the `main` of every test binary (AGAST #1868)
+# ---------------------------------------------------------------------------
 
-_DISPATCH_ARGC = "__ritz_test_argc"
+RITZUNIT_ROOT = Path(__file__).resolve().parent.parent.parent / "ritzunit"
+RITZUNIT_MAIN = RITZUNIT_ROOT / "src" / "bin_main.ritz"
+
+# Per-test timeout handed to ritzunit (-t). The Python harness this replaced
+# allowed each test 10 s.
+TEST_TIMEOUT_MS = 10000
 
 
-def dispatch_args(index: int) -> List[str]:
-    """Extra argv entries that select test `index` in the dispatch harness."""
-    return ["t"] * (index + 1)
+def runner_args() -> List[str]:
+    """ritzunit's flags: the JSON report is what passes or fails the file."""
+    return ["--json", "--no-color", "-t", str(TEST_TIMEOUT_MS)]
 
 
-def generate_dispatch_main(test_names: List[str]) -> str:
-    """Generate a `main` that runs the test selected by argc.
+def _ritzunit_import_context():
+    """(dependencies, source_roots) that ritzunit's own sources resolve under."""
+    deps = parse_project_dependencies(RITZUNIT_ROOT)
+    roots = project_source_roots(RITZUNIT_ROOT) + [str(Path(__file__).resolve().parent.parent)]
+    return deps, roots
 
-    Each branch is `return <test>()`, i.e. the test's result becomes the exit
-    code -- the same as the old per-test harness, whose `fn main() -> i32` had
-    the test call as its tail. That covers `-> i32`, `-> i64` (narrowed, as
-    before) and unit tests (ritz0 lowers a missing return type to i32).
+
+def _as_object(path: str, tmpdir: str) -> Tuple[Optional[str], Optional[str]]:
+    """An object file for `path`: itself if already one, else `clang -c` of the .ll."""
+    if path.endswith(".o"):
+        return path, None
+    obj = os.path.join(tmpdir, Path(path).stem + ".rzu.o")
+    error = _build_module().compile_ll_to_obj(Path(path), Path(obj), Path(path))
+    return (None, error) if error else (obj, None)
+
+
+def build_runner_objects(tmpdir: str, ll_cache: dict,
+                         test_modules=()) -> Tuple[List[str], Optional[str]]:
+    """Objects that make ritzunit the test binary's `main`.
+
+    Every module the runner needs and the test does not (`test_modules`:
+    the test's own dependency sources) is combined with `ld -r`, and every
+    symbol but `main` is made local (`objcopy -G main`). Dependency objects
+    are compiled with external linkage throughout, and the runner brings
+    names the program may define too: its own `run_tests`, `parse_args`,
+    `json_record_pass`, `g_verbose` (spire, http), and the ritzlib modules
+    only it imports (ritzlib.string's `string_contains`; mausoleum defines
+    one). Localized, none of them can clash with the program.
+
+    A module the test imports as well stays an ordinary global object, linked
+    once and shared: `ll_cache` is shared with the test's dependencies, so it
+    is not compiled twice either.
+
+    Returns (objects, error).
     """
-    lines = [
-        "",
-        "",
-        f"fn main({_DISPATCH_ARGC}: i32, __ritz_test_argv: **u8, __ritz_test_envp: **u8) -> i32",
-    ]
-    for i, name in enumerate(test_names):
-        lines.append(f"    if {_DISPATCH_ARGC} == {i + 2}")
-        lines.append(f"        return {name}()")
-    # No test selected: a harness bug, never a pass.
-    lines.append("    127")
-    lines.append("")
-    return "\n".join(lines)
+    deps, roots = _ritzunit_import_context()
+    try:
+        sources = collect_all_source_files(
+            str(RITZUNIT_MAIN), project_root=str(RITZUNIT_ROOT),
+            dependencies=deps, source_roots=roots)
+    except Exception as e:  # noqa: BLE001 -- reported as the file's failure
+        return [], f"ritzunit import resolution failed: {e}"
+    compiled, error = compile_dependencies(
+        [Path(f) for f in sources], tmpdir, ll_cache,
+        dependencies=deps, project_root=RITZUNIT_ROOT)
+    if error:
+        return [], f"ritzunit: {error}"
+
+    shared_with_test = {Path(m).resolve() for m in test_modules}
+    own, shared = [], []
+    for src, out in zip(sources, compiled):
+        if Path(src).resolve() not in shared_with_test:
+            obj, error = _as_object(out, tmpdir)
+            if error:
+                return [], f"ritzunit: {error}"
+            own.append(obj)
+        else:
+            shared.append(out)
+
+    runner = os.path.join(tmpdir, "ritzunit_runner.o")
+    for cmd in (["ld", "-r", "-o", runner, *own],
+                ["objcopy", "--keep-global-symbol=main", runner]):
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            return [], f"ritzunit: {cmd[0]} failed: {result.stderr}"
+    return shared + [runner], None
 
 
-def compile_test_dispatcher(
-    source_path: str,
-    tests: List[Tuple[str, rast.FnDef]],
-    tmpdir: str,
-    dep_ll_files: List[str],
-    project_root: Optional[Path] = None,
-    dependencies: Optional[Dict[str, DependencyMapping]] = None,
-) -> Tuple[Optional[str], Optional[str]]:
-    """Compile and link ONE executable that can run any test in the file.
+def build_test_binary(source_path: str, tmpdir: str) -> Tuple[Optional[str], Optional[str]]:
+    """Compile and link `source_path`'s test binary in `tmpdir`.
 
-    Run it with `dispatch_args(i)` to execute `tests[i]`.
-
-    Returns:
-        (exe_path, error_message) - exe_path is None on failure
+    Returns (exe_path, error).
     """
-    source_no_main = strip_main_from_source(Path(source_path).read_text())
-    dispatch = generate_dispatch_main([name for name, _fn in tests])
+    project_root, dep_files, error, dependencies = setup_test_environment(source_path, tmpdir)
+    if error:
+        return None, error
+
+    ll_cache = {}
+    dep_objects, error = compile_dependencies(
+        dep_files or [], tmpdir, ll_cache,
+        dependencies=dependencies, project_root=project_root)
+    if error:
+        return None, error
+
+    runner_objects, error = build_runner_objects(tmpdir, ll_cache, dep_files or [])
+    if error:
+        return None, error
+
+    # The file's own `main` is dropped by test mode; it is stripped here too
+    # because it is not part of what is being tested and need not compile.
     harness_path = os.path.join(tmpdir, "test_main.ritz")
-    Path(harness_path).write_text(source_no_main + dispatch)
-
-    harness_ll = os.path.join(tmpdir, "harness_dispatch.ll")
+    Path(harness_path).write_text(strip_main_from_source(Path(source_path).read_text()))
+    harness_ll = os.path.join(tmpdir, "test_main.ll")
     error = _compile_harness(harness_path, harness_ll, project_root, dependencies)
     if error:
         return None, error
-    return _link(list(dep_ll_files) + [harness_ll], os.path.join(tmpdir, "test"))
+
+    # A module both the test and ritzunit import is in both lists once.
+    objects = list(dict.fromkeys(dep_objects + runner_objects))
+    return _link(objects + [harness_ll], os.path.join(tmpdir, "test"))
 
 
-def compile_test(
-    source_path: str,
-    test_name: str,
-    tmpdir: str,
-    lib_files: List[str] = None,
-    ll_cache: dict = None,
-    dep_ll_files: List[str] = None,
-    project_root: Path = None,
-    dependencies: Dict[str, DependencyMapping] = None
-) -> Tuple[Optional[str], Optional[str]]:
-    """Compile a single test to a binary using proper separate compilation.
+def _indent(text: str) -> str:
+    return text.rstrip("\n").replace("\n", "\n      ")
 
-    Args:
-        source_path: Path to the test file
-        test_name: Name of the test function to run
-        tmpdir: Temporary directory for build artifacts
-        lib_files: Optional additional library files
-        ll_cache: Optional cache of compiled .ll files (for reuse across tests)
-        dep_ll_files: Pre-compiled dependency .ll files (if already compiled)
-        project_root: Project root (if already determined)
-        dependencies: ritz.toml dependency mappings for import resolution
 
-    Returns:
-        (exe_path, error_message) - exe_path is None on failure
+def failures_from_report(report: dict) -> List[str]:
+    """One message per test that did not pass, as `ritz0 --test` prints them."""
+    failures = []
+    for t in report.get("tests", []):
+        status = t.get("status")
+        if status == "pass":
+            continue
+        name = t.get("name", "?")
+        if status == "crash":
+            msg = f"{name}: crashed with signal {t.get('signal', '?')}"
+        elif status == "timeout":
+            msg = f"{name}: timeout"
+        else:
+            msg = f"{name}: exited with code {t.get('exit_code', '?')}"
+        output = t.get("output", "")
+        if output.strip():
+            msg += "\n      " + _indent(output)
+        failures.append(msg)
+    return failures
+
+
+def run_test_binary(exe_path: str, cwd: Optional[str] = None) -> Tuple[int, int, List[str]]:
+    """Run a test binary once; return (passed, failed, failure_messages).
+
+    ritzunit exits 0 when every test passed and 1 otherwise; anything else, or
+    a report that does not parse, means the runner itself failed.
     """
-    ritz0_dir = Path(__file__).parent
-    ritz0_py = ritz0_dir / "ritz0.py"
-
-    # Read original source and strip any existing main
-    original_source = Path(source_path).read_text()
-    source_no_main = strip_main_from_source(original_source)
-
-    # Create test harness source by appending main that calls the test
-    harness_source = source_no_main + f"""
-
-fn main() -> i32
-  {test_name}()
-"""
-
-    # Write the modified test source to temp
-    test_file_path = os.path.join(tmpdir, "test_main.ritz")
-    Path(test_file_path).write_text(harness_source)
-
-    # If we have pre-compiled dependencies, just compile the harness
-    if dep_ll_files is not None:
-        ll_files = list(dep_ll_files)
-        harness_hash = hashlib.md5(test_name.encode()).hexdigest()[:8]
-        harness_ll = os.path.join(tmpdir, f"harness_{harness_hash}.ll")
-        error = _compile_harness(test_file_path, harness_ll, project_root, dependencies)
-        if error:
-            return None, error
-        ll_files.append(harness_ll)
-    else:
-        # Legacy path: compile everything from scratch
-        # Copy helper files to temp directory
-        test_dir = Path(source_path).parent
-        for lib_file in test_dir.glob("test_import_*.ritz"):
-            shutil.copy(lib_file, tmpdir)
-        helpers_file = test_dir / "helpers.ritz"
-        if helpers_file.exists():
-            shutil.copy(helpers_file, tmpdir)
-
-        # Find project root if not provided
-        if project_root is None:
-            search_dir = Path(source_path).parent.resolve()
-            while search_dir != search_dir.parent:
-                if (search_dir / "ritz.toml").exists():
-                    project_root = search_dir
-                    break
-                search_dir = search_dir.parent
-
-        if project_root:
-            for src_dir in ["lib", "src", "ritzlib"]:
-                src_path = project_root / src_dir
-                if src_path.exists():
-                    real_path = src_path.resolve()
-                    link_path = Path(tmpdir) / src_dir
-                    if not link_path.exists():
-                        os.symlink(real_path, link_path)
-
-        # Parse dependencies from ritz.toml if not provided
-        if dependencies is None and project_root:
-            dependencies = parse_project_dependencies(project_root)
-
-        try:
-            source_files = collect_all_source_files(
-                test_file_path,
-                project_root=str(project_root) if project_root else None,
-                dependencies=dependencies if dependencies else None
-            )
-        except Exception as e:
-            return None, f"Import resolution failed: {e}"
-
-        if lib_files:
-            for lib in lib_files:
-                lib_path = Path(lib).resolve()
-                if lib_path not in [Path(f).resolve() for f in source_files]:
-                    source_files.insert(-1, lib_path)
-
-        ll_files = []
-        if ll_cache is None:
-            ll_cache = {}
-
-        for i, src in enumerate(source_files):
-            is_main = (i == len(source_files) - 1)
-            src_key = str(Path(src).resolve())
-
-            if not is_main and src_key in ll_cache:
-                ll_files.append(ll_cache[src_key])
-                continue
-
-            path_hash = hashlib.md5(src_key.encode()).hexdigest()[:8]
-            src_name = f"{Path(src).stem}_{path_hash}"
-            ll_path = os.path.join(tmpdir, f"{src_name}.ll")
-
-            compile_cmd = [sys.executable, str(ritz0_py), str(src), "-o", ll_path]
-            if not is_main:
-                compile_cmd.append("--no-runtime")
-
-            result = subprocess.run(compile_cmd, capture_output=True, text=True)
-            if result.returncode != 0:
-                return None, f"ritz0 failed for {Path(src).name}: {result.stderr}"
-
-            if not is_main:
-                ll_cache[src_key] = ll_path
-            ll_files.append(ll_path)
-
-    return _link(ll_files, os.path.join(tmpdir, "test"))
+    timeout = int(os.environ.get("RITZ_TEST_TIMEOUT", "180"))
+    try:
+        result = subprocess.run([exe_path] + runner_args(), capture_output=True,
+                                timeout=timeout, cwd=cwd)
+    except subprocess.TimeoutExpired:
+        return 0, 1, [f"test binary timed out after {timeout}s"]
+    stderr = result.stderr.decode("utf-8", errors="replace").strip()
+    try:
+        report = json.loads(result.stdout.decode("utf-8", errors="replace"))
+        summary = report["summary"]
+    except (ValueError, KeyError, TypeError):
+        report = None
+    if report is None or result.returncode not in (0, 1):
+        msg = f"test runner exited with code {result.returncode} without a report"
+        if stderr:
+            msg += "\n      " + _indent(stderr)
+        return 0, 1, [msg]
+    passed = summary["passed"]
+    failed = summary["failed"] + summary["crashed"] + summary["timeout"]
+    failures = failures_from_report(report)
+    if (failed > 0) != (result.returncode == 1):
+        failures.append(f"test runner exit code {result.returncode} disagrees with "
+                        f"its report ({failed} failed)")
+        failed = max(failed, 1)
+    return passed, failed, failures
 
 
-def run_test_file(source_path: str, verbose: bool = False, lib_files: List[str] = None) -> Tuple[int, int, List[str]]:
-    """
-    Run all tests in a file using proper separate compilation.
+def run_test_file(source_path: str, verbose: bool = False) -> Tuple[int, int, List[str]]:
+    """Build `source_path`'s test binary and run it.
 
-    Dependencies are compiled ONCE, and the test file itself is compiled and
-    linked ONCE into a dispatch harness (AGAST #1633); each test then runs in
-    its own process, selected by argc.
-
-    Returns (passed, failed, failure_messages).
+    Returns (passed, failed, failure_messages). A file whose binary cannot be
+    built fails every one of its tests with the build error.
     """
     tests = find_test_functions(source_path)
     if not tests:
         return (0, 0, [])
 
-    passed = 0
-    failed = 0
-    failures = []
-
-    # Create a SINGLE temp directory for all tests in this file
-    # This allows us to cache compiled .ll files across tests
     tmpdir = None
     try:
         tmpdir = make_scratch_dir()
-
-        # Step 1: Set up environment and discover dependencies ONCE
         if verbose:
-            print(f"  Compiling dependencies for {len(tests)} tests...", flush=True)
-
-        project_root, dep_files, error, dependencies = setup_test_environment(source_path, tmpdir)
+            print(f"  Building test binary for {len(tests)} tests...", flush=True)
+        exe_path, error = build_test_binary(source_path, tmpdir)
         if error:
-            # Fall back to per-test compilation on setup error
-            if verbose:
-                print(f"  Warning: {error}, falling back to per-test compilation")
-            cleanup_scratch_dir(tmpdir)
-            return _run_test_file_legacy(source_path, verbose, lib_files)
-
-        # Step 2: Compile all dependencies ONCE
-        ll_cache = {}
-        dep_ll_files, error = compile_dependencies(
-            dep_files or [], tmpdir, ll_cache,
-            dependencies=dependencies,
-            project_root=project_root
-        )
-        if error:
-            if verbose:
-                print(f"  Warning: {error}, falling back to per-test compilation")
-            cleanup_scratch_dir(tmpdir)
-            return _run_test_file_legacy(source_path, verbose, lib_files)
-
-        # Step 3: Compile and link the test file ONCE (AGAST #1633)
-        exe_path, compile_error = compile_test_dispatcher(
-            source_path,
-            tests,
-            tmpdir,
-            dep_ll_files,
-            project_root=project_root,
-            dependencies=dependencies,  # Issue #48: import resolution
-        )
-
-        # Step 4: Run each test in its own process
-        for index, (test_name, test_fn) in enumerate(tests):
-            if verbose:
-                print(f"  Running {test_name}...", end=" ", flush=True)
-
-            try:
-                if compile_error:
-                    failed += 1
-                    failures.append(f"{test_name}: {compile_error}")
-                    if verbose:
-                        print("FAIL (compile)")
-                    continue
-
-                # Run the test
-                result = subprocess.run(
-                    [exe_path] + dispatch_args(index), capture_output=True, timeout=10
-                )
-                if result.returncode == 0:
-                    passed += 1
-                    if verbose:
-                        print("OK")
-                else:
-                    failed += 1
-                    # Surface the assert diagnostic (written to stderr by
-                    # _emit_assert) in the failure message — without this
-                    # you only see "exit 1" with no clue what failed.
-                    msg = f"{test_name}: exited with code {result.returncode}"
-                    err = result.stderr.decode("utf-8", errors="replace").strip()
-                    if err:
-                        msg += f"\n      {err.replace(chr(10), chr(10) + '      ')}"
-                    failures.append(msg)
-                    if verbose:
-                        print(f"FAIL (exit {result.returncode})")
-
-            except subprocess.TimeoutExpired:
-                failed += 1
-                failures.append(f"{test_name}: timeout")
-                if verbose:
-                    print("FAIL (timeout)")
-            except Exception as e:
-                failed += 1
-                failures.append(f"{test_name}: {e}")
-                if verbose:
-                    print(f"FAIL ({e})")
-
-    finally:
-        # Clean up temp directory with proper symlink handling
-        if tmpdir and os.path.exists(tmpdir):
-            cleanup_scratch_dir(tmpdir)
-
-    return (passed, failed, failures)
-
-
-def _run_test_file_legacy(source_path: str, verbose: bool = False, lib_files: List[str] = None) -> Tuple[int, int, List[str]]:
-    """Legacy per-test compilation (fallback when optimized path fails)."""
-    tests = find_test_functions(source_path)
-    if not tests:
-        return (0, 0, [])
-
-    passed = 0
-    failed = 0
-    failures = []
-
-    for test_name, test_fn in tests:
+            return 0, len(tests), [f"{name}: {error}" for name, _fn in tests]
+        passed, failed, failures = run_test_binary(exe_path)
         if verbose:
-            print(f"  Running {test_name}...", end=" ", flush=True)
-
-        tmpdir = None
-        try:
-            tmpdir = make_scratch_dir()
-            exe_path, error = compile_test(
-                source_path,
-                test_name,
-                tmpdir,
-                lib_files
-            )
-
-            if error:
-                failed += 1
-                failures.append(f"{test_name}: {error}")
-                if verbose:
-                    print("FAIL (compile)")
-                continue
-
-            result = subprocess.run([exe_path], capture_output=True, timeout=10)
-            if result.returncode == 0:
-                passed += 1
-                if verbose:
-                    print("OK")
-            else:
-                failed += 1
-                msg = f"{test_name}: exited with code {result.returncode}"
-                err = result.stderr.decode("utf-8", errors="replace").strip()
-                if err:
-                    msg += f"\n      {err.replace(chr(10), chr(10) + '      ')}"
-                failures.append(msg)
-                if verbose:
-                    print(f"FAIL (exit {result.returncode})")
-
-        except subprocess.TimeoutExpired:
-            failed += 1
-            failures.append(f"{test_name}: timeout")
-            if verbose:
-                print("FAIL (timeout)")
-        except Exception as e:
-            failed += 1
-            failures.append(f"{test_name}: {e}")
-            if verbose:
-                print(f"FAIL ({e})")
-        finally:
-            if tmpdir and os.path.exists(tmpdir):
-                cleanup_scratch_dir(tmpdir)
-
-    return (passed, failed, failures)
-
-
-def run_batch_tests(
-    test_files: List[str],
-    verbose: bool = False,
-    project_root: str = None,
-    ritzunit_dir: str = None
-) -> int:
-    """Run all tests in batch mode using ritzunit's ELF-based test discovery.
-
-    This compiles all dependencies ONCE and links all test files into a single
-    binary with ritzunit's runner. Much faster than per-test compilation.
-
-    Args:
-        test_files: List of test file paths
-        verbose: Show verbose output
-        project_root: Project root for import resolution
-        ritzunit_dir: Path to ritzunit project (for runner.ritz)
-
-    Returns:
-        Exit code (0 = all passed)
-    """
-    if not test_files:
-        print("No test files specified")
-        return 1
-
-    ritz0_dir = Path(__file__).parent
-    ritz0_py = ritz0_dir / "ritz0.py"
-    list_deps_py = ritz0_dir / "list_deps.py"
-
-    # Find ritzunit if not specified
-    if ritzunit_dir is None:
-        # Look relative to ritz0 directory
-        # ritz0 is at: projects/ritz/ritz0
-        # ritzunit is at: projects/ritzunit
-        # So: ritz0_dir.parent = projects/ritz, .parent = projects, /ritzunit
-        ritzunit_dir = ritz0_dir.parent.parent / "ritzunit"
-        if not ritzunit_dir.exists():
-            # Try RITZ_PATH
-            ritz_path = os.environ.get("RITZ_PATH")
-            if ritz_path:
-                ritzunit_dir = Path(ritz_path) / "ritzunit"
-
-    if not ritzunit_dir or not ritzunit_dir.exists():
-        print(f"Error: ritzunit not found. Set RITZ_PATH or ensure projects/ritzunit exists.", file=sys.stderr)
-        return 1
-
-    runner_path = ritzunit_dir / "src" / "runner.ritz"
-    if not runner_path.exists():
-        print(f"Error: ritzunit runner not found at {runner_path}", file=sys.stderr)
-        return 1
-
-    # Find project root from first test file
-    if project_root is None:
-        test_path = Path(test_files[0]).resolve()
-        search_dir = test_path.parent
-        while search_dir != search_dir.parent:
-            if (search_dir / "ritz.toml").exists():
-                project_root = str(search_dir)
-                break
-            search_dir = search_dir.parent
-
-    tmpdir = None
-    try:
-        tmpdir = tempfile.mkdtemp(prefix="ritz_batch_test_")
-
-        # Step 1: Collect all dependencies from the runner (includes ritzlib, reporter, etc.)
-        if verbose:
-            print("Collecting runner dependencies...")
-
-        result = subprocess.run(
-            [sys.executable, str(list_deps_py), str(runner_path),
-             "--project-root", str(ritzunit_dir)],
-            capture_output=True, text=True
-        )
-        if result.returncode != 0:
-            print(f"Error collecting runner dependencies: {result.stderr}", file=sys.stderr)
-            return 1
-
-        runner_deps = [Path(f.strip()) for f in result.stdout.strip().split('\n') if f.strip()]
-
-        # Step 2: Collect all source files from test files (excluding duplicates)
-        all_sources = set()
-        for tf in test_files:
-            result = subprocess.run(
-                [sys.executable, str(list_deps_py), str(tf),
-                 "--project-root", project_root or str(Path(tf).parent)],
-                capture_output=True, text=True
-            )
-            if result.returncode != 0:
-                print(f"Error collecting deps for {tf}: {result.stderr}", file=sys.stderr)
-                return 1
-
-            for f in result.stdout.strip().split('\n'):
-                if f.strip():
-                    all_sources.add(Path(f.strip()).resolve())
-
-        # Add runner dependencies
-        for dep in runner_deps:
-            all_sources.add(dep.resolve())
-
-        # Add test files themselves
-        for tf in test_files:
-            all_sources.add(Path(tf).resolve())
-
-        # Convert to list and sort (runner.ritz should be last - it has main())
-        source_list = sorted(all_sources, key=lambda p: (p == runner_path.resolve(), str(p)))
-
-        if verbose:
-            print(f"Compiling {len(source_list)} source files...")
-
-        # Step 3: Compile each source file ONCE
-        ll_files = []
-        compiled = {}  # Track by resolved path to avoid duplicates
-
-        for src in source_list:
-            src_resolved = src.resolve()
-            if str(src_resolved) in compiled:
-                ll_files.append(compiled[str(src_resolved)])
-                continue
-
-            is_runner = (src_resolved == runner_path.resolve())
-
-            # Use path hash for unique names
-            path_hash = hashlib.md5(str(src_resolved).encode()).hexdigest()[:8]
-            src_name = f"{src.stem}_{path_hash}"
-            ll_path = os.path.join(tmpdir, f"{src_name}.ll")
-
-            # All files compiled with --no-runtime except runner (which has main)
-            compile_cmd = [sys.executable, str(ritz0_py), str(src), "-o", ll_path]
-            if not is_runner:
-                compile_cmd.append("--no-runtime")
-
-            result = subprocess.run(compile_cmd, capture_output=True, text=True)
-            if result.returncode != 0:
-                print(f"Error compiling {src.name}: {result.stderr}", file=sys.stderr)
-                return 1
-
-            ll_files.append(ll_path)
-            compiled[str(src_resolved)] = ll_path
-
-        # Step 4: Link everything with clang
-        if verbose:
-            print(f"Linking {len(ll_files)} object files...")
-
-        exe_path = os.path.join(tmpdir, "test_runner")
-        # See note above clang invocation in the per-file path: -msha is
-        # required even for callers that never invoke SHA-NI, because
-        # cryptosec/sha256.ritz defines sha256_transform_ni() unconditionally.
-        clang_cmd = ["clang"] + ll_files + ["-o", exe_path, "-nostdlib", "-no-pie", "-g", "-march=native", "-msha"]
-        result = subprocess.run(clang_cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            print(f"Error linking: {result.stderr}", file=sys.stderr)
-            return 1
-
-        # Step 5: Run the test binary
-        if verbose:
-            print(f"Running tests...")
-
-        run_cmd = [exe_path]
-        if verbose:
-            run_cmd.append("-v")
-
-        result = subprocess.run(run_cmd, capture_output=False)
-        return result.returncode
-
-    except Exception as e:
-        print(f"Error in batch test: {e}", file=sys.stderr)
-        import traceback
-        traceback.print_exc()
-        return 1
+            for f in failures:
+                print(f"  FAIL {f}")
+        return passed, failed, failures
     finally:
         if tmpdir and os.path.exists(tmpdir):
-            cleanup_tmpdir_with_symlinks(tmpdir)
+            cleanup_scratch_dir(tmpdir)
 
 
 def main():
     parser = argparse.ArgumentParser(description='Ritz Test Runner')
     parser.add_argument('files', nargs='+', help='Test files to run')
     parser.add_argument('-v', '--verbose', action='store_true', help='Verbose output')
-    parser.add_argument('-l', '--lib', action='append', default=[], help='Library files to include (can be specified multiple times)')
-    parser.add_argument('--batch', action='store_true',
-                        help='Use batch mode: compile once, run all tests via ritzunit (much faster)')
-    parser.add_argument('--project-root', help='Project root for import resolution')
-    parser.add_argument('--legacy', action='store_true',
-                        help='Use legacy per-test compilation (for benchmarking)')
-
     args = parser.parse_args()
 
     # AGAST #1392: turn SIGTERM/SIGINT into an unwind so the `finally` blocks
@@ -1139,15 +798,6 @@ def main():
     # usage error still behave like an ordinary CLI.
     install_signal_handlers()
 
-    # Use batch mode if requested
-    if args.batch:
-        sys.exit(run_batch_tests(
-            args.files,
-            verbose=args.verbose,
-            project_root=args.project_root
-        ))
-
-    # Optimized per-test mode with dependency caching (default)
     total_passed = 0
     total_failed = 0
     all_failures = []
@@ -1155,12 +805,8 @@ def main():
     for file_path in args.files:
         if args.verbose:
             print(f"\n{file_path}:")
-
         try:
-            if args.legacy:
-                passed, failed, failures = _run_test_file_legacy(file_path, args.verbose, args.lib)
-            else:
-                passed, failed, failures = run_test_file(file_path, args.verbose, args.lib)
+            passed, failed, failures = run_test_file(file_path, args.verbose)
             total_passed += passed
             total_failed += failed
             all_failures.extend(failures)
@@ -1169,7 +815,6 @@ def main():
             total_failed += 1
             all_failures.append(f"{file_path}: parse error")
 
-    # Summary
     print(f"\n{total_passed} passed, {total_failed} failed")
 
     if all_failures:

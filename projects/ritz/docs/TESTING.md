@@ -21,32 +21,26 @@ afternoon to find.
 
 ### Test driver
 
-- **Today**: `python3 build.py test <pkg>` → `python3 ritz0 --test test/*.ritz`
-  + `bash test.sh` (whichever exists). Each `[[test]]` function is compiled
-  into its own binary and run as a subprocess; exit 0 = pass, anything else
-  = fail.
-- **Tomorrow** (planned): `build.py test` will invoke the native `ritzunit`
-  binary instead of `ritz0 --test`. ritzunit benchmarks ~90× faster and
-  adds fork isolation (so SIGSEGV in one test doesn't kill the runner).
-  Today ritzunit is `test_only=true` and doesn't yet produce a binary —
-  see `TODO`.
+`python3 build.py test <pkg>` runs `ritz0 --test` on each `test/*.ritz` (and
+`bash test.sh` if present). Each file becomes one test binary: the file
+compiled in test mode, linked with ritzunit as `main` (LANGUAGE_SPEC.md
+§17.1). ritzunit forks a child per `[[test]]` function, so a SIGSEGV in one
+test does not stop the others. Exit 0 = pass, anything else = fail.
 
 ### ritzunit
 
-Self-tests fully green: **27/27 passing** (as of `186e339`). Lives at
-`projects/ritzunit/`. The intentional-failure demo (SIGSEGV / assert /
-infinite loop tests for fork isolation) lives at
-`projects/ritzunit/examples/isolation_demo.ritz` — moved out of `test/`
-because under `ritz0 --test` (no fork isolation) the intentional failures
-look like real failures.
+Lives at `projects/ritzunit/`; `./rz test ritzunit` runs its own tests. The
+intentional-failure demo (SIGSEGV / assert / infinite loop tests) lives at
+`projects/ritzunit/examples/isolation_demo.ritz`, outside `test/`, because
+its failures are deliberate.
 
 ---
 
 ## The `[[test]]` annotation
 
 A function-level annotation directly above the `fn` declaration. The
-parser recognises it; the test runner compiles each annotated function
-into a standalone binary and executes it.
+compiler lists each annotated function in the file's test table, and ritzunit
+runs each one in its own forked process (LANGUAGE_SPEC.md §17.1).
 
 ```ritz
 import ritzlib.sys

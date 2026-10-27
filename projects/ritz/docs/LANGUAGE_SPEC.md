@@ -1620,6 +1620,45 @@ fn test_addition() -> i32
     0
 ```
 
+**What is a test.** A function is a test if and only if it carries `[[test]]`.
+Its name does not matter: `[[test]] fn check_sum` is a test, and a helper
+`fn test_setup` without the attribute is not.
+
+**Signature.** A test takes no parameters and returns an integer type or
+nothing. Anything else is a compile error in test mode.
+
+**Result.** A test *passes* if it returns 0 (or returns nothing) and its
+process exits normally. It *fails* if it returns any other value, or exits
+with a non-zero status (a failed `assert` exits with status 1 after writing
+its diagnostic to stderr). It *crashes* if its process is killed by a signal,
+and *times out* if it runs past the runner's per-test limit. A non-zero result
+is never read as a pass: a result whose low 8 bits are zero (256) fails with
+status 1, and a result of a type other than `i32` fails as 1.
+
+**Test mode and the test table.** A test file is not compiled to a program of
+its own. In test mode (ritz0 `--test-table`) the compiler omits the file's
+`main`, if any, and emits a table of the file's tests, in source order:
+
+| Symbol | Type | Meaning |
+|---|---|---|
+| `__ritz_tests` | `[N]{ name: StrView, run: fn() -> i32 }` | one entry per `[[test]]` function |
+| `__ritz_tests_count` | `i64` | N |
+| `__ritz_test_table` | `fn(count: *i64) -> *{ StrView, fn() -> i32 }` | stores N, returns the first entry |
+
+`name` is the function's name, NUL-terminated (`len` excludes the NUL). `run`
+calls the test and returns its result as an `i32`. A runner uses the
+accessor, since Ritz has no extern data declarations. Only tests defined in the
+file being compiled are listed, not tests in modules it imports.
+
+**The test binary.** A test file's binary is the file in test mode, linked
+with the ritzunit runner as its `main`, plus the dependencies of both.
+ritzunit runs each entry in its own forked process and captures that
+process's stdout and stderr. The output of a test that did not pass is shown
+with its result, and `--json` includes it, so a test's output cannot corrupt
+the report. The binary exits 0 if every selected test passed and 1 otherwise.
+The runner's own symbols are linked privately, so a program may define names
+the runner also uses.
+
 ### 17.2 Target Attribute
 
 ```ritz

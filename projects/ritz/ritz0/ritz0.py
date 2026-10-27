@@ -24,7 +24,7 @@ from lexer import Lexer, LexerError
 # Use generated parser with adapter (comment out to use hand-written parser)
 # from parser_adapter import Parser, ParseError  # Generated parser
 from parser import Parser, ParseError  # Hand-written parser
-from emitter_llvmlite import emit as emit_llvmlite, get_test_functions, generate_test_main_source, EmitError
+from emitter_llvmlite import emit as emit_llvmlite, EmitError
 from import_resolver import ImportResolver, ImportError as RitzImportError
 import module_interface
 from name_resolver import resolve_names, NameError as RitzNameError
@@ -73,7 +73,7 @@ def compile_file(source_path: str, output_path: str, no_runtime: bool = False,
                   check_types: bool = False, dependencies: dict = None,
                   source_roots: list = None, project_root: str = None,
                   target: str = 'x86_64-unknown-linux-gnu',
-                  target_os: str = 'linux') -> bool:
+                  target_os: str = 'linux', test_mode: bool = False) -> bool:
     """Compile a single Ritz source file to LLVM IR.
 
     This is the only compilation mode. Each .ritz file compiles to one .ll file.
@@ -91,6 +91,9 @@ def compile_file(source_path: str, output_path: str, no_runtime: bool = False,
         project_root: Explicit project root for import resolution (source roots relative to this)
         target: Target triple (default: x86_64-unknown-linux-gnu)
         target_os: Target OS for conditional compilation (default: linux)
+        test_mode: Compile as the root of a test binary (LANGUAGE_SPEC §17.1):
+                   emit the `[[test]]` table and a `_start` that calls the
+                   ritzunit runner's `main`; drop the file's own `main`.
     """
     try:
         # Read source file
@@ -230,7 +233,11 @@ def compile_file(source_path: str, output_path: str, no_runtime: bool = False,
                            source_file=source_file, source_dir=source_dir,
                            main_source_path=source_abs_path,
                            target=target, target_os=target_os,
-                           fn_cache_data=fn_cache_data)
+                           test_mode=test_mode,
+                           # Per-fn IR reuse is keyed on the source alone, so
+                           # it cannot tell a test-mode compile (no `main`)
+                           # from a normal one: test mode always emits fresh.
+                           fn_cache_data=None if test_mode else fn_cache_data)
 
         if fn_cache_data is not None and isinstance(emit_result, tuple):
             ir, emitted_fn_ir = emit_result
@@ -293,48 +300,6 @@ def discover_tests(test_dir: str = "test") -> list:
     return [str(f) for f in test_files]
 
 
-def emit_test_main(source_paths: list, output_path: str) -> bool:
-    """Generate a test main that runs all @test functions from given source files.
-
-    This parses all source files, finds @test functions, and generates a main()
-    that uses ritzlib/testing.ritz to run them all.
-
-    Args:
-        source_paths: List of source file paths to scan for @test functions
-        output_path: Output path for the generated test main source
-    """
-    from ritz_ast import Module, Item
-    import ritz_ast as rast
-
-    all_test_fns = []
-
-    for source_path in source_paths:
-        try:
-            # Read and parse source file
-            source = Path(source_path).read_text()
-            lexer = Lexer(source, source_path)
-            tokens = lexer.tokenize()
-            parser = Parser(tokens)
-            module = parser.parse_module()
-
-            # Collect test functions
-            tests = get_test_functions(module)
-            all_test_fns.extend(tests)
-
-        except Exception as e:
-            print(f"Error scanning {source_path}: {e}", file=sys.stderr)
-            return False
-
-    if not all_test_fns:
-        print("Warning: No @test functions found", file=sys.stderr)
-
-    # Generate test main source
-    test_main_source = generate_test_main_source(all_test_fns)
-    Path(output_path).write_text(test_main_source)
-    print(f"Generated test main with {len(all_test_fns)} tests -> {output_path}")
-    return True
-
-
 def _log_launch() -> None:
     """Append one line per ritz0 process to $RITZ_TEST_RITZ0_LOG, if set.
 
@@ -361,10 +326,11 @@ def main():
     parser.add_argument('-o', '--output', help='Output file (.ll) - required for compile mode')
     parser.add_argument('--test', action='store_true', help='Run tests for specified file')
     parser.add_argument('--test-all', action='store_true', help='Discover and run all tests in test/ directory')
-    parser.add_argument('--emit-test-main', action='store_true',
-                        help='Generate test main source that runs all @test functions')
     parser.add_argument('-v', '--verbose', action='store_true', help='Verbose output')
     parser.add_argument('--no-runtime', action='store_true', help='Do not emit _start entry point (for libraries)')
+    parser.add_argument('--test-table', action='store_true',
+                        help='Compile as a test binary root: emit the [[test]] table for the '
+                             'ritzunit runner (LANGUAGE_SPEC §17.1)')
     parser.add_argument('--check-names', action='store_true',
                         help='Verify all referenced names are defined before IR emission')
     parser.add_argument('--no-check-ownership', action='store_true',
@@ -386,18 +352,6 @@ def main():
 
     args = parser.parse_args()
 
-    # Emit test main mode - generates a test harness source file
-    if args.emit_test_main:
-        if not args.source:
-            print("Error: --emit-test-main requires source file(s)", file=sys.stderr)
-            sys.exit(1)
-        if not args.output:
-            print("Error: --emit-test-main requires -o/--output", file=sys.stderr)
-            sys.exit(1)
-        success = emit_test_main(args.source, args.output)
-        sys.exit(0 if success else 1)
-
-    # Test mode
     if args.test or args.test_all:
         from test_runner import run_test_file, install_signal_handlers
 
@@ -494,7 +448,8 @@ def main():
                                source_roots=source_roots,
                                project_root=project_root,
                                target=args.target,
-                               target_os=args.target_os)
+                               target_os=args.target_os,
+                               test_mode=args.test_table)
         sys.exit(0 if success else 1)
 
 

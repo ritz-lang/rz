@@ -21,7 +21,7 @@ suite once the cycle was removed.
 The invariant these tests pin is deliberately narrow and structural: scratch
 lives under the system temp directory, so it *cannot* be an ancestor of anything
 it links to, and a cycle is unconstructible rather than merely unlikely. That is
-what `run_batch_tests` at test_runner.py:754 already did -- one code path in
+what test_runner.py's batch runner (deleted by AGAST #1868) already did -- one code path in
 this very file was always correct, which is the strongest available evidence
 that relocating the other two is safe.
 

@@ -2023,8 +2023,16 @@ class LLVMEmitter:
         # Seventh pass: emit all impl block method bodies
         self._emit_impl_methods()
 
-        # Emit _start entry point if we have main and runtime is enabled
-        if self.main_fn_def and not getattr(self, 'no_runtime', False):
+        # Test mode (LANGUAGE_SPEC §17.1): the `[[test]]` table that the
+        # ritzunit runner, linked in as `main`, iterates.
+        if getattr(self, 'test_mode', False):
+            self._emit_test_table(module)
+
+        # Emit _start entry point if we have main and runtime is enabled.
+        # In test mode `main` is the runner's `main(argc, argv)`, defined in
+        # another object, so _start is emitted without a local definition.
+        if (self.main_fn_def or getattr(self, 'test_mode', False)) \
+                and not getattr(self, 'no_runtime', False):
             self._emit_start_function()
 
         # Emit memset if we used the llvm.memset intrinsic (needed for -nostdlib linking)
@@ -3909,6 +3917,87 @@ class LLVMEmitter:
 
         return fn
 
+    def _emit_test_table(self, module: rast.Module) -> None:
+        """Emit the `[[test]]` table of LANGUAGE_SPEC §17.1 (AGAST #1868).
+
+            @__ritz_tests       = constant [N x { StrView, i32 ()* }]
+            @__ritz_tests_count = constant i64 N
+            define { StrView, i32 ()* }* @__ritz_test_table(i64* %count)
+
+        One entry per `[[test]]` function defined in this file, in source
+        order. Each name is NUL-terminated (`len` excludes the NUL), so it is
+        also a C string. The runner reaches the table through the accessor because Ritz
+        has no `extern` data declarations. `run` is always `fn() -> i32`; a
+        test whose result is another integer width is called through an
+        internal wrapper that maps 0 to 0 and anything else to 1, so a test
+        returning 256 cannot pass by truncation.
+        """
+        tests = []
+        for item in module.items:
+            if not (isinstance(item, rast.FnDef) and item.has_attr('test')):
+                continue
+            if getattr(item, 'source_file', None) not in (None, self._current_source_file):
+                continue  # declared from an import: not this file's test
+            if item.params:
+                raise EmitError(
+                    f"[[test]] function '{item.name}' must take no parameters", item.span)
+            tests.append(item)
+
+        run_ty = ir.FunctionType(self.i32, [])
+        strview_ty = self._ensure_strview_type()
+        entry_ty = ir.LiteralStructType([strview_ty, run_ty.as_pointer()])
+
+        entries = []
+        for i, fn_def in enumerate(tests):
+            fn = self.functions[fn_def.name][0]
+            ret = fn.function_type.return_type
+            if ret == self.i32:
+                run = fn
+            elif isinstance(ret, (ir.IntType, ir.VoidType)):
+                run = ir.Function(self.module, run_ty, name=f"__ritz_test_run.{i}")
+                run.linkage = 'internal'
+                b = ir.IRBuilder(run.append_basic_block('entry'))
+                result = b.call(fn, [])
+                if isinstance(ret, ir.VoidType):
+                    b.ret(ir.Constant(self.i32, 0))
+                else:
+                    failed = b.icmp_unsigned('!=', result, ir.Constant(ret, 0))
+                    b.ret(b.zext(failed, self.i32))
+            else:
+                raise EmitError(
+                    f"[[test]] function '{fn_def.name}' must return an integer or nothing, "
+                    f"not {ret}", fn_def.span)
+
+            # NUL-terminated so `name.ptr` is also a C string; `len` excludes it.
+            data = bytearray(fn_def.name.encode('utf-8') + b'\x00')
+            name_ty = ir.ArrayType(self.i8, len(data))
+            name_g = ir.GlobalVariable(self.module, name_ty, name=f"__ritz_test_name.{i}")
+            name_g.linkage = 'private'
+            name_g.global_constant = True
+            name_g.initializer = ir.Constant(name_ty, data)
+            name_ptr = name_g.bitcast(self.i8_ptr)
+            entries.append(ir.Constant(entry_ty, [
+                ir.Constant(strview_ty, [name_ptr, ir.Constant(self.i64, len(data) - 1)]),
+                run,
+            ]))
+
+        table_ty = ir.ArrayType(entry_ty, len(entries))
+        table = ir.GlobalVariable(self.module, table_ty, name="__ritz_tests")
+        table.global_constant = True
+        table.initializer = ir.Constant(table_ty, entries)
+
+        count = ir.GlobalVariable(self.module, self.i64, name="__ritz_tests_count")
+        count.global_constant = True
+        count.initializer = ir.Constant(self.i64, len(entries))
+
+        accessor = ir.Function(
+            self.module,
+            ir.FunctionType(entry_ty.as_pointer(), [self.i64.as_pointer()]),
+            name="__ritz_test_table")
+        b = ir.IRBuilder(accessor.append_basic_block('entry'))
+        b.store(ir.Constant(self.i64, len(entries)), accessor.args[0])
+        b.ret(table.bitcast(entry_ty.as_pointer()))
+
     def _emit_start_function(self) -> None:
         """Emit the _start entry point for x86_64.
 
@@ -3918,7 +4007,8 @@ class LLVMEmitter:
         """
         # We need to emit this as raw IR text since llvmlite doesn't support naked functions
         # This will be appended after the module is stringified
-        num_params = len(self.main_fn_def.params)
+        # Test mode: the runner's `main(argc, argv)` lives in another object.
+        num_params = len(self.main_fn_def.params) if self.main_fn_def else 2
         main_takes_args = num_params >= 2
         main_takes_envp = num_params >= 3
 
@@ -12345,6 +12435,11 @@ def emit(module: rast.Module, no_runtime: bool = False,
     from monomorph import monomorphize
     module = monomorphize(module)
 
+    # Test mode (§17.1): the runner supplies `main`, so the file's own goes.
+    if test_mode:
+        module.items = [item for item in module.items
+                        if not (isinstance(item, rast.FnDef) and item.name == 'main')]
+
     # Note: target_os filtering happens earlier in compile_file() before name resolution
 
     emitter = LLVMEmitter(source_file=source_file, source_dir=source_dir, target=target,
@@ -12389,49 +12484,3 @@ def emit(module: rast.Module, no_runtime: bool = False,
         return ir_str, emitted_fn_ir
 
     return ir_str
-
-
-def get_test_functions(module: rast.Module) -> List[rast.FnDef]:
-    """Get all @test functions from a module."""
-    tests = []
-    for item in module.items:
-        if isinstance(item, rast.FnDef) and item.has_attr('test'):
-            tests.append(item)
-    return tests
-
-
-def generate_test_main_source(test_fns: List[rast.FnDef]) -> str:
-    """Generate Ritz source for a test main that runs all test functions.
-
-    This generates a main() function that uses ritzlib/testing.ritz to run
-    all the discovered test functions.
-    """
-    if not test_fns:
-        return """
-import ritzlib.testing
-
-fn main() -> i32
-    prints("No tests found.\\n")
-    return 0
-"""
-
-    # Build the test array and main function
-    lines = [
-        "import ritzlib.testing",
-        "",
-        "# Test entry array",
-        f"var __test_entries: [{len(test_fns)}]TestEntry",
-        "",
-        "fn main() -> i32",
-    ]
-
-    # Initialize test entries
-    for i, fn in enumerate(test_fns):
-        lines.append(f'    __test_entries[{i}].name = "{fn.name}"')
-        lines.append(f'    __test_entries[{i}].func = &{fn.name}')
-
-    # Call the runner
-    lines.append(f"    return run_tests_array(&__test_entries[0], {len(test_fns)})")
-    lines.append("")
-
-    return "\n".join(lines)

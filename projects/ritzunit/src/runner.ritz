@@ -1,25 +1,24 @@
-# ritzunit/src/runner.ritz - Self-discovering test runner
+# ritzunit/src/runner.ritz - The test runner linked into every test binary
 #
-# This module provides test discovery by reading the current binary's ELF
-# symbol table. Tests are functions marked with @test attribute (which
-# generates a test_ prefix in the symbol table).
+# A test binary is a test file compiled in test mode, linked with this runner
+# (LANGUAGE_SPEC.md §17.1). The compiler emits a table of the file's
+# `[[test]]` functions; the runner is the binary's `main` (bin_main.ritz) and
+# runs each entry of that table in a forked child.
 #
-# Architecture:
-# 1. Read /proc/self/exe to get the current binary
-# 2. Parse ELF headers to find the symbol table
-# 3. Discover all global functions starting with "test_"
-# 4. Handle PIE: detect load base address from /proc/self/maps
-# 5. Call each test function and record results
-#
-# Usage:
-#   fn main() -> i32
-#       return run_tests()
+#   * Discovery is the compiler's table, not a symbol-name convention: a
+#     `[[test]] fn check_x` runs, a helper `fn test_x` does not.
+#   * Each test runs in its own child. Its stdout and stderr go to a capture
+#     file, so a test's output can neither interleave with nor corrupt the
+#     report (--json stays parseable). Output of a test that did not pass is
+#     shown under its result.
+#   * The exit status is 0 iff every selected test passed, else 1. (It used
+#     to be the failure count, which the kernel truncates mod 256.)
 #
 # CLI Options:
 #   -v, --verbose    Show detailed output including test names as they run
 #   -q, --quiet      Minimal output - only show failures and summary
 #   -f, --filter     Filter tests by name substring
-#   -l, --list       List discovered tests without running them
+#   -l, --list       List tests without running them
 #   -t, --timeout    Timeout per test in milliseconds (default: 5000)
 #   --no-fork        Disable fork isolation (run tests in main process)
 #   -h, --help       Show help message
@@ -27,23 +26,41 @@
 import ritzlib.sys
 import ritzlib.io
 import ritzlib.memory
-import ritzlib.elf
 import ritzlib.args
 import ritzlib.str
 import ritzlib.strview
 
 # ============================================================================
+# The compiler-emitted test table (LANGUAGE_SPEC §17.1)
+# ============================================================================
+
+# One `[[test]]` function. `name` is NUL-terminated (`len` excludes the NUL).
+struct RitzTest
+    name: StrView
+    run: fn() -> i32
+
+# Defined by the test file's test-mode compile: stores the entry count and
+# returns the first entry.
+extern fn __ritz_test_table(count: *i64) -> *RitzTest
+
+# ============================================================================
 # Constants
 # ============================================================================
 
-const MAX_TESTS: i32 = 1024
 const SEEK_SET: i32 = 0
 const SEEK_END: i32 = 2
+
+const SYS_MEMFD_CREATE: i64 = 319
+const SYS_FTRUNCATE: i64 = 77
+const MFD_CLOEXEC: i64 = 1
+
+# Output kept per failing test: the last CAPTURE_KEEP bytes. A diagnostic is
+# at the end of a test's output, and a runaway test must not exhaust memory.
+const CAPTURE_KEEP: i64 = 65536
 
 # ============================================================================
 # Wait Status Macros (POSIX)
 # ============================================================================
-# These implement the standard POSIX wait status macros.
 
 fn WIFEXITED(status: i32) -> i32
     return ((status & 127) == 0) as i32
@@ -76,77 +93,22 @@ var g_junit: i32 = 0         # --junit: output in JUnit XML format
 var g_color: i32 = 0         # 0=auto, 1=always, -1=never
 
 # ============================================================================
-# Test Entry
-# ============================================================================
-# Stores information about a discovered test function.
-
-struct TestEntry
-    name: *u8           # Pointer to name in string table
-    addr: i64           # Function virtual address from ELF symbol table
-
-# ============================================================================
-# Test Registry
-# ============================================================================
-# Global storage for discovered tests.
-
-var g_tests: [1024]TestEntry
-var g_test_count: i32 = 0
-var g_base_addr: i64 = 0  # PIE load base address
-
-# ============================================================================
-# PIE Base Address Detection
-# ============================================================================
-# For PIE (Position Independent Executable) binaries, symbol values are
-# virtual addresses relative to the load base. At runtime, the kernel loads
-# the binary at a random base (ASLR). We detect this by parsing /proc/self/maps.
-
-fn detect_base_address() -> i64
-    let fd: i32 = sys_open(c"/proc/self/maps", O_RDONLY)
-    if fd < 0
-        return 0
-
-    var buf: [4096]u8
-    let n: i64 = sys_read(fd, @buf as *u8, 4096)
-    sys_close(fd)
-
-    if n <= 0
-        return 0
-
-    # Parse first line to get the base address
-    # Format: 55aabc000000-55aabc001000 r--p 00000000 ...
-    # We need the first hex number (before the dash)
-    var addr: i64 = 0
-    for i in 0..n
-        let c: u8 = buf[i]
-        if c == '-'
-            return addr
-        if c >= '0' && c <= '9'
-            addr = addr * 16 + (c - '0') as i64
-        else if c >= 'a' && c <= 'f'
-            addr = addr * 16 + (c - 'a' + 10) as i64
-
-    return addr
-
-# ============================================================================
 # Timing
 # ============================================================================
-# Get current time in milliseconds using gettimeofday.
 
 fn get_time_ms() -> i64
     var tv: Timeval
     sys_gettimeofday(@tv, null)
     return tv.tv_sec * 1000 + tv.tv_usec / 1000
 
-# Get time in microseconds for seeding
 fn get_time_us() -> i64
     var tv: Timeval
     sys_gettimeofday(@tv, null)
     return tv.tv_sec * 1000000 + tv.tv_usec
 
 # ============================================================================
-# Simple PRNG (Linear Congruential Generator)
+# Simple PRNG (Linear Congruential Generator), for --shuffle
 # ============================================================================
-# Used for test shuffling. Not cryptographically secure, but fine for test ordering.
 
 var g_rng_state: i64 = 0
 
@@ -160,23 +122,20 @@ fn rng_next() -> i64
     g_rng_state = (g_rng_state * 48271) % 2147483647
     return g_rng_state
 
-# Fisher-Yates shuffle for test array
-fn shuffle_tests(count: i32)
+# Fisher-Yates shuffle of the run order
+fn shuffle_order(order: *i64, count: i64)
     if count <= 1
         return
     for i in 0..(count - 1)
-        # Random index from i to count-1
-        let j: i64 = i + (rng_next() % ((count - i) as i64))
-        # Swap tests[i] and tests[j]
-        let tmp: TestEntry = g_tests[i]
-        g_tests[i] = g_tests[j as i32]
-        g_tests[j as i32] = tmp
+        let j: i64 = i + (rng_next() % (count - i))
+        let tmp: i64 = order[i]
+        order[i] = order[j]
+        order[j] = tmp
 
 # ============================================================================
-# Test Execution Results
+# Test Execution
 # ============================================================================
 
-# Test result codes (stored in high bits, signal/exit in low bits)
 const TEST_RESULT_PASS: i32 = 0      # Test passed (exit 0)
 const TEST_RESULT_FAIL: i32 = 1      # Test failed (non-zero exit)
 const TEST_RESULT_SIGNAL: i32 = 2    # Test killed by signal
@@ -187,24 +146,69 @@ struct TestRunResult
     exit_code: i32       # Exit code (if PASS/FAIL)
     signal: i32          # Signal number (if SIGNAL)
 
-# ============================================================================
-# Test Execution
-# ============================================================================
+# The exit status a test's result becomes in its child. Only the low 8 bits
+# of an exit status survive, so a non-zero result whose low byte is zero (256)
+# would read as a pass: report it as 1 instead.
+pub fn test_exit_status(ret: i32) -> i32
+    if ret != 0 && (ret & 255) == 0
+        return 1
+    return ret
 
-# Run a test directly in current process (no isolation).
-fn run_test_direct(entry: *TestEntry) -> i32
-    let runtime_addr: i64 = g_base_addr + entry.addr
-    let test_fn: fn() -> i32 = runtime_addr as fn() -> i32
-    return test_fn()
+# The capture file every child writes its stdout and stderr to. One memfd,
+# emptied before each test; -1 if it could not be created (output then goes
+# to the runner's own stdout/stderr, as before).
+var g_capture_fd: i32 = -1
 
-# Run a single test with fork isolation.
-# Child process runs the test and exits with its return code.
-# Parent waits with timeout and interprets the result.
-fn run_test_forked(entry: *TestEntry, result: *TestRunResult) -> i32
+fn capture_open()
+    let fd: i64 = syscall2(SYS_MEMFD_CREATE, c"ritzunit-capture" as i64, MFD_CLOEXEC)
+    if fd >= 0
+        g_capture_fd = fd as i32
+
+fn capture_reset()
+    if g_capture_fd < 0
+        return
+    syscall2(SYS_FTRUNCATE, g_capture_fd as i64, 0)
+    sys_lseek(g_capture_fd, 0, SEEK_SET)
+
+# The last CAPTURE_KEEP bytes the child wrote, in a fresh allocation.
+fn capture_take() -> StrView
+    var out: StrView = strview_empty()
+    if g_capture_fd < 0
+        return out
+    let size: i64 = sys_lseek(g_capture_fd, 0, SEEK_END)
+    if size <= 0
+        return out
+    var start: i64 = 0
+    if size > CAPTURE_KEEP
+        start = size - CAPTURE_KEEP
+    let want: i64 = size - start
+    let buf: *u8 = malloc(want + 1)
+    if buf == null
+        return out
+    sys_lseek(g_capture_fd, start, SEEK_SET)
+    var got: i64 = 0
+    while got < want
+        let n: i64 = sys_read(g_capture_fd, buf + got, want - got)
+        if n <= 0
+            break
+        got += n
+    buf[got] = 0
+    out.ptr = buf
+    out.len = got
+    return out
+
+# Run a test directly in the current process (no isolation).
+fn run_test_direct(test: *RitzTest) -> i32
+    let run: fn() -> i32 = test.run
+    return run()
+
+# Run one test in a forked child, which exits with the test's result.
+# The parent waits with a timeout and interprets the status.
+fn run_test_forked(test: *RitzTest, result: *TestRunResult) -> i32
+    capture_reset()
     let pid: i32 = sys_fork()
 
     if pid < 0
-        # Fork failed - fall back to direct execution
         result.status = TEST_RESULT_FAIL
         result.exit_code = -1
         result.signal = 0
@@ -212,16 +216,14 @@ fn run_test_forked(entry: *TestEntry, result: *TestRunResult) -> i32
 
     if pid == 0
         # === Child process ===
-        # Run the test and exit with its return code
-        let runtime_addr: i64 = g_base_addr + entry.addr
-        let test_fn: fn() -> i32 = runtime_addr as fn() -> i32
-        let ret: i32 = test_fn()
-        sys_exit(ret)
-        # Never reached
+        if g_capture_fd >= 0
+            sys_dup2(g_capture_fd, 1)
+            sys_dup2(g_capture_fd, 2)
+        let run: fn() -> i32 = test.run
+        sys_exit(test_exit_status(run()))
         return 0
 
     # === Parent process ===
-    # Wait for child with timeout using polling
     let start_ms: i64 = get_time_ms()
     var status: i32 = 0
 
@@ -229,7 +231,6 @@ fn run_test_forked(entry: *TestEntry, result: *TestRunResult) -> i32
         let wait_result: i32 = sys_wait4(pid, @status, WNOHANG, null)
 
         if wait_result > 0
-            # Child exited or was signaled
             if WIFEXITED(status) != 0
                 let exit_code: i32 = WEXITSTATUS(status)
                 if exit_code == 0
@@ -246,50 +247,31 @@ fn run_test_forked(entry: *TestEntry, result: *TestRunResult) -> i32
                 return 0
 
         if wait_result < 0
-            # Wait error
             result.status = TEST_RESULT_FAIL
             result.exit_code = -1
             result.signal = 0
             return -1
 
-        # Check timeout
         let elapsed: i64 = get_time_ms() - start_ms
         if elapsed >= g_timeout_ms
-            # Timeout - kill the child
             sys_kill(pid, SIGKILL)
-            # Reap the zombie
             sys_wait4(pid, @status, 0, null)
             result.status = TEST_RESULT_TIMEOUT
             result.exit_code = 0
             result.signal = 0
             return 0
 
-        # Sleep a bit before polling again (1ms)
+        # Sleep 1ms before polling again
         var req: [2]i64
-        req[0] = 0          # seconds
-        req[1] = 1000000    # nanoseconds (1ms)
+        req[0] = 0
+        req[1] = 1000000
         sys_nanosleep(@req[0], null)
 
     return 0
 
-# Run a single test function and return its result code.
-# Uses fork isolation unless --no-fork is set.
-# Returns 0 on pass, non-zero on fail.
-fn run_test(entry: *TestEntry) -> i32
+fn run_test_with_result(test: *RitzTest, result: *TestRunResult)
     if g_no_fork != 0
-        return run_test_direct(entry)
-
-    var result: TestRunResult
-    run_test_forked(entry, @result)
-
-    if result.status == TEST_RESULT_PASS
-        return 0
-    return 1
-
-# Get detailed result for a test (used by main loop for reporting)
-fn run_test_with_result(entry: *TestEntry, result: *TestRunResult)
-    if g_no_fork != 0
-        let ret: i32 = run_test_direct(entry)
+        let ret: i32 = test_exit_status(run_test_direct(test))
         if ret == 0
             result.status = TEST_RESULT_PASS
         else
@@ -297,117 +279,17 @@ fn run_test_with_result(entry: *TestEntry, result: *TestRunResult)
         result.exit_code = ret
         result.signal = 0
     else
-        run_test_forked(entry, result)
-
-# ============================================================================
-# Test Discovery
-# ============================================================================
-
-# Check if a string starts with "test_"
-fn is_test_name(name: *u8) -> i32
-    if *name != 't'
-        return 0
-    if *(name + 1) != 'e'
-        return 0
-    if *(name + 2) != 's'
-        return 0
-    if *(name + 3) != 't'
-        return 0
-    if *(name + 4) != '_'
-        return 0
-    return 1
-
-# Discover tests from ELF symbol table and populate g_tests.
-# Returns number of tests found, or -1 on error.
-fn discover_tests() -> i32
-    # First, detect PIE load base address
-    g_base_addr = detect_base_address()
-
-    # Read the current binary via /proc/self/exe
-    let fd: i32 = sys_open(c"/proc/self/exe", O_RDONLY)
-    if fd < 0
-        eprints("ritzunit: failed to open /proc/self/exe\n")
-        return -1
-
-    # Get file size
-    let size: i64 = sys_lseek(fd, 0, SEEK_END)
-    sys_lseek(fd, 0, SEEK_SET)
-
-    if size <= 0
-        sys_close(fd)
-        eprints("ritzunit: failed to get binary size\n")
-        return -1
-
-    # Allocate buffer and read the binary
-    let data: *u8 = malloc(size)
-    if data == null
-        sys_close(fd)
-        eprints("ritzunit: failed to allocate memory\n")
-        return -1
-
-    let bytes_read: i64 = sys_read(fd, data, size)
-    sys_close(fd)
-
-    if bytes_read != size
-        free(data)
-        eprints("ritzunit: failed to read binary\n")
-        return -1
-
-    # Initialize ELF reader
-    var reader: ElfReader
-    if elf_init(@reader, data, size) != 0
-        free(data)
-        eprints("ritzunit: not a valid ELF64 binary\n")
-        return -1
-
-    # Parse sections to find symbol table
-    if elf_parse_sections(@reader) != 0
-        free(data)
-        eprints("ritzunit: failed to parse ELF sections\n")
-        return -1
-
-    # Scan symbols for test functions
-    # Note: We scan ALL functions (not just GLOBAL) because ritz compiles
-    # user-defined functions as LOCAL symbols by default.
-    g_test_count = 0
-    var i: i64 = 0
-
-    while i < reader.symtab_count && g_test_count < MAX_TESTS
-        let info: u8 = elf_get_symbol_info(@reader, i)
-
-        # Look at all functions (LOCAL or GLOBAL)
-        if elf_is_function(info) != 0
-            let name: *u8 = elf_get_symbol_name(@reader, i)
-            if name != null && is_test_name(name) != 0
-                # Get symbol value (virtual address)
-                let sym_ptr: *u8 = (reader.symtab as *u8) + (i * 24)
-                let st_value: i64 = read_u64(sym_ptr + 8)  # st_value at offset 8
-
-                g_tests[g_test_count].name = name
-                g_tests[g_test_count].addr = st_value
-                g_test_count += 1
-
-        i += 1
-
-    # Note: We don't free data because test names point into it.
-    # This is acceptable for the lifetime of the test run.
-
-    return g_test_count
+        run_test_forked(test, result)
 
 # ============================================================================
 # Reporter Integration
 # ============================================================================
-# Import reporter functions for visual output.
 
-import src.reporter
-import src.types
-import src.filter
-import src.json_reporter
-import src.junit_reporter
-
-# ============================================================================
-# Signal Name Helper
-# ============================================================================
+import ritzunit.reporter
+import ritzunit.types
+import ritzunit.filter
+import ritzunit.json_reporter
+import ritzunit.junit_reporter
 
 fn signal_name(sig: i32) -> StrView
     if sig == SIGSEGV
@@ -432,19 +314,25 @@ fn signal_name(sig: i32) -> StrView
         return "SIGPIPE"
     return "signal"
 
+# A failed test's captured output, under its result line (human mode).
+fn print_captured(output: @StrView)
+    if output.len == 0
+        return
+    sys_write(1, output.ptr, output.len)
+    if output.ptr[output.len - 1] != 10
+        prints("\n")
+
 # ============================================================================
 # Main Test Runner
 # ============================================================================
 
-# Run all discovered tests and return exit code (0 = all pass).
-fn run_tests() -> i32
+# Run every selected test in the table; 0 iff all of them passed, else 1.
+pub fn run_tests() -> i32
     if g_quiet == 0 && g_json == 0
         print_banner()
 
-    # Discover tests
-    let count: i32 = discover_tests()
-    if count < 0
-        return 1
+    var count: i64 = 0
+    let tests: *RitzTest = __ritz_test_table(@count)
 
     if count == 0
         if g_json != 0
@@ -453,53 +341,53 @@ fn run_tests() -> i32
             prints("No tests found.\n")
         return 0
 
-    # Shuffle tests if requested
+    var order: *i64 = malloc(count * 8) as *i64
+    if order == null
+        eprints("ritzunit: out of memory\n")
+        return 1
+    for i in 0..count
+        order[i] = i
+
     if g_shuffle != 0
         var seed: i64 = g_seed
         if seed == 0
-            seed = get_time_us()  # Auto-seed from current time
+            seed = get_time_us()
         rng_seed(seed)
-        shuffle_tests(count)
+        shuffle_order(order, count)
         if g_verbose != 0
-            prints("Shuffled tests with seed: ")
-            print_int(seed)
-            prints("\n")
+            print("Shuffled tests with seed: {seed}\n")
 
-    # List-only mode: just print test names and exit
     if g_list_only != 0
-        prints("Discovered ")
-        print_int(count as i64)
-        prints(" test(s):\n")
+        print("Discovered {count} test(s):\n")
         for i in 0..count
-            let entry: *TestEntry = @g_tests[i]
-            if matches_filter(entry.name) != 0
+            let test: *RitzTest = @tests[order[i]]
+            if matches_filter(test.name.ptr) != 0
                 prints("  ")
-                prints_cstr(entry.name)
+                prints(test.name)
                 prints("\n")
         return 0
 
     if g_quiet == 0
         print_suite_header(strview_from_cstr(c"tests"))
 
+    if g_no_fork == 0
+        capture_open()
+
     var summary: TestSummary = summary_new()
     var skipped_by_filter: i32 = 0
     let total_start: i64 = get_time_ms()
 
     for i in 0..count
-        let entry: *TestEntry = @g_tests[i]
-        let name_ptr: *u8 = entry.name
+        let test: *RitzTest = @tests[order[i]]
+        var name: StrView = test.name
 
-        # Apply filter
-        if matches_filter(name_ptr) == 0
+        if matches_filter(name.ptr) == 0
             skipped_by_filter += 1
             continue
 
-        # Convert name to StrView for modern APIs
-        var name: StrView = strview_from_cstr(name_ptr)
-
         let start: i64 = get_time_ms()
         var result: TestRunResult
-        run_test_with_result(entry, @result)
+        run_test_with_result(test, @result)
         let elapsed: i64 = get_time_ms() - start
 
         var failed_this_test: i32 = 0
@@ -509,52 +397,45 @@ fn run_tests() -> i32
             else if g_junit != 0
                 junit_record_pass(@name, elapsed)
             else if g_quiet == 0
-                # Reporter takes StrView by value, recreate from ptr
-                print_test_pass(strview_from_cstr(name_ptr), elapsed)
+                print_test_pass(name, elapsed)
             summary_record(@summary, TEST_PASS, elapsed)
-        else if result.status == TEST_RESULT_SIGNAL
-            # Test crashed with signal
-            var sig_name: StrView = signal_name(result.signal)
-            if g_json != 0
-                json_record_crash(@name, elapsed, result.signal)
-            else if g_junit != 0
-                junit_record_crash(@name, elapsed, result.signal, @sig_name)
-            else
-                # Reporter takes StrView by value
-                print_test_crash(strview_from_cstr(name_ptr), elapsed, result.signal, signal_name(result.signal))
-            summary_record(@summary, TEST_CRASH, elapsed)
-            failed_this_test = 1
-        else if result.status == TEST_RESULT_TIMEOUT
-            # Test timed out
-            if g_json != 0
-                json_record_timeout(@name, elapsed)
-            else if g_junit != 0
-                junit_record_timeout(@name, elapsed)
-            else
-                # Reporter takes StrView by value
-                print_test_timeout(strview_from_cstr(name_ptr), g_timeout_ms)
-            summary_record(@summary, TEST_TIMEOUT, elapsed)
-            failed_this_test = 1
         else
-            # Test assertion failure
-            if g_json != 0
-                json_record_fail(@name, elapsed, result.exit_code)
-            else if g_junit != 0
-                junit_record_fail(@name, elapsed, result.exit_code)
-            else
-                # Reporter takes StrView by value
-                print_test_fail(strview_from_cstr(name_ptr), elapsed, result.exit_code)
-            summary_record(@summary, TEST_FAIL, elapsed)
+            var output: StrView = capture_take()
             failed_this_test = 1
+            if result.status == TEST_RESULT_SIGNAL
+                var sig_name: StrView = signal_name(result.signal)
+                if g_json != 0
+                    json_record_crash(@name, elapsed, result.signal, @output)
+                else if g_junit != 0
+                    junit_record_crash(@name, elapsed, result.signal, @sig_name)
+                else
+                    print_test_crash(name, elapsed, result.signal, sig_name)
+                    print_captured(@output)
+                summary_record(@summary, TEST_CRASH, elapsed)
+            else if result.status == TEST_RESULT_TIMEOUT
+                if g_json != 0
+                    json_record_timeout(@name, elapsed, @output)
+                else if g_junit != 0
+                    junit_record_timeout(@name, elapsed)
+                else
+                    print_test_timeout(name, g_timeout_ms)
+                    print_captured(@output)
+                summary_record(@summary, TEST_TIMEOUT, elapsed)
+            else
+                if g_json != 0
+                    json_record_fail(@name, elapsed, result.exit_code, @output)
+                else if g_junit != 0
+                    junit_record_fail(@name, elapsed, result.exit_code)
+                else
+                    print_test_fail(name, elapsed, result.exit_code)
+                    print_captured(@output)
+                summary_record(@summary, TEST_FAIL, elapsed)
 
-        # Fail-fast: stop on first failure
         if g_fail_fast != 0 && failed_this_test != 0
             break
 
-    let total_elapsed: i64 = get_time_ms() - total_start
-    summary.duration_ms = total_elapsed
+    summary.duration_ms = get_time_ms() - total_start
 
-    # Output results
     if g_json != 0
         json_print_report(summary.total, summary.passed, summary.failed, summary.crashed, summary.timeout, skipped_by_filter, summary.duration_ms)
     else if g_junit != 0
@@ -565,10 +446,15 @@ fn run_tests() -> i32
         if g_quiet == 0
             print_suite_divider()
             print_suite_summary(summary.total, summary.passed, summary.failed, summary.crashed, summary.timeout, summary.duration_ms)
-        # Always show grand total
         print_grand_summary(summary.total, summary.passed, summary.failed, summary.crashed, summary.timeout, skipped_by_filter, summary.duration_ms)
 
-    return summary.failed + summary.crashed + summary.timeout
+    return run_exit_status(@summary)
+
+# 0 iff nothing failed, crashed or timed out; else 1.
+pub fn run_exit_status(summary: @TestSummary) -> i32
+    if summary.failed + summary.crashed + summary.timeout > 0
+        return 1
+    return 0
 
 # ============================================================================
 # CLI Argument Parsing
@@ -596,12 +482,10 @@ fn parse_args(argc: i32, argv: **u8) -> i32
     if args_parse(@parser, argc, argv) != 0
         return -1
 
-    # Handle --help
     if args_get_flag(@parser, 'h') != 0
         args_print_help(@parser)
         return 1  # Exit without error, but don't run tests
 
-    # Store options in globals
     g_verbose = args_get_flag(@parser, 'v')
     g_quiet = args_get_flag(@parser, 'q')
     g_list_only = args_get_flag(@parser, 'l')
@@ -614,7 +498,6 @@ fn parse_args(argc: i32, argv: **u8) -> i32
     g_json = args_get_flag(@parser, 'j')
     g_junit = args_get_flag_long(@parser, c"junit")
 
-    # Color options
     let force_color: i32 = args_get_flag_long(@parser, c"color")
     let no_color: i32 = args_get_flag_long(@parser, c"no-color")
 
@@ -629,12 +512,10 @@ fn parse_args(argc: i32, argv: **u8) -> i32
         g_color = -1
         set_color_mode(-1)
 
-    # Verbose and quiet are mutually exclusive
     if g_verbose != 0 && g_quiet != 0
         eprints("ritzunit: --verbose and --quiet are mutually exclusive\n")
         return -1
 
-    # JSON and JUnit are mutually exclusive
     if g_json != 0 && g_junit != 0
         eprints("ritzunit: --json and --junit are mutually exclusive\n")
         return -1
@@ -642,33 +523,19 @@ fn parse_args(argc: i32, argv: **u8) -> i32
     # JSON or JUnit implies quiet and no color
     if g_json != 0 || g_junit != 0
         g_quiet = 1
-        set_color_mode(-1)  # Disable color for machine-readable output
+        set_color_mode(-1)
 
     return 0
 
-# ============================================================================
-# Test Filtering
-# ============================================================================
-
 fn matches_filter(name: *u8) -> i32
-    # Use the filter module for pattern matching
     return filter_match(g_filter, name)
 
 # ============================================================================
 # Entry Point
 # ============================================================================
-# This can be used as the main function for test binaries.
 
-# `ritzunit_main` is the runner's entry-point logic.  It's `pub` so it
-# can be called from any binary that links the runner — either
-# ritzunit's own standalone binary (`bin_main.ritz`) or per-package
-# test binaries that compose ritzunit + their `[[test]]` symbols.
-#
-# We deliberately do NOT define `fn main` here — that lives in
-# `bin_main.ritz` for the standalone binary path, and in each test
-# package's stub for the per-package test-binary path.  This avoids
-# multiple-definition-of-`main` linker errors when test binaries
-# pull both this file and their own main into the same link.
+# The runner's entry point. bin_main.ritz's `main` calls it; it is not `main`
+# itself so a test that imports this module does not define `main`.
 pub fn ritzunit_main(argc: i32, argv: **u8) -> i32
     let parse_result: i32 = parse_args(argc, argv)
     if parse_result != 0

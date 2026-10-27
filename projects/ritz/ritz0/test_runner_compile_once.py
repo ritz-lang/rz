@@ -7,10 +7,11 @@ mausoleum's test_query.ritz costs ~25 s, so its 52 tests took ~22 minutes and
 the file blew through build.py's 180 s per-file budget -- with every single
 test passing.
 
-The fix compiles one harness per file whose `main` dispatches on argc, links
-it once, and runs the binary once per test. Each test still gets its own
-process (and its own 10 s timeout), so a crash or hang stays attributed to the
-test that caused it.
+The fix compiles one harness per file and links it once. Since AGAST #1868 that
+harness is the test binary of LANGUAGE_SPEC §17.1 -- the file in test mode
+plus ritzunit as `main` -- run once; ritzunit forks a child per test, so each
+test still gets its own process (and its own 10 s timeout) and a crash or
+hang stays attributed to the test that caused it.
 
 These tests count the compiler and linker invocations rather than timing them:
 a wall-clock assertion would be flaky on a loaded CI box, while "one ritz0 run
@@ -137,30 +138,30 @@ def test_test_file_is_compiled_once_regardless_of_test_count(package, recorded_c
 
 
 @pytest.mark.integration
-def test_each_test_still_runs_in_its_own_process(package, recorded_commands):
-    """Compiling once must not collapse the tests into one process.
+def test_binary_runs_once_and_ritzunit_forks_per_test(package, recorded_commands):
+    """One execution of the binary; isolation is ritzunit's fork per test.
 
-    A process per test is what keeps a crash, hang or `exit` attributed to the
-    test that caused it, so the binary must still be executed once per test.
+    The report has one entry per test, so every test ran, in its own child.
     """
-    test_runner.run_test_file(str(package))
+    passed, failed, _ = test_runner.run_test_file(str(package))
 
     runs = [
         c for c in recorded_commands
-        if c and c[0] != "clang" and not c[0].endswith(("python", "python3"))
-        and c[0] != sys.executable
+        if c and c[0] not in ("clang", "ld", "objcopy")
+        and not c[0].endswith(("python", "python3")) and c[0] != sys.executable
     ]
-    assert len(runs) == N_TESTS, f"expected {N_TESTS} test executions, got {runs}"
+    assert len(runs) == 1, f"expected one run of the test binary, got {runs}"
+    assert passed + failed == N_TESTS
 
 
 @pytest.mark.integration
 def test_per_test_verdicts_are_preserved(package):
-    """Dispatch must route each test to its own function, with today's exit codes.
+    """Each test's verdict is reported against its own name.
 
-    Pass/fail counts alone could hide a dispatcher that ran the wrong test for an
-    index, so the failure messages are checked by name. `test_wide_fail` pins the
-    i64 behaviour of the old `main() -> i32 { test() }` harness: the return value
-    becomes the exit code.
+    Pass/fail counts alone could hide a runner that ran the wrong function for
+    an entry, so the failure messages are checked by name. `test_wide_fail`
+    returns 3 from `-> i64`: a non-i32 result fails as 1 (§17.1), it is not
+    truncated into an exit status.
     """
     passed, failed, failures = test_runner.run_test_file(str(package))
 
@@ -169,19 +170,4 @@ def test_per_test_verdicts_are_preserved(package):
     assert failed_names == ["test_assert_fails", "test_wide_fail"], failures
     by_name = {f.split(":", 1)[0]: f for f in failures}
     assert "assertion failed" in by_name["test_assert_fails"]
-    assert "exited with code 3" in by_name["test_wide_fail"]
-
-
-@pytest.mark.unit
-def test_dispatch_main_maps_each_test_to_a_distinct_argc():
-    """The generated `main` selects test i when argc == i + 2 (argv[0] + i + 1 args)."""
-    tests = ["test_one", "test_two", "test_three"]
-    src = test_runner.generate_dispatch_main(tests)
-
-    assert "fn main(" in src
-    lines = src.splitlines()
-    for i, name in enumerate(tests):
-        guard = next(n for n, line in enumerate(lines) if line.strip().endswith(f"== {i + 2}"))
-        assert name in lines[guard + 1], f"argc {i + 2} does not call {name}:\n{src}"
-    assert test_runner.dispatch_args(0) == ["t"]
-    assert test_runner.dispatch_args(2) == ["t", "t", "t"]
+    assert "exited with code 1" in by_name["test_wide_fail"]
