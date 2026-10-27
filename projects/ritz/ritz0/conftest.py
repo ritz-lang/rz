@@ -79,6 +79,15 @@ AGAST #1392. Two things live here, and they are independent.
    `@pytest.mark.slow` tests (minutes on their own) and xdist_group members
    (which run one after another on a single worker) are moved to the front,
    stably, so neither becomes the tail of a parallel run.
+
+7. `smoke` (AGAST #1803) — the in-process subset `make smoke` runs with
+   `pytest -m smoke`.  The marker is applied here from SMOKE_FILES, the ONE
+   list of files in the tier, rather than by decorating tests, so the tier is
+   readable and editable in one place.  Within a listed file a test is smoke
+   unless it is `integration`-marked or asks for `ritz1_bin`/`ritz_start`:
+   smoke runs before ritz1 is built and must not build it.  Run it serially
+   (no `-n`): under xdist the controller builds ritz1 before any worker starts
+   (item 4), which is exactly the cost the smoke tier avoids.
 """
 
 import os
@@ -101,6 +110,43 @@ _BUILD_KEY = "ritz1_session_build"
 _build_verdict = pytest.StashKey[str]()
 
 _SESSION_CACHE = None
+
+# The smoke tier's files (item 7), relative to ritz0/.  In-process tests of the
+# front end and of the build/test tooling: no compiler subprocess, no ritz1.
+# tools/test_smoke.py fails if an entry no longer exists or contributes no test.
+SMOKE_FILES = (
+    "test_parser.py",
+    "test_lexer.py",
+    "test_const_eval.py",
+    "test_symbol_table.py",
+    "test_type_checker.py",
+    "test_move_checker.py",
+    "test_monomorph.py",
+    "test_metadata.py",
+    "test_export_map.py",
+    "test_attrs.py",
+    "test_packaging.py",
+    "test_reritz_integration.py",
+    "emitter/test_struct_layout.py",
+    "emitter/test_fn_cache.py",
+    "test_runner_source_roots.py",
+    "test_scratch_dir_location.py",
+    "test_no_artifact_skips.py",
+    "test_build.py",
+)
+_SMOKE_PATHS = frozenset((Path(__file__).resolve().parent / f) for f in SMOKE_FILES)
+# Fixtures that build ritz1; a test that asks for one is not smoke.
+_BUILD_FIXTURES = ("ritz1_bin", "ritz_start")
+
+
+def is_smoke_item(item) -> bool:
+    """Whether a collected test belongs to the smoke tier (item 7)."""
+    if Path(item.path).resolve() not in _SMOKE_PATHS:
+        return False
+    if item.get_closest_marker("integration") is not None:
+        return False
+    return not any(f in item.fixturenames for f in _BUILD_FIXTURES)
+
 
 collect_ignore_glob = [
     "tmp*",
@@ -194,13 +240,24 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers", "slow: minutes on its own; scheduled first under xdist"
     )
+    config.addinivalue_line(
+        "markers", "smoke: in the `make smoke` tier; applied from SMOKE_FILES"
+    )
 
 
+# tryfirst: the marker must be on the items before pytest's own `-m`
+# deselection, which also runs in this hook.
+@pytest.hookimpl(tryfirst=True)
 def pytest_collection_modifyitems(config, items):
-    """Slow tests first, then xdist_group members, then the rest (stable).
+    """Mark the smoke tier; then slow tests first, xdist_group members, the rest.
 
-    Deterministic, so every xdist worker collects the same order.
+    The order is deterministic (a stable sort), so every xdist worker collects
+    the same order.
     """
+    for item in items:
+        if is_smoke_item(item):
+            item.add_marker(pytest.mark.smoke)
+
     def rank(item):
         if item.get_closest_marker("slow") is not None:
             return 0

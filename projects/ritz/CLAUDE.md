@@ -33,6 +33,9 @@ python3 build.py build examples/tier3_coreutils/21_ls
 # like a broken package rather than a missing environment variable.
 RITZ_PATH=$PWD python3 build.py build examples/tier1_basics/03_echo
 
+# Is anything fully broken? (<= 2 min, stops at first failure; runs first in the gate)
+make smoke
+
 # Pre-commit validation (incremental ritz1, 30-60s)
 make matrix
 

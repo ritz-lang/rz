@@ -673,12 +673,32 @@ def run_exe(argv):
     return ("bad-exit", code, err[:300])
 
 
+COMPILER_NAMES = ("ritz0", "ritz1", "ritz1_selfhosted")
+
+
+def parse_compilers(spec):
+    """`all`, one compiler, or a comma list (`ritz0,ritz1`) -> names, in
+    COMPILER_NAMES order whatever order they were given in.
+
+    The list form lets `make smoke` (AGAST #1803) run both compilers in one
+    process, so the ritzlib objects are built once instead of once per run.
+    """
+    if spec == "all":
+        return list(COMPILER_NAMES)
+    names = [n.strip() for n in spec.split(",") if n.strip()]
+    bad = [n for n in names if n not in COMPILER_NAMES]
+    if bad or not names:
+        raise ValueError(f"unknown compiler(s) {bad or spec!r}; "
+                         f"choose from all, {', '.join(COMPILER_NAMES)} or a comma list")
+    return [c for c in COMPILER_NAMES if c in names]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tests", default=".*",
                     help="regex over file names (e.g. test_issue_) to select files")
     ap.add_argument("--compiler", default="all",
-                    choices=["all", "ritz0", "ritz1", "ritz1_selfhosted"])
+                    help="all, ritz0, ritz1, ritz1_selfhosted, or a comma list")
     ap.add_argument("--jobs", "-j", type=int, default=min(8, os.cpu_count() or 1))
     ap.add_argument("--verbose", "-v", action="store_true")
     ap.add_argument("--rebuild", action="store_true",
@@ -697,13 +717,12 @@ def main():
             print(f"FATAL: make bootstrap failed (rc={rc})")
             return 3
 
-    compilers = []
-    if args.compiler in ("all", "ritz0"):
-        compilers.append(("ritz0", None))
-    if args.compiler in ("all", "ritz1"):
-        compilers.append(("ritz1", RITZ1))
-    if args.compiler in ("all", "ritz1_selfhosted"):
-        compilers.append(("ritz1_selfhosted", RITZ1_SH))
+    try:
+        selected = parse_compilers(args.compiler)
+    except ValueError as e:
+        ap.error(str(e))
+    binaries = {"ritz0": None, "ritz1": RITZ1, "ritz1_selfhosted": RITZ1_SH}
+    compilers = [(c, binaries[c]) for c in selected]
 
     test_re = re.compile(args.tests)
     tests = [t for t in discover_test_files() if test_re.search(t)]

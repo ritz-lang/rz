@@ -13,7 +13,7 @@
 #   make build-<name>  - Build a specific package
 #   make test-<name>   - Build and test a specific package
 
-.PHONY: all test unit ritz ritz1 ritz1-bootstrap build clean list help valgrind regression regression-quick check-no-s-strings matrix matrix-full matrix-quick regen-check
+.PHONY: all test unit ritz ritz1 ritz1-bootstrap build clean list help valgrind regression regression-quick check-no-s-strings matrix matrix-full matrix-quick regen-check smoke
 
 PYTHON ?= python3
 VALGRIND ?= valgrind --error-exitcode=1 --leak-check=full -q
@@ -97,6 +97,15 @@ harness-selftest:
 	fi; \
 	echo "$$found harness self-test(s) run."; \
 	exit $$rc
+
+# Smoke tier — AGAST #1803, design projects/larb/review/4/fast-iteration.md §4.
+# "Fully broken" in <= 2 min cold, <= 60 s warm, stopping at the first failure:
+# s-strings + regen-check, `pytest -m smoke` (ritz0/conftest.py SMOKE_FILES),
+# incremental ritz1, a ritz0+ritz1 canary matrix (tools/smoke_canaries.txt),
+# and ritz1 compiling tokens_gen.ritz to IR clang accepts.  Runs first in
+# run-gate.sh and in main.yml's bootstrap job; rooms run it before a gate.
+smoke:
+	@$(PYTHON) tools/smoke.py
 
 # Run exactly what .github/workflows/main.yml runs, by PARSING it — AGAST #1363.
 #
@@ -272,6 +281,7 @@ help:
 	@echo "Targets:"
 	@echo "  make          - Run all tests (unit + ritz + ritz1 + examples)"
 	@echo "  make test     - Same as above"
+	@echo "  make smoke    - Smoke tier: is anything fully broken? (<= 2 min, stops at first failure)"
 	@echo "  make unit     - Run Python unit tests (ritz0)"
 	@echo "  make ritz     - Run .ritz language tests (test levels)"
 	@echo "  make ritz1    - Build the ritz1 compiler (make -j -C ritz1 ritz1)"

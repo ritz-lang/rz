@@ -147,6 +147,8 @@ vouches for that exact commit.
 4. **Out of scope?** File an AGAST ticket. Don't widen the change.
 5. **Finish on main:** `git fetch origin && git rebase origin/main`, then
    squash to one commit: `ritz-task-<id>: 🤖 <terse description>`.
+   Then run `make -C projects/ritz smoke` (≤ 2 min) before requesting a
+   gate; fix anything it reports first. A gate slot is one machine-wide.
 6. **Gate that commit**, detached so a new message can't kill it:
    ```bash
    LOG=$(~/dev/ritz-lang/rz/.claude/skills/rz-iterate/run-gate.sh ~/dev/ritz-lang/rz-task-<id> <id>)

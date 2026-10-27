@@ -60,7 +60,10 @@ SLOTS="${RZ_GATE_SLOTS:-1}"
 # Wipe ritz1/build too: a gate is a verdict on the commit, not on whatever
 # objects an earlier base left behind.  Reusing it is how #1497 got 30 bogus
 # failures from stale struct layouts (AGAST #1659).
-CMD="${RZ_GATE_CMD:-rm -rf projects/ritz/.regression projects/ritz/ritz1/build && make -C projects/ritz ci-local ARGS=--fail-fast}"
+#
+# `make smoke` first (AGAST #1803): a fully broken commit fails in ~2 min, not
+# ~26.  ci-local repeats it as main.yml's first step, warm (~1 min).
+CMD="${RZ_GATE_CMD:-rm -rf projects/ritz/.regression projects/ritz/ritz1/build && make -C projects/ritz smoke && make -C projects/ritz ci-local ARGS=--fail-fast}"
 UNIT="ritz-gate-$NAME"
 
 # Uncommitted tracked changes would be tested but not merged.
