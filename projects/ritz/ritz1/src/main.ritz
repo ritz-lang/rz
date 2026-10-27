@@ -500,6 +500,55 @@ fn load_and_parse(path: @String) -> *Module
 
     mod
 
+# =============================================================================
+# Module interfaces (G9b, AGAST #1899)
+# =============================================================================
+#
+# An imported module contributes only *declarations* to this file's IR: its
+# fns are is_local == 0 and emit as `declare`.  But monomorph's instantiation
+# collector and the emitter's enum-type scans walk EVERY body in the merged
+# module, so a body-only edit to an import used to change the importer's IR
+# (e.g. an extra linkonce_odr instantiation only the import itself needs).
+#
+# So each import is cut down to its interface as it is loaded, with ritz0's
+# rule (ritz0/module_interface.py body_needed): every fn body is dropped
+# except those the importer instantiates itself -- generic fns, and methods
+# of generic impls or with their own type params.  ritz1 has no async fns,
+# and parses trait default bodies without keeping them, so this drops a
+# superset of what ritz0's interface drops: the importer's IR depends only
+# on what ritz0's interface hash covers, which is what build.py keys ritz1
+# objects on (cas_module_key).
+#
+# The source is still lexed and parsed: storing the interface itself, in a
+# format both compilers read, is #1901 (it needs a body-less fn declaration
+# form in the language, #1900).
+
+# The one body every stripped fn shares; never written.  Non-null on
+# purpose: `body == null` means `extern fn`.
+var g_stripped_body: Stmt
+
+fn stripped_body() -> *Stmt
+    g_stripped_body.kind = STMT_STRIPPED
+    g_stripped_body.next = null
+    @g_stripped_body
+
+fn strip_to_interface(m: *Module)
+    let body: *Stmt = stripped_body()
+    var f: *FnDef = m.functions
+    while f != null
+        if f.type_params == null and f.body != null
+            f.body = body
+        f = f.next
+    var ib: *ImplBlock = m.impls
+    while ib != null
+        if ib.type_params == null
+            var method: *FnDef = ib.methods
+            while method != null
+                if method.type_params == null and method.body != null
+                    method.body = body
+                method = method.next
+        ib = ib.next
+
 # Resolve imports recursively, merging into the main module.
 fn resolve_imports(m: *Module, source_dir: StrView, ritz_path: StrView) -> i32
     var imp: *ImportDecl = m.imports
@@ -527,6 +576,7 @@ fn resolve_imports(m: *Module, source_dir: StrView, ritz_path: StrView) -> i32
         if import_module == null
             string_drop(@path)
             return -1
+        strip_to_interface(import_module)
 
         # Child imports: ALWAYS use the resolved file's directory as the
         # source_dir for relative imports.  Earlier behaviour cleared

@@ -23,6 +23,7 @@ one that shifts every later line -- leaves dependents' keys unchanged.
 """
 
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -339,11 +340,117 @@ class TestBuildKey:
         mi._HASH_MEMO.clear()
         assert self._key(proj, "ritz0") != k0
 
-    def test_ritz1_key_still_source_based(self, proj, store):
-        """ritz1 still parses dependency sources, so its key must too."""
-        k0 = self._key(proj, "ritz1")
+    # G9b (AGAST #1899): ritz1 strips its imports to their interfaces
+    # (TestRitz1Compiler), so its objects follow interface hashes too.
+    @pytest.mark.parametrize("compiler", ["ritz1", "ritz1_selfhosted"])
+    def test_body_only_edit_keeps_ritz1_importer_key(self, proj, store, compiler):
+        k0 = self._key(proj, compiler)
+        assert k0
         (proj / "lib.ritz").write_text(LIB.replace("y * 2", "y * 5"))
-        assert self._key(proj, "ritz1") != k0
+        mi._HASH_MEMO.clear()
+        assert self._key(proj, compiler) == k0
+
+    @pytest.mark.parametrize("compiler", ["ritz1", "ritz1_selfhosted"])
+    def test_signature_edit_changes_ritz1_importer_key(self, proj, store, compiler):
+        k0 = self._key(proj, compiler)
+        (proj / "lib.ritz").write_text(LIB.replace("plain(x: i64)", "plain(x: i32)"))
+        mi._HASH_MEMO.clear()
+        assert self._key(proj, compiler) != k0
+
+    def test_compilers_keep_distinct_keys(self, proj, store):
+        """Same deps digest, but ritz0 and ritz1 objects must never collide."""
+        assert self._key(proj, "ritz0") != self._key(proj, "ritz1")
+
+
+# ---------------------------------------------------------------------------
+# ritz1 (G9b, AGAST #1899): an importer's IR depends only on its imports'
+# interfaces -- the precondition for keying ritz1 objects on interface hashes
+# ---------------------------------------------------------------------------
+
+RITZ1_BIN = RITZ_DIR / "ritz1" / "build" / "ritz1"
+
+# Body-only edits to `plain` (non-generic) and to `Pair.sum` (method of a
+# plain impl). Each makes the stripped body reach something an unstripped
+# importer would pick up: a generic instantiation (monomorph walks every
+# body) or an Option$ type (the emitter's tagged-enum scan walks every body).
+BODY_EDITS = {
+    "generic_call": ("    y * 2\n",
+                     "    let q: i32 = ident<i32>(3)\n    y * 2 + q as i64\n"),
+    "method_generic_call": ("        self.a + self.b\n",
+                            "        let w: Wrap<i32> = Wrap<i32> { v: 1 }\n"
+                            "        self.a + self.b + w.get() as i64\n"),
+    "line_shift": ("    y * 2\n", "    let z: i64 = y\n\n\n\n    z * 2\n"),
+}
+
+
+def _ritz1(main: Path, out: Path) -> None:
+    env = dict(os.environ, RITZ_PATH=str(RITZ_DIR))
+    r = subprocess.run([str(RITZ1_BIN), str(main), "-o", str(out)],
+                       capture_output=True, text=True, cwd=str(main.parent),
+                       env=env, timeout=300)
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+@pytest.mark.integration
+@pytest.mark.usefixtures("ritz1_bin")  # conftest session build (#1804); fails, never skips
+class TestRitz1Compiler:
+    @pytest.mark.parametrize("edit", sorted(BODY_EDITS))
+    def test_importer_ir_ignores_import_bodies(self, proj, store, tmp_path, edit):
+        old, new = BODY_EDITS[edit]
+        main = proj / "main.ritz"
+        _ritz1(main, tmp_path / "before.ll")
+        lib = proj / "lib.ritz"
+        assert old in LIB
+        lib.write_text(LIB.replace(old, new))
+        _ritz1(main, tmp_path / "after.ll")
+        assert (tmp_path / "after.ll").read_text() == (tmp_path / "before.ll").read_text()
+
+    def test_import_still_compiles_its_own_bodies(self, proj, store, tmp_path):
+        """Stripping applies to imports only: lib's own .ll defines them."""
+        lib = proj / "lib.ritz"
+        lib.write_text(LIB.replace(*BODY_EDITS["generic_call"]))
+        _ritz1(lib, tmp_path / "lib.ll")
+        ir = (tmp_path / "lib.ll").read_text()
+        assert re.search(r"^define .*@plain\(", ir, re.M)
+        assert re.search(r"^define .*@Pair_sum\(", ir, re.M)
+        assert re.search(r"^define .*@ident\$i32\(", ir, re.M)
+
+    def test_import_struct_field_types_declared(self, store, tmp_path):
+        """An imported struct's generic field types come from the interface.
+
+        Every importer emits `%Holder = type {%Vec$Item, %Option$i64}`; both
+        field types were only reached through bodies that use Holder, which
+        are stripped (ritzlib.argspec's ParsedArgs / Vec$ArgSlot in the gate).
+        """
+        d = tmp_path / "fields"
+        d.mkdir()
+        (d / "lib.ritz").write_text(
+            "import ritzlib.gvec\nimport ritzlib.option\n\n"
+            "pub struct Item\n    v: i64\n\n"
+            "pub struct Holder\n    items: Vec<Item>\n    maybe: Option<i64>\n\n"
+            "pub fn make() -> i64\n    var h: Holder\n"
+            "    h.items = vec_new<Item>()\n"
+            "    vec_push<Item>(@h.items, Item { v: 4 })\n"
+            "    vec_len<Item>(@h.items)\n")
+        (d / "main.ritz").write_text(
+            "import lib\n\nfn main() -> i32\n    (make() - 1) as i32\n")
+        ll = tmp_path / "main.ll"
+        _ritz1(d / "main.ritz", ll)
+        cc = subprocess.run(["clang", "-c", "-x", "ir", str(ll), "-o",
+                             str(tmp_path / "main.o")], capture_output=True, text=True)
+        assert cc.returncode == 0, cc.stderr
+
+    @pytest.mark.parametrize("sym", ["ident$i64", "Wrap$i64_get"])
+    def test_generic_import_body_still_instantiated(self, proj, store, tmp_path, sym):
+        """Kept bodies: generic fns and methods of generic impls."""
+        _ritz1(proj / "main.ritz", tmp_path / "main.ll")
+        ir = (tmp_path / "main.ll").read_text()
+        m = re.search(r"^define linkonce_odr i64 @%s\(.*?^}" % re.escape(sym),
+                      ir, re.M | re.S)
+        assert m, sym
+        # The real body: returns a loaded value, not a placeholder.
+        assert re.search(r"ret i64 %\.\d+", m.group(0)), m.group(0)
+        assert not re.search(r"^define .*@(plain|Pair_sum)\(", ir, re.M)
 
 
 # ---------------------------------------------------------------------------

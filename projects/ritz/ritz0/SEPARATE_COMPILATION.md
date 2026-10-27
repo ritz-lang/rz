@@ -149,7 +149,11 @@ keyed by parser fingerprint, absolute path and source hash.
 
 `build.cas_module_key` keys ritz0 objects on their imports' *interface hashes*,
 which ignore positions outside kept bodies: a body-only edit to an import no
-longer invalidates its importers. ritz1 still parses its closure (AGAST #1899).
+longer invalidates its importers. ritz1/ritz1_selfhosted objects are keyed the
+same way since #1899: ritz1 still parses its closure, but strips each import to
+the same interface before anything reads it (`ritz1/src/main.ritz`
+`strip_to_interface`). Loading a stored, shared interface instead of parsing is
+#1901 (blocked on the body-less declaration form, #1900).
 
 - `RITZ0_PARSE_LOG=<file>` appends every parsed source path (one per line).
 - `RITZ0_NO_INTERFACES=1` restores full parsing, e.g. to compare IR.

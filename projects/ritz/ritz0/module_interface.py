@@ -29,8 +29,12 @@ produce the AST (tokens, lexer, parser, ritz_ast, this file), so a parser
 change can never return an interface from the old one.
 
 Pickle is ritz0-private: the store is the user's own cache directory, and the
-fingerprint pins the exact class definitions. ritz1 needs a language-neutral
-encoding of the same content (follow-up ticket).
+fingerprint pins the exact class definitions. ritz1 cannot read it: it parses
+import sources and strips them in memory by the rule of `body_needed`
+(ritz1/src/main.ritz strip_to_interface, AGAST #1899), which is why
+`build.cas_module_key` may key ritz1 objects on these interface hashes too. A
+language-neutral stored encoding is #1901. Keep `body_needed` and
+strip_to_interface in step: ritz1 must strip at least what this keeps out.
 
 Interface hash
 --------------

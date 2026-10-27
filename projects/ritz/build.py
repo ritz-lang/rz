@@ -361,9 +361,12 @@ def cas_module_key(src: Path, cache: BuildCache, compiler: str) -> Optional[str]
     dep_digest = None
     # G9 (AGAST #1810): ritz0 reads its imports' interfaces, not their
     # sources, so its objects depend on interface hashes: a body-only edit
-    # to an import keeps every importer's key. ritz1 still parses import
-    # sources, so its key stays on source hashes.
-    if compiler == "ritz0" and module_interface.enabled():
+    # to an import keeps every importer's key. G9b (AGAST #1899): ritz1
+    # strips each import to the same interface (or less) before anything
+    # reads it (main.ritz strip_to_interface), so the same holds for it.
+    # RITZ0_NO_INTERFACES is ritz0's switch only; ritz1 always strips.
+    if compiler.startswith("ritz1") or (
+            compiler == "ritz0" and module_interface.enabled()):
         flags["deps"] = module_interface.SCHEMA
         dep_digest = lambda p: module_interface.interface_hash(str(p))  # noqa: E731
     try:
