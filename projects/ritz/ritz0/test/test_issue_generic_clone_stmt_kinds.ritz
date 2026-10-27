@@ -1,0 +1,150 @@
+# Regression (AGAST #1925): ritz1's monomorph clone_stmt / clone_expr had no
+# case for several Stmt / Expr kinds, so a generic fn's instantiation lost
+# them.  The clone kept the node kind but left every field the case did not
+# copy as uninitialised malloc memory: `let a: [2]i64 = [7, 9]` and `a[0] = v`
+# compiled to nothing, so the fn read back zeros.  Non-generic fns were fine.
+#
+# Each test puts one such construct inside a generic fn.  Where the construct
+# has child expressions, they use sizeof(T) and the fn is instantiated at a
+# type whose size is not 8 (i32, Cell).  A clone that copies the node but
+# shares the template's children would then still see the unsubstituted T,
+# so these tests also catch a case that copies too little.
+
+import ritzlib.result
+
+struct Cell
+    v: i64
+    arr: [2]i64
+
+struct Pair
+    a: i64
+    b: i64
+
+fn inc(n: i32) -> i32
+    n + 1
+
+fn dbl(n: i32) -> i32
+    n * 2
+
+# EXPR_ARRAY_LIT: the `[7, ...]` initialiser was never stored.
+fn pick_lit<T>(x: T, i: i64) -> i64
+    let a: [2]i64 = [7, sizeof(T)]
+    return a[i]
+
+[[test]]
+fn test_generic_array_literal_init() -> i32
+    assert pick_lit<i32>(0, 0) == 7
+    assert pick_lit<i32>(0, 1) == 4
+    0
+
+# EXPR_ARRAY_FILL: `[v; 3]` was never stored.
+fn pick_fill<T>(x: T, i: i64) -> i64
+    let a: [3]i64 = [sizeof(T); 3]
+    return a[i]
+
+[[test]]
+fn test_generic_array_fill_init() -> i32
+    assert pick_fill<i32>(0, 2) == 4
+    0
+
+# STMT_INDEX_ASSIGN: `a[i] = v` was dropped (index and value both).
+fn store_idx<T>(x: T, v: i64) -> i64
+    var a: [2]i64 = [0, 0]
+    a[sizeof(T) - 4] = v
+    a[1] = v + sizeof(T)
+    return a[0] * 100 + a[1]
+
+[[test]]
+fn test_generic_index_assign() -> i32
+    assert store_idx<i32>(0, 20) == 2024
+    0
+
+# STMT_INDEX_ASSIGN into a fn-pointer array, then an indexed call (AGAST
+# #1747's non-identifier callee) inside the generic clone.
+fn apply_ops<T>(x: T, i: i64, n: i32) -> i32
+    var ops: [2]fn(i32) -> i32
+    ops[0] = inc
+    ops[1] = dbl
+    return ops[i](n)
+
+[[test]]
+fn test_generic_fn_ptr_array_index_call() -> i32
+    assert apply_ops<i64>(0, 0, 10) == 11
+    assert apply_ops<i64>(0, 1, 10) == 20
+    0
+
+# STMT_MEMBER_ASSIGN (the `(*p).f = v` spelling; plain `p.f = v` parses to
+# STMT_LOCAL_FIELD_ASSIGN, which was already cloned) was dropped.  The pointee
+# is T itself, instantiated at Cell (sizeof 24): a non-generic struct named
+# in a generic fn's signature is a separate bug (AGAST follow-up to #1925).
+fn set_member<T>(p: *T, v: i64) -> i64
+    (*p).v = v + sizeof(T)
+    return p.v
+
+[[test]]
+fn test_generic_member_assign() -> i32
+    var c: Cell = Cell { v: 0, arr: [0, 0] }
+    assert set_member<Cell>(@c, 10) == 34
+    assert c.v == 34
+    0
+
+# STMT_MEMBER_INDEX_ASSIGN (`(*p).f[i] = v`) is cloned too, but has no test:
+# ritz1's emitter cannot lower it even outside a generic fn (AGAST follow-up
+# to #1925).
+
+# STMT_CONTINUE had no clone case at all.
+fn sum_even<T>(x: T, n: i64) -> i64
+    var s: i64 = 0
+    for i in 0..n
+        if i % 2 == 1
+            continue
+        s = s + i
+    return s
+
+[[test]]
+fn test_generic_continue() -> i32
+    assert sum_even<i32>(0, 6) == 6
+    0
+
+# STMT_TUPLE_DECL: both names and the initialiser were dropped.  No sizeof(T)
+# here or in the EXPR_TRY test below: ritz0 evaluates sizeof(T) as 8 inside a
+# tuple-decl initialiser or a `?` operand (AGAST follow-up to #1925).
+fn make_pair(a: i64, b: i64) -> Pair
+    Pair { a: a, b: b }
+
+fn pair_sum<T>(x: T, a: i64, b: i64) -> i64
+    let (p, q) = make_pair(a, b)
+    return p * 10 + q
+
+[[test]]
+fn test_generic_tuple_decl() -> i32
+    assert pair_sum<i32>(0, 4, 3) == 43
+    0
+
+# EXPR_FLOAT_LIT: the literal's digits were dropped.
+fn half_of<T>(x: T, v: i64) -> i64
+    let f: f64 = v as f64 * 0.5
+    return f as i64
+
+[[test]]
+fn test_generic_float_literal() -> i32
+    assert half_of<i32>(0, 10) == 5
+    0
+
+# EXPR_TRY: the `?` operand (left) was dropped.
+fn checked_size(n: i64) -> Result<i64, i64>
+    if n == 4
+        return Ok(n)
+    Err(n)
+
+fn add_with_try<T>(x: T) -> Result<i64, i64>
+    let v = checked_size(4)?
+    Ok(v + 1)
+
+[[test]]
+fn test_generic_try() -> i32
+    let out = add_with_try<i32>(0)
+    if out.is_ok()
+        0
+    else
+        1

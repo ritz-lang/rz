@@ -56,10 +56,18 @@ def test_no_literal_sized_stmt_or_expr_allocs():
     )
 
 
+# Either the field itself, or (AGAST #1925) a byte copy of the whole node
+# made before any case runs, which includes span.
+def _copies_span(body: str, src: str, node: str) -> bool:
+    field = rf"^\s*cloned\.span\s*=\s*{src}\.span\b"
+    whole = rf"^\s*memcpy\(\s*cloned as \*u8,\s*{src} as \*u8,\s*sizeof\({node}\)\s*\)"
+    return bool(re.search(field, body, re.M) or re.search(whole, body, re.M))
+
+
 def test_clone_stmt_copies_span():
     """A cloned statement keeps its source position."""
     body = _fn_body((RITZ1_SRC / "monomorph.ritz").read_text(), "clone_stmt")
-    assert re.search(r"^\s*cloned\.span\s*=\s*s\.span\b", body, re.M), (
+    assert _copies_span(body, "s", "Stmt"), (
         "clone_stmt does not copy s.span into the clone"
     )
 
@@ -67,7 +75,7 @@ def test_clone_stmt_copies_span():
 def test_clone_expr_copies_span():
     """A cloned expression keeps its source position (static half)."""
     body = _fn_body((RITZ1_SRC / "monomorph.ritz").read_text(), "clone_expr")
-    assert re.search(r"^\s*cloned\.span\s*=\s*e\.span\b", body, re.M), (
+    assert _copies_span(body, "e", "Expr"), (
         "clone_expr does not copy e.span into the clone"
     )
 

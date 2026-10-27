@@ -220,9 +220,9 @@ def test_deref_addr_byval_arg_runs_at_O2(ritz1_bin, tmp_path, compiler):
 
 
 # AGAST #1747: monomorph clones a generic fn's body; the clone must keep a
-# nameless call's callee.  IR-level only: ritz1 drops array-literal and
-# indexed-store initialisers in generic clones (a separate defect), so the
-# array is uninitialised at run time.
+# nameless call's callee.  Until AGAST #1925 this checked IR only, because the
+# clone dropped the `[inc]` initialiser and the array was uninitialised at
+# run time.
 GENERIC_INDEXED = """
 fn inc(x: i32) -> i32
     return x + 1
@@ -238,7 +238,10 @@ pub fn main() -> i32
 
 @pytest.mark.integration
 def test_indexed_callee_survives_generic_clone(ritz1_bin, tmp_path):
-    text = _ll("ritz1", tmp_path, "generic_indexed", GENERIC_INDEXED).read_text()
+    ll = _ll("ritz1", tmp_path, "generic_indexed", GENERIC_INDEXED)
+    text = ll.read_text()
     body = text.split("define linkonce_odr i32 @apply_indexed$i64(", 1)[1]
     body = body.split("\n}", 1)[0]
     assert re.search(r"call i32 %[\w.]+\(i32 ", body), body
+    exe = tmp_path / "generic_indexed_ritz1"
+    assert _link_run([_o2_object(ll)], exe, with_start=True) == 42

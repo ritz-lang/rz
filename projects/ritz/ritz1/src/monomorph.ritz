@@ -1300,10 +1300,26 @@ fn clone_body(body: *Stmt, type_param: *u8, type_param_len: i32, subst_type: i32
 
     return cloned
 
+# AGAST #1925: a clone starts as a byte copy of its template, and each case
+# below then replaces the child Expr / Stmt pointers with deep clones.  Before
+# this, a clone copied only the fields its case listed, and malloc does not
+# zero memory.  A kind with no case (STMT_INDEX_ASSIGN, EXPR_ARRAY_LIT, ...)
+# kept its kind but had uninitialised fields, so `a[0] = v` and
+# `let a: [2]i64 = [7, 9]` emitted nothing in a generic fn's instantiation.
+# Scalars (names, kinds, a cast's pointee) are now always carried over.  A
+# kind that has no case still fails loudly (clone_unknown_kind), so a new kind
+# can't share the template's child pointers without anyone noticing.
+fn clone_unknown_kind(what: *u8, kind: i32)
+    eprints_cstr(c"error: ritz1 monomorph: ")
+    eprints_cstr(what)
+    eprints_cstr(c" has no case for kind ")
+    eprint_int(kind as i64)
+    eprints_cstr(c"\n")
+    sys_exit(1)
+
 fn clone_stmt(s: *Stmt, type_param: *u8, type_param_len: i32, subst_type: i32, subst_name: *u8, subst_len: i32, suffix: *u8, suffix_len: i32) -> *Stmt
     let cloned: *Stmt = malloc(sizeof(Stmt)) as *Stmt
-    cloned.kind = s.kind
-    cloned.span = s.span  # Keep the source position (AGAST #1649)
+    memcpy(cloned as *u8, s as *u8, sizeof(Stmt))  # AGAST #1925
     cloned.next = null
 
     let k: i32 = s.kind
@@ -1375,9 +1391,28 @@ fn clone_stmt(s: *Stmt, type_param: *u8, type_param_len: i32, subst_type: i32, s
     else if k == STMT_LOOP
         # Infinite loop — body stored in while_body (same slot as STMT_WHILE).
         cloned.while_body = clone_body(s.while_body, type_param, type_param_len, subst_type, subst_name, subst_len, suffix, suffix_len)
-    else if k == STMT_BREAK
-        # No fields to clone
+    else if k == STMT_BREAK or k == STMT_CONTINUE or k == STMT_STRIPPED
+        # No child nodes to clone
         0
+    else if k == STMT_INDEX_ASSIGN
+        # name[idx] = value; the index is stored in while_cond (AGAST #1925)
+        cloned.while_cond = clone_expr(s.while_cond, type_param, type_param_len, subst_type, subst_name, subst_len, suffix, suffix_len)
+        cloned.assign_value = clone_expr(s.assign_value, type_param, type_param_len, subst_type, subst_name, subst_len, suffix, suffix_len)
+    else if k == STMT_MEMBER_ASSIGN
+        # ptr.field = value; the pointer expression is in if_cond (AGAST #1925)
+        cloned.if_cond = clone_expr(s.if_cond, type_param, type_param_len, subst_type, subst_name, subst_len, suffix, suffix_len)
+        cloned.assign_value = clone_expr(s.assign_value, type_param, type_param_len, subst_type, subst_name, subst_len, suffix, suffix_len)
+    else if k == STMT_MEMBER_INDEX_ASSIGN
+        # ptr.field[idx] = value: pointer in if_cond, index in while_cond (AGAST #1925)
+        cloned.if_cond = clone_expr(s.if_cond, type_param, type_param_len, subst_type, subst_name, subst_len, suffix, suffix_len)
+        cloned.while_cond = clone_expr(s.while_cond, type_param, type_param_len, subst_type, subst_name, subst_len, suffix, suffix_len)
+        cloned.assign_value = clone_expr(s.assign_value, type_param, type_param_len, subst_type, subst_name, subst_len, suffix, suffix_len)
+    else if k == STMT_ASSERT
+        # The condition is in if_cond (AGAST #1925)
+        cloned.if_cond = clone_expr(s.if_cond, type_param, type_param_len, subst_type, subst_name, subst_len, suffix, suffix_len)
+    else if k == STMT_TUPLE_DECL
+        # let (a, b) = init; both names are carried over by the byte copy (AGAST #1925)
+        cloned.var_init = clone_expr(s.var_init, type_param, type_param_len, subst_type, subst_name, subst_len, suffix, suffix_len)
     else if k == STMT_LOCAL_FIELD_ASSIGN
         # v.field = value
         cloned.var_name = s.var_name
@@ -1401,6 +1436,8 @@ fn clone_stmt(s: *Stmt, type_param: *u8, type_param_len: i32, subst_type: i32, s
         cloned.if_cond = clone_expr(s.if_cond, type_param, type_param_len, subst_type, subst_name, subst_len, suffix, suffix_len)
         cloned.if_then = clone_match_arms(s.if_then as *MatchArm, type_param, type_param_len, subst_type, subst_name, subst_len, suffix, suffix_len) as *Stmt
         cloned.if_else = null
+    else
+        clone_unknown_kind(c"clone_stmt", k)
 
     return cloned
 
@@ -1409,8 +1446,7 @@ fn clone_expr(e: *Expr, type_param: *u8, type_param_len: i32, subst_type: i32, s
         return null
 
     let cloned: *Expr = malloc(sizeof(Expr)) as *Expr
-    cloned.kind = e.kind
-    cloned.span = e.span  # Keep the source position (AGAST #1649)
+    memcpy(cloned as *u8, e as *u8, sizeof(Expr))  # AGAST #1925; see clone_stmt
     cloned.next = null
 
     let k: i32 = e.kind
@@ -1532,6 +1568,18 @@ fn clone_expr(e: *Expr, type_param: *u8, type_param_len: i32, subst_type: i32, s
         # EXPR_MATCH stores scrutinee in left, arms in args (recast as *MatchArm).
         cloned.left = clone_expr(e.left, type_param, type_param_len, subst_type, subst_name, subst_len, suffix, suffix_len)
         cloned.args = clone_match_arms(e.args as *MatchArm, type_param, type_param_len, subst_type, subst_name, subst_len, suffix, suffix_len) as *Expr
+    else if k == EXPR_ARRAY_LIT
+        # [a, b, c]: the elements are the args list (AGAST #1925)
+        cloned.args = clone_expr_list(e.args, type_param, type_param_len, subst_type, subst_name, subst_len, suffix, suffix_len)
+    else if k == EXPR_ARRAY_FILL or k == EXPR_TRY
+        # [value; N] keeps value in left and N in int_val; `expr?` keeps expr
+        # in left (AGAST #1925)
+        cloned.left = clone_expr(e.left, type_param, type_param_len, subst_type, subst_name, subst_len, suffix, suffix_len)
+    else if k == EXPR_FLOAT_LIT
+        # The raw digits (string_ptr / string_len) come over with the byte copy
+        0
+    else
+        clone_unknown_kind(c"clone_expr", k)
 
     return cloned
 
