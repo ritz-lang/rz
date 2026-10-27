@@ -1,0 +1,79 @@
+# Regression (AGAST #1926): ritz1's monomorph renamed every bare struct name
+# inside a generic fn by appending the instantiation suffix, so the plain
+# struct `Cell` became `Cell$i64` in `get<i64>`.  No such struct exists, so
+# `p.v` failed with "unhandled EXPR_MEMBER" (or the IR named an undefined
+# type).  The suffix was meant for `@&Vec<T>` params, which parse as the
+# bare template name `Vec`.  It must be appended only when the name is a
+# generic struct template.
+#
+# Each test instantiates at a type whose name differs from the struct's, so
+# a wrongly suffixed name (`Cell$i32`) cannot accidentally resolve.
+
+struct Cell
+    v: i64
+
+struct Box<T>
+    val: T
+
+# Pointer param naming a plain struct (clone_params_with_suffix, *S branch).
+fn get_ptr<T>(x: T, p: *Cell) -> i64
+    return p.v + sizeof(T)
+
+[[test]]
+fn test_generic_plain_struct_ptr_param() -> i32
+    var c: Cell = Cell { v: 10 }
+    assert get_ptr<i32>(0, @c) == 14
+    assert get_ptr<i64>(0, @c) == 18
+    0
+
+# Borrow param naming a plain struct (clone_params_with_suffix, @S branch).
+fn get_ref<T>(x: T, p: @Cell) -> i64
+    return p.v + sizeof(T)
+
+[[test]]
+fn test_generic_plain_struct_ref_param() -> i32
+    var c: Cell = Cell { v: 20 }
+    assert get_ref<i32>(0, @c) == 24
+    0
+
+# Local of a plain struct type, initialised by a struct literal
+# (clone_stmt STMT_VAR_DECL and clone_expr EXPR_STRUCT_LIT).
+fn mk_local<T>(x: T) -> i64
+    var c: Cell = Cell { v: 3 }
+    c.v = c.v + sizeof(T)
+    return c.v
+
+[[test]]
+fn test_generic_plain_struct_local() -> i32
+    assert mk_local<i32>(0) == 7
+    assert mk_local<u8>(0) == 4
+    0
+
+# Plain struct as the return type (specialize_fn_one_param return branch).
+fn mk_ret<T>(x: T) -> Cell
+    return Cell { v: 30 + sizeof(T) }
+
+[[test]]
+fn test_generic_plain_struct_return() -> i32
+    let c: Cell = mk_ret<i32>(0)
+    assert c.v == 34
+    0
+
+# A generic struct named inside a generic fn still gets the suffix: the
+# fix must not stop `*Box<T>` / `Box<T> { .. }` becoming `Box$i32`.
+fn box_get<T>(b: *Box<T>) -> T
+    return b.val
+
+fn box_mk<T>(x: T) -> T
+    let b: Box<T> = Box<T> { val: x }
+    return box_get<T>(@b)
+
+[[test]]
+fn test_generic_struct_still_suffixed() -> i32
+    assert box_mk<i32>(41) == 41
+    assert box_mk<i64>(42) == 42
+    0
+
+# Every spelled `Box<T>` above reaches monomorph already mangled (`Box$T`).
+# Only an inferred literal `Box { val: x }` still reaches the bare-template
+# append path, and ritz0 rejects that form, so this matrix file can't test it.

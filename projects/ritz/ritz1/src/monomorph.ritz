@@ -1063,6 +1063,7 @@ fn replace_param_component(name: *u8, name_len: i32, type_param: *u8, type_param
 # Specialise `template` at ONE type parameter (type_param_name) bound to the
 # one-argument suffix "$arg".  The result's name is template.name + suffix.
 fn specialize_fn_one_param(m: *Module, template: *FnDef, type_param_name: *u8, type_param_len: i32, suffix: *u8, suffix_len: i32) -> *FnDef
+    g_mono_module = m  # AGAST #1926: see names_generic_struct
     # Create a new FnDef with mangled name
     let mangled_name_len: i32 = template.name_len + suffix_len
     let mangled_name: *u8 = malloc(mangled_name_len as i64 + 1) as *u8
@@ -1228,6 +1229,18 @@ fn mangle_struct_name(name: *u8, name_len: i32, suffix: *u8, suffix_len: i32) ->
     *(mangled + mangled_len) = 0
     return mangled
 
+# The module being specialised, so substitute_type_param_in_name can ask
+# whether a bare name is a generic struct template (AGAST #1926).  Set by
+# specialize_fn_one_param, through which every clone_* path runs.
+var g_mono_module: *Module = null
+
+fn names_generic_struct(name: *u8, name_len: i32) -> i32
+    if g_mono_module == null
+        return 0
+    if find_generic_struct(g_mono_module, name, name_len) == null
+        return 0
+    1
+
 # Substitute type parameter in a mangled name like "Vec$T" -> "Vec$u8"
 # Input: name = "Vec$T", type_param = "T", new_suffix = "$u8"
 # Output: "Vec$u8"
@@ -1267,8 +1280,11 @@ fn substitute_type_param_in_name(name: *u8, name_len: i32, type_param: *u8, type
                 return
 
     # If the name doesn't have $T pattern, it might be a bare struct name like "Vec"
-    # that needs the suffix appended (for @&Vec<T> parameters)
-    if new_suffix_len > 0
+    # that needs the suffix appended (for @&Vec<T> parameters).  Only a generic
+    # struct TEMPLATE gets it: a plain struct (`p: *Cell`, `var c: Cell`,
+    # `Cell { .. }`) keeps its name, else `Cell` -> `Cell$i64`, which does not
+    # exist (AGAST #1926).
+    if new_suffix_len > 0 and names_generic_struct(name, name_len) != 0
         # Append the new suffix (e.g., "Vec" + "$u8" = "Vec$u8")
         let new_len: i32 = name_len + new_suffix_len
         let result: *u8 = malloc(new_len as i64 + 1) as *u8
