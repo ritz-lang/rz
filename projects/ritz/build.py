@@ -34,6 +34,7 @@ except ImportError:
     import tomli as tomllib  # Python < 3.11
 
 from cache import BuildCache
+import cas
 
 
 ROOT = Path(__file__).parent
@@ -249,6 +250,12 @@ def _stderr_tail(stderr: str, lines: int = CLANG_OBJ_STDERR_TAIL) -> str:
     return "\n".join(tail)
 
 
+# The per-module object compile. Part of every artifact-store key
+# (`cas_module_key`), so changing it can never return an object built with the
+# old flags.
+OBJ_CLANG_FLAGS = ["-c", "-O2", "-fPIC", *FREESTANDING_FLAGS]
+
+
 def compile_ll_to_obj(ll_path: Path, obj_path: Path, src: Path) -> Optional[str]:
     """Run the bounded `clang -c -O2` for one .ll. Return None on success.
 
@@ -259,8 +266,7 @@ def compile_ll_to_obj(ll_path: Path, obj_path: Path, src: Path) -> Optional[str]
     global CLANG_OBJ_FAILURES
     timeout = _env_int(CLANG_OBJ_TIMEOUT_ENV, CLANG_OBJ_TIMEOUT_DEFAULT)
     mem_mb = _env_int(CLANG_OBJ_MEM_ENV, CLANG_OBJ_MEM_MB_DEFAULT)
-    cmd = ["clang", "-c", "-O2", "-fPIC", *FREESTANDING_FLAGS,
-           str(ll_path), "-o", str(obj_path)]
+    cmd = ["clang", *OBJ_CLANG_FLAGS, str(ll_path), "-o", str(obj_path)]
 
     # Own session, so a timeout kills clang and anything it spawned (cc1 when
     # not integrated), not just the driver.
@@ -311,7 +317,9 @@ RITZ0_DIR = ROOT / "ritz0"
 if str(RITZ0_DIR) not in sys.path:
     sys.path.insert(0, str(RITZ0_DIR))
 
-# Global build cache instance
+# Global build cache instance. Since AGAST #1808 it only supplies the import
+# graph (resolver scans, persisted per worktree) and the compiler fingerprint;
+# compiled artifacts live in the shared `cas.ArtifactStore`.
 _build_cache: dict[str, BuildCache] = {}
 
 def get_build_cache(compiler: str = "ritz0") -> BuildCache:
@@ -325,6 +333,35 @@ def get_build_cache(compiler: str = "ritz0") -> BuildCache:
     if compiler not in _build_cache:
         _build_cache[compiler] = BuildCache(project_root=ROOT, compiler=compiler)
     return _build_cache[compiler]
+
+
+def _verify_ir_enabled() -> bool:
+    return os.environ.get("RITZ_VERIFY_IR", "") in ("1", "true", "yes", "on")
+
+
+def cas_module_key(src: Path, cache: BuildCache, compiler: str) -> Optional[str]:
+    """Artifact-store key for one module compiled `--no-runtime` (AGAST #1808).
+
+    Covers the compiler fingerprint, the object flags, RITZ_VERIFY_IR (a hit
+    must not skip a verification the caller asked for), the module's source
+    and every module in its transitive import closure, resolved by the
+    context `cache.set_import_context` was given. None when the closure
+    cannot be scanned (a parse error): the caller compiles uncached and the
+    compiler reports the real error.
+    """
+    try:
+        closure = cache.get_transitive_dependencies(Path(src))
+    except Exception:
+        return None
+    # Persist fresh scans: a fully cached build never writes them otherwise.
+    cache._save_imports_db()
+    return cas.module_key(
+        compiler_fp=cache._get_current_compiler_hash(),
+        source=Path(src),
+        closure=[Path(p) for p in closure],
+        flags={"compiler": compiler, "emit": "no-runtime",
+               "obj": OBJ_CLANG_FLAGS, "verify_ir": _verify_ir_enabled()},
+    )
 
 
 def report_compile_failures(failures: List[Tuple[Path, str]], compiler: str) -> None:
@@ -1314,8 +1351,8 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
     # compiler is unchanged.
     compiler_changed = cache.invalidate_if_compiler_changed() if use_cache else False
 
-    # Check for llvm-as (needed for .ll → .bc conversion)
-    has_llvm_as = shutil_mod.which("llvm-as") is not None
+    # AGAST #1808: compiled modules come from, and go to, the shared store.
+    store = cas.ArtifactStore()
 
     # Discover all source files through import resolution using subprocess
     # This avoids Python import path issues
@@ -1422,44 +1459,18 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
             bc_path = artifact_dir / f"{src_name}.bc"
             obj_path = artifact_dir / f"{src_name}.o"
 
-            # AGAST #192: Fastest path — cached .o.  Skips ritz1 + clang -c
-            # entirely.  This is what makes the touched-source warm rebuild
-            # finish under 3s on zeus (otherwise the link step has to lower
-            # all 8 .ll files from text IR every time, ~3s of pure clang
-            # work even when their content is unchanged).
-            if use_cache:
-                cached_obj = cache.get_cached_obj(src)
-                if cached_obj:
-                    shutil_mod.copy2(cached_obj, obj_path)
+            # AGAST #1808: the shared content-addressed store. A hit is an
+            # object compiled from exactly this source and import closure, by
+            # this compiler, with these flags: in this worktree or any other.
+            # It replaces the per-worktree .ritz-cache objects (and the
+            # .bc/.ll tiers, which a hit on the .o always made unreachable).
+            cas_key = cas_module_key(src, cache, compiler) if use_cache else None
+            if cas_key is not None:
+                cached_obj = store.get(cas_key, "o")
+                if cached_obj is not None:
+                    shutil_mod.copyfile(cached_obj, obj_path)
                     link_files.append(obj_path)
                     continue
-
-            # RFC #109 Phase 3: Check for cached .bc next (faster than .ll)
-            if use_cache and has_llvm_as:
-                cached_bc = cache.get_cached_bc(src)
-                if cached_bc:
-                    # Copy cached .bc to artifact dir
-                    shutil_mod.copy2(cached_bc, bc_path)
-                    link_files.append(bc_path)
-                    continue
-
-            # Check cache for .ll file
-            if use_cache:
-                needs_rebuild, reason = cache.needs_rebuild(src)
-                if not needs_rebuild:
-                    cached_ll = cache.get_cached_ll(src)
-                    if cached_ll:
-                        ll_path.write_text(cached_ll)
-                        # Pre-compile cached IR to a native .o so the link
-                        # step doesn't have to re-lower it on every invocation.
-                        # AGAST #1731: bounded, and a failure fails the build.
-                        obj_error = compile_ll_to_obj(ll_path, obj_path, src)
-                        if obj_error is not None:
-                            obj_failures.append(obj_error)
-                            continue
-                        cache.update_obj_cache(src, obj_path)
-                        link_files.append(obj_path)
-                        continue
 
             # All sources compiled without runtime - _start comes from external .o
             if compiler.startswith("ritz1"):
@@ -1501,11 +1512,6 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
                 compile_failures.append((src, ir_error))
                 continue
 
-            # Update .ll cache
-            if use_cache:
-                ll_content = ll_path.read_text()
-                cache.update_cache(src, ll_content)
-
             # AGAST #192: Pre-compile freshly emitted .ll to .o.  Without
             # this, the link step pays for full IR lowering on every file
             # (cached or not).  Caching the .o means subsequent rebuilds —
@@ -1518,8 +1524,11 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
             if obj_error is not None:
                 obj_failures.append(obj_error)
                 continue
-            if use_cache:
-                cache.update_obj_cache(src, obj_path)
+            if cas_key is not None:
+                ident = cas.module_identity(src)
+                store.put(cas_key, "ll", ll_path)
+                store.put(cas_key, "o", obj_path, identity=ident)
+                store.put_meta(cas_key, {"module": ident, "compiler": compiler})
             link_files.append(obj_path)
 
         # AGAST #1286: every source has now been attempted. If any failed,

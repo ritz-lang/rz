@@ -57,7 +57,10 @@ Exit code: 0 only if every step it ran exited 0.
 from __future__ import annotations
 
 import argparse
+import importlib.util
+import os
 import subprocess
+import tempfile
 import sys
 import time
 from datetime import datetime
@@ -154,6 +157,34 @@ def print_timings(timings: list[tuple[str, float, int]]) -> None:
     print(f"  {'total':<{width}}  {total:8.1f}s")
 
 
+def _cas_module():
+    """projects/ritz/cas.py, loaded by path (it is not an installed package)."""
+    spec = importlib.util.spec_from_file_location(
+        "ritz_cas", Path(__file__).resolve().parents[1] / "cas.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def print_cas_summary(log: Path) -> None:
+    """AGAST #1808: one line proving how often the gate compiled each module.
+
+    Every build.py / test_runner process appends its artifact-store counters
+    to RITZ_CAS_STATS_LOG; a module named under "compiled more than once" was
+    compiled by two processes that missed on the same key at the same time.
+    """
+    if not log.is_file():
+        print("[ritz-cas] gate: no artifact-store activity recorded")
+        return
+    cas = _cas_module()
+    res = cas.summarise(log)
+    print(f"[ritz-cas] gate: processes={res['processes']} hits={res['hits']} "
+          f"misses={res['misses']} compiled={res['compiled']} "
+          f"bytes_written={res['bytes_written']}")
+    for key, ident in sorted(res["compiled_more_than_once"].items()):
+        print(f"  compiled more than once: {ident} ({key})")
+
+
 def run_step(step: Step, dry_run: bool = False) -> int:
     cwd = (REPO_ROOT / step.workdir).resolve()
     print(f"\n{'=' * 70}", flush=True)
@@ -211,6 +242,13 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         selected = [job]
 
+    cas_log = None
+    if not args.dry_run and not os.environ.get("RITZ_CAS_STATS_LOG"):
+        fd, name = tempfile.mkstemp(prefix="ritz-cas-stats-", suffix=".jsonl")
+        os.close(fd)
+        cas_log = Path(name)
+        os.environ["RITZ_CAS_STATS_LOG"] = name  # inherited by every step
+
     failures: list[str] = []
     skipped: list[str] = []
     not_run: list[str] = []
@@ -231,6 +269,9 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"\n{'=' * 70}")
     print_timings(timings)
+    if cas_log is not None:
+        print_cas_summary(cas_log)
+        cas_log.unlink(missing_ok=True)
     if not_run:
         # Named, never silent: a fail-fast run asserts less than a full one.
         print("not run (--fail-fast stopped after the first failure):")

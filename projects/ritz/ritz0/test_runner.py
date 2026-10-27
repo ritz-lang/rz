@@ -388,6 +388,49 @@ def setup_test_environment(source_path: str, tmpdir: str) -> Tuple[Optional[Path
         return None, None, f"Import resolution failed: {e}", None
 
 
+# AGAST #1808: dependency objects come from the shared content-addressed
+# store (projects/ritz/cas.py) that build.py writes, keyed exactly as build.py
+# keys them. Before this every test file started from an empty in-memory
+# cache and ran ritz0 once per module of its ritzlib closure: thousands of
+# ritzlib compiles per `rz test --all`. Set RITZ_NO_CAS=1 to bypass it.
+NO_CAS_ENV = "RITZ_NO_CAS"
+_BUILD_MODULE = None
+
+
+def _build_module():
+    """build.py, imported once. It owns the store key and the object flags."""
+    global _BUILD_MODULE
+    if _BUILD_MODULE is None:
+        import importlib.util
+        pkg_dir = Path(__file__).resolve().parent.parent
+        # Appended, not prepended: projects/ritz holds `packaging.py`, which
+        # must not shadow the PyPI package. build.py itself is loaded by path,
+        # because a bare `import build` finds whichever `build` comes first on
+        # sys.path (the `ritz0/build/` output directory, PyPA's `build`).
+        if str(pkg_dir) not in sys.path:
+            sys.path.append(str(pkg_dir))
+        spec = importlib.util.spec_from_file_location("ritz_build_py", pkg_dir / "build.py")
+        build = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(build)
+        _BUILD_MODULE = build
+    return _BUILD_MODULE
+
+
+def _cas_context(project_root, dependencies):
+    """(build module, BuildCache, ArtifactStore) set up to resolve imports the
+    way ritz0 is invoked below, or None if the store is disabled."""
+    if os.environ.get(NO_CAS_ENV, "") not in ("", "0"):
+        return None
+    build = _build_module()
+    cache = build.get_build_cache("ritz0")
+    cache.set_import_context(
+        project_root=project_root,
+        dependencies={n: (Path(d.path), list(d.sources)) for n, d in (dependencies or {}).items()},
+        source_roots=project_source_roots(project_root),
+    )
+    return build, cache, build.cas.ArtifactStore()
+
+
 def compile_dependencies(
     source_files: List[Path],
     tmpdir: str,
@@ -411,6 +454,7 @@ def compile_dependencies(
     ritz0_dir = Path(__file__).parent
     ritz0_py = ritz0_dir / "ritz0.py"
     ll_files = []
+    ctx = _cas_context(project_root, dependencies) if source_files else None
 
     for src in source_files:
         src_key = str(Path(src).resolve())
@@ -420,10 +464,24 @@ def compile_dependencies(
             ll_files.append(ll_cache[src_key])
             continue
 
-        # Compile to .ll
         path_hash = hashlib.md5(src_key.encode()).hexdigest()[:8]
         src_name = f"{Path(src).stem}_{path_hash}"
         ll_path = os.path.join(tmpdir, f"{src_name}.ll")
+        obj_path = os.path.join(tmpdir, f"{src_name}.o")
+
+        cas_key = None
+        if ctx is not None:
+            build, cache, store = ctx
+            cas_key = build.cas_module_key(Path(src_key), cache, "ritz0")
+            if cas_key is not None:
+                cached = store.get(cas_key, "o")
+                if cached is not None:
+                    shutil.copyfile(cached, obj_path)
+                    ll_cache[src_key] = obj_path
+                    ll_files.append(obj_path)
+                    continue
+
+        # Compile to .ll
 
         compile_cmd = [sys.executable, str(ritz0_py), str(src), "-o", ll_path, "--no-runtime"]
 
@@ -443,6 +501,18 @@ def compile_dependencies(
         result = subprocess.run(compile_cmd, capture_output=True, text=True)
         if result.returncode != 0:
             return None, f"ritz0 failed for {Path(src).name}: {result.stderr}"
+
+        if cas_key is not None:
+            # Same pipeline as build.py: verify (if asked), clang -c, store.
+            error = (build.verify_ir(Path(ll_path), Path(src_key))
+                     or build.compile_ll_to_obj(Path(ll_path), Path(obj_path), Path(src_key)))
+            if error:
+                return None, error
+            ident = build.cas.module_identity(Path(src_key))
+            store.put(cas_key, "ll", Path(ll_path))
+            store.put(cas_key, "o", Path(obj_path), identity=ident)
+            store.put_meta(cas_key, {"module": ident, "compiler": "ritz0"})
+            ll_path = obj_path
 
         ll_cache[src_key] = ll_path
         ll_files.append(ll_path)
