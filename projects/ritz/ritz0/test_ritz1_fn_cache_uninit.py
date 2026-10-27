@@ -23,7 +23,6 @@ Stmt/Expr clones fixed in #1649.
 """
 
 import json
-import os
 import re
 import shutil
 import subprocess
@@ -56,26 +55,6 @@ CLONED_TYPES = ("FnDef", "Param", "MatchArm", "FieldInit", "StructDef", "StructF
 LITERAL_ALLOC = re.compile(
     r"\bmalloc\(\s*\d+\s*\)\s+as\s+\*(" + "|".join(CLONED_TYPES) + r")\b"
 )
-
-
-@pytest.fixture(scope="module")
-def ritz1_bin() -> Path:
-    """Build (or freshen) ritz1; a stale binary would test old code."""
-    env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
-    proc = subprocess.run(
-        ["make", "-C", "ritz1", "ritz1"],
-        cwd=RITZ_ROOT,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=1800,
-    )
-    if proc.returncode != 0 or not RITZ1_BIN.exists():
-        pytest.fail(
-            "could not build ritz1 for the fn_cache uninit tests:\n"
-            f"{proc.stdout[-4000:]}\n{proc.stderr[-4000:]}"
-        )
-    return RITZ1_BIN
 
 
 @pytest.fixture

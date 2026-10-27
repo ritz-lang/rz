@@ -47,13 +47,7 @@ from pathlib import Path
 
 import pytest
 
-from test_ritz1_builtin_struct_shadow import (  # noqa: F401
-    RITZ0,
-    RITZ1_BIN,
-    RITZ_ROOT,
-    _run_pkg,
-    ritz1_bin,
-)
+from test_ritz1_builtin_struct_shadow import RITZ0, RITZ1_BIN, RITZ_ROOT, _run_pkg
 
 import emitter_llvmlite
 
@@ -208,7 +202,7 @@ def test_ritz0_oracle(tmp_path, name):
 
 @pytest.mark.integration
 @pytest.mark.parametrize("name", sorted(CASES))
-def test_ritz1_ufcs_prefix(ritz1_bin, tmp_path, name):  # noqa: F811
+def test_ritz1_ufcs_prefix(ritz1_bin, tmp_path, name):
     program, want = CASES[name]
     assert _run_pkg("ritz1", tmp_path, name, program) == want
 
@@ -238,7 +232,7 @@ def _called_symbols(compiler: str, tmp_path: Path) -> set:
 
 
 @pytest.mark.integration
-def test_repro_calls_same_symbols_as_ritz0(ritz1_bin, tmp_path):  # noqa: F811
+def test_repro_calls_same_symbols_as_ritz0(ritz1_bin, tmp_path):
     r0, _ = _called_symbols("ritz0", tmp_path)
     r1, r1_text = _called_symbols("ritz1", tmp_path)
     want = {"string_new", "string_push_str", "string_len"}

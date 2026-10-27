@@ -30,7 +30,7 @@ program returns 42 when correct and a small code naming the failed check.
 
 import pytest
 
-from test_ritz1_builtin_struct_shadow import _run, ritz1_bin  # noqa: F401
+from test_ritz1_builtin_struct_shadow import _run
 
 # The ticket's repro: bound arm first, StrView param second.
 BOUND_THEN_PARAM = """\
@@ -169,6 +169,6 @@ def test_ritz0_oracle(tmp_path, name):
 
 @pytest.mark.integration
 @pytest.mark.parametrize("name", sorted(CASES))
-def test_ritz1_let_match_struct(ritz1_bin, tmp_path, name):  # noqa: F811
+def test_ritz1_let_match_struct(ritz1_bin, tmp_path, name):
     program, want = CASES[name]
     assert _run("ritz1", tmp_path, name, program) == want

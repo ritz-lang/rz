@@ -68,27 +68,8 @@ RITZ1 = RITZ_ROOT / "ritz1" / "build" / "ritz1"
 
 
 @pytest.fixture(scope="module", autouse=True)
-def _ritz1_built():
-    """Build (or freshen) the ritz1 binary; fail loudly rather than skip.
-
-    A skipped test is indistinguishable from a passing one in aggregate
-    output — "reported success while asserting nothing" is the exact failure
-    family #1301/#1322/#1327 are about.
-    """
-    env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
-    proc = subprocess.run(
-        ["make", "-C", "ritz1", "ritz1"],
-        cwd=RITZ_ROOT,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=1800,
-    )
-    if proc.returncode != 0 or not RITZ1.exists():
-        pytest.fail(
-            "could not build ritz1 for the cache-identity tests:\n"
-            f"{proc.stdout[-4000:]}\n{proc.stderr[-4000:]}"
-        )
+def _ritz1_built(ritz1_bin):
+    """Every test here needs an up-to-date ritz1: conftest's session build (#1804)."""
 
 # Deliberately import-free: these tests exercise the cache, not the language,
 # and a standalone source keeps the compile fast and RITZ_PATH-independent.

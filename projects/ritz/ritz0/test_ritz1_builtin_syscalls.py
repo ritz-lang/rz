@@ -36,12 +36,7 @@ import subprocess
 
 import pytest
 
-from test_ritz1_builtin_struct_shadow import (  # noqa: F401
-    RITZ1_BIN,
-    RITZ_ROOT,
-    _run,
-    ritz1_bin,
-)
+from test_ritz1_builtin_struct_shadow import RITZ1_BIN, RITZ_ROOT, _run
 
 EXPECTED = 42
 
@@ -323,13 +318,13 @@ RITZ1_XFAIL = {
         for n in sorted(PROGRAMS)
     ],
 )
-def test_ritz1_named_syscall_builtins(ritz1_bin, tmp_path, name):  # noqa: F811
+def test_ritz1_named_syscall_builtins(ritz1_bin, tmp_path, name):
     """ritz1 left `open`/`read`/`write`/`close`/`nanosleep` undefined (#1791)."""
     assert _run("ritz1", tmp_path, name, _program(name, tmp_path)) == EXPECTED
 
 
 @pytest.mark.integration
-def test_ritz1_emits_no_extern_for_builtins(ritz1_bin, tmp_path):  # noqa: F811
+def test_ritz1_emits_no_extern_for_builtins(ritz1_bin, tmp_path):
     """The builtins resolve in-module: no `declare` for them or their bodies."""
     comp, ir = _ritz1_compile(tmp_path, _program("write_read_round_trip", tmp_path))
     assert comp.returncode == 0, comp.stderr[-2000:]
@@ -340,7 +335,7 @@ def test_ritz1_emits_no_extern_for_builtins(ritz1_bin, tmp_path):  # noqa: F811
 
 
 @pytest.mark.integration
-def test_ritz1_builtin_calls_pass_three_args(ritz1_bin, tmp_path):  # noqa: F811
+def test_ritz1_builtin_calls_pass_three_args(ritz1_bin, tmp_path):
     """Every body takes three i64s; shorter calls are zero-padded to match.
 
     A short call still runs (the kernel ignores the unset registers), so
@@ -362,7 +357,7 @@ def test_ritz1_builtin_calls_pass_three_args(ritz1_bin, tmp_path):  # noqa: F811
 
 
 @pytest.mark.integration
-def test_ritz1_builtin_bodies_only_when_used(ritz1_bin, tmp_path):  # noqa: F811
+def test_ritz1_builtin_bodies_only_when_used(ritz1_bin, tmp_path):
     """A module that calls none of the five carries none of their bodies."""
     comp, ir = _ritz1_compile(tmp_path, "pub fn main() -> i32\n    42\n")
     assert comp.returncode == 0, comp.stderr[-2000:]
@@ -373,7 +368,7 @@ def test_ritz1_builtin_bodies_only_when_used(ritz1_bin, tmp_path):  # noqa: F811
 @pytest.mark.parametrize(
     "call", ["close()", 'write(1, c"x", 1, 0)'], ids=["no_args", "four_args"]
 )
-def test_ritz1_rejects_bad_arity(ritz1_bin, tmp_path, call):  # noqa: F811
+def test_ritz1_rejects_bad_arity(ritz1_bin, tmp_path, call):
     """ritz0 refuses 0 or more than 3 arguments; so does ritz1."""
     comp, _ = _ritz1_compile(tmp_path, f"pub fn main() -> i32\n    {call}\n    42\n")
     assert comp.returncode != 0
@@ -381,7 +376,7 @@ def test_ritz1_rejects_bad_arity(ritz1_bin, tmp_path, call):  # noqa: F811
 
 
 @pytest.mark.integration
-def test_ritz1_builtins_link_across_modules(ritz1_bin, tmp_path):  # noqa: F811
+def test_ritz1_builtins_link_across_modules(ritz1_bin, tmp_path):
     """Two modules that both use `write` link: the weak_odr bodies merge."""
     pkg = tmp_path / "twomod"
     (pkg / "src").mkdir(parents=True)

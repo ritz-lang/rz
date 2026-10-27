@@ -29,7 +29,7 @@ Oracle: ritz0 builds and runs every program with the same exit code.
 
 import pytest
 
-from test_ritz1_builtin_struct_shadow import _run_pkg, ritz1_bin  # noqa: F401
+from test_ritz1_builtin_struct_shadow import _run_pkg
 
 # `second.len` = 40 reads element 1 at `data + 1`, so the stride must be
 # sizeof(StrView) = 16. Plus len 2 = 42.
@@ -147,6 +147,6 @@ def test_ritz0_oracle(tmp_path, name):
 
 @pytest.mark.integration
 @pytest.mark.parametrize("name", sorted(CASES))
-def test_ritz1_vec_struct_elem(ritz1_bin, tmp_path, name):  # noqa: F811
+def test_ritz1_vec_struct_elem(ritz1_bin, tmp_path, name):
     program, want = CASES[name]
     assert _run_pkg("ritz1", tmp_path, name, program) == want

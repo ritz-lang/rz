@@ -31,7 +31,11 @@ from pathlib import Path
 import pytest
 
 from test_ritz1_builtin_struct_shadow import RITZ_ROOT
-from test_ritz1_builtin_struct_shadow import ritz1_bin  # noqa: F401
+
+# xdist_group("tree") (AGAST #1804): build.py without --no-cache reads and writes the
+# shared projects/ritz/.ritz-cache{,-ritz1}.  Tests in the group
+# run on one xdist worker, one at a time; see conftest.py.
+pytestmark = pytest.mark.xdist_group("tree")
 
 
 def _manifest(name: str) -> str:

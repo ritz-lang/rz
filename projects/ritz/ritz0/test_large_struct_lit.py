@@ -30,7 +30,6 @@ import re
 
 import pytest
 
-from test_ritz1_builtin_struct_shadow import ritz1_bin  # noqa: F401
 from test_ritz1_large_struct_ret import (
     _assert_no_libc_mem,
     _link_run,
@@ -271,7 +270,7 @@ ZEROED = """\
 
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", ("ritz0", "ritz1"))
-def test_large_struct_lits_run_at_O2(ritz1_bin, tmp_path, compiler):  # noqa: F811
+def test_large_struct_lits_run_at_O2(ritz1_bin, tmp_path, compiler):
     """ritz1 runs the same program as an oracle, minus the omitted-field case:
     ritz1 leaves omitted fields uninitialised (AGAST #1749)."""
     if compiler == "ritz0":

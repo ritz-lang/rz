@@ -27,7 +27,7 @@ import re
 
 import pytest
 
-from test_ritz1_builtin_struct_shadow import _run, ritz1_bin  # noqa: F401
+from test_ritz1_builtin_struct_shadow import _run
 
 # The ticket's repro: an entry-block value, then an if-without-else. The if
 # yields no value, so the method returns 0 for either value of `c`.
@@ -215,7 +215,7 @@ def _block_shape_errors(ll_text: str) -> list[str]:
 
 @pytest.mark.integration
 @pytest.mark.parametrize("name,program", CASES, ids=[c[0] for c in CASES])
-def test_method_tail_matches_ritz0(ritz1_bin, tmp_path, name, program):  # noqa: F811
+def test_method_tail_matches_ritz0(ritz1_bin, tmp_path, name, program):
     expected = _run("ritz0", tmp_path, name, program)
     got = _run("ritz1", tmp_path, name, program)
     shape = _block_shape_errors((tmp_path / f"{name}_ritz1.ll").read_text())

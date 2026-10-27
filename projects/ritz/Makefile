@@ -115,10 +115,15 @@ harness-selftest:
 ci-local:
 	@$(PYTHON) tools/ci_local.py $(ARGS)
 
-# Python unit tests for ritz0 compiler
+# Python unit tests for ritz0 compiler, in parallel under pytest-xdist (AGAST
+# #1804).  PYTEST_J workers, default 8: with -n auto a 12-core host would run
+# 12 on a VM shared with the gate and the task rooms.  `--dist loadgroup` keeps
+# xdist_group("tree") tests on one worker; see ritz0/conftest.py.  PYTEST_J=0
+# runs serially.
+PYTEST_J ?= 8
 unit:
-	@echo "=== Running ritz0 unit tests ==="
-	@cd ritz0 && $(PYTHON) -m pytest -q
+	@echo "=== Running ritz0 unit tests (-n $(PYTEST_J)) ==="
+	@cd ritz0 && $(PYTHON) -m pytest -q -n $(PYTEST_J) --dist loadgroup
 
 # Run .ritz language tests (test levels)
 ritz:

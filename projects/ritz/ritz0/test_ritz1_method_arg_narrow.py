@@ -27,7 +27,7 @@ import re
 
 import pytest
 
-from test_ritz1_builtin_struct_shadow import _run, ritz1_bin  # noqa: F401
+from test_ritz1_builtin_struct_shadow import _run
 
 # The #1607 ticket repro: an i32 param through a `self:& P` receiver.
 MUT_REF_I32 = """\
@@ -231,7 +231,7 @@ CASES = [
 
 @pytest.mark.integration
 @pytest.mark.parametrize("name,program", CASES, ids=[c[0] for c in CASES])
-def test_method_args_match_ritz0(ritz1_bin, tmp_path, name, program):  # noqa: F811
+def test_method_args_match_ritz0(ritz1_bin, tmp_path, name, program):
     expected = _run("ritz0", tmp_path, name, program)
     got = _run("ritz1", tmp_path, name, program)
     assert got == expected, f"{name}: ritz1 exit {got}, ritz0 exit {expected}"
@@ -239,7 +239,7 @@ def test_method_args_match_ritz0(ritz1_bin, tmp_path, name, program):  # noqa: F
 
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", ["ritz0", "ritz1"])
-def test_pointer_receivers_pass_the_pointer(ritz1_bin, tmp_path, compiler):  # noqa: F811
+def test_pointer_receivers_pass_the_pointer(ritz1_bin, tmp_path, compiler):
     """Both compilers must get RECEIVER_FORMS right, not merely agree: ritz0
     also passed a pointer field's slot (`o.q.put`, exit 5) (AGAST #1692)."""
     got = _run(compiler, tmp_path, "ptr_recv", RECEIVER_FORMS)
@@ -247,7 +247,7 @@ def test_pointer_receivers_pass_the_pointer(ritz1_bin, tmp_path, compiler):  # n
 
 
 @pytest.mark.integration
-def test_void_method_called_as_void(ritz1_bin, tmp_path):  # noqa: F811
+def test_void_method_called_as_void(ritz1_bin, tmp_path):
     """clang accepts `call i64` to a void define, so check the IR itself."""
     _run("ritz1", tmp_path, "void_ir", VOID_I64_ONLY)
     ll = (tmp_path / "void_ir_ritz1.ll").read_text()
@@ -280,5 +280,5 @@ pub fn main() -> i32
 
 
 @pytest.mark.integration
-def test_bool_global_arg_not_retruncated(ritz1_bin, tmp_path):  # noqa: F811
+def test_bool_global_arg_not_retruncated(ritz1_bin, tmp_path):
     assert _run("ritz1", tmp_path, "bool_global", BOOL_GLOBAL) == 42

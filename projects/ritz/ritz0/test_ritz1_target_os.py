@@ -82,35 +82,6 @@ PROGRAMS = {
 }
 
 
-def _make(target_dir: str, target: str, product: Path) -> None:
-    env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
-    proc = subprocess.run(
-        ["make", "-C", target_dir, target],
-        cwd=RITZ_ROOT,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=1800,
-    )
-    if proc.returncode != 0 or not product.exists():
-        pytest.fail(
-            f"could not build {product}:\n{proc.stdout[-4000:]}\n{proc.stderr[-4000:]}"
-        )
-
-
-@pytest.fixture(scope="module")
-def ritz_start() -> Path:
-    _make("runtime", RITZ_START.name, RITZ_START)
-    return RITZ_START
-
-
-@pytest.fixture(scope="module")
-def ritz1_bin(ritz_start) -> Path:
-    # A stale binary would test the old filter.
-    _make("ritz1", "ritz1", RITZ1_BIN)
-    return RITZ1_BIN
-
-
 def _ritz1(cwd: Path, argv: list) -> subprocess.CompletedProcess:
     env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
     return subprocess.run(

@@ -38,7 +38,6 @@ import re
 
 import pytest
 
-from test_ritz1_builtin_struct_shadow import ritz1_bin  # noqa: F401
 from test_ritz1_large_struct_ret import (
     _assert_no_libc_mem,
     _link_run,
@@ -141,7 +140,7 @@ pub fn use1(p: *Big, o: *Outer) -> i32
 @pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("name", sorted(COPY_CASES))
 def test_huge_struct_copy_compiles_at_O2_within_bound(
-    ritz1_bin,  # noqa: F811
+    ritz1_bin,
     tmp_path,
     compiler,
     name,
@@ -154,7 +153,7 @@ def test_huge_struct_copy_compiles_at_O2_within_bound(
 @pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("name", sorted(COPY_CASES))
 def test_large_struct_copy_has_no_first_class_store(
-    ritz1_bin,  # noqa: F811
+    ritz1_bin,
     tmp_path,
     compiler,
     name,
@@ -258,7 +257,7 @@ pub fn main() -> i32
 
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
-def test_large_struct_copies_run_at_O2(ritz1_bin, tmp_path, compiler):  # noqa: F811
+def test_large_struct_copies_run_at_O2(ritz1_bin, tmp_path, compiler):
     ll = _ll(compiler, tmp_path, "run", RUN)
     assert COPY_CALL.search(ll.read_text()), "the copy rewrite did not engage"
     obj = _o2_object(ll)
@@ -280,7 +279,7 @@ pub fn use1(p: *Small) -> i64
 
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
-def test_small_struct_copy_is_unchanged(ritz1_bin, tmp_path, compiler):  # noqa: F811
+def test_small_struct_copy_is_unchanged(ritz1_bin, tmp_path, compiler):
     """Below 256 bytes a copy stays a first-class load/store (SROA-friendly)."""
     text = _ll(compiler, tmp_path, "small", SMALL).read_text()
     assert "__ritz_sret_copy" not in text
@@ -351,7 +350,7 @@ ORDER_PARAMS = [
 
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler,name", ORDER_PARAMS)
-def test_large_copy_keeps_evaluation_order(ritz1_bin, tmp_path, compiler, name):  # noqa: F811
+def test_large_copy_keeps_evaluation_order(ritz1_bin, tmp_path, compiler, name):
     codes = {}
     for n in (1, 4):
         ll = _ll(

@@ -37,18 +37,6 @@ _spec.loader.exec_module(RULE)
 # if_constant_arms), so no case is held back as unparseable.
 
 
-@pytest.fixture(scope="module")
-def ritz1_bin() -> Path:
-    """Bring RITZ1_BIN up to date; a stale binary would test the old emitter."""
-    env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
-    proc = subprocess.run(
-        ["make", "-C", "ritz1", "ritz1"], cwd=RITZ_ROOT, env=env,
-        capture_output=True, text=True, timeout=1800)
-    if proc.returncode != 0 or not RITZ1_BIN.exists():
-        pytest.fail(f"could not build ritz1:\n{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}")
-    return RITZ1_BIN
-
-
 def _ritz1(ritz1_bin, tmp_path, body):
     src = tmp_path / "unit.ritz"
     src.write_text(RULE.PRELUDE + body)

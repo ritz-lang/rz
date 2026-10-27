@@ -40,13 +40,7 @@ from pathlib import Path
 
 import pytest
 
-from test_ritz1_builtin_struct_shadow import (  # noqa: F401
-    RITZ0,
-    RITZ1_BIN,
-    RITZ_ROOT,
-    RITZ_START,
-    ritz1_bin,
-)
+from test_ritz1_builtin_struct_shadow import RITZ0, RITZ1_BIN, RITZ_ROOT, RITZ_START
 
 ITERS = 10_000_000
 
@@ -308,7 +302,7 @@ def _misplaced_allocas(ll_text: str) -> list:
 
 @pytest.mark.integration
 @pytest.mark.parametrize("name", sorted(STRUCTURAL_CASES))
-def test_ritz1_allocas_in_entry_block(ritz1_bin, tmp_path, name):  # noqa: F811
+def test_ritz1_allocas_in_entry_block(ritz1_bin, tmp_path, name):
     """Every fixed-size alloca lives in `entry:`, never in a loop block."""
     ll = _compile("ritz1", tmp_path, name, STRUCTURAL_CASES[name])
     text = ll.read_text()
@@ -347,14 +341,14 @@ def test_ritz0_oracle(tmp_path, name):
 
 @pytest.mark.integration
 @pytest.mark.parametrize("name", sorted(CASES))
-def test_ritz1_long_loop_does_not_grow_stack(ritz1_bin, tmp_path, name):  # noqa: F811
+def test_ritz1_long_loop_does_not_grow_stack(ritz1_bin, tmp_path, name):
     """10M iterations under an 8 MB stack: exits with ritz0's code."""
     program, want = CASES[name]
     assert _run("ritz1", tmp_path, name, program) == want
 
 
 @pytest.mark.integration
-def test_ritz1_dynamic_alloca_stays_in_place(ritz1_bin, tmp_path):  # noqa: F811
+def test_ritz1_dynamic_alloca_stays_in_place(ritz1_bin, tmp_path):
     """`__builtin_alloca(n)` has a runtime size: it is not hoisted."""
     ll = _compile("ritz1", tmp_path, "dyn", DYNAMIC_ALLOCA)
     text = ll.read_text()

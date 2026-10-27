@@ -51,29 +51,6 @@ RITZ1_BIN = RITZ_ROOT / "ritz1" / "build" / "ritz1"
 RITZ0 = RITZ_ROOT / "ritz0" / "ritz0.py"
 
 
-def _build_ritz1() -> None:
-    env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
-    proc = subprocess.run(
-        ["make", "-C", "ritz1", "ritz1"],
-        cwd=RITZ_ROOT,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=1800,
-    )
-    if proc.returncode != 0 or not RITZ1_BIN.exists():
-        pytest.fail(
-            "could not build ritz1 for the emitter fail-open tests:\n"
-            f"{proc.stdout[-4000:]}\n{proc.stderr[-4000:]}"
-        )
-
-
-@pytest.fixture(scope="module")
-def ritz1_bin() -> Path:
-    _build_ritz1()
-    return RITZ1_BIN
-
-
 # A function used as a value. ritz0 lowers this and returns 10, which is what
 # made ritz1's old silent-zero substitution a WRONG ANSWER rather than merely
 # an unsupported one. ritz1 handles it since #1503; kept as the ritz0 oracle.

@@ -24,7 +24,6 @@ import re
 import pytest
 
 from test_large_struct_param import BIG_T, MID, _ll
-from test_ritz1_builtin_struct_shadow import ritz1_bin  # noqa: F401
 from test_ritz1_large_struct_ret import _assert_no_libc_mem, _link_run, _o2_object
 
 COMPILERS = ("ritz0", "ritz1")
@@ -123,7 +122,7 @@ def _indirect_calls(text: str) -> list:
 
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
-def test_sret_fn_pointer_type_and_call_are_sret(ritz1_bin, tmp_path, compiler):  # noqa: F811
+def test_sret_fn_pointer_type_and_call_are_sret(ritz1_bin, tmp_path, compiler):
     text = _ll(compiler, tmp_path, "fnptr_ret", FNPTR_RET).read_text()
     assert not re.search(FIRST_CLASS_RET, text), (
         f"a fn-pointer type returns %Big first-class:\n"
@@ -142,7 +141,7 @@ def test_sret_fn_pointer_type_and_call_are_sret(ritz1_bin, tmp_path, compiler): 
 
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
-def test_sret_fn_pointer_runs_at_O2(ritz1_bin, tmp_path, compiler):  # noqa: F811
+def test_sret_fn_pointer_runs_at_O2(ritz1_bin, tmp_path, compiler):
     ll = _ll(compiler, tmp_path, "fnptr_ret_run", FNPTR_RET)
     obj = _o2_object(ll)
     _assert_no_libc_mem(obj)

@@ -33,13 +33,7 @@ import subprocess
 
 import pytest
 
-from test_ritz1_builtin_struct_shadow import (  # noqa: F401
-    RITZ1_BIN,
-    RITZ_ROOT,
-    _run,
-    _run_pkg,
-    ritz1_bin,
-)
+from test_ritz1_builtin_struct_shadow import RITZ1_BIN, RITZ_ROOT, _run, _run_pkg
 
 # --- function / method arguments -------------------------------------------
 
@@ -377,7 +371,7 @@ def test_ritz0_oracle(tmp_path, name):
 
 @pytest.mark.integration
 @pytest.mark.parametrize("name", sorted(CASES))
-def test_ritz1_struct_lit_rvalue(ritz1_bin, tmp_path, name):  # noqa: F811
+def test_ritz1_struct_lit_rvalue(ritz1_bin, tmp_path, name):
     """ritz1 refused a struct literal outside a var initialiser (#1362)."""
     program, want = CASES[name]
     assert _run("ritz1", tmp_path, name, program) == want
@@ -392,13 +386,13 @@ def test_ritz0_oracle_pkg(tmp_path, name):
 
 @pytest.mark.integration
 @pytest.mark.parametrize("name", sorted(PKG_CASES))
-def test_ritz1_struct_lit_rvalue_pkg(ritz1_bin, tmp_path, name):  # noqa: F811
+def test_ritz1_struct_lit_rvalue_pkg(ritz1_bin, tmp_path, name):
     program, want = PKG_CASES[name]
     assert _run_pkg("ritz1", tmp_path, name, program) == want
 
 
 @pytest.mark.integration
-def test_ritz1_compiles_ritzlib_lang_tokens(ritz1_bin, tmp_path):  # noqa: F811
+def test_ritz1_compiles_ritzlib_lang_tokens(ritz1_bin, tmp_path):
     """Acceptance: tokendefs_new's `[TokenDef { .. }; N]` lowers under ritz1."""
     src = RITZ_ROOT / "ritzlib" / "lang" / "tokens.ritz"
     out = tmp_path / "tokens.ll"

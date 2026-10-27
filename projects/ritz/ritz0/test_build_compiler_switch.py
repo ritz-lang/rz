@@ -28,6 +28,11 @@ from pathlib import Path
 
 import pytest
 
+# xdist_group("tree") (AGAST #1804): build.py without --no-cache reads and writes the
+# shared projects/ritz/.ritz-cache{,-ritz1}.  Tests in the group
+# run on one xdist worker, one at a time; see conftest.py.
+pytestmark = pytest.mark.xdist_group("tree")
+
 RITZ_ROOT = Path(__file__).resolve().parents[1]
 BUILD_PY = RITZ_ROOT / "build.py"
 RITZ1_BIN = RITZ_ROOT / "ritz1" / "build" / "ritz1"
@@ -35,27 +40,8 @@ EXAMPLE = RITZ_ROOT / "examples" / "tier1_basics" / "02_exitcode"
 BIN_NAME = "exitcode"
 
 
-def _build_ritz1() -> None:
-    """Bring ritz1 up to date rather than skipping without it (AGAST #1327)."""
-    env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
-    proc = subprocess.run(
-        ["make", "-C", "ritz1", "ritz1"],
-        cwd=RITZ_ROOT, env=env, capture_output=True, text=True, timeout=1800,
-    )
-    if proc.returncode != 0 or not RITZ1_BIN.exists():
-        pytest.fail(
-            "could not build ritz1 for the compiler-switch tests:\n"
-            f"{proc.stdout[-4000:]}\n{proc.stderr[-4000:]}"
-        )
-
-
-@pytest.fixture(scope="module")
-def ritz1_built() -> None:
-    _build_ritz1()
-
-
 @pytest.fixture
-def pkg(tmp_path, ritz1_built):
+def pkg(tmp_path, ritz1_bin):
     dst = tmp_path / "pkg"
     shutil.copytree(EXAMPLE, dst, ignore=shutil.ignore_patterns("build", BIN_NAME))
     return dst

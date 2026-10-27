@@ -131,29 +131,6 @@ fn main() -> i32
 """
 
 
-def _build_ritz1() -> None:
-    """Bring RITZ1_BIN and the start object up to date; make decides the work."""
-    env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
-    for args, product in (
-        (["make", "-C", "ritz1", "ritz1"], RITZ1_BIN),
-        (["make", "-C", "runtime", RITZ_START.name], RITZ_START),
-    ):
-        proc = subprocess.run(
-            args, cwd=RITZ_ROOT, env=env, capture_output=True, text=True, timeout=1800
-        )
-        if proc.returncode != 0 or not product.exists():
-            pytest.fail(
-                f"could not build {product}:\n"
-                f"{proc.stdout[-4000:]}\n{proc.stderr[-4000:]}"
-            )
-
-
-@pytest.fixture(scope="module")
-def ritz1_bin() -> Path:
-    _build_ritz1()
-    return RITZ1_BIN
-
-
 def _run(compiler: str, tmp_path: Path, name: str, program: str) -> int:
     """Compile `program` with `compiler`, link it, run it, return the exit code."""
     src = tmp_path / f"{name}_{compiler}.ritz"

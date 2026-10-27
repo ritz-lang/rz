@@ -25,7 +25,7 @@ import re
 
 import pytest
 
-from test_ritz1_builtin_struct_shadow import _run, ritz1_bin  # noqa: F401
+from test_ritz1_builtin_struct_shadow import _run
 
 TOP = 0xFFFFFFFFFFFFFF00
 
@@ -206,7 +206,7 @@ CASES = [
 
 @pytest.mark.integration
 @pytest.mark.parametrize("name,program", CASES, ids=[c[0] for c in CASES])
-def test_unsigned_ops_match_ritz0(ritz1_bin, tmp_path, name, program):  # noqa: F811
+def test_unsigned_ops_match_ritz0(ritz1_bin, tmp_path, name, program):
     expected = _run("ritz0", tmp_path, name, program)
     got = _run("ritz1", tmp_path, name, program)
     assert expected == 42, f"{name}: ritz0 exit {expected} (test program is wrong)"
@@ -278,7 +278,7 @@ IR_EXPECT = {
 
 
 @pytest.mark.integration
-def test_unsigned_ops_ir(ritz1_bin, tmp_path):  # noqa: F811
+def test_unsigned_ops_ir(ritz1_bin, tmp_path):
     assert _run("ritz1", tmp_path, "ir", IR_PROGRAM) == 0
     ll = (tmp_path / "ir_ritz1.ll").read_text()
     wrong = []

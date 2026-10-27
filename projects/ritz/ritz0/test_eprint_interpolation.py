@@ -37,7 +37,6 @@ from pathlib import Path
 import pytest
 
 from test_ritz1_builtin_struct_shadow import RITZ0, RITZ1_BIN, RITZ_ROOT, RITZ_START
-from test_ritz1_builtin_struct_shadow import ritz1_bin  # noqa: F401
 
 # Build ritz1 (and the runtime start object) once for the module.
 pytestmark = pytest.mark.usefixtures("ritz1_bin")

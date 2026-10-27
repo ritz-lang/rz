@@ -14,7 +14,7 @@ ritz0 is the oracle for every program.
 
 import pytest
 
-from test_ritz1_builtin_struct_shadow import _run_pkg, ritz1_bin  # noqa: F401
+from test_ritz1_builtin_struct_shadow import _run_pkg
 
 PROGRAMS = {
     # The ticket's repro: inherent impl from ritzlib.box.
@@ -78,7 +78,7 @@ pub fn main() -> i32
 
 @pytest.mark.integration
 @pytest.mark.parametrize("name", sorted(PROGRAMS))
-def test_ritz1_matches_ritz0(ritz1_bin, tmp_path, name):  # noqa: F811
+def test_ritz1_matches_ritz0(ritz1_bin, tmp_path, name):
     program = PROGRAMS[name]
     expected = _run_pkg("ritz0", tmp_path, name, program)
     assert _run_pkg("ritz1", tmp_path, name, program) == expected

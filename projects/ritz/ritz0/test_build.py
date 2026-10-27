@@ -1030,6 +1030,8 @@ class TestPartialBuildIsFailure:
 class TestPartialBuildExitCode:
     """End-to-end: the process exit code, via a real compiler run."""
 
+    # Real build.py without --no-cache: shared .ritz-cache (#1804, conftest.py).
+    @pytest.mark.xdist_group("tree")
     @pytest.mark.integration
     def test_build_exits_nonzero_when_one_of_two_binaries_fails(self, tmp_path):
         """The acceptance test for #1314. Real ritz0, real ritz.toml, real exit code."""
@@ -1148,25 +1150,19 @@ class TestSelfNamespace:
         assert str(odd.parent) not in entries
         assert _build_module.ritz1_env()["RITZ_PATH"].split(os.pathsep)[:2] == entries[:2]
 
+    # Real build.py without --no-cache: shared .ritz-cache (#1804, conftest.py).
+    @pytest.mark.xdist_group("tree")
     @pytest.mark.integration
     @pytest.mark.parametrize("compiler", ["ritz0", "ritz1"])
-    def test_package_builds_when_it_imports_itself_by_name(self, tmp_path, compiler):
+    def test_package_builds_when_it_imports_itself_by_name(self, request, tmp_path, compiler):
         """The #1538 acceptance test: real build.py, RITZ_PATH = ritz root only."""
         import os
         import subprocess
         if compiler == "ritz1":
-            # AGAST #1595: build ritz1 here, don't skip. CI runs this suite
-            # before the bootstrap chain builds ritz1, so a skip-if-missing
-            # here never ran in CI and tripped main.yml's #1327 guard. Always
-            # call make: an up-to-date make is a no-op, and a stale binary
-            # (present but out of date) gets rebuilt (#1322).
-            build = subprocess.run(
-                ["make", "-C", "ritz1", "ritz1"],
-                cwd=RITZ_DIR, env=dict(os.environ, RITZ_PATH=str(RITZ_DIR)),
-                capture_output=True, text=True, timeout=1800,
-            )
-            if build.returncode != 0 or not (RITZ_DIR / "ritz1" / "build" / "ritz1").exists():
-                pytest.fail(f"could not build ritz1:\n{build.stdout[-4000:]}\n{build.stderr[-4000:]}")
+            # AGAST #1595: build ritz1, don't skip (CI's #1327 guard).  The
+            # build is conftest's once-per-session fixture (#1804), requested
+            # only by the ritz1 arm so the ritz0 arm does not wait on it.
+            request.getfixturevalue("ritz1_bin")
         pkg = _self_import_package(tmp_path)
         env = dict(os.environ, RITZ_PATH=str(RITZ_DIR))
         proc = subprocess.run(

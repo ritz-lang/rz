@@ -33,12 +33,7 @@ import subprocess
 
 import pytest
 
-from test_ritz1_builtin_struct_shadow import (  # noqa: F401
-    RITZ1_BIN,
-    RITZ_ROOT,
-    _run,
-    ritz1_bin,
-)
+from test_ritz1_builtin_struct_shadow import RITZ1_BIN, RITZ_ROOT, _run
 
 EXPECTED = 42
 
@@ -246,7 +241,7 @@ def _ritz1_ir(tmp_path, program: str) -> str:
 
 
 @pytest.mark.integration
-def test_ritz1_struct_lit_elements_written_in_place(ritz1_bin, tmp_path):  # noqa: F811
+def test_ritz1_struct_lit_elements_written_in_place(ritz1_bin, tmp_path):
     """A struct-literal element or array-field element goes straight into its slot.
 
     Building it in a temp `alloca %Point` and copying it would also run
@@ -277,6 +272,6 @@ def test_ritz0_is_the_oracle(tmp_path, name):
 
 @pytest.mark.integration
 @pytest.mark.parametrize("name", sorted(PROGRAMS))
-def test_ritz1_struct_lit_in_array(ritz1_bin, tmp_path, name):  # noqa: F811
+def test_ritz1_struct_lit_in_array(ritz1_bin, tmp_path, name):
     """ritz1 rejected or mis-stored literals nested in literals (#1608)."""
     assert _run("ritz1", tmp_path, name, PRELUDE + PROGRAMS[name]) == EXPECTED

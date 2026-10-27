@@ -35,7 +35,6 @@ from pathlib import Path
 
 import pytest
 
-from test_ritz1_builtin_struct_shadow import ritz1_bin  # noqa: F401
 from test_ritz1_large_struct_ret import (
     _assert_no_libc_mem,
     _clang_bounded,
@@ -167,7 +166,7 @@ pub fn caller(p: *Big, q: *Big) -> i32
 @pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("name", sorted(PARAM_CASES))
 def test_huge_struct_param_compiles_at_O2_within_bound(
-    ritz1_bin,  # noqa: F811
+    ritz1_bin,
     tmp_path,
     compiler,
     name,
@@ -213,7 +212,7 @@ pub fn caller(p: *Big, q: *Big) -> i32
 
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
-def test_large_param_definitions_are_byval(ritz1_bin, tmp_path, compiler):  # noqa: F811
+def test_large_param_definitions_are_byval(ritz1_bin, tmp_path, compiler):
     text = _ll(compiler, tmp_path, "shape", SHAPE).read_text()
     for fn in ("take", "Big_absorb", "Big_from_other"):
         hdr = _header(text, "define", fn)
@@ -229,7 +228,7 @@ def test_large_param_definitions_are_byval(ritz1_bin, tmp_path, compiler):  # no
 
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
-def test_large_param_extern_declare_is_byval(ritz1_bin, tmp_path, compiler):  # noqa: F811
+def test_large_param_extern_declare_is_byval(ritz1_bin, tmp_path, compiler):
     text = _ll(compiler, tmp_path, "shape", SHAPE).read_text()
     hdr = _header(text, "declare", "ext_take")
     assert re.search(BYVAL_BIG, hdr), hdr
@@ -237,7 +236,7 @@ def test_large_param_extern_declare_is_byval(ritz1_bin, tmp_path, compiler):  # 
 
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
-def test_large_param_every_call_path_passes_byval(ritz1_bin, tmp_path, compiler):  # noqa: F811
+def test_large_param_every_call_path_passes_byval(ritz1_bin, tmp_path, compiler):
     """Direct, method, extern and static-method calls all pass a byval slot."""
     text = _ll(compiler, tmp_path, "shape", SHAPE).read_text()
     for fn in ("take", "Big_absorb", "ext_take", "Big_from_other"):
@@ -249,7 +248,7 @@ def test_large_param_every_call_path_passes_byval(ritz1_bin, tmp_path, compiler)
 
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
-def test_small_struct_param_is_unchanged(ritz1_bin, tmp_path, compiler):  # noqa: F811
+def test_small_struct_param_is_unchanged(ritz1_bin, tmp_path, compiler):
     """A 16-byte struct is still passed first-class: no ABI change below 256 B."""
     text = _ll(compiler, tmp_path, "shape", SHAPE).read_text()
     hdr = _header(text, "define", "small_take")
@@ -341,7 +340,7 @@ pub fn main() -> i32
 
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
-def test_large_struct_params_run_at_O2(ritz1_bin, tmp_path, compiler):  # noqa: F811
+def test_large_struct_params_run_at_O2(ritz1_bin, tmp_path, compiler):
     ll = _ll(compiler, tmp_path, "run", RUN)
     assert "byval(" in ll.read_text(), "the byval lowering did not engage"
     obj = _o2_object(ll)
@@ -382,7 +381,7 @@ pub fn main() -> i32
 
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
-def test_large_param_fn_pointer_is_byval(ritz1_bin, tmp_path, compiler):  # noqa: F811
+def test_large_param_fn_pointer_is_byval(ritz1_bin, tmp_path, compiler):
     text = _ll(compiler, tmp_path, "fnptr", FNPTR).read_text()
     hdr = _header(text, "define", "apply")
     indirect = [
@@ -399,7 +398,7 @@ def test_large_param_fn_pointer_is_byval(ritz1_bin, tmp_path, compiler):  # noqa
 
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
-def test_large_param_fn_pointer_runs_at_O2(ritz1_bin, tmp_path, compiler):  # noqa: F811
+def test_large_param_fn_pointer_runs_at_O2(ritz1_bin, tmp_path, compiler):
     ll = _ll(compiler, tmp_path, "fnptr_run", FNPTR)
     obj = _o2_object(ll)
     _assert_no_libc_mem(obj)
@@ -495,7 +494,7 @@ def _ritz_obj(compiler: str, tmp_path: Path, name: str, program: str) -> Path:
 
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
-def test_ritz_caller_links_c_callee(ritz1_bin, tmp_path, compiler):  # noqa: F811
+def test_ritz_caller_links_c_callee(ritz1_bin, tmp_path, compiler):
     r_obj = _ritz_obj(
         compiler, tmp_path, "calls_c", R_CALLS.replace("{callee}", "c_take")
     )
@@ -506,7 +505,7 @@ def test_ritz_caller_links_c_callee(ritz1_bin, tmp_path, compiler):  # noqa: F81
 
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
-def test_c_caller_links_ritz_callee(ritz1_bin, tmp_path, compiler):  # noqa: F811
+def test_c_caller_links_ritz_callee(ritz1_bin, tmp_path, compiler):
     r_obj = _ritz_obj(compiler, tmp_path, "defines", R_DEFINES_MAIN)
     c_obj = _c_object(tmp_path, "c_caller", C_CALLER)
     exe = tmp_path / f"c_calls_{compiler}"
@@ -515,7 +514,7 @@ def test_c_caller_links_ritz_callee(ritz1_bin, tmp_path, compiler):  # noqa: F81
 
 @pytest.mark.integration
 @pytest.mark.parametrize(("caller", "callee"), [("ritz0", "ritz1"), ("ritz1", "ritz0")])
-def test_ritz0_and_ritz1_link_by_value_param(ritz1_bin, tmp_path, caller, callee):  # noqa: F811
+def test_ritz0_and_ritz1_link_by_value_param(ritz1_bin, tmp_path, caller, callee):
     """FC_CALLER / FC_CALLEE for params: each compiler's caller against the
     other compiler's callee."""
     caller_obj = _ritz_obj(

@@ -4,7 +4,8 @@
 *absent*:
 
     if not RITZ1_BIN.exists():
-        subprocess.run(["make", "-C", "ritz1", "ritz1"], ...)
+        run make on ritz1
+
 
 Absent is not the same as stale.  With a stale binary the suite still ran, and
 it still reported a number — just not one about the tree you have checked out.
@@ -24,7 +25,14 @@ broken tree and asserting they disagree:
     new fixture (delegate to make) -> pytest exits != 0 <- the regression caught
 
 Everything happens inside a `tmp_path` copy of `projects/ritz`; the real tree is
-only ever read (and brought up to date), never mutated.
+only ever read, never mutated.
+
+Since AGAST #1804 the fixture lives in conftest.py — one session-scoped build
+shared by every module — so that is the file whose staleness rule is swapped.
+The copy runs while other xdist workers are busy, so it leaves out the only
+in-tree paths a concurrent test writes (conftest.py, item 5): build.py's
+`.ritz-cache*` and `build.py run`'s top-level `build/`.  Everything else it
+copies is only read during a session, so this module needs no xdist group.
 """
 
 import os
@@ -49,15 +57,28 @@ MUTATION_FROM = "        return module_require_eof(p)"
 MUTATION_TO = "        return 0  # AGAST #1322 mutant: EOF requirement removed"
 
 # --- The two fixture implementations, as literal source ----------------------
-# `FIXTURE_NEW` must match `test_ritz1_parse_errors.py` exactly; if it stops
+# `FIXTURE_NEW` must match conftest.py's `_ritz1_stale` exactly; if it stops
 # matching, this test fails loudly rather than quietly testing nothing.
-FIXTURE_NEW = "    _build_ritz1()\n    return RITZ1_BIN\n"
-FIXTURE_OLD = "    if not RITZ1_BIN.exists():\n        _build_ritz1()\n    return RITZ1_BIN\n"
+FIXTURE_FILE = "conftest.py"
+FIXTURE_NEW = "    return True  # make decides freshness from mtimes (#1322)\n"
+FIXTURE_OLD = "    return not RITZ1_BIN.exists()\n"
 
 # Directories that are pure build noise or would make the copy enormous.
-_COPY_IGNORE = shutil.ignore_patterns(
-    "__pycache__", ".git", ".pytest_cache", "*.pyc", ".mypy_cache", ".ruff_cache"
+_NOISE = shutil.ignore_patterns(
+    "__pycache__", ".git", ".pytest_cache", "*.pyc", ".mypy_cache", ".ruff_cache",
 )
+
+
+def _COPY_IGNORE(directory: str, names: list[str]) -> set[str]:
+    """Noise, plus what concurrent tests write in the real tree (see docstring).
+
+    `build` is dropped only at the top level: ritz1/build must be copied.
+    """
+    ignored = set(_NOISE(directory, names))
+    ignored.update(n for n in names if n.startswith(".ritz-cache"))
+    if Path(directory) == RITZ_ROOT and "build" in names:
+        ignored.add("build")
+    return ignored
 
 
 def _run_pytest(root: Path) -> subprocess.CompletedProcess:
@@ -85,8 +106,9 @@ def _swap_fixture(test_file: Path, old: str, new: str, label: str) -> None:
     test_file.write_text(text.replace(old, new))
 
 
+@pytest.mark.slow  # ~2 min: scheduled first under xdist (conftest.py, item 6)
 @pytest.mark.integration
-def test_stale_ritz1_binary_cannot_produce_a_false_pass(tmp_path):
+def test_stale_ritz1_binary_cannot_produce_a_false_pass(tmp_path, ritz1_bin):
     """A stale binary must not be able to turn a real regression into a green run.
 
     Arms the same broken tree with each fixture implementation in turn.  The old
@@ -94,20 +116,10 @@ def test_stale_ritz1_binary_cannot_produce_a_false_pass(tmp_path):
     one fails (make notices `parser_gen.ritz` moved and relinks).  If both arms
     agree, the fixture is not doing its job — in either direction.
     """
-    # A fresh binary plus its object files, so the copy below starts consistent
-    # and the mutated rebuild is incremental (~6s) rather than cold (~51s).
-    build = subprocess.run(
-        ["make", "-C", "ritz1", "ritz1"],
-        cwd=RITZ_ROOT,
-        env=dict(os.environ, RITZ_PATH=str(RITZ_ROOT)),
-        capture_output=True,
-        text=True,
-        timeout=1800,
-    )
-    assert build.returncode == 0 and RITZ1_BIN.exists(), (
-        f"could not build ritz1 to seed the staleness test:\n"
-        f"{build.stdout[-4000:]}\n{build.stderr[-4000:]}"
-    )
+    # `ritz1_bin` is a fresh binary plus its object files, so the copy below
+    # starts consistent and the mutated rebuild is incremental (~6s) rather
+    # than cold (~51s).
+    assert ritz1_bin == RITZ1_BIN and RITZ1_BIN.exists()
 
     # copytree uses copy2, which preserves mtimes — essential, since the whole
     # experiment is about what make concludes from them.
@@ -125,7 +137,7 @@ def test_stale_ritz1_binary_cannot_produce_a_false_pass(tmp_path):
     )
     src.write_text(text.replace(MUTATION_FROM, MUTATION_TO))
 
-    target_file = root / "ritz0" / "test_ritz1_parse_errors.py"
+    target_file = root / "ritz0" / FIXTURE_FILE
 
     # --- Arm A: the old build-if-missing fixture -----------------------------
     # The binary exists, so it rebuilds nothing and grades the stale compiler,

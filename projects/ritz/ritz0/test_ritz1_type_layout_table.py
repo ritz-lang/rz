@@ -29,7 +29,7 @@ import subprocess
 
 import pytest
 
-from test_ritz1_builtin_struct_shadow import _run, ritz1_bin  # noqa: F401
+from test_ritz1_builtin_struct_shadow import _run
 
 # (ritz spelling, LLVM spelling, size, align) for every primitive.
 PRIMS = [

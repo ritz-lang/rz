@@ -15,7 +15,7 @@ pass.
 
 import pytest
 
-from test_ritz1_bool_fields import EXPECTED, _run, ritz1_bin  # noqa: F401
+from test_ritz1_bool_fields import EXPECTED, _run
 
 PROGRAMS = {
     # The ticket repro: a wrapped literal vs a sext'd i32 load.
@@ -140,6 +140,6 @@ def test_ritz0_is_the_oracle(tmp_path, name):
 
 @pytest.mark.integration
 @pytest.mark.parametrize("name", sorted(PROGRAMS))
-def test_ritz1_int_cast(ritz1_bin, tmp_path, name):  # noqa: F811
+def test_ritz1_int_cast(ritz1_bin, tmp_path, name):
     """ritz1 lowered int→int `as` as a no-op (#1602)."""
     assert _run("ritz1", tmp_path, name, PROGRAMS[name]) == EXPECTED

@@ -12,7 +12,7 @@ RUNTIME, because the bad load compiles cleanly and only gives a wrong answer.
 
 import pytest
 
-from test_ritz1_bool_fields import EXPECTED, _run, ritz1_bin  # noqa: F401, F811
+from test_ritz1_bool_fields import EXPECTED, _run
 
 PROGRAMS = {
     # The ticket repro: a 2-level chain to a StrView's *u8.
@@ -99,6 +99,6 @@ def test_ritz0_is_the_oracle(tmp_path, name):
 
 @pytest.mark.integration
 @pytest.mark.parametrize("name", sorted(PROGRAMS))
-def test_ritz1_deref_member_chain(ritz1_bin, tmp_path, name):  # noqa: F811
+def test_ritz1_deref_member_chain(ritz1_bin, tmp_path, name):
     """ritz1 loaded i64 for `*(a.b.c.ptr + i)` past one member level (#1673)."""
     assert _run("ritz1", tmp_path, name, PROGRAMS[name]) == EXPECTED

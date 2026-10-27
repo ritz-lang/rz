@@ -24,7 +24,7 @@ local: a bare "..." initialiser in a struct literal is the separate #1669.
 
 import pytest
 
-from test_ritz1_bool_fields import EXPECTED, _run, ritz1_bin  # noqa: F401, F811
+from test_ritz1_bool_fields import EXPECTED, _run
 
 PROGRAMS = {
     # The ticket repro, through an @ref param, with the payload read back.
@@ -220,6 +220,6 @@ def test_ritz0_is_the_oracle(tmp_path, name):
 
 @pytest.mark.integration
 @pytest.mark.parametrize("name", sorted(PROGRAMS))
-def test_ritz1_variant_member_payload(ritz1_bin, tmp_path, name):  # noqa: F811
+def test_ritz1_variant_member_payload(ritz1_bin, tmp_path, name):
     """ritz1 stored a struct-typed field payload as i64 (#1664)."""
     assert _run("ritz1", tmp_path, name, PROGRAMS[name]) == EXPECTED

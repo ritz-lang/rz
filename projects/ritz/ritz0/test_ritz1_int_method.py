@@ -25,7 +25,7 @@ import subprocess
 
 import pytest
 
-from test_ritz1_builtin_struct_shadow import _run, ritz1_bin  # noqa: F401
+from test_ritz1_builtin_struct_shadow import _run
 
 # The ticket's repro.
 REPRO = """\
@@ -194,20 +194,20 @@ def test_ritz0_oracle(tmp_path, name):
 
 @pytest.mark.integration
 @pytest.mark.parametrize("name", sorted(CASES))
-def test_ritz1_int_method(ritz1_bin, tmp_path, name):  # noqa: F811
+def test_ritz1_int_method(ritz1_bin, tmp_path, name):
     program, want = CASES[name]
     assert _run("ritz1", tmp_path, name, program) == want
 
 
 @pytest.mark.integration
 @pytest.mark.parametrize("name", sorted(RITZ1_ONLY))
-def test_ritz1_only_int_method(ritz1_bin, tmp_path, name):  # noqa: F811
+def test_ritz1_only_int_method(ritz1_bin, tmp_path, name):
     program, want = RITZ1_ONLY[name]
     assert _run("ritz1", tmp_path, name, program) == want
 
 
 @pytest.mark.integration
-def test_ritz1_declares_each_used_intrinsic_once(ritz1_bin, tmp_path):  # noqa: F811
+def test_ritz1_declares_each_used_intrinsic_once(ritz1_bin, tmp_path):
     """Every intrinsic called gets exactly one matching `declare`.
 
     clang 21 implicitly declares an undeclared `@llvm.*` call, so the

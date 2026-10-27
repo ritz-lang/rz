@@ -40,13 +40,7 @@ from pathlib import Path
 
 import pytest
 
-from test_ritz1_builtin_struct_shadow import (  # noqa: F401
-    RITZ0,
-    RITZ1_BIN,
-    RITZ_ROOT,
-    RITZ_START,
-    ritz1_bin,
-)
+from test_ritz1_builtin_struct_shadow import RITZ0, RITZ1_BIN, RITZ_ROOT, RITZ_START
 
 # clang on ritz0's IR for tokens.ritz takes ~0.1 s at -O2.  20 s and 2 GB are
 # two orders of magnitude of headroom, and still turn the old hang into a
@@ -234,7 +228,7 @@ impl Big
 
 
 @pytest.mark.integration
-def test_ritz1_lang_tokens_compiles_at_O2_within_bound(ritz1_bin, tmp_path):  # noqa: F811
+def test_ritz1_lang_tokens_compiles_at_O2_within_bound(ritz1_bin, tmp_path):
     """The ticket repro: ritzlib/lang/tokens.ritz through clang -O2."""
     ll = _ritz1_ll_file(
         tmp_path, "tokens", RITZ_ROOT / "ritzlib" / "lang" / "tokens.ritz"
@@ -245,7 +239,7 @@ def test_ritz1_lang_tokens_compiles_at_O2_within_bound(ritz1_bin, tmp_path):  # 
 @pytest.mark.integration
 @pytest.mark.parametrize("name", sorted(HUGE_CASES))
 def test_ritz1_huge_struct_return_compiles_at_O2_within_bound(
-    ritz1_bin,  # noqa: F811
+    ritz1_bin,
     tmp_path,
     name,
 ):
@@ -271,7 +265,7 @@ fn big_wrap() -> Big
 
 
 @pytest.mark.integration
-def test_ritz1_large_return_is_sret(ritz1_bin, tmp_path):  # noqa: F811
+def test_ritz1_large_return_is_sret(ritz1_bin, tmp_path):
     ll = _ritz1_ll(tmp_path, "shape", SHAPE)
     hdr = _define_line(ll, "big_new")
     assert " void @big_new(ptr sret(%Big) " in hdr, hdr
@@ -283,7 +277,7 @@ def test_ritz1_large_return_is_sret(ritz1_bin, tmp_path):  # noqa: F811
 
 
 @pytest.mark.integration
-def test_ritz1_small_return_is_unchanged(ritz1_bin, tmp_path):  # noqa: F811
+def test_ritz1_small_return_is_unchanged(ritz1_bin, tmp_path):
     """A 16-byte struct still returns in registers: no ABI change below 256 B."""
     ll = _ritz1_ll(tmp_path, "shape", SHAPE)
     hdr = _define_line(ll, "small_new")
@@ -358,7 +352,7 @@ def test_ritz0_oracle_call_paths(tmp_path):
 
 
 @pytest.mark.integration
-def test_ritz1_every_call_path_passes_sret(ritz1_bin, tmp_path):  # noqa: F811
+def test_ritz1_every_call_path_passes_sret(ritz1_bin, tmp_path):
     """Every call to an sret fn is `call void @f(ptr sret(%T) ...)`.
 
     A leftover first-class `call %Big @f(...)` still RUNS on x86-64 (LLVM
@@ -375,7 +369,7 @@ def test_ritz1_every_call_path_passes_sret(ritz1_bin, tmp_path):  # noqa: F811
 
 
 @pytest.mark.integration
-def test_ritz1_extern_declare_is_sret(ritz1_bin, tmp_path):  # noqa: F811
+def test_ritz1_extern_declare_is_sret(ritz1_bin, tmp_path):
     """An extern large-struct fn is declared `void`, matching its sret calls."""
     text = _ritz1_ll(tmp_path, "calls_ext", RITZ1_CALLS_EXT).read_text()
     assert "declare void @ext_big(" in text, text[-1500:]
@@ -384,7 +378,7 @@ def test_ritz1_extern_declare_is_sret(ritz1_bin, tmp_path):  # noqa: F811
 
 
 @pytest.mark.integration
-def test_ritz1_call_paths_run_at_O2(ritz1_bin, tmp_path):  # noqa: F811
+def test_ritz1_call_paths_run_at_O2(ritz1_bin, tmp_path):
     """Direct, untyped-let, reassignment, chained, branch, method,
     static-method and deref-return calls all agree with ritz0."""
     ll = _ritz1_ll(tmp_path, "paths", CALL_PATHS)
@@ -462,7 +456,7 @@ def _fc_object(tmp_path: Path, name: str, ir: str) -> Path:
 
 
 @pytest.mark.integration
-def test_ritz1_sret_caller_links_first_class_callee(ritz1_bin, tmp_path):  # noqa: F811
+def test_ritz1_sret_caller_links_first_class_callee(ritz1_bin, tmp_path):
     ritz1_obj = _o2_object(_ritz1_ll(tmp_path, "calls_ext", RITZ1_CALLS_EXT))
     fc_obj = _fc_object(tmp_path, "fc_callee", FC_CALLEE)
     exe = tmp_path / "calls_ext"
@@ -470,7 +464,7 @@ def test_ritz1_sret_caller_links_first_class_callee(ritz1_bin, tmp_path):  # noq
 
 
 @pytest.mark.integration
-def test_ritz1_sret_callee_links_first_class_caller(ritz1_bin, tmp_path):  # noqa: F811
+def test_ritz1_sret_callee_links_first_class_caller(ritz1_bin, tmp_path):
     ritz1_obj = _o2_object(_ritz1_ll(tmp_path, "defines", RITZ1_DEFINES))
     fc_obj = _fc_object(tmp_path, "fc_caller", FC_CALLER)
     # FC_CALLER defines `main` directly, so no ritz start object; link a tiny

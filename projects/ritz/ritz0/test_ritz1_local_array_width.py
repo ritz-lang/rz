@@ -24,7 +24,7 @@ import subprocess
 
 import pytest
 
-from test_ritz1_builtin_struct_shadow import _run, ritz1_bin  # noqa: F401
+from test_ritz1_builtin_struct_shadow import _run
 
 # The ticket's repro, verbatim.
 REPRO = """\
@@ -226,7 +226,7 @@ WANT = {
 
 @pytest.mark.integration
 @pytest.mark.parametrize("name", sorted(CASES))
-def test_local_array_width_ritz1_matches_ritz0(ritz1_bin, tmp_path, name):  # noqa: F811
+def test_local_array_width_ritz1_matches_ritz0(ritz1_bin, tmp_path, name):
     program = CASES[name]
     want = _run("ritz0", tmp_path, name, program)
     if name in WANT:
@@ -240,7 +240,7 @@ def test_local_array_width_ritz1_matches_ritz0(ritz1_bin, tmp_path, name):  # no
     [("u8", "i8"), ("i8", "i8"), ("u16", "i16"), ("i16", "i16"),
      ("u32", "i32"), ("i32", "i32"), ("u64", "i64"), ("i64", "i64")],
 )
-def test_local_array_ir_uses_alloca_element_type(ritz1_bin, tmp_path, elem, llvm):  # noqa: F811
+def test_local_array_ir_uses_alloca_element_type(ritz1_bin, tmp_path, elem, llvm):
     """Every GEP over the local indexes the alloca's own `[N x T]`."""
     src = tmp_path / f"arr_{elem}.ritz"
     src.write_text(

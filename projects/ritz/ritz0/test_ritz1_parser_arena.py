@@ -23,11 +23,7 @@ import subprocess
 
 import pytest
 
-from test_ritz1_builtin_struct_shadow import (  # noqa: F401
-    RITZ_ROOT,
-    _run,
-    ritz1_bin,
-)
+from test_ritz1_builtin_struct_shadow import RITZ_ROOT, _run
 
 # ~72k tokens: well past the old 4 MB arena (about 60 bytes of AST per token
 # here), and still quick to compile.
@@ -46,13 +42,13 @@ def test_ritz0_oracle_long_program(tmp_path):
 
 
 @pytest.mark.integration
-def test_ritz1_long_program_fits_parser_arena(ritz1_bin, tmp_path):  # noqa: F811
+def test_ritz1_long_program_fits_parser_arena(ritz1_bin, tmp_path):
     """A source whose AST is bigger than 4 MB parses intact (no overflow)."""
     assert _run("ritz1", tmp_path, "long", LONG_PROGRAM) == 42
 
 
 @pytest.mark.integration
-def test_ritz1_self_compiles_emitter_stmt(ritz1_bin, tmp_path):  # noqa: F811
+def test_ritz1_self_compiles_emitter_stmt(ritz1_bin, tmp_path):
     """The bootstrap's real victim: ritz1 parses its own emitter_stmt.ritz."""
     src_dir = RITZ_ROOT / "ritz1" / "src"
     out = tmp_path / "emitter_stmt.ll"

@@ -60,46 +60,6 @@ RITZ0 = RITZ_ROOT / "ritz0" / "ritz0.py"
 RITZ_START = RITZ_ROOT / "runtime" / "ritz_start.x86_64.o"
 
 
-def _build_ritz1() -> None:
-    env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
-    proc = subprocess.run(
-        ["make", "-C", "ritz1", "ritz1"],
-        cwd=RITZ_ROOT,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=1800,
-    )
-    if proc.returncode != 0 or not RITZ1_BIN.exists():
-        pytest.fail(
-            "could not build ritz1 for the built-in struct shadow tests:\n"
-            f"{proc.stdout[-4000:]}\n{proc.stderr[-4000:]}"
-        )
-
-
-def _build_runtime_start() -> None:
-    """RITZ_START is gitignored; build it rather than assume it exists."""
-    proc = subprocess.run(
-        ["make", "-C", "runtime", RITZ_START.name],
-        cwd=RITZ_ROOT,
-        capture_output=True,
-        text=True,
-        timeout=300,
-    )
-    if proc.returncode != 0 or not RITZ_START.exists():
-        pytest.fail(
-            f"could not build the runtime start object {RITZ_START}:\n"
-            f"{proc.stdout[-2000:]}\n{proc.stderr[-2000:]}"
-        )
-
-
-@pytest.fixture(scope="module")
-def ritz1_bin() -> Path:
-    _build_ritz1()
-    _build_runtime_start()
-    return RITZ1_BIN
-
-
 def _run(compiler: str, tmp_path: Path, name: str, program: str) -> int:
     """Compile `program` with `compiler`, link it, run it, return the exit code."""
     src = tmp_path / f"{name}_{compiler}.ritz"

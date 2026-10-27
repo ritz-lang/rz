@@ -27,7 +27,7 @@ import re
 
 import pytest
 
-from test_ritz1_builtin_struct_shadow import _run, ritz1_bin  # noqa: F401
+from test_ritz1_builtin_struct_shadow import _run
 
 # The ticket's repro: typed `let`, deref read.
 LET_TYPED = """\
@@ -120,7 +120,7 @@ def _rename_self(program: str) -> str:
 
 @pytest.mark.integration
 @pytest.mark.parametrize("name", sorted(CASES))
-def test_let_self_matches_ritz0_and_renamed_twin(ritz1_bin, tmp_path, name):  # noqa: F811
+def test_let_self_matches_ritz0_and_renamed_twin(ritz1_bin, tmp_path, name):
     program = CASES[name]
     oracle = _run("ritz0", tmp_path, name, program)
     got = _run("ritz1", tmp_path, name, program)

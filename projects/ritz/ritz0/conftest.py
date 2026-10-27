@@ -29,13 +29,76 @@ AGAST #1392. Two things live here, and they are independent.
 3. `RITZ_CACHE_DIR` (AGAST #1807) — compilers keep their sig files in a cache
    directory that mirrors each source's absolute path.  Tests compile sources
    under the temp directory, so without this every run would leave a mirror
-   of its tmp_path trees in ~/.cache/ritz.  Each session (each xdist worker)
-   gets a private cache, removed at exit; an explicit RITZ_CACHE_DIR wins.
+   of its tmp_path trees in ~/.cache/ritz.  The session gets a private cache,
+   removed at exit; an explicit RITZ_CACHE_DIR wins.  Under xdist the
+   controller sets it before the workers start, so they inherit and share it
+   (fn_cache writes are atomic for exactly that reason).
+
+4. `ritz1_bin` (AGAST #1804) — ONE build of ritz1 and the runtime start object
+   per session, shared by every test that needs them.
+
+   43 modules used to carry their own copy of `_build_ritz1()` and a module
+   fixture around it, so a serial run invoked `make -C ritz1 ritz1` ~80 times,
+   and an xdist run would have had several workers running make on the same
+   `ritz1/build/` at once (racing on .d.tmp/.ll/.o).  Now:
+
+   * serial run: the session fixture builds on first use;
+   * xdist run: the controller builds while setting up the first worker
+     (`pytest_configure_node`), before any worker runs a test, and hands each
+     worker the verdict through `workerinput`.  Workers
+     never run make.  The verdict travels in workerinput rather than an
+     environment variable on purpose: a test that runs a nested pytest (see
+     test_ritz1_bin_staleness.py) would inherit an env var and skip its own
+     build, grading a stale binary.
+
+   The rules of #1322 and #1327 carry over unchanged: always run make (it
+   decides freshness from mtimes; a binary that merely exists may be stale),
+   and a failed build FAILS every test that asked for ritz1, never skips it.
+
+   `RITZ_TEST_MAKE_LOG`, if set, receives one line per make this conftest runs.
+   test_ritz1_session_build.py uses it to prove an xdist session builds once.
+
+5. `xdist_group("tree")` (AGAST #1804) — the suite runs with
+   `-n <N> --dist loadgroup`.  A test that WRITES state at a fixed path in
+   projects/ritz which another test also uses goes in the "tree" group, so
+   the group runs on one worker, one test at a time.  Today that means:
+   * any real `build.py build|run` WITHOUT `--no-cache`: build.py's
+     BuildCache is rooted at projects/ritz (`.ritz-cache{,-ritz1}`) whatever
+     the package path.  #1806 made its writes atomic and its state merges
+     locked, but a compiler-hash change still wipes `objects/` under a lock
+     that readers of cached objects do not take (`--no-cache` bypasses the
+     cache — prefer that);
+   * `build.py run`, which writes projects/ritz/build/<name>;
+   * running a nested session's make in the real tree
+     (test_ritz1_session_build.py).
+   Reading in-tree sources is fine; compiling into tmp_path is fine; sig
+   files are per-session (item 3).  A test that copies the tree must skip
+   the paths above instead (test_ritz1_bin_staleness.py does).
+
+6. Scheduling (AGAST #1804) — xdist hands out work in collection order.
+   `@pytest.mark.slow` tests (minutes on their own) and xdist_group members
+   (which run one after another on a single worker) are moved to the front,
+   stably, so neither becomes the tail of a parallel run.
 """
 
 import os
 import shutil
+import subprocess
 import tempfile
+from pathlib import Path
+
+import pytest
+
+RITZ_ROOT = Path(__file__).resolve().parent.parent
+RITZ1_BIN = RITZ_ROOT / "ritz1" / "build" / "ritz1"
+# Build product, not a tracked file — see test_ritz1_ptr_arith_chain.py.
+RITZ_START = RITZ_ROOT / "runtime" / "ritz_start.x86_64.o"
+
+# Key for the build verdict, both in config.stash (controller / serial run) and
+# in xdist's `workerinput` (workers).  The verdict is an error string, or "" for
+# a successful build.
+_BUILD_KEY = "ritz1_session_build"
+_build_verdict = pytest.StashKey[str]()
 
 _SESSION_CACHE = None
 
@@ -44,6 +107,77 @@ collect_ignore_glob = [
     "ritz_test_*",
     "ritz_batch_test_*",
 ]
+
+
+def _ritz1_stale() -> bool:
+    """Whether to hand ritz1 to make.  Always: existence is not freshness.
+
+    test_ritz1_bin_staleness.py swaps the return line below for the old
+    build-if-missing rule and asserts the two disagree on a broken tree, so
+    keep it a single literal line.
+    """
+    return True  # make decides freshness from mtimes (#1322)
+
+
+def _ritz1_jobs() -> str:
+    """The repo's -j rule for ritz1 builds (AGAST #1802): min(nproc, 8)."""
+    proc = subprocess.run(
+        ["sh", str(RITZ_ROOT / "scripts" / "ritz1-jobs.sh")],
+        capture_output=True, text=True, check=True,
+    )
+    return proc.stdout.strip()
+
+
+def _make(args: list[str], timeout: int) -> subprocess.CompletedProcess:
+    log = os.environ.get("RITZ_TEST_MAKE_LOG")
+    if log:
+        with open(log, "a") as f:
+            f.write(f"{os.getpid()} make {' '.join(args)}\n")
+    return subprocess.run(
+        ["make", *args],
+        cwd=RITZ_ROOT,
+        env=dict(os.environ, RITZ_PATH=str(RITZ_ROOT)),
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+
+
+def build_ritz1_artifacts() -> str:
+    """Bring ritz1 and the runtime start object up to date.
+
+    Returns "" on success, otherwise the reason (with make's output tail).
+    """
+    if _ritz1_stale():
+        proc = _make(["-j", _ritz1_jobs(), "-C", "ritz1", "ritz1"], timeout=1800)
+        if proc.returncode != 0 or not RITZ1_BIN.exists():
+            return (
+                f"could not build ritz1 (make exit {proc.returncode}):\n"
+                f"{proc.stdout[-4000:]}\n{proc.stderr[-4000:]}"
+            )
+    # RITZ_START is gitignored; build it rather than assume it exists (#1327).
+    proc = _make(["-C", "runtime", RITZ_START.name], timeout=300)
+    if proc.returncode != 0 or not RITZ_START.exists():
+        return (
+            f"could not build the runtime start object {RITZ_START}:\n"
+            f"{proc.stdout[-2000:]}\n{proc.stderr[-2000:]}"
+        )
+    return ""
+
+
+def _session_verdict(config) -> str:
+    """The build verdict for this session, building now if nobody has yet."""
+    workerinput = getattr(config, "workerinput", None)
+    if workerinput is not None:
+        if _BUILD_KEY not in workerinput:
+            return (
+                "xdist worker started without the controller's ritz1 build "
+                "verdict; conftest.pytest_configure_node did not run"
+            )
+        return workerinput[_BUILD_KEY]
+    if _build_verdict not in config.stash:
+        config.stash[_build_verdict] = build_ritz1_artifacts()
+    return config.stash[_build_verdict]
 
 
 def pytest_configure(config):
@@ -57,8 +191,54 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers", "integration: drives a real compile/link/run subprocess"
     )
+    config.addinivalue_line(
+        "markers", "slow: minutes on its own; scheduled first under xdist"
+    )
+
+
+def pytest_collection_modifyitems(config, items):
+    """Slow tests first, then xdist_group members, then the rest (stable).
+
+    Deterministic, so every xdist worker collects the same order.
+    """
+    def rank(item):
+        if item.get_closest_marker("slow") is not None:
+            return 0
+        if item.get_closest_marker("xdist_group") is not None:
+            return 1
+        return 2
+    items.sort(key=rank)
+
+
+@pytest.hookimpl(optionalhook=True)
+def pytest_configure_node(node):
+    """xdist controller hook: hand each worker the session's build verdict.
+
+    Runs on the controller while it sets up each worker, before any worker
+    executes a test; the first call builds, later ones reuse the verdict.
+    """
+    node.workerinput[_BUILD_KEY] = _session_verdict(node.config)
 
 
 def pytest_unconfigure(config):
     if _SESSION_CACHE is not None:
         shutil.rmtree(_SESSION_CACHE, ignore_errors=True)
+
+
+@pytest.fixture(scope="session")
+def ritz1_bin(request) -> Path:
+    """Path to an up-to-date ritz1; the runtime start object is built too.
+
+    Fails — never skips — when the build fails: a skipped test is
+    indistinguishable from a passing one in aggregate output (#1327).
+    """
+    verdict = _session_verdict(request.config)
+    if verdict:
+        pytest.fail(verdict)
+    return RITZ1_BIN
+
+
+@pytest.fixture(scope="session")
+def ritz_start(ritz1_bin) -> Path:
+    """Path to the runtime start object; built alongside ritz1 by `ritz1_bin`."""
+    return RITZ_START

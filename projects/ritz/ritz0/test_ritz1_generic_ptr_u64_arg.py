@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-from test_ritz1_builtin_struct_shadow import RITZ1_BIN, RITZ_ROOT, _run_pkg, ritz1_bin  # noqa: F401
+from test_ritz1_builtin_struct_shadow import RITZ1_BIN, RITZ_ROOT, _run_pkg
 
 
 def _compile_ritz1(tmp_path: Path, program: str) -> str:
@@ -163,7 +163,7 @@ pub fn main() -> i32
 
 @pytest.mark.integration
 @pytest.mark.parametrize("name", sorted(PROGRAMS))
-def test_ritz1_matches_ritz0(ritz1_bin, tmp_path, name):  # noqa: F811
+def test_ritz1_matches_ritz0(ritz1_bin, tmp_path, name):
     program = PROGRAMS[name]
     expected = _run_pkg("ritz0", tmp_path, name, program)
     assert _run_pkg("ritz1", tmp_path, name, program) == expected
@@ -183,7 +183,7 @@ SPELLINGS = {
 
 @pytest.mark.integration
 @pytest.mark.parametrize("annot", sorted(SPELLINGS))
-def test_annotation_mangles_like_call_site(ritz1_bin, tmp_path, annot):  # noqa: F811
+def test_annotation_mangles_like_call_site(ritz1_bin, tmp_path, annot):
     arg = annot[len("Vec<") : -1]
     program = (
         HEADER

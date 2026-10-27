@@ -31,30 +31,6 @@ LITERAL_ALLOC = re.compile(
 )
 
 
-def _build_ritz1() -> None:
-    """Bring RITZ1_BIN up to date; a stale binary would test the old code."""
-    env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
-    proc = subprocess.run(
-        ["make", "-C", "ritz1", "ritz1"],
-        cwd=RITZ_ROOT,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=1800,
-    )
-    if proc.returncode != 0 or not RITZ1_BIN.exists():
-        pytest.fail(
-            "could not build ritz1 for the AST alloc-size tests:\n"
-            f"{proc.stdout[-4000:]}\n{proc.stderr[-4000:]}"
-        )
-
-
-@pytest.fixture(scope="module")
-def ritz1_bin() -> Path:
-    _build_ritz1()
-    return RITZ1_BIN
-
-
 def _fn_body(src: str, name: str) -> str:
     """Return the text of top-level `fn name(...)` up to the next top-level item."""
     m = re.search(rf"^fn {name}\(.*?(?=^\S)", src, re.S | re.M)

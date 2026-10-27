@@ -13,7 +13,7 @@ mistake, and ritz0 (the oracle) rejects each of them as well.
 
 import pytest
 
-from test_ritz1_array_trailing_comma import _compile, ritz1_bin  # noqa: F401
+from test_ritz1_array_trailing_comma import _compile
 
 MALFORMED_FORMS = {
     "call_double_trailing_comma": """\

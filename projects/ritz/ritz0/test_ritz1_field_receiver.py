@@ -19,7 +19,7 @@ Oracle: ritz0 builds and runs every program with the same exit code.
 
 import pytest
 
-from test_ritz1_builtin_struct_shadow import _run_pkg, ritz1_bin  # noqa: F401
+from test_ritz1_builtin_struct_shadow import _run_pkg
 
 # The ticket's repro: `push` mutates the field in place, so len must be 1.
 VEC_FIELD = """\
@@ -157,13 +157,13 @@ def test_ritz0_oracle(tmp_path, name):
 
 @pytest.mark.integration
 @pytest.mark.parametrize("name", sorted(CASES))
-def test_ritz1_field_receiver(ritz1_bin, tmp_path, name):  # noqa: F811
+def test_ritz1_field_receiver(ritz1_bin, tmp_path, name):
     program, want = CASES[name]
     assert _run_pkg("ritz1", tmp_path, name, program) == want
 
 
 @pytest.mark.integration
 @pytest.mark.parametrize("name", sorted(RITZ1_ONLY))
-def test_ritz1_only_field_receiver(ritz1_bin, tmp_path, name):  # noqa: F811
+def test_ritz1_only_field_receiver(ritz1_bin, tmp_path, name):
     program, want = RITZ1_ONLY[name]
     assert _run_pkg("ritz1", tmp_path, name, program) == want

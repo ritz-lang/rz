@@ -20,6 +20,11 @@ from pathlib import Path
 
 import pytest
 
+# xdist_group("tree") (AGAST #1804): `build.py run` writes projects/ritz/build/main at a
+# fixed path and uses the shared .ritz-cache.  Tests in the group
+# run on one xdist worker, one at a time; see conftest.py.
+pytestmark = pytest.mark.xdist_group("tree")
+
 RITZ_ROOT = Path(__file__).resolve().parent.parent
 BUILD_PY = RITZ_ROOT / "build.py"
 

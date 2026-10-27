@@ -31,30 +31,6 @@ RITZ0 = RITZ_ROOT / "ritz0" / "ritz0.py"
 RITZ_START = RITZ_ROOT / "runtime" / "ritz_start.x86_64.o"
 
 
-def _make(target_dir: str, target: str, product: Path) -> None:
-    env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
-    proc = subprocess.run(
-        ["make", "-C", target_dir, target],
-        cwd=RITZ_ROOT,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=1800,
-    )
-    if proc.returncode != 0 or not product.exists():
-        pytest.fail(
-            f"could not build {product}:\n{proc.stdout[-4000:]}\n{proc.stderr[-4000:]}"
-        )
-
-
-@pytest.fixture(scope="module")
-def ritz1_bin() -> Path:
-    # A stale binary would test the old parser.
-    _make("ritz1", "ritz1", RITZ1_BIN)
-    _make("runtime", RITZ_START.name, RITZ_START)
-    return RITZ1_BIN
-
-
 # --- the ticket's repro, verbatim ------------------------------------------
 
 REPRO = """\

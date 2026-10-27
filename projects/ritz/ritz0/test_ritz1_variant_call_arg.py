@@ -31,13 +31,7 @@ import subprocess
 
 import pytest
 
-from test_ritz1_builtin_struct_shadow import (  # noqa: F401
-    RITZ1_BIN,
-    RITZ_ROOT,
-    _run,
-    _run_pkg,
-    ritz1_bin,
-)
+from test_ritz1_builtin_struct_shadow import RITZ1_BIN, RITZ_ROOT, _run, _run_pkg
 
 G_I64 = """\
 fn g(o: Option<i64>) -> i32
@@ -254,7 +248,7 @@ def test_ritz0_oracle(tmp_path, name):
 
 @pytest.mark.integration
 @pytest.mark.parametrize("name", sorted(CASES))
-def test_ritz1_variant_call_arg(ritz1_bin, tmp_path, name):  # noqa: F811
+def test_ritz1_variant_call_arg(ritz1_bin, tmp_path, name):
     program, want = CASES[name]
     assert _run("ritz1", tmp_path, name, program) == want
 
@@ -268,7 +262,7 @@ def test_ritz0_oracle_pkg(tmp_path, name):
 
 @pytest.mark.integration
 @pytest.mark.parametrize("name", sorted(PKG_CASES))
-def test_ritz1_variant_call_arg_pkg(ritz1_bin, tmp_path, name):  # noqa: F811
+def test_ritz1_variant_call_arg_pkg(ritz1_bin, tmp_path, name):
     program, want = PKG_CASES[name]
     assert _run_pkg("ritz1", tmp_path, name, program) == want
 
@@ -311,7 +305,7 @@ pub fn main() -> i32
     [NO_ENUM_PARAM, NO_ENUM_PARAM_NONE, NO_ENUM_PARAM_LET],
     ids=["some", "none", "let"],
 )
-def test_ritz1_ctor_without_enum_param_is_an_error(ritz1_bin, tmp_path, program):  # noqa: F811
+def test_ritz1_ctor_without_enum_param_is_an_error(ritz1_bin, tmp_path, program):
     src = tmp_path / "noenum.ritz"
     src.write_text(program)
     comp = subprocess.run(

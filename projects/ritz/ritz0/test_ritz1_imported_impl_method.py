@@ -29,7 +29,7 @@ from pathlib import Path
 
 import pytest
 
-from test_ritz1_builtin_struct_shadow import RITZ_ROOT, ritz1_bin  # noqa: F401
+from test_ritz1_builtin_struct_shadow import RITZ_ROOT
 
 # The ticket's two-file repro.
 SHAPE_SQ = """\
@@ -196,7 +196,7 @@ CASES = {
 
 @pytest.mark.integration
 @pytest.mark.parametrize("case", sorted(CASES))
-def test_imported_impl_method_matches_ritz0(ritz1_bin, tmp_path, case):  # noqa: F811
+def test_imported_impl_method_matches_ritz0(ritz1_bin, tmp_path, case):
     files, expected = CASES[case]
     want = _build_and_run("ritz0", tmp_path, case, files)
     if expected is not None:
@@ -206,7 +206,7 @@ def test_imported_impl_method_matches_ritz0(ritz1_bin, tmp_path, case):  # noqa:
 
 
 @pytest.mark.integration
-def test_local_impl_method_is_not_also_declared(ritz1_bin, tmp_path):  # noqa: F811
+def test_local_impl_method_is_not_also_declared(ritz1_bin, tmp_path):
     """The method defined in THIS file must stay a single `define` with no
     `declare` beside it (LLVM: invalid redefinition)."""
     src = tmp_path / "local.ritz"
@@ -230,7 +230,7 @@ def test_local_impl_method_is_not_also_declared(ritz1_bin, tmp_path):  # noqa: F
 
 
 @pytest.mark.integration
-def test_imported_method_declare_matches_signature(ritz1_bin, tmp_path):  # noqa: F811
+def test_imported_method_declare_matches_signature(ritz1_bin, tmp_path):
     """Each imported method gets exactly one `declare`, spelled from its FnDef
     the way a free function's is: sret methods return void, a byval param
     gets the concrete signature (#1739), i32 / struct returns keep their type.

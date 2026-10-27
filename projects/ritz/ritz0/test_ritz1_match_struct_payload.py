@@ -26,7 +26,7 @@ Oracle: ritz0 builds and runs every program with the same exit code.
 
 import pytest
 
-from test_ritz1_builtin_struct_shadow import _run, _run_pkg, ritz1_bin  # noqa: F401
+from test_ritz1_builtin_struct_shadow import _run, _run_pkg
 
 # Ticket repro 2a: field access on the bound struct.
 OPTION_MEMBER = """\
@@ -183,7 +183,7 @@ def test_ritz0_oracle(tmp_path, name):
 
 @pytest.mark.integration
 @pytest.mark.parametrize("name", sorted(CASES))
-def test_ritz1_match_struct_payload(ritz1_bin, tmp_path, name):  # noqa: F811
+def test_ritz1_match_struct_payload(ritz1_bin, tmp_path, name):
     program, want = CASES[name]
     assert _run("ritz1", tmp_path, name, program) == want
 
@@ -197,6 +197,6 @@ def test_ritz0_oracle_pkg(tmp_path, name):
 
 @pytest.mark.integration
 @pytest.mark.parametrize("name", sorted(PKG_CASES))
-def test_ritz1_match_struct_payload_pkg(ritz1_bin, tmp_path, name):  # noqa: F811
+def test_ritz1_match_struct_payload_pkg(ritz1_bin, tmp_path, name):
     program, want = PKG_CASES[name]
     assert _run_pkg("ritz1", tmp_path, name, program) == want

@@ -48,30 +48,6 @@ fn main() -> i32
 """
 
 
-def _build_ritz1() -> None:
-    """Bring RITZ1_BIN up to date; a stale binary would test the old code."""
-    env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
-    proc = subprocess.run(
-        ["make", "-C", "ritz1", "ritz1"],
-        cwd=RITZ_ROOT,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=1800,
-    )
-    if proc.returncode != 0 or not RITZ1_BIN.exists():
-        pytest.fail(
-            "could not build ritz1 for the RITZ_PATH tests:\n"
-            f"{proc.stdout[-4000:]}\n{proc.stderr[-4000:]}"
-        )
-
-
-@pytest.fixture(scope="module")
-def ritz1_bin() -> Path:
-    _build_ritz1()
-    return RITZ1_BIN
-
-
 @pytest.fixture
 def layout(tmp_path):
     """tmp/src/main.ritz plus tmp/lib/helper_1750.ritz, in separate dirs."""
