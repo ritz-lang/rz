@@ -1074,6 +1074,27 @@ fn main() -> i32
     point_new(3, 4).distance_squared()
 ```
 
+A method has no type parameters of its own: `fn conv<T>(self: *Point, x: T)`
+inside an `impl` block is a compile error located at the method, in both an
+inherent `impl Point` and a generic `impl<T> W<T>` (whose methods may use the
+impl's `T`). Write a free generic function instead (AGAST #1902):
+
+```ritz
+struct Point
+    x: i32
+    y: i32
+
+fn point_pick<T>(p: *Point, a: T, b: T) -> T
+    if p.x > 0
+        a
+    else
+        b
+
+fn main() -> i32
+    let p = Point { x: 1, y: 0 }
+    point_pick<i32>(@p, 0, 1)
+```
+
 ---
 
 ## 10. Enums

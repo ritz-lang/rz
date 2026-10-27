@@ -2395,6 +2395,16 @@ class Parser:
                 self._advance()
                 is_async = True
             method = self.parse_fn(attrs, is_async=is_async, is_pub=method_is_pub, impl_type=self_type)
+            # AGAST #1902: a method's own `<...>` is never instantiated (the
+            # emitter erased T, e.g. to i8, and `b.m<i32>(x)` crashed), and
+            # LANGUAGE_SPEC does not specify them. ritz1 rejects them too
+            # (ast_helpers.ritz impl_block_new). The impl's params are fine.
+            if method.type_params:
+                raise ParseError(
+                    f"method '{method.name}' of '{type_name}' has its own type "
+                    f"parameters <{', '.join(method.type_params)}>; generic methods "
+                    f"are not supported -- use a free generic fn",
+                    method.span)
             methods.append(method)
             self._skip_newlines()
 
