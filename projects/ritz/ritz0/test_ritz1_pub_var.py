@@ -70,15 +70,18 @@ pub fn add() -> i32
 pub fn main() -> i32
     return add()
 """,
-    # [[attr]] prefix, as items take attrs.
-    "pub_var_with_attr": """\
+}
+
+# An attribute before `pub var` reaches the `attrs global_var_def` arm, but
+# no attribute applies to a global (LANGUAGE_SPEC §17): it is a located
+# error, not accepted and ignored as it was before AGAST #1847.
+PUB_VAR_WITH_ATTR = """\
 [[inline]]
 pub var g: i32 = 5
 
 pub fn main() -> i32
     return g
-""",
-}
+"""
 
 # --- cross-module: helper declares, main imports and reads/writes ----------
 # (helper source, main source, expected exit code)
@@ -172,6 +175,16 @@ def test_ritz1_parses_repro(ritz1_bin, tmp_path):
 @pytest.mark.parametrize("name", sorted(SINGLE_MODULE))
 def test_ritz1_pub_var_single_module(ritz1_bin, tmp_path, name):
     assert _run_single("ritz1", tmp_path, name, SINGLE_MODULE[name]) == 5
+
+
+@pytest.mark.integration
+def test_ritz1_attr_on_pub_var_is_a_located_error(ritz1_bin, tmp_path):
+    src = tmp_path / "attr.ritz"
+    src.write_text(PUB_VAR_WITH_ATTR)
+    ll = tmp_path / "attr.ll"
+    comp = _compile("ritz1", tmp_path, src, ll)
+    assert comp.returncode != 0 and not ll.exists(), comp.stderr
+    assert "attr.ritz:1:3: attribute 'inline' applies to fn items only" in comp.stderr, comp.stderr
 
 
 @pytest.mark.integration

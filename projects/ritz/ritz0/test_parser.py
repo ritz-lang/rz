@@ -485,13 +485,13 @@ class TestAttributes:
         assert fn.attrs[0].name == "test"
 
     def test_multiple_attributes(self):
-        mod = parse("[[test]]\n[[ignore]]\nfn test_foo()\n  42")
+        mod = parse("[[test]]\n[[noinline]]\nfn test_foo()\n  42")
         fn = mod.items[0]
         assert isinstance(fn, rast.FnDef)
         assert fn.name == "test_foo"
         assert len(fn.attrs) == 2
         assert fn.attrs[0].name == "test"
-        assert fn.attrs[1].name == "ignore"
+        assert fn.attrs[1].name == "noinline"
 
     def test_function_with_attr_and_params(self):
         mod = parse("[[test]]\nfn test_add(x: i32, y: i32) -> i32\n  x + y")
@@ -504,11 +504,11 @@ class TestAttributes:
         assert fn.ret_type.name == "i32"
 
     def test_has_attr_method(self):
-        mod = parse("[[test]]\n[[ignore]]\nfn test_bar()\n  0")
+        mod = parse("[[test]]\n[[noinline]]\nfn test_bar()\n  0")
         fn = mod.items[0]
         assert fn.has_attr("test")
-        assert fn.has_attr("ignore")
-        assert not fn.has_attr("skip")
+        assert fn.has_attr("noinline")
+        assert not fn.has_attr("inline")
 
 
 class TestHelloWorld:
@@ -1118,12 +1118,14 @@ class TestReritzAttributes:
         assert fn.has_attr("inline")
 
     def test_attribute_with_string_arg(self):
-        """[[ignore("slow")]] should parse with argument"""
-        mod = reritz_parse('[[ignore("slow")]]\nfn test_foo()\n  0')
-        fn = mod.items[0]
-        assert fn.has_attr("ignore")
-        attr = next(a for a in fn.attrs if a.name == "ignore")
-        assert "slow" in attr.args
+        """`name("arg")` parses, but no attribute takes arguments (#1847)."""
+        with pytest.raises(ParseError, match="takes no arguments"):
+            reritz_parse('[[test("slow")]]\nfn test_foo()\n  0')
+
+    def test_unknown_attribute_is_rejected(self):
+        """Attributes are a closed set (LANGUAGE_SPEC §17, #1847)."""
+        with pytest.raises(ParseError, match="unknown attribute 'ignore'"):
+            reritz_parse('[[ignore]]\nfn test_foo()\n  0')
 
     def test_packed_struct(self):
         """[[packed]] struct should parse - TODO: enable struct attrs"""

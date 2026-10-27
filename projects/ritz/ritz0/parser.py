@@ -27,6 +27,20 @@ class ParseError(Exception):
         super().__init__(f"{span}: {message}")
 
 
+# The attributes (LANGUAGE_SPEC §17, AGAST #1847): name -> (takes a
+# `= "value"`, item kinds it applies to). Everything else is an error; ritz1
+# keeps the same table in ritz1/src/ast_helpers.ritz.
+ATTRS = {
+    "test": (False, ("fn",)),
+    "target_os": (True, ("fn", "struct", "const")),
+    "packed": (False, ("struct",)),
+    "naked": (False, ("fn",)),
+    "inline": (False, ("fn",)),
+    "always_inline": (False, ("fn",)),
+    "noinline": (False, ("fn",)),
+}
+
+
 class Parser:
     """
     Parser for Ritz source code.
@@ -1823,7 +1837,39 @@ class Parser:
         return attrs
 
     def _parse_single_attr(self) -> rast.Attr:
-        """Parse a single attribute: name, name("arg", ...), or name = "value"."""
+        """Parse a single attribute: name, name("arg", ...), or name = "value".
+
+        Attributes are a closed set (LANGUAGE_SPEC §17, AGAST #1847): an
+        unknown name, or a known one in the wrong form, is a located error.
+        They used to be accepted and ignored, which is how `[[cfg(...)]]`
+        sat in a test file meaning nothing.
+        """
+        attr = self._parse_single_attr_syntax()
+        if attr.name not in ATTRS:
+            raise ParseError(
+                f"unknown attribute '{attr.name}' (known: {', '.join(sorted(ATTRS))})",
+                attr.span)
+        takes_value = ATTRS[attr.name][0]
+        if attr.args:
+            raise ParseError(f"attribute '{attr.name}' takes no arguments", attr.span)
+        if takes_value and attr.value is None:
+            raise ParseError(f"attribute '{attr.name}' needs a value: [[{attr.name} = \"...\"]]",
+                             attr.span)
+        if not takes_value and attr.value is not None:
+            raise ParseError(f"attribute '{attr.name}' takes no value: [[{attr.name}]]",
+                             attr.span)
+        return attr
+
+    def _check_attrs_apply(self, attrs: List[rast.Attr], kind: str) -> None:
+        """Reject an attribute on an item kind it does not apply to (#1847)."""
+        for attr in attrs:
+            kinds = ATTRS[attr.name][1]
+            if kind not in kinds:
+                raise ParseError(
+                    f"attribute '{attr.name}' applies to {' or '.join(kinds)} items, not {kind}",
+                    attr.span)
+
+    def _parse_single_attr_syntax(self) -> rast.Attr:
         name_tok = self._expect(TokenType.IDENT, "Expected attribute name")
         args = []
         value = None
@@ -1849,7 +1895,7 @@ class Parser:
                         args.append(self._advance().value)
             self._expect(TokenType.RPAREN)
 
-        return rast.Attr(name_tok.value, args, value)
+        return rast.Attr(name_tok.value, args, value, span=name_tok.span)
 
     def parse_fn(self, attrs: List[rast.Attr] = None, is_async: bool = False, is_pub: bool = False,
                  impl_type: rast.Type = None) -> rast.FnDef:
@@ -1861,6 +1907,7 @@ class Parser:
         """
         if attrs is None:
             attrs = []
+        self._check_attrs_apply(attrs, "fn")
         span = self._current().span
         self._expect(TokenType.FN)
         name_tok = self._expect(TokenType.IDENT)
@@ -1892,6 +1939,17 @@ class Parser:
             ret_type = self.parse_type()
 
         body = self.parse_block()
+        if any(a.name == "naked" for a in attrs):
+            # No prologue means no frame: the body is asm that returns by
+            # itself. Anything else used to be dropped by the emitter in
+            # silence (#1847).
+            for stmt in body.stmts:
+                if not isinstance(stmt, rast.AsmStmt):
+                    raise ParseError(
+                        "a [[naked]] fn body may contain only asm blocks", stmt.span)
+            if body.expr is not None:
+                raise ParseError(
+                    "a [[naked]] fn body may contain only asm blocks", body.expr.span)
         return rast.FnDef(span, name_tok.value, params, ret_type, body, attrs,
                           is_async=is_async, is_pub=is_pub,
                           type_params=type_params, type_param_bounds=type_param_bounds)
@@ -1947,6 +2005,7 @@ class Parser:
         """
         if attrs is None:
             attrs = []
+        self._check_attrs_apply(attrs, "struct")
         span = self._current().span
         self._expect(TokenType.STRUCT)
         name_tok = self._expect(TokenType.IDENT)
@@ -2150,6 +2209,7 @@ class Parser:
 
     def parse_const(self, attrs: list = None, is_pub: bool = False) -> rast.ConstDef:
         """Parse a constant definition: const STDIN: i32 = 0."""
+        self._check_attrs_apply(attrs or [], "const")
         span = self._current().span
         self._expect(TokenType.CONST)
         name = self._expect(TokenType.IDENT).value

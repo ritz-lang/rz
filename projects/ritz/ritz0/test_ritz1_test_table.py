@@ -173,8 +173,14 @@ def test_target_os_filtered_test_is_not_in_the_table(ritz1_bin, tmp_path):
 
 
 def test_attribute_does_not_leak_to_the_next_item(ritz1_bin, tmp_path):
-    """`[[test]]` on a struct must not mark the fn after it."""
-    src = "[[test]]\nstruct S\n    a: i32\n\nfn test_after_struct() -> i32\n    0\n"
+    """`[[test]]` on an item that is not added must not mark the fn after it.
+
+    It used to be `[[test]]` on a struct; that is a located error since
+    AGAST #1847 (LANGUAGE_SPEC §17), so the item here is a fn that
+    `target_os` filters out — its dispatcher must still clear the note.
+    """
+    src = ('[[test]]\n[[target_os = "harland"]]\nfn test_other_os() -> i32\n    0\n\n'
+           'fn test_after_filtered() -> i32\n    0\n')
     assert _table_names(_ir(tmp_path, src)) == []
 
 

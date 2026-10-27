@@ -114,28 +114,16 @@ pub fn check_target_os_filter(p: *Parser, ident_start: *u8, ident_len: i32, str_
         return
     p.skip_item = 1
 
-# Grammar-action wrapper around check_target_os_filter.  The grammar's
-# `attr` rule returns i32; this lets the action stay a single function
-# call (no multi-statement-action support needed in ritzgen).
-pub fn attr_target_os(p: *Parser, ident_start: *u8, ident_len: i32, str_val: *u8, str_len: i32) -> i32
-    check_target_os_filter(p, ident_start, ident_len, str_val, str_len)
-    return 0
-
 # AGAST #1908: `[[test]]` (LANGUAGE_SPEC §17.1).  attr_flag notes it for the
-# item being parsed; item_dispatch_fn records that FnDef in g_test_fns, and
-# every dispatcher clears the note.  A side list rather than an FnDef field:
-# FnDefs come from parser_alloc (not zeroed) and monomorph's malloc'd clones,
-# so a new field would be garbage on every allocation site that did not set
-# it.  Pointers are compared by identity: a clone is never a test.
-var g_attr_test: i32 = 0
+# item being parsed (ATTR_TEST in g_attr_bits); item_dispatch_fn records that
+# FnDef in g_test_fns, and every dispatcher clears the note.  A side list
+# rather than an FnDef field: FnDefs come from parser_alloc (not zeroed) and
+# monomorph's malloc'd clones, so a new field would be garbage on every
+# allocation site that did not set it.  Pointers are compared by identity: a
+# clone is never a test.
 var g_test_fns: *i64 = null
 var g_test_fn_count: i64 = 0
 var g_test_fn_cap: i64 = 0
-
-pub fn attr_flag(p: *Parser, ident_start: *u8, ident_len: i32) -> i32
-    if buf_eq(ident_start, ident_len, c"test", 4) == 1
-        g_attr_test = 1
-    return 0
 
 fn test_fn_record(f: *FnDef)
     if g_test_fn_count == g_test_fn_cap
@@ -170,7 +158,9 @@ pub fn test_fn_at(i: i64) -> *FnDef
 # Forget every recorded test fn: the driver re-parses from scratch (#1475).
 pub fn test_fns_reset()
     g_test_fn_count = 0
-    g_attr_test = 0
+    g_attr_bits = 0
+    # The re-parse allocates new items, possibly at a freed item's address.
+    g_item_attr_count = 0
 
 # =============================================================================
 # Item dispatchers — honour p.skip_item set by attrs (5F.3c)
@@ -193,37 +183,42 @@ pub fn test_fns_reset()
 pub fn item_dispatch_fn(p: *Parser, fn_def: *FnDef) -> i32
     if p.skip_item == 0
         module_add_fn(p.module, fn_def)
-        if g_attr_test == 1
+        if (g_attr_bits & ATTR_TEST) != 0
             test_fn_record(fn_def)
+        let fn_bits: i32 = g_attr_bits & (ATTR_INLINE | ATTR_ALWAYS_INLINE | ATTR_NOINLINE)
+        if fn_bits != 0
+            item_attr_record(fn_def as *u8, fn_bits)
     p.skip_item = 0
-    g_attr_test = 0
+    g_attr_bits = 0
     return 1
 
 pub fn item_dispatch_struct(p: *Parser, st: *StructDef) -> i32
     if p.skip_item == 0
         module_add_struct(p.module, st)
+        if (g_attr_bits & ATTR_PACKED) != 0
+            item_attr_record(st as *u8, ATTR_PACKED)
     p.skip_item = 0
-    g_attr_test = 0
+    g_attr_bits = 0
     return 1
 
 pub fn item_dispatch_const(p: *Parser, c: *ConstEntry) -> i32
     if p.skip_item == 0
         module_add_const(p.module, c)
     p.skip_item = 0
-    g_attr_test = 0
+    g_attr_bits = 0
     return 1
 
 pub fn item_dispatch_global(p: *Parser, g: *GlobalVarDef) -> i32
     if p.skip_item == 0
         module_add_global_var(p.module, g)
     p.skip_item = 0
-    g_attr_test = 0
+    g_attr_bits = 0
     return 1
 
 pub fn item_dispatch_enum(p: *Parser) -> i32
     # enum has no AST node yet; just reset skip flag and report progress.
     p.skip_item = 0
-    g_attr_test = 0
+    g_attr_bits = 0
     return 1
 
 # =============================================================================
@@ -259,6 +254,8 @@ pub fn parser_set_source_file(path: *u8)
 
 pub fn parser_reset_diagnostics()
     g_dropped_items = 0
+    g_attr_errors = 0
+    g_attr_last_err = null
 
 pub fn parser_dropped_items() -> i32
     g_dropped_items
@@ -303,6 +300,221 @@ fn eprint_construct(p: *Parser)
             eprint_char(' ')
             eprint_lexeme(nxt.start, nxt.len)
 
+# =============================================================================
+# Attributes (LANGUAGE_SPEC §17, AGAST #1847)
+# =============================================================================
+#
+# Attributes are a closed set.  ritz1 used to accept every bare `[[name]]`
+# and drop it, so a `[[packed]]` struct got natural alignment and a
+# `[[naked]]` fn a prologue — silently.  Now each attribute is honoured or
+# is a located error, and ritz0/parser.py ATTRS holds the same table:
+#
+#   test           fn      g_test_fns (the test table, #1908)
+#   target_os=".." fn, struct, const   item filtered out unless it matches
+#   packed         struct  `<{ ... }>`, no padding, alignment 1
+#   inline         fn      LLVM inlinehint
+#   always_inline  fn      LLVM alwaysinline
+#   noinline       fn      LLVM noinline
+#   naked          fn      rejected: the body must be asm and ritz1 has no
+#                          inline asm yet (AGAST #1619)
+#
+# The grammar runs these actions before it knows which item follows, and it
+# backtracks: `attrs` is re-parsed for every `item` alternative tried.  So
+# the item kind comes from token lookahead (attr_item_kind), the bits for the
+# item are noted in g_attr_bits and committed by the item_dispatch_* that
+# succeeds, and an error is printed once per attribute token.
+# p.error cannot carry the failure — it is the generated parser's
+# backtracking signal — so module_require_eof checks g_attr_errors.
+
+const ATTR_TEST: i32 = 1
+const ATTR_PACKED: i32 = 2
+const ATTR_INLINE: i32 = 4
+const ATTR_ALWAYS_INLINE: i32 = 8
+const ATTR_NOINLINE: i32 = 16
+
+const ATTR_ITEM_OTHER: i32 = 0
+const ATTR_ITEM_FN: i32 = 1
+const ATTR_ITEM_STRUCT: i32 = 2
+const ATTR_ITEM_CONST: i32 = 3
+
+var g_attr_bits: i32 = 0
+var g_attr_errors: i32 = 0
+var g_attr_last_err: *u8 = null
+
+# (item pointer, ATTR_* bits) pairs, for attributes the emitter reads.
+var g_item_attrs: *i64 = null
+var g_item_attr_count: i64 = 0
+var g_item_attr_cap: i64 = 0
+
+# The kind of item the attribute list at p.pos is attached to: skip the rest
+# of the attribute lines and a `pub`, then look at the keyword.
+fn attr_item_kind(p: *Parser) -> i32
+    var i: i32 = p.pos
+    while i < p.token_count
+        let tok: *Token = p.tokens + i
+        if tok.kind == TOK_LBRACKET2
+            var at_eol: i32 = 0
+            while at_eol == 0 and i < p.token_count
+                let t2: *Token = p.tokens + i
+                if t2.kind == TOK_NEWLINE
+                    at_eol = 1
+                i = i + 1
+        else if tok.kind == TOK_PUB or tok.kind == TOK_NEWLINE
+            i = i + 1
+        else if tok.kind == TOK_FN
+            return ATTR_ITEM_FN
+        else if tok.kind == TOK_STRUCT
+            return ATTR_ITEM_STRUCT
+        else if tok.kind == TOK_CONST
+            return ATTR_ITEM_CONST
+        else
+            return ATTR_ITEM_OTHER
+    ATTR_ITEM_OTHER
+
+# `error: <file>:<line>:<col>: attribute '<name>' <msg>`, once per token.
+fn attr_error(name: *u8, len: i32, line: i32, col: i32, msg: *u8)
+    if name == g_attr_last_err
+        return
+    g_attr_last_err = name
+    g_attr_errors = g_attr_errors + 1
+    eprints_cstr(c"error: ")
+    if g_parse_file != null
+        eprints_cstr(g_parse_file)
+    else
+        eprints_cstr(c"<input>")
+    eprint_char(':')
+    eprint_i64(line as i64)
+    eprint_char(':')
+    eprint_i64(col as i64)
+    eprints_cstr(c": attribute '")
+    eprint_lexeme(name, len)
+    eprints_cstr(c"' ")
+    eprintln_cstr(msg)
+
+fn attr_unknown(name: *u8, len: i32, line: i32, col: i32)
+    if name == g_attr_last_err
+        return
+    g_attr_last_err = name
+    g_attr_errors = g_attr_errors + 1
+    eprints_cstr(c"error: ")
+    if g_parse_file != null
+        eprints_cstr(g_parse_file)
+    else
+        eprints_cstr(c"<input>")
+    eprint_char(':')
+    eprint_i64(line as i64)
+    eprint_char(':')
+    eprint_i64(col as i64)
+    eprints_cstr(c": unknown attribute '")
+    eprint_lexeme(name, len)
+    eprintln_cstr(c"' (known: always_inline, inline, naked, noinline, packed, target_os, test)")
+
+# 1 for the attributes written bare, `[[name]]`.
+fn attr_is_bare_name(name: *u8, len: i32) -> i32
+    if buf_eq(name, len, c"test", 4) == 1 or buf_eq(name, len, c"packed", 6) == 1
+        return 1
+    if buf_eq(name, len, c"naked", 5) == 1 or buf_eq(name, len, c"inline", 6) == 1
+        return 1
+    if buf_eq(name, len, c"always_inline", 13) == 1 or buf_eq(name, len, c"noinline", 8) == 1
+        return 1
+    0
+
+# Grammar action for `[[name]]`.
+pub fn attr_flag(p: *Parser, name: *u8, len: i32, line: i32, col: i32) -> i32
+    var bit: i32 = 0
+    var applies_to: i32 = ATTR_ITEM_FN
+    if buf_eq(name, len, c"test", 4) == 1
+        bit = ATTR_TEST
+    else if buf_eq(name, len, c"packed", 6) == 1
+        bit = ATTR_PACKED
+        applies_to = ATTR_ITEM_STRUCT
+    else if buf_eq(name, len, c"inline", 6) == 1
+        bit = ATTR_INLINE
+    else if buf_eq(name, len, c"always_inline", 13) == 1
+        bit = ATTR_ALWAYS_INLINE
+    else if buf_eq(name, len, c"noinline", 8) == 1
+        bit = ATTR_NOINLINE
+    else if buf_eq(name, len, c"naked", 5) == 1
+        attr_error(name, len, line, col, c"is not supported by ritz1: a [[naked]] fn body may contain only asm, and ritz1 has no inline asm yet (AGAST #1619)")
+        return 0
+    else if buf_eq(name, len, c"target_os", 9) == 1
+        attr_error(name, len, line, col, c"needs a value: [[target_os = <os name string>]]")
+        return 0
+    else
+        attr_unknown(name, len, line, col)
+        return 0
+    if attr_item_kind(p) != applies_to
+        if applies_to == ATTR_ITEM_STRUCT
+            attr_error(name, len, line, col, c"applies to struct items only")
+        else
+            attr_error(name, len, line, col, c"applies to fn items only")
+        return 0
+    g_attr_bits = g_attr_bits | bit
+    0
+
+# Grammar action for `[[name = "value"]]`.
+pub fn attr_kv(p: *Parser, name: *u8, len: i32, line: i32, col: i32, str_val: *u8, str_len: i32) -> i32
+    if buf_eq(name, len, c"target_os", 9) == 1
+        if attr_item_kind(p) == ATTR_ITEM_OTHER
+            attr_error(name, len, line, col, c"applies to fn, struct or const items only")
+            return 0
+        check_target_os_filter(p, name, len, str_val, str_len)
+        return 0
+    if attr_is_bare_name(name, len) == 1
+        attr_error(name, len, line, col, c"takes no value")
+        return 0
+    attr_unknown(name, len, line, col)
+    0
+
+fn item_attr_record(item: *u8, bits: i32)
+    if g_item_attr_count + 2 > g_item_attr_cap
+        var cap: i64 = g_item_attr_cap * 2
+        if cap == 0
+            cap = 32
+        let grown: *i64 = realloc(g_item_attrs as *u8, cap * 8) as *i64
+        if grown == null
+            eprints_cstr(c"error: ritz1: out of memory recording attributes\n")
+            sys_exit(70)
+        g_item_attrs = grown
+        g_item_attr_cap = cap
+    *(g_item_attrs + g_item_attr_count) = item as i64
+    *(g_item_attrs + g_item_attr_count + 1) = bits as i64
+    g_item_attr_count = g_item_attr_count + 2
+
+# ATTR_* bits recorded for `item` (by identity), 0 if none.
+fn item_attr_bits(item: *u8) -> i32
+    let key: i64 = item as i64
+    var i: i64 = 0
+    while i < g_item_attr_count
+        if *(g_item_attrs + i) == key
+            return *(g_item_attrs + i + 1) as i32
+        i = i + 2
+    0
+
+# 1 if `st` was declared `[[packed]]` (or is a clone of one: monomorph marks
+# its specialisations with struct_mark_packed).
+pub fn struct_is_packed(st: *StructDef) -> i32
+    if st == null
+        return 0
+    if (item_attr_bits(st as *u8) & ATTR_PACKED) != 0
+        return 1
+    0
+
+pub fn struct_mark_packed(st: *StructDef)
+    item_attr_record(st as *u8, ATTR_PACKED)
+
+# LLVM fn attribute text for `f`'s inline attribute (with a leading space),
+# or "" when it has none.
+pub fn fn_inline_attr(f: *FnDef) -> *u8
+    let bits: i32 = item_attr_bits(f as *u8)
+    if (bits & ATTR_INLINE) != 0
+        return c" inlinehint"
+    if (bits & ATTR_ALWAYS_INLINE) != 0
+        return c" alwaysinline"
+    if (bits & ATTR_NOINLINE) != 0
+        return c" noinline"
+    c""
+
 # Called by the generated anchor-skip recovery in parse_item BEFORE it
 # skips the construct it could not parse.  p.pos is still at the first
 # token of that construct (every failed alternative rewinds to start_pos).
@@ -321,6 +533,11 @@ pub fn parser_report_dropped_item(p: *Parser) -> i32
     return 1
 
 pub fn module_require_eof(p: *Parser) -> i32
+    # A rejected attribute was reported where it was written (#1847).
+    if g_attr_errors > 0
+        p.error = 1
+        return 1
+
     # Any item the recovery skipped is a dropped top-level definition.
     if g_dropped_items > 0
         eprints_cstr(c"error: ")
@@ -1393,7 +1610,7 @@ pub fn type_alias_resolve(p: *Parser, name: *u8, len: i32) -> i32
 # has no AST node (it lives in the alias table), so only reset skip_item.
 pub fn item_dispatch_alias(p: *Parser) -> i32
     p.skip_item = 0
-    g_attr_test = 0
+    g_attr_bits = 0
     return 1
 
 # Handle immutable reference type @T

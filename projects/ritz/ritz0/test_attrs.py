@@ -47,7 +47,7 @@ struct NormalData
     def test_multiple_attrs_on_struct(self):
         """Test struct with multiple attributes."""
         source = """
-[[packed, repr_c]]
+[[packed, target_os = "linux"]]
 struct ForeignStruct
     x: i32
     y: i32
@@ -59,7 +59,7 @@ struct ForeignStruct
         struct_def = module.items[0]
         assert isinstance(struct_def, rast.StructDef)
         assert struct_def.has_attr('packed')
-        assert struct_def.has_attr('repr_c')
+        assert struct_def.get_attr_value('target_os') == "linux"
 
 
 class TestNakedAttrParser:

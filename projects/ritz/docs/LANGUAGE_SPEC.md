@@ -1609,7 +1609,40 @@ The async runtime uses io_uring for asynchronous I/O on Linux; see
 
 ## 17. Attributes
 
-Attributes use double-bracket syntax on the line before the item.
+Attributes use double-bracket syntax on the line before the item. An item may
+carry several, one per line or comma-separated in one pair of brackets.
+
+The attributes are a closed set:
+
+| Attribute | Applies to | Meaning |
+|---|---|---|
+| `[[test]]` | `fn` | a test ([§17.1](#171-test-attribute)) |
+| `[[target_os = "<os>"]]` | `fn`, `struct`, `const` | the item exists only when compiling for `<os>` ([§17.2](#172-target-attribute)) |
+| `[[packed]]` | `struct` | no padding; alignment 1 ([§17.4](#174-packed-structs)) |
+| `[[naked]]` | `fn` | no prologue or epilogue; the body is `asm` only ([§17.5](#175-naked-functions)) |
+| `[[inline]]` | `fn` | inlining hint ([§17.6](#176-inlining-attributes)) |
+| `[[always_inline]]` | `fn` | always inline |
+| `[[noinline]]` | `fn` | never inline |
+
+Any other attribute, a known attribute on an item kind it does not apply to,
+a value given to an attribute that takes none, or a missing value is a
+compile error located at the attribute. An attribute is never accepted and
+ignored: a compiler that does not implement one rejects it (AGAST #1847).
+
+```ritz expect-error="unknown attribute 'repr_c'"
+[[repr_c]]
+struct Header
+    magic: u32
+```
+
+```ritz expect-error="attribute 'packed' applies to struct"
+[[packed]]
+fn checksum() -> u8
+    0
+```
+
+ritz1 does not yet parse the comma-separated form or implement `[[naked]]`.
+It rejects both with a located error.
 
 ### 17.1 Test Attribute
 
@@ -1678,7 +1711,76 @@ fn test_addition() -> i32
     0
 ```
 
-`@inline` in particular has no replacement: there is no inlining attribute.
+`@inline` is written `[[inline]]` ([§17.6](#176-inlining-attributes)).
+
+### 17.4 Packed Structs
+
+A `[[packed]]` struct lays its fields out back to back in declaration order,
+with no padding between them and none at the end. Its alignment is 1, so it
+also adds no padding where it is embedded in another struct. `sizeof` and
+field offsets follow from that, and every compiler agrees on them. This is
+the layout of hardware- and firmware-defined records: GDT/IDT descriptors,
+ACPI tables, UEFI structures.
+
+```ritz
+[[packed]]
+struct GdtPointer
+    limit: u16
+    base: u64
+
+struct Plain
+    limit: u16
+    base: u64
+
+fn layout_ok() -> bool
+    var p: GdtPointer
+    let base_off: i64 = @p.base as i64 - @p as i64
+    sizeof(GdtPointer) == 10 and sizeof(Plain) == 16 and base_off == 2
+```
+
+Every instance of a generic `[[packed]]` struct is packed. A packed struct's
+fields may be misaligned. Read and write them through the struct (`p.base`);
+a pointer to a misaligned field (`@p.base`) is only an address.
+
+### 17.5 Naked Functions
+
+A `[[naked]]` function gets no prologue or epilogue. The compiler does not
+set up a frame or spill parameters, so the body cannot name its parameters or
+declare locals. The body may contain only `asm` blocks. It finds its
+arguments in the calling convention's registers and must return by itself.
+Any other statement in the body is a compile error.
+
+```ritz
+[[naked]]
+fn add_regs(a: i32, b: i32) -> i32
+    asm x86_64:
+        movl %edi, %eax
+        addl %esi, %eax
+        retq
+```
+
+```ritz expect-error="may contain only asm"
+[[naked]]
+fn not_asm() -> i32
+    let x: i32 = 1
+    x
+```
+
+ritz1 has no inline `asm` yet (AGAST #1619), so it rejects `[[naked]]`.
+
+### 17.6 Inlining Attributes
+
+`[[inline]]` asks for a function to be inlined, `[[always_inline]]`
+requires it, and `[[noinline]]` forbids it. They are LLVM's `inlinehint`,
+`alwaysinline` and `noinline`, and do not change what the function means.
+A function carries at most one of them; if it is given several, the first in
+the order `inline`, `always_inline`, `noinline` applies.
+
+```ritz
+[[noinline]]
+fn slow_path() -> i32
+    1
+```
 
 ---
 
@@ -1821,11 +1923,12 @@ self-hosted parser is generated. A sketch:
 
 ```
 program      := item*
-item         := attrs? (fn_def | extern_fn | struct_def | enum_def
+item         := attrs (fn_def | extern_fn | struct_def | enum_def
                         | const_def | global_var | import | impl_block)
               | trait_def
 
-attr         := '[[' IDENT ']]' | '[[' IDENT '=' STRING ']]'
+attrs        := ('[[' attr (',' attr)* ']]' NEWLINE)*     # §17
+attr         := IDENT | IDENT '=' STRING
 fn_def       := 'pub'? 'fn' IDENT generic_params? '(' params? ')'
                 ('->' type)? block
 struct_def   := 'pub'? 'struct' IDENT generic_params? NEWLINE INDENT field+ DEDENT

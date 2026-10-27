@@ -822,6 +822,8 @@ class Attr:
     name: str
     args: List[str] = None  # For @attr(arg1, arg2) or [[attr("arg")]]
     value: str = None  # For [[attr = "value"]] syntax
+    # Where the attribute's name was written, for located errors (#1847).
+    span: Span = field(default=None, compare=False, repr=False)
 
     def __post_init__(self):
         if self.args is None:
