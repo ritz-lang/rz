@@ -179,6 +179,13 @@ fn emit_variant_tag_check_i64(s: *EmitterState, scrut_reg: i32, tag_one: i32) ->
     emit_str(s, c", true\n")
     return inv
 
+# AGAST #1797: the tag of the variant `arm` names in user enum `enum_name`,
+# or -1 (not a user enum, or no such variant).
+fn user_arm_variant(enum_name: *u8, enum_name_len: i32, arm: *MatchArm) -> i32
+    if user_enum_index(enum_name, enum_name_len) < 0
+        return 0 - 1
+    return enum_variant_index(enum_name, enum_name_len, arm.pattern_name, arm.pattern_name_len)
+
 # AGAST #1515: the struct type carried by a tagged enum's carrier variant
 # (Ok/Some): see tagged_enum_payload_struct.  AGAST #1667 adds Result's Err
 # side (tagged_enum_err_payload_struct).  When it names a known struct,
@@ -190,6 +197,12 @@ fn carrier_payload_struct(s: *EmitterState, arm: *MatchArm, enum_name: *u8, enum
     if enum_name == null or enum_name_len <= 0
         return
     if is_tagged_enum_type(enum_name, enum_name_len) == 0
+        # AGAST #1797: a user enum's tuple variant declares its payload.
+        let uf: *StructField = user_enum_tuple_field(enum_name, enum_name_len, user_arm_variant(enum_name, enum_name_len, arm))
+        if uf != null
+            if uf.field_type == TYPE_STRUCT and uf.field_type_name_len > 0
+                *out_name = uf.field_type_name
+                *out_len = uf.field_type_name_len
         return
     if variant_is_tag_one(arm.pattern_name, arm.pattern_name_len) == 0
         # AGAST #1667: `Err(e)` over Result<T, E> with a struct E binds at %E.
@@ -308,7 +321,13 @@ fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_s
                 else if is_wildcard == 0
                     var payload_reg: i32 = 0
                     if scrut_slot != 0 and enum_name != null and enum_name_len > 0
-                        payload_reg = emit_variant_payload(s, scrut_slot, enum_name, enum_name_len, 1 - variant_is_tag_one(arm.pattern_name, arm.pattern_name_len))
+                        # Result/Option: 0 Ok-Some, 1 Err; a user enum: the
+                        # variant's own tag (AGAST #1797), for its width.
+                        var pay_variant: i32 = 1 - variant_is_tag_one(arm.pattern_name, arm.pattern_name_len)
+                        let uvi: i32 = user_arm_variant(enum_name, enum_name_len, arm)
+                        if uvi >= 0
+                            pay_variant = uvi
+                        payload_reg = emit_variant_payload(s, scrut_slot, enum_name, enum_name_len, pay_variant)
                     else
                         # Non-enum scrutinee (shouldn't reach here in practice).
                         payload_reg = scrut_reg
@@ -474,8 +493,8 @@ fn resolve_scrutinee_enum(s: *EmitterState, scr: *Expr, out_name: **u8, out_len:
                     *out_len = loc.type_name_len
                     return 1
                 # Also recognize user-declared enums (Shade, etc.) via the
-                # parser's per-enum tracker.  Their layout is `{ i8 tag }`
-                # (no payload) so match logic uses the same tag-byte GEP.
+                # parser's per-enum tracker.  The tag is field 0 and the
+                # payload field 2, as for Result/Option (AGAST #1797).
                 if is_enum_type(loc.type_name, loc.type_name_len) == 1
                     *out_name = loc.type_name
                     *out_len = loc.type_name_len
@@ -496,6 +515,16 @@ fn resolve_scrutinee_enum(s: *EmitterState, scr: *Expr, out_name: **u8, out_len:
     else if scr.kind == EXPR_UNARY
         if scr.op == OP_DEREF
             return resolve_scrutinee_enum(s, scr.operand, out_name, out_len)
+    else if scr.kind == EXPR_MEMBER
+        # AGAST #1797: an enum-typed struct field, `match h.d`.  It loads
+        # the `%Enum` aggregate; matched as a scalar, every arm compared
+        # the aggregate register as an i64 and fell through.
+        let fld: *StructField = resolve_member_chain_field(s, scr)
+        if fld != null and fld.field_type == TYPE_STRUCT and fld.field_type_name_len > 0
+            if is_tagged_enum_type(fld.field_type_name, fld.field_type_name_len) == 1 or is_enum_type(fld.field_type_name, fld.field_type_name_len) == 1
+                *out_name = fld.field_type_name
+                *out_len = fld.field_type_name_len
+                return 1
     *out_name = null
     *out_len = 0
     return 0

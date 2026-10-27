@@ -1426,8 +1426,11 @@ fn mangled_type_size_align(s: *EmitterState, name: *u8, len: i32, align: *i64) -
         return 1 + pad + n   # all-i8 struct: 1-aligned
     let st: *StructDef = find_struct(s, name, len)
     if st == null
+        let uei: i32 = user_enum_index(name, len)
+        if uei >= 0
+            return user_enum_size(s, uei)   # all-i8 struct: 1-aligned (#1797)
         if is_enum_type(name, len) == 1
-            return 1   # C-style enum: `{ i8 }`
+            return 1   # generic user enum: unmeasured, tag only
         return 0
     if st.type_params != null
         return 0
@@ -1462,12 +1465,135 @@ pub fn tagged_enum_layout(s: *EmitterState, name: *u8, len: i32, pad: *i64) -> i
     *pad = (align - (1 % align)) % align
     size
 
+# =============================================================================
+# User-enum layout (AGAST #1797) — ritz0's _define_enum, as for Result/Option:
+#
+#     %Opt = type { i8 tag, [pad x i8], [N x i8] payload }
+#
+# N is the largest variant payload, pad aligns it to the most-aligned one.
+# A variant's payload is its fields laid out like a struct's (each at its
+# own alignment, the total rounded up to the strictest), ritz0's
+# _enum_variant_field_layout.  `enum Opt / Vacant / Holds(i32)` is
+# { i8, [3 x i8], [4 x i8] }.  As for tagged enums, ritz1 always writes the
+# pad field (`[0 x i8]` when nothing needs aligning) so the payload is field
+# 2; a zero-length array adds no bytes and no ABI element, so ritz0's
+# `{ i8, [N x i8] }` is the same type at a call boundary.  An enum with no
+# payload at all stays `{ i8 }`.
+#
+# Only non-generic enums are measured: a generic `enum Slot<T>` records `T`
+# unsubstituted.  (ritzlib's Option / Result are generic and take the
+# tagged-enum path above.)
+# =============================================================================
+
+# Tracker index of the non-generic user enum `name`, or -1.
+pub fn user_enum_index(name: *u8, len: i32) -> i32
+    if name == null or len <= 0
+        return 0 - 1
+    let ei: i32 = enum_find(name, len)
+    if ei < 0
+        return 0 - 1
+    if enum_is_generic(ei) == 1
+        return 0 - 1
+    ei
+
+# Size of one variant's payload fields, laid out in declaration order at
+# their natural alignment and rounded up to the strictest (written to
+# *align).  0 for a unit variant.
+fn variant_payload_size_align(s: *EmitterState, fields: *StructField, align: *i64) -> i64
+    var offset: i64 = 0
+    var max_align: i64 = 1
+    var f: *StructField = fields
+    while f != null
+        var falign: i64 = 8
+        var fsize: i64 = 8
+        if f.field_type == TYPE_ARRAY
+            fsize = elem_size_align(s, f.array_elem_type, f.array_elem_type_name, f.array_elem_type_name_len, @falign)
+            fsize = fsize * (f.array_size as i64)
+        else
+            fsize = elem_size_align(s, f.field_type, f.field_type_name, f.field_type_name_len, @falign)
+        if falign < 1
+            falign = 1
+        let rem: i64 = offset % falign
+        if rem != 0
+            offset = offset + (falign - rem)
+        offset = offset + fsize
+        if falign > max_align
+            max_align = falign
+        f = f.next
+    let rem2: i64 = offset % max_align
+    if rem2 != 0
+        offset = offset + (max_align - rem2)
+    *align = max_align
+    offset
+
+# Payload byte count N of user enum `ei`, the tag-to-payload padding written
+# to *pad.  0 (and pad 0) when no variant carries a payload.
+pub fn user_enum_layout(s: *EmitterState, ei: i32, pad: *i64) -> i64
+    *pad = 0
+    var max_size: i64 = 0
+    var max_align: i64 = 1
+    let count: i32 = enum_variant_count(ei)
+    for vi in 0..count
+        var a: i64 = 1
+        let sz: i64 = variant_payload_size_align(s, enum_variant_fields(ei, vi), @a)
+        if sz > max_size
+            max_size = sz
+        if a > max_align
+            max_align = a
+    if max_size > 0
+        *pad = (max_align - (1 % max_align)) % max_align
+    max_size
+
+# Total byte size of user enum `ei` (1 for a tag-only enum).
+pub fn user_enum_size(s: *EmitterState, ei: i32) -> i64
+    var pad: i64 = 0
+    let n: i64 = user_enum_layout(s, ei, @pad)
+    if n == 0
+        return 1
+    1 + pad + n
+
+# The payload field of tuple variant `vi` of user enum `name` (null when it
+# is not one: unit / struct variant, generic or unknown enum).
+pub fn user_enum_tuple_field(name: *u8, len: i32, vi: i32) -> *StructField
+    let ei: i32 = user_enum_index(name, len)
+    if ei < 0 or vi < 0 or vi >= enum_variant_count(ei)
+        return null
+    if enum_variant_kind(ei, vi) != ENUM_VARIANT_TUPLE
+        return null
+    enum_variant_fields(ei, vi)
+
+# Width in bits a scalar type code is stored at (see tagged_enum_scalar_bits).
+fn type_code_scalar_bits(t: i32, signed: *i32) -> i32
+    *signed = 1
+    if t == TYPE_I8
+        return 8
+    if t == TYPE_I16
+        return 16
+    if t == TYPE_I32
+        return 32
+    *signed = 0
+    if t == TYPE_U8 or t == TYPE_BOOL
+        return 8
+    if t == TYPE_U16
+        return 16
+    if t == TYPE_U32
+        return 32
+    *signed = 1
+    64
+
 # Integer width in bits of a scalar payload narrower than i64 — the width it
 # is stored at, as ritz0 does — with *signed set for sign- vs zero-extension
 # back to ritz1's i64 registers.  64 for i64 / pointers / anything else (the
-# i64 store / load ritz1 has always done).
+# i64 store / load ritz1 has always done).  For a user enum (#1797)
+# `variant` is the tag of a tuple variant; for Result/Option it is 0 for
+# Ok / Some, 1 for Err.
 pub fn tagged_enum_scalar_bits(s: *EmitterState, name: *u8, len: i32, variant: i32, signed: *i32) -> i32
     *signed = 1
+    if is_tagged_enum_type(name, len) == 0
+        let uf: *StructField = user_enum_tuple_field(name, len, variant)
+        if uf == null
+            return 64
+        return type_code_scalar_bits(uf.field_type, signed)
     var c_len: i32 = 0
     let c: *u8 = tagged_enum_arg(s, name, len, variant, @c_len)
     if c == null
@@ -2006,6 +2132,24 @@ fn coerce_struct_ret_value(s: *EmitterState, expr: *Expr, val: i32, dst_name: *u
         return rebuild_layout_equiv(s, val, src_name, src_len, dst_name, dst_len)
     val
 
+# AGAST #1797: the user enum a call `Holds(x)` constructs — a one-payload
+# tuple variant of a non-generic enum, resolved as try_emit_user_variant_ctor
+# does (it wins over a same-named fn, as in ritz0).  null/0 otherwise.
+pub fn user_variant_ctor_enum(e: *Expr, out_name: **u8, out_len: *i32)
+    *out_name = null
+    *out_len = 0
+    if e == null or e.kind != EXPR_CALL
+        return
+    var vi: i32 = 0
+    let ei: i32 = enum_of_variant(e.func_name, e.func_name_len, @vi)
+    if ei < 0
+        return
+    if enum_variant_kind(ei, vi) != ENUM_VARIANT_TUPLE
+        return
+    if e.args == null or e.args.next != null
+        return
+    *out_name = enum_name_at(ei, out_len)
+
 # Best-effort resolve the LLVM struct type-name produced by an expression.
 # Writes the name pointer and length into the out-pointers, or null/0 if
 # the producer's struct type isn't statically known.  Used to detect
@@ -2075,6 +2219,10 @@ fn resolve_expr_struct_name(s: *EmitterState, e: *Expr, out_name: **u8, out_len:
         return
     # Function-call return-type lookup.
     if e.kind == EXPR_CALL
+        # AGAST #1797: a user-enum payload ctor `Holds(x)` is the enum.
+        user_variant_ctor_enum(e, out_name, out_len)
+        if *out_name != null
+            return
         let fdr: *FnDef = find_call_fn(s, e)
         if fdr != null and fdr.return_type == TYPE_STRUCT and fdr.return_type_name_len > 0
             *out_name = fdr.return_type_name
@@ -2290,6 +2438,10 @@ fn get_struct_size_by_name(s: *EmitterState, name: *u8, name_len: i32) -> i64
         return 1 + te_pad + te_n   # AGAST #1898: ritz0's layout
     let st: *StructDef = find_struct(s, name, name_len)
     if st == null
+        # AGAST #1797: a user enum, `{ i8 }` or `{ i8, [P x i8], [N x i8] }`.
+        let uei: i32 = user_enum_index(name, name_len)
+        if uei >= 0
+            return user_enum_size(s, uei)
         return 8
     # `[[packed]]` (AGAST #1847): fields back to back, no tail padding —
     # the layout of the `<{ ... }>` type emit_one_struct_type writes.
@@ -2335,6 +2487,8 @@ fn get_struct_align_by_name(s: *EmitterState, name: *u8, name_len: i32) -> i64
         return 1   # AGAST #1898: { i8, [P x i8], [N x i8] } is 1-aligned
     let st: *StructDef = find_struct(s, name, name_len)
     if st == null
+        if user_enum_index(name, name_len) >= 0
+            return 1   # AGAST #1797: an all-i8 struct
         return 8
     if struct_is_packed(st) == 1
         return 1   # `[[packed]]`: an LLVM packed struct is 1-aligned (#1847)

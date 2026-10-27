@@ -797,6 +797,28 @@ fn emit_variant_struct(s: *EmitterState, tag: i32, payload_expr: *Expr) -> i32
         emit_reg(s, z)
         emit_str(s, c" = add i64 0, 0  ; variant w/ no enum ctx\n")
         return z
+    return emit_variant_build(s, enum_name, enum_name_len, tag, payload_expr)
+
+# AGAST #1797: `Holds(x)`, a payload variant of a user enum (unqualified, as
+# ritz0's variant_to_enum resolves it: enum_of_variant).  Only a tuple
+# variant's single payload is constructed here; a struct variant's field
+# list (`Big(1, 2, 3)`) is not, and neither is the qualified
+# `Opt.Holds(x)` (an EXPR_METHOD, #1466).  Returns 0 when `e` is not one.
+fn try_emit_user_variant_ctor(s: *EmitterState, e: *Expr) -> i32
+    var en: *u8 = null
+    var en_len: i32 = 0
+    user_variant_ctor_enum(e, @en, @en_len)
+    if en == null
+        return 0
+    var vi: i32 = 0
+    enum_of_variant(e.func_name, e.func_name_len, @vi)
+    return emit_variant_build(s, en, en_len, vi, e.args)
+
+# Build `%Enum` with tag `tag` and payload `payload_expr` (null: none) in a
+# zeroed alloca, and load it.  `enum_name` is a tagged enum (Result$/Option$,
+# where `tag` 0 / 1 also picks Ok-Some / Err for the payload width) or a
+# user enum (AGAST #1797; the payload type is the tuple variant's).
+fn emit_variant_build(s: *EmitterState, enum_name: *u8, enum_name_len: i32, tag: i32, payload_expr: *Expr) -> i32
 
     # Emit payload first (may consume registers); keep expr value for store.
     var payload_reg: i32 = 0
@@ -902,6 +924,16 @@ fn emit_variant_struct(s: *EmitterState, tag: i32, payload_expr: *Expr) -> i32
                         is_aggregate = 1
                         aggregate_name = fn_def.return_type_name
                         aggregate_name_len = fn_def.return_type_name_len
+
+        # AGAST #1797: a user enum's tuple variant declares its payload
+        # type; a struct one is the aggregate whatever the expression form.
+        if is_aggregate == 0
+            let uf: *StructField = user_enum_tuple_field(enum_name, enum_name_len, tag)
+            if uf != null
+                if uf.field_type == TYPE_STRUCT and uf.field_type_name_len > 0
+                    is_aggregate = 1
+                    aggregate_name = uf.field_type_name
+                    aggregate_name_len = uf.field_type_name_len
 
         if is_aggregate == 1
             emit_str(s, c"  store %")
@@ -1435,6 +1467,11 @@ fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
     if is_variant_null(e.func_name, e.func_name_len) == 1
         # Err = tag 1 (None is the no-arg case, handled in emit_expr_ident)
         return emit_variant_struct(s, 1, e.args)
+    # User-enum payload variant `Holds(x)` (AGAST #1797).  Before the
+    # generic call path, as ritz0 checks variant_to_enum before functions.
+    let user_ctor: i32 = try_emit_user_variant_ctor(s, e)
+    if user_ctor != 0
+        return user_ctor
     # print() / eprint() built-ins: the same lowering to fd 1 / fd 2 (#1641).
     var print_fd: i64 = 0
     if name_eq(e.func_name, e.func_name_len, c"print", 5) == 1

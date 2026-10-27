@@ -280,12 +280,12 @@ gated on closing part of that gap.
 | Capability | ritz0 | ritz1 |
 |---|---|---|
 | Bare variants | yes | yes |
-| Single-field tuple variants | yes | yes |
+| Single-field tuple variants | yes | yes; user enums construct (`Holds(x)`, unqualified) and bind them since #1797 |
 | Multi-field tuple variants | parser yes; **emitter miscompiled** (fixed, §3.3) | **cannot parse** |
-| Struct variants | this task | this task |
-| Payload types retained by parser | yes | **no — discarded** |
+| Struct variants | this task | parsed and laid out (#1797); not constructed or matched |
+| Payload types retained by parser | yes | yes, in the enum tracker (#1797) |
 | Enum AST node | yes (`EnumDef`/`Variant`) | **none** — a global name side-table |
-| Payload sizing | exact, per enum | Result/Option: exact, ritz0's `{ i8, [P x i8], [N x i8] }` from the mangled type arguments (#1898; a fixed `[144 x i8]` before). User enums: n/a, payloads discarded |
+| Payload sizing | exact, per enum | Result/Option: exact, ritz0's `{ i8, [P x i8], [N x i8] }` from the mangled type arguments (#1898; a fixed `[144 x i8]` before). Non-generic user enums: the same ritz0 layout from the recorded variant fields (#1797); all-unit stays `{ i8 }` |
 | Payload load | per-field, typed | field 2; scalars at their own width, widened to i64 (#1898) |
 | Match bindings per pattern | N | **exactly 1** (`IDENT LPAREN IDENT RPAREN`) |
 | Generic enum specialization | yes | none (name mangling only) |
@@ -305,7 +305,7 @@ that no code in the repo had ever used a variant with more than one field:
    conservative bound chosen when payloads were single scalars. tempest's
    `FetchRequest` (u64 + String + i32 + Vec + Vec = 84 bytes) overflows it.
    ritz1 must compute exact sizes, which requires the parser to stop discarding
-   variant payload types.
+   variant payload types. *(User enums: AGAST #1797, which records them.)*
 
 The regression matrix runs every case against ritz0, ritz1 and
 ritz1_selfhosted. Since AGAST #1371 it discovers every file in `ritz0/test/`,

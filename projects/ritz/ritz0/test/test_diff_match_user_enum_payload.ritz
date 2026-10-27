@@ -1,0 +1,254 @@
+# AGAST #1797: ritz1 lays out a user enum with payload variants exactly as
+# ritz0 does, and constructs / matches its tuple-variant payloads.
+#
+# THE DEFECT
+#
+# ritz1's parser recorded only a user enum's variant NAMES, so every user
+# enum was emitted `%Opt = type { i8 }`, with no payload slot:
+#
+#     enum Opt
+#         Vacant
+#         Holds(i32)
+#
+# `Holds(v) =>` then GEP'd field 2 of a one-field struct ("invalid
+# getelementptr indices"), and `Holds(41)` was emitted as a call to an
+# undefined fn `@Holds` returning i64.
+#
+# THE FIX (grammars/ritz1.grammar, ritz1/src)
+#
+# * The enum tracker records each variant's payload fields (a tuple
+#   variant's type, a struct variant's field block) and whether the enum is
+#   generic.
+# * A non-generic user enum is declared with ritz0's _define_enum layout,
+#   `{ i8 tag, [pad x i8], [N x i8] }`: N is the largest variant payload,
+#   pad aligns it to the most-aligned payload (the same shape as #1898's
+#   Result/Option).  An all-unit enum stays `{ i8 }`.
+# * `Holds(x)` builds the enum (tag, payload at field 2, scalars at their
+#   own width); `Holds(v) =>` loads the payload at its own width, or as the
+#   payload struct.
+# * ritz1's own struct sizes count an enum field at its real size (it was
+#   8), and `match h.d` on an enum-typed field matches the enum (it was
+#   compared as an i64 and fell through every arm).
+#
+# Not covered (still ritz1 gaps): constructing / matching a struct variant,
+# and the qualified constructor `Opt.Holds(x)` (#1466).
+#
+# Oracle: ritz0 runs every case to the same result.
+
+# --- repro -----------------------------------------------------------------
+# The ticket's repro: an i32 payload sits at offset 4, 8 bytes total.
+
+enum Opt
+    Vacant
+    Holds(i32)
+
+fn opt_f(o: Opt) -> i32
+    match o
+        Holds(v) => v
+        Vacant => 100
+
+fn repro_main() -> i32
+    return opt_f(Holds(41)) + opt_f(Opt.Vacant) - 99
+
+[[test]]
+fn test_repro() -> i32
+    assert repro_main() == 42
+    0
+
+# --- qualified_and_wildcard ------------------------------------------------
+# Qualified arms (`Opt.Holds(v) =>`, #1794's syntax) and a `_ =>` arm, which
+# the ticket reports failed differently ("defined with type 'i64'").
+
+fn opt_g(o: Opt) -> i32
+    match o
+        Opt.Holds(v) => v * 2
+        _ => 1
+
+fn qualified_and_wildcard_main() -> i32
+    return opt_g(Holds(20)) + opt_g(Opt.Vacant) + opt_g(Holds(0)) + 1
+
+[[test]]
+fn test_qualified_and_wildcard() -> i32
+    assert qualified_and_wildcard_main() == 42
+    0
+
+# --- bindings --------------------------------------------------------------
+# The constructed value through a typed let, an untyped let, and a fn's
+# return value.
+
+fn make_opt(n: i32) -> Opt
+    if n < 0
+        return Opt.Vacant
+    return Holds(n)
+
+fn bindings_main() -> i32
+    let a: Opt = Holds(10)
+    let b = Holds(20)
+    let c = make_opt(12)
+    let d = make_opt(-1)
+    return opt_f(a) + opt_f(b) + opt_f(c) + opt_f(d) - 100
+
+[[test]]
+fn test_bindings() -> i32
+    assert bindings_main() == 42
+    0
+
+# --- narrow_payloads -------------------------------------------------------
+# Payloads of different widths share one buffer sized to the largest (i64,
+# so 8-aligned: { i8, [7 x i8], [8 x i8] }).  Each round-trips at its own
+# width: i16 / i32 sign-extend, u8 zero-extends.
+
+enum Num
+    Small(u8)
+    Short(i16)
+    Word(i32)
+    Long(i64)
+    Nothing
+
+fn num_val(n: Num) -> i64
+    match n
+        Small(v) => v as i64
+        Short(v) => v as i64
+        Word(v) => v as i64
+        Long(v) => v
+        Nothing => 0
+
+fn narrow_payloads_main() -> i32
+    if num_val(Small(200)) != 200
+        return 1
+    if num_val(Short(-300)) != -300
+        return 2
+    if num_val(Word(-70000)) != -70000
+        return 3
+    if num_val(Long(5000000000)) != 5000000000
+        return 4
+    if num_val(Num.Nothing) != 0
+        return 5
+    return 42
+
+[[test]]
+fn test_narrow_payloads() -> i32
+    assert narrow_payloads_main() == 42
+    0
+
+# --- struct_payload --------------------------------------------------------
+# A struct payload (angelo's `ParsedGlyph.Simple(outline)` shape) is built
+# and bound as the struct, not as an i64.
+
+struct Pt
+    x: i64
+    y: i64
+
+enum Shape
+    Empty
+    Point(Pt)
+
+impl Pt
+    fn doubled(self) -> Pt
+        return Pt { x: self.x * 2, y: self.y * 2 }
+
+fn shape_sum(s: Shape) -> i64
+    match s
+        Point(p) => p.x + p.y
+        Empty => 0
+
+fn struct_payload_main() -> i32
+    let p = Pt { x: 30, y: 12 }
+    let s = Point(p)
+    let t = shape_sum(s) + shape_sum(Shape.Empty)
+    if t != 42
+        return 1
+    # A method-call payload: only the variant's declared type says it is a
+    # %Pt aggregate (ritz1 cannot type an EXPR_METHOD from its form here).
+    let h = Pt { x: 10, y: 11 }
+    if shape_sum(Point(h.doubled())) != 42
+        return 2
+    return 42
+
+[[test]]
+fn test_struct_payload() -> i32
+    assert struct_payload_main() == 42
+    0
+
+# --- largest_variant -------------------------------------------------------
+# The payload buffer is sized by the largest variant even when that variant
+# is a struct variant (ritz1 still cannot construct those; it must lay them
+# out).  Big's 24 bytes make Mix { i8, [7 x i8], [24 x i8] }, 32 bytes, so a
+# Mix field puts `after` at offset 32 in a Holder.
+
+enum Mix
+    Tiny(u8)
+    Big
+        a: i64
+        b: i64
+        c: i64
+
+struct Holder
+    m: Mix
+    after: i64
+
+fn mix_tiny(m: Mix) -> i64
+    match m
+        Tiny(v) => v as i64
+        _ => -1
+
+fn largest_variant_main() -> i32
+    let h = Holder { m: Tiny(9), after: 33 }
+    let raw: *u8 = @h as *u8
+    let after: *i64 = (raw + 32) as *i64
+    if *after != 33
+        return 1
+    return (mix_tiny(h.m) + h.after) as i32
+
+[[test]]
+fn test_largest_variant() -> i32
+    assert largest_variant_main() == 42
+    0
+
+# --- unit_only -------------------------------------------------------------
+# An enum with no payload variant keeps ritz0's tag-only `{ i8 }`: `n` sits
+# at offset 4 of a Heading.
+
+enum Dir
+    North
+    South
+
+struct Heading
+    d: Dir
+    n: i32
+
+fn unit_only_main() -> i32
+    let h = Heading { d: Dir.South, n: 40 }
+    let raw: *u8 = @h as *u8
+    let n: *i32 = (raw + 4) as *i32
+    if *n != 40
+        return 1
+    let k: i32 = match h.d
+        North => 0
+        South => 2
+    return h.n + k
+
+[[test]]
+fn test_unit_only() -> i32
+    assert unit_only_main() == 42
+    0
+
+# --- pointer_stride --------------------------------------------------------
+# ritz1's own size of a struct holding a payload enum (pointer arithmetic,
+# sizeof) is the 40 bytes LLVM lays out, not an enum field counted as 8:
+# `p + 1` from `pr.a` must land on `pr.b`.
+
+struct HolderPair
+    a: Holder
+    b: Holder
+
+fn pointer_stride_main() -> i32
+    let pr = HolderPair { a: Holder { m: Tiny(1), after: 5 }, b: Holder { m: Tiny(2), after: 40 } }
+    let p: *Holder = @pr.a
+    let q: *Holder = p + 1
+    return (q.after + mix_tiny(q.m)) as i32
+
+[[test]]
+fn test_pointer_stride() -> i32
+    assert pointer_stride_main() == 42
+    0

@@ -101,10 +101,7 @@ fn main() -> i32
 # --- item 4: qualified enum pattern `E.V =>` -----------------------------------
 
 QUALIFIED_PATTERN = {
-    # #1530's repro shape: qualified unit variant arms and a wildcard.  (A
-    # user enum WITH payload variants is miscompiled by ritz1 whether its
-    # arms are qualified or not -- see #1797 -- so this enum is
-    # unit-only.)
+    # #1530's repro shape: qualified unit variant arms and a wildcard.
     "qualified_unit_pattern": (
         """\
 enum Mode
@@ -123,19 +120,22 @@ fn main() -> i32
 """,
         42,
     ),
-    # angelo's other site binds a payload: `ParsedGlyph.Simple(outline) =>`.
-    # Option is the payload enum ritz1 lays out today.
+    # angelo's other site binds a payload: `ParsedGlyph.Simple(outline) =>`,
+    # over a user enum with a payload variant (laid out by ritz1 since
+    # AGAST #1797; it was `{ i8 }`, with no payload slot).
     "qualified_payload_pattern": (
         """\
-import ritzlib.option
+enum Opt
+    Vacant
+    Holds(i32)
 
-fn f(o: Option<i32>) -> i32
+fn f(o: Opt) -> i32
     match o
-        Option.Some(v) => v
-        Option.None => 100
+        Opt.Holds(v) => v
+        Opt.Vacant => 100
 
 fn main() -> i32
-    return f(Some(41)) + f(None) - 99
+    return f(Holds(41)) + f(Opt.Vacant) - 99
 """,
         42,
     ),

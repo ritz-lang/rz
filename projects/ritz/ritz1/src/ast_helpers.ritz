@@ -3305,6 +3305,22 @@ var g_enum_variant_names: **u8 = null
 var g_enum_variant_name_lens: *i32 = null
 var g_enum_variant_total: i32 = 0
 
+# AGAST #1797: what each variant carries, so the emitter can give the enum
+# ritz0's payload layout instead of a bare `{ i8 }` tag.
+#   g_enum_generic[e]          1 for `enum Name<T>` (its payload types are
+#                              unsubstituted; Option/Result have their own
+#                              layout path, emitter_core tagged_enum_layout)
+#   g_enum_variant_fields[v]   payload fields in declaration order, null for
+#                              a unit variant
+#   g_enum_variant_kinds[v]    ENUM_VARIANT_UNIT / _TUPLE / _STRUCT
+pub const ENUM_VARIANT_UNIT: i32 = 0
+pub const ENUM_VARIANT_TUPLE: i32 = 1
+pub const ENUM_VARIANT_STRUCT: i32 = 2
+
+var g_enum_generic: *i32 = null
+var g_enum_variant_fields: **StructField = null
+var g_enum_variant_kinds: *i32 = null
+
 var g_enum_initialized: i32 = 0
 var g_enum_cap: i32 = 0
 var g_enum_variant_cap: i32 = 0
@@ -3320,6 +3336,9 @@ fn init_enum_tracker()
     g_enum_variant_counts = malloc((g_enum_cap as i64) * 4) as *i32
     g_enum_variant_names = malloc((g_enum_variant_cap as i64) * 8) as **u8
     g_enum_variant_name_lens = malloc((g_enum_variant_cap as i64) * 4) as *i32
+    g_enum_generic = malloc((g_enum_cap as i64) * 4) as *i32
+    g_enum_variant_fields = malloc((g_enum_variant_cap as i64) * 8) as **StructField
+    g_enum_variant_kinds = malloc((g_enum_variant_cap as i64) * 4) as *i32
     g_enum_initialized = 1
     g_enum_count = 0
     g_enum_variant_total = 0
@@ -3331,8 +3350,7 @@ pub fn enum_tracker_reset()
     g_enum_count = 0
     g_enum_variant_total = 0
 
-# Called from grammar rule enum_def_header: starts a new enum-tracking entry.
-pub fn enum_def_start(p: *Parser, name: *u8, len: i32) -> i32
+fn enum_def_start_impl(name: *u8, len: i32, generic: i32) -> i32
     init_enum_tracker()
     if g_enum_count >= g_enum_cap
         let cap: i64 = (g_enum_cap as i64) * 2
@@ -3340,17 +3358,42 @@ pub fn enum_def_start(p: *Parser, name: *u8, len: i32) -> i32
         g_enum_name_lens = realloc(g_enum_name_lens as *u8, cap * 4) as *i32
         g_enum_variant_starts = realloc(g_enum_variant_starts as *u8, cap * 4) as *i32
         g_enum_variant_counts = realloc(g_enum_variant_counts as *u8, cap * 4) as *i32
+        g_enum_generic = realloc(g_enum_generic as *u8, cap * 4) as *i32
         g_enum_cap = cap as i32
     *(g_enum_names + g_enum_count) = name
     *(g_enum_name_lens + g_enum_count) = len
     *(g_enum_variant_starts + g_enum_count) = g_enum_variant_total
     *(g_enum_variant_counts + g_enum_count) = 0
+    *(g_enum_generic + g_enum_count) = generic
     g_enum_count = g_enum_count + 1
     return 0
 
-# Called from grammar rule enum_variant: appends to the most recent enum's
-# variant list.
+# Called from grammar rule enum_def_header: starts a new enum-tracking entry.
+pub fn enum_def_start(p: *Parser, name: *u8, len: i32) -> i32
+    return enum_def_start_impl(name, len, 0)
+
+# `enum Name<T>`: as enum_def_start, flagged generic (AGAST #1797).
+pub fn enum_def_start_generic(p: *Parser, name: *u8, len: i32) -> i32
+    return enum_def_start_impl(name, len, 1)
+
+# Called from grammar rule enum_variant: appends a unit variant to the most
+# recent enum's variant list.
 pub fn enum_variant_record(p: *Parser, name: *u8, len: i32) -> i32
+    return enum_variant_record_impl(name, len, ENUM_VARIANT_UNIT, null)
+
+# `Name(T)` (AGAST #1797): the payload type is the type_spec just parsed;
+# field_new captures its struct / pointer / array detail from the parser
+# state exactly as for a struct field.
+pub fn enum_variant_record_tuple(p: *Parser, name: *u8, len: i32, ty: i32) -> i32
+    let f: *StructField = field_new(p, name, len, ty, 0, 0)
+    f.next = null
+    return enum_variant_record_impl(name, len, ENUM_VARIANT_TUPLE, f)
+
+# `Name` + an indented field block (AGAST #1797): the fields are the payload.
+pub fn enum_variant_record_struct(p: *Parser, name: *u8, len: i32, fields: *StructField) -> i32
+    return enum_variant_record_impl(name, len, ENUM_VARIANT_STRUCT, fields)
+
+fn enum_variant_record_impl(name: *u8, len: i32, kind: i32, fields: *StructField) -> i32
     init_enum_tracker()
     if g_enum_count == 0
         return 0
@@ -3358,9 +3401,13 @@ pub fn enum_variant_record(p: *Parser, name: *u8, len: i32) -> i32
         let vcap: i64 = (g_enum_variant_cap as i64) * 2
         g_enum_variant_names = realloc(g_enum_variant_names as *u8, vcap * 8) as **u8
         g_enum_variant_name_lens = realloc(g_enum_variant_name_lens as *u8, vcap * 4) as *i32
+        g_enum_variant_fields = realloc(g_enum_variant_fields as *u8, vcap * 8) as **StructField
+        g_enum_variant_kinds = realloc(g_enum_variant_kinds as *u8, vcap * 4) as *i32
         g_enum_variant_cap = vcap as i32
     *(g_enum_variant_names + g_enum_variant_total) = name
     *(g_enum_variant_name_lens + g_enum_variant_total) = len
+    *(g_enum_variant_fields + g_enum_variant_total) = fields
+    *(g_enum_variant_kinds + g_enum_variant_total) = kind
     g_enum_variant_total = g_enum_variant_total + 1
     # Read-modify-write through an intermediate `let` to avoid a self-host
     # codegen quirk where the compound `*(p + i) = *(p + i) + 1` form
@@ -3437,6 +3484,79 @@ pub fn is_enum_type(name: *u8, len: i32) -> i32
                 return 1
         ei = ei + 1
     return 0
+
+# --- AGAST #1797: enum / variant accessors for the emitter -----------------
+
+fn enum_name_eq(ei: i32, name: *u8, len: i32) -> i32
+    if *(g_enum_name_lens + ei) != len
+        return 0
+    let stored: *u8 = *(g_enum_names + ei)
+    for k in 0..len
+        let sb: u8 = *(stored + k)
+        let qb: u8 = *(name + k)
+        if sb != qb
+            return 0
+    return 1
+
+# Tracker index of the enum `name`, or -1.  The first one recorded wins, as
+# in enum_variant_index.
+pub fn enum_find(name: *u8, len: i32) -> i32
+    if g_enum_initialized == 0
+        return 0 - 1
+    var ei: i32 = 0
+    while ei < g_enum_count
+        if enum_name_eq(ei, name, len) == 1
+            return ei
+        ei = ei + 1
+    return 0 - 1
+
+pub fn enum_count() -> i32
+    return g_enum_count
+
+pub fn enum_name_at(ei: i32, out_len: *i32) -> *u8
+    *out_len = *(g_enum_name_lens + ei)
+    return *(g_enum_names + ei)
+
+pub fn enum_is_generic(ei: i32) -> i32
+    return *(g_enum_generic + ei)
+
+pub fn enum_variant_count(ei: i32) -> i32
+    return *(g_enum_variant_counts + ei)
+
+# Kind (ENUM_VARIANT_*) and payload fields of variant `vi` of enum `ei`.
+pub fn enum_variant_kind(ei: i32, vi: i32) -> i32
+    return *(g_enum_variant_kinds + *(g_enum_variant_starts + ei) + vi)
+
+pub fn enum_variant_fields(ei: i32, vi: i32) -> *StructField
+    return *(g_enum_variant_fields + *(g_enum_variant_starts + ei) + vi)
+
+# The non-generic enum an unqualified variant name `Holds` constructs, as
+# ritz0's variant_to_enum resolves it: the LAST enum declaring the name
+# wins.  Fills *out_vi with the variant's tag; returns the enum index, or -1.
+pub fn enum_of_variant(name: *u8, len: i32, out_vi: *i32) -> i32
+    *out_vi = 0 - 1
+    if g_enum_initialized == 0
+        return 0 - 1
+    var ei: i32 = g_enum_count - 1
+    while ei >= 0
+        if *(g_enum_generic + ei) == 0
+            let start: i32 = *(g_enum_variant_starts + ei)
+            let count: i32 = *(g_enum_variant_counts + ei)
+            for vi in 0..count
+                let vidx: i32 = start + vi
+                if *(g_enum_variant_name_lens + vidx) == len
+                    var same: i32 = 1
+                    let stored: *u8 = *(g_enum_variant_names + vidx)
+                    for k in 0..len
+                        let sb: u8 = *(stored + k)
+                        let qb: u8 = *(name + k)
+                        if sb != qb
+                            same = 0
+                    if same == 1
+                        *out_vi = vi
+                        return ei
+        ei = ei - 1
+    return 0 - 1
 
 # =============================================================================
 # AGAST #1794: `id<@E>(e)` and `a[:]`
