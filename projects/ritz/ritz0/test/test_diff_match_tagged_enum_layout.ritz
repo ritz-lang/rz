@@ -1,0 +1,122 @@
+# AGAST #1898: ritz1 lays out Result$/Option$ exactly as ritz0 does.
+#
+# THE DEFECT
+#
+# ritz0 sizes each tagged-enum instantiation from its payloads:
+#
+#     { i8 tag, [pad x i8], [N x i8] payload }
+#
+# N = the largest payload, pad = what aligns the payload to the most-aligned
+# one (`Result<i64, i32>` is { i8, [7 x i8], [8 x i8] }, 16 bytes;
+# `Result<i32, i32>` is { i8, [3 x i8], [4 x i8] }, 8 bytes).  ritz1 used one
+# `{ i8, [144 x i8] }` for every instantiation, payload at offset 1.  Within
+# one compiler that was self-consistent; across the two it was not, and the
+# regression matrix's ritz1 cell links ritz1-compiled callers against
+# ritz0-built ritzlib objects: `file_size` / `arg_parse_i64` /`unlink`
+# returned through a different-sized aggregate with the payload elsewhere.
+#
+# THE FIX (ritz1/src)
+#
+# * emitter.ritz emit_tagged_enum_decl_once declares the ritz0 layout,
+#   computed from the mangled `Result$T$E` / `Option$T` arguments
+#   (emitter_core tagged_enum_layout); every payload GEP is field 2.
+# * Scalar payloads are stored / loaded at their own width (trunc on the way
+#   in, sext/zext on the way out), not as an i64 that overran a 4-byte one.
+# * `?` no longer reinterprets an Err of one Result as another: the Err
+#   payload's offset now depends on the Ok type, so it is copied across.
+#
+# Oracle: ritz0 runs every case to the same result.
+
+import ritzlib.result
+import ritzlib.option
+import ritzlib.strview
+import ritzlib.fs
+
+# --- unlink_err (mixed-compiler, 4-byte payload) ---------------------------
+# `unlink(StrView) -> Result<i32, i32>`: payload at offset 4, 8 bytes total.
+
+fn unlink_err_main() -> i32
+    var r: Result<i32, i32> = unlink("/nonexistent/ritz-1898")
+    let code: i64 = match r
+        Ok(v) => -1
+        Err(e) => e as i64
+    if code != 2
+        return 1
+    return 42
+
+[[test]]
+fn test_unlink_err() -> i32
+    assert unlink_err_main() == 42
+    0
+
+# --- narrow_payloads -------------------------------------------------------
+# A 4- and 1-byte payload round-trips at its own width: i32 sign-extends,
+# u8 zero-extends.
+
+fn some_i32(v: i32) -> Option<i32>
+    return Some(v)
+
+fn some_u8(v: u8) -> Option<u8>
+    return Some(v)
+
+fn err_i32(v: i32) -> Result<i64, i32>
+    return Err(v)
+
+fn narrow_payloads_main() -> i32
+    let a: i64 = match some_i32(-5)
+        Some(v) => v as i64
+        None => 0
+    if a != -5
+        return 1
+    let b: i64 = match some_u8(200)
+        Some(v) => v as i64
+        None => 0
+    if b != 200
+        return 2
+    let c: i64 = match err_i32(-7)
+        Ok(v) => 0
+        Err(e) => e as i64
+    if c != -7
+        return 3
+    return 42
+
+[[test]]
+fn test_narrow_payloads() -> i32
+    assert narrow_payloads_main() == 42
+    0
+
+# --- try_relayout ----------------------------------------------------------
+# `?` from Result<Big, i32> (payload at offset 8) into Result<i32, i32>
+# (payload at offset 4): the Err payload must be moved, not reinterpreted.
+
+struct Big
+    a: i64
+    b: i64
+    c: i64
+
+fn make_big(bad: i64) -> Result<Big, i32>
+    if bad != 0
+        return Err(7)
+    return Ok(Big { a: 1, b: 2, c: 3 })
+
+fn use_big(bad: i64) -> Result<i32, i32>
+    let g = make_big(bad)?
+    return Ok(g.c as i32)
+
+fn try_relayout_main() -> i32
+    let ok: i64 = match use_big(0)
+        Ok(v) => v as i64
+        Err(e) => -1
+    if ok != 3
+        return 1
+    let bad: i64 = match use_big(1)
+        Ok(v) => -1
+        Err(e) => e as i64
+    if bad != 7
+        return 2
+    return 42
+
+[[test]]
+fn test_try_relayout() -> i32
+    assert try_relayout_main() == 42
+    0

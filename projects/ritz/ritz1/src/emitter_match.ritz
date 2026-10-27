@@ -142,9 +142,11 @@ fn emit_variant_tag_check(s: *EmitterState, slot_reg: i32, enum_name: *u8, enum_
     return cmp_reg
 
 # Extract the variant payload as an i64 (the common scalar case).  Payload
-# sits at field 1 (the `[N x i8]` buffer).  Callers widen to i64 because
-# ritz1's downstream arithmetic / call paths operate on i64 registers.
-fn emit_variant_payload(s: *EmitterState, slot_reg: i32, enum_name: *u8, enum_name_len: i32) -> i32
+# sits at field 2 (the `[N x i8]` buffer after the alignment pad, AGAST
+# #1898), stored at its own width; it is widened to i64 because ritz1's
+# downstream arithmetic / call paths operate on i64 registers.  `variant` is
+# 0 for Ok / Some, 1 for Err.
+fn emit_variant_payload(s: *EmitterState, slot_reg: i32, enum_name: *u8, enum_name_len: i32, variant: i32) -> i32
     let pay_ptr: i32 = next_reg(s)
     emit_str(s, c"  ")
     emit_reg(s, pay_ptr)
@@ -152,14 +154,8 @@ fn emit_variant_payload(s: *EmitterState, slot_reg: i32, enum_name: *u8, enum_na
     emit_name(s, enum_name, enum_name_len)
     emit_str(s, c", ptr ")
     emit_reg(s, slot_reg)
-    emit_str(s, c", i32 0, i32 1\n")
-    let r: i32 = next_reg(s)
-    emit_str(s, c"  ")
-    emit_reg(s, r)
-    emit_str(s, c" = load i64, ptr ")
-    emit_reg(s, pay_ptr)
-    emit_str(s, c"\n")
-    return r
+    emit_str(s, c", i32 0, i32 2\n")
+    return emit_tagged_payload_load(s, pay_ptr, enum_name, enum_name_len, variant)
 
 # Scalar-scrutinee fallback (non-enum `match x on int`).
 fn emit_variant_tag_check_i64(s: *EmitterState, scrut_reg: i32, tag_one: i32) -> i32
@@ -203,7 +199,7 @@ fn carrier_payload_struct(s: *EmitterState, arm: *MatchArm, enum_name: *u8, enum
     *out_name = tagged_enum_payload_struct(s, enum_name, enum_name_len, out_len)
 
 # AGAST #1515: bind `Some(p)` / `Ok(s)` to a copy of a struct payload.  The
-# payload sits at field 1 of the spilled scrutinee; copy it into its own
+# payload sits at field 2 of the spilled scrutinee (#1898); copy it into its own
 # `alloca %Name` and register a struct local, so `p.x` and by-value passing
 # see `%Name` rather than an i64.
 fn emit_struct_payload_bind(s: *EmitterState, arm: *MatchArm, slot_reg: i32, enum_name: *u8, enum_name_len: i32, st_name: *u8, st_name_len: i32)
@@ -214,7 +210,7 @@ fn emit_struct_payload_bind(s: *EmitterState, arm: *MatchArm, slot_reg: i32, enu
     emit_name(s, enum_name, enum_name_len)
     emit_str(s, c", ptr ")
     emit_reg(s, slot_reg)
-    emit_str(s, c", i32 0, i32 1\n")
+    emit_str(s, c", i32 0, i32 2\n")
     let val: i32 = next_reg(s)
     emit_str(s, c"  ")
     emit_reg(s, val)
@@ -312,7 +308,7 @@ fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_s
                 else if is_wildcard == 0
                     var payload_reg: i32 = 0
                     if scrut_slot != 0 and enum_name != null and enum_name_len > 0
-                        payload_reg = emit_variant_payload(s, scrut_slot, enum_name, enum_name_len)
+                        payload_reg = emit_variant_payload(s, scrut_slot, enum_name, enum_name_len, 1 - variant_is_tag_one(arm.pattern_name, arm.pattern_name_len))
                     else
                         # Non-enum scrutinee (shouldn't reach here in practice).
                         payload_reg = scrut_reg

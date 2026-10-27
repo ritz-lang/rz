@@ -285,8 +285,8 @@ gated on closing part of that gap.
 | Struct variants | this task | this task |
 | Payload types retained by parser | yes | **no — discarded** |
 | Enum AST node | yes (`EnumDef`/`Variant`) | **none** — a global name side-table |
-| Payload sizing | exact, per enum | fixed `[144 x i8]` upper bound (`TAGGED_ENUM_PAYLOAD_BYTES`; was 32 until #1476) |
-| Payload load | per-field, typed | always `load i64` at index 1 |
+| Payload sizing | exact, per enum | Result/Option: exact, ritz0's `{ i8, [P x i8], [N x i8] }` from the mangled type arguments (#1898; a fixed `[144 x i8]` before). User enums: n/a, payloads discarded |
+| Payload load | per-field, typed | field 2; scalars at their own width, widened to i64 (#1898) |
 | Match bindings per pattern | N | **exactly 1** (`IDENT LPAREN IDENT RPAREN`) |
 | Generic enum specialization | yes | none (name mangling only) |
 
@@ -299,7 +299,9 @@ that no code in the repo had ever used a variant with more than one field:
    survived while adjacent stack was destroyed. *Fixed.*
 2. **ritz0 interior alignment** (§3.1) — offsets were a naive running sum, so a
    field needing 8-byte alignment after an `i32` was misaligned.
-3. **ritz1 fixed payload bound** — `TAGGED_ENUM_PAYLOAD_BYTES = 32` is a
+3. **ritz1 fixed payload bound** — *(fixed for Result/Option by AGAST #1898,
+   which computes ritz0's exact layout from the mangled type arguments)*
+   `TAGGED_ENUM_PAYLOAD_BYTES = 32` was a
    conservative bound chosen when payloads were single scalars. tempest's
    `FetchRequest` (u64 + String + i32 + Vec + Vec = 84 bytes) overflows it.
    ritz1 must compute exact sizes, which requires the parser to stop discarding

@@ -636,8 +636,10 @@ fn try_emit_ufcs_method(s: *EmitterState, e: *Expr, type_name: *u8, type_name_le
 
 # Tagged-enum variant constructors (ritz-task-133 rewrite).
 #
-# Layout (ritz0 parity): `%Result$... = type { i8 tag, [N x i8] payload }` —
-# declared once per instantiation by emit_tagged_enum_types in emitter.ritz.
+# Layout (ritz0 parity, AGAST #1898):
+# `%Result$... = type { i8 tag, [P x i8] pad, [N x i8] payload }` — declared
+# once per instantiation by emit_tagged_enum_types in emitter.ritz; see
+# tagged_enum_layout in emitter_core.
 # Tag convention matches ritz0:
 #   Ok   -> 0   Err  -> 1    (enum Result { Ok(T), Err(E) })
 #   Some -> 0   None -> 1    (enum Option { Some(T), None })
@@ -646,8 +648,8 @@ fn try_emit_ufcs_method(s: *EmitterState, e: *Expr, type_name: *u8, type_name_le
 #   %a = alloca %Result$T
 #   %pt = getelementptr %Result$T, ptr %a, i32 0, i32 0
 #   store i8 <tag>, ptr %pt
-#   %pp = getelementptr %Result$T, ptr %a, i32 0, i32 1    ; [N x i8]
-#   store <payload-llvm-type> %v, ptr %pp                  ; bitcast OK
+#   %pp = getelementptr %Result$T, ptr %a, i32 0, i32 2    ; [N x i8]
+#   store <payload-llvm-type> %v, ptr %pp                  ; scalars at own width
 #   %r = load %Result$T, ptr %a
 # See emitter_match.ritz for the consumer side (extract tag, load payload).
 fn is_variant_carrier(name: *u8, name_len: i32) -> i32
@@ -835,13 +837,13 @@ fn emit_variant_struct(s: *EmitterState, tag: i32, payload_expr: *Expr) -> i32
     emit_str(s, c"\n")
 
     if have_payload == 1
-        # Payload goes into field 1 (the `[N x i8]` buffer).  ritz1's expr
-        # evaluation always yields an i64-width register for scalar / ptr
-        # payloads, so we store i64 into the buffer base.  For struct
+        # Payload goes into field 2 (the `[N x i8]` buffer after the pad,
+        # AGAST #1898).  ritz1's expr evaluation always yields an i64-width
+        # register for scalar / ptr payloads; it is stored at the payload's
+        # own width (truncated), as ritz0 stores it.  For struct
         # payloads (e.g. `Vec<u8>` or `StrView`) emit_expr returns the
         # aggregate register — store it by its declared name when we can
-        # recover the type, else fall back to i64.  The conservative
-        # 32-byte buffer accommodates both.
+        # recover the type, else fall back to the scalar store.
         let pay_ptr: i32 = next_reg(s)
         emit_str(s, c"  ")
         emit_reg(s, pay_ptr)
@@ -849,7 +851,7 @@ fn emit_variant_struct(s: *EmitterState, tag: i32, payload_expr: *Expr) -> i32
         emit_name(s, enum_name, enum_name_len)
         emit_str(s, c", ptr ")
         emit_reg(s, slot)
-        emit_str(s, c", i32 0, i32 1\n")
+        emit_str(s, c", i32 0, i32 2\n")
 
         # Detect aggregate payload.  ritz1 lacks a full expr-type oracle so
         # we peek at the expression form: EXPR_IDENT of a known struct
@@ -910,11 +912,7 @@ fn emit_variant_struct(s: *EmitterState, tag: i32, payload_expr: *Expr) -> i32
             emit_reg(s, pay_ptr)
             emit_str(s, c"\n")
         else
-            emit_str(s, c"  store i64 ")
-            emit_reg(s, payload_reg)
-            emit_str(s, c", ptr ")
-            emit_reg(s, pay_ptr)
-            emit_str(s, c"\n")
+            emit_tagged_payload_store(s, payload_reg, pay_ptr, enum_name, enum_name_len, tag)
 
     # Load the assembled struct to return its value.
     let result: i32 = next_reg(s)
@@ -2570,9 +2568,10 @@ fn try_emit_enum_unwrap(s: *EmitterState, e: *Expr, type_name: *u8, type_name_le
     emit_reg(s, tag_ptr)
     emit_str(s, c"\n")
 
-    # payload = load i64 from field 1 (we always widen to i64 here because
-    # ritz1's call/arith paths expect i64-width scalars; aggregate unwrap
-    # returns would need a more careful type-oracle pass — deferred).
+    # payload = the Ok / Some payload at field 2 (AGAST #1898), loaded at its
+    # own width and widened to i64 because ritz1's call/arith paths expect
+    # i64-width scalars; aggregate unwrap returns would need a more careful
+    # type-oracle pass — deferred.
     let pay_ptr: i32 = next_reg(s)
     emit_str(s, c"  ")
     emit_reg(s, pay_ptr)
@@ -2580,13 +2579,8 @@ fn try_emit_enum_unwrap(s: *EmitterState, e: *Expr, type_name: *u8, type_name_le
     emit_name(s, type_name, type_name_len)
     emit_str(s, c", ptr ")
     emit_reg(s, scrut_slot)
-    emit_str(s, c", i32 0, i32 1\n")
-    let payload: i32 = next_reg(s)
-    emit_str(s, c"  ")
-    emit_reg(s, payload)
-    emit_str(s, c" = load i64, ptr ")
-    emit_reg(s, pay_ptr)
-    emit_str(s, c"\n")
+    emit_str(s, c", i32 0, i32 2\n")
+    let payload: i32 = emit_tagged_payload_load(s, pay_ptr, type_name, type_name_len, 0)
 
     if is_unwrap == 1
         # unwrap(): return payload assuming tag==0 (Ok/Some).  ritz0 traps

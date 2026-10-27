@@ -1204,7 +1204,7 @@ pub fn is_float_type(t: i32, name: *u8, name_len: i32) -> i32
 
 # Returns 1 if the type name refers to a tagged-enum instantiation
 # (`Result$...` or `Option$...`).  After ritz-task-133 these are lowered to a
-# real LLVM struct `{ i8, [N x i8] }` (matching ritz0 byte-for-byte) rather
+# real LLVM struct `{ i8, [P x i8], [N x i8] }` (ritz0's layout, #1898) rather
 # than the old packed-i64 representation.  Callers that emit payload load /
 # store paths still key off this predicate to decide between "scalar slot"
 # and "tagged-enum aggregate slot" code shapes.
@@ -1307,18 +1307,237 @@ fn tagged_enum_err_payload_struct(s: *EmitterState, name: *u8, name_len: i32, ou
         start = start - 1
     return null
 
-# Payload-byte count reserved inside a tagged-enum struct (ritz0 parity uses
-# the actual payload size per-instantiation; ritz1 currently uses a conservative
-# upper bound because the enum's variant list is discarded by the parser —
-# ritz-task-133).  It must be ONE size for every instantiation: `?` reinterprets
-# an Err carrier of one Result$.. as another (see emitter_expr), which is only
-# sound if they share a layout.  Bump when a wider payload type lands.
+# =============================================================================
+# Tagged-enum layout (AGAST #1898) — byte-for-byte ritz0's _define_enum:
 #
-# 144 = sizeof(Stat), the kernel's struct stat, for ritzlib.fs's
-# `stat(path) -> Result<Stat, i32>` (AGAST #1476).  At 32 the Ok payload was
-# silently truncated: st_size and every field past byte 32 read back as
-# garbage, and the 144-byte store overran the slot.
-const TAGGED_ENUM_PAYLOAD_BYTES: i32 = 144
+#     %Result$T$E = type { i8 tag, [pad x i8], [N x i8] payload }
+#
+# N is the largest payload (T, and E for Result), pad aligns the payload to
+# the most-aligned of them: Result<i64, i32> is { i8, [7 x i8], [8 x i8] },
+# Option<i32> is { i8, [3 x i8], [4 x i8] }.  ritz1 always emits the pad
+# field, as `[0 x i8]` when nothing needs aligning, so the payload is field
+# 2 everywhere; a zero-length array adds no bytes and no ABI element, so the
+# type stays identical to ritz0's at a call boundary.
+#
+# ritz1 used one `{ i8, [144 x i8] }` for every instantiation (ritz-task-133,
+# #1476).  Self-consistent, but the regression matrix links ritz1-compiled
+# callers against ritz0-built ritzlib objects (and bootstrap mixes the two
+# compilers' objects), and `file_size(..) -> Result<i64, i32>` came back
+# through a 16-byte aggregate read as a 145-byte one with its payload at
+# offset 1 instead of 8.
+#
+# An argument this cannot measure (a type the mangler spells as "", e.g.
+# `Option<u32>` -> `Option$`; an unresolved struct; the raw `Result$T$E`
+# placeholder) keeps the old conservative size, payload 8-aligned.  Such an
+# instantiation is self-consistent within ritz1 but not ritz0-compatible.
+# =============================================================================
+
+# 144 = sizeof(Stat), the kernel's struct stat — the widest payload ritzlib
+# had when this was the only size (AGAST #1476).
+const TAGGED_ENUM_FALLBACK_BYTES: i64 = 144
+
+# Arity of the generic one `$`-component of a mangled name names: Result 2,
+# Option 1, a generic struct template its parameter count; 0 for a leaf
+# (primitive, concrete struct, pointer to a leaf).  `ptr_` prefixes are
+# skipped: `ptr_Vec$u8` is one argument.
+fn te_component_arity(s: *EmitterState, name: *u8, len: i32) -> i32
+    var p: *u8 = name
+    var n: i32 = len
+    while n > 4 and *p == 112 and *(p + 1) == 116 and *(p + 2) == 114 and *(p + 3) == 95   # "ptr_"
+        p = p + 4
+        n = n - 4
+    if name_eq(p, n, c"Result", 6) == 1
+        return 2
+    if name_eq(p, n, c"Option", 6) == 1
+        return 1
+    let st: *StructDef = find_struct(s, p, n)
+    if st == null or st.type_params == null
+        return 0
+    var k: i32 = 0
+    var tp: *TypeParam = st.type_params
+    while tp != null
+        k = k + 1
+        tp = tp.next
+    k
+
+# End (exclusive) of the mangled type argument starting at buf[pos]: its
+# first component plus one nested argument per generic parameter.
+fn te_arg_end(s: *EmitterState, buf: *u8, len: i32, pos: i32) -> i32
+    var end: i32 = pos
+    while end < len and *(buf + end) != 36   # '$'
+        end = end + 1
+    let arity: i32 = te_component_arity(s, buf + pos, end - pos)
+    var k: i32 = 0
+    while k < arity
+        if end >= len
+            return end
+        end = te_arg_end(s, buf, len, end + 1)
+        k = k + 1
+    end
+
+# The mangled type argument a tagged-enum variant carries: variant 0 is T
+# (Ok / Some), variant 1 is Result's E.  null (out_len 0) for Option's None,
+# a non-tagged name, or a name that does not split into exactly its
+# arguments.  `Result$Vec$u8$i32`, variant 0 -> `Vec$u8`, 1 -> `i32`.
+pub fn tagged_enum_arg(s: *EmitterState, name: *u8, len: i32, variant: i32, out_len: *i32) -> *u8
+    *out_len = 0
+    if name == null or is_tagged_enum_type(name, len) == 0
+        return null
+    let start: i32 = 7
+    if start >= len
+        return null
+    let is_result: i32 = name_eq(name, 6, c"Result", 6)
+    let end0: i32 = te_arg_end(s, name, len, start)
+    if is_result == 0
+        if variant != 0 or end0 != len
+            return null
+        *out_len = end0 - start
+        return name + start
+    if end0 + 1 >= len
+        return null
+    let e_start: i32 = end0 + 1
+    let e_end: i32 = te_arg_end(s, name, len, e_start)
+    if e_end != len
+        return null
+    if variant == 0
+        *out_len = end0 - start
+        return name + start
+    if variant != 1
+        return null
+    *out_len = e_end - e_start
+    return name + e_start
+
+# Size and alignment (to *align) of the type one mangled argument spells,
+# laid out as ritz0 does; 0 when it cannot be measured.
+fn mangled_type_size_align(s: *EmitterState, name: *u8, len: i32, align: *i64) -> i64
+    *align = 1
+    if name == null or len <= 0
+        return 0
+    let ps: i64 = prim_name_size(name, len)
+    if ps > 0
+        *align = ps
+        return ps
+    if len > 4 and *name == 112 and *(name + 1) == 116 and *(name + 2) == 114 and *(name + 3) == 95   # "ptr_"
+        *align = 8
+        return 8
+    if is_tagged_enum_type(name, len) == 1
+        var pad: i64 = 0
+        let n: i64 = tagged_enum_layout(s, name, len, @pad)
+        return 1 + pad + n   # all-i8 struct: 1-aligned
+    let st: *StructDef = find_struct(s, name, len)
+    if st == null
+        if is_enum_type(name, len) == 1
+            return 1   # C-style enum: `{ i8 }`
+        return 0
+    if st.type_params != null
+        return 0
+    *align = get_struct_align_by_name(s, name, len)
+    get_struct_size_by_name(s, name, len)
+
+# Payload byte count N of tagged enum `name`, with the padding between the
+# tag and the payload written to *pad.  See the block comment above.
+pub fn tagged_enum_layout(s: *EmitterState, name: *u8, len: i32, pad: *i64) -> i64
+    *pad = 7
+    var t_len: i32 = 0
+    let t: *u8 = tagged_enum_arg(s, name, len, 0, @t_len)
+    if t == null
+        return TAGGED_ENUM_FALLBACK_BYTES
+    var align: i64 = 1
+    var size: i64 = mangled_type_size_align(s, t, t_len, @align)
+    if size == 0
+        return TAGGED_ENUM_FALLBACK_BYTES
+    if name_eq(name, 6, c"Result", 6) == 1
+        var e_len: i32 = 0
+        let e: *u8 = tagged_enum_arg(s, name, len, 1, @e_len)
+        if e == null
+            return TAGGED_ENUM_FALLBACK_BYTES
+        var e_align: i64 = 1
+        let e_size: i64 = mangled_type_size_align(s, e, e_len, @e_align)
+        if e_size == 0
+            return TAGGED_ENUM_FALLBACK_BYTES
+        if e_size > size
+            size = e_size
+        if e_align > align
+            align = e_align
+    *pad = (align - (1 % align)) % align
+    size
+
+# Integer width in bits of a scalar payload narrower than i64 — the width it
+# is stored at, as ritz0 does — with *signed set for sign- vs zero-extension
+# back to ritz1's i64 registers.  64 for i64 / pointers / anything else (the
+# i64 store / load ritz1 has always done).
+pub fn tagged_enum_scalar_bits(s: *EmitterState, name: *u8, len: i32, variant: i32, signed: *i32) -> i32
+    *signed = 1
+    var c_len: i32 = 0
+    let c: *u8 = tagged_enum_arg(s, name, len, variant, @c_len)
+    if c == null
+        return 64
+    if name_eq(c, c_len, c"i8", 2) == 1
+        return 8
+    if name_eq(c, c_len, c"i16", 3) == 1
+        return 16
+    if name_eq(c, c_len, c"i32", 3) == 1
+        return 32
+    *signed = 0
+    if name_eq(c, c_len, c"u8", 2) == 1 or name_eq(c, c_len, c"bool", 4) == 1
+        return 8
+    if name_eq(c, c_len, c"u16", 3) == 1
+        return 16
+    if name_eq(c, c_len, c"u32", 3) == 1
+        return 32
+    *signed = 1
+    64
+
+# `<dst> = load i<bits>, ptr <pay_ptr>` widened to i64 for a scalar payload
+# of `variant`; returns the i64 register.  See tagged_enum_scalar_bits.
+pub fn emit_tagged_payload_load(s: *EmitterState, pay_ptr: i32, name: *u8, len: i32, variant: i32) -> i32
+    var signed: i32 = 1
+    let bits: i32 = tagged_enum_scalar_bits(s, name, len, variant, @signed)
+    let r: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, r)
+    emit_str(s, c" = load i")
+    emit_int(s, bits as i64)
+    emit_str(s, c", ptr ")
+    emit_reg(s, pay_ptr)
+    emit_str(s, c"\n")
+    if bits == 64
+        return r
+    let w: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, w)
+    if signed == 1
+        emit_str(s, c" = sext i")
+    else
+        emit_str(s, c" = zext i")
+    emit_int(s, bits as i64)
+    emit_str(s, c" ")
+    emit_reg(s, r)
+    emit_str(s, c" to i64\n")
+    w
+
+# `store i<bits>` of the i64 register `val` into a scalar payload of
+# `variant`, truncating first when the payload is narrower.
+pub fn emit_tagged_payload_store(s: *EmitterState, val: i32, pay_ptr: i32, name: *u8, len: i32, variant: i32)
+    var signed: i32 = 1
+    let bits: i32 = tagged_enum_scalar_bits(s, name, len, variant, @signed)
+    var v: i32 = val
+    if bits != 64
+        v = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, v)
+        emit_str(s, c" = trunc i64 ")
+        emit_reg(s, val)
+        emit_str(s, c" to i")
+        emit_int(s, bits as i64)
+        emit_str(s, c"\n")
+    emit_str(s, c"  store i")
+    emit_int(s, bits as i64)
+    emit_str(s, c" ")
+    emit_reg(s, v)
+    emit_str(s, c", ptr ")
+    emit_reg(s, pay_ptr)
+    emit_str(s, c"\n")
 
 # Emit LLVM type with struct name support.  Tagged-enum types emit as the
 # named struct so variant constructors / match / return paths share the same
@@ -2065,6 +2284,10 @@ fn find_base_expr(e: *Expr) -> *Expr
 fn get_struct_size_by_name(s: *EmitterState, name: *u8, name_len: i32) -> i64
     if name == null or name_len == 0
         return 8
+    if is_tagged_enum_type(name, name_len) == 1
+        var te_pad: i64 = 0
+        let te_n: i64 = tagged_enum_layout(s, name, name_len, @te_pad)
+        return 1 + te_pad + te_n   # AGAST #1898: ritz0's layout
     let st: *StructDef = find_struct(s, name, name_len)
     if st == null
         return 8
@@ -2108,6 +2331,8 @@ fn get_struct_size_by_name(s: *EmitterState, name: *u8, name_len: i32) -> i64
 fn get_struct_align_by_name(s: *EmitterState, name: *u8, name_len: i32) -> i64
     if name == null or name_len == 0
         return 8
+    if is_tagged_enum_type(name, name_len) == 1
+        return 1   # AGAST #1898: { i8, [P x i8], [N x i8] } is 1-aligned
     let st: *StructDef = find_struct(s, name, name_len)
     if st == null
         return 8

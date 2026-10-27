@@ -713,6 +713,83 @@ fn try_emit_enum_is_ok(s: *EmitterState, e: *Expr) -> i32
 # Try operator (AGAST #134)
 # =============================================================================
 
+# AGAST #1898: the Err / None carrier in `inner_slot` (a `%inner`), rebuilt
+# as the enclosing fn's return type in a fresh slot, which is returned.  The
+# tag byte is copied; for a Result the Err payload's bytes are copied field 2
+# to field 2 — E's size when it can be measured, else the smaller payload.
+fn emit_try_err_relayout(s: *EmitterState, inner_slot: i32, inner: *u8, inner_len: i32) -> i32
+    let out_name: *u8 = s.ret_type_name
+    let out_len: i32 = s.ret_type_name_len
+    let out: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, out)
+    emit_str(s, c" = alloca %")
+    emit_name(s, out_name, out_len)
+    emit_str(s, c"  ; try: Err relayout\n")
+    emit_str(s, c"  store %")
+    emit_name(s, out_name, out_len)
+    emit_str(s, c" zeroinitializer, ptr ")
+    emit_reg(s, out)
+    emit_str(s, c"\n")
+    # Tag: field 0 of both.
+    let tag: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, tag)
+    emit_str(s, c" = load i8, ptr ")
+    emit_reg(s, inner_slot)
+    emit_str(s, c"\n  store i8 ")
+    emit_reg(s, tag)
+    emit_str(s, c", ptr ")
+    emit_reg(s, out)
+    emit_str(s, c"\n")
+    # Err payload bytes (Option's None carries none).
+    var nbytes: i64 = 0
+    if name_eq(out_name, 6, c"Result", 6) == 1 and name_eq(inner, 6, c"Result", 6) == 1
+        var e_len: i32 = 0
+        let e: *u8 = tagged_enum_arg(s, out_name, out_len, 1, @e_len)
+        var e_align: i64 = 1
+        if e != null
+            nbytes = mangled_type_size_align(s, e, e_len, @e_align)
+        if nbytes == 0
+            var pad_in: i64 = 0
+            var pad_out: i64 = 0
+            nbytes = tagged_enum_layout(s, inner, inner_len, @pad_in)
+            let n_out: i64 = tagged_enum_layout(s, out_name, out_len, @pad_out)
+            if n_out < nbytes
+                nbytes = n_out
+    if nbytes > 0
+        let src: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, src)
+        emit_str(s, c" = getelementptr %")
+        emit_name(s, inner, inner_len)
+        emit_str(s, c", ptr ")
+        emit_reg(s, inner_slot)
+        emit_str(s, c", i32 0, i32 2\n")
+        let dst: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, dst)
+        emit_str(s, c" = getelementptr %")
+        emit_name(s, out_name, out_len)
+        emit_str(s, c", ptr ")
+        emit_reg(s, out)
+        emit_str(s, c", i32 0, i32 2\n")
+        let bytes: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, bytes)
+        emit_str(s, c" = load [")
+        emit_int(s, nbytes)
+        emit_str(s, c" x i8], ptr ")
+        emit_reg(s, src)
+        emit_str(s, c"\n  store [")
+        emit_int(s, nbytes)
+        emit_str(s, c" x i8] ")
+        emit_reg(s, bytes)
+        emit_str(s, c", ptr ")
+        emit_reg(s, dst)
+        emit_str(s, c"\n")
+    out
+
 # Lower `expr?`:
 #   * On Some/Ok: extract payload from the carrier struct, continue with it.
 #   * On None/Err: early-return the whole struct back to the caller.
@@ -787,16 +864,19 @@ fn emit_expr_try(s: *EmitterState, e: *Expr) -> i32
     emit_str(s, c"\n")
 
     # Err/None branch: early-return the carrier as the enclosing fn's
-    # return type.  When inner (e.g. Result$Vec_u8_StrView) and outer
-    # (Result$i32_StrView) differ only in the Ok payload type, the stored
-    # bytes are layout-compatible — { i8 tag, [N x i8] payload } is
-    # shared — so a plain "load outer, ptr %slot" reinterprets the Err
-    # without a rebuild.  Opaque pointers allow this access.
+    # return type.  AGAST #1898: inner (e.g. Result$Big$i32) and outer
+    # (Result$i32$i32) are laid out per instantiation like ritz0's, so the
+    # Err payload's offset depends on the Ok type: unless the two names
+    # match, rebuild the outer value — zeroed, tag copied, E's bytes copied
+    # payload to payload — rather than reinterpreting the inner bytes.
     begin_block(s, err_label)
+    var ret_slot: i32 = slot
+    if is_tagged_enum_type(enum_name, enum_name_len) == 1 and is_tagged_enum_type(s.ret_type_name, s.ret_type_name_len) == 1 and name_eq(enum_name, enum_name_len, s.ret_type_name, s.ret_type_name_len) == 0
+        ret_slot = emit_try_err_relayout(s, slot, enum_name, enum_name_len)
     if s.ret_sret == 1
         # AGAST #1730 — never taken today (tagged enums keep their ABI; see
         # struct_ret_uses_sret), but a `ret %T` in an sret fn is invalid IR.
-        emit_sret_ret_from_ptr(s, slot)
+        emit_sret_ret_from_ptr(s, ret_slot)
     else
         let ret_reg: i32 = next_reg(s)
         emit_str(s, c"  ")
@@ -804,7 +884,7 @@ fn emit_expr_try(s: *EmitterState, e: *Expr) -> i32
         emit_str(s, c" = load %")
         emit_name(s, s.ret_type_name, s.ret_type_name_len)
         emit_str(s, c", ptr ")
-        emit_reg(s, slot)
+        emit_reg(s, ret_slot)
         emit_str(s, c"\n")
         emit_str(s, c"  ret %")
         emit_name(s, s.ret_type_name, s.ret_type_name_len)
@@ -812,7 +892,7 @@ fn emit_expr_try(s: *EmitterState, e: *Expr) -> i32
         emit_reg(s, ret_reg)
         emit_str(s, c"\n")
 
-    # Ok/Some branch: load the payload from field 1.  For scalar payloads,
+    # Ok/Some branch: load the payload from field 2 (#1898).  For scalar payloads,
     # emit_variant_struct stores them as i64 so an i64 load is fine.  For
     # struct payloads (e.g., Result<Vec<u8>, E>'s Ok holds a 24-byte
     # %Vec$u8), an i64 load truncates to 8 bytes — corrupting the value.
@@ -826,7 +906,7 @@ fn emit_expr_try(s: *EmitterState, e: *Expr) -> i32
     emit_name(s, enum_name, enum_name_len)
     emit_str(s, c", ptr ")
     emit_reg(s, slot)
-    emit_str(s, c", i32 0, i32 1\n")
+    emit_str(s, c", i32 0, i32 2\n")
 
     # The Ok/Some payload's struct type, if any (e.g. "Result$Vec$u8$E" →
     # "Vec$u8"; "Option$i32" → none).
@@ -836,21 +916,19 @@ fn emit_expr_try(s: *EmitterState, e: *Expr) -> i32
     if pay_name != null
         pay_struct = find_struct(s, pay_name, pay_name_len)
 
+    if pay_struct == null
+        # Scalar payload at its own width (AGAST #1898), widened to i64.
+        return emit_tagged_payload_load(s, pay_ptr, enum_name, enum_name_len, 0)
+    # Struct payload — load the actual type so the 24-byte (or larger)
+    # value is preserved for the caller's let-decl / arg coercion.
     let payload: i32 = next_reg(s)
     emit_str(s, c"  ")
     emit_reg(s, payload)
-    if pay_struct != null
-        # Struct payload — load the actual type so the 24-byte (or larger)
-        # value is preserved for the caller's let-decl / arg coercion.
-        emit_str(s, c" = load %")
-        emit_name(s, pay_name, pay_name_len)
-        emit_str(s, c", ptr ")
-        emit_reg(s, pay_ptr)
-        emit_str(s, c"  ; try: unwrap struct payload\n")
-    else
-        emit_str(s, c" = load i64, ptr ")
-        emit_reg(s, pay_ptr)
-        emit_str(s, c"  ; try: unwrap payload\n")
+    emit_str(s, c" = load %")
+    emit_name(s, pay_name, pay_name_len)
+    emit_str(s, c", ptr ")
+    emit_reg(s, pay_ptr)
+    emit_str(s, c"  ; try: unwrap struct payload\n")
     return payload
 
 # =============================================================================
