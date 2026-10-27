@@ -51,9 +51,9 @@ struct NFA
   transitions: *Transition
   trans_count: i64
   start_state: i64
-  state_trans_offset: *i64
-  state_trans_count: *i64
-  trans_indices: *i64
+  state_trans_offset: *i32
+  state_trans_count: *i32
+  trans_indices: *i32
   max_states: i64
   max_trans: i64
 
@@ -62,7 +62,7 @@ struct NFA
 # max_states sizes `states`, `sto` and `stc`; max_trans sizes `trans` and `ti`.
 # They are i32 on purpose: every nfa_add_* keeps its count below its capacity,
 # so count <= 2^31-1 and narrowing a count to an i32 ID is lossless (#1436).
-fn nfa_init(nfa: *NFA, states: *NFAState, trans: *Transition, sto: *i64, stc: *i64, ti: *i64, max_states: i32, max_trans: i32) -> i32
+fn nfa_init(nfa: *NFA, states: *NFAState, trans: *Transition, sto: *i32, stc: *i32, ti: *i32, max_states: i32, max_trans: i32) -> i32
   nfa.states = states
   nfa.state_count = 0
   nfa.transitions = trans
@@ -190,9 +190,9 @@ fn trans_matches(trans: *Transition, ch: i32) -> i32
 # can iterate only state s's outgoing transitions instead of scanning
 # all nfa.trans_count transitions per recursive step.
 fn nfa_finalize(nfa: *NFA) -> i32
-  let count_arr: *i64 = nfa.state_trans_count
-  let offset_arr: *i64 = nfa.state_trans_offset
-  let indices_arr: *i64 = nfa.trans_indices
+  let count_arr: *i32 = nfa.state_trans_count
+  let offset_arr: *i32 = nfa.state_trans_offset
+  let indices_arr: *i32 = nfa.trans_indices
   let nstates: i64 = nfa.state_count
   let ntrans: i64 = nfa.trans_count
 
@@ -207,12 +207,12 @@ fn nfa_finalize(nfa: *NFA) -> i32
   while t < ntrans
     let trans_ptr: *Transition = nfa.transitions + t
     let from: i64 = trans_ptr.from_state
-    let cur: i64 = *(count_arr + from)
+    let cur: i32 = *(count_arr + from)
     *(count_arr + from) = cur + 1
     t = t + 1
 
   # Phase 3: prefix-sum into offset array
-  var off: i64 = 0
+  var off: i32 = 0
   var s: i64 = 0
   while s < nstates
     *(offset_arr + s) = off
@@ -226,19 +226,14 @@ fn nfa_finalize(nfa: *NFA) -> i32
     k = k + 1
 
   # Phase 5: bin transition indices by from_state.
-  # NOTE: `indices_arr + base_off + cur_count` would left-associate as
-  # `(indices_arr + base_off) + cur_count` — and ritz1 only applies
-  # pointer-arith stride scaling when the LHS of `+` is EXPR_IDENT or
-  # EXPR_MEMBER, not EXPR_BINARY.  Without the explicit parens, the
-  # second `+` would skip the *8 stride and corrupt every read.
-  # (Same workaround used in lexer_nfa.ritz Tier 1 readers.)
   var t2: i64 = 0
   while t2 < ntrans
     let tp2: *Transition = nfa.transitions + t2
     let from2: i64 = tp2.from_state
-    let base_off: i64 = *(offset_arr + from2)
-    let cur_count: i64 = *(count_arr + from2)
-    *(indices_arr + (base_off + cur_count)) = t2
+    let base_off: i64 = *(offset_arr + from2) as i64
+    let cur_count: i32 = *(count_arr + from2)
+    # Lossless: t2 < trans_count <= max_trans, an i32 (#1436).
+    *(indices_arr + base_off + (cur_count as i64)) = t2 as i32
     *(count_arr + from2) = cur_count + 1
     t2 = t2 + 1
 
@@ -253,8 +248,8 @@ fn nfa_finalize(nfa: *NFA) -> i32
 fn nfa_accepts_from(nfa: *NFA, state: i32, src: *u8, pos: i32, len: i32) -> i32
   let state_ptr: *NFAState = nfa.states + state
   let state_i64: i64 = state as i64
-  let off: i64 = *(nfa.state_trans_offset + state_i64)
-  let cnt: i64 = *(nfa.state_trans_count + state_i64)
+  let off: i64 = *(nfa.state_trans_offset + state_i64) as i64
+  let cnt: i64 = *(nfa.state_trans_count + state_i64) as i64
 
   # Check if at end of input
   if pos >= len
@@ -263,7 +258,7 @@ fn nfa_accepts_from(nfa: *NFA, state: i32, src: *u8, pos: i32, len: i32) -> i32
     # Try epsilon transitions
     var k: i64 = 0
     while k < cnt
-      let i: i64 = *(nfa.trans_indices + (off + k))
+      let i: i64 = *(nfa.trans_indices + off + k) as i64
       let trans_ptr: *Transition = nfa.transitions + i
       if trans_ptr.kind == TR_EPSILON
         if nfa_accepts_from(nfa, trans_ptr.to_state as i32, src, pos, len) == 1
@@ -277,7 +272,7 @@ fn nfa_accepts_from(nfa: *NFA, state: i32, src: *u8, pos: i32, len: i32) -> i32
   # Try epsilon transitions first
   var k1: i64 = 0
   while k1 < cnt
-    let i1: i64 = *(nfa.trans_indices + (off + k1))
+    let i1: i64 = *(nfa.trans_indices + off + k1) as i64
     let trans_ptr1: *Transition = nfa.transitions + i1
     if trans_ptr1.kind == TR_EPSILON
       if nfa_accepts_from(nfa, trans_ptr1.to_state as i32, src, pos, len) == 1
@@ -287,7 +282,7 @@ fn nfa_accepts_from(nfa: *NFA, state: i32, src: *u8, pos: i32, len: i32) -> i32
   # Try character transitions
   var k2: i64 = 0
   while k2 < cnt
-    let i2: i64 = *(nfa.trans_indices + (off + k2))
+    let i2: i64 = *(nfa.trans_indices + off + k2) as i64
     let trans_ptr2: *Transition = nfa.transitions + i2
     if trans_matches(trans_ptr2, ch) == 1
       if nfa_accepts_from(nfa, trans_ptr2.to_state as i32, src, pos + 1, len) == 1

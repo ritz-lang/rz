@@ -54,6 +54,9 @@ struct LocalVar
     # AGAST #1671: signature of a `fn(...) -> T`-typed local or param (null
     # otherwise); emit_call uses it for `call <ret> %f(<params>)`.
     fn_sig: *FnDef
+    # AGAST #1815: innermost pointee of a `**T` local/param (TYPE_U8 for
+    # `**u8`); TYPE_VOID otherwise.  pointee_type is TYPE_PTR for every **T.
+    inner_pointee_type: i32
 
 # A let/var seen so far in the current function, with the integer type its
 # annotation WROTE (NARROW_UNKNOWN when unannotated or not an integer).
@@ -592,6 +595,14 @@ fn set_local_fn_sig(s: *EmitterState, name: *u8, len: i32, sig: *FnDef)
     if loc != null
         loc.fn_sig = sig
 
+# AGAST #1815: attach a `**T` local's innermost pointee to the just-registered local.
+fn set_local_inner_pointee(s: *EmitterState, name: *u8, len: i32, inner: i32)
+    if inner == TYPE_VOID
+        return
+    let loc: *LocalVar = find_local_struct_name(s, name, len)
+    if loc != null
+        loc.inner_pointee_type = inner
+
 fn add_local_full(s: *EmitterState, name: *u8, len: i32, reg: i32, var_type: i32, type_name: *u8, type_name_len: i32, pointee: i32, arr_size: i32, arr_elem: i32)
     if s.local_count >= MAX_LOCALS
         emit_fatal_limit(c"too many locals and params in one function", MAX_LOCALS)
@@ -608,6 +619,7 @@ fn add_local_full(s: *EmitterState, name: *u8, len: i32, reg: i32, var_type: i32
     loc.array_elem_type = arr_elem
     loc.is_bool = 0
     loc.fn_sig = null
+    loc.inner_pointee_type = TYPE_VOID
     s.local_count = idx + 1
     # ritz-task-193 — mirror into HashMap so find_local* hits O(1).
     # Store `idx + 1` so the value is non-zero (0 = miss in
@@ -2649,6 +2661,34 @@ fn get_ptr_elem_size(s: *EmitterState, e: *Expr) -> i64
     emit_ir_error(s, c"pointer arithmetic: element size of pointee unknown for a non-name operand")
     return 1
 
+# AGAST #1815: the element a `*(pp + i)` (or `*pp`) points at, when `pp` is a
+# `**T` local, param or global with a primitive T: `*(*(pp + i) + k)` loads a
+# T and `*(pp + i) + k` strides by sizeof(T).  TYPE_VOID when unknown (not a
+# deref, not a `**T` name, a struct T, or a deeper pointer) — callers keep
+# their previous behaviour then.
+#
+# ritz1's own enum tracker read its `**u8` name table this way under
+# self-hosting and got `load i64` for each byte, so it carried a "load each
+# byte through an explicit let" workaround (ast_helpers.ritz) for years.
+fn deref_ptr_ptr_elem_type(s: *EmitterState, d: *Expr) -> i32
+    if d == null or d.kind != EXPR_UNARY or d.op != OP_DEREF or d.operand == null
+        return TYPE_VOID
+    let base: *Expr = find_base_expr(d.operand)
+    if base.kind != EXPR_IDENT
+        return TYPE_VOID
+    var inner: i32 = TYPE_VOID
+    let loc: *LocalVar = find_local_struct_name(s, base.ident_ptr, base.ident_len)
+    if loc != null
+        if loc.var_type == TYPE_PTR_PTR
+            inner = loc.inner_pointee_type
+    else
+        let glob: *GlobalVarDef = find_global(s, base.ident_ptr, base.ident_len)
+        if glob != null and glob.var_type == TYPE_PTR_PTR
+            inner = glob.inner_pointee_type
+    if inner == TYPE_STRUCT or ptr_pointee_size(s, inner, null, 0) == 0
+        return TYPE_VOID
+    return inner
+
 # Classify an operand of `+`/`-` as pointer arithmetic, and if so give its
 # element stride.  Returns 0 for "not a pointer", otherwise the element size
 # in bytes (never 0, so 0 is an unambiguous sentinel).
@@ -2727,6 +2767,10 @@ fn ptr_arith_elem_size(s: *EmitterState, e: *Expr) -> i64
         # q is an identifier with a recorded pointee.)
         if (e.op == OP_ADDR or e.op == OP_ADDR_MUT) and e.operand != null and e.operand.kind == EXPR_INDEX
             return index_elem_size(s, e.operand)
+        # AGAST #1815: `*(pp + i) + k` for `pp: **T` strides by sizeof(T).
+        let dpt: i32 = deref_ptr_ptr_elem_type(s, e)
+        if dpt != TYPE_VOID
+            return ptr_pointee_size(s, dpt, null, 0)
         return 0
     return 0
 
@@ -2791,7 +2835,7 @@ fn get_member_pointee_type_exact(s: *EmitterState, e: *Expr) -> i32
     # `*(struct.ptr_field + i)` would default to TYPE_U8 and
     # emit `load i8`, garbling the actual i64/i32/i16 read.
     # Was the selfhost blocker for the Tier 1 NFA optimization
-    # — `nfa.state_trans_offset` is `*i64`; reading it as i8
+    # — `nfa.state_trans_offset` is `*i32`; reading it as i8
     # gave bogus offsets and the lexer matched no patterns.
     if field != null and field.field_type == TYPE_PTR
         let pe: i32 = field.array_elem_type
@@ -2837,6 +2881,11 @@ fn get_deref_store_type(s: *EmitterState, ptr_expr: *Expr) -> i32
             return TYPE_VOID
         if base.kind == EXPR_MEMBER
             return get_member_pointee_type_exact(s, base)
+        # AGAST #1815: `*(*(pp + i) + k) = v`.
+        return deref_ptr_ptr_elem_type(s, base)
+    if ptr_expr.kind == EXPR_UNARY
+        # AGAST #1815: `**pp = v`.
+        return deref_ptr_ptr_elem_type(s, ptr_expr)
     return TYPE_VOID
 
 fn get_expr_type(s: *EmitterState, e: *Expr) -> i32
@@ -2946,6 +2995,15 @@ fn get_expr_type(s: *EmitterState, e: *Expr) -> i32
                     else if base.kind == EXPR_MEMBER
                         # Member+offset dereference (e.g., *(span.ptr + i))
                         return get_member_pointee_type(s, base)
+                    # AGAST #1815: `*(*(pp + i) + k)` for `pp: **T`.
+                    let bdpt: i32 = deref_ptr_ptr_elem_type(s, base)
+                    if bdpt != TYPE_VOID
+                        return bdpt
+                # AGAST #1815: `**pp` / `*(*(pp + i))` for `pp: **T`.
+                else if e.operand.kind == EXPR_UNARY
+                    let udpt: i32 = deref_ptr_ptr_elem_type(s, e.operand)
+                    if udpt != TYPE_VOID
+                        return udpt
                 # Bare member deref: `*param.name` where param.name is *u8
                 # (selfhost-only bug — emit_impl_method's `is_self` check
                 # `*param.name == 115` was loading i64 instead of i8 because

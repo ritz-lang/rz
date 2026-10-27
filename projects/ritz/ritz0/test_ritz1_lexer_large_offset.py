@@ -72,9 +72,9 @@ fn probe(buf: *u8, n: i64, want_kind: i32) -> i64
     var patterns_storage: [128]TokenPattern
     var states_storage: [4096]NFAState
     var trans_storage: [8192]Transition
-    var sto_storage: [4096]i64
-    var stc_storage: [4096]i64
-    var ti_storage:  [8192]i64
+    var sto_storage: [4096]i32
+    var stc_storage: [4096]i32
+    var ti_storage:  [8192]i32
     var lex: Lexer
     setup_lexer(@lex, @nfa_storage, @patterns_storage[0], @states_storage[0], @trans_storage[0], @sto_storage[0], @stc_storage[0], @ti_storage[0], 4096, 8192)
     let big: i64 = 4294967296

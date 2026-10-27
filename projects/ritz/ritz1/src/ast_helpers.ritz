@@ -645,7 +645,7 @@ pub fn global_var_new(p: *Parser, name: *u8, len: i32, var_type: i32, init_expr:
     # `array_*` writes scribbled past the end of the allocation into the
     # next arena slab — corrupting whatever the parser allocated next.
     # AGAST #1501: 96 → 128 for src_file/line/col (struct is now 104 bytes).
-    let g: *GlobalVarDef = parser_alloc(p, 128) as *GlobalVarDef  # Size of GlobalVarDef struct
+    let g: *GlobalVarDef = parser_alloc(p, sizeof(GlobalVarDef)) as *GlobalVarDef
     g.name = name as *u8
     g.name_len = len
     g.var_type = var_type
@@ -663,6 +663,7 @@ pub fn global_var_new(p: *Parser, name: *u8, len: i32, var_type: i32, init_expr:
         g.pointee_type = p.last_pointee_type
     else
         g.pointee_type = TYPE_I64
+    g.inner_pointee_type = ptr_ptr_inner_pointee(p, var_type)
     # AGAST #190: capture array dimensions for `var g: [N]T` so the global
     # gets emitted as `[N x %T] zeroinitializer` and indexing GEPs can
     # synthesise the right stride.  Mirrors what var_decl does for locals
@@ -858,7 +859,7 @@ pub fn extern_fn_def_new(p: *Parser, name: *u8, len: i32, params: *Param, ret: i
 # =============================================================================
 
 pub fn param_new(p: *Parser, name: *u8, len: i32, ty: i32, line: i32, col: i32) -> *Param
-    let param: *Param = parser_alloc(p, 56) as *Param
+    let param: *Param = parser_alloc(p, sizeof(Param)) as *Param
     param.name = name as *u8
     param.name_len = len
     param.param_type = ty
@@ -877,6 +878,7 @@ pub fn param_new(p: *Parser, name: *u8, len: i32, ty: i32, line: i32, col: i32) 
         param.param_pointee_type = p.last_ref_inner_type
     else
         param.param_pointee_type = TYPE_I64  # Default
+    param.param_inner_pointee_type = ptr_ptr_inner_pointee(p, ty)
     param.next = null
     param.is_borrow = 0
     # AGAST #1671: a `fn(...) -> T` param keeps its signature.
@@ -1467,6 +1469,15 @@ pub fn type_array(p: *Parser, size_str: *u8, size_len: i32, elem_type: i32) -> i
         p.last_array_elem_type_name_len = 0
     return TYPE_ARRAY
 
+# AGAST #1815: the innermost pointee of a just-parsed `**T`, for
+# Param / Stmt / GlobalVarDef.  Exactly two levels only (last_pointee_type
+# is TYPE_PTR): for `***T` the element of `*(ppp + i)` is itself a `**T`,
+# which this one-slot record cannot describe, so it answers TYPE_VOID.
+pub fn ptr_ptr_inner_pointee(p: *Parser, ty: i32) -> i32
+    if ty == TYPE_PTR_PTR and p.last_pointee_type == TYPE_PTR
+        return p.last_inner_pointee_type
+    return TYPE_VOID
+
 # Handle pointer type *T
 # Stores the pointee type and preserves type name if pointing to struct/generic
 pub fn type_ptr(p: *Parser, inner_type: i32) -> i32
@@ -1861,6 +1872,7 @@ pub fn stmt_var_decl(p: *Parser, name: *u8, len: i32, ty: i32, init: *Expr, line
         s.var_pointee_type = TYPE_STRUCT  # AGAST #1754, as param_new
     else
         s.var_pointee_type = TYPE_I64  # Default
+    s.var_inner_pointee_type = ptr_ptr_inner_pointee(p, ty)
     s.var_init = init
     s.next = null
     return s
@@ -3409,19 +3421,11 @@ fn enum_variant_record_impl(name: *u8, len: i32, kind: i32, fields: *StructField
     *(g_enum_variant_fields + g_enum_variant_total) = fields
     *(g_enum_variant_kinds + g_enum_variant_total) = kind
     g_enum_variant_total = g_enum_variant_total + 1
-    # Read-modify-write through an intermediate `let` to avoid a self-host
-    # codegen quirk where the compound `*(p + i) = *(p + i) + 1` form
-    # produces an off-by-one count under ritz1-self-compiled binaries.
-    let idx: i32 = g_enum_count - 1
-    let old_count: i32 = *(g_enum_variant_counts + idx)
-    *(g_enum_variant_counts + idx) = old_count + 1
+    *(g_enum_variant_counts + g_enum_count - 1) = *(g_enum_variant_counts + g_enum_count - 1) + 1
     return 0
 
 # Lookup: returns the variant's tag index (0-based) within an enum, or -1
 # when either the enum or the variant is unknown.
-# Same compound-deref workaround as is_enum_type: load each byte through
-# an explicit `let` binding so the i8 comparison codegen is correct under
-# self-hosting.
 pub fn enum_variant_index(enum_name: *u8, enum_name_len: i32, var_name: *u8, var_name_len: i32) -> i32
     if g_enum_initialized == 0
         return 0 - 1
@@ -3429,31 +3433,16 @@ pub fn enum_variant_index(enum_name: *u8, enum_name_len: i32, var_name: *u8, var
     while ei < g_enum_count
         if *(g_enum_name_lens + ei) == enum_name_len
             var match_e: i32 = 1
-            let stored_e: *u8 = *(g_enum_names + ei)
             for k in 0..enum_name_len
-                let sb: u8 = *(stored_e + k)
-                let qb: u8 = *(enum_name + k)
-                if sb != qb
+                if *(*(g_enum_names + ei) + k) != *(enum_name + k)
                     match_e = 0
             if match_e == 1
-                # Pointer-then-deref via local `let` bindings — same self-host
-                # codegen workaround as is_enum_type's name comparison.
-                let starts_ptr: *i32 = g_enum_variant_starts
-                let counts_ptr: *i32 = g_enum_variant_counts
-                let start: i32 = *(starts_ptr + ei)
-                let count: i32 = *(counts_ptr + ei)
-                for vi in 0..count
-                    let vidx: i32 = start + vi
-                    let vlens_ptr: *i32 = g_enum_variant_name_lens
-                    let stored_len: i32 = *(vlens_ptr + vidx)
-                    if stored_len == var_name_len
+                let start: i32 = *(g_enum_variant_starts + ei)
+                for vi in 0..*(g_enum_variant_counts + ei)
+                    if *(g_enum_variant_name_lens + start + vi) == var_name_len
                         var match_v: i32 = 1
-                        let vnames_ptr: **u8 = g_enum_variant_names
-                        let stored_v: *u8 = *(vnames_ptr + vidx)
                         for k in 0..var_name_len
-                            let svb: u8 = *(stored_v + k)
-                            let qvb: u8 = *(var_name + k)
-                            if svb != qvb
+                            if *(*(g_enum_variant_names + start + vi) + k) != *(var_name + k)
                                 match_v = 0
                         if match_v == 1
                             return vi
@@ -3462,11 +3451,6 @@ pub fn enum_variant_index(enum_name: *u8, enum_name_len: i32, var_name: *u8, var
     return 0 - 1
 
 # Returns 1 if name is a known enum type, 0 otherwise.
-# NOTE: the byte comparison uses explicit `let` bindings for the loaded
-# bytes — when ritz1 self-compiles itself, the inlined compound deref
-# `*(*(g_enum_names + ei) + k) != *(name + k)` was producing buggy code
-# (false negative on equal strings).  Using the let-binding form forces
-# distinct loads with proper i8 type that compare correctly.
 pub fn is_enum_type(name: *u8, len: i32) -> i32
     if g_enum_initialized == 0
         return 0
@@ -3474,11 +3458,8 @@ pub fn is_enum_type(name: *u8, len: i32) -> i32
     while ei < g_enum_count
         if *(g_enum_name_lens + ei) == len
             var match_e: i32 = 1
-            let stored: *u8 = *(g_enum_names + ei)
             for k in 0..len
-                let stored_byte: u8 = *(stored + k)
-                let query_byte: u8 = *(name + k)
-                if stored_byte != query_byte
+                if *(*(g_enum_names + ei) + k) != *(name + k)
                     match_e = 0
             if match_e == 1
                 return 1

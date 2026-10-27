@@ -820,7 +820,7 @@ class RitzGenerator:
         self._emit('import lexer_nfa')
         self._emit('')
         self._emit('# Initialize lexer with token patterns from grammar')
-        self._emit('fn setup_lexer(lex: *Lexer, nfa_storage: *NFA, patterns_storage: *TokenPattern, states_storage: *NFAState, trans_storage: *Transition, sto_storage: *i64, stc_storage: *i64, ti_storage: *i64, max_states: i32, max_trans: i32) -> i32')
+        self._emit('fn setup_lexer(lex: *Lexer, nfa_storage: *NFA, patterns_storage: *TokenPattern, states_storage: *NFAState, trans_storage: *Transition, sto_storage: *i32, stc_storage: *i32, ti_storage: *i32, max_states: i32, max_trans: i32) -> i32')
         self._emit('    # Initialize NFA storage (Tier 1 NFA opt: index buffers for state-indexed lookup)')
         self._emit('    nfa_init(nfa_storage, states_storage, trans_storage, sto_storage, stc_storage, ti_storage, max_states, max_trans)')
         self._emit('')
