@@ -10,8 +10,8 @@
 Absent is not the same as stale.  With a stale binary the suite still ran, and
 it still reported a number — just not one about the tree you have checked out.
 The direction people notice is a false *failure*: someone investigates, rebuilds,
-moves on.  The direction that matters is the other one.  Break `parse_module_end`
-in `parser_gen.ritz` so ritz1 stops requiring EOF, run pytest without rebuilding,
+moves on.  The direction that matters is the other one.  Make `parse_tokens` in
+`main.ritz` ignore the parser's EOF error, run pytest without rebuilding,
 and `test_trailing_garbage_is_not_silently_ignored` passes — against the *old*
 binary, which still has the check.  The regression #1301 exists to prevent ships
 green.  Nobody looks at a green run.
@@ -50,11 +50,27 @@ RITZ1_BIN = RITZ_ROOT / "ritz1" / "build" / "ritz1"
 TARGET_TEST = "test_ritz1_parse_errors.py::test_trailing_garbage_is_not_silently_ignored"
 
 # --- The mutation ------------------------------------------------------------
-# `parse_module_end` is what enforces "the module ends at EOF".  Neutering it is
-# precisely the #1301 regression: trailing garbage is swallowed and ritz1 exits 0.
-MUTATION_FILE = Path("ritz1/src/parser_gen.ritz")
-MUTATION_FROM = "        return module_require_eof(p)"
-MUTATION_TO = "        return 0  # AGAST #1322 mutant: EOF requirement removed"
+# The parser rejects trailing garbage by setting `p.error` (module_require_eof),
+# and main.ritz's `parse_tokens` turns that into a non-zero exit.  The mutant
+# ignores the error and keeps the partial module, which is the #1301 regression:
+# trailing garbage is swallowed and ritz1 exits 0.
+#
+# The site is in main.ritz because nothing imports main (AGAST #1895).  The
+# rebuild is then main.ll + main.o + a relink (~2 s).  The previous site,
+# parser_gen.ritz, recompiled 10 dependent modules (110-340 s).
+# `test_mutation_site_is_a_leaf_module` keeps it that way.
+MUTATION_FILE = Path("ritz1/src/main.ritz")
+MUTATION_FROM = (
+    "    let m: *Module = parse_module(@p)\n"
+    "\n"
+    "    if p.error != 0\n"
+)
+MUTATION_TO = (
+    "    parse_module(@p)\n"
+    "    let m: *Module = p.module  # AGAST #1322 mutant: keep the partial module\n"
+    "\n"
+    "    if p.error != p.error\n"
+)
 
 # --- The two fixture implementations, as literal source ----------------------
 # `FIXTURE_NEW` must match conftest.py's `_ritz1_stale` exactly; if it stops
@@ -106,19 +122,49 @@ def _swap_fixture(test_file: Path, old: str, new: str, label: str) -> None:
     test_file.write_text(text.replace(old, new))
 
 
-@pytest.mark.slow  # ~2 min: scheduled first under xdist (conftest.py, item 6)
+def _dependents(mutation_file: Path) -> list[str]:
+    """ritz1 modules whose make dependency file (`build/<m>.d`) lists `mutation_file`.
+
+    Each of them gets recompiled, often with clang -O2 too, when the mutation lands.
+    """
+    rel = f"src/{mutation_file.name}"
+    return sorted(
+        d.stem
+        for d in (RITZ_ROOT / "ritz1" / "build").glob("*.d")
+        if rel in d.read_text()
+    )
+
+
+@pytest.mark.integration
+def test_mutation_site_is_a_leaf_module(ritz1_bin):
+    """AGAST #1895: the mutated module must have no dependents.
+
+    The old site, parser_gen.ritz, was imported by 10 modules, including emitter
+    at -O2.  The mutated "incremental" rebuild then took 110-340 s, and this
+    module became the critical path of the whole xdist session.  If the site
+    gets dependents, the slow test is slow again.
+    """
+    assert ritz1_bin.exists()
+    deps = _dependents(MUTATION_FILE)
+    assert deps == [], (
+        f"{MUTATION_FILE} is imported by {deps}; mutating it rebuilds each of "
+        f"them.  Pick a mutation site in a module nothing imports (main.ritz)."
+    )
+
+
+@pytest.mark.slow  # scheduled first under xdist (conftest.py, item 6)
 @pytest.mark.integration
 def test_stale_ritz1_binary_cannot_produce_a_false_pass(tmp_path, ritz1_bin):
     """A stale binary must not be able to turn a real regression into a green run.
 
     Arms the same broken tree with each fixture implementation in turn.  The old
     one passes (it never rebuilds, so it grades yesterday's compiler); the new
-    one fails (make notices `parser_gen.ritz` moved and relinks).  If both arms
+    one fails (make notices `main.ritz` moved and relinks).  If both arms
     agree, the fixture is not doing its job — in either direction.
     """
     # `ritz1_bin` is a fresh binary plus its object files, so the copy below
-    # starts consistent and the mutated rebuild is incremental (~6s) rather
-    # than cold (~51s).
+    # starts consistent.  The mutated rebuild then recompiles only main.ritz
+    # (a leaf) and relinks, instead of a cold build (~51s).
     assert ritz1_bin == RITZ1_BIN and RITZ1_BIN.exists()
 
     # copytree uses copy2, which preserves mtimes — essential, since the whole
@@ -127,12 +173,12 @@ def test_stale_ritz1_binary_cannot_produce_a_false_pass(tmp_path, ritz1_bin):
     shutil.copytree(RITZ_ROOT, root, ignore=_COPY_IGNORE, symlinks=True)
     assert (root / "ritz1" / "build" / "ritz1").exists(), "copy lost the binary"
 
-    # Break the compiler at the source level.  The binary in the copy still has
-    # the EOF check; only the sources disagree with it now.
+    # Break the compiler at the source level.  The binary in the copy still
+    # rejects trailing garbage; only the sources disagree with it now.
     src = root / MUTATION_FILE
     text = src.read_text()
     assert text.count(MUTATION_FROM) == 1, (
-        f"{MUTATION_FILE} no longer contains the expected EOF-enforcement line "
+        f"{MUTATION_FILE} no longer contains the expected parse-error check "
         f"{MUTATION_FROM!r}; pick a new mutation site rather than skipping."
     )
     src.write_text(text.replace(MUTATION_FROM, MUTATION_TO))
@@ -152,12 +198,12 @@ def test_stale_ritz1_binary_cannot_produce_a_false_pass(tmp_path, ritz1_bin):
     )
 
     # --- Arm B: the real fixture ---------------------------------------------
-    # make sees parser_gen.ritz is newer than the binary, relinks, and the fresh
+    # make sees main.ritz is newer than the binary, relinks, and the fresh
     # compiler happily accepts trailing garbage — so the test fails, as it must.
     _swap_fixture(target_file, FIXTURE_OLD, FIXTURE_NEW, "old")
     fresh = _run_pytest(root)
     assert fresh.returncode != 0, (
-        "THE FIXTURE IS FAILING OPEN: ritz1's EOF check was removed at the source "
+        "THE FIXTURE IS FAILING OPEN: ritz1's parse-error exit was removed at the source "
         "level and the parse-error suite still passed, which means it graded a "
         "stale binary.  A green run of test_ritz1_parse_errors.py currently proves "
         "nothing about the working tree (AGAST #1322).\n"
