@@ -259,3 +259,73 @@ fn test_tls_server_state_transitions()
     assert_eq_i32(tls_server_is_connected(@server), 0)
 
     tls_server_free(@server)
+
+# ============================================================================
+# Wire-length bounds (#1861)
+#
+# The handshake header's 24-bit length is attacker-controlled. The server
+# must reject a ClientHello whose claimed length overruns its record, rather
+# than parsing and hashing bytes past it (up to 16 MiB past a 4 KiB buffer).
+# ============================================================================
+
+# Overwrite the ClientHello handshake length (bytes 6..8 of the record).
+fn set_hs_length(rec: *u8, length: i64)
+    rec[6] = ((length >> 16) & 0xff) as u8
+    rec[7] = ((length >> 8) & 0xff) as u8
+    rec[8] = (length & 0xff) as u8
+
+# These tests return their verdict: ritzunit's assert_* only print and return
+# 1, so a discarded assert in a void test can never fail it.
+
+# Feed `rec` to a fresh server; return the process result and the error code.
+fn run_client_hello(rec: *u8, rec_len: i64, err: *i32) -> i32
+    var cfg: TlsServerConfig
+    tls_server_config_init(@cfg)
+    var server: TlsServer
+    tls_server_init(@server, @cfg)
+    var out: [4096]u8
+    var out_len: i64 = 0
+    let result: i32 = tls_server_process(@server, rec, rec_len, @out[0], 4096, @out_len)
+    *err = tls_server_error(@server)
+    tls_server_free(@server)
+    return result
+
+[[test]]
+fn test_tls_server_rejects_handshake_length_past_record() -> i32
+    var rec: [512]u8
+    let rec_len: i64 = build_test_client_hello(@rec[0])
+    # Claim one byte more than the record carries after the 4-byte header.
+    set_hs_length(@rec[0], rec_len - 9 + 1)
+    var err: i32 = 0
+    if run_client_hello(@rec[0], rec_len, @err) != TLS_RESULT_ERROR
+        return 1
+    if err != TLS_ERR_PARSE_ERROR
+        return 2
+    return 0
+
+[[test]]
+fn test_tls_server_rejects_max_handshake_length() -> i32
+    var rec: [512]u8
+    let rec_len: i64 = build_test_client_hello(@rec[0])
+    set_hs_length(@rec[0], 0xffffff)
+    var err: i32 = 0
+    if run_client_hello(@rec[0], rec_len, @err) != TLS_RESULT_ERROR
+        return 1
+    if err != TLS_ERR_PARSE_ERROR
+        return 2
+    return 0
+
+[[test]]
+fn test_tls_server_accepts_exact_handshake_length() -> i32
+    # Control: length == record body - 4 parses, so the bound is not off by
+    # one. With no certificate configured the server then stops at building
+    # its flight, i.e. strictly after the ClientHello was accepted.
+    var rec: [512]u8
+    let rec_len: i64 = build_test_client_hello(@rec[0])
+    set_hs_length(@rec[0], rec_len - 9)
+    var err: i32 = 0
+    if run_client_hello(@rec[0], rec_len, @err) != TLS_RESULT_ERROR
+        return 1
+    if err != TLS_ERR_NO_CERTIFICATE
+        return 2
+    return 0

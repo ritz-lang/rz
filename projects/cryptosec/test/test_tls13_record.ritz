@@ -476,3 +476,111 @@ fn test_tls_record_state_encrypt_decrypt() -> i32
     if mem_eq(@decrypted[0], @plaintext[0], 8) != 1
         return 4
     0
+
+# ============================================================================
+# Wire-length bounds (#1861)
+#
+# The record header's 16-bit length is attacker-controlled. Decryption must
+# never write more plaintext than its scratch buffer holds, and must reject
+# records longer than RFC 8446 §5.2 allows (2^14 + 256) before decrypting.
+# ============================================================================
+
+# Fill `n` bytes of `buf` with a recognisable non-zero pattern.
+fn fill_pattern(buf: *u8, n: i32)
+    var i: i32 = 0
+    while i < n
+        buf[i] = ((i % 251) + 1) as u8
+        i += 1
+
+[[test]]
+fn test_tls13_record_decrypt_large_authentic_record() -> i32
+    # An authentic 8000-byte record: well inside the RFC limit, far bigger than
+    # the old 1024-byte decrypt scratch buffer (which it used to overrun).
+    var key: [16]u8
+    var iv: [12]u8
+    fill_from_hex(@key[0], "dbfaa693d1762c5b666af5d950258d01", 16)
+    fill_from_hex(@iv[0], "5bd3c71b836e0b76bb73265f", 12)
+
+    var plaintext: [8000]u8
+    fill_pattern(@plaintext[0], 8000)
+
+    var record: [8100]u8
+    let record_len: i32 = tls13_record_encrypt(@key[0], 16, @iv[0], 0, @plaintext[0], 8000, TLS_CONTENT_APPLICATION, @record[0], 8100)
+    if record_len != 8000 + 1 + 16 + 5
+        return 1
+
+    var decrypted: [8000]u8
+    var ct: u8 = 0
+    let dec_len: i32 = tls13_record_decrypt(@key[0], 16, @iv[0], 0, @record[0], record_len, @decrypted[0], 8000, @ct)
+    if dec_len != 8000
+        return 2
+    if ct != TLS_CONTENT_APPLICATION
+        return 3
+    if mem_eq(@decrypted[0], @plaintext[0], 8000) != 1
+        return 4
+    0
+
+# Build a header-only-valid record whose ciphertext length is `ct_len`.
+fn build_junk_record(rec: *u8, ct_len: i32)
+    rec[0] = TLS_CONTENT_APPLICATION
+    rec[1] = 0x03
+    rec[2] = 0x03
+    rec[3] = ((ct_len >> 8) & 0xff) as u8
+    rec[4] = (ct_len & 0xff) as u8
+    fill_pattern(@rec[5], ct_len)
+
+[[test]]
+fn test_tls13_record_decrypt_rejects_oversized_record() -> i32
+    # ciphertext_len one past 2^14 + 256 is a record_overflow: rejected before
+    # any decryption, with its own error code (not the AEAD failure, -7).
+    var key: [16]u8
+    var iv: [12]u8
+    fill_from_hex(@key[0], "dbfaa693d1762c5b666af5d950258d01", 16)
+    fill_from_hex(@iv[0], "5bd3c71b836e0b76bb73265f", 12)
+
+    var record: [16700]u8
+    build_junk_record(@record[0], TLS_MAX_CIPHERTEXT_LEN + 1)
+
+    var out: [64]u8
+    var ct: u8 = 0
+    let r: i32 = tls13_record_decrypt(@key[0], 16, @iv[0], 0, @record[0], 5 + TLS_MAX_CIPHERTEXT_LEN + 1, @out[0], 64, @ct)
+    if r != TLS_RECORD_ERR_OVERFLOW
+        return 1
+    0
+
+[[test]]
+fn test_tls13_record_decrypt_rejects_max_u16_record() -> i32
+    # The largest length the 16-bit header can express.
+    var key: [16]u8
+    var iv: [12]u8
+    fill_from_hex(@key[0], "dbfaa693d1762c5b666af5d950258d01", 16)
+    fill_from_hex(@iv[0], "5bd3c71b836e0b76bb73265f", 12)
+
+    var record: [65540]u8
+    build_junk_record(@record[0], 65535)
+
+    var out: [64]u8
+    var ct: u8 = 0
+    let r: i32 = tls13_record_decrypt(@key[0], 16, @iv[0], 0, @record[0], 5 + 65535, @out[0], 64, @ct)
+    if r != TLS_RECORD_ERR_OVERFLOW
+        return 1
+    0
+
+[[test]]
+fn test_tls13_record_decrypt_max_size_record_reaches_aead() -> i32
+    # Exactly 2^14 + 256 is legal: the bound must not reject it. Junk bytes
+    # fail authentication (-7) instead of tripping the overflow check.
+    var key: [16]u8
+    var iv: [12]u8
+    fill_from_hex(@key[0], "dbfaa693d1762c5b666af5d950258d01", 16)
+    fill_from_hex(@iv[0], "5bd3c71b836e0b76bb73265f", 12)
+
+    var record: [16700]u8
+    build_junk_record(@record[0], TLS_MAX_CIPHERTEXT_LEN)
+
+    var out: [64]u8
+    var ct: u8 = 0
+    let r: i32 = tls13_record_decrypt(@key[0], 16, @iv[0], 0, @record[0], 5 + TLS_MAX_CIPHERTEXT_LEN, @out[0], 64, @ct)
+    if r != -7
+        return 1
+    0
