@@ -57,7 +57,7 @@ RITZ1_SRC = RITZ_ROOT / "ritz1" / "src"
 # The lexer and everything it transitively imports. ritz0 compiles one module
 # at a time, so each is compiled and linked explicitly.
 LOCAL_MODULES = ["tokens_gen", "nfa", "regex", "lexer_nfa", "lexer_setup_gen"]
-RITZLIB_MODULES = ["memory", "strview", "sys", "str"]
+RITZLIB_MODULES = ["memory", "strview", "sys", "str", "fmt"]  # str imports fmt (itoa)
 
 PROBE_HEAD = """\
 import tokens_gen

@@ -30,7 +30,7 @@ RITZ1_SH = str(RITZ_ROOT / "ritz1/build/ritz1_selfhosted")
 # to link, a minority of the modules on disk; ritzlib_coverage_line() prints
 # the real denominator on every run. Widening it is separate work.
 RITZLIB_DIR = RITZ_ROOT / "ritzlib"
-RITZLIB_MODULES = ["sys", "io", "str", "strview", "string", "hash", "memory",
+RITZLIB_MODULES = ["sys", "io", "str", "fmt", "strview", "string", "hash", "memory",
                    "gvec", "drop", "option", "result", "hashmap",
                    "span"]
 

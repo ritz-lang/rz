@@ -51,6 +51,7 @@ Ritzlib is built on three core principles:
    - [span](#span) - Non-owning memory views
 4. [String Utilities](#string-utilities)
    - [str](#str) - C-style string operations
+   - [fmt](#fmt) - Integer-to-text digit routines
    - [buf](#buf) - Buffer and parsing utilities
 5. [System Interface](#system-interface)
    - [sys](#sys) - Raw syscall wrappers
@@ -691,6 +692,32 @@ the compiler emits calls to those symbols.
 
 ---
 
+### fmt
+
+**Module**: `ritzlib.fmt`
+
+The one integer digit routine. Every ritzlib integer formatter (`print_int`,
+`eprint_int`, `print_hex`, `itoa`, `string_push_i64`, `string_from_hex`,
+`iovec_append_int`/`_uint`) calls it, so all of them handle i64's minimum
+(AGAST #1856). Each writes into a caller buffer, returns the byte count, and
+writes no NUL. It has no imports, so freestanding code can use it too.
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `fmt_i64_into` | `fn(buf: *u8, n: i64) -> i64` | Decimal with `-` when negative; needs 20 bytes |
+| `fmt_u64_into` | `fn(buf: *u8, n: u64) -> i64` | Unsigned decimal; needs 20 bytes |
+| `fmt_u64_hex_into` | `fn(buf: *u8, n: u64) -> i64` | Lowercase hex, no `0x`, no leading zeros; needs 16 bytes |
+
+```ritz
+import ritzlib.fmt
+
+fn fmt_example() -> i64
+    var buf: [20]u8
+    fmt_i64_into(@buf[0], -9223372036854775807 - 1)  # "-9223372036854775808", returns 20
+```
+
+---
+
 ### buf
 
 **Module**: `ritzlib.buf`
@@ -1055,7 +1082,7 @@ High-level console I/O functions.
 | `println_cstr` | `fn(s: *u8)` | C interop: print a C string with newline. Prefer `println` |
 | `print_char` | `fn(c: u8)` | Print character |
 | `print_int` | `fn(n: i64)` | Print integer |
-| `print_hex` | `fn(n: i64)` | Print hex with 0x prefix |
+| `print_hex` | `fn(n: i64)` | Print hex with 0x prefix (a negative prints its two's-complement bits) |
 | `print_size_human` | `fn(size: i64)` | Print human-readable size (K/M/G/T) |
 | `newline` | `fn()` | Print newline |
 
