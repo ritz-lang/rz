@@ -27,6 +27,12 @@ compiled in test mode, linked with ritzunit as `main` (LANGUAGE_SPEC.md
 §17.1). ritzunit forks a child per `[[test]]` function, so a SIGSEGV in one
 test does not stop the others. Exit 0 = pass, anything else = fail.
 
+A test binary run by hand takes `-j N` to run up to N of its tests at once.
+Each child gets its own output capture, and results are reported in table
+order whatever order the children finish in. The harness does not pass `-j`.
+`rz test --all -j` already runs files in parallel (#1809), and a second level
+of parallelism inside each binary would oversubscribe the CPUs.
+
 ### ritzunit
 
 Lives at `projects/ritzunit/`; `./rz test ritzunit` runs its own tests. The

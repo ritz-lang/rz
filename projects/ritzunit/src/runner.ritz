@@ -20,6 +20,8 @@
 #   -f, --filter     Filter tests by name substring
 #   -l, --list       List tests without running them
 #   -t, --timeout    Timeout per test in milliseconds (default: 5000)
+#   -j, --jobs N     Run up to N tests at once (default: 1); reported in order
+#   --json           JSON report (no short form: -j is --jobs, as in make/rz)
 #   --no-fork        Disable fork isolation (run tests in main process)
 #   -h, --help       Show help message
 
@@ -91,6 +93,7 @@ var g_seed: i64 = 0          # --seed: random seed (0 = auto from time)
 var g_json: i32 = 0          # --json: output in JSON format
 var g_junit: i32 = 0         # --junit: output in JUnit XML format
 var g_color: i32 = 0         # 0=auto, 1=always, -1=never
+var g_jobs: i64 = 1          # -j: tests run at once (forked children)
 
 # ============================================================================
 # Timing
@@ -154,28 +157,27 @@ pub fn test_exit_status(ret: i32) -> i32
         return 1
     return ret
 
-# The capture file every child writes its stdout and stderr to. One memfd,
-# emptied before each test; -1 if it could not be created (output then goes
-# to the runner's own stdout/stderr, as before).
-var g_capture_fd: i32 = -1
-
-fn capture_open()
+# The capture file a child writes its stdout and stderr to: a memfd, one per
+# pool slot, emptied before each test. -1 if it could not be created (output
+# then goes to the runner's own stdout/stderr).
+fn capture_open() -> i32
     let fd: i64 = syscall2(SYS_MEMFD_CREATE, c"ritzunit-capture" as i64, MFD_CLOEXEC)
-    if fd >= 0
-        g_capture_fd = fd as i32
+    if fd < 0
+        return -1
+    return fd as i32
 
-fn capture_reset()
-    if g_capture_fd < 0
+fn capture_reset(fd: i32)
+    if fd < 0
         return
-    syscall2(SYS_FTRUNCATE, g_capture_fd as i64, 0)
-    sys_lseek(g_capture_fd, 0, SEEK_SET)
+    syscall2(SYS_FTRUNCATE, fd as i64, 0)
+    sys_lseek(fd, 0, SEEK_SET)
 
-# The last CAPTURE_KEEP bytes the child wrote, in a fresh allocation.
-fn capture_take() -> StrView
+# The last CAPTURE_KEEP bytes a child wrote to `fd`, in a fresh allocation.
+fn capture_take(fd: i32) -> StrView
     var out: StrView = strview_empty()
-    if g_capture_fd < 0
+    if fd < 0
         return out
-    let size: i64 = sys_lseek(g_capture_fd, 0, SEEK_END)
+    let size: i64 = sys_lseek(fd, 0, SEEK_END)
     if size <= 0
         return out
     var start: i64 = 0
@@ -185,10 +187,10 @@ fn capture_take() -> StrView
     let buf: *u8 = malloc(want + 1)
     if buf == null
         return out
-    sys_lseek(g_capture_fd, start, SEEK_SET)
+    sys_lseek(fd, start, SEEK_SET)
     var got: i64 = 0
     while got < want
-        let n: i64 = sys_read(g_capture_fd, buf + got, want - got)
+        let n: i64 = sys_read(fd, buf + got, want - got)
         if n <= 0
             break
         got += n
@@ -202,84 +204,159 @@ fn run_test_direct(test: *RitzTest) -> i32
     let run: fn() -> i32 = test.run
     return run()
 
-# Run one test in a forked child, which exits with the test's result.
-# The parent waits with a timeout and interprets the status.
-fn run_test_forked(test: *RitzTest, result: *TestRunResult) -> i32
-    capture_reset()
-    let pid: i32 = sys_fork()
-
-    if pid < 0
+# What a reaped child's wait status means.
+fn result_from_status(status: i32, result: *TestRunResult)
+    result.exit_code = 0
+    result.signal = 0
+    if WIFEXITED(status) != 0
+        result.exit_code = WEXITSTATUS(status)
+        if result.exit_code == 0
+            result.status = TEST_RESULT_PASS
+        else
+            result.status = TEST_RESULT_FAIL
+    else if WIFSIGNALED(status) != 0
+        result.status = TEST_RESULT_SIGNAL
+        result.signal = WTERMSIG(status)
+    else
         result.status = TEST_RESULT_FAIL
         result.exit_code = -1
-        result.signal = 0
-        return -1
+
+# ============================================================================
+# The pool: up to g_jobs forked children at once (-j N, AGAST #1909)
+# ============================================================================
+#
+# The runner blocks SIGCHLD and sleeps in rt_sigtimedwait until a child exits
+# or the earliest live deadline passes: no busy poll, and one long test cannot
+# delay another's timeout. Every child gets its own capture memfd. Results are
+# reported in run order (table order, or the --shuffle order), never finish
+# order, so the report does not depend on scheduling; with --fail-fast it is
+# exactly what -j 1 reports.
+
+const SYS_RT_SIGTIMEDWAIT: i64 = 128
+
+# One live child.
+struct PoolSlot
+    pid: i32             # 0: slot free
+    pos: i64             # the test's index in the run list
+    start_ms: i64
+    deadline_ms: i64
+    killed: i32          # 1 once SIGKILLed for passing its deadline
+    capture_fd: i32
+
+# One test's outcome, held until every test before it has been reported.
+struct Outcome
+    done: i32
+    result: TestRunResult
+    elapsed: i64
+    output: StrView      # captured output, only for a test that did not pass
+
+fn sigchld_mask() -> i64
+    return (1 as i64) << ((SIGCHLD - 1) as i64)
+
+fn outcome_fail_to_start(out: *Outcome)
+    out.done = 1
+    out.result.status = TEST_RESULT_FAIL
+    out.result.exit_code = -1
+    out.result.signal = 0
+    out.elapsed = 0
+    out.output = strview_empty()
+
+# Fork the test at run-list position `pos` into `slot`. A failed fork records
+# the test as failed at once.
+fn pool_launch(slot: *PoolSlot, test: *RitzTest, pos: i64, out: *Outcome, old_mask: *i64) -> i32
+    capture_reset(slot.capture_fd)
+    let pid: i32 = sys_fork()
+    if pid < 0
+        outcome_fail_to_start(out)
+        return 0
 
     if pid == 0
-        # === Child process ===
-        if g_capture_fd >= 0
-            sys_dup2(g_capture_fd, 1)
-            sys_dup2(g_capture_fd, 2)
+        # === Child: the test sees the signal mask the runner started with ===
+        sys_rt_sigprocmask(SIG_SETMASK, old_mask, null, 8)
+        if slot.capture_fd >= 0
+            sys_dup2(slot.capture_fd, 1)
+            sys_dup2(slot.capture_fd, 2)
         let run: fn() -> i32 = test.run
         sys_exit(test_exit_status(run()))
         return 0
 
-    # === Parent process ===
-    let start_ms: i64 = get_time_ms()
-    var status: i32 = 0
+    slot.pid = pid
+    slot.pos = pos
+    slot.start_ms = get_time_ms()
+    slot.deadline_ms = slot.start_ms + g_timeout_ms
+    slot.killed = 0
+    return 1
 
-    loop
-        let wait_result: i32 = sys_wait4(pid, @status, WNOHANG, null)
-
-        if wait_result > 0
-            if WIFEXITED(status) != 0
-                let exit_code: i32 = WEXITSTATUS(status)
-                if exit_code == 0
-                    result.status = TEST_RESULT_PASS
-                else
-                    result.status = TEST_RESULT_FAIL
-                result.exit_code = exit_code
-                result.signal = 0
-                return 0
-            else if WIFSIGNALED(status) != 0
-                result.status = TEST_RESULT_SIGNAL
-                result.exit_code = 0
-                result.signal = WTERMSIG(status)
-                return 0
-
-        if wait_result < 0
-            result.status = TEST_RESULT_FAIL
-            result.exit_code = -1
-            result.signal = 0
-            return -1
-
-        let elapsed: i64 = get_time_ms() - start_ms
-        if elapsed >= g_timeout_ms
-            sys_kill(pid, SIGKILL)
-            sys_wait4(pid, @status, 0, null)
-            result.status = TEST_RESULT_TIMEOUT
-            result.exit_code = 0
-            result.signal = 0
-            return 0
-
-        # Sleep 1ms before polling again
-        var req: [2]i64
-        req[0] = 0
-        req[1] = 1000000
-        sys_nanosleep(@req[0], null)
-
-    return 0
-
-fn run_test_with_result(test: *RitzTest, result: *TestRunResult)
-    if g_no_fork != 0
-        let ret: i32 = test_exit_status(run_test_direct(test))
-        if ret == 0
-            result.status = TEST_RESULT_PASS
-        else
-            result.status = TEST_RESULT_FAIL
-        result.exit_code = ret
-        result.signal = 0
+# Record a reaped child's outcome and free its slot.
+fn pool_record(slot: *PoolSlot, status: i32, outcomes: *Outcome)
+    let out: *Outcome = @outcomes[slot.pos]
+    out.elapsed = get_time_ms() - slot.start_ms
+    if slot.killed != 0
+        out.result.status = TEST_RESULT_TIMEOUT
+        out.result.exit_code = 0
+        out.result.signal = 0
     else
-        run_test_forked(test, result)
+        result_from_status(status, @out.result)
+    out.output = strview_empty()
+    if out.result.status != TEST_RESULT_PASS
+        out.output = capture_take(slot.capture_fd)
+    out.done = 1
+    slot.pid = 0
+
+# Reap every child that has exited; the number reaped.
+fn pool_reap(slots: *PoolSlot, nslots: i64, outcomes: *Outcome) -> i32
+    var reaped: i32 = 0
+    loop
+        var status: i32 = 0
+        let pid: i32 = sys_wait4(-1, @status, WNOHANG, null)
+        if pid <= 0
+            return reaped
+        for i in 0..nslots
+            let slot: *PoolSlot = @slots[i]
+            if slot.pid == pid
+                pool_record(slot, status, outcomes)
+                reaped += 1
+                break
+    return reaped
+
+# Block until at least one child is reaped. Children past their deadline are
+# killed (and reaped once they are gone); the wait ends no later than the
+# earliest deadline still pending.
+fn pool_wait(slots: *PoolSlot, nslots: i64, outcomes: *Outcome)
+    let mask: i64 = sigchld_mask()
+    loop
+        if pool_reap(slots, nslots, outcomes) > 0
+            return
+        let now: i64 = get_time_ms()
+        var earliest: i64 = -1
+        for i in 0..nslots
+            let slot: *PoolSlot = @slots[i]
+            if slot.pid != 0 && slot.killed == 0
+                if slot.deadline_ms <= now
+                    sys_kill(slot.pid, SIGKILL)
+                    slot.killed = 1
+                else if earliest < 0 || slot.deadline_ms < earliest
+                    earliest = slot.deadline_ms
+        # SIGCHLD is blocked, so a child that exited since pool_reap is a
+        # pending signal and this returns at once.
+        if earliest < 0
+            syscall4(SYS_RT_SIGTIMEDWAIT, @mask as i64, 0, 0, 8)
+        else
+            var ts: [2]i64
+            let wait_ms: i64 = earliest - now
+            ts[0] = wait_ms / 1000
+            ts[1] = (wait_ms % 1000) * 1000000
+            syscall4(SYS_RT_SIGTIMEDWAIT, @mask as i64, 0, @ts[0] as i64, 8)
+
+# Kill and reap every live child (--fail-fast stopped the run).
+fn pool_abandon(slots: *PoolSlot, nslots: i64)
+    for i in 0..nslots
+        let slot: *PoolSlot = @slots[i]
+        if slot.pid != 0
+            sys_kill(slot.pid, SIGKILL)
+            var status: i32 = 0
+            sys_wait4(slot.pid, @status, 0, null)
+            slot.pid = 0
 
 # ============================================================================
 # Reporter Integration
@@ -321,6 +398,103 @@ fn print_captured(output: @StrView)
     sys_write(1, output.ptr, output.len)
     if output.ptr[output.len - 1] != 10
         prints("\n")
+
+# Report one test's outcome; 1 if it did not pass.
+fn report_outcome(test: *RitzTest, out: *Outcome, summary: *TestSummary) -> i32
+    var name: StrView = test.name
+    let elapsed: i64 = out.elapsed
+    if out.result.status == TEST_RESULT_PASS
+        if g_json != 0
+            json_record_pass(@name, elapsed)
+        else if g_junit != 0
+            junit_record_pass(@name, elapsed)
+        else if g_quiet == 0
+            print_test_pass(name, elapsed)
+        summary_record(summary, TEST_PASS, elapsed)
+        return 0
+
+    var output: StrView = out.output
+    if out.result.status == TEST_RESULT_SIGNAL
+        var sig_name: StrView = signal_name(out.result.signal)
+        if g_json != 0
+            json_record_crash(@name, elapsed, out.result.signal, @output)
+        else if g_junit != 0
+            junit_record_crash(@name, elapsed, out.result.signal, @sig_name)
+        else
+            print_test_crash(name, elapsed, out.result.signal, sig_name)
+            print_captured(@output)
+        summary_record(summary, TEST_CRASH, elapsed)
+    else if out.result.status == TEST_RESULT_TIMEOUT
+        if g_json != 0
+            json_record_timeout(@name, elapsed, @output)
+        else if g_junit != 0
+            junit_record_timeout(@name, elapsed)
+        else
+            print_test_timeout(name, g_timeout_ms)
+            print_captured(@output)
+        summary_record(summary, TEST_TIMEOUT, elapsed)
+    else
+        if g_json != 0
+            json_record_fail(@name, elapsed, out.result.exit_code, @output)
+        else if g_junit != 0
+            junit_record_fail(@name, elapsed, out.result.exit_code)
+        else
+            print_test_fail(name, elapsed, out.result.exit_code)
+            print_captured(@output)
+        summary_record(summary, TEST_FAIL, elapsed)
+    return 1
+
+# Run the run list in a pool of up to g_jobs children, reporting in run order.
+fn run_pool(tests: *RitzTest, run: *i64, nrun: i64, outcomes: *Outcome, summary: *TestSummary)
+    var nslots: i64 = g_jobs
+    if nslots > nrun
+        nslots = nrun
+    if nslots <= 0
+        return
+    var slots: *PoolSlot = malloc(nslots * sizeof(PoolSlot)) as *PoolSlot
+    if slots == null
+        eprints("ritzunit: out of memory\n")
+        return
+    for i in 0..nslots
+        slots[i].pid = 0
+        slots[i].capture_fd = capture_open()
+
+    var mask: i64 = sigchld_mask()
+    var old_mask: i64 = 0
+    sys_rt_sigprocmask(SIG_BLOCK, @mask, @old_mask, 8)
+
+    var next: i64 = 0       # next position to launch
+    var reported: i64 = 0   # next position to report
+    var live: i64 = 0
+    while reported < nrun
+        # Fill free slots.
+        for i in 0..nslots
+            if next < nrun && slots[i].pid == 0
+                if pool_launch(@slots[i], @tests[run[next]], next, @outcomes[next], @old_mask) != 0
+                    live += 1
+                next += 1
+        # Report whatever is finished, in order.
+        var stop: i32 = 0
+        while reported < next && outcomes[reported].done != 0
+            let failed: i32 = report_outcome(@tests[run[reported]], @outcomes[reported], summary)
+            reported += 1
+            if failed != 0 && g_fail_fast != 0
+                stop = 1
+                break
+        if stop != 0
+            pool_abandon(slots, nslots)
+            break
+        if reported < nrun && live > 0
+            pool_wait(slots, nslots, outcomes)
+            live = 0
+            for i in 0..nslots
+                if slots[i].pid != 0
+                    live += 1
+
+    sys_rt_sigprocmask(SIG_SETMASK, @old_mask, null, 8)
+    for i in 0..nslots
+        if slots[i].capture_fd >= 0
+            sys_close(slots[i].capture_fd)
 
 # ============================================================================
 # Main Test Runner
@@ -370,69 +544,41 @@ pub fn run_tests() -> i32
     if g_quiet == 0
         print_suite_header(strview_from_cstr(c"tests"))
 
-    if g_no_fork == 0
-        capture_open()
+    # The run list: the selected tests, in run order.
+    var run: *i64 = malloc(count * 8) as *i64
+    var outcomes: *Outcome = malloc(count * sizeof(Outcome)) as *Outcome
+    if run == null || outcomes == null
+        eprints("ritzunit: out of memory\n")
+        return 1
+    var nrun: i64 = 0
+    var skipped_by_filter: i32 = 0
+    for i in 0..count
+        if matches_filter(tests[order[i]].name.ptr) == 0
+            skipped_by_filter += 1
+        else
+            run[nrun] = order[i]
+            outcomes[nrun].done = 0
+            nrun += 1
 
     var summary: TestSummary = summary_new()
-    var skipped_by_filter: i32 = 0
     let total_start: i64 = get_time_ms()
 
-    for i in 0..count
-        let test: *RitzTest = @tests[order[i]]
-        var name: StrView = test.name
-
-        if matches_filter(name.ptr) == 0
-            skipped_by_filter += 1
-            continue
-
-        let start: i64 = get_time_ms()
-        var result: TestRunResult
-        run_test_with_result(test, @result)
-        let elapsed: i64 = get_time_ms() - start
-
-        var failed_this_test: i32 = 0
-        if result.status == TEST_RESULT_PASS
-            if g_json != 0
-                json_record_pass(@name, elapsed)
-            else if g_junit != 0
-                junit_record_pass(@name, elapsed)
-            else if g_quiet == 0
-                print_test_pass(name, elapsed)
-            summary_record(@summary, TEST_PASS, elapsed)
-        else
-            var output: StrView = capture_take()
-            failed_this_test = 1
-            if result.status == TEST_RESULT_SIGNAL
-                var sig_name: StrView = signal_name(result.signal)
-                if g_json != 0
-                    json_record_crash(@name, elapsed, result.signal, @output)
-                else if g_junit != 0
-                    junit_record_crash(@name, elapsed, result.signal, @sig_name)
-                else
-                    print_test_crash(name, elapsed, result.signal, sig_name)
-                    print_captured(@output)
-                summary_record(@summary, TEST_CRASH, elapsed)
-            else if result.status == TEST_RESULT_TIMEOUT
-                if g_json != 0
-                    json_record_timeout(@name, elapsed, @output)
-                else if g_junit != 0
-                    junit_record_timeout(@name, elapsed)
-                else
-                    print_test_timeout(name, g_timeout_ms)
-                    print_captured(@output)
-                summary_record(@summary, TEST_TIMEOUT, elapsed)
-            else
-                if g_json != 0
-                    json_record_fail(@name, elapsed, result.exit_code, @output)
-                else if g_junit != 0
-                    junit_record_fail(@name, elapsed, result.exit_code)
-                else
-                    print_test_fail(name, elapsed, result.exit_code)
-                    print_captured(@output)
-                summary_record(@summary, TEST_FAIL, elapsed)
-
-        if g_fail_fast != 0 && failed_this_test != 0
-            break
+    if g_no_fork != 0
+        for k in 0..nrun
+            let out: *Outcome = @outcomes[k]
+            let start: i64 = get_time_ms()
+            let ret: i32 = test_exit_status(run_test_direct(@tests[run[k]]))
+            out.elapsed = get_time_ms() - start
+            out.result.exit_code = ret
+            out.result.signal = 0
+            out.result.status = TEST_RESULT_PASS
+            if ret != 0
+                out.result.status = TEST_RESULT_FAIL
+            out.output = strview_empty()
+            if report_outcome(@tests[run[k]], out, @summary) != 0 && g_fail_fast != 0
+                break
+    else
+        run_pool(tests, run, nrun, outcomes, @summary)
 
     summary.duration_ms = get_time_ms() - total_start
 
@@ -474,7 +620,8 @@ fn parse_args(argc: i32, argv: **u8) -> i32
     args_flag(@parser, 'x', c"fail-fast", c"Stop on first test failure")
     args_flag(@parser, 's', c"shuffle", c"Randomize test execution order")
     args_option(@parser, 0, c"seed", c"N", c"Random seed for shuffling (0 = auto)", c"0")
-    args_flag(@parser, 'j', c"json", c"Output results in JSON format")
+    args_option(@parser, 'j', c"jobs", c"N", c"Run up to N tests at once, each in its own child", c"1")
+    args_flag(@parser, 0, c"json", c"Output results in JSON format")
     args_flag(@parser, 0, c"junit", c"Output results in JUnit XML format")
     args_flag(@parser, 0, c"color", c"Force colored output (even when not a TTY)")
     args_flag(@parser, 0, c"no-color", c"Disable colored output")
@@ -495,7 +642,11 @@ fn parse_args(argc: i32, argv: **u8) -> i32
     g_fail_fast = args_get_flag(@parser, 'x')
     g_shuffle = args_get_flag(@parser, 's')
     g_seed = args_get_int_long(@parser, c"seed")
-    g_json = args_get_flag(@parser, 'j')
+    g_json = args_get_flag_long(@parser, c"json")
+    g_jobs = args_get_int(@parser, 'j')
+    if g_jobs < 1
+        eprints("ritzunit: --jobs must be at least 1\n")
+        return -1
     g_junit = args_get_flag_long(@parser, c"junit")
 
     let force_color: i32 = args_get_flag_long(@parser, c"color")

@@ -18,6 +18,7 @@ The framework handles ASLR and PIE (position-independent executables) correctly 
 - Each test's stdout/stderr captured; shown (and put in `--json`) only for tests that did not pass
 - Exit status 0 iff every selected test passed, else 1
 - Fork-based process isolation - crashes don't abort the test run
+- `-j N`: up to N tests at once, each in its own child with its own capture; reported in run order, so the report does not depend on scheduling
 - Glob pattern and boolean expression filtering
 - Attribute-based test tagging via naming conventions (`@slow`, `@ignore`, `@fast`)
 - JSON output for tooling integration
@@ -90,10 +91,11 @@ Options:
   -f, --filter=EXPR    Filter tests by EXPR (glob, @attr, bool)
   -t, --timeout=MS     Timeout per test in milliseconds (default: 5000)
       --no-fork        Disable fork isolation (run tests in main process)
+  -j, --jobs=N         Run up to N tests at once, each in its own child (default: 1)
   -x, --fail-fast      Stop on first test failure
   -s, --shuffle        Randomize test execution order
       --seed=N         Random seed for shuffling (0 = auto)
-  -j, --json           Output results in JSON format
+      --json           Output results in JSON format (no short form: -j is --jobs)
       --junit          Output results in JUnit XML format
       --color          Force colored output (even when not a TTY)
       --no-color       Disable colored output

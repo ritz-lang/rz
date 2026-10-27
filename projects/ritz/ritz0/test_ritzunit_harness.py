@@ -29,6 +29,23 @@ import test_runner  # noqa: E402
 # Every test builds and runs a binary.
 pytestmark = pytest.mark.integration
 
+# AGAST #1909: every test below runs both sequentially and under `-j 4`, so
+# crash, timeout and output attribution are pinned for the pool too. This is
+# the `-j` value `_run` and test_runner add to every run (None: no `-j`).
+_jobs = None
+
+
+@pytest.fixture(params=[None, 4], ids=["seq", "j4"], autouse=True)
+def jobs(request, monkeypatch):
+    global _jobs
+    _jobs = request.param
+    if request.param is not None:
+        base = test_runner.runner_args
+        monkeypatch.setattr(test_runner, "runner_args",
+                            lambda: base() + ["-j", str(request.param)])
+    yield request.param
+    _jobs = None
+
 
 @pytest.fixture
 def package(tmp_path, monkeypatch):
@@ -65,7 +82,8 @@ def _binary(test_file: Path, tmp_path: Path) -> str:
 
 
 def _run(exe: str, *args: str) -> subprocess.CompletedProcess:
-    return subprocess.run([exe, *args], capture_output=True, timeout=120)
+    extra = ["-j", str(_jobs)] if _jobs is not None else []
+    return subprocess.run([exe, *args, *extra], capture_output=True, timeout=120)
 
 
 def test_attribute_not_name_prefix_decides_what_runs(package, tmp_path):
