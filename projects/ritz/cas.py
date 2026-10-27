@@ -48,8 +48,11 @@ with that trim.
 
 Stats: `RITZ_CAS_STATS=1` prints hits/misses/bytes for the process to stderr
 at exit. `RITZ_CAS_STATS_LOG=<file>` appends one JSON line per process with
-the same counts plus the identity of every miss; `python3 cas.py summary
-<file>` aggregates a whole gate and lists any key compiled more than once.
+the same counts plus the identity of every miss and every failed build;
+`python3 cas.py summary <file>` aggregates a whole gate and lists any key
+compiled more than once. A build that fails (`get_or_build`'s build_fn
+raises) stores nothing and is counted as `failed`, not as a miss: a module
+that does not compile fails on every run, and is not a cache defect.
 """
 
 from __future__ import annotations
@@ -217,22 +220,28 @@ class Stats:
         self.misses = 0
         self.bytes_written = 0
         self.missed: List[List[str]] = []  # [key, ext, identity, store root]
+        # Builds whose build_fn raised: nothing stored, so not a miss (a miss
+        # is a compile whose result the next run hits). A module that does
+        # not compile fails on every run; on an unchanged tree these are the
+        # only "misses" a warm run used to report (AGAST #1896).
+        self.failed: List[List[str]] = []  # [key, ext, identity, store root]
 
     def as_dict(self) -> dict:
         return {"pid": os.getpid(), "argv0": Path(sys.argv[0]).name if sys.argv else "",
                 "hits": self.hits, "misses": self.misses,
-                "bytes_written": self.bytes_written, "missed": self.missed}
+                "bytes_written": self.bytes_written, "missed": self.missed,
+                "failed": self.failed}
 
 
 STATS = Stats()
 
 
 def _report_stats() -> None:
-    if STATS.hits == 0 and STATS.misses == 0:
+    if STATS.hits == 0 and STATS.misses == 0 and not STATS.failed:
         return
     if os.environ.get(STATS_ENV, "") not in ("", "0"):
         print(f"[ritz-cas] {Path(sys.argv[0]).name if sys.argv else '?'}: "
-              f"hits={STATS.hits} misses={STATS.misses} "
+              f"hits={STATS.hits} misses={STATS.misses} failed={len(STATS.failed)} "
               f"bytes_written={STATS.bytes_written}", file=sys.stderr)
     log = os.environ.get(STATS_LOG_ENV)
     if log:
@@ -354,8 +363,12 @@ class ArtifactStore:
                 if p.is_file():
                     # Somebody built it while we waited for the lock.
                     return self._hit(p), False
+                try:
+                    files = build_fn()
+                except BaseException:
+                    STATS.failed.append([key, ext, identity, str(self.root)])
+                    raise
                 STATS.misses += 1
-                files = build_fn()
                 if ext not in files:
                     raise ValueError(f"build_fn for {key[:12]} produced {sorted(files)}, not {ext!r}")
                 for e in files:
@@ -428,6 +441,7 @@ def summarise(log: Path) -> dict:
     """Aggregate a RITZ_CAS_STATS_LOG over a whole gate."""
     hits = misses = written = procs = 0
     seen: Dict[tuple, List[str]] = {}
+    failed: Dict[str, str] = {}
     for line in Path(log).read_text().splitlines():
         try:
             rec = json.loads(line)
@@ -440,13 +454,27 @@ def summarise(log: Path) -> dict:
         for key, ext, ident, *root in rec.get("missed", []):
             # Records from before AGAST #1911 carry no store root.
             seen.setdefault((key, ext, root[0] if root else ""), []).append(ident)
+        for key, ext, ident, *_root in rec.get("failed", []):
+            failed[f"{key[:12]}.{ext}"] = ident
     # Per store: a key compiled once in each of two stores (a pytest
     # session's private store and the user's) was compiled once per store.
     dup = {f"{k[:12]}.{e}" + (f" in {r}" if r else ""): ids[0]
            for (k, e, r), ids in seen.items() if len(ids) > 1}
     return {"processes": procs, "hits": hits, "misses": misses,
             "bytes_written": written, "compiled": len(seen),
-            "compiled_more_than_once": dup}
+            "compiled_more_than_once": dup, "failed_builds": failed}
+
+
+def format_summary(res: dict) -> List[str]:
+    """The gate's `[ritz-cas]` lines for a `summarise` result."""
+    lines = [f"[ritz-cas] gate: processes={res['processes']} hits={res['hits']} "
+             f"misses={res['misses']} compiled={res['compiled']} "
+             f"failed={len(res['failed_builds'])} bytes_written={res['bytes_written']}"]
+    lines += [f"  compiled more than once: {ident} ({k})"
+              for k, ident in sorted(res["compiled_more_than_once"].items())]
+    lines += [f"  failed to build: {ident} ({k})"
+              for k, ident in sorted(res["failed_builds"].items(), key=lambda kv: kv[1])]
+    return lines
 
 
 def _build_module():
@@ -500,12 +528,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     elif args.cmd == "get-or-build":
         return get_or_build(Path(args.src), Path(args.out), Path(args.project_root))
     elif args.cmd == "summary":
-        res = summarise(Path(args.log))
-        print(f"[ritz-cas] gate: processes={res['processes']} hits={res['hits']} "
-              f"misses={res['misses']} compiled={res['compiled']} "
-              f"bytes_written={res['bytes_written']}")
-        for k, ident in sorted(res["compiled_more_than_once"].items()):
-            print(f"  compiled more than once: {ident} ({k})")
+        print("\n".join(format_summary(summarise(Path(args.log)))))
     return 0
 
 

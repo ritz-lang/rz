@@ -341,7 +341,8 @@ def _verify_ir_enabled() -> bool:
     return os.environ.get("RITZ_VERIFY_IR", "") in ("1", "true", "yes", "on")
 
 
-def cas_module_key(src: Path, cache: BuildCache, compiler: str) -> Optional[str]:
+def cas_module_key(src: Path, cache: BuildCache, compiler: str,
+                   object_flags: Optional[dict] = None) -> Optional[str]:
     """Artifact-store key for one module compiled `--no-runtime` (AGAST #1808).
 
     Covers the compiler fingerprint, the object flags, RITZ_VERIFY_IR (a hit
@@ -350,6 +351,10 @@ def cas_module_key(src: Path, cache: BuildCache, compiler: str) -> Optional[str]
     context `cache.set_import_context` was given. None when the closure
     cannot be scanned (a parse error): the caller compiles uncached and the
     compiler reports the real error.
+
+    `object_flags` replaces the hosted object flags for a module built
+    another way (compile_freestanding_binary: its target, target_os and
+    clang flags), so the two never share an entry.
     """
     try:
         closure = cache.get_transitive_dependencies(Path(src))
@@ -358,7 +363,8 @@ def cas_module_key(src: Path, cache: BuildCache, compiler: str) -> Optional[str]
     # Persist fresh scans: a fully cached build never writes them otherwise.
     cache._save_imports_db()
     flags = {"compiler": compiler, "emit": "no-runtime",
-             "obj": OBJ_CLANG_FLAGS, "verify_ir": _verify_ir_enabled()}
+             "obj": OBJ_CLANG_FLAGS if object_flags is None else object_flags,
+             "verify_ir": _verify_ir_enabled()}
     dep_digest = None
     # G9 (AGAST #1810): ritz0 reads its imports' interfaces, not their
     # sources, so its objects depend on interface hashes: a body-only edit
@@ -1842,6 +1848,62 @@ def compile_freestanding_binary(
 
         all_sources = [Path(f.strip()) for f in result.stdout.strip().split('\n') if f.strip()]
 
+        # Compile LLVM IR to object file with target-specific options.
+        # Use clang -c which can compile .ll files directly (more portable
+        # than llc). The same for every module, so built once.
+        if is_uefi:
+            # UEFI: compile for Windows x64 ABI (produces COFF objects for lld-link)
+            clang_flags = [
+                "--target=x86_64-unknown-windows-gnu",  # Windows x64 target for COFF
+                "-fshort-wchar",      # UEFI uses 16-bit wchar
+                "-mno-red-zone",      # Required for UEFI
+                "-fno-stack-protector",
+                "-ffreestanding",
+            ]
+        else:
+            clang_flags = [
+                f"--target={target}",
+                *FREESTANDING_FLAGS,
+                "-march=native",  # Enable CPU-specific features (SHA-NI, AES-NI, etc.)
+                "-msha",  # Force SHA extensions: cryptosec emits SHA intrinsics
+                          # in dead SHA-NI dispatch path; runtime detection
+                          # ensures they only execute on capable CPUs. Without
+                          # this, clang refuses to lower llvm.x86.sha256rnds2
+                          # on hosts where -march=native doesn't include +sha
+                          # (e.g. pre-Skylake). The disabled paths still need
+                          # to compile.
+            ]
+            # Add PIC flag if explicitly requested or for Linux targets
+            if pic or target.endswith("-linux"):
+                clang_flags.append("-fPIC")
+
+            if code_model:
+                # Note: -mcmodel=large is incompatible with -fPIC on x86_64
+                # For PIC code, use "small" model (default) which supports
+                # GOT/PLT relocations for position-independent code
+                if pic and code_model == "large":
+                    # Skip code model for PIC - use default small model
+                    pass
+                else:
+                    clang_flags.append(f"-mcmodel={code_model}")
+            if no_red_zone:
+                clang_flags.append("-mno-red-zone")
+
+        # AGAST #1896: objects come from, and go to, the shared store, as
+        # compile_binary's do. Without it every freestanding module (harland's
+        # 51) was recompiled on every build: the two longest units of a warm
+        # `rz test --all`. Keyed like a hosted module, except that the object
+        # flags are this target's (target_os too: [[target_os]] conditional
+        # compilation makes the same source a different module).
+        store = cas.ArtifactStore() if use_cache else None
+        cache = get_build_cache(compiler)
+        cache.set_import_context(
+            project_root=pkg_dir,
+            dependencies={n: (s.path, s.sources) for n, s in (dependencies or {}).items()},
+            source_roots=source_roots,
+        )
+        object_flags = {"freestanding": True, "target_os": target_os, "clang": clang_flags}
+
         # Step 2: Compile each Ritz source to LLVM IR, then to object file
         print(f"  Compiling {len(all_sources)} Ritz source file(s)...")
         compile_failures: List[Tuple[Path, str]] = []
@@ -1884,67 +1946,55 @@ def compile_freestanding_binary(
                     compile_cmd.extend(["--sources", json.dumps(abs_source_roots)])
                 env = None
 
-            result = subprocess.run(compile_cmd, capture_output=True, text=True, env=env)
-            if result.returncode != 0:
+            def compile_src(compile_cmd=compile_cmd, env=env, src=src,
+                            ll_path=ll_path, obj_path=obj_path) -> Optional[tuple]:
+                """ritz0/ritz1, verify, `clang -c` of one module into obj_path.
+                None on success, else ("compile" | "clang", message)."""
+                result = subprocess.run(compile_cmd, capture_output=True, text=True, env=env)
+                if result.returncode != 0:
+                    return ("compile", result.stderr)
+                # AGAST #1308: see verify_ir. No-op unless RITZ_VERIFY_IR is set.
+                ir_error = verify_ir(ll_path, src)
+                if ir_error is not None:
+                    return ("compile", ir_error)
+                result = subprocess.run(
+                    ["clang", "-c", *clang_flags, "-o", str(obj_path), str(ll_path)],
+                    capture_output=True, text=True)
+                if result.returncode != 0:
+                    return ("clang", result.stderr)
+                return None
+
+            cas_key = (cas_module_key(src, cache, compiler, object_flags)
+                       if store is not None else None)
+            if cas_key is None:
+                failure = compile_src()
+            else:
+                def build_fn(compile_src=compile_src, ll_path=ll_path, obj_path=obj_path):
+                    failure = compile_src()
+                    if failure is not None:
+                        raise cas.BuildFailed(failure)
+                    return {"ll": ll_path, "o": obj_path}
+                ident = cas.module_identity(src)
+                try:
+                    stored, built = store.get_or_build(
+                        cas_key, "o", build_fn, identity=ident,
+                        meta={"module": ident, "compiler": compiler,
+                              "freestanding": object_flags})
+                    failure = None
+                    if not built:
+                        shutil_mod.copyfile(stored, obj_path)
+                except cas.BuildFailed as e:
+                    failure = e.args[0]
+
+            if failure is not None:
+                kind, msg = failure
+                if kind == "clang":
+                    print(f"  ✗ clang failed for {src.name}: {msg}", file=sys.stderr)
+                    return None
                 # AGAST #1286: collect rather than bail, so all broken files
                 # surface in one build. See `report_compile_failures`.
-                compile_failures.append((src, result.stderr))
+                compile_failures.append((src, msg))
                 continue
-
-            # AGAST #1308: see verify_ir. No-op unless RITZ_VERIFY_IR is set.
-            ir_error = verify_ir(ll_path, src)
-            if ir_error is not None:
-                compile_failures.append((src, ir_error))
-                continue
-
-            # Compile LLVM IR to object file with target-specific options
-            # Use clang -c which can compile .ll files directly (more portable than llc)
-            if is_uefi:
-                # UEFI: compile for Windows x64 ABI (produces COFF objects for lld-link)
-                clang_cmd = [
-                    "clang", "-c",
-                    "--target=x86_64-unknown-windows-gnu",  # Windows x64 target for COFF
-                    "-fshort-wchar",      # UEFI uses 16-bit wchar
-                    "-mno-red-zone",      # Required for UEFI
-                    "-fno-stack-protector",
-                    "-ffreestanding",
-                ]
-            else:
-                clang_cmd = [
-                    "clang", "-c",
-                    f"--target={target}",
-                    *FREESTANDING_FLAGS,
-                    "-march=native",  # Enable CPU-specific features (SHA-NI, AES-NI, etc.)
-                    "-msha",  # Force SHA extensions: cryptosec emits SHA intrinsics
-                              # in dead SHA-NI dispatch path; runtime detection
-                              # ensures they only execute on capable CPUs. Without
-                              # this, clang refuses to lower llvm.x86.sha256rnds2
-                              # on hosts where -march=native doesn't include +sha
-                              # (e.g. pre-Skylake). The disabled paths still need
-                              # to compile.
-                ]
-                # Add PIC flag if explicitly requested or for Linux targets
-                if pic or target.endswith("-linux"):
-                    clang_cmd.append("-fPIC")
-
-                if code_model:
-                    # Note: -mcmodel=large is incompatible with -fPIC on x86_64
-                    # For PIC code, use "small" model (default) which supports
-                    # GOT/PLT relocations for position-independent code
-                    if pic and code_model == "large":
-                        # Skip code model for PIC - use default small model
-                        pass
-                    else:
-                        clang_cmd.append(f"-mcmodel={code_model}")
-                if no_red_zone:
-                    clang_cmd.append("-mno-red-zone")
-
-            clang_cmd.extend(["-o", str(obj_path), str(ll_path)])
-
-            result = subprocess.run(clang_cmd, capture_output=True, text=True)
-            if result.returncode != 0:
-                print(f"  ✗ clang failed for {src.name}: {result.stderr}", file=sys.stderr)
-                return None
 
             object_files.append(obj_path)
 

@@ -226,12 +226,7 @@ def print_cas_summary(log: Path) -> None:
         print("[ritz-cas] gate: no artifact-store activity recorded")
         return
     cas = _cas_module()
-    res = cas.summarise(log)
-    print(f"[ritz-cas] gate: processes={res['processes']} hits={res['hits']} "
-          f"misses={res['misses']} compiled={res['compiled']} "
-          f"bytes_written={res['bytes_written']}")
-    for key, ident in sorted(res["compiled_more_than_once"].items()):
-        print(f"  compiled more than once: {ident} ({key})")
+    print("\n".join(cas.format_summary(cas.summarise(log))))
 
 
 def trim_cas() -> None:
