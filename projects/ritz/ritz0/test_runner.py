@@ -28,8 +28,8 @@ import threading
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict
 
-from lexer import Lexer, LexerError
-from parser import Parser, ParseError
+from lexer import Lexer
+from parser import Parser
 from import_resolver import collect_all_source_files, DependencyMapping
 import ritz_ast as rast
 
@@ -619,6 +619,49 @@ def _compile_harness(
     return None
 
 
+def _cas_enabled() -> bool:
+    return os.environ.get(NO_CAS_ENV, "") in ("", "0")
+
+
+def _harness_ll(source_path: str, harness_path: str, harness_ll: str,
+                project_root: Optional[Path],
+                dependencies: Optional[Dict[str, DependencyMapping]],
+                closure: List[Path], compiler: str = "ritz0") -> Optional[str]:
+    """Write the test file's `--test-table` IR to `harness_ll`; an error or None.
+
+    AGAST #1915: from the artifact store when it has it, keyed on the harness
+    source and its closure's interfaces (build.cas_harness_key). Before this
+    every file of every warm `rz test --all` recompiled IR it had produced
+    before: ~0.75 s x 180 files.
+    """
+    def compile_it() -> Optional[str]:
+        return _compile_harness(harness_path, harness_ll, project_root, dependencies, compiler)
+
+    if not _cas_enabled():
+        return compile_it()
+    build = _build_module()
+    key = build.cas_harness_key(Path(harness_path), closure, compiler)
+    if key is None:
+        return compile_it()
+
+    def build_fn():
+        error = compile_it()
+        if error:
+            raise build.cas.BuildFailed(error)
+        return {"ll": Path(harness_ll)}
+
+    ident = build.cas.module_identity(Path(source_path)) + "#test-table"
+    try:
+        stored, built = build.cas.ArtifactStore().get_or_build(
+            key, "ll", build_fn, identity=ident,
+            meta={"module": ident, "compiler": compiler})
+    except build.cas.BuildFailed as e:
+        return str(e)
+    if not built:
+        shutil.copyfile(stored, harness_ll)
+    return None
+
+
 def _link(objects: List[str], exe_path: str) -> Tuple[Optional[str], Optional[str]]:
     """Link objects / .ll files into an executable. Returns (exe_path, error)."""
     # -march=native enables host CPU features (AES-NI, AVX2, etc.).  -msha is
@@ -755,7 +798,8 @@ def build_test_binary(source_path: str, tmpdir: str,
         Path(harness_path).write_text(strip_main_from_source(Path(source_path).read_text()))
     else:
         harness_path = str(Path(source_path).resolve())
-    error = _compile_harness(harness_path, harness_ll, project_root, dependencies, compiler)
+    error = _harness_ll(source_path, harness_path, harness_ll, project_root, dependencies,
+                        [Path(f) for f in dep_files or []], compiler)
     if error:
         return None, error
 
@@ -851,6 +895,40 @@ def run_test_file(source_path: str, verbose: bool = False,
             cleanup_scratch_dir(tmpdir)
 
 
+def run_files(files: List[str], verbose: bool = False, compiler: str = "ritz0") -> int:
+    """Run test files; print the report `ritz0 --test` prints; its exit code.
+
+    The report ends with "N passed, M failed", which build.py's
+    classify_test_file reads, so `ritz0 --test` and build.py's in-process
+    unit (AGAST #1915) must share this one printer.
+    """
+    total_passed = 0
+    total_failed = 0
+    all_failures = []
+
+    for file_path in files:
+        if verbose:
+            print(f"\n{file_path}:")
+        try:
+            passed, failed, failures = run_test_file(file_path, verbose, compiler)
+            total_passed += passed
+            total_failed += failed
+            all_failures.extend(failures)
+        except Exception as e:  # noqa: BLE001 -- the file's verdict, not a crash
+            print(f"Error in {file_path}: {e}", file=sys.stderr)
+            total_failed += 1
+            all_failures.append(f"{file_path}: error")
+
+    print(f"\n{total_passed} passed, {total_failed} failed")
+
+    if all_failures:
+        print("\nFailures:")
+        for f in all_failures:
+            print(f"  - {f}")
+
+    return 0 if total_failed == 0 else 1
+
+
 def main():
     parser = argparse.ArgumentParser(description='Ritz Test Runner')
     parser.add_argument('files', nargs='+', help='Test files to run')
@@ -861,32 +939,7 @@ def main():
     # below actually run. Installed after argument parsing so `--help` and a
     # usage error still behave like an ordinary CLI.
     install_signal_handlers()
-
-    total_passed = 0
-    total_failed = 0
-    all_failures = []
-
-    for file_path in args.files:
-        if args.verbose:
-            print(f"\n{file_path}:")
-        try:
-            passed, failed, failures = run_test_file(file_path, args.verbose)
-            total_passed += passed
-            total_failed += failed
-            all_failures.extend(failures)
-        except (LexerError, ParseError) as e:
-            print(f"Error in {file_path}: {e}", file=sys.stderr)
-            total_failed += 1
-            all_failures.append(f"{file_path}: parse error")
-
-    print(f"\n{total_passed} passed, {total_failed} failed")
-
-    if all_failures:
-        print("\nFailures:")
-        for f in all_failures:
-            print(f"  - {f}")
-
-    sys.exit(0 if total_failed == 0 else 1)
+    sys.exit(run_files(args.files, args.verbose))
 
 
 if __name__ == '__main__':

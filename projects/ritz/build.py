@@ -365,6 +365,14 @@ def cas_module_key(src: Path, cache: BuildCache, compiler: str,
     flags = {"compiler": compiler, "emit": "no-runtime",
              "obj": OBJ_CLANG_FLAGS if object_flags is None else object_flags,
              "verify_ir": _verify_ir_enabled()}
+    return _cas_key(src, closure, cache, compiler, flags)
+
+
+def _cas_key(src: Path, closure, cache: BuildCache, compiler: str,
+             flags: dict) -> Optional[str]:
+    """cas.module_key for `src` built by `compiler`, its imports digested the
+    way that compiler reads them. None if an import does not parse."""
+    flags = dict(flags)
     dep_digest = None
     # G9 (AGAST #1810): ritz0 reads its imports' interfaces, not their
     # sources, so its objects depend on interface hashes: a body-only edit
@@ -388,6 +396,21 @@ def cas_module_key(src: Path, cache: BuildCache, compiler: str,
         # An import that does not parse has no interface: compile uncached
         # and let the compiler report the real error.
         return None
+
+
+def cas_harness_key(src: Path, closure, compiler: str) -> Optional[str]:
+    """Artifact-store key of a test file's `--test-table` IR (AGAST #1915).
+
+    `src` is the file the harness compile reads (test_runner's main-stripped
+    copy for ritz0, the test file itself for ritz1) and `closure` its
+    transitive imports, as test_runner resolved them. Keyed like a module,
+    with `emit: test-table` so it never shares an entry with the file's
+    `--no-runtime` object. The IR is stored, not an object: the link compiles
+    it as it always has (at -O0; #1914 found -O2 changes three verdicts).
+    None when an import does not parse: compile uncached.
+    """
+    flags = {"compiler": compiler, "emit": "test-table", "artifact": "ll"}
+    return _cas_key(src, closure, get_build_cache(compiler), compiler, flags)
 
 
 # BuildCache is not thread-safe; the regression matrix calls in from a pool.
@@ -2485,9 +2508,106 @@ def per_file_timeout() -> int:
     return int(os.environ.get("RITZ_TEST_TIMEOUT", "180"))
 
 
+@dataclass
+class _TestRun:
+    """What one `ritz0 --test <file>` printed, and its exit code."""
+    returncode: int
+    stdout: str
+    stderr: str
+
+
+def _ritz0_test_subprocess(tfile: Path, pkg_dir: Path, test_env: dict,
+                           timeout: int, compiler: str) -> Optional[_TestRun]:
+    """`ritz0 --test <tfile>` as a child process; None if it timed out."""
+    cmd = [sys.executable, str(RITZ0), "--test", str(tfile)]
+    if compiler != "ritz0":
+        cmd += ["--compiler", compiler]
+    try:
+        r = subprocess.run(cmd, cwd=pkg_dir, env=test_env, capture_output=True,
+                           text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return None
+    return _TestRun(r.returncode, r.stdout, r.stderr)
+
+
+_TEST_RUNNER = None
+
+
+def _test_runner():
+    """ritz0/test_runner.py, imported once (RITZ0_DIR is on sys.path)."""
+    global _TEST_RUNNER
+    if _TEST_RUNNER is None:
+        import importlib
+        tr = importlib.import_module("test_runner")
+        # It loads build.py for the store key and object flags; in this
+        # process that is us, already imported. (A module exec'd by path
+        # without registering itself is absent: test_runner loads its own.)
+        if tr._BUILD_MODULE is None and sys.modules.get(__name__) is not None:
+            tr._BUILD_MODULE = sys.modules[__name__]
+        _TEST_RUNNER = tr
+    return _TEST_RUNNER
+
+
+def _can_run_in_process() -> bool:
+    """The in-process timeout is a SIGALRM, which only the main thread gets."""
+    return threading.current_thread() is threading.main_thread()
+
+
+class _TestFileTimeout(BaseException):
+    """Raised by SIGALRM. A BaseException, so run_files' per-file `except
+    Exception` cannot turn the timeout into an ordinary failure."""
+
+
+def _ritz0_test_in_process(tfile: Path, pkg_dir: Path, test_env: dict,
+                           timeout: int, compiler: str) -> Optional[_TestRun]:
+    """What `ritz0 --test <tfile>` would print, without starting it.
+
+    AGAST #1915: the subprocess cost a second interpreter, ritz0.py's imports
+    and test_runner's on every file unit, ~0.7 s per file before any work.
+    test_runner.run_files is the code `ritz0 --test` runs, so the report (and
+    classify_test_file's verdict) is the same. The child ran in pkg_dir with
+    test_env (integration tests `fork/exec ./binary`); so does this, and both
+    are put back afterwards. None if `timeout` expired: SIGALRM unwinds the
+    run, and subprocess.run kills whatever child was running.
+    """
+    import contextlib
+    import io
+
+    tr = _test_runner()
+    tfile = tfile.resolve()  # relative to our cwd, not pkg_dir
+    out, err = io.StringIO(), io.StringIO()
+    old_cwd, old_env = os.getcwd(), os.environ.copy()
+
+    def on_alarm(_signum, _frame):
+        raise _TestFileTimeout()
+
+    old_handler = signal.signal(signal.SIGALRM, on_alarm)
+    try:
+        try:
+            signal.setitimer(signal.ITIMER_REAL, timeout)
+            os.environ.clear()
+            os.environ.update(test_env)
+            os.chdir(pkg_dir)
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                rc = tr.run_files([str(tfile)], compiler=compiler)
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+    except _TestFileTimeout:
+        return None
+    finally:
+        signal.signal(signal.SIGALRM, old_handler)
+        os.chdir(old_cwd)
+        os.environ.clear()
+        os.environ.update(old_env)
+    return _TestRun(rc, out.getvalue(), err.getvalue())
+
+
 def run_test_file(tfile: Path, pkg_dir: Path, test_env: dict,
                   timeout: int, compiler: str = "ritz0") -> dict:
     """Run one `ritz0 --test <tfile>` and print its verdict line(s).
+
+    In-process on the main thread (AGAST #1915), as a `ritz0.py --test` child
+    otherwise; both run test_runner.run_files and print the same report.
 
     `compiler` builds the test binary (`--compiler`, AGAST #1908): with a
     ritz1-family compiler, ritz0.py only drives the harness; every object in
@@ -2503,18 +2623,9 @@ def run_test_file(tfile: Path, pkg_dir: Path, test_env: dict,
     relative paths work; imports still resolve via RITZ_PATH (env-based,
     not CWD-based — see ritz0/import_resolver.py).
     """
-    try:
-        cmd = [sys.executable, str(RITZ0), "--test", str(tfile)]
-        if compiler != "ritz0":
-            cmd += ["--compiler", compiler]
-        result = subprocess.run(
-            cmd,
-            cwd=pkg_dir,
-            env=test_env,
-            capture_output=True, text=True,
-            timeout=timeout,
-        )
-    except subprocess.TimeoutExpired:
+    run = _ritz0_test_in_process if _can_run_in_process() else _ritz0_test_subprocess
+    result = run(Path(tfile), Path(pkg_dir), test_env, timeout, compiler)
+    if result is None:
         print(f"    ⏱  {tfile.name} — TIMEOUT after {timeout}s")
         return {"status": "timeout", "passed": 0, "failed": 0}
 

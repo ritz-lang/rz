@@ -271,6 +271,9 @@ def test_ritz1_test_binary_runs_exactly_the_test_table(ritz1_bin, tmp_path, monk
     import test_runner
 
     monkeypatch.setenv("RITZ_PATH", str(RITZ_ROOT))
+    # AGAST #1915: a warm shared artifact store would serve the harness with
+    # no `ritz1 --test-table` call; assert against a private, empty one.
+    monkeypatch.setenv("RITZ_CACHE_DIR", str(tmp_path / "cas"))
     src = tmp_path / "test_e2e.ritz"
     src.write_text(E2E_SOURCE)
     scratch = tmp_path / "scratch"

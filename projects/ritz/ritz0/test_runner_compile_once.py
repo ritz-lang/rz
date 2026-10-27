@@ -75,6 +75,10 @@ N_TESTS = 5
 def package(tmp_path, monkeypatch):
     """A minimal package whose only dependency is ritzlib."""
     monkeypatch.setenv("RITZ_PATH", str(RITZ_DIR))
+    # AGAST #1915: the harness now comes from the artifact store when it has
+    # it. A shared store warmed by an earlier run (or another xdist worker)
+    # would serve it with 0 compiles, so count against a private, empty one.
+    monkeypatch.setenv("RITZ_CACHE_DIR", str(tmp_path / "cas"))
     (tmp_path / "ritz.toml").write_text(
         textwrap.dedent(
             f"""\

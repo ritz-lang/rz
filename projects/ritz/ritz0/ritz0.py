@@ -357,7 +357,7 @@ def main():
     args = parser.parse_args()
 
     if args.test or args.test_all:
-        from test_runner import run_test_file, install_signal_handlers
+        from test_runner import run_files, install_signal_handlers
 
         # AGAST #1392: this is the entry point build.py drives, and the one
         # that was being killed by an outer `timeout`. Without a handler the
@@ -377,34 +377,8 @@ def main():
             print("Error: --test requires a source file, or use --test-all", file=sys.stderr)
             sys.exit(1)
 
-        total_passed = 0
-        total_failed = 0
-        all_failures = []
-
-        for file_path in test_files:
-            if args.verbose:
-                print(f"\n{file_path}:")
-
-            try:
-                passed, failed, failures = run_test_file(file_path, args.verbose,
-                                                         args.compiler)
-                total_passed += passed
-                total_failed += failed
-                all_failures.extend(failures)
-            except Exception as e:
-                print(f"Error in {file_path}: {e}", file=sys.stderr)
-                total_failed += 1
-                all_failures.append(f"{file_path}: error")
-
-        # Summary
-        print(f"\n{total_passed} passed, {total_failed} failed")
-
-        if all_failures:
-            print("\nFailures:")
-            for f in all_failures:
-                print(f"  - {f}")
-
-        sys.exit(0 if total_failed == 0 else 1)
+        # Shared with build.py's in-process test unit (AGAST #1915).
+        sys.exit(run_files(test_files, args.verbose, args.compiler))
 
     # Compile mode
     else:

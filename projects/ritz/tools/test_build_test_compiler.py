@@ -47,13 +47,27 @@ def buildpy(request):
 
 @pytest.fixture
 def stub_ritz0(tmp_path, monkeypatch, buildpy):
-    """Point build.py's RITZ0 at a call-recording stub; return the log path."""
+    """Record every `ritz0 --test` run build.py makes; return the log path.
+
+    Since AGAST #1915 build.py runs the file in-process (test_runner.run_files,
+    what `ritz0 --test` runs), and as a `ritz0.py --test` child only off the
+    main thread. Both are stubbed to log the same `ritz0 --test` argv.
+    """
     stub = tmp_path / "ritz0_stub.py"
     stub.write_text(STUB)
     log = tmp_path / "ritz0_calls.log"
     log.write_text("")
     monkeypatch.setenv("RITZ0_STUB_LOG", str(log))
     monkeypatch.setattr(buildpy, "RITZ0", stub)
+
+    def run_files(files, verbose=False, compiler="ritz0"):
+        with open(log, "a") as f:
+            for path in files:
+                f.write(f"--test {path}"
+                        + ("" if compiler == "ritz0" else f" --compiler {compiler}") + "\n")
+        print("1 passed, 0 failed")
+        return 0
+    monkeypatch.setattr(buildpy._test_runner(), "run_files", run_files)
     return log
 
 
