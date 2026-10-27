@@ -1659,6 +1659,41 @@ fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
         let icall_lv: *LocalVar = find_local_struct_name(s, e.func_name, e.func_name_len)
         if icall_lv != null
             icall_sig = icall_lv.fn_sig
+    # AGAST #1747: a nameless call (`fs[i](..)`): the callee is an expression
+    # in `left`, evaluated first (left to right), to an i64 address.  With a
+    # known signature it takes the typed path below, as a typed fn-ptr local
+    # does; otherwise it is the untyped `call i64` an untyped local gets.
+    var callee_val: i32 = -1
+    if e.func_name_len == 0
+        icall_sig = call_callee_sig(s, e)
+        callee_val = emit_expr(s, e.left)
+        if icall_sig == null
+            let ut_args: *i32 = call_reg_slots(e.args, 0)
+            var ut_argc: i32 = 0
+            var ut_arg: *Expr = e.args
+            while ut_arg != null
+                ut_args[ut_argc] = emit_expr(s, ut_arg)
+                ut_argc += 1
+                ut_arg = ut_arg.next
+            let ut_fp: i32 = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, ut_fp)
+            emit_str(s, c" = inttoptr i64 ")
+            emit_reg(s, callee_val)
+            emit_str(s, c" to ptr\n")
+            let ut_result: i32 = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, ut_result)
+            emit_str(s, c" = call i64 ")
+            emit_reg(s, ut_fp)
+            emit_str(s, c"(")
+            for j in 0..ut_argc
+                if j > 0
+                    emit_str(s, c", ")
+                emit_str(s, c"i64 ")
+                emit_reg(s, ut_args[j])
+            emit_str(s, c")\n")
+            return ut_result
     if icall_local >= 0 and e.call_type_suffix_len == 0 and icall_sig == null
         # Evaluate args first.
         let icall_args: *i32 = call_reg_slots(e.args, 0)
@@ -2291,7 +2326,14 @@ fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
     # Now emit the call with converted registers.  A typed indirect call
     # loads the fn pointer from its slot here, after the args.
     var icall_fp_reg: i32 = -1
-    if icall_sig != null
+    if callee_val >= 0
+        icall_fp_reg = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, icall_fp_reg)
+        emit_str(s, c" = inttoptr i64 ")
+        emit_reg(s, callee_val)
+        emit_str(s, c" to ptr\n")
+    else if icall_sig != null
         icall_fp_reg = next_reg(s)
         emit_str(s, c"  ")
         emit_reg(s, icall_fp_reg)

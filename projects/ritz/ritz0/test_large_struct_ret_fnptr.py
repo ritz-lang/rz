@@ -77,7 +77,7 @@ pub fn main() -> i32
 )
 
 # ritz0's other indirect-call path: a callee that is not an identifier.
-# ritz0-only: ritz1 types this sret result i64 (AGAST #1747).
+# ritz1 typed this sret result i64 until AGAST #1747.
 INDEXED_RET = (
     MID
     + """
@@ -86,6 +86,34 @@ pub fn main() -> i32
     var z: Big = fs[1](3)
     if total(@z) != 3 + 4 + 6
         return 1
+    return 42
+"""
+)
+
+# AGAST #1746: `*@x` of a large struct, by value to a direct and an indirect
+# call.  ritz1 loaded `*@x` as i64, then stored it into the byval slot as %Big.
+DEREF_ADDR_ARG = (
+    MID
+    + """
+fn take(b: Big) -> i32
+    return total(@b)
+
+fn twice(b: Big) -> Big
+    var c: Big = b
+    c.count = c.count * 2
+    return c
+
+pub fn main() -> i32
+    var x: Big = big_make(5)
+    if take(*@x) != 21
+        return 1
+    let h: fn(Big) -> Big = twice
+    var y: Big = h(*@x)
+    if y.count != 10
+        return 2
+    var z: Big = *@x
+    if total(@z) != 21
+        return 3
     return 42
 """
 )
@@ -167,10 +195,50 @@ def test_sret_closure_pointer_runs_at_O2(tmp_path):
 
 
 @pytest.mark.integration
-def test_sret_fn_pointer_non_identifier_callee_runs_at_O2(tmp_path):
-    ll = _ll("ritz0", tmp_path, "indexed_ret", INDEXED_RET)
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_sret_fn_pointer_non_identifier_callee_runs_at_O2(
+    ritz1_bin, tmp_path, compiler
+):
+    ll = _ll(compiler, tmp_path, "indexed_ret", INDEXED_RET)
     for line in _indirect_calls(ll.read_text()):
         assert re.search(rf"call void .*sret\({BIG_T}\)", line), line
     obj = _o2_object(ll)
     _assert_no_libc_mem(obj)
-    assert _link_run([obj], tmp_path / "indexed_ret", with_start=False) == 42
+    exe = tmp_path / f"indexed_ret_{compiler}"
+    assert _link_run([obj], exe, with_start=(compiler == "ritz1")) == 42
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_deref_addr_byval_arg_runs_at_O2(ritz1_bin, tmp_path, compiler):
+    """AGAST #1746: `*@x` is a %Big, not an i64, as a byval arg."""
+    ll = _ll(compiler, tmp_path, "deref_addr", DEREF_ADDR_ARG)
+    obj = _o2_object(ll)
+    _assert_no_libc_mem(obj)
+    exe = tmp_path / f"deref_addr_{compiler}"
+    assert _link_run([obj], exe, with_start=(compiler == "ritz1")) == 42
+
+
+# AGAST #1747: monomorph clones a generic fn's body; the clone must keep a
+# nameless call's callee.  IR-level only: ritz1 drops array-literal and
+# indexed-store initialisers in generic clones (a separate defect), so the
+# array is uninitialised at run time.
+GENERIC_INDEXED = """
+fn inc(x: i32) -> i32
+    return x + 1
+
+fn apply_indexed<T>(x: T, i: i64) -> i32
+    let ops: [1]fn(i32) -> i32 = [inc]
+    return ops[i](x as i32)
+
+pub fn main() -> i32
+    return apply_indexed<i64>(41, 0)
+"""
+
+
+@pytest.mark.integration
+def test_indexed_callee_survives_generic_clone(ritz1_bin, tmp_path):
+    text = _ll("ritz1", tmp_path, "generic_indexed", GENERIC_INDEXED).read_text()
+    body = text.split("define linkonce_odr i32 @apply_indexed$i64(", 1)[1]
+    body = body.split("\n}", 1)[0]
+    assert re.search(r"call i32 %[\w.]+\(i32 ", body), body

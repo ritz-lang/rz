@@ -1429,8 +1429,10 @@ pub fn capture_var_type(p: *Parser, ty: i32) -> i32
         p.var_type_name_len = 0
     # AGAST #1671: latch a `let f: fn(...) -> T` signature before the
     # initializer is parsed (it may contain fn types of its own).
+    # AGAST #1747: on a `[N]fn(...) -> T` array it is the ELEMENT signature
+    # (the fn type ends where the array type does); `fs[i](..)` calls by it.
     p.var_fn_sig = null
-    if ty == TYPE_PTR
+    if ty == TYPE_PTR or ty == TYPE_ARRAY
         p.var_fn_sig = fresh_fn_sig(p)
     return ty
 
@@ -1832,8 +1834,9 @@ pub fn stmt_var_decl(p: *Parser, name: *u8, len: i32, ty: i32, init: *Expr, line
     s.kind = STMT_VAR_DECL
     # AGAST #1671: typed decls go through capture_var_type, which latched
     # var_fn_sig (null unless the type is a fn type).  Untyped ones have none.
+    # On a `[N]fn(..)` array it is the element signature (AGAST #1747).
     s.var_fn_sig = null
-    if ty == TYPE_PTR
+    if ty == TYPE_PTR or ty == TYPE_ARRAY
         s.var_fn_sig = p.var_fn_sig
     s.span.line = line
     s.span.col = col
@@ -2915,6 +2918,26 @@ pub fn apply_postfix_p(p: *Parser, base: *Expr, ops: *PostfixOp) -> *Expr
                 result.kind = EXPR_METHOD
                 result.args = op.args
                 # left and ident_ptr/ident_len are already set from POSTFIX_MEMBER
+            else
+                # AGAST #1747: a call through any other callee (`fs[1](3)`,
+                # `f(1)(2)`) is an indirect call: EXPR_CALL with no name,
+                # the callee expression in `left`.  This arm used to drop
+                # the call, so `fs[1](3)` evaluated to the fn pointer.
+                let call_expr: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+                call_expr.kind = EXPR_CALL
+                call_expr.span = result.span
+                call_expr.func_name = null
+                call_expr.func_name_len = 0
+                call_expr.call_type_suffix = null
+                call_expr.call_type_suffix_len = 0
+                call_expr.args = op.args
+                call_expr.left = result
+                call_expr.right = null
+                call_expr.operand = null
+                call_expr.ident_ptr = null
+                call_expr.ident_len = 0
+                call_expr.next = null
+                result = call_expr
         else if op.kind == POSTFIX_INDEX
             # Create new index expression
             let index_expr: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
