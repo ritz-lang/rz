@@ -1,0 +1,123 @@
+# Regression (AGAST #1927): `(*p).field[i] = v` parses to
+# STMT_MEMBER_INDEX_ASSIGN, which ritz1's emit_stmt had no case for, so even
+# a non-generic fn failed with "ritz1 cannot emit: unhandled statement kind 8".
+# ritz0 accepts it.  The emitter now lowers it as the expression assignment
+# `(*p).field[i] = v`, the same path the `p.field[i] = v` fallback takes.
+
+struct Cell
+    v: i64
+    arr: [2]i64
+
+struct Narrow
+    tag: u8
+    bytes: [4]u8
+    words: [3]i32
+
+struct Item
+    a: i64
+    b: i64
+
+struct Bag
+    items: [2]Item
+    data: *i64
+
+struct Holder
+    cell: *Cell
+
+fn set_arr(p: *Cell, i: i64, v: i64) -> i64
+    (*p).arr[i] = v
+    return p.arr[i]
+
+[[test]]
+fn test_member_index_assign_i64() -> i32
+    var c: Cell = Cell { v: 5, arr: [0, 0] }
+    assert set_arr(@c, 1, 42) == 42
+    assert c.arr[0] == 0
+    assert c.arr[1] == 42
+    assert c.v == 5
+    0
+
+# The index and the value are arbitrary expressions, evaluated once each.
+[[test]]
+fn test_member_index_assign_expr_operands() -> i32
+    var c: Cell = Cell { v: 1, arr: [0, 0] }
+    let p: *Cell = @c
+    (*p).arr[c.v] = c.v + 10
+    (*p).arr[c.v - 1] = (*p).arr[c.v] * 2
+    assert c.arr[0] == 22
+    assert c.arr[1] == 11
+    0
+
+# Narrow element types store at their declared width, not 8 bytes.
+[[test]]
+fn test_member_index_assign_narrow() -> i32
+    # Struct-literal init: `n.bytes = [..]` miscompiles in ritz1 (separate
+    # AGAST ticket).
+    var n: Narrow = Narrow { tag: 9, bytes: [0, 0, 0, 0], words: [0, 0, 0] }
+    let p: *Narrow = @n
+    (*p).bytes[1] = 200
+    (*p).bytes[2] = 7
+    (*p).words[0] = 70000
+    (*p).words[2] = -3
+    assert n.tag == 9
+    assert n.bytes[0] == 0
+    assert n.bytes[1] == 200
+    assert n.bytes[2] == 7
+    assert n.bytes[3] == 0
+    assert n.words[0] == 70000
+    assert n.words[1] == 0
+    assert n.words[2] == -3
+    0
+
+# Compound assignment takes the same statement kind.
+[[test]]
+fn test_member_index_compound_assign() -> i32
+    var c: Cell = Cell { v: 0, arr: [3, 4] }
+    let p: *Cell = @c
+    (*p).arr[1] += 10
+    (*p).arr[0] *= 5
+    assert c.arr[0] == 15
+    assert c.arr[1] == 14
+    0
+
+# A struct element of an inline array field.
+[[test]]
+fn test_member_index_assign_struct_elem() -> i32
+    var b: Bag
+    b.items[0] = Item { a: 0, b: 0 }
+    b.items[1] = Item { a: 0, b: 0 }
+    let p: *Bag = @b
+    (*p).items[1] = Item { a: 6, b: 7 }
+    assert b.items[0].a == 0
+    assert b.items[1].a == 6
+    assert b.items[1].b == 7
+    0
+
+# A pointer field: index through the pointer it holds.
+[[test]]
+fn test_member_index_assign_ptr_field() -> i32
+    var store: [3]i64 = [0, 0, 0]
+    var b: Bag
+    b.data = @store[0]
+    let p: *Bag = @b
+    (*p).data[2] = 99
+    assert store[2] == 99
+    assert store[0] == 0
+    0
+
+# The pointer is itself an expression: a field, and a double deref.  `pp` is
+# a param: a `let pp: **Cell = @pc` local cannot be dereferenced twice for a
+# member by ritz1 at all, read or write (separate AGAST ticket).
+fn set_through_pp(pp: **Cell, v: i64)
+    (**pp).arr[1] = v
+
+[[test]]
+fn test_member_index_assign_nested_ptr() -> i32
+    var c: Cell = Cell { v: 0, arr: [0, 0] }
+    var h: Holder = Holder { cell: @c }
+    (*h.cell).arr[0] = 31
+    var pc: *Cell = @c
+    set_through_pp(@pc, 32)
+    assert c.arr[0] == 31
+    assert c.arr[1] == 32
+    0
