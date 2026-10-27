@@ -464,28 +464,48 @@ def ritzlib_coverage_line(modules=None, ritzlib_dir=None):
             f"(RITZLIB_MODULES). A green matrix does NOT mean ritzlib is covered.")
 
 
-def build_ritzlib_objs(tmpdir, env):
+_BUILD = None
+_BUILD_LOCK = threading.Lock()
+
+
+def build_module():
+    """build.py, imported once by path. It owns the artifact-store key and the
+    object pipeline (AGAST #1894), so the matrix's ritzlib and dependency
+    objects are the same store entries build.py, test_runner and ritz1's
+    Makefile use: a warm machine compiles no ritzlib here at all."""
+    global _BUILD
+    with _BUILD_LOCK:
+        if _BUILD is None:
+            import importlib.util
+            # Appended, not prepended, and loaded by path: see
+            # ritz0/test_runner.py _build_module for why.
+            if str(RITZ_ROOT) not in sys.path:
+                sys.path.append(str(RITZ_ROOT))
+            spec = importlib.util.spec_from_file_location("ritz_build_py", RITZ_ROOT / "build.py")
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            _BUILD = mod
+        return _BUILD
+
+
+def build_ritzlib_objs(tmpdir, env, jobs=None):
+    """(objs, None) or (None, error): the baseline ritzlib objects, fetched
+    from the shared store or compiled into it, in parallel, copied to tmpdir."""
     srcs, missing = resolve_ritzlib_modules()
     if missing:
         return None, (f"RITZLIB_MODULES names module(s) with no source file in "
                       f"{RITZLIB_DIR}: {', '.join(missing)}. Write the module "
                       f"or delete the name, and say which in the commit.")
-    objs = []
-    for src in srcs:
-        mod = src.stem
-        ll = Path(tmpdir) / f"ritzlib_{mod}.ll"
-        o = Path(tmpdir) / f"ritzlib_{mod}.o"
-        cmd = RITZ0 + [str(src), "-o", str(ll), "--no-runtime",
-                       "--project-root", RITZ_PATH_ENV]
-        r = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=60)
-        if r.returncode != 0:
-            return None, f"ritzlib {mod} compile failed: {r.stderr[-300:]}"
-        cmd = CLANG_C + [str(ll), "-o", str(o)]
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-        if r.returncode != 0:
-            return None, f"ritzlib {mod} asm failed: {r.stderr[-300:]}"
-        objs.append(str(o))
-    return objs, None
+    build = build_module()
+    objs = [Path(tmpdir) / f"ritzlib_{src.stem}.o" for src in srcs]
+    with ThreadPoolExecutor(max_workers=jobs or min(8, os.cpu_count() or 1)) as pool:
+        errs = list(pool.map(
+            lambda so: build.cas_object(so[0], so[1], project_root=RITZ_ROOT, env=env),
+            zip(srcs, objs)))
+    for src, err in zip(srcs, errs):
+        if err:
+            return None, f"ritzlib {src.stem}: {err}"
+    return [str(o) for o in objs], None
 
 
 class DepObjects:
@@ -494,7 +514,7 @@ class DepObjects:
     RITZLIB_MODULES is the baseline linked into every cell. A file importing
     anything else (ritzlib.box, ritzlib.uring, a sibling like test_import_lib)
     would otherwise link-fail for a reason that is not a compiler bug, so its
-    transitive closure (ritz0/list_deps.py) is compiled and linked on top.
+    transitive closure (build.cas_closure) is compiled and linked on top.
     """
 
     def __init__(self, tmpdir, env, baseline_srcs, baseline_objs):
@@ -503,22 +523,40 @@ class DepObjects:
         self.baseline = {str(Path(s).resolve()) for s in baseline_srcs}
         self.baseline_objs = list(baseline_objs)
         self._objs = {}
+        self._closures = {}
         self._lock = threading.Lock()
         self._key_locks = {}
         self.cpu_flags = cpu_flags()
 
     def closure(self, src_path):
-        """Absolute paths of src_path's imports (excluding itself), or raise."""
-        r = subprocess.run(RITZ0[:1] + [str(RITZ_ROOT / "ritz0/list_deps.py"), str(src_path),
-                                        "--project-root", RITZ_PATH_ENV],
-                           capture_output=True, text=True, env=self.env, timeout=60)
-        if r.returncode != 0:
-            raise RuntimeError(f"list_deps failed: {r.stderr[-300:]}")
-        me = str(Path(src_path).resolve())
-        return [p for p in r.stdout.split() if str(Path(p).resolve()) != me]
+        """Absolute paths of src_path's imports (excluding itself), or raise.
+
+        Resolved once per file, in-process (build.cas_closure), and memoised:
+        every compiler column asks for the same file's closure, which used to
+        be one list_deps.py subprocess per (file, compiler) -- 375 for 125
+        files (AGAST #1894)."""
+        key = str(Path(src_path).resolve())
+        with self._lock:
+            if key in self._closures:
+                res = self._closures[key]
+            else:
+                res = None
+        if res is None:
+            try:
+                res = (build_module().cas_closure(Path(key), RITZ_ROOT), None)
+            except Exception as e:  # a parse error in the file or an import
+                res = (None, f"import resolution failed: {e}")
+            with self._lock:
+                res = self._closures.setdefault(key, res)
+        if res[1] is not None:
+            raise RuntimeError(res[1])
+        return list(res[0])
 
     def obj_for(self, dep):
-        """Object for one dependency source; (obj, None) or (None, error)."""
+        """Object for one dependency source; (obj, None) or (None, error).
+
+        From the shared store when it has it (AGAST #1894), else compiled and
+        stored; copied into this run's tmpdir either way."""
         key = str(Path(dep).resolve())
         with self._lock:
             if key in self._objs:
@@ -529,15 +567,9 @@ class DepObjects:
                 if key in self._objs:
                     return self._objs[key]
             tag = f"dep_{abs(hash(key)) & 0xFFFFFFFF:08x}_{Path(dep).stem}"
-            ll, o = self.tmpdir / f"{tag}.ll", self.tmpdir / f"{tag}.o"
-            r = subprocess.run(RITZ0 + [dep, "-o", str(ll), "--no-runtime",
-                                        "--project-root", RITZ_PATH_ENV],
-                               capture_output=True, text=True, env=self.env, timeout=120)
-            if r.returncode == 0:
-                r = subprocess.run(CLANG_C + [str(ll), "-o", str(o)],
-                                   capture_output=True, text=True, timeout=120)
-            res = (str(o), None) if r.returncode == 0 else (
-                None, f"{Path(dep).name}: {r.stderr[-300:]}")
+            o = self.tmpdir / f"{tag}.o"
+            err = build_module().cas_object(Path(key), o, project_root=RITZ_ROOT, env=self.env)
+            res = (str(o), None) if err is None else (None, f"{Path(dep).name}: {err}")
             with self._lock:
                 self._objs[key] = res
             return res
@@ -602,7 +634,7 @@ def run_file(test_name, compiler_name, compiler_bin, deps, env, tmpdir):
     except RuntimeError:
         # ritz0's import resolver could not parse the file. Link only the
         # baseline and let the compiler under test report its own diagnostic,
-        # so the cell says what that compiler thinks, not what list_deps does.
+        # so the cell says what that compiler thinks, not what the import scan does.
         closure = []
     # Sibling modules (import test_import_lib) must resolve from the wrapper's
     # directory too, for compilers that read their declarations.
@@ -707,8 +739,9 @@ def main():
                          "binary reflects the changes too.")
     args = ap.parse_args()
 
+    # In os.environ too: closures are resolved in-process (build.cas_closure).
+    os.environ["RITZ_PATH"] = RITZ_PATH_ENV
     env = os.environ.copy()
-    env["RITZ_PATH"] = RITZ_PATH_ENV
 
     if args.rebuild:
         print("# Rebuilding ritz1 + ritz1_selfhosted...", flush=True)
@@ -734,8 +767,9 @@ def main():
         print(f"# {len(tests)} test files, {n_units} units "
               f"({sum(count_test_markers(s) for s in srcs.values())} [[test]] fns) "
               f"× {len(compilers)} compiler(s), -j{args.jobs}", flush=True)
-        print(f"# Building ritzlib objects in {tmpdir} ...", flush=True)
-        ritzlib_objs, err = build_ritzlib_objs(tmpdir, env)
+        print(f"# Fetching ritzlib objects from {build_module().cas.default_root()} ...",
+              flush=True)
+        ritzlib_objs, err = build_ritzlib_objs(tmpdir, env, jobs=max(1, args.jobs))
         if err:
             print(f"FATAL: {err}")
             return 2

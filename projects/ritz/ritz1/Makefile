@@ -108,8 +108,7 @@ MKDEPS = python3 mkdeps.py
 # Keep the .ll files.  They are intermediates of .ritz → .ll → .o, so make
 # would delete them after a build; the next run then sees the .d naming a
 # missing .ll and recompiles every module.
-.SECONDARY: $(LL_FILES) $(patsubst %,$(BUILD_DIR)/ritzlib_%.ll,$(RITZLIB_MODULES)) \
-	$(patsubst %,$(BUILD_DIR)/%_sh.ll,$(SOURCES))
+.SECONDARY: $(LL_FILES) $(patsubst %,$(BUILD_DIR)/%_sh.ll,$(SOURCES))
 
 # Compile .ritz to .ll (1:1, with imports as external declarations).
 # All modules use --no-runtime: main.ritz defines main(), and _start comes
@@ -124,22 +123,28 @@ $(BUILD_DIR)/%.o: $(BUILD_DIR)/%.ll
 	@echo "Compiling $< → $@"
 	clang -c -O2 $< -o $@
 
-# === Compile ritzlib modules ===
-$(BUILD_DIR)/ritzlib_%.ll: $(RITZLIB_DIR)/%.ritz | $(BUILD_DIR)
-	@echo "Compiling ritzlib/$*.ritz → $@"
+# === ritzlib modules: from the shared artifact store (AGAST #1894) ===
+# `cas.py get-or-build` returns the ritz0 --no-runtime object of a module
+# from ~/.cache/ritz/cas ($RITZ_CACHE_DIR), compiling and storing it on a miss,
+# with build.py's key and object flags.  So the ritz1 build, build.py,
+# test_runner and the regression matrix share one compiled copy of each
+# ritzlib module, across every worktree on the machine.  It used to be its own
+# ritz0 + `clang -c -O2` pair per worktree, a key nothing else could hit.
+# The .d still lists the transitive imports, so an edit re-runs the shim
+# (whose key covers the closure anyway).
+CAS_OBJ = python3 ../cas.py get-or-build
+
+$(BUILD_DIR)/ritzlib_%.o: $(RITZLIB_DIR)/%.ritz | $(BUILD_DIR)
+	@echo "ritzlib/$*.ritz → $@ (artifact store)"
 	@$(MKDEPS) $< $@ > $(BUILD_DIR)/ritzlib_$*.d.tmp && mv $(BUILD_DIR)/ritzlib_$*.d.tmp $(BUILD_DIR)/ritzlib_$*.d
-	$(RITZ0) $< --no-runtime -o $@
+	$(CAS_OBJ) $< $@
 
 # Nested ritzlib modules (ritzlib/os/env.ritz -> ritzlib_os_env).  Explicit
 # rules beat the ritzlib_% pattern above, which would look for os_env.ritz.
-$(BUILD_DIR)/ritzlib_os_env.ll: $(RITZLIB_DIR)/os/env.ritz | $(BUILD_DIR)
-	@echo "Compiling ritzlib/os/env.ritz → $@"
+$(BUILD_DIR)/ritzlib_os_env.o: $(RITZLIB_DIR)/os/env.ritz | $(BUILD_DIR)
+	@echo "ritzlib/os/env.ritz → $@ (artifact store)"
 	@$(MKDEPS) $< $@ > $(BUILD_DIR)/ritzlib_os_env.d.tmp && mv $(BUILD_DIR)/ritzlib_os_env.d.tmp $(BUILD_DIR)/ritzlib_os_env.d
-	$(RITZ0) $< --no-runtime -o $@
-
-$(BUILD_DIR)/ritzlib_%.o: $(BUILD_DIR)/ritzlib_%.ll
-	@echo "Compiling $< → $@"
-	clang -c -O2 $< -o $@
+	$(CAS_OBJ) $< $@
 
 # === Build ritz1 from source using ritz0 ===
 ritz1: $(RITZ1)

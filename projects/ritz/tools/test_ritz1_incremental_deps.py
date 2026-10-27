@@ -44,6 +44,22 @@ FAKE_RITZ0 = textwrap.dedent(
     """
 )
 
+# ritzlib objects come from `cas.py get-or-build` (AGAST #1894), which always
+# runs the real ritz0; this stands in for it the way FAKE_RITZ0 stands in for
+# ritz0: record the source, emit a trivial object.
+FAKE_CAS_OBJ = textwrap.dedent(
+    """\
+    import subprocess, sys
+    from pathlib import Path
+    src, out = Path(sys.argv[1]), Path(sys.argv[2])
+    with open(Path(__file__).with_name("compiled.log"), "a") as f:
+        f.write("ritzlib/" + src.name + "\\n")
+    ll = out.with_suffix(".ll")
+    ll.write_text("; fake\\n")
+    subprocess.run(["clang", "-c", str(ll), "-o", str(out)], check=True)
+    """
+)
+
 pytestmark = pytest.mark.skipif(
     not (shutil.which("make") and shutil.which("clang") and shutil.which("ld")),
     reason="needs make, clang and ld",
@@ -69,6 +85,7 @@ def built_tree(tmp_path_factory: pytest.TempPathFactory) -> Path:
     for f in [ROOT / "runtime" / "Makefile", *(ROOT / "runtime").glob("*.ll")]:
         shutil.copy(f, tmp_path / "runtime")
     (tmp_path / "fake_ritz0.py").write_text(FAKE_RITZ0)
+    (tmp_path / "fake_cas_obj.py").write_text(FAKE_CAS_OBJ)
     _make(tmp_path)
     assert (tmp_path / "ritz1" / "build" / "ritz1").exists()
     return tmp_path
@@ -93,6 +110,7 @@ def _make(tree: Path) -> list[str]:
             str(tree / "ritz1"),
             "ritz1",
             f"RITZ0={sys.executable} {tree / 'fake_ritz0.py'}",
+            f"CAS_OBJ={sys.executable} {tree / 'fake_cas_obj.py'}",
         ],
         capture_output=True,
         text=True,

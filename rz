@@ -999,12 +999,12 @@ def build_example_with_build_py(example_rel_path, compiler="ritz0"):
 
     build_py = PROJECTS_DIR / "ritz" / "build.py"
 
-    # Clean first to ensure fresh build (avoid cross-compiler cache pollution)
-    subprocess.run(
-        [sys.executable, str(build_py), "clean", example_rel_path],
-        env=env, capture_output=True, text=True,
-        cwd=PROJECTS_DIR / "ritz",
-    )
+    # No `build.py clean` first (AGAST #1894). It was there to stop one
+    # compiler's cached artifacts answering for the other's; since #1808
+    # objects live in the shared store keyed by compiler fingerprint, and the
+    # binary manifest names the compiler, so neither can. And `clean` ignored
+    # the example argument: per example it deleted every package's binaries,
+    # every __pycache__ and the whole import-scan cache.
 
     # Build with the selected compiler (build.py gained --compiler ritz1 in Phase I)
     cmd = [sys.executable, str(build_py), "build", example_rel_path,
@@ -1043,6 +1043,20 @@ def test_example_with_build_py(example_rel_path, compiler="ritz0"):
         cwd=PROJECTS_DIR / "ritz",
     )
     return "ok" if result.returncode == 0 else "fail"
+
+
+def cmd_cache(args):
+    """Handle 'rz cache' — the shared artifact store (projects/ritz/cas.py).
+
+    `rz cache gc` trims it to a size cap, least-recently-used first
+    (default $RITZ_CACHE_MAX_BYTES, else cas.DEFAULT_GC_BYTES); every
+    ci_local gate ends with the same trim. `rz cache path` prints where it is.
+    AGAST #1894.
+    """
+    argv = [args.cache_command or "path"]
+    if getattr(args, "max_bytes", None) is not None:
+        argv += ["--max-bytes", str(args.max_bytes)]
+    return subprocess.run([sys.executable, str(PROJECTS_DIR / "ritz" / "cas.py"), *argv]).returncode
 
 
 def cmd_compare(args):
@@ -1858,6 +1872,14 @@ def build_parser():
     compare_parser.add_argument("--skip-tests", action="store_true",
                                help="Only run builds, skip test execution (faster)")
 
+    # cache
+    cache_parser = subparsers.add_parser("cache", help="Shared artifact store (gc, path)")
+    cache_sub = cache_parser.add_subparsers(dest="cache_command")
+    cache_gc = cache_sub.add_parser("gc", help="Trim least-recently-used entries to a size cap")
+    cache_gc.add_argument("--max-bytes", type=int, default=None,
+                          help="cap in bytes (default $RITZ_CACHE_MAX_BYTES, else 4 GiB)")
+    cache_sub.add_parser("path", help="Print the store directory")
+
     # ci (new subcommand tree — ported from holy-fuck-wip; see cmd_ci* funcs above)
     ci_parser = subparsers.add_parser("ci", help="CI planning/execution/generation")
     ci_sub = ci_parser.add_subparsers(dest="ci_command")
@@ -1885,6 +1907,7 @@ def build_parser():
         "list": cmd_list,
         "clean": cmd_clean,
         "compare": cmd_compare,
+        "cache": cmd_cache,
         "ci": cmd_ci,
     }
     for name, sub in subparsers.choices.items():

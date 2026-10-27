@@ -24,6 +24,7 @@ import signal
 import argparse
 import tempfile
 import textwrap
+import threading
 from pathlib import Path
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
@@ -381,6 +382,70 @@ def cas_module_key(src: Path, cache: BuildCache, compiler: str) -> Optional[str]
         # An import that does not parse has no interface: compile uncached
         # and let the compiler report the real error.
         return None
+
+
+# BuildCache is not thread-safe; the regression matrix calls in from a pool.
+_CAS_CONTEXT_LOCK = threading.Lock()
+
+
+def cas_closure(src: Path, project_root: Path) -> List[str]:
+    """Transitive imports of `src` (itself excluded), resolved in-process the
+    way `ritz0 --project-root <project_root>` resolves them. Raises if the
+    file (or an import) does not parse. Scans persist in the per-worktree
+    import store, so a later process re-parses only changed files."""
+    src = Path(src).resolve()
+    cache = get_build_cache("ritz0")
+    with _CAS_CONTEXT_LOCK:
+        cache.set_import_context(project_root=project_root)
+        closure = cache.get_transitive_dependencies(src)
+        cache._save_imports_db()
+    return sorted(p for p in closure if p != str(src))
+
+
+def cas_object(src: Path, out_obj: Path, *, project_root: Path,
+               env: Optional[dict] = None, timeout: int = 120) -> Optional[str]:
+    """Write the ritz0 `--no-runtime` object of `src` to `out_obj`, from the
+    shared store or by compiling and storing it (AGAST #1894).
+
+    The key and the object pipeline are exactly compile_binary's (ritz0,
+    verify_ir, `compile_ll_to_obj`), so an object built here is a hit for
+    build.py, test_runner, the regression matrix and ritz1's Makefile alike.
+    Returns None on success, else an error naming the file; on failure
+    `out_obj` does not exist and nothing is stored.
+    """
+    src = Path(src).resolve()
+    out_obj = Path(out_obj)
+    out_obj.parent.mkdir(parents=True, exist_ok=True)
+    cache = get_build_cache("ritz0")
+    with _CAS_CONTEXT_LOCK:
+        cache.set_import_context(project_root=project_root)
+        key = cas_module_key(src, cache, "ritz0")
+    store = cas.ArtifactStore()
+    if key is not None:
+        hit = store.get(key, "o")
+        if hit is not None:
+            shutil.copyfile(hit, out_obj)
+            return None
+    ll_path = out_obj.with_suffix(".ll")
+    cmd = [sys.executable, str(RITZ0), str(src), "-o", str(ll_path), "--no-runtime",
+           "--project-root", str(project_root)]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return f"{src.name}: ritz0 timed out after {timeout}s"
+    if r.returncode != 0:
+        out_obj.unlink(missing_ok=True)
+        return f"{src.name}: ritz0 failed: {r.stderr[-300:]}"
+    error = verify_ir(ll_path, src) or compile_ll_to_obj(ll_path, out_obj, src)
+    if error:
+        out_obj.unlink(missing_ok=True)
+        return error
+    if key is not None:
+        ident = cas.module_identity(src)
+        store.put(key, "ll", ll_path)
+        store.put(key, "o", out_obj, identity=ident)
+        store.put_meta(key, {"module": ident, "compiler": "ritz0"})
+    return None
 
 
 def report_compile_failures(failures: List[Tuple[Path, str]], compiler: str) -> None:

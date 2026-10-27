@@ -228,6 +228,18 @@ def print_cas_summary(log: Path) -> None:
         print(f"  compiled more than once: {ident} ({key})")
 
 
+def trim_cas() -> None:
+    """AGAST #1894: the periodic trim. Every gate ends by bounding the shared
+    store to $RITZ_CACHE_MAX_BYTES (default cas.DEFAULT_GC_BYTES), least
+    recently used first, so it cannot grow without limit on a machine that
+    runs gates all day. Entries this gate used were just touched, so they
+    are the last to go."""
+    cas = _cas_module()
+    store = cas.ArtifactStore()
+    removed, freed = store.gc(cas.default_max_bytes())
+    print(f"[ritz-cas] gc: removed {removed} files, freed {freed} bytes from {store.root}")
+
+
 def run_step(step: Step, dry_run: bool = False) -> int:
     cwd = (REPO_ROOT / step.workdir).resolve()
     print(f"\n{'=' * 70}", flush=True)
@@ -328,6 +340,7 @@ def main(argv: list[str] | None = None) -> int:
     if cas_log is not None:
         print_cas_summary(cas_log)
         cas_log.unlink(missing_ok=True)
+        trim_cas()
     if not_run:
         # Named, never silent: a fail-fast run asserts less than a full one.
         print("not run (--fail-fast stopped after the first failure):")

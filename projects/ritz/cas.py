@@ -33,6 +33,16 @@ private temp file and `os.replace`, so a reader sees the whole file or no
 file. Two processes that miss on the same key both compile and both write
 equivalent bytes; there is no shared index file to fight over.
 
+Consumers (AGAST #1894): build.py compile_binary, ritz0/test_runner's
+dependency objects, tools/run_regression_matrix.py's ritzlib and dependency
+objects (build.cas_object), and ritz1/Makefile's ritzlib objects through
+`cas.py get-or-build SRC OUT.o`. All share build.cas_module_key, so one
+compile of a module serves all of them, in every worktree.
+
+Size: `rz cache gc` (`cas.py gc`) trims least-recently-used entries to
+$RITZ_CACHE_MAX_BYTES (default DEFAULT_GC_BYTES); every ci_local gate ends
+with that trim.
+
 Stats: `RITZ_CAS_STATS=1` prints hits/misses/bytes for the process to stderr
 at exit. `RITZ_CAS_STATS_LOG=<file>` appends one JSON line per process with
 the same counts plus the identity of every miss; `python3 cas.py summary
@@ -57,9 +67,22 @@ from typing import Callable, Dict, Iterable, List, Optional
 CAS_DIR_ENV = "RITZ_CACHE_DIR"
 STATS_ENV = "RITZ_CAS_STATS"
 STATS_LOG_ENV = "RITZ_CAS_STATS_LOG"
+MAX_BYTES_ENV = "RITZ_CACHE_MAX_BYTES"
 # Bumped when the key layout changes, so old and new layouts never collide.
 KEY_SCHEMA = "ritz-cas-v1"
+# The default cap for `rz cache gc` and the trim every ci_local gate ends
+# with (AGAST #1894). A full gate stores well under 1 GiB of objects (one
+# compiler fingerprint's worth of ritzlib, ritz1 and test closures), so 4 GiB
+# keeps several compiler versions -- other worktrees, a bisect -- warm.
 DEFAULT_GC_BYTES = 4 * 1024 ** 3
+
+
+def default_max_bytes() -> int:
+    """$RITZ_CACHE_MAX_BYTES, else DEFAULT_GC_BYTES."""
+    try:
+        return int(os.environ[MAX_BYTES_ENV])
+    except (KeyError, ValueError):
+        return DEFAULT_GC_BYTES
 
 
 def default_root() -> Path:
@@ -354,13 +377,44 @@ def summarise(log: Path) -> dict:
             "compiled_more_than_once": dup}
 
 
+def _build_module():
+    """build.py, loaded by path. It owns the key and the object pipeline; this
+    file stays a plain store that build.py imports, not the other way round."""
+    import importlib.util
+    pkg_dir = Path(__file__).resolve().parent
+    if str(pkg_dir) not in sys.path:
+        sys.path.append(str(pkg_dir))
+    spec = importlib.util.spec_from_file_location("ritz_build_py", pkg_dir / "build.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def get_or_build(src: Path, out: Path, project_root: Path) -> int:
+    """`cas.py get-or-build`: the ritz1 Makefile's ritzlib rule (AGAST #1894).
+
+    Same key and pipeline as build.py's, so the ritz1 build and the gate share
+    ritzlib objects across worktrees.
+    """
+    err = _build_module().cas_object(src, out, project_root=project_root)
+    if err:
+        print(f"cas.py get-or-build: {err}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     import argparse
     ap = argparse.ArgumentParser(description="Ritz content-addressed artifact store")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("path", help="print the store directory")
     g = sub.add_parser("gc", help="trim least-recently-used entries")
-    g.add_argument("--max-bytes", type=int, default=DEFAULT_GC_BYTES)
+    g.add_argument("--max-bytes", type=int, default=None,
+                   help=f"cap (default ${MAX_BYTES_ENV}, else {DEFAULT_GC_BYTES})")
+    b = sub.add_parser("get-or-build", help="ritz0 --no-runtime object of SRC, via the store")
+    b.add_argument("src")
+    b.add_argument("out")
+    b.add_argument("--project-root", default=str(Path(__file__).resolve().parent))
     s = sub.add_parser("summary", help="aggregate a RITZ_CAS_STATS_LOG file")
     s.add_argument("log")
     args = ap.parse_args(argv)
@@ -368,8 +422,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.cmd == "path":
         print(store.root)
     elif args.cmd == "gc":
-        removed, freed = store.gc(args.max_bytes)
+        cap = args.max_bytes if args.max_bytes is not None else default_max_bytes()
+        removed, freed = store.gc(cap)
         print(f"removed {removed} files, freed {freed} bytes from {store.root}")
+    elif args.cmd == "get-or-build":
+        return get_or_build(Path(args.src), Path(args.out), Path(args.project_root))
     elif args.cmd == "summary":
         res = summarise(Path(args.log))
         print(f"[ritz-cas] gate: processes={res['processes']} hits={res['hits']} "
