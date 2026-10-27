@@ -4,7 +4,23 @@ import ast
 import emitter_core
 import emitter_expr
 import emitter_print
+import ritzlib.memory
 
+# AGAST #1813: per-call register arrays, sized from the argument list.  They
+# were `[16]i32` locals: two sites dropped arguments past the 16th (a 17-arg
+# call passed 16 and miscompiled with exit 0); the others wrote past the
+# array.  `min` reserves slots the caller appends beyond the written args.
+fn call_reg_slots(args: *Expr, min: i32) -> *i32
+    var n: i32 = 0
+    var a: *Expr = args
+    while a != null
+        n = n + 1
+        a = a.next
+    if n < min
+        n = min
+    if n < 1
+        n = 1
+    return malloc((n as i64) * 4) as *i32
 
 # =============================================================================
 # Method-dispatch helpers (ported from ritz0 Wave-1 commit 0278a27).
@@ -290,8 +306,9 @@ fn try_emit_ufcs_method(s: *EmitterState, e: *Expr, type_name: *u8, type_name_le
         prefix_len = ng_len
         append_suffix = 0
 
-    # Build: <prefix><method>[<$T>]
-    var mangled: [128]u8
+    # Build: <prefix><method>[<$T>].  Heap, sized exactly: a fixed [128]u8
+    # was overrun by a long method or type name (AGAST #1813).
+    let mangled: *u8 = malloc((prefix_len + e.ident_len + type_name_len + 1) as i64)
     var mangled_len: i32 = 0
     for i in 0..prefix_len
         mangled[mangled_len] = prefix_buf[i]
@@ -305,7 +322,7 @@ fn try_emit_ufcs_method(s: *EmitterState, e: *Expr, type_name: *u8, type_name_le
             mangled_len += 1
 
     # Must resolve to a known function for us to dispatch here
-    let fn_def: *FnDef = find_fn(s, @mangled[0], mangled_len)
+    let fn_def: *FnDef = find_fn(s, mangled, mangled_len)
     if fn_def == null
         return -1
 
@@ -322,7 +339,7 @@ fn try_emit_ufcs_method(s: *EmitterState, e: *Expr, type_name: *u8, type_name_le
         recv_ptr = loaded
 
     # Evaluate the argument expressions first (receiver is already a ptr register)
-    var arg_regs: [16]i32
+    let arg_regs: *i32 = call_reg_slots(e.args, 0)
     var arg_count: i32 = 0
     var arg: *Expr = e.args
     # Params walked alongside, skipping the receiver (AGAST #1498).
@@ -330,15 +347,14 @@ fn try_emit_ufcs_method(s: *EmitterState, e: *Expr, type_name: *u8, type_name_le
     if ap != null
         ap = ap.next
     while arg != null
-        if arg_count < 16
-            arg_regs[arg_count] = emit_call_arg(s, arg, ap)
-            arg_count = arg_count + 1
+        arg_regs[arg_count] = emit_call_arg(s, arg, ap)
+        arg_count = arg_count + 1
         if ap != null
             ap = ap.next
         arg = arg.next
 
     # Convert argument values to match parameter types (skip the receiver slot)
-    var converted_regs: [16]i32
+    let converted_regs: *i32 = call_reg_slots(e.args, 0)
     var param_ptr: *Param = fn_def.params
     # Skip receiver param
     if param_ptr != null
@@ -529,7 +545,7 @@ fn try_emit_ufcs_method(s: *EmitterState, e: *Expr, type_name: *u8, type_name_le
             emit_str(s, c" = call ptr @")
         else
             emit_str(s, c" = call i64 @")
-    emit_name(s, @mangled[0], mangled_len)
+    emit_name(s, mangled, mangled_len)
     emit_str(s, c"(")
     if ufcs_sret > 0
         emit_sret_attr(s, fn_def.return_type_name, fn_def.return_type_name_len)
@@ -557,7 +573,7 @@ fn try_emit_ufcs_method(s: *EmitterState, e: *Expr, type_name: *u8, type_name_le
 
     # Register as an external so link-time lookups succeed even if monomorphization
     # instantiated this helper in a sibling module.
-    add_extern(s, @mangled[0], mangled_len)
+    add_extern(s, mangled, mangled_len)
 
     # Sign/zero-extend smaller return values to i64 for uniform representation
     if ret_type == TYPE_I32
@@ -877,16 +893,7 @@ fn emit_variant_struct(s: *EmitterState, tag: i32, payload_expr: *Expr) -> i32
                         aggregate_name = fld.field_type_name
                         aggregate_name_len = fld.field_type_name_len
         else if payload_expr.kind == EXPR_CALL
-            var full_name: [256]u8
-            var full_len: i32 = 0
-            for i in 0..payload_expr.func_name_len
-                full_name[full_len] = *(payload_expr.func_name + i)
-                full_len = full_len + 1
-            if payload_expr.call_type_suffix_len > 0
-                for i in 0..payload_expr.call_type_suffix_len
-                    full_name[full_len] = *(payload_expr.call_type_suffix + i)
-                    full_len = full_len + 1
-            let fn_def: *FnDef = find_fn(s, @full_name[0], full_len)
+            let fn_def: *FnDef = find_call_fn(s, payload_expr)
             if fn_def != null
                 if fn_def.return_type == TYPE_STRUCT
                     if fn_def.return_type_name_len > 0
@@ -1619,13 +1626,12 @@ fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
             icall_sig = icall_lv.fn_sig
     if icall_local >= 0 and e.call_type_suffix_len == 0 and icall_sig == null
         # Evaluate args first.
-        var icall_args: [16]i32
+        let icall_args: *i32 = call_reg_slots(e.args, 0)
         var icall_argc: i32 = 0
         var icall_arg: *Expr = e.args
         while icall_arg != null
-            if icall_argc < 16
-                icall_args[icall_argc] = emit_expr(s, icall_arg)
-                icall_argc += 1
+            icall_args[icall_argc] = emit_expr(s, icall_arg)
+            icall_argc += 1
             icall_arg = icall_arg.next
         # Load fn pointer from the slot.
         let icall_fp: i32 = next_reg(s)
@@ -1654,7 +1660,9 @@ fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
 
     # Regular function call - register as external if not defined in this module
     # Build the full function name with type suffix (e.g., "vec_new$u8" for vec_new<u8>())
-    var full_name: [128]u8
+    # Heap, sized for the longer of name+suffix and "__ritz_builtin_"+name: a
+    # fixed [128]u8 was overrun by a long name (AGAST #1813).
+    let full_name: *u8 = malloc((e.func_name_len + e.call_type_suffix_len + 16) as i64)
     var full_len: i32 = 0
     # Copy base function name
     for i in 0..e.func_name_len
@@ -1685,21 +1693,22 @@ fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
         for i in 0..e.func_name_len
             full_name[full_len] = *(e.func_name + i)
             full_len += 1
-        add_extern(s, @full_name[0], full_len)
+        add_extern(s, full_name, full_len)
     else if icall_sig == null
-        add_extern(s, @full_name[0], full_len)
-        fn_def = find_fn(s, @full_name[0], full_len)
+        add_extern(s, full_name, full_len)
+        fn_def = find_fn(s, full_name, full_len)
 
-    var arg_regs: [16]i32
+    # Sized from the argument list (AGAST #1813): a fixed [16] dropped every
+    # argument past the 16th.  Room for the 3 a syscall builtin is padded to.
+    let arg_regs: *i32 = call_reg_slots(e.args, 3)
     var arg_count: i32 = 0
     var arg2: *Expr = e.args
     var ap: *Param = null
     if fn_def != null
         ap = fn_def.params
     while arg2 != null
-        if arg_count < 16
-            arg_regs[arg_count] = emit_call_arg(s, arg2, ap)
-            arg_count += 1
+        arg_regs[arg_count] = emit_call_arg(s, arg2, ap)
+        arg_count += 1
         if ap != null
             ap = ap.next
         arg2 = arg2.next
@@ -1729,8 +1738,8 @@ fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
             ret_struct_name_len = fn_def.return_type_name_len
 
     # Convert argument values to match parameter types BEFORE emitting call
-    var converted_regs: [16]i32
-    var param_types: [16]i32
+    let converted_regs: *i32 = call_reg_slots(e.args, 3)
+    let param_types: *i32 = call_reg_slots(e.args, 3)
     var param_ptr: *Param = null
     if fn_def != null
         param_ptr = fn_def.params
@@ -2303,7 +2312,7 @@ fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
         emit_reg(s, icall_fp_reg)
     else
         emit_str(s, c"@")
-        emit_name(s, @full_name[0], full_len)
+        emit_name(s, full_name, full_len)
     emit_str(s, c"(")
     if call_sret > 0
         emit_sret_attr(s, ret_struct_name, ret_struct_name_len)
@@ -2902,7 +2911,7 @@ fn emit_expr_method(s: *EmitterState, e: *Expr) -> i32
                 sib = sib.next
             if sm_method != null
                 # Evaluate args first.
-                var sm_arg_regs: [16]i32
+                let sm_arg_regs: *i32 = call_reg_slots(e.args, 0)
                 var sm_arg_count: i32 = 0
                 var sm_arg: *Expr = e.args
                 # No receiver: params line up from the head (AGAST #1498).
@@ -2918,7 +2927,7 @@ fn emit_expr_method(s: *EmitterState, e: *Expr) -> i32
                 # head (no skip).  Float-narrow lit→f32 via fptrunc when
                 # the param type is f32 — same pattern as f32-aware var-decl
                 # narrowing (commit 960a388).  Other types pass-through.
-                var sm_conv: [16]i32
+                let sm_conv: *i32 = call_reg_slots(e.args, 0)
                 var sm_p: *Param = sm_method.params
                 var sm_arg_e: *Expr = e.args
                 for k in 0..sm_arg_count
@@ -2993,16 +3002,7 @@ fn emit_expr_method(s: *EmitterState, e: *Expr) -> i32
         # call itself and materialise the result into a stack slot so the
         # ptr-dispatch fallback paths still have something to pass.
         # (ritz-task-106)
-        var full_name: [256]u8
-        var full_len: i32 = 0
-        for i in 0..e.left.func_name_len
-            full_name[full_len] = *(e.left.func_name + i)
-            full_len = full_len + 1
-        if e.left.call_type_suffix_len > 0
-            for i in 0..e.left.call_type_suffix_len
-                full_name[full_len] = *(e.left.call_type_suffix + i)
-                full_len = full_len + 1
-        let fn_def: *FnDef = find_fn(s, @full_name[0], full_len)
+        let fn_def: *FnDef = find_call_fn(s, e.left)
         if fn_def != null
             if fn_def.return_type == TYPE_STRUCT
                 if fn_def.return_type_name_len > 0
@@ -3168,8 +3168,8 @@ fn emit_expr_method(s: *EmitterState, e: *Expr) -> i32
         ib_it = ib_it.next
 
     # First, evaluate all arguments and collect their registers
-    var arg_regs: [16]i32
-    var conv_regs: [16]i32
+    let arg_regs: *i32 = call_reg_slots(e.args, 0)
+    let conv_regs: *i32 = call_reg_slots(e.args, 0)
     var arg_count: i32 = 0
     var arg: *Expr = e.args
     # Params walked alongside, skipping self (AGAST #1498).

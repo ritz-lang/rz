@@ -19,15 +19,22 @@ import tokens_gen
 # Emitter State
 # =============================================================================
 
+# Fixed tables: overflowing either is a located fatal error (AGAST #1813),
+# never a silent drop.  Both are inline arrays in EmitterState, which ritz1
+# cannot yet address through a pointer field (`@s.p[i]`).
 const MAX_LOCALS: i32 = 256
 const MAX_STRINGS: i32 = 4096  # Self-hosting: merged modules have >256 string literals
-const MAX_EXTERNS: i32 = 2048  # Self-hosting needs many externs (hundreds of functions per module)
-const MAX_EMITTED_NAMES: i32 = 512  # Track emitted structs/functions to avoid duplicates
 
-# Track emitted names for deduplication (imports can duplicate structs/functions)
-struct EmittedName
-    name: *u8
-    name_len: i32
+# A growable list of names (pointer + length), for the extern and emitted-
+# name sets.  Those were fixed arrays (2048 / 512) that silently dropped
+# entries past the cap (AGAST #1813): a dropped emitted name is emitted twice,
+# a dropped extern is never declared.  Parallel arrays rather than an array
+# of structs: ritz1 cannot take `@s.p[i]` through a pointer field.
+struct NameList
+    names: **u8
+    lens: *i32
+    count: i32
+    cap: i32
 
 struct LocalVar
     name: *u8
@@ -59,10 +66,6 @@ struct StringLit
     data: *u8
     len: i32
 
-struct ExternFunc
-    name: *u8
-    name_len: i32
-
 struct EmitterState
     out: *Vec<u8>
     reg_counter: i32
@@ -74,15 +77,11 @@ struct EmitterState
     module: *Module
     strings: [4096]StringLit
     string_count: i32
-    externs: [2048]ExternFunc  # Self-hosting needs many externs (hundreds of functions per module)
-    extern_count: i32
+    externs: NameList
     # Deduplication tracking for imports
-    emitted_structs: [512]EmittedName
-    emitted_struct_count: i32
-    emitted_fns: [512]EmittedName
-    emitted_fn_count: i32
-    emitted_globals: [512]EmittedName
-    emitted_global_count: i32
+    emitted_structs: NameList
+    emitted_fns: NameList
+    emitted_globals: NameList
     # Track last expression value for if/else phi nodes
     last_expr_reg: i32
     # ritz-task-1309 — the block that DEFINED `last_expr_reg`.
@@ -238,6 +237,54 @@ fn emit_ir_error_end(s: *EmitterState, name: *u8, len: i32)
         i += 1
     eprints_cstr(c"'\n")
     s.error_count = s.error_count + 1
+
+# Same, for a message followed by an integer (a kind number, say).
+fn emit_ir_error_kind(s: *EmitterState, msg: *u8, kind: i32)
+    emit_str(s, c"  ; ERROR: ")
+    emit_str(s, msg)
+    emit_int(s, kind as i64)
+    emit_str(s, c"\n")
+    eprints_cstr(c"error: ritz1 cannot emit: ")
+    eprints_cstr(msg)
+    eprint_int(kind as i64)
+    eprints_cstr(c"\n")
+    s.error_count = s.error_count + 1
+
+# AGAST #1813 — where the emitter is, for fatal capacity errors: the input
+# file (set by the driver) and the function being emitted (set by emit_fn).
+var g_emit_file: *u8 = null
+var g_emit_fn: *FnDef = null
+
+pub fn emitter_set_source_file(path: *u8)
+    g_emit_file = path
+
+pub fn emitter_set_current_fn(f: *FnDef)
+    g_emit_fn = f
+
+# A fixed ritz1 table is full.  Print a located error and exit: carrying on
+# without the entry is exactly the silent miscompile this replaces, and the
+# driver has not written the output yet.
+fn emit_fatal_limit(what: *u8, limit: i32)
+    eprints_cstr(c"error: ")
+    if g_emit_file != null
+        eprints_cstr(g_emit_file)
+    else
+        eprints_cstr(c"<input>")
+    # Through a local: ritz1 cannot lower a member read on a global pointer.
+    let f: *FnDef = g_emit_fn
+    if f != null
+        eprints_cstr(c":")
+        eprint_int(f.line as i64)
+        eprints_cstr(c": in fn '")
+        for i in 0..f.name_len
+            eprint_char(*(f.name + i))
+        eprints_cstr(c"'")
+    eprints_cstr(c": ")
+    eprints_cstr(what)
+    eprints_cstr(c" (ritz1's limit is ")
+    eprint_int(limit as i64)
+    eprints_cstr(c")\n")
+    sys_exit(1)
 
 fn emit_int(s: *EmitterState, n: i64)
     if n < 0
@@ -543,28 +590,29 @@ fn set_local_fn_sig(s: *EmitterState, name: *u8, len: i32, sig: *FnDef)
         loc.fn_sig = sig
 
 fn add_local_full(s: *EmitterState, name: *u8, len: i32, reg: i32, var_type: i32, type_name: *u8, type_name_len: i32, pointee: i32, arr_size: i32, arr_elem: i32)
-    if s.local_count < MAX_LOCALS
-        let idx: i32 = s.local_count
-        let loc: *LocalVar = @s.locals[idx]
-        loc.name = name
-        loc.name_len = len
-        loc.reg = reg
-        loc.var_type = var_type
-        loc.type_name = type_name
-        loc.type_name_len = type_name_len
-        loc.pointee_type = pointee
-        loc.array_size = arr_size
-        loc.array_elem_type = arr_elem
-        loc.is_bool = 0
-        loc.fn_sig = null
-        s.local_count = idx + 1
-        # ritz-task-193 — mirror into HashMap so find_local* hits O(1).
-        # Store `idx + 1` so the value is non-zero (0 = miss in
-        # hashmap_i64_get).  Same name overwrites (inner shadows outer);
-        # the find fallback + rebuild_local_map together preserve correct
-        # shadow semantics.
-        let key: i64 = fnv1a_str(name, len) as i64
-        hashmap_i64_insert(@s.local_map, key, (idx + 1) as i64)
+    if s.local_count >= MAX_LOCALS
+        emit_fatal_limit(c"too many locals and params in one function", MAX_LOCALS)
+    let idx: i32 = s.local_count
+    let loc: *LocalVar = @s.locals[idx]
+    loc.name = name
+    loc.name_len = len
+    loc.reg = reg
+    loc.var_type = var_type
+    loc.type_name = type_name
+    loc.type_name_len = type_name_len
+    loc.pointee_type = pointee
+    loc.array_size = arr_size
+    loc.array_elem_type = arr_elem
+    loc.is_bool = 0
+    loc.fn_sig = null
+    s.local_count = idx + 1
+    # ritz-task-193 — mirror into HashMap so find_local* hits O(1).
+    # Store `idx + 1` so the value is non-zero (0 = miss in
+    # hashmap_i64_get).  Same name overwrites (inner shadows outer);
+    # the find fallback + rebuild_local_map together preserve correct
+    # shadow semantics.
+    let key: i64 = fnv1a_str(name, len) as i64
+    hashmap_i64_insert(@s.local_map, key, (idx + 1) as i64)
 
 # ritz-task-193 — module-scope find_* now use HashMaps populated once per
 # module by build_symbol_maps in emit_module (after monomorphization fixes
@@ -582,15 +630,17 @@ fn find_global(s: *EmitterState, name: *u8, len: i32) -> *GlobalVarDef
     let g: *GlobalVarDef = hashmap_i64_get(@s.global_map, key) as *GlobalVarDef
     if g == null
         return null
-    # Collision check — verify the name matches before trusting the entry.
-    if g.name_len != len
-        return null
-    var j: i32 = 0
-    while j < len
-        if *(g.name + j) != *(name + j)
-            return null
-        j = j + 1
-    return g
+    if name_eq(g.name, g.name_len, name, len) == 1
+        return g
+    # AGAST #1813: the map is keyed by the 64-bit hash alone, so a hit with
+    # another name is a collision, not a miss.  Scan the list (first
+    # occurrence wins, as in build_symbol_maps).
+    var cur: *GlobalVarDef = s.module.globals
+    while cur != null
+        if name_eq(cur.name, cur.name_len, name, len) == 1
+            return cur
+        cur = cur.next
+    return null
 
 # Find a function definition by name - returns the FnDef or null.
 # Same null-as-miss optimization as find_global.
@@ -599,14 +649,34 @@ fn find_fn(s: *EmitterState, name: *u8, len: i32) -> *FnDef
     let fn_def: *FnDef = hashmap_i64_get(@s.fn_map, key) as *FnDef
     if fn_def == null
         return null
-    if fn_def.name_len != len
-        return null
-    var j: i32 = 0
-    while j < len
-        if *(fn_def.name + j) != *(name + j)
-            return null
-        j = j + 1
-    return fn_def
+    if name_eq(fn_def.name, fn_def.name_len, name, len) == 1
+        return fn_def
+    # AGAST #1813: the map is keyed by the 64-bit hash alone, so a hit with
+    # another name is a collision, not a miss.  Scan the list (first
+    # occurrence wins, as in build_symbol_maps).
+    var cur: *FnDef = s.module.functions
+    while cur != null
+        if name_eq(cur.name, cur.name_len, name, len) == 1
+            return cur
+        cur = cur.next
+    return null
+
+# The FnDef a call expression names: `func_name` plus its generic suffix
+# (`vec_new` + `$u8`).  Replaces nine copies of a loop that built the name in
+# a fixed [256]u8 stack buffer with no bounds check (AGAST #1813).
+fn find_call_fn(s: *EmitterState, e: *Expr) -> *FnDef
+    if e.call_type_suffix_len <= 0
+        return find_fn(s, e.func_name, e.func_name_len)
+    let n: i32 = e.func_name_len + e.call_type_suffix_len
+    let buf: *u8 = malloc(n as i64 + 1)
+    for i in 0..e.func_name_len
+        *(buf + i) = *(e.func_name + i)
+    for i in 0..e.call_type_suffix_len
+        *(buf + e.func_name_len + i) = *(e.call_type_suffix + i)
+    *(buf + n) = 0
+    let fd: *FnDef = find_fn(s, buf, n)
+    free(buf)
+    return fd
 
 # Find a struct definition by name.  Same null-as-miss optimization.
 fn find_struct(s: *EmitterState, name: *u8, len: i32) -> *StructDef
@@ -614,14 +684,17 @@ fn find_struct(s: *EmitterState, name: *u8, len: i32) -> *StructDef
     let st: *StructDef = hashmap_i64_get(@s.struct_map, key) as *StructDef
     if st == null
         return null
-    if st.name_len != len
-        return null
-    var j: i32 = 0
-    while j < len
-        if *(st.name + j) != *(name + j)
-            return null
-        j = j + 1
-    return st
+    if name_eq(st.name, st.name_len, name, len) == 1
+        return st
+    # AGAST #1813: the map is keyed by the 64-bit hash alone, so a hit with
+    # another name is a collision, not a miss.  Scan the list (first
+    # occurrence wins, as in build_symbol_maps).
+    var cur: *StructDef = s.module.structs
+    while cur != null
+        if name_eq(cur.name, cur.name_len, name, len) == 1
+            return cur
+        cur = cur.next
+    return null
 
 # Find field index in a struct (returns -1 if not found)
 fn find_field_index(st: *StructDef, field: *u8, field_len: i32) -> i32
@@ -659,34 +732,58 @@ struct MemberPtrResult
     field: *StructField   # Field info (type, name, etc.)
     success: i32          # 1 if successful, 0 if error
 
-fn add_extern(s: *EmitterState, name: *u8, len: i32)
-    # Check if already registered
+pub fn namelist_init(l: *NameList, cap: i32)
+    l.names = malloc((cap as i64) * 8) as **u8
+    l.lens = malloc((cap as i64) * 4) as *i32
+    l.count = 0
+    l.cap = cap
+
+# Index of `name` in the list, or -1.
+fn namelist_find(l: *NameList, name: *u8, len: i32) -> i32
+    let names: **u8 = l.names
+    let lens: *i32 = l.lens
     var i: i32 = 0
-    while i < s.extern_count
-        let ex: *ExternFunc = @s.externs[i]
-        if ex.name_len == len
-            var j: i32 = 0
-            var matched: i32 = 1
-            while j < len
-                if *(ex.name + j) != *(name + j)
-                    matched = 0
-                    break
-                j += 1
-            if matched == 1
-                return  # Already registered
-        i += 1
+    while i < l.count
+        let n: i32 = *(lens + i)
+        if n == len
+            let stored: *u8 = *(names + i)
+            if name_eq(stored, n, name, len) == 1
+                return i
+        i = i + 1
+    -1
+
+fn namelist_push(l: *NameList, name: *u8, len: i32)
+    if l.count >= l.cap
+        let cap: i64 = (l.cap as i64) * 2
+        l.names = realloc(l.names as *u8, cap * 8) as **u8
+        l.lens = realloc(l.lens as *u8, cap * 4) as *i32
+        l.cap = cap as i32
+    let names: **u8 = l.names
+    let lens: *i32 = l.lens
+    *(names + l.count) = name
+    *(lens + l.count) = len
+    l.count = l.count + 1
+
+fn namelist_count(l: *NameList) -> i32
+    l.count
+
+fn namelist_name(l: *NameList, i: i32) -> *u8
+    let names: **u8 = l.names
+    *(names + i)
+
+fn namelist_len(l: *NameList, i: i32) -> i32
+    let lens: *i32 = l.lens
+    *(lens + i)
+
+fn add_extern(s: *EmitterState, name: *u8, len: i32)
+    if namelist_find(@s.externs, name, len) >= 0
+        return  # Already registered
     # Add new external - copy the name since caller might use a stack buffer
-    if s.extern_count < MAX_EXTERNS
-        let ex: *ExternFunc = @s.externs[s.extern_count]
-        # Allocate memory for the name copy
-        let name_copy: *u8 = malloc(len as i64 + 1) as *u8
-        if name_copy != null
-            for k in 0..len
-                *(name_copy + k) = *(name + k)
-            *(name_copy + len) = 0  # Null terminate
-            ex.name = name_copy
-            ex.name_len = len
-            s.extern_count = s.extern_count + 1
+    let name_copy: *u8 = malloc(len as i64 + 1) as *u8
+    for k in 0..len
+        *(name_copy + k) = *(name + k)
+    *(name_copy + len) = 0  # Null terminate
+    namelist_push(@s.externs, name_copy, len)
 
 # Add extern for method call: TypeName_methodName
 # Allocates memory for the mangled name
@@ -779,75 +876,33 @@ fn named_syscall_builtin_type(name: *u8, len: i32) -> i32
 
 # Check if a struct has already been emitted
 fn was_struct_emitted(s: *EmitterState, name: *u8, len: i32) -> i32
-    for i in 0..s.emitted_struct_count
-        let e: *EmittedName = @s.emitted_structs[i]
-        if e.name_len == len
-            var j: i32 = 0
-            var matched: i32 = 1
-            while j < len
-                if *(e.name + j) != *(name + j)
-                    matched = 0
-                    break
-                j += 1
-            if matched == 1
-                return 1
+    if namelist_find(@s.emitted_structs, name, len) >= 0
+        return 1
     0
 
 # Mark a struct as emitted
 fn mark_struct_emitted(s: *EmitterState, name: *u8, len: i32)
-    if s.emitted_struct_count < MAX_EMITTED_NAMES
-        let e: *EmittedName = @s.emitted_structs[s.emitted_struct_count]
-        e.name = name
-        e.name_len = len
-        s.emitted_struct_count = s.emitted_struct_count + 1
+    namelist_push(@s.emitted_structs, name, len)
 
 # Check if a function has already been emitted
 fn was_fn_emitted(s: *EmitterState, name: *u8, len: i32) -> i32
-    for i in 0..s.emitted_fn_count
-        let e: *EmittedName = @s.emitted_fns[i]
-        if e.name_len == len
-            var j: i32 = 0
-            var matched: i32 = 1
-            while j < len
-                if *(e.name + j) != *(name + j)
-                    matched = 0
-                    break
-                j += 1
-            if matched == 1
-                return 1
+    if namelist_find(@s.emitted_fns, name, len) >= 0
+        return 1
     0
 
 # Mark a function as emitted
 fn mark_fn_emitted(s: *EmitterState, name: *u8, len: i32)
-    if s.emitted_fn_count < MAX_EMITTED_NAMES
-        let e: *EmittedName = @s.emitted_fns[s.emitted_fn_count]
-        e.name = name
-        e.name_len = len
-        s.emitted_fn_count = s.emitted_fn_count + 1
+    namelist_push(@s.emitted_fns, name, len)
 
 # Check if a global has already been emitted
 fn was_global_emitted(s: *EmitterState, name: *u8, len: i32) -> i32
-    for i in 0..s.emitted_global_count
-        let e: *EmittedName = @s.emitted_globals[i]
-        if e.name_len == len
-            var j: i32 = 0
-            var matched: i32 = 1
-            while j < len
-                if *(e.name + j) != *(name + j)
-                    matched = 0
-                    break
-                j += 1
-            if matched == 1
-                return 1
+    if namelist_find(@s.emitted_globals, name, len) >= 0
+        return 1
     0
 
 # Mark a global as emitted
 fn mark_global_emitted(s: *EmitterState, name: *u8, len: i32)
-    if s.emitted_global_count < MAX_EMITTED_NAMES
-        let e: *EmittedName = @s.emitted_globals[s.emitted_global_count]
-        e.name = name
-        e.name_len = len
-        s.emitted_global_count = s.emitted_global_count + 1
+    namelist_push(@s.emitted_globals, name, len)
 
 # Check for well-known constants from ritzlib.sys
 fn find_builtin_const(name: *u8, len: i32) -> i64
@@ -894,14 +949,17 @@ pub fn find_const_entry(s: *EmitterState, name: *u8, len: i32) -> *ConstEntry
     let ce: *ConstEntry = hashmap_i64_get(@s.const_map, key) as *ConstEntry
     if ce == null
         return null
-    if ce.name_len != len
-        return null
-    var j: i32 = 0
-    while j < len
-        if *(ce.name + j) != *(name + j)
-            return null
-        j = j + 1
-    return ce
+    if name_eq(ce.name, ce.name_len, name, len) == 1
+        return ce
+    # AGAST #1813: the map is keyed by the 64-bit hash alone, so a hit with
+    # another name is a collision, not a miss.  Scan the list (first
+    # occurrence wins, as in build_symbol_maps).
+    var cur: *ConstEntry = s.module.constants
+    while cur != null
+        if name_eq(cur.name, cur.name_len, name, len) == 1
+            return cur
+        cur = cur.next
+    return null
 
 fn is_const(s: *EmitterState, name: *u8, len: i32) -> i32
     # Check module constants first via HashMap
@@ -1795,16 +1853,7 @@ fn resolve_expr_struct_name(s: *EmitterState, e: *Expr, out_name: **u8, out_len:
         return
     # Function-call return-type lookup.
     if e.kind == EXPR_CALL
-        var fname: [256]u8
-        var flen: i32 = 0
-        for i in 0..e.func_name_len
-            fname[flen] = *(e.func_name + i)
-            flen += 1
-        if e.call_type_suffix_len > 0
-            for i in 0..e.call_type_suffix_len
-                fname[flen] = *(e.call_type_suffix + i)
-                flen += 1
-        let fdr: *FnDef = find_fn(s, @fname[0], flen)
+        let fdr: *FnDef = find_call_fn(s, e)
         if fdr != null and fdr.return_type == TYPE_STRUCT and fdr.return_type_name_len > 0
             *out_name = fdr.return_type_name
             *out_len = fdr.return_type_name_len
@@ -1993,9 +2042,8 @@ fn add_string(s: *EmitterState, data: *u8, len: i32) -> i32
         s.strings[idx].len = len
         s.string_count = s.string_count + 1
         return idx
-    # Overflow — report error loudly so it's visible instead of silently aliasing @.str.0
-    eprints_cstr(c"[FATAL] add_string: MAX_STRINGS exceeded — bump MAX_STRINGS\n")
-    sys_exit(1)
+    # Overflow: a located error, instead of silently aliasing @.str.0.
+    emit_fatal_limit(c"too many string literals in one module", MAX_STRINGS)
     0
 
 # =============================================================================
@@ -2546,22 +2594,7 @@ fn get_expr_type(s: *EmitterState, e: *Expr) -> i32
             return named_syscall_builtin_type(e.func_name, e.func_name_len)
         # Look up function return type
         # Build full function name with type suffix if generic
-        var full_name: [256]u8
-        var full_len: i32 = 0
-
-        # Copy function name
-        for i in 0..e.func_name_len
-            full_name[full_len] = *(e.func_name + i)
-            full_len += 1
-
-        # Add type suffix if present (e.g., "$u8" for vec_new<u8>())
-        if e.call_type_suffix_len > 0
-            for i in 0..e.call_type_suffix_len
-                full_name[full_len] = *(e.call_type_suffix + i)
-                full_len += 1
-
-        # Look up the function
-        let fn_def: *FnDef = find_fn(s, @full_name[0], full_len)
+        let fn_def: *FnDef = find_call_fn(s, e)
         if fn_def != null
             return fn_def.return_type
 

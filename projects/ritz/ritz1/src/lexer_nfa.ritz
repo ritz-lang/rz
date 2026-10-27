@@ -29,7 +29,9 @@ struct TokenPattern
   priority: i64       # Lower = higher priority (first defined wins)
   frag: NFAFragment
 
-# Maximum indentation depth (nested blocks)
+# Maximum indentation depth (nested blocks): the size of Lexer.indent_stack.
+# Deeper nesting is a located lexer error (AGAST #1813); it used to be pushed
+# with no bounds check, writing past the array into the fields after it.
 const MAX_INDENT_DEPTH: i32 = 64
 
 # Initial capacity of the cooked-string scratch buffer.  This is a starting
@@ -78,6 +80,9 @@ struct Lexer
   string_buf: *i8          # heap scratch; null until the first literal
   string_cap: i32          # bytes allocated in string_buf
   string_pos: i32          # write cursor within the literal being cooked
+  # AGAST #1813: the message for the TOK_ERROR just returned, or null for an
+  # unrecognised character.  Set by lexer_fail, which also stops the lexer.
+  error_msg: *u8
 
 # Reset lexer for new source (preserves NFA and patterns, resets state)
 # Use this when reusing a lexer for multiple files to avoid stack overflow
@@ -95,7 +100,18 @@ fn lexer_reset(lex: *Lexer, src: *u8, len: i64) -> i32
   lex.bracket_depth = 0    # Not inside any brackets
   # Reset string buffer
   lex.string_pos = 0
+  lex.error_msg = null
   0
+
+# Return a located, fatal TOK_ERROR at the current position and stop lexing:
+# the next lexer_next returns EOF.  The tab case used to return TOK_ERROR
+# without advancing, so tokenize looped forever printing the same error.
+fn lexer_fail(lex: *Lexer, out_tok: *Token, msg: *u8) -> i32
+  *out_tok = token_new(TOK_ERROR, lex.pos, 1, lex.line, lex.col)
+  lex.error_msg = msg
+  lex.pos = lex.len
+  lex.pending_dedents = 0
+  1
 
 # Initialize a lexer with source and pre-allocated NFA/patterns storage
 fn lexer_init(lex: *Lexer, src: *u8, len: i32, nfa: *NFA, patterns: *TokenPattern) -> i32
@@ -328,10 +344,11 @@ fn lexer_handle_indent(lex: *Lexer, out_tok: *Token) -> i32
   while lexer_peek_at(lex, indent) == 32  # space
     indent = indent + 1
 
-  # Check for tab (error)
+  # Check for tab (error); ritz0's message.
   if lexer_peek_at(lex, indent) == 9  # tab
-    *out_tok = token_new(TOK_ERROR, lex.pos, 1, lex.line, lex.col)
-    return 1
+    lex.pos = lex.pos + indent
+    lex.col = lex.col + indent
+    return lexer_fail(lex, out_tok, c"Tabs not allowed for indentation; use spaces")
 
   # Skip blank lines (just newline after spaces)
   if lexer_peek_at(lex, indent) == 10  # newline
@@ -358,6 +375,8 @@ fn lexer_handle_indent(lex: *Lexer, out_tok: *Token) -> i32
 
   if indent > current
     # Deeper indentation - push and emit INDENT
+    if lex.indent_depth >= MAX_INDENT_DEPTH
+      return lexer_fail(lex, out_tok, c"blocks nested more than 64 levels deep")
     lex.indent_stack[lex.indent_depth] = indent
     lex.indent_depth = lex.indent_depth + 1
     *out_tok = token_new(TOK_INDENT, lex.pos, 0, lex.line, lex.col)

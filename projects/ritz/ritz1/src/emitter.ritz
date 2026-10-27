@@ -371,6 +371,7 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
         add_extern(s, f.name, f.name_len)
         return
 
+    emitter_set_current_fn(f)   # AGAST #1813: locates emit_fatal_limit
     s.reg_counter = 1
     s.label_counter = 0
     # AGAST #1335 — the entry block is unlabelled; see ENTRY_BLOCK_LABEL.
@@ -1389,9 +1390,10 @@ fn emit_extern_declarations(s: *EmitterState)
     # Check ALL externs for syscalls — even "local" ones (imported from ritzlib.sys),
     # because ritz1 can't emit their inline asm bodies. We provide our own implementations.
     var need_syscalls: i32 = 0
-    for i in 0..s.extern_count
-        let ex: *ExternFunc = @s.externs[i]
-        if is_syscall_function(ex.name, ex.name_len) == 1
+    for i in 0..namelist_count(@s.externs)
+        let ex_name: *u8 = namelist_name(@s.externs, i)
+        let ex_len: i32 = namelist_len(@s.externs, i)
+        if is_syscall_function(ex_name, ex_len) == 1
             need_syscalls = 1
     if need_syscalls == 1
         emit_syscall_implementations(s)
@@ -1400,80 +1402,83 @@ fn emit_extern_declarations(s: *EmitterState)
     # Same rationale as syscalls — ritz1 can't emit inline-asm intrinsic
     # bodies from source, so we provide one here.
     var need_cpuid: i32 = 0
-    for i in 0..s.extern_count
-        let ex: *ExternFunc = @s.externs[i]
-        if is_cpuid_raw_function(ex.name, ex.name_len) == 1
+    for i in 0..namelist_count(@s.externs)
+        let ex_name: *u8 = namelist_name(@s.externs, i)
+        let ex_len: i32 = namelist_len(@s.externs, i)
+        if is_cpuid_raw_function(ex_name, ex_len) == 1
             need_cpuid = 1
     if need_cpuid == 1
         emit_cpuid_raw_implementation(s)
 
     # AGAST #1791: bodies for the named syscall builtins, if any is called.
     var need_builtin_sys: i32 = 0
-    for i in 0..s.extern_count
-        let ex: *ExternFunc = @s.externs[i]
-        if is_builtin_syscall_symbol(ex.name, ex.name_len) == 1
+    for i in 0..namelist_count(@s.externs)
+        let ex_name: *u8 = namelist_name(@s.externs, i)
+        let ex_len: i32 = namelist_len(@s.externs, i)
+        if is_builtin_syscall_symbol(ex_name, ex_len) == 1
             need_builtin_sys = 1
     if need_builtin_sys == 1
         emit_builtin_syscall_implementations(s)
 
     # Emit remaining external declarations (non-syscall, non-local functions)
-    for i in 0..s.extern_count
-        let ex: *ExternFunc = @s.externs[i]
+    for i in 0..namelist_count(@s.externs)
+        let ex_name: *u8 = namelist_name(@s.externs, i)
+        let ex_len: i32 = namelist_len(@s.externs, i)
         # Skip syscalls (already emitted inline above)
-        if is_syscall_function(ex.name, ex.name_len) == 1
+        if is_syscall_function(ex_name, ex_len) == 1
             continue
         # Skip cpuid_raw (weak_odr body emitted above)
-        if is_cpuid_raw_function(ex.name, ex.name_len) == 1
+        if is_cpuid_raw_function(ex_name, ex_len) == 1
             continue
         # Skip named syscall builtins (weak_odr bodies emitted above)
-        if is_builtin_syscall_symbol(ex.name, ex.name_len) == 1
+        if is_builtin_syscall_symbol(ex_name, ex_len) == 1
             continue
         # AGAST #167: x86 LLVM intrinsics (`llvm.x86.sha256rnds2`, etc.) need
         # vector-typed declarations so clang accepts the inline calls emitted
         # by emit_x86_simd_intrinsic.  Detect by `llvm.x86.` prefix and emit
         # the right vector signature; everything else falls through to the
         # generic `declare i64 @name(...)` path below.
-        if is_llvm_x86_intrinsic_name(ex.name, ex.name_len) == 1
-            emit_llvm_x86_intrinsic_decl(s, ex.name, ex.name_len)
+        if is_llvm_x86_intrinsic_name(ex_name, ex_len) == 1
+            emit_llvm_x86_intrinsic_decl(s, ex_name, ex_len)
             continue
         # Skip if this function is defined in this module
-        if is_local_function(s.module, ex.name, ex.name_len) == 0
+        if is_local_function(s.module, ex_name, ex_len) == 0
                 # Look up the function's return type from its definition
-                var fn_def: *FnDef = find_fn(s, ex.name, ex.name_len)
+                var fn_def: *FnDef = find_fn(s, ex_name, ex_len)
                 # AGAST #1518: an imported impl method (`Type_method`) is not
                 # in fn_map; take its signature from the impl table so the
                 # declare matches the call site (sret / byval / i32 / struct).
                 var is_method: i32 = 0
                 if fn_def == null
-                    fn_def = find_impl_method_by_symbol(s.module, ex.name, ex.name_len)
+                    fn_def = find_impl_method_by_symbol(s.module, ex_name, ex_len)
                     if fn_def != null
                         is_method = 1
                 if fn_has_byval_param(s, fn_def) == 1
-                    emit_concrete_extern_declare(s, fn_def, ex.name, ex.name_len, is_method)   # AGAST #1739
+                    emit_concrete_extern_declare(s, fn_def, ex_name, ex_len, is_method)   # AGAST #1739
                 else if fn_def != null and struct_ret_uses_sret(s, fn_def.return_type, fn_def.return_type_name, fn_def.return_type_name_len) == 1
                     # AGAST #1730 — the call sites pass `ptr sret(%T)`.
                     emit_str(s, c"declare void @")
-                    emit_name(s, ex.name, ex.name_len)
+                    emit_name(s, ex_name, ex_len)
                     emit_str(s, c"(...)\n")
                 else if fn_def != null and fn_def.return_type == TYPE_STRUCT
                     emit_str(s, c"declare %")
                     emit_name(s, fn_def.return_type_name, fn_def.return_type_name_len)
                     emit_str(s, c" @")
-                    emit_name(s, ex.name, ex.name_len)
+                    emit_name(s, ex_name, ex_len)
                     emit_str(s, c"(...)\n")
                 else if fn_def != null and fn_def.return_type == TYPE_I32
                     emit_str(s, c"declare i32 @")
-                    emit_name(s, ex.name, ex.name_len)
+                    emit_name(s, ex_name, ex_len)
                     emit_str(s, c"(...)\n")
                 else if fn_def != null and fn_def.return_type == TYPE_VOID
                     emit_str(s, c"declare void @")
-                    emit_name(s, ex.name, ex.name_len)
+                    emit_name(s, ex_name, ex_len)
                     emit_str(s, c"(...)\n")
                 else
                     emit_str(s, c"declare i64 @")
-                    emit_name(s, ex.name, ex.name_len)
+                    emit_name(s, ex_name, ex_len)
                     emit_str(s, c"(...)\n")
-    if s.extern_count > 0
+    if namelist_count(@s.externs) > 0
         emit_str(s, c"\n")
 # Returns 1 if every value-type struct dependency of `st` has already been
 # emitted, 0 otherwise.  Pointer fields (TYPE_PTR / TYPE_PTR_PTR) are not
@@ -2506,10 +2511,10 @@ fn emit_module(m: *Module, out: *Vec<u8>) -> i32
     s.continue_label = -1
     s.module = m
     s.string_count = 0
-    s.extern_count = 0
-    s.emitted_struct_count = 0
-    s.emitted_fn_count = 0
-    s.emitted_global_count = 0
+    namelist_init(@s.externs, 256)
+    namelist_init(@s.emitted_structs, 256)
+    namelist_init(@s.emitted_fns, 512)
+    namelist_init(@s.emitted_globals, 256)
     s.ctx_enum_name = null
     s.ctx_enum_name_len = 0
     s.ctx_enum_arg = 0

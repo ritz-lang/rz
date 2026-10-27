@@ -23,7 +23,11 @@ import ritzlib.memory
 # ============================================================================
 # Track generic function AND struct instantiations as (name, type_suffix) pairs
 
-const MAX_INSTANTIATIONS: i32 = 256
+# Initial capacity; the fn and struct tables each grow by doubling (AGAST
+# #1813).  add_instantiation used to return -1 when full and every caller
+# ignored it, so instantiations past 256 were silently never specialised
+# (#1325's root cause).
+const INST_INIT_CAP: i32 = 256
 
 # Function instantiation tracking (stored as parallel arrays for simplicity)
 var g_inst_names: **u8 = null        # Function names
@@ -31,6 +35,7 @@ var g_inst_name_lens: *i32 = null
 var g_inst_suffixes: **u8 = null     # Type suffixes ($u8, $i32, etc.)
 var g_inst_suffix_lens: *i32 = null
 var g_inst_count: i32 = 0
+var g_inst_cap: i32 = 0
 
 # Struct instantiation tracking (parallel arrays)
 var g_struct_names: **u8 = null      # Struct names (e.g., "Pair", "Vec")
@@ -38,19 +43,22 @@ var g_struct_name_lens: *i32 = null
 var g_struct_suffixes: **u8 = null   # Type suffixes ($i32, $u8, etc.)
 var g_struct_suffix_lens: *i32 = null
 var g_struct_count: i32 = 0
+var g_struct_cap: i32 = 0
 
 fn init_instantiation_tracker()
     # Initialize function tracking
-    g_inst_names = malloc(MAX_INSTANTIATIONS * 8) as **u8
-    g_inst_name_lens = malloc(MAX_INSTANTIATIONS * 4) as *i32
-    g_inst_suffixes = malloc(MAX_INSTANTIATIONS * 8) as **u8
-    g_inst_suffix_lens = malloc(MAX_INSTANTIATIONS * 4) as *i32
+    g_inst_cap = INST_INIT_CAP
+    g_inst_names = malloc((g_inst_cap as i64) * 8) as **u8
+    g_inst_name_lens = malloc((g_inst_cap as i64) * 4) as *i32
+    g_inst_suffixes = malloc((g_inst_cap as i64) * 8) as **u8
+    g_inst_suffix_lens = malloc((g_inst_cap as i64) * 4) as *i32
     g_inst_count = 0
     # Initialize struct tracking
-    g_struct_names = malloc(MAX_INSTANTIATIONS * 8) as **u8
-    g_struct_name_lens = malloc(MAX_INSTANTIATIONS * 4) as *i32
-    g_struct_suffixes = malloc(MAX_INSTANTIATIONS * 8) as **u8
-    g_struct_suffix_lens = malloc(MAX_INSTANTIATIONS * 4) as *i32
+    g_struct_cap = INST_INIT_CAP
+    g_struct_names = malloc((g_struct_cap as i64) * 8) as **u8
+    g_struct_name_lens = malloc((g_struct_cap as i64) * 4) as *i32
+    g_struct_suffixes = malloc((g_struct_cap as i64) * 8) as **u8
+    g_struct_suffix_lens = malloc((g_struct_cap as i64) * 4) as *i32
     g_struct_count = 0
 
 fn add_instantiation(name: *u8, name_len: i32, suffix: *u8, suffix_len: i32) -> i32
@@ -62,8 +70,13 @@ fn add_instantiation(name: *u8, name_len: i32, suffix: *u8, suffix_len: i32) -> 
                     return 0  # Already tracked
 
     # Add new entry
-    if g_inst_count >= MAX_INSTANTIATIONS
-        return -1  # Error: too many instantiations
+    if g_inst_count >= g_inst_cap
+        let cap: i64 = (g_inst_cap as i64) * 2
+        g_inst_names = realloc(g_inst_names as *u8, cap * 8) as **u8
+        g_inst_name_lens = realloc(g_inst_name_lens as *u8, cap * 4) as *i32
+        g_inst_suffixes = realloc(g_inst_suffixes as *u8, cap * 8) as **u8
+        g_inst_suffix_lens = realloc(g_inst_suffix_lens as *u8, cap * 4) as *i32
+        g_inst_cap = cap as i32
 
     *(g_inst_names + g_inst_count) = name
     *(g_inst_name_lens + g_inst_count) = name_len
@@ -108,8 +121,13 @@ fn add_struct_instantiation(name: *u8, name_len: i32, suffix: *u8, suffix_len: i
                     return 0  # Already tracked
 
     # Add new entry
-    if g_struct_count >= MAX_INSTANTIATIONS
-        return -1  # Error: too many instantiations
+    if g_struct_count >= g_struct_cap
+        let cap: i64 = (g_struct_cap as i64) * 2
+        g_struct_names = realloc(g_struct_names as *u8, cap * 8) as **u8
+        g_struct_name_lens = realloc(g_struct_name_lens as *u8, cap * 4) as *i32
+        g_struct_suffixes = realloc(g_struct_suffixes as *u8, cap * 8) as **u8
+        g_struct_suffix_lens = realloc(g_struct_suffix_lens as *u8, cap * 4) as *i32
+        g_struct_cap = cap as i32
 
     *(g_struct_names + g_struct_count) = name
     *(g_struct_name_lens + g_struct_count) = name_len
@@ -167,10 +185,10 @@ fn find_generic_struct(m: *Module, name: *u8, name_len: i32) -> *StructDef
 # receiver, register the corresponding `vec_<method>$<T>` / `span_<method>$<T>`
 # instantiation when a matching generic template exists.
 
-# Sized for the Vec/Span locals AND the plain-struct locals (kind 0) that
-# field receivers resolve through (AGAST #1512); an entry past the cap is
-# silently dropped, so keep it well above any real fn's local count.
-const MAX_LOCAL_VARS: i32 = 256
+# Holds the Vec/Span locals AND the plain-struct locals (kind 0) that field
+# receivers resolve through (AGAST #1512).  Grows by doubling: entries past
+# the old fixed cap of 256 used to be dropped silently (AGAST #1813).
+const LOCAL_VARS_INIT_CAP: i32 = 256
 
 var g_lv_names: **u8 = null
 var g_lv_name_lens: *i32 = null
@@ -180,18 +198,20 @@ var g_lv_suffix_lens: *i32 = null
 var g_lv_type_names: **u8 = null       # Kind 0: the struct's name (e.g. "R")
 var g_lv_type_name_lens: *i32 = null
 var g_lv_count: i32 = 0
+var g_lv_cap: i32 = 0
 var g_lv_initialized: i32 = 0
 
 fn init_local_var_tracker()
     if g_lv_initialized == 1
         return
-    g_lv_names = malloc(MAX_LOCAL_VARS * 8) as **u8
-    g_lv_name_lens = malloc(MAX_LOCAL_VARS * 4) as *i32
-    g_lv_prefix_kind = malloc(MAX_LOCAL_VARS * 4) as *i32
-    g_lv_suffixes = malloc(MAX_LOCAL_VARS * 8) as **u8
-    g_lv_suffix_lens = malloc(MAX_LOCAL_VARS * 4) as *i32
-    g_lv_type_names = malloc(MAX_LOCAL_VARS * 8) as **u8
-    g_lv_type_name_lens = malloc(MAX_LOCAL_VARS * 4) as *i32
+    g_lv_cap = LOCAL_VARS_INIT_CAP
+    g_lv_names = malloc((g_lv_cap as i64) * 8) as **u8
+    g_lv_name_lens = malloc((g_lv_cap as i64) * 4) as *i32
+    g_lv_prefix_kind = malloc((g_lv_cap as i64) * 4) as *i32
+    g_lv_suffixes = malloc((g_lv_cap as i64) * 8) as **u8
+    g_lv_suffix_lens = malloc((g_lv_cap as i64) * 4) as *i32
+    g_lv_type_names = malloc((g_lv_cap as i64) * 8) as **u8
+    g_lv_type_name_lens = malloc((g_lv_cap as i64) * 4) as *i32
     g_lv_initialized = 1
     g_lv_count = 0
 
@@ -199,8 +219,16 @@ fn reset_local_var_tracker()
     g_lv_count = 0
 
 fn add_local_var(name: *u8, name_len: i32, prefix_kind: i32, suffix: *u8, suffix_len: i32)
-    if g_lv_count >= MAX_LOCAL_VARS
-        return
+    if g_lv_count >= g_lv_cap
+        let cap: i64 = (g_lv_cap as i64) * 2
+        g_lv_names = realloc(g_lv_names as *u8, cap * 8) as **u8
+        g_lv_name_lens = realloc(g_lv_name_lens as *u8, cap * 4) as *i32
+        g_lv_prefix_kind = realloc(g_lv_prefix_kind as *u8, cap * 4) as *i32
+        g_lv_suffixes = realloc(g_lv_suffixes as *u8, cap * 8) as **u8
+        g_lv_suffix_lens = realloc(g_lv_suffix_lens as *u8, cap * 4) as *i32
+        g_lv_type_names = realloc(g_lv_type_names as *u8, cap * 8) as **u8
+        g_lv_type_name_lens = realloc(g_lv_type_name_lens as *u8, cap * 4) as *i32
+        g_lv_cap = cap as i32
     *(g_lv_names + g_lv_count) = name
     *(g_lv_name_lens + g_lv_count) = name_len
     *(g_lv_prefix_kind + g_lv_count) = prefix_kind
@@ -216,8 +244,6 @@ fn add_local_var(name: *u8, name_len: i32, prefix_kind: i32, suffix: *u8, suffix
 # prefix, so the ident-receiver path ignores these entries.
 fn add_local_struct_var(name: *u8, name_len: i32, type_name: *u8, type_name_len: i32)
     if type_name == null or type_name_len <= 0
-        return
-    if g_lv_count >= MAX_LOCAL_VARS
         return
     add_local_var(name, name_len, 0, null, 0)
     *(g_lv_type_names + g_lv_count - 1) = type_name
@@ -1082,24 +1108,12 @@ fn specialize_fn_one_param(m: *Module, template: *FnDef, type_param_name: *u8, t
     specialized.is_local = 1
 
     # Handle return type struct name substitution
-    # DEBUG
-    eprints_cstr(c"[MONO-RET] Template return_type=")
-    eprint_int(template.return_type as i64)
-    eprints_cstr(c", name_len=")
-    eprint_int(template.return_type_name_len as i64)
-    if template.return_type_name != null
-        eprints_cstr(c", name=")
-        for dbgi in 0..template.return_type_name_len
-            eprint_char(*(template.return_type_name + dbgi))
-    eprints_cstr(c"\n")
-
     if specialized.return_type == TYPE_STRUCT
         if specialized.return_type_name != null
             # Check if it matches the type param exactly (e.g., "T" -> "u8")
             if specialized.return_type_name_len == type_param_len
                 if memcmp(specialized.return_type_name, type_param_name, type_param_len as i64) == 0
                     # Substitute with concrete type
-                    eprints_cstr(c"[MONO-RET] Exact match T -> concrete\n")
                     specialized.return_type = subst_type
                     specialized.return_type_name = subst_type_name
                     specialized.return_type_name_len = subst_type_len
@@ -1110,13 +1124,6 @@ fn specialize_fn_one_param(m: *Module, template: *FnDef, type_param_name: *u8, t
                 substitute_type_param_in_name(specialized.return_type_name, specialized.return_type_name_len, type_param_name, type_param_len, suffix, suffix_len, @new_name, @new_len)
                 specialized.return_type_name = new_name
                 specialized.return_type_name_len = new_len
-                eprints_cstr(c"[MONO-RET] After subst, name_len=")
-                eprint_int(specialized.return_type_name_len as i64)
-                if specialized.return_type_name != null
-                    eprints_cstr(c", name=")
-                    for dbgj in 0..specialized.return_type_name_len
-                        eprint_char(*(specialized.return_type_name + dbgj))
-                eprints_cstr(c"\n")
 
     return specialized
 
@@ -1889,48 +1896,8 @@ fn monomorphize_module(m: *Module)
     init_instantiation_tracker()
     init_local_var_tracker()
 
-    # DEBUG: Count functions and check for generics
-    var fn_count: i32 = 0
-    var generic_fn_count: i32 = 0
-    var f_dbg: *FnDef = m.functions
-    while f_dbg != null
-        fn_count = fn_count + 1
-        if f_dbg.type_params != null
-            generic_fn_count = generic_fn_count + 1
-            eprints_cstr(c"[MONOMORPH]   Generic: ")
-            for k in 0..f_dbg.name_len
-                eprint_char(*(f_dbg.name + k) as i64)
-            eprints_cstr(c"\n")
-        # Show first 10 function names for debugging
-        if fn_count <= 10
-            eprints_cstr(c"[MONOMORPH]   fn[")
-            eprint_int(fn_count as i64)
-            eprints_cstr(c"]: ")
-            for k in 0..f_dbg.name_len
-                eprint_char(*(f_dbg.name + k) as i64)
-            eprints_cstr(c" (type_params=")
-            if f_dbg.type_params != null
-                eprints_cstr(c"yes")
-            else
-                eprints_cstr(c"null")
-            eprints_cstr(c")\n")
-        f_dbg = f_dbg.next
-    eprints_cstr(c"[MONOMORPH] Total functions: ")
-    eprint_int(fn_count as i64)
-    eprints_cstr(c", Generic functions: ")
-    eprint_int(generic_fn_count as i64)
-    eprints_cstr(c"\n")
-
     # Collect all generic function and struct instantiations
     collect_instantiations_from_module(m)
-
-    # DEBUG: Show what was collected
-    eprints_cstr(c"[MONOMORPH] Collected function instantiations: ")
-    eprint_int(g_inst_count as i64)
-    eprints_cstr(c"\n")
-    eprints_cstr(c"[MONOMORPH] Collected struct instantiations: ")
-    eprint_int(g_struct_count as i64)
-    eprints_cstr(c"\n")
 
     # Structs and fns are specialised to a fixpoint: specialising `vec_push<T>`
     # at u8 yields a fn whose signature names `Vec$u8`, which is a struct

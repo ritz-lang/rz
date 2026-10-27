@@ -97,7 +97,7 @@ fn write_file(path: *u8, data: *u8, len: i64) -> i32
 # Tokenizer
 # =============================================================================
 
-fn tokenize(src: *u8, src_len: i64, tokens: *Vec<Token>) -> i32
+fn tokenize(path: *u8, src: *u8, src_len: i64, tokens: *Vec<Token>) -> i32
     # Allocate storage for lexer NFA structures
     var nfa_storage: NFA
     var patterns_storage: [128]TokenPattern
@@ -135,10 +135,20 @@ fn tokenize(src: *u8, src_len: i64, tokens: *Vec<Token>) -> i32
         if kind == TOK_EOF
             break
         if kind == TOK_ERROR
-            var msg: String = string_from("Lexer error at line ")
+            # "error: <path>:<line>:<col>: <what>", like the parser's
+            # diagnostics (AGAST #1813).
+            var msg: String = string_from("error: ")
+            string_push_cstr(@msg, path)
+            string_push_strview(@msg, ":")
             string_push_i64(@msg, line as i64)
-            string_push_strview(@msg, ", column ")
+            string_push_strview(@msg, ":")
             string_push_i64(@msg, col as i64)
+            string_push_strview(@msg, ": ")
+            if lex.error_msg != null
+                string_push_cstr(@msg, lex.error_msg)
+                lex.error_msg = null
+            else
+                string_push_strview(@msg, "Lexer error: unexpected character")
             eprintln_string(@msg)
             string_drop(@msg)
             errors = errors + 1
@@ -479,7 +489,7 @@ fn load_and_parse(path: @String) -> *Module
         return null
 
     var tokens: Vec<Token> = vec_with_cap<Token>(24000)
-    let lex_err: i32 = tokenize(src.data, src.len - 1, @tokens)
+    let lex_err: i32 = tokenize(path_ptr, src.data, src.len - 1, @tokens)
     if lex_err > 0
         err2("Lexer errors in: ", path_ptr)
         return null
@@ -795,7 +805,7 @@ fn main(argc: i32, argv: **u8) -> i32
     # Tokenize. Typical compiler input files produce under 20K tokens;
     # bigger files realloc organically.
     var tokens: Vec<Token> = vec_with_cap<Token>(24000)
-    let lex_errors: i32 = tokenize(src.data, src.len - 1, @tokens)
+    let lex_errors: i32 = tokenize(args.input_path, src.data, src.len - 1, @tokens)
     if lex_errors > 0
         var msg: String = string_from("Lexer errors: ")
         string_push_i64(@msg, lex_errors as i64)
@@ -835,6 +845,7 @@ fn main(argc: i32, argv: **u8) -> i32
 
     # Emit IR
     var ir: Vec<u8> = vec_with_cap<u8>(131072)  # 128KB seed; realloc as needed
+    emitter_set_source_file(args.input_path)   # AGAST #1813
     let emit_errors: i32 = emit_module(m, @ir)
 
     # AGAST #1369.  This return value was previously discarded, and it was a
