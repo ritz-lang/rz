@@ -1,16 +1,16 @@
-"""`build.py test --compiler X` must run tests with X, or say plainly it did not.
+"""`build.py test --compiler X` must run tests with X.
 
 AGAST #1500: `run_tests` took no compiler and hard-coded `RITZ0 --test`, so
-every `build.py test --compiler ritz1` verdict was ritz0's. For test-only
-packages the entire "ritz1" result was produced without ritz1 ever running.
+every `build.py test --compiler ritz1` verdict was ritz0's. Until ritz1 had a
+test mode, ritz1 runs were a named failure ("has no --test harness").
 
-ritz1 has no `--test` harness yet, so the honest answer for ritz1 and
-ritz1_selfhosted is a named, FAILING verdict -- never a silent fall back to
-ritz0 and never a skip that reads green.
+AGAST #1908: ritz1 emits the [[test]] table, so `ritz0 --test <file>
+--compiler ritz1` builds the whole test binary with ritz1. Every ritz1-family
+run must pass `--compiler`: a bare `--test` would be a silent fall back to
+ritz0, the #1500 bug.
 
 These tests point build.py's RITZ0 at a stub that records every invocation
-and reports a passing harness summary. If ritz1 fell back to ritz0 the stub
-would make the run look green; the assertions catch both halves of that.
+and reports a passing harness summary.
 """
 
 import importlib.util
@@ -80,17 +80,21 @@ def _run(buildpy, monkeypatch, pkg, compiler):
 
 @pytest.mark.unit
 @pytest.mark.parametrize("compiler", ["ritz1", "ritz1_selfhosted"])
-def test_ritz1_family_never_runs_ritz0_and_fails(
+def test_ritz1_family_builds_test_binaries_with_that_compiler(
     buildpy, stub_ritz0, test_only_pkg, monkeypatch, capsys, compiler
 ):
     rc = _run(buildpy, monkeypatch, test_only_pkg, compiler)
-    out = capsys.readouterr()
-    text = out.out + out.err
+    calls = stub_ritz0.read_text().splitlines()
+    text = capsys.readouterr().out
 
-    assert stub_ritz0.read_text() == "", f"ritz0 was invoked for --compiler {compiler}"
-    assert rc != 0, "a test run that ran nothing must not exit 0"
-    assert f"✗ fixture_pkg: {compiler} has no --test harness; 2 test file(s) NOT run" in text
-    assert "All tests passed" not in text
+    assert rc == 0
+    assert len(calls) == 2
+    # Every harness run names the compiler; none is a bare (ritz0) `--test`.
+    assert all(c.startswith("--test ") and c.endswith(f" --compiler {compiler}")
+               for c in calls), calls
+    assert {Path(c.split(" ")[1]).name for c in calls} == {"test_a.ritz", "test_b.ritz"}
+    assert "has no --test harness" not in text
+    assert "All tests passed" in text
 
 
 @pytest.mark.unit
@@ -134,8 +138,28 @@ def test_normal_package_threads_compiler_to_run_tests(
     rc = _run(buildpy, monkeypatch, test_only_pkg, "ritz1")
     text = capsys.readouterr().out
 
+    calls = stub_ritz0.read_text().splitlines()
     assert built_with == ["ritz1"]
-    assert stub_ritz0.read_text() == ""
-    assert rc != 0
+    assert rc == 0
     # Only test/*.ritz: the root test_*.ritz glob is for test-only packages.
-    assert "✗ fixture_pkg: ritz1 has no --test harness; 1 test file(s) NOT run" in text
+    assert len(calls) == 1 and calls[0].endswith("test_a.ritz --compiler ritz1"), calls
+    assert "has no --test harness" not in text
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("compiler", ["ritz0", "ritz1"])
+def test_unit_file_entry_point_passes_the_compiler_on(
+    buildpy, stub_ritz0, test_only_pkg, tmp_path, monkeypatch, compiler
+):
+    # `rz test --compiler X` fans files out through `--unit-file`; that entry
+    # point must hand X to the harness, or rz's ritz1 runs are silently ritz0.
+    result = tmp_path / "result.json"
+    tfile = test_only_pkg / "test" / "test_a.ritz"
+    monkeypatch.setattr(sys, "argv", [
+        "build.py", "test", str(test_only_pkg), "--compiler", compiler,
+        "--unit-file", str(tfile), "--unit-result", str(result),
+    ])
+    assert (buildpy.main() or 0) == 0
+    calls = stub_ritz0.read_text().splitlines()
+    want = f"--test {tfile}" + ("" if compiler == "ritz0" else f" --compiler {compiler}")
+    assert calls == [want]

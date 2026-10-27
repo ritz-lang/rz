@@ -2500,6 +2500,190 @@ fn ensure_string_literal_struct(s: *EmitterState, m: *Module)
         last = last.next
     last.next = st
 
+# =============================================================================
+# Test mode: the `[[test]]` table (LANGUAGE_SPEC §17.1, AGAST #1908)
+# =============================================================================
+#
+# Port of ritz0's _emit_test_table (emitter_llvmlite.py).  A test binary is
+# this file compiled with `--test-table`, linked with ritzunit, whose `main`
+# iterates the table:
+#
+#   @__ritz_tests       = constant [N x { { ptr, i64 }, ptr }]   ; {StrView name, fn() -> i32}
+#   @__ritz_tests_count = constant i64 N
+#   define ptr @__ritz_test_table(ptr %count)
+#   define void @_start() naked                                  ; calls main(argc, argv)
+#
+# One entry per `[[test]]` fn of this file, in source order.  Names are
+# NUL-terminated (len excludes the NUL).  `run` is always `fn() -> i32`: a
+# test returning another integer width (or nothing) is called through an
+# internal wrapper mapping 0 to 0 and anything else to 1, so a test that
+# returns 256 cannot pass by truncation.  The driver drops the file's own
+# `main` in this mode.
+
+var g_emit_test_table: i32 = 0
+
+pub fn emitter_set_test_mode(on: i32)
+    g_emit_test_table = on
+
+# Bit width of a [[test]] fn's result: 0 for none, 1..64 for an integer,
+# -1 for anything else (rejected).
+fn test_ret_bits(f: *FnDef) -> i32
+    let t: i32 = f.return_type
+    if t == TYPE_VOID
+        return 0
+    if t == TYPE_BOOL
+        return 1
+    if t == TYPE_I8 or t == TYPE_U8
+        return 8
+    if t == TYPE_I16 or t == TYPE_U16
+        return 16
+    if t == TYPE_I32 or t == TYPE_U32
+        return 32
+    if t == TYPE_I64 or t == TYPE_U64
+        return 64
+    if t == TYPE_STRUCT
+        let n: *u8 = f.return_type_name
+        let l: i32 = f.return_type_name_len
+        if name_eq(n, l, c"void", 4) == 1
+            return 0
+        if name_eq(n, l, c"bool", 4) == 1
+            return 1
+        if name_eq(n, l, c"i8", 2) == 1 or name_eq(n, l, c"u8", 2) == 1
+            return 8
+        if name_eq(n, l, c"i16", 3) == 1 or name_eq(n, l, c"u16", 3) == 1
+            return 16
+        if name_eq(n, l, c"i32", 3) == 1 or name_eq(n, l, c"u32", 3) == 1
+            return 32
+        if name_eq(n, l, c"i64", 3) == 1 or name_eq(n, l, c"u64", 3) == 1
+            return 64
+        if name_eq(n, l, c"isize", 5) == 1 or name_eq(n, l, c"usize", 5) == 1
+            return 64
+    0 - 1
+
+# "error: ritz1: [[test]] function 'NAME' <what>", counted like emit_ir_error.
+fn test_fn_error(s: *EmitterState, f: *FnDef, what: *u8)
+    eprints_cstr(c"error: ")
+    let file: *u8 = emitter_source_file()
+    if file != null
+        eprints_cstr(file)
+        eprints_cstr(c":")
+        eprint_int(f.line as i64)
+        eprints_cstr(c": ")
+    eprints_cstr(c"[[test]] function '")
+    for i in 0..f.name_len
+        eprint_char(*(f.name + i))
+    eprints_cstr(c"' ")
+    eprints_cstr(what)
+    eprints_cstr(c"\n")
+    s.error_count = s.error_count + 1
+
+# `{ { ptr, i64 }, ptr }`: one table entry.
+fn emit_test_entry_type(s: *EmitterState)
+    emit_str(s, c"{ { ptr, i64 }, ptr }")
+
+fn emit_test_bits_type(s: *EmitterState, bits: i32)
+    if bits == 0
+        emit_str(s, c"void")
+    else
+        emit_str(s, c"i")
+        emit_int(s, bits as i64)
+
+fn emit_test_table(s: *EmitterState)
+    # This file's tests, in source order.  Imported files record their
+    # [[test]] fns too; only the input file's (is_local) count.
+    var n: i64 = 0
+    var k: i64 = 0
+    let total: i64 = test_fn_count()
+    var idx: *i64 = malloc((total + 1) * 8) as *i64
+    while k < total
+        let f: *FnDef = test_fn_at(k)
+        k = k + 1
+        if f.is_local != 1 or f.body == null
+            continue
+        if f.params != null
+            test_fn_error(s, f, c"must take no parameters")
+            continue
+        let bits: i32 = test_ret_bits(f)
+        if bits < 0
+            test_fn_error(s, f, c"must return an integer or nothing")
+            continue
+        *(idx + n) = f as i64
+        n = n + 1
+
+    emit_str(s, c"\n; [[test]] table (LANGUAGE_SPEC 17.1)\n")
+    var i: i64 = 0
+    while i < n
+        let f: *FnDef = *(idx + i) as *FnDef
+        emit_str(s, c"@__ritz_test_name.")
+        emit_int(s, i)
+        emit_str(s, c" = private constant [")
+        emit_int(s, (f.name_len + 1) as i64)
+        emit_str(s, c" x i8] c\"")
+        emit_name(s, f.name, f.name_len)
+        emit_str(s, c"\\00\"\n")
+        let bits: i32 = test_ret_bits(f)
+        if bits != 32
+            emit_str(s, c"define internal i32 @__ritz_test_run.")
+            emit_int(s, i)
+            emit_str(s, c"() {\nentry:\n")
+            if bits == 0
+                emit_str(s, c"  call void @")
+                emit_name(s, f.name, f.name_len)
+                emit_str(s, c"()\n  ret i32 0\n}\n")
+            else
+                emit_str(s, c"  %r = call ")
+                emit_test_bits_type(s, bits)
+                emit_str(s, c" @")
+                emit_name(s, f.name, f.name_len)
+                emit_str(s, c"()\n  %failed = icmp ne ")
+                emit_test_bits_type(s, bits)
+                emit_str(s, c" %r, 0\n  %code = zext i1 %failed to i32\n  ret i32 %code\n}\n")
+        i = i + 1
+
+    emit_str(s, c"@__ritz_tests = constant [")
+    emit_int(s, n)
+    emit_str(s, c" x ")
+    emit_test_entry_type(s)
+    emit_str(s, c"] ")
+    if n == 0
+        emit_str(s, c"zeroinitializer\n")
+    else
+        emit_str(s, c"[")
+        i = 0
+        while i < n
+            let f: *FnDef = *(idx + i) as *FnDef
+            if i > 0
+                emit_str(s, c", ")
+            emit_test_entry_type(s)
+            emit_str(s, c" { { ptr, i64 } { ptr @__ritz_test_name.")
+            emit_int(s, i)
+            emit_str(s, c", i64 ")
+            emit_int(s, f.name_len as i64)
+            emit_str(s, c" }, ptr @")
+            if test_ret_bits(f) == 32
+                emit_name(s, f.name, f.name_len)
+            else
+                emit_str(s, c"__ritz_test_run.")
+                emit_int(s, i)
+            emit_str(s, c" }")
+            i = i + 1
+        emit_str(s, c"]\n")
+    emit_str(s, c"@__ritz_tests_count = constant i64 ")
+    emit_int(s, n)
+    emit_str(s, c"\n")
+    emit_str(s, c"define ptr @__ritz_test_table(ptr %count) {\nentry:\n  store i64 ")
+    emit_int(s, n)
+    emit_str(s, c", ptr %count\n  ret ptr @__ritz_tests\n}\n")
+    free(idx as *u8)
+
+    # The runner's `main(argc, argv)` lives in ritzunit's object; this file's
+    # own `main` was dropped by the driver.  Same shim as
+    # runtime/ritz_start.x86_64.ll.
+    emit_str(s, c"declare i32 @main(i32, ptr)\n")
+    emit_str(s, c"define void @_start() naked {\nentry:\n")
+    emit_str(s, c"  call void asm sideeffect \"movq (%rsp), %rdi\\0Aleaq 8(%rsp), %rsi\\0Aandq $$-16, %rsp\\0Acall main\\0Amovq %rax, %rdi\\0Amovq $$60, %rax\\0Asyscall\", \"~{rax},~{rdi},~{rsi},~{rsp},~{rcx},~{r11},~{memory}\"()\n")
+    emit_str(s, c"  unreachable\n}\n")
+
 fn emit_module(m: *Module, out: *Vec<u8>) -> i32
     var s: EmitterState
     s.out = out
@@ -2666,6 +2850,9 @@ fn emit_module(m: *Module, out: *Vec<u8>) -> i32
     # intrinsic decls.
     emit_str(@s, c"declare void @llvm.memset.p0.i64(ptr nocapture writeonly, i8, i64, i1 immarg)\n")
     emit_sret_helpers(@s)   # AGAST #1730
+
+    if g_emit_test_table == 1
+        emit_test_table(@s)
 
     # Note: _start is provided by runtime/ritz_crt0.o which properly sets up argc/argv
 

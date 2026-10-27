@@ -545,6 +545,11 @@ fn emit_member_ptr(s: *EmitterState, e: *Expr, result: *MemberPtrResult)
                             emit_str(s, c"\n")
                             emit_member_gep_from_ptr(s, result, elem_ptr_ap, elem_st_ap, field_idx_ap, field_ap)
                             return
+                # AGAST #1908: `p[i].field` where p is a `*St` local or param
+                # (ritzunit's `slots[i].pid`).  Same address as `(p + i).field`.
+                else if arr_loc.var_type == TYPE_PTR and arr_loc.type_name_len > 0
+                    if emit_ptr_elem_member_ptr(s, e, result, arr_loc.type_name, arr_loc.type_name_len) == 1
+                        return
                 # AGAST #1487: `w[i].field` where w is a Vec<Struct> local.
                 else if emit_vec_elem_member_ptr(s, e, result, arr_loc) == 1
                     return
@@ -579,6 +584,45 @@ fn emit_member_ptr(s: *EmitterState, e: *Expr, result: *MemberPtrResult)
                                 emit_str(s, c"\n")
                                 emit_member_gep_from_ptr(s, result, g_elem_ptr, g_elem_st, g_field_idx, g_field)
                                 return
+                    # AGAST #1908: `g[i].field` where g is a `*St` global
+                    # (ritzunit's `g_junit_results[i].name`).
+                    if g_arr.var_type == TYPE_PTR and g_arr.pointee_type_name_len > 0
+                        if emit_ptr_elem_member_ptr(s, e, result, g_arr.pointee_type_name, g_arr.pointee_type_name_len) == 1
+                            return
+
+# AGAST #1908: address of `p[i].field` for `e` = EXPR_MEMBER over EXPR_INDEX,
+# where `p` (e.left.left) is a `*St` value and `st_name` names St.  The
+# pointer is an i64 value in ritz1, so: inttoptr, GEP one St per index, then
+# the field.  Returns 1 with `result` filled, or 0 if St or the field is
+# unknown (the caller falls through to the "unhandled EXPR_MEMBER" error).
+fn emit_ptr_elem_member_ptr(s: *EmitterState, e: *Expr, result: *MemberPtrResult, st_name: *u8, st_name_len: i32) -> i32
+    let st: *StructDef = find_struct(s, st_name, st_name_len)
+    if st == null
+        return 0
+    let field_idx: i32 = find_field_index(st, e.ident_ptr, e.ident_len)
+    if field_idx < 0
+        return 0
+    let field: *StructField = get_field_type(st, field_idx)
+    let ptr_val: i32 = emit_expr(s, e.left.left)
+    let idx_reg: i32 = emit_expr(s, e.left.right)
+    let base_ptr: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, base_ptr)
+    emit_str(s, c" = inttoptr i64 ")
+    emit_reg(s, ptr_val)
+    emit_str(s, c" to ptr\n")
+    let elem_ptr: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, elem_ptr)
+    emit_str(s, c" = getelementptr %")
+    emit_name(s, st.name, st.name_len)
+    emit_str(s, c", ptr ")
+    emit_reg(s, base_ptr)
+    emit_str(s, c", i64 ")
+    emit_reg(s, idx_reg)
+    emit_str(s, c"\n")
+    emit_member_gep_from_ptr(s, result, elem_ptr, st, field_idx, field)
+    1
 
 
 # =============================================================================

@@ -326,6 +326,10 @@ def main():
     parser.add_argument('-o', '--output', help='Output file (.ll) - required for compile mode')
     parser.add_argument('--test', action='store_true', help='Run tests for specified file')
     parser.add_argument('--test-all', action='store_true', help='Discover and run all tests in test/ directory')
+    parser.add_argument('--compiler', default='ritz0',
+                        choices=('ritz0', 'ritz1', 'ritz1_selfhosted'),
+                        help='With --test: the compiler that builds each test binary, '
+                             'ritzunit included (default: ritz0)')
     parser.add_argument('-v', '--verbose', action='store_true', help='Verbose output')
     parser.add_argument('--no-runtime', action='store_true', help='Do not emit _start entry point (for libraries)')
     parser.add_argument('--test-table', action='store_true',
@@ -382,7 +386,8 @@ def main():
                 print(f"\n{file_path}:")
 
             try:
-                passed, failed, failures = run_test_file(file_path, args.verbose)
+                passed, failed, failures = run_test_file(file_path, args.verbose,
+                                                         args.compiler)
                 total_passed += passed
                 total_failed += failed
                 all_failures.extend(failures)

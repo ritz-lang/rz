@@ -205,13 +205,11 @@ class FakeWorkspace:
             # none): rz itself must not schedule anything after a failed
             # plan, whatever the plan file says.
             plan = {"built": p.get("built", True),
-                    "no_harness": p.get("no_harness", False),
                     "files": [f"/pkg/{unit.project}/test/{f}"
-                              for f in p.get("files", {})]
-                    if not p.get("no_harness") else [],
+                              for f in p.get("files", {})],
                     "test_sh": p.get("test_sh", False)}
             unit.path.write_text(json.dumps(plan))
-            unit.rc = 0 if plan["built"] and not plan["no_harness"] else 1
+            unit.rc = 0 if plan["built"] else 1
             unit.output = f"[plan {unit.project}]\n"
         elif unit.kind == "file":
             name = Path(unit.file).name
@@ -234,8 +232,7 @@ SPEC = {
     "gamma": {"files": {"g1.ritz": "pass", "g2.ritz": "pass"},
               "test_sh": True},
     "delta": {},
-    "eps": {"no_harness": True, "files": {"e1.ritz": "pass"},
-            "test_sh": True},
+    "eps": {"files": {"e1.ritz": "fail"}, "test_sh": True},
 }
 
 
@@ -250,7 +247,7 @@ def fake(rz, monkeypatch):
 class TestTestSweep:
     def test_failed_set_matches_serial_semantics(self, rz, fake, capsys):
         failed = rz.test_projects_parallel(list(SPEC), 4, "ritz0")
-        # alpha: a failing file. beta: build failed. eps: no harness.
+        # alpha, eps: a failing file. beta: build failed.
         # gamma (files + test.sh pass) and delta (no tests) pass.
         assert failed == ["alpha", "beta", "eps"]
 
@@ -258,17 +255,17 @@ class TestTestSweep:
         rz.test_projects_parallel(list(SPEC), 4, "ritz0")
         assert [k for p, k, _ in fake.ran if p == "beta"] == ["plan"]
 
-    def test_no_harness_still_runs_test_sh(self, rz, fake, capsys):
-        # Serial run_tests runs test.sh after the no-harness failure.
+    def test_failing_file_still_runs_test_sh(self, rz, fake, capsys):
+        # Serial run_tests runs test.sh after a failing test file.
         rz.test_projects_parallel(list(SPEC), 4, "ritz0")
         assert sorted(k for p, k, _ in fake.ran if p == "eps") == [
-            "plan", "test-sh"]
+            "file", "plan", "test-sh"]
 
     def test_every_file_is_its_own_unit(self, rz, fake, capsys):
         rz.test_projects_parallel(list(SPEC), 4, "ritz0")
         files = sorted(f for p, k, f in fake.ran if k == "file")
-        assert files == ["a1.ritz", "a2.ritz", "a3.ritz", "g1.ritz",
-                         "g2.ritz"]
+        assert files == ["a1.ritz", "a2.ritz", "a3.ritz", "e1.ritz",
+                         "g1.ritz", "g2.ritz"]
 
     def test_output_is_in_serial_order_despite_completion_order(
             self, rz, fake, capsys):
@@ -319,7 +316,7 @@ class TestTestSweep:
         def crash(unit):
             if unit.kind == "plan":
                 unit.path.write_text(json.dumps(
-                    {"built": True, "no_harness": False,
+                    {"built": True,
                      "files": ["/x/test/t.ritz"], "test_sh": False}))
                 unit.rc = 0
             else:
@@ -338,7 +335,7 @@ class TestTestSweep:
             cmds.append(unit.cmd)
             if unit.kind == "plan":
                 unit.path.write_text(json.dumps(
-                    {"built": True, "no_harness": False,
+                    {"built": True,
                      "files": ["/x/test/t.ritz"], "test_sh": True}))
             else:
                 if unit.kind == "file":
@@ -353,7 +350,7 @@ class TestTestSweep:
         assert any("--unit-plan" in c and "--compiler ritz1" in c
                    for c in flat)
         assert any("--unit-file /x/test/t.ritz" in c and "--unit-result" in c
-                   for c in flat)
+                   and "--compiler ritz1" in c for c in flat)
         assert any("--unit-test-sh" in c for c in flat)
         assert all(str(rz.RITZ_BUILD) in c for c in flat)
 
@@ -495,7 +492,7 @@ class TestBuildPyUnits:
                                profile_name=None, compiler="ritz0")
         assert rc == 1
         assert json.loads(plan_path.read_text()) == {
-            "built": False, "no_harness": False, "files": [],
+            "built": False, "files": [],
             "test_sh": False}
 
     def test_plan_lists_files_and_test_sh(self, buildpy, tmp_path):
@@ -507,23 +504,24 @@ class TestBuildPyUnits:
                                compiler="ritz0")
         assert rc == 0
         plan = json.loads(plan_path.read_text())
-        assert plan == {"built": True, "no_harness": False,
+        assert plan == {"built": True,
                         "files": [str(pkg / "test" / "a.ritz")],
                         "test_sh": True}
 
-    def test_plan_non_ritz0_is_named_no_harness_failure(self, buildpy,
-                                                        tmp_path, capsys):
+    def test_plan_ritz1_lists_its_files(self, buildpy, tmp_path, capsys):
         pkg = _pkg(tmp_path, files=[("a.ritz", "")], test_sh=True)
         plan_path = tmp_path / "plan.json"
         cfg = {"package": {"name": "pkg"}, "build": {"test_only": True}}
         rc = buildpy.unit_plan(pkg, cfg, plan_path, keep_artifacts=False,
                                use_cache=True, profile_name=None,
                                compiler="ritz1")
-        assert rc == 1
+        # AGAST #1908: ritz1 has a test mode; its files are run like ritz0's.
+        assert rc == 0
         plan = json.loads(plan_path.read_text())
-        assert plan["no_harness"] and plan["files"] == [] and plan["test_sh"]
-        assert "ritz1 has no --test harness; 1 test file(s) NOT run" in \
-            capsys.readouterr().out
+        assert plan == {"built": True,
+                        "files": [str(pkg / "test" / "a.ritz")],
+                        "test_sh": True}
+        assert "has no --test harness" not in capsys.readouterr().out
 
 
 # --------------------------------------------------------------------------

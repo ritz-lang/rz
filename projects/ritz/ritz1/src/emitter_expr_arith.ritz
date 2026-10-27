@@ -506,6 +506,24 @@ fn deref_pointee_struct_name(s: *EmitterState, op: *Expr, out_name: **u8, out_le
 # OP_ADDR only, and `@&` handled nothing but a bare local, so `@&s.field`,
 # `@&p.a.b`, `@&arr[i].f` and `@&g` were all "cannot take mutable address".
 # Emits no diagnostic of its own: the caller reports the failure.
+# The GEP element type of `p[i]` for `p: *T`, given T's kind (pointee_type)
+# and, for a struct, its name.  AGAST #1908: a struct pointee used to fall
+# to the i8 default, so `@tests[1]` over `*RitzTest` pointed one BYTE in.
+fn emit_ptr_elem_gep_type(s: *EmitterState, pointee_type: i32, name: *u8, name_len: i32)
+    if pointee_type == TYPE_I32 or pointee_type == TYPE_U32
+        emit_str(s, c"i32")
+    else if pointee_type == TYPE_I64 or pointee_type == TYPE_U64
+        emit_str(s, c"i64")
+    else if pointee_type == TYPE_I16 or pointee_type == TYPE_U16
+        emit_str(s, c"i16")
+    else if pointee_type == TYPE_PTR or pointee_type == TYPE_PTR_PTR
+        emit_str(s, c"ptr")
+    else if pointee_type == TYPE_STRUCT and name_len > 0
+        emit_llvm_type_struct(s, TYPE_STRUCT, name, name_len)
+    else
+        # Default to i8 (covers *u8 / *i8 — most common).
+        emit_str(s, c"i8")
+
 fn emit_lvalue_ptr(s: *EmitterState, op: *Expr) -> i32
     if op.kind == EXPR_IDENT
         let loc: i32 = find_local(s, op.ident_ptr, op.ident_len)
@@ -574,17 +592,7 @@ fn emit_lvalue_ptr(s: *EmitterState, op: *Expr) -> i32
                     emit_str(s, c"  ")
                     emit_reg(s, elem_ptr_p)
                     emit_str(s, c" = getelementptr ")
-                    if local.pointee_type == TYPE_I32 or local.pointee_type == TYPE_U32
-                        emit_str(s, c"i32")
-                    else if local.pointee_type == TYPE_I64 or local.pointee_type == TYPE_U64
-                        emit_str(s, c"i64")
-                    else if local.pointee_type == TYPE_I16 or local.pointee_type == TYPE_U16
-                        emit_str(s, c"i16")
-                    else if local.pointee_type == TYPE_PTR or local.pointee_type == TYPE_PTR_PTR
-                        emit_str(s, c"ptr")
-                    else
-                        # Default to i8 (covers *u8 / *i8 — most common).
-                        emit_str(s, c"i8")
+                    emit_ptr_elem_gep_type(s, local.pointee_type, local.type_name, local.type_name_len)
                     emit_str(s, c", ptr ")
                     emit_reg(s, loaded_p)
                     emit_str(s, c", i64 ")
@@ -618,6 +626,27 @@ fn emit_lvalue_ptr(s: *EmitterState, op: *Expr) -> i32
                     emit_reg(s, gas_idx)
                     emit_str(s, c"\n")
                     return gas_elem
+                # AGAST #1908: `@g[i]` with `var g: *T` indexes the pointee,
+                # not the global's own storage: load g, then GEP one T.
+                if glob_arr.var_type == TYPE_PTR
+                    let gp_base: i32 = next_reg(s)
+                    emit_str(s, c"  ")
+                    emit_reg(s, gp_base)
+                    emit_str(s, c" = load ptr, ptr @")
+                    emit_name(s, glob_arr.name, glob_arr.name_len)
+                    emit_str(s, c"\n")
+                    let gp_idx: i32 = emit_expr(s, op.right)
+                    let gp_elem: i32 = next_reg(s)
+                    emit_str(s, c"  ")
+                    emit_reg(s, gp_elem)
+                    emit_str(s, c" = getelementptr ")
+                    emit_ptr_elem_gep_type(s, glob_arr.pointee_type, glob_arr.pointee_type_name, glob_arr.pointee_type_name_len)
+                    emit_str(s, c", ptr ")
+                    emit_reg(s, gp_base)
+                    emit_str(s, c", i64 ")
+                    emit_reg(s, gp_idx)
+                    emit_str(s, c"\n")
+                    return gp_elem
                 let ga_idx: i32 = emit_expr(s, op.right)
                 let ga_elem: i32 = next_reg(s)
                 emit_str(s, c"  ")

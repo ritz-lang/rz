@@ -77,6 +77,36 @@ def project_source_roots(project_root: Optional[Path]) -> List[str]:
     return [str(r) for r in roots if r.is_dir()]
 
 
+# AGAST #1908: a test binary is built by one compiler, ritz0 by default. With
+# a ritz1-family compiler every module is built by it: the test file
+# (`ritz1 --test-table`), its dependencies and ritzunit's own sources.
+def _ritz1_compile(compiler: str, src: str, out_ll: str, project_root: Optional[Path],
+                   dependencies: Optional[Dict[str, DependencyMapping]],
+                   *extra: str) -> Optional[str]:
+    """Compile `src` to `out_ll` with a ritz1-family compiler; an error or None.
+
+    The command and environment are build.py's (`ritz1_compile_cmd`,
+    `ritz1_env`), so a module compiles exactly as `rz build --compiler ritz1`
+    compiles it. ritz1 takes no --sources: the project's source roots go on
+    RITZ_PATH instead, after build.py's entries, so `import types.color` from
+    a test file resolves as it does under ritz0's `--sources`.
+    """
+    build = _build_module()
+    cmd = build.ritz1_compile_cmd(compiler, Path(src), Path(out_ll))
+    if cmd is None:
+        return f"{compiler} binary not found"
+    namespaces = {n: d for n, d in (dependencies or {}).items()
+                  if isinstance(d.path, Path)}
+    env = build.ritz1_env(namespaces)
+    entries = env["RITZ_PATH"].split(os.pathsep)
+    entries += [r for r in project_source_roots(project_root) if r not in entries]
+    env["RITZ_PATH"] = os.pathsep.join(entries)
+    result = subprocess.run(cmd + list(extra), capture_output=True, text=True, env=env)
+    if result.returncode != 0:
+        return f"{compiler} failed for {Path(src).name}: {result.stderr}{result.stdout}"
+    return None
+
+
 def _sources_args(project_root: Optional[Path]) -> List[str]:
     """`--sources <json>` for a ritz0 compile, or nothing if there are none."""
     import json
@@ -426,13 +456,13 @@ def _build_module():
     return _BUILD_MODULE
 
 
-def _cas_context(project_root, dependencies):
+def _cas_context(project_root, dependencies, compiler="ritz0"):
     """(build module, BuildCache, ArtifactStore) set up to resolve imports the
     way ritz0 is invoked below, or None if the store is disabled."""
     if os.environ.get(NO_CAS_ENV, "") not in ("", "0"):
         return None
     build = _build_module()
-    cache = build.get_build_cache("ritz0")
+    cache = build.get_build_cache(compiler)
     cache.set_import_context(
         project_root=project_root,
         dependencies={n: (Path(d.path), list(d.sources)) for n, d in (dependencies or {}).items()},
@@ -441,14 +471,42 @@ def _cas_context(project_root, dependencies):
     return build, cache, build.cas.ArtifactStore()
 
 
+def _ritz0_compile_dependency(ritz0_py: Path, src: str, ll_path: str,
+                              project_root: Optional[Path],
+                              dependencies: Optional[Dict[str, DependencyMapping]]
+                              ) -> Optional[str]:
+    """`ritz0 <src> --no-runtime` to `ll_path`; an error message or None."""
+    import json
+    compile_cmd = [sys.executable, str(ritz0_py), src, "-o", ll_path, "--no-runtime"]
+
+    # Pass dependencies to ritz0 if provided (Issue #48)
+    if dependencies:
+        deps_json = {
+            name: {"path": str(spec.path), "sources": spec.sources}
+            for name, spec in dependencies.items()
+        }
+        compile_cmd.extend(["--deps", json.dumps(deps_json)])
+
+    # Pass project root if provided
+    if project_root:
+        compile_cmd.extend(["--project-root", str(project_root)])
+    compile_cmd.extend(_sources_args(project_root))
+
+    result = subprocess.run(compile_cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        return f"ritz0 failed for {Path(src).name}: {result.stderr}"
+    return None
+
+
 def compile_dependencies(
     source_files: List[Path],
     tmpdir: str,
     ll_cache: dict,
     dependencies: Dict[str, DependencyMapping] = None,
-    project_root: Path = None
+    project_root: Path = None,
+    compiler: str = "ritz0",
 ) -> Tuple[List[str], Optional[str]]:
-    """Compile dependencies to LLVM IR, using cache when possible.
+    """Compile dependencies to LLVM IR with `compiler`, using cache when possible.
 
     Args:
         source_files: List of source files to compile
@@ -464,7 +522,7 @@ def compile_dependencies(
     ritz0_dir = Path(__file__).parent
     ritz0_py = ritz0_dir / "ritz0.py"
     ll_files = []
-    ctx = _cas_context(project_root, dependencies) if source_files else None
+    ctx = _cas_context(project_root, dependencies, compiler) if source_files else None
 
     for src in source_files:
         src_key = str(Path(src).resolve())
@@ -482,29 +540,14 @@ def compile_dependencies(
         cas_key = None
         if ctx is not None:
             build, cache, store = ctx
-            cas_key = build.cas_module_key(Path(src_key), cache, "ritz0")
+            cas_key = build.cas_module_key(Path(src_key), cache, compiler)
 
         def emit_ll(src=src, ll_path=ll_path) -> Optional[str]:
-            """ritz0 --no-runtime of `src` into ll_path; an error, or None."""
-            compile_cmd = [sys.executable, str(ritz0_py), str(src), "-o", ll_path, "--no-runtime"]
-
-            # Pass dependencies to ritz0 if provided (Issue #48)
-            if dependencies:
-                deps_json = {
-                    name: {"path": str(spec.path), "sources": spec.sources}
-                    for name, spec in dependencies.items()
-                }
-                compile_cmd.extend(["--deps", json.dumps(deps_json)])
-
-            # Pass project root if provided
-            if project_root:
-                compile_cmd.extend(["--project-root", str(project_root)])
-            compile_cmd.extend(_sources_args(project_root))
-
-            result = subprocess.run(compile_cmd, capture_output=True, text=True)
-            if result.returncode != 0:
-                return f"ritz0 failed for {Path(src).name}: {result.stderr}"
-            return None
+            """`compiler` --no-runtime of `src` into ll_path; an error, or None."""
+            if compiler != "ritz0":
+                return _ritz1_compile(compiler, str(src), ll_path, project_root, dependencies)
+            return _ritz0_compile_dependency(ritz0_py, str(src), ll_path, project_root,
+                                             dependencies)
 
         if cas_key is None:
             error = emit_ll()
@@ -512,7 +555,7 @@ def compile_dependencies(
                 return None, error
         else:
             def build_fn(emit_ll=emit_ll, ll_path=ll_path, obj_path=obj_path):
-                # Same pipeline as build.py: ritz0, verify (if asked), clang -c.
+                # Same pipeline as build.py: compile, verify (if asked), clang -c.
                 error = (emit_ll()
                          or build.verify_ir(Path(ll_path), Path(src_key))
                          or build.compile_ll_to_obj(Path(ll_path), Path(obj_path), Path(src_key)))
@@ -525,7 +568,7 @@ def compile_dependencies(
             try:
                 stored, built = store.get_or_build(
                     cas_key, "o", build_fn, identity=ident,
-                    meta={"module": ident, "compiler": "ritz0"})
+                    meta={"module": ident, "compiler": compiler})
             except build.cas.BuildFailed as e:
                 return None, str(e)
             if not built:
@@ -543,12 +586,16 @@ def _compile_harness(
     harness_ll: str,
     project_root: Optional[Path],
     dependencies: Optional[Dict[str, DependencyMapping]],
+    compiler: str = "ritz0",
 ) -> Optional[str]:
     """Compile a test file in test mode (`--test-table`) to LLVM IR.
 
     Compiled *with* the runtime: its `_start` calls ritzunit's `main`. Returns an
     error message, or None on success.
     """
+    if compiler != "ritz0":
+        return _ritz1_compile(compiler, harness_path, harness_ll, project_root,
+                              dependencies, "--test-table")
     import json
     ritz0_py = Path(__file__).parent / "ritz0.py"
     compile_cmd = [sys.executable, str(ritz0_py), harness_path, "-o", harness_ll, "--test-table"]
@@ -623,8 +670,8 @@ def _as_object(path: str, tmpdir: str) -> Tuple[Optional[str], Optional[str]]:
     return (None, error) if error else (obj, None)
 
 
-def build_runner_objects(tmpdir: str, ll_cache: dict,
-                         test_modules=()) -> Tuple[List[str], Optional[str]]:
+def build_runner_objects(tmpdir: str, ll_cache: dict, test_modules=(),
+                         compiler: str = "ritz0") -> Tuple[List[str], Optional[str]]:
     """Objects that make ritzunit the test binary's `main`.
 
     Every module the runner needs and the test does not (`test_modules`:
@@ -651,7 +698,7 @@ def build_runner_objects(tmpdir: str, ll_cache: dict,
         return [], f"ritzunit import resolution failed: {e}"
     compiled, error = compile_dependencies(
         [Path(f) for f in sources], tmpdir, ll_cache,
-        dependencies=deps, project_root=RITZUNIT_ROOT)
+        dependencies=deps, project_root=RITZUNIT_ROOT, compiler=compiler)
     if error:
         return [], f"ritzunit: {error}"
 
@@ -675,8 +722,11 @@ def build_runner_objects(tmpdir: str, ll_cache: dict,
     return shared + [runner], None
 
 
-def build_test_binary(source_path: str, tmpdir: str) -> Tuple[Optional[str], Optional[str]]:
-    """Compile and link `source_path`'s test binary in `tmpdir`.
+def build_test_binary(source_path: str, tmpdir: str,
+                      compiler: str = "ritz0") -> Tuple[Optional[str], Optional[str]]:
+    """Compile and link `source_path`'s test binary in `tmpdir` with `compiler`.
+
+    Every object in it, ritzunit's included, is built by `compiler`.
 
     Returns (exe_path, error).
     """
@@ -687,20 +737,25 @@ def build_test_binary(source_path: str, tmpdir: str) -> Tuple[Optional[str], Opt
     ll_cache = {}
     dep_objects, error = compile_dependencies(
         dep_files or [], tmpdir, ll_cache,
-        dependencies=dependencies, project_root=project_root)
+        dependencies=dependencies, project_root=project_root, compiler=compiler)
     if error:
         return None, error
 
-    runner_objects, error = build_runner_objects(tmpdir, ll_cache, dep_files or [])
+    runner_objects, error = build_runner_objects(tmpdir, ll_cache, dep_files or [], compiler)
     if error:
         return None, error
 
-    # The file's own `main` is dropped by test mode; it is stripped here too
-    # because it is not part of what is being tested and need not compile.
-    harness_path = os.path.join(tmpdir, "test_main.ritz")
-    Path(harness_path).write_text(strip_main_from_source(Path(source_path).read_text()))
+    # The file's own `main` is dropped by test mode; for ritz0 it is stripped
+    # here too because it is not part of what is being tested and need not
+    # compile. ritz1 resolves imports from the file's own directory first, so
+    # it compiles the file in place; it drops `main` before emitting anything.
     harness_ll = os.path.join(tmpdir, "test_main.ll")
-    error = _compile_harness(harness_path, harness_ll, project_root, dependencies)
+    if compiler == "ritz0":
+        harness_path = os.path.join(tmpdir, "test_main.ritz")
+        Path(harness_path).write_text(strip_main_from_source(Path(source_path).read_text()))
+    else:
+        harness_path = str(Path(source_path).resolve())
+    error = _compile_harness(harness_path, harness_ll, project_root, dependencies, compiler)
     if error:
         return None, error
 
@@ -767,8 +822,9 @@ def run_test_binary(exe_path: str, cwd: Optional[str] = None) -> Tuple[int, int,
     return passed, failed, failures
 
 
-def run_test_file(source_path: str, verbose: bool = False) -> Tuple[int, int, List[str]]:
-    """Build `source_path`'s test binary and run it.
+def run_test_file(source_path: str, verbose: bool = False,
+                  compiler: str = "ritz0") -> Tuple[int, int, List[str]]:
+    """Build `source_path`'s test binary with `compiler` and run it.
 
     Returns (passed, failed, failure_messages). A file whose binary cannot be
     built fails every one of its tests with the build error.
@@ -782,7 +838,7 @@ def run_test_file(source_path: str, verbose: bool = False) -> Tuple[int, int, Li
         tmpdir = make_scratch_dir()
         if verbose:
             print(f"  Building test binary for {len(tests)} tests...", flush=True)
-        exe_path, error = build_test_binary(source_path, tmpdir)
+        exe_path, error = build_test_binary(source_path, tmpdir, compiler)
         if error:
             return 0, len(tests), [f"{name}: {error}" for name, _fn in tests]
         passed, failed, failures = run_test_binary(exe_path)

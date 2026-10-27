@@ -2436,8 +2436,12 @@ def per_file_timeout() -> int:
 
 
 def run_test_file(tfile: Path, pkg_dir: Path, test_env: dict,
-                  timeout: int) -> dict:
+                  timeout: int, compiler: str = "ritz0") -> dict:
     """Run one `ritz0 --test <tfile>` and print its verdict line(s).
+
+    `compiler` builds the test binary (`--compiler`, AGAST #1908): with a
+    ritz1-family compiler, ritz0.py only drives the harness; every object in
+    the binary, ritzunit's included, is compiled by `compiler`.
 
     Returns {"status", "passed", "failed"}, status being one of
     classify_test_file's statuses or "timeout". Shared by the serial loop
@@ -2450,8 +2454,11 @@ def run_test_file(tfile: Path, pkg_dir: Path, test_env: dict,
     not CWD-based — see ritz0/import_resolver.py).
     """
     try:
+        cmd = [sys.executable, str(RITZ0), "--test", str(tfile)]
+        if compiler != "ritz0":
+            cmd += ["--compiler", compiler]
         result = subprocess.run(
-            [sys.executable, str(RITZ0), "--test", str(tfile)],
+            cmd,
             cwd=pkg_dir,
             env=test_env,
             capture_output=True, text=True,
@@ -2538,36 +2545,20 @@ def run_test_sh(pkg_dir: Path) -> bool:
     return False
 
 
-def report_no_harness(pkg_name: str, compiler: str, n_files: int) -> None:
-    """The ritz1/ritz1_selfhosted 'files NOT run' failure line.
-
-    The only .ritz test harness is `ritz0 --test`; ritz1 has no --test mode.
-    This used to run every file through ritz0 regardless of --compiler, so
-    each "ritz1" verdict was ritz0's (AGAST #1500). Do NOT fall back to ritz0
-    and do not skip quietly: a run that tested nothing with the requested
-    compiler is a named failure.
-    """
-    print(f"  ✗ {pkg_name}: {compiler} has no --test harness; "
-          f"{n_files} test file(s) NOT run")
-
-
 def run_tests(pkg_dir: Path, config: dict, compiler: str = "ritz0") -> bool:
     """Run tests for a package with `compiler`.
 
-    .ritz test files only run under ritz0 (`ritz0 --test`). For ritz1 and
-    ritz1_selfhosted they are reported as NOT run and the package fails.
+    Every test binary is built by `compiler`: the test file in test mode,
+    its dependencies and ritzunit (AGAST #1908). Before that, ritz1 had no
+    test mode and its files were reported as NOT run (#1500): a ritz1 run
+    must never fall back to ritz0.
     """
-    pkg_name = config["package"]["name"]
     all_passed = True
     tests_found = False
 
     ritz_tests = discover_test_files(pkg_dir, config)
 
-    if ritz_tests and compiler != "ritz0":
-        tests_found = True
-        report_no_harness(pkg_name, compiler, len(ritz_tests))
-        all_passed = False
-    elif ritz_tests:
+    if ritz_tests:
         tests_found = True
         print(f"  🧪 Running {len(ritz_tests)} .ritz test file(s)...")
         # ritz0 --test compiles a test-harness binary and then EXECUTES it.
@@ -2582,7 +2573,7 @@ def run_tests(pkg_dir: Path, config: dict, compiler: str = "ritz0") -> bool:
         # across the workspace via --unit-file; AGAST #1809.)
         test_env = test_env_for_files()
         timeout = per_file_timeout()
-        outcomes = [run_test_file(t, pkg_dir, test_env, timeout)
+        outcomes = [run_test_file(t, pkg_dir, test_env, timeout, compiler)
                     for t in ritz_tests]
         if any(o["status"] != "pass" for o in outcomes):
             all_passed = False
@@ -2726,8 +2717,7 @@ def unit_plan(pkg_dir: Path, config: dict, plan_path: Path, *,
     """Build step of a package's test run; writes the plan JSON.
 
     Mirrors cmd_test's per-package build branch and run_tests' preamble:
-    a failed build runs nothing (built=false); a non-ritz0 compiler with
-    test files is the named no-harness failure, and test.sh still runs.
+    a failed build runs nothing (built=false), and test.sh still runs.
     """
     import json
     pkg_name = config["package"]["name"]
@@ -2744,28 +2734,23 @@ def unit_plan(pkg_dir: Path, config: dict, plan_path: Path, *,
             built = False
 
     files: list[Path] = []
-    no_harness = False
     if built:
         files = discover_test_files(pkg_dir, config)
-        if files and compiler != "ritz0":
-            report_no_harness(pkg_name, compiler, len(files))
-            no_harness = True
-            files = []
     plan = {
         "built": built,
-        "no_harness": no_harness,
         "files": [str(f) for f in files],
         "test_sh": built and (pkg_dir / "test.sh").exists(),
     }
     plan_path.write_text(json.dumps(plan))
-    return 0 if built and not no_harness else 1
+    return 0 if built else 1
 
 
-def unit_file(pkg_dir: Path, tfile: Path, result_path: Path) -> int:
+def unit_file(pkg_dir: Path, tfile: Path, result_path: Path,
+              compiler: str = "ritz0") -> int:
     """Run one test file; write its run_test_file outcome as JSON."""
     import json
     outcome = run_test_file(tfile, pkg_dir, test_env_for_files(),
-                            per_file_timeout())
+                            per_file_timeout(), compiler)
     result_path.write_text(json.dumps(outcome))
     return 0 if outcome["status"] == "pass" else 1
 
@@ -2814,7 +2799,7 @@ def cmd_test(args):
                              profile_name=profile_name, compiler=compiler)
         if unit == "file":
             return unit_file(pkg_dir, Path(args.unit_file),
-                             Path(args.unit_result))
+                             Path(args.unit_result), compiler)
         return 0 if run_test_sh(pkg_dir) else 1
 
     all_passed = True
