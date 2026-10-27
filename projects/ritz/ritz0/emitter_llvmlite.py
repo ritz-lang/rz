@@ -4719,8 +4719,12 @@ class LLVMEmitter:
                 # Assignment to struct field: obj.field = val
                 # First, try to get the value of the expression
                 # If it's already a pointer to a struct, use it directly
-                # Otherwise, try to get its address
-                struct_val = self._emit_expr(stmt.target.expr)
+                # Otherwise, try to get its address. Struct storage (a local,
+                # global or field chain) is addressed directly: evaluating it
+                # as a value loads the whole struct (AGAST #1914).
+                struct_val = self._struct_place_addr(stmt.target.expr)
+                if struct_val is None:
+                    struct_val = self._emit_expr(stmt.target.expr)
 
                 if isinstance(struct_val.type, ir.PointerType):
                     # Expression evaluates to a pointer - use it directly
@@ -8181,6 +8185,52 @@ class LLVMEmitter:
                 return alloca
         return None
 
+    def _struct_place_addr(self, expr: rast.Expr) -> Optional[ir.Value]:
+        """The address of `expr` if it names struct storage, else None.
+
+        Covers a struct-typed local (its alloca), a struct-typed global not
+        shadowed by a local or param, and a field chain on either whose every
+        step is a declared struct field. Anything else (params, pointers,
+        Box implicit deref, calls) is None: the caller takes its general path.
+        """
+        if isinstance(expr, rast.Ident):
+            name = expr.name
+            if name in self.locals:
+                addr = self.locals[name][0]
+            elif name in self.params:
+                return None
+            elif name in self.globals:
+                addr = self.globals[name][0]
+            else:
+                return None
+            if isinstance(addr.type, ir.PointerType) and isinstance(
+                    addr.type.pointee, ir.BaseStructType):
+                return addr
+            return None
+        if isinstance(expr, rast.Field) and not expr.field.isdigit():
+            ptr = self._struct_place_field_ptr(expr)
+            if ptr is not None and isinstance(ptr.type.pointee, ir.BaseStructType):
+                return ptr
+        return None
+
+    def _struct_place_field_ptr(self, expr: rast.Field) -> Optional[ir.Value]:
+        """GEP to `expr.field` when `expr.expr` is struct storage, else None.
+
+        AGAST #1914: reading a field through a loaded struct value
+        (`load %Big` + `extractvalue`) makes LLVM -O0 expand the whole struct
+        into scalar DAG nodes -- tens of seconds for a ~74 KB global.
+        """
+        if expr.field.isdigit():
+            return None
+        base = self._struct_place_addr(expr.expr)
+        if base is None:
+            return None
+        struct_name = self._get_struct_name_from_type(base.type.pointee)
+        if not struct_name or not self._struct_has_field(struct_name, expr.field):
+            return None
+        idx = self._get_struct_field_index(struct_name, expr.field)
+        return self.builder.gep(base, [ir.Constant(self.i32, 0), ir.Constant(self.i32, idx)])
+
     def _emit_field_access(self, expr: rast.Field) -> ir.Value:
         """Emit field access: struct_val.field or struct_ptr->field.
 
@@ -8283,6 +8333,12 @@ class LLVMEmitter:
                     idx = self._get_struct_field_index(struct_name, expr.field)
                     field_ptr = self.builder.gep(local_alloca, [ir.Constant(self.i32, 0), ir.Constant(self.i32, idx)])
                     return self.builder.load(field_ptr)
+
+        # A field of a struct *place* (a global, or a chain like `l.a.b` /
+        # `g.a.b`): GEP to it and load only the field (AGAST #1914).
+        field_ptr = self._struct_place_field_ptr(expr)
+        if field_ptr is not None:
+            return self.builder.load(field_ptr)
 
         struct_val = self._emit_expr(expr.expr)
 
