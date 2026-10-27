@@ -42,6 +42,13 @@ venv. `--with-setup` includes them. Skipped steps are PRINTED, not silently
 dropped -- a runner that quietly omits work is the thing this file exists to
 prevent.
 
+Skipping setup must not skip its EFFECT on the environment (AGAST #1907).
+Each step runs with the workflow/job/step `env:` CI gives it (RITZ_VERIFY_IR=1),
+and, after an install-toolchain step, with /usr/lib/llvm-$CLANG_VERSION/bin
+prepended to PATH as that action does -- without it `opt`/`llvm-as` are absent,
+verifier tests skip, and the gate passes what CI fails. A missing bindir fails
+the step rather than running on with whatever toolchain happens to be there.
+
 Every step prints `[<step>] START <iso>` and `[<step>] END <iso> <secs>s rc=<n>`,
 and the run ends with a timing table (AGAST #1802): before this, every gate
 baseline had to be reconstructed from log timestamps.
@@ -59,6 +66,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import os
+import re
 import subprocess
 import tempfile
 import sys
@@ -77,13 +85,29 @@ SETUP_STEP_MARKERS = ("install toolchain", "install ritz0 dependencies")
 
 DEFAULT_JOB = "bootstrap"
 
+# The composite action that pins clang (AGAST #1308). It is a `uses:` step, so
+# it has no command to run -- but its effect matters: it prepends the
+# versioned LLVM bindir to PATH, which is what puts `opt`/`llvm-as` there.
+# Steps after it in the same job get that PATH here too (AGAST #1907).
+TOOLCHAIN_ACTION = "install-toolchain"
+LLVM_BINDIR = "/usr/lib/llvm-{version}/bin"
+
+_EXPR = re.compile(r"\$\{\{\s*env\.(\w+)\s*\}\}")
+
 
 class Step:
-    def __init__(self, job: str, name: str, run: str, workdir: str):
+    def __init__(self, job: str, name: str, run: str, workdir: str,
+                 env: dict[str, str] | None = None,
+                 llvm_bindir: str | None = None):
         self.job = job
         self.name = name
         self.run = run
         self.workdir = workdir
+        # workflow < job < step `env:`, merged as Actions merges them.
+        self.env = dict(env or {})
+        # The pinned toolchain's bindir, if an install-toolchain step ran
+        # earlier in this job; prepended to PATH when the step runs.
+        self.llvm_bindir = llvm_bindir
 
     @property
     def is_setup(self) -> bool:
@@ -107,9 +131,17 @@ def load_steps(workflow: Path | None = None) -> list[Step]:
     """
     workflow = workflow or WORKFLOW
     spec = yaml.safe_load(workflow.read_text())
+    wf_env = _env_block(spec)
     steps: list[Step] = []
     for job, jobspec in spec.get("jobs", {}).items():
+        job_env = {**wf_env, **_env_block(jobspec)}
+        bindir = None
         for s in jobspec.get("steps", []) or []:
+            if TOOLCHAIN_ACTION in str(s.get("uses", "")):
+                version = _expand(str((s.get("with") or {}).get("clang-version", "")),
+                                  job_env)
+                bindir = LLVM_BINDIR.format(version=version)
+                continue
             if "run" not in s:
                 continue
             steps.append(Step(
@@ -120,8 +152,19 @@ def load_steps(workflow: Path | None = None) -> list[Step]:
                 # its `run:` block. Parsing the YAML rather than grepping is
                 # exactly why that no longer matters.
                 workdir=s.get("working-directory", "."),
+                env={**job_env, **_env_block(s)},
+                llvm_bindir=bindir,
             ))
     return steps
+
+
+def _env_block(node: dict) -> dict[str, str]:
+    return {str(k): str(v) for k, v in (node.get("env") or {}).items()}
+
+
+def _expand(value: str, env: dict[str, str]) -> str:
+    """Resolve `${{ env.X }}` -- the only expression the workflow feeds the action."""
+    return _EXPR.sub(lambda m: env.get(m.group(1), ""), value)
 
 
 def jobs_in(steps: list[Step]) -> list[str]:
@@ -191,6 +234,10 @@ def run_step(step: Step, dry_run: bool = False) -> int:
     print(f"[{step.job}] {step.name}", flush=True)
     print(f"  cwd: {cwd}", flush=True)
     print(f"{'=' * 70}", flush=True)
+    if step.llvm_bindir:
+        print(f"  PATH: {step.llvm_bindir} prepended (install-toolchain)", flush=True)
+    for k, v in step.env.items():
+        print(f"  env: {k}={v}", flush=True)
     if dry_run:
         for line in step.run.rstrip().split("\n"):
             print(f"  $ {line}", flush=True)
@@ -199,8 +246,17 @@ def run_step(step: Step, dry_run: bool = False) -> int:
         # The 127/2 class of failure, named rather than left to a shell.
         print(f"  ERROR: working-directory does not exist: {cwd}", file=sys.stderr)
         return 2
+    env = {**os.environ, **step.env}
+    if step.llvm_bindir:
+        if not Path(step.llvm_bindir).is_dir():
+            # CI's action fails here too. Running on without it would skip
+            # every verifier-dependent test: the #1907 miss.
+            print(f"  ERROR: pinned LLVM toolchain not installed: {step.llvm_bindir} "
+                  f"(see projects/ritz/docs/TOOLCHAIN.md)", file=sys.stderr)
+            return 2
+        env["PATH"] = step.llvm_bindir + os.pathsep + env.get("PATH", "")
     return subprocess.run(["bash", "-e", "-o", "pipefail", "-c", step.run],
-                          cwd=cwd).returncode
+                          cwd=cwd, env=env).returncode
 
 
 def main(argv: list[str] | None = None) -> int:

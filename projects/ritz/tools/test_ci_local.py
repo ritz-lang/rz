@@ -255,3 +255,92 @@ def test_gate_runner_defaults_to_fail_fast():
     cmd_line = next(line for line in gate.read_text().splitlines()
                     if line.startswith("CMD="))
     assert "ARGS=--fail-fast" in cmd_line, cmd_line
+
+
+# --------------------------------------------------------------------------
+# AGAST #1907: the gate must see CI's environment, not just CI's commands.
+#
+# #1805's gate passed and CI went red on the same commit: CI's
+# install-toolchain action puts /usr/lib/llvm-21/bin on PATH (so `opt` and
+# `llvm-as` exist), ci_local dropped that `uses:` step without a trace, and
+# TestIRVerification skipped locally instead of tripping the spawn guard.
+# Step `env:` (RITZ_VERIFY_IR=1) was dropped the same way.
+# --------------------------------------------------------------------------
+
+TOOLCHAIN_WF = """\
+env:
+  CLANG_VERSION: '77'
+  FOO: workflow
+jobs:
+  alpha:
+    env:
+      BAR: job
+    steps:
+      - name: Before toolchain
+        run: test "$(command -v opt || true)" != "{bindir}/opt"
+      - name: Install toolchain
+        uses: ./.github/actions/install-toolchain
+        with:
+          clang-version: ${{{{ env.CLANG_VERSION }}}}
+      - name: Sees pinned opt
+        run: test "$(command -v opt)" = "{bindir}/opt"
+      - name: Sees merged env
+        run: test "$FOO" = step && test "$BAR" = job && test "$CLANG_VERSION" = 77
+        env:
+          FOO: step
+"""
+
+
+@pytest.fixture
+def toolchain_wf(tmp_path, monkeypatch):
+    bindir = tmp_path / "llvm-77" / "bin"
+    bindir.mkdir(parents=True)
+    opt = bindir / "opt"
+    opt.write_text("#!/bin/sh\nexit 0\n")
+    opt.chmod(0o755)
+    wf = tmp_path / "main.yml"
+    wf.write_text(TOOLCHAIN_WF.format(bindir=bindir))
+    monkeypatch.setattr(ci_local, "WORKFLOW", wf)
+    monkeypatch.setattr(ci_local, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(ci_local, "DEFAULT_JOB", "alpha")
+    monkeypatch.setattr(ci_local, "LLVM_BINDIR", str(tmp_path / "llvm-{version}" / "bin"))
+    return bindir
+
+
+def test_steps_after_install_toolchain_get_the_pinned_bindir(toolchain_wf):
+    steps = {s.name: s for s in ci_local.load_steps()}
+    assert steps["Before toolchain"].llvm_bindir is None
+    assert steps["Sees pinned opt"].llvm_bindir == str(toolchain_wf)
+
+
+def test_pinned_toolchain_is_on_path_when_steps_run(toolchain_wf, capsys):
+    """The #1907 miss: TestIRVerification needs `opt` on PATH, as in CI."""
+    assert ci_local.main([]) == 0, capsys.readouterr().out
+
+
+def test_missing_pinned_bindir_fails_loudly(toolchain_wf, capsys):
+    """A gate without the pinned toolchain asserts less than CI: say so."""
+    for f in toolchain_wf.iterdir():
+        f.unlink()
+    toolchain_wf.rmdir()
+    assert ci_local.main(["--job", "alpha"]) == 1
+    assert str(toolchain_wf) in capsys.readouterr().err
+
+
+def test_workflow_job_and_step_env_are_merged_like_ci(toolchain_wf):
+    step = next(s for s in ci_local.load_steps() if s.name == "Sees merged env")
+    assert step.env == {"CLANG_VERSION": "77", "FOO": "step", "BAR": "job"}
+
+
+def test_real_bootstrap_job_pins_the_workflow_clang():
+    wf = yaml.safe_load(ci_local.WORKFLOW.read_text())
+    version = str(wf["env"]["CLANG_VERSION"])
+    pytest_step = next(s for s in ci_local.load_steps()
+                       if s.job == "bootstrap" and s.name == "ritz0 unit tests")
+    assert pytest_step.llvm_bindir == ci_local.LLVM_BINDIR.format(version=version)
+
+
+def test_real_verify_ir_steps_carry_their_env():
+    verified = [s.name for s in ci_local.load_steps()
+                if s.job == "bootstrap" and s.env.get("RITZ_VERIFY_IR") == "1"]
+    assert len(verified) >= 2, verified

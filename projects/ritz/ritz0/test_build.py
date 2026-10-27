@@ -787,6 +787,11 @@ class TestIRVerification:
     a `RITZ_VERIFY_IR=1` run can exit 0 having verified nothing at all.
     That silent-success branch is tested here deliberately; it is the reason
     a green run is not by itself evidence the IR was checked.
+
+    Tests that hand IR to a real verifier start `opt`/`llvm-as`, so they are
+    `integration` (spawn_guard) and outside smoke. They skip where no verifier
+    is on PATH — which is why #1805's gate never saw them spawn (AGAST #1907;
+    ci_local.py now mirrors CI's toolchain PATH).
     """
 
     # Dominance violation: %y is never defined.
@@ -827,7 +832,7 @@ class TestIRVerification:
         ll = self._write(tmp_path, self.BAD_IR)
         assert _build_module.verify_ir(ll, Path("src.ritz")) is None
 
-    @pytest.mark.unit
+    @pytest.mark.integration  # runs opt/llvm-as (spawn_guard, AGAST #1907)
     @pytest.mark.parametrize("val", ["1", "true", "yes", "on"])
     def test_truthy_values_enable_verification(self, tmp_path, monkeypatch, val):
         if not self._has_verifier():
@@ -843,7 +848,7 @@ class TestIRVerification:
         ll = self._write(tmp_path, self.BAD_IR)
         assert _build_module.verify_ir(ll, Path("src.ritz")) is None
 
-    @pytest.mark.unit
+    @pytest.mark.integration  # runs opt/llvm-as (spawn_guard, AGAST #1907)
     def test_rejects_invalid_ir_and_names_the_source(self, tmp_path, monkeypatch):
         if not self._has_verifier():
             pytest.skip("no `opt`/`llvm-as` on PATH")
@@ -856,7 +861,7 @@ class TestIRVerification:
         assert "emitter_stmt.ritz" in err
         assert str(ll) in err
 
-    @pytest.mark.unit
+    @pytest.mark.integration  # runs opt/llvm-as (spawn_guard, AGAST #1907)
     def test_accepts_valid_ir(self, tmp_path, monkeypatch):
         if not self._has_verifier():
             pytest.skip("no `opt`/`llvm-as` on PATH")
