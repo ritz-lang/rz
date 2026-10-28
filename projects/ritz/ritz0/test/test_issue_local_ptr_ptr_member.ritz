@@ -1,0 +1,113 @@
+# Regression (AGAST #1933): `(**pp).f` where pp is a LOCAL `**S`
+# (`let pp: **Cell = @pc`) failed in ritz1 with "unhandled EXPR_MEMBER",
+# read or write, while the same expression on a `**Cell` param compiled.
+# The parser dropped the struct name of a `**S` let (stmt_var_decl only kept
+# it for `*S` / `S` / `@S`), and emit_var_decl registered the local through
+# add_local_ptr, which has no name slot, so emit_deref_operand_ptr could not
+# find the pointee struct.  ritz0 is the oracle.
+
+struct Cell
+    v: i64
+    arr: [2]i64
+
+[[test]]
+fn test_local_pp_let_read() -> i32
+    var c: Cell = Cell { v: 41, arr: [0, 0] }
+    let pc: *Cell = @c
+    let pp: **Cell = @pc
+    assert (**pp).v == 41
+    0
+
+[[test]]
+fn test_local_pp_var_read() -> i32
+    var c: Cell = Cell { v: 42, arr: [0, 0] }
+    var pc: *Cell = @c
+    var pp: **Cell = @pc
+    assert (**pp).v == 42
+    0
+
+fn read_via_local_pp(c: *Cell) -> i64
+    let pc: *Cell = c
+    let pp: **Cell = @pc
+    return (**pp).v
+
+[[test]]
+fn test_local_pp_return_read() -> i32
+    var c: Cell = Cell { v: 43, arr: [0, 0] }
+    assert read_via_local_pp(@c) == 43
+    0
+
+# The local is copied from a `**Cell` param rather than built with `@`.
+fn read_via_copied_pp(q: **Cell) -> i64
+    let pp: **Cell = q
+    return (**pp).arr[1]
+
+[[test]]
+fn test_local_pp_from_param() -> i32
+    var c: Cell = Cell { v: 0, arr: [5, 44] }
+    var pc: *Cell = @c
+    assert read_via_copied_pp(@pc) == 44
+    0
+
+[[test]]
+fn test_local_pp_field_write() -> i32
+    var c: Cell = Cell { v: 0, arr: [0, 0] }
+    var pc: *Cell = @c
+    let pp: **Cell = @pc
+    (**pp).v = 45
+    assert c.v == 45
+    assert (**pp).v == 45
+    0
+
+[[test]]
+fn test_local_pp_index_write() -> i32
+    var c: Cell = Cell { v: 0, arr: [0, 0] }
+    var pc: *Cell = @c
+    let pp: **Cell = @pc
+    (**pp).arr[1] = 46
+    (**pp).arr[0] = 7
+    assert c.arr[1] == 46
+    assert c.arr[0] == 7
+    assert (**pp).arr[1] == 46
+    assert c.v == 0
+    0
+
+# Retargeting the middle pointer through pp: the next `(**pp)` must reload.
+[[test]]
+fn test_local_pp_retarget() -> i32
+    var a: Cell = Cell { v: 1, arr: [0, 0] }
+    var b: Cell = Cell { v: 2, arr: [0, 0] }
+    var pc: *Cell = @a
+    let pp: **Cell = @pc
+    assert (**pp).v == 1
+    *pp = @b
+    assert (**pp).v == 2
+    (**pp).v = 47
+    assert b.v == 47
+    assert a.v == 1
+    0
+
+# Keeping the struct name on the local must not change its pointer stride:
+# `pp + 1` steps one `*Cell` (8 bytes), not one Cell.
+[[test]]
+fn test_local_pp_stride() -> i32
+    var a: Cell = Cell { v: 10, arr: [0, 0] }
+    var b: Cell = Cell { v: 48, arr: [0, 0] }
+    var ptrs: [2]*Cell = [@a, @b]
+    let pp: **Cell = @ptrs[0]
+    let second: *Cell = *(pp + 1)
+    assert second.v == 48
+    assert (**pp).v == 10
+    0
+
+# The `**Cell` param form, which already worked: kept as the control.
+fn set_through_param_pp(pp: **Cell, v: i64)
+    (**pp).arr[1] = v
+
+[[test]]
+fn test_param_pp_index_write() -> i32
+    var c: Cell = Cell { v: 0, arr: [0, 0] }
+    var pc: *Cell = @c
+    set_through_param_pp(@pc, 49)
+    assert c.arr[1] == 49
+    0
