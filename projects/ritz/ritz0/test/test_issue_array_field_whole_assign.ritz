@@ -1,0 +1,191 @@
+# Regression (AGAST #1934): assigning an array literal `[a, b, ..]` or a fill
+# `[v; N]` to a whole inline array field (`x.f = [..]`, `p.f = [..]`) made
+# ritz1 build the literal in a shadow `[N x i64]` alloca and then
+# `store i64 (ptrtoint ...)` that ADDRESS into the field: 8 bytes of a stack
+# address over the field (and past it, for fields narrower than 8 bytes),
+# with the elements never copied.  ritz0 copies the elements at the field's
+# declared element type.  ritz1 now writes them in place, the same way a
+# struct literal's array field is initialised (#1605 / #1608).
+
+struct Narrow
+    tag: u8
+    bytes: [4]u8
+    after: u8
+
+struct Words
+    head: i64
+    words: [3]i32
+    tail: i32
+
+struct Wide
+    vals: [2]i64
+    tail: i64
+
+struct Item
+    a: i64
+    b: i32
+
+struct Bag
+    items: [2]Item
+    tail: i64
+
+fn fill_narrow(p: *Narrow, v: u8)
+    p.bytes = [v, v + 1, v + 2, v + 3]
+
+fn fill_words(p: *Words, v: i32)
+    p.words = [v; 3]
+
+fn set_wide(p: *Wide, a: i64, b: i64)
+    p.vals = [a, b]
+
+fn set_bag(p: *Bag, x: i64)
+    p.items = [Item { a: x, b: 1 }, Item { a: x + 1, b: 2 }]
+
+struct Outer
+    lead: u8
+    inner: Narrow
+
+# `(*p).f = ..` (STMT_MEMBER_ASSIGN) and `o.inner.f = ..` reach the store
+# through emit_assign rather than the `x.f = ..` statement kind.
+fn set_wide_deref(p: *Wide, a: i64)
+    (*p).vals = [a, a * 2]
+
+fn fill_wide_deref(p: *Wide, a: i64)
+    (*p).vals = [a; 2]
+
+[[test]]
+fn test_whole_assign_u8_local() -> i32
+    var n: Narrow = Narrow { tag: 7, bytes: [9, 9, 9, 9], after: 5 }
+    n.bytes = [0, 1, 2, 250]
+    assert n.bytes[0] == 0
+    assert n.bytes[1] == 1
+    assert n.bytes[2] == 2
+    assert n.bytes[3] == 250
+    assert n.tag == 7
+    assert n.after == 5
+    n.bytes = [3; 4]
+    assert n.bytes[0] == 3
+    assert n.bytes[3] == 3
+    assert n.after == 5
+    n.bytes = [0; 4]
+    assert n.bytes[0] == 0
+    assert n.bytes[3] == 0
+    assert n.tag == 7
+    assert n.after == 5
+    0
+
+[[test]]
+fn test_whole_assign_u8_ptr() -> i32
+    var n: Narrow = Narrow { tag: 7, bytes: [0, 0, 0, 0], after: 5 }
+    fill_narrow(@n, 10)
+    assert n.bytes[0] == 10
+    assert n.bytes[1] == 11
+    assert n.bytes[2] == 12
+    assert n.bytes[3] == 13
+    assert n.tag == 7
+    assert n.after == 5
+    0
+
+[[test]]
+fn test_whole_assign_i32_local() -> i32
+    var w: Words = Words { head: 1, words: [0, 0, 0], tail: 2 }
+    w.words = [-5, 6, 70000]
+    assert w.words[0] == -5
+    assert w.words[1] == 6
+    assert w.words[2] == 70000
+    assert w.head == 1
+    assert w.tail == 2
+    0
+
+[[test]]
+fn test_whole_assign_i32_ptr_fill() -> i32
+    var w: Words = Words { head: 1, words: [0, 0, 0], tail: 2 }
+    fill_words(@w, -3)
+    assert w.words[0] == -3
+    assert w.words[1] == -3
+    assert w.words[2] == -3
+    assert w.head == 1
+    assert w.tail == 2
+    0
+
+[[test]]
+fn test_whole_assign_i64_local() -> i32
+    var w: Wide = Wide { vals: [0, 0], tail: 9 }
+    w.vals = [1234567890123, -4]
+    assert w.vals[0] == 1234567890123
+    assert w.vals[1] == -4
+    assert w.tail == 9
+    w.vals = [8; 2]
+    assert w.vals[0] == 8
+    assert w.vals[1] == 8
+    assert w.tail == 9
+    0
+
+[[test]]
+fn test_whole_assign_i64_ptr() -> i32
+    var w: Wide = Wide { vals: [0, 0], tail: 9 }
+    set_wide(@w, 11, 22)
+    assert w.vals[0] == 11
+    assert w.vals[1] == 22
+    assert w.tail == 9
+    0
+
+[[test]]
+fn test_whole_assign_struct_local() -> i32
+    var g: Bag = Bag { items: [Item { a: 0, b: 0 }, Item { a: 0, b: 0 }], tail: 3 }
+    g.items = [Item { a: 5, b: 6 }, Item { a: 7, b: 8 }]
+    assert g.items[0].a == 5
+    assert g.items[0].b == 6
+    assert g.items[1].a == 7
+    assert g.items[1].b == 8
+    assert g.tail == 3
+    0
+
+[[test]]
+fn test_whole_assign_struct_ptr() -> i32
+    var g: Bag = Bag { items: [Item { a: 0, b: 0 }, Item { a: 0, b: 0 }], tail: 3 }
+    set_bag(@g, 40)
+    assert g.items[0].a == 40
+    assert g.items[0].b == 1
+    assert g.items[1].a == 41
+    assert g.items[1].b == 2
+    assert g.tail == 3
+    0
+
+[[test]]
+fn test_whole_assign_deref_member() -> i32
+    var w: Wide = Wide { vals: [0, 0], tail: 9 }
+    set_wide_deref(@w, 21)
+    assert w.vals[0] == 21
+    assert w.vals[1] == 42
+    assert w.tail == 9
+    fill_wide_deref(@w, 5)
+    assert w.vals[0] == 5
+    assert w.vals[1] == 5
+    assert w.tail == 9
+    0
+
+[[test]]
+fn test_whole_assign_nested_member() -> i32
+    var o: Outer = Outer { lead: 4, inner: Narrow { tag: 7, bytes: [0, 0, 0, 0], after: 5 } }
+    o.inner.bytes = [1, 2, 3, 4]
+    assert o.inner.bytes[0] == 1
+    assert o.inner.bytes[3] == 4
+    assert o.inner.tag == 7
+    assert o.inner.after == 5
+    assert o.lead == 4
+    o.inner.bytes = [9; 4]
+    assert o.inner.bytes[0] == 9
+    assert o.inner.bytes[3] == 9
+    assert o.inner.after == 5
+    0
+
+# Every element is read before any is written: the right-hand side sees
+# the field's old contents.
+[[test]]
+fn test_whole_assign_reads_old_value() -> i32
+    var w: Wide = Wide { vals: [1, 2], tail: 9 }
+    w.vals = [w.vals[1], w.vals[0]]
+    assert w.vals[0] == 2
+    assert w.vals[1] == 1
+    0
