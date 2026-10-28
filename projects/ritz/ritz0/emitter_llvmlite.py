@@ -576,6 +576,11 @@ class LLVMEmitter:
             if layout:
                 return (layout.size, layout.alignment)
 
+            # Enum types (AGAST #1923): their real all-i8 layout, not 8/8.
+            enum_sa = self._enum_size_and_align(ty.name)
+            if enum_sa:
+                return enum_sa
+
             # Unmangled generic instantiation (e.g. `Span<u8>`): the registry
             # is keyed by the specialized name, and built-in generics may not
             # be materialized yet. Resolve it rather than guessing 8 bytes.
@@ -584,6 +589,12 @@ class LLVMEmitter:
                 layout = self.struct_registry.get_layout(specialized)
                 if layout:
                     return (layout.size, layout.alignment)
+                # Option<T> / Result<T, E> / generic user enums (#1923).
+                if specialized not in self.enum_types:
+                    self._ensure_builtin_generic_specialization(ty)
+                enum_sa = self._enum_size_and_align(specialized)
+                if enum_sa:
+                    return enum_sa
                 synthesized = self._ensure_builtin_generic_struct_specialization(ty)
                 if synthesized and synthesized in self.struct_types:
                     llvm_ty = self.struct_types[synthesized]
@@ -865,23 +876,7 @@ class LLVMEmitter:
         # struct (e.g. String) to the 1-byte generic placeholder — producing
         # a `{i8, [1 x i8]}` body that use-time layout (align 8, data at
         # index 2) then GEPed past the end of. AGAST #1321.
-        max_size = 0
-        max_align = 1
-        for variant in variants:
-            if variant.fields:
-                _, size, align = self._enum_variant_field_layout(variant)
-                max_size = max(max_size, size)
-                max_align = max(max_align, align)
-
-        if max_size > 0:
-            tag_size = 1
-            padding_needed = (max_align - (tag_size % max_align)) % max_align
-            if padding_needed > 0:
-                enum_type.set_body(self.i8, ir.ArrayType(self.i8, padding_needed), ir.ArrayType(self.i8, max_size))
-            else:
-                enum_type.set_body(self.i8, ir.ArrayType(self.i8, max_size))
-        else:
-            enum_type.set_body(self.i8)
+        self._set_enum_body(enum_type, variants)
 
         return specialized_name
 
@@ -2358,37 +2353,55 @@ class LLVMEmitter:
             Result: { i8, [7 x i8] padding, [24 x i8] data } = 32 bytes total
         """
         enum_type, variants = self.enum_types[enum_def.name]
+        self._set_enum_body(enum_type, variants)
 
-        # Calculate max size and alignment of all variant payloads
+    def _enum_payload_shape(self, variants) -> Tuple[int, int]:
+        """(padding, data_size) of an enum's `{ i8, [P x i8], [N x i8] }` body.
+
+        N is the largest variant payload; P pads the tag so the payload sits
+        at the strictest alignment any variant requires. N == 0 means a
+        tag-only enum, `{ i8 }`. The single source of the enum body: the
+        LLVM type (_set_enum_body) and its size (_enum_size_and_align) both
+        come from here, so sizeof cannot drift from the emitted type.
+        """
         max_size = 0
         max_align = 1
         for variant in variants:
             _, variant_size, variant_align = \
                 self._enum_variant_field_layout(variant)
             max_align = max(max_align, variant_align)
-            if variant_size > max_size:
-                max_size = variant_size
+            max_size = max(max_size, variant_size)
+        if max_size == 0:
+            return 0, 0
+        return (max_align - (1 % max_align)) % max_align, max_size
 
-        # Layout with proper alignment for data buffer
-        # If max_size is 0 (all unit variants), we still need the tag
-        if max_size > 0:
-            # Compute padding needed after tag (1 byte) to align data to max_align
-            tag_size = 1
-            padding_needed = (max_align - (tag_size % max_align)) % max_align
-
-            if padding_needed > 0:
-                # Layout: { i8 tag, [padding x i8], [max_size x i8] data }
-                padding_array = ir.ArrayType(self.i8, padding_needed)
-                data_array = ir.ArrayType(self.i8, max_size)
-                enum_type.set_body(self.i8, padding_array, data_array)
-            else:
-                # No padding needed (data is 1-byte aligned)
-                # Layout: { i8 tag, [max_size x i8] data }
-                data_array = ir.ArrayType(self.i8, max_size)
-                enum_type.set_body(self.i8, data_array)
+    def _set_enum_body(self, enum_type, variants) -> None:
+        """Give an enum its `{ i8 tag, [P x i8] pad, [N x i8] data }` body."""
+        padding, data_size = self._enum_payload_shape(variants)
+        if data_size == 0:
+            enum_type.set_body(self.i8)      # all unit variants: just a tag
+        elif padding > 0:
+            enum_type.set_body(self.i8, ir.ArrayType(self.i8, padding),
+                               ir.ArrayType(self.i8, data_size))
         else:
-            # All unit variants - just a tag
-            enum_type.set_body(self.i8)
+            enum_type.set_body(self.i8, ir.ArrayType(self.i8, data_size))
+
+    def _enum_size_and_align(self, name: str) -> Optional[Tuple[int, int]]:
+        """ABI (size, alignment) of enum `name`, or None if it is not one.
+
+        AGAST #1923: the body is all i8, so LLVM 1-aligns it and its size is
+        exactly 1 + P + N. This used to fall through to the unknown-type
+        (8, 8) guess, so `sizeof` of a struct with an enum field disagreed
+        with the `{ %Enum, ... }` type it emits (16 vs 40 for a 32-byte
+        enum), and an enum nested in another's payload got an 8-byte slot.
+        Computed from the variants rather than the LLVM body because struct
+        layouts are computed before enum bodies are set.
+        """
+        entry = self.enum_types.get(name)
+        if entry is None:
+            return None
+        padding, data_size = self._enum_payload_shape(entry[1])
+        return (1 + padding + data_size, 1)
 
     def _enum_variant_field_layout(self, variant):
         """Compute payload field offsets for one enum variant.
@@ -8588,6 +8601,12 @@ class LLVMEmitter:
                 layout = self.struct_registry.get_layout(type_name)
                 if layout:
                     return ir.Constant(self.i64, layout.size)
+
+                # Enum types: the size of the body they are emitted with
+                # (AGAST #1923).
+                enum_sa = self._enum_size_and_align(type_name)
+                if enum_sa:
+                    return ir.Constant(self.i64, enum_sa[0])
 
                 # Fallback: unknown type, return 8 (pointer size)
                 return ir.Constant(self.i64, 8)
