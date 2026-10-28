@@ -1041,6 +1041,11 @@ class Monomorphizer:
             new_type = subst.apply(stmt.type) if stmt.type else None
             new_value = self._specialize_expr(stmt.value, subst) if stmt.value else None
             return rast.VarStmt(stmt.span, stmt.name, new_type, new_value)
+        elif isinstance(stmt, rast.LetTupleStmt):
+            # `let (a, b) = init`: the initialiser can mention T (e.g.
+            # sizeof(T)), so it must be specialized too (AGAST #1928).
+            return rast.LetTupleStmt(stmt.span, stmt.names,
+                                     self._specialize_expr(stmt.value, subst))
         elif isinstance(stmt, rast.ExprStmt):
             return rast.ExprStmt(stmt.span, self._specialize_expr(stmt.expr, subst))
         elif isinstance(stmt, rast.AssignStmt):
@@ -1168,6 +1173,9 @@ class Monomorphizer:
             return rast.Cast(expr.span,
                             self._specialize_expr(expr.expr, subst),
                             subst.apply(expr.target))
+        elif isinstance(expr, rast.TryOp):
+            # `operand?`: the operand can mention T (AGAST #1928).
+            return rast.TryOp(expr.span, self._specialize_expr(expr.expr, subst))
         elif isinstance(expr, rast.Range):
             return rast.Range(expr.span,
                              self._specialize_expr(expr.start, subst) if expr.start else None,
