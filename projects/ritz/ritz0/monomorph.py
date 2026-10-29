@@ -32,7 +32,59 @@ After monomorphization:
 from typing import Dict, List, Set, Tuple, Optional
 from dataclasses import dataclass
 import copy
+import dataclasses
 import ritz_ast as rast
+
+
+def map_child_nodes(node, on_expr, on_stmt, on_type):
+    """Rebuild `node` with on_expr / on_stmt / on_type applied to its children.
+
+    The fallback for every AST kind the monomorph walks have no dedicated case
+    for.  Each dataclass field is mapped by kind: an Expr (Block included) goes
+    through on_expr, a Stmt through on_stmt, a Type through on_type; lists and
+    tuples are mapped element-wise; any other dataclass (MatchArm, Pattern,
+    Param, ClosureParam, AsmOperand) is walked recursively.  Spans and plain
+    values are kept.
+
+    Returns `node` itself when nothing beneath it changed, otherwise a shallow
+    copy with the changed fields replaced — never mutates `node`, which is the
+    generic template shared by every instantiation.
+
+    Before AGAST #1937 the fallback was `return node`, so sizeof(T), casts and
+    generic calls inside Match, Grouped, TupleLit, Lambda, InterpString, ...
+    kept the template's T.
+    """
+    def map_value(value):
+        if isinstance(value, rast.Expr):
+            return on_expr(value)
+        if isinstance(value, rast.Stmt):
+            return on_stmt(value)
+        if isinstance(value, rast.Type):
+            return on_type(value)
+        if isinstance(value, list):
+            new = [map_value(v) for v in value]
+            return value if all(a is b for a, b in zip(new, value)) else new
+        if isinstance(value, tuple):
+            new = tuple(map_value(v) for v in value)
+            return value if all(a is b for a, b in zip(new, value)) else new
+        if dataclasses.is_dataclass(value) and not isinstance(value, type):
+            return map_child_nodes(value, on_expr, on_stmt, on_type)
+        return value
+
+    changes = {}
+    for f in dataclasses.fields(node):
+        if f.name == "span":
+            continue
+        old = getattr(node, f.name)
+        new = map_value(old)
+        if new is not old:
+            changes[f.name] = new
+    if not changes:
+        return node
+    new_node = copy.copy(node)
+    for name, value in changes.items():
+        setattr(new_node, name, value)
+    return new_node
 
 
 @dataclass
@@ -1067,12 +1119,14 @@ class Monomorphizer:
             return rast.AssertStmt(stmt.span,
                                    self._specialize_expr(stmt.condition, subst),
                                    stmt.message)
-        elif isinstance(stmt, rast.BreakStmt):
-            return stmt
-        elif isinstance(stmt, rast.ContinueStmt):
-            return stmt
         else:
-            return stmt
+            # Every other kind (UnsafeBlock, AsmStmt, Break/Continue, ...):
+            # walk its fields generically so nothing nested is skipped
+            # (AGAST #1937).
+            return map_child_nodes(stmt,
+                                   lambda e: self._specialize_expr(e, subst),
+                                   lambda s: self._specialize_stmt(s, subst),
+                                   subst.apply)
 
     def _specialize_expr(self, expr: rast.Expr, subst: TypeSubstitution) -> rast.Expr:
         """Specialize an expression by substituting types and rewriting names."""
@@ -1182,8 +1236,14 @@ class Monomorphizer:
                              self._specialize_expr(expr.end, subst) if expr.end else None,
                              expr.inclusive)
         else:
-            # Literals and identifiers don't need specialization
-            return expr
+            # Every other kind (Match, Grouped, TupleLit, Lambda, ...): walk
+            # its fields generically.  Returning it unchanged left sizeof(T),
+            # casts and generic calls nested inside on the template's T
+            # (AGAST #1937).  Leaves (literals, identifiers) come back as-is.
+            return map_child_nodes(expr,
+                                   lambda e: self._specialize_expr(e, subst),
+                                   lambda s: self._specialize_stmt(s, subst),
+                                   subst.apply)
 
     def _rewrite_items(self, items: List[rast.Item]) -> List[rast.Item]:
         """Rewrite items, removing generics and adding specializations."""
@@ -1385,7 +1445,9 @@ class Monomorphizer:
                                    self._rewrite_expr(stmt.condition),
                                    stmt.message)
         else:
-            return stmt
+            # Same generic walk as _specialize_stmt (AGAST #1937).
+            return map_child_nodes(stmt, self._rewrite_expr,
+                                   self._rewrite_stmt, self._rewrite_type)
 
     def _rewrite_expr(self, expr: rast.Expr) -> rast.Expr:
         """Rewrite an expression to use specialized types and calls."""
@@ -1482,7 +1544,10 @@ class Monomorphizer:
         elif isinstance(expr, rast.TryOp):
             return rast.TryOp(expr.span, self._rewrite_expr(expr.expr))
         else:
-            return expr
+            # Grouped, TupleLit, Lambda, ...: a generic call nested inside
+            # must still reach its mangled name (AGAST #1937).
+            return map_child_nodes(expr, self._rewrite_expr,
+                                   self._rewrite_stmt, self._rewrite_type)
 
 
 def monomorphize(module: rast.Module) -> rast.Module:
