@@ -348,6 +348,10 @@ class StructRegistry:
         self._layouts[name] = layout
         return layout
 
+    def is_pending(self, name: str) -> bool:
+        """True if `name` is declared (laid out yet or not)."""
+        return name in self._pending
+
     def get_layout(self, name: str) -> Optional[StructLayout]:
         """Get computed layout for a struct, or None if not computed yet."""
         return self._layouts.get(name)
@@ -537,6 +541,15 @@ class LLVMEmitter:
         # for SIMD load/store operations (movaps requires 16-byte aligned addresses)
         self.simd_functions: Set[str] = set()
 
+    def _struct_layout_on_demand(self, name: str) -> Optional[StructLayout]:
+        """Layout of struct `name`, computing it now if it is only declared."""
+        layout = self.struct_registry.get_layout(name)
+        if layout is None and self.struct_registry.is_pending(name):
+            layout = self.struct_registry.compute_layout(
+                name, self._ritz_type_size_and_align
+            )
+        return layout
+
     def _ritz_type_size_and_align(self, ty: rast.Type) -> Tuple[int, int]:
         """Get size and alignment of a Ritz type in bytes.
 
@@ -571,8 +584,12 @@ class LLVMEmitter:
             if ty.name in primitives:
                 return primitives[ty.name]
 
-            # Struct types - get from registry if computed
-            layout = self.struct_registry.get_layout(ty.name)
+            # Struct types - get from registry, laying out on demand.
+            # AGAST #1936: structs are laid out in source order, so a struct
+            # declared later (or an enum payload naming one) used to miss here
+            # and fall back to 8/8. Lazy layout can't recurse without bound: a
+            # by-value struct cycle has infinite size and can't exist.
+            layout = self._struct_layout_on_demand(ty.name)
             if layout:
                 return (layout.size, layout.alignment)
 
