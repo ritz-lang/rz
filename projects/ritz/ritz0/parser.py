@@ -1214,10 +1214,17 @@ class Parser:
         span = self._current().span
         pattern = self.parse_pattern()
 
-        guard = None
+        # Match-arm guards (`n if n == 4 => ...`) are not part of the language
+        # (docs/LANGUAGE_SPEC.md; ritz1 does not parse them). ritz0 once parsed
+        # them, but the emitter ignored the guard and always took the arm, a
+        # silent miscompile (AGAST #1939). Refuse them until they are specified.
         if self._at(TokenType.IF):
-            self._advance()
-            guard = self.parse_expr()
+            raise ParseError(
+                "match-arm guards (`pattern if cond => ...`) are not supported; "
+                "move the condition into the arm body",
+                self._current().span,
+            )
+        guard = None
 
         self._expect(TokenType.FATARROW)
 
